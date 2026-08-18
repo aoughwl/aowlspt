@@ -48,13 +48,43 @@ either log.
 | **Static tables** | items, globals, handbook, customization, locales, languages, settings, quests, achievements |
 | **Inventory** | move, split, merge, transfer, remove, fold, toggle, tag, swap, examine |
 | **Traders** | settings, assorts, per-trader prices |
+| **Trading** | buy from a trader, sell back at the handbook price |
+| **Quests** | accept, hand over, complete, fail — with reward experience |
+| **Hideout** | area upgrade start and complete, toggle, slots |
 | **Raids** | configuration, local loot, weather, match start, **match end** |
+| **Bots** | generation by role and difficulty, out of the database's bot tables |
+| **Mail** | dialogs, messages, attachments (redeeming them is not implemented) |
+| **Insurance** | premiums off the handbook, and returns that survive a restart |
 | **Menu** | notifier channel, mail, friends, builds, flea market, insurance, hideout tables |
 
 The profile is held **as JSON text** and edited member-wise. A typed model would
 have to name several hundred fields to avoid dropping any — and the day the
 client adds one, a typed model silently deletes it from every profile it saves.
 Text plus a merge keeps what it does not know about.
+
+## Money is stacks, not a balance
+
+Paying 25,000 roubles from a stack of 500,000 edits that stack; paying from
+three stacks of 10,000 consumes two and edits the third. A server that treats
+currency as a number and rewrites one stack loses the rest of the player's
+money, silently, because the client believes whatever the diff says.
+
+So `takePayment` verifies every stack in the request before it takes anything.
+There is no transaction to roll back, which means the transaction has to be
+"check it all, then act".
+
+The same reasoning runs through the rest of it:
+
+- An item the server gives you gets a **real cell** in the stash, found by a
+  first-fit scan of an occupancy map built from what is already there. An item
+  with no position, or one overlapping another, is drawn on top of it and cannot
+  be picked up — which looks exactly like never having been given it. If the
+  stash is full the purchase is refused.
+- Selling something the handbook has no price for is **refused**, not paid at
+  zero. The item is gone either way.
+- A hideout upgrade that was never started cannot be completed. A repeated
+  `HideoutUpgradeComplete` is either a replayed request or a client out of step,
+  and granting it is a free level.
 
 ## What comes out of the database, and what happens without one
 
@@ -91,9 +121,16 @@ ok    split reports the new stack
 ok    merge deletes the source
 ok    and the encyclopedia remembers it
 ok    a move of an item that is not there is a warning, not a 500
+ok    buying takes the money and gives the item
+ok    and the payment came out of the right stack
+ok    a payment larger than the stack is refused
 ok    the raid result is accepted
 ok    a raid result for another profile is refused
 ```
+
+63 checks, and the trading ones run against `tests/fixtures/emu-db.json` — a
+small database with one trader, one offer, one handbook price and a stash grid
+in it, because "buy this" needs a server that has something to sell.
 
 Two of those checks carry more weight than the rest.
 
@@ -108,9 +145,19 @@ way to tell a working profile store from a working in-memory cache.
 ## What it is not
 
 It does not have the game's content. Traders sell what the database gives them,
-maps have the loot the database has, quests are the quests in the database. Bot
-generation, the flea market's economy, hideout production and insurance returns
-are endpoints that answer correctly and do nothing interesting yet.
+maps have the loot the database has, quests are the quests in the database, bots
+wear what the bot tables dress them in. The flea market's economy and hideout
+production are endpoints that answer correctly and do nothing interesting yet.
+
+Two things are refused rather than half-built, and the refusal is in the source:
+
+- **Redeeming a mail attachment.** Moving an item out of a message means the
+  item has to exist in a container the client can drag from, and the ordinary
+  inventory move has to work across that boundary. Half of that is worse than
+  none: a player who drags a reward out and finds it gone after a restart has
+  lost it.
+- **Reading a hook's arguments** on the client side — a pipeline limitation, not
+  an emulator one, and documented in [MODDING.md](MODDING.md).
 
 The distinction that matters: those are *content*, and they belong in mods —
 including in this one. The pipeline underneath them is finished and tested.

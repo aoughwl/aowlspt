@@ -1,0 +1,47 @@
+{
+  "enabled": true,
+  "difficulty": "default",
+  "forcePersonality": "",
+  "logDecisions": false,
+
+  "global": {
+    "engageDistance": 70.0,
+    "timeBeforeSearch": 40.0,
+    "holdGroundBaseTime": 1.0,
+    "fightBackHealthThreshold": 0.55,
+    "runAwayHealthThreshold": 0.28,
+    "coverMinEnemyDistance": 8.0,
+    "maxCoverPathLength": 60.0,
+    "decisionHz": 10.0,
+    "maxBotsPerTick": 8,
+    "farFromPlayerDistance": 150.0
+  },
+
+  "roles": {
+    "pmc": {
+      "engageDistance": 90.0,
+      "timeBeforeSearch": 25.0
+    },
+    "scav": {
+      "engageDistance": 50.0,
+      "timeBeforeSearch": 60.0,
+      "willSearchForEnemy": false
+    },
+    "boss": {
+      "engageDistance": 110.0,
+      "timeBeforeSearch": 5.0,
+      "runAwayHealthThreshold": 0.1
+    },
+    "zombie": {
+      "engageDistance": 200.0,
+      "timeBeforeSearch": 1.0,
+      "runAwayHealthThreshold": 0.0,
+      "canShiftCoverPosition": false
+    }
+  },
+
+  "server": {
+    "patchBrains": true,
+    "neutraliseLocationModifiers": true
+  }
+}

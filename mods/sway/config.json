@@ -1,0 +1,196 @@
+{
+  "_comment": "SPT-SWAY. Sections are in the order the signal chain runs: sources first, then the modifiers that scale them, then the raw BSG values written on top. Every key here is documented in model/tuning.nim, including its sane range.",
+
+  "general": {
+    "enabled": true,
+    "preset": "custom",
+    "masterIntensity": 1.0,
+    "adsMultiplier": 1.0,
+    "hipfireMultiplier": 1.0,
+    "rateMultiplier": 1.0,
+    "keepVanillaSway": true,
+    "outputSmoothingHz": 12.0
+  },
+
+  "respiration": {
+    "enabled": true,
+    "amplitude": 1.0,
+    "rateRestedBpm": 14.0,
+    "rateExhaustedBpm": 32.0,
+    "inhaleFraction": 0.35,
+    "exhaleFraction": 0.45,
+    "endExpiratoryPause": 0.20,
+    "waveformSharpness": 1.0,
+    "pitchWeight": 1.0,
+    "yawWeight": 0.38,
+    "rollWeight": 0.22,
+    "adsMultiplier": 0.7,
+    "hipfireMultiplier": 1.15,
+    "breathHoldSuppression": 0.12,
+    "holdReboundGain": 1.8,
+    "holdReboundDecay": 0.45,
+    "oxygenInfluence": 1.0,
+    "irregularity": 0.15
+  },
+
+  "cardiac": {
+    "enabled": true,
+    "amplitude": 0.8,
+    "restingBpm": 65.0,
+    "maxBpm": 165.0,
+    "rateRiseSpeed": 0.9,
+    "rateFallSpeed": 0.25,
+    "systolicSharpness": 4.5,
+    "dicroticNotch": 0.35,
+    "dicroticDelay": 0.34,
+    "pitchWeight": 1.0,
+    "yawWeight": 0.32,
+    "rollWeight": 0.14,
+    "adsMultiplier": 1.25,
+    "hipfireMultiplier": 0.5,
+    "exertionAmplitudeGain": 1.6
+  },
+
+  "tremor": {
+    "enabled": true,
+    "amplitude": 0.45,
+    "centreFrequencyHz": 9.5,
+    "frequencySpread": 0.35,
+    "octaves": 2,
+    "fatigueGain": 2.2,
+    "weaponLoadGain": 1.2,
+    "pitchWeight": 1.0,
+    "yawWeight": 0.95,
+    "rollWeight": 0.45,
+    "adsMultiplier": 1.05,
+    "hipfireMultiplier": 0.75
+  },
+
+  "drift": {
+    "enabled": true,
+    "amplitude": 0.7,
+    "frequencyHz": 0.28,
+    "pitchWeight": 0.7,
+    "yawWeight": 1.0,
+    "rollWeight": 0.3,
+    "adsMultiplier": 0.85,
+    "hipfireMultiplier": 1.0,
+    "movementGain": 1.5
+  },
+
+  "inertia": {
+    "enabled": true,
+    "strength": 1.0,
+    "naturalFrequencyHz": 2.6,
+    "dampingRatio": 0.62,
+    "massCoupling": 1.0,
+    "rollCoupling": 0.45,
+    "maxDeflection": 4.5,
+    "adsMultiplier": 0.5,
+    "hipfireMultiplier": 1.2,
+    "movementGain": 1.0,
+    "turnRateClamp": 900.0,
+    "inputSmoothingHz": 9.0
+  },
+
+  "handling": {
+    "ergonomicsHalfPoint": 55.0,
+    "ergonomicsCurve": 1.15,
+    "ergonomicsFloor": 0.55,
+    "ergonomicsCeiling": 2.1,
+    "weightInfluence": 1.0,
+    "referenceWeightKg": 3.6,
+    "recoilStatInfluence": 0.35
+  },
+
+  "stance": {
+    "standing": 1.0,
+    "crouched": 0.78,
+    "prone": 0.42,
+    "mounted": 0.22,
+    "bipodDeployed": 0.15,
+    "leaningPenalty": 1.25,
+    "sprinting": 1.4,
+    "poseLevelInfluence": 1.0,
+    "supportBlendSpeed": 7.0
+  },
+
+  "fatigue": {
+    "enabled": true,
+    "staminaInfluence": 1.3,
+    "oxygenInfluence": 1.0,
+    "armStaminaInfluence": 1.1,
+    "exhaustedMultiplier": 1.9,
+    "sustainedAimRate": 0.09,
+    "sustainedAimRecovery": 0.35,
+    "sustainedAimCeiling": 0.8
+  },
+
+  "injury": {
+    "enabled": true,
+    "fracturedArm": 2.4,
+    "blackedArm": 1.7,
+    "injuryTremorGain": 2.2
+  },
+
+  "shot": {
+    "enabled": true,
+    "perShotGain": 0.12,
+    "decay": 1.1,
+    "ceiling": 0.9,
+    "heartRateKick": 1.5
+  },
+
+  "camera": {
+    "masterCameraCoupling": 0.10,
+    "respirationShare": 0.75,
+    "cardiacShare": 0.45,
+    "tremorShare": 0.04,
+    "driftShare": 0.45,
+    "inertiaShare": 0.12
+  },
+
+  "springs": {
+    "_comment": "driveGain converts the model's output in degrees into the impulse BSG's springs expect. It was derived analytically and has never been playtested. If everything feels uniformly too strong or too weak, change general.masterIntensity first.",
+    "driveGain": 8.0,
+    "overrideSprings": false,
+    "handsRotationDamping": 0.55,
+    "handsRotationReturnSpeed": 7.0,
+    "handsRotationAccelerationMax": 12.0,
+    "handsRotationInputIntensity": 1.0,
+    "handsRotationSoftness": 1.0,
+    "handsPositionDamping": 0.55,
+    "handsPositionReturnSpeed": 7.0,
+    "cameraRotationDamping": 0.6,
+    "cameraRotationReturnSpeed": 8.0
+  },
+
+  "vanilla": {
+    "overrideVanillaEffectors": false,
+    "breathIntensity": 1.0,
+    "breathFrequency": 1.0,
+    "breathShake": 1.0,
+    "breathHipPenalty": 1.0,
+    "breathCameraSensitivity": 1.0,
+    "vanillaTremorEnabled": true,
+    "vanillaTremorAmplitude": 1.0,
+    "vanillaTremorHardness": 1.0,
+    "motionIntensity": 1.0,
+    "motionSwayFactorX": 1.0,
+    "motionSwayFactorY": 1.0,
+    "motionSwayFactorZ": 1.0,
+    "motionInputClamp": 1.0,
+    "walkBobIntensity": 1.0,
+    "walkStepFrequency": 1.0,
+    "handShakeIntensity": 1.0,
+    "forceEffectorIntensity": 1.0,
+    "aimSwayScale": 1.0,
+    "swayFalloff": 1.0
+  },
+
+  "debug": {
+    "overlay": false,
+    "overlayIntervalMs": 1000,
+    "verboseLogging": false
+  }
+}

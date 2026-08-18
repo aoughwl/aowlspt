@@ -139,6 +139,49 @@ alternative is overwriting whatever the linker put next.
 
 There are 16 patch slots.
 
+## Live objects
+
+A `GameType` is the static half of the game. Almost everything a mod wants is on
+the other half — *this* player's health, *this* weapon's animation:
+
+```nim
+var GameWorld = gameType("EFT.GameWorld")
+
+let world  = GameWorld.instanceOf()          # get_Instance
+let player = world.child("MainPlayer")       # get_MainPlayer, on that world
+info $player.get("Health").asFloat()
+discard player.invoke("Damage", 25.0)
+player.release()
+world.release()
+```
+
+`instanceOf`, `child` and any call that returns a reference type hand back a
+`GameObj`. It holds an IL2CPP GC handle, not a pointer, so keeping one across
+frames is safe — the collector moves objects, and a raw pointer that was right
+last frame is not right this one. The price is `release()`: a handle held for
+the session pins its object. That is a leak rather than a crash, which is the
+right way round for a mistake to fall.
+
+`alive()` answers whether the object is still there, so a mod can ask before it
+tries.
+
+### Fields
+
+`get`/`set` reach a C# **property**, which compiles to `get_X`/`set_X`. A
+**field** has no method behind it and is unreachable that way — and a great deal
+of what a mod wants on this game is a field, often a private one:
+
+```nim
+let hp = player.field("Health").asFloat()
+discard player.setField("Level", v(7))
+```
+
+Reading a field is not a trick; reflection is what the runtime provides for it.
+Values are read and written by the field's **declared** type, so writing a float
+into an int field is refused rather than reinterpreted — the bytes for `1` and
+`1.0` are different bytes, and nothing downstream would notice until the game
+did.
+
 ## What a client mod does not get
 
 | | |

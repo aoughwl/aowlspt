@@ -88,16 +88,32 @@ mods are missing is worse than not starting.
 |---|---|
 | `log`, `config_get`, `now_ms` | yes |
 | `invoke_main`, `schedule` | yes, on the host's own thread — see below |
-| `resolve` / `call` | yes: any type, any zero-argument method, by name |
-| `event_emit` | logged; delivery between mods is not wired yet |
+| `resolve` / `call` | yes: any type, any method, with arguments, by name |
+| live objects | yes: a reference return comes back as a handle you can call on |
+| fields | yes: `Type::@Name` reads one, and with an argument writes it |
+| `patch` | yes: an x64 inline detour on the compiled method |
+| `event_emit` / `event_subscribe` | yes, delivered between mods |
+| `store_get` / `store_set` / `store_list` | yes (ABI revision 2) |
 | `db_get` / `db_patch`, `route_register` | `ErrUnsupported` — server-side |
-| `patch` (Harmony) | `ErrUnsupported` — needs a detour engine |
 
-Two limits are deliberate and reported rather than faked:
+Arguments are bound to the method's **declared** parameter types, read from
+`il2cpp_method_get_param`, rather than guessed from the JSON's shape — a boxed
+`Single` and a boxed `Int32` are the same shape in memory and only the
+declaration tells them apart. A mistyped argument is refused, not coerced.
 
-- **`call` invokes zero-argument methods only.** Given arguments it returns
-  `ErrUnsupported` rather than dropping them. A reflection call that quietly
-  ignores its arguments surfaces as wrong game behaviour hours later.
+A call that returns a reference type gives back `{"handle":n,"type":"..."}`, and
+that handle addresses the object: `#7::Damage`. Underneath it is an IL2CPP GC
+handle rather than a raw pointer, because the collector moves objects and a
+pointer held across two frames is a use-after-free waiting for its moment. The
+cost is that a handle must be released; a mod that forgets pins one object for
+the session, which is a leak rather than a crash and is the right way round.
+
+Two limits remain, reported rather than faked:
+
+- **A hook cannot read the patched method's arguments.** It fires, and it knows
+  which method fired. Reading the arguments needs a thunk generated per
+  signature, and guessing at the register layout instead would produce garbage
+  that looks like data.
 - **`invoke_main` is not Unity's main thread.** It queues onto the host's own
   attached thread. A mod touching a Unity object still needs the real main
   thread, and this host cannot yet put it there. Said plainly rather than

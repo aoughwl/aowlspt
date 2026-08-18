@@ -3,8 +3,6 @@
   "defaultSide": "Usec",
   "startingRoubles": 500000,
   "epochBase": 1700000000,
-  "raid": {
-    "insuranceReturnHours": 24,
-    "scavCooldownSeconds": 900
-  }
+  "insurancePercent": 10,
+  "insuranceReturnHours": 24
 }

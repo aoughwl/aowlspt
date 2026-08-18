@@ -260,19 +260,79 @@ proc mergeInto(target, patch: string): string =
     result.add outMembers[i]
   result.add "}"
 
+proc splitPath(path: string): seq[string] =
+  result = @[]
+  var part = ""
+  for ch in path:
+    if ch == '.':
+      if part.len > 0:
+        result.add part
+        part = ""
+    else:
+      part.add ch
+  if part.len > 0:
+    result.add part
+
+proc joinPathParts(parts: seq[string]; upto: int): string =
+  result = ""
+  for i in 0 ..< upto:
+    if i > 0: result.add "."
+    result.add parts[i]
+
+proc wrapUnder(parts: seq[string]; fromIndex: int; value: string): string =
+  ## `{"a":{"b":<value>}}` for the parts from `fromIndex` on. Built innermost
+  ## first, which is the only order that does not need a second pass.
+  result = value
+  var i = parts.len - 1
+  while i >= fromIndex:
+    result = "{\"" & parts[i] & "\":" & result & "}"
+    dec i
+
 proc dbPatchPath*(path, patchJson: string; error: var string): bool =
+  ## Merges `patchJson` into the value at `path`, **creating the path when it is
+  ## not there**.
+  ##
+  ## Creating rather than refusing, because refusing made the API unable to
+  ## express the ordinary thing: a mod adding a table of its own, or a location
+  ## the database has never held. A patch of an existing member is still a
+  ## merge, so nothing a mod did not name is disturbed either way.
   error = ""
   if gDoc.len == 0:
     error = "no database is loaded"
     return false
+
   var vs = 0
   var ve = 0
-  if not locate(path, vs, ve):
-    error = "no such database path: " & path
+  if locate(path, vs, ve):
+    let existing = strip(gDoc.substr(vs, ve - 1))
+    let merged = mergeInto(existing, strip(patchJson))
+    gDoc = gDoc.substr(0, vs - 1) & merged & gDoc.substr(ve)
+    return true
+
+  # Find the deepest prefix that does exist, and merge the missing tail into it
+  # as nested objects. `have == 0` means not even the first member is there, so
+  # the tail is merged into the document itself.
+  let parts = splitPath(path)
+  if parts.len == 0:
+    let merged = mergeInto(strip(gDoc), strip(patchJson))
+    gDoc = merged
+    return true
+
+  var have = parts.len - 1
+  while have > 0:
+    if locate(joinPathParts(parts, have), vs, ve):
+      break
+    dec have
+
+  let tail = wrapUnder(parts, have, strip(patchJson))
+  if have == 0:
+    gDoc = mergeInto(strip(gDoc), tail)
+    return true
+  if not locate(joinPathParts(parts, have), vs, ve):
+    error = "could not create the database path: " & path
     return false
   let existing = strip(gDoc.substr(vs, ve - 1))
-  let merged = mergeInto(existing, strip(patchJson))
-  gDoc = gDoc.substr(0, vs - 1) & merged & gDoc.substr(ve)
+  gDoc = gDoc.substr(0, vs - 1) & mergeInto(existing, tail) & gDoc.substr(ve)
   result = true
 
 # --------------------------------------------------------------- config

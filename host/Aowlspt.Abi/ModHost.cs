@@ -352,8 +352,16 @@ public sealed class ModHost : IDisposable
 
     // --------------------------------------------------------------- events
 
-    /// <summary>Publish an event to every subscriber, host-originated or mod-originated.</summary>
-    public void Emit(string name, string payload = "")
+    /// <summary>
+    /// Publish an event to every subscriber except <paramref name="from"/>.
+    ///
+    /// The emitter is skipped, matching the nimony hosts. A mod that owns an
+    /// event usually subscribes to it as well, and delivering it back means a
+    /// handler that emits from inside itself recurses -- which is a loop nobody
+    /// wrote. The simulator used to deliver to everyone, so the same mod
+    /// behaved differently here and on the server.
+    /// </summary>
+    public void Emit(string name, string payload = "", LoadedMod? from = null)
     {
         if (!_events.TryGetValue(name, out var subs) || subs.Count == 0) return;
         var bytes = Encoding.UTF8.GetBytes(payload ?? "");
@@ -368,6 +376,7 @@ public sealed class ModHost : IDisposable
             foreach (var sub in subs.ToList())
             {
                 if (sub.Mod.Faulted) continue;
+                if (from is not null && ReferenceEquals(sub.Mod, from)) continue;
                 Invoke(sub.Mod, $"event {name}", () => sub.Handler(sub.User, slice, IntPtr.Zero));
             }
         }
@@ -618,7 +627,7 @@ public sealed class ModHost : IDisposable
 
     private int HostEventEmit(IntPtr ctx, AowlSlice name, AowlSlice payload)
     {
-        Emit(name.ToUtf8String(), payload.ToUtf8String());
+        Emit(name.ToUtf8String(), payload.ToUtf8String(), FromCtx(ctx));
         return AowlStatus.Ok;
     }
 

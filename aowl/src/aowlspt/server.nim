@@ -188,6 +188,15 @@ proc dbWrite*(path: string; patch: Json): Status =
 proc dbWrite*(path, patchJson: string): Status =
   result = dbPatch(path, patchJson)
 
+proc dbWrite*(path: string; patch: JsonObject): Status =
+  ## The overload that was missing, so `dbWrite(path, obj)` had to be written
+  ## `dbWrite(path, done(obj))` -- and `done(obj)` at every call site is
+  ## ceremony that says nothing.
+  result = dbPatch(path, done(patch).text)
+
+proc dbWrite*(path: string; patch: JsonArray): Status =
+  result = dbPatch(path, done(patch).text)
+
 # ---------------------------------------------------------------------------
 # Config
 # ---------------------------------------------------------------------------
@@ -395,3 +404,8 @@ proc afterMs*(delayMs: int; handler: TickHandler): Status =
   ## Run `handler` once, `delayMs` from now, from the server's own loop rather
   ## than from a request thread.
   result = after(delayMs, handler)
+
+proc everyMs*(intervalMs: int; handler: TickHandler): Status =
+  ## Run `handler` on a repeating timer, off the request threads. What a
+  ## periodic sweep -- expiring offers, posting insurance returns -- is for.
+  result = every(intervalMs, handler)

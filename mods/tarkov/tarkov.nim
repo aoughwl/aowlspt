@@ -42,6 +42,10 @@ import emu/inventory
 import emu/raid
 import emu/quests
 import emu/hideout
+import emu/trading
+import emu/bots
+import emu/mail
+import emu/insurance
 
 const
   ModGuid = "aowl.tarkov"
@@ -52,6 +56,8 @@ var gEdition = "standard"
 var gDefaultSide = "Usec"
 var gNowSeconds = 0
 var gStartingRoubles = 500000
+var gInsurancePercent = 10
+var gInsuranceHours = 24
 
 proc nowSeconds(): int =
   ## Wall-clock seconds. The host gives monotonic milliseconds since it started,
@@ -167,6 +173,13 @@ proc onProfileSelect(url, body, session: string): string =
     return failure(1, "no such profile: " & id)
   bindSession(session, id)
   success "session " & session & " -> profile " & id & " (" & p.nickname & ")"
+
+  # Insurance returns are checked at login as well as on a timer. A server that
+  # was switched off when a return came due must still deliver it, and a timer
+  # alone never does.
+  let posted = deliverDue(id, nowSeconds())
+  if posted > 0:
+    info "delivered " & $posted & " insurance return(s)"
 
   var notifier = obj()
   put(notifier, "server", ServerName)
@@ -330,6 +343,8 @@ proc onItemsMoving(url, body, session: string): string =
       else:
         setRaw(p, "Hideout.Areas", updated)
         touchedProfile = true
+    elif kind == "TradingConfirm":
+      discard applyTrading(inv, a, p.stashId, ch)
     else:
       discard applyAction(inv, a, ch, examined)
 
@@ -532,6 +547,17 @@ proc onMatchEnd(url, body, session: string): string =
     # what was lost from the profile it is handing back, so this is a log line
     # rather than an edit. Doing it again here would take it twice.
     info "profile " & p.id & " died in the raid"
+  # What was insured and did not come home goes into the post. Worked out from
+  # the *pre-raid* profile, because the post-raid one no longer has the items --
+  # which is exactly what makes them eligible.
+  let lost = lostAfterRaid(p.text, raw(played))
+  if lost.len > 0:
+    let goods = itemsById(p.text, lost)
+    let due = nowSeconds() + gInsuranceHours * 3600
+    if queueReturn(p.id, "54cb50c76803fa8b248b4571", goods, due):
+      info $lost.len & " insured item(s) will be returned in " &
+           $gInsuranceHours & "h"
+
   if not saveProfile(updated):
     return failure(1, "could not save the profile after the raid")
   success "raid ended: " & field(body, "exit").asText("Left") & " for " &
@@ -558,6 +584,60 @@ proc onLocations(url, body, session: string): string =
   put(o, "locations", if v.ok: raw(v.raw) else: emptyObject())
   put(o, "paths", arr())
   result = envelope(o)
+
+# ---------------------------------------------------------------------------
+# Bots
+# ---------------------------------------------------------------------------
+
+proc onBotGenerate(url, body, session: string): string =
+  ## The largest body the server builds, at the worst moment: the player is on a
+  ## loading screen waiting for it. The cost work is in `emu/bots` -- tables
+  ## read once per batch rather than once per bot -- and what is left here is
+  ## the reporting, so a slow batch is visible in the log rather than guessed at.
+  inc gRequests
+  let started = nowMs()
+  var generated = 0
+  let batch = generate(body, generated)
+  let took = nowMs() - started
+  info "generated " & $generated & " bot(s) in " & $int(took) & "ms"
+  result = envelope(raw(batch))
+
+proc onBotLimit(url, body, session: string): string =
+  inc gRequests
+  result = envelope(raw("30"))
+
+proc onBotDifficulty(url, body, session: string): string =
+  inc gRequests
+  let v = dbRead("bots.core")
+  if v.ok:
+    return envelope(raw(v.raw))
+  result = envelope(emptyObject())
+
+# ---------------------------------------------------------------------------
+# Mail
+# ---------------------------------------------------------------------------
+
+proc onMailList(url, body, session: string): string =
+  inc gRequests
+  let p = currentProfile(session)
+  if not p.ok:
+    return envelope(emptyArray())
+  result = envelope(raw(dialogList(p.id)))
+
+proc onMailView(url, body, session: string): string =
+  inc gRequests
+  let p = currentProfile(session)
+  if not p.ok:
+    return envelope(emptyObject())
+  let dialogId = field(body, "dialogId").asText("")
+  result = envelope(raw(dialogView(p.id, dialogId)))
+
+proc onMailAttachments(url, body, session: string): string =
+  inc gRequests
+  let p = currentProfile(session)
+  if not p.ok:
+    return envelope(emptyObject())
+  result = envelope(raw(allAttachments(p.id)))
 
 # ---------------------------------------------------------------------------
 # Hideout, the flea market, insurance
@@ -598,8 +678,27 @@ proc onRagfairPrice(url, body, session: string): string =
   result = envelope(o)
 
 proc onInsuranceCost(url, body, session: string): string =
+  ## What each trader would charge to insure each item in the request. Priced
+  ## off the handbook, so a server with no handbook quotes nothing rather than
+  ## quoting zero -- a free premium makes insuring strictly better than not,
+  ## which is a decision the player should be making.
   inc gRequests
-  result = envelope(emptyObject())
+  let traders = each(field(body, "traders"))
+  let itemIds = each(field(body, "items"))
+  var out1 = obj()
+  for t in traders:
+    let tid = t.asText("")
+    if tid.len == 0:
+      continue
+    var perItem = obj()
+    for it in itemIds:
+      let tpl = it.asText("")
+      let price = handbookPrice(tpl)
+      let premium = premiumFor(price, gInsurancePercent)
+      if premium > 0:
+        put(perItem, tpl, premium)
+    put(out1, tid, perItem)
+  result = envelope(out1)
 
 # ---------------------------------------------------------------------------
 # Loading
@@ -672,9 +771,19 @@ proc registerRoutes() =
   # The menu's supporting cast
   discard serve("/client/notifier/channel/create", onNotifierChannel)
   discard servePrefix("/client/notifier/getwebsocket", onNotifierPoll)
-  discard serve("/client/mail/dialog/list", onEmptyArray)
+  discard serve("/client/mail/dialog/list", onMailList)
   discard serve("/client/mail/dialog/info", onEmptyObject)
-  discard serve("/client/mail/dialog/view", onEmptyObject)
+  discard serve("/client/mail/dialog/view", onMailView)
+  discard serve("/client/mail/dialog/getAllAttachments", onMailAttachments)
+  discard serve("/client/mail/dialog/read", onNullData)
+  discard serve("/client/mail/dialog/pin", onNullData)
+  discard serve("/client/mail/dialog/unpin", onNullData)
+  discard serve("/client/mail/dialog/remove", onNullData)
+
+  # Bots
+  discard serve("/client/game/bot/generate", onBotGenerate)
+  discard serve("/client/game/bot/limit", onBotLimit)
+  discard serve("/client/game/bot/difficulty", onBotDifficulty)
   discard serve("/client/friend/list", onEmptyArray)
   discard serve("/client/friend/request/list/inbox", onEmptyArray)
   discard serve("/client/friend/request/list/outbox", onEmptyArray)
@@ -695,6 +804,8 @@ proc onLoad(): Status =
   gDefaultSide = setting("defaultSide").asText("Usec")
   gNowSeconds = setting("epochBase").asInt(1700000000)
   gStartingRoubles = setting("startingRoubles").asInt(500000)
+  gInsurancePercent = setting("insurancePercent").asInt(10)
+  gInsuranceHours = setting("insuranceReturnHours").asInt(24)
 
   if not storeReady():
     error "this host has no persistent store; profiles cannot be kept " &

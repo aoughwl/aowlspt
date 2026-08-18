@@ -65,6 +65,10 @@ var
   gEvents: seq[EventHandler] = @[]
   gPatches: seq[PatchHandler] = @[]
   gTicks: seq[TickHandler] = @[]
+  ## Milliseconds between firings for each entry in `gTicks`, or zero for a
+  ## one-shot. Parallel to `gTicks` rather than a field on it because a cookie
+  ## is an index and the two must stay in step.
+  gTickRepeat: seq[int] = @[]
 
 proc host*(): ptr HostApi {.inline.} = gHost
 proc hostReady*(): bool {.inline.} = not isNilPtr(cast[pointer](gHost))
@@ -216,6 +220,13 @@ proc tickTrampoline(user: pointer; payload: AowlSlice;
   let idx = fromCookie(user)
   if idx < 0 or idx >= gTicks.len: return ErrNotFound
   discard gTicks[idx](payload.toString())
+  # A repeating timer re-arms itself with the *same* cookie. Calling `after`
+  # again from inside the handler would work and would also add one entry to
+  # `gTicks` per firing -- a leak that only shows up in a server left running
+  # for a week, which is the worst place to find one.
+  if idx < gTickRepeat.len and gTickRepeat[idx] > 0 and hostReady():
+    discard gHost.schedule(gHost.ctx, int32(gTickRepeat[idx]),
+                           tickTrampoline, user)
   Ok
 
 # ---------------------------------------------------------------------------
@@ -252,13 +263,30 @@ proc after*(delayMs: int; handler: TickHandler): Status =
   ## Run `handler` once on the host's main thread, `delayMs` from now.
   if not hostReady(): return ErrBadArg
   gTicks.add handler
+  gTickRepeat.add 0
   gHost.schedule(gHost.ctx, int32(delayMs), tickTrampoline, toCookie(gTicks.len - 1))
+
+proc every*(intervalMs: int; handler: TickHandler): Status =
+  ## Run `handler` every `intervalMs`, starting one interval from now.
+  ##
+  ## The interval is between *firings*, not between starts: the next one is
+  ## armed after the handler returns, so a handler that takes longer than its
+  ## interval falls behind rather than overlapping itself. That is almost always
+  ## what a periodic sweep wants, and it is never what a handler that assumes it
+  ## runs alone can survive without.
+  if not hostReady(): return ErrBadArg
+  if intervalMs <= 0: return ErrBadArg
+  gTicks.add handler
+  gTickRepeat.add intervalMs
+  gHost.schedule(gHost.ctx, int32(intervalMs), tickTrampoline,
+                 toCookie(gTicks.len - 1))
 
 proc onMainThread*(handler: TickHandler): Status =
   ## Run `handler` on the host's main thread as soon as possible. Safe from a
   ## worker thread — this is how a mod touches Unity objects.
   if not hostReady(): return ErrBadArg
   gTicks.add handler
+  gTickRepeat.add 0
   gHost.invokeMain(gHost.ctx, tickTrampoline, toCookie(gTicks.len - 1))
 
 # ---------------------------------------------------------------------------

@@ -1,0 +1,63 @@
+{
+  "slotId": "suburbs",
+  "slotObjectId": "5714dc342459777137212e0b",
+
+  "displayName": "Icebreaker",
+  "description": "The nuclear icebreaker BOREAS, locked in arctic ice.",
+  "scenePath": "maps/icebreaker.bundle",
+  "sceneRcid": "icebreaker.scenespreset.asset",
+
+  "enabled": true,
+  "disabledForScav": true,
+  "disabledScavExits": "Cellars,Gate 0",
+  "insurance": true,
+  "safeLocation": false,
+  "openZones": "ZoneIcebreaker",
+
+  "escapeTimeLimit": 50,
+  "escapeTimeLimitCoop": 50,
+  "escapeTimeLimitPVE": 50,
+  "minPlayers": 1,
+  "maxPlayers": 3,
+  "maxCoopGroup": 6,
+  "requiredPlayerLevelMin": 0,
+  "requiredPlayerLevelMax": 100,
+  "averagePlayerLevel": 60,
+  "averagePlayTime": 50,
+
+  "iconX": 91,
+  "iconY": 747,
+
+  "botCap": 40,
+  "maxBotPerZone": 2,
+  "botStop": 2400,
+
+  "globalLootChanceModifier": 0.27,
+  "globalContainerChanceModifier": 1.0,
+
+  "exitLocaleKey": "Icebreaker_Exit_Heli",
+  "exitLocaleName": "Helicopter",
+  "rebrandLocales": true,
+
+  "lockUntilQuestComplete": false,
+  "finalQuestId": "",
+
+  "crossingWatch": true,
+  "crossingGateQuests": [
+    "e857e9c34949ecbf1cf5a5b2",
+    "6a752a6bc498772c6a150baf",
+    "6a753b58478c184bd220c417",
+    "6a75661b478c184bd220c433",
+    "6a757a2f478c184bd220c458",
+    "6a7e0916b881de241018539d"
+  ],
+
+  "bundlePrefix": "manimal/",
+  "bundles": [
+    "manimal/hovercraft.bundle",
+    "manimal/icebreaker_keypad.bundle",
+    "manimal/icebreaker_keypad_ui.bundle",
+    "manimal/icebreaker_postit.bundle",
+    "manimal/torch_container.bundle"
+  ]
+}

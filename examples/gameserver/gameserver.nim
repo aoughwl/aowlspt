@@ -53,6 +53,16 @@ proc onItem(url, body, session: string): string =
   put(o, "weight", weight.asFloat())
   result = done(o).text
 
+proc onCreated(url, body, session: string): string =
+  ## Reads back a database path this mod created at load. Served as a route so
+  ## the backend's self test can assert it over the wire rather than trusting a
+  ## log line.
+  let v = dbRead("aowlspt.demo.created.by")
+  var o = obj()
+  put(o, "ok", v.ok)
+  put(o, "by", v.asText())
+  result = done(o).text
+
 proc onLoad(): Status =
   success "gameserver loaded on " & hostName()
 
@@ -66,6 +76,19 @@ proc onLoad(): Status =
   discard serve("/aowlspt/status", onStatus)
   discard serve("/aowlspt/echo", onEcho)
   discard servePrefix("/aowlspt/item/", onItem)
+  discard serve("/aowlspt/created", onCreated)
+
+  # A path the database has never held. `dbWrite` creates it rather than
+  # refusing: a mod adding a table of its own -- a new location, its own
+  # settings -- is the ordinary case, and refusing made that inexpressible.
+  if dbWrite("aowlspt.demo.created", "{\"by\":\"gameserver\"}") == Ok:
+    let back = dbRead("aowlspt.demo.created.by")
+    if back.ok and back.asText() == "gameserver":
+      success "created a database path that did not exist"
+    else:
+      warn "the created path did not read back"
+  else:
+    warn "could not create a database path: " & lastError()
 
   # A database patch. It merges, so a sibling field another mod set on the same
   # item survives this.

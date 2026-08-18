@@ -1,0 +1,11 @@
+{
+  "NoInertia": true,
+  "QuickTilting": true,
+  "DoBushesSlowYouDown": false,
+  "BotsUseOldMovement": true,
+  "DoesAimingSlowYouDown": true,
+  "RemoveJitteryRotation": false,
+  "NostalgiaMode": false,
+
+  "verifyHooks": true
+}

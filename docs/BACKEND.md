@@ -66,7 +66,7 @@ exportMod(guid = "you.mod", name = "Mod", author = "you", version = "1.0.0",
 | `serve(url, handler)` | exact-match route |
 | `servePrefix(prefix, handler)` | prefix route; `pathAfter(url, prefix)` for the rest |
 | `dbRead(path)` | `.asText()`, `.asFloat()`, `.asInt()` |
-| `dbWrite(path, patch)` | **merges** into the object at `path` |
+| `dbWrite(path, patch)` | **merges** into the object at `path`, creating it if it is not there |
 | `setting(key)` | this mod's `config.json` |
 | `obj()` / `put` / `arr()` / `done` | JSON, with escaping you cannot forget |
 | `envelope(data)` | the client's `{"err":0,...}` wrapper — not optional |
@@ -98,7 +98,11 @@ before a route sees it, so a malformed id is not reported as some mod's bug.
 
 ## Merging, and why it matters
 
-`dbWrite` merges recursively. Two mods editing sibling fields of the same item
+`dbWrite` merges recursively, and **creates a path that is not there**. Refusing
+a missing path is right for a patch and wrong for a mod whose job is adding
+content — a new location, a new bot type, its own table — which made the
+ordinary case inexpressible and had every such mod carrying the same workaround.
+ Two mods editing sibling fields of the same item
 do not clobber each other — that is the difference between a mod system and a
 pile of mods that happen to coexist. The test asserts it both ways:
 

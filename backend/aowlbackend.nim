@@ -31,6 +31,7 @@ import aowlsptinstall/winfs
 import aowlsptinstall/log as console
 import modhost
 import modstore
+import jsonpath
 import jsondb
 import wire
 
@@ -364,10 +365,15 @@ var gLastError = ""
 proc hostLog(ctx: HostPtr; level: int32; msg: HostPtr; len: int32) {.
     exportc: "aowlspt_nim_log", cdecl.} =
   let text = readBytes(msg, len)
+  # Every level is distinct. Folding trace and debug into info left a mod with
+  # no way to say something quietly, so mods that wanted quiet diagnostics
+  # simply did not emit them.
   case level
+  of 0'i32: modhost.logLine("trace", text)
+  of 1'i32: modhost.logLine("debug", text)
+  of 3'i32: modhost.okLog text
   of 4'i32: modhost.warn text
   of 5'i32: modhost.fail text
-  of 3'i32: modhost.okLog text
   else: modhost.info text
 
 proc hostLastError(ctx: HostPtr; outPtr, outLen: HostPtr) {.
@@ -392,8 +398,13 @@ proc hostConfigGet(ctx: HostPtr; key: HostPtr; keyLen: int32;
   if not readTextFile(joinPath(dir, "config.json"), text):
     gLastError = "no config.json for " & modGuidOf(idx)
     return ErrNotFound
+  # An empty key is the whole document, which `aowlspt.nim` documents and this
+  # did not do -- so a mod reading its config in one round trip got an error
+  # instead. Dotted keys work too, through the same lookup the client host uses.
   var value = ""
-  if not jsonGet(text, k, value):
+  if k.len == 0:
+    value = text
+  elif not pathGet(text, k, value):
     gLastError = "no such key: " & k
     return ErrNotFound
   var v = value
@@ -734,6 +745,8 @@ proc main(): int =
     expect("prefix route reads the database",
            "/aowlspt/item/5447a9cd4bdc2dbd208b4567", "", "\"weight\"")
     expect("unknown routes 404", "/nope", "", "no route")
+    expect("a mod can create a database path that was not there",
+           "/aowlspt/created", "", "gameserver")
 
     # A body that is not compressed must still be accepted: the tools people
     # debug with do not compress, and rejecting them would make the server

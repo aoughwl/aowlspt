@@ -32,6 +32,7 @@ import std/[strutils, syncio]
 import aowlspt/il2cpp
 import aowlsptinstall/winfs
 import modstore
+import jsonpath
 import invoke
 
 {.emit: """#include "aowlspt_shim.h" """.}
@@ -114,6 +115,7 @@ const
   ErrBadArg = -4'i32
   ErrDecode = -5'i32
   ErrUnsupported = -6'i32
+  ErrDisposed = -8'i32
 
 # --------------------------------------------------------------- state
 
@@ -173,6 +175,10 @@ var gLastError = ""
 var gStartMs = 0'u64
 var gHandles: seq[Il2CppPtr] = @[]
 var gHandleIsObject: seq[bool] = @[]
+## For an object handle, the IL2CPP GC handle keeping it alive; zero for a type
+## handle. Parallel to `gHandles` because a mod-facing handle is an index and
+## the three must stay in step.
+var gHandleGc: seq[uint32] = @[]
 var gPatches: seq[Patch] = @[]
 var gSubs: seq[Sub] = @[]
 
@@ -249,9 +255,9 @@ proc hostConfigGet(ctx: Il2CppPtr; key: Il2CppPtr; keyLen: int32;
   ## cache is a worse problem than a file read.
   let k = readBytes(key, keyLen)
   discard cOutCopy(outPtr, outLen, cast[Il2CppPtr](0), 0'i32)
-  if k.len == 0:
-    gLastError = "empty config key"
-    return ErrBadArg
+  # An empty key is the whole document. A mod with fifty settings reading them
+  # in one round trip rather than fifty is the reason, and `aowlspt.nim` has
+  # documented it as the behaviour all along.
   # Which mod is asking is carried in `ctx`, which is its index.
   let idx = int(cast[uint](ctx))
   if idx < 0 or idx >= gMods.len:
@@ -261,26 +267,20 @@ proc hostConfigGet(ctx: Il2CppPtr; key: Il2CppPtr; keyLen: int32;
   if not readTextFile(joinPath(gMods[idx].dir, "config.json"), text):
     gLastError = "no config.json for " & gMods[idx].guid
     return ErrNotFound
-  let needle = "\"" & k & "\""
-  let at = find(text, needle)
-  if at < 0:
+  # A dotted-path lookup, and the same one the backend uses. This was a
+  # substring search for `"key"`, which matches inside `"MaxHealth"` when asked
+  # for `Health`, matches inside any string value containing it, and could not
+  # address a nested member at all -- so a mod's config had to be flat on this
+  # side and could be nested on the other.
+  var value = ""
+  if k.len == 0:
+    value = text
+    var v0 = value
+    return cOutCopy(outPtr, outLen, cast[Il2CppPtr](toCString(v0)),
+                    int32(v0.len))
+  if not pathGet(text, k, value):
     gLastError = "no such key: " & k
     return ErrNotFound
-  var i = at + needle.len
-  while i < text.len and (text[i] == ' ' or text[i] == ':' or text[i] == '\t'):
-    inc i
-  var value = ""
-  if i < text.len and text[i] == '"':
-    inc i
-    while i < text.len and text[i] != '"':
-      value.add text[i]
-      inc i
-  else:
-    while i < text.len and text[i] != ',' and text[i] != '}' and
-          text[i] != '\n' and text[i] != '\r':
-      value.add text[i]
-      inc i
-    value = strip(value)
   var v = value
   result = cOutCopy(outPtr, outLen, cast[Il2CppPtr](toCString(v)),
                     int32(v.len))
@@ -317,11 +317,39 @@ proc hostNowMs(ctx: Il2CppPtr): int64 {.
     exportc: "aowlspt_nim_now_ms", cdecl.} =
   result = int64(cNowMs() - gStartMs)
 
+proc handleTarget(idx: int): Il2CppPtr =
+  ## What a handle points at *now*.
+  ##
+  ## For an object that means asking the GC handle, every time, rather than
+  ## caching the pointer: the collector moves objects, so a pointer that was
+  ## right last frame is not a pointer that is right this frame. A collected
+  ## object comes back null, which callers report rather than dereference.
+  result = cast[Il2CppPtr](0)
+  if idx < 0 or idx >= gHandles.len:
+    return
+  if gHandleIsObject[idx]:
+    if gHandleGc[idx] != 0'u32:
+      result = gcHandleTarget(gRt, gHandleGc[idx])
+  else:
+    result = gHandles[idx]
+
+proc liveHandles(): seq[Il2CppPtr] =
+  ## A snapshot for `bindArgs`, which takes a plain sequence. Rebuilt per call
+  ## rather than kept: handles are counted in tens and correctness here is worth
+  ## more than the copy.
+  result = @[]
+  for i in 0 ..< gHandles.len:
+    result.add handleTarget(i)
+
 proc hostHandleRelease(ctx: Il2CppPtr; handle: uint64) {.
     exportc: "aowlspt_nim_handle_release", cdecl.} =
   let idx = int(handle) - 1
   if idx >= 0 and idx < gHandles.len:
+    if gHandleIsObject[idx] and gHandleGc[idx] != 0'u32:
+      gcHandleFree(gRt, gHandleGc[idx])
+      gHandleGc[idx] = 0'u32
     gHandles[idx] = cast[Il2CppPtr](0)
+    gHandleIsObject[idx] = false
 
 proc hostResolve(ctx: Il2CppPtr; typeName: Il2CppPtr; nameLen: int32;
                  outHandle: Il2CppPtr): int32 {.
@@ -341,6 +369,7 @@ proc hostResolve(ctx: Il2CppPtr; typeName: Il2CppPtr; nameLen: int32;
     return ErrNotFound
   gHandles.add c
   gHandleIsObject.add false
+  gHandleGc.add 0'u32
   let h = uint64(gHandles.len)
   # The out-parameter is a uint64*; write it as eight bytes.
   discard cOutCopy(cast[Il2CppPtr](0), cast[Il2CppPtr](0),
@@ -394,8 +423,12 @@ proc hostCall(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
     # A handle is either a type (from `resolve`) or a live object (from a call
     # that returned one). Both are reachable, and which one it is decides
     # whether the invoke gets an instance.
-    let h = gHandles[idx - 1]
+    let h = handleTarget(idx - 1)
     if gHandleIsObject[idx - 1]:
+      if h == nil:
+        gLastError = "handle " & typePart &
+                     " refers to an object the game has collected"
+        return ErrDisposed
       instance = h
       cls = objectClass(gRt, h)
     else:
@@ -413,6 +446,33 @@ proc hostCall(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
     gLastError = parseError
     return ErrDecode
 
+  # `@name` is a field rather than a method. A property compiles to `get_X` and
+  # is reachable through an ordinary call; a field has no method behind it, and
+  # half of what a mod wants to read on this game is a field -- often a private
+  # one, which is what reflection is for. No new ABI entry: the escape hatch is
+  # already the thing that means "reach what the header has no door for".
+  if member.len > 1 and member[0] == '@':
+    let fieldName = member.substr(1)
+    var fieldError = ""
+    if values.len == 0:
+      let text = readField(gRt, cls, instance, fieldName, gHandles,
+                           gHandleIsObject, gHandleGc, fieldError)
+      if fieldError.len > 0:
+        gLastError = fieldError & " on " & typePart
+        return ErrNotFound
+      var t = text
+      return cOutCopy(outPtr, outLen, cast[Il2CppPtr](toCString(t)),
+                      int32(t.len))
+    if values.len != 1:
+      gLastError = "writing a field takes one value, got " & $values.len
+      return ErrBadArg
+    var live = liveHandles()
+    if not writeField(gRt, cls, instance, fieldName, values[0], live,
+                      fieldError):
+      gLastError = fieldError & " on " & typePart
+      return ErrBadArg
+    return StatusOk
+
   let m = findMethod(gRt, cls, member, values.len)
   if m == nil:
     gLastError = "no method " & member & "/" & $values.len & " on " & typePart
@@ -425,7 +485,8 @@ proc hostCall(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
       gLastError = "too many arguments (" & $values.len & ")"
       return ErrBadArg
     var bindError = ""
-    if not bindArgs(gRt, m, values, gHandles, argBlock, bindError):
+    var live = liveHandles()
+    if not bindArgs(gRt, m, values, live, argBlock, bindError):
       cArgsFree(argBlock)
       gLastError = bindError
       return ErrBadArg
@@ -441,7 +502,7 @@ proc hostCall(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
     gLastError = "managed exception from " & spec
     return ErrGeneric
 
-  let text = describeResult(gRt, m, res)
+  let text = describeResult(gRt, m, res, gHandles, gHandleIsObject, gHandleGc)
   if text.len == 0:
     return StatusOk
   var t = text

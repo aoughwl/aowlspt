@@ -1,0 +1,69 @@
+{
+  "traders": {
+    "54cb50c76803fa8b248b4571": {
+      "base": {
+        "_id": "54cb50c76803fa8b248b4571",
+        "nickname": "Prapor",
+        "currency": "RUB",
+        "unlockedByDefault": true
+      },
+      "assort": {
+        "items": [
+          {
+            "_id": "aaaaaaaaaaaaaaaaaaaaaaa1",
+            "_tpl": "5644bd2b4bdc2d3b4c8b4572",
+            "parentId": "hideout",
+            "slotId": "hideout",
+            "upd": { "StackObjectsCount": 10 }
+          }
+        ],
+        "barter_scheme": {
+          "aaaaaaaaaaaaaaaaaaaaaaa1": [
+            [{ "_tpl": "5449016a4bdc2d6f028b456f", "count": 25000 }]
+          ]
+        },
+        "loyal_level_items": { "aaaaaaaaaaaaaaaaaaaaaaa1": 1 }
+      }
+    }
+  },
+  "templates": {
+    "items": {
+      "5449016a4bdc2d6f028b456f": {
+        "_id": "5449016a4bdc2d6f028b456f",
+        "_props": { "Name": "Roubles", "Width": 1, "Height": 1, "StackMaxSize": 500000 }
+      },
+      "5644bd2b4bdc2d3b4c8b4572": {
+        "_id": "5644bd2b4bdc2d3b4c8b4572",
+        "_props": { "Name": "AK-74N", "Width": 4, "Height": 2, "StackMaxSize": 1 }
+      },
+      "5811ce572459770cba1a34ea": {
+        "_id": "5811ce572459770cba1a34ea",
+        "_props": {
+          "Name": "Stash 10x68",
+          "Grids": [{ "_props": { "cellsH": 10, "cellsV": 68 } }]
+        }
+      }
+    },
+    "handbook": {
+      "Categories": [],
+      "Items": [
+        { "Id": "5644bd2b4bdc2d3b4c8b4572", "ParentId": "5b5f78dc86f77409407a7f8e", "Price": 22000 }
+      ]
+    }
+  },
+  "locales": {
+    "global": {
+      "en": { "5644bd2b4bdc2d3b4c8b4572 Name": "AK-74N" }
+    },
+    "menu": { "en": { "MainMenu": "Main menu" } }
+  },
+  "hideout": {
+    "areas": [
+      {
+        "type": 3,
+        "enabled": true,
+        "stages": { "1": { "constructionTime": 0, "requirements": [] } }
+      }
+    ]
+  }
+}

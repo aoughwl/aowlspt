@@ -219,6 +219,87 @@ static void* m_playerTick(void* obj, void** params) {
 
 MOCK_EXPORT int32_t mock_tick_count(void) { return g_tickCount; }
 
+/* Live objects.
+ *
+ * Everything above is static: a method that needs no `this`. The interesting
+ * half of a real game is not -- it is *this* player's health, reached from
+ * *this* world -- and a host that can only call static members can reach none
+ * of it. So the mock grows two singletons and an instance method that mutates
+ * one, because the only way to prove a host passed the right `this` is to
+ * change something on it and read it back.
+ */
+static MockClass g_gameWorldClass;
+static MockClass g_playerClass;
+
+/* Laid out to match `g_playerFields` exactly -- Health at 16, Level at 20 --
+ * because a field read goes through `il2cpp_field_get_offset` and a mock whose
+ * struct disagrees with its own metadata tests nothing. The padding is there to
+ * make the offsets real rather than to make the numbers look tidy. */
+typedef struct MockPlayer {
+    MockClass* klass;   /* 0  */
+    void*      pad;     /* 8  */
+    float      health;  /* 16 */
+    int32_t    level;   /* 20 */
+} MockPlayer;
+
+typedef struct MockWorld {
+    MockClass*  klass;
+    MockPlayer* mainPlayer;
+} MockWorld;
+
+static MockPlayer* g_thePlayer = NULL;
+static MockWorld*  g_theWorld = NULL;
+
+static MockPlayer* mock_player(void) {
+    if (!g_thePlayer) {
+        g_thePlayer = (MockPlayer*)calloc(1, sizeof(MockPlayer));
+        g_thePlayer->klass = &g_playerClass;
+        g_thePlayer->health = 100.0f;
+        g_thePlayer->level = 1;
+    }
+    return g_thePlayer;
+}
+
+/* EFT.GameWorld::get_Instance() -> EFT.GameWorld  (static) */
+static void* m_worldInstance(void* obj, void** params) {
+    (void)obj; (void)params;
+    if (!g_theWorld) {
+        g_theWorld = (MockWorld*)calloc(1, sizeof(MockWorld));
+        g_theWorld->klass = &g_gameWorldClass;
+        g_theWorld->mainPlayer = mock_player();
+    }
+    return g_theWorld;
+}
+
+/* EFT.GameWorld::get_MainPlayer() -> EFT.Player  (instance) */
+static void* m_worldMainPlayer(void* obj, void** params) {
+    (void)params;
+    if (!obj) return NULL;
+    return ((MockWorld*)obj)->mainPlayer;
+}
+
+/* EFT.Player::get_Health() -> System.Single  (instance) */
+static void* m_playerGetHealth(void* obj, void** params) {
+    (void)params;
+    if (!obj) return NULL;
+    return mock_box_f32(((MockPlayer*)obj)->health);
+}
+
+/* EFT.Player::Damage(System.Single) -> System.Single  (instance)
+ *
+ * The proof. It subtracts from *this* player and returns what is left, so a
+ * host that called it with the wrong `this` -- or with none -- returns a value
+ * that cannot be confused with the right one. */
+static void* m_playerDamage(void* obj, void** params) {
+    if (!obj) return NULL;
+    float amount = *(float*)params[0];
+    MockPlayer* p = (MockPlayer*)obj;
+    p->health -= amount;
+    return mock_box_f32(p->health);
+}
+
+MOCK_EXPORT float mock_player_health(void) { return mock_player()->health; }
+
 /* ------------------------------------------------------------------ *
  * The type universe
  * ------------------------------------------------------------------ */
@@ -234,6 +315,13 @@ static MockMethod g_playerMethods[] = {
     { NULL, "Scale",   1, {"System.Single",0,0,0},             "System.Single",  m_playerScale,   NULL },
     { NULL, "SetFlag", 1, {"System.Boolean",0,0,0},            "System.Boolean", m_playerSetFlag, NULL },
     { NULL, "Tick",    0, {0,0,0,0},                           "System.Void",    m_playerTick,    NULL },
+    { NULL, "get_Health", 0, {0,0,0,0},                        "System.Single",  m_playerGetHealth, NULL },
+    { NULL, "Damage",  1, {"System.Single",0,0,0},             "System.Single",  m_playerDamage,  NULL },
+};
+
+static MockMethod g_worldMethods[] = {
+    { NULL, "get_Instance",   0, {0,0,0,0}, "EFT.GameWorld", m_worldInstance,   NULL },
+    { NULL, "get_MainPlayer", 0, {0,0,0,0}, "EFT.Player",    m_worldMainPlayer, NULL },
 };
 
 static MockField g_playerFields[] = {
@@ -255,10 +343,11 @@ static MockClass g_appClass = {
 };
 static MockClass g_playerClass = {
     "EFT", "Player", &g_objectClass, 64, 0,
-    g_playerMethods, 6, g_playerFields, 3
+    g_playerMethods, 8, g_playerFields, 3
 };
 static MockClass g_gameWorldClass = {
-    "EFT", "GameWorld", &g_objectClass, 32, 0, NULL, 0, NULL, 0
+    "EFT", "GameWorld", &g_objectClass, 32, 0,
+    g_worldMethods, 2, NULL, 0
 };
 
 static MockClass* g_corlibClasses[] = {
@@ -280,11 +369,25 @@ static void* g_assemblyPtrs[3];
 static int  g_initialised = 0;
 static char g_domain[8] = "mock";
 
+/* Walks the type universe rather than naming each method table with a count.
+ *
+ * It used to be a loop per class with the count written in by hand, and adding
+ * a method to a class left `methodPointer` NULL on the ones past the old count
+ * -- which `il2cpp_runtime_invoke` reads, so the method resolved, invoked, and
+ * returned NULL. That looks exactly like a method that legitimately returns
+ * null, and it cost an hour. Derived from the tables now, so there is one place
+ * to be wrong and it is the table itself. */
 static void mock_wire(void) {
-    for (int i = 0; i < 1; i++) { g_appMethods[i].klass = &g_appClass;
-                                  g_appMethods[i].methodPointer = (void*)g_appMethods[i].impl; }
-    for (int i = 0; i < 6; i++) { g_playerMethods[i].klass = &g_playerClass;
-                                  g_playerMethods[i].methodPointer = (void*)g_playerMethods[i].impl; }
+    for (int a = 0; a < 3; a++) {
+        MockImage* img = g_assemblies[a].image;
+        for (int c = 0; c < img->classCount; c++) {
+            MockClass* k = img->classes[c];
+            for (int m = 0; m < k->methodCount; m++) {
+                k->methods[m].klass = k;
+                k->methods[m].methodPointer = (void*)k->methods[m].impl;
+            }
+        }
+    }
     for (int i = 0; i < 3; i++) g_assemblyPtrs[i] = &g_assemblies[i];
 }
 

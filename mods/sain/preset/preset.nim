@@ -1,0 +1,224 @@
+## The preset system: `config.json` in, a resolved `Settings` out.
+##
+## SAIN's presets are a folder of JSON per bot type per difficulty plus a file
+## per personality, served over HTTP from the server mod and edited through two
+## separate GUIs. Reproducing that machinery would be reproducing the GUIs,
+## which do not exist here. What is reproduced is the *shape* that matters:
+##
+##     global defaults
+##       overridden per difficulty band
+##         overridden per bot role
+##           multiplied by personality
+##
+## and the resolution happens **once, at load**, into a table of `Settings`
+## indexed by role. A bot spawning mid-raid copies one of those and applies its
+## personality; it does not parse anything, look anything up by string, or touch
+## the config again for the rest of the raid.
+##
+## That is the performance decision here. SAIN reaches a threshold through
+## `Bot.Info.FileSettings.Mind.X` — a dictionary lookup keyed on a wild-spawn
+## enum and a difficulty enum, cached on the bot but rebuilt whenever the preset
+## changes. Here a threshold is a field of a struct the bot owns.
+
+import aowlspt
+import aowlspt/json
+import ".." / core / types
+import ".." / core / settings
+
+type
+  Preset* = object
+    ## Everything the mod needs to make a bot, resolved.
+    base*: Settings
+    ## One entry per `BotRole`, in `ord(BotRole)` order. An array indexed by an
+    ## enum is not available in nimony, so this is an int-indexed `seq` with
+    ## `ord()` at the call site — noted because it looks like an oversight and
+    ## is not.
+    byRole*: seq[Settings]
+    ## A forced personality, or `pNone` to let the role decide.
+    forcePersonality*: Personality
+    ## The difficulty band from `config.json`, as a 0..1 scalar. SAIN ships six
+    ## generated presets that differ in a dozen coefficients; one scalar through
+    ## `resolvedFor` reaches the same behaviour, and the per-setting overrides
+    ## are the escape hatch for anything it does not cover.
+    difficulty*: float
+    enabled*: bool
+    ## Server-side switches, read on the server side only.
+    patchBrains*: bool
+    neutraliseLocationModifiers*: bool
+    logDecisions*: bool
+
+const RoleCount = 8      ## must match the number of `BotRole` members
+
+func roleFromText*(s: string): int =
+  ## Index into `byRole`. Unknown names fall to scav rather than being refused:
+  ## a config naming a bot type this build does not model should not stop the
+  ## mod from loading.
+  case s
+  of "pmc": ord(brPmc)
+  of "raider": ord(brRaider)
+  of "boss": ord(brBoss)
+  of "follower": ord(brFollower)
+  of "goon": ord(brGoon)
+  of "zombie": ord(brZombie)
+  of "playerscav": ord(brPlayerScav)
+  else: ord(brScav)
+
+func roleName*(r: BotRole): string =
+  case r
+  of brScav: "scav"
+  of brPmc: "pmc"
+  of brRaider: "raider"
+  of brBoss: "boss"
+  of brFollower: "follower"
+  of brGoon: "goon"
+  of brZombie: "zombie"
+  of brPlayerScav: "playerscav"
+
+proc applyOverrides(s: var Settings; node: JsonRef) =
+  ## Fold a JSON object of `"settingName": number` over a `Settings`.
+  ##
+  ## A long `case` rather than reflection, because nimony has no runtime field
+  ## lookup and because an explicit list is the only way an unknown key can be
+  ## *reported* rather than silently ignored — a typo in a tuning file that
+  ## quietly does nothing is the worst possible failure mode for a config.
+  if not node.exists or not node.isObject:
+    return
+  let names = node.keys()
+  for key in names:
+    let child = node.child(key)
+    let f = child.asFloat(-99999.0)
+    let b = child.asBool(false)
+    case key
+    of "holdGroundBaseTime": s.holdGroundBaseTime = f
+    of "fightBackHealthThreshold": s.fightBackHealthThreshold = f
+    of "runAwayHealthThreshold": s.runAwayHealthThreshold = f
+    of "timeBeforeSearch": s.timeBeforeSearch = f
+    of "searchGiveUpSeconds": s.searchGiveUpSeconds = f
+    of "engageDistance": s.engageDistance = f
+    of "maxPointFireDistance": s.maxPointFireDistance = f
+    of "dogFightPathStart": s.dogFightPathStart = f
+    of "dogFightPathEnd": s.dogFightPathEnd = f
+    of "rushMaxPathDistance": s.rushMaxPathDistance = f
+    of "rushMaxPathDistanceSprint": s.rushMaxPathDistanceSprint = f
+    of "meleeDistance": s.meleeDistance = f
+    of "creepMaxDistance": s.creepMaxDistance = f
+    of "forgetEnemySeconds": s.forgetEnemySeconds = f
+    of "heardTimeout": s.heardTimeout = f
+    of "visionSeenTimeout": s.visionSeenTimeout = f
+    of "fieldOfViewCos": s.fieldOfViewCos = f
+    of "threatDecayPerSecond": s.threatDecayPerSecond = f
+    of "minSeenTimeToEngage": s.minSeenTimeToEngage = f
+    of "coverMinEnemyDistance": s.coverMinEnemyDistance = f
+    of "maxCoverPathLength": s.maxCoverPathLength = f
+    of "coverMinHeight": s.coverMinHeight = f
+    of "shiftCoverResetTime": s.shiftCoverResetTime = f
+    of "healHealthThreshold": s.healHealthThreshold = f
+    of "surgeryHealthThreshold": s.surgeryHealthThreshold = f
+    of "stimsHealthThreshold": s.stimsHealthThreshold = f
+    of "reloadNoEnemyRatio": s.reloadNoEnemyRatio = f
+    of "reloadInCombatAmmoRatio": s.reloadInCombatAmmoRatio = f
+    of "grenadeAvoidDistance": s.grenadeAvoidDistance = f
+    of "grenadeChance": s.grenadeChance = f
+    of "helpStartDistance": s.helpStartDistance = f
+    of "regroupStartNoEnemy": s.regroupStartNoEnemy = f
+    of "squadSpreadMinDistance": s.squadSpreadMinDistance = f
+    of "suppressionSeekCoverLevel": s.suppressionSeekCoverLevel = f
+    of "suppressionPinnedLevel": s.suppressionPinnedLevel = f
+    of "decisionHz": s.decisionHz = f
+    of "farFromPlayerDistance": s.farFromPlayerDistance = f
+    of "maxBotsPerTick": s.maxBotsPerTick = int(f)
+    of "willSearchForEnemy": s.willSearchForEnemy = b
+    of "canShiftCoverPosition": s.canShiftCoverPosition = b
+    else:
+      warn "sain: config key '" & key & "' is not a setting this build knows"
+
+func difficultyScale(name: string): float =
+  ## SAIN ships six generated difficulty presets. They differ in a dozen
+  ## coefficients; the single scalar here reaches the same behaviour through
+  ## `resolvedFor`, and the per-setting overrides in `config.json` are the
+  ## escape hatch for anything the scalar does not cover.
+  case name
+  of "easy": 0.15
+  of "lessdifficult", "lesshard": 0.35
+  of "default", "normal": 0.5
+  of "harderpmcs": 0.65
+  of "ilikepain", "veryhard": 0.8
+  of "deathwish": 1.0
+  else: 0.5
+
+proc loadPreset*(): Preset =
+  ## Read `config.json` once and resolve it.
+  ##
+  ## The whole document comes back in a single `configGet("")` rather than a
+  ## host call per key. Forty keys is forty marshalled round trips through the
+  ## ABI otherwise, and this runs while the game is loading, when the frame
+  ## budget is already gone.
+  var text = ""
+  discard configGet("", text)
+  let doc = whole(text)
+
+  var base = defaultSettings()
+  let enabled = doc.field("enabled").asBool(true)
+  let difficulty = doc.field("difficulty").asText("default")
+  let scale = difficultyScale(difficulty)
+
+  applyOverrides(base, doc.field("global"))
+
+  var roles: seq[Settings] = @[]
+  var i = 0
+  while i < RoleCount:
+    roles.add base
+    inc i
+
+  let perRole = doc.field("roles")
+  if perRole.exists and perRole.isObject:
+    let names = perRole.keys()
+    for name in names:
+      let idx = roleFromText(name)
+      var s = roles[idx]
+      applyOverrides(s, perRole.child(name))
+      roles[idx] = s
+
+  let forced = personalityFromText(doc.field("forcePersonality").asText(""))
+
+  result = Preset(
+    base: base, byRole: roles, forcePersonality: forced,
+    difficulty: scale, enabled: enabled,
+    patchBrains: doc.field("server.patchBrains").asBool(true),
+    neutraliseLocationModifiers:
+      doc.field("server.neutraliseLocationModifiers").asBool(true),
+    logDecisions: doc.field("logDecisions").asBool(false))
+
+  # The difficulty scale is folded in here rather than at every spawn: a bot
+  # spawning gets `resolvedFor(preset.byRole[role], personality, scale)` and
+  # that is the whole of its setup.
+  var j = 0
+  while j < RoleCount:
+    var s = roles[j]
+    s.aggressionMultiplier = scale
+    result.byRole[j] = s
+    inc j
+
+proc settingsFor*(p: Preset; role: BotRole; personality: Personality;
+                  difficulty: float): Settings =
+  ## What a spawning bot gets. One struct copy and one pass of multiplies —
+  ## no parsing, no lookup by string, no allocation.
+  result = resolvedFor(p.byRole[ord(role)], personality, difficulty)
+
+proc personalityFor*(p: Preset; role: BotRole; roll: float): Personality =
+  ## SAIN's assignment chain — forced, then nickname, then boss table, then a
+  ## weighted roll — reduced to what this port can actually observe. A forced
+  ## personality wins; otherwise the role picks a bias and the roll gives one
+  ## bot in three something else, so a squad is not four identical minds.
+  if p.forcePersonality != pNone:
+    return p.forcePersonality
+  let bias = rolePersonalityBias(role)
+  if roll < 0.66:
+    return bias
+  # The off-bias third, spread over the remaining personalities by role.
+  case role
+  of brPmc, brRaider: (if roll < 0.83: pGigaChad else: pRat)
+  of brBoss, brGoon: (if roll < 0.83: pWreckless else: pSnappingTurtle)
+  of brScav, brPlayerScav: (if roll < 0.83: pCoward else: pTimmy)
+  of brFollower: (if roll < 0.83: pChad else: pTimmy)
+  of brZombie: pWreckless

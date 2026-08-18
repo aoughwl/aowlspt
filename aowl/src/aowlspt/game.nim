@@ -274,6 +274,13 @@ proc invoke*(t: var GameType; member: string; a: bool): CallResult =
 proc invoke*(t: var GameType; member: string; a, b: int): CallResult =
   invoke(t, member, [v(a), v(b)])
 
+proc field*(t: var GameType; name: string): CallResult =
+  ## A static field.
+  invoke(t, "@" & name)
+
+proc setField*(t: var GameType; name: string; value: Value): CallResult =
+  invoke(t, "@" & name, [value])
+
 proc get*(t: var GameType; property: string): CallResult =
   ## A property getter. In IL2CPP a C# property compiles to `get_Name`, so
   ## this is the same call with the convention applied — which is worth
@@ -283,6 +290,139 @@ proc get*(t: var GameType; property: string): CallResult =
 
 proc set*(t: var GameType; property: string; value: Value): CallResult =
   invoke(t, "set_" & property, [value])
+
+# ---------------------------------------------------------------------------
+# Live objects
+# ---------------------------------------------------------------------------
+#
+# A type gets you the static half of the game. Almost everything a mod wants is
+# on the other half: *this* player's health, *this* weapon's animation, *this*
+# world's time. Those are instances, and an instance arrives as the return value
+# of a call -- `GameWorld::get_Instance`, `Player::get_Physical`.
+#
+# The host hands one back as `{"handle":7,"type":"EFT.Player"}`, and the handle
+# is what `invoke` on an object addresses. Underneath it is an IL2CPP GC handle,
+# so holding one across frames is safe in the way holding a raw pointer is not:
+# the collector moves objects, and a pointer that was right last frame is not a
+# pointer that is right this one.
+#
+# The cost of that safety is that a handle must be released. A mod that forgets
+# pins one object for the session -- a leak rather than a crash, which is the
+# right way round for a mistake to fall.
+
+type
+  GameObj* = object
+    ## A live object in the game. `ok` is false for "the call did not return
+    ## one", which is an ordinary answer -- `get_Instance` before the world
+    ## exists returns null, and that is not a failure.
+    handle*: Handle
+    typeName*: string
+    ok*: bool
+
+proc noObject*(): GameObj = GameObj(handle: 0, typeName: "", ok: false)
+
+proc asObject*(r: CallResult): GameObj =
+  ## The object a call returned, if it returned one.
+  result = noObject()
+  if not r.ok:
+    return
+  let at = find(r.raw, "\"handle\":")
+  if at < 0:
+    return
+  var i = at + len("\"handle\":")
+  var n = 0
+  var any = false
+  while i < r.raw.len and r.raw[i] >= '0' and r.raw[i] <= '9':
+    n = n * 10 + (ord(r.raw[i]) - ord('0'))
+    any = true
+    inc i
+  if not any or n <= 0:
+    return
+  var tn = ""
+  let tat = find(r.raw, "\"type\":\"")
+  if tat >= 0:
+    var k = tat + len("\"type\":\"")
+    while k < r.raw.len and r.raw[k] != '"':
+      tn.add r.raw[k]
+      inc k
+  result = GameObj(handle: Handle(n), typeName: tn, ok: true)
+
+proc isObject*(r: CallResult): bool = asObject(r).ok
+
+proc target(o: GameObj): string = "#" & $int(o.handle)
+
+proc invoke*(o: GameObj; member: string;
+             args: openArray[Value] = []): CallResult =
+  ## Calls a member **on this object**.
+  result = CallResult(ok: false, raw: "", error: "")
+  if not o.ok:
+    result.error = "not a live object"
+    return
+  var out1 = ""
+  let st = call(target(o) & "::" & member, argsJson(args), out1)
+  if st == Ok:
+    result.ok = true
+    result.raw = out1
+  else:
+    result.error = lastError()
+
+proc invoke*(o: GameObj; member: string; a: Value): CallResult =
+  invoke(o, member, [a])
+proc invoke*(o: GameObj; member: string; a, b: Value): CallResult =
+  invoke(o, member, [a, b])
+proc invoke*(o: GameObj; member: string; a, b, c: Value): CallResult =
+  invoke(o, member, [a, b, c])
+proc invoke*(o: GameObj; member: string; a: int): CallResult =
+  invoke(o, member, [v(a)])
+proc invoke*(o: GameObj; member: string; a: float): CallResult =
+  invoke(o, member, [v(a)])
+proc invoke*(o: GameObj; member: string; a: string): CallResult =
+  invoke(o, member, [v(a)])
+proc invoke*(o: GameObj; member: string; a: bool): CallResult =
+  invoke(o, member, [v(a)])
+
+proc get*(o: GameObj; property: string): CallResult =
+  invoke(o, "get_" & property)
+
+proc set*(o: GameObj; property: string; value: Value): CallResult =
+  invoke(o, "set_" & property, [value])
+
+proc field*(o: GameObj; name: string): CallResult =
+  ## A **field**, not a property.
+  ##
+  ## `get`/`set` reach a C# property, which compiles to `get_X`/`set_X`. A field
+  ## has no method behind it and is unreachable that way -- and a great deal of
+  ## what a mod wants to read on this game is a field, often a private one.
+  ## Reaching it is not a trick: reflection is what the runtime provides for it.
+  invoke(o, "@" & name)
+
+proc setField*(o: GameObj; name: string; value: Value): CallResult =
+  invoke(o, "@" & name, [value])
+
+proc child*(o: GameObj; property: string): GameObj =
+  ## The object a property returns -- `player.child("Physical")`. Walking a
+  ## chain of these is how a mod gets from a world to a weapon.
+  result = asObject(get(o, property))
+
+proc alive*(o: GameObj): bool =
+  ## Whether the object is still there. A handle to something the collector has
+  ## taken answers false rather than crashing when it is next used, and this is
+  ## how a mod can ask before it tries.
+  if not o.ok:
+    return false
+  var out1 = ""
+  result = call(target(o) & "::GetType", "[]", out1) == Ok
+
+proc release*(o: GameObj) =
+  ## Lets go. A handle held for the session is a pinned object.
+  if o.ok:
+    release(o.handle)
+
+proc instanceOf*(t: var GameType; property: string = "Instance"): GameObj =
+  ## The singleton behind a type -- `GameWorld`, `CameraManager` and most of the
+  ## game's managers expose exactly this. Separated out because reaching for the
+  ## singleton is the first thing almost every client mod does.
+  result = asObject(get(t, property))
 
 # ---------------------------------------------------------------------------
 # Hooks

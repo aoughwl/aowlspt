@@ -398,6 +398,25 @@ proc exampleDirs(e: Env): seq[string] =
       continue
     result.add joinPath(examples, d)
 
+proc modDirs(e: Env): seq[string] =
+  ## Every mod under `mods/`. Separate from `examples/` because these are real
+  ## mods rather than teaching material -- the emulator, and the ports -- and
+  ## because `aowl build` should not quietly stop covering them the moment one
+  ## more appears.
+  result = @[]
+  let root = joinPath(e.repo, "mods")
+  if not isDirectory(root):
+    return
+  var files: seq[string] = @[]
+  var dirs: seq[string] = @[]
+  collectEntries(root, files, dirs)
+  for d in dirs:
+    if find(d, "\\") >= 0:
+      continue
+    if d == "bin" or d == "nimcache":
+      continue
+    result.add joinPath(root, d)
+
 # --------------------------------------------------------------- commands
 
 proc abiStamp(e: Env): string =
@@ -481,6 +500,10 @@ proc cmdBuild(e: Env): int =
   heading "Examples"
   let mods = exampleDirs(e)
   for m in mods:
+    discard buildMod(e, m)
+  heading "Mods"
+  let real = modDirs(e)
+  for m in real:
     discard buildMod(e, m)
   result = if failures > 0: 1 else: 0
 
@@ -621,6 +644,13 @@ proc cmdTest(e: Env): int =
         discard copyFileAt(
           joinPath(e.repo, "mods\\tarkov\\config.json"),
           joinPath(estage, "mods\\tarkov\\config.json"))
+      # A database with a trader, an assort, a handbook price and a stash grid
+      # in it. Without one the emulator answers out of its fallbacks, which is a
+      # path worth testing and not the only one -- buying something requires a
+      # trader who has it and a price to pay.
+      discard copyFileAt(
+        joinPath(e.repo, "tests\\fixtures\\emu-db.json"),
+        joinPath(estage, "db.json"))
       let emutest = joinPath(e.repo, "installer\\build\\emutest.exe")
       if fileExists(emutest):
         discard run(e, "the emulator boots a client",
@@ -634,6 +664,16 @@ proc cmdTest(e: Env): int =
     "host\\Aowlspt.Sim\\bin\\Release\\net10.0\\aowlspt-sim.exe")
   let mods = exampleDirs(e)
   for m in mods:
+    if buildMod(e, m) and fileExists(sim):
+      discard run(e, "sim " & baseName(m),
+                  quoted(sim) & " " & quoted(m) & " --side sim --ticks 3")
+
+  # And the real mods. They are the reason the pipeline exists, so "it still
+  # builds" is not the bar -- each one has to load through the ABI and survive a
+  # few ticks. Several carry their own self-tests and run them here.
+  heading "Mods through the simulator"
+  let realMods = modDirs(e)
+  for m in realMods:
     if buildMod(e, m) and fileExists(sim):
       discard run(e, "sim " & baseName(m),
                   quoted(sim) & " " & quoted(m) & " --side sim --ticks 3")
@@ -689,7 +729,12 @@ proc cmdPayload(e: Env): int =
         inc copied
     say name & " host -> " & joinPath(dest, name)
 
-  let mods = exampleDirs(e)
+  # Examples first, then the real mods -- the emulator and the ports, which are
+  # the reason someone installs this at all.
+  var mods = exampleDirs(e)
+  let realMods = modDirs(e)
+  for m in realMods:
+    mods.add m
   for m in mods:
     let bin = joinPath(m, "bin")
     if not isDirectory(bin):

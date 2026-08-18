@@ -134,6 +134,8 @@ proc checkLog(logPath: string; expectRuntime: bool = false): int =
   var calledOk = false
   var patchFired = false
   var argsOk = false
+  var objectOk = false
+  var fieldOk = false
   for l in splitLines(text):
     if find(l, "host running") >= 0:
       started = true
@@ -152,6 +154,16 @@ proc checkLog(logPath: string; expectRuntime: bool = false): int =
       patchFired = true
     if find(l, "Add(17, 25) = 42") >= 0:
       argsOk = true
+    # The instance half. "took this player from" is only printed when a method
+    # ran against a live object *and* the change stuck to it -- a host that
+    # invoked with a null `this`, or against a copy, cannot produce that line.
+    if find(l, "the change is on the object") >= 0:
+      objectOk = true
+    # A field read that agrees with the property getter for the same storage.
+    # Either alone can be plausibly wrong; agreeing is what makes the offset
+    # right rather than lucky.
+    if find(l, "field agrees with get_") >= 0:
+      fieldOk = true
 
   heading "Result"
   if not started:
@@ -190,6 +202,14 @@ proc checkLog(logPath: string; expectRuntime: bool = false): int =
     err "no patch fired"
     return 1
   ok "a compiled method was detoured and the patch fired"
+  if not objectOk:
+    err "no live object was reached; instance calls did not work"
+    return 1
+  ok "a live object was reached and an instance call changed it"
+  if not fieldOk:
+    err "no field was read; reflection over fields did not work"
+    return 1
+  ok "a field was read by declared type and agreed with its property"
   result = 0
 
 proc runInjection(hostDll, logPath, target: string; seconds: int): int =

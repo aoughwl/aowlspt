@@ -15,6 +15,7 @@ import aowlspt/game
 var Player = gameType("EFT.Player")
 var Application = gameType("UnityEngine.Application")
 
+var GameWorld = gameType("EFT.GameWorld")
 var world = whenReady("EFT.GameWorld")
 var ticks = 0
 var hookFires = 0
@@ -60,6 +61,62 @@ proc onWorldReady() =
   let bad = Player.invoke("Add", "seventeen")
   if bad.failed:
     success "a mistyped argument was refused: " & bad.error
+
+  # Live objects. Everything above this line is static -- the half of the game
+  # that needs no `this`. What a mod actually wants is on the other half: this
+  # world, this player, this player's health.
+  let instanceCall = GameWorld.get("Instance")
+  let gameWorld = instanceCall.asObject()
+  if gameWorld.ok:
+    success "the world instance is a " & gameWorld.typeName
+    let player = gameWorld.child("MainPlayer")
+    if player.ok:
+      success "and its main player is a " & player.typeName
+      let before = player.get("Health").asFloat()
+      let after = player.invoke("Damage", 25.0).asFloat()
+      if after == before - 25.0:
+        success "Damage(25) took this player from " & $before & " to " & $after
+      else:
+        warn "health went from " & $before & " to " & $after &
+             ", which is not what damaging this player should do"
+      # A second read proves it stuck on the object rather than on a copy.
+      let again = player.get("Health").asFloat()
+      if again == after:
+        success "and the change is on the object, not a copy"
+      else:
+        warn "the object did not keep the change: " & $again
+      # A field, which no property getter reaches. `Level` is a plain field on
+      # the mock exactly as half the game's interesting state is on the real
+      # thing.
+      # The strong version of the check: the field and the property getter must
+      # agree. They read the same storage by two different mechanisms, so a
+      # wrong field offset shows up here rather than as a number that merely
+      # looks plausible.
+      let byField = player.field("Health")
+      if byField.ok and byField.asFloat() == again:
+        success "the Health field agrees with get_Health: " & $byField.asFloat()
+      else:
+        warn "the Health field says " & byField.raw & " but get_Health said " &
+             $again
+
+      let lvl = player.field("Level")
+      if lvl.ok:
+        success "the Level field reads " & $lvl.asInt()
+        if player.setField("Level", v(7)).ok and
+           player.field("Level").asInt() == 7:
+          success "and writing it stuck"
+        else:
+          warn "writing the Level field did not stick"
+      else:
+        warn "could not read the Level field: " & lvl.error
+
+      player.release()
+    else:
+      warn "no main player: " & gameWorld.get("MainPlayer").error
+    gameWorld.release()
+  else:
+    warn "no world instance: " & (if instanceCall.ok: "returned " &
+                                  instanceCall.raw else: instanceCall.error)
 
   if not hooked:
     hooked = true

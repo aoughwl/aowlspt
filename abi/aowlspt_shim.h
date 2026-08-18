@@ -563,6 +563,23 @@ static void* aowl_read_ptr(void* p, int32_t off) {
 
 static int32_t aowl_read_i32(void* p) { return p ? *(int32_t*)p : 0; }
 static int64_t aowl_read_i64(void* p) { return p ? *(int64_t*)p : 0; }
+/* A 16-byte scratch cell.
+ *
+ * A field is read out of an object into raw memory rather than into a boxed
+ * object -- `il2cpp_field_get_value` writes the value itself, not a reference
+ * to one -- so something has to own the bytes for the length of the call.
+ * Sixteen because that covers every primitive and a pointer with room to spare;
+ * a value type larger than that is not something this path can read anyway, and
+ * refusing it is better than writing past the end. */
+static void* aowl_cell_new(void)  { return calloc(1, 16); }
+static void  aowl_cell_free(void* p) { free(p); }
+static void  aowl_cell_set_i32(void* p, int32_t v) { if (p) *(int32_t*)p = v; }
+static void  aowl_cell_set_i64(void* p, int64_t v) { if (p) *(int64_t*)p = v; }
+static void  aowl_cell_set_f32(void* p, double v)  { if (p) *(float*)p = (float)v; }
+static void  aowl_cell_set_f64(void* p, double v)  { if (p) *(double*)p = v; }
+static void  aowl_cell_set_ptr(void* p, void* v)   { if (p) *(void**)p = v; }
+static void* aowl_cell_get_ptr(void* p)            { return p ? *(void**)p : NULL; }
+
 static double  aowl_read_f32(void* p) { return p ? (double)*(float*)p : 0.0; }
 static double  aowl_read_f64(void* p) { return p ? *(double*)p : 0.0; }
 

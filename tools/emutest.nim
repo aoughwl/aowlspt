@@ -104,6 +104,16 @@ proc idOfTemplate(body, tpl: string): string =
     dec i
   result = ""
 
+proc countOf(haystack, needle: string): int =
+  result = 0
+  var i = 0
+  while i < haystack.len:
+    let at = find(haystack.substr(i), needle)
+    if at < 0:
+      return
+    inc result
+    i = i + at + needle.len
+
 proc raidProfile(listBody, uid: string): string =
   ## The profile out of a `profile/list` response, with its experience changed,
   ## as the client would hand it back after a raid. Cut out of the response text
@@ -222,8 +232,22 @@ proc main(): int =
   discard expectIn("game config", "/client/game/config", "", "\"err\":0")
   discard expectIn("version validate", "/client/game/version/validate",
                    "{\"version\":{\"major\":\"1.1.0\"}}", "isvalid")
-  discard expectIn("no profiles on a fresh install",
-                   "/client/game/profile/list", "", "\"data\":[]")
+  # Fresh-root check, and it stops the run rather than logging a failure.
+  #
+  # Every check after this one assumes an empty store: the nickname must be
+  # free, the hideout area must be at level zero, the profile the raid section
+  # hands back must be the one this run created. Run against a root left over
+  # from a previous run and all of that fails in ways that describe the previous
+  # run rather than this one -- five confusing failures instead of one
+  # actionable line.
+  let fresh = call("/client/game/profile/list", "")
+  if not fresh.ok or not fresh.contains("\"data\":[]"):
+    err "this root already has profiles in it; emutest needs an empty store"
+    note "delete " & root & "\\store and run again"
+    cSpawnKill(proc1)
+    return 1
+  ok "no profiles on a fresh install"
+  inc gChecks
 
   heading "Creating a profile"
   let created = call("/client/game/profile/create",
@@ -318,6 +342,89 @@ proc main(): int =
         bogus.ok and bogus.contains("warnings") and bogus.contains("no such item"),
         bogus.body)
 
+  heading "Trading"
+  # These need the database fixture: a trader who has something, a price to pay
+  # for it, and a handbook price to sell it back at. Skipped rather than failed
+  # when the server was started without one, because the emulator answering out
+  # of its fallbacks is a supported way to run it.
+  let traders = call("/client/trading/api/traderSettings", "")
+  let haveFixture = traders.contains("Prapor")
+  if haveFixture:
+    ok "the database's trader is there"
+    inc gChecks
+    discard expectIn("and so is the offer",
+                     "/client/trading/api/getTraderAssort/54cb50c76803fa8b248b4571",
+                     "", "aaaaaaaaaaaaaaaaaaaaaaa1")
+
+    let bought = call("/client/game/profile/items/moving",
+      "{\"data\":[{\"Action\":\"TradingConfirm\",\"type\":\"buy_from_trader\"," &
+      "\"tid\":\"54cb50c76803fa8b248b4571\",\"item_id\":\"aaaaaaaaaaaaaaaaaaaaaaa1\"," &
+      "\"count\":1,\"scheme_id\":0,\"scheme_items\":[{\"id\":\"" & moneyId &
+      "\",\"count\":25000}]}],\"tm\":2}")
+    check("buying takes the money and gives the item",
+          bought.ok and bought.contains("5644bd2b4bdc2d3b4c8b4572"), bought.body)
+    check("and the payment came out of the right stack",
+          bought.contains("475000"), bought.body)
+    check("and the new item was given a position in the stash",
+          bought.contains("\"location\""), bought.body)
+
+    let boughtId = idOfTemplate(call("/client/game/profile/list", "").body,
+                                "5644bd2b4bdc2d3b4c8b4572")
+    check("the bought item is in the profile", boughtId.len == 24, boughtId)
+
+    let sold = call("/client/game/profile/items/moving",
+      "{\"data\":[{\"Action\":\"TradingConfirm\",\"type\":\"sell_to_trader\"," &
+      "\"tid\":\"54cb50c76803fa8b248b4571\",\"items\":[{\"id\":\"" & boughtId &
+      "\",\"count\":1,\"scheme_id\":0}]}],\"tm\":2}")
+    check("selling it back pays the handbook price",
+          sold.ok and sold.contains("22000"), sold.body)
+
+    # And the refusal: paying from a stack that does not hold enough must take
+    # nothing at all, rather than taking what is there.
+    let broke = call("/client/game/profile/items/moving",
+      "{\"data\":[{\"Action\":\"TradingConfirm\",\"type\":\"buy_from_trader\"," &
+      "\"tid\":\"54cb50c76803fa8b248b4571\",\"item_id\":\"aaaaaaaaaaaaaaaaaaaaaaa1\"," &
+      "\"count\":1,\"scheme_items\":[{\"id\":\"" & moneyId &
+      "\",\"count\":99999999}]}],\"tm\":2}")
+    check("a payment larger than the stack is refused",
+          broke.contains("not enough in that stack"), broke.body)
+  else:
+    note "no database fixture; skipping the trading checks"
+
+  heading "Quests and the hideout"
+  # Both arrive down the same endpoint as the drags, and the emulator has to
+  # tell them apart from an inventory action rather than trying to move an item
+  # that is a quest id.
+  let accepted = call("/client/game/profile/items/moving",
+    "{\"data\":[{\"Action\":\"QuestAccept\",\"qid\":\"59c50c1686f7745fed3193bf\"}],\"tm\":2}")
+  check("a quest can be accepted",
+        accepted.ok and accepted.contains("\"err\":0"), accepted.body)
+  discard expectIn("and the profile records it as started",
+                   "/client/game/profile/list", "", "\"Started\"")
+
+  let completed = call("/client/game/profile/items/moving",
+    "{\"data\":[{\"Action\":\"QuestComplete\",\"qid\":\"59c50c1686f7745fed3193bf\"}],\"tm\":2}")
+  check("and completed", completed.ok and completed.contains("\"err\":0"),
+        completed.body)
+  discard expectIn("which the profile records as a success",
+                   "/client/game/profile/list", "", "\"Success\"")
+
+  let upgrade = call("/client/game/profile/items/moving",
+    "{\"data\":[{\"Action\":\"HideoutUpgrade\",\"areaType\":3}],\"tm\":2}")
+  check("a hideout area can be upgraded", upgrade.ok, upgrade.body)
+  let finished = call("/client/game/profile/items/moving",
+    "{\"data\":[{\"Action\":\"HideoutUpgradeComplete\",\"areaType\":3}],\"tm\":2}")
+  check("and the upgrade completes", finished.ok, finished.body)
+  discard expectIn("leaving the area at level 1",
+                   "/client/game/profile/list", "", "\"level\":1")
+
+  # The refusal that matters: a complete with no upgrade in progress is either a
+  # replayed request or a client out of step, and granting it is a free level.
+  let freeLevel = call("/client/game/profile/items/moving",
+    "{\"data\":[{\"Action\":\"HideoutUpgradeComplete\",\"areaType\":3}],\"tm\":2}")
+  check("a second complete is refused",
+        freeLevel.contains("not being upgraded"), freeLevel.body)
+
   heading "A raid"
   discard expectIn("raid configuration is accepted",
                    "/client/raid/configuration",
@@ -348,6 +455,40 @@ proc main(): int =
                    "/client/match/local/end",
                    "{\"exit\":\"Survived\",\"profile\":{\"_id\":" &
                    "\"cccccccccccccccccccccccc\"}}", "different profile")
+
+  heading "Bots"
+  let bots = call("/client/game/bot/generate",
+    "{\"conditions\":[{\"Role\":\"assault\",\"Limit\":3,\"Difficulty\":\"normal\"}]}")
+  check("a batch of bots is generated", bots.ok and bots.contains("assault"),
+        bots.body)
+  # Three requested, three delivered. Counting the equipment template is the
+  # cheap way to count bots without parsing: every bot has exactly one.
+  check("three of them", countOf(bots.body, "55d7217a4bdc2d86028b456d") == 3,
+        $countOf(bots.body, "55d7217a4bdc2d86028b456d") & " found")
+  check("each one has a body to render",
+        bots.contains("\"BodyParts\""), bots.body)
+
+  let huge = call("/client/game/bot/generate",
+    "{\"conditions\":[{\"Role\":\"assault\",\"Limit\":5000,\"Difficulty\":\"normal\"}]}")
+  check("an absurd request is capped rather than honoured",
+        huge.ok and countOf(huge.body, "55d7217a4bdc2d86028b456d") <= 64,
+        $countOf(huge.body, "55d7217a4bdc2d86028b456d") & " bots")
+
+  heading "Mail and insurance"
+  discard expectIn("an empty inbox is an empty list, not an error",
+                   "/client/mail/dialog/list", "", "\"data\":[]")
+  # Priced off the handbook, so it needs the fixture for the same reason trading
+  # does. Without one the right answer is an empty quote, and checking for a
+  # number there would be checking that the server invented a price.
+  let quote = call("/client/insurance/items/list/cost",
+                   "{\"traders\":[\"54cb50c76803fa8b248b4571\"]," &
+                   "\"items\":[\"5644bd2b4bdc2d3b4c8b4572\"]}")
+  if haveFixture:
+    check("insurance quotes a premium from the handbook",
+          quote.contains("2200"), quote.body)
+  else:
+    check("with no handbook, insurance quotes nothing rather than zero",
+          quote.ok and not quote.contains(":0}"), quote.body)
 
   # -- the part that only a restart can prove -------------------------------
 

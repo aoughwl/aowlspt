@@ -114,3 +114,19 @@ proc itemStackLimit*(tpl: string): int =
     return 0
   result = v.asInt(0)
   if result < 0: result = 0
+
+proc handbookPrice*(tpl: string): int =
+  ## What the handbook says an item is worth, or zero when it says nothing.
+  ##
+  ## Zero is a refusal, not a price. A caller that pays it would let a player
+  ## sell a rifle for nothing on a server whose database has no handbook -- and
+  ## the item is gone either way, so "I do not know what this is worth" has to
+  ## be a different answer from "it is worth nothing".
+  result = 0
+  let hb = dbRead("templates.handbook.Items")
+  if not hb.ok:
+    return
+  let list = each(whole(hb.raw))
+  for entry in list:
+    if entry.field("Id").asText("") == tpl:
+      return entry.field("Price").asInt(0)
