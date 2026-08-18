@@ -1,0 +1,4 @@
+# The tree is Windows-native and mixed CRLF/LF by history. Normalising on
+# commit would rewrite files agents are actively editing and produce a diff of
+# every line in half the repo, so line endings are left exactly as written.
+* -text
