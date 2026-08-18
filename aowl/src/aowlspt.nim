@@ -252,11 +252,29 @@ proc emit*(event {.byref.}: string; payload {.byref.}: string = ""): Status =
   if not hostReady(): return ErrBadArg
   gHost.eventEmit(gHost.ctx, slice(event), slice(payload))
 
-proc patch*(target {.byref.}: string; kind: PatchKind; handler: PatchHandler): Status =
-  ## Harmony-patch a host method named "Namespace.Type::Method".
+const PatchArgsFlag* = 0x10'i32
+  ## OR'd into `kind` to ask the host for the original arguments.
+  ##
+  ## Opt-in, because decoding them costs a JSON build inside a method the game
+  ## may call thousands of times a frame. A patch that only wants to know *that*
+  ## something happened should not pay for what it was called with.
+
+proc patch*(target {.byref.}: string; kind: PatchKind; handler: PatchHandler;
+            withArgs = false): Status =
+  ## Patch a host method named "Namespace.Type::Method".
+  ##
+  ## With `withArgs`, the handler receives the arguments as a JSON array in the
+  ## same shape `call` accepts, and may return `patchReplace(...)` to suppress
+  ## the original and hand back a result of the method's declared return type.
+  ## Without it, the handler is told the method fired and nothing more, and a
+  ## `patchReplace` it returns is refused rather than honoured -- a mod that
+  ## believes it is suppressing when it is not would be debugging the game
+  ## instead of its own registration.
   if not hostReady(): return ErrBadArg
   gPatches.add handler
-  gHost.patch(gHost.ctx, slice(target), int32(ord(kind)),
+  var k = int32(ord(kind))
+  if withArgs: k = k or PatchArgsFlag
+  gHost.patch(gHost.ctx, slice(target), k,
               patchTrampoline, toCookie(gPatches.len - 1))
 
 proc after*(delayMs: int; handler: TickHandler): Status =

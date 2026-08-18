@@ -431,6 +431,32 @@ proc instanceOf*(t: var GameType; property: string = "Instance"): GameObj =
 type
   HookHandler* = proc (target: string)
 
+  ArgHookHandler* = proc (target, args: string): HookResult
+    ## A hook that is told what the method was called with, and may answer.
+    ##
+    ## `args` is a JSON array in the same shape `call` takes, so it is read with
+    ## `aowlspt/json` exactly like a request body on the server side. A
+    ## reference argument arrives as `{"handle":n,...}` -- the live object the
+    ## game was about to act on, which is usually the reason to want the
+    ## arguments at all.
+
+  HookResult* = object
+    ## What a hook decided. `stop` suppresses the original; `replaceWith` is the
+    ## value the caller gets instead, as JSON, and must match the method's
+    ## declared return type or the suppression is refused.
+    stop*: bool
+    replaceWith*: string
+
+func carryOn*(): HookResult = HookResult(stop: false, replaceWith: "")
+
+func stopWith*(json: string): HookResult =
+  ## Suppress the original and return this value instead.
+  HookResult(stop: true, replaceWith: json)
+
+func stopVoid*(): HookResult =
+  ## Suppress a method that returns nothing.
+  HookResult(stop: true, replaceWith: "null")
+
 ## Hooks are kept as two parallel sequences and dispatched by matching the
 ## target name the host hands back.
 ##
@@ -446,19 +472,60 @@ type
 var gHookTargets: seq[string] = @[]
 var gHookHandlers: seq[HookHandler] = @[]
 
+var gArgHookTargets: seq[string] = @[]
+var gArgHookHandlers: seq[ArgHookHandler] = @[]
+
 proc hookDispatch(target, args: string): PatchResult =
   for i in 0 ..< gHookTargets.len:
     if gHookTargets[i] == target:
       gHookHandlers[i](target)
   patchContinue()
 
+proc argHookDispatch(target, args: string): PatchResult =
+  ## The first handler that asks to stop wins, and the rest still run.
+  ##
+  ## Running the rest is deliberate: two mods hooking the same method are not
+  ## in a race, and one deciding to suppress the original is not a reason the
+  ## other should stop being told the method fired. Only the *decision* is
+  ## first-wins, because there is one original and it either runs or does not.
+  var decided = false
+  var answer = ""
+  for i in 0 ..< gArgHookTargets.len:
+    if gArgHookTargets[i] != target:
+      continue
+    let r = gArgHookHandlers[i](target, args)
+    if r.stop and not decided:
+      decided = true
+      answer = r.replaceWith
+  if decided:
+    return patchReplace(if answer.len > 0: answer else: "null")
+  patchContinue()
+
+proc hookArgs*(target: string; handler: ArgHookHandler): Status =
+  ## Be told whenever a game method runs, **with its arguments**, and be able to
+  ## stop it.
+  ##
+  ## This is the full Harmony prefix: read what the method was called with, and
+  ## return `stopWith(...)` to keep it from running at all. The cost over `hook`
+  ## is one JSON array built per call, which is why it is a separate function
+  ## rather than the default -- a hook on a method the game calls every frame
+  ## for every bot should be a `hook`.
+  ##
+  ## Arguments past the fourth arrive on the stack and are not reported. They
+  ## are omitted rather than guessed at.
+  gArgHookTargets.add target
+  gArgHookHandlers.add handler
+  result = patch(target, pkPrefix, argHookDispatch, withArgs = true)
+  if result != Ok:
+    shrink(gArgHookTargets, gArgHookTargets.len - 1)
+    shrink(gArgHookHandlers, gArgHookHandlers.len - 1)
+
 proc hook*(target: string; handler: HookHandler): Status =
   ## Be told whenever a game method runs.
   ##
-  ## This is the client-side equivalent of a Harmony prefix, and it inherits
-  ## the host's two limits: the handler cannot read the method's arguments and
-  ## cannot stop the original from running. Both are reported by the ABI rather
-  ## than silently approximated — see docs/IL2CPP.md.
+  ## The cheap one: it costs a name comparison and nothing else, and the handler
+  ## is told only that the method fired. Use `hookArgs` when you need to know
+  ## what it was called with or want to stop it.
   gHookTargets.add target
   gHookHandlers.add handler
   result = patch(target, pkPrefix, hookDispatch)

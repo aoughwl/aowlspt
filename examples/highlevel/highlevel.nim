@@ -20,6 +20,10 @@ var world = whenReady("EFT.GameWorld")
 var ticks = 0
 var hookFires = 0
 var hooked = false
+var argHooked = false
+var skipHooked = false
+var argHookFires = 0
+var lastArgs = ""
 
 proc onLoad(): Status =
   success "highlevel loaded on " & hostName()
@@ -117,6 +121,42 @@ proc onWorldReady() =
   else:
     warn "no world instance: " & (if instanceCall.ok: "returned " &
                                   instanceCall.raw else: instanceCall.error)
+
+  # A hook that reads the arguments. `Hurt(amount, kind)` is a compiled
+  # instance method in the stand-in, with the signature a real one has, so this
+  # exercises the whole path: this in RCX, the float in XMM1, the int in R8.
+  if not argHooked:
+    argHooked = true
+    if hookArgs("EFT.Player::Hurt",
+                proc (target, args: string): HookResult =
+                  lastArgs = args
+                  inc argHookFires
+                  carryOn()) == Ok:
+      success "hooked EFT.Player::Hurt with arguments"
+      let player2 = GameWorld.instanceOf().child("MainPlayer")
+      if player2.ok:
+        discard player2.invoke("Hurt", v(12.5), v(2))
+        if lastArgs == "[12.5,2]":
+          success "the hook saw its arguments: " & lastArgs
+        else:
+          warn "the hook saw " & lastArgs & ", expected [12.5,2]"
+        player2.release()
+    else:
+      warn "could not hook with arguments: " & lastError()
+
+  # And suppression: a static method, patched to answer without running.
+  if not skipHooked:
+    skipHooked = true
+    if hookArgs("EFT.Player::Boost",
+                proc (target, args: string): HookResult =
+                  stopWith("99.0")) == Ok:
+      let scaled2 = Player.invoke("Boost", 2.5)
+      if scaled2.ok and scaled2.asFloat() == 99.0:
+        success "the patch suppressed the original and returned 99.0"
+      else:
+        warn "suppression returned " & scaled2.raw & ", expected 99.0"
+    else:
+      warn "could not install the suppressing patch: " & lastError()
 
   if not hooked:
     hooked = true

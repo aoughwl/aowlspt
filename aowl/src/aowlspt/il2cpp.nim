@@ -91,6 +91,7 @@ proc ti32P(f, a: Il2CppPtr): int32 {.importc: "aowl_i32_p", nodecl.}
 proc tu32P(f, a: Il2CppPtr): uint32 {.importc: "aowl_u32_p", nodecl.}
 proc tzP(f, a: Il2CppPtr): uint64 {.importc: "aowl_z_p", nodecl.}
 proc tu32PI(f, a: Il2CppPtr; i: int32): uint32 {.importc: "aowl_u32_pi", nodecl.}
+proc tu32PP(f, a, b: Il2CppPtr): uint32 {.importc: "aowl_u32_pp", nodecl.}
 
 proc byteAt(p: Il2CppPtr; i: uint64): uint8 {.importc: "aowl_byte_at", nodecl.}
 proc readPtr(p: Il2CppPtr; off: int32): Il2CppPtr {.
@@ -123,9 +124,13 @@ type
     eTypeGetName, eTypeGetObject,
     eThreadAttach, eThreadDetach, eThreadCurrent,
     eGcHandleNew, eGcHandleGetTarget, eGcHandleFree,
-    eFree
+    eFree,
+    ## Appended rather than inserted: the enum's order is the order of
+    ## `EntryNames`, and moving an existing member renames every entry
+    ## after it without changing a line of this file.
+    eMethodGetFlags
 
-const NumEntries* = 57
+const NumEntries* = 58
 
 const EntryNames*: array[NumEntries, string] = [
   "il2cpp_set_data_dir", "il2cpp_set_config_dir", "il2cpp_init",
@@ -156,7 +161,7 @@ const EntryNames*: array[NumEntries, string] = [
   "il2cpp_type_get_name", "il2cpp_type_get_object",
   "il2cpp_thread_attach", "il2cpp_thread_detach", "il2cpp_thread_current",
   "il2cpp_gchandle_new", "il2cpp_gchandle_get_target", "il2cpp_gchandle_free",
-  "il2cpp_free"
+  "il2cpp_free", "il2cpp_method_get_flags"
 ]
 
 ## The entry points the host cannot work without, as opposed to the ones it
@@ -628,3 +633,16 @@ proc fullName*(rt: Il2Cpp; c: Il2CppClass): string =
     result = n
   else:
     result = ns & "." & n
+
+proc methodFlags*(rt: Il2Cpp; m: Il2CppMethod): uint32 =
+  ## The method's attribute flags. Bit 0x10 is `static`, which is the one thing
+  ## the detour path needs: a compiled instance method takes `this` in the first
+  ## argument register and a static one does not, so getting this wrong shifts
+  ## every argument by one and reports the wrong values with total confidence.
+  if not rt.has(eMethodGetFlags): return 0'u32
+  var iflags = 0'u32
+  result = tu32PP(rt.fns[ord(eMethodGetFlags)], m,
+                  cast[Il2CppPtr](addr iflags))
+
+proc methodIsStatic*(rt: Il2Cpp; m: Il2CppMethod): bool =
+  result = (methodFlags(rt, m) and 0x10'u32) != 0'u32

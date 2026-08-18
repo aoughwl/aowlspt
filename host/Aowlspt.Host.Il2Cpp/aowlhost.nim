@@ -93,6 +93,13 @@ proc cOutCopy(outPtr: Il2CppPtr; outLen: Il2CppPtr; src: Il2CppPtr;
               len: int32): int32 {.importc: "aowl_out_copy", nodecl.}
 proc cInvokeCallback(cb, user, payload: Il2CppPtr; len: int32): int32 {.
   importc: "aowl_invoke_callback", nodecl.}
+proc cFreeBuf(p: Il2CppPtr) {.importc: "aowl_host_release", nodecl.}
+
+proc cInvokePatchArgs(cb, user, target: Il2CppPtr; tlen: int32;
+                      args: Il2CppPtr; alen: int32;
+                      outPtr, outLen: Il2CppPtr): int32 {.
+  importc: "aowl_invoke_patch_args", nodecl.}
+
 proc cInvokePatch(cb, user, target: Il2CppPtr; tlen: int32): int32 {.
   importc: "aowl_invoke_patch", nodecl.}
 proc cByteAt(p: Il2CppPtr; i: uint64): uint8 {.importc: "aowl_byte_at", nodecl.}
@@ -110,6 +117,7 @@ const
   HostVersion = "0.1.0"
 
   StatusOk = 0'i32
+  PatchSkipStatus = 1'i32
   ErrGeneric = -1'i32
   ErrNotFound = -3'i32
   ErrBadArg = -4'i32
@@ -146,6 +154,16 @@ type
     ## runs inside a patched game method and must not allocate.
     targetC: seq[byte]
     live: bool
+    ## The method itself, kept so the firing path can decode the arguments
+    ## against its declared signature without looking anything up.
+    meth: Il2CppMethod
+    ## Whether this patch asked for arguments. Decoding them builds a JSON
+    ## array inside a method the game may call thousands of times a frame, so
+    ## it is opt-in: a patch that only counts calls does not pay for it.
+    wantArgs: bool
+    ## Whether the patch may suppress the original. A patch that returns
+    ## `PatchSkip` without having asked is a mistake, not an instruction.
+    canSkip: bool
 
   Sub = object
     ## An event subscription. Client-side events are how one mod tells another
@@ -533,28 +551,75 @@ proc hostEventEmit(ctx: Il2CppPtr; name: Il2CppPtr; nameLen: int32;
     info "event " & n & " (no subscribers)"
   result = StatusOk
 
-proc patchFired(slot: int32) {.exportc: "aowlspt_nim_patch_fired", cdecl.} =
+proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
+    exportc: "aowlspt_nim_patch_fired", cdecl.} =
   ## Called from the detour thunk, on the game thread, inside the patched
-  ## method. Everything here is on that path, so it does the minimum: find the
-  ## callback and call it. No logging, no allocation.
+  ## method, with every argument register saved in `regs`.
+  ##
+  ## Returns 0 to let the original run and 1 to suppress it. Suppression is the
+  ## sharpest thing this file does: the original never executes, and whatever is
+  ## left in the return register is what the game gets. So it happens only when
+  ## the patch asked for it *and* a return value of the declared type could
+  ## actually be produced -- a skip with garbage in RAX is worse than no skip.
+  ##
+  ## The cheap path stays cheap. A patch that did not ask for arguments does no
+  ## decoding, no allocation and no logging, exactly as before.
   let i = int(slot)
   if i < 0 or i >= gPatches.len:
-    return
+    return 0'i32
   if not gPatches[i].live:
-    return
-  discard cInvokePatch(gPatches[i].cb, gPatches[i].user,
-                       cast[Il2CppPtr](addr gPatches[i].targetC[0]),
-                       int32(gPatches[i].targetC.len - 1))
+    return 0'i32
+
+  var argsText = ""
+  if gPatches[i].wantArgs and gPatches[i].meth != nil:
+    argsText = describeArgs(gRt, gPatches[i].meth, regs,
+                            gHandles, gHandleIsObject, gHandleGc)
+
+  var outPtr: Il2CppPtr = cast[Il2CppPtr](0)
+  var outLen = 0'i32
+  var a = argsText
+  let st = cInvokePatchArgs(gPatches[i].cb, gPatches[i].user,
+                            cast[Il2CppPtr](addr gPatches[i].targetC[0]),
+                            int32(gPatches[i].targetC.len - 1),
+                            (if argsText.len > 0: cast[Il2CppPtr](toCString(a))
+                             else: cast[Il2CppPtr](0)),
+                            int32(argsText.len),
+                            cast[Il2CppPtr](addr outPtr),
+                            cast[Il2CppPtr](addr outLen))
+
+  var replacement = ""
+  if outPtr != nil and outLen > 0'i32:
+    replacement = readBytes(outPtr, outLen)
+  if outPtr != nil:
+    cFreeBuf(outPtr)
+
+  if st != PatchSkipStatus:
+    return 0'i32
+  if not gPatches[i].canSkip:
+    # Asked to skip without having registered for it. Refused rather than
+    # honoured: the mod believes it is a prefix that suppresses, and finding out
+    # here beats finding out from a game that behaves strangely.
+    return 0'i32
+  if gPatches[i].meth == nil:
+    return 0'i32
+  if not applyPatchReturn(gRt, gPatches[i].meth, regs,
+                          (if replacement.len > 0: replacement else: "null")):
+    return 0'i32
+  result = 1'i32
 
 proc hostPatch(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
                kind: int32; cb: Il2CppPtr; user: Il2CppPtr): int32 {.
     exportc: "aowlspt_nim_patch", cdecl.} =
   ## Detours a compiled method, which is this side's answer to a Harmony patch.
   ##
-  ## The limits are worth stating where a caller will meet them: the callback
-  ## takes no arguments and cannot suppress the original. Reading the original
-  ## arguments correctly needs a thunk per signature, and a patch that reports
-  ## the wrong arguments would be worse than one that reports none.
+  ## `kind` carries two things: the patch kind in its low bits, and
+  ## `AOWLSPT_PATCH_ARGS` (0x10) to ask for the original arguments. Arguments
+  ## are opt-in because decoding them costs a JSON build inside a method the
+  ## game may call thousands of times a frame, and a patch that only counts
+  ## calls should not pay for that.
+  ##
+  ## A patch that asked for arguments may also return `PatchSkip` with a
+  ## replacement result, and the original will not run.
   let spec = readBytes(target, targetLen)
   if cb == nil:
     gLastError = "patch needs a handler"
@@ -602,8 +667,10 @@ proc hostPatch(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
   for k in 0 ..< spec.len:
     targetBytes[k] = byte(spec[k])
   targetBytes[spec.len] = 0'u8
+  let wantArgs = (kind and 0x10'i32) != 0'i32
   gPatches.add Patch(hook: hook, cb: cb, user: user, target: spec,
-                     targetC: targetBytes, live: false)
+                     targetC: targetBytes, live: false, meth: m,
+                     wantArgs: wantArgs, canSkip: wantArgs)
   let slot = cHookAttach(hook, fn)
   if slot < 0'i32:
     shrink(gPatches, gPatches.len - 1)

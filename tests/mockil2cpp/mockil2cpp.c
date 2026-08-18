@@ -84,6 +84,22 @@ struct MockMethod {
     const char* returnType;
     MockInvoke  impl;
     MockClass*  klass;
+    /* Whether the method is static. `il2cpp_method_get_flags` reports 0x10 for
+     * these, and the host needs it: a compiled instance method takes `this` in
+     * the first argument register and a static one does not, so a mock that got
+     * this wrong would shift every decoded argument by one. */
+    int32_t     isStatic;
+    /* The *compiled* function, when the method has one.
+     *
+     * `methodPointer` in real IL2CPP is the compiled native function, with the
+     * signature `(this, a, b, ..., MethodInfo*)`; `runtime_invoke` goes through
+     * a per-signature invoker that unpacks the boxed argument array and calls
+     * it. Everywhere else in this mock the two are conflated -- `methodPointer`
+     * is set to the invoker -- which is harmless for calling and useless for
+     * *detouring*, because a detour on an invoker sees an argument array rather
+     * than arguments. Where a method sets `native`, the mock is faithful:
+     * `methodPointer` is the native function and `impl` unpacks into it. */
+    void*       native;
 };
 
 struct MockClass {
@@ -300,28 +316,94 @@ static void* m_playerDamage(void* obj, void** params) {
 
 MOCK_EXPORT float mock_player_health(void) { return mock_player()->health; }
 
+/* EFT.Player::Hurt(System.Single, System.Int32) -> System.Single
+ *
+ * Written with the signature a *compiled* IL2CPP method has, because it is the
+ * one the detour path sees: `this` in RCX, the float in XMM1, the int in R8,
+ * and the trailing MethodInfo* in R9. A host that decoded the arguments by
+ * counting integer and float registers separately -- rather than by position --
+ * would read the float out of XMM0 and get `this` reinterpreted as a double.
+ * That is the mistake this method exists to catch. */
+static float mock_native_hurt(void* thisPtr, float amount, int32_t kind,
+                              void* methodInfo) {
+    /* No null check, deliberately.
+     *
+     * A `if (!thisPtr) return 0;` compiles to a conditional branch inside the
+     * first fourteen bytes, and the detour engine refuses to relocate a
+     * relative branch out of a prologue -- correctly, since the target would
+     * move. Real game methods have long prologues and this one has to as well
+     * to be a useful stand-in. The mock is only ever called with a real
+     * object. */
+    (void)methodInfo;
+    MockPlayer* p = (MockPlayer*)thisPtr;
+    p->health -= amount * (float)kind;
+    return p->health;
+}
+
+/* The invoker `runtime_invoke` uses: unpack the boxed array, call the compiled
+ * function, box the result. Exactly what IL2CPP generates per signature. */
+static void* m_playerHurt(void* obj, void** params) {
+    float amount = *(float*)params[0];
+    int32_t kind = *(int32_t*)params[1];
+    return mock_box_f32(mock_native_hurt(obj, amount, kind, NULL));
+}
+
+/* EFT.Player::Boost(System.Single) -> System.Single, **static** and compiled.
+ *
+ * The suppression test patches this one. Static on purpose: with no `this`,
+ * argument 0 is the float itself, so a host that assumed an instance would read
+ * the wrong register and any replaced value would be right for the wrong
+ * reason.
+ *
+ * It must be a *compiled* method rather than an invoker, and that distinction
+ * is what this pair exists to enforce. Suppressing a detour on an invoker
+ * returns the replacement where `runtime_invoke` expects a boxed object, and
+ * the caller dereferences a float as a pointer -- which is a segfault, and was
+ * one, before the mock grew `native`. Detouring the compiled function instead
+ * puts the replacement in XMM0 where the invoker boxes it, exactly as it would
+ * in the game. */
+static int32_t g_boostCalls = 0;
+static float mock_native_boost(float amount, void* methodInfo) {
+    (void)methodInfo;
+    g_boostCalls++;
+    return amount * 3.0f;
+}
+static void* m_playerBoost(void* obj, void** params) {
+    (void)obj;
+    return mock_box_f32(mock_native_boost(*(float*)params[0], NULL));
+}
+
+/* How many times the original ran. A suppressed call must leave this alone --
+ * which is the only way to tell "replaced the result" from "ran and then had
+ * its result overwritten", and those are very different things. */
+MOCK_EXPORT int32_t mock_boost_calls(void) { return g_boostCalls; }
+
 /* ------------------------------------------------------------------ *
  * The type universe
  * ------------------------------------------------------------------ */
 
 static MockMethod g_appMethods[] = {
-    { NULL, "get_unityVersion", 0, {0,0,0,0}, "System.String", m_unityVersion, NULL },
+    { NULL, "get_unityVersion", 0, {0,0,0,0}, "System.String", m_unityVersion, NULL, 1, NULL },
 };
 
 static MockMethod g_playerMethods[] = {
-    { NULL, "GetName", 0, {0,0,0,0},                           "System.String",  m_playerGetName, NULL },
-    { NULL, "Add",     2, {"System.Int32","System.Int32",0,0}, "System.Int32",   m_playerAdd,     NULL },
-    { NULL, "Greet",   1, {"System.String",0,0,0},             "System.String",  m_playerGreet,   NULL },
-    { NULL, "Scale",   1, {"System.Single",0,0,0},             "System.Single",  m_playerScale,   NULL },
-    { NULL, "SetFlag", 1, {"System.Boolean",0,0,0},            "System.Boolean", m_playerSetFlag, NULL },
-    { NULL, "Tick",    0, {0,0,0,0},                           "System.Void",    m_playerTick,    NULL },
-    { NULL, "get_Health", 0, {0,0,0,0},                        "System.Single",  m_playerGetHealth, NULL },
-    { NULL, "Damage",  1, {"System.Single",0,0,0},             "System.Single",  m_playerDamage,  NULL },
+    { NULL, "GetName", 0, {0,0,0,0},                           "System.String",  m_playerGetName, NULL, 1, NULL },
+    { NULL, "Add",     2, {"System.Int32","System.Int32",0,0}, "System.Int32",   m_playerAdd,     NULL, 1, NULL },
+    { NULL, "Greet",   1, {"System.String",0,0,0},             "System.String",  m_playerGreet,   NULL, 1, NULL },
+    { NULL, "Scale",   1, {"System.Single",0,0,0},             "System.Single",  m_playerScale,   NULL, 1, NULL },
+    { NULL, "SetFlag", 1, {"System.Boolean",0,0,0},            "System.Boolean", m_playerSetFlag, NULL, 1, NULL },
+    { NULL, "Tick",    0, {0,0,0,0},                           "System.Void",    m_playerTick,    NULL, 1, NULL },
+    { NULL, "get_Health", 0, {0,0,0,0},                        "System.Single",  m_playerGetHealth, NULL, 0, NULL },
+    { NULL, "Damage",  1, {"System.Single",0,0,0},             "System.Single",  m_playerDamage,  NULL, 0, NULL },
+    { NULL, "Hurt",    2, {"System.Single","System.Int32",0,0},"System.Single",  m_playerHurt,    NULL, 0,
+      (void*)mock_native_hurt },
+    { NULL, "Boost",   1, {"System.Single",0,0,0},             "System.Single",  m_playerBoost,   NULL, 1,
+      (void*)mock_native_boost },
 };
 
 static MockMethod g_worldMethods[] = {
-    { NULL, "get_Instance",   0, {0,0,0,0}, "EFT.GameWorld", m_worldInstance,   NULL },
-    { NULL, "get_MainPlayer", 0, {0,0,0,0}, "EFT.Player",    m_worldMainPlayer, NULL },
+    { NULL, "get_Instance",   0, {0,0,0,0}, "EFT.GameWorld", m_worldInstance,   NULL, 1, NULL },
+    { NULL, "get_MainPlayer", 0, {0,0,0,0}, "EFT.Player",    m_worldMainPlayer, NULL, 0, NULL },
 };
 
 static MockField g_playerFields[] = {
@@ -343,7 +425,7 @@ static MockClass g_appClass = {
 };
 static MockClass g_playerClass = {
     "EFT", "Player", &g_objectClass, 64, 0,
-    g_playerMethods, 8, g_playerFields, 3
+    g_playerMethods, 10, g_playerFields, 3
 };
 static MockClass g_gameWorldClass = {
     "EFT", "GameWorld", &g_objectClass, 32, 0,
@@ -384,7 +466,13 @@ static void mock_wire(void) {
             MockClass* k = img->classes[c];
             for (int m = 0; m < k->methodCount; m++) {
                 k->methods[m].klass = k;
-                k->methods[m].methodPointer = (void*)k->methods[m].impl;
+                /* The compiled function when the method has one, the invoker
+                 * otherwise. Detouring an invoker would see an argument array
+                 * where the arguments should be, which is exactly the thing the
+                 * argument-decoding tests need to be able to distinguish. */
+                k->methods[m].methodPointer = k->methods[m].native
+                    ? k->methods[m].native
+                    : (void*)k->methods[m].impl;
             }
         }
     }
@@ -527,7 +615,10 @@ MOCK_EXPORT void* il2cpp_method_get_param(void* m, uint32_t i) {
     return (void*)mm->paramTypes[i];
 }
 MOCK_EXPORT uint32_t il2cpp_method_get_flags(void* m, uint32_t* iflags) {
-    (void)m; if (iflags) *iflags = 0; return 0;
+    if (iflags) *iflags = 0;
+    if (!m) return 0;
+    /* 0x0010 is METHOD_ATTRIBUTE_STATIC. Nothing else here is modelled. */
+    return ((MockMethod*)m)->isStatic ? 0x0010u : 0u;
 }
 
 MOCK_EXPORT const char* il2cpp_field_get_name(void* f) {

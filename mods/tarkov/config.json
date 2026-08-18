@@ -3,6 +3,21 @@
   "defaultSide": "Usec",
   "startingRoubles": 500000,
   "epochBase": 1700000000,
+
   "insurancePercent": 10,
-  "insuranceReturnHours": 24
+  "insuranceReturnHours": 24,
+  "scavCooldownSeconds": 900,
+
+  "lootEnabled": true,
+  "staticLootMultiplier": 1.0,
+  "looseLootMultiplier": 1.0,
+  "maxLootItems": 20000,
+
+  "fleaSpreadPercent": 20,
+  "fleaOfferHours": 12,
+  "fleaMaxOffers": 600,
+  "fleaSaleMinutes": 30,
+
+  "skillMaxPerRaid": 100.0,
+  "masteringMaxPerRaid": 100
 }

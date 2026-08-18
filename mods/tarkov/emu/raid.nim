@@ -16,6 +16,7 @@ import aowlspt
 import aowlspt/server
 import aowlspt/json
 import ids
+import loot
 
 type
   RaidResult* = enum
@@ -45,7 +46,8 @@ proc locationBase*(id: string): string =
     return byKey.raw
   result = ""
 
-proc localLoot*(locationId: string; nowSeconds: int): string =
+proc localLoot*(locationId: string; nowSeconds: int;
+                raidId: string = ""): string =
   ## What is lying on the floor when the raid starts.
   ##
   ## The database's static loot when it has any, and an empty map when it does
@@ -56,7 +58,14 @@ proc localLoot*(locationId: string; nowSeconds: int): string =
   var o = obj()
   put(o, "Id", locationId)
   put(o, "Name", locationId)
-  put(o, "Loot", arr())
+  # Seeded from the raid id, so the floor of a given raid is reproducible from
+  # a bug report. Falling back to the map name when there is no raid id keeps it
+  # deterministic rather than empty -- the same map then has the same loot every
+  # time, which is worse for play and better than nothing to debug.
+  var seed = raidId
+  if seed.len == 0:
+    seed = locationId
+  put(o, "Loot", raw(lootFor(locationId, seed)))
   put(o, "transitionParameters", jnull())
   if base.len > 0:
     let esc = field(base, "EscapeTimeLimit")

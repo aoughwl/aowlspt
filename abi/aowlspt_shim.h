@@ -61,6 +61,7 @@ static int32_t  aowl_i32_p  (void* f, void* a)                            { retu
 static uint32_t aowl_u32_p  (void* f, void* a)                            { return ((uint32_t(*)(void*))f)(a); }
 static uint64_t aowl_z_p    (void* f, void* a)                            { return (uint64_t)((size_t(*)(void*))f)(a); }
 static uint32_t aowl_u32_pi (void* f, void* a, int32_t i)                 { return ((uint32_t(*)(void*,int32_t))f)(a,i); }
+static uint32_t aowl_u32_pp (void* f, void* a, void* b)                   { return ((uint32_t(*)(void*,void*))f)(a,b); }
 
 /* Reading memory the runtime owns. Copying into a nimony string on the other
  * side sidesteps every cstring-lifetime question, and the strings involved are
@@ -350,6 +351,34 @@ static int32_t aowl_invoke_route(void* cb, void* user,
 /* Releasing a buffer a mod allocated with the host allocator. */
 static void aowl_host_release(void* p) { free(p); }
 
+/* The patch invoker that carries arguments and hands back a replacement.
+ *
+ * `aowl_invoke_patch` below is the older, narrower form: no arguments, and the
+ * replacement result is released rather than used. This one is what a patch
+ * that wants to read what the method was called with -- or to suppress it --
+ * goes through. The out buffer belongs to the caller and must be released with
+ * `aowl_host_release`. */
+static int32_t aowl_invoke_patch_args(void* cb, void* user,
+                                      void* target, int32_t tlen,
+                                      void* args, int32_t alen,
+                                      void* outPtrRaw, void* outLenRaw) {
+    void** outPtr = (void**)outPtrRaw;
+    int32_t* outLen = (int32_t*)outLenRaw;
+    AowlSlice t;
+    AowlSlice a;
+    AowlBuffer out;
+    t.ptr = (const uint8_t*)target;
+    t.len = tlen;
+    a.ptr = (const uint8_t*)args;
+    a.len = alen;
+    out.ptr = NULL;
+    out.len = 0;
+    int32_t st = (int32_t)((AowlPatchFn)cb)(user, t, a, &out);
+    if (outPtr) *outPtr = (void*)out.ptr;
+    if (outLen) *outLen = out.len;
+    return st;
+}
+
 static int32_t aowl_invoke_patch(void* cb, void* user, void* target, int32_t tlen) {
     AowlSlice t;
     AowlSlice a;
@@ -563,6 +592,63 @@ static void* aowl_read_ptr(void* p, int32_t off) {
 
 static int32_t aowl_read_i32(void* p) { return p ? *(int32_t*)p : 0; }
 static int64_t aowl_read_i64(void* p) { return p ? *(int64_t*)p : 0; }
+/* The saved argument registers, in the order the thunk writes them. `ret` is
+ * where the dispatcher leaves a return value when it suppresses the original. */
+typedef struct AowlRegs {
+    uint64_t rcx, rdx, r8, r9;   /* 0x00 0x08 0x10 0x18 */
+    double   x0, x1, x2, x3;     /* 0x20 0x28 0x30 0x38 */
+    uint64_t ret;                /* 0x40 */
+} AowlRegs;
+
+/* Returns 0 to run the original, 1 to suppress it. */
+extern int32_t aowlspt_nim_patch_fired(int32_t slot, void* regs);
+
+
+
+/* Reading the saved frame from the host, which cannot dereference a struct it
+ * has no declaration for. Index 0-3 is argument *position*, and a position is
+ * either an integer register or an XMM register -- on this ABI the position
+ * picks the register file, rather than each file having its own counter. */
+static uint64_t aowl_regs_int(void* p, int32_t i) {
+    AowlRegs* r = (AowlRegs*)p;
+    if (!r) return 0;
+    switch (i) {
+        case 0: return r->rcx;
+        case 1: return r->rdx;
+        case 2: return r->r8;
+        case 3: return r->r9;
+        default: return 0;
+    }
+}
+static double aowl_regs_flt(void* p, int32_t i) {
+    AowlRegs* r = (AowlRegs*)p;
+    if (!r) return 0.0;
+    switch (i) {
+        case 0: return r->x0;
+        case 1: return r->x1;
+        case 2: return r->x2;
+        case 3: return r->x3;
+        default: return 0.0;
+    }
+}
+static void aowl_regs_set_ret_int(void* p, uint64_t v) {
+    if (p) ((AowlRegs*)p)->ret = v;
+}
+static void aowl_regs_set_ret_f32(void* p, double v) {
+    if (!p) return;
+    float f = (float)v;
+    uint64_t bits = 0;
+    memcpy(&bits, &f, sizeof(f));
+    ((AowlRegs*)p)->ret = bits;
+}
+static void aowl_regs_set_ret_f64(void* p, double v) {
+    if (!p) return;
+    uint64_t bits = 0;
+    memcpy(&bits, &v, sizeof(v));
+    ((AowlRegs*)p)->ret = bits;
+}
+static int32_t aowl_regs_sizeof(void) { return (int32_t)sizeof(AowlRegs); }
+
 /* A 16-byte scratch cell.
  *
  * A field is read out of an object into raw memory rather than into a boxed

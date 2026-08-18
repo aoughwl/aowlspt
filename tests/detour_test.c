@@ -46,10 +46,12 @@ void victim(void) {
     g_originalCalls++;
 }
 
-/* The nimony side normally provides this; here the test does. */
-void aowlspt_nim_patch_fired(int32_t slot) {
-    (void)slot;
+/* The nimony side normally provides this; here the test does. Returning zero
+ * means "run the original", which is what every check below expects. */
+int32_t aowlspt_nim_patch_fired(int32_t slot, void* regs) {
+    (void)slot; (void)regs;
     g_detourCalls++;
+    return 0;
 }
 
 int main(void) {
@@ -110,12 +112,19 @@ int main(void) {
 
     printf("\nstolen length\n");
     {
-        /* push rbp; mov rbp,rsp; sub rsp,0x20; mov [rsp+8],rcx
-           = 1 + 3 + 4 + 5 = 13, the first whole-instruction total >= 12. */
+        /* push rbp; mov rbp,rsp; sub rsp,0x20; mov [rsp+8],rcx; mov [rsp+16],rdx
+           = 1 + 3 + 4 + 5 + 5 = 18. Whole instructions only, so the answer is
+           the first cumulative total that reaches the jump size -- 13 is not
+           enough for a 14-byte jump, and half of the fifth instruction is not
+           an option. Written against AOWL_JMP_SIZE rather than a literal,
+           because this assertion is about the rule and not about today's
+           encoding. */
         uint8_t b[] = {0x55, 0x48,0x89,0xE5, 0x48,0x83,0xEC,0x20,
-                       0x48,0x89,0x4C,0x24,0x08};
+                       0x48,0x89,0x4C,0x24,0x08,
+                       0x48,0x89,0x54,0x24,0x10};
         int32_t n = aowl_stolen_len(b, AOWL_JMP_SIZE);
-        check("covers 12 bytes with whole instructions", n == 13);
+        check("covers the jump with whole instructions",
+              n >= AOWL_JMP_SIZE && n == 18);
     }
     {
         /* A prologue whose second instruction is a relative call cannot be
@@ -139,12 +148,15 @@ int main(void) {
               aowl_stolen_len(b, AOWL_JMP_SIZE) == 0);
     }
     {
-        /* Exactly long enough: 7 + 5 = 12, leaving the ret in place. */
+        /* Exactly long enough: 7 + 5 + 3 = 15 >= AOWL_JMP_SIZE, with the ret
+           left in place. One byte of slack, which is what "exactly long
+           enough" means when instructions have length. */
         uint8_t b[] = {0x83,0x05,1,2,3,4,0x01,   /* addl $1, disp(%rip) */
                        0xB8,0,0,0,0,             /* mov  $0, %eax       */
+                       0x48,0x89,0xE5,           /* mov  %rsp, %rbp     */
                        0xC3};
         check("accepts a function that is exactly long enough",
-              aowl_stolen_len(b, AOWL_JMP_SIZE) == 12);
+              aowl_stolen_len(b, AOWL_JMP_SIZE) == 15);
     }
 
     printf("\nrelocation\n");

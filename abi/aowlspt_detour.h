@@ -46,7 +46,7 @@
 #include <stdlib.h>
 #include <string.h>
 
-#define AOWL_JMP_SIZE 12   /* mov rax, imm64 ; jmp rax */
+#define AOWL_JMP_SIZE 14   /* jmp [rip+0] ; qword dest */
 #define AOWL_MAX_STOLEN 32
 
 typedef struct AowlHook {
@@ -247,13 +247,24 @@ static int32_t aowl_copy_relocated(uint8_t* dst, const uint8_t* src, int32_t byt
  * ------------------------------------------------------------------ */
 
 static void aowl_write_jmp_abs(uint8_t* at, void* dest) {
-    /* mov rax, imm64 ; jmp rax — 12 bytes, no displacement to get wrong, and
-     * reaches anywhere in the address space. The 5-byte rel32 form is smaller
-     * but only reaches +/-2 GB, which a DLL loaded far from the game image
-     * cannot rely on. */
-    at[0] = 0x48; at[1] = 0xB8;
-    memcpy(at + 2, &dest, 8);
-    at[10] = 0xFF; at[11] = 0xE0;
+    /* jmp qword ptr [rip+0] ; <dest>  -- 14 bytes, and **clobbers nothing**.
+     *
+     * The obvious encoding is `mov rax, imm64 ; jmp rax`, which is two bytes
+     * shorter and wrong in a way that is invisible until it is not. The
+     * trampoline ends with this jump, immediately after the stolen instructions
+     * -- and a stolen prologue very often leaves a value in RAX that the rest
+     * of the function still needs. `void f(void) { counter++; }` compiles to
+     * `mov eax,[rip+x] ; add eax,1 ; mov [rip+x],eax`, the first twelve bytes
+     * of which get stolen, so the jump back would overwrite the incremented
+     * value with its own jump target and the store would write a pointer
+     * fragment into the counter.
+     *
+     * The rel32 form (`e9`) is smaller still and only reaches +/-2 GB, which a
+     * DLL loaded far from the game image cannot rely on. This form reaches
+     * anywhere, touches no register, and costs two bytes. */
+    at[0] = 0xFF; at[1] = 0x25;
+    at[2] = 0x00; at[3] = 0x00; at[4] = 0x00; at[5] = 0x00;
+    memcpy(at + 6, &dest, 8);
 }
 
 /* Executable memory within +/-2 GB of `near`.
@@ -379,36 +390,125 @@ static int32_t aowl_hook_remove(void* handle) {
  * The detour body
  *
  * A patched method must land somewhere with the same calling convention as the
- * original, and there is one of those per patch. Rather than generate code per
- * hook, a fixed pool of thunks is used: each knows its own slot, and they all
- * funnel into one dispatcher.
+ * original. Rather than generate code per hook, a fixed pool of thunks is used:
+ * each knows its own slot, and they all funnel into one dispatcher.
  *
- * The dispatcher takes no arguments and returns nothing, which bounds what a
- * patch can do: it fires, it cannot read the original arguments, and it cannot
- * suppress the original. That is a real limit and the honest one to ship
- * first — reading arguments correctly needs a thunk per signature, and a patch
- * that reports the wrong arguments is worse than one that reports none.
+ * The thunks are **assembly**, and they have to be. The C version of this was
+ * wrong in a way that only showed up on a method with arguments:
+ *
+ *     static void aowl_thunk_0(void) {
+ *         aowlspt_nim_patch_fired(0);       // passes 0 in ECX
+ *         ((void(*)(void))trampoline)();    // ...RCX is now 0
+ *     }
+ *
+ * On Windows x64 the first four arguments arrive in RCX/RDX/R8/R9 (or XMM0-3),
+ * and calling anything at all clobbers them. So the dispatcher call destroyed
+ * `this` and every argument before the original ran, and the original then ran
+ * with garbage. It survived only because the one method the tests hooked took
+ * no arguments. It also *called* the trampoline instead of tail-jumping, so the
+ * original's return value in RAX survived by luck rather than by design.
+ *
+ * What the assembly does, in order:
+ *
+ *   1. Save RCX, RDX, R8, R9 and XMM0-3 -- every register an argument can
+ *      arrive in -- into its own frame.
+ *   2. Call the dispatcher with the slot and a pointer to that frame. The host
+ *      decodes the arguments from it against the method's declared parameter
+ *      types, the same way `call` binds them in the other direction.
+ *   3. If the dispatcher says continue: restore all of them and **tail-jump**
+ *      to the trampoline. Tail-jumping rather than calling is what makes the
+ *      original's return value, its stack arguments and its return address
+ *      correct by construction rather than by accident.
+ *   4. If the dispatcher says skip: load the return value it left behind into
+ *      both RAX and XMM0 and return, without the original running at all.
+ *
+ * The frames carry SEH unwind directives. A managed exception thrown through a
+ * patched method unwinds through this thunk, and a frame with no unwind
+ * information does not merely fail that unwind -- it terminates the process.
+ *
+ * What is still not covered, and is reported rather than guessed: arguments
+ * past the fourth, which arrive on the stack, and value types larger than
+ * eight bytes, which arrive by hidden reference.
  * ------------------------------------------------------------------ */
 
 #define AOWL_MAX_HOOKS 16
 
-extern void aowlspt_nim_patch_fired(int32_t slot);
+/* `AowlRegs` and its accessors live in `aowlspt_shim.h`.
+ *
+ * They are used from two translation units -- this one, which writes the frame
+ * from assembly, and the host's `invoke`, which decodes it against a method
+ * signature -- and only the shim is included by both. Defining them here left
+ * the decoder calling functions it had no declaration for, which C accepts with
+ * a warning and then miscompiles on the return type. */
 
-typedef void (*AowlThunk)(void);
+/* Returns 0 to run the original, 1 to suppress it. */
+extern int32_t aowlspt_nim_patch_fired(int32_t slot, void* regs);
 
 static AowlHook* g_hookSlots[AOWL_MAX_HOOKS];
+/* `used` because the only reader is the assembly below, and the compiler cannot
+ * see that. Without it the table is dropped at -O1 and the link fails on a
+ * symbol that is right there in the file. */
+void* aowl_tramp_table[AOWL_MAX_HOOKS];
 static int32_t   g_hookCount = 0;
 
-#define AOWL_THUNK(n) \
-    static void aowl_thunk_##n(void) { \
-        aowlspt_nim_patch_fired(n); \
-        ((void(*)(void))g_hookSlots[n]->trampoline)(); \
-    }
+/* Likewise: called only from assembly, so it needs a name the linker keeps. */
+int32_t aowl_patch_dispatch(int32_t slot, void* regs) {
+    return aowlspt_nim_patch_fired(slot, regs);
+}
 
-AOWL_THUNK(0)  AOWL_THUNK(1)  AOWL_THUNK(2)  AOWL_THUNK(3)
-AOWL_THUNK(4)  AOWL_THUNK(5)  AOWL_THUNK(6)  AOWL_THUNK(7)
-AOWL_THUNK(8)  AOWL_THUNK(9)  AOWL_THUNK(10) AOWL_THUNK(11)
-AOWL_THUNK(12) AOWL_THUNK(13) AOWL_THUNK(14) AOWL_THUNK(15)
+#if defined(__x86_64__)
+
+#define AOWL_ASM_THUNK(n) __asm__(                                            \
+    ".text\n"                                                                 \
+    ".def aowl_thunk_" #n "; .scl 3; .type 32; .endef\n"                      \
+    ".seh_proc aowl_thunk_" #n "\n"                                           \
+    "aowl_thunk_" #n ":\n"                                                    \
+    "  subq $0x98, %rsp\n"                                                    \
+    "  .seh_stackalloc 0x98\n"                                                \
+    "  .seh_endprologue\n"                                                    \
+    "  movq %rcx, 0x40(%rsp)\n"                                               \
+    "  movq %rdx, 0x48(%rsp)\n"                                               \
+    "  movq %r8,  0x50(%rsp)\n"                                               \
+    "  movq %r9,  0x58(%rsp)\n"                                               \
+    "  movsd %xmm0, 0x60(%rsp)\n"                                             \
+    "  movsd %xmm1, 0x68(%rsp)\n"                                             \
+    "  movsd %xmm2, 0x70(%rsp)\n"                                             \
+    "  movsd %xmm3, 0x78(%rsp)\n"                                             \
+    "  movq $0, 0x80(%rsp)\n"                                                 \
+    "  movl $" #n ", %ecx\n"                                                  \
+    "  leaq 0x40(%rsp), %rdx\n"                                               \
+    "  call aowl_patch_dispatch\n"                                            \
+    "  testl %eax, %eax\n"                                                    \
+    "  jne .Laowl_skip_" #n "\n"                                              \
+    "  movq 0x40(%rsp), %rcx\n"                                               \
+    "  movq 0x48(%rsp), %rdx\n"                                               \
+    "  movq 0x50(%rsp), %r8\n"                                                \
+    "  movq 0x58(%rsp), %r9\n"                                                \
+    "  movsd 0x60(%rsp), %xmm0\n"                                             \
+    "  movsd 0x68(%rsp), %xmm1\n"                                             \
+    "  movsd 0x70(%rsp), %xmm2\n"                                             \
+    "  movsd 0x78(%rsp), %xmm3\n"                                             \
+    "  movq aowl_tramp_table+" #n "*8(%rip), %rax\n"                          \
+    "  addq $0x98, %rsp\n"                                                    \
+    "  jmp *%rax\n"                                                           \
+    ".Laowl_skip_" #n ":\n"                                                   \
+    "  movq 0x80(%rsp), %rax\n"                                               \
+    "  movq %rax, %xmm0\n"                                                    \
+    "  addq $0x98, %rsp\n"                                                    \
+    "  ret\n"                                                                 \
+    ".seh_endproc\n");                                                        \
+    extern void aowl_thunk_##n(void);
+
+AOWL_ASM_THUNK(0)  AOWL_ASM_THUNK(1)  AOWL_ASM_THUNK(2)  AOWL_ASM_THUNK(3)
+AOWL_ASM_THUNK(4)  AOWL_ASM_THUNK(5)  AOWL_ASM_THUNK(6)  AOWL_ASM_THUNK(7)
+AOWL_ASM_THUNK(8)  AOWL_ASM_THUNK(9)  AOWL_ASM_THUNK(10) AOWL_ASM_THUNK(11)
+AOWL_ASM_THUNK(12) AOWL_ASM_THUNK(13) AOWL_ASM_THUNK(14) AOWL_ASM_THUNK(15)
+
+#else
+#  error "the aowlspt detour thunks are x86-64 only"
+#endif
+
+typedef void (*AowlThunk)(void);
 
 static AowlThunk g_thunks[AOWL_MAX_HOOKS] = {
     aowl_thunk_0,  aowl_thunk_1,  aowl_thunk_2,  aowl_thunk_3,
@@ -420,7 +520,7 @@ static AowlThunk g_thunks[AOWL_MAX_HOOKS] = {
 static int32_t aowl_hook_capacity(void) { return AOWL_MAX_HOOKS; }
 static int32_t aowl_hook_used(void) { return g_hookCount; }
 
-/* Claims a slot, installs the hook, and returns the slot index — which is what
+/* Claims a slot, installs the hook, and returns the slot index -- which is what
  * `aowlspt_nim_patch_fired` receives, so the host knows which patch fired with
  * no lookup on the hot path. Negative values are the install errors above, or
  * -5 when the pool is exhausted. */
@@ -433,6 +533,9 @@ static int32_t aowl_hook_attach(void* handle, void* target) {
         g_hookSlots[slot] = NULL;
         return rc;
     }
+    /* The thunk reads the trampoline out of this table rather than walking the
+     * hook struct, so the hot path is one load rather than two. */
+    aowl_tramp_table[slot] = ((AowlHook*)handle)->trampoline;
     g_hookCount++;
     return slot;
 }

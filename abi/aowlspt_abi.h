@@ -154,6 +154,14 @@ typedef AowlStatus (AOWLSPT_CALL *AowlPatchFn)(
  * that "ran fine, continue" stays the zero value. */
 #define AOWLSPT_PATCH_SKIP 1
 
+/* OR this into `kind` to ask for the original arguments.
+ *
+ * A flag rather than a fourth patch kind, because it is orthogonal to prefix
+ * and postfix -- and opt-in rather than always-on, because decoding arguments
+ * costs a JSON build inside a method the game may call thousands of times a
+ * frame. A patch that only wants to count calls should not pay for one. */
+#define AOWLSPT_PATCH_ARGS 0x10
+
 typedef enum AowlPatchKind {
     AOWLSPT_PATCH_PREFIX   = 0,
     AOWLSPT_PATCH_POSTFIX  = 1,

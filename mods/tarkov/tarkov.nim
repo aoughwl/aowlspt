@@ -46,6 +46,11 @@ import emu/trading
 import emu/bots
 import emu/mail
 import emu/insurance
+import emu/market
+import emu/production
+import emu/skills
+import emu/scav
+import emu/redeem
 
 const
   ModGuid = "aowl.tarkov"
@@ -58,6 +63,8 @@ var gNowSeconds = 0
 var gStartingRoubles = 500000
 var gInsurancePercent = 10
 var gInsuranceHours = 24
+var gScavCooldownSeconds = 900
+var gRaidId = ""
 
 proc nowSeconds(): int =
   ## Wall-clock seconds. The host gives monotonic milliseconds since it started,
@@ -87,6 +94,12 @@ proc currentProfile(session: string): Profile =
   if id.len == 0:
     return Profile(id: "", text: "", ok: false)
   result = loadProfile(id)
+  # Continuous production and area bonuses catch up here rather than on a timer.
+  # A server that was switched off for a day must not lose that day's water, and
+  # must not invent a day of fuel it never burned -- `tickHideout` works both out
+  # from what is actually in the generator.
+  if tickHideout(result, nowSeconds()):
+    discard saveProfile(result)
 
 # ---------------------------------------------------------------------------
 # Launcher and login
@@ -153,6 +166,11 @@ proc onProfileList(url, body, session: string): string =
     let p = loadProfile(id)
     if p.ok:
       a.add raw(p.text)
+      # The scav goes straight after its PMC. The client reads the pair in that
+      # order and shows the second as the scav character.
+      let sc = scavText(p, nowSeconds())
+      if sc.len > 0:
+        a.add raw(sc)
   result = envelope(a)
 
 proc onProfileSelect(url, body, session: string): string =
@@ -180,6 +198,9 @@ proc onProfileSelect(url, body, session: string): string =
   let posted = deliverDue(id, nowSeconds())
   if posted > 0:
     info "delivered " & $posted & " insurance return(s)"
+  let settled = settleOffers(id, nowSeconds())
+  if settled > 0:
+    info "settled " & $settled & " flea offer(s)"
 
   var notifier = obj()
   put(notifier, "server", ServerName)
@@ -211,6 +232,17 @@ proc onProfileCreate(url, body, session: string): string =
   success "created profile " & p.id & " (" & nickname & ", " & sideName & ")"
   discard broadcast("tarkov.profile.created", objOf("id", p.id))
   result = envelope(objOf("uid", p.id))
+
+proc onSavageRegenerate(url, body, session: string): string =
+  ## A new scav character. The `savage` id is kept -- the client caches it from
+  ## the profile list and from the raid it just played -- and only the character
+  ## behind it is replaced.
+  let p = currentProfile(session)
+  if not p.ok:
+    return failure(1, "no profile on this session")
+  if not regenerateScav(p, nowSeconds()):
+    return failure(1, "could not regenerate the scav")
+  result = envelope(objOf("status", "ok"))
 
 proc onNicknameValidate(url, body, session: string): string =
   let nickname = field(body, "nickname").asText("")
@@ -274,7 +306,9 @@ proc itemEventResponse(p: Profile; ch: Change): string =
   put(changes, "improvements", obj())
   put(changes, "skills", skills)
   put(changes, "health", raw(p.field("Health").raw()))
-  put(changes, "traderRelations", obj())
+  # The real trader standings, so a quest reward that moved one is visible
+  # without a reload.
+  put(changes, "traderRelations", raw(p.field("TradersInfo").raw()))
 
   var byProfile = obj()
   put(byProfile, p.id, changes)
@@ -323,17 +357,20 @@ proc onItemsMoving(url, body, session: string): string =
     let kind = a.field("Action").asText("")
     let qa = questAction(kind)
     let ha = hideoutAction(kind)
+    let pa = productionAction(kind)
     if qa != qaNone:
+      # The profile-aware entry point rather than the array-only one. Every
+      # condition worth evaluating -- level, trader standing, what has actually
+      # been handed over -- is about the profile, so a version that only sees
+      # the quest array cannot refuse anything and a quest that pays out for
+      # nothing is worse than one that will not complete.
       var gained = 0
       var problem = ""
-      let updated = applyQuest(p.field("Quests").raw(), qa, a, nowSeconds(),
-                               gained, problem)
-      if problem.len > 0:
-        ch.problems.add problem
-      else:
-        setRaw(p, "Quests", updated)
+      if applyQuestOnProfile(p, qa, a, nowSeconds(), gained, problem):
         earned = earned + gained
         touchedProfile = true
+      if problem.len > 0:
+        ch.problems.add problem
     elif ha != haNone:
       var problem = ""
       let updated = applyHideout(p.field("Hideout.Areas").raw(), ha, a,
@@ -343,6 +380,17 @@ proc onItemsMoving(url, body, session: string): string =
       else:
         setRaw(p, "Hideout.Areas", updated)
         touchedProfile = true
+    elif pa != paNone:
+      if applyProduction(p, inv, pa, a, nowSeconds(), ch):
+        touchedProfile = true
+    elif isRagfairAction(kind):
+      discard applyRagfair(inv, a, p.stashId, p.id, p.nickname, ch,
+                           nowSeconds())
+    elif mailSource(a).len > 0:
+      # A reward dragged out of a message is an ordinary `Move` carrying
+      # `fromOwner: {type:"Mail"}`. Tested before the generic move, because the
+      # item it names is not in the inventory yet.
+      discard redeem(inv, p.id, p.stashId, a, ch)
     elif kind == "TradingConfirm":
       discard applyTrading(inv, a, p.stashId, ch)
     else:
@@ -365,7 +413,12 @@ proc onItemsMoving(url, body, session: string): string =
     setRaw(p, "Encyclopedia", text(enc))
   if inv.dirty or examined.len > 0 or touchedProfile:
     if not saveProfile(p):
+      # A redemption that took an item out of the mailbox and then failed to
+      # save the profile would lose it. The mailbox edits are staged until the
+      # profile is on disk, and dropped if it is not.
+      discardRedemptions()
       return failure(1, "could not save the profile: " & lastError())
+  commitRedemptions()
 
   for problem in ch.problems:
     warn "items/moving: " & problem
@@ -493,6 +546,7 @@ proc onNotifierPoll(url, body, session: string): string =
 proc onRaidConfiguration(url, body, session: string): string =
   inc gRequests
   let cfg = raidConfiguration(body)
+  gRaidId = field(cfg, "raidId").asText("")
   info "raid configured: " & field(cfg, "location").asText("?") & " as " &
        field(cfg, "side").asText("?")
   discard broadcast("tarkov.raid.configured", raw(cfg))
@@ -501,10 +555,15 @@ proc onRaidConfiguration(url, body, session: string): string =
 proc onLocalLoot(url, body, session: string): string =
   inc gRequests
   let loc = field(body, "locationId").asText("factory4_day")
-  result = envelope(raw(localLoot(loc, nowSeconds())))
+  result = envelope(raw(localLoot(loc, nowSeconds(), gRaidId)))
 
 proc onMatchStart(url, body, session: string): string =
   inc gRequests
+  # The per-raid skill counter resets here rather than at the end: the raid the
+  # player is entering is the one whose gains are capped.
+  var starting = currentProfile(session)
+  if starting.ok and startRaidSkills(starting):
+    discard saveProfile(starting)
   var settings = obj()
   put(settings, "aiAmount", "AsOnline")
   put(settings, "aiDifficulty", "AsOnline")
@@ -535,6 +594,23 @@ proc onMatchEnd(url, body, session: string): string =
     return envelopeNull()
 
   let playedId = played.field("_id").asText("")
+  # A scav raid hands back the scav, not the PMC. Recognised by the id rather
+  # than by a flag in the body, because the id is the one thing that cannot be
+  # wrong about which character was played.
+  if playedId.len > 0 and playedId == p.scavId:
+    var brought = 0
+    var scavProblems: seq[string] = @[]
+    if not endScavRaid(p, raw(played), keepsGear(outcome), nowSeconds(),
+                       gScavCooldownSeconds, brought, scavProblems):
+      return failure(1, "could not finish the scav raid")
+    for problem in scavProblems:
+      warn "scav raid: " & problem
+    if not saveProfile(p):
+      return failure(1, "could not save the profile after the scav raid")
+    success "scav raid ended: " & $brought & " item(s) brought home"
+    discard broadcast("tarkov.raid.ended", objOf("profile", p.id))
+    return envelopeNull()
+
   if playedId != p.id:
     # A body naming a different profile is refused rather than applied. Applying
     # it would overwrite one player's character with another's.
@@ -542,6 +618,13 @@ proc onMatchEnd(url, body, session: string): string =
     return failure(1, "that raid result is for a different profile")
 
   var updated = Profile(id: p.id, text: raw(played), ok: true)
+  # Skills are applied as a delta against the pre-raid profile and run through
+  # the game's curve, rather than believed as sent. The client's numbers are the
+  # client's.
+  var levelUps: seq[string] = @[]
+  discard applyRaidProgress(updated, p.text, nowSeconds(), levelUps)
+  for s in levelUps:
+    info p.nickname & " levelled " & s
   if not keepsGear(outcome):
     # Death takes the gear but not the stash: the client has already removed
     # what was lost from the profile it is handing back, so this is a log line
@@ -557,6 +640,14 @@ proc onMatchEnd(url, body, session: string): string =
     if queueReturn(p.id, "54cb50c76803fa8b248b4571", goods, due):
       info $lost.len & " insured item(s) will be returned in " &
            $gInsuranceHours & "h"
+
+  # Quest progress out of the raid: the counters the client accumulated, the
+  # kills it did not count, and every quest that is now ready to hand in.
+  # Rewards are *not* paid here -- the `QuestComplete` the player sends pays
+  # them, and paying here as well would pay them twice.
+  discard advanceQuestsAfterRaid(updated, p.text, raidLocation(body),
+                                 field(body, "exit").asText("Left"),
+                                 nowSeconds())
 
   if not saveProfile(updated):
     return failure(1, "could not save the profile after the raid")
@@ -662,20 +753,12 @@ proc onHideoutSettings(url, body, session: string): string =
 
 proc onRagfairFind(url, body, session: string): string =
   inc gRequests
-  var o = obj()
-  put(o, "offers", arr())
-  put(o, "offersCount", 0)
-  put(o, "selectedCategory", field(body, "handbookId").asText(""))
-  put(o, "categories", obj())
-  result = envelope(o)
+  let p = currentProfile(session)
+  result = envelope(raw(searchResult(body, p.id, p.nickname, nowSeconds())))
 
 proc onRagfairPrice(url, body, session: string): string =
   inc gRequests
-  var o = obj()
-  put(o, "avg", 0)
-  put(o, "min", 0)
-  put(o, "max", 0)
-  result = envelope(o)
+  result = envelope(raw(marketPrice(body, nowSeconds())))
 
 proc onInsuranceCost(url, body, session: string): string =
   ## What each trader would charge to insure each item in the request. Priced
@@ -724,7 +807,7 @@ proc registerRoutes() =
   discard serve("/client/game/profile/nickname/validate", onNicknameValidate)
   discard serve("/client/game/profile/nickname/reserved", onNicknameReserved)
   discard serve("/client/game/profile/nickname/change", onNicknameChange)
-  discard serve("/client/game/profile/savage/regenerate", onOkStatus)
+  discard serve("/client/game/profile/savage/regenerate", onSavageRegenerate)
   discard serve("/client/game/profile/voice/change", onOkStatus)
 
   # Static tables
@@ -806,6 +889,11 @@ proc onLoad(): Status =
   gStartingRoubles = setting("startingRoubles").asInt(500000)
   gInsurancePercent = setting("insurancePercent").asInt(10)
   gInsuranceHours = setting("insuranceReturnHours").asInt(24)
+  gScavCooldownSeconds = setting("scavCooldownSeconds").asInt(900)
+  configureMarket(setting("fleaSpreadPercent").asInt(20),
+                  setting("fleaOfferHours").asInt(12),
+                  setting("fleaMaxOffers").asInt(600),
+                  setting("fleaSaleMinutes").asInt(30))
 
   if not storeReady():
     error "this host has no persistent store; profiles cannot be kept " &

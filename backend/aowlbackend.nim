@@ -87,24 +87,24 @@ var gPort = 6969
 var gRequests = 0
 
 # --------------------------------------------------------------- bytes
+#
+# `toBytes` / `fromBytes` live in `wire.nim` now and go through `copyMem`.
+# They used to be per-byte loops here as well, which is invisible on a 200-byte
+# request and is the largest single cost on a 4 MB one: a route body has to
+# cross from the mod's buffer into a string and then into a byte buffer, and
+# doing either of those a byte at a time costs more than deflating it.
 
-proc toBytes(s: string): seq[byte] =
-  result = newSeq[byte](s.len)
-  for i in 0 ..< s.len:
-    result[i] = byte(s[i])
-
-proc fromBytes(b: seq[byte]; len: int): string =
-  result = ""
-  for i in 0 ..< len:
-    result.add char(b[i])
-
-proc inflateBody(raw: seq[byte]; rawLen: int; into: var string): bool =
+proc inflateBody(raw {.byref.}: seq[byte]; rawLen: int; into: var string): bool =
   ## Inflates when the body looks framed, passes it through when it does not.
+  ##
+  ## `byref` on the buffer is not a micro-optimisation: a by-value `seq`
+  ## parameter copies the whole request body on entry, and this is called with
+  ## the raw receive buffer.
   into = ""
   if rawLen <= 0:
     return true
-  var src = raw
-  if cZlibFramed(cast[WirePtr](addr src[0]), int32(rawLen)) == 0'i32:
+  let src = cast[WirePtr](addr raw[0])
+  if cZlibFramed(src, int32(rawLen)) == 0'i32:
     into = fromBytes(raw, rawLen)
     return true
   # 64x is generous for JSON and bounded; a body that will not fit is refused
@@ -114,26 +114,115 @@ proc inflateBody(raw: seq[byte]; rawLen: int; into: var string): bool =
   if cap < 65536: cap = 65536
   if cap > 64 * 1024 * 1024: cap = 64 * 1024 * 1024
   var dst = newSeq[byte](cap)
-  let n = cZlibInflate(cast[WirePtr](addr src[0]), int32(rawLen),
+  let n = cZlibInflate(src, int32(rawLen),
                        cast[WirePtr](addr dst[0]), int32(cap))
   if n < 0'i32:
     return false
   into = fromBytes(dst, int(n))
   result = true
 
-proc deflateBody(text: string; into: var seq[byte]; outLen: var int): bool =
+proc deflateBody(text {.byref.}: string; into: var seq[byte];
+                 outLen: var int): bool =
+  ## Deflates straight out of the string.
+  ##
+  ## It used to copy `text` into a `seq[byte]` first, one byte at a time, which
+  ## on the static tables was more wall time than the compression itself.
   outLen = 0
   into = @[]
   if text.len == 0:
     return true
-  var src = toBytes(text)
   let cap = cZlibBound(int32(text.len))
   into = newSeq[byte](int(cap))
-  let n = cZlibDeflate(cast[WirePtr](addr src[0]), int32(text.len),
+  let n = cZlibDeflate(cast[WirePtr](readRawData(text)), int32(text.len),
                        cast[WirePtr](addr into[0]), cap)
   if n < 0'i32:
     return false
   outLen = int(n)
+  result = true
+
+# --------------------------------------------------- the compressed-body cache
+#
+# The static tables are the same bytes on every request and deflating 4 MB of
+# JSON costs ~45 ms. Nothing about them changes between requests, so the second
+# and every later request for one should not pay that again.
+#
+# **The cache key is the response text itself**, not the URL and not a database
+# revision counter. That is the whole design. A key derived from anything else
+# has to be invalidated when the answer changes, and the answer here can change
+# for reasons this module cannot see -- `dbPatch` from a timer, a mod rebuilding
+# a table, a route that varies its answer by session. Keying on the bytes makes
+# a stale hit impossible by construction: an entry can only be returned for a
+# body byte-identical to the one it was built from. The price is a `memcmp` of
+# the body per request, which at 4 MB is under a millisecond against the 45 the
+# deflate costs.
+
+const
+  ZCacheMinBody = 8192   ## below this, the compare costs more than the deflate
+  ZCacheMax = 12         ## entries; the emulator has seven bodies this large
+
+type
+  ZEntry = object
+    text: string
+    packed: seq[byte]
+    packedLen: int
+    stamp: int64
+
+var gZCache: seq[ZEntry] = @[]
+var gZStamp = 0'i64
+var gZHits = 0
+var gZMisses = 0
+
+proc zFind(body: string): int =
+  ## Caller holds the lock. Length first: it rejects every non-candidate
+  ## without touching the bytes.
+  result = -1
+  for i in 0 ..< gZCache.len:
+    if gZCache[i].text.len == body.len and gZCache[i].text == body:
+      return i
+
+proc cachedDeflate(body: string; into: var seq[byte]; outLen: var int): bool =
+  if body.len < ZCacheMinBody:
+    return deflateBody(body, into, outLen)
+
+  cLock()
+  var hit = zFind(body)
+  if hit >= 0:
+    inc gZStamp
+    gZCache[hit].stamp = gZStamp
+    inc gZHits
+    outLen = gZCache[hit].packedLen
+    into = newSeq[byte](if outLen > 0: outLen else: 1)
+    if outLen > 0:
+      copyMem(addr into[0], addr gZCache[hit].packed[0], outLen)
+    cUnlock()
+    return true
+  inc gZMisses
+  cUnlock()
+
+  # Deflated outside the lock. Holding it here would serialise every worker
+  # behind the first one to ask for a table, which is exactly the moment the
+  # client asks for all of them at once.
+  if not deflateBody(body, into, outLen):
+    return false
+
+  cLock()
+  # Re-checked, because two workers can miss the same body at the same time and
+  # the second one must not add a duplicate entry that then evicts a live one.
+  if zFind(body) < 0:
+    var slot = -1
+    if gZCache.len >= ZCacheMax:
+      slot = 0
+      for i in 1 ..< gZCache.len:
+        if gZCache[i].stamp < gZCache[slot].stamp:
+          slot = i
+    inc gZStamp
+    var p = newSeq[byte](if outLen > 0: outLen else: 1)
+    if outLen > 0:
+      copyMem(addr p[0], addr into[0], outLen)
+    let e = ZEntry(text: body, packed: p, packedLen: outLen, stamp: gZStamp)
+    if slot >= 0: gZCache[slot] = e
+    else: gZCache.add e
+  cUnlock()
   result = true
 
 # --------------------------------------------------------------- http
@@ -211,27 +300,36 @@ proc parseHead(head: string; r: var Request; contentLength: var int): bool =
   r.ok = true
   result = true
 
-proc sendResponse(sock: uint64; status: string; body: string; compress: bool) =
+proc sendResponse(sock: uint64; status: string; body: string;
+                  compress: bool; keepAlive = false) =
   var payload: seq[byte] = @[]
   var payloadLen = 0
+  var compressed = false
   if compress and body.len > 0:
-    if not deflateBody(body, payload, payloadLen):
-      payload = toBytes(body)
+    if cachedDeflate(body, payload, payloadLen):
+      compressed = true
+    else:
       payloadLen = body.len
   else:
-    payload = toBytes(body)
     payloadLen = body.len
 
   var head = "HTTP/1.1 " & status & "\r\n"
   head.add "Content-Type: application/json\r\n"
   head.add "Content-Length: " & $payloadLen & "\r\n"
-  head.add "Connection: close\r\n"
+  head.add(if keepAlive: "Connection: keep-alive\r\n"
+           else: "Connection: close\r\n")
   head.add "\r\n"
 
-  var headBytes = toBytes(head)
-  discard cNetSend(sock, cast[HostPtr](addr headBytes[0]), int32(head.len))
+  discard cNetSend(sock, cast[HostPtr](toCString(head)), int32(head.len))
   if payloadLen > 0:
-    discard cNetSend(sock, cast[HostPtr](addr payload[0]), int32(payloadLen))
+    if compressed:
+      discard cNetSend(sock, cast[HostPtr](addr payload[0]), int32(payloadLen))
+    else:
+      # Straight out of the string. The uncompressed path used to copy the body
+      # into a `seq[byte]` for no reason but having a pointer to hand `send`,
+      # and `readRawData` already is one.
+      discard cNetSend(sock, cast[HostPtr](readRawData(body)),
+                       int32(payloadLen))
 
 # --------------------------------------------------------------- routing
 
@@ -275,7 +373,10 @@ proc runRoute(index: int; r: Request; into: var string): bool =
                         cast[HostPtr](toCString(session)), int32(session.len),
                         cast[HostPtr](addr outPtr), cast[HostPtr](addr outLen))
   if outPtr != nil and outLen > 0'i32:
-    into = readBytes(outPtr, outLen)
+    # `readMem`, not `modhost.readBytes`: the latter goes through
+    # `aowl_byte_at`, one call across a translation unit per byte, and a static
+    # table is millions of them. Same bytes, one `copyMem`.
+    into = readMem(cast[WirePtr](outPtr), outLen)
   if outPtr != nil:
     cFreeBuf(outPtr)
   result = st == StatusOk
@@ -288,27 +389,39 @@ proc serveConnection(sock: uint64) {.exportc: "aowlspt_nim_serve", cdecl.} =
   var buf = newSeq[byte](65536)
   var have = 0
   var headEnd = -1
+  var sep = 4
 
   # Read until the header terminator. The body may already be partly here.
+  #
+  # The terminator is looked for in the byte buffer, and only in the bytes that
+  # arrived since the last look. It used to turn the whole buffer into a string
+  # and `find` in that after every `recv`, which is quadratic in the number of
+  # segments and allocates a copy of the request per segment.
+  var scanned = 0
   while headEnd < 0 and have < buf.len:
     let n = cNetRecv(sock, cast[HostPtr](addr buf[have]), int32(buf.len - have))
     if n <= 0'i32:
       return
     have = have + int(n)
-    let text = fromBytes(buf, have)
-    headEnd = find(text, "\r\n\r\n")
-    if headEnd < 0 and find(text, "\n\n") >= 0:
-      headEnd = find(text, "\n\n")
+    var k = if scanned > 3: scanned - 3 else: 0
+    while k + 1 < have:
+      if buf[k] == byte(13) and k + 3 < have and buf[k + 1] == byte(10) and
+         buf[k + 2] == byte(13) and buf[k + 3] == byte(10):
+        headEnd = k
+        sep = 4
+        break
+      if buf[k] == byte(10) and buf[k + 1] == byte(10):
+        headEnd = k
+        sep = 2
+        break
+      inc k
+    scanned = have
 
   if headEnd < 0:
     sendResponse(sock, "431 Request Header Fields Too Large", "", false)
     return
 
-  let whole = fromBytes(buf, have)
-  let head = whole.substr(0, headEnd - 1)
-  var sep = 4
-  if whole.substr(headEnd, headEnd + 1) == "\n\n":
-    sep = 2
+  let head = bytesAt(buf, 0, headEnd)
 
   var req = Request(verb: "", url: "", session: "", body: "", ok: false)
   var contentLength = 0
@@ -317,13 +430,14 @@ proc serveConnection(sock: uint64) {.exportc: "aowlspt_nim_serve", cdecl.} =
     return
 
   # Pull the rest of the body.
-  var bodyStart = headEnd + sep
+  let bodyStart = headEnd + sep
   var bodyBytes = newSeq[byte](if contentLength > 0: contentLength else: 1)
-  var bodyHave = 0
-  for i in bodyStart ..< have:
-    if bodyHave < contentLength:
-      bodyBytes[bodyHave] = buf[i]
-      inc bodyHave
+  var bodyHave = have - bodyStart
+  if bodyHave > contentLength: bodyHave = contentLength
+  if bodyHave < 0: bodyHave = 0
+  if bodyHave > 0:
+    copyMem(addr bodyBytes[0],
+            cast[pointer](cast[uint](addr buf[0]) + uint(bodyStart)), bodyHave)
   while bodyHave < contentLength:
     let n = cNetRecv(sock, cast[HostPtr](addr bodyBytes[bodyHave]),
                      int32(contentLength - bodyHave))
@@ -617,8 +731,13 @@ proc hostStoreList(ctx: HostPtr; prefix: HostPtr; prefixLen: int32;
   var v = storeKeys(guid, p)
   result = cOutCopy(outPtr, outLen, cast[HostPtr](toCString(v)), int32(v.len))
 
-proc patchFired(slot: int32) {.exportc: "aowlspt_nim_patch_fired", cdecl.} =
-  discard
+proc patchFired(slot: int32; regs: HostPtr): int32 {.
+    exportc: "aowlspt_nim_patch_fired", cdecl.} =
+  ## Nothing here can fire: the backend refuses `patch` outright, having no
+  ## compiled game code to detour. It exists because the shim declares the
+  ## symbol unconditionally and the link needs one. Zero means "run the
+  ## original", which is the only safe answer for a slot that cannot exist.
+  result = 0'i32
 
 # --------------------------------------------------------------- self test
 

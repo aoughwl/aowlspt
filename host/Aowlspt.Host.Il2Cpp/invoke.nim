@@ -34,6 +34,17 @@ proc cArgsSetF32*(p: ArgsPtr; i: int32; v: float) {.
 proc cArgsSetF64*(p: ArgsPtr; i: int32; v: float) {.
   importc: "aowl_args_set_f64", nodecl.}
 
+proc cRegsInt*(p: Il2CppPtr; i: int32): uint64 {.
+  importc: "aowl_regs_int", nodecl.}
+proc cRegsFlt*(p: Il2CppPtr; i: int32): float {.
+  importc: "aowl_regs_flt", nodecl.}
+proc cRegsSetRetInt*(p: Il2CppPtr; v: uint64) {.
+  importc: "aowl_regs_set_ret_int", nodecl.}
+proc cRegsSetRetF32*(p: Il2CppPtr; v: float) {.
+  importc: "aowl_regs_set_ret_f32", nodecl.}
+proc cRegsSetRetF64*(p: Il2CppPtr; v: float) {.
+  importc: "aowl_regs_set_ret_f64", nodecl.}
+
 proc cCellNew*(): Il2CppPtr {.importc: "aowl_cell_new", nodecl.}
 proc cCellFree*(p: Il2CppPtr) {.importc: "aowl_cell_free", nodecl.}
 proc cCellSetI32*(p: Il2CppPtr; v: int32) {.importc: "aowl_cell_set_i32", nodecl.}
@@ -343,6 +354,160 @@ proc describeResult*(rt: Il2Cpp; m: Il2CppMethod; res: Il2CppObject;
 # field. `#7::@health` reads it, and the same target with one argument writes
 # it. No new ABI entry, because the escape hatch is already the thing that means
 # "reach something the header has not grown a door for".
+
+# ---------------------------------------------------------------------------
+# Decoding a patched method's arguments
+# ---------------------------------------------------------------------------
+#
+# The detour thunk saves RCX/RDX/R8/R9 and XMM0-3 -- every register an argument
+# can arrive in on this ABI -- and hands the frame here. Turning that back into
+# values needs the method's declared signature, for the same reason binding an
+# argument does: the bytes in a register do not say whether they are an `int`,
+# a `float` or a pointer, and only the declaration knows.
+#
+# Position picks the register file. Argument 0 is RCX *or* XMM0 depending on its
+# declared type, argument 1 is RDX *or* XMM1, and so on -- there is not a
+# separate counter per file. Getting that wrong reads the right bits from the
+# wrong place for every argument after the first float.
+#
+# A compiled instance method takes `this` in position 0, so its declared
+# parameters start at position 1. A static one starts at 0. That is what
+# `methodIsStatic` is for, and it is the difference between correct values and
+# confidently wrong ones.
+
+proc escapeForJson*(s: string): string =
+  ## A game string reaches a patch handler inside a JSON array, so it has to be
+  ## escaped -- a nickname with a quote in it would otherwise produce a body the
+  ## handler cannot parse, blamed on the handler.
+  result = ""
+  for ch in s:
+    case ch
+    of '"': result.add "\\\""
+    of '\\': result.add "\\\\"
+    of '\n': result.add "\\n"
+    of '\r': result.add "\\r"
+    of '\t': result.add "\\t"
+    else:
+      if ord(ch) < 0x20:
+        const hexd = "0123456789abcdef"
+        result.add "\\u00"
+        result.add hexd[(ord(ch) shr 4) and 0xF]
+        result.add hexd[ord(ch) and 0xF]
+      else:
+        result.add ch
+
+const MaxRegArgs* = 4
+
+proc describeArgs*(rt: Il2Cpp; m: Il2CppMethod; regs: Il2CppPtr;
+                   handles: var seq[Il2CppPtr]; isObject: var seq[bool];
+                   gcHandles: var seq[uint32]): string =
+  ## The arguments as a JSON array, in the same shape `call` accepts -- so a
+  ## patch handler reads them with the same `aowlspt/json` a route handler uses
+  ## on a request body.
+  ##
+  ## Arguments past the fourth arrive on the stack and are **not** reported.
+  ## They are omitted rather than guessed at: a patch that reports the wrong
+  ## fifth argument is worse than one that reports four and says so.
+  let isStatic = methodIsStatic(rt, m)
+  let declared = methodParamCount(rt, m)
+  var out1 = "["
+  var i = 0
+  while i < declared:
+    let pos = (if isStatic: i else: i + 1)
+    if pos >= MaxRegArgs:
+      break
+    if i > 0: out1.add ","
+    let t = typeName(rt, methodParam(rt, m, i))
+    if t == "System.Single":
+      out1.add $cRegsFlt(regs, int32(pos))
+    elif t == "System.Double":
+      out1.add $cRegsFlt(regs, int32(pos))
+    elif t == "System.Boolean":
+      out1.add (if (cRegsInt(regs, int32(pos)) and 0xFF'u64) != 0'u64: "true"
+                else: "false")
+    elif isIntegerType(t):
+      out1.add $int(int32(cRegsInt(regs, int32(pos)) and 0xFFFFFFFF'u64))
+    elif isLongType(t):
+      out1.add $int64(cRegsInt(regs, int32(pos)))
+    elif t == "System.String":
+      let p = cast[Il2CppPtr](cRegsInt(regs, int32(pos)))
+      if p == nil:
+        out1.add "null"
+      else:
+        out1.add "\"" & escapeForJson(readString(rt, p)) & "\""
+    else:
+      # A reference argument. Registered as a handle so the patch can call
+      # methods on the very object the game was about to act on -- which is the
+      # whole reason to want the arguments at all.
+      let p = cast[Il2CppPtr](cRegsInt(regs, int32(pos)))
+      if p == nil:
+        out1.add "null"
+      else:
+        let gc = gcHandleNew(rt, p, false)
+        if gc == 0'u32:
+          out1.add "{\"type\":\"" & t & "\"}"
+        else:
+          handles.add cast[Il2CppPtr](0)
+          isObject.add true
+          gcHandles.add gc
+          out1.add "{\"handle\":" & $handles.len & ",\"type\":\"" & t & "\"}"
+    inc i
+  out1.add "]"
+  result = out1
+
+proc thisOf*(rt: Il2Cpp; m: Il2CppMethod; regs: Il2CppPtr): Il2CppPtr =
+  ## The instance a patched method was called on, or nil for a static method.
+  if methodIsStatic(rt, m):
+    return cast[Il2CppPtr](0)
+  result = cast[Il2CppPtr](cRegsInt(regs, 0'i32))
+
+proc applyPatchReturn*(rt: Il2Cpp; m: Il2CppMethod; regs: Il2CppPtr;
+                       json: string): bool =
+  ## Writes a replacement return value into the saved frame, by the method's
+  ## **declared** return type. Returns false when the type is one this cannot
+  ## produce, so the caller can refuse the suppression rather than let the
+  ## original be skipped and garbage returned in its place -- which would be the
+  ## worst outcome available.
+  let t = typeName(rt, methodReturnType(rt, m))
+  if t == "System.Void":
+    cRegsSetRetInt(regs, 0'u64)
+    return true
+  var values: seq[JsonValue] = @[]
+  var err = ""
+  # The handler hands back a bare value; wrapping it in an array reuses the one
+  # parser rather than growing a second one that can disagree with it.
+  if not parseArgs("[" & json & "]", values, err) or values.len != 1:
+    return false
+  let v = values[0]
+  if t == "System.Single":
+    if v.kind == jkFloat: cRegsSetRetF32(regs, v.f)
+    elif v.kind == jkInt: cRegsSetRetF32(regs, float(v.i))
+    else: return false
+    return true
+  if t == "System.Double":
+    if v.kind == jkFloat: cRegsSetRetF64(regs, v.f)
+    elif v.kind == jkInt: cRegsSetRetF64(regs, float(v.i))
+    else: return false
+    return true
+  if t == "System.Boolean":
+    if v.kind != jkBool: return false
+    cRegsSetRetInt(regs, (if v.b: 1'u64 else: 0'u64))
+    return true
+  if isIntegerType(t) or isLongType(t):
+    if v.kind != jkInt: return false
+    cRegsSetRetInt(regs, uint64(v.i))
+    return true
+  if t == "System.String":
+    if v.kind == jkNull:
+      cRegsSetRetInt(regs, 0'u64)
+      return true
+    if v.kind != jkString: return false
+    cRegsSetRetInt(regs, uint64(cast[uint](newString(rt, v.s))))
+    return true
+  if v.kind == jkNull:
+    cRegsSetRetInt(regs, 0'u64)
+    return true
+  result = false
 
 proc readField*(rt: Il2Cpp; cls: Il2CppClass; obj: Il2CppObject;
                 name: string; handles: var seq[Il2CppPtr];
