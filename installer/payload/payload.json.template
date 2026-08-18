@@ -1,0 +1,15 @@
+{
+  "name": "aowlspt",
+  "version": "0.1.0",
+
+  "//": "The client these binaries were built against. Read it off your own",
+  "//": "install with: aowlspt-install detect. Required.",
+  "targetTarkovVersion": "1.1.0.46777",
+
+  "//": "mono for pre-1.0 clients, il2cpp for post-1.0. Required, and not",
+  "//": "inferable from the version -- see README.md.",
+  "targetBackend": "il2cpp",
+
+  "//": "Written to <target>/aowlspt/backend.json for the client to read.",
+  "backendUrl": "https://127.0.0.1:6969"
+}

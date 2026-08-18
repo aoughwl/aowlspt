@@ -1,0 +1,27 @@
+# Build output
+bin/
+obj/
+nimcache/
+
+# nimony leaves its intermediate NIF files beside the sources it compiles
+*.nif
+!reference/**/*.nif
+
+# Tool output that is regenerated rather than reviewed
+reference/*.txt
+reference/*.err
+
+# Local editor state
+.vs/
+.idea/
+*.user
+
+# Installer build output and the payload assembled into the tree by `aowl payload`
+installer/build/
+installer/payload/aowlspt/
+installer/payload/runtime/
+installer/payload/client/
+installer/payload/payload.json
+
+# Compiled test executables left beside the ABI layout tests
+tests/*.exe

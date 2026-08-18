@@ -1,0 +1,52 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <!--
+      netstandard2.1 because this loads into Unity's Mono runtime, not .NET.
+      That constraint is why the shared Aowlspt.Abi assembly targets it too.
+    -->
+    <TargetFramework>netstandard2.1</TargetFramework>
+    <AssemblyName>Aowlspt.Host.Client</AssemblyName>
+    <RootNamespace>Aowlspt.Host.Client</RootNamespace>
+    <LangVersion>latest</LangVersion>
+    <Nullable>enable</Nullable>
+    <Version>1.0.0</Version>
+
+    <!--
+      Point SptRoot at an SPT install to compile. Every reference is
+      Private=false: the install is read for metadata and never written to, and
+      nothing from it is copied into the output.
+    -->
+    <SptRoot Condition="'$(SptRoot)' == ''">D:\SPT</SptRoot>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Aowlspt.Abi\Aowlspt.Abi.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="BepInEx">
+      <HintPath>$(SptRoot)\BepInEx\core\BepInEx.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="0Harmony">
+      <HintPath>$(SptRoot)\BepInEx\core\0Harmony.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine">
+      <HintPath>$(SptRoot)\EscapeFromTarkov_Data\Managed\UnityEngine.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="UnityEngine.CoreModule">
+      <HintPath>$(SptRoot)\EscapeFromTarkov_Data\Managed\UnityEngine.CoreModule.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Assembly-CSharp">
+      <HintPath>$(SptRoot)\EscapeFromTarkov_Data\Managed\Assembly-CSharp.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="Newtonsoft.Json">
+      <HintPath>$(SptRoot)\EscapeFromTarkov_Data\Managed\Newtonsoft.Json.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+</Project>

@@ -1,0 +1,45 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>Aowlspt.Host.Server</AssemblyName>
+    <RootNamespace>Aowlspt.Host.Server</RootNamespace>
+    <Nullable>enable</Nullable>
+    <ImplicitUsings>enable</ImplicitUsings>
+    <LangVersion>latest</LangVersion>
+    <Version>1.0.0</Version>
+
+    <!--
+      Point SptRoot at an SPT 4.x install to compile against its assemblies.
+      Nothing is ever written there: every reference is Private=false, so the
+      SPT DLLs are read for metadata and never copied into the output.
+    -->
+    <SptRoot Condition="'$(SptRoot)' == ''">D:\SPT\SPT_Runtime</SptRoot>
+  </PropertyGroup>
+
+  <ItemGroup>
+    <ProjectReference Include="..\Aowlspt.Abi\Aowlspt.Abi.csproj" />
+  </ItemGroup>
+
+  <ItemGroup>
+    <Reference Include="SPTarkov.Common">
+      <HintPath>$(SptRoot)\SPTarkov.Common.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="SPTarkov.DI">
+      <HintPath>$(SptRoot)\SPTarkov.DI.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="SPTarkov.Server.Core">
+      <HintPath>$(SptRoot)\SPTarkov.Server.Core.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="SemanticVersioning">
+      <HintPath>$(SptRoot)\SemanticVersioning.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+    <Reference Include="0Harmony">
+      <HintPath>$(SptRoot)\0Harmony.dll</HintPath>
+      <Private>false</Private>
+    </Reference>
+  </ItemGroup>
+</Project>
