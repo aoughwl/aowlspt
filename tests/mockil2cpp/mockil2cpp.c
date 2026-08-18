@@ -374,10 +374,16 @@ static void* m_playerHurt(void* obj, void** params) {
  * It must be a *compiled* method rather than an invoker, and that distinction
  * is what this pair exists to enforce. Suppressing a detour on an invoker
  * returns the replacement where `runtime_invoke` expects a boxed object, and
- * the caller dereferences a float as a pointer -- which is a segfault, and was
- * one, before the mock grew `native`. Detouring the compiled function instead
- * puts the replacement in XMM0 where the invoker boxes it, exactly as it would
- * in the game. */
+ * the caller dereferences a float as a pointer -- which is a segfault.
+ * Detouring the compiled function instead puts the replacement in XMM0 where
+ * the invoker boxes it, exactly as it would in the game.
+ *
+ * Growing `native` was only half of that. The other half was `runtime_invoke`,
+ * which went on calling `methodPointer` directly -- so once `methodPointer`
+ * became the compiled function, invoke handed `(obj, params)` to something
+ * whose signature is `(float, MethodInfo*)` and unboxed the returned float by
+ * dereferencing it. The same segfault, one level along, and it looked like the
+ * detour engine's because it only appeared when a suppression was in flight. */
 static int32_t g_boostCalls = 0;
 static float mock_native_boost(float amount, void* methodInfo) {
     (void)methodInfo;

@@ -82,3 +82,14 @@ proc unbind*(session: string) =
 proc sessionCount*(): int =
   ensureLoaded()
   result = gBindings.len
+
+proc boundSessions*(sessions, profiles: var seq[string]) =
+  ## Every session and the profile it is playing, for a sweep that has to visit
+  ## each of them. Two parallel sequences rather than the internal record type,
+  ## so nothing outside this module depends on how a binding is stored.
+  ensureLoaded()
+  sessions = @[]
+  profiles = @[]
+  for b in gBindings:
+    sessions.add b.session
+    profiles.add b.profile

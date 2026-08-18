@@ -27,6 +27,17 @@ proc cZlibFramed*(p: WirePtr; len: int32): int32 {.
   importc: "aowl_zlib_looks_framed", nodecl.}
 
 {.emit: """
+/* One clock for both request paths. QPC rather than GetTickCount64: a small
+ * request answers in a couple of hundred microseconds and a millisecond clock
+ * cannot see that at all. */
+static int64_t aowl_wire_now_us(void) {
+  LARGE_INTEGER v, f;
+  QueryPerformanceCounter(&v);
+  QueryPerformanceFrequency(&f);
+  return (int64_t)((v.QuadPart / f.QuadPart) * 1000000LL +
+                   ((v.QuadPart % f.QuadPart) * 1000000LL) / f.QuadPart);
+}
+
 static uint64_t aowl_wire_connect(int32_t port) {
   SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
   if (s == INVALID_SOCKET) return 0;
@@ -46,6 +57,7 @@ static uint64_t aowl_wire_connect(int32_t port) {
 """.}
 
 proc cConnect*(port: int32): uint64 {.importc: "aowl_wire_connect", nodecl.}
+proc nowUs*(): int64 {.importc: "aowl_wire_now_us", nodecl.}
 proc cSend*(sock: uint64; buf: WirePtr; len: int32): int32 {.
   importc: "aowl_net_send", nodecl.}
 proc cRecv*(sock: uint64; buf: WirePtr; len: int32): int32 {.
@@ -58,6 +70,12 @@ type
     status*: string
     body*: string
     error*: string
+    ttfbUs*: int64
+      ## Microseconds from "request sent" to "first byte of the answer
+      ## arrived". This is the server's time; everything after it is transfer
+      ## and decompression on this side. Splitting the two matters because the
+      ## largest bodies here are dominated by the client's own `inflate`, and a
+      ## round-trip number alone makes that look like server cost.
 
 proc toBytes*(s: string): seq[byte] =
   ## `copyMem`, not a byte loop.
@@ -131,7 +149,7 @@ proc splitUrl*(url: string; port: var int; path: var string) =
 
 proc request*(port: int; path, body, session: string;
               compress = true): Response =
-  result = Response(ok: false, status: "", body: "", error: "")
+  result = Response(ok: false, status: "", body: "", error: "", ttfbUs: 0)
 
   let sock = cConnect(int32(port))
   if sock == 0'u64:
@@ -178,6 +196,7 @@ proc request*(port: int; path, body, session: string;
   # that. The symptom was not a short body but "the response body would not
   # inflate", because a truncated zlib stream is a corrupt one, so the bug read
   # as a server fault rather than a client one.
+  let sentAt = nowUs()
   var buf = newSeq[byte](262144)
   var have = 0
   while true:
@@ -188,6 +207,8 @@ proc request*(port: int; path, body, session: string;
     let m = cRecv(sock, cast[WirePtr](addr buf[have]), int32(buf.len - have))
     if m <= 0'i32:
       break
+    if have == 0:
+      result.ttfbUs = nowUs() - sentAt
     have = have + int(m)
   cClose(sock)
 
@@ -250,3 +271,191 @@ proc request*(port: int; path, body, session: string;
 
 proc contains*(r: Response; text: string): bool =
   result = find(r.body, text) >= 0
+
+# --------------------------------------------------------------- keep-alive
+#
+# `request` above opens a connection, says `Connection: close` and reads to
+# end-of-stream. That is the right shape for `aowlprobe` and for the self test:
+# one question, one answer, nothing to clean up, and it works against a server
+# that does not do keep-alive at all.
+#
+# A load generator is the other case. A session is thousands of small requests
+# and a handshake per request is a real share of each answer, so `Conn` holds
+# one socket open across them. Reading to end-of-stream is no longer available
+# as a frame -- the stream does not end -- so this path reads exactly the
+# `Content-Length` the response declares, and keeps whatever arrived past it
+# for the next call.
+
+type
+  Conn* = object
+    sock*: uint64
+    buf*: seq[byte]
+    have*: int
+    port*: int
+
+proc openConn*(port: int): Conn =
+  result = Conn(sock: cConnect(int32(port)), buf: newSeq[byte](262144),
+                have: 0, port: port)
+
+proc closeConn*(c: var Conn) =
+  if c.sock != 0'u64:
+    cClose(c.sock)
+    c.sock = 0'u64
+  c.have = 0
+
+proc findTerminator(b {.byref.}: seq[byte]; have: int;
+                    headEnd, sep: var int): bool =
+  headEnd = -1
+  sep = 4
+  var k = 0
+  while k + 1 < have:
+    if b[k] == byte(13) and k + 3 < have and b[k + 1] == byte(10) and
+       b[k + 2] == byte(13) and b[k + 3] == byte(10):
+      headEnd = k
+      sep = 4
+      return true
+    if b[k] == byte(10) and b[k + 1] == byte(10):
+      headEnd = k
+      sep = 2
+      return true
+    inc k
+  result = false
+
+proc contentLengthOf(head: string): int =
+  ## `-1` for "not stated", which on a keep-alive connection is unrecoverable:
+  ## there is no end-of-stream to fall back on.
+  result = -1
+  let lines = splitLines(head)
+  for i in 0 ..< lines.len:
+    let l = lines[i]
+    let colon = find(l, ":")
+    if colon < 0: continue
+    if toLowerAscii(strip(l.substr(0, colon - 1))) != "content-length":
+      continue
+    var v = 0
+    var any = false
+    for ch in strip(l.substr(colon + 1)):
+      if ch >= '0' and ch <= '9':
+        v = v * 10 + (ord(ch) - ord('0'))
+        any = true
+      else:
+        break
+    if any: return v
+  result = -1
+
+proc requestOn*(c: var Conn; path, body, session: string;
+                compress = true): Response =
+  ## One request on a connection that stays open. Reconnects once if the server
+  ## closed the connection between requests -- which it will, at the keep-alive
+  ## bound -- because a load generator that dies at request five hundred and
+  ## thirteen is measuring the bound rather than the server.
+  result = Response(ok: false, status: "", body: "", error: "", ttfbUs: 0)
+  if c.sock == 0'u64:
+    c = openConn(c.port)
+    if c.sock == 0'u64:
+      result.error = "could not connect to 127.0.0.1:" & $c.port
+      return
+
+  var payload: seq[byte] = @[]
+  var payloadLen = 0
+  if body.len > 0:
+    if compress:
+      var src = toBytes(body)
+      let cap = cZlibBound(int32(body.len))
+      payload = newSeq[byte](int(cap))
+      let m = cZlibDeflate(cast[WirePtr](addr src[0]), int32(body.len),
+                           cast[WirePtr](addr payload[0]), cap)
+      if m < 0'i32:
+        result.error = "could not compress the body"
+        return
+      payloadLen = int(m)
+    else:
+      payload = toBytes(body)
+      payloadLen = body.len
+
+  var req = (if body.len > 0: "POST " else: "GET ") & path & " HTTP/1.1\r\n"
+  req.add "Host: 127.0.0.1:" & $c.port & "\r\n"
+  req.add "Cookie: PHPSESSID=" & session & "\r\n"
+  req.add "Content-Length: " & $payloadLen & "\r\n"
+  req.add "Connection: keep-alive\r\n\r\n"
+
+  var headBytes = toBytes(req)
+  if cSend(c.sock, cast[WirePtr](addr headBytes[0]), int32(req.len)) < 0'i32:
+    closeConn(c)
+    result.error = "could not send"
+    return
+  if payloadLen > 0:
+    discard cSend(c.sock, cast[WirePtr](addr payload[0]), int32(payloadLen))
+
+  let sentAt = nowUs()
+  var headEnd = -1
+  var sep = 4
+  while not findTerminator(c.buf, c.have, headEnd, sep):
+    if c.have >= c.buf.len:
+      var bigger = newSeq[byte](c.buf.len * 2)
+      copyMem(addr bigger[0], addr c.buf[0], c.have)
+      c.buf = bigger
+    let m = cRecv(c.sock, cast[WirePtr](addr c.buf[c.have]),
+                  int32(c.buf.len - c.have))
+    if m <= 0'i32:
+      closeConn(c)
+      result.error = "the server closed without answering"
+      return
+    if result.ttfbUs == 0'i64:
+      result.ttfbUs = nowUs() - sentAt
+    c.have = c.have + int(m)
+
+  let headText = bytesAt(c.buf, 0, headEnd)
+  result.status = splitLines(headText)[0]
+  let bodyStart = headEnd + sep
+  let length = contentLengthOf(headText)
+  if length < 0:
+    closeConn(c)
+    result.error = "no Content-Length on a keep-alive response"
+    return
+
+  while c.have < bodyStart + length:
+    if c.have >= c.buf.len:
+      var bigger = newSeq[byte](c.buf.len * 2)
+      copyMem(addr bigger[0], addr c.buf[0], c.have)
+      c.buf = bigger
+    let m = cRecv(c.sock, cast[WirePtr](addr c.buf[c.have]),
+                  int32(c.buf.len - c.have))
+    if m <= 0'i32:
+      closeConn(c)
+      result.error = "the response body was cut short"
+      return
+    c.have = c.have + int(m)
+
+  if length > 0:
+    let rawAt = cast[WirePtr](cast[uint](addr c.buf[0]) + uint(bodyStart))
+    if cZlibFramed(rawAt, int32(length)) != 0'i32:
+      var cap = length * 8
+      if cap < 65536: cap = 65536
+      var tries = 0
+      var done = false
+      while tries < 6 and not done:
+        var dst = newSeq[byte](cap)
+        let m = cZlibInflate(rawAt, int32(length),
+                             cast[WirePtr](addr dst[0]), int32(cap))
+        if m >= 0'i32:
+          result.body = fromBytes(dst, int(m))
+          done = true
+        else:
+          cap = cap * 4
+          inc tries
+      if not done:
+        result.error = "the response body would not inflate"
+        return
+    else:
+      result.body = bytesAt(c.buf, bodyStart, length)
+
+  # Whatever came in past this response belongs to the next one.
+  let consumed = bodyStart + length
+  var leftover = c.have - consumed
+  if leftover < 0: leftover = 0
+  if leftover > 0:
+    copyMem(addr c.buf[0],
+            cast[pointer](cast[uint](addr c.buf[0]) + uint(consumed)), leftover)
+  c.have = leftover
+  result.ok = true

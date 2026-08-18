@@ -48,6 +48,8 @@
 ##
 ##     GET  /aowlspt/mods                what this is, and a one-line summary
 ##     GET  /aowlspt/mods/list           every mod, its verdict and the reason
+##     GET  /aowlspt/mods/panel          the same, flattened for the in-game overlay
+##     POST /aowlspt/mods/toggle/<id>    {"enabled":true} -- set it and apply it
 ##     GET  /aowlspt/mods/lists          the lists in the registry
 ##     GET  /aowlspt/mods/conflicts      only the problems
 ##     GET  /aowlspt/mods/describe/<id>  one mod, in full
@@ -61,6 +63,27 @@
 ##
 ## Every route also accepts `{"id":"..."}` in the body, because a browser can
 ## reach a path and a script would rather send a document.
+##
+## ## The panel route
+##
+## `/aowlspt/mods/panel` and `/aowlspt/mods/toggle/<id>` are the two the in-game
+## overlay speaks, and they exist because the overlay's JSON reader is 60 lines
+## of C running on a worker thread inside `EscapeFromTarkov.exe` — see the note
+## at the top of `abi/aowlspt_overlay.h`. The alternative was to grow that reader
+## until it could walk `/aowlspt/mods/list`'s decision objects and cross-index
+## them against `/describe` for a version string, and the rule the overlay is
+## written under is that if the shapes do not fit, the *server* flattens them.
+## So the panel route answers exactly one flat array of rows, with the four
+## fields the reader already knew and two it now needs (`live`, `restart`), and
+## nothing about it is load-bearing for any other consumer.
+##
+## The rows are the registry's view — the mods this manager resolves, on the
+## side it is running on. A client-side mod the backend has never heard of is not
+## in it, and must not be: the client host pushes those into the overlay itself
+## through `overlaySetMod`, and the overlay merges the two by guid. That is why
+## `live` is `null` rather than `false` when no host has answered the control
+## probe — an unknown rendered as "not loaded" would grey out every row the
+## client host had just told the truth about.
 
 import std/syncio
 import aowlspt

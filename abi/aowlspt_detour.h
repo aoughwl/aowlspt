@@ -15,15 +15,24 @@
  * useless: it would appear to work in a test and never fire in a raid. So the
  * code gets patched and `methodPointer` is left alone.
  *
- * **Why there is a length decoder below.** The jump needs 12 bytes, and x64
- * instructions are variable length, so the bytes being overwritten have to be
- * decoded to find a whole number of them. Copying a partial instruction into
- * the trampoline produces garbage that then executes.
+ * **Why there is a length decoder below.** The jump needs `AOWL_JMP_SIZE`
+ * bytes, and x64 instructions are variable length, so the bytes being
+ * overwritten have to be decoded to find a whole number of them. Copying a
+ * partial instruction into the trampoline produces garbage that then executes.
  *
- * The decoder is deliberately conservative: it covers the instruction forms a
- * function prologue actually contains and refuses anything it does not
- * recognise rather than guessing a length. A refused patch is an error a mod
- * author can read. A guessed length is a corrupted game.
+ * The decoder refuses anything it does not recognise rather than guessing a
+ * length. A refused patch is an error a mod author can read. A guessed length
+ * is a corrupted game.
+ *
+ * "Conservative" is not the same as "small", though, and it was small for a
+ * while in a way that made it useless. It covered the one-byte map and a
+ * handful of two-byte opcodes, which is the prologue of a function that does
+ * integer work -- and almost nothing in a Unity game does integer work. An
+ * ordinary method opens `pxor`/`cvtsi2ss`/`mulss`/`movss`, all of it in the
+ * two-byte map, and every one of those was refused. So the two-byte map is
+ * covered properly: the mandatory prefixes, the three-byte escapes, and the
+ * opcodes that carry an immediate, which is the one fact a length decoder
+ * cannot get from the ModRM byte.
  *
  * RIP-relative instructions encode a displacement from their own address, so
  * copying one into a trampoline silently changes where it points. They are
@@ -33,9 +42,17 @@
  * instruction moved, and the patch is refused if the result no longer fits in
  * 32 bits.
  *
- * Relative branches (`call rel32`, `jmp rel8/32`, `jcc`) are still refused.
- * They could be rewritten too, but they are rare this early in a function, and
- * a refusal a mod author can read beats a rewrite nobody has checked.
+ * Relative branches (`call rel32`, `jmp rel8/32`, `jcc`, `loop`) are still
+ * refused. They could be rewritten too, but they are rare this early in a
+ * function, and a refusal a mod author can read beats a rewrite nobody has
+ * checked.
+ *
+ * The refusals are kept apart from each other on purpose. "I do not know this
+ * instruction", "I know it and it cannot move", and "the function is shorter
+ * than the jump" are three different problems -- the first is a gap in this
+ * file, the second is a fact about the target that will never change, and the
+ * third is neither -- and a single message listing all three tells the reader
+ * only that something went wrong. See `aowl_hook_error_text`.
  */
 
 #ifndef AOWLSPT_DETOUR_H

@@ -73,6 +73,7 @@ benchbackend -- drive aowlspt-backend under load and report the numbers
   --moves N        item moves per round (default 25)
   --label TEXT     printed with the results, so two runs can be told apart
   --keep-db        reuse an existing db.json in --root rather than regenerating
+  --keepalive      reuse one connection for every request, as the game does
   -h, --help       this
 """
   Session = "aaaaaaaaaaaaaaaaaaaaaaaa"
@@ -87,6 +88,13 @@ benchbackend -- drive aowlspt-backend under load and report the numbers
 var gPort = 6977
 var gQpf = 1'i64
 
+# One connection reused across requests, when `--keepalive` is on. Kept as a
+# module-level variable rather than threaded through every call site because
+# `mixRound` cannot close over a local -- nimony has no closures over an
+# enclosing scope.
+var gKeepAlive = false
+var gConn = Conn(sock: 0'u64, buf: @[], have: 0, port: 6977)
+
 proc nowUs(): int64 =
   ## Microseconds. The division is done per reading rather than at the end so a
   ## long run cannot overflow the multiply.
@@ -99,6 +107,7 @@ type
   Bucket = object
     name: string
     us: seq[int64]
+    ttfb: seq[int64]
     bytes: int64
 
 var gBuckets: seq[Bucket] = @[]
@@ -108,14 +117,16 @@ proc cmpI64(x, y: int64): int =
   elif x > y: 1
   else: 0
 
-proc record(name: string; us: int64; bytes: int) =
+proc record(name: string; us, ttfb: int64; bytes: int) =
   for i in 0 ..< gBuckets.len:
     if gBuckets[i].name == name:
       gBuckets[i].us.add us
+      if ttfb > 0'i64: gBuckets[i].ttfb.add ttfb
       gBuckets[i].bytes = gBuckets[i].bytes + int64(bytes)
       return
-  var b = Bucket(name: name, us: @[], bytes: int64(bytes))
+  var b = Bucket(name: name, us: @[], ttfb: @[], bytes: int64(bytes))
   b.us.add us
+  if ttfb > 0'i64: b.ttfb.add ttfb
   gBuckets.add b
 
 proc resetSamples() =
@@ -161,13 +172,16 @@ proc pct(s: seq[int64]; p: int): int64 =
 # --------------------------------------------------------------- the mix
 
 proc call(path, body: string): Response =
-  result = request(gPort, path, body, Session)
+  if gKeepAlive:
+    result = requestOn(gConn, path, body, Session)
+  else:
+    result = request(gPort, path, body, Session)
 
 proc timed(name, path, body: string): Response =
   let t0 = nowUs()
-  let r = request(gPort, path, body, Session)
+  let r = call(path, body)
   let t1 = nowUs()
-  record(name, t1 - t0, r.body.len)
+  record(name, t1 - t0, r.ttfbUs, r.body.len)
   result = r
 
 proc jsonText(body, key: string): string =
@@ -402,14 +416,25 @@ proc reportLine(b: Bucket) =
   row.add lpad(msText(pct(s, 95)), 11)
   row.add lpad(msText(pct(s, 99)), 11)
   row.add lpad(msText(s[s.len - 1]), 11)
+  var ttfbMean = 0'i64
+  if b.ttfb.len > 0:
+    var tt = 0'i64
+    for v in b.ttfb:
+      tt = tt + v
+    ttfbMean = tt div int64(b.ttfb.len)
+  row.add lpad(msText(ttfbMean), 11)
   row.add lpad($(b.bytes div int64(b.us.len) div 1024) & "K", 9)
   line row
 
 proc report(label: string; wallUs: int64) =
   heading "Results" & (if label.len > 0: " -- " & label else: "")
+  # `ttfb` is time to the first byte of the answer: the server's share. The
+  # difference between it and `mean` is transfer and this process's own
+  # `inflate`, which on the biggest tables is most of the number and is not
+  # something the server can be blamed for or fix.
   line pad("endpoint", 15) & lpad("n", 6) & lpad("mean", 11) &
        lpad("p50", 11) & lpad("p95", 11) & lpad("p99", 11) &
-       lpad("max", 11) & lpad("body", 9)
+       lpad("max", 11) & lpad("ttfb", 11) & lpad("body", 9)
   var requests = 0
   var bytes = 0'i64
   for b in gBuckets:
@@ -472,6 +497,8 @@ proc main(): int =
         else: moves = v
     elif a == "--keep-db":
       keepDb = true
+    elif a == "--keepalive":
+      gKeepAlive = true
     elif a == "--help" or a == "-h":
       echo Usage
       return 0
@@ -524,8 +551,10 @@ proc main(): int =
     discard copyFileAt(modConfig, joinPath(root, "mods\\tarkov\\config.json"))
   line "  root    " & root
   line "  port    " & $gPort
+  line "  conn    " & (if gKeepAlive: "one, kept alive" else: "one per request")
 
   discard cNetStartup()
+  gConn = Conn(sock: 0'u64, buf: @[], have: 0, port: gPort)
 
   let bootStart = nowUs()
   let server = startBackend(backend, root)

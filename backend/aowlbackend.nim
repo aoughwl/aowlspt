@@ -57,6 +57,11 @@ const
   HostVersion = "0.1.0"
   RouteStatic = 0'i32
   RouteDynamic = 1'i32
+  MaxKeepAlive = 512
+    ## Requests served on one connection before it is closed anyway. The pool
+    ## size is the concurrency limit, so a connection that is never closed has
+    ## taken one of its slots for good; the client reconnects and nothing is
+    ## lost but one handshake per five hundred requests.
 
 # --------------------------------------------------------------- state
 
@@ -234,6 +239,7 @@ type
     session: string
     body: string
     ok: bool
+    keepAlive: bool
 
 proc isHexId(s: string): bool =
   ## SPT parses the session id as a MongoId: 24 hex characters, nothing else.
@@ -266,6 +272,10 @@ proc parseHead(head: string; r: var Request; contentLength: var int): bool =
     return false
   r.verb = first.substr(0, sp1 - 1)
   r.url = first.substr(sp1 + 1, sp1 + sp2)
+  # HTTP/1.1 keeps the connection open unless the client says otherwise; 1.0
+  # closes unless it says otherwise. Getting that default backwards is how a
+  # server ends up holding a socket the client has already forgotten about.
+  r.keepAlive = find(first, "HTTP/1.1") >= 0
 
   for i in 1 ..< lines.len:
     let l = lines[i]
@@ -296,6 +306,12 @@ proc parseHead(head: string; r: var Request; contentLength: var int): bool =
         r.session = s
     elif name == "sessionid":
       r.session = value
+    elif name == "connection":
+      let v = toLowerAscii(value)
+      if find(v, "close") >= 0:
+        r.keepAlive = false
+      elif find(v, "keep-alive") >= 0:
+        r.keepAlive = true
 
   r.ok = true
   result = true
@@ -384,93 +400,136 @@ proc runRoute(index: int; r: Request; into: var string): bool =
 # --------------------------------------------------------------- serving
 
 proc serveConnection(sock: uint64) {.exportc: "aowlspt_nim_serve", cdecl.} =
-  ## One request per connection. Keep-alive would be a real optimisation and is
-  ## not one worth having before the endpoints exist.
+  ## Serves requests on one connection until the client says to stop.
+  ##
+  ## This used to be one request per connection, on the grounds that keep-alive
+  ## was not worth having before the endpoints existed. The endpoints exist now,
+  ## and a session is thousands of small requests -- inventory drags, keepalives,
+  ## profile reads -- where a fresh TCP handshake, accept and close is a
+  ## measurable share of the whole answer.
+  ##
+  ## The loop keeps whatever arrived past the end of one request and starts the
+  ## next scan from it. Without that, a pipelined second request sitting in the
+  ## same segment is dropped on the floor and the client waits for an answer
+  ## that was already thrown away.
   var buf = newSeq[byte](65536)
   var have = 0
-  var headEnd = -1
-  var sep = 4
-
-  # Read until the header terminator. The body may already be partly here.
-  #
-  # The terminator is looked for in the byte buffer, and only in the bytes that
-  # arrived since the last look. It used to turn the whole buffer into a string
-  # and `find` in that after every `recv`, which is quadratic in the number of
-  # segments and allocates a copy of the request per segment.
   var scanned = 0
-  while headEnd < 0 and have < buf.len:
-    let n = cNetRecv(sock, cast[HostPtr](addr buf[have]), int32(buf.len - have))
-    if n <= 0'i32:
+  var served = 0
+
+  while true:
+    # -- the header ---------------------------------------------------------
+    var headEnd = -1
+    var sep = 4
+    while true:
+      # The terminator is looked for in the byte buffer, and only from a little
+      # behind the last look. It used to turn the whole buffer into a string
+      # and `find` in that after every `recv`, which is quadratic in the number
+      # of segments and allocates a copy of the request per segment.
+      var k = if scanned > 3: scanned - 3 else: 0
+      while k + 1 < have:
+        if buf[k] == byte(13) and k + 3 < have and buf[k + 1] == byte(10) and
+           buf[k + 2] == byte(13) and buf[k + 3] == byte(10):
+          headEnd = k
+          sep = 4
+          break
+        if buf[k] == byte(10) and buf[k + 1] == byte(10):
+          headEnd = k
+          sep = 2
+          break
+        inc k
+      scanned = have
+      if headEnd >= 0:
+        break
+      if have >= buf.len:
+        break
+      let n = cNetRecv(sock, cast[HostPtr](addr buf[have]),
+                       int32(buf.len - have))
+      if n <= 0'i32:
+        # A closed connection between requests is the ordinary end of a
+        # keep-alive session, not an error -- only a truncated first request is.
+        return
+      have = have + int(n)
+
+    if headEnd < 0:
+      sendResponse(sock, "431 Request Header Fields Too Large", "", false)
       return
-    have = have + int(n)
-    var k = if scanned > 3: scanned - 3 else: 0
-    while k + 1 < have:
-      if buf[k] == byte(13) and k + 3 < have and buf[k + 1] == byte(10) and
-         buf[k + 2] == byte(13) and buf[k + 3] == byte(10):
-        headEnd = k
-        sep = 4
+
+    let head = bytesAt(buf, 0, headEnd)
+
+    var req = Request(verb: "", url: "", session: "", body: "", ok: false,
+                      keepAlive: false)
+    var contentLength = 0
+    if not parseHead(head, req, contentLength):
+      sendResponse(sock, "400 Bad Request", "", false)
+      return
+
+    # -- the body -----------------------------------------------------------
+    let bodyStart = headEnd + sep
+    var bodyBytes = newSeq[byte](if contentLength > 0: contentLength else: 1)
+    var bodyHave = have - bodyStart
+    if bodyHave > contentLength: bodyHave = contentLength
+    if bodyHave < 0: bodyHave = 0
+    if bodyHave > 0:
+      copyMem(addr bodyBytes[0],
+              cast[pointer](cast[uint](addr buf[0]) + uint(bodyStart)),
+              bodyHave)
+    while bodyHave < contentLength:
+      let n = cNetRecv(sock, cast[HostPtr](addr bodyBytes[bodyHave]),
+                       int32(contentLength - bodyHave))
+      if n <= 0'i32:
         break
-      if buf[k] == byte(10) and buf[k + 1] == byte(10):
-        headEnd = k
-        sep = 2
-        break
-      inc k
-    scanned = have
+      bodyHave = bodyHave + int(n)
 
-  if headEnd < 0:
-    sendResponse(sock, "431 Request Header Fields Too Large", "", false)
-    return
+    # Anything past this request belongs to the next one. Shifting it down
+    # rather than tracking an offset keeps every scan above indexing from zero.
+    let consumed = bodyStart + bodyHave
+    var leftover = have - consumed
+    if leftover < 0: leftover = 0
+    if leftover > 0:
+      copyMem(addr buf[0],
+              cast[pointer](cast[uint](addr buf[0]) + uint(consumed)), leftover)
+    have = leftover
+    scanned = 0
 
-  let head = bytesAt(buf, 0, headEnd)
+    if not inflateBody(bodyBytes, bodyHave, req.body):
+      modhost.warn "could not inflate a " & $bodyHave & "-byte body for " &
+                   req.url
+      sendResponse(sock, "400 Bad Request", "", false)
+      return
 
-  var req = Request(verb: "", url: "", session: "", body: "", ok: false)
-  var contentLength = 0
-  if not parseHead(head, req, contentLength):
-    sendResponse(sock, "400 Bad Request", "", false)
-    return
+    inc gRequests
+    inc served
 
-  # Pull the rest of the body.
-  let bodyStart = headEnd + sep
-  var bodyBytes = newSeq[byte](if contentLength > 0: contentLength else: 1)
-  var bodyHave = have - bodyStart
-  if bodyHave > contentLength: bodyHave = contentLength
-  if bodyHave < 0: bodyHave = 0
-  if bodyHave > 0:
-    copyMem(addr bodyBytes[0],
-            cast[pointer](cast[uint](addr buf[0]) + uint(bodyStart)), bodyHave)
-  while bodyHave < contentLength:
-    let n = cNetRecv(sock, cast[HostPtr](addr bodyBytes[bodyHave]),
-                     int32(contentLength - bodyHave))
-    if n <= 0'i32:
-      break
-    bodyHave = bodyHave + int(n)
+    # -- the answer ---------------------------------------------------------
+    if req.session.len > 0 and not isHexId(req.session):
+      # Rejected before any route sees it: a malformed id reaching a mod would
+      # be reported as that mod's bug.
+      modhost.warn "rejecting a malformed session id on " & req.url
+      sendResponse(sock, "400 Bad Request", "{\"err\":\"bad session id\"}",
+                   true, req.keepAlive)
+    else:
+      let idx = matchRoute(req.url)
+      if idx < 0:
+        sendResponse(sock, "404 Not Found",
+                     "{\"err\":\"no route\",\"url\":\"" & req.url &
+                     "\"}", true, req.keepAlive)
+      else:
+        var body = ""
+        if runRoute(idx, req, body):
+          sendResponse(sock, "200 OK", body, true, req.keepAlive)
+        else:
+          sendResponse(sock, "500 Internal Server Error",
+                       "{\"err\":\"the route handler failed\"}",
+                       true, req.keepAlive)
 
-  if not inflateBody(bodyBytes, bodyHave, req.body):
-    modhost.warn "could not inflate a " & $bodyHave & "-byte body for " & req.url
-    sendResponse(sock, "400 Bad Request", "", false)
-    return
-
-  inc gRequests
-
-  if req.session.len > 0 and not isHexId(req.session):
-    # Rejected before any route sees it: a malformed id reaching a mod would
-    # be reported as that mod's bug.
-    modhost.warn "rejecting a malformed session id on " & req.url
-    sendResponse(sock, "400 Bad Request", "{\"err\":\"bad session id\"}", true)
-    return
-
-  let idx = matchRoute(req.url)
-  if idx < 0:
-    sendResponse(sock, "404 Not Found",
-                 "{\"err\":\"no route\",\"url\":\"" & req.url & "\"}", true)
-    return
-
-  var body = ""
-  if runRoute(idx, req, body):
-    sendResponse(sock, "200 OK", body, true)
-  else:
-    sendResponse(sock, "500 Internal Server Error",
-                 "{\"err\":\"the route handler failed\"}", true)
+    if not req.keepAlive:
+      return
+    if served >= MaxKeepAlive:
+      # A bound, so one client cannot pin a worker for the life of the process.
+      # The pool is the concurrency limit and a connection that never ends is a
+      # connection that has taken one of its slots permanently.
+      return
 
 # --------------------------------------------------------------- host api
 

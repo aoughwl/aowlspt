@@ -1,0 +1,1056 @@
+{
+  "traders": {
+    "54cb50c76803fa8b248b4571": {
+      "base": {
+        "_id": "54cb50c76803fa8b248b4571",
+        "nickname": "Prapor",
+        "currency": "RUB",
+        "unlockedByDefault": true
+      },
+      "assort": {
+        "items": [
+          {
+            "_id": "aaaaaaaaaaaaaaaaaaaaaaa1",
+            "_tpl": "5644bd2b4bdc2d3b4c8b4572",
+            "parentId": "hideout",
+            "slotId": "hideout",
+            "upd": {
+              "StackObjectsCount": 10
+            }
+          },
+          {
+            "_id": "aaaaaaaaaaaaaaaaaaaaaaa2",
+            "_tpl": "544fb45d4bdc2dee738b4568",
+            "parentId": "hideout",
+            "slotId": "hideout",
+            "upd": {
+              "StackObjectsCount": 40
+            }
+          },
+          {
+            "_comment": "A barter. It must NOT become a flea offer: it has no price, and an offer with no price sorts to the top of every cheapest-first search and cannot be paid for with money.",
+            "_id": "aaaaaaaaaaaaaaaaaaaaaaa3",
+            "_tpl": "590c657e86f77412b013051d",
+            "parentId": "hideout",
+            "slotId": "hideout"
+          },
+          {
+            "_comment": "A part of a rifle in the assort, not a separate offer. slotId is not 'hideout', so the generator skips it.",
+            "_id": "aaaaaaaaaaaaaaaaaaaaaaa4",
+            "_tpl": "57ac965c24597706be5f975c",
+            "parentId": "aaaaaaaaaaaaaaaaaaaaaaa1",
+            "slotId": "mod_scope"
+          }
+        ],
+        "barter_scheme": {
+          "aaaaaaaaaaaaaaaaaaaaaaa1": [
+            [
+              {
+                "_tpl": "5449016a4bdc2d6f028b456f",
+                "count": 25000
+              }
+            ]
+          ],
+          "aaaaaaaaaaaaaaaaaaaaaaa2": [
+            [
+              {
+                "_tpl": "5449016a4bdc2d6f028b456f",
+                "count": 1200
+              }
+            ]
+          ],
+          "aaaaaaaaaaaaaaaaaaaaaaa3": [
+            [
+              {
+                "_tpl": "544fb45d4bdc2dee738b4568",
+                "count": 3
+              }
+            ]
+          ]
+        },
+        "loyal_level_items": {
+          "aaaaaaaaaaaaaaaaaaaaaaa1": 1,
+          "aaaaaaaaaaaaaaaaaaaaaaa2": 1,
+          "aaaaaaaaaaaaaaaaaaaaaaa3": 1
+        }
+      }
+    },
+    "5ac3b934156ae10c4430e83c": {
+      "base": {
+        "_id": "5ac3b934156ae10c4430e83c",
+        "nickname": "Ragman",
+        "currency": "USD",
+        "unlockedByDefault": true
+      },
+      "assort": {
+        "items": [
+          {
+            "_id": "bbbbbbbbbbbbbbbbbbbbbbb1",
+            "_tpl": "5648a7494bdc2d9d488b4583",
+            "parentId": "hideout",
+            "slotId": "hideout"
+          }
+        ],
+        "barter_scheme": {
+          "bbbbbbbbbbbbbbbbbbbbbbb1": [
+            [
+              {
+                "_tpl": "5696686a4bdc2da3298b456a",
+                "count": 180
+              }
+            ]
+          ]
+        },
+        "loyal_level_items": {
+          "bbbbbbbbbbbbbbbbbbbbbbb1": 1
+        }
+      }
+    }
+  },
+  "templates": {
+    "items": {
+      "5449016a4bdc2d6f028b456f": {
+        "_id": "5449016a4bdc2d6f028b456f",
+        "_props": {
+          "Name": "Roubles",
+          "Width": 1,
+          "Height": 1,
+          "StackMaxSize": 500000
+        }
+      },
+      "5644bd2b4bdc2d3b4c8b4572": {
+        "_id": "5644bd2b4bdc2d3b4c8b4572",
+        "_props": {
+          "Name": "AK-74N",
+          "Width": 4,
+          "Height": 2,
+          "StackMaxSize": 1
+        }
+      },
+      "5811ce572459770cba1a34ea": {
+        "_id": "5811ce572459770cba1a34ea",
+        "_props": {
+          "Name": "Stash 10x68",
+          "Grids": [
+            {
+              "_props": {
+                "cellsH": 10,
+                "cellsV": 68
+              }
+            }
+          ]
+        }
+      },
+      "5696686a4bdc2da3298b456a": {
+        "_id": "5696686a4bdc2da3298b456a",
+        "_props": {
+          "Name": "Dollars",
+          "Width": 1,
+          "Height": 1,
+          "StackMaxSize": 50000
+        }
+      },
+      "544fb45d4bdc2dee738b4568": {
+        "_id": "544fb45d4bdc2dee738b4568",
+        "_props": {
+          "Name": "Salewa",
+          "Width": 1,
+          "Height": 2,
+          "StackMaxSize": 1
+        }
+      },
+      "590c657e86f77412b013051d": {
+        "_id": "590c657e86f77412b013051d",
+        "_props": {
+          "Name": "Grizzly",
+          "Width": 2,
+          "Height": 2,
+          "StackMaxSize": 1
+        }
+      },
+      "57ac965c24597706be5f975c": {
+        "_id": "57ac965c24597706be5f975c",
+        "_props": {
+          "Name": "PSO-1",
+          "Width": 2,
+          "Height": 1,
+          "StackMaxSize": 1
+        }
+      },
+      "5648a7494bdc2d9d488b4583": {
+        "_id": "5648a7494bdc2d9d488b4583",
+        "_props": {
+          "Name": "6B47",
+          "Width": 2,
+          "Height": 2,
+          "StackMaxSize": 1
+        }
+      },
+      "5710c24ad2720bc3458b45a3": {
+        "_id": "5710c24ad2720bc3458b45a3",
+        "_props": {
+          "Name": "Bolts",
+          "Width": 1,
+          "Height": 1,
+          "StackMaxSize": 30
+        }
+      },
+      "590c2e1186f77425357b6124": {
+        "_id": "590c2e1186f77425357b6124",
+        "_props": {
+          "Name": "Toolset",
+          "Width": 2,
+          "Height": 2,
+          "StackMaxSize": 1
+        }
+      },
+      "59e35de086f7741778269d83": {
+        "_id": "59e35de086f7741778269d83",
+        "_props": {
+          "Name": "Bolts",
+          "Width": 1,
+          "Height": 1,
+          "StackMaxSize": 20
+        }
+      },
+      "5448ff904bdc2d6f028b456e": {
+        "_id": "5448ff904bdc2d6f028b456e",
+        "_props": {
+          "Name": "Water bottle",
+          "Width": 1,
+          "Height": 2,
+          "StackMaxSize": 1
+        }
+      },
+      "5d1b371186f774253763a656": {
+        "_id": "5d1b371186f774253763a656",
+        "_props": {
+          "Name": "Expeditionary fuel tank",
+          "Width": 2,
+          "Height": 2,
+          "StackMaxSize": 1,
+          "MaxResource": 100
+        }
+      },
+      "ccccbox00000000000000001": {
+        "_id": "ccccbox00000000000000001",
+        "_props": {
+          "Name": "Test crate",
+          "Width": 2,
+          "Height": 2,
+          "Grids": [
+            {
+              "_name": "main",
+              "_props": {
+                "cellsH": 3,
+                "cellsV": 3
+              }
+            }
+          ]
+        }
+      },
+      "aaaaammo0000000000000001": {
+        "_id": "aaaaammo0000000000000001",
+        "_props": {
+          "Name": "Test cartridge",
+          "Width": 1,
+          "Height": 1,
+          "StackMaxSize": 60
+        }
+      },
+      "bbbbbox00000000000000002": {
+        "_id": "bbbbbox00000000000000002",
+        "_props": {
+          "Name": "Test ammo box",
+          "Width": 1,
+          "Height": 1,
+          "StackMaxSize": 1,
+          "StackSlots": [
+            {
+              "_name": "cartridges",
+              "_max_count": 100,
+              "_props": {
+                "filters": [
+                  {
+                    "Filter": [
+                      "aaaaammo0000000000000001"
+                    ]
+                  }
+                ]
+              }
+            }
+          ]
+        }
+      },
+      "qqqquest0000000000000001": {
+        "_id": "qqqquest0000000000000001",
+        "_props": {
+          "Name": "Test quest item",
+          "Width": 1,
+          "Height": 1,
+          "StackMaxSize": 1
+        }
+      },
+      "wwwwgun00000000000000001": {
+        "_id": "wwwwgun00000000000000001",
+        "_props": {
+          "Name": "Test rifle",
+          "Width": 4,
+          "Height": 2,
+          "StackMaxSize": 1
+        }
+      },
+      "mmmmmag00000000000000001": {
+        "_id": "mmmmmag00000000000000001",
+        "_props": {
+          "Name": "Test magazine",
+          "Width": 1,
+          "Height": 1,
+          "StackMaxSize": 1
+        }
+      }
+    },
+    "handbook": {
+      "Categories": [
+        {
+          "Id": "5b5f78dc86f77409407a7f8e",
+          "ParentId": null,
+          "Icon": "",
+          "Color": "",
+          "Order": "0"
+        },
+        {
+          "Id": "5b5f78b786f77447ed5636b1",
+          "ParentId": "5b5f78dc86f77409407a7f8e",
+          "Icon": "",
+          "Color": "",
+          "Order": "1"
+        },
+        {
+          "Id": "5b47574386f77428ca22b33e",
+          "ParentId": null,
+          "Icon": "",
+          "Color": "",
+          "Order": "2"
+        },
+        {
+          "Id": "5b47574386f77428ca22b340",
+          "ParentId": "5b47574386f77428ca22b33e",
+          "Icon": "",
+          "Color": "",
+          "Order": "3"
+        },
+        {
+          "Id": "5b5f701386f774093f2ecf0f",
+          "ParentId": null,
+          "Icon": "",
+          "Color": "",
+          "Order": "4"
+        },
+        {
+          "Id": "5b47574386f77428ca22b336",
+          "ParentId": null,
+          "Icon": "",
+          "Color": "",
+          "Order": "5"
+        }
+      ],
+      "Items": [
+        {
+          "Id": "5644bd2b4bdc2d3b4c8b4572",
+          "ParentId": "5b5f78b786f77447ed5636b1",
+          "Price": 22000
+        },
+        {
+          "Id": "57ac965c24597706be5f975c",
+          "ParentId": "5b5f78b786f77447ed5636b1",
+          "Price": 9500
+        },
+        {
+          "Id": "544fb45d4bdc2dee738b4568",
+          "ParentId": "5b47574386f77428ca22b340",
+          "Price": 1100
+        },
+        {
+          "Id": "590c657e86f77412b013051d",
+          "ParentId": "5b47574386f77428ca22b340",
+          "Price": 24000
+        },
+        {
+          "Id": "5648a7494bdc2d9d488b4583",
+          "ParentId": "5b5f701386f774093f2ecf0f",
+          "Price": 18000
+        },
+        {
+          "Id": "5710c24ad2720bc3458b45a3",
+          "ParentId": "5b5f701386f774093f2ecf0f",
+          "Price": 350
+        },
+        {
+          "_comment": "Currency is in the real handbook too. An offer selling roubles for roubles matches every search and is skipped by the generator.",
+          "Id": "5449016a4bdc2d6f028b456f",
+          "ParentId": "5b5f701386f774093f2ecf0f",
+          "Price": 1
+        },
+        {
+          "_comment": "Priced at zero: no offer, and no sale to a trader either. 'I do not know what this is worth' is a different answer from 'it is worth nothing'.",
+          "Id": "5648a7494bdc2d9d488b4584",
+          "ParentId": "5b5f701386f774093f2ecf0f",
+          "Price": 0
+        },
+        {
+          "Id": "59e35de086f7741778269d83",
+          "ParentId": "5b47574386f77428ca22b336",
+          "Price": 2000
+        },
+        {
+          "Id": "5448ff904bdc2d6f028b456e",
+          "ParentId": "5b47574386f77428ca22b336",
+          "Price": 15000
+        },
+        {
+          "Id": "5d1b371186f774253763a656",
+          "ParentId": "5b47574386f77428ca22b336",
+          "Price": 60000
+        }
+      ],
+      "_comment": "Two levels deep, so a search for the parent category has to walk the tree to find the offers under it. Matching only the exact id gives a tree whose branches are all empty."
+    },
+    "quests": {
+      "q_debut": {
+        "_id": "q_debut",
+        "QuestName": "Debut",
+        "traderId": "54cb50c76803fa8b248b4571",
+        "conditions": {
+          "AvailableForStart": [
+            {
+              "conditionType": "Level",
+              "id": "c_start_level",
+              "value": 1,
+              "compareMethod": ">="
+            }
+          ],
+          "AvailableForFinish": [
+            {
+              "conditionType": "CounterCreator",
+              "id": "c_kill_scavs",
+              "value": 5,
+              "counter": {
+                "id": "c_kill_scavs_counter",
+                "conditions": [
+                  {
+                    "conditionType": "Kills",
+                    "target": "Savage"
+                  },
+                  {
+                    "conditionType": "Location",
+                    "target": [
+                      "bigmap"
+                    ]
+                  }
+                ]
+              }
+            },
+            {
+              "conditionType": "HandoverItem",
+              "id": "c_hand_rifles",
+              "value": 2,
+              "target": [
+                "5644bd2b4bdc2d3b4c8b4572"
+              ]
+            }
+          ],
+          "Fail": []
+        },
+        "rewards": {
+          "Started": [],
+          "Success": [
+            {
+              "type": "Experience",
+              "index": 0,
+              "value": "1500"
+            },
+            {
+              "type": "TraderStanding",
+              "index": 1,
+              "target": "54cb50c76803fa8b248b4571",
+              "value": 0.02
+            },
+            {
+              "type": "Item",
+              "index": 2,
+              "value": "1",
+              "target": "reward_rifle_0001",
+              "items": [
+                {
+                  "_id": "reward_rifle_0001",
+                  "_tpl": "5644bd2b4bdc2d3b4c8b4572",
+                  "upd": {
+                    "StackObjectsCount": 1
+                  }
+                }
+              ]
+            }
+          ],
+          "Fail": []
+        }
+      },
+      "q_followup": {
+        "_id": "q_followup",
+        "QuestName": "Second Debut",
+        "traderId": "54cb50c76803fa8b248b4571",
+        "conditions": {
+          "AvailableForStart": [
+            {
+              "_parent": "Quest",
+              "_props": {
+                "id": "c_needs_debut",
+                "target": "q_debut",
+                "status": [
+                  4
+                ]
+              }
+            }
+          ],
+          "AvailableForFinish": [
+            {
+              "_parent": "TraderLoyalty",
+              "_props": {
+                "id": "c_needs_loyalty",
+                "target": "54cb50c76803fa8b248b4571",
+                "value": 2,
+                "compareMethod": ">="
+              }
+            }
+          ],
+          "Fail": []
+        },
+        "rewards": {
+          "Started": [],
+          "Success": [
+            {
+              "type": "Experience",
+              "index": 0,
+              "value": 800
+            }
+          ],
+          "Fail": []
+        }
+      },
+      "q_reward": {
+        "_comment": "The only quest here that can actually be finished, and the only one that pays an item: redeeming that item out of the mailbox is what the mail checks drag.",
+        "_id": "q_reward",
+        "QuestName": "The Payout",
+        "traderId": "54cb50c76803fa8b248b4571",
+        "conditions": {
+          "AvailableForStart": [
+            {
+              "conditionType": "Level",
+              "id": "c_reward_level",
+              "value": 1,
+              "compareMethod": ">="
+            }
+          ],
+          "AvailableForFinish": [
+            {
+              "conditionType": "HandoverItem",
+              "id": "c_reward_hand",
+              "value": 1,
+              "target": [
+                "544fb45d4bdc2dee738b4568"
+              ]
+            }
+          ],
+          "Fail": []
+        },
+        "rewards": {
+          "Started": [],
+          "Success": [
+            {
+              "type": "Experience",
+              "index": 0,
+              "value": 900
+            },
+            {
+              "type": "Item",
+              "index": 1,
+              "value": "1",
+              "target": "reward_salewa_0001",
+              "items": [
+                {
+                  "_id": "reward_salewa_0001",
+                  "_tpl": "544fb45d4bdc2dee738b4568",
+                  "upd": {
+                    "StackObjectsCount": 1
+                  }
+                }
+              ]
+            }
+          ],
+          "Fail": []
+        }
+      }
+    }
+  },
+  "locales": {
+    "global": {
+      "en": {
+        "5644bd2b4bdc2d3b4c8b4572 Name": "AK-74N 5.45x39 assault rifle",
+        "544fb45d4bdc2dee738b4568 Name": "Salewa first aid kit",
+        "590c657e86f77412b013051d Name": "Grizzly first aid kit",
+        "57ac965c24597706be5f975c Name": "PSO-1 4x24 scope",
+        "5648a7494bdc2d9d488b4583 Name": "6B47 helmet",
+        "5710c24ad2720bc3458b45a3 Name": "Bolts",
+        "59e35de086f7741778269d83 Name": "Bolts",
+        "5448ff904bdc2d6f028b456e Name": "Water bottle"
+      }
+    },
+    "menu": {
+      "en": {
+        "MainMenu": "Main menu"
+      }
+    }
+  },
+  "hideout": {
+    "areas": [
+      {
+        "type": 3,
+        "enabled": true,
+        "stages": {
+          "1": {
+            "constructionTime": 0,
+            "requirements": []
+          }
+        },
+        "_comment": "Area 3 is the one the upgrade checks drive, and its first stage is instant so the upgrade and the complete can be sent back to back."
+      },
+      {
+        "_id": "area-workbench",
+        "type": 10,
+        "enabled": true,
+        "needsFuel": false,
+        "stages": {
+          "0": {
+            "constructionTime": 0,
+            "requirements": [],
+            "bonuses": []
+          },
+          "1": {
+            "constructionTime": 60,
+            "requirements": [],
+            "bonuses": [
+              {
+                "type": "UnlockWeaponModification",
+                "value": 1,
+                "passive": true,
+                "visible": true
+              }
+            ]
+          },
+          "2": {
+            "constructionTime": 600,
+            "requirements": [],
+            "bonuses": [
+              {
+                "type": "SkillGroupLevelingBoost",
+                "skillName": "WeaponModding",
+                "value": 0.2,
+                "passive": true,
+                "visible": true
+              }
+            ]
+          }
+        }
+      },
+      {
+        "_id": "area-generator",
+        "type": 4,
+        "enabled": true,
+        "needsFuel": true,
+        "stages": {
+          "0": {
+            "constructionTime": 0,
+            "requirements": [],
+            "bonuses": []
+          },
+          "1": {
+            "constructionTime": 120,
+            "requirements": [],
+            "bonuses": [
+              {
+                "type": "EnergyRegeneration",
+                "value": 1,
+                "passive": true,
+                "visible": false
+              }
+            ]
+          }
+        }
+      },
+      {
+        "_id": "area-watercollector",
+        "type": 6,
+        "enabled": true,
+        "needsFuel": false,
+        "stages": {
+          "0": {
+            "constructionTime": 0,
+            "requirements": [],
+            "bonuses": []
+          },
+          "1": {
+            "constructionTime": 300,
+            "requirements": [],
+            "bonuses": []
+          }
+        }
+      }
+    ],
+    "settings": {
+      "generatorSpeed": 1,
+      "generatorFuelFlowRate": 1.0,
+      "airFilterUnitFlowRate": 0.001,
+      "gpuBoostRate": 0.041225
+    },
+    "production": {
+      "recipes": [
+        {
+          "_id": "recipe-bolts",
+          "areaType": 10,
+          "productionTime": 3600,
+          "endProduct": "59e35de086f7741778269d83",
+          "count": 2,
+          "continuous": false,
+          "productionLimitCount": 0,
+          "needFuelForAllProductionTime": false,
+          "locked": false,
+          "requirements": [
+            {
+              "type": "Area",
+              "areaType": 10,
+              "requiredLevel": 1
+            },
+            {
+              "type": "Item",
+              "templateId": "5449016a4bdc2d6f028b456f",
+              "count": 3,
+              "isFunctional": false
+            },
+            {
+              "type": "Tool",
+              "templateId": "590c2e1186f77425357b6124"
+            }
+          ]
+        },
+        {
+          "_id": "recipe-water",
+          "areaType": 6,
+          "productionTime": 1800,
+          "endProduct": "5448ff904bdc2d6f028b456e",
+          "count": 1,
+          "continuous": true,
+          "productionLimitCount": 3,
+          "needFuelForAllProductionTime": true,
+          "locked": false,
+          "requirements": [
+            {
+              "type": "Area",
+              "areaType": 6,
+              "requiredLevel": 1
+            }
+          ]
+        },
+        {
+          "_id": "recipe-quick",
+          "areaType": 10,
+          "productionTime": 0,
+          "endProduct": "59e35de086f7741778269d83",
+          "count": 2,
+          "continuous": false,
+          "productionLimitCount": 0,
+          "needFuelForAllProductionTime": false,
+          "locked": false,
+          "requirements": [
+            {
+              "type": "Area",
+              "areaType": 10,
+              "requiredLevel": 1
+            },
+            {
+              "type": "Item",
+              "templateId": "5449016a4bdc2d6f028b456f",
+              "count": 3,
+              "isFunctional": false
+            }
+          ]
+        },
+        {
+          "_id": "recipe-slow",
+          "areaType": 10,
+          "productionTime": 3600,
+          "endProduct": "5448ff904bdc2d6f028b456e",
+          "count": 1,
+          "continuous": false,
+          "productionLimitCount": 0,
+          "needFuelForAllProductionTime": false,
+          "locked": false,
+          "requirements": [
+            {
+              "type": "Area",
+              "areaType": 10,
+              "requiredLevel": 1
+            },
+            {
+              "type": "Item",
+              "templateId": "5449016a4bdc2d6f028b456f",
+              "count": 5,
+              "isFunctional": false
+            }
+          ]
+        },
+        {
+          "_id": "recipe-rich",
+          "areaType": 10,
+          "productionTime": 0,
+          "endProduct": "59e35de086f7741778269d83",
+          "count": 1,
+          "continuous": false,
+          "productionLimitCount": 0,
+          "needFuelForAllProductionTime": false,
+          "locked": false,
+          "requirements": [
+            {
+              "type": "Area",
+              "areaType": 10,
+              "requiredLevel": 1
+            },
+            {
+              "type": "Item",
+              "templateId": "590c657e86f77412b013051d",
+              "count": 4,
+              "isFunctional": false
+            }
+          ]
+        }
+      ],
+      "scavRecipes": [],
+      "cultistRecipes": [],
+      "_comment": "Each refusal in emu/production has exactly one recipe that provokes it: recipe-quick finishes at once, recipe-slow cannot finish inside a test run, recipe-rich asks for materials the profile does not have, and recipe-bolts asks for a tool it does not have. recipe-water is the continuous one."
+    }
+  },
+  "globals": {
+    "config": {
+      "SkillsSettings": {
+        "SkillProgressRate": 1.0,
+        "SkillFreshEffectiveness": 1.5,
+        "SkillFreshPoints": 10.0,
+        "SkillPointsBeforeFatigue": 100.0,
+        "SkillFatiguePerPoint": 1.0,
+        "SkillFatigueReset": 43200,
+        "WeaponSkillProgressRate": 1.0
+      },
+      "Mastering": [
+        {
+          "Name": "Ak",
+          "Templates": [
+            "5644bd2b4bdc2d3b4c8b4572"
+          ],
+          "Level2": 250,
+          "Level3": 1000
+        }
+      ]
+    },
+    "ItemPresets": {
+      "pppppppppppppppppppppppp": {
+        "_id": "pppppppppppppppppppppppp",
+        "_encyclopedia": "wwwwgun00000000000000001",
+        "_items": [
+          {
+            "_id": "r0000000000000000000000r",
+            "_tpl": "wwwwgun00000000000000001"
+          },
+          {
+            "_id": "m0000000000000000000000m",
+            "_tpl": "mmmmmag00000000000000001",
+            "parentId": "r0000000000000000000000r",
+            "slotId": "mod_magazine"
+          }
+        ]
+      }
+    }
+  },
+  "locations": {
+    "testmap": {
+      "base": {
+        "_Id": "testmap",
+        "Name": "Test Map",
+        "EscapeTimeLimit": 35,
+        "GlobalLootChanceModifier": 1.0,
+        "GlobalContainerChanceModifier": 1.0
+      },
+      "staticContainers": {
+        "staticContainers": [
+          {
+            "probability": 1.0,
+            "template": {
+              "Id": "crate_1",
+              "IsStatic": true,
+              "useGravity": false,
+              "randomRotation": false,
+              "Position": {
+                "x": 1.0,
+                "y": 2.0,
+                "z": 3.0
+              },
+              "Rotation": {
+                "x": 0.0,
+                "y": 90.0,
+                "z": 0.0
+              },
+              "IsGroupPosition": false,
+              "GroupPositions": [],
+              "Root": "cccccccccccccccccccccccc",
+              "Items": [
+                {
+                  "_id": "cccccccccccccccccccccccc",
+                  "_tpl": "ccccbox00000000000000001"
+                }
+              ]
+            }
+          },
+          {
+            "probability": 0.0,
+            "template": {
+              "Id": "crate_never",
+              "IsStatic": true,
+              "Position": {
+                "x": 9.0,
+                "y": 0.0,
+                "z": 9.0
+              },
+              "Root": "dddddddddddddddddddddddd",
+              "Items": [
+                {
+                  "_id": "dddddddddddddddddddddddd",
+                  "_tpl": "ccccbox00000000000000001"
+                }
+              ]
+            }
+          }
+        ],
+        "staticForced": [
+          {
+            "containerId": "crate_1",
+            "itemTpl": "qqqquest0000000000000001"
+          }
+        ]
+      },
+      "looseLoot": {
+        "spawnpointCount": {
+          "mean": 2,
+          "std": 0
+        },
+        "spawnpointsForced": [
+          {
+            "locationId": "forced_1",
+            "probability": 1.0,
+            "template": {
+              "Id": "forced_1",
+              "IsStatic": false,
+              "useGravity": true,
+              "Position": {
+                "x": 4.0,
+                "y": 0.0,
+                "z": 4.0
+              },
+              "Root": "eeeeeeeeeeeeeeeeeeeeeeee",
+              "Items": [
+                {
+                  "_id": "eeeeeeeeeeeeeeeeeeeeeeee",
+                  "_tpl": "qqqquest0000000000000001"
+                }
+              ]
+            }
+          }
+        ],
+        "spawnpoints": [
+          {
+            "locationId": "loose_1",
+            "probability": 1.0,
+            "template": {
+              "Id": "loose_1",
+              "IsStatic": false,
+              "useGravity": true,
+              "Position": {
+                "x": 5.0,
+                "y": 0.0,
+                "z": 6.0
+              },
+              "Root": "ffffffffffffffffffffffff",
+              "Items": [
+                {
+                  "_id": "ffffffffffffffffffffffff",
+                  "_tpl": "wwwwgun00000000000000001"
+                },
+                {
+                  "_id": "ffffffffffffffffffffff02",
+                  "_tpl": "aaaaammo0000000000000001"
+                }
+              ]
+            },
+            "itemDistribution": [
+              {
+                "composedKey": {
+                  "key": "ffffffffffffffffffffffff"
+                },
+                "relativeProbability": 1
+              }
+            ]
+          },
+          {
+            "locationId": "loose_never",
+            "probability": 0.0,
+            "template": {
+              "Id": "loose_never",
+              "Position": {
+                "x": 0.0,
+                "y": 0.0,
+                "z": 0.0
+              },
+              "Root": "1111111111111111111111ff",
+              "Items": [
+                {
+                  "_id": "1111111111111111111111ff",
+                  "_tpl": "aaaaammo0000000000000001"
+                }
+              ]
+            }
+          }
+        ]
+      }
+    }
+  },
+  "loot": {
+    "staticLoot": {
+      "ccccbox00000000000000001": {
+        "itemcountDistribution": [
+          {
+            "count": 2,
+            "relativeProbability": 1
+          }
+        ],
+        "itemDistribution": [
+          {
+            "tpl": "aaaaammo0000000000000001",
+            "relativeProbability": 5
+          },
+          {
+            "tpl": "bbbbbox00000000000000002",
+            "relativeProbability": 5
+          }
+        ]
+      }
+    }
+  },
+  "_comment": "One database for the whole of emutest: the union of emu-db, emu-market, emu-hideout, emu-loot and emu-quests, plus what the joins between them need. It is one file because the emulator is one server and its systems meet each other -- a quest reward is redeemed out of the mailbox into the same stash a flea purchase lands in, and a craft consumes the same rouble stack a trader was paid from. Five databases would prove each system and none of the joins. Every number in here is small enough to check by hand."
+}

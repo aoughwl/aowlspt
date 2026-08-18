@@ -631,6 +631,25 @@ static double aowl_regs_flt(void* p, int32_t i) {
         default: return 0.0;
     }
 }
+/* A `float` argument, read as a float.
+ *
+ * The thunk saves each XMM register with `movsd` -- the low 64 bits -- because
+ * it does not know, and cannot know, what type the argument is: that lives in
+ * the method's declared signature, which only the host has. A `System.Single`
+ * occupies the low **32** of those bits and the rest is whatever the register
+ * happened to hold, so reading the slot as a `double` produces a number with no
+ * relationship to the argument. Passing 12.5f reported 0.000000.
+ *
+ * So there are two readers, and the caller picks by declared type: this one for
+ * `System.Single`, `aowl_regs_flt` for `System.Double`. */
+static double aowl_regs_f32(void* p, int32_t i) {
+    AowlRegs* r = (AowlRegs*)p;
+    float f = 0.0f;
+    if (!r || i < 0 || i > 3) return 0.0;
+    memcpy(&f, (&r->x0) + i, sizeof(f));
+    return (double)f;
+}
+
 static void aowl_regs_set_ret_int(void* p, uint64_t v) {
     if (p) ((AowlRegs*)p)->ret = v;
 }

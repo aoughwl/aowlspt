@@ -8,73 +8,112 @@
 ## copyright holder is unchanged.
 ##
 ## ---------------------------------------------------------------------------
-## WHAT THIS PORT DOES, AND WHAT IT CANNOT DO
+## WHAT THIS PORT DOES
 ## ---------------------------------------------------------------------------
 ##
-## Read this before opening an issue about "the FOV did not change".
+## The original is a BepInEx plugin: a per-frame `FovController` component plus
+## a handful of Harmony prefixes that read `__instance`, rewrite private fields
+## and `return false`. Post-1.0 Tarkov is IL2CPP, so none of that exists — but
+## the three things those patches needed do now, and this port uses them:
 ##
-## The original is a BepInEx plugin built entirely out of Harmony patches that
-## **replace** game methods: `LerpCamera`, `Player::Look`,
-## `CalculateScaleValueByFov` and `SightComponent::get_GetCurrentSensitivity`
-## are all `[PatchPrefix]`es that read `__instance`, read and write private
-## instance fields by reflection, and `return false` so the original never
-## runs. `AimingSensitivityPatch` writes a `ref float ____aimingSens`.
-## `FovController` calls `CameraManager.Instance.SetFov(...)` every frame.
+##   * **live objects** — a reference return is a handle you can call on;
+##   * **fields**, including private ones, read and written by name;
+##   * **hooks with arguments and suppression** — `hookArgs` + `stopWith` is a
+##     Harmony prefix that returns `false` with a `__result`.
 ##
-## Post-1.0 Tarkov is IL2CPP. There are no managed assemblies, so there is no
-## Harmony, no reflection over fields, and no `__instance`. What this host
-## offers a client mod is exactly three things (docs/MODDING.md):
+## and, for anything on the frame path, **`aowlspt/fast`**: the mod binds a
+## method or a field once and then calls it in ~10 ns instead of ~1000. A FOV
+## write happens every frame, so it is on that path and nowhere near the boxed
+## one (docs/PERF.md).
 ##
-##   * `resolve(name)`      — find a compiled type by name
-##   * `call(Type::Member)` — invoke a **static** member with scalar arguments
-##   * `patch(Type::Method)`— detour a compiled method, **observe only**
+## Three effects are implemented, each one armed only when every binding it
+## needs actually resolved, and each one reporting whether it applied:
 ##
-## The detour cannot read the method's arguments (that needs a thunk generated
-## per signature) and cannot suppress the original — both limits are stated by
-## the host rather than approximated, and both are load-bearing here. Every
-## effect FOV Fix produces needs at least one of:
+##   1. **The per-frame FOV write.** Upstream's `FovController`: the camera's
+##      field of view is multiplied by `opticFovMulti` or `nonOpticFovMulti`
+##      while aiming. Entirely on the fast path — `GameWorld.Instance` →
+##      `MainPlayer` → `ProceduralWeaponAnimation` → `IsAiming`, and
+##      `CameraManager.Instance` → `SetFov` — driven from a cheap hook on a
+##      method the game already calls every frame, so the write lands on the
+##      game thread rather than the host's own (`invoke_main` is *not* Unity's
+##      main thread, docs/MODDING.md).
+##   2. **`Player::CalculateScaleValueByFov`.** A float in, a float out, and
+##      upstream replaces the body. `hookArgs` + `stopWith` expresses that
+##      exactly. Gated on `enableFovScaleFix`.
+##   3. **`SightComponent::get_GetCurrentSensitivity`.** A float getter whose
+##      body upstream replaces with the magnification→sensitivity table below.
+##      Same mechanism; the table is the pure arithmetic it always was, and it
+##      is now wired to the optic camera's live field of view.
 ##
-##   1. an *instance* pointer (`__instance`) — the host's `resolve` yields type
-##      handles only, and `call` reports a reference return as
-##      `{"type":"..."}` rather than handing back an object handle, so there is
-##      no path from `CameraManager::get_Instance` to `SetFov` on it;
-##   2. reading or writing a *field* — there is no field accessor in the ABI;
-##   3. *replacing* a method body — the detour is prefix-observe only.
+## ---------------------------------------------------------------------------
+## WHAT IS STILL NOT EXPRESSIBLE, AND WHY
+## ---------------------------------------------------------------------------
 ##
-## So **no FOV value, camera offset, aim speed or mouse sensitivity is applied
-## by this mod.** Nothing here fakes one. Faking it is the failure mode the
-## C# port of Classic Movement actually hit: `protected virtual` overrides that
-## *hid* rather than overrode the base members, so the build was clean and the
-## mod silently did nothing. A mod that says it changed your FOV and did not is
-## the same lie with a different cause.
+## Reported here rather than approximated. Every one of these is blocked by a
+## specific missing capability, named so it can be fixed rather than guessed
+## around.
 ##
-## What the port *is*, therefore, is the two halves that do survive:
+## * **`ProceduralWeaponAnimation::LerpCamera`** — upstream's `LerpCameraPatch`
+##   replaces the ADS camera lerp: it reads and writes the instance's `Vector3`
+##   camera-offset fields and its per-axis speeds. Two blockers. A hook is not
+##   told **which instance** it fired on — `args` carries the declared
+##   parameters and not `this` — and a `Vector3` is a 12-byte value type that
+##   neither the fast path (it would have to be copied, not loaded) nor the
+##   boxed field reader will hand over. Both would have to go.
 ##
-##   * **The configuration surface.** Every tunable the original bound through
-##     BepInEx lives in `config.json` and is read here through `setting()`,
-##     validated, and reported. When the ABI grows instance handles and field
-##     access, the values are already in the right place with the right names.
-##   * **Target verification.** The porting lesson from Classic Movement is
-##     "verify that the thing you hooked is the thing the game actually calls".
-##     With `verifyHooks` on, this mod detours the exact methods FOV Fix
-##     patched and counts how often each one fires. A target that resolves,
-##     patches and then never fires is a renamed or inlined method, and you
-##     find that out from the log instead of from a mod that quietly does
-##     nothing. That is *evidence*, not an effect, and it is logged as such.
+## * **`Player::Look`** — upstream's `FreeLookPatch` clamps the free-look
+##   angles on `__instance`. Same missing `this`, and the argument is a
+##   `Vector2`: a hook that asked for arguments would have the host classify
+##   that struct as a reference and take a GC handle to a register that holds
+##   float bits. This port refuses to install an argument hook on any method
+##   with a value-type parameter for exactly that reason — see `argsSafe`.
 ##
-## The gaps this port needs closed, in the order they block work, are listed in
-## the report that accompanied it: object handles out of `call`, a field
-## get/set pair, and a replace-kind patch.
+## * **`FirearmController::get_AimingSensitivity`** — upstream injects
+##   `ref float ____aimingSens`, i.e. the private `_aimingSens` field of the
+##   instance, and **scales** it. The interesting half of the question is
+##   whether `stopWith` expresses that, and the answer is: *for a getter whose
+##   patch sets an absolute value, yes, exactly* — writing the backing field
+##   and returning it is indistinguishable from returning it. But upstream does
+##   not set an absolute value, it multiplies the one the original would have
+##   produced, and a prefix that suppresses the original never learns what that
+##   was. Expressing "post-process the result" needs a **postfix** patch whose
+##   handler is given the return value; `PatchKind` has `pkPostfix` and the
+##   host ignores it (every patch is a prefix detour). Left out.
+##
+## * **The toggle-zoom key.** `zoomToggleKey`, `holdToZoom` and the three
+##   `*ToggleZoomMulti` settings need to know whether a key is down.
+##   `UnityEngine.Input::GetKey` takes a `KeyCode`, which is an enum, and
+##   mapping the configured names onto its numeric values by hand is precisely
+##   the kind of guess this port does not make. The settings are read, reported
+##   and carried; nothing acts on them.
+##
+## * **The base-FOV slider range** (`minBaseFov`/`maxBaseFov`) — upstream's
+##   `FovRangePatch` rewrites the slider bounds on a `GameSettingsTab`
+##   instance. Missing `this` again.
+##
+## ---------------------------------------------------------------------------
+## HOW YOU KNOW IT WORKED
+## ---------------------------------------------------------------------------
+##
+## The verification machinery that was this port's only content is kept, and
+## extended. `verifyHooks` still detours the exact methods upstream patched and
+## counts them, because "the thing I hooked is not the thing the game calls" is
+## the failure mode that compiles clean and does nothing. On top of that, each
+## of the three effects reports its own state — armed, or refused with the
+## reason the runtime gave — and its own applied count. A minute into the
+## world the log says both: what fired, and what this mod actually did.
 
 import aowlspt
 import aowlspt/game
 import aowlspt/server   # `setting` — configGet with a typed reader on top
+import aowlspt/il2cpp   # the runtime's own C API, for signature checks
+import aowlspt/fast     # bind once, call in ~10 ns — docs/PERF.md
 
 const
   ModGuid = "aowl.fovfix"
   ModName = "FOV Fix"
   ModAuthor = "Fontaine (ported by savannt)"
-  ModVersion = "4.0.2"
+  ModVersion = "4.1.0"
 
 # ---------------------------------------------------------------------------
 # Configuration
@@ -245,11 +284,10 @@ proc loadConfig() =
 # ---------------------------------------------------------------------------
 #
 # Upstream's `Utils.GetZoomSensValue` maps the optic camera's field of view to
-# one of the per-magnification multipliers. The table is ported in full and
-# tested here, because it is pure arithmetic over configuration: it needs
-# nothing from the game, so it is the one piece of FOV Fix's behaviour that can
-# be carried across whole and shown to be right. What it cannot do yet is
-# reach the value it would be applied to.
+# one of the per-magnification multipliers. Pure arithmetic over configuration,
+# ported whole; what has changed since the first version of this port is that
+# it is now reachable — the optic camera's live field of view goes in one end
+# and `SightComponent::get_GetCurrentSensitivity` returns the result.
 
 proc zoomSensFor(scopeFov: float): float =
   ## `scopeFov` is the optic camera's vertical FOV in degrees, as
@@ -286,6 +324,430 @@ var ScopeZoomHandler = gameType("EFT.CameraControl.ScopeZoomHandler")
 
 var world = whenReady("EFT.GameWorld")
 
+const
+  TyGameWorld = "EFT.GameWorld"
+  TyPlayer = "EFT.Player"
+  TyPwa = "EFT.Animations.ProceduralWeaponAnimation"
+  TyCamera = "EFT.CameraControl.CameraManager"
+  TyUnityCamera = "UnityEngine.Camera"
+  TySight = "EFT.InventoryLogic.SightComponent"
+
+  FrameDriver = "EFT.Player::Look"
+    ## The per-frame hook the FOV write rides on.
+    ##
+    ## It has to be a method the game already calls every frame, because the
+    ## alternative — `onUpdate` — runs on the host's own attached thread, and
+    ## `invoke_main` queues onto that same thread rather than Unity's. Writing
+    ## a camera's field of view from there is not legal. `Look` is upstream's
+    ## `FreeLookPatch` target, so it is one this port already watches, and it
+    ## is reached once per player per frame.
+
+# ---------------------------------------------------------------------------
+# The runtime, and the signature checks that gate every hook
+# ---------------------------------------------------------------------------
+#
+# A mod DLL is in the same process as the host, so `openIl2Cpp` binds the
+# already-loaded `GameAssembly.dll` directly and the host is simply not on the
+# path (docs/PERF.md). That buys two things: the fast path, and the runtime's
+# own metadata — which is what makes it possible to *check* a signature before
+# hooking it rather than assuming one.
+
+var rt: Il2Cpp
+var rtOpen = false
+
+proc openRuntime(): bool =
+  if rtOpen:
+    return true
+  rt = openIl2Cpp()
+  if not rt.loaded:
+    return false
+  let missing = rt.missingEssential()
+  if missing.len > 0:
+    warn "the IL2CPP runtime is missing " & $missing.len &
+         " essential entry points; the fast path stays off"
+    return false
+  rtOpen = true
+  result = true
+
+proc signatureOf(owner, member: string; argc: int;
+                 params: var seq[string]; ret: var string): bool =
+  ## The declared parameter types and return type of a method, from the
+  ## runtime's own metadata. `argc` of -1 matches any arity, exactly as the
+  ## host's `patch` does.
+  params = @[]
+  ret = ""
+  if not rtOpen:
+    return false
+  let cls = findClass(rt, owner)
+  if cls == nil:
+    return false
+  let m = findMethod(rt, cls, member, argc)
+  if m == nil:
+    return false
+  let n = methodParamCount(rt, m)
+  for i in 0 ..< n:
+    params.add typeName(rt, methodParam(rt, m, i))
+  ret = typeName(rt, methodReturnType(rt, m))
+  result = true
+
+proc describeSig(params: seq[string]; ret: string): string =
+  result = "("
+  for i in 0 ..< params.len:
+    if i > 0: result.add ", "
+    result.add params[i]
+  result.add ") -> " & ret
+
+proc argsSafe(params: seq[string]): bool =
+  ## Whether it is safe to ask the host for this method's arguments.
+  ##
+  ## This is a guard, not a convenience. The host builds the argument array by
+  ## the declared type name: primitives and strings it formats, and **anything
+  ## else it treats as a reference** — it takes the register, calls
+  ## `il2cpp_gc_handle_new` on it and reports a handle. For a `Vector2`, a
+  ## `Vector3` or an enum that register holds float bits or a small integer,
+  ## not an object pointer, and handing that to the collector is not a wrong
+  ## answer, it is a crash in the middle of a game method.
+  ##
+  ## `classifyType` answers the same question the fast path asks: a primitive
+  ## or a reference is a kind, and a value type — struct or enum — is `fkNone`.
+  ## So a method with any unclassifiable parameter does not get an argument
+  ## hook from this mod, and the log says which type stopped it.
+  result = true
+  for i in 0 ..< params.len:
+    if classifyType(rt, params[i]) == fkNone:
+      return false
+
+# ---------------------------------------------------------------------------
+# Effects: what this mod applies, and whether it managed to
+# ---------------------------------------------------------------------------
+#
+# Each effect carries a state string — "armed", or "refused: <what the runtime
+# said>" — and its own applied counter. Nothing here is a boolean "installed":
+# a patch that installs and never runs is the whole reason this mod counts
+# anything at all, and the same doubt applies to an effect.
+
+var gFovState = "not attempted"
+var gFovWrites = 0
+var gScaleState = "not attempted"
+var gScaleHits = 0
+var gSensState = "not attempted"
+var gSensHits = 0
+
+# The FOV chain, bound once. `Binding` and `FieldBinding` are declared bare and
+# assigned from a proc: a nimony `--app:lib` global initialised by a *call* is
+# silently left zeroed, and a zeroed Binding has `ok = false`, so it fails safe
+# but never becomes true. See fast.nim's rule 1.
+var bWorld: Binding
+var bMainPlayer: Binding
+var bPwa: Binding
+var bIsAiming: Binding
+var bScope: Binding
+var bIsOptic: Binding
+var bCamInstance: Binding
+var bCamCamera: Binding
+var bCamFov: Binding
+var bSetFov: Binding
+var bOpticInstance: Binding
+var bOpticCamera: Binding
+
+var gSetFovArgc = 0
+var gOpticClassTried = false
+var gOpticChainState = "not attempted"
+var gBaseFov = 0.0
+var gLastFovMs = 0'i64
+
+const
+  FovIntervalMs = 4'i64
+    ## The FOV write is idempotent and the hook it rides on fires once per
+    ## player per frame — including every bot's. Rate-limiting to ~250 Hz means
+    ## a raid full of bots costs one write per frame rather than forty, and a
+    ## 240 Hz client still gets one per frame.
+    ##
+    ## The clock is the host's `nowMs` rather than `fast`'s `perfCounter`:
+    ## `perfCounter` is an `importc ... nodecl` that only compiles in a
+    ## translation unit which `#include`s `abi/aowlspt_fast.h`, and fast.nim
+    ## does that emit for itself, not for its importers. A millisecond is the
+    ## right resolution for a gate measured in milliseconds anyway.
+
+proc bindFovChain(): bool =
+  ## Binds everything the per-frame FOV write needs. All or nothing: an effect
+  ## that half-binds is an effect that reads a field it did not check.
+  bWorld = bindMethod(rt, TyGameWorld, "get_Instance", 0)
+  if not bWorld.ok:
+    gFovState = "refused: " & bWorld.why
+    return false
+  bMainPlayer = bindMethod(rt, TyGameWorld, "get_MainPlayer", 0)
+  if not bMainPlayer.ok:
+    gFovState = "refused: " & bMainPlayer.why
+    return false
+  bPwa = bindMethod(rt, TyPlayer, "get_ProceduralWeaponAnimation", 0)
+  if not bPwa.ok:
+    gFovState = "refused: " & bPwa.why
+    return false
+  bIsAiming = bindMethod(rt, TyPwa, "get_IsAiming", 0)
+  if not bIsAiming.ok:
+    gFovState = "refused: " & bIsAiming.why
+    return false
+  bCamInstance = bindMethod(rt, TyCamera, "get_Instance", 0)
+  if not bCamInstance.ok:
+    gFovState = "refused: " & bCamInstance.why
+    return false
+  bCamCamera = bindMethod(rt, TyCamera, "get_Camera", 0)
+  if not bCamCamera.ok:
+    gFovState = "refused: " & bCamCamera.why
+    return false
+  bCamFov = bindMethod(rt, TyUnityCamera, "get_fieldOfView", 0)
+  if not bCamFov.ok:
+    gFovState = "refused: " & bCamFov.why
+    return false
+
+  # `SetFov` is the one place upstream's call shape has to be confirmed rather
+  # than remembered. Two overloads are accepted, and only if the runtime says
+  # the parameters are what this would pass; anything else is refused with the
+  # signature printed, which is the line somebody needs in order to fix it.
+  var params: seq[string] = @[]
+  var ret = ""
+  if signatureOf(TyCamera, "SetFov", 3, params, ret) and params.len == 3 and
+     params[0] == "System.Single" and params[1] == "System.Single" and
+     params[2] == "System.Boolean":
+    bSetFov = bindMethod(rt, TyCamera, "SetFov", 3)
+    gSetFovArgc = 3
+  elif signatureOf(TyCamera, "SetFov", 1, params, ret) and params.len == 1 and
+       params[0] == "System.Single":
+    bSetFov = bindMethod(rt, TyCamera, "SetFov", 1)
+    gSetFovArgc = 1
+  else:
+    discard signatureOf(TyCamera, "SetFov", -1, params, ret)
+    gFovState = "refused: " & TyCamera & "::SetFov is " &
+                describeSig(params, ret) &
+                ", which is neither (Single, Single, Boolean) nor (Single); " &
+                "this port will not guess what the extra parameters mean"
+    return false
+  if not bSetFov.ok:
+    gFovState = "refused: " & bSetFov.why
+    return false
+
+  # Optic detection is optional. Without it every aim is treated as
+  # unmagnified, which is a *reduced* effect rather than a wrong one, so it
+  # does not veto the whole chain -- but it is reported.
+  bScope = bindMethod(rt, TyPwa, "get_CurrentScope", 0)
+  if not bScope.ok:
+    warn "FOV Fix: no optic detection (" & bScope.why &
+         "); opticFovMulti will not be used"
+  result = true
+
+proc bindOpticIsOptic(scope: Il2CppPtr) =
+  ## `CurrentScope`'s declared type is not the type of the object it returns,
+  ## and `get_IsOptic` lives on the latter. So the class comes off the object
+  ## the first time one exists, and the binding is made against that name.
+  if gOpticClassTried:
+    return
+  gOpticClassTried = true
+  let cls = objectClass(rt, scope)
+  if cls == nil:
+    return
+  let owner = fullName(rt, cls)
+  if owner.len == 0:
+    return
+  bIsOptic = bindMethod(rt, owner, "get_IsOptic", 0)
+  if bIsOptic.ok:
+    info "FOV Fix: optic detection bound on " & owner
+  else:
+    warn "FOV Fix: " & bIsOptic.why & "; every aim counts as unmagnified"
+
+proc bindOpticCamera(): bool =
+  ## The optic camera, for the sensitivity table. Its container was renamed
+  ## more than once, so both spellings are tried and the one that resolves is
+  ## reported -- an empirical answer rather than a remembered one.
+  if bOpticCamera.ok:
+    return true
+  var owner = "EFT.CameraControl.OpticCameraManagerContainer"
+  bOpticInstance = bindMethod(rt, owner, "get_Instance", 0)
+  if not bOpticInstance.ok:
+    owner = "EFT.CameraControl.OpticCameraManager"
+    bOpticInstance = bindMethod(rt, owner, "get_Instance", 0)
+  if not bOpticInstance.ok:
+    gOpticChainState = "refused: " & bOpticInstance.why
+    return false
+  bOpticCamera = bindMethod(rt, owner, "get_Camera", 0)
+  if not bOpticCamera.ok:
+    gOpticChainState = "refused: " & bOpticCamera.why
+    return false
+  gOpticChainState = "bound on " & owner
+  result = true
+
+proc opticFieldOfView(): float =
+  ## The optic camera's live vertical FOV, or 0 when there is no optic camera —
+  ## which `zoomSensFor` reads as "unmagnified" and answers accordingly.
+  result = 0.0
+  if not bOpticCamera.ok or not bCamFov.ok:
+    return
+  var a = noArgs()
+  let container = callPtr(bOpticInstance, nullPtr(), a)
+  if container == nil:
+    return
+  a.reset()
+  let cam = callPtr(bOpticCamera, container, a)
+  if cam == nil:
+    return
+  a.reset()
+  result = callFloat(bCamFov, cam, a)
+
+# ---------------------------------------------------------------------------
+# Effect 1: the per-frame FOV write
+# ---------------------------------------------------------------------------
+
+proc applyFov() =
+  ## Upstream's `FovController.Update`, on the fast path.
+  ##
+  ## Runs inside a patched game method, so it is on the game thread and inside
+  ## the game's own frame -- which is where a Unity write has to happen. Every
+  ## pointer here is resolved fresh and dropped before the call returns: rule 4
+  ## in docs/PERF.md, and the reason nothing in this file stores one.
+  if not bSetFov.ok:
+    return
+  let now = nowMs()
+  if gLastFovMs != 0'i64 and now - gLastFovMs < FovIntervalMs:
+    return
+  gLastFovMs = now
+
+  var a = noArgs()
+  let w = callPtr(bWorld, nullPtr(), a)
+  if w == nil: return
+  a.reset()
+  let player = callPtr(bMainPlayer, w, a)
+  if player == nil: return
+  a.reset()
+  let pwa = callPtr(bPwa, player, a)
+  if pwa == nil: return
+
+  a.reset()
+  let cm = callPtr(bCamInstance, nullPtr(), a)
+  if cm == nil: return
+  a.reset()
+  let cam = callPtr(bCamCamera, cm, a)
+  if cam == nil: return
+
+  # The base is captured once, before anything is written, and never re-read.
+  # Reading it every frame would be a feedback loop: this mod's own output is
+  # the camera's field of view, so the second frame would multiply the first
+  # frame's product. The cost is that changing the in-game FOV slider mid-raid
+  # does not take effect until the next one, which is stated rather than hidden.
+  if gBaseFov <= 0.0:
+    a.reset()
+    let seen = callFloat(bCamFov, cam, a)
+    if seen <= 0.0:
+      return
+    gBaseFov = seen
+    info "FOV Fix: base field of view captured at " & $gBaseFov
+
+  a.reset()
+  let aiming = callBool(bIsAiming, pwa, a)
+
+  var optic = false
+  if aiming and bScope.ok:
+    a.reset()
+    let scope = callPtr(bScope, pwa, a)
+    if scope != nil:
+      if not gOpticClassTried:
+        bindOpticIsOptic(scope)
+      if bIsOptic.ok:
+        a.reset()
+        optic = callBool(bIsOptic, scope, a)
+
+  var mult = 1.0
+  if aiming:
+    mult = (if optic: cfgOpticFovMulti else: cfgNonOpticFovMulti)
+
+  let target = gBaseFov * mult
+  a.reset()
+  addFloat(a, target)
+  if gSetFovArgc == 3:
+    addFloat(a, 0.0)     # lerp time: upstream sets the value outright
+    addBool(a, true)
+  callVoid(bSetFov, cm, a)
+  gFovWrites = gFovWrites + 1
+
+# ---------------------------------------------------------------------------
+# Effect 2: CalculateScaleValueByFov
+# ---------------------------------------------------------------------------
+
+proc onScaleValue(target, args: string): HookResult =
+  ## Upstream's `CalculateScaleValueByFovPatch`: the body is replaced by a
+  ## constant, so the viewmodel stops being rescaled as the field of view
+  ## changes. A prefix that returns a `__result` and `false` is exactly
+  ## `stopWith`, and this is the case where the two are the same thing.
+  gScaleHits = gScaleHits + 1
+  result = stopWith($cfgFovScale)
+
+proc armScaleFix() =
+  if not cfgEnableFovScaleFix:
+    gScaleState = "off (enableFovScaleFix is false)"
+    return
+  var params: seq[string] = @[]
+  var ret = ""
+  if not signatureOf(TyPlayer, "CalculateScaleValueByFov", -1, params, ret):
+    gScaleState = "refused: no " & TyPlayer & "::CalculateScaleValueByFov"
+    return
+  if ret != "System.Single":
+    gScaleState = "refused: it is " & describeSig(params, ret) &
+                  " and this replaces a float"
+    return
+  if not argsSafe(params):
+    gScaleState = "refused: " & describeSig(params, ret) &
+                  " has a value-type parameter, which the host would report " &
+                  "as a reference"
+    return
+  if hookArgs(TyPlayer & "::CalculateScaleValueByFov", onScaleValue) == Ok:
+    gScaleState = "armed, returning " & $cfgFovScale
+  else:
+    gScaleState = "refused: " & lastError()
+
+# ---------------------------------------------------------------------------
+# Effect 3: SightComponent::get_GetCurrentSensitivity
+# ---------------------------------------------------------------------------
+
+proc onScopeSensitivity(target, args: string): HookResult =
+  ## Upstream's `ScopeSensitivityPatch`. The magnification→sensitivity table is
+  ## the arithmetic at the top of this file; what it is applied to is the optic
+  ## camera's field of view, read live on the fast path.
+  ##
+  ## The one thing this cannot do is tell *which* sight is being asked: a hook
+  ## is not given the instance it fired on, only the declared arguments, and
+  ## this getter has none. In a raid the sight being queried for sensitivity is
+  ## the one being aimed through, which is the one the optic camera is showing,
+  ## so the answer is the same -- but it is an assumption and it is written
+  ## down rather than left implied.
+  gSensHits = gSensHits + 1
+  result = stopWith($zoomSensFor(opticFieldOfView()))
+
+proc armScopeSensitivity() =
+  if not cfgChangeMouseSensitivity:
+    gSensState = "off (changeMouseSensitivity is false)"
+    return
+  var params: seq[string] = @[]
+  var ret = ""
+  if not signatureOf(TySight, "get_GetCurrentSensitivity", -1, params, ret):
+    gSensState = "refused: no " & TySight & "::get_GetCurrentSensitivity"
+    return
+  if ret != "System.Single":
+    gSensState = "refused: it is " & describeSig(params, ret) &
+                 " and this replaces a float"
+    return
+  if not argsSafe(params):
+    gSensState = "refused: " & describeSig(params, ret) &
+                 " has a value-type parameter"
+    return
+  if not bindOpticCamera():
+    gSensState = "refused: the optic camera is unreachable (" &
+                 gOpticChainState & "), so the table has no field of view " &
+                 "to read and would be answering from nothing"
+    return
+  if hookArgs(TySight & "::get_GetCurrentSensitivity", onScopeSensitivity) == Ok:
+    gSensState = "armed, " & gOpticChainState
+  else:
+    gSensState = "refused: " & lastError()
+
 # ---------------------------------------------------------------------------
 # Hook verification
 # ---------------------------------------------------------------------------
@@ -309,6 +771,11 @@ proc onWatched(target: string) =
   let i = watchIndex(target)
   if i >= 0:
     gWatchCounts[i] = gWatchCounts[i] + 1
+  # The frame driver is a watched target and not a second detour on the same
+  # method: two patches on one compiled function would be a detour of a
+  # detour. One hook, and the dispatcher decides what else it means.
+  if target == FrameDriver:
+    applyFov()
 
 proc watch(target, why: string) =
   ## Detour `target` and count its calls.
@@ -336,7 +803,7 @@ proc reportType(t: var GameType) =
     warn "  NOT FOUND: " & t.name & " -- a rename would show up here first"
 
 proc onWorldReady() =
-  success "FOV Fix: the game world is up; checking what this build can reach"
+  success "FOV Fix: the game world is up"
 
   # Every type FOV Fix patched. Resolving them is not decorative: if BSG or a
   # backport renames one, this is the line that says so, and it says it before
@@ -349,39 +816,78 @@ proc onWorldReady() =
   reportType(GameSettingsTab)
   reportType(ScopeZoomHandler)
 
+  # Binding happens here rather than in `onLoad`, and that is not a detail:
+  # `findClass` walks every loaded assembly, and at load time the game's own
+  # assemblies are not among them, so a binding made then would correctly
+  # refuse and never be retried.
+  if not openRuntime():
+    gFovState = "refused: the IL2CPP runtime could not be bound from the mod"
+    gScaleState = gFovState
+    gSensState = gFovState
+    warn "FOV Fix: " & gFovState
+  else:
+    if bindFovChain():
+      gFovState = "armed, SetFov taking " & $gSetFovArgc & " argument(s)"
+    armScaleFix()
+    armScopeSensitivity()
+
+  info "FOV Fix: per-frame FOV write -- " & gFovState
+  info "FOV Fix: CalculateScaleValueByFov -- " & gScaleState
+  info "FOV Fix: scope sensitivity -- " & gSensState
+
   if not cfgVerifyHooks:
     info "verifyHooks is off; not attaching the target-verification detours"
+    # The frame driver is one of those detours, so the FOV write goes with it.
+    if gFovState.len > 0 and bSetFov.ok:
+      warn "the per-frame FOV write rides on the " & FrameDriver &
+           " detour and is therefore also off"
     return
 
   # The exact methods the original patched, in the original's order. Sixteen
-  # patch slots exist; this uses six.
+  # patch slots exist; this uses six, two of which now do work rather than
+  # only counting.
   watch("EFT.Animations.ProceduralWeaponAnimation::UpdateWeaponVariables",
         "PwaWeaponParamsPatch -- where upstream learns the current weapon")
   watch("EFT.Animations.ProceduralWeaponAnimation::LerpCamera",
-        "LerpCameraPatch -- the ADS camera position and smoothing")
-  watch("EFT.Player::Look",
-        "FreeLookPatch -- freelook clamping")
+        "LerpCameraPatch -- not ported: Vector3 fields, and no instance")
+  watch(FrameDriver,
+        "FreeLookPatch -- not ported; carries the per-frame FOV write")
   watch("EFT.Player::CalculateScaleValueByFov",
         "CalculateScaleValueByFovPatch -- viewmodel/ribcage scale")
   watch("EFT.Player.FirearmController::get_AimingSensitivity",
-        "AimingSensitivityPatch -- aimed mouse sensitivity")
+        "AimingSensitivityPatch -- not ported: it scales, a prefix replaces")
   watch("EFT.InventoryLogic.SightComponent::get_GetCurrentSensitivity",
         "ScopeSensitivityPatch -- per-scope sensitivity")
 
-proc reportWatch() =
-  if gWatchNames.len == 0:
-    return
-  info "FOV Fix target verification, after roughly a minute in raid:"
-  for i in 0 ..< gWatchNames.len:
-    if gWatchCounts[i] > 0:
-      success "  " & gWatchNames[i] & " fired " & $gWatchCounts[i] & " times"
+proc reportEffect(name, state: string; hits: int) =
+  if state.len >= 6 and state.substr(0, 4) == "armed":
+    if hits > 0:
+      success "  " & name & ": " & state & " -- applied " & $hits & " times"
     else:
-      warn "  " & gWatchNames[i] & " never fired -- it is patched but the " &
-           "game does not call it; treat the name as stale"
-  warn "no FOV, camera or sensitivity value was applied: this host's client " &
-       "API is resolve + static call + observe-only detour, and every effect " &
-       "in FOV Fix needs an instance pointer, a field, or a replaced body. " &
-       "See the module comment."
+      warn "  " & name & ": " & state & " -- but it never applied; the " &
+           "method it replaces is not being called on this build"
+  else:
+    warn "  " & name & ": " & state
+
+proc reportWatch() =
+  if gWatchNames.len > 0:
+    info "FOV Fix target verification, after roughly a minute in raid:"
+    for i in 0 ..< gWatchNames.len:
+      if gWatchCounts[i] > 0:
+        success "  " & gWatchNames[i] & " fired " & $gWatchCounts[i] & " times"
+      else:
+        warn "  " & gWatchNames[i] & " never fired -- it is patched but the " &
+             "game does not call it; treat the name as stale"
+  info "FOV Fix, what was actually applied:"
+  reportEffect("per-frame FOV write", gFovState, gFovWrites)
+  reportEffect("CalculateScaleValueByFov", gScaleState, gScaleHits)
+  reportEffect("scope sensitivity", gSensState, gSensHits)
+  info "  not ported, and why: LerpCamera and the FOV slider range need the " &
+       "instance a hook fired on, which is not reported; LerpCamera and Look " &
+       "also need Vector2/Vector3, which no path here reads; " &
+       "get_AimingSensitivity scales the original's result, which needs a " &
+       "postfix; the toggle-zoom key needs keyboard input. See the module " &
+       "comment."
 
 # ---------------------------------------------------------------------------
 # Lifecycle
@@ -433,6 +939,10 @@ proc onLoad(): Status =
        $cfgUnaimedToggleZoomMulti &
        (if cfgCancelZoomOnUnAds: ", cancelled on un-ADS" else: "") &
        (if cfgZoomOnHoldBreath: ", driven by hold-breath" else: "")
+  info "note: the camera offsets, aim speeds and toggle-zoom settings above " &
+       "are read and reported but not applied -- the patches that would use " &
+       "them are the ones this build cannot express. The module comment says " &
+       "which capability each one is waiting on."
   Ok
 
 proc onUpdate(elapsedMs: int64): Status =
@@ -445,7 +955,7 @@ proc onUpdate(elapsedMs: int64): Status =
   # One report, a minute after the world came up: long enough that a method
   # called only on ADS or only on a weapon swap has had a chance to fire, so a
   # zero here means "never", not "not yet".
-  if not gReported and gWatchNames.len > 0 and gElapsedMs > 60_000:
+  if not gReported and gElapsedMs > 60_000 and world.fired:
     gReported = true
     reportWatch()
   Ok

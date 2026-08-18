@@ -51,6 +51,7 @@ import emu/production
 import emu/skills
 import emu/scav
 import emu/redeem
+import emu/notify
 
 const
   ModGuid = "aowl.tarkov"
@@ -531,13 +532,14 @@ proc onNotifierChannel(url, body, session: string): string =
   result = envelope(notifier)
 
 proc onNotifierPoll(url, body, session: string): string =
-  ## Long-polled by the client. Answering immediately with nothing rather than
-  ## holding the connection: a held connection occupies one of a fixed number of
-  ## accept workers, and the client is happy to be told there is no news.
-  var o = obj()
-  put(o, "type", "ping")
-  put(o, "eventId", "ping")
-  result = envelope(o)
+  ## Long-polled by the client. Answering immediately -- with news if there is
+  ## any, and a ping if there is not -- rather than holding the connection: a
+  ## held connection occupies one of a fixed number of accept workers, and four
+  ## players idling in the menu would take the whole pool.
+  let queued = take(session)
+  if queued.len > 0:
+    return envelope(raw(queued))
+  result = envelope(raw(ping()))
 
 # ---------------------------------------------------------------------------
 # Raids
@@ -787,6 +789,29 @@ proc onInsuranceCost(url, body, session: string): string =
 # Loading
 # ---------------------------------------------------------------------------
 
+proc sweep(payload: string): string =
+  ## The periodic pass: insurance that has come due, flea offers that have sold
+  ## or expired, and a notification to whoever is playing so they find out now
+  ## rather than the next time a screen happens to reload.
+  ##
+  ## On a timer *and* at login, which is not redundancy. A server that was
+  ## switched off when a return came due must still deliver it, and a timer
+  ## alone never does; a login alone never tells a player who is already sitting
+  ## in the menu.
+  var sessions: seq[string] = @[]
+  var profiles: seq[string] = @[]
+  boundSessions(sessions, profiles)
+  for i in 0 ..< sessions.len:
+    let posted = deliverDue(profiles[i], nowSeconds())
+    let settled = settleOffers(profiles[i], nowSeconds())
+    if posted + settled > 0:
+      info "sweep: " & $posted & " insurance, " & $settled & " offer(s) for " &
+           profiles[i]
+      # One note, not one per item: the client opens the inbox from it, and the
+      # inbox is where the detail already is.
+      push(sessions[i], newMessageNote("", "", 5, nowSeconds()))
+  result = ""
+
 proc registerRoutes() =
   ## Every route, in one place, in the order the client calls them. Reading this
   ## list top to bottom is reading the client's boot sequence.
@@ -902,6 +927,12 @@ proc onLoad(): Status =
     return ErrUnsupported
 
   registerRoutes()
+
+  # A minute is the right period for this: it is not a game loop, and every
+  # thing it does is something the player would otherwise wait for a screen
+  # reload to see.
+  if everyMs(60000, sweep) != Ok:
+    warn "no periodic sweep on this host: " & lastError()
 
   let all = allProfileIds()
   success "Tarkov emulator loaded, " & $all.len & " profile(s)"

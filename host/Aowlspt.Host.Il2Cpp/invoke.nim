@@ -38,6 +38,14 @@ proc cRegsInt*(p: Il2CppPtr; i: int32): uint64 {.
   importc: "aowl_regs_int", nodecl.}
 proc cRegsFlt*(p: Il2CppPtr; i: int32): float {.
   importc: "aowl_regs_flt", nodecl.}
+## A `System.Single` argument, read as one. The thunk saves each XMM register
+## with `movsd` -- the low 64 bits -- because only the method's declared
+## signature says how wide the argument is, and the thunk does not have it. A
+## float lives in the low 32 of those bits and the rest is register residue, so
+## reading the slot as a double produces a number unrelated to the argument:
+## 12.5f came back as 0.000000. Two readers, picked by declared type.
+proc cRegsF32*(p: Il2CppPtr; i: int32): float {.
+  importc: "aowl_regs_f32", nodecl.}
 proc cRegsSetRetInt*(p: Il2CppPtr; v: uint64) {.
   importc: "aowl_regs_set_ret_int", nodecl.}
 proc cRegsSetRetF32*(p: Il2CppPtr; v: float) {.
@@ -419,7 +427,7 @@ proc describeArgs*(rt: Il2Cpp; m: Il2CppMethod; regs: Il2CppPtr;
     if i > 0: out1.add ","
     let t = typeName(rt, methodParam(rt, m, i))
     if t == "System.Single":
-      out1.add $cRegsFlt(regs, int32(pos))
+      out1.add $cRegsF32(regs, int32(pos))
     elif t == "System.Double":
       out1.add $cRegsFlt(regs, int32(pos))
     elif t == "System.Boolean":

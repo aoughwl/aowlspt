@@ -8,13 +8,20 @@
  * lengths are checked against hand-encoded byte sequences with known answers,
  * including the cases the decoder is supposed to *refuse*.
  *
- * Then the whole thing is exercised for real: a function is hooked, called,
- * and unhooked, and the observable behaviour is checked at each step.
+ * Hand-encoded rather than compiler-produced on purpose: a check written as
+ * "whatever gcc emitted here decodes to something" passes whether or not the
+ * decoder is right, and stops testing the day the compiler changes its mind.
+ * The bytes below are the instruction; the number beside them is the answer.
+ *
+ * Then the whole thing is exercised for real: functions are hooked, called,
+ * and unhooked, and the observable behaviour is checked at each step -- with
+ * an SSE prologue, with arguments, and with the original suppressed.
  */
 
 #include <stdio.h>
 #include <stdint.h>
 #include <string.h>
+#include <stddef.h>
 
 #include "aowlspt_detour.h"
 
@@ -32,8 +39,74 @@ static void check_len(const char* name, const uint8_t* bytes, int32_t want) {
     else { failed++; printf("FAIL  %s: got %d, want %d\n", name, got, want); }
 }
 
+static void check_why(const char* name, const uint8_t* bytes, int32_t want) {
+    AowlInsn in = aowl_insn(bytes);
+    if (in.len == 0 && in.why == want) { passed++; printf("ok    %s\n", name); }
+    else {
+        failed++;
+        printf("FAIL  %s: len %d, why %d, want refusal %d\n",
+               name, in.len, in.why, want);
+    }
+}
+
 /* ------------------------------------------------------------------ *
- * The function under test
+ * The saved argument frame
+ *
+ * A mirror of `AowlRegs`, which lives in `aowlspt_shim.h` and is not included
+ * here: at -O0 the shim emits the whole host vtable and this test would then
+ * need the nimony side to link.
+ *
+ * What these checks are actually about is not the shim's struct but the frame
+ * *the thunk writes*, whose offsets are hard-coded in the assembly in
+ * `aowlspt_detour.h`. So the mirror is pinned to `AOWL_REGS_BYTES`, which that
+ * same file declares: a thunk that grows a slot without this following it
+ * fails to compile rather than reading the wrong one at run time.
+ * ------------------------------------------------------------------ */
+
+typedef struct TestRegs {
+    uint64_t rcx, rdx, r8, r9;   /* 0x00 0x08 0x10 0x18 */
+    /* The low 64 bits of XMM0-3, held as raw bits rather than as `double`.
+     * A `float` argument occupies only the low *32* of them and the rest is
+     * whatever the register happened to contain, so reading one of these
+     * slots as a `double` yields a number unrelated to the argument. Keeping
+     * them untyped here makes that impossible to do by accident. */
+    uint64_t x0, x1, x2, x3;     /* 0x20 0x28 0x30 0x38 */
+    uint64_t ret;                /* 0x40 */
+} TestRegs;
+
+_Static_assert(sizeof(TestRegs) == AOWL_REGS_BYTES,
+               "the saved frame and the thunk that writes it disagree");
+_Static_assert(offsetof(TestRegs, x0) == 0x20, "XMM slots moved");
+_Static_assert(offsetof(TestRegs, ret) == 0x40, "the return slot moved");
+
+/* Argument *position*, which is the rule this ABI uses: position 0 is RCX or
+ * XMM0, position 1 is RDX or XMM1, and which of the two it is depends on the
+ * declared type of that parameter -- not on how many floats came before it. */
+static uint64_t int_arg(const TestRegs* r, int pos) {
+    switch (pos) {
+        case 0: return r->rcx;
+        case 1: return r->rdx;
+        case 2: return r->r8;
+        case 3: return r->r9;
+        default: return 0;
+    }
+}
+static float float_arg(const TestRegs* r, int pos) {
+    uint64_t bits;
+    float f;
+    switch (pos) {
+        case 0: bits = r->x0; break;
+        case 1: bits = r->x1; break;
+        case 2: bits = r->x2; break;
+        case 3: bits = r->x3; break;
+        default: return 0.0f;
+    }
+    memcpy(&f, &bits, sizeof(f));
+    return f;
+}
+
+/* ------------------------------------------------------------------ *
+ * The functions under test
  * ------------------------------------------------------------------ */
 
 static volatile int g_originalCalls = 0;
@@ -46,12 +119,87 @@ void victim(void) {
     g_originalCalls++;
 }
 
-/* The nimony side normally provides this; here the test does. Returning zero
- * means "run the original", which is what every check below expects. */
+typedef struct TestObj {
+    float   health;
+    int32_t level;
+} TestObj;
+
+static TestObj g_obj;
+static volatile int g_sseCalls = 0;
+
+/* An SSE prologue, and the signature a compiled IL2CPP instance method has:
+ * `this` in RCX, the float in XMM1 *because it is the second parameter*, the
+ * int in R8, and the trailing MethodInfo* in R9.
+ *
+ * Compiled at -O2 while the rest of the file is at -O0, because -O0 spells
+ * this out through the stack in `mov`s and the point is to get the compiler to
+ * emit `pxor`/`cvtsi2ss`/`mulss` -- the two-byte opcodes that a decoder
+ * covering only one-byte forms refuses, and which most of a real game method
+ * is made of. `noinline` so it exists as a function to patch. */
+__attribute__((noinline, optimize("O2")))
+float sse_victim(void* self, float amount, int32_t kind, void* methodInfo) {
+    (void)methodInfo;
+    g_sseCalls++;
+    TestObj* o = (TestObj*)self;
+    o->health -= amount * (float)kind;
+    return o->health;
+}
+
+static volatile int g_intCalls = 0;
+
+/* The integer counterpart: four integer arguments by position, an integer
+ * return, and no floating point anywhere. */
+__attribute__((noinline, optimize("O2")))
+int64_t int_victim(int64_t a, int64_t b, int64_t c, int64_t d) {
+    g_intCalls++;
+    return a * 1000 + b * 100 + c * 10 + d;
+}
+
+/* ------------------------------------------------------------------ *
+ * The handler
+ *
+ * The nimony side normally provides this. Here the test does, keyed by slot so
+ * several hooks can be live at once with different behaviour -- which is also
+ * a check in itself, since the slot is the only thing the thunk passes and a
+ * mix-up would show as the wrong function being suppressed.
+ * ------------------------------------------------------------------ */
+
+#define MODE_PASS 0
+#define MODE_SKIP 1
+
+static int      g_mode[AOWL_MAX_HOOKS];
+static uint64_t g_replacement[AOWL_MAX_HOOKS];
+static TestRegs g_seen[AOWL_MAX_HOOKS];
+static int      g_fired[AOWL_MAX_HOOKS];
+
 int32_t aowlspt_nim_patch_fired(int32_t slot, void* regs) {
-    (void)slot; (void)regs;
     g_detourCalls++;
+    if (slot < 0 || slot >= AOWL_MAX_HOOKS || regs == NULL) return 0;
+    g_fired[slot]++;
+    memcpy(&g_seen[slot], regs, sizeof(TestRegs));
+    if (g_mode[slot] == MODE_SKIP) {
+        ((TestRegs*)regs)->ret = g_replacement[slot];
+        return 1;
+    }
     return 0;
+}
+
+static uint64_t float_bits(float f) {
+    uint32_t b;
+    uint64_t out = 0;
+    memcpy(&b, &f, sizeof(b));
+    out = b;
+    return out;
+}
+
+static void show_prologue(const char* name, const void* fn) {
+    const uint8_t* p = (const uint8_t*)fn;
+    int32_t why = AOWL_INSN_OK;
+    int32_t n = aowl_stolen_len_why(p, AOWL_JMP_SIZE, &why);
+    printf("      %s prologue:", name);
+    for (int32_t i = 0; i < (n > 0 ? n : 16); i++) printf(" %02x", p[i]);
+    if (n > 0) printf("   (%d bytes stolen)\n", n);
+    else printf("   (refused: %s)\n", aowl_hook_error_text(aowl_why_to_rc(why)));
 }
 
 int main(void) {
@@ -89,6 +237,88 @@ int main(void) {
     /* mov dword [rax+0x10], 1 -> C7 40 10 01 00 00 00 */
     { uint8_t b[] = {0xC7,0x40,0x10,0x01,0x00,0x00,0x00};
       check_len("mov [rax+16],imm32", b, 7); }
+    /* leave */
+    { uint8_t b[] = {0xC9}; check_len("leave", b, 1); }
+    /* cdqe -> 48 98 */
+    { uint8_t b[] = {0x48,0x98}; check_len("cdqe", b, 2); }
+
+    /* The two-byte map, which is where SSE lives.
+     *
+     * Every one of these was refused before, and between them they are the
+     * whole body of an ordinary float method -- `mock_native_hurt` opens with
+     * the first four. A decoder that refuses these refuses most of Tarkov, so
+     * "conservative" stopped being a virtue and became the bug. */
+    printf("\nSSE and the two-byte opcode map\n");
+    /* pxor %xmm0,%xmm0 -- 66 is a mandatory prefix here, not an operand size */
+    { uint8_t b[] = {0x66,0x0F,0xEF,0xC0}; check_len("pxor xmm0,xmm0", b, 4); }
+    /* cvtsi2ss %r8d,%xmm0 -- F3 mandatory prefix *and* a REX between it and
+       the 0F, which is the order the manual requires and the easy one to get
+       backwards */
+    { uint8_t b[] = {0xF3,0x41,0x0F,0x2A,0xC0};
+      check_len("cvtsi2ss r8d,xmm0 (REX after F3)", b, 5); }
+    { uint8_t b[] = {0xF3,0x0F,0x59,0xC8}; check_len("mulss xmm0,xmm1", b, 4); }
+    { uint8_t b[] = {0xF3,0x0F,0x10,0x41,0x10};
+      check_len("movss 0x10(%rcx),%xmm0", b, 5); }
+    { uint8_t b[] = {0xF3,0x0F,0x11,0x41,0x10};
+      check_len("movss %xmm0,0x10(%rcx)", b, 5); }
+    { uint8_t b[] = {0xF3,0x0F,0x5C,0xC1}; check_len("subss", b, 4); }
+    { uint8_t b[] = {0x0F,0x28,0xC1};      check_len("movaps xmm1,xmm0", b, 3); }
+    { uint8_t b[] = {0x0F,0x57,0xC0};      check_len("xorps xmm0,xmm0", b, 3); }
+    { uint8_t b[] = {0x0F,0x2E,0xC1};      check_len("ucomiss", b, 3); }
+    { uint8_t b[] = {0xF3,0x0F,0x2C,0xC0}; check_len("cvttss2si", b, 4); }
+    { uint8_t b[] = {0xF2,0x48,0x0F,0x2A,0xC1};
+      check_len("cvtsi2sd rcx,xmm0 (REX.W)", b, 5); }
+    { uint8_t b[] = {0xF3,0x0F,0x51,0xC0}; check_len("sqrtss", b, 4); }
+    { uint8_t b[] = {0x66,0x0F,0x6F,0x01}; check_len("movdqa (%rcx),%xmm0", b, 4); }
+    { uint8_t b[] = {0x66,0x0F,0x7E,0xC0}; check_len("movd %xmm0,%eax", b, 4); }
+    { uint8_t b[] = {0x0F,0x11,0x44,0x24,0x20};
+      check_len("movups %xmm0,0x20(%rsp)", b, 5); }
+    /* The two-byte forms that carry an immediate. Sizing these as if they did
+       not is a four-byte-short trampoline, and they are common: `cmpltss` is
+       how a float comparison compiles and `shufps` is how a vector swizzle
+       does. */
+    { uint8_t b[] = {0xF3,0x0F,0xC2,0xC1,0x01};
+      check_len("cmpss xmm1,xmm0,imm8", b, 5); }
+    { uint8_t b[] = {0x0F,0xC6,0xC1,0x1B};
+      check_len("shufps xmm1,xmm0,imm8", b, 4); }
+    { uint8_t b[] = {0x66,0x0F,0x70,0xC1,0xE4};
+      check_len("pshufd xmm1,xmm0,imm8", b, 5); }
+    /* The three-byte escapes: 0F 38 has no immediate, 0F 3A always has one. */
+    { uint8_t b[] = {0x66,0x0F,0x38,0x00,0xC1};
+      check_len("pshufb (0F 38, no imm)", b, 5); }
+    { uint8_t b[] = {0x66,0x0F,0x3A,0x0A,0xC0,0x04};
+      check_len("roundss (0F 3A, imm8)", b, 6); }
+    /* RIP-relative in the two-byte map. Loading a float constant compiles to
+       exactly this, so the displacement offset has to be right or every
+       relocated constant load reads the wrong four bytes of .rdata. */
+    { uint8_t b[] = {0xF3,0x0F,0x59,0x05,1,2,3,4};
+      check_len("mulss disp32(%rip),%xmm0", b, 8); }
+    {
+        uint8_t b[] = {0xF3,0x0F,0x59,0x05,1,2,3,4};
+        AowlInsn in = aowl_insn(b);
+        check("its RIP displacement is at offset 4", in.ripDisp == 4);
+    }
+
+    /* One-byte forms whose length is not a function of the opcode alone. */
+    printf("\none-byte forms that are easy to mis-size\n");
+    /* The group-3 trap. Same opcode, same ModRM byte position, four bytes of
+       difference -- decided by the /reg field alone. */
+    { uint8_t b[] = {0xF7,0xC0,0x01,0x00,0x00,0x00};
+      check_len("test eax,imm32 (F7 /0)", b, 6); }
+    { uint8_t b[] = {0xF7,0xD8}; check_len("neg eax (F7 /3)", b, 2); }
+    { uint8_t b[] = {0x48,0xF7,0xD1}; check_len("not rcx (REX.W F7 /2)", b, 3); }
+    { uint8_t b[] = {0xF6,0xC0,0x01}; check_len("test al,imm8 (F6 /0)", b, 3); }
+    /* The accumulator forms: no ModRM at all, which is why a decoder that
+       assumes one steals a byte too many. */
+    { uint8_t b[] = {0x3D,0x00,0x10,0x00,0x00};
+      check_len("cmp eax,imm32 (no ModRM)", b, 5); }
+    { uint8_t b[] = {0x04,0x02}; check_len("add al,imm8 (no ModRM)", b, 2); }
+    { uint8_t b[] = {0xA9,0x01,0x00,0x00,0x00}; check_len("test eax,imm32", b, 5); }
+    { uint8_t b[] = {0x6B,0xC0,0x07}; check_len("imul eax,eax,imm8", b, 3); }
+    { uint8_t b[] = {0x69,0xC0,0x00,0x01,0x00,0x00};
+      check_len("imul eax,eax,imm32", b, 6); }
+    { uint8_t b[] = {0xC1,0xE0,0x02}; check_len("shl eax,imm8", b, 3); }
+    { uint8_t b[] = {0xD1,0xF8}; check_len("sar eax,1", b, 2); }
 
     printf("\ninstructions that must be refused\n");
     /* Relative branches move if relocated, so their displacement would be
@@ -98,6 +328,27 @@ int main(void) {
     { uint8_t b[] = {0xEB,0x10};    check_len("jmp rel8 refused", b, 0); }
     { uint8_t b[] = {0x74,0x10};    check_len("je rel8 refused", b, 0); }
     { uint8_t b[] = {0x0F,0x84,1,2,3,4}; check_len("je rel32 refused", b, 0); }
+
+    /* ...and the refusal has to say *which*. "I do not know this instruction"
+       is a gap in this file that someone can close; "this instruction cannot
+       move" is a property of the code being patched that no amount of decoder
+       work will change. Reporting both as one message sent the last reader
+       looking for a missing opcode that was never missing. */
+    { uint8_t b[] = {0xE8,1,2,3,4};
+      check_why("call rel32 refused as relative", b, AOWL_INSN_RELATIVE); }
+    { uint8_t b[] = {0x0F,0x84,1,2,3,4};
+      check_why("je rel32 refused as relative", b, AOWL_INSN_RELATIVE); }
+    { uint8_t b[] = {0xE2,0x10};
+      check_why("loop rel8 refused as relative", b, AOWL_INSN_RELATIVE); }
+    /* vaddps %xmm1,%xmm0,%xmm0 -- a VEX prefix, which encodes the opcode map
+       and operand size in the prefix itself. Guessing at its length would give
+       a plausible wrong answer, so it is refused as unknown rather than sized
+       as if the C5 were LDS. */
+    { uint8_t b[] = {0xC5,0xF8,0x58,0xC1};
+      check_why("AVX (VEX) refused as unknown", b, AOWL_INSN_UNKNOWN); }
+    { uint8_t b[] = {0x0F,0x0F,0xC1,0xB4};
+      check_why("3DNow! refused as unknown", b, AOWL_INSN_UNKNOWN); }
+
     /* lea rax, [rip+x] -> 48 8D 05 ..
        RIP-relative is decoded, not refused: it is relocated on copy, which is
        what makes real functions patchable at all. The length must still be
@@ -133,10 +384,61 @@ int main(void) {
         int32_t n = aowl_stolen_len(b, AOWL_JMP_SIZE);
         check("refuses a prologue holding a relative call", n == 0);
     }
+    {
+        /* mock_native_hurt's real prologue, byte for byte: pxor, cvtsi2ss,
+           mulss, movss. 4+5+4+5 = 18. This is the sequence the engine used to
+           refuse outright, and it is what an ordinary float method looks
+           like -- so the check is that it is now *accepted*, at a length that
+           is a whole number of these instructions. */
+        uint8_t b[] = {0x66,0x0F,0xEF,0xC0,
+                       0xF3,0x41,0x0F,0x2A,0xC0,
+                       0xF3,0x0F,0x59,0xC8,
+                       0xF3,0x0F,0x10,0x41,0x10,
+                       0xC3};
+        int32_t n = aowl_stolen_len(b, AOWL_JMP_SIZE);
+        check("accepts a real SSE prologue", n == 18);
+    }
+
+    printf("\nwhich refusal it was\n");
+    {
+        uint8_t b[] = {0x55, 0xE8,1,2,3,4, 0x90,0x90,0x90,0x90,0x90,0x90};
+        int32_t why = AOWL_INSN_OK;
+        check("a relative branch is reported as one",
+              aowl_stolen_len_why(b, AOWL_JMP_SIZE, &why) == 0 &&
+              why == AOWL_INSN_RELATIVE);
+    }
+    {
+        uint8_t b[] = {0x55, 0xC5,0xF8,0x58,0xC1, 0x90,0x90,0x90,0x90,0x90};
+        int32_t why = AOWL_INSN_OK;
+        check("an unknown instruction is reported as one",
+              aowl_stolen_len_why(b, AOWL_JMP_SIZE, &why) == 0 &&
+              why == AOWL_INSN_UNKNOWN);
+    }
+    {
+        uint8_t b[] = {0x31,0xC0, 0xC3, 0x90,0x90,0x90,0x90,0x90,0x90};
+        int32_t why = AOWL_INSN_OK;
+        check("a function shorter than the jump is reported as one",
+              aowl_stolen_len_why(b, AOWL_JMP_SIZE, &why) == 0 &&
+              why == AOWL_INSN_SHORT);
+    }
+    {
+        /* The three refusals must not collapse back into one message. */
+        const char* unknown  = aowl_hook_error_text(-2);
+        const char* relative = aowl_hook_error_text(-6);
+        const char* tooShort = aowl_hook_error_text(-7);
+        check("each refusal has its own sentence",
+              strcmp(unknown, relative) != 0 &&
+              strcmp(relative, tooShort) != 0 &&
+              strcmp(unknown, tooShort) != 0);
+        check("the relative-branch refusal says so",
+              strstr(relative, "relative branch") != NULL);
+        check("the unknown-instruction refusal says so",
+              strstr(unknown, "does not know") != NULL);
+    }
 
     printf("\nfunctions too short to patch\n");
     {
-        /* Shorter than the 12-byte jump. Stealing enough bytes would run past
+        /* Shorter than the 14-byte jump. Stealing enough bytes would run past
            its `ret` into whatever the linker put next, so the hook would
            overwrite an unrelated function and the trampoline would jump into
            the middle of one. It presents as a crash a long way from the patch,
@@ -174,6 +476,22 @@ int main(void) {
         check("displacement adjusted by the distance moved",
               (int64_t)got == expect);
     }
+    {
+        /* The same, for a two-byte SSE opcode: `mulss disp32(%rip),%xmm0`.
+           Loading a float constant is precisely this instruction, so getting
+           the displacement offset wrong in the two-byte map would corrupt
+           every relocated constant rather than fail. */
+        uint8_t src[16] = {0xF3,0x0F,0x59,0x05,0x00,0x01,0x00,0x00};
+        uint8_t dst[16];
+        memset(dst, 0, sizeof(dst));
+        check("an SSE RIP-relative load relocates",
+              aowl_copy_relocated(dst, src, 8) == 0);
+        int32_t got;
+        memcpy(&got, dst + 4, 4);
+        int64_t expect = 0x100 + ((int64_t)(intptr_t)src - (int64_t)(intptr_t)dst);
+        check("its displacement adjusted by the distance moved",
+              (int64_t)got == expect);
+    }
 
     printf("\nhooking a live function\n");
     victim();
@@ -184,7 +502,7 @@ int main(void) {
 
     int32_t slot = aowl_hook_attach(h, (void*)victim);
     if (slot < 0) {
-        printf("FAIL  attach returned %d\n", slot);
+        printf("FAIL  attach returned %d (%s)\n", slot, aowl_hook_error_text(slot));
         failed++;
     } else {
         passed++;
@@ -208,6 +526,160 @@ int main(void) {
         check("the original is intact after unhooking", g_originalCalls == 1);
     }
     aowl_hook_free(h);
+
+    /* ------------------------------------------------------------------ *
+     * An SSE prologue, hooked for real
+     * ------------------------------------------------------------------ */
+    printf("\nhooking a function with an SSE prologue\n");
+    show_prologue("sse_victim", (void*)sse_victim);
+
+    uint8_t sseBefore[AOWL_MAX_STOLEN];
+    memcpy(sseBefore, (void*)sse_victim, sizeof(sseBefore));
+
+    void* sseHook = aowl_hook_new();
+    int32_t sseSlot = aowl_hook_attach(sseHook, (void*)sse_victim);
+    if (sseSlot < 0) {
+        printf("FAIL  SSE attach refused: %s\n", aowl_hook_error_text(sseSlot));
+        failed++;
+    } else {
+        passed++;
+        printf("ok    SSE prologue attached in slot %d (%d bytes stolen)\n",
+               sseSlot, aowl_hook_stolen(sseHook));
+
+        /* The original must still run, and run *correctly*: the trampoline
+           holds SSE instructions and a relocated constant load, so a decoder
+           that got a length wrong would leave the arithmetic subtly off rather
+           than crash. The value is what proves the relocation. */
+        g_obj.health = 100.0f;
+        g_sseCalls = 0;
+        g_mode[sseSlot] = MODE_PASS;
+        g_fired[sseSlot] = 0;
+        /* XMM0 is loaded with a value that is not any argument, immediately
+           before the call. `sse_victim`'s first parameter is a pointer, so
+           position 0 uses RCX and XMM0 is left alone by the call -- which
+           makes it a witness. A dispatcher that counted float registers
+           separately would look in XMM0 for the first float parameter and
+           report 7.25 as `amount`; asserting the *poison* is there rather
+           than merely "not 12.5" turns that from a coincidence the test might
+           miss into one it cannot. */
+        float poison = 7.25f;
+        __asm__ volatile ("movss %0, %%xmm0" :: "m"(poison) : "xmm0");
+        float left = sse_victim(&g_obj, 12.5f, 2, NULL);
+        check("the SSE detour fired", g_fired[sseSlot] == 1);
+        check("the original still ran", g_sseCalls == 1);
+        check("the original's arithmetic survived relocation",
+              left == 75.0f && g_obj.health == 75.0f);
+
+        /* ---------------------------------------------------------------- *
+         * Arguments, by position
+         *
+         * This is the rule the ABI actually uses and the one most likely to
+         * be got wrong: position 0 is RCX *or* XMM0, position 1 is RDX *or*
+         * XMM1, and which file a position uses is decided by that parameter's
+         * declared type -- not by counting integers and floats separately.
+         * A decoder that kept two counters would look for `amount` in XMM0,
+         * find whatever `this` left there, and report a number that is not
+         * any argument at all.
+         * ---------------------------------------------------------------- */
+        const TestRegs* r = &g_seen[sseSlot];
+        check("argument 0 (this) is in RCX",
+              int_arg(r, 0) == (uint64_t)(uintptr_t)&g_obj);
+        check("argument 1 (a float) is in XMM1, not XMM0",
+              float_arg(r, 1) == 12.5f);
+        check("argument 2 (an int) is in R8",
+              (int32_t)(int_arg(r, 2) & 0xFFFFFFFFu) == 2);
+        check("argument 3 (MethodInfo*) is in R9", int_arg(r, 3) == 0);
+        /* The negative half of the same fact, and the one that fails if the
+           registers are counted per file rather than per position: XMM0 still
+           holds what the caller left in it, because position 0 was a pointer
+           and went to RCX. */
+        check("XMM0 holds the caller's value, not the float argument",
+              float_arg(r, 0) == 7.25f);
+
+        /* ---------------------------------------------------------------- *
+         * Suppression, float return
+         * ---------------------------------------------------------------- */
+        g_obj.health = 100.0f;
+        g_sseCalls = 0;
+        g_fired[sseSlot] = 0;
+        g_mode[sseSlot] = MODE_SKIP;
+        g_replacement[sseSlot] = float_bits(42.5f);
+        float replaced = sse_victim(&g_obj, 12.5f, 2, NULL);
+        check("the suppressed detour still fired", g_fired[sseSlot] == 1);
+        /* Not "ran and had its result overwritten" -- the two are very
+           different, and only the side effect can tell them apart. */
+        check("the original did not run", g_sseCalls == 0);
+        check("nothing the original would have changed changed",
+              g_obj.health == 100.0f);
+        check("the caller got the replacement in XMM0", replaced == 42.5f);
+
+        check("SSE hook removed", aowl_hook_remove(sseHook) == 0);
+        check("the function is byte-identical after unhooking",
+              memcmp(sseBefore, (void*)sse_victim, sizeof(sseBefore)) == 0);
+
+        g_obj.health = 100.0f;
+        g_sseCalls = 0;
+        g_fired[sseSlot] = 0;
+        float after = sse_victim(&g_obj, 12.5f, 2, NULL);
+        check("and behaves exactly as it did before it was ever hooked",
+              g_fired[sseSlot] == 0 && g_sseCalls == 1 && after == 75.0f);
+    }
+    aowl_hook_free(sseHook);
+
+    /* ------------------------------------------------------------------ *
+     * Suppression with an integer return
+     * ------------------------------------------------------------------ */
+    printf("\nsuppressing a function that returns an integer\n");
+    show_prologue("int_victim", (void*)int_victim);
+
+    uint8_t intBefore[AOWL_MAX_STOLEN];
+    memcpy(intBefore, (void*)int_victim, sizeof(intBefore));
+
+    void* intHook = aowl_hook_new();
+    int32_t intSlot = aowl_hook_attach(intHook, (void*)int_victim);
+    if (intSlot < 0) {
+        printf("FAIL  int attach refused: %s\n", aowl_hook_error_text(intSlot));
+        failed++;
+    } else {
+        passed++;
+        printf("ok    attached in slot %d (%d bytes stolen)\n",
+               intSlot, aowl_hook_stolen(intHook));
+
+        g_intCalls = 0;
+        g_fired[intSlot] = 0;
+        g_mode[intSlot] = MODE_PASS;
+        int64_t got = int_victim(1, 2, 3, 4);
+        check("the detour fired", g_fired[intSlot] == 1);
+        check("the original still ran and returned its own answer",
+              g_intCalls == 1 && got == 1234);
+
+        /* Four integer arguments, all four positions, all in the integer
+           file -- the mirror image of the float case above. */
+        const TestRegs* ri = &g_seen[intSlot];
+        check("four integer arguments arrive in RCX/RDX/R8/R9 by position",
+              int_arg(ri, 0) == 1 && int_arg(ri, 1) == 2 &&
+              int_arg(ri, 2) == 3 && int_arg(ri, 3) == 4);
+
+        g_intCalls = 0;
+        g_fired[intSlot] = 0;
+        g_mode[intSlot] = MODE_SKIP;
+        g_replacement[intSlot] = 9999;
+        int64_t replaced = int_victim(1, 2, 3, 4);
+        check("the suppressed detour fired", g_fired[intSlot] == 1);
+        check("the original did not run", g_intCalls == 0);
+        check("the caller got the replacement in RAX", replaced == 9999);
+
+        check("int hook removed", aowl_hook_remove(intHook) == 0);
+        check("the function is byte-identical after unhooking",
+              memcmp(intBefore, (void*)int_victim, sizeof(intBefore)) == 0);
+
+        g_intCalls = 0;
+        g_fired[intSlot] = 0;
+        check("and runs unhooked exactly as before",
+              int_victim(1, 2, 3, 4) == 1234 &&
+              g_intCalls == 1 && g_fired[intSlot] == 0);
+    }
+    aowl_hook_free(intHook);
 
     printf("\n%d passed, %d failed\n", passed, failed);
     return failed == 0 ? 0 : 1;

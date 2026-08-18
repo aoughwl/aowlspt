@@ -40,6 +40,102 @@ import invoke
 {.emit: """#include "aowlspt_hostboot.h" """.}
 {.emit: """#include "aowlspt_detour.h" """.}
 
+# --------------------------------------------------- the main-thread handoff
+#
+# `invoke_main` used to mean "the host's own attached thread", which is not the
+# thread Unity runs its player loop on, so a callback that touched a Unity
+# object was a crash waiting for a frame. The fix is to detour a method Unity
+# calls once per frame on that thread and drain the queue from inside it -- see
+# `bindMainDrain` for which methods, and why the host cannot know at compile
+# time which of them exists.
+#
+# This block is the part nimony cannot express: a lock, and counters read
+# without one. It is emitted here rather than included from
+# `abi/aowlspt_net.h`, which has exactly this lock -- that header also pulls in
+# winsock2 and zlib, neither of which belongs in a DLL injected into the game.
+# (A small `abi/aowlspt_lock.h` split out of it would let both share one; noted
+# for whoever owns that directory.)
+{.emit: """
+/* One lock for `gPending`. A mod calls `invoke_main` from a worker thread; the
+ * drain runs on the game thread. That is a real handoff between two threads
+ * neither of which the other knows about, so it needs a lock rather than an
+ * argument about how unlikely the interleaving is.
+ *
+ * Initialised on first use under a one-time flag, because the first caller may
+ * be a mod's worker thread and there is no earlier point both sides pass
+ * through. */
+static CRITICAL_SECTION aowl_mq_cs;
+static LONG aowl_mq_state = 0;   /* 0 unset, 1 initialising, 2 ready */
+
+/* Read without the lock, on every frame, by the drain. A plain LONG rather
+ * than a queue walk: the empty case is the only case most frames, and it has to
+ * cost a load and a branch. It is written only under the lock, so the worst a
+ * racing reader can see is the value from a moment ago -- which delays a
+ * callback by one frame and cannot corrupt anything. */
+static volatile LONG aowl_mq_count = 0;
+
+/* The thread the drain hook fires on, claimed by the first frame that reaches
+ * it. Claimed with an interlocked exchange rather than a plain store because
+ * nothing guarantees the hooked method is called from one thread only -- and if
+ * it is not, two threads draining the same queue would run one mod's callbacks
+ * concurrently. Whoever gets there first is the main thread; anyone else is
+ * counted and sent away. */
+static volatile LONG aowl_mq_tid = 0;
+static volatile LONG aowl_mq_alien = 0;
+static LONG aowl_mq_fires = 0;   /* main thread only, so no interlock needed */
+
+static void aowl_mq_lock(void) {
+    LONG was = InterlockedCompareExchange(&aowl_mq_state, 1, 0);
+    if (was == 0) {
+        InitializeCriticalSection(&aowl_mq_cs);
+        InterlockedExchange(&aowl_mq_state, 2);
+    } else {
+        while (InterlockedCompareExchange(&aowl_mq_state, 2, 2) != 2) Sleep(0);
+    }
+    EnterCriticalSection(&aowl_mq_cs);
+}
+
+static void aowl_mq_unlock(void) {
+    if (InterlockedCompareExchange(&aowl_mq_state, 2, 2) == 2)
+        LeaveCriticalSection(&aowl_mq_cs);
+}
+
+static void aowl_mq_set_count(int32_t n) { aowl_mq_count = (LONG)n; }
+static int32_t aowl_mq_get_count(void) { return (int32_t)aowl_mq_count; }
+static uint32_t aowl_mq_thread(void) { return (uint32_t)aowl_mq_tid; }
+static int32_t aowl_mq_alien_fires(void) { return (int32_t)aowl_mq_alien; }
+static int32_t aowl_mq_fire_count(void) { return (int32_t)aowl_mq_fires; }
+
+/* The whole per-frame cost of an empty queue: two loads, two branches, one
+ * increment. No allocation, no lock, no logging, and no call into the runtime.
+ * Returns 1 only when this thread owns the drain *and* there is something to
+ * run -- so the caller's slow path is entered on the frames that need it and no
+ * others.
+ *
+ * The interlocked claim runs once, on the first frame, and never again: the
+ * common path reads `aowl_mq_tid` plainly and compares. */
+static int32_t aowl_mq_enter(void) {
+    LONG me = (LONG)GetCurrentThreadId();
+    LONG owner = aowl_mq_tid;
+    if (owner == 0) {
+        InterlockedCompareExchange(&aowl_mq_tid, me, 0);
+        owner = aowl_mq_tid;
+    }
+    if (owner != me) { InterlockedIncrement(&aowl_mq_alien); return 0; }
+    aowl_mq_fires++;
+    return aowl_mq_count != 0;
+}
+""".}
+
+proc cMqLock() {.importc: "aowl_mq_lock", nodecl.}
+proc cMqUnlock() {.importc: "aowl_mq_unlock", nodecl.}
+proc cMqSetCount(n: int32) {.importc: "aowl_mq_set_count", nodecl.}
+proc cMqCount(): int32 {.importc: "aowl_mq_get_count", nodecl.}
+proc cMqThread(): uint32 {.importc: "aowl_mq_thread", nodecl.}
+proc cMqAlienFires(): int32 {.importc: "aowl_mq_alien_fires", nodecl.}
+proc cMqFireCount(): int32 {.importc: "aowl_mq_fire_count", nodecl.}
+proc cMqEnter(): int32 {.importc: "aowl_mq_enter", nodecl.}
+
 # --------------------------------------------------------------- C surface
 
 proc cModulePath(buf: Il2CppPtr; cap: int32): int32 {.
@@ -111,6 +207,12 @@ proc cHookAttach(p, target: Il2CppPtr): int32 {.importc: "aowl_hook_attach", nod
 proc cHookRemove(p: Il2CppPtr): int32 {.importc: "aowl_hook_remove", nodecl.}
 proc cHookStolen(p: Il2CppPtr): int32 {.importc: "aowl_hook_stolen", nodecl.}
 proc cHookCapacity(): int32 {.importc: "aowl_hook_capacity", nodecl.}
+## The engine's own text for an install code. Kept there rather than mirrored
+## here: the codes were split apart once already -- "could not be relocated"
+## used to mean four different things -- and a copy of that table in this file
+## would have gone on printing the old sentence for the new code.
+proc cHookErrorText(rc: int32): Il2CppPtr {.
+  importc: "aowl_hook_error_text", nodecl.}
 
 const
   SideClient = 2'i32
@@ -168,7 +270,16 @@ type
     ## Which mod installed it. Needed to take a mod's detours out when the mod
     ## goes: a detour whose handler lives in a freed library is a jump into
     ## unmapped memory the next time the game calls that method.
+    ##
+    ## -1 for the host's own drain hook, which no mod owns and no mod unload
+    ## may remove.
     modIndex: int
+    ## The host's own per-frame drain hook rather than a mod's patch. It goes
+    ## through the same engine and occupies a real slot, because the engine
+    ## hands slots out in order and this file indexes `gPatches` by slot -- a
+    ## hook the host installed outside that table would shift every mod's slot
+    ## by one and fire the wrong handler.
+    isDrain: bool
 
   Sub = object
     ## An event subscription. Client-side events are how one mod tells another
@@ -186,6 +297,11 @@ type
     user: Il2CppPtr
     dueMs: uint64
     modIndex: int
+    ## The host's own proof-of-thread entry rather than a mod's callback. It
+    ## carries no function pointer: it is queued from the host thread and its
+    ## only effect is that the drain records which thread ran it, which is the
+    ## one fact this whole path exists to establish.
+    selfTest: bool
 
 var gDir = ""
 var gLogPath = ""
@@ -205,6 +321,29 @@ var gHandleIsObject: seq[bool] = @[]
 var gHandleGc: seq[uint32] = @[]
 var gPatches: seq[Patch] = @[]
 var gSubs: seq[Sub] = @[]
+
+## The slot the drain hook took, or -1 when nothing bound. Checked first in the
+## firing path, so it must be a value no real slot can have.
+var gDrainSlot = -1
+## Which method it bound to, for the log and for `aowlspt.host::main_thread`.
+var gDrainMethod = ""
+## The host's own thread, recorded at boot. `invoke_main` runs here when no
+## candidate bound, and the difference between this and the drain thread is the
+## proof that the drain is somewhere else.
+var gHostThreadId = 0'u32
+## Whether the host has already written the "this is the main thread" line. The
+## drain never logs -- it runs inside the game's update path -- so the host
+## thread notices and reports it instead.
+var gDrainProven = false
+var gAlienReported = false
+var gStallReported = false
+## The drain's liveness, watched from the tick loop. `gLastFire` is the fire
+## count last seen and `gLastFireMs` when it last changed; if the count stops
+## moving while work is queued, the hook has gone quiet -- the method it bound
+## may only exist inside a raid -- and the host thread takes the queue back.
+var gLastFire = 0
+var gLastFireMs = 0'u64
+var gDrainStalled = false
 
 # --------------------------------------------------------------- logging
 
@@ -682,17 +821,8 @@ proc hostPatch(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
   if slot < 0'i32:
     shrink(gPatches, gPatches.len - 1)
     cHookFree(hook)
-    case slot
-    of -2'i32:
-      gLastError = "the prologue of " & spec & " could not be relocated " &
-                   "(it holds a relative branch, or an instruction this " &
-                   "decoder does not know)"
-    of -3'i32:
-      gLastError = "no executable memory within reach of " & spec
-    of -5'i32:
-      gLastError = "no free patch slots"
-    else:
-      gLastError = "could not patch " & spec & " (code " & $int(slot) & ")"
+    gLastError = "could not patch " & spec & ": " &
+                 readCString(cHookErrorText(slot))
     return ErrGeneric
 
   if int(slot) != gPatches.len - 1:
@@ -771,28 +901,54 @@ proc hostStoreList(ctx: Il2CppPtr; prefix: Il2CppPtr; prefixLen: int32;
   var v = storeKeys(guid, p)
   result = cOutCopy(outPtr, outLen, cast[Il2CppPtr](toCString(v)), int32(v.len))
 
+proc enqueue(cb, user: Il2CppPtr; dueMs: uint64; modIndex: int;
+             selfTest: bool) =
+  ## The only way into `gPending`, from any thread.
+  ##
+  ## Under the lock because the caller may be a mod's worker thread while the
+  ## drain is running on the game thread -- appending to a seq that another
+  ## thread is rebuilding is a corrupted list, not a lost callback. The count
+  ## is republished inside the lock so the drain's lock-free empty check can
+  ## never see a queue that has entries.
+  cMqLock()
+  gPending.add Pending(cb: cb, user: user, dueMs: dueMs, modIndex: modIndex,
+                       selfTest: selfTest)
+  cMqSetCount(int32(gPending.len))
+  cMqUnlock()
+
 proc hostInvokeMain(ctx: Il2CppPtr; cb: Il2CppPtr; user: Il2CppPtr): int32 {.
     exportc: "aowlspt_nim_invoke_main", cdecl.} =
-  ## Queued for the tick loop rather than run here. The tick loop is the host's
-  ## own attached thread, which is not literally Unity's main thread -- that
-  ## distinction is documented rather than papered over, because a mod touching
-  ## a Unity object still has to be on the real main thread and this host
-  ## cannot yet put it there.
+  ## Queued for whichever thread drains it, which is the point of this whole
+  ## file's newest part: when a per-frame method could be detoured, that is
+  ## Unity's own main thread and the name means what it says. When none could,
+  ## it is the host's own attached thread, and the log says so at boot rather
+  ## than letting the name imply otherwise. A mod can ask which it got --
+  ## `call("aowlspt.host::main_thread")`.
   if cb == nil:
     return ErrBadArg
-  gPending.add Pending(cb: cb, user: user, dueMs: cNowMs(),
-                       modIndex: int(cast[uint](ctx)))
+  enqueue(cb, user, cNowMs(), int(cast[uint](ctx)), false)
   result = StatusOk
 
 proc hostSchedule(ctx: Il2CppPtr; delayMs: int32; cb: Il2CppPtr;
                   user: Il2CppPtr): int32 {.
     exportc: "aowlspt_nim_schedule", cdecl.} =
+  ## Same queue, same thread as `invoke_main`, and deliberately so.
+  ##
+  ## The alternative was to leave delayed callbacks on the host thread, where
+  ## the timing is better: the host ticks every 16ms regardless of what the
+  ## game is doing, whereas the drain resolves a delay at frame granularity and
+  ## a frame can be long. That was rejected. A mod that says "do this in two
+  ## seconds" almost always means work of the same kind `invoke_main` carries,
+  ## and if `schedule` stayed on the host thread the only way to get a *delayed
+  ## main-thread* call would be to schedule a callback that calls `invoke_main`,
+  ## paying two hops and an extra frame for something the host can just do. The
+  ## cost is honest and small: a delay is now "at the first frame at or after
+  ## the deadline", not "within a millisecond of it".
   if cb == nil:
     return ErrBadArg
   var d = delayMs
   if d < 0'i32: d = 0'i32
-  gPending.add Pending(cb: cb, user: user, dueMs: cNowMs() + uint64(d),
-                       modIndex: int(cast[uint](ctx)))
+  enqueue(cb, user, cNowMs() + uint64(d), int(cast[uint](ctx)), false)
   result = StatusOk
 
 # --------------------------------------------------------------- mods
@@ -1067,17 +1223,59 @@ proc reportRuntime() =
 
 # --------------------------------------------------------------- main
 
-proc runPending() =
-  if gPending.len == 0:
-    return
-  let now = cNowMs()
-  var keep: seq[Pending] = @[]
-  for p in gPending:
-    if p.dueMs <= now:
-      discard cInvokeCallback(p.cb, p.user, cast[Il2CppPtr](0), 0'i32)
+proc drainDue() =
+  ## Takes the due callbacks out under the lock and runs them outside it.
+  ##
+  ## Outside it on purpose: a callback is a mod's code, it may take as long as
+  ## it likes, and it may call `invoke_main` again. Running it with the lock
+  ## held would block every other thread behind whatever it does. Taking the
+  ## work out first is the same shape the backend's timer queue uses.
+  var due: seq[Pending] = @[]
+  cMqLock()
+  if gPending.len > 0:
+    let now = cNowMs()
+    var keep: seq[Pending] = @[]
+    for p in gPending:
+      if p.dueMs <= now:
+        due.add p
+      else:
+        keep.add p
+    gPending = keep
+    cMqSetCount(int32(gPending.len))
+  cMqUnlock()
+
+  for p in due:
+    if p.selfTest:
+      # The proof, and the reason it is an entry in the queue rather than a
+      # log line at bind time: it went in from the host thread and comes out
+      # here, so the thread it names is the thread a mod's callback would get.
+      okLog "invoke_main self-test ran on thread " & $int(cThreadId())
     else:
-      keep.add p
-  gPending = keep
+      discard cInvokeCallback(p.cb, p.user, cast[Il2CppPtr](0), 0'i32)
+
+proc mainDrain() =
+  ## The per-frame drain, called from inside a method Unity runs on its main
+  ## thread. Everything expensive is behind `cMqEnter`, which answers "is this
+  ## my thread, and is there anything to do" in a handful of instructions.
+  if cMqEnter() == 0'i32:
+    return
+  drainDue()
+
+proc runPending() =
+  ## The host thread's half.
+  ##
+  ## Silent while the drain hook is bound and firing -- those callbacks belong
+  ## to the game thread now. It stays as the fallback for two cases, and both
+  ## are real: no candidate bound at all, and a hook that bound and then stopped
+  ## firing, which is what happens if the method it bound only exists during a
+  ## raid. A mod whose callbacks stop arriving because a hook went quiet is a
+  ## worse failure than one whose callbacks arrive on the wrong thread, so the
+  ## host takes them back and says so.
+  if cMqCount() == 0'i32:
+    return
+  if gDrainSlot >= 0 and not gDrainStalled:
+    return
+  drainDue()
 
 proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   gStartMs = cNowMs()
