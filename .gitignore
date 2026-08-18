@@ -29,3 +29,10 @@ tests/*.exe
 # The stand-in runtime is built by `aowl test`, not checked in
 tests/mockil2cpp/GameAssembly.dll
 tests/detour_test.exe
+
+# Test-host artefacts: compiled probes and the screenshots they produce. They
+# are evidence in a report, not sources, and a 2 MB bitmap per run is not
+# something a history should carry.
+*.exe
+*.bmp
+tests/overlayhost/shots/
