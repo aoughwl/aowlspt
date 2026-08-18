@@ -175,6 +175,12 @@ extern int32_t aowlspt_nim_event_subscribe(void* ctx, void* name, int32_t nameLe
                                            void* cb, void* user);
 extern int32_t aowlspt_nim_patch(void* ctx, void* target, int32_t targetLen,
                                  int32_t kind, void* cb, void* user);
+extern int32_t aowlspt_nim_db_get(void* ctx, void* path, int32_t pathLen,
+                                  void* outPtr, void* outLen);
+extern int32_t aowlspt_nim_db_patch(void* ctx, void* path, int32_t pathLen,
+                                    void* patch, int32_t patchLen);
+extern int32_t aowlspt_nim_route_register(void* ctx, void* url, int32_t urlLen,
+                                          int32_t kind, void* cb, void* user);
 
 /* The host allocator. One malloc for the whole boundary: the mod allocates
  * through this and the host frees through it, and neither side's CRT heap is
@@ -211,19 +217,26 @@ static AowlStatus AOWLSPT_CALL aowl_host_config_set(void* ctx, AowlSlice key, Ao
     return aowlspt_nim_config_set(ctx, (void*)key.ptr, key.len, (void*)value.ptr, value.len);
 }
 
-/* The database lives in the server. Saying so is better than pretending. */
+/* The database and routes belong to whichever host has them: the backend
+ * implements both, the client host answers `ErrUnsupported`. Which is which is
+ * decided by the host, not by this header — every binary defines its own
+ * `aowlspt_nim_*`, so a capability is present exactly where it is real. */
 static AowlStatus AOWLSPT_CALL aowl_host_db_get(void* ctx, AowlSlice path, AowlBuffer* out) {
-    (void)ctx; (void)path; if (out) { out->ptr = NULL; out->len = 0; }
-    return AOWLSPT_ERR_UNSUPPORTED;
+    void* p = NULL;
+    int32_t n = 0;
+    int32_t st = aowlspt_nim_db_get(ctx, (void*)path.ptr, path.len,
+                                    (void*)&p, (void*)&n);
+    if (out) { out->ptr = (uint8_t*)p; out->len = n; }
+    return st;
 }
 static AowlStatus AOWLSPT_CALL aowl_host_db_patch(void* ctx, AowlSlice path, AowlSlice patch) {
-    (void)ctx; (void)path; (void)patch;
-    return AOWLSPT_ERR_UNSUPPORTED;
+    return aowlspt_nim_db_patch(ctx, (void*)path.ptr, path.len,
+                                (void*)patch.ptr, patch.len);
 }
 static AowlStatus AOWLSPT_CALL aowl_host_route_register(void* ctx, AowlSlice url, int32_t kind,
                                                         AowlRouteFn h, void* user) {
-    (void)ctx; (void)url; (void)kind; (void)h; (void)user;
-    return AOWLSPT_ERR_UNSUPPORTED;
+    return aowlspt_nim_route_register(ctx, (void*)url.ptr, url.len, kind,
+                                      (void*)h, user);
 }
 
 static AowlStatus AOWLSPT_CALL aowl_host_event_subscribe(void* ctx, AowlSlice name,
@@ -286,6 +299,28 @@ static int32_t aowl_invoke_callback(void* cb, void* user, void* payload, int32_t
     s.len = len;
     return (int32_t)((AowlCallbackFn)cb)(user, s, NULL);
 }
+
+/* A route handler. Its own trampoline for the same reason a patch handler has
+ * one: `AowlRouteFn` takes five parameters where `AowlCallbackFn` takes three,
+ * and calling one through the other is a crash rather than a type error. */
+static int32_t aowl_invoke_route(void* cb, void* user,
+                                 void* url, int32_t urlLen,
+                                 void* body, int32_t bodyLen,
+                                 void* session, int32_t sessionLen,
+                                 void* outPtrRaw, void* outLenRaw) {
+    AowlSlice u; AowlSlice b; AowlSlice s; AowlBuffer out;
+    u.ptr = (const uint8_t*)url;     u.len = urlLen;
+    b.ptr = (const uint8_t*)body;    b.len = bodyLen;
+    s.ptr = (const uint8_t*)session; s.len = sessionLen;
+    out.ptr = NULL; out.len = 0;
+    int32_t st = (int32_t)((AowlRouteFn)cb)(user, u, b, s, &out);
+    *(void**)outPtrRaw = out.ptr;
+    *(int32_t*)outLenRaw = out.len;
+    return st;
+}
+
+/* Releasing a buffer a mod allocated with the host allocator. */
+static void aowl_host_release(void* p) { free(p); }
 
 static int32_t aowl_invoke_patch(void* cb, void* user, void* target, int32_t tlen) {
     AowlSlice t;
@@ -499,5 +534,60 @@ static int32_t aowl_read_i32(void* p) { return p ? *(int32_t*)p : 0; }
 static int64_t aowl_read_i64(void* p) { return p ? *(int64_t*)p : 0; }
 static double  aowl_read_f32(void* p) { return p ? (double)*(float*)p : 0.0; }
 static double  aowl_read_f64(void* p) { return p ? *(double*)p : 0.0; }
+
+/* ------------------------------------------------------------------ *
+ * Small Win32 services the host needs and nimony's stdlib does not have
+ * ------------------------------------------------------------------ */
+
+/* Where this DLL is on disk. The host reads its mods and writes its log
+ * relative to itself, so that an install can be moved without reconfiguring
+ * anything. Resolved from the address of a function in this module rather than
+ * from a stored HINSTANCE, since a constructor is not handed one. */
+/* An anchor whose address is inside whichever binary included this header.
+ * `aowl_sys_module_path` needs *some* address in its own module; taking one
+ * from a function that lives here means the answer is right whether the
+ * includer is an exe or a DLL. */
+static void aowl_sys_anchor(void) { }
+
+static int32_t aowl_sys_module_path(char* buf, int32_t cap) {
+    HMODULE self = NULL;
+    if (!GetModuleHandleExA(
+            GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+            (LPCSTR)(void*)&aowl_sys_anchor, &self)) {
+        return 0;
+    }
+    return (int32_t)GetModuleFileNameA(self, buf, (DWORD)cap);
+}
+
+static uint64_t aowl_sys_now_ms(void) {
+    return (uint64_t)GetTickCount64();
+}
+
+static void aowl_sys_sleep(int32_t ms) {
+    Sleep((DWORD)ms);
+}
+
+static uint32_t aowl_sys_thread_id(void) {
+    return (uint32_t)GetCurrentThreadId();
+}
+
+/* Loading a mod. Kept here beside the rest of the Win32 surface rather than
+ * imported separately in nimony, so there is one place that knows how a mod
+ * becomes a module. */
+static void* aowl_sys_load_library(const char* path) {
+    return (void*)LoadLibraryExA(path, NULL, LOAD_WITH_ALTERED_SEARCH_PATH);
+}
+static void aowl_sys_free_library(void* h) {
+    if (h) FreeLibrary((HMODULE)h);
+}
+static void* aowl_sys_get_proc(void* h, const char* name) {
+    if (!h) return NULL;
+    return (void*)GetProcAddress((HMODULE)h, name);
+}
+static uint32_t aowl_sys_last_error(void) {
+    return (uint32_t)GetLastError();
+}
+
 
 #endif /* AOWLSPT_SHIM_H */

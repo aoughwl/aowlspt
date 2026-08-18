@@ -1,7 +1,7 @@
 # aowlspt
 
-Write SPT 4.x mods in **aowl/nimony**, ship them as **native binaries**, and run
-them on the server, in the client, or with no game at all.
+A modding pipeline for post-1.0 Tarkov, in **aowl/nimony**, front to back: a
+native client host, a backend server, one mod ABI, one build command.
 
 ```nim
 import aowlspt
@@ -54,6 +54,8 @@ host/Aowlspt.Sim         aowlspt-sim: run a mod with no game and no server
 host/Aowlspt.Host.Server SPT 4.x server mod that hosts native mods
 host/Aowlspt.Host.Client BepInEx plugin that hosts native mods (pre-1.0, Mono)
 host/Aowlspt.Host.Il2Cpp native client host for post-1.0 (IL2CPP), in nimony
+host/common/modhost.nim  mod loading, shared by both nimony hosts
+backend/                 aowlspt-backend: the server, in nimony
 installer/               aowlspt-install: build an install from a vanilla one
 tools/aowl.nim           aowl: the only build command — build, test, package
 tools/SptProbe           sptprobe: call a route with SPT's zlib framing
@@ -61,9 +63,12 @@ tools/SptReflect         dump SPT's public API surface
 tools/aowllaunch.nim     aowlspt-launch: start the game with the host inside it
 tools/il2cppprobe.nim    what a post-1.0 client exposes
 tools/hostharness.nim    run the client host with no game
+tools/aowlprobe.nim      call a backend route with the game's wire framing
 examples/hello           the plumbing, end to end
 examples/backend         config, database patching, dynamic routes, `call`
 examples/clientprobe     reaching into a post-1.0 client by name
+examples/highlevel       the same, through the high-level API
+examples/gameserver      routes, database and config on the backend
 reference/               SPT's public API surface, dumped per version
 tests/                   ABI layout, checked against the C header
 ```
@@ -186,14 +191,15 @@ aowlspt-launch --root D:\Aowlspt
 | | post-1.0 (IL2CPP) |
 |---|---|
 | the installer | detects, plans, installs, verifies, uninstalls |
-| server-side mods | portable — the backend is HTTP and does not care about the client's backend |
+| the backend | `aowlspt-backend`, in nimony: routes, database, mod API, the client's zlib framing |
 | client-side mods | load and tick, with a typed high-level API |
 | `resolve` / `call` | any type, any method, arguments bound by declared type |
 | `hook` / `patch` | x64 code detours: fires however the game reaches the method |
 | reading a hook's arguments | not yet — refuses rather than reporting the wrong ones |
 | `invoke_main` | the host thread, not Unity's main thread |
 
-Writing one: [docs/MODDING.md](docs/MODDING.md). Why there is no BepInEx
+Writing one: [docs/MODDING.md](docs/MODDING.md) for the client,
+[docs/BACKEND.md](docs/BACKEND.md) for the server. Why there is no BepInEx
 underneath, and what a performance port actually costs:
 [docs/IL2CPP.md](docs/IL2CPP.md).
 

@@ -281,6 +281,28 @@ proc hostConfigSet(ctx: Il2CppPtr; key: Il2CppPtr; keyLen: int32;
   gLastError = "the client host does not write config"
   result = ErrUnsupported
 
+proc hostDbGet(ctx: Il2CppPtr; path: Il2CppPtr; pathLen: int32;
+               outPtr, outLen: Il2CppPtr): int32 {.
+    exportc: "aowlspt_nim_db_get", cdecl.} =
+  ## The database is the backend's. Answering "unsupported" here is the ABI's
+  ## own way of saying a side lacks a capability, and it lets one mod binary
+  ## ship to both sides with a `side()` guard rather than two builds.
+  discard cOutCopy(outPtr, outLen, cast[Il2CppPtr](0), 0'i32)
+  gLastError = "the client has no database; db_get is server-side"
+  result = ErrUnsupported
+
+proc hostDbPatch(ctx: Il2CppPtr; path: Il2CppPtr; pathLen: int32;
+                 patch: Il2CppPtr; patchLen: int32): int32 {.
+    exportc: "aowlspt_nim_db_patch", cdecl.} =
+  gLastError = "the client has no database; db_patch is server-side"
+  result = ErrUnsupported
+
+proc hostRouteRegister(ctx: Il2CppPtr; url: Il2CppPtr; urlLen: int32;
+                       kind: int32; cb, user: Il2CppPtr): int32 {.
+    exportc: "aowlspt_nim_route_register", cdecl.} =
+  gLastError = "the client does not serve HTTP; routes are server-side"
+  result = ErrUnsupported
+
 proc hostNowMs(ctx: Il2CppPtr): int64 {.
     exportc: "aowlspt_nim_now_ms", cdecl.} =
   result = int64(cNowMs() - gStartMs)

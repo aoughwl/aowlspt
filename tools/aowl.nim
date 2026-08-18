@@ -274,6 +274,43 @@ proc buildIl2CppHost(e: Env): bool =
     return false
   result = placeLibrary(dir, "aowlhost", outPath)
 
+proc buildBackend(e: Env): bool =
+  ## The backend links winsock and zlib; nothing else in the repo does, which
+  ## is why it has its own build rather than going through `buildTool`.
+  let dir = joinPath(e.repo, "backend")
+  let binDir = joinPath(dir, "bin")
+  discard ensureDir(binDir)
+  let outPath = joinPath(binDir, "aowlspt-backend.exe")
+  discard removeFileAt(outPath)
+
+  var cmd = quoted(nimonyExe(e))
+  cmd.add " c"
+  cmd.add abiInclude(e)
+  cmd.add " --passL:-lws2_32 --passL:-lz"
+  if e.debugBuild:
+    cmd.add " -d:debug"
+  cmd.add " -p:" & quoted(dir)
+  cmd.add " -p:" & quoted(joinPath(e.repo, "host\\common"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
+  cmd.add " -o:" & quoted(outPath)
+  cmd.add " " & quoted(joinPath(dir, "aowlbackend.nim"))
+  result = run(e, "aowlspt-backend", cmd, dir)
+
+proc buildProbe(e: Env): bool =
+  let outDir = joinPath(e.repo, "installer\\build")
+  discard ensureDir(outDir)
+  var cmd = quoted(nimonyExe(e))
+  cmd.add " c"
+  cmd.add abiInclude(e)
+  cmd.add " --passL:-lws2_32 --passL:-lz"
+  cmd.add " -p:" & quoted(joinPath(e.repo, "backend"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
+  cmd.add " -o:" & quoted(joinPath(outDir, "aowlprobe.exe"))
+  cmd.add " " & quoted(joinPath(e.repo, "tools\\aowlprobe.nim"))
+  result = run(e, "aowlprobe", cmd, e.repo)
+
 proc buildTool(e: Env; source, exeName, label: string): bool =
   ## The nimony command-line tools. All of them want the ABI include path and
   ## both source trees; keeping that in one place stops them drifting apart.
@@ -337,6 +374,9 @@ proc cmdBuild(e: Env): int =
   discard buildHosts(e)
   heading "Host (IL2CPP, native)"
   discard buildIl2CppHost(e)
+  heading "Backend"
+  discard buildBackend(e)
+  discard buildProbe(e)
   heading "Tools"
   discard buildInstaller(e)
   discard buildTool(e, "tools\\aowllaunch.nim", "aowlspt-launch.exe",
@@ -440,6 +480,38 @@ proc cmdTest(e: Env): int =
                   harness & " " & quoted(stage) & " --runtime " &
                   quoted(mockDll) & " --seconds 8")
 
+  heading "Backend"
+  let haveBackend = buildBackend(e)
+  discard buildProbe(e)
+  if haveBackend:
+    # The backend is driven for real: a scratch install with a mod and a
+    # database, then every route called over the wire — zlib framing included,
+    # which is the part a plain HTTP client cannot check.
+    let bstage = joinPath(e.repo, "installer\\build\\backendstage")
+    discard winfs.removeTree(bstage)
+    discard ensureDir(joinPath(bstage, "mods\\gameserver"))
+    if buildMod(e, joinPath(e.repo, "examples\\gameserver")):
+      discard copyFileAt(
+        joinPath(e.repo, "examples\\gameserver\\bin\\gameserver.dll"),
+        joinPath(bstage, "mods\\gameserver\\gameserver.dll"))
+      discard copyFileAt(
+        joinPath(e.repo, "examples\\gameserver\\config.json"),
+        joinPath(bstage, "mods\\gameserver\\config.json"))
+    discard writeTextFile(joinPath(bstage, "db.json"),
+      "{\n" &
+      "  \"templates\": { \"items\": {\n" &
+      "    \"5447a9cd4bdc2dbd208b4567\": {\n" &
+      "      \"_id\": \"5447a9cd4bdc2dbd208b4567\",\n" &
+      "      \"_props\": { \"Name\": \"M4A1\", \"Weight\": 0.38 }\n" &
+      "    }\n" &
+      "  } }\n" &
+      "}\n")
+    # A port of its own, so a backend the developer already has running does
+    # not make this fail — or worse, pass against the wrong server.
+    discard run(e, "backend serves every route over the wire",
+                quoted(joinPath(e.repo, "backend\\bin\\aowlspt-backend.exe")) &
+                " --root " & quoted(bstage) & " --port 6974 --selftest")
+
   heading "Examples through the simulator"
   let sim = joinPath(e.repo,
     "host\\Aowlspt.Sim\\bin\\Release\\net10.0\\aowlspt-sim.exe")
@@ -529,6 +601,16 @@ proc cmdPayload(e: Env): int =
       say "IL2CPP client host -> " & joinPath(dest, "aowlspt-host-il2cpp.dll")
   else:
     warn "the IL2CPP client host is not built; a post-1.0 payload needs it"
+
+  # The backend goes in the payload too: it is half the pipeline, and an
+  # install without it has mods that can serve routes and nothing listening.
+  let backend = joinPath(e.repo, "backend\\bin\\aowlspt-backend.exe")
+  if fileExists(backend):
+    if copyFileAt(backend, joinPath(dest, "aowlspt-backend.exe")).ok:
+      inc copied
+      say "backend -> " & joinPath(dest, "aowlspt-backend.exe")
+  else:
+    warn "the backend is not built; the install will have no server"
 
   let launcher = joinPath(e.repo, "installer\\build\\aowlspt-launch.exe")
   if fileExists(launcher):
