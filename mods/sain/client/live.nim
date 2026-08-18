@@ -113,6 +113,7 @@ var gF0: FieldBinding
 var gF4: FieldBinding
 var gF8: FieldBinding
 var gI0: FieldBinding
+var gB0: FieldBinding
 
 proc initFloatReaders() =
   gF0 = FieldBinding(ok: true, why: "", target: "unboxed+0", offset: 0'i32,
@@ -123,6 +124,11 @@ proc initFloatReaders() =
                      kind: fkF32, bindNs: 0'i64)
   gI0 = FieldBinding(ok: true, why: "", target: "unboxed+0", offset: 0'i32,
                      kind: fkI32, bindNs: 0'i64)
+  # A boxed `System.Boolean` is one byte. Reading four would run past the
+  # payload of the smallest box the runtime allocates, which is the kind of
+  # read that is right until the day it is not.
+  gB0 = FieldBinding(ok: true, why: "", target: "unboxed+0", offset: 0'i32,
+                     kind: fkBool, bindNs: 0'i64)
 
 proc unboxVec3(boxed: Il2CppPtr): Vec3 =
   result = zeroVec()
@@ -372,7 +378,10 @@ proc callBoolOn*(l: var LazyCall; obj: Il2CppPtr; default: bool): bool =
   let r = reflect(l.m, obj, cast[Il2CppPtr](0))
   if r == nil:
     return default
-  result = unboxInt(r) != 0
+  let p = objectUnbox(gRt, r)
+  if p == nil:
+    return default
+  result = readBool(gB0, p)
 
 proc callIntOn*(l: var LazyCall; obj: Il2CppPtr; default: int): int =
   result = default

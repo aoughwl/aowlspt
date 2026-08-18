@@ -112,26 +112,84 @@ real client — see "risks" in the report.
 
 ## The backend
 
-The worker thread polls `GET /aowlspt/mods` and posts
-`POST /aowlspt/mods/{guid}/enabled` with `{"enabled":true|false}`. It is the
-only thread in this file that blocks; the render thread never does.
+The schema is no longer provisional. `mods/manager` is the thing on the other
+end, and it serves two routes written for this panel specifically:
+
+```
+GET  /aowlspt/mods/panel        the rows
+POST /aowlspt/mods/toggle/<id>  {"enabled":true|false}
+```
+
+```json
+{"ok":true,"schema":"aowlspt.panel/1","side":"server","control":"absent",
+ "liveKnown":false,"summary":"1 of 8 registry mods resolve on the server side",
+ "mods":[
+   {"guid":"aowl.sain","id":"aowl.sain","name":"SAIN","version":"0.1.0",
+    "enabled":true,"live":null,"restart":false,
+    "verdict":"loaded","reason":"enabled by aowl.list.core"}]}
+```
+
+| field | what the panel does with it |
+|---|---|
+| `guid` / `id` | the same string, by rule (`registry/README.md`); the row key |
+| `name`, `version` | the row's text |
+| `enabled` | what the manager's selection **resolves to** — the button's state |
+| `live` | what the host says is **running**. `null` means nobody knows, and the panel leaves the row's own value alone |
+| `restart` | this mod, on this change, only takes effect on a restart — the `*` |
+| `verdict`, `reason` | not drawn yet; there for a row that wants to say why |
+
+`mods` is the last key and has to stay there: the reader skips to it and then
+takes every `{`…`}` after it as a row, so a wrapper field placed after the array
+would be read as part of the last row.
+
+### Why the manager grew a route rather than the C growing a parser
+
+The rule this directory was written under is in `abi/aowlspt_overlay.h`: if the
+schema settles into something the small reader cannot handle, parse it in nimony
+with `aowl/src/aowlspt/json.nim` and push rows in through `overlaySetMod`. It
+was weighed and not taken, for a reason that is about *where the code would
+have to live* rather than about JSON. That parser would run in the **client**
+host, which has no HTTP client and no poll loop of its own — so it would mean a
+second worker thread in nimony beside the one already here, `aowlspt_net` pulled
+into a DLL injected mid-startup, and every line of it in
+`host/Aowlspt.Host.Il2Cpp`, which this work does not own.
+
+The manager's own routes were also the wrong shape for a panel and right for a
+script: `/aowlspt/mods/list` nests a decision object per mod, carries no version
+on the row, and would need a second request to `/describe/<id>` per row to get
+one. So the manager — which this work does own — grew one flattened view. The
+cost was one route there and eight lines here.
+
+### What a toggle does now, end to end
+
+1. The click flips the row locally and marks it `pending` (`~`), so the button
+   answers immediately, and queues a command for the worker thread.
+2. The worker POSTs `/aowlspt/mods/toggle/<guid>` with `{"enabled":…}`.
+3. The manager sets your override, re-resolves the registry, and calls its own
+   `/apply` path: for every mod in the resolved set a `load`, for every mod it
+   knows and no longer wants an `unload`, each through `mgr/control.nim`.
+4. `control.nim` emits `aowlspt.host.mods.load` / `.unload` to the host and gets
+   back a per-mod `requested` → `applied` | `deferred` | `refused`.
+5. The next poll (forced immediately after the POST) brings the answer back as
+   `live` and `restart` on that row.
+
+Which is why the `*` is no longer a constant. It used to mean "a native mod
+cannot be unloaded from under a running raid, so this is for next launch" — a
+true statement about the whole panel, printed on every row that was ever
+clicked. It now means *the manager asked about this mod and this was the
+answer*: a mod the host really did unload live comes back `live:false,
+restart:false` and greys out instead.
+
+**No host answers those events yet**, so today every answer is `deferred` and
+every clicked row stars. That is a fact about the tree, not about this design —
+see below.
 
 With no backend — port 0, or nothing listening — the panel is read-only and
 lists what the host pushed in through `overlaySetMod`, which is what is actually
-running in this process and the one source that cannot be stale.
-
-The JSON reader is deliberately small and tolerant: it pulls whichever of
-`guid`/`id`, `name`, `version`, `enabled` it finds and leaves anything missing
-at the host's value, so an unexpected schema degrades to the read-only list
-rather than to an empty panel. **The schema is provisional** — it was written
-against a stand-in server, not the real routes. If it settles into something
-this cannot read, the fix is to parse it in nimony with
-`aowl/src/aowlspt/json.nim` and push rows in through `overlaySetMod`, not to
-grow the C.
-
-A toggle marks the row `pending` and shows `*`. That is the honest meaning: a
-native mod cannot be unloaded from under a running raid, so the button records
-what should happen next launch.
+running in this process and the one source that cannot be stale. Those rows are
+marked `hostPushed` and the backend can never lower their `loaded`: the manager
+runs on the *server* side and has never heard of a client-only mod, so its
+`live:false` is not evidence about one.
 
 ## Using it from the client host
 
@@ -160,8 +218,27 @@ game hanging on a black screen at startup, not as an error.
 ```
 .\build.ps1              # build + headless run, screenshots into tests\overlayhost\shots
 .\build.ps1 -Backend     # also run the stand-in backend and check the POST arrives
+.\build.ps1 -Real        # first drive the real backend with the real manager
+.\build.ps1 -Control present   # which control state the stand-in answers in
 .\build.ps1 -Interactive # a visible window; INSERT toggles, ESC closes
 ```
+
+Two backends, because they prove different halves and neither one proves both.
+
+`tests/overlayhost/realbackend.py` is the honest one: it stages `manager.dll`
+and a copy of `registry/` into a scratch install, starts `aowlspt-backend`
+against it, and drives `/aowlspt/mods/panel` and `/aowlspt/mods/toggle/<id>`
+over the wire. It checks every field this reader consumes is present and of the
+right type, that `mods` is the last key, that a toggle on a host with no control
+comes back `restart:true` with a `deferred` outcome per mod, and that toggling
+back **clears** the flag — the `*` is a difference from what the host started
+with, not a one-way latch. It writes what it saw to `panel.golden.json`.
+
+`tests/overlayhost/fakebackend.py` serves that capture — the real manager's
+bytes — to the overlay, and adds the one thing a capture cannot carry: what
+happens between the POST and the next GET, in each of the manager's three
+control states (`absent`, `present`, `stubborn`). It does **not** deflate its
+answers, which is the only reason the overlay can read it today.
 
 `tests/overlayhost/overlayhost.c` is a D3D11 application that stands in for
 Tarkov: a window, a device, a swap chain, a scene, a present loop. The overlay
@@ -182,6 +259,14 @@ Three things it proves rather than merely exercises:
   `HRESULT` is checked. Without the overlay dropping its render target view
   first this returns `DXGI_ERROR_INVALID_CALL` — the most common way an overlay
   breaks a game.
+- **The rows on the panel came from the manager.** With `--port`, the run clicks
+  the first row the *backend* contributed rather than a fixed index — the rows
+  the test host pushes in are named after mods the registry does not have, so a
+  fixed index would be clicking something the manager cannot answer about. It
+  then checks the row changed state, that it came back either starred or greyed
+  (the manager's answer, whichever it was — what would be wrong is the field
+  never moving off the host's default), and that no host-pushed row was greyed
+  out by the backend.
 
 `tests/overlayhost/overlaynimtest.nim` covers the other boundary: that nimony
 binds the header the way the rest of the repo binds C, that a nimony build needs
@@ -190,7 +275,9 @@ no extra link library, and that a nimony `string` survives the trip to
 
 ## What the rest of the tree needs to change
 
-Two things, both outside this directory and neither made here:
+Four things, all outside this directory and none made here. The first two are
+what makes the overlay appear at all; the last two are what makes the toggle
+mean something.
 
 1. **`host/Aowlspt.Host.Il2Cpp/aowlhost.nim`** — `import aowloverlay`, then
    call `overlayStart` on the boot thread after the mod loop and
@@ -198,6 +285,95 @@ Two things, both outside this directory and neither made here:
 2. **`tools/aowl.nim`** — add `-p:host\Aowlspt.Overlay` to `buildIl2CppHost`'s
    command so the import resolves, and a `buildOverlayTests` alongside the other
    test builds if the headless run should be part of `aowl test`.
+
+### 3. `backend/aowlbackend.nim` must not deflate the panel body
+
+`sendResponse` compresses **every** response body, unconditionally, with no
+`Content-Encoding` header, because that is what the Tarkov client expects. The
+overlay's WinHTTP client gets 439 bytes starting `78 9C`, finds no rows in them,
+and falls back to read-only — silently, unless you know to look for it. It has
+no inflater and should not grow one: `zlib` is not in any DLL the header can
+resolve by name, and linking one would make the injected host depend on it.
+
+The change is a header the client already sends. In `parseHead`, beside
+`content-length` and `cookie`:
+
+```nim
+elif name == "accept-encoding":
+  # The game client never sends this and always wants the framed body. Anything
+  # that does ask — the in-game overlay's WinHTTP worker, curl, a browser
+  # looking at /aowlspt/mods — gets what it asked for.
+  r.identity = find(toLowerAscii(value), "identity") >= 0
+```
+
+with `identity*: bool` on `Request`, and at the one call site that serves a
+route:
+
+```nim
+sendResponse(sock, "200 OK", body, not req.identity, req.keepAlive)
+```
+
+Nothing else changes: the client does not send the header, so its path is
+byte-identical. Until this lands the overlay reports the deflated answer by
+name in `overlayStatus()` rather than looking like a network failure, and
+`tests/overlayhost/realbackend.py` inflates it itself so the schema is still
+checked against the real manager.
+
+### 4. A host has to answer `aowlspt.host.mods.*`
+
+`mods/manager/mgr/control.nim` implements the whole mod half of an event
+protocol for live load/unload — probe, capabilities, load, unload, list, result
+— and the protocol is written out at the top of that file. **Nothing subscribes
+to it.** `hostEventEmit` in `backend/aowlbackend.nim` delivers only to `gSubs`,
+which mods fill in; the host itself is not a subscriber and cannot become one
+through the public API.
+
+`host/common/modhost.nim` already has the hard half: `unloadOne` runs the mod's
+`on_unload`, calls the teardown the host registered with `setModTeardown`, and
+then frees the library — in that order, which is the whole of the danger — and
+the IL2CPP host's `dropModRegistrations` is such a teardown. What is missing is
+the wiring. In each host:
+
+```nim
+# In hostEventEmit, before the delivery loop:
+if n.len > 18 and n.substr(0, 17) == "aowlspt.host.mods.":
+  hostModsControl(from1, n, body)
+# ... and then deliver to gSubs as it does today, so the request also reaches
+# any other mod that wants to see it.
+```
+
+`hostModsControl` answers by emitting **from the host**, which needs an emit
+that excludes nobody — `hostEventEmit` skips the emitter by `modIndex`, and the
+host is not a mod:
+
+```nim
+proc emitFromHost(name, payload: string) =
+  let subs = gSubs          # a snapshot: a subscriber list can change under an
+  for i in 0 ..< subs.len:  # unload, and iterating the live one is a crash
+    if subs[i].name == name: discard cInvokeCallback(...)
+```
+
+Four rules, and each one is a bug if it is missed:
+
+- **`probe` → `capabilities` immediately**, with `control:true, unload:true`
+  only if `setModTeardown` has actually been called. A host that answers `true`
+  and then cannot unload is worse than one that answers `false`.
+- **`unload` must not happen inside the emit.** `broadcast` is synchronous, so
+  the stack at that moment runs through the requesting mod's route handler;
+  `FreeLibrary` there is a return into unmapped memory. Queue the guid, do it on
+  the host's own loop, then emit `result`. Refuse to unload the requester, and
+  refuse to unload the manager.
+- **Exactly one `result` per request, including failures.** Silence is
+  indistinguishable from a host that never implemented this, and the manager
+  sits in `csUnknown` forever.
+- **`load` is idempotent** and `list` answers `{"mods":[{guid,name,version,path,
+  live,hotReloadable}]}`. The manager states the whole desired set on every
+  apply rather than a diff, because a diff from a stale picture loads a mod
+  twice.
+
+The manager needs no change when this lands, and neither does this header: the
+`deferred` outcomes become `applied`, `live` stops being `null`, and the rows
+start greying out instead of starring.
 
 No new link libraries. Everything the header needs from `d3d11.dll` and
 `winhttp.dll` is resolved with `GetProcAddress` at runtime; every COM call goes

@@ -546,7 +546,6 @@ proc main(): int =
   # trader whose stock becomes offers, a stash to put a purchase in and a stack
   # of roubles to pay with. Every filter check reads `offersOf` rather than the
   # whole body -- see the note there.
-  var listedId = ""
   if haveFixture:
     let page = call("/client/ragfair/find",
       "{\"page\":0,\"limit\":50,\"sortType\":5,\"sortDirection\":0}")
@@ -643,7 +642,6 @@ proc main(): int =
     # Listing it again. The items leave the stash and are held by the offer:
     # they have to leave, because an item that is both listed and in the stash
     # can be sold twice.
-    listedId = psoId
     let listed = call("/client/game/profile/items/moving",
       "{\"data\":[{\"Action\":\"RagFairAddOffer\",\"sellInOnePiece\":false," &
       "\"items\":[\"" & psoId & "\"],\"requirements\":[{\"_tpl\":\"" &

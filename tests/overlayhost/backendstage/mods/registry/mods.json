@@ -1,0 +1,217 @@
+{
+  "schema": "aowlspt.registry/1",
+  "registry": {
+    "id": "aowl.registry.official",
+    "name": "aowlspt official registry",
+    "description": "Every mod built in this repository, plus the lists that name them. One file with one git history, so a mod list is a document you can send someone."
+  },
+
+  "mods": [
+    {
+      "id": "aowl.tarkov",
+      "name": "Tarkov Emulator",
+      "author": "aowlspt",
+      "version": "0.1.0",
+      "description": "The game server: profiles, static tables, traders, flea market, quests, hideout, raids. Written entirely on the public mod API, which is the only honest test that the API is enough to build a game server with.",
+      "pipeline": ">=0.1.0",
+      "sides": ["server", "sim"],
+      "source": { "kind": "intree", "path": "mods/tarkov", "url": null },
+      "artifact": { "dir": "tarkov", "library": "tarkov.dll" },
+      "upstream": null,
+      "license": "see repository",
+      "download": null,
+      "requires": [],
+      "conflicts": [],
+      "provides": ["aowl.capability.gameserver"],
+      "loadAfter": [],
+      "tags": ["server", "core"]
+    },
+    {
+      "id": "aowl.morebots",
+      "name": "MoreBots",
+      "author": "TacticalToaster (ported to aowlspt)",
+      "version": "1.0.0",
+      "description": "The bot-type and faction API other mods build on. Announces itself with morebots.ready and does the database writing on behalf of whoever answers.",
+      "pipeline": ">=0.1.0",
+      "sides": ["server", "client", "sim"],
+      "source": { "kind": "intree", "path": "mods/morebots", "url": null },
+      "artifact": { "dir": "morebots", "library": "morebots.dll" },
+      "upstream": { "name": "MoreBotsAPI", "author": "TacticalToaster", "url": "https://discord.gg/nxa3W7w4rJ" },
+      "license": "CC-BY-NC-SA-4.0",
+      "download": null,
+      "requires": [],
+      "conflicts": [],
+      "provides": ["aowl.capability.bottypes"],
+      "loadAfter": [],
+      "tags": ["bots", "api"]
+    },
+    {
+      "id": "aowl.blackdivision",
+      "name": "Black Division",
+      "author": "TacticalToaster (ported to aowlspt)",
+      "version": "1.2.3",
+      "description": "A hostile PMC faction of six roles, hunting the player across ten maps and camping the Labs extracts. Registers its bots through morebots rather than writing the database itself.",
+      "pipeline": ">=0.1.0",
+      "sides": ["server", "client", "sim"],
+      "source": { "kind": "intree", "path": "mods/blackdivision", "url": null },
+      "artifact": { "dir": "blackdivision", "library": "blackdivision.dll" },
+      "upstream": { "name": "WTT Black Division", "author": "Matthew Ryan Christensen II", "url": "https://discord.gg/nxa3W7w4rJ" },
+      "license": "MIT",
+      "download": null,
+      "requires": [{ "id": "aowl.morebots", "version": ">=1.0.0" }],
+      "conflicts": [],
+      "provides": [],
+      "loadAfter": ["aowl.morebots"],
+      "tags": ["bots", "content"]
+    },
+    {
+      "id": "aowl.sain",
+      "name": "SAIN",
+      "author": "aowlspt port of SAIN by Solarint and ArchangelWTF",
+      "version": "0.1.0",
+      "description": "Bot AI: layered decisions, per-bot personalities, cover use, searching that looks like searching, squads that behave like squads. A port of the design, not of the C#.",
+      "pipeline": ">=0.1.0",
+      "sides": ["server", "client", "sim"],
+      "source": { "kind": "intree", "path": "mods/sain", "url": null },
+      "artifact": { "dir": "sain", "library": "sain.dll" },
+      "upstream": { "name": "SAIN", "author": "Solarint, maintained by ArchangelWTF", "url": "https://github.com/Solarint/SAIN" },
+      "license": null,
+      "download": null,
+      "requires": [],
+      "conflicts": [],
+      "provides": ["aowl.capability.botbrains"],
+      "loadAfter": ["aowl.morebots"],
+      "tags": ["bots", "ai"]
+    },
+    {
+      "id": "aowl.icebreaker",
+      "name": "Icebreaker",
+      "author": "Manimal (ported by savannt)",
+      "version": "1.0.0",
+      "description": "The server half of the Icebreaker map backport: the location, its spawns and its loot tables. The ship's ladders need a separate client mod that is not part of this port.",
+      "pipeline": ">=0.1.0",
+      "sides": ["server", "sim"],
+      "source": { "kind": "intree", "path": "mods/icebreaker", "url": null },
+      "artifact": { "dir": "icebreaker", "library": "icebreaker.dll" },
+      "upstream": { "name": "ManimalIcebreaker", "author": "Manimal / danauraborealis", "url": "https://github.com/danauraborealis/ManimalIcebreaker" },
+      "license": "MIT",
+      "download": null,
+      "requires": [],
+      "conflicts": [],
+      "provides": [],
+      "loadAfter": [],
+      "tags": ["map", "content"]
+    },
+    {
+      "id": "aowl.classicmovement",
+      "name": "Classic Movement",
+      "author": "TheBoogle (ported by savannt)",
+      "version": "1.2.0",
+      "description": "Old Tarkov movement: inertia removed, with the client and server halves in one binary split by side().",
+      "pipeline": ">=0.1.0",
+      "sides": ["server", "client", "sim"],
+      "source": { "kind": "intree", "path": "mods/classicmovement", "url": null },
+      "artifact": { "dir": "classicmovement", "library": "classicmovement.dll" },
+      "upstream": { "name": "Old Tarkov Movement (no inertia)", "author": "TheBoogle", "url": "https://github.com/TheBoogle/OldTarkovMovement" },
+      "license": "MIT",
+      "download": null,
+      "requires": [],
+      "conflicts": [],
+      "provides": ["aowl.capability.movement"],
+      "loadAfter": [],
+      "tags": ["gameplay", "movement"]
+    },
+    {
+      "id": "aowl.fovfix",
+      "name": "FOV Fix",
+      "author": "Fontaine (ported by savannt)",
+      "version": "4.0.2",
+      "description": "Field of view that stays where you put it, including while aiming and while scoped.",
+      "pipeline": ">=0.1.0",
+      "sides": ["client", "sim"],
+      "source": { "kind": "intree", "path": "mods/fov", "url": null },
+      "artifact": { "dir": "fov", "library": "fov.dll" },
+      "upstream": { "name": "Fontaine-FOVFix", "author": "Fontaine (space-commits)", "url": "https://github.com/space-commits" },
+      "license": "CC-BY-NC-SA-3.0",
+      "download": null,
+      "requires": [],
+      "conflicts": [],
+      "provides": ["aowl.capability.fov"],
+      "loadAfter": [],
+      "tags": ["client", "quality-of-life"]
+    },
+    {
+      "id": "com.savannt.sptsway",
+      "name": "SPT-SWAY",
+      "author": "savannt",
+      "version": "3.0.0",
+      "description": "Five physical sources of weapon sway -- respiration, cardiac, tremor, postural drift, weapon inertia -- summed, scaled by the shooter's condition and the weapon in their hands, and pushed into the game's rotation springs.",
+      "pipeline": ">=0.1.0",
+      "sides": ["client", "sim"],
+      "source": { "kind": "intree", "path": "mods/sway", "url": null },
+      "artifact": { "dir": "sway", "library": "sway.dll" },
+      "upstream": { "name": "SPT-SWAY (BepInEx)", "author": "savannt", "url": null },
+      "license": "see repository",
+      "download": null,
+      "requires": [],
+      "conflicts": [],
+      "provides": ["aowl.capability.weaponsway"],
+      "loadAfter": [],
+      "tags": ["client", "weapons"]
+    }
+  ],
+
+  "lists": [
+    {
+      "id": "aowl.list.core",
+      "name": "Core",
+      "author": "aowlspt",
+      "version": "1.0.0",
+      "description": "The server and nothing else. What an install needs to be a game rather than a pipeline.",
+      "inherits": [],
+      "entries": [
+        { "id": "aowl.tarkov", "enabled": true }
+      ]
+    },
+    {
+      "id": "aowl.list.vanillaplus",
+      "name": "Vanilla Plus",
+      "author": "savannt",
+      "version": "1.0.0",
+      "description": "Core, plus the three client mods that change how the game feels without changing what is in it.",
+      "inherits": ["aowl.list.core"],
+      "entries": [
+        { "id": "aowl.fovfix", "enabled": true },
+        { "id": "com.savannt.sptsway", "enabled": true },
+        { "id": "aowl.classicmovement", "enabled": true }
+      ]
+    },
+    {
+      "id": "aowl.list.raidnight",
+      "name": "Raid Night",
+      "author": "savannt",
+      "version": "1.0.0",
+      "description": "Vanilla Plus with the bots turned up: new brains, a new faction, and a map that is not in the base game.",
+      "inherits": ["aowl.list.vanillaplus"],
+      "entries": [
+        { "id": "aowl.morebots", "enabled": true },
+        { "id": "aowl.sain", "enabled": true },
+        { "id": "aowl.blackdivision", "enabled": true },
+        { "id": "aowl.icebreaker", "enabled": true }
+      ]
+    },
+    {
+      "id": "aowl.list.headless",
+      "name": "Headless",
+      "author": "savannt",
+      "version": "1.0.0",
+      "description": "Raid Night as a server operator wants it: the same content, with the three client-only feel mods switched off, so the list records that they were considered and declined rather than forgotten.",
+      "inherits": ["aowl.list.raidnight"],
+      "entries": [
+        { "id": "aowl.fovfix", "enabled": false, "note": "client-only; there is nothing here for it to run in" },
+        { "id": "com.savannt.sptsway", "enabled": false, "note": "client-only; there is nothing here for it to run in" },
+        { "id": "aowl.classicmovement", "enabled": false, "note": "the server half only matters with the client half" }
+      ]
+    }
+  ]
+}

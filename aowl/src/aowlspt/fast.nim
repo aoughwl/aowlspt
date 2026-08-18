@@ -205,6 +205,11 @@ proc classifyType*(rt: Il2Cpp; t: string): FastKind =
 # ---------------------------------------------------------------------------
 
 const MaxArgs* = 4
+
+const MaxSlots* = 5
+  ## Native register slots a call can use: `this` plus four arguments, which is
+  ## what Win64 passes before it starts using the stack. A shaped call counts
+  ## its own slots against this, including a hidden struct-return pointer.
   ## Four declared arguments plus `this` is five slots, which is exactly the
   ## four general-purpose and four SSE registers Win64 passes arguments in
   ## before it starts using the stack. Past that the shape count doubles per
@@ -304,6 +309,9 @@ proc noBinding(target, why: string): Binding =
                    argc: 0'i32, slots: 0'i32, mask: 0'u32, ret: fkNone,
                    isStatic: false, bindNs: 0'i64)
 
+proc bindInClass*(rt: Il2Cpp; cls: Il2CppClass; owner, member: string;
+                  argKinds: openArray[FastKind]; ret: FastKind): Binding
+
 proc bindMethodAs*(rt: Il2Cpp; owner, member: string;
                    argKinds: openArray[FastKind]; ret: FastKind): Binding =
   ## Binds a method with the signature stated rather than inferred.
@@ -328,6 +336,37 @@ proc bindMethodAs*(rt: Il2Cpp; owner, member: string;
   if cls == nil:
     result.why = "no such type: " & owner &
                  " (the game's assemblies may not be loaded yet)"
+    return
+  result = bindInClass(rt, cls, owner, member, argKinds, ret)
+  result.bindNs = nanosBetween(t0, perfCounter())
+
+proc bindInClass*(rt: Il2Cpp; cls: Il2CppClass; owner, member: string;
+                  argKinds: openArray[FastKind]; ret: FastKind): Binding =
+  ## The same, against a class already in hand.
+  ##
+  ## Two things need this and neither can use the by-name form. Binding against
+  ## **the object's own class** rather than the one the mod named is the
+  ## difference between calling a subclass's override and silently calling the
+  ## base implementation -- a bound call is non-virtual by construction, so a
+  ## binding taken against `EFT.Player` by name calls `EFT.Player`'s body even
+  ## on a bot subclass that overrides it. And a generic instantiation such as
+  ## `List<Player>` has no name `findClass` accepts, but every instance of one
+  ## can hand over its class.
+  ##
+  ## `owner` here is only used for the messages, so a caller with a class and no
+  ## good name may pass whatever reads best in a log.
+  let t0 = perfCounter()
+  result = noBinding(owner & "::" & member, "")
+  if argKinds.len > MaxArgs:
+    result.why = result.target & ": " & $argKinds.len &
+                 " arguments; the fast path passes at most " & $MaxArgs &
+                 " before Win64 starts using the stack"
+    return
+  if ret == fkNone:
+    result.why = result.target & ": the return type was not classified"
+    return
+  if cls == nil:
+    result.why = result.target & ": no class was given"
     return
   let m = findMethod(rt, cls, member, argKinds.len)
   if m == nil:
@@ -375,6 +414,28 @@ proc bindMethodAs*(rt: Il2Cpp; owner, member: string;
   result.why = result.target & ": " &
     (if result.isStatic: "static" else: "instance") & ", " &
     $argKinds.len & " arg(s), returns " & describe(ret)
+
+proc bindOnObject*(rt: Il2Cpp; obj: Il2CppPtr; member: string;
+                   argKinds: openArray[FastKind]; ret: FastKind): Binding =
+  ## Binds against the class of a live object, walking its base chain.
+  ##
+  ## This is what a mod holding an instance actually wants: the object knows its
+  ## own type, including the subclass the game handed it, and including generic
+  ## instantiations that cannot be named.
+  if obj == nil:
+    return noBinding("::" & member, "no object to bind against")
+  var cls = objectClass(rt, obj)
+  var name = fullName(rt, cls)
+  while cls != nil:
+    let b = bindInClass(rt, cls, name, member, argKinds, ret)
+    if b.ok:
+      return b
+    cls = classParent(rt, cls)
+    if cls != nil:
+      name = fullName(rt, cls)
+  result = noBinding(name & "::" & member,
+                     "no method " & member & "/" & $argKinds.len &
+                     " on that object or any of its base classes")
 
 proc bindMethod*(rt: Il2Cpp; owner, member: string; argc: int): Binding =
   ## Binds a method, inferring the signature from the runtime's own metadata.
@@ -427,6 +488,140 @@ proc bindMethod*(rt: Il2Cpp; owner, member: string; argc: int): Binding =
   # The inference walked the parameter list, and that is part of what binding
   # cost; `bindMethodAs` only timed its own half.
   result.bindNs = nanosBetween(t0, perfCounter())
+
+# ---------------------------------------------------------------------------
+# Stating the call shape outright
+# ---------------------------------------------------------------------------
+#
+# `bindMethod` classifies each declared parameter into a register class and
+# refuses anything it cannot. `bindMethodAs` lets a mod assert those classes.
+# Neither can express a method whose *shape* differs from its signature -- and
+# on Win64 the two most common such methods in this game are exactly the ones a
+# mod wants most.
+#
+# A `Vector3` is twelve bytes. Win64 passes anything larger than eight and not a
+# power of two **by hidden pointer**, and returns it the same way: the caller
+# allocates the space, passes its address as an invisible first argument, and
+# the callee writes through it and returns that address. So
+#
+#     Vector3 Player::get_Position()            is really
+#     void*   get_Position(void* sret, void* this, MethodInfo*)
+#
+#     void Mover::GoToPoint(Vector3 p, ...)     is really
+#     void GoToPoint(void* this, void* p, ..., MethodInfo*)
+#
+# Every slot in both is a plain pointer -- which the existing trampoline table
+# already passes. Nothing new is needed in the C at all; what was missing was a
+# way to say "this method has four pointer slots" when its signature says it has
+# one argument.
+#
+# That is what `bindRaw` is. It is the sharpest tool here: the mod is asserting
+# a calling convention, and a wrong assertion is a call into the game with the
+# arguments in the wrong registers. It exists because the alternative -- the
+# reflective path -- costs about a hundred times as much and allocates a managed
+# object per call, on a path that runs per bot per frame.
+
+type
+  ShapedArgs* = object
+    ## Slots for a shaped call, filled positionally by the mod. Unlike `Args`,
+    ## nothing here is inferred: slot 0 is whatever the mod says slot 0 is.
+    slots*: array[MaxSlots, uint64]
+    n*: int32
+
+proc shaped*(): ShapedArgs =
+  result = ShapedArgs(n: 0'i32)
+
+proc addSlotPtr*(a: var ShapedArgs; p: Il2CppPtr) =
+  if a.n >= int32(MaxSlots): return
+  cSetP(cast[Il2CppPtr](addr a.slots[0]), a.n, p)
+  inc a.n
+
+proc addSlotInt*(a: var ShapedArgs; v: int64) =
+  if a.n >= int32(MaxSlots): return
+  cSetG(cast[Il2CppPtr](addr a.slots[0]), a.n, v)
+  inc a.n
+
+proc addSlotFloat*(a: var ShapedArgs; v: float) =
+  ## The slot's *mask* bit lives on the binding, not here: a shaped call states
+  ## its whole shape up front, so which slots are floats is fixed at bind time
+  ## and cannot be varied per call.
+  if a.n >= int32(MaxSlots): return
+  cSetF(cast[Il2CppPtr](addr a.slots[0]), a.n, v)
+  inc a.n
+
+proc bindRaw*(rt: Il2Cpp; cls: Il2CppClass; owner, member: string;
+              declaredArgc: int; slots: int; floatMask: uint32;
+              ret: FastKind): Binding =
+  ## Binds a method by its **native slot shape** rather than its signature.
+  ##
+  ## `declaredArgc` finds the method (IL2CPP looks up by name and arity);
+  ## `slots` is how many registers the call actually uses, counting a hidden
+  ## return pointer and `this`; `floatMask` says which of those are floats.
+  ##
+  ## The mod is asserting the convention. Getting `slots` wrong reads an
+  ## uninitialised register as an argument -- a plausible number rather than a
+  ## crash -- so this is the last resort, not the first, and every use of it
+  ## should say in a comment why the shape is what it claims.
+  let t0 = perfCounter()
+  result = noBinding(owner & "::" & member, "")
+  if slots < 0 or slots > MaxSlots:
+    result.why = result.target & ": " & $slots &
+                 " slots; the fast path passes at most " & $MaxSlots
+    return
+  if cls == nil:
+    result.why = result.target & ": no class was given"
+    return
+  let m = findMethod(rt, cls, member, declaredArgc)
+  if m == nil:
+    result.why = "no method " & result.target & " taking " & $declaredArgc &
+                 " argument(s)"
+    return
+  let fn = methodPointer(rt, m)
+  if fn == nil:
+    result.why = result.target &
+      ": MethodInfo.methodPointer is not a code address on this build"
+    return
+
+  result.fn = fn
+  result.info = m
+  result.isStatic = methodIsStatic(rt, m)
+  # A shaped call fills every slot itself, including `this`, so the caller must
+  # not have one written for it: `argc` equals `slots` and `isStatic` is forced
+  # true for the calling path. What the method really is stays in `why`.
+  result.argc = int32(slots)
+  result.slots = int32(slots)
+  result.mask = floatMask
+  result.ret = ret
+  result.ok = true
+  result.bindNs = nanosBetween(t0, perfCounter())
+  result.why = result.target & ": shaped, " & $slots & " slot(s), " &
+    (if result.isStatic: "static" else: "instance") & ", returns " &
+    describe(ret)
+  result.isStatic = true
+
+proc callShapedPtr*(b: Binding; a: var ShapedArgs): Il2CppPtr =
+  ## A shaped call returning a pointer -- which is what a struct return is: the
+  ## address the callee wrote through, and the same address the caller passed.
+  result = cast[Il2CppPtr](0)
+  if not b.ok or a.n != b.slots: return
+  let v = cFastG(b.fn, b.info, b.slots, b.mask,
+                 cast[Il2CppPtr](addr a.slots[0]))
+  result = cast[Il2CppPtr](v)
+
+proc callShapedVoid*(b: Binding; a: var ShapedArgs) =
+  if not b.ok or a.n != b.slots: return
+  discard cFastG(b.fn, b.info, b.slots, b.mask,
+                 cast[Il2CppPtr](addr a.slots[0]))
+
+proc callShapedFloat*(b: Binding; a: var ShapedArgs): float =
+  result = 0.0
+  if not b.ok or a.n != b.slots: return
+  if b.ret == fkF64:
+    result = cFastD(b.fn, b.info, b.slots, b.mask,
+                    cast[Il2CppPtr](addr a.slots[0]))
+  else:
+    result = cFastF(b.fn, b.info, b.slots, b.mask,
+                    cast[Il2CppPtr](addr a.slots[0]))
 
 # ---------------------------------------------------------------------------
 # Calling

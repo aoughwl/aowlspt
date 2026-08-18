@@ -415,6 +415,8 @@ int main(int argc, char** argv) {
 
     int printMismatches = 0, drewPixels = 0, resizeOk = -1;
     char path[512];
+    int32_t clickedRow = 2, clickedWas = 0, backendRows = 0;
+    char clickedGuid[80] = {0};
 
     for (int f = 0; f < frames; f++) {
         MSG msg;
@@ -449,10 +451,25 @@ int main(int argc, char** argv) {
                 drewPixels = n;
             }
             if (f == 40) {
-                /* Row 2 (zero-based) sits at y = 60 + 30 + 2*22 + 11 = 145;
-                 * its button is at x = 40 + 520 - 10 - 56 + 28 = 522. */
-                SendMessageW(hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(522, 145));
-                SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(522, 145));
+                /* Row `n` (zero-based) sits at y = 60 + 30 + n*22 + 11; its
+                 * button is at x = 40 + 520 - 10 - 56 + 28 = 522.
+                 *
+                 * With a backend up, the row clicked is the first one the
+                 * backend contributed rather than a fixed index: everything
+                 * checked after the click -- the `*`, the grey-out, the POST --
+                 * is the manager's answer about a mod, and the manager can only
+                 * answer about mods in its registry. The rows the host pushed in
+                 * are deliberately named after mods it does not have. */
+                clickedRow = 2;
+                for (int32_t k = 0; k < g_ov.modCount; k++) {
+                    if (!g_ov.mods[k].hostPushed) { clickedRow = k; break; }
+                }
+                strncpy(clickedGuid, g_ov.mods[clickedRow].guid,
+                        sizeof(clickedGuid) - 1);
+                clickedWas = g_ov.mods[clickedRow].enabled;
+                int cy = 60 + 30 + clickedRow * 22 + 11;
+                SendMessageW(hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(522, cy));
+                SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(522, cy));
             }
             if (f == 52 && shotDir) {
                 _snprintf(path, sizeof(path), "%s\\02-clicked.bmp", shotDir);
@@ -481,6 +498,10 @@ int main(int argc, char** argv) {
                 _snprintf(path, sizeof(path), "%s\\04-hidden.bmp", shotDir);
                 if (shoot(path)) ok("wrote 04-hidden.bmp");
             }
+            if (f == 88) {
+                for (int32_t k = 0; k < g_ov.modCount; k++)
+                    if (!g_ov.mods[k].hostPushed) backendRows++;
+            }
             if (f == 92) break;
             Sleep(16);   /* ~60 Hz, so the backend poll thread gets real time */
         }
@@ -508,6 +529,68 @@ int main(int argc, char** argv) {
         else bad("ResizeBuffers failed with the overlay hooked");
         if (aowl_ov_visible() == 0) ok("the toggle key turned the panel on and off again");
         else bad("the panel did not close on the second toggle");
+    }
+
+    /* --- the backend, when there is one ----------------------------------
+     *
+     * These are the checks that the reconciled schema is the one being read.
+     * They are skipped without `--port` rather than faked: a run with no
+     * backend is a legitimate configuration (the panel is read-only) and
+     * asserting backend behaviour there would be asserting nothing. */
+    if (headless && port > 0) {
+        if (backendRows > 0) {
+            char m[96];
+            _snprintf(m, sizeof(m), "%d rows came from the backend's panel route",
+                      backendRows);
+            ok(m);
+        } else {
+            bad("no row came from the backend: the panel route was not read");
+        }
+
+        int32_t at = -1;
+        for (int32_t k = 0; k < g_ov.modCount; k++)
+            if (strcmp(g_ov.mods[k].guid, clickedGuid) == 0) { at = k; break; }
+        if (at < 0) {
+            bad("the clicked row vanished from the table");
+        } else {
+            AowlOvMod* m = &g_ov.mods[at];
+            char line[192];
+            _snprintf(line, sizeof(line),
+                      "      clicked %s: enabled %d -> %d, live %d, restart %d, "
+                      "pending %d", m->guid, clickedWas, m->enabled, m->loaded,
+                      m->restart, m->pending);
+            printf("%s\n", line);
+
+            if (m->enabled != clickedWas)
+                ok("the click changed the row's state and the server agreed");
+            else
+                bad("the row came back from the server unchanged");
+
+            /* The whole point of the exercise. `restart` used to be a constant
+             * `1` on any clicked row; it is now whatever the manager answered,
+             * and the stand-in answers what the real manager answers in each of
+             * its three control states. Either value is correct here -- what
+             * would not be is the field never moving off the host's default. */
+            if (m->restart || m->loaded == 0)
+                ok("the row reflects the manager's own answer: a `*` for a "
+                   "change that needs a restart, or a greyed row for one the "
+                   "host unloaded live");
+            else
+                bad("the toggled row shows neither a restart marker nor a "
+                    "grey-out; the manager's answer is not reaching the panel");
+        }
+
+        /* A host-pushed row must never be greyed out by the backend. The
+         * manager runs on the server side and has never heard of a client-only
+         * mod, so its `live` is not evidence about one. */
+        int32_t lowered = 0;
+        for (int32_t k = 0; k < g_ov.modCount; k++)
+            if (g_ov.mods[k].hostPushed && !g_ov.mods[k].loaded) lowered++;
+        if (lowered == 0)
+            ok("the backend did not grey out a mod the host loaded in this "
+               "process");
+        else
+            bad("the backend lowered `loaded` on a row the host pushed in");
     }
 
     aowl_ov_stop();

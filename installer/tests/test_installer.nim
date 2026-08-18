@@ -17,7 +17,8 @@
 ## any, and only ever reads it.
 
 import std/[strutils, syncio, envvars]
-import aowlsptinstall/[winfs, eft, payload, compat, plan, journal, log]
+import aowlsptinstall/[winfs, eft, payload, compat, plan, journal, log,
+                       registry]
 
 var passed = 0
 var failed = 0
@@ -385,12 +386,112 @@ proc testPayload() =
   let vague = payload.load(joinPath(root, "vague"))
   check("a payload with no target version is invalid", not vague.valid)
 
+  # The break the `kind` key exists to close. A post-1.0 payload has no
+  # `runtime/` and no `client/` -- the host is injected at start-up and the
+  # server is a mod -- so the old inference read it as an overlay, and an
+  # overlay never mirrors the client. `install --source <vanilla> --target
+  # <new>` then produced a target holding `aowlspt/` and no game at all, and
+  # reported success.
+  check("a mods-only payload is an overlay unless it says otherwise",
+        good.kind == plModsOnly)
+  discard ensureDir(joinPath(root, "post10\\aowlspt"))
+  discard writeTextFile(joinPath(root, "post10\\aowlspt\\m.dll"), "x")
+  discard writeTextFile(joinPath(root, "post10\\payload.json"),
+    "{\n  \"name\": \"t\",\n  \"targetTarkovVersion\": \"1.1.0.46777\",\n" &
+    "  \"targetBackend\": \"il2cpp\",\n  \"kind\": \"full\"\n}\n")
+  let post10 = payload.load(joinPath(root, "post10"))
+  check("...and is a full install when it does", post10.kind == plFull)
+  check("...which is still a valid payload", post10.valid)
+
+  discard ensureDir(joinPath(root, "badkind\\aowlspt"))
+  discard writeTextFile(joinPath(root, "badkind\\aowlspt\\m.dll"), "x")
+  discard writeTextFile(joinPath(root, "badkind\\payload.json"),
+    "{\n  \"name\": \"t\",\n  \"targetTarkovVersion\": \"1.1.0.46777\",\n" &
+    "  \"targetBackend\": \"il2cpp\",\n  \"kind\": \"sideways\"\n}\n")
+  let badkind = payload.load(joinPath(root, "badkind"))
+  check("a payload declaring a kind nobody knows is invalid", not badkind.valid)
+
   discard ensureDir(joinPath(root, "empty"))
   discard writeTextFile(joinPath(root, "empty\\payload.json"),
     "{\n  \"name\": \"t\",\n  \"targetTarkovVersion\": \"1.1.0\",\n" &
     "  \"targetBackend\": \"mono\"\n}\n")
   let empty = payload.load(joinPath(root, "empty"))
   check("a payload with nothing in it is invalid", not empty.valid)
+
+  discard winfs.removeTree(root)
+
+
+# --------------------------------------------------------------- registry
+
+proc testRegistry() =
+  echo "\nregistry and the default selection"
+
+  # The shipped manager config, near enough. The documentation key sits
+  # immediately above the real one and contains the same word: patching that
+  # one instead would turn a doc string into a JSON array, leave `activeLists`
+  # untouched, and produce a config that reads as configured and is not.
+  let cfg = "{\n" &
+            "  \"//activeLists\": \"The lists active on a fresh install.\",\n" &
+            "  \"activeLists\": [\"aowl.list.core\"],\n" &
+            "  \"controlProbeMs\": 750\n}\n"
+  let patched = patchActiveLists(cfg, "aowl.list.raidnight")
+  check("the active list is replaced",
+        find(patched, "\"activeLists\": [\"aowl.list.raidnight\"]") >= 0)
+  check("...and the documentation key above it is not",
+        find(patched, "\"//activeLists\": \"The lists active on a fresh install.\"") >= 0)
+  check("...and the settings after it survive",
+        find(patched, "\"controlProbeMs\": 750") >= 0)
+  checkEq("the value can be read back", activeListsOf(patched),
+          "[\"aowl.list.raidnight\"]")
+
+  # A config without the key in the shape expected is left alone rather than
+  # having a second `activeLists` appended: two keys of the same name resolve to
+  # whichever one the parser reaches last, which is a config that behaves
+  # differently from how it reads.
+  checkEq("a config with no activeLists is not patched",
+          patchActiveLists("{\n  \"controlProbeMs\": 750\n}\n", "x"), "")
+  checkEq("a config whose activeLists is not an array is not patched",
+          patchActiveLists("{\"activeLists\": \"core\"}", "x"), "")
+
+  let reg = "{\"schema\":\"aowlspt.registry/1\"," &
+            "\"mods\":[{\"id\":\"a\",\"requires\":[{\"id\":\"b\"}]," &
+            "\"artifact\":{\"dir\":\"a\"}}," &
+            "{\"id\":\"b\",\"artifact\":{\"dir\":\"b\"}}]," &
+            "\"lists\":[{\"id\":\"aowl.list.core\",\"entries\":[{\"id\":\"a\"}]}]}"
+  checkEq("the schema is read", schemaOf(reg), "aowlspt.registry/1")
+  # Counted off `artifact` and `entries` rather than off `id`: this document has
+  # five `"id"` keys, two mods and one list.
+  var counted = ""
+  let described = describeRegistry(reg)
+  for l in described:
+    if l.startsWith("contains"):
+      counted = l
+  checkEq("mods and lists are counted, not ids", counted,
+          "contains  2 mods, 1 lists")
+  check("a list that is there is found", hasList(reg, "aowl.list.core"))
+  check("a list that is not is not", not hasList(reg, "aowl.list.nope"))
+
+  let root = joinPath(tempRoot(), "registry")
+  discard winfs.removeTree(root)
+  discard ensureDir(root)
+  checkEq("a payload with no registry has none", registryIn(root), "")
+  discard writeTextFile(joinPath(root, "registry\\mods.json"), reg)
+  checkEq("the top-level one is found", registryIn(root),
+          joinPath(root, "registry\\mods.json"))
+  discard writeTextFile(joinPath(root, "aowlspt\\registry\\mods.json"), reg)
+  checkEq("the one inside aowlspt/ wins", registryIn(root),
+          joinPath(root, "aowlspt\\registry\\mods.json"))
+  checkEq("--registry naming a directory finds mods.json in it",
+          resolveRegistry(root, joinPath(root, "registry")),
+          joinPath(root, "registry\\mods.json"))
+  checkEq("--registry naming the file uses it",
+          resolveRegistry(root, joinPath(root, "registry\\mods.json")),
+          joinPath(root, "registry\\mods.json"))
+  # An explicit path that is not there must not fall back to the payload's.
+  # Installing a registry other than the one that was asked for is how somebody
+  # spends an evening debugging a mod list they are not running.
+  checkEq("--registry naming nothing does not fall back",
+          resolveRegistry(root, joinPath(root, "nope")), "")
 
   discard winfs.removeTree(root)
 
@@ -420,6 +521,7 @@ proc main() =
   testJournal()
   testPlan()
   testPayload()
+  testRegistry()
   testLive()
 
   echo ""

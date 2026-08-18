@@ -233,6 +233,32 @@ makes it soft.
 Nothing else can happen. If a mod is not in exactly one of those states, the
 resolver is wrong.
 
+## What the in-game panel needs from an entry
+
+The overlay draws one row per registry mod, from
+`GET /aowlspt/mods/panel` — see `host/Aowlspt.Overlay/README.md` for the shape.
+Three fields stop being cosmetic once a row is a button.
+
+- **`id` really must equal the mod's `guid`.** The panel is keyed by guid, and
+  it merges two sources on that key: the manager's rows, from the registry, and
+  the rows the client host pushes in for what is loaded in *its* process. An
+  entry whose `id` disagrees with the mod's `exportMod` guid does not correct
+  itself — it shows up as two rows for one mod, one of which cannot be toggled.
+- **`artifact` really is required.** It is the only thing that lets the manager
+  say *which file* to load, so a mod without one answers `refused` on every
+  enable, with that sentence, rather than being quietly skipped.
+- **`version` has to fit in 24 bytes and `id` in 80.** Those are the panel's
+  fixed row fields — a pointer into a string a worker thread might be
+  reallocating is a use-after-free at 60 Hz, so the rows are fixed-size. A
+  longer value truncates rather than crashing, but it truncates *on screen*.
+  `tests/overlayhost/realbackend.py` checks every entry against both limits.
+
+`sides` matters too, and in a way that is easy to misread: the manager runs on
+the **server** side, so its rows describe the backend's view. A client-only mod
+is not on the panel because the manager knows nothing about it — the client host
+puts it there itself, and the manager's "not running" is never allowed to grey
+such a row out.
+
 ## What the resolver does not do
 
 - It does not download anything. `download` is metadata for a fetcher that does

@@ -406,19 +406,107 @@ proc escapeForJson*(s: string): string =
 
 const MaxRegArgs* = 4
 
+## The bytes an IL2CPP object header takes before a boxed value type's payload.
+##
+## `il2cpp_class_instance_size` on a value type reports the size of its *boxed*
+## form -- header plus payload -- because that is the only form the runtime
+## allocates. What matters for reading an argument out of a register is the
+## payload, so the header comes off. Guarded: a runtime (or a mock) that reports
+## the payload alone gives a number at or below the header size, and subtracting
+## would produce nonsense.
+const ObjectHeaderBytes = 16
+
+type ArgShape* = enum
+  ## What a parameter or field type turns out to be, once the runtime is asked
+  ## rather than guessed at.
+  asUnknown    ## the runtime could not name a class for it
+  asValueSmall ## a value type that fits in a register: an enum, a small struct
+  asValueBig   ## a value type too large for a register; it arrives by hidden
+               ## pointer, so there is nothing in the register to report
+  asReference  ## a class: the register holds an object pointer
+
+proc shapeOfType*(rt: Il2Cpp; t: Il2CppType; bytes: var int): ArgShape =
+  ## Classifies a declared type, by asking the runtime for the class behind it.
+  ##
+  ## This exists because the alternative -- "everything I do not recognise by
+  ## name is a reference" -- is a crash rather than a wrong answer. An `enum`
+  ## parameter (`EPhysicalCondition`, `EPlayerState`, every state enum this game
+  ## passes around) arrives as a small integer in a register, and handing that
+  ## integer to `il2cpp_gchandle_new` as if it were an object is undefined
+  ## behaviour inside the collector. A mod cannot protect itself from it either:
+  ## it asks for the arguments without knowing the signature.
+  bytes = 0
+  let c = classFromType(rt, t)
+  if c == nil:
+    return asUnknown
+  if not classIsValueType(rt, c):
+    return asReference
+  var n = classInstanceSize(rt, c)
+  if n > ObjectHeaderBytes:
+    n = n - ObjectHeaderBytes
+  bytes = n
+  if n > 0 and n <= 8:
+    return asValueSmall
+  result = asValueBig
+
+proc referenceHandle(rt: Il2Cpp; p: Il2CppPtr; typeName1: string;
+                     handles: var seq[Il2CppPtr]; isObject: var seq[bool];
+                     gcHandles: var seq[uint32]): string =
+  ## A reference, as a handle a patch handler can call methods on.
+  ##
+  ## The handle lives until the handler returns and no longer -- `patchFired`
+  ## reclaims it. See its comment for why that is the only workable lifetime on
+  ## a path that fires thousands of times a second.
+  if p == nil:
+    return "null"
+  let gc = gcHandleNew(rt, p, false)
+  if gc == 0'u32:
+    return "{\"type\":\"" & typeName1 & "\"}"
+  handles.add cast[Il2CppPtr](0)
+  isObject.add true
+  gcHandles.add gc
+  result = "{\"handle\":" & $handles.len & ",\"type\":\"" & typeName1 & "\"}"
+
 proc describeArgs*(rt: Il2Cpp; m: Il2CppMethod; regs: Il2CppPtr;
                    handles: var seq[Il2CppPtr]; isObject: var seq[bool];
                    gcHandles: var seq[uint32]): string =
-  ## The arguments as a JSON array, in the same shape `call` accepts -- so a
-  ## patch handler reads them with the same `aowlspt/json` a route handler uses
-  ## on a request body.
+  ## What a patched method was called with, as JSON:
+  ##
+  ##     {"this":{"handle":3,"type":"EFT.Player"},"args":[...]}
+  ##     {"this":null,"args":[...]}                 -- a static method
+  ##
+  ## An object rather than a bare array, and that is the whole point of the
+  ## shape. `this` is not a declared parameter -- it arrives in RCX ahead of
+  ## them -- and it used to be dropped, which cost two mods five features
+  ## between them: telling the local player from a bot *is* `__instance.IsAI`,
+  ## and redirecting one context's tilt without knowing the context aims every
+  ## context at one player's.
+  ##
+  ## Putting it in the array as element zero would have been more compact and
+  ## would have made every argument index depend on whether the method is
+  ## static, which is the kind of thing that goes wrong silently and far away.
+  ## A handler reading `"args"` reads the declared parameters and nothing else,
+  ## and a static method's `"this"` is `null` rather than absent, so "no
+  ## instance" cannot be confused with "the payload did not say".
   ##
   ## Arguments past the fourth arrive on the stack and are **not** reported.
   ## They are omitted rather than guessed at: a patch that reports the wrong
   ## fifth argument is worse than one that reports four and says so.
   let isStatic = methodIsStatic(rt, m)
   let declared = methodParamCount(rt, m)
-  var out1 = "["
+
+  var out1 = "{\"this\":"
+  if isStatic:
+    out1.add "null"
+  else:
+    let self = cast[Il2CppPtr](cRegsInt(regs, 0'i32))
+    var selfType = "System.Object"
+    let sc = objectClass(rt, self)
+    if sc != nil:
+      selfType = fullName(rt, sc)
+    out1.add referenceHandle(rt, self, selfType, handles, isObject, gcHandles)
+  out1.add ",\"args\":["
+
   var i = 0
   while i < declared:
     let pos = (if isStatic: i else: i + 1)
@@ -444,23 +532,38 @@ proc describeArgs*(rt: Il2Cpp; m: Il2CppMethod; regs: Il2CppPtr;
       else:
         out1.add "\"" & escapeForJson(readString(rt, p)) & "\""
     else:
-      # A reference argument. Registered as a handle so the patch can call
-      # methods on the very object the game was about to act on -- which is the
-      # whole reason to want the arguments at all.
-      let p = cast[Il2CppPtr](cRegsInt(regs, int32(pos)))
-      if p == nil:
-        out1.add "null"
-      else:
-        let gc = gcHandleNew(rt, p, false)
-        if gc == 0'u32:
-          out1.add "{\"type\":\"" & t & "\"}"
+      # Everything else is asked about rather than assumed. What used to be
+      # here treated any unrecognised type as a reference and made a GC handle
+      # out of whatever the register held, which for an enum parameter means
+      # handing the collector the number 2 as an object.
+      var bytes = 0
+      case shapeOfType(rt, methodParam(rt, m, i), bytes)
+      of asValueSmall:
+        # An enum or a small value type: the register holds the value itself.
+        # Reported the same way an integer parameter is, because that is what
+        # it is -- an enum is its underlying integer once compiled.
+        if bytes <= 4:
+          out1.add $int(int32(cRegsInt(regs, int32(pos)) and 0xFFFFFFFF'u64))
         else:
-          handles.add cast[Il2CppPtr](0)
-          isObject.add true
-          gcHandles.add gc
-          out1.add "{\"handle\":" & $handles.len & ",\"type\":\"" & t & "\"}"
+          out1.add $int64(cRegsInt(regs, int32(pos)))
+      of asValueBig:
+        # Larger than a register, so it arrived by hidden reference and the
+        # register holds a pointer to a copy whose layout this cannot read.
+        # Named and refused rather than invented.
+        out1.add "{\"valueType\":\"" & t & "\"}"
+      of asReference:
+        # A reference argument. Registered as a handle so the patch can call
+        # methods on the very object the game was about to act on -- which is
+        # the whole reason to want the arguments at all.
+        out1.add referenceHandle(rt,
+                                 cast[Il2CppPtr](cRegsInt(regs, int32(pos))),
+                                 t, handles, isObject, gcHandles)
+      of asUnknown:
+        # The runtime would not name a class for it. Saying so is much better
+        # than guessing that it is an object: the guess is a crash.
+        out1.add "{\"type\":\"" & t & "\"}"
     inc i
-  out1.add "]"
+  out1.add "]}"
   result = out1
 
 proc thisOf*(rt: Il2Cpp; m: Il2CppMethod; regs: Il2CppPtr): Il2CppPtr =
@@ -551,20 +654,26 @@ proc readField*(rt: Il2Cpp; cls: Il2CppClass; obj: Il2CppObject;
     let sp = cCellGetPtr(cell)
     out1 = (if sp == nil: "null" else: "\"" & readString(rt, sp) & "\"")
   else:
-    # A reference field: the same handle treatment a reference return gets, so
-    # walking a field chain works exactly like walking a property chain.
-    let p = cCellGetPtr(cell)
-    if p == nil:
-      out1 = "null"
-    else:
-      let gc = gcHandleNew(rt, p, false)
-      if gc == 0'u32:
-        out1 = "{\"type\":\"" & t & "\"}"
-      else:
-        handles.add cast[Il2CppPtr](0)
-        isObject.add true
-        gcHandles.add gc
-        out1 = "{\"handle\":" & $handles.len & ",\"type\":\"" & t & "\"}"
+    # Same classification the arguments get, and for the same reason: an enum
+    # field read as a reference hands the collector its integer value. The
+    # names this branch sees are the ones the tests above did not match, which
+    # is every enum in the game.
+    var bytes = 0
+    case shapeOfType(rt, fieldType(rt, f), bytes)
+    of asValueSmall:
+      out1 = (if bytes <= 4: $int(cReadI32(cell)) else: $cReadI64(cell))
+    of asValueBig:
+      # A struct field larger than the cell. `il2cpp_field_get_value` copied
+      # it into a buffer whose layout this cannot read without the field's own
+      # type walked out, so it is named and refused.
+      out1 = "{\"valueType\":\"" & t & "\"}"
+    of asReference:
+      # A reference field: the same handle treatment a reference return gets,
+      # so walking a field chain works exactly like walking a property chain.
+      out1 = referenceHandle(rt, cCellGetPtr(cell), t, handles, isObject,
+                             gcHandles)
+    of asUnknown:
+      out1 = "{\"type\":\"" & t & "\"}"
   cCellFree(cell)
   result = out1
 

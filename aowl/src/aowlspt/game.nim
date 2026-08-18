@@ -507,9 +507,33 @@ proc hookArgs*(target: string; handler: ArgHookHandler): Status =
   ##
   ## This is the full Harmony prefix: read what the method was called with, and
   ## return `stopWith(...)` to keep it from running at all. The cost over `hook`
-  ## is one JSON array built per call, which is why it is a separate function
+  ## is one JSON payload built per call, which is why it is a separate function
   ## rather than the default -- a hook on a method the game calls every frame
   ## for every bot should be a `hook`.
+  ##
+  ## **What the handler is given.** An object, not an array:
+  ##
+  ##     {"this":{"handle":3,"type":"EFT.Player"},"args":[1,2.5]}
+  ##     {"this":null,"args":[]}                     -- a static method
+  ##
+  ## `this` is Harmony's `__instance`, and it is separate from `args` on
+  ## purpose: it is not a declared parameter, and folding it into the array
+  ## would make every argument index depend on whether the method happens to be
+  ## static -- a difference that shows up as reading the wrong argument, far
+  ## from the hook. A static method's `this` is `null` rather than missing, so
+  ## "there is no instance" cannot be read as "the host did not say".
+  ##
+  ## `this` and any reference argument arrive as handles, and they are valid
+  ## **only until the handler returns**. The host frees them at that point: a
+  ## handler on a per-frame method would otherwise pin one object per call, and
+  ## a contract that depends on a mod remembering to release on that path is a
+  ## leak with extra steps. Read what you need inside the handler; do not store
+  ## the handle.
+  ##
+  ## An `enum` argument arrives as its integer, and a value type too large for
+  ## a register arrives as `{"valueType":"..."}` -- named and refused, because
+  ## it is passed by hidden pointer and there is nothing in the register to
+  ## report. A type the runtime cannot classify is `{"type":"..."}`.
   ##
   ## Arguments past the fourth arrive on the stack and are not reported. They
   ## are omitted rather than guessed at.

@@ -722,6 +722,15 @@ done:
  * a real parser, and that is what the panel route is. Nothing else consumes it,
  * so it can stay exactly the shape sixty lines of C can read.
  *
+ * The alternative the earlier version of this comment proposed -- parse it in
+ * nimony with `aowl/src/aowlspt/json.nim` and push rows in through
+ * `aowl_ov_set_mod` -- was weighed and not taken. That parser would have to run
+ * in the *client* host, which has no HTTP client of its own and no poll loop; it
+ * would mean a second worker thread in nimony beside the one here, `aowlspt_net`
+ * pulled into a DLL that is injected mid-startup, and all of it in a file this
+ * directory does not own. Reconciling the schema on the server cost the manager
+ * one route and this reader eight lines.
+ *
  * Still tolerant of everything it can afford to be: a field it does not find is
  * left at whatever the host already told us, `"live":null` reads as "no change",
  * and an unrecognised body degrades to the host's own list rather than to an
@@ -1342,7 +1351,15 @@ static void aowl_ov_build(void) {
         aowl_ov_rect(bx, by, (float)AOWL_OV_BTN_W, bh,
                      hot ? AOWL_OV_HOT : (m->enabled ? AOWL_OV_ON : AOWL_OV_OFF));
         aowl_ov_frame_rect(bx, by, (float)AOWL_OV_BTN_W, bh, 1.0f, AOWL_OV_EDGE);
-        const char* label = m->pending ? (m->enabled ? " ON *" : " OFF*")
+        /* Three states in four characters, and each one means one thing.
+         *   ` ON ` / ` OFF`  what the manager resolves this mod to
+         *   `~`              clicked; the server has not answered yet
+         *   `*`              the manager says it only changes on a restart
+         * `~` wins the slot while both are true: an outstanding request is the
+         * more recent fact, and the `*` comes back one poll later if the answer
+         * was a deferral. */
+        const char* label = m->pending ? (m->enabled ? " ON ~" : " OFF~")
+                          : m->restart ? (m->enabled ? " ON *" : " OFF*")
                                        : (m->enabled ? " ON " : " OFF");
         aowl_ov_text(bx + 6.0f, by + 1.0f, label, AOWL_OV_TEXT);
 
@@ -1367,8 +1384,13 @@ static void aowl_ov_build(void) {
         ry += AOWL_OV_ROW_H;
     }
 
+    /* Both markers explained, because a `*` with no legend is a rumour. And it
+     * is deliberately no longer the unconditional "applies on restart": that was
+     * true while the panel had nothing to ask, and it is exactly the claim this
+     * change exists to stop making. */
     aowl_ov_text(x + AOWL_OV_PAD, ry + 6.0f,
-                 "* applies on restart", AOWL_OV_DIM);
+                 "~ waiting on the server   * needs a restart   dim = not loaded",
+                 AOWL_OV_DIM);
 
     /* Our own cursor. The game hides the OS cursor in a raid and keeps its own
      * ShowCursor count; calling ShowCursor here would fight that counter and

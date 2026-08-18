@@ -289,7 +289,14 @@ proc tickBot(index: int): bool =
   ## One bot's whole decision, start to finish. False when the bot has died and
   ## should be dropped from the table.
   var st = gBots[index]
-  let dt = gTimeSeconds - st.lastDecisionAt
+  # How long since this bot last thought, which is what perception integrates
+  # over. Clamped at both ends: the first tick after a spawn would otherwise
+  # hand `observe` the whole raid so far as one step of accumulated contact,
+  # and a bot that was out of budget for a second should not have a second's
+  # worth of threat decay applied in one go either.
+  var dt = gTimeSeconds - st.lastDecisionAt
+  if dt < 0.016: dt = 0.016
+  if dt > 1.0: dt = 1.0
 
   # This frame's pointers. One `gc_handle_get_target` plus two bound property
   # calls; every read below runs off them with no further indirection.
@@ -307,7 +314,7 @@ proc tickBot(index: int): bool =
     let obs = observeEnemy(st.handle, l, gTimeSeconds)
     if obs.id.len > 0:
       observe(st.enemies, obs, me.position, me.lookDirection, st.settings,
-              gTimeSeconds, (if dt > 0.0: dt else: 0.1))
+              gTimeSeconds, dt)
 
   # `forget` is cheap and compacting, and running it here rather than on its own
   # timer means a bot never scans entries it has already stopped believing in.

@@ -183,8 +183,16 @@ proc main(): int =
   if dryRun():
     heading "Dry run"
     let be = joinPath(root, "aowlspt\\aowlspt-backend.exe")
-    if not o.noBackend and fileExists(be):
+    if o.noBackend:
+      line "  would start   no backend (--no-backend was given)"
+    elif fileExists(be):
       line "  would start   " & be & " --port " & $o.port
+    else:
+      # Said rather than left out. A dry run that silently omits the backend
+      # line reads as "the backend is not part of this", when what it means is
+      # "there is no backend in this install" -- and the real launch would go
+      # on to start a client with nothing to talk to.
+      warn "  no backend at " & be & "; the client would start alone"
     line "  would start   " & exePath
     line "  would inject  " & hostDll
     line "  nothing was started."
@@ -212,7 +220,7 @@ proc main(): int =
       cSleepMs(1200'i32)
       if cSpawnAlive(backendProc) == 0'i32:
         err "the backend exited immediately; see " &
-            joinPath(root, "aowlspt\aowlspt-backend.log")
+            joinPath(root, "aowlspt\\aowlspt-backend.log")
         return 1
       ok "backend still up"
 

@@ -1,0 +1,13 @@
+{
+  "//registryPath": "Full path to a checkout's mods.json. Empty means: look in this mod's data/ directory, then in registry/ beside the mods folder, then one and two directories above that. Set it when the registry is cloned somewhere else.",
+  "registryPath": "",
+
+  "//activeLists": "The lists that are active on a fresh install, in order. A later list overrides an earlier one for the same mod. Once you change the selection through /aowlspt/mods/select this value is not consulted again -- your choice lives in the mod's own store, not in this file.",
+  "activeLists": ["aowl.list.core"],
+
+  "//controlProbeMs": "How long to wait for a host to answer the live-control probe before concluding there is none. Silence has to become an answer on a timer, or the reply would depend on whether the manager loaded before the host finished wiring its subscriptions.",
+  "controlProbeMs": 750,
+
+  "//writeSelectionFile": "Write the resolved load order to aowlspt-selection.json beside the mods. Inert until a host reads it at startup; harmless either way, and it is what makes 'takes effect on restart' true rather than aspirational.",
+  "writeSelectionFile": true
+}

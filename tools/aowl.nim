@@ -35,6 +35,7 @@ aowl -- build, test and install aowlspt
   build-hosts        the .NET hosts and aowlspt-sim
   build-installer    aowlspt-install.exe
   test               every gate
+  doctor             check the toolchain before it wastes your afternoon
   run PATH           build a mod and run it in the simulator
   payload            assemble installer/payload from what is built
   clean              remove build output
@@ -535,6 +536,73 @@ proc cmdBuild(e: Env): int =
     discard buildMod(e, m)
   result = if failures > 0: 1 else: 0
 
+proc report(what: string; ok1: bool; detail: string; problems: var int) =
+  ## A free proc with the counter passed in, rather than a nested one closing
+  ## over it: nimony will not let a nested proc touch its enclosing scope's
+  ## variables without being made a closure.
+  if ok1:
+    ok what
+  else:
+    err what & ": " & detail
+    inc problems
+
+proc cmdDoctor(e: Env): int =
+  ## Checks the toolchain before it can waste anyone's afternoon.
+  ##
+  ## Every item here is something that has actually gone wrong and cost real
+  ## time, and each failed in a way that pointed somewhere else: a build that
+  ## dies with no diagnostic, a link that cannot find a symbol in the file it is
+  ## reading, a mod that talks to a struct two fields shorter than it thinks.
+  ## A check that has never caught anything does not belong in this list.
+  heading "Toolchain"
+  var problems = 0
+  let nimony = nimonyExe(e)
+  report("nimony", fileExists(nimony), "not at " & nimony, problems)
+
+  let ucrt = joinPath(e.ucrt64, "gcc.exe")
+  report("ucrt64 gcc", fileExists(ucrt), "not at " & ucrt, problems)
+
+  # The ordering trap. gcc finds cc1 and its libraries relative to PATH, so a
+  # Git-for-Windows mingw64 ahead of ucrt64 gives a cc1 that loads the wrong
+  # libgcc and dies with **no message at all** -- the build simply stops.
+  let pathVar = getEnv("PATH", "")
+  var ucrtAt = find(toLowerAscii(pathVar), toLowerAscii(e.ucrt64))
+  var gitAt = find(toLowerAscii(pathVar), "git" & chr(92) & "mingw64")
+  if gitAt < 0:
+    gitAt = find(toLowerAscii(pathVar), "git/mingw64")
+  if gitAt >= 0 and (ucrtAt < 0 or ucrtAt > gitAt):
+    err "PATH has Git's mingw64 ahead of ucrt64"
+    note "gcc then loads the wrong cc1 and dies with no diagnostic at all"
+    inc problems
+  else:
+    ok "PATH order (ucrt64 before any Git mingw64)"
+
+  let lld = joinPath(e.ucrt64, "ld.lld.exe")
+  report("lld", fileExists(lld),
+         "nimony passes -fuse-ld=lld on Windows and the link will fail without it",
+         problems)
+
+  report("the ABI headers", isDirectory(joinPath(e.repo, "abi")),
+         "no abi/ directory under " & e.repo, problems)
+
+  # The stale-cache trap, checked rather than assumed: if the recorded header
+  # fingerprint does not match the headers, the next build would link against
+  # the old ones. `dropStaleCaches` fixes it -- this says so before it bites.
+  let stampPath = joinPath(joinPath(e.repo, "installer"), "build\\.abistamp")
+  var was = ""
+  discard readTextFile(stampPath, was)
+  if was.len > 0 and was != abiStamp(e):
+    warn "the C headers changed since the last build; caches will be dropped"
+  else:
+    ok "build caches match the headers"
+
+  heading "Result"
+  if problems > 0:
+    err $problems & " problem(s)"
+    return 1
+  ok "the toolchain is fit to build with"
+  result = 0
+
 proc cmdTest(e: Env): int =
   dropStaleCaches(e)
   heading "ABI layout (C)"
@@ -934,6 +1002,7 @@ proc main(): int =
   of "build-hosts": result = if buildHosts(e): 0 else: 1
   of "build-installer": result = if buildInstaller(e): 0 else: 1
   of "test": result = cmdTest(e)
+  of "doctor": result = cmdDoctor(e)
   of "run":
     if arg.len == 0:
       fatal "run needs a path"

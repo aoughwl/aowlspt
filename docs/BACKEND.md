@@ -67,13 +67,29 @@ exportMod(guid = "you.mod", name = "Mod", author = "you", version = "1.0.0",
 | `servePrefix(prefix, handler)` | prefix route; `pathAfter(url, prefix)` for the rest |
 | `dbRead(path)` | `.asText()`, `.asFloat()`, `.asInt()` |
 | `dbWrite(path, patch)` | **merges** into the object at `path`, creating it if it is not there |
-| `setting(key)` | this mod's `config.json` |
+| `setting(key)` | this mod's `config.json` — `.asText()`, `.asInt()`, `.asFloat()`, `.asBool()` |
 | `obj()` / `put` / `arr()` / `done` | JSON, with escaping you cannot forget |
 | `envelope(data)` | the client's `{"err":0,...}` wrapper — not optional |
 | `save(key, value)` / `load(key)` / `savedKeys(prefix)` | this mod's own persistent store |
 | `broadcast(name, payload)` / `onEvent(name, handler)` | between mods, delivered synchronously |
-| `afterMs(delay, handler)` | run something later, off the request thread |
+| `afterMs(delay, handler)` / `everyMs(interval, handler)` | run something later, or repeatedly, off the request threads |
 | `field(body, "a.b[0].c")` | reading a request body — `aowlspt/json` |
+
+`everyMs` re-arms *after* the handler returns, not on a fixed schedule, so a
+sweep that takes longer than its interval falls behind rather than overlapping
+itself. That is what a periodic sweep — expiring flea offers, posting insurance
+returns — wants, and it is the only version a handler that assumes it runs alone
+can survive.
+
+**`setting(...).asText()` strips the quotes, on every host.** It did not, and
+the hosts disagreed: the backend and the client host strip them on the way out,
+the C# simulator hands back the raw JSON literal. So `setting("edition")` was
+`standard` on a server and `"standard"` in the simulator — an empty string
+setting had length two, and a value used to build a database path addressed
+nothing on one side while working on the other. Two mods had grown their own
+private unquoting helper by the time it was noticed, which is the shape of a
+missing library function. Stripping in `ConfigValue.asText` rather than in each
+host is what makes it true everywhere, including on a host written later.
 
 ## The wire protocol
 
@@ -154,6 +170,7 @@ ok    status route
 ok    body survives the round trip
 ok    prefix route reads the database
 ok    unknown routes 404
+ok    a mod can create a database path that was not there
 ok    an uncompressed body is accepted too
 ok    a malformed session id is refused
 ```

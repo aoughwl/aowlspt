@@ -1,0 +1,98 @@
+{
+ "ok": true,
+ "schema": "aowlspt.panel/1",
+ "side": "server",
+ "control": "unknown",
+ "liveKnown": false,
+ "summary": "1 of 8 registry mods resolve on the server side",
+ "mods": [
+  {
+   "guid": "aowl.tarkov",
+   "id": "aowl.tarkov",
+   "name": "Tarkov Emulator",
+   "version": "0.1.0",
+   "enabled": true,
+   "live": null,
+   "restart": false,
+   "verdict": "loaded",
+   "reason": "enabled by aowl.list.core"
+  },
+  {
+   "guid": "aowl.morebots",
+   "id": "aowl.morebots",
+   "name": "MoreBots",
+   "version": "1.0.0",
+   "enabled": false,
+   "live": null,
+   "restart": false,
+   "verdict": "disabled",
+   "reason": "you turned it off"
+  },
+  {
+   "guid": "aowl.blackdivision",
+   "id": "aowl.blackdivision",
+   "name": "Black Division",
+   "version": "1.2.3",
+   "enabled": false,
+   "live": null,
+   "restart": false,
+   "verdict": "not-selected",
+   "reason": "no active list mentions it"
+  },
+  {
+   "guid": "aowl.sain",
+   "id": "aowl.sain",
+   "name": "SAIN",
+   "version": "0.1.0",
+   "enabled": false,
+   "live": null,
+   "restart": false,
+   "verdict": "not-selected",
+   "reason": "no active list mentions it"
+  },
+  {
+   "guid": "aowl.icebreaker",
+   "id": "aowl.icebreaker",
+   "name": "Icebreaker",
+   "version": "1.0.0",
+   "enabled": false,
+   "live": null,
+   "restart": false,
+   "verdict": "not-selected",
+   "reason": "no active list mentions it"
+  },
+  {
+   "guid": "aowl.classicmovement",
+   "id": "aowl.classicmovement",
+   "name": "Classic Movement",
+   "version": "1.2.0",
+   "enabled": false,
+   "live": null,
+   "restart": false,
+   "verdict": "not-selected",
+   "reason": "no active list mentions it"
+  },
+  {
+   "guid": "aowl.fovfix",
+   "id": "aowl.fovfix",
+   "name": "FOV Fix",
+   "version": "4.0.2",
+   "enabled": false,
+   "live": null,
+   "restart": false,
+   "verdict": "not-selected",
+   "reason": "no active list mentions it"
+  },
+  {
+   "guid": "com.savannt.sptsway",
+   "id": "com.savannt.sptsway",
+   "name": "SPT-SWAY",
+   "version": "3.0.0",
+   "enabled": false,
+   "live": null,
+   "restart": false,
+   "verdict": "not-selected",
+   "reason": "no active list mentions it"
+  }
+ ]
+}

@@ -801,9 +801,17 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     return 0'i32
 
   var argsText = ""
+  # Where the handle table stood before the arguments were described, so the
+  # handles describing them can be given back afterwards. Every reference
+  # argument costs a GC handle, and a handler that forgot to release one would
+  # pin one object per call -- on a method the game runs per frame per bot,
+  # that is a leak measured in objects per second. Expecting a mod to remember
+  # on that path is not a contract, it is a trap.
+  let handleMark = gHandles.len
   if gPatches[i].wantArgs and gPatches[i].meth != nil:
     argsText = describeArgs(gRt, gPatches[i].meth, regs,
                             gHandles, gHandleIsObject, gHandleGc)
+  let handleTop = gHandles.len
 
   var outPtr: Il2CppPtr = cast[Il2CppPtr](0)
   var outLen = 0'i32
@@ -822,6 +830,27 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     replacement = readBytes(outPtr, outLen)
   if outPtr != nil:
     cFreeBuf(outPtr)
+
+  # The handler has returned, so `this` and every reference argument it was
+  # given stop being valid here. Freeing the GC handles is what keeps a
+  # per-frame hook from pinning the world.
+  #
+  # The table is only shortened when nothing else was added to it while the
+  # handler ran: a handler that called `resolve` or a method returning an
+  # object got handles of its own with higher indices, and those are the
+  # handler's to keep. In that case the slots are emptied in place instead, so
+  # nothing is freed twice and no live handle is renumbered.
+  if handleTop > handleMark:
+    for k in handleMark ..< handleTop:
+      if gHandleIsObject[k] and gHandleGc[k] != 0'u32:
+        gcHandleFree(gRt, gHandleGc[k])
+      gHandleGc[k] = 0'u32
+      gHandles[k] = cast[Il2CppPtr](0)
+      gHandleIsObject[k] = false
+    if gHandles.len == handleTop:
+      shrink(gHandles, handleMark)
+      shrink(gHandleIsObject, handleMark)
+      shrink(gHandleGc, handleMark)
 
   if st != PatchSkipStatus:
     return 0'i32
@@ -856,6 +885,32 @@ proc hostPatch(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
     return ErrBadArg
   if not gReady:
     gLastError = "the IL2CPP runtime is not up yet"
+    return ErrUnsupported
+
+  # `kind` low bits are the patch kind. Only a prefix can be honoured by an
+  # entry detour, and saying so is the point of this check.
+  #
+  # A postfix has to see the value the original produced, which means regaining
+  # control *after* it runs. This engine's thunk tail-jumps into the
+  # trampoline -- that is what makes the original's return value, its stack
+  # arguments and its return address correct by construction rather than by
+  # luck -- and a tail jump never comes back. Wrapping the return would mean
+  # pushing a synthetic return address and a per-signature epilogue that knows
+  # whether the value is in RAX or XMM0, which is a different piece of work in
+  # a file this host does not own.
+  #
+  # So it is refused rather than silently downgraded. A postfix that behaves
+  # like a prefix does not merely do less: a mod scaling a getter's result
+  # would multiply a value the original had not produced yet, and the number it
+  # wrote would be wrong rather than absent.
+  if (kind and 0x0F'i32) == 1'i32:
+    gLastError = "a postfix patch is not available on this host: the detour " &
+                 "runs before the method and tail-jumps into it, so there is " &
+                 "no point at which it sees the return value. Use a prefix " &
+                 "that suppresses and returns its own result instead."
+    return ErrUnsupported
+  if (kind and 0x0F'i32) != 0'i32:
+    gLastError = "unsupported patch kind " & $int(kind and 0x0F'i32)
     return ErrUnsupported
 
   let sep = find(spec, "::")

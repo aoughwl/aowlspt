@@ -336,8 +336,10 @@ proc readSelf*(b: BotHandle; l: BotLive): SelfView =
   if not l.ok:
     return
 
-  # --- position and facing. Two reflective calls, and the only two managed
-  # allocations this mod makes per bot per tick: a Vector3 return is boxed.
+  # --- position and facing. Two reflective calls, and two of the three managed
+  # allocations this mod makes per bot per tick: a Vector3 return is boxed, and
+  # so is the health struct below. Everything else on this path allocates
+  # nothing at all.
   result.position = readVec(gB.pPosition, l.player)
   result.lookDirection = readVec(gB.pLookDir, l.player)
 

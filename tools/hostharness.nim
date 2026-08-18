@@ -234,6 +234,31 @@ proc checkLog(logPath: string; expectRuntime: bool = false;
     err "the host never bound the runtime"
     return 1
   ok "the host bound the runtime and attached a thread"
+
+  # The main-thread handoff. This is the one assertion that cannot be made from
+  # the log alone: the host says which thread ran a callback that was queued
+  # from a different one, and only the runtime knows which thread its frame
+  # loop is. They have to be the same number.
+  # Skipped when the runtime has no frame loop -- an older stand-in, or the
+  # injected run, where there is nothing to compare against and a claim would
+  # be worth nothing.
+  if frameThread > 0:
+    if not drainBound:
+      err "the host bound no per-frame method, so invoke_main is still on " &
+          "its own thread"
+      return 1
+    ok "the host detoured " & drainMethod & " to drain on the game's thread"
+    if selfTestThread < 0:
+      err "the callback queued from the host thread never ran"
+      return 1
+    if selfTestThread != frameThread:
+      err "a callback queued from the host thread ran on thread " &
+          $selfTestThread & ", but the per-frame method runs on " &
+          $frameThread
+      return 1
+    ok "a callback queued from another thread ran on thread " & $frameThread &
+       " -- the same thread the drain hook fires on"
+
   if resolved < 3:
     err "only " & $resolved & " types resolved; expected at least 3"
     return 1
@@ -259,26 +284,6 @@ proc checkLog(logPath: string; expectRuntime: bool = false;
     return 1
   ok "a field was read by declared type and agreed with its property"
 
-  # The main-thread handoff. This is the one assertion that cannot be made from
-  # the log alone: the host says which thread ran a callback that was queued
-  # from a different one, and only the runtime knows which thread its frame
-  # loop is. They have to be the same number.
-  if frameThread <= 0:
-    return 0
-  if not drainBound:
-    err "the host bound no per-frame method, so invoke_main is still on its " &
-        "own thread"
-    return 1
-  ok "the host detoured " & drainMethod & " to drain on the game's thread"
-  if selfTestThread < 0:
-    err "the queued callback never ran"
-    return 1
-  if selfTestThread != frameThread:
-    err "a callback queued from the host thread ran on thread " &
-        $selfTestThread & ", but the per-frame method runs on " & $frameThread
-    return 1
-  ok "a callback queued from another thread ran on thread " & $frameThread &
-     " -- the same thread the drain hook fires on"
   result = 0
 
 proc runInjection(hostDll, logPath, target: string; seconds: int): int =

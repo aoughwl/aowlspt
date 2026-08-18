@@ -517,16 +517,142 @@ static MockClass g_frameClass = {
     g_frameMethods, 1, NULL, 0
 };
 
+/* ------------------------------------------------------------------ *
+ * A movement context, an enum, and an instance  (added for `this` and for
+ * value-type arguments)
+ *
+ * Two holes in the host were found against real mods and neither could be
+ * reproduced here, because nothing in this universe had the shape:
+ *
+ *   A patched **instance** method's `this` was dropped. Every compiled method
+ *   above that a test detours is static, so the omission was invisible.
+ *   `SetTilt` is an instance method with one float argument: a handler that
+ *   is not told `this` cannot say which context was tilted, which is exactly
+ *   the failure two mods hit.
+ *
+ *   An **enum** argument was treated as a reference, and the host made a GC
+ *   handle out of the integer. `ApplyCondition` takes one. `EPhysicalCondition`
+ *   is a value type here, as it is in the game, so the host's classification
+ *   path runs against a runtime that answers rather than against a name it
+ *   happens to recognise.
+ *
+ * The private field is `_player`, spelled the way the game spells one, because
+ * reaching a private field is most of what reflection is for here.
+ * ------------------------------------------------------------------ */
+
+static MockClass g_conditionClass;
+static MockClass g_moveContextClass;
+
+/* Laid out to match `g_contextFields` exactly. */
+typedef struct MockMoveContext {
+    MockClass*  klass;      /* 0  */
+    MockPlayer* player;     /* 8  */
+    float       tilt;       /* 16 */
+    int32_t     condition;  /* 20 */
+} MockMoveContext;
+
+static MockMoveContext* g_theContext = NULL;
+
+static MockMoveContext* mock_context(void) {
+    if (!g_theContext) {
+        g_theContext = (MockMoveContext*)calloc(1, sizeof(MockMoveContext));
+        g_theContext->klass = &g_moveContextClass;
+        g_theContext->player = mock_player();
+        g_theContext->tilt = 0.0f;
+        g_theContext->condition = 0;
+    }
+    return g_theContext;
+}
+
+/* EFT.MovementContext::SetTilt(System.Single), instance and compiled.
+ *
+ * No null check, for the reason `mock_native_hurt` gives: a conditional branch
+ * inside the first fourteen bytes is a relative branch the detour engine
+ * correctly refuses to relocate, and a stand-in for a real method has to have
+ * a real prologue. */
+static void mock_native_set_tilt(void* thisPtr, float tilt, void* methodInfo) {
+    (void)methodInfo;
+    MockMoveContext* c = (MockMoveContext*)thisPtr;
+    c->tilt = tilt * 2.0f;
+}
+
+/* EFT.MovementContext::ApplyCondition(EFT.EPhysicalCondition), instance and
+ * compiled. The enum arrives in EDX as a plain integer -- there is no object
+ * anywhere in this call -- which is what makes it the regression test. */
+static void mock_native_apply_condition(void* thisPtr, int32_t condition,
+                                        void* methodInfo) {
+    (void)methodInfo;
+    MockMoveContext* c = (MockMoveContext*)thisPtr;
+    c->condition = c->condition + condition;
+}
+
+static MockMethod* g_setTiltMethod = NULL;
+static MockMethod* g_applyConditionMethod = NULL;
+
+typedef void (*FnSetTilt)(void*, float, void*);
+typedef void (*FnApplyCondition)(void*, int32_t, void*);
+
+static void* m_contextSetTilt(void* obj, void** params) {
+    FnSetTilt fn = (FnSetTilt)g_setTiltMethod->methodPointer;
+    fn(obj, *(float*)params[0], NULL);
+    return NULL;
+}
+static void* m_contextApplyCondition(void* obj, void** params) {
+    FnApplyCondition fn = (FnApplyCondition)g_applyConditionMethod->methodPointer;
+    fn(obj, *(int32_t*)params[0], NULL);
+    return NULL;
+}
+/* EFT.MovementContext::get_Instance() -> EFT.MovementContext (static) */
+static void* m_contextInstance(void* obj, void** params) {
+    (void)obj; (void)params;
+    return mock_context();
+}
+
+static MockMethod g_contextMethods[] = {
+    { NULL, "get_Instance", 0, {0,0,0,0}, "EFT.MovementContext",
+      m_contextInstance, NULL, 1, NULL },
+    { NULL, "SetTilt", 1, {"System.Single",0,0,0}, "System.Void",
+      m_contextSetTilt, NULL, 0, (void*)mock_native_set_tilt },
+    { NULL, "ApplyCondition", 1, {"EFT.EPhysicalCondition",0,0,0},
+      "System.Void", m_contextApplyCondition, NULL, 0,
+      (void*)mock_native_apply_condition },
+};
+
+static MockField g_contextFields[] = {
+    { "_player", 8,  "EFT.Player"   },
+    { "Tilt",    16, "System.Single" },
+    { "Condition", 20, "EFT.EPhysicalCondition" },
+};
+
+/* A value type, and marked as one -- which is the whole point of it being
+ * here. `instanceSize` is the payload rather than the boxed form, matching
+ * every other value type in this file; the host subtracts an object header
+ * only when the number it is given is larger than one. */
+static MockClass g_conditionClass = {
+    "EFT", "EPhysicalCondition", &g_objectClass, 4, 1, NULL, 0, NULL, 0
+};
+static MockClass g_moveContextClass = {
+    "EFT", "MovementContext", &g_objectClass, 32, 0,
+    g_contextMethods, 3, g_contextFields, 3
+};
+
+MOCK_EXPORT float mock_context_tilt(void) { return mock_context()->tilt; }
+MOCK_EXPORT int32_t mock_context_condition(void) {
+    return mock_context()->condition;
+}
+
 static MockClass* g_corlibClasses[] = {
     &g_objectClass, &g_stringClass, &g_int32Class,
     &g_singleClass, &g_boolClass, &g_voidClass
 };
 static MockClass* g_unityClasses[] = { &g_appClass, &g_frameClass };
-static MockClass* g_eftClasses[]   = { &g_playerClass, &g_gameWorldClass };
+static MockClass* g_eftClasses[]   = { &g_playerClass, &g_gameWorldClass,
+                                       &g_moveContextClass,
+                                       &g_conditionClass };
 
 static MockImage g_corlibImage = { "mscorlib.dll",       g_corlibClasses, 6 };
 static MockImage g_unityImage  = { "UnityEngine.dll",    g_unityClasses,  2 };
-static MockImage g_eftImage    = { "Assembly-CSharp.dll",g_eftClasses,    2 };
+static MockImage g_eftImage    = { "Assembly-CSharp.dll",g_eftClasses,    4 };
 
 static MockAssembly g_assemblies[] = {
     { &g_corlibImage }, { &g_unityImage }, { &g_eftImage }
@@ -606,6 +732,11 @@ static DWORD WINAPI mock_frame_loop(LPVOID arg) {
 static void mock_frame_start(void) {
     if (g_frameThreadId != 0) return;
     g_frameMethod = mock_find(&g_frameClass, "PerformUpdate");
+    /* Bound here for the same reason: an invoker reads `methodPointer` back
+     * out of the table at call time so that a detour installed later is on the
+     * path it takes, and this is the first point where the table is complete. */
+    g_setTiltMethod = mock_find(&g_moveContextClass, "SetTilt");
+    g_applyConditionMethod = mock_find(&g_moveContextClass, "ApplyCondition");
     HANDLE h = CreateThread(NULL, 0, mock_frame_loop, NULL, 0, &g_frameThreadId);
     if (h) CloseHandle(h);
 }
@@ -617,6 +748,48 @@ MOCK_EXPORT uint32_t mock_frame_thread_id(void) {
     return (uint32_t)g_frameThreadId;
 }
 MOCK_EXPORT int32_t mock_frame_count(void) { return (int32_t)g_frameCount; }
+
+/* `il2cpp_class_from_type`, which this mock needs for a reason worth writing
+ * down: without it the host cannot tell a value type from a reference, and its
+ * fallback -- "anything I do not recognise by name is an object" -- turns an
+ * enum argument into a GC handle over the integer 2.
+ *
+ * Types here are their own name strings (see `il2cpp_method_get_param`), so
+ * this is a lookup by name across the universe. A class pointer is accepted
+ * too, because `il2cpp_class_get_type` returns the class itself, and a caller
+ * that round-trips one through here should get it back rather than have its
+ * bytes read as text.
+ */
+MOCK_EXPORT void* il2cpp_class_from_type(void* type) {
+    if (!type) return NULL;
+    for (int a = 0; a < 3; a++) {
+        MockImage* img = g_assemblies[a].image;
+        for (int c = 0; c < img->classCount; c++)
+            if ((void*)img->classes[c] == type) return type;
+    }
+    const char* want = (const char*)type;
+    for (int a = 0; a < 3; a++) {
+        MockImage* img = g_assemblies[a].image;
+        for (int c = 0; c < img->classCount; c++) {
+            MockClass* k = img->classes[c];
+            char full[256];
+            if (k->ns && k->ns[0]) {
+                size_t nsn = strlen(k->ns);
+                size_t nn = strlen(k->name);
+                if (nsn + nn + 2 > sizeof(full)) continue;
+                memcpy(full, k->ns, nsn);
+                full[nsn] = '.';
+                memcpy(full + nsn + 1, k->name, nn + 1);
+            } else {
+                size_t nn = strlen(k->name);
+                if (nn + 1 > sizeof(full)) continue;
+                memcpy(full, k->name, nn + 1);
+            }
+            if (strcmp(full, want) == 0) return k;
+        }
+    }
+    return NULL;
+}
 
 /* ------------------------------------------------------------------ *
  * The IL2CPP C API

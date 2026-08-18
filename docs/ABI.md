@@ -42,14 +42,20 @@ would *break* the match, not tighten it.
 |---|---|
 | `AowlSlice`, `AowlBuffer` | 16 |
 | `AowlHostInfo` | 120 |
-| `AowlHostApi` | 168 |
+| `AowlHostApi` | 192 |
 | `AowlModInfo` | 104 |
 | `AowlModApi` | 56 |
 
+`AowlHostApi` was 168 at revision 1 and is 192 at revision 2 — three appended
+function pointers, `store_get`/`store_set`/`store_list`, and nothing moved. That
+is rule 4 doing its job: a revision-1 host and a revision-2 mod still agree
+about every field either of them knew about, and the mod finds out about the
+difference from `size`.
+
 `tests/abi_layout.c` computes these with the real compiler over the real header;
-`tests/abi_layout.nim` asserts nimony agrees. Both run in `tools/aowlspt-test.ps1`.
-This is not ceremony — a mismatch here does not crash, it reads a length as a
-pointer, and the failure surfaces somewhere else entirely.
+`tests/abi_layout.nim` asserts nimony agrees. Both are the first two gates of
+`aowl test`. This is not ceremony — a mismatch here does not crash, it reads a
+length as a pointer, and the failure surfaces somewhere else entirely.
 
 One deliberate deviation from the obvious design: `last_error` writes through an
 out-parameter instead of returning an `AowlSlice` by value. A 16-byte struct
@@ -95,11 +101,47 @@ Type lookup accepts simple names as well as fully-qualified ones. That matters
 in practice: SPT moves types between namespaces across releases, and EFT's
 obfuscated types get renamed every patch.
 
+## The per-mod store (revision 2)
+
+`store_get` / `store_set` / `store_list`: a private key/value store per mod, held
+by the host and surviving a restart. `db_get`/`db_patch` address the *shared*
+game database, loaded from disk and common to every mod; this is where a mod
+keeps what belongs to it alone.
+
+A mod could open files itself, and then every mod would invent its own layout
+inside the install and there would be no way for the host to move, back up or
+clear a mod's data. Keys are flat, `[A-Za-z0-9._-]`, and a key outside that set
+is **rejected rather than sanitised**: silently mapping two keys onto one file is
+worse than refusing one of them.
+
+`store_list(prefix)` returns a JSON array of the mod's keys, which is what makes
+"every profile" expressible without the mod knowing where the host put them.
+
+Because these are appended fields, a mod must test `AowlHostApi.size` before
+using them — `storeReady()` in the nimony library — rather than calling through
+a function pointer a revision-1 host never filled in.
+
 ## Patching
 
-`patch(target, kind, handler)` bridges to Harmony. A prefix handler returning
+`patch(target, kind, handler)` bridges to Harmony on the C# hosts and to an x64
+inline detour in the IL2CPP host. A prefix handler returning
 `AOWLSPT_PATCH_SKIP` suppresses the original and may write a replacement result
 into the out-buffer.
+
+`AOWLSPT_PATCH_ARGS` (0x10) is OR'd into `kind` to ask the host for the original
+arguments, which then arrive in the handler's `args` slice as a JSON array in
+the same shape `call` accepts. A **flag** rather than a fourth patch kind,
+because it is orthogonal to prefix and postfix; **opt-in** rather than
+always-on, because building that array inside a method the game may call
+thousands of times a frame is a cost a patch that only counts calls should not
+pay.
+
+Two consequences the header states and the hosts enforce: a patch that did not
+ask for arguments cannot suppress — a mod that believes it is suppressing when
+it is not would be debugging the game instead of its own registration — and a
+suppression is refused unless a return value of the method's declared type can
+actually be produced, because skipping with garbage in the return register is
+the worst outcome available.
 
 Finalizer patches are **not** bridged, and that is a decision rather than an
 omission: a finalizer's whole contract is about the exception in flight, and
@@ -108,19 +150,30 @@ Refusing is more honest than pretending.
 
 One Harmony patch is installed per target method however many mods attach to it;
 a fixed pair of static hooks fans out to the handlers registered for whichever
-method is currently executing.
+method is currently executing. The detour engine's equivalent is a fixed pool of
+16 assembly thunks — one per patched method, claimed at attach — which is why a
+seventeenth patch is refused with a message about slots rather than silently
+sharing one.
 
 ## Threading
 
-`on_update` runs on the host's main thread — the tick thread on the server,
-Unity's frame loop in the client. A mod's own threads reach the game through
-`invoke_main`. In Unity this is not a convenience; touching a GameObject off the
-main thread throws or corrupts.
+`on_update` runs on the host's main thread — whatever that host's main thread
+is. On the C# hosts it is the server's tick thread or Unity's frame loop. On the
+IL2CPP client host it is the host's **own attached thread**, not Unity's frame
+loop, and `invoke_main` queues onto that same thread. That distinction is
+documented rather than papered over: a mod's own threads reach the game through
+`invoke_main`, and in Unity this is not a convenience — touching a GameObject
+off the real main thread throws or corrupts — so a mod that needs the frame loop
+cannot get there through this host yet. See [IL2CPP.md](IL2CPP.md).
 
 A mod that declares `AOWLSPT_MOD_THREAD_SAFE` is promising its callbacks may be
 invoked off the main thread. Most should not.
 
 ## Hot reload
+
+**Implemented by the C# hosts only** — `aowlspt-sim`, the SPT server host and the
+BepInEx client host share `ModHost.Reload`. `aowlspt-backend` and the IL2CPP
+client host do not have it; what they have is unloading, below.
 
 A mod declaring `AOWLSPT_MOD_HOT_RELOADABLE` and implementing
 `state_save`/`state_load` can be swapped for a freshly built copy without
@@ -134,6 +187,28 @@ what makes rebuild-and-reload possible at all.
 
 A mod that does not claim the flag is told to restart rather than being reloaded
 anyway — silently losing state is worse than being told to restart.
+
+## Unloading
+
+`host/common/modhost.nim` — the loader both nimony hosts share — can take one
+mod out while the host keeps running: `on_unload`, then a **teardown**, then
+`FreeLibrary`.
+
+The teardown is the whole of it. Everything the mod registered is a function
+pointer into its library: a route, an event subscription, a timer, a detour. A
+route still in the table after `FreeLibrary` is a call into unmapped memory on
+the next request, which is a crash with no stack worth reading. So the host
+supplies the teardown, it runs *before* the library is freed, and `unloadOne`
+**refuses outright when no teardown has been registered** — a host that cannot
+say what a mod registered cannot safely unload it.
+
+The slot is kept rather than removed from the list. Every context pointer the
+host handed a mod is that index, and compacting the sequence would silently
+repoint them at their neighbours.
+
+Neither host registers a teardown yet, so today it refuses on both. `loadOne`
+takes the same path a cold start takes, deliberately: a mod that loads
+differently when added late is a mod whose bugs only appear one way round.
 
 ## Faults
 
