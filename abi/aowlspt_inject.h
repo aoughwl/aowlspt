@@ -183,6 +183,50 @@ static int32_t aowl_launch_alive(void* handle) {
     return code == STILL_ACTIVE;
 }
 
+/* Starting a companion process — the backend — and leaving it running.
+ *
+ * Separate from `aowl_launch_start` because nothing is injected into it and it
+ * must not be suspended: the client will try to reach it as soon as it starts,
+ * so it has to be up first. */
+static uint64_t aowl_spawn(const char* exePath, const char* workDir,
+                           const char* cmdLine) {
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    char* mutableCmd = NULL;
+
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    ZeroMemory(&pi, sizeof(pi));
+
+    if (cmdLine && cmdLine[0]) {
+        size_t n = strlen(cmdLine);
+        mutableCmd = (char*)calloc(1, n + 1);
+        if (!mutableCmd) return 0;
+        memcpy(mutableCmd, cmdLine, n);
+    }
+
+    BOOL ok = CreateProcessA(exePath, mutableCmd, NULL, NULL, FALSE,
+                             CREATE_NEW_CONSOLE, NULL, workDir, &si, &pi);
+    free(mutableCmd);
+    if (!ok) return 0;
+    CloseHandle(pi.hThread);
+    return (uint64_t)(uintptr_t)pi.hProcess;
+}
+
+static int32_t aowl_spawn_alive(uint64_t handle) {
+    DWORD code = 0;
+    if (!handle) return 0;
+    if (!GetExitCodeProcess((HANDLE)(uintptr_t)handle, &code)) return 0;
+    return code == STILL_ACTIVE;
+}
+
+static void aowl_spawn_kill(uint64_t handle) {
+    if (handle) {
+        TerminateProcess((HANDLE)(uintptr_t)handle, 0);
+        CloseHandle((HANDLE)(uintptr_t)handle);
+    }
+}
+
 static int32_t aowl_launch_wait(void* handle, int32_t ms) {
     AowlLaunch* l = (AowlLaunch*)handle;
     if (!l->process) return 0;

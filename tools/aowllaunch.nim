@@ -19,6 +19,7 @@ import aowlsptinstall/[winfs, log, eft]
 
 {.emit: """#include <stdlib.h>""".}
 {.emit: """#include <string.h>""".}
+{.emit: """#include "aowlspt_shim.h" """.}
 {.emit: """#include "aowlspt_inject.h" """.}
 
 type LaunchPtr = nil pointer
@@ -37,6 +38,11 @@ proc cLaunchError(p: LaunchPtr): uint32 {.importc: "aowl_launch_error", nodecl.}
 proc cLaunchAlive(p: LaunchPtr): int32 {.importc: "aowl_launch_alive", nodecl.}
 proc cLaunchWait(p: LaunchPtr; ms: int32): int32 {.
   importc: "aowl_launch_wait", nodecl.}
+proc cSpawn(exe, workDir, cmdLine: cstring): uint64 {.
+  importc: "aowl_spawn", nodecl.}
+proc cSpawnAlive(h: uint64): int32 {.importc: "aowl_spawn_alive", nodecl.}
+proc cSpawnKill(h: uint64) {.importc: "aowl_spawn_kill", nodecl.}
+proc cSleepMs(ms: int32) {.importc: "aowl_sys_sleep", nodecl.}
 
 const Usage = """
 aowlspt-launch -- start Tarkov with the aowlspt host inside it
@@ -48,6 +54,8 @@ Options
   --exe NAME     executable to start (default: EscapeFromTarkov.exe)
   --args "..."   extra command line for the game
   --wait         stay open until the game exits
+  --no-backend   do not start the backend server
+  --port N       backend port (default 6969)
   --dry-run      report what would happen and start nothing
   --force        launch even if the client looks wrong for this host
   -h, --help     this
@@ -60,11 +68,14 @@ type
     extraArgs: string
     wait: bool
     force: bool
+    noBackend: bool
+    port: int
     help: bool
 
 proc parseArgs(): Options =
   result = Options(root: "", exeName: "EscapeFromTarkov.exe", extraArgs: "",
-                   wait: false, force: false, help: false)
+                   wait: false, force: false, noBackend: false, port: 6969,
+                   help: false)
   var i = 1
   let n = paramCount()
   while i <= n:
@@ -80,6 +91,18 @@ proc parseArgs(): Options =
       if i <= n: result.extraArgs = paramStr(i)
     elif a == "--wait":
       result.wait = true
+    elif a == "--no-backend":
+      result.noBackend = true
+    elif a == "--port":
+      inc i
+      if i <= n:
+        var v = 0
+        var any = false
+        for ch in paramStr(i):
+          if ch >= '0' and ch <= '9':
+            v = v * 10 + (ord(ch) - ord('0'))
+            any = true
+        if any: result.port = v
     elif a == "--dry-run" or a == "-n":
       setDryRun true
     elif a == "--force":
@@ -159,10 +182,39 @@ proc main(): int =
 
   if dryRun():
     heading "Dry run"
+    let be = joinPath(root, "aowlspt\\aowlspt-backend.exe")
+    if not o.noBackend and fileExists(be):
+      line "  would start   " & be & " --port " & $o.port
     line "  would start   " & exePath
     line "  would inject  " & hostDll
     line "  nothing was started."
     return 0
+
+  # The backend goes up first. The client tries to reach it as soon as it
+  # starts, so starting them the other way round is a race the client loses.
+  var backendProc = 0'u64
+  let backendExe = joinPath(root, "aowlspt\\aowlspt-backend.exe")
+  if not o.noBackend:
+    heading "Backend"
+    if not fileExists(backendExe):
+      warn "no backend at " & backendExe & "; starting the client alone"
+    else:
+      var be = backendExe
+      var bd = joinPath(root, "aowlspt")
+      var bc = "\"" & backendExe & "\" --root \"" & bd & "\" --port " & $o.port
+      backendProc = cSpawn(toCString(be), toCString(bd), toCString(bc))
+      if backendProc == 0'u64:
+        err "could not start the backend"
+        return 1
+      ok "backend started on port " & $o.port
+      # A backend that dies immediately (a port already in use, a broken mod)
+      # would otherwise show up as a client that cannot connect.
+      cSleepMs(1200'i32)
+      if cSpawnAlive(backendProc) == 0'i32:
+        err "the backend exited immediately; see " &
+            joinPath(root, "aowlspt\aowlspt-backend.log")
+        return 1
+      ok "backend still up"
 
   heading "Launching"
   let launch = cLaunchNew()
@@ -208,6 +260,9 @@ proc main(): int =
     heading "Waiting"
     discard cLaunchWait(launch, -1'i32)
     line "  the client exited"
+    if backendProc != 0'u64:
+      cSpawnKill(backendProc)
+      line "  backend stopped"
   else:
     # A moment's grace so an immediate crash is reported here rather than
     # leaving the launcher claiming success.
