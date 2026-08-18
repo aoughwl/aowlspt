@@ -109,6 +109,22 @@ proc parentOf(path: string): string =
   if cut == 0: return path.substr(0, 0)
   result = path.substr(0, cut - 1)
 
+proc cfgText(key, default: string): string =
+  ## A config *string*, with its JSON quotes off.
+  ##
+  ## `setting()` hands back the raw token so a caller can tell `"1"` from `1`,
+  ## which means every string setting arrives as `"value"` and an empty one
+  ## arrives as two quote characters — length two, not zero. Read as a path that
+  ## is a directory nobody named; read as an "is it set" test it is always true.
+  ## `mods/fov` carries the identical helper, which is the second copy of a
+  ## workaround that belongs in `aowlspt/server` -- `ConfigValue.asText` should
+  ## unquote a JSON string, and until it does every mod reading a string setting
+  ## has to know this.
+  var raw = setting(key).asText(default)
+  if raw.len >= 2 and raw[0] == '"' and raw[raw.len - 1] == '"':
+    raw = raw.substr(1, raw.len - 2)
+  result = raw
+
 proc registryCandidates(): seq[string] =
   ## Where a checkout of the registry repository plausibly is, most specific
   ## first. Searched rather than hard-coded because the same binary runs from a
@@ -116,7 +132,7 @@ proc registryCandidates(): seq[string] =
   ## trees — and because the registry is a *separate* repository that a player
   ## may have cloned anywhere, which is what `registryPath` in config is for.
   result = @[]
-  let cfg = setting("registryPath").asText("")
+  let cfg = cfgText("registryPath", "")
   if cfg.len > 0:
     result.add cfg
     return                       # an explicit path is not a hint to search past
@@ -147,11 +163,19 @@ proc discoverRegistry() =
     gRegistry = parseRegistry(text, path)
     return
   gRegistryPath = ""
+  # The paths are in the message, not just "not found". Which directories were
+  # searched is the entire content of this failure -- without them the answer to
+  # "why can it not see my registry" is a guess about where the host thinks the
+  # mod lives.
+  var looked = ""
+  for path in candidates:
+    if looked.len > 0: looked.add ", "
+    looked.add path
   gRegistry = Registry(ok: false, path: "",
-                       error: "no registry found. Looked for mods.json in " &
-                              "this mod's data/ directory and in registry/ " &
-                              "beside the mods folder; set \"registryPath\" " &
-                              "in config.json to point at a checkout.",
+                       error: "no registry found. Looked at: " & looked &
+                              " (mod dir " & modDir() & "). Set " &
+                              "\"registryPath\" in config.json to point at a " &
+                              "checkout of the registry.",
                        name: "", warnings: @[], mods: @[], lists: @[])
 
 # ---------------------------------------------------------------------------
@@ -317,6 +341,11 @@ proc applySelection(): JsonObject =
   # this manager does not manage would be overreach.
   for d in gRes.decisions:
     if d.verdict == vLoaded or d.verdict == vNotSelected or d.verdict == vUnknown:
+      continue
+    # `wrong-side` is not an unload: the host skips a mod that does not declare
+    # its side before it ever calls `on_load`, so asking for one back would be a
+    # request that can only ever answer "there was nothing there".
+    if d.verdict == vWrongSide:
       continue
     let r = requestUnload(d.id)
     if r.outcome == aoDeferred: inc deferredCount

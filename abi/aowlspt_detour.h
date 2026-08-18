@@ -62,13 +62,31 @@ typedef struct AowlHook {
  * Instruction length
  * ------------------------------------------------------------------ */
 
+/* Why a decode produced no length.
+ *
+ * "I do not know this instruction" and "I know it and it cannot move" are
+ * different failures with different answers -- the first is a decoder gap to
+ * be filled, the second is a property of the code being patched that no amount
+ * of decoder work will change -- so they are reported apart. A single "could
+ * not be relocated" message sent every report of both down the wrong path. */
+#define AOWL_INSN_OK        0
+#define AOWL_INSN_UNKNOWN   1   /* not in this decoder's tables            */
+#define AOWL_INSN_RELATIVE  2   /* decoded, but its operand is a relative
+                                   displacement, so moving it moves where it
+                                   goes                                    */
+#define AOWL_INSN_SHORT     3   /* not an instruction property: the function
+                                   ends before the jump would fit           */
+#define AOWL_INSN_FAR       4   /* a RIP-relative disp32 no longer reaches   */
+
 /* The result of decoding one instruction. `len` is 0 when this decoder does
- * not recognise the instruction or cannot relocate it. `ripDisp` is the offset
- * within the instruction of a RIP-relative disp32, or -1 when there is none. */
+ * not recognise the instruction or cannot relocate it, and `why` says which.
+ * `ripDisp` is the offset within the instruction of a RIP-relative disp32, or
+ * -1 when there is none. */
 typedef struct AowlInsn {
     int32_t len;
     int32_t ripDisp;
     int32_t terminal;   /* the instruction ends the function (ret) */
+    int32_t why;        /* AOWL_INSN_* -- meaningful only when len == 0 */
 } AowlInsn;
 
 static AowlInsn aowl_insn(const uint8_t* p) {
@@ -76,12 +94,22 @@ static AowlInsn aowl_insn(const uint8_t* p) {
     out.len = 0;
     out.ripDisp = -1;
     out.terminal = 0;
+    out.why = AOWL_INSN_UNKNOWN;
 
     int32_t i = 0;
-    int32_t opsize = 4;       /* immediate size for the 0x81/0xC7 group */
+    int32_t opsize = 4;       /* operand size, which is also the size of an
+                                 immediate for the forms that take a full one */
+    int32_t immBytes = 0;     /* immediate trailing the ModRM operand         */
     int rexW = 0;
 
-    /* Legacy prefixes. */
+    /* Legacy prefixes.
+     *
+     * 66/F2/F3 are counted here as prefixes because that is what they cost in
+     * bytes, which is all this loop is for. In the two-byte map they are also
+     * *mandatory prefixes* -- they select which instruction `0F 58` is, rather
+     * than modifying one -- but they never change its length, so the two-byte
+     * decoder below can ignore them. 66 does change the length of a one-byte
+     * form that carries a full immediate, which is why it sets `opsize`. */
     for (;;) {
         uint8_t b = p[i];
         if (b == 0x66) { opsize = 2; i++; continue; }
@@ -91,66 +119,190 @@ static AowlInsn aowl_insn(const uint8_t* p) {
         break;
     }
 
-    /* REX. */
+    /* REX, which must be the last prefix before the opcode. */
     if ((p[i] & 0xF0) == 0x40) {
         rexW = (p[i] & 0x08) != 0;
         i++;
     }
 
+    /* VEX (C4/C5) and EVEX (62) introduce a different encoding entirely: the
+     * prefix carries the opcode map and the operand size, and guessing at one
+     * would produce a plausible-looking wrong length. Refused by name so the
+     * report says "AVX", not "unknown byte". A prologue built by MSVC for
+     * IL2CPP is SSE2, so this is a gap rather than a wall -- but it is a gap
+     * that must be visible. */
+    if (p[i] == 0xC4 || p[i] == 0xC5 || p[i] == 0x62) {
+        /* C4/C5 are also LES/LDS, which do not exist in 64-bit mode, and 62 is
+         * BOUND, likewise. So in 64-bit code these bytes can only be VEX/EVEX
+         * and there is nothing to disambiguate. */
+        return out;
+    }
+
     uint8_t op = p[i++];
 
-    /* Two-byte opcodes. Only the ones that turn up in a prologue. */
+    /* ------------------------------------------------------------------
+     * The two-byte map.
+     *
+     * This is where SSE lives, and SSE is most of what a real IL2CPP method
+     * does: `pxor`, `cvtsi2ss`, `mulss`, `movss` -- an ordinary float method's
+     * whole prologue. The map is covered by shape (ModRM? immediate?) rather
+     * than opcode by opcode, because the shape is what the length depends on
+     * and enumerating four hundred mnemonics to recover four facts is how a
+     * table acquires a hole. ------------------------------------------------ */
     if (op == 0x0F) {
         uint8_t op2 = p[i++];
-        if (op2 >= 0x80 && op2 <= 0x8F) return out;    /* jcc rel32 */
-        if ((op2 >= 0x10 && op2 <= 0x17) ||            /* movups/movss etc  */
-            (op2 >= 0x28 && op2 <= 0x2F) ||
-            (op2 >= 0x40 && op2 <= 0x4F) ||            /* cmovcc            */
-            (op2 >= 0x54 && op2 <= 0x5F) ||
-            (op2 >= 0x90 && op2 <= 0x9F) ||            /* setcc             */
-            op2 == 0xB6 || op2 == 0xB7 ||              /* movzx             */
-            op2 == 0xBE || op2 == 0xBF ||              /* movsx             */
-            op2 == 0x1E || op2 == 0x1F) {              /* endbr64 / long nop */
+
+        /* jcc rel32. Knowable length, unmovable operand. */
+        if (op2 >= 0x80 && op2 <= 0x8F) {
+            out.why = AOWL_INSN_RELATIVE;
+            return out;
+        }
+
+        /* Three-byte escapes. `0F 38 xx` (pshufb, pcmpeqq, the SSSE3/SSE4.1
+         * bulk) is ModRM with no immediate; `0F 3A xx` (roundss, pblendw,
+         * palignr) is ModRM plus an imm8. Two whole maps, two facts. */
+        if (op2 == 0x38) { i++; immBytes = 0; goto modrm; }
+        if (op2 == 0x3A) { i++; immBytes = 1; goto modrm; }
+
+        /* Forms whose length is not a function of the opcode alone.
+         *   0F 0F -- 3DNow!, where the trailing imm8 *is* the opcode.
+         *   0F 78/79 -- vmread/vmwrite normally, but extrq/insertq under a 66
+         *               or F2 prefix, and those carry two imm8s.
+         * Neither is anything a compiler emits into a method prologue; both
+         * are refused rather than sized by a rule that is right most of the
+         * time. */
+        if (op2 == 0x0F || op2 == 0x78 || op2 == 0x79) return out;
+
+        /* No ModRM byte: nullary or fixed-register forms. */
+        if (op2 == 0x05 || op2 == 0x06 || op2 == 0x07 ||   /* syscall/clts/sysret */
+            op2 == 0x08 || op2 == 0x09 || op2 == 0x0B ||   /* invd/wbinvd/ud2     */
+            op2 == 0x0E ||                                  /* femms               */
+            (op2 >= 0x30 && op2 <= 0x37) ||                 /* rdtsc & friends     */
+            op2 == 0x77 ||                                  /* emms                */
+            (op2 >= 0xA0 && op2 <= 0xA2) ||                 /* push/pop fs, cpuid  */
+            (op2 >= 0xA8 && op2 <= 0xAA) ||                 /* push/pop gs, rsm    */
+            (op2 >= 0xC8 && op2 <= 0xCF)) {                 /* bswap               */
+            out.len = i;
+            out.why = AOWL_INSN_OK;
+            return out;
+        }
+
+        /* ModRM plus an imm8. In the two-byte map an immediate is always one
+         * byte -- there is no `66`-sized immediate here, which is why `opsize`
+         * plays no part below. */
+        if ((op2 >= 0x70 && op2 <= 0x73) ||                 /* pshufd/psrlw group  */
+            op2 == 0xA4 || op2 == 0xAC ||                   /* shld/shrd imm8      */
+            op2 == 0xBA ||                                  /* bt/bts/btr/btc imm8 */
+            op2 == 0xC2 ||                                  /* cmpps/cmpss         */
+            op2 == 0xC4 || op2 == 0xC5 ||                   /* pinsrw/pextrw       */
+            op2 == 0xC6) {                                  /* shufps/shufpd       */
+            immBytes = 1;
+            goto modrm;
+        }
+
+        /* Everything else that is defined: ModRM, no immediate. Written as
+         * ranges over the map rather than as a default, so a byte that is not
+         * a defined two-byte opcode is refused instead of being handed a
+         * length -- an undefined opcode inside a prologue means the decoder
+         * has already lost its place, and continuing from there is how a
+         * trampoline ends up holding half an instruction. */
+        if (op2 <= 0x03 ||                                  /* sldt/lar/lsl        */
+            op2 == 0x0D ||                                  /* prefetch            */
+            (op2 >= 0x10 && op2 <= 0x23) ||                 /* movups..endbr64..mov cr */
+            (op2 >= 0x28 && op2 <= 0x2F) ||                 /* movaps, cvt*, comiss */
+            (op2 >= 0x40 && op2 <= 0x6F) ||                 /* cmovcc, the SSE bulk */
+            (op2 >= 0x74 && op2 <= 0x76) ||                 /* pcmpeq              */
+            (op2 >= 0x7C && op2 <= 0x7F) ||                 /* haddps/movd/movdqa  */
+            (op2 >= 0x90 && op2 <= 0x9F) ||                 /* setcc               */
+            op2 == 0xA3 || op2 == 0xA5 || op2 == 0xAB ||    /* bt/shld cl/bts      */
+            (op2 >= 0xAD && op2 <= 0xB9) ||                 /* shrd cl..popcnt     */
+            (op2 >= 0xBB && op2 <= 0xC1) ||                 /* btc..movsx..xadd    */
+            op2 == 0xC3 || op2 == 0xC7 ||                   /* movnti/cmpxchg16b   */
+            op2 >= 0xD0) {                                  /* the packed-integer bulk */
+            immBytes = 0;
             goto modrm;
         }
         return out;
     }
 
-    /* One-byte opcodes with no ModRM. */
-    if ((op >= 0x50 && op <= 0x57) ||                  /* push r64 */
-        (op >= 0x58 && op <= 0x5F) ||                  /* pop r64  */
-        op == 0x90 || op == 0xC3 || op == 0xCC || op == 0x99) {
-        if (op == 0xC3) out.terminal = 1;              /* ret */
-        out.len = i;
-        return out;
-    }
-    if (op == 0xC2) { out.terminal = 1; out.len = i + 2; return out; }  /* ret imm16 */
-    if (op >= 0xB8 && op <= 0xBF) {                    /* mov r, imm */
-        out.len = i + (rexW ? 8 : (opsize == 2 ? 2 : 4));
-        return out;
-    }
-    if (op == 0x68) { out.len = i + 4; return out; }   /* push imm32 */
-    if (op == 0x6A) { out.len = i + 1; return out; }   /* push imm8  */
+    /* ------------------------------------------------------------------
+     * The one-byte map.
+     * ------------------------------------------------------------------ */
 
     /* Relative branches: the length is knowable, but relocating one would
      * change where it goes, so no length is reported. */
-    if (op == 0xE8 || op == 0xE9) return out;          /* call/jmp rel32 */
-    if (op == 0xEB) return out;                        /* jmp rel8       */
-    if (op >= 0x70 && op <= 0x7F) return out;          /* jcc rel8       */
+    if (op == 0xE8 || op == 0xE9 || op == 0xEB ||          /* call/jmp rel   */
+        (op >= 0x70 && op <= 0x7F) ||                      /* jcc rel8       */
+        op == 0xE0 || op == 0xE1 || op == 0xE2 ||          /* loopcc         */
+        op == 0xE3) {                                      /* jrcxz          */
+        out.why = AOWL_INSN_RELATIVE;
+        return out;
+    }
 
-    /* One-byte opcodes with ModRM. */
-    if ((op <= 0x3B && (op & 0x07) <= 0x03) ||         /* alu r/m, r */
-        op == 0x84 || op == 0x85 ||                    /* test       */
-        op == 0x88 || op == 0x89 || op == 0x8A || op == 0x8B ||  /* mov */
-        op == 0x8D ||                                  /* lea        */
-        op == 0x63) {                                  /* movsxd     */
+    /* No ModRM, no immediate. */
+    if ((op >= 0x50 && op <= 0x5F) ||                      /* push/pop r64   */
+        op == 0x90 || op == 0x99 || op == 0x98 ||          /* nop/cqo/cdqe   */
+        op == 0x9C || op == 0x9D ||                        /* pushf/popf     */
+        op == 0xC9 || op == 0xCC || op == 0xF4 ||          /* leave/int3/hlt */
+        (op >= 0xF8 && op <= 0xFD)) {                      /* clc..std       */
+        out.len = i;
+        out.why = AOWL_INSN_OK;
+        return out;
+    }
+    if (op == 0xC3) { out.terminal = 1; out.len = i; out.why = AOWL_INSN_OK; return out; }
+    if (op == 0xC2) { out.terminal = 1; out.len = i + 2; out.why = AOWL_INSN_OK; return out; }
+
+    /* No ModRM, immediate. */
+    if (op >= 0xB8 && op <= 0xBF) {                        /* mov r, imm     */
+        out.len = i + (rexW ? 8 : (opsize == 2 ? 2 : 4));
+        out.why = AOWL_INSN_OK;
+        return out;
+    }
+    if (op >= 0xB0 && op <= 0xB7) { out.len = i + 1; out.why = AOWL_INSN_OK; return out; }
+    if (op == 0x68) { out.len = i + 4; out.why = AOWL_INSN_OK; return out; }  /* push imm32 */
+    if (op == 0x6A) { out.len = i + 1; out.why = AOWL_INSN_OK; return out; }  /* push imm8  */
+    if (op == 0xA8) { out.len = i + 1; out.why = AOWL_INSN_OK; return out; }  /* test al,imm8 */
+    if (op == 0xA9) { out.len = i + (opsize == 2 ? 2 : 4); out.why = AOWL_INSN_OK; return out; }
+    /* The accumulator forms of the ALU group: `add al, imm8` (op&7 == 4) and
+     * `add eax, imm32` (op&7 == 5). No ModRM, which is exactly why they are
+     * easy to leave out and then mis-size as if they had one. */
+    if (op <= 0x3D && (op & 0x07) == 0x04) { out.len = i + 1; out.why = AOWL_INSN_OK; return out; }
+    if (op <= 0x3D && (op & 0x07) == 0x05) {
+        out.len = i + (opsize == 2 ? 2 : 4);
+        out.why = AOWL_INSN_OK;
+        return out;
+    }
+
+    /* ModRM. */
+    if ((op <= 0x3B && (op & 0x07) <= 0x03) ||             /* alu r/m, r     */
+        op == 0x63 ||                                      /* movsxd         */
+        (op >= 0x84 && op <= 0x8B) ||                      /* test/xchg/mov  */
+        op == 0x8D || op == 0x8F ||                        /* lea / pop r/m  */
+        (op >= 0xD0 && op <= 0xD3) ||                      /* shift by 1/cl  */
+        op == 0xFE || op == 0xFF) {                        /* inc/dec/call/jmp r/m */
+        immBytes = 0;
         goto modrm;
     }
-    if (op == 0x80 || op == 0x83) { opsize = 1; goto modrm; }
-    if (op == 0x81) goto modrm;
-    if (op == 0xC6) { opsize = 1; goto modrm; }
-    if (op == 0xC7) goto modrm;
-    if (op == 0xFF) goto modrm;                        /* inc/dec/call/jmp r/m */
+    if (op == 0x80 || op == 0x83 || op == 0x6B ||          /* alu/imul imm8  */
+        op == 0xC0 || op == 0xC1 || op == 0xC6) {          /* shift/mov imm8 */
+        immBytes = 1;
+        goto modrm;
+    }
+    if (op == 0x81 || op == 0x69 || op == 0xC7) {          /* alu/imul/mov imm */
+        immBytes = (opsize == 2 ? 2 : 4);
+        goto modrm;
+    }
+    /* The group-3 trap: `F7 /0` and `F7 /1` are `test r/m, imm32` and carry a
+     * full immediate, while `/2` through `/7` (not, neg, mul, imul, div, idiv)
+     * carry none. A decoder that sizes the whole opcode the same way is wrong
+     * by four bytes on one of the commonest instructions in existence, and the
+     * error is silent -- it just steals four bytes too many or too few. */
+    if (op == 0xF6 || op == 0xF7) {
+        uint8_t reg = (uint8_t)((p[i] >> 3) & 0x07);
+        if (reg <= 1) immBytes = (op == 0xF6) ? 1 : (opsize == 2 ? 2 : 4);
+        else immBytes = 0;
+        goto modrm;
+    }
 
     return out;
 
@@ -180,10 +332,15 @@ modrm: {
             }
         }
 
-        if (op == 0x80 || op == 0x83 || op == 0xC6) i += 1;
-        else if (op == 0x81 || op == 0xC7) i += (opsize == 2 ? 2 : 4);
+        /* The immediate comes last, after any displacement. A RIP-relative
+         * displacement is measured from the end of the *whole* instruction,
+         * immediate included -- which is why `ripDisp` is an offset and not a
+         * value, and why the copier corrects it by the distance moved rather
+         * than by anything derived from the length. */
+        i += immBytes;
 
         out.len = i;
+        out.why = AOWL_INSN_OK;
         return out;
     }
 }
@@ -201,17 +358,38 @@ static int32_t aowl_insn_len(const uint8_t* p) {
  * next. The hook would then overwrite an unrelated function and the trampoline
  * would jump into the middle of one. It presents as a crash a long way from
  * the patch, which is exactly why it is checked here.
+ *
+ * `why` receives an AOWL_INSN_* code on refusal, so the report can say which
+ * of the three refusals this was rather than offering the caller all of them
+ * and leaving them to guess. It is untouched on success.
  */
-static int32_t aowl_stolen_len(const uint8_t* p, int32_t need) {
+static int32_t aowl_stolen_len_why(const uint8_t* p, int32_t need, int32_t* why) {
     int32_t total = 0;
     while (total < need) {
         AowlInsn in = aowl_insn(p + total);
-        if (in.len <= 0) return 0;
-        if (total + in.len > AOWL_MAX_STOLEN) return 0;
+        if (in.len <= 0) {
+            if (why) *why = in.why;
+            return 0;
+        }
+        if (total + in.len > AOWL_MAX_STOLEN) {
+            /* Not a decode failure: the prologue decodes fine, it is simply
+             * longer than the trampoline is willing to hold. Reported as
+             * "unknown" would be a lie, so it gets the length refusal. */
+            if (why) *why = AOWL_INSN_SHORT;
+            return 0;
+        }
         total += in.len;
-        if (in.terminal && total < need) return 0;
+        if (in.terminal && total < need) {
+            if (why) *why = AOWL_INSN_SHORT;
+            return 0;
+        }
     }
     return total;
+}
+
+static int32_t aowl_stolen_len(const uint8_t* p, int32_t need) {
+    int32_t why = AOWL_INSN_OK;
+    return aowl_stolen_len_why(p, need, &why);
 }
 
 /* Copies instructions from `src` to `dst`, rewriting the displacement of every
@@ -319,19 +497,61 @@ static int32_t aowl_hook_stolen(void* p) {
 }
 
 /* 0 on success; negative codes describe the refusal so the host can report it.
+ *
+ * The three ways a prologue can be unpatchable used to share one code, and the
+ * message the host printed had to list all three and let the reader pick. They
+ * are different problems with different answers -- a decoder gap is ours to
+ * close, a relative branch is the target's and never will be, and a function
+ * shorter than the jump is neither -- so they get their own codes and
+ * `aowl_hook_error_text` turns each into a sentence that is true on its own.
+ *
  *   -1  no target or detour
- *   -2  the prologue could not be decoded, held a relative branch, or could
- *       not be relocated
+ *   -2  the prologue holds an instruction this decoder does not know
  *   -3  the trampoline could not be allocated
  *   -4  the target pages could not be made writable
+ *   -5  no free patch slots (from `aowl_hook_attach`)
+ *   -6  the prologue holds a relative branch, which cannot be moved
+ *   -7  the function is shorter than the jump that would replace its start
+ *   -8  the trampoline landed too far away for a RIP-relative displacement
  */
+static const char* aowl_hook_error_text(int32_t rc) {
+    switch (rc) {
+        case  0: return "ok";
+        case -1: return "no target or detour";
+        case -2: return "the prologue holds an instruction this decoder does "
+                        "not know";
+        case -3: return "no executable memory within reach of the target";
+        case -4: return "the target's pages could not be made writable";
+        case -5: return "no free patch slots";
+        case -6: return "the prologue holds a relative branch, which cannot "
+                        "be moved into a trampoline";
+        case -7: return "the function is shorter than the jump that would "
+                        "replace its start";
+        case -8: return "the trampoline landed more than 2 GB from the "
+                        "target, so a RIP-relative displacement in the "
+                        "stolen bytes no longer reaches";
+        default: return "unknown detour error";
+    }
+}
+
+/* The AOWL_INSN_* refusal a decode produced, as the install code for it. */
+static int32_t aowl_why_to_rc(int32_t why) {
+    switch (why) {
+        case AOWL_INSN_RELATIVE: return -6;
+        case AOWL_INSN_SHORT:    return -7;
+        case AOWL_INSN_FAR:      return -8;
+        default:                 return -2;
+    }
+}
+
 static int32_t aowl_hook_install(void* handle, void* target, void* detour) {
     AowlHook* h = (AowlHook*)handle;
     if (!h || !target || !detour) return -1;
 
     uint8_t* t = (uint8_t*)target;
-    int32_t stolen = aowl_stolen_len(t, AOWL_JMP_SIZE);
-    if (stolen == 0) return -2;
+    int32_t why = AOWL_INSN_UNKNOWN;
+    int32_t stolen = aowl_stolen_len_why(t, AOWL_JMP_SIZE, &why);
+    if (stolen == 0) return aowl_why_to_rc(why);
 
     uint8_t* tramp = (uint8_t*)aowl_alloc_near(target,
                                                (size_t)(stolen + AOWL_JMP_SIZE));
@@ -339,7 +559,11 @@ static int32_t aowl_hook_install(void* handle, void* target, void* detour) {
 
     if (aowl_copy_relocated(tramp, t, stolen) != 0) {
         VirtualFree(tramp, 0, MEM_RELEASE);
-        return -2;
+        /* The prologue decoded -- `aowl_stolen_len_why` already proved that --
+         * so the only way the copy fails is a displacement that no longer
+         * reaches. Reporting that as a decoder gap sent the last reader
+         * looking for a missing opcode. */
+        return -8;
     }
     aowl_write_jmp_abs(tramp + stolen, t + stolen);
 
@@ -439,7 +663,15 @@ static int32_t aowl_hook_remove(void* handle) {
  * from assembly, and the host's `invoke`, which decodes it against a method
  * signature -- and only the shim is included by both. Defining them here left
  * the decoder calling functions it had no declaration for, which C accepts with
- * a warning and then miscompiles on the return type. */
+ * a warning and then miscompiles on the return type.
+ *
+ * The offsets the assembly below uses are, however, this file's own: the thunk
+ * stores RCX/RDX/R8/R9 at +0x00/0x08/0x10/0x18, XMM0-3 at +0x20/0x28/0x30/0x38
+ * and reads the replacement return value from +0x40, which is exactly the
+ * layout of `AowlRegs`. The size is named here so anything that mirrors the
+ * frame can be pinned to the assembly that writes it rather than to a copy of
+ * the struct that can drift from both. */
+#define AOWL_REGS_BYTES 0x48
 
 /* Returns 0 to run the original, 1 to suppress it. */
 extern int32_t aowlspt_nim_patch_fired(int32_t slot, void* regs);
@@ -448,11 +680,12 @@ static AowlHook* g_hookSlots[AOWL_MAX_HOOKS];
 /* `used` because the only reader is the assembly below, and the compiler cannot
  * see that. Without it the table is dropped at -O1 and the link fails on a
  * symbol that is right there in the file. */
-void* aowl_tramp_table[AOWL_MAX_HOOKS];
+__attribute__((used)) static void* aowl_tramp_table[AOWL_MAX_HOOKS];
 static int32_t   g_hookCount = 0;
 
-/* Likewise: called only from assembly, so it needs a name the linker keeps. */
-int32_t aowl_patch_dispatch(int32_t slot, void* regs) {
+/* Likewise: called only from assembly, so it needs `used` to survive -- and
+ * `static`, so a second translation unit including this header does not clash. */
+__attribute__((used)) static int32_t aowl_patch_dispatch(int32_t slot, void* regs) {
     return aowlspt_nim_patch_fired(slot, regs);
 }
 

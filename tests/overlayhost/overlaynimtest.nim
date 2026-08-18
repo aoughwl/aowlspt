@@ -11,6 +11,7 @@
 ## -- which is also exactly what a host would log if it were injected into
 ## something that does not render.
 
+import std/syncio
 import aowloverlay
 
 proc patchFired(slot: int32; regs: pointer): int32 {.

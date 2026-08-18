@@ -748,11 +748,13 @@ static void aowl_ov_ingest(const char* body, int32_t len) {
                         aowl_ov_copy(m->version, (int32_t)sizeof(m->version), tmp);
                 }
                 const char* e = aowl_ov_jfind(o, c, "enabled");
-                /* Only the backend's answer clears `pending`: the row is
-                 * pending until the server confirms the state we asked for. */
-                int32_t was = m->enabled;
-                m->enabled = aowl_ov_jbool(e, c, m->enabled);
-                if (m->enabled == was) { /* unchanged */ }
+                int32_t want = aowl_ov_jbool(e, c, m->enabled);
+                /* Only the backend's answer clears `pending`. The row shows a
+                 * `*` from the moment it is clicked until the server confirms
+                 * the state we asked for, so a POST that silently failed stays
+                 * visible on the panel rather than looking applied. */
+                if (m->pending && want == m->enabled) m->pending = 0;
+                m->enabled = want;
                 seen++;
             }
         }
@@ -764,7 +766,10 @@ static void aowl_ov_ingest(const char* body, int32_t len) {
 static DWORD WINAPI aowl_ov_worker(LPVOID unused) {
     (void)unused;
     static char buf[16384];
-    int32_t sinceRefresh = 0;
+    /* Starts at the interval so the first poll happens immediately: an
+     * overlay that shows a stale read-only list for a second after the
+     * game starts looks broken. */
+    int32_t sinceRefresh = 1000;
 
     while (g_ov.workerRun) {
         /* Commands first: a click should not wait out the poll interval. */
@@ -1643,6 +1648,10 @@ static int32_t aowl_ov_capture_vtable(void** outPresent, void** outResize) {
 static int32_t aowl_ov_start(int32_t toggleVk, int32_t backendPort) {
     if (InterlockedCompareExchange(&g_ov.started, 1, 0) != 0) return 1;
 
+    /* `aowl_ov_stop` latches `broken` on the way out so the detours become
+     * pass-throughs while they are still installed; a later start has to clear
+     * it or it would come up already dead. */
+    InterlockedExchange(&g_ov.broken, 0);
     InitializeCriticalSection(&g_ov.cs);
     g_ov.toggleVk = toggleVk ? toggleVk : VK_INSERT;
     g_ov.backendPort = backendPort;

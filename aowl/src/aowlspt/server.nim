@@ -214,7 +214,24 @@ proc setting*(key: string): ConfigValue =
     result = ConfigValue(ok: false, raw: "")
 
 proc asText*(c: ConfigValue; default: string = ""): string =
-  if c.ok: c.raw else: default
+  ## The quotes come off here, whichever host is underneath.
+  ##
+  ## They did not, and the three hosts disagreed: the backend and the client
+  ## host strip them on the way out, the .NET simulator hands back the raw JSON
+  ## literal. So `setting("edition").asText()` was `standard` on a server and
+  ## `"standard"` in the simulator -- an empty string setting had length two,
+  ## and a value used to build a database path addressed nothing on one side
+  ## while working on the other. Two mods had already grown their own private
+  ## unquoting helper by the time it was noticed, which is the shape of a
+  ## missing library function.
+  ##
+  ## Stripping here rather than in each host is what makes it true everywhere,
+  ## including on a host written later.
+  if not c.ok:
+    return default
+  if c.raw.len >= 2 and c.raw[0] == '"' and c.raw[c.raw.len - 1] == '"':
+    return c.raw.substr(1, c.raw.len - 2)
+  result = c.raw
 
 proc asFloat*(c: ConfigValue; default: float = 0.0): float =
   if not c.ok:

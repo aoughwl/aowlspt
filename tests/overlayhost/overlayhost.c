@@ -439,26 +439,26 @@ int main(int argc, char** argv) {
             /* A scripted run: toggle on, move the mouse over the third row's
              * button, click it, then resize. Every step goes through the real
              * window procedure the overlay installed. */
-            if (f == 10) SendMessageW(hwnd, WM_KEYDOWN, VK_INSERT, 0);
-            if (f == 12 && shotDir) {
+            if (f == 20) SendMessageW(hwnd, WM_KEYDOWN, VK_INSERT, 0);
+            if (f == 34 && shotDir) {
                 _snprintf(path, sizeof(path), "%s\\01-visible.bmp", shotDir);
                 if (shoot(path)) ok("wrote 01-visible.bmp");
             }
-            if (f == 13) {
+            if (f == 36) {
                 int n = count_overlay_pixels();
                 drewPixels = n;
             }
-            if (f == 20) {
+            if (f == 40) {
                 /* Row 2 (zero-based) sits at y = 60 + 30 + 2*22 + 11 = 145;
                  * its button is at x = 40 + 520 - 10 - 56 + 28 = 522. */
                 SendMessageW(hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(522, 145));
                 SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(522, 145));
             }
-            if (f == 24 && shotDir) {
+            if (f == 52 && shotDir) {
                 _snprintf(path, sizeof(path), "%s\\02-clicked.bmp", shotDir);
                 if (shoot(path)) ok("wrote 02-clicked.bmp");
             }
-            if (f == 30) {
+            if (f == 60) {
                 /* The resize test. The host must drop its own RTV; the overlay
                  * must drop its own from inside the ResizeBuffers hook. */
                 ID3D11DeviceContext_OMSetRenderTargets(ctx, 0, NULL, NULL);
@@ -472,16 +472,17 @@ int main(int argc, char** argv) {
                 if (!make_rtv()) bad("could not recreate the host's RTV after resize");
                 scene_bind();
             }
-            if (f == 40 && shotDir) {
+            if (f == 72 && shotDir) {
                 _snprintf(path, sizeof(path), "%s\\03-resized.bmp", shotDir);
                 if (shoot(path)) ok("wrote 03-resized.bmp");
             }
-            if (f == 45) SendMessageW(hwnd, WM_KEYDOWN, VK_INSERT, 0);
-            if (f == 50 && shotDir) {
+            if (f == 80) SendMessageW(hwnd, WM_KEYDOWN, VK_INSERT, 0);
+            if (f == 86 && shotDir) {
                 _snprintf(path, sizeof(path), "%s\\04-hidden.bmp", shotDir);
                 if (shoot(path)) ok("wrote 04-hidden.bmp");
             }
-            if (f == 55) break;
+            if (f == 92) break;
+            Sleep(16);   /* ~60 Hz, so the backend poll thread gets real time */
         }
     }
 

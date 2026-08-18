@@ -33,6 +33,7 @@ import aowlspt/il2cpp
 import aowlsptinstall/winfs
 import modstore
 import jsonpath
+import aowloverlay
 import invoke
 
 {.emit: """#include "aowlspt_shim.h" """.}
@@ -164,6 +165,10 @@ type
     ## Whether the patch may suppress the original. A patch that returns
     ## `PatchSkip` without having asked is a mistake, not an instruction.
     canSkip: bool
+    ## Which mod installed it. Needed to take a mod's detours out when the mod
+    ## goes: a detour whose handler lives in a freed library is a jump into
+    ## unmapped memory the next time the game calls that method.
+    modIndex: int
 
   Sub = object
     ## An event subscription. Client-side events are how one mod tells another
@@ -180,6 +185,7 @@ type
     cb: Il2CppPtr
     user: Il2CppPtr
     dueMs: uint64
+    modIndex: int
 
 var gDir = ""
 var gLogPath = ""
@@ -670,7 +676,8 @@ proc hostPatch(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
   let wantArgs = (kind and 0x10'i32) != 0'i32
   gPatches.add Patch(hook: hook, cb: cb, user: user, target: spec,
                      targetC: targetBytes, live: false, meth: m,
-                     wantArgs: wantArgs, canSkip: wantArgs)
+                     wantArgs: wantArgs, canSkip: wantArgs,
+                     modIndex: int(cast[uint](ctx)))
   let slot = cHookAttach(hook, fn)
   if slot < 0'i32:
     shrink(gPatches, gPatches.len - 1)
@@ -773,7 +780,8 @@ proc hostInvokeMain(ctx: Il2CppPtr; cb: Il2CppPtr; user: Il2CppPtr): int32 {.
   ## cannot yet put it there.
   if cb == nil:
     return ErrBadArg
-  gPending.add Pending(cb: cb, user: user, dueMs: cNowMs())
+  gPending.add Pending(cb: cb, user: user, dueMs: cNowMs(),
+                       modIndex: int(cast[uint](ctx)))
   result = StatusOk
 
 proc hostSchedule(ctx: Il2CppPtr; delayMs: int32; cb: Il2CppPtr;
@@ -783,7 +791,8 @@ proc hostSchedule(ctx: Il2CppPtr; delayMs: int32; cb: Il2CppPtr;
     return ErrBadArg
   var d = delayMs
   if d < 0'i32: d = 0'i32
-  gPending.add Pending(cb: cb, user: user, dueMs: cNowMs() + uint64(d))
+  gPending.add Pending(cb: cb, user: user, dueMs: cNowMs() + uint64(d),
+                       modIndex: int(cast[uint](ctx)))
   result = StatusOk
 
 # --------------------------------------------------------------- mods
@@ -909,6 +918,54 @@ proc discoverMods(root: string): seq[string] =
       continue
     result.add joinPath(root, f)
 
+proc dropModRegistrations(index: int) =
+  ## Everything the mod at `index` left in this host, dropped before its library
+  ## is freed.
+  ##
+  ## Order within this proc does not matter; the order *around* it does, and the
+  ## loader guarantees it -- this runs after the mod's `on_unload` and before
+  ## `FreeLibrary`. Every item here holds a function pointer into that library,
+  ## so anything missed becomes a call into unmapped memory: a detour the game
+  ## still jumps to, a subscriber an event still reaches, a timer that still
+  ## comes due.
+  var kept: seq[Sub] = @[]
+  for sub1 in gSubs:
+    if sub1.modIndex != index:
+      kept.add sub1
+  gSubs = kept
+
+  var keptPending: seq[Pending] = @[]
+  for pend in gPending:
+    if pend.modIndex != index:
+      keptPending.add pend
+  gPending = keptPending
+
+  for i in 0 ..< gPatches.len:
+    if gPatches[i].live and gPatches[i].modIndex == index:
+      gPatches[i].live = false
+      discard cHookRemove(gPatches[i].hook)
+      cHookFree(gPatches[i].hook)
+      gPatches[i].hook = cast[Il2CppPtr](0)
+      okLog "removed the detour on " & gPatches[i].target
+
+proc readBackendPort(): int =
+  ## The port the backend is on, out of `aowlspt-host.json` beside the host.
+  ## Zero means "do not try", and the overlay then shows what the host knows
+  ## rather than nothing at all.
+  result = 0
+  var text = ""
+  if not readTextFile(joinPath(gDir, "aowlspt-host.json"), text):
+    return
+  var value = ""
+  if pathGet(text, "backendPort", value):
+    var n = 0
+    var any = false
+    for ch in value:
+      if ch >= '0' and ch <= '9':
+        n = n * 10 + (ord(ch) - ord('0'))
+        any = true
+    if any: result = n
+
 proc removePatches() =
   ## Every detour comes out before the host stops. Leaving one installed means
   ## the game jumps into a DLL that may be gone.
@@ -917,6 +974,10 @@ proc removePatches() =
       gPatches[i].live = false
       discard cHookRemove(gPatches[i].hook)
       cHookFree(gPatches[i].hook)
+
+proc stopOverlay() =
+  if overlayRunning():
+    overlayStop()
 
 proc unloadMods() =
   for i in 0 ..< gMods.len:
@@ -1058,6 +1119,22 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
 
   if gMods.len == 0:
     info "no mods loaded; the host will idle"
+
+  # The overlay, on this thread and not a moment earlier.
+  #
+  # It creates a window, a D3D11 device and a thread. Every one of those
+  # deadlocks under the loader lock, so it cannot go anywhere near `DllMain` --
+  # this is the boot thread the constructor started, which is exactly the place
+  # for it. A failure is a warning: a host that loses its overlay still runs
+  # every mod, and a game that will not start because a panel would not draw is
+  # a worse trade than no panel.
+  if overlayStart(VkInsert, int32(readBackendPort())):
+    okLog "overlay ready (Insert toggles it)"
+    for i in 0 ..< gMods.len:
+      if gMods[i].live:
+        overlaySetMod(gMods[i].guid, gMods[i].name, gMods[i].version, true)
+  else:
+    warn "the overlay did not start: " & overlayStatus()
 
   okLog "host running"
 

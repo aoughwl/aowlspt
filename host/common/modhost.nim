@@ -293,6 +293,105 @@ proc unloadMods*() =
     cFreeLibrary(gMods[i].module)
     gMods[i].live = false
 
+# ---------------------------------------------------------------------------
+# Loading and unloading one mod, while the host keeps running
+# ---------------------------------------------------------------------------
+#
+# A mod can be taken out and put back without stopping the server. That is worth
+# having and it is not free, because a mod leaves things behind it: routes,
+# event subscriptions, timers, and on the client, detours. Those live in the
+# host that owns them, not here, so unloading is two halves -- this half frees
+# the library, and the host's half drops what the mod registered.
+#
+# The order matters and is the whole of the danger. Everything the mod
+# registered has to be dropped **before** its library is freed, because every
+# one of those is a function pointer into it: a route still in the table after
+# `FreeLibrary` is a call into unmapped memory on the next request, which is a
+# crash with no stack worth reading. So the host passes a teardown it runs
+# first, and this refuses to unload without one.
+
+type
+  TeardownFn* = proc (index: int)
+    ## Drops everything the mod at `index` registered with the host. Called
+    ## before the library is freed, and must be complete: whatever it misses
+    ## becomes a call into unmapped memory.
+
+var gTeardown: TeardownFn = nil
+
+proc setModTeardown*(fn: TeardownFn) =
+  ## Installed once by the host at startup. Without it, `unloadOne` refuses --
+  ## a host that cannot say what a mod registered cannot safely unload it.
+  gTeardown = fn
+
+proc modCount*(): int = gMods.len
+
+proc modIndexOf*(guid: string): int =
+  result = -1
+  for i in 0 ..< gMods.len:
+    if gMods[i].live and gMods[i].guid == guid:
+      return i
+
+proc modPathOf*(index: int): string =
+  if index < 0 or index >= gMods.len:
+    return ""
+  result = gMods[index].path
+
+proc modNameOf*(index: int): string =
+  if index < 0 or index >= gMods.len:
+    return ""
+  result = gMods[index].name
+
+proc modIsLive*(index: int): bool =
+  if index < 0 or index >= gMods.len:
+    return false
+  result = gMods[index].live
+
+proc unloadOne*(index: int; error: var string): bool =
+  ## Takes one mod out. The slot is kept rather than removed: every context
+  ## pointer the host handed to a mod is that index, and compacting the
+  ## sequence would silently repoint them at their neighbours.
+  error = ""
+  if index < 0 or index >= gMods.len:
+    error = "no such mod"
+    return false
+  if not gMods[index].live:
+    error = "that mod is not loaded"
+    return false
+  if gTeardown == nil:
+    error = "this host cannot unload a mod: it has no teardown registered"
+    return false
+
+  let name = gMods[index].name
+  # The mod's own `on_unload` first, so it can save state; then everything it
+  # registered; then the library.
+  discard cModApiOnUnload(gMods[index].api)
+  gTeardown(index)
+  cModApiFree(gMods[index].api)
+  cHostApiFree(gMods[index].hostBlock)
+  cModInfoFree(gMods[index].info)
+  cFreeLibrary(gMods[index].module)
+  gMods[index].live = false
+  gMods[index].api = cast[HostPtr](0)
+  gMods[index].info = cast[HostPtr](0)
+  gMods[index].hostBlock = cast[HostPtr](0)
+  gMods[index].module = cast[HostPtr](0)
+  okLog "unloaded " & name
+  result = true
+
+proc unloadByGuid*(guid: string; error: var string): bool =
+  let idx = modIndexOf(guid)
+  if idx < 0:
+    error = "no loaded mod with guid " & guid
+    return false
+  result = unloadOne(idx, error)
+
+proc loadOne*(path: string; side: int32; hostName, hostVersion: string;
+              sptVersion = ""; gameVersion = ""): bool =
+  ## Brings a mod up while the host is running. The same path a cold start
+  ## takes, deliberately -- a mod that loads differently when added late is a
+  ## mod whose bugs only appear one way round.
+  result = loadMod(path, side, hostName, hostVersion, sptVersion, gameVersion)
+
 proc modDirOf*(index: int): string =
   if index < 0 or index >= gMods.len:
     return ""

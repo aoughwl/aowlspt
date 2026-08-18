@@ -12,20 +12,73 @@
 ##
 ## That sounds wrong and is deliberate. A parsed tree would need a mutable
 ## dynamic value type, which nimony's `std/json` does not give cheaply, and the
-## access pattern here is not tree-shaped: mods read a handful of paths at load
-## and patch a handful more. Scanning for a path costs a pass over the document;
-## doing it a few dozen times at startup is nothing, and doing it per request
-## would be a mistake this module cannot prevent anyway.
+## access pattern here is not tree-shaped.
 ##
 ## What it does guarantee is that a patch which cannot be applied exactly is
 ## refused, rather than applied approximately.
+##
+## ## The index
+##
+## Text alone was not enough. The original comment here said mods read "a
+## handful of paths at load", and that turned out to be wrong the moment a real
+## game server ran on this: the emulator reads a template's `Width`, `Height`
+## and `StackMaxSize` on every inventory operation, and `/client/items` reads
+## `templates.items` on every request. Each of those was a fresh walk from the
+## document root, and each walk had to *skip over* every value it passed --
+## which for anything living after `templates.items` means stepping through
+## four megabytes of JSON, per lookup.
+##
+## So each object is indexed the first time something addresses it: its
+## immediate members are enumerated once, and every later lookup into that
+## object is a hash lookup instead of a scan. Building the index for an object
+## costs exactly the scan the first lookup was going to cost anyway, so nothing
+## is slower and repeated access is bounded by the depth of the path rather
+## than by the size of the document.
+##
+## The index holds **byte offsets into `gDoc`**, so it is only valid for the
+## document it was built from. `dbLoad` and `dbPatchPath` both replace `gDoc`
+## wholesale, and both clear it. That is the whole invalidation story, and it is
+## deliberately not cleverer than that: a partial invalidation would have to
+## reason about which offsets a splice moved, and getting that wrong hands a mod
+## a byte range out of the middle of some other item.
 
-import std/strutils
+import std/[strutils, tables]
+
+{.emit: """#include "aowlspt_net.h" """.}
+
+proc cLock() {.importc: "aowl_lock", nodecl.}
+proc cUnlock() {.importc: "aowl_unlock", nodecl.}
 
 var gDoc = ""
 
+# Member ranges, keyed by "<object offset><unit separator><member name>", packed
+# as (start shl 32) or end. Zero is not a reachable packing -- a member's value
+# always begins after the object's own `{` -- so it doubles as "not there".
+var gMembers = initTable[string, int64]()
+var gIndexed = initTable[int, bool]()
+
+const IndexCeiling = 2_000_000
+  ## Members held before the index is thrown away and rebuilt on demand. A
+  ## database is bounded, but a mod addressing a million distinct paths is not,
+  ## and an index that can only grow is a leak with a slow fuse.
+
+proc indexClear() =
+  clear(gMembers)
+  clear(gIndexed)
+
+proc docReplaced() =
+  ## Called after every assignment to `gDoc`. The index is byte offsets into a
+  ## document that no longer exists, and a splice moves every offset after it --
+  ## so the whole thing goes, rather than an attempt to fix up the tail. A mod
+  ## reading a range out of the middle of some other item is not a bug that
+  ## announces itself.
+  cLock()
+  indexClear()
+  cUnlock()
+
 proc dbLoad*(text: string) =
   gDoc = text
+  docReplaced()
 
 proc dbText*(): string = gDoc
 
@@ -127,8 +180,77 @@ proc findKeyIn(s: string; objStart: int; key: string;
       return false
   result = false
 
+# ----------------------------------------------------------------- the index
+
+proc memberKey(objStart: int; name: string): string =
+  ## The unit separator rather than a dot or a colon: a member name may contain
+  ## either (`"5449016a4bdc2d6f028b456f Name"` in the locale table contains a
+  ## space, and nothing stops a name containing a dot), and a separator that can
+  ## appear in the name lets two different members collide on one key.
+  result = $objStart
+  result.add char(31)
+  result.add name
+
+proc indexObject(objStart: int) =
+  ## Enumerates the immediate members of the object at `objStart` and records
+  ## each one's byte range. Caller holds the lock.
+  ##
+  ## This is `findKeyIn`'s loop with the early return taken out: the scan it
+  ## does to find one member finds all of them on the way past, and throwing
+  ## that away was the waste.
+  gIndexed[objStart] = true
+  var i = objStart
+  skipWs(gDoc, i)
+  if i >= gDoc.len or gDoc[i] != '{':
+    return
+  inc i
+  while i < gDoc.len:
+    skipWs(gDoc, i)
+    if i < gDoc.len and gDoc[i] == '}':
+      return
+    if i >= gDoc.len or gDoc[i] != '"':
+      return
+    let nameStart = i
+    if not skipString(gDoc, i):
+      return
+    let name = gDoc.substr(nameStart + 1, i - 2)
+    skipWs(gDoc, i)
+    if i >= gDoc.len or gDoc[i] != ':':
+      return
+    inc i
+    skipWs(gDoc, i)
+    let vs = i
+    if not skipValue(gDoc, i):
+      return
+    gMembers[memberKey(objStart, name)] = (int64(vs) shl 32) or int64(i)
+    skipWs(gDoc, i)
+    if i < gDoc.len and gDoc[i] == ',':
+      inc i
+      continue
+    if i < gDoc.len and gDoc[i] == '}':
+      return
+
+proc indexedFind(objStart: int; key: string;
+                 valueStart, valueEnd: var int): bool =
+  valueStart = -1
+  valueEnd = -1
+  cLock()
+  if not hasKey(gIndexed, objStart):
+    if len(gMembers) > IndexCeiling:
+      indexClear()
+    indexObject(objStart)
+  let packed = getOrDefault(gMembers, memberKey(objStart, key), 0'i64)
+  cUnlock()
+  if packed == 0'i64:
+    return false
+  valueStart = int(packed shr 32'i64)
+  valueEnd = int(packed and 0xFFFFFFFF'i64)
+  result = true
+
 proc locate(path: string; valueStart, valueEnd: var int): bool =
-  ## Walks a dotted path down from the document root.
+  ## Walks a dotted path down from the document root, one indexed lookup per
+  ## part. The first part is looked up in the root object, whose index is the
+  ## one full pass over the document that this design pays exactly once.
   valueStart = -1
   valueEnd = -1
   if gDoc.len == 0:
@@ -143,7 +265,7 @@ proc locate(path: string; valueStart, valueEnd: var int): bool =
     var vs = 0
     var ve = 0
     let base = if first: start else: cursor
-    if not findKeyIn(gDoc, base, part, vs, ve):
+    if not indexedFind(base, part, vs, ve):
       return false
     cursor = vs
     valueStart = vs
@@ -307,6 +429,7 @@ proc dbPatchPath*(path, patchJson: string; error: var string): bool =
     let existing = strip(gDoc.substr(vs, ve - 1))
     let merged = mergeInto(existing, strip(patchJson))
     gDoc = gDoc.substr(0, vs - 1) & merged & gDoc.substr(ve)
+    docReplaced()
     return true
 
   # Find the deepest prefix that does exist, and merge the missing tail into it
@@ -316,6 +439,7 @@ proc dbPatchPath*(path, patchJson: string; error: var string): bool =
   if parts.len == 0:
     let merged = mergeInto(strip(gDoc), strip(patchJson))
     gDoc = merged
+    docReplaced()
     return true
 
   var have = parts.len - 1
@@ -327,12 +451,14 @@ proc dbPatchPath*(path, patchJson: string; error: var string): bool =
   let tail = wrapUnder(parts, have, strip(patchJson))
   if have == 0:
     gDoc = mergeInto(strip(gDoc), tail)
+    docReplaced()
     return true
   if not locate(joinPathParts(parts, have), vs, ve):
     error = "could not create the database path: " & path
     return false
   let existing = strip(gDoc.substr(vs, ve - 1))
   gDoc = gDoc.substr(0, vs - 1) & mergeInto(existing, tail) & gDoc.substr(ve)
+  docReplaced()
   result = true
 
 # --------------------------------------------------------------- config

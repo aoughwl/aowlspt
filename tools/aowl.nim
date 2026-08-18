@@ -182,6 +182,14 @@ proc buildMod(e: Env; modPathIn: string): bool =
 
   var cmd = quoted(nimonyExe(e))
   cmd.add " c --app:lib"
+  # Mods get the ABI include path too.
+  #
+  # They did not, and the consequence was invisible until someone tried: a mod
+  # cannot `import aowlspt/il2cpp` or `aowlspt/fast` without it, because those
+  # reach the runtime through the C shims in `abi/`. So the fast path -- the
+  # whole reason a native mod beats the C# it replaces -- was unreachable from
+  # the one place it was for.
+  cmd.add abiInclude(e)
   if e.debugBuild:
     cmd.add " -d:debug"
   cmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
@@ -283,6 +291,7 @@ proc buildIl2CppHost(e: Env): bool =
   cmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
   cmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
   cmd.add " -p:" & quoted(joinPath(e.repo, "host\\common"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "host\\Aowlspt.Overlay"))
   cmd.add " -o:" & quoted(outPath)
   cmd.add " " & quoted(source)
   if not run(e, "aowlspt-host-il2cpp", cmd, dir):
@@ -325,6 +334,24 @@ proc buildProbe(e: Env): bool =
   cmd.add " -o:" & quoted(joinPath(outDir, "aowlprobe.exe"))
   cmd.add " " & quoted(joinPath(e.repo, "tools\\aowlprobe.nim"))
   result = run(e, "aowlprobe", cmd, e.repo)
+
+proc buildPerfBench(e: Env): bool =
+  ## The client-side benchmark. It wants two things `buildTool` does not give:
+  ## the fast path's bench fixture (compiled methods with real signatures, which
+  ## the stand-in runtime does not carry), and the host's own `invoke` for the
+  ## boxed path it measures against.
+  let outDir = joinPath(e.repo, "installer\\build")
+  discard ensureDir(outDir)
+  var cmd = quoted(nimonyExe(e))
+  cmd.add " c"
+  cmd.add abiInclude(e)
+  cmd.add " --passC:-DAOWLSPT_FAST_BENCH"
+  cmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "host\\Aowlspt.Host.Il2Cpp"))
+  cmd.add " -o:" & quoted(joinPath(outDir, "perfbench.exe"))
+  cmd.add " " & quoted(joinPath(e.repo, "tools\\perfbench.nim"))
+  result = run(e, "perfbench", cmd, e.repo)
 
 proc buildEmuTest(e: Env): bool =
   ## Same shape as the probe: it speaks the client's wire protocol, so it wants
@@ -489,6 +516,7 @@ proc cmdBuild(e: Env): int =
   discard buildBackend(e)
   discard buildProbe(e)
   discard buildEmuTest(e)
+  discard buildPerfBench(e)
   heading "Tools"
   discard buildInstaller(e)
   discard buildTool(e, "tools\\aowllaunch.nim", "aowlspt-launch.exe",
@@ -596,6 +624,14 @@ proc cmdTest(e: Env): int =
       discard run(e, "resolve, call and patch against a runtime",
                   harness & " " & quoted(stage) & " --runtime " &
                   quoted(mockDll) & " --seconds 8")
+
+      # The fast path, measured rather than asserted. It runs in the gate
+      # because a performance claim that is not re-checked is a performance
+      # claim that quietly stops being true.
+      if buildPerfBench(e):
+        discard run(e, "the fast path is measurably faster",
+                    quoted(joinPath(e.repo, "installer\\build\\perfbench.exe")) &
+                    " --runtime " & quoted(mockDll) & " --check")
 
   heading "Backend"
   let haveBackend = buildBackend(e)
@@ -746,6 +782,20 @@ proc cmdPayload(e: Env): int =
       let to1 = joinPath(joinPath(joinPath(dest, "mods"), baseName(m)), f)
       if copyFileAt(joinPath(bin, f), to1).ok:
         inc copied
+    # A mod's `data/` goes with it. Some mods *are* their data -- a faction is
+    # bot templates, loadouts and locale -- and a payload that carries the
+    # library without them installs a mod that loads and does nothing.
+    let dataDir = joinPath(m, "data")
+    if isDirectory(dataDir):
+      var dataFiles: seq[string] = @[]
+      var dataDirs: seq[string] = @[]
+      collectEntries(dataDir, dataFiles, dataDirs)
+      for f in dataFiles:
+        let to2 = joinPath(joinPath(joinPath(joinPath(dest, "mods"),
+                                             baseName(m)), "data"), f)
+        if copyFileAt(joinPath(dataDir, f), to2).ok:
+          inc copied
+
     let cfg = joinPath(m, "config.json")
     if fileExists(cfg):
       discard copyFileAt(cfg,

@@ -50,6 +50,11 @@
 ##    cannot be reverted) must answer `ok:false, deferred:true` rather than
 ##    being unloaded anyway. "Takes effect on restart" is a fine answer; a
 ##    half-unloaded mod is not.
+##  * `load` must be **idempotent**: a guid that is already live answers
+##    `ok:true` and does nothing. `/aowlspt/mods/apply` states the whole desired
+##    set rather than a diff, because the manager cannot know what the host has
+##    without asking — and a diff computed from a stale picture is how you get
+##    two copies of a mod loaded.
 ##  * Every request must produce exactly one `result`, including failures.
 ##    Silence is indistinguishable from a host that never implemented this, and
 ##    the manager would sit in `csUnknown` forever.

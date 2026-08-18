@@ -106,7 +106,11 @@ proc overlayClearMods*() = cOvClearMods()
 proc overlayStatus*(): string =
   ## One line, meant to be logged verbatim: either what the overlay is doing or
   ## the first thing that went wrong.
-  var buf: array[256, char]
+  # Zeroed explicitly: nimony will not let an uninitialised array's
+  # address be taken, and it is right to insist -- the C side writes at
+  # most `cap` bytes and nul-terminates, but a refusal there would leave
+  # this reading whatever was on the stack.
+  var buf: array[256, char] = default(array[256, char])
   let n = cOvStatus(addr buf[0], 256'i32)
   result = ""
   var i = 0

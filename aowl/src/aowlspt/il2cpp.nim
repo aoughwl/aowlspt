@@ -125,12 +125,16 @@ type
     eThreadAttach, eThreadDetach, eThreadCurrent,
     eGcHandleNew, eGcHandleGetTarget, eGcHandleFree,
     eFree,
+    ## Appended in one group, for the same reason as `eMethodGetFlags` below:
+    ## the enum's order is `EntryNames`' order, and inserting renames every
+    ## entry after the insertion point without touching a line of this file.
+    eClassFromType, eFieldGetFlags, eClassStaticFieldData, eGcWriteBarrier,
     ## Appended rather than inserted: the enum's order is the order of
     ## `EntryNames`, and moving an existing member renames every entry
     ## after it without changing a line of this file.
     eMethodGetFlags
 
-const NumEntries* = 58
+const NumEntries* = 62
 
 const EntryNames*: array[NumEntries, string] = [
   "il2cpp_set_data_dir", "il2cpp_set_config_dir", "il2cpp_init",
@@ -161,7 +165,10 @@ const EntryNames*: array[NumEntries, string] = [
   "il2cpp_type_get_name", "il2cpp_type_get_object",
   "il2cpp_thread_attach", "il2cpp_thread_detach", "il2cpp_thread_current",
   "il2cpp_gchandle_new", "il2cpp_gchandle_get_target", "il2cpp_gchandle_free",
-  "il2cpp_free", "il2cpp_method_get_flags"
+  "il2cpp_free",
+  "il2cpp_class_from_il2cpp_type", "il2cpp_field_get_flags",
+  "il2cpp_class_get_static_field_data", "il2cpp_gc_wbarrier_set_field",
+  "il2cpp_method_get_flags"
 ]
 
 ## The entry points the host cannot work without, as opposed to the ones it
@@ -646,3 +653,43 @@ proc methodFlags*(rt: Il2Cpp; m: Il2CppMethod): uint32 =
 
 proc methodIsStatic*(rt: Il2Cpp; m: Il2CppMethod): bool =
   result = (methodFlags(rt, m) and 0x10'u32) != 0'u32
+
+proc classFromType*(rt: Il2Cpp; t: Il2CppType): Il2CppClass =
+  ## The class behind a type, exactly.
+  ##
+  ## The alternative is to take the type's *name* and look the class up by it,
+  ## which works for `System.Int32` and falls apart on a generic, an array or a
+  ## nested type -- the printed name is not always a name the resolver accepts.
+  ## Classifying a parameter is the difference between binding a method on the
+  ## fast path and refusing it, so it is worth an entry point.
+  if not rt.has(eClassFromType): return nullPtr()
+  result = tpP(rt.fns[ord(eClassFromType)], t)
+
+proc fieldFlags*(rt: Il2Cpp; f: Il2CppField): uint32 =
+  ## Field attributes. Bit 0x10 is `static`, which cannot be inferred reliably
+  ## from the offset: a static field's offset is into the class's static data,
+  ## not into an instance, and the two ranges can overlap.
+  if not rt.has(eFieldGetFlags): return 0'u32
+  result = tu32P(rt.fns[ord(eFieldGetFlags)], f)
+
+proc fieldIsStatic*(rt: Il2Cpp; f: Il2CppField): bool =
+  result = (fieldFlags(rt, f) and 0x10'u32) != 0'u32
+
+proc staticFieldData*(rt: Il2Cpp; c: Il2CppClass): Il2CppPtr =
+  ## The base address of a class's static storage, which is what a static
+  ## field's offset is relative to.
+  if not rt.has(eClassStaticFieldData): return nullPtr()
+  result = tpP(rt.fns[ord(eClassStaticFieldData)], c)
+
+proc writeBarrier*(rt: Il2Cpp; obj, field, value: Il2CppPtr) =
+  ## Stores a reference into a field *and tells the collector*.
+  ##
+  ## Writing the pointer directly is faster and is how an object gets collected
+  ## while something still points at it: a generational collector needs to know
+  ## that an old object now references a young one, and a plain store does not
+  ## tell it. The crash arrives at the next collection, far from the write.
+  if not rt.has(eGcWriteBarrier):
+    return
+  tvPPP(rt.fns[ord(eGcWriteBarrier)], obj, field, value)
+
+proc hasWriteBarrier*(rt: Il2Cpp): bool = rt.has(eGcWriteBarrier)

@@ -341,11 +341,27 @@ static float mock_native_hurt(void* thisPtr, float amount, int32_t kind,
 }
 
 /* The invoker `runtime_invoke` uses: unpack the boxed array, call the compiled
- * function, box the result. Exactly what IL2CPP generates per signature. */
+ * function, box the result. Exactly what IL2CPP generates per signature.
+ *
+ * The call is **indirect, through `methodPointer`**, and that is the whole
+ * point of the pair. Written as a direct `mock_native_hurt(...)` it was a call
+ * gcc could see through: at -O1 it inlined the compiled function into the
+ * invoker, so `runtime_invoke` ran a private copy and a detour on
+ * `mock_native_hurt` fired for nobody. The test passed the value through
+ * unchanged and looked like a working hook that simply chose not to intervene.
+ * Real IL2CPP invokers take `methodPointer` as an argument and call it
+ * indirectly for the same reason a detour has to work at all. */
+static MockMethod* g_hurtMethod = NULL;
+static MockMethod* g_boostMethod = NULL;
+
+typedef float (*FnHurt)(void*, float, int32_t, void*);
+typedef float (*FnBoost)(float, void*);
+
 static void* m_playerHurt(void* obj, void** params) {
     float amount = *(float*)params[0];
     int32_t kind = *(int32_t*)params[1];
-    return mock_box_f32(mock_native_hurt(obj, amount, kind, NULL));
+    FnHurt fn = (FnHurt)g_hurtMethod->methodPointer;
+    return mock_box_f32(fn(obj, amount, kind, NULL));
 }
 
 /* EFT.Player::Boost(System.Single) -> System.Single, **static** and compiled.
@@ -370,7 +386,8 @@ static float mock_native_boost(float amount, void* methodInfo) {
 }
 static void* m_playerBoost(void* obj, void** params) {
     (void)obj;
-    return mock_box_f32(mock_native_boost(*(float*)params[0], NULL));
+    FnBoost fn = (FnBoost)g_boostMethod->methodPointer;
+    return mock_box_f32(fn(*(float*)params[0], NULL));
 }
 
 /* How many times the original ran. A suppressed call must leave this alone --
@@ -459,6 +476,12 @@ static char g_domain[8] = "mock";
  * returned NULL. That looks exactly like a method that legitimately returns
  * null, and it cost an hour. Derived from the tables now, so there is one place
  * to be wrong and it is the table itself. */
+static MockMethod* mock_find(MockClass* k, const char* name) {
+    for (int32_t i = 0; i < k->methodCount; i++)
+        if (strcmp(k->methods[i].name, name) == 0) return &k->methods[i];
+    return NULL;
+}
+
 static void mock_wire(void) {
     for (int a = 0; a < 3; a++) {
         MockImage* img = g_assemblies[a].image;
@@ -477,6 +500,13 @@ static void mock_wire(void) {
         }
     }
     for (int i = 0; i < 3; i++) g_assemblyPtrs[i] = &g_assemblies[i];
+
+    /* The compiled methods' invokers read `methodPointer` back out of the
+     * table at call time rather than closing over the function's address, so
+     * that a detour installed after wiring is still seen. Bound here because
+     * this is the one place that knows the table is complete. */
+    g_hurtMethod = mock_find(&g_playerClass, "Hurt");
+    g_boostMethod = mock_find(&g_playerClass, "Boost");
 }
 
 /* ------------------------------------------------------------------ *
@@ -645,14 +675,26 @@ MOCK_EXPORT const char* il2cpp_property_get_name(void* p) { (void)p; return ""; 
 MOCK_EXPORT void* il2cpp_property_get_get_method(void* p) { (void)p; return NULL; }
 MOCK_EXPORT void* il2cpp_property_get_set_method(void* p) { (void)p; return NULL; }
 
-/* Dispatch through `methodPointer`, not through `impl`. That is what makes a
- * detour observable here the way it is in the real runtime: patching the
- * pointer changes what invoke calls. */
+/* Real IL2CPP invokes in two steps: `runtime_invoke` calls the method's
+ * per-signature *invoker*, and the invoker unpacks the boxed argument array
+ * and calls `methodPointer` -- the compiled function -- indirectly.
+ *
+ * This used to call `methodPointer` itself, which was right while
+ * `methodPointer` was the invoker and catastrophic once methods grew a
+ * `native`: it handed `(obj, params)` to a function whose real signature is
+ * `(float, MethodInfo*)`, so the returned float came back as a `void*` and the
+ * caller unboxed it by dereferencing it. That is the segfault the suppression
+ * test hit, and it was the mock's, not the engine's -- the replaced value
+ * never reached a boxing step because there was none in the path.
+ *
+ * A method with no `native` is one whose `impl` *is* its whole implementation,
+ * so it is called directly; there is nothing compiled underneath it. */
 MOCK_EXPORT void* il2cpp_runtime_invoke(void* m, void* obj, void** params, void** exc) {
     if (exc) *exc = NULL;
     MockMethod* mm = (MockMethod*)m;
-    if (!mm || !mm->methodPointer) return NULL;
-    return ((MockInvoke)mm->methodPointer)(obj, params);
+    if (!mm || !mm->impl) return NULL;
+    if (!mm->native && !mm->methodPointer) return NULL;
+    return mm->impl(obj, params);
 }
 
 MOCK_EXPORT void* il2cpp_object_new(void* c) {
