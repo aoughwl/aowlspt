@@ -122,10 +122,26 @@ typedef struct AowlOvMod {
     char    guid[80];
     char    name[64];
     char    version[24];
-    int32_t enabled;   /* the desired state, as the backend knows it        */
-    int32_t loaded;    /* 1 when the host actually has it running this session */
-    int32_t pending;   /* toggled this session; takes effect on restart     */
+    int32_t enabled;    /* the desired state, as the manager resolves it      */
+    int32_t loaded;     /* 1 when it is actually running                      */
+    int32_t pending;    /* clicked, and the server has not confirmed yet      */
+    int32_t restart;    /* the manager says this one only changes on restart  */
+    int32_t hostPushed; /* the host told us about this row itself             */
 } AowlOvMod;
+
+/* `loaded` has two sources and they are not equal in authority.
+ *
+ * `hostPushed` marks the rows the host handed us through `aowl_ov_set_mod` --
+ * mods loaded in *this* process, which is a fact the process cannot be wrong
+ * about. The backend's `live` field is the *backend's* inventory, and the
+ * manager runs on the server side: it has never heard of a client-only mod. So
+ * a host-pushed row keeps its `loaded` no matter what the backend says, and a
+ * backend that answers `"live":null` (it has no host control and does not know
+ * what is running) leaves every row's `loaded` exactly where it was.
+ *
+ * Getting this backwards greys out every client-side mod the moment the panel
+ * reaches a backend, which looks precisely like the overlay deciding nothing is
+ * loaded. */
 
 /* Called on the *worker* thread after a toggle has been accepted, so the host
  * can react without polling. Optional; may be left NULL. */
@@ -553,6 +569,7 @@ static void aowl_ov_set_mod(const char* guid, const char* name,
             aowl_ov_copy(m->version, (int32_t)sizeof(m->version), version);
         m->enabled = enabled ? 1 : 0;
         m->loaded = 1;
+        m->hostPushed = 1;
     }
     LeaveCriticalSection(&g_ov.cs);
 }
@@ -644,8 +661,22 @@ static int32_t aowl_ov_http(const wchar_t* verb, const wchar_t* path,
     if (!r) goto done;
 
     {
-        const wchar_t* hdr = body ? L"Content-Type: application/json\r\n" : NULL;
-        DWORD hdrLen = body ? (DWORD)wcslen(hdr) : 0;
+        /* `Accept-Encoding: identity` is not politeness. `aowlspt-backend`
+         * zlib-deflates every response body it sends, with no `Content-Encoding`
+         * header, because that is what the Tarkov client expects -- see
+         * `sendResponse` in `backend/aowlbackend.nim`. This reader would then be
+         * handed 439 bytes starting `78 9C` and would find no rows in them, and
+         * the panel would silently fall back to read-only.
+         *
+         * The header asks the backend not to. It is ignored by the backend as it
+         * stands today -- that is a change that has to be made there, and it is
+         * written up in this directory's README -- so the check in the worker
+         * names it in the status line rather than letting it look like a network
+         * failure. */
+        const wchar_t* hdr =
+            body ? L"Content-Type: application/json\r\nAccept-Encoding: identity\r\n"
+                 : L"Accept-Encoding: identity\r\n";
+        DWORD hdrLen = (DWORD)wcslen(hdr);
         DWORD blen = body ? (DWORD)strlen(body) : 0;
         if (!g_wh.send(r, hdr, hdrLen, (LPVOID)body, blen, blen, 0)) goto done;
     }
@@ -674,18 +705,28 @@ done:
 /* ------------------------------------------------------------------ *
  * A deliberately small JSON reader.
  *
- * The backend's `/aowlspt/mods` schema is owned by the server side and is being
- * built alongside this, so this parser is written to be *tolerant of the shape
- * and strict about nothing*: it walks the response for objects at array depth
- * and pulls whichever of `guid`/`id`, `name`, `version`, `enabled` are present.
- * A field it does not find is left at whatever the host already told us, so an
- * unexpected schema degrades to the host's own list rather than to an empty
- * panel.
+ * The schema is no longer a guess. `mods/manager` serves
+ * `GET /aowlspt/mods/panel` specifically for this reader, and the shape is:
  *
- * It is not a JSON parser and does not pretend to be: no escapes, no nesting
- * beyond skipping, no numbers. If the schema settles into something this cannot
- * read, the fix is to use `aowl/src/aowlspt/json.nim` from the nimony side and
- * push rows in through `aowl_ov_set_mod`, not to grow this.
+ *   {"ok":true,"schema":"aowlspt.panel/1","side":"server","control":"absent",
+ *    "liveKnown":false,"summary":"...","mods":[
+ *      {"guid":"aowl.sain","id":"aowl.sain","name":"SAIN","version":"0.1.0",
+ *       "enabled":true,"live":null,"restart":false,
+ *       "verdict":"loaded","reason":"enabled by aowl.list.core"}, ...]}
+ *
+ * The manager's other routes -- `/aowlspt/mods/list` and friends -- carry the
+ * same information in a shape built for a script: nested decision objects, no
+ * version on the row, the version only reachable through a second request to
+ * `/describe/<id>`. The rule this file is written under (see the header) is that
+ * if the shapes do not fit, the *server* flattens them rather than this growing
+ * a real parser, and that is what the panel route is. Nothing else consumes it,
+ * so it can stay exactly the shape sixty lines of C can read.
+ *
+ * Still tolerant of everything it can afford to be: a field it does not find is
+ * left at whatever the host already told us, `"live":null` reads as "no change",
+ * and an unrecognised body degrades to the host's own list rather than to an
+ * empty panel. It is not a JSON parser and does not pretend to be: no escapes,
+ * no nesting beyond skipping, no numbers.
  * ------------------------------------------------------------------ */
 
 static const char* aowl_ov_jfind(const char* p, const char* end, const char* key) {
@@ -721,6 +762,18 @@ static void aowl_ov_ingest(const char* body, int32_t len) {
     const char* p = body;
     int32_t seen = 0;
 
+    /* Start at the array, not at the first brace. The wrapper object's own keys
+     * sit before `"mods"`, and the scan below takes each `{`..`}` pair as a row
+     * -- so from the top of the body the first "row" would be the wrapper's
+     * scalars plus row zero's fields. It reads correctly by luck today because
+     * the manager puts the scalars first and none of them is called `guid`.
+     * Skipping to the key makes it correct by construction, and costs one
+     * strstr-shaped loop. */
+    {
+        const char* a = aowl_ov_jfind(body, end, "mods");
+        if (a && a < end) p = a;
+    }
+
     EnterCriticalSection(&g_ov.cs);
     while (p < end && seen < AOWL_OV_MAX_MODS) {
         const char* o = (const char*)memchr(p, '{', (size_t)(end - p));
@@ -750,11 +803,29 @@ static void aowl_ov_ingest(const char* body, int32_t len) {
                 const char* e = aowl_ov_jfind(o, c, "enabled");
                 int32_t want = aowl_ov_jbool(e, c, m->enabled);
                 /* Only the backend's answer clears `pending`. The row shows a
-                 * `*` from the moment it is clicked until the server confirms
+                 * `~` from the moment it is clicked until the server confirms
                  * the state we asked for, so a POST that silently failed stays
                  * visible on the panel rather than looking applied. */
                 if (m->pending && want == m->enabled) m->pending = 0;
                 m->enabled = want;
+
+                /* `live` is what the *manager* knows is running, and it is only
+                 * a fact when a host has answered its control probe -- until
+                 * then the manager sends null and `aowl_ov_jbool` hands back the
+                 * default, which is this row's existing value. A row the host
+                 * pushed in is never lowered by it: see the note on
+                 * `hostPushed`. */
+                const char* lv = aowl_ov_jfind(o, c, "live");
+                if (lv && !m->hostPushed)
+                    m->loaded = aowl_ov_jbool(lv, c, m->loaded);
+
+                /* The `*` on the row. This is the whole point of the schema
+                 * reconciliation: it used to be a constant -- every toggle was
+                 * "applies on restart" because nothing could ask. Now it is the
+                 * manager's per-mod answer, and a mod the host really did unload
+                 * live comes back with restart:false and loaded:0. */
+                const char* rs = aowl_ov_jfind(o, c, "restart");
+                if (rs) m->restart = aowl_ov_jbool(rs, c, m->restart);
                 seen++;
             }
         }
@@ -790,7 +861,12 @@ static DWORD WINAPI aowl_ov_worker(LPVOID unused) {
             int32_t i = 0;
             for (; cmd.guid[i] && i < 79; i++) wguid[i] = (wchar_t)(unsigned char)cmd.guid[i];
             wguid[i] = 0;
-            _snwprintf(path, 192, L"/aowlspt/mods/%ls/enabled", wguid);
+            /* `mods/manager` serves this: it sets the override, re-resolves,
+             * and then asks the host to make it true, all in the one request.
+             * The panel has one button per row and no separate `apply`, so a
+             * toggle that only recorded an intention would need a second gesture
+             * this UI does not have. */
+            _snwprintf(path, 192, L"/aowlspt/mods/toggle/%ls", wguid);
             path[191] = 0;
             char body[48];
             _snprintf(body, sizeof(body), "{\"enabled\":%s}",
@@ -803,9 +879,17 @@ static DWORD WINAPI aowl_ov_worker(LPVOID unused) {
 
         if (sinceRefresh >= 1000) {
             sinceRefresh = 0;
-            int32_t rc = aowl_ov_http(L"GET", L"/aowlspt/mods", NULL, buf,
+            int32_t rc = aowl_ov_http(L"GET", L"/aowlspt/mods/panel", NULL, buf,
                                       (int32_t)sizeof(buf));
-            if (rc > 0) {
+            if (rc > 1 && (unsigned char)buf[0] == 0x78) {
+                /* A zlib stream, not JSON. Named exactly, because every other
+                 * symptom of it -- an empty panel, a "backend up" light over a
+                 * read-only list -- points at the wrong half of the system. */
+                InterlockedExchange(&g_ov.backendOk, 0);
+                aowl_ov_note("backend answered with a deflated body; it must "
+                             "honour Accept-Encoding: identity (see "
+                             "host/Aowlspt.Overlay/README.md)");
+            } else if (rc > 0) {
                 InterlockedExchange(&g_ov.backendOk, 1);
                 aowl_ov_ingest(buf, rc);
             } else {

@@ -433,6 +433,12 @@ var gScaleHits = 0
 var gSensState = "not attempted"
 var gSensHits = 0
 
+proc armed(state: string): bool =
+  ## An effect state reads "armed..." or "refused: ..." or "off (...)". Only
+  ## the first means a hook was installed, and that is the question every
+  ## caller of this actually has.
+  result = state.len >= 5 and state.substr(0, 4) == "armed"
+
 # The FOV chain, bound once. `Binding` and `FieldBinding` are declared bare and
 # assigned from a proc: a nimony `--app:lib` global initialised by a *call* is
 # silently left zeroed, and a zeroed Binding has `ok = false`, so it fails safe
@@ -852,15 +858,27 @@ proc onWorldReady() =
         "LerpCameraPatch -- not ported: Vector3 fields, and no instance")
   watch(FrameDriver,
         "FreeLookPatch -- not ported; carries the per-frame FOV write")
-  watch("EFT.Player::CalculateScaleValueByFov",
-        "CalculateScaleValueByFovPatch -- viewmodel/ribcage scale")
+  # An effect that already hooked its target is its own watcher: `hookArgs`
+  # and `hook` both go through `patch`, and two patches on one compiled
+  # function would be a detour of a detour.
+  if armed(gScaleState):
+    info "watching EFT.Player::CalculateScaleValueByFov through the " &
+         "replacing hook (CalculateScaleValueByFovPatch)"
+  else:
+    watch("EFT.Player::CalculateScaleValueByFov",
+          "CalculateScaleValueByFovPatch -- viewmodel/ribcage scale")
   watch("EFT.Player.FirearmController::get_AimingSensitivity",
         "AimingSensitivityPatch -- not ported: it scales, a prefix replaces")
-  watch("EFT.InventoryLogic.SightComponent::get_GetCurrentSensitivity",
-        "ScopeSensitivityPatch -- per-scope sensitivity")
+  if armed(gSensState):
+    info "watching EFT.InventoryLogic.SightComponent::" &
+         "get_GetCurrentSensitivity through the replacing hook " &
+         "(ScopeSensitivityPatch)"
+  else:
+    watch("EFT.InventoryLogic.SightComponent::get_GetCurrentSensitivity",
+          "ScopeSensitivityPatch -- per-scope sensitivity")
 
 proc reportEffect(name, state: string; hits: int) =
-  if state.len >= 6 and state.substr(0, 4) == "armed":
+  if armed(state):
     if hits > 0:
       success "  " & name & ": " & state & " -- applied " & $hits & " times"
     else:

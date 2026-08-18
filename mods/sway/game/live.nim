@@ -101,6 +101,12 @@ import ".." / model/tuning
 import ".." / model/state
 import binding
 
+# `aowlspt/fast` reaches its C side through `importc ... nodecl`, so the
+# declarations only exist in the translation unit that `#include`s the header.
+# A module that calls `perfCounter` without this gets an implicit declaration
+# and a link that happens to work on one compiler and not the next.
+{.emit: """#include "aowlspt_fast.h" """.}
+
 # ---------------------------------------------------------------------------
 # The runtime
 # ---------------------------------------------------------------------------
@@ -583,6 +589,7 @@ var gMotionSwayOrig = Zero3
 var gAimMinOrig = Zero3
 var gAimMaxOrig = Zero3
 var gCaptured = false
+var gAppliedOnce = false
 var gOverrideReported = false
 
 proc bindKnobsFor(owner: int) =
@@ -687,6 +694,17 @@ proc applyOverrides(t: Tuning) =
   ## leaving the last scaled value in place.
   if not gCaptured:
     return
+  # Both switches ship off, and a mod that has never been asked to touch BSG's
+  # numbers should not be writing to them thirty times a frame — even writing
+  # back the value that is already there. The latch is what makes turning a
+  # switch off at runtime still restore the game: once we have written, we
+  # remain responsible for putting it back.
+  let anyOn = t.springOverride or t.vanillaOverride
+  if not anyOn and not gAppliedOnce:
+    return
+  if anyOn:
+    gAppliedOnce = true
+
   for i in 0 ..< KnCount:
     if not gKnob[i].writable():
       continue
@@ -782,8 +800,9 @@ proc addAcceleration(spring: Il2CppPtr; v: Vec3) =
   if gAddAccel == nil or spring == nil:
     return
   var value = Vector3F(x: float32(v.x), y: float32(v.y), z: float32(v.z))
-  var argv: array[1, Il2CppPtr]
-  argv[0] = cast[Il2CppPtr](addr value)
+  # Initialised at the declaration rather than assigned into: nimony will not
+  # take the address of an array it cannot prove was written.
+  var argv: array[1, Il2CppPtr] = [cast[Il2CppPtr](addr value)]
   var exc: Il2CppException = nullPtr()
   discard invoke(gRt, gAddAccel, spring, cast[Il2CppPtr](addr argv[0]), exc)
   # A managed throw does not unwind through a C caller; it arrives as a written
@@ -1011,7 +1030,7 @@ proc onWeaponChanged*() =
   sWeapon = bindSlot(gRt, "", "Weapon")   # forget the old controller's class
   gCaptured = false
 
-proc actuate*(hands, camera: Vec3; t: Tuning; dt: float) =
+proc actuate*(hands, camera: Vec3; t: Tuning) =
   ## Model output in degrees -> the game's rotation springs.
   ##
   ## The impulse itself is computed by `model/director.springImpulse`, which is
@@ -1048,3 +1067,17 @@ proc actuate*(hands, camera: Vec3; t: Tuning; dt: float) =
 proc actuating*(): bool = gActuated
 proc rootWhy*(): string = gRootWhy
 proc springWhy*(): string = gSpringWhy
+
+proc frameDelta*(lastTicks: var int64): float =
+  ## Seconds since this was last called, on `QueryPerformanceCounter`.
+  ##
+  ## `LerpCamera` is handed the frame's own `dt` and this mod does not read it
+  ## (see `sway.nim`); the interval between two firings of a detour on it is
+  ## that same delta, it costs about twenty nanoseconds, and the model clamps
+  ## it to a sane band anyway. The first frame has nothing to measure against
+  ## and answers 60 Hz.
+  let now = perfCounter()
+  result = 1.0 / 60.0
+  if lastTicks != 0'i64:
+    result = float(nanosBetween(lastTicks, now)) * 0.000000001
+  lastTicks = now

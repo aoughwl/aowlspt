@@ -49,6 +49,8 @@ proc cNetRecv(sock: uint64; buf: HostPtr; len: int32): int32 {.
 proc cNetSend(sock: uint64; buf: HostPtr; len: int32): int32 {.
   importc: "aowl_net_send", nodecl.}
 proc cNetLastError(): int32 {.importc: "aowl_net_last_error", nodecl.}
+proc cNetSetTimeout(sock: uint64; ms: int32): int32 {.
+  importc: "aowl_net_set_timeout", nodecl.}
 proc cLock() {.importc: "aowl_lock", nodecl.}
 proc cUnlock() {.importc: "aowl_unlock", nodecl.}
 
@@ -525,6 +527,13 @@ proc serveConnection(sock: uint64) {.exportc: "aowlspt_nim_serve", cdecl.} =
 
     if not req.keepAlive:
       return
+    # A shorter deadline once the connection is idle between requests.
+    #
+    # The pool is the concurrency limit, and a kept-alive connection holds one
+    # of its slots for as long as it is open. Fifteen seconds is the right wait
+    # for a client that has begun a request and is still sending it; it is far
+    # too long to hold a worker for a client that has finished and gone quiet.
+    discard cNetSetTimeout(sock, 5000'i32)
     if served >= MaxKeepAlive:
       # A bound, so one client cannot pin a worker for the life of the process.
       # The pool is the concurrency limit and a connection that never ends is a
@@ -903,7 +912,12 @@ proc main(): int =
   console.line "  mods  " & $count
   console.line "  routes " & $gRoutes.len
 
-  if cNetServe(int32(gPort), 4'i32) == 0'i32:
+  # Eight, not four. A worker is occupied for the life of a connection now
+  # rather than for the life of one request, and the game opens more than one:
+  # a pool of four with keep-alive is four connections away from a server that
+  # accepts nothing. This is a robustness change and not a measured speedup --
+  # `benchbackend` drives one connection and cannot show it either way.
+  if cNetServe(int32(gPort), 8'i32) == 0'i32:
     console.err "could not listen on port " & $gPort &
         " (error " & $int(cNetLastError()) & ")"
     modhost.fail "could not listen on " & $gPort

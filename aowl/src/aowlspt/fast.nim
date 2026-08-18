@@ -96,10 +96,26 @@ proc cFldSetF64(o: Il2CppPtr; off: int32; v: float) {.importc: "aowl_fld_set_f64
 proc cFldSetU8(o: Il2CppPtr; off: int32; v: int32) {.importc: "aowl_fld_set_u8", nodecl.}
 proc cFldSetPtr(o: Il2CppPtr; off: int32; v: Il2CppPtr) {.importc: "aowl_fld_set_ptr", nodecl.}
 
-proc perfCounter*(): int64 {.importc: "aowl_perf_counter", nodecl.}
+# The clock, wrapped rather than exported raw.
+#
+# `importc ... nodecl` only works in a translation unit that has the header, and
+# the `{.emit.}` above is scoped to *this* module -- so an importing mod calling
+# `perfCounter` directly got an implicit-declaration error from the C compiler
+# rather than anything a nimony error message would explain. Two mods hit that
+# and fell back to the host's millisecond clock, which is the wrong resolution
+# for measuring a hot loop.
+#
+# The wrappers below are ordinary nimony procs. They are in this module, so they
+# have the header; an importer calls them, not the C.
+proc cPerfCounter(): int64 {.importc: "aowl_perf_counter", nodecl.}
+proc cPerfFreq(): int64 {.importc: "aowl_perf_freq", nodecl.}
+
+proc perfCounter*(): int64 =
   ## QueryPerformanceCounter. Exposed because a mod measuring its own hot loop
   ## wants the same clock the bindings report their cost on.
-proc perfFreq*(): int64 {.importc: "aowl_perf_freq", nodecl.}
+  result = cPerfCounter()
+
+proc perfFreq*(): int64 = cPerfFreq()
 
 proc nanosBetween*(startTicks, endTicks: int64): int64 =
   ## Ticks to nanoseconds. Multiplies before dividing, because the frequency is

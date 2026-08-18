@@ -21,8 +21,9 @@
 ##     model/state.nim     the shooter, as data
 ##     model/sources.nim   the five sources
 ##     model/director.nim  the signal chain
-##     game/config.nim     config.json -> Tuning
-##     sway.nim            this file: the only thing that talks to EFT
+##     game/binding.nim    one scalar on a game object: field or property
+##     game/live.nim       the walk from the world to the springs, and back
+##     sway.nim            this file: config, hooks, and the frame
 ##
 ## Nothing under `model/` imports `aowlspt`. That is deliberate and it is the
 ## whole reason the split exists: the model is pure arithmetic over two records,
@@ -30,39 +31,53 @@
 ## physics can be checked in under a second rather than by loading a raid.
 ##
 ## ---------------------------------------------------------------------------
-## What this mod can and cannot reach on a post-1.0 client
+## What reaches the game, and how
 ## ---------------------------------------------------------------------------
 ##
-## Post-1.0 Tarkov is IL2CPP. There are no managed assemblies and no Harmony,
-## so everything goes through `aowlspt/game`, and that interface has one hard
-## limit today: **it has no way to name a live object.** `resolve` hands back a
-## handle to a *class*, `call` invokes with no `this`, and a method whose
-## return type is a reference type comes back as `{"type":"..."}` with no
-## handle attached. There is therefore no path from `EFT.Player` to *this*
-## player's `Physical`, and none from `ProceduralWeaponAnimation` to *this*
-## weapon's `HandsContainer.HandsRotation`.
+## An earlier revision of this mod ran the model and published its output as an
+## event, because the client API of the day could not name a live object: there
+## was no path from `EFT.Player` to *this* player's `Physical`, and none from
+## `ProceduralWeaponAnimation` to *this* weapon's springs. That limitation is
+## gone. The mod now samples the shooter and drives the springs.
 ##
-## What that costs, precisely:
+## **Where the work happens.** Not in `onUpdate`. That runs on the host's own
+## attached thread, and writing into a spring from there would race the main
+## thread integrating it. The per-frame path is called from the detour on
+## `ProceduralWeaponAnimation::LerpCamera`, which runs on whatever thread calls
+## it — Unity's main thread — which is where the BepInEx original did it too.
+## `onUpdate` is left with what is genuinely the host's: config, the readout,
+## and publishing the last frame's output for other mods.
 ##
-## * **Sampling.** Stamina, oxygen, arm stamina, pose, lean, movement speed,
-##   ergonomics, weight and the recoil stat are all instance reads. They are
-##   held at the rested defaults in `freshState` until the host can name an
-##   object. Everything downstream of them still runs.
-## * **Output.** `HandsRotation.AddAcceleration` is an instance call on an
-##   instance field. The model's output is published — as an event and into the
-##   mod store — rather than written into the springs.
+## **How it reaches the objects.** `game/live.nim`, directly through the IL2CPP
+## runtime rather than through the host: a bound field read is 1.9 ns against
+## 305, and a bound call 10 ns against 1235 (`docs/PERF.md`). Bindings are
+## resolved once — per session for everything type-level, per *weapon change*
+## for the hands controller, whose class differs between a rifle and a knife.
+## The object chain itself is re-walked every frame, six loads, because the
+## collector moves objects and a cached pointer is a use-after-free waiting for
+## its moment.
 ##
-## What still works, and is not a stand-in:
+## **What is still not reachable, said plainly:**
 ##
-## * The model runs, in full, on the host's real frame clock.
-## * `hook` detours compiled methods, so shots, weapon changes, condition
-##   changes and per-frame ticks arrive as real game events. A detour needs no
-##   instance; it is the *calls* that do.
+## * **The `EPhysicalCondition` mask.** It is the argument to
+##   `PhysicalConditionUpdated`, and `hookArgs` would hand it over — except that
+##   the host encodes an argument it does not recognise as a *reference*, and
+##   an enum is a value type. It would call `il2cpp_gchandle_new` on the small
+##   integer `2`. So this mod does not ask for that method's arguments. The one
+##   thing the mask carried that nothing else exposes is the neurological
+##   tremor condition (stims, shock), so `neuroTremor` stays false; arm
+##   fractures and blacked limbs are read straight off the health controller
+##   instead, which the original could not do.
+## * **`LerpCamera`'s own `dt`.** Same reason it is not asked for: the frame
+##   delta is measured with `perfCounter` between detour firings instead, which
+##   is the same clock and costs twenty nanoseconds.
+## * **The view angles and the body velocity** are `Vector2`/`Vector3`
+##   properties, and a value-type *return* is unreachable on either path. They
+##   are read off the backing field instead, found by scanning `MovementContext`
+##   for a vector field with the right name and shape, once. The field it
+##   settled on is in the log.
 ##
-## Nothing here fakes the difference. Attempting an instance call with a null
-## `this` would not fail politely — IL2CPP would dereference it inside the
-## method body and take the game down — so this mod does not attempt one, and
-## says so once at load rather than looking broken in a raid.
+## Nothing here has ever run against Tarkov.
 
 import std/strutils
 import aowlspt
@@ -73,11 +88,12 @@ import model/state
 import model/sources
 import model/director
 import game/config
+import game/live
 
 const
   ModGuid = "com.savannt.sptsway"
   ModName = "SPT-SWAY"
-  ModVersion = "3.0.0"
+  ModVersion = "3.1.0"
 
 # ---------------------------------------------------------------------------
 # The model
@@ -102,10 +118,11 @@ var gDirector = newDirector()
 
 var world = whenReady("EFT.Animations.ProceduralWeaponAnimation")
 
-# Counters written by the hook handlers, which run on the game thread inside a
-# patched method, and read by `onUpdate`. Each is a plain int bumped by one
-# instruction: the handlers do the least possible work and the frame's actual
-# consequences are worked out on the mod's own tick.
+# Counters written by the hook handlers and drained by the frame handler.
+# Every one of those now runs on the game's own thread — the handlers are
+# inline detours and the frame handler is one of them — so this is ordering,
+# not synchronisation: a shot that lands mid-frame is applied at the top of the
+# next one rather than in the middle of a signal chain.
 var gShots = 0
 var gShotsSeen = 0
 var gWeaponChanges = 0
@@ -118,6 +135,9 @@ var gHooksInstalled = false
 var gStarted = false
 var gTicks = 0
 var gLastReadoutMs = 0'i64
+var gLastFrameTicks = 0'i64
+var gInjuryReadable = false
+var gSaidIdle = false
 
 # ---------------------------------------------------------------------------
 # Formatting
@@ -143,17 +163,82 @@ proc fmtVec(v: Vec3): string =
   "p " & f3(v.x) & "  y " & f3(v.y) & "  r " & f3(v.z)
 
 # ---------------------------------------------------------------------------
+# The frame
+# ---------------------------------------------------------------------------
+#
+# Everything below this line runs inside a detour, on the game's main thread.
+
+proc drainEvents() =
+  ## Turn the hook counters into model events.
+  while gShotsSeen < gShots:
+    inc gShotsSeen
+    onShot(gDirector, gTuning)
+
+  if gWeaponChangesSeen < gWeaponChanges:
+    gWeaponChangesSeen = gWeaponChanges
+    onWeaponChanged(gDirector)
+    live.onWeaponChanged()
+
+  if gConditionChangesSeen < gConditionChanges:
+    gConditionChangesSeen = gConditionChanges
+    if not gInjuryReadable:
+      # No health controller to ask, so all that arrived is "something
+      # changed" — the mask itself is the hooked method's argument and this
+      # mod does not read it (see the header). Clearing the flags is the honest
+      # response: claiming a fracture the player does not have would multiply
+      # their sway by 2.4 for no reason.
+      applyCondition(gState, 0, false, gTuning.injuryEnabled)
+
+proc sampleInjury() =
+  ## Arm state, read rather than inferred from a hook.
+  var fractured = false
+  var blacked = false
+  gInjuryReadable = sampleArmInjury(fractured, blacked)
+  if not gInjuryReadable:
+    return
+  # `applyCondition` owns the decoding, in `model/`, so the rule that a damaged
+  # but not destroyed arm means a fracture lives with the rest of the physics
+  # rather than here. It takes BSG's bitmask, so the two booleans are put back
+  # into one.
+  let mask = (if fractured or blacked: PcLeftArmDamaged else: 0)
+  applyCondition(gState, mask, blacked, gTuning.injuryEnabled)
+
+proc onFrame() =
+  ## One rendered frame: reach the game, sample it, step the model, push the
+  ## result into the springs.
+  if not beginFrame(gTuning):
+    return
+
+  # The frame delta, measured between two firings of this detour on the same
+  # clock the fast path reports its own cost on.
+  let dt = frameDelta(gLastFrameTicks)
+
+  drainEvents()
+  sample(gState)
+  sampleInjury()
+
+  var yaw = 0.0
+  var pitch = 0.0
+  discard viewAngles(yaw, pitch)
+  drive(gDirector.inertia, yaw, pitch, bodyVelocity(), gState, gTuning, dt)
+
+  let o = tick(gDirector, gState, gTuning, dt)
+
+  # `springImpulse` is in `model/` because it is arithmetic — degrees to the
+  # acceleration the springs expect, normalised to a 60 Hz frame so the mod is
+  # not twice as strong at 120 fps. It carries `driveGain`, the one constant in
+  # this mod that was calculated rather than measured; `live.actuate` says so
+  # again at the point it first matters.
+  actuate(springImpulse(o.hands, gTuning, dt),
+          springImpulse(o.camera, gTuning, dt), gTuning)
+
+# ---------------------------------------------------------------------------
 # Hooks
 # ---------------------------------------------------------------------------
 #
 # Each handler is a top-level proc, not a closure: nimony will not let a nested
 # proc touch its enclosing scope without being made a closure, and a closure is
 # not a plain function pointer so it could not cross the C ABI anyway.
-#
-# The handlers cannot read the hooked method's arguments — the host refuses to
-# guess them rather than reporting the wrong ones — which is why the condition
-# hook can only say *that* the physical condition changed, not what it changed
-# to. See the header.
 
 proc onShotFired(target: string) =
   inc gShots
@@ -166,6 +251,7 @@ proc onConditionUpdated(target: string) =
 
 proc onLerpCamera(target: string) =
   inc gFrames
+  onFrame()
 
 proc installHooks() =
   ## Four detours, each reported individually. A method that cannot be patched
@@ -191,35 +277,42 @@ proc installHooks() =
   else:
     warn "arm injury will not be noticed: " & lastError()
 
-  # LerpCamera runs every rendered frame, after BSG's own effectors have had
-  # their say, which is where the C# added this mod's output on top. It is
-  # hooked here for the frame count alone: the model is stepped from
-  # `onUpdate`, on the host's clock, because a detour handler runs inside a
-  # patched game method and must do as little as possible.
+  # LerpCamera runs every rendered frame, on Unity's main thread, and this is
+  # where the whole mod happens: sample, step, actuate.
+  #
+  # Two honest differences from the BepInEx original. It used a Harmony
+  # **postfix**, so its impulse landed after BSG's own effectors had run;
+  # aowlspt's patch is an entry detour and the host ignores the
+  # prefix/postfix distinction, so ours lands before them. `AddAcceleration`
+  # accumulates rather than sets, so that is one frame of ordering against
+  # BSG's contribution rather than a different result. And it resolved the
+  # player from the `this` the patch handed it; this one walks from the world
+  # to `MainPlayer`, which reaches the same object and is why the local player's
+  # animator is the only one driven — bots run the same animator and driving
+  # their sway from this model would be both wrong and expensive.
   if hook("EFT.Animations.ProceduralWeaponAnimation::LerpCamera",
           onLerpCamera) == Ok:
     info "hooked ProceduralWeaponAnimation::LerpCamera"
   else:
-    warn "no frame signal from the weapon animator: " & lastError()
+    error "the model has no frame to run on: " & lastError() &
+          ". Nothing will move."
 
 # ---------------------------------------------------------------------------
 # Publishing the model's output
 # ---------------------------------------------------------------------------
 
-proc publish(o: SwayOutput; dt: float) =
-  ## Where the output goes until the host can name a live object.
+proc publish() =
+  ## What the last frame produced, for anything else that wants it.
   ##
-  ## The impulse is computed here, in the units the springs want, so that the
-  ## day `AddAcceleration` becomes reachable this is the only line that changes
-  ## — and so that anything reading the event today is reading exactly what the
-  ## springs would have been given.
-  let hands = springImpulse(o.hands, gTuning, dt)
-  let camera = springImpulse(o.camera, gTuning, dt)
-
-  var payload = "{\"hands\":[" & f3(hands.x) & "," & f3(hands.y) & "," &
-                f3(hands.z) & "],\"camera\":[" & f3(camera.x) & "," &
-                f3(camera.y) & "," & f3(camera.z) & "],\"multiplier\":" &
-                f3(o.multiplier) & "}"
+  ## This used to be the mod's *output*, because the springs were unreachable.
+  ## Now it is a courtesy, so it moved to the host's tick: emitting an event and
+  ## writing a file on every rendered frame would cost more than the physics.
+  let o = gDirector.last
+  var payload = "{\"hands\":[" & f3(o.hands.x) & "," & f3(o.hands.y) & "," &
+                f3(o.hands.z) & "],\"camera\":[" & f3(o.camera.x) & "," &
+                f3(o.camera.y) & "," & f3(o.camera.z) & "],\"multiplier\":" &
+                f3(o.multiplier) & ",\"actuating\":" &
+                (if actuating(): "true" else: "false") & "}"
   discard emit("sway.output", payload)
   if storeReady():
     discard storeSet("sway.lastOutput", payload)
@@ -227,6 +320,11 @@ proc publish(o: SwayOutput; dt: float) =
 proc readout() =
   ## The BepInEx build drew this with OnGUI every frame. A native client mod
   ## has no GUI to draw into, so it goes to the log on an interval instead.
+  ##
+  ## Read from the host's thread while the game's thread writes it. That is a
+  ## torn read of a readout and nothing else: no value here is acted on, and
+  ## taking a lock around the model to print a line would put the host's
+  ## scheduling inside the frame.
   let s = gState
   let d = gDirector
   info "sway  aiming " & (if s.isAiming: "yes" else: "no") &
@@ -234,48 +332,14 @@ proc readout() =
        "  handling " & f3(s.handlingFactor)
   info "sway  stamina " & f3(s.stamina) & "  oxy " & f3(s.oxygen) &
        "  arms " & f3(s.armStamina) & "  exertion " & f3(s.exertion)
+  info "sway  ergo " & f3(s.ergonomics) & "  weight " & f3(s.weightKg) &
+       " kg  recoil " & f3(s.recoilStat) &
+       "  fracture " & (if s.armFractured: "yes" else: "no")
   info "sway  breath " & f3(d.breath.rateBpm) & " bpm  phase " &
        f3(d.breath.phase) & "  pulse " & f3(d.heart.bpm) & " bpm"
   info "sway  multiplier " & f3(d.last.multiplier)
   info "sway  hands  " & fmtVec(d.last.hands)
   info "sway  camera " & fmtVec(d.last.camera)
-
-# ---------------------------------------------------------------------------
-# The frame
-# ---------------------------------------------------------------------------
-
-proc drainEvents() =
-  ## Turn the hook counters into model events. Done here rather than in the
-  ## handlers because the handlers run on the game thread inside a patched
-  ## method: counting is one add, and everything else can wait for our tick.
-  while gShotsSeen < gShots:
-    inc gShotsSeen
-    onShot(gDirector, gTuning)
-
-  if gWeaponChangesSeen < gWeaponChanges:
-    gWeaponChangesSeen = gWeaponChanges
-    onWeaponChanged(gDirector)
-
-  if gConditionChangesSeen < gConditionChanges:
-    gConditionChangesSeen = gConditionChanges
-    # The mask itself is an argument of the hooked method and a hook cannot
-    # read arguments, so what arrives is only "something changed". Clearing the
-    # flags is the honest response: claiming a fracture the player does not
-    # have would multiply their sway by 2.4 for no reason.
-    applyCondition(gState, 0, false, gTuning.injuryEnabled)
-
-proc step(dt: float) =
-  drainEvents()
-
-  # Inertia is driven from where the view actually ended up rather than from
-  # raw mouse input, so sensitivity changes, controllers and any other mod that
-  # moves the view all feed it the same way. Those are instance reads on the
-  # camera transform, so until the host can name one the oscillator is driven
-  # at rest: it stays centred, and every other source is unaffected.
-  drive(gDirector.inertia, 0.0, 0.0, Zero3, gState, gTuning, dt)
-
-  let o = tick(gDirector, gState, gTuning, dt)
-  publish(o, dt)
 
 # ---------------------------------------------------------------------------
 # Mod entry points
@@ -304,19 +368,20 @@ proc onLoad(): Status =
   if gTuning.verboseLogging:
     info DriveGainProvenance
 
-  if side() == sideClient:
-    # Said once, at load, so that a raid where the weapon does not move has an
-    # explanation somebody can read rather than a mod that looks broken.
-    warn "this host cannot yet name a live object, so the model's output " &
-         "cannot be written into the weapon springs and the shooter cannot " &
-         "be sampled. The model runs and its output is published on the " &
-         "'sway.output' event; see the header of sway.nim."
+  # Deliberately not opening the IL2CPP runtime here. At load the process has a
+  # runtime but not yet a game, and every binding made now would be refused —
+  # correctly, and permanently, since a refusal is not retried. `onUpdate` does
+  # it on the first tick the animator exists.
   Ok
 
 proc simSelfTest() =
   ## `aowl run mods/sway` ends here. It is not a demo: it is the only place the
   ## model is exercised end to end without a game, and it fails loudly if a
   ## source has been broken.
+  ##
+  ## Note what it does *not* touch: nothing in `game/`. The model takes a state
+  ## record and a tuning record and returns two vectors, and that is still true
+  ## now that something is on the other end of it.
   var t = defaultTuning()
   var s = freshState()
   var d = newDirector()
@@ -333,6 +398,7 @@ proc simSelfTest() =
   s.moveSpeed = 1.4
 
   var peak = 0.0
+  var peakImpulse = 0.0
   var i = 0
   const Frames = 600            # ten seconds at 60 fps: two full breaths
   while i < Frames:
@@ -341,10 +407,15 @@ proc simSelfTest() =
     let m = magnitude(o.hands)
     if m > peak:
       peak = m
+    let im = magnitude(springImpulse(o.hands, t, 1.0 / 60.0))
+    if im > peakImpulse:
+      peakImpulse = im
     inc i
 
   info "sim  " & $Frames & " frames of a spent shooter aiming a 5.2 kg rifle"
   info "sim  peak hands deflection " & f3(peak) & " deg"
+  info "sim  peak spring impulse " & f3(peakImpulse) &
+       " (degrees x driveGain " & f3(t.driveGain) & ", never playtested)"
   info "sim  breath " & f3(d.breath.rateBpm) & " bpm, pulse " &
        f3(d.heart.bpm) & " bpm, exertion " & f3(s.exertion)
   info "sim  handling " & f3(s.handlingFactor) & ", support " &
@@ -372,19 +443,34 @@ proc onUpdate(elapsedMs: int64): Status =
 
   if world.ready():
     success "the weapon animator is up"
-    installHooks()
     gStarted = true
 
   if not gStarted:
     return Ok
 
-  # The host's own elapsed time. Unity's `Time.deltaTime` would be the truer
-  # frame delta, but reading it means calling into the engine from the host's
-  # attached thread rather than Unity's main thread, and `invoke_main` queues
-  # onto the host thread rather than the game's. A clock we can read safely
-  # beats a slightly better one we cannot.
-  let dt = float(elapsedMs) / 1000.0
-  step(dt)
+  # Retried until it takes: the runtime is in this process from the start, but
+  # a mod that loaded before `GameAssembly.dll` did would otherwise never bind.
+  if not openRuntime():
+    return Ok
+
+  # Hooks go in *after* the runtime is bound, and the order is the point: a
+  # detour can fire on the very next frame, on another thread, and it reads the
+  # `Il2Cpp` this call fills in. Installing first would leave a window in which
+  # the frame handler could see a half-written one.
+  installHooks()
+
+  # The model is stepped by the LerpCamera detour, on the game's thread. What
+  # is left here is what belongs on the host's: publishing, and the readout.
+  publish()
+
+  if not actuating() and not gSaidIdle and gTicks > 300:
+    gSaidIdle = true
+    if rootWhy().len > 0:
+      warn "sway  the weapon is not being driven: " & rootWhy()
+    elif springWhy().len > 0:
+      warn "sway  the weapon is not being driven: " & springWhy()
+    else:
+      info "sway  no frames driven yet; this is expected outside a raid"
 
   if gTuning.debugOverlay:
     let now = nowMs()

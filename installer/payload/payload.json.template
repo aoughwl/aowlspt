@@ -10,6 +10,13 @@
   "//": "inferable from the version -- see README.md.",
   "targetBackend": "il2cpp",
 
+  "//": "full  -- installing mirrors the client from --source into --target,",
+  "//":          "then lays this payload over it. What a post-1.0 payload is:",
+  "//":          "everything ships in aowlspt/ and there is no runtime/ or",
+  "//":          "client/ to infer it from.",
+  "//": "overlay -- adds only to the install already at --target.",
+  "kind": "full",
+
   "//": "Written to <target>/aowlspt/backend.json for the client to read.",
   "backendUrl": "https://127.0.0.1:6969"
 }

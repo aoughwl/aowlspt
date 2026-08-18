@@ -1,12 +1,12 @@
 <Project Sdk="Microsoft.NET.Sdk">
   <PropertyGroup>
     <!--
-      netstandard2.1 on purpose: the BepInEx client host runs on Unity's Mono
-      and the server host on .NET 10, and this assembly is referenced by both.
-      Anything that cannot be expressed here (UnmanagedCallersOnly, NativeLibrary)
-      belongs in the side-specific host, not in the shared contract.
+      net10.0 since the pre-1.0 hosts were retired. This targeted netstandard2.1
+      so the BepInEx client host (Unity Mono) and the SPT server host (.NET 10)
+      could share it. Both are gone (post-1.0 Tarkov is IL2CPP and its host is
+      native nimony), and aowlspt-sim, the only consumer left, is .NET 10.
     -->
-    <TargetFramework>netstandard2.1</TargetFramework>
+    <TargetFramework>net10.0</TargetFramework>
     <AssemblyName>Aowlspt.Abi</AssemblyName>
     <RootNamespace>Aowlspt.Abi</RootNamespace>
     <LangVersion>latest</LangVersion>

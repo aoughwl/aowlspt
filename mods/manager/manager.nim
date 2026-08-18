@@ -25,16 +25,24 @@
 ## ## The honest part
 ##
 ## Enabling and disabling a mod *while the game runs* needs the host to be able
-## to tear one down, and that facility is being built. Everything the manager
-## needs from it goes through `mgr/control.nim`, which today probes for it,
-## finds nothing, and says so:
+## to tear one down. `host/common/modhost.nim` can now do it — `unloadOne`
+## drops the mod's registrations through the teardown the host installs and then
+## frees the library — but **no host has been wired to answer the manager's
+## control events yet**, so on every host that exists today the probe times out
+## and you get:
 ##
 ##     manager: no host answered the control probe, so this host has no live
 ##     enable/disable. Selection changes are saved and take effect when the
 ##     host restarts.
 ##
-## Routes report the same thing, per change, in `outcome`. Nothing here claims
-## to have enabled a mod that is not running.
+## The whole mod side of that conversation is implemented, in `mgr/control.nim`,
+## against the event protocol written down at the top of that file. When a host
+## subscribes, `/apply` and `/toggle` start answering `requested` and then
+## `applied`, `live` on the panel starts being a fact rather than a `null`, and
+## nothing else in this mod changes.
+##
+## Routes report the truth, per change, in `outcome`. Nothing here claims to
+## have enabled a mod that is not running.
 ##
 ## ## Layout
 ##
@@ -114,6 +122,18 @@ var gProbeMs = 750
 var gWriteSelectionFile = true
 var gRegistryPath = ""
 var gPending = false
+
+# What the selection resolved to when this manager loaded. It is the only
+# baseline available on a host with no live control: "does this row need a
+# restart" is *does your selection differ from the one the host started with*,
+# and without a remembered starting point the honest answer would have to be
+# "everything might" — which is a `*` on every row, which is no information.
+#
+# Two parallel seqs rather than a seq of a two-field object, for the same reason
+# `recompute` builds its overrides that way: it is the shape that survives
+# nimony's handling of nested seqs in loop variables without a workaround.
+var gBaseIds: seq[string] = @[]
+var gBaseOn: seq[bool] = @[]
 
 # ---------------------------------------------------------------------------
 # Finding the registry
@@ -279,6 +299,85 @@ proc decisionJson(d: Decision): JsonObject =
   put(o, "order", d.order)
   result = o
 
+proc baselineOf(id: string; outEnabled: var bool): bool =
+  for i in 0 ..< gBaseIds.len:
+    if gBaseIds[i] == id:
+      outEnabled = gBaseOn[i]
+      return true
+  result = false
+
+proc captureBaseline() =
+  ## Taken once, at load, from the first resolution. Not refreshed by
+  ## `afterChange`: the point of it is to remember what the *host* started with,
+  ## and a baseline that moved with the selection would say "no restart needed"
+  ## about every change ever made.
+  gBaseIds = @[]
+  gBaseOn = @[]
+  for d in gRes.decisions:
+    gBaseIds.add d.id
+    gBaseOn.add d.verdict == vLoaded
+
+proc rowRestart(id: string; want: bool): bool =
+  ## Whether this one row will only be true after a restart. Four sources, in
+  ## the order they are allowed to answer:
+  ##
+  ##  1. the host said so about this mod (`deferred`, or a failure) — that is a
+  ##     fact about this mod and beats everything below,
+  ##  2. a request is out and unanswered — briefly, what is running differs from
+  ##     what was asked for, and flagging that would put a `*` on every row you
+  ##     click for the second it takes the host to answer,
+  ##  3. the host has listed what it has — then it is simply whether the running
+  ##     state differs from the wanted one,
+  ##  4. nothing answered at all — then the only thing that can be compared is
+  ##     this selection against the one the manager loaded with.
+  if needsRestart(id):
+    return true
+  if isPending(id):
+    return false
+  if liveKnown():
+    return isLive(id) != want
+  var was = false
+  if baselineOf(id, was):
+    return was != want
+  result = false
+
+proc panelRow(d: Decision): JsonObject =
+  ## One row of the in-game panel. Flat, six fields, no nesting: the reader on
+  ## the other end is `aowl_ov_ingest` in `abi/aowlspt_overlay.h`, which scans
+  ## for `{`..`}` and pulls named scalars out of it. Anything nested here would
+  ## be read as another row.
+  var version = ""
+  var name = d.name
+  var idx = -1
+  if findMod(gRegistry, d.id, idx):
+    let m = gRegistry.mods[idx]
+    version = m.version
+    if name.len == 0:
+      name = m.name
+  let want = d.verdict == vLoaded
+  var o = obj()
+  # Both spellings. `id` is what the registry and every other route call it;
+  # `guid` is what the host, the ABI and the overlay call the same string, and
+  # the two are required to be equal (registry/README.md). Emitting both costs
+  # twenty bytes a row and means neither side has to translate.
+  put(o, "guid", d.id)
+  put(o, "id", d.id)
+  put(o, "name", name)
+  put(o, "version", version)
+  put(o, "enabled", want)
+  if liveKnown():
+    put(o, "live", isLive(d.id))
+  else:
+    # Not `false`. No host has said what is running, and the overlay treats a
+    # null as "leave the row's own value alone" — which preserves what the
+    # client host pushed in about this process, the one source that cannot be
+    # stale.
+    put(o, "live", jnull())
+  put(o, "restart", rowRestart(d.id, want))
+  put(o, "verdict", verdictName(d.verdict))
+  put(o, "reason", (if hostMessage(d.id).len > 0: hostMessage(d.id) else: d.reason))
+  result = o
+
 proc problemsJson(): JsonArray =
   var a = arr()
   for p in gRes.problems:
@@ -415,6 +514,33 @@ proc routeList(url, body, session: string): string =
   put(o, "order", order)
   put(o, "mods", a)
   put(o, "problems", problemsJson())
+  result = done(o).text
+
+proc routePanel(url, body, session: string): string =
+  ## What the in-game overlay polls, once a second, from a worker thread inside
+  ## the game process.
+  ##
+  ## The scalar fields come first and the `mods` array last, deliberately: the
+  ## overlay's reader finds the `"mods"` key and starts scanning objects from
+  ## there, and a wrapper key placed after the array would be read as part of the
+  ## last row. It costs nothing to keep the order and it is the difference
+  ## between a tolerant reader and a lucky one.
+  var a = arr()
+  for d in gRes.decisions:
+    # `unknown` is a list naming a mod the registry does not have. It has no
+    # version, no artifact and nothing to toggle, so it is a problem rather than
+    # a row -- it is already in `problems` and on `/conflicts`.
+    if d.verdict == vUnknown:
+      continue
+    a.add panelRow(d)
+  var o = obj()
+  put(o, "ok", true)
+  put(o, "schema", "aowlspt.panel/1")
+  put(o, "side", gRes.side)
+  put(o, "control", stateName(controlState()))
+  put(o, "liveKnown", liveKnown())
+  put(o, "summary", summaryLine())
+  put(o, "mods", a)
   result = done(o).text
 
 proc routeLists(url, body, session: string): string =
@@ -642,6 +768,53 @@ proc routeApply(url, body, session: string): string =
   let o = applySelection()
   result = done(o).text
 
+proc routeToggle(url, body, session: string): string =
+  ## Set one mod's override and immediately try to make it true. The overlay has
+  ## one button per row and no `apply`, so a toggle that only recorded an
+  ## intention would need a second gesture that the panel does not have -- and a
+  ## panel with a button that does nothing you can see is worse than a panel
+  ## with no button.
+  ##
+  ## `{"enabled":true|false}` in the body; with no `enabled` at all it flips,
+  ## which is what a browser hitting the path can do.
+  var id = pathAfter(url, "/aowlspt/mods/toggle/")
+  if id.len == 0:
+    id = field(body, "id").asText("")
+  if id.len == 0:
+    return errorBody("name a mod: /aowlspt/mods/toggle/<id> with {\"enabled\":true}")
+  var idx = -1
+  if not findMod(gRegistry, id, idx):
+    # Said in full, because the overlay's panel also carries rows the *client*
+    # host pushed in for mods loaded on the other side of the wire, and clicking
+    # one of those lands here. That is a real situation and not a typo.
+    return errorBody("no mod called " & id & " in " & gRegistryPath &
+                     ". This manager can only change mods its registry knows; " &
+                     "a mod the client host loaded but the registry does not " &
+                     "list has to be added to the registry first.")
+  var want = false
+  var di = -1
+  if decisionFor(gRes, id, di):
+    want = gRes.decisions[di].verdict == vLoaded
+  want = not want
+  if field(body, "enabled").exists:
+    want = field(body, "enabled").asBool(want)
+
+  setOverride(id, want)
+  afterChange()
+  let ap = applySelection()
+
+  var o = obj()
+  put(o, "ok", true)
+  put(o, "id", id)
+  put(o, "guid", id)
+  put(o, "action", (if want: "enable" else: "disable"))
+  put(o, "control", stateName(controlState()))
+  var di2 = -1
+  if decisionFor(gRes, id, di2):
+    put(o, "row", panelRow(gRes.decisions[di2]))
+  put(o, "apply", ap)
+  result = done(o).text
+
 # ---------------------------------------------------------------------------
 # Lifecycle
 # ---------------------------------------------------------------------------
@@ -692,6 +865,8 @@ proc registerRoutes() =
   discard serve("/aowlspt/mods", routeStatus)
   discard serve("/aowlspt/mods/status", routeStatus)
   discard serve("/aowlspt/mods/list", routeList)
+  discard serve("/aowlspt/mods/panel", routePanel)
+  discard serve("/aowlspt/mods/toggle", routeToggle)
   discard serve("/aowlspt/mods/lists", routeLists)
   discard serve("/aowlspt/mods/conflicts", routeConflicts)
   discard serve("/aowlspt/mods/reload", routeReload)
@@ -701,6 +876,7 @@ proc registerRoutes() =
   discard servePrefix("/aowlspt/mods/enable/", routeEnable)
   discard servePrefix("/aowlspt/mods/disable/", routeDisable)
   discard servePrefix("/aowlspt/mods/clear/", routeClear)
+  discard servePrefix("/aowlspt/mods/toggle/", routeToggle)
   discard servePrefix("/aowlspt/mods/select/", routeSelectOne)
 
 proc onLoad(): Status =
@@ -708,6 +884,7 @@ proc onLoad(): Status =
   ensureLoaded(gDefaultLists)
   discoverRegistry()
   recompute()
+  captureBaseline()
   registerRoutes()
   # The probe goes out after the routes exist: a host that answers instantly
   # would otherwise be answered by a mod that cannot yet be asked anything.

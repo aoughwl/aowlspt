@@ -1,4 +1,4 @@
-## The driver: who thinks, when.
+## The driver: who thinks, when — and who is even there.
 ##
 ## SAIN ticks every bot from `GameWorld.DoWorldTick`, every frame, and each
 ## sub-component decides internally whether it is due. That is thirty-odd
@@ -7,7 +7,7 @@
 ## timers coincide. The user's stated reason for this whole project is that bot
 ## AI was the expensive part; this file is where that is answered.
 ##
-## Three decisions, all of them the point:
+## Four decisions, all of them the point:
 ##
 ## **A fixed budget per tick.** `maxBotsPerTick` bots are considered each tick,
 ## in round-robin order. Thirty bots at a budget of eight means every bot is
@@ -25,6 +25,15 @@
 ## tick is not read from the game at all. In SAIN a sleeping bot still ticks its
 ## always-update components.
 ##
+## **Discovery is amortised too.** Walking the world's alive-players list is the
+## one piece of work whose cost is linear in the raid's population and cannot be
+## made per-bot, so it runs at `ScanIntervalMs` rather than per frame, and it is
+## the *reconciler* rather than the primary path — the spawn hook in `sain.nim`
+## is what usually registers a bot first. A scan of thirty players is thirty
+## bound `get_Item` calls plus one bound `get_IsAI` each, which is under a
+## microsecond in total; doing it at 2 Hz rather than 60 is still worth it,
+## because the profile-id string read on a *new* player is not.
+##
 ## What this file deliberately does *not* do is spread one bot's work across
 ## ticks. A decision computed from half-stale state is a decision nobody can
 ## reason about, and the whole ladder for one bot is a few hundred nanoseconds
@@ -32,6 +41,7 @@
 ## budget rations.
 
 import aowlspt
+import aowlspt/il2cpp
 import ".." / core / vec
 import ".." / core / types
 import ".." / core / settings
@@ -42,6 +52,13 @@ import ".." / core / cover
 import ".." / core / rng
 import ".." / preset / preset
 import bridge
+import live
+
+const
+  ScanIntervalMs = 500'i64
+    ## How often the world is walked for bots nobody has told us about. Half a
+    ## second is a latency nobody can see on a bot that has just spawned and
+    ## has not yet been given a decision, and it is 1/30th of the frames.
 
 type
   BotState = object
@@ -71,6 +88,14 @@ var gTimeSeconds = 0.0
 var gPlayerPosition = zeroVec()
 var gDecisionsMade = 0
 var gCallsMade = 0
+var gLastScanAt = 0'i64
+var gAttached = 0
+var gDetached = 0
+
+## The human player, held the same way a bot is: one GC handle, resolved to a
+## pointer once per tick. Everything in `decisionInterval` is keyed off distance
+## to this position, so a stale one would mis-band every bot in the raid.
+var gHumanHandle = 0'u32
 
 proc setPreset*(p: Preset) = gPreset = p
 
@@ -80,14 +105,18 @@ proc indexOfBot(id: string): int =
     if gBots[i].handle.id == id:
       return i
 
-proc spawnBot*(id: string; handle: Handle; spawnType: string;
-               difficulty: float) =
+proc spawnBot*(id: string; spawnType: string; difficulty: float) =
   ## Register a bot. All of its per-raid setup happens here, once.
   ##
   ## This is the payoff for `preset.settingsFor` being a struct copy: a bot
   ## joining a raid in progress costs one copy and one pass of multiplies, not a
   ## config parse and a dictionary walk per settings category the way SAIN's
   ## `GetSAINSettings` does.
+  ##
+  ## No game pointer is taken here, and that is deliberate: this is called both
+  ## from the spawn hook (which has a host handle the fast path cannot use) and
+  ## from the sim (which has no game at all). `attachBot` is the separate step
+  ## that gives the record its IL2CPP handle, and the scan does it.
   if indexOfBot(id) >= 0:
     return
   let role = roleFromSpawnType(spawnType)
@@ -95,7 +124,7 @@ proc spawnBot*(id: string; handle: Handle; spawnType: string;
   let personality = personalityFor(gPreset, role, nextFloat(r))
   let s = settingsFor(gPreset, role, personality, difficulty)
   gBots.add BotState(
-    handle: BotHandle(id: id, handle: handle, role: role),
+    handle: BotHandle(id: id, role: role, gcPlayer: 0'u32),
     settings: s, personality: personality,
     ctx: newContext(nextFloat(r)),
     enemies: newEnemyTable(), searchState: newSearch(),
@@ -110,6 +139,10 @@ proc despawnBot*(id: string) =
   ## Compact in place. A raid that spawns and kills a few hundred bots would
   ## otherwise leave the table growing all raid, and every scan of it paying
   ## for the dead.
+  ##
+  ## The handle is released on the way past. Missing that is a leak rather than
+  ## a crash -- the object stays pinned for the session -- which is exactly the
+  ## kind of failure that never shows up until a long raid.
   var w = 0
   for r in 0 ..< gBots.len:
     if gBots[r].handle.id != id:
@@ -117,12 +150,103 @@ proc despawnBot*(id: string) =
         let keep = gBots[r]
         gBots[w] = keep
       inc w
+    else:
+      var dying = gBots[r]
+      detach(dying.handle)
+      gBots[r] = dying
+      inc gDetached
   if w < gBots.len:
     shrink(gBots, w)
   if gCursor >= gBots.len:
     gCursor = 0
 
 proc botCount*(): int = gBots.len
+
+proc attachBot(id: string; player: Il2CppPtr) =
+  ## Give a registered bot its IL2CPP handle.
+  let i = indexOfBot(id)
+  if i < 0:
+    return
+  var st = gBots[i]
+  if st.handle.gcPlayer != 0'u32:
+    return
+  attach(st.handle, player)
+  gBots[i] = st
+  if st.handle.gcPlayer != 0'u32:
+    inc gAttached
+
+# ---------------------------------------------------------------------------
+# Discovery
+# ---------------------------------------------------------------------------
+
+proc scanWorld(nowMillis: int64) =
+  ## Reconcile the bot table against the world.
+  ##
+  ## Three jobs, one walk: find the human (for the distance banding), attach any
+  ## bot that has no handle yet, and register any bot the spawn hook never told
+  ## us about. Bots that have *died* are not detected here -- `AllAlivePlayersList`
+  ## dropping a player is indistinguishable from a scan that ran while the list
+  ## was being rebuilt, so death is decided per bot by reading its health
+  ## controller in `tickBot`, which cannot be wrong about it.
+  if nowMillis - gLastScanAt < ScanIntervalMs:
+    return
+  gLastScanAt = nowMillis
+  if not capable():
+    return
+  let world = worldObject()
+  if world == nil:
+    return
+  let list = alivePlayers(world)
+  if list == nil:
+    return
+  let n = listLen(list)
+  var i = 0
+  while i < n:
+    let p = listAt(list, i)
+    inc i
+    if p == nil:
+      continue
+    if not isAI(p):
+      # The human. One handle, taken once; `hold` is not free and this list is
+      # walked twice a second.
+      if gHumanHandle == 0'u32:
+        gHumanHandle = hold(p)
+      continue
+    # A bot. The profile-id read is the expensive part of this loop -- a bound
+    # call plus a UTF-16 to UTF-8 copy -- so it happens once per player per
+    # scan and never on the per-bot decision path.
+    let id = profileIdOf(p)
+    if id.len == 0:
+      continue
+    let at = indexOfBot(id)
+    if at < 0:
+      # The spawn hook never fired for this one, or fired before this mod was
+      # listening. Registering it with a scav's settings is the safe default:
+      # `roleFromSpawnType` says why, and the hook supplies the real role when
+      # it does fire first.
+      spawnBot(id, "", 0.5)
+    attachBot(id, p)
+
+proc updatePlayerPosition() =
+  ## One handle lookup and one reflective `Vector3` read per tick, for the whole
+  ## raid, rather than per bot. Everything the scheduler does with distance is
+  ## keyed off this.
+  if gHumanHandle == 0'u32:
+    return
+  let p = target(gHumanHandle)
+  if p == nil:
+    # The human's `Player` was collected -- raid over, or a transition. Drop the
+    # handle so the next scan takes a fresh one.
+    drop(gHumanHandle)
+    gHumanHandle = 0'u32
+    return
+  gPlayerPosition = readVec(gB.pPosition, p)
+
+proc setPlayerPosition*(p: Vec3) = gPlayerPosition = p
+
+# ---------------------------------------------------------------------------
+# One bot's tick
+# ---------------------------------------------------------------------------
 
 proc decisionInterval(s: Settings; distanceToPlayer: float): float =
   ## How long until this bot is due again.
@@ -161,14 +285,30 @@ proc buildView(st: BotState; me: SelfView): BotView =
     hasSearchTarget: active(st.searchState),
     searchTarget: st.searchState.target, extractRequested: false)
 
-proc tickBot(index: int) =
-  ## One bot's whole decision, start to finish.
+proc tickBot(index: int): bool =
+  ## One bot's whole decision, start to finish. False when the bot has died and
+  ## should be dropped from the table.
   var st = gBots[index]
-  let me = readSelf(st.handle)
+  let dt = gTimeSeconds - st.lastDecisionAt
+
+  # This frame's pointers. One `gc_handle_get_target` plus two bound property
+  # calls; every read below runs off them with no further indirection.
+  let l = liveOf(st.handle)
+  if l.ok and not isAlive(l.player):
+    return false
+
+  let me = readSelf(st.handle, l)
   st.lastDecisionAt = gTimeSeconds
   st.lastPosition = me.position
 
-  # Perception first: the ladder reads the enemy table, so it has to be current.
+  # Perception. The game has already done the visibility work; this folds its
+  # answer into the bot's own memory, which is what decays, forgets and ranks.
+  if l.ok:
+    let obs = observeEnemy(st.handle, l, gTimeSeconds)
+    if obs.id.len > 0:
+      observe(st.enemies, obs, me.position, me.lookDirection, st.settings,
+              gTimeSeconds, (if dt > 0.0: dt else: 0.1))
+
   # `forget` is cheap and compacting, and running it here rather than on its own
   # timer means a bot never scans entries it has already stopped believing in.
   forget(st.enemies, st.settings)
@@ -201,10 +341,11 @@ proc tickBot(index: int) =
                    d.combat == cdRetreat or d.combat == cdRunAway)
 
   # Only act on a change. A bot already sprinting to cover does not need to be
-  # told again every tick, and each telling is an IL2CPP invoke.
+  # told again every tick, and each telling is at best a bound call and at worst
+  # a reflective one with a boxed Vector3 argument.
   if d.combat != st.lastAppliedCombat:
     let a = actuationFor(d, view)
-    gCallsMade = gCallsMade + apply(st.handle, a)
+    gCallsMade = gCallsMade + apply(st.handle, l, a)
     st.lastAppliedCombat = d.combat
     if gPreset.logDecisions:
       debug "sain: " & st.handle.id & " -> " & decisionName(d.combat) &
@@ -212,15 +353,18 @@ proc tickBot(index: int) =
             selfActionName(d.self) & "  (" & d.reason & ")"
 
   gBots[index] = st
+  result = true
 
 proc tick*(elapsedMs: int64) =
   ## Called from `onUpdate`. Constant cost in the number of bots.
   gTimeSeconds = gTimeSeconds + float(int(elapsedMs)) / 1000.0
+  updatePlayerPosition()
   if gBots.len == 0:
     return
   let budget = gPreset.base.maxBotsPerTick
   var considered = 0
   var scanned = 0
+  var died = ""
   # Round-robin from where the last tick stopped, so no bot is starved by the
   # ones ahead of it in the table.
   while scanned < gBots.len and considered < budget:
@@ -237,11 +381,33 @@ proc tick*(elapsedMs: int64) =
               decisionInterval(st.settings, dist)
     if not due:
       continue
-    tickBot(i)
+    if not tickBot(i):
+      # One death per tick is enough: `despawnBot` compacts the table, which
+      # would invalidate the cursor and the index this loop is holding. The
+      # rest are picked up on the next tick, which is 16 ms away.
+      died = gBots[i].handle.id
+      break
     inc considered
+  if died.len > 0:
+    despawnBot(died)
 
-proc setPlayerPosition*(p: Vec3) = gPlayerPosition = p
+proc scan*(nowMillis: int64) =
+  ## The discovery half of the tick, kept separate so `onUpdate` can call it
+  ## before `tick` and so the sim can skip it.
+  scanWorld(nowMillis)
+
+proc releaseAll*() =
+  ## Drop every handle this mod is holding. Called at unload; without it, a
+  ## reload of the mod leaks one pinned object per bot plus the human.
+  for i in 0 ..< gBots.len:
+    var st = gBots[i]
+    detach(st.handle)
+    gBots[i] = st
+  if gHumanHandle != 0'u32:
+    drop(gHumanHandle)
+    gHumanHandle = 0'u32
 
 proc stats*(): string =
   result = $gBots.len & " bots, " & $gDecisionsMade & " decisions, " &
-           $gCallsMade & " game calls"
+           $gCallsMade & " game calls, " & $gAttached & " attached, " &
+           $gDetached & " released"

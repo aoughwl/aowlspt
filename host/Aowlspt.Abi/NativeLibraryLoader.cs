@@ -1,9 +1,12 @@
-// Loading a shared library, portably, from netstandard2.1.
+// Loading a shared library, portably.
 //
-// System.Runtime.InteropServices.NativeLibrary would do this in one line, but it
-// does not exist on netstandard2.1 and is not available on the Unity Mono
-// runtime the client host lives in. So the platform calls are made directly —
-// they are three functions per platform and they are stable.
+// System.Runtime.InteropServices.NativeLibrary would do this in one line. This
+// hand-rolls it because the assembly used to target netstandard2.1 for the
+// Unity-Mono client host, which had neither. That host is gone and the
+// constraint with it; the code stays because it works, is three stable
+// functions per platform, and reports LoadLibrary's failure modes better than
+// NativeLibrary does. Replacing it is a change to how every mod is loaded, so
+// it wants its own commit rather than riding along with a deletion.
 
 using System;
 using System.IO;

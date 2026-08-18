@@ -61,6 +61,22 @@ static int32_t aowl_rt_tick_count(void) {
   if (!f) return -1;
   return ((int32_t(*)(void))f)();
 }
+/* The thread the mock's per-frame method runs on, and how many frames it has
+   run. This is the harness's half of the main-thread proof: the host says
+   which thread ran a callback that was queued from another one, and only the
+   mock knows which thread its frame loop is. Equal is the assertion. */
+static uint32_t aowl_rt_frame_thread(void) {
+  if (!g_mockRt) return 0;
+  void* f = (void*)GetProcAddress((HMODULE)g_mockRt, "mock_frame_thread_id");
+  if (!f) return 0;
+  return ((uint32_t(*)(void))f)();
+}
+static int32_t aowl_rt_frame_count(void) {
+  if (!g_mockRt) return -1;
+  void* f = (void*)GetProcAddress((HMODULE)g_mockRt, "mock_frame_count");
+  if (!f) return -1;
+  return ((int32_t(*)(void))f)();
+}
 """.}
 {.emit: """#include "aowlspt_inject.h" """.}
 
@@ -71,6 +87,8 @@ proc harnessSleep(ms: int32) {.importc: "aowl_harness_sleep", nodecl.}
 proc rtLoad(path: cstring): int32 {.importc: "aowl_rt_load", nodecl.}
 proc rtInit(): int32 {.importc: "aowl_rt_init", nodecl.}
 proc rtTickCount(): int32 {.importc: "aowl_rt_tick_count", nodecl.}
+proc rtFrameThread(): uint32 {.importc: "aowl_rt_frame_thread", nodecl.}
+proc rtFrameCount(): int32 {.importc: "aowl_rt_frame_count", nodecl.}
 
 type LaunchPtr = nil pointer
 
@@ -115,7 +133,25 @@ proc parseCount(s: string; into: var int): bool =
   if any: into = v
   result = any
 
-proc checkLog(logPath: string; expectRuntime: bool = false): int =
+proc numberAfter(line: string; needle: string): int =
+  ## The first run of digits after `needle`, or -1 if the needle is not there.
+  ## Written out rather than reached for with a parser because the only thing
+  ## being read is a thread id the host printed itself.
+  result = -1
+  let at = find(line, needle)
+  if at < 0:
+    return
+  var i = at + needle.len
+  var v = 0
+  var any = false
+  while i < line.len and line[i] >= '0' and line[i] <= '9':
+    v = v * 10 + (ord(line[i]) - ord('0'))
+    any = true
+    inc i
+  if any: result = v
+
+proc checkLog(logPath: string; expectRuntime: bool = false;
+              frameThread: int = 0): int =
   heading "Host log"
   var text = ""
   if not readTextFile(logPath, text):
@@ -136,6 +172,9 @@ proc checkLog(logPath: string; expectRuntime: bool = false): int =
   var argsOk = false
   var objectOk = false
   var fieldOk = false
+  var drainBound = false
+  var drainMethod = ""
+  var selfTestThread = -1
   for l in splitLines(text):
     if find(l, "host running") >= 0:
       started = true
@@ -164,6 +203,15 @@ proc checkLog(logPath: string; expectRuntime: bool = false): int =
     # right rather than lucky.
     if find(l, "field agrees with get_") >= 0:
       fieldOk = true
+    # The main-thread drain. Which method bound is reported rather than
+    # assumed: the host tries several and the harness has no business knowing
+    # which one this runtime happens to have.
+    if find(l, "main-thread drain bound to ") >= 0:
+      drainBound = true
+      let at = find(l, "main-thread drain bound to ")
+      drainMethod = l.substr(at + len("main-thread drain bound to "))
+    if find(l, "invoke_main self-test ran on thread ") >= 0:
+      selfTestThread = numberAfter(l, "invoke_main self-test ran on thread ")
 
   heading "Result"
   if not started:
@@ -210,6 +258,27 @@ proc checkLog(logPath: string; expectRuntime: bool = false): int =
     err "no field was read; reflection over fields did not work"
     return 1
   ok "a field was read by declared type and agreed with its property"
+
+  # The main-thread handoff. This is the one assertion that cannot be made from
+  # the log alone: the host says which thread ran a callback that was queued
+  # from a different one, and only the runtime knows which thread its frame
+  # loop is. They have to be the same number.
+  if frameThread <= 0:
+    return 0
+  if not drainBound:
+    err "the host bound no per-frame method, so invoke_main is still on its " &
+        "own thread"
+    return 1
+  ok "the host detoured " & drainMethod & " to drain on the game's thread"
+  if selfTestThread < 0:
+    err "the queued callback never ran"
+    return 1
+  if selfTestThread != frameThread:
+    err "a callback queued from the host thread ran on thread " &
+        $selfTestThread & ", but the per-frame method runs on " & $frameThread
+    return 1
+  ok "a callback queued from another thread ran on thread " & $frameThread &
+     " -- the same thread the drain hook fires on"
   result = 0
 
 proc runInjection(hostDll, logPath, target: string; seconds: int): int =
@@ -361,6 +430,14 @@ proc main(): int =
   line "  running for " & $seconds & "s"
   harnessSleep(int32(seconds * 1000))
 
-  result = checkLog(logPath, haveRuntime)
+  var frameThread = 0
+  if haveRuntime:
+    frameThread = int(rtFrameThread())
+    if frameThread > 0:
+      heading "Frame loop"
+      line "  the mock ran " & $int(rtFrameCount()) &
+           " frames on thread " & $frameThread
+
+  result = checkLog(logPath, haveRuntime, frameThread)
 
 quit(main())

@@ -1,8 +1,17 @@
 // sptreflect — dumps the public API surface of the SPT 4.x server assemblies.
 //
 // Reads assemblies with MetadataLoadContext (metadata only, never executes SPT
-// code and never writes into the SPT install). Used to (a) discover the host
-// API we bind against and (b) drive binding generation for the Nim/aowl side.
+// code and never writes into the SPT install).
+//
+// This targets SPT 4.x, which is a pre-1.0 (Mono) project, and aowlspt no longer
+// builds anything against SPT: the live path is the nimony backend
+// (`aowlspt-backend`) and the native IL2CPP client host. It is kept for one
+// reason -- it is what produces `reference/spt-4.1-surface.*`, and the ~590
+// `SPTarkov.Server.Core.Models.Eft` types in that dump are the closest thing
+// there is to a written spec of the request and response shapes the Tarkov
+// client speaks. The emulator in `mods/tarkov` has to match those shapes, and
+// the wire protocol does not care whether the client is Mono or IL2CPP. Re-run
+// it when SPT updates; see `reference/README.md`.
 //
 //   sptreflect <spt-runtime-dir> [--filter <substring>] [--json <out>] [--members]
 //

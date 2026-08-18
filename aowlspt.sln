@@ -1,4 +1,4 @@
-Microsoft Visual Studio Solution File, Format Version 12.00
+﻿Microsoft Visual Studio Solution File, Format Version 12.00
 # Visual Studio Version 17
 VisualStudioVersion = 17.0.31903.59
 MinimumVisualStudioVersion = 10.0.40219.1
@@ -6,13 +6,7 @@ Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Aowlspt.Abi", "host\Aowlspt
 EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Aowlspt.Sim", "host\Aowlspt.Sim\Aowlspt.Sim.csproj", "{A0000001-0000-0000-0000-000000000002}"
 EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Aowlspt.Host.Server", "host\Aowlspt.Host.Server\Aowlspt.Host.Server.csproj", "{A0000001-0000-0000-0000-000000000003}"
-EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "Aowlspt.Host.Client", "host\Aowlspt.Host.Client\Aowlspt.Host.Client.csproj", "{A0000001-0000-0000-0000-000000000004}"
-EndProject
 Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SptReflect", "tools\SptReflect\SptReflect.csproj", "{A0000001-0000-0000-0000-000000000005}"
-EndProject
-Project("{FAE04EC0-301F-11D3-BF4B-00C04F79EFBC}") = "SptProbe", "tools\SptProbe\SptProbe.csproj", "{A0000001-0000-0000-0000-000000000006}"
 EndProject
 Global
 	GlobalSection(SolutionConfigurationPlatforms) = preSolution
@@ -28,22 +22,10 @@ Global
 		{A0000001-0000-0000-0000-000000000002}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{A0000001-0000-0000-0000-000000000002}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{A0000001-0000-0000-0000-000000000002}.Release|Any CPU.Build.0 = Release|Any CPU
-		{A0000001-0000-0000-0000-000000000003}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{A0000001-0000-0000-0000-000000000003}.Debug|Any CPU.Build.0 = Debug|Any CPU
-		{A0000001-0000-0000-0000-000000000003}.Release|Any CPU.ActiveCfg = Release|Any CPU
-		{A0000001-0000-0000-0000-000000000003}.Release|Any CPU.Build.0 = Release|Any CPU
-		{A0000001-0000-0000-0000-000000000004}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{A0000001-0000-0000-0000-000000000004}.Debug|Any CPU.Build.0 = Debug|Any CPU
-		{A0000001-0000-0000-0000-000000000004}.Release|Any CPU.ActiveCfg = Release|Any CPU
-		{A0000001-0000-0000-0000-000000000004}.Release|Any CPU.Build.0 = Release|Any CPU
 		{A0000001-0000-0000-0000-000000000005}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
 		{A0000001-0000-0000-0000-000000000005}.Debug|Any CPU.Build.0 = Debug|Any CPU
 		{A0000001-0000-0000-0000-000000000005}.Release|Any CPU.ActiveCfg = Release|Any CPU
 		{A0000001-0000-0000-0000-000000000005}.Release|Any CPU.Build.0 = Release|Any CPU
-		{A0000001-0000-0000-0000-000000000006}.Debug|Any CPU.ActiveCfg = Debug|Any CPU
-		{A0000001-0000-0000-0000-000000000006}.Debug|Any CPU.Build.0 = Debug|Any CPU
-		{A0000001-0000-0000-0000-000000000006}.Release|Any CPU.ActiveCfg = Release|Any CPU
-		{A0000001-0000-0000-0000-000000000006}.Release|Any CPU.Build.0 = Release|Any CPU
 	EndGlobalSection
 	GlobalSection(SolutionProperties) = preSolution
 		HideSolutionNode = FALSE

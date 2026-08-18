@@ -81,10 +81,10 @@ proc toBytes*(s: string): seq[byte] =
   ## `copyMem`, not a byte loop.
   ##
   ## These carry whole request and response bodies, and the static tables are
-  ## megabytes: a per-byte loop over one of those costs more wall time than the
-  ## deflate it feeds. Measured at 3000 item templates, converting the
-  ## `/client/items` body one byte at a time was 24 ms of the 41 ms the whole
-  ## response took.
+  ## megabytes: a per-byte loop over one of those is real wall time. Taking the
+  ## byte loops out of this file and the backend's copy of them moved
+  ## `/client/items` from 71.0 ms to 57.7 ms round-trip on a 4.2 MB body, before
+  ## any of the caching that came after it.
   result = newSeq[byte](if s.len > 0: s.len else: 1)
   if s.len > 0:
     copyMem(addr result[0], readRawData(s), s.len)

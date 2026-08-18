@@ -22,6 +22,7 @@
 
 import std/[strutils, syncio, cmdline]
 import aowlsptinstall/[winfs, log, eft, payload, compat, plan, journal]
+import aowlsptinstall/registry
 
 const Usage = """
 aowlspt-install -- install aowlspt over a Tarkov client
@@ -36,6 +37,14 @@ Options
   --source PATH    the vanilla install to build from (read only, never written)
   --target PATH    where the aowlspt install goes (created if missing)
   --payload PATH   the payload directory to install from
+  --registry PATH  the mod registry (mods.json, or a directory holding one).
+                   Defaults to the one in the payload, if it carries one.
+  --list ID        the mod list a fresh install starts with
+                   (default aowl.list.vanillaplus; `none` leaves the
+                   payload's own default alone)
+  --overlay        add the payload to the install already at --target, rather
+                   than mirroring a client into it. What you want when you are
+                   updating the mods in an install you already made.
   --copy           copy every file, rather than hard linking the asset bundles
   --force          proceed past a recoverable objection; see below
   --yes            do not ask for confirmation
@@ -64,15 +73,20 @@ type
     source: string
     target: string
     payloadPath: string
+    registryPath: string
+    listId: string
     positional: seq[string]
     copyInstead: bool
+    overlay: bool
     force: bool
     assumeYes: bool
     help: bool
 
 proc parseArgs(): Options =
   result = Options(command: "", source: "", target: "", payloadPath: "",
-                   positional: @[], copyInstead: false, force: false,
+                   registryPath: "", listId: registry.DefaultList,
+                   positional: @[], copyInstead: false, overlay: false,
+                   force: false,
                    assumeYes: false, help: false)
   var i = 1
   let n = paramCount()
@@ -87,6 +101,14 @@ proc parseArgs(): Options =
     elif a == "--payload" or a == "-p":
       inc i
       if i <= n: result.payloadPath = paramStr(i)
+    elif a == "--registry":
+      inc i
+      if i <= n: result.registryPath = paramStr(i)
+    elif a == "--list":
+      inc i
+      if i <= n: result.listId = paramStr(i)
+    elif a == "--overlay":
+      result.overlay = true
     elif a == "--copy":
       result.copyInstead = true
     elif a == "--force":
@@ -159,23 +181,32 @@ proc cmdDetect(o: Options): int =
 
 # ----------------------------------------------------------- shared setup
 
+proc wholeInstall(o: Options; pay: Payload): bool =
+  ## Whether this run lays down a client of its own. The payload declares it;
+  ## `--overlay` can only ever turn it off, never on -- a payload with no client
+  ## in it cannot be talked into producing one, and a flag that pretended
+  ## otherwise would produce a target with a journal claiming it owns a game
+  ## that is not there.
+  result = pay.kind == plFull and not o.overlay
+
 proc requireOpt(value: string; name: string): string =
   if value.len == 0:
     fatal "missing " & name
   result = value
 
-proc buildPlan(install: EftInstall; pay: Payload; targetIn: string): Plan =
+proc buildPlan(install: EftInstall; pay: Payload; targetIn: string;
+               registryPath, listId: string; whole: bool): Plan =
   ## The order matters and is the order a person would do it by hand: lay down
   ## the client, put the runtime beside it, then the mod loader, then aowlspt,
   ## then the configuration that points the client at the backend. Each step
   ## only overwrites what the step before it put there.
   let target = absolutePathOf(targetIn)
 
-  # A payload carrying a runtime or a mod loader is one that builds a whole
-  # install; a payload carrying only `aowlspt/` is an overlay onto one that
-  # already exists. The difference decides whether the target belongs to this
-  # installer, which is what uninstall needs to know.
-  let whole = pay.kind == plFull
+  # `whole` -- the payload's declared kind, unless `--overlay` overrode it --
+  # decides whether a client is mirrored into the target, and with it whether
+  # the target belongs to this installer. Uninstall needs to know, so it is
+  # decided once by the caller and passed in rather than re-derived here where
+  # it could disagree with what was printed.
   result = newPlan(target, whole)
 
   # BattlEye is not carried across. It is anti-cheat for the live service, the
@@ -219,6 +250,35 @@ proc buildPlan(install: EftInstall; pay: Payload; targetIn: string): Plan =
     copyTree(result, aowlsptDir(pay), joinPath(target, "aowlspt"),
              "aowlspt: the hosts, and the mods built against them")
 
+  # The registry, and the list a fresh install starts with. Both come after the
+  # `aowlspt/` copy, because both write into what that copy laid down -- and the
+  # plan is executed in the order it is printed, so "after" here is the same
+  # word it is on screen.
+  if registryPath.len > 0:
+    copyFile(result, registryPath, joinPath(target, RegistryRelPath),
+             "the mod registry: what exists, and the lists that name it")
+
+    # And the default selection. The manager seeds itself, once, from
+    # `activeLists` in its own config; there is no other way in. So the payload's
+    # copy of that config is read here, patched, and written back as a step of
+    # its own -- rather than a config invented here, which would be missing
+    # every key the mod grows after today.
+    if listId.len > 0 and listId != NoList:
+      let cfgPath = joinPath(aowlsptDir(pay), "mods\\manager\\config.json")
+      var cfgText = ""
+      if not fileExists(cfgPath):
+        note "the payload has no mod manager; no default selection to set"
+      elif not readTextFile(cfgPath, cfgText):
+        warn "could not read " & cfgPath & "; leaving the default selection alone"
+      else:
+        let patched = patchActiveLists(cfgText, listId)
+        if patched.len == 0:
+          warn "no \"activeLists\" array in the manager's config; leaving its " &
+               "default selection (" & activeListsOf(cfgText) & ") alone"
+        else:
+          writeFile(result, joinPath(target, ManagerConfigRelPath), patched,
+                    "the mod list a fresh install starts with: " & listId)
+
   if pay.backendUrl.len > 0:
     # Deliberately a file of its own rather than an edit to someone else's
     # config: a setting this installer owns is one it can also remove.
@@ -253,7 +313,10 @@ proc prepare(o: Options; install: var EftInstall; pay: var Payload;
   # exists, and the install it is added to is the target -- so `--source`
   # defaults to it, and pointing them at the same directory is the normal case
   # rather than a mistake.
-  let whole = pay.kind == plFull
+  let whole = wholeInstall(o, pay)
+  if o.overlay and pay.kind == plFull:
+    note "--overlay: the client at --target is left as it is; only the " &
+         "payload is (re)written"
   var source = o.source
   if source.len == 0:
     if whole:
@@ -269,6 +332,43 @@ proc prepare(o: Options; install: var EftInstall; pay: var Payload;
   heading "Payload"
   let pl = payload.describe(pay)
   printLines(pl, "  ")
+
+  # The registry is reported here, beside the payload, because it is part of
+  # what is about to be installed and because its absence is otherwise
+  # invisible until the game is running and the mod manager says it found
+  # nothing. It is a note rather than a refusal: an install with no registry is
+  # a working install with an unmanaged mod set, which is a thing somebody may
+  # legitimately want.
+  # A registry objection does not short-circuit: the compatibility verdict
+  # below is the thing a person came here to read, and hiding a refusal about
+  # the 1.0 line behind "your list id is wrong" would be a poor trade.
+  var registryOk = true
+  heading "Registry"
+  let regPath = resolveRegistry(pay.root, o.registryPath)
+  if regPath.len == 0:
+    if o.registryPath.len > 0:
+      err "no mods.json at " & o.registryPath
+      registryOk = false
+    note "this payload carries no registry"
+    note "the mod manager will load, find nothing to manage, and say so"
+  else:
+    line "  file      " & regPath
+    var regText = ""
+    if readTextFile(regPath, regText):
+      printLines(describeRegistry(regText), "  ")
+      if o.listId.len > 0 and o.listId != NoList:
+        line "  default   " & o.listId
+        if not hasList(regText, o.listId):
+          # A default naming a list the registry does not define resolves to
+          # nothing, and the player gets an install with everything off and no
+          # reason given. Blocked rather than refused: a registry that gains the
+          # list later is a real thing, and --force is the way to say so.
+          err "this registry defines no list called " & o.listId
+          note "pass --list with one it does define, or --list none"
+          if not o.force:
+            registryOk = false
+      else:
+        line "  default   (the payload's own)"
 
   verdict = evaluate(install, pay, o.force, whole)
   showVerdict(verdict)
@@ -289,7 +389,7 @@ proc prepare(o: Options; install: var EftInstall; pay: var Payload;
           "install being read"
       return false
 
-  result = verdict.allowed
+  result = verdict.allowed and registryOk
 
 proc cmdPlan(o: Options): int =
   var install = identify("")
@@ -297,7 +397,9 @@ proc cmdPlan(o: Options): int =
   var verdict = Verdict(findings: @[], allowed: false, forcible: false)
   let okToGo = prepare(o, install, pay, verdict)
 
-  let p = buildPlan(install, pay, o.target)
+  let p = buildPlan(install, pay, o.target,
+                    resolveRegistry(pay.root, o.registryPath), o.listId,
+                    wholeInstall(o, pay))
   heading "Plan"
   let lines = plan.render(p)
   printLines(lines, "  ")
@@ -325,7 +427,9 @@ proc cmdInstall(o: Options): int =
     return 1
 
   let target = absolutePathOf(o.target)
-  let p = buildPlan(install, pay, target)
+  let p = buildPlan(install, pay, target,
+                    resolveRegistry(pay.root, o.registryPath), o.listId,
+                    wholeInstall(o, pay))
 
   heading "Plan"
   let lines = plan.render(p)

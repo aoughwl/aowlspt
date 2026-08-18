@@ -554,12 +554,21 @@ proc main(): int =
     check("and says how many matched",
           jsonNumber(page.body, "offersCount") > 5,
           $jsonNumber(page.body, "offersCount") & " offers")
-    # The barter in the fixture's assort must not be one of them: it has no
-    # price, and an offer with no price is free at the top of every
-    # cheapest-first search.
-    check("the trader's barter is not on the flea",
-          find(offersOf(page.body), "\"_tpl\":\"590c657e86f77412b013051d\"") < 0,
-          offersOf(page.body))
+    # The barter in the fixture's assort must not be one of the trader's rows:
+    # it has no price, and an offer with no price is free at the top of every
+    # cheapest-first search. Asked with the owner filter set to traders,
+    # because the handbook prices that template too and the *player* offer for
+    # it is legitimate -- a check over the whole page would be reading the
+    # wrong row and would fail against a working market.
+    let fromTraders = call("/client/ragfair/find",
+      "{\"page\":0,\"limit\":50,\"offerOwnerType\":1}")
+    let traderRows = offersOf(fromTraders.body)
+    check("the trader's priced stock is on the flea",
+          find(traderRows, "\"_tpl\":\"5644bd2b4bdc2d3b4c8b4572\"") >= 0,
+          traderRows)
+    check("and the trader's barter is not",
+          find(traderRows, "\"_tpl\":\"590c657e86f77412b013051d\"") < 0,
+          traderRows)
 
     # The category box. Clicking the parent node has to show what is under it,
     # which is the whole reason the handbook tree is walked rather than matched.
@@ -669,6 +678,91 @@ proc main(): int =
   discard expectIn("which the profile records as a success",
                    "/client/game/profile/list", "", "\"Success\"")
 
+  # The quests the database *does* have, and therefore has conditions for. The
+  # pair above proves the state machine; these prove the guard on it, which is
+  # the half that decides whether a quest can be paid out for nothing.
+  var rewardMessage = ""
+  var rewardItem = ""
+  if haveFixture:
+    let tooSoon = call("/client/game/profile/items/moving",
+      "{\"data\":[{\"Action\":\"QuestAccept\",\"qid\":\"q_followup\"}],\"tm\":2}")
+    check("a quest whose start conditions fail is refused",
+          tooSoon.contains("cannot accept") and tooSoon.contains("q_debut"),
+          tooSoon.body)
+    let followupState = call("/client/game/profile/list", "")
+    check("nor recorded at all",
+          not followupState.contains("\"qid\":\"q_followup\""),
+          "q_followup is in the Quests array")
+
+    let debut = call("/client/game/profile/items/moving",
+      "{\"data\":[{\"Action\":\"QuestAccept\",\"qid\":\"q_debut\"}],\"tm\":2}")
+    check("a quest whose start conditions hold is accepted",
+          debut.ok and not debut.contains("cannot accept"), debut.body)
+
+    # The refusal that carries the weight. A completion that pays for nothing is
+    # invisible; a refusal is visible, and it has to say *which* condition,
+    # because "no" with no reason sends the player to a wiki.
+    let unearned = call("/client/game/profile/items/moving",
+      "{\"data\":[{\"Action\":\"QuestComplete\",\"qid\":\"q_debut\"}],\"tm\":2}")
+    check("completing a quest whose finish conditions fail is refused",
+          unearned.contains("cannot complete"), unearned.body)
+    check("and the refusal names the condition",
+          unearned.contains("c_kill_scavs") and unearned.contains("0 of 5"),
+          unearned.body)
+
+    # Handing over one of the two rifles the condition asks for. The old
+    # behaviour credited the condition on the first item, which finished a
+    # "hand over five" after one -- and the items are removed by the inventory
+    # actions in the same batch either way, so the player was five items poorer
+    # for nothing.
+    let handOne = call("/client/game/profile/items/moving",
+      "{\"data\":[{\"Action\":\"QuestHandover\",\"qid\":\"q_debut\"," &
+      "\"conditionId\":\"c_hand_rifles\",\"items\":[{\"id\":\"" & moneyId &
+      "\",\"count\":1}]}],\"tm\":2}")
+    check("a handover is accepted", handOne.ok, handOne.body)
+    let afterOne = call("/client/game/profile/list", "")
+    let counted = numberAt(afterOne.body,
+                           find(afterOne.body, "\"c_hand_rifles\""), "value")
+    # Both halves, because either one alone passes against a broken server: a
+    # handover that did nothing leaves the condition uncompleted too, and a
+    # handover that completed it on the first item still counted to one.
+    check("and counts rather than completing the condition",
+          counted == 1 and not afterOne.contains("\"c_hand_rifles\"]"),
+          "counter " & $counted & " in " & afterOne.body)
+    let handTwo = call("/client/game/profile/items/moving",
+      "{\"data\":[{\"Action\":\"QuestHandover\",\"qid\":\"q_debut\"," &
+      "\"conditionId\":\"c_hand_rifles\",\"items\":[{\"id\":\"" & moneyId &
+      "\",\"count\":1}]}],\"tm\":2}")
+    check("the second handover is accepted", handTwo.ok, handTwo.body)
+    discard expectIn("and completes the condition",
+                     "/client/game/profile/list", "", "\"c_hand_rifles\"]")
+
+    # And the whole of a payout: experience, and the item rewards through the
+    # post rather than into a stash that may be full.
+    let payout = call("/client/game/profile/items/moving",
+      "{\"data\":[{\"Action\":\"QuestAccept\",\"qid\":\"q_reward\"}," &
+      "{\"Action\":\"QuestHandover\",\"qid\":\"q_reward\"," &
+      "\"conditionId\":\"c_reward_hand\",\"items\":[{\"id\":\"" & moneyId &
+      "\",\"count\":1}]}," &
+      "{\"Action\":\"QuestComplete\",\"qid\":\"q_reward\"}],\"tm\":2}")
+    check("a quest whose conditions are met completes",
+          payout.ok and not payout.contains("cannot complete"), payout.body)
+    discard expectIn("and pays its experience",
+                     "/client/game/profile/list", "", "\"Experience\":900")
+
+    # Read off `dialog/list` rather than `dialog/getAllAttachments`: the
+    # collect-all endpoint renders each message as an escaped *string* rather
+    # than as an object (see the report accompanying these checks), so nothing
+    # can be read out of it. The dialog list nests them properly and carries
+    # the same message.
+    let post = call("/client/mail/dialog/list", "")
+    rewardMessage = textAt(post.body, find(post.body, "\"message\":"), "_id")
+    rewardItem = idOfTemplate(post.body, "544fb45d4bdc2dee738b4568")
+    check("and posts its item reward to the mailbox",
+          rewardMessage.len == 24 and rewardItem.len > 0, post.body)
+    check("with the badge that tells the player it is there",
+          numberAt(post.body, 0, "attachmentsNew") == 1, post.body)
+
   let upgrade = call("/client/game/profile/items/moving",
     "{\"data\":[{\"Action\":\"HideoutUpgrade\",\"areaType\":3}],\"tm\":2}")
   check("a hideout area can be upgraded", upgrade.ok, upgrade.body)
@@ -685,14 +779,181 @@ proc main(): int =
   check("a second complete is refused",
         freeLevel.contains("not being upgraded"), freeLevel.body)
 
+  heading "Production"
+  # Crafts, in the workbench the checks above have just proved can be built.
+  # The recipes come out of the fixture and each one exists to provoke exactly
+  # one answer: recipe-rich has materials the profile does not have,
+  # recipe-bolts a tool it does not have, recipe-quick finishes at once, and
+  # recipe-slow cannot finish inside a test run.
+  var slowStarted = -1
+  if haveFixture:
+    discard call("/client/game/profile/items/moving",
+      "{\"data\":[{\"Action\":\"HideoutUpgrade\",\"areaType\":10}],\"tm\":2}")
+    let bench = call("/client/game/profile/items/moving",
+      "{\"data\":[{\"Action\":\"HideoutUpgradeComplete\",\"areaType\":10}],\"tm\":2}")
+    check("the workbench can be built", bench.ok and
+          not bench.contains("not being upgraded"), bench.body)
+
+    let noMaterials = call("/client/game/profile/items/moving",
+      "{\"data\":[{\"Action\":\"HideoutSingleProductionStart\"," &
+      "\"recipeId\":\"recipe-rich\"}],\"tm\":2}")
+    check("a craft with materials the player does not have is refused",
+          noMaterials.contains("not enough"), noMaterials.body)
+    let noTool = call("/client/game/profile/items/moving",
+      "{\"data\":[{\"Action\":\"HideoutSingleProductionStart\"," &
+      "\"recipeId\":\"recipe-bolts\"}],\"tm\":2}")
+    check("and so is one whose tool is missing",
+          noTool.contains("tool"), noTool.body)
+    let untouched = call("/client/game/profile/list", "")
+    check("a refused craft starts nothing",
+          not untouched.contains("recipe-rich") and
+          not untouched.contains("recipe-bolts"),
+          "a refused recipe is in Hideout.Production")
+
+    # Three roubles for two screw nuts. The exact arithmetic, because a craft
+    # that charges the wrong amount -- or charges nothing -- is the same shape
+    # of bug as a trade that does, and "the stack got smaller" would pass
+    # against both.
+    let payBefore = stackOf(call("/client/game/profile/list", "").body, moneyId)
+    let started = call("/client/game/profile/items/moving",
+      "{\"data\":[{\"Action\":\"HideoutSingleProductionStart\"," &
+      "\"recipeId\":\"recipe-quick\"}],\"tm\":2}")
+    check("a craft the player can afford starts",
+          started.ok and not started.contains("not enough"), started.body)
+    let payAfter = stackOf(call("/client/game/profile/list", "").body, moneyId)
+    check("and consumes exactly its inputs", payBefore - payAfter == 3,
+          $payBefore & " - " & $payAfter & " != 3")
+
+    let collected = call("/client/game/profile/items/moving",
+      "{\"data\":[{\"Action\":\"HideoutTakeProduction\"," &
+      "\"recipeId\":\"recipe-quick\"}],\"tm\":2}")
+    check("collecting a finished craft gives the product",
+          collected.ok and collected.contains("59e35de086f7741778269d83"),
+          collected.body)
+    # The one that is free items if it is wrong. A record cleared on collection
+    # is the only thing standing between a finished craft and an infinite one.
+    let twice = call("/client/game/profile/items/moving",
+      "{\"data\":[{\"Action\":\"HideoutTakeProduction\"," &
+      "\"recipeId\":\"recipe-quick\"}],\"tm\":2}")
+    check("collecting it a second time is refused",
+          twice.contains("nothing is being made"), twice.body)
+
+    let slow = call("/client/game/profile/items/moving",
+      "{\"data\":[{\"Action\":\"HideoutSingleProductionStart\"," &
+      "\"recipeId\":\"recipe-slow\"}],\"tm\":2}")
+    check("a long craft starts", slow.ok and not slow.contains("not enough"),
+          slow.body)
+    let early = call("/client/game/profile/items/moving",
+      "{\"data\":[{\"Action\":\"HideoutTakeProduction\"," &
+      "\"recipeId\":\"recipe-slow\"}],\"tm\":2}")
+    check("and collecting it before it is finished is refused",
+          early.contains("not finished"), early.body)
+    # Kept for the restart: a craft's clock is a timestamp, not a countdown, so
+    # the number the server comes back with has to be the number it went down
+    # with. See "Across a restart".
+    let record = call("/client/game/profile/list", "")
+    slowStarted = numberAt(record.body, find(record.body, "recipe-slow"),
+                           "StartTimestamp")
+    check("the craft records when it started", slowStarted > 0, $slowStarted)
+  else:
+    let noRecipe = call("/client/game/profile/items/moving",
+      "{\"data\":[{\"Action\":\"HideoutSingleProductionStart\"," &
+      "\"recipeId\":\"recipe-quick\"}],\"tm\":2}")
+    check("with no recipe table a craft is refused, not crashed",
+          noRecipe.ok and noRecipe.contains("no such recipe"), noRecipe.body)
+
+  heading "Redeeming a reward"
+  # The reward the quest above posted, dragged out of the message. The client
+  # has no redeem endpoint: this is an ordinary `Move` with `fromOwner` naming
+  # the message, which is why it is tested through the same endpoint as a drag.
+  if rewardMessage.len == 24 and rewardItem.len > 0:
+    let stashId = jsonText(listBody, "stash")
+    let dragged = call("/client/game/profile/items/moving",
+      "{\"data\":[{\"Action\":\"Move\",\"item\":\"" & rewardItem &
+      "\",\"fromOwner\":{\"id\":\"" & rewardMessage & "\",\"type\":\"Mail\"}," &
+      "\"to\":{\"id\":\"" & stashId & "\",\"container\":\"hideout\"}}],\"tm\":2}")
+    check("a reward can be dragged out of a message",
+          dragged.ok and dragged.contains(rewardItem), dragged.body)
+    let held = call("/client/game/profile/list", "")
+    check("and it is in the stash", held.contains(rewardItem), "not there")
+    # A redeemed item with no position is drawn on top of whatever is in the
+    # top-left cell and cannot be picked up, which looks exactly like never
+    # having been given it. Read out of this item's own slice of the document,
+    # because every other item in the stash has a location too.
+    let placed = between(held.body, rewardItem, "\"_id\"")
+    check("with a cell of its own", find(placed, "\"location\"") >= 0, placed)
+
+    let again = call("/client/game/profile/items/moving",
+      "{\"data\":[{\"Action\":\"Move\",\"item\":\"" & rewardItem &
+      "\",\"fromOwner\":{\"id\":\"" & rewardMessage & "\",\"type\":\"Mail\"}," &
+      "\"to\":{\"id\":\"" & stashId & "\",\"container\":\"hideout\"}}],\"tm\":2}")
+    check("dragging it a second time says so rather than duplicating it",
+          again.contains("already been collected"), again.body)
+    # And the count, because "it said no" and "it did nothing" are different
+    # claims and only the second one matters to the player's stash.
+    check("and there is still exactly one of it",
+          countOf(call("/client/game/profile/list", "").body, rewardItem) == 1,
+          $countOf(call("/client/game/profile/list", "").body, rewardItem) &
+          " copies")
+  else:
+    note "no quest reward in the post; skipping the redemption checks"
+
+  heading "The floor of a raid"
+  # Loot first, because the client asks for it before it starts the match, and
+  # because the raid id it is seeded from is issued by `raid/configuration`.
+  # The map here is the fixture's own: `factory4_day` below has no tables at
+  # all, and both cases matter.
+  if haveFixture:
+    discard expectIn("a raid on a map with loot tables is configured",
+                     "/client/raid/configuration",
+                     "{\"location\":\"testmap\",\"timeVariant\":\"CURR\"," &
+                     "\"raidMode\":\"Local\",\"side\":\"Pmc\"}", "\"err\":0")
+    let floor1 = call("/client/location/getLocalloot",
+                      "{\"locationId\":\"testmap\",\"variantId\":0}")
+    let loot1 = lootOf(floor1.body)
+    check("the map's loot tables put items on the floor",
+          find(loot1, "\"_tpl\"") >= 0, floor1.body)
+    check("including the container that is always there",
+          find(loot1, "ccccbox00000000000000001") >= 0, loot1)
+    # A weapon spawns as its preset or it is a floating receiver with no
+    # magazine -- which the client draws, and which is not a gun.
+    check("and a weapon comes with the mods its preset names",
+          find(loot1, "mmmmmag00000000000000001") >= 0, loot1)
+
+    let floor2 = call("/client/location/getLocalloot",
+                      "{\"locationId\":\"testmap\",\"variantId\":0}")
+    # The whole point of seeding from the raid id: the same raid is the same
+    # floor, down to the item ids, so "the crate by the gas station was empty"
+    # is a reproducible statement. An ambient RNG passes every other check in
+    # this section and fails this one.
+    check("the same raid id lays out the same floor",
+          lootOf(floor2.body) == loot1,
+          "two calls in one raid disagreed")
+
+    discard call("/client/raid/configuration",
+                 "{\"location\":\"testmap\",\"timeVariant\":\"CURR\"," &
+                 "\"raidMode\":\"Local\",\"side\":\"Pmc\"}")
+    let floor3 = call("/client/location/getLocalloot",
+                      "{\"locationId\":\"testmap\",\"variantId\":0}")
+    check("and a different raid id lays out a different one",
+          lootOf(floor3.body) != loot1,
+          "two raids produced identical loot")
+  else:
+    note "no database fixture; skipping the loot generation checks"
+
   heading "A raid"
   discard expectIn("raid configuration is accepted",
                    "/client/raid/configuration",
                    "{\"location\":\"factory4_day\",\"timeVariant\":\"CURR\"," &
                    "\"raidMode\":\"Local\",\"side\":\"Pmc\"}", "\"err\":0")
-  discard expectIn("the map hands over its loot",
-                   "/client/location/getLocalloot",
-                   "{\"locationId\":\"factory4_day\",\"variantId\":0}", "Loot")
+  let bare = expectIn("the map hands over its loot",
+                      "/client/location/getLocalloot",
+                      "{\"locationId\":\"factory4_day\",\"variantId\":0}", "Loot")
+  # Nothing in the database describes this map. An empty floor loads and plays;
+  # a request that fails is a client that cannot enter a raid at all, which is
+  # what makes this the property the whole loot module is written around.
+  check("a map with no tables gets an empty floor rather than an error",
+        find(lootOf(bare.body), "\"_id\"") < 0, lootOf(bare.body))
   discard expectIn("weather", "/client/weather", "", "season")
   discard expectIn("the raid starts", "/client/match/local/start",
                    "{\"location\":\"factory4_day\"}", "serverId")
@@ -716,6 +977,114 @@ proc main(): int =
                    "{\"exit\":\"Survived\",\"profile\":{\"_id\":" &
                    "\"cccccccccccccccccccccccc\"}}", "different profile")
 
+  heading "Skills"
+  # A raid result *is* a profile, so the server that believes its skill numbers
+  # has skills that are whatever the client says they are. What is taken is the
+  # delta, run through the game's curve -- and the curve is only worth having if
+  # it is integrated, which is what these two claims measure.
+  #
+  # The claim is made by replacing `Skills.Common` in the profile the client
+  # hands back. `match/local/start` resets the per-raid fatigue counter, so each
+  # of the two experiments below starts from the same place.
+  discard call("/client/match/local/start", "{\"location\":\"factory4_day\"}")
+  let base0 = call("/client/game/profile/list", "").body
+  let start0 = endurance(base0)
+  let bigClaim = withCommon(raidProfile(base0, uid),
+    "{\"Id\":\"Endurance\",\"Progress\":" & $(start0 + 60) &
+    ",\"PointsEarnedDuringSession\":0,\"LastAccess\":0}")
+  let bigEnd = call("/client/match/local/end",
+                    "{\"exit\":\"Survived\",\"profile\":" & bigClaim & "}")
+  check("a raid's skill claim is accepted", bigEnd.ok, bigEnd.body)
+  let afterBig = endurance(call("/client/game/profile/list", "").body)
+  check("and moves the skill", afterBig > start0,
+        $start0 & " -> " & $afterBig)
+  let big = afterBig - start0
+
+  discard call("/client/match/local/start", "{\"location\":\"factory4_day\"}")
+  var small = 0
+  var round1 = 0
+  while round1 < 6:
+    let now1 = call("/client/game/profile/list", "").body
+    let was = endurance(now1)
+    let claim = withCommon(raidProfile(now1, uid),
+      "{\"Id\":\"Endurance\",\"Progress\":" & $(was + 10) &
+      ",\"PointsEarnedDuringSession\":0,\"LastAccess\":0}")
+    discard call("/client/match/local/end",
+                 "{\"exit\":\"Survived\",\"profile\":" & claim & "}")
+    small = small + (endurance(call("/client/game/profile/list", "").body) - was)
+    inc round1
+  # The exploit shape, and the reason `grantedFor` integrates a point at a time:
+  # fatigue is a function of what has been earned so far, so pricing a whole
+  # claim at its cheapest rate makes one enormous claim strictly better than the
+  # many small ones the game actually produces. Six tens must be worth at least
+  # as much as one sixty.
+  check("one large claim is not worth more than several small ones",
+        big <= small, "60 in one raid granted " & $big &
+        ", six claims of 10 granted " & $small)
+
+  # And the backstop over the top of the curve. Fatigue only converges slowly,
+  # so a large enough claim still crawls past it -- the per-raid cap is what
+  # answers a client that reports a thousand points of Endurance.
+  discard call("/client/match/local/start", "{\"location\":\"factory4_day\"}")
+  let beforeAbsurd = call("/client/game/profile/list", "").body
+  let was2 = endurance(beforeAbsurd)
+  let absurd = withCommon(raidProfile(beforeAbsurd, uid),
+    "{\"Id\":\"Endurance\",\"Progress\":" & $(was2 + 100000) &
+    ",\"PointsEarnedDuringSession\":0,\"LastAccess\":0}")
+  discard call("/client/match/local/end",
+               "{\"exit\":\"Survived\",\"profile\":" & absurd & "}")
+  let granted = endurance(call("/client/game/profile/list", "").body) - was2
+  check("an absurd claim is capped rather than honoured",
+        granted > 0 and granted <= 100,
+        "a claim of 100000 granted " & $granted)
+
+  heading "The scav"
+  let withScav = call("/client/game/profile/list", "")
+  let scavId = jsonText(withScav.body, "savage")
+  check("the profile list carries the scav beside the PMC",
+        scavId.len == 24 and withScav.contains("\"Side\":\"Savage\""),
+        "savage " & scavId)
+  let scavAt = find(withScav.body, "\"_id\":\"" & scavId & "\"")
+  let gearId = textAt(withScav.body, scavAt, "equipment")
+  check("and the scav has an equipment container to hang gear off",
+        scavAt > 0 and gearId.len == 24, gearId)
+
+  # Surviving. The gear on the scav's back becomes the player's, in real cells
+  # of the real stash -- the scav's own document has no stash, so this is the
+  # one join that makes a scav run worth playing.
+  let brought = call("/client/match/local/end",
+    "{\"exit\":\"Survived\",\"profile\":{\"_id\":\"" & scavId &
+    "\",\"Inventory\":{\"equipment\":\"" & gearId & "\",\"items\":[" &
+    "{\"_id\":\"" & gearId & "\",\"_tpl\":\"55d7217a4bdc2d86028b456d\"}," &
+    "{\"_id\":\"5ca1a5a5a5a5a5a5a5a5a5a1\",\"_tpl\":\"5710c24ad2720bc3458b45a3\"," &
+    "\"parentId\":\"" & gearId & "\",\"slotId\":\"FirstPrimaryWeapon\"}]}}}")
+  check("a scav raid result is accepted", brought.ok and
+        brought.contains("\"err\":0"), brought.body)
+  let home = call("/client/game/profile/list", "")
+  check("and what the scav was carrying is in the PMC's stash",
+        home.contains("5ca1a5a5a5a5a5a5a5a5a5a1"), "nothing came home")
+  check("the cooldown is set", numberAt(home.body,
+        find(home.body, "\"SavageLockTime\""), "SavageLockTime") > 0,
+        "SavageLockTime is still zero")
+
+  # Dying. There is nothing to undo -- the scav's gear was never in the PMC
+  # document -- so the check is that nothing arrived, which is the whole of the
+  # rule.
+  let deadScav = call("/client/game/profile/list", "")
+  let deadGear = textAt(deadScav.body,
+                        find(deadScav.body, "\"_id\":\"" & scavId & "\""),
+                        "equipment")
+  let died = call("/client/match/local/end",
+    "{\"exit\":\"Killed\",\"profile\":{\"_id\":\"" & scavId &
+    "\",\"Inventory\":{\"equipment\":\"" & deadGear & "\",\"items\":[" &
+    "{\"_id\":\"" & deadGear & "\",\"_tpl\":\"55d7217a4bdc2d86028b456d\"}," &
+    "{\"_id\":\"5ca1a5a5a5a5a5a5a5a5a5a2\",\"_tpl\":\"590c657e86f77412b013051d\"," &
+    "\"parentId\":\"" & deadGear & "\",\"slotId\":\"FirstPrimaryWeapon\"}]}}}")
+  check("a dead scav's raid result is accepted too", died.ok, died.body)
+  check("and brings nothing home",
+        not call("/client/game/profile/list", "").contains(
+          "5ca1a5a5a5a5a5a5a5a5a5a2"), "the dead scav's gear arrived")
+
   heading "Bots"
   let bots = call("/client/game/bot/generate",
     "{\"conditions\":[{\"Role\":\"assault\",\"Limit\":3,\"Difficulty\":\"normal\"}]}")
@@ -735,8 +1104,16 @@ proc main(): int =
         $countOf(huge.body, "55d7217a4bdc2d86028b456d") & " bots")
 
   heading "Mail and insurance"
-  discard expectIn("an empty inbox is an empty list, not an error",
-                   "/client/mail/dialog/list", "", "\"data\":[]")
+  # The inbox. Empty on a server with nothing to say -- which is what the boot
+  # section already proved, before anything had been posted -- and by now it
+  # holds the quest reward, so this is the same property from the other side:
+  # a dialog with a message in it, rather than an error.
+  if rewardMessage.len > 0:
+    discard expectIn("the inbox carries the message the quest posted",
+                     "/client/mail/dialog/list", "", rewardMessage)
+  else:
+    discard expectIn("an empty inbox is an empty list, not an error",
+                     "/client/mail/dialog/list", "", "\"data\":[]")
   # Priced off the handbook, so it needs the fixture for the same reason trading
   # does. Without one the right answer is an empty quote, and checking for a
   # number there would be checking that the server invented a price.
@@ -755,6 +1132,25 @@ proc main(): int =
   heading "Across a restart"
   cSpawnKill(proc1)
   cSleepMs(400'i32)
+
+  # The second server runs with the flea's offer lifetime set to zero. An offer
+  # that has expired is the only way to watch one come back by post, and the
+  # alternative is a test that waits twelve hours -- the emulator has no clock
+  # to wind forward, so the config is what moves. Only offers listed *after*
+  # this point are affected: an offer's expiry is written onto the record when
+  # it is listed, so the one listed above is still live, which is what makes
+  # this safe to do halfway through a run.
+  let configPath = root & "\\mods\\tarkov\\config.json"
+  var configText = ""
+  var retimedFlea = false
+  if readTextFile(configPath, configText):
+    let changed = retimed(configText, "fleaOfferHours", 0)
+    if changed.len > 0 and writeTextFile(configPath, changed).ok:
+      retimedFlea = true
+  if not retimedFlea:
+    note "could not retime the flea in " & configPath &
+         "; the expiry check will be skipped"
+
   var proc2 = startBackend(backend, root)
   if proc2 == 0'u64:
     err "could not restart the backend"
@@ -772,6 +1168,61 @@ proc main(): int =
   discard expectIn("and the nickname is still taken",
                    "/client/game/profile/create",
                    "{\"nickname\":\"AowlTest\",\"side\":\"Bear\"}", "\"err\":255")
+
+  # A craft is a timestamp, not a countdown. A server that stored "so many
+  # seconds left" and ticked it while it was running would come back with the
+  # craft either finished or restarted, and both are wrong in the player's
+  # favour exactly once.
+  if slowStarted > 0:
+    let survived = call("/client/game/profile/list", "")
+    check("the craft survived the restart",
+          survived.contains("recipe-slow"), "recipe-slow is gone")
+    check("with its clock intact",
+          numberAt(survived.body, find(survived.body, "recipe-slow"),
+                   "StartTimestamp") == slowStarted,
+          "started at " & $slowStarted & ", now " &
+          $numberAt(survived.body, find(survived.body, "recipe-slow"),
+                    "StartTimestamp"))
+    let stillEarly = call("/client/game/profile/items/moving",
+      "{\"data\":[{\"Action\":\"HideoutTakeProduction\"," &
+      "\"recipeId\":\"recipe-slow\"}],\"tm\":2}")
+    check("and it is still not finished",
+          stillEarly.contains("not finished"), stillEarly.body)
+
+  # The redemption's other half. The identity check stops it being collected
+  # twice; this is the ordering one -- a player who drags a reward out and finds
+  # it gone after a restart has lost it, which is the failure the whole staged
+  # commit exists to prevent.
+  if rewardItem.len > 0:
+    let kept = call("/client/game/profile/list", "")
+    check("the redeemed reward is still in the stash",
+          kept.contains(rewardItem), "gone after the restart")
+    check("and it is not back in the mailbox as well",
+          not call("/client/mail/dialog/list", "").contains(rewardItem),
+          "the message still holds it")
+
+  # An offer that has run out of time comes back by post rather than being
+  # dropped, and posting it is the only way the player can be given items when
+  # there is nobody logged in to receive a diff.
+  if retimedFlea and rewardItem.len > 0:
+    let listing = call("/client/game/profile/items/moving",
+      "{\"data\":[{\"Action\":\"RagFairAddOffer\",\"sellInOnePiece\":false," &
+      "\"items\":[\"" & rewardItem & "\"],\"requirements\":[{\"_tpl\":\"" &
+      "5449016a4bdc2d6f028b456f\",\"count\":999999}]}],\"tm\":2}")
+    check("an item can be listed on the retimed market",
+          listing.ok and not listing.contains("not here"), listing.body)
+    check("and it leaves the stash",
+          not call("/client/game/profile/list", "").contains(rewardItem),
+          "still in the profile")
+    # Settling happens at login as well as on a timer, for the same reason
+    # insurance returns do: a server that was off when an offer came due must
+    # still settle it, and a timer alone never does.
+    discard call("/client/game/profile/select", "{\"uid\":\"" & uid & "\"}")
+    let inbox = call("/client/mail/dialog/list", "")
+    check("an expired offer comes back by mail",
+          inbox.contains("expired"), inbox.body)
+    check("with the item that was in it",
+          inbox.contains(rewardItem), "the message carries no items")
 
   if not keep:
     cSpawnKill(proc2)

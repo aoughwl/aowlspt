@@ -113,22 +113,32 @@ ok     the sibling field survived the patch: M4A1
 
 The document is held as text and edited as text. That sounds wrong and is
 deliberate: a parsed tree needs a mutable dynamic value type nimony does not
-give cheaply, and the access pattern is not tree-shaped — mods read a handful of
-paths at load and patch a handful more. What it guarantees is that a patch which
-cannot be applied *exactly* is refused rather than applied approximately.
+give cheaply. What it guarantees is that a patch which cannot be applied
+*exactly* is refused rather than applied approximately.
+
+Text alone was not enough, though. Each object is indexed the first time
+something addresses it, so a lookup costs a hash lookup per path segment instead
+of a walk from the document root — see [PERF-SERVER.md](PERF-SERVER.md). The
+index is byte offsets into the document, so `dbWrite` throws all of it away.
 
 ## Shape of a run
 
 - Loopback only, and there is no flag to change that. A single-player game
   server that listens on every interface by accident is how a LAN party becomes
   an incident.
-- A fixed pool of accept threads (4 by default). Several threads may `accept`
+- A fixed pool of accept threads (8 by default). Several threads may `accept`
   the same listening socket on Windows; the pool size is the concurrency limit
-  and there is no per-request thread creation.
-- One request per connection. Keep-alive is a real optimisation and not one
-  worth having before the endpoints exist.
-- 15-second receive timeout, so a client that connects and says nothing cannot
-  hold a worker.
+  and there is no per-request thread creation. It is the *connection* limit now
+  rather than the request limit, which is why it is eight rather than four.
+- Keep-alive, so a session is one connection rather than thousands. A
+  connection is closed after 512 requests anyway, so no client can hold a
+  worker for the life of the process.
+- 15-second receive timeout on a request in flight, dropping to 5 seconds once
+  a keep-alive connection goes idle between requests.
+- The static tables are served out of a compressed-body cache keyed on the
+  response text itself, so a stale hit is impossible by construction, and the
+  database is indexed per object so a lookup is a hash lookup rather than a
+  scan. The numbers and the reasoning are in [PERF-SERVER.md](PERF-SERVER.md).
 
 ## Testing
 

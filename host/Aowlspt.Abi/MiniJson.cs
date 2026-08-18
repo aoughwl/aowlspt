@@ -1,15 +1,17 @@
 // A small, dependency-free JSON document model.
 //
-// Why not System.Text.Json or Newtonsoft: this assembly is shared by a .NET 10
-// host and a Unity-Mono host, and those two runtimes do not agree on which JSON
-// library is present. Config lookup and patch-merge semantics have to be
-// *identical* on both — a mod that reads `weapons.recoil` must get the same
-// answer in the simulator as in a raid — so the one place that decides those
-// semantics lives here, in code both runtimes compile.
+// Why not System.Text.Json or Newtonsoft: config lookup and patch-merge
+// semantics are part of the ABI, not an implementation detail. A mod that reads
+// `weapons.recoil` or writes a `dbPatch` must get the same answer in the
+// simulator as it does from the nimony backend and client host, so the code that
+// decides those semantics is written out explicitly and kept small enough to
+// compare against the other implementations line by line. (It originally also
+// had to compile for Unity's Mono, where neither library was reliably present —
+// that host is gone, the reason above is not.)
 //
 // Scope is deliberately small: parse, serialize, get-by-path, set-by-path, and
 // a recursive merge. It is not a general-purpose JSON library and does not try
-// to be one; the hosts still use their own fast serializers for bulk payloads.
+// to be one.
 
 using System;
 using System.Collections.Generic;

@@ -16,6 +16,12 @@
  * connection. Windows allows several threads to `accept` the same listening
  * socket, the pool size is the concurrency limit, and there is no per-request
  * thread creation on the hot path.
+ *
+ * The pool size is now the *connection* limit rather than the request limit:
+ * the server speaks keep-alive, so a worker stays with a connection until the
+ * client closes it or it goes idle. That is why the ceiling here is sixteen
+ * rather than eight -- a game that opens a handful of connections and holds
+ * them must not be able to exhaust the pool by itself.
  */
 
 #ifndef AOWLSPT_NET_H
@@ -146,7 +152,7 @@ static int32_t aowl_net_set_timeout(uint64_t sock, int32_t ms) {
  * The accept pool
  * ------------------------------------------------------------------ */
 
-#define AOWL_NET_WORKERS 8
+#define AOWL_NET_WORKERS 16
 
 static uint64_t g_listenSock = 0;
 static volatile LONG g_netRunning = 0;

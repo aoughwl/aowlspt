@@ -72,19 +72,23 @@ aowlspt/
   aowlspt-host-il2cpp.dll   the post-1.0 client host
   aowlspt-launch.exe        starts the game with that host inside it
   aowlspt-host.json         how long the host waits for IL2CPP to come up
-  mods/<name>/<name>.dll    every built example mod
-  server/                   the .NET server host, for SPT's server
-  client/                   the Mono BepInEx plugin, for pre-1.0 clients
+  aowlspt-backend.exe       the server
+  mods/<name>/<name>.dll    every built mod, with its data/ and config.json
 ```
 
-`targetBackend` decides which of the two client hosts is the relevant one.
-`il2cpp` means the post-1.0 client, hosted by `aowlspt-host-il2cpp.dll` with no
-BepInEx involved at all — see [docs/IL2CPP.md](../../docs/IL2CPP.md). `mono`
-means a pre-1.0 client, where `client/` is the BepInEx plugin and `aowlspt/`
-is deployed under `BepInEx/plugins`.
+This repo only builds `il2cpp` payloads. The client host is
+`aowlspt-host-il2cpp.dll`, loaded into the post-1.0 client by `aowlspt-launch`
+with no BepInEx involved at all — see [docs/IL2CPP.md](../../docs/IL2CPP.md).
+There is no longer a `client/` or a `server/` directory: the Mono BepInEx plugin
+and the SPT 4.x server host were deleted with the pivot to post-1.0, because a
+Mono plugin cannot load into an IL2CPP process and the server half is now
+`aowlspt-backend`.
 
-Neither loads into the other, and no version flag changes that, which is why
-the backend is declared rather than inferred.
+`targetBackend` is still declared, and the installer still refuses a `mono`
+payload on an IL2CPP client and the reverse. That check is about the client in
+front of it, not about what this repo happens to produce: neither kind of
+binary loads into the other, and no version flag changes that, which is why the
+backend is declared rather than inferred.
 
 The server side does not care either way: it is an HTTP backend and is
 indifferent to the client's scripting backend. A payload with `runtime/` and

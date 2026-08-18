@@ -6,9 +6,13 @@
 // how to reach the SPT database, how to register a route, how to patch a
 // method, how to get back onto the main thread.
 //
-// Three implementations exist: the SPT server, the BepInEx client, and the
-// simulator. A capability a side does not have throws NotSupportedException,
-// which ModHost turns into AOWLSPT_ERR_UNSUPPORTED for the mod.
+// One implementation exists in .NET: the simulator. (The SPT server host and
+// the BepInEx client host implemented this too, and were deleted with the pivot
+// to post-1.0; the live client host is native nimony and speaks the C ABI
+// directly.) The interface stays side-shaped anyway, because the simulator
+// stands in for every side: a capability a side does not have throws
+// NotSupportedException, which ModHost turns into AOWLSPT_ERR_UNSUPPORTED for
+// the mod, and that is what a mod's `side()` guards are tested against.
 
 using System;
 

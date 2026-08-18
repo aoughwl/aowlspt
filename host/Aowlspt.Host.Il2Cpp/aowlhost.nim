@@ -541,6 +541,23 @@ proc hostResolve(ctx: Il2CppPtr; typeName: Il2CppPtr; nameLen: int32;
   copyMem(outHandle, cast[Il2CppPtr](addr tmp), 8)
   result = StatusOk
 
+proc mainThreadReport(): string =
+  ## What `call("aowlspt.host::main_thread")` answers.
+  ##
+  ## A mod has to be able to ask, because the answer decides what it may do: a
+  ## callback that touches a Unity object is correct when `bound` is true and a
+  ## crash when it is false, and nothing else in the ABI tells those apart.
+  ## `bound` is only true once the hook has actually fired -- a hook that is
+  ## installed but has never been reached has proved nothing.
+  let bound = gDrainSlot >= 0 and cMqFireCount() > 0
+  result = "{\"bound\":" & (if bound: "true" else: "false") &
+           ",\"method\":\"" & gDrainMethod & "\"" &
+           ",\"mainThreadId\":" & $int(cMqThread()) &
+           ",\"hostThreadId\":" & $int(gHostThreadId) &
+           ",\"frames\":" & $int(cMqFireCount()) &
+           ",\"otherThreadFires\":" & $int(cMqAlienFires()) &
+           ",\"stalled\":" & (if gDrainStalled: "true" else: "false") & "}"
+
 proc hostCall(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
               args: Il2CppPtr; argsLen: int32;
               outPtr: Il2CppPtr; outLen: Il2CppPtr): int32 {.
@@ -557,6 +574,16 @@ proc hostCall(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
   discard cOutCopy(outPtr, outLen, cast[Il2CppPtr](0), 0'i32)
   let spec = readBytes(target, targetLen)
   let argText = readBytes(args, argsLen)
+
+  # One target that is not a game type: where `invoke_main` will actually run.
+  # Answered before the runtime check, because the answer is meaningful -- "the
+  # host thread, and no main thread was found" -- even with no runtime at all.
+  # A dot in the type part keeps it clear of any real IL2CPP type, whose class
+  # name never contains one.
+  if spec == "aowlspt.host::main_thread":
+    var report = mainThreadReport()
+    return cOutCopy(outPtr, outLen, cast[Il2CppPtr](toCString(report)),
+                    int32(report.len))
 
   if not gReady:
     gLastError = "the IL2CPP runtime is not up yet"
@@ -696,6 +723,59 @@ proc hostEventEmit(ctx: Il2CppPtr; name: Il2CppPtr; nameLen: int32;
     info "event " & n & " (no subscribers)"
   result = StatusOk
 
+proc enqueue(cb, user: Il2CppPtr; dueMs: uint64; modIndex: int;
+             selfTest: bool) =
+  ## The only way into `gPending`, from any thread.
+  ##
+  ## Under the lock because the caller may be a mod's worker thread while the
+  ## drain is running on the game thread -- appending to a seq that another
+  ## thread is rebuilding is a corrupted list, not a lost callback. The count
+  ## is republished inside the lock so the drain's lock-free empty check can
+  ## never see a queue that has entries.
+  cMqLock()
+  gPending.add Pending(cb: cb, user: user, dueMs: dueMs, modIndex: modIndex,
+                       selfTest: selfTest)
+  cMqSetCount(int32(gPending.len))
+  cMqUnlock()
+
+proc drainDue() =
+  ## Takes the due callbacks out under the lock and runs them outside it.
+  ##
+  ## Outside it on purpose: a callback is a mod's code, it may take as long as
+  ## it likes, and it may call `invoke_main` again. Running it with the lock
+  ## held would block every other thread behind whatever it does. Taking the
+  ## work out first is the same shape the backend's timer queue uses.
+  var due: seq[Pending] = @[]
+  cMqLock()
+  if gPending.len > 0:
+    let now = cNowMs()
+    var keep: seq[Pending] = @[]
+    for p in gPending:
+      if p.dueMs <= now:
+        due.add p
+      else:
+        keep.add p
+    gPending = keep
+    cMqSetCount(int32(gPending.len))
+  cMqUnlock()
+
+  for p in due:
+    if p.selfTest:
+      # The proof, and the reason it is an entry in the queue rather than a
+      # log line at bind time: it went in from the host thread and comes out
+      # here, so the thread it names is the thread a mod's callback would get.
+      okLog "invoke_main self-test ran on thread " & $int(cThreadId())
+    else:
+      discard cInvokeCallback(p.cb, p.user, cast[Il2CppPtr](0), 0'i32)
+
+proc mainDrain() =
+  ## The per-frame drain, called from inside a method Unity runs on its main
+  ## thread. Everything expensive is behind `cMqEnter`, which answers "is this
+  ## my thread, and is there anything to do" in a handful of instructions.
+  if cMqEnter() == 0'i32:
+    return
+  drainDue()
+
 proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     exportc: "aowlspt_nim_patch_fired", cdecl.} =
   ## Called from the detour thunk, on the game thread, inside the patched
@@ -710,6 +790,11 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
   ## The cheap path stays cheap. A patch that did not ask for arguments does no
   ## decoding, no allocation and no logging, exactly as before.
   let i = int(slot)
+  # The host's own drain hook comes first, and by identity rather than by
+  # scanning: it fires on every frame of the game and must not walk anything.
+  if i == gDrainSlot:
+    mainDrain()
+    return 0'i32
   if i < 0 or i >= gPatches.len:
     return 0'i32
   if not gPatches[i].live:
@@ -816,7 +901,7 @@ proc hostPatch(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
   gPatches.add Patch(hook: hook, cb: cb, user: user, target: spec,
                      targetC: targetBytes, live: false, meth: m,
                      wantArgs: wantArgs, canSkip: wantArgs,
-                     modIndex: int(cast[uint](ctx)))
+                     modIndex: int(cast[uint](ctx)), isDrain: false)
   let slot = cHookAttach(hook, fn)
   if slot < 0'i32:
     shrink(gPatches, gPatches.len - 1)
@@ -839,6 +924,129 @@ proc hostPatch(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
   gPatches[int(slot)].live = true
   okLog "patched " & spec & " (" & $int(cHookStolen(hook)) & " bytes)"
   result = StatusOk
+
+proc bindMainDrain(verbose: bool): bool =
+  ## Detours a method Unity calls once per frame on its main thread, so that
+  ## `invoke_main` can be drained from *there* rather than from the host's own
+  ## attached thread.
+  ##
+  ## Which method is a research question this host cannot answer at compile
+  ## time, and this is the honest state of it.
+  ##
+  ## Unity's player loop is native C++ and is not in the metadata, so there is
+  ## no `PlayerLoop::Update` to look up. What is reachable by name is *managed*
+  ## code the loop calls, and a candidate has to be all four of: called every
+  ## frame, called on the main thread only, present for the whole session, and
+  ## compiled into a function whose first bytes the detour engine can relocate.
+  ## The four below are tried in order, most specific first:
+  ##
+  ##   `EFT.MainApplication::Update` -- the game's own root behaviour. If it
+  ##   exists it is the best of these: once a frame, main thread, alive from the
+  ##   menu to the desktop. The name is what the class is called in pre-1.0
+  ##   dumps and has **not** been verified against a post-1.0 client by anyone
+  ##   who wrote this file, which is exactly why this is a list and not a
+  ##   constant.
+  ##
+  ##   `EFT.GameWorld::Update` -- narrower, and certain to be absent in the
+  ##   menu, so it can only ever be the answer inside a raid. Kept because a
+  ##   raid is where a mod most wants the main thread, and because binding late
+  ##   beats not binding.
+  ##
+  ##   `UnityEngine.UI.CanvasUpdateRegistry::PerformUpdate` -- uGUI's per-frame
+  ##   layout and graphic rebuild, driven from `Canvas.willRenderCanvases` on
+  ##   the main thread. Engine code, so it is present whenever the UI module is,
+  ##   which for this game is always. This is the reliable fallback.
+  ##
+  ##   `UnityEngine.Time::get_deltaTime` -- last, and reluctantly. It is a Unity
+  ##   API that may only be called from the main thread, so whoever calls it is
+  ##   on that thread; but it is called *many* times per frame rather than once,
+  ##   and it is a small function whose compiled body may well be shorter than
+  ##   the fourteen bytes a jump needs -- in which case the engine refuses it
+  ##   and this loop moves on, which is the right outcome rather than a failure.
+  ##
+  ## Whichever binds gets the same treatment: an empty drain costs a handful of
+  ## instructions, so being called ten times a frame instead of once is a
+  ## difference in noise rather than in frame time.
+  ##
+  ## The hook goes through the same engine and the same slot table as a mod's
+  ## patch, and is entered in `gPatches` like one. It has to be: the engine
+  ## hands slots out in ascending order and the firing path indexes `gPatches`
+  ## by slot, so a host hook kept outside that table would shift every mod's
+  ## slot by one and deliver each patch to the wrong handler.
+  if gDrainSlot >= 0:
+    return true
+  if not gReady:
+    return false
+
+  # Built here rather than as a module-level `seq`: a global whose initialiser
+  # is a call is silently left zeroed in an `--app:lib` build.
+  var candidates: seq[string] = @[]
+  candidates.add "EFT.MainApplication::Update"
+  candidates.add "EFT.GameWorld::Update"
+  candidates.add "UnityEngine.UI.CanvasUpdateRegistry::PerformUpdate"
+  candidates.add "UnityEngine.Time::get_deltaTime"
+
+  for spec in candidates:
+    let sep = find(spec, "::")
+    if sep < 0:
+      continue
+    let typePart = spec.substr(0, sep - 1)
+    let member = spec.substr(sep + 2)
+
+    let cls = findClass(gRt, typePart)
+    if cls == nil:
+      if verbose: info "no per-frame candidate " & typePart & " in this build"
+      continue
+    # -1: a per-frame update takes no arguments, but naming an arity here would
+    # miss an overload set and there is nothing to gain from being strict.
+    let m = findMethod(gRt, cls, member, -1)
+    if m == nil:
+      if verbose: info typePart & " has no " & member
+      continue
+    let fn = methodPointer(gRt, m)
+    if fn == nil:
+      if verbose: info "no usable code pointer for " & spec
+      continue
+
+    if gPatches.len >= int(cHookCapacity()):
+      warn "no free patch slots for the main-thread drain"
+      return false
+    let hook = cHookNew()
+    if hook == nil:
+      return false
+
+    var targetBytes = newSeq[byte](spec.len + 1)
+    for k in 0 ..< spec.len:
+      targetBytes[k] = byte(spec[k])
+    targetBytes[spec.len] = 0'u8
+    gPatches.add Patch(hook: hook, cb: cast[Il2CppPtr](0),
+                       user: cast[Il2CppPtr](0), target: spec,
+                       targetC: targetBytes, live: true, meth: m,
+                       wantArgs: false, canSkip: false, modIndex: -1,
+                       isDrain: true)
+    let slot = cHookAttach(hook, fn)
+    if slot < 0'i32:
+      shrink(gPatches, gPatches.len - 1)
+      cHookFree(hook)
+      if verbose:
+        info "cannot drain from " & spec & ": " &
+             readCString(cHookErrorText(slot))
+      continue
+    if int(slot) != gPatches.len - 1:
+      warn "drain slot " & $int(slot) & " does not match index " &
+           $(gPatches.len - 1) & "; refusing to arm it"
+      discard cHookRemove(hook)
+      shrink(gPatches, gPatches.len - 1)
+      cHookFree(hook)
+      return false
+
+    gDrainSlot = int(slot)
+    gDrainMethod = spec
+    okLog "main-thread drain bound to " & spec & " (" &
+          $int(cHookStolen(hook)) & " bytes)"
+    return true
+
+  result = false
 
 proc hostEventSubscribe(ctx: Il2CppPtr; name: Il2CppPtr; nameLen: int32;
                         cb: Il2CppPtr; user: Il2CppPtr): int32 {.
@@ -900,21 +1108,6 @@ proc hostStoreList(ctx: Il2CppPtr; prefix: Il2CppPtr; prefixLen: int32;
     return ErrBadArg
   var v = storeKeys(guid, p)
   result = cOutCopy(outPtr, outLen, cast[Il2CppPtr](toCString(v)), int32(v.len))
-
-proc enqueue(cb, user: Il2CppPtr; dueMs: uint64; modIndex: int;
-             selfTest: bool) =
-  ## The only way into `gPending`, from any thread.
-  ##
-  ## Under the lock because the caller may be a mod's worker thread while the
-  ## drain is running on the game thread -- appending to a seq that another
-  ## thread is rebuilding is a corrupted list, not a lost callback. The count
-  ## is republished inside the lock so the drain's lock-free empty check can
-  ## never see a queue that has entries.
-  cMqLock()
-  gPending.add Pending(cb: cb, user: user, dueMs: dueMs, modIndex: modIndex,
-                       selfTest: selfTest)
-  cMqSetCount(int32(gPending.len))
-  cMqUnlock()
 
 proc hostInvokeMain(ctx: Il2CppPtr; cb: Il2CppPtr; user: Il2CppPtr): int32 {.
     exportc: "aowlspt_nim_invoke_main", cdecl.} =
@@ -1090,11 +1283,16 @@ proc dropModRegistrations(index: int) =
       kept.add sub1
   gSubs = kept
 
+  # Under the lock, because the drain runs on the game thread and may be part
+  # way through this same list while a mod is being unloaded.
+  cMqLock()
   var keptPending: seq[Pending] = @[]
   for pend in gPending:
     if pend.modIndex != index:
       keptPending.add pend
   gPending = keptPending
+  cMqSetCount(int32(gPending.len))
+  cMqUnlock()
 
   for i in 0 ..< gPatches.len:
     if gPatches[i].live and gPatches[i].modIndex == index:
@@ -1223,44 +1421,6 @@ proc reportRuntime() =
 
 # --------------------------------------------------------------- main
 
-proc drainDue() =
-  ## Takes the due callbacks out under the lock and runs them outside it.
-  ##
-  ## Outside it on purpose: a callback is a mod's code, it may take as long as
-  ## it likes, and it may call `invoke_main` again. Running it with the lock
-  ## held would block every other thread behind whatever it does. Taking the
-  ## work out first is the same shape the backend's timer queue uses.
-  var due: seq[Pending] = @[]
-  cMqLock()
-  if gPending.len > 0:
-    let now = cNowMs()
-    var keep: seq[Pending] = @[]
-    for p in gPending:
-      if p.dueMs <= now:
-        due.add p
-      else:
-        keep.add p
-    gPending = keep
-    cMqSetCount(int32(gPending.len))
-  cMqUnlock()
-
-  for p in due:
-    if p.selfTest:
-      # The proof, and the reason it is an entry in the queue rather than a
-      # log line at bind time: it went in from the host thread and comes out
-      # here, so the thread it names is the thread a mod's callback would get.
-      okLog "invoke_main self-test ran on thread " & $int(cThreadId())
-    else:
-      discard cInvokeCallback(p.cb, p.user, cast[Il2CppPtr](0), 0'i32)
-
-proc mainDrain() =
-  ## The per-frame drain, called from inside a method Unity runs on its main
-  ## thread. Everything expensive is behind `cMqEnter`, which answers "is this
-  ## my thread, and is there anything to do" in a handful of instructions.
-  if cMqEnter() == 0'i32:
-    return
-  drainDue()
-
 proc runPending() =
   ## The host thread's half.
   ##
@@ -1285,10 +1445,11 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   gLogPath = joinPath(gDir, "aowlspt-host.log")
 
   # A fresh log each launch. The interesting failure is always this run's.
+  gHostThreadId = cThreadId()
   discard writeTextFile(gLogPath,
     "aowlspt-host-il2cpp " & HostVersion & "\n" &
     "directory " & gDir & "\n" &
-    "thread " & $int(cThreadId()) & "\n\n")
+    "thread " & $int(gHostThreadId) & "\n\n")
 
   storeInit(gDir)
 
@@ -1308,6 +1469,15 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       gReady = false
     else:
       reportRuntime()
+      # Before any mod loads, and for one reason that is not about timing: the
+      # detour engine hands out slots in ascending order and the firing path
+      # indexes `gPatches` by slot, so the host's own hook has to claim slot 0
+      # before a mod can claim it. Failing here is not fatal -- the queue keeps
+      # running on this thread, which is what it did before any of this existed.
+      if not bindMainDrain(true):
+        warn "no per-frame method could be detoured, so invoke_main runs on " &
+             "the host's own thread (" & $int(gHostThreadId) & ") and not " &
+             "Unity's; a callback that touches a Unity object is unsafe"
 
   let modsDir = joinPath(gDir, "mods")
   let found = discoverMods(modsDir)
@@ -1336,12 +1506,73 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
 
   okLog "host running"
 
+  # Queued from *this* thread, drained by whoever drains. When the two are
+  # different threads, the line it writes is the proof -- not the claim -- that
+  # `invoke_main` leaves this thread and arrives on Unity's.
+  enqueue(cast[Il2CppPtr](0), cast[Il2CppPtr](0), cNowMs(), -1, true)
+
   var lastTick = cNowMs()
+  gLastFireMs = lastTick
+  var nextBindTry = lastTick + 5000'u64
   while true:
     cSleep(16'i32)
     let now = cNowMs()
     let elapsed = int64(now - lastTick)
     lastTick = now
+
+    # Retry while nothing is bound. The first candidate that is worth having is
+    # a game type, and the game's own types come up long after the runtime
+    # does -- resolving once at boot would report a false negative for the rest
+    # of the session. Quiet after the first attempt: the reasons do not change.
+    if gDrainSlot < 0 and gReady and now >= nextBindTry:
+      nextBindTry = now + 5000'u64
+      if bindMainDrain(false):
+        okLog "the main-thread drain bound late, on " & gDrainMethod
+
+    let fires = int(cMqFireCount())
+    if fires != gLastFire:
+      gLastFire = fires
+      gLastFireMs = now
+      if gDrainStalled:
+        gDrainStalled = false
+        okLog "the main-thread drain is firing again on " & gDrainMethod
+      if not gDrainProven:
+        gDrainProven = true
+        # Reported from here rather than from the drain: the drain runs inside
+        # the game's update path and opening a log file there would cost a file
+        # handle on a frame, every frame it first fires.
+        let mainTid = int(cMqThread())
+        okLog "the drain fires on thread " & $mainTid & "; the host runs on " &
+              $int(gHostThreadId)
+        if uint32(mainTid) == gHostThreadId:
+          # Only possible if the hooked method were somehow called from this
+          # very thread, which would mean it is not the player loop's.
+          warn "the drain fires on the host's own thread, so it is not " &
+               "Unity's; invoke_main is no better placed than it was"
+        else:
+          okLog "invoke_main now runs on Unity's main thread (" &
+                gDrainMethod & ")"
+    elif gDrainSlot >= 0 and not gDrainStalled and cMqCount() != 0'i32 and
+         now - gLastFireMs > 2000'u64:
+      # The hook is installed and the game has stopped calling it -- which is
+      # exactly what happens if it bound to something that only exists during a
+      # raid. Callbacks that never arrive are a worse failure than callbacks on
+      # the wrong thread, so this thread takes the queue back and says so.
+      gDrainStalled = true
+      if not gStallReported:
+        gStallReported = true
+        warn "the main-thread drain has not fired for 2s with work queued; " &
+             "running it on the host thread until it comes back"
+
+    if not gAlienReported and cMqAlienFires() > 0'i32:
+      gAlienReported = true
+      # The hooked method turned out to be called from more than one thread.
+      # Only the first thread to reach it ever drains, so this is a note about
+      # the candidate rather than a fault -- but it means the choice was not as
+      # main-thread-only as it looked.
+      warn gDrainMethod & " also runs on other threads; only thread " &
+           $int(cMqThread()) & " drains the queue"
+
     runPending()
     for i in 0 ..< gMods.len:
       if gMods[i].live and gMods[i].hasUpdate:

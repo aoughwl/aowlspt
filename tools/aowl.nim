@@ -683,9 +683,11 @@ proc cmdTest(e: Env): int =
       # A database with a trader, an assort, a handbook price and a stash grid
       # in it. Without one the emulator answers out of its fallbacks, which is a
       # path worth testing and not the only one -- buying something requires a
-      # trader who has it and a price to pay.
+      # trader who has it and a price to pay. `emu-full.json` is that plus what
+      # the flea, the hideout, the loot tables and the quests need, in one
+      # database, because the checks for those cross into each other.
       discard copyFileAt(
-        joinPath(e.repo, "tests\\fixtures\\emu-db.json"),
+        joinPath(e.repo, "tests\\fixtures\\emu-full.json"),
         joinPath(estage, "db.json"))
       let emutest = joinPath(e.repo, "installer\\build\\emutest.exe")
       if fileExists(emutest):

@@ -499,6 +499,48 @@ proc callVec*(l: var LazyCall; obj: Il2CppPtr; p: Vec3; flag: bool): bool =
   discard reflect(l.m, obj, cast[Il2CppPtr](addr argv[0]))
   result = true
 
+# ---------------------------------------------------------------------------
+# Reading a field out of a boxed value struct
+# ---------------------------------------------------------------------------
+
+type
+  LazyField* = object
+    ## A field on whatever class the object turns out to be, cached the same
+    ## way `LazyCall` caches a method.
+    ##
+    ## This is for the value structs EFT returns from health queries, where the
+    ## *struct* has a name that moves between versions but the fields inside it
+    ## (`Current`, `Maximum`) do not. `il2cpp_field_get_value` is used rather
+    ## than an offset load because it is the runtime's own answer to where a
+    ## field lives inside a boxed value -- the header offset question that
+    ## `bindField` refuses to guess at.
+    name*: string
+    cls*: Il2CppClass
+    f*: Il2CppField
+    tried*: bool
+
+proc lazyField*(name: string): LazyField =
+  LazyField(name: name, cls: cast[Il2CppClass](0), f: cast[Il2CppField](0),
+            tried: false)
+
+proc readStructFloat*(l: var LazyField; boxed: Il2CppPtr;
+                      default: float): float =
+  result = default
+  if boxed == nil or not gLive:
+    return
+  let c = objectClass(gRt, boxed)
+  if c == nil:
+    return
+  if (not l.tried) or l.cls != c:
+    l.cls = c
+    l.tried = true
+    l.f = findField(gRt, c, l.name)
+  if l.f == nil:
+    return
+  var v: float32 = 0.0
+  fieldGetValue(gRt, boxed, l.f, cast[Il2CppPtr](addr v))
+  result = float(v)
+
 proc readManagedString*(p: Il2CppPtr): string =
   ## A `System.String` the game handed back.
   if p == nil:
@@ -524,8 +566,8 @@ type
     ready*: bool
     reported*: bool
 
-    ## World -> players. Bound by *name*, because there is no instance to bind
-    ## from until after the first of these calls has returned one.
+    # World -> players. Bound by *name*, because there is no instance to bind
+    # from until after the first of these calls has returned one.
     worldInstance*: Binding
     worldAlive*: Binding
     worldMethod*: Il2CppMethod   ## the reflective form, when the fast one refuses
@@ -533,33 +575,38 @@ type
     worldWhy*: string
     aliveWhy*: string
 
-    ## The alive-players list. Generic-instantiated, so it can only be bound
-    ## from an instance -- which is the case `LazyCall` exists for.
+    # The alive-players list. Generic-instantiated, so it can only be bound
+    # from an instance -- which is the case `LazyCall` exists for.
     listCount*: LazyCall
     listItem*: LazyCall
 
-    ## Player
+    # Player
     pIsAI*: LazyCall
     pProfileId*: LazyCall
     pAIData*: LazyCall
     pHealth*: LazyCall
     pMovement*: LazyCall
+    pPhysical*: LazyCall
     pPosition*: LazyCall         ## Vector3 -> reflective
     pLookDir*: LazyCall          ## Vector3 -> reflective
 
-    ## AIData -> BotOwner
+    # AIData -> BotOwner
     aiBotOwner*: LazyCall
 
-    ## MovementContext
+    # MovementContext
     mcSprint*: LazyCall
 
-    ## HealthController
+    # Physical -> Stamina
+    phStamina*: LazyCall
+    stNormal*: LazyCall
+
+    # HealthController
     hcAlive*: LazyCall
     hcBodyPart*: LazyCall        ## enum arg, value-struct return -> reflective
-    hcEnergy*: LazyCall
-    hcHydration*: LazyCall
+    vsCurrent*: LazyField
+    vsMaximum*: LazyField
 
-    ## BotOwner components
+    # BotOwner components
     boMemory*: LazyCall
     boWeapon*: LazyCall
     boMover*: LazyCall
@@ -567,28 +614,39 @@ type
     boShoot*: LazyCall
     boMedecine*: LazyCall
 
-    ## The bot's memory
+    # The bot's memory
     memUnderFire*: LazyCall
     memGoalEnemy*: LazyCall
 
-    ## The enemy record the game keeps
+    # The enemy record the game keeps
     enPerson*: LazyCall
     enVisible*: LazyCall
     enCanShoot*: LazyCall
     enPosition*: LazyCall        ## Vector3 -> reflective
 
-    ## Weapon
+    # Weapon
     wmHaveBullets*: LazyCall
+    wmReady*: LazyCall
     wmReload*: LazyCall
     rlTryReload*: LazyCall
     rlBullets*: LazyCall
     rlMaxBullets*: LazyCall
 
-    ## Medicine
+    # Medicine. Three separate `LazyCall`s for what is the same member name on
+    # three different component classes: one shared binding would rebind on
+    # every call as the class under it alternated, which is the one way to
+    # make lazy binding cost something.
     medFirstAid*: LazyCall
+    medStims*: LazyCall
+    medSurgery*: LazyCall
+    faHave*: LazyCall
+    stimHave*: LazyCall
+    surgHave*: LazyCall
     faApply*: LazyCall
+    stimApply*: LazyCall
+    surgApply*: LazyCall
 
-    ## Driving
+    # Driving
     mvGoTo*: LazyCall            ## Vector3 argument -> reflective
     mvSprint*: LazyCall          ## one bool -> fast
     mvStop*: LazyCall
@@ -638,16 +696,20 @@ proc bindAll*() =
   gB.pAIData = lazy("get_AIData")
   gB.pHealth = lazy("get_HealthController")
   gB.pMovement = lazy("get_MovementContext")
+  gB.pPhysical = lazy("get_Physical")
   gB.pPosition = lazy("get_Position")
   gB.pLookDir = lazy("get_LookDirection")
 
   gB.aiBotOwner = lazy("get_BotOwner")
   gB.mcSprint = lazy("get_IsSprintEnabled")
 
+  gB.phStamina = lazy("get_Stamina")
+  gB.stNormal = lazy("get_NormalValue")
+
   gB.hcAlive = lazy("get_IsAlive")
   gB.hcBodyPart = lazyAs("GetBodyPartHealth", [fkI32], fkNone)
-  gB.hcEnergy = lazy("get_Energy")
-  gB.hcHydration = lazy("get_Hydration")
+  gB.vsCurrent = lazyField("Current")
+  gB.vsMaximum = lazyField("Maximum")
 
   gB.boMemory = lazy("get_Memory")
   gB.boWeapon = lazy("get_WeaponManager")
@@ -665,13 +727,21 @@ proc bindAll*() =
   gB.enPosition = lazy("get_CurrPosition")
 
   gB.wmHaveBullets = lazy("get_HaveBullets")
+  gB.wmReady = lazy("get_IsReady")
   gB.wmReload = lazy("get_Reload")
   gB.rlTryReload = lazy("TryReload")
   gB.rlBullets = lazy("get_BulletCount")
   gB.rlMaxBullets = lazy("get_MaxBulletCount")
 
   gB.medFirstAid = lazy("get_FirstAid")
+  gB.medStims = lazy("get_Stimulators")
+  gB.medSurgery = lazy("get_SurgicalKit")
+  gB.faHave = lazy("get_HaveSmth2Use")
+  gB.stimHave = lazy("get_HaveSmth2Use")
+  gB.surgHave = lazy("get_HaveWork")
   gB.faApply = lazy("TryApplyToCurrentPart")
+  gB.stimApply = lazy("TryApply")
+  gB.surgApply = lazy("TryApplyToCurrentPart")
 
   # `GoToPoint` is overloaded by arity across client versions -- one argument in
   # the shortest form, five or six in the fullest. Trying arities in order of

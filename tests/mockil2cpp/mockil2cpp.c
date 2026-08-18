@@ -402,6 +402,55 @@ static void* m_playerBoost(void* obj, void** params) {
 MOCK_EXPORT int32_t mock_boost_calls(void) { return g_boostCalls; }
 
 /* ------------------------------------------------------------------ *
+ * Unity's per-frame update  (added for the main-thread drain)
+ *
+ * `invoke_main` is only worth its name if the host can get onto the thread
+ * Unity runs its player loop on, and the way it does that is to detour a
+ * managed method that loop calls once a frame. To test that, this mock needs
+ * two things the rest of it has no reason to have: a method that plays the
+ * part, and a thread that calls it the way the player loop would.
+ *
+ * The name is one of the host's real candidates rather than an invented one,
+ * so the mock exercises the candidate list as written -- and deliberately not
+ * the *first* candidate, so a run also proves the host falls through the ones
+ * that are absent (`EFT.MainApplication`, which does not exist here) and the
+ * ones whose class exists without the method (`EFT.GameWorld::Update`).
+ *
+ * The body is longer than it needs to be, and that is the point: a detour
+ * replaces the first fourteen bytes of a function, so a one-line function is
+ * refused for being shorter than its own prologue. Real per-frame methods are
+ * not that short; this one must not be either or it would test a refusal
+ * rather than a hook.
+ * ------------------------------------------------------------------ */
+
+static MockClass  g_frameClass;
+static MockMethod* g_frameMethod = NULL;
+static volatile LONG g_frameCount = 0;
+static double g_frameTime = 0.0;
+static double g_frameDelta = 1.0 / 60.0;
+
+/* UnityEngine.UI.CanvasUpdateRegistry::PerformUpdate() -> void, static and
+ * compiled. Detoured, not invoked: the host hooks the compiled function, and
+ * the thread below calls it through `methodPointer` for the same reason the
+ * other compiled methods here do -- a direct call is one gcc inlines at -O1,
+ * and a detour on an inlined body fires for nobody. */
+static void mock_native_frame(void* methodInfo) {
+    (void)methodInfo;
+    g_frameTime += g_frameDelta;
+    if (g_frameTime > 1.0e9) g_frameTime = 0.0;
+    InterlockedIncrement(&g_frameCount);
+}
+
+typedef void (*FnFrame)(void*);
+
+static void* m_framePerformUpdate(void* obj, void** params) {
+    (void)obj; (void)params;
+    FnFrame fn = (FnFrame)g_frameMethod->methodPointer;
+    fn(NULL);
+    return NULL;
+}
+
+/* ------------------------------------------------------------------ *
  * The type universe
  * ------------------------------------------------------------------ */
 
@@ -455,15 +504,28 @@ static MockClass g_gameWorldClass = {
     g_worldMethods, 2, NULL, 0
 };
 
+/* The per-frame method's own table and class. Its namespace really does
+ * contain a dot -- `UnityEngine.UI` -- which is worth having here: the host
+ * splits a qualified name at the *last* dot, and a type universe where every
+ * namespace is a single word would never have proved that. */
+static MockMethod g_frameMethods[] = {
+    { NULL, "PerformUpdate", 0, {0,0,0,0}, "System.Void", m_framePerformUpdate,
+      NULL, 1, (void*)mock_native_frame },
+};
+static MockClass g_frameClass = {
+    "UnityEngine.UI", "CanvasUpdateRegistry", &g_objectClass, 16, 0,
+    g_frameMethods, 1, NULL, 0
+};
+
 static MockClass* g_corlibClasses[] = {
     &g_objectClass, &g_stringClass, &g_int32Class,
     &g_singleClass, &g_boolClass, &g_voidClass
 };
-static MockClass* g_unityClasses[] = { &g_appClass };
+static MockClass* g_unityClasses[] = { &g_appClass, &g_frameClass };
 static MockClass* g_eftClasses[]   = { &g_playerClass, &g_gameWorldClass };
 
 static MockImage g_corlibImage = { "mscorlib.dll",       g_corlibClasses, 6 };
-static MockImage g_unityImage  = { "UnityEngine.dll",    g_unityClasses,  1 };
+static MockImage g_unityImage  = { "UnityEngine.dll",    g_unityClasses,  2 };
 static MockImage g_eftImage    = { "Assembly-CSharp.dll",g_eftClasses,    2 };
 
 static MockAssembly g_assemblies[] = {
@@ -515,6 +577,47 @@ static void mock_wire(void) {
     g_boostMethod = mock_find(&g_playerClass, "Boost");
 }
 
+/* The thread that plays Unity's main thread.
+ *
+ * Started from `il2cpp_init`, so it exists from the moment the host can see a
+ * domain -- the same order the game has, where the player loop is already
+ * running by the time anything else is up. It calls the compiled function
+ * through the method table rather than directly, so a detour installed
+ * afterwards is on the path it takes.
+ *
+ * It never stops. The process it runs in is a test harness that exits when it
+ * is done, and a loop with a shutdown flag would only add a way for the host's
+ * hook to be removed while a frame is inside it -- which is a real hazard in
+ * the game and not one this mock is trying to model.
+ */
+static DWORD g_frameThreadId = 0;
+
+static DWORD WINAPI mock_frame_loop(LPVOID arg) {
+    (void)arg;
+    for (;;) {
+        if (g_frameMethod && g_frameMethod->methodPointer) {
+            FnFrame fn = (FnFrame)g_frameMethod->methodPointer;
+            fn(NULL);
+        }
+        Sleep(8);   /* about 120 frames a second */
+    }
+}
+
+static void mock_frame_start(void) {
+    if (g_frameThreadId != 0) return;
+    g_frameMethod = mock_find(&g_frameClass, "PerformUpdate");
+    HANDLE h = CreateThread(NULL, 0, mock_frame_loop, NULL, 0, &g_frameThreadId);
+    if (h) CloseHandle(h);
+}
+
+/* The thread the frame loop runs on, and how many frames it has run. The
+ * harness reads the first one and compares it with the thread the host says a
+ * queued callback ran on: equal is the whole assertion. */
+MOCK_EXPORT uint32_t mock_frame_thread_id(void) {
+    return (uint32_t)g_frameThreadId;
+}
+MOCK_EXPORT int32_t mock_frame_count(void) { return (int32_t)g_frameCount; }
+
 /* ------------------------------------------------------------------ *
  * The IL2CPP C API
  * ------------------------------------------------------------------ */
@@ -525,6 +628,9 @@ MOCK_EXPORT void il2cpp_set_config_dir(const char* dir) { (void)dir; }
 MOCK_EXPORT void* il2cpp_init(const char* name) {
     (void)name;
     mock_wire();
+    /* The player loop, such as it is. After `mock_wire`, because it calls the
+     * method through `methodPointer` and that is where it gets filled in. */
+    mock_frame_start();
     g_initialised = 1;
     return g_domain;
 }

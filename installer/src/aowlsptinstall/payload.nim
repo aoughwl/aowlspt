@@ -17,11 +17,18 @@
 ##       payload.json        the manifest -- required
 ##       runtime/            copied to <target>/           (SPT_Runtime, ...)
 ##       client/             copied to <target>/           (BepInEx, doorstop)
-##       aowlspt/            copied to <target>/           (our hosts and mods)
+##       aowlspt/            copied to <target>/aowlspt/   (our hosts and mods)
+##       registry/mods.json  the mod registry -- see `registry.nim`
 ##
 ## Every one of `runtime/`, `client/` and `aowlspt/` is optional; a payload with
 ## only `aowlspt/` is how you add the mod system to an install that already has
 ## the rest, which is exactly what the old deploy script did.
+##
+## `kind` in the manifest says whether installing it mirrors a client or only
+## adds to one. See `load` for why that is declared rather than inferred; the
+## short version is that a post-1.0 payload has no `runtime/` and no `client/`,
+## so the inference reads it as an overlay and quietly builds a target with no
+## game in it.
 
 import std/strutils
 import winfs
@@ -98,7 +105,27 @@ proc load*(rootIn: string): Payload =
   result.hasClient = isDirectory(clientDir(result))
   result.hasAowlspt = isDirectory(aowlsptDir(result))
 
-  if result.hasRuntime or result.hasClient:
+  # What kind of install this payload makes.
+  #
+  # It is declared, and only inferred when it is not. The inference -- "it
+  # carries a runtime or a mod loader, so it builds a whole install" -- was
+  # written for pre-1.0 Tarkov, where a playable install meant BepInEx and
+  # doorstop in `client/` and SPT's server in `runtime/`. A post-1.0 payload has
+  # neither: the host is injected by `aowlspt-launch` at start-up and the server
+  # is one of the mods, so everything it ships lives in `aowlspt/`. Left to the
+  # inference, that payload reads as an overlay -- and an overlay never mirrors
+  # the client, so `install --source <vanilla> --target <new>` produces a target
+  # holding `aowlspt/` and no game, reporting success. That is the whole
+  # first-run path failing quietly, which is why the manifest gets to say.
+  let declared = toLowerAscii(strip(scalarAfterKey(text, "kind")))
+  if declared == "full":
+    result.kind = plFull
+  elif declared == "overlay" or declared == "modsonly" or declared == "mods":
+    result.kind = plModsOnly
+  elif declared.len > 0:
+    result.problems.add "payload.json has \"kind\": \"" & declared &
+      "\", which is neither \"full\" nor \"overlay\""
+  elif result.hasRuntime or result.hasClient:
     result.kind = plFull
   else:
     result.kind = plModsOnly
@@ -138,6 +165,14 @@ proc describe*(p: Payload): seq[string] =
   if joined.len == 0:
     joined = "(empty)"
   result.add "contains  " & joined
+  # Spelled out rather than left to be inferred from the directory list: it
+  # decides whether the client is mirrored at all, which is the difference
+  # between an install you can start and a directory of libraries.
+  if p.kind == plFull:
+    result.add "kind      full -- the client is mirrored from --source, then " &
+               "this goes over it"
+  else:
+    result.add "kind      overlay -- added to the install already at --target"
   if p.backendUrl.len > 0:
     result.add "backend   " & p.backendUrl
   for problem in p.problems:
