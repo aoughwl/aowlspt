@@ -25,3 +25,7 @@ installer/payload/payload.json
 
 # Compiled test executables left beside the ABI layout tests
 tests/*.exe
+
+# The stand-in runtime is built by `aowl test`, not checked in
+tests/mockil2cpp/GameAssembly.dll
+tests/detour_test.exe
