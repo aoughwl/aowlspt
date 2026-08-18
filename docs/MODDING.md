@@ -145,12 +145,73 @@ There are 16 patch slots.
 |---|---|
 | `db_get` / `db_patch` | server-side; returns `ErrUnsupported` |
 | `route_register` | server-side; returns `ErrUnsupported` |
-| `event_subscribe` | not delivered between mods yet |
 | `invoke_main` | queues onto the host thread, **not** Unity's main thread |
 
 That last one matters if you touch Unity objects. The host runs its own attached
 thread; a mod that needs the real main thread cannot get there yet, and the name
 is documented rather than left to imply otherwise.
+
+## Keeping things: JSON, and a store of your own
+
+Two facilities every non-trivial mod needs, on either side.
+
+**Reading and editing JSON** — `aowlspt/json`:
+
+```nim
+import aowlspt/json
+
+let name  = body.field("Info.Nickname").asText
+let first = body.field("items[0]._id").asText
+for it in each(body.field("items")):
+  info it.field("_tpl").asText
+```
+
+It scans; it does not build a tree. A `JsonRef` is a pair of offsets into text
+somebody else owns, so `field` costs one walk and no allocation.
+
+For *editing*, take a document apart member-wise and put it back:
+
+```nim
+var d = parseObject(itemText)
+setNumber(d, "StackObjectsCount", 42)
+let updated = text(d)          # every field you did not touch is byte-identical
+```
+
+That is not a style preference. Rebuilding a document from a builder silently
+drops every field your mod does not model, and the game's documents are full of
+them. Member-wise editing keeps what it does not know about.
+
+**A store of your own** — ABI revision 2:
+
+```nim
+discard save("profile." & id, profileJson)
+let stored = load("profile." & id)
+for key in savedKeys("profile."):
+  info key
+```
+
+One file per key, held by the host under `store/<your-guid>/`. Use it for what
+your mod owns; `dbGet`/`dbPatch` is the *shared* game database and is the wrong
+place for your save state. Keys are flat `[A-Za-z0-9._-]`, and an invalid key is
+refused rather than mangled into a filename that might collide with another one.
+
+Check `storeReady()` before you rely on it — a host older than revision 2 does
+not have it, and finding that out from a `false` is better than from a null
+function pointer.
+
+## Talking to other mods
+
+```nim
+discard on("someone.else.event", proc (payload: string): string =
+  info "heard it"
+  "")
+
+discard emit("my.mod.event", "{\"id\":\"...\"}")
+```
+
+Delivered synchronously, in subscription order, to everyone **but** the emitter —
+a mod that owns an event usually subscribes to it too, and delivering it back
+would be a loop nobody wrote. Both hosts implement this.
 
 ## Testing without the game
 

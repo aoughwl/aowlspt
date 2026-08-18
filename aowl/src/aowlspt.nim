@@ -313,6 +313,52 @@ proc configSet*(key {.byref.}: string; valueJson {.byref.}: string): Status =
   gHost.configSet(gHost.ctx, slice(key), slice(valueJson))
 
 # ---------------------------------------------------------------------------
+# Persistence
+# ---------------------------------------------------------------------------
+#
+# Revision 2 of the host API, so every one of these checks `size` first. A mod
+# built against a newer ABI than the host it lands in must find out here, with
+# `ErrUnsupported`, rather than by calling through a null function pointer.
+
+proc hostApiSize*(): int =
+  ## What the host says its API struct is. Reported rather than inferred when a
+  ## capability is missing, because "unsupported" and "your host is older than
+  ## this mod" want different actions from whoever reads the log.
+  if not hostReady(): return 0
+  result = int(gHost.size)
+
+proc expectedApiSize*(): int = sizeof(HostApi)
+
+proc storeReady*(): bool =
+  ## Whether this host implements the revision-2 persistence calls.
+  ## `size` is the only usable test: nimony will not `cast` a proc field to a
+  ## pointer to compare it against null, and a host that reports the full struct
+  ## size has filled every field in it -- that is what the size means.
+  if not hostReady(): return false
+  result = gHost.size >= int32(sizeof(HostApi))
+
+proc storeGet*(key {.byref.}: string; outText: var string): Status =
+  ## Read this mod's private stored value. `ErrNotFound` if it was never set.
+  outText = ""
+  if not storeReady(): return ErrUnsupported
+  var buf = emptyBuffer()
+  result = gHost.storeGet(gHost.ctx, slice(key), addr buf)
+  if result == Ok: outText = takeBuffer(buf)
+
+proc storeSet*(key {.byref.}: string; value {.byref.}: string): Status =
+  ## Write this mod's private stored value, durably.
+  if not storeReady(): return ErrUnsupported
+  gHost.storeSet(gHost.ctx, slice(key), slice(value))
+
+proc storeList*(prefix {.byref.}: string; outJson: var string): Status =
+  ## A JSON array of this mod's keys beginning with `prefix`.
+  outJson = ""
+  if not storeReady(): return ErrUnsupported
+  var buf = emptyBuffer()
+  result = gHost.storeList(gHost.ctx, slice(prefix), addr buf)
+  if result == Ok: outJson = takeBuffer(buf)
+
+# ---------------------------------------------------------------------------
 # The exported entry points
 # ---------------------------------------------------------------------------
 

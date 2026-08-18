@@ -19,9 +19,16 @@ Owning the backend also collapses the pipeline into one thing: the backend and
 the client host share an ABI, a mod format, a build command and a test gate. One
 `.dll` serves both sides with a `side()` guard.
 
-## What it is not
+## The emulator
 
-It is not a finished Tarkov emulator. Serving the game's several hundred
+There **is** a Tarkov server on this now, and it is a mod like any other:
+`mods/tarkov`, documented in [EMULATOR.md](EMULATOR.md). It imports `aowlspt`
+and `aowlspt/server` and nothing else — which is the only honest test of whether
+this API is enough to build a game server with.
+
+## What the backend itself is not
+
+The backend is not the game. Serving the game's several hundred
 endpoints with correct data is an order of magnitude more work than this, and it
 belongs in mods rather than in the server. What is here is the pipeline —
 sockets, the client's wire framing, routing, a database, the mod ABI, and the
@@ -61,7 +68,12 @@ exportMod(guid = "you.mod", name = "Mod", author = "you", version = "1.0.0",
 | `dbRead(path)` | `.asText()`, `.asFloat()`, `.asInt()` |
 | `dbWrite(path, patch)` | **merges** into the object at `path` |
 | `setting(key)` | this mod's `config.json` |
-| `obj()` / `put` / `done` | JSON, with escaping you cannot forget |
+| `obj()` / `put` / `arr()` / `done` | JSON, with escaping you cannot forget |
+| `envelope(data)` | the client's `{"err":0,...}` wrapper — not optional |
+| `save(key, value)` / `load(key)` / `savedKeys(prefix)` | this mod's own persistent store |
+| `broadcast(name, payload)` / `onEvent(name, handler)` | between mods, delivered synchronously |
+| `afterMs(delay, handler)` | run something later, off the request thread |
+| `field(body, "a.b[0].c")` | reading a request body — `aowlspt/json` |
 
 ## The wire protocol
 
@@ -140,8 +152,7 @@ One command, no orchestration, and it tests the framing rather than trusting it.
 |---|---|
 | `resolve` / `call` | client-side; there is no managed runtime here to reflect into |
 | `patch` | client-side; there is no compiled game code here to detour |
-| `event_subscribe` | not delivered between mods yet |
-| `schedule` | not implemented yet |
+| nothing else | events, timers and the store all work here |
 
 `invoke_main` runs the callback where it stands: routes already run on worker
 threads, so there is no main thread a mod needs to be moved to.

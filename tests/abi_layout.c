@@ -31,7 +31,7 @@ int main(void)
     CHECK("sizeof(AowlSlice)", sizeof(AowlSlice), 16);
     CHECK("sizeof(AowlBuffer)", sizeof(AowlBuffer), 16);
     CHECK("sizeof(AowlHostInfo)", sizeof(AowlHostInfo), 120);
-    CHECK("sizeof(AowlHostApi)", sizeof(AowlHostApi), 168);
+    CHECK("sizeof(AowlHostApi)", sizeof(AowlHostApi), 192);
     CHECK("sizeof(AowlModInfo)", sizeof(AowlModInfo), 104);
     CHECK("sizeof(AowlModApi)", sizeof(AowlModApi), 56);
 
@@ -40,6 +40,12 @@ int main(void)
     CHECK("offsetof(AowlHostApi, info)", offsetof(AowlHostApi, info), 16);
     CHECK("offsetof(AowlHostApi, alloc)", offsetof(AowlHostApi, alloc), 24);
     CHECK("offsetof(AowlHostApi, now_ms)", offsetof(AowlHostApi, now_ms), 160);
+    /* Revision 2 appended `store_*` after `now_ms`. Checking the offset as well
+     * as the size is what catches an insertion in the middle, which would keep
+     * the size right and move every field a mod built against revision 1
+     * reads. */
+    CHECK("offsetof(AowlHostApi, store_get)", offsetof(AowlHostApi, store_get), 168);
+    CHECK("offsetof(AowlHostApi, store_list)", offsetof(AowlHostApi, store_list), 184);
 
     CHECK("offsetof(AowlHostInfo, host_name)", offsetof(AowlHostInfo, host_name), 16);
     CHECK("offsetof(AowlHostInfo, encodings)", offsetof(AowlHostInfo, encodings), 80);
@@ -54,6 +60,7 @@ int main(void)
     CHECK("offsetof(AowlModApi, state_load)", offsetof(AowlModApi, state_load), 48);
 
     CHECK("AOWLSPT_ABI_VERSION", AOWLSPT_ABI_VERSION, 1);
+    CHECK("AOWLSPT_ABI_REVISION", AOWLSPT_ABI_REVISION, 2);
     CHECK("AOWLSPT_SIDE_SIM", AOWLSPT_SIDE_SIM, 3);
     CHECK("AOWLSPT_PATCH_SKIP", AOWLSPT_PATCH_SKIP, 1);
 

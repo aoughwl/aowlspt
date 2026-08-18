@@ -16,7 +16,7 @@
 
 const
   AbiVersion* = 1'u32
-  AbiRevision* = 1'u32
+  AbiRevision* = 2'u32
 
 type
   Status* = int32
@@ -143,6 +143,13 @@ type
     invokeMain*: proc (ctx: pointer; cb: CallbackFn; user: pointer): Status {.cdecl.}
 
     nowMs*: proc (ctx: pointer): int64 {.cdecl.}
+
+    # -- revision 2 ---------------------------------------------------------
+    # Appended, never inserted: a mod built against revision 1 checks `size`
+    # and simply does not see these.
+    storeGet*: proc (ctx: pointer; key: AowlSlice; outBuf: ptr AowlBuffer): Status {.cdecl.}
+    storeSet*: proc (ctx: pointer; key, value: AowlSlice): Status {.cdecl.}
+    storeList*: proc (ctx: pointer; prefix: AowlSlice; outBuf: ptr AowlBuffer): Status {.cdecl.}
 
   ModInfo* {.bycopy.} = object
     size*: int32

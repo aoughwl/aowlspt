@@ -48,7 +48,7 @@ extern "C" {
 
 /* Additive revision within version 1. A host may expose a higher revision than
  * a mod was built against; the mod uses struct `size` to tell what is present. */
-#define AOWLSPT_ABI_REVISION 1u
+#define AOWLSPT_ABI_REVISION 2u
 
 #if defined(_WIN32)
 #  define AOWLSPT_CALL __cdecl
@@ -283,6 +283,27 @@ typedef struct AowlHostApi {
 
     /* Monotonic milliseconds since host start. */
     int64_t (AOWLSPT_CALL *now_ms)(void* ctx);
+
+    /* -- persistence (revision 2) ------------------------------------------
+     *
+     * A private key/value store per mod, held by the host and surviving a
+     * restart. `db_get`/`db_patch` address the *shared* game database, which is
+     * loaded from disk and common to every mod; this is where a mod keeps what
+     * belongs to it alone — profiles, progress, anything it must still know
+     * next time.
+     *
+     * A mod could open files itself, and then every mod would invent its own
+     * layout inside the install and there would be no way for the host to move,
+     * back up or clear a mod's data. Keys are flat, `[A-Za-z0-9._-]`, and a key
+     * outside that set is rejected rather than sanitised: silently mapping two
+     * keys onto one file is worse than refusing one of them.
+     *
+     * `store_list` returns a JSON array of the keys beginning with `prefix`,
+     * which is what makes "every profile" expressible without the mod knowing
+     * where the host put them. */
+    AowlStatus (AOWLSPT_CALL *store_get)(void* ctx, AowlSlice key, AowlBuffer* out);
+    AowlStatus (AOWLSPT_CALL *store_set)(void* ctx, AowlSlice key, AowlSlice value);
+    AowlStatus (AOWLSPT_CALL *store_list)(void* ctx, AowlSlice prefix, AowlBuffer* out);
 } AowlHostApi;
 
 /* ------------------------------------------------------------------ *

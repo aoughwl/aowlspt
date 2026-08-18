@@ -22,6 +22,7 @@ import std/strutils
 import aowlspt
 
 var ticks = 0
+var waitedMs = 0'i64
 var probed = false
 var tickHookFired = 0
 var found = 0
@@ -144,11 +145,17 @@ proc onLoad(): Status =
   Ok
 
 proc onUpdate(elapsedMs: int64): Status =
+  ## Waits by the clock, not by a tick count.
+  ##
+  ## Counting ticks assumes a tick rate. The host's is nominally 16ms, so "300
+  ## ticks" was meant to be five seconds -- and on a loaded machine it is
+  ## whatever it turns out to be, which made this probe intermittently miss the
+  ## harness window and fail a gate that had nothing wrong with it.
   inc ticks
+  waitedMs = waitedMs + elapsedMs
   if side() != sideClient:
     return Ok
-  # ~5 seconds at the host's 16ms tick.
-  if not probed and ticks > 300:
+  if not probed and waitedMs >= 3000:
     probed = true
     probeAll()
   Ok

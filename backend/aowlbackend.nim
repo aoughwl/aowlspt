@@ -30,6 +30,7 @@ import std/[strutils, syncio, cmdline]
 import aowlsptinstall/winfs
 import aowlsptinstall/log as console
 import modhost
+import modstore
 import jsondb
 import wire
 
@@ -47,6 +48,8 @@ proc cNetRecv(sock: uint64; buf: HostPtr; len: int32): int32 {.
 proc cNetSend(sock: uint64; buf: HostPtr; len: int32): int32 {.
   importc: "aowl_net_send", nodecl.}
 proc cNetLastError(): int32 {.importc: "aowl_net_last_error", nodecl.}
+proc cLock() {.importc: "aowl_lock", nodecl.}
+proc cUnlock() {.importc: "aowl_unlock", nodecl.}
 
 const
   HostName = "aowlspt-backend"
@@ -64,7 +67,20 @@ type
     user: HostPtr
     modIndex: int
 
+  Sub = object
+    name: string
+    cb: HostPtr
+    user: HostPtr
+    modIndex: int
+
+  Timer = object
+    dueMs: int64
+    cb: HostPtr
+    user: HostPtr
+
 var gRoutes: seq[Route] = @[]
+var gSubs: seq[Sub] = @[]
+var gTimers: seq[Timer] = @[]
 var gRoot = ""
 var gPort = 6969
 var gRequests = 0
@@ -431,14 +447,39 @@ proc hostRouteRegister(ctx: HostPtr; url: HostPtr; urlLen: int32; kind: int32;
 proc hostEventEmit(ctx: HostPtr; name: HostPtr; nameLen: int32;
                    payload: HostPtr; payloadLen: int32): int32 {.
     exportc: "aowlspt_nim_event_emit", cdecl.} =
-  modhost.info "event " & readBytes(name, nameLen)
+  ## Delivered synchronously, in subscription order, to everyone but the
+  ## emitter -- a mod that both emits and subscribes to a name is the ordinary
+  ## case (it owns the event), and calling it back into its own handler turns
+  ## that into a loop it never asked for.
+  let n = readBytes(name, nameLen)
+  let body = readBytes(payload, payloadLen)
+  let from1 = int(cast[uint](ctx))
+  var delivered = 0
+  for i in 0 ..< gSubs.len:
+    if gSubs[i].name != n or gSubs[i].modIndex == from1:
+      continue
+    var b = body
+    let st = cInvokeCallback(gSubs[i].cb, gSubs[i].user,
+                             cast[HostPtr](toCString(b)), int32(body.len))
+    if st != StatusOk:
+      # One bad subscriber must not stop the rest: an event is a broadcast, and
+      # a mod dropping it is that mod's problem rather than the emitter's.
+      modhost.warn "a subscriber to " & n & " returned " & $int(st)
+    inc delivered
+  if delivered == 0:
+    modhost.info "event " & n & " (no subscribers)"
   result = StatusOk
 
 proc hostEventSubscribe(ctx: HostPtr; name: HostPtr; nameLen: int32;
                         cb, user: HostPtr): int32 {.
     exportc: "aowlspt_nim_event_subscribe", cdecl.} =
-  gLastError = "events are not delivered between mods yet"
-  result = ErrUnsupported
+  let n = readBytes(name, nameLen)
+  if n.len == 0 or cb == nil:
+    gLastError = "a subscription needs a name and a handler"
+    return ErrBadArg
+  gSubs.add Sub(name: n, cb: cb, user: user, modIndex: int(cast[uint](ctx)))
+  modhost.okLog "subscribed to " & n
+  result = StatusOk
 
 proc hostCall(ctx: HostPtr; target: HostPtr; targetLen: int32;
               args: HostPtr; argsLen: int32;
@@ -480,8 +521,90 @@ proc hostInvokeMain(ctx: HostPtr; cb, user: HostPtr): int32 {.
 
 proc hostSchedule(ctx: HostPtr; delayMs: int32; cb, user: HostPtr): int32 {.
     exportc: "aowlspt_nim_schedule", cdecl.} =
-  gLastError = "scheduling is not implemented in the backend yet"
-  result = ErrUnsupported
+  ## Queued, and run from the serve loop rather than from whatever thread asked.
+  ## A timer that fired on the calling thread would run a mod's callback on an
+  ## accept worker, holding a connection slot for the length of the delay.
+  if cb == nil:
+    gLastError = "a timer needs a callback"
+    return ErrBadArg
+  var d = int64(delayMs)
+  if d < 0: d = 0
+  cLock()
+  gTimers.add Timer(dueMs: elapsedMs() + d, cb: cb, user: user)
+  cUnlock()
+  result = StatusOk
+
+proc runTimers() =
+  ## Due timers, one pass, oldest first. Rebuilding the list rather than
+  ## deleting in place: a callback may schedule another timer, and appending to
+  ## a sequence being iterated by index is how that turns into a lost timer or
+  ## a fired-twice one.
+  if gTimers.len == 0:
+    return
+  let now = elapsedMs()
+  var due: seq[Timer] = @[]
+  var keep: seq[Timer] = @[]
+  cLock()
+  for t in gTimers:
+    if t.dueMs <= now: due.add t
+    else: keep.add t
+  if due.len > 0:
+    gTimers = keep
+  cUnlock()
+  if due.len == 0:
+    return
+  # The callbacks run outside the lock. Mod code may take as long as it likes,
+  # and holding the queue while it does would stall every route handler that
+  # wants to schedule something. A repeating timer -- the obvious thing to
+  # write -- therefore re-queues onto a list nobody is iterating.
+  for t in due:
+    discard cInvokeCallback(t.cb, t.user, cast[HostPtr](0), 0'i32)
+
+# --------------------------------------------------------------- store
+
+proc hostStoreGet(ctx: HostPtr; key: HostPtr; keyLen: int32;
+                  outPtr, outLen: HostPtr): int32 {.
+    exportc: "aowlspt_nim_store_get", cdecl.} =
+  discard cOutCopy(outPtr, outLen, cast[HostPtr](0), 0'i32)
+  let k = readBytes(key, keyLen)
+  let guid = modGuidOf(int(cast[uint](ctx)))
+  if guid.len == 0:
+    gLastError = "no such mod context"
+    return ErrBadArg
+  var value = ""
+  var error = ""
+  if not storeRead(guid, k, value, error):
+    gLastError = error
+    return ErrNotFound
+  var v = value
+  result = cOutCopy(outPtr, outLen, cast[HostPtr](toCString(v)), int32(v.len))
+
+proc hostStoreSet(ctx: HostPtr; key: HostPtr; keyLen: int32;
+                  val: HostPtr; valLen: int32): int32 {.
+    exportc: "aowlspt_nim_store_set", cdecl.} =
+  let k = readBytes(key, keyLen)
+  let v = readBytes(val, valLen)
+  let guid = modGuidOf(int(cast[uint](ctx)))
+  if guid.len == 0:
+    gLastError = "no such mod context"
+    return ErrBadArg
+  var error = ""
+  if not storeWrite(guid, k, v, error):
+    gLastError = error
+    return ErrGeneric
+  result = StatusOk
+
+proc hostStoreList(ctx: HostPtr; prefix: HostPtr; prefixLen: int32;
+                   outPtr, outLen: HostPtr): int32 {.
+    exportc: "aowlspt_nim_store_list", cdecl.} =
+  discard cOutCopy(outPtr, outLen, cast[HostPtr](0), 0'i32)
+  let p = readBytes(prefix, prefixLen)
+  let guid = modGuidOf(int(cast[uint](ctx)))
+  if guid.len == 0:
+    gLastError = "no such mod context"
+    return ErrBadArg
+  var v = storeKeys(guid, p)
+  result = cOutCopy(outPtr, outLen, cast[HostPtr](toCString(v)), int32(v.len))
 
 proc patchFired(slot: int32) {.exportc: "aowlspt_nim_patch_fired", cdecl.} =
   discard
@@ -583,6 +706,9 @@ proc main(): int =
     modhost.info "no database at " & dbPath & "; db_get will find nothing"
     console.line "  db    (none)"
 
+  storeInit(gRoot)
+  console.line "  store " & storeRoot()
+
   let modsDir = joinPath(gRoot, "mods")
   let count = loadAll(modsDir, SideServer, HostName, HostVersion)
   console.line "  mods  " & $count
@@ -642,6 +768,7 @@ proc main(): int =
     cSysSleep(50'i32)
     let now = elapsedMs()
     tickMods(now - lastTick)
+    runTimers()
     lastTick = now
     if once and gRequests > 0:
       # One request then stop: how the test harness drives it.

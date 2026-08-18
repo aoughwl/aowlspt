@@ -189,7 +189,21 @@ proc buildMod(e: Env; modPathIn: string): bool =
   cmd.add " -o:" & quoted(outPath)
   cmd.add " " & quoted(source)
   if not run(e, "mod " & stem, cmd, dir):
-    return false
+    # One retry with the cache cleared.
+    #
+    # nimony's incremental cache does not always survive a source file being
+    # added to a mod: the build fails at the link step with an undefined string
+    # literal, which reads like a code error and is not one. A developer who
+    # does not know that loses an hour to it; the tool knows it, so it clears
+    # the cache and tries again, and only a second failure is real.
+    let cache = joinPath(dir, "nimcache")
+    if not isDirectory(cache):
+      return false
+    note "retrying " & stem & " with a cleared build cache"
+    discard winfs.removeTree(cache)
+    dec failures
+    if not run(e, "mod " & stem & " (retry)", cmd, dir):
+      return false
 
   result = placeLibrary(dir, stem, outPath)
 
@@ -268,6 +282,7 @@ proc buildIl2CppHost(e: Env): bool =
     cmd.add " -d:debug"
   cmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
   cmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "host\\common"))
   cmd.add " -o:" & quoted(outPath)
   cmd.add " " & quoted(source)
   if not run(e, "aowlspt-host-il2cpp", cmd, dir):
@@ -310,6 +325,22 @@ proc buildProbe(e: Env): bool =
   cmd.add " -o:" & quoted(joinPath(outDir, "aowlprobe.exe"))
   cmd.add " " & quoted(joinPath(e.repo, "tools\\aowlprobe.nim"))
   result = run(e, "aowlprobe", cmd, e.repo)
+
+proc buildEmuTest(e: Env): bool =
+  ## Same shape as the probe: it speaks the client's wire protocol, so it wants
+  ## `wire.nim` out of the backend and the same two libraries.
+  let outDir = joinPath(e.repo, "installer\\build")
+  discard ensureDir(outDir)
+  var cmd = quoted(nimonyExe(e))
+  cmd.add " c"
+  cmd.add abiInclude(e)
+  cmd.add " --passL:-lws2_32 --passL:-lz"
+  cmd.add " -p:" & quoted(joinPath(e.repo, "backend"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
+  cmd.add " -o:" & quoted(joinPath(outDir, "emutest.exe"))
+  cmd.add " " & quoted(joinPath(e.repo, "tools\\emutest.nim"))
+  result = run(e, "emutest", cmd, e.repo)
 
 proc buildTool(e: Env; source, exeName, label: string): bool =
   ## The nimony command-line tools. All of them want the ABI include path and
@@ -369,7 +400,68 @@ proc exampleDirs(e: Env): seq[string] =
 
 # --------------------------------------------------------------- commands
 
+proc abiStamp(e: Env): string =
+  ## A fingerprint of the C shims in `abi/`: a rolling hash of each header's
+  ## contents. Contents rather than timestamps, because a checkout or a revert
+  ## restores an old header with a new time, and hashing is the version that
+  ## says "the same bytes as last build" rather than "touched since".
+  var files: seq[string] = @[]
+  var dirs: seq[string] = @[]
+  let abiDir = joinPath(e.repo, "abi")
+  collectEntries(abiDir, files, dirs)
+  var total = 0
+  var count = 0
+  for f in files:
+    if not f.endsWith(".h"): continue
+    var text = ""
+    if not readTextFile(joinPath(abiDir, f), text):
+      continue
+    inc count
+    var h = 5381
+    for ch in f:
+      h = ((h * 33) + ord(ch)) and 0x3FFFFFFF
+    for ch in text:
+      h = ((h * 33) + ord(ch)) and 0x3FFFFFFF
+    # Summed rather than combined in order: `collectEntries` does not promise
+    # one, and a stamp that changes when the directory is walked differently
+    # would drop every cache for nothing.
+    total = (total + h) and 0x3FFFFFFF
+  result = $count & ":" & $total
+
+proc dropStaleCaches(e: Env) =
+  ## nimony tracks its own sources and knows nothing about a `#include` reached
+  ## through `--passC:-I`. Edit a header in `abi/` and every build reports
+  ## success while linking the object files compiled against the old one -- which
+  ## is how a mod ends up talking to a host API two fields shorter than it
+  ## thinks, with no error anywhere. So the headers are fingerprinted, and a
+  ## change throws the caches away.
+  let stampPath = joinPath(joinPath(e.repo, "installer"), "build\\.abistamp")
+  let now = abiStamp(e)
+  var was = ""
+  discard readTextFile(stampPath, was)
+  if was == now:
+    return
+  var roots: seq[string] = @[e.repo,
+                             joinPath(e.repo, "backend"),
+                             joinPath(e.repo, "host\\Aowlspt.Host.Il2Cpp"),
+                             joinPath(e.repo, "installer"),
+                             joinPath(e.repo, "mods\\tarkov")]
+  let mods = exampleDirs(e)
+  for m in mods:
+    roots.add m
+  var dropped = 0
+  for r in roots:
+    let cache = joinPath(r, "nimcache")
+    if isDirectory(cache):
+      discard winfs.removeTree(cache)
+      inc dropped
+  if was.len > 0 and dropped > 0:
+    note "the ABI headers changed; dropped " & $dropped & " build cache(s)"
+  discard ensureDir(joinPath(joinPath(e.repo, "installer"), "build"))
+  discard writeTextFile(stampPath, now)
+
 proc cmdBuild(e: Env): int =
+  dropStaleCaches(e)
   heading "Hosts (.NET)"
   discard buildHosts(e)
   heading "Host (IL2CPP, native)"
@@ -377,6 +469,7 @@ proc cmdBuild(e: Env): int =
   heading "Backend"
   discard buildBackend(e)
   discard buildProbe(e)
+  discard buildEmuTest(e)
   heading "Tools"
   discard buildInstaller(e)
   discard buildTool(e, "tools\\aowllaunch.nim", "aowlspt-launch.exe",
@@ -392,6 +485,7 @@ proc cmdBuild(e: Env): int =
   result = if failures > 0: 1 else: 0
 
 proc cmdTest(e: Env): int =
+  dropStaleCaches(e)
   heading "ABI layout (C)"
   let testsDir = joinPath(e.repo, "tests")
   let cExe = joinPath(testsDir, "abi_layout_c.exe")
@@ -511,6 +605,29 @@ proc cmdTest(e: Env): int =
     discard run(e, "backend serves every route over the wire",
                 quoted(joinPath(e.repo, "backend\\bin\\aowlspt-backend.exe")) &
                 " --root " & quoted(bstage) & " --port 6974 --selftest")
+
+    # And the emulator, driven the way the client drives it: the boot sequence
+    # in order, then a restart to prove the profile store is a store rather
+    # than a cache.
+    let estage = joinPath(e.repo, "installer\\build\\emustage")
+    discard winfs.removeTree(estage)
+    discard ensureDir(joinPath(estage, "mods\\tarkov"))
+    discard buildEmuTest(e)
+    if buildMod(e, joinPath(e.repo, "mods\\tarkov")):
+      discard copyFileAt(
+        joinPath(e.repo, "mods\\tarkov\\bin\\tarkov.dll"),
+        joinPath(estage, "mods\\tarkov\\tarkov.dll"))
+      if fileExists(joinPath(e.repo, "mods\\tarkov\\config.json")):
+        discard copyFileAt(
+          joinPath(e.repo, "mods\\tarkov\\config.json"),
+          joinPath(estage, "mods\\tarkov\\config.json"))
+      let emutest = joinPath(e.repo, "installer\\build\\emutest.exe")
+      if fileExists(emutest):
+        discard run(e, "the emulator boots a client",
+                    quoted(emutest) & " --root " & quoted(estage) &
+                    " --backend " & quoted(joinPath(e.repo,
+                      "backend\\bin\\aowlspt-backend.exe")) &
+                    " --port 6975")
 
   heading "Examples through the simulator"
   let sim = joinPath(e.repo,

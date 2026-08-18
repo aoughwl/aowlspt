@@ -1,7 +1,8 @@
 # aowlspt
 
 A modding pipeline for post-1.0 Tarkov, in **aowl/nimony**, front to back: a
-native client host, a backend server, one mod ABI, one build command.
+native client host, a backend server, one mod ABI, one build command -- and a
+Tarkov emulator written as a mod on top of it, using nothing a mod cannot use.
 
 ```nim
 import aowlspt

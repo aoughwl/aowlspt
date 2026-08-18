@@ -31,6 +31,7 @@
 import std/[strutils, syncio]
 import aowlspt/il2cpp
 import aowlsptinstall/winfs
+import modstore
 import invoke
 
 {.emit: """#include "aowlspt_shim.h" """.}
@@ -144,6 +145,14 @@ type
     targetC: seq[byte]
     live: bool
 
+  Sub = object
+    ## An event subscription. Client-side events are how one mod tells another
+    ## something happened without either knowing the other exists.
+    name: string
+    cb: Il2CppPtr
+    user: Il2CppPtr
+    modIndex: int
+
   Pending = object
     ## A callback a mod asked to have run on the game's main thread, or after a
     ## delay. Held as raw pointers because nimony cannot hold a `proc` it did
@@ -165,6 +174,7 @@ var gStartMs = 0'u64
 var gHandles: seq[Il2CppPtr] = @[]
 var gHandleIsObject: seq[bool] = @[]
 var gPatches: seq[Patch] = @[]
+var gSubs: seq[Sub] = @[]
 
 # --------------------------------------------------------------- logging
 
@@ -441,8 +451,25 @@ proc hostCall(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
 proc hostEventEmit(ctx: Il2CppPtr; name: Il2CppPtr; nameLen: int32;
                    payload: Il2CppPtr; payloadLen: int32): int32 {.
     exportc: "aowlspt_nim_event_emit", cdecl.} =
+  ## Synchronous, and on whatever thread emitted -- which on this side is
+  ## usually the game thread inside a patch. Queueing instead would be safer and
+  ## would also mean a mod cannot react to a hook before the hooked method runs,
+  ## which is the main reason to have events here at all.
   let n = readBytes(name, nameLen)
-  info "event " & n
+  let body = readBytes(payload, payloadLen)
+  let from1 = int(cast[uint](ctx))
+  var delivered = 0
+  for i in 0 ..< gSubs.len:
+    if gSubs[i].name != n or gSubs[i].modIndex == from1:
+      continue
+    var b = body
+    let st = cInvokeCallback(gSubs[i].cb, gSubs[i].user,
+                             cast[Il2CppPtr](toCString(b)), int32(body.len))
+    if st != StatusOk:
+      warn "a subscriber to " & n & " returned " & $int(st)
+    inc delivered
+  if delivered == 0:
+    info "event " & n & " (no subscribers)"
   result = StatusOk
 
 proc patchFired(slot: int32) {.exportc: "aowlspt_nim_patch_fired", cdecl.} =
@@ -551,8 +578,63 @@ proc hostPatch(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
 proc hostEventSubscribe(ctx: Il2CppPtr; name: Il2CppPtr; nameLen: int32;
                         cb: Il2CppPtr; user: Il2CppPtr): int32 {.
     exportc: "aowlspt_nim_event_subscribe", cdecl.} =
-  gLastError = "events are not delivered by the client host yet"
-  result = ErrUnsupported
+  let n = readBytes(name, nameLen)
+  if n.len == 0 or cb == nil:
+    gLastError = "a subscription needs a name and a handler"
+    return ErrBadArg
+  gSubs.add Sub(name: n, cb: cb, user: user, modIndex: int(cast[uint](ctx)))
+  okLog "subscribed to " & n
+  result = StatusOk
+
+# --------------------------------------------------------------- store
+
+proc guidOf(idx: int): string =
+  if idx < 0 or idx >= gMods.len: return ""
+  result = gMods[idx].guid
+
+proc hostStoreGet(ctx: Il2CppPtr; key: Il2CppPtr; keyLen: int32;
+                  outPtr, outLen: Il2CppPtr): int32 {.
+    exportc: "aowlspt_nim_store_get", cdecl.} =
+  discard cOutCopy(outPtr, outLen, cast[Il2CppPtr](0), 0'i32)
+  let k = readBytes(key, keyLen)
+  let guid = guidOf(int(cast[uint](ctx)))
+  if guid.len == 0:
+    gLastError = "no such mod context"
+    return ErrBadArg
+  var value = ""
+  var error = ""
+  if not storeRead(guid, k, value, error):
+    gLastError = error
+    return ErrNotFound
+  var v = value
+  result = cOutCopy(outPtr, outLen, cast[Il2CppPtr](toCString(v)), int32(v.len))
+
+proc hostStoreSet(ctx: Il2CppPtr; key: Il2CppPtr; keyLen: int32;
+                  val: Il2CppPtr; valLen: int32): int32 {.
+    exportc: "aowlspt_nim_store_set", cdecl.} =
+  let k = readBytes(key, keyLen)
+  let v = readBytes(val, valLen)
+  let guid = guidOf(int(cast[uint](ctx)))
+  if guid.len == 0:
+    gLastError = "no such mod context"
+    return ErrBadArg
+  var error = ""
+  if not storeWrite(guid, k, v, error):
+    gLastError = error
+    return ErrGeneric
+  result = StatusOk
+
+proc hostStoreList(ctx: Il2CppPtr; prefix: Il2CppPtr; prefixLen: int32;
+                   outPtr, outLen: Il2CppPtr): int32 {.
+    exportc: "aowlspt_nim_store_list", cdecl.} =
+  discard cOutCopy(outPtr, outLen, cast[Il2CppPtr](0), 0'i32)
+  let p = readBytes(prefix, prefixLen)
+  let guid = guidOf(int(cast[uint](ctx)))
+  if guid.len == 0:
+    gLastError = "no such mod context"
+    return ErrBadArg
+  var v = storeKeys(guid, p)
+  result = cOutCopy(outPtr, outLen, cast[Il2CppPtr](toCString(v)), int32(v.len))
 
 proc hostInvokeMain(ctx: Il2CppPtr; cb: Il2CppPtr; user: Il2CppPtr): int32 {.
     exportc: "aowlspt_nim_invoke_main", cdecl.} =
@@ -820,6 +902,8 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
     "aowlspt-host-il2cpp " & HostVersion & "\n" &
     "directory " & gDir & "\n" &
     "thread " & $int(cThreadId()) & "\n\n")
+
+  storeInit(gDir)
 
   let waitMs = readWaitMs()
   info "waiting for the IL2CPP runtime (up to " & $(waitMs div 1000) & "s)"

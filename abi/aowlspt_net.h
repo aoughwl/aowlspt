@@ -33,6 +33,35 @@
  * finished with it. */
 extern void aowlspt_nim_serve(uint64_t sock);
 
+/* One lock, for the host's own mutable lists.
+ *
+ * Requests are served on a pool of threads, so anything a route handler can
+ * reach that the serve loop also touches -- the timer queue is the one -- needs
+ * a lock rather than an argument about how unlikely the interleaving is.
+ * Initialised on first use under a one-time flag, because there is no point in
+ * the host in the process where it could be initialised earlier. */
+static CRITICAL_SECTION aowl_host_cs;
+static LONG aowl_host_cs_state = 0; /* 0 unset, 1 initialising, 2 ready */
+
+static void aowl_lock(void) {
+    LONG was = InterlockedCompareExchange(&aowl_host_cs_state, 1, 0);
+    if (was == 0) {
+        InitializeCriticalSection(&aowl_host_cs);
+        InterlockedExchange(&aowl_host_cs_state, 2);
+    } else {
+        while (InterlockedCompareExchange(&aowl_host_cs_state, 2, 2) != 2) {
+            Sleep(0);
+        }
+    }
+    EnterCriticalSection(&aowl_host_cs);
+}
+
+static void aowl_unlock(void) {
+    if (InterlockedCompareExchange(&aowl_host_cs_state, 2, 2) == 2) {
+        LeaveCriticalSection(&aowl_host_cs);
+    }
+}
+
 static int32_t aowl_net_startup(void) {
     WSADATA wsa;
     return WSAStartup(MAKEWORD(2, 2), &wsa) == 0 ? 1 : 0;

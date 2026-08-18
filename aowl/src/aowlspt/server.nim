@@ -77,6 +77,8 @@ proc put*(o: var JsonObject; key: string; value: int) = put(o, key, jint(value))
 proc put*(o: var JsonObject; key: string; value: float) = put(o, key, jfloat(value))
 proc put*(o: var JsonObject; key: string; value: bool) = put(o, key, jbool(value))
 
+proc len*(o: JsonObject): int = o.parts.len
+
 proc done*(o: JsonObject): Json =
   var s = "{"
   for i in 0 ..< o.parts.len:
@@ -219,3 +221,177 @@ proc asBool*(c: ConfigValue; default: bool = false): bool =
   if c.raw == "true": return true
   if c.raw == "false": return false
   result = default
+
+# ---------------------------------------------------------------------------
+# Arrays and nesting
+# ---------------------------------------------------------------------------
+#
+# `obj()` covers a flat object, which covers a status endpoint and almost
+# nothing else the game asks for. Real responses are arrays of objects, so the
+# builder has to nest without the mod concatenating text by hand -- the moment
+# it does that, one missing comma produces a body the client rejects with no
+# error anywhere.
+
+type
+  JsonArray* = object
+    parts: seq[string]
+
+proc arr*(): JsonArray = JsonArray(parts: @[])
+
+proc add*(a: var JsonArray; value: Json) = a.parts.add value.text
+proc add*(a: var JsonArray; value: string) = a.parts.add jstr(value).text
+proc add*(a: var JsonArray; value: int) = a.parts.add jint(value).text
+proc add*(a: var JsonArray; value: float) = a.parts.add jfloat(value).text
+proc add*(a: var JsonArray; value: bool) = a.parts.add jbool(value).text
+
+proc len*(a: JsonArray): int = a.parts.len
+
+proc done*(a: JsonArray): Json =
+  var s = "["
+  for i in 0 ..< a.parts.len:
+    if i > 0: s.add ","
+    s.add a.parts[i]
+  s.add "]"
+  result = Json(text: s)
+
+proc put*(o: var JsonObject; key: string; value: JsonArray) =
+  put(o, key, done(value))
+
+proc put*(o: var JsonObject; key: string; value: JsonObject) =
+  put(o, key, done(value))
+
+proc add*(a: var JsonArray; value: JsonObject) = a.parts.add done(value).text
+proc add*(a: var JsonArray; value: JsonArray) = a.parts.add done(value).text
+
+proc objOf*(key: string; value: Json): JsonObject =
+  ## A one-member object. The client's bodies are full of single-key wrappers
+  ## (`{"Health":{...}}`, `{"Counters":[]}`), and writing each as three lines of
+  ## builder buries the shape of the response in ceremony.
+  result = obj()
+  put(result, key, value)
+
+proc objOf*(key: string; value: JsonObject): JsonObject = objOf(key, done(value))
+proc objOf*(key: string; value: JsonArray): JsonObject = objOf(key, done(value))
+proc objOf*(key, value: string): JsonObject = objOf(key, jstr(value))
+proc objOf*(key: string; value: int): JsonObject = objOf(key, jint(value))
+proc objOf*(key: string; value: bool): JsonObject = objOf(key, jbool(value))
+
+proc emptyArray*(): Json = Json(text: "[]")
+proc emptyObject*(): Json = Json(text: "{}")
+
+# ---------------------------------------------------------------------------
+# The response envelope
+# ---------------------------------------------------------------------------
+#
+# Every `/client/*` endpoint answers with the same wrapper, and the client reads
+# `err` before it looks at anything else. A route that returns bare data gets a
+# client that treats a perfectly good response as a failure, which is a whole
+# evening to find and one function to prevent.
+
+proc envelope*(data: Json): string =
+  ## `{"err":0,"errmsg":null,"data":...}` -- what the client expects from every
+  ## `/client/*` route.
+  result = "{\"err\":0,\"errmsg\":null,\"data\":" & data.text & "}"
+
+proc envelope*(dataText: string): string =
+  result = "{\"err\":0,\"errmsg\":null,\"data\":" & dataText & "}"
+
+proc envelope*(o: JsonObject): string = envelope(done(o))
+proc envelope*(a: JsonArray): string = envelope(done(a))
+
+proc envelopeNull*(): string =
+  ## A successful response carrying nothing. Distinct from an empty object: some
+  ## endpoints are checked for `data === null` by the client.
+  result = "{\"err\":0,\"errmsg\":null,\"data\":null}"
+
+proc failure*(code: int; message: string): string =
+  ## The error shape. `code` is the client's own error number; zero would say
+  ## success, so it is refused rather than sent.
+  var c = code
+  if c == 0: c = 1
+  result = "{\"err\":" & $c & ",\"errmsg\":\"" & escapeText(message) &
+           "\",\"data\":null}"
+
+# ---------------------------------------------------------------------------
+# Persistence
+# ---------------------------------------------------------------------------
+#
+# What a mod must still know next time: profiles, progress, anything it owns.
+# Not `dbWrite` -- that is the shared game database, loaded from disk and common
+# to every mod, and patching it to store a player's stash would put one mod's
+# save state where every other mod reads templates.
+
+type
+  Stored* = object
+    ok*: bool
+    raw*: string
+    error*: string
+
+proc save*(key: string; value: Json): Status =
+  ## Write this mod's value at `key`, durably. Keys are flat and
+  ## `[A-Za-z0-9._-]`; anything else is refused rather than mangled into a
+  ## filename that might collide with another key.
+  result = storeSet(key, value.text)
+
+proc save*(key, value: string): Status =
+  result = storeSet(key, value)
+
+proc save*(key: string; value: JsonObject): Status = save(key, done(value))
+
+proc load*(key: string): Stored =
+  ## Read this mod's value at `key`. `ok` is false and `error` says why when it
+  ## was never written -- which is the normal first-run case, not a fault.
+  var text = ""
+  let st = storeGet(key, text)
+  if st == Ok:
+    result = Stored(ok: true, raw: text, error: "")
+  else:
+    result = Stored(ok: false, raw: "", error: lastError())
+
+proc saved*(key: string): bool =
+  var text = ""
+  result = storeGet(key, text) == Ok
+
+proc savedKeys*(prefix: string = ""): seq[string] =
+  ## This mod's keys beginning with `prefix`, so "every profile" is expressible
+  ## without the mod knowing where the host put them.
+  result = @[]
+  var listJson = ""
+  if storeList(prefix, listJson) != Ok:
+    return
+  # A flat array of quoted names. Parsed here rather than through the JSON
+  # reader so `aowlspt/server` does not force every mod to import it.
+  var i = 0
+  while i < listJson.len:
+    if listJson[i] == '"':
+      var name = ""
+      inc i
+      while i < listJson.len and listJson[i] != '"':
+        name.add listJson[i]
+        inc i
+      result.add name
+    inc i
+
+# ---------------------------------------------------------------------------
+# Events and timers
+# ---------------------------------------------------------------------------
+
+proc broadcast*(name: string; payload: Json): Status =
+  ## Tell every other mod something happened. The emitter does not receive its
+  ## own event: a mod that owns an event usually also subscribes to it, and
+  ## delivering it back would be a loop nobody wrote.
+  result = emit(name, payload.text)
+
+proc broadcast*(name, payload: string): Status = emit(name, payload)
+proc broadcast*(name: string; payload: JsonObject): Status =
+  emit(name, done(payload).text)
+proc broadcast*(name: string; payload: JsonArray): Status =
+  emit(name, done(payload).text)
+
+proc onEvent*(name: string; handler: EventHandler): Status =
+  result = on(name, handler)
+
+proc afterMs*(delayMs: int; handler: TickHandler): Status =
+  ## Run `handler` once, `delayMs` from now, from the server's own loop rather
+  ## than from a request thread.
+  result = after(delayMs, handler)

@@ -37,7 +37,7 @@ proc main =
   check "sizeof(HostInfo)", sizeof(HostInfo), 120
 
   # int32 size + 4 pad + ctx + info + 18 function pointers = 24 + 18*8.
-  check "sizeof(HostApi)", sizeof(HostApi), 168
+  check "sizeof(HostApi)", sizeof(HostApi), 192
 
   # int32 size + 2 uint32 (12) + 4 pad + 5 slices (80) + 2 uint32 (8).
   check "sizeof(ModInfo)", sizeof(ModInfo), 104
@@ -63,6 +63,7 @@ proc main =
   check "flagBits(both)", int(flagBits({mfHotReloadable, mfThreadSafe})), 3
 
   check "AbiVersion", int(AbiVersion), 1
+  check "AbiRevision", int(AbiRevision), 2
 
   if failures == 0:
     echo "all layout checks passed"

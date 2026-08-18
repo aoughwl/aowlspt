@@ -181,6 +181,12 @@ extern int32_t aowlspt_nim_db_patch(void* ctx, void* path, int32_t pathLen,
                                     void* patch, int32_t patchLen);
 extern int32_t aowlspt_nim_route_register(void* ctx, void* url, int32_t urlLen,
                                           int32_t kind, void* cb, void* user);
+extern int32_t aowlspt_nim_store_get(void* ctx, void* key, int32_t keyLen,
+                                     void* outPtr, void* outLen);
+extern int32_t aowlspt_nim_store_set(void* ctx, void* key, int32_t keyLen,
+                                     void* val, int32_t valLen);
+extern int32_t aowlspt_nim_store_list(void* ctx, void* prefix, int32_t prefixLen,
+                                      void* outPtr, void* outLen);
 
 /* The host allocator. One malloc for the whole boundary: the mod allocates
  * through this and the host frees through it, and neither side's CRT heap is
@@ -283,6 +289,28 @@ static AowlStatus AOWLSPT_CALL aowl_host_invoke_main(void* ctx, AowlCallbackFn c
 }
 static int64_t AOWLSPT_CALL aowl_host_now_ms(void* ctx) {
     return aowlspt_nim_now_ms(ctx);
+}
+
+static AowlStatus AOWLSPT_CALL aowl_host_store_get(void* ctx, AowlSlice key,
+                                                   AowlBuffer* out) {
+    void* p = NULL; int32_t n = 0;
+    int32_t st = aowlspt_nim_store_get(ctx, (void*)key.ptr, key.len,
+                                       (void*)&p, (void*)&n);
+    if (out) { out->ptr = (uint8_t*)p; out->len = n; }
+    return st;
+}
+static AowlStatus AOWLSPT_CALL aowl_host_store_set(void* ctx, AowlSlice key,
+                                                   AowlSlice value) {
+    return aowlspt_nim_store_set(ctx, (void*)key.ptr, key.len,
+                                 (void*)value.ptr, value.len);
+}
+static AowlStatus AOWLSPT_CALL aowl_host_store_list(void* ctx, AowlSlice prefix,
+                                                    AowlBuffer* out) {
+    void* p = NULL; int32_t n = 0;
+    int32_t st = aowlspt_nim_store_list(ctx, (void*)prefix.ptr, prefix.len,
+                                        (void*)&p, (void*)&n);
+    if (out) { out->ptr = (uint8_t*)p; out->len = n; }
+    return st;
 }
 
 /* Invoking a callback a mod handed us, from nimony, which cannot hold it as a
@@ -412,6 +440,9 @@ static void* aowl_hostapi_new(void* ctx,
     b->api.schedule       = aowl_host_schedule;
     b->api.invoke_main    = aowl_host_invoke_main;
     b->api.now_ms         = aowl_host_now_ms;
+    b->api.store_get      = aowl_host_store_get;
+    b->api.store_set      = aowl_host_store_set;
+    b->api.store_list     = aowl_host_store_list;
 
     return b;
 }
