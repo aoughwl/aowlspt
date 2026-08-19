@@ -15,11 +15,15 @@
 ## because a benchmark whose caveats live somewhere else gets quoted without
 ## them.
 ##
-## Build (this does not go through `aowl build-tools`, which does not know
-## about `-d:AOWLSPT_FAST_BENCH`):
+## Build: `aowl build` and `aowl test` already build this, through
+## `buildPerfBench` in `tools/aowl.nim`. It is a separate step from the other
+## tools because it needs `--passC:-DAOWLSPT_FAST_BENCH` for the fast path's
+## bench fixture and the host's own `invoke` for the boxed path it measures
+## against. By hand, that is:
 ##
 ##     nimony c --passC:-I<repo>/abi --passC:-DAOWLSPT_FAST_BENCH \
-##       -p:<repo>/aowl/src -p:<repo>/host/Aowlspt.Host.Il2Cpp \
+##       -p:<repo>/installer/src -p:<repo>/aowl/src \
+##       -p:<repo>/host/Aowlspt.Host.Il2Cpp \
 ##       -o:<repo>/installer/build/perfbench.exe <repo>/tools/perfbench.nim
 
 import std/[syncio, cmdline, strutils]
@@ -49,6 +53,190 @@ Options
   --iters N     iterations for the cheap operations (default 2000000)
   -h, --help    this
 """
+
+# ---------------------------------------------------------------------------
+# The patch paths
+# ---------------------------------------------------------------------------
+#
+# A hook's price is not the detour. It is the payload, and until ABI revision 4
+# there was one payload: JSON. These rows are what that costs and what the typed
+# frame costs instead, on the same method, in the same run, with the same
+# detour engine underneath.
+#
+# **What is measured.** `EFT.Player::Ping(Single) -> Single` in the stand-in, a
+# static compiled method reached through a bound call -- so the unpatched row is
+# a real bound call and every other row is that same call with the detour in the
+# middle. The dispatchers below are the host's: they call `describeArgs`,
+# `describeReturn` and `applyPatchReturn` out of `invoke.nim`, which is the host
+# module, rather than a second implementation that could be faster than the
+# thing being reported on. What they stand in for is the mod: a JSON row copies
+# the payload into a second string, because that is what `toString` does on the
+# other side of the ABI, and reads one member out of it.
+#
+# Every row in the table below uses `EFT.Player::Ping` and nothing else, and it
+# is checked at run time for having a compiled body rather than an invoker --
+# see `pbIsCompiled`. The fast-path rows above use `abi/aowlspt_fast.h`'s own
+# fixture, which is compiled by construction.
+#
+# **What is not measured**, and it favours JSON: `Ping` takes a float and no
+# references, so `describeArgs` registers no GC handle. A hook on a method with
+# an object argument -- which is most of the interesting ones -- pays one
+# `il2cpp_gchandle_new` and one `il2cpp_gchandle_free` per reference per firing
+# on top of these numbers, and the typed path pays neither.
+
+{.emit: """#include "aowlspt_detour.h" """.}
+{.emit: """#include "aowlspt_frame.h" """.}
+
+# Is the method this is about to time a *compiled* one?
+#
+# `tests/mockil2cpp` carries two function pointers per method: the invoker,
+# which `il2cpp_runtime_invoke` calls and which boxes its result, and the
+# compiled body with the signature IL2CPP would give it. A row with no compiled
+# body has `methodPointer` pointing at the invoker -- so binding it, detouring
+# it or timing it measures the invoker, plausibly and silently. A bound call on
+# one reads the boxed object's *address* as the return value: as a bool that is
+# true about fifteen times in sixteen because the allocator aligns, which passes
+# once and fails 6.25% of the time over two hundred thousand calls.
+#
+# So it is asked rather than remembered. `-2` means the runtime is not the
+# stand-in and has no such export, which is not a failure -- against the real
+# GameAssembly every method is compiled by definition.
+{.emit: """
+static int32_t aowl_pb_is_compiled(void* mod, const char* t, const char* m) {
+  if (!mod) return -1;
+  {
+    void* f = (void*)GetProcAddress((HMODULE)mod, "mock_is_compiled");
+    if (!f) return -2;
+    return ((int32_t(*)(const char*, const char*))f)(t, m);
+  }
+}
+static int32_t aowl_pb_uncompiled_count(void* mod) {
+  void* f;
+  if (!mod) return -1;
+  f = (void*)GetProcAddress((HMODULE)mod, "mock_uncompiled_count");
+  if (!f) return -2;
+  return ((int32_t(*)(void))f)();
+}
+""".}
+
+proc pbIsCompiled(m: Il2CppPtr; t, name: cstring): int32 {.
+  importc: "aowl_pb_is_compiled", nodecl.}
+proc pbUncompiledCount(m: Il2CppPtr): int32 {.
+  importc: "aowl_pb_uncompiled_count", nodecl.}
+
+proc cHookNew(): Il2CppPtr {.importc: "aowl_hook_new", nodecl.}
+proc cHookFree(p: Il2CppPtr) {.importc: "aowl_hook_free", nodecl.}
+proc cHookAttach(p, target: Il2CppPtr): int32 {.importc: "aowl_hook_attach", nodecl.}
+proc cHookRemove(p: Il2CppPtr): int32 {.importc: "aowl_hook_remove", nodecl.}
+proc cHookErrorText(rc: int32): Il2CppPtr {.importc: "aowl_hook_error_text", nodecl.}
+proc cHookSetPostfix(slot: int32; on: int32) {.
+  importc: "aowl_hook_set_postfix", nodecl.}
+
+proc cFrameSlot(depth: int32): Il2CppPtr {.importc: "aowl_frame_slot", nodecl.}
+proc cFrameArm(f, regs, kinds: Il2CppPtr; argc, retKind: int32;
+               flags: uint32; self: uint64) {.importc: "aowl_frame_arm", nodecl.}
+proc cFrameDisarm(f: Il2CppPtr) {.importc: "aowl_frame_disarm", nodecl.}
+proc cFrameFlt(f: Il2CppPtr; i: int32; ok: pointer): float {.
+  importc: "aowl_frame_flt", nodecl.}
+proc cFrameRetFlt(f: Il2CppPtr; ok: pointer): float {.
+  importc: "aowl_frame_ret_flt", nodecl.}
+proc cFrameSetRetFlt(f: Il2CppPtr; v: float): int32 {.
+  importc: "aowl_frame_set_ret_flt", nodecl.}
+
+const
+  ModeOff = 0'i32
+  ModeJsonPrefix = 1'i32
+  ModeTypedPrefix = 2'i32
+  ModeJsonPostfix = 3'i32
+  ModeJsonPostfixReplace = 4'i32
+  ModeTypedPostfix = 5'i32
+  ModeTypedPostfixReplace = 6'i32
+
+var gMode = ModeOff
+var gBenchRt = Il2Cpp(handle: cast[Il2CppPtr](0), loaded: false,
+                      lastError: 0'i32, missing: @[])
+var gBenchMethod: Il2CppMethod = cast[Il2CppMethod](0)
+## `Ping` is static and takes one `System.Single`, so the shape is one byte and
+## the return is a float. Built once here, exactly as `installPatch` builds it
+## once at registration -- that is the optimisation, not an incidental detail.
+var gBenchKinds: seq[uint8] = @[2'u8]   # AOWLSPT_ARG_FLOAT
+var gBenchHandles: seq[Il2CppPtr] = @[]
+var gBenchIsObj: seq[bool] = @[]
+var gBenchGcs: seq[uint32] = @[]
+var gBenchSink = 0.0
+var gBenchFires = 0'i64
+
+proc jsonRoundTrip(payload: string): float =
+  ## What the mod side of a JSON firing does, and no more.
+  ##
+  ## The copy is not padding: `patchTrampoline` calls `toString` on the slice
+  ## the host handed over, because a slice is borrowed and dies with the call.
+  ## That is one allocation per firing on the mod's own heap, and it is the
+  ## half of the JSON cost that does not show up in the host's profile at all.
+  var mine = payload
+  var i = 0
+  var acc = 0.0
+  while i < mine.len:
+    let ch = mine[i]
+    if ch >= '0' and ch <= '9':
+      acc = acc + float(ord(ch) - ord('0'))
+    inc i
+  result = acc
+
+proc benchFired(slot: int32; regs: Il2CppPtr): int32 {.
+    exportc: "aowlspt_nim_patch_fired", cdecl.} =
+  ## The prefix dispatcher, in both flavours.
+  gBenchFires = gBenchFires + 1'i64
+  if gMode == ModeJsonPrefix:
+    let text = describeArgs(gBenchRt, gBenchMethod, regs,
+                            gBenchHandles, gBenchIsObj, gBenchGcs)
+    gBenchSink = gBenchSink + jsonRoundTrip(text)
+    return 0'i32
+  if gMode == ModeTypedPrefix:
+    let f = cFrameSlot(0'i32)
+    cFrameArm(f, regs, cast[Il2CppPtr](addr gBenchKinds[0]), 1'i32,
+              2'i32, 0x2'u32, 0'u64)
+    var ok = 0'i32
+    gBenchSink = gBenchSink + cFrameFlt(f, 0'i32, addr ok)
+    cFrameDisarm(f)
+    return 0'i32
+  result = 0'i32
+
+proc benchReturned(slot: int32; regs: Il2CppPtr): int32 {.
+    exportc: "aowlspt_nim_patch_returned", cdecl.} =
+  ## The postfix dispatcher, in three flavours: watch as JSON, watch and replace
+  ## as JSON, and the typed pair.
+  gBenchFires = gBenchFires + 1'i64
+  if gMode == ModeJsonPostfix or gMode == ModeJsonPostfixReplace:
+    let resultText = describeReturn(gBenchRt, gBenchMethod, regs,
+                                    gBenchHandles, gBenchIsObj, gBenchGcs)
+    let argsText = describeArgs(gBenchRt, gBenchMethod, regs,
+                                gBenchHandles, gBenchIsObj, gBenchGcs)
+    let payload = argsText.substr(0, argsText.len - 2) & ",\"result\":" &
+                  resultText & "}"
+    gBenchSink = gBenchSink + jsonRoundTrip(payload)
+    if gMode == ModeJsonPostfixReplace:
+      # And back: the mod formats a replacement as text, the host parses it and
+      # writes it into the frame by the declared return type.
+      let replacement = $(gBenchSink * 0.0 + 3.5)
+      if not applyPatchReturn(gBenchRt, gBenchMethod, regs, replacement):
+        return 0'i32
+      return 1'i32
+    return 0'i32
+  if gMode == ModeTypedPostfix or gMode == ModeTypedPostfixReplace:
+    let f = cFrameSlot(0'i32)
+    cFrameArm(f, regs, cast[Il2CppPtr](addr gBenchKinds[0]), 1'i32,
+              2'i32, 0x3'u32, 0'u64)   # STATIC | POSTFIX
+    var ok = 0'i32
+    let got = cFrameRetFlt(f, addr ok)
+    gBenchSink = gBenchSink + got
+    var st = 0'i32
+    if gMode == ModeTypedPostfixReplace:
+      if cFrameSetRetFlt(f, got * 2.0) != 0'i32:
+        st = 1'i32
+    cFrameDisarm(f)
+    return st
+  result = 0'i32
 
 # ---------------------------------------------------------------------------
 # Reporting
@@ -121,10 +309,11 @@ type
     dll: string
     iters: int
     help: bool
+    badFlag: string
 
 proc parseArgs(): Options =
   result = Options(dll: "tests\\mockil2cpp\\GameAssembly.dll",
-                   iters: 2000000, help: false)
+                   iters: 2000000, help: false, badFlag: "")
   var i = 1
   let n = paramCount()
   while i <= n:
@@ -142,9 +331,21 @@ proc parseArgs(): Options =
             ok = false
             break
         if ok and v > 0: result.iters = v
+    elif a == "--runtime":
+      # Accepted because the gate passes it. It used to work only by accident:
+      # `--runtime` fell through to the "unknown flag" case and was ignored,
+      # and the path after it was picked up by the positional branch below --
+      # so the right DLL was benchmarked for the wrong reason, and a typo in
+      # the flag would have benchmarked the default silently.
+      inc i
+      if i <= n: result.dll = paramStr(i)
     elif a == "--help" or a == "-h":
       result.help = true
-    elif not a.startsWith("-"):
+    elif a.startsWith("-"):
+      # A flag nobody parses is a flag whose absence nobody notices. `--check`
+      # was passed by the gate for a threshold this tool has never had.
+      result.badFlag = a
+    else:
       result.dll = a
     inc i
 
@@ -160,6 +361,10 @@ proc main(): int =
   if opt.help:
     echo Usage
     return 0
+  if opt.badFlag.len > 0:
+    echo "perfbench: no such option " & opt.badFlag
+    echo Usage
+    return 2
 
   var rt = openIl2Cpp(opt.dll)
   if not rt.loaded:
@@ -424,6 +629,132 @@ proc main(): int =
     gSinkI = gSinkI + int64(readInt32(fbLevel, player))
   t1 = perfCounter()
   record("field via cached offset, int32", n, t0, t1)
+
+  # --- what a hook costs -------------------------------------------------
+  #
+  # Six rows on one method, so that the only variable is the payload. The
+  # unpatched row is taken first and with the detour not yet installed, which
+  # matters: a hook the engine has landed changes the first fourteen bytes of
+  # the function, and measuring "unpatched" after removing one would be
+  # measuring a restored function rather than an untouched one.
+  gBenchRt = rt
+  let pingMethod = findMethod(rt, playerCls, "Ping", 1)
+  var bPing = bindMethod(rt, "EFT.Player", "Ping", 1)
+  echo "bind   " & bPing.why & "  (" & $bPing.bindNs & " ns)"
+  if pingMethod == nil or not bPing.ok:
+    echo "error  no EFT.Player::Ping to hook; the patch rows are skipped"
+  else:
+    # And that it is a compiled body rather than the mock's invoker. Every row
+    # below is a *bound* call into a *detoured* function, and both of those go
+    # through `methodPointer`; on an invoker-only row they would time the
+    # invoker and report six confident numbers about the wrong function.
+    let compiled = pbIsCompiled(rt.handle, "EFT.Player", "Ping")
+    if compiled == 0'i32:
+      echo "error  EFT.Player::Ping has no compiled body in this runtime, so"
+      echo "       every patch row below would be timing the invoker instead."
+      return 1
+    elif compiled == 1'i32:
+      echo "check  EFT.Player::Ping is a compiled method (" &
+           $int(pbUncompiledCount(rt.handle)) &
+           " invoker-only rows in this runtime, none of them used here)"
+    gBenchMethod = pingMethod
+    let nHook = (if n div 100 < 20000: 20000 else: n div 100)
+
+    var pa = argsF(1.0)
+    for i in 0 ..< 2000:
+      gSinkF = gSinkF + callFloat(bPing, nullPtr(), pa)
+    t0 = perfCounter()
+    for i in 0 ..< nHook:
+      gSinkF = gSinkF + callFloat(bPing, nullPtr(), pa)
+    t1 = perfCounter()
+    record("bound call, unpatched", nHook, t0, t1)
+
+    let pingFn = methodPointer(rt, pingMethod)
+    let hook = cHookNew()
+    let slot = cHookAttach(hook, pingFn)
+    if slot < 0'i32:
+      echo "error  could not detour EFT.Player::Ping: " &
+           readCString(cHookErrorText(slot))
+    else:
+      # Prefix first: the engine's post table is off, so the thunk tail-jumps
+      # into the trampoline and never comes back.
+      cHookSetPostfix(slot, 0'i32)
+
+      gMode = ModeJsonPrefix
+      for i in 0 ..< 200:
+        gSinkF = gSinkF + callFloat(bPing, nullPtr(), pa)
+      t0 = perfCounter()
+      for i in 0 ..< nHook:
+        gSinkF = gSinkF + callFloat(bPing, nullPtr(), pa)
+      t1 = perfCounter()
+      record("prefix hook, JSON arguments", nHook, t0, t1)
+
+      gMode = ModeTypedPrefix
+      for i in 0 ..< 200:
+        gSinkF = gSinkF + callFloat(bPing, nullPtr(), pa)
+      t0 = perfCounter()
+      for i in 0 ..< nHook:
+        gSinkF = gSinkF + callFloat(bPing, nullPtr(), pa)
+      t1 = perfCounter()
+      record("prefix hook, typed frame", nHook, t0, t1)
+
+      # And now the postfix path: the thunk calls the original and comes back,
+      # which is the same detour and a different branch at the top of it.
+      cHookSetPostfix(slot, 1'i32)
+
+      gMode = ModeJsonPostfix
+      for i in 0 ..< 200:
+        gSinkF = gSinkF + callFloat(bPing, nullPtr(), pa)
+      t0 = perfCounter()
+      for i in 0 ..< nHook:
+        gSinkF = gSinkF + callFloat(bPing, nullPtr(), pa)
+      t1 = perfCounter()
+      record("postfix hook, JSON result and arguments", nHook, t0, t1)
+
+      gMode = ModeJsonPostfixReplace
+      for i in 0 ..< 200:
+        gSinkF = gSinkF + callFloat(bPing, nullPtr(), pa)
+      t0 = perfCounter()
+      for i in 0 ..< nHook:
+        gSinkF = gSinkF + callFloat(bPing, nullPtr(), pa)
+      t1 = perfCounter()
+      record("postfix hook, JSON + replacement", nHook, t0, t1)
+
+      gMode = ModeTypedPostfix
+      for i in 0 ..< 200:
+        gSinkF = gSinkF + callFloat(bPing, nullPtr(), pa)
+      t0 = perfCounter()
+      for i in 0 ..< nHook:
+        gSinkF = gSinkF + callFloat(bPing, nullPtr(), pa)
+      t1 = perfCounter()
+      record("postfix hook, typed frame", nHook, t0, t1)
+
+      gMode = ModeTypedPostfixReplace
+      for i in 0 ..< 200:
+        gSinkF = gSinkF + callFloat(bPing, nullPtr(), pa)
+      t0 = perfCounter()
+      for i in 0 ..< nHook:
+        gSinkF = gSinkF + callFloat(bPing, nullPtr(), pa)
+      t1 = perfCounter()
+      record("postfix hook, typed frame + replacement", nHook, t0, t1)
+
+      gMode = ModeOff
+      cHookSetPostfix(slot, 0'i32)
+      discard cHookRemove(hook)
+      # Every row above ran through the detour, and this is how that is known
+      # rather than assumed: six loops of `nHook` firings each, and a dispatcher
+      # that was never reached would leave this at zero while every row still
+      # reported a plausible number.
+      echo ""
+      # Six measured loops plus six warm-ups, all of them through the detour.
+      let expected = int64(nHook + 200) * 6'i64
+      echo "check  the hook fired " & $gBenchFires & " times across " &
+           $expected & " patched calls"
+      if gBenchFires < expected:
+        echo "error  the detour did not fire on every patched call; the patch"
+        echo "       rows above are measuring an unpatched function"
+    cHookFree(hook)
+    gSinkF = gSinkF + gBenchSink
 
   printTable()
 

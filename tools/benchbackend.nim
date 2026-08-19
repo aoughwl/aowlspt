@@ -74,6 +74,8 @@ benchbackend -- drive aowlspt-backend under load and report the numbers
   --label TEXT     printed with the results, so two runs can be told apart
   --keep-db        reuse an existing db.json in --root rather than regenerating
   --keepalive      reuse one connection for every request, as the game does
+  --perf           ask the backend for its per-phase breakdown and print it
+  --floor N        fail (exit 1) if the run is under N requests/second
   -h, --help       this
 """
   Session = "aaaaaaaaaaaaaaaaaaaaaaaa"
@@ -93,6 +95,7 @@ var gQpf = 1'i64
 # `mixRound` cannot close over a local -- nimony has no closures over an
 # enclosing scope.
 var gKeepAlive = false
+var gPerf = false
 var gConn = Conn(sock: 0'u64, buf: @[], have: 0, port: 6977)
 
 proc nowUs(): int64 =
@@ -177,11 +180,36 @@ proc call(path, body: string): Response =
   else:
     result = request(gPort, path, body, Session)
 
+var gBadRequests = 0
+var gBadFirst = ""
+
+proc healthy(name: string; r: Response): bool =
+  ## Whether a request in the mix was actually served.
+  ##
+  ## This tool measures throughput, and until now it measured it with
+  ## `discard timed(...)` -- every response thrown away unread. A 404 is the
+  ## *fastest* thing this server can produce, so a stage where the emulator did
+  ## not load answers `{"err":"no route"}` to five of the seven endpoints in the
+  ## mix, reports a higher requests/second than a working one, and clears
+  ## `--floor` comfortably. A performance gate that a broken server passes more
+  ## easily than a working one is worse than no gate, so every request is now
+  ## looked at, and one that was not served is counted.
+  result = r.ok and r.body.len > 0 and
+           find(r.body, "\"err\":\"no route\"") < 0 and
+           (find(r.body, "\"err\":0") >= 0 or find(r.body, "OK") >= 0)
+  if not result:
+    inc gBadRequests
+    if gBadFirst.len == 0:
+      var seen = r.body
+      if seen.len > 140: seen = seen.substr(0, 139) & "..."
+      gBadFirst = name & " -> " & (if r.error.len > 0: r.error else: seen)
+
 proc timed(name, path, body: string): Response =
   let t0 = nowUs()
   let r = call(path, body)
   let t1 = nowUs()
   record(name, t1 - t0, r.ttfbUs, r.body.len)
+  discard healthy(name, r)
   result = r
 
 proc jsonText(body, key: string): string =
@@ -236,15 +264,16 @@ proc mixRound(itemId: string; moves: int; measure: bool) =
       discard timed("items/moving", "/client/game/profile/items/moving",
                     moveBody(itemId, 1 + (i mod 8), i mod 6))
   else:
-    discard call("/client/items", "")
-    discard call("/client/globals", "")
-    discard call("/client/locale/en", "")
-    discard call("/client/handbook/templates", "")
-    discard call("/client/game/profile/list", "")
-    discard call("/client/game/keepalive", "")
+    discard healthy("items", call("/client/items", ""))
+    discard healthy("globals", call("/client/globals", ""))
+    discard healthy("locale/en", call("/client/locale/en", ""))
+    discard healthy("handbook", call("/client/handbook/templates", ""))
+    discard healthy("profile/list", call("/client/game/profile/list", ""))
+    discard healthy("keepalive", call("/client/game/keepalive", ""))
     for i in 0 ..< moves:
-      discard call("/client/game/profile/items/moving",
-                   moveBody(itemId, 1 + (i mod 8), i mod 6))
+      discard healthy("items/moving",
+                      call("/client/game/profile/items/moving",
+                           moveBody(itemId, 1 + (i mod 8), i mod 6)))
 
 # --------------------------------------------------------------- database
 
@@ -344,7 +373,19 @@ proc buildDb(items: int): string =
     inc n
   s.add "]},"
 
-  s.add "\"quests\":{},\"customization\":{},\"achievements\":[]},"
+  # No `customization` key at all, and the difference between that and an empty
+  # one is the whole reason this line has a comment.
+  #
+  # The emulator's load-time self-check runs its default-appearance validation
+  # only when the database *has* a customisation table: with none it skips, with
+  # an empty one it looks up ten default ids, finds none of them, declares "this
+  # build fails its own arithmetic" and refuses to serve. This tool wrote
+  # `"customization":{}`, so the emulator came up, logged twelve errors, listened
+  # on the port and answered nothing -- and every run of this benchmark died at
+  # "the backend never answered /client/game/config", including the one in
+  # `aowl test`. A synthetic database has no business asserting anything about
+  # appearance, so it declares no table rather than an empty one.
+  s.add "\"quests\":{},\"achievements\":[]},"
 
   # `globals` is one large object in a real dump. Its shape does not matter to
   # anything measured here; its size does.
@@ -401,6 +442,11 @@ proc startBackend(exe, root: string): uint64 =
   var e = exe
   var w = root
   var c = "\"" & exe & "\" --root \"" & root & "\" --port " & $gPort
+  if gPerf:
+    # The backend writes its breakdown to `<root>/perf.txt` once a second as
+    # well as at exit, because this tool kills it rather than asking it to
+    # stop -- a report printed at exit is a report nobody ever sees.
+    c.add " --perf"
   result = cSpawn(toCString(e), toCString(w), toCString(c))
 
 proc reportLine(b: Bucket) =
@@ -426,6 +472,36 @@ proc reportLine(b: Bucket) =
   row.add lpad($(b.bytes div int64(b.us.len) div 1024) & "K", 9)
   line row
 
+proc served(name, path, body, needle: string; minBytes: int): bool =
+  ## One endpoint of the mix, asked once and *read*, before anything is timed.
+  ##
+  ## `healthy` catches a refusal; this catches the subtler half -- an endpoint
+  ## that answers `err:0` out of an empty table. The needle is something only a
+  ## real answer carries: an id out of the database this run generated, the uid
+  ## of the profile it created. Without it a server with no database in it
+  ## serves seven tiny bodies very quickly and the report calls that throughput.
+  ## `minBytes` is the other half of it: an emulator serving an *empty* table
+  ## answers `err:0` in forty bytes, and forty-byte answers are the fastest
+  ## thing this benchmark can be handed.
+  let r = call(path, body)
+  let good = healthy(name, r) and find(r.body, needle) >= 0 and
+             r.body.len >= minBytes
+  if good:
+    line "  ok    " & pad(name, 14) & lpad($r.body.len & " bytes", 14)
+  else:
+    var seen = r.body
+    if seen.len > 140: seen = seen.substr(0, 139) & "..."
+    err name & " (" & path & ") is not serving this stage: " &
+        (if r.error.len > 0: r.error else: seen)
+    if r.ok and find(r.body, needle) < 0:
+      note "  it answered, and its answer does not contain " & needle
+    if r.ok and r.body.len < minBytes:
+      note "  it answered in " & $r.body.len & " bytes; anything under " &
+           $minBytes & " is an empty table, not a database"
+  result = good
+
+var gRate = 0'i64
+
 proc report(label: string; wallUs: int64) =
   heading "Results" & (if label.len > 0: " -- " & label else: "")
   # `ttfb` is time to the first byte of the answer: the server's share. The
@@ -444,8 +520,8 @@ proc report(label: string; wallUs: int64) =
   line ""
   line "  " & $requests & " requests in " & msText(wallUs) & " ms"
   if wallUs > 0:
-    line "  " & $((int64(requests) * 1000000'i64) div wallUs) &
-         " requests/second"
+    gRate = (int64(requests) * 1000000'i64) div wallUs
+    line "  " & $gRate & " requests/second"
     line "  " & $((bytes * 1000000'i64) div wallUs div 1048576'i64) &
          " MiB/second of response body (uncompressed)"
 
@@ -459,6 +535,7 @@ proc main(): int =
   var rounds = 20
   var warmup = 3
   var moves = 25
+  var floor1 = 0
   var keepDb = false
   var i = 1
   let n = paramCount()
@@ -480,7 +557,7 @@ proc main(): int =
       inc i
       if i <= n: label = paramStr(i)
     elif a == "--port" or a == "--items" or a == "--rounds" or
-         a == "--warmup" or a == "--moves":
+         a == "--warmup" or a == "--moves" or a == "--floor":
       inc i
       var v = 0
       var any = false
@@ -494,11 +571,14 @@ proc main(): int =
         elif a == "--items": items = v
         elif a == "--rounds": rounds = v
         elif a == "--warmup": warmup = v
+        elif a == "--floor": floor1 = v
         else: moves = v
     elif a == "--keep-db":
       keepDb = true
     elif a == "--keepalive":
       gKeepAlive = true
+    elif a == "--perf":
+      gPerf = true
     elif a == "--help" or a == "-h":
       echo Usage
       return 0
@@ -532,8 +612,10 @@ proc main(): int =
 
   heading "Staging"
   let dbPath = joinPath(root, "db.json")
+  var dbGenerated = true
   if keepDb and fileExists(dbPath):
     line "  db      reused"
+    dbGenerated = false
   else:
     discard winfs.removeTree(root)
     let db = buildDb(items)
@@ -588,6 +670,40 @@ proc main(): int =
     return 1
   ok "profile " & uid & " ready"
 
+  heading "The mix is being served"
+  # Asserted, once, before a single number is measured. Everything below this
+  # point is `discard`-ed on purpose -- reading a response inside the timing
+  # loop would time the reading -- so this is the only place that establishes
+  # the requests being counted are requests that were answered.
+  var unserved = 0
+  # `hexId(0)` is only in the database when this run generated it. With
+  # `--keep-db` against somebody else's file the weaker needle is the honest
+  # one: it still fails on a refusal and on an empty table.
+  let probe0 = if dbGenerated: hexId(0) else: "_props"
+  if not served("items", "/client/items", "", probe0, 1024): inc unserved
+  if not served("globals", "/client/globals", "", "\"err\":0", 64):
+    inc unserved
+  if not served("locale/en", "/client/locale/en", "",
+                (if dbGenerated: hexId(0) & " Name" else: " Name"), 1024):
+    inc unserved
+  if not served("handbook", "/client/handbook/templates", "",
+                (if dbGenerated: hexId(0) else: "\"Id\""), 512):
+    inc unserved
+  if not served("profile/list", "/client/game/profile/list", "", uid, 200):
+    inc unserved
+  if not served("keepalive", "/client/game/keepalive", "", "OK", 2):
+    inc unserved
+  if not served("items/moving", "/client/game/profile/items/moving",
+                moveBody(moneyId, 1, 1), "\"err\":0", 8):
+    inc unserved
+  if unserved > 0:
+    err $unserved & " of the 7 endpoints in the mix are not served by this " &
+        "stage. The rate below would be a measurement of refusals, which are " &
+        "faster than answers -- so it would read as a better result than a " &
+        "working server."
+    cSpawnKill(server)
+    return 1
+
   heading "Warmup"
   var w = 0
   while w < warmup:
@@ -597,6 +713,10 @@ proc main(): int =
 
   heading "Measuring"
   resetSamples()
+  # The counters too: what matters is whether the *measured* rounds were served,
+  # and a warmup that stumbled on a cold disk should not be what fails the run.
+  gBadRequests = 0
+  gBadFirst = ""
   let t0 = nowUs()
   var r = 0
   while r < rounds:
@@ -606,7 +726,44 @@ proc main(): int =
   line "  " & $rounds & " rounds of " & $(6 + moves) & " requests"
 
   report(label, wall)
+
+  if gPerf:
+    # Read before the process is killed: the file is rewritten once a second
+    # and the last write may be up to that far behind.
+    cSleepMs(1200'i32)
+    var text = ""
+    if readTextFile(joinPath(root, "perf.txt"), text):
+      heading "Server phases"
+      for l in splitLines(text):
+        if l.len > 0:
+          line l
+    else:
+      err "the backend wrote no perf.txt; was it built with --perf support?"
+
   cSpawnKill(server)
+
+  # Before the floor, and it fails the run whether or not a floor was asked for.
+  # A rate computed over requests the server refused is not a slow number, it is
+  # a wrong one, and it is wrong in the flattering direction.
+  let measured = rounds * (6 + moves)
+  if gBadRequests > 0:
+    err $gBadRequests & " of " & $measured & " measured requests were not " &
+        "served; the numbers above are not a throughput measurement"
+    line "  first one: " & gBadFirst
+    return 1
+  ok "all " & $measured & " measured requests were served"
+
+  if floor1 > 0:
+    # The gate. A throughput claim that is not re-measured stops being true,
+    # and the only way to notice is to fail a build over it. The floor is set
+    # generously under the measured number: this is a check against a
+    # regression of kind -- a per-byte copy coming back, a cache that stopped
+    # hitting -- not a benchmark of the machine it happens to run on.
+    heading "Gate"
+    if gRate < int64(floor1):
+      err $gRate & " requests/second is under the floor of " & $floor1
+      return 1
+    ok $gRate & " requests/second, floor " & $floor1
   result = 0
 
 quit(main())

@@ -40,21 +40,74 @@ GOLDEN = os.path.join(HERE, "panel.golden.json")
 # The registry's view, in the manager's row shape. `enabled` is what the
 # selection resolves to; `live` is what the host says is running (null when no
 # host has said anything); `restart` is per-mod and starts false.
+#
+# The first row is protected, which is what the real manager answers about
+# itself: `isProtected` in `mods/manager/manager.nim` puts `"protected": true`
+# on its own panel row, because a selection that can switch off the mod serving
+# every route on this panel is a selection nothing left running can undo. The
+# hand-written rows carried no `protected` key at all before, so the overlay's
+# `KEEP` label and its local refusal of SPACE had no stand-in that exercised
+# them -- the test host said as much and passed anyway.
+#
+# Four of the five rows carry what the *client* host said about them, and one
+# carries nothing at all. That last one is not an oversight: a guid with no
+# `clientLive` key is how this whole protocol says "no answer yet", the overlay
+# has to draw it as unknown rather than as off, and a fixture in which every row
+# has an answer cannot tell the two apart. `aowl.manager` is the row with no
+# answer -- a server-side mod, which the game has no reason to speak about and
+# whose `live` comes from `mgr/control` instead; `CLIENT` below is the wrapper
+# that says why the silence might yet end.
+#
+# `aowl.sway` is the interesting one. The test host pushes it in through
+# `aowl_ov_set_mod` as loaded in this process, and the client host's own ledger
+# then says it is not -- same process, later fact. The panel is required to
+# believe the later one. Before the report existed the overlay pinned a
+# host-pushed row's `loaded` at 1 forever, which meant a mod the host had
+# unloaded read `running yes` until the game was restarted.
 ROWS = [
+    {"guid": "aowl.manager", "id": "aowl.manager", "name": "Mod Manager",
+     "version": "1.0.0", "enabled": True, "live": True, "restart": False,
+     "protected": True,
+     "verdict": "loaded", "reason": "enabled by aowl.list.core"},
     {"guid": "aowl.tarkov", "id": "aowl.tarkov", "name": "Tarkov Emulator",
-     "version": "0.1.0", "enabled": True, "live": None, "restart": False,
+     "version": "0.1.0", "enabled": True, "live": True, "restart": False,
+     "protected": False,
+     "clientLive": True, "clientWant": True, "clientOutcome": "settled",
      "verdict": "loaded", "reason": "enabled by aowl.list.core"},
     {"guid": "aowl.sway", "id": "aowl.sway", "name": "SWAY",
-     "version": "1.4.2", "enabled": True, "live": None, "restart": False,
-     "verdict": "loaded", "reason": "enabled by aowl.list.core"},
+     "version": "1.4.2", "enabled": True, "live": False, "restart": False,
+     "protected": False,
+     "clientLive": False, "clientWant": True, "clientOutcome": "skipped",
+     "clientCode": "nofile",
+     "verdict": "loaded",
+     "reason": "enabled by aowl.list.core -- the client host did not try -- "
+               "it is not installed on the client side"},
     {"guid": "aowl.efmb", "id": "aowl.efmb", "name": "EscapeFromMyBasement",
-     "version": "0.3.0", "enabled": False, "live": None, "restart": False,
+     "version": "0.3.0", "enabled": False, "live": False, "restart": False,
+     "protected": False,
+     "clientLive": False, "clientWant": False, "clientOutcome": "settled",
      "verdict": "not-selected", "reason": "no active list mentions it"},
     {"guid": "aowl.backendonly", "id": "aowl.backendonly",
      "name": "InstalledNotLoaded", "version": "9.9.9", "enabled": False,
-     "live": None, "restart": False,
-     "verdict": "disabled", "reason": "you turned it off"},
+     "live": True, "restart": False,
+     "protected": False,
+     "clientLive": True, "clientWant": False, "clientOutcome": "refused",
+     "clientCode": "noteardown",
+     "verdict": "disabled",
+     "reason": "you turned it off -- the client host tried and could not -- "
+               "that host cannot take any mod out while it runs"},
 ]
+
+# The wrapper's half. `clientMore` is what turns "this row has no answer" into
+# "this row has no answer *yet*", and it is the difference between a panel that
+# says wait and a panel that says nothing.
+CLIENT = {
+    "clientHost": True,
+    "clientSession": "b7f0",
+    "clientSeq": 12,
+    "clientRows": 4,
+    "clientMore": True,
+}
 
 CONTROL = "absent"
 POSTS = []
@@ -76,6 +129,7 @@ def panel():
         "liveKnown": CONTROL == "present" or CONTROL == "stubborn",
         "summary": "%d of %d registry mods resolve on the server side"
                    % (sum(1 for r in ROWS if r["enabled"]), len(ROWS)),
+        **CLIENT,
         # Last, and it has to stay last: the overlay's reader skips to the
         # `"mods"` key and then treats every `{`..`}` after it as a row, so a
         # wrapper key placed after the array would be read as part of the last
@@ -95,6 +149,20 @@ def apply_toggle(guid, want):
     r = row(guid)
     if r is None:
         return {"ok": False, "error": "no mod called %s in the registry" % guid}
+    # The manager's own refusal, from `routeToggle` in
+    # `mods/manager/manager.nim`: it takes `{"enabled":true}` on a protected mod
+    # like any other row and refuses only the *off* direction. The overlay is
+    # supposed to answer this one locally and never send it, so a stand-in that
+    # honoured it would let a regression in the panel pass silently -- the POST
+    # would go out, the row would flip, and nothing in the run would notice.
+    if r.get("protected") and not want:
+        return {"ok": False,
+                "error": "%s is what you are using to ask. Switching it off "
+                         "takes every /aowlspt/mods route with it, and nothing "
+                         "running could switch it back on -- not even a "
+                         "restart, because the selection would be on disk. "
+                         "Remove it from the install if you want it gone."
+                         % guid}
     r["enabled"] = want
 
     # `unknown` -- the probe is out and nothing has answered yet -- behaves
@@ -118,6 +186,22 @@ def apply_toggle(guid, want):
         r["live"] = want
         r["restart"] = False
 
+    # And what the client host would have said about it on its next poll, for
+    # the rows it has a record for. Left alone for the rows it has not: a toggle
+    # cannot make the game answer about a mod it has never mentioned, and a
+    # stand-in that grew a `clientLive` here would be teaching the panel that
+    # clicking a switch is a source of truth about the other process.
+    if "clientLive" in r:
+        if outcome == "applied":
+            r["clientLive"] = want
+            r["clientWant"] = want
+            r["clientOutcome"] = "changed"
+            r.pop("clientCode", None)
+        else:
+            r["clientWant"] = want
+            r["clientOutcome"] = "on-restart"
+            r["clientCode"] = "noteardown"
+
     return {
         "ok": True,
         "id": guid,
@@ -137,6 +221,138 @@ def apply_toggle(guid, want):
                          "message": message}],
         },
     }
+
+
+# ---------------------------------------------------------------------------
+# The other three routes the panel reads
+#
+# `/panel` alone is not a mod manager: it carries no `from` or `explicit` (which
+# list decided this, and did you), no named lists, and nothing about what was
+# excluded. The overlay merges four routes, so a stand-in that serves one proves
+# only the easy quarter.
+#
+# The shapes here are the real manager's, from `mods/manager/manager.nim`:
+# `decisionJson` for a `/list` row, `routeLists` for a list, `routeConflicts`
+# for an exclusion, `changeReply` for a clear, `applySelection` for an apply.
+# ---------------------------------------------------------------------------
+
+# Which list last decided each mod, and whether you overrode it. Parallel to
+# ROWS by guid.
+DECIDED = {
+    "aowl.manager": ("aowl.list.core", False),
+    "aowl.tarkov": ("aowl.list.core", False),
+    "aowl.sway": ("aowl.list.core", False),
+    "aowl.efmb": ("", False),
+    "aowl.backendonly": ("override", True),
+}
+
+LISTS = [
+    {"id": "aowl.list.core", "name": "Core", "author": "aowlspt",
+     "version": "1.0.0",
+     "description": "The mod manager and the game server, and nothing else.",
+     "inherits": [],
+     "entries": [{"id": "aowl.manager", "enabled": True,
+                  "note": "protected; it is what serves this panel"},
+                 {"id": "aowl.tarkov", "enabled": True,
+                  "note": "the emulator; nothing works without it"},
+                 {"id": "aowl.sway", "enabled": True}]},
+    {"id": "aowl.list.raidnight", "name": "Raid Night", "author": "savannt",
+     "version": "1.0.0",
+     "description": "Core with the bots turned up and a map that is not in the "
+                    "base game.",
+     "inherits": ["aowl.list.core"],
+     "entries": [{"id": "aowl.efmb", "enabled": True},
+                 {"id": "aowl.backendonly", "enabled": False,
+                  "note": "server-side only; there is nothing here for it"}]},
+]
+ACTIVE = ["aowl.list.core"]
+
+
+def decisions():
+    mods = []
+    for r in ROWS:
+        frm, explicit = DECIDED.get(r["guid"], ("", False))
+        mods.append({"id": r["guid"], "name": r["name"],
+                     "verdict": r["verdict"], "reason": r["reason"],
+                     "from": frm, "explicit": explicit,
+                     "order": 0 if r["enabled"] else -1})
+    return {"ok": True, "side": "server",
+            "order": [r["guid"] for r in ROWS if r["enabled"]],
+            "mods": mods, "problems": []}
+
+
+def lists():
+    return {"ok": True, "active": ACTIVE, "lists": LISTS}
+
+
+def conflicts():
+    # One of each kind the resolver can produce, so the ISSUES view has
+    # something to be right or wrong about. A stand-in that always answers
+    # "nothing is wrong" cannot fail.
+    excluded = [r for r in ROWS
+                if r["verdict"] not in ("loaded", "disabled", "not-selected",
+                                        "wrong-side")]
+    return {"ok": len(excluded) == 0,
+            "excluded": [{"id": r["guid"], "name": r["name"],
+                          "verdict": r["verdict"], "reason": r["reason"],
+                          "from": DECIDED.get(r["guid"], ("", False))[0],
+                          "explicit": DECIDED.get(r["guid"], ("", False))[1],
+                          "order": -1}
+                         for r in excluded],
+            "problems": ([] if CONTROL == "present" else
+                         ["no host answered the control probe, so this host has "
+                          "no live enable/disable"])}
+
+
+def apply_all():
+    results = []
+    deferred = 0
+    for r in ROWS:
+        if not r["enabled"]:
+            continue
+        if CONTROL == "present":
+            outcome, msg = "applied", "%s is already loaded" % r["guid"]
+        else:
+            outcome, msg = "deferred", ("this host has no live mod control, so "
+                                        "the change is saved and takes effect "
+                                        "when it restarts")
+            deferred += 1
+        results.append({"id": r["guid"], "action": "load",
+                        "outcome": outcome, "message": msg})
+    out = {"ok": True, "requested": 0, "deferred": deferred,
+           "restartRequired": deferred > 0, "control": CONTROL,
+           "results": results}
+    if deferred:
+        out["note"] = ("the selection is saved; %d change(s) cannot take effect "
+                       "until the host restarts" % deferred)
+    return out
+
+
+def clear(guid):
+    r = row(guid)
+    if r is None:
+        return {"ok": False, "error": "no mod called %s in the registry" % guid}
+    frm, _ = DECIDED.get(guid, ("", False))
+    DECIDED[guid] = (frm, False)
+    return {"ok": True, "id": guid, "action": "clear",
+            "decision": {"id": guid, "name": r["name"], "verdict": r["verdict"],
+                         "reason": r["reason"], "from": frm, "explicit": False,
+                         "order": 0},
+            "loaded": sum(1 for x in ROWS if x["enabled"]),
+            "control": CONTROL,
+            "inEffect": ("apply it with /aowlspt/mods/apply"
+                         if CONTROL == "present" else
+                         "saved, but this host cannot load or unload a mod "
+                         "while it runs; it takes effect on the next start"),
+            "problems": []}
+
+
+def select(list_id):
+    if not any(l["id"] == list_id for l in LISTS):
+        return {"ok": False, "error": "no list called %s in the registry" % list_id}
+    ACTIVE[:] = [list_id]
+    return {"ok": True, "active": list_id,
+            "loaded": sum(1 for x in ROWS if x["enabled"]), "problems": []}
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -159,6 +375,22 @@ class Handler(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path in ("/aowlspt/mods/panel", "/aowlspt/mods"):
             self._send(panel())
+        elif self.path == "/aowlspt/mods/list":
+            self._send(decisions())
+        elif self.path == "/aowlspt/mods/lists":
+            self._send(lists())
+        elif self.path == "/aowlspt/mods/conflicts":
+            self._send(conflicts())
+        elif self.path == "/aowlspt/mods/apply":
+            self._send(apply_all())
+        elif self.path.startswith("/aowlspt/mods/clear/"):
+            POSTS.append({"path": self.path, "body": "", "accept-encoding":
+                          self.headers.get("Accept-Encoding", "")})
+            self._send(clear(self.path[len("/aowlspt/mods/clear/"):]))
+        elif self.path.startswith("/aowlspt/mods/select/"):
+            POSTS.append({"path": self.path, "body": "", "accept-encoding":
+                          self.headers.get("Accept-Encoding", "")})
+            self._send(select(self.path[len("/aowlspt/mods/select/"):]))
         elif self.path == "/posts":
             self._send(POSTS)
         elif self.path == "/rows":
@@ -192,11 +424,22 @@ if __name__ == "__main__":
         elif args[i] == "--golden":
             with open(GOLDEN, encoding="utf-8") as f:
                 captured = json.load(f)
-            # Rows only. The control state is behaviour, not shape, and it
-            # comes from --control -- a capture taken in the first 750 ms of a
-            # backend's life records `unknown`, which is a real state and the
-            # least interesting one to test in.
+            # Rows, and the client host's wrapper. The control state is
+            # behaviour, not shape, and it comes from --control -- a capture
+            # taken in the first 750 ms of a backend's life records `unknown`,
+            # which is a real state and the least interesting one to test in.
+            #
+            # The `client*` scalars are *shape*, and taking them is what makes
+            # `--golden` exercise the same path the hand-written rows do:
+            # `realbackend.py` polls the client route with a report before it
+            # captures, so the capture carries a real ledger. Serving the
+            # capture's rows under a hand-written `clientHost: True` would be
+            # the worst of both -- a wrapper that says four rows were reported
+            # over rows that say nothing.
             ROWS[:] = captured["mods"]
+            for key in CLIENT:
+                if key in captured:
+                    CLIENT[key] = captured[key]
             i += 1
         else:
             port = int(args[i])

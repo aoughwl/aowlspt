@@ -18,10 +18,18 @@ import aowlsptinstall/log
 
 {.emit: """#include "aowlspt_net.h" """.}
 
-## `aowlspt_net.h` declares the server's accept-pool entry point as an extern,
-## so a client that includes it still has to define the symbol. It is never
-## called here.
-proc probeServeStub(sock: uint64) {.exportc: "aowlspt_nim_serve", cdecl.} =
+## `aowlspt_net.h` declares the two entry points its poller calls into nimony
+## with as externs, so a client that includes it still has to define the
+## symbols. Neither is ever called here -- this tool is a client, and nothing
+## in it starts a server.
+proc probeHandleStub(sock: uint64; buf: pointer; len: int32;
+                     headEnd: int32; sep: int32): int32 {.
+    exportc: "aowlspt_nim_handle", cdecl.} =
+  result = 0'i32
+
+proc probeTimeoutStub(sock: uint64; phase: int32; have: int32;
+                      declared: int32) {.
+    exportc: "aowlspt_nim_timeout", cdecl.} =
   discard
 
 type NetPtr = nil pointer
@@ -186,9 +194,19 @@ proc main(): int =
   if payloadLen > 0:
     discard cSend(sock, cast[NetPtr](addr payload[0]), int32(payloadLen))
 
+  # The buffer grows rather than being a fixed 256 KiB. It was fixed, and
+  # against a real database `/client/items` is 12 MiB of JSON -- more than
+  # 256 KiB even deflated -- so the body arrived truncated and the only report
+  # was "the response body would not inflate", from the one tool a person
+  # reaches for when they are trying to find out what the server said.
   var buf = newSeq[byte](262144)
   var have = 0
-  while have < buf.len:
+  while true:
+    if have == buf.len:
+      var bigger = newSeq[byte](buf.len * 2)
+      for k in 0 ..< have:
+        bigger[k] = buf[k]
+      buf = bigger
     let m = cRecv(sock, cast[NetPtr](addr buf[have]), int32(buf.len - have))
     if m <= 0'i32:
       break

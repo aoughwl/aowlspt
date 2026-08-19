@@ -8,7 +8,7 @@
 ## The numbers below are the x86-64 System V / Win64 layout of the structs in
 ## `abi/aowlspt_abi.h`, worked out by hand. `tests/abi_layout.c` computes the
 ## same numbers with the real C compiler over the real header, and
-## `tools/aowlspt-test.ps1` runs both and diffs them — so this file is checked
+## `aowl test` runs both and compares them — so this file is checked
 ## against the header, not merely against itself.
 ##
 ## Run: nimony c tests/abi_layout.nim && ./nimcache/*/abi_layout.exe
@@ -36,8 +36,20 @@ proc main =
   # + 4 slices (64) + uint32 encodings + 4 pad + 2 slices (32).
   check "sizeof(HostInfo)", sizeof(HostInfo), 120
 
-  # int32 size + 4 pad + ctx + info + 18 function pointers = 24 + 18*8.
-  check "sizeof(HostApi)", sizeof(HostApi), 192
+  # int32 size + 4 pad + ctx + info + 25 function pointers.
+  # Revision 3 appended `handlePointer` and `handlePin`; 192 was revision 2.
+  # Revision 4 appended `patchTyped`; 208 was revision 3.
+  # Revision 5 appended `notifyPush`; 216 was revision 4.
+  check "sizeof(HostApi)", sizeof(HostApi), 224
+
+  # The per-revision boundaries a mod tests a capability against. Literals, and
+  # deliberately so -- they must not move when the struct does -- which is why
+  # `tests/abi_layout.c` pins them to the real offsets from the other side.
+  check "HostApiSizeRev1", int(HostApiSizeRev1), 168
+  check "HostApiSizeRev2", int(HostApiSizeRev2), 192
+  check "HostApiSizeRev3", int(HostApiSizeRev3), 208
+  check "HostApiSizeRev4", int(HostApiSizeRev4), 216
+  check "HostApiSizeRev5", int(HostApiSizeRev5), 224
 
   # int32 size + 2 uint32 (12) + 4 pad + 5 slices (80) + 2 uint32 (8).
   check "sizeof(ModInfo)", sizeof(ModInfo), 104
@@ -51,6 +63,7 @@ proc main =
   check "ord(sideSim)", ord(sideSim), 3
   check "ord(llError)", ord(llError), 5
   check "ord(rkDynamic)", ord(rkDynamic), 1
+  check "ord(pkPostfix)", ord(pkPostfix), 1
   check "ord(pkFinalizer)", ord(pkFinalizer), 2
 
   # `sides` is a bitmask of 1 << side, not an ordinal.
@@ -63,7 +76,13 @@ proc main =
   check "flagBits(both)", int(flagBits({mfHotReloadable, mfThreadSafe})), 3
 
   check "AbiVersion", int(AbiVersion), 1
-  check "AbiRevision", int(AbiRevision), 2
+  check "AbiRevision", int(AbiRevision), 5
+
+  # The typed patch frame. Its fields are read directly by a mod's accessors,
+  # so its layout is ABI in the same sense `HostApi`'s is.
+  check "ord(akObject)", ord(akObject), 4
+  check "ord(akStack)", ord(akStack), 8
+  check "ord(akUnknown)", ord(akUnknown), 9
 
   if failures == 0:
     echo "all layout checks passed"

@@ -19,6 +19,16 @@ int32_t aowlspt_nim_patch_fired(int32_t slot, void* regs) {
     return 0;
 }
 
+/* Added alongside `aowlspt_nim_patch_fired` when `abi/aowlspt_detour.h` grew a
+ * return-side dispatcher: the same rule applies -- the thunk pool is emitted
+ * unconditionally, so any binary that includes the engine has to satisfy both
+ * symbols. The overlay routes through neither; its detours are C functions with
+ * the right signature, installed with `aowl_hook_install`. */
+int32_t aowlspt_nim_patch_returned(int32_t slot, void* regs) {
+    (void)slot; (void)regs;
+    return 0;
+}
+
 int main(void) {
     /* Starting it also exercises the probe device and both detour installs on
      * a process with no rendering of its own. */

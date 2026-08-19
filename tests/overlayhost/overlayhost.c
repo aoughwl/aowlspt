@@ -28,7 +28,7 @@
  *     view first this returns DXGI_ERROR_INVALID_CALL, which is the single most
  *     common way an overlay breaks a game.
  *
- * Build:  see build.ps1 / README.md in host/Aowlspt.Overlay
+ * Build:  aowl build (or see README.md in host/Aowlspt.Overlay)
  * Run:    overlayhost.exe --headless --shot shots\    (CI)
  *         overlayhost.exe                             (interactive; INSERT)
  */
@@ -52,6 +52,16 @@
  * detours with `aowl_hook_install` and its own C functions -- so this being
  * unreachable is the expected state, not a stub standing in for real work. */
 int32_t aowlspt_nim_patch_fired(int32_t slot, void* regs) {
+    (void)slot; (void)regs;
+    return 0;
+}
+
+/* Added alongside `aowlspt_nim_patch_fired` when `abi/aowlspt_detour.h` grew a
+ * return-side dispatcher: the same rule applies -- the thunk pool is emitted
+ * unconditionally, so any binary that includes the engine has to satisfy both
+ * symbols. The overlay routes through neither; its detours are C functions with
+ * the right signature, installed with `aowl_hook_install`. */
+int32_t aowlspt_nim_patch_returned(int32_t slot, void* regs) {
     (void)slot; (void)regs;
     return 0;
 }
@@ -344,12 +354,40 @@ static int make_rtv(void) {
 }
 
 int main(int argc, char** argv) {
-    int headless = 0, frames = 240;
+    /* 300 rather than 240: the scripted run reaches frame 172, and everything
+     * after that exists so the frame-cost average has a hundred steady-state
+     * frames to settle over rather than reporting start-up. */
+    int headless = 0, frames = 300;
     const char* shotDir = NULL;
+    /* `--fill N` pushes N synthetic mods in, up to the table's own ceiling, and
+     * `--size WxH` opens the window at a real resolution. Together they are the
+     * case nobody had tried: a full 64-mod table on a 4K panel, which is where
+     * the fixed vertex buffer would overflow if it were going to. */
+    int fill = 0;
     for (int i = 1; i < argc; i++) {
         if (strcmp(argv[i], "--headless") == 0) headless = 1;
         else if (strcmp(argv[i], "--frames") == 0 && i + 1 < argc) frames = atoi(argv[++i]);
-        else if (strcmp(argv[i], "--shot") == 0 && i + 1 < argc) shotDir = argv[++i];
+        else if (strcmp(argv[i], "--shot") == 0 && i + 1 < argc) {
+            shotDir = argv[++i];
+            /* Create it rather than write nothing. `shoot()` fails quietly
+             * against a directory that is not there, so `--shot shots-4k` on a
+             * clean checkout used to run the whole script, report every check
+             * as passing, and produce not one BMP -- and the BMPs are the only
+             * evidence the panel drew what it says it drew. */
+            if (!CreateDirectoryA(shotDir, NULL) &&
+                GetLastError() != ERROR_ALREADY_EXISTS) {
+                printf("error --shot %s: cannot create that directory (%lu)\n",
+                       shotDir, (unsigned long)GetLastError());
+                return 1;
+            }
+        }
+        else if (strcmp(argv[i], "--fill") == 0 && i + 1 < argc) fill = atoi(argv[++i]);
+        else if (strcmp(argv[i], "--size") == 0 && i + 1 < argc) {
+            unsigned w = 0, h = 0;
+            if (sscanf(argv[++i], "%ux%u", &w, &h) == 2 && w >= 320 && h >= 240) {
+                winW = w; winH = h;
+            }
+        }
     }
 
     WNDCLASSEXW wc;
@@ -388,6 +426,29 @@ int main(int argc, char** argv) {
     if (FAILED(hr)) { bad("could not create a D3D11 device"); return 1; }
     ok("D3D11 device and swap chain");
 
+    /* Which adapter, printed. The frame cost this run reports is a number about
+     * a particular GPU, and "50 microseconds" means something very different on
+     * a discrete card and on the WARP software rasteriser the HARDWARE path
+     * falls back to on a machine with no usable driver. A perf figure with no
+     * device beside it is not a measurement. */
+    {
+        IDXGIDevice* dxdev = NULL;
+        static const GUID iidDxgiDevice =
+            { 0x54ec77fa, 0x1377, 0x44e6, { 0x8c, 0x32, 0x88, 0xfd, 0x5f, 0x44, 0xc8, 0x4c } };
+        if (SUCCEEDED(ID3D11Device_QueryInterface(dev, &iidDxgiDevice, (void**)&dxdev))) {
+            IDXGIAdapter* ad = NULL;
+            if (SUCCEEDED(IDXGIDevice_GetAdapter(dxdev, &ad))) {
+                DXGI_ADAPTER_DESC ds;
+                if (SUCCEEDED(IDXGIAdapter_GetDesc(ad, &ds)))
+                    printf("      device: %ls (feature level %x.%x)\n",
+                           ds.Description, (unsigned)(fl >> 12) & 0xF,
+                           (unsigned)(fl >> 8) & 0xF);
+                IDXGIAdapter_Release(ad);
+            }
+            IDXGIDevice_Release(dxdev);
+        }
+    }
+
     if (!make_rtv()) { bad("could not create the host's render target view"); return 1; }
     if (!scene_init()) { bad("could not build the stand-in scene"); return 1; }
     scene_bind();
@@ -408,15 +469,100 @@ int main(int argc, char** argv) {
     }
     ok("Present and ResizeBuffers detoured from a probe swap chain's vtable");
 
-    aowl_ov_set_mod("aowl.clientprobe", "clientprobe", "0.1.0", 1);
-    aowl_ov_set_mod("aowl.sway", "SWAY", "1.4.2", 1);
-    aowl_ov_set_mod("aowl.efmb", "EscapeFromMyBasement", "0.3.0", 0);
-    aowl_ov_set_mod("aowl.loot", "LootRebalance", "2.0.1", 1);
+    /* What this process claims about its own library table, which is what
+     * `aowlhost.nim` pushes in through `aowl_ov_set_mod`. Kept as a table
+     * rather than five bare calls because the checks at the bottom of this file
+     * need to know which of these guids were pushed as *loaded*: a row that is
+     * not running because the host said so is right, and a row that is not
+     * running because the backend said so is only right where the client host
+     * answered about it, and the panel row cannot tell you which happened.
+     *
+     * `aowl.fovfix` is here because it is in the real registry, and therefore
+     * in `panel.golden.json` -- so the golden fixture, not just the
+     * hand-written one, has a guid that is both pushed in by this process and
+     * reported on by a client host. Without it the run against real bytes had
+     * no row where the two sources meet, which is the exact case the rule
+     * below exists for. */
+    static const struct { const char* guid; const char* name; const char* ver;
+                          int32_t live; } kPushed[] = {
+        { "aowl.clientprobe", "clientprobe",          "0.1.0", 1 },
+        { "aowl.sway",        "SWAY",                 "1.4.2", 1 },
+        { "aowl.efmb",        "EscapeFromMyBasement", "0.3.0", 0 },
+        { "aowl.loot",        "LootRebalance",        "2.0.1", 1 },
+        { "aowl.fovfix",      "FOV Fix",              "4.1.0", 1 },
+    };
+    for (size_t k = 0; k < sizeof(kPushed) / sizeof(kPushed[0]); k++)
+        aowl_ov_set_mod(kPushed[k].guid, kPushed[k].name, kPushed[k].ver,
+                        kPushed[k].live);
+
+    /* Loaded, and then taken out again -- which is exactly the pair of calls
+     * `aowlhost.nim` makes when a mod is unloaded while the game runs, and the
+     * one case no backend is involved in. The row must end up saying it is not
+     * running: it used to say it was, forever, because the push pinned
+     * `loaded` at 1 in both directions. */
+    aowl_ov_set_mod("aowl.unloaded", "UnloadedMidSession", "1.0.0", 1);
+    aowl_ov_set_mod("aowl.unloaded", "UnloadedMidSession", "1.0.0", 0);
+    {
+        int32_t at = -1;
+        for (int32_t k = 0; k < g_ov.modCount; k++)
+            if (strcmp(g_ov.mods[k].guid, "aowl.unloaded") == 0) at = k;
+        if (at < 0)
+            bad("the unloaded row is not in the table at all");
+        else if (g_ov.mods[at].loaded)
+            bad("a mod the host unloaded still reads as running on the panel");
+        else
+            ok("a mod the host loaded and then unloaded reads as not running");
+    }
+
+    /* The stress case. Names and guids are as long as the row's fields allow,
+     * because a short name is a short row and the point is to find the ceiling:
+     * every glyph drawn is six vertices out of a fixed 24,576. */
+    for (int i = 0; i < fill; i++) {
+        char guid[80], name[64], ver[24];
+        _snprintf(guid, sizeof(guid),
+                  "com.example.verylongreversedomain.filler%03d", i);
+        _snprintf(name, sizeof(name), "Filler Mod With A Long Name %03d", i);
+        _snprintf(ver, sizeof(ver), "%d.%d.%d", i / 100, (i / 10) % 10, i % 10);
+        guid[sizeof(guid) - 1] = name[sizeof(name) - 1] = ver[sizeof(ver) - 1] = 0;
+        aowl_ov_set_mod(guid, name, ver, i & 1);
+    }
+    if (fill > 0) {
+        char m[96];
+        _snprintf(m, sizeof(m), "pushed %d filler rows; the table holds %d",
+                  fill, g_ov.modCount);
+        ok(m);
+    }
 
     int printMismatches = 0, drewPixels = 0, resizeOk = -1;
     char path[512];
-    int32_t clickedRow = 2, clickedWas = 0, backendRows = 0;
-    char clickedGuid[80] = {0};
+    int32_t backendRows = 0;
+    /* A high-water mark rather than an end-state reading: the last
+     * gesture in the script is a `C` that can legitimately be refused
+     * (clearing an override on a row that has none), and a refusal
+     * correctly clears the outcome list. The question is whether per-mod
+     * outcomes ever reached the panel, not whether they are still there. */
+    int32_t sawResults = 0;
+    int32_t protRow = -1, protWas = 0, protHeld = 0;
+    char    protGuid[80] = {0};
+    /* The mouse half of the same rule. Clicking where a protected row's button
+     * would be must not toggle it -- there is no button there, only `KEEP` --
+     * and clicking the row must still *select* it, because a row you cannot
+     * select is a row whose `reason` and `from` you cannot read. The two used
+     * to be the same refusal: the draw loop `continue`d past the row-select hit
+     * test, so the protected row was the one row the mouse could not reach, and
+     * with the shipped registry that is row zero. */
+    int32_t protBtnMoved = -1, protRowSel = -1, protRowMoved = -1;
+    int32_t protMouseX = 0, protMouseY = 0;
+    /* the keyboard path */
+    int32_t keyRow = 0, keyWas = 0, keySelOk = 0, keyToggled = 0;
+    char    keyGuid[80] = {0};
+    int32_t tabbedToLists = 0, tabbedRound = 0;
+    int32_t filterWas = -1, filterMoved = 0;
+    int32_t listRow = -1;
+    char    listId[64] = {0};
+    /* the mouse path */
+    int32_t mouseX = 0, mouseY = 0, mouseWas = -1, mouseMoved = 0;
+    char    mouseGuid[80] = {0};
 
     for (int f = 0; f < frames; f++) {
         MSG msg;
@@ -438,46 +584,284 @@ int main(int argc, char** argv) {
         if (!print_eq(&before, &after)) printMismatches++;
 
         if (headless) {
-            /* A scripted run: toggle on, move the mouse over the third row's
-             * button, click it, then resize. Every step goes through the real
-             * window procedure the overlay installed. */
+            if (g_ov.resultCount > sawResults) sawResults = g_ov.resultCount;
+            /* A scripted run of the whole manager, driven the way a player
+             * drives it: through the window procedure the overlay installed,
+             * with keys. Every step below is a `SendMessageW` that the game's
+             * own wndproc would have received, so nothing here reaches around
+             * the input path being tested.
+             *
+             * The mouse is exercised too, once, on the row button -- it is a
+             * supported gesture and it is the one that regressed silently when
+             * the panel got wider. */
             if (f == 20) SendMessageW(hwnd, WM_KEYDOWN, VK_INSERT, 0);
-            if (f == 34 && shotDir) {
-                _snprintf(path, sizeof(path), "%s\\01-visible.bmp", shotDir);
-                if (shoot(path)) ok("wrote 01-visible.bmp");
+            if (f == 30 && shotDir) {
+                _snprintf(path, sizeof(path), "%s\\01-mods.bmp", shotDir);
+                if (shoot(path)) ok("wrote 01-mods.bmp");
             }
-            if (f == 36) {
-                int n = count_overlay_pixels();
-                drewPixels = n;
+            if (f == 34) drewPixels = count_overlay_pixels();
+
+            /* --- pick a row with the keyboard and toggle it --------------
+             *
+             * With a backend up the row chosen is the first one the *backend*
+             * contributed rather than a fixed index: everything checked after
+             * the toggle -- the `*`, the grey-out, the POST -- is the manager's
+             * answer about a mod, and the manager can only answer about mods in
+             * its registry. The rows the test host pushes in are deliberately
+             * named after mods it does not have. */
+            if (f == 38) {
+                keyRow = 0;
+                for (int32_t k = 0; k < g_ov.modCount; k++) {
+                    /* Not a protected mod. Toggling `aowl.manager` off is a
+                     * real gesture with a real answer -- it unloads the mod
+                     * serving every route this panel reads -- and the first
+                     * version of this script did exactly that, then spent the
+                     * rest of the run reporting an empty backend. Both the
+                     * manager and the panel refuse it now; the test picks a row
+                     * that is not protected, because a refusal is not a toggle.
+                     *
+                     * By the row's own flag rather than by name: which mods are
+                     * protected is the manager's business, and a test that
+                     * hardcodes a guid is the thing that just got deleted from
+                     * the header. */
+                    if (g_ov.mods[k].hostPushed) continue;
+                    if (g_ov.mods[k].protectedRow) continue;
+                    keyRow = k;
+                    break;
+                }
+                strncpy(keyGuid, g_ov.mods[keyRow].guid, sizeof(keyGuid) - 1);
+                keyWas = g_ov.mods[keyRow].enabled;
+                SendMessageW(hwnd, WM_KEYDOWN, VK_HOME, 0);
+                for (int32_t k = 0; k < keyRow; k++)
+                    SendMessageW(hwnd, WM_KEYDOWN, VK_DOWN, 0);
             }
             if (f == 40) {
-                /* Row `n` (zero-based) sits at y = 60 + 30 + n*22 + 11; its
-                 * button is at x = 40 + 520 - 10 - 56 + 28 = 522.
-                 *
-                 * With a backend up, the row clicked is the first one the
-                 * backend contributed rather than a fixed index: everything
-                 * checked after the click -- the `*`, the grey-out, the POST --
-                 * is the manager's answer about a mod, and the manager can only
-                 * answer about mods in its registry. The rows the host pushed in
-                 * are deliberately named after mods it does not have. */
-                clickedRow = 2;
-                for (int32_t k = 0; k < g_ov.modCount; k++) {
-                    if (!g_ov.mods[k].hostPushed) { clickedRow = k; break; }
-                }
-                strncpy(clickedGuid, g_ov.mods[clickedRow].guid,
-                        sizeof(clickedGuid) - 1);
-                clickedWas = g_ov.mods[clickedRow].enabled;
-                int cy = 60 + 30 + clickedRow * 22 + 11;
-                SendMessageW(hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(522, cy));
-                SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON, MAKELPARAM(522, cy));
+                /* The cursor has to have landed on the row the arrows walked
+                 * to before SPACE is pressed, or the toggle is of something
+                 * else and every check after it is meaningless. */
+                keySelOk = (g_ov.sel[AOWL_VIEW_MODS] == keyRow);
+                SendMessageW(hwnd, WM_KEYDOWN, VK_SPACE, 0);
+            }
+            if (f == 50) {
+                /* Read the answer *here*, not at the end of the run: the list
+                 * switch a hundred frames later re-resolves every row, and a
+                 * mod that came back on because a list turned it on is not
+                 * evidence that SPACE did nothing. */
+                for (int32_t k = 0; k < g_ov.modCount; k++)
+                    if (strcmp(g_ov.mods[k].guid, keyGuid) == 0)
+                        keyToggled = (g_ov.mods[k].enabled != keyWas) ||
+                                     g_ov.mods[k].pending;
             }
             if (f == 52 && shotDir) {
-                _snprintf(path, sizeof(path), "%s\\02-clicked.bmp", shotDir);
-                if (shoot(path)) ok("wrote 02-clicked.bmp");
+                _snprintf(path, sizeof(path), "%s\\02-toggled.bmp", shotDir);
+                if (shoot(path)) ok("wrote 02-toggled.bmp");
             }
-            if (f == 60) {
-                /* The resize test. The host must drop its own RTV; the overlay
-                 * must drop its own from inside the ResizeBuffers hook. */
+
+            /* --- the other three views, by keyboard ---------------------- */
+            if (f == 56) SendMessageW(hwnd, WM_KEYDOWN, VK_TAB, 0);
+            if (f == 58) tabbedToLists = (g_ov.view == AOWL_VIEW_LISTS);
+            if (f == 62 && shotDir) {
+                _snprintf(path, sizeof(path), "%s\\03-lists.bmp", shotDir);
+                if (shoot(path)) ok("wrote 03-lists.bmp");
+            }
+            /* Pick the first list that is not already active and make it the
+             * active one -- the "switch between named lists" gesture. */
+            if (f == 64 && g_ov.listCount > 0) {
+                for (int32_t k = 0; k < g_ov.listCount; k++)
+                    if (!g_ov.lists[k].active) { listRow = k; break; }
+                if (listRow >= 0) {
+                    strncpy(listId, g_ov.lists[listRow].id, sizeof(listId) - 1);
+                    SendMessageW(hwnd, WM_KEYDOWN, VK_HOME, 0);
+                    for (int32_t k = 0; k < listRow; k++)
+                        SendMessageW(hwnd, WM_KEYDOWN, VK_DOWN, 0);
+                    SendMessageW(hwnd, WM_KEYDOWN, VK_RETURN, 0);
+                }
+            }
+            if (f == 78 && shotDir) {
+                _snprintf(path, sizeof(path), "%s\\04-list-picked.bmp", shotDir);
+                if (shoot(path)) ok("wrote 04-list-picked.bmp");
+            }
+            if (f == 82) SendMessageW(hwnd, WM_KEYDOWN, VK_TAB, 0);
+            if (f == 86 && shotDir) {
+                _snprintf(path, sizeof(path), "%s\\05-issues.bmp", shotDir);
+                if (shoot(path)) ok("wrote 05-issues.bmp");
+            }
+            if (f == 88) SendMessageW(hwnd, WM_KEYDOWN, VK_TAB, 0);
+            if (f == 92 && shotDir) {
+                _snprintf(path, sizeof(path), "%s\\06-apply.bmp", shotDir);
+                if (shoot(path)) ok("wrote 06-apply.bmp");
+            }
+            if (f == 94) tabbedRound = (g_ov.view == AOWL_VIEW_APPLY);
+            if (f == 96) SendMessageW(hwnd, WM_KEYDOWN, VK_TAB, 0);   /* back to MODS */
+
+            /* --- the filter ---------------------------------------------- */
+            if (f == 100) { filterWas = g_ov.filter; SendMessageW(hwnd, WM_KEYDOWN, 'F', 0); }
+            if (f == 102) filterMoved = (g_ov.filter != filterWas);
+            if (f == 104 && shotDir) {
+                _snprintf(path, sizeof(path), "%s\\07-filtered.bmp", shotDir);
+                if (shoot(path)) ok("wrote 07-filtered.bmp");
+            }
+            if (f == 106) {
+                /* Back to `all`, so the mouse click below has a full list under
+                 * it whatever the filter happened to leave visible. */
+                for (int32_t k = g_ov.filter; k % AOWL_FILTER_COUNT; k++)
+                    SendMessageW(hwnd, WM_KEYDOWN, 'F', 0);
+            }
+
+            /* --- the mouse, on the row button ---------------------------- */
+            if (f == 110) {
+                /* Computed from the header's own constants rather than written
+                 * out: the panel is sized to the back buffer now, and a hard
+                 * coded 522 was silently landing in the `decided by` column the
+                 * moment the panel got wider. */
+                int32_t k = aowl_ov_scale();
+                int32_t availW = (int32_t)(g_ov.bbW ? g_ov.bbW : 1280) / k;
+                int32_t pw = AOWL_OV_PANEL_W;
+                if (pw > availW - 2 * AOWL_OV_PANEL_X)
+                    pw = availW - 2 * AOWL_OV_PANEL_X;
+                int32_t mouseRow = -1;
+                mouseX = AOWL_OV_PANEL_X + pw - AOWL_OV_PAD - AOWL_OV_BTN_W / 2;
+                mouseWas = -1;
+                /* A row that has a button. A protected row draws `KEEP`
+                 * instead, and clicking where its button would be correctly
+                 * does nothing -- so aiming at one would test the wrong thing.
+                 * (`j`, not `k`: `k` is the scale.) */
+                for (int32_t j = 0; j < g_ov.modCount; j++) {
+                    if (g_ov.mods[j].protectedRow) continue;
+                    mouseWas = g_ov.mods[j].enabled;
+                    strncpy(mouseGuid, g_ov.mods[j].guid, sizeof(mouseGuid) - 1);
+                    mouseRow = j;
+                    break;
+                }
+                /* The filter is back at `all` and the view is scrolled to the
+                 * top, so the table index is the on-screen index. */
+                mouseY = AOWL_OV_PANEL_Y + AOWL_OV_HEAD_H + AOWL_OV_LINE_H
+                         + (mouseRow < 0 ? 0 : mouseRow) * AOWL_OV_ROW_H
+                         + AOWL_OV_ROW_H / 2;
+                /* Panel units up to here; the window wants back-buffer pixels,
+                 * and on a tall back buffer the panel is drawn at 2x or 3x. */
+                mouseX *= k;
+                mouseY *= k;
+                SendMessageW(hwnd, WM_KEYDOWN, VK_HOME, 0);
+                SendMessageW(hwnd, WM_MOUSEMOVE, 0, MAKELPARAM(mouseX, mouseY));
+            }
+            if (f == 112) SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON,
+                                       MAKELPARAM(mouseX, mouseY));
+            if (f == 124 && shotDir) {
+                _snprintf(path, sizeof(path), "%s\\08-clicked.bmp", shotDir);
+                if (shoot(path)) ok("wrote 08-clicked.bmp");
+            }
+            if (f == 126) {
+                for (int32_t k = 0; k < g_ov.modCount; k++)
+                    if (strcmp(g_ov.mods[k].guid, mouseGuid) == 0)
+                        mouseMoved = (g_ov.mods[k].enabled != mouseWas);
+            }
+
+            /* --- SPACE on a protected row -------------------------------
+             *
+             * The gesture that used to unload the mod manager and take every
+             * route with it. Both the manager and the panel refuse it now; this
+             * checks the panel's half, which is the one that has to answer
+             * without a round trip. Skipped when nothing protected is on
+             * screen -- with no backend there are only host-pushed rows and
+             * none of them is protected, which is itself correct. */
+            if (f == 126) {
+                protRow = -1;
+                for (int32_t j = 0; j < g_ov.modCount; j++)
+                    if (g_ov.mods[j].protectedRow && g_ov.mods[j].enabled) {
+                        protRow = j;
+                        protWas = g_ov.mods[j].enabled;
+                        strncpy(protGuid, g_ov.mods[j].guid, sizeof(protGuid) - 1);
+                        break;
+                    }
+                if (protRow >= 0) {
+                    SendMessageW(hwnd, WM_KEYDOWN, VK_HOME, 0);
+                    for (int32_t j = 0; j < protRow; j++)
+                        SendMessageW(hwnd, WM_KEYDOWN, VK_DOWN, 0);
+                }
+            }
+            if (f == 128 && protRow >= 0) SendMessageW(hwnd, WM_KEYDOWN, VK_SPACE, 0);
+            if (f == 129 && protRow >= 0) {
+                /* Read on the very next frame: no request went out, so there is
+                 * nothing to wait for, and that immediacy is the point. */
+                for (int32_t j = 0; j < g_ov.modCount; j++)
+                    if (strcmp(g_ov.mods[j].guid, protGuid) == 0)
+                        protHeld = (g_ov.mods[j].enabled == protWas) &&
+                                   !g_ov.mods[j].pending &&
+                                   g_ov.lastError[0] != 0;
+            }
+
+            /* --- the mouse on a protected row ---------------------------
+             *
+             * Two gestures, one row. Aimed with the header's own constants,
+             * the same way the button click above is, so that a layout change
+             * moves both together. The filter is back at `all` and the table
+             * is scrolled to the top, so the table index is the screen index.
+             *
+             * Frames are spaced because a click is consumed by the *render*
+             * thread inside the next build, not in the window procedure. */
+            if (f == 131 && protRow >= 0) {
+                int32_t k = aowl_ov_scale();
+                int32_t availW = (int32_t)(g_ov.bbW ? g_ov.bbW : 1280) / k;
+                int32_t pw = AOWL_OV_PANEL_W;
+                if (pw > availW - 2 * AOWL_OV_PANEL_X)
+                    pw = availW - 2 * AOWL_OV_PANEL_X;
+                protMouseY = AOWL_OV_PANEL_Y + AOWL_OV_HEAD_H + AOWL_OV_LINE_H
+                             + protRow * AOWL_OV_ROW_H + AOWL_OV_ROW_H / 2;
+                /* Straight at the `KEEP` label, where every other row's button
+                 * is. */
+                protMouseX = AOWL_OV_PANEL_X + pw - AOWL_OV_PAD
+                             - AOWL_OV_BTN_W / 2;
+                protMouseX *= k;
+                protMouseY *= k;
+                SendMessageW(hwnd, WM_MOUSEMOVE, 0,
+                             MAKELPARAM(protMouseX, protMouseY));
+            }
+            if (f == 133 && protRow >= 0)
+                SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON,
+                             MAKELPARAM(protMouseX, protMouseY));
+            if (f == 136 && protRow >= 0) {
+                protBtnMoved = 0;
+                for (int32_t j = 0; j < g_ov.modCount; j++)
+                    if (strcmp(g_ov.mods[j].guid, protGuid) == 0)
+                        protBtnMoved = (g_ov.mods[j].enabled != protWas) ||
+                                       g_ov.mods[j].pending;
+                /* Now move the selection somewhere else, so that the row-click
+                 * below has to actually move it back. Selecting a row that was
+                 * already selected proves nothing. */
+                SendMessageW(hwnd, WM_KEYDOWN, VK_HOME, 0);
+                if (protRow == 0) SendMessageW(hwnd, WM_KEYDOWN, VK_DOWN, 0);
+            }
+            if (f == 138 && protRow >= 0) {
+                /* The name column, well clear of where the button would be. */
+                int32_t k = aowl_ov_scale();
+                protMouseX = (AOWL_OV_PANEL_X + AOWL_OV_PAD + 60) * k;
+                SendMessageW(hwnd, WM_MOUSEMOVE, 0,
+                             MAKELPARAM(protMouseX, protMouseY));
+            }
+            if (f == 140 && protRow >= 0)
+                SendMessageW(hwnd, WM_LBUTTONDOWN, MK_LBUTTON,
+                             MAKELPARAM(protMouseX, protMouseY));
+            if (f == 143 && protRow >= 0) {
+                protRowSel = (g_ov.sel[AOWL_VIEW_MODS] == protRow);
+                protRowMoved = 0;
+                for (int32_t j = 0; j < g_ov.modCount; j++)
+                    if (strcmp(g_ov.mods[j].guid, protGuid) == 0)
+                        protRowMoved = (g_ov.mods[j].enabled != protWas) ||
+                                       g_ov.mods[j].pending;
+            }
+
+            /* --- clearing an override ------------------------------------ */
+            if (f == 145) SendMessageW(hwnd, WM_KEYDOWN, 'C', 0);
+            if (f == 150 && shotDir) {
+                _snprintf(path, sizeof(path), "%s\\09-cleared.bmp", shotDir);
+                if (shoot(path)) ok("wrote 09-cleared.bmp");
+            }
+
+            /* --- resize, mid-run ----------------------------------------- */
+            if (f == 156) {
+                /* The host must drop its own RTV; the overlay must drop its own
+                 * from inside the ResizeBuffers hook. */
                 ID3D11DeviceContext_OMSetRenderTargets(ctx, 0, NULL, NULL);
                 ID3D11RenderTargetView_Release(rtv);
                 rtv = NULL;
@@ -489,21 +873,50 @@ int main(int argc, char** argv) {
                 if (!make_rtv()) bad("could not recreate the host's RTV after resize");
                 scene_bind();
             }
-            if (f == 72 && shotDir) {
-                _snprintf(path, sizeof(path), "%s\\03-resized.bmp", shotDir);
-                if (shoot(path)) ok("wrote 03-resized.bmp");
+            if (f == 168 && shotDir) {
+                _snprintf(path, sizeof(path), "%s\\10-resized.bmp", shotDir);
+                if (shoot(path)) ok("wrote 10-resized.bmp");
             }
-            if (f == 80) SendMessageW(hwnd, WM_KEYDOWN, VK_INSERT, 0);
-            if (f == 86 && shotDir) {
-                _snprintf(path, sizeof(path), "%s\\04-hidden.bmp", shotDir);
-                if (shoot(path)) ok("wrote 04-hidden.bmp");
-            }
-            if (f == 88) {
+
+            if (f == 172) {
+                /* `backendRow`, not `!hostPushed`. A guid can be both -- a mod
+                 * the registry lists *and* the client host loaded is exactly
+                 * the case the merge exists for -- and counting the negation
+                 * undercounts by however many of those there are. */
                 for (int32_t k = 0; k < g_ov.modCount; k++)
-                    if (!g_ov.mods[k].hostPushed) backendRows++;
+                    if (g_ov.mods[k].backendRow) backendRows++;
             }
-            if (f == 92) break;
-            Sleep(16);   /* ~60 Hz, so the backend poll thread gets real time */
+
+            /* Everything from here to `frames` is left drawing so the frame
+             * cost settles: the EWMA is 1/32 and the first eight drawn frames
+             * are dropped, so a run that stops at 90 reports start-up. */
+            /* Posted, not sent, and that is the point.
+             *
+             * `SendMessageW` calls the window procedure directly, so it proves
+             * the subclass *body* works and nothing about whether the subclass
+             * is on the path a real keystroke takes. A real key goes into the
+             * thread's message queue and reaches a window procedure only
+             * because `DispatchMessageW` -- the loop at the top of this
+             * function -- sends it there, through whatever `SetWindowLongPtrW`
+             * left in `GWLP_WNDPROC`. Posting the close exercises exactly that
+             * path, so "the toggle key turned the panel on and off again"
+             * below is evidence about the mechanism the game's own input uses
+             * rather than about a function call.
+             *
+             * It is still not evidence about Tarkov: a subclass cannot see
+             * `GetAsyncKeyState`, DirectInput or `GetRawInputBuffer` polling.
+             * See "Input" in host/Aowlspt.Overlay/README.md. */
+            if (f == frames - 6) PostMessageW(hwnd, WM_KEYDOWN, VK_INSERT, 0);
+            if (f == frames - 2 && shotDir) {
+                _snprintf(path, sizeof(path), "%s\\11-hidden.bmp", shotDir);
+                if (shoot(path)) ok("wrote 11-hidden.bmp");
+            }
+            /* With a backend, frames have to take about as long as real ones:
+             * the overlay's worker polls on a wall-clock timer and a run that
+             * sprints through 300 frames in a second would check the panel
+             * against one poll's worth of data. Without one there is nothing to
+             * wait for. */
+            Sleep(port > 0 ? 16 : 4);
         }
     }
 
@@ -513,6 +926,21 @@ int main(int argc, char** argv) {
         aowl_ov_status(why, sizeof(why));
         printf("      status: %s\n", why);
     }
+    /* The worker's own state, printed on every run. `queued` is the one to
+     * watch: anything but zero means gestures were made and never reached the
+     * far end, which against a live backend is a bug and against a dead one is
+     * a regression in the refusal path. */
+    printf("      worker: reachable=%ld everReached=%ld lastRequest=%ldms "
+           "queued=%d\n      last gesture: %s\n",
+           (long)g_ov.backendOk, (long)g_ov.everOk, (long)g_ov.lastRttMs,
+           g_ov.cmdCount,
+           g_ov.applyWhat[0] ? g_ov.applyWhat : "(none)");
+    if (g_ov.lastError[0]) printf("      last error: %s\n", g_ov.lastError);
+    if (g_ov.cmdCount == 0)
+        ok("no gesture was left stranded in the worker's queue");
+    else
+        bad("gestures are still queued: the worker did not drain them, and a "
+            "player would be looking at a row stuck at `~`");
     if (aowl_ov_frames() > 0) ok("the Present hook fired");
     else bad("the Present hook never fired");
 
@@ -527,8 +955,178 @@ int main(int argc, char** argv) {
                bad(m); }
         if (resizeOk == 1) ok("ResizeBuffers succeeded with the overlay hooked");
         else bad("ResizeBuffers failed with the overlay hooked");
-        if (aowl_ov_visible() == 0) ok("the toggle key turned the panel on and off again");
+        if (aowl_ov_visible() == 0) ok("the toggle key turned the panel on and off again "
+                                       "(the close was posted through the message queue, so "
+                                       "the subclass is on the path DispatchMessage uses)");
         else bad("the panel did not close on the second toggle");
+
+        /* --- the keyboard, which is the whole interface in a raid ---------
+         *
+         * Tarkov captures the cursor and reads the mouse through raw input. The
+         * overlay integrates raw deltas into a cursor of its own, so the mouse
+         * does work -- but the gesture a player can actually perform mid-raid
+         * is a keypress, so the keyboard path is the one that has to be
+         * checked rather than assumed. */
+        if (keySelOk) ok("HOME and DOWN moved the cursor to the intended row");
+        else bad("the arrow keys did not land the cursor where they were aimed");
+
+        /* Sampled ten frames after the keypress rather than at the end of
+         * the run: the list switch later re-resolves every row, and a mod
+         * turned back on by a list is not evidence about what SPACE did.
+         *
+         * With no `--port` the correct behaviour is the opposite one: there is
+         * no worker thread, so the overlay must refuse the gesture and say why
+         * rather than flip the row and leave a `~` nothing can clear. */
+        if (port > 0) {
+            if (keyToggled)
+                ok("SPACE toggled the selected row (or left it pending, which "
+                   "is the honest state while no backend has answered)");
+            else
+                bad("SPACE on the selected row changed nothing at all");
+        } else {
+            if (!keyToggled && g_ov.lastError[0])
+                ok("read-only: SPACE was refused with a reason rather than "
+                   "flipping a row nothing could ever confirm");
+            else
+                bad("read-only: SPACE changed a row with no backend to confirm "
+                    "it, which leaves a `~` that never clears");
+        }
+
+        if (tabbedToLists) ok("TAB moved to the LISTS view");
+        else bad("TAB did not change view");
+        if (tabbedRound) ok("TAB walked on through ISSUES to APPLY");
+        else bad("TAB did not reach the APPLY view");
+        if (filterMoved) ok("F cycled the mods filter");
+        else bad("F did not change the filter");
+
+        /* SPACE on a protected row: the gesture that used to unload the mod
+         * manager and take every route with it. Both the manager and the panel
+         * refuse it now, and this is the panel's half -- the one that has to
+         * answer without a round trip, so that a protected row does not sit at
+         * `~` for a second before nothing happens. */
+        if (protRow >= 0) {
+            if (protHeld)
+                ok("SPACE on a protected row was refused on the spot, with a "
+                   "reason, and the row did not move");
+            else
+                bad("SPACE on a protected row changed it or left it pending -- "
+                    "the panel is about to ask the manager to unload the thing "
+                    "that serves it");
+        } else if (backendRows > 0) {
+            /* `backendRows`, not `port > 0`: a port with nothing listening on
+             * it is one of the configurations this file exists to check, and
+             * there are no rows at all in it to be protected. The claim below
+             * is only meaningful once a manager has actually answered. */
+            /* Not a note any more. Every manager that can answer this panel
+             * protects itself -- `isProtected` in `mods/manager/manager.nim`
+             * always names `aowl.manager` -- so with a backend up, no protected
+             * row on screen means the flag stopped being served or stopped
+             * being read, and the panel is offering a working OFF button on the
+             * mod that serves every route it reads. That used to print as a
+             * line nobody looked at, on a run that passed. */
+            bad("no row came back protected, but a backend answered: the "
+                "manager always protects itself, so either it stopped sending "
+                "`protected` or aowl_ov_read_panel stopped reading it -- and "
+                "the panel now has an OFF button on the mod serving it");
+        }
+
+        /* The mouse half of the protected rule, both directions. */
+        if (protRow >= 0) {
+            if (protBtnMoved == 0)
+                ok("a click where a protected row's button would be does "
+                   "nothing -- there is a KEEP label there, not a button");
+            else if (protBtnMoved > 0)
+                bad("clicking a protected row's KEEP label toggled it");
+            if (protRowSel > 0 && protRowMoved == 0)
+                ok("a click on a protected row still selects it, so its reason "
+                   "and `decided by` are readable");
+            else if (protRowMoved > 0)
+                bad("clicking the body of a protected row toggled it");
+            else if (protRowSel == 0)
+                bad("a click on a protected row did not select it -- the draw "
+                   "loop is skipping the row-select hit test along with the "
+                   "button, so the one row that most needs explaining is the "
+                   "one row the mouse cannot reach");
+        }
+
+        /* The mouse is a supported gesture and it is the one that regressed
+         * silently when the panel got wider -- a hard-coded x was landing in
+         * the `decided by` column. With no backend the correct answer is the
+         * refusal again, for the same reason as SPACE. */
+        if (port > 0) {
+            if (mouseMoved || mouseWas < 0)
+                ok("the mouse click on a row button still toggles it");
+            else
+                bad("a click on the row button did nothing -- the button "
+                    "geometry and the hit test have drifted apart");
+        } else if (!mouseMoved) {
+            ok("read-only: a click on a row button was refused too");
+        } else {
+            bad("read-only: a click changed a row with no backend to confirm it");
+        }
+
+        /* --- what a frame of this costs ----------------------------------
+         *
+         * Reported rather than asserted against a threshold. The number here is
+         * a WARP software device on a CI-shaped machine and a real GPU is
+         * faster; what a threshold would catch is the machine being busy, which
+         * is not a bug in the overlay. What it is here for is that the figure
+         * gets printed on every run, so a change that makes it ten times worse
+         * is visible in the diff of a build log. */
+        {
+            char m[160];
+            _snprintf(m, sizeof(m),
+                      "      per frame with the panel open: %d ns average "
+                      "(%ld ns laying out geometry, %ld ns of D3D11), "
+                      "%d ns worst, %d frames drawn",
+                      aowl_ov_frame_ns(), (long)g_ov.avgBuildNs,
+                      (long)(aowl_ov_frame_ns() - g_ov.avgBuildNs),
+                      aowl_ov_frame_ns_max(), g_ov.drawn);
+            printf("%s\n", m);
+            _snprintf(m, sizeof(m),
+                      "      geometry rebuilt on %d of %d drawn frames (%d%%)",
+                      g_ov.builds, g_ov.drawn,
+                      g_ov.drawn ? (100 * g_ov.builds) / g_ov.drawn : 0);
+            printf("%s\n", m);
+            if (aowl_ov_frame_ns() > 0) ok("the frame cost was measured");
+            else bad("no frame cost was measured; the panel never drew");
+            /* The cache has to be doing something and it has to not be doing
+             * everything. A hundred percent means the signature never settles
+             * -- something that ticks on its own got into it -- and a rebuild
+             * count that barely grows across a scripted run of keypresses and
+             * mouse moves means it settled too hard and the panel is showing a
+             * stale frame. */
+            if (g_ov.drawn > 100) {
+                if (g_ov.builds >= g_ov.drawn)
+                    bad("the geometry cache never hit: the signature is moving "
+                        "every frame");
+                else if (g_ov.builds < 8)
+                    bad("the geometry cache never missed across a run full of "
+                        "keypresses; it is showing stale frames");
+                else
+                    ok("the geometry cache hits on quiet frames and misses when "
+                       "something moves");
+            }
+        }
+
+        /* Headroom in the one fixed buffer the panel can overrun. A dropped
+         * quad is not a crash -- `aowl_ov_vert` refuses rather than grows,
+         * because the render thread does not allocate -- it is a line of text
+         * that silently is not there, which is the worst kind of wrong. */
+        {
+            char m[128];
+            _snprintf(m, sizeof(m), "      busiest frame: %d of %d vertices",
+                      g_ov.maxVtx, AOWL_OV_MAX_VERTS);
+            printf("%s\n", m);
+            if (g_ov.vtxDropped == 0) ok("no geometry was dropped by the cap");
+            else {
+                _snprintf(m, sizeof(m),
+                          "%d vertices were dropped: AOWL_OV_MAX_VERTS is too "
+                          "small and part of the panel did not draw",
+                          g_ov.vtxDropped);
+                bad(m);
+            }
+        }
     }
 
     /* --- the backend, when there is one ----------------------------------
@@ -537,7 +1135,18 @@ int main(int argc, char** argv) {
      * They are skipped without `--port` rather than faked: a run with no
      * backend is a legitimate configuration (the panel is read-only) and
      * asserting backend behaviour there would be asserting nothing. */
-    if (headless && port > 0) {
+    if (headless && port > 0 && !g_ov.everOk) {
+        /* The port was given and nothing ever answered on it. That is a
+         * legitimate thing to test -- the run above checked the panel stayed
+         * interactive and refused gestures with a reason -- but asserting the
+         * manager's schema against a backend that is not there would be
+         * asserting nothing, so it is said out loud and skipped. */
+        char m[128];
+        _snprintf(m, sizeof(m),
+                  "      no backend ever answered on :%d, so the manager's "
+                  "schema was not checked", port);
+        printf("%s\n", m);
+    } else if (headless && port > 0) {
         if (backendRows > 0) {
             char m[96];
             _snprintf(m, sizeof(m), "%d rows came from the backend's panel route",
@@ -547,50 +1156,191 @@ int main(int argc, char** argv) {
             bad("no row came from the backend: the panel route was not read");
         }
 
-        int32_t at = -1;
-        for (int32_t k = 0; k < g_ov.modCount; k++)
-            if (strcmp(g_ov.mods[k].guid, clickedGuid) == 0) { at = k; break; }
-        if (at < 0) {
-            bad("the clicked row vanished from the table");
-        } else {
-            AowlOvMod* m = &g_ov.mods[at];
-            char line[192];
-            _snprintf(line, sizeof(line),
-                      "      clicked %s: enabled %d -> %d, live %d, restart %d, "
-                      "pending %d", m->guid, clickedWas, m->enabled, m->loaded,
-                      m->restart, m->pending);
-            printf("%s\n", line);
-
-            if (m->enabled != clickedWas)
-                ok("the click changed the row's state and the server agreed");
+        /* Everything below is a field that only `/aowlspt/mods/list`,
+         * `/lists`, `/conflicts` or a change reply can fill in. A panel that
+         * only read `/panel` would pass every check above and none of these. */
+        {
+            int32_t withReason = 0, withVerdict = 0, withFrom = 0;
+            for (int32_t k = 0; k < g_ov.modCount; k++) {
+                if (!g_ov.mods[k].backendRow) continue;
+                if (g_ov.mods[k].reason[0]) withReason++;
+                if (g_ov.mods[k].verdict[0]) withVerdict++;
+                if (g_ov.mods[k].from[0]) withFrom++;
+            }
+            if (withReason == backendRows && withVerdict == backendRows) {
+                ok("every backend row carries the manager's own verdict and "
+                   "reason");
+            } else {
+                char m[128];
+                _snprintf(m, sizeof(m),
+                          "%d/%d rows have a reason and %d/%d a verdict",
+                          withReason, backendRows, withVerdict, backendRows);
+                bad(m);
+            }
+            /* `from` is legitimately empty for a mod no list mentions, so the
+             * check is that *some* row has one -- that the `/list` route was
+             * read at all. */
+            if (withFrom > 0)
+                ok("`decided by` is populated, so /aowlspt/mods/list was read "
+                   "and merged with the panel rows");
             else
-                bad("the row came back from the server unchanged");
-
-            /* The whole point of the exercise. `restart` used to be a constant
-             * `1` on any clicked row; it is now whatever the manager answered,
-             * and the stand-in answers what the real manager answers in each of
-             * its three control states. Either value is correct here -- what
-             * would not be is the field never moving off the host's default. */
-            if (m->restart || m->loaded == 0)
-                ok("the row reflects the manager's own answer: a `*` for a "
-                   "change that needs a restart, or a greyed row for one the "
-                   "host unloaded live");
-            else
-                bad("the toggled row shows neither a restart marker nor a "
-                    "grey-out; the manager's answer is not reaching the panel");
+                bad("no row has a `from`: the /list route was never read, and "
+                    "the panel cannot say which list decided anything");
         }
 
-        /* A host-pushed row must never be greyed out by the backend. The
-         * manager runs on the server side and has never heard of a client-only
-         * mod, so its `live` is not evidence about one. */
-        int32_t lowered = 0;
-        for (int32_t k = 0; k < g_ov.modCount; k++)
-            if (g_ov.mods[k].hostPushed && !g_ov.mods[k].loaded) lowered++;
-        if (lowered == 0)
-            ok("the backend did not grey out a mod the host loaded in this "
-               "process");
-        else
-            bad("the backend lowered `loaded` on a row the host pushed in");
+        if (g_ov.listCount > 0) {
+            char m[128];
+            int32_t active = 0, entries = 0;
+            for (int32_t k = 0; k < g_ov.listCount; k++)
+                if (g_ov.lists[k].active) active++;
+            entries = g_ov.entryCount;
+            _snprintf(m, sizeof(m),
+                      "%d named lists read, %d active, %d entries across them",
+                      g_ov.listCount, active, entries);
+            ok(m);
+            if (entries == 0)
+                bad("the lists have no entries: the nested `entries` array was "
+                    "not walked, which is exactly what the old brace-scanning "
+                    "reader could not do");
+        } else {
+            /* Not a failure on a stand-in that does not serve /lists. It is
+             * reported so a run against something that should is not silently
+             * missing a whole view. */
+            printf("      note: no lists were read (the backend served no "
+                   "/aowlspt/mods/lists)\n");
+        }
+
+        if (listRow >= 0) {
+            char m[160];
+            int32_t nowActive = 0;
+            for (int32_t k = 0; k < g_ov.listCount; k++)
+                if (strcmp(g_ov.lists[k].id, listId) == 0) nowActive = g_ov.lists[k].active;
+            _snprintf(m, sizeof(m), "      ENTER on list %s: active now %d",
+                      listId, nowActive);
+            printf("%s\n", m);
+        }
+
+        {
+            char m[192];
+            _snprintf(m, sizeof(m),
+                      "      manager says: control=%s liveKnown=%d "
+                      "results=%d(max %d) requested=%d deferred=%d restart=%d",
+                      g_ov.control[0] ? g_ov.control : "?", g_ov.liveKnownAll,
+                      g_ov.resultCount, sawResults, g_ov.applyRequested, g_ov.applyDeferred,
+                      g_ov.applyRestart);
+            printf("%s\n", m);
+            if (sawResults > 0)
+                ok("per-mod outcomes came back and reached the APPLY view");
+            else
+                bad("no per-mod outcome reached the panel: a toggle's `apply` "
+                    "results were not read");
+        }
+
+        {
+            int32_t at = -1;
+            for (int32_t k = 0; k < g_ov.modCount; k++)
+                if (strcmp(g_ov.mods[k].guid, keyGuid) == 0) { at = k; break; }
+            if (at < 0) {
+                bad("the toggled row vanished from the table");
+            } else {
+                AowlOvMod* m = &g_ov.mods[at];
+                char line[224];
+                _snprintf(line, sizeof(line),
+                          "      toggled %s: enabled %d -> %d, live %d, "
+                          "restart %d, pending %d, verdict %s",
+                          m->guid, keyWas, m->enabled, m->loaded, m->restart,
+                          m->pending, m->verdict);
+                printf("%s\n", line);
+
+                /* `restart` used to be a constant `1` on any clicked row; it is
+                 * now whatever the manager answered. Either value is correct
+                 * here -- what would not be is the field never moving off the
+                 * host's default, or the row never coming back with a verdict
+                 * at all. */
+                if (m->verdict[0])
+                    ok("the toggled row came back with the manager's verdict");
+                else
+                    bad("the toggled row has no verdict; the reply was not read");
+            }
+        }
+
+        /* --- the other host ------------------------------------------------
+         *
+         * A row this process pushed in may be lowered by the backend only where
+         * the backend's answer carries the *client host's* own word about that
+         * guid. Without it the manager is the server side guessing about a
+         * process it cannot see, and believing it greys out every client mod;
+         * with it, it is the same host that pushed the row, answering again one
+         * poll later, and refusing it leaves an unloaded mod reading `running
+         * yes` for the rest of the session.
+         *
+         * `aowl.clientprobe` is in no backend fixture, so nothing can lower it.
+         * `aowl.sway` is in both fixtures with a client record that says it is
+         * not running, so it must come down. */
+        {
+            int32_t badly = 0, rightly = 0;
+            for (size_t j = 0; j < sizeof(kPushed) / sizeof(kPushed[0]); j++) {
+                AowlOvMod* m = NULL;
+                if (!kPushed[j].live) continue;   /* the host said it was off */
+                for (int32_t k = 0; k < g_ov.modCount; k++)
+                    if (strcmp(g_ov.mods[k].guid, kPushed[j].guid) == 0)
+                        m = &g_ov.mods[k];
+                if (!m || m->loaded) continue;
+                if (m->clientKnown) rightly++; else badly++;
+            }
+            if (badly > 0)
+                bad("the backend lowered `loaded` on a row the host pushed in "
+                    "without the client host having answered about it");
+            else
+                ok("no host-pushed row was greyed out on the manager's word "
+                   "alone");
+            if (rightly > 0)
+                ok("a host-pushed row the client host reported as stopped was "
+                   "lowered, so an unloaded mod stops reading `running yes`");
+            else
+                bad("no host-pushed row was lowered by a client record: the "
+                    "fixture carries no clientLive for a pushed guid, so the "
+                    "rule that lets one through is not being tested");
+        }
+
+        /* And the wrapper, which is the only thing that can tell one kind of
+         * `unknown` from another. A fixture where every row has an answer, or
+         * none does, cannot test either. */
+        {
+            char m[192];
+            int32_t known = 0, quiet = 0, argued = 0;
+            for (int32_t k = 0; k < g_ov.modCount; k++) {
+                if (!g_ov.mods[k].backendRow) continue;
+                if (g_ov.mods[k].clientKnown) {
+                    known++;
+                    if (g_ov.mods[k].clientLive != g_ov.mods[k].clientWant) argued++;
+                } else quiet++;
+            }
+            _snprintf(m, sizeof(m),
+                      "      the game says: host=%d session=%s seq=%d rows=%d "
+                      "more=%d; %d row(s) answered, %d unknown, %d disagreeing",
+                      g_ov.clientHost, g_ov.clientSession[0] ? g_ov.clientSession : "-",
+                      g_ov.clientSeq, g_ov.clientRows, g_ov.clientMore,
+                      known, quiet, argued);
+            printf("%s\n", m);
+            if (!g_ov.clientHost)
+                bad("the panel body carried no client host at all, so nothing "
+                    "below it was exercised");
+            else if (known == 0)
+                bad("no backend row carries the client host's answer");
+            else if (quiet == 0)
+                bad("every backend row carries an answer, so the panel's "
+                    "`unknown` path has no row to draw and is not tested");
+            else
+                ok("the panel can tell a row the game answered about from one "
+                   "it did not, and says which host and how much it has sent");
+            if (argued > 0)
+                ok("a row where the game disagrees with the switch is on screen, "
+                   "so the `!` marker is drawn");
+            else
+                bad("no row disagrees with the game, so the `!` marker never "
+                    "drew and the fixture cannot fail without it");
+        }
     }
 
     aowl_ov_stop();

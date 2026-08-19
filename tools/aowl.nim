@@ -2,7 +2,7 @@
 ##
 ##     aowl build                 everything: hosts, installer, examples
 ##     aowl build-mod PATH        one nimony mod -> a native .dll
-##     aowl build-hosts           the .NET hosts and the simulator
+##     aowl build-hosts           the simulator and the .NET tools
 ##     aowl build-installer       aowlspt-install.exe
 ##     aowl test                  every gate
 ##     aowl run PATH              build a mod, then run it in the simulator
@@ -32,12 +32,15 @@ aowl -- build, test and install aowlspt
 
   build              hosts, installer and every example
   build-mod PATH     compile one nimony mod into a native library
-  build-hosts        the .NET hosts and aowlspt-sim
+  build-hosts        aowlspt-sim (nimony) and the .NET tools left
   build-installer    aowlspt-install.exe
   test               every gate
   doctor             check the toolchain before it wastes your afternoon
   run PATH           build a mod and run it in the simulator
   payload            assemble installer/payload from what is built
+  release            a versioned, verifiable artifact; --mod NAME for one mod
+  importdb           build the emulator's db.json from an SPT install
+                     (--from D:\SPT; --help for the rest)
   clean              remove build output
 
 Options
@@ -256,14 +259,52 @@ proc placeLibrary(dir, stem, outPath: string): bool =
 
 # --------------------------------------------------------------- hosts
 
+proc simExe(e: Env): string =
+  ## One place that knows where the simulator lands, because three callers ask.
+  result = joinPath(e.repo, "host\\Aowlspt.Sim\\bin\\aowlspt-sim.exe")
+
 proc buildHosts(e: Env): bool =
+  ## The simulator. It used to be C# -- the last C# host in the repo -- and it
+  ## is a nimony host now, built out of the same `host/common` loader the
+  ## backend and the client host use. It wants three source trees the other
+  ## tools do not: `host/common` for the loader, the store and the JSON path
+  ## reader, and `backend` for `jsondb`, so that `--db` and `db_patch` mean
+  ## here exactly what they mean on the server.
+  let dir = joinPath(e.repo, "host\\Aowlspt.Sim")
+  let source = joinPath(dir, "aowlsim.nim")
+  if not fileExists(source):
+    err "no aowlsim.nim under " & dir
+    inc failures
+    return false
+  discard ensureDir(joinPath(dir, "bin"))
+  let outPath = simExe(e)
+  discard removeFileAt(outPath)
+
+  var cmd = quoted(nimonyExe(e))
+  cmd.add " c"
+  cmd.add abiInclude(e)
+  if e.debugBuild:
+    cmd.add " -d:debug"
+  cmd.add " -p:" & quoted(joinPath(e.repo, "host\\common"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "backend"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
+  cmd.add " -o:" & quoted(outPath)
+  cmd.add " " & quoted(source)
+  result = run(e, "aowlspt-sim", cmd, dir)
+
+proc buildDotnetTools(e: Env): bool =
+  ## What is left of the .NET side: `tools/SptReflect`, which reads SPT's
+  ## assemblies with `MetadataLoadContext` and is the only thing that
+  ## regenerates `reference/`. It stays C# because the thing it does is read
+  ## .NET metadata, and it stays in the gate so that it keeps compiling.
   let sln = joinPath(e.repo, "aowlspt.sln")
   if not fileExists(sln):
     err "no aowlspt.sln at " & e.repo
     inc failures
     return false
   let config = if e.debugBuild: "Debug" else: "Release"
-  result = run(e, "hosts (" & config & ")",
+  result = run(e, "the .NET tools (" & config & ")",
                "dotnet build " & quoted(sln) & " -c " & config & " --nologo -v q")
 
 # --------------------------------------------------------------- il2cpp
@@ -298,6 +339,66 @@ proc buildIl2CppHost(e: Env): bool =
   if not run(e, "aowlspt-host-il2cpp", cmd, dir):
     return false
   result = placeLibrary(dir, "aowlhost", outPath)
+
+proc buildOverlayTests(e: Env): bool =
+  ## The overlay's four test binaries. This used to be
+  ## `host/Aowlspt.Overlay/build.ps1`; it is here now because the repo has one
+  ## toolchain, not two.
+  ##
+  ## They are built beside their sources rather than into `installer\build`:
+  ## `overlayhost.exe` writes screenshots into `tests\overlayhost\shots` and
+  ## reads nothing else, and none of the three ships.
+  ##
+  ##  * `overlayhost.exe` -- a D3D11 application that stands in for Tarkov.
+  ##    Links d3d11/dxgi/user32 because *it* renders; the overlay itself does
+  ##    not, which is what `linkprobe.exe` is for.
+  ##  * `linkprobe.exe` -- the same header with **no** graphics library on the
+  ##    command line. If a future edit grows a direct call to an imported
+  ##    function this stops linking, and the injected host would have gained a
+  ##    load-time dependency that fails silently mid-startup.
+  ##  * `overlaynimtest.exe` -- the nimony side of the boundary.
+  ##
+  ## `-Wno-unused-function`: the header is header-only, so a translation unit
+  ## that uses part of it carries the rest as unreferenced statics.
+  let dir = joinPath(e.repo, "tests\\overlayhost")
+  if not fileExists(joinPath(dir, "overlayhost.c")):
+    err "no overlayhost.c under " & dir
+    inc failures
+    return false
+  let inc = quoted(joinPath(e.repo, "abi"))
+  discard ensureDir(joinPath(dir, "shots"))
+
+  var okAll = run(e, "overlayhost",
+    "gcc -O1 -g -Wno-unused-function -I" & inc & " " &
+    quoted(joinPath(dir, "overlayhost.c")) & " -o " &
+    quoted(joinPath(dir, "overlayhost.exe")) & " -ld3d11 -ldxgi -luser32", dir)
+
+  # The JSON reader on its own, against captured manager bodies: no device, no
+  # sockets, no window. It is where a parser bug is *legible* -- through the
+  # rendered panel the same bug is a blank column in a bitmap.
+  if not run(e, "the overlay reads the manager's JSON",
+    "gcc -O1 -Wno-unused-function -I" & inc & " " &
+    quoted(joinPath(dir, "jsontest.c")) & " -o " &
+    quoted(joinPath(dir, "jsontest.exe")), dir):
+    okAll = false
+  elif not run(e, "overlay json checks", quoted(joinPath(dir, "jsontest.exe")), dir):
+    okAll = false
+
+  if not run(e, "overlay header needs no extra link library",
+    "gcc -O1 -Wno-unused-function -I" & inc & " " &
+    quoted(joinPath(dir, "linkprobe.c")) & " -o " &
+    quoted(joinPath(dir, "linkprobe.exe")), dir):
+    okAll = false
+
+  var cmd = quoted(nimonyExe(e))
+  cmd.add " c"
+  cmd.add abiInclude(e)
+  cmd.add " -p:" & quoted(joinPath(e.repo, "host\\Aowlspt.Overlay"))
+  cmd.add " -o:" & quoted(joinPath(dir, "overlaynimtest.exe"))
+  cmd.add " " & quoted(joinPath(dir, "overlaynimtest.nim"))
+  if not run(e, "overlaynimtest", cmd, dir):
+    okAll = false
+  result = okAll
 
 proc buildBackend(e: Env): bool =
   ## The backend links winsock and zlib; nothing else in the repo does, which
@@ -354,6 +455,23 @@ proc buildPerfBench(e: Env): bool =
   cmd.add " " & quoted(joinPath(e.repo, "tools\\perfbench.nim"))
   result = run(e, "perfbench", cmd, e.repo)
 
+proc buildSoak(e: Env): bool =
+  ## `soak`: the emulator over a long session. Same shape as `emutest` -- it
+  ## speaks the client's wire protocol, so it wants `wire.nim` out of the
+  ## backend and the same two libraries.
+  let outDir = joinPath(e.repo, "installer\\build")
+  discard ensureDir(outDir)
+  var cmd = quoted(nimonyExe(e))
+  cmd.add " c"
+  cmd.add abiInclude(e)
+  cmd.add " --passL:-lws2_32 --passL:-lz"
+  cmd.add " -p:" & quoted(joinPath(e.repo, "backend"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
+  cmd.add " -o:" & quoted(joinPath(outDir, "soak.exe"))
+  cmd.add " " & quoted(joinPath(e.repo, "tools\\soak.nim"))
+  result = run(e, "soak", cmd, e.repo)
+
 proc buildEmuTest(e: Env): bool =
   ## Same shape as the probe: it speaks the client's wire protocol, so it wants
   ## `wire.nim` out of the backend and the same two libraries.
@@ -369,6 +487,195 @@ proc buildEmuTest(e: Env): bool =
   cmd.add " -o:" & quoted(joinPath(outDir, "emutest.exe"))
   cmd.add " " & quoted(joinPath(e.repo, "tools\\emutest.nim"))
   result = run(e, "emutest", cmd, e.repo)
+
+proc buildRealTest(e: Env): bool =
+  ## `realtest`: the emulator against an *imported* database rather than the
+  ## fixture. Same shape as `emutest` -- it speaks the client's wire protocol,
+  ## so it wants `wire.nim` out of the backend and the same two libraries.
+  let outDir = joinPath(e.repo, "installer\\build")
+  discard ensureDir(outDir)
+  var cmd = quoted(nimonyExe(e))
+  cmd.add " c"
+  cmd.add abiInclude(e)
+  cmd.add " --passL:-lws2_32 --passL:-lz"
+  cmd.add " -p:" & quoted(joinPath(e.repo, "backend"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
+  cmd.add " -o:" & quoted(joinPath(outDir, "realtest.exe"))
+  cmd.add " " & quoted(joinPath(e.repo, "tools\\realtest.nim"))
+  result = run(e, "realtest", cmd, e.repo)
+
+proc buildStoreCrash(e: Env): bool =
+  ## `storecrash`: kills a process in the middle of a store write. It links the
+  ## store itself rather than driving a server, so it wants `host\\common` on
+  ## the path -- and none of the network libraries, because it never opens a
+  ## socket.
+  let outDir = joinPath(e.repo, "installer\\build")
+  discard ensureDir(outDir)
+  var cmd = quoted(nimonyExe(e))
+  cmd.add " c"
+  cmd.add abiInclude(e)
+  cmd.add " -p:" & quoted(joinPath(e.repo, "host\\common"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
+  cmd.add " -o:" & quoted(joinPath(outDir, "storecrash.exe"))
+  cmd.add " " & quoted(joinPath(e.repo, "tools\\storecrash.nim"))
+  result = run(e, "storecrash", cmd, e.repo)
+
+proc buildFuzzWire(e: Env): bool =
+  ## `fuzzwire`: the same wire, driven with input a client would never send.
+  ## Same shape as `emutest` -- it speaks the protocol through `wire.nim`, and
+  ## below it, so it wants the backend on the path and the same two libraries.
+  let outDir = joinPath(e.repo, "installer\\build")
+  discard ensureDir(outDir)
+  var cmd = quoted(nimonyExe(e))
+  cmd.add " c"
+  cmd.add abiInclude(e)
+  cmd.add " --passL:-lws2_32 --passL:-lz"
+  cmd.add " -p:" & quoted(joinPath(e.repo, "backend"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
+  cmd.add " -o:" & quoted(joinPath(outDir, "fuzzwire.exe"))
+  cmd.add " " & quoted(joinPath(e.repo, "tools\\fuzzwire.nim"))
+  result = run(e, "fuzzwire", cmd, e.repo)
+
+proc buildWsTest(e: Env): bool =
+  ## `wstest`: the notifier websocket, end to end. Same shape as `fuzzwire` --
+  ## it speaks the protocol below `wire.nim`, so it wants the backend on the
+  ## path and the same two libraries.
+  let outDir = joinPath(e.repo, "installer\\build")
+  discard ensureDir(outDir)
+  var cmd = quoted(nimonyExe(e))
+  cmd.add " c"
+  cmd.add abiInclude(e)
+  cmd.add " --passL:-lws2_32 --passL:-lz"
+  cmd.add " -p:" & quoted(joinPath(e.repo, "backend"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
+  cmd.add " -o:" & quoted(joinPath(outDir, "wstest.exe"))
+  cmd.add " " & quoted(joinPath(e.repo, "tools\\wstest.nim"))
+  result = run(e, "wstest", cmd, e.repo)
+
+proc buildLiveCtl(e: Env): bool =
+  ## `livectl`: enables and disables mods on a running backend and checks that
+  ## the routes follow. Same shape as `emutest` -- it drives the server over the
+  ## real wire, so it wants `wire.nim` out of the backend and the same two
+  ## libraries.
+  let outDir = joinPath(e.repo, "installer\\build")
+  discard ensureDir(outDir)
+  var cmd = quoted(nimonyExe(e))
+  cmd.add " c"
+  cmd.add abiInclude(e)
+  cmd.add " --passL:-lws2_32 --passL:-lz"
+  cmd.add " -p:" & quoted(joinPath(e.repo, "backend"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
+  cmd.add " -o:" & quoted(joinPath(outDir, "livectl.exe"))
+  cmd.add " " & quoted(joinPath(e.repo, "tools\\livectl.nim"))
+  result = run(e, "livectl", cmd, e.repo)
+
+proc buildAllMods(e: Env): bool =
+  ## `allmods`: every mod the registry names, in one backend at once. Same
+  ## shape as `emutest` -- it drives the server over the real wire, so it wants
+  ## `wire.nim` out of the backend and the same two libraries. It stages its own
+  ## roots out of the checkout rather than being handed one, because it needs a
+  ## dozen of them: a baseline, a pair and a solo run per mod, and the all-mods
+  ## run every one of those is compared against.
+  let outDir = joinPath(e.repo, "installer\\build")
+  discard ensureDir(outDir)
+  var cmd = quoted(nimonyExe(e))
+  cmd.add " c"
+  cmd.add abiInclude(e)
+  cmd.add " --passL:-lws2_32 --passL:-lz"
+  cmd.add " -p:" & quoted(joinPath(e.repo, "backend"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
+  cmd.add " -o:" & quoted(joinPath(outDir, "allmods.exe"))
+  cmd.add " " & quoted(joinPath(e.repo, "tools\\allmods.nim"))
+  result = run(e, "allmods", cmd, e.repo)
+
+proc buildModResolve(e: Env): bool =
+  ## `modresolve`: the mod manager's rules, with no server under them. Same
+  ## shape as `emutest` minus the network -- it imports `mods\manager\mgr`
+  ## directly and never opens a socket, which is what lets it be exhaustive:
+  ## every verdict, every cycle, and every shape of damaged selection file, in
+  ## a few milliseconds and with nothing to stage.
+  let outDir = joinPath(e.repo, "installer\\build")
+  discard ensureDir(outDir)
+  var cmd = quoted(nimonyExe(e))
+  cmd.add " c"
+  cmd.add abiInclude(e)
+  cmd.add " -p:" & quoted(joinPath(e.repo, "mods\\manager\\mgr"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
+  cmd.add " -o:" & quoted(joinPath(outDir, "modresolve.exe"))
+  cmd.add " " & quoted(joinPath(e.repo, "tools\\modresolve.nim"))
+  result = run(e, "modresolve", cmd, e.repo)
+
+proc buildBench(e: Env): bool =
+  ## `benchbackend`: the load generator. Same shape as `emutest` -- it drives
+  ## the backend over the real wire, so it wants `wire.nim` out of the backend
+  ## and the same two libraries. It is built here rather than by hand because a
+  ## performance number that takes a remembered command line to reproduce is a
+  ## number that stops being reproduced.
+  let outDir = joinPath(e.repo, "installer\\build")
+  discard ensureDir(outDir)
+  var cmd = quoted(nimonyExe(e))
+  cmd.add " c"
+  cmd.add abiInclude(e)
+  cmd.add " --passL:-lws2_32 --passL:-lz"
+  cmd.add " -p:" & quoted(joinPath(e.repo, "backend"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
+  cmd.add " -o:" & quoted(joinPath(outDir, "benchbackend.exe"))
+  cmd.add " " & quoted(joinPath(e.repo, "tools\\benchbackend.nim"))
+  result = run(e, "benchbackend", cmd, e.repo)
+
+proc buildVerifyInstall(e: Env): bool =
+  ## `aowlspt-verify`: points at an installed tree, checks it is coherent, then
+  ## starts its backend on a spare port and drives it over the wire. Same shape
+  ## as `emutest` because it speaks the same protocol.
+  let outDir = joinPath(e.repo, "installer\\build")
+  discard ensureDir(outDir)
+  var cmd = quoted(nimonyExe(e))
+  cmd.add " c"
+  cmd.add abiInclude(e)
+  cmd.add " --passL:-lws2_32 --passL:-lz"
+  cmd.add " -p:" & quoted(joinPath(e.repo, "backend"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
+  cmd.add " -o:" & quoted(joinPath(outDir, "aowlspt-verify.exe"))
+  cmd.add " " & quoted(joinPath(e.repo, "tools\\verifyinstall.nim"))
+  result = run(e, "aowlspt-verify", cmd, e.repo)
+
+proc buildFirstRun(e: Env): bool =
+  ## `firstrun`: the whole first-run path in order -- a synthetic vanilla
+  ## client, payload, install, importdb, verify, the client's boot sequence,
+  ## live mod control, and a restart with the profile still in it. Same shape
+  ## as `emutest` because the last four steps are over the same wire.
+  ##
+  ## Built here, and deliberately **not** run by `aowl test`: a full walk takes
+  ## about three minutes, most of it the real mod set loading a 39 MiB database,
+  ## and a gate that costs three minutes on every run is a gate somebody
+  ## comments out. Run it by hand before a release, and after any change to the
+  ## installer, the payload or the database step:
+  ##
+  ##     installer\build\firstrun.exe --scratch C:\scratch\firstrun
+  ##
+  ## It exits 0 with an explanation when there is no SPT install to import a
+  ## database from, which is most machines.
+  let outDir = joinPath(e.repo, "installer\\build")
+  discard ensureDir(outDir)
+  var cmd = quoted(nimonyExe(e))
+  cmd.add " c"
+  cmd.add abiInclude(e)
+  cmd.add " --passL:-lws2_32 --passL:-lz"
+  cmd.add " -p:" & quoted(joinPath(e.repo, "backend"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
+  cmd.add " -o:" & quoted(joinPath(outDir, "firstrun.exe"))
+  cmd.add " " & quoted(joinPath(e.repo, "tools\\firstrun.nim"))
+  result = run(e, "firstrun", cmd, e.repo)
 
 proc buildTool(e: Env; source, exeName, label: string): bool =
   ## The nimony command-line tools. All of them want the ABI include path and
@@ -509,14 +816,21 @@ proc dropStaleCaches(e: Env) =
 
 proc cmdBuild(e: Env): int =
   dropStaleCaches(e)
-  heading "Hosts (.NET)"
+  heading "Simulator"
   discard buildHosts(e)
+  discard buildDotnetTools(e)
   heading "Host (IL2CPP, native)"
   discard buildIl2CppHost(e)
+  discard buildOverlayTests(e)
   heading "Backend"
   discard buildBackend(e)
   discard buildProbe(e)
   discard buildEmuTest(e)
+  discard buildRealTest(e)
+  discard buildSoak(e)
+  discard buildBench(e)
+  discard buildVerifyInstall(e)
+  discard buildFirstRun(e)
   discard buildPerfBench(e)
   heading "Tools"
   discard buildInstaller(e)
@@ -622,8 +936,9 @@ proc cmdTest(e: Env): int =
   if run(e, "compile abi_layout.nim", cmd):
     discard run(e, "abi_layout (nimony)", quoted(nimExe))
 
-  heading "Hosts"
+  heading "Simulator"
   discard buildHosts(e)
+  discard buildDotnetTools(e)
 
   heading "Installer"
   if buildInstallerTests(e):
@@ -637,6 +952,26 @@ proc cmdTest(e: Env): int =
          quoted(detourExe) & " " &
          quoted(joinPath(testsDir, "detour_test.c"))):
     discard run(e, "detour_test", quoted(detourExe))
+
+  # And the same engine with the patch moving underneath the callers. Six
+  # threads call a patched function while another installs and removes the
+  # patch, and it asserts on the **answers**: a vectored handler turns an
+  # access violation into a counted, classified number instead of a dead
+  # process, and every worker checks every return against what the function
+  # must produce.
+  #
+  # Before the trampoline was retired rather than freed, this reported 1726
+  # faults inside unmapped memory and 328 calls answered with a zero the method
+  # never returns -- five runs out of five. `detour_test` above passed
+  # throughout: it installs, fires and removes in one thread, which is the one
+  # arrangement in which freeing a trampoline is safe.
+  let raceExe = joinPath(testsDir, "detour_race.exe")
+  if run(e, "compile detour_race.c",
+         "gcc -I" & quoted(joinPath(e.repo, "abi")) & " -O1 -o " &
+         quoted(raceExe) & " " &
+         quoted(joinPath(testsDir, "detour_race.c"))):
+    discard run(e, "a patch installed and removed under live callers never " &
+                   "answers wrongly", quoted(raceExe))
 
   heading "IL2CPP host"
   let haveHost = buildIl2CppHost(e)
@@ -699,7 +1034,122 @@ proc cmdTest(e: Env): int =
       if buildPerfBench(e):
         discard run(e, "the fast path is measurably faster",
                     quoted(joinPath(e.repo, "installer\\build\\perfbench.exe")) &
-                    " --runtime " & quoted(mockDll) & " --check")
+                    " --runtime " & quoted(mockDll))
+
+      # And the same host under churn. Everything above proves it can do a
+      # thing once; this proves it can stop doing it -- a mod loaded and
+      # unloaded, detours installed and removed past the size of the slot pool,
+      # handles taken and given back, and every host table sampled as it goes
+      # and judged on its *trend*. A leak is a slope, and the failures it finds
+      # are the ones that end a raid rather than a launch.
+      #
+      # Its own stage, with clientprobe and nothing else in it: `highlevel`
+      # patches almost every compiled method the mock has, and the churn run
+      # needs three of them for itself.
+      #
+      # A hundred and twenty rounds, which is about five seconds on top of the
+      # boot and the stall check. That is enough to prove every trend is flat
+      # and not enough to be a claim about a session; the run says so itself in
+      # its last line, and `--churn 2000` is what to type when it matters.
+      let churnStage = joinPath(e.repo, "installer\\build\\churnstage")
+      discard winfs.removeTree(churnStage)
+      discard ensureDir(joinPath(churnStage, "mods\\clientprobe"))
+      discard copyFileAt(
+        joinPath(e.repo,
+                 "host\\Aowlspt.Host.Il2Cpp\\bin\\aowlspt-host-il2cpp.dll"),
+        joinPath(churnStage, "aowlspt-host-il2cpp.dll"))
+      discard copyFileAt(
+        joinPath(e.repo, "examples\\clientprobe\\bin\\clientprobe.dll"),
+        joinPath(churnStage, "mods\\clientprobe\\clientprobe.dll"))
+      discard writeTextFile(joinPath(churnStage, "aowlspt-host.json"),
+                            "{\n  \"waitForRuntimeMs\": 2000\n}\n")
+      discard run(e, "nothing the host holds grows with the cycle count",
+                  harness & " " & quoted(churnStage) & " --runtime " &
+                  quoted(mockDll) & " --churn 120")
+
+  # The mod manager's rules, with nothing under them. Nothing is staged and
+  # nothing is started: `modresolve` imports the manager's own `mgr` modules
+  # and drives the resolver over registries it builds in memory -- every
+  # verdict, every kind of cycle, every shape of damaged selection file -- so
+  # it can be exhaustive where `livectl`, which needs a backend and three
+  # built mods, is necessarily a scenario. It runs before anything is started,
+  # because a resolver failure explains a `livectl` failure and not the other
+  # way round, and because a test that needs no process is a test people run.
+  heading "The mod manager's rules"
+  if buildModResolve(e):
+    discard run(e, "the resolver, the manifest reader and the selection " &
+                   "store answer for every case",
+                quoted(joinPath(e.repo, "installer\\build\\modresolve.exe")))
+
+  # And what the manager refuses to *write down*, which is a different
+  # question from what it resolves. Its worst failure was resolving nothing out
+  # of a broken input and then recording that as the player's selection: the
+  # next start loaded one mod out of ten, silently. A three-byte UTF-8 BOM on
+  # `config.json` was enough, and Notepad writes one by default.
+  #
+  # Every check in here is a **pair** -- the input that must be refused and the
+  # nearest input that must not be -- so a guard answering "" for everything,
+  # or a sentence for everything, fails rather than passing quietly. Six
+  # deliberate mutations of the guards were run against it and none escaped.
+  let mgrGuardExe = joinPath(e.repo, "installer\\build\\mgrguard.exe")
+  var mgCmd = quoted(nimonyExe(e))
+  mgCmd.add " c"
+  mgCmd.add abiInclude(e)
+  mgCmd.add " -p:" & quoted(joinPath(e.repo, "mods\\manager\\mgr"))
+  mgCmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
+  mgCmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
+  mgCmd.add " -o:" & quoted(mgrGuardExe)
+  mgCmd.add " " & quoted(joinPath(e.repo, "tests\\mgrguard\\mgrguard.nim"))
+  if run(e, "mgrguard builds", mgCmd, e.repo):
+    discard run(e, "the manager will not write a selection it resolved out of " &
+                   "a broken input", quoted(mgrGuardExe))
+
+  # And the other half of live control: what the **client** host says came of a
+  # request. It drives `modcontrol`'s ledger directly -- no host, no runtime, no
+  # server -- because the outcomes that matter are the ones a stage cannot
+  # produce on demand: a mod with no teardown against one whose unload failed,
+  # a library whose guid is not the guid asked for, and a row the backend has
+  # stopped naming.
+  #
+  # The rule it exists to protect: there is no encoding for "no answer yet". A
+  # guid with no record is unknown, and unknown may never be read as "off". A
+  # truncated report, an old host and a host that has not polled all converge
+  # on absence, so absence has to stay meaningless.
+  let modReportExe = joinPath(e.repo, "installer\\build\\modreport.exe")
+  var mrCmd = quoted(nimonyExe(e))
+  mrCmd.add " c"
+  mrCmd.add abiInclude(e)
+  mrCmd.add " -p:" & quoted(joinPath(e.repo, "host\\common"))
+  mrCmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
+  mrCmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
+  mrCmd.add " -o:" & quoted(modReportExe)
+  mrCmd.add " " & quoted(joinPath(e.repo, "tests\\modreport\\modreport.nim"))
+  if run(e, "modreport builds", mrCmd, e.repo):
+    discard run(e, "the client host's outcome report says what happened and " &
+                   "never says it twice", quoted(modReportExe))
+
+  # The reading half of the same protocol. Two programs, two gates: `modreport`
+  # proves the host produces the wire and `modclient` proves the manager reads
+  # it, and neither can cover for the other being wrong.
+  #
+  # What it is really guarding is the absence rule. There is no encoding for
+  # "no answer yet" -- a row the rotation has not reached, a host that has not
+  # polled, a process that has been replaced all arrive as *nothing* -- and the
+  # manager may never render that as "off". Six of its checks fail the moment
+  # absence is read as a negative, which is exactly the collapse this project
+  # keeps shipping.
+  let modClientExe = joinPath(e.repo, "installer\\build\\modclient.exe")
+  var mcCmd = quoted(nimonyExe(e))
+  mcCmd.add " c"
+  mcCmd.add abiInclude(e)
+  mcCmd.add " -p:" & quoted(joinPath(e.repo, "mods\\manager\\mgr"))
+  mcCmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
+  mcCmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
+  mcCmd.add " -o:" & quoted(modClientExe)
+  mcCmd.add " " & quoted(joinPath(e.repo, "tests\\modclient\\modclient.nim"))
+  if run(e, "modclient builds", mcCmd, e.repo):
+    discard run(e, "the manager reads that report and never reads silence " &
+                   "as a no", quoted(modClientExe))
 
   heading "Backend"
   let haveBackend = buildBackend(e)
@@ -733,6 +1183,165 @@ proc cmdTest(e: Env): int =
                 quoted(joinPath(e.repo, "backend\\bin\\aowlspt-backend.exe")) &
                 " --root " & quoted(bstage) & " --port 6974 --selftest")
 
+    # And the database under concurrent readers and writers, which nothing else
+    # here can see. Every other backend gate drives one connection at a time,
+    # so a reader copying 12.5 MB out of a buffer a patch is reallocating
+    # underneath it survives all of them -- the answer is wrong or the process
+    # is gone, and neither shows up in a sequential run.
+    #
+    # It asserts on **answers**, not on survival: values nothing patches must
+    # come back byte-identical, a patched value must be the old text or the new
+    # one and never a splice of both, and a path that exists must never report
+    # missing. Surviving a race proves nothing; a 404 for an item template is
+    # what the player would actually see.
+    let dbRaceExe = joinPath(e.repo, "backend\\bin\\dbrace.exe")
+    var drCmd = quoted(nimonyExe(e))
+    drCmd.add " c"
+    drCmd.add abiInclude(e)
+    drCmd.add " --passL:-lws2_32 --passL:-lz"
+    drCmd.add " -p:" & quoted(joinPath(e.repo, "backend"))
+    drCmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
+    drCmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
+    drCmd.add " -o:" & quoted(dbRaceExe)
+    drCmd.add " " & quoted(joinPath(e.repo, "backend\\dbrace.nim"))
+    if run(e, "dbrace builds", drCmd, e.repo):
+      discard run(e, "concurrent readers and writers on one database never " &
+                     "see a wrong answer",
+                  quoted(dbRaceExe) & " --readers 16 --writers 4 --seconds 8")
+
+    # And the client that lies about how long its body is. `fuzzwire` covers
+    # hostile *requests*; this covers hostile **framing**, which is a different
+    # failure: when the framer and the parser agree on a wrong length, nothing
+    # inside the server notices anything at all.
+    #
+    # It found a request-smuggling primitive. `Content-Length: 5abc` was read
+    # as far as it parsed and the rest discarded -- by both sides identically
+    # -- so the value was zero, the body was not consumed, and the bytes the
+    # client sent as a body began the *next* request on the connection. One
+    # keep-alive connection carrying `5abc` + `hello` + a well-formed request
+    # came back with two answers, the second a 400 for a request line made out
+    # of the first one's body. `-1`, `+5` and `0x10` gave two 200s.
+    #
+    # So the assertion that matters is not "did it survive" but **how many
+    # answers came back**, counted by parsing each response's own
+    # `Content-Length` out of the stream. 14 of its 102 checks fail against the
+    # code as it was.
+    let frameLenExe = joinPath(e.repo, "backend\\bin\\framelen.exe")
+    var flCmd = quoted(nimonyExe(e))
+    flCmd.add " c"
+    flCmd.add abiInclude(e)
+    flCmd.add " --passL:-lws2_32 --passL:-lz"
+    flCmd.add " -p:" & quoted(joinPath(e.repo, "backend"))
+    flCmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
+    flCmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
+    flCmd.add " -o:" & quoted(frameLenExe)
+    flCmd.add " " & quoted(joinPath(e.repo, "backend\\framelen.nim"))
+    if run(e, "framelen builds", flCmd, e.repo):
+      # The emulator has to be in the stage. `framelen` decides the server is
+      # up by asking `/client/game/config` -- an ordinary request, because a
+      # framing test that cannot ask an ordinary question cannot tell a refused
+      # frame from a dead server. With no mod staged, nothing answers that
+      # route and the run reports "the backend never came up" about a backend
+      # that came up perfectly.
+      let flStage = joinPath(e.repo, "installer\\build\\framestage")
+      discard winfs.removeTree(flStage)
+      discard ensureDir(joinPath(flStage, "mods\\tarkov"))
+      discard copyFileAt(joinPath(e.repo, "tests\\fixtures\\emu-full.json"),
+                         joinPath(flStage, "db.json"))
+      discard copyFileAt(
+        joinPath(e.repo, "mods\\tarkov\\bin\\tarkov.dll"),
+        joinPath(flStage, "mods\\tarkov\\tarkov.dll"))
+      if fileExists(joinPath(e.repo, "mods\\tarkov\\config.json")):
+        discard copyFileAt(
+          joinPath(e.repo, "mods\\tarkov\\config.json"),
+          joinPath(flStage, "mods\\tarkov\\config.json"))
+      discard run(e, "a lying Content-Length cannot smuggle a second request",
+                  quoted(frameLenExe) & " --root " & quoted(flStage) &
+                  " --backend " & quoted(joinPath(e.repo,
+                    "backend\\bin\\aowlspt-backend.exe")) &
+                  " --port 6983")
+
+    # And the mod taken away while workers are inside it. This is the shape no
+    # socket-driven gate can see: `matchRoute` copies a route out under the
+    # registration lock and lets go -- deliberately, because a handler may
+    # register a route and holding the lock across the call would wait on
+    # itself -- so from that point a worker carries a function pointer into a
+    # library with nothing holding it open. `livectl` toggles mods *between*
+    # requests, so its unloads never overlap a handler.
+    #
+    # Unguarded, this faults 16 workers out of 16 at 0xc0000005 inside the
+    # freed image, five runs out of five. It also catches the quieter half: a
+    # late call landing in the *next* incarnation at the same base address
+    # never faults at all, so every reply carries a generation and a stale
+    # answer is counted rather than passing as a good one.
+    let raceModDll = joinPath(e.repo, "backend\\bin\\racemod.dll")
+    let modRaceExe = joinPath(e.repo, "backend\\bin\\modrace.exe")
+    if run(e, "compile racemod.c",
+           "gcc -O1 -shared -I" & quoted(joinPath(e.repo, "abi")) & " -o " &
+           quoted(raceModDll) & " " &
+           quoted(joinPath(e.repo, "backend\\racemod.c"))):
+      var mrcCmd = quoted(nimonyExe(e))
+      mrcCmd.add " c"
+      mrcCmd.add abiInclude(e)
+      mrcCmd.add " --passL:-lws2_32 --passL:-lz"
+      mrcCmd.add " -p:" & quoted(joinPath(e.repo, "backend"))
+      mrcCmd.add " -p:" & quoted(joinPath(e.repo, "host\\common"))
+      mrcCmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
+      mrcCmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
+      mrcCmd.add " -o:" & quoted(modRaceExe)
+      mrcCmd.add " " & quoted(joinPath(e.repo, "backend\\modrace.nim"))
+      if run(e, "modrace builds", mrcCmd, e.repo):
+        discard run(e, "a mod unloaded under live callers never answers from " &
+                       "a freed library", quoted(modRaceExe) &
+                    " --cycles 24 --workers 16")
+
+    # And the SDK's own scheduler table, which every mod links and which no
+    # host can protect. `claimTick`/`releaseTick` run on whatever thread a mod's
+    # handler runs on; `tickTrampoline` runs on the host's drain thread. One
+    # scheduling thread against one draining thread -- which is exactly the
+    # client host's shape, `on_update` plus the game thread -- died inside two
+    # seconds on a seq bounds assertion; two or more corrupted the heap.
+    #
+    # The quiet failure is the one to keep in mind: two claims handed the same
+    # slot means one mod callback runs twice and another never runs at all. A
+    # timer that silently stopped, not a crash.
+    let tickRaceExe = joinPath(e.repo, "installer\\build\\tickrace.exe")
+    var trCmd = quoted(nimonyExe(e))
+    trCmd.add " c"
+    trCmd.add abiInclude(e)
+    trCmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
+    trCmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
+    trCmd.add " -o:" & quoted(tickRaceExe)
+    trCmd.add " " & quoted(joinPath(e.repo, "tests\\tickrace.nim"))
+    if run(e, "tickrace builds", trCmd, e.repo):
+      discard run(e, "the scheduler hands out no slot twice and loses no " &
+                     "callback", quoted(tickRaceExe) &
+                  " --sched 8 --drains 4 --seconds 4")
+
+    # And the SDK's *registration* tables, which are the same shape one table
+    # over: `seq.add handler` then `toCookie(len - 1)` is check-then-act, so two
+    # threads both read the second index and `/a` is served by `/b`'s handler
+    # while `/a`'s is unreachable. A wrong answer with no log line.
+    #
+    # "Register during on_load only" would have made a lock unnecessary and is
+    # **not true of this repository**: `examples/clientprobe` patches from
+    # `on_update` after waiting for EFT's assemblies, and `examples/lesson` arms
+    # nine hooks on the first tick its types resolve. A type that does not exist
+    # yet cannot be hooked at load. So the tables are filled to capacity once
+    # and never move -- a lock pair is 25-27 ns against a 21.8 ns typed prefix
+    # and would more than double the path.
+    let regRaceExe = joinPath(e.repo, "installer\\build\\regrace.exe")
+    var rrCmd = quoted(nimonyExe(e))
+    rrCmd.add " c"
+    rrCmd.add abiInclude(e)
+    rrCmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
+    rrCmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
+    rrCmd.add " -o:" & quoted(regRaceExe)
+    rrCmd.add " " & quoted(joinPath(e.repo, "tests\\regrace.nim"))
+    if run(e, "regrace builds", rrCmd, e.repo):
+      discard run(e, "every registration is reached by the handler it named",
+                  quoted(regRaceExe))
+
     # And the emulator, driven the way the client drives it: the boot sequence
     # in order, then a restart to prove the profile store is a store rather
     # than a cache.
@@ -765,9 +1374,269 @@ proc cmdTest(e: Env): int =
                       "backend\\bin\\aowlspt-backend.exe")) &
                     " --port 6975")
 
+    # And the same emulator against a *real* database, when there is one.
+    #
+    # Everything above this point runs on `tests/fixtures/emu-full.json`, and
+    # every check in `emutest` and `soak` names an id out of it -- which is what
+    # makes them exact and what makes them silent about the tables a player
+    # actually plays on. `realtest` discovers its ids from the answers instead:
+    # whichever trader has the cheapest rouble offer, whichever quest has no
+    # prerequisite, whichever map the locations table lists first. It asserts
+    # shape and cross-reference rather than identity, and it prints what it
+    # exercised.
+    #
+    # It is skipped -- plainly, with the command that produces one -- when there
+    # is no imported database, because building one needs an SPT install that
+    # most machines running this do not have.
+    heading "Real data"
+    let realDb = joinPath(e.repo, "build\\db\\db.json")
+    if not fileExists(realDb):
+      note "skipped: no imported database at " & realDb
+      note "  produce one with:  aowl importdb --from D:\\SPT"
+    else:
+      let rstage = joinPath(e.repo, "installer\\build\\realstage")
+      discard winfs.removeTree(rstage)
+      discard ensureDir(joinPath(rstage, "mods\\tarkov"))
+      if buildRealTest(e) and buildMod(e, joinPath(e.repo, "mods\\tarkov")):
+        discard copyFileAt(
+          joinPath(e.repo, "mods\\tarkov\\bin\\tarkov.dll"),
+          joinPath(rstage, "mods\\tarkov\\tarkov.dll"))
+        if fileExists(joinPath(e.repo, "mods\\tarkov\\config.json")):
+          discard copyFileAt(
+            joinPath(e.repo, "mods\\tarkov\\config.json"),
+            joinPath(rstage, "mods\\tarkov\\config.json"))
+        discard run(e, "the emulator serves a real database",
+                    quoted(joinPath(e.repo, "installer\\build\\realtest.exe")) &
+                    " --root " & quoted(rstage) &
+                    " --db " & quoted(realDb) &
+                    " --backend " & quoted(joinPath(e.repo,
+                      "backend\\bin\\aowlspt-backend.exe")) &
+                    " --port 6978")
+
+    # And the same server driven by a client that is lying. `emutest` proves it
+    # is right when it is asked politely; this proves it cannot be crashed,
+    # wedged, or made to leave a profile the next request cannot read. Its own
+    # stage, because half of what it does is deliberately corrupt a profile and
+    # the emulator's checks all assume a clean one.
+    #
+    # A crash here is a crash of the whole server from one request, so it runs
+    # in the gate rather than by hand: the last one was ninety bytes of
+    # `Content-Length`.
+    heading "Hostile input"
+    let fstage = joinPath(e.repo, "installer\\build\\fuzzstage")
+    discard winfs.removeTree(fstage)
+    discard ensureDir(joinPath(fstage, "mods\\tarkov"))
+    if buildFuzzWire(e) and buildMod(e, joinPath(e.repo, "mods\\tarkov")):
+      discard copyFileAt(
+        joinPath(e.repo, "mods\\tarkov\\bin\\tarkov.dll"),
+        joinPath(fstage, "mods\\tarkov\\tarkov.dll"))
+      if fileExists(joinPath(e.repo, "mods\\tarkov\\config.json")):
+        discard copyFileAt(
+          joinPath(e.repo, "mods\\tarkov\\config.json"),
+          joinPath(fstage, "mods\\tarkov\\config.json"))
+      discard copyFileAt(
+        joinPath(e.repo, "tests\\fixtures\\emu-full.json"),
+        joinPath(fstage, "db.json"))
+      discard run(e, "the server survives a hostile client",
+                  quoted(joinPath(e.repo, "installer\\build\\fuzzwire.exe")) &
+                  " --root " & quoted(fstage) &
+                  " --backend " & quoted(joinPath(e.repo,
+                    "backend\\bin\\aowlspt-backend.exe")) &
+                  " --port 6977")
+
+    # And the connection that is *held*. `fuzzwire` proves no request can wedge
+    # the server; this proves the notifier websocket -- the handshake, a
+    # notification provoked through the game's own routes and asserted frame by
+    # frame, every refusal, a client that vanishes without closing, and a
+    # hundred idle sockets held open while ordinary requests are timed behind
+    # them. Its own stage and its own port, because a hundred long-lived
+    # sockets in the fuzz stage would change what those request checks measure.
+    heading "The notifier websocket"
+    let wstage = joinPath(e.repo, "installer\\build\\wsstage")
+    discard winfs.removeTree(wstage)
+    discard ensureDir(joinPath(wstage, "mods\\tarkov"))
+    if buildWsTest(e) and buildMod(e, joinPath(e.repo, "mods\\tarkov")):
+      discard copyFileAt(
+        joinPath(e.repo, "mods\\tarkov\\bin\\tarkov.dll"),
+        joinPath(wstage, "mods\\tarkov\\tarkov.dll"))
+      if fileExists(joinPath(e.repo, "mods\\tarkov\\config.json")):
+        discard copyFileAt(
+          joinPath(e.repo, "mods\\tarkov\\config.json"),
+          joinPath(wstage, "mods\\tarkov\\config.json"))
+      discard copyFileAt(
+        joinPath(e.repo, "tests\\fixtures\\emu-full.json"),
+        joinPath(wstage, "db.json"))
+      discard run(e, "the notifier websocket holds and pushes",
+                  quoted(joinPath(e.repo, "installer\\build\\wstest.exe")) &
+                  " --root " & quoted(wstage) &
+                  " --backend " & quoted(joinPath(e.repo,
+                    "backend\\bin\\aowlspt-backend.exe")) &
+                  " --port 6982")
+
+      # And the same emulator over a long session: 24 closed loops of ordinary
+      # play, each ending where it started, so every check is an equality
+      # rather than a trend. It found the three bugs a single-pass test cannot
+      # see -- a payout that opened a new stack every time, a sale that trusted
+      # the client's `count`, and a mailbox that grew for the life of a profile.
+      #
+      # Its own stage, because every equality it checks is against a baseline
+      # it establishes on its first cycle, and a store left behind by `emutest`
+      # makes that baseline somebody else's.
+      let sstage = joinPath(e.repo, "installer\\build\\soakstage")
+      discard winfs.removeTree(sstage)
+      discard ensureDir(joinPath(sstage, "mods\\tarkov"))
+      discard copyFileAt(
+        joinPath(e.repo, "mods\\tarkov\\bin\\tarkov.dll"),
+        joinPath(sstage, "mods\\tarkov\\tarkov.dll"))
+      if fileExists(joinPath(e.repo, "mods\\tarkov\\config.json")):
+        discard copyFileAt(
+          joinPath(e.repo, "mods\\tarkov\\config.json"),
+          joinPath(sstage, "mods\\tarkov\\config.json"))
+      discard copyFileAt(
+        joinPath(e.repo, "tests\\fixtures\\emu-full.json"),
+        joinPath(sstage, "db.json"))
+      let soak = joinPath(e.repo, "installer\\build\\soak.exe")
+      if fileExists(soak):
+        discard run(e, "the emulator survives a long session",
+                    quoted(soak) & " --root " & quoted(sstage) &
+                    " --backend " & quoted(joinPath(e.repo,
+                      "backend\\bin\\aowlspt-backend.exe")) &
+                    " --port 6976 --cycles 24")
+
+      # And how fast it is, because a performance number that is not
+      # re-measured stops being true and nothing announces it. `benchbackend`
+      # drives the client's own mix -- the big static tables, a profile read, a
+      # keepalive, and a burst of inventory moves -- over real sockets and real
+      # zlib framing, and `--floor` fails the build under a rate.
+      #
+      # The floor is set well under what this machine does, and is a check
+      # against a regression of *kind* rather than a benchmark of the hardware:
+      # a per-byte copy reintroduced, a compressed-body cache that has stopped
+      # hitting, a store that has gone back to opening a file per read. Each of
+      # those halves the number or worse. A slower machine should still clear
+      # it; a machine that cannot is better off being told.
+      #
+      # A small database and few rounds, because this runs on every `aowl test`
+      # and the shape of the curve is what PERF-SERVER.md is for.
+      #
+      # The floor was 800 and is 500, because the premise under it changed: a
+      # store write used to be an in-place overwrite through an open handle,
+      # about 20 us, and is now a durable commit -- a temporary file renamed
+      # over the key -- at about a millisecond, which is what makes a profile
+      # survive the server being killed (docs/BACKEND.md, "What survives a
+      # crash"). `items/moving`, the write-heavy endpoint, went from 0.44 ms to
+      # about 1.1, and the whole mix from ~1500 requests a second to ~800.
+      # Leaving the floor at 800 makes this fail on a busy machine and pass on
+      # a quiet one, which is a gate nobody trusts. At 500 it still catches
+      # every regression of kind named above -- each of those halves the number
+      # or worse -- and it is still six times what a game client asks for
+      # across a whole session.
+      let benchstage = joinPath(e.repo, "installer\\build\\benchstage")
+      let bench = joinPath(e.repo, "installer\\build\\benchbackend.exe")
+      if buildBench(e) and fileExists(bench):
+        discard run(e, "the backend still serves at speed",
+                    quoted(bench) & " --root " & quoted(benchstage) &
+                    " --backend " & quoted(joinPath(e.repo,
+                      "backend\\bin\\aowlspt-backend.exe")) &
+                    " --mod " & quoted(joinPath(e.repo,
+                      "mods\\tarkov\\bin\\tarkov.dll")) &
+                    " --config " & quoted(joinPath(e.repo,
+                      "mods\\tarkov\\config.json")) &
+                    " --port 6977 --items 1000 --rounds 6 --warmup 2" &
+                    " --moves 15 --keepalive --floor 500" &
+                    " --label \"aowl test\"")
+
+    # And the mod manager, driven the way the panel drives it: a mod switched
+    # off and back on while the server is answering requests. Its own stage,
+    # because the fixture is a three-mod registry and a selection store, and
+    # sharing `emustage` would have each test's leftovers decide the other's
+    # starting state.
+    heading "Live mod control"
+    let lstage = joinPath(e.repo, "installer\\build\\livectlstage")
+    discard winfs.removeTree(lstage)
+    discard ensureDir(joinPath(lstage, "mods\\manager"))
+    discard ensureDir(joinPath(lstage, "mods\\tarkov"))
+    discard ensureDir(joinPath(lstage, "mods\\gameserver"))
+    let haveLiveCtl = buildLiveCtl(e)
+    let haveManager = buildMod(e, joinPath(e.repo, "mods\\manager"))
+    let haveEmu = buildMod(e, joinPath(e.repo, "mods\\tarkov"))
+    let haveExample = buildMod(e, joinPath(e.repo, "examples\\gameserver"))
+    if haveLiveCtl and haveManager and haveEmu and haveExample:
+      discard copyFileAt(
+        joinPath(e.repo, "mods\\manager\\bin\\manager.dll"),
+        joinPath(lstage, "mods\\manager\\manager.dll"))
+      discard copyFileAt(
+        joinPath(e.repo, "mods\\tarkov\\bin\\tarkov.dll"),
+        joinPath(lstage, "mods\\tarkov\\tarkov.dll"))
+      if fileExists(joinPath(e.repo, "mods\\tarkov\\config.json")):
+        discard copyFileAt(
+          joinPath(e.repo, "mods\\tarkov\\config.json"),
+          joinPath(lstage, "mods\\tarkov\\config.json"))
+      discard copyFileAt(
+        joinPath(e.repo, "examples\\gameserver\\bin\\gameserver.dll"),
+        joinPath(lstage, "mods\\gameserver\\gameserver.dll"))
+      # The registry and the manager's own config are written by the tool
+      # itself: they are its fixture, and the checks it makes name the mods and
+      # the list in them.
+      discard run(e, "a mod can be disabled and enabled while the server runs",
+                  quoted(joinPath(e.repo, "installer\\build\\livectl.exe")) &
+                  " --root " & quoted(lstage) &
+                  " --backend " & quoted(joinPath(e.repo,
+                    "backend\\bin\\aowlspt-backend.exe")) &
+                  " --port 6979")
+
+    # And every mod in the registry, in one backend, which is the configuration
+    # a player installs and the one nothing above this line has ever run.
+    #
+    # Every other gate here loads one mod, or three chosen to make a point. The
+    # failures this one is for all need a second mod to exist: a route the
+    # router refuses because another mod already has it (and `serve` is
+    # `discard`ed everywhere, so nobody is told), a `dbWrite` another mod
+    # overwrites, and a load order the registry states and the loader does not
+    # read. It stages its own roots -- a baseline, a pair and a solo run for
+    # each mod, then all of them together -- so that every route it names has an
+    # owner and every database leaf it names has an author, measured rather than
+    # written down here.
+    heading "Every mod at once"
+    if buildAllMods(e):
+      var built = true
+      for m in modDirs(e):
+        if not buildMod(e, m):
+          built = false
+      if built:
+        discard run(e, "every mod in the registry loads into one backend",
+                    quoted(joinPath(e.repo, "installer\\build\\allmods.exe")) &
+                    " --repo " & quoted(e.repo) &
+                    " --stage " & quoted(joinPath(e.repo,
+                      "installer\\build\\allmodsstage")) &
+                    " --backend " & quoted(joinPath(e.repo,
+                      "backend\\bin\\aowlspt-backend.exe")) &
+                    " --db " & quoted(joinPath(e.repo, "build\\db\\db.json")) &
+                    " --port 6980")
+
+  # A player's profile is the only thing here that cannot be rebuilt, so the
+  # claim that a store write survives a crash is tested by causing one:
+  # `storecrash` writes into the store from a child process and kills it with
+  # `TerminateProcess` at jittered points, then reads the store back and
+  # demands a whole value. It reports how many of those kills landed inside a
+  # commit, so "no torn values" means "none at timings that demonstrably reach
+  # the window" rather than "none observed".
+  #
+  # Its default twelve rounds a phase, not the sixty a coverage claim wants:
+  # this runs on every `aowl test`, on a machine somebody is using for
+  # something else, and fifteen seconds of silent work is what that is worth.
+  # The tool prints the longer command when it has been run the short way. Its
+  # children are spawned without consoles, and it cleans its own stage up.
+  heading "The store under a crash"
+  let cstage = joinPath(e.repo, "installer\\build\\crashstage")
+  discard winfs.removeTree(cstage)
+  if buildStoreCrash(e):
+    discard run(e, "a store write survives the process being killed",
+                quoted(joinPath(e.repo, "installer\\build\\storecrash.exe")) &
+                " --root " & quoted(cstage))
+
   heading "Examples through the simulator"
-  let sim = joinPath(e.repo,
-    "host\\Aowlspt.Sim\\bin\\Release\\net10.0\\aowlspt-sim.exe")
+  let sim = simExe(e)
   let mods = exampleDirs(e)
   for m in mods:
     if buildMod(e, m) and fileExists(sim):
@@ -784,6 +1653,36 @@ proc cmdTest(e: Env): int =
       discard run(e, "sim " & baseName(m),
                   quoted(sim) & " " & quoted(m) & " --side sim --ticks 3")
 
+  # The registry is the only file that claims to know every mod that exists,
+  # and until now nothing checked the claim. Both halves of getting it wrong
+  # are silent: a mod that is built and loaded but absent from `mods.json`
+  # cannot be enabled or disabled by anything, and an entry whose `id` is not
+  # the guid the mod exports puts a second, dead row on the in-game panel
+  # instead of correcting itself. The manager cannot detect either -- it
+  # reports honestly on what it was told, and being told something false is not
+  # a state it can see -- so the check has to live out here, against the source
+  # tree, reading each guid out of the mod's own `exportMod` call.
+  #
+  # It runs after the mods have been through the simulator because those are
+  # the expensive checks and this is the cheap one; a build that gets this far
+  # and fails here has a manifest problem and nothing else, which is worth
+  # being able to read off the last line.
+  heading "The mod registry against the mods"
+  block:
+    let outDir = joinPath(e.repo, "installer\\build")
+    discard ensureDir(outDir)
+    var cmd = quoted(nimonyExe(e))
+    cmd.add " c"
+    cmd.add abiInclude(e)
+    cmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
+    cmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
+    cmd.add " -o:" & quoted(joinPath(outDir, "aowl-regcheck.exe"))
+    cmd.add " " & quoted(joinPath(e.repo, "tools\\regcheck.nim"))
+    if run(e, "aowl-regcheck builds", cmd, e.repo):
+      discard run(e, "every mod has a true registry entry",
+                  quoted(joinPath(outDir, "aowl-regcheck.exe")) &
+                  " --repo " & quoted(e.repo))
+
   heading "Result"
   if failures > 0:
     err $failures & " failed"
@@ -792,16 +1691,47 @@ proc cmdTest(e: Env): int =
     ok "everything passed"
     result = 0
 
-proc cmdRun(e: Env; modPath: string): int =
+proc cmdRun(e: Env; modPath: string; simArgs: string = ""): int =
+  ## `aowl run <mod>` — build it and run it under the simulator.
+  ##
+  ## **The simulator's output is printed, always.** It used to go through
+  ## `run`, which captures output and prints it only when the command fails or
+  ## `-v` is given -- so on a successful run every line the simulator wrote was
+  ## discarded. That is the wrong way round for this command in particular: the
+  ## simulator's whole job is to narrate what a mod did, and an audit of it
+  ## added a dozen warnings ("this config did not parse", "nothing in memory
+  ## crosses a reload", "an installed host would have excluded this mod") that
+  ## were invisible through the one command anybody types. A mod's own
+  ## self-check output was going the same way.
+  ##
+  ## Anything after the mod path is handed to the simulator unchanged, so
+  ## `--watch`, `--db`, `--stubs`, `--route` and `--ticks` are reachable
+  ## without knowing where the binary lives.
   if not buildMod(e, modPath):
     return 1
-  let sim = joinPath(e.repo,
-    "host\\Aowlspt.Sim\\bin\\Release\\net10.0\\aowlspt-sim.exe")
+  let sim = simExe(e)
   if not fileExists(sim):
     err "aowlspt-sim is not built. Run: aowl build-hosts"
     return 1
-  discard run(e, "sim", quoted(sim) & " " & quoted(absolutePathOf(modPath)) &
-                        " --side sim")
+  var cmd = quoted(sim) & " " & quoted(absolutePathOf(modPath))
+  if find(simArgs, "--side") < 0:
+    cmd.add " --side sim"
+  if simArgs.len > 0:
+    cmd.add " " & simArgs
+  if e.verbose:
+    detail cmd
+  var code = -1
+  try:
+    code = execCmd(cmd)
+  except:
+    err "sim: could not start " & sim
+    inc failures
+    return 1
+  if code != 0:
+    err "sim exited " & $code
+    inc failures
+  else:
+    ok "sim"
   result = if failures > 0: 1 else: 0
 
 proc cmdPayload(e: Env): int =
@@ -811,33 +1741,28 @@ proc cmdPayload(e: Env): int =
   ## directory for them would suggest otherwise.
   let payload = joinPath(e.repo, "installer\\payload")
   let dest = joinPath(payload, "aowlspt")
+  # Counted from here rather than from zero: `failures` is a process-wide tally
+  # and one command must not report another's.
+  let failuresAtEntry = failures
   heading "Payload"
 
   discard winfs.removeTree(dest)
   discard ensureDir(dest)
 
-  let serverHost = joinPath(e.repo,
-    "host\\Aowlspt.Host.Server\\bin\\Release\\net10.0")
-  let clientHost = joinPath(e.repo,
-    "host\\Aowlspt.Host.Client\\bin\\Release\\netstandard2.1")
-
+  # No `server/` or `client/` here any more. Both were .NET hosts for a
+  # pre-1.0 SPT -- a Mono BepInEx plugin and a mod for SPT's own C# server --
+  # and neither can load into a post-1.0 install: the client is IL2CPP and the
+  # server is `aowlspt-backend`, both staged below.
   var copied = 0
-  for pair in [(serverHost, "server"), (clientHost, "client")]:
-    let (from1, name) = pair
-    if not isDirectory(from1):
-      warn name & " host is not built; skipping"
-      continue
-    var files: seq[string] = @[]
-    var dirs: seq[string] = @[]
-    collectEntries(from1, files, dirs)
-    for f in files:
-      if copyFileAt(joinPath(from1, f), joinPath(joinPath(dest, name), f)).ok:
-        inc copied
-    say name & " host -> " & joinPath(dest, name)
 
-  # Examples first, then the real mods -- the emulator and the ports, which are
-  # the reason someone installs this at all.
-  var mods = exampleDirs(e)
+  # The real mods only: the emulator and the ports, which are the reason
+  # someone installs this at all.
+  #
+  # `examples/` is deliberately **not** staged. Those mods load and act --
+  # `Backend Example` writes into `templates.items` -- and they exist to be read
+  # and run out of the repo, not to turn up in somebody's game because they
+  # happened to sit in the same tree. `aowl run <example>` runs one.
+  var mods: seq[string] = @[]
   let realMods = modDirs(e)
   for m in realMods:
     mods.add m
@@ -870,7 +1795,29 @@ proc cmdPayload(e: Env): int =
     if fileExists(cfg):
       discard copyFileAt(cfg,
         joinPath(joinPath(joinPath(dest, "mods"), baseName(m)), "config.json"))
+    if not fileExists(joinPath(bin, baseName(m) & ".dll")):
+      # A failure, not a warning. A first-run walk found the shape: `aowl build`
+      # exits 1 on a mod that would not compile, `aowl payload` then stages that
+      # mod's `config.json` and `data/` without its library and exits **0**, and
+      # four commands later `aowlspt-verify` is the first thing to say anything.
+      # A payload that installs a directory nothing loads is not a payload.
+      err "mod " & baseName(m) & " has no library; its config and data would " &
+          "install as a directory nothing loads. Build it first: the payload " &
+          "is only as good as the build under it."
+      inc failures
     say "mod " & baseName(m) & " -> " & joinPath(dest, "mods")
+
+  # The registry: without it the mod manager loads, finds nothing to manage,
+  # and says so only in a log nobody reads until something has already gone
+  # wrong. It rides in under `aowlspt/`, which is where the installer looks
+  # first.
+  let reg = joinPath(e.repo, "registry\\mods.json")
+  if fileExists(reg):
+    if copyFileAt(reg, joinPath(joinPath(dest, "registry"), "mods.json")).ok:
+      inc copied
+      say "registry -> " & joinPath(dest, "registry\\mods.json")
+  else:
+    warn "no registry/mods.json; the mod manager will have nothing to manage"
 
   # The post-1.0 client host and the launcher that puts it in the game. These
   # go at the top of `aowlspt/` rather than under a side directory, because
@@ -882,7 +1829,15 @@ proc cmdPayload(e: Env): int =
       inc copied
       say "IL2CPP client host -> " & joinPath(dest, "aowlspt-host-il2cpp.dll")
   else:
-    warn "the IL2CPP client host is not built; a post-1.0 payload needs it"
+    # A refusal, for the same reason a library-less mod is one, and a bigger
+    # one: a payload without the client host installs a game with nothing in
+    # it. This warned and exited 0 until an install walk found that `aowl
+    # payload` was the only step that would not say no -- `aowl release` and
+    # `aowlspt-verify` both catch it later, so the release path was safe, but
+    # a payload staged by hand and installed straight was not.
+    err "the IL2CPP client host is not built; a post-1.0 payload without it " &
+        "installs a client that loads nothing. Build it first."
+    inc failures
 
   # The backend goes in the payload too: it is half the pipeline, and an
   # install without it has mods that can serve routes and nothing listening.
@@ -892,7 +1847,9 @@ proc cmdPayload(e: Env): int =
       inc copied
       say "backend -> " & joinPath(dest, "aowlspt-backend.exe")
   else:
-    warn "the backend is not built; the install will have no server"
+    err "the backend is not built; the install would have mods that serve " &
+        "routes and nothing listening. Build it first."
+    inc failures
 
   let launcher = joinPath(e.repo, "installer\\build\\aowlspt-launch.exe")
   if fileExists(launcher):
@@ -900,7 +1857,9 @@ proc cmdPayload(e: Env): int =
       inc copied
       say "launcher -> " & joinPath(dest, "aowlspt-launch.exe")
   else:
-    warn "aowlspt-launch is not built; there will be no way to start the game"
+    err "aowlspt-launch is not built; there would be no way to start the " &
+        "game. Build it first."
+    inc failures
 
   # A default the player can edit, rather than a value compiled into the host.
   let hostCfg = joinPath(dest, "aowlspt-host.json")
@@ -908,14 +1867,96 @@ proc cmdPayload(e: Env): int =
     discard writeTextFile(hostCfg,
       "{\n" &
       "  \"//\": \"How long to wait for the game to bring IL2CPP up.\",\n" &
-      "  \"waitForRuntimeMs\": 120000\n" &
+      "  \"waitForRuntimeMs\": 120000,\n" &
+      "\n" &
+      "  \"//backendPort\": \"The aowlspt backend, so the overlay and the " &
+      "in-game mod manager can reach it. 0 means do not try, and the game " &
+      "still runs -- the overlay then shows only what the host itself " &
+      "knows.\",\n" &
+      "  \"backendPort\": 0,\n" &
+      "\n" &
+      "  \"//modSyncMs\": \"How often to ask the backend which client mods " &
+      "should be running, so a mod switched off in the manager is switched " &
+      "off in the game without a restart. 0 turns it off, and it needs " &
+      "backendPort.\",\n" &
+      "  \"modSyncMs\": 3000\n" &
       "}\n")
+
+  let staged = failures - failuresAtEntry
+  if staged > 0:
+    # Deliberately not counted as "mods": the same tally now carries the three
+    # binaries above, and a message that says "2 mod(s)" when one of them is
+    # the backend sends the reader to look at the wrong thing.
+    err $staged & " missing piece(s) above; this payload is not installable"
+    return 1
 
   ok $copied & " files staged in " & dest
   if not fileExists(joinPath(payload, "payload.json")):
     warn "there is still no payload.json here -- copy payload.json.template " &
          "and fill in the version this was built against"
   result = 0
+
+proc cmdRelease(e: Env; extra: seq[string]): int =
+  ## `aowl release` -- builds `tools/release.nim` and hands it this repo plus
+  ## whatever else was typed. Every gate, every refusal and the archive format
+  ## live over there and nothing about them is duplicated here: a release gate
+  ## that lives in two files is a release gate with two answers.
+  let outDir = joinPath(e.repo, "installer\\build")
+  discard ensureDir(outDir)
+  var cmd = quoted(nimonyExe(e))
+  cmd.add " c"
+  cmd.add abiInclude(e)
+  cmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
+  cmd.add " -o:" & quoted(joinPath(outDir, "aowl-release.exe"))
+  cmd.add " " & quoted(joinPath(e.repo, "tools\\release.nim"))
+  if not run(e, "aowl-release builds", cmd, e.repo):
+    return 1
+  var invocation = quoted(joinPath(outDir, "aowl-release.exe"))
+  invocation.add " --repo " & quoted(e.repo)
+  for a in extra:
+    invocation.add " " & quoted(a)
+  var code = -1
+  try:
+    let (o, c) = execCmdEx(invocation, workingDir = e.repo)
+    for l in splitLines(o):
+      echo l
+    code = c
+  except:
+    err "could not start aowl-release"
+    return 1
+  result = code
+
+proc cmdImportDb(e: Env; extra: seq[string]): int =
+  ## `aowl importdb` -- builds `tools/importdb.nim` and hands it this repo plus
+  ## whatever else was typed. Same shape as `release`: the flags, the refusals
+  ## and the conversion itself live over there, because a rule about somebody's
+  ## SPT install that exists in two files is a rule with two answers.
+  let outDir = joinPath(e.repo, "installer\\build")
+  discard ensureDir(outDir)
+  var cmd = quoted(nimonyExe(e))
+  cmd.add " c"
+  cmd.add abiInclude(e)
+  cmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
+  cmd.add " -o:" & quoted(joinPath(outDir, "aowl-importdb.exe"))
+  cmd.add " " & quoted(joinPath(e.repo, "tools\\importdb.nim"))
+  if not run(e, "aowl-importdb builds", cmd, e.repo):
+    return 1
+  var invocation = quoted(joinPath(outDir, "aowl-importdb.exe"))
+  invocation.add " --repo " & quoted(e.repo)
+  for a in extra:
+    invocation.add " " & quoted(a)
+  var code = -1
+  try:
+    let (o, c) = execCmdEx(invocation, workingDir = e.repo)
+    for l in splitLines(o):
+      echo l
+    code = c
+  except:
+    err "could not start aowl-importdb"
+    return 1
+  result = code
 
 proc cmdClean(e: Env): int =
   heading "Clean"
@@ -955,12 +1996,18 @@ proc main(): int =
 
   var command = ""
   var arg = ""
+  var extra: seq[string] = @[]
   var i = 1
   let n = paramCount()
   var help = false
   while i <= n:
     let a = paramStr(i)
-    if a == "--debug":
+    # `release` parses its own options -- `--mod`, `--out`, `--check-only`.
+    # Forwarding everything after the verb verbatim keeps this parser from
+    # having to learn a second command's flags, and keeps them from drifting.
+    if command == "release" or command == "importdb":
+      extra.add a
+    elif a == "--debug":
       e.debugBuild = true
     elif a == "--nimony":
       inc i
@@ -999,15 +2046,29 @@ proc main(): int =
     if arg.len == 0:
       fatal "build-mod needs a path"
     result = if buildMod(e, arg): 0 else: 1
-  of "build-hosts": result = if buildHosts(e): 0 else: 1
+  of "build-hosts":
+    let sim = buildHosts(e)
+    let net = buildDotnetTools(e)
+    result = if sim and net: 0 else: 1
   of "build-installer": result = if buildInstaller(e): 0 else: 1
   of "test": result = cmdTest(e)
   of "doctor": result = cmdDoctor(e)
   of "run":
     if arg.len == 0:
       fatal "run needs a path"
-    result = cmdRun(e, arg)
+    # Everything after the mod path goes to the simulator untouched, so
+    # `aowl run mods\sain --watch` and `--db`/`--stubs`/`--route`/`--ticks`
+    # work without knowing where the binary is. `extra` already excludes
+    # `aowl`'s own flags.
+    var simArgs = ""
+    for a in extra:
+      if a == arg: continue
+      if simArgs.len > 0: simArgs.add " "
+      simArgs.add quoted(a)
+    result = cmdRun(e, arg, simArgs)
   of "payload": result = cmdPayload(e)
+  of "release": result = cmdRelease(e, extra)
+  of "importdb": result = cmdImportDb(e, extra)
   of "clean": result = cmdClean(e)
   else:
     err "unknown command: " & command

@@ -85,8 +85,10 @@ soak -- long-session invariant test for the Tarkov emulator
   Session = "aaaaaaaaaaaaaaaaaaaaaaaa"
   Roubles = "5449016a4bdc2d6f028b456f"
   Trader = "54cb50c76803fa8b248b4571"
-  Assort = "aaaaaaaaaaaaaaaaaaaaaaa1"
-  Rifle = "5644bd2b4bdc2d3b4c8b4572"
+  # The rouble template's own `StackMaxSize`, out of the fixture. A payout that
+  # would take a stack past this has to open another one -- which is the one
+  # case where a new currency stack is correct rather than a leak.
+  RoubleStackMax = 500000
 
 var gFailures = 0
 var gChecks = 0
@@ -108,10 +110,6 @@ proc check(what: string; condition: bool; detail = "") =
   if detail.len > 0:
     note "  " & detail
   inc gFailures
-
-proc pass(what: string) =
-  inc gChecks
-  ok what
 
 proc call(path, body: string): Response =
   gLastRequest = path & " " & (if body.len > 220: body.substr(0, 220) & "..."
@@ -316,6 +314,28 @@ proc storeSize(root: string; files: var int): int64 =
       result = result + n
     inc files
 
+proc storeSnapshot(root: string; names: var seq[string]; sizes: var seq[int]) =
+  ## Every key in the store with its size on disk. Per key rather than one
+  ## total, because "the store grew" is not a bug report -- "the mailbox grew
+  ## and the flea did not" names the subsystem, and the two behave completely
+  ## differently: withdrawn offers are reclaimed and read messages are not.
+  names = @[]
+  sizes = @[]
+  let dir = joinPath(root, "store")
+  if not exists(dir):
+    return
+  var fs: seq[string] = @[]
+  var ds: seq[string] = @[]
+  collectEntries(dir, fs, ds)
+  for f in fs:
+    var name = f
+    let slash = find(f, "\\")
+    if slash >= 0:
+      name = f.substr(slash + 1)
+    names.add name
+    let n = fileSizeOf(joinPath(dir, f))
+    sizes.add (if n > 0'i64: int(n) else: 0)
+
 # ------------------------------------------------------------- invariants
 #
 # Each of these runs after every cycle. They are deliberately cheap: an
@@ -379,6 +399,16 @@ proc checkNoNegativeStacks(items: seq[Item]) =
   check("no stack holds a negative count", n == 0, $n & " negative: " & bad)
 
 proc invariants(items: seq[Item]) =
+  # The list before the invariants over it. All three of them report by absence
+  # -- no id twice, no missing parent, no negative count -- and all three are
+  # true of an empty list. An empty list is exactly what `itemsArray` hands back
+  # for a profile it could not find, or a document whose `Inventory.items` it
+  # could not cut out: a reader that broke would turn every invariant in this
+  # tool green. A profile has a stash, the equipment roots and a rouble stack in
+  # it from the moment it is created.
+  check("there are items in the profile for the invariants to be about",
+        items.len >= 4,
+        $items.len & " items parsed out of the profile document")
   checkNoDuplicates(items)
   checkNoOrphans(items)
   checkNoNegativeStacks(items)
@@ -575,8 +605,12 @@ proc warned(r: Response; text: string): bool =
 var gUid = ""
 var gStash = ""
 var gBaselineItems = -1
+var gBaselineStacks = 0
+var gStacksNow = 0
 var gNullGrowth = 0
 var gRedeemCarried = 0
+var gStore1Names: seq[string] = @[]
+var gStore1Sizes: seq[int] = @[]
 
 proc endRaid(doc: string; outcome: string): Response =
   result = timed("/client/match/local/end",
@@ -617,6 +651,12 @@ proc nullRaid() =
   check("a raid that changed nothing is accepted", r.ok and r.contains("\"err\":0"),
         r.body)
   let after = profileOf(profileList(), gUid)
+  # The document has to be there before its size means anything. `profileOf`
+  # answers "" for a profile it cannot find, and "" is 3863 bytes *smaller* than
+  # the document that went in -- so a raid that lost the profile outright passes
+  # a check on growth, and passes it more comfortably than a correct one.
+  check("the profile is still in the list after the raid", after.len >= 100,
+        $after.len & " bytes came back for " & gUid)
   let grew = after.len - doc.len
   gNullGrowth = gNullGrowth + (if grew > 0: grew else: 0)
   # 16 bytes of slack and not zero: the profile carries timestamps, and one
@@ -749,6 +789,45 @@ proc craft() =
     check("the output can be thrown away again", binned.ok, binned.body)
     check("and it is gone", countOfId(itemsNow(), boltId) == 0, boltId)
 
+proc messageHolding(post, itemId: string): string =
+  ## The id of the mail message that currently holds this item.
+  ##
+  ## `getAllAttachments` answers `{"messages":[{...}]}` -- an array of message
+  ## *objects*. It used to answer an array of JSON **strings**, every key inside
+  ## a message reading `\\"_id\\":\\"` rather than `"_id":"`, because the
+  ## builder quoted each message on the way out. This reader was written against
+  ## that shape; it now reads the real one, and the escaped form would find
+  ## nothing -- which is the right way round, because a soak that silently
+  ## understood the broken encoding is a soak that never reports it.
+  ##
+  ## And it is the message holding *this* item, not the first message in the
+  ## box. The mailbox keeps collected messages for a while, so by the tenth
+  ## cycle the first message is stale, and redeeming out of it would test
+  ## nothing and fail forever.
+  let at = find(post, itemId)
+  if at < 0:
+    return ""
+  # A message object begins `{"_id":"<24>","uid":"`. The `"uid"` is what tells
+  # a message apart from an item object inside one: both start `{"_id":"`, and
+  # picking the wrong one hands the redemption an item id where it wants a
+  # message id.
+  const Start = "{\"_id\":\""
+  var best = ""
+  var i = 0
+  while true:
+    let k = findFrom(post, Start, i)
+    if k < 0 or k > at:
+      break
+    var j = k + Start.len
+    var id = ""
+    while j < post.len and post[j] != '"':
+      id.add post[j]
+      inc j
+    if j + 8 < post.len and post.substr(j, j + 7) == "\",\"uid\":":
+      best = id
+    i = k + 1
+  result = best
+
 proc offerIdFor(price: int): string =
   ## This profile's own listing, found on the flea by the price it was listed
   ## at. Found rather than remembered, because the offer id is minted by the
@@ -770,6 +849,13 @@ proc fleaAndMail(salewaId: string) =
   ## and the redemption path, and must end with the item back where it started
   ## and in the stash exactly once.
   if salewaId.len == 0:
+    # Not a silent return. Everything below -- the listing, the withdrawal, the
+    # mailbox, the redemption and the replay, nine checks of the twelve this
+    # cycle makes about the flea -- would simply not run, and the cycle would
+    # report a smaller number of checks with nothing saying which ones went.
+    check("there is a medkit to take to the flea", false,
+          "the purchase produced no item id, so the flea, the mailbox and the " &
+          "double-redemption check did not run this cycle")
     return
   let listed = moving("{\"Action\":\"RagFairAddOffer\",\"sellInOnePiece\":false," &
     "\"items\":[\"" & salewaId & "\"],\"requirements\":[{\"_tpl\":\"" &
@@ -795,9 +881,10 @@ proc fleaAndMail(salewaId: string) =
 
   # Out of the post and back into the stash, keeping its id.
   let post = timed("/client/mail/dialog/getAllAttachments", "")
-  let msg = jsonText(post.body, "_id")
-  check("the withdrawn item is in the post", msg.len > 0 and
-        find(post.body, salewaId) >= 0, post.body)
+  let msg = messageHolding(post.body, salewaId)
+  check("the withdrawn item is in the post", msg.len == 24, post.body)
+  if msg.len != 24:
+    return
   let took = moving("{\"Action\":\"Move\",\"item\":\"" & salewaId &
     "\",\"fromOwner\":{\"id\":\"" & msg & "\",\"type\":\"Mail\"}," &
     "\"to\":{\"id\":\"" & gStash & "\",\"container\":\"hideout\"}}")
@@ -879,20 +966,75 @@ proc measure(cycle: int) =
   mUsAvg.add avg
   mUsMax.add int(gUsMax)
 
+proc overclaimedSale() =
+  ## Selling one item while claiming to sell five.
+  ##
+  ## Run once, not per cycle, because if it pays out it *creates money* and
+  ## every exact-difference check after it would be measuring a stash this test
+  ## inflated. The invariant is the one the trading module states about itself
+  ## -- "nothing here trusts the client's arithmetic" -- and the only way to
+  ## test a claim like that is to send arithmetic worth not trusting.
+  ##
+  ## The assertion is on the *money*, not on a refusal message. A server may
+  ## legitimately answer this by refusing, or by paying for the one item that
+  ## is actually there; what it may not do is pay for five.
+  let doc = profileOf(profileList(), gUid)
+  var seeded = withItem(doc, lootItem(mkId("beef", 0), Water, gStash, 8, 66))
+  enterRaid()
+  discard endRaid(seeded, "Survived")
+  let before = itemsNow()
+  let id = mkId("beef", 0)
+  if countOfId(before, id) != 1:
+    check("the item to overclaim on is in the stash", false, id)
+    return
+  let had = moneyTotal(before)
+  let r = moving("{\"Action\":\"TradingConfirm\",\"type\":\"sell_to_trader\"," &
+    "\"tid\":\"" & Trader & "\",\"items\":[{\"id\":\"" & id &
+    "\",\"count\":5,\"scheme_id\":0}]}")
+  discard r
+  let paid = moneyTotal(itemsNow()) - had
+  check("selling one item paid for one item, whatever the client claimed",
+        paid <= 15000, "one water bottle sold as five paid " & $paid &
+        ", the handbook price is 15000")
+
+proc largestStack(items: seq[Item]): int =
+  ## The fattest rouble stack, for the failure message. Printed next to the
+  ## stack count because it is what tells the reader which of the two bugs this
+  ## is: a stash full of full stacks is arithmetic, a stash full of stacks of
+  ## fifteen thousand is a merge that never happens.
+  result = 0
+  for it in items:
+    if it.tpl == Roubles and it.count > result:
+      result = it.count
+
 proc runCycle(cycle: int) =
   gCycle = cycle
   resetTiming()
 
   nullRaid()
   let loot = lootRaid(cycle)
+  # Both of these guards used to be a bare `if ... > 0`, which turns a cycle
+  # that could not bring anything home into a cycle that quietly stops checking
+  # sales. The guard stays -- `sellTo("")` would ask the server to sell nothing
+  # and report on the answer to a question nobody asked -- but the skip is now
+  # a failure, because a run that sold nothing has established nothing about
+  # selling.
   if loot.len > 0:
     sellTo(loot, 15000, "what came home")
+  else:
+    check("there is something from the raid to sell", false,
+          "the raid produced no item id; the three checks about selling it " &
+          "did not run this cycle")
   craft()
   let salewa = buySalewa()
   fleaAndMail(salewa)
   questAgain()
   if salewa.len > 0:
     sellTo(salewa, 1100, "the medkit")
+  else:
+    check("there is a medkit to sell back", false,
+          "the purchase produced no item id; the three checks about selling " &
+          "it did not run this cycle")
 
   let items = itemsNow()
   invariants(items)
@@ -903,15 +1045,73 @@ proc runCycle(cycle: int) =
   # the tool: any path that leaves one item behind per cycle fails it on the
   # cycle after the one that introduced it, rather than on the day someone
   # notices their stash is full of ghosts.
+  var goods = 0
+  var stacks = 0
+  for it in items:
+    if it.tpl == Roubles:
+      inc stacks
+    else:
+      inc goods
   if gBaselineItems < 0:
-    gBaselineItems = items.len
-    note "steady state is " & $items.len & " items"
+    gBaselineItems = goods
+    gBaselineStacks = stacks
+    note "steady state is " & $goods & " items and " & $stacks &
+         " currency stacks"
   else:
     check("the item count came back to its steady state",
-          items.len == gBaselineItems,
-          $gBaselineItems & " -> " & $items.len & ": " &
-          firstFew(items, 12))
+          goods == gBaselineItems,
+          $gBaselineItems & " -> " & $goods & ": " & firstFew(items, 12))
+    # Counted apart from the goods, because a currency stack is the one thing
+    # in the stash that a correct server is allowed to *create*: a sale that
+    # will not fit in any existing stack has to open a new one. What it is not
+    # allowed to do is open a new one when an existing stack has room, and the
+    # difference between those two is the difference between a stash with three
+    # rouble stacks in it and a stash with three hundred.
+    #
+    # So the assertion is not "the same number of stacks". A cycle nets about
+    # 15000 roubles, so past 500000 a correct server *must* open a second one,
+    # and by cycle 2 of a run it has. It is that the money is in the *fewest*
+    # stacks it will go in: `ceil(total / StackMaxSize)`, exactly. One more
+    # than that is a stack that was opened while there was room next door,
+    # which is the bug -- the one that put 50 rouble stacks in a stash over 24
+    # cycles, the largest of them 471125 of 500000.
+    #
+    # Nor is it "at most one stack is short of the maximum": paying 1200 out of
+    # a full stack and being paid 1100 back leaves it 100 short for good, and a
+    # second short stack beside it is arithmetic rather than a leak as long as
+    # the two together will not fit in one.
+    let total = moneyTotal(items)
+    var fewest = total div RoubleStackMax
+    if total mod RoubleStackMax != 0:
+      inc fewest
+    if fewest < 1:
+      fewest = 1
+    check("selling does not open a new currency stack while one has room",
+          stacks == fewest,
+          $stacks & " rouble stacks hold " & $total & ", which goes in " &
+          $fewest & " (the largest holds " & $largestStack(items) & " of " &
+          $RoubleStackMax & ")")
+  gStacksNow = stacks
   measure(cycle)
+  if cycle == 1:
+    storeSnapshot(gRoot, gStore1Names, gStore1Sizes)
+    # The baseline the store check at the end is made against, asserted before
+    # anything is compared to it.
+    #
+    # Without this the whole store half of this tool is a comparison between two
+    # empty lists. It is not hypothetical: point `storeSnapshot` at a directory
+    # that is not the one the server writes -- a relative `--root` resolved
+    # twice, a backend that came up in `<root>/<root>` -- and every line of the
+    # report disappears, `grew` stays 0 because there is nothing to add up, and
+    # "the store came back to the size it was" passes with the same check count
+    # and the same green result as a run that measured a real store. A cycle of
+    # play has just written a profile, a scav, a mailbox and the id counter, so
+    # anything under four keys here means this tool is looking in the wrong
+    # place and its answer about leaks is worth nothing.
+    check("the store this run is measuring is the one the server writes to",
+          gStore1Names.len >= 4,
+          $gStore1Names.len & " key(s) under " & joinPath(gRoot, "store") &
+          " after a full cycle of play; nothing below is measuring a store")
 
 # --------------------------------------------------------------------- main
 
@@ -993,6 +1193,20 @@ proc main(): int =
       return 1
     inc i
 
+  # Absolute, before anything uses it.
+  #
+  # The child is started **with its working directory set to the root** and
+  # `--root` on its command line. A relative root is then resolved twice: the
+  # backend joins it to its own new cwd and lands in `<root>/<root>`. That was
+  # live -- `installer/build/gate-fuzzstage/installer/build/gate-fuzzstage/`
+  # exists on disk, with the log and the store in it, while the stage's own top
+  # level has neither -- and it is silent, because the server starts perfectly
+  # well in the wrong place.
+  # Guarded, because `absolutePathOf("")` answers the current directory, and a
+  # run with no `--root` would then quietly point at wherever it was started.
+  if gRoot.len > 0:
+    gRoot = absolutePathOf(gRoot)
+
   if gRoot.len == 0 or backend.len == 0:
     echo Usage
     return 1
@@ -1065,6 +1279,9 @@ proc main(): int =
     discard moving("{\"Action\":\"Remove\",\"item\":\"" & boltId & "\"}")
   ok "the workbench is built and the craft runs"
 
+  heading "What the client claims"
+  overclaimedSale()
+
   heading "Soaking"
   header()
   var c = 1
@@ -1076,6 +1293,68 @@ proc main(): int =
           mStoreFiles[k], mUsAvg[k], mUsMax[k])
     inc c
 
+  if cycles < 2:
+    # The steady-state equality -- the strongest thing this tool asserts -- is
+    # made against a baseline cycle 1 establishes, so it is first *made* on
+    # cycle 2. A one-cycle run still prints "held all N invariants", and that
+    # sentence would be covering for the absence of the check the tool exists
+    # for.
+    note "--cycles 1: the steady-state and currency-stack checks compare a " &
+         "cycle against the baseline the first cycle sets, so neither of them " &
+         "ran. Nothing here says the emulator returns to where it started."
+
+  heading "The store"
+  # The check the flea and the mailbox are here for. Every cycle listed an item
+  # and withdrew it, and collected the withdrawal out of the post -- so every
+  # key the cycle touched was fully consumed, and a store that keeps growing is
+  # a store that is not reclaiming what it wrote. Measured from *after the
+  # first cycle*, so that one-off setup writes are not counted as a leak.
+  var names2: seq[string] = @[]
+  var sizes2: seq[int] = @[]
+  storeSnapshot(gRoot, names2, sizes2)
+  gCycle = cycles
+  # Both halves of the comparison, before it is made. `grew` is a sum over the
+  # keys found now, so an empty list sums to zero and the growth check below
+  # passes without having looked at anything; and a first-cycle baseline this
+  # run never took makes every key read as "new" and its whole size as growth,
+  # which fails for the wrong reason. Neither is allowed to be silent.
+  check("the store still has the keys this run started measuring",
+        names2.len > 0,
+        "nothing under " & joinPath(gRoot, "store") & " at the end of the run")
+  check("there is a first-cycle baseline to compare against",
+        gStore1Names.len > 0, "no snapshot was taken after cycle 1")
+  var grew = 0
+  var i2 = 0
+  while i2 < names2.len:
+    var was = -1
+    for k in 0 ..< gStore1Names.len:
+      if gStore1Names[k] == names2[i2]:
+        was = gStore1Sizes[k]
+    let delta = if was < 0: sizes2[i2] else: sizes2[i2] - was
+    line "  " & pad(names2[i2], 40) & padLeft($sizes2[i2], 9) &
+         " bytes   " & (if delta > 0: "+" else: "") & $delta &
+         (if delta > 0: " over " & $cycles & " cycles" else: " -- reclaimed")
+    if delta > 0:
+      grew = grew + delta
+    inc i2
+  # 64 bytes of slack for timestamps that gained a digit, and 256 more for each
+  # currency stack the profile legitimately gained -- a rouble item is about
+  # 200 bytes of document, and a soak that nets 15000 roubles a cycle is owed
+  # one more stack per 500000 it earns. Nothing else: every cycle put the world
+  # back the way it found it, so the honest expectation for the rest is zero.
+  #
+  # The allowance is there because a check that fails on correct behaviour is a
+  # check somebody turns off, and turning this one off would have hidden the
+  # mailbox that never reclaimed anything.
+  var opened = gStacksNow - gBaselineStacks
+  if opened < 0:
+    opened = 0
+  let allowance = 64 + 256 * opened
+  check("the store came back to the size it was after the first cycle",
+        grew <= allowance,
+        $grew & " bytes of growth across the keys above, against an " &
+        "allowance of " & $allowance & " for " & $opened & " new stack(s)")
+
   heading "Over time"
   trend("profile bytes", mProfileBytes)
   trend("store bytes", mStoreBytes)
@@ -1085,6 +1364,8 @@ proc main(): int =
   trend("request us max", mUsMax)
   note "null raids grew the profile by " & $gNullGrowth &
        " bytes in total over " & $cycles & " cycles"
+  note $gRedeemCarried & " of " & $cycles &
+       " redemptions brought back exactly one item"
 
   if not keep:
     cSpawnKill(server)

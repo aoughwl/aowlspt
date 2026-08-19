@@ -23,6 +23,14 @@ proc patchFired(slot: int32; regs: pointer): int32 {.
   ## is unreachable here.
   0'i32
 
+proc patchReturned(slot: int32; regs: pointer): int32 {.
+  exportc: "aowlspt_nim_patch_returned", cdecl.} =
+  ## The return-side half of the same dispatcher, and unreachable for the same
+  ## reason. Both symbols have to exist in any binary that includes
+  ## `aowlspt_detour.h`, because its thunk pool is emitted whether or not
+  ## anything in the program routes through it.
+  0'i32
+
 proc main() =
   if overlayStart(VkInsert, 0'i32):
     echo "ok    overlay started from nimony"
@@ -51,6 +59,16 @@ proc main() =
 
   if overlayFrames() == 0'i32:
     echo "ok    no frames seen, as expected in a process that never presents"
+
+  # The cost accessors bind and answer. Zero is the correct answer here and the
+  # reason is the point of the check: nothing has been drawn, so nothing has
+  # been measured, and a non-zero figure would mean the counter is reporting
+  # something other than time spent drawing.
+  if overlayFrameNs() == 0'i32 and overlayFrameNsMax() == 0'i32:
+    echo "ok    frame cost reads zero with no frame ever drawn"
+  else:
+    echo "error frame cost is non-zero in a process that never presented"
+    quit 1
 
   overlayStop()
   echo "ok    overlay stopped"

@@ -17,7 +17,17 @@ What it does:
   3. starts `backend/bin/aowlspt-backend.exe --root <stage> --port <p>`,
   4. calls `/aowlspt/mods/panel`, `/aowlspt/mods/toggle/<id>` and `/apply` and
      checks every field the overlay reads is present and the right type,
-  5. writes `panel.golden.json`.
+  5. polls `/aowlspt/mods/client/<ver>` **as the game's host would**, carrying a
+     report, and then checks what the panel says about it,
+  6. writes `panel.golden.json`.
+
+Step 5 is the only way a test run can have a client host at all -- there is no
+game here -- and it is worth being clear about what is real in it. The report is
+hand-written; the route, the parser (`mgr/clientreport.nim`), the arbitration
+(`liveVerdict`) and the panel rows that come back are all the shipping ones. The
+capture it writes therefore carries a real ledger, four rows answered and six
+left alone, which is what lets `fakebackend.py --golden` replay a panel body
+with the `client*` keys in it instead of a body from before they existed.
 
 ## The one thing it cannot do
 
@@ -111,6 +121,15 @@ def check_row(r):
         bad("row %s: restart must be a bool" % r["guid"])
     if "live" not in r:
         bad("row %s: live must be present (null when nothing knows)" % r["guid"])
+    # The overlay draws `KEEP` instead of a button from this flag and refuses
+    # SPACE on it locally, so a manager that stopped sending it would put a
+    # working ON/OFF button on the row that unloads every route this panel
+    # reads. Absent is not false: `aowl_ov_read_panel` deliberately leaves the
+    # flag alone when the key is missing, so an older manager cannot grow a
+    # button -- but a *current* manager must say.
+    if not isinstance(r.get("protected"), bool):
+        bad("row %s: protected must be a bool (the overlay draws KEEP from it)"
+            % r["guid"])
     if r["guid"] != r["id"]:
         bad("row %s: guid and id must be the same string" % r["guid"])
     # The overlay's fixed-width fields. A longer value is not a crash -- the
@@ -120,6 +139,167 @@ def check_row(r):
         bad("row %s: guid does not fit the overlay's 80-byte field" % r["guid"])
     if len(r["version"]) >= 24:
         bad("row %s: version does not fit the overlay's 24-byte field" % r["guid"])
+
+
+# The report one poll from the game's host carries, as `host/common/modcontrol`
+# writes it and `mgr/clientreport.nim` reads it. Sent here by hand because there
+# is no game in a test run -- but it goes in through the real route, is parsed
+# by the real parser, and comes back out of the real `/panel`, which is the
+# whole point: the overlay is then reading a shape nobody wrote for it.
+#
+# Four records and six mods left out, deliberately. The rows that are here cover
+# every state the panel draws differently -- running and settled, not running
+# and settled, wanted-on and skipped, wanted-on and deferred -- and the ones
+# that are not are what proves the panel can say `unknown` about a mod while
+# saying facts about its neighbours. `more=1` says the rest are still coming,
+# which is the difference between "the host has not got to it" and "the host
+# says it is not there".
+CLIENT_SESSION = "a1b2"
+CLIENT_SEQ = 3
+CLIENT_RECORDS = [
+    ("com.savannt.sptsway", "+n", ""),      # running, and where it should be
+    ("aowl.fovfix", "+s", "nofile"),        # wanted on, never attempted
+    ("aowl.classicmovement", "-n", ""),     # wanted off, and off
+    ("aowl.sain", "+d", "noteardown"),      # wanted on, refused live
+]
+
+# Client-only, and deliberately left out of the report above. It is the row that
+# proves the rule: nothing that could answer about it has, so the manager must
+# send `live:null` and the panel must draw `unknown`. A server-side mod cannot
+# stand in for it -- `mgr/control` answers about those, so their `live` is a
+# fact whatever the game says.
+CLIENT_UNMENTIONED = "aowl.perf"
+
+
+def report_as_client(port):
+    """One client-host poll, carrying a report, through the route it rides on."""
+    recs = "!".join(g + "~" + s + (("~" + c) if c else "")
+                    for g, s, c in CLIENT_RECORDS)
+    path = ("/aowlspt/mods/client/1.0.0?hs=%s&sq=%d&r=%s&more=1"
+            % (CLIENT_SESSION, CLIENT_SEQ, recs))
+    status, text, _ = request(port, "GET", path)
+    if status != 200:
+        bad("the client route answered %d to a poll with a report" % status)
+        return
+    doc = json.loads(text)
+    if doc.get("schema") != "aowlspt.clientset/1":
+        bad("the client route did not answer the client set: %r" % doc.get("schema"))
+    else:
+        ok("a client host reported %d rows and got its mod set back unchanged"
+           % len(CLIENT_RECORDS))
+
+
+def check_client(port, doc):
+    """What the panel now carries about the *other* host.
+
+    Every check here is about one rule: absence is not a negative. A row with no
+    `clientLive` is a row nothing has answered about, and the manager must not
+    invent a `false` for it -- if it did, the overlay would grey out every mod
+    the rotation had not reached yet and a player would read that as "your mods
+    are not loading".
+    """
+    for key, want in (("clientHost", True), ("clientSession", CLIENT_SESSION),
+                      ("clientSeq", CLIENT_SEQ), ("clientRows", len(CLIENT_RECORDS)),
+                      ("clientMore", True)):
+        if doc.get(key) != want:
+            bad("panel wrapper %s is %r, expected %r" % (key, doc.get(key), want))
+    ok("the panel wrapper says which client host reported, how much, and that "
+       "there is more coming")
+
+    rows = {r["guid"]: r for r in doc.get("mods") or []}
+    said = [g for g in rows if "clientLive" in rows[g]]
+    quiet = [g for g in rows if "clientLive" not in rows[g]]
+    if not said:
+        bad("no row carries clientLive, so nothing the client host reported "
+            "reached the panel")
+        return
+    if not quiet:
+        bad("every row carries clientLive; nothing is left unknown, so the "
+            "panel's `no answer yet` path has no fixture")
+    else:
+        ok("%d row(s) carry the client host's answer and %d are left with no "
+           "key at all, which is how the panel is told `unknown`"
+           % (len(said), len(quiet)))
+
+    for guid, state, code in CLIENT_RECORDS:
+        r = rows.get(guid)
+        if r is None:
+            bad("%s is not a panel row, so this fixture proves nothing about it"
+                % guid)
+            continue
+        if "clientLive" not in r:
+            bad("%s was reported on and the panel row carries no clientLive"
+                % guid)
+            continue
+        for key in ("clientLive", "clientWant"):
+            if not isinstance(r.get(key), bool):
+                bad("row %s: %s must be a bool" % (guid, key))
+        if not isinstance(r.get("clientOutcome"), str) or not r.get("clientOutcome"):
+            bad("row %s: clientOutcome must be a non-empty string" % guid)
+        # The overlay's fixed fields. Longer is a truncated word on the panel.
+        if len(r.get("clientOutcome", "")) >= 12:
+            bad("row %s: clientOutcome %r does not fit the overlay's 12-byte "
+                "field" % (guid, r["clientOutcome"]))
+        if code:
+            if r.get("clientCode") != code:
+                bad("row %s: clientCode is %r, expected %r"
+                    % (guid, r.get("clientCode"), code))
+            elif len(code) >= 24:
+                bad("row %s: clientCode does not fit the overlay's 24-byte field"
+                    % guid)
+        elif "clientCode" in r:
+            bad("row %s: a settled row carries a clientCode (%r); the slug only "
+                "rides on skipped/refused/on-restart"
+                % (guid, r.get("clientCode")))
+    ok("every reported row carries live/want/outcome, and the slug only where "
+       "there is one")
+
+    # The one that matters most: a mod the client host says is *running* must
+    # come back live, and a mod nobody mentioned must come back null.
+    sway = rows.get("com.savannt.sptsway") or {}
+    if sway.get("clientLive") is not True or sway.get("live") is not True:
+        bad("the client host said com.savannt.sptsway is running and the panel "
+            "answered live=%r clientLive=%r"
+            % (sway.get("live"), sway.get("clientLive")))
+    else:
+        ok("a client-only mod the game says is running comes back live:true, "
+           "which is what stops the overlay greying it")
+    missed = rows.get(CLIENT_UNMENTIONED) or {}
+    if "clientLive" in missed:
+        bad("%s was left out of the report and the panel carries a clientLive "
+            "for it anyway" % CLIENT_UNMENTIONED)
+    elif "live" not in missed:
+        bad("%s has no live key at all" % CLIENT_UNMENTIONED)
+    elif missed["live"] is not None:
+        bad("the panel answered live=%r for %s -- a client-only mod that only "
+            "the game could answer about, and the game has not. Absence has "
+            "become a negative, and the overlay will grey it out"
+            % (missed["live"], CLIENT_UNMENTIONED))
+    else:
+        ok("a client-only mod the report has not reached answers live:null, so "
+           "absence is never drawn as off")
+
+    # And the ledger route. `/panel` withholds the dull rows to keep the body
+    # inside the overlay's 32 KB buffer, so this is the only place the whole
+    # ledger is visible -- and the only place a player can be pointed when a
+    # mod they expected to see has no row on the panel at all.
+    status, text, _ = request(port, "GET", "/aowlspt/mods/clientreport")
+    if status != 200:
+        bad("/aowlspt/mods/clientreport answered %d" % status)
+        return
+    led = json.loads(text)
+    if led.get("schema") != "aowlspt.clientreport/1":
+        bad("clientreport schema is %r" % led.get("schema"))
+    elif not led.get("reporting"):
+        bad("clientreport says nothing has reported, after a report")
+    elif led.get("rows") != len(CLIENT_RECORDS):
+        bad("clientreport holds %r rows, expected %d"
+            % (led.get("rows"), len(CLIENT_RECORDS)))
+    else:
+        ok("/aowlspt/mods/clientreport carries the whole ledger: %d rows, "
+           "session %s, seq %s, silentPolls %s, sessions %s"
+           % (led["rows"], led.get("session"), led.get("seq"),
+              led.get("silentPolls"), led.get("sessions")))
 
 
 def drive(port):
@@ -155,6 +335,77 @@ def drive(port):
     for r in rows:
         check_row(r)
     ok("%d rows, every field the overlay reads present and typed" % len(rows))
+
+    # Before anything is reported, nothing is known about the game -- and the
+    # manager has to say that as absence rather than as `false`. Checked first
+    # because it is the state a fresh backend is in and the state a player with
+    # no game running stays in.
+    if doc.get("clientHost") is not False:
+        bad("clientHost is %r before any client host has polled" % doc.get("clientHost"))
+    elif any("clientLive" in r for r in rows):
+        bad("a row carries clientLive before any client host has reported")
+    else:
+        ok("with no client host, the wrapper says so and no row claims anything "
+           "about the game")
+
+    report_as_client(port)
+
+    # --- protected -------------------------------------------------------
+    #
+    # The whole KEEP path -- the label instead of a button, and SPACE refused
+    # without a round trip -- hangs off this one flag, and until now nothing
+    # checked it end to end. The capture this file writes had no `protected`
+    # key on any row at all, so `fakebackend.py --golden` served rows the
+    # overlay could happily offer an OFF button on, and the test host printed
+    # "nothing protected was on screen" and passed.
+    prot = [r["guid"] for r in rows if r.get("protected")]
+    if not prot:
+        bad("no row is protected; the manager protects itself, so either "
+            "isProtected stopped answering or its own row left the panel")
+    else:
+        ok("%d protected row(s): %s" % (len(prot), ", ".join(prot)))
+    if len(prot) == len(rows):
+        bad("every row is protected, so nothing on the panel has a button")
+
+    # And the refusal itself, which is the property the flag exists for. The
+    # overlay answers this locally and never sends it; this checks the *other*
+    # half, so that neither side is the only thing standing between a player
+    # and a panel that unloads the mod serving it.
+    if prot:
+        status, text, _ = request(port, "POST",
+                                  "/aowlspt/mods/toggle/" + prot[0],
+                                  '{"enabled":false}')
+        reply = json.loads(text)
+        if reply.get("ok"):
+            bad("the manager honoured a request to switch off the protected "
+                "mod %s -- that unloads every /aowlspt/mods route" % prot[0])
+        elif not reply.get("error"):
+            bad("the protected toggle was refused with no reason to show")
+        else:
+            ok("the manager refuses `enabled:false` on %s, with a sentence the "
+               "panel can print" % prot[0])
+        # It must not have moved anyway.
+        _, text, _ = request(port, "GET", "/aowlspt/mods/panel")
+        after = {r["guid"]: r for r in json.loads(text).get("mods") or []}
+        if after.get(prot[0], {}).get("enabled") is not True:
+            bad("%s came back disabled after a refused toggle" % prot[0])
+        else:
+            ok("the refused toggle left the protected row on")
+        # The other direction is allowed, and has to stay allowed: a protected
+        # mod that is somehow off is one you must be able to switch back on.
+        status, text, _ = request(port, "POST",
+                                  "/aowlspt/mods/toggle/" + prot[0],
+                                  '{"enabled":true}')
+        if json.loads(text).get("ok"):
+            ok("`enabled:true` on a protected mod is still accepted")
+        else:
+            bad("the manager refuses to *enable* a protected mod, so one that "
+                "is off can never be recovered from the panel")
+        # Put it back. That last POST recorded an *explicit* override on the
+        # manager's own row, and the capture below is what `fakebackend.py
+        # --golden` replays -- a golden that says "decided by override" on a row
+        # nobody chose is a fixture that quietly disagrees with a fresh install.
+        request(port, "GET", "/aowlspt/mods/clear/" + prot[0])
 
     # A mod that is off, toggled on. On a host with no control this is the
     # deferred path, and the row must come back saying so.
@@ -202,7 +453,9 @@ def drive(port):
         bad("toggling back left restart=%r" % back.get("restart"))
 
     status, text, _ = request(port, "GET", "/aowlspt/mods/panel")
-    return json.loads(text)
+    final = json.loads(text)
+    check_client(port, final)
+    return final
 
 
 def main():
