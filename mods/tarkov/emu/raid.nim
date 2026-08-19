@@ -17,6 +17,7 @@ import aowlspt/server
 import aowlspt/json
 import ids
 import loot
+import questcond
 
 type
   RaidResult* = enum
@@ -279,6 +280,111 @@ proc raidConfiguration*(body: string): string =
   put(o, "raidMode", field(body, "raidMode").asText("Local"))
   put(o, "side", field(body, "side").asText("Pmc"))
   result = done(o).text
+
+proc timeFlow(spelling: string; known: var bool): float =
+  ## `TimeFlowType`, as the client spells it, as a multiplier.
+  ##
+  ## The enum in the reference dump is `x0, x0_14, x0_25, x0_5, x1, x2, x4, x8`
+  ## -- a leading `x`, an underscore where the decimal point goes. Read from the
+  ## spelling rather than from a table of the eight, so that a client sending
+  ## `x3` is understood rather than refused, and a client sending something that
+  ## is not a multiplier at all is refused rather than read as 1.
+  known = false
+  result = 0.0
+  if spelling.len < 2 or (spelling[0] != 'x' and spelling[0] != 'X'):
+    return
+  var digits = ""
+  for i in 1 ..< spelling.len:
+    let ch = spelling[i]
+    if ch == '_':
+      digits.add '.'
+    elif ch >= '0' and ch <= '9':
+      digits.add ch
+    else:
+      return
+  if digits.len == 0:
+    return
+  known = true
+  result = parseNumber(digits)
+
+const MaxTimeFlow = 8.0
+  ## The ceiling of `TimeFlowType`, used when the client did not send one.
+  ##
+  ## It has to be a *ceiling* rather than a guess, and this is the one number
+  ## here where that matters. A raid clock that runs slower than the truth
+  ## makes the raid's span look shorter than it is, and a span that is too
+  ## short is a span that fits inside a window it really crossed -- which is a
+  ## kill credited that was not earned. Reading the acceleration this server
+  ## publishes in `/client/weather` would be worse still: its shipped value is
+  ## **0**, which would collapse every raid to a single instant and credit
+  ## almost everything. `x8` is the largest value the enum admits, so the span
+  ## it produces cannot be too short, and every error it makes is a refusal.
+
+proc raidClock*(cfgBody: string): RaidClock =
+  ## The in-game clock a `RaidSettings` establishes, for
+  ## `emu/questcond.daytimeVerdict`.
+  ##
+  ## ## What it reads, and what it refuses to read
+  ##
+  ## `RaidSettings.TimeAndWeatherSettings.HourOfDay` is a `Nullable<Int32>` and
+  ## is the only member of the whole request that names an hour. Everything
+  ## else the client sends about time says *which* time was picked, not what it
+  ## is: `TimeVariant` is a two-valued `CURR`/`PAST` selector and
+  ## `IsNightRaid` is a boolean. Neither can establish that a raid's whole span
+  ## sits inside `22 -> 07`, so neither is read here, and a request carrying
+  ## only those is refused rather than turned into an hour by a rule this
+  ## repository would have had to invent. *(A raid has never been run against
+  ## BSG's client, so which of the three it actually posts is unknown. If it
+  ## turns out to post `timeVariant` alone, this closes nothing and the refusal
+  ## is the honest answer.)*
+  ##
+  ## `IsRandomTime` refuses the whole clock: it is the client saying the hour it
+  ## sent is not the hour it will play.
+  ##
+  ## The span is the map's own `EscapeTimeLimit` -- present on all 19 maps,
+  ## Customs 40 minutes, `factory4_day` 20, Streets 50 -- times the flow rate.
+  ## A map this database has no base for, or one whose limit is absent, zero or
+  ## longer than half a day, decides nothing: `develop` at 60000 minutes and
+  ## `hideout` at 99999 are exactly that, and neither is a raid.
+  result = unknownClock()
+  let tw = field(cfgBody, "timeAndWeatherSettings")
+  if not tw.found:
+    return
+  if tw.field("isRandomTime").asBool(false):
+    return
+  let hourNode = tw.field("hourOfDay")
+  if not hourNode.found or hourNode.isNull or hourNode.isText:
+    return
+  let hour = hourNode.asFloat(-1.0)
+  if hour < 0.0 or hour > 23.0:
+    return
+
+  var flow = MaxTimeFlow
+  let spelling = tw.field("timeFlowType").asText("")
+  if spelling.len > 0:
+    var flowKnown = false
+    let parsed = timeFlow(spelling, flowKnown)
+    if not flowKnown or parsed < 0.0:
+      return
+    flow = parsed
+
+  let name = canonicalLocation(field(cfgBody, "location").asText(""))
+  if name.len == 0:
+    return
+  let base = locationBase(name)
+  if base.len == 0:
+    return
+  let limitNode = field(base, "EscapeTimeLimit")
+  if not limitNode.found:
+    return
+  let limit = limitNode.asFloat(0.0)
+  if limit <= 0.0 or limit > 720.0:
+    return
+
+  let span = limit / 60.0 * flow
+  if span >= 24.0:
+    return
+  result = RaidClock(known: true, startHour: hour, spanHours: span)
 
 proc weatherFrom*(stored: string; nowSeconds: int): string =
   ## The sky, out of `stored` when there is one and dull when there is not.

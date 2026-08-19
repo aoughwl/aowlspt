@@ -470,12 +470,42 @@ proc doTraderRepair(p: var Profile; inv: var Inventory; action: JsonRef;
   # them -- and `spendCurrency` verifies the whole amount is there before it
   # takes any of it.
   #
-  # Charged in roubles whatever the trader's own `currency` says. Converting
+  # Charged in the trader's own currency, at the trader's own rate.
+  #
+  # This used to be roubles unconditionally, on the grounds that "converting
   # would need a rate, and the only rate in this database is the handbook price
-  # of a currency item, which prices a *stack of notes* rather than an exchange
-  # -- see `roubleValue` in `emu/trading`. An invented rate here would be a
-  # price nobody can check.
-  if not spendCurrency(inv, trading.Roubles, total, p.stashId, ch):
+  # of a currency item, which prices a *stack of notes* rather than an
+  # exchange". Both halves of that were wrong.
+  # `traders.<id>.base.repair.currency_coefficient` **is** the rate, and it sits
+  # in the same object as the currency it converts: 1 for every rouble trader,
+  # `0.00847457627118644` for Peacekeeper -- which is 1/118. And the handbook
+  # prices are per note, not per stack: RUB is 1, USD 121, EUR 134, and 1/121
+  # agrees with Peacekeeper's own coefficient to within 2.5%.
+  #
+  # It is worth being plain about how much this buys today: **nothing**. Only
+  # Prapor, Skier and Mechanic have `repair.availability` true, all three
+  # charge roubles and all three carry a coefficient of exactly 1. Peacekeeper
+  # is the one non-rouble repairer in the database and he does not repair. So
+  # this is a wrong reason corrected rather than a feature added, and the
+  # reason mattered: a trader added by a mod who charges dollars would have
+  # been silently billed in roubles at 118 times the price.
+  var payTpl = trading.Roubles
+  var payTotal = total
+  let currency = field(traderBase(traderId), "repair.currency").asText("")
+  if currency.len > 0 and currency != trading.Roubles:
+    let rate = field(traderBase(traderId),
+                     "repair.currency_coefficient").asFloat(0.0)
+    if rate <= 0.0:
+      # A currency with no coefficient beside it. Refused rather than billed in
+      # roubles: the player would be charged 118 times what the screen said.
+      ch.problems.add "repair: " & traderId & " charges in " & currency &
+                      " and this database gives no rate to convert it at"
+      return false
+    payTpl = currency
+    payTotal = ceilInt(float(total) * rate)
+    if payTotal <= 0:
+      payTotal = 1
+  if not spendCurrency(inv, payTpl, payTotal, p.stashId, ch):
     return false
   for k in 0 ..< plans.len:
     applyPlan(inv, plans[k], tpls[k], false, ch)

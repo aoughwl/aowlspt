@@ -220,44 +220,200 @@ proc offerLoyalty*(traderId, offerId: string): int =
 #
 # Fence's standing is the scav's reputation, and the reference gives it exactly
 # the same shape as every other trader's: `TraderInfo.standing`, gating
-# `TraderLoyaltyLevel.MinStanding`. What it does **not** give, anywhere, is the
-# rate -- how much standing one scav run is worth, or what dying in one costs.
-# That is a balance number and it lives in the real server's own config file,
-# which is not part of the database dump this reads.
+# `TraderLoyaltyLevel.MinStanding`.
 #
-# So the rate is a setting, with a default this file is allowed to have an
-# opinion about and not allowed to present as fact:
+# ## The rates that *are* the game's, and were not being read
+#
+# `bots.types.<role>.experience.standingForKill` is in the database for **all
+# 57 bot roles**, keyed by difficulty, with BSG's own numbers:
+#
+#     assault   {"easy": -0.03, "normal": -0.04, "hard": -0.05}
+#     bear      {"easy":  0.02, "normal":  0.02, "hard":  0.03}
+#
+# Twelve roles sit at -0.05, ten at -0.2, twenty-one at 0. `emu/bots` has read
+# that exact path all along -- to hand the number to the *client*, as
+# `Info.Settings.StandingForKill` on a generated bot. Nothing read it back.
+#
+# And there is no client fallback on the scav path to read it back for us.
+# `emu/scav.newScavRecord` writes the played scav's own `StandingForKill` as
+# 0.0 before the raid, and `endScavRaid` copies **only items** off the returned
+# scav -- no `TradersInfo`, no `Stats`. So whatever standing the client computed
+# during a scav raid is discarded by design, and until now nothing recomputed
+# it: killing scavs as a scav was free and killing PMCs as a scav earned
+# nothing.
+#
+# `scavKillKarma` below is the join. The key is `Stats.Eft.Victims[].Role` on
+# the profile the client hands back -- the same list `emu/questcond.killCredit`
+# already walks for quest kills.
+#
+# Two facts beside it, also in the database and also unused until now:
+# `globals.config.FenceSettings.PmcBotKillStandingMultiplier` (1) and
+# `globals.config.FenceSettings.FenceId`.
+#
+# ## The one number that is still invented, and why it stays
+#
+# Kills are the game's rate. **Extraction is not**: no figure for surviving a
+# scav run exists anywhere in `build/db/db.json` or in
+# `reference/spt-4.1-surface.json`. It is a server balance number, and it stays
+# a setting:
 #
 #   fenceKarmaOnScavExtract   0.01   standing for walking out of a scav raid
 #   fenceKarmaOnScavDeath     0.0    standing for dying in one
 #
-# 0.01 is chosen so that a hundred successful scav runs move the standing by
-# 1.0, which is the granularity Fence's loyalty levels are written at in the
-# live trader base -- it is a scale that makes the number mean something, not a
-# figure recovered from the game. Zero for a death because the reference gives
-# no penalty and inventing one takes something from the player that nothing can
-# be pointed at to justify. Both are in `mods/tarkov/config.json` and either can
-# be set to zero to turn the system off entirely.
+# What changed about it is the *claim*. The old comment here justified 0.01 as
+# "a scale that makes the number mean something" -- it was the only input, so it
+# alone had to make Fence's -7..+6 ladder reachable. That justification is now
+# gone: the ladder's scale is set by BSG's own per-kill numbers, and 0.01 is a
+# supplement to them rather than the whole system. It is kept at 0.01 rather
+# than dropped to zero for the same reason the death penalty is zero --
+# removing it takes something from the player and nothing can be pointed at to
+# justify the removal -- but it is now the **only** invented figure in Fence's
+# karma, it is worth a quarter of one `assault` kill, and
+# `mods/tarkov/config.json` can set it to zero to leave the game's own numbers
+# running on their own.
 
-const FenceId* = "579dc571d53a0658a154fbec"
-  ## Fence. Hard-coded because it is an id in the game's own data rather than a
-  ## thing this server can look up: there is no "is this the scav trader" flag
-  ## on `TraderBase`. A database without this trader in it simply has no karma,
-  ## because `addStanding` writes an entry and `loyaltyLevelFor` finds no base
-  ## to derive a level from -- which is the same state as before.
+const
+  FenceId* = "579dc571d53a0658a154fbec"
+    ## Fence, as a compiled-in fallback. Preferred over it at run time is
+    ## `globals.config.FenceSettings.FenceId`, which is the game's own statement
+    ## of which trader is the scav trader -- the comment that used to stand here
+    ## said no such flag existed, and it does, one level up from `TraderBase`.
+    ## The constant stays because a database with no `globals.config` must still
+    ## have karma, and because the two agree on every dump seen so far.
+
+  KillDifficulty = "normal"
+    ## Which column of `standingForKill` a victim is priced at.
+    ##
+    ## The raid report carries no per-victim difficulty and nothing else does
+    ## either: `RaidSettings.BotSettings` in the reference dump is
+    ## `{IsScavWars, BotAmount}` and `/client/match/local/start` answers
+    ## `aiDifficulty: "AsOnline"`. So this is a default, and it is the honest
+    ## one -- it is the column every one of the 57 roles carries, where `easy`
+    ## and `hard` are present on only nine. A role that lacks it is refused by
+    ## name rather than priced off a column nobody asked for.
+
+proc fenceId*(): string =
+  ## The scav trader. `globals.config.FenceSettings.FenceId` when the database
+  ## has it, the constant when it does not.
+  let v = dbRead("globals.config.FenceSettings.FenceId")
+  if v.ok:
+    let id = asText(v)
+    if id.len == 24:
+      return id
+  result = FenceId
+
+proc plainRoleKey(role: string): bool =
+  ## Whether a victim's `Role` is safe to build a database path out of.
+  ##
+  ## `Role` is a `String` the client chooses, and it is about to become the
+  ## middle of a dotted `dbRead` path. A role carrying a `.` would read a
+  ## different table than the one it names.
+  if role.len == 0 or role.len > 48:
+    return false
+  for ch in role:
+    let okChar = (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or
+                 (ch >= '0' and ch <= '9') or ch == '_'
+    if not okChar:
+      return false
+  result = true
+
+proc standingForKill*(role, difficulty: string; known: var bool): float =
+  ## `bots.types.<role>.experience.standingForKill.<difficulty>`.
+  ##
+  ## The role is lower-cased before the lookup: the database keys these
+  ## `pmcbear`, `bosskilla`, `followerbigpipe`, and the client's
+  ## `WildSpawnType` spells the same values `pmcBEAR`, `bossKilla`,
+  ## `followerBigPipe`. `known` is false for a role the table does not have and
+  ## for a role that has no entry at this difficulty -- both are refusals to
+  ## price, and neither is a zero.
+  known = false
+  result = 0.0
+  if not plainRoleKey(role):
+    return
+  let t = dbRead("bots.types." & toLowerAscii(role) &
+                 ".experience.standingForKill")
+  if not t.ok or t.raw.len == 0:
+    return
+  let v = field(t.raw, toLowerAscii(difficulty))
+  if not v.found or v.isNull:
+    return
+  known = true
+  result = v.asFloat(0.0)
+
+proc noteOnce(into: var seq[string]; what: string) =
+  for r in into:
+    if r == what:
+      return
+  into.add what
+
+proc scavKillKarma*(playedScav: string; problems: var seq[string];
+                    counted: var int): float =
+  ## What one scav raid's kills are worth in Fence standing.
+  ##
+  ## Reads `Stats.Eft.Victims` off the profile the client hands back and prices
+  ## every victim at the game's own `standingForKill` for its role. A victim
+  ## whose role the database does not price is **skipped and named**, not
+  ## guessed at and not silently dropped.
+  ##
+  ## PMC victims -- the ones the report's own `Side` calls `Bear` or `Usec` --
+  ## are scaled by `FenceSettings.PmcBotKillStandingMultiplier`. That is 1 on
+  ## every dump seen, so today it changes nothing; it is read rather than
+  ## assumed because a mod that changes it means it. The join is on `Side`
+  ## rather than on a list of PMC role names because `Side` is what the report
+  ## states outright, where "is `pmcBEAR` a PMC" is an inference. *(That
+  ## `WildSpawnTypeExtensions.IsPmc` exists in the reference dump is a fact; its
+  ## body is not in the dump, so the mapping it makes is not.)*
+  result = 0.0
+  counted = 0
+  let victims = field(playedScav, "Stats.Eft.Victims")
+  if not victims.found:
+    return
+  var pmcMultiplier = 1.0
+  let m = dbRead("globals.config.FenceSettings.PmcBotKillStandingMultiplier")
+  if m.ok:
+    pmcMultiplier = m.asFloat(1.0)
+  let list = each(victims)
+  for v in list:
+    let role = v.field("Role").asText("")
+    if role.len == 0:
+      noteOnce(problems, "a kill with no role on it earned no standing")
+      continue
+    var known = false
+    let rate = standingForKill(role, KillDifficulty, known)
+    if not known:
+      noteOnce(problems, "this database prices no kill of a " & role &
+                         " at difficulty " & KillDifficulty &
+                         "; that kill moved no standing")
+      continue
+    var delta = rate
+    let side = v.field("Side").asText("")
+    if side == "Bear" or side == "Usec":
+      delta = delta * pmcMultiplier
+    result = result + delta
+    inc counted
 
 proc applyScavKarma*(p: var Profile; survived: bool;
-                     onExtract, onDeath: float): bool =
+                     onExtract, onDeath: float; playedScav: string;
+                     problems: var seq[string]; killed: var int): bool =
   ## Moves Fence's standing for one finished scav raid. Returns whether it
   ## changed anything, so a caller with nothing else to write does not save.
+  ##
+  ## Two inputs, added and written once: the configured survival figure, and
+  ## the game's own per-kill rate summed over the raid's victim list. Written
+  ## once rather than per kill because `addStanding` snaps to a 1/1,000,000
+  ## grid on every write, and a raid with twelve victims in it should round
+  ## once.
   ##
   ## Refused outright when the database has no Fence: writing standing into a
   ## `TradersInfo` entry for a trader that does not exist leaves a row the
   ## trader screen cannot draw and the player cannot spend.
-  if traderBase(FenceId).len == 0:
+  killed = 0
+  let fence = fenceId()
+  if traderBase(fence).len == 0:
     return false
-  let delta = if survived: onExtract else: onDeath
+  var delta = if survived: onExtract else: onDeath
+  delta = delta + scavKillKarma(playedScav, problems, killed)
   if delta == 0.0:
     return false
-  addStanding(p, FenceId, delta)
+  addStanding(p, fence, delta)
   result = true

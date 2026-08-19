@@ -362,6 +362,54 @@ proc applyCustomisation*(p: var Profile; body: JsonRef; ch: var Change): bool =
     setRaw(p, plan.paths[k], plan.values[k])
   result = plan.paths.len > 0
 
+proc plainId(id: string): bool =
+  ## Whether an id is safe to put inside a JSON literal.
+  ##
+  ## `applyVoice` builds a one-element `customizations` array out of the id the
+  ## client sent, so an id carrying a quote would be a body this server wrote
+  ## and did not mean. Every id in `templates.customization` is 24 hex
+  ## characters; the check is looser than that on purpose, because a fixture
+  ## and a mod may key entries by name.
+  if id.len == 0 or id.len > 64:
+    return false
+  for ch in id:
+    let okChar = (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or
+                 (ch >= '0' and ch <= '9') or ch == '_' or ch == '-'
+    if not okChar:
+      return false
+  result = true
+
+proc applyVoice*(p: var Profile; voiceId: string; problem: var string): bool =
+  ## `/client/game/profile/voice/change`. Returns whether the profile changed.
+  ##
+  ## This route used to be bound to the stock "ok" stub: it answered
+  ## `{"status":"ok"}` and wrote nothing, so the voice selector on the
+  ## character screen appeared to work and did not. That is the failure this
+  ## whole server is written against, arrived at from the wrong side -- not a
+  ## refusal the client swallows but a success the server invented -- and
+  ## `docs/EMULATOR-COVERAGE.md` recorded it as "served".
+  ##
+  ## Everything it needs was already here. `ProfileChangeVoiceRequestData` in
+  ## the reference dump has exactly one property, `MongoId Voice`, and
+  ## `planCustomisation`'s `voice` arm already checks the entry exists, is
+  ## under the `Voice` branch, is allowed for this side and edition, and writes
+  ## the entry's `_name` rather than its id -- which is what `Info.Voice`
+  ## holds. So this is that arm, reached by a second door, and a voice the
+  ## table does not allow is refused by the same sentence either door.
+  problem = ""
+  if not plainId(voiceId):
+    problem = "that request named no voice this server can look up"
+    return false
+  let plan = planCustomisation(customisationTable(), p.side,
+                               p.field("Info.GameVersion").asText("standard"),
+                               "[{\"id\":\"" & voiceId & "\",\"type\":\"voice\"}]")
+  if not plan.ok:
+    problem = plan.problem
+    return false
+  for k in 0 ..< plan.paths.len:
+    setRaw(p, plan.paths[k], plan.values[k])
+  result = plan.paths.len > 0
+
 # ---------------------------------------------------------------------------
 # The self-check
 # ---------------------------------------------------------------------------

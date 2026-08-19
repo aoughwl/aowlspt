@@ -1341,6 +1341,15 @@ proc main(): int =
   var killTarget = 0
   var neutralKillConds = 0
   var qualifiedKillConds = 0
+  # Every `daytime` window that restricts anything, as its width in minutes.
+  # `emu/questcond.daytimeVerdict` credits a kill when the raid's whole possible
+  # span sits inside the window, and the span is the map's `EscapeTimeLimit`
+  # times the acceleration -- so whether the feature can ever fire on real data
+  # is a relationship between two tables that no fixture has. The locations
+  # section below is where the two meet.
+  var dayWidths: seq[int] = @[]
+  var dayNarrowest = ""
+  var dayMinutes = -1
   var q = 0
   while q < questKeys.len:
     let qAt = questVals[q]
@@ -1471,9 +1480,19 @@ proc main(): int =
             let tAt = memberValue(questsR.body, sb, "daytime")
             if tAt >= 0:
               carriesNeutral = true
-              if intField(questsR.body, tAt, "from") !=
-                 intField(questsR.body, tAt, "to"):
+              let dayFrom = intField(questsR.body, tAt, "from")
+              let dayTo = intField(questsR.body, tAt, "to")
+              if dayFrom != dayTo:
                 plain = false
+                # A real window, and the only ones in the database wrap
+                # midnight: 22->10, 21->4, 21->5, 21->6, 22->7.
+                var width = dayTo - dayFrom
+                if width <= 0:
+                  width = width + 24
+                dayWidths.add width * 60
+                if dayMinutes < 0 or width * 60 < dayMinutes:
+                  dayMinutes = width * 60
+                  dayNarrowest = qid & " " & $dayFrom & "->" & $dayTo
           if sawKills:
             if plain: inc neutralKillConds
             else: inc qualifiedKillConds
@@ -1701,6 +1720,53 @@ proc main(): int =
           findAt(locR.body, "\"" & absent & "\"", 0) < 0,
           "it is in the body, which is what made this route 560 MiB")
   line "  " & $mapKeys.len & " maps, " & kib(locR.body.len) & " of map data"
+
+  # -- the two tables a `daytime` window is decided from -------------------
+  #
+  # `emu/questcond.daytimeVerdict` credits a night-only kill condition when the
+  # raid's **whole possible span** lies inside the window, and refuses when it
+  # crosses the edge. The span is this map's `EscapeTimeLimit` times the
+  # acceleration, and when the client does not send one `emu/raid` uses the
+  # ceiling of the `TimeFlowType` enum -- x8 -- because a span read too short is
+  # a kill credited that was not earned.
+  #
+  # Which makes the whole feature contingent on a relationship between two
+  # tables that no fixture has: **the narrowest quest window must be wider than
+  # the longest map's fastest span**, or there is no start hour at all that
+  # credits it and the twelve conditions are refused whatever this server does.
+  # On a real import that is 7 hours (`The Survivalist Path - Eagle-Owl`, 21->4)
+  # against Streets' 50 minutes at x8, which is 6 hours 40 -- twenty minutes of
+  # margin, and worth knowing about rather than assuming.
+  var longestRaid = 0
+  var longestMap = ""
+  for i in 0 ..< mapVals.len:
+    let limit = intField(locR.body, mapVals[i], "EscapeTimeLimit")
+    # `develop` at 60000 minutes and `hideout` at 99999 are not raids, and the
+    # three maps at 0 are not playable. Half a day is the cut.
+    if limit > 0 and limit <= 720 and limit > longestRaid:
+      longestRaid = limit
+      longestMap = mapKeys[i]
+  check("the longest raid on any playable map is a raid, not a lobby",
+        longestRaid > 0 and longestRaid <= 720,
+        $longestRaid & " minutes on " & longestMap)
+  if dayWidths.len == 0:
+    skip("every night-only kill window is wider than the longest raid's clock",
+         "no quest in this database restricts a kill by time of day")
+  else:
+    let widest = longestRaid * 8
+    var undecidable = 0
+    for w in dayWidths:
+      if w <= widest:
+        inc undecidable
+    check("every night-only kill window is wider than the longest raid's clock",
+          undecidable == 0,
+          $undecidable & " of " & $dayWidths.len & " windows are no wider " &
+          "than " & $widest & " minutes, so no start hour credits them; " &
+          "narrowest is " & dayNarrowest)
+    line "  " & $dayWidths.len & " time-of-day kill windows, narrowest " &
+         $dayMinutes & " min (" & dayNarrowest & "), against " &
+         $longestRaid & " min on " & longestMap & " -> " & $widest &
+         " min at the TimeFlowType ceiling"
 
   # Loot, generated. This is the one place the emulator *makes* something out of
   # the database rather than handing a table back, so every item it invents is
@@ -2548,6 +2614,155 @@ proc main(): int =
     line "  quest " & killQuest & ": three " & vSide & " kills on " &
          killMap & " credited to " & killCondition & " (target " &
          $killTarget & ")"
+
+  # -- Fence's karma, at the rate the same server hands the client ----------
+  #
+  # `bots.types.<role>.experience.standingForKill` is in a real database for all
+  # 57 roles, and `emu/bots` has always read it -- to put it on a generated bot
+  # as `Info.Settings.StandingForKill`. Nothing read it back off the raid, so
+  # killing scavs as a scav was free.
+  #
+  # The check joins the two routes rather than naming a number. `/client/game/
+  # bot/generate` says what one `assault` at `normal` is worth; a scav raid then
+  # reports killing exactly one, and Fence's standing must come back as that
+  # same figure, character for character. Neither side is a literal here, so an
+  # import that changes BSG's numbers moves both and the check still holds --
+  # and a server that reads the wrong difficulty column, or the wrong role, or
+  # nothing at all, moves only one of them.
+  #
+  # The raid is a **death** on purpose. `fenceKarmaOnScavDeath` is 0, so the
+  # kills are the only term and the answer is the bot's own number with nothing
+  # added to it; a survived raid would carry the configured extract figure too
+  # and the check would be about this server's setting instead of about BSG's
+  # data. A dying scav also brings nothing home, so the raid body needs no
+  # inventory at all.
+  let fenceCfg = memberValue(globalsR.body,
+    memberValue(globalsR.body, dataAt(globalsR), "config"), "FenceSettings")
+  let fenceReal = textField(globalsR.body, fenceCfg, "FenceId")
+  check("globals names which trader is the scav trader",
+        fenceReal.len == 24 and contains(traderIds, fenceReal),
+        "FenceSettings.FenceId is \"" & fenceReal &
+        "\", which is not a trader in this database")
+
+  let botOne = call("/client/game/bot/generate",
+    "{\"conditions\":[{\"Role\":\"assault\",\"Limit\":1," &
+    "\"Difficulty\":\"normal\"}]}")
+  let botOnes = elements(botOne.body, dataAt(botOne))
+  var botRate = ""
+  if botOnes.len > 0:
+    let botSettings = memberValue(botOne.body,
+      memberValue(botOne.body, botOnes[0], "Info"), "Settings")
+    botRate = slice(botOne.body,
+                    memberValue(botOne.body, botSettings, "StandingForKill"))
+  check("a generated scav carries the standing the database prices it at",
+        botRate.len > 0 and botRate != "0" and botRate != "0.0",
+        "StandingForKill on a generated assault is \"" & botRate & "\"")
+
+  if fenceReal.len != 24 or botRate.len == 0:
+    skip("a scav who kills a scav is charged Fence's own rate for it",
+         "the database gives no Fence id or no standingForKill for `assault`")
+  else:
+    listR = call("/client/game/profile/list", "")
+    profAt = profileOf(listR.body, uid)
+    let fenceBefore = slice(listR.body,
+      memberValue(listR.body,
+        memberValue(listR.body,
+          memberValue(listR.body, profAt, "TradersInfo"), fenceReal),
+        "standing"))
+    let realScav = textField(listR.body, profAt, "savage")
+    check("the profile carries a scav to play", realScav.len == 24, realScav)
+    discard call("/client/match/local/end",
+      "{\"exit\":\"Killed\",\"profile\":{\"_id\":\"" & realScav &
+      "\",\"Stats\":{\"Eft\":{\"Victims\":[" &
+      "{\"Side\":\"Savage\",\"Role\":\"assault\",\"BodyPart\":\"Head\"}]}}}}")
+    listR = call("/client/game/profile/list", "")
+    profAt = profileOf(listR.body, uid)
+    let fenceAfter = slice(listR.body,
+      memberValue(listR.body,
+        memberValue(listR.body,
+          memberValue(listR.body, profAt, "TradersInfo"), fenceReal),
+        "standing"))
+    # Zero before is what makes the comparison exact: nothing in this session
+    # gives Fence standing, but a quest reward in somebody else's database
+    # could, and a check that reads a sum as a rate would be a check that lies
+    # about which number it is testing.
+    #
+    # `(nothing)` is zero and is the ordinary case here. `TradersInfo` on the
+    # profile the client hands back after a raid is the *client's* copy, and it
+    # carries entries only for traders the run has touched -- `addStanding`
+    # creates Fence's the moment there is standing to put in it. No entry is
+    # therefore "no standing", which is what the comparison needs.
+    if fenceBefore != "0" and fenceBefore != "0.0" and
+       fenceBefore != "(nothing)":
+      skip("a scav who kills a scav is charged Fence's own rate for it",
+           "this session had already moved Fence's standing to " &
+           fenceBefore & " before any scav raid, so the raid's own term " &
+           "cannot be read off the total")
+    else:
+      check("a scav who kills a scav is charged Fence's own rate for it",
+            fenceAfter == botRate,
+            "Fence's standing is " & fenceAfter & " and the same server " &
+            "prices an `assault` kill at " & botRate)
+      line "  one assault kill: Fence " & fenceBefore & " -> " & fenceAfter &
+           ", the rate the bot route published"
+
+  # -- the voice route, on a voice this database actually has ---------------
+  #
+  # `/client/game/profile/voice/change` answered `{"status":"ok"}` and wrote
+  # nothing, which is the one failure this server's whole design is against:
+  # not a refusal the client swallows but a success the server invented. The
+  # voice is discovered out of `/client/customization` -- whichever entry hangs
+  # off the `Voice` node, is allowed to this profile's side, and is not the one
+  # the profile already has -- so the check says nothing about which voices the
+  # game ships and everything about whether the route writes.
+  var voiceId = ""
+  var voiceName = ""
+  var voiceCount = 0
+  listR = call("/client/game/profile/list", "")
+  profAt = profileOf(listR.body, uid)
+  let voiceNow = textField(listR.body,
+                           memberValue(listR.body, profAt, "Info"), "Voice")
+  var vk = 0
+  while vk < customKeys.len:
+    if parentNameIn(customR.body, customKeys, customVals,
+                    customKeys[vk]) == "Voice":
+      let vProps = memberValue(customR.body, customVals[vk], "_props")
+      var forSide = false
+      for s in elements(customR.body, memberValue(customR.body, vProps, "Side")):
+        if textVal(customR.body, s) == "Usec":
+          forSide = true
+      let vName = textField(customR.body, vProps, "Name")
+      if forSide and vName.len > 0:
+        inc voiceCount
+        if voiceId.len == 0 and vName != voiceNow:
+          voiceId = customKeys[vk]
+          voiceName = vName
+    inc vk
+  if voiceId.len == 0:
+    skip("the voice route writes the voice it says it wrote",
+         "this database has no second Usec voice to change to; " &
+         $voiceCount & " were found")
+  else:
+    let voiceReply = call("/client/game/profile/voice/change",
+                          "{\"voice\":\"" & voiceId & "\"}")
+    check("the voice route answers", voiceReply.ok, why(voiceReply))
+    listR = call("/client/game/profile/list", "")
+    profAt = profileOf(listR.body, uid)
+    check("the voice route writes the voice it says it wrote",
+          textField(listR.body, memberValue(listR.body, profAt, "Info"),
+                    "Voice") == voiceName,
+          "Info.Voice is \"" &
+          textField(listR.body, memberValue(listR.body, profAt, "Info"),
+                    "Voice") & "\", not \"" & voiceName & "\"")
+    # And `Info.Voice` holds the entry's `_name`, not its id. On real data
+    # those differ often enough that a server writing the id would look right
+    # against a fixture and wrong against every player's profile.
+    check("and it wrote the entry's name rather than its id",
+          voiceName != voiceId,
+          "this database's voice " & voiceId & " is named the same as its " &
+          "id, so this check cannot tell the two apart")
+    line "  voice " & voiceId & " -> Info.Voice \"" & voiceName & "\", one of " &
+         $voiceCount & " Usec voices"
 
   # -- a real craft, and what it takes to get the hideout to make it --------
   #

@@ -41,6 +41,18 @@ Six reasons are wrong. Two of them are wrong in `mods/tarkov/README.md`, two in
 a code comment, one in `docs/EMULATOR-COVERAGE.md`, and one is a route that
 reports success and does nothing while no document says so.
 
+> ## Five of the six are closed
+>
+> Sections 1, 3, 4, 6 and 7 below were acted on, and each carries a
+> **Closed** note saying what was implemented and what is still refused.
+> Section 2 (`OpenRandomLootContainer`) and section 5 (`weaponCaliber`) are
+> untouched: the first needs an importer row and `tools/` is not this
+> document's to edit, and the second still depends on how the live client
+> spells `Victim.Weapon`.
+>
+> The rest of the document is left as it was written, so that the reasoning
+> that was wrong stays readable next to what replaced it.
+
 ---
 
 ## The five that pay best, ranked
@@ -94,6 +106,43 @@ discards it (see §4 below); `normal` is the honest default, and a role whose
 entry lacks the requested difficulty should refuse by name rather than pick one.
 
 **Verdict: nobody has looked.**
+
+> **Closed.** `emu/traders.scavKillKarma` reads `Stats.Eft.Victims` off the
+> profile the client hands back at the scav branch of `onMatchEnd` and prices
+> every victim at `bots.types.<role>.experience.standingForKill.normal`, with
+> the role lower-cased for the lookup (the database keys `pmcbear`, the client
+> spells `pmcBEAR`). PMC victims — the ones the report's own `Side` calls
+> `Bear` or `Usec` — are scaled by `FenceSettings.PmcBotKillStandingMultiplier`,
+> read rather than assumed. The whole raid's standing is written once, so
+> `numText`'s 1/1,000,000 grid rounds once for twelve kills rather than twelve
+> times. `emu/traders.fenceId()` now prefers `FenceSettings.FenceId` over the
+> hard-coded constant, which closes §7 as a side effect.
+>
+> **Still refused, by name in the log:** a victim with no `Role`; a role
+> `bots.types` does not carry; and a role that has no entry at the difficulty
+> asked for. `normal` is the difficulty asked for, and it is a default rather
+> than a fact — the raid report carries no per-victim difficulty,
+> `RaidSettings.BotSettings` is `{IsScavWars, BotAmount}`, and
+> `/client/match/local/start` answers `aiDifficulty: "AsOnline"`. It costs the
+> player nothing on a real database, where all 57 roles carry `normal`; on one
+> where a role does not, that role's kills move no standing and say so.
+>
+> **What happened to the invented constant.** `fenceKarmaOnScavExtract` stays
+> at 0.01 and stays a setting. Its *justification* changed and the comment
+> saying so was rewritten: it used to be the only input, so it alone had to make
+> Fence's −7..+6 ladder reachable, and "a scale that makes the number mean
+> something" was a real argument for it. It is not any more — BSG's per-kill
+> numbers set the scale now, and 0.01 is worth a quarter of one `assault` kill.
+> It was kept rather than zeroed for the same reason the death penalty is zero:
+> **removing it takes something from the player and nothing in the data can be
+> pointed at to justify the removal**, and no figure for surviving a scav run
+> exists in `build/db/db.json` or in the dump at all. It is now the only
+> invented number in Fence's karma, it is named as such in `emu/traders`, and
+> `config.json` can set it to zero.
+>
+> `paidExitStandingNumerator` (0.2) is still unused: nothing in the raid report
+> says which exit was taken or that it was paid for, so there is nothing to
+> multiply.
 
 ### 2. `OpenRandomLootContainer` — a button that does nothing, with no reason written anywhere
 
@@ -149,6 +198,24 @@ stands is a claim nobody checked.
 
 **Verdict: nobody has looked.**
 
+> **Closed.** The route is bound to `onVoiceChange`, which reads `voice` (and
+> `Voice`, because the dump names the property that way and every other body
+> this client sends is camel-cased), runs the id through
+> `emu/customise.applyVoice` — the same `planCustomisation` voice arm the item
+> event uses — and saves. So the id is checked against the table, against the
+> `Voice` branch, against the profile's side and edition, and `Info.Voice`
+> receives the entry's `_name` rather than its id, all by the code that already
+> did those things. A refusal is now a refusal: the other faction's voice
+> answers "not available to Usec" instead of `{"status":"ok"}`.
+>
+> **Still refused:** an id that is not plain (letters, digits, `_`, `-`, up to
+> 64 characters) is refused before the lookup, because the id is about to be
+> put inside a JSON literal and a quote in it would be a body this server wrote
+> and did not mean.
+>
+> `docs/EMULATOR-COVERAGE.md:203` still records the route as "served", which is
+> now true. That file is generated and was not edited here.
+
 ### 4. `daytime` on quest kills — the raid configuration establishes the clock, and this server throws it away
 
 **What the player loses.** Twelve `Kills` sub-conditions across eight quests,
@@ -198,6 +265,43 @@ lines that answers only when the whole span is decided and refuses otherwise.
 
 **Verdict: nobody has looked.** The refusal is not wrong to distrust
 `Victim.Time`; it is wrong that `Victim.Time` is the only source.
+
+> **Closed, and narrower than this section proposed.**
+> `emu/questcond.daytimeVerdict` answers one of three things about a window:
+> the raid's whole span is **inside** it (credit), **outside** it (a verified
+> no, handled exactly as a wrong `Location` is), or **across its edge** (refused
+> by name). `emu/raid.raidClock` builds the span and `tarkov.nim` keeps it in
+> `gRaidClock` instead of dropping everything but the raid id.
+>
+> Three departures from the plan above, all in the direction of refusing more:
+>
+> * **Only `hourOfDay` is read.** `timeVariant` and `isNightRaid` say *which*
+>   time was picked, not what it is, and neither can establish that a span sits
+>   inside `22 -> 07`. A request carrying only those is refused rather than
+>   turned into an hour by a rule invented here. `isRandomTime` refuses the
+>   clock outright — it is the client saying the hour it sent is not the hour it
+>   will play.
+> * **The acceleration is not taken from the weather response.** This section
+>   argued that `emu/raid.weatherFrom` publishes it, so this server is the
+>   authority on it. It is, and the value it publishes is **0** — which would
+>   collapse every raid to a single instant and credit almost everything. The
+>   client's own `timeFlowType` is used when it sends one; when it does not, the
+>   **ceiling of the `TimeFlowType` enum, x8**, is used, because a span read too
+>   short is a kill credited that was not earned and every error a ceiling makes
+>   is a refusal.
+> * **A map whose `EscapeTimeLimit` is absent, zero, or longer than half a day
+>   decides nothing.** `develop` at 60000 minutes and `hideout` at 99999 are
+>   exactly that, and neither is a raid.
+>
+> Whether this closes anything for a real player is one raid's worth of unknown,
+> and it is the honest size of the caveat: if the live client posts
+> `timeVariant` alone, all twelve conditions stay refused and the refusal is
+> correct. What is settled is that the *arithmetic* works and that the two real
+> tables leave room for it — `tools/realtest` checks the narrowest window in
+> `templates.quests` (7 hours, *The Survivalist Path — Eagle-Owl*, 21->4)
+> against the longest playable map at the enum's ceiling (Streets, 50 minutes,
+> 6 h 40), and the twenty minutes of margin between them is the whole reason
+> the feature is not vacuous.
 
 *The caveat that belongs to this repository: no raid has ever been run against
 BSG's client, so which of `timeVariant`, `isNightRaid` and
@@ -257,11 +361,24 @@ Peacekeeper is the only non-rouble trader and his `repair.availability` is
 **Verdict: nobody has looked** — the cost to close is reading one field already
 inside the trader base this module opens.
 
+> **Closed.** `doTraderRepair` reads `repair.currency` and, when it is not
+> roubles, `repair.currency_coefficient`, and charges that currency at that
+> rate. A currency with no coefficient beside it is refused by name rather than
+> billed in roubles — which would have taken 118 times the price the screen
+> showed. It buys a player nothing today, exactly as this section says: the
+> branch is unreachable on a real database. The wrong reason was the thing
+> worth fixing, and a mod adding a trader who charges dollars is what would
+> have found it the expensive way.
+
 **`emu/traders` — "there is no 'is this the scav trader' flag on `TraderBase`."**
 `mods/tarkov/emu/traders.nim:242-246` hard-codes Fence's id on that basis. There
 is a flag, one level up: `globals.config.FenceSettings.FenceId` =
 `"579dc571d53a0658a154fbec"`, the game's own statement of which trader Fence is.
 **Verdict: nobody has looked.** Cosmetic — the hard-coded value is correct.
+
+> **Closed.** `emu/traders.fenceId()` reads `FenceSettings.FenceId` and falls
+> back to the constant, which stays: a database with no `globals.config` must
+> still have karma. The comment claiming no such flag exists is gone.
 
 ---
 
@@ -351,7 +468,9 @@ screen is what the end call produces, but a hypothesis.
 
 ## Things refused in code that no document mentions
 
-Three, in descending order of how much they matter.
+Three, in descending order of how much they matter. **The first two are
+closed** — see the notes on §3 and §1 — and are left here as written, because
+the point of the list is what the sweep found rather than what it now says.
 
 1. **`/client/game/profile/voice/change` reports success and writes nothing**
    (`mods/tarkov/tarkov.nim:1493`), while `docs/EMULATOR-COVERAGE.md:203`

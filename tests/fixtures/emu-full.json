@@ -2425,6 +2425,12 @@
  },
  "globals": {
   "config": {
+   "_comment_fence": "`FenceSettings`, for two things that used to be assumed. `FenceId` is the game's own statement of which trader is the scav trader -- `emu/traders` hard-coded it on the stated grounds that no such flag existed, and it does. `PmcBotKillStandingMultiplier` scales what killing a PMC as a scav is worth; it is 1 in every real dump, so a fixture that also wrote 1 could not tell a server that reads it from one that ignores it. It is 3 here, and the karma arithmetic in `emutest` is what says which of those this server is.",
+   "FenceSettings": {
+    "FenceId": "579dc571d53a0658a154fbec",
+    "PmcBotKillStandingMultiplier": 3,
+    "paidExitStandingNumerator": 0.2
+   },
    "SkillsSettings": {
     "SkillProgressRate": 1.0,
     "SkillFreshEffectiveness": 1.5,
@@ -3032,6 +3038,23 @@
        },
        "whitelist": []
       }
+     }
+    }
+   },
+   "_comment_karma": "Two more roles, here for `emu/traders.scavKillKarma` and for nothing else -- they carry only the one member it reads, because a role a raid never generates does not need a loadout. `bear` is the positive side of Fence's karma at BSG's own rate, and it is the role that makes `PmcBotKillStandingMultiplier` and the `Side` join reachable. `gifter` carries `easy` and no `normal` on purpose: it is the only way to reach the refusal that says a role this database does not price at the requested difficulty earns no standing. Every one of the 57 roles in a real dump does carry `normal`, so that branch is unreachable on real data and would be dead code nobody had ever run. Its `easy` is -0.9 rather than the 0 a real `gifter` carries, and that is the whole point of the number: a server that quietly fell back to whichever column the role does have would move Fence's standing by nine tenths, which no arithmetic mistake can hide.",
+   "bear": {
+    "experience": {
+     "standingForKill": {
+      "easy": 0.02,
+      "normal": 0.02,
+      "hard": 0.03
+     }
+    }
+   },
+   "gifter": {
+    "experience": {
+     "standingForKill": {
+      "easy": -0.9
      }
     }
    }

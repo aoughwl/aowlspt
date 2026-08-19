@@ -572,7 +572,8 @@ proc pruneExpiredRepeatables*(p: var Profile; nowSeconds: int): int =
     setTopLevel(p, "Quests", text(kept))
 
 proc advanceQuestsAfterRaid*(p: var Profile; beforeText, location,
-                             exitStatus: string; nowSeconds: int): int =
+                             exitStatus: string; nowSeconds: int;
+                             clock: RaidClock = unknownClock()): int =
   ## Folds a raid's results into the quest state. Returns the number of quests
   ## whose status changed.
   ##
@@ -608,7 +609,8 @@ proc advanceQuestsAfterRaid*(p: var Profile; beforeText, location,
       if ident.len == 0 or hasCounter(now1, ident):
         continue
       var refused: seq[string] = @[]
-      let credit = killCredit(c, p.text, location, exitStatus, refused)
+      let credit = killCredit(c, p.text, location, exitStatus, refused,
+                              clock)
       if credit > 0:
         now1 = setCounter(now1, ident, "CounterCreator", qid, credit)
         info "credited " & $credit & " kill(s) to " & questLabel(qid, tpl) &

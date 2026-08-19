@@ -541,8 +541,88 @@ proc noteRefusal(refused: var seq[string]; what: string) =
       return
   refused.add what
 
+# ---------------------------------------------------------------------------
+# The raid's clock
+# ---------------------------------------------------------------------------
+#
+# `daytime` used to be refused on the grounds that "`Victim.Time` is a `String`
+# and nothing establishes which clock it is on". The distrust was right and the
+# conclusion was not, because `Victim.Time` is the wrong input and never was
+# the only one. `WeatherHelper.IsNightTime(DateTimeEnum timeVariant, String
+# mapLocation)` in the reference dump is proof of method: the game decides
+# night from **what the client selected and which map**, never from a victim's
+# timestamp.
+#
+# So this takes a raid clock from the caller and answers a window question with
+# it. What the clock is built from -- and the arithmetic that turns
+# `RaidSettings` into one -- is `emu/raid.raidClock`; this module reads no
+# database and does not gain one here.
+#
+# The question it answers is deliberately narrow. A `daytime` window is checked
+# per **kill** in the game and this server has no per-kill clock, so the only
+# answer it can give is about the whole raid: does the entire interval the raid
+# could have spanned lie inside the window, entirely outside it, or across its
+# edge. Inside credits, outside is a verified no, and across the edge is
+# refused by name -- which is the same three-way answer `Location` gets, and
+# for the same reason.
+
+type
+  RaidClock* = object
+    ## What the raid configuration establishes about the in-game clock.
+    ##
+    ## `startHour` is the hour the raid begins at, 0..24. `spanHours` is how
+    ## far the in-game clock can move before the raid must be over -- the map's
+    ## `EscapeTimeLimit` multiplied by the client's `TimeFlowType`. `known` is
+    ## false when the configuration did not establish both, and a clock that is
+    ## not known decides nothing.
+    known*: bool
+    startHour*: float
+    spanHours*: float
+
+  DaytimeVerdict* = enum
+    dtInside     ## every moment of the raid is inside the window
+    dtOutside    ## no moment of it is
+    dtUndecided  ## the raid crosses the window's edge
+
+proc unknownClock*(): RaidClock =
+  ## The clock a raid this server was told nothing about has.
+  RaidClock(known: false, startHour: 0.0, spanHours: 0.0)
+
+proc wrap24(v: float): float =
+  result = v
+  while result < 0.0:
+    result = result + 24.0
+  while result >= 24.0:
+    result = result - 24.0
+
+proc daytimeVerdict*(c: RaidClock; fromHour, toHour: float): DaytimeVerdict =
+  ## Where a raid sits against one `{from, to}` window.
+  ##
+  ## Every window in a real `templates.quests` wraps midnight -- 22->10, 21->4,
+  ## 21->5, 21->6, 22->7 -- so the arithmetic is done relative to the window's
+  ## own start rather than to midnight, which makes wrapping cost nothing.
+  ## `from == to` never reaches here: `restrictsDaytime` reads it as "the whole
+  ## day", which is what 244 of the 283 `Kills` sub-conditions carry.
+  if not c.known:
+    return dtUndecided
+  if c.spanHours < 0.0 or c.spanHours >= 24.0:
+    # A span of a whole day or more is inside every window and outside every
+    # window at once. Nothing to say.
+    return dtUndecided
+  var width = toHour - fromHour
+  if width <= 0.0:
+    width = width + 24.0
+  if width <= 0.0 or width >= 24.0:
+    return dtUndecided
+  let offset = wrap24(c.startHour - fromHour)
+  if offset + c.spanHours <= width:
+    return dtInside
+  if offset >= width and offset + c.spanHours <= 24.0:
+    return dtOutside
+  result = dtUndecided
+
 proc killCredit*(cond, victimsJson, location, exitStatus: string;
-                 refused: var seq[string]): int =
+                 refused: var seq[string]; clock: RaidClock): int =
   ## How many of a raid's victims this `CounterCreator` should count.
   ##
   ## `refused` comes back naming every qualifier that stopped the count. It is
@@ -570,12 +650,13 @@ proc killCredit*(cond, victimsJson, location, exitStatus: string;
   ##
   ## ## What is still refused, and why
   ##
-  ## - **`daytime`** -- `Victim.Time` is a `String` and nothing establishes
-  ##   which clock it is on. The condition is about the *raid's* clock (the
-  ##   windows in the database are 22->10, 21->4, 21->5: in-game night), and EFT
-  ##   runs its clock at seven times real time with a per-raid offset. A wall
-  ##   clock read as a raid clock over-credits about half the time, which is the
-  ##   exact failure the refusal exists to prevent.
+  ## - **`daytime`**, when and only when `clock` does not decide it. The old
+  ##   refusal here read `Victim.Time` and distrusted it, correctly -- a wall
+  ##   clock read as a raid clock over-credits about half the time. What it got
+  ##   wrong is that `Victim.Time` was ever the input. `clock` is the raid's own
+  ##   configuration, and `daytimeVerdict` above answers only when the whole
+  ##   raid is on one side of the window's edge. A raid this server was told
+  ##   nothing about still lands here, by name.
   ## - **`weapon`**, when the report does not spell it as a template id. The
   ##   condition's list is template ids; `Victim.Weapon` is a `String`. If the
   ##   client puts an id there this credits it; if it puts a display name there
@@ -629,10 +710,21 @@ proc killCredit*(cond, victimsJson, location, exitStatus: string;
         distWant = numberAt(dist, "value", 0.0)
       if sj.field("weapon").count > 0:
         weapons = sj.field("weapon")
+      # Checked against the raid's own configuration rather than against any
+      # victim's timestamp -- see `daytimeVerdict`.
+      let day = sj.field("daytime")
+      if restrictsDaytime(day):
+        let verdict = daytimeVerdict(clock, numberAt(day, "from", 0.0),
+                                     numberAt(day, "to", 0.0))
+        if verdict == dtOutside:
+          # The raid was at the wrong time of day, start to finish. Not
+          # unverifiable -- verified, and no, exactly like `Location` below.
+          refused = @[]
+          return 0
+        if verdict == dtUndecided:
+          noteRefusal(refused, "daytime")
       # Not checked here. Each one names itself, so the player is told which
       # clause stopped the quest rather than being told nothing.
-      if restrictsDaytime(sj.field("daytime")):
-        noteRefusal(refused, "daytime")
       if sj.field("weaponModsInclusive").count > 0 or
          sj.field("weaponModsExclusive").count > 0:
         noteRefusal(refused, "weapon mods")
@@ -700,6 +792,14 @@ proc killCredit*(cond, victimsJson, location, exitStatus: string;
       if not listHas(weapons, w):
         continue
     inc result
+
+proc killCredit*(cond, victimsJson, location, exitStatus: string;
+                 refused: var seq[string]): int =
+  ## The same, for a caller that knows nothing about the raid's clock. Every
+  ## `daytime` window is then undecided and refused by name, which is what this
+  ## function did for all of them before there was a clock to ask.
+  result = killCredit(cond, victimsJson, location, exitStatus, refused,
+                      unknownClock())
 
 # ---------------------------------------------------------------------------
 # Rewards
@@ -924,6 +1024,49 @@ proc selfCheck*(): string =
     out1.add "FAIL daytime refusal\n"
   else:
     out1.add "ok    a night-only kill condition refuses and names `daytime`\n"
+
+  # And the three answers a clock can give it. The window is 22->10, twelve
+  # hours wide and wrapping midnight, which is the shape every one of the
+  # twelve real ones has.
+  let inside = RaidClock(known: true, startHour: 23.0, spanHours: 5.0)
+  if killCredit(AtNight, Victims, "bigmap", "Survived", why1, inside) != 2 or
+     why1.len != 0:
+    inc fails
+    out1.add "FAIL a raid wholly inside the window is credited\n"
+  else:
+    out1.add "ok    a raid whose whole span is inside 22->10 is credited\n"
+
+  let outside = RaidClock(known: true, startHour: 12.0, spanHours: 5.0)
+  if killCredit(AtNight, Victims, "bigmap", "Survived", why1, outside) != 0 or
+     why1.len != 0:
+    inc fails
+    out1.add "FAIL a raid wholly outside the window is a verified no\n"
+  else:
+    out1.add "ok    and one wholly outside it is refused without naming a " &
+             "qualifier\n"
+
+  let straddling = RaidClock(known: true, startHour: 9.0, spanHours: 5.0)
+  if killCredit(AtNight, Victims, "bigmap", "Survived", why1, straddling) != 0 or
+     why1.len != 1 or why1[0] != "daytime":
+    inc fails
+    out1.add "FAIL a raid across the window's edge names `daytime`\n"
+  else:
+    out1.add "ok    and one across the window's edge still names `daytime`\n"
+
+  # The wrap is not an accident of the numbers above: 23 + 5 runs to 04:00 the
+  # next day, and 09:00 + 5 runs to 14:00 which is outside a window that ends
+  # at 10. A window that does *not* wrap has to work too, and this is the only
+  # place one exists.
+  const ByDay = """{"conditionType":"CounterCreator","id":"c5d","value":1,
+    "counter":{"conditions":[{"conditionType":"Kills","target":"Savage",
+      "daytime":{"from":8,"to":16}}]}}"""
+  let midday = RaidClock(known: true, startHour: 9.0, spanHours: 5.0)
+  if killCredit(ByDay, Victims, "bigmap", "Survived", why1, midday) != 2 or
+     why1.len != 0:
+    inc fails
+    out1.add "FAIL a window that does not wrap midnight\n"
+  else:
+    out1.add "ok    a daytime window that does not wrap midnight works too\n"
   const Kitted = """{"conditionType":"CounterCreator","id":"c4","value":1,
     "counter":{"conditions":[{"conditionType":"Kills","target":"Savage",
       "weaponCaliber":["7.62x39"],

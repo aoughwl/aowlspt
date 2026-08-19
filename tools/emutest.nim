@@ -3240,14 +3240,26 @@ proc main(): int =
     note "no database fixture; skipping the achievement checks"
 
   heading "Fence and scav karma"
-  # The reference gives Fence's requirement -- `TraderInfo.standing` against
-  # `TraderLoyaltyLevel.MinStanding` -- and no rate at all, so the rate is a
-  # setting. These checks pin the *configured* number rather than a number this
-  # file believes in: 0.01 an extract and nothing for a death.
+  # Two rates, and only one of them is this server's own.
   #
-  # The scav section above already ran one survived raid and one death, so the
-  # standing before this section is one extract's worth. That is the check that
-  # says a death costs nothing, and it is worth more than two more raids here.
+  # The reference gives Fence's requirement -- `TraderInfo.standing` against
+  # `TraderLoyaltyLevel.MinStanding` -- and no figure for *surviving* a scav
+  # run, so that one is a setting: 0.01 an extract and nothing for a death, and
+  # the first two checks pin the configured number rather than a number this
+  # file believes in.
+  #
+  # The **kills** are the game's own, and they were being thrown away.
+  # `bots.types.<role>.experience.standingForKill` is in the database for all
+  # 57 roles -- `assault` -0.04 at `normal`, `bear` +0.02 -- and nothing read
+  # it back off the raid's own `Stats.Eft.Victims`. So killing scavs as a scav
+  # was free and killing PMCs as a scav earned nothing, and the whole of
+  # Fence's -7..+6 ladder ran off one invented constant counting extractions.
+  # Everything below the second check is about that.
+  #
+  # The scav section above already ran one survived raid and one death, neither
+  # carrying a victim list, so the standing before this section is one
+  # extract's worth. That is the check that says a death costs nothing, and it
+  # is worth more than two more raids here.
   if haveFixture:
     let karmaDoc = profileOf(call("/client/game/profile/list", "").body, uid)
     let fence = traderEntry(karmaDoc, "579dc571d53a0658a154fbec")
@@ -3274,6 +3286,114 @@ proc main(): int =
           rawNumberAt(karmaAfter, 0, "standing") == "0.02",
           "standing is " & rawNumberAt(karmaAfter, 0, "standing") &
           ", not 0.02")
+
+    # ---- and now the kills ------------------------------------------------
+    #
+    # The victims go into the profile the client hands back, in the member the
+    # client puts them in -- `Stats.Eft.Victims` -- because that is the
+    # document the claim is about. `endScavRaid` copies only *items* off it, so
+    # if the karma pass did not read the victims here nothing else ever would.
+    #
+    # Every expected standing below is the arithmetic written out, so a wrong
+    # one says which term is wrong rather than "not 0.02".
+
+    # Two scavs, at the fixture's own `assault` rate of -0.04 at `normal`.
+    # 0.02 + 0.01 extract - 0.08 = -0.05. A server that ignores the victim list
+    # answers 0.03 here.
+    let killList1 = call("/client/game/profile/list", "")
+    let killScav1 = jsonText(killList1.body, "savage")
+    let killGear1 = textAt(killList1.body,
+                           find(killList1.body, "\"_id\":\"" & killScav1 & "\""),
+                           "equipment")
+    discard call("/client/match/local/end",
+      "{\"exit\":\"Survived\",\"profile\":{\"_id\":\"" & killScav1 &
+      "\",\"Stats\":{\"Eft\":{\"Victims\":[" &
+      "{\"Side\":\"Savage\",\"Role\":\"assault\",\"BodyPart\":\"Head\"}," &
+      "{\"Side\":\"Savage\",\"Role\":\"assault\",\"BodyPart\":\"Chest\"}]}}," &
+      "\"Inventory\":{\"equipment\":\"" & killGear1 & "\",\"items\":[" &
+      "{\"_id\":\"" & killGear1 &
+      "\",\"_tpl\":\"55d7217a4bdc2d86028b456d\"}]}}}")
+    let killed1 = traderEntry(
+      profileOf(call("/client/game/profile/list", "").body, uid),
+      "579dc571d53a0658a154fbec")
+    check("killing scavs as a scav costs standing at the game's own rate",
+          rawNumberAt(killed1, 0, "standing") == "-0.05",
+          "standing is " & rawNumberAt(killed1, 0, "standing") &
+          ", not -0.05 (0.02 + 0.01 extract - 2 x 0.04)")
+
+    # One PMC, at `bear`'s +0.02, scaled by the fixture's
+    # `PmcBotKillStandingMultiplier` of 3. -0.05 + 0.01 + 0.06 = 0.02. A server
+    # that credits the kill and ignores the multiplier answers -0.02; one that
+    # ignores PMC kills entirely answers -0.04. The join is on the report's own
+    # `Side`, which is why the victim carries one.
+    let killList2 = call("/client/game/profile/list", "")
+    let killScav2 = jsonText(killList2.body, "savage")
+    let killGear2 = textAt(killList2.body,
+                           find(killList2.body, "\"_id\":\"" & killScav2 & "\""),
+                           "equipment")
+    discard call("/client/match/local/end",
+      "{\"exit\":\"Survived\",\"profile\":{\"_id\":\"" & killScav2 &
+      "\",\"Stats\":{\"Eft\":{\"Victims\":[" &
+      "{\"Side\":\"Bear\",\"Role\":\"bear\",\"BodyPart\":\"Head\"}]}}," &
+      "\"Inventory\":{\"equipment\":\"" & killGear2 & "\",\"items\":[" &
+      "{\"_id\":\"" & killGear2 &
+      "\",\"_tpl\":\"55d7217a4bdc2d86028b456d\"}]}}}")
+    let killed2 = traderEntry(
+      profileOf(call("/client/game/profile/list", "").body, uid),
+      "579dc571d53a0658a154fbec")
+    check("and killing a PMC as a scav earns it, at the multiplier the database gives",
+          rawNumberAt(killed2, 0, "standing") == "0.02",
+          "standing is " & rawNumberAt(killed2, 0, "standing") &
+          ", not 0.02 (-0.05 + 0.01 extract + 3 x 0.02)")
+
+    # A role the database prices at `easy` and not at `normal`, and a role it
+    # does not carry at all. Both must earn nothing, so the standing moves by
+    # the extract alone: 0.02 + 0.01 = 0.03. The fixture's `gifter` is -0.9 at
+    # `easy` precisely so that a server which fell back to whichever column the
+    # role happens to have cannot hide -- it would answer -0.87.
+    let killList3 = call("/client/game/profile/list", "")
+    let killScav3 = jsonText(killList3.body, "savage")
+    let killGear3 = textAt(killList3.body,
+                           find(killList3.body, "\"_id\":\"" & killScav3 & "\""),
+                           "equipment")
+    discard call("/client/match/local/end",
+      "{\"exit\":\"Survived\",\"profile\":{\"_id\":\"" & killScav3 &
+      "\",\"Stats\":{\"Eft\":{\"Victims\":[" &
+      "{\"Side\":\"Savage\",\"Role\":\"gifter\",\"BodyPart\":\"Head\"}," &
+      "{\"Side\":\"Savage\",\"Role\":\"bossKilla\",\"BodyPart\":\"Head\"}]}}," &
+      "\"Inventory\":{\"equipment\":\"" & killGear3 & "\",\"items\":[" &
+      "{\"_id\":\"" & killGear3 &
+      "\",\"_tpl\":\"55d7217a4bdc2d86028b456d\"}]}}}")
+    let killed3 = traderEntry(
+      profileOf(call("/client/game/profile/list", "").body, uid),
+      "579dc571d53a0658a154fbec")
+    check("a role this database does not price at `normal` earns nothing rather than the wrong column",
+          rawNumberAt(killed3, 0, "standing") == "0.03",
+          "standing is " & rawNumberAt(killed3, 0, "standing") &
+          ", not 0.03 (0.02 + 0.01 extract, both kills unpriced)")
+
+    # And a death. The configured death figure is zero, so before this the raid
+    # changed nothing at all; the kills are what makes a scav who murders the
+    # map and then dies cost something. 0.03 + 0 - 0.04 = -0.01.
+    let killList4 = call("/client/game/profile/list", "")
+    let killScav4 = jsonText(killList4.body, "savage")
+    let killGear4 = textAt(killList4.body,
+                           find(killList4.body, "\"_id\":\"" & killScav4 & "\""),
+                           "equipment")
+    discard call("/client/match/local/end",
+      "{\"exit\":\"Killed\",\"profile\":{\"_id\":\"" & killScav4 &
+      "\",\"Stats\":{\"Eft\":{\"Victims\":[" &
+      "{\"Side\":\"Savage\",\"Role\":\"assault\",\"BodyPart\":\"Head\"}]}}," &
+      "\"Inventory\":{\"equipment\":\"" & killGear4 & "\",\"items\":[" &
+      "{\"_id\":\"" & killGear4 &
+      "\",\"_tpl\":\"55d7217a4bdc2d86028b456d\"}]}}}")
+    let killed4 = traderEntry(
+      profileOf(call("/client/game/profile/list", "").body, uid),
+      "579dc571d53a0658a154fbec")
+    check("a scav who kills and then dies is still charged for the kills",
+          rawNumberAt(killed4, 0, "standing") == "-0.01",
+          "standing is " & rawNumberAt(killed4, 0, "standing") &
+          ", not -0.01 (0.03 + 0 for the death - 0.04)")
   else:
     note "no database fixture; skipping the scav karma checks"
 
@@ -4340,6 +4460,47 @@ proc main(): int =
           "Info.Voice is " &
           jsonText(memberObject(lookDoc, "Info"), "Voice"))
 
+    # ---- and the same thing through its own route ------------------------
+    #
+    # `/client/game/profile/voice/change` used to be bound to the stock "ok"
+    # stub: it answered `{"status":"ok"}` and wrote nothing, so the voice
+    # selector on the character screen appeared to work and did not, and the
+    # coverage document recorded the route as "served". A refusal the client
+    # swallows is the failure this server is written against; a *success* the
+    # server invents is the same failure from the other side, and nothing in
+    # the suite could see it because the response was correct.
+    #
+    # Which is why the check is on the profile and not on the answer. The
+    # voice asked for here is deliberately not the one the `CustomizationSet`
+    # above just wrote, so a route that writes nothing leaves "Usec_2" behind
+    # and is caught.
+    let voiceRoute = call("/client/game/profile/voice/change",
+                          "{\"voice\":\"cust_voice_usec_1\"}")
+    check("the voice route answers", voiceRoute.ok and
+          not voiceRoute.contains("\"err\":1"), voiceRoute.body)
+    lookDoc = profileOf(call("/client/game/profile/list", "").body, uid)
+    check("and it actually wrote the voice, which it used to only claim",
+          jsonText(memberObject(lookDoc, "Info"), "Voice") == "Usec_1",
+          "Info.Voice is " &
+          jsonText(memberObject(lookDoc, "Info"), "Voice") & ", not Usec_1")
+
+    # And it is the same gate as the item-event door, not a second one with
+    # its own opinions: the other faction's voice is refused by the sentence
+    # `entryAllowed` writes, and nothing is written.
+    let wrongVoice = call("/client/game/profile/voice/change",
+                          "{\"voice\":\"cust_voice_bear_1\"}")
+    check("a voice belonging to the other faction is refused, by name",
+          wrongVoice.contains("not available to Usec"), wrongVoice.body)
+    let notAVoice = call("/client/game/profile/voice/change",
+                         "{\"voice\":\"cust_head_alt\"}")
+    check("and a customisation that is not a voice is refused as one",
+          notAVoice.contains("is not a voice"), notAVoice.body)
+    lookDoc = profileOf(call("/client/game/profile/list", "").body, uid)
+    check("and neither refusal changed the voice the player had",
+          jsonText(memberObject(lookDoc, "Info"), "Voice") == "Usec_1",
+          "Info.Voice is " &
+          jsonText(memberObject(lookDoc, "Info"), "Voice"))
+
     # All or nothing. The first option is good and would be visible; the second
     # is the other faction's. Neither may be written.
     let look2 = memberObject(lookDoc, "Customization")
@@ -4968,6 +5129,75 @@ proc main(): int =
     check("and the one that could not be checked is still started",
           questStatus(counters, uid, "q_nightowl") == "Started",
           "q_nightowl is " & questStatus(counters, uid, "q_nightowl"))
+
+    # ---- the night-only condition, once the raid says what time it is -----
+    #
+    # The raid above went through `/client/match/local/start` with no
+    # configuration behind it, so the server knew nothing about the clock and
+    # `daytime` was refused. That is still the right answer and the check above
+    # is still the one that says so.
+    #
+    # What was wrong was the *reason*: the refusal read `Victim.Time` and
+    # distrusted it, and `Victim.Time` was never the input.
+    # `RaidSettings.TimeAndWeatherSettings` carries `HourOfDay` and
+    # `TimeFlowType`, the client posts them to `/client/raid/configuration`,
+    # and this server parsed that body for the raid id and threw the rest away.
+    # `WeatherHelper.IsNightTime(timeVariant, mapLocation)` in the reference
+    # dump is the proof of method: the game decides night from what was
+    # selected and which map, never from a victim's clock.
+    #
+    # `q_nightowl`'s window is 22 -> 10, twelve hours wide. Customs is 40
+    # minutes of `EscapeTimeLimit`. The two raids below start at the **same
+    # hour** and differ only in how fast the clock runs, which is the whole of
+    # the arithmetic: an hour alone cannot answer this question and a span can.
+    #
+    #   09:00 at x8  ->  09:00..14:20, and the window closes at 10 -- straddled
+    #   09:00 at x0  ->  09:00 flat, one hour inside the window -- credited
+    #
+    # The first raid sends no `timeFlowType` at all, which is the other claim:
+    # a client that does not say gets the **ceiling** of the `TimeFlowType`
+    # enum, x8, because a span that is too short is a kill credited that was
+    # not earned. Read at x1 the same raid would span 09:00..09:40 and be
+    # credited, so this check is what says the default is a ceiling and not a
+    # guess.
+    discard call("/client/raid/configuration",
+      "{\"location\":\"bigmap\",\"timeVariant\":\"CURR\"," &
+      "\"timeAndWeatherSettings\":{\"hourOfDay\":9}}")
+    discard call("/client/match/local/start", "{\"location\":\"bigmap\"}")
+    let dayPre1 = call("/client/game/profile/list", "").body
+    let dayPlayed1 = withVictims(raidProfile(dayPre1, uid),
+      "[{\"Side\":\"Savage\",\"Role\":\"assault\",\"BodyPart\":\"Head\"," &
+      "\"Distance\":40.0,\"Location\":\"bigmap\"}]")
+    discard call("/client/match/local/end",
+      "{\"exit\":\"Survived\",\"location\":\"bigmap\",\"profile\":" &
+      dayPlayed1 & "}")
+    let dayAfter1 = call("/client/game/profile/list", "").body
+    check("a raid that runs out of the window before it ends is still refused",
+          find(dayAfter1, "\"c_nightowl\"") < 0,
+          "c_nightowl was credited for a raid starting at 09:00 whose clock " &
+          "reaches 14:20")
+
+    # Same hour, and now the client says the clock does not move at all.
+    discard call("/client/raid/configuration",
+      "{\"location\":\"bigmap\",\"timeVariant\":\"CURR\"," &
+      "\"timeAndWeatherSettings\":{\"hourOfDay\":9,\"timeFlowType\":\"x0\"}}")
+    discard call("/client/match/local/start", "{\"location\":\"bigmap\"}")
+    let dayPre2 = call("/client/game/profile/list", "").body
+    let dayPlayed2 = withVictims(raidProfile(dayPre2, uid),
+      "[{\"Side\":\"Savage\",\"Role\":\"assault\",\"BodyPart\":\"Head\"," &
+      "\"Distance\":40.0,\"Location\":\"bigmap\"}]")
+    discard call("/client/match/local/end",
+      "{\"exit\":\"Survived\",\"location\":\"bigmap\",\"profile\":" &
+      dayPlayed2 & "}")
+    let dayAfter2 = call("/client/game/profile/list", "").body
+    let nightAt = find(dayAfter2, "\"c_nightowl\"")
+    check("but one whose whole span is inside the window is credited",
+          nightAt >= 0 and numberAt(dayAfter2, nightAt, "value") == 1,
+          "c_nightowl counter is " & $numberAt(dayAfter2, nightAt, "value") &
+          ", not 1 -- the raid ran 09:00 to 09:00 inside a 22->10 window")
+    check("and the night-only quest is ready to hand in",
+          questStatus(dayAfter2, uid, "q_nightowl") == "AvailableForFinish",
+          "q_nightowl is " & questStatus(dayAfter2, uid, "q_nightowl"))
 
   # =========================================================================
   heading "The inbox: read, pinned and removed"

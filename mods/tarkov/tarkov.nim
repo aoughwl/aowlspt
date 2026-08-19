@@ -43,6 +43,7 @@ import emu/templates
 import emu/traders
 import emu/inventory
 import emu/raid
+import emu/questcond
 import emu/quests
 import emu/hideout
 import emu/trading
@@ -85,6 +86,14 @@ var gDefaultBotLimit = 30
 var gFenceKarmaExtract = 0.01
 var gFenceKarmaDeath = 0.0
 var gRaidId = ""
+var gRaidClock = unknownClock()
+  ## The in-game clock the last `/client/raid/configuration` established, kept
+  ## for `emu/questcond`'s `daytime` windows. Kept rather than dropped: the
+  ## parse already existed and everything but the raid id used to be thrown
+  ## away at the end of `onRaidConfiguration`, which is why twelve `Kills`
+  ## conditions across eight quests could never be credited from the victim
+  ## list. One raid at a time, like `gRaidId` beside it -- this server plays
+  ## one player.
 var gSelfCheckFailures: seq[string] = @[]
   ## Every load-time check that did not hold, for `/aowlspt/tarkov/selfcheck`.
   ## Empty is the ordinary state and is also an answer: it is the difference
@@ -302,6 +311,27 @@ proc onNicknameChange(url, body, session: string): string =
   if not saveProfile(p):
     return failure(1, "could not save the profile")
   result = envelope(objOf("status", 0))
+
+proc onVoiceChange(url, body, session: string): string =
+  ## `ProfileChangeVoice`. Both spellings of the one property are read: the
+  ## reference dump names it `Voice` and every other body this client sends
+  ## arrives camel-cased.
+  inc gRequests
+  var voice = field(body, "voice").asText("")
+  if voice.len == 0:
+    voice = field(body, "Voice").asText("")
+  var p = currentProfile(session)
+  if not p.ok:
+    return failure(1, "no profile on this session")
+  var problem = ""
+  if not applyVoice(p, voice, problem):
+    return failure(1, if problem.len > 0: problem
+                      else: "that voice is already set")
+  if not saveProfile(p):
+    return failure(1, "could not save the profile")
+  info p.nickname & " now speaks as " &
+       p.field("Info.Voice").asText("")
+  result = envelope(objOf("status", "ok"))
 
 # ---------------------------------------------------------------------------
 # The item event: everything the player does by dragging something
@@ -949,6 +979,10 @@ proc onRaidConfiguration(url, body, session: string): string =
   inc gRequests
   let cfg = raidConfiguration(body)
   gRaidId = field(cfg, "raidId").asText("")
+  # From the request rather than from the echo: `raidConfiguration` answers
+  # with the five members the client needs back and the clock is not among
+  # them.
+  gRaidClock = raidClock(body)
   info "raid configured: " & field(cfg, "location").asText("?") & " as " &
        field(cfg, "side").asText("?")
   discard broadcast("tarkov.raid.configured", raw(cfg))
@@ -1010,10 +1044,21 @@ proc onMatchEnd(url, body, session: string): string =
     # Scav karma. Applied after the gear has been brought home and before the
     # single save, so a raid that failed to save does not leave the standing
     # moved for a raid whose loot was thrown away.
+    #
+    # The played scav goes in whole rather than just its exit status: the
+    # raid's `Stats.Eft.Victims` are on it, and those carry the game's own
+    # `standingForKill` per role. `endScavRaid` above copies only items off
+    # this document, so this is the one place the kills are still readable.
+    var karmaProblems: seq[string] = @[]
+    var karmaKills = 0
     if applyScavKarma(p, keepsGear(outcome), gFenceKarmaExtract,
-                      gFenceKarmaDeath):
+                      gFenceKarmaDeath, raw(played), karmaProblems,
+                      karmaKills):
       info "Fence standing is now " &
-           $p.field("TradersInfo." & FenceId & ".standing").asFloat(0.0)
+           $p.field("TradersInfo." & fenceId() & ".standing").asFloat(0.0) &
+           " (" & $karmaKills & " kill(s) priced)"
+    for problem in karmaProblems:
+      warn "scav karma: " & problem
     if not saveProfile(p):
       return failure(1, "could not save the profile after the scav raid")
     success "scav raid ended: " & $brought & " item(s) brought home"
@@ -1105,7 +1150,7 @@ proc onMatchEnd(url, body, session: string): string =
   # them, and paying here as well would pay them twice.
   discard advanceQuestsAfterRaid(updated, p.text, raidLocation(body),
                                  field(body, "exit").asText("Left"),
-                                 nowSeconds())
+                                 nowSeconds(), gRaidClock)
 
   # And whatever the raid just earned. After the quest pass rather than before
   # it: an achievement condition can name a quest status, and the status the
@@ -1490,7 +1535,7 @@ proc registerRoutes() =
   discard serve("/client/game/profile/nickname/reserved", onNicknameReserved)
   discard serve("/client/game/profile/nickname/change", onNicknameChange)
   discard serve("/client/game/profile/savage/regenerate", onSavageRegenerate)
-  discard serve("/client/game/profile/voice/change", onOkStatus)
+  discard serve("/client/game/profile/voice/change", onVoiceChange)
   discard serve("/client/game/mode", onGameMode)
   discard serve("/client/profile/status", onProfileStatus)
   # `GetProfileSettings` answers a bare `true`; the client only checks that the
