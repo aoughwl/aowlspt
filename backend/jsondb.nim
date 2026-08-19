@@ -35,19 +35,167 @@
 ## is slower and repeated access is bounded by the depth of the path rather
 ## than by the size of the document.
 ##
-## The index holds **byte offsets into `gDoc`**, so it is only valid for the
-## document it was built from. `dbLoad` and `dbPatchPath` both replace `gDoc`
-## wholesale, and both clear it. That is the whole invalidation story, and it is
-## deliberately not cleverer than that: a partial invalidation would have to
-## reason about which offsets a splice moved, and getting that wrong hands a mod
-## a byte range out of the middle of some other item.
+## ## What a write costs
+##
+## It used to cost the document. `dbPatchPath` ended in
+##
+##     gDoc = gDoc.substr(0, vs - 1) & merged & gDoc.substr(ve)
+##     docReplaced()
+##
+## -- two whole copies of the document, and then the index thrown away so the
+## next read rebuilt it by scanning. On the 41 MB imported database that is
+## **160 ms for a two-hundred-byte patch**, and it is 160 ms whatever the patch
+## says: the cost was `writes x sizeof(document)`. It stayed invisible while
+## every test ran against a fixture of a few dozen entries, and it surfaced as a
+## 54 second server boot. Four mods had grown their own write buffering to get
+## around it, which is a thing no mod should have to know.
+##
+## Two changes take it apart.
+##
+## **The splice happens in place.** `beginStore` hands back the string's own
+## buffer, so a patch is one `moveMem` of the bytes after the edit and a
+## `copyMem` of the patch -- no allocation at all when the replacement fits the
+## capacity the document already has, which after the first growth it does.
+##
+## **The index survives.** The index is byte offsets, and a splice moves every
+## offset after it -- but by a *known* delta. So the index is not held in the
+## document's live coordinates at all: it is held in **anchor coordinates**, the
+## coordinates the document had when the index was last rebuilt, and every
+## splice appends to a short list of edited regions that maps between the two.
+## A lookup is one binary search over that list per path segment, which is
+## nothing beside the hash lookup it accompanies.
+##
+## Three rules keep it honest, and each of them fails *closed* -- to a
+## re-anchor, which is exactly the old behaviour of throwing the index away:
+##
+##  * An anchor offset that lands **strictly inside** a region some later patch
+##    rewrote has no meaning any more. It is refused rather than translated, and
+##    the caller re-anchors. This is the case the old comment here worried
+##    about: handing a mod a byte range out of the middle of some other item.
+##  * Text a patch *wrote* has no anchor coordinate at all -- it did not exist
+##    when the anchor was taken. So the first read that has to index inside a
+##    patched value re-anchors, and after that reads are indexed again. In the
+##    ordinary shape of a run -- mods patch at load, the game reads afterwards
+##    -- that is one re-anchor for the whole session.
+##  * The list is bounded (`EditCeiling`). A run that patches without ever
+##    reading cannot grow it without limit.
+##
+## The document itself stays one contiguous string, deliberately. Holding it in
+## segments would make a splice free, and would put an indirection under every
+## byte of `skipValue` and under the 12.5 MB `substr` that answers
+## `/client/items` -- paying on the request path to save on the load path, which
+## is the wrong way round.
+##
+## ## A patch racing a read
+##
+## It used to be undefended, and said so. Reads took no lock at all, so a
+## `dbPatch` from a request thread while another request was reading was a
+## use-after-free waiting to happen: the old code rebound `gDoc`, dropping the
+## last reference to the buffer a reader was copying out of; the in-place splice
+## that replaced it reads bytes mid-`moveMem` instead, and becomes the same
+## use-after-free the first time the buffer has to grow. With sixteen workers
+## serving concurrently and mods patching from route handlers and from timers,
+## that is reachable rather than theoretical.
+##
+## It is closed by **a reader-writer lock on the document** -- see "the two
+## locks" below for which lock guards what, and why there are two.
+##
+## The alternatives, and why not:
+##
+##  * **A sequence number the reader validates and redoes on.** It does not
+##    address the hazard. The failure here is not a torn read that can be
+##    noticed afterwards and repeated; it is a `substr` copying out of a buffer
+##    that was freed *during* the copy. Validating after the fact arrives too
+##    late, and making it arrive in time means keeping the old buffer alive --
+##    hazard pointers, or an allocator that never reuses -- which is more
+##    machinery than a lock and harder to be sure of.
+##  * **Copy-on-write for the duration of a read.** The document is 41 MB and
+##    `/client/items` is answered out of it several times a second. Refcounting
+##    the buffer instead of copying it would work in principle and is defeated
+##    in practice by the in-place splice, which is the change this file exists
+##    to keep.
+##  * **Serialising writes onto the poller thread.** It moves the writer without
+##    moving the readers, and the race is between a writer and a *reader*. It
+##    would close nothing.
+##
+## What it costs is the thing to check rather than to assert, so it was
+## measured against the real 41 MB database, over the wire, before and after:
+##
+## | | before | after |
+## |---|---|---|
+## | the whole mix | 227 req/s | 230 req/s |
+## | `/client/items` | 83.5 ms | 81.5 ms |
+## | `db_get` | 187 us | 186 us |
+##
+## Which is what a shared acquire should cost: one interlocked compare-and-swap
+## in and one out, tens of nanoseconds against a call that means a hundred and
+## eighty microseconds. It is also the reason the lock is reader-writer rather
+## than the critical section that was already in this file -- an exclusive lock
+## held over the 12.5 MB copy that answers `/client/items` would have serialised
+## the workers behind each other on exactly the request that carries the bytes.
+##
+## And it is checked rather than argued: `backend/dbrace.nim` runs readers and
+## writers on one document at once and asserts on the *answers* rather than on
+## survival. Against this file it does seventy thousand concurrent read passes
+## in eight seconds without a wrong answer. Against a copy of this file with the
+## four lock calls made no-ops, it dies inside a second -- three access
+## violations and two bounds failures in five runs.
 
 import std/[strutils, tables]
 
-{.emit: """#include "aowlspt_net.h" """.}
+# Only the lock is wanted here, so this includes `aowlspt_lock.h` rather than
+# `aowlspt_net.h`: the index has no business dragging winsock and zlib into
+# its translation unit to guard a table.
+{.emit: """#include "aowlspt_lock.h" """.}
 
 proc cLock() {.importc: "aowl_lock", nodecl.}
 proc cUnlock() {.importc: "aowl_unlock", nodecl.}
+
+# ------------------------------------------------------------ the two locks
+#
+# There are two, and which one guards what is the whole of the concurrency
+# story in this file.
+#
+# **`cLock` guards the index.** The member table, the indexed set, the dirty
+# set, the edit list and the anchor generation. It is a critical section --
+# exclusive -- because every one of those is written on the *read* path: the
+# first lookup into an object indexes it.
+#
+# **The document lock guards `gDoc`'s bytes**, and it is a reader-writer lock
+# because the read path is the hot one and reads do not disturb each other.
+# A read holds it shared for the whole of `dbGetPath` -- the walk *and* the
+# `substr` that copies the answer out -- and a patch holds it exclusive for the
+# whole of `dbPatchPath`.
+#
+# The order is always document first, index second, and never the other way,
+# which is what makes the pair impossible to deadlock. Nothing in this file
+# takes `cLock` and then reaches for the document lock.
+#
+# `SRWLOCK_INIT` is all zero bits, so a `static` needs no initialisation call
+# and there is no order to get wrong -- the same reason `aowlspt_net.h`
+# zero-initialises its session table lock. Uncontended, each of these is one
+# interlocked compare-and-swap in and one out, with no kernel transition:
+# tens of nanoseconds against a `db_get` that means 187 microseconds.
+#
+# It is emitted here rather than added to `aowlspt_lock.h` for the reason that
+# file exists at all. `aowlspt_lock.h` is shared with the injected client host,
+# which has no document; this lock is the database's and belongs to the
+# database. Everything in `abi/` is `static` and nimony emits one translation
+# unit per module, so a lock declared there would in any case be a *different*
+# lock in every module that included it -- which is exactly the trap the
+# websocket table fell into.
+{.emit: """
+static SRWLOCK aowl_db_doc_lock;
+static void aowl_db_read_begin(void)  { AcquireSRWLockShared(&aowl_db_doc_lock); }
+static void aowl_db_read_end(void)    { ReleaseSRWLockShared(&aowl_db_doc_lock); }
+static void aowl_db_write_begin(void) { AcquireSRWLockExclusive(&aowl_db_doc_lock); }
+static void aowl_db_write_end(void)   { ReleaseSRWLockExclusive(&aowl_db_doc_lock); }
+""".}
+
+proc docRead() {.importc: "aowl_db_read_begin", nodecl.}
+proc docReadEnd() {.importc: "aowl_db_read_end", nodecl.}
+proc docWrite() {.importc: "aowl_db_write_begin", nodecl.}
+proc docWriteEnd() {.importc: "aowl_db_write_end", nodecl.}
 
 var gDoc = ""
 
@@ -66,23 +214,281 @@ proc indexClear() =
   clear(gMembers)
   clear(gIndexed)
 
-proc docReplaced() =
-  ## Called after every assignment to `gDoc`. The index is byte offsets into a
-  ## document that no longer exists, and a splice moves every offset after it --
-  ## so the whole thing goes, rather than an attempt to fix up the tail. A mod
-  ## reading a range out of the middle of some other item is not a bug that
-  ## announces itself.
-  cLock()
+# ------------------------------------------------------------- the edit list
+#
+# Anchor coordinates, and the map from them to the document as it stands now.
+# Every offset in `gMembers` and every key in `gIndexed` is an anchor offset.
+
+type
+  Edit = object
+    ## One region that a patch replaced. `aStart`/`aStop` are where it was in
+    ## anchor coordinates; `newLen` is how many bytes stand there now.
+    ## `shiftBefore` is the sum of every earlier edit's delta, cached so that
+    ## either translation is a binary search rather than a walk.
+    aStart: int
+    aStop: int
+    newLen: int
+    shiftBefore: int
+
+var gEdits: seq[Edit] = @[]
+  ## Sorted by `aStart` and disjoint. Both properties are maintained by
+  ## `recordEdit` and relied on by both translations.
+
+var gShiftAll = 0
+  ## The shift that applies past the last edit.
+
+var gAnchorGen = 0
+  ## Bumped every time the anchor moves -- every `reanchorLocked`, and every
+  ## `rebaseLocked` that actually had edits to fold in.
+  ##
+  ## This is what makes anchor coordinates safe to hand between the segments of
+  ## one path walk while *other* readers are walking too. A read holds the
+  ## document lock shared, so no patch can be running -- but a second reader
+  ## can, and a reader re-anchors: the first lookup that lands inside text a
+  ## patch wrote folds the edit list away. That silently changes what every
+  ## anchor offset in flight means, including the cursor the first reader is
+  ## halfway down a path with, and the result would be a byte range out of the
+  ## middle of some other item -- the one failure this file's whole design
+  ## exists to refuse.
+  ##
+  ## So a walk records the generation it started in and every lookup re-checks
+  ## it. A mismatch is not an error and not a miss: it is a restart, which is
+  ## the same answer the walk already had for its own re-anchor.
+
+const EditCeiling = 4096
+  ## Edits held before the index is re-anchored. The list is only as long as
+  ## the number of *distinct* regions patched -- patching the same item twice
+  ## coalesces -- but a mod that writes in a loop and never reads would
+  ## otherwise grow it without bound, and a translation is only cheap while it
+  ## is short.
+
+var gPartial = -1
+  ## An object whose indexing was abandoned part-way, so that a rebase drops
+  ## what it did manage to record rather than keeping half an object.
+
+var gDirty = initTable[int, bool]()
+  ## Objects whose *value* a patch replaced, by anchor offset.
+  ##
+  ## Their entry in `gIndexed` survives a translation -- the value still starts
+  ## where it started -- but the member table behind it describes text that is
+  ## no longer there. Without this, a member the patch added is looked up in the
+  ## old table, missed, and reported as a path that does not exist: the one
+  ## thing a merge must never do. Re-indexing such an object always re-anchors,
+  ## because everything in it is text a patch wrote, so this set is emptied by
+  ## every rebase.
+
+proc reanchorLocked() =
+  ## Drop the index and take the current document as the new anchor. This is
+  ## what a wholesale replacement of the document leaves, and it is exactly
+  ## what this file used to do on every single write.
   indexClear()
+  clear(gDirty)
+  gPartial = -1
+  gEdits = @[]
+  gShiftAll = 0
+  inc gAnchorGen
+
+proc toCur(a: int; okOut: var bool): int =
+  ## An anchor offset, in the coordinates the document has now.
+  ##
+  ## Refused -- `okOut` false -- when it lands strictly inside a region a patch
+  ## rewrote, because there is no honest answer: the bytes it named are gone.
+  okOut = true
+  if gEdits.len == 0:
+    return a
+  var lo = 0
+  var hi = gEdits.len
+  while lo < hi:
+    let mid = (lo + hi) div 2
+    if gEdits[mid].aStop <= a: lo = mid + 1
+    else: hi = mid
+  if lo >= gEdits.len:
+    return a + gShiftAll
+  if gEdits[lo].aStart < a:
+    okOut = false
+    return -1
+  result = a + gEdits[lo].shiftBefore
+
+proc toAnchor(c: int; okOut: var bool): int =
+  ## A current offset, in anchor coordinates.
+  ##
+  ## Refused when it points into text a patch *wrote*: that text did not exist
+  ## when the anchor was taken, so it has no anchor coordinate. The boundary of
+  ## such a region does -- which is what lets one patched value be patched
+  ## again without re-anchoring.
+  okOut = true
+  if gEdits.len == 0:
+    return c
+  var lo = 0
+  var hi = gEdits.len
+  while lo < hi:
+    let mid = (lo + hi) div 2
+    if gEdits[mid].aStart + gEdits[mid].shiftBefore + gEdits[mid].newLen <= c:
+      lo = mid + 1
+    else:
+      hi = mid
+  if lo >= gEdits.len:
+    return c - gShiftAll
+  let curStart = gEdits[lo].aStart + gEdits[lo].shiftBefore
+  if c < curStart:
+    return c - gEdits[lo].shiftBefore
+  if c == curStart:
+    return gEdits[lo].aStart
+  okOut = false
+  result = -1
+
+proc recordEdit(aStart, aStop, newLen: int) =
+  ## Fold one splice into the list. Edits wholly inside the new region are
+  ## dropped: their text has just been replaced along with everything else
+  ## between `aStart` and `aStop`, so the one new entry describes all of it.
+  ##
+  ## Nothing can *partially* overlap. `aStart` and `aStop` came back from
+  ## `toAnchor`, which only ever returns an offset outside every edit or the
+  ## exact start of one -- never a point in the middle -- so an existing edit is
+  ## either disjoint from the new region or contained in it.
+  var next: seq[Edit] = @[]
+  for e in gEdits:
+    if e.aStop <= aStart:
+      next.add e
+  next.add Edit(aStart: aStart, aStop: aStop, newLen: newLen, shiftBefore: 0)
+  for e in gEdits:
+    if e.aStart >= aStop:
+      next.add e
+  var shift = 0
+  var i = 0
+  while i < next.len:
+    next[i].shiftBefore = shift
+    shift = shift + next[i].newLen - (next[i].aStop - next[i].aStart)
+    inc i
+  gEdits = next
+  gShiftAll = shift
+
+proc rebaseLocked() =
+  ## Take the current document as the new anchor **without throwing the index
+  ## away**: every offset is translated, and only the entries that cannot be --
+  ## the ones naming text a patch wrote, which never had an anchor coordinate
+  ## -- are dropped.
+  ##
+  ## This is the difference between a re-anchor costing a hash pass over the
+  ## index and costing a fresh scan of the document. A mod filling in a table it
+  ## created itself re-anchors on every write, because every write puts the next
+  ## lookup inside text the previous one wrote; with a clear that is a full walk
+  ## of a 41 MB document per entry, and with this it is a walk of an index that
+  ## has ten things in it.
+  ##
+  ## An object is dropped whenever *any* of its members is, and never kept with
+  ## a hole in it: an object present in `gIndexed` is a promise that its member
+  ## table is complete, and a lookup that finds it half-filled reports a path
+  ## that exists as missing.
+  if gEdits.len == 0:
+    gPartial = -1
+    return
+  inc gAnchorGen
+  # Which objects lose something, before anything is built: an object that
+  # cannot keep all of its members must keep none of them.
+  var dropped = initTable[int, bool]()
+  if gPartial >= 0:
+    dropped[gPartial] = true
+  for k, v in pairs(gDirty):
+    dropped[k] = true
+  for k, v in pairs(gMembers):
+    var i = 0
+    var obj = 0
+    while i < k.len and k[i] != char(31):
+      obj = obj * 10 + (ord(k[i]) - ord('0'))
+      inc i
+    var okObj = true
+    discard toCur(obj, okObj)
+    var okStart = true
+    discard toCur(int(v shr 32'i64), okStart)
+    var okStop = true
+    discard toCur(int(v and 0xFFFFFFFF'i64), okStop)
+    if i >= k.len or not okObj or not okStart or not okStop:
+      dropped[obj] = true
+
+  var members = initTable[string, int64]()
+  for k, v in pairs(gMembers):
+    var i = 0
+    var obj = 0
+    while i < k.len and k[i] != char(31):
+      obj = obj * 10 + (ord(k[i]) - ord('0'))
+      inc i
+    if i >= k.len or hasKey(dropped, obj):
+      continue
+    var okObj = true
+    let objCur = toCur(obj, okObj)
+    var okStart = true
+    let vsCur = toCur(int(v shr 32'i64), okStart)
+    var okStop = true
+    let veCur = toCur(int(v and 0xFFFFFFFF'i64), okStop)
+    if not okObj or not okStart or not okStop:
+      continue
+    members[$objCur & k.substr(i)] = (int64(vsCur) shl 32) or int64(veCur)
+
+  var indexed = initTable[int, bool]()
+  for k, v in pairs(gIndexed):
+    if hasKey(dropped, k):
+      continue
+    var ok = true
+    let cur = toCur(k, ok)
+    if ok:
+      indexed[cur] = v
+  gMembers = members
+  gIndexed = indexed
+  clear(gDirty)
+  gPartial = -1
+  gEdits = @[]
+  gShiftAll = 0
+
+proc spliceDoc(vs, ve: int; repl: string) =
+  ## `gDoc[vs ..< ve] = repl`, in the document's own buffer.
+  ##
+  ## `beginStore` returns a pointer to the string's data and, for a string that
+  ## is already long and uniquely owned with room, does no allocation and no
+  ## copy -- so the whole cost here is one `moveMem` of the bytes after the edit.
+  ## The three-way `substr & repl & substr` this replaced allocated two whole
+  ## copies of the document and then copied both of them again into the
+  ## concatenation.
+  let oldLen = gDoc.len
+  let tail = oldLen - ve
+  let newLen = oldLen - (ve - vs) + repl.len
+  # Grow first, always: `beginStore` with a shorter length would publish the
+  # shorter length before the tail has been moved out of the way.
+  let widest = if newLen > oldLen: newLen else: oldLen
+  let p = beginStore(gDoc, widest)
+  if tail > 0 and repl.len != ve - vs:
+    moveMem(cast[pointer](cast[uint](p) + uint(vs + repl.len)),
+            cast[pointer](cast[uint](p) + uint(ve)), tail)
+  if repl.len > 0:
+    copyMem(cast[pointer](cast[uint](p) + uint(vs)),
+            cast[pointer](readRawData(repl)), repl.len)
+  endStore(gDoc)
+  if newLen < widest:
+    setLen(gDoc, newLen)
+
+proc docReplaced() =
+  ## Called after `gDoc` is replaced *wholesale* -- a load, or a patch of the
+  ## document root. Nothing of the old coordinates survives that, so the index
+  ## goes and the new document becomes the anchor.
+  cLock()
+  reanchorLocked()
   cUnlock()
 
 proc dbLoad*(text: string) =
+  docWrite()
   gDoc = text
   docReplaced()
+  docWriteEnd()
 
-proc dbText*(): string = gDoc
+proc dbText*(): string =
+  docRead()
+  result = gDoc
+  docReadEnd()
 
-proc dbLoaded*(): bool = gDoc.len > 0
+proc dbLoaded*(): bool =
+  docRead()
+  result = gDoc.len > 0
+  docReadEnd()
 
 # --------------------------------------------------------------- scanning
 
@@ -191,55 +597,116 @@ proc memberKey(objStart: int; name: string): string =
   result.add char(31)
   result.add name
 
-proc indexObject(objStart: int) =
-  ## Enumerates the immediate members of the object at `objStart` and records
-  ## each one's byte range. Caller holds the lock.
+proc indexObject(objA: int): bool =
+  ## Enumerates the immediate members of the object at anchor offset `objA` and
+  ## records each one's byte range, in anchor coordinates. Caller holds the
+  ## lock.
   ##
   ## This is `findKeyIn`'s loop with the early return taken out: the scan it
   ## does to find one member finds all of them on the way past, and throwing
   ## that away was the waste.
-  gIndexed[objStart] = true
+  ##
+  ## False means "not in these coordinates" -- either the object itself or one
+  ## of its members lives in text a patch wrote, which has no anchor
+  ## coordinate. The caller re-anchors and asks again. It is never a report
+  ## that the object is malformed; a malformed object indexes as far as it
+  ## parses and returns true, exactly as it always did.
+  var ok = true
+  let objStart = toCur(objA, ok)
+  if not ok:
+    return false
+  gIndexed[objA] = true
   var i = objStart
   skipWs(gDoc, i)
   if i >= gDoc.len or gDoc[i] != '{':
-    return
+    return true
   inc i
   while i < gDoc.len:
     skipWs(gDoc, i)
     if i < gDoc.len and gDoc[i] == '}':
-      return
+      return true
     if i >= gDoc.len or gDoc[i] != '"':
-      return
+      return true
     let nameStart = i
     if not skipString(gDoc, i):
-      return
+      return true
     let name = gDoc.substr(nameStart + 1, i - 2)
     skipWs(gDoc, i)
     if i >= gDoc.len or gDoc[i] != ':':
-      return
+      return true
     inc i
     skipWs(gDoc, i)
     let vs = i
     if not skipValue(gDoc, i):
-      return
-    gMembers[memberKey(objStart, name)] = (int64(vs) shl 32) or int64(i)
+      return true
+    var okStart = true
+    let vsA = toAnchor(vs, okStart)
+    var okStop = true
+    let veA = toAnchor(i, okStop)
+    if not okStart or not okStop:
+      gPartial = objA
+      return false
+    gMembers[memberKey(objA, name)] = (int64(vsA) shl 32) or int64(veA)
     skipWs(gDoc, i)
     if i < gDoc.len and gDoc[i] == ',':
       inc i
       continue
     if i < gDoc.len and gDoc[i] == '}':
-      return
+      return true
+  result = true
 
-proc indexedFind(objStart: int; key: string;
-                 valueStart, valueEnd: var int): bool =
+const RestartCeiling = 8
+  ## Restarts one `locate` will take before it reports the path as missing.
+  ## See the loop at the bottom of `locate` for why a single retry is no longer
+  ## enough and why this cannot spin.
+
+# `gRestart` used to be a `var` up here, set when a lookup gave up its
+# coordinates so that `locate` would walk the path again rather than report a
+# path that is there as missing. One global, written by every reader.
+#
+# With one thread that is a flag. With sixteen it is a lost retry and a
+# spurious one at once: reader A re-anchors and sets it, reader B's next
+# `locate` clears it, and A's walk answers "no such path" for a path that is
+# there -- which the emulator reads as a missing item template. It is a
+# parameter now, threaded down the walk, so a restart belongs to the walk that
+# earned it.
+
+proc indexedFind(objA: int; key: string; valueStart, valueEnd: var int;
+                 gen: var int; restart: var bool): bool =
+  ## `objA` and the range returned are anchor offsets. `gen` is the anchor
+  ## generation this walk believes it is in.
   valueStart = -1
   valueEnd = -1
   cLock()
-  if not hasKey(gIndexed, objStart):
+  if gen != gAnchorGen:
+    # Another reader re-anchored between two segments of this walk. `objA` is
+    # in coordinates that have stopped meaning anything, and translating it
+    # would answer with somebody else's bytes. Start again from the root.
+    cUnlock()
+    restart = true
+    return false
+  var obj = objA
+  if not hasKey(gIndexed, obj) or hasKey(gDirty, obj):
     if len(gMembers) > IndexCeiling:
       indexClear()
-    indexObject(objStart)
-  let packed = getOrDefault(gMembers, memberKey(objStart, key), 0'i64)
+    if not indexObject(obj):
+      # The object, or something in it, is text a patch wrote. Re-anchor --
+      # after which anchor coordinates *are* current ones -- and index it
+      # there. `toCur` is taken before the re-anchor, while the old
+      # coordinates still mean something.
+      var ok = true
+      let cur = toCur(obj, ok)
+      rebaseLocked()
+      gen = gAnchorGen
+      if not ok:
+        # `objA` itself was stale: the caller is walking with an offset from
+        # before some patch, and the walk has to start again.
+        restart = true
+        cUnlock()
+        return false
+      obj = cur
+      discard indexObject(obj)
+  let packed = getOrDefault(gMembers, memberKey(obj, key), 0'i64)
   cUnlock()
   if packed == 0'i64:
     return false
@@ -247,39 +714,142 @@ proc indexedFind(objStart: int; key: string;
   valueEnd = int(packed and 0xFFFFFFFF'i64)
   result = true
 
-proc locate(path: string; valueStart, valueEnd: var int): bool =
-  ## Walks a dotted path down from the document root, one indexed lookup per
-  ## part. The first part is looked up in the root object, whose index is the
-  ## one full pass over the document that this design pays exactly once.
+proc locateOnce(path: string; valueStart, valueEnd: var int;
+                restart: var bool): bool =
+  ## One walk. Anchor coordinates on the way down, current ones on the way out,
+  ## so every caller above this line sees the document as it is now.
+  ##
+  ## The caller holds the document lock -- shared for a read, exclusive for a
+  ## patch -- so `gDoc` cannot move underneath this. What it does not hold is
+  ## the index lock, which is taken and dropped per segment; every stretch of
+  ## anchor arithmetic below is inside it, because `toAnchor` and `toCur` read
+  ## the edit list and another reader's re-anchor rewrites it. That the root's
+  ## translation was outside it was a genuine hole and not a stylistic one.
   valueStart = -1
   valueEnd = -1
   if gDoc.len == 0:
     return false
   var start = 0
   skipWs(gDoc, start)
-  var cursor = start
+  cLock()
+  var gen = gAnchorGen
+  var okRoot = true
+  let rootA = toAnchor(start, okRoot)
+  if not okRoot:
+    # The document's first byte is inside something a patch wrote -- a patch of
+    # the root itself. Nothing of the old coordinates is worth keeping.
+    rebaseLocked()
+    cUnlock()
+    restart = true
+    return false
+  cUnlock()
+  var cursor = rootA
   var first = true
   for part in split(path, '.'):
     if part.len == 0:
       continue
     var vs = 0
     var ve = 0
-    let base = if first: start else: cursor
-    if not indexedFind(base, part, vs, ve):
+    let base = if first: rootA else: cursor
+    if not indexedFind(base, part, vs, ve, gen, restart):
       return false
     cursor = vs
     valueStart = vs
     valueEnd = ve
     first = false
-  result = valueStart >= 0
+  if valueStart < 0:
+    return false
+  # Out of anchor coordinates. A refusal here is a stale index entry -- an
+  # offset inside a region some later patch rewrote -- and is answered by
+  # re-anchoring and walking again, never by reporting the path as missing.
+  cLock()
+  if gen != gAnchorGen:
+    cUnlock()
+    restart = true
+    return false
+  var okStart = true
+  let curStart = toCur(valueStart, okStart)
+  var okStop = true
+  let curStop = toCur(valueEnd, okStop)
+  if not okStart or not okStop:
+    rebaseLocked()
+    cUnlock()
+    restart = true
+    return false
+  cUnlock()
+  valueStart = curStart
+  valueEnd = curStop
+  result = true
+
+proc locate(path: string; valueStart, valueEnd: var int): bool =
+  ## Walks a dotted path down from the document root, one indexed lookup per
+  ## part. The first part is looked up in the root object, whose index is the
+  ## one full pass over the document that this design pays exactly once.
+  ##
+  ## The caller holds the document lock.
+  var restart = false
+  result = locateOnce(path, valueStart, valueEnd, restart)
+  var tries = 0
+  while not result and restart and tries < RestartCeiling:
+    # A second walk normally runs against a freshly anchored index, in which
+    # every offset is a current offset and nothing can be stale -- so one retry
+    # was the whole of this while one thread was the whole story.
+    #
+    # It is not enough now. A read holds the document lock *shared*, so a
+    # second reader can re-anchor between this walk and its retry and send it
+    # back again. Each restart is progress -- there is one anchor, the
+    # generation only moves forward, and a re-anchor leaves anchor coordinates
+    # equal to current ones -- but the progress is not bounded by one, so this
+    # is a bounded loop rather than a single retry. Bounded rather than open so
+    # that it cannot become a spin: reaching the ceiling reports the path as
+    # missing, which is the honest answer about a database being re-anchored
+    # faster than it can be read.
+    restart = false
+    inc tries
+    result = locateOnce(path, valueStart, valueEnd, restart)
+
+proc trimmed(start, stop1: int): string =
+  ## `gDoc[start ..< stop1]` with the whitespace trimmed by moving the indices,
+  ## not by copying twice.
+  ##
+  ## `strip(gDoc.substr(a, b))` reads as one operation and is two allocations
+  ## of the whole value: `substr` cuts it out, `strip` copies the result again
+  ## to shave whitespace off the ends. On `templates.items` that is four
+  ## megabytes copied for nothing -- `locate` already left `valueStart` past
+  ## the leading whitespace, so in the ordinary case `strip` has nothing at all
+  ## to do and the second copy is pure waste.
+  var a = start
+  var b = stop1
+  while a < b and (gDoc[a] == ' ' or gDoc[a] == '\t' or gDoc[a] == '\n' or
+                   gDoc[a] == '\r'):
+    inc a
+  while b > a and (gDoc[b - 1] == ' ' or gDoc[b - 1] == '\t' or
+                   gDoc[b - 1] == '\n' or gDoc[b - 1] == '\r'):
+    dec b
+  if b <= a:
+    return ""
+  result = gDoc.substr(a, b - 1)
 
 proc dbGetPath*(path: string; into: var string): bool =
+  ## The read path, and the hot one.
+  ##
+  ## The document lock is held **shared for the whole of this**, walk and copy
+  ## alike, and the copy is the half that matters: `trimmed` is a 12.5 MB
+  ## `substr` out of `gDoc`'s buffer for `/client/items`, and a patch that
+  ## spliced or grew that buffer underneath it is a use-after-free, not a torn
+  ## read. Shared means readers still do not wait for each other -- which is
+  ## the property this whole file is arranged around -- and a patch waits for
+  ## them, which is the cost, and it is a cost writes already pay in
+  ## milliseconds.
   into = ""
+  docRead()
   var vs = 0
   var ve = 0
   if not locate(path, vs, ve):
+    docReadEnd()
     return false
-  into = strip(gDoc.substr(vs, ve - 1))
+  into = trimmed(vs, ve)
+  docReadEnd()
   result = true
 
 # --------------------------------------------------------------- merging
@@ -410,14 +980,35 @@ proc wrapUnder(parts: seq[string]; fromIndex: int; value: string): string =
     result = "{\"" & parts[i] & "\":" & result & "}"
     dec i
 
-proc dbPatchPath*(path, patchJson: string; error: var string): bool =
-  ## Merges `patchJson` into the value at `path`, **creating the path when it is
-  ## not there**.
+proc applyPatch(vs, ve: int; merged: string) =
+  ## Put `merged` where `gDoc[vs ..< ve]` is, and keep the index.
   ##
-  ## Creating rather than refusing, because refusing made the API unable to
-  ## express the ordinary thing: a mod adding a table of its own, or a location
-  ## the database has never held. A patch of an existing member is still a
-  ## merge, so nothing a mod did not name is disturbed either way.
+  ## The two translations are taken *before* the splice, while the coordinates
+  ## still describe the document the index was read from; the edit is recorded
+  ## after, so a reader that arrives between them sees either the old document
+  ## with the old map or the new document with the new one, and never a map
+  ## that describes neither.
+  cLock()
+  var okStart = true
+  var aStart = toAnchor(vs, okStart)
+  var okStop = true
+  var aStop = toAnchor(ve, okStop)
+  if not okStart or not okStop or gEdits.len >= EditCeiling:
+    # Either this patch lands in text an earlier one wrote -- which has no
+    # anchor coordinate to record against -- or the list has grown as long as
+    # it is allowed to. Both are answered by folding what is there into a new
+    # anchor first, after which anchor coordinates and current ones are the
+    # same thing and this patch records against them cleanly.
+    rebaseLocked()
+    aStart = vs
+    aStop = ve
+  spliceDoc(vs, ve, merged)
+  recordEdit(aStart, aStop, merged.len)
+  gDirty[aStart] = true
+  cUnlock()
+
+proc patchLocked(path, patchJson: string; error: var string): bool =
+  ## The caller holds the document lock exclusively.
   error = ""
   if gDoc.len == 0:
     error = "no database is loaded"
@@ -426,10 +1017,9 @@ proc dbPatchPath*(path, patchJson: string; error: var string): bool =
   var vs = 0
   var ve = 0
   if locate(path, vs, ve):
-    let existing = strip(gDoc.substr(vs, ve - 1))
+    let existing = trimmed(vs, ve)
     let merged = mergeInto(existing, strip(patchJson))
-    gDoc = gDoc.substr(0, vs - 1) & merged & gDoc.substr(ve)
-    docReplaced()
+    applyPatch(vs, ve, merged)
     return true
 
   # Find the deepest prefix that does exist, and merge the missing tail into it
@@ -456,10 +1046,34 @@ proc dbPatchPath*(path, patchJson: string; error: var string): bool =
   if not locate(joinPathParts(parts, have), vs, ve):
     error = "could not create the database path: " & path
     return false
-  let existing = strip(gDoc.substr(vs, ve - 1))
-  gDoc = gDoc.substr(0, vs - 1) & mergeInto(existing, tail) & gDoc.substr(ve)
-  docReplaced()
+  let existing = trimmed(vs, ve)
+  applyPatch(vs, ve, mergeInto(existing, tail))
   result = true
+
+proc dbPatchPath*(path, patchJson: string; error: var string): bool =
+  ## Merges `patchJson` into the value at `path`, **creating the path when it is
+  ## not there**.
+  ##
+  ## Creating rather than refusing, because refusing made the API unable to
+  ## express the ordinary thing: a mod adding a table of its own, or a location
+  ## the database has never held. A patch of an existing member is still a
+  ## merge, so nothing a mod did not name is disturbed either way.
+  ##
+  ## The document lock is held **exclusively across the whole operation**, not
+  ## merely across the splice. The splice is not the only part that touches the
+  ## document: the merge reads the existing value out of it first, and a merge
+  ## against a value some other patch has since replaced writes back text that
+  ## was never there -- a lost update rather than a crash, which is the harder
+  ## kind to notice. Read, merge and write are one operation or they are a race,
+  ## and this is the only place that can say so.
+  ##
+  ## It is the whole of `dbPatchPath` rather than of `applyPatch` for the same
+  ## reason the session lock in `aowlbackend.nim` wraps the whole handler rather
+  ## than the store call: anything narrower leaves the same race in a smaller
+  ## window.
+  docWrite()
+  result = patchLocked(path, patchJson, error)
+  docWriteEnd()
 
 # --------------------------------------------------------------- config
 
