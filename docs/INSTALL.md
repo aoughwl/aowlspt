@@ -1,7 +1,50 @@
 # Installing
 
 From a Tarkov install the official launcher maintains, to a modded one you can
-start. Six commands, in order, and what to do when one of them refuses.
+start: seven steps, in order, and what to do when one of them refuses.
+
+This is the order somebody actually walked, not an idealised one. `tools/firstrun.nim`
+walks the same order automatically — a synthetic client, `payload`, `install`,
+`importdb`, `verify`, the client's boot sequence, a mod switched off and on, a
+restart — and asserts each step, so the day one of them stops working it is
+caught at the step that broke it:
+
+```
+installer\build\firstrun.exe --scratch C:\scratch\firstrun
+```
+
+It writes nothing outside `--scratch`, and it exits 0 with an explanation when
+there is no SPT install to import a database from. It is a repository tool and
+is not in the release archive: it builds a client fixture with a compiler.
+
+**This document ships inside the release archive as well as living in the
+repository, and the two are laid out differently.** If you extracted a `.zip`,
+you can skip step 2 entirely — the payload is already built and already in
+front of you — and the tools are one directory over from where the commands
+below say:
+
+| | you extracted `aowlspt-<version>.zip` | you cloned the repository |
+|---|---|---|
+| the tools | `install\` | `installer\build\` |
+| the payload | `payload` | `installer\payload` |
+| step 2 | skip it | do it |
+
+So `detect` is `install\aowlspt-install.exe detect` from the archive and
+`installer\build\aowlspt-install.exe detect` from the repository. Commands are
+written the repository's way below; substitute if you downloaded.
+
+## What version is this
+
+One line in `VERSION`, at the top of the archive and at the top of the
+repository, and that number is the whole release: the archive is named after
+it, `MANIFEST.sha256` is headed with it, the `payload.json` inside the archive
+carries it, and `aowlspt-install` writes it into `aowlspt-install.txt` so a
+finished install can still say which build it is. `aowlspt-verify` prints it
+back. Nothing else versions the bundle — the numbers in `registry/mods.json`
+version individual mods and move independently.
+
+It is not a Tarkov version. `targetTarkovVersion` in `payload.json` is that,
+and the two are unrelated numbers that appear on the same screen.
 
 ## Read this part first
 
@@ -52,7 +95,7 @@ D:\Games\Tarkov
   flavour   vanilla
   build     027f6efbac104c93993ac42b36d26826
   present   BattlEye
-  suitable  yes -- this is a post-1.0 client
+  suitable  yes — this is a post-1.0 client
 ```
 
 Write the **version** down. It is the number the payload has to declare, and it
@@ -84,8 +127,16 @@ installer\payload\
     mods\<name>\<name>.dll   every mod, with its config.json and its data\
 ```
 
-Then open `installer\payload\payload.json` and make `targetTarkovVersion` the
-number `detect` gave you:
+`payload.json` is **not** produced by `aowl payload` and is not in the
+repository: it is per-machine, so it is `.gitignore`d and you make it once.
+
+```
+copy installer\payload\payload.json.template installer\payload\payload.json
+```
+
+Then open it and make `targetTarkovVersion` the number `detect` gave you.
+`aowl payload` ends with a warning when the file is still missing; that warning
+is this paragraph.
 
 ```json
 {
@@ -107,9 +158,37 @@ written:
 | `targetBackend` | `il2cpp` for post-1.0, `mono` for pre-1.0. Not inferable from the version |
 | `kind` | `full` mirrors a client from `--source` into `--target` and lays the payload over it. `overlay` adds only to an install already at `--target` |
 
-`aowl payload` warns if a piece is missing rather than staging a payload that
-looks complete. **Read those warnings.** "the IL2CPP client host is not built"
-means the install you are about to make will start the game with no mods in it.
+**Read the exit codes, not just the output.** `aowl build` exits 1 if any one
+mod fails to compile. `aowl payload` used to exit **0** anyway, staging that
+mod's `config.json` and `data/` into a directory with no library in it —
+which installs perfectly, is loaded by nothing, and says nothing at all until
+step 6. It now refuses:
+
+```
+error mod <name> has no library; its config and data would install as a
+      directory nothing loads. Build it first.
+error 1 mod(s) staged without a library; this payload is not installable
+```
+
+**The three binaries a payload is useless without are refused on the same
+terms.** A missing IL2CPP client host means the install you are about to make
+starts the game with no mods in it; a missing backend means the client has
+nothing to talk to; a missing launcher means there is no way to start the game
+at all. Each of the three used to be a *warning* on a run that exited 0 —
+`aowl release` and `aowlspt-verify` both caught it later, so the release path
+was safe, but a payload staged by hand and installed straight was not. All
+three are now errors (`tools/aowl.nim:1721`, `:1733`, `:1743`) and they are
+counted into the same tally as a library-less mod:
+
+```
+error the IL2CPP client host is not built; a post-1.0 payload without it
+      installs a client that loads nothing. Build it first.
+error 1 missing piece(s) above; this payload is not installable
+```
+
+What `aowl payload` still only *warns* about is a missing
+`registry/mods.json` — the mod manager would have nothing to manage — and a
+missing `payload.json`, which is the paragraph above. **Read the warnings.**
 
 ## 3. See what would happen
 
@@ -138,9 +217,12 @@ installer\build\aowlspt-install.exe install ^
     --payload installer\payload
 ```
 
-It prints the same plan, asks once, and does it. On a real install this takes
-seconds, because the ~77 GB of asset bundles that nothing ever writes to are
-hard linked rather than copied. Everything a patcher could plausibly rewrite —
+It prints the same plan, asks once, and does it. `--yes` skips the question,
+which is what a script wants and not what you want the first time.
+
+On a real install this takes seconds, because the ~77 GB of asset bundles that
+nothing ever writes to are hard linked rather than copied. Everything a patcher
+could plausibly rewrite —
 the executables, `GameAssembly.dll`, `UnityPlayer.dll`, `il2cpp_data\`,
 `Plugins\`, `boot.config` — is copied even so, because a hard link is a second
 name for the same bytes and writing through one would reach back into the
@@ -180,7 +262,41 @@ Useful flags:
   payload.
 - `--dry-run` — print every step and execute none.
 
-## 5. Check it
+## 5. Give it the game's data
+
+**This step is not optional and it is not in the installer.** Everything above
+produces a complete, verifiable, *empty* server: it answers every route the
+client asks, out of the emulator's built-in fallbacks, with no items, no
+traders, no quests and no maps in any of them. The payload does not carry a
+database and cannot — what would be in it is BSG's data, by way of SPT's, and
+that is not something this repository distributes.
+
+```
+installer\build\aowl.exe importdb --from D:\SPT --out D:\Aowlspt\aowlspt
+```
+
+From the archive the same importer is a tool of its own, because this step is
+mandatory and there is no `aowl.exe` in a download:
+
+```
+install\aowl-importdb.exe --from D:\SPT --out D:\Aowlspt\aowlspt
+```
+
+About three seconds and 39 MiB later there is a `db.json` where the backend looks
+for it. **`--out` is the `aowlspt\` directory inside the install, not the
+install root**: the backend is started with `--root <target>\aowlspt` and
+reads `<root>\db.json`. Put it one level up and the server comes up on its
+fallbacks with nothing anywhere saying why.
+
+The importer opens the SPT install read-only and refuses an `--out` inside it.
+[IMPORTDB.md](IMPORTDB.md) has what converts, what does not, what the self-check
+asserts, and the flags for a smaller or larger database.
+
+If you do not have an SPT install, you do not have a database, and there is
+currently no other way to get one. The server will still start, `aowlspt-verify`
+will still pass, and the game will have nothing in it.
+
+## 6. Check it
 
 ```
 installer\build\aowlspt-verify.exe --root D:\Aowlspt
@@ -196,24 +312,54 @@ and stops it again.
 ```
 Result
 ------
-  29 checks
+  28 checks
+  1 warning(s)
 ok    this install is complete and serves
 ```
 
-`--offline` does the file checks and starts nothing.
+The count moves as mods are added, so do not read a number off this page; read
+the failures and the warnings. (28 is what a `tools/firstrun.nim` install
+reported on the development machine on 2026-08-19; it was 26 when this page
+was first written, and the number moving is the point.)
+
+**The warnings are the interesting part.** A missing `db.json` is one of them:
+the install is not broken, there is no game in it, and those are two different
+sentences.
+
+```
+warn  the game's data is installed: there is no D:\Aowlspt\aowlspt\db.json,
+      so the emulator answers out of its own fallbacks: it will serve, and the
+      client will find no items, no traders and no quests.
+```
+
+A `db.json` under about 4 MB gets its own warning, because a real import is
+tens of megabytes and anything smaller is a test fixture or a half-written
+file. So does an install whose `aowlspt-install.txt` does not name a release,
+which means it was assembled by hand out of a staging directory rather than
+installed from a payload.
+
+The last line is exact about what was proved. "this install is complete and
+serves" is printed only when the backend was started and answered; with
+`--offline`, which starts nothing, it prints "the files of this install are all
+present" and says what it did not do. A tool that reports a server answering
+when it never opened a socket is the failure it exists to catch.
+
+Without `--offline` it takes about a minute on an install with a real database,
+almost all of it waiting for the backend to load. That is not this tool being
+slow — see step 7.
 
 `aowlspt-install verify --target D:\Aowlspt` is a different and narrower check:
 it reads the uninstall manifest and asks whether the paths it names are still
 there. Both are worth having.
 
-## 6. Play
+## 7. Play
 
 ```
 D:\Aowlspt\aowlspt\aowlspt-launch.exe
 ```
 
-It starts the backend, waits until it is actually up, then starts
-`EscapeFromTarkov.exe` **suspended**, loads `aowlspt-host-il2cpp.dll` into it,
+It starts the backend, checks a moment later that it has not exited, then
+starts `EscapeFromTarkov.exe` **suspended**, loads `aowlspt-host-il2cpp.dll` into it,
 and resumes. The game comes up with the host already inside it and nothing in
 the install pretending to be a Windows component — no `winhttp.dll`, no
 doorstop, no BepInEx.
@@ -233,6 +379,60 @@ Two logs, and between them they answer almost every question:
 
 On a cold launch the host waits for the game to bring IL2CPP up before it can
 resolve anything, which takes a while. `aowlspt-host.json` sets how long.
+
+**The server is the slow half, and the launcher now waits for it.** Measured on
+the development machine, with the mod set a default install carries and the
+39 MiB imported database:
+
+| | boot to first answer |
+|---|---:|
+| the emulator alone, imported database | 0.6 s |
+| every mod in the payload, imported database | **2.9 s** |
+| the same, before the mods were batched | 54 s |
+
+The 54 s was one defect wearing four hats, and it was never really the mods.
+`dbWrite` costs the size of the *database*, not the size of the patch: the
+backend holds the whole thing as one text document, splices the patch into it,
+and throws its member index away — so every call copies 41 MB twice and the next
+read rebuilds the index by scanning 41 MB again. That is **95–130 ms per call**,
+whatever the call says.
+
+Four mods were issuing about **420** of them between them. `blackdivision`
+registering through `morebots` was ~390 on its own, mostly hostility relations:
+`fromFaction: "savage"` names thirty-seven roles and each one had four `Mind`
+arrays read and written individually. `sain` wrote one map at a time (19),
+`icebreaker` one table at a time (13). Each mod now builds its whole
+contribution in memory and writes it in as few patches as its shape allows —
+ten between all four — and the resulting document is identical, because a merge
+of merges is the same document as one merge of the merged patch.
+
+What is left is those ten calls, about 1.9 s of the 2.9. Going lower means
+making `dbPatch` itself cheaper than "rewrite the document"; the mods have run
+out of writes to remove.
+
+`aowlspt-launch` no longer sleeps a fixed 1.2 s before starting the client. It
+polls `127.0.0.1:<port>` until the backend answers a request — a socket that
+accepts is exact rather than approximate, because the backend opens the port
+only after the last mod has loaded — printing a line every five seconds while it
+waits, and giving up after `--backend-wait` seconds (300 by default) with a
+warning rather than silently. So the old workaround is no longer needed; it
+still works if you want the server in its own window:
+
+```
+D:\Aowlspt\aowlspt\aowlspt-backend.exe --root D:\Aowlspt\aowlspt --port 6969
+D:\Aowlspt\aowlspt\aowlspt-launch.exe --no-backend
+```
+
+With `--no-backend` the launcher checks the port once and says whether anything
+is answering, rather than assuming.
+
+**Stopping the server is killing it.** There is no shutdown route and no console
+handler; `--wait` stops the backend with `TerminateProcess` when the game exits,
+and closing the window does the same. That is safe on purpose rather than by
+luck — a profile write is a temporary file renamed over the key, so there is no
+half-written value to find afterwards (`docs/BACKEND.md`, "What survives a
+crash") — but it does mean "stop the server" and "kill the server" are the same
+operation here.
 
 If the launcher cannot inject, it **kills the client rather than resuming it**.
 A game running without its host is worse than no game, because you would be in a
@@ -256,6 +456,29 @@ lists and the resolution rules, and press **Insert** in game for the overlay.
 Your own choices live in the mod manager's store, not in the registry and not in
 `config.json`. The `--list` you installed with is the seed for the first run and
 is not consulted again after you change anything.
+
+`disable` and `enable` record a decision; **`/aowlspt/mods/apply` is what
+performs it.** The reply to a disable says so (`"inEffect":"apply it with
+/aowlspt/mods/apply"`), and a route belonging to a disabled mod keeps answering
+until you call it.
+
+**A `"not-selected"` mod is not running.** This page used to say the opposite —
+that the backend loaded every `.dll` under `aowlspt\mods\` and nothing took the
+unselected ones out until somebody called `/aowlspt/mods/apply`, so a mod the
+panel reported as `"not-selected"` had already run its `on_load` and registered
+its routes. That is no longer true. The manager writes what it resolved to
+`aowlspt-selection.json`, and `host/common/modhost.nim:646-717` reads that file
+*before* it opens anything: each candidate library is loaded, asked what it
+calls itself through `describe`, and put straight back down without being
+initialised (`probeGuid`, `:657`). A mod that is not in `load` never runs a line
+of its own code — no `on_load`, no database writes, no routes.
+
+Four ways of not having a selection and all four load everything, which is what
+a fresh install needs: the file absent, unreadable, written for another side, or
+naming an empty `load`. [MODMANAGER.md](MODMANAGER.md) has why the last one is a
+refusal rather than an instruction. A brand-new install has no selection file
+until the manager has run once, so the first start after installing is still a
+directory walk.
 
 ## Refusals
 
@@ -345,9 +568,11 @@ install guides.
 
 | | |
 |---|---|
-| the installer's refusal matrix | 122 automated checks, against constructed values — including the cases you cannot produce on demand |
+| the installer's refusal matrix | 126 automated checks, against constructed values — including the cases you cannot produce on demand |
 | the filesystem layer | against a real temporary directory, including that a hard-linked file in the target does not write through to the source |
 | build → payload → install → verify → launch | end to end, against a synthetic install carrying a real version resource, IL2CPP layout and asset bundles |
+| the whole first-run path, in this order | `tools/firstrun.nim`: from a synthesised vanilla client through payload, install, `importdb`, `verify`, the client's boot sequence against a 39 MiB imported database, a mod switched off and on live, and a restart with the profile still in it |
+| the release archive | `aowl release`: every gate before a byte is written, then the `.zip` it just wrote opened again and checked entry by entry against the shape the installer reads. Two runs of one tree into one output directory are byte-identical |
 | the host inside a foreign process | injected, loaded its mods, and reported the IL2CPP runtime as absent rather than crashing — which is the correct answer when there is no game |
 | the backend and the emulator | started from the installed tree and answered the client's boot sequence over the wire, zlib framing included |
 | **the real client** | **never** |

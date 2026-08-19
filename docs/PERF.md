@@ -37,27 +37,177 @@ simply not on the path.
 gcc 15.2 (ucrt64) at nimony's default optimisation. Median of three runs.
 
 ```
-aowl build-tools           # or the direct nimony line at the top of perfbench.nim
-perfbench tests\mockil2cpp\GameAssembly.dll
+aowl build                                          # builds perfbench too
+installer\build\perfbench.exe tests\mockil2cpp\GameAssembly.dll
 ```
+
+`aowl test` builds it and runs it every time, and prints this table, because a
+performance claim that is not re-checked is a performance claim that quietly
+stops being true.
+
+Be exact about what that gate asserts, though, because it is **correctness and
+not a threshold**. `perfbench` exits non-zero when `methodPointer` does not land
+in an executable page, when the fast call, the boxed property getter and the
+direct field read disagree about `Health`, when `Add(2, 40)` is not 42, or when
+the hook target's compiled body turns out to be the generic invoker — a
+benchmark of a path that returns the wrong answer is a benchmark of nothing. It
+also counts the detour's firings and says so if a "patched" row was really
+measuring an unpatched function. What it does *not* do is compare any number
+against a budget: a row that got slower appears in the printed table and does
+not fail the run. Reading the table is still a person's job.
+
+There is no `aowl build-tools`; the direct nimony line is at the top of
+`perfbench.nim` if you want to build only this.
+
+Re-derived on 2026-08-18 with msys2 ucrt64 gcc 15.2.0, by running
+`installer\build\perfbench.exe --runtime tests\mockil2cpp\GameAssembly.dll`
+and copying its table. The hook rows below the fold are from the same run,
+which is why they are here rather than in a second table of their own.
 
 | operation | ns/op | × fastest |
 |---|---:|---:|
-| boxed call, type resolved by name (host `call`) | 1235 | 654 |
-| boxed call, class in hand (host `#n::` target) | 952 | 504 |
-| `il2cpp_runtime_invoke` alone, arguments prebuilt | 41 | 22 |
-| **fast call, static, 2 int args → int** | **10.2** | **5.4** |
-| **fast call, instance, 1 float arg → float** | **8.4** | **4.5** |
-| **fast call, instance, no args, void** | **6.5** | **3.4** |
-| field via property getter, boxed invoke | 48 | 26 |
-| field via host `@Name` path (JSON out) | 305 | 162 |
-| **field via cached offset, direct load** | **1.88** | **1.00** |
-| field via cached offset, int32 | 2.5 | 1.3 |
+| boxed call, type resolved by name (host `call`) | 1103.6 | 590 |
+| boxed call, class in hand (host `#n::` target) | 951.5 | 509 |
+| `il2cpp_runtime_invoke` alone, arguments prebuilt | 42.9 | 23 |
+| **fast call, static, 2 int args → int** | **10.07** | **5.4** |
+| **fast call, instance, 1 float arg → float** | **8.40** | **4.5** |
+| **fast call, instance, no args, void** | **5.95** | **3.2** |
+| field via property getter, boxed invoke | 42.6 | 22.8 |
+| field via host `@Name` path (JSON out) | 381.7 | 204 |
+| **field via cached offset, direct load** | **1.87** | **1.00** |
+| field via cached offset, int32 | 2.44 | 1.30 |
+| bound call, unpatched | 3.47 | 1.85 |
+| prefix hook, JSON arguments | 626.5 | 335 |
+| **prefix hook, typed frame** | **23.08** | **12.3** |
+| postfix hook, JSON result and arguments | 1101.7 | 589 |
+| postfix hook, JSON + replacement | 1524.9 | 815 |
+| **postfix hook, typed frame** | **24.11** | **12.9** |
+| **postfix hook, typed frame + replacement** | **36.70** | **19.6** |
+
+Two of these moved enough since the numbers this page used to carry to be worth
+naming rather than quietly overwriting: the boxed call by name was **1235** and
+is 1104, and `field via host @Name path` was **305** and is 382. Both are the
+same code on a newer compiler; neither changed for a reason anybody intended,
+which is the argument for re-running the table rather than remembering it.
 
 Binding costs, measured the same run: a field binding is 1–7 µs, a method
 binding 3–9 µs. Almost all of that is `findClass`, which walks every loaded
 assembly. That is the whole argument for binding once: it costs about as much
 as a hundred bound calls, and then it costs nothing.
+
+### Handles, addresses and postfix patches
+
+Two paths the table above predates, measured by `examples/highlevel` against the
+same stand-in on the same machine, in the run `hostharness` drives. They are
+reported here because both are new prices a mod has to choose between.
+
+| operation | ns/op |
+|---|---:|
+| `pointerOf(handle)` — the address behind a handle | 8 |
+| the boxed property read it replaces (`get_Health` through a handle) | 1112 |
+| a bound call, unpatched | 3 |
+| the same call with a postfix that only *watches* the return value | 443 |
+| the same call with a postfix that reads the arguments and replaces the result | 2320 |
+| **the same hook on the typed path** (`hookReturnTyped`, result read and replaced) | **80** |
+
+**The address bridge is the cheap one and it is not close.** 8 ns against 1112:
+a hook that wants anything from the object it fired for should take the address
+and use its own bindings, not call back through the handle. That is the whole
+capability — before it, `hookArgs` could tell a mod *which* object, and reaching
+that object cost a microsecond.
+
+**A postfix is not cheap, and the two prices are far apart.** 440 ns to watch a
+return value; 2.4 µs to also build `this` and the argument list and parse a
+replacement back. Both are dominated by the payload, not by the thunk — the
+thunk's extra `call`/`ret` and register save are single-digit nanoseconds. So:
+`hookReturn(..., withArgs = false)` when the result is all you need on the JSON
+path, and `hookReturnTyped` when the hook fires once per entity per frame. At
+2.3 µs, forty bots at 60 fps would be 5.5 ms a frame, which is not a patch, it
+is a stutter; the same hook on the typed path is 80 ns, which is 190 µs.
+
+Neither number includes what a mod does *inside* its handler.
+
+### A hook's price is the payload, and there are now two payloads
+
+`perfbench` measures all six forms on one method — `EFT.Player::Ping`, a static
+compiled `Single -> Single` in the stand-in, reached through a bound call so
+that the unpatched row is a real bound call and every other row is that same
+call with the detour in the middle. The bench asks the mock whether that method
+has a compiled body before reporting anything, because a row whose
+`methodPointer` is the invoker would time the invoker and say nothing about the
+method.
+
+Median of three runs, same machine as the tables above.
+
+| operation | ns/op | × unpatched | × the JSON form |
+|---|---:|---:|---:|
+| bound call, unpatched | 3.3 | 1 | — |
+| prefix hook, JSON arguments | 645 | 194 | 1 |
+| **prefix hook, typed frame** | **23.3** | **7** | **28× faster** |
+| postfix hook, JSON result and arguments | 1144 | 344 | 1 |
+| **postfix hook, typed frame** | **24.9** | **7** | **46× faster** |
+| postfix hook, JSON + replacement | 1615 | 485 | 1 |
+| **postfix hook, typed frame + replacement** | **37.3** | **11** | **43× faster** |
+
+The two tables report the same hook at two different prices -- 80 ns in the
+`examples/highlevel` row above and 37 ns here -- and the gap is real rather than
+noise. `perfbench` arms the frame and reads it inside one binary; the mod-side
+figure crosses the ABI into a mod DLL, and every accessor there is an ordinary
+call rather than an inlined load, because `{.emit.}` is scoped to the module
+that has the header and an inline body copied into an importing mod would not
+compile. Roughly forty nanoseconds for a handler that makes six reads. Both
+numbers are worth having: the first is what a mod pays, the second is what the
+mechanism costs.
+
+The JSON-plus-replacement row is the noisiest of the seven — 1590 to 2225 across
+runs — because it is the only one that formats a float to text and parses it
+back, and that is two allocator round trips whose cost depends on what the heap
+looks like. The typed rows do not vary, because they do not allocate.
+
+Twenty-seven to forty-two times, and the thunk is identical in every row. What
+differs is what the host does with the registers the thunk saved: the JSON rows
+build a string, ask the runtime what every parameter is, register a GC handle
+per reference, hand the string across the ABI where the mod copies it into its
+own heap and parses it, and take a host-allocated buffer back. The typed rows
+store six words into a pooled frame and call.
+
+Two of those costs are worth naming separately because they do not appear in
+this table at all. `Ping` takes a float and no references, so the JSON rows here
+pay **no** `il2cpp_gchandle_new`; a hook on a method with an object argument —
+which is most of the interesting ones — pays one allocation and one free per
+reference per firing on top of the figures above, and the typed path pays
+neither. And the runtime interrogation the JSON path does per firing is exactly
+what the typed path moved to registration: shapes are computed once, out of
+`il2cpp_method_get_param` and `shapeOfType`, when the patch is installed.
+
+**Allocation-free is measured, not asserted.** `examples/highlevel` fires a
+typed postfix twenty thousand times and checks three counters that must not
+move: mimalloc's cumulative allocation count inside the *mod* (mimalloc counters
+only ever increase, so an unchanged count means no allocations at all rather
+than none *net*), and the host's own `payloadBytes` and `handlesTaken`, readable
+through `call("aowlspt.host::patch_stats")`. The measured result on the
+stand-in: **0 allocations in the mod and 0 payload bytes in the host over 20000
+typed firings, against 20000 allocations and 780000 payload bytes for the same
+20000 through the JSON hook.**
+
+The control matters as much as the result, and finding that out cost a rewrite.
+The first control was the *watching* JSON postfix, whose payload is
+`{"result":5.0}` — fourteen bytes, which a nimony string keeps inside the string
+object with no heap block. So both paths reported zero, which proves nothing
+rather than proving the typed path is free. The control is the full form now.
+
+**When to use which.** `hookArgs`/`hookReturn` unless the hook fires per entity
+per frame. JSON is self-describing, survives an argument the host cannot
+classify, reads a `System.String` for you, and 2 µs at 10 Hz is 0.002 percent of
+a frame. `hookTyped`/`hookReturnTyped` when the hook is on the per-frame path:
+at forty bots and 60 fps the difference is 5.3 ms a frame against 60 µs, which
+is the difference between a stutter and a mod.
+
+`mods/classicmovement`'s `InertiaSmoothTilt` redirect is the worked conversion.
+It reads `this` and two floats and suppresses, once per movement context per
+frame, and it now arms the typed form when the host reports revision 4 and the
+JSON form otherwise — saying which in its own state line, because the two differ
+by roughly a hundredfold and "armed" alone would hide that.
 
 ### Reading the table
 
@@ -110,26 +260,59 @@ an instance one, and then it is a load.
 - **Binding.** 3–9 µs, dominated by `findClass` walking every assembly. Not
   worth fixing: it happens once. It *is* worth not doing in `onLoad` — the
   game's assemblies are not up yet then, and the binding will correctly refuse.
-- **Anything the fast path refuses.** `Vector3` and `Quaternion` arguments and
+- **Anything `bindMethod` refuses.** `Vector3` and `Quaternion` arguments and
   returns, `double` arguments, five or more arguments, enums, generic
-  instantiations, arrays. These stay on the boxed path. The `Vector3` case is
-  the one that will bite: Win64 passes a 12-byte struct by hidden pointer,
-  which is a different call shape rather than a different register class, and
-  covering it means generating more trampolines rather than more cases.
+  instantiations, arrays. `bindMethodAs` lets a mod assert the register classes
+  the inference would not commit to; `bindRaw` goes further and is described
+  below. What is left after both stays on the boxed path.
+
+  The `Vector3` case turned out **not** to need more trampolines, which is
+  worth correcting because this document said it did. Win64 passes anything
+  larger than eight bytes and not a power of two by hidden pointer and returns
+  it the same way, so `Vector3 get_Position()` is really
+  `void* f(void* sret, void* this, MethodInfo*)` — every slot a plain pointer,
+  which the existing table already passes. What was missing was a way to *say*
+  that a method's slot shape differs from its signature. `bindRaw` is that, and
+  it is the sharpest tool in the module: the mod asserts a calling convention,
+  and a wrong slot count reads an uninitialised register as an argument, which
+  is a plausible number rather than a crash. Last resort, with a comment at
+  every use saying why the shape is what it claims.
+
+- **Virtual dispatch, which the fast path does not do.** A bound call goes
+  straight to a compiled body, so a binding taken *by name* against
+  `EFT.Player` calls `EFT.Player`'s implementation even on a subclass that
+  overrides it — silently, with a plausible answer. `bindOnObject` binds against
+  the class the live object actually is, walking its base chain, and
+  `bindInClass` takes a class the mod already holds. That is also the only way
+  to reach a generic instantiation like `List<Player>`: it has no name
+  `findClass` accepts, but any instance of one can hand over its class.
 - **Strings.** Passing a `System.String` argument still means
   `il2cpp_string_new`, which allocates in the managed heap. The fast path
   removes the boxing around the call, not the string itself.
-- **Reference field writes.** `writePtr` skips IL2CPP's write barrier, because
-  `il2cpp_gc_wbarrier_set_field` is not in the binding. Safe for a pointer the
-  object already reachably holds; not safe for a fresh allocation.
-- **Static fields.** `il2cpp_field_get_offset` on a static field returns an
-  offset into the class's static data block, which needs
-  `il2cpp_class_get_static_field_data` to reach. `bindField` refuses them.
+- **Reference field writes.** `writePtr` goes **through** the collector's write
+  barrier now, resolved once at bind time; `writePtrRaw` is the deliberate
+  opt-out for a pointer the object already reachably holds, and `barrierReady`
+  says which you are getting. The stand-in exports the barrier and counts
+  calls, so the gate asserts both the mod's line and the runtime's counter —
+  one alone proves nothing, since a stand-in without the export leaves the
+  binding silently on a plain store.
+- **Static fields.** `bindStaticField` reads them, through
+  `il2cpp_class_get_static_field_data` and with `il2cpp_runtime_class_init`
+  first, so "zero" cannot mean "the static constructor has not run". Its
+  readers take **no object** — a static and an instance field share an offset
+  space, and the stand-in deliberately puts `Player::SpawnCount` (static Int32)
+  and `Player::Health` (instance Single) both at offset 16, where the wrong
+  binding answers `1091567616` with `ok` true. Only the type system catches
+  that; a `bool` flag would read the same either way.
 - **Raycasts, NavMesh, physics.** Unchanged. They are in the engine and cost
   what they cost. Profile the sensing/logic split before rewriting anything.
-- **The main thread.** `invoke_main` still queues onto the host's own attached
-  thread, not Unity's. A bound call is cheap; it is still not legal to make it
-  against a Unity object from an arbitrary thread.
+- **The main thread.** `invoke_main` now drains from inside a per-frame method
+  the host detoured, so on a build where one binds it *is* Unity's thread — and
+  on one where none does it is the host's own, with a warning at boot. A bound
+  call is cheap; it is still not legal to make it against a Unity object from an
+  arbitrary thread, so branch on
+  `call("aowlspt.host::main_thread")` rather than on the name. The drain itself
+  is a handful of instructions when the queue is empty, which is most frames.
 
 ## What this measurement does not prove
 
@@ -162,12 +345,99 @@ the same value read through `il2cpp_runtime_invoke`. Three paths, one number.
 **It is one machine.** Absolute nanoseconds will differ. The ratios are the
 part worth quoting.
 
+## Measuring your own loop
+
+`allocationCount()` is exported from `aowlspt/fast` beside them, and is how
+"this loop allocates nothing" becomes a measurement. It reads mimalloc's
+cumulative block count out of the allocator statically linked into the calling
+binary. Cumulative is the whole point: a string built and freed once per firing
+leaves `getOccupiedMem` exactly where it was, so a live-bytes figure cannot tell
+"allocated nothing" from "allocated and freed at frame rate".
+
+`allocProbeOk()` checks that the counter is reading the allocator at all, by
+making an allocation of known size and confirming the count moved. That is not
+ceremony: the first version of this read `malloc_requested`, which mimalloc only
+maintains under `MI_STAT > 1` — a debug build — and reported a confident zero
+for a loop allocating at frame rate. A permanent zero is exactly the answer this
+is used to establish, which makes it the worst possible field to have picked and
+the reason the probe exists.
+
+Take the counter *outside* the window you are measuring if the reading itself
+allocates. `hostPatchStat` in `examples/highlevel` goes through `call`, which is
+a host-allocated buffer, a string copy and a key to search for — five
+allocations, which read as "20000 typed firings made 5 allocations" until they
+were moved out.
+
+`perfCounter()` and `perfFreq()` are exported from `aowlspt/fast`, with
+`nanosBetween(a, b)` to turn a pair into nanoseconds — the same clock the
+bindings report their own cost on, which is the point of using it rather than
+`nowMs()`.
+
+They were `importc`/`nodecl` declarations against a header included only in
+`fast.nim`'s own translation unit, so a mod that imported the module and called
+`perfCounter` got an **implicit-declaration error from the C compiler** rather
+than anything a nimony message could explain. Two mods gave up and measured a
+hot loop with a millisecond clock, which is the wrong resolution by three orders
+of magnitude. They are ordinary nimony procs now: the wrapper is in the module
+that has the header, and an importer calls the wrapper.
+
+`nanosBetween` multiplies before dividing, because the frequency is around
+10 MHz and dividing first turns every measurement under a microsecond into
+zero.
+
+## Measuring frame time rather than frame rate
+
+Everything above is the cost of a *call*. The other half of a client mod's
+performance story is the frame it runs in, and `mods/perf` is where that is
+measured. Two things there are worth knowing outside it.
+
+**A frames-per-second figure is a mean, and a mean cannot see a hitch.** A
+second holding fifty-five even frames and one 200 ms freeze reports about the
+same number as a second of sixty even ones. Best and worst over one-second
+windows do not rescue it — a hitch has to last most of a second to move either.
+Anything claiming to have made the client smoother has to report percentiles and
+a hitch count, and `mods/perf`'s `hist.nim` is a 4 KB fixed histogram (1024
+buckets of 64 µs, plus an exact tail) that does it at **26 ns a sample with zero
+allocations**, measured against mimalloc's cumulative counter.
+
+**The ABI has no repeating main-thread callback, and one can be built from the
+two it has.** `every` repeats on the host's thread; `onMainThread` reaches
+Unity's and does not repeat. A one-shot that queues *itself* before returning
+does both — it runs inside the host's drain, the drain runs inside a per-frame
+method, and `drainDue` snapshots the due list before running it, so the re-queue
+lands next frame rather than spinning inside this one. `claimTick` reuses freed
+slots, so the chain holds **3 scheduler slots over a thousand firings** rather
+than one per frame.
+
+Measured on the stand-in, in `mods/perf`'s own self-test:
+
+| operation | ns | note |
+|---|---:|---|
+| recording one frame interval into the histogram | 26 | clock read, subtract, array store; 0 allocations over 20000 |
+| one firing of the self-re-arming chain, inside the mod | ~1000 | nearly all of it `onMainThread`'s enqueue: a host lock and a seq append |
+| the host's drain overhead for a non-empty queue | **not measured** | `drainDue` allocates two seqs per frame while such a chain runs |
+| `hookTyped` on a per-frame method, for comparison | 23 | the alternative, at the price of a second detour on the hottest path |
+
+One microsecond a frame is 64 parts per million of a 16.7 ms frame, which is why
+the chain is the right trade for a *readout*. It is the wrong trade for anything
+firing per entity per frame: at forty bots that is 40 µs against the typed
+hook's 0.9 µs, and the queue is a lock the typed path does not take at all.
+
+**A differential A/B against the stand-in could not resolve the chain's cost**,
+and that is reported rather than hidden: four alternating 14-second runs gave
+53.48 / 53.65 / 50.50 / 54.67 fps, so the stand-in's own run-to-run variance is
+several percent against an effect of 0.006 percent. Measuring from inside the
+firing is what resolves it. The general lesson is the one this document opens
+with: measure the thing, not the difference, when the difference is smaller than
+the noise.
+
 ## What a mod should actually do
 
 1. Use `aowlspt/game` for everything that is not per-frame. It is the pleasant
    API and 1 µs is nothing at 10 Hz.
 2. Bind, in `onUpdate`, guarded on `ok`, on the first frame the type resolves —
-   not in `onLoad`, where the game's assemblies do not exist yet.
+   not in `onLoad`, where the game's assemblies do not exist yet. Bind against
+   the *object* rather than a type name whenever the method might be overridden.
 3. Read the binding's `why` into the log once. It says what the signature was
    inferred to be, or why it was refused. A refused binding is a mod that will
    quietly do nothing otherwise.

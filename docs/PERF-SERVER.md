@@ -151,13 +151,17 @@ object is a hash lookup. Building the index costs exactly the scan the first
 lookup was going to cost anyway, so no path got slower.
 
 **Invalidation.** The index holds byte offsets into the document, so it is valid
-only for the document it was built from. `dbLoad` and every one of the four
-places `dbPatchPath` reassigns `gDoc` call `docReplaced()`, which throws the
-whole index away. That is deliberately not cleverer than it sounds: a partial
-invalidation would have to reason about which offsets a splice moved, and getting
-it wrong hands a mod a byte range out of the middle of some other item — a bug
-that does not announce itself. Rebuilding is one lazy scan per object actually
-touched, and `dbPatch` happens at mod load.
+only for the document it was built from. In this pass `dbLoad` and every one of
+the four places `dbPatchPath` reassigned `gDoc` called `docReplaced()`, which
+threw the whole index away — deliberately not cleverer than it sounds, because
+a partial invalidation has to reason about which offsets a splice moved, and
+getting it wrong hands a mod a byte range out of the middle of some other item.
+
+That held while `dbPatch` only happened at mod load and mods only patched a
+handful of things. It stopped holding: throwing the index away *is* what made a
+write cost the whole document, and the cost surfaced as a 54 second boot. What
+replaced it — anchor coordinates, and a short list of edited regions to
+translate through — is the last section of this file.
 
 It is locked, unlike the old read path, because the index mutates on *reads* and
 reads happen on every worker thread at once.
@@ -277,10 +281,9 @@ reassigned.
 ## Reproducing
 
 ```
-# build the bench
-nimony c --passC:-I<repo>/abi --passL:-lws2_32 --passL:-lz \
-  -p:<repo>/backend -p:<repo>/installer/src -p:<repo>/aowl/src \
-  -o:<repo>/installer/build/benchbackend.exe tools/benchbackend.nim
+# build the bench -- `aowl build` does this now; it did not when the numbers
+# above were first taken, which is why they were hard to reproduce
+aowl build
 
 # run it
 installer/build/benchbackend.exe \
@@ -293,3 +296,865 @@ installer/build/benchbackend.exe \
 `--label` exists because the only way to trust a before-and-after is to have
 both printed with the thing that distinguishes them. Pin the mod DLL if anything
 else in the tree is moving.
+
+Add `--perf` for the server's own per-phase breakdown — where inside the answer
+the time went, rather than how long the answer took. See the next section.
+
+# The second pass: measuring first
+
+Everything above is one body of work. What follows is the next one, and it
+started by building the instrument the first pass did not have.
+
+## The instrument
+
+`benchbackend` says what a request costs. It cannot say *what* the cost was —
+whether an item move spent its milliseconds in zlib, in the merge-patch
+database, in the socket, or somewhere nobody had thought to look. The first
+pass answered that by reasoning about the code, which worked, and would not
+have worked twice.
+
+So the backend now carries `--perf`: per-phase accumulators in
+`backend/perfphase.nim`, off by default, one predictable branch per call site
+when off. It times the five phases of answering a request — inflate, route
+match, the route itself, deflate, send — and, nested inside `route`, the four
+host callbacks a mod spends its time in: `db_get`, `db_patch`, `store_get`,
+`store_set`. `route` minus its children is the mod's own work, which is the
+number the whole exercise is after. It also prints the compressed-body cache's
+hit rate, which the design above rests on and which nothing was reporting.
+
+The report is written to `<root>/perf.txt` once a second as well as at exit,
+because a load generator kills the server rather than asking it to stop, and a
+report printed at exit is a report nobody ever sees. `benchbackend --perf`
+passes the flag through and prints the file.
+
+`aowl build` now builds `benchbackend` (`buildBench`), which it did not: the
+numbers in this file were taken with a tool that had to be compiled by hand
+from a command line kept in somebody's scrollback.
+
+## The profile, before
+
+3000 templates, 20 rounds, keep-alive, 716 requests including warmup. Totals in
+milliseconds across the whole run.
+
+| phase | total ms | calls | mean us |
+|---|---|---|---|
+| `route` | 949.7 | 716 | 1326 |
+| — `store_get` | **362.0** | 627 | **577** |
+| — `store_set` | **275.0** | 578 | **475** |
+| — `db_get` | 56.0 | 1248 | 44 |
+| — `store_list` | 5.5 | 27 | 203 |
+| `deflate` | 76.5 | 716 | 106 |
+| `inflate` | 30.0 | 716 | 41 |
+| `send` | 26.2 | 716 | 36 |
+| `match` | 1.0 | 716 | 1 |
+
+Two thirds of all server time was the profile store — 637 ms of the 950 ms
+spent inside routes, against 76 ms for all compression and 56 ms for every
+database lookup in the run. The endpoint that mattered, `items/moving`, was
+spending essentially its whole budget reading a 3 KB file and writing it back.
+
+Nothing in the first pass was wrong. It was simply looking at the parts of the
+server that are made of code, and the cost was in the part made of syscalls.
+
+## Why a 3 KB file cost 577 microseconds
+
+It is not the disk, and it is not the directory lookup. Measured directly, on
+this machine, on a 3 KB file:
+
+| | |
+|---|---|
+| open + read + close, file unchanged since last time | **35 us** |
+| open + write + close | **176 us** |
+| open + read + close, immediately after writing it | **890 us** |
+
+Real-time antivirus rescans a file when it is opened *and has been modified
+since the last open*. The profile store does exactly that, once per inventory
+move: read the profile, mutate it, write it back, and read it again on the next
+move. Every read in the benchmark was a read-after-write, and paid the scan.
+
+That is not a Windows detail to be worked around cleverly. It is what the file
+API costs on a player's machine, and the answer is to stop calling it.
+
+## What changed, and what each was worth
+
+Each row is a measured run against the same pinned `tarkov.dll`, keep-alive,
+3000 templates, 20 rounds.
+
+### 1. The store stops paying for the installer's caution — 600 → 691 req/s
+
+`storeWrite` went through `winfs.writeTextFile`, whose contract is the
+installer's: ensure the parent directory, check whether the destination exists,
+**delete it**, then create it. The delete is there because an installer's
+destination may be a hard link into a game install that must not be written
+through. A file the host made, in a directory the host made, is not that.
+
+Seven filesystem round trips became one. `store_set` 475 → **206 us**.
+`storeRead`'s `exists` probe went too: a missing file and an unreadable one
+both fail the open, so the probe only ever bought a better error message, which
+is now recovered on the failure path where a syscall costs nothing.
+
+### 2. Reads through `ReadFile` rather than the buffered `File` — 691 → 696 req/s
+
+`store_get` 577 → **309 us**. Real, and it turned out to be the small half of
+that number.
+
+### 3. `dbGetPath` stops copying the answer twice — `db_get` 44 → 31 us
+
+`strip(gDoc.substr(vs, ve - 1))` reads as one operation and is two allocations
+of the whole value: `substr` cuts it out, `strip` copies the result again to
+shave whitespace off the ends. On `templates.items` that is four megabytes
+copied for nothing — `locate` has already left the start index past the leading
+whitespace, so `strip` has nothing to do. The indices are trimmed instead and
+the value is cut once.
+
+### 4. The inflate buffer is sized to the body — `inflate` 41 → 6 us
+
+`inflateBody` allocated `max(rawLen * 64, 65536)` bytes and zeroed them. Every
+request the client makes carries a body of a few hundred bytes, so every
+request allocated and zeroed 64 KB in order to inflate 200 bytes into it, and
+the allocation cost seven times the decompression. It is 16x with a 4 KB floor
+now, retried at 8x on failure so that a body which does not fit is slower
+rather than refused. 30.0 ms → **4.5 ms** across the run.
+
+### 5. The store keeps its files open — 715 → 930 req/s
+
+The one that mattered. `modstore` holds a handle per file it has touched,
+bounded at 32 and evicted least-recently-used, opened `GENERIC_READ |
+GENERIC_WRITE` and shared every way — read, write and delete — so the other
+host may open, rewrite or even delete the file while it is held. A read seeks
+to the start and reads the file; a write seeks to the start, writes, and
+truncates, which is what `CREATE_ALWAYS` did without the create.
+
+| | before | after |
+|---|---|---|
+| `store_get` | 529 us | **12 us** |
+| `store_set` | 205 us | **43 us** |
+| `items/moving` mean | 0.938 ms | **0.418 ms** |
+
+**This is not a cache of the contents, and the difference is the whole reason
+it is safe.** Every read still goes to the file, through the operating system's
+page cache, so a write by the other host is seen exactly as it is seen today.
+The client host and the backend run at the same time against one
+`<root>/store` — that is what the module is for — and neither can be told when
+the other has written. A cache of the values would be faster still and would be
+wrong. Removing the *open* removes the antivirus rescan without touching the
+coherence.
+
+### 6. One `send` for a small answer — 930 → ~1030 req/s
+
+The header and the body went out as two `send` calls, which is two system calls
+and two segments, and the second is at the mercy of Nagle: this socket has no
+`TCP_NODELAY`. On loopback that rarely bites, and it is not a risk worth
+carrying to avoid copying a kilobyte — which is what almost every response
+here is. Bodies over 64 KB still go out on their own, straight from the
+compressed buffer or the response string, because above that the copy would be
+the larger cost of the two.
+
+### 7. `byref` on the response path — no measurable effect
+
+`zFind`, `cachedDeflate` and `sendResponse` took the response body by value.
+`inflateBody` carries a comment explaining why that matters for a `seq`, so the
+same bug in the same file for a `string` looked like the obvious next find. It
+measured as nothing — nimony was not copying — and the annotations are kept
+because they are correct and cheap, not because they bought anything.
+
+## Before and after
+
+Same pinned mod, same machine, both binaries built from the same tree, one with
+the changes reverted. Interleaved, because the machine has other work on it and
+two runs half an hour apart are not a comparison. Median of five pairs:
+**536 → 1015 requests/second, 1.9x.** The table below is one such pair.
+
+| endpoint | before, mean | after, mean | before, ttfb | after, ttfb |
+|---|---|---|---|---|
+| `items` (4251 K) | 14.49 ms | 13.10 ms | 6.53 ms | **5.24 ms** |
+| `locale/en` (677 K) | 3.54 ms | 3.42 ms | 0.81 ms | **0.70 ms** |
+| `handbook` (250 K) | 1.07 ms | 1.02 ms | 0.34 ms | 0.32 ms |
+| `globals` (196 K) | 0.76 ms | 0.72 ms | 0.32 ms | 0.29 ms |
+| `profile/list` (5 K) | 1.51 ms | **0.54 ms** | 1.40 ms | **0.45 ms** |
+| `items/moving` (1 K) | 1.46 ms | **0.41 ms** | 1.35 ms | **0.31 ms** |
+| `keepalive` | 0.15 ms | 0.15 ms | 0.07 ms | 0.08 ms |
+
+620 requests: 1165 ms → **589 ms**. `items/moving` p99 2.10 ms → **0.53 ms**.
+
+Against the 17 MiB database (12000 templates, 6 rounds): **245 → 311
+requests/second**, and `items/moving` server time 1.293 ms → **0.333 ms** —
+which is the same 0.311 ms it costs against the 5 MiB one. The endpoint a
+player hits thousands of times per session now scales with neither the size of
+the database nor the size of the profile document.
+
+## The profile, after
+
+| phase | before | after |
+|---|---|---|
+| `route` | 949.7 ms | **303.1 ms** |
+| — `store_get` | 362.0 ms | **7.1 ms** |
+| — `store_set` | 275.0 ms | **23.0 ms** |
+| — `db_get` | 56.0 ms | **38.5 ms** |
+| `deflate` | 76.5 ms | 73.7 ms |
+| `inflate` | 30.0 ms | **4.3 ms** |
+| `send` | 26.2 ms | **19.8 ms** |
+
+The shape has changed completely. The store has gone from two thirds of the
+server to under ten percent of it, and what is left inside `route` — 303 ms
+less its 73 ms of host calls — is the emulator's own work in `mods/tarkov`,
+which this pass did not own.
+
+`deflate` is now the largest thing the server itself does, and 88 of its calls
+are cache *hits*: `zcache 88 hits, 4 misses, 624 bodies under the size it
+caches`, which is exactly right — four large tables, deflated once each, served
+88 times. A hit costs about 0.9 ms on `/client/items` and almost all of that is
+the `memcmp` of a 4.2 MB body against the cache key. That is the design, not a
+defect in it: the key is the response text precisely so that a stale hit is
+impossible, and a hash would have to read the same four megabytes.
+
+## The gate
+
+`aowl test` now runs `benchbackend --floor 800` against a 1000-template
+database and fails the build under it. It prints the number either way.
+
+The floor is set well under what this machine does (≈1550 req/s on that
+configuration) because it is a check against a regression of *kind* — a
+per-byte copy reintroduced, a cache that has stopped hitting, a store that has
+gone back to opening a file per read — each of which halves the number or
+worse. The backend before this pass manages 710 on the same configuration, so
+the floor sits above it: the specific regressions this work guards against
+would trip it.
+
+## Slow clients, and what the pool is really limiting
+
+A finding from the fuzzing pass landed in the middle of this one, and it is a
+serving-architecture problem rather than a throughput problem, so it belongs
+here: **twelve dead connections locked every other client out.**
+
+A socket that declares a `Content-Length` and then sends nothing parks a worker
+inside `recv` for the whole in-flight receive timeout. The accept pool is a
+fixed set of threads each blocking on `accept`, so the pool size *is* the
+concurrency limit, and a worker blocked in `recv` has taken one of its slots.
+`fuzzwire` opens twelve such sockets and times an ordinary request behind them:
+
+```
+twelve stalled connections shut every other client out for 10007 ms
+```
+
+Ten seconds is when the *client* gave up; the server was going to hold those
+workers for fifteen. A client that keeps reconnecting keeps them held.
+
+### One timeout could not be right
+
+The socket had a single `SO_RCVTIMEO`: fifteen seconds while a request was in
+flight, dropped to five once a keep-alive connection went idle. That is one
+number doing three jobs, and it is wrong for at least one of them however it is
+set. Idle between requests is what a kept-alive connection is *for* and wants a
+generous wait; idle in the middle of a request is a stall and wants a short
+one; and a wait long enough for a genuinely slow sender is by definition long
+enough to be worth attacking.
+
+So `SO_RCVTIMEO` is now a 500 ms *slice* rather than a deadline, and
+`recvBounded` distinguishes `WSAETIMEDOUT` — nothing yet — from a zero-length
+read, which is an orderly close. A slice that expires with time left simply
+goes round again, so a client dribbling a byte a second is not mistaken for one
+that has stopped. What ends a wait is a wall-clock deadline, and there are
+three of them:
+
+| | |
+|---|---|
+| idle between requests, keep-alive | 5 s |
+| first byte of a request → complete header | 3 s |
+| complete header → complete body | 5 s |
+
+Three seconds to finish a set of headers is not tight: this server listens on
+loopback and nowhere else. A client that has begun a request and cannot finish
+it in that is not slow, it is stuck. Either in-flight deadline now answers
+`408` and closes rather than waiting, and a body that stops arriving is
+answered rather than handed to a route as a short one — asking a mod to tell a
+truncated document from a malformed one is asking for something it cannot do.
+
+### And the pool is sixteen
+
+The deadlines bound how long a stalled connection holds a worker. How many
+stalled connections it takes to be *felt* is the pool size, which was eight —
+so twelve of them starved it outright. It is sixteen now, the ceiling
+`aowlspt_net.h` already allowed, so the twelve `fuzzwire` throws leave four
+workers free.
+
+```
+before   twelve stalled connections shut every other client out for 10007 ms
+after    ok    stalled connections do not delay an ordinary request
+```
+
+**This bounds the damage; it does not remove the shape.** A client with more
+sockets than the pool can still fill it, five seconds at a time. Removing that
+means a non-blocking, poll-driven accept and read path — one worker serving
+many connections, so that a connection making no progress costs a file
+descriptor rather than a thread. That is a rewrite of the C pool in
+`abi/aowlspt_net.h`, a header both hosts include, and it is the right next
+change rather than one to make in passing. What is here turns a denial of
+service into a five-second annoyance and puts a measured number on the
+remainder.
+
+Throughput is unchanged by it: 1013 and 1012 requests/second on the two
+interleaved runs taken after, against 1015 median before.
+
+## The gate went red the same afternoon
+
+Within half an hour of the floor being installed it failed, and this is the
+record of that rather than a reason to move the floor.
+
+The store write became an atomic commit while this pass was finishing: value
+into a temporary file, `FlushFileBuffers`, `MoveFileEx` over the key. The
+hazard it is aimed at is real — a process killed part-way through an in-place
+overwrite leaves a profile that is a mixture of two values, which is the one
+loss nothing afterwards repairs. The cost of it, measured the same way as
+everything else in this file:
+
+| write of a 3 KB value | |
+|---|---|
+| in place, through a held handle | **19.6 us** |
+| temp + rename | 473.8 us |
+| temp + `FlushFileBuffers` + rename | **4335.9 us** |
+
+and end to end, through the server, `store_set` measured by `--perf`:
+
+```
+store_set     24419.448 ms      124 calls      196931 us
+```
+
+197 milliseconds per profile write, against 43 microseconds an hour earlier.
+The gate configuration went from ~1430 requests/second to **6**:
+
+```
+Gate
+----
+error 15 requests/second is under the floor of 800
+```
+
+Two things are worth separating, because they are not the same decision.
+
+**The flush is not what makes the write atomic — the rename is.** A process
+killed at any point still leaves either the old file or the new one, because
+the rename is a single filesystem operation and the page cache survives a dead
+process. `FlushFileBuffers` adds protection against the machine losing power,
+which is a different and much rarer failure, and it is 3.9 ms of the 4.3.
+Dropping it keeps the guarantee the code's own comment claims and was measured
+end to end at 11 → 15 requests/second — real, and not the main cost.
+
+**The main cost is the commit itself**, and it is worth more than the 24x the
+microbenchmark suggests once a live directory and real-time antivirus are
+involved: every write creates a new file at the key's path, which is a new file
+for the scanner to look at. That is the same effect documented above for
+read-after-write, arriving from the other direction.
+
+None of that says the atomic write is wrong. It says the profile is written on
+every inventory drag, and a commit protocol priced for a save point is being
+paid thousands of times a raid. Somewhere between the two — committing on a
+schedule and at the points that matter, writing in place between them — is a
+design decision rather than an optimisation, which is why this section records
+the numbers and does not make it.
+
+The floor stays at 800. A gate moved to accommodate the regression it caught is
+not a gate.
+
+## Tried, kept out
+
+- **Caching store values in memory.** It is the obvious next step and it is
+  wrong. The client host and the backend run at the same time against one
+  `<root>/store`, and a value one of them cached is a value the other can
+  invalidate with no way for either to find out. Validating a cached copy with
+  a timestamp does not close the hole — NTFS write times are updated with far
+  coarser granularity than two writes can be apart. Holding the file open gets
+  most of the same speed and keeps the coherence, so that is what is there.
+- **Reusing one `z_stream` per thread instead of `compress2`.** `compress2` is
+  `deflateInit2` + `deflate` + `deflateEnd` per call, and `deflateInit2` at
+  level 6 allocates about a quarter of a megabyte every time. It was
+  implemented, verified byte-identical against `compress2` over 500 inputs, and
+  measured: **0.5%**. The estimate that motivated it — 95 us per small response
+  — was wrong; the `deflate` phase is dominated by the cache hits, not by the
+  small bodies. It was reverted, and `abi/aowlspt_net.h` is unchanged, because
+  a shared header that both hosts include is not worth editing for half a
+  percent.
+- **A lower zlib level.** Still no: it would change the bytes on the wire for
+  every dynamic response, and the tables that would benefit are cached anyway.
+- **`TCP_NODELAY`.** It would be an `abi/` edit; sending the header and a small
+  body in one call gets the same result without one.
+
+## Correctness
+
+`--selftest`: 7 of 7.
+
+`emutest` is the gate that means something, and it was moving underneath this
+work again — another agent was adding emulator features while it ran. So the
+check is not the pass count but the *difference*, both binaries against the
+same pinned `tarkov.dll`, the same fixture and a fresh store each:
+
+```
+this backend       21 of 149 failed
+baseline backend   21 of 149 failed
+```
+
+and the failing sets are byte-for-byte identical, compared line by line. The
+21 are the emulator's own in-flight work; nothing in this pass is implicated.
+
+The store change is the one with a correctness story worth stating plainly.
+Held handles do not change what is in the file or when: `WriteFile` has reached
+the kernel before the call returns, so a killed process loses nothing that a
+`CloseHandle` would have saved — only a machine crash does, which was true of
+the buffered write before it. `emutest` exercises exactly this, restarting the
+backend mid-suite and checking that a hideout craft, its clock and a redeemed
+reward survived; it does, on both binaries.
+
+# The third pass: the pool stops being the connection limit
+
+The pass above ends by naming its own remainder — *a client with more sockets
+than the pool can still fill it, five seconds at a time* — and says the fix is
+a poll-driven accept and read path in `abi/aowlspt_net.h`. This is that.
+
+## What was actually wrong
+
+Nothing about the deadlines. They were right and they are unchanged. What was
+wrong is one sentence: **a worker thread was taken at `accept` and given back
+at `close`.** Keep-alive means a connection lives for a session, so the pool
+size was the number of *connections* the server could have, and every number
+anyone might pick for it is a number an attacker can exceed with a `for` loop.
+Eight was starved by twelve; sixteen would be starved by twenty.
+
+## The shape now
+
+One **poller** thread owns the listening socket and every connection that is
+not currently being answered. It sits in `WSAPoll`, accepts, and reads whatever
+has arrived into that connection's buffer. It never runs a route.
+
+A connection reaches a **request worker** only when a complete request is
+buffered — headers and the whole declared body. The worker answers it and hands
+the connection back.
+
+So a connection that stalls, dribbles, or opens and says nothing never touches
+a worker. The sixteen threads are now the concurrency limit on *answering*,
+which is the only thing a thread was ever needed for, and the limit on
+connections is `AOWL_NET_MAX_CONNS` (1024) and `AOWL_NET_MAX_BUFFERED`
+(64 MiB) — sockets and memory, not threads.
+
+**WSAPoll rather than IOCP**, and the reasoning is written at the head of
+`abi/aowlspt_net.h` along with what it costs: an O(connections) scan per
+wakeup, and one thread doing all the reads. This is a loopback server for one
+game; IOCP's advantage begins where this server ends, and it would turn the
+"have I got a whole request yet" loop into a set of completions with a buffer
+lifetime attached to each — the bug class this file must not have.
+
+## The measurement
+
+`fuzzwire` grew a check the old server cannot pass. It opens 256 stalled
+connections in three shapes — a socket that says nothing, one that dribbles
+half a request line, one that declares a body and never sends it — and times an
+ordinary request behind them.
+
+```
+baseline backend   error an ordinary request is answered behind 243 stalled
+                         connections: no answer after 10004 ms
+this backend       ok    an ordinary request is answered behind 256 stalled
+                         connections    (it took 0 ms)
+```
+
+The baseline only reached 243 because it could not accept the rest. Ten seconds
+is again where the *client* gave up.
+
+By hand, at 900 stalled connections:
+
+| | |
+|---|---|
+| backend resident set, idle | 5.4 MiB |
+| backend resident set, 900 stalled connections | 11.8 MiB |
+| an ordinary request, behind those 900 | 1.6 ms |
+
+About 7 KiB a connection, and only for the ones that have actually sent
+something: the buffer is allocated on the first byte received and grows with
+what arrives, never with what a `Content-Length` claims. A socket that connects
+and says nothing owns no buffer at all, and is dropped after the 3 s header
+deadline. **The bound is 1024 connections and 64 MiB of buffered request.**
+
+## The three things that made it slower, and what each cost
+
+This is the interesting half. The first working version was **15% slower**, and
+none of the reasons were where they were looked for.
+
+### 1. The session lock — 15%, and it is never contended
+
+The per-session lock (below) was first an `SRWLOCK` plus a
+`CONDITION_VARIABLE` per slot, with a `WakeConditionVariable` on every release
+so a timed wait could work. Completely uncontended — one connection, one
+session, one request at a time — it cost around **seventy microseconds a
+request**, which is 15% of the whole server. Disabling it took the new binary
+from 1290 back to 1548 req/s against a baseline of 1515.
+
+It is now `TryAcquireSRWLockExclusive` on the way in and
+`ReleaseSRWLockExclusive` on the way out: two interlocked operations in the
+case that always happens, and a yield loop in the case that almost never does.
+A lock taken on every request and contended on none has to be free when it is
+uncontended before it is anything else.
+
+### 2. Non-blocking sends — the 1.4 MiB response, +35%
+
+Making the accepted socket non-blocking for the poller made it non-blocking for
+the response too, so `aowl_net_send` began partial-sending the item table and
+waiting for `POLLWRNORM` between the pieces. `items` went 4.28 to 5.79 ms.
+
+The socket is now put *back* into blocking mode by the worker that picks the
+connection up, with `SO_SNDTIMEO` supplying the bound that non-blocking was
+giving, and returned to non-blocking only when the connection goes back to the
+poller.
+
+### 3. Handing the connection back too eagerly — a flat 70 us a request
+
+The worker's grace window — the short wait for the next request before giving
+the connection up — first returned to the poller on *any* short read. A request
+with a body arrives as a header segment and a body segment, so nearly every
+request handed the connection back and picked it up again, and two thread
+wakeups landed on the critical path of almost every answer. It read as a flat
+cost on every endpoint, from the item table down to the empty-bodied keepalive.
+
+It now keeps reading while bytes keep coming, capped at `AOWL_HOT_READS`, and
+lingers for `AOWL_HOT_GRACE_MS` only when the ready queue is empty *and* at
+least one other worker is not lingering either. Without that second condition
+sixteen hot connections could put every worker in a grace window at once, which
+is the failure this whole change removes, rebuilt out of smaller parts.
+
+## Throughput
+
+Interleaved A/B on one tree, with the baseline binary rebuilt from the
+*current* sources before each round. Three other agents were editing
+`host/common/modstore.nim`, `backend/jsondb.nim` and `mods/tarkov` while this
+ran, and a baseline frozen an hour earlier measures their work as well as this
+one — an early set of numbers had to be thrown away for exactly that reason:
+both binaries dropped from ~1500 to ~800 req/s between two runs and the cause
+was somebody else's store change.
+
+The same interference makes the median unusable — both sides show runs at a
+third of their rate. The honest statistic on a contended machine is the *best*
+run, which is the one least interfered with:
+
+```
+18 interleaved pairs, 20 rounds each, on a machine running three other builds
+baseline   best 872 req/s
+this pass  best 851 req/s     -2.4%
+```
+
+An earlier set taken on a quieter machine, same method:
+
+```
+9 interleaved pairs
+baseline   median 1515 req/s   best 1566
+this pass  median 1483 req/s   best 1548     -2%
+```
+
+Per endpoint, at parity or better on the median request and slightly worse on
+the mean — the mean carries the handful of requests that took the cold path
+through the poller:
+
+```
+                base p50   this p50      base mean   this mean
+items             4.257      4.203          4.225       4.415
+items/moving      0.417      0.411          0.421       0.446
+keepalive         0.151      0.149          0.151       0.141
+```
+
+So: **about 2% down, at the edge of what this machine can resolve**, in
+exchange for the connection limit going from sixteen to 1024 and the cost of a
+stalled connection going from a thread to 7 KiB. The `--floor 800` gate still
+passes.
+
+## Serialising a session
+
+A second finding landed in this pass, from the same fuzzing work: **concurrent
+requests against one profile lost updates.** Six concurrent `buy_from_trader`
+were each answered `err:0`; three rifles arrived and 75,000 was paid. The
+arithmetic was self-consistent and nothing duplicated — three purchases were
+simply discarded while the client was told they had succeeded.
+
+Profile handling is a read-modify-write of a whole document and the mod API has
+no mutex, so the emulator could only narrow the window: every save stamps a
+per-profile counter and the item-event endpoint refuses when it moved.
+`mods/tarkov/emu/profile.nim` says in as many words that this narrows and does
+not close, and that the fix belongs in the host.
+
+It is in the dispatch path now, because that is the only place that knows a
+request is about to begin and has somewhere to put a lock. `aowl_session_lock`
+in `abi/aowlspt_net.h`:
+
+- **The whole callback**, not the store call. The read and the write are at
+  either end of the handler.
+- **Keyed on the session**, matched exactly on the 24-character id in a table
+  that is only ever added to. Two profiles do not wait on each other, and a
+  route with no session — the status routes, the mod manager — takes no lock at
+  all.
+- **Per session, not per connection.** It is released before the response goes
+  out and long before the connection waits for its next request, so keep-alive
+  holds nothing. Holding it across a keep-alive wait would rebuild the
+  thread-per-connection stall this pass exists to remove.
+- **A handler that never returns** holds its session's lock for as long as it
+  runs, and nothing can be done about that: releasing a lock under a handler
+  that is still writing is the lost update this exists to prevent. What is
+  bounded is the blast radius. Other sessions carry on, and a request that
+  cannot get the lock in ten seconds is answered `503` rather than pinning a
+  worker for the life of the process.
+
+`benchbackend` drives one connection and so measures only the cost — which is
+where the 15% above came from and is now two interlocked operations.
+`fuzzwire`'s concurrency checks are where the benefit is, and they pass.
+
+## Correctness
+
+Every gate was run against the tree *before* this work started, because several
+of them are red for reasons belonging to other agents' in-flight work and this
+pass must neither be blamed for those nor hide behind them.
+
+```
+                 before            after
+--selftest       8 ok, 0 failed    8 ok, 0 failed
+fuzzwire         148 ok, 0 failed  151 ok, 0 failed   (three new checks)
+livectl          43 ok, 0 failed   43 ok, 0 failed
+emutest          237 ok, 8 failed  244 ok, 1 failed
+```
+
+`emutest`'s eight were all in "Across a restart" — a hideout craft, a trader's
+turnover and a redeemed reward that did not survive one. Seven of them stopped
+failing with this change and nothing here was aimed at them; the honest reading
+is that they were the lost-update race, which is what the session lock closes.
+The one that remains, a saved weapon build, is the emulator's own work.
+
+Later the same day the emulator stopped booting at all on `mods/tarkov`'s
+in-flight state. That is recorded rather than worked around, and it was checked
+the way the pass above checks this kind of thing — both binaries, the same
+pinned `tarkov.dll`, the same fixture, a fresh store each — and they fail
+identically.
+
+## What is deliberately unchanged
+
+Byte for byte on the wire, and each of these was checked rather than assumed:
+
+- Every status line, header and response body is still composed in nimony.
+  `aowlspt_net.h` writes nothing: the two `408`s a stalled request gets are a
+  call back into `aowlspt_nim_timeout` rather than a `send` from C.
+- The 512-request keep-alive cap still applies *after* the response has gone
+  out, so request 512 is still answered `Connection: keep-alive` and the socket
+  still closes under it.
+- `Accept-Encoding: identity` handling, the zlib framing both ways, the
+  unframed-request tolerance and the 24-hex session check are untouched —
+  `parseHead` and `sendResponse` were not edited at all.
+- The three deadlines keep their values and their meanings; only the thing
+  holding the clock changed.
+- A peer that closes between requests or mid-headers still gets nothing back; a
+  peer that closes mid-body still gets the `408` the old body loop sent.
+- `aowl_net_serve`, `aowl_net_running` and `aowl_net_stop` keep their
+  signatures and their meanings. The one shape that had to change is the
+  callback: `aowlspt_nim_serve(sock)`, which owned a connection, is now
+  `aowlspt_nim_handle(sock, buf, len, headEnd, sep)`, which answers one
+  request. `tools/aowlprobe.nim`, the only other file in the repo that defines
+  the symbol, was updated in the same change.
+
+# A write costs the patch, not the document
+
+Later pass, same instrument, same machine. Everything above this line is about
+what a *read* costs. This is about what a write costs, which nothing had ever
+measured, and the answer was: the document.
+
+## The finding
+
+`dbPatchPath` ended in
+
+```nim
+gDoc = gDoc.substr(0, vs - 1) & merged & gDoc.substr(ve)
+docReplaced()
+```
+
+Two whole copies of the document, concatenated into a third, and then the index
+thrown away so that the next read rebuilt it by scanning. Timed directly against
+the 41 MB imported database, with a 200-byte patch:
+
+| | 41 MB imported | 51 KB fixture |
+|---|---|---|
+| `db_patch` of an existing value | **171 ms** | 0.201 ms |
+| `db_patch` creating a path | **109 ms** | 0.193 ms |
+
+It is 171 ms whatever the patch says. The cost was `writes x sizeof(document)`,
+and every test in the repo ran against a fixture of a few dozen entries, which is
+a benchmark that reports the problem does not exist.
+
+Four mods had grown their own write buffering to get around it -- 363 changes
+folded into 2 writes, 420 patches into 10 -- which is a thing every future mod
+would otherwise also have to know.
+
+## What replaced it
+
+**The splice happens in place.** `beginStore` returns the string's own buffer
+and, for a long uniquely-owned string with room, allocates and copies nothing --
+so a patch is one `moveMem` of the bytes after the edit plus a `copyMem` of the
+patch itself.
+
+**The index survives the splice.** Every offset after an edit moves by a *known*
+delta, so the index is no longer held in the document's live coordinates: it is
+held in **anchor coordinates**, the coordinates the document had when the index
+was last rebuilt, plus a short sorted list of the regions that have been
+replaced since. A lookup binary searches that list once per path segment --
+nothing beside the hash lookup it accompanies -- and a write appends one entry.
+
+Every ambiguity fails closed, to a **rebase**: the index is translated into the
+current document's coordinates and the list emptied. Only the entries that
+cannot be translated are dropped, and an object that loses one member loses all
+of them, because an object present in the index is a promise that its member
+table is complete. Three things trigger a rebase, and each is bounded:
+
+- indexing *inside* text a patch wrote -- that text has no anchor coordinate, so
+  the first read into a patched value rebases and every read after it is indexed
+  again. In the ordinary shape of a run (mods patch at load, the game reads
+  afterwards) that is one rebase for the whole session;
+- an index entry left inside a region a later patch rewrote, which is refused
+  rather than translated: that is the bug the old comment worried about, and the
+  one thing this design must never do;
+- `EditCeiling` (4096) distinct edited regions.
+
+A rebase is a pass over the index, not a scan of the document -- which is what
+makes a mod filling in a table it created itself, where every write puts the next
+lookup inside text the previous one wrote, cost a walk of the index rather than a
+walk of 41 MB.
+
+## What it costs now
+
+Interleaved A/B on the same tree, median of three pairs.
+
+| | 41 MB imported | 51 KB fixture |
+|---|---|---|
+| `db_patch` of an existing value | 171 ms -> **6.1 ms** | 0.201 -> **0.012 ms** |
+| `db_patch` creating a path | 109 ms -> **12.4 ms** | 0.193 -> **0.057 ms** |
+| `db_get` of a deep path, warm | 6 us -> **6 us** | 1 us -> 1 us |
+| `db_get` of `templates.items` (12.5 MB) | 1.42 ms -> 1.62 ms | -- |
+| `db_get` after a burst of patches | 9-12 us -> **5-6 us** | 1 us -> 1 us |
+
+The residual is the `moveMem`: patching an item early in the document costs
+5.2 ms and one late in it 3.7 ms, in the ratio of the bytes that follow them --
+about 7.5 GB/s. A patch is now proportional to what follows it rather than to two
+copies of the whole document plus a rescan, which is a factor of about 30.
+
+Reads are unchanged, which is the point they had to be. `benchbackend
+--keepalive` against the real database, three interleaved pairs: **162 -> 161
+requests/second** at the median, `/client/items` ttfb 24.3 -> 23.9 ms, and the
+per-phase `db_get` mean 686 -> 674 us. Against the 1000-template generated
+database, 817 -> 820 requests/second.
+
+## Boot
+
+`aowlspt-backend` in the install `firstrun` builds -- every mod in the registry,
+the 41 MB database the installer imports -- started with an empty store, which is
+the boot a player's first ever start actually is. Two pairs, alternated:
+
+| | before | after |
+|---|---|---|
+| boot to first answer | 2854, 2897 ms | **1690, 1723 ms** |
+| `db_patch`, 10 calls | 980 ms | **452 ms** |
+| `db_get` during load, 269 calls | 743 ms | **213 ms** |
+
+The `db_get` row is the second half of the same fix: those reads were paying to
+rebuild an index the previous write had thrown away.
+
+The ten remaining `db_patch` calls are the mods' *buffered* writes, each carrying
+hundreds of folded-in changes, so what is left of them is the merge itself and
+the size of the value being merged -- which is the cost a patch is supposed to
+have.
+
+**`firstrun`'s own boot number does not move, and that is worth knowing.** It
+prints 2893 ms before this change and 2882 ms after. The reason is not the
+change: by the time step 8 times a boot, step 7 (`aowlspt-verify`) has already
+run a backend against that install, so the mod store is warm and the mods take
+their "already done" path. Timed on the same install with the store left in
+place, the backend answers in 650 ms and makes **no `db_patch` calls at all**.
+So the figure `firstrun` reports as "boot to first answer" is a restart, not a
+first run, and the database work it was meant to cover happens one step earlier.
+Fixing that is `tools/firstrun.nim`'s to make.
+
+## Does the buffering still earn its place
+
+Partly, and much less than it did. Unbuffered, the same work is about 420 small
+patches; at 6 ms each on the 41 MB database that is ~2.5 s, against ~0.6 s for
+the ten buffered ones. A mod that dropped its buffering would boot in about three
+and a half seconds rather than the fifty-four it faced before: the workaround is
+no longer load-bearing, and on a database this size it is still worth about two
+seconds. Getting the rest of it would mean holding the document in segments so
+that a splice moves no bytes at all, and that puts an indirection under every
+byte of `skipValue` and under the 12.5 MB `substr` that answers `/client/items`
+-- paying on the request path to save on the load path, which is the wrong way
+round.
+
+## Correctness
+
+The merge semantics had to come out byte-identical, so they were checked that way
+rather than argued about. A differential harness was built for this pass: a
+deterministic script of 400 mixed patches and reads -- top-level tables, paths
+that have never existed, paths written by an earlier step of the same run, and
+reads of all of them -- run against the old `jsondb` and the new one and diffed,
+including the final document's length and checksum and a reload of it.
+
+Identical, byte for byte, on 25 seeds x 3 fixtures and on the 41 MB database.
+
+It found the one bug this design can have. An object whose *value* a patch
+replaced keeps its place in the document, so its index entry survives
+translation while the member table behind it describes text that is no longer
+there -- and a member the patch had just added was looked up in the stale table,
+missed, and reported as a path that does not exist. That is precisely the failure
+a merge must never produce. Such objects are marked when the patch is applied and
+re-indexed on the next lookup (`gDirty` in `backend/jsondb.nim`).
+
+The gates, before and after, same backend build otherwise:
+
+```
+emutest    393 ok        393 ok
+realtest    90 ok         90 ok   (against the real database)
+soak       864 ok        864 ok
+fuzzwire   150 ok        150 ok   (its route list is discovered, so the count moves)
+allmods     56 ok         56 ok
+firstrun   63 checks ok  63 checks ok
+```
+
+`allmods` failed three load-order checks on some runs — the registry's
+`loadAfter` against a directory walk — and did so identically on both binaries;
+they came and went with a mod being rebuilt underneath the run rather than with
+anything here.
+
+
+## A patch racing a read is still undefended, and no gate would notice
+
+Written down because it is the one hazard this pass left open, and an open
+hazard nobody has written down is one that gets rediscovered as a bug report.
+
+**Reads take no lock.** That is deliberate and it is most of why the read path
+is fast: `/client/items` answers out of a `substr` of the live document, and
+putting a lock around it would serialise the largest response the server sends
+behind every write. The write path used to rebuild the whole document and swap
+it; it now splices in place, which is a `moveMem` of the bytes following the
+edit. **The hazard is the same size either way** — a reader walking the document
+while a writer moves bytes underneath it — and this pass neither introduced it
+nor closed it.
+
+What makes it survivable in practice is the traffic, not the code: SPT is one
+player, the writes are small and rare, and the big reads happen at boot and on
+menu transitions rather than concurrently with an item move. That is an argument
+about the workload, and it stops being true the moment anything drives the
+server harder than a single client does.
+
+**`benchbackend` cannot detect it, and this is what it would take.** The tool is
+sequential: one connection, one request at a time, `--keepalive` reusing the
+socket rather than adding a second. A race needs two requests genuinely in
+flight, so catching this would mean a second connection issuing
+`/client/game/profile/items/moving` in a loop while the first pulls
+`/client/items`, with the large response checksummed against a known-good copy
+on every round rather than merely timed. That is a correctness harness wearing a
+benchmark's clothes, and it belongs beside `fuzzwire` rather than here — but
+`benchbackend` already owns the process spawning, the staging and the wire
+client it would need, which is why it is recorded in this file rather than
+another.
+
+Re-checked on this tree, so the tool itself is known to work: 3000 templates, a
+5 MiB database, one kept-alive connection, 12 rounds of 31 requests — 372
+requests in 616 ms, **603 requests/second**, 102 MiB/s of uncompressed body.
+`items` 15.5 ms mean, `items/moving` 1.1 ms mean with a p99 of 3.5 ms and a
+worst of 24.8 ms. That tail is on the write path and is the one number here a
+segmented document would move; the trade that rules that out is written up above
+and is not reopened.

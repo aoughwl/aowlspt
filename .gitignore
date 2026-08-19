@@ -36,3 +36,30 @@ tests/detour_test.exe
 *.exe
 *.bmp
 tests/overlayhost/shots/
+tests/overlayhost/shots-*/
+
+# Trees the test hosts assemble for themselves: a staged install, a staged
+# backend and the database, logs and selection files they write while running.
+# Every one of them is produced by `aowl test`, and `shots-4k` alone is 292 MB.
+tests/overlayhost/ovstage/
+
+# `backendstage` is half fixture and half output. The fixtures — a small
+# `db.json`, the manager's config, a registry to refresh against — are inputs a
+# reviewer needs to read. Everything below is written by the run: logs, the
+# selection the manager persists, its store, and the mod library `aowl test`
+# builds and copies in. The library in particular was committed once at 616 KB.
+tests/overlayhost/backendstage/*.log
+tests/overlayhost/backendstage/store/
+tests/overlayhost/backendstage/mods/aowlspt-selection.json
+tests/overlayhost/backendstage/mods/**/*.dll
+
+# `aowl importdb` output. This is BSG's data by way of SPT's: it is produced
+# locally from your own install, never committed and never released.
+build/db/
+
+# A selection file is written by the mod manager at run time, and it decides
+# what the next start loads. One was committed here: `side: sim`, naming two
+# mods -- so a simulator pointed at `mods/` honoured a checked-in artifact and
+# loaded two of the ten. It is output, in the source tree, that changes
+# behaviour.
+mods/aowlspt-selection.json
