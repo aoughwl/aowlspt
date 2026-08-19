@@ -229,8 +229,8 @@ the last person who did:
 
 | gate | checks | how |
 |---|---:|---|
-| `emutest`, against `tests/fixtures/emu-full.json` | **541** | `emutest.exe --root <stage> --backend … --port <n>` |
-| `realtest`, against the 39.40 MiB imported database | **144**, 1 skipped | `realtest.exe --root <stage> --db build\db\db.json …` |
+| `emutest`, against `tests/fixtures/emu-full.json` | **577** | `emutest.exe --root <stage> --backend … --port <n>` |
+| `realtest`, against the 39.40 MiB imported database | **168**, 1 skipped | `realtest.exe --root <stage> --db build\db\db.json …` |
 | `soak`, 24 closed play cycles | **915** | `soak.exe --root <stage> … --cycles 24` |
 | `fuzzwire` | **152** | `fuzzwire.exe --root <stage> …` |
 | `wstest`, the notifier websocket | **62** | `wstest.exe --root <stage> …` |
@@ -239,8 +239,14 @@ the last person who did:
 | `modreport`, the client host's ledger | **27** | `installer\build\modreport.exe` |
 | `modclient`, the manager reading it | **90** | `installer\build\modclient.exe` |
 | `detour_race`, a patch under live callers | **11** | `tests\detour_race.exe` |
-| `dbrace`, concurrent readers and writers | **2** | `backend\bin\dbrace.exe` |
-| `hostharness` against the stand-in runtime | **24** verdicts | `hostharness.exe <stage> --runtime tests\mockil2cpp\GameAssembly.dll` — count the lines under `Result`, not `grep -c '^ok'`, which answers 27: three of those are the harness reporting its own staging before it has read a line of the host's log |
+| `dbrace`, concurrent readers and writers | **2** | `backend\bin\dbrace.exe` — one for torn reads and lost paths, one for stale key lists. The second was added with `dbKeys` on 2026-08-19 and is asked *in program order on the writer's own thread*, so it has no window to miss: 121,334 key lists, 0 stale |
+| `hostharness` against the stand-in runtime | **28** verdicts | `hostharness.exe <stage> --runtime tests\mockil2cpp\GameAssembly.dll` — count the lines under `Result`, not `grep -c '^ok'`, which answers 31: three of those are the harness reporting its own staging before it has read a line of the host's log. It was 24 until 2026-08-19, when four verdicts about an instance method's unreportable fourth argument landed |
+| `ws_stall`, a websocket peer that stops reading | **15** | `tests\ws_stall.exe --port <n>` — 14 and **2 failures** against the engine before the poller stopped waiting on a worker |
+| `storeguard`, a reader holding a key across a commit | **9** | `installer\build\storeguard.exe --root <dir>` — 2 fail against the store as it was, because a handle that never sees a change is trivially never torn |
+| `tickfault`, a mod whose `on_update` fails | **22** | `installer\build\tickfault.exe tests\tickfault` — three fixture mods; 9 fail with the honouring removed |
+| `ovsync`, the client host's poll reaching the backend | **24** | `ovsync.exe --root <dir> --backend … --manager … --port <n>` — 18 fail against a dead port, with `silentPolls: 0` as the proof nothing arrived |
+| `aowl-coverage --check`, the document against the code | **12** | `installer\build\coverage.exe --repo . --check` |
+| `pttguard`, Path To Tarkov's graph against the real database | **62** | `installer\build\pttguard.exe` |
 | `fakeregistry --check`, document + transport | **27**, 1 skipped | `python registry\fakeregistry.py --check --regcheck …` (44 with `--manager`, which needs a staged manager) |
 
 **`tools/firstrun.nim` runs, and the row above is measured rather than
