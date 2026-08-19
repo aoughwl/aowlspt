@@ -599,8 +599,8 @@ static void aowl_session_unlock(int32_t slot) {
     /* Requests on one connection before it is closed anyway. It lived in
      * `aowlbackend.nim` when the connection loop did; it is applied here now,
      * after the response has gone out, so the bytes on the wire are unchanged
-     * -- request 512 is still answered `Connection: keep-alive` and the socket
-     * still closes under it. */
+     * -- and request 512 is answered `Connection: close`, because that is
+     * what then happens to the socket. See `aowl_final_req`. */
 
 #define AOWL_IDLE_MS 5000
 #define AOWL_HEAD_MS 3000
@@ -1476,6 +1476,22 @@ static int aowl_conn_read_hot(AowlConn* c) {
 
 /* -- the workers --------------------------------------------------------- */
 
+/* Whether the request this worker is about to answer is the last one this
+ * connection is allowed. Thread-local because a worker answers one request at
+ * a time and sixteen of them do it at once; read by `aowl_conn_final` from
+ * inside the nimony callback, on the same thread, before anything is sent.
+ *
+ * This exists because the cap below used to be applied *after* the response
+ * had gone out, so request 512 was answered `Connection: keep-alive` and the
+ * socket then closed under it. The client, told to keep going, sent request
+ * 513 into a dead socket and got nothing back -- one silently lost request per
+ * 512 on every kept-alive connection, which `benchbackend` reports on every
+ * run long enough to reach it ("the server closed without answering"). The
+ * server's behaviour is unchanged; what changes is that it now says so. */
+static __declspec(thread) int aowl_final_req = 0;
+
+static int aowl_conn_final(void) { return aowl_final_req; }
+
 /* One request out of the buffer, answered, and the bytes behind it kept.
  * The shift-down is what the nimony loop did with its own buffer: anything
  * past this request belongs to the next one, and a pipelined request left on
@@ -1483,8 +1499,10 @@ static int aowl_conn_read_hot(AowlConn* c) {
 static int aowl_serve_one(AowlConn* c) {
     int32_t total = c->need;
     if (total < 0 || total > c->len) total = c->len;
+    aowl_final_req = (c->served + 1 >= AOWL_KEEPALIVE_MAX) ? 1 : 0;
     int32_t keep = aowlspt_nim_handle((uint64_t)c->s, c->buf, total,
                                       c->headEnd, c->sep);
+    aowl_final_req = 0;
     int32_t left = c->len - total;
     if (left > 0) memmove(c->buf, c->buf + total, (size_t)left);
     c->len = left;

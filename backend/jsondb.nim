@@ -808,6 +808,10 @@ proc locate(path: string; valueStart, valueEnd: var int): bool =
     inc tries
     result = locateOnce(path, valueStart, valueEnd, restart)
 
+proc isDocWs(c: char): bool =
+  ## The four characters JSON allows between tokens.
+  result = c == ' ' or c == '\t' or c == '\n' or c == '\r'
+
 proc trimmed(start, stop1: int): string =
   ## `gDoc[start ..< stop1]` with the whitespace trimmed by moving the indices,
   ## not by copying twice.
@@ -851,6 +855,56 @@ proc dbGetPath*(path: string; into: var string): bool =
   into = trimmed(vs, ve)
   docReadEnd()
   result = true
+
+proc dbHoldPath*(path: string; at: var pointer; length: var int): bool =
+  ## `dbGetPath` without the copy: the value is left where it lives, and this
+  ## returns a pointer straight into the document's own buffer.
+  ##
+  ## **It returns with the document read lock still held**, and the caller must
+  ## call `dbRelease()` when it has finished with the bytes. That is a shape
+  ## worth being uncomfortable about, so here is why it is the right one and
+  ## what makes it safe.
+  ##
+  ## The only caller is `hostDbGet`, whose whole job is to put the value into a
+  ## host buffer for a mod. Through `dbGetPath` that is *two* copies of the
+  ## value -- `trimmed` cuts it out of the document into a nimony string, and
+  ## `aowl_out_copy` then copies that string into the host buffer -- and on
+  ## `templates.items` against a real database each of those is 12.5 MB. One of
+  ## them is pure transit.
+  ##
+  ## The lock is held for no longer than `dbGetPath` already held it. `trimmed`
+  ## copies *under* the read lock, and for exactly the reason this must: the
+  ## document lock is what stops a concurrent `dbPatchPath` splicing or
+  ## reallocating the buffer the copy is reading. Shared means readers still do
+  ## not wait on each other; a writer waits for them, which it did before.
+  ##
+  ## What the caller must not do is take any other lock while holding this, or
+  ## call back into `jsondb`. `hostDbGet` does neither: between the two calls it
+  ## makes one `aowl_out_copy`, which allocates and memcpys and nothing else.
+  ## The order this file keeps -- document first, index second, never `cLock`
+  ## then the document -- is unchanged, because no second lock is taken at all.
+  at = cast[pointer](0)
+  length = 0
+  docRead()
+  var vs = 0
+  var ve = 0
+  if not locate(path, vs, ve):
+    docReadEnd()
+    return false
+  var a = vs
+  var b = ve
+  while a < b and isDocWs(gDoc[a]):
+    inc a
+  while b > a and isDocWs(gDoc[b - 1]):
+    dec b
+  at = cast[pointer](cast[uint](readRawData(gDoc)) + uint(a))
+  length = b - a
+  result = true
+
+proc dbRelease*() =
+  ## The other half of `dbHoldPath`. Separate rather than a template taking a
+  ## block because there is one call site and a block form would invite more.
+  docReadEnd()
 
 # --------------------------------------------------------------- merging
 

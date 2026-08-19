@@ -59,6 +59,32 @@ static int64_t aowl_race_get_missing(void)  { return (int64_t)InterlockedCompare
 static int32_t aowl_race_running(void)      { return InterlockedCompareExchange(&aowl_race_stop, 0, 0) ? 0 : 1; }
 static void    aowl_race_halt(void)         { InterlockedExchange(&aowl_race_stop, 1); }
 
+/* A held read, probed through the raw pointer `dbHoldPath` hands back.
+ *
+ * `hostDbGet` no longer copies the value into a nimony string before handing
+ * it to the host: it takes the document's own bytes and copies once, with the
+ * read lock held for the length of that copy. The pointer is therefore into
+ * `gDoc`'s live buffer, and what would go wrong is precisely what this file
+ * exists to catch -- a splice moving those bytes, or a growth freeing the page
+ * they are on, while the copy is in progress.
+ *
+ * So this touches one byte per 4 KB page across the whole value, which is what
+ * turns a freed buffer into an access violation here rather than into a
+ * plausible-looking answer somewhere else, and returns whether the value still
+ * begins `{` and ends `}`. A `templates.items` that does not is a range out of
+ * the middle of the document. */
+static LONG64 aowl_race_held = 0;
+static void    aowl_race_bump_held(void) { InterlockedIncrement64(&aowl_race_held); }
+static int64_t aowl_race_get_held(void)  { return (int64_t)InterlockedCompareExchange64(&aowl_race_held, 0, 0); }
+
+static int32_t aowl_race_probe(const char* p, int32_t n) {
+    if (p == 0 || n < 2) return 0;
+    volatile int32_t acc = 0;
+    for (int32_t i = 0; i < n; i += 4096) acc += (unsigned char)p[i];
+    acc += (unsigned char)p[n - 1];
+    return (p[0] == '{' && p[n - 1] == '}') ? 1 : 0;
+}
+
 /* nimony emits the definitions of these below this block, so they are declared
  * here rather than assumed. */
 int32_t aowl_race_reader(int32_t which);
@@ -112,6 +138,9 @@ proc cBumpRead() {.importc: "aowl_race_bump_read", nodecl.}
 proc cBumpWrite() {.importc: "aowl_race_bump_write", nodecl.}
 proc cBumpTorn() {.importc: "aowl_race_bump_torn", nodecl.}
 proc cBumpMissing() {.importc: "aowl_race_bump_missing", nodecl.}
+proc cBumpHeld() {.importc: "aowl_race_bump_held", nodecl.}
+proc cGetHeld(): int64 {.importc: "aowl_race_get_held", nodecl.}
+proc cRaceProbe(p: pointer; n: int32): int32 {.importc: "aowl_race_probe", nodecl.}
 proc cReads(): int64 {.importc: "aowl_race_get_reads", nodecl.}
 proc cWrites(): int64 {.importc: "aowl_race_get_writes", nodecl.}
 proc cTorn(): int64 {.importc: "aowl_race_get_torn", nodecl.}
@@ -250,6 +279,26 @@ proc raceReader(which: int32): int32 {.exportc: "aowl_race_reader", cdecl.} =
       cBumpMissing()
     elif all.len < 16 or all[0] != '{' or all[all.len - 1] != '}':
       cBumpTorn()
+
+    # And the same table again through `dbHoldPath`, which is the path
+    # `hostDbGet` actually takes: no nimony string in the middle, the document's
+    # own bytes read under the read lock and released after. It is a different
+    # hazard from the `substr` above even though it is the same lock -- the
+    # copy there is made by code that owns the buffer it writes into, and the
+    # copy here is made by the host allocator through a pointer this thread was
+    # handed. If the lock is doing less than it claims, this is where a splice
+    # lands in the middle of somebody else's read.
+    var at = cast[pointer](0)
+    var held = 0
+    if not dbHoldPath("templates.items", at, held):
+      cBumpMissing()
+    else:
+      let shape = cRaceProbe(at, int32(held))
+      dbRelease()
+      if shape == 0'i32:
+        cBumpTorn()
+      else:
+        cBumpHeld()
     cBumpRead()
   result = 0'i32
 
@@ -336,7 +385,9 @@ proc main(): int =
   echo ""
   echo "Result"
   echo "------"
-  echo "  reads     " & $reads & " passes (" & $(reads * 4) & " values)"
+  echo "  reads     " & $reads & " passes (" & $(reads * 5) & " values)"
+  echo "  held      " & $cGetHeld() & " of those read the table through " &
+       "`dbHoldPath`, the pointer `hostDbGet` copies from"
   echo "  writes    " & $writes
   if torn == 0 and missing == 0:
     echo "ok    no torn read and no path lost across " & $reads &

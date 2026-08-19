@@ -1158,3 +1158,258 @@ requests in 616 ms, **603 requests/second**, 102 MiB/s of uncompressed body.
 worst of 24.8 ms. That tail is on the write path and is the one number here a
 segmented document would move; the trade that rules that out is written up above
 and is not reopened.
+
+# The fourth pass: measure per endpoint, then find there is not much left
+
+This pass started by re-running every number above, because several numbers
+elsewhere in this repo had silently drifted and there was no reason to think
+these had not. Several had. What follows is what reproduces, what does not, the
+instrument that was missing, the three changes that came out of it, and the
+ceilings -- because most of what this pass found is that the backend is no
+longer where the time goes.
+
+Same method as everything above: `benchbackend` against the real emulator over
+the real wire, one pinned `mods/tarkov/bin/tarkov.dll` copied out of the tree
+before anything was built, two server binaries from the same sources with the
+change reverted in one, interleaved A/B, ports 7071-7080 one run at a time.
+
+## What no longer reproduces
+
+| | recorded above | measured now |
+|---|---|---|
+| the whole mix, 3000 templates, keep-alive | 1015 req/s | **561 req/s** |
+| `store_set` | 43 us | **723-917 us** |
+| the `aowl test` floor | `--floor 800` | it is `--floor 500` in `tools/aowl.nim` |
+| that configuration's headroom | ~1550 req/s | **~800 req/s**, and one cold run in eight at 268 |
+| a `zcache` hit on `/client/items` | ~0.9 ms | **~0.12 ms** at 3000 templates |
+| "reads take no lock" | stated at the end of the pass above | no longer true: `jsondb` has a document reader-writer lock, and its own header says so |
+
+The first two rows are one fact. `storeWrite` is an atomic commit now -- value
+into a temporary, `MoveFileEx` over the key -- which is the change the section
+"The gate went red the same afternoon" measured and then, correctly, declined to
+decide. It was decided in `host/common/modstore.nim` afterwards, and the
+consequence for the headline number was never written down here. It is now:
+**the profile store is two thirds of this server again**, for a stated and
+defensible reason, and no throughput number above the "gate went red" section is
+still the number this tree produces.
+
+The last row matters for anyone reading the previous pass's closing section: the
+hazard it says is open -- *a patch racing a read is still undefended* -- was
+closed afterwards by `jsondb`'s document lock. That section is out of date and
+this line is the correction.
+
+## The instrument: `--perf` now splits by endpoint
+
+The per-phase totals say the server spent 420 ms in `store_set`. They cannot say
+*which endpoint* spent it, and that turned out to be the question every decision
+in this pass needed. `/client/items` and `/client/game/profile/items/moving`
+have nothing in common except that they are both requests, and a mix containing
+both reports a mean belonging to neither. Splitting them was previously done
+with arithmetic -- take the aggregate, run a second mix, subtract, divide --
+which is an estimate wearing a measurement's clothes, and it is how the `zcache`
+row in the table above came to be wrong by a factor of seven.
+
+So a request is tagged with its URL in `aowlspt_nim_handle`, and every phase it
+accounts for lands in that URL's row as well as in the total. The class is a
+**thread-local index**, not a string: `perfAdd` is called twelve times a request
+from sixteen workers and must not hash anything on that path. Slot 0 is "not
+attributed", because a thread-local integer starts at zero and charging a thread
+that never began a request to whichever URL happens to be first is exactly the
+quiet wrong answer this module exists to replace.
+
+`--perf` still costs nothing: 583 and 589 req/s with it, against 579, 564 and
+567 without.
+
+## The profile, per endpoint
+
+3000 templates, 20 rounds, keep-alive, 723 requests. Mean microseconds per
+request; `route` is net of the host calls it contains, so it is the mod's own
+work plus the ABI copies.
+
+| url | n | route | deflate | send | db_get | store_get | store_set | store_list |
+|---|---|---|---|---|---|---|---|---|
+| `/client/items` | 24 | 6321 | 1515 | 124 | 988 | | | |
+| `/client/locale/en` | 24 | 828 | 385 | 59 | 187 | 110 | | |
+| `/client/handbook/templates` | 24 | 268 | 182 | 69 | 34 | | | |
+| `/client/globals` | 24 | 275 | 59 | 31 | 43 | | | |
+| `/client/game/profile/list` | 25 | 145 | 82 | 28 | 0 | 36 | 46 | 260 |
+| `/client/game/keepalive` | 23 | 6 | 10 | 22 | | | | |
+| `/client/game/profile/items/moving` | 576 | 209 | 28 | 23 | 2 | 13 | **736** | |
+
+And against the real 41 MB imported database, 12 rounds:
+
+| url | n | route | deflate | send | db_get | store_set |
+|---|---|---|---|---|---|---|
+| `/client/items` (12.5 MB) | 16 | 18649 | 9161 | 495 | 3475 | |
+| `/client/locale/en` (2.8 MB) | 16 | 3992 | 4867 | 332 | 904 | |
+| `/client/game/profile/items/moving` | 376 | 196 | 28 | 50 | 12 | **1114** |
+
+Two readings, and they are the whole result of this pass.
+
+**The endpoint a player hits thousands of times a session is 1.04 ms, and 70 to
+85 percent of it is one file write.** `store_set` is 736 us of it against the
+generated database and 1114 us against the real one -- the same number, because
+the profile is the same size either way. Everything the backend itself does on
+that request is `deflate` 28 us, `send` 23 us, `inflate` 7 us and `match` 1 us:
+**59 us, six percent.** There is no change to `backend/` that moves this
+endpoint, and the change that would is in `host/common/modstore.nim`, which this
+work does not own and which has already priced the trade above.
+
+**`/client/items` is memory bandwidth and nothing else.** 4.25 MB of body, 8.0 ms
+to first byte, and the phases account for it as copies: the `substr` out of the
+document, the ABI's host buffer, the mod's `takeBuffer`, `envelope`,
+`allocBuffer`, `readMem` back into the server, and the cache's compare. That is
+the seven copies the first pass counted and could not remove. One of them turned
+out to be removable from here.
+
+## The changes
+
+### 1. `db_get` copies the value once instead of twice
+
+`hostDbGet` was `dbGetPath` into a nimony string and then `aowl_out_copy` out of
+that string into the host buffer. The string in the middle exists only to be the
+argument of the second copy: on `templates.items` against a real database that
+is 12.5 MB allocated, copied and freed, per request, for nothing.
+
+`jsondb.dbHoldPath` locates the value and hands back a pointer into the
+document's own buffer **with the read lock still held**; `dbRelease` gives it
+back. One `aowl_out_copy` happens in between and nothing else does.
+
+**The concurrency argument, because this is a raw pointer into a buffer another
+thread may splice.** The document lock is a reader-writer lock and this holds it
+*shared*, which is what `dbGetPath` already did -- its `substr` copied under the
+same lock, for the same reason: an in-place splice or a growth by a concurrent
+`dbPatchPath` under a copy in progress is a use-after-free, not a torn read. The
+critical section is therefore no longer than it was; one copy under the lock has
+been replaced by a different copy under the lock. A writer takes it exclusive
+and so waits for readers, exactly as before. The one new rule is that the caller
+must take no other lock and make no other `jsondb` call between the two, and
+`hostDbGet` -- the only caller -- does neither. The file's existing order,
+document lock first and index lock second and never `cLock` before the document,
+is untouched because no second lock is taken at all.
+
+Interleaved A/B, three pairs each, medians:
+
+| | before | after |
+|---|---|---|
+| `/client/items` ttfb, 5 MiB database | 8.01 ms | **6.77 ms** |
+| `/client/items` `route` (mean us) | 6554 | **5131** |
+| `/client/items` `db_get` (mean us) | 1036 | **785** |
+| `/client/items` ttfb, 41 MB database | 22.76 ms | **16.73 ms** |
+| `/client/items` `route` (mean us) | 18649 | **12864** |
+| `/client/items` `db_get` (mean us) | 3358 | **2233** |
+| `/client/locale/en` `route` (mean us) | 886 | **590** |
+| `/client/game/profile/items/moving` `route` | 206 us | 206 us |
+
+Six milliseconds off `/client/items` on a real database, which is more than one
+copy of it costs -- removing the string also removes a 12.5 MB allocation and
+its page faults. Nothing else moves, which is right: every other body is small.
+
+`backend/dbrace.nim` is extended for it, and the extension was checked the way
+that file demands. Every reader pass now reads `templates.items` a second time
+through `dbHoldPath` and probes one byte per 4 KB page of the returned range
+before releasing, so a freed or spliced buffer is an access violation here
+rather than a plausible answer somewhere else. Against this tree: **25754
+concurrent read passes against 12481 writes, no torn read, no path lost.**
+Against a copy of `jsondb.nim` with `dbHoldPath`'s two lock calls deleted and
+nothing else changed: **it fails inside the three seconds**, one read answered
+with text that was never in the document. A check that cannot fail is not a
+check.
+
+### 2. Request 512 stops lying about the connection
+
+`AOWL_KEEPALIVE_MAX` is applied after the response has gone out, and the note
+above records that as deliberate: *request 512 is still answered
+`Connection: keep-alive` and the socket still closes under it.* That is a
+protocol lie with a measurable cost. A client that believes the header sends
+request 513 into a socket the server has already closed and gets nothing back --
+**one silently lost request per 512 on every kept-alive connection.**
+
+`benchbackend` has been reporting it on every run long enough to reach it:
+
+```
+error 1 of 620 measured requests were not served
+  first one: keepalive -> the server closed without answering
+```
+
+The server's behaviour is unchanged; what changed is that it says so. A
+thread-local set in `aowl_serve_one` before the callback and cleared after it,
+read once by `aowlspt_nim_handle`, which clears `req.keepAlive` -- so the header
+and the socket agree, and every `return` path already turns `req.keepAlive` into
+the poller's keep-or-close answer. Thread-local because a worker answers one
+request at a time and sixteen of them do it at once; set and cleared around one
+synchronous call on the same thread, so there is no lifetime to reason about and
+nothing shared between workers.
+
+Proven on the wire rather than through the benchmark, because `benchbackend`'s
+client does not reconnect either way. 513 requests down one socket:
+
+```
+baseline    request 1:   Connection: keep-alive      (and 511 more)
+            request 513: no answer, socket closed
+this tree   request 1:   Connection: keep-alive
+            request 512: Connection: close
+            request 513: no answer, socket closed
+```
+
+Throughput unchanged: 563, 560, 548, 564 req/s before against 580, 591, 520, 587
+after, interleaved.
+
+### 3. `hostDbGet`'s redundant local -- no measurable effect
+
+`var v = value` before handing it to `aowl_out_copy` reads as a whole-value copy
+and measured as nothing, on three interleaved pairs: nimony was moving it, which
+is the same answer the `byref` annotations got in the pass above. It is gone
+anyway, because change 1 replaced the block it was in, but it is recorded so the
+next person does not spend a run on it.
+
+## What is at its ceiling, and what that means
+
+- **`items/moving`, the endpoint that matters.** 1.04 ms, 59 us of it in
+  `backend/`. It does not scale with the database -- 1.04 ms against 5 MiB and
+  1.07 ms against 41 MB, which is the index still doing its job -- and it does
+  not scale with the profile. The remainder is one atomic file commit, priced
+  and argued in `host/common/modstore.nim`.
+- **`/client/items`.** 6.8 ms for 4.25 MB and 16.7 ms for 12.5 MB after change
+  1. What is left is five copies of the body, four of which are in
+  `mods/tarkov` and `aowl/src`. The client's own `inflate` is larger than all of
+  it: 14.5 ms round trip against 6.8 ms of server.
+- **The compressed-body cache.** A hit on `/client/items` is 120 us at 3000
+  templates and about 3 ms at 12.5 MB, and it is the `memcmp` the design
+  requires. Sending straight out of the cache entry rather than copying the
+  packed bytes out under the lock was costed and not built: it is worth about
+  0.4 ms on one boot-time request and it needs a pin count on entries so that an
+  eviction cannot free a buffer a worker is still sending from. That is a
+  concurrency hazard bought for one percent.
+- **`send`, `match`, `inflate`.** 23 us, 1 us and 7 us on the hot endpoint, and
+  `keepalive` -- the whole server with an empty answer -- is 38 us. There is no
+  fixed overhead left to find.
+
+## The gate
+
+`aowl test` runs `benchbackend --items 1000 --rounds 6 --moves 15 --keepalive
+--floor 500`. On this machine that is 783, 826, 788, 812 and 823 requests/second
+on five consecutive runs -- and **268 on the first run against a fresh
+directory**, which is under the floor. The failure is the store meeting a
+directory real-time antivirus has not seen before, not the server; but a gate
+that fails one run in eight for a reason its message does not name is a gate
+people learn to re-run. It is recorded here rather than adjusted, for the reason
+the previous pass gives: a gate moved to accommodate what it caught is not a
+gate.
+
+## Correctness
+
+Every suite against the same pinned `tarkov.dll` and the same fixture, before
+and after, back to back:
+
+```
+                 before              after
+emutest          541 ok, 0 failed    541 ok, 0 failed
+soak             915 ok, 0 failed    915 ok, 0 failed
+fuzzwire         152 ok, 0 failed    152 ok, 0 failed
+wstest            62 ok, 0 failed     62 ok, 0 failed
+framelen         102 ok, 0 failed    102 ok, 0 failed
+realtest         144 ok, 1 skipped   144 ok, 1 skipped   (real 41 MB database)
+dbrace           passes              passes, and 25754 of its read passes now
+                                     go through `dbHoldPath`
+```

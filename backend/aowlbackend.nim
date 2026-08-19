@@ -641,6 +641,7 @@ proc cInvokeRoute(cb, user, url: HostPtr; urlLen: int32;
                   outPtr, outLen: HostPtr): int32 {.
   importc: "aowl_invoke_route", nodecl.}
 proc cFreeBuf(p: HostPtr) {.importc: "aowl_host_release", nodecl.}
+proc cConnFinal(): int32 {.importc: "aowl_conn_final", nodecl.}
 
 proc runRoute(route: Route; r: Request; into: var string): bool =
   ## The route is a copy taken under the registration lock, and nothing here
@@ -780,6 +781,22 @@ proc handleRequest(sock: uint64; buf: HostPtr; len: int32;
                  "{\"err\":\"the request line or its Content-Length is " &
                  "malformed\"}", false)
     return 0'i32
+
+  # The connection's last allowed request answers `Connection: close`.
+  #
+  # `AOWL_KEEPALIVE_MAX` is applied by the poller after the answer has gone
+  # out, so this request's response used to promise a connection that was
+  # already going to be closed under it. Every `return` below turns
+  # `req.keepAlive` into the poller's keep/close answer as well, so clearing it
+  # here makes the header and the socket agree instead of contradicting each
+  # other -- and the poller closes on either.
+  if cConnFinal() != 0'i32:
+    req.keepAlive = false
+
+  # Every phase this thread accounts for from here on belongs to this URL.
+  # Before the body work rather than after it, so `inflate` lands in the right
+  # row; after `parseHead`, because there is no URL to name until it has run.
+  perfBegin(req.url)
 
   # Refused rather than served, and the poller never waited for the body: the
   # allocation *is* the attack. See `MaxBodyBytes`.
@@ -1037,8 +1054,12 @@ proc hostConfigGet(ctx: HostPtr; key: HostPtr; keyLen: int32;
   elif not pathGet(text, k, value):
     gLastError = "no such key: " & k
     return ErrNotFound
-  var v = value
-  result = cOutCopy(outPtr, outLen, cast[HostPtr](toCString(v)), int32(v.len))
+  # `value` is handed to `cOutCopy` directly. It used to be copied into a local
+  # `v` first, which on `templates.items` is a 4.25 MB allocation and copy that
+  # nothing reads: `cOutCopy` takes a pointer and a length and does its own
+  # copy into the host buffer.
+  result = cOutCopy(outPtr, outLen, cast[HostPtr](toCString(value)),
+                    int32(value.len))
 
 proc hostConfigSet(ctx: HostPtr; key: HostPtr; keyLen: int32;
                    val: HostPtr; valLen: int32): int32 {.
@@ -1051,15 +1072,31 @@ proc hostDbGet(ctx: HostPtr; path: HostPtr; pathLen: int32;
     exportc: "aowlspt_nim_db_get", cdecl.} =
   discard cOutCopy(outPtr, outLen, cast[HostPtr](0), 0'i32)
   let p = readBytes(path, pathLen)
-  var value = ""
   let tDb = perfNow()
-  let found = dbGetPath(p, value)
-  perfAdd(PhaseDbGet, tDb)
-  if not found:
+  # Copied **once**: out of the document and straight into the host buffer.
+  #
+  # This was `dbGetPath` into a nimony string and then `cOutCopy` out of that
+  # string, which is two copies of the value -- the first into a string that
+  # exists only to be the argument of the second. On `templates.items` against
+  # a real database that is 12.5 MB allocated and copied for nothing, on every
+  # request, and it is one of the seven copies `docs/PERF-SERVER.md` counts
+  # between the database and the socket.
+  #
+  # `dbHoldPath` returns with the document read lock held and `dbRelease` gives
+  # it back. The critical section is no longer than it was: `dbGetPath`'s
+  # `substr` ran inside the same lock and for the same reason -- the lock is
+  # what stops a concurrent `dbPatchPath` splicing the buffer being copied out
+  # of. Nothing else is taken while it is held; the rest of the argument is at
+  # `dbHoldPath`.
+  var at = cast[pointer](0)
+  var length = 0
+  if not dbHoldPath(p, at, length):
+    perfAdd(PhaseDbGet, tDb)
     gLastError = "no such database path: " & p
     return ErrNotFound
-  var v = value
-  result = cOutCopy(outPtr, outLen, cast[HostPtr](toCString(v)), int32(v.len))
+  result = cOutCopy(outPtr, outLen, cast[HostPtr](at), int32(length))
+  dbRelease()
+  perfAdd(PhaseDbGet, tDb)
 
 proc hostDbPatch(ctx: HostPtr; path: HostPtr; pathLen: int32;
                  patch: HostPtr; patchLen: int32): int32 {.
