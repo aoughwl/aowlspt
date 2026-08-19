@@ -1,8 +1,8 @@
 ## A server-side mod that actually changes the game.
 ##
 ## Where examples/hello proves the plumbing, this one shows the surface a real
-## backend mod uses: read its own config, patch the SPT database, serve a
-## dynamic route, and reach anything the ABI does not name through `call`.
+## backend mod uses: read its own config, patch the SPT database, and serve a
+## dynamic route. It also *asks* for `call`, and is told no — see below.
 ##
 ## ## What it changes, exactly
 ##
@@ -162,9 +162,15 @@ proc applyDatabaseChanges() =
 
 proc onLoad(): Status =
   if side() != sideServer and side() != sideSim:
-    # Declared for the client too so a single package can ship everywhere, but
-    # there is nothing for this mod to do there.
-    info "backend mod idle on the client"
+    # Unreachable on a host that honours `sides`, and kept anyway.
+    #
+    # `exportMod` below declares `{sideServer, sideSim}` and `modhost.loadOne`
+    # skips a mod whose bit is clear for the side it is on, so the client never
+    # gets this far. The guard is what a mod that *did* declare the client
+    # would need, and it costs one comparison a load. This comment said the mod
+    # was "declared for the client too" until 2026-08-19, which the `sides` set
+    # twenty lines down had never agreed with.
+    info "backend mod idle on a side it has nothing to do on"
     return Ok
 
   readConfig()
@@ -185,14 +191,30 @@ proc onLoad(): Status =
       else:
         """{"err":1,"errmsg":"unknown endpoint: """ & tail & "\"}")
 
-  # The escape hatch. Anything the ABI does not name is still reachable by
-  # name; this is the slow path, so it belongs in setup code, not a hot loop.
+  # The escape hatch, and the one place it does not open.
+  #
+  # `call` reaches a member by name through reflection, and it is **client-side
+  # only**: `aowlspt-backend` answers every one of them `ErrUnsupported`, with
+  # the words "the backend has no managed runtime to reflect into". There is no
+  # managed SPT server in this process to reflect into — the backend *is* the
+  # server. So on the host this mod actually ships to, this call always fails,
+  # and it is kept because being told no in the log is worth more than not
+  # asking: a mod author who read "anything the ABI does not name is reachable
+  # by name" and planned around it should meet the refusal here rather than in
+  # a raid.
+  #
+  # It succeeds under `aowlspt-sim --stubs examples/backend/stubs.json`, which
+  # is what that file is for and is the only place this line prints a version.
+  #
+  # This header and this comment claimed the escape hatch outright until
+  # 2026-08-19. `examples/clientprobe` is where `call` genuinely works.
   var version = ""
   let st = call("SPTarkov.Server.Core.Utils.Watermark::GetVersionTag", "[]", version)
   if st == Ok:
     info "server watermark: " & version
   else:
-    debug "watermark unavailable here: " & lastError()
+    debug "watermark unavailable here, which on a real backend is the only " &
+          "answer: " & lastError()
 
   Ok
 

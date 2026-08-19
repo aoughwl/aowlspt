@@ -2,9 +2,14 @@
 ##
 ##     aowl build-mod examples/gameserver
 ##
-## The point of reading this next to `examples/highlevel` is that they are the
+## The point of reading this next to `examples/lesson` is that they are the
 ## same shape. One reaches into a running game, the other answers HTTP, and
 ## both are a nimony file that names things and hands back values.
+##
+## (It pointed at `examples/highlevel` until 2026-08-19. That file is the
+## client host's regression test and says in its own first line that it is not
+## the one to copy from; `examples/lesson` is, and its sections 8 to 13 are the
+## game-side half of the comparison.)
 ##
 ## ## What it changes, exactly
 ##

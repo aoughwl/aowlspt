@@ -35,7 +35,7 @@ half is a read-only census whose every `EFT.` name is a hypothesis.
 | 10 | The DI-priority load ordering (`LoadFactions` before `LoadBots`) | **Replaced,** by a two-way `morebots.ready` / `morebots.hello` handshake, which does not depend on load order at all. |
 | 11 | **`increaseBotCapAmount`** — raise every map's bot cap | **Reimplemented properly; the old version did nothing.** See below. |
 | 12 | **Prepatcher:** `Utils.AddEnumValue` appends a field to `EFT.WildSpawnType` before the CLR loads it | **Impossible post-1.0.** IL2CPP: no managed assembly to rewrite, the enum is native constants with its switch tables already emitted, and nothing is loaded so there is no pre-load window. **New `WildSpawnType` values cannot reach the client.** |
-| 13 | Nine Harmony patches (`BotsGroup::IsPlayerEnemy`, `BotGroupWarnData::ShallBossAttack`, `SuitableFollowersList`, `BaseStatisticsManager::OnDeath`, `StandartBotBrain::Activate`, …) | **Impossible.** Not for the reason an earlier note here claimed — `hookArgs` does read declared arguments and `stopWith` does override a return value. The blocker is narrower and it is the same one eight times: **a hook is not told which instance it fired on**, and all eight need `this`. The two that would have worked existed only to construct the managers below. |
+| 13 | Nine Harmony patches (`BotsGroup::IsPlayerEnemy`, `BotGroupWarnData::ShallBossAttack`, `SuitableFollowersList`, `BaseStatisticsManager::OnDeath`, `StandartBotBrain::Activate`, …) | **Not ported** — and this row used to say **Impossible**, twice over for reasons that have both expired. The first was that `hookArgs` could not read declared arguments and `stopWith` could not override a return value; both can. The second was that **a hook is not told which instance it fired on**, and all eight needed `this`: `hookArgs` delivers `{"this":{...},"args":[...]}` — Harmony's `__instance`, kept separate from the argument array — and `thisHandle`/`thisPointer` read it, as `mods/fov` and `mods/classicmovement` both do in shipped code. So nothing in this list is known to be inexpressible. None of it has been written, and the two that would have worked existed only to construct the managers below. |
 | 14 | `HuntManager`, `BotHuntManager`, `HuntTargetLayer` and its three actions | **Impossible.** Unity `MonoBehaviour`s plus BigBrain custom layers; no BepInEx, no BigBrain, and `invoke_main` reaches the host's thread rather than Unity's. |
 | 15 | SAIN interop (`AddSAINLayers`) | **Impossible, and already a stub upstream** in 2.0.3 — SAIN's `BigBrainHandler.BrainAssignment` API had been removed. |
 
@@ -96,12 +96,15 @@ The baseline covers the nineteen slots a stock database ships, and that is a
 hard limit rather than an oversight: scaling a modded map would mean scaling
 from its *live* numbers, which is exactly the compounding bug above.
 
-It is also a real gap, and `mods/icebreaker` is it. That mod rebinds the
+It **was** also a real gap, and `mods/icebreaker` was it. That mod rebinds the
 dormant `suburbs` slot into a working map with eleven waves; the vanilla
-baseline has that slot at `botMax: 0` with two stub waves, so the cap is
-skipped for being zero and the wave array is skipped for being a different
-length. Install both, ask for `horde`, and eighteen maps get busier and the
-nineteenth does not.
+baseline has that slot at `botMax: 0` with two stub waves, so the cap was
+skipped for being zero and the wave array skipped for being a different length.
+Install both, ask for `horde`, and eighteen maps got busier and the nineteenth
+did not. **It is closed from the other side**: icebreaker's `populationBaseline`
+puts that map's cap, per-zone limit and eleven wave slot pairs into every
+announcement it makes, a donated entry wins over the shipped stub for the same
+slot, and all nineteen scale. This paragraph read as an open gap until then.
 
 The mod that owns the map is the only thing in the install that knows its stock
 numbers — it ships them as data and rewrites them from that data on every boot
@@ -149,11 +152,15 @@ logged, never silent — "I asked for 3x and got 1.9x" is a fact you need.
   the database says nothing. The map id is read from the query *and* the body,
   because the client has spelled it both ways across builds and reading it
   wrong is a silent fall back to the default.
-* **The emulator does not read `waves`, `BotMax`, `MaxBotPerZone` or any
-  difficulty table.** That is not a reason to skip writing them —
-  `/client/locations` serves the whole `locations` table untouched, so the
-  client receives every field written here, and the client is what spawns bots.
-  It does mean the *server-side* effect of this mod is zero on this stack today.
+* **The emulator does not read `waves` or `MaxBotPerZone`.** That is not a
+  reason to skip writing them — `/client/locations` serves the whole `locations`
+  table untouched, so the client receives every field written here, and the
+  client is what spawns bots. This bullet used to name `BotMax` and "any
+  difficulty table" among the unread and conclude that the *server-side* effect
+  of this mod is zero: both are read on this stack now, `BotMax` by
+  `/client/game/bot/limit` (see below) and the per-role difficulty tables by
+  `/singleplayer/settings/bot/difficulties` through `emu/bots.difficultyOf`, so
+  that conclusion no longer holds.
 * **A map whose live `waves` array is a different length from the baseline is
   left entirely alone** and named as skipped: another mod owns it, and guessing
   which of their entries matches which of ours is a coin toss with a raid on

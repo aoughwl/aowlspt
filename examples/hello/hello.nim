@@ -1,4 +1,10 @@
-## The smallest mod that exercises every part of the ABI it can reach.
+## The smallest mod with all the moving parts: identity, a route, an event, the
+## tick, and state that survives a rebuild.
+##
+## Not *every* part of the ABI it can reach, which is what this header claimed
+## until 2026-08-19. Config, the store, timers and `call` are all available on
+## this side and none of them are here; `examples/lesson` has them, in the
+## order a mod needs them.
 ##
 ## Build:  aowl build-mod examples/hello
 ## Run:    aowl run examples/hello
@@ -18,9 +24,18 @@ proc onLoad(): Status =
   if spt.len > 0:
     info "SPT " & spt
 
-  # Routes are server-only; asking for one elsewhere answers ErrUnsupported
-  # rather than failing the load.
-  if side() == sideServer:
+  # Routes are the backend's. It is the **client** that refuses
+  # `route_register` with ErrUnsupported -- there is no HTTP server inside the
+  # game process -- and the simulator refuses it too, but only under
+  # `--side client`, where it is deliberately presenting as that host. The
+  # backend and an ordinary `aowl run` both serve.
+  #
+  # So the guard is "not the client" rather than "is the server", which is what
+  # it said until 2026-08-19. The narrower version meant `aowl run
+  # examples/hello` -- which presents as `sim` -- registered nothing and then
+  # answered "no route registered for ...", a trap the simulator's own error
+  # text calls out by name.
+  if side() != sideClient:
     let st = route("/aowlspt/hello", rkStatic,
       proc (url, body, session: string): string =
         info "hello route hit, session=" & session & " body=" & body
@@ -50,7 +65,13 @@ proc onLoad(): Status =
 
 proc onUpdate(elapsedMs: int64): Status =
   inc tickCount
-  # Keep this cheap: it is on the main thread and a raid is running behind it.
+  # Keep this cheap: every loaded mod's `on_update` runs in turn on one thread
+  # and a raid is running behind it.
+  #
+  # It is *not* the game's main thread, which this comment said until
+  # 2026-08-19. The client host ticks mods from its own 16 ms loop; a Unity
+  # object touched from here is the crash `onMainThread` and `everyMain` exist
+  # to prevent.
   if tickCount mod 60 == 0:
     debug "tick " & $tickCount & " (+" & $elapsedMs & "ms)"
   Ok

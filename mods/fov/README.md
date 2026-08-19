@@ -6,8 +6,10 @@ the game through `aowlspt`'s C ABI instead. CC BY-NC-SA 3.0, see `LICENSE.txt`
 beside this file; this is a modified redistribution and the copyright holder is
 unchanged.
 
-Four effects are implemented. Six settings groups are read, printed and **not**
-applied, and section 3 says which named thing each one is waiting on.
+Four effects are implemented. Eight settings groups are read, printed and
+**not** applied, and section 3 says which named thing each one is waiting on.
+(The count used to read six and never matched the eight groups section 5
+enumerates.)
 
 **Nothing here has ever run against BSG's client.** Every `EFT.` name below is
 from the pre-1.0 C# surface, and post-1.0 is a different build.
@@ -40,7 +42,9 @@ does not take effect until the next one, which is stated rather than hidden.
 
 ## 2. What changed in this pass, and why each change was necessary
 
-Four library changes landed under this mod while it sat untouched.
+Five changes landed under this mod while it sat untouched -- two of them in the
+library, one in the host and two in this file. This used to say "four library
+changes" and the five subsections below outgrew it.
 
 ### `classifyType` stopped answering `fkPtr` for everything
 
@@ -152,9 +156,9 @@ Nothing here degrades into a guess.
 | A host older than ABI revision 4 (`typedPatchesReady`) | The aiming-sensitivity postfix arms on the JSON path at ~1.6 us a call instead of ~44 ns. Not a refusal — this getter is asked once per aiming frame for one player — and the state line says which armed, because the two are thirty-six-fold apart and "armed" alone would hide that. |
 | The typed frame's `setResultFloat` refuses at runtime | The handler returns `frameContinue()` rather than `frameReplace()`, so the caller gets the original's unscaled sensitivity. Saying `frameReplace()` anyway would hand back whatever residue is in the register, which is the difference between a failure and a wrong number. |
 | The host does not answer `aowlspt.host::main_thread` | Only matters when `Look` could not be detoured. In that case the `everyMain` fallback refuses, because there is no thread it could be *shown* to reach. |
-| `ProceduralWeaponAnimation::LerpCamera` — **not attempted** | The ADS camera lerp is the game's. Every capability blocker this file used to name is gone: `this` is delivered, an address for it costs ~8 ns, and `bindRaw`/`ShapedArgs` binds a method by its native slot shape, which is exactly what Win64 does with a 12-byte `Vector3`. What is left is that this port cannot confirm the camera-offset field names on `ProceduralWeaponAnimation` against a running build, and will not write a camera offset through a guessed name. `opticCameraDistanceOffset`, the shoulder offsets and the six per-axis camera offsets are all read, printed and inert because of this one row. |
+| `ProceduralWeaponAnimation::LerpCamera` — **not attempted** | The ADS camera lerp is the game's. Every capability blocker this file used to name is gone: `this` is delivered, an address for it costs ~8 ns, and `bindRaw`/`ShapedArgs` binds a method by its native slot shape, which is exactly what Win64 does with a 12-byte `Vector3`. What is left is that this port cannot confirm the camera-offset field names on `ProceduralWeaponAnimation` against a running build, and will not write a camera offset through a guessed name. All three distance offsets (`opticCameraDistanceOffset`, `nonOpticCameraDistanceOffset`, `pistolCameraDistanceOffset`), the shoulder offsets, the six per-axis camera offsets and the camera and aim/un-aim speeds are all read, printed and inert because of this one row. The list here used to name only the optic one. |
 | `Player::Look`'s angles — **not attempted** | Free-look is unclamped. This one is about the payload rather than the instance: the angles arrive as a `UnityEngine.Vector2`, which is passed by hidden pointer and reported as `{"valueType":"..."}` — named and refused rather than invented — so there is nothing in the payload to clamp. A postfix does not help; `Look` returns void. |
-| `GameSettingsTab`'s slider-bounds field — **not attempted** | `minBaseFov`/`maxBaseFov` are read, swapped if they are the wrong way round exactly as upstream swaps them, and never applied. The instance is delivered and this fires when a menu opens, so the cost objection does not apply; what cannot be confirmed from here is which field holds the bounds. |
+| `GameSettingsTab`'s slider-bounds field — **not attempted** | `minBaseFov`/`maxBaseFov` are read, and when they are the wrong way round they are **replaced with upstream's 50..75** rather than exchanged -- this row used to say "swapped ... exactly as upstream swaps them", and `loadConfig` discards both hand-edited values instead. Either way they are never applied. The instance is delivered and this fires when a menu opens, so the cost objection does not apply; what cannot be confirmed from here is which field holds the bounds. |
 | `UnityEngine.Input::GetKey` — **not attempted** | `zoomToggleKey`, `holdToZoom`, `cancelZoomOnUnAds`, `zoomOnHoldBreath` and the six `*ToggleZoom*Multi` settings are read, printed and inert. Half of this objection expired: an enum argument is a plain number to the host now, so `GetKey` is callable the moment this mod has a number to pass it. The other half stands — this mod has the string `"M"` out of `config.json`, and turning one into a `KeyCode` ordinal means writing Unity's enumeration out from memory. That is a guess about a value, and it is the same class of refusal as the camera-offset field names. |
 | `ScopeZoomHandler`, `GameSettingsTab` as *types* | Reported as `NOT FOUND` in the world-ready log and nothing else. They exist only as the cheapest confirmation that a rename would show up somewhere legible before it shows up as a different bug. |
 
@@ -257,6 +261,7 @@ and three distance offsets, the two shoulder offsets, the two offset keys, the
 toggle-zoom group, the three camera speeds, the nine aim/un-aim speeds, and
 `minBaseFov`/`maxBaseFov`.
 
-Two are aowlspt's rather than upstream's: `verifyHooks`, which now decides only
-whether the target-verification detours are attached, and `selfTestRuntime`,
-which is read on the sim side only.
+Three are aowlspt's rather than upstream's: `verifyHooks`, which now decides
+only whether the target-verification detours are attached, and `selfTestRuntime`
+and `selfTestDataDir`, both read on the sim side only. `selfTestDataDir` was
+missing from this list.

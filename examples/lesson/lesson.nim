@@ -1,4 +1,4 @@
-## The lesson — every part of the current API, in the order a mod needs it.
+## The lesson — the API a mod on any host needs, in the order it needs it.
 ##
 ##     aowl run examples/lesson                    the simulator: no game, no server
 ##     aowl build-mod examples/lesson              just compile it
@@ -45,6 +45,14 @@
 ## ---------------------------------------------------------------------------
 ## THE ORDER, AND WHY IT IS THIS ORDER
 ## ---------------------------------------------------------------------------
+##
+## It said "every part of the current API" until 2026-08-19, and three things
+## it never covered are worth naming rather than leaving a reader to notice the
+## gap: **routes** and the **database** (`serve`, `servePrefix`, `dbRead`,
+## `dbWrite` — `examples/gameserver` and `examples/backend`), and
+## **`notifyPush`**, the revision-5 push to a session, which section 1 asks
+## about and no example anywhere demonstrates. `mods/pathtotarkov` and
+## `mods/tarkov` are the two working uses of it.
 ##
 ##   1. Identity, and asking what the host can do    — every mod, first
 ##   2. Config                                       — every mod
@@ -371,13 +379,19 @@ proc armEvents() =
 # *firings*, not between starts, so a handler slower than its interval falls
 # behind rather than overlapping itself.
 #
-# **All three give their slot back once they have fired.** That is worth
-# proving rather than believing, because it used to be false: `after` and
-# `onMainThread` took a slot per call and never returned it, so a mod queueing
-# work every frame — the documented way to reach Unity's thread — grew the table
-# without bound. `scheduledSlots()` reports its size, live plus free, and the
-# number below should settle at roughly the number of callbacks outstanding at
-# once rather than at the number ever scheduled.
+# **A one-shot gives its slot back once it has fired; a repeat holds exactly
+# one for the life of the chain.** `after` and `onMainThread` release theirs in
+# `tickTrampoline`; `every` and `everyMain` re-arm on the same cookie and the
+# same slot, which is the point made at length under `everyMain` below. This
+# said "all three give their slot back", which was right about the two one-shots
+# and wrong about `every`, until 2026-08-19.
+#
+# The one-shot half is worth proving rather than believing, because it used to
+# be false: `after` and `onMainThread` took a slot per call and never returned
+# it, so a mod queueing work every frame — the documented way to reach Unity's
+# thread — grew the table without bound. `scheduledSlots()` reports its size,
+# live plus free, and the number below should settle at roughly the number of
+# callbacks outstanding at once rather than at the number ever scheduled.
 #
 # On the client, `onMainThread` gets Unity's thread only if the host managed to
 # detour a per-frame method. Ask outright with `call("aowlspt.host::main_thread")`
@@ -392,9 +406,11 @@ proc armEvents() =
 # says how many it stopped.
 #
 # **It is not `every(16, ...)`, and the difference is not the one that is
-# written down in most places.** The version in circulation — `docs/BACKLOG.md`
-# and `mods/perf/README.md` still carry it — is that "`every` repeats on the
-# host's thread; `onMainThread` reaches Unity's and does not repeat". On the
+# written down in most places.** The version in circulation was that "`every`
+# repeats on the host's thread; `onMainThread` reaches Unity's and does not
+# repeat". `docs/BACKLOG.md` and `mods/perf/README.md` both carried it and both
+# now name it as wrong, so this paragraph no longer points at a live example of
+# it — it is written down here because it will be repeated again. On the
 # IL2CPP client host the first half is false: `hostSchedule` and
 # `hostInvokeMain` share one queue and one thread there, so a short `every` does
 # land on the game's thread. Two real differences remain, and they are the
@@ -833,9 +849,18 @@ proc boxedPath() =
 #    registration with a sentence saying which: a return type wider than eight
 #    bytes, and a compiled call needing more than four register slots.
 #
-# When two mods hook one method every handler runs and the *first* one that asks
-# to stop wins. Running the rest is deliberate: two mods hooking one method are
-# not in a race.
+# **Two mods cannot hook one method.** The detour engine takes the method's
+# first fourteen bytes, so there is one detour and one handler row per method
+# across the whole process: `aowl_hook_attach` answers -9, "that method is
+# already patched -- something else detoured it first", to whichever mod arms
+# second. There is no merge and no chain, which is why every stage in this
+# repository that runs two hooking mods gives each its own copy — and why the
+# build command at the top of this file uses a stage of its own.
+#
+# This said the opposite until 2026-08-19: "every handler runs and the first one
+# that asks to stop wins". A mod written to that would arm second, get a status
+# it discarded, and never fire — the failure this whole file is arranged to make
+# impossible, which is why the arm sites below all record `lastError()`.
 
 var gReadyFires = 0
 var gAimFires = 0
@@ -1110,7 +1135,7 @@ proc onBoostJson(target, payload: string): HookResult =
 # why it costs about a microsecond a call. Once per frame per entity, that is
 # the wrong budget. `aowlspt/fast` is the other shape: bind a method or a field
 # once, then call through the binding. A bound call is 6–10 ns and a bound field
-# read 1.7 ns, against 940–1110 ns for the boxed path — re-derived with
+# read 1.9 ns, against 950–1100 ns for the boxed path — re-derived with
 # `installer\build\perfbench.exe --runtime tests\mockil2cpp\GameAssembly.dll`,
 # msys2 ucrt64 gcc 15.2.0. Section 13 measures its own versions of those in this
 # process, which are the ones to trust on your machine.

@@ -20,8 +20,9 @@ conclusion about what happened in a raid.
 
 ## 1. What it changes, and what it does not
 
-Three writes, all on the client, plus two more effects that suppress rather than
-write.
+One write, on the client, plus four more effects that suppress rather than
+write. This used to read "three writes ... plus two more", which the table
+below never supported: there is one `writeFloat` and four `stopVoid`s.
 
 | Upstream patch | Here |
 |---|---|
@@ -41,8 +42,10 @@ Nothing else is written. The server half serves one route,
 
 ## 2. What changed in this pass, and why each change was necessary
 
-Four library changes landed under this mod while it sat untouched. Three of them
-altered what it does; one of them altered a guard from decorative to real.
+Six changes landed under this mod while it sat untouched: two library changes,
+three fixes in this file, and one host change that made a second driver
+possible. One of the library changes altered a guard from decorative to real.
+This used to say "four library changes"; the six subsections below outgrew it.
 
 ### `classifyType` stopped answering `fkPtr` for everything
 
@@ -74,7 +77,7 @@ ordinary rather than contrived — neither number knows about the other.
 
 This mod's own `bindFieldOn` had only the offset test, so it would have bound
 `SpawnCount` as an instance field with `ok` true and read `Health`'s bits as an
-integer: `1091567616`, with total confidence. It asks the runtime now, and
+integer: `1120403456`, with total confidence. It asks the runtime now, and
 refuses outright on a runtime that does not export the flag rather than falling
 back on a test that cannot answer the question. It also classifies from the
 **declared type** first and the printed name second, matching `bindField`.
@@ -152,10 +155,10 @@ Nothing here degrades into a guess.
 | `MovementContext::SetAimingSlowdown` — must return void | `AimingSlowdownPatch` refuses; aiming slows you down. Also refused when any parameter arrives as a placeholder, even though this handler reads no argument — a hook whose payload cannot be fully accounted for is the conservative side to be on, and the reason is printed. |
 | `MovementContext::InertiaSmoothTilt` — must be `(Single, Single) -> void` | `OldTiltingFix` refuses and leaning keeps its inertia ramp. The signature is checked before the hook is installed, not after. |
 | `MovementContext::LegacySmoothTilt` — the redirect target, same signature | **Checked before the original is suppressed.** Suppressing `InertiaSmoothTilt` and then failing to reach `LegacySmoothTilt` is a frozen lean, and it would only show up in a raid. If the target is missing or shaped differently, the effect refuses whole and the original lean runs. |
-| A host older than ABI revision 3 (`livePointersReady`) | `OldTiltingFix` and `RemoveJitteryRotationPatch` both refuse, with the arithmetic: without an address for `this` the redirect is a ~1 us boxed call per movement context per frame, which is 2.4 ms a frame at forty bots. That is a stutter shipped to remove a lean delay. |
+| A host older than ABI revision 3 (`livePointersReady`) | `OldTiltingFix` and `RemoveJitteryRotationPatch` both refuse, with the arithmetic: without an address for `this` the redirect is a ~1 us boxed call per movement context per frame, which is 40 us a frame -- 2.4 ms a second -- at forty bots. This row used to say 2.4 ms *a frame*, which is the per-second figure with the wrong unit on it and made the cost look sixty times worse than it is; the refusal stands on the measurement rather than on that sentence. |
 | A host older than ABI revision 4 (`typedPatchesReady`) | `OldTiltingFix` arms on the JSON path instead, at ~2.2 us a context a frame. Not a refusal — four or five contexts in a solo raid is a real cost rather than a disqualifying one — and the state line says which path armed, because the two are a hundredfold apart. |
 | `MovementContext::PlayerAnimatorSetDeltaRotation` — must return void | `RemoveJitteryRotationPatch` refuses; rotation is written as the game writes it. |
-| `MovementContext::get_IsAI` (property) **or** `IsAI` (field) | Neither answering means the original runs for **everything**, bots included. Suppressing for everything is not what upstream does and would be a guess about which contexts matter, so the effect declines to act rather than acting broadly. The log says which of the two answered. |
+| `MovementContext::get_IsAI` (property) **or** `IsAI` (field) | Neither answering means the original runs for **everything**, bots included. Suppressing for everything is not what upstream does and would be a guess about which contexts matter, so the effect declines to act rather than acting broadly. Which of the two answered is **not** reported: this row used to claim the log said, and it does not -- the effect's state line is fixed at arm time and `contextIsAi` records only that one of them did. |
 | `EFTHardSettings::TRANSFORM_ROTATION_LERP_SPEED` | **Not attempted at all.** This is the only refusal in the file about a *value* rather than a symbol: upstream writes a constant this port cannot confirm against a running build, and inventing a lerp speed is the approximation everything else here refuses. Half of `RemoveJitteryRotationPatch` is therefore permanently out until somebody measures the number. |
 | `MovementContext::GetNewState` | **Permanent, and not the kind an ABI fixes.** The replacement states are C# subclasses with `UpdatePosition` overridden; nothing native can declare a managed type, construct one, or hand it back as a reference return. Watched and counted so the log can at least say the method is live. Its second, older blocker — that an `EPlayerState` argument would be handed to the collector as an object — is gone: the host asks the runtime and an enum arrives as its number. |
 | A runtime with no `il2cpp_field_get_flags` | Every field this mod binds against a live object is refused, so `SmoothSpeedFix` does not arm. There is no way to establish that a field is an instance field on such a runtime, and an offset cannot stand in for the flag. Refusing beats a read that answers a neighbouring field. |

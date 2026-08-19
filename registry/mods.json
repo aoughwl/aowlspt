@@ -259,7 +259,7 @@
         { "id": "aowl.sain", "enabled": true },
         { "id": "aowl.blackdivision", "enabled": true },
         { "id": "aowl.icebreaker", "enabled": true },
-        { "id": "aowl.pathtotarkov", "enabled": false }
+        { "id": "aowl.pathtotarkov", "enabled": true }
       ]
     },
     {

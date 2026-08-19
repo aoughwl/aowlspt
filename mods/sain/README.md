@@ -29,7 +29,7 @@ Four columns' worth of judgement, in three groups.
 |---|---|
 | **Layered decision-making** — self-care above squad above solo combat, one priority cascade at 10 Hz emitting three simultaneous outputs | `core/decide.nim`. Same shape, same order, same three enums. The one structural change is that hysteresis is stated *once* (urgency + a hold time) instead of as a timer per check. |
 | **Per-bot personality** — eight personalities as multipliers over every threshold | `core/settings.nim`. Resolved into a flat struct **once at spawn**; the ladder then compares plain numbers. SAIN reads `Bot.Info.Personality.Behavior.X` inside each check. |
-| **Difficulty presets** | One scalar through `resolvedFor`, plus per-setting overrides in `config.json`. Difficulty now moves the two dials it should: acquisition rate and reaction delay. |
+| **Difficulty presets** | One scalar through `resolvedFor`, plus per-setting overrides in `config.json`. Difficulty now moves perception rather than behaviour: acquisition rate and reaction delay, and with them hearing acuity and both seen-time thresholds. This used to say two dials; `resolvedFor` moves five settings. |
 | **Search behaviour** — a state machine over a last-known place, not a destination | `core/search.nim`. Six phases: go to the place, look around, push past in the direction they went, guess the flank, sweep the uncertainty circle, give up. Stall detection moves it on when the navmesh will not. |
 | **Last-known-position decay** | `EnemyView.uncertainty`, grown at an assumed walking pace since contact was lost and collapsed to zero on sight. It is what makes the search widen with age instead of pointing confidently at a stale dot. |
 | **Suppression** — an accumulator with two thresholds, not a flag | `core/suppress.nim`. See below: the *sensor* is a bool, the model is ours — plus, where the damage hook takes, an exact per-hit step through `feed`'s `told` parameter. |
@@ -41,7 +41,7 @@ Four columns' worth of judgement, in three groups.
 | **Cover *usage*** — scoring, dwell hysteresis, path-failure counting, in/near/far banding | `core/cover.nim`, fully implemented and tested, and no longer unreachable: `core/probe.nim` plans a sample and folds its answers into a `CoverSet`, `client/coverprobe.nim` casts the rays for it on Unity's thread. Whether a *raid* produces points depends on two names and one host fact, all three asked rather than assumed — see the sensor table below. |
 | **Extraction** | `cdExtract`, latched. The decision is expressible; the destination is not. See the refusals. |
 | **Grenade avoidance** | `cdAvoidGrenade`, fed by a world-level grenade sample. Three guessed names — the only place in the mod where a decision depends on a guess it cannot work around. |
-| **Brain forcing and per-map difficulty skew** (SAIN's server mod) | `server/serverside.nim`, unchanged and working: both are database writes. The skew is neutralised on every location including the ones a mod that loads *after* this one creates — a sweep at load plus an `aowlspt.locations.changed` subscription and an `aowlspt.locations.hello` handshake, because the host's load order is a directory walk and a fix that depended on it would break the next time somebody added a mod. `/sain/status` reports which maps were actually reached. |
+| **Brain forcing and per-map difficulty skew** (SAIN's server mod) | `server/serverside.nim`; both are database writes. The skew works, and this cell used to call both of them working: **the brain forcing reaches nothing here.** Neither the emulator's database nor the 39 MiB import carries a top-level `configs` object, it is SPT's own bot generator that reads those paths, and there is not one on this server — the mod says so in the log. The skew is neutralised on every location including the ones a mod that loads *after* this one creates — a sweep at load plus an `aowlspt.locations.changed` subscription and an `aowlspt.locations.hello` handshake, because the host's load order is a directory walk and a fix that depended on it would break the next time somebody added a mod. `/sain/status` reports which maps were actually reached. |
 
 Five of those are worth explaining, because in each case SAIN gets the input
 from a subscription or a patch that does not exist post-1.0, and this port gets
@@ -233,8 +233,11 @@ that the row stayed open. It is the next section.
 
 SAIN decides and then has to make the bot *do* it. Five calls carry every
 decision in the ladder into the game: `Mover.GoToPoint`, `Mover.Sprint`,
-`Steering.LookToPoint`, `ShootData.Shoot`, and the three self-actions on the
-medicine and weapon components. Two things were wrong with them and they were
+`Steering.LookToPoint`, `ShootData.Shoot`, and the four self-actions on the
+medicine and weapon components — `Reload.TryReload`,
+`FirstAid.TryApplyToCurrentPart`, `Stimulators.TryApply` and
+`SurgicalKit.TryApplyToCurrentPart`, which the table below has always listed as
+four. Two things were wrong with them and they were
 wrong in different ways.
 
 **The first was that nothing checked what they were.** `GoToPoint` is resolved
@@ -321,7 +324,7 @@ sampler and, now, the driving calls — in descending order of how likely a raid
 is to embarrass them:
 
 1. **The driving calls are refused by their own gate.** Everything a decision
-   *does* now runs through `core/sig.checkDrive`, and every one of the eight
+   *does* now runs through `core/sig.checkDrive`, and every one of the nine
    members it guards is a name from the pre-1.0 C# surface. A build whose
    one-argument `GoToPoint` takes something other than a `Vector3`, or whose
    `Sprint` takes a float, produces a bot that thinks correctly and stands
@@ -425,8 +428,8 @@ one.
 What *did* move is measured separately, on the same runtime, in the same run.
 The stand-in carries an instance method with no arguments returning a bool —
 the exact shape of `get_IsAlive` — so timing 200,000 of them measures the thing
-that was removed on this machine. **14 ns**, not the 6.25 ns `docs/PERF.md`
-quotes for a raw bound call, because the mod's path is `LazyCall.callBoolOn`:
+that was removed on this machine. **14 ns**, not the 3.47 ns `docs/PERF.md`
+quotes for a raw bound call (this said 6.25, which is not a figure in that file), because the mod's path is `LazyCall.callBoolOn`:
 an `il2cpp_object_get_class` and a pointer compare to confirm the binding still
 matches this object's class, and then the call. That is the honest per-call
 figure for this mod, and quoting the raw one would understate what was saved.
@@ -469,8 +472,9 @@ So: **211 parts in a million of a frame on the frame a sample lands, at eight
 bots or at forty**, for the half that can be measured.
 
 **The engine half has never been measured and this file will not pretend
-otherwise.** `tests/mockil2cpp` has no `UnityEngine.Physics`, so no raycast has
-ever been cast by this mod, and `client/coverprobe.nim`'s cost line says
+otherwise.** `tests/mockil2cpp`'s `UnityEngine.Physics` carries two read-only
+property getters and no `Raycast` at any arity — this used to say it had no
+`UnityEngine.Physics` at all — so no raycast has ever been cast by this mod, and `client/coverprobe.nim`'s cost line says
 "nothing measured: no sample has been taken" rather than quoting somebody
 else's number. What can be said is the shape: the call goes through
 `il2cpp_runtime_invoke` rather than a bound trampoline, because a static taking
@@ -639,13 +643,15 @@ there first.
    boundary, suppression across both of its thresholds, a bot sitting exactly
    on the dogfight latch, and a bot whose situation does not change at all.
 
-Coverage by area: 20 ladder scenarios (including both new rungs and the
-reason-text completeness check), 3 extract, 6 flank, 7 hearing, 12 vision,
-9 suppression (three of them about the damage hook: that a hit told by it moves
+Coverage by area: 22 ladder scenarios (including both new rungs and the
+reason-text completeness check), 3 extract, 8 flank, 9 hearing, 14 vision,
+10 suppression (three of them about the damage hook: that a hit told by it moves
 the accumulator by exactly as much as the same hit inferred from health, that a
 hit with no readable magnitude still registers, and that an empty damage event
-is not a hit), 6 squad, 6 perception, 6 search, 3 cover scoring, 11 cover
-sampling, 5 flicker, **20 driving signatures**.
+is not a hit), 6 squad, 6 perception, 7 search, 3 cover scoring, 11 cover
+sampling, 5 flicker, **20 driving signatures**. (These used to read 20 / 6 / 7 /
+12 / 9 / 6 and summed to 114 against a stated total of 124; the total was the
+right number and the breakdown had fallen behind it.)
 
 **The twenty new ones are the driving-signature gate, both branches.** A gate
 that refuses everything passes every "does it refuse?" assertion ever written,
@@ -797,7 +803,7 @@ whose magazine count cannot be read should not spend the raid reloading.
 | `BotOwner.BotsGroup` | Squads fall back to faction + proximity. Every squad decision still works. |
 | `BotOwner.AimingData` (identity only) | The aim postfix has no way to attribute its reading to a bot, so the aim gate never engages and bots shoot when the ladder says so — which is what they did before the hook existed. |
 | Any of the three candidate aim members, or the three candidate damage members | Named individually in the log with the signature the runtime reported. The aim gate stays off; suppression falls back to the health delta. Both are stated in the effect's own state line rather than inferred from silence. |
-| `UnityEngine.Physics::Raycast` — **now attempted**, by exact signature | No cover points. The cover *logic* runs on an empty set and the ladder falls through to the rungs below it; `moveTargetFor` substitutes "away from the enemy" for "to cover" — which is what it does on every build so far, because `tests/mockil2cpp` has no `UnityEngine.Physics` and BSG's client has never been asked. The refusal names the signature the runtime reported. |
+| `UnityEngine.Physics::Raycast` — **now attempted**, by exact signature | No cover points. The cover *logic* runs on an empty set and the ladder falls through to the rungs below it; `moveTargetFor` substitutes "away from the enemy" for "to cover" — which is what it does on every build so far, because `tests/mockil2cpp`'s `UnityEngine.Physics` has no `Raycast` at any arity and BSG's client has never been asked. The refusal names the signature the runtime reported. |
 | `UnityEngine.AI.NavMesh::SamplePosition` — **now attempted**, by exact signature | Cover points are still produced, on the rays alone, and are no longer filtered by whether a bot can stand where one was proposed. A bot can then be sent at a place inside a wall, where `pathFailures` drops the point after three tries. Worse than having it; better than having no cover. |
 | `NavMesh::CalculatePath` — still not attempted | `pathDistance` stays a straight line. This needs a managed `NavMeshPath` instance constructed from a native mod and a corner array read back out of it, which is a different bet from calling a static with value arguments. |
 | Unity's main thread not confirmed by the host | **No cover sample is ever posted.** Not a refusal and not an error: `call("aowlspt.host::main_thread")` reports `bound` only once the drain has actually fired, so early in a session this is "not yet". The posts held back are counted in the stats line so that "not yet" and "never" can be told apart. |

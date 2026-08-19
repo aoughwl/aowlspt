@@ -63,8 +63,14 @@ than calling through, and its layout is therefore as much a contract as
 because it is read inside a method the game runs per entity per frame: an
 accessor reached through a pointer in `AowlHostApi` would be an indirect
 cross-module call per argument, which is a handful of nanoseconds each and a
-barrier the optimiser cannot see through. `tests/abi_layout.c` pins every offset
-in it, and it carries its own `size` like everything else here.
+barrier the optimiser cannot see through. `tests/abi_layout.c` pins its size and
+the register offsets its accessors read — `AOWL_FRAME_OFF_GPR/XMM/RET/RETF`,
+which are the thunk's own numbers and are pinned to the assembly itself by
+`tests/detour_test.c` — and it carries its own `size` like everything else here.
+(The struct's *field* offsets are not individually pinned; the size check plus
+`size`-before-anything-appended is what stands behind them. The struct itself
+lives in `abi/aowlspt_frame.h`, not in `aowlspt_abi.h`, which declares only the
+`const AowlPatchFrame*` a typed handler is given.)
 
 Revision 3 also fixed a way of *reading* `size` that was right exactly once. A
 mod tested a capability with `size >= sizeof(AowlHostApi)`, which is true while
@@ -242,8 +248,9 @@ which is the one thing this call must never do.
 
 There is no `notify_broadcast` and no push by profile id. A session is what the
 request layer has and what a connection is keyed on; a mod that knows a profile
-resolves it to sessions itself, which is four lines in `emu/notify.nim` and
-would be a policy decision in the host.
+resolves it to sessions itself, which is eight lines — `notifyProfile` in
+`mods/tarkov/emu/notify.nim`, a loop over the bound sessions — and would be a
+policy decision in the host.
 
 ## The per-mod store (revision 2)
 
@@ -324,14 +331,31 @@ exceptions do not cross the C ABI in any form the other side could act on.
 Refusing is more honest than pretending.
 
 However many mods attach to one method, there is one detour on it. The engine
-holds a fixed pool of
-16 assembly thunks — one per patched method, claimed at attach — which is why a
-seventeenth patch is refused with a message about slots rather than silently
-sharing one. The IL2CPP host spends one of those on its own main-thread drain,
+holds a fixed pool of **256** slots — one per patched method, claimed at attach —
+which is why the two-hundred-and-fifty-seventh patch is refused with a message
+about slots rather than silently sharing one. It was 16 until commit `1179ef3`,
+and 16 was never a budget: each slot needed its own hand-written `aowl_thunk_N`
+macro expansion and sixteen was what fitted on a screen. Two example mods
+exhausted it. The thunks are gone — a slot's stub is written at attach — so
+nothing is enumerated per slot any more and the constant costs only tables, 25
+bytes a slot, 6.4 KB of BSS for the lot and nothing at all on the firing path.
+A slot is also released and reused now (`aowl_hook_claim`/`aowl_hook_release`),
+where it used only ever to be handed out, so a mod switched off and on again no
+longer spends the pool down permanently.
+
+Installing a detour **stops the world for the fourteen bytes**, as of the same
+commit: `aowl_hook_arm` suspends every other thread in the process across the
+prologue write, enumerating them through `ntdll!NtGetNextThread` and falling
+back to `CreateToolhelp32Snapshot` where that is absent. Everything that can be
+done outside the freeze is — resolving the enumerator, opening the handles,
+`VirtualProtect` — so the window is the suspend sweep and the write.
+
+The IL2CPP host spends one of those slots on its own main-thread drain,
 and enters it in the same patch table a mod's patch goes into: the engine hands
-slots out in ascending order and the firing path indexes that table by slot, so
-a host hook kept outside it would shift every mod's slot by one and deliver each
-patch to the wrong handler.
+slots out in ascending order — an unused slot before any recycled one, and the
+free queue only once the high-water mark reaches the end of the pool — and the
+firing path indexes that table by slot, so a host hook kept outside it would
+shift every mod's slot by one and deliver each patch to the wrong handler.
 
 ## Typed patch frames (revision 4)
 
@@ -514,9 +538,30 @@ differently when added late is a mod whose bugs only appear one way round.
 
 ## Faults
 
-A mod that returns a bad status or throws past its own boundary is marked
-faulted and dropped from dispatch; the host keeps running. A broken mod should
-cost you that mod, not the raid.
+A mod that fails its tick over and over is marked faulted and dropped from the
+tick; the host keeps running. A broken mod should cost you that mod, not the
+raid.
+
+Precisely, as of commit `be5598a` and in `host/common/modhost.nim`: `tickMods`
+counts **consecutive** non-`Ok` answers from `on_update`, and at
+`TickFaultLimit` — **120** in a row, which is about two seconds at the client
+host's 16 ms tick and about six at the backend's 50 ms — it logs
+`faulted, mod disabled` and stops ticking that mod. Any `Ok` resets the run to
+zero, so a mod that fails one tick in fifty all session is never disabled. The
+mod stays loaded and **only its tick stops**: its routes, events, timers and
+detours go on working, it is still `live`, and the manager can still list and
+unload it. The status is said twice per mod for the life of the process and no
+more — one `warn` on the first failure ever, one `error` on crossing the
+threshold.
+
+Until that commit the return value of `on_update` was `discard`ed, so this
+paragraph described an intent rather than a mechanism.
+
+The other half of the old sentence — "or throws past its own boundary" — was
+never true and cannot be made true. A hard crash inside a mod takes the process
+with it; there is no frame between the host and the mod's fault that could
+catch it. What the boundary can do is refuse to *carry* an exception, which is
+the next paragraph.
 
 Unwinding across a C frame is undefined, which is why the nimony library returns
 status codes everywhere instead of raising — and why nimony's own error-code

@@ -232,7 +232,7 @@ re-arms on the same cookie.
 | recording one interval (clock read, subtract, array store) | **25** | `benchPumpBody`, 200000 samples |
 | this mod's half of a firing | **350–800** | accumulated inside `pumpTick` over every firing |
 | `everyMain`'s re-arm | **not measured** | it happens in the library's trampoline after the handler returns; nothing here can hold a clock around it |
-| the host's drain overhead for a non-empty queue | **not measured** | `drainDue` allocates two seqs per frame while this runs; it is in another tree and nothing here can time it |
+| the host's drain overhead for a non-empty queue | **89, elsewhere** | measured in `docs/PERF.md` on 2026-08-19, not from here. This row used to read *not measured*, and used to add that `drainDue` allocates two seqs per frame: `takeDue` compacts in place and reuses the caller's buffer, so the steady per-frame chain allocates nothing |
 
 **The middle row shrank without the work getting cheaper, and that is what the
 row under it is for.** With the hand-rolled chain the `onMainThread` call was
@@ -296,8 +296,9 @@ the simulator self-test.
 | `aowl.perf.resetFrameTimes` | start the frame-time distribution over. Answers `{"ok":true,"discarded":n,"epoch":e}`. The mod already resets on its own when a setting is applied or restored; this covers the changes it cannot see — the player moving a slider in the game's own settings menu, a raid loading, another mod arming a hook |
 
 It also *subscribes* to one: `aowlspt.host.mods.unload`. The mod manager's
-unload request is delivered to subscribers before the host queues and performs
-it, so that is a whole host tick of warning with the game still running and the
+unload request is queued by the host and then delivered to subscribers, and the
+host performs it from its own loop on a later turn — so that is a whole host
+tick of warning with the game still running and the
 drain still firing — which is the earliest and safest moment to put the
 settings back. A request naming another mod's guid is ignored; one naming no
 guid is treated as ours, because a restore that did not need to happen is
@@ -308,8 +309,8 @@ cheaper than settings that outlive the mod that set them.
 First line of every run, before any refusal:
 
 ```
-perf  talking to aowlspt-host-il2cpp 0.1.0, host API size 216 (mod built
-      against 216), store yes, live pointers yes, typed patches yes,
+perf  talking to aowlspt-host-il2cpp 0.1.0, host API size 224 (mod built
+      against 224), store yes, live pointers yes, typed patches yes,
       perFrame reported yes
 perf  first run recorded against this host
 ```
@@ -326,7 +327,7 @@ own store, and says outright when the answer has changed:
 perf  THIS IS A DIFFERENT HOST from the one the last run recorded its refusals
       against. Every REFUSED line below is evidence about this host and about
       no other ...
-perf  was: {"host":"aowlspt-host-il2cpp","version":"0.1.0","apiSize":216,
+perf  was: {"host":"aowlspt-host-il2cpp","version":"0.1.0","apiSize":224,
             "store":true,"livePointers":true,"typedPatches":true,
             "perFrameReported":true}
 perf  now: {"host":"aowlspt-host-il2cpp","version":"0.1.0","apiSize":192,
@@ -403,8 +404,8 @@ installer\build\hostharness.exe installer\build\perfstage ^
 ```
 
 ```
-info  host: aowlspt-host-il2cpp 0.1.0, host API size 216 (mod built against
-      216), store yes, live pointers yes, typed patches yes, perFrame
+info  host: aowlspt-host-il2cpp 0.1.0, host API size 224 (mod built against
+      224), store yes, live pointers yes, typed patches yes, perFrame
       reported yes
 ok    the host says whether its drain counter counts frames
 ok    every knob answered or refused with a reason
@@ -526,9 +527,14 @@ is a list nobody reads.
   says so. A knob that used it says so in its log line, and the self-test says so
   in a warning, because "the runtime reported four bytes" and "this mod asserted
   four bytes" are different amounts of confidence. `aowlspt/fast`'s
-  `classifyType` still refuses an enum outright and is still right to: it decides
-  from `findClass` and `classIsValueType`, neither of which distinguishes a byte
-  enum from a long one.
+  `classifyType` **used to refuse an enum outright**, on the grounds that it
+  decided from `findClass` and `classIsValueType` and neither distinguishes a
+  byte enum from a long one. That refusal is gone: `classifyClass` consults the
+  type name first and then the width the runtime reports -- instance size minus
+  a *measured* box header -- so a 1-, 2-, 4- or 8-byte enum classifies now. What
+  is still refused is a value type too wide for a register, and must be: Win64
+  passes one by hidden pointer, which is a different call shape rather than a
+  different register.
 
 * **A repeating main-thread callback — CLOSED.** `everyMain` is in the library
   now and this mod uses it; the hand-rolled chain, and the fifty lines of
@@ -554,8 +560,12 @@ is a list nobody reads.
   of JSON: about 24 ns a firing against 650, measured at zero allocations in the
   mod and zero payload bytes in the host over twenty thousand firings. The old
   complaint — that `patchTrampoline` calls `toString` on both slices before any
-  mod code runs, even for `hook`, which discards them — is still true of the
-  JSON hooks and is no longer true of the ABI.
+  mod code runs, even for `hook`, which discards them — is no longer true of
+  either, and this paragraph used to say it still held for the JSON hooks. The
+  target name comes from the registration rather than from the slice, and an
+  empty argument slice converts without allocating, so the no-arguments `hook`
+  form is free. A JSON hook that does take arguments still builds one string a
+  firing.
 
   **This mod still installs no hooks**, and the reason is now small rather than
   structural: the only method it would want to hook is the per-frame method the
@@ -566,9 +576,10 @@ is a list nobody reads.
   slot and a second trampoline on the game's hottest path.
 
 * **A postfix hook — available, and deliberately unused.** `hookReturn` can
-  adjust what a game method answers: 418 ns to watch a return value, 2245 ns to
+  adjust what a game method answers: 443 ns to watch a return value, 2320 ns to
   also read the arguments and replace the result, 80 ns for the same work on
-  `hookReturnTyped`. Nothing here wants one. A setting is written twice in a
+  `hookReturnTyped`. (The first two read 418 and 2245 until `docs/PERF.md` was
+  re-measured.) Nothing here wants one. A setting is written twice in a
   session, not adjusted per call, and a postfix holding a `QualitySettings`
   property against the game's own settings menu would be fighting the player
   rather than the frame time.
@@ -620,7 +631,11 @@ And the one gap this list had left, closed since it was written:
   what the previous version's "queued a restore" line was quietly reporting. The
   thread being blocked is the host's tick thread and the thread being waited on
   is the game's, so it cannot wait on itself; where the host has taken the queue
-  back onto its own thread (`stalled`), the wait is skipped entirely.
+  back onto its own thread (`stalled`), nothing is queued and nothing is waited
+  for at all: the settings are reported STILL APPLIED in an `error` naming the
+  count, because a Unity write from that thread is the crash the apply gate
+  exists to avoid. This used to say the wait was "skipped", which reads as
+  though the restore still happened.
 
   When it does fail — the drain gone, the budget spent, the settings still
   applied — that is an `error` naming the count, saying whether the drain was
@@ -661,7 +676,9 @@ And the one gap this list had left, closed since it was written:
   p50/p99/p99.9, a hitch count and a pacing ratio. What that costs is partly
   measured (350–800 ns a frame inside the mod, about 46 ppm of a 16.7 ms frame)
   and what it does not cover is stated rather than estimated (`everyMain`'s
-  re-arm and the host's own drain overhead, both **not measured**).
+  re-arm, still **not measured** from here; the host's own drain overhead is
+  89 ns in `docs/PERF.md`, measured there rather than here). The self-test's
+  own line still prints both as NOT MEASURED and is quoted verbatim above.
 
   Two limits remain. The distribution needs 120 samples before it reports
   anything and 1000 before it reports p99.9, so the first seconds of a session

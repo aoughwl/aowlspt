@@ -8,9 +8,9 @@ traders, the flea market, quests, the hideout, raids, insurance, the scav, mail.
 aowl build-mod mods/tarkov
 ```
 
-It is a **mod**, not part of the backend. It imports `aowlspt` and
-`aowlspt/server` — the same two imports any other mod has — and reaches the host
-through nothing else. That constraint is the point of the thing: if a game
+It is a **mod**, not part of the backend. It imports `aowlspt`,
+`aowlspt/server` and `aowlspt/json` — the same public imports any other mod has
+— and reaches the host through nothing else. That constraint is the point of the thing: if a game
 server needed a private door into the host, the plugin API would not be enough
 to write one with, and everyone else's mods would hit the same wall one endpoint
 later. Every gap found while writing it was closed in the API rather than worked
@@ -19,9 +19,9 @@ around here.
 |  | measured |
 |---|---:|
 | modules | 37 under `emu/` plus `tarkov.nim` |
-| lines | 20,747 |
+| lines | 21,500 |
 | routes registered | 95 — 94 in `/client/`, 1 in `/aowlspt/` |
-| item-event action arms | 145 |
+| item-event action arms | 152 |
 
 ```
 wc -l mods/tarkov/tarkov.nim mods/tarkov/emu/*.nim | tail -1
@@ -89,7 +89,7 @@ The four derivation commands reproduce, run 2026-08-19:
 | the `Callbacks` sweep over `reference/spt-4.1-surface.txt` | **226** methods |
 | the `ItemEventActions` sweep over the same file | **55** fields |
 | `grep -oE 'serve(Prefix)?\("[^"]+"' mods/tarkov/tarkov.nim` | **95** routes |
-| `grep -rn 'of "' mods/tarkov/emu/*.nim` | **145** arms |
+| `grep -rn 'of "' mods/tarkov/emu/*.nim` | **152** arms |
 
 Of the 226 callbacks, 15 are SPT's own plumbing (the launcher, mod bundles, the
 mod loader) and are not client requests. That leaves **211 client-facing
@@ -97,15 +97,18 @@ operations**, split:
 
 | | operations |
 |---|---:|
-| served, and shaped against the reference DTO | 127 |
-| served, deliberately empty or flattened | 24 |
-| not served | 60 |
+| served, and shaped against the reference DTO | 125 |
+| served, deliberately empty or flattened | 25 |
+| not served | 61 |
 
-**That split is a hand join and says so.** 226, 55, 95 and 145 come out of
-commands. 127 / 24 / 60 does not: it is a join between a callback list and a
-route list done by hand and moved by delta, and `docs/BACKLOG.md` carries the
-argument for `tools/coverage.nim` as B11. Read the number as approximately
-right and the per-row reasons as exact.
+**That split is generated, not a hand join.** `tools/coverage.nim` writes it out
+of `docs/coverage-rows.json` — one row per callback method — and out of
+`mods/tarkov/tarkov.nim` itself, and `aowl test` fails if the three numbers are
+not what the code says. It was a hand join moved by delta until 2026-08-19, and
+this paragraph used to say so and to carry the argument for building the
+generator as `docs/BACKLOG.md` B11; B11 is closed. The figures here were
+127 / 24 / 60, the last of five hand-joined passes. Read the numbers as measured
+and the per-row reasons as exact.
 
 **The distinction that matters is not served/absent.** A route answering
 `{"err":0,"data":null}` where a populated object belongs does not fail at the
@@ -260,7 +263,7 @@ fallback is the shipped answer until something *renders* weather.
 | **`emu/bots`** — no `bots.types.<role>` data | A raid still starts, populated by bots wearing nothing. A strange raid and a working one, and far better than a client that cannot enter one. |
 | **`emu/templates`, `emu/traders`** — no database at all | Every table answers with a valid **empty** table. The client renders an empty flea market and reaches the menu. A server that only works against a full live dump cannot be started for the first time. |
 | **`emu/grid`** — no stash template | Falls back to 10×68, the standard-edition stash. A server with no item table still has to be able to hand somebody a gun. |
-| **`emu/mail`** — `remove` on a dialog holding uncollected items | The row goes off the inbox and every message of that sender that holds **nothing** is deleted outright; a message that still holds items is kept, off the inbox and still on the collect-all screen, and a warning says how many. The mailbox is the only place an uncollected insurance return or quest reward exists and there is no undo anywhere in this server, so a mis-click may not destroy them. A new message from the same sender puts the dialog back, which is the client's own behaviour. (`read`, `pin`, `unpin` and `remove` were all four stock `null` stubs until now, and `dialogList` answered `"pinned": false` and `"new": 0` whatever the mailbox held.) |
+| **`emu/mail`** — `remove` on a dialog holding uncollected items | The row goes off the inbox and every message of that sender that holds **nothing** is deleted outright; a message that still holds items is kept, off the inbox and still on the collect-all screen, and a warning says how many. The mailbox is the only place an uncollected insurance return or quest reward exists and there is no undo anywhere in this server, so a mis-click may not destroy them. A new message from the same sender is believed to put the dialog back, which is the client's own behaviour and is one of the things a raid would settle — nothing here has run against BSG's client. (`read`, `pin`, `unpin` and `remove` were all four stock `null` stubs until now, and `dialogList` answered `"pinned": false` and `"new": 0` whatever the mailbox held.) |
 | **`emu/market`** — every source is missing | Degrades to an empty market rather than to an error. |
 | **`emu/numbers`** — a gain smaller than 5×10⁻⁷ | Rounds to nothing. Every rate in this server is a hundredth or larger, four orders of magnitude clear, and a rate that small is one no player could observe. Named rather than hidden. |
 
@@ -305,7 +308,7 @@ consequence rather than the missing feature.
 | Two gym effects are never applied | the workout is slightly cheap; a warning says so | a definition of `MusclePain` and `GymArmTrauma`, which this database does not contain |
 | Weather is one constant sky unless a mod writes `weather` | every raid looks the same | something that *renders* weather from `configs/weather.json`'s weights — a generator, not an importer row |
 | Clothing and mannequin-pose unlocks are not enforced | every entry the table has is wearable | `trader/<id>/suits.json`, which `aowl importdb` does not bring |
-| Trader **standing** moves only on quest rewards | buying and selling do not build reputation | the reference gives the three requirements a loyalty level has and says nothing about what a purchase is worth in standing. A rate invented here is a number nobody can check. |
+| Trader **standing** moves on quest rewards, and Fence's also on a finished scav raid | buying and selling do not build reputation | the reference gives the three requirements a loyalty level has and says nothing about what a purchase is worth in standing. A rate invented here is a number nobody can check. (This row used to say *only* on quest rewards. Fence's scav rate is invented, which is exactly why it is `fenceKarmaOnScavExtract` in config rather than a constant.) |
 | Poster and statuette slots stay empty | 47 of the hideout's 85 decoration entries do nothing | an `itemId` on a slot entry, which the table does not carry |
 | `SellAllFromSavage` is refused | one lost convenience | a scav stash separate from the PMC's — a design change, not a fix. `docs/BACKLOG.md` Group F. |
 | `/client/locations` cannot list a map added after the first request | none in practice — mods patch maps at load, before any request | a key-enumeration call in the plugin ABI. `abi/aowlspt_abi.h` has `db_get` for a dotted path and no sibling that lists an object's members, so the map names can only come from reading `locations` whole — which is the 560 MiB read this route exists to stop doing. It is therefore done once and cached. |

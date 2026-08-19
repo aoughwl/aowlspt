@@ -94,16 +94,22 @@ contains world coordinates.**
 
 The exit and zone names are the names **upstream's own config already refers
 to** (`ZoneIcebreaker` from `openZones`; Helicopter / Cellars / Gate 0 from
-`exitLocaleKey` and `disabledScavExits`). This port did not choose them. If a
+`exitLocaleName` and `disabledScavExits` — this used to name `exitLocaleKey`,
+which holds `Icebreaker_Exit_Heli` rather than a display name, and all three of
+those keys are marked IGNORED in `config.json` now that the tables are rebuilt
+from `data/`). This port did not choose them. If a
 scene bundle turns out to disagree, the fix is a data file — `exitsFile` and
 `wavesFile` are config keys and nothing in code knows the names.
 
 ## The bot cap: what was wrong
 
 The old code wrote `configs.bot.maxBotCap.<slot>` and logged a shrug when that
-failed. It always failed: a stock SPT 4.x database has **no top-level `configs`
-object at all**, so the write had nowhere to land and the cap was never set on
-any install, ever. The stub ships `BotMax: 0`, and a map with a cap of zero
+failed. It always failed, though not for the reason this paragraph used to give:
+the 39 MiB import **does** carry a top-level `configs` object, with **only
+`quest`** in it — no `bot.maxBotCap` table and no `location.scavRaidTimeSettings`
+either — and `dbPut` creates a path that is not there. So the write either landed
+somewhere nothing reads or created it, and the cap was never set on any install,
+ever. The stub ships `BotMax: 0`, and a map with a cap of zero
 spawns none of the waves above it.
 
 It now writes `locations.<slot>.base.BotMax` and `.BotMaxPvE`, which is where
@@ -157,7 +163,10 @@ tables, which are assets.
   because `dbWrite` merges.
 * **The floor is empty.** Same refusal at 8MB. The written tables are empty and
   *valid*, which is the difference between a raid that starts with nothing on
-  the floor and a raid that does not start.
+  the floor and a raid that does not start. One consequence is newer than this
+  bullet: `mods/tarkov` now loads a preset's magazine from the map's own
+  `staticAmmo`, and this map's `staticAmmo` is one of the empty tables, so every
+  magazine that spawns here arrives empty.
 * **Map locking and quest visibility are global, not per-profile.** Rows 16–17.
 * **Banner images are not served.** Row 15.
 * **`globalLootChanceModifier` multiplies an empty table.** 0.27 is upstream's
@@ -184,7 +193,9 @@ map tables: 3 exit(s) (2 closed to scavs), 11 wave(s) totalling 34 bot slot(s),
   almost-right spellings deserialise to nothing without a word**:
   `BossDifficult` is not `BossDifficulty`, `BossPlayer` is not `IsBossPlayer`,
   `RandomTimeSpawn` is not `IsRandomTimeSpawn`, `BossEscortDifficult` is not
-  `BossEscortDifficulty` (140 of 140 records in a stock database agree);
+  `BossEscortDifficulty` (of the 140 records in a stock database, 140 use the
+  first three spellings and 134 carry `RandomTimeSpawn` at all; none of the
+  four almost-right spellings appears once);
 * the exit list and the locale list are checked against each other **in both
   directions** — an exit with no locale prints its raw id at the player, and a
   locale entry for an exit that no longer exists hides the next rename;

@@ -66,7 +66,7 @@ either log.
 | **Scavs** | a second character per profile — identity, appearance, cooldown, regenerate — sharing the PMC's stash rather than copying it, and moving Fence's standing at a configured rate |
 | **The gym** | `hideout.qte`'s workout minigame — the entry's own requirements, energy and hydration spent per hit and per miss, and Strength paid out of the `results` block |
 | **Customisation** | the wardrobe (`CustomizationSet`, validated against `templates.customization`) and the hideout's decorations — floors, walls, ceilings, shooting-range targets, mannequin poses and the shooting range's score, out of `hideout.customisation` |
-| **Mail** | dialogs, messages, attachments, **and redeeming them** |
+| **Mail** | dialogs, messages, attachments, **and redeeming them** — and, since commit `2ea0559`, the inbox itself: **read, pin, unpin and remove** are real handlers rather than the `onEmptyObject` stubs they were, so marking a message read marks it read |
 | **Insurance** | premiums off the handbook, buying the cover, and returns that survive a restart — with the covering letter **in the trader's own words**, resolved out of `traders.<id>.dialogue` through the locale the client last asked for |
 | **Health** | healing and eating between raids, bounded by the damage and by what the item has left — and **treatment at a trader**, priced from `globals.config.Health`: hit points, energy, hydration and the effects a trader will remove, times that trader's `heal_price_coef` |
 | **Repair** | durability on the item, restored at a trader for the template's price or with a kit for the kit's charge — and a permanent bite out of the maximum either way. A trader's `ExcludedIdList` and `ExcludedCategory` are both honoured, the second by a walk up the handbook tree |
@@ -353,7 +353,7 @@ Where the live dump comes from is [IMPORTDB.md](IMPORTDB.md):
 this reads — 4,673 templates, 12 traders, 558 quests, 19 maps, 39.40 MiB
 (41,313,127 bytes) — in **2.8 s** on the development machine, with a self-check
 over the invariants above. Part of that self-check is `checkReadPaths`
-(`tools/importdb.nim:669`), which walks the 29 database paths `mods/tarkov`
+(`tools/importdb.nim:679`), which walks the 29 database paths `mods/tarkov`
 reads with a literal spelling and asserts each one is in the document it just
 wrote, rather than asserting it in prose. It reads the
 install and never writes to it, and what it produces is BSG's data by way of
@@ -383,7 +383,8 @@ Repair and durability · Notes and map markers · The client's own batch
 Achievements · Fence and scav karma · What a hideout upgrade costs
 What a bot is wearing · The dailies · The sky · The menu's own state
 The scav case · The gym · Customisation · The hideout's wardrobe
-Across a restart
+Across a restart · Kills credited from the raid's own victim list
+The inbox: read, pinned and removed
 ```
 
 ```
@@ -403,7 +404,8 @@ ok    the map hands over its loot
 ok    the raid result is accepted
 ok    and the raid experience stuck
 ok    a raid result for another profile is refused
-ok    the craft survived the restart, with its clock intact
+ok    the craft survived the restart
+ok    with its clock intact
 ok    the redeemed reward is still in the stash
 ok    and it is not back in the mailbox as well
 ok    moving the stash into something the stash holds is refused
@@ -415,7 +417,7 @@ ok    an offer above the player's loyalty level is refused
 ok    and the barter it would have cost is untouched
 ok    and the part is full, not over-healed
 ok    and the kit is down by exactly what it healed
-ok    the insured kit came back once the cover matured
+ok    the insured kits came back once the cover matured
 ok    and only once
 ok    the rifle came home with the durability the raid left on it
 ok    and the price was the item's arithmetic, not the request's count
@@ -444,14 +446,18 @@ is not quoted here — the number in a stale document is worse than no number.
 What is worth quoting is that the count is the *whole* count: a check that could
 not run is reported as skipped, not omitted.
 
-Before any of that, the mod checks itself. `emu/selfchecks` runs the four
-module self-checks — the flea's filter, sort and category walk, the loot
-generator over its own fixture, the quest condition evaluator over literals, and
-the skill curve — at **load**, and a failure returns `ErrUnsupported`, which
-means no routes and no first answer. They used to be four exported procs nobody
-called, which is worse than not having them: they read like coverage in a review
-and were none. The gate is the server not starting, which every test and every
-developer's own run already waits for.
+Before any of that, the mod checks itself. `emu/selfchecks` runs the module
+self-checks at **load**, and a failure returns `ErrUnsupported`, which means no
+routes and no first answer. They used to be four exported procs nobody called —
+the flea's filter, sort and category walk, the loot generator over its own
+fixture, the quest condition evaluator over literals, and the skill curve —
+which is worse than not having them: they read like coverage in a review and
+were none. There are **thirteen** now: those four plus `health`, `production`'s
+scav case, `gym`, `customise`, `decorate`, `dialogue`, `insurance`, `raid` and
+`bots`. Each is over code with no database, no host and no profile in it, which
+is exactly the code `emutest` cannot reach precisely — everything `emutest` sees
+has been through a route, a JSON encoder and the wire. The gate is the server
+not starting, which every test and every developer's own run already waits for.
 
 The database is `tests/fixtures/emu-full.json` — a trader with an assort, a
 handbook price, a stash grid, plus what the flea, the hideout, the loot tables
@@ -480,9 +486,16 @@ registers, in three buckets — served and shaped against the reference's own
 DTO, served deliberately empty, and not served at all. It says how it was
 derived, so it can be rebuilt from `reference/` rather than trusted.
 
-The short version of it: of 211 client-facing operations, **127** are served and
-shaped, **24** answer the right shape with nothing in it, and **60** are not
-served. What is still missing is content and multiplayer — group matchmaking and
+The short version of it: of 211 client-facing operations, **129** are served and
+shaped, **21** answer the right shape with nothing in it, and **61** are not
+served. Those three numbers are derived, not stored — `tools/coverage.nim` reads
+the routes `mods/tarkov/tarkov.nim` registers and puts a row in the *empty*
+bucket only when every route it names is bound to `onNullData`,
+`onEmptyObject`, `onEmptyArray` or `onTrue`. They were 127/24/60 here and
+125/25/61 in the generated document; both were stale in different directions,
+and the four mail routes of commit `2ea0559` (`read`, `pin`, `unpin`, `remove`)
+are the difference between the generated pair and the current one.
+What is still missing is content and multiplayer — group matchmaking and
 friends, the SPT launcher's own routes, trader clothing (`trader/<id>/
 suits.json` is not imported), cultist recipes (`hideout.production.cultistRecipes`
 imports as a single entry carrying nothing but an `_id`), and random loot
@@ -501,7 +514,7 @@ held connection took one of its threads for the whole wait; the backend is a
 poller with a pool of *request* workers now, so a held connection costs a socket
 and its buffer. `/client/notifier/getwebsocket/<session>` is upgraded and held,
 and the mod pushes with `notifyPush` — the revision-5 host call — from
-`emu/notify.deliver`, falling back to the same queue and the same poll for any
+`emu/notify.notifyOrQueue`, falling back to the same queue and the same poll for any
 client that has not upgraded. `emu/mail.deliver` is where the notification is
 raised, so a quest reward, an insurance return and a sold flea offer all
 announce themselves when the message is written rather than on the next
@@ -542,11 +555,21 @@ around it:
   in [MODDING.md](MODDING.md) and [IL2CPP.md](IL2CPP.md).
 
 What is genuinely not evaluated is named in the source rather than faked. The
-clearest case is quest conditions: `distance`, `weapon`, `daytime`, `equipment`
-and the other qualifiers inside a `Kills` condition. When one is present and
-non-empty the kill is **not credited from the raid's victim list at all**,
-because crediting a kill whose qualifier could not be checked hands out progress
-that was not earned. Time limits are not evaluated either.
+clearest case is quest conditions: `daytime`, `weaponCaliber`, the weapon-mod
+lists and the two equipment lists inside a `Kills` condition. When one of those
+restricts anything the kill is **not credited from the raid's victim list at
+all**, because crediting a kill whose qualifier could not be checked hands out
+progress that was not earned — though the refusal now **names the clause** it
+could not check, so a player whose quest will not finish is told which one
+stopped it. Time limits are not evaluated either.
+
+`distance` used to be on that list and is not any more, as of commit `2ea0559`:
+the reference dump's `Victim` carries a `Distance` per kill, so the qualifier
+can be checked and the kill can be credited. It mattered more than one clause
+should — 191 of the 283 `Kills` sub-conditions in a real database carry
+`distance` and `daytime` keys with neutral values (`>= 0`, `0..0`) that restrict
+nothing, and refusing those refused almost every kill in the game.
+`emu/questcond.killCredit` carries the counts and the reasoning.
 
 The distinction that matters: those are *content*, and they belong in mods —
 including in this one. The pipeline underneath them is finished and tested.

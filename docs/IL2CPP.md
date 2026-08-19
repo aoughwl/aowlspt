@@ -87,7 +87,7 @@ mods are missing is worse than not starting.
 | | client (IL2CPP) |
 |---|---|
 | `log`, `config_get`, `now_ms` | yes |
-| `invoke_main`, `schedule` | yes, on the host's own thread — see below |
+| `invoke_main`, `schedule` | yes — on Unity's main thread when the host bound its per-frame drain, on the host's own thread when it did not, and the host says which; see below |
 | `resolve` / `call` | yes: any type, any method, with arguments, by name |
 | live objects | yes: a reference return comes back as a handle you can call on |
 | fields | yes: `Type::@Name` reads one, and with an argument writes it |
@@ -469,7 +469,36 @@ than delivering the firing. Letting it run is safe and true: the trampoline it
 will run came out of the same record, and a released trampoline is retired
 rather than freed, so it is still mapped and still that method's own prologue.
 
-None of this costs anything: `perfbench` measures a typed prefix firing at 23.6
+**And arming one stops the world for the fourteen bytes.** The prologue write is
+not one instruction and cannot be made into one, so a thread executing the
+method while those bytes go in runs the half of an instruction that is left.
+Until commit `1179ef3` the write went in unparked and that was a real if rare
+tear. `aowl_hook_arm` now suspends every other thread in the process across it,
+enumerating them through `ntdll!NtGetNextThread` and falling back to
+`CreateToolhelp32Snapshot` where that is absent — and then checks, with
+`GetThreadContext`, that nobody is standing *inside* `[target, target + stolen)`,
+because a thread parked there resumes into the middle of the new jump. If
+anybody is, everyone is released and it tries again, bounded by
+`AOWL_PARK_RETRIES`; on exhaustion the write goes ahead unparked rather than
+hanging the client, and the giveup is counted (`aowl_hook_park_giveups`).
+
+The constraint that shapes it is that **nothing inside the freeze may take a
+user-mode lock** — a suspended thread keeps whatever it held, and an arming
+thread that waits on it is a hang with no thread to blame. So the trampoline,
+the site record and the stub are built beforehand in `aowl_hook_prepare_ex`, and
+the enumeration, the `GetProcAddress` and every handle open happen in
+`aowl_park_begin` before the first `SuspendThread`. What is left in the window
+is the suspend sweep, two `VirtualProtect` calls and the stores.
+
+The cost is a product number rather than a test artifact, because live enable
+and disable both pay it on a mod-manager click: about 11 µs per thread inside
+the freeze and about 0.8 µs per thread outside it, so a park on a 65-thread
+process is around 0.9 ms of which 0.7 ms is frozen. A hitch, not a hang. The
+Toolhelp fallback adds about 2 ms flat, all of it outside the freeze. A process
+with more than `AOWL_PARK_MAX` (512) threads, and any thread created after the
+enumeration, are not parked — both deliberately.
+
+None of this costs anything on the firing path: `perfbench` measures a typed prefix firing at 23.6
 ns before and after, a typed postfix at 23.5 against 25.7, and one bare firing
 at 2.9 ns either way. `aowl_hook_stale_fires()` counts the firings dropped —
 counted rather than assumed, because a reuse race being caught and a reuse race
@@ -545,8 +574,12 @@ one that proves the ABI crosses the boundary intact.
 
 The third run is the one that exercises `resolve`, `call` with arguments, live
 objects, fields and a detour for real — see the check list in
-[MODDING.md](MODDING.md), including the one check that is currently red on this
-toolchain and why.
+[MODDING.md](MODDING.md). This used to point at the one verdict that came out
+red on msys2 ucrt64 gcc 15.2, where the stand-in's `Tick` and `Hurt` compiled to
+prologues the detour engine would not relocate. That caveat has gone: on gcc
+15.2.0 with `GameAssembly.dll` rebuilt from `mockil2cpp.c`, all twenty-four
+verdicts are green. If one goes red on your toolchain it is still a stand-in
+artefact rather than a hole in the engine, but it is no longer expected.
 
 What none of them can prove is that **BSG's** implementation of the same C API
 behaves identically. Nothing here has been run against the real client. That is

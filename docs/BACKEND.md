@@ -493,8 +493,12 @@ with the answers all twelve got as the assertion. `connect` failing under the
 tool's own load is counted apart from a wrong answer, because a load generator
 that reports its own limits as the server's bugs is worse than no tool.
 
-It is not wired into `aowl test` yet; it builds and runs the same way
-`fuzzwire` does, against its own stage and port:
+It **is** wired into `aowl test` now — it was not when this was written. The
+gate builds it, stages `mods/tarkov` and `emu-full.json` beside it (the tool
+decides the server is up by asking `/client/game/config`, so a stage with no
+mod in it reports a dead backend about a live one), and runs it on port 6983
+as *a lying Content-Length cannot smuggle a second request*. It also builds and
+runs by hand the same way `fuzzwire` does, against its own stage and port:
 
 ```
 nimony c --passC:-I<repo>\abi --passL:-lws2_32 --passL:-lz ^

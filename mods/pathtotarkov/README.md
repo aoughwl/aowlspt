@@ -88,7 +88,7 @@ database, for BSG. It is still an argument.
 | maps | 19 |
 | transits | 38 |
 | edges that resolve to a map in the same table | 38 of 38 |
-| transits BSG ships `active: false` | 3 (Ground Zero→Labs, Shoreline→Terminal, an Interchange event loop) |
+| transits BSG ships `active: false` | 4 (Ground Zero and Ground Zero 21+ → Labs, Shoreline→Terminal, an Interchange event loop) |
 | `globals.config.TransitSettings.active` | `true` — the game's own transit system is switched on, which is what makes a graph worth locking by. The mod reads it and says so, and warns loudly if it is ever `false` |
 | maps with **no way out** | `develop`, `hideout`, `privatearea`, `suburbs`, `terminal`, `town` |
 | maps **nothing leads to** | `develop`, `factory4_night`, `hideout`, `privatearea`, `sandbox`, `suburbs`, `terminal`, `town` |
@@ -135,7 +135,7 @@ touched:
 |---|---|---|
 | `stateSave` / `stateLoad` + `mfHotReloadable` | **first in `mods/`** | a rebuild mid-session must not lose the baseline (below) or the raid in flight. Nothing else in the tree had claimed hot reload at all |
 | `configFaulted()` | **first anywhere** | the docstring on it describes this mod: its defaults are decisions — a starting map, a hop count, a list of maps — and acting on them because the file failed to parse means locking fifteen maps the player never asked to have locked. A faulted config disables the mod loudly |
-| `notifyReady()` | **first anywhere** | asked rather than assumed, and the answer is reported. `notifyPush` is used behind `notifyOnMove`, which is off, and the README says why below |
+| `notifyReady()` | **first in `mods/`** | this cell used to say *first anywhere*; `examples/lesson` already probes it. Asked rather than assumed, and the answer is reported. `notifyPush` is used behind `notifyOnMove`, which is off, and the README says why below |
 | `everyMs` | second call site in the tree | the reconcile pass. Nothing this mod serves is on the client's path, so there is no request to hang a periodic check off |
 
 Beyond calls: it is the first mod to read `locations.*.base.transits` and
@@ -269,7 +269,7 @@ GET /aowlspt/ptt/where
 {"position":"sandbox","maps":19,"transits":38,"unresolved":0,"writes":11,
  "open":["sandbox","tarkovstreets"],
  "locked":["bigmap","factory4_day",...,"woods"],
- "lockedInDatabase":[... the twelve above plus BSG's four ...]}
+ "lockedInDatabase":[... the eleven above plus BSG's five ...]}
 
 GET /aowlspt/ptt/travel/bigmap
 {"ok":false,"err":"bigmap is not reachable from sandbox; set allowTeleport to travel anywhere"}
@@ -311,8 +311,10 @@ Both were reverted; the file in the tree is the green one.
   the thing to look at first.
 * **`startAt`** — `sandbox` (Ground Zero). Nothing in BSG's table leads back to
   it.
-* **`hops`** — 1 is Path To Tarkov as it plays. 2 opens most of the map list on
-  this graph, which is close to having the mod switched off.
+* **`hops`** — 1 is Path To Tarkov as it plays. 2 barely moves from Ground Zero
+  (5 of 19) but opens 10 of 19 from a hub like Customs — ten of the thirteen
+  maps this mod ever locks, which is close to having it switched off. This used
+  to say 2 opens most of the map list, which is only true from a hub.
 * **`freeRoamWhenStranded`** — on. Do not turn it off without reading the sink
   row above.
 

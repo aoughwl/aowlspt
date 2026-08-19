@@ -41,7 +41,7 @@ until a runtime answers it.
 | 15 | `WTT-ContentBackport`'s item and appearance templates | **Not shipped — content, not code.** 18 loadout ids and all 4 bodies, 4 feet and 2 voices are its. Consequences below. |
 | 16 | **Prepatcher:** append six members to `EFT.WildSpawnType` in `Assembly-CSharp.dll` with Mono.Cecil | **Impossible post-1.0.** IL2CPP: no managed assembly, the enum is native constants with switch tables already compiled, no pre-load window. |
 | 17 | **`HuntTargetLayer`** at priority 10 over the PMC brains, `AdvAssaultTarget` removed, `HuntManager.AddHuntRoles`/`AddHuntSides` | **Impossible post-1.0.** BigBrain custom layers and Unity `MonoBehaviour`s hosted by BepInEx; none of the three exists. The *timing and placement* half of the hunt survives, because that lives in the spawn table. |
-| 18 | **`BDNvgPatch`** — suppress night vision for BD bots | **Impossible, and already dead upstream.** `BotOwner_0` was removed in SPT 4.1.2 so it could no longer tell which bot it was looking at; the shipped version returns unconditionally. A hook here is told a method's declared arguments and not `this`, so the only expressible version would suppress NVG for *every* bot in the raid. |
+| 18 | **`BDNvgPatch`** — suppress night vision for BD bots | **Dead upstream, and not ported.** `BotOwner_0` was removed in SPT 4.1.2 so it could no longer tell which bot it was looking at; the shipped version returns unconditionally. This row used to add that a hook here is told a method's declared arguments and not `this`, so the only expressible version would suppress NVG for *every* bot in the raid. **That half is wrong, and has been since `hookArgs` grew an instance:** the payload is `{"this":{...},"args":[...]}` -- Harmony's `__instance`, separate from the argument array -- and `thisHandle`/`thisPointer` read it, as `mods/fov` and `mods/classicmovement` both do in shipped code. A per-bot version is expressible; what is missing is the NVG-toggling target itself, which upstream no longer has either. |
 
 ## What this port ships that upstream did not
 
@@ -83,7 +83,9 @@ BossDifficulty   BossEscortDifficulty   IsBossPlayer   IsRandomTimeSpawn
 ```
 
 All four spellings are plausible, readable and wrong. A real SPT 4.x database
-has 140 `BossLocationSpawn` records and **140 of 140** spell them:
+has 140 `BossLocationSpawn` records, and not one of them uses any of the four
+spellings above. **140 of 140** spell the first three, and 134 of 140 carry the
+fourth at all -- never once as `IsRandomTimeSpawn`:
 
 ```
 BossDifficult    BossEscortDifficult    BossPlayer     RandomTimeSpawn
@@ -143,16 +145,23 @@ on a database that is merely incomplete. The self-test reports both branches.
   stock data, so an exact-key lookup silently misses; and a weight of zero means
   never, so a pool summing to zero must produce nothing rather than element
   zero — which is how every scav on a map ends up in the same hat.
-  They are still written, because the database is what a *real* SPT server and
-  any future generator read, and because writing them wrong would be a bug that
-  only surfaced later. **This is a gap in `mods/tarkov`, not in this mod**, and
-  it is the single change that would make this faction's gear real.
-* **Appearance is broken without WTT-ContentBackport.** The emulator takes
-  `appearance.body[0]` etc. verbatim, and index 0 of every list here is a WTT
-  id. Without that mod the bots get a customisation id that resolves to nothing.
+  The database is still where they are written, because that is what a *real*
+  SPT server reads as well. **This gap is closed, and `mods/tarkov/emu/bots.nim`
+  is where it closed**; the last two sentences here used to call it open on
+  `mods/tarkov` and outlived the fix.
+* **Appearance is broken without WTT-ContentBackport.** The emulator no longer
+  takes `appearance.body[0]` verbatim -- `appearanceOf` draws each of
+  `appearance.{head,body,feet,hands,voice}` from a weighted pool -- but the
+  consequence is unchanged and if anything stronger: *every* entry in this mod's
+  `body`, `feet` and `voice` pools is a WTT id, so without that mod the draw
+  resolves to nothing whichever way it falls. The `head` and `hands` pools are
+  stock and are unaffected.
 * **`armoryLoadouts` without WTT-Armory gives unarmed bots.** All eleven weapon
   ids in that loadout -- seven primaries and four holsters -- are Armory's, so
-  there is nothing left to fall back on. The self-test names them.
+  there is nothing left to fall back on. **Nothing checks this offline**: the
+  self-test validates id *shape*, not existence, and there is no database pass
+  -- `checkAgainstDatabase`, which `bd/validate.nim` refers to, does not exist
+  anywhere in the tree. This bullet used to say the self-test named them.
 * **No night-vision control, no per-bot Harmony behaviour.** See rows 16–18.
 
 ## The self-test
@@ -186,12 +195,19 @@ and checks, per `bd/validate.nim`:
 * every pool has a chance in this file or in the template it lands on;
 * every caliber has at least one round;
 * `appearance.{head,body,feet,hands}` and `health.BodyParts[0]` are non-empty,
-  because those are the only parts of a template the emulator reads;
+  because a bot with an empty appearance pool falls back to the emulator's four
+  default ids and one with no `BodyParts` falls back to its stock human. (These
+  used to be called the only parts of a template the emulator reads; it now also
+  reads `inventory.equipment`, `inventory.mods`, the three `chances.*` tables,
+  `Ammo`, `generation.items` and `difficulty.<level>`.)
 * no duplicate role id, role name, first name or achievement id;
 * every achievement has a locale string;
 * every configured hunt map that this database has can actually host a spawn,
-  with the ones that cannot named — both branches are exercised, so the guard
-  is tested rather than described.
+  with the ones that cannot named — the refusal is reported by name rather than
+  counted. (This line used to claim both branches are exercised. Only one runs,
+  whichever the attached database implies, and against a real database it is
+  always the accepting one: none of the ten `huntMaps` entries is one of the
+  four spawn-pointless slots.)
 
 It also drives the whole `morebots.ready` handshake with no backend, exercises
 the client watch's Win64 hidden-pointer rule exhaustively, and prints the

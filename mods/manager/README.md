@@ -3,7 +3,7 @@
 `aowl.manager` 1.0.0 — the registry, your lists, and what is actually running.
 
 A backend mod on the same public API as any other: `aowlspt`, `aowlspt/server`,
-`aowlspt/json` and nothing else. It has no private door into the host, which is
+`aowlspt/json`, `aowlspt/sync` and nothing else. It has no private door into the host, which is
 the same constraint the emulator is written under and for the same reason — a
 manager that needed privileged access would prove the plugin API is not enough
 to manage plugins with.
@@ -73,9 +73,11 @@ left out owns every route that could put it back. It goes at the front: it has
 no `loadAfter`, nothing requires it, so no edge in the registry can be broken by
 placing it there.
 
-**The file is inert until a host reads it.** `startupHonoured` on
-`/aowlspt/mods` says whether one ever has. That is what makes "takes effect on
-restart" true rather than aspirational.
+**The file is inert until a host reads it.** `/aowlspt/mods` reports
+`selectionFile`, `selectionFileWritten` and `selectionFileRefused` — where the
+document is, whether this run wrote it, and why not. It used to say a
+`startupHonoured` field said whether a host had ever read it; there is no such
+field, here or anywhere, and whether a host reads it is a fact about the host.
 
 **What was already there is inspected before it is overwritten**
 (`inspectSelectionFile`, once, at load), because three states have the same
@@ -231,7 +233,8 @@ unknown, which is what they are.
 
 On the panel, `clientLive` / `clientOutcome` / `clientCode` are **absent from
 the row entirely** when nothing is known, rather than false. The overlay's JSON
-reader is 60 lines of C and leaves a field it cannot find alone.
+reader is about 130 lines of C — it was 60 before it became a structural walker
+— and leaves a field it cannot find alone.
 
 ---
 
@@ -323,7 +326,8 @@ Every route also accepts `{"id":"…"}` in the body, because a browser can reach
 path and a script would rather send a document. Every route reports the truth,
 per change, in `outcome`: nothing here claims to have enabled a mod that is not
 running. `/panel` and `/toggle/<id>` are the two the in-game overlay speaks, and
-`/panel` is flat because the overlay's reader is 60 lines of C — the rule is
+`/panel` is flat because the overlay's reader is a hand-written structural JSON
+reader in C that builds no tree and allocates nothing — the rule is
 that if the shapes do not fit, the *server* flattens them.
 
 A client-only mod reads as `wrong-side` on `/list` and `/panel`, correctly:
@@ -342,8 +346,9 @@ was told is on `/client`; what the game did is on `/clientreport`.
    degenerate document. It does not cover a resolution that is *wrong* while
    naming ten mods — a bad registry that resolves confidently is written down
    without complaint, by design, because "wrong" is not a thing this mod can see.
-3. **That `startupHonoured` is ever true.** The document is documented as inert
-   until a host reads it. Whether the client host in a shipped install actually
+3. **That the document is ever honoured at startup.** It is documented as inert
+   until a host reads it, and nothing on `/aowlspt/mods` can say whether one
+   has — this item used to name a `startupHonoured` field that does not exist. Whether the client host in a shipped install actually
    reads it is a fact about that host.
 4. **That the client's `hs`/`sq` scoping survives a real game restart.** A new
    process id drops the whole table to unknown; that path is exercised by

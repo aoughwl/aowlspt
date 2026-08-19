@@ -147,12 +147,18 @@ proc probeAll() =
       else:
         warn "the patch fired " & $tickHookFired & " times, expected 3"
     else:
-      # One detour per method, across every mod in the process. In the gate's
-      # stage `examples/highlevel` is loaded first and hooks this same method,
-      # so the refusal here is the engine's rule working rather than anything
-      # wrong -- and it is said in those words, because "could not patch" on
-      # its own has sent people looking at the detour engine for a collision in
-      # the mods directory.
+      # One detour per method, across every mod in the process. The pool holds
+      # 256 slots and is not what runs out here: `aowl_hook_attach` refuses a
+      # method something else already detoured, with its own message.
+      #
+      # In the gate's stage `examples/highlevel` gets to this same method
+      # first -- it hooks `Tick` on the first tick the world resolves, while
+      # this probe deliberately waits three seconds -- so the refusal here is
+      # the engine's rule working rather than anything wrong. Which of the two
+      # is *loaded* first is not the point and is the other way round anyway;
+      # this comment said "loaded first" until 2026-08-19. It is said in those
+      # words because "could not patch" on its own has sent people looking at
+      # the detour engine for a collision in the mods directory.
       let why = lastError()
       if find(why, "already patched") >= 0:
         info "EFT.Player::Tick is already detoured by another mod in this " &
