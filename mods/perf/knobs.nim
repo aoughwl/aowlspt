@@ -348,11 +348,16 @@ proc enumBinding(owner, member: string; setter: bool;
   ## An enum property, by asserted register class. **The fallback, not the
   ## first choice** — see rule 4 at the top of this file.
   ##
-  ## `aowlspt/fast`'s `classifyType` still refuses an enum outright, and is
-  ## right to: it decides from `findClass` and `classIsValueType` alone, and
+  ## This used to say `aowlspt/fast`'s `classifyType` refuses an enum outright,
+  ## because it decided from `findClass` and `classIsValueType` alone and
   ## nothing there says whether the underlying type is a byte, an int or a long.
-  ## `bindMethodAs` is the sanctioned way to say it outright, and what is being
-  ## asserted is narrow and checkable: `AnisotropicFiltering`,
+  ## **It no longer refuses one**: `classifyClass` checks the type name first
+  ## and then the width the runtime reports, so an enum narrow enough for a
+  ## register classifies like any other value type. This proc is therefore one
+  ## fallback further out than it was — it is what remains for a host whose
+  ## boxed path came back handle-shaped, and `bindMethodAs` is still the
+  ## sanctioned way to state a signature outright. What is being asserted here
+  ## is narrow and checkable: `AnisotropicFiltering`,
   ## `ShadowResolution` and `SkinWeights` are all `enum : int` in Unity's own
   ## source, so one general-purpose register holding a 32-bit integer is the
   ## whole shape. `mask` stays 0 — no slot is a float.

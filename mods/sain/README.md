@@ -587,11 +587,22 @@ stand-in (median of three, same machine):
 
 | operation | ns/op | vs its JSON form |
 |---|---:|---:|
-| bound call, unpatched | 3.3 | — |
-| postfix hook, JSON result and arguments | 1132 | — |
-| **postfix hook, typed frame** | **25.1** | 45× |
-| postfix hook, JSON + replacement | 1583 | — |
-| **postfix hook, typed frame + replacement** | **38.1** | 42× |
+| bound call, unpatched | 3.2 | — |
+| postfix hook, JSON result and arguments | 1370 | — |
+| **postfix hook, typed frame** | **25.6** | 53× |
+| postfix hook, JSON + replacement | 1806 | — |
+| **postfix hook, typed frame + replacement** | **38.2** | 47× |
+
+Re-derived on 2026-08-19 by running `perfbench` here three times rather than by
+copying a figure out of another document, which is how the numbers this table
+used to carry (1132 and 1583) came to disagree with `docs/PERF.md`'s (1102 and
+1525) with neither being wrong. **The two JSON rows are the only ones that
+move.** Across the three runs they spanned 1318–1393 and 1797–1820 while the
+typed rows held 25.15–25.74 and 37.50–38.28 — a JSON firing is two allocator
+round trips and costs whatever the heap costs that minute, and a typed firing
+allocates nothing. So quote the typed rows to two figures and the JSON rows as
+"about 1.4 and 1.8 microseconds"; the ratio is the durable part, and it is
+between forty and fifty times either way.
 
 Add roughly ten to twenty nanoseconds for a handler crossing into a mod DLL,
 where each frame accessor is an ordinary call rather than an inlined load —
@@ -894,7 +905,10 @@ argument, a copy into this mod's heap, a parse, and on a replacement a float
 formatted to text and parsed back. `hookReturnTyped` hands over the registers
 the thunk already saved plus the declared kind of every slot, computed once at
 registration. Measured on this machine, median of three: **25 ns watching and
-38 ns with a replacement, against 1132 and 1583** for the same hooks as JSON.
+38 ns with a replacement, against about 1400 and 1800** for the same hooks as
+JSON — the JSON figures were 1132 and 1583 when this was written and are
+whatever the allocator is doing on the day, which is the point rather than a
+caveat.
 Nothing is built, nothing is copied, nothing is freed.
 
 **Wrong about the rate — but only for one of the two.** "Both fire per bot per

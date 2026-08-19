@@ -1,7 +1,7 @@
 {
   "_comment": "aowl.icebreaker. Rebinds the dormant `suburbs` location slot to the nuclear icebreaker BOREAS: points it at a scene, gives it exits, waves, boss spawns, a bot cap and a name, and watches raid ends for the quest crossings. Server-only -- it never enters the game's process. Every key is documented on the line above it. README.md says which of upstream's features survived and which cannot exist on this stack.",
 
-  "_assets": "This mod is code and tables. The scene bundle, the prop bundles, the culling and acoustics bakes, the navmesh and the 8MB of authored loot are ASSETS and are not shipped here; without them the slot resolves to a map the client cannot load. See README.md.",
+  "_assets": "This mod is code and tables. The scene bundle, the prop bundles, the culling and acoustics bakes, the navmesh and the authored loot are ASSETS and are not shipped here; without them the slot resolves to a map the client cannot load. The size of that loot is quoted as 8MB here and elsewhere and as 16MB in the module header, and the two have never been reconciled -- the upstream documents are in neither this tree nor the installed game. See README.md, which says what would settle it.",
 
   "//slotId": "The database key of the location slot to rebind. `suburbs` is a stub BSG ships disabled with a real entry in every table keyed by location, which is why hijacking it works where inventing a new id does not. Changing this changes every path this mod writes.",
   "slotId": "suburbs",
@@ -27,7 +27,7 @@
   "//disabledForScav": "Player scavs cannot deploy here.",
   "disabledForScav": true,
 
-  "//disabledScavExits": "IGNORED, and kept only so an existing config does not look like it lost a setting. This is now built from `scavDisabled` in data/exits.json, so that renaming an exit cannot leave the exit list and the scav restriction disagreeing. The game's own shape for it is a comma-separated string rather than an array, which is why it looked out of place here.",
+  "//disabledScavExits": "IGNORED WHENEVER `mapTables` IS ON, which is the default, and kept so an existing config does not look like it lost a setting. This value is written into the base object and then overwritten from `scavDisabled` in data/exits.json by the map-table pass, so that renaming an exit cannot leave the exit list and the scav restriction disagreeing; with `mapTables` off there is no such pass and this value is what the client sees. It used to say IGNORED without that condition. The game's own shape for it is a comma-separated string rather than an array, which is why it looked out of place here.",
   "disabledScavExits": "Cellars,Gate 0",
 
   "//insurance": "Insurance returns work on this map.",

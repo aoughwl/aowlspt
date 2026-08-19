@@ -28,7 +28,7 @@
 ##       search    the search state machine
 ##       decide    the arbiter: SAIN's 10 Hz priority cascade
 ##       rng       a deterministic per-bot stream
-##       selftest  104 checks that need no Tarkov to run
+##       selftest  124 checks that need no Tarkov to run
 ##     preset/     config.json -> a resolved Settings per bot role
 ##     client/     the only files that know Tarkov exists
 ##       live      the IL2CPP runtime, held directly; every binding
@@ -666,10 +666,14 @@ const
   BudgetNsPerDecision = 1500
     ## The regression gate.
     ##
-    ## Deliberately loose -- around twenty times the measured cost -- because
-    ## this runs on whatever machine someone happens to build on, and a gate
-    ## tight enough to be a benchmark is a gate that fails for reasons that are
-    ## not the code. What it catches is the failure that matters: a decision
+    ## Deliberately loose -- about **forty** times the measured cost, 1500 ns
+    ## against the 35 ns/bot/decision the cost report prints on this machine --
+    ## because this runs on whatever machine someone happens to build on, and a
+    ## gate tight enough to be a benchmark is a gate that fails for reasons
+    ## that are not the code. This said "around twenty times" while the
+    ## decision cost was 37-39 ns and the budget was already 1500, so it was
+    ## never right; the seeding fix in `vec.nim` that took the cost to 35 only
+    ## widened it further. What it catches is the failure that matters: a decision
     ## path that starts allocating, or hits the game, or grows a loop over
     ## every bot. Those are factor-of-ten regressions, not five-percent ones.
     ## The *number* is printed every run regardless, which is what makes a

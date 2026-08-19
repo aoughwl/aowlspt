@@ -3,16 +3,25 @@
 
   "general": {
     "_comment": "restoreWaitMs is how long the mod blocks the host thread on unload waiting for the queued restore to run on the game's thread. It has to block: the host runs on_unload, then drops every callback the mod still has queued, then frees the library, so a restore that has not run by then never runs. 0 disables the wait, which does not merely make the restore unreliable: it restores the old behaviour, in which the queued callback was dropped by dropModRegistrations microseconds later and the restore reliably did not happen, while the log said it had been queued. Set it to 0 only to reproduce that, never to save time on the way out. When the budget is spent the mod logs an error naming every setting still applied rather than a warning about a possibility.",
+    "//enabled": "The master switch. False and onUpdate returns immediately: no knob is applied, no readout is published and no self-test runs. It does not stop the mod loading, and the load line says so.",
     "enabled": true,
+
+    "//requireMainThread": "Whether an apply pass waits for the host to confirm that its per-frame drain really is Unity's thread. True is the safe direction: until the drain has fired once the apply is deferred rather than refused, and the mod says which drain method it is waiting on. False writes the settings from whatever thread it has, which Unity does not support -- it is logged as a warning, and it is also what makes the restore path skip the queue on the way out.",
     "requireMainThread": true,
+
+    "//restoreOnUnload": "Whether the original values are put back when the mod unloads. False leaves every applied setting in place until the game exits, which is stated in a warning naming the count rather than done quietly.",
     "restoreOnUnload": true,
+
     "restoreWaitMs": 2000,
+
+    "//verbose": "Per-knob detail in the self-test: one line per knob that resolved, naming the method it resolved to and the value read, and one per knob that refused with its reason. Off by default because that is twenty-three lines a run; the counts and the failures are reported either way.",
     "verbose": false
   },
 
   "hud": {
     "_comment": "The readout. `intervalMs` is how often a window is closed and a line logged. `readUnityTime` adds a fast-path read of UnityEngine.Time as a cross-check; it is off because Unity API is main-thread-only and onUpdate is not guaranteed to be on that thread. It is refused at runtime unless the host reports its per-frame drain really is Unity's thread. Where it is on, the readout also closes its window against Time.frameCount, which is a frame count by definition; where it is off, the window uses the host's drain-firing counter and the readout says 'drain firings/s' rather than 'fps' unless the drain bound to a method this mod knows runs once per frame.",
-    "_comment_frameTimes": "`frameTimes` is the frame-time distribution: p50/p99/p99.9, a hitch count and a pacing ratio, from a sample taken every frame rather than once a second. It is on because a mean is the one statistic that cannot see a hitch, and a hitch is what a performance mod is for. It costs one queued main-thread callback per frame, measured at about 1 microsecond inside the mod on the stand-in runtime -- 64 parts per million of a 16.7 ms frame -- plus the host's own drain overhead for a non-empty queue, which is real and is not measured. The readout prints the cost every window; turn this off if you would rather not pay it. It refuses to start at all unless the host reports that its drain method runs exactly once per frame, because the interval between sub-frame firings is not a frame time and a histogram of them would report a confident p99 of nearly zero. `hitchMs` is the threshold a frame has to exceed to be counted as a hitch; 50 ms is roughly where a stall stops being a slow frame and starts being something the player sees.",
+    "_comment_frameTimes": "`frameTimes` is the frame-time distribution: p50/p99/p99.9, a hitch count and a pacing ratio, from a sample taken every frame rather than once a second. It is on because a mean is the one statistic that cannot see a hitch, and a hitch is what a performance mod is for. It costs one queued main-thread callback per frame, measured at 350-800 ns inside the mod on the stand-in runtime -- about 46 parts per million of a 16.7 ms frame, from the 776 ns the self-test transcript in README.md reports -- plus the host's own drain overhead, which used to be described here as real and not measured and has been measured since: 90 ns for an armed chain frame against 2.8 ns for an empty one, allocating nothing either way (docs/PERF.md, 2026-08-19). The 64 ppm this used to claim came from rounding the mod's half up to a microsecond. The readout prints the cost every window; turn this off if you would rather not pay it. It refuses to start at all unless the host reports that its drain method runs exactly once per frame, because the interval between sub-frame firings is not a frame time and a histogram of them would report a confident p99 of nearly zero. `hitchMs` is the threshold a frame has to exceed to be counted as a hitch; 50 ms is roughly where a stall stops being a slow frame and starts being something the player sees.",
+    "//enabled": "Whether the readout is published and logged at all. False stops the window arithmetic and the log line; it does not stop the frame-time sampler, which `frameTimes` owns.",
     "enabled": true,
     "intervalMs": 1000,
     "readUnityTime": false,
@@ -21,7 +30,10 @@
   },
 
   "selftest": {
+    "//enabled": "Whether the client-side self-test runs. It runs once, after the apply pass and after two readout windows have closed, and it is what produces the `ok`/`info` transcript in README.md. It reads settings and restores what it wrote; turning it off costs the evidence, not the safety.",
     "enabled": true,
+
+    "//benchIterations": "How many iterations the two timed loops run: `benchUnitySample`, the bound-call sample path, and `benchPumpBody`, the recording half of one sampler firing. 200000 is enough that a 10 ns operation is measured against a clock with a much coarser tick; lowering it makes the ns/call figures noisier, not cheaper in any way that matters, because each loop runs once a session. The simulator-side self-test uses its own fixed count and ignores this.",
     "benchIterations": 200000
   },
 

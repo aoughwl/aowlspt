@@ -67,6 +67,22 @@
 ## that is code and none of it is portable — it is shipped as files and loaded
 ## by the client's own bundle system.
 ##
+## **The two loot figures in this repository do not agree, and cannot be
+## reconciled from here.** This line says about 16MB of authored loot JSON;
+## the refusal below, `ice/tables.nim` and the boot report all say 8MB, and
+## name `looseLoot.json` (8MB) and `staticContainers.json` (50KB) as the files.
+## Neither figure can be re-derived in this tree: upstream's
+## `database/locations/<slot>/*.json` are not here, and the Icebreaker release
+## installed under the game is the BepInEx client plugin only -- no server
+## side, so no loot files. What *is* checkable is the scale: a stock SPT 4.x
+## `looseLoot.json` runs from 9.4 MB (`sandbox`) to 132 MB (`lighthouse`) and a
+## `staticContainers.json` from 345 KB to 1.1 MB, so 8MB is a plausible size
+## for one small map's loose loot and 50KB is smaller than any shipped map's
+## containers. Read 16MB as every authored loot document together and 8MB as
+## `looseLoot.json` alone if you must quote one; what would settle it is an
+## `ls` of the upstream release's `database/locations/<slot>/`, and until
+## somebody does that neither number should be repeated as measured.
+##
 ## What the *mod* does is make the server and the client agree that the map
 ## exists, and this file is that job:
 ##
@@ -107,11 +123,18 @@
 ##   and this mod writes the *table shape* (empty, valid) so a raid starts
 ##   clean; dropping the real files in under the same paths is a data step.
 ## * **The banner image routes.** Upstream calls `ImageRouter.AddRoute` to
-##   serve `/files/banners/<name>` off disk. This ABI has no static-file route
-##   and a mod cannot read its own directory, so the banner *entries* are
-##   written into the base and the images are not served. Named as a gap in the
-##   report rather than faked with an empty response, which would render a
-##   broken image instead of the default art.
+##   serve `/files/banners/<name>` off disk. This used to say the ABI has no
+##   static-file route *and* that a mod cannot read its own directory. The
+##   second half is false and this mod disproves it in its own code:
+##   `ice/tables.nim` reads `data/exits.json` and `data/waves.json` off disk
+##   through `dataDir()`, which the host fills in from the mod's own folder.
+##   What is actually missing is the *serving* end -- a route handler answers
+##   with a string that the backend sends under a hard-coded
+##   `Content-Type: application/json` (`backend/aowlbackend.nim`), so there is
+##   no way to hand back a PNG that a browser or the client would accept. So
+##   the banner *entries* are written into the base and the images are not
+##   served. Named as a gap in the report rather than faked with an empty
+##   response, which would render a broken image instead of the default art.
 ## * **Per-profile map locking.** Upstream recomputes `Enabled`/`Locked` per
 ##   request inside its own `/client/locations` router, which runs after the
 ##   core one and rewrites its output. Here `/client/locations` belongs to
@@ -923,9 +946,14 @@ proc registerLocation(): Status =
   #
   # The donor is not hard-coded to `factory4_day` any more, and the miss is not
   # silent any more. `configs` is a table this mod did not write: SPT's dump
-  # has it, the emulator's database does not, and the 39 MiB import this was
-  # checked against has no top-level `configs` object at all -- so the clone
-  # never once happened on that install and said nothing about it. Preferring
+  # has it and the emulator's database does not. This used to add that the
+  # 39 MiB import it was checked against "has no top-level `configs` object at
+  # all", which is wrong and was checked again on 2026-08-19: that import
+  # (`build/db/db.json`, 39.4 MiB) *does* carry one, holding **only** `quest`.
+  # So there is no `location.scavRaidTimeSettings` table and no
+  # `bot.maxBotCap` table on it either, and the conclusion is unchanged -- the
+  # clone never once happened on that install and said nothing about it -- but
+  # the reason is a missing sub-table rather than a missing root. Preferring
   # factory4_day when it is there keeps the old behaviour exactly; falling back
   # to whatever map the table does carry is what makes it work on a dump that
   # is keyed differently; and saying so when the table is absent is what turns

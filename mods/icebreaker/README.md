@@ -18,7 +18,14 @@ per-frame path.
 **This is a map mod, and a map mod is mostly assets.** The scene bundle, the
 scenes preset, the culling and acoustics bakes, the AI navmesh, five prop
 bundles and about 16MB of authored loot are **not shipped here and cannot be** —
-they are not code. Without them the slot resolves to a map the client has no
+they are not code. (That 16MB and the 8MB quoted in row 13 and under "What it
+still cannot do" have never been reconciled, and cannot be from this tree: the
+upstream loot documents are not here, and the Icebreaker release installed
+under the game is the client plugin only. Read 16MB as every authored loot
+document together and 8MB as `looseLoot.json` alone; an `ls` of the upstream
+release's `database/locations/<slot>/` is what would settle it. For scale, a
+stock SPT 4.x `looseLoot.json` runs 9.4 MB to 132 MB and a
+`staticContainers.json` 345 KB to 1.1 MB.) Without them the slot resolves to a map the client has no
 geometry for. What this mod is, is the half that makes the server and the client
 agree the map exists, plus every table that can be authored without the scene
 open.
@@ -50,7 +57,7 @@ of it.
 | 12 | **`SpawnPointParams`** — where a player and a bot may start | **Not shippable.** See below. This is the one gap that stops a raid. |
 | 13 | **The authored loot tables** (`looseLoot.json`, `staticContainers.json`) | **Not shipped — 8MB of extracted coordinates.** Same reason as 12. |
 | 14 | **The scene and prop bundles, navmesh, culling, acoustics, weather/sky tables** | **Not shipped — assets, not code.** |
-| 15 | **Banner image routes** (`ImageRouter.AddRoute` serving `/files/banners/*` off disk) | **Impossible.** This ABI has no static-file route. The banner *entries* and captions are written; the pictures are the install's problem. A missing picture degrades to the default art, which is why the entries are still worth writing. |
+| 15 | **Banner image routes** (`ImageRouter.AddRoute` serving `/files/banners/*` off disk) | **Not ported.** This ABI has no static-file route, and the reason is narrower than "impossible": a mod *can* read its own directory (`dataDir()`, which is how `data/exits.json` is loaded), but a route handler answers with a string the backend sends under a hard-coded `Content-Type: application/json`, so there is no way to hand back a PNG anything would accept. Closing it is a host change, not a mod one. The banner *entries* and captions are written; the pictures are the install's problem. A missing picture degrades to the default art, which is why the entries are still worth writing. |
 | 16 | **Per-profile map locking** — recompute `Enabled`/`Locked` inside its own `/client/locations` router | **Impossible as designed; degraded honestly.** `/client/locations` belongs to `mods/tarkov` and the backend refuses a second registration of an exact route (`the route ... is already registered`). There is no route chaining and no output filter. The lock is therefore applied at the *database* level and is **global**: on or off for the install. The per-profile answer is still computed and served at `/icebreaker/state`. |
 | 17 | **Quest-visibility gating** of `/client/quest/list` | **Impossible, same reason.** The gate *evaluation* is here and answers at `/icebreaker/state`; the filtering is not. |
 | 18 | Fika coop paths | **Not applicable.** No Fika post-1.0. |
@@ -172,6 +179,90 @@ tables, which are assets.
 * **`globalLootChanceModifier` multiplies an empty table.** 0.27 is upstream's
   number, tuned against its authored loot; on a stock install the answer is
   still empty.
+
+## Settings
+
+Every key in `config.json` carries a `//`-prefixed sibling above it with the
+long form of the answer; this table is the index, because a reader looking for
+"which key changes the bot cap" should not have to read a 10 KB JSON file to
+find out there are 44 of them. **This section did not exist until 2026-08-19,
+and the README named ten of the forty-four keys in passing.**
+
+`loadConfig` reads 42 of the 44. The two it never reads are marked below.
+
+**The slot, and what the map is called**
+
+| key | default | what it does |
+|---|---|---|
+| `slotId` | `suburbs` | the database key of the location slot being rebound. Changes every path this mod writes |
+| `slotObjectId` | `5714dc342459777137212e0b` | the slot's MongoId. The locale keys `<_Id> Name` / `<_Id> Description` are built from it, so it is **not** interchangeable with `slotId` |
+| `displayName` | `Icebreaker` | what the map dot and the raid summary say instead of SUBURBS |
+| `description` | the blurb | the card text under the name. Empty falls back to the built-in blurb |
+| `scenePath` | `maps/icebreaker.bundle` | `Base.Scene.path` -- the bundle the client loads. Not shipped |
+| `sceneRcid` | `icebreaker.scenespreset.asset` | `Base.Scene.rcid`, the preset inside that bundle |
+| `enabled` | `true` | whether the dot appears at all. The entry stays in `/client/locations` either way, because transits resolve their target through the location list |
+| `rebrandLocales` | `true` | write the name and description into every language the database carries. Off, and the dot keeps saying SUBURBS |
+
+**Who may go, and for how long**
+
+| key | default | what it does |
+|---|---|---|
+| `disabledForScav` | `true` | player scavs cannot deploy here |
+| `disabledScavExits` | `Cellars,Gate 0` | comma-separated exits closed to scavs. **Overwritten** by `scavDisabled` in `data/exits.json` whenever `mapTables` writes the exit table, which is the default -- so it only takes effect with `mapTables` off |
+| `insurance` | `true` | insurance returns work here |
+| `safeLocation` | `false` | true would mean gear cannot be lost |
+| `escapeTimeLimit` | `50` | raid length in minutes. The stub ships 0, which is a raid that ends immediately |
+| `escapeTimeLimitCoop` | `50` | the same for coop |
+| `escapeTimeLimitPVE` | `50` | the same for PvE |
+| `minPlayers` | `1` | lower bound of the matchmaking band. Cosmetic offline |
+| `maxPlayers` | `3` | upper bound of the same band |
+| `maxCoopGroup` | `6` | largest coop group the map advertises |
+| `requiredPlayerLevelMin` | `0` | lowest character level offered this map |
+| `requiredPlayerLevelMax` | `100` | highest |
+| `averagePlayerLevel` | `60` | the "average level" figure on the map card. Cosmetic |
+| `averagePlayTime` | `50` | the "average time" figure, in minutes. Cosmetic |
+| `iconX` | `91` | where the dot sits on the world map, horizontally |
+| `iconY` | `747` | the same, vertically |
+
+**The map tables**
+
+| key | default | what it does |
+|---|---|---|
+| `mapTables` | `true` | write exits, waves and boss spawns from `data/`. Off, the stub's `exits: []` stands and the map is a raid you cannot leave except by dying |
+| `exitsFile` | `exits.json` | the exit table, under `data/`. Its `Name` fields are what the scene's exfil triggers match on |
+| `wavesFile` | `waves.json` | scav waves and boss spawns, under `data/`. 11 waves, 34 bot slots as shipped |
+| `bossSpawns` | `false` | write the boss spawns from `wavesFile`. Off, because a boss on a map with empty loot tables is a fight for nothing |
+| `spawnPointsFile` | `""` | a `SpawnPointParams` array, under `data/`, for an install that has the scene. Nothing is invented in its place -- see "What it still cannot do" |
+| `openZones` | `ZoneIcebreaker` | the bot zones the map declares. Every wave must name one, and the self-test checks that it does |
+| `arcticWeather` | `false` | asks for arctic weather, and is **refused out loud** with the reason -- the weather table is one record for the whole install |
+
+**Bots and loot**
+
+| key | default | what it does |
+|---|---|---|
+| `botCap` | `40` | how many AI may be alive at once. Written to `locations.<slot>.base.BotMax`/`BotMaxPvE`, which is where the client reads it |
+| `maxBotPerZone` | `2` | how many may be alive in one zone. This map declares one zone, so the lower of the two caps wins and raising `botCap` alone does nothing |
+| `botStop` | `2400` | seconds into the raid after which no further waves spawn. 40 minutes of a 50-minute raid |
+| `globalLootChanceModifier` | `0.27` | multiplies loose-loot probability. Multiplies an empty table on a stock install |
+| `globalContainerChanceModifier` | `1.0` | the same for static containers |
+
+**Quests, gating and what is served**
+
+| key | default | what it does |
+|---|---|---|
+| `lockUntilQuestComplete` | `false` | hide the map until a quest is done. Applied at the database level, so **global** rather than per profile -- row 16 |
+| `finalQuestId` | `""` | the quest that unlocks it. Empty with the lock on leaves the map open |
+| `crossingWatch` | `true` | record which profiles have come back alive from this map, and answer at `/icebreaker/state` |
+| `crossingGateQuests` | 6 ids | the quests gated on that crossing. Evaluated here; `/client/quest/list` is not filtered, for the route-ownership reason in row 17 |
+| `bundles` | 5 keys | the bundle keys served at `/icebreaker/bundles`, so a client can say *which* one is missing |
+
+**Read by nothing**
+
+| key | default | what it does |
+|---|---|---|
+| `exitLocaleKey` | `Icebreaker_Exit_Heli` | loaded into a variable and never used. Exit locales come from `data/locales.json`, checked against `data/exits.json` in both directions. Kept so an existing config does not look like it lost a setting |
+| `exitLocaleName` | `Helicopter` | the same |
+| `bundlePrefix` | `manimal/` | never read by `loadConfig` at all. Informational: the namespace upstream ships bundles under |
 
 ## The self-test
 

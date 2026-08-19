@@ -436,8 +436,9 @@ info  one sampler firing spends 776 ns in this mod (25 ns of it recording) over
 ok    this mod's half of a sampler firing costs under 5 us
 info  that is 46 parts per million of a 16.7 ms frame, and it is a floor rather
       than the price: everyMain's re-arm (a lock and a seq append in the host)
-      and the host's own drain overhead (two seq allocations in drainDue, every
-      frame while this runs) are both NOT MEASURED and neither is included
+      is NOT MEASURED and is not included, and the host's own drain overhead is
+      measured in the host rather than here -- 90 ns for an armed chain frame,
+      2.8 ns for an empty one, no allocations either way (docs/PERF.md)
 ```
 
 and, once enough frames have accumulated for a median, from the readout rather
@@ -677,8 +678,10 @@ And the one gap this list had left, closed since it was written:
   measured (350–800 ns a frame inside the mod, about 46 ppm of a 16.7 ms frame)
   and what it does not cover is stated rather than estimated (`everyMain`'s
   re-arm, still **not measured** from here; the host's own drain overhead is
-  89 ns in `docs/PERF.md`, measured there rather than here). The self-test's
-  own line still prints both as NOT MEASURED and is quoted verbatim above.
+  89.9 ns for an armed chain frame in `docs/PERF.md`, measured there rather
+  than here). The self-test's own line used to print both as NOT MEASURED; it
+  prints the re-arm as NOT MEASURED and the drain's measured figure beside it,
+  and is quoted verbatim above.
 
   Two limits remain. The distribution needs 120 samples before it reports
   anything and 1000 before it reports p99.9, so the first seconds of a session

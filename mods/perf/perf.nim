@@ -104,24 +104,39 @@
 ##   when it sees the old shape — chosen on the shape rather than on a version,
 ##   because a version number is a claim and the shape is the fact.
 ##
-##   `aowlspt/fast`'s `classifyType` still refuses an enum, and is right to:
-##   `findClass` plus `classIsValueType` cannot tell a byte enum from a long
-##   one. The boxed path can, because it asks for the width.
+##   This used to add that `aowlspt/fast`'s `classifyType` still refuses an
+##   enum, and that it was right to because `findClass` plus `classIsValueType`
+##   cannot tell a byte enum from a long one. **That refusal is gone.**
+##   `classifyClass` consults the type name first — so a float or a bool is
+##   never mistaken for an integer of the same width — and then measures the
+##   width the runtime reports, instance size minus a measured box header, so a
+##   1-, 2-, 4- or 8-byte enum classifies like any other register-sized value.
+##   What is still refused is a value type too wide for a register, and must be:
+##   Win64 passes one by hidden pointer, which is a different call shape rather
+##   than a different register.
 ##
-## * **A repeating main-thread callback — HALF CLOSED, and the half that
-##   mattered.** `onMainThread` is still one-shot; there is still no `everyMain`.
-##   But it no longer leaks: `claimTick` reuses a freed slot and
-##   `tickTrampoline` releases a one-shot's slot after it fires, so queueing
-##   work every frame costs one slot at a time rather than one per frame. The
-##   reason this mod samples off-thread is now purely that it does not need to be
-##   on Unity's thread to read a counter, not that looping would leak.
+## * **A repeating main-thread callback — CLOSED.** This used to read HALF
+##   CLOSED: `onMainThread` was one-shot, there was no `everyMain`, and what had
+##   been fixed was only the leak (`claimTick` reuses a freed slot and
+##   `tickTrampoline` releases a one-shot's slot after it fires). `everyMain`
+##   and `stopMainRepeats` are in `aowl/src/aowlspt.nim` now and this mod uses
+##   them: a repeating callback on the drain's thread, re-armed on the same
+##   cookie inside the library, so a chain holds **one** slot rather than one
+##   per firing. The hand-rolled chain that used to live in this file — and
+##   the fifty lines of commentary establishing that it was safe — are gone
+##   with it. The reason this mod still samples off-thread for the *counter* is
+##   unchanged: it does not need Unity's thread to read one.
 ##
 ## * **An allocation-free per-frame callback — CLOSED.** `hookTyped` /
 ##   `hookReturnTyped` (ABI revision 4) hand a handler the saved registers
 ##   rather than JSON: about 24 ns a firing against 650, and measured at zero
 ##   allocations in the mod and zero payload bytes in the host over 20,000
 ##   firings. The old sentence about `patchTrampoline` calling `toString` on two
-##   slices is still true of the *JSON* hooks and no longer true of the ABI.
+##   slices — which this said was still true of the *JSON* hooks — is no
+##   longer true of either: the target name is taken from the registration
+##   rather than from the slice, and an empty argument slice converts without
+##   allocating, so the no-arguments `hook` form costs nothing per firing. A
+##   JSON hook that does take arguments still builds one string a firing.
 ##
 ##   This mod still installs no hooks, and the reason is now a small one rather
 ##   than a refusal: the only method it would want is the per-frame method the
@@ -132,13 +147,14 @@
 ##   patch slot and a second trampoline on the game's hottest path.
 ##
 ## * **A postfix hook — available, and deliberately not used.** `hookReturn`
-##   exists and can adjust what a game method answers. It is 418 ns to watch a
-##   return value and 2245 ns to also read the arguments and replace the result,
-##   because the payload crosses as JSON; `hookReturnTyped` is 80 ns for the
-##   same work. Nothing this mod does wants one: a setting is written twice in a
-##   session, not adjusted per call, and a postfix that held a `QualitySettings`
-##   property against the game's own settings menu would be fighting the player
-##   rather than the frame time.
+##   exists and can adjust what a game method answers. It is 443 ns to watch a
+##   return value and 2320 ns to also read the arguments and replace the result
+##   (they read 418 and 2245 until `docs/PERF.md` was re-measured on
+##   2026-08-19), because the payload crosses as JSON; `hookReturnTyped` is 80
+##   ns for the same work. Nothing this mod does wants one: a setting is written
+##   twice in a session, not adjusted per call, and a postfix holding a
+##   `QualitySettings` property against the game's own settings menu would be
+##   fighting the player rather than the frame time.
 ##
 ## * **A way to prove an allocation count — CLOSED, and not used here.**
 ##   `allocationCount()` and `allocProbeOk()` are exported from `aowlspt/fast`
@@ -1664,12 +1680,22 @@ proc clientSelfTest() =
     if body > 0'i64:
       # As a share of a 60 fps frame, in parts per million, so the reader does
       # not have to do the division.
+      #
+      # This used to print the host's drain overhead as NOT MEASURED alongside
+      # the re-arm, and to assert that `drainDue` allocated two seqs a frame
+      # while a chain runs. The host measures it on its own thread now
+      # (`hostharness --frame-bench`, reported in docs/PERF.md on 2026-08-19),
+      # and `takeDue` compacts in place into a buffer the drain thread reuses,
+      # so the allocation claim was wrong as well as unmeasured. The re-arm is
+      # still not measured, and still cannot be from here: it happens in the
+      # library's trampoline after this handler has returned.
       info "selftest  that is " & $((body * 1000000'i64) div 16666667'i64) &
            " parts per million of a 16.7 ms frame, and it is a floor rather " &
            "than the price: everyMain's re-arm (a lock and a seq append in " &
-           "the host) and the host's own drain overhead (two seq allocations " &
-           "in drainDue, every frame while this runs) are both NOT MEASURED " &
-           "and neither is included"
+           "the host) is NOT MEASURED and is not included, and the host's " &
+           "own drain overhead is measured in the host rather than here -- " &
+           "90 ns for an armed chain frame, 2.8 ns for an empty one, no " &
+           "allocations either way (docs/PERF.md)"
 
     info "selftest  the median-against-window-rate cross-check is deferred " &
          "until there are enough samples for a median; it runs from the " &
