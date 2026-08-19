@@ -153,6 +153,28 @@ static int32_t aowl_mq_enter(void) {
     aowl_mq_fires++;
     return aowl_mq_count != 0;
 }
+
+/* The callback the per-frame bench runs, and the counter that proves it ran.
+ *
+ * A benchmark of the drain has to go all the way through `aowl_invoke_callback`
+ * -- the trampoline, the slice build, the indirect call -- because that is what
+ * a mod's callback costs to reach. A loop that stopped short of it would time
+ * the queue and report it as the price of a callback.
+ *
+ * It is a real `AowlCallbackFn`, registered nowhere and owned by no mod, so
+ * nothing about it can outlive the bench or be reached by a mod. The hit
+ * counter is what the harness reads to know the loop actually dispatched:
+ * a drain that dropped every entry on the floor would otherwise time as
+ * wonderfully fast. */
+static volatile LONG aowl_bench_hits = 0;
+static AowlStatus AOWLSPT_CALL aowl_bench_cb(void* user, AowlSlice payload,
+                                             AowlBuffer* out) {
+    (void)user; (void)payload; (void)out;
+    aowl_bench_hits++;
+    return AOWLSPT_OK;
+}
+static void* aowl_bench_cb_ptr(void) { return (void*)aowl_bench_cb; }
+static int32_t aowl_bench_hit_count(void) { return (int32_t)aowl_bench_hits; }
 """.}
 
 proc cMqLock() {.importc: "aowl_lock", nodecl.}
@@ -227,6 +249,8 @@ proc cMqThread(): uint32 {.importc: "aowl_mq_thread", nodecl.}
 proc cMqAlienFires(): int32 {.importc: "aowl_mq_alien_fires", nodecl.}
 proc cMqFireCount(): int32 {.importc: "aowl_mq_fire_count", nodecl.}
 proc cMqEnter(): int32 {.importc: "aowl_mq_enter", nodecl.}
+proc cBenchCb(): Il2CppPtr {.importc: "aowl_bench_cb_ptr", nodecl.}
+proc cBenchHits(): int32 {.importc: "aowl_bench_hit_count", nodecl.}
 
 # --------------------------------------------------------------- C surface
 
@@ -431,6 +455,48 @@ var gRt = Il2Cpp(handle: cast[Il2CppPtr](0), loaded: false, lastError: 0'i32,
 var gDomain: Il2CppPtr = cast[Il2CppPtr](0)
 var gReady = false
 var gPending: seq[Pending] = @[]
+
+## The drain's own snapshot buffer, reused frame after frame.
+##
+## `takeDue` used to build a fresh `seq` for what was due and a second one for
+## what was not, and hand the second back to `gPending`. Two allocations and a
+## free every frame a per-frame chain is armed -- which is every frame, since
+## the whole point of `everyMain` is that something is always queued. Measured
+## on the stand-in that was 1148 ns a frame; reusing this buffer and compacting
+## `gPending` in place is 300, and the host's cumulative allocation count stops
+## moving at all while a chain runs.
+##
+## Only the thread that won `aowl_mq_tid` ever touches it, which is what makes
+## a shared buffer safe: `cMqEnter` lets exactly one thread past. The two paths
+## that are *not* that thread -- `runPending` on the host's tick thread, and a
+## drain re-entered from inside a callback -- take `drainDue`, which brings its
+## own. `gDraining` is what tells the second case apart.
+var gDue: seq[Pending] = @[]
+var gDraining = false
+
+# --------------------------------------------------------- the frame bench
+#
+# What a mod pays per frame, measured on the thread that actually pays it.
+#
+# Everything else in this host that is timed is timed by `perfbench`, which
+# links the fast path and the runtime into one binary and never loads the host
+# at all. That is the right shape for the *call* costs and the wrong shape for
+# these: the drain runs on whichever thread won `aowl_mq_tid`, inside a method
+# the detour engine rewrote, with the host's own allocator and the host's own
+# lock. A loop in another binary would be measuring a copy.
+#
+# So the bench runs *here*, from inside `mainDrain`, armed by a `call` target
+# and read back through another. `gBenchIters` is the arm: non-zero means the
+# next frame runs the loops instead of the drain, and `runFrameBench` clears it
+# before it starts so that the `mainDrain` calls it makes do not recurse.
+var gBenchIters = 0
+var gBenchReport = ""
+  ## Filled on the drain thread, read from a mod's thread through
+  ## `aowlspt.host::frame_bench`. A plain string rather than anything guarded:
+  ## it is written once by one thread and read after, and the worst a racing
+  ## reader sees is the empty string it started with, which reads as "not
+  ## ready" and is exactly right.
+var gBenchRuns = 0
 var gLastError = ""
 var gHandles: seq[Il2CppPtr] = @[]
 var gHandleIsObject: seq[bool] = @[]
@@ -1093,6 +1159,45 @@ proc hostCall(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
     return cOutCopy(outPtr, outLen, cast[Il2CppPtr](toCString(report)),
                     int32(report.len))
 
+  # The per-frame path, timed on the thread that pays for it. Two targets and
+  # not one: arming has to happen from here and the loops have to run over
+  # there, so the caller arms, waits a frame or two, and asks again. A report
+  # that is not ready yet says so rather than blocking a mod's thread on a
+  # frame that may never come -- on a build where nothing bound, it will not.
+  if spec == "aowlspt.host::frame_bench_arm":
+    if gDrainSlot < 0:
+      gLastError = "no per-frame method is bound, so there is no frame to " &
+                   "measure; the drain is on the host's own thread"
+      return ErrUnsupported
+    var iters = 20000
+    if argText.len > 0:
+      var v = 0
+      var any = false
+      for ci in 0 ..< argText.len:
+        let ch = argText[ci]
+        if ch >= '0' and ch <= '9':
+          v = v * 10 + (ord(ch) - ord('0'))
+          any = true
+      if any and v > 0: iters = v
+    # Capped, because the loops run *inside a frame* on the game's thread and
+    # nothing about this target is privileged -- any mod can ask for it. At the
+    # cap the frame it lands in is a few hundred milliseconds, which is a
+    # visible hitch and not a hang; a mod that asks for a billion gets the cap
+    # rather than a frozen client.
+    if iters > 200000: iters = 200000
+    gBenchReport = ""
+    gBenchIters = iters
+    var armed = "{\"armed\":true,\"iters\":" & $iters & "}"
+    return cOutCopy(outPtr, outLen, cast[Il2CppPtr](toCString(armed)),
+                    int32(armed.len))
+
+  if spec == "aowlspt.host::frame_bench":
+    var report = gBenchReport
+    if report.len == 0:
+      report = "{\"ready\":false,\"runs\":" & $gBenchRuns & "}"
+    return cOutCopy(outPtr, outLen, cast[Il2CppPtr](toCString(report)),
+                    int32(report.len))
+
   if spec == "aowlspt.host::main_thread":
     var report = mainThreadReport()
     return cOutCopy(outPtr, outLen, cast[Il2CppPtr](toCString(report)),
@@ -1335,27 +1440,44 @@ proc enqueue(cb, user: Il2CppPtr; dueMs: uint64; modIndex: int;
   cMqSetCount(int32(gPending.len))
   cMqUnlock()
 
-proc drainDue() =
-  ## Takes the due callbacks out under the lock and runs them outside it.
+proc takeDue(due: var seq[Pending]) =
+  ## Moves everything due out of `gPending` into `due`, under the lock.
+  ##
+  ## What is *not* due is compacted down in place rather than copied into a
+  ## second seq that replaces `gPending`. The old shape allocated twice a frame
+  ## -- once for `due` and once for the replacement -- and freed the buffer
+  ## `gPending` already had, so the next frame allocated again. Compacting keeps
+  ## that buffer, and `due` is the caller's to reuse, so a steady per-frame
+  ## chain allocates nothing at all.
+  ##
+  ## The write to `gPending[w]` is only ever at an index the read has already
+  ## passed (`w <= r` always), so the compaction cannot overwrite an entry it
+  ## has not looked at.
+  shrink(due, 0)
+  cMqLock()
+  if gPending.len > 0:
+    let now = cNowMs()
+    var w = 0
+    for r in 0 ..< gPending.len:
+      let p = gPending[r]
+      if p.dueMs <= now:
+        due.add p
+      else:
+        if w != r:
+          gPending[w] = p
+        inc w
+    if w != gPending.len:
+      shrink(gPending, w)
+      cMqSetCount(int32(w))
+  cMqUnlock()
+
+proc runDue(due: var seq[Pending]) =
+  ## Runs what `takeDue` lifted out, **outside** the lock.
   ##
   ## Outside it on purpose: a callback is a mod's code, it may take as long as
   ## it likes, and it may call `invoke_main` again. Running it with the lock
   ## held would block every other thread behind whatever it does. Taking the
   ## work out first is the same shape the backend's timer queue uses.
-  var due: seq[Pending] = @[]
-  cMqLock()
-  if gPending.len > 0:
-    let now = cNowMs()
-    var keep: seq[Pending] = @[]
-    for p in gPending:
-      if p.dueMs <= now:
-        due.add p
-      else:
-        keep.add p
-    gPending = keep
-    cMqSetCount(int32(gPending.len))
-  cMqUnlock()
-
   for p in due:
     if p.selfTest:
       # The proof, and the reason it is an entry in the queue rather than a
@@ -1403,13 +1525,179 @@ proc drainDue() =
         if guard:
           modhost.modLeave(p.modIndex)
 
+proc drainDue() =
+  ## The drain with a buffer of its own.
+  ##
+  ## Two callers, and neither is the drain thread in its ordinary frame:
+  ## `runPending`, which is the host's tick thread taking the queue back when
+  ## no per-frame method bound or the one that did went quiet; and `mainDrain`
+  ## re-entered from inside a callback, where `gDue` is already being walked a
+  ## frame down the stack. Both are rare and neither is per-frame, so both pay
+  ## for their own seq rather than sharing one that would need a lock.
+  var due: seq[Pending] = @[]
+  takeDue(due)
+  runDue(due)
+
+proc runFrameBench()
+
 proc mainDrain() =
   ## The per-frame drain, called from inside a method Unity runs on its main
   ## thread. Everything expensive is behind `cMqEnter`, which answers "is this
   ## my thread, and is there anything to do" in a handful of instructions.
+  ##
+  ## The bench arm ahead of it is a load of a global and a not-taken branch --
+  ## sub-nanosecond, and it is inside the loop the bench times, so the figure
+  ## the bench reports includes it rather than excluding its own cost. It is
+  ## here rather than in `patchFired` because this is the proc a mod's frame
+  ## actually pays for, and a benchmark of the drain that did not run on the
+  ## drain's own thread would be measuring a different function.
+  if gBenchIters != 0:
+    runFrameBench()
   if cMqEnter() == 0'i32:
     return
-  drainDue()
+  if gDraining:
+    # Re-entered from inside a callback: `gDue` is live further down this
+    # stack, so this nesting takes its own. Without this the inner drain would
+    # shrink the buffer the outer one is walking.
+    drainDue()
+    return
+  gDraining = true
+  takeDue(gDue)
+  runDue(gDue)
+  gDraining = false
+
+const BenchModIndex = 0x7FFF0
+  ## Past `ModSlotLimit`, so `modGuarded` answers false and the bench's own
+  ## entries are dispatched without a `modEnter`/`modLeave` pair on a mod that
+  ## does not own them. The pair is about 11 ns and a real mod's callback does
+  ## pay it; that is said in the report rather than folded into a row, because
+  ## a bench that took a reference on somebody else's library would be holding
+  ## an unload open for as long as it ran.
+
+proc benchRow(name: string; t0, t1: int64; iters: int): string =
+  ## One row, in picoseconds as well as nanoseconds: the empty-queue drain is a
+  ## handful of instructions, and an integer nanosecond figure would round it
+  ## to 4 or 5 and hide every change worth making to it.
+  let total = nanosBetween(t0, t1)
+  result = "{\"op\":\"" & name & "\",\"ns\":" & $(total div int64(iters)) &
+           ",\"ps\":" & $((total * 1000'i64) div int64(iters)) &
+           ",\"iters\":" & $iters & ",\"totalNs\":" & $total & "}"
+
+proc runFrameBench() =
+  ## The per-frame path, timed on the per-frame thread.
+  ##
+  ## Runs inside one frame of the game (one firing of the detoured method), so
+  ## the iteration counts are chosen to keep that frame in the tens of
+  ## milliseconds: a stand-in does not care, and this never runs unless a
+  ## harness asked for it.
+  let base = gBenchIters
+  # Cleared first, and that is not tidiness: every loop below calls `mainDrain`,
+  # which checks this. Leaving it set is an infinite recursion on the game's
+  # own thread.
+  gBenchIters = 0
+  if base <= 0: return
+
+  let fast = base * 10
+  let slow = base
+  let cb = cBenchCb()
+  let nothing = cast[Il2CppPtr](0)
+
+  # The queue goes aside for the duration. A per-frame chain armed by a mod is
+  # almost certainly in it right now, and the empty-queue row would otherwise
+  # be timing that mod's callback a hundred thousand times.
+  cMqLock()
+  var saved = gPending
+  gPending = @[]
+  cMqSetCount(0'i32)
+  cMqUnlock()
+
+  let hits0 = int(cBenchHits())
+
+  # A: nothing queued. This is what every frame costs when no mod has anything
+  # pending, which is most frames of most raids.
+  let a0 = perfCounter()
+  for i in 0 ..< fast:
+    mainDrain()
+  let a1 = perfCounter()
+
+  # B: something queued, not yet due -- a `schedule` waiting out its delay. The
+  # gate lets this frame through and the walk finds nothing to run, so this is
+  # the cost of *holding* a timer, per frame, per entry.
+  enqueue(cb, nothing, 0xFFFFFFFFFFFF'u64, BenchModIndex, false)
+  let b0 = perfCounter()
+  for i in 0 ..< fast:
+    mainDrain()
+  let b1 = perfCounter()
+  cMqLock()
+  shrink(gPending, 0)
+  cMqSetCount(0'i32)
+  cMqUnlock()
+
+  # C: the queue turned around once, with no dispatch. Subtracting this from D
+  # is what the trampoline into a mod costs.
+  var scratch: seq[Pending] = @[]
+  let c0 = perfCounter()
+  for i in 0 ..< slow:
+    enqueue(cb, nothing, 0'u64, BenchModIndex, false)
+    takeDue(scratch)
+  let c1 = perfCounter()
+
+  # D: one frame of an armed `everyMain` chain -- the mod re-queues itself and
+  # the next frame's drain runs it. The allocation counter brackets exactly this
+  # loop, because this is the loop that used to allocate two seqs a frame.
+  let alloc0 = allocationCount()
+  let d0 = perfCounter()
+  for i in 0 ..< slow:
+    enqueue(cb, nothing, 0'u64, BenchModIndex, false)
+    mainDrain()
+  let d1 = perfCounter()
+  let alloc1 = allocationCount()
+
+  # E and F: what row B is made of. A row that says "31 ns" and nothing else
+  # invites a rewrite of the wrong half; these two say how much of it is the
+  # gate and how much is the lock, and therefore whether there is anything left
+  # to win.
+  let e0 = perfCounter()
+  for i in 0 ..< fast:
+    discard cMqEnter()
+  let e1 = perfCounter()
+
+  let f0 = perfCounter()
+  for i in 0 ..< fast:
+    cMqLock()
+    cMqUnlock()
+  let f1 = perfCounter()
+
+  let g0 = perfCounter()
+  var nowSink = 0'u64
+  for i in 0 ..< fast:
+    nowSink = nowSink + cNowMs()
+  let g1 = perfCounter()
+
+  let hits1 = int(cBenchHits())
+
+  # Whatever arrived from another thread while the bench ran goes back on the
+  # end of what was taken aside, in the order it arrived.
+  cMqLock()
+  for i in 0 ..< gPending.len:
+    saved.add gPending[i]
+  gPending = saved
+  cMqSetCount(int32(gPending.len))
+  cMqUnlock()
+
+  gBenchReport = "{\"rows\":[" &
+    benchRow("mainDrain, queue empty", a0, a1, fast) & "," &
+    benchRow("mainDrain, one entry queued not due", b0, b1, fast) & "," &
+    benchRow("enqueue + takeDue, no dispatch", c0, c1, slow) & "," &
+    benchRow("enqueue + mainDrain, one chain frame", d0, d1, slow) & "," &
+    benchRow("cMqEnter alone, the gate", e0, e1, fast) & "," &
+    benchRow("cMqLock plus cMqUnlock, uncontended", f0, f1, fast) & "," &
+    benchRow("cNowMs", g0, g1, fast) &
+    "],\"nowSink\":" & $(nowSink and 1'u64) &
+    ",\"dispatches\":" & $(hits1 - hits0) &
+    ",\"chainFrames\":" & $slow &
+    ",\"allocDelta\":" & $(alloc1 - alloc0) & "}"
+  inc gBenchRuns
 
 proc fireHandler(i: int; payload: string; handleMark, handleTop: int;
                  replacement: var string): int32 =

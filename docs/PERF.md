@@ -59,6 +59,12 @@ not fail the run. Reading the table is still a person's job.
 There is no `aowl build-tools`; the direct nimony line is at the top of
 `perfbench.nim` if you want to build only this.
 
+Re-run unchanged on 2026-08-19 and every row landed within noise of the figures
+below, so nothing here was stale: the largest move was the boxed call by name at
+1099 against 1104. That is worth saying rather than silently leaving the table
+alone, because "still true" is a result of re-running it and not a property of
+having written it down.
+
 Re-derived on 2026-08-18 with msys2 ucrt64 gcc 15.2.0, by running
 `installer\build\perfbench.exe --runtime tests\mockil2cpp\GameAssembly.dll`
 and copying its table. The hook rows below the fold are from the same run,
@@ -414,9 +420,19 @@ Measured on the stand-in, in `mods/perf`'s own self-test:
 | operation | ns | note |
 |---|---:|---|
 | recording one frame interval into the histogram | 26 | clock read, subtract, array store; 0 allocations over 20000 |
-| one firing of the self-re-arming chain, inside the mod | ~1000 | nearly all of it `onMainThread`'s enqueue: a host lock and a seq append |
-| the host's drain overhead for a non-empty queue | **not measured** | `drainDue` allocates two seqs per frame while such a chain runs |
+| one firing of the self-re-arming chain, inside the mod | ~1000 | see the correction below: the attribution in this row was wrong |
+| the host's drain overhead for a non-empty queue | **89** | measured 2026-08-19; was `not measured`, and was 627 |
 | `hookTyped` on a per-frame method, for comparison | 23 | the alternative, at the price of a second detour on the hottest path |
+
+**The second row used to say `not measured`, and the note beside the first was
+wrong.** It read "nearly all of it `onMainThread`'s enqueue: a host lock and a
+seq append". The host's half of that is now measured — see *What the host costs
+per frame* below — and it is 89 ns, of which the lock is 51 and the seq append
+is not visible at all. So roughly nine hundred of that microsecond is somewhere
+else: the two ABI crossings and whatever the mod does around them. `mods/perf`
+is where the mod-side figure comes from and it is not re-derived here; what is
+corrected is the claim about *where the time went*, which was a guess sitting in
+a table of measurements.
 
 One microsecond a frame is 64 parts per million of a 16.7 ms frame, which is why
 the chain is the right trade for a *readout*. It is the wrong trade for anything
@@ -430,6 +446,146 @@ several percent against an effect of 0.006 percent. Measuring from inside the
 firing is what resolves it. The general lesson is the one this document opens
 with: measure the thing, not the difference, when the difference is smaller than
 the noise.
+
+## What the host costs per frame
+
+Everything above is measured either inside a mod or inside `perfbench`, and
+`perfbench` never loads the host at all — it links the fast path and the
+stand-in into one binary. That is the right shape for the *call* costs and the
+wrong shape for the host's own per-frame work, which runs on whichever thread
+won the detoured method, with the host's allocator and the host's lock. A loop
+in another binary would be timing a copy.
+
+So it is measured where it runs. `hostharness --frame-bench N` arms a benchmark
+through `call("aowlspt.host::frame_bench_arm")`; the next firing of the drain
+hook runs the loops **inside that frame, on that thread**, and the harness reads
+the table back through `call("aowlspt.host::frame_bench")`. Same machine and
+stand-in as every other table here, 20000 iterations of the dispatch rows and
+200000 of the cheap ones, median of three runs.
+
+```
+hostharness.exe installer\build\hoststage --runtime tests\mockil2cpp\GameAssembly.dll --frame-bench 20000
+```
+
+| operation | ns/op | note |
+|---|---:|---|
+| **`mainDrain`, queue empty** | **2.8** | what every frame costs when no mod has anything queued, which is most frames |
+| `mainDrain`, one entry queued, not yet due | 32.1 | a `schedule` waiting out its delay: the gate lets the frame through and the walk finds nothing to run |
+| `enqueue` + `takeDue`, no dispatch | 84.6 | the queue turned around once |
+| **`enqueue` + `mainDrain`, one armed chain frame** | **89.9** | what `everyMain` costs the host per frame |
+| `cMqEnter` alone, the gate | 1.65 | |
+| `cMqLock` + `cMqUnlock`, uncontended | 25.5 | |
+| `cNowMs` | 1.24 | |
+
+**The empty frame is at its ceiling and the numbers say so.** 2.8 ns against a
+`cMqEnter` of 1.65: the gate is two loads, a compare and an increment, and the
+rest is the call around it. There is nothing to win there and no rewrite of it
+should be believed without a number.
+
+**Everything else on this path is the lock.** A chain frame is 89.9 ns and two
+uncontended `EnterCriticalSection`/`LeaveCriticalSection` pairs are 51 of them —
+one taken by `enqueue` and one by `takeDue`. The queue walk, the compaction and
+the trampoline into the callback are the remaining forty between them.
+
+A `gNextDueMs` published lock-free beside `aowl_mq_count` would let a frame
+holding a not-yet-due timer skip the lock entirely and take row two from 32 ns
+to about 4. It is **measured and declined**: 28 ns of a 16.7 ms frame is 0.0002
+percent, and the price is a second racy invariant on the one path in this host
+where a wrong answer is a callback that never arrives. The number is here so
+that the next person to have the idea can see what it is worth before spending
+an afternoon on it.
+
+### What the boxed path costs before it does anything
+
+Two rows the harness times from *its own* binary, because half of the cost is
+the caller's — copying the reply out of the buffer the host allocated and
+freeing it, which is exactly what a mod does.
+
+| operation | ns/op |
+|---|---:|
+| `call("aowlspt.host::patch_stats")` — a host-internal target, no type resolved, no method invoked | 900 |
+| the same crossing with a malformed target, refused before any reply is built | 338 |
+
+That is the boxed path's floor, and it is most of the boxed path's cost: a
+`call` that reaches the game is 1100 ns (top of this document), and 900 of that
+is spent before any game work happens. 338 ns is the crossing itself — two
+argument buffers copied into nimony strings and a status back — and the other
+560 is building a hundred bytes of JSON and handing it over: a `calloc`, a
+`memcpy`, a `free`, and a concatenation per field.
+
+Which sharpens the advice at the top rather than changing it. The boxed path is
+not slow because IL2CPP is slow, and it is not even mostly slow because of the
+type lookup: it is slow because *asking* costs 900 ns before anything is asked.
+Ask once per second, not once per frame.
+
+### What this one does not prove either
+
+The same caveat as every other table here, plus one of its own. The stand-in's
+frame loop is a thread in a test DLL, not Unity's; the drain hook is attached to
+`UnityEngine.UI.CanvasUpdateRegistry::PerformUpdate` in the mock's own type
+universe. What the table establishes is the cost of the host's code on the
+thread that runs it. What it cannot establish is contention: every lock figure
+here is uncontended, and it is uncontended because nothing else in a stand-in
+run is calling `invoke_main` from a worker thread at the same moment. A mod that
+does will pay more, and how much more is not measurable outside the game.
+
+`--frame-bench` **is** in `aowl test`, in the "Against a live runtime" section
+next to `perfbench`. This paragraph said it was not, and that it could be
+because the assertions below are real ones; it was wired in the same day, once
+`tools/aowl.nim` was free to edit. The timings are printed and only the three
+assertions can fail the run, which is the right split: a number that moves is
+information, and a drain that stopped dispatching or started allocating is a
+regression.
+
+### The assertions it makes
+
+Four things, and each one is written so that it fails when the thing it names
+stops happening rather than when a number moves:
+
+1. **The loop dispatched.** The host counts every callback the bench's own
+   `AowlCallbackFn` received, and the harness checks that it moved once per
+   armed frame. Without this every row is a benchmark of a drain that dropped
+   its queue on the floor, which would time beautifully.
+2. **An armed chain costs the host zero allocations.** mimalloc's cumulative
+   block count inside the host, bracketed around the chain loop. Cumulative, so
+   nothing on the free path can lower it back to a passing figure. Against the
+   drain as it stood the day before this was written the figure is **40000 over
+   20000 frames** — exactly two — and the check fails.
+3. **The empty-queue gate short-circuits.** An empty frame must be cheaper than
+   one that walks the queue. 2.8 against 32 is an order of magnitude, so this
+   is a check rather than a coin toss; if `cMqEnter` ever stopped answering
+   early the two would converge and nothing else here would notice.
+4. There is no fourth. There was: it asserted that a chain frame costs more
+   than the same turnaround without a dispatch. True, and about 5 ns of truth
+   against two rows whose run-to-run spread is fifteen — it failed on the first
+   run where the noise went the other way. A check that reports the weather is
+   not a check. The dispatch difference is printed and not asserted, and what
+   it was trying to establish is what assertion 1 establishes exactly.
+
+### What changed, and by how much
+
+One change: `drainDue` was split into `takeDue` and `runDue`, `takeDue`
+compacts `gPending` in place instead of building a replacement seq, and the
+drain thread reuses one snapshot buffer instead of allocating a fresh one every
+frame. The two callers that are *not* the drain thread — `runPending` when the
+hook has gone quiet, and a drain re-entered from inside a callback — still take
+a local buffer, which is what makes the shared one safe to have.
+
+| operation | before | after | |
+|---|---:|---:|---:|
+| `mainDrain`, queue empty | 3.13 | 2.84 | unchanged; both are the gate |
+| `mainDrain`, one entry queued, not due | 248.2 | 32.1 | **7.7×** |
+| `enqueue` + `takeDue` | 349.8 | 84.6 | **4.1×** |
+| `enqueue` + `mainDrain`, one chain frame | 626.8 | 89.9 | **7.0×** |
+| host allocations per chain frame | 2 | **0** | |
+
+The before column is the same binary with `takeDue` restored to the shape it
+had and `mainDrain` calling `drainDue`, built and measured the same afternoon —
+one run of it against a median of three of the after, which is fine at these
+ratios and would not be at a ratio near one.
+Two allocations a frame is 120 a second at 60 fps, which is not a stutter and
+was never going to be one — the point is the seven-fold, and that the number
+existed at all where the table said `not measured`.
 
 ## What a mod should actually do
 

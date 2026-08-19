@@ -43,6 +43,17 @@ static void* aowl_harness_load(const char* p) {
 static uint32_t aowl_harness_error(void) { return (uint32_t)GetLastError(); }
 static void aowl_harness_sleep(int32_t ms) { Sleep((DWORD)ms); }
 
+/* The clock, for the one row of the frame bench that has to be timed from
+   *outside* the host: what a `call` costs the caller, ABI crossing and reply
+   string included. The host cannot time that one, because half of it is the
+   caller's own copy of the reply out of the buffer the host allocated. */
+static int64_t aowl_harness_qpc(void) {
+  LARGE_INTEGER v; QueryPerformanceCounter(&v); return (int64_t)v.QuadPart;
+}
+static int64_t aowl_harness_qpf(void) {
+  LARGE_INTEGER v; QueryPerformanceFrequency(&v); return (int64_t)v.QuadPart;
+}
+
 /* A stand-in IL2CPP runtime, for exercising the host paths the real one
    cannot reach outside the game. Loaded before the host and started after it,
    so the host's "wait for the runtime" poll is exercised rather than skipped. */
@@ -730,6 +741,8 @@ proc harnessLoad(path: cstring): nil pointer {.
   importc: "aowl_harness_load", nodecl.}
 proc harnessError(): uint32 {.importc: "aowl_harness_error", nodecl.}
 proc harnessSleep(ms: int32) {.importc: "aowl_harness_sleep", nodecl.}
+proc harnessQpc(): int64 {.importc: "aowl_harness_qpc", nodecl.}
+proc harnessQpf(): int64 {.importc: "aowl_harness_qpf", nodecl.}
 proc rtLoad(path: cstring): int32 {.importc: "aowl_rt_load", nodecl.}
 proc rtInit(): int32 {.importc: "aowl_rt_init", nodecl.}
 proc rtTickCount(): int32 {.importc: "aowl_rt_tick_count", nodecl.}
@@ -781,6 +794,12 @@ goes. It fails on a *trend*, not a threshold: a table that grows with the cycle
 count is a leak whatever its absolute size. The mods directory must not hold a
 mod that patches the same methods the run does; a stage with clientprobe alone
 is what it expects.
+
+--frame-bench N needs --runtime too. It arms a benchmark of the host's own
+per-frame path and lets the drain thread run it, inside the frame, so what is
+timed is the drain on the thread that pays for it rather than a copy of it in
+this binary. It prints a table and asserts four things about it, including that
+an armed per-frame chain costs the host no allocations at all.
 """
 
 proc parseCount(s: string; into: var int): bool =
@@ -1329,6 +1348,201 @@ proc numAfter(doc, key: string): int64 =
   if not any:
     return -1
   result = (if neg: -v else: v)
+
+proc hostAskArgs(target, args: string): string =
+  var t = target
+  var a = args
+  if churnCall(toCString(t), toCString(a)) != 0'i32:
+    return ""
+  result = replyText()
+
+proc rowNs(doc, op: string): int64 =
+  ## The `ps` figure of the row whose `op` is `op`, or -1.
+  ##
+  ## Picoseconds rather than nanoseconds because two of the four rows are a
+  ## handful of instructions, and a nanosecond figure rounds a change of thirty
+  ## percent in the empty-queue drain to no change at all.
+  result = -1
+  let needle = "\"op\":\"" & op & "\""
+  let at = find(doc, needle)
+  if at < 0:
+    return
+  result = numAfter(doc.substr(at), "ps")
+
+proc psText(ps: int64): string =
+  ## Picoseconds as nanoseconds with two decimals. Written out because the two
+  ## cheap rows are single-digit nanoseconds and an integer would report every
+  ## one of them as "5".
+  if ps < 0'i64:
+    return "n/a"
+  let whole = ps div 1000'i64
+  let frac = ps mod 1000'i64
+  var f = $(frac div 10'i64)
+  if f.len < 2: f = "0" & f
+  result = $whole & "." & f
+
+proc benchTable(root: string; iters: int): int =
+  ## The per-frame path, measured inside the host on the host's drain thread.
+  ##
+  ## The whole point of measuring it there rather than here: the drain runs on
+  ## whichever thread won the detoured method, with the host's allocator and
+  ## the host's lock. A loop in this binary would be timing a copy of the code
+  ## rather than the code, and would say nothing about either.
+  heading "Per-frame path"
+  var problems = 0
+
+  if churnBind() == 0'i32:
+    err "the host does not export the entry points this drives"
+    return 1
+
+  let armed = hostAskArgs("aowlspt.host::frame_bench_arm", "[" & $iters & "]")
+  if find(armed, "\"armed\":true") < 0:
+    err "the host would not arm the frame bench: " & armed
+    note "it refuses when no per-frame method bound, because then there is " &
+         "no frame to measure and the drain is on the host's own thread"
+    return 1
+  ok "armed for " & $iters & " iterations; waiting for a frame to run it"
+
+  var report = ""
+  var waited = 0
+  while waited < 30000:
+    harnessSleep(250'i32)
+    waited = waited + 250
+    report = hostAsk("aowlspt.host::frame_bench")
+    if find(report, "\"rows\"") >= 0:
+      break
+  if find(report, "\"rows\"") < 0:
+    err "no report after " & $waited & "ms; the drain never fired"
+    return 1
+
+  let empty = rowNs(report, "mainDrain, queue empty")
+  let held = rowNs(report, "mainDrain, one entry queued not due")
+  let turn = rowNs(report, "enqueue + takeDue, no dispatch")
+  let chain = rowNs(report, "enqueue + mainDrain, one chain frame")
+  let dispatches = numAfter(report, "dispatches")
+  let chainFrames = numAfter(report, "chainFrames")
+  let allocDelta = numAfter(report, "allocDelta")
+
+  line ""
+  line "  operation                                        ns/op"
+  line "  ---------------------------------------------  -------"
+  line "  mainDrain, queue empty                         " & psText(empty)
+  line "  mainDrain, one entry queued, not yet due        " & psText(held)
+  line "  enqueue + takeDue, no dispatch                  " & psText(turn)
+  line "  enqueue + mainDrain, one armed chain frame      " & psText(chain)
+  line ""
+  line "  what those are made of:"
+  line "  cMqEnter alone, the gate                        " &
+       psText(rowNs(report, "cMqEnter alone, the gate"))
+  line "  cMqLock + cMqUnlock, uncontended                " &
+       psText(rowNs(report, "cMqLock plus cMqUnlock, uncontended"))
+  line "  cNowMs                                         " &
+       psText(rowNs(report, "cNowMs"))
+  line ""
+
+  # And the one row that cannot be timed inside the host, because half of it is
+  # the caller's: an ABI `call` in and a reply string out. `patch_stats` is a
+  # host-internal target, so no game type is resolved and no method invoked --
+  # what is left is exactly the crossing and the marshalling. A mod reaching
+  # the *game* pays this on top of `perfbench`'s boxed-call figure.
+  var probeArgs = "[]"
+  var probeTarget = "aowlspt.host::patch_stats"
+  discard churnCall(toCString(probeTarget), toCString(probeArgs))
+  let callIters = 20000
+  let q0 = harnessQpc()
+  for k in 0 ..< callIters:
+    discard churnCall(toCString(probeTarget), toCString(probeArgs))
+  let q1 = harnessQpc()
+  let freq = harnessQpf()
+  var callPs = -1'i64
+  if freq > 0'i64:
+    callPs = ((q1 - q0) * 1000000000000'i64) div (freq * int64(callIters))
+  # The same crossing with the reply taken out of it: a malformed target is
+  # refused after the two argument copies and before anything is built, so the
+  # gap between these two rows is what building and handing back a hundred
+  # bytes of JSON costs.
+  var badTarget = "not-a-target"
+  discard churnCall(toCString(badTarget), toCString(probeArgs))
+  let r0 = harnessQpc()
+  for k in 0 ..< callIters:
+    discard churnCall(toCString(badTarget), toCString(probeArgs))
+  let r1 = harnessQpc()
+  var refusedPs = -1'i64
+  if freq > 0'i64:
+    refusedPs = ((r1 - r0) * 1000000000000'i64) div (freq * int64(callIters))
+
+  line "  host `call` round trip from another binary, reply string included:"
+  line "  aowlspt.host::patch_stats                      " & psText(callPs)
+  line "  a malformed target, refused before any reply    " & psText(refusedPs)
+  line ""
+  line "  " & $dispatches & " callbacks dispatched, " & $allocDelta &
+       " host allocations over " & $chainFrames & " chain frames"
+  line ""
+
+  # --- the assertions ------------------------------------------------------
+  #
+  # Every one of these is written so that it fails if the thing it names stops
+  # happening, and not merely if a number moves. A timing threshold on its own
+  # would be noise wearing a check's clothes.
+
+  # 1. The loop dispatched. Without this every row below is a benchmark of a
+  #    drain that dropped its queue on the floor, which would time beautifully.
+  if dispatches < chainFrames:
+    err "the chain loop ran " & $chainFrames & " frames but the host's " &
+        "callback counter moved by " & $dispatches &
+        "; the drain is not dispatching what it dequeues"
+    return 1
+  ok $dispatches & " callbacks were dispatched through the ABI trampoline, " &
+     "one per armed frame"
+
+  # 2. The steady state allocates nothing. This is the property the drain was
+  #    rewritten for, and it is the one assertion here that a person could not
+  #    have written before the rewrite: the old drain built a fresh `due` seq
+  #    and a fresh `keep` seq every frame and handed the second to `gPending`,
+  #    so this number was two per frame -- 40000 over this loop, not zero.
+  #    The counter is mimalloc's cumulative block count inside the *host*, so
+  #    nothing on the free path can lower it back to a passing figure.
+  if allocDelta < 0'i64:
+    err "the host could not read its own allocation counter"
+    return 1
+  if allocDelta != 0'i64:
+    err "the drain made " & $allocDelta & " host allocations over " &
+        $chainFrames & " frames of an armed chain; the steady state is " &
+        "supposed to reuse its buffers"
+    return 1
+  ok "an armed per-frame chain cost the host 0 allocations over " &
+     $chainFrames & " frames"
+
+  # 3. The gate is doing its job: a frame with nothing queued must be cheaper
+  #    than a frame that has to walk the queue. If `cMqEnter` ever stopped
+  #    short-circuiting, these two would converge -- and nothing else here
+  #    would notice.
+  if empty <= 0'i64 or held <= 0'i64:
+    err "a row came back at or below zero; the clock is not resolving this"
+    return 1
+  if empty >= held:
+    err "an empty-queue frame (" & psText(empty) & ") costs at least as much " &
+        "as one with an entry to walk (" & psText(held) & "); the lock-free " &
+        "empty check is not short-circuiting"
+    return 1
+  ok "an empty frame is cheaper than a frame that walks the queue (" &
+     psText(empty) & " against " & psText(held) & ")"
+
+  # There was a fourth check here and it is gone on purpose. It asserted that
+  # a chain frame costs more than the same queue turnaround without a
+  # dispatch -- true, and about 2.5 ns of truth, against two rows whose
+  # run-to-run spread is fifteen. It failed on the first run where the noise
+  # went the other way, which is a check reporting the weather. What it was
+  # trying to establish -- that the callback is really on the measured path --
+  # is what the dispatch counter above establishes exactly, and the counter
+  # cannot be satisfied by a fast afternoon.
+  line "  the dispatch itself is " & psText(chain - turn) &
+       " of the chain frame, which is inside the run-to-run spread of both " &
+       "rows; it is reported and not asserted"
+
+  note "these are tests/mockil2cpp, not Tarkov: what they establish is the " &
+       "host's own per-frame cost, on a stand-in's frame loop"
+  result = problems
 
 proc takeSample(cycle: int): Sample =
   let t = hostAsk("aowlspt.host::table_stats")
@@ -1943,6 +2157,7 @@ proc main(): int =
   var runtimeDll = ""
   var sleepFor = -1
   var churnCycles = 0
+  var frameBenchIters = 0
   var i = 1
   let n = paramCount()
   while i <= n:
@@ -1962,6 +2177,10 @@ proc main(): int =
     elif a == "--churn":
       inc i
       if i <= n: discard parseCount(paramStr(i), churnCycles)
+    elif a == "--frame-bench":
+      inc i
+      frameBenchIters = 20000
+      if i <= n: discard parseCount(paramStr(i), frameBenchIters)
     elif a == "--help" or a == "-h":
       echo Usage
       return 0
@@ -2040,6 +2259,16 @@ proc main(): int =
       err "the mock runtime would not start"
       return 1
     ok "mock runtime started; the host should pick it up on its next poll"
+
+  if frameBenchIters > 0:
+    if not haveRuntime:
+      err "--frame-bench needs --runtime: without one nothing detours a " &
+          "per-frame method, so the drain never reaches the game's thread " &
+          "and there is no frame to measure"
+      return 1
+    # Long enough for the runtime poll, the drain bind and the mods to settle.
+    harnessSleep(6000'i32)
+    return benchTable(root, frameBenchIters)
 
   if churnCycles > 0:
     if not haveRuntime:

@@ -1068,6 +1068,23 @@ proc cmdTest(e: Env): int =
                   harness & " " & quoted(stage) & " --runtime " &
                   quoted(mockDll) & " --seconds 8")
 
+      # And the host's own half of a frame, which `perfbench` cannot see: it
+      # never loads the host, so until this existed the per-frame cost of the
+      # drain had never been timed at all. This runs *inside* a frame, on the
+      # drain thread, out of a detoured per-frame method.
+      #
+      # Three of its lines are assertions rather than timings, and they are the
+      # reason it belongs in the gate rather than in a notebook. The dispatch
+      # count catches the failure that would otherwise make every row look
+      # wonderful -- a drain that discards the queue instead of running it
+      # benchmarks beautifully. The allocation count is the actual regression
+      # guard: the drain reuses one buffer and allocates nothing per frame, and
+      # against the shape it replaced this line reads 40000 and fails.
+      discard run(e, "the host's own per-frame cost, and the drain allocating " &
+                     "nothing to pay it",
+                  harness & " " & quoted(stage) & " --runtime " &
+                  quoted(mockDll) & " --frame-bench 20000")
+
       # The fast path, measured rather than asserted. It runs in the gate
       # because a performance claim that is not re-checked is a performance
       # claim that quietly stops being true.
