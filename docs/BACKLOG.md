@@ -191,7 +191,7 @@ of the whole repository:
 | the installer's refusal matrix | **126** automated checks (`installer\build\test-installer.exe`, re-run 2026-08-19: *"126 passed, 0 failed"*) |
 | the filesystem layer | against a real temporary directory |
 | build → payload → install → verify → launch | end to end, against a synthetic install |
-| the whole first-run path | `tools/firstrun.nim` — **not re-run this pass**, see below |
+| the whole first-run path | **64** checks (`installeruildirstrun.exe --scratch <dir>`, re-run 2026-08-19, 0 failed) — a synthetic vanilla client through install, a 39 MiB `importdb`, verify, the boot sequence against real data, live mod control, and a restart with the profile and the selection intact |
 | the host inside a foreign process | injected, loaded its mods, reported the runtime absent |
 | the backend and the emulator | answered the client's boot sequence over the wire |
 | **the real client** | **never** |
@@ -215,15 +215,35 @@ the last person who did:
 | `hostharness` against the stand-in runtime | **27** assertions | `hostharness.exe <stage> --runtime tests\mockil2cpp\GameAssembly.dll` |
 | `fakeregistry --check`, document + transport | **27**, 1 skipped | `python registry\fakeregistry.py --check --regcheck …` (44 with `--manager`, which needs a staged manager) |
 
-**`tools/firstrun.nim` could not be re-run**, and the reason is itself a
-finding: `installer/payload/aowlspt/` currently holds the host, the launcher and
-`aowlspt-host.json` and **no `aowlspt-backend.exe`**, so `firstrun` installs a
-target it cannot start and fails at step 8 with *"could not spawn …
-aowlspt-backend.exe"*. `aowl payload` would now refuse to produce that directory
-— the three-binary refusal below — so what is on disk predates the refusal. The
-`aowlspt-verify` run inside it reported **28 checks, 1 failed**; this document
-used to say "all thirty-one checks", which was not a number anybody could
-reproduce and is retired rather than corrected.
+**`tools/firstrun.nim` runs, and the row above is measured rather than
+inherited.** This paragraph used to say it *could not* be re-run, and gave the
+reason: `installer/payload/aowlspt/` held the host, the launcher and
+`aowlspt-host.json` and **no `aowlspt-backend.exe`**, so `firstrun` installed a
+target it could not start and failed at step 8 with *"could not spawn …
+aowlspt-backend.exe"*.
+
+That was true of the directory on disk and was never true of the payload step.
+`aowl payload` stages all three binaries and **errors and returns 1** if any is
+missing, so what had been observed was a directory assembled before the refusal
+existed, left lying about. It has since been restaged: 32 files, host, backend,
+launcher, registry and all ten mod libraries. Re-run 2026-08-19 the whole walk
+completes — **64 checks, 0 failed**, nothing skipped.
+
+Two numbers worth keeping out of it. **Cold boot on an empty store 1524 ms,
+restart on a warm one 525 ms** — a delta of 999 ms, which is the store being
+built rather than read. And the `aowlspt-verify` inside the walk reports **28**
+checks; this document used to say "all thirty-one checks", which was not a
+number anybody could reproduce and is retired rather than corrected.
+
+The failure that hid all this is worth naming, because it is the same species as
+the rest of this document and `firstrun` now refuses it: **the symptom appeared
+three steps and two minutes after the cause.** A tree missing its backend was
+diagnosed at step 8, when the spawn failed, rather than at step 5, when the
+install produced it. The walk now halts as soon as the installed tree lacks
+`aowlspt-backend.exe` or the host DLL, and says which and what to re-run.
+Verified by taking the backend out of the payload deliberately: the walk stops
+at **26 checks, exit 1**, with the diagnosis — so the 64 are checks that can
+fail.
 
 > The gap in the last row is the whole gap. Everything above it says the pipeline
 > is sound; none of it says the game starts.

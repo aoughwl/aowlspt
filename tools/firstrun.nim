@@ -6,10 +6,13 @@
 ##     firstrun --scratch C:\scratch\firstrun --source D:\Games\Tarkov --keep
 ##
 ## Every piece of this pipeline is tested in isolation and each of those tests
-## is good: 122 checks on the installer's refusal matrix, 35 on an installed
-## tree, 81 on the emulator against an imported database, a live mod-control
-## test, a host driven against a stand-in IL2CPP runtime. None of them runs the
-## pieces **in order**, and the order is where a first run breaks:
+## is good: the installer's refusal matrix, an installed tree, the emulator
+## against an imported database, a live mod-control test, a host driven against
+## a stand-in IL2CPP runtime. Their counts are not quoted here, because a number
+## copied into a comment goes stale the next time the suite grows and then
+## misinforms with authority -- `docs/BACKLOG.md` carries them, re-measured.
+## None of them runs the pieces **in order**, and the order is where a first
+## run breaks:
 ##
 ##  * `aowl build` fails one mod and `aowl payload` stages that mod's config
 ##    anyway. That used to exit 0, and three commands later `aowlspt-verify`
@@ -741,6 +744,27 @@ proc main(): int =
   check("there is an uninstall manifest",
         fileExists(joinPath(target, "aowlspt-install.txt")),
         "`aowlspt-install uninstall` would refuse to run")
+
+  # Stop here rather than three steps later. A payload assembled before `aowl
+  # payload` learned to refuse one carries the host and the launcher and no
+  # `aowlspt-backend.exe`; every check above reports that honestly and the walk
+  # then carries on to step 8 and dies as *"could not spawn ...
+  # aowlspt-backend.exe"* -- which is the symptom, printed three steps and two
+  # minutes away from the cause, and is what a reader of that output blames on
+  # the spawn. The binaries the rest of this walk *runs* are worth a gate of
+  # their own; the checks above are the diagnosis and this is only the halt.
+  if not fileExists(joinPath(aowlDir, "aowlspt-backend.exe")) or
+     not fileExists(joinPath(aowlDir, "aowlspt-host-il2cpp.dll")):
+    heading "Result"
+    line "  " & $gChecks & " checks"
+    err "the installed tree has no backend and/or no client host; steps 6-10 " &
+        "run against those two binaries and there is nothing to run"
+    note "this walk installs `installer\\payload`. `aowl payload` refuses to " &
+         "assemble one without them, so a payload missing them was staged " &
+         "before that refusal or edited by hand: run `aowl build` and then " &
+         "`aowl payload`, and walk again."
+    note "the scratch root was left at " & o.scratch & " to look at"
+    return 1
 
   # ------------------------------------------------------------ 6. database
   #
