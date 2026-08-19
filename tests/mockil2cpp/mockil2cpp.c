@@ -827,10 +827,19 @@ static MockMethod g_worldMethods[] = {
  * `Health` is a `System.Single` at offset 16 of a Player object. A binding
  * that decides staticness by asking whether the offset falls inside the
  * instance size cannot tell them apart -- it reads a float's bits as an int
- * and answers 1091567616 with total confidence. That is the failure this block
- * exists to make reachable, and the reason `mock_player_spawn_count` is
- * exported: the *runtime's* view of the value is the only thing that can say
- * whether a write landed in the static block or in some object. */
+ * and answers with total confidence. That is the failure this block exists to
+ * make reachable, and the reason `mock_player_spawn_count` is exported: the
+ * *runtime's* view of the value is the only thing that can say whether a write
+ * landed in the static block or in some object.
+ *
+ * This comment used to name the wrong answer as 1091567616, which is 9.0f and
+ * is a value `health` never holds here: it is initialised to 100.0f
+ * (0x42C80000, 1120403456) and every `Hurt` call moves it, so the wrong read
+ * answers whatever the float happens to be at that moment reinterpreted. A
+ * checker must therefore compare against the bits of the *live* float rather
+ * than against a constant -- which is what `mods/classicmovement`'s guard does,
+ * and it is why that guard is a real check and a hard-coded number would not
+ * have been. */
 static struct {
     unsigned char pad[16];
     int32_t       spawnCount;   /* offset 16 */

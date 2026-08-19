@@ -101,6 +101,17 @@
 ## a lean delay is a stutter, not a feature, so both were left out with the
 ## number attached rather than a shrug.
 ##
+## **That third sentence is off by a factor of sixty, and it is the sentence two
+## refusals were decided on.** Forty contexts at a microsecond each is 40 us of
+## work *in a frame*; 2.4 ms is what the same work costs *in a second*. Against
+## a 60 fps frame's 16.67 ms the true share is **0.24%**, not fifteen percent --
+## and the percentage was wrong twice over, because a per-second total was being
+## divided by a per-frame budget. The arithmetic now lives in `frameShareText`
+## below rather than in prose, every sentence that quotes it calls it, and the
+## self-test asserts it. See "The frame budget" further down for the full
+## re-derivation and for what happened to the two refusals when the premise
+## moved two orders of magnitude: both were overturned and both are implemented.
+##
 ## **ABI revision 3 turns a handle into an address.** `thisPointer(args)` gives
 ## the `Il2CppPtr` that `bindOnObject` takes, measured at 8 ns against 1148 for
 ## the boxed read it replaces (docs/PERF.md). The redirect and the `IsAI` read
@@ -1000,6 +1011,113 @@ proc armAimingSlowdown() =
     gAimState = "refused: " & lastError()
 
 # ---------------------------------------------------------------------------
+# The frame budget, and the arithmetic two refusals were decided on
+# ---------------------------------------------------------------------------
+#
+# This file used to do this sum in prose, in five places, and it was wrong in
+# all five by the same factor of sixty. It said the boxed redirect cost
+# "2.4 ms a frame with forty bots" and called that "fifteen percent of a frame
+# budget"; it said the JSON form's 2.2 us was "5.3 ms a frame" and the typed
+# form's 25 ns "60 us". Every one of those is a **per-second** total wearing a
+# per-frame label. Forty contexts at 1 us each is 40 us of work in a frame and
+# 2.4 ms of work in a second; the percentage then inherited the same factor,
+# because a second's total was divided by a frame's budget. 0.24% was written
+# down as fifteen percent.
+#
+# It survived because it was wrong *consistently*. 2.4 ms against 60 us is the
+# same hundredfold as the 1 us against 25 ns underneath, so every comparison
+# the file drew from these numbers was sound and only the verdicts were not.
+# A consistent error is the kind that lives longest, and the same species turned
+# up in docs/ARCHITECTURE.md the same day.
+#
+# So it is a function now, and the sentences quote the function.
+#
+# **The derivation, from what the code does rather than from what it said.**
+#
+#  * *What fires, per what.* `InertiaSmoothTilt` and
+#    `PlayerAnimatorSetDeltaRotation` are instance methods on a movement
+#    context and the game runs them once per context per frame. The unit is
+#    therefore **firings per frame = contexts**, and the worst case this mod
+#    plans for is a full bot population: forty.
+#  * *What one firing costs.* From docs/PERF.md, every row against
+#    `tests/mockil2cpp` on one machine and none of it against BSG's client:
+#    a JSON prefix hook dispatch is 626.5 ns; a boxed call with the class in
+#    hand is 951.5 ns and by name 1103.6; a boxed property read through a
+#    handle is 1112; `pointerOf` is 8; a bound instance call with one float is
+#    8.4; a typed prefix hook is 23.08. Those add up into the three shapes this
+#    hook can take, named as constants below.
+#  * *Against what budget.* One frame at 60 fps is 16.67 ms -- `FrameNs`. Not a
+#    second, which is the whole of the mistake. At 144 fps it is 6.94 ms, so
+#    every share below roughly doubles and none of the verdicts change.
+#
+# Which gives, per frame, at forty contexts:
+#
+#   | shape | per firing | per frame | share of a 60 fps frame |
+#   |---|---:|---:|---:|
+#   | typed hook, revision 4 | 25 ns | 1.0 us | 0.006% |
+#   | JSON hook + `thisPointer`, revision 3 | 2200 ns | 88 us | 0.528% |
+#   | JSON hook + a boxed call on the handle, revision 2 | 1600 ns | 64 us | 0.384% |
+#   | one boxed `IsAI` read on the handle, revision 2 | 1112 ns | 44 us | 0.267% |
+#   | *what the old prose assumed* | 1000 ns | 40 us | **0.240%**, not 15% |
+#
+# The 2200 for the revision-3 shape is the ceiling this file has quoted since
+# the port and it is **not measured**: PERF.md's parts add to about 700 ns
+# (626 dispatch + 8 `pointerOf` + a bound call + the payload scans), and 2200 is
+# kept anyway because a decision taken on the pessimistic figure stays right
+# when the real one arrives. The typed 25 ns *is* measured, in-client, by
+# `tiltCostNs`.
+
+const
+  BusiestContexts = 40
+    ## Movement contexts alive in the worst raid this mod plans for. The unit
+    ## that matters: it is also firings **per frame**, because these methods run
+    ## once per context per frame.
+  FrameNs = 16_666_667
+    ## One frame at 60 fps, in nanoseconds. The denominator that was missing.
+  TiltTypedNs = 25
+    ## Typed hook, revision 4. Measured in-client by `tiltCostNs`; PERF.md's
+    ## typed prefix hook is 23.08 ns on the stand-in.
+  TiltAddressNs = 2200
+    ## JSON hook plus `thisPointer` plus a bound call, revision 3. An unmeasured
+    ## ceiling -- see above.
+  TiltBoxedNs = 1600
+    ## JSON hook plus one boxed call on the handle, revision 2: 626.5 + 951.5,
+    ## the two rows PERF.md measures for exactly those two steps.
+  IsAiBoxedNs = 1112
+    ## One boxed property read through a handle, revision 2. PERF.md measures
+    ## `get_Health` that way at 1112 ns.
+
+proc perFrameNs(nsPerFiring: int): int =
+  ## What `BusiestContexts` firings of something cost **in one frame**.
+  ##
+  ## Multiplying by 60 as well is the bug this proc exists to make unrepeatable:
+  ## that answers what they cost in a *second*, and a second is not what a frame
+  ## budget is measured against.
+  BusiestContexts * nsPerFiring
+
+proc perFrameUs(nsPerFiring: int): int = perFrameNs(nsPerFiring) div 1000
+
+proc frameShareMilli(nsPerFiring: int): int =
+  ## Share of one 60 fps frame, in thousandths of a percent. 240 is 0.240%.
+  ##
+  ## Rounded rather than truncated, and the half added on is not cosmetic: the
+  ## true share of a frame for forty firings at 1 us is 0.239999...%, so a
+  ## floor answers 239 and the file's headline figure of 0.240% would have read
+  ## as an off-by-one against its own function. A rounding rule chosen after
+  ## seeing what it answers is worth saying out loud, so: this one was.
+  let n = int64(perFrameNs(nsPerFiring)) * 100_000'i64
+  int((n + int64(FrameNs) div 2'i64) div int64(FrameNs))
+
+proc frameShareText(nsPerFiring: int): string =
+  ## "88 us a frame, 0.528% of a 60 fps frame" -- the sentence, from the sum.
+  let m = frameShareMilli(nsPerFiring)
+  var frac = $(m mod 1000)
+  while frac.len < 3: frac = "0" & frac
+  result = $perFrameUs(nsPerFiring) & " us a frame with " &
+           $BusiestContexts & " contexts, " & $(m div 1000) & "." & frac &
+           "% of a 60 fps frame"
+
+# ---------------------------------------------------------------------------
 # Effect 4: OldTiltingFix
 # ---------------------------------------------------------------------------
 #
@@ -1015,6 +1133,16 @@ proc armAimingSlowdown() =
 # which with forty bots at 60 fps is 2.4 ms a frame. That is fifteen percent of
 # a frame budget to remove a lean delay, and shipping it would have been
 # shipping a stutter.
+#
+# **The last two sentences are wrong by sixty and are kept here so the record
+# is.** 2.4 ms is what that costs in a second; in a frame it is 40 us, which is
+# 0.24% -- and the boxed shape measured properly (626.5 ns of hook dispatch plus
+# 951.5 for a call with the class in hand) is 1.6 us a firing, so
+# `frameShareText(TiltBoxedNs)` a frame. That is not a stutter and it was never
+# a reason. What was actually true is that the boxed form is a hundredfold
+# worse than the address one for no gain *on a host that has addresses*; on a
+# host that does not, it is affordable and is now what runs. See
+# `onInertiaSmoothTiltBoxed`.
 #
 # ABI revision 3 gives `thisPointer(args)`: the address behind that handle, in
 # about 8 ns. The redirect is now a bound call on the object the hook fired
@@ -1069,6 +1197,66 @@ proc onInertiaSmoothTilt(target, args: string): HookResult =
   result = stopVoid()
 
 # ---------------------------------------------------------------------------
+# ...and the same redirect with nothing but the handle
+# ---------------------------------------------------------------------------
+#
+# **This is a refusal that was overturned.** On a host below ABI revision 3
+# there is no `pointerOf`, so `this` is a handle and nothing else, and this
+# effect used to refuse outright with "the redirect would be a boxed call per
+# context per frame -- about 2.4 ms a frame with forty bots". The 2.4 ms was a
+# per-second total (see "The frame budget"): per frame the boxed shape is
+# 626.5 ns of hook dispatch plus 951.5 ns for a call with the class already in
+# hand, so 1.6 us a firing and `frameShareText(TiltBoxedNs)`. Refusing a
+# feature over a third of one percent of a frame is not a performance decision,
+# it is an arithmetic mistake, so the effect arms here instead.
+#
+# `GameObj` over the payload's handle rather than `thisHandle` + a raw `call`:
+# the `#n::` target form is the one PERF.md measures at 951.5, and it resolves
+# the method against **the object's own class**, which is the same non-virtual
+# guarantee `bindOnObject` gives the address path. A context that is really a
+# subclass gets the subclass's `LegacySmoothTilt`.
+#
+# The handle is **not released**. It is the host's, on loan for the duration of
+# the handler, and the host reclaims it on return; releasing it here would be
+# freeing something twice.
+#
+# **The suppression is conditional, and that is the whole of the risk.** The
+# address path suppresses after a call that cannot really fail (a bound call to
+# a compiled method). A boxed call can fail for a dozen host reasons, and
+# suppressing the original after one has failed is a lean frozen mid-tilt that
+# only shows up in a raid. So the replacement runs first and the original is
+# suppressed only if it came back `ok`. The self-test asserts exactly this, on
+# a host where the call is guaranteed to fail.
+#
+# **It has never run.** Every host in this tree reports revision 4, so nothing
+# here has executed this path in anger; it is an argument from code, and the
+# only part of it the self-test can execute is the failure branch.
+
+var gTiltBoxedRefused = 0
+  ## Firings where the boxed replacement could not be reached and the original
+  ## was let through. A non-zero count here is the effect not working; it is
+  ## still much better than the alternative, which is a lean that stops moving.
+
+proc onInertiaSmoothTiltBoxed(target, args: string): HookResult =
+  result = carryOn()
+  let h = thisHandle(args)
+  if h == 0'u64:
+    return
+  var okA = false
+  var okB = false
+  let a = argFloat(args, 0, okA)
+  let b = argFloat(args, 1, okB)
+  if not okA or not okB:
+    return
+  let ctx = GameObj(handle: h, typeName: TyCtx, ok: true)
+  let r = invoke(ctx, "LegacySmoothTilt", v(a), v(b))
+  if not r.ok:
+    gTiltBoxedRefused = gTiltBoxedRefused + 1
+    return
+  gTiltRedirects = gTiltRedirects + 1
+  result = stopVoid()
+
+# ---------------------------------------------------------------------------
 # ...and the same redirect on the typed path
 # ---------------------------------------------------------------------------
 #
@@ -1076,8 +1264,11 @@ proc onInertiaSmoothTilt(target, args: string): HookResult =
 # than ABI revision 4 has nothing else. This is the same redirect written
 # against the register frame, and it is the form this hook should actually be
 # in: `InertiaSmoothTilt` runs once per movement context per frame, so with
-# forty bots at 60 fps the JSON version's ~2.2 us is 5.3 ms a frame, and this
-# one's ~25 ns is 60 us.
+# forty bots at 60 fps the JSON version's ~2.2 us is 88 us a frame and this
+# one's ~25 ns is 1.0 us. (This used to read "5.3 ms a frame" and "60 us": both
+# were per-*second* totals, and both are now `frameShareText` calls so they
+# cannot drift apart from the sum again. The hundredfold between them was
+# always right, which is why nobody noticed.)
 #
 # Line for line it is the same decision. What is gone is the machinery around
 # it: `thisPointer` was a handle lookup, a GC handle the host took out and gave
@@ -1090,7 +1281,9 @@ var gTiltTypedNs = 0'i64
 var gTiltTypedSamples = 0
 var gTiltTyped = false
   ## Which form armed. Reported in the effect's state, because "armed" without
-  ## saying which would hide the difference between 25 ns and 2.2 us a frame.
+  ## saying which would hide the difference between 25 ns and 2.2 us a firing.
+  ## ("a frame" is what this said, and a firing is what it meant: forty of them
+  ## fit in a frame.)
 
 proc onInertiaSmoothTiltTyped(f: PatchFrame): TypedResult =
   let measuring = gTiltTypedSamples < CostSamples
@@ -1171,17 +1364,30 @@ proc armOldTilting() =
                  "redirected into"
     return
   if not livePointersReady():
-    gTiltState = "refused: this host cannot turn a handle into an address " &
-                 "(ABI revision 3), so the redirect would be a boxed call per " &
-                 "context per frame -- about 2.4 ms a frame with forty bots"
+    # This used to `return` here, refused, with "the redirect would be a boxed
+    # call per context per frame -- about 2.4 ms a frame with forty bots". The
+    # 2.4 ms was per second. Per frame the boxed shape is
+    # `frameShareText(TiltBoxedNs)`, so the refusal is withdrawn and the boxed
+    # form arms instead. What is *not* withdrawn is the warning: it is a
+    # hundredfold worse than the address path and it has never been run.
+    if hookArgs(TyCtx & "::InertiaSmoothTilt", onInertiaSmoothTiltBoxed) == Ok:
+      gTiltState = "armed on the handle-only path (this host has no " &
+                   "pointerOf, so the redirect is a boxed call on `this` at " &
+                   "~" & $TiltBoxedNs & " ns a firing -- " &
+                   frameShareText(TiltBoxedNs) & "). This used to be a " &
+                   "refusal quoting 2.4 ms a frame, which was 2.4 ms a second"
+    else:
+      gTiltState = "refused: " & lastError()
     return
   # The typed form when the host has it, and the JSON one when it does not.
   #
   # Not "typed or nothing": a host at revision 3 can still run this effect, and
-  # 2.2 us a context a frame is a real cost rather than a disqualifying one at
-  # the four or five contexts a solo raid has. It is disqualifying at forty,
-  # which is why the typed form is tried first and which form armed is in the
-  # state line rather than implied.
+  # 2.2 us a context is a real cost rather than a disqualifying one -- at forty
+  # contexts it is `frameShareText(TiltAddressNs)`. The typed form is tried
+  # first because it is a hundredfold cheaper for nothing, not because the JSON
+  # one is unaffordable; which form armed is in the state line rather than
+  # implied. (This comment used to say the JSON form was "disqualifying at
+  # forty". At forty it is half of one percent of a frame.)
   if typedPatchesReady() and
      hookTyped(TyCtx & "::InertiaSmoothTilt", onInertiaSmoothTiltTyped) == Ok:
     gTiltTyped = true
@@ -1191,7 +1397,8 @@ proc armOldTilting() =
     gTiltState = "armed on the JSON path (this host is ABI revision " &
                  $hostApiSize() & " bytes of HostApi, and the typed frame " &
                  "wants revision 4), redirecting into LegacySmoothTilt on " &
-                 "`this` at about 2 us a context a frame"
+                 "`this` at ~" & $TiltAddressNs & " ns a firing -- " &
+                 frameShareText(TiltAddressNs)
   else:
     gTiltState = "refused: " & lastError()
 
@@ -1216,26 +1423,52 @@ proc armOldTilting() =
 # one it is on a post-1.0 build cannot be confirmed from here and both are
 # ordinary. Whichever answers is reported in the effect's state, so the log says
 # what was actually read rather than what was hoped for.
+#
+# **That last sentence was a claim the code could not keep.** `contextIsAi` took
+# a `known: var bool` and set it to true down either branch, so the only thing
+# it could report was *that* one of the two answered -- which is precisely the
+# question nobody has. The log then said "get_IsAI as a property, then IsAI as a
+# field" and let a reader believe the answer was in there somewhere. It takes a
+# `how: var string` now and names the branch it came back from; `gJitterHow`
+# carries it into the report, and the self-test asserts the string against a
+# runtime that really does have `get_IsAI` as a property and one that has
+# neither. Either record which, or stop saying you do.
 
-proc contextIsAi(obj: Il2CppPtr; known: var bool): bool =
-  known = false
+const
+  IsAiViaProperty = "get_IsAI, a property, bound on the context's own class"
+  IsAiViaField = "IsAI, a field, read at its offset"
+    ## The two answers, named once. The self-test compares against these rather
+    ## than against a substring, so a reworded string that stops distinguishing
+    ## the branches fails to compile rather than quietly passing.
+
+proc contextIsAi(obj: Il2CppPtr; how: var string): bool =
+  ## `how` is "" when neither shape answered, and otherwise names the one that
+  ## did. Empty is the only value that means "unknown", so a caller cannot read
+  ## a default as an answer.
+  how = ""
   result = false
   if ensureCall(obIsAiProp, obj, "get_IsAI", noKinds(), fkBool):
-    known = true
+    how = IsAiViaProperty
     var none = noArgs()
     return callBool(obIsAiProp.b, obj, none)
   if ensureField(obIsAiField, obj, "IsAI"):
-    known = true
+    how = IsAiViaField
     return readBool(obIsAiField.f, obj)
+
+var gJitterHow = ""
+  ## Which shape answered, last time one did. Reported rather than assumed: see
+  ## the paragraph above for what this replaced.
 
 proc onDeltaRotation(target, args: string): HookResult =
   let p = thisPointer(args)
   if p == 0'u64:
     return carryOn()
   let obj = cast[Il2CppPtr](p)
-  var known = false
-  let isAi = contextIsAi(obj, known)
-  if not known:
+  var how = ""
+  let isAi = contextIsAi(obj, how)
+  if how.len > 0 and gJitterHow != how:
+    gJitterHow = how
+  if how.len == 0:
     # Neither a property nor a field answered. Suppressing for everything --
     # bots included -- is not what upstream does, and doing it anyway would be
     # a guess about which contexts matter. The original runs.
@@ -1243,6 +1476,61 @@ proc onDeltaRotation(target, args: string): HookResult =
   if isAi:
     gJitterLet = gJitterLet + 1
     return carryOn()
+  gJitterSuppressed = gJitterSuppressed + 1
+  result = stopVoid()
+
+# The same split with nothing but the handle, and the second overturned refusal.
+#
+# This effect used to refuse on a host without `pointerOf`, on the grounds that
+# "telling the player from a bot would be a boxed property get per context per
+# frame" -- a sentence that carried the same 2.4-ms-a-frame arithmetic as the
+# tilt refusal did, from the same paragraph. PERF.md measures that boxed
+# property get through a handle at 1112 ns, so forty of them is
+# `frameShareText(IsAiBoxedNs)`. A quarter of one percent of a frame is a price,
+# not a disqualification, and the refusal is withdrawn.
+#
+# Which shape answered is remembered in `gJitterBoxedHow` so the steady state is
+# **one** boxed call and not two: the property is tried first, and a host where
+# `IsAI` turns out to be a field pays the double cost once rather than every
+# frame. Same conditional-suppression rule as the tilt fallback for the same
+# reason -- if neither read answers, the original runs. Suppressing rotation for
+# every bot in the raid because a read failed is a far worse outcome than a
+# jittery player.
+#
+# Never run: no host in this tree is below revision 3.
+
+var gJitterBoxedHow = ""
+
+proc boxedIsAi(ctx: GameObj; how: var string): bool =
+  how = ""
+  result = false
+  if gJitterBoxedHow != "field":
+    let p = get(ctx, "IsAI")
+    if p.ok:
+      gJitterBoxedHow = "property"
+      how = "get_IsAI, a boxed property get on the handle"
+      return p.asBool(false)
+  let f = field(ctx, "IsAI")
+  if f.ok:
+    gJitterBoxedHow = "field"
+    how = "IsAI, a boxed field read on the handle"
+    return f.asBool(false)
+
+proc onDeltaRotationBoxed(target, args: string): HookResult =
+  result = carryOn()
+  let h = thisHandle(args)
+  if h == 0'u64:
+    return
+  let ctx = GameObj(handle: h, typeName: TyCtx, ok: true)
+  var how = ""
+  let isAi = boxedIsAi(ctx, how)
+  if how.len > 0 and gJitterHow != how:
+    gJitterHow = how
+  if how.len == 0:
+    return
+  if isAi:
+    gJitterLet = gJitterLet + 1
+    return
   gJitterSuppressed = gJitterSuppressed + 1
   result = stopVoid()
 
@@ -1261,9 +1549,18 @@ proc armRemoveJitter() =
                    "inventing the something"
     return
   if not livePointersReady():
-    gJitterState = "refused: this host cannot turn a handle into an address " &
-                   "(ABI revision 3), so telling the player from a bot would " &
-                   "be a boxed property get per context per frame"
+    # Overturned, for the reason above `onDeltaRotationBoxed`: the refusal this
+    # replaced rested on the same off-by-sixty sum as the tilt one, and a boxed
+    # `IsAI` read at forty contexts is a quarter of one percent of a frame.
+    if hookArgs(TyCtx & "::PlayerAnimatorSetDeltaRotation",
+                onDeltaRotationBoxed) == Ok:
+      gJitterState = "armed on the handle-only path (this host has no " &
+                     "pointerOf, so IsAI is a boxed read at ~" &
+                     $IsAiBoxedNs & " ns a firing -- " &
+                     frameShareText(IsAiBoxedNs) & "); the " &
+                     "TRANSFORM_ROTATION_LERP_SPEED write is still out"
+    else:
+      gJitterState = "refused: " & lastError()
     return
   if hookArgs(TyCtx & "::PlayerAnimatorSetDeltaRotation", onDeltaRotation) == Ok:
     gJitterState = "armed, suppressing for the player and letting AI through " &
@@ -1633,6 +1930,16 @@ proc reportWatch() =
   if gJitterLet > 0 or gJitterSuppressed > 0:
     info "    (" & $gJitterSuppressed & " suppressed for the player, " &
          $gJitterLet & " let through for AI)"
+  # Which shape answered, not merely that one did. See `contextIsAi`.
+  if gJitterHow.len > 0:
+    info "    (the player/AI split was read from " & gJitterHow & ")"
+  elif gJitterSuppressed > 0 or gJitterLet > 0:
+    warn "    (the split was decided but nothing recorded how, which should " &
+         "be impossible -- gJitterHow is set on the same branch that decides)"
+  if gTiltBoxedRefused > 0:
+    warn "    (OldTiltingFix: " & $gTiltBoxedRefused & " firings where the " &
+         "boxed LegacySmoothTilt could not be reached and the original was " &
+         "let through, so the lean still ramps)"
   info "  not ported, and why -- re-checked against what the host does " &
        "today rather than what it did when the port was written: " &
        "**GetNewState** is the only permanent one, and it is permanent for a " &
@@ -1640,7 +1947,9 @@ proc reportWatch() =
        "nothing native declares a managed type. InertiaSmoothTilt and " &
        "PlayerAnimatorSetDeltaRotation are **ported**: what blocked them was " &
        "the price of reaching `this` through a host Handle, ~1 us per " &
-       "movement context per frame, and ABI revision 3 turns that handle into " &
+       "movement context per frame -- " & frameShareText(1000) & ", which " &
+       "this file spent months calling 2.4 ms a frame and fifteen percent -- " &
+       "and ABI revision 3 turns that handle into " &
        "an address in 8 ns. The one piece still missing is the second half of " &
        "RemoveJitteryRotationPatch -- upstream's " &
        "TRANSFORM_ROTATION_LERP_SPEED constant, which this port cannot " &
@@ -1730,7 +2039,19 @@ proc probeField(owner, member: string) =
 #   * `EFT.Player::SpawnCount` is **static** and sits at offset 16 of the
 #     class's static block; `EFT.Player::Health` is an instance `Single` at
 #     offset 16 of an object. An offset test cannot tell them apart, and the
-#     wrong answer is `1091567616` rather than a refusal.
+#     wrong answer is `1120403456` rather than a refusal.
+#
+#     That number used to read `1091567616`, which is `9.0f`. The stand-in
+#     initialises `Health` to `100.0f`, and `100.0f` is `0x42C80000` --
+#     1120403456. Nothing in this file's path damages the player, so 9.0 was
+#     never a value this guard could produce; it was a plausible-looking
+#     constant somebody wrote down. It is asserted now rather than quoted: the
+#     check below binds `Health`, re-reads the same offset with the kind forced
+#     to `fkI32` -- which is exactly what the offset-guessing bug did -- and
+#     compares. A wrong constant here goes red instead of reading fine.
+#     (`tests/mockil2cpp/mockil2cpp.c` carries the same 1091567616 in its own
+#     comment; that file is not this mod's to edit and the mismatch is noted
+#     rather than fixed.)
 #   * `UnityEngine.Vector3` is a 12-byte value type, which is what a parameter
 #     the host reports as `{"valueType":"..."}` looks like from here.
 #   * `EFT.MovementContext::Drift(Single, Single)` is `LegacySmoothTilt`'s
@@ -1875,6 +2196,265 @@ proc checkGuards(): int =
       guardOk "ensureCall refuses Drift stated as (int32, int32) -- " &
               wrong.why
 
+# ---------------------------------------------------------------------------
+# The answers, asserted rather than printed
+# ---------------------------------------------------------------------------
+#
+# Everything above this line either binds something and reports what it got, or
+# watches a guard refuse. What it did not do is **assert an answer** -- and the
+# four things fixed today were all wrong answers sitting in comments and state
+# lines where nothing could disagree with them: a per-second cost labelled per
+# frame, a float's bit pattern that was the wrong float's, a log line claiming
+# to say which of two shapes answered when the code only knew that one had, and
+# a config key read by this file and absent from the file it is read from.
+#
+# Each check below is written so that it goes red against the code as it was.
+# Two of them take deliberate care not to pass vacuously, which is the failure
+# this file keeps warning about: the handler checks assert that the payload was
+# really parsed *before* asserting what the handler decided, so "it did not
+# suppress" cannot be earned by "it never got that far".
+#
+# **They were watched red before they were left green.** Every fix in this
+# commit was backed out -- `perFrameNs` multiplied by 60 again, `HealthBits` set
+# to 1091567616, `contextIsAi` recording "one of them" the way a `var bool`
+# could, `onInertiaSmoothTiltBoxed` suppressing unconditionally, the
+# `selfTestDataDir` key deleted from config.json -- and the self-test failed
+# with six wrong answers and a non-zero exit. Two of them are worth quoting,
+# because they reproduce the old prose exactly and so confirm the diagnosis
+# rather than merely disagreeing with it:
+#
+#     ANSWER  the frame-budget sum answers 2400000 ns a frame and 14400
+#             thousandths of a percent for forty firings at 1 us
+#     ANSWER  ... address 5280 us a frame ...
+#
+# 2.4 ms and 14.400% are the "2.4 ms a frame" and "fifteen percent" this file
+# carried, and 5280 us is its "5.3 ms a frame". The backed-out code prints the
+# old numbers, which is the evidence that the old numbers were this sum with
+# `* 60` in it.
+
+proc answerOk(what: string) =
+  success "  answer   " & what
+
+proc answerBad(what: string) =
+  error "  ANSWER   " & what
+
+proc mockPlayer(): Il2CppPtr =
+  ## The stand-in's live `EFT.Player`, by the route the frame path takes.
+  result = nullPtr()
+  let bw = bindMethod(rt, TyGameWorld, "get_Instance", 0)
+  if not bw.ok: return
+  var a = noArgs()
+  let w = callPtr(bw, nullPtr(), a)
+  if w == nil: return
+  var mp = noObjBind()
+  var none = noKinds()
+  if not ensureCall(mp, w, "get_MainPlayer", none, fkPtr): return
+  a.reset()
+  result = callPtr(mp.b, w, a)
+
+proc mockContext(): Il2CppPtr =
+  result = nullPtr()
+  let bc = bindMethod(rt, TyCtx, "get_Instance", 0)
+  if not bc.ok: return
+  var a = noArgs()
+  result = callPtr(bc, nullPtr(), a)
+
+const
+  # A hook payload of the shape the host builds, written out here so the
+  # handle-only handlers can be run without a host that has hooks.
+  BoxedPayload = "{\"this\":{\"handle\":3,\"type\":\"EFT.MovementContext\"}," &
+                 "\"args\":[0.25,0.5]}"
+  StaticPayload = "{\"this\":null,\"args\":[0.25,0.5]}"
+  HealthBits = 1120403456
+    ## `100.0f` as an `int32`. See the guards' comment for what this used to be.
+
+proc checkAnswers(): int =
+  ## How many answers came back wrong. Zero is the only acceptable number.
+  result = 0
+
+  # --- 1. the frame budget, which used to be prose and was off by sixty -----
+  #
+  # Asserted against the exact figure the old sentences were making a decision
+  # on: one microsecond a firing, forty firings a frame.
+  if perFrameNs(1000) != 40_000 or frameShareMilli(1000) != 240:
+    answerBad "the frame-budget sum answers " & $perFrameNs(1000) &
+              " ns a frame and " & $frameShareMilli(1000) &
+              " thousandths of a percent for forty firings at 1 us. It " &
+              "should be 40000 ns and 240 (0.240%). The old prose said " &
+              "2.4 ms and fifteen percent, which is this same work measured " &
+              "over a second and then divided by a frame."
+    inc result
+  else:
+    answerOk "forty contexts at 1 us is " & frameShareText(1000) &
+             " -- the sentence this replaced said 2.4 ms a frame and " &
+             "fifteen percent, which was per second over per frame"
+  # And the claim the two overturned refusals now rest on, stated as a bound
+  # rather than as a figure: every shape this hook can take is under one
+  # percent of a frame, so none of them is a performance reason to refuse.
+  if frameShareMilli(TiltAddressNs) >= 1000 or
+     frameShareMilli(TiltBoxedNs) >= 1000 or
+     frameShareMilli(IsAiBoxedNs) >= 1000:
+    answerBad "one of the three hook shapes costs a percent of a frame or " &
+              "more, which would make the refusals this file withdrew " &
+              "correct after all: address " &
+              frameShareText(TiltAddressNs) & "; boxed " &
+              frameShareText(TiltBoxedNs) & "; boxed IsAI " &
+              frameShareText(IsAiBoxedNs)
+    inc result
+  else:
+    answerOk "every hook shape is under one percent of a frame -- typed " &
+             frameShareText(TiltTypedNs) & "; address " &
+             frameShareText(TiltAddressNs) & "; boxed " &
+             frameShareText(TiltBoxedNs) & "; boxed IsAI " &
+             frameShareText(IsAiBoxedNs)
+
+  # --- 2. the wrong-answer constant in the guards' comment ------------------
+  #
+  # Not quoted: produced. `Health` is bound properly, then the same offset is
+  # re-read with the kind forced to `fkI32`, which is the read an offset-guessing
+  # static/instance test would have done. Whatever comes out is the number the
+  # comment must name.
+  if not rtOpen:
+    warn "  answers about the runtime not checked: nothing is bound"
+  else:
+    let player = mockPlayer()
+    if player == nil:
+      warn "  no live EFT.Player, so the Health bit pattern is not checked"
+    else:
+      var owner = ""
+      let hb = bindFieldOn(rt, player, "Health", owner)
+      if not hb.ok or hb.kind != fkF32:
+        answerBad "Health did not bind as a float, so the bit pattern the " &
+                  "guards' comment names cannot be produced: " & hb.why
+        inc result
+      else:
+        var asInt = hb
+        asInt.kind = fkI32
+        let bits = int(readInt32(asInt, player))
+        if bits != HealthBits:
+          answerBad "reading Health's offset as an int32 -- the exact " &
+                    "mistake the static-field guard exists to prevent -- " &
+                    "answers " & $bits & ", and the guards' comment names " &
+                    $HealthBits & ". One of the two is wrong."
+          inc result
+        else:
+          answerOk "Health read as an int32 is " & $bits &
+                   ", which is what the guards' comment names (the comment " &
+                   "used to say 1091567616, which is 9.0f)"
+
+    # --- 3. contextIsAi says *which* shape answered ------------------------
+    #
+    # Two runtimes' worth of shape in one stand-in: `EFT.Player` really does
+    # declare `get_IsAI` as a compiled property, and `EFT.MovementContext`
+    # declares no `IsAI` at all. The second is the branch that matters most,
+    # because "neither answered" must not read as "not AI".
+    if player == nil:
+      warn "  contextIsAi not checked against a property: no live EFT.Player"
+    else:
+      var how = ""
+      discard contextIsAi(player, how)
+      if how.len == 0:
+        answerBad "contextIsAi found nothing on EFT.Player, which declares " &
+                  "get_IsAI as a compiled property in the stand-in"
+        inc result
+      elif how != IsAiViaProperty:
+        answerBad "contextIsAi resolved IsAI on EFT.Player but recorded it " &
+                  "as \"" & how & "\" rather than as the property it " &
+                  "actually used"
+        inc result
+      else:
+        answerOk "contextIsAi names the shape it read: " & how
+    let ctx = mockContext()
+    if ctx == nil:
+      warn "  contextIsAi not checked against a type with no IsAI: no live " &
+           TyCtx
+    else:
+      var how = ""
+      let ai = contextIsAi(ctx, how)
+      if how.len != 0:
+        answerBad "contextIsAi claims to have read IsAI off " & TyCtx &
+                  " as \"" & how & "\"; the stand-in declares neither a " &
+                  "property nor a field of that name there"
+        inc result
+      elif ai:
+        answerBad "contextIsAi answered true with nothing to read it from"
+        inc result
+      else:
+        answerOk "contextIsAi records \"\" -- not a guess -- on a type with " &
+                 "neither get_IsAI nor IsAI, and onDeltaRotation treats that " &
+                 "as carry-on rather than as \"not AI\""
+    # The field branch is **not** exercised: no type in the stand-in carries
+    # `IsAI` as a field, so nothing here has ever watched that string come
+    # back. Said rather than papered over.
+    info "  (the field branch of contextIsAi is unexercised -- the stand-in " &
+         "has no type with an IsAI field, and inventing one to test against " &
+         "would be testing the invention)"
+
+  # --- 4. the handle-only handlers do not suppress what they cannot replace -
+  #
+  # `aowlspt-sim` has no IL2CPP and no boxed `call` into a game, so both boxed
+  # reads below are guaranteed to fail -- which is exactly the case worth
+  # asserting, because the failure mode is a lean frozen mid-tilt or every
+  # bot's rotation suppressed.
+  #
+  # The payload is parsed first and asserted on, so that a handler which bailed
+  # out at the front door cannot be mistaken for one that made the decision.
+  var okA = false
+  let firstArg = argFloat(BoxedPayload, 0, okA)
+  if thisHandle(BoxedPayload) != 3'u64 or not okA or firstArg < 0.2 or
+     firstArg > 0.3:
+    answerBad "the synthetic hook payload does not parse -- handle " &
+              $int(thisHandle(BoxedPayload)) & ", first argument " &
+              $firstArg & ". Every handler check below it would then be " &
+              "passing because the handler stopped at the front door."
+    inc result
+  else:
+    answerOk "the synthetic payload parses: this is handle 3 and argument 0 " &
+             "is 0.25, so the handler checks below reach the decision"
+    let tilt = onInertiaSmoothTiltBoxed(TyCtx & "::InertiaSmoothTilt",
+                                        BoxedPayload)
+    if tilt.stop:
+      answerBad "onInertiaSmoothTiltBoxed suppressed InertiaSmoothTilt after " &
+                "a LegacySmoothTilt call that could not have succeeded on " &
+                "this host. In a raid that is a lean frozen at whatever " &
+                "angle it was at."
+      inc result
+    elif gTiltBoxedRefused <= 0:
+      answerBad "onInertiaSmoothTiltBoxed carried on without counting a " &
+                "refused redirect, so it did not reach the boxed call at all"
+      inc result
+    else:
+      answerOk "onInertiaSmoothTiltBoxed carries on when the boxed " &
+               "LegacySmoothTilt refuses, and counts it (" &
+               $gTiltBoxedRefused & ")"
+    let jitter = onDeltaRotationBoxed(
+      TyCtx & "::PlayerAnimatorSetDeltaRotation", BoxedPayload)
+    if jitter.stop:
+      answerBad "onDeltaRotationBoxed suppressed the rotation without ever " &
+                "reading IsAI, which suppresses it for every bot too"
+      inc result
+    else:
+      answerOk "onDeltaRotationBoxed carries on when neither boxed IsAI read " &
+               "answers"
+    let staticCall = onInertiaSmoothTiltBoxed(TyCtx & "::InertiaSmoothTilt",
+                                              StaticPayload)
+    if staticCall.stop:
+      answerBad "onInertiaSmoothTiltBoxed suppressed a firing whose `this` " &
+                "is null"
+      inc result
+    else:
+      answerOk "onInertiaSmoothTiltBoxed carries on for a null `this`"
+
+  # --- 5. the setting this file reads is in the file it reads --------------
+  if not setting("selfTestDataDir").ok:
+    answerBad "classicmovement reads selfTestDataDir and config.json does " &
+              "not declare it. A setting nobody can find is a setting nobody " &
+              "can use."
+    inc result
+  else:
+    answerOk "selfTestDataDir is declared in config.json, with the " &
+             "//-prefixed sibling comment the other keys have"
+
 proc simSelfTest(): Status =
   info "Classic Movement self-test (--side sim)"
 
@@ -1950,6 +2530,14 @@ proc simSelfTest(): Status =
           "is a wrong number handed to the game rather than a refusal"
     return ErrGeneric
 
+  info "  the answers, asserted rather than printed:"
+  let badAnswers = checkAnswers()
+  if badAnswers > 0:
+    error "  " & $badAnswers & " answer(s) are wrong. Every one of these was " &
+          "a number or a claim sitting in a comment where nothing could " &
+          "disagree with it, which is how the last four got there."
+    return ErrGeneric
+
   info "  refusals that remain, with the reason each one actually has:"
   info "    GetNewState -- permanent. Its replacement states are C# " &
        "subclasses and nothing native can declare a managed type, so there " &
@@ -1970,6 +2558,14 @@ proc simSelfTest(): Status =
        "fired for. On a revision-4 host it arms as a typed hook at ~25 ns a " &
        "firing; on revision 3 it arms on the JSON path at ~2.2 us, and the " &
        "effect's state line says which."
+  info "    below revision 3 both of these used to refuse, on the grounds " &
+       "that a boxed call per context per frame was 2.4 ms a frame with " &
+       "forty bots. 2.4 ms is per second: per frame it is " &
+       frameShareText(1000) & ". Measured properly the boxed redirect is " &
+       frameShareText(TiltBoxedNs) & " and the boxed IsAI read is " &
+       frameShareText(IsAiBoxedNs) & ", so **both refusals are withdrawn** " &
+       "and both effects arm on a handle-only path instead. Neither has ever " &
+       "run: every host here is revision 4."
   info "    PlayerAnimatorSetDeltaRotation -- **half ported**. The player/AI " &
        "split is done (get_IsAI as a property, then IsAI as a field, off the " &
        "address). What is still out is upstream's " &

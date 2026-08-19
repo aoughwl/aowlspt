@@ -10,5 +10,8 @@
   "verifyHooks": true,
 
   "//selfTestRuntime": "A GameAssembly.dll for `aowl run` to bind against, so the self-test can report real bindings offline. Empty means the process, which under aowlspt-sim has no runtime at all. tests/mockil2cpp/GameAssembly.dll is the stand-in aowl test uses.",
-  "selfTestRuntime": "tests/mockil2cpp/GameAssembly.dll"
+  "selfTestRuntime": "tests/mockil2cpp/GameAssembly.dll",
+
+  "//selfTestDataDir": "The Managed data directory il2cpp_init is given when selfTestRuntime is loaded out of process -- a real client's EscapeFromTarkov_Data. Empty means the runtime is started without one, which is right for the stand-in and wrong for a real GameAssembly.dll. The mod has read this key since the self-test learned to start a runtime; it was never declared here, so nobody could find it. Adding it changes nothing about the default behaviour.",
+  "selfTestDataDir": ""
 }
