@@ -473,6 +473,22 @@ static void* aowl_hostapi_new(void* ctx,
     b->api.store_set      = aowl_host_store_set;
     b->api.store_list     = aowl_host_store_list;
 
+    /* `handle_pointer` and `handle_pin` are deliberately left NULL here, and
+     * `size` deliberately says so.
+     *
+     * They only mean anything to a host that has live managed objects, which is
+     * the IL2CPP client host and not the server or the backend -- and the
+     * functions behind them cannot even be *named* in this header without every
+     * binary that includes it having to define them. So they are armed by
+     * `aowlspt_live.h`, which only that host includes, and until they are the
+     * struct honestly reports the revision-2 size.
+     *
+     * That is the whole meaning of `size` in rule 4: not "which revision of the
+     * header was this compiled against", but "how much of this struct did I
+     * fill". A host that reported the full size with two null pointers in it
+     * would be telling a mod to call them. */
+    b->api.size           = AOWLSPT_HOSTAPI_SIZE_REV2;
+
     return b;
 }
 
@@ -597,11 +613,15 @@ static int64_t aowl_read_i64(void* p) { return p ? *(int64_t*)p : 0; }
 typedef struct AowlRegs {
     uint64_t rcx, rdx, r8, r9;   /* 0x00 0x08 0x10 0x18 */
     double   x0, x1, x2, x3;     /* 0x20 0x28 0x30 0x38 */
-    uint64_t ret;                /* 0x40 */
+    uint64_t ret;                /* 0x40 -- a replacement return value        */
+    double   retf;               /* 0x48 -- XMM0 as the original left it, on
+                                    the postfix path only                     */
 } AowlRegs;
 
 /* Returns 0 to run the original, 1 to suppress it. */
 extern int32_t aowlspt_nim_patch_fired(int32_t slot, void* regs);
+/* Returns 0 to keep the original's return value, 1 to use `ret`. */
+extern int32_t aowlspt_nim_patch_returned(int32_t slot, void* regs);
 
 
 
@@ -667,6 +687,30 @@ static void aowl_regs_set_ret_f64(void* p, double v) {
     ((AowlRegs*)p)->ret = bits;
 }
 static int32_t aowl_regs_sizeof(void) { return (int32_t)sizeof(AowlRegs); }
+
+/* What the original returned, on the postfix path.
+ *
+ * Two readers for the same reason there are two readers for a float *argument*:
+ * an integer or reference return is in RAX and a floating-point one is in XMM0,
+ * the thunk saves both because it cannot know which, and only the method's
+ * declared return type -- which the host has and the assembly does not -- says
+ * which of the two is the value. Reading the wrong one produces a number rather
+ * than an error, which is precisely the failure this pair exists to avoid. */
+static uint64_t aowl_regs_ret_int(void* p) {
+    return p ? ((AowlRegs*)p)->ret : 0;
+}
+static double aowl_regs_ret_f64(void* p) {
+    return p ? ((AowlRegs*)p)->retf : 0.0;
+}
+/* A `System.Single` return occupies the low 32 bits of XMM0 and the rest is
+ * whatever the register held; read as a double it is a number unrelated to the
+ * result. Same trap as `aowl_regs_f32`, same fix. */
+static double aowl_regs_ret_f32(void* p) {
+    float f = 0.0f;
+    if (!p) return 0.0;
+    memcpy(&f, &((AowlRegs*)p)->retf, sizeof(f));
+    return (double)f;
+}
 
 /* A 16-byte scratch cell.
  *

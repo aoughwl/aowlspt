@@ -70,6 +70,8 @@ typedef struct AowlHook {
     void*   target;                       /* the function that was patched   */
     void*   detour;                       /* what it now jumps to            */
     void*   trampoline;                   /* stolen bytes + jump back        */
+    void*   site;                         /* AowlSite: this hook's own record*/
+    void*   stub;                         /* the 24 bytes the target jumps to*/
     uint8_t original[AOWL_MAX_STOLEN];    /* for unpatching                  */
     int32_t stolen;                       /* how many bytes were replaced    */
     int32_t installed;
@@ -462,6 +464,44 @@ static void aowl_write_jmp_abs(uint8_t* at, void* dest) {
     memcpy(at + 6, &dest, 8);
 }
 
+/* Defined by the assembly at the bottom of this file. Declared here because
+ * `aowl_write_stub` needs its address and the stubs are written from the
+ * install path, which is a long way above it. */
+extern void aowl_thunk_common(void);
+
+/* The per-hook stub: the two instructions that turn "a firing arrived" into
+ * "a firing arrived *for this hook*".
+ *
+ *     mov r11, <site>
+ *     jmp [rip+0] ; aowl_thunk_common
+ *
+ * This is the fix for the only race the generation could not close. A firing
+ * used to be told nothing but a **slot number**, baked into one of sixteen
+ * fixed thunks, and had to look the rest up in slot-indexed tables. A thread
+ * preempted between the jump landing on the thunk and those loads read them
+ * after the slot had been released *and re-claimed*: trampoline and generation
+ * both belonged to the new occupant, agreed with each other, passed the
+ * generation check, and ran the wrong hook's handler with the wrong method's
+ * arguments. `tests/detour_race.c` saw exactly `decoy(x)` come back, which is
+ * the other function's body and nothing else.
+ *
+ * With the site pointer carried in a register from the stub, there is no
+ * lookup and therefore no window: the record is allocated with the hook, never
+ * reclaimed, never written after the hook is armed, and reached only from a
+ * stub that only this hook's target jumps to. The generation stays, but its
+ * job is now narrow and exact -- it says whether the *host's* row for this slot
+ * is still ours, since that table is indexed by slot and the slot does come
+ * back.
+ *
+ * R11 rather than RAX or R10: it is volatile under the Windows x64 ABI, it is
+ * not an argument register, and it is not the varargs vector count that RAX
+ * carries. Nothing that can arrive at a patched method is in it. */
+static void aowl_write_stub(uint8_t* at, void* site) {
+    at[0] = 0x49; at[1] = 0xBB;              /* mov r11, imm64 */
+    memcpy(at + 2, &site, 8);
+    aowl_write_jmp_abs(at + 10, (void*)(uintptr_t)&aowl_thunk_common);
+}
+
 /* Executable memory within +/-2 GB of `near`.
  *
  * This is not an optimisation. The stolen instructions can be RIP-relative,
@@ -501,6 +541,154 @@ static void* aowl_alloc_near(void* anchor, size_t size) {
     return NULL;
 }
 
+/* ------------------------------------------------------------------ *
+ * A trampoline is never given back
+ *
+ * `aowl_hook_remove` used to `VirtualFree` the trampoline it allocated, and
+ * that is a use-after-free with a thread already running in it. The thunk
+ * reaches the original by jumping into the trampoline; a removal that unmaps
+ * those pages while a thread's RIP is inside them is an access violation in
+ * the middle of a game method, from a thread that never asked to be patched.
+ * `tests/detour_race.c` counts them: six threads calling a patched function
+ * while another installs and removes the patch faulted on essentially every
+ * cycle -- 1878 faults in a three-second run, which is not a rare window, it
+ * is the ordinary case.
+ *
+ * The obvious fix is to make the removal wait for the threads, and the obvious
+ * fix is wrong here. Waiting means either instrumenting the firing -- a
+ * refcount taken and released around every call into a trampoline, which is
+ * two locked instructions on a path that costs 23 ns end to end and would be
+ * the largest single item in it -- or suspending every thread in the game and
+ * inspecting it, from a mod-manager click, with the render thread among them.
+ * The first makes every patched method in the game slower for ever to make one
+ * click safe; the second is a stall a player sees.
+ *
+ * So the trampoline is simply never freed. That costs nothing at all on the
+ * firing path and nothing on the removal path, and it is *correct* rather than
+ * merely unlikely to fault: the retired bytes are the stolen prologue followed
+ * by a jump to `target + stolen`, and the removal has just put the original
+ * bytes back at `target` -- so a firing that arrives late runs the original
+ * function's own prologue and continues into the original function's body.
+ * The right answer, from memory nobody will unmap.
+ *
+ * What it costs is address space, and that is why the pool slots are
+ * suballocated rather than each given a `VirtualAlloc` of its own. A
+ * `VirtualAlloc` reserves a whole allocation granularity -- 64 KB for a
+ * hundred-odd bytes -- so never freeing one per install would burn 64 KB per
+ * mod toggle and, far more sharply, would use up the +/-2 GB window the stolen
+ * RIP-relative displacements need after 32768 of them. Suballocated, one 64 KB
+ * block holds 512 slots and the whole pool is bounded at `AOWL_TRAMP_BLOCKS`
+ * blocks: 8 MB, 65536 installs, and a refusal rather than a silent wrap when
+ * that runs out. Only the blocks actually reached are ever allocated.
+ *
+ * Bounded rather than growable on purpose. A pool that grows without limit
+ * turns a mod stuck in a load/unload loop into a slow exhaustion of the near
+ * window, which surfaces as patches that stop working for reasons no log
+ * explains. A pool that ends says "the trampoline could not be allocated" --
+ * error -3, which the host already prints.
+ *
+ * Not thread-safe, and neither is anything else here: `g_hookFree`,
+ * `g_hookCount` and `g_hookSlots` have always assumed one installer at a time,
+ * and both hosts install and remove from a single control thread.
+ * ------------------------------------------------------------------ */
+
+/* One pool slot per hook, holding the three things that share the hook's
+ * lifetime and must outlive its removal:
+ *
+ *   +0x00  the trampoline -- stolen prologue plus the jump back
+ *   +0x40  `AowlSite`, the record a firing reads everything out of
+ *   +0x60  the stub, which is what the patched method actually jumps to
+ *
+ * They are together because they are retired together and never reclaimed
+ * (see below), so binding them to one allocation is what makes "this firing
+ * belongs to this hook" a fact about an address rather than about timing.
+ *
+ * 128 bytes rather than 64: the trampoline needs 46 at most, the site 24 and
+ * the stub 24. The site and the stub share the second 64-byte line and the
+ * trampoline has the first to itself, so the stores that fill the site at
+ * install time never land in a line something is executing out of. */
+#define AOWL_TRAMP_TRAMP  0x00
+#define AOWL_TRAMP_SITE   0x40
+#define AOWL_TRAMP_STUB   0x60
+#define AOWL_TRAMP_SLOT   128       /* >= AOWL_TRAMP_STUB + AOWL_STUB_SIZE */
+#define AOWL_TRAMP_BLOCK  0x10000   /* one allocation granularity          */
+#define AOWL_TRAMP_BLOCKS 128       /* 8 MB and 65536 hooks, at most        */
+
+/* The per-hook record. A firing loads **everything** it needs out of one of
+ * these -- the trampoline to run, the slot to report, the generation it was
+ * installed under, and whether it is a postfix -- so the four can never be
+ * read from different occupants of a reused slot. See `aowl_write_stub` and
+ * the thunk.
+ *
+ * The layout is the thunk's, not the compiler's: the assembly reads +0x00,
+ * +0x08, +0x0C and +0x10 literally. `_Static_assert` below pins the two
+ * together. */
+typedef struct AowlSite {
+    void*    tramp;     /* +0x00  the retired-but-mapped original prologue  */
+    uint32_t gen;       /* +0x08  the slot generation this hook was born in */
+    int32_t  slot;      /* +0x0C  which row the host should look at         */
+    uint64_t post;      /* +0x10  non-zero: call the original and come back */
+} AowlSite;
+
+#define AOWL_STUB_SIZE 24   /* mov r11, imm64 (10) + jmp [rip+0] (14) */
+
+typedef struct AowlTrampBlock {
+    uint8_t* base;
+    int32_t  used;      /* trampolines handed out of this block */
+} AowlTrampBlock;
+
+static AowlTrampBlock g_trampBlocks[AOWL_TRAMP_BLOCKS];
+static int32_t g_trampBlockCount = 0;
+static int32_t g_trampHandedOut = 0;
+
+/* Whether every byte of a block is close enough to `anchor` for a 32-bit
+ * displacement copied out of the prologue to still reach. The whole block is
+ * checked, not the one slot, so a block accepted here stays usable for this
+ * anchor until it is full. */
+static int aowl_tramp_block_reaches(const uint8_t* base, const void* anchor) {
+    const int64_t lo = (int64_t)(intptr_t)base - (int64_t)(intptr_t)anchor;
+    const int64_t hi = lo + AOWL_TRAMP_BLOCK;
+    const int64_t limit = 0x7F000000LL;   /* inside 2 GB, with room to spare */
+    return lo > -limit && hi < limit;
+}
+
+/* A pool slot within reach of `anchor`, or NULL when the pool is spent. */
+static uint8_t* aowl_tramp_alloc(void* anchor) {
+    for (int32_t i = 0; i < g_trampBlockCount; i++) {
+        AowlTrampBlock* b = &g_trampBlocks[i];
+        if (b->used >= AOWL_TRAMP_BLOCK / AOWL_TRAMP_SLOT) continue;
+        if (!aowl_tramp_block_reaches(b->base, anchor)) continue;
+        uint8_t* p = b->base + (size_t)b->used * AOWL_TRAMP_SLOT;
+        b->used++;
+        g_trampHandedOut++;
+        return p;
+    }
+    if (g_trampBlockCount >= AOWL_TRAMP_BLOCKS) return NULL;
+    uint8_t* base = (uint8_t*)aowl_alloc_near(anchor, AOWL_TRAMP_BLOCK);
+    if (!base) return NULL;
+    /* `aowl_alloc_near` searches out to just under 2 GB and a block is 64 KB
+     * wide, so its far end can sit outside the range a copied displacement can
+     * still reach. Refused here rather than accepted and then discovered by
+     * `aowl_copy_relocated`, which would spend a block of the bounded pool on
+     * a trampoline nothing can use and leave it in the table refusing every
+     * anchor after it. The caller gets -3, which says the trampoline could not
+     * be allocated -- which is exactly what happened. */
+    if (!aowl_tramp_block_reaches(base, anchor)) {
+        VirtualFree(base, 0, MEM_RELEASE);
+        return NULL;
+    }
+    g_trampBlocks[g_trampBlockCount].base = base;
+    g_trampBlocks[g_trampBlockCount].used = 1;
+    g_trampBlockCount++;
+    g_trampHandedOut++;
+    return base;
+}
+
+/* For a harness that wants the pool as a number rather than an impression:
+ * how many trampolines have been handed out, and how many blocks that took. */
+static int32_t aowl_tramp_count(void)  { return g_trampHandedOut; }
+static int32_t aowl_tramp_blocks(void) { return g_trampBlockCount; }
+
 static void* aowl_hook_new(void) { return calloc(1, sizeof(AowlHook)); }
 static void  aowl_hook_free(void* p) { free(p); }
 static void* aowl_hook_trampoline(void* p) {
@@ -530,6 +718,7 @@ static int32_t aowl_hook_stolen(void* p) {
  *   -6  the prologue holds a relative branch, which cannot be moved
  *   -7  the function is shorter than the jump that would replace its start
  *   -8  the trampoline landed too far away for a RIP-relative displacement
+ *   -9  the target already starts with one of our jumps
  */
 static const char* aowl_hook_error_text(int32_t rc) {
     switch (rc) {
@@ -547,6 +736,8 @@ static const char* aowl_hook_error_text(int32_t rc) {
         case -8: return "the trampoline landed more than 2 GB from the "
                         "target, so a RIP-relative displacement in the "
                         "stolen bytes no longer reaches";
+        case -9: return "that method is already patched -- something else "
+                        "detoured it first";
         default: return "unknown detour error";
     }
 }
@@ -561,36 +752,94 @@ static int32_t aowl_why_to_rc(int32_t why) {
     }
 }
 
-static int32_t aowl_hook_install(void* handle, void* target, void* detour) {
+/* Installing is two halves, and the seam is not a tidy-up.
+ *
+ * `aowl_hook_prepare` decodes the prologue and builds the trampoline; nothing
+ * it does is visible to a running thread. `aowl_hook_arm` writes the jump, and
+ * from the instruction after it the thunk can fire.
+ *
+ * A caller with anything a firing will read has to write it *between* the two.
+ * The slot-based path has all of it: the site record and the stub that names
+ * it, filled in by `aowl_hook_attach_at`. When the equivalent went in after the
+ * jump there was a window -- short, and hit constantly under load -- in which a
+ * firing read the NULL still sitting there and jumped through it. One call in a
+ * few thousand, in `tests/detour_race.c`, before the split. */
+
+/* `wantStub` distinguishes the two callers. The overlay's own Present and
+ * ResizeBuffers hooks name a plain C function as their detour and take no slot,
+ * so they get no stub and no site; a slot-based patch passes NULL and has its
+ * detour filled in by `aowl_hook_attach_at`, which is the only place that knows
+ * the slot number the site has to carry. */
+static int32_t aowl_hook_prepare_ex(void* handle, void* target, void* detour,
+                                    int32_t wantStub) {
     AowlHook* h = (AowlHook*)handle;
-    if (!h || !target || !detour) return -1;
+    if (!h || !target || (!detour && !wantStub)) return -1;
 
     uint8_t* t = (uint8_t*)target;
+
+    /* Already ours.
+     *
+     * Patching a patched method decodes the jump we wrote last time, sees the
+     * RIP-relative operand and refuses it as "the prologue holds a relative
+     * branch" -- which is true of the bytes and useless to the reader, who goes
+     * looking at the game's code for a branch the game did not write. Two mods
+     * hooking the same method is an ordinary thing to happen, so it gets a
+     * sentence that says so. (The check is for *our* encoding specifically:
+     * `ff 25 00000000`, jump through the qword immediately after it.) */
+    if (t[0] == 0xFF && t[1] == 0x25 &&
+        t[2] == 0x00 && t[3] == 0x00 && t[4] == 0x00 && t[5] == 0x00) {
+        return -9;
+    }
+
     int32_t why = AOWL_INSN_UNKNOWN;
     int32_t stolen = aowl_stolen_len_why(t, AOWL_JMP_SIZE, &why);
     if (stolen == 0) return aowl_why_to_rc(why);
 
-    uint8_t* tramp = (uint8_t*)aowl_alloc_near(target,
-                                               (size_t)(stolen + AOWL_JMP_SIZE));
-    if (!tramp) return -3;
+    uint8_t* pool = aowl_tramp_alloc(target);
+    if (!pool) return -3;
+    uint8_t* tramp = pool + AOWL_TRAMP_TRAMP;
 
     if (aowl_copy_relocated(tramp, t, stolen) != 0) {
-        VirtualFree(tramp, 0, MEM_RELEASE);
         /* The prologue decoded -- `aowl_stolen_len_why` already proved that --
          * so the only way the copy fails is a displacement that no longer
          * reaches. Reporting that as a decoder gap sent the last reader
-         * looking for a missing opcode. */
+         * looking for a missing opcode.
+         *
+         * The trampoline is not given back. It cannot be: the pool hands out
+         * fixed slots that are never reclaimed, which is the whole point of it
+         * (see `aowl_tramp_alloc`). One slot of 64 bytes is lost per refused
+         * install, out of 65536. */
         return -8;
     }
     aowl_write_jmp_abs(tramp + stolen, t + stolen);
 
-    DWORD old = 0;
-    if (!VirtualProtect(t, (SIZE_T)stolen, PAGE_EXECUTE_READWRITE, &old)) {
-        VirtualFree(tramp, 0, MEM_RELEASE);
-        return -4;
-    }
-
     memcpy(h->original, t, (size_t)stolen);
+    h->target = target;
+    h->detour = detour;          /* NULL until the stub exists, when wanted */
+    h->trampoline = tramp;
+    h->site  = wantStub ? (void*)(pool + AOWL_TRAMP_SITE) : NULL;
+    h->stub  = wantStub ? (void*)(pool + AOWL_TRAMP_STUB) : NULL;
+    h->stolen = stolen;
+    h->installed = 0;   /* not until it is armed */
+    return 0;
+}
+
+static int32_t aowl_hook_prepare(void* handle, void* target, void* detour) {
+    return aowl_hook_prepare_ex(handle, target, detour, 0);
+}
+
+/* The second half: the jump goes in, and the patch is live from here. */
+static int32_t aowl_hook_arm(void* handle) {
+    AowlHook* h = (AowlHook*)handle;
+    if (!h || !h->target || !h->trampoline || !h->detour) return -1;
+    uint8_t* t = (uint8_t*)h->target;
+    int32_t stolen = h->stolen;
+    void* detour = h->detour;
+
+    DWORD old = 0;
+    if (!VirtualProtect(t, (SIZE_T)stolen, PAGE_EXECUTE_READWRITE, &old))
+        return -4;
+
     aowl_write_jmp_abs(t, detour);
     /* Bytes between the jump and the end of the last stolen instruction are
      * filled with int3 rather than left as the tail of a half-overwritten
@@ -601,12 +850,17 @@ static int32_t aowl_hook_install(void* handle, void* target, void* detour) {
     VirtualProtect(t, (SIZE_T)stolen, old, &old);
     FlushInstructionCache(GetCurrentProcess(), t, (SIZE_T)stolen);
 
-    h->target = target;
-    h->detour = detour;
-    h->trampoline = tramp;
-    h->stolen = stolen;
     h->installed = 1;
     return 0;
+}
+
+/* Both halves, for a caller with nothing to write down in between -- the
+ * overlay's own Present and ResizeBuffers hooks, which take no pool slot and
+ * so have no table for a firing to read. */
+static int32_t aowl_hook_install(void* handle, void* target, void* detour) {
+    int32_t rc = aowl_hook_prepare(handle, target, detour);
+    if (rc != 0) return rc;
+    return aowl_hook_arm(handle);
 }
 
 static int32_t aowl_hook_remove(void* handle) {
@@ -621,7 +875,13 @@ static int32_t aowl_hook_remove(void* handle) {
     VirtualProtect(t, (SIZE_T)h->stolen, old, &old);
     FlushInstructionCache(GetCurrentProcess(), t, (SIZE_T)h->stolen);
 
-    if (h->trampoline) VirtualFree(h->trampoline, 0, MEM_RELEASE);
+    /* The trampoline is *retired*, not freed -- see `aowl_tramp_alloc`. A
+     * thread is very likely inside it right now; the original bytes are back
+     * at `target` above, so the retired copy still runs the stolen prologue
+     * and still jumps to `target + stolen`, which is now the original function
+     * from beginning to end. Unmapping it here is what
+     * `tests/detour_race.c` counted as 1878 access violations in three
+     * seconds. */
     h->trampoline = NULL;
     h->installed = 0;
     return 0;
@@ -670,9 +930,78 @@ static int32_t aowl_hook_remove(void* handle) {
  * What is still not covered, and is reported rather than guessed: arguments
  * past the fourth, which arrive on the stack, and value types larger than
  * eight bytes, which arrive by hidden reference.
+ *
+ * ------------------------------------------------------------------
+ * The postfix path, and why it is a second path rather than a change
+ * ------------------------------------------------------------------
+ *
+ * A postfix has to see what the original returned, so it cannot tail-jump: a
+ * tail jump gives the original *our* return address and it never comes back.
+ * The thunk has to `call` the trampoline instead and regain control -- and
+ * everything the tail jump was making correct for free then becomes this file's
+ * problem. Three things, in the order they bite:
+ *
+ * **The return registers.** After the call, RAX holds an integer or reference
+ * return and XMM0 holds a float or double one, and nothing says which. Both are
+ * saved, both are handed to the host (which knows the declared return type and
+ * reads the right one), and both are restored on the way out -- so a postfix
+ * that changes nothing is bit-for-bit transparent, including on a method whose
+ * return type this file could not classify.
+ *
+ * **The hidden struct-return pointer.** A value type larger than eight bytes is
+ * returned through a caller-allocated buffer whose address arrives in RCX and
+ * comes back in RAX. Saving and restoring RAX keeps that ABI intact -- but the
+ * *value* lives in memory this file cannot read the layout of, so a postfix
+ * there could neither report the result nor replace it. The host refuses such a
+ * patch at registration rather than installing one that silently observes
+ * nothing. See `hostPatch`.
+ *
+ * **Stack arguments.** Arguments past the fourth register slot sit above the
+ * caller's home space, at a fixed offset from the rsp the original was entered
+ * with. A tail jump preserves that rsp; a `call` from inside this frame does
+ * not, so the original would read our frame where its fifth argument should be.
+ * They could be copied down -- the count is known to the host at attach time and
+ * could be published in a side table for the assembly to `rep movsq` -- but that
+ * is a second thing to get wrong on a path where being wrong means a corrupted
+ * argument rather than a crash. The host counts the compiled call's slots
+ * (`this`, the declared arguments, and IL2CPP's trailing `MethodInfo*`) and
+ * **refuses a postfix that would need more than four**.
+ *
+ * **SEH.** The `call` happens inside the same `.seh_proc` with the same
+ * `.seh_stackalloc 0x98` prologue, so the frame is describable and an exception
+ * thrown out of the original unwinds through it exactly as it unwinds through
+ * any other frame. What it does *not* do is run the postfix handler: an unwind
+ * skips the rest of this function by definition. A postfix therefore means
+ * "after the original returned", not "after the original finished", and a mod
+ * that needs the exception case wants a finalizer, which does not cross this
+ * ABI at all.
+ *
+ * Which path a slot takes is a load and a branch off `aowl_post_table`, read at
+ * the top of the thunk. A prefix slot's instruction sequence is otherwise
+ * unchanged, so the hot path -- the drain hook, which fires every frame -- pays
+ * one predictable load for the postfix path's existence.
  * ------------------------------------------------------------------ */
 
-#define AOWL_MAX_HOOKS 16
+/* Sixteen was not a budget, it was the number of thunks that had been typed
+ * out: each slot needed its own `aowl_thunk_N`, written by hand as a macro
+ * expansion, and sixteen expansions is what fitted on a screen. Two example
+ * mods exhausted it -- `hostharness --churn 120` stopped with thirteen slots
+ * live and three more to install -- and a real install is eight or ten mods,
+ * not two.
+ *
+ * The thunks are gone (see `aowl_write_stub`), so nothing is enumerated per
+ * slot any more and the constant costs only tables. Per slot that is a hook
+ * pointer, a taken flag, a generation, a postfix word and a free-list entry:
+ * 25 bytes, so 256 slots is 6.4 KB of BSS and nothing on the firing path,
+ * which reaches none of these tables. The per-hook trampoline pool slot is 128
+ * bytes and is allocated on demand, so an install that uses twenty slots pays
+ * for twenty.
+ *
+ * 256 rather than "unbounded": the host preallocates its patch table to this
+ * capacity precisely so that a `seq` cannot move under a firing thread, and a
+ * bound is what makes a mod stuck in an install loop report "no free patch
+ * slots" instead of quietly eating address space. */
+#define AOWL_MAX_HOOKS 256
 
 /* `AowlRegs` and its accessors live in `aowlspt_shim.h`.
  *
@@ -683,110 +1012,454 @@ static int32_t aowl_hook_remove(void* handle) {
  * a warning and then miscompiles on the return type.
  *
  * The offsets the assembly below uses are, however, this file's own: the thunk
- * stores RCX/RDX/R8/R9 at +0x00/0x08/0x10/0x18, XMM0-3 at +0x20/0x28/0x30/0x38
- * and reads the replacement return value from +0x40, which is exactly the
- * layout of `AowlRegs`. The size is named here so anything that mirrors the
- * frame can be pinned to the assembly that writes it rather than to a copy of
- * the struct that can drift from both. */
-#define AOWL_REGS_BYTES 0x48
+ * stores RCX/RDX/R8/R9 at +0x00/0x08/0x10/0x18, XMM0-3 at +0x20/0x28/0x30/0x38,
+ * reads the replacement return value from +0x40, and -- on the postfix path --
+ * publishes the original's float return at +0x48, which is exactly the layout of
+ * `AowlRegs`. The size is named here so anything that mirrors the frame can be
+ * pinned to the assembly that writes it rather than to a copy of the struct that
+ * can drift from both. */
+#define AOWL_REGS_BYTES 0x50
 
 /* Returns 0 to run the original, 1 to suppress it. */
 extern int32_t aowlspt_nim_patch_fired(int32_t slot, void* regs);
 
+/* Called only on the postfix path, after the original has returned. `regs`
+ * still holds the argument registers saved on entry, plus the original's
+ * integer return at +0x40 and its float return at +0x48. Returns 0 to hand the
+ * caller what the original produced, 1 to hand it whatever was left at +0x40
+ * instead. */
+extern int32_t aowlspt_nim_patch_returned(int32_t slot, void* regs);
+
 static AowlHook* g_hookSlots[AOWL_MAX_HOOKS];
-/* `used` because the only reader is the assembly below, and the compiler cannot
- * see that. Without it the table is dropped at -O1 and the link fails on a
- * symbol that is right there in the file. */
-__attribute__((used)) static void* aowl_tramp_table[AOWL_MAX_HOOKS];
+/* Whether a slot is spoken for. A slot may be claimed and not yet attached --
+ * the host fills its own table between the two, because the thunk can fire the
+ * instant the jump lands -- so "has a hook" is not the same question.
+ *
+ * Declared up here rather than beside the free list it belongs to because the
+ * dispatcher reads it; see `aowl_patch_dispatch`. */
+static uint8_t g_hookTaken[AOWL_MAX_HOOKS];
+/* Which occupant of a slot the **host's** row belongs to.
+ *
+ * The slot number is the one thing a firing carries that is not private to its
+ * hook: `aowlspt_nim_patch_fired(slot, regs)` is how the host finds the patch
+ * row, and the host indexes that table by slot because the alternative is a
+ * lookup on the hot path. Slots come back (see `aowl_hook_claim`), so a firing
+ * left over from a removed patch could otherwise be delivered to whichever
+ * patch claimed the slot next -- a plausible handler called with the arguments
+ * of a method it was not written for, which is worse than a crash because it
+ * looks like it worked.
+ *
+ * So every slot carries a generation, bumped on release. A hook records the
+ * generation it was installed under **in its own site record**, the firing
+ * carries that record's contents up from the stub, and the dispatcher compares
+ * the two. A firing whose generation has moved on is dropped rather than
+ * delivered.
+ *
+ * This used to have a window and no longer does, and the difference is where
+ * the generation is read from. It used to be loaded out of *this table*, by a
+ * thunk that knew only its slot -- so a thread preempted between the jump
+ * landing on the thunk and that load read the generation and the trampoline
+ * after the slot had turned over, got a self-consistent pair belonging to the
+ * new occupant, passed this check, and ran the other hook. Now both come out of
+ * one record that belongs to one hook for ever, so the pair cannot disagree and
+ * cannot describe anybody else. See `aowl_write_stub`.
+ *
+ * `used` is no longer needed for the assembly's sake -- the thunk reads the
+ * site, not this -- but the table is still read by the dispatchers below. */
+static uint32_t aowl_gen_table[AOWL_MAX_HOOKS];
+/* Firings dropped because their slot had turned over. Zero is the number this
+ * should be; it is counted rather than assumed, because a reuse race that is
+ * being caught and a reuse race that is not happening answer identically from
+ * outside. */
+static volatile LONG aowl_stale_fires = 0;
+static int32_t aowl_hook_stale_fires(void) { return (int32_t)aowl_stale_fires; }
+/* Non-zero for a slot whose thunk must call the original and come back.
+ *
+ * Written by the host *before* the hook is attached -- the thunk can fire the
+ * instant the jump lands, and a slot that is armed as a postfix a moment later
+ * would spend its first firings silently behaving like a prefix -- and copied
+ * into the site record at attach, which is what the firing actually reads.
+ * This table remains the place the host states its intent, because it does so
+ * before there is a hook to state it on. */
+static uint64_t aowl_post_table[AOWL_MAX_HOOKS];
 static int32_t   g_hookCount = 0;
 
 /* Likewise: called only from assembly, so it needs `used` to survive -- and
  * `static`, so a second translation unit including this header does not clash. */
-__attribute__((used)) static int32_t aowl_patch_dispatch(int32_t slot, void* regs) {
+__attribute__((used)) static int32_t aowl_patch_dispatch(int32_t slot, void* regs,
+                                                         uint32_t gen) {
+    /* Two loads and two never-taken branches. See `aowl_gen_table` for what
+     * they prove.
+     *
+     * Both answer **0**, which is "let the original run", and the trampoline
+     * the thunk will run is the one out of this firing's own site record --
+     * retired, not freed, so still mapped and still the prologue of the method
+     * this firing was for. The original runs and the caller gets a true
+     * answer, whatever has happened to the slot in the meantime.
+     *
+     * It used to answer 1 -- suppress the method, hand the caller the zero in
+     * the frame -- because with the trampoline read at the point of use there
+     * was nothing else it could safely do. That is a wrong answer given to a
+     * caller whose only misfortune was to be inside a method at the moment a
+     * player switched a mod off, and there were 1048 of them in a three-second
+     * run of `tests/detour_race.c`. 1 is still what a *handler* returns to
+     * suppress a method deliberately; it is no longer what the engine returns
+     * because it lost track.
+     *
+     * The two conditions are different windows and neither implies the other.
+     * The generation catches a slot that turned over *while* this firing was
+     * in flight. `g_hookTaken` catches a firing that arrived entirely after
+     * the release -- the generation cannot see that one at all, because it is
+     * read on entry and an entry after the bump reads the bumped value and
+     * matches it. That is not a rare case: it is what every thread mid-jump at
+     * the moment of removal does. */
+    if (gen != aowl_gen_table[slot] || !g_hookTaken[slot]) {
+        InterlockedIncrement(&aowl_stale_fires);
+        return 0;
+    }
     return aowlspt_nim_patch_fired(slot, regs);
+}
+
+__attribute__((used)) static int32_t aowl_patch_return_dispatch(int32_t slot,
+                                                                void* regs,
+                                                                uint32_t gen) {
+    /* The same two conditions, and here both answers were 0 already: the
+     * original has run and its result is in the frame, so handing the caller
+     * what it produced is the only true thing to do. The window the generation
+     * covers is much wider on this path -- a postfix firing spends the whole
+     * of the original method between reading the generation and getting here.
+     */
+    if (gen != aowl_gen_table[slot] || !g_hookTaken[slot]) {
+        InterlockedIncrement(&aowl_stale_fires);
+        return 0;
+    }
+    return aowlspt_nim_patch_returned(slot, regs);
+}
+
+/* Arms or disarms the postfix path for a slot. Separate from `aowl_hook_attach`
+ * because it has to happen first; see the table's comment. */
+static void aowl_hook_set_postfix(int32_t slot, int32_t on) {
+    if (slot < 0 || slot >= AOWL_MAX_HOOKS) return;
+    aowl_post_table[slot] = on ? 1u : 0u;
+    /* If the slot is already attached, the firing path is reading the site and
+     * not this table, so both have to move. A host that arms the postfix flag
+     * before attaching -- which is the documented order -- never reaches here. */
+    AowlHook* live = g_hookSlots[slot];
+    if (live && live->site)
+        ((AowlSite*)live->site)->post = aowl_post_table[slot];
+}
+static int32_t aowl_hook_is_postfix(int32_t slot) {
+    if (slot < 0 || slot >= AOWL_MAX_HOOKS) return 0;
+    return aowl_post_table[slot] != 0u;
 }
 
 #if defined(__x86_64__)
 
-#define AOWL_ASM_THUNK(n) __asm__(                                            \
-    ".text\n"                                                                 \
-    ".def aowl_thunk_" #n "; .scl 3; .type 32; .endef\n"                      \
-    ".seh_proc aowl_thunk_" #n "\n"                                           \
-    "aowl_thunk_" #n ":\n"                                                    \
-    "  subq $0x98, %rsp\n"                                                    \
-    "  .seh_stackalloc 0x98\n"                                                \
-    "  .seh_endprologue\n"                                                    \
-    "  movq %rcx, 0x40(%rsp)\n"                                               \
-    "  movq %rdx, 0x48(%rsp)\n"                                               \
-    "  movq %r8,  0x50(%rsp)\n"                                               \
-    "  movq %r9,  0x58(%rsp)\n"                                               \
-    "  movsd %xmm0, 0x60(%rsp)\n"                                             \
-    "  movsd %xmm1, 0x68(%rsp)\n"                                             \
-    "  movsd %xmm2, 0x70(%rsp)\n"                                             \
-    "  movsd %xmm3, 0x78(%rsp)\n"                                             \
-    "  movq $0, 0x80(%rsp)\n"                                                 \
-    "  movl $" #n ", %ecx\n"                                                  \
-    "  leaq 0x40(%rsp), %rdx\n"                                               \
-    "  call aowl_patch_dispatch\n"                                            \
-    "  testl %eax, %eax\n"                                                    \
-    "  jne .Laowl_skip_" #n "\n"                                              \
-    "  movq 0x40(%rsp), %rcx\n"                                               \
-    "  movq 0x48(%rsp), %rdx\n"                                               \
-    "  movq 0x50(%rsp), %r8\n"                                                \
-    "  movq 0x58(%rsp), %r9\n"                                                \
-    "  movsd 0x60(%rsp), %xmm0\n"                                             \
-    "  movsd 0x68(%rsp), %xmm1\n"                                             \
-    "  movsd 0x70(%rsp), %xmm2\n"                                             \
-    "  movsd 0x78(%rsp), %xmm3\n"                                             \
-    "  movq aowl_tramp_table+" #n "*8(%rip), %rax\n"                          \
-    "  addq $0x98, %rsp\n"                                                    \
-    "  jmp *%rax\n"                                                           \
-    ".Laowl_skip_" #n ":\n"                                                   \
-    "  movq 0x80(%rsp), %rax\n"                                               \
-    "  movq %rax, %xmm0\n"                                                    \
-    "  addq $0x98, %rsp\n"                                                    \
-    "  ret\n"                                                                 \
-    ".seh_endproc\n");                                                        \
-    extern void aowl_thunk_##n(void);
+_Static_assert(sizeof(AowlSite) == 24, "the thunk reads AowlSite by offset");
 
-AOWL_ASM_THUNK(0)  AOWL_ASM_THUNK(1)  AOWL_ASM_THUNK(2)  AOWL_ASM_THUNK(3)
-AOWL_ASM_THUNK(4)  AOWL_ASM_THUNK(5)  AOWL_ASM_THUNK(6)  AOWL_ASM_THUNK(7)
-AOWL_ASM_THUNK(8)  AOWL_ASM_THUNK(9)  AOWL_ASM_THUNK(10) AOWL_ASM_THUNK(11)
-AOWL_ASM_THUNK(12) AOWL_ASM_THUNK(13) AOWL_ASM_THUNK(14) AOWL_ASM_THUNK(15)
+/* One thunk, entered with R11 holding the firing's own `AowlSite`.
+ *
+ * There used to be sixteen of these, one per slot, each with its slot number
+ * baked into its instructions and each looking the rest up in slot-indexed
+ * tables -- which is the race described in `aowl_write_stub`, and also the
+ * reason `AOWL_MAX_HOOKS` was sixteen. One thunk reading one record fixes both
+ * at once.
+ *
+ * The frame is unchanged: 0x98 bytes, RCX/RDX/R8/R9 at 0x40-0x58, XMM0-3 at
+ * 0x60-0x78, the replacement return at 0x80 and the original's float return at
+ * 0x88 -- which is `AowlRegs` from 0x40. 0x30 and 0x34 hold the generation and
+ * the slot across the postfix path's call into the original, and 0x38 holds
+ * the trampoline. The prefix path never spills either of the first two: R11 is
+ * still live where they are wanted, so it loads them straight into the
+ * argument registers.
+ *
+ * The order the site's fields are read in no longer matters, and that is the
+ * whole point. It mattered a great deal when they came from two tables. */
+__asm__(
+    ".text\n"
+    ".def aowl_thunk_common; .scl 3; .type 32; .endef\n"
+    ".seh_proc aowl_thunk_common\n"
+    "aowl_thunk_common:\n"
+    "  subq $0x98, %rsp\n"
+    "  .seh_stackalloc 0x98\n"
+    "  .seh_endprologue\n"
+    /* site->tramp. Spilled because R11 does not survive the dispatcher call
+     * and both paths need it afterwards. */
+    "  movq 0(%r11), %rax\n"
+    "  movq %rax, 0x38(%rsp)\n"
+    "  movq 16(%r11), %rax\n"           /* site->post */
+    "  testq %rax, %rax\n"
+    "  jne .Laowl_post\n"
+    "  movq %rcx, 0x40(%rsp)\n"
+    "  movq %rdx, 0x48(%rsp)\n"
+    "  movq %r8,  0x50(%rsp)\n"
+    "  movq %r9,  0x58(%rsp)\n"
+    "  movsd %xmm0, 0x60(%rsp)\n"
+    "  movsd %xmm1, 0x68(%rsp)\n"
+    "  movsd %xmm2, 0x70(%rsp)\n"
+    "  movsd %xmm3, 0x78(%rsp)\n"
+    "  movq $0, 0x80(%rsp)\n"
+    "  movl 12(%r11), %ecx\n"           /* site->slot, straight to the arg */
+    "  movl 8(%r11), %r8d\n"            /* site->gen, likewise */
+    "  leaq 0x40(%rsp), %rdx\n"
+    "  call aowl_patch_dispatch\n"
+    "  testl %eax, %eax\n"
+    "  jne .Laowl_skip\n"
+    "  movq 0x40(%rsp), %rcx\n"
+    "  movq 0x48(%rsp), %rdx\n"
+    "  movq 0x50(%rsp), %r8\n"
+    "  movq 0x58(%rsp), %r9\n"
+    "  movsd 0x60(%rsp), %xmm0\n"
+    "  movsd 0x68(%rsp), %xmm1\n"
+    "  movsd 0x70(%rsp), %xmm2\n"
+    "  movsd 0x78(%rsp), %xmm3\n"
+    "  movq 0x38(%rsp), %rax\n"
+    "  addq $0x98, %rsp\n"
+    "  jmp *%rax\n"
+    ".Laowl_skip:\n"
+    "  movq 0x80(%rsp), %rax\n"
+    "  movq %rax, %xmm0\n"
+    "  addq $0x98, %rsp\n"
+    "  ret\n"
+    /* ---- the postfix path --------------------------------------------
+     * The argument registers are saved for the same reason as above -- the
+     * handler is told what the method was called with -- and this time they
+     * are saved rather than restored, because the frame outlives the
+     * original's execution and the registers do not.
+     *
+     * `call` the trampoline rather than `jmp` to it: the trampoline runs the
+     * stolen prologue and jumps back into the body, the body's own `ret`
+     * returns here, and control comes back with the result in RAX and XMM0.
+     * 0x20 and 0x28 hold those across the dispatcher call -- both are above
+     * the 32 bytes of home space the callee may write, which is why the save
+     * slots are there and not lower.
+     *
+     * The slot and the generation are spilled here and not on the prefix path:
+     * R11 is dead once the original has been called, and the original is what
+     * this path exists to run. */
+    ".Laowl_post:\n"
+    "  movq %rcx, 0x40(%rsp)\n"
+    "  movq %rdx, 0x48(%rsp)\n"
+    "  movq %r8,  0x50(%rsp)\n"
+    "  movq %r9,  0x58(%rsp)\n"
+    "  movsd %xmm0, 0x60(%rsp)\n"
+    "  movsd %xmm1, 0x68(%rsp)\n"
+    "  movsd %xmm2, 0x70(%rsp)\n"
+    "  movsd %xmm3, 0x78(%rsp)\n"
+    "  movl 8(%r11), %eax\n"
+    "  movl %eax, 0x30(%rsp)\n"
+    "  movl 12(%r11), %eax\n"
+    "  movl %eax, 0x34(%rsp)\n"
+    "  movq 0x38(%rsp), %rax\n"
+    "  call *%rax\n"
+    "  movq %rax, 0x20(%rsp)\n"
+    "  movsd %xmm0, 0x28(%rsp)\n"
+    /* Publish both halves of the return into the frame the host reads: the
+     * integer one where a replacement would go, so an unchanged postfix and
+     * a replacing one write the same slot, and the float one beside it. Only
+     * the declared return type says which is the value, and only the host
+     * has that. */
+    "  movq %rax, 0x80(%rsp)\n"
+    "  movsd %xmm0, 0x88(%rsp)\n"
+    "  movl 0x34(%rsp), %ecx\n"
+    "  leaq 0x40(%rsp), %rdx\n"
+    "  movl 0x30(%rsp), %r8d\n"
+    "  call aowl_patch_return_dispatch\n"
+    "  testl %eax, %eax\n"
+    "  jne .Laowl_repl\n"
+    "  movq 0x20(%rsp), %rax\n"
+    "  movsd 0x28(%rsp), %xmm0\n"
+    "  addq $0x98, %rsp\n"
+    "  ret\n"
+    ".Laowl_repl:\n"
+    "  movq 0x80(%rsp), %rax\n"
+    "  movq %rax, %xmm0\n"
+    "  addq $0x98, %rsp\n"
+    "  ret\n"
+    ".seh_endproc\n");
 
 #else
 #  error "the aowlspt detour thunks are x86-64 only"
 #endif
 
-typedef void (*AowlThunk)(void);
-
-static AowlThunk g_thunks[AOWL_MAX_HOOKS] = {
-    aowl_thunk_0,  aowl_thunk_1,  aowl_thunk_2,  aowl_thunk_3,
-    aowl_thunk_4,  aowl_thunk_5,  aowl_thunk_6,  aowl_thunk_7,
-    aowl_thunk_8,  aowl_thunk_9,  aowl_thunk_10, aowl_thunk_11,
-    aowl_thunk_12, aowl_thunk_13, aowl_thunk_14, aowl_thunk_15
-};
-
 static int32_t aowl_hook_capacity(void) { return AOWL_MAX_HOOKS; }
-static int32_t aowl_hook_used(void) { return g_hookCount; }
 
-/* Claims a slot, installs the hook, and returns the slot index -- which is what
- * `aowlspt_nim_patch_fired` receives, so the host knows which patch fired with
- * no lookup on the hot path. Negative values are the install errors above, or
- * -5 when the pool is exhausted. */
-static int32_t aowl_hook_attach(void* handle, void* target) {
-    if (g_hookCount >= AOWL_MAX_HOOKS) return -5;
-    int32_t slot = g_hookCount;
-    g_hookSlots[slot] = (AowlHook*)handle;
-    int32_t rc = aowl_hook_install(handle, target, (void*)g_thunks[slot]);
+/* ------------------------------------------------------------------ *
+ * Slots come back
+ *
+ * `g_hookCount` used to be the whole allocator: the next slot was the next
+ * number, and `aowl_hook_remove` put the method's bytes back and freed the
+ * trampoline but never said the slot was spare again. Sixteen patches into a
+ * session that was the end of patching -- and a session reaches sixteen
+ * quickly, because a mod that is switched off and on again spends a slot each
+ * time. The seventeenth `patch()` answered "no free patch slots" with fifteen
+ * of them holding nothing, which is the worst shape a limit can have: it is not
+ * the limit the documentation states and it moves with the player's clicking.
+ *
+ * So a slot is now claimed and released, and `g_hookCount` is a high-water mark
+ * rather than a count.
+ *
+ * Reuse is put off as long as it can be: an unused slot before a recycled one,
+ * and the free list a **queue and not a stack** once every slot has been used
+ * once. Removing a detour restores the method's bytes, but a thread that is
+ * already inside the thunk keeps running it, and reusing that slot immediately
+ * would hand its number -- which is the index of the *host's* patch row -- to
+ * whichever patch took it next. See `aowl_hook_claim` for why the queue alone
+ * was doing none of this.
+ *
+ * That is a mitigation and not a proof, and the proof is beside it in two
+ * parts. Every slot carries a **generation**, bumped here on release and
+ * recorded in each hook's own site record at install; and the record is what a
+ * firing reads, so the generation and the trampoline it is being checked
+ * alongside cannot come from different occupants of the slot. See
+ * `aowl_gen_table` and `aowl_write_stub`. The measured cost of the compare was
+ * nothing: a register compare and a branch that is never taken, on a path that
+ * has already loaded the record it came out of.
+ * ------------------------------------------------------------------ */
+static int32_t g_hookFree[AOWL_MAX_HOOKS];
+static int32_t g_hookFreeHead  = 0;
+static int32_t g_hookFreeTail  = 0;
+static int32_t g_hookFreeCount = 0;
+
+/* Live hooks. Equal to the next slot `aowl_hook_attach` will hand out whenever
+ * nothing has been released, which is every caller that only ever installs. */
+static int32_t aowl_hook_used(void) { return g_hookCount - g_hookFreeCount; }
+static int32_t aowl_hook_free_count(void) { return g_hookFreeCount; }
+
+/* Reserves a slot without installing anything.
+ *
+ * Split out from `aowl_hook_attach` for the host's sake: it indexes its own
+ * patch table by slot and the thunk can fire on the next instruction after the
+ * jump lands, so the row has to exist *before* the install -- which means the
+ * slot number has to exist before it too. -5 when the pool is exhausted. */
+static int32_t aowl_hook_claim(void) {
+    int32_t slot;
+    /* A slot that has never been used first, and the free queue only once the
+     * high-water mark has reached the end of the pool.
+     *
+     * The queue was doing nothing it was meant to do. With two live hooks --
+     * which is what two example mods amount to, and what `detour_race.c`
+     * models -- a claim/release cycle oscillates over slots 0 and 1, so "the
+     * oldest freed slot has every other free slot between it and the newest"
+     * described a queue that never held more than one entry. Reaching for an
+     * unused slot first makes the queue actually hold 254 of them before
+     * anything is reused, which is the separation the comment above claims.
+     *
+     * This is a mitigation and not the proof; the proof is that a firing now
+     * carries its own site record and cannot be handed another hook's (see
+     * `aowl_write_stub`). It is kept because it costs one comparison on the
+     * install path and nothing at all on the firing path, and because
+     * "unlikely" and "impossible" failing together is what a second layer is
+     * for. */
+    if (g_hookCount < AOWL_MAX_HOOKS) {
+        slot = g_hookCount++;
+        g_hookTaken[slot] = 1;
+        return slot;
+    }
+    if (g_hookFreeCount > 0) {
+        slot = g_hookFree[g_hookFreeHead];
+        g_hookFreeHead = (g_hookFreeHead + 1) % AOWL_MAX_HOOKS;
+        g_hookFreeCount--;
+        g_hookTaken[slot] = 1;
+        return slot;
+    }
+    return -5;
+}
+
+/* Hands a claimed slot back. The caller must have removed and freed its hook
+ * first: this clears the tables the thunk reads and nothing else. */
+static void aowl_hook_release(int32_t slot) {
+    if (slot < 0 || slot >= AOWL_MAX_HOOKS) return;
+    if (!g_hookTaken[slot]) return;
+    /* Before the tables the thunk reads, not after: a firing that is in flight
+     * right now should see the new generation as early as possible, and the
+     * ones it would otherwise chase -- the trampoline, the postfix flag -- are
+     * cleared underneath it. The counter wraps at 2^32 releases of one slot,
+     * which is not a session. */
+    aowl_gen_table[slot]++;
+    g_hookTaken[slot] = 0;
+    g_hookSlots[slot] = NULL;
+    /* Nothing here touches the released hook's **site**, and nothing may.
+     * A thread can be anywhere between the stub's `mov r11` and the dispatcher
+     * right now, and the site is where it is about to read the trampoline it
+     * will run. Clearing it would put a NULL in the one place a firing jumps
+     * through -- which is what clearing the old slot-indexed trampoline table
+     * here used to do, and in `tests/detour_race.c` that was every worker's
+     * first call.
+     *
+     * Leaving it is safe because the site and the trampoline it names are
+     * never freed and never handed out twice -- see `aowl_tramp_alloc`. The
+     * retired copy stays mapped, stays the stolen prologue of the method this
+     * hook patched, and still jumps to `target + stolen`, where
+     * `aowl_hook_remove` has just put the original bytes back. A late firing
+     * runs the original. */
+    aowl_post_table[slot] = 0;
+    g_hookFree[g_hookFreeTail] = slot;
+    g_hookFreeTail = (g_hookFreeTail + 1) % AOWL_MAX_HOOKS;
+    g_hookFreeCount++;
+}
+
+/* Installs into a slot already claimed. 0 on success, or one of the install
+ * errors above; the slot stays claimed either way, so a caller that fails here
+ * releases it itself -- which is what the host does, after taking its own row
+ * back out. */
+static int32_t aowl_hook_attach_at(void* handle, void* target, int32_t slot) {
+    if (slot < 0 || slot >= AOWL_MAX_HOOKS) return -1;
+    if (!g_hookTaken[slot]) return -1;
+    AowlHook* h = (AowlHook*)handle;
+    g_hookSlots[slot] = h;
+    int32_t rc = aowl_hook_prepare_ex(handle, target, NULL, 1);
     if (rc != 0) {
         g_hookSlots[slot] = NULL;
         return rc;
     }
-    /* The thunk reads the trampoline out of this table rather than walking the
-     * hook struct, so the hot path is one load rather than two. */
-    aowl_tramp_table[slot] = ((AowlHook*)handle)->trampoline;
-    g_hookCount++;
+    /* The site is filled and the stub written **before** the jump goes in, and
+     * that order is the whole reason `aowl_hook_prepare` and `aowl_hook_arm`
+     * are separate: the stub can be entered on the instruction after the jump
+     * lands, and a firing that arrives to find a half-built record jumps
+     * through whatever is in it. When the equivalent assignment came after the
+     * arm, `tests/detour_race.c` hit it on the first call of every worker it
+     * started.
+     *
+     * Everything a firing will ever read about this hook is written here, once,
+     * and never again -- which is what makes the record a fact about the hook
+     * rather than about the moment. */
+    AowlSite* site = (AowlSite*)h->site;
+    site->tramp = h->trampoline;
+    site->gen   = aowl_gen_table[slot];
+    site->slot  = slot;
+    site->post  = aowl_post_table[slot];
+    aowl_write_stub((uint8_t*)h->stub, site);
+    FlushInstructionCache(GetCurrentProcess(), h->stub, AOWL_STUB_SIZE);
+    h->detour = h->stub;
+
+    rc = aowl_hook_arm(handle);
+    if (rc != 0) {
+        /* The site and the stub are left as they are. Nothing jumps to them --
+         * the arm failed, so no jump was written -- and they are this hook's
+         * own memory, retired with it rather than handed to anybody else. */
+        g_hookSlots[slot] = NULL;
+        return rc;
+    }
+    return 0;
+}
+
+/* Claims a slot, installs the hook, and returns the slot index -- which is what
+ * `aowlspt_nim_patch_fired` receives, so the host knows which patch fired with
+ * no lookup on the hot path. Negative values are the install errors above, or
+ * -5 when the pool is exhausted.
+ *
+ * The one-call form, for a caller that has nothing to write down between the
+ * two halves. The host uses `aowl_hook_claim` and `aowl_hook_attach_at`
+ * instead, because it does. */
+static int32_t aowl_hook_attach(void* handle, void* target) {
+    int32_t slot = aowl_hook_claim();
+    if (slot < 0) return -5;
+    int32_t rc = aowl_hook_attach_at(handle, target, slot);
+    if (rc != 0) {
+        aowl_hook_release(slot);
+        return rc;
+    }
     return slot;
 }
 

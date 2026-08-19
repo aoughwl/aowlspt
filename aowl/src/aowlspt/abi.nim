@@ -16,7 +16,41 @@
 
 const
   AbiVersion* = 1'u32
-  AbiRevision* = 2'u32
+  AbiRevision* = 5'u32
+
+  HostApiSizeRev1* = 168'i32
+  HostApiSizeRev2* = 192'i32
+  HostApiSizeRev3* = 208'i32
+  HostApiSizeRev4* = 216'i32
+  HostApiSizeRev5* = 224'i32
+    ## How large `HostApi` was at each revision, as literals.
+    ##
+    ## A capability test has to be against the boundary the capability appeared
+    ## at, not against `sizeof(HostApi)`. The obvious form -- "the host's size is
+    ## at least the size I know about" -- is right for exactly one revision:
+    ## revision 3 grows `sizeof` to 208, so a mod asking only for the
+    ## revision-2 store would start refusing a revision-2 host that has it.
+    ##
+    ## Literals rather than arithmetic over the struct because the whole point
+    ## is that they must *not* move when the struct does.
+    ## `tests/abi_layout.nim` and `tests/abi_layout.c` pin all four to the real
+    ## offsets, from the two sides.
+    ##
+    ## Revision 3 is `handlePointer`/`handlePin`, revision 4 is `patchTyped`
+    ## and revision 5 is `notifyPush`. They are separate boundaries rather than
+    ## one because a host may have any of them without the others: the
+    ## addresses need a managed heap, the typed patch needs a working detour
+    ## engine, the push needs a listening socket, and `size` says how much was
+    ## filled rather than which header the host saw.
+    ##
+    ## Revision 5 is where the *watermark* in that sentence stopped being free.
+    ## Only the client host can fill 3 and 4; only the backend can fill 5; one
+    ## integer cannot say "the fifth and not the third". A host in that position
+    ## fills the entries under its watermark with the refusal it already owes --
+    ## `abi/aowlspt_notify.h` does exactly that for the backend -- so a size test
+    ## keeps meaning "there is a function here that will answer", which is all it
+    ## ever established. It cannot mean more than that here in any case: nimony
+    ## will not cast a proc field to a pointer to compare it against null.
 
 type
   Status* = int32
@@ -32,6 +66,22 @@ const
   ErrWrongThread* = -7'i32
   ErrDisposed* = -8'i32
   ErrModFault* = -9'i32
+
+  ErrConfigParse* = -10'i32
+    ## `config.json` exists and is **not readable JSON**, so no key in it can
+    ## be answered. Distinct from `ErrNotFound`, which is the ordinary "no such
+    ## setting, use your default".
+    ##
+    ## They were the same status, and that is how a BOM on the mod manager's
+    ## config made it read `activeLists` as empty, resolve nothing, and write a
+    ## selection naming only itself -- one mod out of ten loaded on the next
+    ## start, with no error anywhere. A mod that falls back to defaults on any
+    ## failure, which is most of them, cannot tell "absent" from "the file is
+    ## broken" without this.
+    ##
+    ## `lastError()` after one of these names the file and the fault -- the
+    ## offset and what was found there -- not the key. The key is not what is
+    ## missing.
 
   ## Returned by a prefix patch to suppress the original method.
   PatchSkip* = 1'i32
@@ -107,6 +157,30 @@ type
   PatchFn* = proc (user: pointer; target, args: AowlSlice;
                    outBuf: ptr AowlBuffer): Status {.cdecl.}
 
+  PatchFramePtr* = pointer
+    ## A borrowed `const AowlPatchFrame*`. Opaque here: the accessors live in
+    ## `aowlspt.nim`, over the `static` readers in `abi/aowlspt_frame.h`, so
+    ## that this file stays a transliteration of the struct layout and nothing
+    ## else.
+
+  TypedPatchFn* = proc (user: pointer; frame: PatchFramePtr): Status {.cdecl.}
+    ## Revision 4's patch handler: the same two return statuses, and a borrowed
+    ## view of the saved registers instead of a JSON payload.
+
+  ArgKind* = enum
+    ## What one slot of a typed frame is, decided once at registration.
+    ## Mirrors `AowlArgKind`; the numbers are wire values.
+    akNone = 0'i32
+    akInt = 1
+    akFloat = 2
+    akDouble = 3
+    akObject = 4
+    akValue = 5
+    akBigValue = 6
+    akVoid = 7
+    akStack = 8
+    akUnknown = 9
+
   HostApi* {.bycopy.} = object
     size*: int32
     ctx*: pointer
@@ -150,6 +224,30 @@ type
     storeGet*: proc (ctx: pointer; key: AowlSlice; outBuf: ptr AowlBuffer): Status {.cdecl.}
     storeSet*: proc (ctx: pointer; key, value: AowlSlice): Status {.cdecl.}
     storeList*: proc (ctx: pointer; prefix: AowlSlice; outBuf: ptr AowlBuffer): Status {.cdecl.}
+
+    # -- revision 3 ---------------------------------------------------------
+    # The address behind a handle, for a mod that wants to reach an object on
+    # its own fast path rather than through `call`. Present only on a host with
+    # a managed heap, which is why `size` may still say revision 2 on a host
+    # built from this same header -- see `livePointersReady`.
+    handlePointer*: proc (ctx: pointer; handle: Handle;
+                          outAddress: ptr uint64): Status {.cdecl.}
+    handlePin*: proc (ctx: pointer; handle: Handle;
+                      outPinned: ptr Handle): Status {.cdecl.}
+
+    # -- revision 4 ---------------------------------------------------------
+    # The same detour, with the arguments left in the registers the thunk saved
+    # rather than described as JSON. See `patchTyped` in `aowlspt.nim` for what
+    # that is worth and `abi/aowlspt_frame.h` for how the frame is read.
+    patchTyped*: proc (ctx: pointer; target: AowlSlice; kind: int32;
+                       handler: TypedPatchFn; user: pointer): Status {.cdecl.}
+
+    # -- revision 5 ---------------------------------------------------------
+    # Hand a notification to whatever the host has that reaches this player --
+    # a websocket, on the backend. `ErrNotFound` means "no connection for that
+    # session", which is a normal answer and the mod's cue to fall back rather
+    # than a failure.
+    notifyPush*: proc (ctx: pointer; session, payload: AowlSlice): Status {.cdecl.}
 
   ModInfo* {.bycopy.} = object
     size*: int32

@@ -353,6 +353,21 @@ static void aowl_fld_set_f64(void* o, int32_t off, double v)  { memcpy((char*)o 
 static void aowl_fld_set_u8 (void* o, int32_t off, int32_t v) { uint8_t b = (uint8_t)(v != 0); memcpy((char*)o + off, &b, 1); }
 static void aowl_fld_set_ptr(void* o, int32_t off, void* v)   { memcpy((char*)o + off, &v, sizeof(void*)); }
 
+/* The same store, routed through the collector.
+ *
+ * `il2cpp_gc_wbarrier_set_field(object, void** field, value)` wants the
+ * *address* of the field, not its offset, which is the only reason this is a
+ * helper rather than a call made directly from nimony. `fn` is the runtime's
+ * entry, already resolved -- passing it in keeps this file free of any
+ * knowledge of how entries are looked up.
+ *
+ * Why it exists at all: a generational collector has to be told when an old
+ * object starts referring to a young one. A plain store does not tell it, the
+ * young object is collected while still referenced, and the crash arrives at
+ * the next collection with nothing on the stack to connect it to the write. */
+static void aowl_fld_set_ptr_wb(void* fn, void* o, int32_t off, void* v)
+{ ((void(*)(void*, void**, void*))fn)(o, (void**)((char*)o + off), v); }
+
 /* ==================================================================== *
  * Timing
  *

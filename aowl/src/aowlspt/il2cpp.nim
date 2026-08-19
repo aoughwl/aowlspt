@@ -25,7 +25,7 @@
 ## runtime symbol resolution (which is not optional: inside the game the module
 ## is already loaded, and out of it the path is only known to the caller), the
 ## indirect call is done in `abi/aowlspt_shim.h`, one trampoline per distinct
-## signature. There are sixteen of them and they are each one line. Compile with
+## signature. There are eighteen of them and they are each one line. Compile with
 ## `--passC:-I<repo>/abi`.
 ##
 ## **What this module deliberately does not do:** it does not read
@@ -665,6 +665,54 @@ proc classFromType*(rt: Il2Cpp; t: Il2CppType): Il2CppClass =
   if not rt.has(eClassFromType): return nullPtr()
   result = tpP(rt.fns[ord(eClassFromType)], t)
 
+var gBoxHeader = -1
+
+proc boxHeaderBytes*(rt: Il2Cpp): int =
+  ## How much of a value type's reported instance size is object header --
+  ## measured, not assumed.
+  ##
+  ## `il2cpp_class_get_instance_size` on the game reports a value type's
+  ## **boxed** size, header plus payload, because that is the only form the
+  ## runtime allocates. That is not universal: a stand-in can just as reasonably
+  ## report the payload, and both answers are self-consistent, so no single
+  ## number in isolation tells them apart.
+  ##
+  ## One number whose payload is *known* does. `System.Int32` holds four bytes
+  ## by definition, so whatever this runtime reports for it, minus four, is the
+  ## header. `System.Double` only checks that answer: eight bytes of payload
+  ## must report four more than `Int32` does, and if it does not, this runtime
+  ## is not measuring what it is assumed to be, and the fallback stands.
+  ##
+  ## Getting it wrong subtracts a header that is not there, which turns every
+  ## small value type into a negative width and refuses it -- an enum reported
+  ## as unclassifiable, a shaped call quietly falling back to reflection, and
+  ## the log saying the shape was checked. Two mods hit exactly that before this
+  ## existed; the host has the same calculation in `invoke.nim`.
+  if gBoxHeader >= 0:
+    return gBoxHeader
+  gBoxHeader = 16
+  let i32 = findClass(rt, "System.Int32")
+  if i32 != nil:
+    let a = classInstanceSize(rt, i32)
+    if a >= 4:
+      let f64 = findClass(rt, "System.Double")
+      var agree = true
+      if f64 != nil:
+        agree = classInstanceSize(rt, f64) - a == 4
+      if agree:
+        gBoxHeader = a - 4
+  result = gBoxHeader
+
+proc valueWidth*(rt: Il2Cpp; c: Il2CppClass): int =
+  ## The payload width of a value type, or 0 if it is not one. See
+  ## `boxHeaderBytes` for why the header is measured rather than named.
+  result = 0
+  if c == nil or not classIsValueType(rt, c):
+    return 0
+  let n = classInstanceSize(rt, c) - boxHeaderBytes(rt)
+  if n > 0:
+    result = n
+
 proc fieldFlags*(rt: Il2Cpp; f: Il2CppField): uint32 =
   ## Field attributes. Bit 0x10 is `static`, which cannot be inferred reliably
   ## from the offset: a static field's offset is into the class's static data,
@@ -693,3 +741,14 @@ proc writeBarrier*(rt: Il2Cpp; obj, field, value: Il2CppPtr) =
   tvPPP(rt.fns[ord(eGcWriteBarrier)], obj, field, value)
 
 proc hasWriteBarrier*(rt: Il2Cpp): bool = rt.has(eGcWriteBarrier)
+
+proc writeBarrierFn*(rt: Il2Cpp): Il2CppPtr =
+  ## The resolved entry itself, for the fast path.
+  ##
+  ## `writeBarrier` above is the pleasant form and costs a `has` test and an
+  ## `Il2Cpp` copy per call. A `FieldBinding` is bound once and written many
+  ## times, so it keeps this pointer instead and branches on nil -- which is
+  ## also how it records that a runtime *without* the entry was bound against,
+  ## rather than silently deciding that question again at every write.
+  if not rt.has(eGcWriteBarrier): return nullPtr()
+  result = rt.fns[ord(eGcWriteBarrier)]

@@ -213,6 +213,41 @@ static uint64_t aowl_spawn(const char* exePath, const char* workDir,
     return (uint64_t)(uintptr_t)pi.hProcess;
 }
 
+/* The same spawn with no console of its own.
+ *
+ * `aowl_spawn` above asks for CREATE_NEW_CONSOLE, which is right for a tool
+ * that starts one server and wants its log where a person can watch it. It is
+ * wrong for a test that starts and kills a process dozens of times in a row:
+ * that flashes a window across the screen of whoever happens to be using the
+ * machine, and a test people turn off has stopped testing anything.
+ */
+static uint64_t aowl_spawn_quiet(const char* exePath, const char* workDir,
+                                 const char* cmdLine) {
+    STARTUPINFOA si;
+    PROCESS_INFORMATION pi;
+    char* mutableCmd = NULL;
+
+    ZeroMemory(&si, sizeof(si));
+    si.cb = sizeof(si);
+    si.dwFlags = STARTF_USESHOWWINDOW;
+    si.wShowWindow = SW_HIDE;
+    ZeroMemory(&pi, sizeof(pi));
+
+    if (cmdLine && cmdLine[0]) {
+        size_t n = strlen(cmdLine);
+        mutableCmd = (char*)calloc(1, n + 1);
+        if (!mutableCmd) return 0;
+        memcpy(mutableCmd, cmdLine, n);
+    }
+
+    BOOL ok = CreateProcessA(exePath, mutableCmd, NULL, NULL, FALSE,
+                             CREATE_NO_WINDOW, NULL, workDir, &si, &pi);
+    free(mutableCmd);
+    if (!ok) return 0;
+    CloseHandle(pi.hThread);
+    return (uint64_t)(uintptr_t)pi.hProcess;
+}
+
 static int32_t aowl_spawn_alive(uint64_t handle) {
     DWORD code = 0;
     if (!handle) return 0;
@@ -220,11 +255,36 @@ static int32_t aowl_spawn_alive(uint64_t handle) {
     return code == STILL_ACTIVE;
 }
 
+/* Kill it, and wait for it to actually be dead before letting the handle go.
+ *
+ * `TerminateProcess` is asynchronous: it returns as soon as the kill is
+ * requested, so a caller that immediately re-binds the port or re-opens the
+ * store can lose a race against a process that is still exiting. One second is
+ * far longer than that takes and far shorter than a hang.
+ *
+ * The handle is closed here, which means an exit code cannot be read
+ * afterwards -- `aowl_spawn_alive` on a closed handle answers about nothing.
+ * A tool that kills a child and then asks how it died must read the code
+ * *before* calling this. That has already produced one wrong answer: a test
+ * reported a server as having crashed when another agent's cleanup had killed
+ * it by image name. */
 static void aowl_spawn_kill(uint64_t handle) {
     if (handle) {
         TerminateProcess((HANDLE)(uintptr_t)handle, 0);
+        WaitForSingleObject((HANDLE)(uintptr_t)handle, 1000);
         CloseHandle((HANDLE)(uintptr_t)handle);
     }
+}
+
+/* The exit code, while the handle is still open. `STILL_ACTIVE` (259) means it
+ * has not exited; anything with the high bit set is a fault rather than an
+ * ordinary exit, and the difference decides whether a request killed a server
+ * or something outside the test did. */
+static int32_t aowl_spawn_exit_code(uint64_t handle) {
+    DWORD code = 0;
+    if (!handle) return -1;
+    if (!GetExitCodeProcess((HANDLE)(uintptr_t)handle, &code)) return -1;
+    return (int32_t)code;
 }
 
 static int32_t aowl_launch_wait(void* handle, int32_t ms) {

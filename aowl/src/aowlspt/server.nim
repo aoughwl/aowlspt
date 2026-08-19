@@ -8,8 +8,12 @@
 ##     discard Player.invoke("Heal", 50)
 ##
 ##     # server
-##     discard get "/aowlspt/status":
-##       json {"ok": true}
+##     proc status(url, body, session: string): string =
+##       var o = obj()
+##       o.put("ok", true)
+##       envelope(o)
+##
+##     discard serve("/aowlspt/status", status)
 ##
 ## What this wraps is `route_register`, `db_get`/`db_patch` and `config_get`.
 ## Underneath it is the same ABI the client uses, which is why one mod binary
@@ -177,25 +181,60 @@ proc asFloat*(v: DbValue; default: float = 0.0): float =
 proc asInt*(v: DbValue; default: int = 0): int =
   result = int(asFloat(v, float(default)))
 
+proc lastDotIn(s: string): int =
+  result = -1
+  for i in 0 ..< s.len:
+    if s[i] == '.':
+      result = i
+
+proc dbWritePath(path, patchJson: string): Status =
+  ## Merges into `path`, **creating it when it is not there**.
+  ##
+  ## Three mods hand-rolled this same fallback under three different names,
+  ## which is the signal that it belongs here. The reason each of them needed
+  ## it: a patch of a member that has never been written is refused with "no
+  ## such database path", which is right for *patching* something and wrong for
+  ## a mod adding a table of its own -- a faction's bot types, a location the
+  ## database has never held, an achievement list.
+  ##
+  ## `aowlspt-backend` creates the path itself, so the fallback below never
+  ## runs there. It exists for the hosts that do not: a miss is retried as a
+  ## one-member object merged into the parent, and into *its* parent if that is
+  ## missing too, wrapping as it goes.
+  ##
+  ## It stops one segment short of the root, because an empty path locates
+  ## nothing -- so a database with no top-level `locations` at all is reported
+  ## rather than silently skipped.
+  result = dbPatch(path, patchJson)
+  if result == Ok:
+    return
+  let cut = lastDotIn(path)
+  if cut < 0:
+    return
+  let parent = path.substr(0, cut - 1)
+  let leaf = path.substr(cut + 1)
+  result = dbWritePath(parent, "{\"" & leaf & "\":" & patchJson & "}")
+
 proc dbWrite*(path: string; patch: Json): Status =
-  ## Merges `patch` into the object at `path`.
+  ## Merges `patch` into the object at `path`, creating the path if the
+  ## database has never held it.
   ##
   ## A merge, not a replace: two mods editing sibling fields of the same item
   ## must not clobber one another. That is the difference between a mod system
   ## and a pile of mods that happen to coexist.
-  result = dbPatch(path, patch.text)
+  result = dbWritePath(path, patch.text)
 
 proc dbWrite*(path, patchJson: string): Status =
-  result = dbPatch(path, patchJson)
+  result = dbWritePath(path, patchJson)
 
 proc dbWrite*(path: string; patch: JsonObject): Status =
   ## The overload that was missing, so `dbWrite(path, obj)` had to be written
   ## `dbWrite(path, done(obj))` -- and `done(obj)` at every call site is
   ## ceremony that says nothing.
-  result = dbPatch(path, done(patch).text)
+  result = dbWritePath(path, done(patch).text)
 
 proc dbWrite*(path: string; patch: JsonArray): Status =
-  result = dbPatch(path, done(patch).text)
+  result = dbWritePath(path, done(patch).text)
 
 # ---------------------------------------------------------------------------
 # Config
@@ -205,20 +244,49 @@ type
   ConfigValue* = object
     ok*: bool
     raw*: string
+    faulted*: bool
+      ## The config file exists and did not parse, so **no** setting read
+      ## through this mod is real -- not just this one.
+      ##
+      ## Appended rather than folded into `ok`, and that is the compatibility
+      ## story: `ok` is false in this case exactly as it was before, so every
+      ## `asText(default)` and every `if v.ok` in every mod already written
+      ## behaves identically. What is new is that a mod which cares can now
+      ## ask, and the ones that should care are the ones whose defaults are a
+      ## *decision* rather than a fallback -- a load order, an enabled set, a
+      ## list of maps. `lastError()` carries the file and the fault.
 
 proc setting*(key: string): ConfigValue =
   var out1 = ""
-  if configGet(key, out1) == Ok:
-    result = ConfigValue(ok: true, raw: out1)
+  let st = configGet(key, out1)
+  if st == Ok:
+    result = ConfigValue(ok: true, raw: out1, faulted: false)
   else:
-    result = ConfigValue(ok: false, raw: "")
+    # `raw` is kept on a parse fault, and only there. `setting("")` on a broken
+    # file hands back the bytes that are on disk, which is what a mod that
+    # parses its own document needs in order to say *what* is wrong with it --
+    # and what the backend and the client host used to return with a bare `Ok`,
+    # so a mod already written that way keeps working unchanged. `ok` is false
+    # either way, so nothing that reads through `asText` and friends can see a
+    # difference.
+    result = ConfigValue(ok: false, raw: out1, faulted: st == ErrConfigParse)
+
+proc configFaulted*(): bool =
+  ## Whether this mod's `config.json` is present and unreadable.
+  ##
+  ## The question asked once, at load, by a mod that would rather refuse than
+  ## run on defaults it did not choose. It reads the whole document, which is
+  ## the cheapest way to ask -- an empty key is one round trip on every host.
+  var whole = ""
+  result = configGet("", whole) == ErrConfigParse
 
 proc asText*(c: ConfigValue; default: string = ""): string =
   ## The quotes come off here, whichever host is underneath.
   ##
   ## They did not, and the three hosts disagreed: the backend and the client
-  ## host strip them on the way out, the .NET simulator hands back the raw JSON
-  ## literal. So `setting("edition").asText()` was `standard` on a server and
+  ## host strip them on the way out, while the simulator -- then a C# program,
+  ## since rewritten in nimony -- handed back the raw JSON literal. So
+  ## `setting("edition").asText()` was `standard` on a server and
   ## `"standard"` in the simulator -- an empty string setting had length two,
   ## and a value used to build a database path addressed nothing on one side
   ## while working on the other. Two mods had already grown their own private
@@ -352,6 +420,18 @@ type
     ok*: bool
     raw*: string
     error*: string
+    missing*: bool
+      ## True when there is no such key, false when there *is* one and it could
+      ## not be read.
+      ##
+      ## The difference is not cosmetic and it is not a logging detail. A mod
+      ## that keeps a player's progress reacts to "nothing saved yet" by making
+      ## a new one, which is right on a first run and is the worst possible
+      ## answer to "your save is on disk and the host could not read it": it
+      ## writes a new character over a file that a copy out of the store's
+      ## history would very likely have recovered. Anything that creates on a
+      ## failed `load` must check this first and refuse loudly when it is
+      ## false.
 
 proc save*(key: string; value: Json): Status =
   ## Write this mod's value at `key`, durably. Keys are flat and
@@ -366,13 +446,15 @@ proc save*(key: string; value: JsonObject): Status = save(key, done(value))
 
 proc load*(key: string): Stored =
   ## Read this mod's value at `key`. `ok` is false and `error` says why when it
-  ## was never written -- which is the normal first-run case, not a fault.
+  ## was never written -- which is the normal first-run case, not a fault --
+  ## and `missing` separates that case from a value that is there and unreadable.
   var text = ""
   let st = storeGet(key, text)
   if st == Ok:
-    result = Stored(ok: true, raw: text, error: "")
+    result = Stored(ok: true, raw: text, error: "", missing: false)
   else:
-    result = Stored(ok: false, raw: "", error: lastError())
+    result = Stored(ok: false, raw: "", error: lastError(),
+                    missing: st == ErrNotFound)
 
 proc saved*(key: string): bool =
   var text = ""

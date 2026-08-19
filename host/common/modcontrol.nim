@@ -1,0 +1,997 @@
+## The host half of live mod control: loading and unloading mods while the
+## game and the server are both running.
+##
+## `mods/manager` speaks a small request/reply protocol over the ordinary event
+## channel, and has done since it was written -- but nothing answered, because
+## an event emitted by a mod is delivered to *subscribers* and a host is not a
+## subscriber. So the manager degraded to "recorded; takes effect on restart"
+## forever. This module is what answers, and it is shared by both hosts because
+## the protocol is the same on either side of the wire and two implementations
+## of it would drift the way the two JSON path lookups did.
+##
+## The protocol, verbatim from `mods/manager/mgr/control.nim`:
+##
+##   `aowlspt.host.mods.probe`   {"from":"<guid>"}
+##     -> `aowlspt.host.mods.capabilities`
+##        {"host":"...","version":"...","control":true,"load":true,
+##         "unload":true,"reloadNeedsRestart":false}
+##
+##   `aowlspt.host.mods.load`    {"guid":"...","path":"<absolute .dll>"}
+##   `aowlspt.host.mods.unload`  {"guid":"..."}
+##     -> `aowlspt.host.mods.result`
+##        {"guid":"...","action":"load"|"unload","ok":...,"deferred":...,
+##         "error":"..."}
+##
+##   `aowlspt.host.mods.list`    {}
+##     -> `aowlspt.host.mods.listed`
+##        {"mods":[{"guid","name","version","path","live","hotReloadable"}]}
+##
+## ---------------------------------------------------------------------------
+## The client host's answer, which does not travel on the event channel
+## ---------------------------------------------------------------------------
+##
+## Everything above only works where the manager and the host share a process.
+## The client host does not: it polls `/aowlspt/mods/client/<hostver>` for the
+## set it should be running, acts, and -- until the ledger further down existed
+## -- said nothing back. So the manager's `live` and `restart` verdicts for a
+## client-side mod were its own guess about a process it cannot see.
+##
+## The answer rides the *next poll*, in the query string, because that request
+## is already being made and a second channel would need an HTTP client, a
+## socket and a thread that this DLL has exactly one of, inside the overlay,
+## for the panel:
+##
+##   GET /aowlspt/mods/client/<hostver>?hs=<sid>&sq=<n>&r=<records>[&more=1]
+##
+##   hs   this host *process*, 1..16 of [0-9a-f]. Constant for one run of the
+##        game. A different `hs` means every outcome held for this host is from
+##        a process that no longer exists and drops back to unknown.
+##   sq   decimal, from 0, +1 on every real change to any row. The same `sq`
+##        twice carries no news -- it is a re-send, not a repetition of intent.
+##   r    records joined by `!`, each `<guid>~<want><outcome>[~<code>]`
+##          <want>     `+` should be loaded, `-` should be unloaded
+##          <outcome>  one letter, closed set:
+##                       n  nothing to do; already in that state
+##                       k  attempted, and it worked
+##                       s  **not attempted**; `code` says why
+##                       r  attempted and refused; refused after a restart too
+##                       d  attempted and refused *live*; holds on restart
+##          <code>     optional slug, only on s/r/d, from the closed set below
+##   more `1` when the rows did not all fit in the path. The rest arrive on
+##        later polls; the host rotates rather than prioritises, so every row is
+##        said within a few polls.
+##
+## **A guid with no record is a guid this host has not answered about**, and
+## that is the load-bearing distinction: there is deliberately no letter for it.
+## `more=1`, a truncated path, an old host and a host that has not polled yet
+## all converge on absence, and absence means unknown -- never "no", never
+## "off", never "not running". The manager may only ever narrow a mod's state on
+## a record it actually received.
+##
+## `k` is transient. The tick after a load or unload succeeds, the mod is simply
+## in the state it was asked for, and the next poll reports it as `n`. Both mean
+## "this mod is where you wanted it"; `k` additionally means "and this host is
+## the one that just moved it". A manager deciding what is *running* must treat
+## them identically -- reading `k` as a durable state and `n` as a lesser one
+## would have every successful change appear to regress one poll later.
+##
+## Two more rules a reader has to keep:
+##
+##  * The query is a *report*, not a filter. The body served must be the same
+##    body the bare route serves. A manager that answered a filtered set to a
+##    reporting host would make the report change the thing it reports on.
+##  * A bare path with no query is a host that has nothing to say -- an older
+##    build, or one that has not been told a session -- and is byte-for-byte
+##    what this route saw before any of this existed.
+##
+## ---------------------------------------------------------------------------
+## Why every request is queued and nothing happens inside the emit
+## ---------------------------------------------------------------------------
+##
+## `broadcast` is delivered synchronously. At the moment a control request
+## arrives, the stack runs through the manager's own route handler -- and, for
+## an unload, quite possibly through the mod being unloaded. Calling
+## `FreeLibrary` there would return into unmapped memory. So `submit` only
+## records the request and returns; `drain` performs it from the host's own
+## loop, where the only aowlspt code on the stack is the host's.
+##
+## That is also why the manager's `requestUnload` answers `aoRequested` rather
+## than `aoApplied` and learns the outcome from the next `result`.
+##
+## ---------------------------------------------------------------------------
+## What is refused, and why refusing is the feature
+## ---------------------------------------------------------------------------
+##
+## A mod is taken out only when the host can prove it left nothing behind: the
+## host must have registered a teardown (`setModTeardown`), and the teardown
+## must drop routes, event subscriptions, timers and detours. Without one,
+## `unloadOne` refuses -- and this module reports that refusal as
+## `deferred:true`, meaning "on restart", rather than unloading anyway.
+##
+## The `AOWLSPT_MOD_HOT_RELOADABLE` flag is reported in `listed` but is **not**
+## required for an unload, and that is a deliberate reading of the ABI: the flag
+## says the mod implements `state_save`/`state_load` and can be taken out *and
+## put back* mid-session without losing what it was doing. Taking a mod out and
+## leaving it out needs less than that -- it needs `on_unload` to run and the
+## host to drop the registrations, both of which the host guarantees. A mod
+## without the flag that is unloaded and then loaded again comes up in its
+## initial state, which is exactly what "disable it, then enable it" means to
+## the person clicking the switch.
+
+## ---------------------------------------------------------------------------
+## Why the host is passed in rather than imported
+## ---------------------------------------------------------------------------
+##
+## Both hosts now share one loader -- `host/common/modhost.nim` -- so the
+## original reason for `HostOps` (there were two loaders and importing either
+## would have tied this module to one host) is gone. It stays anyway, and the
+## reasons it stays are not the reason it was written:
+##
+##  * The wrappers are *not* the same on both sides. `load` carries the host's
+##    own side, name and version; `unload` on the client also marks the mod's
+##    row in the overlay as stopped. Those are host facts, and a version of
+##    this module that called `modhost` directly would have to grow a way to be
+##    told them anyway -- which is `HostOps` with extra steps.
+##  * It keeps this module usable by a host that is not built on `modhost` --
+##    the C# hosts, or the next one. The protocol is the wire, not the loader,
+##    and a `modcontrol` that could only answer for `modhost.gMods` would be a
+##    third implementation of the wire waiting to be written.
+##
+## So the host still hands over a `HostOps`: twelve small procs, each one a
+## thing this module needs to know or do and nothing more, and neither host has
+## to expose its mod table to get it.
+
+import std/strutils
+import aowlsptinstall/winfs
+import jsonpath
+
+type
+  EmitFn* = nil proc (name, payload: string)
+    ## How this module answers. Each host delivers events to its own subscriber
+    ## list, so the delivery is passed in rather than reimplemented here.
+    ## `nil proc` for the reason `TeardownFn` is: nimony's proc types are
+    ## non-nil by default and this starts as nil.
+
+  CountFn* = nil proc (): int
+  TextOfFn* = nil proc (index: int): string
+  FlagFn* = nil proc (index: int): bool
+  FlagsOfFn* = nil proc (index: int): uint32
+  LiveOfFn* = nil proc (index: int): bool
+  LoadFn* = nil proc (path: string): bool
+  UnloadFn* = nil proc (guid: string): string
+    ## Empty on success; otherwise the host's own words about why not.
+  IndexFn* = nil proc (guid: string): int
+  LogFn* = nil proc (msg: string)
+
+  HostOps* = object
+    count*: CountFn
+    guidOf*: TextOfFn
+    nameOf*: TextOfFn
+    versionOf*: TextOfFn
+    pathOf*: TextOfFn
+    liveOf*: LiveOfFn
+    flagsOf*: FlagsOfFn
+    indexOf*: IndexFn
+    canUnload*: FlagFn
+      ## Takes an index it ignores -- nimony has no zero-argument proc type in
+      ## this object without a second name for it, and one shape for every
+      ## predicate is worth more than the argument it discards.
+    load*: LoadFn
+    unload*: UnloadFn
+    log*: LogFn
+
+  DesiredMod* = object
+    ## One row of the backend's answer to "what should be running on this
+    ## side". Deliberately not a verdict, a reason or a conflict: the manager
+    ## resolves, this obeys, and a host that carried enough of the registry to
+    ## second-guess it would be a second resolver to keep in step.
+    guid*: string
+    enabled*: bool
+    dir*: string   ## the artifact directory, relative to the host's mods root
+    lib*: string   ## the library file inside it
+
+  PendKind = enum
+    pkProbe
+    pkLoad
+    pkUnload
+    pkList
+
+  Pending = object
+    kind: PendKind
+    guid: string
+    path: string
+
+const ControlPrefix* = "aowlspt.host.mods."
+const ModHotReloadable* = 1'u32   ## AOWLSPT_MOD_HOT_RELOADABLE
+
+var gEmit: EmitFn = nil
+var gOps: HostOps = HostOps(count: nil, guidOf: nil, nameOf: nil,
+                            versionOf: nil, pathOf: nil, liveOf: nil,
+                            flagsOf: nil, indexOf: nil, canUnload: nil,
+                            load: nil, unload: nil, log: nil)
+var gHostName = ""
+var gHostVersion = ""
+var gSide = 0'i32
+var gReady = false
+var gQueue: seq[Pending] = @[]
+
+proc controlInit*(hostName, hostVersion: string; side: int32; emit: EmitFn;
+                  ops: HostOps) =
+  ## Called once by the host at startup, after the mods are up. Until this
+  ## runs, `submit` ignores every control request -- a half-initialised
+  ## controller that answered would tell the manager the host can do things it
+  ## has not been told how to do.
+  gHostName = hostName
+  gHostVersion = hostVersion
+  gSide = side
+  gEmit = emit
+  gOps = ops
+  gReady = true
+
+proc note(msg: string) =
+  if gOps.log != nil:
+    gOps.log(msg)
+
+proc jsonEscape(s: string): string =
+  ## Enough of an escaper for the strings that go in a reply: a guid, a path
+  ## (which on Windows is full of backslashes) and an error message (which is
+  ## whatever the loader said, including quotes).
+  result = ""
+  for ch in s:
+    case ch
+    of '"': result.add "\\\""
+    of '\\': result.add "\\\\"
+    of '\n': result.add "\\n"
+    of '\r': result.add "\\r"
+    of '\t': result.add "\\t"
+    else:
+      if ch < ' ':
+        result.add ' '
+      else:
+        result.add ch
+
+proc emitReply(name, payload: string) =
+  if gEmit == nil:
+    return
+  gEmit(name, payload)
+
+proc isControl*(name: string): bool =
+  result = name.len > ControlPrefix.len and startsWith(name, ControlPrefix)
+
+proc submit*(name, payload: string): bool =
+  ## Records a control request. Returns true when the name is one of ours, so
+  ## the caller can log it as handled; the event is still delivered to any
+  ## ordinary subscriber, because a second manager watching the channel is a
+  ## reasonable thing to write and this is not a private wire.
+  if not gReady or not isControl(name):
+    return false
+  let verb = name.substr(ControlPrefix.len)
+  var guid = ""
+  var path = ""
+  discard pathGet(payload, "guid", guid)
+  discard pathGet(payload, "path", path)
+  # A queue that is never drained is a host with no loop, and every request
+  # after this point would be a leak rather than a delay. The cap is far above
+  # any real burst -- `apply` states a whole selection, which is at most the
+  # registry's length -- so hitting it means the drain is gone.
+  if gQueue.len >= 256:
+    note "mod control: " & $gQueue.len &
+         " requests are queued and nothing is draining them; dropping " & name
+    return false
+
+  case verb
+  of "probe":
+    gQueue.add Pending(kind: pkProbe, guid: "", path: "")
+  of "list":
+    gQueue.add Pending(kind: pkList, guid: "", path: "")
+  of "load":
+    gQueue.add Pending(kind: pkLoad, guid: guid, path: path)
+  of "unload":
+    gQueue.add Pending(kind: pkUnload, guid: guid, path: "")
+  else:
+    # A verb from a newer manager than this host. Saying so beats silence: the
+    # manager's contract is that every request produces exactly one reply, and
+    # a name nobody answers is indistinguishable from a host with no control at
+    # all.
+    note "mod control: no such request " & name
+    return false
+  result = true
+
+proc replyResult(guid, action: string; ok1, deferred: bool; error: string) =
+  var body = "{\"guid\":\"" & jsonEscape(guid) & "\",\"action\":\"" & action &
+             "\",\"ok\":" & (if ok1: "true" else: "false") &
+             ",\"deferred\":" & (if deferred: "true" else: "false") &
+             ",\"error\":\"" & jsonEscape(error) & "\"}"
+  emitReply(ControlPrefix & "result", body)
+
+## ---------------------------------------------------------------------------
+## The outcome ledger, and why a host that only listens is a host that lies
+## ---------------------------------------------------------------------------
+##
+## Everything above answers the *manager*, in the manager's process. The client
+## host is not in that process: it polls, it acts, and until this ledger existed
+## it said nothing at all about what happened. So the manager's `live` and
+## `restart` verdicts for a client-side mod were the **server's guess** -- it
+## knew what it had asked for and never learned whether it worked -- and the
+## overlay panel had to write `decided by: client host` / `running unknown`
+## rather than state something it could not know.
+##
+## What is recorded here is one row per guid the backend named, carrying the
+## last thing this host actually did about it. Five outcomes, and the set is
+## closed on purpose: a manager that has to parse a sentence to decide what to
+## draw is a manager that will draw the wrong thing the first time the sentence
+## changes.
+##
+##   `moNoop`     nothing to do -- it was already in the requested state
+##   `moOk`       attempted, and it worked
+##   `moSkipped`  **not attempted**, and the host says why (`code`)
+##   `moRefused`  attempted and refused, live -- and it will still be refused
+##                after a restart, because the reason is not liveness
+##   `moDeferred` attempted and refused *live*; the change holds on restart
+##
+## `moNone` is the sixth, and it is the one that carries the weight: it is never
+## encoded. A guid with no row is a guid this host **has not answered about
+## yet**, which is not the same as a guid it answered "no" about, and this
+## project has now found the same bug twice in the places those two were allowed
+## to collapse into one. So the wire has no letter for it: absence is the only
+## way to say it, and a manager that treats absence as anything but "unknown"
+## is wrong by construction rather than by accident.
+
+type
+  ModOutcome* = enum
+    moNone      ## never encoded -- see above
+    moNoop
+    moOk
+    moSkipped
+    moRefused
+    moDeferred
+
+## The closed set of reasons. A code is a slug, not a sentence: the sentence is
+## in the host's log, where it can be as long as it needs to be, and the slug is
+## what the manager renders.
+const
+  CodeNoArtifact* = "noartifact"
+    ## the registry names this mod but gives no artifact to load
+  CodeNoFile* = "nofile"
+    ## its library is not installed on this side -- a server-only mod
+  CodeNoPath* = "nopath"
+    ## a load request arrived with no path and this host cannot find one
+  CodeMissing* = "missing"
+    ## the loader reported success and left no live mod behind
+  CodeWrongGuid* = "wrongguid"
+    ## the library announces a different guid than the one requested
+  CodeLoadFailed* = "loadfailed"
+    ## the loader refused it; the host log carries the reason
+  CodeNoTeardown* = "noteardown"
+    ## this host cannot take a mod out live at all; the change holds on restart
+  CodeUnloadFailed* = "unloadfailed"
+    ## the unload itself failed; the host log carries the reason
+
+const ReportMaxPath* = 191
+  ## What one report may cost, in characters of request path, **including the
+  ## route it rides on**. This is not a taste: `aowl_ov_sync_start` copies the
+  ## path into a 192-byte field and the worker widens at most 191 of them, so a
+  ## longer path is not a longer request, it is a silently truncated one. Every
+  ## encoding decision below -- slugs rather than sentences, one letter per
+  ## outcome, and a rotation instead of a full dump -- is paid for out of this.
+
+var gRepGuid: seq[string] = @[]
+var gRepWant: seq[bool] = @[]
+var gRepOut: seq[ModOutcome] = @[]
+var gRepCode: seq[string] = @[]
+var gRepSeq = 0
+var gRepCursor = 0
+var gRepTruncated = false
+var gRepSession = ""
+
+proc reportSession*(id: string) =
+  ## Names this host's *process*. Set once at startup by a host that polls;
+  ## never set on the backend, whose manager shares its process and needs none
+  ## of this.
+  ##
+  ## It is on the wire because every outcome below is scoped to one run of one
+  ## game. A manager holding "aowl.foo refused" from the session before last and
+  ## drawing it against the client running now would be reporting a fact about a
+  ## process that no longer exists -- which is the same class of lie as guessing,
+  ## with the added charm of looking authoritative. A changed `hs` means every
+  ## outcome the manager holds for this host is stale and drops back to unknown.
+  gRepSession = id
+
+proc reportSeq*(): int = gRepSeq
+  ## Bumped whenever any row changes and never otherwise, so a caller can tell
+  ## "there is something new to say" from "say the same thing again".
+
+proc reportPending*(): bool = gRepTruncated
+  ## True when the last path built could not carry every row. The rest are not
+  ## lost -- the next build starts where this one stopped -- but the caller has
+  ## to build again for them to be said.
+
+proc recordOutcome(guid: string; want: bool; outcome: ModOutcome;
+                   code: string) =
+  ## One row per guid, overwritten. The sequence moves only on a real change:
+  ## `applyDesired` records `moNoop` for every settled mod on every poll, and a
+  ## sequence that counted those would report news twenty times a minute forever.
+  if guid.len == 0 or outcome == moNone:
+    return
+  for i in 0 ..< gRepGuid.len:
+    if gRepGuid[i] == guid:
+      if gRepWant[i] == want and gRepOut[i] == outcome and gRepCode[i] == code:
+        return
+      gRepWant[i] = want
+      gRepOut[i] = outcome
+      gRepCode[i] = code
+      inc gRepSeq
+      return
+  gRepGuid.add guid
+  gRepWant.add want
+  gRepOut.add outcome
+  gRepCode.add code
+  inc gRepSeq
+
+proc forgetOutcomes(keep: seq[string]) =
+  ## Drops rows for guids the backend has stopped naming. A row that outlives
+  ## the mod it is about is the stale-fact problem again, one scope down: the
+  ## manager would keep drawing a verdict for something its own registry no
+  ## longer lists.
+  var i = 0
+  while i < gRepGuid.len:
+    var wanted = false
+    for g in keep:
+      if g == gRepGuid[i]:
+        wanted = true
+    if wanted:
+      inc i
+      continue
+    gRepGuid.delete(i)
+    gRepWant.delete(i)
+    gRepOut.delete(i)
+    gRepCode.delete(i)
+    inc gRepSeq
+    if gRepCursor > i:
+      dec gRepCursor
+  if gRepCursor > gRepGuid.len:
+    gRepCursor = 0
+
+proc answer(guid, action: string; ok1, deferred: bool; error: string;
+            outcome: ModOutcome; code: string) =
+  ## Both halves of a reply: the event the manager subscribes to, and the row
+  ## the poll will carry. They are written together so that a future branch
+  ## cannot answer one and forget the other -- which would present exactly as
+  ## "the server-side switch works and the client-side one does nothing", the
+  ## bug this whole ledger exists to close.
+  replyResult(guid, action, ok1, deferred, error)
+  recordOutcome(guid, action == "load", outcome, code)
+
+proc outcomeLetter(o: ModOutcome): char =
+  result = 'u'
+  case o
+  of moNone: result = 'u'
+  of moNoop: result = 'n'
+  of moOk: result = 'k'
+  of moSkipped: result = 's'
+  of moRefused: result = 'r'
+  of moDeferred: result = 'd'
+
+proc urlSafe(s: string): string =
+  ## Guids and slugs only, and both are already `[a-z0-9.-]` by every convention
+  ## in the registry. Anything else is dropped rather than escaped: a percent
+  ## escape would cost three characters out of a budget of 191 to carry a
+  ## character that cannot legitimately be there, and dropping it cannot forge a
+  ## *different* valid guid -- it can only produce one the manager does not know,
+  ## which reads as unknown, which is the safe answer.
+  result = ""
+  for ch in s:
+    if (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or
+       (ch >= '0' and ch <= '9') or ch == '.' or ch == '-' or ch == '_':
+      result.add ch
+
+proc reportPath*(base: string; budget: int = ReportMaxPath): string =
+  ## `base`, with everything this host has to say about the mods the backend
+  ## named appended as a query string -- and never longer than `budget`.
+  ##
+  ## The report rides on the poll the client host already makes, rather than on
+  ## a channel of its own, and that is the whole design. A second channel would
+  ## need an HTTP client, a socket and a thread inside a DLL injected into a
+  ## running game, all three of which exist here exactly once, in the overlay,
+  ## for the panel. It would also need the far end to be reachable at a moment
+  ## the host chose, which is precisely the property a poll declines to depend
+  ## on. Riding the poll costs nothing that is not already being spent: the same
+  ## request, a longer path.
+  ##
+  ## `base` alone is returned when there is nothing to say -- no session, no
+  ## rows -- so a host that has not started reporting is byte-for-byte the host
+  ## that came before this, and an old manager reading the bare route sees
+  ## exactly what it saw.
+  ##
+  ## When the rows do not all fit, the ones that did are sent, `more=1` says so,
+  ## and the next call starts where this one stopped. Rotation rather than
+  ## priority: every row is said within a few polls, no row can be starved by a
+  ## noisier neighbour, and the manager needs no ack for that to be true because
+  ## each row is a *state* and repeating it is free.
+  result = base
+  gRepTruncated = false
+  if gRepSession.len == 0 or gRepGuid.len == 0:
+    return
+  let head = base & "?hs=" & urlSafe(gRepSession) & "&sq=" & $gRepSeq & "&r="
+  # The smallest possible record is `g~+n`, and `&more=1` has to be affordable
+  # for the truncated case. Below that there is no honest report to make, so the
+  # bare route goes out and the manager stays at unknown -- which it is.
+  if head.len + 4 + 7 > budget:
+    return
+  var body = ""
+  var emitted = 0
+  var i = 0
+  var stoppedAt = -1
+  while i < gRepGuid.len:
+    let k = (gRepCursor + i) mod gRepGuid.len
+    inc i
+    var rec = urlSafe(gRepGuid[k])
+    if rec.len == 0:
+      continue
+    rec.add '~'
+    rec.add (if gRepWant[k]: '+' else: '-')
+    rec.add outcomeLetter(gRepOut[k])
+    if gRepCode[k].len > 0:
+      rec.add '~'
+      rec.add urlSafe(gRepCode[k])
+    # A record that cannot fit into an empty report will never fit into any
+    # report, so it is skipped rather than allowed to wedge the rotation behind
+    # it. It stays unknown to the manager, which is the truth about it.
+    if head.len + rec.len + 7 > budget:
+      gRepTruncated = true
+      continue
+    let sep = if body.len > 0: 1 else: 0
+    if head.len + body.len + sep + rec.len + 7 > budget:
+      stoppedAt = k
+      break
+    if body.len > 0:
+      body.add '!'
+    body.add rec
+    inc emitted
+  if stoppedAt >= 0:
+    gRepTruncated = true
+    gRepCursor = stoppedAt
+  else:
+    gRepCursor = 0
+  if emitted == 0:
+    return
+  result = head & body
+  if gRepTruncated:
+    result = result & "&more=1"
+
+proc replyCapabilities() =
+  # `reloadNeedsRestart` is answered from what the host can actually do rather
+  # than from a constant: a host with no teardown registered can load a mod but
+  # not take one out, and claiming otherwise would have the manager offer a
+  # switch that always reports "deferred".
+  let canUnload = gOps.canUnload != nil and gOps.canUnload(0)
+  var body = "{\"host\":\"" & jsonEscape(gHostName) & "\",\"version\":\"" &
+             jsonEscape(gHostVersion) & "\",\"control\":true,\"load\":true," &
+             "\"unload\":" & (if canUnload: "true" else: "false") &
+             ",\"reloadNeedsRestart\":" &
+             (if canUnload: "false" else: "true") & "}"
+  emitReply(ControlPrefix & "capabilities", body)
+
+proc listedRowFor(guid: string): int =
+  ## Which of a guid's rows to report, or -1 when this is not the one.
+  ##
+  ## The loader keeps dead slots -- a context pointer is an index, so a row is
+  ## never removed -- and a mod that has been switched off and on again
+  ## therefore owns one row per toggle, all but the last of them a corpse with
+  ## the same guid. Reporting every one of them made this reply grow by a row
+  ## per toggle for the life of the process, which is a table growing without
+  ## bound in a message the manager parses; at a few dozen toggles it is already
+  ## larger than the buffers on either side of it.
+  ##
+  ## So one row per guid: the live one if there is one, otherwise the last,
+  ## which is the most recent thing that mod said about itself. The manager's
+  ## contract is unaffected -- it draws one row per mod and asks for a guid, not
+  ## for an index -- and "this mod is here and is not running" is still exactly
+  ## what a guid with no live row answers.
+  result = -1
+  var lastDead = -1
+  for i in 0 ..< gOps.count():
+    if gOps.guidOf(i) != guid:
+      continue
+    if gOps.liveOf(i):
+      return i
+    lastDead = i
+  result = lastDead
+
+proc replyListed() =
+  var body = "{\"mods\":["
+  var first = true
+  for i in 0 ..< gOps.count():
+    # One row per guid. See `listedRowFor`: dead slots are kept and reported,
+    # but a guid with twenty of them is twenty rows saying the same thing.
+    if listedRowFor(gOps.guidOf(i)) != i:
+      continue
+    if not first:
+      body.add ","
+    first = false
+    let hot = (gOps.flagsOf(i) and ModHotReloadable) != 0'u32
+    body.add "{\"guid\":\"" & jsonEscape(gOps.guidOf(i)) &
+             "\",\"name\":\"" & jsonEscape(gOps.nameOf(i)) &
+             "\",\"version\":\"" & jsonEscape(gOps.versionOf(i)) &
+             "\",\"path\":\"" & jsonEscape(gOps.pathOf(i)) &
+             "\",\"live\":" & (if gOps.liveOf(i): "true" else: "false") &
+             ",\"hotReloadable\":" & (if hot: "true" else: "false") & "}"
+  body.add "]}"
+  emitReply(ControlPrefix & "listed", body)
+
+proc doLoad(p: Pending) =
+  # Idempotent by contract: `/aowlspt/mods/apply` states the whole desired set
+  # rather than a diff, so a guid that is already up is an ordinary case and
+  # must answer ok rather than loading a second copy.
+  if p.guid.len > 0 and gOps.indexOf(p.guid) >= 0:
+    answer(p.guid, "load", true, false, "", moNoop, "")
+    return
+  if p.path.len == 0:
+    answer(p.guid, "load", false, false,
+           "no path: this host cannot find a mod by guid alone",
+           moRefused, CodeNoPath)
+    return
+  if not fileExists(p.path):
+    answer(p.guid, "load", false, false, "no such file: " & p.path,
+           moSkipped, CodeNoFile)
+    return
+  if gOps.load(p.path):
+    # The guid is read back off what actually loaded rather than echoed: a
+    # request naming one guid and a library exporting another is a mistake the
+    # manager has to see, and echoing the request would hide it.
+    #
+    # Found by **path**, not by taking the last slot. The loader keeps dead
+    # slots rather than compacting -- every mod's context pointer is its index
+    # -- so "the last slot" is only ever the newest one by accident, and a
+    # reader that assumed it would report a neighbour's guid the first time a
+    # slot was reused. The failure would look like a mislabelled mod.
+    var idx = -1
+    for i in 0 ..< gOps.count():
+      if gOps.liveOf(i) and gOps.pathOf(i) == p.path:
+        idx = i
+    if idx < 0:
+      answer(p.guid, "load", false, false,
+             "the host reported success but has no live mod from " & p.path,
+             moRefused, CodeMissing)
+      return
+    let got = gOps.guidOf(idx)
+    if p.guid.len > 0 and got != p.guid:
+      # And take it back out again. Reporting the mismatch while leaving the
+      # library loaded is the worst of both: the manager believes the mod it
+      # asked for is not running, the host is running one it never asked for,
+      # and every later `apply` tries to load it again on top of itself.
+      let undo = gOps.unload(got)
+      var why = "that library exports " & got & ", not " & p.guid
+      if undo.len > 0:
+        why = why & "; and it could not be taken back out again (" & undo &
+              "), so it is running and this host cannot stop it"
+      answer(p.guid, "load", false, false, why, moRefused, CodeWrongGuid)
+      return
+    answer(got, "load", true, false, "", moOk, "")
+  else:
+    # `loadMod` refuses for reasons it has already written to the log with the
+    # detail; the manager gets the short form and the log has the rest.
+    answer(p.guid, "load", false, false,
+           "the host refused to load " & p.path & "; see the host log",
+           moRefused, CodeLoadFailed)
+
+proc doUnload(p: Pending) =
+  if p.guid.len == 0:
+    replyResult("", "unload", false, false, "no guid")
+    return
+  if gOps.indexOf(p.guid) < 0:
+    # Already out, which is the same end state the caller asked for.
+    answer(p.guid, "unload", true, false, "", moNoop, "")
+    return
+  # Asked *before* the attempt, so the reason can be told apart afterwards. A
+  # host with no teardown refuses every unload for one reason and a host with
+  # one refuses a particular unload for another; both answer `deferred`, and a
+  # manager that cannot distinguish them cannot tell "this build cannot do live
+  # unloads" from "this mod would not come out".
+  let live = gOps.canUnload != nil and gOps.canUnload(0)
+  let err = gOps.unload(p.guid)
+  if err.len == 0:
+    answer(p.guid, "unload", true, false, "", moOk, "")
+  else:
+    # `deferred`, not `refused`: everything that stops an unload here is
+    # "this host cannot do it live", and the change still holds on restart
+    # because the selection is stored rather than inferred from what is
+    # running.
+    answer(p.guid, "unload", false, true, err, moDeferred,
+           (if live: CodeUnloadFailed else: CodeNoTeardown))
+
+proc drain*() =
+  ## Called from the host's own loop, once a tick. Everything queued is
+  ## performed and answered here and nowhere else.
+  ##
+  ## The queue is taken wholesale before anything runs: performing a request
+  ## loads or unloads a mod, which can emit, which can queue another request,
+  ## and appending to a sequence being walked by index is how that becomes a
+  ## request that runs twice or never.
+  if gQueue.len == 0:
+    return
+  var work = gQueue
+  gQueue = @[]
+  for p in work:
+    case p.kind
+    of pkProbe: replyCapabilities()
+    of pkList: replyListed()
+    of pkLoad: doLoad(p)
+    of pkUnload: doUnload(p)
+
+## ---------------------------------------------------------------------------
+## Making the live set match a set the backend states
+## ---------------------------------------------------------------------------
+##
+## Everything above is *request*-shaped: the manager, running in the same
+## process, emits one load or one unload and gets one answer. That is the whole
+## story on the server, where the manager and the host share an event channel.
+##
+## The client host is a different process. Events do not cross processes, so
+## nothing there ever drives the protocol above, and a player toggling a
+## client-side mod in the overlay changed a stored selection and nothing else
+## until the game restarted.
+##
+## What crosses a process boundary is HTTP, and the backend already serves the
+## manager's decisions. So the client host asks -- on a slow timer, and never
+## the other way round -- and hands the answer to `applyDesired`, which turns
+## "here is the whole desired set" into the same `pkLoad`/`pkUnload` entries the
+## manager's own requests become. It reuses the queue for the reason the queue
+## exists: the answer arrives on a worker thread, and a `FreeLibrary` there
+## would be a `FreeLibrary` on a thread that has no business owning the mod
+## table. Everything below only *queues*; `drain` still does the deed, still
+## from the host's own loop.
+##
+## Poll rather than push, and the asymmetry is deliberate. A backend that is
+## down, starting, restarting or answering something else entirely must leave
+## the host running exactly what it is running -- so the failure mode of every
+## step here is "no action", never "unload it to be safe". Unloading a mod
+## because a server hiccuped is the worst outcome available.
+##
+## Three things this does **not** cover, which is cheaper to say than to find
+## out:
+##
+##  * A mod the backend does not name is left alone, and said so once. That
+##    includes a dll dropped into `mods/` by hand: the manager can only speak
+##    for what its registry lists.
+##  * A load or unload the host refuses is not retried until the backend's
+##    answer for that mod changes. One failed attempt per change, not one per
+##    poll, because the alternative is the same log line every few seconds
+##    forever.
+##  * Order is not honoured. The manager resolves a load order and this applies
+##    a set, so a mod that must come up after another comes up in whatever order
+##    the rows are in. It has not mattered because the client-side mods do not
+##    depend on each other; when it does, the fix is to sort by the order the
+##    backend already computes, not to invent one here.
+
+const DesiredSchema* = "aowlspt.clientset/1"
+
+## Guids this host has already acted on, and what it was asked for. Without
+## this a load the host refuses is retried on every poll, which is the same log
+## line every few seconds for something that is not going to start working.
+var gActedGuid: seq[string] = @[]
+var gActedWant: seq[bool] = @[]
+## Guids that are running here and that the backend has never mentioned,
+## reported once each and then left alone.
+var gStrangers: seq[string] = @[]
+
+proc jsonBool(doc, key: string; into: var bool): bool =
+  var raw = ""
+  if not pathGet(doc, key, raw):
+    return false
+  let v = strip(raw)
+  if v == "true":
+    into = true
+    return true
+  if v == "false":
+    into = false
+    return true
+  result = false
+
+proc jsonInt(doc, key: string; into: var int): bool =
+  var raw = ""
+  if not pathGet(doc, key, raw):
+    return false
+  let v = strip(raw)
+  if v.len == 0:
+    return false
+  var n = 0
+  for ch in v:
+    if ch < '0' or ch > '9':
+      return false
+    n = n * 10 + (ord(ch) - ord('0'))
+  into = n
+  result = true
+
+proc parseDesired*(doc: string; into: var seq[DesiredMod];
+                   error: var string): bool =
+  ## Reads the backend's desired set, and refuses everything it is not certain
+  ## about.
+  ##
+  ## Four checks, and each is here because of a way the body can be wrong
+  ## without looking wrong:
+  ##
+  ##  * `schema` -- a different route, an error page, or a newer manager. The
+  ##    name carries a version so a change of shape is a refusal rather than a
+  ##    misreading.
+  ##  * `ok` -- the manager's own "this answer is usable". A registry it could
+  ##    not read still produces a body.
+  ##  * `count` against the rows actually read -- the check that catches a body
+  ##    cut in half by a buffer, which is otherwise perfectly parseable and says
+  ##    half the mods should be off.
+  ##  * `complete`, which the manager writes *last*. Belt and braces with
+  ##    `count`, and free: a truncated body loses its final key before it loses
+  ##    anything else.
+  ##
+  ## A body that fails any of them yields no rows and a sentence, and the caller
+  ## does nothing at all.
+  into = @[]
+  error = ""
+  if doc.len == 0:
+    error = "empty body"
+    return false
+  var schema = ""
+  if not pathGet(doc, "schema", schema):
+    error = "no schema key; this is not the mod-set route"
+    return false
+  if schema != DesiredSchema:
+    error = "schema is " & schema & ", not " & DesiredSchema
+    return false
+  var ok1 = false
+  if not jsonBool(doc, "ok", ok1) or not ok1:
+    var why = ""
+    discard pathGet(doc, "error", why)
+    error = "the backend says its answer is not usable" &
+            (if why.len > 0: ": " & why else: "")
+    return false
+  var complete = false
+  if not jsonBool(doc, "complete", complete) or not complete:
+    error = "the body has no terminating complete key, so it was cut short"
+    return false
+  var count = -1
+  if not jsonInt(doc, "count", count):
+    error = "no count"
+    return false
+  var rows: seq[string] = @[]
+  if not pathItems(doc, "mods", rows):
+    error = "no mods array"
+    return false
+  if rows.len != count:
+    error = "the body says " & $count & " mods and carries " & $rows.len
+    return false
+  var built: seq[DesiredMod] = @[]
+  for row in rows:
+    var guid = ""
+    if not pathGet(row, "guid", guid) or guid.len == 0:
+      error = "a row with no guid"
+      return false
+    var on1 = false
+    if not jsonBool(row, "enabled", on1):
+      error = guid & ": no enabled flag"
+      return false
+    var dir = ""
+    var lib = ""
+    discard pathGet(row, "dir", dir)
+    discard pathGet(row, "lib", lib)
+    built.add DesiredMod(guid: guid, enabled: on1, dir: dir, lib: lib)
+  into = built
+  result = true
+
+proc actedIndex(guid: string): int =
+  ## The slot recording what this host last asked for about `guid`, or -1.
+  ## An empty name is a slot that was forgotten and is free to reuse, and a
+  ## guid is never empty, so the comparison needs no special case.
+  result = -1
+  for i in 0 ..< gActedGuid.len:
+    if gActedGuid[i] == guid:
+      return i
+
+proc rememberAct(guid: string; want: bool) =
+  let at = actedIndex(guid)
+  if at >= 0:
+    gActedWant[at] = want
+    return
+  # A slot emptied by `forgetAct` is reused rather than left behind. Without
+  # this the table grows by one entry per toggle for the life of the process,
+  # which is a small leak with no bound on it.
+  for i in 0 ..< gActedGuid.len:
+    if gActedGuid[i].len == 0:
+      gActedGuid[i] = guid
+      gActedWant[i] = want
+      return
+  gActedGuid.add guid
+  gActedWant.add want
+
+proc forgetAct(guid: string) =
+  let at = actedIndex(guid)
+  if at >= 0:
+    gActedGuid[at] = ""
+
+proc alreadyTried(guid: string; want: bool): bool =
+  let at = actedIndex(guid)
+  result = at >= 0 and gActedWant[at] == want
+
+proc knownStranger(guid: string): bool =
+  for g in gStrangers:
+    if g == guid:
+      return true
+  result = false
+
+proc applyDesired*(want: seq[DesiredMod]; modsRoot: string) =
+  ## Queue whatever it takes for the live set to become `want`.
+  ##
+  ## Nothing here loads or unloads anything: it appends to the same queue the
+  ## manager's own requests land in, and `drain` -- on the host's own loop --
+  ## performs them. That is not tidiness. This is called from the tick that
+  ## noticed a new answer, and the answer was fetched on a worker thread; the
+  ## queue is what keeps the actual `FreeLibrary` on the one thread that owns
+  ## the mod table.
+  if not gReady:
+    return
+
+  for d in want:
+    let live = gOps.indexOf(d.guid) >= 0
+    if live == d.enabled:
+      # Already right. Forgetting any earlier attempt here is what makes "one
+      # attempt per change" work in both directions: a mod switched off, back
+      # on and off again gets a fresh attempt each time.
+      forgetAct(d.guid)
+      # And said so. This is the row that retires "running unknown": a mod that
+      # needed nothing doing is the commonest state by far, and a host that only
+      # reported the mods it *moved* would leave the manager guessing about
+      # every settled one -- which is the guess this whole path exists to stop.
+      recordOutcome(d.guid, d.enabled, moNoop, "")
+      continue
+    if alreadyTried(d.guid, d.enabled):
+      # One attempt per change, and the outcome of that attempt still stands --
+      # so the row is left exactly as the attempt wrote it. Overwriting it here
+      # with anything, including "unknown", would have the manager watch a
+      # refusal flicker back to a guess on the next poll.
+      continue
+    if d.enabled:
+      if d.dir.len == 0 or d.lib.len == 0:
+        note "the backend wants " & d.guid & " loaded, but the registry gives " &
+             "no artifact for it, so there is no library to load"
+        rememberAct(d.guid, d.enabled)
+        recordOutcome(d.guid, d.enabled, moSkipped, CodeNoArtifact)
+        continue
+      let path = joinPath(joinPath(modsRoot, d.dir), d.lib)
+      if not fileExists(path):
+        note "the backend wants " & d.guid & " loaded and there is no " &
+             path & " on this side; it is installed on the server only"
+        rememberAct(d.guid, d.enabled)
+        recordOutcome(d.guid, d.enabled, moSkipped, CodeNoFile)
+        continue
+      note "the backend wants " & d.guid & " loaded; queueing " & path
+      gQueue.add Pending(kind: pkLoad, guid: d.guid, path: path)
+    else:
+      note "the backend wants " & d.guid & " unloaded; queueing it"
+      gQueue.add Pending(kind: pkUnload, guid: d.guid, path: "")
+    rememberAct(d.guid, d.enabled)
+
+  # Rows for guids the backend has stopped naming go now. Everything above has
+  # had its say about this set, so what is left over is about a previous one.
+  var named: seq[string] = @[]
+  for d in want:
+    named.add d.guid
+  forgetOutcomes(named)
+
+  # Anything running that the backend did not mention. Named once and then left
+  # entirely alone -- a hand-dropped dll is somebody's deliberate act, the
+  # manager has no opinion on it, and inventing one here would be this host
+  # deciding what the registry should have said.
+  for i in 0 ..< gOps.count():
+    if not gOps.liveOf(i):
+      continue
+    let guid = gOps.guidOf(i)
+    if guid.len == 0 or knownStranger(guid):
+      continue
+    var named = false
+    for d in want:
+      if d.guid == guid:
+        named = true
+    if named:
+      continue
+    gStrangers.add guid
+    note "the backend's mod set does not mention " & guid &
+         ", so this host leaves it exactly as it is"

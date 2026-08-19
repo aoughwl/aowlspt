@@ -6,16 +6,18 @@
 ##
 ##     var h: Handle = 0
 ##     discard resolve("EFT.Player", h)
-##     var out = ""
-##     discard call("EFT.Player::Heal", "[50]", out)
+##     var res = ""
+##     discard call("EFT.Player::Heal", "[50]", res)
 ##
 ## This module is the same three things with the boilerplate gone:
 ##
-##     let Player = gameType("EFT.Player")
+##     var Player = gameType("EFT.Player")
 ##     discard Player.invoke("Heal", 50)
 ##
-##     hook "EFT.Player::OnDead":
+##     proc onDead(target: string) =
 ##       info "someone died"
+##
+##     discard hook("EFT.Player::OnDead", onDead)
 ##
 ## Two things it does beyond tidying.
 ##
@@ -457,6 +459,20 @@ func stopVoid*(): HookResult =
   ## Suppress a method that returns nothing.
   HookResult(stop: true, replaceWith: "null")
 
+func replaceResult*(json: string): HookResult =
+  ## For a `hookReturn` handler: hand the caller this instead of what the
+  ## original returned.
+  ##
+  ## The same `HookResult` a prefix uses, and the same field, because it is the
+  ## same single decision -- what the caller ends up with. Named separately
+  ## because "stop" is the wrong word once the original has already run, and a
+  ## postfix handler reading `stopWith` would reasonably wonder what it was
+  ## stopping.
+  HookResult(stop: true, replaceWith: json)
+
+func keepResult*(): HookResult = HookResult(stop: false, replaceWith: "")
+  ## For a `hookReturn` handler: leave the original's answer alone.
+
 ## Hooks are kept as two parallel sequences and dispatched by matching the
 ## target name the host hands back.
 ##
@@ -474,6 +490,9 @@ var gHookHandlers: seq[HookHandler] = @[]
 
 var gArgHookTargets: seq[string] = @[]
 var gArgHookHandlers: seq[ArgHookHandler] = @[]
+
+var gRetHookTargets: seq[string] = @[]
+var gRetHookHandlers: seq[ArgHookHandler] = @[]
 
 proc hookDispatch(target, args: string): PatchResult =
   for i in 0 ..< gHookTargets.len:
@@ -500,6 +519,72 @@ proc argHookDispatch(target, args: string): PatchResult =
   if decided:
     return patchReplace(if answer.len > 0: answer else: "null")
   patchContinue()
+
+proc retHookDispatch(target, args: string): PatchResult =
+  ## The postfix half of `argHookDispatch`, and the same first-wins rule for the
+  ## same reason: two mods may both want to be told, and only one value can
+  ## reach the caller.
+  ##
+  ## Kept as its own registry rather than folded into the prefix one, because a
+  ## prefix and a postfix on the same method are two different patches with two
+  ## different payloads, and a shared table would deliver a prefix payload to a
+  ## handler expecting a `result`.
+  var decided = false
+  var answer = ""
+  for i in 0 ..< gRetHookTargets.len:
+    if gRetHookTargets[i] != target:
+      continue
+    let r = gRetHookHandlers[i](target, args)
+    if r.stop and not decided:
+      decided = true
+      answer = r.replaceWith
+  if decided:
+    return patchReplace(if answer.len > 0: answer else: "null")
+  patchContinue()
+
+proc hookReturn*(target: string; handler: ArgHookHandler;
+                 withArgs = true): Status =
+  ## Be told what a game method **returned**, and be able to change it.
+  ##
+  ## This is Harmony's postfix, and it is the shape a mod needs whenever the
+  ## answer depends on the original's own answer -- scaling a sensitivity,
+  ## clamping a speed, filtering a list the game just built. The prefix
+  ## alternative is `stopWith`, which means reimplementing the method, and a
+  ## reimplementation of a method you cannot read is a guess.
+  ##
+  ## **What the handler is given.** The `hookArgs` payload with one more member:
+  ##
+  ##     {"this":{"handle":3,...},"args":[4.0],"result":6.0}
+  ##     {"result":6.0}                              -- withArgs = false
+  ##
+  ## `hookResult(payload)` reads it as a `CallResult`, so `asFloat()`,
+  ## `asInt()`, `asBool()` and `asObject()` all work on it. Return
+  ## `replaceResult(...)` to change it, `keepResult()` to leave it alone.
+  ##
+  ## `result` is always present, whether or not arguments were asked for: it is
+  ## one register read and it is the reason the hook exists. The arguments stay
+  ## opt-in, and they are the values the method was **entered** with -- the
+  ## registers saved on the way in, which is the only place they still are once
+  ## the original has run.
+  ##
+  ## **Two methods cannot carry one, and the host says which.** A method
+  ## returning a value type wider than eight bytes returns it through a buffer
+  ## the host cannot read the layout of, so a postfix there could neither report
+  ## the result nor replace it. And a method whose compiled call uses more than
+  ## four register slots -- its declared arguments, `this`, and IL2CPP's
+  ## trailing `MethodInfo*` -- has stack arguments, which a postfix cannot pass
+  ## on, because it must *call* the original rather than jump to it. Both are
+  ## refused at registration with a sentence naming which; check the status and
+  ## read `lastError()`.
+  ##
+  ## An exception thrown out of the original does not reach the handler. A
+  ## postfix means "after it returned", not "after it finished".
+  gRetHookTargets.add target
+  gRetHookHandlers.add handler
+  result = patch(target, pkPostfix, retHookDispatch, withArgs = withArgs)
+  if result != Ok:
+    shrink(gRetHookTargets, gRetHookTargets.len - 1)
+    shrink(gRetHookHandlers, gRetHookHandlers.len - 1)
 
 proc hookArgs*(target: string; handler: ArgHookHandler): Status =
   ## Be told whenever a game method runs, **with its arguments**, and be able to
@@ -543,6 +628,225 @@ proc hookArgs*(target: string; handler: ArgHookHandler): Status =
   if result != Ok:
     shrink(gArgHookTargets, gArgHookTargets.len - 1)
     shrink(gArgHookHandlers, gArgHookHandlers.len - 1)
+
+# ---------------------------------------------------------------------------
+# Typed hooks (ABI revision 4)
+# ---------------------------------------------------------------------------
+#
+# `hookArgs` and `hookReturn` describe a firing as JSON. `hookTyped` and
+# `hookReturnTyped` hand over the registers instead.
+#
+# The difference is not a percentage. Measured against the stand-in runtime on
+# the same machine, in the same run: a bound call is 3 ns unpatched, a JSON
+# prefix with arguments is about 2.2 us, and the typed equivalent is tens of
+# nanoseconds -- because the JSON one builds a string, registers a GC handle per
+# reference argument, copies the string into this mod's heap and parses it, and
+# the typed one reads the register the argument is already in.
+#
+# Neither of these has a dispatcher scanning a list of target names, which the
+# JSON hooks need because the host tells them only *what* fired. A typed handler
+# is registered with its own cookie and is called directly, so a mod with twenty
+# typed hooks pays nothing for the other nineteen.
+#
+# **When to use which.** `hookArgs` unless the hook fires per entity per frame.
+# JSON survives an argument the host cannot classify, reads a `System.String`
+# for you, and 2 us at 10 Hz is 0.002 percent of a frame. The typed form asks
+# the mod to know the signature -- which it should check with `signatureOf`
+# before installing either -- and gives back the frame budget.
+
+proc hookTyped*(target: string; handler: TypedPatchHandler): Status =
+  ## A prefix hook that is given the registers rather than a description of
+  ## them, and may suppress the original.
+  ##
+  ## The handler receives a `PatchFrame`:
+  ##
+  ## ```nim
+  ## proc onTilt(f: PatchFrame): TypedResult =
+  ##   let obj = cast[Il2CppPtr](f.selfPointer())   # `this`, no handle, no call
+  ##   var ok = false
+  ##   let a = f.argFloat(0, ok)                    # declared parameter 0
+  ##   if not ok: return frameContinue()
+  ##   ...
+  ##   if f.setResultVoid(): frameReplace() else: frameContinue()
+  ## ```
+  ##
+  ## `selfPointer` is the address `thisPointer(payload)` costs a JSON build, a
+  ## GC handle and a `pointerOf` round trip to produce; here it is the register
+  ## the method was entered with. The same lifetime rule applies to it and to
+  ## every `argPointer`: they are addresses, the collector moves objects, use
+  ## them inside the handler. The frame itself is checked -- reading one after
+  ## the handler has returned is refused and `frameWhyText()` says so.
+  ##
+  ## Arguments past the fourth register position report `akStack` and cannot be
+  ## read; they are named rather than omitted, so argument *n* is always
+  ## declared parameter *n*.
+  ##
+  ## `ErrUnsupported` on a host older than revision 4 -- test `typedPatchesReady()`
+  ## and fall back to `hookArgs`, which is the point of keeping both.
+  patchTyped(target, pkPrefix, handler)
+
+proc hookReturnTyped*(target: string; handler: TypedPatchHandler): Status =
+  ## The postfix half: the original has run, and `resultFloat`, `resultInt` and
+  ## `resultPointer` read what it produced -- out of the register the declared
+  ## return type says it is in. `setResultFloat` and friends change it, and
+  ## `frameReplace()` makes the change stick.
+  ##
+  ## Reading a result on a *prefix* frame is refused rather than answered,
+  ## because the original has not run and scaling a number that does not exist
+  ## yet is worse than not scaling one.
+  ##
+  ## The same two method shapes the host refuses for a JSON postfix are refused
+  ## here, for the same reasons and with the same sentences: a value-type return
+  ## wider than a register, and a compiled call needing more than four register
+  ## slots. See `hookReturn`.
+  patchTyped(target, pkPostfix, handler)
+
+# ---------------------------------------------------------------------------
+# Reading a hook payload
+# ---------------------------------------------------------------------------
+#
+# The payload is a flat object with three possible members -- `this`, `args`
+# and (for a postfix) `result` -- and the host is its only producer. So this is
+# a scanner over that shape rather than a JSON parser: it finds a member by
+# name and returns its value verbatim, balancing braces and brackets so that a
+# nested object comes back whole and a `}` inside a string does not end it.
+
+proc memberRaw*(payload: string; key: string): string =
+  ## The raw JSON of one top-level member of a hook payload, or "" if absent.
+  ##
+  ## Only *top-level* members: the scan starts at depth 0 and a `"result"` that
+  ## appeared inside a nested object would be skipped rather than mistaken for
+  ## the one being asked for. Worth the extra state, because a game string in an
+  ## argument can contain anything at all.
+  result = ""
+  let needle = "\"" & key & "\":"
+  var i = 0
+  var depth = 0
+  var inStr = false
+  while i < payload.len:
+    let ch = payload[i]
+    if inStr:
+      if ch == '\\':
+        inc i
+      elif ch == '"':
+        inStr = false
+      inc i
+      continue
+    if ch == '"':
+      # Only a key at the object's own level can be the one wanted.
+      if depth == 1 and i + needle.len <= payload.len and
+         payload.substr(i, i + needle.len - 1) == needle:
+        i = i + needle.len
+        break
+      inStr = true
+      inc i
+      continue
+    if ch == '{' or ch == '[': inc depth
+    elif ch == '}' or ch == ']': dec depth
+    inc i
+  if i >= payload.len:
+    return ""
+
+  # The value, up to the comma or the brace that ends it at this level.
+  var vdepth = 0
+  var vstr = false
+  var out1 = ""
+  while i < payload.len:
+    let ch = payload[i]
+    if vstr:
+      out1.add ch
+      if ch == '\\' and i + 1 < payload.len:
+        inc i
+        out1.add payload[i]
+      elif ch == '"':
+        vstr = false
+      inc i
+      continue
+    if ch == '"':
+      vstr = true
+      out1.add ch
+      inc i
+      continue
+    if ch == '{' or ch == '[':
+      inc vdepth
+      out1.add ch
+      inc i
+      continue
+    if ch == '}' or ch == ']':
+      # At depth 0 this is the brace closing the payload itself, not part of
+      # the value.
+      if vdepth == 0: break
+      dec vdepth
+      out1.add ch
+      inc i
+      continue
+    if ch == ',' and vdepth == 0: break
+    out1.add ch
+    inc i
+  result = out1
+
+proc handleIn*(json: string): Handle =
+  ## The handle in a `{"handle":n,"type":"..."}`, or 0.
+  result = 0'u64
+  let at = find(json, "\"handle\":")
+  if at < 0:
+    return
+  var i = at + len("\"handle\":")
+  var n = 0
+  var any = false
+  while i < json.len and json[i] >= '0' and json[i] <= '9':
+    n = n * 10 + (ord(json[i]) - ord('0'))
+    any = true
+    inc i
+  if any and n > 0:
+    result = Handle(n)
+
+proc thisHandle*(payload: string): Handle =
+  ## The handle for `__instance`, or 0 for a static method.
+  result = handleIn(memberRaw(payload, "this"))
+
+proc thisPointer*(payload: string): uint64 =
+  ## The **address** of the object a hook fired for, for the fast path.
+  ##
+  ## This is the one line that turns a hook from a notification into a place to
+  ## do work. `hookArgs` gives `this` as a handle, and everything reached through
+  ## a handle goes through `call` -- roughly a microsecond, which on a method the
+  ## game runs per entity per frame is a frame tax rather than a feature. The
+  ## address is what `aowlspt/fast`'s `bindOnObject`, `callFloat` and `readFloat`
+  ## take, and those are tens of nanoseconds.
+  ##
+  ## **Valid only while the handler runs.** The host reclaims the handle when the
+  ## handler returns, and asking afterwards is refused rather than answered with
+  ## a stale address -- but nothing can refuse an address the mod wrote down and
+  ## used next frame, because by then it is just a number. Read what you need
+  ## inside the handler. `pinHandle` is the way to keep an object, and says what
+  ## pinning costs.
+  ##
+  ## Zero means there is no address: a static method, a host without a managed
+  ## heap, or a handler that has already returned. `lastError()` says which.
+  result = 0'u64
+  let h = thisHandle(payload)
+  if h == 0'u64:
+    return
+  var addr1 = 0'u64
+  if pointerOf(h, addr1) == Ok:
+    result = addr1
+
+proc hookResult*(payload: string): CallResult =
+  ## What the original returned, for a postfix handler.
+  ##
+  ## A `CallResult` rather than a bare string for the same reason `invoke`
+  ## returns one: `asFloat()` on a missing member would answer 0.0, and 0.0 is a
+  ## plausible sensitivity. `ok` is false when the payload carries no `result`,
+  ## which is what a *prefix* handler's payload looks like -- so a handler
+  ## registered the wrong way round finds out here rather than scaling a zero.
+  result = CallResult(ok: false, raw: "", error: "")
+  let raw = memberRaw(payload, "result")
+  if raw.len == 0:
+    result.error = "this payload has no result; it is not a postfix hook"
+    return
+  result.ok = true
+  result.raw = raw
 
 proc hook*(target: string; handler: HookHandler): Status =
   ## Be told whenever a game method runs.

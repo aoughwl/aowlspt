@@ -14,17 +14,265 @@
 ## **refused, not sanitised**: mapping `a/b` and `a.b` onto one file would be a
 ## data-loss bug that only shows up with two keys that look nothing alike. The
 ## same rule stops `..\..\` from ever being a key.
+##
+## ## What this promises about a value
+##
+## What is in here is a player's profile, which is the only thing in this
+## project that cannot be rebuilt from something else. So, in order of how much
+## each one costs when it is missing:
+##
+##  * **A value is never half-written.** A commit writes a temporary file and
+##    renames it over the key; a reader sees the whole old value or the whole
+##    new one and never a mixture, whatever happens to this process in between.
+##    `tools/storecrash.nim` kills a process mid-write to check it rather than
+##    to assert it.
+##  * **"Never written" and "unreadable" are different answers.** See
+##    `storeReadInto`. A caller that treats them alike creates a new character
+##    over a save that was probably still recoverable.
+##  * **There is history.** A bounded ring of previous versions under `.hist`,
+##    which is what a *bad* value is recovered from -- atomicity is no help
+##    there, since the store commits a bad value perfectly.
+##  * **One host side per store.** See `storeLock`.
+##  * **A write is committed before `storeWrite` returns.** Nothing is held in
+##    memory waiting for a later moment, so there is no window in which a
+##    process that dies loses a save it has already reported as made, and no
+##    host has to remember to flush anything.
 
 import std/strutils
 import aowlsptinstall/winfs
 
+# The store is touched from every worker thread, so the handle table below is
+# guarded. `aowlspt_lock.h` rather than `aowlspt_net.h`: this needs a critical
+# section and has no business acquiring winsock and zlib to get one -- see the
+# comment at the top of that header.
+{.emit: """#include "aowlspt_lock.h" """.}
+
+proc cLock() {.importc: "aowl_lock", nodecl.}
+proc cUnlock() {.importc: "aowl_unlock", nodecl.}
+
 var gStoreRoot = ""
+
+# Directories this process has already created, so a write does not ask the
+# filesystem whether its own directory exists on every call. This caches a
+# fact about *this* process's actions, not the content of any file: nothing
+# another process does can make "I created this directory" wrong in a way that
+# matters, because the worst case is that the directory was deleted underneath
+# us and the write fails -- which the caller already handles.
+#
+# Caching the values themselves would be the obvious next step and is
+# deliberately not taken. The client host and the backend run at the same time
+# against the same `<root>/store`, so a value one of them cached is a value the
+# other can invalidate, and there is no cheap way for either to find out.
+var gMadeDirs: seq[string] = @[]
+
+# ------------------------------------------------------------ history
+#
+# One bad write is not supposed to be terminal. A migration that got a field
+# wrong, a mod that wrote nonsense, a disk that returned it -- none of those
+# are crashes, so atomicity does not help with any of them: the store commits
+# the bad value perfectly. What helps is having the value from before.
+#
+# So a bounded ring of previous versions, in a subdirectory of the mod's own
+# store directory. Bounded twice over: `BackupGenerations` files per key, and
+# at most one written per key per `BackupIntervalMs`, so the cost is amortised
+# to nothing on the request path and the disk cost is (generations x size)
+# rather than a log that grows for the life of a profile.
+#
+# The directory name begins with a dot, which `validKey` refuses, so it can
+# never collide with a key -- and `storeKeys` skips it besides.
+
+const
+  HistDir = ".hist"
+  BackupGenerations = 3
+  BackupIntervalMs = 300_000'i64   ## five minutes
+  BackupTrackMax = 4096
+    ## Keys tracked for scheduling. A mod is free to have more; the only
+    ## consequence of forgetting one is a snapshot taken sooner than it had
+    ## to be.
+
+type
+  KeyState = object
+    ## What this process remembers about one key: when it last snapshotted it
+    ## into the history, and when it last committed it. Both are schedules
+    ## rather than facts about the data, so losing the lot -- which the bound
+    ## below does -- costs a snapshot taken early and a commit done at once.
+    path: string
+    lastBackupMs: int64
+
+var gKeys: seq[KeyState] = @[]
+
+# Whether a commit forces its bytes to the medium before the rename. Off by
+# default; `storeFlushOnWrite` and the long comment in `atomicPut` say what
+# that does and does not change.
+var gFlushOnWrite = false
+
+
+# ------------------------------------------------------------ open handles
+#
+# The backend reads a player's profile and writes it back on every inventory
+# move. Opening the file each time is the expensive part of that, and not for
+# the reason it looks like: real-time antivirus rescans a file on open when it
+# has been modified since the last one, so the read that follows a write costs
+# 890 us against 35 us for a read of something unchanged. Measured on this
+# machine, on the 3 KB document the emulator actually stores.
+#
+# So the handle is kept. A read then costs 3 us and a write 19 us, and nothing
+# about what is stored changes: the bytes still live in the file and still go
+# through the operating system's cache, so the client host reading the same
+# store sees exactly what it sees today. An in-memory copy of the values would
+# be faster again and would be wrong -- the two hosts run at the same time
+# against one `<root>/store`, and neither can be told when the other has
+# written.
+#
+# Bounded, and least-recently-used: a mod is free to have ten thousand keys and
+# a host is not free to have ten thousand handles.
+const HeldMax = 32
+
+type
+  Held = object
+    path: string
+    h: Handle
+    stamp: int64
+
+var gHeld: seq[Held] = @[]
+var gHeldStamp = 0'i64
+
+proc heldFor(path: string; create: bool): Handle =
+  ## Caller holds the lock. `create` distinguishes a write (which may be the
+  ## first) from a read (which must not bring a file into existence -- a `load`
+  ## of a key that was never saved has to keep answering "no").
+  inc gHeldStamp
+  for i in 0 ..< gHeld.len:
+    if gHeld[i].path == path:
+      gHeld[i].stamp = gHeldStamp
+      return gHeld[i].h
+  let h = openHeld(path, create)
+  if not heldValid(h):
+    return h
+  if gHeld.len >= HeldMax:
+    var slot = 0
+    for i in 1 ..< gHeld.len:
+      if gHeld[i].stamp < gHeld[slot].stamp:
+        slot = i
+    heldClose(gHeld[slot].h)
+    gHeld[slot] = Held(path: path, h: h, stamp: gHeldStamp)
+  else:
+    gHeld.add Held(path: path, h: h, stamp: gHeldStamp)
+  result = h
+
+proc heldDrop(path: string) =
+  ## Caller holds the lock. Used when an operation on a held handle fails:
+  ## whatever went wrong, the next attempt should start from a fresh open
+  ## rather than inherit it.
+  for i in 0 ..< gHeld.len:
+    if gHeld[i].path == path:
+      heldClose(gHeld[i].h)
+      gHeld.del i
+      return
+
+proc heldAdopt(path: string; h: Handle) =
+  ## Caller holds the lock. A handle to a file that has just *become* `path` --
+  ## it was opened under the temporary name and renamed onto the destination
+  ## while this process held it open.
+  ##
+  ## That is why the write below does not have to give the read-after-write
+  ## optimisation back to get atomicity. A Win32 handle follows the file, not
+  ## the name: after the rename this handle is a handle to the store file, so
+  ## the next read is served without an open and without the antivirus rescan
+  ## that an open after a write pays. The old handle for `path` -- if there was
+  ## one -- is now a handle to a file that no longer has a name, so it goes.
+  for i in 0 ..< gHeld.len:
+    if gHeld[i].path == path:
+      heldClose(gHeld[i].h)
+      gHeld.del i
+      break
+  inc gHeldStamp
+  if gHeld.len >= HeldMax:
+    var slot = 0
+    for i in 1 ..< gHeld.len:
+      if gHeld[i].stamp < gHeld[slot].stamp:
+        slot = i
+    heldClose(gHeld[slot].h)
+    gHeld[slot] = Held(path: path, h: h, stamp: gHeldStamp)
+  else:
+    gHeld.add Held(path: path, h: h, stamp: gHeldStamp)
+
+proc storeClose*() =
+  ## Every handle, released. For a host shutting down, and for a test that
+  ## wants the store on disk with nothing holding it.
+  ##
+  ## Nothing is committed here because nothing is ever waiting to be: a write
+  ## is on disk before `storeWrite` returns. What goes is the handles.
+  cLock()
+  for e in gHeld:
+    heldClose(e.h)
+  gHeld = @[]
+  cUnlock()
 
 proc storeInit*(root: string) =
   ## `root` is the host's own directory -- the store goes in `store/` beneath it.
   gStoreRoot = joinPath(root, "store")
 
 proc storeRoot*(): string = gStoreRoot
+
+# ------------------------------------------------------------- one writer
+#
+# Two backends started on the same root both hold a profile, both read it, and
+# both write it back -- and whichever writes second wins, silently, with the
+# other's raid in it undone. It is not a hypothetical: a launcher that does not
+# notice the server it started last time is still running produces exactly
+# this, and the only symptom a player sees is progress that comes and goes.
+#
+# So the store is claimed. Not with a pid file that has to be checked, aged and
+# cleaned up -- a pid file left by a crash locks a player out of their own game
+# and the fix is a file they have to be told to delete. A held handle with
+# `FILE_FLAG_DELETE_ON_CLOSE` cannot go stale: the kernel releases it however
+# the process ends, `TerminateProcess` included.
+#
+# Named per host side, because the client host and the backend are *meant* to
+# run at the same time against one `<root>/store`. What must not happen twice
+# is one side.
+
+var gLockHandle = Handle(0)
+var gLockPath = ""
+
+proc storeLock*(side: string; holder: var string; error: var string): bool =
+  ## Claim `<root>/store` for this host side. `holder` is what the process that
+  ## already has it wrote about itself, when it can be read.
+  holder = ""
+  error = ""
+  if gStoreRoot.len == 0:
+    error = "the store is not initialised"
+    return false
+  let mk = ensureDir(gStoreRoot)
+  if not mk.ok:
+    error = "could not create " & gStoreRoot & " (error " & $int(mk.err) & ")"
+    return false
+  let path = joinPath(gStoreRoot, ".lock-" & side)
+  let h = openExclusive(path)
+  if not heldValid(h):
+    let e = lastFsError()
+    var text = ""
+    if readShared(path, text):
+      holder = text
+    error = "another " & side & " is already using this store (error " &
+            $int(e) & ")"
+    return false
+  gLockHandle = h
+  gLockPath = path
+  # Who has it, for the message the loser prints. Best effort: failing to write
+  # the note does not make the claim any less exclusive.
+  discard heldWrite(h, "pid " & $processId() & "\n")
+  discard heldFlush(h)
+  result = true
+
+proc storeUnlock*() =
+  ## Ordinary shutdown. A crash does not need this -- that is the point of
+  ## `FILE_FLAG_DELETE_ON_CLOSE`.
+  if heldValid(gLockHandle):
+    heldClose(gLockHandle)
+    gLockHandle = Handle(0)
+    gLockPath = ""
 
 proc validKey*(key: string): bool =
   ## Flat, and nothing that can escape the directory. Also bounded: a key long
@@ -62,25 +310,258 @@ proc guidDir(guid: string): string =
     safe = "unnamed"
   result = joinPath(gStoreRoot, safe)
 
-proc storeRead*(guid, key: string; into: var string; error: var string): bool =
+const
+  ReadOk* = 0
+    ## The value is in `into`.
+  ReadMissing* = 1
+    ## There is no such key. First run, a profile that was never created --
+    ## normal, and the caller may go ahead and make one.
+  ReadFailed* = 2
+    ## The key is *there* and could not be read.
+  ReadBadArg* = 3
+    ## The key or the store itself is wrong; nothing was looked at.
+
+proc storeReadInto*(guid, key: string; into: var string;
+                    error: var string): int =
+  ## The three-way answer. `storeRead` below is the two-way one, kept because
+  ## both hosts call it, but every caller that can act on the difference should
+  ## use this instead.
+  ##
+  ## The difference is the whole point. "No profile yet" and "your profile is
+  ## on disk and I cannot read it" arrive at the same `false` in a boolean API,
+  ## and a caller that treats them alike answers the second with a brand new
+  ## character -- over the top of a save that was probably still recoverable.
+  ## That is the failure that costs a player something they cannot get back, so
+  ## it gets a return value of its own rather than a string a caller has to
+  ## parse to notice.
   into = ""
   error = ""
   if gStoreRoot.len == 0:
     error = "the store is not initialised"
-    return false
+    return ReadBadArg
   if not validKey(key):
     error = "not a valid store key: " & key
-    return false
+    return ReadBadArg
   let path = joinPath(guidDir(guid), key)
-  if not exists(path):
-    error = "no stored value for " & key
+  cLock()
+  let h = heldFor(path, false)
+  var got = false
+  if heldValid(h):
+    got = heldRead(h, into)
+    if not got:
+      heldDrop(path)
+  cUnlock()
+  if got:
+    return ReadOk
+  # No `exists` probe on the way in: a missing file and an unreadable one
+  # both fail the open, so the probe only ever bought a better message for
+  # the second case. It is recovered here instead, on the path where a
+  # syscall costs nothing because the request has already failed.
+  into = ""
+  if exists(path):
+    error = "could not read " & path & " (error " & $int(lastFsError()) &
+            "); a previous version may be under " &
+            joinPath(guidDir(guid), HistDir)
+    return ReadFailed
+  error = "no stored value for " & key
+  result = ReadMissing
+
+proc storeRead*(guid, key: string; into: var string; error: var string): bool =
+  result = storeReadInto(guid, key, into, error) == ReadOk
+
+proc atomicPut(tmp, dst, value: string; keep: bool; kept: var Handle;
+               error: var string): bool =
+  ## `value` becomes the whole contents of `dst`, or `dst` is untouched.
+  ##
+  ## Write into a file nothing is reading, force it to the medium, then rename
+  ## it over the destination. Every step is ordinary Win32; what makes it a
+  ## commit is the order. See `replaceFileAt` in `winfs` for what each call
+  ## guarantees and, more usefully, what it does not.
+  ##
+  ## With `keep`, the handle comes back in `kept` and is now a handle to `dst`
+  ## -- see `heldAdopt`.
+  kept = Handle(0)
+  let h = openHeld(tmp, true)
+  if not heldValid(h):
+    error = "could not open " & tmp & " (error " & $int(lastFsError()) & ")"
     return false
-  if not readTextFile(path, into):
-    error = "could not read " & path
+  if not heldWrite(h, value):
+    heldClose(h)
+    discard removeFileAt(tmp)
+    error = "could not write " & tmp & " (error " & $int(lastFsError()) & ")"
     return false
+  # The flush is the expensive step by an order of magnitude -- 3.9 ms of a
+  # 4.3 ms write on this machine -- and it is **not** what makes the write
+  # atomic. The rename is. What `FlushFileBuffers` adds is power-loss
+  # protection: without it, a machine that loses power can come back with the
+  # rename applied and the file's contents not yet on the platter, losing the
+  # last write. With it, that cannot happen.
+  #
+  # So it is off unless asked for. Neither setting can produce a truncated or
+  # mixed document -- that property comes from the rename and is not
+  # negotiable. The choice here is only between "a power cut may cost the last
+  # write" and "a power cut costs nothing, and every write costs four
+  # milliseconds".
+  if gFlushOnWrite:
+    if not heldFlush(h):
+      heldClose(h)
+      discard removeFileAt(tmp)
+      error = "could not flush " & tmp & " (error " & $int(lastFsError()) & ")"
+      return false
+  let mv = replaceFileAt(tmp, dst)
+  if not mv.ok:
+    heldClose(h)
+    discard removeFileAt(tmp)
+    error = "could not replace " & dst & " (error " & $int(mv.err) & ")"
+    return false
+  if keep:
+    kept = h
+  else:
+    heldClose(h)
   result = true
 
+proc keyStateFor(path: string): int =
+  ## Caller holds the lock. The index of this key's state, adding it if it is
+  ## new. Never fails: a full table is emptied rather than grown, which costs a
+  ## snapshot taken sooner than it had to be.
+  for i in 0 ..< gKeys.len:
+    if gKeys[i].path == path:
+      return i
+  if gKeys.len >= BackupTrackMax:
+    gKeys = @[]
+  gKeys.add KeyState(path: path, lastBackupMs: 0'i64)
+  result = gKeys.len - 1
+
+proc backupDue(path: string; now: int64): bool =
+  ## Caller holds the lock. True at most once per `BackupIntervalMs` per key,
+  ## and always on this process's first write of a key -- so a server that is
+  ## started, plays one raid and is closed still leaves a generation behind.
+  let i = keyStateFor(path)
+  if gKeys[i].lastBackupMs != 0'i64 and
+     now - gKeys[i].lastBackupMs < BackupIntervalMs:
+    return false
+  gKeys[i].lastBackupMs = now
+  result = true
+
+proc backupSlot(now: int64): int =
+  ## Which generation this snapshot replaces, taken from the clock rather than
+  ## from a counter this process keeps.
+  ##
+  ## A counter is reset by every restart, and a server that is started and
+  ## stopped between raids -- which is every server -- would then write
+  ## generation one over and over and never fill the other two. Off the clock,
+  ## the ring holds the last `BackupGenerations` intervals in which anything
+  ## was written, whether that was one session or thirty.
+  result = int((now div BackupIntervalMs) mod int64(BackupGenerations)) + 1
+
+# --------------------------------------------------------------- committing
+#
+# A commit is a rename, and a rename needs a file to rename, so every commit
+# creates one. That is the expensive half and it was worth trying to remove:
+# keeping one empty file per key open under `.hist/<key>.spare`, writing the
+# value into it through the handle, and renaming that over the key, so the
+# create happens after the answer rather than inside the request.
+#
+# It was tried, measured, and taken out again, because the create is not where
+# the time goes. On the 84 KB document the emulator has after two hundred
+# raids, on this machine:
+#
+#     create an empty file, close it                    164 us
+#     create + write 84 KB + close                      516 us
+#     create + write + rename over the key             1013 us
+#     spare + rename + make the next spare             1351 us
+#     rename two files nothing has written               311 us
+#
+# The last line is the one that misled me first time round: a rename is cheap
+# *when the file has not just been written*. Renaming a file this process has
+# filled with 84 KB costs several hundred microseconds however that file came
+# to exist, because a real-time virus scanner inspects the contents on the way
+# past. Pre-creating removes 164 us of a millisecond and adds a second file to
+# reason about, and end to end -- through `benchbackend`, which is the only
+# measurement that decides anything -- it was inside the noise.
+#
+# So: create, write, rename. One shape, one temporary, no second file per key
+# to keep in step, and the commit costs what a rename of a freshly written file
+# costs. `storeCommitStats` counts commits so the rate is a number rather than
+# an impression.
+
+var gCommits = 0
+
+proc storeCommitStats*(commits: var int) =
+  ## Commits made. For a test, and for anyone pricing a change to this file.
+  commits = gCommits
+
+proc commitNow(dir, key, value: string; error: var string): bool =
+  ## Caller holds the lock. The commit itself: `value` becomes the whole
+  ## contents of `<dir>/<key>`, or that file is exactly as it was.
+  ##
+  ## Not written in place. It used to be -- through a handle that stayed open,
+  ## overwriting from byte zero and truncating -- and that is fast and is not a
+  ## commit: a process killed between the first byte and `setEndOfFile` leaves
+  ## the file as a mixture of the old value and the new one, which for a
+  ## profile is the one loss nothing afterwards can repair. `atomicPut` writes
+  ## a temporary and renames it over the key, so a reader sees the whole old
+  ## value or the whole new one and never a mixture.
+  let hist = joinPath(dir, HistDir)
+  let path = joinPath(dir, key)
+  let tmp = joinPath(hist, key & ".tmp")
+  inc gCommits
+
+  # The held handle for this key goes **before** the rename, not after it.
+  #
+  # This is the one place where the two things this module wants are in direct
+  # tension. The handle cache exists so a read after a write does not pay for
+  # an open (and the antivirus rescan behind it); the commit works by replacing
+  # the file at the key path. `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`
+  # will not replace a destination this process still holds open -- it fails
+  # with error 5 -- and because the cache is empty on the first write of a key,
+  # the failure begins on the *second* write and reads as intermittent. It is
+  # not: without this line every second write of every key fails.
+  #
+  # The optimisation survives anyway: the handle that wrote the temporary is
+  # adopted below and, after the rename, is a handle to the key's own file.
+  heldDrop(path)
+
+  var kept = Handle(0)
+  if not atomicPut(tmp, path, value, true, kept, error):
+    return false
+  heldAdopt(path, kept)
+
+  # A generation, on a schedule. Off the request path in the sense that
+  # matters: at one snapshot per key per five minutes, a raid's worth of
+  # inventory moves pays for it once. Written the same atomic way, because a
+  # history that can itself be torn is a history nobody can trust at the moment
+  # they come to use it.
+  let now = nowMs()
+  if backupDue(path, now):
+    let histPath = joinPath(hist, key & "." & $backupSlot(now))
+    var ignored = Handle(0)
+    var histError = ""
+    if not atomicPut(joinPath(hist, key & ".tmpgen"), histPath, value,
+                     false, ignored, histError):
+      # Not a failure of the write: the value is committed. Reported anyway,
+      # because a store quietly running without the history the documentation
+      # promises should not be a silent state.
+      error = "value written, but the history copy failed: " & histError
+  result = true
+
+proc storeFlushOnWrite*(on: bool) =
+  ## Whether every commit forces its bytes to the medium before the rename.
+  ## Off by default: see `atomicPut`. Atomicity does not depend on it.
+  gFlushOnWrite = on
+
 proc storeWrite*(guid, key, value: string; error: var string): bool =
+  ## Committed before this returns. There is no queue, nothing held in memory,
+  ## and nothing a host has to remember to flush: when this answers true, the
+  ## value is the whole contents of the key's file.
+  ##
+  ## It did hold writes briefly and commit them together for a while, because a
+  ## commit costs about a millisecond and the emulator writes the whole profile
+  ## document on every inventory drag. That bought throughput and cost the one
+  ## thing this file exists to protect: a process killed outright lost a save
+  ## it had already reported as made. The queue is gone and the millisecond is
+  ## paid -- see the note above `commitNow` for what was tried to make it
+  ## cheaper and why it did not work.
   error = ""
   if gStoreRoot.len == 0:
     error = "the store is not initialised"
@@ -89,15 +570,53 @@ proc storeWrite*(guid, key, value: string; error: var string): bool =
     error = "not a valid store key: " & key
     return false
   let dir = guidDir(guid)
-  let mk = ensureDir(dir)
-  if not mk.ok:
-    error = "could not create " & dir & " (error " & $int(mk.err) & ")"
+  let hist = joinPath(dir, HistDir)
+  # `gMadeDirs` is walked and appended to **under the lock**, and it used to be
+  # neither.
+  #
+  # It reads as bookkeeping -- a list of directories this process has already
+  # created -- and it is a `seq`, which is the whole problem. Sixteen workers
+  # serve `store_set` at once, a `seq` that grows reallocates, and a thread
+  # appending the first key of one mod while another walks the list for a
+  # different mod drops the buffer the walker is standing in. That is the same
+  # use-after-free the backend found in `gRoutes` and the database document,
+  # one table over, and it is the more dangerous shape of it: the window opens
+  # only on the *first* write of each new directory, so it is invisible in
+  # every steady-state test and waits for the moment a second mod starts
+  # writing while the first is busy.
+  #
+  # The lock was already being taken two lines below for the commit, so the
+  # cost of moving it up is one `ensureDir` syscall inside the critical section
+  # -- once per directory per process, on a path that is about to spend a
+  # millisecond renaming a file -- and, in the steady state, a walk of a list
+  # with as many entries as the host has mods.
+  cLock()
+  var made = false
+  for d in gMadeDirs:
+    if d == hist:
+      made = true
+  var mkErr = 0
+  var mkOk = true
+  if not made:
+    # One `ensureDir` makes both: `.hist` is under `dir`.
+    let mk = ensureDir(hist)
+    mkOk = mk.ok
+    mkErr = int(mk.err)
+    if mkOk:
+      gMadeDirs.add hist
+  var wrote = false
+  if mkOk:
+    wrote = commitNow(dir, key, value, error)
+  cUnlock()
+  if not mkOk:
+    error = "could not create " & hist & " (error " & $mkErr & ")"
     return false
-  let w = writeTextFile(joinPath(dir, key), value)
-  if not w.ok:
-    error = "could not write " & key & " (error " & $int(w.err) & ")"
-    return false
-  result = true
+  result = wrote
+
+proc storeHistoryDir*(guid: string): string =
+  ## Where the generations for a mod live, for a message that has to tell
+  ## somebody where to look.
+  result = joinPath(guidDir(guid), HistDir)
 
 proc storeKeys*(guid, prefix: string): string =
   ## A JSON array of the keys under `prefix`. An empty store is `[]`, not an
@@ -110,7 +629,19 @@ proc storeKeys*(guid, prefix: string): string =
     collectEntries(dir, files, dirs)
     var first = true
     for f in files:
+      # `collectEntries` recurses, and there is a subdirectory under here now:
+      # `.hist`, holding the previous generations of every key. A path with a
+      # separator in it is one of those, and reporting `profile.<id>.2` as a
+      # key would hand the emulator two more profiles per real one -- each of
+      # them an id it would then try to load. Skipped by shape rather than by
+      # name, so anything else that ever lands in a subdirectory is skipped
+      # too.
+      if find(f, "\\") >= 0:
+        continue
       let name = baseName(f)
+      # Nothing a mod could have stored: `validKey` refuses a leading dot.
+      if name.len == 0 or name[0] == '.':
+        continue
       if prefix.len > 0:
         if name.len < prefix.len or name.substr(0, prefix.len - 1) != prefix:
           continue

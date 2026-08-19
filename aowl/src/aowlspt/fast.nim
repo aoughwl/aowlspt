@@ -21,7 +21,11 @@
 ##         if not damage.ok:
 ##           warn damage.why
 ##       let hp = readFloat(health, player)   # a load
-##       discard callFloat(damage, player, argsF(1.0))  # a call
+##       var a = argsF(1.0)
+##       discard callFloat(damage, player, a)  # a call
+##
+## `callFloat` takes its `Args` as a `var`, so the pack has to be a variable:
+## `callFloat(damage, player, argsF(1.0))` does not compile.
 ##
 ## **What is actually removed.** A bound call is: pack the arguments into a
 ## five-slot buffer, one switch on a byte, one indirect call to the compiled
@@ -67,6 +71,22 @@ import aowlspt/il2cpp
 
 {.emit: """#include "aowlspt_fast.h" """.}
 
+{.emit: """
+/* Which thread this is.
+ *
+ * Here rather than left to the mod, for the reason the clock is: `{.emit.}` is
+ * module-scoped, so a mod that declared this itself would get an
+ * implicit-declaration error out of the C compiler naming a function it never
+ * wrote. `aowlspt_fast.h` has already pulled in <windows.h> above.
+ *
+ * It is not decoration. "This callback ran on the game's thread" is the whole
+ * claim behind `everyMain` and behind every Unity object a mod touches from
+ * one, and a mod cannot check it against anything without a thread id to
+ * compare. */
+static int64_t aowl_thread_id(void) { return (int64_t)GetCurrentThreadId(); }
+
+""".}
+
 # ---------------------------------------------------------------------------
 # The C side
 # ---------------------------------------------------------------------------
@@ -95,6 +115,7 @@ proc cFldSetF32(o: Il2CppPtr; off: int32; v: float) {.importc: "aowl_fld_set_f32
 proc cFldSetF64(o: Il2CppPtr; off: int32; v: float) {.importc: "aowl_fld_set_f64", nodecl.}
 proc cFldSetU8(o: Il2CppPtr; off: int32; v: int32) {.importc: "aowl_fld_set_u8", nodecl.}
 proc cFldSetPtr(o: Il2CppPtr; off: int32; v: Il2CppPtr) {.importc: "aowl_fld_set_ptr", nodecl.}
+proc cFldSetPtrWb(fn, o: Il2CppPtr; off: int32; v: Il2CppPtr) {.importc: "aowl_fld_set_ptr_wb", nodecl.}
 
 # The clock, wrapped rather than exported raw.
 #
@@ -117,6 +138,18 @@ proc perfCounter*(): int64 =
 
 proc perfFreq*(): int64 = cPerfFreq()
 
+proc cThreadId(): int64 {.importc: "aowl_thread_id", nodecl.}
+
+proc currentThreadId*(): int64 =
+  ## The calling thread's id, as Windows numbers them.
+  ##
+  ## For checking that a callback ran where it was supposed to. A mod that
+  ## touches a Unity object from a worker thread does not fail: it usually
+  ## works, until the frame it does not, and the crash is nowhere near the
+  ## call. Comparing this between two firings is how a mod establishes that
+  ## `everyMain` really reached the game's thread rather than merely running.
+  result = cThreadId()
+
 proc nanosBetween*(startTicks, endTicks: int64): int64 =
   ## Ticks to nanoseconds. Multiplies before dividing, because the frequency is
   ## around 10 MHz and dividing first turns every measurement under a
@@ -124,6 +157,168 @@ proc nanosBetween*(startTicks, endTicks: int64): int64 =
   let f = perfFreq()
   if f <= 0: return 0
   result = ((endTicks - startTicks) * 1000000000'i64) div f
+
+# ---------------------------------------------------------------------------
+# The allocation counter
+# ---------------------------------------------------------------------------
+#
+# "This path allocates nothing" is a claim, and a claim about a hot loop is
+# worth what it is measured at. `allocationCount()` is the measurement: every
+# nimony binary statically links mimalloc with `MI_STAT=1`, and mimalloc keeps
+# a **cumulative** count of the blocks it has handed out that nothing on the
+# free path lowers. Cumulative is what makes it usable here -- a string built
+# and freed once per firing leaves the *live* figure exactly where it was, so
+# `getOccupiedMem` would report zero growth for a path allocating at frame
+# rate.
+#
+# The counter is per binary, because the allocator is: a mod DLL and the host
+# DLL each link their own. That is not a limitation, it is the shape of the
+# question -- "does the mod side allocate" and "does the host side allocate"
+# are two claims, and the host answers its own through
+# `call("aowlspt.host::patch_stats")`.
+#
+# The struct below is a prefix of mimalloc's `mi_stats_t`, which is all
+# `mi_stats_get` is asked for -- it copies `min(size, sizeof)` and stamps the
+# version, so a prefix is a supported way to read it. The version is checked
+# rather than assumed, and `allocProbeOk()` goes further: it makes an
+# allocation and confirms the counter moved. A wrong field would otherwise read
+# as "nothing allocated", which is exactly the answer this is used to
+# establish -- and did, once: see the note on `malloc_requested` below.
+
+{.emit: """
+#include <stdint.h>
+#include <string.h>
+
+typedef struct AowlMiCount   { int64_t total, peak, current; } AowlMiCount;
+typedef struct AowlMiCounter { int64_t total; } AowlMiCounter;
+
+/* The prefix of mimalloc's `mi_stats_t`, in declaration order.
+ *
+ * Two things about which field to read, and both were found by the counter
+ * answering zero for a loop that certainly allocated.
+ *
+ * `malloc_requested` is the obvious one and it is **only maintained under
+ * `MI_STAT > 1`**, which is a debug build. nimony compiles mimalloc with
+ * `MI_STAT=1`, so that field is a permanent zero here -- and a permanent zero
+ * is exactly the answer this is used to establish, which makes it the worst
+ * possible field to have picked.
+ *
+ * `malloc_normal_count` is a *counter*, and mimalloc's counters "can just be
+ * increased" -- nothing on the free path lowers one. That is what makes it a
+ * proof rather than a snapshot: an unchanged count across a loop means the loop
+ * made no allocations at all, not that it freed as many as it made.
+ *
+ * `MI_STAT_VERSION` is 1 and `mi_stats_get` stamps it, so a mismatch means the
+ * layout moved and the number must not be trusted. */
+typedef struct AowlMiStats {
+  int32_t     version;
+  AowlMiCount pages, reserved, committed, reset, purged, page_committed,
+              pages_abandoned, threads, malloc_normal, malloc_huge,
+              malloc_requested;
+  AowlMiCounter mmap_calls, commit_calls, reset_calls, purge_calls,
+                arena_count, malloc_normal_count, malloc_huge_count;
+} AowlMiStats;
+
+extern void mi_stats_merge(void);
+extern void mi_stats_get(size_t stats_size, void* stats);
+
+static int64_t aowl_alloc_count(void) {
+  AowlMiStats st;
+  memset(&st, 0, sizeof(st));
+  /* Folds this thread's counters into the process-wide ones, so a hook that
+     fires on the game thread is visible to a check made on another. */
+  mi_stats_merge();
+  mi_stats_get(sizeof(st), (void*)&st);
+  if (st.version != 1) return -1;
+  return st.malloc_normal_count.total + st.malloc_huge_count.total;
+}
+
+/* Bytes currently live, rather than ever handed out.
+ *
+ * The counter beside it is cumulative and that is what makes it a proof: an
+ * unchanged total means a loop allocated nothing at all. This one answers the
+ * other question, and it is the one a leak hunt wants -- "is the heap the same
+ * size it was after all that", which a cumulative figure cannot say. It is a
+ * *snapshot* and nothing about it is a proof: a run that allocated and freed
+ * leaves it where it was, which is exactly the answer that is wanted here and
+ * exactly the answer that made it useless for the claim above. Read both. */
+static int64_t aowl_alloc_live(void) {
+  AowlMiStats st;
+  memset(&st, 0, sizeof(st));
+  mi_stats_merge();
+  mi_stats_get(sizeof(st), (void*)&st);
+  if (st.version != 1) return -1;
+  return st.malloc_normal.current + st.malloc_huge.current;
+}
+
+static int64_t aowl_alloc_bytes(void) {
+  AowlMiStats st;
+  memset(&st, 0, sizeof(st));
+  mi_stats_merge();
+  mi_stats_get(sizeof(st), (void*)&st);
+  if (st.version != 1) return -1;
+  return st.malloc_normal.total + st.malloc_huge.total;
+}
+""".}
+
+proc cAllocCount(): int64 {.importc: "aowl_alloc_count", nodecl.}
+proc cAllocBytes(): int64 {.importc: "aowl_alloc_bytes", nodecl.}
+proc cAllocLive(): int64 {.importc: "aowl_alloc_live", nodecl.}
+
+proc allocationCount*(): int64 =
+  ## How many blocks this binary's allocator has ever handed out, or -1 when
+  ## the counter could not be read.
+  ##
+  ## Monotone: a free does not lower it. That is the whole reason it is usable
+  ## as a proof -- take it, run a loop, take it again, and an unchanged number
+  ## means the loop allocated nothing at all rather than nothing *net*. A
+  ## live-bytes figure like `getOccupiedMem` cannot say that: a string built and
+  ## freed once per firing leaves it exactly where it was.
+  ##
+  ## Per binary, because the allocator is: a mod DLL and the host DLL each link
+  ## their own mimalloc. That is the shape of the question rather than a
+  ## limitation -- "does the mod side allocate" and "does the host side
+  ## allocate" are two claims, and the host answers its own through
+  ## `call("aowlspt.host::patch_stats")`.
+  result = cAllocCount()
+
+proc allocatedBytes*(): int64 =
+  ## The same, in bytes of block size. Reported beside the count because a
+  ## number of bytes is what a reader wants to see; the *count* is what an
+  ## assertion should be written against, since nothing lowers it.
+  result = cAllocBytes()
+
+proc liveBytes*(): int64 =
+  ## How many bytes this binary's allocator is holding right now, or -1 when the
+  ## counter could not be read.
+  ##
+  ## A snapshot rather than a proof -- see `allocationCount` for the difference
+  ## and why the cumulative one is the one to assert against. This is the figure
+  ## to *watch over time*: a heap that is the same size after ten thousand
+  ## cycles as after ten is a heap nothing is accumulating in, and no cumulative
+  ## counter can say that.
+  result = cAllocLive()
+
+proc allocProbeOk*(): bool =
+  ## Whether `allocationCount` is actually reading the allocator.
+  ##
+  ## It makes an allocation of a known size and checks that the count moved.
+  ## Without this, a build where the counters are compiled out reports a
+  ## constant -- and a constant is indistinguishable from "your loop allocated
+  ## nothing", which is the one answer this must never give by accident. That is
+  ## not hypothetical: the first version of this read `malloc_requested`, which
+  ## is only maintained in a debug build, and reported a confident zero for a
+  ## loop allocating at frame rate.
+  let before = allocationCount()
+  if before < 0'i64: return false
+  var probe = ""
+  for i in 0 ..< 4099:
+    probe.add 'x'
+  let after = allocationCount()
+  # Kept alive past the second read; without a use, the string is free to be
+  # optimised out and the probe would measure nothing.
+  if probe.len != 4099: return false
+  result = after > before
 
 # ---------------------------------------------------------------------------
 # Kinds
@@ -169,6 +364,64 @@ proc primitiveKind(t: string): FastKind =
   elif t == "System.String" or t == "System.Object": result = fkPtr
   else: result = fkNone
 
+proc classifyClass*(rt: Il2Cpp; c: Il2CppClass): FastKind =
+  ## A class, as a register class.
+  ##
+  ## An **enum** lands here, and it used to be refused: it passes as its
+  ## underlying integer, nothing in the C API names which one, and guessing
+  ## `Int32` is wrong for the `long` enums that exist. But the width is not a
+  ## guess -- it is `instance size` minus the object header, and the header is
+  ## measured rather than assumed (`boxHeaderBytes`). So an enum, and any other
+  ## value type small enough to travel in a register, is classified by the size
+  ## the runtime reports for it.
+  ##
+  ## A value type too wide for a register is still refused, and must be: Win64
+  ## passes it by hidden pointer, which is a different call *shape* rather than
+  ## a different register. `bindRaw` is how a mod states that shape.
+  if c == nil:
+    return fkNone
+  if not classIsValueType(rt, c):
+    # A class: one register holding an address.
+    return fkPtr
+  # Ask what it *is* before measuring how wide it is. `System.Single` and
+  # `System.Double` are value types that travel in **SSE** registers, and
+  # `System.Boolean` is one that a callee reads as a byte -- and all three are
+  # widths (4, 8, 1) the register-class test below happily calls an integer.
+  # Getting this wrong does not crash: a float bound as `fkI32` is passed in
+  # RCX instead of XMM0 and its result read out of RAX, so `Boost(4.0)`
+  # answers `0.0` rather than `24.0`. A plausible number is the worst possible
+  # failure, so the name is consulted first and the width is only for the
+  # types no name decides -- enums, and small structs.
+  let named = primitiveKind(fullName(rt, c))
+  if named != fkNone:
+    return named
+  let w = valueWidth(rt, c)
+  if w <= 0:
+    return fkNone
+  # 1, 2, 4 and 8 are the sizes Win64 puts in a general-purpose register; 3, 5,
+  # 6, 7 and anything above 8 go to memory.
+  if w == 1 or w == 2 or w == 4:
+    return fkI32
+  if w == 8:
+    return fkI64
+  result = fkNone
+
+proc classifyDeclared*(rt: Il2Cpp; t: Il2CppType): FastKind =
+  ## The same, from the **declared type** rather than from its printed name.
+  ##
+  ## This is the one that works on a generic instantiation, an array or a
+  ## nested type: `il2cpp_class_from_il2cpp_type` answers exactly, where the
+  ## printed name is not always a name the resolver accepts. Prefer it wherever
+  ## the type itself is in hand, which is everywhere the signature is being
+  ## walked.
+  let c = classFromType(rt, t)
+  if c == nil:
+    # The runtime could not name a class for it. That is a refusal, not a
+    # reference: reporting `fkPtr` here would guess a register for something
+    # nobody has established the shape of.
+    return fkNone
+  result = classifyClass(rt, c)
+
 proc classifyType*(rt: Il2Cpp; t: string): FastKind =
   ## A parameter or return type, as a register class.
   ##
@@ -178,13 +431,15 @@ proc classifyType*(rt: Il2Cpp; t: string): FastKind =
   ## bytes is passed by a hidden pointer, which is a different call shape
   ## entirely rather than a different register.
   ##
-  ## The lookup is by qualified name through `findClass`, which is what this
-  ## module has -- there is no `il2cpp_class_from_il2cpp_type` in the binding
-  ## yet (see docs/PERF.md). So a generic instantiation, an array type or a
-  ## nested type whose name `findClass` cannot resolve comes back `fkNone` and
-  ## the binding is refused. Conservative in the one direction that matters:
-  ## the failure is "you must classify this yourself", not a call with the
-  ## arguments in the wrong registers.
+  ## The lookup here is by qualified **name**, so a generic instantiation, an
+  ## array type or a nested type whose name `findClass` cannot resolve still
+  ## comes back `fkNone` and the binding is refused. `classifyDeclared` below
+  ## takes the declared type itself and has no such problem; this overload
+  ## remains for the callers that only ever have a name.
+  ##
+  ## Conservative in the one direction that matters: the failure is "you must
+  ## classify this yourself", not a call with the arguments in the wrong
+  ## registers.
   result = primitiveKind(t)
   if result != fkNone:
     return
@@ -193,12 +448,12 @@ proc classifyType*(rt: Il2Cpp; t: string): FastKind =
   let c = findClass(rt, t)
   if c == nil:
     return fkNone
-  if classIsValueType(rt, c):
-    # An enum lands here too. It does pass as its underlying integer, but
-    # nothing in the C API says which one, and guessing `Int32` is wrong for
-    # the `long` enums that do exist. `bindMethodAs` is the way to say so.
-    return fkNone
-  result = fkPtr
+  # Whatever `classifyClass` says, including `fkNone`. An unconditional
+  # `result = fkPtr` stood here and made every resolvable non-primitive a
+  # reference -- which silently disarmed the `classifyType(...) == fkNone`
+  # gate that `classicmovement` and `fov` use to refuse a value type too wide
+  # for a register.
+  result = classifyClass(rt, c)
 
 # ---------------------------------------------------------------------------
 # Arguments
@@ -465,23 +720,35 @@ proc bindMethod*(rt: Il2Cpp; owner, member: string; argc: int): Binding =
                  " argument(s)"
     return
 
+  # Classified from the **declared type**, not from its printed name: the two
+  # differ exactly where it matters -- a generic instantiation, an array, a
+  # nested type -- and the name form is kept only as the fallback for a runtime
+  # too old to answer `il2cpp_class_from_il2cpp_type`.
   var kinds: seq[FastKind] = @[]
   for i in 0 ..< argc:
-    let tn = typeName(rt, methodParam(rt, m, i))
-    let k = classifyType(rt, tn)
+    let pt = methodParam(rt, m, i)
+    let tn = typeName(rt, pt)
+    var k = classifyDeclared(rt, pt)
+    if k == fkNone:
+      k = classifyType(rt, tn)
     if k == fkNone:
       result.why = result.target & ": argument " & $i & " is declared " & tn &
-        ", which the fast path will not classify. If it is a reference or an " &
-        "enum, say so with bindMethodAs."
+        ", which the fast path will not classify -- a value type wider than a " &
+        "register is passed by hidden pointer, which is a different call " &
+        "shape. State it with bindMethodAs, or bindRaw for the shape."
       return
     kinds.add k
 
-  let rtn = typeName(rt, methodReturnType(rt, m))
-  let rk = classifyType(rt, rtn)
+  let rt2 = methodReturnType(rt, m)
+  let rtn = typeName(rt, rt2)
+  var rk = classifyDeclared(rt, rt2)
+  if rk == fkNone:
+    rk = classifyType(rt, rtn)
   if rk == fkNone:
     result.why = result.target & ": returns " & rtn &
-      ", which the fast path will not classify. If it is a reference or an " &
-      "enum, say so with bindMethodAs."
+      ", which the fast path will not classify -- a value type wider than a " &
+      "register comes back by hidden pointer, which is a different call " &
+      "shape. State it with bindMethodAs, or bindRaw for the shape."
     return
 
   result = bindMethodAs(rt, owner, member, kinds, rk)
@@ -710,18 +977,28 @@ type
     offset*: int32
     kind*: FastKind
     bindNs*: int64
+    wbarrier*: Il2CppPtr
+      ## `il2cpp_gc_wbarrier_set_field`, resolved at bind time, or nil on a
+      ## runtime that does not export it. Kept here rather than looked up per
+      ## write: a binding is made once and written many times, and the answer
+      ## cannot change under a binding that is already live.
 
 proc bindField*(rt: Il2Cpp; owner, fieldName: string): FieldBinding =
   ## Binds an **instance** field.
   ##
-  ## A static field is refused, and the reason is worth stating: for a static
-  ## field `il2cpp_field_get_offset` returns an offset into the class's static
-  ## data block, not into any object, and reaching that block needs
-  ## `il2cpp_class_get_static_field_data`, which is not in the binding yet.
-  ## Applying an instance read to it would read some object's payload at the
-  ## same offset and hand back a number. Since the C API exposes no field flags
-  ## in the current binding either, staticness is inferred from the offset
-  ## falling outside the object -- see below.
+  ## A static field is refused *by name*, not approximated: for a static field
+  ## `il2cpp_field_get_offset` returns an offset into the class's static data
+  ## block rather than into any object, and applying an instance read to it
+  ## would read some object's payload at the same offset and hand back a
+  ## number. `bindStaticField` is the one that binds those, and the two produce
+  ## different types on purpose -- see the note there.
+  ##
+  ## Staticness is asked of the runtime (`il2cpp_field_get_flags`) wherever the
+  ## runtime answers, and only inferred from the offset where it does not. The
+  ## inference is a guard, not a test: the two offset ranges overlap, so a
+  ## static field can sit at an offset that is perfectly plausible inside an
+  ## instance -- which is precisely what the stand-in's `Player::SpawnCount`
+  ## does, at the same offset as `Player::Health`.
   let t0 = perfCounter()
   result = FieldBinding(ok: false, why: "", target: owner & "::" & fieldName,
                         offset: 0'i32, kind: fkNone, bindNs: 0'i64)
@@ -736,6 +1013,17 @@ proc bindField*(rt: Il2Cpp; owner, fieldName: string): FieldBinding =
     result.why = "no field " & result.target
     return
 
+  # The runtime's own answer, where it has one. This comes first because it is
+  # the only *correct* test: the offset test below cannot distinguish a static
+  # field at offset 16 from an instance field at offset 16, and both exist.
+  if rt.has(eFieldGetFlags) and fieldIsStatic(rt, f):
+    result.why = result.target &
+      " is a static field: its offset is into the class's static data block, " &
+      "not into an object. Bind it with bindStaticField, which reads that " &
+      "block -- an instance read of the same offset would answer a " &
+      "neighbouring field's bytes."
+    return
+
   let off = fieldOffset(rt, f)
   let size = classInstanceSize(rt, cls)
   # The bound is the guard. An offset of zero is the object header (never a
@@ -748,8 +1036,11 @@ proc bindField*(rt: Il2Cpp; owner, fieldName: string): FieldBinding =
       " -- a static field, or a layout this path cannot use. Use the boxed path."
     return
 
-  let tn = typeName(rt, fieldType(rt, f))
-  let k = classifyType(rt, tn)
+  let ft = fieldType(rt, f)
+  let tn = typeName(rt, ft)
+  var k = classifyDeclared(rt, ft)
+  if k == fkNone:
+    k = classifyType(rt, tn)
   if k == fkNone or k == fkVoid:
     result.why = result.target & " is declared " & tn &
       ", which the fast path will not read by offset. A value type wider than " &
@@ -758,6 +1049,10 @@ proc bindField*(rt: Il2Cpp; owner, fieldName: string): FieldBinding =
 
   result.offset = int32(off)
   result.kind = k
+  # Resolved once, here, so `writePtr` is a branch on a pointer rather than a
+  # lookup. On a runtime with no barrier entry this stays nil and the binding
+  # remembers that, instead of asking again at every write.
+  result.wbarrier = writeBarrierFn(rt)
   result.ok = true
   result.bindNs = nanosBetween(t0, perfCounter())
   result.why = result.target & ": " & describe(k) & " at offset " & $off
@@ -818,14 +1113,258 @@ proc writeFloat*(f: FieldBinding; obj: Il2CppPtr; v: float) =
     cFldSetF32(obj, f.offset, v)
 
 proc writePtr*(f: FieldBinding; obj: Il2CppPtr; v: Il2CppPtr) =
-  ## Writing a reference field **without a write barrier**.
+  ## Writing a reference field, **through the collector's write barrier** when
+  ## the runtime has one.
   ##
-  ## IL2CPP's collector needs to be told when an object starts referring to
-  ## another one; `il2cpp_gc_wbarrier_set_field` is what does that, and it is
-  ## not in the binding. Storing a young object into an old one's field and
-  ## skipping the barrier can get that object collected while it is still
-  ## referenced. Safe for a pointer the object already reachably holds; not
-  ## safe for a fresh allocation. Use the boxed path if that distinction is not
-  ## obviously on your side.
+  ## IL2CPP's collector has to be told when an object starts referring to
+  ## another one. `il2cpp_gc_wbarrier_set_field` is what tells it; skipping it
+  ## and storing the pointer directly can get a young object collected while an
+  ## old one still references it, and the crash then arrives at the next
+  ## collection, far from the write and with nothing on the stack to connect
+  ## the two. That is the worst failure shape this file can produce, so it is
+  ## the default rather than the option.
+  ##
+  ## This used to be the unbarriered store, documented as such and left to the
+  ## caller to be careful about -- while `writeBarrier` sat bound and unused in
+  ## `il2cpp.nim` one call site away. A hazard that is *documented* is still a
+  ## hazard; the note told a mod author to reason about object age at every
+  ## write, which is not a thing anyone can reliably do.
+  ##
+  ## On a runtime with no barrier entry the store still happens, unbarriered,
+  ## because the alternative is a field that silently does not get written.
+  ## `barrierReady` is how a mod asks which of those it is getting.
+  if not f.ok or obj == nil: return
+  if f.wbarrier != nil:
+    cFldSetPtrWb(f.wbarrier, obj, f.offset, v)
+  else:
+    cFldSetPtr(obj, f.offset, v)
+
+proc writePtrRaw*(f: FieldBinding; obj: Il2CppPtr; v: Il2CppPtr) =
+  ## The unbarriered store, for the one case that is genuinely safe: writing
+  ## back a pointer the object already reachably holds -- clearing a field to
+  ## nil, or restoring a value read out of the same object a moment ago.
+  ##
+  ## Nothing in this repository needs it. It exists so that a mod that has
+  ## measured the barrier and found it in its way can say so explicitly,
+  ## instead of the default being the dangerous one for everybody.
   if not f.ok or obj == nil: return
   cFldSetPtr(obj, f.offset, v)
+
+proc barrierReady*(f: FieldBinding): bool =
+  ## Whether `writePtr` on this binding goes through the collector.
+  result = f.wbarrier != nil
+
+# ---------------------------------------------------------------------------
+# Static field bindings
+# ---------------------------------------------------------------------------
+#
+# ## Why this is a different type rather than a flag on `FieldBinding`
+#
+# A static field's offset is into the class's static data block; an instance
+# field's is into the object. The two ranges overlap completely -- the stand-in
+# runtime has `EFT.Player::SpawnCount` (static, `Int32`) and
+# `EFT.Player::Health` (instance, `Single`) both at offset 16, which is not a
+# contrivance but the ordinary case, since neither number knows about the
+# other.
+#
+# So the failure mode of getting this wrong is not a crash and not a refusal.
+# `readInt` on a static binding applied to an object reads a `float`'s bits as
+# an integer and answers 1091567616; `readFloat` on an instance binding applied
+# to the static block reads a spawn count as a float. Both are numbers, both
+# arrive with `ok` true, and a mod acts on them.
+#
+# The only defence that actually holds is one the compiler makes: a static
+# binding is a **different type**, and its readers take no object at all.
+#
+#     readFloat(fHealth, player)      # instance: FieldBinding + an object
+#     readInt(fSpawnCount)            # static:   StaticFieldBinding, no object
+#
+# Passing either to the other's reader does not compile. That is the whole
+# design; everything below is bookkeeping.
+#
+# ## What binding one costs, and why it is done once
+#
+# `il2cpp_class_get_static_field_data` is a call, and the address it returns
+# does not move for the life of the class. So it is asked once, at bind time,
+# and the binding holds the block. A read is then the same one load an instance
+# read is, from a base that is a constant instead of an object.
+#
+# `il2cpp_runtime_class_init` runs first. A class whose static constructor has
+# not run has a static block that exists and is zero, and "the field is zero"
+# is not distinguishable from "the field is zero because nothing has
+# initialised it yet".
+
+type
+  StaticFieldBinding* = object
+    ## A **static** field, resolved to the address of its storage.
+    ##
+    ## Deliberately not a `FieldBinding` with a flag: see the note above. The
+    ## readers below take no object, so an instance binding and a static one
+    ## cannot be swapped by accident even when both are in scope and both are
+    ## called `f`.
+    ok*: bool
+    why*: string
+    target*: string
+    base*: Il2CppPtr    ## the class's static data block
+    offset*: int32      ## where in it this field lives
+    kind*: FastKind
+    bindNs*: int64
+
+proc bindStaticField*(rt: Il2Cpp; owner, fieldName: string): StaticFieldBinding =
+  ## Binds a **static** field, refusing an instance one.
+  ##
+  ## Both directions are refusals rather than approximations, and both are
+  ## asked of the runtime:
+  ##
+  ## * A runtime that does not export `il2cpp_field_get_flags` cannot say
+  ##   whether a field is static, so this refuses rather than assuming. The
+  ##   offset cannot stand in for the flag -- that is the whole point of the
+  ##   note above.
+  ## * A runtime that does not export `il2cpp_class_get_static_field_data`
+  ##   cannot say where the block is, and adding an offset to nil is how a mod
+  ##   reads address 16.
+  let t0 = perfCounter()
+  result = StaticFieldBinding(ok: false, why: "",
+                              target: owner & "::" & fieldName,
+                              base: nullPtr(), offset: 0'i32, kind: fkNone,
+                              bindNs: 0'i64)
+
+  if not rt.has(eFieldGetFlags):
+    result.why = result.target &
+      ": this runtime does not export il2cpp_field_get_flags, so there is no " &
+      "way to establish that the field is static. Refusing rather than " &
+      "guessing from the offset, which cannot tell the two apart."
+    return
+  if not rt.has(eClassStaticFieldData):
+    result.why = result.target &
+      ": this runtime does not export il2cpp_class_get_static_field_data, so " &
+      "the static block has no address. Use the boxed path."
+    return
+
+  let cls = findClass(rt, owner)
+  if cls == nil:
+    result.why = "no such type: " & owner &
+                 " (the game's assemblies may not be loaded yet)"
+    return
+  let f = findField(rt, cls, fieldName)
+  if f == nil:
+    result.why = "no field " & result.target
+    return
+  if not fieldIsStatic(rt, f):
+    result.why = result.target &
+      " is an instance field: its offset is into an object, not into the " &
+      "class's static block. Bind it with bindField and read it off an " &
+      "object -- reading it here would answer whatever the static block " &
+      "happens to hold at the same offset."
+    return
+
+  # The static constructor, before the block is read. Otherwise a field that is
+  # zero because nothing has initialised it yet is indistinguishable from one
+  # that is zero.
+  runtimeClassInit(rt, cls)
+
+  let base = staticFieldData(rt, cls)
+  if base == nil:
+    result.why = result.target &
+      ": the runtime gave no static data block for " & owner &
+      " (a class with no static storage, or one that has not been initialised)"
+    return
+
+  let off = fieldOffset(rt, f)
+  if off < 0:
+    result.why = result.target & ": negative offset " & $off
+    return
+
+  let ft = fieldType(rt, f)
+  let tn = typeName(rt, ft)
+  var k = classifyDeclared(rt, ft)
+  if k == fkNone:
+    k = classifyType(rt, tn)
+  if k == fkNone or k == fkVoid:
+    result.why = result.target & " is declared " & tn &
+      ", which the fast path will not read by offset. A value type wider than " &
+      "eight bytes has to be copied, not loaded."
+    return
+
+  # Kept as base and offset rather than added here: the addition is the same
+  # one an instance read does, it happens in C where the arithmetic is on a
+  # `char*`, and nimony will not add an integer to a pointer anyway.
+  result.base = base
+  result.offset = int32(off)
+  result.kind = k
+  result.ok = true
+  result.bindNs = nanosBetween(t0, perfCounter())
+  result.why = result.target & ": static " & describe(k) & " at offset " &
+    $off & " of the class's static block"
+
+proc readInt*(f: StaticFieldBinding): int64 =
+  ## No object argument, and that is the safety property rather than a
+  ## convenience: an instance binding cannot reach this overload.
+  result = 0'i64
+  if not f.ok: return
+  if f.kind == fkI64 or f.kind == fkPtr:
+    result = cFldI64(f.base, f.offset)
+  elif f.kind == fkBool:
+    result = int64(cFldU8(f.base, f.offset))
+  else:
+    result = int64(cFldI32(f.base, f.offset))
+
+proc readInt32*(f: StaticFieldBinding): int32 =
+  result = int32(readInt(f))
+
+proc readBool*(f: StaticFieldBinding): bool =
+  result = false
+  if not f.ok: return
+  result = cFldU8(f.base, f.offset) != 0'i32
+
+proc readFloat*(f: StaticFieldBinding): float =
+  result = 0.0
+  if not f.ok: return
+  if f.kind == fkF64:
+    result = cFldF64(f.base, f.offset)
+  else:
+    result = cFldF32(f.base, f.offset)
+
+proc readPtr*(f: StaticFieldBinding): Il2CppPtr =
+  ## A static reference field -- which is how a hand-rolled singleton is
+  ## spelled when it is not a property. Same warning as `callPtr`: a raw
+  ## managed pointer, good for this frame.
+  result = nullPtr()
+  if not f.ok: return
+  result = cFldPtr(f.base, f.offset)
+
+proc writeInt*(f: StaticFieldBinding; v: int64) =
+  if not f.ok: return
+  if f.kind == fkI64:
+    cFldSetI64(f.base, f.offset, v)
+  elif f.kind == fkBool:
+    cFldSetU8(f.base, f.offset, int32(v))
+  else:
+    cFldSetI32(f.base, f.offset, int32(v))
+
+proc writeBool*(f: StaticFieldBinding; v: bool) =
+  if not f.ok: return
+  cFldSetU8(f.base, f.offset, (if v: 1'i32 else: 0'i32))
+
+proc writeFloat*(f: StaticFieldBinding; v: float) =
+  if not f.ok: return
+  if f.kind == fkF64:
+    cFldSetF64(f.base, f.offset, v)
+  else:
+    cFldSetF32(f.base, f.offset, v)
+
+proc writePtrRaw*(f: StaticFieldBinding; v: Il2CppPtr) =
+  ## Stores a reference into a static field, **without** a write barrier, and
+  ## the name says so because there is no barriered version to reach for.
+  ##
+  ## `il2cpp_gc_wbarrier_set_field` takes the *object* whose field is being
+  ## written, so that the collector can mark that object's card. A static field
+  ## has no such object: the storage is a GC root in its own right, scanned on
+  ## every collection rather than reached through an owner. Passing the static
+  ## block where an object header is expected is not a conservative choice, it
+  ## is a wrong pointer handed to the collector.
+  ##
+  ## So this is the honest shape: the store a static reference field needs, and
+  ## a name that does not let a caller believe a barrier happened.
+  if not f.ok: return
+  cFldSetPtr(f.base, f.offset, v)
