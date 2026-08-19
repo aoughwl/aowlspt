@@ -442,11 +442,25 @@ instead. `stopVoid()` is the same for a method that returns nothing.
 Four things about this are worth holding on to, because each of them is a
 refusal that could have been a guess:
 
-- **Arguments past the fourth are not reported.** They arrive on the stack
-  rather than in registers, and the host omits them rather than guessing.
-  A patch that reported the wrong fifth argument would be worse than one that
-  reports four and says so. On an *instance* method `this` occupies the first
-  register, so three declared arguments are what fits.
+- **An argument past the register window is named, not dropped.** Win64 passes
+  four arguments in registers and the thunk saves those four; on an *instance*
+  method `this` occupies the first, so **three** declared arguments fit there
+  and a static method's four do. The rest arrived on the stack and the host
+  cannot report their values -- but it does not fall silent about them either.
+  The `args` array is always `argc` long and the slot holds
+
+  ```json
+  {"onStack":true,"type":"System.Single"}
+  ```
+
+  so argument *n* is always declared parameter *n*, and *"the host did not
+  report this argument"* can never read the same as *"this argument was
+  empty"*. The payload also carries `argc`, the declared parameter count, and
+  `stackArgs`, how many of them are in that state -- so a handler that wants
+  nothing to do with a truncated firing checks one number before it reads
+  anything. This is the same rule the typed path has always held to with
+  `akStack`; until now the two paths described the same method differently, and
+  the JSON one did it by silently stopping early.
 - **A suppression whose replacement does not match the declared return type is
   refused**, and the original runs. Skipping the method with garbage in the
   return register is the worst outcome available, so it is the one thing the

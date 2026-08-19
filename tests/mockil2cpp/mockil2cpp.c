@@ -131,7 +131,14 @@ struct MockMethod {
     void*       methodPointer;
     const char* name;
     uint32_t    paramCount;
-    const char* paramTypes[4];
+    /* Six, not four, so that a method with more declared parameters than
+     * Win64 has argument registers can exist here at all. `Quint` below is
+     * five, which is the only way to reach the host's stack-argument case for
+     * a *static* method; `Step` is four, which reaches it for an instance one
+     * because `this` takes the first register. A stand-in that cannot express
+     * the shape cannot test it, and that case was untested for exactly that
+     * reason. */
+    const char* paramTypes[6];
     const char* returnType;
     MockInvoke  impl;
     MockClass*  klass;
@@ -561,6 +568,44 @@ static void* m_playerSway(void* obj, void** params) {
  * which is what separates it from a prefix that answered instead. */
 MOCK_EXPORT int32_t mock_sway_calls(void) { return g_swayCalls; }
 
+/* EFT.Player::Quint(Single, Int32, String, Single, Int32) -> System.Single,
+ * **static** and compiled.
+ *
+ * Five declared parameters, which is one more than Win64 has argument
+ * registers, and static so that parameter *n* lands in register position *n*.
+ * So the first four are in registers -- and deliberately in both files:
+ * `System.Single` at positions 0 and 3 is XMM0 and XMM3, `System.Int32` at 1
+ * is RDX, and the string pointer at 2 is R8. A host that counted the two
+ * register files separately would read the second float out of XMM1 and
+ * report a number.
+ *
+ * The fifth travelled on the stack and the thunk did not save it. It exists to
+ * be *named* rather than answered: `describeArgs` is what says so, and before
+ * this method there was nothing in the stand-in that could reach that case for
+ * a static method at all.
+ *
+ * No branches, and long enough to hold a fourteen-byte jump, for the reason
+ * every other compiled stand-in here has neither. */
+static int32_t g_quintCalls = 0;
+static float mock_native_quint(float a, int32_t b, void* text, float d,
+                               int32_t e, void* methodInfo) {
+    (void)methodInfo; (void)text;
+    g_quintCalls++;
+    return a * 1000.0f + (float)b * 100.0f + d * 10.0f + (float)e;
+}
+static MockMethod* g_quintMethod = NULL;
+typedef float (*FnQuint)(float, int32_t, void*, float, int32_t, void*);
+static void* m_playerQuint(void* obj, void** params) {
+    (void)obj;
+    FnQuint fn = (FnQuint)g_quintMethod->methodPointer;
+    return mock_box_f32(fn(*(float*)params[0], *(int32_t*)params[1], params[2],
+                           *(float*)params[3], *(int32_t*)params[4], NULL));
+}
+/* How many times the original ran. A prefix that only reads the arguments must
+ * leave this rising: a payload assertion against a method that never ran would
+ * be an assertion about nothing. */
+MOCK_EXPORT int32_t mock_quint_calls(void) { return g_quintCalls; }
+
 /* EFT.Player::Wide(Int32, Int32, Int32, Int32) -> System.Int32, static.
  *
  * Here to be refused. Four declared arguments plus IL2CPP's trailing
@@ -758,6 +803,9 @@ static MockMethod g_playerMethods[] = {
       (void*)mock_native_sway },
     { NULL, "Wide",    4, {"System.Int32","System.Int32","System.Int32","System.Int32"},
                                                              "System.Int32",   m_playerWide,    NULL, 1, NULL },
+    { NULL, "Quint",   5, {"System.Single","System.Int32","System.String",
+                           "System.Single","System.Int32"},   "System.Single",  m_playerQuint,   NULL, 1,
+      (void*)mock_native_quint },
     /* Added for `mods/sain`'s binding self-test: a bool the plain fast path
        takes, and a Vector3 only the shaped path can. */
     { (void*)mock_native_get_is_ai, "get_IsAI", 0, {0,0,0,0}, "System.Boolean",
@@ -1118,6 +1166,38 @@ static void* m_contextAim(void* obj, void** params) {
     FnAim fn = (FnAim)g_aimMethod->methodPointer;
     return mock_box_f32(fn(obj, *(float*)params[0], NULL));
 }
+/* EFT.MovementContext::Step(Single, Int32, String, Single) -> System.Single,
+ * instance and compiled.
+ *
+ * `Quint`'s instance twin, and the pair is the point: the same four leading
+ * parameter types, one method static and one not, so the only difference
+ * between what a hook is told about them is `this`. It takes register position
+ * 0 and pushes every parameter along by one, so `Step`'s fourth declared
+ * parameter -- the trailing `System.Single` -- is on the stack while `Quint`'s
+ * fourth is in XMM3.
+ *
+ * That was the silent case. The host reported three arguments here and four
+ * there and said nothing about the difference, so a handler reading argument 3
+ * got an absence that read exactly like an empty value. This method is what
+ * makes that reachable from a test rather than only from a raid. */
+static int32_t g_stepCalls = 0;
+static float mock_native_step(void* thisPtr, float a, int32_t kind, void* text,
+                              float tail, void* methodInfo) {
+    (void)methodInfo; (void)text;
+    MockMoveContext* c = (MockMoveContext*)thisPtr;
+    g_stepCalls++;
+    c->tilt = a * 100.0f + (float)kind + tail;
+    return c->tilt;
+}
+MOCK_EXPORT int32_t mock_step_calls(void) { return g_stepCalls; }
+static MockMethod* g_stepMethod = NULL;
+typedef float (*FnStep)(void*, float, int32_t, void*, float, void*);
+static void* m_contextStep(void* obj, void** params) {
+    FnStep fn = (FnStep)g_stepMethod->methodPointer;
+    return mock_box_f32(fn(obj, *(float*)params[0], *(int32_t*)params[1],
+                           params[2], *(float*)params[3], NULL));
+}
+
 /* EFT.MovementContext::get_Instance() -> EFT.MovementContext (static) */
 static void* m_contextInstance(void* obj, void** params) {
     (void)obj; (void)params;
@@ -1140,6 +1220,9 @@ static MockMethod g_contextMethods[] = {
       m_contextDrift, NULL, 0, (void*)mock_native_drift },
     { NULL, "Ready", 0, {0,0,0,0}, "System.Boolean",
       m_contextReady, NULL, 0, (void*)mock_native_ready },
+    { NULL, "Step", 4, {"System.Single","System.Int32","System.String",
+                        "System.Single"}, "System.Single",
+      m_contextStep, NULL, 0, (void*)mock_native_step },
 };
 
 static MockField g_contextFields[] = {
@@ -1593,6 +1676,8 @@ static void mock_wire(void) {
     g_sensMethod = mock_find(&g_playerClass, "Sensitivity");
     g_pingMethod = mock_find(&g_playerClass, "Ping");
     g_swayMethod = mock_find(&g_playerClass, "Sway");
+    g_quintMethod = mock_find(&g_playerClass, "Quint");
+    g_stepMethod = mock_find(&g_moveContextClass, "Step");
     g_setAnisoMethod = mock_find(&g_qualityClass, "set_anisotropicFiltering");
     g_getAnisoMethod = mock_find(&g_qualityClass, "get_anisotropicFiltering");
 }

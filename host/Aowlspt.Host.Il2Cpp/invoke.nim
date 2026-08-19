@@ -510,6 +510,20 @@ proc escapeForJson*(s: string): string =
 
 const MaxRegArgs* = 4
 
+proc reportableArgs*(isStatic: bool; declared: int): int =
+  ## How many of `declared` parameters land in a register the thunk saved.
+  ##
+  ## `this` occupies register position 0 on an instance method and pushes every
+  ## parameter along by one, so an instance method has room for three and a
+  ## static one for four. Stated once, here, because the payload and its
+  ## `stackArgs` count both need it as a number -- `frameKinds` needs the same
+  ## rule per index and applies it there -- and the day the window moves it
+  ## must move in both.
+  if declared <= 0:
+    return 0
+  let room = (if isStatic: MaxRegArgs else: MaxRegArgs - 1)
+  result = (if declared < room: declared else: room)
+
 type ArgShape* = enum
   ## What a parameter or field type turns out to be, once the runtime is asked
   ## rather than guessed at.
@@ -568,8 +582,9 @@ proc describeArgs*(rt: Il2Cpp; m: Il2CppMethod; regs: Il2CppPtr;
                    gcHandles: var seq[uint32]): string =
   ## What a patched method was called with, as JSON:
   ##
-  ##     {"this":{"handle":3,"type":"EFT.Player"},"args":[...]}
-  ##     {"this":null,"args":[...]}                 -- a static method
+  ##     {"this":{"handle":3,"type":"EFT.Player"},"argc":2,"stackArgs":0,
+  ##      "args":[...]}
+  ##     {"this":null,"argc":0,"stackArgs":0,"args":[]}   -- a static method
   ##
   ## An object rather than a bare array, and that is the whole point of the
   ## shape. `this` is not a declared parameter -- it arrives in RCX ahead of
@@ -585,11 +600,39 @@ proc describeArgs*(rt: Il2Cpp; m: Il2CppMethod; regs: Il2CppPtr;
   ## and a static method's `"this"` is `null` rather than absent, so "no
   ## instance" cannot be confused with "the payload did not say".
   ##
-  ## Arguments past the fourth arrive on the stack and are **not** reported.
-  ## They are omitted rather than guessed at: a patch that reports the wrong
-  ## fifth argument is worse than one that reports four and says so.
+  ## **An argument past the register window is named, not dropped.** Win64
+  ## passes the first four arguments in registers and the thunk saves those
+  ## four; `this` is one of them on an instance method, so a four-argument
+  ## instance method's last parameter travelled on the stack and there is
+  ## nothing in the frame to report. That much is the ABI and cannot be argued
+  ## with. What can be argued with is what the payload then says, and it used
+  ## to say nothing: the array stopped early, so a handler reading argument 3
+  ## got the same empty answer it would get for an argument that was genuinely
+  ## empty, and went on to decide something on a value the game never supplied.
+  ##
+  ## So the array is always `argc` long and the missing one is
+  ##
+  ##     {"onStack":true,"type":"System.Single"}
+  ##
+  ## which no real argument can be confused with, and argument *n* is declared
+  ## parameter *n* whatever the method's shape -- the same rule
+  ## `AOWLSPT_ARG_STACK` already holds the typed path to, and the two paths
+  ## disagreed about it until now. Two counts come with it: `argc`, the
+  ## declared parameter count, and `stackArgs`, how many of them are in that
+  ## state. A handler that wants to refuse the whole firing can read one number
+  ## and refuse; one that only wants argument 0 carries on, which is why this
+  ## is a marker rather than a refusal to install the patch. Most hooks want
+  ## the first argument of a method whose later ones they have no use for, and
+  ## turning a partial answer into no answer at all would have cost working
+  ## features to prevent a mistake a named slot already prevents.
+  ##
+  ## The `"type"` in the marker is load-bearing and not decoration: it names
+  ## what was lost, and it is also what makes the marker fail *closed* in a mod
+  ## that has never heard of `onStack` -- an object carrying `"type"` and no
+  ## `"handle"` is already the shape those mods refuse.
   let isStatic = methodIsStatic(rt, m)
   let declared = methodParamCount(rt, m)
+  let onStack = declared - reportableArgs(isStatic, declared)
 
   var out1 = "{\"this\":"
   if isStatic:
@@ -601,16 +644,21 @@ proc describeArgs*(rt: Il2Cpp; m: Il2CppMethod; regs: Il2CppPtr;
     if sc != nil:
       selfType = fullName(rt, sc)
     out1.add referenceHandle(rt, self, selfType, handles, isObject, gcHandles)
+  out1.add ",\"argc\":" & $declared
+  out1.add ",\"stackArgs\":" & $onStack
   out1.add ",\"args\":["
 
   var i = 0
   while i < declared:
     let pos = (if isStatic: i else: i + 1)
-    if pos >= MaxRegArgs:
-      break
     if i > 0: out1.add ","
     let t = typeName(rt, methodParam(rt, m, i))
-    if t == "System.Single":
+    if pos >= MaxRegArgs:
+      # Past the register window. The thunk did not save it and nothing here
+      # can recover it, so it is named rather than omitted -- and named with
+      # its declared type, which is the part of it that *is* knowable.
+      out1.add "{\"onStack\":true,\"type\":\"" & escapeForJson(t) & "\"}"
+    elif t == "System.Single":
       out1.add $cRegsF32(regs, int32(pos))
     elif t == "System.Double":
       out1.add $cRegsFlt(regs, int32(pos))
@@ -769,8 +817,9 @@ proc frameKinds*(rt: Il2Cpp; m: Il2CppMethod): seq[uint8] =
   ##
   ## Parameters past the fourth register position are `AkStack`: named rather
   ## than dropped, so that argument *n* is always declared parameter *n*
-  ## whatever the method's shape. The JSON path stops early instead, which
-  ## silently renumbers nothing but does leave a handler counting.
+  ## whatever the method's shape. `describeArgs` used to stop early instead,
+  ## which meant the two paths described the same method differently; it now
+  ## marks the slot the same way and the rule is one rule.
   result = @[]
   let isStatic = methodIsStatic(rt, m)
   let declared = methodParamCount(rt, m)

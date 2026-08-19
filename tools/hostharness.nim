@@ -94,6 +94,24 @@ static int32_t aowl_rt_frame_count(void) {
    only report that its binding resolved the entry; whether the store went
    through the collector or around it is knowable here and nowhere else. A
    stand-in without the export leaves the mod silently on the plain store. */
+/* How many times the two stack-argument stand-ins actually ran. A payload
+   assertion is only about something if the method behind it ran, and a prefix
+   that reads the arguments must leave the original running -- so this is the
+   half of the argument checks that the payload itself cannot state. -1 means
+   the runtime is not the stand-in and has no such export, which is the same
+   answer every other counter here gives. */
+static int32_t aowl_rt_step_calls(void) {
+  if (!g_mockRt) return -1;
+  void* f = (void*)GetProcAddress((HMODULE)g_mockRt, "mock_step_calls");
+  if (!f) return -1;
+  return ((int32_t(*)(void))f)();
+}
+static int32_t aowl_rt_quint_calls(void) {
+  if (!g_mockRt) return -1;
+  void* f = (void*)GetProcAddress((HMODULE)g_mockRt, "mock_quint_calls");
+  if (!f) return -1;
+  return ((int32_t(*)(void))f)();
+}
 static int32_t aowl_rt_wbarrier_calls(void) {
   if (!g_mockRt) return -1;
   void* f = (void*)GetProcAddress((HMODULE)g_mockRt, "mock_wbarrier_calls");
@@ -315,12 +333,37 @@ static volatile LONG g_nestEnabled = 0;
 static volatile LONG g_nestDepth   = 0;
 static char g_hurtSpec[64];
 
+/* The last JSON payload a hook was handed, kept verbatim.
+ *
+ * This is the only place in the tree where the *mod's* view of a firing can be
+ * asserted on. Everything else reads the host's own reply to a `call`, or a
+ * line a mod printed about a payload it had already decided about -- neither of
+ * which can show that an argument the method declares is missing from the
+ * string, because a payload that omits it looks exactly like one whose value
+ * happened to be empty. That is the defect this exists to make visible: the
+ * bytes are compared, not a summary of them. */
+static char    g_payload[8192];
+static int32_t g_payloadLen = 0;
+
 static int32_t AOWLSPT_CALL aowl_churn_patch_cb(void* user, AowlSlice target,
                                                 AowlSlice args, AowlBuffer* out) {
-    (void)user; (void)target; (void)args;
+    (void)user; (void)target;
+    if (args.ptr && args.len > 0) {
+        int32_t n = args.len;
+        if (n > (int32_t)sizeof(g_payload) - 1) n = (int32_t)sizeof(g_payload) - 1;
+        memcpy(g_payload, args.ptr, (size_t)n);
+        g_payload[n] = 0;
+        g_payloadLen = n;
+    }
     if (out) { out->ptr = NULL; out->len = 0; }
     InterlockedIncrement(&g_jsonFires);
     return 0;
+}
+
+static void aowl_churn_payload_clear(void) { g_payload[0] = 0; g_payloadLen = 0; }
+static int32_t aowl_churn_payload_len(void) { return g_payloadLen; }
+static uint8_t aowl_churn_payload_at(int32_t i) {
+    return (i >= 0 && i < g_payloadLen) ? (uint8_t)g_payload[i] : (uint8_t)0;
 }
 
 /* A typed handler that, when asked, calls something the host has also patched.
@@ -748,6 +791,11 @@ proc rtInit(): int32 {.importc: "aowl_rt_init", nodecl.}
 proc rtTickCount(): int32 {.importc: "aowl_rt_tick_count", nodecl.}
 proc rtFrameThread(): uint32 {.importc: "aowl_rt_frame_thread", nodecl.}
 proc rtFrameCount(): int32 {.importc: "aowl_rt_frame_count", nodecl.}
+proc mockStepCalls(): int32 {.importc: "aowl_rt_step_calls", nodecl.}
+proc mockQuintCalls(): int32 {.importc: "aowl_rt_quint_calls", nodecl.}
+proc payloadClear() {.importc: "aowl_churn_payload_clear", nodecl.}
+proc payloadLen(): int32 {.importc: "aowl_churn_payload_len", nodecl.}
+proc payloadAt(i: int32): uint8 {.importc: "aowl_churn_payload_at", nodecl.}
 proc mockWbarrierCalls(): int32 {.importc: "aowl_rt_wbarrier_calls", nodecl.}
 proc mockStaticDataCalls(): int32 {.importc: "aowl_rt_static_data_calls", nodecl.}
 proc mockSpawnCount(): int32 {.importc: "aowl_rt_spawn_count", nodecl.}
@@ -801,6 +849,21 @@ timed is the drain on the thread that pays for it rather than a copy of it in
 this binary. It prints a table and asserts four things about it, including that
 an armed per-frame chain costs the host no allocations at all.
 """
+
+var gArgVerdicts: seq[string] = @[]
+  ## What a hook was told about its arguments, decided before `checkLog` runs
+  ## and printed under its `Result` heading.
+  ##
+  ## A seq rather than four assertions in place, because the payloads have to be
+  ## collected while the host is still loaded and the runtime is still up, and
+  ## the verdicts have to be printed where every other verdict in this run is
+  ## printed. A check that prints somewhere else is a check a reader counts
+  ## separately and eventually stops counting.
+  ##
+  ## Each entry begins with `ok ` or `err `, and an `err` fails the run.
+
+proc recordOk(s: string) = gArgVerdicts.add "ok " & s
+proc recordErr(s: string) = gArgVerdicts.add "err " & s
 
 proc parseCount(s: string; into: var int): bool =
   var v = 0
@@ -1203,6 +1266,23 @@ proc checkLog(logPath: string; expectRuntime: bool = false;
     return 1
   ok "a field was read by declared type and agreed with its property"
 
+  # ---- what a hook is told about its arguments ---------------------------
+  #
+  # Collected by `probeArgPayloads`, which reads the bytes a handler was
+  # actually handed rather than a line some mod printed about them. Every
+  # failure is reported rather than the first, because these four are four
+  # different statements about the same payload and knowing which of them
+  # broke is the whole value of having four.
+  var argsBad = 0
+  for v in gArgVerdicts:
+    if startsWith(v, "ok "):
+      ok substr(v, 3)
+    else:
+      err substr(v, 4)
+      inc argsBad
+  if argsBad > 0:
+    return 1
+
   result = 0
 
 proc runInjection(hostDll, logPath, target: string; seconds: int): int =
@@ -1355,6 +1435,239 @@ proc hostAskArgs(target, args: string): string =
   if churnCall(toCString(t), toCString(a)) != 0'i32:
     return ""
   result = replyText()
+
+# ---------------------------------------------------------------------------
+# What a hook is told about its arguments
+#
+# Win64 passes four arguments in registers and the detour thunk saves those
+# four. `this` is one of them on an instance method, so a four-argument
+# instance method's last parameter arrived on the stack and is not in the
+# frame at all. That constraint is real and is not what is being tested here.
+#
+# What is tested is what the payload *says* about it. It used to say nothing:
+# the array stopped at three entries and a handler reading argument 3 got the
+# same empty answer an argument with an empty value would give it. The two
+# methods below are the pair that makes the difference reachable --
+# `EFT.MovementContext::Step` and `EFT.Player::Quint` have the same four
+# leading parameter types and differ only in `this` -- and these checks read
+# the bytes the handler was handed, because a payload that omits an argument
+# and one that reports it as empty are indistinguishable in any summary.
+# ---------------------------------------------------------------------------
+
+const
+  StepTarget  = "EFT.MovementContext::Step"
+  QuintTarget = "EFT.Player::Quint"
+  MarkerF     = "{\"onStack\":true,\"type\":\"System.Single\"}"
+  MarkerI     = "{\"onStack\":true,\"type\":\"System.Int32\"}"
+
+proc payloadText(): string =
+  ## The last payload a JSON hook was handed, verbatim.
+  result = ""
+  let n = int(payloadLen())
+  for i in 0 ..< n:
+    result.add char(payloadAt(int32(i)))
+
+proc argsInterior(payload: string): string =
+  ## The inside of the payload's `"args"` array, or "" if there is not one.
+  ##
+  ## Bracket-counted rather than taken to the last `]`, because an argument may
+  ## itself be an object and a `System.String` argument may contain anything at
+  ## all -- including a bracket. The one producer of these payloads is the host,
+  ## and the strings inside them come from the game.
+  result = ""
+  let needle = "\"args\":["
+  let at = find(payload, needle)
+  if at < 0:
+    return
+  var i = at + needle.len
+  var depth = 0
+  var inStr = false
+  var out1 = ""
+  while i < payload.len:
+    let ch = payload[i]
+    if inStr:
+      out1.add ch
+      if ch == '\\' and i + 1 < payload.len:
+        inc i
+        out1.add payload[i]
+      elif ch == '"':
+        inStr = false
+    elif ch == '"':
+      inStr = true
+      out1.add ch
+    elif ch == '{' or ch == '[':
+      inc depth
+      out1.add ch
+    elif ch == ']' and depth == 0:
+      return out1
+    elif ch == '}' or ch == ']':
+      dec depth
+      out1.add ch
+    else:
+      out1.add ch
+    inc i
+  # Unterminated. Nothing is claimed about a payload that does not close its
+  # own array; the caller sees "" and says so.
+  result = ""
+
+proc splitTop(interior: string): seq[string] =
+  ## An array's elements, split on the commas that are not inside a string or a
+  ## nested object.
+  result = @[]
+  if interior.len == 0:
+    return
+  var depth = 0
+  var inStr = false
+  var cur = ""
+  var i = 0
+  while i < interior.len:
+    let ch = interior[i]
+    if inStr:
+      cur.add ch
+      if ch == '\\' and i + 1 < interior.len:
+        inc i
+        cur.add interior[i]
+      elif ch == '"':
+        inStr = false
+    elif ch == '"':
+      inStr = true
+      cur.add ch
+    elif ch == '{' or ch == '[':
+      inc depth
+      cur.add ch
+    elif ch == '}' or ch == ']':
+      dec depth
+      cur.add ch
+    elif ch == ',' and depth == 0:
+      result.add cur
+      cur = ""
+    else:
+      cur.add ch
+    inc i
+  result.add cur
+
+proc probeArgPayloads() =
+  ## Fires a hook on one instance method and one static method whose fourth and
+  ## fifth arguments are past the register window, and reads what the handler
+  ## was handed.
+  if churnBind() == 0'i32:
+    recordErr "the harness could not bind the host's patch and call entry " &
+              "points, so nothing could be asked what a hook is told about " &
+              "its arguments"
+    return
+  let ctxReply = hostAsk("EFT.MovementContext::get_Instance")
+  let ctxHandle = numAfter(ctxReply, "handle")
+  if ctxHandle <= 0'i64:
+    recordErr "no EFT.MovementContext instance came back, so the instance " &
+              "half of the argument checks could not be fired"
+    return
+  var stepTarget = StepTarget
+  var quintTarget = QuintTarget
+  if churnInstall(toCString(stepTarget), 0x10'i32, 0'i32, 0x7FFF'i32) != 0'i32:
+    recordErr "could not install a JSON prefix with arguments on " &
+              StepTarget & " (code " & $int(churnCounter(7'i32)) & ")"
+    return
+  if churnInstall(toCString(quintTarget), 0x10'i32, 0'i32, 0x7FFF'i32) != 0'i32:
+    recordErr "could not install a JSON prefix with arguments on " &
+              QuintTarget & " (code " & $int(churnCounter(7'i32)) & ")"
+    return
+
+  # ---- the instance method: four declared, three in registers -------------
+  let stepBefore = mockStepCalls()
+  payloadClear()
+  var spec = "#" & $int(ctxHandle) & "::Step"
+  discard hostAskArgs(spec, "[0.5,3,\"seven\",1.5]")
+  let stepPayload = payloadText()
+  let stepArgs = splitTop(argsInterior(stepPayload))
+  if stepPayload.len == 0:
+    recordErr "the hook on " & StepTarget & " was never handed a payload; " &
+              "either the detour did not fire or it fired without arguments"
+    return
+  if mockStepCalls() <= stepBefore:
+    recordErr "the original " & StepTarget & " never ran, so the payload " &
+              "below describes a firing that did not happen"
+    return
+
+  if numAfter(stepPayload, "argc") != 4'i64 or stepArgs.len != 4:
+    recordErr "a four-argument instance method's payload should carry " &
+              "argc 4 and four entries; it carries argc " &
+              $int(numAfter(stepPayload, "argc")) & " and " & $stepArgs.len &
+              " entry(s). An argument that is simply absent reads exactly " &
+              "like one whose value was empty: " & stepPayload
+  elif stepArgs[3] != MarkerF:
+    recordErr "the fourth declared argument of an instance method is on the " &
+              "stack and must be named as such; the payload has " &
+              stepArgs[3] & " there rather than " & MarkerF
+  elif numAfter(stepPayload, "stackArgs") != 1'i64:
+    recordErr "the payload names one stack argument in its array but its " &
+              "stackArgs count says " & $int(numAfter(stepPayload, "stackArgs"))
+  else:
+    recordOk "a hook on a four-argument instance method is told about all " &
+             "four: three values and the fourth named " & MarkerF &
+             ", which no reported value can be mistaken for"
+
+  # The three that *are* in registers, and specifically that the float went to
+  # its own file at the same *position*: `Step`'s first parameter is XMM1
+  # because `this` took position 0, and a host that counted integer and float
+  # registers separately would read it out of XMM0 and report `this` as a
+  # number.
+  if stepArgs.len >= 3:
+    if find(stepArgs[0], "0.5") < 0 or stepArgs[1] != "3" or
+       stepArgs[2] != "\"seven\"":
+      recordErr "the three register arguments of " & StepTarget &
+                " came back as " & stepArgs[0] & ", " & stepArgs[1] & ", " &
+                stepArgs[2] & " rather than 0.5, 3 and \"seven\"; a float at " &
+                "position 1 is XMM1, an integer at 2 is R8 and a reference " &
+                "at 3 is R9"
+    else:
+      recordOk "the three arguments an instance method does fit in registers " &
+               "are read by position across both register files: 0.5 out of " &
+               "XMM1, 3 out of R8 and \"seven\" out of R9"
+
+  # ---- the static method: five declared, four in registers ----------------
+  let quintBefore = mockQuintCalls()
+  payloadClear()
+  discard hostAskArgs("EFT.Player::Quint", "[0.5,3,\"seven\",1.5,9]")
+  let quintPayload = payloadText()
+  let quintArgs = splitTop(argsInterior(quintPayload))
+  if quintPayload.len == 0 or mockQuintCalls() <= quintBefore:
+    recordErr "the hook on " & QuintTarget & " was never handed a payload, " &
+              "or the original never ran"
+    return
+  if numAfter(quintPayload, "argc") != 5'i64 or quintArgs.len != 5:
+    recordErr "a five-argument static method's payload should carry argc 5 " &
+              "and five entries; it carries argc " &
+              $int(numAfter(quintPayload, "argc")) & " and " & $quintArgs.len &
+              " entry(s): " & quintPayload
+  elif quintArgs[4] != MarkerI:
+    recordErr "the fifth declared argument of a static method is on the " &
+              "stack and must be named as such; the payload has " &
+              quintArgs[4] & " there rather than " & MarkerI
+  elif numAfter(quintPayload, "stackArgs") != 1'i64:
+    recordErr "the static payload names one stack argument but its " &
+              "stackArgs count says " &
+              $int(numAfter(quintPayload, "stackArgs"))
+  else:
+    recordOk "a hook on a five-argument static method is told about all " &
+             "five: four values and the fifth named " & MarkerI
+
+  # The difference between the two, which is the whole point of the pair: the
+  # same declared type at the same index is a value on the static method and a
+  # stack marker on the instance one, and `this` is the only reason.
+  if quintArgs.len >= 4 and stepArgs.len >= 4:
+    if find(quintArgs[3], "1.5") < 0:
+      recordErr "the static method's fourth argument should be 1.5 out of " &
+                "XMM3 -- static means parameter n is register position n -- " &
+                "and it is " & quintArgs[3]
+    elif stepArgs[3] == quintArgs[3]:
+      recordErr "the instance and static methods reported their fourth " &
+                "argument identically; one of them is wrong, because `this` " &
+                "pushes the instance one onto the stack"
+    else:
+      recordOk "the same declared parameter is a value on the static method " &
+               "(1.5, out of XMM3) and a named stack argument on the " &
+               "instance one, and the payload says which it is rather than " &
+               "leaving a handler to work it out from the arity"
 
 proc rowNs(doc, op: string): int64 =
   ## The `ps` figure of the row whose `op` is `op`, or -1.
@@ -2290,6 +2603,12 @@ proc main(): int =
       heading "Frame loop"
       line "  the mock ran " & $int(rtFrameCount()) &
            " frames on thread " & $frameThread
+
+  # What a hook is handed, read from inside a handler rather than from a log.
+  # It goes here, while the host is loaded and the runtime is up, and its
+  # verdicts are printed with everything else under `Result`.
+  if haveRuntime:
+    probeArgPayloads()
 
   # Both subjects, not one. `haveProbe` gates the resolve/call/patch block on
   # `clientprobe`; a stage carrying that but not `highlevel` used to reach the

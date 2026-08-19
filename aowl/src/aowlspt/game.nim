@@ -598,8 +598,9 @@ proc hookArgs*(target: string; handler: ArgHookHandler): Status =
   ##
   ## **What the handler is given.** An object, not an array:
   ##
-  ##     {"this":{"handle":3,"type":"EFT.Player"},"args":[1,2.5]}
-  ##     {"this":null,"args":[]}                     -- a static method
+  ##     {"this":{"handle":3,"type":"EFT.Player"},"argc":2,"stackArgs":0,
+  ##      "args":[1,2.5]}
+  ##     {"this":null,"argc":0,"stackArgs":0,"args":[]}   -- a static method
   ##
   ## `this` is Harmony's `__instance`, and it is separate from `args` on
   ## purpose: it is not a declared parameter, and folding it into the array
@@ -620,8 +621,25 @@ proc hookArgs*(target: string; handler: ArgHookHandler): Status =
   ## it is passed by hidden pointer and there is nothing in the register to
   ## report. A type the runtime cannot classify is `{"type":"..."}`.
   ##
-  ## Arguments past the fourth arrive on the stack and are not reported. They
-  ## are omitted rather than guessed at.
+  ## **An argument past the register window is named, not dropped.** Win64
+  ## passes four arguments in registers and the thunk saves those four; on an
+  ## instance method `this` is one of them, so a method with four declared
+  ## parameters has its **fourth** on the stack and a static one has its fifth.
+  ## There is nothing in the frame to report for it and nothing here can
+  ## invent it -- but the payload says so rather than falling silent:
+  ##
+  ##     {"onStack":true,"type":"System.Single"}
+  ##
+  ## sits in that slot, so argument *n* is always declared parameter *n*, and
+  ## "the host did not report this" can never be read as "this was empty".
+  ## `argc` is the declared parameter count and `stackArgs` is how many of them
+  ## are in that state, so a handler that wants nothing to do with a truncated
+  ## firing can check one number before it reads anything.
+  ##
+  ## This was the last silent wrong answer on this path. The array used to stop
+  ## early, so a handler reading argument 3 of a four-argument instance method
+  ## got the same empty answer an empty argument would give it, and went on to
+  ## decide something on a value the game never supplied.
   gArgHookTargets.add target
   gArgHookHandlers.add handler
   result = patch(target, pkPrefix, argHookDispatch, withArgs = true)

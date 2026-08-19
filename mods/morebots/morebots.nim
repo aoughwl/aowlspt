@@ -1272,13 +1272,41 @@ proc simSelfTest(): Status =
           "and not a stack argument; argStatus said `" & stS & "`"
     inc instBad
 
+  # And the same parameter as the host reports it *today*. The slot used to be
+  # omitted -- that is every check above -- and is now named, so this file has
+  # to read both: an old host drops it, a current one marks it, and a mod that
+  # only understood one of the two would be wrong on half the hosts it runs on.
+  #
+  # The marker carries `type` and no `handle` on purpose, so a reader that has
+  # never heard of `onStack` falls through to the unnamed-class refusal and
+  # refuses rather than passing. That is asserted here rather than assumed,
+  # because "it fails closed" is exactly the kind of claim that is true when
+  # written and quietly stops being.
+  let onStackArg = "{\"onStack\":true,\"type\":\"System.Single\"}"
+  let osR = argRefusal(onStackArg)
+  if osR.len == 0:
+    error "  instance: a stack-argument marker was reported as readable. " &
+          "The host names that slot precisely so it cannot be read as a value"
+    inc instBad
+  elif find(osR, "on the stack") < 0:
+    error "  instance: a stack-argument marker was refused for the wrong " &
+          "reason, which is worse than refusing it for none -- it tells the " &
+          "reader to go looking for a runtime that would not name a class. " &
+          "argRefusal said `" & osR & "`"
+    inc instBad
+  if find(osR, "System.Single") < 0:
+    error "  instance: the refusal did not name the parameter's type, which " &
+          "is the one thing the host knew and the reader cannot recover"
+    inc instBad
+
   if instBad == 0:
     success "  instance: a hook IS told which object it fired on -- handle, " &
             "concrete runtime class, and static-vs-absent kept apart. An " &
-            "instance method's 4th declared argument is reported as ABSENT " &
-            "and not as empty, and `not reported`, `no such parameter` and " &
-            "`payload disagrees with the signature` are three distinct " &
-            "answers rather than one silence"
+            "instance method's 4th declared argument is never read as a " &
+            "value -- omitted by an older host, named `onStack` by a current " &
+            "one, and refused by its own type either way -- and `not " &
+            "reported`, `no such parameter` and `payload disagrees with the " &
+            "signature` are three distinct answers rather than one silence"
   else:
     bad = bad + instBad
 

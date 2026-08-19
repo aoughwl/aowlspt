@@ -247,7 +247,15 @@ proc argAt*(payload: string; index: int): string =
   result = items[index].raw()
 
 proc argsReportable*(declared: int; isStatic: bool): int =
-  ## How many of `declared` parameters the host will put in the array.
+  ## How many of `declared` parameters arrive **with a value**.
+  ##
+  ## This said "will put in the array", and that stopped being true the day the
+  ## host started naming the slots it cannot fill. The array is now `argc` long
+  ## always: the parameters past the register window are present and carry
+  ## `{"onStack":true,"type":"..."}` instead of a value. So the count below is
+  ## still exactly right and still worth asserting on -- it is the number of
+  ## *readable* entries -- but the ones past it are no longer missing, they are
+  ## named. `argRefusal` says so in its own words.
   ##
   ## `this` occupies register position 0 on an instance method and pushes every
   ## parameter along by one, so an instance method reports **three** and a
@@ -265,13 +273,18 @@ proc argsReportable*(declared: int; isStatic: bool): int =
 proc argsTruncated*(declared: int; isStatic: bool): int =
   ## How many declared parameters the payload will simply not contain.
   ##
-  ## **This is the check that has to exist.** A hook that reads argument 3 of a
-  ## four-argument instance method gets "" and, if it treats "" as a default,
-  ## gets a decision made on a value the game never supplied. Nothing errors,
-  ## nothing logs, and the hook works perfectly on every three-argument method
-  ## anyone tests it against. It is the same species as the bug this mod's
-  ## population baseline exists for: a wrong answer that only ever arrives in
-  ## the one case nobody exercised.
+  ## **This is the check that had to exist**, and the failure it was written
+  ## against has since been closed at the host rather than only guarded here. A
+  ## hook that read argument 3 of a four-argument instance method used to get
+  ## "" and, if it treated "" as a default, made a decision on a value the game
+  ## never supplied -- nothing erroring, nothing logging, and working perfectly
+  ## on every three-argument method anyone tested it against. It was the same
+  ## species as the bug this mod's population baseline exists for: a wrong
+  ## answer that only ever arrives in the one case nobody exercised.
+  ##
+  ## The host now names that slot instead of dropping it, so the silent read is
+  ## gone. The count is still the honest thing to ask before arming, because a
+  ## named slot is still a parameter you cannot have.
   ##
   ## So a caller that has a signature in hand asks this *before* arming, and
   ## refuses with the number, rather than discovering it one argument at a time
@@ -302,6 +315,13 @@ proc argRefusal*(raw: string): string =
   ##     layout nothing here can read.
   ##   * `{"type":"X"}` — the runtime would not name a class for it. Saying so
   ##     beats guessing that it is an object, because that guess is a crash.
+  ##   * `{"onStack":true,"type":"X"}` — the parameter is real and is past the
+  ##     four registers the patch frame captures. This one is newer than the
+  ##     rest of this file: the host used to omit the slot entirely, which is
+  ##     the absence above. It is named now, so the index no longer lies, and
+  ##     the marker carries `type` without `handle` deliberately -- a reader
+  ##     that has never heard of `onStack` falls into the case above and
+  ##     refuses, rather than passing.
   ##
   ## An argument that is none of the three is a number, a string, `null`, or a
   ## `{"handle":n,"type":"..."}` — and a handle object carries `handle` too,
@@ -315,6 +335,14 @@ proc argRefusal*(raw: string): string =
     let named = (if t.len > 0: t else: "an unnamed value type")
     return "it is " & named & ", a value type too wide for a register: it " &
            "arrives by hidden pointer and its layout cannot be read here"
+  if find(raw, "\"onStack\":") >= 0:
+    let t = typeIn(raw)
+    let named = (if t.len > 0: t else: "an unnamed type")
+    return "it is " & named & " passed on the stack, past the four registers " &
+           "the patch frame captures: `this` takes the first, so an instance " &
+           "method's fourth declared parameter lands here. The host names the " &
+           "slot rather than dropping it, which is why this is a refusal you " &
+           "can read instead of an index that quietly is not there"
   if find(raw, "\"type\":") >= 0 and find(raw, "\"handle\":") < 0:
     let t = typeIn(raw)
     let named = (if t.len > 0: t else: "an unnamed type")
