@@ -10,8 +10,11 @@
  * **zlib-framed bodies**: a request body arrives deflated and a response must
  * be deflated too. A server that answers in plain JSON gets a client that
  * silently fails to parse it, and `curl` against such a server appears to work
- * while the game does not — which is exactly the trap `tools/SptProbe` exists
- * to document on the SPT side.
+ * while the game does not — which is exactly the trap `tools/aowlprobe.nim`
+ * exists to document, and why it frames its own bodies rather than shelling out
+ * to `curl`. (This named `tools/SptProbe`, which has never existed in this
+ * repo; the C# tool in `tools/SptReflect` is a metadata dumper and speaks no
+ * protocol at all.)
  *
  * ------------------------------------------------------------------------
  * Why this is a poller and a request pool rather than a pool of accept
@@ -43,8 +46,10 @@
  *     nimony to answer it, and gives the connection back to the poller.
  *
  * So a connection that stalls, dribbles, or opens and says nothing never
- * reaches a worker at all. It costs one socket, one `AowlConn` (about 80
- * bytes) and whatever it has actually managed to send — nothing is allocated
+ * reaches a worker at all. It costs one socket, one `AowlConn` (about a
+ * hundred bytes; it was 80 before the websocket fields went in, and that is a
+ * hand count off the struct rather than a `sizeof` anybody has printed) and
+ * whatever it has actually managed to send — nothing is allocated
  * for a body it merely *claims* it will send. The limit is
  * `AOWL_NET_MAX_CONNS` sockets and `AOWL_NET_MAX_BUFFERED` bytes of buffered
  * request, not a thread count.
@@ -81,8 +86,10 @@
  *     the worker pool, which is where the parallelism was already.
  *   * `WSAPoll` has a documented wart: it never reports `POLLOUT` for a socket
  *     with a connection in progress. Nothing here polls for writability on a
- *     connecting socket — the only `POLLWRNORM` wait is in `aowl_net_send`, on
- *     an already-established connection — so it does not bite.
+ *     connecting socket — the only `POLLWRNORM` wait is in
+ *     `aowl_net_send_within`, reached from `aowl_net_send` and from
+ *     `aowl_ws_send`, and in both cases on an already-established connection
+ *     — so it does not bite.
  *
  * ------------------------------------------------------------------------
  * Why the byte framing is in C when everything else is nimony
@@ -112,7 +119,12 @@
  * so four players idling in the menu owned the server — and the poller removed
  * exactly that. A connection nobody is answering now costs a socket and its
  * buffer. So a held websocket is a thing this shape can afford, and
- * `mods/tarkov` no longer has to fake it with a poll.
+ * `mods/tarkov` no longer has to fake it with a poll *for a client that
+ * upgrades*. The poll route is still registered and still the fallback: a
+ * client that has not upgraded, has not finished logging in, or has just lost
+ * its connection gets `ErrNotFound` from `notifyPush` and is drained through
+ * `/client/notifier/getwebsocket` instead. See `mods/tarkov/emu/notify.nim`,
+ * which tries the socket first and falls back on purpose.
  *
  * **The trap is the completeness rule above.** A connection reaches a worker
  * when a *complete request* is buffered, and a websocket is precisely the
@@ -153,10 +165,16 @@
  * writing frames onto one socket interleave into a stream neither side can
  * parse. One critical section covers every websocket write and the close of a
  * websocket connection, so a socket is never closed out from under a send in
- * flight. The poller takes it with `TryEnterCriticalSection` and defers to its
- * next wakeup if it is busy — the poller must not wait on a worker for any
- * reason, and a connection that closes one poll round later closes just as
- * dead.
+ * flight. On the **close** path the poller takes it with
+ * `TryEnterCriticalSection` and defers to its next wakeup if it is busy: a
+ * connection that closes one poll round later closes just as dead, and there is
+ * nothing to be gained by waiting for it. On the **write** path it does wait —
+ * every pong, close and refusal the poller sends goes out through
+ * `aowl_ws_send`, which enters the section outright, and so does
+ * `aowl_ws_adopt` on a worker thread at the 101. What keeps that bounded is
+ * `AOWL_WS_SEND_MS`, which is short for exactly this reason. This used to say
+ * the poller must not wait on a worker for any reason; that is the rule for the
+ * close, not for the whole lock.
  */
 
 #ifndef AOWLSPT_NET_H
@@ -338,8 +356,8 @@ static int32_t aowl_net_recv(uint64_t sock, void* buf, int32_t len) {
  *
  * Server sockets are non-blocking now, so a `send` that fills the kernel
  * buffer returns `WSAEWOULDBLOCK` rather than parking the thread. Waiting for
- * writability with a deadline is what makes "a client that asks for the 4 MiB
- * item table and then stops reading it" cost one worker for thirty seconds
+ * writability with a deadline is what makes "a client that asks for the item
+ * table and then stops reading it" cost one worker for thirty seconds
  * instead of forever. It is generous on purpose: this is loopback, and the
  * only way a healthy client reaches it is by being suspended in a debugger. */
 #define AOWL_SEND_DEADLINE_MS 30000
@@ -394,9 +412,13 @@ static void aowl_net_shutdown_recv(uint64_t sock) {
     if (sock) shutdown((SOCKET)sock, SD_RECEIVE);
 }
 
-/* Kept for `wire.nim` and the probe tools, whose client sockets are blocking
- * and want an overall timeout. The server's own sockets are non-blocking and
- * get their deadlines from the poller instead. */
+/* Nothing calls this. It was kept for `wire.nim` and the probe tools, whose
+ * client sockets are blocking and want an overall timeout -- but `wire.nim`
+ * sets `SO_RCVTIMEO` itself, inline in its own `{.emit.}` block, and the probe
+ * tools import only the zlib entry points. The server's own sockets are
+ * non-blocking and get their deadlines from the poller. Named as dead rather
+ * than quietly deleted: whether it goes or gains its caller back is a code
+ * decision, not a comment one. */
 static int32_t aowl_net_set_timeout(uint64_t sock, int32_t ms) {
     DWORD t = (DWORD)ms;
     return setsockopt((SOCKET)sock, SOL_SOCKET, SO_RCVTIMEO,
@@ -423,8 +445,9 @@ static int32_t aowl_net_set_timeout(uint64_t sock, int32_t ms) {
  *   * **Unrelated sessions must not contend.** One lock per session, matched
  *     exactly on the 24-character id, in a table that is only ever added to.
  *     A single-player server has a handful of sessions for the life of the
- *     process, so the table never turns over and an entry costs a few dozen
- *     bytes. Only when 128 *distinct* sessions have been seen does it degrade
+ *     process, so the table never turns over and an entry costs 80 bytes -- a
+ *     lock, two counters and the 64-byte id -- for 10 KB of table. Only when
+ *     128 *distinct* sessions have been seen does it degrade
  *     to sharing a slot by hash — still correct, and a case this server does
  *     not have.
  *   * **No session, no contention.** `len == 0` returns -1 without touching
@@ -968,9 +991,9 @@ static int32_t aowl_scan_length(const char* head, int32_t n) {
  *
  * Advisory in exactly the way the rest of the framing is: all it decides here
  * is that the worker is about to hand nimony a request that may not come back
- * as an ordinary one. `wsHandshake` in `backend/websocket.nim` re-reads the
- * same bytes and is the authority -- it checks the version, the key and the
- * `Connection` token as well, and a request that fails any of them is answered
+ * as an ordinary one. `handshake` in `backend/websocket.nim` re-reads the same
+ * bytes and is the authority -- it checks the version, the key, the
+ * `Connection` token and a non-empty session, and a request that fails any of
  * `400` and closed rather than upgraded. So a disagreement between the two
  * costs nothing: this side never acts on `wsReq` except to skip the keep-alive
  * bookkeeping for a connection nimony has already said is a websocket. */
@@ -1109,8 +1132,11 @@ static ULONGLONG aowl_conn_deadline(AowlConn* c, ULONGLONG now) {
 /* One critical section over every websocket write and over the close of a
  * websocket connection. Two threads writing frames onto one socket interleave
  * into a stream neither side can parse, and a socket closed under a send in
- * flight is a use-after-close; one lock covers both, and it is only ever taken
- * by a push (rare) or by the poller (which uses `TryEnterCriticalSection`).
+ * flight is a use-after-close; one lock covers both. Three things take it: a
+ * push from a worker (rare), `aowl_ws_adopt` from a worker at the 101, and the
+ * poller -- blocking, in `aowl_ws_send`, when it answers a ping or a close, and
+ * with `TryEnterCriticalSection` in `aowl_ws_drop` when it closes one. Only the
+ * last of those declines to wait; this used to say the poller never waits.
  *
  * The lock order is **nimony's lock, then this one, never the reverse**. Every
  * call from here into nimony -- a ping to echo, a close, a violation, an idle
@@ -1391,7 +1417,8 @@ static int aowl_ws_pump(AowlConn* c) {
          * and that is about what an idle websocket costs. A notifier receives
          * pings and a close and nothing else, so a 64 KiB read grows every
          * held connection's buffer to 64 KiB the first time it says anything
-         * -- 1024 of them would be past `AOWL_NET_MAX_BUFFERED` on their own.
+         * -- 1024 of them would land exactly on `AOWL_NET_MAX_BUFFERED` and
+         * leave nothing for anything else.
          * A frame larger than this is still read whole; it just takes another
          * turn of this loop, which costs one `recv` and no correctness. */
         int32_t want = AOWL_CONN_CHUNK;
@@ -1485,8 +1512,10 @@ static int aowl_conn_read_hot(AowlConn* c) {
  * had gone out, so request 512 was answered `Connection: keep-alive` and the
  * socket then closed under it. The client, told to keep going, sent request
  * 513 into a dead socket and got nothing back -- one silently lost request per
- * 512 on every kept-alive connection, which `benchbackend` reports on every
- * run long enough to reach it ("the server closed without answering"). The
+ * 512 on every kept-alive connection, which `benchbackend --keepalive` runs
+ * long enough to reach. (A sentence here quoted a diagnostic string that
+ * `benchbackend` does not print; what the run shows is a request with no
+ * answer, however that happens to be worded.) The
  * server's behaviour is unchanged; what changes is that it now says so. */
 static __declspec(thread) int aowl_final_req = 0;
 
@@ -1940,8 +1969,11 @@ static int32_t aowl_zlib_bound(int32_t srcLen) {
  * backend's own load generator that was ~95 us per small response, against a
  * few microseconds for the deflate itself, and small responses are almost
  * every response: the large static tables are served out of a compressed-body
- * cache and never reach this at all, so what does reach it is the item moves
- * and the keepalives.
+ * cache, so each distinct body reaches this once and comes from the cache after
+ * that. (This used to say they never reach it at all. The cache is a
+ * miss-through -- a miss, and anything under its 8 KiB floor, falls straight
+ * through to the deflate.) What reaches it repeatedly is the item moves and the
+ * keepalives.
  *
  * `deflateReset` restores the stream to exactly the state `deflateInit2` left
  * it in, so the bytes on the wire are identical to what `compress2` produced.
@@ -1949,11 +1981,14 @@ static int32_t aowl_zlib_bound(int32_t srcLen) {
  * a compression change is not something that can be tested by reading the
  * response back.
  *
- * Thread-local rather than locked, because the backend deflates on eight
- * accept workers at once and a lock here would serialise exactly the path this
- * is meant to make cheap. The state is never `deflateEnd`ed — it lives for the
- * life of the thread, which is the life of the process for a pool worker; a
- * quarter of a megabyte per worker, bounded by the pool size, is the price of
+ * Thread-local rather than locked, because the backend deflates on all sixteen
+ * of its request workers at once and a lock here would serialise exactly the
+ * path this is meant to make cheap. This used to say "eight accept workers",
+ * which is the shape this file was written to remove: `AOWL_NET_WORKERS` is 16
+ * and a worker takes a complete request off the poller rather than calling
+ * `accept`. The state is never `deflateEnd`ed — it lives for the life of the
+ * thread, which is the life of the process for a pool worker; a quarter of a
+ * megabyte per worker, so about four megabytes across the pool, is the price of
  * not paying for it per request.
  */
 static _Thread_local z_stream aowl_zdef;

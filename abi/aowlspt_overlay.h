@@ -47,7 +47,7 @@
  *   IA: input layout, vertex buffer 0, index buffer, primitive topology
  *   VS: shader + class instances, constant buffer 0
  *   PS: shader + class instances, shader resource 0, sampler 0
- *   GS/HS/DS: shader only — see below
+ *   GS: shader + class instances;  HS/DS: shader only — see below
  *   RS: rasteriser state, viewports, scissor rects
  *   OM: blend state + factor + mask, depth-stencil state + ref,
  *       all 8 render targets + depth-stencil view
@@ -82,10 +82,15 @@
  *                   first frame.
  *   window thread   the hooked WndProc. Records input into atomics.
  *   worker thread   polls the backend over HTTP and posts toggles. Owns every
- *                   blocking call in this file.
+ *                   blocking call on the steady-state path. The exception is
+ *                   teardown: `aowl_ov_stop` runs on the host thread and both
+ *                   waits on the worker and sleeps out the render thread.
  *
- * Everything shared between them is the `AowlOvMod` table and the command
- * queue, both under `g_ov.cs`.
+ * Most of what is shared between them -- the `AowlOvMod` table, the lists,
+ * entries, issues and results tables, the wrapper scalars and the mod-sync body
+ * -- is under `g_ov.cs`, and the command queue with it. The key ring is the one
+ * deliberate exception, single-producer/single-consumer between the window and
+ * render threads and outside the lock; see the note above it for why.
  */
 
 #ifndef AOWLSPT_OVERLAY_H
@@ -123,8 +128,13 @@
 /* The mod-sync feed's buffer. It holds one whole response body and nothing is
  * acted on unless the body is whole, so the size is the ceiling on how many
  * mods the backend can describe -- about two hundred rows at seventy bytes
- * each. A body that does not fit is truncated by `aowl_ov_http`, loses its
- * terminating key, and is rejected by the reader rather than half-applied. */
+ * each. A body that does not fit is **dropped outright**: the worker reads into
+ * a 32 KB stack buffer and refuses to publish anything whose length is not
+ * under this bound, so the previous serial stands and the host keeps doing what
+ * it was already doing. That is a whole-body test rather than a parse, which is
+ * the point -- half a feed applied to loaded code is the failure this guards.
+ * (This used to describe a truncation losing its terminating key and being
+ * rejected by the reader. The reader never sees it.) */
 #define AOWL_OV_SYNC_MAX 16384
 
 /* One row of the panel. Fixed-size fields rather than pointers: the render
@@ -242,8 +252,11 @@ typedef struct AowlOvResult {
  * the host has just unloaded reading `running yes` for the rest of the session,
  * which is the one thing on this panel a player has no way to check. */
 
-/* Called on the *worker* thread after a toggle has been accepted, so the host
- * can react without polling. Optional; may be left NULL. */
+/* Called on the *worker* thread after a toggle has been **attempted**, so the
+ * host can react without polling. It fires whether or not the backend answered
+ * -- the failure path sets the error line and leaves the row's `~` up, and the
+ * callback still runs -- so a host that treats it as "this was accepted" is
+ * reading more into it than it says. Optional; may be left NULL. */
 typedef void (*AowlOvToggleFn)(const char* guid, int32_t enabled, void* user);
 
 static int32_t aowl_ov_start(int32_t toggleVk, int32_t backendPort);
@@ -263,12 +276,19 @@ static void    aowl_ov_on_toggle(AowlOvToggleFn fn, void* user);
  * The overlay runs inside the game's present loop, so its cost is not a
  * curiosity: it is subtracted from the frame budget of a game people play
  * competitively. These are measured with QPC around the build-and-draw, on the
- * render thread, and they cost one QPC pair per frame to keep.
+ * render thread, and they cost three QPC reads per drawn frame to keep -- it
+ * was one pair until the build and the draw were split apart, so that
+ * `avgBuildNs` could say which half the time went to.
  *
  * `avg` is an exponential moving average over roughly the last hundred frames;
  * `max` is the worst single frame since the overlay started, which is the one
- * that shows up as a stutter. Both are 0 while the panel is closed -- a hidden
- * panel is one `if` in the hook and nothing else. */
+ * that shows up as a stutter. Both are 0 until the panel has been drawn -- and
+ * they are **not** reset when it is closed again: only `aowl_ov_start` zeroes
+ * them, so after a close they keep reporting the last thing that was measured.
+ * A hidden frame is cheap but it is not free: the frame counter, the `inDraw`
+ * guard and `aowl_ov_bind` all run before the visible test. This used to say
+ * both figures were 0 while the panel was closed and that a hidden panel was
+ * one `if`; neither was quite the case. */
 static int32_t aowl_ov_frame_ns(void);
 /* The integer factor the panel is drawn at: 1 below about 1300 lines, 2 above,
  * 3 above 2500. The font is an 8x16 atlas sampled POINT/CLAMP, so an integer
@@ -571,9 +591,9 @@ typedef struct AowlOvVert {
     uint32_t col;       /* R8G8B8A8_UNORM, so low byte is red */
 } AowlOvVert;
 
-/* 4096 quads. A full manager screen -- 22 rows, a four-line detail pane, a
- * wrapped reason and two legend lines -- is about 1,500 glyphs plus 60 solid
- * quads, so this is roughly a 2.5x margin and it is a flat 480 KB of .bss that
+/* 4096 quads. A full manager screen -- 18 rows, a six-line detail pane, a
+ * wrapped reason and two legend lines -- is about 1,300 glyphs plus 60 solid
+ * quads, so this is a margin of roughly 3x and it is a flat 480 KB of .bss that
  * is never reallocated. Overflow is dropped by `aowl_ov_vert` rather than
  * grown: the render thread does not allocate. */
 #define AOWL_OV_MAX_VERTS 24576
@@ -787,7 +807,8 @@ typedef struct AowlOvState {
     LARGE_INTEGER qpcFreq;
     int32_t       drawn;        /* frames actually drawn; render thread only */
     int32_t       maxVtx;       /* the busiest frame's vertex count, ever */
-    int32_t       vtxDropped;   /* quads the cap refused; must stay 0 */
+    int32_t       vtxDropped;   /* vertices the cap refused (a whole quad
+                                   counts 6); must stay 0                  */
     volatile LONG lastNs, avgNs, maxNs;
     volatile LONG avgBuildNs;   /* the geometry half, on its own */
 } AowlOvState;
@@ -1029,7 +1050,10 @@ static int32_t aowl_ov_http(const wchar_t* verb, const wchar_t* path,
     if (!s) goto done;
     /* Short timeouts on every phase. This runs on our own thread, but a stalled
      * backend must not keep the overlay's "backend reachable" light green for
-     * thirty seconds — resolve/connect/send/receive, 500/800/800/1500 ms. */
+     * thirty seconds — resolve/connect/send/receive, 300/500/500/1200 ms. This
+     * line said 500/800/800/1500 for a while, from before the call below was
+     * tightened; the call is the authority and the longer note under it says
+     * the same thing without numbers to go stale. */
     /* Resolve / connect / send / receive. The far end is `127.0.0.1` and the
      * near end is a thread inside a game, so these are short on purpose: a
      * stalled backend must not keep the panel's "reachable" light green, and
@@ -2642,9 +2666,12 @@ static int32_t aowl_ov_wrap(float x, float y, const char* s, uint32_t col,
     return used;
 }
 
-/* `_snprintf` does not always terminate on the Microsoft CRT. Every formatted
- * string in this file goes through here so that the exception does not have to
- * be remembered at thirty call sites. */
+/* `_snprintf` does not always terminate on the Microsoft CRT. Nearly every
+ * formatted string in this file goes through here so that the exception does
+ * not have to be remembered at thirty call sites. Nine call sites still reach
+ * `_snprintf` directly -- the worker's request building and two fixed-format
+ * failure messages -- and those terminate by hand or by having a format that
+ * cannot fill the buffer. New code should use this rather than join them. */
 static void aowl_ov_fmt(char* out, int32_t cap, const char* fmt, ...) {
     va_list ap;
     va_start(ap, fmt);
@@ -3833,9 +3860,16 @@ static void aowl_ov_build(void) {
                           g_ov.sLastError, AOWL_OV_ERR, cols);
         else {
             aowl_ov_fmt(buf, sizeof(buf),
-                        /* 106 characters, and the room is 107 at the narrowest
-                         * panel this draws at. A marker legend that runs off
-                         * the right edge loses the marker nobody knows yet. */
+                        /* 106 characters. The room is `innerW / AOWL_OV_CW`:
+                         * 115 columns at the default 940-wide panel and 87 at
+                         * the 800x520 the test host resizes to, but 57 at the
+                         * 480 floor `aowl_ov_build` clamps to -- and there
+                         * `aowl_ov_textn` clips it. This used to say the room
+                         * was 107 at the narrowest panel this draws at, which
+                         * matches none of those and was never re-derived. A
+                         * marker legend that runs off the right edge loses the
+                         * marker nobody knows yet, so on a small panel that is
+                         * a real gap and not only a wording one. */
                         "* your override   ~ asked, no answer yet   "
                         "! game disagrees   ON*/OFF* takes a restart   "
                         "dim = not running");
@@ -4127,8 +4161,10 @@ static HRESULT STDMETHODCALLTYPE aowl_ov_present(IDXGISwapChain* sc, UINT sync,
              * overlay is drawn inside the present loop of a game people play
              * competitively, so "it is cheap" is a claim that has to have a
              * number attached and the number has to come from the machine it is
-             * running on. Two QPC reads is about forty nanoseconds and it buys
-             * a figure the player can see in the legend. */
+             * running on. Three QPC reads -- one each side of the build and
+             * one after the draw -- is about sixty nanoseconds and it buys a
+             * figure the player can see on the title bar, and the build/draw
+             * split behind it. */
             LARGE_INTEGER t0, tb, t1;
             QueryPerformanceCounter(&t0);
             aowl_ov_build();

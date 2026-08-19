@@ -44,8 +44,16 @@
  *     is `float` throughout; a `double` parameter is refused at bind time.
  *   * value-type arguments and returns larger than 8 bytes (`Vector3`,
  *     `Quaternion`). Win64 passes those by hidden pointer, which is a
- *     different call shape rather than a different register class. A mod that
- *     needs them keeps using the boxed path, and is told so.
+ *     different call shape rather than a different register class, so
+ *     `bindMethod` refuses them and says why. That refusal is no longer the
+ *     end of the road: a hidden pointer is a plain pointer slot, and the table
+ *     below already passes those, so `bindRaw` in `aowl/src/aowlspt/fast.nim`
+ *     lets a mod state the shape outright -- four pointer slots for a method
+ *     whose signature says one argument -- and reach `get_Position` and its
+ *     kind at fast-path cost. `blackdivision`, `fov`, `morebots` and `sain`
+ *     all do. Nothing in this header had to change for it; the shapes were
+ *     already here. This paragraph used to end "a mod that needs them keeps
+ *     using the boxed path, and is told so", which was true when written.
  *   * more than four arguments. Five and up spill to the stack, and the
  *     shape count doubles per slot.
  *

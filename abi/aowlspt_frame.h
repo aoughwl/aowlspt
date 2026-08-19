@@ -5,10 +5,12 @@
  * and it is what made reading a hook's arguments possible at all. It is the
  * wrong answer for a method the game runs per entity per frame. Measured
  * against the stand-in runtime: an unpatched bound call is 3 ns, a postfix that
- * only watches the return value is 418 ns, and a postfix that reads the
- * arguments and replaces the result is 2245 ns. At forty bots and 60 fps that
- * last figure is 5.8 ms a frame, which is a third of the budget for one mod's
- * hooks.
+ * only watches the return value is 443 ns, and a postfix that reads the
+ * arguments and replaces the result is 2320 ns. At forty bots and 60 fps that
+ * last figure is 5.6 ms a frame, which is a third of the budget for one mod's
+ * hooks. (Those two figures read 418 and 2245 here for a while, from an older
+ * run; the live ones are the `examples/highlevel` rows in `docs/PERF.md`,
+ * which `aowl test` re-measures.)
  *
  * The thunk is not the cost. Building the payload is: a JSON string per firing
  * on the host side, a GC handle per reference argument, a copy into a mod-side
@@ -45,7 +47,7 @@
  * maybe five times faster. It was rejected because the shape of the cost does
  * not change: it is still an encode and a decode proportional to the argument
  * count, still a buffer somebody owns, and still a GC handle per reference. A
- * five-fold cut on 2245 ns is 450 ns, which is the *cheap* postfix's price for
+ * five-fold cut on 2320 ns is 464 ns, which is the *cheap* postfix's price for
  * the expensive postfix's work -- an improvement that would have to be
  * re-litigated the next time a mod put a hook on a per-bot method. Reading the
  * register the argument is already in costs nothing and cannot be made to cost
@@ -576,8 +578,12 @@ static int32_t aowl_frame_set_ret_void(void* p) {
  *
  * Indexed by patch depth, because a handler is free to call something the host
  * has also patched. Eight is far more nesting than a detour on a game method
- * has ever produced; past it the host falls back to the JSON path rather than
- * reusing a live frame.
+ * has ever produced; past it the typed handler is not fired at all: the host
+ * counts the firing and lets the original run, because reusing a live frame
+ * would hand the inner handler the outer firing's registers -- a plausible set
+ * of arguments rather than an error. This used to say the host fell back to
+ * the JSON path there; it does not, and the host has no payload built at that
+ * point to fall back to.
  *
  * `static` here means each translation unit gets its own array. Only the host
  * ever arms one; a mod links the pool as dead weight and never touches it,

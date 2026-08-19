@@ -596,8 +596,18 @@ static void* aowl_alloc_near(void* anchor, size_t size) {
  * error -3, which the host already prints.
  *
  * Not thread-safe, and neither is anything else here: `g_hookFree`,
- * `g_hookCount` and `g_hookSlots` have always assumed one installer at a time,
- * and both hosts install and remove from a single control thread.
+ * `g_hookCount` and `g_hookSlots` assume one installer at a time. This used to
+ * add "and both hosts install and remove from a single control thread", which
+ * is no longer the reason it holds. A mod may call `AowlHostApi.patch` from any
+ * thread it likes, and the client host's own tick thread may be taking another
+ * mod's detours out at the same moment; what keeps the assumption true is that
+ * the *caller* serialises -- `installPatch` in
+ * `host/Aowlspt.Host.Il2Cpp/aowlhost.nim` wraps every `aowl_hook_claim` /
+ * `aowl_hook_attach_at` / `aowl_hook_release` in `tablesLock`, because the
+ * engine's free list, its generation table and the host's own row for the slot
+ * are three structures that have to move together. The overlay installs its two
+ * hooks from its start path and takes no slot at all. An engine caller that
+ * does neither is the one this sentence is a warning to.
  * ------------------------------------------------------------------ */
 
 /* One pool slot per hook, holding the three things that share the hook's
@@ -815,8 +825,9 @@ static int32_t aowl_hook_prepare_ex(void* handle, void* target, void* detour,
          *
          * The trampoline is not given back. It cannot be: the pool hands out
          * fixed slots that are never reclaimed, which is the whole point of it
-         * (see `aowl_tramp_alloc`). One slot of 64 bytes is lost per refused
-         * install, out of 65536. */
+         * (see `aowl_tramp_alloc`). One slot of 128 bytes is lost per refused
+         * install, out of 65536 -- the slot was 64 bytes when this was
+         * written, and grew when the site and the stub moved into it. */
         return -8;
     }
     aowl_write_jmp_abs(tramp + stolen, t + stolen);
@@ -846,8 +857,10 @@ static int32_t aowl_hook_prepare(void* handle, void* target, void* detour) {
  * pointer. It faults, or worse it does not. `tests/detour_race.c` counted this
  * separately from the trampoline races -- `g_faultsPatch` -- and with six
  * threads calling the target it is not a rare window either: over a thousand
- * faults in a three-second run, which is why that test used to park the workers
- * itself just to be able to see the race it was actually about.
+ * faults in a three-second run, which is why that test parks the workers itself
+ * in its default mode, just to be able to see the race it was actually about.
+ * It still does: the default is the test's own park with the engine's switched
+ * off, `--engine-park` is the reverse, and `--no-park` is the control.
  *
  * There are two ways to close it. One is to make the patch atomic: five bytes
  * (`jmp rel32`) written with a single `lock cmpxchg`-width store, reaching an
@@ -1275,8 +1288,13 @@ static int32_t aowl_hook_remove(void* handle) {
  * The detour body
  *
  * A patched method must land somewhere with the same calling convention as the
- * original. Rather than generate code per hook, a fixed pool of thunks is used:
- * each knows its own slot, and they all funnel into one dispatcher.
+ * original. There used to be a fixed pool of thunks here, one per slot, each
+ * knowing its own slot number. There is now exactly one -- `aowl_thunk_common`
+ * -- reached through a 24-byte stub written per hook by `aowl_write_stub`,
+ * which loads that hook's `AowlSite` into R11 and jumps. The thunk reads the
+ * slot, the generation and the trampoline out of the site rather than knowing
+ * any of them, and every hook funnels into the one dispatcher. See the note
+ * above `aowl_thunk_common` for why the pool of typed-out thunks ended.
  *
  * The thunks are **assembly**, and they have to be. The C version of this was
  * wrong in a way that only showed up on a method with arguments:
@@ -1297,8 +1315,12 @@ static int32_t aowl_hook_remove(void* handle) {
  *
  *   1. Save RCX, RDX, R8, R9 and XMM0-3 -- every register an argument can
  *      arrive in -- into its own frame.
- *   2. Call the dispatcher with the slot and a pointer to that frame. The host
- *      decodes the arguments from it against the method's declared parameter
+ *   2. Call the dispatcher with the slot, a pointer to that frame, and the
+ *      generation the hook was born in -- all three read out of the site
+ *      record R11 already points at, which is why this step names no table.
+ *      The generation is not decoration: it is what catches a firing that
+ *      arrived through a slot since released and re-claimed. The host decodes
+ *      the arguments from the frame against the method's declared parameter
  *      types, the same way `call` binds them in the other direction.
  *   3. If the dispatcher says continue: restore all of them and **tail-jump**
  *      to the trampoline. Tail-jumping rather than calling is what makes the
@@ -1360,8 +1382,11 @@ static int32_t aowl_hook_remove(void* handle) {
  * that needs the exception case wants a finalizer, which does not cross this
  * ABI at all.
  *
- * Which path a slot takes is a load and a branch off `aowl_post_table`, read at
- * the top of the thunk. A prefix slot's instruction sequence is otherwise
+ * Which path a hook takes is a load and a branch off `site->post`, read at the
+ * top of the thunk out of the record R11 already points at. (This used to name
+ * `aowl_post_table`, which is where the bit is *kept*; it is copied into the
+ * site at attach and by `aowl_hook_set_postfix`, and the firing path never
+ * reads the table.) A prefix hook's instruction sequence is otherwise
  * unchanged, so the hot path -- the drain hook, which fires every frame -- pays
  * one predictable load for the postfix path's existence.
  * ------------------------------------------------------------------ */

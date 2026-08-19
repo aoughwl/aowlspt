@@ -586,13 +586,13 @@ typedef struct AowlHostApi {
  * IL2CPP client host fills them. Revision 5 needs a listening socket, so only
  * the backend fills it. There is no way to say "the fifth and not the third"
  * in one integer, and the backend must say something: reporting revision 2
- * hides `notify_push`, and reporting revision 5 over two null pointers tells a
+ * hides `notify_push`, and reporting revision 5 over three null pointers tells a
  * mod to call them.
  *
  * So the backend fills them -- with the refusal it already owes. Every host
  * already returns `AOWLSPT_ERR_UNSUPPORTED` from the rev-1 entries it cannot
  * honour (`call`, `resolve` and `patch` on the backend are exactly that), and
- * `aowl_hostapi_arm_notify` in `abi/aowlspt_shim.h` extends the same treatment
+ * `aowl_hostapi_arm_notify` in `abi/aowlspt_notify.h` extends the same treatment
  * forward: it installs refusing implementations of `handle_pointer`,
  * `handle_pin` and `patch_typed` and only then raises `size` to
  * `AOWLSPT_HOSTAPI_SIZE_REV5`. A mod that asks the backend for a live address
