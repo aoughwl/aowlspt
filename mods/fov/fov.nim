@@ -1067,12 +1067,26 @@ proc onScopeSensitivity(target, args: string): HookResult =
   ## the arithmetic at the top of this file; what it is applied to is the optic
   ## camera's field of view, read live on the fast path.
   ##
-  ## The one thing this cannot do is tell *which* sight is being asked: a hook
-  ## is not given the instance it fired on, only the declared arguments, and
-  ## this getter has none. In a raid the sight being queried for sensitivity is
-  ## the one being aimed through, which is the one the optic camera is showing,
-  ## so the answer is the same -- but it is an assumption and it is written
-  ## down rather than left implied.
+  ## The one thing this cannot do is tell *which* sight is being asked, and the
+  ## reason used to be stated wrongly here: "a hook is not given the instance it
+  ## fired on, only the declared arguments". **A hook is given the instance** --
+  ## `hookArgs` carries `this`, `thisPointer` turns it into an address, and this
+  ## file says so twice, at :128 and :1607. The claim was false where it
+  ## mattered most, in the one place a reader would take it as the reason for a
+  ## limitation.
+  ##
+  ## What is actually true is narrower and does not go away. The host reports
+  ## the receiver's *concrete class name* and a handle, which is enough to know
+  ## it is a `SightComponent` and not enough to know **which** one: telling two
+  ## sights apart means reading a member off the object, and every candidate
+  ## member name here is a pre-1.0 guess. So this is unverifiable rather than
+  ## inexpressible -- a real difference, and not the same as being closed.
+  ##
+  ## The assumption therefore stands unchanged: in a raid the sight being
+  ## queried for sensitivity is the one being aimed through, which is the one
+  ## the optic camera is showing, so the answer is the same. It is an
+  ## assumption, it is written down rather than left implied, and **nothing
+  ## here has ever run against BSG's client**.
   gSensHits = gSensHits + 1
   result = stopWith($zoomSensFor(opticFieldOfView()))
 
