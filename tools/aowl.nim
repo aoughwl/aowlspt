@@ -1844,6 +1844,95 @@ proc cmdTest(e: Env): int =
       discard run(e, "sim " & baseName(m),
                   quoted(sim) & " " & quoted(m) & " --side sim --ticks 3")
 
+  # Two claims the loop above cannot make, because all it knows is whether a run
+  # exited zero -- and a mod that does nothing exits zero. That is not
+  # hypothetical: `examples/gameserver` guarded on `side() != sideServer` and so
+  # registered no routes and wrote nothing under the simulator, and this loop
+  # reported ok for it for as long as it has existed.
+  #
+  # The first claim is that the envelope reaches the wire. `--route` drives two
+  # handlers and the bodies are read, so a `/client/*` route that quietly went
+  # back to `done(o).text` is caught here rather than by a client nobody has.
+  #
+  # The second is a run that must **fail**. `examples/strictconfig` against a
+  # config.json that does not parse has to apply nothing, name the fault, and
+  # take the simulator's exit status down with it -- a mod logging at error
+  # level is how a sim run reports failure, and a refusal is exactly that. So it
+  # cannot go through `run`, which counts a non-zero exit as a gate failure:
+  # what is asserted is that the run *does* fail, and for the stated reason. A
+  # run that failed to load, or failed a self-check, would also exit non-zero
+  # and would prove nothing.
+  #
+  # It runs from a stage because the broken document has to be named
+  # `config.json` to be read as one, and a broken `config.json` sitting in the
+  # example directory is what the loop above would have run.
+  heading "The two examples that teach a failure"
+  block:
+    let env = joinPath(e.repo, "examples\\envelope")
+    if buildMod(e, env) and fileExists(sim):
+      var cmd = quoted(sim) & " " & quoted(env) & " --side sim --ticks 1"
+      cmd.add " --route /client/aowlspt/envelope/status"
+      cmd.add " --route /client/aowlspt/envelope/bare"
+      var code = -1
+      var output = ""
+      try:
+        let (o, c) = execCmdEx(cmd, workingDir = e.repo)
+        output = o
+        code = c
+      except:
+        output = ""
+      let wrapped = find(output,
+        "/client/aowlspt/envelope/status -> {\"err\":0,\"errmsg\":null,\"data\":") >= 0
+      let bare = find(output,
+        "/client/aowlspt/envelope/bare -> {\"ok\":true") >= 0
+      if code == 0 and wrapped and bare:
+        ok "a /client/* route answers in the envelope, and the bare one still " &
+           "shows what the mistake looks like"
+      else:
+        err "the envelope example's routes did not answer as it claims " &
+            "(exit " & $code & ", envelope=" & $wrapped & ", bare=" & $bare & ")"
+        for l in splitLines(output):
+          if l.len > 0:
+            line "        " & l
+        inc failures
+
+  block:
+    let src = joinPath(e.repo, "examples\\strictconfig")
+    let stage = joinPath(e.repo, "installer\\build\\strictconfig-broken")
+    discard winfs.removeTree(stage)
+    discard ensureDir(stage)
+    if not buildMod(e, src) or not fileExists(sim):
+      err "examples/strictconfig did not build, or there is no simulator; " &
+          "the refusal cannot be checked"
+      inc failures
+    else:
+      discard copyFileAt(joinPath(src, "bin\\strictconfig.dll"),
+                         joinPath(stage, "strictconfig.dll"))
+      discard copyFileAt(joinPath(src, "broken-config.json"),
+                         joinPath(stage, "config.json"))
+      let cmd = quoted(sim) & " " & quoted(stage) & " --side sim --ticks 3"
+      var code = -1
+      var output = ""
+      try:
+        let (o, c) = execCmdEx(cmd, workingDir = e.repo)
+        output = o
+        code = c
+      except:
+        output = ""
+      let refused = find(output, "refused: no setting was applied") >= 0
+      let named = find(output, "did not parse: there is a trailing comma") >= 0
+      let clean = find(output, "0 self-check failure(s)") >= 0
+      if code != 0 and refused and named and clean:
+        ok "a config.json that does not parse is refused rather than defaulted"
+      else:
+        err "examples/strictconfig did not refuse a broken config (exit " &
+            $code & ", refused=" & $refused & ", the fault was named=" & $named &
+            ", self-checks clean=" & $clean & ")"
+        for l in splitLines(output):
+          if l.len > 0:
+            line "        " & l
+        inc failures
+
   # And the real mods. They are the reason the pipeline exists, so "it still
   # builds" is not the bar -- each one has to load through the ABI and survive a
   # few ticks. Several carry their own self-tests and run them here.

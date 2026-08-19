@@ -94,8 +94,22 @@ proc onCreated(url, body, session: string): string =
 proc onLoad(): Status =
   success "gameserver loaded on " & hostName()
 
-  if side() != sideServer:
-    info "this mod only serves on the backend"
+  # `!= sideClient`, not `== sideServer`, and the difference is the whole
+  # example working or silently not.
+  #
+  # It read `!= sideServer` and returned here, so under `aowlspt-sim` -- which
+  # presents as `sim`, not `server` -- this mod registered **no routes and wrote
+  # nothing to the database**. The gate's own `sim gameserver` run exercised the
+  # two lines above and nothing else, and reported ok, because a run that does
+  # nothing exits zero. `examples/hello` had the identical bug and the simulator
+  # carries a bespoke "no route registered for..." message whose only job is to
+  # explain the resulting confusion, which is how you can tell it has happened
+  # to people.
+  #
+  # The client is the only host that genuinely refuses `route_register`, so the
+  # guard belongs on the client and nowhere else.
+  if side() == sideClient:
+    info "this mod serves; there is no HTTP server inside the game"
     return Ok
 
   weightMultiplier = setting("weightMultiplier").asFloat(1.0)
