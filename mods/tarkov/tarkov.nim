@@ -14,7 +14,10 @@
 ## around here: persistence (`save`/`load`/`savedKeys`), reading a request body
 ## (`aowlspt/json`), building arrays and envelopes, events, timers.
 ##
-## Layout:
+## Layout — the spine of it. There are **37** modules under `emu/` and
+## `README.md` beside this file lists all of them, along with every refusal this
+## server makes and what each one costs the player. This list is the seven a
+## reader needs to follow a request through, not the whole set:
 ##
 ##     emu/ids.nim        MongoIds
 ##     emu/profile.nim    the profile document, and its persistence

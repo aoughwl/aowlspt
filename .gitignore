@@ -62,4 +62,10 @@ build/db/
 # mods -- so a simulator pointed at `mods/` honoured a checked-in artifact and
 # loaded two of the ten. It is output, in the source tree, that changes
 # behaviour.
+#
+# The rule alone did nothing: a file already tracked stays tracked, so this sat
+# here ignored and committed at the same time, and the ignore read as if it had
+# solved something. Untracked with `git rm --cached` on 2026-08-19; it still
+# names an absolute path from one machine, which is the other half of why a
+# clone must not have it.
 mods/aowlspt-selection.json

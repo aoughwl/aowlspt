@@ -78,11 +78,13 @@
 ## damping law.
 ##
 ## What damping decides is the transient, and this spring's natural frequency is
-## sqrt(ReturnSpeed) = 0.42 Hz, which lands between the postural drift at
-## 0.28 Hz and the pulse at 1.1 Hz. So the model's whole slow band sits on the
+## sqrt(ReturnSpeed) = 2.65 rad/s, which is 0.42 Hz — between the postural drift
+## at 0.28 Hz and the pulse at 1.1 Hz. So the model's whole slow band sits on the
 ## spring's resonance, and how much of it arrives at the weapon depends entirely
 ## on how damped that resonance is: measured over the two candidate laws, the
-## breathing band comes through at anywhere between 3% and 450%. That is the
+## slow band comes through at anywhere between 3% and 456% (drift at 0.28 Hz
+## overdamped, up to the resonance itself underdamped; breathing at 0.23 Hz is
+## 9% against 135%). That is the
 ## second assumption, it is a factor of a hundred, and it is the largest thing
 ## about this mod that a playtest would settle in one second and no amount of
 ## offline work can.

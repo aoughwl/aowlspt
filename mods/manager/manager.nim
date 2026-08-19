@@ -87,10 +87,13 @@
 ##     mgr/clientreport.nim  what the client host says came of it (the game)
 ##     mgr/httpfetch.nim  one HTTP GET, on a worker thread, blocking nothing
 ##     mgr/refresh.nim    fetching a newer mods.json, and refusing to
+##     mgr/cfgscan.nim    which *other* mods are running on defaults because
+##                        their own config.json did not parse
 ##
 ## ## The routes
 ##
 ##     GET  /aowlspt/mods                what this is, and a one-line summary
+##     GET  /aowlspt/mods/status         the same route under a second name
 ##     GET  /aowlspt/mods/list           every mod, its verdict and the reason
 ##     GET  /aowlspt/mods/panel          the same, flattened for the in-game overlay
 ##     GET  /aowlspt/mods/client         the desired set, resolved for the client side

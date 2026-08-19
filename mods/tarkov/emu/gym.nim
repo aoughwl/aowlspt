@@ -29,9 +29,17 @@
 ## - **The requirements the entry carries.** 30 energy, 30 hydration, and no
 ##   `Fracture` on either arm. This is the real limiter and it is worth saying
 ##   why: a workout costs 2 energy and 2 hydration per circle hit and 4 per one
-##   missed, so a full fifteen-event run costs between 30 and 60 of each, and
-##   the 30-point floor means the gym cannot be run indefinitely without food
-##   and water. Skipping this check is what makes strength free.
+##   missed, so a full fifteen-event run costs **30 to 32** of each — 30 for
+##   fifteen hits, 32 for fourteen and a miss — and the 30-point floor means
+##   the gym cannot be run indefinitely without food and water. Skipping this
+##   check is what makes strength free.
+##
+##   (This line used to read "between 30 and 60", which is 15 × 4 — the cost of
+##   a run that missed every circle. This server refuses that array two bullets
+##   down: `singleFailEffect` carries `result: "Exit"`, so a miss may only be
+##   the *last* element and at most one of a run can be a miss. 60 was never
+##   reachable through `gymRun`. `finishEffect` adds 0/0, so the bound is the
+##   whole of it.)
 ## - **The length of the array.** `results` may not be longer than the fifteen
 ##   events the database defines. A client claiming forty circles in a
 ##   fifteen-circle workout is claiming events that do not exist.

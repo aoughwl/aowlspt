@@ -41,15 +41,17 @@
 ## thread calls it, and that is Unity's main thread. This is where the BepInEx
 ## original did it too.
 ##
-## One difference from the original, stated because it is a real one: aowlspt's
-## `patch` is an inline detour at the method's entry, and the host ignores the
-## prefix/postfix distinction — every patch fires *before* the original body. The
-## C# used a **postfix**, so it added this mod's impulse after BSG's own
-## effectors had had their say. Here the impulse lands at the top of
-## `LerpCamera` instead. `AddAcceleration` accumulates into the spring rather
-## than setting it, so the difference is one frame of ordering against BSG's
-## own contribution, not a different result — but it is a difference, and it
-## has never been seen running.
+## **Where in `LerpCamera` the impulse lands depends on the host, and this
+## paragraph used to state the worse of the two cases as the only one.** The
+## C# used a Harmony **postfix**, so its impulse landed after BSG's own
+## effectors had had their say. `sway.nim` now asks for that same shape first —
+## `hookReturnTyped`, a typed postfix — and only falls back to a prefix
+## (`hookTyped`, then plain `hook`) on a host that refuses it. On the fallback
+## path the impulse lands at the top of `LerpCamera` instead;
+## `AddAcceleration` accumulates into the spring rather than setting it, so
+## that is one frame of ordering against BSG's own contribution, not a
+## different result. Which of the two happened is a line in the log. Neither
+## has been seen against BSG's client.
 ##
 ## ---------------------------------------------------------------------------
 ## Vector3, and the shape of a call
