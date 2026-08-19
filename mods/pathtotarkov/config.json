@@ -1,0 +1,47 @@
+{
+  "_comment": "aowl.pathtotarkov. The deploy screen stops being a teleporter: you stand somewhere, and only the maps the game's own transit table connects to that place are unlocked. The graph is read from locations.<map>.base.transits -- BSG's data, never a table invented here. Every key is documented on the line above it. README.md says which of Path To Tarkov's features survived post-1.0 without a client plugin and what each refusal costs you.",
+
+  "_mechanism": "The only thing this mod writes into the database is locations.<map>.base.Locked, and it writes back what it found there when it is unloaded. It registers no route the emulator owns, and it never touches a profile.",
+
+  "//enabled": "Whether anything is written at all. OFF, deliberately: a server that quietly locked fifteen of nineteen maps would look like a broken install rather than a mod, and the database persists, so a surprise here outlives the session. With this off the mod still reads the graph and prints the whole analysis -- including how many maps it WOULD lock -- which is what to look at before turning it on.",
+  "enabled": false,
+
+  "//startAt": "The map key you are standing on before your first raid. `sandbox` is Ground Zero, which is where the game itself starts a new player and, on the shipped table, a place nothing else leads back to -- so it plays as a one-way front door. Use a database key (`bigmap`), not a display name (`Customs`); a name is accepted but a key is what the log will print back.",
+  "startAt": "sandbox",
+
+  "//hops": "How many transits count as `nearby`. 1 is Path To Tarkov as it plays: from Customs you may go to Reserve, Factory, Interchange or Shoreline and nowhere else. 2 opens their neighbours as well and is most of the map list on this graph, which is close to having the mod switched off. Clamped to 1..6.",
+  "hops": 1,
+
+  "//includeInactiveTransits": "Count transits whose own `active` flag is false. Three of the thirty-eight on a stock database are inactive -- Ground Zero to Labs, Shoreline to Terminal, and an event transit on Interchange -- and BSG turns them on and off for events. False follows the game; true gives you the routes the game currently disables.",
+  "includeInactiveTransits": false,
+
+  "//alwaysOpen": "Map keys that are never locked, whatever the graph says. Empty as shipped. This is the escape hatch for a run that wants Factory permanently available, and for a map added by another mod that has no transits of its own.",
+  "alwaysOpen": [],
+
+  "//lockMapsWithNoTransits": "Whether a map that is in no transit in either direction gets locked too. FALSE: on a stock database that set is `hideout`, `develop`, `privatearea`, `suburbs`, `town` and `terminal`, and the game already ships five of them Locked. Locking them here would be this mod deciding about maps the game's graph says nothing about -- including the slot `mods/icebreaker` rebinds for its own map.",
+  "lockMapsWithNoTransits": false,
+
+  "//freeRoamWhenStranded": "What to do when you are standing on a map with no outgoing transit. TRUE: unlock everything this mod had locked, and say why. The game's own table has such places -- `terminal` has no transits at all -- and locking the world around one leaves you with a single map and no way off it, which is not a difficulty setting, it is the end of the save. False accepts the dead end.",
+  "freeRoamWhenStranded": true,
+
+  "//scavRaidsMove": "Whether a scav raid moves you. FALSE, following upstream: the scav run is the free one, and having it relocate your PMC is a surprise. The side comes from the raid the client configured (`Pmc` or `Savage`); an unrecognised side is treated as a PMC raid rather than as `do nothing`.",
+  "scavRaidsMove": false,
+
+  "//maps": "The map keys this mod manages. Empty means the nineteen a stock database ships, plus anything a map mod announces at runtime through `aowlspt.locations.changed`. Fill it in to confine the mod to a subset -- every map not listed is left exactly as found.",
+  "maps": [],
+
+  "//discoverMaps": "`config` or `scan`. `config` reads the map keys above (or the built-in nineteen) and asks the database for each one. `scan` asks the database for the whole `locations` table and takes its member names -- correct on any database, and it costs a 13.5 MB read on a stock import and about 560 MB on one imported with loose loot, because the API has no way to list the keys under a path. The mod prints what the pass cost either way.",
+  "discoverMaps": "config",
+
+  "//reconcileSeconds": "How often to check that the database still says what this mod last wrote, and correct it. 300 seconds. The database is shared -- another mod, or a hand edit, can move `Locked` -- and this is what turns `the world quietly stopped matching` into a line in the log. 0 turns the repeat off; the check still runs at load and after every raid.",
+  "reconcileSeconds": 300,
+
+  "//routes": "Register /aowlspt/ptt/where, /aowlspt/ptt/graph and /aowlspt/ptt/travel/<map>. The game client never calls these; they are for you, for a mod manager, and for the only supported way out of a dead end.",
+  "routes": true,
+
+  "//allowTeleport": "Whether /aowlspt/ptt/travel/<map> may move you somewhere the graph does not connect to. FALSE, so that the operator door cannot quietly become the thing the mod exists to remove. Turn it on to unstick a save.",
+  "allowTeleport": false,
+
+  "//notifyOnMove": "Push a notification to the game client when you move. OFF, and it will almost certainly do nothing if you turn it on: `notifyPush` addresses a session, everything this mod can observe names a profile, and the API offers no way to turn one into the other -- so the only session ids that ever reach here are the ones an operator tool leaves on this mod's own routes. The payload shape is this port's guess and no client has ever acknowledged one. Every move is broadcast to other mods regardless, which is the delivery that works.",
+  "notifyOnMove": false
+}

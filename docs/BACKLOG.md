@@ -62,7 +62,7 @@ It said `aowl test`'s "patch fired" check was red because on msys2 ucrt64 gcc
 15.2 the stand-in's `Tick` and `Hurt` compiled to prologues the detour engine
 would not relocate. `docs/MODDING.md:1285-1294` now retracts that in place, and
 a `hostharness` run against `tests/mockil2cpp/GameAssembly.dll` on 2026-08-19
-answers **all 27 verdicts green**, including *"a compiled method was detoured
+answers **all 24 verdicts green**, including *"a compiled method was detoured
 and the patch fired"* and *"patched EFT.Player::Tick (14 bytes) … the hook fired
 on all 3 calls"*. If it goes red on another toolchain it is still a stand-in
 artefact — but it is no longer the expected outcome.
@@ -240,7 +240,7 @@ the last person who did:
 | `modclient`, the manager reading it | **90** | `installer\build\modclient.exe` |
 | `detour_race`, a patch under live callers | **11** | `tests\detour_race.exe` |
 | `dbrace`, concurrent readers and writers | **2** | `backend\bin\dbrace.exe` |
-| `hostharness` against the stand-in runtime | **27** assertions | `hostharness.exe <stage> --runtime tests\mockil2cpp\GameAssembly.dll` |
+| `hostharness` against the stand-in runtime | **24** verdicts | `hostharness.exe <stage> --runtime tests\mockil2cpp\GameAssembly.dll` — count the lines under `Result`, not `grep -c '^ok'`, which answers 27: three of those are the harness reporting its own staging before it has read a line of the host's log |
 | `fakeregistry --check`, document + transport | **27**, 1 skipped | `python registry\fakeregistry.py --check --regcheck …` (44 with `--manager`, which needs a staged manager) |
 
 **`tools/firstrun.nim` runs, and the row above is measured rather than
@@ -1073,7 +1073,7 @@ against a changelog.
 | A generic instantiation has no name `findClass` accepts | reachable without a name | `fast.nim:644` `bindOnObject`, and `bindInClass` |
 | `airdrop` loot table missing | served | `mods/tarkov/tarkov.nim:785`, route at `:1292` |
 | `prestige` unserved | served | `mods/tarkov/tarkov.nim:1346` |
-| B2. `aowl test`'s "patch fired" check is red | green, and the caveat retracted | `docs/MODDING.md:1285-1294`; `hostharness --runtime tests\mockil2cpp\GameAssembly.dll` re-run 2026-08-19 — 27 of 27 verdicts, *"a compiled method was detoured and the patch fired"* among them |
+| B2. `aowl test`'s "patch fired" check is red | green, and the caveat retracted | `docs/MODDING.md:1285-1294`; `hostharness --runtime tests\mockil2cpp\GameAssembly.dll` re-run 2026-08-19 — 24 of 24 verdicts, *"a compiled method was detoured and the patch fired"* among them |
 | No `everyMain` | `everyMain` / `stopMainRepeats` | `aowl/src/aowlspt.nim:474` and `:524`; the harness asserts *"everyMain fired 78 times on thread 24476, the game's own, and never more than once per frame (456 frames)"* and *"stopMainRepeats stopped a running everyMain chain"* |
 | `bindField` refuses static fields | `bindStaticField`, with its own reader and writer types | `fast.nim:1213`; asserted three ways — the value agrees with the boxed path *and* the runtime counted the static-block lookups, an instance binding and a static binding each refuse the other's field, and a static write lands in the runtime's own block |
 | `writePtr` skips IL2CPP's write barrier | it routes through `il2cpp_gc_wbarrier_set_field`; `writePtrRaw` is the opt-out and `barrierReady` says which you have | `fast.nim` (`writePtrRaw` at `:1142` and `:1356`, `barrierReady` at `:1153`); the stand-in now exports the barrier *and counts calls*, and the gate asserts both the mod's line and the runtime's counter — *"a reference field was stored through the collector's write barrier (2 call(s) counted by the runtime)"* |

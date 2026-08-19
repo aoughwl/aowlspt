@@ -132,7 +132,11 @@ itself. So a worker can be between the copy and the call, or inside the call, at
 the moment the control thread reaches `FreeLibrary`. That is closed by a
 reference held across the dispatch: `modhost.modEnter` before the call and
 `modLeave` after it (`host/common/modhost.nim:273`, taken at
-`backend/aowlbackend.nim:936` for routes and `:1117` for the event fan-out), and
+`backend/aowlbackend.nim:941` for routes and `:1148` for the event fan-out —
+re-derived 2026-08-19; those two were `:936` and `:1117`, which by then landed
+in the comment above the call and in another proc's doc comment. `modhost:273`
+is still exactly `proc modEnter*`. Note that `backend/aowlbackend.nim` is under
+active edit, so these two will move again), and
 `unloadOne` sets a draining flag, waits up to `DrainDeadlineMs` (5 s) for the
 count to reach zero, and gives up and leaves the mod loaded rather than freeing
 it out from under somebody. The ordering is the whole of it — `modEnter`
@@ -147,19 +151,40 @@ route handler's ~423 µs, two thousandths of one percent — which is why a
 refcount is right here and wrong on a detour firing, where the call itself is
 2.9 ns and trampolines are retired instead.
 
-`backend/modrace.nim` is the reproducer, and it is the one gate here that
-`aowl test` does not run: nothing in `tools/aowl.nim` mentions it and no
-`modrace.exe` is built by the gate. Run by hand it is a clean before-and-after
-out of one binary — `--unguarded` skips `modEnter`/`modLeave` and nothing else:
+**7.3 ns is the source's figure and it is for the bare interlocked pair**
+(`host/common/modhost.nim:164`, `backend/aowlbackend.nim:949`), not for
+`modEnter`/`modLeave` with their bounds check and their second load.
+[ARCHITECTURE.md](ARCHITECTURE.md) quotes 11.2 ns for the shipped bodies and
+33 ns under sixteen threads. Neither figure was re-derived on 2026-08-19,
+because nothing in this tree measures either: `modrace` counts answers and has
+no timing mode. Both are plausible and only one of them can be describing the
+same thing; treat them as unverified rather than as two documents agreeing.
+
+`backend/modrace.nim` is the reproducer, and **`aowl test` runs it.** This
+paragraph used to say it was "the one gate here that `aowl test` does not run:
+nothing in `tools/aowl.nim` mentions it and no `modrace.exe` is built by the
+gate". That stopped being true: `tools/aowl.nim:1297-1314` compiles
+`backend/racemod.c`, builds `modrace.exe` and runs it as
+`--cycles 24 --workers 16` under the check "a mod unloaded under live callers
+never answers from a freed library". Re-derived 2026-08-19.
+
+It is also a clean before-and-after out of one binary — `--unguarded` skips
+`modEnter`/`modLeave` and nothing else. Run by hand at its defaults, 8 workers
+and 40 cycles, on 2026-08-19:
 
 ```
-backend\bin\modrace.exe               43393 answers, 30822 clean refusals,
-                                      173210 empty tables, no fault and no
+backend\bin\modrace.exe               45527 answers, 29552 clean refusals,
+                                      220674 empty tables, no fault and no
                                       stale answer across 40 unloads under
                                       8 threads
 backend\bin\modrace.exe --unguarded   8 of 8 workers faulted -- a call into a
-                                      freed image
+                                      freed image, and 4 answers came from
+                                      another incarnation of the mod
 ```
+
+The three counts are throughput and move run to run; the counts that matter are
+the two zeros. At the gate's own size the unguarded run faults **16 of 16**,
+which is the number [ARCHITECTURE.md](ARCHITECTURE.md) quotes.
 
 ## The client half, as the source has it
 
@@ -455,8 +480,9 @@ a mod with state worth keeping keeps it in the store.
 `tools/livectl.nim`, run by `aowl test` under the heading **Live mod control**.
 It stages a root with the manager, the Tarkov emulator and
 `examples/gameserver`, writes a three-mod registry of its own, starts the
-backend on port 6979, and drives the routes the way the panel does. **211
-checks** — it was forty when this paragraph was written, and the growth is
+backend on port 6979, and drives the routes the way the panel does. **213
+checks** — 211 when this paragraph last named a number and forty when it was
+first written, and the growth is
 mostly the selection document, the registry refresh and the client-report
 ledger arriving under the same tool. The ones worth knowing about:
 
@@ -476,6 +502,13 @@ ledger arriving under the same tool. The ones worth knowing about:
   not loaded — are checked by **counting host log lines**, because all three
   answer `ok` whether or not anything happened underneath.
 
+213 is the tool's own last line — "live mod control answered all 213 checks" —
+re-derived 2026-08-19 against a scratch root staged the way `aowl test` stages
+it. Worth one warning if you do the same: stage it with the *current* builds of
+`manager.dll`, `tarkov.dll` and `gameserver.dll`. A stage carrying yesterday's
+manager fails 27 of the 213 on the selection-persistence group, which reads as a
+regression and is a stale DLL.
+
 Run it by hand against a stage of your own:
 
 ```
@@ -493,7 +526,9 @@ runtime, no server — and asserts what the client host *says*: 27 checks, and t
 outcomes a staged run cannot produce on demand are the point of it (a mod with
 no teardown, an unload that failed, a library announcing the wrong guid, a row
 the backend has stopped naming). `tests/modclient` drives the other end,
-`mods/manager/mgr/clientreport.nim`, over **90** checks: every letter, every code,
+`mods/manager/mgr/clientreport.nim`, exactly **90** checks (both counts re-run
+2026-08-19: `modreport.exe` prints 27 `ok` lines and `modclient.exe` 90, all
+passing; "over 90" was one too generous): every letter, every code,
 a report cut off mid-rotation, a host that comes back under a new process id,
 and the group headed "absence is not off", which fails the moment a guid with no
 record is allowed to mean "not running".
@@ -552,6 +587,15 @@ against the shipped `registryFetchMaxBytes` and `registryFetchTimeoutMs`, and
 with `--manager <url>` drives all thirteen modes against a running manager and
 asserts the outcome and the reason: 44 checks. It found that the `huge` mode had
 quietly stopped being larger than the ceiling and was being *adopted*.
+
+Both numbers re-derived 2026-08-19. *Thirteen* is `MANAGER_CASES` in
+`registry/fakeregistry.py`, which has thirteen entries. *44* is only **partly**
+re-run: `fakeregistry.py --check --regcheck installer\build\aowl-regcheck.exe`
+without `--manager` answers "27 passed, 0 failed, 1 skipped" — the document and
+transport layers — and skips the manager layer, which needs a manager running on
+a URL. That layer is one check per mode plus one per stated reason fragment,
+which is 13 + 4 = 17, and 27 + 17 = 44. The arithmetic closes; the seventeen
+themselves were not driven this pass.
 
 That last one is the deliberate line. `download` is *specified* — `{url,
 sha256, size}`, all three or none — and nothing reads it. Fetching metadata is

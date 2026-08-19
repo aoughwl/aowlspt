@@ -7,13 +7,24 @@
 ## `call`, parse the result out of a string -- and this one is the same ground
 ## covered through `aowlspt/game` and `aowlspt/fast`.
 ##
-## **This is not the file to copy from.** `tools/hostharness.nim` makes
-## twenty-three assertions about a run of the gate's stage, and seventeen of
-## them are greps for exact strings this file prints -- `field agrees with
-## get_`, `an enum parameter binds on the fast path`, `refused the other's
-## binding`, `everyMain fired`. Three of those seventeen (`Add(17, 25) = 42`,
-## the Unity version, a patch firing) it prints alongside `clientprobe`, which
-## can satisfy them too. So it is organised around covering the host, not
+## **This is not the file to copy from.** `checkLog` in `tools/hostharness.nim`
+## makes **twenty-four** verdicts about a run of the gate's stage, and
+## **eighteen** of them are greps for exact strings this file prints -- `field
+## agrees with get_`, `an enum parameter binds on the fast path`, `refused the
+## other's binding`, `everyMain fired`. **Three** of those eighteen
+## (`Add(17, 25) = 42`, the Unity version, a patch firing) it prints alongside
+## `clientprobe`, which can satisfy them too, leaving **fifteen** that only this
+## file can satisfy. Of the other six, two are `clientprobe`'s alone (the
+## `resolved ` line and the Unity version) and four are the host's own log.
+##
+## This header said "twenty-three assertions and seventeen of them" until
+## 2026-08-19, when the split was re-derived by matching every `find(l, "...")`
+## in `checkLog` against what each mod actually prints. Do not count it by
+## grepping `^ok` over the harness's output: that answers twenty-seven, because
+## three `ok` lines belong to the "Mock runtime" and "Loading" sections and are
+## about the staging rather than about the host. Count under `Result`.
+##
+## So it is organised around covering the host, not
 ## around teaching anyone: it hooks nearly every compiled method the stand-in
 ## runtime has, measures things a mod would not measure, and keeps a raw `this`
 ## address well past the handler it came from in order to compare two paths.

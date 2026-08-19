@@ -222,7 +222,7 @@ reach, and each of those is one header under `abi/`:
 | `aowlspt_abi.h` | the contract itself. C because it is the thing two languages have to agree on. |
 | `aowlspt_shim.h` | the indirect calls nimony cannot express — it refuses to `cast` between a `pointer` and a `proc`. |
 | `aowlspt_fast.h` | 189 call trampolines. Calling an IL2CPP-compiled method directly is a function-pointer call *with the right type*, and C needs that type at compile time while a mod only knows it at bind time. So the space is enumerated: on Win64 a parameter's type only decides which register file it lands in, which collapses to two kinds per slot, five slots, three return forms. |
-| `aowlspt_detour.h` | the x64 inline-detour engine: a length decoder, a trampoline, and a fixed pool of 16 assembly thunks. Hand-written assembly is not something nimony emits. |
+| `aowlspt_detour.h` | the x64 inline-detour engine: a length decoder, a trampoline, and **one** assembly thunk shared by all 256 hook slots (`AOWL_MAX_HOOKS`). Hand-written assembly is not something nimony emits. This row said "a fixed pool of 16 assembly thunks" until the thunks were replaced by one common thunk entered with the firing's own site record in R11; sixteen was never a budget, it was how many `aowl_thunk_N` macro expansions fitted on a screen. |
 | `aowlspt_frame.h` | the typed patch frame. A struct rather than accessor function pointers, because it is read inside a method the game may run per entity per frame. |
 | `aowlspt_net.h` | the backend's sockets: `WSAPoll`, the connection table, zlib, the per-session lock table, and websocket frame boundaries. The websocket *handshake* is not here — it is SHA-1 and base64, which nimony ships. |
 | `aowlspt_overlay.h` | the in-game panel, drawn from a detour on `IDXGISwapChain::Present`. Header-only C, D3D11. |
@@ -230,6 +230,10 @@ reach, and each of those is one header under `abi/`:
 | `aowlspt_live.h` | arming the revision-3 and revision-4 entries of `AowlHostApi`, included only by the host that can honour them. |
 | `aowlspt_notify.h` | arming revision 5 the same way, included only by the backend — plus the refusing stubs that let one integer say "the fifth and not the third". |
 | `aowlspt_lock.h` | the process-wide lock, and nothing else. |
+| `aowlspt_hostboot.h` | starting the client host from inside the game: a C constructor that does nothing but `CreateThread`, because a constructor runs under the loader lock and nimony's `--app:lib` output already owns `DllMain`. |
+
+(That table listed eleven headers and `abi/` has held twelve since
+`aowlspt_hostboot.h` was split out; the twelfth row was added 2026-08-19.)
 
 `aowlspt_lock.h` is worth one sentence as an example of the habit: it was split
 out of `aowlspt_net.h`, which begins with `winsock2.h` and `zlib.h`, so anything
@@ -388,15 +392,18 @@ in `abi/aowlspt_lock.h` — coarse on purpose, for the reason that header gives.
 
 **The firing path is deliberately off it.** A detour fires on the game's thread
 thousands of times a second, and an uncontended `EnterCriticalSection`/
-`LeaveCriticalSection` pair is of the same order as the whole 23 ns of a typed
-prefix firing — so guarding it would cost most of what the typed path was built
-to save. It takes no lock, and is made safe by construction instead: it touches
+`LeaveCriticalSection` pair is of the same order as the whole ~24 ns of a typed
+prefix firing (the table below) — so guarding it would cost most of what the
+typed path was built to save. It takes no lock, and is made safe by construction instead: it touches
 no host table at all, and `gPatches` is filled to the detour engine's full slot
 capacity once at startup (`reservePatchRows`) so the backing array can never
 move under a firing. The JSON firing path *does* register a GC handle per
 reference argument, and it does take the lock for exactly that — around the
 describe and around the reclaim, never around the call into the mod — where it
-is a few percent of a path that already costs 645 ns.
+is a few percent of a path that already costs ~640 ns. What the client host
+costs per *frame*, as opposed to per firing, is measured in
+[PERF.md](PERF.md), "What the host costs per frame"; this page deliberately does
+not carry a second copy of those figures.
 
 What is still unguarded and known to be: `modhost.gMods`, which grows on the
 tick thread and is read from mod threads. The lock for it belongs in `modhost`,
@@ -424,10 +431,14 @@ in the same process as the runtime, so `openIl2Cpp()` binds `GameAssembly.dll`
 directly and the host is simply not on the path.
 
 Measured by `tools/perfbench.nim` against `tests/mockil2cpp`: a boxed call is
-952–1235 ns and a bound one is 6.5–10.2 ns; a boxed field read through a
-property getter is 48 ns and a bound field read is 1.88 ns. Binding costs 1–9 µs,
-almost all of it `findClass` walking every assembly, which is the whole argument
-for binding once.
+956–1217 ns and a bound one is 6.0–10.2 ns; a boxed field read through a
+property getter is 43 ns and a bound field read is 1.87 ns. Binding costs
+1–12 µs, almost all of it `findClass` walking every assembly, which is the whole
+argument for binding once. (Re-derived 2026-08-19, median of three runs; the
+figures here were 952–1235, 6.5–10.2, 48 and 1.88, and the bind range was 1–9 µs.
+Note that the boxed spread is *not* ordered the way the wording elsewhere
+assumes: on two of the three runs the "class in hand" target was the faster of
+the two, on the third it was the slower.)
 
 `handle_pointer` (revision 3) is what joins the two halves. A handle is the only
 safe *durable* reference to a managed object — the collector moves objects, so
@@ -444,10 +455,20 @@ the rest of the session unless the mod releases the pin.
 `patch(target, kind, handler)` detours a compiled method. The engine is
 `abi/aowlspt_detour.h`: it decodes enough of the prologue to relocate it into a
 trampoline, writes a 14-byte `jmp [rip+0]` over the start, and dispatches through
-a fixed pool of **16 assembly thunks**, one per patched method, claimed at
-attach. A seventeenth patch is refused with a message about slots rather than
-silently sharing one. The client host spends one of those slots on its own
-main-thread drain and enters it in the same table a mod's patch goes into — the
+**256 hook slots** (`AOWL_MAX_HOOKS`), one per patched method, claimed at
+attach. A 257th patch is refused with a message about slots rather than silently
+sharing one.
+
+**This paragraph said sixteen, and a seventeenth patch, until 2026-08-19.** That
+was true while each slot needed its own hand-written `aowl_thunk_N`; two example
+mods exhausted it (`hostharness --churn 120` stopped with thirteen slots live
+and three left to install) and a real install is eight or ten mods. With one
+common thunk entered through a per-hook site record nothing is enumerated per
+slot any more, so a slot costs 25 bytes of tables — 6.4 KB of BSS for all 256 —
+and the bound exists only so a mod stuck in an install loop reports "no free
+patch slots" instead of quietly eating address space. The client host spends one
+of those slots on its own main-thread drain and enters it in the same table a
+mod's patch goes into — the
 engine hands slots out in ascending order and the firing path indexes that table
 by slot, so a host hook kept outside it would shift every mod's slot by one and
 deliver each patch to the wrong handler.
@@ -474,25 +495,41 @@ every slot, worked out once at registration. It allocates nothing on either side
 and asks the runtime nothing per firing.
 
 Measured by `perfbench` on `EFT.Player::Ping` against the stand-in, median of
-three runs on one machine:
+three runs on one machine. Re-derived 2026-08-19 with
+`installer\build\perfbench.exe --runtime tests\mockil2cpp\GameAssembly.dll`,
+three runs, median; the "was" column is what this table carried before that:
 
-| | ns/op |
-|---|---:|
-| bound call, unpatched | 3.3 |
-| prefix hook, JSON arguments | 645 |
-| **prefix hook, typed frame** | **23.3** |
-| postfix hook, JSON result and arguments | 1144 |
-| **postfix hook, typed frame** | **24.9** |
-| postfix hook, JSON + replacement | 1615 |
-| **postfix hook, typed frame + replacement** | **37.3** |
+| | ns/op | was |
+|---|---:|---:|
+| bound call, unpatched | 3.33 | 3.3 |
+| prefix hook, JSON arguments | 643 | 645 |
+| **prefix hook, typed frame** | **24.3** | 23.3 |
+| postfix hook, JSON result and arguments | 1140 | 1144 |
+| **postfix hook, typed frame** | **25.8** | 24.9 |
+| postfix hook, JSON + replacement | 1614 | 1615 |
+| **postfix hook, typed frame + replacement** | **38.6** | 37.3 |
+
+The four JSON rows and the unpatched call came back within a nanosecond of what
+was written down; the three typed rows are all about a nanosecond higher, which
+is the same direction on all three and inside the spread a fourth, cold run gave
+(35.0 / 45.4 / 72.2 — a first run on a machine with a build going is not a
+measurement). Nothing here has moved by enough to change a decision.
 
 The typed path does not replace the JSON one and a mod should not reach for it
 by default. JSON is self-describing, survives an argument the host cannot
-classify, reads a `System.String` for you, and 2 µs at 10 Hz is 0.002 percent of
-a frame. The typed path is for the hook that fires forty times a frame: at forty
-bots and 60 fps that difference is 5.3 ms a frame against 60 µs, which is the
-difference between a stutter and a mod. [PERF.md](PERF.md) has the full tables,
-the provenance, and what they do not prove.
+classify, reads a `System.String` for you, and a 2 µs hook at 10 Hz is 20 µs a
+second — 0.002 percent of the machine. The typed path is for the hook that fires
+forty times a frame: at 60 fps that is 2400 firings a second, so the JSON
+postfix at 1140 ns costs **2.7 ms of every second** and the typed one at 25.8 ns
+costs **62 µs**, which is the difference between a stutter and a mod.
+
+(Both figures in this paragraph used to be stated per *frame* — "0.002 percent
+of a frame" and "5.3 ms a frame against 60 µs". The arithmetic behind them was
+per second all along: 2400 firings times ~2.2 µs is 5.3 ms **a second**, and
+2400 times 23.3 ns is 56 µs. The ratio was right and the unit was not.
+Recomputed against the re-derived table above, 2026-08-19.)
+[PERF.md](PERF.md) has the full tables, the provenance, and what they do not
+prove.
 
 Two refusals in the typed path are worth naming because both could have been
 guesses. Reads are by index **and by declared kind** — asking for a float where
@@ -513,10 +550,16 @@ This is the piece that makes the rest make sense.
 The game needs a server, and SPT's targets a pre-1.0 client. So there is one
 here — `mods/tarkov`, guid `aowl.tarkov` — and it is an ordinary mod. It imports
 `aowlspt`, `aowlspt/server` and `aowlspt/json` and **nothing else**. It has no
-private door into the host. It registers its 94 routes with the same `serve`
+private door into the host. It registers its 95 routes with the same `serve`
 and `servePrefix` any mod uses, persists profiles through the same `save`/`load`
 every mod gets, and is loaded by the same `modhost.loadMod` as everything else.
 Its `exportMod` declares `sides = {sideServer, sideSim}`.
+
+(95, not the 94 this paragraph carried: `grep -o 'serve\(Prefix\)\?("[^"]*"'
+mods/tarkov/tarkov.nim | sort -u | wc -l` answers 95 on 2026-08-19 — 85 `serve`,
+9 `servePrefix`, and one `serve` whose status is checked rather than discarded.
+The count went 69 → 95 in one commit; 94 does not appear to have been right for
+either state of the file.)
 
 The constraint is the point: **a plugin API is only as good as the largest thing
 anyone has written with it.** Every gap found while writing a game server was
@@ -554,8 +597,12 @@ and against the disk filling mid-write, which leaves the temporary behind and th
 key untouched.
 
 **A write is on disk before the call that made it returns.** Nothing is held in
-memory for a later moment. There is no `storeTick`, no `storeFlush`, no
-write-behind queue and no deferred commit anywhere in this repository; there was
+memory for a later moment. There is no `storeTick`, no write-behind queue and no
+deferred commit anywhere in this repository. (This sentence also said "no
+`storeFlush`"; `storeFlushOnWrite` does exist in `host/common/modstore.nim:548`,
+but it is the `--store-flush` switch three paragraphs down — a `FlushFileBuffers`
+*before* the rename, not a flush of anything deferred. Corrected 2026-08-19.)
+There was
 one, it bought throughput, and it reopened exactly the hole this paragraph
 exists to close. The removal is written up above `commitNow` so the next person
 does not re-derive it. Killing the server the instant after a trade, a loadout
@@ -672,8 +719,12 @@ while a thread was very likely executing inside it, because the trampoline is ho
 a firing reaches the original method. `tests/detour_race.c` counted that: six
 threads calling a patched function while another installs and removes the patch
 faulted on essentially every cycle. The fix is that a trampoline is never given
-back. It is suballocated out of 64 KB blocks near its target, 1024 to a block and
-64 blocks at most, so never freeing costs address space that is bounded and
+back. It is suballocated out of 64 KB blocks near its target, **512 to a block
+and 128 blocks at most — 8 MB and 65536 installs** (`AOWL_TRAMP_SLOT` 128 bytes,
+`AOWL_TRAMP_BLOCK` 0x10000, `AOWL_TRAMP_BLOCKS` 128; this read "1024 to a block
+and 64 blocks" until 2026-08-19, which was the arithmetic of a 64-byte slot,
+before the per-hook site record and stub moved into the slot beside the
+trampoline). Never freeing therefore costs address space that is bounded and
 countable rather than the 64 KB per install a `VirtualAlloc` each would burn —
 and, far more sharply, it stops the +/-2 GB window the stolen RIP-relative
 displacements need from filling up. `hostharness --churn 2000` sees no trend.
@@ -720,7 +771,8 @@ when the serve loop reaches `cFreeLibrary`.
 
 Retirement does not transfer from the trampoline to the library, and it is worth
 saying why, because it is the first thing anyone will try. A trampoline is 46
-bytes; a mod image is hundreds of kilobytes, and `hostharness --churn 2000` does
+bytes at most (128 with the site record and stub it shares a pool slot with);
+a mod image is hundreds of kilobytes, and `hostharness --churn 2000` does
 500 load/unload cycles, which is the trend that check exists to catch.
 `LoadLibrary` of a path already mapped returns the same image with a bumped
 reference count rather than a fresh one, so a mod loaded again after a retirement
@@ -776,7 +828,19 @@ enter/leave uncontended, **33 ns** with sixteen threads on one mod's counter —
 0.003% and 0.008% of a 423 us handler. `benchbackend` sees no difference outside
 its noise.
 
-`backend/modrace.nim` is the gate, and it asserts on **answers**: eight workers
+**Neither of those two numbers was re-derived on 2026-08-19, because nothing in
+this tree measures them.** `modrace` counts answers rather than timing the pair,
+and there is no `--bench` on it. What the source does state is the figure for
+the bare interlocked pair alone — 7.3 ns (`host/common/modhost.nim:164`,
+`backend/aowlbackend.nim:949`), against a 2.9 ns detour firing — and
+[MODMANAGER.md](MODMANAGER.md) quotes that one for `modEnter`/`modLeave`, where
+this page quotes 11.2 for the shipped bodies, which do a bounds check and a
+second load on top of it. Both may be right; only one of them has a stated
+provenance. Treat 11.2/33 as unverified until something re-measures them.
+
+`backend/modrace.nim` is the gate, and it asserts on **answers**: sixteen
+workers (the gate runs `--cycles 24 --workers 16`; the tool's own default is
+eight and forty cycles)
 call a route while another thread loads and unloads the library under them, and
 every attempt is counted as a whole current answer, a clean refusal (the mod is
 draining), an empty table (the mod is gone), or a failure. Two kinds of failure
@@ -916,8 +980,11 @@ them built and run as phases of `aowl test`: `emutest`, `realtest`, `soak`,
 `fuzzwire`, `wstest`, `livectl`, `allmods`, `modresolve`, `storecrash`,
 `regcheck`, `perfbench`, `benchbackend`, `hostharness`, `dbrace`, `modrace`,
 `modreport`, `modclient`, `framelen`, `tickrace`, `mgrguard`, `detour_race`,
-plus `aowlprobe`, `il2cppprobe`, `firstrun`,
-`aowlspt-launch` and `aowlspt-verify` for use by hand.
+`coverage`, plus `aowlprobe`, `il2cppprobe`, `firstrun`,
+`aowlspt-launch` and `aowlspt-verify` for use by hand. (`coverage` —
+`aowl-coverage --check` — was missing from this list; it is a gate,
+`tools/aowl.nim:1712-1737`. `modrace` is on it and is genuinely run,
+`tools/aowl.nim:1297-1314`.)
 
 Two gates earn their keep out of proportion to their cost. The **layout** gate
 compares nimony's `sizeof` against the numbers the real C compiler gives the real

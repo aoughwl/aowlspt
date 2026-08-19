@@ -198,6 +198,25 @@
       "provides": ["aowl.capability.weaponsway"],
       "loadAfter": [],
       "tags": ["client", "weapons"]
+    },
+    {
+      "id": "aowl.pathtotarkov",
+      "name": "Path To Tarkov",
+      "author": "Path To Tarkov's design, rewritten for aowlspt",
+      "version": "1.0.0",
+      "description": "The deploy screen stops being a teleporter: you stand somewhere, and only the maps BSG's own transit table connects to that place stay unlocked. Reads locations.*.base.transits, writes locations.*.base.Locked, and puts it back on unload.",
+      "pipeline": ">=0.1.0",
+      "sides": ["server", "sim"],
+      "source": { "kind": "intree", "path": "mods/pathtotarkov", "url": null },
+      "artifact": { "dir": "pathtotarkov", "library": "pathtotarkov.dll" },
+      "upstream": { "name": "Path To Tarkov", "author": null, "url": null },
+      "license": null,
+      "download": null,
+      "requires": [],
+      "conflicts": [],
+      "provides": [],
+      "loadAfter": ["aowl.tarkov", "aowl.icebreaker"],
+      "tags": ["travel", "locations", "content"]
     }
   ],
 
@@ -239,7 +258,8 @@
         { "id": "aowl.morebots", "enabled": true },
         { "id": "aowl.sain", "enabled": true },
         { "id": "aowl.blackdivision", "enabled": true },
-        { "id": "aowl.icebreaker", "enabled": true }
+        { "id": "aowl.icebreaker", "enabled": true },
+        { "id": "aowl.pathtotarkov", "enabled": false }
       ]
     },
     {

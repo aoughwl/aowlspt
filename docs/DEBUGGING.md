@@ -117,10 +117,15 @@ runs fails with a sharing violation. Stop the host first.
 
 ### Calling a route from outside
 
-`curl` cannot test a route on this server. The listener reads every request body
-through a zlib stream, so a plain body fails to inflate *before any router is
-consulted*, and what comes back is a 200 the caller cannot read — which looks
-like your mod returned nothing. Use `aowlprobe`, which speaks the protocol:
+`curl` cannot read an answer from this server. This page used to say the reason
+was the *request* side — "the listener reads every request body through a zlib
+stream, so a plain body fails to inflate before any router is consulted". That
+is not what happens, and this page contradicts it two paragraphs down:
+`inflateBody` (`backend/aowlbackend.nim:217-229`, re-read 2026-08-19) checks the
+two-byte zlib header and passes an unframed body straight through. The reason is
+the **response**, which is deflated unless the caller sent `Accept-Encoding:
+identity` — so what comes back is a 200 `curl` cannot read, which looks like your
+mod returned nothing. Use `aowlprobe`, which speaks the protocol:
 
 ```
 installer\build\aowlprobe.exe http://127.0.0.1:6969/aowlspt/status --expect '"ok":true'
@@ -191,10 +196,22 @@ Error 126 is worth calling out: Windows reports "module not found" both for a
 missing DLL and for a DLL whose own imports cannot be resolved. If the file is
 clearly there, run `objdump -p yourmod.dll | grep 'DLL Name'` and check each one.
 
-**A mod faults at run time.** The host marks it `Faulted`, logs the message, and
-stops dispatching to it. The rest of the server keeps running — a broken mod
-should cost you that mod, not the raid. Look for `faulted, mod disabled` in the
-log.
+**A mod faults at run time.** This page used to say the host marks it `Faulted`,
+logs the message and stops dispatching to it, and told you to look for
+`faulted, mod disabled` in the log. **No such mechanism and no such log line
+exist.** Re-derived 2026-08-19: nothing under `host/` carries a faulted mod
+state, the string appears nowhere in the tree, and `modhost.tickMods`
+(`host/common/modhost.nim:938-941`) is three lines that `discard` whatever
+`on_update` returned. A mod that answers non-`Ok` every tick does so silently
+and keeps being ticked.
+
+What survives of the claim is the part about the ABI: nothing crosses this
+boundary as an exception, so a mod that returns a failure returns a *status*,
+and the host carries on. The consequence is the opposite of what was written —
+the failure you will see is silence rather than a log line, or the whole process
+going if the mod faults hard. Check the status in your own `on_update` and log
+it yourself. Marking a mod dead after repeated non-`Ok` is a host change, not a
+documentation one; it is not in this repository today.
 
 **A host call returns non-OK.** `lastError()` carries the host's own text for the
 most recent failure on this thread, and every helper sets it. Log it; the status

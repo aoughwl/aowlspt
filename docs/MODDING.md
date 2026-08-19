@@ -51,13 +51,24 @@ under `aowl run examples/lesson` with no game and no server, where it names each
 facility it cannot exercise and why, and against `tests/mockil2cpp` in a stage of
 its own. That is the sample to copy from.
 
-`examples/highlevel` is **not**. It is the client host's regression test: seventeen
-gate assertions in `tools/hostharness.nim` grep its log for exact strings, so
+`examples/highlevel` is **not**. It is the client host's regression test:
+**eighteen** of the harness's twenty-four verdicts are greps for exact strings
+that file prints, so
 every line it prints is load-bearing for somebody else's red gate and it is
 organised around covering the host rather than around teaching anyone. Read it to
 find out what the host is asserted to do. `examples/clientprobe` is the same mod
 written against the raw interface, worth reading once to see what the layer above
 is doing.
+
+(This said "seventeen gate assertions" and took the figure from
+`examples/highlevel/highlevel.nim`'s own header, which still says twenty-three
+assertions and seventeen. Derived afresh 2026-08-19 by matching every
+`find(l, "...")` in `tools/hostharness.nim` against what each mod actually
+prints: twenty-four verdicts, of which fifteen are satisfied only by lines
+`highlevel` prints, three by lines it shares with `clientprobe`, two by
+`clientprobe` alone — "resolved " and the Unity version — and four by the host's
+own log. So eighteen involve `highlevel`. The stale seventeen in
+`highlevel.nim` is a source comment and wants moving with the rest.)
 
 Every snippet on this page was compiled against the current library before it
 was written down. Where something has *not* been verified, it says so.
@@ -364,9 +375,10 @@ argument handle past the end of the call; copy out what you need.
 **`thisPointer(args)` is how you actually use `this`.** A handle addresses the
 object through `call`, which is about a microsecond; the *address* is what
 `aowlspt/fast` binds against, at tens of nanoseconds. Measured against the
-stand-in in the gate run: 34 ns against 1146 for the boxed property read it
+stand-in in the gate run: 35 ns against 1070 for the boxed property read it
 replaces (`hostharness.exe <stage> --runtime tests\mockil2cpp\GameAssembly.dll
---seconds 8`, the line `an address out of a handle costs`). The absolute numbers
+--seconds 8`, the line `an address out of a handle costs`; re-run 2026-08-19,
+where this page had 34 and 1146). The absolute numbers
 move between runs; the two orders of magnitude between them do not.
 `examples/lesson` re-measures both, on one object in one hook firing, in its own
 process, and prints the pair — because a performance claim that is not re-checked
@@ -407,9 +419,10 @@ reimplementation of a method you cannot read is a guess. The payload is the
 `hookArgs` payload with a `result` member added; `hookResult(payload)` reads it
 as a `CallResult`, so `asFloat()`, `asInt()` and `asObject()` all work.
 `withArgs = false` drops `this` and the arguments and keeps `result`, which is
-about five times cheaper — 461 ns a call against 2249 ns, from the same gate run
+about five times cheaper — 439 ns a call against 2326 ns, from the same gate run
 (the lines `a postfix that only watches costs` and `with a postfix that reads the
-arguments and replaces the result`).
+arguments and replaces the result`; re-run 2026-08-19, where this page had 461
+and 2249 — the ratio is unchanged at 5.3).
 
 Two method shapes cannot carry a postfix and the host refuses them at
 registration, with a sentence saying which: a return type wider than eight bytes
@@ -463,10 +476,17 @@ into a trampoline — see [IL2CPP.md](IL2CPP.md). A function shorter than the
 14-byte jump (`AOWL_JMP_SIZE`) is refused for the same reason. Refusing is
 deliberate: the alternative is overwriting whatever the linker put next.
 
-There are 16 patch slots, and on the client host the main-thread drain takes one
-of them for itself — so 15 is the number a mod should plan against, and the
-seventeenth patch is refused with a message about slots rather than silently
-sharing one.
+There are **256** patch slots (`AOWL_MAX_HOOKS`, `abi/aowlspt_detour.h`), and on
+the client host the main-thread drain takes one of them for itself — so 255 is
+the number a mod should plan against, and the 257th patch is refused with a
+message about slots rather than silently sharing one.
+
+**This paragraph said 16, 15 and a seventeenth patch until 2026-08-19**, which
+was true while every slot needed its own hand-written `aowl_thunk_N` and sixteen
+of those fitted on a screen. `hostharness --churn 120` exhausting it with two
+example mods is what moved it. With one common thunk a slot costs 25 bytes of
+tables, so the number is now a bound against a mod stuck in an install loop
+rather than a budget anybody has to plan around.
 
 **One detour per method**, too. Two hooks on the same target — yours and another
 mod's, or a prefix and a postfix you armed separately — is a refusal in whichever
@@ -515,16 +535,29 @@ discard hookReturnTyped("EFT.MovementContext::InertiaSmoothTilt", onTilt)
 ```
 
 Re-derived with `installer\build\perfbench.exe --runtime
-tests\mockil2cpp\GameAssembly.dll`: 21.9 ns for a typed prefix and 35.6 ns for a
-typed postfix that replaces a result, against 587 and 1483 ns for the same two as
-JSON, and 3.3 ns for the unpatched call.
+tests\mockil2cpp\GameAssembly.dll`, median of three runs, 2026-08-19: **24.3 ns**
+for a typed prefix and **38.6 ns** for a typed postfix that replaces a result,
+against **643** and **1614 ns** for the same two as JSON, and **3.33 ns** for the
+unpatched call.
+
+This page carried 21.9 / 35.6 / 587 / 1483 / 3.3, and the two JSON figures had
+drifted by about a tenth — enough to matter to the arithmetic in the next
+paragraph, which was derived from them. [ARCHITECTURE.md](ARCHITECTURE.md)'s
+copy of the same table was already at the current numbers, which is exactly why
+two documents agreeing is not evidence.
 
 **Do not reach for it by default.** JSON is self-describing, survives an argument
-the host cannot classify, reads a `System.String` for you, and a 1.5 µs hook at
-10 Hz is 15 µs a second — 0.002 percent of the machine. This is for the hook that
-fires forty times a frame, where those same numbers are 59 µs a frame for the
-JSON postfix against 1.4 µs for the typed one: a fortieth of a 60 fps frame
-budget, against a thousandth of it.
+the host cannot classify, reads a `System.String` for you, and a 1.6 µs hook at
+10 Hz is 16 µs a second — under two thousandths of one percent of the machine.
+This is for the hook that fires forty times a frame, where those same numbers are
+**65 µs a frame** for the JSON postfix against **1.5 µs** for the typed one:
+about **1/260th** of a 60 fps frame budget against about **1/11000th** of it.
+
+(The old wording — "59 µs a frame against 1.4 µs" — followed correctly from the
+old 1483 ns and 35.6 ns above. The two fractions after it did not follow from
+anything: 59 µs is not a fortieth of 16.67 ms and 1.4 µs is not a thousandth of
+it, they are 1/280th and 1/12000th. Recomputed 2026-08-19. The conclusion is
+unchanged and the margin is larger than it was claimed to be.)
 
 Three things to hold on to:
 
@@ -783,12 +816,16 @@ one-shot that calls `onMainThread` again before it returns, which is what
 the end of the same firing. Correct, but it churns the pool and leaves
 `scheduledSlots()` unable to tell a working chain from a leaking one.
 
-**It does not spin inside one frame**, because the host's `drainDue` takes the
-due callbacks out of its queue under a lock and runs them *outside* it: a
-callback queued from inside a firing lands after the snapshot the current drain
-is walking, and is picked up by the next drain. That is a property of the host,
-and `everyMain` is the single place that depends on it instead of every mod that
-wants a frame.
+**It does not spin inside one frame**, because the host's `takeDue` takes the
+due callbacks out of its queue under a lock and `runDue` runs them *outside* it:
+a callback queued from inside a firing lands after the snapshot the current
+drain is walking, and is picked up by the next drain. That is a property of the
+host, and `everyMain` is the single place that depends on it instead of every
+mod that wants a frame. (This named `drainDue`, which still exists and still
+calls both; the snapshot moved into `takeDue` when the pair was split, and the
+property is unchanged. What the drain itself costs per frame is measured in
+[PERF.md](PERF.md), "What the host costs per frame" — read it there rather than
+from a figure copied into this page.)
 
 **The stop is deferred by exactly one firing, on purpose.** `stopMainRepeats`
 clears the marker; the firing already queued runs one more time and then releases
@@ -935,8 +972,9 @@ proc perFrame() =
   writeFloat(fHealth, player, hp + 1.0)
 ```
 
-A bound call is 6–10 ns and a bound field read 1.7 ns, against 940–1110 ns for
-the boxed path — re-derived on this machine with
+A bound call is 6.0–10.2 ns and a bound field read 1.87 ns, against 956–1217 ns
+for the boxed path (re-derived 2026-08-19, median of three runs; this page had
+6–10, 1.7 and 940–1110) — re-derived on this machine with
 
 ```
 installer\build\perfbench.exe --runtime tests\mockil2cpp\GameAssembly.dll
@@ -1277,7 +1315,19 @@ installer\build\hostharness.exe installer\build\hoststage ^
     --runtime tests\mockil2cpp\GameAssembly.dll --seconds 8
 ```
 
-and count the `ok`/`error` lines under `Result`.
+and count the `ok`/`error` lines **under `Result`**, which is the whole of the
+instruction. A bare `grep -c '^ok'` over that output answers **27**, and the
+three extra are not verdicts about the host at all: `loaded, not yet started`
+under "Mock runtime", and `host loaded; the constructor should have started its
+thread` and `mock runtime started; the host should pick it up on its next poll`
+under "Loading". They are the harness reporting that its own staging worked,
+before it has read a line of the host's log. Twenty-seven has been miscounted
+this way once already, on 2026-08-19, and read as three assertions having just
+landed; they had not.
+
+Stage it with the **current** builds, too. A stage carrying an older
+`aowlspt-host-il2cpp.dll` fails at `the host never reached 'host running'`,
+which reads as a broken host and is a stale copy.
 
 The field check is stronger than it looks: it passes only when the field and the
 property getter for the same storage *agree*. Either alone can be plausibly

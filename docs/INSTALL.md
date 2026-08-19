@@ -4,10 +4,12 @@ From a Tarkov install the official launcher maintains, to a modded one you can
 start: seven steps, in order, and what to do when one of them refuses.
 
 This is the order somebody actually walked, not an idealised one. `tools/firstrun.nim`
-walks the same order automatically — a synthetic client, `payload`, `install`,
-`importdb`, `verify`, the client's boot sequence, a mod switched off and on, a
-restart — and asserts each step, so the day one of them stops working it is
-caught at the step that broke it:
+walks the same order automatically — a synthetic client, `payload`, what the
+payload declares, `plan`, `install`, `importdb`, `verify`, the client's boot
+sequence, a mod switched off and on, a restart — and asserts each step, so the
+day one of them stops working it is caught at the step that broke it. It prints
+ten numbered steps and **64 checks** (run 2026-08-19; this paragraph named eight
+of the ten and no count at all):
 
 ```
 installer\build\firstrun.exe --scratch C:\scratch\firstrun
@@ -177,7 +179,9 @@ nothing to talk to; a missing launcher means there is no way to start the game
 at all. Each of the three used to be a *warning* on a run that exited 0 —
 `aowl release` and `aowlspt-verify` both caught it later, so the release path
 was safe, but a payload staged by hand and installed straight was not. All
-three are now errors (`tools/aowl.nim:1721`, `:1733`, `:1743`) and they are
+three are now errors (`tools/aowl.nim:1891`, `:1903`, `:1913` — re-derived
+2026-08-19; this said `:1721`, `:1733`, `:1743`, which by then had drifted about
+170 lines and landed on the store-crash gate and two blank lines) and they are
 counted into the same tally as a library-less mod:
 
 ```
@@ -312,15 +316,19 @@ and stops it again.
 ```
 Result
 ------
-  28 checks
-  1 warning(s)
+  36 checks
+  0 warning(s)
 ok    this install is complete and serves
 ```
 
 The count moves as mods are added, so do not read a number off this page; read
-the failures and the warnings. (28 is what a `tools/firstrun.nim` install
-reported on the development machine on 2026-08-19; it was 26 when this page
-was first written, and the number moving is the point.)
+the failures and the warnings. (36 with 0 warnings is what a `tools/firstrun.nim
+--keep` install answered on the development machine on 2026-08-19. This page
+showed **28 checks and 1 warning**, and 28 turns out to be the count
+`--offline` gives on the *same* install — the offline run really does answer
+"28 checks" today. So the sample was the narrower run's tally under the wider
+run's last line. It was 26 when this page was first written, and the number
+moving is the point.)
 
 **The warnings are the interesting part.** A missing `db.json` is one of them:
 the install is not broken, there is no game in it, and those are two different
@@ -344,9 +352,13 @@ serves" is printed only when the backend was started and answered; with
 present" and says what it did not do. A tool that reports a server answering
 when it never opened a socket is the failure it exists to catch.
 
-Without `--offline` it takes about a minute on an install with a real database,
-almost all of it waiting for the backend to load. That is not this tool being
-slow — see step 7.
+Without `--offline` it takes **about three seconds** on an install with a real
+database — 2.6 s measured 2026-08-19 — almost all of it waiting for the backend
+to load. This page said "about a minute", which was true while the backend took
+54 s to come up and stopped being true when the mods stopped issuing 420
+`dbPatch` calls between them. Step 7 has that story, and used to be what this
+sentence pointed at as the excuse; it is now the reason there is nothing to
+excuse.
 
 `aowlspt-install verify --target D:\Aowlspt` is a different and narrower check:
 it reads the uninstall manifest and asks whether the paths it names are still
@@ -467,11 +479,14 @@ that the backend loaded every `.dll` under `aowlspt\mods\` and nothing took the
 unselected ones out until somebody called `/aowlspt/mods/apply`, so a mod the
 panel reported as `"not-selected"` had already run its `on_load` and registered
 its routes. That is no longer true. The manager writes what it resolved to
-`aowlspt-selection.json`, and `host/common/modhost.nim:646-717` reads that file
-*before* it opens anything: each candidate library is loaded, asked what it
-calls itself through `describe`, and put straight back down without being
-initialised (`probeGuid`, `:657`). A mod that is not in `load` never runs a line
-of its own code — no `on_load`, no database writes, no routes.
+`aowlspt-selection.json`, and `modhost.loadAll`
+(`host/common/modhost.nim:862`) reads that file through `readSelection`
+(`:599-686`) *before* it opens anything: each candidate library is loaded, asked
+what it calls itself through `describe`, and put straight back down without
+being initialised (`probeGuid`, `:688-726`). A mod that is not in `load` never
+runs a line of its own code — no `on_load`, no database writes, no routes.
+(Re-derived 2026-08-19. This cited `:646-717` and `probeGuid` at `:657`; both
+had drifted, and `:657` had come to sit inside `readSelection`'s body.)
 
 Four ways of not having a selection and all four load everything, which is what
 a fresh install needs: the file absent, unreadable, written for another side, or
