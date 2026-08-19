@@ -1125,12 +1125,24 @@ proc deliverEvent(n, body: string; fromIndex: int): int =
     # unload the subscriber. A subscriber that is going away is simply skipped
     # -- an event is a broadcast, and a mod that is being unloaded is exactly a
     # mod that no longer wants to hear about anything.
-    if not modhost.modEnter(fanout[i].modIndex):
+    #
+    # `modGuardable` first, because `modEnter` answers the same `false` for
+    # "out of range" as for "being unloaded", and only the second is a reason
+    # to skip. A subscriber registered under an index that is not a mod's --
+    # `tools/hostharness` uses `0x7FFF` on purpose, so its own registrations
+    # outlive the churn it measures -- would otherwise be dropped as though it
+    # were going away, and the reply it was waiting for would simply never
+    # come. The client host hit exactly that and it took a gate failure to
+    # find; nothing registers such an index here today, which is why this is
+    # written down rather than left to be rediscovered.
+    let guarded = modhost.modGuardable(fanout[i].modIndex)
+    if guarded and not modhost.modEnter(fanout[i].modIndex):
       continue
     var b = body
     let st = cInvokeCallback(fanout[i].cb, fanout[i].user,
                              cast[HostPtr](toCString(b)), int32(body.len))
-    modhost.modLeave(fanout[i].modIndex)
+    if guarded:
+      modhost.modLeave(fanout[i].modIndex)
     if st != StatusOk:
       # One bad subscriber must not stop the rest: an event is a broadcast, and
       # a mod dropping it is that mod's problem rather than the emitter's.

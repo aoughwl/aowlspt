@@ -20,25 +20,68 @@
 ##   4. It loads every mod under `mods/`, and ticks them.
 ##
 ## What a client mod gets here: `log`, `config_get`, `now_ms`, `invoke_main`,
-## `schedule`, events, and the escape hatch -- `resolve` and `call` -- which on
-## this side means reaching any type and any method in the game by name.
+## `schedule`, events, `patch` -- an x64 inline detour on the compiled method --
+## and the escape hatch, `resolve` and `call`, which on this side means reaching
+## any type and any method in the game by name.
+##
+## `invoke_main` means Unity's main thread when it can. The host detours a
+## method the engine calls once per frame on that thread and drains the queue
+## from inside it; `bindMainDrain` holds the candidate list and the honest
+## account of which of them exist. When none can be detoured the queue runs on
+## the host's own thread, exactly as it used to, and the log says so in those
+## words rather than letting the name imply otherwise. A mod can ask:
+## `call("aowlspt.host::main_thread")`.
+##
+## Mods can also come and go while the game runs. `modcontrol` answers the mod
+## manager's control protocol, and -- because the manager lives in the *backend*
+## process and an event cannot cross a process boundary -- this host also asks
+## the backend directly, over the overlay's existing HTTP worker, which
+## client-side mods should be running. See `takeModSet` and
+## `host/common/modcontrol.nim`. It is a poll and never a push: no
+## `backendPort`, no answer, or an answer that does not parse whole, and this
+## host runs exactly what it loaded at boot.
+##
+## A patch may be a *prefix* or a *postfix*. A postfix takes a second thunk
+## path: it calls the original rather than tail-jumping into it, so it regains
+## control and can hand the handler what the method returned -- and may replace
+## it. That costs two refusals, both checked at registration rather than found
+## at run time: a value-type return wider than a register, which comes back
+## through a buffer this host cannot read the layout of, and a compiled call
+## with stack arguments, which a *called* original would look for in the thunk's
+## frame. `postfixRefusal` in `invoke.nim` is both of them.
+##
+## `handle_pointer` turns a handle into the address of the object behind it, so
+## a mod can reach `this` on its own fast path rather than through `call`. The
+## address is good for the call it was got in and no longer; `handle_pin` is the
+## way to keep one, and pins the object until the mod releases it.
 ##
 ## What it does not get: `db_get`/`db_patch` and `route_register`, which are
-## server-side and return `ErrUnsupported`; and `patch`, which needs a detour
-## engine this host does not have yet and which also returns `ErrUnsupported`
-## rather than installing a hook that half works.
+## server-side and return `ErrUnsupported`; and a *finalizer* patch, whose whole
+## contract is the exception in flight, which does not cross this ABI.
 
 import std/[strutils, syncio]
 import aowlspt/il2cpp
+import aowlspt/fast
 import aowlsptinstall/winfs
 import modstore
+import modhost
+import modcontrol
 import jsonpath
 import aowloverlay
 import invoke
 
 {.emit: """#include "aowlspt_shim.h" """.}
+## The revision-3 live-object entry points. A separate header, and only this
+## host includes it: `handle_pointer` and `handle_pin` mean nothing without a
+## managed heap, and naming them in the shared shim would make every nimony
+## binary that includes it have to define them. See `aowlspt_live.h`.
+{.emit: """#include "aowlspt_live.h" """.}
 {.emit: """#include "aowlspt_hostboot.h" """.}
 {.emit: """#include "aowlspt_detour.h" """.}
+## The typed patch frame. Included here as well as through `aowlspt_abi.h`
+## because this file names its pool directly; the include guard makes the second
+## one free.
+{.emit: """#include "aowlspt_frame.h" """.}
 
 # --------------------------------------------------- the main-thread handoff
 #
@@ -50,22 +93,23 @@ import invoke
 # time which of them exists.
 #
 # This block is the part nimony cannot express: a lock, and counters read
-# without one. It is emitted here rather than included from
-# `abi/aowlspt_net.h`, which has exactly this lock -- that header also pulls in
-# winsock2 and zlib, neither of which belongs in a DLL injected into the game.
-# (A small `abi/aowlspt_lock.h` split out of it would let both share one; noted
-# for whoever owns that directory.)
+# without one. The lock itself now comes from `abi/aowlspt_lock.h` -- it used
+# to be a byte-for-byte copy of the one in `abi/aowlspt_net.h`, kept separate
+# only because that header also pulls in winsock2 and zlib, neither of which
+# belongs in a DLL injected into the game. The split header has the lock and
+# nothing else, so this host can share it and still import nothing but
+# kernel32.
+{.emit: """#include "aowlspt_lock.h" """.}
 {.emit: """
-/* One lock for `gPending`. A mod calls `invoke_main` from a worker thread; the
- * drain runs on the game thread. That is a real handoff between two threads
- * neither of which the other knows about, so it needs a lock rather than an
- * argument about how unlikely the interleaving is.
+/* `aowl_lock` guards `gPending`. A mod calls `invoke_main` from a worker
+ * thread; the drain runs on the game thread. That is a real handoff between two
+ * threads neither of which the other knows about, so it needs a lock rather
+ * than an argument about how unlikely the interleaving is.
  *
- * Initialised on first use under a one-time flag, because the first caller may
- * be a mod's worker thread and there is no earlier point both sides pass
- * through. */
-static CRITICAL_SECTION aowl_mq_cs;
-static LONG aowl_mq_state = 0;   /* 0 unset, 1 initialising, 2 ready */
+ * It is the process-wide lock from `aowlspt_lock.h` rather than one of this
+ * host's own: this queue is the only thing in the client host that is contended
+ * at all, and a second lock would be a second ordering to get wrong for no
+ * measured gain. */
 
 /* Read without the lock, on every frame, by the drain. A plain LONG rather
  * than a queue walk: the empty case is the only case most frames, and it has to
@@ -83,22 +127,6 @@ static volatile LONG aowl_mq_count = 0;
 static volatile LONG aowl_mq_tid = 0;
 static volatile LONG aowl_mq_alien = 0;
 static LONG aowl_mq_fires = 0;   /* main thread only, so no interlock needed */
-
-static void aowl_mq_lock(void) {
-    LONG was = InterlockedCompareExchange(&aowl_mq_state, 1, 0);
-    if (was == 0) {
-        InitializeCriticalSection(&aowl_mq_cs);
-        InterlockedExchange(&aowl_mq_state, 2);
-    } else {
-        while (InterlockedCompareExchange(&aowl_mq_state, 2, 2) != 2) Sleep(0);
-    }
-    EnterCriticalSection(&aowl_mq_cs);
-}
-
-static void aowl_mq_unlock(void) {
-    if (InterlockedCompareExchange(&aowl_mq_state, 2, 2) == 2)
-        LeaveCriticalSection(&aowl_mq_cs);
-}
 
 static void aowl_mq_set_count(int32_t n) { aowl_mq_count = (LONG)n; }
 static int32_t aowl_mq_get_count(void) { return (int32_t)aowl_mq_count; }
@@ -127,8 +155,72 @@ static int32_t aowl_mq_enter(void) {
 }
 """.}
 
-proc cMqLock() {.importc: "aowl_mq_lock", nodecl.}
-proc cMqUnlock() {.importc: "aowl_mq_unlock", nodecl.}
+proc cMqLock() {.importc: "aowl_lock", nodecl.}
+proc cMqUnlock() {.importc: "aowl_unlock", nodecl.}
+
+# ------------------------------------------------------- the host's tables
+#
+# `cMqLock` was named for the main-thread queue because that is all it used to
+# guard. It guards the rest of this host's mutable state now, and the rename
+# would cost more than it explains, so this block is the explanation instead.
+#
+# **Three threads touch these tables.** The host's own tick loop loads and
+# unloads mods and drops what they registered. The game's thread runs every
+# patch firing and the per-frame drain. And *any* thread a mod cares to create
+# calls `resolve`, `call`, `handle_release`, `event_subscribe` and `patch` --
+# the ABI never said a mod may not, and a mod that polls the game from a worker
+# is doing the thing this host exists to allow.
+#
+# Until now none of it was guarded. The symptom was an occasional failed shrink
+# of the handle table under churn, which is the mild end of the same fault: a
+# `seq` that grows reallocates, and a thread indexing the old buffer while
+# another has moved it is a read of freed memory rather than a wrong number.
+#
+# **What is guarded**: the handle table and its free queue (`gHandles`,
+# `gHandleIsObject`, `gHandleGc`, `gHandleFree`), the subscription list
+# (`gSubs`), and the *rows* of the patch table (`gPatches`) as they are written
+# and torn down. `gPending` always was.
+#
+# **What is deliberately not guarded, and why:**
+#
+#  * **The firing path.** `patchFired` -> `typedFire` runs on the game's thread
+#    inside a patched method, thousands of times a second, and a lock there is
+#    frame time. It is measured rather than argued about: the typed prefix path
+#    is 23 ns end to end (`perfbench`), and an uncontended `EnterCriticalSection`
+#    /`LeaveCriticalSection` pair is of the same order -- so guarding it would
+#    cost most of what the typed path was built to save. It stays off the lock,
+#    and is made safe another way: `gPatches` is grown to the detour engine's
+#    full slot capacity **once, at startup** (`reservePatchRows`), so the
+#    backing array never moves under a firing. A row is written before its hook
+#    is attached and cleared after its hook is removed, and `live` is the flag
+#    that gates the read.
+#
+#  * **The typed path's handles.** It takes none. That is what makes the
+#    above possible: `typedFire` hands the mod a borrowed view of the saved
+#    registers and touches no host table at all. The **JSON** firing path does
+#    take handles, and it *is* locked -- around the describe and around the
+#    reclaim, never around the call into the mod.
+#
+#  * **`cMqEnter`,** the drain's per-frame "is this my thread and is there
+#    anything to do". It is two loads and a branch by design and is already
+#    correct without a lock; see its own comment.
+#
+#  * **`modhost.gMods`.** A mod row is added on the host's tick thread and read
+#    from mod threads (`config_get`, the store). It only ever grows and is
+#    never compacted, so the failure mode is a reallocation under a reader, the
+#    same as the handle table's -- but the lock for it belongs in `modhost`,
+#    which the backend shares, and this host cannot add it alone. It is left as
+#    it is and said out loud rather than half-fixed here.
+#
+# One lock and not several, for the reason `aowlspt_lock.h` gives: everything
+# under it is touched at human rates or on paths that already cost hundreds of
+# nanoseconds, and one lock nobody has to reason about the ordering of is worth
+# more than a set of finer ones somebody eventually takes in two orders. It is
+# a Windows critical section, so a mod handler that calls back into the host on
+# the same thread re-enters rather than deadlocking -- but no host call holds it
+# across a call into a mod, which is the rule that actually matters.
+proc tablesLock() {.inline.} = cMqLock()
+proc tablesUnlock() {.inline.} = cMqUnlock()
 proc cMqSetCount(n: int32) {.importc: "aowl_mq_set_count", nodecl.}
 proc cMqCount(): int32 {.importc: "aowl_mq_get_count", nodecl.}
 proc cMqThread(): uint32 {.importc: "aowl_mq_thread", nodecl.}
@@ -143,63 +235,40 @@ proc cModulePath(buf: Il2CppPtr; cap: int32): int32 {.
 proc cNowMs(): uint64 {.importc: "aowl_sys_now_ms", nodecl.}
 proc cSleep(ms: int32) {.importc: "aowl_sys_sleep", nodecl.}
 proc cThreadId(): uint32 {.importc: "aowl_sys_thread_id", nodecl.}
-proc cLoadLibrary(path: cstring): Il2CppPtr {.
-  importc: "aowl_sys_load_library", nodecl.}
-proc cFreeLibrary(h: Il2CppPtr) {.importc: "aowl_sys_free_library", nodecl.}
-proc cGetProc(h: Il2CppPtr; name: cstring): Il2CppPtr {.
-  importc: "aowl_sys_get_proc", nodecl.}
-proc cLastError(): uint32 {.importc: "aowl_sys_last_error", nodecl.}
 proc cIsCodePointer(p: Il2CppPtr): int32 {.
   importc: "aowl_is_code_pointer", nodecl.}
 
-proc cModInfoNew(): Il2CppPtr {.importc: "aowl_modinfo_new", nodecl.}
-proc cModInfoFree(p: Il2CppPtr) {.importc: "aowl_modinfo_free", nodecl.}
-proc cModInfoAbiVersion(p: Il2CppPtr): uint32 {.
-  importc: "aowl_modinfo_abi_version", nodecl.}
-proc cModInfoSides(p: Il2CppPtr): uint32 {.importc: "aowl_modinfo_sides", nodecl.}
-proc cModInfoFlags(p: Il2CppPtr): uint32 {.importc: "aowl_modinfo_flags", nodecl.}
-proc cModInfoGuidPtr(p: Il2CppPtr): Il2CppPtr {.importc: "aowl_modinfo_guid_ptr", nodecl.}
-proc cModInfoGuidLen(p: Il2CppPtr): int32 {.importc: "aowl_modinfo_guid_len", nodecl.}
-proc cModInfoNamePtr(p: Il2CppPtr): Il2CppPtr {.importc: "aowl_modinfo_name_ptr", nodecl.}
-proc cModInfoNameLen(p: Il2CppPtr): int32 {.importc: "aowl_modinfo_name_len", nodecl.}
-proc cModInfoAuthorPtr(p: Il2CppPtr): Il2CppPtr {.importc: "aowl_modinfo_author_ptr", nodecl.}
-proc cModInfoAuthorLen(p: Il2CppPtr): int32 {.importc: "aowl_modinfo_author_len", nodecl.}
-proc cModInfoVersionPtr(p: Il2CppPtr): Il2CppPtr {.importc: "aowl_modinfo_version_ptr", nodecl.}
-proc cModInfoVersionLen(p: Il2CppPtr): int32 {.importc: "aowl_modinfo_version_len", nodecl.}
+## Fills `handle_pointer`/`handle_pin` and only then grows the struct's reported
+## `size`. `aowl_hostapi_new` leaves both null and reports the revision-2 size,
+## because a mod is told it may trust `size` before calling an appended pointer
+## and that has to stay true of a host without a managed heap.
+proc cHostApiArmLive(p: Il2CppPtr) {.importc: "aowl_hostapi_arm_live", nodecl.}
+## Revision 4's `patch_typed`, armed separately from the live pair because they
+## are separate capabilities -- see `aowlspt_live.h`. Called right after it, so
+## `size` only ever grows.
+proc cHostApiArmTyped(p: Il2CppPtr) {.importc: "aowl_hostapi_arm_typed", nodecl.}
 
-proc cModAbiVersion(fn: Il2CppPtr): uint32 {.importc: "aowl_mod_abi_version", nodecl.}
-proc cModDescribe(fn, info: Il2CppPtr): int32 {.importc: "aowl_mod_describe", nodecl.}
-proc cModInit(fn, host, outApi: Il2CppPtr): int32 {.importc: "aowl_mod_init", nodecl.}
-
-proc cModApiNew(): Il2CppPtr {.importc: "aowl_modapi_new", nodecl.}
-proc cModApiFree(p: Il2CppPtr) {.importc: "aowl_modapi_free", nodecl.}
-proc cModApiHasUpdate(p: Il2CppPtr): int32 {.importc: "aowl_modapi_has_update", nodecl.}
-proc cModApiOnLoad(p: Il2CppPtr): int32 {.importc: "aowl_modapi_on_load", nodecl.}
-proc cModApiOnUpdate(p: Il2CppPtr; elapsed: int64): int32 {.
-  importc: "aowl_modapi_on_update", nodecl.}
-proc cModApiOnUnload(p: Il2CppPtr): int32 {.importc: "aowl_modapi_on_unload", nodecl.}
-
-proc cHostApiNew(ctx: Il2CppPtr; side: int32;
-                 hostName, hostVersion, sptVersion, gameVersion,
-                 modDir, dataDir: cstring): Il2CppPtr {.
-  importc: "aowl_hostapi_new", nodecl.}
-proc cHostApiFree(p: Il2CppPtr) {.importc: "aowl_hostapi_free", nodecl.}
-proc cHostApiPtr(p: Il2CppPtr): Il2CppPtr {.importc: "aowl_hostapi_ptr", nodecl.}
-proc cAbiVersionExpected(): uint32 {.importc: "aowl_abi_version_expected", nodecl.}
-proc cOutCopy(outPtr: Il2CppPtr; outLen: Il2CppPtr; src: Il2CppPtr;
-              len: int32): int32 {.importc: "aowl_out_copy", nodecl.}
-proc cInvokeCallback(cb, user, payload: Il2CppPtr; len: int32): int32 {.
-  importc: "aowl_invoke_callback", nodecl.}
+## The typed patch frame: a pooled, borrowed view of the thunk's saved
+## registers, handed to a mod instead of a JSON payload. `aowlspt_frame.h` has
+## the mechanism and the lifetime rule.
+proc cFrameSlot(depth: int32): Il2CppPtr {.importc: "aowl_frame_slot", nodecl.}
+proc cFrameArm(f, regs, kinds: Il2CppPtr; argc, retKind: int32;
+               flags: uint32; self: uint64) {.importc: "aowl_frame_arm", nodecl.}
+proc cFrameDisarm(f: Il2CppPtr) {.importc: "aowl_frame_disarm", nodecl.}
+proc cFrameDepthMax(): int32 {.importc: "aowl_frame_depth_max", nodecl.}
+proc cInvokeTypedPatch(cb, user, frame: Il2CppPtr): int32 {.
+  importc: "aowl_invoke_typed_patch", nodecl.}
 proc cFreeBuf(p: Il2CppPtr) {.importc: "aowl_host_release", nodecl.}
+
+const
+  FrameFlagPostfix = 0x1'u32
+  FrameFlagStatic = 0x2'u32
 
 proc cInvokePatchArgs(cb, user, target: Il2CppPtr; tlen: int32;
                       args: Il2CppPtr; alen: int32;
                       outPtr, outLen: Il2CppPtr): int32 {.
   importc: "aowl_invoke_patch_args", nodecl.}
 
-proc cInvokePatch(cb, user, target: Il2CppPtr; tlen: int32): int32 {.
-  importc: "aowl_invoke_patch", nodecl.}
-proc cByteAt(p: Il2CppPtr; i: uint64): uint8 {.importc: "aowl_byte_at", nodecl.}
 
 proc cHookNew(): Il2CppPtr {.importc: "aowl_hook_new", nodecl.}
 proc cHookFree(p: Il2CppPtr) {.importc: "aowl_hook_free", nodecl.}
@@ -207,6 +276,38 @@ proc cHookAttach(p, target: Il2CppPtr): int32 {.importc: "aowl_hook_attach", nod
 proc cHookRemove(p: Il2CppPtr): int32 {.importc: "aowl_hook_remove", nodecl.}
 proc cHookStolen(p: Il2CppPtr): int32 {.importc: "aowl_hook_stolen", nodecl.}
 proc cHookCapacity(): int32 {.importc: "aowl_hook_capacity", nodecl.}
+## How many slots the engine has live, and how many it has back on its free
+## list. Both are read only by `aowlspt.host::table_stats`; they exist because
+## "the slot was reclaimed" is otherwise unobservable from outside the engine,
+## and a reclaim that silently did not happen is exactly the failure that ends
+## a session twenty minutes in.
+proc cHookUsed(): int32 {.importc: "aowl_hook_used", nodecl.}
+
+proc cHookFreeCount(): int32 {.importc: "aowl_hook_free_count", nodecl.}
+## Firings the engine dropped because the slot they belonged to had been
+## released and re-claimed while they were in flight. Reported in
+## `table_stats` because a race that is being caught and a race that is not
+## happening are the same number from outside -- and this is the number.
+proc cHookStaleFires(): int32 {.importc: "aowl_hook_stale_fires", nodecl.}
+## Hands a slot back to the engine, after its hook has been removed and freed.
+## Without this the pool was one-way: sixteen patches into a session -- which a
+## player switching a mod off and on again reaches quickly -- every further
+## `patch()` was refused with fifteen slots holding nothing.
+proc cHookRelease(slot: int32) {.importc: "aowl_hook_release", nodecl.}
+## Reserves the next free slot without installing anything, so this file can
+## fill `gPatches[slot]` **before** the jump lands. The thunk can fire on the
+## instruction after the install and it indexes `gPatches` by slot, so the row
+## has to exist first -- which means the slot number has to.
+proc cHookClaim(): int32 {.importc: "aowl_hook_claim", nodecl.}
+proc cHookAttachAt(p, target: Il2CppPtr; slot: int32): int32 {.
+  importc: "aowl_hook_attach_at", nodecl.}
+## Arms a slot's postfix path. Called *before* `cHookAttach`, never after: the
+## thunk reads this table on every firing and can fire the instant the jump
+## lands, so a slot armed a moment late would spend its first firings behaving
+## like a prefix -- which for a mod scaling a return value is a wrong number
+## rather than a missing one.
+proc cHookSetPostfix(slot: int32; on: int32) {.
+  importc: "aowl_hook_set_postfix", nodecl.}
 ## The engine's own text for an install code. Kept there rather than mirrored
 ## here: the codes were split apart once already -- "could not be relocated"
 ## used to mean four different things -- and a copy of that table in this file
@@ -215,36 +316,23 @@ proc cHookErrorText(rc: int32): Il2CppPtr {.
   importc: "aowl_hook_error_text", nodecl.}
 
 const
-  SideClient = 2'i32
   HostName = "aowlspt-host-il2cpp"
   HostVersion = "0.1.0"
 
-  StatusOk = 0'i32
+  # `SideClient` and the shared status codes (`StatusOk`, `ErrBadArg`, and the
+  # rest) come from `modhost`. Only the two this host answers on its own are
+  # declared here.
   PatchSkipStatus = 1'i32
-  ErrGeneric = -1'i32
-  ErrNotFound = -3'i32
-  ErrBadArg = -4'i32
-  ErrDecode = -5'i32
-  ErrUnsupported = -6'i32
   ErrDisposed = -8'i32
 
 # --------------------------------------------------------------- state
 
-type
-  LoadedMod = object
-    path: string
-    dir: string
-    module: Il2CppPtr
-    info: Il2CppPtr
-    api: Il2CppPtr
-    hostBlock: Il2CppPtr
-    guid: string
-    name: string
-    author: string
-    version: string
-    hasUpdate: bool
-    live: bool
+## What this host keeps *per mod* -- detour slots, GC handles, queued
+## main-thread callbacks -- is below, keyed by the mod's index in
+## `modhost.gMods`. The mod itself (`LoadedMod`, the table, the loader) is
+## `host/common/modhost.nim`, shared with the backend.
 
+type
   Patch = object
     ## One installed detour, and the mod callback it belongs to. Indexed by the
     ## slot the detour engine handed out, so the firing path is an array index
@@ -280,6 +368,27 @@ type
     ## hook the host installed outside that table would shift every mod's slot
     ## by one and fire the wrong handler.
     isDrain: bool
+    ## A postfix: the thunk calls the original and comes back, and the handler
+    ## runs then, with what it returned. Mirrored into the engine's
+    ## `aowl_post_table` before the hook is attached, because the thunk reads
+    ## that table and can fire the instant the jump lands.
+    isPostfix: bool
+    ## A **typed** patch (ABI revision 4): the handler is given a borrowed view
+    ## of the saved registers rather than a JSON description of them, and `cb`
+    ## is an `AowlTypedPatchFn` rather than an `AowlPatchFn`. The two shapes take
+    ## different numbers of parameters, so calling one through the other is a
+    ## crash rather than a type error -- which is why this is a field the firing
+    ## path branches on rather than something inferred.
+    typed: bool
+    ## The declared kind of each parameter and of the return, worked out **once**
+    ## here rather than per firing. This is where the JSON path's cost actually
+    ## goes: it asks the runtime what everything is on every call, and the answer
+    ## cannot change between calls.
+    kinds: seq[uint8]
+    retKind: uint8
+    ## `AOWL_FRAME_F_STATIC` for a static method, pre-computed for the same
+    ## reason: it is a property of the signature, not of the firing.
+    frameFlags: uint32
 
   Sub = object
     ## An event subscription. Client-side events are how one mod tells another
@@ -303,30 +412,128 @@ type
     ## one fact this whole path exists to establish.
     selfTest: bool
 
+proc deadPatch(): Patch =
+  ## An empty row. Used for two things and they are the same thing: filling the
+  ## gap when the engine hands back a slot above the end of this table, and
+  ## clearing a row whose detour has been removed so that the slot can be
+  ## claimed again. Every pointer in it is null, so a firing that somehow
+  ## reaches it finds `live` false and returns.
+  result = Patch(hook: cast[Il2CppPtr](0), cb: cast[Il2CppPtr](0),
+                 user: cast[Il2CppPtr](0), target: "", targetC: @[0'u8],
+                 live: false, meth: cast[Il2CppMethod](0), wantArgs: false,
+                 canSkip: false, modIndex: -2, isDrain: false,
+                 isPostfix: false, typed: false, kinds: @[], retKind: 0'u8,
+                 frameFlags: 0'u32)
+
 var gDir = ""
-var gLogPath = ""
 var gRt = Il2Cpp(handle: cast[Il2CppPtr](0), loaded: false, lastError: 0'i32,
                  missing: @[])
 var gDomain: Il2CppPtr = cast[Il2CppPtr](0)
 var gReady = false
-var gMods: seq[LoadedMod] = @[]
 var gPending: seq[Pending] = @[]
 var gLastError = ""
-var gStartMs = 0'u64
 var gHandles: seq[Il2CppPtr] = @[]
 var gHandleIsObject: seq[bool] = @[]
 ## For an object handle, the IL2CPP GC handle keeping it alive; zero for a type
 ## handle. Parallel to `gHandles` because a mod-facing handle is an index and
 ## the three must stay in step.
 var gHandleGc: seq[uint32] = @[]
+
+## Released handle slots, waiting to be handed out again.
+##
+## The table used to be append-only: `handle_release` emptied a slot and
+## nothing ever took it back, so a mod that resolved and released once a frame
+## grew this by one entry a frame for the length of a raid. `fireHandler` hid
+## the worst of it -- a patch argument's handles are usually at the top and the
+## table is shrunk back -- which is why it went unnoticed: the leak is on the
+## paths a *mod* drives, not the one the host drives.
+##
+## A queue rather than a stack, and the reason is the diagnostic rather than the
+## memory. A handle number handed straight back out means a mod using a released
+## handle gets somebody else's object instead of "handle 7 has already been
+## released"; recycling oldest-first puts every other freed slot in between, so
+## the sentence survives for as long as there is anything else to hand out. It
+## is a delay and not a guarantee, and the guarantee -- a generation in the high
+## bits of the handle -- would change every handle number a mod ever prints.
+##
+## `gHandleFreeHead` is where the queue starts; the seq in front of it is
+## compacted rather than shifted, because a shift is a copy per release.
+var gHandleFree: seq[int32] = @[]
+var gHandleFreeHead = 0
+
 var gPatches: seq[Patch] = @[]
+
+## What the patch paths have cost, cumulatively, so that "allocation-free" is a
+## measurement rather than a claim.
+##
+## `gPatchPayloadBytes` is every byte of JSON this host has built to describe a
+## firing, and `gPatchHandlesTaken` every GC handle it has registered for one.
+## Both are exactly the work the typed path removes, and both are readable from
+## a mod through `call("aowlspt.host::patch_stats")` -- so a test can fire a
+## typed hook twenty thousand times and assert that neither moved by one. The
+## same test against the JSON hook moves them by twenty thousand.
+##
+## Counters rather than a flag, and cumulative rather than per-firing, because
+## the interesting assertion is "this number did not change", which needs a
+## number.
+var gPatchPayloadBytes = 0'i64
+var gPatchHandlesTaken = 0'i64
+var gPatchFires = 0'i64
+var gTypedFires = 0'i64
+## Firings that arrived deeper than the frame pool and fell back to letting the
+## original run. Reported because a non-zero value here means a mod is not being
+## called, which is exactly the kind of silence that should be visible.
+var gTypedTooDeep = 0'i64
 var gSubs: seq[Sub] = @[]
+
+## How deep the stack is inside a patch handler, and which handle indices that
+## firing created. `handle_pointer` uses them to tell "the object a hook is
+## looking at right now" from "a handle number a hook wrote down last frame".
+##
+## A count rather than a flag because a handler may itself call something the
+## host has patched -- reentering `patchFired` -- and a flag would have the
+## inner firing's return clear the outer one's scope.
+var gPatchDepth = 0
+var gPatchHandleMark = 0
+var gPatchHandleTop = 0
+
+proc reservePatchRows() =
+  ## Every row the detour engine can ever hand out, present before the first
+  ## one is used.
+  ##
+  ## This is what lets the firing path stay off the lock. `gPatches` used to be
+  ## grown on demand -- `while gPatches.len <= claimed: add` -- and a `seq` that
+  ## grows *moves*, so a patch installed from a mod's worker thread could
+  ## reallocate the array while the game's thread was indexing it inside a
+  ## patched method. Filling it to the engine's capacity once means the array
+  ## never moves again: a row is only ever written, and `live` says whether the
+  ## firing path should read it.
+  ##
+  ## Sixteen rows of nulls. The `while` loops at the two install sites are kept
+  ## as they were -- they are now no-ops, and a capacity that grows one day
+  ## should not depend on this having been called.
+  let cap = int(cHookCapacity())
+  while gPatches.len < cap:
+    gPatches.add deadPatch()
+
 
 ## The slot the drain hook took, or -1 when nothing bound. Checked first in the
 ## firing path, so it must be a value no real slot can have.
 var gDrainSlot = -1
 ## Which method it bound to, for the log and for `aowlspt.host::main_thread`.
 var gDrainMethod = ""
+## Whether the bound method runs **once** per frame.
+##
+## Three of the four candidates do; `UnityEngine.Time::get_deltaTime` is the
+## last resort precisely because it does not -- it is called many times a frame
+## by whatever the game is doing. A mod dividing the firing count by wall-clock
+## time and calling the answer a frame rate is right for three of them and
+## wrong for the fourth, and it has no way to tell which it got.
+##
+## So the host says. This is a fact about the method the host chose, and a mod
+## guessing at it from a name list is a mod that has to be edited every time
+## this list is.
+var gDrainPerFrame = false
 ## The host's own thread, recorded at boot. `invoke_main` runs here when no
 ## candidate bound, and the difference between this and the drain thread is the
 ## proof that the drain is somewhere else.
@@ -345,43 +552,16 @@ var gLastFire = 0
 var gLastFireMs = 0'u64
 var gDrainStalled = false
 
-# --------------------------------------------------------------- logging
-
-proc logLine(level, msg: string) =
-  ## Appended, never buffered. A host that crashes the game is a host whose log
-  ## must survive the crash, so each line is opened, written and closed.
-  let stamp = $int(cNowMs() - gStartMs)
-  let text = "[" & stamp & "ms] " & level & "  " & msg & "\n"
-  var f: File
-  if open(f, gLogPath, fmAppend):
-    try:
-      write(f, text)
-    finally:
-      close(f)
-
-proc info(msg: string) = logLine("info ", msg)
-proc warn(msg: string) = logLine("warn ", msg)
-proc fail(msg: string) = logLine("error", msg)
-proc okLog(msg: string) = logLine("ok   ", msg)
-
-# --------------------------------------------------------------- helpers
-
-proc readBytes(p: Il2CppPtr; len: int32): string =
-  result = ""
-  if p == nil or len <= 0'i32:
-    return
-  for i in 0 ..< int(len):
-    result.add char(cByteAt(p, uint64(i)))
-
-proc ownDirectory(): string =
-  var buf = newSeq[byte](32768)
-  let n = cModulePath(cast[Il2CppPtr](addr buf[0]), 32767'i32)
-  if n <= 0'i32:
-    return ""
-  var path = ""
-  for i in 0 ..< int(n):
-    path.add char(buf[i])
-  result = parentOf(path)
+# ------------------------------------------------------- logging, helpers
+#
+# `info`/`warn`/`fail`/`okLog`, the clock they stamp with, `readBytes` and
+# `ownDirectory` all come from `modhost` now. One log file, one line format,
+# one `openLog`, opened by `hostMain` with this host's banner.
+#
+# `modhost.readBytes` is a single `copyMem` where this file's copy walked the
+# buffer through `aowl_byte_at` one byte at a time. That is how every string
+# argument crosses the ABI on this side, patch arguments included, so the
+# cheaper one is the one worth keeping.
 
 # --------------------------------------------------------------- host API
 #
@@ -423,13 +603,28 @@ proc hostConfigGet(ctx: Il2CppPtr; key: Il2CppPtr; keyLen: int32;
   # documented it as the behaviour all along.
   # Which mod is asking is carried in `ctx`, which is its index.
   let idx = int(cast[uint](ctx))
-  if idx < 0 or idx >= gMods.len:
+  if idx < 0 or idx >= modhost.modCount():
     gLastError = "no such mod context"
     return ErrBadArg
+  # Through `modhost.configRead`, which is where the backend and the simulator
+  # now read it too. This host answered `ErrNotFound` for a `config.json` that
+  # did not parse -- the same status as "no such setting" -- so a client mod
+  # with a BOM'd or half-written config was told its settings were absent and
+  # ran the raid on defaults. `ErrConfigParse` is the answer now, and the
+  # message names the file and the fault rather than the key.
   var text = ""
-  if not readTextFile(joinPath(gMods[idx].dir, "config.json"), text):
-    gLastError = "no config.json for " & gMods[idx].guid
-    return ErrNotFound
+  var cfgErr = ""
+  let cfgSt = modhost.configRead(idx, text, cfgErr)
+  if cfgSt != StatusOk:
+    gLastError = cfgErr
+    # The whole document comes back even unparsed -- see the backend's copy of
+    # this for why. A mod must be able to tell "broken" from "absent", and the
+    # bytes are half of how it does that.
+    if cfgSt == ErrConfigParse and k.len == 0 and text.len > 0:
+      var raw = text
+      discard cOutCopy(outPtr, outLen, cast[Il2CppPtr](toCString(raw)),
+                       int32(raw.len))
+    return cfgSt
   # A dotted-path lookup, and the same one the backend uses. This was a
   # substring search for `"key"`, which matches inside `"MaxHealth"` when asked
   # for `Health`, matches inside any string value containing it, and could not
@@ -478,7 +673,97 @@ proc hostRouteRegister(ctx: Il2CppPtr; url: Il2CppPtr; urlLen: int32;
 
 proc hostNowMs(ctx: Il2CppPtr): int64 {.
     exportc: "aowlspt_nim_now_ms", cdecl.} =
-  result = int64(cNowMs() - gStartMs)
+  result = modhost.elapsedMs()
+
+proc freeHandleCount(): int = gHandleFree.len - gHandleFreeHead
+
+# The handle table's internals -- `pushFreeHandle`, `takeHandleSlot`,
+# `trimHandles`, `newHandle`, `handleTarget` -- assume the lock is already
+# held, and the entry points below take it. Nothing here takes it twice on
+# purpose; a critical section is re-entrant on the same thread, so a nesting
+# that slips through is harmless rather than a hang, but the discipline is
+# "lock at the door".
+
+proc pushFreeHandle(idx: int) =
+  ## A slot that has just been emptied. Compacted here rather than on the way
+  ## out: a run that releases millions of handles would otherwise grow this
+  ## queue by one entry per release even though it never holds more than a
+  ## handful at a time.
+  if gHandleFreeHead >= 64:
+    var kept: seq[int32] = @[]
+    for i in gHandleFreeHead ..< gHandleFree.len:
+      kept.add gHandleFree[i]
+    gHandleFree = kept
+    gHandleFreeHead = 0
+  gHandleFree.add int32(idx)
+
+proc takeHandleSlot(): int =
+  ## The oldest freed slot that is still empty, or -1 to append.
+  ##
+  ## Nothing is handed out while a patch handler is running. `fireHandler`
+  ## reclaims everything between the marks it took on the way in, so a slot
+  ## handed to the handler from inside that range would be freed underneath the
+  ## mod that had just been given it. Appending there is free anyway: those
+  ## handles are given back when the handler returns.
+  result = -1
+  if gPatchDepth > 0:
+    return
+  while gHandleFreeHead < gHandleFree.len:
+    let i = int(gHandleFree[gHandleFreeHead])
+    inc gHandleFreeHead
+    # Stale entries: `fireHandler` shrinks the table, so a queued index may be
+    # off the end of it, and a slot may have been refilled by the append path.
+    if i >= 0 and i < gHandles.len and not gHandleIsObject[i] and
+       gHandles[i] == nil and gHandleGc[i] == 0'u32:
+      return i
+
+proc trimHandles() =
+  ## Drops empty slots off the end of the table.
+  ##
+  ## The free list keeps the table from growing when a slot is released and
+  ## another is taken, but it cannot answer the other half: `describeResult`,
+  ## `describeArgs` and `readField` in `invoke.nim` **append**, because they are
+  ## handed the three sequences and not this file's bookkeeping. Every call that
+  ## returns an object and every firing that describes one therefore extends the
+  ## table by a slot that the free list can only fill later, and a run that does
+  ## nothing but call and release grew it by one per call for the session.
+  ##
+  ## So the tail is trimmed instead, which costs a loop over trailing empties
+  ## and leaves the table the size of the most handles held at once rather than
+  ## the number ever taken. Only at depth zero: inside a patch handler the
+  ## firing's own handles sit at the top and `fireHandler` is about to reclaim
+  ## them by index.
+  if gPatchDepth > 0:
+    return
+  var n = gHandles.len
+  while n > 0 and not gHandleIsObject[n - 1] and gHandles[n - 1] == nil and
+        gHandleGc[n - 1] == 0'u32:
+    dec n
+  if n < gHandles.len:
+    shrink(gHandles, n)
+    shrink(gHandleIsObject, n)
+    shrink(gHandleGc, n)
+
+proc newHandle(target: Il2CppPtr; isObject: bool; gc: uint32): uint64 =
+  ## One handle, into a reclaimed slot where there is one. The number a mod
+  ## sees is the index plus one, exactly as it always was.
+  ##
+  ## The door for every *append*, and therefore the one that has to hold the
+  ## lock: `resolve` on a mod's worker thread and a release on another are the
+  ## pair that reallocates this table under a reader.
+  tablesLock()
+  let slot = takeHandleSlot()
+  if slot >= 0:
+    gHandles[slot] = target
+    gHandleIsObject[slot] = isObject
+    gHandleGc[slot] = gc
+    result = uint64(slot + 1)
+  else:
+    gHandles.add target
+    gHandleIsObject.add isObject
+    gHandleGc.add gc
+    result = uint64(gHandles.len)
+  tablesUnlock()
 
 proc handleTarget(idx: int): Il2CppPtr =
   ## What a handle points at *now*.
@@ -500,19 +785,164 @@ proc liveHandles(): seq[Il2CppPtr] =
   ## A snapshot for `bindArgs`, which takes a plain sequence. Rebuilt per call
   ## rather than kept: handles are counted in tens and correctness here is worth
   ## more than the copy.
+  ##
+  ## Under the lock, and a *copy* rather than a view, which is what makes the
+  ## caller safe: `bindArgs` runs outside the lock and would otherwise be
+  ## indexing a table another thread can reallocate underneath it.
   result = @[]
+  tablesLock()
   for i in 0 ..< gHandles.len:
     result.add handleTarget(i)
+  tablesUnlock()
 
 proc hostHandleRelease(ctx: Il2CppPtr; handle: uint64) {.
     exportc: "aowlspt_nim_handle_release", cdecl.} =
+  ## Called from whichever thread the mod is on, which is the whole reason this
+  ## takes the lock: releasing a handle empties a slot and queues it, and a
+  ## release racing a `resolve` on another thread is two writers on one table.
+  tablesLock()
   let idx = int(handle) - 1
   if idx >= 0 and idx < gHandles.len:
+    let wasHeld = gHandleIsObject[idx] or gHandles[idx] != nil
     if gHandleIsObject[idx] and gHandleGc[idx] != 0'u32:
       gcHandleFree(gRt, gHandleGc[idx])
       gHandleGc[idx] = 0'u32
     gHandles[idx] = cast[Il2CppPtr](0)
     gHandleIsObject[idx] = false
+    # The slot goes back on the queue, so the table stays the size of what is
+    # actually held rather than the number of handles ever taken. Only when it
+    # held something: releasing the same handle twice must not queue it twice,
+    # which would hand the same slot out to two callers.
+    if wasHeld:
+      pushFreeHandle(idx)
+      trimHandles()
+  tablesUnlock()
+
+proc hostHandlePointer(ctx: Il2CppPtr; handle: uint64;
+                       outAddress: Il2CppPtr): int32 {.
+    exportc: "aowlspt_nim_handle_pointer", cdecl.} =
+  ## The address of the object a handle names, for a mod's own fast path.
+  ##
+  ## This is the whole of the bridge, and almost all of it is refusals -- which
+  ## is the point. A handle is safe *because* the host asks the GC handle every
+  ## time; an address is the thing that is not safe, and the only useful
+  ## guarantee to add is that a bad one is never produced in the first place.
+  ##
+  ## So: the address is read afresh from the GC handle on every call (never
+  ## cached -- the collector moves objects and a cache would be exactly the bug
+  ## this exists to avoid), a type handle is refused rather than answered with a
+  ## class pointer, a released or collected handle is refused, and a handle
+  ## belonging to a patch firing that has already returned is refused. The last
+  ## one is the one a mod will actually hit: `this` is reclaimed by `patchFired`
+  ## when the handler returns, so asking afterwards answers `ErrDisposed`
+  ## instead of the address the object used to be at.
+  var zero = 0'u64
+  copyMem(outAddress, cast[Il2CppPtr](addr zero), 8)
+  if not gReady:
+    gLastError = "the IL2CPP runtime is not up yet"
+    return ErrUnsupported
+  let idx = int(handle) - 1
+  if idx < 0:
+    gLastError = "no such handle: " & $int(handle)
+    return ErrNotFound
+
+  # Every fact about the table is taken in one go, under the lock, and the
+  # refusals below are decided from the copies. Reading the table a field at a
+  # time across six branches would be six chances for another thread to move it
+  # -- and the answer this returns is an *address*, which is the one thing here
+  # it is not acceptable to be wrong about.
+  tablesLock()
+  let tableLen = gHandles.len
+  let inRange = idx < tableLen
+  let isObject = inRange and gHandleIsObject[idx]
+  let raw = (if inRange: gHandles[idx] else: cast[Il2CppPtr](0))
+  let target = (if isObject: handleTarget(idx) else: cast[Il2CppPtr](0))
+  let patchMark = gPatchHandleMark
+  let patchTop = gPatchHandleTop
+  tablesUnlock()
+  # The refusal a mod will actually meet, and it comes first because it is the
+  # only one whose right answer is a sentence rather than a code. A handle that
+  # a patch firing took out and no longer holds is either off the end of the
+  # table (the usual case -- the firing shrank it back) or an emptied slot; both
+  # mean the same thing, and "no such handle" would send the reader looking for
+  # a bug in their bookkeeping instead of at the lifetime.
+  if idx >= patchMark and idx < patchTop and not isObject:
+    gLastError = "handle " & $int(handle) &
+                 " was a patch argument and its handler has returned; the " &
+                 "host reclaimed it there. An address taken in a hook is good " &
+                 "for the length of that hook -- read what you need inside it, " &
+                 "or `pinHandle` the object if you must keep it."
+    return ErrDisposed
+  if not inRange:
+    gLastError = "no such handle: " & $int(handle)
+    return ErrNotFound
+  if not isObject:
+    # A slot holding a class pointer is a handle from `resolve`; an empty one is
+    # a handle that has been released. Different mistakes, different sentences.
+    if raw != nil:
+      gLastError = "handle " & $int(handle) &
+                   " names a type, not a live object; there is no instance " &
+                   "address for it. A handle from `resolve` is for `call` and " &
+                   "for naming a class, not for the fast path."
+      return ErrBadArg
+    gLastError = "handle " & $int(handle) & " has already been released"
+    return ErrDisposed
+  let p = target
+  if p == nil:
+    gLastError = "handle " & $int(handle) &
+                 " refers to an object the game has collected or that has " &
+                 "already been released"
+    return ErrDisposed
+  var v = uint64(cast[uint](p))
+  copyMem(outAddress, cast[Il2CppPtr](addr v), 8)
+  result = StatusOk
+
+proc hostHandlePin(ctx: Il2CppPtr; handle: uint64;
+                   outHandle: Il2CppPtr): int32 {.
+    exportc: "aowlspt_nim_handle_pin", cdecl.} =
+  ## A second handle over the same object, this one **pinned**.
+  ##
+  ## A pinned object does not move, so the address behind a pinned handle stays
+  ## correct across frames -- which is the only way a mod can honestly keep one.
+  ## It is a separate handle rather than a mode on the existing one because the
+  ## lifetimes differ: the original may be a patch argument the host reclaims in
+  ## a moment, and the pin is the mod's, released when the mod says so.
+  ##
+  ## The cost is real and it is why this is not the default. The collector must
+  ## work around that address for as long as the pin lives, and a mod that pins
+  ## per hook rather than per session would pin at frame rate. `handle_release`
+  ## on the pinned handle is what ends it.
+  var zero = 0'u64
+  copyMem(outHandle, cast[Il2CppPtr](addr zero), 8)
+  if not gReady:
+    gLastError = "the IL2CPP runtime is not up yet"
+    return ErrUnsupported
+  let idx = int(handle) - 1
+  # As in `handle_pointer`: one look at the table, and the branches decided
+  # from the copies.
+  tablesLock()
+  let inRange = idx >= 0 and idx < gHandles.len
+  let isObject = inRange and gHandleIsObject[idx]
+  let p = (if isObject: handleTarget(idx) else: cast[Il2CppPtr](0))
+  tablesUnlock()
+  if not inRange:
+    gLastError = "no such handle: " & $int(handle)
+    return ErrNotFound
+  if not isObject:
+    gLastError = "handle " & $int(handle) & " names a type, not a live object"
+    return ErrBadArg
+  if p == nil:
+    gLastError = "handle " & $int(handle) &
+                 " refers to an object the game has collected"
+    return ErrDisposed
+  let gc = gcHandleNew(gRt, p, true)
+  if gc == 0'u32:
+    gLastError = "the runtime would not give a pinned handle for handle " &
+                 $int(handle)
+    return ErrGeneric
+  var v = newHandle(cast[Il2CppPtr](0), true, gc)
+  copyMem(outHandle, cast[Il2CppPtr](addr v), 8)
+  result = StatusOk
 
 proc hostResolve(ctx: Il2CppPtr; typeName: Il2CppPtr; nameLen: int32;
                  outHandle: Il2CppPtr): int32 {.
@@ -530,10 +960,7 @@ proc hostResolve(ctx: Il2CppPtr; typeName: Il2CppPtr; nameLen: int32;
   if c == nil:
     gLastError = "no such type: " & name
     return ErrNotFound
-  gHandles.add c
-  gHandleIsObject.add false
-  gHandleGc.add 0'u32
-  let h = uint64(gHandles.len)
+  let h = newHandle(c, false, 0'u32)
   # The out-parameter is a uint64*; write it as eight bytes.
   discard cOutCopy(cast[Il2CppPtr](0), cast[Il2CppPtr](0),
                    cast[Il2CppPtr](0), 0'i32)
@@ -555,8 +982,71 @@ proc mainThreadReport(): string =
            ",\"mainThreadId\":" & $int(cMqThread()) &
            ",\"hostThreadId\":" & $int(gHostThreadId) &
            ",\"frames\":" & $int(cMqFireCount()) &
+           ",\"perFrame\":" & (if gDrainPerFrame: "true" else: "false") &
            ",\"otherThreadFires\":" & $int(cMqAlienFires()) &
            ",\"stalled\":" & (if gDrainStalled: "true" else: "false") & "}"
+
+proc tableStatsReport(): string =
+  ## Every table this host keeps, by size, in one reply.
+  ##
+  ## `patch_stats` answers what the patch paths have *cost*; this answers what
+  ## the host is still *holding*. The two questions are different and only the
+  ## second one finds a leak: a counter that grows is the point of a counter,
+  ## whereas a table that grows with the number of cycles rather than with the
+  ## number of live things is a bug wherever it is.
+  ##
+  ## Read by `hostharness --churn`, which samples it every few hundred cycles
+  ## and fits a line through each figure. So every number here is a *size*, not
+  ## an event count, and each one has a shape it is supposed to have:
+  ##
+  ##   `patches`   bounded by the slot pool; `patchesLive` is how many are armed
+  ##   `hookUsed`  the engine's own live-slot count, which must agree
+  ##   `handles`   grows with handles a mod holds and must come back down
+  ##   `subs`, `pending`, `mods` -- `mods` is the one that grows by design, and
+  ##   the reason is `modIndexOf`: a context pointer is an index, so a dead slot
+  ##   is kept rather than compacted.
+  ##
+  ## `allocCount` is this binary's mimalloc block count -- cumulative, so
+  ## nothing lowers it. It is here rather than in `aowlspt/fast` on the mod side
+  ## because the allocator is per binary and the host's own is the one a mod
+  ## cannot see.
+  # Under the lock: this walks three tables that other threads write, and it is
+  # asked for by a mod -- so it is exactly the reader that used to see a table
+  # mid-move. It is also read by `hostharness --churn` between cycles, where a
+  # count that was off by one would be reported as a slope.
+  tablesLock()
+  var patchesLive = 0
+  for i in 0 ..< gPatches.len:
+    if gPatches[i].live: inc patchesLive
+  var handlesLive = 0
+  for i in 0 ..< gHandles.len:
+    if gHandleIsObject[i] or gHandles[i] != nil: inc handlesLive
+  let handleCount = gHandles.len
+  let patchCount = gPatches.len
+  let subCount = gSubs.len
+  let freeHandles = freeHandleCount()
+  tablesUnlock()
+  var modsLive = 0
+  for i in 0 ..< modhost.modCount():
+    if modhost.modIsLive(i): inc modsLive
+  result = "{\"patches\":" & $patchCount &
+           ",\"patchesLive\":" & $patchesLive &
+           ",\"hookUsed\":" & $int(cHookUsed()) &
+           ",\"hookFree\":" & $int(cHookFreeCount()) &
+           ",\"hookCapacity\":" & $int(cHookCapacity()) &
+           ",\"staleFires\":" & $int(cHookStaleFires()) &
+           ",\"handles\":" & $handleCount &
+           ",\"handlesLive\":" & $handlesLive &
+           ",\"handlesFree\":" & $freeHandles &
+           ",\"subs\":" & $subCount &
+           ",\"pending\":" & $int(cMqCount()) &
+           ",\"mods\":" & $modhost.modCount() &
+           ",\"modsLive\":" & $modsLive &
+           ",\"drainSlot\":" & $gDrainSlot &
+           ",\"drainStalled\":" & (if gDrainStalled: "true" else: "false") &
+           ",\"allocCount\":" & $allocationCount() &
+           ",\"allocBytes\":" & $allocatedBytes() &
+           ",\"allocLive\":" & $liveBytes() & "}"
 
 proc hostCall(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
               args: Il2CppPtr; argsLen: int32;
@@ -580,6 +1070,29 @@ proc hostCall(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
   # host thread, and no main thread was found" -- even with no runtime at all.
   # A dot in the type part keeps it clear of any real IL2CPP type, whose class
   # name never contains one.
+  # What the two patch paths have cost. Here rather than in a log line because
+  # the interesting assertion is a mod-side one -- fire a typed hook twenty
+  # thousand times and check that `payloadBytes` and `handlesTaken` did not
+  # move -- and a number a test can read is the only way to make
+  # "allocation-free" a measurement instead of a promise.
+  if spec == "aowlspt.host::patch_stats":
+    var report = "{\"fires\":" & $gPatchFires &
+                 ",\"typedFires\":" & $gTypedFires &
+                 ",\"payloadBytes\":" & $gPatchPayloadBytes &
+                 ",\"handlesTaken\":" & $gPatchHandlesTaken &
+                 ",\"typedTooDeep\":" & $gTypedTooDeep &
+                 ",\"frameDepth\":" & $int(cFrameDepthMax()) & "}"
+    return cOutCopy(outPtr, outLen, cast[Il2CppPtr](toCString(report)),
+                    int32(report.len))
+
+  # Every table this host holds, by size. `patch_stats` above says what the
+  # patch paths have cost; this says what is still held, which is the only one
+  # of the two a leak shows up in.
+  if spec == "aowlspt.host::table_stats":
+    var report = tableStatsReport()
+    return cOutCopy(outPtr, outLen, cast[Il2CppPtr](toCString(report)),
+                    int32(report.len))
+
   if spec == "aowlspt.host::main_thread":
     var report = mainThreadReport()
     return cOutCopy(outPtr, outLen, cast[Il2CppPtr](toCString(report)),
@@ -607,14 +1120,19 @@ proc hostCall(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
       else:
         gLastError = "malformed handle in: " & spec
         return ErrBadArg
-    if idx <= 0 or idx > gHandles.len:
-      gLastError = "no such handle: " & typePart
-      return ErrNotFound
     # A handle is either a type (from `resolve`) or a live object (from a call
     # that returned one). Both are reachable, and which one it is decides
-    # whether the invoke gets an instance.
-    let h = handleTarget(idx - 1)
-    if gHandleIsObject[idx - 1]:
+    # whether the invoke gets an instance. Both facts are taken together under
+    # the lock, because this runs on whatever thread the mod called from.
+    tablesLock()
+    let known = idx > 0 and idx <= gHandles.len
+    let h = (if known: handleTarget(idx - 1) else: cast[Il2CppPtr](0))
+    let objectHandle = known and gHandleIsObject[idx - 1]
+    tablesUnlock()
+    if not known:
+      gLastError = "no such handle: " & typePart
+      return ErrNotFound
+    if objectHandle:
       if h == nil:
         gLastError = "handle " & typePart &
                      " refers to an object the game has collected"
@@ -645,8 +1163,12 @@ proc hostCall(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
     let fieldName = member.substr(1)
     var fieldError = ""
     if values.len == 0:
+      # `readField` may register a handle for a reference field, so it appends
+      # to the table and has to do it under the lock.
+      tablesLock()
       let text = readField(gRt, cls, instance, fieldName, gHandles,
                            gHandleIsObject, gHandleGc, fieldError)
+      tablesUnlock()
       if fieldError.len > 0:
         gLastError = fieldError & " on " & typePart
         return ErrNotFound
@@ -692,12 +1214,92 @@ proc hostCall(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
     gLastError = "managed exception from " & spec
     return ErrGeneric
 
+  # And the same for the return: a method that returns an object costs a handle.
+  tablesLock()
   let text = describeResult(gRt, m, res, gHandles, gHandleIsObject, gHandleGc)
+  tablesUnlock()
   if text.len == 0:
     return StatusOk
   var t = text
   result = cOutCopy(outPtr, outLen, cast[Il2CppPtr](toCString(t)),
                     int32(t.len))
+
+proc modGuarded(index: int): bool =
+  ## Whether `index` names a row the unload counter can speak about at all.
+  ##
+  ## A context pointer *is* a mod index for a mod, and `loadMod` refuses past
+  ## `ModSlotLimit`, so every real mod is in range. But not every registration
+  ## in this host's tables comes from a mod: `hostharness` subscribes under
+  ## `0x7FFF` on purpose -- a number no mod table reaches, so that its own
+  ## subscriptions survive the mod churn it is there to measure -- and the
+  ## overlay and the host itself register under indices of their own.
+  ##
+  ## `modEnter` answers `false` for those, because its bounds check and its
+  ## draining check share one return value. Taken at face value that turns
+  ## "there is no library here to protect" into "skip this subscriber", which
+  ## is how the churn gate lost the reply to `aowlspt.host.mods.list`. So the
+  ## two cases are separated here: out of range means *not a mod*, and a
+  ## non-mod is delivered to without a reference because there is nothing that
+  ## could be unloaded out from under it.
+  ##
+  ## A constant rather than `modCount()` deliberately. The count moves on the
+  ## tick thread, and an index that tested in-range on the way in and out-of-
+  ## range on the way out would drop a `modLeave` and wedge that mod's unload
+  ## for good. `ModSlotLimit` cannot change, so the two ends always agree.
+  result = index >= 0 and index < modhost.ModSlotLimit
+
+proc deliverEvent(n, body: string; fromIndex: int): int =
+  ## One event to every subscriber but `fromIndex`. Factored out because the
+  ## **host** emits as well now: the mod-control replies come from here and
+  ## pass `-1`, which is not a mod index, so nobody is skipped.
+  ## The matching subscribers are taken out under the lock and called outside
+  ## it -- the same shape `drainDue` uses, and for the same reason: a subscriber
+  ## is a mod's code, it may take as long as it likes and may subscribe again
+  ## from inside itself, and holding the host's one lock across it would block
+  ## every other thread behind whatever it does. Delivering from a snapshot also
+  ## means a mod unloaded mid-delivery cannot shorten the list underneath this
+  ## loop.
+  ##
+  ## The snapshot is exactly what makes a reference necessary. Not shortening
+  ## the list is only half the problem: the other half is that these `cb`
+  ## pointers point *into the subscriber's library*, and the list they came from
+  ## is no longer the thing that keeps that library mapped. `dropModRegistrations`
+  ## empties `gSubs` and then `FreeLibrary` runs, and this loop is still holding
+  ## the copy. An emit reaches here on the game thread inside a patch while the
+  ## host's tick thread is in `modcontrol.drain`, so the two genuinely overlap.
+  ## `modhost.modEnter` is the count that unload can see; the ordering that makes
+  ## the pair correct is written down where they are.
+  ##
+  ## A subscriber that is draining is skipped rather than refused loudly -- an
+  ## event is a broadcast, and a mod on its way out is exactly a mod that no
+  ## longer wants to hear anything. That is the backend's rule for the same loop.
+  result = 0
+  var cbs: seq[Il2CppPtr] = @[]
+  var users: seq[Il2CppPtr] = @[]
+  var owners: seq[int] = @[]
+  tablesLock()
+  for i in 0 ..< gSubs.len:
+    if gSubs[i].name != n or gSubs[i].modIndex == fromIndex:
+      continue
+    cbs.add gSubs[i].cb
+    users.add gSubs[i].user
+    owners.add gSubs[i].modIndex
+  tablesUnlock()
+  for i in 0 ..< cbs.len:
+    let guard = modGuarded(owners[i])
+    if guard and not modhost.modEnter(owners[i]):
+      continue
+    var b = body
+    let st = cInvokeCallback(cbs[i], users[i],
+                             cast[Il2CppPtr](toCString(b)), int32(body.len))
+    if guard:
+      modhost.modLeave(owners[i])
+    if st != StatusOk:
+      warn "a subscriber to " & n & " returned " & $int(st)
+    inc result
+
+proc hostEmit(name, payload: string) =
+  discard deliverEvent(name, payload, -1)
 
 proc hostEventEmit(ctx: Il2CppPtr; name: Il2CppPtr; nameLen: int32;
                    payload: Il2CppPtr; payloadLen: int32): int32 {.
@@ -709,17 +1311,12 @@ proc hostEventEmit(ctx: Il2CppPtr; name: Il2CppPtr; nameLen: int32;
   let n = readBytes(name, nameLen)
   let body = readBytes(payload, payloadLen)
   let from1 = int(cast[uint](ctx))
-  var delivered = 0
-  for i in 0 ..< gSubs.len:
-    if gSubs[i].name != n or gSubs[i].modIndex == from1:
-      continue
-    var b = body
-    let st = cInvokeCallback(gSubs[i].cb, gSubs[i].user,
-                             cast[Il2CppPtr](toCString(b)), int32(body.len))
-    if st != StatusOk:
-      warn "a subscriber to " & n & " returned " & $int(st)
-    inc delivered
-  if delivered == 0:
+  # A mod-control request is recorded and performed from the host's own loop.
+  # Never from here: this stack is usually the game thread inside a patch, and
+  # for an unload it can run through the very mod being unloaded.
+  let control = modcontrol.submit(n, body)
+  let delivered = deliverEvent(n, body, from1)
+  if delivered == 0 and not control:
     info "event " & n & " (no subscribers)"
   result = StatusOk
 
@@ -764,9 +1361,47 @@ proc drainDue() =
       # The proof, and the reason it is an entry in the queue rather than a
       # log line at bind time: it went in from the host thread and comes out
       # here, so the thread it names is the thread a mod's callback would get.
-      okLog "invoke_main self-test ran on thread " & $int(cThreadId())
+      # Says where, and -- when nothing bound -- what that means. A mod author
+      # reading this log should not have to know that thread 21728 is the
+      # host's own to know the callback was not on Unity's.
+      if gDrainSlot < 0:
+        warn "invoke_main self-test ran on thread " & $int(cThreadId()) &
+             ", the host's own thread and not Unity's; a callback queued " &
+             "with invoke_main must not touch a Unity object"
+      else:
+        okLog "invoke_main self-test ran on thread " & $int(cThreadId())
     else:
-      discard cInvokeCallback(p.cb, p.user, cast[Il2CppPtr](0), 0'i32)
+      # A reference on the owning mod, held across the callback.
+      #
+      # This is the one dispatch in this host that genuinely races the unload,
+      # and it is worth being exact about why. The queue is emptied under the
+      # lock above and `dropModRegistrations` rebuilds it under the same lock,
+      # so a callback still in `gPending` when a mod is torn down is dropped
+      # correctly. What the lock cannot reach is the callback already lifted
+      # into `due`: `p.cb` is a function pointer into the mod's library and
+      # this loop runs on **Unity's main thread**, while `unloadOne` runs on the
+      # host's tick thread a few lines below `modcontrol.drain`. Between the
+      # `cMqUnlock` above and this call the tick thread is free to run the
+      # teardown and `FreeLibrary`, and then this is a jump into unmapped
+      # memory on the game's own thread.
+      #
+      # `runPending` reaches the same loop from the tick thread, where the
+      # unload cannot be concurrent -- the guard is simply uncontended there.
+      #
+      # The pair costs about 11 ns uncontended. This runs once per due callback
+      # rather than once per frame: `mainDrain` returns inside `cMqEnter` when
+      # the queue is empty, so a frame with nothing due never reaches here, and
+      # a frame with something due is already paying for a call into a mod.
+      # A `selfTest` entry is the host's own and has no mod behind it, and
+      # `modGuarded` covers the other non-mod queuers -- the harness queues
+      # through `invoke_main` and `schedule` under `0x7FFF` exactly as it
+      # subscribes under it, and dropping those callbacks would silently gut
+      # the churn gate's timer arm rather than fail it.
+      let guard = modGuarded(p.modIndex)
+      if not guard or modhost.modEnter(p.modIndex):
+        discard cInvokeCallback(p.cb, p.user, cast[Il2CppPtr](0), 0'i32)
+        if guard:
+          modhost.modLeave(p.modIndex)
 
 proc mainDrain() =
   ## The per-frame drain, called from inside a method Unity runs on its main
@@ -775,6 +1410,144 @@ proc mainDrain() =
   if cMqEnter() == 0'i32:
     return
   drainDue()
+
+proc fireHandler(i: int; payload: string; handleMark, handleTop: int;
+                 replacement: var string): int32 =
+  ## Hands one payload to a mod's patch handler and cleans up after it.
+  ##
+  ## Shared by the prefix and the postfix paths because everything except *when*
+  ## it happens is the same: the same trampoline into the mod, the same
+  ## owned-buffer rule for a replacement, and above all the same handle
+  ## lifetime. Every reference in the payload cost a GC handle, and they are all
+  ## given back here -- a handler on a per-frame method that was expected to
+  ## release them itself would pin objects at frame rate, which is a trap rather
+  ## than a contract.
+  ##
+  ## The table is only shortened when nothing else was added to it while the
+  ## handler ran: a handler that called `resolve`, or a method that returned an
+  ## object, got handles of its own with higher indices and those are its to
+  ## keep. In that case the slots are emptied in place, so nothing is freed
+  ## twice and no live handle is renumbered.
+  replacement = ""
+
+  # While the handler runs, these two say which handles it may take an address
+  # for; afterwards they say which ones it may not. Saved and restored rather
+  # than assigned, because a handler is free to call something the host has
+  # patched, and an inner firing's cleanup must not close the outer one's scope.
+  let prevMark = gPatchHandleMark
+  let prevTop = gPatchHandleTop
+  gPatchHandleMark = handleMark
+  gPatchHandleTop = handleTop
+  inc gPatchDepth
+
+  var outPtr: Il2CppPtr = cast[Il2CppPtr](0)
+  var outLen = 0'i32
+  var a = payload
+  let st = cInvokePatchArgs(gPatches[i].cb, gPatches[i].user,
+                            cast[Il2CppPtr](addr gPatches[i].targetC[0]),
+                            int32(gPatches[i].targetC.len - 1),
+                            (if payload.len > 0: cast[Il2CppPtr](toCString(a))
+                             else: cast[Il2CppPtr](0)),
+                            int32(payload.len),
+                            cast[Il2CppPtr](addr outPtr),
+                            cast[Il2CppPtr](addr outLen))
+  dec gPatchDepth
+
+  if outPtr != nil and outLen > 0'i32:
+    replacement = readBytes(outPtr, outLen)
+  if outPtr != nil:
+    cFreeBuf(outPtr)
+
+  # The reclaim, under the lock and *after* the mod has returned -- never
+  # around the call itself. A handler is a mod's code: it may take as long as
+  # it likes, it may call `resolve` on this thread (which re-enters the lock
+  # harmlessly) or start a thread that does (which would block behind it for
+  # as long as the handler ran).
+  if handleTop > handleMark:
+    tablesLock()
+    for k in handleMark ..< handleTop:
+      if gHandleIsObject[k] and gHandleGc[k] != 0'u32:
+        gcHandleFree(gRt, gHandleGc[k])
+      gHandleGc[k] = 0'u32
+      gHandles[k] = cast[Il2CppPtr](0)
+      gHandleIsObject[k] = false
+    if gHandles.len == handleTop:
+      shrink(gHandles, handleMark)
+      shrink(gHandleIsObject, handleMark)
+      shrink(gHandleGc, handleMark)
+    else:
+      # The handler took handles of its own, so the table cannot be shortened
+      # without renumbering them. The firing's own slots are emptied in place
+      # above and queued here, which is what stops a handler that calls
+      # `resolve` from leaving a hole per firing.
+      for k in handleMark ..< handleTop:
+        pushFreeHandle(k)
+    if gPatchDepth == 0:
+      trimHandles()
+    tablesUnlock()
+
+  if gPatchDepth > 0:
+    # Nested: the outer firing's handles are live again and its scope is the
+    # one `handle_pointer` should be judging against.
+    gPatchHandleMark = prevMark
+    gPatchHandleTop = prevTop
+  # Otherwise the range stays as it is, dead, so that a mod asking for one of
+  # these afterwards is told what it did rather than "no such handle".
+  result = st
+
+proc typedFire(i: int; regs: Il2CppPtr; postfix: bool): int32 =
+  ## One firing of a typed patch: arm a pooled frame over the registers the
+  ## thunk already saved, call the mod, disarm.
+  ##
+  ## Compare it with `fireHandler` above, which is the JSON path: that one builds
+  ## a string describing the arguments, registers a GC handle for every reference
+  ## in it, hands the string across the ABI where the mod copies it into its own
+  ## heap and parses it, takes a host-allocated buffer back, and gives every
+  ## handle up again. This one stores six words and calls.
+  ##
+  ## Nothing here touches `gPatchPayloadBytes` or `gPatchHandlesTaken`, and that
+  ## is the point: `call("aowlspt.host::patch_stats")` reports both, so a test
+  ## can fire a typed hook twenty thousand times and assert that neither moved.
+  ##
+  ## `gPatchDepth` is raised around the call for the same reason `fireHandler`
+  ## raises it -- a handler may itself call something this host has patched --
+  ## and it is also what picks the frame out of the pool, so a nested firing
+  ## cannot overwrite the outer one's view of the registers.
+  if gPatchDepth >= int(cFrameDepthMax()):
+    # Deeper than the pool. Letting the original run is the only safe answer:
+    # reusing a live frame would hand the inner handler the outer firing's
+    # registers, which is a plausible set of arguments rather than an error.
+    gTypedTooDeep = gTypedTooDeep + 1
+    return 0'i32
+  let f = cFrameSlot(int32(gPatchDepth))
+  if f == nil:
+    gTypedTooDeep = gTypedTooDeep + 1
+    return 0'i32
+  var flags = gPatches[i].frameFlags
+  if postfix: flags = flags or FrameFlagPostfix
+  var selfPtr = 0'u64
+  if (flags and FrameFlagStatic) == 0'u32:
+    selfPtr = cRegsInt(regs, 0'i32)
+  # `addr` of element zero rather than the seq itself: the frame points at the
+  # bytes, and the array was built at registration and is never rewritten.
+  let kinds = (if gPatches[i].kinds.len > 0:
+                 cast[Il2CppPtr](addr gPatches[i].kinds[0])
+               else: cast[Il2CppPtr](0))
+  cFrameArm(f, regs, kinds, int32(gPatches[i].kinds.len),
+            int32(gPatches[i].retKind), flags, selfPtr)
+  inc gPatchDepth
+  gTypedFires = gTypedFires + 1
+  let st = cInvokeTypedPatch(gPatches[i].cb, gPatches[i].user, f)
+  dec gPatchDepth
+  # Before anything else can return. A mod that stored the frame reads a cleared
+  # one from here on, and every accessor in `aowlspt_frame.h` refuses it by name
+  # rather than answering with the registers of whatever fired next.
+  cFrameDisarm(f)
+  # No `applyPatchReturn` and no `canSkip` gate. The mod wrote the replacement
+  # itself, through a setter that checked it against the declared return kind
+  # and answered whether it had written -- so by the time a skip reaches here the
+  # value in the frame is of the right shape or the mod chose not to claim one.
+  result = (if st == PatchSkipStatus: 1'i32 else: 0'i32)
 
 proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     exportc: "aowlspt_nim_patch_fired", cdecl.} =
@@ -799,6 +1572,15 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     return 0'i32
   if not gPatches[i].live:
     return 0'i32
+  if gPatches[i].isPostfix:
+    # A postfix does its work in `patchReturned`, and the thunk branches on the
+    # engine's own table before it gets here, so this is unreachable while the
+    # two agree. It is checked anyway: if they ever disagreed, running a postfix
+    # handler as a prefix would hand it a `result` from the previous call.
+    return 0'i32
+  gPatchFires = gPatchFires + 1
+  if gPatches[i].typed:
+    return typedFire(i, regs, false)
 
   var argsText = ""
   # Where the handle table stood before the arguments were described, so the
@@ -807,50 +1589,25 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
   # pin one object per call -- on a method the game runs per frame per bot,
   # that is a leak measured in objects per second. Expecting a mod to remember
   # on that path is not a contract, it is a trap.
+  # The one place the firing path touches a shared table, and the one place it
+  # takes the lock. `describeArgs` registers a GC handle per reference argument
+  # and appends each to the table, which a mod's worker thread may be appending
+  # to at the same moment. It is affordable *here* and nowhere else on this
+  # path: the JSON hook already costs some 625 ns a firing, so a critical
+  # section is a percent or two of it, where on the typed path -- 23 ns, and no
+  # handles at all -- it would be most of the cost.
+  tablesLock()
   let handleMark = gHandles.len
   if gPatches[i].wantArgs and gPatches[i].meth != nil:
     argsText = describeArgs(gRt, gPatches[i].meth, regs,
                             gHandles, gHandleIsObject, gHandleGc)
   let handleTop = gHandles.len
-
-  var outPtr: Il2CppPtr = cast[Il2CppPtr](0)
-  var outLen = 0'i32
-  var a = argsText
-  let st = cInvokePatchArgs(gPatches[i].cb, gPatches[i].user,
-                            cast[Il2CppPtr](addr gPatches[i].targetC[0]),
-                            int32(gPatches[i].targetC.len - 1),
-                            (if argsText.len > 0: cast[Il2CppPtr](toCString(a))
-                             else: cast[Il2CppPtr](0)),
-                            int32(argsText.len),
-                            cast[Il2CppPtr](addr outPtr),
-                            cast[Il2CppPtr](addr outLen))
+  tablesUnlock()
+  gPatchPayloadBytes = gPatchPayloadBytes + int64(argsText.len)
+  gPatchHandlesTaken = gPatchHandlesTaken + int64(handleTop - handleMark)
 
   var replacement = ""
-  if outPtr != nil and outLen > 0'i32:
-    replacement = readBytes(outPtr, outLen)
-  if outPtr != nil:
-    cFreeBuf(outPtr)
-
-  # The handler has returned, so `this` and every reference argument it was
-  # given stop being valid here. Freeing the GC handles is what keeps a
-  # per-frame hook from pinning the world.
-  #
-  # The table is only shortened when nothing else was added to it while the
-  # handler ran: a handler that called `resolve` or a method returning an
-  # object got handles of its own with higher indices, and those are the
-  # handler's to keep. In that case the slots are emptied in place instead, so
-  # nothing is freed twice and no live handle is renumbered.
-  if handleTop > handleMark:
-    for k in handleMark ..< handleTop:
-      if gHandleIsObject[k] and gHandleGc[k] != 0'u32:
-        gcHandleFree(gRt, gHandleGc[k])
-      gHandleGc[k] = 0'u32
-      gHandles[k] = cast[Il2CppPtr](0)
-      gHandleIsObject[k] = false
-    if gHandles.len == handleTop:
-      shrink(gHandles, handleMark)
-      shrink(gHandleIsObject, handleMark)
-      shrink(gHandleGc, handleMark)
+  let st = fireHandler(i, argsText, handleMark, handleTop, replacement)
 
   if st != PatchSkipStatus:
     return 0'i32
@@ -866,10 +1623,95 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     return 0'i32
   result = 1'i32
 
-proc hostPatch(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
-               kind: int32; cb: Il2CppPtr; user: Il2CppPtr): int32 {.
-    exportc: "aowlspt_nim_patch", cdecl.} =
+proc patchReturned(slot: int32; regs: Il2CppPtr): int32 {.
+    exportc: "aowlspt_nim_patch_returned", cdecl.} =
+  ## The postfix half, called from the thunk **after** the original returned,
+  ## still on the game thread and still inside the patched call.
+  ##
+  ## `regs` holds the argument registers saved on entry, plus what the original
+  ## produced: RAX at `ret` and XMM0 at `retf`. Returns 0 to hand the caller
+  ## what the original produced and 1 to hand it what the handler wrote instead.
+  ##
+  ## The payload is the prefix payload with one member added:
+  ##
+  ##     {"this":{...},"args":[...],"result":6.0}
+  ##     {"result":6.0}                            -- no AOWLSPT_PATCH_ARGS
+  ##
+  ## `result` is always there, whether or not the patch asked for arguments: it
+  ## is one value read out of a register, it costs no GC handle unless the
+  ## method returns a reference, and it is the reason a postfix exists at all.
+  ## The arguments stay opt-in for the reason they always were -- building that
+  ## array inside a method the game runs thousands of times a frame is the
+  ## expensive half.
+  ##
+  ## The arguments reported are the **entry** values, because that is where they
+  ## still exist: the registers were saved on the way in and the original has
+  ## since had its way with everything else. Harmony's postfix has the same
+  ## property for by-value parameters and this host cannot do better.
+  let i = int(slot)
+  if i < 0 or i >= gPatches.len:
+    return 0'i32
+  if not gPatches[i].live:
+    return 0'i32
+  if gPatches[i].meth == nil:
+    return 0'i32
+  gPatchFires = gPatchFires + 1
+  if gPatches[i].typed:
+    return typedFire(i, regs, true)
+
+  # As on the prefix path: the whole of the table-touching part under the lock,
+  # and nothing else.
+  tablesLock()
+  let handleMark = gHandles.len
+  var payload = ""
+  # A reference return costs a GC handle exactly as a reference argument does,
+  # so the result is described inside the same mark/top bracket and reclaimed by
+  # the same cleanup.
+  let resultText = describeReturn(gRt, gPatches[i].meth, regs,
+                                  gHandles, gHandleIsObject, gHandleGc)
+  if gPatches[i].wantArgs:
+    let argsText = describeArgs(gRt, gPatches[i].meth, regs,
+                                gHandles, gHandleIsObject, gHandleGc)
+    # `describeArgs` ends in `}`; the result goes in beside `this` and `args`
+    # rather than wrapping them, so a handler reads one object either way and
+    # `"args"` still means the declared parameters and nothing else.
+    payload = argsText.substr(0, argsText.len - 2) & ",\"result\":" &
+              resultText & "}"
+  else:
+    payload = "{\"result\":" & resultText & "}"
+  let handleTop = gHandles.len
+  tablesUnlock()
+  gPatchPayloadBytes = gPatchPayloadBytes + int64(payload.len)
+  gPatchHandlesTaken = gPatchHandlesTaken + int64(handleTop - handleMark)
+
+  var replacement = ""
+  let st = fireHandler(i, payload, handleMark, handleTop, replacement)
+
+  if st != PatchSkipStatus:
+    return 0'i32
+  # No `canSkip` gate here, and that asymmetry is deliberate. A prefix skip from
+  # a patch that never asked for arguments is almost always a misregistration --
+  # the mod thinks it is suppressing and is not. A postfix replacement cannot be
+  # that mistake: the handler was handed the original's answer and returned a
+  # different one, which is unambiguous whichever way it registered.
+  if not applyPatchReturn(gRt, gPatches[i].meth, regs,
+                          (if replacement.len > 0: replacement else: "null")):
+    # The declared return type is one no value could be built for. The
+    # original's answer stands, which is the only safe way to be wrong here.
+    return 0'i32
+  result = 1'i32
+
+proc installPatch(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
+                  kind: int32; cb: Il2CppPtr; user: Il2CppPtr;
+                  typed: bool): int32 =
   ## Detours a compiled method, which is this side's answer to a Harmony patch.
+  ##
+  ## One body for both the JSON patch and the typed one, because everything
+  ## about *installing* a detour is the same: the same name split, the same
+  ## method lookup, the same code-pointer check, the same two postfix refusals,
+  ## the same slot bookkeeping. Only what happens when it fires differs, and
+  ## that is one field on `Patch`. Two copies of this would be two copies of the
+  ## slot-ordering argument below, and one of them would eventually be wrong.
   ##
   ## `kind` carries two things: the patch kind in its low bits, and
   ## `AOWLSPT_PATCH_ARGS` (0x10) to ask for the original arguments. Arguments
@@ -879,6 +1721,11 @@ proc hostPatch(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
   ##
   ## A patch that asked for arguments may also return `PatchSkip` with a
   ## replacement result, and the original will not run.
+  ##
+  ## A **postfix** runs the other way round: the thunk calls the original,
+  ## regains control, and hands the handler what it returned. Two method shapes
+  ## cannot carry one and are refused here rather than installed and quietly
+  ## useless -- see `postfixRefusal`.
   let spec = readBytes(target, targetLen)
   if cb == nil:
     gLastError = "patch needs a handler"
@@ -887,30 +1734,30 @@ proc hostPatch(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
     gLastError = "the IL2CPP runtime is not up yet"
     return ErrUnsupported
 
-  # `kind` low bits are the patch kind. Only a prefix can be honoured by an
-  # entry detour, and saying so is the point of this check.
+  # `kind` low bits are the patch kind.
   #
-  # A postfix has to see the value the original produced, which means regaining
-  # control *after* it runs. This engine's thunk tail-jumps into the
-  # trampoline -- that is what makes the original's return value, its stack
-  # arguments and its return address correct by construction rather than by
-  # luck -- and a tail jump never comes back. Wrapping the return would mean
-  # pushing a synthetic return address and a per-signature epilogue that knows
-  # whether the value is in RAX or XMM0, which is a different piece of work in
-  # a file this host does not own.
+  # A prefix and a postfix are two different thunk paths rather than two
+  # readings of one: a prefix tail-jumps into the trampoline, which is what
+  # makes the original's return value, its stack arguments and its return
+  # address correct by construction; a postfix has to *call* it and come back,
+  # and pays for that with the two refusals below. Neither is ever silently
+  # substituted for the other -- a postfix that behaved like a prefix would hand
+  # a mod scaling a getter's result a value the original had not produced yet,
+  # and the number it wrote would be wrong rather than absent.
   #
-  # So it is refused rather than silently downgraded. A postfix that behaves
-  # like a prefix does not merely do less: a mod scaling a getter's result
-  # would multiply a value the original had not produced yet, and the number it
-  # wrote would be wrong rather than absent.
-  if (kind and 0x0F'i32) == 1'i32:
-    gLastError = "a postfix patch is not available on this host: the detour " &
-                 "runs before the method and tail-jumps into it, so there is " &
-                 "no point at which it sees the return value. Use a prefix " &
-                 "that suppresses and returns its own result instead."
-    return ErrUnsupported
-  if (kind and 0x0F'i32) != 0'i32:
-    gLastError = "unsupported patch kind " & $int(kind and 0x0F'i32)
+  # A finalizer is still refused, and not for want of machinery: its whole
+  # contract is about the exception in flight, and an exception does not cross
+  # this ABI in any form the other side could act on. An unwind out of the
+  # original does not even reach the postfix path -- it skips the rest of the
+  # thunk by definition -- so there is nothing here to build it out of.
+  let patchKind = kind and 0x0F'i32
+  let isPostfix = patchKind == 1'i32
+  if patchKind != 0'i32 and not isPostfix:
+    gLastError = "unsupported patch kind " & $int(patchKind) &
+                 (if patchKind == 2'i32:
+                    "; a finalizer patch is not bridged, because a managed " &
+                    "exception cannot cross this ABI"
+                  else: "")
     return ErrUnsupported
 
   let sep = find(spec, "::")
@@ -937,48 +1784,129 @@ proc hostPatch(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
                  " (the method may not be compiled yet)"
     return ErrUnsupported
 
-  if gPatches.len >= int(cHookCapacity()):
-    gLastError = "no free patch slots (" & $int(cHookCapacity()) & " in use)"
+  # The two shapes a postfix cannot carry, checked against the method rather
+  # than against the patch kind alone: a value-type return wider than a
+  # register, which comes back through a buffer whose layout this host cannot
+  # read, and a compiled call with stack arguments, which a called original
+  # would look for in the thunk's frame. Both would install cleanly and be
+  # wrong at run time, which is why they are refused at registration with a
+  # sentence naming which one it was.
+  if isPostfix:
+    let refusal = postfixRefusal(gRt, m, spec)
+    if refusal.len > 0:
+      gLastError = refusal
+      return ErrUnsupported
+
+  # The slot comes from the engine, and it comes *first*.
+  #
+  # This used to be `gPatches.len` and a check afterwards that the engine had
+  # agreed. It agreed because both counters only ever went up -- and that was
+  # the bug rather than the invariant: removing a detour freed its trampoline
+  # and put the method's bytes back, but neither the engine's slot nor this
+  # table's row was ever spare again, so a mod switched off and on again spent
+  # a slot each time and the sixteenth cycle was the end of patching for the
+  # session. Now the engine hands out a reclaimed slot and this file writes the
+  # row at that index, which makes the two agree by construction rather than by
+  # a check that could only ever report the disagreement.
+  # From here to the end of this proc, under the lock.
+  #
+  # A mod may call `patch` from any thread it likes, and the host's own tick
+  # thread may be taking another mod's detours out at the same moment: the
+  # engine's free list, its generation table and this file's row for the slot
+  # are three structures that have to move together, and two threads claiming
+  # slots at once would interleave through all three. It is not on the firing
+  # path -- installing a detour happens at human rates -- so this is the cheap
+  # half of the bargain the block at the top of this file describes.
+  tablesLock()
+  let claimed = cHookClaim()
+  if claimed < 0'i32:
+    tablesUnlock()
+    gLastError = "no free patch slots (" & $int(cHookCapacity()) &
+                 " in use); every one of them belongs to a live patch"
     return ErrUnsupported
 
   let hook = cHookNew()
   if hook == nil:
+    cHookRelease(claimed)
+    tablesUnlock()
     gLastError = "out of memory"
     return ErrGeneric
 
-  # The slot is claimed before attaching: the thunk can fire the instant the
-  # hook lands, and it indexes `gPatches` by that slot.
   var targetBytes = newSeq[byte](spec.len + 1)
   for k in 0 ..< spec.len:
     targetBytes[k] = byte(spec[k])
   targetBytes[spec.len] = 0'u8
-  let wantArgs = (kind and 0x10'i32) != 0'i32
-  gPatches.add Patch(hook: hook, cb: cb, user: user, target: spec,
+  # `AOWLSPT_PATCH_ARGS` is not consulted for a typed patch, and a typed prefix
+  # may always suppress. Both because the flag exists to avoid a cost that does
+  # not arise here: the arguments are in the frame whether or not anybody reads
+  # them, so there is no "registered without arguments" state for a suppression
+  # to be a mistake about.
+  let wantArgs = (not typed) and (kind and 0x10'i32) != 0'i32
+  # The shapes, worked out once. This is the whole optimisation: `frameKinds`
+  # asks the runtime what every parameter is, here, at registration -- and the
+  # JSON path asks the same questions on every firing for an answer that cannot
+  # have changed.
+  let kinds = frameKinds(gRt, m)
+  let retKind = argKindOf(gRt, methodReturnType(gRt, m))
+  let frameFlags = (if methodIsStatic(gRt, m): FrameFlagStatic else: 0'u32)
+  # The row is written before the hook lands, never after, and at the slot the
+  # engine handed out. The table is grown with dead rows where it has to be:
+  # the engine may hand back slot 3 while this table is two rows long, and a
+  # row that is not there when the thunk fires is a firing that indexes past
+  # the end.
+  while gPatches.len <= int(claimed):
+    gPatches.add deadPatch()
+  gPatches[int(claimed)] = Patch(hook: hook, cb: cb, user: user, target: spec,
                      targetC: targetBytes, live: false, meth: m,
-                     wantArgs: wantArgs, canSkip: wantArgs,
-                     modIndex: int(cast[uint](ctx)), isDrain: false)
-  let slot = cHookAttach(hook, fn)
-  if slot < 0'i32:
-    shrink(gPatches, gPatches.len - 1)
+                     wantArgs: wantArgs, canSkip: wantArgs or typed,
+                     modIndex: int(cast[uint](ctx)), isDrain: false,
+                     isPostfix: isPostfix, typed: typed, kinds: kinds,
+                     retKind: retKind, frameFlags: frameFlags)
+  # Armed before the hook lands, never after. The thunk reads the engine's
+  # table on entry and the game can reach the patched method on the very next
+  # instruction, so a postfix armed a moment late would run its first firings as
+  # a prefix -- and a prefix handler that was written as a postfix reads a
+  # `result` that does not exist yet.
+  cHookSetPostfix(claimed, (if isPostfix: 1'i32 else: 0'i32))
+  let rc = cHookAttachAt(hook, fn, claimed)
+  if rc != 0'i32:
+    cHookSetPostfix(claimed, 0'i32)
+    gPatches[int(claimed)] = deadPatch()
     cHookFree(hook)
+    cHookRelease(claimed)
+    tablesUnlock()
     gLastError = "could not patch " & spec & ": " &
-                 readCString(cHookErrorText(slot))
+                 readCString(cHookErrorText(rc))
     return ErrGeneric
 
-  if int(slot) != gPatches.len - 1:
-    # The engine hands out slots in order and so does this; if they ever
-    # disagree the firing path would call the wrong mod.
-    warn "patch slot " & $int(slot) & " does not match index " &
-         $(gPatches.len - 1) & "; refusing to arm it"
-    discard cHookRemove(hook)
-    shrink(gPatches, gPatches.len - 1)
-    cHookFree(hook)
-    gLastError = "internal patch slot mismatch"
-    return ErrGeneric
-
+  let slot = claimed
   gPatches[int(slot)].live = true
-  okLog "patched " & spec & " (" & $int(cHookStolen(hook)) & " bytes)"
+  tablesUnlock()
+  okLog "patched " & spec & " (" & $int(cHookStolen(hook)) & " bytes" &
+        (if isPostfix: ", postfix" else: "") &
+        (if typed: ", typed" else: "") & ")"
   result = StatusOk
+
+proc hostPatch(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
+               kind: int32; cb: Il2CppPtr; user: Il2CppPtr): int32 {.
+    exportc: "aowlspt_nim_patch", cdecl.} =
+  ## `AowlHostApi.patch`: the handler is handed a JSON description of the
+  ## firing.
+  installPatch(ctx, target, targetLen, kind, cb, user, false)
+
+proc hostPatchTyped(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
+                    kind: int32; cb: Il2CppPtr; user: Il2CppPtr): int32 {.
+    exportc: "aowlspt_nim_patch_typed", cdecl.} =
+  ## `AowlHostApi.patch_typed` (ABI revision 4): the handler is handed a
+  ## borrowed view of the registers instead.
+  ##
+  ## A separate export rather than a flag on `hostPatch`, because `cb` is a
+  ## different function-pointer shape -- an `AowlTypedPatchFn` takes two
+  ## parameters where an `AowlPatchFn` takes four -- and the two are both
+  ## `void*` by the time they reach this file. Getting that wrong would be a
+  ## handler reading its frame out of a register nobody set, so the distinction
+  ## is made where the type still exists: in `aowlspt_live.h`, on the way in.
+  installPatch(ctx, target, targetLen, kind, cb, user, true)
 
 proc bindMainDrain(verbose: bool): bool =
   ## Detours a method Unity calls once per frame on its main thread, so that
@@ -1041,7 +1969,21 @@ proc bindMainDrain(verbose: bool): bool =
   candidates.add "UnityEngine.UI.CanvasUpdateRegistry::PerformUpdate"
   candidates.add "UnityEngine.Time::get_deltaTime"
 
+  # Whether each candidate runs once per frame, in the same order. The first
+  # three are the player loop calling a method it calls once; the last is a
+  # property anything may read, several times a frame, which is why it is the
+  # last resort. A mod is told this through `aowlspt.host::main_thread` so it
+  # can say "frames" only when that is what it is counting.
+  var perFrame: seq[bool] = @[]
+  perFrame.add true
+  perFrame.add true
+  perFrame.add true
+  perFrame.add false
+
+  var candidateIndex = -1
+
   for spec in candidates:
+    inc candidateIndex
     let sep = find(spec, "::")
     if sep < 0:
       continue
@@ -1063,42 +2005,54 @@ proc bindMainDrain(verbose: bool): bool =
       if verbose: info "no usable code pointer for " & spec
       continue
 
-    if gPatches.len >= int(cHookCapacity()):
+    # Same lock as `installPatch`, for the same reason: this claims a slot and
+    # writes its row, and a mod's `patch` on another thread does too. It is the
+    # host's own hook, and it is not exempt from the rule.
+    tablesLock()
+    let claimed = cHookClaim()
+    if claimed < 0'i32:
+      tablesUnlock()
       warn "no free patch slots for the main-thread drain"
       return false
     let hook = cHookNew()
     if hook == nil:
+      cHookRelease(claimed)
+      tablesUnlock()
       return false
 
     var targetBytes = newSeq[byte](spec.len + 1)
     for k in 0 ..< spec.len:
       targetBytes[k] = byte(spec[k])
     targetBytes[spec.len] = 0'u8
-    gPatches.add Patch(hook: hook, cb: cast[Il2CppPtr](0),
+    while gPatches.len <= int(claimed):
+      gPatches.add deadPatch()
+    gPatches[int(claimed)] = Patch(hook: hook, cb: cast[Il2CppPtr](0),
                        user: cast[Il2CppPtr](0), target: spec,
                        targetC: targetBytes, live: true, meth: m,
                        wantArgs: false, canSkip: false, modIndex: -1,
-                       isDrain: true)
-    let slot = cHookAttach(hook, fn)
-    if slot < 0'i32:
-      shrink(gPatches, gPatches.len - 1)
+                       isDrain: true, isPostfix: false, typed: false,
+                       kinds: @[], retKind: 0'u8, frameFlags: 0'u32)
+    let rc = cHookAttachAt(hook, fn, claimed)
+    if rc != 0'i32:
+      gPatches[int(claimed)] = deadPatch()
       cHookFree(hook)
+      cHookRelease(claimed)
+      tablesUnlock()
       if verbose:
         info "cannot drain from " & spec & ": " &
-             readCString(cHookErrorText(slot))
+             readCString(cHookErrorText(rc))
       continue
-    if int(slot) != gPatches.len - 1:
-      warn "drain slot " & $int(slot) & " does not match index " &
-           $(gPatches.len - 1) & "; refusing to arm it"
-      discard cHookRemove(hook)
-      shrink(gPatches, gPatches.len - 1)
-      cHookFree(hook)
-      return false
 
+    let slot = claimed
     gDrainSlot = int(slot)
+    tablesUnlock()
     gDrainMethod = spec
+    gDrainPerFrame = candidateIndex < perFrame.len and perFrame[candidateIndex]
     okLog "main-thread drain bound to " & spec & " (" &
-          $int(cHookStolen(hook)) & " bytes)"
+          $int(cHookStolen(hook)) & " bytes)" &
+          (if gDrainPerFrame: "" else:
+             "; it runs more than once a frame, so its firing count is not a " &
+             "frame count")
     return true
 
   result = false
@@ -1110,15 +2064,15 @@ proc hostEventSubscribe(ctx: Il2CppPtr; name: Il2CppPtr; nameLen: int32;
   if n.len == 0 or cb == nil:
     gLastError = "a subscription needs a name and a handler"
     return ErrBadArg
+  tablesLock()
   gSubs.add Sub(name: n, cb: cb, user: user, modIndex: int(cast[uint](ctx)))
+  tablesUnlock()
   okLog "subscribed to " & n
   result = StatusOk
 
 # --------------------------------------------------------------- store
 
-proc guidOf(idx: int): string =
-  if idx < 0 or idx >= gMods.len: return ""
-  result = gMods[idx].guid
+proc guidOf(idx: int): string = modhost.modGuidOf(idx)
 
 proc hostStoreGet(ctx: Il2CppPtr; key: Il2CppPtr; keyLen: int32;
                   outPtr, outLen: Il2CppPtr): int32 {.
@@ -1200,127 +2154,24 @@ proc hostSchedule(ctx: Il2CppPtr; delayMs: int32; cb: Il2CppPtr;
   result = StatusOk
 
 # --------------------------------------------------------------- mods
+#
+# The loader is `host/common/modhost.nim` and is shared with the backend:
+# discovery, the ABI version probe, `describe`/`init`/`on_load`, the mod table,
+# ticking, and taking one out again. This host used to carry a near-verbatim
+# copy of all of it. What is left here is the part that is genuinely this
+# host's: what a mod leaves behind in *this* process, and the one entry in the
+# host block only a host with a managed heap can fill.
 
-proc loadMod(path: string): bool =
-  ## Loads one mod library and brings it up: version probe, describe, init,
-  ## on_load. Each step that fails leaves the mod unloaded rather than
-  ## half-loaded, and says which step it was.
-  var m = LoadedMod(path: path, dir: parentOf(path),
-                    module: cast[Il2CppPtr](0), info: cast[Il2CppPtr](0),
-                    api: cast[Il2CppPtr](0), hostBlock: cast[Il2CppPtr](0),
-                    guid: "", name: "", author: "", version: "",
-                    hasUpdate: false, live: false)
-
-  var p = path
-  m.module = cLoadLibrary(toCString(p))
-  if m.module == nil:
-    fail "could not load " & path & " (error " & $int(cLastError()) & ")"
-    return false
-
-  var symVersion = "aowlspt_abi_version"
-  var symDescribe = "aowlspt_describe"
-  var symInit = "aowlspt_init"
-
-  let fnVersion = cGetProc(m.module, toCString(symVersion))
-  let fnDescribe = cGetProc(m.module, toCString(symDescribe))
-  let fnInit = cGetProc(m.module, toCString(symInit))
-
-  if fnVersion == nil or fnDescribe == nil or fnInit == nil:
-    fail baseName(path) & " does not export the aowlspt entry points"
-    cFreeLibrary(m.module)
-    return false
-
-  let theirs = cModAbiVersion(fnVersion)
-  let ours = cAbiVersionExpected()
-  if theirs != ours:
-    fail baseName(path) & " was built against ABI version " & $int(theirs) &
-         "; this host implements " & $int(ours)
-    cFreeLibrary(m.module)
-    return false
-
-  m.info = cModInfoNew()
-  if m.info == nil:
-    cFreeLibrary(m.module)
-    return false
-  if cModDescribe(fnDescribe, m.info) != StatusOk:
-    fail baseName(path) & ": describe failed"
-    cModInfoFree(m.info)
-    cFreeLibrary(m.module)
-    return false
-
-  m.guid = readBytes(cModInfoGuidPtr(m.info), cModInfoGuidLen(m.info))
-  m.name = readBytes(cModInfoNamePtr(m.info), cModInfoNameLen(m.info))
-  m.author = readBytes(cModInfoAuthorPtr(m.info), cModInfoAuthorLen(m.info))
-  m.version = readBytes(cModInfoVersionPtr(m.info), cModInfoVersionLen(m.info))
-
-  # A mod that does not claim the client side is skipped rather than run. The
-  # same binary ships to the server and the simulator, and running its server
-  # half in the game would be worse than not loading it.
-  let sides = cModInfoSides(m.info)
-  if (sides and (1'u32 shl 2'u32)) == 0'u32:
-    info m.name & " does not support the client side; skipping"
-    cModInfoFree(m.info)
-    cFreeLibrary(m.module)
-    return false
-
-  let index = gMods.len
-  var modDir = m.dir
-  var dataDir = joinPath(m.dir, "data")
-  var hostName = HostName
-  var hostVersion = HostVersion
-  var sptVersion = ""
-  var gameVersion = ""
-  m.hostBlock = cHostApiNew(cast[Il2CppPtr](uint(index)), SideClient,
-                            toCString(hostName), toCString(hostVersion),
-                            toCString(sptVersion), toCString(gameVersion),
-                            toCString(modDir), toCString(dataDir))
-  if m.hostBlock == nil:
-    cModInfoFree(m.info)
-    cFreeLibrary(m.module)
-    return false
-
-  m.api = cModApiNew()
-  if cModInit(fnInit, cHostApiPtr(m.hostBlock), m.api) != StatusOk:
-    fail m.name & ": init refused the host"
-    cModApiFree(m.api)
-    cHostApiFree(m.hostBlock)
-    cModInfoFree(m.info)
-    cFreeLibrary(m.module)
-    return false
-
-  m.hasUpdate = cModApiHasUpdate(m.api) != 0'i32
-  m.live = true
-  gMods.add m
-
-  if cModApiOnLoad(m.api) != StatusOk:
-    warn m.name & ": on_load returned an error; it stays loaded but may not work"
-
-  okLog "loaded " & m.name & " (" & m.guid & ") v" & m.version &
-        (if m.author.len > 0: " by " & m.author else: "")
-  result = true
-
-proc discoverMods(root: string): seq[string] =
-  ## `mods/<name>/<name>.dll`, plus any dll directly under `mods/`. Directory
-  ## per mod is the layout the deploy path produces and the one that lets a mod
-  ## carry its own config and data.
-  result = @[]
-  if not isDirectory(root):
-    return
-  var files: seq[string] = @[]
-  var dirs: seq[string] = @[]
-  collectEntries(root, files, dirs)
-  for f in files:
-    if not endsWith(toLowerAscii(f), ".dll"):
-      continue
-    # Only one level deep: a mod's own dependencies sit beside it and must not
-    # be probed as mods.
-    var depth = 0
-    for ch in f:
-      if ch == '\\':
-        inc depth
-    if depth > 1:
-      continue
-    result.add joinPath(root, f)
+proc armLive(hostBlock: Il2CppPtr) =
+  ## `modhost.setHostBlockArm` calls this once per mod, after
+  ## `aowl_hostapi_new` has built the block and before `aowlspt_init` is handed
+  ## it. See `cHostApiArmLive` above for why the shared builder cannot do it.
+  cHostApiArmLive(hostBlock)
+  # And revision 4, after it, so `size` only ever grows. Two calls rather than
+  # one because they are two capabilities: `handle_pointer` needs a managed heap
+  # and `patch_typed` needs the detour engine, and `size` is a statement about
+  # what was filled rather than about which header this was built from.
+  cHostApiArmTyped(hostBlock)
 
 proc dropModRegistrations(index: int) =
   ## Everything the mod at `index` left in this host, dropped before its library
@@ -1332,11 +2183,13 @@ proc dropModRegistrations(index: int) =
   ## so anything missed becomes a call into unmapped memory: a detour the game
   ## still jumps to, a subscriber an event still reaches, a timer that still
   ## comes due.
+  tablesLock()
   var kept: seq[Sub] = @[]
   for sub1 in gSubs:
     if sub1.modIndex != index:
       kept.add sub1
   gSubs = kept
+  tablesUnlock()
 
   # Under the lock, because the drain runs on the game thread and may be part
   # way through this same list while a mod is being unloaded.
@@ -1349,24 +2202,116 @@ proc dropModRegistrations(index: int) =
   cMqSetCount(int32(gPending.len))
   cMqUnlock()
 
+  # The detours, under the lock: this releases slots back to the engine while
+  # another thread may be claiming one, and it bumps each slot's generation --
+  # which is what makes a firing that is in flight right now get dropped rather
+  # than delivered to whoever takes the slot next. `okLog` is inside it and
+  # that is a file write under a lock; it happens once per removed detour, on
+  # an unload, and the alternative is collecting the names to print afterwards
+  # for no benefit anybody can measure.
+  tablesLock()
   for i in 0 ..< gPatches.len:
     if gPatches[i].live and gPatches[i].modIndex == index:
+      let what = gPatches[i].target
       gPatches[i].live = false
       discard cHookRemove(gPatches[i].hook)
+      # The engine's postfix table is indexed by slot and outlives the hook, so
+      # it is cleared here too. A slot left armed would send the next patch to
+      # take it down the postfix path with a prefix handler on the other end.
+      cHookSetPostfix(int32(i), 0'i32)
       cHookFree(gPatches[i].hook)
-      gPatches[i].hook = cast[Il2CppPtr](0)
-      okLog "removed the detour on " & gPatches[i].target
+      # And the slot itself, which is the whole point of a teardown that runs
+      # while the game is still going. Without this the pool was one-way: the
+      # method's bytes went back and the trampoline was freed, but the slot
+      # stayed spent, so sixteen mod toggles into a session `patch()` answered
+      # "no free patch slots" with every one of them holding nothing.
+      #
+      # The row is cleared to match. `cHookRelease` may hand this slot out
+      # again, and a stale row would put the old mod's handler pointer -- into
+      # a library that has been freed -- behind the new patch's number.
+      gPatches[i] = deadPatch()
+      cHookRelease(int32(i))
+      okLog "removed the detour on " & what
+  tablesUnlock()
+
+proc digitsIn(text: string): int =
+  ## The last run of digits in a string, as a number. Used on a url, where the
+  ## port is the only number that can appear after the host -- `127.0.0.1:6969`
+  ## gives 6969 rather than 127.
+  result = 0
+  var n = 0
+  var any = false
+  for ch in text:
+    if ch >= '0' and ch <= '9':
+      n = n * 10 + (ord(ch) - ord('0'))
+      any = true
+    else:
+      if any:
+        result = n
+      n = 0
+      any = false
+  if any:
+    result = n
 
 proc readBackendPort(): int =
-  ## The port the backend is on, out of `aowlspt-host.json` beside the host.
-  ## Zero means "do not try", and the overlay then shows what the host knows
-  ## rather than nothing at all.
+  ## The port the backend is on. Zero means "do not try", and the overlay then
+  ## shows what the host knows rather than nothing at all.
+  ##
+  ## Two places, in order. `aowlspt-host.json`'s `backendPort` is the player's
+  ## own setting and wins. Failing that, `backend.json` -- which the **installer**
+  ## writes, naming the backend it just installed. Without that second half the
+  ## shipped default (`backendPort: 0`) left the overlay and the in-game mod
+  ## manager switched off on every fresh install, next to a file that said
+  ## exactly where the backend was, and the only way to find out was to read the
+  ## documentation for a setting nobody knew they needed.
   result = 0
+  var text = ""
+  if readTextFile(joinPath(gDir, "aowlspt-host.json"), text):
+    var value = ""
+    if pathGet(text, "backendPort", value):
+      result = digitsIn(value)
+  if result > 0:
+    return
+  var cfg = ""
+  if readTextFile(joinPath(gDir, "backend.json"), cfg):
+    var url = ""
+    if pathGet(cfg, "backendUrl", url):
+      let port = digitsIn(url)
+      # A url with no port in it (`http://localhost/`) means the default HTTP
+      # port, which this backend never listens on; treating that as a port
+      # would have the host talk to something that is not it.
+      if port > 0 and port < 65536:
+        result = port
+
+proc removePatches() =
+  ## Every detour comes out before the host stops. Leaving one installed means
+  ## the game jumps into a DLL that may be gone.
+  tablesLock()
+  for i in 0 ..< gPatches.len:
+    if gPatches[i].live:
+      gPatches[i].live = false
+      discard cHookRemove(gPatches[i].hook)
+      cHookSetPostfix(int32(i), 0'i32)
+      cHookFree(gPatches[i].hook)
+      gPatches[i] = deadPatch()
+      cHookRelease(int32(i))
+  tablesUnlock()
+
+proc readSyncMs(): int =
+  ## How often to ask the backend which client-side mods should be running,
+  ## from `aowlspt-host.json`, key `modSyncMs`. Zero switches the whole thing
+  ## off and leaves this host doing exactly what it did before it existed.
+  ##
+  ## Three seconds by default. It is a control loop over loaded code, not a
+  ## display: the change it reacts to is a person clicking a switch, and the
+  ## difference between reacting in one second and in three is not worth a
+  ## request per second for the rest of the session.
+  result = 3000
   var text = ""
   if not readTextFile(joinPath(gDir, "aowlspt-host.json"), text):
     return
   var value = ""
-  if pathGet(text, "backendPort", value):
+  if pathGet(text, "modSyncMs", value):
     var n = 0
     var any = false
     for ch in value:
@@ -1375,29 +2320,60 @@ proc readBackendPort(): int =
         any = true
     if any: result = n
 
-proc removePatches() =
-  ## Every detour comes out before the host stops. Leaving one installed means
-  ## the game jumps into a DLL that may be gone.
-  for i in 0 ..< gPatches.len:
-    if gPatches[i].live:
-      gPatches[i].live = false
-      discard cHookRemove(gPatches[i].hook)
-      cHookFree(gPatches[i].hook)
-
 proc stopOverlay() =
   if overlayRunning():
     overlayStop()
 
-proc unloadMods() =
-  for i in 0 ..< gMods.len:
-    if not gMods[i].live:
-      continue
-    discard cModApiOnUnload(gMods[i].api)
-    cModApiFree(gMods[i].api)
-    cHostApiFree(gMods[i].hostBlock)
-    cModInfoFree(gMods[i].info)
-    cFreeLibrary(gMods[i].module)
-    gMods[i].live = false
+proc opsCount(): int = modhost.modCount()
+proc opsGuid(i: int): string = modhost.modGuidOf(i)
+proc opsName(i: int): string = modhost.modNameOf(i)
+proc opsVersion(i: int): string = modhost.modVersionOf(i)
+proc opsPath(i: int): string = modhost.modPathOf(i)
+proc opsLive(i: int): bool = modhost.modIsLive(i)
+proc opsFlags(i: int): uint32 = modhost.modFlagsOf(i)
+proc opsIndex(guid: string): int = modhost.modIndexOf(guid)
+
+proc opsCanUnload(ignored: int): bool = modhost.hasTeardown()
+  ## True here in every run that reached `hostMain`, which installs
+  ## `dropModRegistrations` before it loads anything. Asked of the loader
+  ## rather than answered `true` outright: the loader is what refuses an
+  ## unload without a teardown, and a capabilities reply that disagreed with it
+  ## would have the manager offer a switch that always answers "deferred".
+
+proc opsLoad(path: string): bool =
+  modhost.loadOne(path, modhost.SideClient, HostName, HostVersion)
+
+proc opsUnload(guid: string): string =
+  ## Empty on success; otherwise the sentence the manager shows.
+  ##
+  ## `modhost.unloadByGuid` runs the mod's `on_unload`, then the teardown
+  ## installed below -- which is where this host's detours, subscriptions and
+  ## queued callbacks go -- and only then frees the library. The slot is kept
+  ## rather than removed, because every context pointer handed to a mod is its
+  ## index and compacting would repoint the survivors at their neighbours.
+  var err = ""
+  if not modhost.unloadByGuid(guid, err):
+    return (if err.len > 0: err else: "the host refused to unload " & guid)
+  # The overlay's row, marked stopped rather than dropped. Read back out of the
+  # slot, which is still there: the loader keeps dead slots so that the context
+  # pointers it handed out stay pointing at the right mod, and a dead slot
+  # still carries what that mod said about itself.
+  for i in 0 ..< modhost.modCount():
+    if modhost.modGuidOf(i) == guid:
+      overlaySetMod(guid, modhost.modNameOf(i), modhost.modVersionOf(i), false)
+  result = ""
+
+proc opsLog(msg: string) = info msg
+
+proc startModControl() =
+  modcontrol.controlInit(HostName, HostVersion, modhost.SideClient,
+                         hostEmit,
+                         HostOps(count: opsCount, guidOf: opsGuid,
+                                 nameOf: opsName, versionOf: opsVersion,
+                                 pathOf: opsPath, liveOf: opsLive,
+                                 flagsOf: opsFlags, indexOf: opsIndex,
+                                 canUnload: opsCanUnload, load: opsLoad,
+                                 unload: opsUnload, log: opsLog))
 
 # --------------------------------------------------------------- runtime
 
@@ -1476,6 +2452,106 @@ proc reportRuntime() =
 
 # --------------------------------------------------------------- main
 
+## The last complaint written about the backend's mod set, so a server that is
+## answering the wrong thing says so once rather than once every three seconds.
+var gSyncError = ""
+
+## The route the mod-sync feed is polling, without the report on the end of it,
+## and how often. Empty when this host is not asking the backend anything.
+var gSyncBase = ""
+var gSyncMs = 0
+## The last path actually handed to the feed, so an unchanged report costs
+## nothing. `gReportSeq` starts at -1 rather than 0 because 0 is a real sequence
+## -- the one a host has before it has decided anything -- and starting equal to
+## it would suppress the first report this host ever makes.
+var gSyncPath = ""
+var gReportSeq = -1
+var gReportNextMs = 0'u64
+
+proc hex16(v: uint64): string =
+  const digits = "0123456789abcdef"
+  result = ""
+  var started = false
+  var shift = 60
+  while shift >= 0:
+    let nib = int((v shr uint64(shift)) and 0xF'u64)
+    if nib != 0 or started or shift == 0:
+      started = true
+      result.add digits[nib]
+    shift = shift - 4
+
+proc publishReport(now: uint64) =
+  ## Put what this host has actually done about the mods onto the end of the
+  ## path it is already polling.
+  ##
+  ## This is the return leg, and it is deliberately not a channel. The client
+  ## host has exactly one way to reach the backend -- the overlay's worker
+  ## thread, which exists for the panel -- and `aowl_ov_sync_start` can be
+  ## called again to change the path it fetches. So the report goes in the query
+  ## string of the next poll: no socket, no thread, no request that would not
+  ## have been made anyway, and nothing new that can fail. A push would have had
+  ## to choose a moment to reach a server that may be down, which is the one
+  ## property this side has spent the whole design refusing to depend on.
+  ##
+  ## Two reasons to rebuild, and only two:
+  ##
+  ##  * the report changed -- something was loaded, refused, or settled;
+  ##  * the last one did not fit, and the rest are waiting their turn.
+  ##
+  ## Both are rate-limited to the poll interval, because the path is read by the
+  ## worker once per poll and rewriting it faster changes nothing that anyone
+  ## reads.
+  if gSyncBase.len == 0:
+    return
+  let fresh = modcontrol.reportSeq() != gReportSeq
+  let rotate = modcontrol.reportPending() and now >= gReportNextMs
+  if not fresh and not rotate:
+    return
+  gReportSeq = modcontrol.reportSeq()
+  gReportNextMs = now + uint64(gSyncMs)
+  let path = modcontrol.reportPath(gSyncBase)
+  if path == gSyncPath:
+    return
+  gSyncPath = path
+  overlaySyncStart(path, int32(gSyncMs))
+  # Only when something actually changed. A stage with more mods than fit in one
+  # path rotates through them for the life of the process, and a line per
+  # rotation would be a log line every few seconds saying nothing new.
+  if fresh:
+    info "telling the backend what happened to its mods: " & path
+
+proc takeModSet() =
+  ## Read the newest answer the backend gave about which client-side mods
+  ## should be running, and queue whatever it takes to match it.
+  ##
+  ## Called from the host's own loop and nowhere else, immediately before
+  ## `modcontrol.drain` performs what it queued. Both halves of that matter:
+  ## the answer arrives on the overlay's worker thread and is only *read* here,
+  ## and the load or unload itself happens in the drain, on this thread, with
+  ## nothing but this host's own frames on the stack.
+  ##
+  ## Nothing at all happens on a poll that brought no answer, which is most of
+  ## them, and nothing at all happens on an answer that does not parse. That is
+  ## the whole safety argument: every failure of the far end -- down, starting,
+  ## restarting, serving a 404, serving a body too big for the buffer --
+  ## converges on "leave the mods alone", because the only thing that can move
+  ## a mod is a complete document that says so.
+  let doc = overlaySyncTake()
+  if doc.len == 0:
+    return
+  var want: seq[DesiredMod] = @[]
+  var err = ""
+  if not parseDesired(doc, want, err):
+    if err != gSyncError:
+      gSyncError = err
+      warn "the backend's client mod set was not usable, so nothing was " &
+           "changed: " & err
+    return
+  if gSyncError.len > 0:
+    gSyncError = ""
+    okLog "the backend's client mod set is readable again"
+  applyDesired(want, joinPath(gDir, "mods"))
+
 proc runPending() =
   ## The host thread's half.
   ##
@@ -1493,18 +2569,30 @@ proc runPending() =
   drainDue()
 
 proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
-  gStartMs = cNowMs()
-  gDir = ownDirectory()
+  modhost.startClock()
+  gDir = modhost.ownDirectory()
   if gDir.len == 0:
     return
-  gLogPath = joinPath(gDir, "aowlspt-host.log")
 
   # A fresh log each launch. The interesting failure is always this run's.
   gHostThreadId = cThreadId()
-  discard writeTextFile(gLogPath,
-    "aowlspt-host-il2cpp " & HostVersion & "\n" &
+  modhost.openLog(joinPath(gDir, "aowlspt-host.log"),
+    HostName & " " & HostVersion & "\n" &
     "directory " & gDir & "\n" &
     "thread " & $int(gHostThreadId) & "\n\n")
+
+  # Before a single mod is loaded, because the loader refuses an unload it has
+  # no teardown for and the manager is told so in the capabilities reply.
+  # `dropModRegistrations` is this host's half: subscriptions, queued
+  # main-thread callbacks, and the detours the backend has no equivalent of.
+  modhost.setModTeardown(dropModRegistrations)
+  # And the half of the host block `aowl_hostapi_new` cannot fill.
+  modhost.setHostBlockArm(armLive)
+
+  # Before the first patch of any kind, including the host's own drain hook:
+  # once this has run, `gPatches` never moves again, which is what lets the
+  # firing path read it on the game's thread without a lock.
+  reservePatchRows()
 
   storeInit(gDir)
 
@@ -1535,12 +2623,12 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
              "Unity's; a callback that touches a Unity object is unsafe"
 
   let modsDir = joinPath(gDir, "mods")
-  let found = discoverMods(modsDir)
-  info $found.len & " candidate libraries under " & modsDir
-  for path in found:
-    discard loadMod(path)
-
-  if gMods.len == 0:
+  # The runtime may not have come up, and that deliberately does not stop this:
+  # a client mod that only logs, schedules and talks to the backend works
+  # perfectly well without IL2CPP, and a host injected into a process that has
+  # none at all is exactly what `hostharness --inject` is. `resolve` and `call`
+  # report it; loading does not gate on it.
+  if modhost.loadAll(modsDir, modhost.SideClient, HostName, HostVersion) == 0:
     info "no mods loaded; the host will idle"
 
   # The overlay, on this thread and not a moment earlier.
@@ -1553,11 +2641,61 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # a worse trade than no panel.
   if overlayStart(VkInsert, int32(readBackendPort())):
     okLog "overlay ready (Insert toggles it)"
-    for i in 0 ..< gMods.len:
-      if gMods[i].live:
-        overlaySetMod(gMods[i].guid, gMods[i].name, gMods[i].version, true)
+    for i in 0 ..< modhost.modCount():
+      if modhost.modIsLive(i):
+        overlaySetMod(modhost.modGuidOf(i), modhost.modNameOf(i),
+                      modhost.modVersionOf(i), true)
   else:
     warn "the overlay did not start: " & overlayStatus()
+
+  # The mods are up, so the host can start answering the manager. Before this
+  # point a control request is ignored rather than queued.
+  startModControl()
+
+  # And the other half of it, which is the half that works across a process
+  # boundary.
+  #
+  # `startModControl` wires this host into the manager's *event* protocol, and
+  # on the server that is the whole story: the manager and the host share an
+  # event channel because they share a process. Here they do not. Nothing in
+  # this process ever emits `aowlspt.host.mods.unload`, so until now a player
+  # switching off a client-side mod changed a stored selection on the server and
+  # nothing at all in the game until it was restarted.
+  #
+  # So the client asks instead. The overlay's worker thread -- which already
+  # exists, already polls, and is already the one HTTP client in this process --
+  # fetches the manager's client-side decisions every few seconds, and the tick
+  # loop below turns the newest whole answer into loads and unloads. The
+  # direction matters: the backend is asked, never listened to, so a backend
+  # that is down, starting or answering something else leaves this host running
+  # precisely what it is running.
+  let syncPort = readBackendPort()
+  let syncMs = readSyncMs()
+  if syncPort <= 0:
+    info "no backendPort in aowlspt-host.json, so this host cannot ask the " &
+         "server which mods to run; it loads what is in mods/ and keeps it"
+  elif syncMs <= 0:
+    info "modSyncMs is 0, so live mod control from the server is off"
+  else:
+    # The host's own version goes in the path: the manager checks each mod's
+    # `pipeline` range against it, and without it the range would be matched
+    # against the backend's version instead -- a different program, allowed to
+    # be at a different version.
+    gSyncBase = "/aowlspt/mods/client/" & HostVersion
+    gSyncMs = syncMs
+    gSyncPath = gSyncBase
+    # Name this process before the first poll goes out. Only a host that asks
+    # gets a session, because a session is only ever used to answer -- and the
+    # answer exists to stop the manager holding a verdict from a client that has
+    # since been restarted, which looks authoritative and is about a process
+    # that no longer exists.
+    let session = hex16(cNowMs() * 65536'u64 +
+                        uint64(gHostThreadId and 0xFFFF'u32))
+    modcontrol.reportSession(session)
+    overlaySyncStart(gSyncPath, int32(syncMs))
+    okLog "asking the backend on port " & $syncPort & " which client mods " &
+          "should be running, every " & $syncMs & "ms; this host reports back " &
+          "as session " & session
 
   okLog "host running"
 
@@ -1629,6 +2767,11 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
            $int(cMqThread()) & " drains the queue"
 
     runPending()
-    for i in 0 ..< gMods.len:
-      if gMods[i].live and gMods[i].hasUpdate:
-        discard cModApiOnUpdate(gMods[i].api, elapsed)
+    takeModSet()
+    # Live mod control, off the emitting stack -- the only place in this host a
+    # mod is loaded or unloaded while the game is running.
+    modcontrol.drain()
+    # And the answer, on the way back out. It rides the next poll of the same
+    # route the desired set came in on -- see `publishReport`.
+    publishReport(now)
+    modhost.tickMods(elapsed)

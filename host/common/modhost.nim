@@ -280,6 +280,30 @@ proc modEnter*(index: int): bool =
   ## never be taken off, which is a far quieter bug than the one this closes.
   result = cModEnter(int64(index)) != 0'i32
 
+proc modGuardable*(index: int): bool =
+  ## Whether `index` names a slot the guard covers at all.
+  ##
+  ## This exists because `modEnter` folds two different answers into one
+  ## `false`: **"out of range"** and **"being unloaded"**. A caller that reads
+  ## the second meaning into the first silently drops work that was never a
+  ## mod's to begin with -- and that is not hypothetical. `tools/hostharness`
+  ## subscribes to events under context `0x7FFF` on purpose, a number no mod
+  ## table reaches, so its own registrations survive the churn it measures.
+  ## Guarding that subscriber turned "there is no library here to protect" into
+  ## "skip this subscriber", and the reply to `aowlspt.host.mods.list`
+  ## disappeared.
+  ##
+  ## So: ask this first, and only take the guard for an index it answers true
+  ## for. Every host does it the same way, from here, rather than each carrying
+  ## a copy of the bound.
+  ##
+  ## The bound is the fixed slot count and **not** `modCount()`, deliberately.
+  ## A count that moved between the enter and the leave would drop a
+  ## `modLeave`, and a reference leaked here is an unload that times out and a
+  ## mod that can never be taken off -- a far quieter bug than the one the
+  ## guard closes.
+  result = index >= 0 and index < int(cModSlots())
+
 proc modLeave*(index: int) =
   ## Give back what `modEnter` took. Only ever call this after a `modEnter`
   ## that answered `true`.

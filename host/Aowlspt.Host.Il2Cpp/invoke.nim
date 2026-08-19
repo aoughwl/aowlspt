@@ -46,6 +46,14 @@ proc cRegsFlt*(p: Il2CppPtr; i: int32): float {.
 ## 12.5f came back as 0.000000. Two readers, picked by declared type.
 proc cRegsF32*(p: Il2CppPtr; i: int32): float {.
   importc: "aowl_regs_f32", nodecl.}
+## What the original returned, on the postfix path. Two readers for the same
+## reason there are two for a float argument: RAX and XMM0 are both saved
+## because the thunk cannot know which holds the value, and only the declared
+## return type says. See `aowl_regs_ret_f32` in the shim.
+proc cRegsRetInt*(p: Il2CppPtr): uint64 {.importc: "aowl_regs_ret_int", nodecl.}
+proc cRegsRetF32*(p: Il2CppPtr): float {.importc: "aowl_regs_ret_f32", nodecl.}
+proc cRegsRetF64*(p: Il2CppPtr): float {.importc: "aowl_regs_ret_f64", nodecl.}
+
 proc cRegsSetRetInt*(p: Il2CppPtr; v: uint64) {.
   importc: "aowl_regs_set_ret_int", nodecl.}
 proc cRegsSetRetF32*(p: Il2CppPtr; v: float) {.
@@ -233,6 +241,57 @@ proc isIntegerType(t: string): bool =
 proc isLongType(t: string): bool =
   result = t == "System.Int64" or t == "System.UInt64" or t == "System.IntPtr"
 
+const BoxHeaderFallback = 16
+  ## `sizeof(Il2CppObject)` on x64: a class pointer and a monitor pointer.
+
+var gBoxHeader = -1
+
+proc boxHeaderBytes*(rt: Il2Cpp): int =
+  ## How much of a value type's reported instance size is object header --
+  ## asked of the runtime rather than assumed.
+  ##
+  ## `il2cpp_class_instance_size` on the game reports the **boxed** size, header
+  ## plus payload, because that is the only form the runtime allocates. That is
+  ## not universal: a stand-in can just as reasonably report the payload, and
+  ## both answers are self-consistent, so no single number in isolation
+  ## distinguishes them.
+  ##
+  ## One number whose payload is *known* does. `System.Int32` holds four bytes
+  ## by definition, so whatever this runtime reports for it, minus four, is the
+  ## header. `System.Double` is used only to check that answer: eight bytes of
+  ## payload must report four more than `Int32` does, and if it does not, this
+  ## runtime is not measuring what it is assumed to be measuring and the
+  ## fallback is kept.
+  ##
+  ## Getting it wrong subtracts a header that is not there, which turns every
+  ## small value type into a negative width and refuses it -- an enum argument
+  ## reported as unclassifiable, a shaped call falling back to reflection, both
+  ## quietly, and both while the code looks as though it had checked.
+  if gBoxHeader >= 0:
+    return gBoxHeader
+  gBoxHeader = BoxHeaderFallback
+  let i32 = findClass(rt, "System.Int32")
+  if i32 != nil:
+    let a = classInstanceSize(rt, i32)
+    if a >= 4:
+      let f64 = findClass(rt, "System.Double")
+      var agree = true
+      if f64 != nil:
+        agree = classInstanceSize(rt, f64) - a == 4
+      if agree:
+        gBoxHeader = a - 4
+  result = gBoxHeader
+
+proc valueWidth(rt: Il2Cpp; t: Il2CppType): int =
+  ## The payload width of a value type, or 0 if it is not one.
+  result = 0
+  let c = classFromType(rt, t)
+  if c == nil or not classIsValueType(rt, c):
+    return 0
+  let n = classInstanceSize(rt, c) - boxHeaderBytes(rt)
+  if n > 0:
+    result = n
+
 proc bindArgs*(rt: Il2Cpp; m: Il2CppMethod; values: seq[JsonValue];
                handles: seq[Il2CppPtr]; args: ArgsPtr;
                error: var string): bool =
@@ -289,6 +348,34 @@ proc bindArgs*(rt: Il2Cpp; m: Il2CppMethod; values: seq[JsonValue];
     elif v.kind == jkNull:
       # A null reference is the one thing that fits any reference type.
       cArgsSetRef(args, int32(i), cast[Il2CppPtr](0))
+    elif v.kind == jkInt and valueWidth(rt, methodParam(rt, m, i)) > 0:
+      # An **enum**, which is most of what this game's methods take: every
+      # state, condition, damage kind and body part is one. It is declared by
+      # its own name (`EFT.EPhysicalCondition`), so none of the branches above
+      # match it, and it used to land in the refusal below -- a mod could patch
+      # such a method and read its arguments but could not call it.
+      #
+      # Nothing is boxed: `runtime_invoke` takes a value type as a pointer to
+      # the raw value, which is exactly what `aowl_args_set_i32` leaves behind.
+      # The width comes from the runtime rather than from an assumption that
+      # every enum is an `int` -- a `byte` or `long` enum is legal and this
+      # game has both.
+      #
+      # This also accepts a small struct built from one integer, which is
+      # wrong-ish and harmless: such a struct's single field is at offset 0 and
+      # the value written is the value it would have. A struct with more than
+      # one field cannot be expressed as a JSON number in the first place, so
+      # there is nothing here to get wrong that a mod could reach.
+      let w = valueWidth(rt, methodParam(rt, m, i))
+      if w <= 4:
+        cArgsSetI32(args, int32(i), int32(v.i))
+      elif w <= 8:
+        cArgsSetI64(args, int32(i), v.i)
+      else:
+        error = "argument " & $i & " is declared " & t & ", a " & $w &
+                "-byte value type; this host can build one of at most 8 bytes " &
+                "from a number"
+        return false
     else:
       error = "argument " & $i & " is declared " & t &
               ", which this host cannot build from a JSON scalar. " &
@@ -322,6 +409,23 @@ proc describeResult*(rt: Il2Cpp; m: Il2CppMethod; res: Il2CppObject;
     return $cReadF32(raw)
   if rt2 == "System.Double":
     return $cReadF64(raw)
+  # An **enum**, or any small value type the runtime can name. It arrives boxed,
+  # like every value type coming back from `runtime_invoke`, and the branches
+  # above do not match it because it is declared by its own name
+  # (`EFT.EPhysicalCondition`, `UnityEngine.ShadowResolution`, `EPlayerState`).
+  #
+  # It used to fall through to the reference path below, which is wrong twice
+  # over: the mod got `{"handle":6,"type":"System.Int32"}` where it asked for a
+  # number, so `asFloat()` answered 0.0 with `ok` true -- a wrong value that
+  # reads as a right one -- and a GC handle was taken out on it that nothing
+  # would ever release. The width comes from the runtime rather than from
+  # assuming every enum is an `int`.
+  let vw = valueWidth(rt, methodReturnType(rt, m))
+  if vw > 0 and vw <= 8:
+    if vw <= 4:
+      return $int(cReadI32(raw))
+    return $cReadI64(raw)
+
   # A reference type that is not a string: a *live object*, which is the thing
   # a mod actually wants -- this player, this weapon, this world -- rather than
   # the class it is an instance of.
@@ -406,16 +510,6 @@ proc escapeForJson*(s: string): string =
 
 const MaxRegArgs* = 4
 
-## The bytes an IL2CPP object header takes before a boxed value type's payload.
-##
-## `il2cpp_class_instance_size` on a value type reports the size of its *boxed*
-## form -- header plus payload -- because that is the only form the runtime
-## allocates. What matters for reading an argument out of a register is the
-## payload, so the header comes off. Guarded: a runtime (or a mock) that reports
-## the payload alone gives a number at or below the header size, and subtracting
-## would produce nonsense.
-const ObjectHeaderBytes = 16
-
 type ArgShape* = enum
   ## What a parameter or field type turns out to be, once the runtime is asked
   ## rather than guessed at.
@@ -441,9 +535,11 @@ proc shapeOfType*(rt: Il2Cpp; t: Il2CppType; bytes: var int): ArgShape =
     return asUnknown
   if not classIsValueType(rt, c):
     return asReference
-  var n = classInstanceSize(rt, c)
-  if n > ObjectHeaderBytes:
-    n = n - ObjectHeaderBytes
+  # The header comes from `boxHeaderBytes`, which measures it against two known
+  # types, rather than from a constant. See that proc for why a constant here
+  # reads as "every value type is unclassifiable" against a runtime that reports
+  # sizes the other way round.
+  let n = classInstanceSize(rt, c) - boxHeaderBytes(rt)
   bytes = n
   if n > 0 and n <= 8:
     return asValueSmall
@@ -565,6 +661,175 @@ proc describeArgs*(rt: Il2Cpp; m: Il2CppMethod; regs: Il2CppPtr;
     inc i
   out1.add "]}"
   result = out1
+
+proc describeReturn*(rt: Il2Cpp; m: Il2CppMethod; regs: Il2CppPtr;
+                     handles: var seq[Il2CppPtr]; isObject: var seq[bool];
+                     gcHandles: var seq[uint32]): string =
+  ## What a patched method returned, as JSON, for a postfix handler.
+  ##
+  ## The mirror image of `describeArgs`, and it reads the frame by the same
+  ## rule: the bytes do not say what they are, the **declared return type**
+  ## does. An integer or a reference is in RAX, a `Single` or a `Double` is in
+  ## XMM0, and the thunk saved both because it has no signature to consult.
+  ##
+  ## A reference return is registered as a handle on the same terms `this` is:
+  ## live until the handler returns, and reclaimed by `patchReturned`. That is
+  ## what lets a postfix on a factory method inspect -- or keep, by pinning --
+  ## the object the game just built.
+  let t = typeName(rt, methodReturnType(rt, m))
+  if t == "System.Void":
+    return "null"
+  if t == "System.Boolean":
+    return (if (cRegsRetInt(regs) and 0xFF'u64) != 0'u64: "true" else: "false")
+  if t == "System.Single":
+    return $cRegsRetF32(regs)
+  if t == "System.Double":
+    return $cRegsRetF64(regs)
+  if isIntegerType(t):
+    return $int(int32(cRegsRetInt(regs) and 0xFFFFFFFF'u64))
+  if isLongType(t):
+    return $int64(cRegsRetInt(regs))
+  if t == "System.String":
+    let p = cast[Il2CppPtr](cRegsRetInt(regs))
+    if p == nil:
+      return "null"
+    return "\"" & escapeForJson(readString(rt, p)) & "\""
+  var bytes = 0
+  case shapeOfType(rt, methodReturnType(rt, m), bytes)
+  of asValueSmall:
+    if bytes <= 4:
+      return $int(int32(cRegsRetInt(regs) and 0xFFFFFFFF'u64))
+    return $int64(cRegsRetInt(regs))
+  of asValueBig:
+    # Refused at registration, so reaching here means the shape changed under
+    # us. Named rather than invented, exactly as the argument path does.
+    return "{\"valueType\":\"" & t & "\"}"
+  of asReference:
+    return referenceHandle(rt, cast[Il2CppPtr](cRegsRetInt(regs)), t,
+                           handles, isObject, gcHandles)
+  of asUnknown:
+    return "{\"type\":\"" & t & "\"}"
+
+# ---------------------------------------------------------------------------
+# Typed frame shapes (ABI revision 4)
+# ---------------------------------------------------------------------------
+#
+# The JSON path asks the runtime what every argument is on *every* firing:
+# `typeName` on each parameter, `classFromType` and `classIsValueType` for
+# anything it does not recognise by name, `gcHandleNew` for every reference. On
+# a method the game runs per bot per frame that is the whole cost.
+#
+# None of it can change between firings. A method's declared signature is fixed
+# when the assembly is compiled, so the answers are worked out once, here, at
+# registration -- and the firing path becomes six stores into a pooled frame.
+#
+# The kinds are the wire values of `AowlArgKind` in `abi/aowlspt_frame.h`, held
+# as bytes because that is what the frame points at.
+
+const
+  AkNone* = 0'u8
+  AkInt* = 1'u8
+  AkFloat* = 2'u8
+  AkDouble* = 3'u8
+  AkObject* = 4'u8
+  AkValue* = 5'u8
+  AkBigValue* = 6'u8
+  AkVoid* = 7'u8
+  AkStack* = 8'u8
+  AkUnknown* = 9'u8
+
+proc argKindOf*(rt: Il2Cpp; t: Il2CppType): uint8 =
+  ## What one declared type is, as a register-file classification.
+  ##
+  ## By name where the name is decisive and by `shapeOfType` otherwise, which is
+  ## the same split `describeArgs` makes and for the same reason: "anything I do
+  ## not recognise is a reference" hands the collector an enum's integer value as
+  ## if it were an object.
+  ##
+  ## `System.String` is an object here rather than a string. The JSON path reads
+  ## the characters out because it has to produce text; a typed handler is given
+  ## the address and may do as it likes with it, which is both cheaper and more
+  ## honest -- reading a managed string allocates, and this path does not.
+  let n = typeName(rt, t)
+  if n == "System.Void": return AkVoid
+  if n == "System.Single": return AkFloat
+  if n == "System.Double": return AkDouble
+  if n == "System.Boolean" or n == "System.Char": return AkInt
+  if isIntegerType(n) or isLongType(n): return AkInt
+  if n == "System.String": return AkObject
+  var bytes = 0
+  case shapeOfType(rt, t, bytes)
+  of asValueSmall: result = AkValue
+  of asValueBig: result = AkBigValue
+  of asReference: result = AkObject
+  of asUnknown: result = AkUnknown
+
+proc frameKinds*(rt: Il2Cpp; m: Il2CppMethod): seq[uint8] =
+  ## One byte per **declared** parameter, in declaration order.
+  ##
+  ## Parameters past the fourth register position are `AkStack`: named rather
+  ## than dropped, so that argument *n* is always declared parameter *n*
+  ## whatever the method's shape. The JSON path stops early instead, which
+  ## silently renumbers nothing but does leave a handler counting.
+  result = @[]
+  let isStatic = methodIsStatic(rt, m)
+  let declared = methodParamCount(rt, m)
+  for i in 0 ..< declared:
+    let pos = (if isStatic: i else: i + 1)
+    if pos >= MaxRegArgs:
+      result.add AkStack
+    else:
+      result.add argKindOf(rt, methodParam(rt, m, i))
+
+const PostfixMaxSlots* = 4
+  ## Register slots a postfix-patched call may use. Four, because that is what
+  ## Win64 passes in registers before it starts using the stack -- and the
+  ## postfix thunk `call`s the original from inside its own frame, so a stack
+  ## argument would be read from the wrong address. See `aowlspt_detour.h`.
+
+proc postfixSlots*(rt: Il2Cpp; m: Il2CppMethod): int =
+  ## How many register slots the *compiled* call uses: `this` where there is
+  ## one, the declared arguments, and IL2CPP's trailing `MethodInfo*`.
+  ##
+  ## The `MethodInfo*` is counted because IL2CPP passes it, and forgetting it is
+  ## the difference between a method that fits and one whose last argument lands
+  ## on the stack. Counting it makes this conservative by one slot on a build
+  ## that somehow does not -- which is the direction to be wrong in.
+  result = methodParamCount(rt, m) + 1
+  if not methodIsStatic(rt, m):
+    result = result + 1
+
+proc postfixRefusal*(rt: Il2Cpp; m: Il2CppMethod; target: string): string =
+  ## Empty if this method can carry a postfix; otherwise the sentence to hand
+  ## the mod author, naming which of the two shapes stopped it.
+  ##
+  ## Both refusals are about the thunk having to regain control after the
+  ## original rather than tail-jumping into it, and both are silent corruption
+  ## if honoured anyway -- a wrong argument or a return value nobody can read.
+  ## Refusing is the whole point.
+  let rn = typeName(rt, methodReturnType(rt, m))
+  if rn != "System.Void":
+    var bytes = 0
+    if shapeOfType(rt, methodReturnType(rt, m), bytes) == asValueBig:
+      return "a postfix on " & target & " is refused: it returns " & rn &
+             ", a " & $bytes & "-byte value type, which Win64 returns through " &
+             "a caller-allocated buffer rather than in a register. The host " &
+             "cannot read that buffer's layout, so a postfix there could " &
+             "neither report the result nor replace it -- it would be a patch " &
+             "that silently observes nothing. Use a prefix that suppresses, " &
+             "or reach the value another way."
+  let slots = postfixSlots(rt, m)
+  if slots > PostfixMaxSlots:
+    return "a postfix on " & target & " is refused: its compiled call uses " &
+           $slots & " register slots (" & $methodParamCount(rt, m) &
+           " declared argument(s)" &
+           (if methodIsStatic(rt, m): "" else: ", plus `this`") &
+           ", plus IL2CPP's trailing MethodInfo*), and past " &
+           $PostfixMaxSlots & " they arrive on the stack. A postfix has to " &
+           "call the original rather than jump to it, and a called original " &
+           "would read the thunk's frame where its stack arguments should be. " &
+           "A prefix on this method is unaffected."
+  result = ""
 
 proc thisOf*(rt: Il2Cpp; m: Il2CppMethod; regs: Il2CppPtr): Il2CppPtr =
   ## The instance a patched method was called on, or nil for a static method.
@@ -738,6 +1003,21 @@ proc writeField*(rt: Il2Cpp; cls: Il2CppClass; obj: Il2CppObject;
       ok1 = false
     else:
       cCellSetPtr(cell, newString(rt, value.s))
+  elif value.kind == jkInt and valueWidth(rt, fieldType(rt, f)) > 0:
+    # An enum field, written from a number -- the other half of the read above,
+    # which has classified enums correctly for a while. Writing one required a
+    # handle, and there is no handle to a value type, so every enum field in
+    # the game was read-only through this API for no reason anyone chose.
+    let w = valueWidth(rt, fieldType(rt, f))
+    if w <= 4:
+      cCellSetI32(cell, int32(value.i))
+    elif w <= 8:
+      cCellSetI64(cell, value.i)
+    else:
+      error = "field " & name & " is declared " & t & ", a " & $w &
+              "-byte value type; this host can write one of at most 8 bytes " &
+              "from a number"
+      ok1 = false
   else:
     if value.kind != jkHandle:
       error = "field " & name & " is a " & t &
