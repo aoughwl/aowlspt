@@ -919,9 +919,28 @@ which is the right call each time.
 > design decision rather than an optimisation, which is why this section records
 > the numbers and does not make it.
 
-**Worth:** roughly 2× server throughput (~800 → ~1500 req/s). **Risk:** it is the
-exact hole the current design was built to close. Two prior attempts are
+**Worth:** roughly 2x server throughput (~800 -> ~1500 req/s). **Risk:** it is
+the exact hole the current design was built to close. Two prior attempts are
 documented as reverted.
+
+**Part of it was taken on 2026-08-19 without touching the decision.** The commit
+was decomposed by syscall and the cost was not where the prose assumed -- not
+the data (687/699/688 us at 3/16/84 KB), not the `.hist` ring (one snapshot per
+key per five minutes, so a raid pays it once), but metadata. `MoveFileEx` with
+`MOVEFILE_WRITE_THROUGH` was 415 us against 175 for a rename through the handle
+that already wrote the file, and **the write-through flag had no defensible
+reading where it sat**: with the data flush off, which is the default, it forced
+the directory entry to the platter *ahead of the bytes it names*. Dropping it
+strictly reduces that window. `store_set` went 718 -> 476 us, `items/moving`
+1.17 -> 0.90 ms, throughput 840 -> 961 req/s on the gate configuration.
+
+So the question this row asks is unchanged and is still the owner's: **the
+profile is still committed on every inventory drag.** What has changed is that
+the commit is 35% cheaper and that two bugs the atomic write brought with it are
+gone -- a commit failed outright when the other host held the key open, and a
+held reader handle never saw a commit at all, because the rename left it
+following the unlinked file forever. `tests/storeperf/storeguard.nim` fails 2 of
+9 against the code as it was, for exactly that.
 
 ### G2. Should the mod manager download binaries?
 
@@ -980,16 +999,21 @@ Re-derived against the tree, item by item, rather than carried forward.
 | **Just work** | ~30 | Of which ~21 unserved emulator operations are the bulk. |
 | **Deliberate, decided** | ~19 | Not backlog. Listed so nobody re-opens them. |
 | **Owner's decisions, open** | 3 | Three conversations. |
-| **Broken rather than undone** | **3** | Dispatch. |
-| **Closed since this list was written** | 21 | Nothing. Kept for the record. |
+| **Broken rather than undone** | **0** | Nothing left to dispatch. |
+| **Closed since this list was written** | 21, plus the 2026-08-19 list below | Nothing. Kept for the record. |
 
 Four things those numbers hide, and each matters more than the totals:
 
 1. **Fifteen of them are one afternoon.** Group C is not fifteen tasks. It is one
    session, and it also collapses eight of the Group B name rows with it.
-2. **The broken section went from nine to three.** Eight of the original nine
-   are genuinely closed and are listed at the end with proof. What is left is
-   two stale mod READMEs and one hand-maintained table.
+2. **The broken section went from nine to three and is now empty.** The last
+   three closed on 2026-08-19: the two stale mod READMEs were corrected in
+   place, and the hand-maintained table became `tools/coverage.nim`, which
+   derives the served/empty/absent split from which handler each route is bound
+   to and fails `aowl test` when the document on disk disagrees. It earned that
+   the same day -- the four mail routes stopped being stubs one commit after
+   the document was generated, and the split moved 125/25/61 to 129/21/61 with
+   nobody editing a number.
 3. **The two items this list called "one call site from closed" are done, and
    proved.** `bindStaticField` and `writePtr`'s write barrier are both in
    `fast.nim`, and `hostharness` asserts each of them against the stand-in
@@ -997,8 +1021,10 @@ Four things those numbers hide, and each matters more than the totals:
    the stand-in did not export the barrier at all, so any "the field was
    written" check would have passed without exercising it. The same is true of
    the module refcount: `modEnter` landed, and `backend/modrace.nim` shows the
-   before-and-after out of one binary. **What is left of that group is not code
-   but wiring — `modrace` is in no gate.**
+   before-and-after out of one binary. **The wiring this note used to call for
+   is done**: `modrace` runs in `aowl test`, beside `tickrace`, `regrace`,
+   `dbrace`, `detour_race` and, since 2026-08-19, `ws_stall`, `storeguard`,
+   `tickfault` and `ovsync`.
 4. **The decided pile is not backlog.** Roughly 19 of the ~115 items are Group F.
    The genuinely open list is around 75, and a quarter of that is the emulator's
    unserved surface, enumerated operation-by-operation in
@@ -1054,6 +1080,59 @@ top of the list is blocked on somebody reading more code.
 Kept rather than deleted: a backlog that silently loses its own items cannot be
 checked against what it used to claim. Each was verified against code, not
 against a changelog.
+
+### Closed on 2026-08-19
+
+A long day, and the entries are grouped by what kind of thing they were rather
+than by when they landed, because the kinds are the useful part.
+
+**Defects nobody knew about, found by writing a check for something else:**
+
+| what | how it presented |
+|---|---|
+| **One websocket client that stopped reading stopped the whole HTTP server** | every pong, close and refusal the poller sent took the registry lock with a *blocking* enter, and `AOWL_WS_SEND_MS` does not bound the holder -- its deadline is per stall and resets on every byte the peer accepts. A poller asleep on that lock is not in `WSAPoll`: no accepts, no reads, no deadlines. Measured against the old engine: one ordinary request in a two-second window, unanswered. `tests/ws_stall.c`, 14 checks and 2 failures against the pre-fix header |
+| **`__declspec(thread)` is silently ignored by this gcc** | so the keep-alive fix committed the same morning was a process-global shared by sixteen workers. `__thread` now |
+| **Three bot roles spawn with no rig and no backpack** | `mods/blackdivision`'s pools have nothing left that can roll against a stock database, and both its README and its source claimed the opposite. Found by building the `checkAgainstDatabase` its config had promised for months and never had |
+| **A hook was told three of an instance method's four arguments** | omitted, not flagged, so index 3 read `""` and could not be told from an argument that was genuinely empty. The Win64 register rule is real; the silence was the defect. The slot is named `{"onStack":true,"type":"..."}` now, and the marker fails closed on a reader that has never heard of it |
+| **The overlay legend was cut in half at the 480 floor** | 57 columns for a 106-character legend, silently truncated -- "loses the marker nobody knows yet", in the header's own words. `tests/overlayhost` decodes the back buffer into characters now, so the check is about pixels rather than intent |
+| **A mod that failed every tick did so in silence** | `tickMods` discarded `on_update`'s status while `docs/DEBUGGING.md` had described a `Faulted` state for a long time. The state exists now: 120 consecutive failures, any success resets, routes and events untouched |
+
+**Refusals that turned out to be nobody having looked:**
+
+| what | what was actually there |
+|---|---|
+| **Quest kills refused on a `distance` qualifier** | `Victim.Distance` was in the report all along, and the check refused on the *presence* of the key: 191 of 283 kill conditions carry neutral values, and every one was refused |
+| **`daytime` on quest kills** | `Victim.Time` was never the right input. The raid configuration the server already receives establishes the clock -- and the published acceleration is **0**, so it is refused and the enum ceiling assumed instead |
+| **Fence karma from scav kills** | `standingForKill` is in the database for all 57 roles, and `emu/bots.nim` already read that exact path to hand it to the client |
+| **`staticAmmo` imported and unread** | `docs/IMPORTDB.md` named a consumer that could never have used it: every ammo box has one cartridge in its filter. **Magazines** were the consumer, 3 to 51 each |
+| **Four mail routes documented as "served"** | `onNullData`. Reading mail did not mark it read, pinning did not pin, removing did not remove |
+| **`/client/game/profile/voice/change`** | answered `{"status":"ok"}` and wrote nothing, sitting directly under a route that really does write |
+
+**Claims that were true when written:**
+
+Four audits checked roughly 840 of them and found ~120 wrong -- the eleven mod
+READMEs, five `docs/` files, four more `docs/` files, the twelve `abi/` headers
+and the six examples. The two worth naming: **`examples/lesson` §9 taught that
+when two mods hook one method "every handler runs and the first one that asks to
+stop wins"**, which is exactly backwards -- the second to arm is refused, and
+that is the file people copy from. And **"a hook is not told which instance it
+fired on"** was asserted as a hard blocker in two mods, printed at runtime by
+one of them, and was the stated reason for nine refusals; `hookArgs` carries
+`this`, and the host reports the receiver's *concrete runtime class*.
+
+**Wiring, which is where work goes to be forgotten:**
+
+`modrace`, `tickfault`, `storeguard`, `ovsync`, `ws_stall`, `--engine-park` and
+`aowl-coverage --check` are all in `aowl test` now. Several existed and ran
+nowhere. `tools/firstrun.nim` runs again -- 64 checks -- and now halts at the
+install that produced a broken tree rather than at the spawn three steps later.
+
+**And the lesson that repeated all day**, in the corrections above and in four
+briefs I wrote that were themselves wrong: *a document cannot see its own
+subject.* `mods/fov` was cited to two READMEs as evidence that a hook is given
+its instance; it never calls `thisPointer` and still printed the false claim.
+The fix for that class is not more prose -- it is `tools/coverage.nim`,
+`checkAgainstDatabase`, and a gate phase for everything else.
 
 | was | now | proof |
 |---|---|---|
