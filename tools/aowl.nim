@@ -1208,6 +1208,54 @@ proc cmdTest(e: Env): int =
     discard run(e, "the manager reads that report and never reads silence " &
                    "as a no", quoted(modClientExe))
 
+  # And what a host does with a mod whose `on_update` fails, which for a long
+  # time was nothing at all. `tickMods` was three lines that discarded the
+  # status, so a mod failing on every frame of a raid did it in silence, with
+  # nothing anywhere naming it -- while `docs/DEBUGGING.md` told a player to
+  # search the log for `faulted, mod disabled`, a string that appeared nowhere
+  # in the tree.
+  #
+  # Three fixture mods rather than one, and each is load-bearing: a mod that
+  # fails every tick (the subject -- no mod in this repository returns anything
+  # but `Ok`, which is exactly why the omission survived), a bystander loaded
+  # *after* it that must be ticked all the same, and a flaky one that fails 150
+  # times without ever failing twice in a row and must never be disabled. The
+  # last is the threshold check: a count of total failures rather than
+  # consecutive ones takes a working mod off the tick partway through a
+  # session, and it was also what caught a log line written once per *run* of
+  # failures -- a line every fourth frame, which is the flood this was meant to
+  # avoid.
+  #
+  # Four mutations of `tickMods` were run against it: the honouring removed
+  # (9 of 22 red), the threshold cut to 1 (5), the reset on success removed
+  # (5), and the disable done by setting the draining flag instead (1 -- the
+  # over-correction check, and the one that says a faulted mod's routes still
+  # answer).
+  #
+  # Built with its working directory set to the fixture directory so its
+  # nimcache lands beside it, and the fixtures go through `buildMod` rather
+  # than a hand-rolled command because `-o:` does not reach an `--app:lib`
+  # build: `placeLibrary` is what moves the DLL out of nimcache into `bin/`.
+  var tickFaultMods = true
+  for fixture in ["faultmod", "goodmod", "flakymod"]:
+    if not buildMod(e, joinPath(e.repo, "tests\\tickfault\\" & fixture)):
+      tickFaultMods = false
+  if tickFaultMods:
+    let tickFaultExe = joinPath(e.repo, "installer\\build\\tickfault.exe")
+    var tfCmd = quoted(nimonyExe(e))
+    tfCmd.add " c"
+    tfCmd.add abiInclude(e)
+    tfCmd.add " -p:" & quoted(joinPath(e.repo, "host\\common"))
+    tfCmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
+    tfCmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
+    tfCmd.add " -o:" & quoted(tickFaultExe)
+    tfCmd.add " " & quoted(joinPath(e.repo, "tests\\tickfault\\tickfault.nim"))
+    if run(e, "tickfault builds", tfCmd, joinPath(e.repo, "tests\\tickfault")):
+      discard run(e, "a mod that fails every tick is named, dropped from the " &
+                     "tick and left otherwise alone",
+                  quoted(tickFaultExe) & " " &
+                  quoted(joinPath(e.repo, "tests\\tickfault")))
+
   heading "Backend"
   let haveBackend = buildBackend(e)
   discard buildProbe(e)

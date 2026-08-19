@@ -196,22 +196,40 @@ Error 126 is worth calling out: Windows reports "module not found" both for a
 missing DLL and for a DLL whose own imports cannot be resolved. If the file is
 clearly there, run `objdump -p yourmod.dll | grep 'DLL Name'` and check each one.
 
-**A mod faults at run time.** This page used to say the host marks it `Faulted`,
-logs the message and stops dispatching to it, and told you to look for
-`faulted, mod disabled` in the log. **No such mechanism and no such log line
-exist.** Re-derived 2026-08-19: nothing under `host/` carries a faulted mod
-state, the string appears nowhere in the tree, and `modhost.tickMods`
-(`host/common/modhost.nim:938-941`) is three lines that `discard` whatever
-`on_update` returned. A mod that answers non-`Ok` every tick does so silently
-and keeps being ticked.
+**A mod faults at run time.** Nothing crosses the ABI as an exception, so a mod
+that fails returns a *status* — and the host reads it. `on_update` is the entry
+this matters for, because it is the one called on every frame, and a mod failing
+on every frame used to do it in complete silence.
 
-What survives of the claim is the part about the ABI: nothing crosses this
-boundary as an exception, so a mod that returns a failure returns a *status*,
-and the host carries on. The consequence is the opposite of what was written —
-the failure you will see is silence rather than a log line, or the whole process
-going if the mod faults hard. Check the status in your own `on_update` and log
-it yourself. Marking a mod dead after repeated non-`Ok` is a host change, not a
-documentation one; it is not in this repository today.
+What happens now, in `modhost.tickMods` and therefore in all three hosts:
+
+* **The first failure, ever, is logged at `warn`**, naming the mod's guid and
+  the status by its ABI name — `aowl.yourmod: on_update returned -9
+  (AOWLSPT_ERR_MOD_FAULT)`.
+* **After 120 consecutive failures the mod stops being ticked**, and that is
+  logged once at `error`. Search the log for **`faulted, mod disabled`**.
+* **Any successful tick resets the count.** A mod that fails occasionally is
+  never disabled, however many times it fails in total.
+* Those two lines are all you get, for the life of the process. A line per
+  frame at 60 fps would bury everything else in the log, so a mod that has
+  already been reported is silent from then on.
+
+120 consecutive failures is about **two seconds** in the client host and the
+simulator (16 ms ticks) and about **six** in the backend (50 ms). One failed
+tick while a mod waits for the game world is not a fault; two seconds of
+nothing but failure is.
+
+A faulted mod is **disabled, not unloaded**. It stays listed, its routes still
+answer, its event subscriptions still fire and its hooks are still installed —
+only its tick has stopped. To give it another chance, take it out and put it
+back in the mod manager, or restart the host; the state does not clear by
+itself, because a mod that has failed two thousand frames in a row is not about
+to recover on frame two thousand and one.
+
+What this does *not* catch is a mod that faults **hard** — a crash inside
+`on_update` rather than a status returned from it. Nothing between the mod and
+the game can catch that, and the process goes. Check the status of your own
+host calls and return a failure rather than reading through a null.
 
 **A host call returns non-OK.** `lastError()` carries the host's own text for the
 most recent failure on this thread, and every helper sets it. Log it; the status

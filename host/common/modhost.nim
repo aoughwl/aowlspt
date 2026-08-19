@@ -356,6 +356,27 @@ const
     ## your settings are real" on any host, and could not even tell the same
     ## story twice across two of them.
 
+proc statusName*(st: int32): string =
+  ## The ABI's name for a status code, for a log line a person reads.
+  ##
+  ## `-9` in a log is a number somebody has to go and look up in
+  ## `abi/aowlspt_abi.h`; `AOWLSPT_ERR_MOD_FAULT` is the answer they were going
+  ## to find there. The spelling is the header's, not a paraphrase, so that
+  ## searching the log line in the tree lands on the definition.
+  case st
+  of 0'i32: "AOWLSPT_OK"
+  of -1'i32: "AOWLSPT_ERR_GENERIC"
+  of -2'i32: "AOWLSPT_ERR_ABI"
+  of -3'i32: "AOWLSPT_ERR_NOT_FOUND"
+  of -4'i32: "AOWLSPT_ERR_BAD_ARG"
+  of -5'i32: "AOWLSPT_ERR_DECODE"
+  of -6'i32: "AOWLSPT_ERR_UNSUPPORTED"
+  of -7'i32: "AOWLSPT_ERR_WRONG_THREAD"
+  of -8'i32: "AOWLSPT_ERR_DISPOSED"
+  of -9'i32: "AOWLSPT_ERR_MOD_FAULT"
+  of -10'i32: "AOWLSPT_ERR_CONFIG_PARSE"
+  else: "an unnamed status"
+
 type
   LoadedMod* = object
     path*: string
@@ -370,6 +391,27 @@ type
     version*: string
     hasUpdate*: bool
     live*: bool
+    tickFails*: int
+      ## How many times in a row `on_update` has answered non-OK. Reset by the
+      ## first tick that answers OK, so this counts a *run* of failures rather
+      ## than a total: a mod that fails one tick in a thousand never
+      ## accumulates. See `TickFaultLimit` and `tickMods`.
+      ##
+      ## Touched only by `tickMods`, which every host calls from the one thread
+      ## that also loads and unloads mods -- so unlike the in-flight counter
+      ## and the draining flag it may live here, in the `seq`. The argument is
+      ## written out at `TickFaultLimit`.
+    tickWarned*: bool
+      ## Whether this mod's first failed tick has been reported. Never cleared,
+      ## and that is the point: `tickFails` resets on every success, so a mod
+      ## that fails one tick in four starts a fresh *run* 150 times in a
+      ## session, and a line per run-start is the per-frame log flood this was
+      ## supposed to avoid wearing a disguise. `tests/tickfault`'s flaky
+      ## fixture is what found it.
+    tickFaulted*: bool
+      ## Set once the run above reaches `TickFaultLimit`. The mod stays
+      ## **loaded** -- its routes, events, timers and detours all keep working;
+      ## it simply stops being handed the tick it cannot survive.
     flags*: uint32
       ## `AowlModFlags` as the mod declared them. Kept because the mod's
       ## `AowlModInfo` is freed on unload and the answer is still wanted after
@@ -749,7 +791,8 @@ proc loadMod*(path: string; side: int32; hostName, hostVersion: string;
                     module: cast[HostPtr](0), info: cast[HostPtr](0),
                     api: cast[HostPtr](0), hostBlock: cast[HostPtr](0),
                     guid: "", name: "", author: "", version: "",
-                    hasUpdate: false, live: false, flags: 0'u32)
+                    hasUpdate: false, live: false, tickFails: 0,
+                    tickWarned: false, tickFaulted: false, flags: 0'u32)
 
   # Before the first `LoadLibrary` of the process and harmless on every one
   # after it: each mod's mimalloc reads this when it initialises, and without
@@ -935,10 +978,123 @@ proc loadAll*(modsDir: string; side: int32; hostName, hostVersion: string;
     discard loadMod(path, side, hostName, hostVersion, sptVersion, gameVersion)
   result = gMods.len
 
+const
+  TickFaultLimit* = 120
+    ## How many **consecutive** non-OK answers from `on_update` it takes before
+    ## a host stops calling it.
+    ##
+    ## The number is a duration in disguise, and the two tick rates it has to
+    ## suit are 16 ms (the client host's loop and the simulator's default) and
+    ## 50 ms (the backend's). 120 consecutive failures is therefore about two
+    ## seconds of a mod failing every single frame in the game, and about six
+    ## on the server. That is the line the threshold is drawn on: one failed
+    ## tick is not a broken mod -- a mod polls for a world that is not up yet,
+    ## a config read loses a race with a file being written -- and two seconds
+    ## of nothing but failure is not a mod that is about to recover.
+    ##
+    ## It counts a **run**, not a total: any OK answer sets the count back to
+    ## zero, so a mod that fails one tick in fifty for an entire session is
+    ## never disabled. That is deliberate. The failure this exists to make
+    ## visible is the one that is total and silent, and a mod that mostly works
+    ## is not it -- disabling one mid-raid over an intermittent fault would
+    ## take away more than it gave.
+    ##
+    ## No mod in this repository can reach even 1. Every `on_update` under
+    ## `mods/` and `examples/` returns `Ok` on every path, including the early
+    ## returns for the wrong side -- checked, not assumed, because whether the
+    ## status is routinely non-zero for benign reasons is the whole question of
+    ## whether it can be acted on at all. The ABI is unambiguous that it cannot
+    ## be: `AOWLSPT_OK` is "ran fine" and `AOWLSPT_PATCH_SKIP` -- the one other
+    ## status with a non-failure meaning -- belongs to patch handlers, not to
+    ## this entry.
+
 proc tickMods*(elapsed: int64) =
+  ## One `on_update` per live mod, and the ABI's answer to it honoured.
+  ##
+  ## This used to `discard` the status, which made the whole return value
+  ## decorative and made a mod that failed on every single tick completely
+  ## silent -- the exact species of failure a player has no way to diagnose,
+  ## because nothing anywhere says which mod stopped working or that anything
+  ## stopped at all.
+  ##
+  ## Three rules, and each of them is a constraint the tick loop imposes:
+  ##
+  ##  * **Nothing here may take the host down or stall the frame.** So a
+  ##    failure costs a compare and an increment, the log happens twice per mod
+  ##    for the life of the process, and a faulted mod is skipped by a branch
+  ##    rather than unloaded -- an unload from in here would run `on_unload`,
+  ##    the host's teardown and `FreeLibrary` inside the game's frame budget,
+  ##    on a mod whose own tick is on the stack one frame earlier.
+  ##  * **Say it once.** The first failure *ever* is one `warn` naming the mod
+  ##    and the status; crossing the threshold is one `error`. Two lines per
+  ##    mod for the life of the process, and no more. A line per frame at
+  ##    60 fps is its own denial of service, and it would bury the line that
+  ##    mattered. "Once per run of failures" is not good enough and looked as
+  ##    though it was -- see `tickWarned`.
+  ##  * **Leave every other mod alone.** The loop carries on; a faulted mod's
+  ##    routes, events, timers and detours are untouched, and it is still
+  ##    `live`, so the manager can still unload it and a player can still see
+  ##    it listed.
+  ##
+  ## **On the refcount discipline, and why this does not touch it.** The
+  ## in-flight counter and the draining flag exist because a mod's *other*
+  ## entries -- routes, events, timers -- are called from threads that are not
+  ## this one, so an unload has to close the door and wait. Disabling a tick is
+  ## none of that: `tickFails` and `tickFaulted` are read and written here and
+  ## nowhere else, and `tickMods`, `loadMod` and `unloadOne` all run on the one
+  ## thread in every host that has one (the backend's serve loop, the client
+  ## host's tick thread, the simulator's single thread -- in each, `tickMods`
+  ## and `modcontrol.drain` are consecutive statements in the same loop). So
+  ## there is no call in flight to race: the only call this can suppress is the
+  ## one this same thread would have made on the next pass.
+  ##
+  ## What it must **not** do, and does not, is reuse `cModDrainBegin` to mean
+  ## "disabled". That flag is the unload path's, it is read on the way into
+  ## every route and event handler, and setting it here would silently stop a
+  ## faulted mod answering HTTP as well -- and would leave `unloadOne`'s drain
+  ## looking at a flag somebody else set. `tests/tickfault` asserts that a
+  ## faulted mod is still enterable for exactly that reason.
   for i in 0 ..< gMods.len:
-    if gMods[i].live and gMods[i].hasUpdate:
-      discard cModApiOnUpdate(gMods[i].api, elapsed)
+    if not gMods[i].live or not gMods[i].hasUpdate or gMods[i].tickFaulted:
+      continue
+    let st = cModApiOnUpdate(gMods[i].api, elapsed)
+    if st == StatusOk:
+      # A run of failures ended by a success never gets to the threshold.
+      gMods[i].tickFails = 0
+      continue
+    if not gMods[i].tickWarned:
+      # Once for the life of the process, not once per run of failures. The
+      # difference is not pedantic: a mod that fails every fourth tick starts a
+      # new run 150 times in a session, and "the first failure of a run" would
+      # be a line every fourth frame.
+      gMods[i].tickWarned = true
+      warn gMods[i].guid & ": on_update returned " & $int(st) &
+           " (" & statusName(st) & "). This is said once, however often it " &
+           "happens; if " & $TickFaultLimit & " ticks in a row fail, the mod " &
+           "stops being ticked and that is said once too."
+    gMods[i].tickFails = gMods[i].tickFails + 1
+    if gMods[i].tickFails >= TickFaultLimit:
+      gMods[i].tickFaulted = true
+      fail gMods[i].guid & " faulted, mod disabled: on_update failed " &
+           $TickFaultLimit & " times in a row (last status " & $int(st) &
+           ", " & statusName(st) & "). It stays loaded and its routes, " &
+           "events and hooks still work -- only its tick has stopped. " &
+           "Take it out and put it back, or restart the host, to try again."
+
+proc modTickFaulted*(index: int): bool =
+  ## Whether this mod has been dropped from the tick. For the mod manager's
+  ## row and for the tests; nothing in the loop above reads it back through
+  ## here.
+  if index < 0 or index >= gMods.len:
+    return false
+  result = gMods[index].tickFaulted
+
+proc modTickFailures*(index: int): int =
+  ## The current run of consecutive `on_update` failures. Zero for a healthy
+  ## mod, `TickFaultLimit` for a faulted one.
+  if index < 0 or index >= gMods.len:
+    return 0
+  result = gMods[index].tickFails
 
 proc unloadMods*() =
   ## Every mod, on the way out of the process.
