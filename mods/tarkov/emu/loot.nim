@@ -56,12 +56,17 @@
 ## makes a raid testable against the small fixture, and it is why nothing below
 ## is allowed to assume a table exists.
 ##
+## ## Magazines
+##
+## A preset's magazine spawns **loaded**, from `locations.<map>.staticAmmo` —
+## the map's own weighted cartridge table, which was imported and read by
+## nothing until this. The cartridge is the intersection of the weapon's
+## `ammoCaliber` bucket and the magazine's own `Cartridges` filter, so it both
+## fits the magazine and fires from the gun; a magazine with no intersection is
+## left empty rather than filled with a guess. See `fillMagazine`.
+##
 ## ## Not done here
 ##
-## - **Magazines are not filled.** A preset's magazine spawns empty. Doing it
-##   properly means resolving the weapon's caliber to `loot.staticAmmo`, and a
-##   half-done version that guesses a cartridge puts the wrong ammo in the gun,
-##   which is worse than an empty magazine the player can see is empty.
 ## - **Spawn point clustering.** SPT thins loose loot by picking a target count
 ##   for the map and choosing points to hit it; here every point is rolled
 ##   independently against its own probability. The totals are close and the
@@ -426,8 +431,136 @@ proc presetFor(p: PresetIndex; tpl: string): string =
       return p.items[i]
   result = ""
 
-proc expandPreset(s: var ItemSink; r: var Rng; presetItems, rootId: string) =
-  ## Every mod of a preset, re-parented onto `rootId` with fresh ids.
+# --- the map's ammunition --------------------------------------------------
+#
+# `locations.<map>.staticAmmo` is a per-map, per-caliber weighted list of
+# cartridges:
+#
+#     "staticAmmo": { "Caliber762x39": [ {"tpl": "...", "relativeProbability":
+#     12154}, ... ], ... }
+#
+# 28 calibers on most maps, 13 maps in an imported database. It was imported
+# and read by nothing, and `docs/IMPORTDB.md` guessed it belonged in
+# `expandAmmoBox`. It does not: **every one of the 213 ammo-box templates in a
+# real `templates.items` has exactly one cartridge in its `StackSlots` filter**,
+#
+#     ammo box StackSlots filter sizes, build/db/db.json:  1 -> 213 (all of them)
+#
+# so the box's own filter is not a choice at all and a weighted pick over it
+# would change nothing. Magazines are the other story:
+#
+#     magazine Cartridges filter sizes:  1 -> 3, 4 -> 9, 8 -> 29, 9 -> 51,
+#                                        13 -> 33, ... up to 13+
+#
+# and `loot.nim` has carried "magazines are not filled -- doing it properly
+# means resolving the weapon's caliber to `loot.staticAmmo`" as a stated gap
+# since it was written. That is what this is.
+
+type
+  AmmoTable = object
+    ## One map's `staticAmmo`, by caliber. Empty on a database that has none,
+    ## which leaves every magazine empty -- the behaviour before this existed.
+    calibers: seq[string]
+    dists: seq[Distribution]
+
+proc readAmmoTable(d: LootDb; locationId: string): AmmoTable =
+  result = AmmoTable(calibers: @[], dists: @[])
+  let root = sub(d, "locations." & locationId & ".staticAmmo")
+  if root.len == 0:
+    return
+  let j = whole(root)
+  if not isObject(j):
+    return
+  for k in keys(j):
+    # Caliber keys carry no dots, so a one-step lookup is exact.
+    let dist = readDistribution(raw(j.field(k)))
+    if dist.keys.len == 0:
+      continue
+    result.calibers.add k
+    result.dists.add dist
+
+proc cartridgeFor(a: AmmoTable; caliber: string; allowed: JsonRef;
+                  r: var Rng): string =
+  ## A cartridge of `caliber` that this magazine will physically take, drawn
+  ## with the map's own weights.
+  ##
+  ## The **intersection** is the whole safety property. `allowed` is the
+  ## magazine's own `Cartridges[0]._props.filters[0].Filter`, so nothing that
+  ## does not fit can come out of here however the map's table is weighted; the
+  ## caliber bucket is what stops a magazine whose filter lists two calibers
+  ## from being loaded with the one the gun does not fire. Either restriction
+  ## alone is wrong, which is why both are applied.
+  ##
+  ## "" when the map has no bucket for this caliber, or when nothing in the
+  ## bucket fits: the magazine is then left empty rather than filled with a
+  ## guess. One weapon preset in a real database hits that (`Caliber9x18PMM`,
+  ## which `bigmap`'s table does not carry) and 263 of the 264 do not.
+  result = ""
+  if caliber.len == 0 or not allowed.found:
+    return
+  var keep: seq[string] = @[]
+  var weights: seq[float] = @[]
+  for i in 0 ..< a.calibers.len:
+    if a.calibers[i] != caliber:
+      continue
+    let dist = a.dists[i]
+    for k in 0 ..< dist.keys.len:
+      var fits = false
+      for e in each(allowed):
+        if e.asText("") == dist.keys[k]:
+          fits = true
+          break
+      if fits:
+        keep.add dist.keys[k]
+        weights.add dist.weights[k]
+  if keep.len == 0:
+    return
+  let pickAt = pickWeighted(r, weights)
+  if pickAt < 0:
+    return
+  result = keep[pickAt]
+
+proc fillMagazine(s: var ItemSink; d: LootDb; a: AmmoTable; r: var Rng;
+                  magTpl, magId, caliber: string) =
+  ## Loads one magazine, if the map's table and the magazine's filter agree on
+  ## a cartridge.
+  ##
+  ## **How many** is `_max_count` -- the magazine's stated capacity, and the
+  ## only round count anything in the database gives. The real game spawns
+  ## partly-loaded magazines, and a fraction of capacity would be a constant
+  ## nobody could check against anything: neither `globals.config` nor the
+  ## reference dump says what it is (`grep` over `globals` finds
+  ## `MagazineMalfChanceMult`, `EliteMagChanceReduceMult` and nothing about
+  ## fill). So the magazine comes out full, which is generous in the player's
+  ## favour and is a number that came from the database rather than from here.
+  if caliber.len == 0:
+    return
+  let props = itemProps(d, magTpl)
+  if props.len == 0:
+    return
+  let slots = field(props, "Cartridges")
+  if not isArray(slots):
+    return
+  for slot in each(slots):
+    let rounds = slot.field("_max_count").asInt(0)
+    if rounds <= 0:
+      continue
+    let allowed = at(slot.field("_props.filters"), 0).field("Filter")
+    let cartridge = cartridgeFor(a, caliber, allowed, r)
+    if cartridge.len == 0:
+      continue
+    var doc = simpleItem(mongoId(r), cartridge)
+    setText(doc, "parentId", magId)
+    setText(doc, "slotId", slot.field("_name").asText("cartridges"))
+    var upd = newDoc()
+    setNumber(upd, "StackObjectsCount", rounds)
+    setRaw(doc, "upd", text(upd))
+    s.emit text(doc)
+
+proc expandPreset(s: var ItemSink; d: LootDb; a: AmmoTable; r: var Rng;
+                  presetItems, rootId: string) =
+  ## Every mod of a preset, re-parented onto `rootId` with fresh ids, and every
+  ## magazine among them loaded from the map's `staticAmmo`.
   ##
   ## The preset's own ids are reused across every copy of the weapon in the
   ## database, so they cannot go out as-is: two rifles on the floor sharing a
@@ -445,6 +578,11 @@ proc expandPreset(s: var ItemSink; r: var Rng; presetItems, rootId: string) =
       newIds.add rootId   # the preset's root *is* the item already emitted
     else:
       newIds.add mongoId(r)
+  # The caliber comes from the *weapon* -- the preset's root -- because that is
+  # the only thing in the tree that states one; a magazine states only what it
+  # will physically hold, which is a different question on a mag that takes two.
+  let rootTpl = field(list.items[0], "_tpl").asText("")
+  let caliber = field(itemProps(d, rootTpl), "ammoCaliber").asText("")
   for i in 1 ..< list.len:
     var doc = parseObject(list.items[i])
     if not doc.ok:
@@ -458,6 +596,8 @@ proc expandPreset(s: var ItemSink; r: var Rng; presetItems, rootId: string) =
         break
     setText(doc, "parentId", mapped)
     s.emit text(doc)
+    # And if that mod is a magazine, load it.
+    fillMagazine(s, d, a, r, get(doc, "_tpl").asText(""), newIds[i], caliber)
 
 # --- ammo boxes ------------------------------------------------------------
 
@@ -514,7 +654,8 @@ proc expandAmmoBox(s: var ItemSink; d: LootDb; r: var Rng;
 
 # --- one spawned item ------------------------------------------------------
 
-proc spawnItem(s: var ItemSink; d: LootDb; p: PresetIndex; r: var Rng;
+proc spawnItem(s: var ItemSink; d: LootDb; p: PresetIndex; a: AmmoTable;
+               r: var Rng;
                tpl, parentId, slotId, locationJson: string): string =
   ## One item and everything it needs to be a real item, appended to `s`.
   ## Returns the new item's id.
@@ -539,14 +680,15 @@ proc spawnItem(s: var ItemSink; d: LootDb; p: PresetIndex; r: var Rng;
   if not expandAmmoBox(s, d, r, tpl, id):
     let preset = presetFor(p, tpl)
     if preset.len > 0:
-      expandPreset(s, r, preset, id)
+      expandPreset(s, d, a, r, preset, id)
   result = id
 
 # ---------------------------------------------------------------------------
 # Filling a container
 # ---------------------------------------------------------------------------
 
-proc packInto(s: var ItemSink; d: LootDb; p: PresetIndex; r: var Rng;
+proc packInto(s: var ItemSink; d: LootDb; p: PresetIndex; a: AmmoTable;
+              r: var Rng;
               grids: var seq[Cells]; containerId, tpl: string): bool =
   ## First fit across a container's grids, upright then rotated -- the same
   ## scan `emu/grid.findSpace` does, over sizes read through `LootDb`. False
@@ -563,12 +705,12 @@ proc packInto(s: var ItemSink; d: LootDb; p: PresetIndex; r: var Rng;
       while x < grids[gi].w:
         if fitsAt(grids[gi], x, y, w, h):
           occupy(grids[gi], x, y, w, h)
-          discard spawnItem(s, d, p, r, tpl, containerId, grids[gi].name,
+          discard spawnItem(s, d, p, a, r, tpl, containerId, grids[gi].name,
                             locationRaw(x, y, false))
           return true
         if w != h and fitsAt(grids[gi], x, y, h, w):
           occupy(grids[gi], x, y, h, w)
-          discard spawnItem(s, d, p, r, tpl, containerId, grids[gi].name,
+          discard spawnItem(s, d, p, a, r, tpl, containerId, grids[gi].name,
                             locationRaw(x, y, true))
           return true
         inc x
@@ -633,7 +775,7 @@ proc forcedFor(forcedJson, containerId: string): seq[string] =
     if tpl.len > 0:
       result.add tpl
 
-proc staticContainers(d: LootDb; p: PresetIndex; r: var Rng;
+proc staticContainers(d: LootDb; p: PresetIndex; a: AmmoTable; r: var Rng;
                       cfg: LootConfig; locationId: string;
                       chanceMul: float; budget: var int): seq[string] =
   result = @[]
@@ -679,7 +821,7 @@ proc staticContainers(d: LootDb; p: PresetIndex; r: var Rng;
     if grids.len > 0:
       let forced = forcedFor(forcedJson, spawnId)
       for tpl in forced:
-        discard packInto(sink, d, p, r, grids, containerId, tpl)
+        discard packInto(sink, d, p, a, r, grids, containerId, tpl)
 
       let pool = staticPool(d, locationId, containerTpl)
       if pool.len > 0:
@@ -695,7 +837,7 @@ proc staticContainers(d: LootDb; p: PresetIndex; r: var Rng;
           let tpl = pick(dist, r)
           if tpl.len == 0:
             break
-          if not packInto(sink, d, p, r, grids, containerId, tpl):
+          if not packInto(sink, d, p, a, r, grids, containerId, tpl):
             break   # full: every further item would land on one already there
           inc k
 
@@ -741,7 +883,7 @@ proc descendants(list: List; rootId: string; picked: var seq[int]) =
     frontier = added
     inc guard
 
-proc looseSpawn(d: LootDb; p: PresetIndex; r: var Rng;
+proc looseSpawn(d: LootDb; p: PresetIndex; a: AmmoTable; r: var Rng;
                 point: JsonRef; budget: var int): string =
   ## One loose spawn point, resolved to a loot entry.
   let tmpl = point.field("template")
@@ -809,12 +951,13 @@ proc looseSpawn(d: LootDb; p: PresetIndex; r: var Rng;
     if not expandAmmoBox(sink, d, r, tpl, newRoot):
       let preset = presetFor(p, tpl)
       if preset.len > 0:
-        expandPreset(sink, r, preset, newRoot)
+        expandPreset(sink, d, a, r, preset, newRoot)
 
   budget = budget - sink.items.len
   result = lootEntry(raw(tmpl), newRoot, itemsArray(sink))
 
-proc looseLoot(d: LootDb; p: PresetIndex; r: var Rng; cfg: LootConfig;
+proc looseLoot(d: LootDb; p: PresetIndex; a: AmmoTable; r: var Rng;
+               cfg: LootConfig;
                locationId: string; chanceMul: float;
                budget: var int): seq[string] =
   result = @[]
@@ -830,7 +973,7 @@ proc looseLoot(d: LootDb; p: PresetIndex; r: var Rng; cfg: LootConfig;
     for pt in pts:
       if budget <= 0:
         return
-      let e = looseSpawn(d, p, r, pt, budget)
+      let e = looseSpawn(d, p, a, r, pt, budget)
       if e.len > 0:
         result.add e
 
@@ -845,7 +988,7 @@ proc looseLoot(d: LootDb; p: PresetIndex; r: var Rng; cfg: LootConfig;
                       cfg.looseMultiplier * chanceMul
     if not chance(r, probability):
       continue
-    let e = looseSpawn(d, p, r, pt, budget)
+    let e = looseSpawn(d, p, a, r, pt, budget)
     if e.len > 0:
       result.add e
 
@@ -879,6 +1022,10 @@ proc generateLoot*(d: LootDb; cfg: LootConfig;
   if looseMul < 0.0: looseMul = 0.0
 
   let p = buildPresets(d)
+  # The map's own cartridge table, read once. Threaded rather than held in a
+  # module variable: two raids on two maps can be generated at the same time,
+  # and a shared one would load a Woods magazine out of Factory's table.
+  let ammo = readAmmoTable(d, locationId)
   var out1 = newList()
 
   # The budget, shared out, and it is the same rule the flea's offer cap
@@ -900,14 +1047,14 @@ proc generateLoot*(d: LootDb; cfg: LootConfig;
   if staticShare < 1:
     staticShare = budget
   var staticBudget = staticShare
-  let statics = staticContainers(d, p, r, cfg, locationId, containerMul,
+  let statics = staticContainers(d, p, ammo, r, cfg, locationId, containerMul,
                                  staticBudget)
   for e in statics:
     out1.add e
   # `staticBudget` is what that pass did *not* spend, so the sum of the two
   # halves is still exactly `maxItems`.
   var looseBudget = budget - staticShare + staticBudget
-  let loose = looseLoot(d, p, r, cfg, locationId, looseMul, looseBudget)
+  let loose = looseLoot(d, p, ammo, r, cfg, locationId, looseMul, looseBudget)
   for e in loose:
     out1.add e
   result = text(out1)
@@ -975,6 +1122,14 @@ const Fixture* = """{
         ],
         "staticForced": [
           { "containerId": "crate_1", "itemTpl": "qqqquest0000000000000001" }
+        ]
+      },
+      "staticAmmo": {
+        "TestCaliber": [
+          { "tpl": "aaaaammo0000000000000001", "relativeProbability": 1000 }
+        ],
+        "OtherCaliber": [
+          { "tpl": "zzzzammo0000000000000009", "relativeProbability": 1000 }
         ]
       },
       "looseLoot": {
@@ -1087,11 +1242,26 @@ const Fixture* = """{
       },
       "wwwwgun00000000000000001": {
         "_id": "wwwwgun00000000000000001",
-        "_props": { "Name": "Test rifle", "Width": 4, "Height": 2, "StackMaxSize": 1 }
+        "_props": { "Name": "Test rifle", "Width": 4, "Height": 2, "StackMaxSize": 1,
+                    "ammoCaliber": "TestCaliber" }
       },
       "mmmmmag00000000000000001": {
         "_id": "mmmmmag00000000000000001",
-        "_props": { "Name": "Test magazine", "Width": 1, "Height": 1, "StackMaxSize": 1 }
+        "_props": { "Name": "Test magazine", "Width": 1, "Height": 1, "StackMaxSize": 1,
+          "Cartridges": [
+            {
+              "_name": "cartridges",
+              "_max_count": 30,
+              "_props": { "filters": [ { "Filter": [ "aaaaammo0000000000000001",
+                                                     "zzzzammo0000000000000009" ] } ] }
+            }
+          ]
+        }
+      },
+      "zzzzammo0000000000000009": {
+        "_id": "zzzzammo0000000000000009",
+        "_props": { "Name": "Wrong-caliber cartridge", "Width": 1, "Height": 1,
+                    "StackMaxSize": 60 }
       }
     }
   }
@@ -1180,6 +1350,66 @@ proc selfCheck*(document: string): string =
         "the rifle spawned with its magazine")
   check(result, countOccurrences(a, "\"r0000000000000000000000r\"") == 0,
         "the preset's own ids were replaced")
+
+  # -- the magazine is loaded, out of `staticAmmo` -------------------------
+  #
+  # Asserted through the *parentage*, not by counting a template: the fixture's
+  # static pool spawns the same cartridge on its own, so a check that only
+  # counted `aaaaammo...` would be green with `fillMagazine` deleted.
+  var magRounds = -1
+  var magCartridge = ""
+  for i in 0 ..< entries.len:
+    let inside = parseArray(whole(entries.items[i]).field("Items"))
+    var magIds: seq[string] = @[]
+    for k in 0 ..< inside.len:
+      let it = whole(inside.items[k])
+      if it.field("_tpl").asText("") == "mmmmmag00000000000000001":
+        magIds.add it.field("_id").asText("")
+    for k in 0 ..< inside.len:
+      let it = whole(inside.items[k])
+      for m in magIds:
+        if m.len > 0 and it.field("parentId").asText("") == m:
+          magCartridge = it.field("_tpl").asText("")
+          magRounds = it.field("upd.StackObjectsCount").asInt(-1)
+  check(result, magCartridge == "aaaaammo0000000000000001",
+        "the magazine is loaded with a cartridge of the weapon's own caliber")
+  check(result, magRounds == 30,
+        "and with the magazine's stated capacity, from `_max_count`")
+  check(result, countOccurrences(a, "zzzzammo0000000000000009") == 0,
+        "the other caliber in the same filter is never loaded")
+
+  # And the source of it. With `staticAmmo` taken out of the document and
+  # nothing else changed, the magazine has to come back empty -- which is what
+  # makes the two checks above claims about the table rather than about the
+  # magazine's own filter.
+  var stripped = ""
+  var si = 0
+  let marker = "\"staticAmmo\""
+  while si < document.len:
+    if si + marker.len <= document.len and
+       document.substr(si, si + marker.len - 1) == marker:
+      stripped.add "\"notStaticAmmo\""
+      si = si + marker.len
+    else:
+      stripped.add document[si]
+      inc si
+  let noAmmo = generateLoot(textDb(stripped), cfg, "testmap", "raid-one")
+  var loadedWithout = false
+  let noEntries = parseArray(noAmmo)
+  for i in 0 ..< noEntries.len:
+    let inside = parseArray(whole(noEntries.items[i]).field("Items"))
+    var magIds: seq[string] = @[]
+    for k in 0 ..< inside.len:
+      let it = whole(inside.items[k])
+      if it.field("_tpl").asText("") == "mmmmmag00000000000000001":
+        magIds.add it.field("_id").asText("")
+    for k in 0 ..< inside.len:
+      let it = whole(inside.items[k])
+      for m in magIds:
+        if m.len > 0 and it.field("parentId").asText("") == m:
+          loadedWithout = true
+  check(result, noEntries.len >= 3 and not loadedWithout,
+        "with no `staticAmmo` table the magazine spawns empty")
 
   # An ammo box arrives with cartridges, split to the stack limit.
   let manyRaids = generateLoot(d, cfg, "testmap", "raid-ammo-check")

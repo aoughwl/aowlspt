@@ -240,6 +240,66 @@ proc prune*(messages: List; nowSeconds: int): List =
       out1.add messages.items[i]
   result = out1
 
+# ---------------------------------------------------------------------------
+# What the player does to a dialog
+# ---------------------------------------------------------------------------
+#
+# Four routes -- `read`, `pin`, `unpin`, `remove` -- and all four were stubs
+# answering `null` and doing nothing, so reading mail never cleared the badge,
+# pinning never pinned and removing never removed. The reference dump has the
+# shapes: `SetDialogReadRequestData { Dialogs: List<MongoId> }`,
+# `PinDialogRequestData { DialogId }`, `RemoveDialogRequestData { DialogId }`,
+# and `Profile.Dialogue { Id, Type, Messages, Users, Pinned, New,
+# AttachmentsNew }` -- which is why `pinned` and `new` are members of what
+# `dialogList` builds, and why both were hard-coded.
+#
+# **Where the state lives.** `read` is per *message*, so it goes on the message.
+# `pinned` and `removed` are per *dialog*, and this mod has no dialog document
+# to put them on -- the inbox is a flat list of messages and a dialog is a
+# `uid` that appears in some of them. So they go in a second store key,
+# `maildlg.<profile id>`, an object keyed by sender. Keeping them there rather
+# than duplicating them onto every message means "pin this dialog" is one write
+# whatever the dialog holds, and a dialog with no messages left can still be
+# marked.
+
+const StateKeyPrefix* = "maildlg."
+
+proc dialogStateKey*(profileId: string): string = StateKeyPrefix & profileId
+
+proc loadDialogState(profileId: string; usable: var bool): Doc =
+  let raw1 = readKey(dialogStateKey(profileId), usable)
+  if raw1.len == 0:
+    return newDoc()
+  result = parseObject(raw1)
+  if not result.ok:
+    result = newDoc()
+
+proc loadDialogState(profileId: string): Doc =
+  var usable = true
+  result = loadDialogState(profileId, usable)
+
+proc saveDialogState(profileId: string; state: Doc): bool =
+  result = save(dialogStateKey(profileId), text(state)) == Ok
+
+proc dialogFlag(state: Doc; uid, name: string): bool =
+  if uid.len == 0:
+    return false
+  result = get(state, uid).field(name).asBool(false)
+
+proc setDialogFlag(state: var Doc; uid, name: string; value: bool) =
+  var entry = parseObject(getRaw(state, uid))
+  if not entry.ok:
+    entry = newDoc()
+  setBool(entry, name, value)
+  setRaw(state, uid, text(entry))
+
+proc unread(messageJson: string): bool =
+  ## Absent is unread. Every message written before this existed has no `read`
+  ## member, and the honest reading of "nobody has said you read this" is that
+  ## you have not -- the other way round would silently clear the badge on
+  ## every mailbox in existence the first time this shipped.
+  not field(messageJson, "read").asBool(false)
+
 proc deliver*(profileId, sender, text1: string; kind: MessageKind;
               nowSeconds: int; attachments: string = ""): bool =
   ## Appends a message and saves. The whole inbox is rewritten, which is the
@@ -276,18 +336,129 @@ proc deliver*(profileId, sender, text1: string; kind: MessageKind;
   if result:
     discard notifyProfile(profileId,
                           newMessageNote(sender, "", ord(kind), nowSeconds))
+    # A dialog the player removed comes back when its sender writes again --
+    # the client's own behaviour, and the only alternative here is a trader
+    # whose insurance returns land in a row nobody can see.
+    var stateUsable = true
+    var state = loadDialogState(profileId, stateUsable)
+    if stateUsable and dialogFlag(state, sender, "removed"):
+      setDialogFlag(state, sender, "removed", false)
+      discard saveDialogState(profileId, state)
+
+proc markDialogsRead*(profileId: string; dialogIds: seq[string]): int =
+  ## `/client/mail/dialog/read`. Returns how many messages changed.
+  ##
+  ## An empty `dialogIds` marks **nothing**, rather than everything: the
+  ## request DTO always names the dialogs, so an empty list is a request this
+  ## server did not understand, and the destructive reading of a request nobody
+  ## made is the wrong one.
+  result = 0
+  if dialogIds.len == 0:
+    return 0
+  var usable = true
+  var messages = loadMail(profileId, usable)
+  if not usable:
+    return 0
+  for i in 0 ..< messages.len:
+    let uid = field(messages.items[i], "uid").asText("")
+    var wanted = false
+    for want in dialogIds:
+      if want == uid:
+        wanted = true
+    if not wanted or not unread(messages.items[i]):
+      continue
+    var m = parseObject(messages.items[i])
+    if not m.ok:
+      continue
+    setBool(m, "read", true)
+    messages.replaceAt(i, text(m))
+    inc result
+  if result > 0 and not saveMail(profileId, messages):
+    return 0
+
+proc setDialogPinned*(profileId, dialogId: string; pinned: bool): bool =
+  ## `/client/mail/dialog/pin` and `/unpin`.
+  if dialogId.len == 0:
+    return false
+  var usable = true
+  var state = loadDialogState(profileId, usable)
+  if not usable:
+    return false
+  if dialogFlag(state, dialogId, "pinned") == pinned:
+    return true
+  setDialogFlag(state, dialogId, "pinned", pinned)
+  result = saveDialogState(profileId, state)
+
+proc removeDialog*(profileId, dialogId: string; kept: var int): bool =
+  ## `/client/mail/dialog/remove`. `kept` comes back with the number of
+  ## messages that were **not** deleted because they still hold the player's
+  ## property.
+  ##
+  ## The client's semantics are a delete: the row goes off the inbox and does
+  ## not come back. That is what happens here -- the dialog is marked `removed`
+  ## and `dialogList` stops building a row for it, and every message of that
+  ## sender that holds nothing is deleted outright rather than merely hidden,
+  ## because a hidden message is a store that grows forever for a player who
+  ## thought they were tidying up.
+  ##
+  ## The exception is the one this mod cannot give away: **a message that still
+  ## holds uncollected items is the only place those items exist.** Deleting it
+  ## destroys an insurance return or a quest reward on a mis-click, with no
+  ## undo anywhere in this server. Those messages stay in the store. They are
+  ## off the inbox like everything else in the dialog, and they are still on
+  ## `getAllAttachments` -- the "collect all" screen, which lists messages with
+  ## rewards and not dialogs -- so the gear is reachable and the row is gone.
+  ##
+  ## A new message from the same sender clears the mark, which is also the
+  ## client's behaviour: a deleted chat comes back when the trader writes
+  ## again. `deliver` does that.
+  kept = 0
+  if dialogId.len == 0:
+    return false
+  var usable = true
+  var messages = loadMail(profileId, usable)
+  if not usable:
+    return false
+  var keepList = newList()
+  var removedAny = false
+  for i in 0 ..< messages.len:
+    let m = whole(messages.items[i])
+    if m.field("uid").asText("") != dialogId:
+      keepList.add messages.items[i]
+      continue
+    removedAny = true
+    if m.field("hasRewards").asBool(false) and
+       not m.field("rewardCollected").asBool(false):
+      keepList.add messages.items[i]
+      inc kept
+  if removedAny and not saveMail(profileId, keepList):
+    return false
+  var state = loadDialogState(profileId, usable)
+  if not usable:
+    return false
+  setDialogFlag(state, dialogId, "removed", true)
+  result = saveDialogState(profileId, state)
 
 proc dialogList*(profileId: string): string =
   ## The inbox screen: one entry per sender, with the newest message as its
-  ## preview and an unread count.
+  ## preview, an unread count, and whether the player pinned it.
+  ##
+  ## A dialog the player removed is not built at all -- that is what makes
+  ## `remove` stick across a restart, and it is checked over the wire rather
+  ## than assumed.
   let messages = loadMail(profileId)
+  let state = loadDialogState(profileId)
   var senders: seq[string] = @[]
   var newest: seq[string] = @[]
   var counts: seq[int] = @[]
   var waiting: seq[int] = @[]
+  var fresh: seq[int] = @[]
   for i in 0 ..< messages.len:
     let m = whole(messages.items[i])
     let uid = m.field("uid").asText("")
+    if dialogFlag(state, uid, "removed"):
+      continue
+    let isNew = (if unread(messages.items[i]): 1 else: 0)
     # A message still holding something is what puts the parcel badge on the
     # dialog. Counted rather than hard-coded to zero: a badge that never appears
     # sends a player who was posted an insurance return looking for it in the
@@ -304,11 +475,13 @@ proc dialogList*(profileId: string): string =
       newest.add messages.items[i]
       counts.add 1
       waiting.add (if pending: 1 else: 0)
+      fresh.add isNew
     else:
       newest[at] = messages.items[i]
       counts[at] = counts[at] + 1
       if pending:
         waiting[at] = waiting[at] + 1
+      fresh[at] = fresh[at] + isNew
 
   var out1 = arr()
   for k in 0 ..< senders.len:
@@ -316,8 +489,12 @@ proc dialogList*(profileId: string): string =
     put(d, "_id", senders[k])
     put(d, "type", ord(mkNpcTrader))
     put(d, "message", raw(newest[k]))
-    put(d, "pinned", false)
-    put(d, "new", 0)
+    put(d, "pinned", dialogFlag(state, senders[k], "pinned"))
+    # The unread badge. Hard-coded to zero for as long as this route existed,
+    # which is the same defect as the four stub handlers: the client draws
+    # whatever the server says, and a server that always says "nothing new"
+    # has no unread mail however much of it arrives.
+    put(d, "new", fresh[k])
     put(d, "attachmentsNew", waiting[k])
     put(d, "Users", arr())
     out1.add d

@@ -607,12 +607,25 @@ proc advanceQuestsAfterRaid*(p: var Profile; beforeText, location,
       let ident = condId(c)
       if ident.len == 0 or hasCounter(now1, ident):
         continue
-      var unverifiable = false
-      let credit = killCredit(c, p.text, location, exitStatus, unverifiable)
+      var refused: seq[string] = @[]
+      let credit = killCredit(c, p.text, location, exitStatus, refused)
       if credit > 0:
         now1 = setCounter(now1, ident, "CounterCreator", qid, credit)
         info "credited " & $credit & " kill(s) to " & questLabel(qid, tpl) &
              " from the raid's victim list"
+      elif refused.len > 0:
+        # The refusal is said out loud, with the clause that caused it. A
+        # player who cannot finish a quest deserves to know which qualifier
+        # stopped it -- silence here is indistinguishable from a server that
+        # simply lost the kills. `killCredit` carries why each one is refused.
+        var which = ""
+        for r in refused:
+          if which.len > 0: which.add ", "
+          which.add r
+        warn questLabel(qid, tpl) & ": this raid's kills were not credited " &
+             "from the victim list -- the condition qualifies on " & which &
+             ", which the raid report does not let this server check. " &
+             "The quest advances only if the client reported its own counter."
 
   setTopLevel(p, "TaskConditionCounters", now1)
 

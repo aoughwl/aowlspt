@@ -192,11 +192,38 @@ people's work in that directory:
    as well, that is an emulator-side decision and not a reason to duplicate
    6.7 MB of map descriptions.
 
-One thing is worth naming precisely as **not expressible**: `bots/types/*.json`
-imports fine and `emu/bots` reads it, but nothing in the emulator consumes
-`staticAmmo` — `expandAmmoBox` picks a cartridge from the box template's own
-filter instead. The data is imported (`locations.<map>.staticAmmo`) so that the
-day someone wires it up, the table is already where they would look.
+**`staticAmmo` is read now, and this note used to point at the wrong consumer.**
+It said the table was imported and unused because "`expandAmmoBox` picks a
+cartridge from the box template's own filter instead". `expandAmmoBox` is not
+where it belongs and never was: **every one of the 213 ammo-box templates in
+`build/db/db.json` has exactly one cartridge in its `StackSlots` filter**, so
+the box's own filter is not a choice and a weighted pick over it would change
+nothing.
+
+```
+# filter sizes over templates.items in build/db/db.json
+ammo boxes  (StackSlots[]._props.filters[0].Filter):  1 -> 213   (all of them)
+magazines   (Cartridges[]._props.filters[0].Filter):  1 -> 3, 4 -> 9, 5 -> 13,
+                                                      8 -> 29, 9 -> 51, 13 -> 33, …
+```
+
+Magazines are the choice, and `emu/loot` had carried "magazines are not filled;
+doing it properly means resolving the weapon's caliber to `loot.staticAmmo`" as
+a stated gap since it was written. That is what reads it: `emu/loot.fillMagazine`
+loads every magazine a weapon preset puts on the floor with a cartridge drawn
+from `locations.<map>.staticAmmo`, weighted by the map's own
+`relativeProbability`, intersected with the magazine's `Cartridges` filter and
+restricted to the weapon's `_props.ammoCaliber` bucket. Over `globals.ItemPresets`
+against `bigmap`'s table, **263 of the 264 presets with a magazine resolve to a
+cartridge**; the one that does not is a `Caliber9x18PMM` weapon that map's table
+has no bucket for, and its magazine is left empty rather than filled with a
+guess. `realtest` asserts the loaded magazines over real maps.
+
+Nothing in the imported set is now named as not expressible. The row that used
+to be — `staticAmmo` — is the one above, and the reason it sat unread for so
+long is worth keeping: the note said which function would consume it, that
+function was the wrong one, and nobody checked the filter sizes that would have
+said so in one line.
 
 ## Tables the emulator reads
 

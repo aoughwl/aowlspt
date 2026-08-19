@@ -20,11 +20,19 @@
 ##
 ## What is **not** evaluated, and is not faked:
 ##
-## - `distance`, `weapon`, `daytime`, `equipment` and the other qualifiers
-##   inside a `Kills` condition. When one is present and non-empty the kill is
-##   not credited from a raid's victim list at all, because crediting a kill
+## - `daytime`, `weaponCaliber`, the weapon-mod lists and the two equipment
+##   lists inside a `Kills` condition. When one of those restricts anything the
+##   kill is not credited from a raid's victim list, because crediting a kill
 ##   whose qualifier could not be checked hands out progress that was not
-##   earned. The client's own counter still counts — see `mergeCounters`.
+##   earned — but the refusal now **names the clause** it could not check, so a
+##   player whose quest will not finish is told which one stopped it. The
+##   client's own counter still counts — see `mergeCounters`.
+##
+##   `distance` **is** checked: the reference dump's `Victim` carries a
+##   `Distance` per kill and this used to refuse it anyway. So did 191 of the
+##   283 `Kills` sub-conditions in a real database, which carry `distance` and
+##   `daytime` keys with neutral values (`>= 0`, `0..0`) and restrict nothing.
+##   `killCredit` carries the counts and the reasoning.
 ## - Time limits (`availableAfter`, `Fail` conditions with a duration). Nothing
 ##   here has a clock in it beyond the timestamp a caller passes in.
 ## - Skill levels beyond `Skills.Common`, and hideout-area conditions.
@@ -473,17 +481,120 @@ proc sideMatches(target, side: string): bool =
   of "Savage": side == "Savage"
   else: target == side
 
+proc isMongoId(s: string): bool =
+  ## A 24-character hex string. A quest's `weapon` list is written in template
+  ## ids, and this is how a value that *is* one is told from a display name --
+  ## which matters because `Victim.Weapon` is typed `String` in the reference
+  ## and nothing establishes which of the two the client puts there.
+  if s.len != 24:
+    return false
+  for ch in s:
+    let hex = (ch >= '0' and ch <= '9') or (ch >= 'a' and ch <= 'f') or
+              (ch >= 'A' and ch <= 'F')
+    if not hex:
+      return false
+  result = true
+
+proc restrictsDistance(node: JsonRef): bool =
+  ## Whether a `distance` qualifier restricts anything at all.
+  ##
+  ## `{"compareMethod": ">=", "value": 0}` is *every kill at every range* --
+  ## the database's way of writing "no restriction", and it is what 243 of the
+  ## 283 `Kills` sub-conditions in a real `templates.quests` carry. Reading the
+  ## mere presence of the key as a restriction is what used to refuse two
+  ## thirds of every kill condition in the game:
+  ##
+  ##     distance values, build/db/db.json, 283 Kills sub-conditions
+  ##       (">=", 0)  243     absent  27     everything else  13
+  if not node.found or node.isNull:
+    return false
+  let how = node.field("compareMethod").asText(">=")
+  let want = numberAt(node, "value", 0.0)
+  if want <= 0.0 and (how == ">=" or how == ">"):
+    return false
+  result = true
+
+proc distanceMet(how: string; want, got: float): bool =
+  case how
+  of ">=": got >= want
+  of ">": got > want
+  of "<=": got <= want
+  of "<": got < want
+  of "=", "==": got == want
+  of "!=": got != want
+  else:
+    # An unknown comparison is not a comparison. The caller turns this into a
+    # refusal rather than a credit, for the same reason as everything else here.
+    false
+
+proc restrictsDaytime(node: JsonRef): bool =
+  ## `{"from": 0, "to": 0}` is the whole day -- 244 of 283 in a real database.
+  if not node.found or node.isNull:
+    return false
+  let a = numberAt(node, "from", 0.0)
+  let b = numberAt(node, "to", 0.0)
+  result = a != b
+
+proc noteRefusal(refused: var seq[string]; what: string) =
+  for r in refused:
+    if r == what:
+      return
+  refused.add what
+
 proc killCredit*(cond, victimsJson, location, exitStatus: string;
-                 unverifiable: var bool): int =
+                 refused: var seq[string]): int =
   ## How many of a raid's victims this `CounterCreator` should count.
   ##
-  ## `unverifiable` comes back true when the condition carries a qualifier this
-  ## module cannot check -- a weapon list, a distance, a time of day. In that
-  ## case the count is **zero**, not a guess: the alternative is crediting a
-  ## sniper-rifle-only kill to a pistol, which completes a quest that was not
-  ## done. The client's own counter is the answer for those, and it is merged
-  ## in ahead of this.
-  unverifiable = false
+  ## `refused` comes back naming every qualifier that stopped the count. It is
+  ## empty on a clean credit and on a counter that is not about kills at all;
+  ## when it is not empty the count is **zero**, not a guess, because crediting
+  ## a kill whose qualifier could not be checked hands out progress that was not
+  ## earned. The caller turns the names into a sentence the player can read --
+  ## a quest that will not finish should say which clause stopped it.
+  ##
+  ## ## What the raid report actually carries
+  ##
+  ## The refusal used to reach much further than the data justified. The
+  ## reference dump's `Victim` (`SPTarkov.Server.Core.Models.Eft.Common.Tables`)
+  ## is:
+  ##
+  ##     Distance, Level, PrestigeLevel, ProfileId, AccountId, BodyPart,
+  ##     ColliderType, Location, Name, Role, Side, Time, Weapon
+  ##
+  ## so **`distance` is in the report**, per kill, as a number -- and it was
+  ## being refused. Worse, the old check refused on the *presence* of the
+  ## `distance` and `daytime` keys, and a real `templates.quests` writes both on
+  ## almost every kill condition with neutral values (`>= 0`, `0..0`): 191 of
+  ## the 283 `Kills` sub-conditions in `build/db/db.json` carry no real
+  ## qualifier at all and every one of them was refused.
+  ##
+  ## ## What is still refused, and why
+  ##
+  ## - **`daytime`** -- `Victim.Time` is a `String` and nothing establishes
+  ##   which clock it is on. The condition is about the *raid's* clock (the
+  ##   windows in the database are 22->10, 21->4, 21->5: in-game night), and EFT
+  ##   runs its clock at seven times real time with a per-raid offset. A wall
+  ##   clock read as a raid clock over-credits about half the time, which is the
+  ##   exact failure the refusal exists to prevent.
+  ## - **`weapon`**, when the report does not spell it as a template id. The
+  ##   condition's list is template ids; `Victim.Weapon` is a `String`. If the
+  ##   client puts an id there this credits it; if it puts a display name there
+  ##   nothing here can map one to the other -- that needs `templates.items` and
+  ##   the locale table, and this module deliberately reads no database.
+  ## - **`weaponCaliber`** -- the report carries no caliber, and deriving one
+  ##   from a weapon id needs the item table this module does not read.
+  ## - **`weaponModsInclusive` / `weaponModsExclusive`** -- the report carries
+  ##   nothing about what was bolted to the gun.
+  ## - **`equipmentInclusive` / `equipmentExclusive`** -- what the *player* was
+  ##   wearing at the moment of the kill is not in the report in any form.
+  ## - **`enemyEquipmentInclusive` / `enemyEquipmentExclusive` /
+  ##   `enemyHealthEffects`** -- `Victim` carries no equipment and no effects.
+  ##
+  ## None of these is a dead end for the player: this whole function is the
+  ## *fallback* for a counter the client did not report. `mergeCounters` takes
+  ## the client's own `TaskConditionCounters` first, and the client can check
+  ## every one of the above because it was there.
+  refused = @[]
   result = 0
   let subs = subConditions(cond)
   if subs.len == 0:
@@ -493,7 +604,10 @@ proc killCredit*(cond, victimsJson, location, exitStatus: string;
   var side = ""
   var roles = notFound()
   var bodyParts = notFound()
-  var propsText: seq[string] = @[]
+  var weapons = notFound()
+  var distHow = ""
+  var distWant = 0.0
+  var wantsDistance = false
 
   for s in subs:
     let k = condKind(s)
@@ -503,34 +617,58 @@ proc killCredit*(cond, victimsJson, location, exitStatus: string;
     of "Kills":
       wantsKills = true
       side = sj.field("target").asText("")
-      propsText.add sp
-      # Qualifiers with no evaluator here. Checked for presence rather than
-      # ignored, because ignoring one over-credits.
-      if sj.field("weapon").count > 0 or
-         sj.field("weaponModsInclusive").count > 0 or
-         sj.field("distance").exists or
-         sj.field("equipmentInclusive").count > 0 or
-         sj.field("daytime").exists:
-        unverifiable = true
       if sj.field("savageRole").count > 0:
         roles = sj.field("savageRole")
       if sj.field("bodyPart").count > 0:
         bodyParts = sj.field("bodyPart")
+      # Checked here, against the victim record's own members.
+      let dist = sj.field("distance")
+      if restrictsDistance(dist):
+        wantsDistance = true
+        distHow = dist.field("compareMethod").asText(">=")
+        distWant = numberAt(dist, "value", 0.0)
+      if sj.field("weapon").count > 0:
+        weapons = sj.field("weapon")
+      # Not checked here. Each one names itself, so the player is told which
+      # clause stopped the quest rather than being told nothing.
+      if restrictsDaytime(sj.field("daytime")):
+        noteRefusal(refused, "daytime")
+      if sj.field("weaponModsInclusive").count > 0 or
+         sj.field("weaponModsExclusive").count > 0:
+        noteRefusal(refused, "weapon mods")
+      if sj.field("weaponCaliber").count > 0:
+        noteRefusal(refused, "weaponCaliber")
+      if sj.field("equipmentInclusive").count > 0 or
+         sj.field("equipmentExclusive").count > 0:
+        noteRefusal(refused, "your own equipment")
+      if sj.field("enemyEquipmentInclusive").count > 0 or
+         sj.field("enemyEquipmentExclusive").count > 0:
+        noteRefusal(refused, "the target's equipment")
+      if sj.field("enemyHealthEffects").count > 0:
+        noteRefusal(refused, "the target's health effects")
     of "Location":
       let target = sj.field("target")
       if target.count > 0 and not listHas(target, location):
         # The raid was somewhere else. Not unverifiable -- verified, and no.
+        refused = @[]
         return 0
     of "ExitStatus":
       let status = sj.field("status")
       if status.count > 0 and not listHas(status, exitStatus):
+        refused = @[]
         return 0
     else:
       # A sub-condition with no evaluator makes the whole counter unverifiable
       # for the same reason a qualifier does.
-      unverifiable = true
+      noteRefusal(refused, "a " & k & " sub-condition")
 
-  if not wantsKills or unverifiable:
+  if not wantsKills:
+    # Not a kill counter at all. Nothing here has an opinion about it, and
+    # reporting its unknown sub-conditions as refused kills would put a
+    # sentence about kills in front of a player doing a hand-in.
+    refused = @[]
+    return 0
+  if refused.len > 0:
     return 0
 
   let victims = field(victimsJson, "Stats.Eft.Victims")
@@ -544,6 +682,23 @@ proc killCredit*(cond, victimsJson, location, exitStatus: string;
       continue
     if bodyParts.found and not listHas(bodyParts, v.field("BodyPart").asText("")):
       continue
+    if wantsDistance:
+      let dnode = v.field("Distance")
+      if not dnode.found or dnode.isNull or dnode.isText:
+        # The condition restricts range and this victim record does not carry
+        # one. The whole counter is refused rather than this one victim: a
+        # partial count is a number nobody can act on.
+        noteRefusal(refused, "distance")
+        return 0
+      if not distanceMet(distHow, distWant, dnode.asFloat(0.0)):
+        continue
+    if weapons.found:
+      let w = v.field("Weapon").asText("")
+      if not isMongoId(w):
+        noteRefusal(refused, "weapon")
+        return 0
+      if not listHas(weapons, w):
+        continue
     inc result
 
 # ---------------------------------------------------------------------------
@@ -678,29 +833,118 @@ proc selfCheck*(): string =
   # Kill credit: the right map counts, the wrong one does not, and a condition
   # with a weapon list counts nothing at all.
   const Victims = """{"Stats":{"Eft":{"Victims":[
-    {"Side":"Savage","Role":"assault","BodyPart":"Head"},
-    {"Side":"Savage","Role":"assault","BodyPart":"Chest"},
-    {"Side":"Usec","Role":"pmcUSEC","BodyPart":"Head"}]}}}"""
-  var unver = false
-  if killCredit(Counter5, Victims, "bigmap", "Survived", unver) != 2:
+    {"Side":"Savage","Role":"assault","BodyPart":"Head","Distance":142.5,
+     "Weapon":"5cadc190ae921500103bb3b6","Time":"22:14:03"},
+    {"Side":"Savage","Role":"assault","BodyPart":"Chest","Distance":11.25,
+     "Weapon":"5448bd6b4bdc2dfc2f8b4569","Time":"22:15:40"},
+    {"Side":"Usec","Role":"pmcUSEC","BodyPart":"Head","Distance":63.0,
+     "Weapon":"5cadc190ae921500103bb3b6","Time":"03:02:11"}]}}}"""
+  var why1: seq[string] = @[]
+  if killCredit(Counter5, Victims, "bigmap", "Survived", why1) != 2:
     inc fails
     out1.add "FAIL kill credit on the right map\n"
   else:
     out1.add "ok    two scav kills on the named map are credited\n"
-  if killCredit(Counter5, Victims, "factory4_day", "Survived", unver) != 0:
+  if killCredit(Counter5, Victims, "factory4_day", "Survived", why1) != 0:
     inc fails
     out1.add "FAIL kill credit on the wrong map\n"
   else:
     out1.add "ok    the same kills on another map are not\n"
 
+  # The shape a real `templates.quests` writes on almost every kill condition:
+  # both keys present, both neutral. This used to refuse every one of them.
+  const Neutral = """{"conditionType":"CounterCreator","id":"c8","value":1,
+    "counter":{"conditions":[{"conditionType":"Kills","target":"Savage",
+      "distance":{"compareMethod":">=","value":0},
+      "daytime":{"from":0,"to":0},"weapon":[],"weaponModsInclusive":[],
+      "enemyEquipmentInclusive":[]}]}}"""
+  if killCredit(Neutral, Victims, "bigmap", "Survived", why1) != 2 or
+     why1.len != 0:
+    inc fails
+    out1.add "FAIL neutral distance/daytime keys refused the count\n"
+  else:
+    out1.add "ok    a neutral distance and daytime restrict nothing\n"
+
+  # And a real one is evaluated against `Victim.Distance` rather than refused.
+  const Far = """{"conditionType":"CounterCreator","id":"c7","value":1,
+    "counter":{"conditions":[{"conditionType":"Kills","target":"Savage",
+      "distance":{"compareMethod":">=","value":100}}]}}"""
+  if killCredit(Far, Victims, "bigmap", "Survived", why1) != 1 or why1.len != 0:
+    inc fails
+    out1.add "FAIL long-range kill credit\n"
+  else:
+    out1.add "ok    only the 142 m kill counts for a >= 100 m condition\n"
+  const Near = """{"conditionType":"CounterCreator","id":"c6","value":1,
+    "counter":{"conditions":[{"conditionType":"Kills","target":"Savage",
+      "distance":{"compareMethod":"<=","value":25}}]}}"""
+  if killCredit(Near, Victims, "bigmap", "Survived", why1) != 1:
+    inc fails
+    out1.add "FAIL short-range kill credit\n"
+  else:
+    out1.add "ok    and only the 11 m kill for a <= 25 m one\n"
+
+  # A distance condition against a report that carries no distance is refused,
+  # by name -- not credited and not silently zero.
+  const NoDist = """{"Stats":{"Eft":{"Victims":[
+    {"Side":"Savage","Role":"assault"}]}}}"""
+  if killCredit(Far, NoDist, "bigmap", "Survived", why1) != 0 or
+     why1.len != 1 or why1[0] != "distance":
+    inc fails
+    out1.add "FAIL distance with no Distance in the report\n"
+  else:
+    out1.add "ok    a range condition over a report with no range says so\n"
+
+  # A weapon list is checked when the report spells the weapon as a template
+  # id, and refused by name when it does not.
   const Sniped = """{"conditionType":"CounterCreator","id":"c9","value":1,
     "counter":{"conditions":[{"conditionType":"Kills","target":"Savage",
-                             "weapon":["mosin"]}]}}"""
-  if killCredit(Sniped, Victims, "bigmap", "Survived", unver) != 0 or not unver:
+                             "weapon":["5cadc190ae921500103bb3b6"]}]}}"""
+  if killCredit(Sniped, Victims, "bigmap", "Survived", why1) != 1 or
+     why1.len != 0:
     inc fails
-    out1.add "FAIL unverifiable qualifier\n"
+    out1.add "FAIL weapon credited by template id\n"
   else:
-    out1.add "ok    a weapon qualifier credits nothing and says so\n"
+    out1.add "ok    a weapon list matches the victim's weapon by template id\n"
+  const NamedGun = """{"Stats":{"Eft":{"Victims":[
+    {"Side":"Savage","Role":"assault","Weapon":"Mosin bolt-action rifle"}]}}}"""
+  if killCredit(Sniped, NamedGun, "bigmap", "Survived", why1) != 0 or
+     why1.len != 1 or why1[0] != "weapon":
+    inc fails
+    out1.add "FAIL weapon refused when the report gives a display name\n"
+  else:
+    out1.add "ok    and refuses by name when the report gives a display name\n"
+
+  # The qualifiers that stay refused, each naming itself.
+  const AtNight = """{"conditionType":"CounterCreator","id":"c5","value":1,
+    "counter":{"conditions":[{"conditionType":"Kills","target":"Savage",
+      "daytime":{"from":22,"to":10}}]}}"""
+  if killCredit(AtNight, Victims, "bigmap", "Survived", why1) != 0 or
+     why1.len != 1 or why1[0] != "daytime":
+    inc fails
+    out1.add "FAIL daytime refusal\n"
+  else:
+    out1.add "ok    a night-only kill condition refuses and names `daytime`\n"
+  const Kitted = """{"conditionType":"CounterCreator","id":"c4","value":1,
+    "counter":{"conditions":[{"conditionType":"Kills","target":"Savage",
+      "weaponCaliber":["7.62x39"],
+      "enemyEquipmentInclusive":[["5df8a4d786f77412672a1e3b"]]}]}}"""
+  if killCredit(Kitted, Victims, "bigmap", "Survived", why1) != 0 or
+     why1.len != 2:
+    inc fails
+    out1.add "FAIL caliber/equipment refusal " & $why1.len & "\n"
+  else:
+    out1.add "ok    caliber and the target's kit refuse, and both are named\n"
+
+  # A counter that is not about kills reports nothing, however strange its
+  # sub-conditions -- a hand-in must not produce a sentence about kills.
+  const HandIn = """{"conditionType":"CounterCreator","id":"c3","value":1,
+    "counter":{"conditions":[{"conditionType":"VisitPlace","target":"x"}]}}"""
+  if killCredit(HandIn, Victims, "bigmap", "Survived", why1) != 0 or
+     why1.len != 0:
+    inc fails
+    out1.add "FAIL a non-kill counter reported a kill refusal\n"
+  else:
+    out1.add "ok    a counter that is not about kills refuses nothing\n"
 
   # A whole group, and the reason it refused.
   const Tpl = """{"QuestName":"Debut","traderId":"T1","conditions":{

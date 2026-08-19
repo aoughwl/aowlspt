@@ -411,6 +411,68 @@ proc raidProfile(listBody, uid: string): string =
     inc k
   result = doc.substr(0, j - 1) & "1234" & doc.substr(k)
 
+proc withVictims(profileDoc, victimsJson: string): string =
+  ## The profile with its `Stats.Eft.Victims` array replaced.
+  ##
+  ## Replaced inside the document the client hands back, rather than passed
+  ## beside it: `questcond.killCredit` reads the victim list out of the profile
+  ## the raid was played with, and a test that handed the server a tidy list of
+  ## its own would prove nothing about the document the client actually sends.
+  let key = "\"Victims\":["
+  let at = find(profileDoc, key)
+  if at < 0:
+    return profileDoc
+  var i = at + key.len
+  var depth = 1
+  var inString = false
+  while i < profileDoc.len and depth > 0:
+    let c = profileDoc[i]
+    if inString:
+      if c == '\\': inc i
+      elif c == '"': inString = false
+    elif c == '"': inString = true
+    elif c == '[': inc depth
+    elif c == ']': dec depth
+    inc i
+  # `i` is one past the closing bracket; the replacement carries its own.
+  result = profileDoc.substr(0, at + key.len - 2) & victimsJson &
+           profileDoc.substr(i)
+
+proc questStatus(listBody, uid, qid: string): string =
+  ## One quest's status out of a `profile/list` response. The entry is written
+  ## `qid` first and `status` second, so reading forward from the id finds this
+  ## quest's status and not the next one's.
+  let doc = profileOf(listBody, uid)
+  let at = find(doc, "\"qid\":\"" & qid & "\"")
+  if at < 0:
+    return ""
+  result = textAt(doc, at, "status")
+
+proc rowOf(listBody, dialogId: string): int =
+  ## Where one `/client/mail/dialog/list` row starts, or -1.
+  ##
+  ## Found by the row's own `_id`, which is the *sender*: the message nested
+  ## inside the row carries an `_id` of its own, so anything that scanned for
+  ## the next `"_id"` would land inside the wrong object.
+  result = find(listBody, "\"_id\":\"" & dialogId & "\"")
+
+proc flagAt(body: string; start: int; key: string): int =
+  ## `"key":true` / `"key":false` at or after `start`: 1, 0, or -1 for absent.
+  ## `numberAt` reads neither, and a check that cannot tell a false from a
+  ## missing member is a check that passes against a route that answers
+  ## nothing.
+  if start < 0:
+    return -1
+  let at = findFrom(body, "\"" & key & "\":", start)
+  if at < 0:
+    return -1
+  let i = at + key.len + 3
+  if i + 4 <= body.len and body.substr(i, i + 3) == "true":
+    return 1
+  if i + 5 <= body.len and body.substr(i, i + 4) == "false":
+    return 0
+  result = -1
+
 proc objectAt(body: string; start: int): string =
   ## The `{...}` beginning at `start`, brace-matched and string-aware. The one
   ## primitive the readers below share: a JSON object cut out of a response
@@ -4824,6 +4886,169 @@ proc main(): int =
           $countOf(prapPost.body, "Prapor here.") & " became " &
           $countOf(prapPost2.body, "Prapor here.") &
           ", and two is right: one start and one return")
+
+  # =========================================================================
+  heading "Kills credited from the raid's own victim list"
+  # =========================================================================
+  #
+  # `questcond.killCredit` is the fallback for a kill counter the client did
+  # not report, and it used to refuse a `Kills` condition whenever a
+  # `distance`, `daytime`, `weapon` or equipment key was *present* -- which a
+  # real `templates.quests` writes on almost every one of them with a neutral
+  # value. `q_ratrun` in the fixture is that exact shape: eleven qualifier keys,
+  # all of them empty or neutral. `q_marksman` restricts range for real, and
+  # `q_nightowl` restricts time of day, which is the one this server still
+  # cannot check.
+  #
+  # The victims go into the profile the client hands back, in the member the
+  # client puts them in -- `Stats.Eft.Victims` -- rather than into a body this
+  # test invented, because the whole claim is about the document the client
+  # sends.
+  if haveFixture:
+    let killQuests = @["q_ratrun", "q_marksman", "q_nightowl"]
+    for qid in killQuests:
+      let taken = call("/client/game/profile/items/moving",
+        "{\"data\":[{\"Action\":\"QuestAccept\",\"qid\":\"" & qid &
+        "\"}],\"tm\":2}")
+      check("the kill quest " & qid & " can be accepted",
+            taken.ok and not taken.contains("cannot accept"), taken.body)
+
+    discard call("/client/match/local/start", "{\"location\":\"bigmap\"}")
+    let preRaid = call("/client/game/profile/list", "").body
+    # Two scavs: one at 142 m, one at 11 m. Both count for the neutral
+    # condition, only the first for the 100 m one, and neither for the
+    # night-only one.
+    let played = withVictims(raidProfile(preRaid, uid),
+      "[{\"Side\":\"Savage\",\"Role\":\"assault\",\"BodyPart\":\"Head\"," &
+      "\"Distance\":142.5,\"Location\":\"bigmap\",\"Time\":\"22:14:03\"}," &
+      "{\"Side\":\"Savage\",\"Role\":\"assault\",\"BodyPart\":\"Chest\"," &
+      "\"Distance\":11.25,\"Location\":\"bigmap\",\"Time\":\"22:15:40\"}]")
+    check("the test could put victims in the profile the client hands back",
+          countOf(played, "\"Distance\":") == 2, "victims not injected")
+    let back = call("/client/match/local/end",
+      "{\"exit\":\"Survived\",\"location\":\"bigmap\",\"profile\":" &
+      played & "}")
+    check("the raid with two scav kills in it is accepted", back.ok, back.body)
+
+    let afterKills = call("/client/game/profile/list", "")
+    let counters = afterKills.body
+    # The counter, not the quest state: `advanceQuestsAfterRaid` writes the
+    # count and then re-reads the group, so a check on the count is a check on
+    # exactly the thing `killCredit` returned.
+    let ratAt = find(counters, "\"c_ratrun\"")
+    check("a kill condition whose distance and daytime keys are neutral is credited",
+          ratAt >= 0 and numberAt(counters, ratAt, "value") == 2,
+          "c_ratrun counter is " & $numberAt(counters, ratAt, "value") &
+          ", not 2")
+    let markAt = find(counters, "\"c_marksman\"")
+    check("and a real range is checked against the victim's own Distance",
+          markAt >= 0 and numberAt(counters, markAt, "value") == 1,
+          "c_marksman counter is " & $numberAt(counters, markAt, "value") &
+          ", not 1 -- only the 142 m kill is over 100 m")
+    check("but a night-only condition is refused rather than guessed at",
+          find(counters, "\"c_nightowl\"") < 0,
+          "c_nightowl was credited from a report with no raid clock in it")
+
+    # And the quests the counters belong to moved with them.
+    check("the quest whose counter was met is ready to hand in",
+          questStatus(counters, uid, "q_ratrun") == "AvailableForFinish",
+          "q_ratrun is " & questStatus(counters, uid, "q_ratrun"))
+    check("and the one that could not be checked is still started",
+          questStatus(counters, uid, "q_nightowl") == "Started",
+          "q_nightowl is " & questStatus(counters, uid, "q_nightowl"))
+
+  # =========================================================================
+  heading "The inbox: read, pinned and removed"
+  # =========================================================================
+  #
+  # All four of `read`, `pin`, `unpin` and `remove` were bound to the stock
+  # `onNullData` stub, so the client's request was answered `null` and nothing
+  # happened -- and `dialogList` hard-coded `"pinned": false` and `"new": 0`,
+  # so there was nothing for them to change either. Every check below reads the
+  # *next* `/client/mail/dialog/list` rather than the route's own answer, which
+  # is what a check on a stub cannot do.
+  let inbox0 = call("/client/mail/dialog/list", "")
+  let dialogId = textAt(inbox0.body, 0, "_id")
+  check("the run left at least one dialog in the inbox", dialogId.len > 0,
+        inbox0.body)
+  if dialogId.len > 0:
+    let unreadBefore = numberAt(inbox0.body, rowOf(inbox0.body, dialogId),
+                                "new")
+    check("a delivered message is unread on the inbox",
+          unreadBefore >= 1,
+          "\"new\" is " & $unreadBefore & " on a dialog nobody has read")
+
+    let readIt = call("/client/mail/dialog/read",
+                      "{\"dialogs\":[\"" & dialogId & "\"]}")
+    check("marking the dialog read is accepted", readIt.ok, readIt.body)
+    let inbox1 = call("/client/mail/dialog/list", "")
+    # Both halves: the count has to have been non-zero and it has to be zero
+    # now. Either alone passes against the stub, which always answered zero.
+    check("and the unread count clears on the next inbox",
+          unreadBefore >= 1 and
+          numberAt(inbox1.body, rowOf(inbox1.body, dialogId), "new") == 0,
+          "\"new\" went " & $unreadBefore & " -> " &
+          $numberAt(inbox1.body, rowOf(inbox1.body, dialogId), "new"))
+    check("while the dialog itself is still there",
+          rowOf(inbox1.body, dialogId) >= 0, inbox1.body)
+
+    let pinIt = call("/client/mail/dialog/pin",
+                     "{\"dialogId\":\"" & dialogId & "\"}")
+    check("pinning the dialog is accepted", pinIt.ok, pinIt.body)
+    let inbox2 = call("/client/mail/dialog/list", "")
+    check("and the inbox reports it pinned",
+          flagAt(inbox2.body, rowOf(inbox2.body, dialogId), "pinned") == 1,
+          "\"pinned\" is still false after a pin")
+    discard call("/client/mail/dialog/unpin",
+                 "{\"dialogId\":\"" & dialogId & "\"}")
+    let inbox3 = call("/client/mail/dialog/list", "")
+    check("and unpinning it puts it back",
+          flagAt(inbox2.body, rowOf(inbox2.body, dialogId), "pinned") == 1 and
+          flagAt(inbox3.body, rowOf(inbox3.body, dialogId), "pinned") == 0,
+          "\"pinned\" did not come back down")
+
+    # Removal. Every message that still holds items is named first, because
+    # the one thing this operation may not do is destroy them: the mailbox is
+    # the only place an uncollected insurance return or quest reward exists.
+    let heldBefore = call("/client/mail/dialog/getAllAttachments", "")
+    var owedIds: seq[string] = @[]
+    var scan = 0
+    while true:
+      let at = findFrom(heldBefore.body, "\"_id\":\"", scan)
+      if at < 0: break
+      owedIds.add textAt(heldBefore.body, at, "_id")
+      scan = at + 7
+    let removed = call("/client/mail/dialog/remove",
+                       "{\"dialogId\":\"" & dialogId & "\"}")
+    check("removing the dialog is accepted", removed.ok, removed.body)
+    let inbox4 = call("/client/mail/dialog/list", "")
+    check("and it is gone from the inbox",
+          rowOf(inbox4.body, dialogId) < 0,
+          "the removed dialog is still listed: " & inbox4.body)
+    check("and it does not come back on the next request",
+          rowOf(call("/client/mail/dialog/list", "").body, dialogId) < 0,
+          "the removal did not stick")
+    # The other dialogs are untouched -- a remove that emptied the whole
+    # mailbox would pass the two checks above.
+    check("while the rest of the inbox is untouched",
+          countOf(inbox4.body, "\"attachmentsNew\"") ==
+          countOf(inbox1.body, "\"attachmentsNew\"") - 1,
+          $countOf(inbox1.body, "\"attachmentsNew\"") & " dialogs became " &
+          $countOf(inbox4.body, "\"attachmentsNew\""))
+    let heldAfter = call("/client/mail/dialog/getAllAttachments", "")
+    var lost = ""
+    for id in owedIds:
+      if id.len > 0 and not heldAfter.contains(id):
+        lost = id
+    check("and nothing the player had not collected was destroyed with it",
+          lost.len == 0, "message " & lost & " and its items are gone")
+
+    let noId = call("/client/mail/dialog/remove", "{}")
+    check("a remove naming no dialog removes nothing",
+          noId.ok and
+          countOf(call("/client/mail/dialog/list", "").body,
+                  "\"attachmentsNew\"") ==
+          countOf(inbox4.body, "\"attachmentsNew\""), noId.body)
 
   if not keep:
     cSpawnKill(proc2)

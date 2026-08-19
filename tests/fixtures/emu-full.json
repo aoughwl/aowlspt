@@ -1236,6 +1236,107 @@
    "_comment": "Two levels deep, so a search for the parent category has to walk the tree to find the offers under it. Matching only the exact id gives a tree whose branches are all empty."
   },
   "quests": {
+   "q_ratrun": {
+    "_id": "q_ratrun",
+    "QuestName": "Rat Run",
+    "traderId": "54cb50c76803fa8b248b4571",
+    "conditions": {
+     "AvailableForStart": [
+      { "conditionType": "Level", "id": "c_ratrun_level", "value": 1,
+        "compareMethod": ">=" }
+     ],
+     "AvailableForFinish": [
+      {
+       "conditionType": "CounterCreator",
+       "id": "c_ratrun",
+       "value": 1,
+       "counter": {
+        "id": "c_ratrun_counter",
+        "conditions": [
+         {
+          "conditionType": "Kills",
+          "target": "Savage",
+          "distance": { "compareMethod": ">=", "value": 0 },
+          "daytime": { "from": 0, "to": 0 },
+          "weapon": [],
+          "weaponModsInclusive": [],
+          "weaponModsExclusive": [],
+          "weaponCaliber": [],
+          "enemyEquipmentInclusive": [],
+          "enemyEquipmentExclusive": [],
+          "savageRole": [],
+          "bodyPart": []
+         }
+        ]
+       }
+      }
+     ],
+     "Fail": []
+    },
+    "rewards": { "Started": [], "Success": [], "Fail": [] }
+   },
+   "q_marksman": {
+    "_id": "q_marksman",
+    "QuestName": "Marksman",
+    "traderId": "54cb50c76803fa8b248b4571",
+    "conditions": {
+     "AvailableForStart": [
+      { "conditionType": "Level", "id": "c_marksman_level", "value": 1,
+        "compareMethod": ">=" }
+     ],
+     "AvailableForFinish": [
+      {
+       "conditionType": "CounterCreator",
+       "id": "c_marksman",
+       "value": 1,
+       "counter": {
+        "id": "c_marksman_counter",
+        "conditions": [
+         {
+          "conditionType": "Kills",
+          "target": "Savage",
+          "distance": { "compareMethod": ">=", "value": 100 },
+          "daytime": { "from": 0, "to": 0 }
+         }
+        ]
+       }
+      }
+     ],
+     "Fail": []
+    },
+    "rewards": { "Started": [], "Success": [], "Fail": [] }
+   },
+   "q_nightowl": {
+    "_id": "q_nightowl",
+    "QuestName": "Night Owl",
+    "traderId": "54cb50c76803fa8b248b4571",
+    "conditions": {
+     "AvailableForStart": [
+      { "conditionType": "Level", "id": "c_nightowl_level", "value": 1,
+        "compareMethod": ">=" }
+     ],
+     "AvailableForFinish": [
+      {
+       "conditionType": "CounterCreator",
+       "id": "c_nightowl",
+       "value": 1,
+       "counter": {
+        "id": "c_nightowl_counter",
+        "conditions": [
+         {
+          "conditionType": "Kills",
+          "target": "Savage",
+          "distance": { "compareMethod": ">=", "value": 0 },
+          "daytime": { "from": 22, "to": 10 }
+         }
+        ]
+       }
+      }
+     ],
+     "Fail": []
+    },
+    "rewards": { "Started": [], "Success": [], "Fail": [] }
+   },
    "q_debut": {
     "_id": "q_debut",
     "QuestName": "Debut",

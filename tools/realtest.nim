@@ -619,6 +619,60 @@ proc withItems(doc, itemsJson: string): string =
   let cut = at + 9
   result = doc.substr(0, cut - 1) & itemsJson & "," & doc.substr(cut)
 
+proc withVictims(doc, victimsJson: string): string =
+  ## The profile document with its `Stats.Eft.Victims` array replaced.
+  ##
+  ## `questcond.killCredit` reads the victim list out of the profile the client
+  ## hands back at `/client/match/local/end`, so that is where the kills have to
+  ## go: a list passed beside the document would test a path the client never
+  ## uses.
+  let key = "\"Victims\":["
+  let at = findAt(doc, key, 0)
+  if at < 0:
+    return ""
+  var i = at + key.len
+  var depth = 1
+  var inString = false
+  while i < doc.len and depth > 0:
+    let c = doc[i]
+    if inString:
+      if c == '\\': inc i
+      elif c == '"': inString = false
+    elif c == '"': inString = true
+    elif c == '[': inc depth
+    elif c == ']': dec depth
+    inc i
+  result = doc.substr(0, at + key.len - 2) & victimsJson & doc.substr(i)
+
+proc dialogRowOf(listBody: string; rows: seq[int];
+                 dialogId: string): int =
+  ## One `/client/mail/dialog/list` row, by its own `_id` -- the sender.
+  ##
+  ## Matched over the parsed elements rather than by searching the text: the
+  ## row nests a *message* with an `_id` of its own, and a text scan lands on
+  ## the member rather than on the object every reader here needs.
+  result = -1
+  for r in rows:
+    if textField(listBody, r, "_id") == dialogId:
+      return r
+
+proc flagField(body: string; objAt: int; key: string): int =
+  ## 1 for true, 0 for false, -1 for absent. `intField` reads neither, and a
+  ## check that cannot tell false from missing is a check that passes against a
+  ## route answering nothing at all.
+  let at = memberValue(body, objAt, key)
+  if at < 0 or at >= body.len:
+    return -1
+  if at + 4 <= body.len and body.substr(at, at + 3) == "true":
+    return 1
+  if at + 5 <= body.len and body.substr(at, at + 4) == "false":
+    return 0
+  result = -1
+
+proc arrayLen(body: string; objAt: int; key: string): int =
+  ## How many elements one array member has; 0 when it is absent or empty.
+  result = elements(body, memberValue(body, objAt, key)).len
+
 proc areaObject(body: string; areaList: seq[int]; ty: int): int =
   result = -1
   for a in areaList:
@@ -1256,6 +1310,25 @@ proc main(): int =
   var playCondition = ""
   var playTemplate = ""
   var playCount = 0
+  # And one more, for the kill counter. `questcond.killCredit` used to refuse
+  # any `Kills` condition that merely *carried* a `distance` or `daytime` key,
+  # and a real `templates.quests` writes both on almost every one of them with a
+  # neutral value -- so the quest looked for here is the ordinary case, not an
+  # exotic one: kill N of something, no range, no time of day, no weapon list.
+  # And one that posts something. The inbox checks below need a dialog to act
+  # on, and the only thing in this session that reliably produces one out of
+  # the database is a quest whose *Started* rewards carry items -- those go
+  # through the post rather than into the stash. Discovered rather than named,
+  # because which quests do that is somebody else's data.
+  var mailQuest = ""
+  var killQuest = ""
+  var killCondition = ""
+  var killSide = ""
+  var killWhere = ""
+  var killExit = ""
+  var killTarget = 0
+  var neutralKillConds = 0
+  var qualifiedKillConds = 0
   var q = 0
   while q < questKeys.len:
     let qAt = questVals[q]
@@ -1272,6 +1345,11 @@ proc main(): int =
     members(questsR.body, conds, groupKeys, groupVals)
     var gated = false
     var handoverAt = -1
+    var qKillCond = ""
+    var qKillSide = ""
+    var qKillWhere = ""
+    var qKillExit = ""
+    var qKillTarget = 0
     var g = 0
     while g < groupKeys.len:
       let group = elements(questsR.body, groupVals[g])
@@ -1309,6 +1387,91 @@ proc main(): int =
               if qSample.len == 0: qSample = qid & " -> template " & tgt
           if kind == "HandoverItem" and groupKeys[g] == "AvailableForFinish":
             handoverAt = c
+        elif kind == "CounterCreator" and
+             groupKeys[g] == "AvailableForFinish":
+          # Every `Kills` sub-condition of this counter, and whether this
+          # server can check all of it. `plain` is the whole test: a neutral
+          # `{">=", 0}` distance and a `{0, 0}` daytime restrict nothing, and
+          # reading their presence as a restriction is the defect.
+          let counterAt = memberValue(questsR.body, bodyAt, "counter")
+          let subs = elements(questsR.body,
+                              memberValue(questsR.body, counterAt,
+                                          "conditions"))
+          var sawKills = false
+          var onlyKills = subs.len > 0
+          var plain = true
+          # The discriminator. A `Kills` condition that carries no `distance`
+          # and no `daytime` member at all was credited by the old reading too,
+          # so a check driven by one proves nothing. What the old reading
+          # refused is a condition that carries them with *neutral* values --
+          # `{">=", 0}` and `{0, 0}` -- which is how a real `templates.quests`
+          # writes almost all of them.
+          var carriesNeutral = false
+          var killsSide = ""
+          var killsWhere = ""
+          var killsExit = ""
+          for sc in subs:
+            var sk = textField(questsR.body, sc, "conditionType")
+            if sk.len == 0:
+              sk = textField(questsR.body, sc, "_parent")
+            var sb = memberValue(questsR.body, sc, "_props")
+            if sb < 0:
+              sb = sc
+            if sk == "Location":
+              # `killCredit` checks this against the raid's own map, so it is
+              # not a qualifier it cannot see -- it is one it can. The map the
+              # condition names is the map this test then raids.
+              let locs = elements(questsR.body,
+                                  memberValue(questsR.body, sb, "target"))
+              if locs.len > 0:
+                killsWhere = textVal(questsR.body, locs[0])
+              continue
+            if sk == "ExitStatus":
+              let outs = elements(questsR.body,
+                                  memberValue(questsR.body, sb, "status"))
+              if outs.len > 0:
+                killsExit = textVal(questsR.body, outs[0])
+              continue
+            if sk != "Kills":
+              onlyKills = false
+              continue
+            sawKills = true
+            let side = textField(questsR.body, sb, "target")
+            if side != "Savage" and side != "Any" and side != "AnyPmc":
+              plain = false
+            killsSide = side
+            if arrayLen(questsR.body, sb, "savageRole") > 0 or
+               arrayLen(questsR.body, sb, "bodyPart") > 0 or
+               arrayLen(questsR.body, sb, "weapon") > 0 or
+               arrayLen(questsR.body, sb, "weaponModsInclusive") > 0 or
+               arrayLen(questsR.body, sb, "weaponModsExclusive") > 0 or
+               arrayLen(questsR.body, sb, "weaponCaliber") > 0 or
+               arrayLen(questsR.body, sb, "enemyEquipmentInclusive") > 0 or
+               arrayLen(questsR.body, sb, "enemyEquipmentExclusive") > 0 or
+               arrayLen(questsR.body, sb, "enemyHealthEffects") > 0:
+              plain = false
+            let dAt = memberValue(questsR.body, sb, "distance")
+            if dAt >= 0:
+              carriesNeutral = true
+              if textField(questsR.body, dAt, "compareMethod") != ">=" or
+                 intField(questsR.body, dAt, "value") != 0:
+                plain = false
+            let tAt = memberValue(questsR.body, sb, "daytime")
+            if tAt >= 0:
+              carriesNeutral = true
+              if intField(questsR.body, tAt, "from") !=
+                 intField(questsR.body, tAt, "to"):
+                plain = false
+          if sawKills:
+            if plain: inc neutralKillConds
+            else: inc qualifiedKillConds
+          if sawKills and onlyKills and plain and carriesNeutral and
+             qKillCond.len == 0:
+            qKillCond = textField(questsR.body, bodyAt, "id")
+            qKillTarget = intField(questsR.body, bodyAt, "value")
+            qKillSide = killsSide
+            qKillWhere = killsWhere
+            qKillExit = killsExit
         elif kind == "TraderLoyalty" or kind == "TraderStanding":
           for tgt in targets:
             inc traderRefs
@@ -1320,6 +1483,21 @@ proc main(): int =
           if intField(questsR.body, bodyAt, "value") > 1:
             gated = true
       inc g
+    if not gated and mailQuest.len == 0:
+      let startedAt = memberValue(questsR.body,
+        memberValue(questsR.body, qAt, "rewards"), "Started")
+      for rw in elements(questsR.body, startedAt):
+        if textField(questsR.body, rw, "type") == "Item" and
+           arrayLen(questsR.body, rw, "items") > 0:
+          mailQuest = qid
+    if not gated and qKillCond.len > 0 and killQuest.len == 0 and
+       qid != playQuest:
+      killQuest = qid
+      killCondition = qKillCond
+      killSide = qKillSide
+      killWhere = qKillWhere
+      killExit = qKillExit
+      killTarget = qKillTarget
     if not gated and handoverAt >= 0 and playQuest.len == 0:
       let want = intField(questsR.body, handoverAt, "value")
       if want >= 1 and want <= 5:
@@ -1345,6 +1523,12 @@ proc main(): int =
         questMissing == 0, $questMissing & " dangling, e.g. " & qSample)
   check("every quest condition naming an item names a real template",
         itemMissing == 0, $itemMissing & " dangling, e.g. " & qSample)
+  # The census the refusal used to be argued from. It is printed rather than
+  # asserted -- it is a fact about somebody's database, not about this server --
+  # but it is the number that says how much of the game the old reading refused:
+  # every one of the neutral ones.
+  line "  " & $neutralKillConds & " kill counters with no qualifier this " &
+       "server cannot check, " & $qualifiedKillConds & " with one"
   line "  " & $questKeys.len & " quests, " & $condCount & " conditions, " &
        $itemRefs & " template references, " & $questRefs &
        " quest references, " & $traderRefs & " trader references"
@@ -1514,6 +1698,10 @@ proc main(): int =
   var lootItems = 0
   var lootDangling = 0
   var lootOrphans = 0
+  var magsSeen = 0
+  var magsLoaded = 0
+  var magsEmptyLoad = 0
+  var magSample = ""
   var lootSample = ""
   var m = 0
   while m < mapKeys.len and lootMaps < mapsToLoot:
@@ -1540,6 +1728,29 @@ proc main(): int =
       var ids = initHashSet[string]()
       for it in inner:
         incl(ids, textField(floor1.body, it, "_id"))
+      # Magazines, and what is in them. `locations.<map>.staticAmmo` was
+      # imported and read by nothing; `emu/loot.fillMagazine` now draws a
+      # cartridge out of it for every magazine a weapon preset puts on the
+      # floor. The claim is checked through *parentage* rather than by counting
+      # cartridge templates, because the static pools spawn loose cartridges of
+      # their own and a count would be green with the feature deleted.
+      var magIds = initHashSet[string]()
+      for it in inner:
+        if textField(floor1.body, it, "slotId") == "mod_magazine":
+          incl(magIds, textField(floor1.body, it, "_id"))
+      magsSeen = magsSeen + len(magIds)
+      for it in inner:
+        if not contains(magIds, textField(floor1.body, it, "parentId")):
+          continue
+        inc magsLoaded
+        let rounds = intField(floor1.body,
+                              memberValue(floor1.body, it, "upd"),
+                              "StackObjectsCount")
+        if rounds < 1:
+          inc magsEmptyLoad
+        if magSample.len == 0:
+          magSample = name & ": " & textField(floor1.body, it, "_tpl") &
+                      " x" & $rounds
       for it in inner:
         inc count
         let tpl = textField(floor1.body, it, "_tpl")
@@ -1566,6 +1777,18 @@ proc main(): int =
     inc m
   check("loot was generated from the database's own tables", lootItems > 0,
         $lootItems & " items over " & $lootMaps & " maps")
+  # The magazines. `magsSeen` is the denominator and is asserted separately:
+  # "no magazine was loaded" and "no weapon spawned at all" are different
+  # answers and a single check cannot tell them apart.
+  check("weapon presets put magazines on the floor", magsSeen > 0,
+        "no item on any of these maps is slotted mod_magazine")
+  check("and the map's own `staticAmmo` table loads them", magsLoaded > 0,
+        $magsSeen & " magazines and not one round in any of them")
+  check("with a real round count in every loaded one", magsEmptyLoad == 0,
+        $magsEmptyLoad & " magazines carry a cartridge with no stack count")
+  if magsSeen > 0:
+    line "  " & $magsLoaded & " of " & $magsSeen &
+         " magazines loaded from staticAmmo, e.g. " & magSample
   check("every item the loot generator invented is a real template",
         lootDangling == 0, $lootDangling & " dangling, e.g. " & lootSample)
   # A mod on a weapon whose parent was left behind is an item the client cannot
@@ -2169,6 +2392,150 @@ proc main(): int =
             $condIds.len & " conditions, none named in: " & done.body)
       line "  quest " & playQuest & ": handed over " & $playCount & " of " &
            playTemplate
+
+  # -- the inbox: read, pinned, removed -------------------------------------
+  #
+  # `/client/mail/dialog/{read,pin,unpin,remove}` were all four bound to the
+  # stock null stub, and `dialogList` answered `"pinned": false` and `"new": 0`
+  # whatever the mailbox held. Everything below asserts on the *next* inbox
+  # rather than on the routes' own answers, which is the only thing a stub
+  # cannot survive.
+  if mailQuest.len > 0 and mailQuest != playQuest:
+    discard call("/client/game/profile/items/moving",
+      "{\"data\":[{\"Action\":\"QuestAccept\",\"qid\":\"" & mailQuest &
+      "\"}],\"tm\":2}")
+  let inboxR = call("/client/mail/dialog/list", "")
+  let inboxRows = elements(inboxR.body, dataAt(inboxR))
+  var firstDialog = ""
+  if inboxRows.len > 0:
+    firstDialog = textField(inboxR.body, inboxRows[0], "_id")
+  if firstDialog.len == 0:
+    skip("marking a real dialog read, pinned and removed",
+         "no quest in this database posts anything at the moment it is " &
+         "accepted, so this session has no dialog to act on")
+  else:
+    let row0 = dialogRowOf(inboxR.body, inboxRows, firstDialog)
+    let unread0 = intField(inboxR.body, row0, "new")
+    check("mail this session delivered is unread on the inbox", unread0 >= 1,
+          "\"new\" is " & $unread0 & " on a dialog nobody has read")
+    discard call("/client/mail/dialog/read",
+                 "{\"dialogs\":[\"" & firstDialog & "\"]}")
+    let inbox1R = call("/client/mail/dialog/list", "")
+    check("and reading it clears the unread count",
+          unread0 >= 1 and
+          intField(inbox1R.body,
+                   dialogRowOf(inbox1R.body, elements(inbox1R.body, dataAt(inbox1R)), firstDialog), "new") == 0,
+          "\"new\" went " & $unread0 & " -> " &
+          $intField(inbox1R.body,
+                    dialogRowOf(inbox1R.body, elements(inbox1R.body, dataAt(inbox1R)), firstDialog), "new"))
+    discard call("/client/mail/dialog/pin",
+                 "{\"dialogId\":\"" & firstDialog & "\"}")
+    let inbox2R = call("/client/mail/dialog/list", "")
+    check("pinning it is reported on the next inbox",
+          flagField(inbox2R.body,
+                    dialogRowOf(inbox2R.body, elements(inbox2R.body, dataAt(inbox2R)), firstDialog), "pinned") == 1,
+          slice(inbox2R.body, dialogRowOf(inbox2R.body, elements(inbox2R.body, dataAt(inbox2R)), firstDialog)))
+    discard call("/client/mail/dialog/unpin",
+                 "{\"dialogId\":\"" & firstDialog & "\"}")
+    let inbox3R = call("/client/mail/dialog/list", "")
+    check("and unpinning it puts it back",
+          flagField(inbox3R.body,
+                    dialogRowOf(inbox3R.body, elements(inbox3R.body, dataAt(inbox3R)), firstDialog), "pinned") == 0,
+          slice(inbox3R.body, dialogRowOf(inbox3R.body, elements(inbox3R.body, dataAt(inbox3R)), firstDialog)))
+    let owed = call("/client/mail/dialog/getAllAttachments", "")
+    let owedCount = elements(owed.body,
+                             memberValue(owed.body, dataAt(owed),
+                                         "messages")).len
+    let dialogsBefore = elements(inbox3R.body, dataAt(inbox3R)).len
+    discard call("/client/mail/dialog/remove",
+                 "{\"dialogId\":\"" & firstDialog & "\"}")
+    let inbox4R = call("/client/mail/dialog/list", "")
+    check("removing it takes the row off the inbox",
+          dialogRowOf(inbox4R.body, elements(inbox4R.body, dataAt(inbox4R)), firstDialog) < 0,
+          "the removed dialog is still listed")
+    check("and takes exactly that one row",
+          elements(inbox4R.body, dataAt(inbox4R)).len == dialogsBefore - 1,
+          $dialogsBefore & " dialogs became " &
+          $elements(inbox4R.body, dataAt(inbox4R)).len)
+    # And the property that makes the delete safe: a message still holding
+    # uncollected items is the only place those items exist, so it survives the
+    # removal and stays on the collect-all screen.
+    let owed2 = call("/client/mail/dialog/getAllAttachments", "")
+    check("and destroys nothing the player had not collected",
+          elements(owed2.body,
+                   memberValue(owed2.body, dataAt(owed2),
+                               "messages")).len == owedCount,
+          $owedCount & " uncollected messages became " &
+          $elements(owed2.body,
+                    memberValue(owed2.body, dataAt(owed2), "messages")).len)
+
+  # -- a real quest's kills, credited from the raid's victim list -----------
+  #
+  # The fallback path in `questcond.killCredit`: the client did not report a
+  # counter for this quest (it has never seen it), so the server derives the
+  # count from `Stats.Eft.Victims` in the profile the raid hands back. Against a
+  # real `templates.quests` this used to credit nothing at all, because the
+  # condition carries neutral `distance` and `daytime` keys and their presence
+  # was read as a qualifier.
+  if killQuest.len == 0:
+    skip("crediting a real quest's kills from a raid's victim list",
+         "no quest in this database has an ungated kill counter whose only " &
+         "qualifiers are the neutral `distance` and `daytime` members")
+  elif mapKeys.len == 0:
+    skip("crediting a real quest's kills from a raid's victim list",
+         "the locations table lists no map to raid")
+  else:
+    let tookKill = call("/client/game/profile/items/moving",
+      "{\"data\":[{\"Action\":\"QuestAccept\",\"qid\":\"" & killQuest &
+      "\"}],\"tm\":2}")
+    check("a real kill quest with no prerequisite can be accepted",
+          tookKill.ok and not tookKill.contains("cannot accept"),
+          tookKill.body)
+    # The map the condition names, if it names one. It is sent as the raid's
+    # `location` exactly as the condition spells it, because that is the string
+    # the client sends and the string `killCredit` compares against.
+    let killMap = (if killWhere.len > 0: killWhere else: mapKeys[0])
+    let killOut = (if killExit.len > 0: killExit else: "Survived")
+    discard call("/client/match/local/start",
+                 "{\"location\":\"" & mapKeys[0] & "\"}")
+    listR = call("/client/game/profile/list", "")
+    profAt = profileOf(listR.body, uid)
+    let doc3 = listR.body.substr(profAt, endOf(listR.body, profAt) - 1)
+    # Three kills, at three ranges, on the side the discovered condition asks
+    # for -- `AnyPmc` and `Savage` are both common and a fixed side would make
+    # this check pass or fail on which quest the database happened to offer.
+    let vSide = (if killSide == "AnyPmc": "Usec" else: "Savage")
+    let vRole = (if killSide == "AnyPmc": "pmcUSEC" else: "assault")
+    let vHead = "{\"Side\":\"" & vSide & "\",\"Role\":\"" & vRole & "\","
+    let fought = withVictims(doc3,
+      "[" & vHead &
+      "\"BodyPart\":\"Head\",\"Distance\":18.5,\"Time\":\"11:02:44\"}," &
+      vHead &
+      "\"BodyPart\":\"Chest\",\"Distance\":143.0,\"Time\":\"11:05:01\"}," &
+      vHead &
+      "\"BodyPart\":\"LeftArm\",\"Distance\":7.25,\"Time\":\"11:07:30\"}]")
+    check("the profile the client hands back can carry a victim list",
+          fought.len > doc3.len,
+          "the profile has no Stats.Eft.Victims to put them in")
+    let ended2 = call("/client/match/local/end",
+      "{\"exit\":\"" & killOut & "\",\"location\":\"" & killMap &
+      "\",\"profile\":" & fought & "}")
+    check("the raid carrying three kills is accepted", ended2.ok,
+          why(ended2))
+    listR = call("/client/game/profile/list", "")
+    profAt = profileOf(listR.body, uid)
+    let killCounter = memberValue(listR.body,
+      memberValue(listR.body, profAt, "TaskConditionCounters"), killCondition)
+    check("and the quest's kill counter is credited from the victim list",
+          intField(listR.body, killCounter, "value") == 3,
+          "counter " & killCondition & " is " &
+          $intField(listR.body, killCounter, "value") & ", not 3")
+    check("and it names the quest the condition belongs to",
+          textField(listR.body, killCounter, "sourceId") == killQuest,
+          slice(listR.body, killCounter))
+    line "  quest " & killQuest & ": three " & vSide & " kills on " &
+         killMap & " credited to " & killCondition & " (target " &
+         $killTarget & ")"
 
   # -- a real craft, and what it takes to get the hideout to make it --------
   #

@@ -1258,6 +1258,95 @@ proc onMailAttachments(url, body, session: string): string =
     return envelope(emptyObject())
   result = envelope(raw(allAttachments(p.id)))
 
+# The four that used to be `onNullData`. Each answers `null` like the stub did
+# -- that part was right, the reference has no response DTO for any of them --
+# and each now changes the state the *next* `/client/mail/dialog/list` is built
+# from, which is the part that was missing. See `emu/mail`, "What the player
+# does to a dialog", for where `pinned` and `removed` live and why `remove`
+# keeps a message that still holds items.
+#
+# Both spellings of every member are read. The reference names them `Dialogs`
+# and `DialogId`; the client sends the camel-cased wire form, which is what
+# `/client/mail/dialog/view` already reads as `dialogId`. Accepting both costs
+# one line and is the difference between a working route and a route that
+# silently does nothing on a build that spells it the other way -- which is
+# exactly the failure these four are being fixed out of.
+
+proc dialogIdOf(body: string): string =
+  let a = field(body, "dialogId")
+  if a.found:
+    return a.asText("")
+  result = field(body, "DialogId").asText("")
+
+proc onMailRead(url, body, session: string): string =
+  inc gRequests
+  let p = currentProfile(session)
+  if not p.ok:
+    return envelopeNull()
+  var wanted: seq[string] = @[]
+  var list = field(body, "dialogs")
+  if not list.found:
+    list = field(body, "Dialogs")
+  if list.found and isArray(list):
+    for e in each(list):
+      let id = e.asText("")
+      if id.len > 0:
+        wanted.add id
+  # A single-id spelling is accepted as well: the route is used from the
+  # dialog screen as well as from the inbox, and a request naming one dialog
+  # must not be read as naming none.
+  let single = dialogIdOf(body)
+  if single.len > 0:
+    wanted.add single
+  let changed = markDialogsRead(p.id, wanted)
+  if changed > 0:
+    info "marked " & $changed & " message(s) read for " & p.id
+  result = envelopeNull()
+
+proc onMailPin(url, body, session: string): string =
+  inc gRequests
+  let p = currentProfile(session)
+  if not p.ok:
+    return envelopeNull()
+  let id = dialogIdOf(body)
+  if id.len == 0:
+    warn "mail: a pin request named no dialog; nothing was pinned"
+  elif not setDialogPinned(p.id, id, true):
+    warn "mail: could not pin " & id & "; the dialog state was not written"
+  result = envelopeNull()
+
+proc onMailUnpin(url, body, session: string): string =
+  inc gRequests
+  let p = currentProfile(session)
+  if not p.ok:
+    return envelopeNull()
+  let id = dialogIdOf(body)
+  if id.len == 0:
+    warn "mail: an unpin request named no dialog; nothing was unpinned"
+  elif not setDialogPinned(p.id, id, false):
+    warn "mail: could not unpin " & id & "; the dialog state was not written"
+  result = envelopeNull()
+
+proc onMailRemove(url, body, session: string): string =
+  inc gRequests
+  let p = currentProfile(session)
+  if not p.ok:
+    return envelopeNull()
+  let id = dialogIdOf(body)
+  if id.len == 0:
+    warn "mail: a remove request named no dialog; nothing was removed"
+    return envelopeNull()
+  var kept = 0
+  if not removeDialog(p.id, id, kept):
+    warn "mail: could not remove " & id & "; the mailbox was left as it was"
+  elif kept > 0:
+    # Said out loud, because it is the one thing about this operation that is
+    # not what the player asked for.
+    warn "mail: removed the dialog with " & id & ", but kept " & $kept &
+         " message(s) that still hold uncollected items -- they are off the " &
+         "inbox and still on the collect-all screen"
+  result = envelopeNull()
+
 # ---------------------------------------------------------------------------
 # Hideout, the flea market, insurance
 # ---------------------------------------------------------------------------
@@ -1472,10 +1561,10 @@ proc registerRoutes() =
   discard serve("/client/mail/dialog/info", onEmptyObject)
   discard serve("/client/mail/dialog/view", onMailView)
   discard serve("/client/mail/dialog/getAllAttachments", onMailAttachments)
-  discard serve("/client/mail/dialog/read", onNullData)
-  discard serve("/client/mail/dialog/pin", onNullData)
-  discard serve("/client/mail/dialog/unpin", onNullData)
-  discard serve("/client/mail/dialog/remove", onNullData)
+  discard serve("/client/mail/dialog/read", onMailRead)
+  discard serve("/client/mail/dialog/pin", onMailPin)
+  discard serve("/client/mail/dialog/unpin", onMailUnpin)
+  discard serve("/client/mail/dialog/remove", onMailRemove)
 
   # Bots
   discard serve("/client/game/bot/generate", onBotGenerate)

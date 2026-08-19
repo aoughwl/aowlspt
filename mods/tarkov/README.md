@@ -248,7 +248,7 @@ fallback is the shipped answer until something *renders* weather.
 | **`emu/decorate`** — a condition kind the evaluator does not know | Refused, not waved through. A gate nobody can evaluate is still a gate. (The four kinds this database uses on its 38 globals: `Block` 18, `Quest` 12, `Level` 3, `HideoutArea` 1.) |
 | **`emu/decorate`** — a mannequin *slot key* | **Cannot be checked and is stored as sent.** There is no table of mannequins in this database. A wrong key is a pose recorded under a slot the client never reads — visible, harmless, indistinguishable here from a correct one. |
 | **`emu/decorate`** — `RecordShootingRangePoints` | The number is **entirely the client's word**. There is no shooting range in this process: no target, no bullet, no hit. What is checked is that the player has area 12 and that the number is not negative. Stored as sent rather than as a running maximum, because nothing in the database reads the counter (`grep -c ShootingRangePoints build/db/db.json` → 0) so its only consumer is the client's own board, and showing a higher number than the client just displayed would be inventing a score. |
-| **`emu/questcond`** — a `Kills` condition carrying `distance`, `weapon`, `daytime` or `equipment` | The kill is **not credited** from the raid's victim list at all. Crediting a kill whose qualifier could not be checked hands out progress nobody earned. The client's own counter still counts, through `mergeCounters`. |
+| **`emu/questcond`** — a `Kills` condition qualified on `daytime`, `weaponCaliber`, the weapon-mod lists, or either equipment list | The kill is **not credited** from the raid's victim list, and the refusal now **names the clause** in the log so a player whose quest will not finish knows which one stopped it. Crediting a kill whose qualifier could not be checked hands out progress nobody earned. The client's own counter still counts, through `mergeCounters`. **`distance` is no longer among these** — the reference dump's `Victim` carries one per kill and it is now evaluated; nor is the mere *presence* of a `distance`/`daytime` key, which is how a real `templates.quests` writes 191 of its 283 `Kills` sub-conditions with neutral values (`>= 0`, `0..0`) and which used to refuse all of them. A `weapon` list is credited when the report spells the weapon as a template id and refused by name when it spells it as a display name; nothing here can map one to the other, because this module reads no database. |
 | **`emu/questcond`** — a condition kind the evaluator does not know | Reported as *unchecked*, not as failed and not as passed. `isChecked` says which is which. Failing strands a player forever; passing is a free reward; naming it is the only honest third option. |
 | **`emu/quests`** — a quest whose template the loaded database does not have | The one place the rule bends: it completes with whatever rewards the template does not name, because the alternative is a player stranded on a quest the server cannot describe. Logged, not silent. |
 | **`emu/achievements`** — any condition in the finish group could not be evaluated, or the finish group is **empty** | Not awarded. An empty group makes "every condition is met" trivially true, which would award the entire table on the first raid a player finished. |
@@ -260,6 +260,7 @@ fallback is the shipped answer until something *renders* weather.
 | **`emu/bots`** — no `bots.types.<role>` data | A raid still starts, populated by bots wearing nothing. A strange raid and a working one, and far better than a client that cannot enter one. |
 | **`emu/templates`, `emu/traders`** — no database at all | Every table answers with a valid **empty** table. The client renders an empty flea market and reaches the menu. A server that only works against a full live dump cannot be started for the first time. |
 | **`emu/grid`** — no stash template | Falls back to 10×68, the standard-edition stash. A server with no item table still has to be able to hand somebody a gun. |
+| **`emu/mail`** — `remove` on a dialog holding uncollected items | The row goes off the inbox and every message of that sender that holds **nothing** is deleted outright; a message that still holds items is kept, off the inbox and still on the collect-all screen, and a warning says how many. The mailbox is the only place an uncollected insurance return or quest reward exists and there is no undo anywhere in this server, so a mis-click may not destroy them. A new message from the same sender puts the dialog back, which is the client's own behaviour. (`read`, `pin`, `unpin` and `remove` were all four stock `null` stubs until now, and `dialogList` answered `"pinned": false` and `"new": 0` whatever the mailbox held.) |
 | **`emu/market`** — every source is missing | Degrades to an empty market rather than to an error. |
 | **`emu/numbers`** — a gain smaller than 5×10⁻⁷ | Rounds to nothing. Every rate in this server is a hundredth or larger, four orders of magnitude clear, and a rate that small is one no player could observe. Named rather than hidden. |
 
@@ -364,6 +365,24 @@ Ordered by how cheaply one real session would settle it.
    and a weight of zero means *never*, so a pool summing to zero must produce
    nothing rather than element zero — which is how every scav on a map ends up
    in the same hat.
+9. **Which clock `Victim.Time` is on, and how `Victim.Weapon` is spelled.** Two
+   members of the raid report, and the only two things standing between the
+   kill-condition evaluator and the last qualifiers it refuses. `Time` is typed
+   `String` in the dump with no format; the `daytime` windows in the database
+   are 22→10, 21→4, 21→5 — in-game night — and EFT runs its clock at seven
+   times real time with a per-raid offset, so a wall clock read as a raid clock
+   over-credits about half the time. `Weapon` is typed `String` too, while a
+   quest's `weapon` list is template ids: `killCredit` credits it when the
+   report puts a 24-character id there and refuses by name when it does not, so
+   **one raid with one weapon-qualified quest accepted settles it either way**.
+   Both refusals cost only the fallback path — the client reports its own
+   counter for these and `mergeCounters` takes it first.
+10. **Whether a loaded magazine should be full.** `emu/loot.fillMagazine` fills
+   to the magazine's `_max_count`, because that is the only round count
+   anything in the database states: neither `globals.config` nor the reference
+   dump carries a fill fraction, and any other number would be invented here.
+   The real game spawns partly-loaded magazines, so this is generous in the
+   player's favour by a bounded amount and one raid says by how much.
 
 ---
 
