@@ -35,22 +35,53 @@
 ## WHAT IT DELIBERATELY DOES NOT CHECK
 ## ---------------------------------------------------------------------------
 ##
-## **Whether an id exists in `templates.items`.** It cannot, offline, and it
-## should not pretend to. `aowl run` has no database. What it *can* do is check
-## the id's shape, which catches every typo, and then check existence for real
-## when a database happens to be attached — which is `checkAgainstDatabase`
-## below, and which is why that is a separate pass with a separate verdict.
+## **Whether an id exists in `templates.items`.** Not in the offline pass, and
+## it should not pretend to: `aowl run` with no `--db` has no database. What
+## the offline pass does is check the id's *shape*, which catches every typo.
 ##
-## Eighteen ids in the shipped loadouts are known not to be in a stock database
-## and are not faults: they are WTT-ContentBackport's rigs, packs and face
-## covers. They are counted and named as *absent content*, never as errors, and
-## every slot that contains one also contains db-verified alternatives — so a
-## player without WTT gets a Black Division operator in a BlackHawk! Commando
-## rig rather than a Black Division operator in nothing.
+## Existence is a second pass with a separate verdict — `checkAgainstDatabase`
+## at the end of this file — and it runs only when a database is actually
+## attached. **This paragraph named that proc for a long time before the proc
+## existed**, and `config.json` promised its output to the user; both are now
+## true, and the gap is recorded here because a promise the code does not keep
+## is worse than no promise at all.
+##
+## Ids in the shipped loadouts that a stock database does not have are not
+## automatically faults: WTT-ContentBackport's rigs, packs and face covers are
+## legitimately absent, and a pass that reported each one as an error would
+## produce a screenful of errors on a correct install and teach its reader to
+## skip the section. So absence is *reported* and the fault rule is asked one
+## level up, per pool: a slot where **nothing** resolves is a slot that is
+## always bare.
+##
+## **The first run of this pass found that six pools are exactly that**, which
+## is the answer nobody had because nobody had asked. Against a stock SPT 4.x
+## database, 44 of this mod's 850 distinct ids are absent, and the absences are
+## not spread evenly: `blackdivassault` and `blackdivib` have no rig and no
+## backpack left at all, and `bosswedge` has neither rig nor face cover. This
+## file used to say that every slot holding a WTT id also holds a db-verified
+## alternative, so a player without WTT would get an operator in a BlackHawk!
+## Commando rig rather than an operator in nothing. For those six slots that
+## was false. It is a content gap in `data/loadouts/*.json` rather than a bug
+## in any code, and closing it means adding a stock fallback id to each of the
+## six -- a decision about which item, which is not one a validator should make
+## on its own. Until then it is named on every run.
+##
+## **Severity follows the rule this file already applies to maps.** A hunt map
+## with no spawn points is reported and does not fail the self-test, because it
+## is a fact about the database attached rather than about this mod's data --
+## and an absent WTT rig is the same kind of fact, since the same loadout
+## against a database with WTT installed has no empty pool at all. A verdict
+## that changes with whichever database is lying around is not a gate. The
+## exception is a **weapon** slot: a bot with no rig is a worse bot, a bot with
+## no gun is not a bot, and that fails outright. In practice that can only fire
+## for `armoryLoadouts` with WTT-Armory absent, which is exactly the case
+## `config.json` warns about and exactly the case nothing checked before.
 
 import std/strutils
 import aowlspt
 import aowlspt/json
+import aowlspt/server   # `dbRead` -- the database pass at the end of this file
 import data
 
 type
@@ -429,6 +460,221 @@ proc checkAchievements*(label, text, localeText: string; r: var Report) =
 # ---------------------------------------------------------------------------
 # With a database attached
 # ---------------------------------------------------------------------------
+#
+# This section header sat over nothing for as long as the file's own comment
+# above promised a `checkAgainstDatabase` "below", and `config.json` promised
+# that `aowl run mods/blackdivision` "names the ids it cannot verify". Neither
+# was true: there was no database pass anywhere in this mod. A promise in a
+# config file that the code does not keep is worse than no promise, because the
+# person reading it stops looking.
+#
+# **What the check is, and what it is not.** It is not "does every id exist" —
+# that question has a wrong answer built into this mod's own data. Dozens of ids
+# in the shipped loadouts are WTT-ContentBackport's rigs, packs and face covers
+# and are legitimately absent from a stock database -- 44 of 850 measured, and
+# 146 of 967 with the Armory loadout switched on; a pass that reported those as
+# faults would produce a screenful of errors on a correct install and teach its
+# reader to ignore the whole section. (The figure here used to be "eighteen",
+# from before anything counted them.)
+#
+# The question with no wrong answer is asked **per pool**: after removing the
+# ids this database does not have, *can this slot still roll anything*? An
+# equipment pool with three ids where two are WTT content is a bot that
+# sometimes wears the third — fine, and worth seeing. An equipment pool where
+# every id is absent is a slot that is **always bare**, which is a bot with no
+# gun, and it is indistinguishable at a glance from the working case.
+#
+# That is exactly the `armoryLoadouts` failure `config.json` warns about: all
+# eleven weapon ids in `armory-blackdivassault.json` belong to WTT-Armory, so
+# without that mod the assault role's primary-weapon pool is empty and those
+# bots spawn unarmed. Nothing checked it before this. Now the check names it,
+# and the same rule catches the next content dependency without being told
+# about it.
+#
+# **`_id` rather than the whole item.** The probe reads
+# `templates.items.<id>._id`, a short string, because `dbRead` copies the
+# object at the path and the item documents are large — `templates.items` is
+# 4.25 MB on a real import. Three hundred whole item documents to answer three
+# hundred yes/no questions is a self-test nobody runs twice.
+#
+# **No database is not a pass.** The caller says whether one is attached, from
+# a probe it has already done, and with none the pass reports `unchecked` and
+# says what running with `--db` would settle. A check that quietly returns "no
+# problems" because it never ran is the failure species this whole file exists
+# to catch.
+
+type
+  DbCheck* = object
+    ## What one database pass found. Counts, and the names behind them.
+    attached*: bool
+    ids*: int            ## distinct ids put to the database
+    present*: int
+    absent*: int
+    pools*: int          ## pools examined (equipment slots and calibers)
+    emptiedPools*: int   ## pools where nothing at all resolved
+    emptied*: seq[string]
+    emptiedArmed*: seq[string]
+      ## The subset of `emptied` that is a **weapon** slot.
+      ##
+      ## Split out because the two are not the same severity and this file has
+      ## already decided that question once, for maps: a hunt map with no
+      ## spawn points is reported and does not fail the self-test, because it
+      ## is a fact about the database attached rather than about this mod's
+      ## data. An absent WTT rig is the same kind of fact — the same loadout
+      ## against a database with WTT content installed has no empty pool at
+      ## all — and a verdict that depends on which database happens to be
+      ## lying around is useless as a gate.
+      ##
+      ## A weapon slot is where that stops. A bot with no rig is a worse bot;
+      ## a bot with no gun is not a bot. That one fails.
+    absentIds*: seq[string]
+
+const
+  WeaponSlots* = [
+    "FirstPrimaryWeapon", "SecondPrimaryWeapon", "Holster", "Scabbard"]
+    ## The four slots whose emptiness is not a cosmetic loss.
+
+proc isWeaponSlot*(s: string): bool =
+  for k in WeaponSlots:
+    if k == s:
+      return true
+  result = false
+
+proc emptyDbCheck*(): DbCheck =
+  DbCheck(attached: false, ids: 0, present: 0, absent: 0, pools: 0,
+          emptiedPools: 0, emptied: @[], emptiedArmed: @[], absentIds: @[])
+
+proc itemExists(id: string): bool =
+  ## One id, against `templates.items`.
+  ##
+  ## Shape is checked first and a malformed id is answered `false` without
+  ## touching the database: `isMongoId` already reported it as a fault, and
+  ## asking the database about `5E00C1AD...` would add a second, differently
+  ## worded complaint about the same typo.
+  if not isMongoId(id):
+    return false
+  let v = dbRead("templates.items." & id & "._id")
+  result = v.ok and v.raw.len > 2
+
+proc noteId(c: var DbCheck; id: string; seen: var seq[string]): bool =
+  ## Probe one id at most once across the whole pass, and return whether the
+  ## database has it. Deduplicated because the same rig appears in four role
+  ## loadouts and four identical `dbRead`s is three wasted copies and three
+  ## duplicate lines in the absent list.
+  var known = -1
+  for k in 0 ..< seen.len:
+    if seen[k] == id:
+      known = k
+  if known >= 0:
+    # Already probed. Its verdict is whether it landed in `absentIds`.
+    for a in c.absentIds:
+      if a == id:
+        return false
+    return true
+  seen.add id
+  inc c.ids
+  if itemExists(id):
+    inc c.present
+    return true
+  inc c.absent
+  c.absentIds.add id
+  result = false
+
+proc checkPools(label: string; doc: JsonRef; c: var DbCheck;
+                seen: var seq[string]) =
+  ## Every pool in one loadout document, by the "can it still roll" rule.
+  let inv = child(doc, "inventory")
+  if not inv.found:
+    return
+
+  let equip = child(inv, "equipment")
+  if equip.found:
+    for slot in keys(equip):
+      let pool = child(equip, slot)
+      let ids = keys(pool)
+      if ids.len == 0:
+        continue
+      inc c.pools
+      var live = 0
+      for id in ids:
+        if noteId(c, id, seen):
+          inc live
+      if live == 0:
+        inc c.emptiedPools
+        let line = label & "." & slot & " (" & $ids.len & " id(s), none in " &
+                   "this database)"
+        c.emptied.add line
+        if isWeaponSlot(slot):
+          c.emptiedArmed.add line
+
+  let ammo = child(inv, "Ammo")
+  if ammo.found:
+    for cal in keys(ammo):
+      let rounds = keys(child(ammo, cal))
+      if rounds.len == 0:
+        continue
+      inc c.pools
+      var live = 0
+      for rd in rounds:
+        if noteId(c, rd, seen):
+          inc live
+      if live == 0:
+        inc c.emptiedPools
+        c.emptied.add label & ".Ammo." & cal & " (" & $rounds.len &
+                      " round(s), none in this database)"
+
+  # The mod graph is probed for presence but is not subject to the pool rule: a
+  # weapon whose attachments are all absent is still a weapon, and the game
+  # attaches what it can find. Counted so the absent list is complete.
+  let mods1 = child(inv, "mods")
+  if mods1.found:
+    for root in keys(mods1):
+      discard noteId(c, root, seen)
+      let slots = child(mods1, root)
+      for slot in keys(slots):
+        for e in each(child(slots, slot)):
+          let id = e.asText("")
+          if id.len > 0:
+            discard noteId(c, id, seen)
+
+proc checkAgainstDatabase*(labels, texts: seq[string];
+                           attached: bool): DbCheck =
+  ## Every id in every shipped loadout, against the database that is loaded.
+  ##
+  ## `attached` is passed in rather than probed here, because the caller has
+  ## already answered it — `locationExists` on a hunt map — and a second probe
+  ## would be a second thing that can disagree. With no database this returns
+  ## immediately with `attached: false` and every count zero, and the caller is
+  ## expected to report that as *unchecked* and never as *clean*.
+  var c = emptyDbCheck()
+  c.attached = attached
+  if not attached:
+    return c
+  var seen: seq[string] = @[]
+  for i in 0 ..< labels.len:
+    if i >= texts.len:
+      break
+    if texts[i].len < 3:
+      continue
+    let doc = whole(texts[i])
+    if not isObject(doc):
+      continue
+    checkPools(labels[i], doc, c, seen)
+  result = c
+
+proc describeDbCheck*(c: DbCheck): string =
+  ## Counts, never a verdict.
+  if not c.attached:
+    return "no database attached, so 0 of this mod's template ids were " &
+           "verified. Run `aowlspt-sim mods/blackdivision --side sim --db " &
+           "<file>` to settle it; until then an id that resolves to nothing " &
+           "and an id that resolves are the same thing here"
+  result = $c.present & " of " & $c.ids & " distinct template id(s) are in " &
+           "this database (" & $c.absent & " absent) across " & $c.pools &
+           " pool(s)"
+  if c.emptiedPools > 0:
+    result = result & "; " & $c.emptiedPools & " pool(s) have nothing left " &
+             "that can roll, " & $c.emptiedArmed.len & " of them weapon slot(s)"
 
 proc summarise*(r: Report): string =
   ## The counts, in one line, because a number is the only thing that

@@ -19,6 +19,8 @@ aowl run mods/morebots                 # the simulator self-test
 manipulation and HTTP and is checkable offline; `aowl run` checks it. The client
 half is a read-only census whose every `EFT.` name is a hypothesis.
 
+The client half is now two things: the **census**, which walks the alive-player list every few seconds and answers "how many are there right now", and the **death ledger** (`bots/deaths.nim`), which is hooked and answers "how many have there been". The census alone cannot see a bot that spawned and died between two scans, so a raid churning through sixty bots and one holding a steady twenty-two produce the same log. The ledger is read-only on every path — it returns `carryOn()` unconditionally, suppresses nothing and writes nothing — which is the only reason it is defensible to arm a hook against a target name nothing in this tree can verify. If the name is wrong the hook never arms and the ledger reads zero.
+
 ## What the original did, feature by feature — and where this port stands
 
 | # | Upstream feature | Status here |
@@ -35,7 +37,7 @@ half is a read-only census whose every `EFT.` name is a hypothesis.
 | 10 | The DI-priority load ordering (`LoadFactions` before `LoadBots`) | **Replaced,** by a two-way `morebots.ready` / `morebots.hello` handshake, which does not depend on load order at all. |
 | 11 | **`increaseBotCapAmount`** — raise every map's bot cap | **Reimplemented properly; the old version did nothing.** See below. |
 | 12 | **Prepatcher:** `Utils.AddEnumValue` appends a field to `EFT.WildSpawnType` before the CLR loads it | **Impossible post-1.0.** IL2CPP: no managed assembly to rewrite, the enum is native constants with its switch tables already emitted, and nothing is loaded so there is no pre-load window. **New `WildSpawnType` values cannot reach the client.** |
-| 13 | Nine Harmony patches (`BotsGroup::IsPlayerEnemy`, `BotGroupWarnData::ShallBossAttack`, `SuitableFollowersList`, `BaseStatisticsManager::OnDeath`, `StandartBotBrain::Activate`, …) | **Not ported** — and this row used to say **Impossible**, twice over for reasons that have both expired. The first was that `hookArgs` could not read declared arguments and `stopWith` could not override a return value; both can. The second was that **a hook is not told which instance it fired on**, and all eight needed `this`: `hookArgs` delivers `{"this":{...},"args":[...]}` — Harmony's `__instance`, kept separate from the argument array — and `thisHandle`/`thisPointer` read it, as `mods/fov` and `mods/classicmovement` both do in shipped code. So nothing in this list is known to be inexpressible. None of it has been written, and the two that would have worked existed only to construct the managers below. |
+| 13 | Nine Harmony patches (`BotsGroup::IsPlayerEnemy`, `BotGroupWarnData::ShallBossAttack`, `SuitableFollowersList`, `BaseStatisticsManager::OnDeath`, `StandartBotBrain::Activate`, …) | **One ported, the rest split three ways.** This row has been wrong twice and both corrections are kept. First it said `hookArgs` could not read declared arguments and `stopWith` could not override a return value; both can. Then it said **a hook is not told which instance it fired on** and rested eight refusals on that; it is false, and `bots/instance.nim` now proves it in the self-test. The payload is `{"this":{"handle":n,"type":"…"},"args":[…]}` — Harmony's `__instance` — and `thisHandle`/`thisPointer` read it, as `mods/classicmovement` does in shipped code (`mods/fov` only *discusses* `thisPointer`; it calls it nowhere, so citing both was itself half wrong). Per patch: **`BaseStatisticsManager::OnDeath` is ported**, read-only, as the death ledger in `bots/deaths.nim`. `IsPlayerEnemy` and `ShallBossAttack` are **expressible but absent** — naming *which* group means reading a member off it, every candidate name is a pre-1.0 guess, and server-side `ENEMY_BOT_TYPES` already does the job with a mechanism that has been tested. `SuitableFollowersList` never needed `this` at all: the list is an *argument*, and `bindOnObject` can call `Add`/`Remove` on a collection `findClass` cannot name — what is missing is upstream's filter rule, which nothing here records. `StandartBotBrain::Activate` is **genuinely impossible** and always was: it needs a *new managed type* with overridden virtuals, and IL2CPP has no runtime type definition. `TarkovApplication::Init` and `BotsController::Init` were always expressible and have nothing left to construct. That is seven; **the remaining two are named nowhere in this tree**, so two ninths of this row cannot be audited by anyone, including its author. |
 | 14 | `HuntManager`, `BotHuntManager`, `HuntTargetLayer` and its three actions | **Impossible.** Unity `MonoBehaviour`s plus BigBrain custom layers; no BepInEx, no BigBrain, and `invoke_main` reaches the host's thread rather than Unity's. |
 | 15 | SAIN interop (`AddSAINLayers`) | **Impossible, and already a stub upstream** in 2.0.3 — SAIN's `BigBrainHandler.BrainAssignment` API had been removed. |
 
@@ -167,6 +169,7 @@ logged, never silent — "I asked for 3x and got 1.9x" is a fact you need.
   the other side of it. Named rather than counted — "1 map was skipped" is not
   something a player can act on, and "suburbs kept stock wave slots while every
   other map went to 2.5x" is. The owning mod closes it by donating a baseline.
+* **A hook now knows which object it fired on — and that is not the same as knowing which *bot*.** The payload carries `this` as a handle, an address and a **concrete runtime class name**, with no binding and no member name needed for any of the three. What it does not carry is identity: which group, which faction, which nickname. Reaching those means reading a member off the object, and every candidate member name here is a pre-1.0 hypothesis nothing in this tree can check. `this` moved several refusals from *inexpressible* to *unverifiable*; that is a real change and it is not the same as closing them. Two harder limits go with it: `this` is the receiver and never its owner, so a hook on a component cannot reach the entity holding it; and an instance method's **fourth declared argument is on the stack and is omitted from the payload entirely**, because `this` takes register position 0. Both are asserted in the self-test rather than described here.
 * **No hunt behaviour, no per-group hostility override, no brain swapping.**
   Rows 12–15.
 
@@ -184,6 +187,16 @@ presets: vanilla is 1.0x on all three knobs, lots is 1.75x / 2.0x / 1.75x
 the shipped config.json does not shadow its own preset: `horde` through the
                      real file gives 250% cap, 300% per-zone, 250% wave slots
 the buffered fold matches a sequential merge byte for byte on four shapes
+a hook IS told which object it fired on: handle, concrete runtime class, and
+                     static-vs-absent kept apart; and a 4-argument instance
+                     method reports 3 arguments and drops 1
+an argument the host never reported does not read the same as one that is
+                     fine: `not reported`, `no such parameter` and `the payload
+                     disagrees with the signature` are three distinct answers
+deaths: 5 payload(s) over 2 receiver class(es), grouped by concrete class,
+                     with 2 firings carrying no receiver counted separately
+deaths: the hook refuses offline for the runtime reason and names what it
+                     costs — checked by reason, not merely by refusal
 ```
 
 With a database attached (`aowlspt-sim <mod> --side sim --db <file>`) it also

@@ -9,6 +9,10 @@
 ## about the *original* client half -- the prepatcher that appended members to
 ## `EFT.WildSpawnType` and the nine Harmony patches -- and it was being used as
 ## a reason to do nothing at all, which is a different claim and a false one.
+## It was not even wholly true about the nine: one of them is ported now, as
+## `bots/deaths.nim`, once it turned out that the sentence blocking eight of
+## them -- that a hook is not told which instance it fired on -- had never been
+## true. See `bots/instance.nim`.
 ##
 ## The question MoreBots exists to answer is "did the bots I asked for actually
 ## show up?", and on this side of the ABI that question is answerable. The
@@ -31,6 +35,11 @@
 ##    numbers have never been in the same log line before.
 ##  * **The spawn distance.** A squad that spawns 600 m from the player is a
 ##    squad the player will never meet; that reads as "the mod does nothing".
+##  * **Not the turnover.** An interval scan cannot see a bot that spawned and
+##    died between two of them, so a raid churning sixty bots and one holding a
+##    steady twenty-two look identical from here. That is the one question this
+##    file structurally cannot answer, and it is why `bots/deaths.nim` is a
+##    hook rather than a longer scan.
 ##  * **Whether a custom spawn type reached the client at all.** It cannot --
 ##    see the module comment in `morebots.nim` -- and this is the observation
 ##    rather than the assertion. If a role id outside BSG's own range is ever
@@ -94,6 +103,17 @@ var gRt: Il2Cpp
 var gLive = false
 
 proc censusLive*(): bool = gLive
+
+proc censusRuntime*(): Il2Cpp =
+  ## The runtime this file opened, for anything else in the client half that
+  ## needs to ask the metadata a question.
+  ##
+  ## Exported rather than each module opening its own, because `openIl2Cpp`
+  ## twice in one process is two handles onto one library and two answers to
+  ## "is it loaded" that can disagree while the game is starting. `bots/
+  ## deaths.nim` is the caller; it checks `censusLive()` first, because a
+  ## zeroed `Il2Cpp` here is what "not yet" looks like.
+  result = gRt
 
 proc openCensus*(): bool =
   ## Binds `GameAssembly.dll` if it is in the process. Cheap to call again once

@@ -126,12 +126,33 @@
 ## suppressed night vision for Black Division bots. It was already dead upstream
 ## — `BotOwner_0` was removed in SPT 4.1.2, so it could no longer tell which bot
 ## it was looking at, and the shipped version returns unconditionally. There is
-## nothing to port. And the second half of what this comment used to say was
-## wrong and is corrected rather than quietly deleted: `hookArgs` + `stopWith`
-## **can** override a return value now. What is still missing is knowing *which
-## instance* the method fired on, so the only night-vision suppression
-## expressible here would apply to every bot in the raid — which is worse than
-## leaving it alone.
+## nothing to port.
+##
+## This comment has since been wrong about it twice, and both corrections stay
+## on the record rather than being quietly made. The first version said
+## `hookArgs` + `stopWith` could not override a return value; it can. The second
+## said **a hook is not told which instance it fired on**, and that is false:
+## the payload is `{"this":{"handle":n,"type":"..."},"args":[...]}` — Harmony's
+## `__instance`, kept out of the argument array on purpose — and `thisHandle`
+## and `thisPointer` in `aowlspt/game` read it. `mods/classicmovement` has been
+## calling `thisPointer(args)` in shipped code since ABI revision 3.
+##
+## So the real blocker is a third thing, and it is narrower and it is not going
+## away: **`this` is the receiver, never its owner.** A hook on
+## `BotNightVisionData::ManualUpdate` is handed the night-vision component. It
+## is not handed the bot wearing it, and it cannot navigate upwards to one — a
+## payload carries the object in front of the hook and nothing above it. Going
+## from the component to the bot's identity is exactly what `BotOwner_0` was
+## for, and it is exactly what SPT 4.1.2 removed. Nothing in this tree names a
+## replacement, and nothing in this tree could check a guess at one: every
+## `EFT.` name here is a pre-1.0 hypothesis.
+##
+## What this means for the row is that its verdict changes and its outcome does
+## not. Suppressing the method is expressible (`stopVoid`); telling which bot to
+## suppress it for is not — not because a hook cannot see its instance, but
+## because the instance it can see is the wrong object. The identity signal this
+## mod does use, its own nickname table, lives on the *player*, which is where
+## `bd/watch.nim` reads it and where a night-vision component cannot reach.
 ##
 ## **The WTT libraries.** `WTT-ServerCommonLib` supplied three services and all
 ## three are done here directly, because each turned out to be one `dbWrite`:
@@ -777,6 +798,102 @@ proc simSelfTest(): Status =
     info "  " & $noPoints.len & " hunt map(s) refused for an empty " &
          "SpawnPointParams (" & names & ") and " & $withPoints & " accepted"
 
+  # --- and the same data against a real item table, when there is one.
+  #
+  # The offline pass above checks id *shape*. Shape catches every typo and
+  # catches nothing else: `5e00c1ad86f774747333222c` is a perfectly well-formed
+  # id for an item that does not exist, and a pool full of those is a slot that
+  # is always bare. That is not hypothetical for this mod -- see `config.json`
+  # on `armoryLoadouts`, whose eleven weapon ids all belong to WTT-Armory.
+  #
+  # `attached` is the probe already done just above: if any hunt map resolved,
+  # there is a database. With none, this reports *unchecked*, which is a
+  # different thing from clean and is printed as a different thing.
+  let dbAttached = (withPoints > 0 or noPoints.len > 0)
+  var dbLabels: seq[string] = @[]
+  var dbTexts: seq[string] = @[]
+  for t in all:
+    if t.loadoutFile.len == 0:
+      continue
+    dbLabels.add "data/" & t.loadoutFile
+    dbTexts.add readData(t.loadoutFile)
+  # The Armory loadout is checked only when it is switched on. Checking a file
+  # the mod does not load would report a fault nobody has -- `armoryLoadouts`
+  # is false by default and all eleven of its weapon ids are WTT-Armory's, so
+  # on a default install it would fail every run against a stock database for
+  # a file that never reaches a bot.
+  if gArmory:
+    dbLabels.add "data/loadouts/armory-blackdivassault.json"
+    dbTexts.add readData("loadouts/armory-blackdivassault.json")
+  let dbc = checkAgainstDatabase(dbLabels, dbTexts, dbAttached)
+  info "  database: " & describeDbCheck(dbc)
+  if dbc.attached:
+    # The positive control, and it is not decoration. Every count this pass
+    # reports is monotone, so "0 problems" and "the pass never ran" print
+    # identically -- which is the failure this project keeps producing. If a
+    # database is attached and not one id was put to it, the pass is broken and
+    # says so rather than reporting a clean bill of health for nothing.
+    if dbc.ids == 0 or dbc.pools == 0:
+      error "  a database is attached and the pass probed " & $dbc.ids &
+            " id(s) across " & $dbc.pools & " pool(s). It did not run, and a " &
+            "check that reports no problems because it never happened is " &
+            "worse than no check"
+      inc bad
+    if dbc.absent > 0:
+      var shown = 0
+      var absentLine = ""
+      for a in dbc.absentIds:
+        if shown >= 24:
+          break
+        if shown > 0: absentLine = absentLine & ", "
+        absentLine = absentLine & a
+        inc shown
+      var howMany = ""
+      if dbc.absent > shown:
+        howMany = " (first " & $shown & " named)"
+      info "  " & $dbc.absent & " id(s) this database does not have" &
+           howMany &
+           ": " & absentLine & ". Absent content is not a fault by itself -- " &
+           "WTT-ContentBackport's rigs, packs and face covers live here -- " &
+           "so the fault rule is asked per pool instead."
+    if dbc.emptiedPools == 0:
+      success "  every one of the " & $dbc.pools & " pool(s) in the shipped " &
+              "loadouts still has at least one id this database can resolve, " &
+              "so no slot is silently always-bare"
+    else:
+      # Reported at warn and NOT failed, on the same rule this file already
+      # applies to a hunt map with no spawn points: it is a fact about the
+      # database attached, not about this mod's data. The same loadout against
+      # a database that has WTT-ContentBackport installed has no empty pool at
+      # all, and a self-test whose verdict depends on which database happens to
+      # be lying around is not a gate. It is still said out loud, per pool and
+      # by name, because "the faction is quietly a bit worse" is precisely the
+      # failure this whole file exists to make visible.
+      for e in dbc.emptied:
+        warn "  " & e & " -- every id in this pool is absent from THIS " &
+             "database, so the slot is always bare here. A bot rolls for it, " &
+             "finds nothing, and spawns without it; nothing errors and " &
+             "nothing logs in a raid"
+      warn "  " & $dbc.emptiedPools & " pool(s) can never roll against this " &
+           "database. Install WTT-ContentBackport and they fill; without it " &
+           "those bots wear nothing in those slots. NOTE: this mod's README " &
+           "used to claim every slot holding a WTT id also holds a " &
+           "db-verified alternative. Against a stock 4.x database that is " &
+           "false for the pools named above, and this pass is how it was found"
+    # The weapon slots are the exception, and they are a hard failure. A bot
+    # with no rig is a worse bot; a bot with no gun is not a bot. This can only
+    # fire when `armoryLoadouts` is on, because that is the only loadout whose
+    # weapon pools are entirely third-party -- which is exactly the case
+    # config.json warns about and nothing checked until this pass existed.
+    if dbc.emptiedArmed.len > 0:
+      for e in dbc.emptiedArmed:
+        error "  " & e & " -- this is a WEAPON slot with nothing in it that " &
+              "this database can resolve. Those bots spawn UNARMED"
+      error "  " & $dbc.emptiedArmed.len & " weapon pool(s) can never roll. " &
+            "`armoryLoadouts` is on and WTT-Armory is not in this database; " &
+            "turn the switch off or install the mod it needs"
+      bad = bad + dbc.emptiedArmed.len
+
   # --- the registration, driven by hand because morebots is not here.
   discard onMorebotsReady("")
   if gRegistered:
@@ -888,9 +1005,16 @@ proc simSelfTest(): Status =
        "because that lives in the spawn table."
   info "    BDNvgPatch -- already dead upstream (BotOwner_0 was removed in " &
        "SPT 4.1.2, so it could no longer tell which bot it was looking at). " &
-       "A hook here is told a method's declared arguments and not `this`, so " &
-       "the only thing it could do is suppress night vision for every bot in " &
-       "the raid, which is worse than leaving it alone."
+       "This line used to add that a hook here is told a method's declared " &
+       "arguments and not `this`. That was FALSE and is corrected: the " &
+       "payload carries `this` as Harmony's __instance and thisPointer turns " &
+       "it into an address, as mods/classicmovement does in shipped code. " &
+       "The real blocker is narrower -- `this` is the RECEIVER, never its " &
+       "owner. A hook on BotNightVisionData::ManualUpdate gets the " &
+       "night-vision component and cannot navigate up to the bot wearing " &
+       "it, which is precisely the step BotOwner_0 used to be. Suppressing " &
+       "the method is expressible; knowing which bot to suppress it for is " &
+       "not."
   info "    WTT-ContentBackport's item and appearance templates -- content, " &
        "not code. Without them the bots spawn and fight with fallback " &
        "appearance, which is cosmetic rather than a crash."

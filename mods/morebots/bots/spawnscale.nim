@@ -294,12 +294,18 @@ proc scaleWaves(baseWaves: JsonRef; current: string; mapKey: string;
 # every restart. That is the bug the whole shipped-baseline design exists to
 # prevent, and it does not stop being that bug for a modded map.
 #
-# It is also a real gap. `mods/icebreaker` rebinds the dormant `suburbs` slot
-# into a working map with eleven waves; the vanilla baseline has that slot at
-# `botMax: 0` with two stub waves, so the cap is skipped for being zero and the
-# wave array is skipped for being a different length. A player who installs
-# Icebreaker and sets `population.preset: "horde"` gets a busier raid on
-# eighteen maps and stock numbers on the nineteenth, with nothing said.
+# It **was** also a real gap, and it is closed. `mods/icebreaker` rebinds the
+# dormant `suburbs` slot into a working map with eleven waves; the vanilla
+# baseline has that slot at `botMax: 0` with two stub waves, so the cap was
+# skipped for being zero and the wave array skipped for being a different
+# length. A player who installed Icebreaker and asked for `horde` got a busier
+# raid on eighteen maps and stock numbers on the nineteenth, with nothing said.
+#
+# That paragraph described an open gap for as long as it was true and then
+# outlived the fix, which is the failure this file's own comments keep warning
+# about. Icebreaker's `populationBaseline` now puts that map's cap, per-zone
+# limit and eleven wave slot pairs into every announcement it makes; a donated
+# entry wins over the shipped stub for the same slot; all nineteen scale.
 #
 # The way out is not for this mod to guess. It is for the mod that *owns* the
 # map to say what its own stock numbers are, which it knows exactly, because it

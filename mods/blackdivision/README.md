@@ -41,7 +41,7 @@ until a runtime answers it.
 | 15 | `WTT-ContentBackport`'s item and appearance templates | **Not shipped — content, not code.** 18 loadout ids and all 4 bodies, 4 feet and 2 voices are its. Consequences below. |
 | 16 | **Prepatcher:** append six members to `EFT.WildSpawnType` in `Assembly-CSharp.dll` with Mono.Cecil | **Impossible post-1.0.** IL2CPP: no managed assembly, the enum is native constants with switch tables already compiled, no pre-load window. |
 | 17 | **`HuntTargetLayer`** at priority 10 over the PMC brains, `AdvAssaultTarget` removed, `HuntManager.AddHuntRoles`/`AddHuntSides` | **Impossible post-1.0.** BigBrain custom layers and Unity `MonoBehaviour`s hosted by BepInEx; none of the three exists. The *timing and placement* half of the hunt survives, because that lives in the spawn table. |
-| 18 | **`BDNvgPatch`** — suppress night vision for BD bots | **Dead upstream, and not ported.** `BotOwner_0` was removed in SPT 4.1.2 so it could no longer tell which bot it was looking at; the shipped version returns unconditionally. This row used to add that a hook here is told a method's declared arguments and not `this`, so the only expressible version would suppress NVG for *every* bot in the raid. **That half is wrong, and has been since `hookArgs` grew an instance:** the payload is `{"this":{...},"args":[...]}` -- Harmony's `__instance`, separate from the argument array -- and `thisHandle`/`thisPointer` read it, as `mods/fov` and `mods/classicmovement` both do in shipped code. A per-bot version is expressible; what is missing is the NVG-toggling target itself, which upstream no longer has either. |
+| 18 | **`BDNvgPatch`** — suppress night vision for BD bots | **Dead upstream, and not ported.** `BotOwner_0` was removed in SPT 4.1.2 so it could no longer tell which bot it was looking at; the shipped version returns unconditionally. This row used to add that a hook here is told a method's declared arguments and not `this`, so the only expressible version would suppress NVG for *every* bot in the raid. **That half is wrong, and has been since `hookArgs` grew an instance:** the payload is `{"this":{...},"args":[...]}` -- Harmony's `__instance`, separate from the argument array -- and `thisHandle`/`thisPointer` read it, as `mods/classicmovement` does in shipped code (`classicmovement.nim:1050` and `:1232`; `mods/fov` only *discusses* `thisPointer` in comments and calls it nowhere, so an earlier version of this row citing both was itself half wrong). **The real blocker is a third thing and it is narrower: `this` is the receiver, never its owner.** A hook on `BotNightVisionData::ManualUpdate` is handed the night-vision component and cannot navigate up to the bot wearing it -- which is exactly the step `BotOwner_0` used to be and exactly what SPT 4.1.2 removed. Suppressing the method is expressible (`stopVoid`); knowing which bot to suppress it for is not. |
 
 ## What this port ships that upstream did not
 
@@ -149,6 +149,22 @@ on a database that is merely incomplete. The self-test reports both branches.
   SPT server reads as well. **This gap is closed, and `mods/tarkov/emu/bots.nim`
   is where it closed**; the last two sentences here used to call it open on
   `mods/tarkov` and outlived the fix.
+* **Three roles have no rig and no backpack without WTT-ContentBackport, and
+  that is new information.** The database pass measures it: against a stock SPT
+  4.x database, 44 of this mod's 850 distinct template ids are absent, and six
+  pools are left with **nothing that can roll** — `blackdivassault` and
+  `blackdivib` lose both `TacticalVest` and `Backpack`, and `bosswedge` loses
+  `TacticalVest` and `FaceCover`. This README and `bd/validate.nim` both used to
+  say that every slot holding a WTT id also holds a db-verified alternative, so
+  a player without WTT would get an operator in a BlackHawk! Commando rig rather
+  than an operator in nothing. **For those six slots that was false**, and no
+  check existed that could have found it. It is a content gap in
+  `data/loadouts/*.json`, not a code bug; closing it means choosing a stock
+  fallback item for each of the six, which is a decision for whoever owns the
+  loadouts. Until then it is named, per pool, on every run with a database
+  attached — and it does not fail the self-test, on the same rule that a hunt
+  map with no spawn points does not: it is a fact about the database attached
+  rather than about this mod's data.
 * **Appearance is broken without WTT-ContentBackport.** The emulator no longer
   takes `appearance.body[0]` verbatim -- `appearanceOf` draws each of
   `appearance.{head,body,feet,hands,voice}` from a weighted pool -- but the
@@ -158,10 +174,17 @@ on a database that is merely incomplete. The self-test reports both branches.
   stock and are unaffected.
 * **`armoryLoadouts` without WTT-Armory gives unarmed bots.** All eleven weapon
   ids in that loadout -- seven primaries and four holsters -- are Armory's, so
-  there is nothing left to fall back on. **Nothing checks this offline**: the
-  self-test validates id *shape*, not existence, and there is no database pass
-  -- `checkAgainstDatabase`, which `bd/validate.nim` refers to, does not exist
-  anywhere in the tree. This bullet used to say the self-test named them.
+  there is nothing left to fall back on. **This is now checked, with a database
+  attached.** `checkAgainstDatabase` in `bd/validate.nim` exists — this bullet
+  correctly reported that it did not, for as long as `config.json` was
+  promising its output to the user — and it asks the question one level up from
+  "does this id exist", because absent ids are not automatically faults: WTT
+  content legitimately is not in a stock database. The rule is per pool: a slot
+  where **nothing** resolves is a slot that is always bare, and that is what
+  this loadout without WTT-Armory is. Run
+  `aowlspt-sim mods/blackdivision --side sim --db <file>`; with no database the
+  pass reports *unchecked* and fails nothing, which is deliberately not the
+  same output as a clean run.
 * **No night-vision control, no per-bot Harmony behaviour.** See rows 16–18.
 
 ## The self-test

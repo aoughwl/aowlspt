@@ -141,22 +141,57 @@
 ## it one; the registry keeps and serves the mapping (`/morebotsapi/bottypes`)
 ## so the data is not lost, but no shipped client reads it.
 ##
-## **The Harmony patches are gone.** Nine of them, and eight need something this
-## ABI cannot do — though not the thing an earlier revision of this comment
-## claimed. `hookArgs` *does* read a method's declared arguments and `stopWith`
-## *does* suppress the original and answer in its place; that sentence was
-## stale and is corrected here rather than quietly deleted. What is still
-## missing is narrower and it is the same thing eight times: **a hook is not
-## told which instance it fired on.** `BotsGroup::IsPlayerEnemy` needs to change
-## a return value *for one group*, and the group is `this`;
-## `BotGroupWarnData::ShallBossAttack` the same; `SuitableFollowersList` needs
-## to mutate a list it is handed; `BaseStatisticsManager::OnDeath` needs the
-## dead player; `StandartBotBrain::Activate` needs to swap a live brain object,
-## which means constructing a managed type and nothing native can declare one.
-## None of that is expressible, so none of it is here. The two that
-## *would* have worked (`TarkovApplication::Init` and `BotsController::Init`,
-## which only need to know *that* something happened) existed solely to
-## construct the managers below, so they have nothing left to do.
+## **Most of the Harmony patches are gone, and one of them is not.** There were
+## nine. This comment has now been wrong about them twice and both corrections
+## are recorded rather than quietly made, because a refusal nobody re-checks is
+## how a mod loses features for years.
+##
+## The first wrong version said `hookArgs` could not read a method's declared
+## arguments and `stopWith` could not override a return value. Both can.
+##
+## The second wrong version said **a hook is not told which instance it fired
+## on**, and rested eight of the nine refusals on it. That is false, and was
+## false when it was written: the payload is
+## `{"this":{"handle":n,"type":"..."},"args":[...]}` — Harmony's `__instance`,
+## kept out of the argument array on purpose — and `thisHandle`/`thisPointer`
+## read it. `mods/classicmovement` has been calling `thisPointer(args)` in
+## shipped code since ABI revision 3. `bots/instance.nim` now states in code,
+## and asserts in the self-test, exactly what the payload carries about the
+## receiver and exactly what it does not.
+##
+## What the nine actually need, one by one:
+##
+##   * `BaseStatisticsManager::OnDeath` — **ported**, read-only, as the death
+##     ledger in `bots/deaths.nim`. It never needed `this` to be *the dead
+##     player*; it needed to be told about each death at all, which closes the
+##     census's one blind spot: a bot that spawns and dies between two scans.
+##   * `BotsGroup::IsPlayerEnemy` and `BotGroupWarnData::ShallBossAttack` —
+##     expressible. `this` is the group, the player is a reference argument,
+##     and `stopWith` overrides the bool. They are not here for a different
+##     reason: deciding *which* group this is means reading a member off it,
+##     every candidate name is a pre-1.0 guess, and hostility already works on
+##     the server through `ENEMY_BOT_TYPES`, which is a mechanism that has been
+##     tested. An override that is quietly wrong about which group it fired for
+##     is worse than the server-side graph that is right about all of them.
+##   * `SuitableFollowersList` — the list is an *argument*, not the receiver,
+##     so `this` was never what stood in the way. `bindOnObject` can call
+##     `Add`/`Remove` on a generic collection `findClass` cannot even name.
+##     What is missing is the filter rule: nothing in this tree records what
+##     upstream's version actually did, and inventing one is not a port.
+##   * `StandartBotBrain::Activate` — **genuinely impossible, and `this` is
+##     irrelevant to it.** Swapping a brain means supplying a *new managed
+##     type* with overridden virtuals. IL2CPP has no runtime type definition;
+##     `il2cpp_object_new` instantiates a class that already exists and is not
+##     exposed to a mod in any case. Nothing native can declare a C# class.
+##   * `TarkovApplication::Init` and `BotsController::Init` — always
+##     expressible, with the plain `hook` that costs a name comparison. They
+##     existed solely to construct the managers below, so they have nothing
+##     left to do.
+##
+## That is seven. **The remaining two are not named anywhere in this tree**,
+## and this comment will not invent them: the count of nine came from
+## upstream's plugin and only seven of the nine were ever written down here.
+## Anyone re-auditing this row should know that two of it cannot be audited.
 ##
 ## **The hunt behaviour is gone.** `HuntManager`, `BotHuntManager`,
 ## `HuntTargetLayer` and its three actions are Unity `MonoBehaviour`s plus
@@ -181,6 +216,8 @@ import bots/factions
 import bots/revenge
 import bots/spawnscale
 import bots/census
+import bots/instance
+import bots/deaths
 import aowlspt/game    # `whenReady` -- the client half waits for a world
 import aowlspt/fast    # `perfCounter` -- the clock the census reports on
 
@@ -596,6 +633,13 @@ proc censusTick() =
     if not openCensus():
       return
     censusBind()
+    # The death ledger goes up with the census and on the same runtime, because
+    # the two answer halves of one question: the census is the population and
+    # the ledger is the turnover, and a raid can be steady in one while the
+    # other is churning. Armed once; the refusal, if it refuses, is printed
+    # with the census's own binding report below.
+    discard armDeaths(censusRuntime(), censusLive())
+    info "morebots: death ledger -- " & deathState()
     gCensusBound = true
   let now = nowMs()
   if gLastCensusMs != 0'i64 and now - gLastCensusMs < int64(gCensusIntervalMs):
@@ -612,6 +656,10 @@ proc censusTick() =
     censusReport()
   info "morebots: " & describe(c, gCensusCap)
   reportRoles(c)
+  if deathFirings() > 0:
+    info "morebots: turnover -- " & describeDeaths() & ". The census above is " &
+         "who is alive now; this is who has died since the raid began, and a " &
+         "raid can be flat in the first while churning in the second."
   # Published for anything watching -- `mods/blackdivision` is the intended
   # reader, since "did my faction actually spawn" is the same question with a
   # narrower filter. Delivered to everyone but the emitter, so this mod does
@@ -1089,6 +1137,218 @@ proc simSelfTest(): Status =
   let c = runCensus()
   info "  census: " & describe(c, setting("expectedBotCap").asInt(0))
 
+  # --- what a hook is told about the instance it fired on.
+  #
+  # Eight of this mod's nine Harmony refusals were written against the claim
+  # that a hook is not told which instance it fired on. The claim was false.
+  # These assertions exist so that it cannot quietly become true again, and so
+  # that the *replacement* claims -- which are narrower and are the whole value
+  # of the correction -- are checked rather than asserted in a comment.
+  #
+  # Every payload below is the host's own shape, copied from `describeArgs` in
+  # host/Aowlspt.Host.Il2Cpp/invoke.nim. Nothing here needs a game, a runtime
+  # or a hook: the decision is a function of a string, which is exactly why it
+  # was moved into `bots/instance.nim` instead of being written inline in a
+  # handler where it could only ever be tested by playing a raid.
+  var instBad = 0
+  const PayInst = "{\"this\":{\"handle\":3,\"type\":\"EFT.BotsGroup\"}," &
+                  "\"args\":[{\"handle\":4,\"type\":\"EFT.Player\"},2.5]}"
+  const PayStatic = "{\"this\":null,\"args\":[]}"
+  const PayNotHook = "{\"result\":6.0}"
+
+  let inst = instanceOf(PayInst)
+  if not inst.said or inst.isStatic or inst.handle != 3'u64 or
+     inst.typeName != "EFT.BotsGroup":
+    error "  instance: the receiver was not read out of a hook payload -- " &
+          "said=" & $inst.said & " static=" & $inst.isStatic &
+          " type=`" & inst.typeName & "`. This is the exact claim eight " &
+          "refusals in this file rested on, so it is checked and not assumed"
+    inc instBad
+
+  # The distinction that a `said`/`isStatic` pair exists for. An implementation
+  # that folded them into one bool passes every check above and fails here, and
+  # the difference matters: "the method is static" is an answer and "this is
+  # not a hook payload" is a bug in the caller.
+  let st = instanceOf(PayStatic)
+  let nh = instanceOf(PayNotHook)
+  if not (st.said and st.isStatic and st.handle == 0'u64):
+    error "  instance: `\"this\":null` did not read as a static method"
+    inc instBad
+  if nh.said:
+    error "  instance: a payload with no `this` member at all read as one " &
+          "that had one; `null` and absent are being conflated"
+    inc instBad
+
+  # The concrete class is an exact match and not a prefix. `EFT.BotsGroup` and
+  # `EFT.BotsGroupClass` are two classes and a startsWith test conflates them.
+  if not isInstanceOf(PayInst, "EFT.BotsGroup") or
+     isInstanceOf(PayInst, "EFT.BotsGroupClass") or
+     isInstanceOf(PayInst, "BotsGroup") or
+     isInstanceOf(PayStatic, "EFT.BotsGroup"):
+    error "  instance: the receiver-class test is not an exact match"
+    inc instBad
+
+  # THE ONE THAT MATTERS. `this` takes register position 0 on an instance
+  # method, so the fourth declared parameter of one is on the stack and is
+  # OMITTED from the payload rather than reported as missing. A hook that read
+  # argument 3 of such a method would get "" and, treating "" as a default,
+  # would decide on a value the game never supplied -- silently, and only on
+  # methods with four parameters, which is why it would survive every test
+  # anyone wrote. An implementation that forgot the instance shift answers 0
+  # here for all three cases and this check is the whole of the difference.
+  if argsReportable(4, false) != 3 or argsTruncated(4, false) != 1:
+    error "  instance: a 4-argument INSTANCE method should report 3 and drop " &
+          "1; it says " & $argsReportable(4, false) & " and " &
+          $argsTruncated(4, false) & ". `this` occupies register position 0"
+    inc instBad
+  if argsReportable(4, true) != 4 or argsTruncated(4, true) != 0:
+    error "  instance: a 4-argument STATIC method should report all 4; it " &
+          "says " & $argsReportable(4, true)
+    inc instBad
+  if argsTruncated(3, false) != 0 or argsTruncated(0, false) != 0 or
+     argsTruncated(9, false) != 6:
+    error "  instance: the truncation arithmetic is wrong at the edges"
+    inc instBad
+
+  # The arguments that are present but unreadable are NAMED, not invented. Both
+  # placeholders the host can emit are exercised, and so is the case they are
+  # most easily confused with -- a handle object, which also carries a `type`.
+  if argsReported(PayInst) != 2 or argHandle(PayInst, 0) != 4'u64:
+    error "  instance: a reference argument's handle was not read"
+    inc instBad
+  if argRefusal(argAt(PayInst, 0)).len != 0:
+    error "  instance: a live handle was mistaken for a refused placeholder " &
+          "-- `{\"handle\":n,\"type\":...}` carries a `type` too"
+    inc instBad
+  if argRefusal("{\"valueType\":\"UnityEngine.Vector3\"}").len == 0 or
+     argRefusal("{\"type\":\"Something\"}").len == 0:
+    error "  instance: an unreadable argument was not refused by name"
+    inc instBad
+  if argHandle(PayInst, 7) != 0'u64 or argsReported(PayStatic) != 0:
+    error "  instance: an out-of-range or empty argument list misread"
+    inc instBad
+
+  # AND THE AMBIGUITY THAT IS THE WHOLE DEFECT. An argument the host never
+  # reported must not read the same as one that is fine. `argRefusal("")` used
+  # to answer "" -- "nothing wrong with this value" -- for a value that does
+  # not exist, which is precisely how a hook ends up deciding on something the
+  # game never supplied. Four positions on one hypothetical 5-argument instance
+  # method, and all four have to answer differently:
+  #
+  #   0  reported and readable            -> ""
+  #   3  declared, past the register window, ABSENT
+  #   4  the same, and the last one
+  #   9  not declared at all              -> an off-by-one, not an absence
+  if argRefusal("").len == 0:
+    error "  instance: an absent argument reported as readable. `\"\"` and " &
+          "`a value that is fine` are the same answer, which is the exact " &
+          "ambiguity this file exists to remove"
+    inc instBad
+  if argStatus(PayInst, 0, 5, false).len != 0:
+    error "  instance: a readable argument was refused (" &
+          argStatus(PayInst, 0, 5, false) & ")"
+    inc instBad
+  let st3 = argStatus(PayInst, 3, 5, false)
+  let st9 = argStatus(PayInst, 9, 5, false)
+  if st3.len == 0 or find(st3, "NOT REPORTED") < 0:
+    error "  instance: declared parameter 3 of a 5-argument instance method " &
+          "is on the stack and absent from the payload; argStatus said `" &
+          st3 & "`"
+    inc instBad
+  if st9.len == 0 or find(st9, "no declared parameter") < 0:
+    error "  instance: reading past the signature is an off-by-one and must " &
+          "not be reported as a stack argument; argStatus said `" & st9 & "`"
+    inc instBad
+  if st3 == st9:
+    error "  instance: `the host did not report it` and `there is no such " &
+          "parameter` gave the same sentence. They are different bugs"
+    inc instBad
+  # A static method has room for all four, so position 3 there is a payload
+  # that disagrees with its signature -- a third distinct answer again.
+  let stS = argStatus(PayStatic, 3, 5, true)
+  if stS.len == 0 or find(stS, "NOT REPORTED") >= 0:
+    error "  instance: on a STATIC method position 3 fits the register " &
+          "window, so an empty slot there is a payload/signature mismatch " &
+          "and not a stack argument; argStatus said `" & stS & "`"
+    inc instBad
+
+  if instBad == 0:
+    success "  instance: a hook IS told which object it fired on -- handle, " &
+            "concrete runtime class, and static-vs-absent kept apart. An " &
+            "instance method's 4th declared argument is reported as ABSENT " &
+            "and not as empty, and `not reported`, `no such parameter` and " &
+            "`payload disagrees with the signature` are three distinct " &
+            "answers rather than one silence"
+  else:
+    bad = bad + instBad
+
+  # --- the death ledger, driven rather than described.
+  #
+  # The failure species this project keeps producing is a check that passes
+  # because the thing it checks never happened. So the ledger is reset, driven
+  # with a known number of payloads, and asserted on the exact counts -- and
+  # every counter it moves is monotone, so an unchanged one means the drive did
+  # nothing and cannot be confused with a count that went up and came back.
+  var ledBad = 0
+  resetLedger()
+  if deathFirings() != 0 or deathClasses() != 0:
+    error "  deaths: the ledger did not start empty"
+    inc ledBad
+  noteDeath(PayInst)
+  noteDeath(PayInst)
+  noteDeath("{\"this\":{\"handle\":9,\"type\":\"EFT.Player\"},\"args\":[]}")
+  noteDeath(PayStatic)
+  noteDeath(PayNotHook)
+  if deathFirings() != 5:
+    error "  deaths: five payloads were fed in and the ledger counted " &
+          $deathFirings() & ". The drive did not happen"
+    inc ledBad
+  if deathClasses() != 2 or deathsOf("EFT.BotsGroup") != 2 or
+     deathsOf("EFT.Player") != 1:
+    error "  deaths: deaths were not grouped by the receiver's concrete " &
+          "class (" & $deathClasses() & " class(es), BotsGroup " &
+          $deathsOf("EFT.BotsGroup") & ", Player " & $deathsOf("EFT.Player") &
+          ")"
+    inc ledBad
+  if deathsWithoutInstance() != 2:
+    error "  deaths: a static firing and a non-hook payload should both be " &
+          "counted as carrying no receiver; " & $deathsWithoutInstance() &
+          " was"
+    inc ledBad
+  if deathsOf("EFT.NeverSeen") != 0:
+    error "  deaths: a class that was never seen reported a count"
+    inc ledBad
+  if ledBad == 0:
+    success "  deaths: " & describeDeaths() & " -- grouped by concrete " &
+            "receiver class, with no field offset and no member name, which " &
+            "is the one per-instance fact this mod can act on without a " &
+            "second hypothesis on top of the target name"
+  else:
+    bad = bad + ledBad
+  resetLedger()
+
+  # And the arming guard, which offline must refuse -- for the runtime reason
+  # and no other. A guard that refused for the wrong reason would still look
+  # like a pass here, so the reason is checked and not just the refusal.
+  if armDeaths(censusRuntime(), censusLive()):
+    if not censusLive():
+      error "  deaths: the hook armed with no runtime attached, which means " &
+            "the guard is not looking at anything"
+      inc bad
+    else:
+      success "  deaths: " & deathState()
+  else:
+    if censusLive():
+      info "  deaths: " & deathState()
+    elif find(deathState(), "no IL2CPP runtime") < 0:
+      error "  deaths: refused offline, but for the wrong reason (" &
+            deathState() & "). The runtime clause is the one that should " &
+            "fire here"
+      inc bad
+    else:
+      success "  deaths: refused offline for the runtime reason and named " &
+              "what it costs -- " & deathState()
+
   info "  refusals that are permanent on any post-1.0 client, with the reason:"
   info "    new WildSpawnType members -- the enum is native constants with " &
        "its switch tables already compiled, and there is no managed " &
@@ -1096,12 +1356,22 @@ proc simSelfTest(): Status =
        "keeps and serves the mapping at /morebotsapi/bottypes; no shipped " &
        "client reads it. The census counts any role id at or above 100 so " &
        "that this claim is tested rather than repeated."
-  info "    BotsGroup::IsPlayerEnemy, ShallBossAttack, SuitableFollowersList " &
-       "-- each needs the instance the patch fired on, and a hook is told a " &
-       "method's declared arguments and not `this`. Deciding hostility from " &
-       "the argument alone would answer for the wrong group."
-  info "    StandartBotBrain::Activate -- swapping a live brain object means " &
-       "constructing a managed type, which nothing native can declare."
+  info "    StandartBotBrain::Activate -- swapping a live brain object needs " &
+       "a NEW managed type with overridden virtuals. IL2CPP has no runtime " &
+       "type definition and nothing native can declare a C# class. This one " &
+       "is permanent and knowing `this` does not touch it."
+  info "  refusals that are NOT permanent, and were until recently recorded " &
+       "as if they were:"
+  info "    BotsGroup::IsPlayerEnemy, BotGroupWarnData::ShallBossAttack -- " &
+       "these were refused on the grounds that a hook is not told which " &
+       "instance it fired on. That was FALSE. The payload carries `this` as " &
+       "Harmony's __instance and bots/instance.nim reads it. They are absent " &
+       "for a different and smaller reason: naming WHICH group means reading " &
+       "a member off it, every candidate name is a pre-1.0 guess, and " &
+       "hostility already works server-side through ENEMY_BOT_TYPES."
+  info "    SuitableFollowersList -- `this` was never the blocker; the list " &
+       "is an argument and bindOnObject can call Add/Remove on it. What is " &
+       "missing is upstream's filter rule, which nothing in this tree records."
   info "    HuntTargetLayer and the hunt actions -- BigBrain custom layers and " &
        "Unity MonoBehaviours, hosted by a BepInEx that does not exist here."
 
