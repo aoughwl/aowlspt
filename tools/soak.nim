@@ -1222,6 +1222,18 @@ proc main(): int =
   let server = startBackend(backend, gRoot)
   if server == 0'u64:
     err "could not start the backend"
+    # The spawn takes `root` as its working directory, so a root that does not
+    # exist yet fails here -- and "could not start the backend" then names the
+    # backend, which is fine, while the thing that is wrong is the argument two
+    # flags to the left. Every other caller of this suite stages the root
+    # first, so it went years without being said out loud.
+    if not exists(gRoot):
+      note "there is no directory at " & gRoot & " -- the spawn takes the " &
+           "root as its working directory, so it fails before the backend " &
+           "runs. Create it (and stage the mod and the database into it) " &
+           "first; `aowl test` does that for you"
+    elif not fileExists(backend):
+      note "there is no file at " & backend & "; build it with `aowl build`"
     return 1
   if not waitForBackend(60):
     err "the backend never answered /client/game/config"

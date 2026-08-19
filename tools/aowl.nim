@@ -1771,6 +1771,38 @@ proc cmdTest(e: Env): int =
                 quoted(joinPath(e.repo, "installer\\build\\storecrash.exe")) &
                 " --root " & quoted(cstage))
 
+  # And the other half of the same property, which `storecrash` cannot see: a
+  # reader that is *running* while the commit happens. `storecrash` kills a
+  # writer and then reads; this holds a handle open across somebody else's
+  # commits and demands two things at once -- that every read is one whole
+  # value, and that the reader **keeps up**. The second is what makes it a
+  # check rather than a tautology: a handle that never sees anything change is
+  # trivially never torn, and against the store as it was that is exactly what
+  # happened. Two of its nine checks fail there -- "the file never changed" and
+  # "the held handle answered 1 distinct value" -- because the rename left the
+  # reader following an unlinked file forever.
+  #
+  # Its own control, in the same run: the same loop over an in-place write,
+  # which tears. If that phase ever stops tearing, the harness has stopped
+  # reaching the window and the green above it means nothing.
+  block:
+    let sgStage = joinPath(e.repo, "installer\\build\\storeguardstage")
+    discard winfs.removeTree(sgStage)
+    discard ensureDir(sgStage)
+    let sgExe = joinPath(e.repo, "installer\\build\\storeguard.exe")
+    var sgCmd = quoted(nimonyExe(e))
+    sgCmd.add " c"
+    sgCmd.add abiInclude(e)
+    sgCmd.add " -p:" & quoted(joinPath(e.repo, "host\\common"))
+    sgCmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
+    sgCmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
+    sgCmd.add " -o:" & quoted(sgExe)
+    sgCmd.add " " & quoted(joinPath(e.repo, "tests\\storeperf\\storeguard.nim"))
+    if run(e, "storeguard builds", sgCmd, e.repo):
+      discard run(e, "a reader holding the key open across a commit sees " &
+                     "whole values, and sees the new ones",
+                  quoted(sgExe) & " --root " & quoted(sgStage))
+
   heading "Examples through the simulator"
   let sim = simExe(e)
   let mods = exampleDirs(e)

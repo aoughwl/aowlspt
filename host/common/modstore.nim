@@ -25,7 +25,10 @@
 ##    renames it over the key; a reader sees the whole old value or the whole
 ##    new one and never a mixture, whatever happens to this process in between.
 ##    `tools/storecrash.nim` kills a process mid-write to check it rather than
-##    to assert it.
+##    to assert it, and `tests/storeperf/storeguard.nim` checks the other side
+##    of the same claim: what a reader in a *different* process sees while the
+##    commit happens, which is not the same question and had a different
+##    answer -- see `renameHeld` and `stillNamed`.
 ##  * **"Never written" and "unreadable" are different answers.** See
 ##    `storeReadInto`. A caller that treats them alike creates a new character
 ##    over a save that was probably still recoverable.
@@ -39,6 +42,8 @@
 ##    host has to remember to flush anything.
 
 import std/strutils
+import std/windows/winlean
+import std/widestrs
 import aowlsptinstall/winfs
 
 # The store is touched from every worker thread, so the handle table below is
@@ -118,11 +123,26 @@ var gFlushOnWrite = false
 #
 # So the handle is kept. A read then costs 3 us and a write 19 us, and nothing
 # about what is stored changes: the bytes still live in the file and still go
-# through the operating system's cache, so the client host reading the same
-# store sees exactly what it sees today. An in-memory copy of the values would
+# through the operating system's cache. An in-memory copy of the values would
 # be faster again and would be wrong -- the two hosts run at the same time
 # against one `<root>/store`, and neither can be told when the other has
 # written.
+#
+# **That argument used to end "so the client host reading the same store sees
+# exactly what it sees today", and for a while that was false.** It was true
+# while a write was an in-place overwrite: the file kept its identity and a
+# held handle saw every change to it. It stopped being true when the write
+# became a commit, because a commit gives the *name* to a different file and a
+# handle follows the file. A reader holding the key was then holding a file
+# that had been unlinked, and answered every later read with a value that had
+# been overwritten -- for as long as the handle lived, which is until the LRU
+# below evicted it. That is exactly the in-memory cache this comment says the
+# module must not have, arrived at by accident.
+#
+# `stillNamed` is what makes the sentence true again: one handle-only syscall
+# per read, no open, and a handle whose file has lost its last name is dropped
+# and reopened. `tests/storeperf/storeguard` is the check, and it fails against
+# the code as it was.
 #
 # Bounded, and least-recently-used: a mod is free to have ten thousand keys and
 # a host is not free to have ten thousand handles.
@@ -137,6 +157,29 @@ type
 var gHeld: seq[Held] = @[]
 var gHeldStamp = 0'i64
 
+proc stillNamed(h: Handle): bool =
+  ## Whether the file this handle is on still has a name.
+  ##
+  ## This is the other half of the commit, and without it the handle cache is
+  ## the value cache the comment above says it deliberately is not. A commit
+  ## replaces the file at the key's path, and a handle follows the *file*, not
+  ## the name -- so the moment the other host commits to a key this process is
+  ## holding, this process's handle is on a file that has been unlinked, and
+  ## every read of that key afterwards answers with a value that was true once.
+  ## Not stale by a race: stale for as long as the handle lives, which is until
+  ## the LRU gets round to it.
+  ##
+  ## An unlinked file has no links, and `GetFileInformationByHandle` says so
+  ## without opening anything -- which is the point, because an open is the
+  ## 890 us the handle cache exists to avoid. It costs about a microsecond
+  ## against a 17 us read.
+  var info: BY_HANDLE_FILE_INFORMATION = default(BY_HANDLE_FILE_INFORMATION)
+  if getFileInformationByHandle(h, addr info) == WINBOOL(0):
+    # No answer is not evidence of a deleted file, but it is evidence that
+    # this handle is not worth keeping.
+    return false
+  result = info.nNumberOfLinks > DWORD(0)
+
 proc heldFor(path: string; create: bool): Handle =
   ## Caller holds the lock. `create` distinguishes a write (which may be the
   ## first) from a read (which must not bring a file into existence -- a `load`
@@ -144,6 +187,13 @@ proc heldFor(path: string; create: bool): Handle =
   inc gHeldStamp
   for i in 0 ..< gHeld.len:
     if gHeld[i].path == path:
+      if not stillNamed(gHeld[i].h):
+        # Somebody else committed to this key. Drop the handle and open the
+        # file that has the name now; the caller gets what the store says
+        # rather than what it said.
+        heldClose(gHeld[i].h)
+        gHeld.del i
+        break
       gHeld[i].stamp = gHeldStamp
       return gHeld[i].h
   let h = openHeld(path, create)
@@ -369,19 +419,209 @@ proc storeReadInto*(guid, key: string; into: var string;
 proc storeRead*(guid, key: string; into: var string; error: var string): bool =
   result = storeReadInto(guid, key, into, error) == ReadOk
 
+# ------------------------------------------------ committing, in two steps
+#
+# A commit is: write a temporary, then make it be the key. The second step is
+# a rename, and there are two ways to ask for one. They are the same kernel
+# operation -- `MoveFileExW` is a wrapper over `FileRenameInformation` -- and
+# they differ in what they cost and in one flag.
+#
+#  * **By path**, `winfs.replaceFileAt`: `MoveFileExW` opens the source by
+#    name to get a handle with `DELETE` on it, renames, and closes. This
+#    process has just written that file and already holds a handle to it, so
+#    the open is one this module has already paid for once.
+#  * **By handle**, `renameHeld` below: `SetFileInformationByHandle` with
+#    `FileRenameInfo` on the handle the value was written through. No second
+#    open of the source, and nothing else about the operation changes.
+#
+# Measured on this machine, 3 KB value, 300 commits each (`tests/storeperf`):
+# 225 us by path against 175 us by handle. Small, and free.
+#
+# ## `MOVEFILE_WRITE_THROUGH` is the interesting one, and it was wrong
+#
+# `winfs.replaceFileAt` passes `MOVEFILE_WRITE_THROUGH`, which makes the call
+# wait until the *directory change* is on the disk. It costs 225 us of a
+# 460 us commit -- half of it -- and what it buys depends entirely on whether
+# the file's **data** was flushed first, which by default it is not:
+# `gFlushOnWrite` is off.
+#
+# So the pairing that was in force -- data not flushed, rename forced to the
+# platter -- is the one combination that has no defensible reading. It pushes
+# the *name* of the new value out to disk ahead of the bytes that name points
+# at, which is precisely the ordering a power cut turns into a key file full
+# of nothing. Forcing the metadata out sooner cannot make that safer; it can
+# only make the window it needs easier to hit.
+#
+# The flag therefore follows the flush, and is not a knob of its own:
+#
+#   `storeFlushOnWrite(false)` (default)  no flush, no write-through. A power
+#       cut may cost the last write. Nothing about atomicity changes: a
+#       process killed at any point still leaves the whole old value or the
+#       whole new one, because that comes from the rename being one
+#       filesystem operation and from the page cache outliving the process.
+#   `storeFlushOnWrite(true)`             `FlushFileBuffers` and then
+#       `MOVEFILE_WRITE_THROUGH`, in that order, which is the only order in
+#       which the second flag means anything: the bytes are on the medium
+#       before the name that points at them is.
+#
+# Nothing here is a durability switch with a new default. The switch already
+# existed and its default has not moved; what changed is that the off position
+# no longer pays 225 us for a guarantee the on position is the only one that
+# can actually make.
+
+const
+  DeleteAccess = 0x00010000'u32
+    ## `DELETE`, which `winlean` does not name. A handle needs it to be
+    ## renamed through, and this module's temporary files are the only files
+    ## it opens that way.
+  FileRenameInfoClass = 3'i32
+    ## `FileRenameInfo` in `FILE_INFO_BY_HANDLE_CLASS`.
+  FileRenameInfoExClass = 22'i32
+    ## `FileRenameInfoEx`, which takes flags where `FileRenameInfo` takes a
+    ## `BOOLEAN`. The two structures are otherwise the same shape, so one
+    ## buffer serves both.
+  RenamePosixReplace = 0x00000003'u32
+    ## `FILE_RENAME_FLAG_REPLACE_IF_EXISTS or FILE_RENAME_FLAG_POSIX_SEMANTICS`.
+    ## The second flag is the one that matters and is explained at
+    ## `renameHeld`: without it a commit fails outright whenever the *other*
+    ## host has the key open.
+  RenameBufBytes = 2048
+    ## Enough for the header and a fully qualified path of about a thousand
+    ## wide characters. A path longer than that falls back to the by-path
+    ## rename rather than being refused -- see `renameHeld`.
+
+proc setFileInformationByHandle(hFile: Handle; infoClass: int32;
+                                info: pointer; size: DWORD): WINBOOL {.
+  importc: "SetFileInformationByHandle", stdcall, dynlib: "kernel32",
+  sideEffect.}
+
+proc toWide(s: string): WideCStringObj =
+  ## `newWideCString` takes its argument by `var`, so the string has to be
+  ## bound to a local for the buffer to outlive the call. Same reasoning as
+  ## `winfs.toWide`, which is private to that module.
+  var t = s
+  result = newWideCString(t)
+
+proc fullyQualified(p: string): bool =
+  ## `FileRenameInfo` with a null `RootDirectory` requires a fully qualified
+  ## destination. A store rooted at a relative path would otherwise be renamed
+  ## somewhere surprising, so it takes the by-path route instead, where the
+  ## resolution against the current directory is Win32's own.
+  if p.len >= 2 and p[1] == ':':
+    return true
+  if p.len >= 2 and p[0] == '\\' and p[1] == '\\':
+    return true
+  result = false
+
+proc renameHeld(h: Handle; dst: string; posix: bool): bool =
+  ## `h`'s file becomes `dst`, replacing whatever is there. The handle follows
+  ## the file, so afterwards it is a handle to `dst` -- exactly as it is after
+  ## `replaceFileAt`, which is what `heldAdopt` relies on.
+  ##
+  ## False means "not done, and nothing was changed"; the caller falls back to
+  ## the by-path rename, which is the same operation asked for the other way.
+  ##
+  ## ## `posix`, and the bug it is here for
+  ##
+  ## A rename that replaces an existing file refuses -- `ERROR_ACCESS_DENIED`,
+  ## and no amount of retrying helps -- while **any other process has the
+  ## destination open**, `FILE_SHARE_DELETE` or not. That is the classic
+  ## Win32 rule and `MoveFileExW` obeys it.
+  ##
+  ## This module keeps files open. So the moment the client host has read a
+  ## key, every commit the backend makes to that key fails, for as long as the
+  ## reader's handle lives -- and the two hosts running at once against one
+  ## `<root>/store` is what this module is *for*. `tests/storeperf/storeguard`
+  ## reproduces it in two lines of output: the writer's first commit succeeds,
+  ## the reader opens the key, and nothing the writer does afterwards reaches
+  ## the disk. It has been that way since the write became a commit.
+  ##
+  ## `FileRenameInfoEx` with `FILE_RENAME_FLAG_POSIX_SEMANTICS` is the rule
+  ## lifted: the destination is unlinked rather than required to be unopened,
+  ## exactly as `rename(2)` has always behaved, and existing handles to it stay
+  ## valid on a file that no longer has a name. Windows 10 1809 and NTFS; where
+  ## it is refused the caller falls back, and the fallback is what the store
+  ## did before.
+  if not heldValid(h) or not fullyQualified(dst):
+    return false
+  var w = toWide(dst)
+  let n = w.len
+  if 20 + (n + 1) * 2 > RenameBufBytes:
+    return false
+  var buf: array[RenameBufBytes, byte] = default(array[RenameBufBytes, byte])
+  # FILE_RENAME_INFO, x64 layout: BOOLEAN ReplaceIfExists at 0, HANDLE
+  # RootDirectory at 8 (left null), DWORD FileNameLength at 16, and the name
+  # itself from 20. `FileNameLength` is in bytes and excludes the terminator,
+  # which is nevertheless written because the kernel is happier with it there.
+  # `FILE_RENAME_INFORMATION_EX` is the same layout with a `DWORD Flags` where
+  # the `BOOLEAN` is, so only the first four bytes and the class differ.
+  if posix:
+    buf[0] = byte(RenamePosixReplace and 0xFF'u32)
+    buf[1] = byte((RenamePosixReplace shr 8) and 0xFF'u32)
+    buf[2] = byte((RenamePosixReplace shr 16) and 0xFF'u32)
+    buf[3] = byte((RenamePosixReplace shr 24) and 0xFF'u32)
+  else:
+    buf[0] = 1'u8
+  let nameBytes = uint32(n * 2)
+  buf[16] = byte(nameBytes and 0xFF'u32)
+  buf[17] = byte((nameBytes shr 8) and 0xFF'u32)
+  buf[18] = byte((nameBytes shr 16) and 0xFF'u32)
+  buf[19] = byte((nameBytes shr 24) and 0xFF'u32)
+  for i in 0 ..< n:
+    let u = cast[uint16](w[i])
+    buf[20 + i * 2] = byte(u and 0xFF'u16)
+    buf[21 + i * 2] = byte((u shr 8) and 0xFF'u16)
+  let size = DWORD(20 + n * 2 + 2)
+  # The same retry `replaceFileAt` carries, and for the same reason: a
+  # destination another process holds open without `FILE_SHARE_DELETE` --
+  # on a player's machine, a virus scanner that has it for a few milliseconds
+  # after the last write -- refuses the replace. A small fixed number of
+  # attempts, not a loop.
+  let cls = (if posix: FileRenameInfoExClass else: FileRenameInfoClass)
+  var attempt = 0
+  while attempt < 6:
+    if setFileInformationByHandle(h, cls, addr buf[0], size) != WINBOOL(0):
+      return true
+    let e = getLastError()
+    if e != 5'i32 and e != 32'i32:   # ACCESS_DENIED, SHARING_VIOLATION
+      return false
+    if posix:
+      # POSIX semantics do not fail on an open destination, so an
+      # `ACCESS_DENIED` here is a filesystem that will not do this at all --
+      # not a conflict that waiting clears. Retrying it would spend twelve
+      # milliseconds per write on every commit of a store on such a volume.
+      return false
+    inc attempt
+    sleep(DWORD(2))
+  result = false
+
+proc openTemp(p: string): Handle =
+  ## `winfs.openHeld(p, true)` plus `DELETE`, which is what lets `renameHeld`
+  ## put this handle's file at the key's path without opening it again.
+  ## Shared every way, as `openHeld` is and for the same reason.
+  let w = toWide(p)
+  result = createFileW(w.toWideCString,
+                       GENERIC_READ or GENERIC_WRITE or DeleteAccess,
+                       FILE_SHARE_READ or FILE_SHARE_WRITE or
+                       FILE_SHARE_DELETE,
+                       nil, OPEN_ALWAYS, FILE_ATTRIBUTE_NORMAL, Handle(0))
+
 proc atomicPut(tmp, dst, value: string; keep: bool; kept: var Handle;
                error: var string): bool =
   ## `value` becomes the whole contents of `dst`, or `dst` is untouched.
   ##
-  ## Write into a file nothing is reading, force it to the medium, then rename
-  ## it over the destination. Every step is ordinary Win32; what makes it a
+  ## Write into a file nothing is reading, then rename it over the
+  ## destination -- and, if this store is running durable, force the bytes to
+  ## the medium in between. Every step is ordinary Win32; what makes it a
   ## commit is the order. See `replaceFileAt` in `winfs` for what each call
-  ## guarantees and, more usefully, what it does not.
+  ## guarantees and, more usefully, what it does not, and the note above
+  ## `renameHeld` for why the rename is asked for through the handle rather
+  ## than by path and why `MOVEFILE_WRITE_THROUGH` now follows the flush.
   ##
   ## With `keep`, the handle comes back in `kept` and is now a handle to `dst`
   ## -- see `heldAdopt`.
   kept = Handle(0)
-  let h = openHeld(tmp, true)
+  let h = openTemp(tmp)
   if not heldValid(h):
     error = "could not open " & tmp & " (error " & $int(lastFsError()) & ")"
     return false
@@ -390,8 +630,8 @@ proc atomicPut(tmp, dst, value: string; keep: bool; kept: var Handle;
     discard removeFileAt(tmp)
     error = "could not write " & tmp & " (error " & $int(lastFsError()) & ")"
     return false
-  # The flush is the expensive step by an order of magnitude -- 3.9 ms of a
-  # 4.3 ms write on this machine -- and it is **not** what makes the write
+  # The flush is the expensive step by an order of magnitude -- 3.4 ms of a
+  # 4.1 ms write on this machine -- and it is **not** what makes the write
   # atomic. The rename is. What `FlushFileBuffers` adds is power-loss
   # protection: without it, a machine that loses power can come back with the
   # rename applied and the file's contents not yet on the platter, losing the
@@ -408,12 +648,34 @@ proc atomicPut(tmp, dst, value: string; keep: bool; kept: var Handle;
       discard removeFileAt(tmp)
       error = "could not flush " & tmp & " (error " & $int(lastFsError()) & ")"
       return false
-  let mv = replaceFileAt(tmp, dst)
-  if not mv.ok:
-    heldClose(h)
-    discard removeFileAt(tmp)
-    error = "could not replace " & dst & " (error " & $int(mv.err) & ")"
-    return false
+    # Only here does `MOVEFILE_WRITE_THROUGH` mean anything, and
+    # `replaceFileAt` is the call that passes it. See the note above
+    # `renameHeld`: forcing the directory entry to the platter is a guarantee
+    # about the *name*, and a name is worth forcing out only once the bytes it
+    # points at have been. If it is refused because the other host has the key
+    # open, the POSIX rename below is tried rather than the write being lost:
+    # a commit that reaches the disk without its directory entry forced is
+    # worth more than one that does not happen.
+    let mv = replaceFileAt(tmp, dst)
+    if not mv.ok and not renameHeld(h, dst, true):
+      heldClose(h)
+      discard removeFileAt(tmp)
+      error = "could not replace " & dst & " (error " & $int(mv.err) & ")"
+      return false
+  elif not renameHeld(h, dst, true):
+    # The fallbacks, in the order of how much they give up. The classic rename
+    # through the handle first -- same call, no POSIX semantics, so it is
+    # refused if the other host holds the key -- and then the by-path
+    # `MOVEFILE_REPLACE_EXISTING`, which is what the store did before and
+    # covers the cases `renameHeld` declines outright: a store rooted at a
+    # relative path, or a path too long for its buffer.
+    if not renameHeld(h, dst, false):
+      let mv = replaceFileAt(tmp, dst)
+      if not mv.ok:
+        heldClose(h)
+        discard removeFileAt(tmp)
+        error = "could not replace " & dst & " (error " & $int(mv.err) & ")"
+        return false
   if keep:
     kept = h
   else:
@@ -546,8 +808,13 @@ proc commitNow(dir, key, value: string; error: var string): bool =
   result = true
 
 proc storeFlushOnWrite*(on: bool) =
-  ## Whether every commit forces its bytes to the medium before the rename.
-  ## Off by default: see `atomicPut`. Atomicity does not depend on it.
+  ## Whether every commit forces its bytes to the medium before the rename,
+  ## and -- because the two are only meaningful together -- whether the rename
+  ## itself waits for the directory entry to reach the disk.
+  ##
+  ## Off by default: see `atomicPut` and the note above `renameHeld`.
+  ## Atomicity does not depend on either, in either position. What this
+  ## chooses is whether a *power cut* may cost the last write.
   gFlushOnWrite = on
 
 proc storeWrite*(guid, key, value: string; error: var string): bool =

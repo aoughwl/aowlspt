@@ -1413,3 +1413,316 @@ realtest         144 ok, 1 skipped   144 ok, 1 skipped   (real 41 MB database)
 dbrace           passes              passes, and 25754 of its read passes now
                                      go through `dbHoldPath`
 ```
+
+# The fifth pass: the commit costs 736 us, and 225 of them bought nothing
+
+The pass above ends by naming its own remainder twice over: *the endpoint a
+player hits thousands of times a session is 1.04 ms, and 70 to 85 percent of it
+is one file write*, and *the change that would move it is in
+`host/common/modstore.nim`, which this work does not own*. This is that file.
+
+Same method as everything above: one pinned `mods/tarkov/bin/tarkov.dll` copied
+out of the tree before anything was built, two backends from the same sources
+with `modstore.nim` reverted in one, interleaved A/B, ports 7100-7110.
+
+## Why the write is a commit at all
+
+Worth restating before anything is taken off it, because the answer is in this
+file and in the module's own comment and it is not negotiable.
+
+The store used to write in place: one handle kept open, overwritten from byte
+zero, truncated to the new length. That is 21 us and it is not a commit -- a
+process killed between the bytes landing and `setEndOfFile` returning leaves the
+file as a mixture of the old value and the new one. What is in this store is a
+player's profile, the only thing in the project that cannot be rebuilt from
+something else, and a half-written profile is the one loss nothing afterwards
+repairs. So `storeWrite` writes a temporary and renames it over the key, and a
+reader sees the whole old value or the whole new one.
+
+**That property is kept, in full, by everything below.** What was negotiable was
+the price, and a third of it turned out to be buying nothing at all.
+
+## The decomposition
+
+`tools/storecrash --bench` prices the *shapes* a commit could have.
+`tests/storeperf` prices the steps of the shape it has, timed inside C around
+one system call at a time -- the cheapest step is twenty microseconds and a
+millisecond clock reports that as zero. 3 KB value, 300 commits a row, this
+machine:
+
+| step | us |
+|---|---|
+| in place through a held handle -- the floor, and not a commit | **21** |
+| create the temporary | 138 |
+| write | 76 |
+| `FlushFileBuffers` (off by default) | 3400-4500 |
+| `MoveFileEx`, `MOVEFILE_REPLACE_EXISTING` and `MOVEFILE_WRITE_THROUGH` | **415** |
+| `MoveFileEx`, `MOVEFILE_REPLACE_EXISTING` alone | **218** |
+| the same rename through the handle, `SetFileInformationByHandle` | **175** |
+| close | 27 |
+| the whole thing, through `storeWrite` | **687** |
+
+Three readings.
+
+**It is not the data.** `storeWrite` costs 687, 699 and 688 us for a 3 KB, a
+16 KB and an 84 KB value. Every microsecond of it is metadata and scanner, and
+none of it is the bytes.
+
+**It is not the `.hist` ring.** That was the obvious suspect and it is innocent:
+`storeCommitStats` reports 300 commits for 300 writes, and `backupDue` lets one
+snapshot through per key per five minutes. A snapshot costs 650-780 us *when it
+happens*, which for a raid's worth of inventory moves is once. The ring is
+already amortised correctly and is unchanged by this pass.
+
+**It is not the flush either**, which is the surprise if you read the "gate went
+red" section above and stopped there. `gFlushOnWrite` has been off by default
+since that section was written, so the 4 ms `FlushFileBuffers` is not in the
+736 us at all.
+
+## `MOVEFILE_WRITE_THROUGH` was the wrong half of a pair
+
+Half the rename -- 225 us of a 460 us commit -- was one flag, and it is the one
+combination of settings that has no defensible reading.
+
+`MOVEFILE_WRITE_THROUGH` makes the call wait until the **directory change** is
+on the disk. `FlushFileBuffers` puts the **file's data** on the disk. The store
+was doing the first and not the second: forcing the *name* of the new value out
+to the platter while the bytes that name points at were still only in the cache.
+A power cut in that window comes back with the key pointing at a file whose
+contents never arrived -- which is not "the last write was lost", it is "the
+profile is unreadable". Forcing the metadata out sooner cannot make that safer.
+It can only make the window easier to hit.
+
+So the flag follows the flush and is not a knob of its own:
+
+| `storeFlushOnWrite` | what happens | what a power cut can do |
+|---|---|---|
+| `false` (default, unchanged) | no flush, no write-through | cost the last write |
+| `true` (`--store-flush`) | `FlushFileBuffers`, *then* `MOVEFILE_WRITE_THROUGH` | nothing |
+
+**No durability switch was added and no default was moved.** The switch already
+existed with this default; what changed is that its off position stopped paying
+225 us for a guarantee only its on position can actually make. Atomicity is
+untouched in both positions, because atomicity comes from the rename being one
+filesystem operation and from the page cache outliving a dead process, and
+neither flag is involved in either.
+
+## And the rename is asked for through the handle
+
+`MoveFileExW` opens the source by name to get a handle with `DELETE` on it,
+renames, and closes. This process has just written that file and is still
+holding it. `SetFileInformationByHandle` with `FileRenameInfo` is the same
+kernel operation -- `MoveFileExW` is a wrapper over it -- asked for on the
+handle that already exists: 175 us against 218. Small, and free.
+
+The temporary is opened with `DELETE` in its access mask for it (`openTemp`),
+which is the only thing `winfs.openHeld` did not already ask for.
+
+## What was tried and is not here
+
+- **`ReplaceFileW`.** It moves the displaced file *aside* to a backup name
+  rather than deleting it, which would hand the next commit a file to write
+  into and remove the 138 us create for good. It costs **1746 us** at 3 KB and
+  **15470 us** at 84 KB -- an order of magnitude the wrong way, because it
+  copies attributes and streams rather than swapping a directory entry.
+- **A temporary name this process has never used before**, on the theory that
+  creating over a slot a scanner has just finished with is what the 138 us is.
+  The create does drop to 128 us and the rename rises to **560**: 809 us in
+  total against 466.
+- **`FILE_ATTRIBUTE_TEMPORARY` on the temporary.** Measured as nothing, twice.
+- **The temporary beside the key rather than under `.hist`.** 451-478 us, which
+  is the same number, so it stays where it is -- one directory holds the things
+  that are not keys.
+- **A pre-created spare.** Priced by the pass above (`spare + rename + make the
+  next spare`, 1351 us) and not re-litigated. Moving the create off the request
+  path needs a thread in a module both hosts link, for 138 us.
+- **Coalescing writes in a burst.** This is the one that would actually get the
+  remaining 400 us, and it is the one the store already removed once, for the
+  reason written above `storeWrite`: a process killed outright lost a save it
+  had already reported as made. Nothing here reopens it. A store that answers
+  "written" before the bytes are committed is not this store.
+
+## The two bugs the measurement walked into
+
+Neither was the errand. Both are the atomic commit's, both have been there since
+it landed, and `tests/storeperf/storeguard` reproduces both against the tree as
+it was.
+
+### A commit fails outright while the other host is reading the key
+
+A rename that replaces an existing file is refused -- `ERROR_ACCESS_DENIED`, and
+no amount of retrying helps -- while **any other process has the destination
+open**, `FILE_SHARE_DELETE` or not. That is the Win32 rule and `MoveFileExW`
+obeys it.
+
+This module keeps files open. So from the moment the client host has read a key,
+every commit the backend makes to that key fails, for as long as the reader's
+handle lives -- and *the two hosts running at once against one `<root>/store` is
+what the module is for*. `storeguard` prints it in three lines: the writer's
+first commit lands, the reader opens the key, and nothing the writer does
+afterwards reaches the disk.
+
+```
+committed writes: 7689 reads through the held handle, 0 torn, 1 distinct value;
+                  the file itself moved through 1
+error the writer was actually writing: the file never changed
+      could not replace ...\profile.guardtest (error 5)
+```
+
+`FileRenameInfoEx` with `FILE_RENAME_FLAG_POSIX_SEMANTICS` is that rule lifted:
+the destination is unlinked rather than required to be unopened, exactly as
+`rename(2)` has always behaved. Windows 10 1809 and NTFS, and where it is
+refused the code falls back to the classic rename and then to `MoveFileExW`,
+which is what the store did before.
+
+### A held handle never sees the other host's commit
+
+The second half of the same fact, and it survives the first being fixed. A
+handle follows the **file**, not the name. A commit gives the name to a
+different file, so a reader holding the key has a handle to a file that has been
+unlinked -- and answers every later read with a value that was true once. Not
+stale by a race: stale for as long as the handle lives, which is until the
+32-entry LRU gets round to it.
+
+That invalidates the argument the handle cache was built on, which is in this
+file two passes up: *this is not a cache of the contents, and the difference is
+the whole reason it is safe... every read still goes to the file, so a write by
+the other host is seen exactly as it is seen today*. It was true when the write
+was an in-place overwrite. It stopped being true when the write became a rename,
+and nothing said so.
+
+An unlinked file has no links, and `GetFileInformationByHandle` says so without
+opening anything -- which is the point, because an open is the 890 us the handle
+cache exists to avoid. `heldFor` checks it and reopens when the answer is zero.
+It costs about 7 us on a 13 us read, and `store_get` on the item-move endpoint
+goes 13 -> 20 us for it. That is the price of the cache being a cache of handles
+rather than a cache of values, which is what it always claimed to be.
+
+## What it costs now
+
+`tests/storeperf`, same machine, 300 commits:
+
+| | before | after |
+|---|---|---|
+| `storeWrite`, 3 KB value | 687 us | **423 us** |
+| `storeWrite`, 84 KB value | 676 us | **449 us** |
+
+Through the server, 3000 templates, 20 rounds, keep-alive, `--perf`:
+
+| | before | after |
+|---|---|---|
+| `items/moving` `store_set` | **718 us** | **476 us** |
+| `items/moving` `store_get` | 13 us | 20 us |
+| `items/moving` mean | 1.171 ms | **0.897 ms** |
+| `items/moving` p50 | 1.074 ms | **0.885 ms** |
+| `items/moving` p99 | 1.697 ms | **1.102 ms** |
+| `store_set` across the run | 428.2 ms / 581 calls | **281.0 ms** / 581 calls |
+| `route` across the run | 736.0 ms | **598.3 ms** |
+
+Eight interleaved pairs of the whole mix, one connection, same pinned mod:
+
+```
+before   611 608 611 605 606 597 540 571      median 606   best 611
+after    682 499 606 675 688 693 663 689      median 682   best 693
+```
+
+Two of the "after" runs and two of the "before" runs carry a 70-200 ms outlier
+on a single request; the machine had three other builds on it and the spikes
+land on both binaries, so the honest statistics are the median and the best.
+**+13%**, and the reason it is not +35% is that this mix is dominated by
+`/client/items` at 13 ms a request, which this change does not touch.
+
+The gate configuration -- `--items 1000 --rounds 6 --moves 15 --keepalive
+--floor 500` -- is where the endpoint's share is largest, and it is also the one
+the build fails on. Eleven cold runs a side, each against a directory that has
+never existed before:
+
+```
+before   837 860 819 840 841 832 826 870 854 846 820      median 840
+after    961 990 961 1021 929 939 1006 978 934 963 951    median 961
+```
+
+**840 -> 961 requests/second, and the floor is 500.** The margin goes from 1.68x
+to 1.92x.
+
+**The 268 did not reproduce.** The pass above records one cold run in eight
+coming in under the floor; twenty-two cold runs against fresh directories were
+taken here, eleven a side, and the lowest was 819. That is not a refutation --
+the run that produced 268 was a real run and the mechanism it names (the store
+meeting a directory real-time antivirus has not seen) is real -- but it is not
+reproducible on this machine today, and a floor now 1.9x under the median is the
+answer to it rather than moving the floor. The floor stays at 500.
+
+## Correctness
+
+Three gates, each run against the tree before this work as well as after,
+because a gate that has only ever been run one way is a gate nobody has seen
+fail.
+
+**`tools/storecrash --rounds 60`** -- kills a process inside a write and demands
+the file be one whole value.
+
+```
+this tree   in place (the control): 3 of 60 kills left a torn file
+            the store as it is:     0 of 60 torn, 23 kills landed inside a commit
+            ok  8 checks over 60 kills a phase
+```
+
+The 23 is the coverage claim: a temporary still sitting there after the kill is
+proof the kill happened inside a commit. A run where none did would pass and
+would mean nothing, and it is asserted for that reason.
+
+**`tests/storeperf/storeguard`** -- new, and the one this pass needed. A child
+process writes a key while this process reads it, and every read has to be
+exactly one whole value *and* the sequence of values a reader sees has to move.
+A reader that keeps answering `n=2` while the writer is on `n=900` has not torn
+anything; it has stopped being a reader. A second phase runs the same thing
+against the in-place write the store used to do, which is where the torn reads
+come from -- the check can fail, which is what makes the first phase's silence
+worth something.
+
+```
+against HEAD    error the writer was actually writing: the file never changed
+                error a reader keeps up with a committed write: the held handle
+                      answered 1 distinct value while the file moved through 1
+                2 of 9 checks failed
+
+this tree       committed writes: 25762 reads through the held handle, 0 torn,
+                                  4 distinct values; the file moved through 4
+                in-place writes:  26839 reads, 8 torn
+                ok  9 checks over two phases of 4s
+```
+
+It also holds the `.hist` ring to what the module promises: at most three
+generations for a key, every one of them a whole value, and none of them
+reported by `storeKeys`.
+
+**`emutest`**, both backends against the same pinned `tarkov.dll`, the same
+fixture and a fresh store each:
+
+```
+before   3 of 565 failed
+after    3 of 565 failed   (the same three)
+```
+
+The three are the emulator's own in-flight quest-condition work -- a kill
+condition's counter reading -1 -- and both binaries fail them identically.
+
+## The hazard this pass leaves open
+
+**Two processes committing the same key share one temporary name.** The
+temporary is `<dir>/.hist/<key>.tmp`, which is per key and not per process, and
+it is opened with every share flag set. Two hosts committing the same key at the
+same moment can therefore interleave their writes into one temporary and rename
+a mixture of the two values over the key -- which is the one thing this module
+exists to prevent, arriving from a direction its lock does not cover, because
+the lock is per process.
+
+It is not reachable today: the two host sides write disjoint keys, and
+`storeguard` had to put both roles on one key deliberately to get near it. The
+fix is a per-process suffix on the temporary -- `<key>.<pid>.tmp` -- which is
+free, because it is a name this process reuses rather than a new one each write,
+and the new-name-each-write variant is the one measured above as slower. It is
+not made here because `tools/storecrash` asserts on the exact name `<key>.tmp`
+as its coverage evidence, and the two edits belong in one commit rather than in
+two agents'.
