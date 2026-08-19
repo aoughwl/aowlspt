@@ -88,19 +88,69 @@ proc scavName(salt: int): string =
     if surname.len > 0:
       result = result & " " & surname
 
+proc pickLook(path: string; salt: int; fallback: string): string =
+  ## One appearance id, out of a table written **either way round**.
+  ##
+  ## This read `dbList` alone, i.e. it assumed an array -- and SPT 4.x writes
+  ## `appearance.head` and its siblings as **weight maps** (`{tpl: weight}`),
+  ## as all 57 roles in a real import do. So on any real database the list came
+  ## back empty and the player's scav wore the four hard-coded ids below,
+  ## every single raid. `emu/bots.nim` had the identical bug one file over.
+  ##
+  ## It was invisible from the fixture in both files for the same reason: the
+  ## fixture's arrays held exactly these four ids, so the fallback and the
+  ## table agreed and no check could tell them apart. The fixture ships weight
+  ## maps now.
+  ##
+  ## A weight of zero means never -- that is the shape's own rule, and it is
+  ## why this cannot simply take the first key. A pool that is absent, empty,
+  ## or all zero falls back, which is safe here in a way it is not everywhere:
+  ## a wrong customisation id is a missing model in the client, not a crash.
+  let pool = dbRead(path)
+  if pool.ok and pool.raw.len > 0:
+    let whole = whole(pool.raw)
+    if whole.found:
+      if isArray(whole):
+        let n = count(whole)
+        if n > 0:
+          var i = salt mod n
+          if i < 0: i = -i
+          return at(whole, i).asText(fallback)
+      else:
+        # Weighted, by the same rule `emu/bots` uses: skip zero weights, and
+        # walk the cumulative total with the caller's salt so the answer is
+        # reproducible from a log line rather than merely varied.
+        var keys: seq[string] = @[]
+        var weights: seq[int] = @[]
+        var total = 0
+        for m in members(whole):
+          let w = whole(m.value).asInt(0)
+          if w > 0:
+            keys.add m.name
+            weights.add w
+            total = total + w
+        if total > 0:
+          var pick = salt mod total
+          if pick < 0: pick = -pick
+          for i in 0 ..< keys.len:
+            pick = pick - weights[i]
+            if pick < 0:
+              return keys[i]
+  result = fallback
+
 proc scavLooks(salt: int): JsonObject =
   ## A face. The four customisation ids the client resolves against its own
   ## bundles -- a wrong one is a missing model, not a crash, which is why the
-  ## fallbacks below are safe to hard-code.
-  let heads = dbList("bots.types.assault.appearance.head")
-  let bodies = dbList("bots.types.assault.appearance.body")
-  let feet = dbList("bots.types.assault.appearance.feet")
-  let hands = dbList("bots.types.assault.appearance.hands")
+  ## fallbacks are safe to hard-code.
   result = obj()
-  put(result, "Head", pickFrom(heads, salt, "5cc084dd14c02e000b0550a3"))
-  put(result, "Body", pickFrom(bodies, salt, "5cde95ef7d6c8b04713c4f2d"))
-  put(result, "Feet", pickFrom(feet, salt, "5cde95d97d6c8b647a3769b0"))
-  put(result, "Hands", pickFrom(hands, salt, "5cc0876314c02e000c6bea6b"))
+  put(result, "Head", pickLook("bots.types.assault.appearance.head",
+                               salt, "5cc084dd14c02e000b0550a3"))
+  put(result, "Body", pickLook("bots.types.assault.appearance.body",
+                               salt, "5cde95ef7d6c8b04713c4f2d"))
+  put(result, "Feet", pickLook("bots.types.assault.appearance.feet",
+                               salt, "5cde95d97d6c8b647a3769b0"))
+  put(result, "Hands", pickLook("bots.types.assault.appearance.hands",
+                                salt, "5cc0876314c02e000c6bea6b"))
 
 proc healthPart(current, maximum: int): JsonObject =
   var h = obj()

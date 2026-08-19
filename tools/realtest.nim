@@ -1576,6 +1576,180 @@ proc main(): int =
         lootOrphans == 0, $lootOrphans & " orphans, e.g. " & lootSample)
 
   # =========================================================================
+  heading "Bots, against the real role tables"
+  # =========================================================================
+  #
+  # The database half of the bot generator, and it is here rather than in the
+  # mod's own load gate deliberately. `emu/bots` carries a self-check over
+  # literal tables -- pure arithmetic, which no input can work around, and a
+  # server that fails it refuses to serve. The assertions below are about
+  # *somebody else's data*: that every role writes its five appearance tables
+  # as weight maps, that every health variant names all seven body parts, that
+  # `bots/base.json` was imported at all. Every one of them is a claim a mod is
+  # allowed to break, and a load-time refusal over a modded bot table would be
+  # this server declining to start because a player installed something. So
+  # they report here, against a real import, and refuse nothing.
+  #
+  # Three defects made this section worth writing, and all three shipped green:
+  # every bot in every raid wore the same four appearance ids, every bot got
+  # the literal 35/85 human health -- bosses included -- and the voice went to
+  # `Info.Voice`, which is not a member of the client's `BotBase` at all.
+  var botRoles = 0
+  var botVariants = 0
+  var botHeadKinds = 0
+  var botRole = ""
+  var dbText = ""
+  if not readTextFile(staged, dbText):
+    skip("every role's appearance tables", "could not read " & staged)
+    skip("every role's health variants", "could not read " & staged)
+    skip("bots.base", "could not read " & staged)
+    skip("twenty bots are not all in one hat", "could not read " & staged)
+  else:
+    var rootAt = 0
+    while rootAt < dbText.len and dbText[rootAt] != '{':
+      inc rootAt
+    let botsAt = memberValue(dbText, rootAt, "bots")
+    var roleNames: seq[string] = @[]
+    var roleVals: seq[int] = @[]
+    members(dbText, memberValue(dbText, botsAt, "types"), roleNames, roleVals)
+    botRoles = roleNames.len
+
+    # 1. All five appearance tables, on every role, as objects.
+    #
+    # `pickFromPool` reads an array too, and that leniency is deliberate: the
+    # failure mode of refusing one is not a refusal, it is the default id on
+    # every bot on the map. So the array shape cannot be caught by anything the
+    # server does with it -- it can only be caught by looking at what the
+    # database actually says, which is what this does.
+    var badApp = 0
+    var badAppSample = ""
+    var missingVoice = 0
+    var i2 = 0
+    while i2 < roleNames.len:
+      let appAt = memberValue(dbText, roleVals[i2], "appearance")
+      for table in ["head", "body", "feet", "hands", "voice"]:
+        let at = memberValue(dbText, appAt, table)
+        if at < 0:
+          if table == "voice":
+            inc missingVoice
+          else:
+            inc badApp
+            if badAppSample.len == 0:
+              badAppSample = roleNames[i2] & "." & table & " is absent"
+        elif dbText[at] != '{':
+          inc badApp
+          if badAppSample.len == 0:
+            badAppSample = roleNames[i2] & "." & table & " is " &
+                           slice(dbText, at)
+      inc i2
+    check("every bot role writes all five appearance tables as weight maps",
+          roleNames.len > 0 and badApp == 0 and missingVoice == 0,
+          $badApp & " of " & $(roleNames.len * 5) & " tables are not objects" &
+          (if badAppSample.len > 0: ", e.g. " & badAppSample else: "") &
+          ", and " & $missingVoice & " roles carry no voice table")
+
+    # 2. Every variant of every role's `BodyParts` names all seven parts.
+    #
+    # `bodyPartsOf` refuses a partial table *whole* and falls back to a
+    # complete human, which is the right call -- half a body is a bot the
+    # client will not spawn -- and it means a role missing a leg is not a crash
+    # and not a log line. It is a boss with a scav's health, which is exactly
+    # the defect this replaced and exactly what no route can be asked about.
+    var badParts = 0
+    var badPartsSample = ""
+    var noHealth = 0
+    i2 = 0
+    while i2 < roleNames.len:
+      let hAt = memberValue(dbText, roleVals[i2], "health")
+      let bpAt = memberValue(dbText, hAt, "BodyParts")
+      if bpAt < 0 or dbText[bpAt] != '[':
+        inc noHealth
+        if badPartsSample.len == 0:
+          badPartsSample = roleNames[i2] & " has no BodyParts list"
+      else:
+        let variants = elements(dbText, bpAt)
+        if variants.len == 0:
+          inc noHealth
+          if badPartsSample.len == 0:
+            badPartsSample = roleNames[i2] & " has an empty BodyParts list"
+        for v in variants:
+          inc botVariants
+          for part in ["Head", "Chest", "Stomach", "LeftArm", "RightArm",
+                       "LeftLeg", "RightLeg"]:
+            if memberValue(dbText, v, part) < 0:
+              inc badParts
+              if badPartsSample.len == 0:
+                badPartsSample = roleNames[i2] & " has a variant with no " &
+                                 part
+      inc i2
+    check("and every health variant of every role names all seven body parts",
+          roleNames.len > 0 and noHealth == 0 and badParts == 0,
+          $noHealth & " roles with no variant list and " & $badParts &
+          " missing parts over " & $botVariants & " variants" &
+          (if badPartsSample.len > 0: ", e.g. " & badPartsSample else: ""))
+
+    # 3. `bots/base.json` -- 2 KB, imported, and for a long time never opened.
+    #    `Customization.Voice` is the member that matters: it is a template id,
+    #    it is `Nullable<MongoId>` on the client's own type, and it is where a
+    #    voice lives. `Info.Voice`, where the voice used to be written, is not
+    #    a member of anything.
+    let baseAt = memberValue(dbText, botsAt, "base")
+    let baseCust = memberValue(dbText, baseAt, "Customization")
+    let baseVoice = textVal(dbText, memberValue(dbText, baseCust, "Voice"))
+    check("bots.base is in the database, with a voice on its Customization",
+          baseAt >= 0 and dbText[baseAt] == '{' and baseCust >= 0 and
+          baseVoice.len > 0 and memberValue(dbText, baseAt, "Info") >= 0,
+          (if baseAt < 0: "there is no bots.base in this database"
+           else: "Customization.Voice is " & baseVoice))
+
+    # 4. And a generated batch, over the wire, on whichever role the database
+    #    gives the most heads to. Discovered rather than named, like every
+    #    other id in this file: a database imported next year picks a different
+    #    role and the check means the same thing.
+    var bestHeads = 0
+    i2 = 0
+    while i2 < roleNames.len:
+      let headAt = memberValue(dbText,
+                     memberValue(dbText, roleVals[i2], "appearance"), "head")
+      if headAt >= 0 and dbText[headAt] == '{':
+        var headKeys: seq[string] = @[]
+        var headVals: seq[int] = @[]
+        members(dbText, headAt, headKeys, headVals)
+        if headKeys.len > bestHeads:
+          bestHeads = headKeys.len
+          botRole = roleNames[i2]
+      inc i2
+    if botRole.len == 0 or bestHeads < 2:
+      skip("twenty bots are not all wearing the same head",
+           "no role in this database names two heads")
+    else:
+      let batch = timed("a batch of bots", "/client/game/bot/generate",
+        "{\"conditions\":[{\"Role\":\"" & botRole &
+        "\",\"Limit\":20,\"Difficulty\":\"normal\"}]}")
+      let botList = elements(batch.body, dataAt(batch))
+      check("a batch of twenty bots is generated off the real role tables",
+            batch.ok and botList.len == 20,
+            $botList.len & " bots for " & botRole & ": " & why(batch))
+      var botHeads = initHashSet[string]()
+      var noVoice = 0
+      for b in botList:
+        let cAt = memberValue(batch.body, b, "Customization")
+        incl(botHeads,
+             textVal(batch.body, memberValue(batch.body, cAt, "Head")))
+        if textVal(batch.body, memberValue(batch.body, cAt, "Voice")).len == 0:
+          inc noVoice
+      botHeadKinds = botHeads.len
+      # The one that would have caught the original defect on its own. A real
+      # `head` table has a dozen entries in it, and one distinct head over
+      # twenty draws is what a raid full of identical scavs looks like from
+      # here.
+      check("and twenty of them are not all wearing the same head",
+            botList.len == 20 and botHeadKinds > 1 and noVoice == 0,
+            $botHeadKinds & " distinct heads over " & $botList.len & " " &
+            botRole & " bots drawn from " & $bestHeads & " weighted ids, and " &
+            $noVoice & " of them have no voice")
+
+  # =========================================================================
   heading "A session, on the real tables"
   # =========================================================================
   let created = call("/client/game/profile/create",
@@ -3399,6 +3573,9 @@ proc main(): int =
        $recipeList.len & " recipes, " & $areaTypes.len & " hideout areas"
   line "  " & $mapKeys.len & " maps, " & $lootItems & " loot items over " &
        $lootMaps & " of them"
+  line "  " & $botRoles & " bot roles, " & $botVariants & " health variants, " &
+       $botHeadKinds & " distinct heads over 20 " &
+       (if botRole.len > 0: botRole else: "bot") & " bots"
   line "  largest response: " & gLargest & ", " & kib(gLargestBytes)
   line "  slowest request: " & gSlowest & ", " & $(gSlowestUs div 1000'i64) &
        " ms"

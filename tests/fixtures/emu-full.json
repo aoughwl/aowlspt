@@ -2606,6 +2606,103 @@
    "_comment": "The fallback brain settings, answered for a role or a difficulty the database does not have.",
    "aimSpeed": 1
   },
+  "_comment_base": "`bots/base.json` -- SPT's own bot skeleton, verbatim from an imported database, and the document every generated bot is now a copy of before anything is written over it. It is a sibling of `base` rather than a member of it so that the skeleton stays byte-faithful: a `_comment` inside it would ship to the client inside every bot. Two members are here for their shape and are the two places `base.json` and the client's declared `BotBase` disagree: `WishList` is `[]` where the type says `Dictionary<MongoId, Int32>`, and `Encyclopedia` is `null` where the type says `Dictionary<MongoId, Boolean>`. The type wins in both, and keeping the file's spelling here is what makes that checkable. `Customization.Voice` is the third: a template id, on `Customization`, which is where the client reads a voice -- `Info.Voice` is not a member of anything.",
+  "base": {
+   "_id": "60dc8576337fdf54e60e1800",
+   "aid": 0,
+   "savage": null,
+   "Info": {
+    "Nickname": "BOTNAME",
+    "LowerNickname": "",
+    "Side": "Savage",
+    "Level": 1,
+    "Experience": 0,
+    "RegistrationDate": 0,
+    "GameVersion": "",
+    "AccountType": 0,
+    "MemberCategory": 0,
+    "SelectedMemberCategory": 0,
+    "lockedMoveCommands": false,
+    "SavageLockTime": 0,
+    "LastTimePlayedAsSavage": 0,
+    "Settings": {
+     "Role": "assault",
+     "BotDifficulty": "normal",
+     "Experience": -1,
+     "StandingForKill": -0.04,
+     "AggressorBonus": 0.02,
+     "UseSimpleAnimator": false
+    },
+    "NicknameChangeDate": 0,
+    "NeedWipeOptions": [],
+    "lastCompletedWipe": null,
+    "lastWipeTimestamp": null,
+    "lastCompletedEvent": null,
+    "BannedState": false,
+    "BannedUntil": 0,
+    "IsStreamerModeAvailable": false,
+    "SquadInviteRestriction": false,
+    "HasCoopExtension": false,
+    "isMigratedSkills": false,
+    "HasPveGame": false,
+    "PrestigeLevel": 0
+   },
+   "Customization": {
+    "Head": "5cc2e4d014c02e000d0115f8",
+    "Body": "5cc2e59214c02e000f16684e",
+    "Feet": "5cde9fb87d6c8b0474535da9",
+    "Hands": "5cc2e68f14c02e28b47de290",
+    "Voice": "67b877e7d2dc6a01d5059dd9"
+   },
+   "Health": {
+    "UpdateTime": 0,
+    "Immortal": false
+   },
+   "Inventory": {
+    "fastPanel": {},
+    "hideoutAreaStashes": {},
+    "favoriteItems": []
+   },
+   "Skills": {
+    "Common": [],
+    "Mastering": [],
+    "Points": 0
+   },
+   "Stats": {
+    "Eft": {
+     "SessionCounters": {
+      "Items": []
+     },
+     "OverallCounters": {
+      "Items": []
+     },
+     "SessionExperienceMult": 0,
+     "ExperienceBonusMult": 0,
+     "TotalSessionExperience": 0,
+     "LastSessionDate": 0,
+     "Aggressor": null,
+     "DroppedItems": [],
+     "FoundInRaidItems": [],
+     "Victims": [],
+     "CarriedQuestItems": [],
+     "DamageHistory": {
+      "LethalDamagePart": "Head",
+      "LethalDamage": null,
+      "BodyParts": []
+     },
+     "LastPlayerState": null,
+     "TotalInGameTime": 0,
+     "SurvivorClass": "Unknown"
+    }
+   },
+   "Encyclopedia": null,
+   "TaskConditionCounters": {},
+   "InsuredItems": [],
+   "Hideout": null,
+   "Bonuses": [],
+   "WishList": [],
+   "Variables": {}
+  },
   "types": {
    "assault": {
     "firstName": [
@@ -2613,18 +2710,26 @@
     ],
     "lastName": [],
     "appearance": {
-     "head": [
-      "5cc084dd14c02e000b0550a3"
-     ],
-     "body": [
-      "5cde95ef7d6c8b04713c4f2d"
-     ],
-     "feet": [
-      "5cde95d97d6c8b647a3769b0"
-     ],
-     "hands": [
-      "5cc0876314c02e000c6bea6b"
-     ]
+     "_comment": "Weight maps -- `{template: weight}` -- which is how SPT 4.x writes all five of these, and `voice` is the fifth. This block used to be four arrays, the generator used to read four arrays, and the two agreeing is exactly why every bot in every raid wore the same four ids for months with a green test suite. Three things here are deliberate. `head` carries an entry weighted zero, so `a weight of zero means never, not rarely` is checkable. `feet` is entirely zero, so `a pool that sums to zero produces nothing rather than element zero` is checkable -- element zero of a degenerate distribution is precisely how a map ends up in one pair of boots -- and what has to show instead is `bots.base`'s own foot. And `voice` is here at all, because it is the table nothing ever read.",
+     "head": {
+      "aaaahead0000000000000001": 5,
+      "aaaahead0000000000000002": 5,
+      "aaaahead0000000000000003": 0
+     },
+     "body": {
+      "bbbbbody0000000000000001": 1
+     },
+     "feet": {
+      "ccccfeet0000000000000001": 0,
+      "ccccfeet0000000000000002": 0
+     },
+     "hands": {
+      "ddddhand0000000000000001": 1
+     },
+     "voice": {
+      "eeeevoic0000000000000001": 3,
+      "eeeevoic0000000000000002": 0
+     }
     },
     "experience": {
      "standingForKill": {
@@ -2729,14 +2834,81 @@
      }
     },
     "health": {
-     "BodyParts": {
-      "0": {
+     "_comment": "The shape a real `bots/types/<role>.json` ships. `BodyParts` is a LIST of variants -- stock `assault` has three, most roles have one -- and each variant is a map of part name to `{min, max}`. What used to be here was an object keyed \"0\" carrying `Head` alone, which the generator refuses whole and correctly: half a body is a bot the client will not spawn. So every bot this fixture ever produced fell back to the literal 35/85 human, bosses included, and no check could see it. Two variants, so a roll can be told from a splice. `LeftLeg` has `min` != `max`, so a range can be told from a point and `Maximum` can be told from the roll. `Head` is 33 and 44 rather than 35, so the hardcoded human is distinguishable from the table. And `Temperature`, `Hydration` and `Energy` sit one level up as `{min, max}` of their own, which is where a real table puts them.",
+     "Hydration": {
+      "min": 100,
+      "max": 100
+     },
+     "Energy": {
+      "min": 100,
+      "max": 100
+     },
+     "Temperature": {
+      "min": 36,
+      "max": 40
+     },
+     "BodyParts": [
+      {
        "Head": {
-        "min": 35,
-        "max": 35
+        "min": 33,
+        "max": 33
+       },
+       "Chest": {
+        "min": 80,
+        "max": 80
+       },
+       "Stomach": {
+        "min": 70,
+        "max": 70
+       },
+       "LeftArm": {
+        "min": 60,
+        "max": 60
+       },
+       "RightArm": {
+        "min": 60,
+        "max": 60
+       },
+       "LeftLeg": {
+        "min": 50,
+        "max": 70
+       },
+       "RightLeg": {
+        "min": 65,
+        "max": 65
+       }
+      },
+      {
+       "Head": {
+        "min": 44,
+        "max": 44
+       },
+       "Chest": {
+        "min": 85,
+        "max": 85
+       },
+       "Stomach": {
+        "min": 70,
+        "max": 70
+       },
+       "LeftArm": {
+        "min": 60,
+        "max": 60
+       },
+       "RightArm": {
+        "min": 60,
+        "max": 60
+       },
+       "LeftLeg": {
+        "min": 50,
+        "max": 70
+       },
+       "RightLeg": {
+        "min": 65,
+        "max": 65
        }
       }
-     }
+     ]
     },
     "generation": {
      "_comment": "The key of a weights entry is a COUNT and the value is how likely that count is, so a single entry is a fixed count and a count of zero means nothing goes in. Three kinds, deliberately: two items into a rig with room for exactly two, two into a backpack with room for neither, and none into pockets that have room.",

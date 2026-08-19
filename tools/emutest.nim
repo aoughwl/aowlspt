@@ -712,6 +712,44 @@ proc main(): int =
     err "no backend at " & backend
     return 1
 
+  # -- the fresh-root check, asked of the disk, before the server starts ----
+  #
+  # There is a second half of this below -- "no profiles on a fresh install",
+  # asked of `/client/game/profile/list` -- and it is not enough on its own.
+  # It was the only guard for a long time, and this is the hole it left.
+  #
+  # The store is a directory of files, one per subject: `profile.<id>`, and
+  # beside it `market.<id>`, `mail.<id>`, `insurance.<id>`, `builds.<id>`,
+  # `repeat.<id>`, `scav.<id>` and the server's own `ids.run`. Delete the
+  # profiles alone -- which is what a half-finished cleanup, an interrupted
+  # `rm -rf`, or a file still held open by a backend nobody killed leaves
+  # behind -- and the profile list answers `[]` quite truthfully. The guard
+  # below passes, the run proceeds, and thirteen checks then fail describing
+  # the *previous* run: the flea's offer counts include the last run's
+  # generated offers, the hideout's crafts are already finished, the insurance
+  # cover has already matured and been paid, and the traders' return lines have
+  # already been rotated past. Measured, not imagined: deleting `profile.*` and
+  # `sessions` from a completed run and leaving the other seven files produces
+  # exactly that set of thirteen, and every one of them reads like a bug in
+  # whatever the reader last changed.
+  #
+  # So the question is asked of the store itself, and asked before the backend
+  # has had a chance to create `ids.run` in it. A root that has been run
+  # against is not fresh no matter what the profile list says.
+  let storeDir = joinPath(root, "store")
+  if exists(storeDir):
+    var storeFiles: seq[string] = @[]
+    var storeDirs: seq[string] = @[]
+    collectEntries(storeDir, storeFiles, storeDirs)
+    if storeFiles.len > 0:
+      err "this root already has a store in it; emutest needs an empty one"
+      note "delete " & storeDir & " and run again -- all of it, not the " &
+           "profiles alone: every check after the boot sequence assumes a " &
+           "world this run made"
+      note $storeFiles.len & " files are still there, e.g. " &
+           baseName(storeFiles[0])
+      return 1
+
   discard cNetStartup()
 
   heading "Starting"
@@ -3408,6 +3446,105 @@ proc main(): int =
       "/client/game/bot/difficulty?type=assault&difficulty=nosuchlevel", "")
     check("and a difficulty the role does not have falls back to the core one",
           coreBrains.contains("fallback brain settings"), coreBrains.body)
+
+    # ---- and what a bot *is*: its face, its voice, and its body ----------
+    #
+    # Everything above this point is about a bot's gear, and every check in it
+    # was green while three defects shipped for months: every bot in every raid
+    # wore the same four appearance ids, every bot got the literal 35/85 human
+    # health regardless of role, and the voice was written to `Info.Voice` --
+    # a member the client's own `BotBase` does not declare.
+    #
+    # None of the three was visible from here, and the reason was not the
+    # checks. It was the fixture: `bots.types.assault.appearance` was four
+    # *arrays* and the generator read four arrays, `health.BodyParts` was an
+    # object the generator refuses whole, and there was no `bots.base` at all.
+    # The fixture was written in the shape the code expected rather than the
+    # shape the game ships, so it agreed with every bug. It now carries the
+    # real shapes -- five weight maps, with a zero-weight entry and an all-zero
+    # pool among them, two `BodyParts` variants with a real range in one part,
+    # a `Temperature` range, and SPT's own `bots/base.json` -- and these are
+    # the checks that shape makes possible.
+    #
+    # Twelve bots rather than two. Every defect below is a defect of
+    # *sameness*, and a sample of one cannot see one.
+    let dozen = call("/client/game/bot/generate",
+      "{\"conditions\":[{\"Role\":\"assault\",\"Limit\":12," &
+      "\"Difficulty\":\"normal\"}]}")
+    let dozenCount = countOf(dozen.body, "55d7217a4bdc2d86028b456d")
+    check("a dozen bots are generated", dozen.ok and dozenCount == 12,
+          $dozenCount & " bots, not 12")
+    # 1. The appearance tables are weight maps, and both weighted heads are
+    #    drawn. The sum is asserted as well as the pair, because "both ids
+    #    appear" would pass against a generator that also invented a third.
+    let headA = countOf(dozen.body, "\"Head\":\"aaaahead0000000000000001\"")
+    let headB = countOf(dozen.body, "\"Head\":\"aaaahead0000000000000002\"")
+    check("and two of them are not wearing the same head",
+          headA > 0 and headB > 0 and headA + headB == dozenCount,
+          $headA & " in one head, " & $headB & " in the other, out of " &
+          $dozenCount & " bots")
+    # 2. A weight of zero means never, not rarely -- for a head and for a
+    #    voice, because they are drawn by the same proc and only one of the
+    #    five tables was ever read.
+    check("and an id the role weights at zero is never worn or spoken",
+          not dozen.contains("aaaahead0000000000000003") and
+          not dozen.contains("eeeevoic0000000000000002"), dozen.body)
+    # 3. A pool whose weights all sum to zero produces *nothing*, and the
+    #    fallback is `bots.base`'s own foot. Element zero of a degenerate
+    #    distribution is exactly how a map ends up in one pair of boots, so
+    #    both halves are asserted: the fixture's ids are absent, and the
+    #    base's is on every bot.
+    check("and an all-zero pool falls back to bots.base, not to element zero",
+          countOf(dozen.body, "\"Feet\":\"5cde9fb87d6c8b0474535da9\"") ==
+            dozenCount and not dozen.contains("ccccfeet"),
+          dozen.body)
+    # 4. The fifth appearance table, and the one nothing ever read.
+    #    `Customization.Voice` is `Nullable<MongoId>` on the client's own type.
+    check("and the voice is the weighted table's, on Customization",
+          countOf(dozen.body, "\"Voice\":\"eeeevoic0000000000000001\"") ==
+            dozenCount,
+          dozen.body)
+    # 5. And *only* there. `Info.Voice` is not a member of `BotBase`, so a bot
+    #    carrying two voices is a bot with one the client cannot read. Counted
+    #    rather than searched for, because `Customization.Voice` is legitimate
+    #    and a search for `"Voice"` would find it and call the bug fixed.
+    check("and it is the only Voice on the bot; BotBase declares no other",
+          countOf(dozen.body, "\"Voice\":") == dozenCount,
+          $countOf(dozen.body, "\"Voice\":") & " Voice members across " &
+          $dozenCount & " bots, not one each")
+    # 6. `health.BodyParts` is a *list of variants*, drawn from, and rolled.
+    #    33 and 44 are the two variants' heads and neither is 35, so a bot that
+    #    fell back to the hardcoded human is not a bot that happened to match.
+    let head33 = countOf(dozen.body, "\"Head\":{\"Health\":{\"Current\":33")
+    let head44 = countOf(dozen.body, "\"Head\":{\"Health\":{\"Current\":44")
+    check("and its head health came out of the two-variant table, both of them",
+          head33 > 0 and head44 > 0 and head33 + head44 == dozenCount,
+          $head33 & " at 33, " & $head44 & " at 44, out of " & $dozenCount &
+          " bots -- 35 is the hardcoded human and is neither variant")
+    # 7. And the table's own spelling does not reach the client, which reads
+    #    `{Health: {Current, Maximum}}` and nothing else.
+    # Both halves, and the second is the one that matters. The first bot's
+    # `Health` alone is one draw out of two variants, so a `min` left on a part
+    # in the *other* variant is invisible to it -- which is exactly what
+    # happened the first time this was written. The batch-wide count is what
+    # makes the claim about the table rather than about one bot.
+    let botHealth = memberObject(dozen.body, "Health")
+    check("and the table's {min, max} is nowhere under Health",
+          botHealth.len > 0 and find(botHealth, "min") < 0 and
+          countOf(dozen.body, "\"min\":") == 0 and
+          countOf(dozen.body, "\"max\":") == 0,
+          $countOf(dozen.body, "\"min\":") & " min and " &
+          $countOf(dozen.body, "\"max\":") & " max across the batch: " &
+          botHealth)
+    # 8. The profile is `bots.base` with things written over it, and where the
+    #    base file and the client's declared type disagree the type wins.
+    #    `lockedMoveCommands` is a member only the base carries: nothing in the
+    #    generator computes it, so its presence is the base having been opened.
+    check("and the bot is built on bots.base, with the client's type winning",
+          dozen.contains("\"lockedMoveCommands\":false") and
+          countOf(dozen.body, "\"WishList\":{}") == dozenCount and
+          not dozen.contains("\"WishList\":[]") and
+          not dozen.contains("\"Encyclopedia\":null"), dozen.body)
   else:
     note "no database fixture; skipping the bot loadout checks"
 
