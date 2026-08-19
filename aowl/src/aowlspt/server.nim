@@ -21,6 +21,7 @@
 
 import std/strutils
 import ".." / aowlspt
+import "." / json
 
 # ---------------------------------------------------------------------------
 # Building JSON without a JSON library
@@ -138,6 +139,273 @@ proc dbRead*(path: string): DbValue =
     result = DbValue(ok: true, raw: out1, error: "")
   else:
     result = DbValue(ok: false, raw: "", error: lastError())
+
+# ------------------------------------------------------------ key enumeration
+#
+# The five procs below decode JSON strings, which `aowlspt/json` already does
+# and does identically. They are written out again here rather than imported,
+# and the reason is narrow: `aowlspt/json` exports an `escapeText` with the
+# same signature as the one this module defines above, and importing it would
+# make every call to that one *inside this module* ambiguous. A mod importing
+# both is unaffected -- ambiguity bites at a call site, and a mod calls one or
+# the other -- but this module cannot import it without renaming its own.
+#
+# So: duplicated deliberately, and kept behaviourally identical to
+# `json.unquote`, `json.skipValue` and `json.keys`. A mod must be able to
+# replace `keys(whole(dbRead(path).raw))` with `dbKeys(path, names)` and get
+# the same `seq[string]` out, escapes and all -- that is the whole point of
+# the wrapper, and a second decoder that disagreed about `\"` would break it.
+
+proc keySkipWs(s: string; i: var int) =
+  while i < s.len and (s[i] == ' ' or s[i] == '\t' or s[i] == '\n' or
+                       s[i] == '\r'):
+    inc i
+
+proc keySkipString(s: string; i: var int): bool =
+  ## `i` at the opening quote, left just past the closing one. Escapes are
+  ## stepped two at a time, which is what stops a `\"` inside a name ending it.
+  if i >= s.len or s[i] != '"':
+    return false
+  inc i
+  while i < s.len:
+    if s[i] == '\\':
+      i = i + 2
+      continue
+    if s[i] == '"':
+      inc i
+      return true
+    inc i
+  result = false
+
+proc keySkipValue(s: string; i: var int): bool =
+  ## `json.skipValue`. Depth-counting rather than parsing: where the value
+  ## ends, not what it means.
+  keySkipWs(s, i)
+  if i >= s.len:
+    return false
+  case s[i]
+  of '"':
+    return keySkipString(s, i)
+  of '{', '[':
+    var depth = 0
+    while i < s.len:
+      let c = s[i]
+      if c == '"':
+        if not keySkipString(s, i):
+          return false
+        continue
+      if c == '{' or c == '[':
+        inc depth
+      elif c == '}' or c == ']':
+        dec depth
+        if depth == 0:
+          inc i
+          return true
+      inc i
+    return false
+  else:
+    while i < s.len and s[i] != ',' and s[i] != '}' and s[i] != ']':
+      inc i
+    return true
+
+proc keyUnquote(s: string): string =
+  ## `json.unquote`, character for character. `\u` is decoded for the ASCII
+  ## range and otherwise left as written, so a Cyrillic locale key comes back
+  ## visibly escaped rather than silently mangled.
+  result = ""
+  var i = 0
+  while i < s.len:
+    if s[i] != '\\':
+      result.add s[i]
+      inc i
+      continue
+    inc i
+    if i >= s.len:
+      break
+    case s[i]
+    of '"': result.add '"'
+    of '\\': result.add '\\'
+    of '/': result.add '/'
+    of 'n': result.add '\n'
+    of 'r': result.add '\r'
+    of 't': result.add '\t'
+    of 'b': result.add '\b'
+    of 'f': result.add '\f'
+    of 'u':
+      var code = 0
+      var got = 0
+      var k = i + 1
+      while k < s.len and got < 4:
+        let ch = s[k]
+        var d = -1
+        if ch >= '0' and ch <= '9': d = ord(ch) - ord('0')
+        elif ch >= 'a' and ch <= 'f': d = ord(ch) - ord('a') + 10
+        elif ch >= 'A' and ch <= 'F': d = ord(ch) - ord('A') + 10
+        if d < 0: break
+        code = code * 16 + d
+        inc got
+        inc k
+      if got == 4 and code >= 0x20 and code < 0x80:
+        result.add char(code)
+        i = k - 1
+      else:
+        result.add "\\u"
+        var m = i + 1
+        while m < i + 1 + got:
+          result.add s[m]
+          inc m
+        i = m - 1
+    else:
+      result.add s[i]
+    inc i
+
+proc keyArray(text: string): seq[string] =
+  ## `["a","b"]` as a `seq[string]`. This parses the host's own answer and
+  ## nothing else, so it gives up on anything that is not an array of strings
+  ## rather than guessing at it.
+  result = @[]
+  var i = 0
+  keySkipWs(text, i)
+  if i >= text.len or text[i] != '[':
+    return
+  inc i
+  while i < text.len:
+    keySkipWs(text, i)
+    if i < text.len and text[i] == ',':
+      inc i
+      keySkipWs(text, i)
+    if i >= text.len or text[i] == ']':
+      return
+    if text[i] != '"':
+      return
+    let start = i
+    if not keySkipString(text, i):
+      return
+    result.add keyUnquote(text.substr(start + 1, i - 2))
+
+proc objectKeys(text: string): seq[string] =
+  ## `json.keys`: the member names of an object's text, in document order.
+  ## Only the fallback path in `dbKeysOrRead` uses it.
+  result = @[]
+  var i = 0
+  keySkipWs(text, i)
+  if i >= text.len or text[i] != '{':
+    return
+  inc i
+  while i < text.len:
+    keySkipWs(text, i)
+    if i >= text.len or text[i] == '}':
+      return
+    if text[i] != '"':
+      return
+    let nameStart = i
+    if not keySkipString(text, i):
+      return
+    result.add keyUnquote(text.substr(nameStart + 1, i - 2))
+    keySkipWs(text, i)
+    if i >= text.len or text[i] != ':':
+      return
+    inc i
+    if not keySkipValue(text, i):
+      return
+    keySkipWs(text, i)
+    if i < text.len and text[i] == ',':
+      inc i
+
+const DbKeysSigil* = "?keys "
+  ## The reserved path prefix that asks a `db_get` for an object's member names
+  ## instead of its value. Exposed so a mod can read the wrappers below and see
+  ## what they send, not so it has to compose one by hand.
+
+proc dbKeysReady*(): bool =
+  ## Whether this host can enumerate keys.
+  ##
+  ## **Not a size test**, because this is not an ABI entry. The probe is the
+  ## sigil with no path after it: a host that implements key enumeration
+  ## refuses that with `ErrBadArg` -- there is nothing to enumerate -- and a
+  ## host that does not walks a path called `"?keys "`, finds no root member by
+  ## that name, and answers `ErrNotFound`. One call, no ABI surface, and no
+  ## guessing.
+  ##
+  ## `aowlspt-backend` answers true. The simulator and the in-game client host
+  ## answer false, and will until somebody adds the sigil to them; a mod should
+  ## treat false as "read the subtree instead", which is what it did before
+  ## this existed.
+  var out1 = ""
+  result = dbGet(DbKeysSigil, out1) == ErrBadArg
+
+proc dbKeys*(path: string; into: var seq[string]): Status =
+  ## The immediate member names of the object at `path`, in document order.
+  ##
+  ## The answer is the same `seq[string]` that `keys(whole(text))` gives for
+  ## the same object -- it *is* that call, over the array the host sends back
+  ## -- so a mod can swap one for the other without changing the code that
+  ## consumes it.
+  ##
+  ## Four answers, and the difference between the last two is the point:
+  ##
+  ##  * `Ok` -- `into` holds the names. An object with no members is `Ok` and
+  ##    an empty `into`.
+  ##  * `ErrBadArg` -- the path is an **array or a scalar**. A list has no
+  ##    keys, and it is not answered with `["0","1",...]`: for a large table
+  ##    that is a huge reply to a question whose real form is "how long is it",
+  ##    and a caller that wanted indices already has the length from `dbRead`.
+  ##  * `ErrNotFound` -- **there is no such path**. That is not the same as an
+  ##    object with no members, and a caller that treats them alike will create
+  ##    something over the top of a table it failed to read.
+  ##  * `ErrNotFound` **again**, from a host that does not implement this at
+  ##    all: it looked for a root member literally named `?keys <path>` and did
+  ##    not find one. The two are indistinguishable from this call alone, which
+  ##    is the price of not spending an ABI revision. `dbKeysReady()` separates
+  ##    them for one call, and `dbKeysOrRead` does it for you.
+  ##
+  ## ## What it costs
+  ##
+  ## Not nothing. The reply is `sum(len(name)) + 3n` bytes for `n` members --
+  ## about 2.7 MB for a table of 100k Mongo ids. That is roughly 200x smaller
+  ## than reading the subtree, and it is still megabytes crossing the ABI and
+  ## then being parsed into a `seq[string]` on this side. Ask for it once and
+  ## keep the answer for as long as you would have kept the read.
+  ##
+  ## It is a **snapshot**, not an index. Another mod may patch that object
+  ## between this call and the `dbRead` of a child, and the order is the
+  ## document's -- which a merge can change. Nobody promised the order.
+  into = @[]
+  var out1 = ""
+  result = dbGet(DbKeysSigil & path, out1)
+  if result != Ok:
+    return
+  into = keyArray(out1)
+
+proc dbKeysOrRead*(path: string; into: var seq[string]; scanned: var bool): Status =
+  ## `dbKeys`, falling back to reading the whole subtree on a host that has no
+  ## key enumeration -- and **saying which it did**, in `scanned`.
+  ##
+  ## The fallback is the read a mod was doing before this existed, and it is
+  ## the expensive one: `locations` on a stock import is 13.5 MB and on one
+  ## with loose loot it is over half a gigabyte. `scanned` is true when that is
+  ## what happened, so a mod can log what the answer cost instead of leaving a
+  ## user wondering where the second went.
+  ##
+  ## `ErrNotFound` from this means the path is genuinely not there: the host
+  ## was asked twice, the second time for the subtree itself.
+  into = @[]
+  scanned = false
+  result = dbKeys(path, into)
+  if result == Ok or result == ErrBadArg:
+    return
+  # `ErrNotFound` -- either no such path, or no such feature. One read tells
+  # both apart and answers the question at the same time.
+  scanned = true
+  let v = dbRead(path)
+  if not v.ok:
+    return ErrNotFound
+  var i = 0
+  keySkipWs(v.raw, i)
+  if i >= v.raw.len or v.raw[i] != '{':
+    return ErrBadArg
+  into = objectKeys(v.raw)
+  result = Ok
 
 proc asText*(v: DbValue): string =
   if v.raw.len >= 2 and v.raw[0] == '"' and v.raw[v.raw.len - 1] == '"':

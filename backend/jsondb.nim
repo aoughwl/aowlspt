@@ -205,14 +205,51 @@ var gDoc = ""
 var gMembers = initTable[string, int64]()
 var gIndexed = initTable[int, bool]()
 
+var gNames = initTable[int, string]()
+  ## The immediate member names of an object, as the **finished JSON array
+  ## text**, keyed by the same anchor offset as `gIndexed`.
+  ##
+  ## Two things about the shape, both deliberate.
+  ##
+  ## It is the answer rather than the ingredients. `gMembers` already holds
+  ## every name -- inside its keys, as `"<offset><US><name>"` -- so answering
+  ## "the keys of this object" from it means scanning every entry in the table
+  ## for a matching prefix, which is O(every indexed member in the document)
+  ## for a question about one object. That is the wrong shape. Holding the
+  ## array text instead means the answer is a table lookup and a copy, and it
+  ## needs no re-escaping: a name is stored here exactly as the document spells
+  ## it, escapes and all, so wrapping it in quotes reproduces valid JSON.
+  ##
+  ## It is filled only for objects somebody **asked** about, never for every
+  ## object a path walk happens to index. That is mitigation (a) of the two
+  ## `docs/API-GAPS.md` lists, and it is the one that keeps the memory honest:
+  ## a walk down `templates.items.<id>._props.Weight` indexes four objects and
+  ## one of them has 100k members, none of which anybody asked to enumerate.
+  ## The price is that "already indexed" is not the same as "already asked" --
+  ## the first `dbKeysPath` on a table pays one scan of it even if a read has
+  ## been there before, which is the scan the read had already paid once. It
+  ## is paid again rather than remembered, and that is the trade.
+  ##
+  ## Every entry is an anchor offset, so everything that drops a `gIndexed`
+  ## entry must drop the matching one here. There are three such places and
+  ## they are named in `docs/API-GAPS.md`: `indexClear`, `rebaseLocked`, and
+  ## the `IndexCeiling` branch of `indexedFind` -- which reaches this through
+  ## `indexClear`. A miss is stale names against a re-anchored document, which
+  ## is the one failure the anchor-coordinate design exists to refuse.
+
 const IndexCeiling = 2_000_000
   ## Members held before the index is thrown away and rebuilt on demand. A
   ## database is bounded, but a mod addressing a million distinct paths is not,
   ## and an index that can only grow is a leak with a slow fuse.
+  ##
+  ## `gNames` has no ceiling of its own and does not need one: it holds one
+  ## entry per object a mod has *enumerated*, which is bounded by the tables a
+  ## mod knows the name of, and it is emptied by this one anyway.
 
 proc indexClear() =
   clear(gMembers)
   clear(gIndexed)
+  clear(gNames)
 
 # ------------------------------------------------------------- the edit list
 #
@@ -433,8 +470,23 @@ proc rebaseLocked() =
     let cur = toCur(k, ok)
     if ok:
       indexed[cur] = v
+
+  # The names, translated by exactly the rule above them and dropped by exactly
+  # the same `dropped` set. An object that loses one member loses its whole
+  # member table, and a key list that outlived the members it names would be a
+  # list of paths a caller is about to be told do not exist.
+  var names = initTable[int, string]()
+  for k, v in pairs(gNames):
+    if hasKey(dropped, k):
+      continue
+    var ok = true
+    let cur = toCur(k, ok)
+    if ok:
+      names[cur] = v
+
   gMembers = members
   gIndexed = indexed
+  gNames = names
   clear(gDirty)
   gPartial = -1
   gEdits = @[]
@@ -597,10 +649,16 @@ proc memberKey(objStart: int; name: string): string =
   result.add char(31)
   result.add name
 
-proc indexObject(objA: int): bool =
+proc indexObject(objA: int; wantNames: bool): bool =
   ## Enumerates the immediate members of the object at anchor offset `objA` and
   ## records each one's byte range, in anchor coordinates. Caller holds the
   ## lock.
+  ##
+  ## `wantNames` additionally records the member *names*, as the JSON array
+  ## text `dbKeysPath` answers with. It is off for every ordinary path walk:
+  ## the enumeration is free -- these names are read and discarded here either
+  ## way -- but *keeping* them is not, and a walk indexes objects nobody asked
+  ## to enumerate. See `gNames`.
   ##
   ## This is `findKeyIn`'s loop with the early return taken out: the scan it
   ## does to find one member finds all of them on the way past, and throwing
@@ -616,28 +674,59 @@ proc indexObject(objA: int): bool =
   if not ok:
     return false
   gIndexed[objA] = true
+  # Whatever was remembered about this object's names describes the text that
+  # was here before, and this call is re-reading it. Dropped **first**, so that
+  # every path out of the loop below -- including the two that give up part-way
+  # -- leaves no entry rather than a stale one. Fail closed: no answer is a
+  # scan next time, a wrong answer is a list of paths that are not there.
+  if wantNames:
+    del(gNames, objA)
+  # The array is built as the loop goes and stored at **every** exit that
+  # returns true, including the four that give up on malformed text. An object
+  # that indexes as far as it parses answers with the members it has, exactly
+  # as `gMembers` describes the members it has -- the alternative is a
+  # `dbKeysPath` that rescans a truncated object on every single call.
+  var names = "["
   var i = objStart
   skipWs(gDoc, i)
   if i >= gDoc.len or gDoc[i] != '{':
+    if wantNames:
+      names.add ']'
+      gNames[objA] = names
     return true
   inc i
   while i < gDoc.len:
     skipWs(gDoc, i)
     if i < gDoc.len and gDoc[i] == '}':
+      if wantNames:
+        names.add ']'
+        gNames[objA] = names
       return true
     if i >= gDoc.len or gDoc[i] != '"':
+      if wantNames:
+        names.add ']'
+        gNames[objA] = names
       return true
     let nameStart = i
     if not skipString(gDoc, i):
+      if wantNames:
+        names.add ']'
+        gNames[objA] = names
       return true
     let name = gDoc.substr(nameStart + 1, i - 2)
     skipWs(gDoc, i)
     if i >= gDoc.len or gDoc[i] != ':':
+      if wantNames:
+        names.add ']'
+        gNames[objA] = names
       return true
     inc i
     skipWs(gDoc, i)
     let vs = i
     if not skipValue(gDoc, i):
+      if wantNames:
+        names.add ']'
+        gNames[objA] = names
       return true
     var okStart = true
     let vsA = toAnchor(vs, okStart)
@@ -647,12 +736,30 @@ proc indexObject(objA: int): bool =
       gPartial = objA
       return false
     gMembers[memberKey(objA, name)] = (int64(vsA) shl 32) or int64(veA)
+    if wantNames:
+      # The document's own bytes, quoted. `name` is the *source* text between
+      # the quotes, so whatever escaping the document used is carried through
+      # unchanged and the result is valid JSON without re-escaping anything --
+      # which also means a name is answered with exactly the spelling a caller
+      # would have to hand back to `db_get`.
+      if names.len > 1:
+        names.add ','
+      names.add '"'
+      names.add name
+      names.add '"'
     skipWs(gDoc, i)
     if i < gDoc.len and gDoc[i] == ',':
       inc i
       continue
     if i < gDoc.len and gDoc[i] == '}':
+      if wantNames:
+        names.add ']'
+        gNames[objA] = names
       return true
+  # Ran off the end of the document: a truncated object. Same rule.
+  if wantNames:
+    names.add ']'
+    gNames[objA] = names
   result = true
 
 const RestartCeiling = 8
@@ -689,7 +796,7 @@ proc indexedFind(objA: int; key: string; valueStart, valueEnd: var int;
   if not hasKey(gIndexed, obj) or hasKey(gDirty, obj):
     if len(gMembers) > IndexCeiling:
       indexClear()
-    if not indexObject(obj):
+    if not indexObject(obj, false):
       # The object, or something in it, is text a patch wrote. Re-anchor --
       # after which anchor coordinates *are* current ones -- and index it
       # there. `toCur` is taken before the re-anchor, while the old
@@ -705,7 +812,7 @@ proc indexedFind(objA: int; key: string; valueStart, valueEnd: var int;
         cUnlock()
         return false
       obj = cur
-      discard indexObject(obj)
+      discard indexObject(obj, false)
   let packed = getOrDefault(gMembers, memberKey(obj, key), 0'i64)
   cUnlock()
   if packed == 0'i64:
@@ -905,6 +1012,156 @@ proc dbRelease*() =
   ## The other half of `dbHoldPath`. Separate rather than a template taking a
   ## block because there is one call site and a block form would invite more.
   docReadEnd()
+
+# ------------------------------------------------------------ key enumeration
+
+const
+  KeysNoSuchPath* = 1
+    ## `dbKeysPath` refused: there is no such path. Distinct from an object
+    ## with no members, which answers `true` with `[]`.
+  KeysNotAnObject* = 2
+    ## `dbKeysPath` refused: the path is an array or a scalar.
+
+const KeysSigil* = "?keys "
+  ## The reserved prefix that turns a `db_get` into a key enumeration.
+  ##
+  ## The whole of `docs/API-GAPS.md`'s gap 2 comes down to this string, and it
+  ## is a string rather than an ABI entry on purpose. A host entry means
+  ## revision 6, and revision 6 cannot be reached by the simulator without it
+  ## first claiming revision 5 -- installing a refusing `notify_push` it has no
+  ## socket for -- which flips `notifyReady()` from an honest `false` to `true`
+  ## in the one host a mod author develops against. A sigil costs none of that
+  ## and **degrades without a capability test**: a host that has never heard of
+  ## it walks the path, finds no root member literally named `?keys locations`,
+  ## and answers `ErrNotFound`, which is exactly the answer a caller needs.
+  ##
+  ## The cost is that it is a side channel in a string, and the collision is
+  ## real rather than theoretical: nothing stops a JSON member name containing
+  ## a space, a question mark, or both -- `memberKey`'s own comment is about
+  ## names with spaces in them. A root member literally named `?keys locations`
+  ## would be shadowed by this. The root of an SPT database has members named
+  ## `templates`, `locations`, `globals`, `traders`; the collision is not
+  ## credible, and it is still a collision, and this comment is where it is
+  ## written down. Only the **root** is exposed: a nested member named
+  ## `?keys x` is unreachable through this only if the whole path begins with
+  ## the sigil, and `"a.?keys b"` is not affected at all.
+
+proc dbKeysRequest*(path: string; rest: var string): bool =
+  ## Splits `KeysSigil` off the front of a `db_get` path.
+  ##
+  ## True means this is a key enumeration and `rest` is the path to enumerate,
+  ## **which may be empty**: `"?keys "` on its own is a deliberate answer and
+  ## not an accident. A host that implements this refuses it with
+  ## `ErrBadArg`; a host that does not answers `ErrNotFound`, because there is
+  ## no root member called `"?keys "`. That difference is the capability probe,
+  ## and it costs one call and no ABI surface.
+  rest = ""
+  if path.len < KeysSigil.len:
+    return false
+  var i = 0
+  while i < KeysSigil.len:
+    if path[i] != KeysSigil[i]:
+      return false
+    inc i
+  rest = path.substr(KeysSigil.len)
+  result = true
+
+proc dbKeysPath*(path: string; into: var string; why: var int): bool =
+  ## The immediate member names of the object at `path`, as JSON array text,
+  ## in document order, duplicates included if the document has them.
+  ##
+  ## False sets `why` to `KeysNoSuchPath` or `KeysNotAnObject`, and the caller
+  ## turns those into `ErrNotFound` and `ErrBadArg`. **The two are not the
+  ## same question and must not be folded together**: an object with no members
+  ## answers `true` with `[]`, and a caller that reads "no keys" out of "no
+  ## such path" will create a table over the top of one it failed to read.
+  ##
+  ## An array is refused rather than answered with `["0","1",...]`. For a
+  ## hundred thousand elements that is a 700 KB reply to a question whose real
+  ## form is "how long is it", and a caller that wanted indices already has the
+  ## length from a `db_get`.
+  ##
+  ## ## What it costs
+  ##
+  ## The answer is `sum(len(name)) + 3n` bytes for `n` members -- about 2.7 MB
+  ## for a table of 100k Mongo ids, which is 200x smaller than reading that
+  ## subtree and is **not small**. The doc comment gives the formula rather
+  ## than the word "cheap" for that reason.
+  ##
+  ## The first call on an object walks it once: `skipValue` steps over every
+  ## byte of the subtree without parsing any of it, and nothing is copied out
+  ## of it. That is the same walk the next `db_get` into that object was going
+  ## to pay, so it makes later reads faster rather than slower. Later calls on
+  ## the same object are a table lookup and a copy of the answer.
+  ##
+  ## ## What it is not
+  ##
+  ## It is a **snapshot**, not an index. Between this and a `db_get` of a child
+  ## another mod may patch; that is true of every read here, and a key list
+  ## looks enough like an index to invite being cached when it should not be.
+  ## Document order is the document's, and `dbPatchPath` merges -- `mergeInto`
+  ## can move a member -- so the order may change when anything patches that
+  ## object. Nobody promised the order; this says so.
+  into = ""
+  why = 0
+  docRead()
+  var vs = 0
+  var ve = 0
+  if not locate(path, vs, ve):
+    docReadEnd()
+    why = KeysNoSuchPath
+    return false
+  var i = vs
+  while i < ve and isDocWs(gDoc[i]):
+    inc i
+  if i >= ve or gDoc[i] != '{':
+    docReadEnd()
+    why = KeysNotAnObject
+    return false
+
+  # From here down is the index, and the order of the two locks is the order
+  # this file keeps everywhere: the document lock is held (shared, from
+  # `docRead` above) and the index lock is taken **inside** it, never the other
+  # way round. `dbGetPath` and `dbHoldPath` are the same shape.
+  #
+  # Everything that reads or writes `gNames` is inside one `cLock`, which is
+  # what makes it safe to key by an anchor offset computed from a current one:
+  # `toAnchor(i)` is only meaningful while the edit list is what it was when it
+  # was taken, and no other reader can re-anchor between the translation and
+  # the lookup because a re-anchor is under this same lock. The document lock
+  # being held shared means no *patch* can run at all, so `i` itself cannot
+  # move. There is no walk in flight here to invalidate -- `locate` has already
+  # returned -- so unlike `indexedFind` this has no generation to re-check and
+  # no restart to report.
+  cLock()
+  var okA = true
+  var objA = toAnchor(i, okA)
+  if okA and not hasKey(gDirty, objA):
+    let cached = getOrDefault(gNames, objA, "")
+    if cached.len > 0:
+      into = cached
+      cUnlock()
+      docReadEnd()
+      return true
+  if not okA or not indexObject(objA, true):
+    # The object, or a member of it, is text a patch wrote and has no anchor
+    # coordinate. Re-anchor, after which anchor coordinates *are* current ones
+    # -- and `i` is a current offset that no patch can have moved, because the
+    # document lock has been held shared throughout. So unlike `indexedFind`
+    # there is nothing to translate and nothing that can fail twice.
+    rebaseLocked()
+    objA = i
+    discard indexObject(objA, true)
+  into = getOrDefault(gNames, objA, "")
+  cUnlock()
+  docReadEnd()
+  if into.len == 0:
+    # `indexObject` returning true always leaves an entry, so this is
+    # unreachable -- and it is written down rather than assumed, because the
+    # honest answer to "I do not have the names" is not an empty key list.
+    why = KeysNotAnObject
+    return false
+  result = true
 
 # --------------------------------------------------------------- merging
 

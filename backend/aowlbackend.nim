@@ -1090,6 +1090,40 @@ proc hostDbGet(ctx: HostPtr; path: HostPtr; pathLen: int32;
   # what stops a concurrent `dbPatchPath` splicing the buffer being copied out
   # of. Nothing else is taken while it is held; the rest of the argument is at
   # `dbHoldPath`.
+  # The reserved sigil, before anything else looks at the path.
+  #
+  # `docs/API-GAPS.md`'s gap 2: there is no `db_keys` entry, because adding one
+  # is ABI revision 6 and the simulator cannot claim 6 without claiming 5 --
+  # which means arming a `notify_push` it has no socket for, and which turns
+  # `notifyReady()` from an honest `false` into a `true` in the one host mod
+  # authors develop against. So the enumeration rides on the path string of the
+  # entry that already exists, and a host that has never heard of the sigil
+  # answers `ErrNotFound` for a root member that is not there, which is the
+  # degradation a caller wanted anyway.
+  var keysOf = ""
+  if dbKeysRequest(p, keysOf):
+    if keysOf.len == 0:
+      # `"?keys "` alone. Refused here and **not found** on a host without
+      # this, which is the difference a mod uses as a capability probe. Say
+      # what it is rather than only that it is wrong.
+      perfAdd(PhaseDbGet, tDb)
+      gLastError = "`" & KeysSigil & "` needs a path to enumerate, e.g. `" &
+                   KeysSigil & "locations`"
+      return ErrBadArg
+    var keys = ""
+    var why = 0
+    if not dbKeysPath(keysOf, keys, why):
+      perfAdd(PhaseDbGet, tDb)
+      if why == KeysNotAnObject:
+        gLastError = keysOf & " is an array or a scalar, not an object"
+        return ErrBadArg
+      gLastError = "no such database path: " & keysOf
+      return ErrNotFound
+    result = cOutCopy(outPtr, outLen, cast[HostPtr](readRawData(keys)),
+                      int32(keys.len))
+    perfAdd(PhaseDbGet, tDb)
+    return result
+
   var at = cast[pointer](0)
   var length = 0
   if not dbHoldPath(p, at, length):
