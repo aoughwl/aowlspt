@@ -81,3 +81,16 @@ proc floorToInt*(v: float): int = int(floor(v))
 
 proc clampi*(v, lo, hi: int): int =
   if v < lo: lo elif v > hi: hi else: v
+
+proc fabs*(v: float): float = (if v < 0.0: -v else: v)
+
+proc isFinite*(v: float): bool =
+  ## False for a NaN and for either infinity. `v != v` catches the NaN; the
+  ## magnitude test catches the infinities without naming a constant the
+  ## platform might not agree with.
+  if v != v:
+    return false
+  result = v > -1.0e300 and v < 1.0e300
+
+proc isFinite*(a: Vec3): bool =
+  isFinite(a.x) and isFinite(a.y) and isFinite(a.z)

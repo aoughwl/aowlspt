@@ -52,46 +52,48 @@
 ## has never been seen running.
 ##
 ## ---------------------------------------------------------------------------
-## The Vector3 problem, and what is actually reachable
+## Vector3, and the shape of a call
 ## ---------------------------------------------------------------------------
 ##
-## `Spring.AddAcceleration(Vector3)` is the target and a `Vector3` argument is
-## refused by both of aowlspt's paths:
+## `Spring.AddAcceleration(Vector3)` is the target, and a `Vector3` is neither
+## a register class nor a handle:
 ##
-## * **The fast path refuses it by design.** Win64 passes a 12-byte struct by a
-##   hidden pointer, which is a different *call shape* rather than a different
-##   register class, and `classifyType` will not classify a value type at all
-##   (`docs/PERF.md`, "What is still slow, and why").
+## * **`bindMethod` refuses it, correctly.** `classifyType` will not classify a
+##   value type, because a value type wider than eight bytes is not passed in a
+##   register at all.
 ## * **The host's boxed path cannot build one.** `invoke.nim` binds a
-##   non-primitive parameter only from a `{"handle":n}`, and there is no way for
-##   a mod to allocate a boxed `UnityEngine.Vector3` and get a handle to it.
+##   non-primitive parameter only from a `{"handle":n}`, and a mod has no way to
+##   allocate a boxed `UnityEngine.Vector3` and get a handle to it.
 ##
-## What *is* reachable, and what this file does: `il2cpp_runtime_invoke` takes
-## an array of pointers to arguments, and for a value type the pointer is to the
-## **unboxed data** — a plain 12-byte struct on our own stack. That is the
-## documented contract of the C API the whole host is built on, not an
-## assumption about a calling convention. The `MethodInfo*` is resolved once, so
-## per frame this is two `il2cpp_runtime_invoke` calls with nothing around them:
-## no name lookup, no JSON, no boxing of the (void) return.
+## What closes the gap is `bindRaw`: a method bound by its **native slot shape**
+## rather than by its signature. Win64 passes anything larger than eight bytes
+## and not a power of two by hidden pointer, and returns it the same way — the
+## caller allocates the space, passes its address, and the callee writes through
+## it. So:
 ##
-## Two other routes were considered and not taken:
+##     void AddAcceleration(Vector3 v)   is really
+##     void AddAcceleration(void* this, void* v, MethodInfo*)
 ##
-## * **A float-per-axis overload.** There is none. `Spring` exposes
-##   `AddAcceleration(Vector3)` and nothing narrower.
-## * **`bindMethodAs(..., [fkPtr], fkVoid)` and passing `addr vec`.** This would
-##   work — MSVC's x64 ABI passes a 12-byte struct as a pointer to a
-##   caller-allocated temporary, so the register layout really is
-##   `(this, &vec, MethodInfo*)`, three general-purpose slots, which the fast
-##   path can express. It would also be ~10 ns instead of a few hundred. It was
-##   not taken because it is an *assertion about a calling convention* aimed at
-##   a method that moves the player's aim: if the assertion is ever wrong the
-##   game reads a Vector3 out of whatever the register happened to hold. Two
-##   calls a frame is not worth that. If profiling ever says otherwise, this is
-##   the line to change, and it should be changed with a test that reads the
-##   spring back.
+##     Vector3 Transform::get_eulerAngles()   is really
+##     void*   get_eulerAngles(void* sret, void* this, MethodInfo*)
+##
+## Every slot in both is a plain pointer, which the existing trampoline table
+## already passes. This file states those two shapes and nothing else. Both
+## assertions are written out at their call sites, because a wrong one is a call
+## into the game with the arguments in the wrong registers rather than an error.
+##
+## An earlier revision of this file used `il2cpp_runtime_invoke` with a pointer
+## to the unboxed struct — the documented contract, and correct, but a few
+## hundred nanoseconds and a generic dispatch per call on a path that runs twice
+## a frame. The shaped call is about ten.
+##
+## Two other routes, for the record: there is no float-per-axis overload of
+## `AddAcceleration`, and there is no field on `Spring` to write instead —
+## `AddAcceleration` clamps against `AccelerationMax` on the way in, so writing
+## the accumulator directly would skip the clamp this mod also configures.
 ##
 ## Everything else — every scalar, every bool, every step of the object chain —
-## is on the fast path.
+## is on the ordinary fast path.
 
 import aowlspt
 import aowlspt/il2cpp
@@ -99,13 +101,9 @@ import aowlspt/fast
 import ".." / model/vec
 import ".." / model/tuning
 import ".." / model/state
+import ".." / model/spring
+import ".." / model/fmt
 import binding
-
-# `aowlspt/fast` reaches its C side through `importc ... nodecl`, so the
-# declarations only exist in the translation unit that `#include`s the header.
-# A module that calls `perfCounter` without this gets an implicit declaration
-# and a link that happens to work on one compiler and not the next.
-{.emit: """#include "aowlspt_fast.h" """.}
 
 # ---------------------------------------------------------------------------
 # The runtime
@@ -155,13 +153,56 @@ proc openRuntime*(): bool =
 # from the outside and only one of them is worth reporting as a bug.
 
 var gWorldInstance: Binding      ## static EFT.GameWorld::get_Instance
-var gWorldStaticOff: int32 = -1  ## fallback: a static field holding the world
-var gWorldStaticData: Il2CppPtr
+var gWorldStatic: StaticFieldBinding
+                                 ## fallback: a static field holding the world
 var gRootTried = false
 var gRootWhy = ""
 
+proc staticFieldOfType*(rt: Il2Cpp; owner, declared: string;
+                        outName: var string): StaticFieldBinding =
+  ## The **static** field of `owner` whose declared type is `declared`, bound.
+  ##
+  ## Split out of `bindRoot` for one reason: `bindRoot`'s use of it can never
+  ## run anywhere this project can execute. `EFT.GameWorld::get_Instance`
+  ## exists on the stand-in and on every build of the game anyone has looked
+  ## at, so the fallback below it is dead code in every environment that has a
+  ## runtime at all — and dead code that nothing has run is dead code that has
+  ## never been shown to work. `probeStaticRoot` calls this against a type the
+  ## stand-in *does* have a static field on, so the walk-then-bind path itself
+  ## has been executed by the time the fallback needs it.
+  ##
+  ## The walk is by declared type because the *name* is what is unknown: a
+  ## hand-rolled singleton may be `Instance`, `_instance` or anything else, and
+  ## what identifies it is that it is static and holds one of its own class.
+  ## `bindStaticField` takes a name, so the walk supplies it.
+  outName = ""
+  result = StaticFieldBinding(ok: false, why: "no such type: " & owner,
+                              target: owner, base: nullPtr(), offset: 0'i32,
+                              kind: fkNone, bindNs: 0'i64)
+  let cls = findClass(rt, owner)
+  if cls == nil:
+    return
+  result.why = owner & " has no static field declared " & declared
+  var iter: Il2CppIter = nullPtr()
+  while true:
+    let f = nextField(rt, cls, iter)
+    if f == nil:
+      break
+    if not fieldIsStatic(rt, f):
+      continue
+    if typeName(rt, fieldType(rt, f)) != declared:
+      continue
+    outName = fieldName(rt, f)
+    result = bindStaticField(rt, owner, outName)
+    if result.ok:
+      return
+    # Named, found, and refused. That is a different answer from "there is no
+    # such field" and sends the reader somewhere else, so it is kept rather
+    # than folded into the not-found message on the way out.
+    return
+
 proc bindRoot(): bool =
-  if gWorldInstance.ok or gWorldStaticOff >= 0'i32:
+  if gWorldInstance.ok or gWorldStatic.ok:
     return true
   if gRootTried:
     return false
@@ -178,37 +219,57 @@ proc bindRoot(): bool =
     return true
 
   # Second spelling: a static field on GameWorld whose declared type is
-  # GameWorld itself. That is what a hand-rolled singleton looks like, and it is
-  # reachable because `il2cpp_class_get_static_field_data` gives the class's
-  # static block and the field's offset is an offset into it.
-  let cls = findClass(gRt, "EFT.GameWorld")
-  if cls == nil:
+  # GameWorld itself. That is what a hand-rolled singleton looks like.
+  #
+  # **The walk stays; the read does not.** `bindStaticField` binds a static
+  # field *by name*, and the name is exactly what is not known here — the whole
+  # reason this fallback exists is that BSG might have called it `_instance` or
+  # `Instance` or anything else, and what identifies it is its declared type.
+  # So the field list is still walked to find out what it is called, and then
+  # the answer is handed to `bindStaticField` rather than turned into a
+  # pointer here.
+  #
+  # That hand-off is not ceremony. What this file used to do instead was build
+  # a `FieldBinding` literal with `ok: true` and read it with `readPtr(fb,
+  # staticBlock)` — an **instance** reader pointed at a class's static data.
+  # It worked, and it is precisely the confusion `StaticFieldBinding` was added
+  # to make impossible: the two offset spaces overlap completely, and getting
+  # it wrong produces a number rather than a refusal. Two more things come with
+  # the real binding and neither was here before:
+  #
+  # * `il2cpp_runtime_class_init` runs before the block is read. A class whose
+  #   static constructor has not run has a static block that exists and is
+  #   zero, so the old code's answer for "GameWorld is not initialised yet" was
+  #   a null world pointer indistinguishable from "no raid in progress" — this
+  #   mod's quietest possible failure.
+  # * a runtime that does not export `il2cpp_field_get_flags` is refused with a
+  #   reason instead of being asked for an offset it cannot qualify.
+  if findClass(gRt, "EFT.GameWorld") == nil:
     gRootTried = true
     gRootWhy = "EFT.GameWorld does not resolve (" & gWorldInstance.why & ")"
     return false
-  let data = staticFieldData(gRt, cls)
-  if data != nil:
-    var iter: Il2CppIter = nullPtr()
-    while true:
-      let f = nextField(gRt, cls, iter)
-      if f == nil:
-        break
-      if not fieldIsStatic(gRt, f):
-        continue
-      if typeName(gRt, fieldType(gRt, f)) != "EFT.GameWorld":
-        continue
-      gWorldStaticData = data
-      gWorldStaticOff = int32(fieldOffset(gRt, f))
-      info "sway  root: static EFT.GameWorld::" & fieldName(gRt, f)
-      return true
+  var sawCandidate = ""
+  gWorldStatic = staticFieldOfType(gRt, "EFT.GameWorld", "EFT.GameWorld",
+                                   sawCandidate)
+  if gWorldStatic.ok:
+    info "sway  root: static EFT.GameWorld::" & sawCandidate &
+         " (" & gWorldStatic.why & ")"
+    return true
+  if sawCandidate.len > 0:
+    warn "sway  EFT.GameWorld::" & sawCandidate & " looks like the " &
+         "singleton but would not bind: " & gWorldStatic.why
 
   # Both refused. Say so once, with both reasons, and stop trying: this is a
   # build difference, not a timing one — the class resolved, the member did not.
   gRootTried = true
   gRootWhy = "no way to reach the GameWorld singleton: " &
              gWorldInstance.why &
-             ", and EFT.GameWorld has no static field of its own type. " &
-             "Everything downstream of the shooter is unreachable."
+             (if sawCandidate.len > 0:
+                ", and EFT.GameWorld::" & sawCandidate &
+                " would not bind as a static field (" & gWorldStatic.why & ")"
+              else:
+                ", and EFT.GameWorld has no static field of its own type") &
+             ". Everything downstream of the shooter is unreachable."
   warn "sway  " & gRootWhy
   result = false
 
@@ -217,12 +278,77 @@ proc worldPtr(): Il2CppPtr =
   if gWorldInstance.ok:
     var a = noArgs()
     result = callPtr(gWorldInstance, nullPtr(), a)
-  elif gWorldStaticOff >= 0'i32 and gWorldStaticData != nil:
-    # The static block is a plain allocation, so the field is at
-    # `data + offset` and a FieldBinding reads it exactly like an instance one.
-    let fb = FieldBinding(ok: true, why: "", target: "EFT.GameWorld static",
-                          offset: gWorldStaticOff, kind: fkPtr, bindNs: 0'i64)
-    result = readPtr(fb, gWorldStaticData)
+  elif gWorldStatic.ok:
+    # One load from an address settled at bind time. No object argument exists
+    # on this overload, which is the point: there is nothing here that could be
+    # handed a player pointer by accident.
+    result = readPtr(gWorldStatic)
+
+var gStaticProbed = false
+var gStaticProbeFailed = false
+
+proc probeStaticRoot*() =
+  ## Gives `staticFieldOfType` a subject, once, on whatever runtime is present.
+  ##
+  ## `bindRoot`'s use of it is unreachable in practice: `get_Instance` answers
+  ## first on the stand-in and on every build of the game that has been looked
+  ## at, so the fallback underneath it would never run and would never be shown
+  ## to work. A path that only executes on the day everything else has already
+  ## broken is a path nobody wants to be reading for the first time then.
+  ##
+  ## So the same walk-and-bind is run here against a **different** target: a
+  ## static `System.Int32` on `EFT.Player`, which the stand-in has and BSG's
+  ## client may or may not. Where it is absent this says so and asserts
+  ## nothing; where it is present, three things are checked, and each is a
+  ## failure this mod's root binding could have.
+  if gStaticProbed:
+    return
+  gStaticProbed = true
+  var name = ""
+  let sf = staticFieldOfType(gRt, "EFT.Player", "System.Int32", name)
+  if name.len == 0:
+    info "sway  static-field probe: this runtime has no static System.Int32 " &
+         "on EFT.Player, so the walk-and-bind the GameWorld fallback uses " &
+         "has NOT been exercised here. That fallback is unchecked on this " &
+         "build; it is not being reported as working."
+    return
+
+  if not sf.ok:
+    error "sway  static-field probe: EFT.Player::" & name & " is a static " &
+          "Int32 by the runtime's own account and bindStaticField refused " &
+          "it: " & sf.why
+    gStaticProbeFailed = true
+    return
+
+  # The value. Zero is the answer a static block gives when its class's static
+  # constructor has not run, and running it is exactly what `bindStaticField`
+  # adds over the offset arithmetic this file used to do -- so a zero here is
+  # either that regression or a field genuinely initialised to zero, and both
+  # are worth a line rather than silence.
+  let v = readInt(sf)
+  if v == 0'i64:
+    error "sway  static-field probe: EFT.Player::" & name & " read 0. Either " &
+          "the class's static constructor did not run before the block was " &
+          "read, or the base address is wrong; both make a null GameWorld " &
+          "indistinguishable from no raid in progress."
+    gStaticProbeFailed = true
+
+  # And the refusal in the other direction. The binding this replaced was a
+  # `FieldBinding` literal pointed at a static block; if `bindField` were to
+  # hand back an offset for a static field, that mistake would be one line
+  # away again.
+  let inst = bindField(gRt, "EFT.Player", name)
+  if inst.ok:
+    error "sway  static-field probe: bindField accepted the static field " &
+          name & ", so an instance read of it would answer whatever an " &
+          "object happens to hold at that offset"
+    gStaticProbeFailed = true
+
+  if not gStaticProbeFailed:
+    success "sway  static-field probe: EFT.Player::" & name &
+            " bound static, read " & $v & " with no object, and the " &
+            "instance binder refused it — the walk the GameWorld fallback " &
+            "uses works on this runtime"
 
 # ---------------------------------------------------------------------------
 # The object chain
@@ -246,6 +372,7 @@ var sPhysical: Slot
 var sMovement: Slot
 var sHands: Slot
 var sHealth: Slot
+var bVelocity: Binding         ## Player::get_Velocity, shaped
 
 var gPwaSlots = false
 var sIsAiming: Slot
@@ -261,6 +388,9 @@ var gContainerSlots = false
 var sHandsRotation: Slot
 var sHandsPosition: Slot
 var sCameraRotation: Slot
+var sCameraTransform: Slot
+var bEulerAngles: Binding      ## UnityEngine.Transform::get_eulerAngles, shaped
+var gEulerTried = false
 
 var gPhysicalSlots = false
 var sStamina: Slot
@@ -326,6 +456,22 @@ proc bindPlayer(p: Il2CppPtr) =
   report("Player::HandsController", sHands)
   report("Player::HealthController", sHealth)
 
+  # `Velocity` is a `Vector3` property, and a value-type *return* is not a
+  # register class either. Same shape as the actuator, one slot further along:
+  #
+  #     Vector3 get_Velocity()   is really
+  #     void*   get_Velocity(void* sret, void* this, MethodInfo*)
+  #
+  # — the caller allocates twelve bytes, hands over its address as an invisible
+  # first argument, and the callee writes through it. Two slots, no floats, and
+  # the return is the same pointer we passed. This is the number the BepInEx
+  # original read (`player.Velocity`), reached by name rather than by guessing
+  # at a backing field.
+  let cls = objectClass(gRt, p)
+  bVelocity = bindRaw(gRt, cls, t, "get_Velocity", 0, 2, 0'u32, fkPtr)
+  if bVelocity.ok:
+    debug "sway  bound " & bVelocity.why & " (Vector3 by sret)"
+
 proc bindPwa(pwa: Il2CppPtr) =
   if gPwaSlots or pwa == nil:
     return
@@ -351,8 +497,10 @@ proc bindContainer(hc: Il2CppPtr) =
   sHandsRotation = bindSlot(gRt, t, "HandsRotation")
   sHandsPosition = bindSlot(gRt, t, "HandsPosition")
   sCameraRotation = bindSlot(gRt, t, "CameraRotation")
+  sCameraTransform = bindSlot(gRt, t, "CameraTransform")
   report("HandsContainer::HandsRotation", sHandsRotation)
   report("HandsContainer::CameraRotation", sCameraRotation)
+  report("HandsContainer::CameraTransform", sCameraTransform)
 
 proc bindPhysical(ph: Il2CppPtr) =
   if gPhysicalSlots or ph == nil:
@@ -396,27 +544,24 @@ proc bindMovement(mc: Il2CppPtr) =
   report("MovementContext::Tilt", sTilt)
   report("MovementContext::SmoothedCharacterMovementSpeed", sMoveSpeed)
 
-  # The two inputs that are vectors. `Rotation` is a `Vector2` and `Velocity` a
-  # `Vector3`, and a value-type *return* is unreachable on either path — so
-  # these go through the backing field, found by scanning for a vector field
-  # whose name looks right. The name it settled on is logged: a wrong match here
-  # would drive the inertia oscillator off the wrong number, and that must be
-  # visible in the log rather than only in the feel.
+  # The two vector inputs, as **fallbacks**.
+  #
+  # Both are read from named properties now — `Transform::get_eulerAngles` and
+  # `Player::get_Velocity`, shaped calls with an sret buffer, which is what the
+  # BepInEx original read. These backing fields are what this mod used when a
+  # `Vector3` return was unreachable at all, and they are kept for a build where
+  # the property is gone: a scan for a vector field with the right name and
+  # shape. Only reached if the shaped call did not bind, and the name it settled
+  # on is logged either way — a wrong match would drive the inertia oscillator
+  # off the wrong number, and that must be visible in the log rather than only
+  # in the feel.
   var found = ""
   vRotation = findVecFieldNamed(gRt, t, "rotation", 2, found)
   if vRotation.ok:
-    info "sway  view angles from " & t & "::" & found & " (Vector2)"
-  else:
-    warn "sway  no view-angle field on " & t & ": " & vRotation.why &
-         ". Weapon inertia will be driven at rest — the oscillator stays " &
-         "centred and every other source is unaffected."
+    debug "sway  view-angle fallback: " & t & "::" & found & " (Vector2)"
   vVelocity = findVecFieldNamed(gRt, t, "velocity", 3, found)
   if vVelocity.ok:
-    info "sway  body velocity from " & t & "::" & found & " (Vector3)"
-  else:
-    warn "sway  no velocity field on " & t & ": " & vVelocity.why &
-         ". Inertia will not be driven by the body accelerating, only by " &
-         "turning."
+    debug "sway  velocity fallback: " & t & "::" & found & " (Vector3)"
 
 proc bindHealth(hcon: Il2CppPtr) =
   if gHealthSlots or hcon == nil:
@@ -456,19 +601,27 @@ proc bindWeapon(controller, weapon: Il2CppPtr) =
     return
   if controller == nil:
     return
-  let ct = typeNameOf(gRt, controller)
   if not sWeapon.bound():
-    sWeapon = bindSlot(gRt, ct, "Weapon")
+    # Bound against the object, not a name. `Player.FirearmController` is a
+    # nested class, and a nested class's qualified name is not a name
+    # `findClass` accepts — so the named path would find nothing here and the
+    # whole weapon group would read its defaults forever.
+    sWeapon = bindSlotOn(gRt, controller, "Weapon", fkPtr)
+    if not sWeapon.bound():
+      debug "sway  no weapon on this controller: " & sWeapon.why
   if weapon == nil:
     # The controller bound, but there is nothing in the shooter's hands this
     # frame. Not an error and not final: try again next frame.
     return
   gWeaponSlots = true
   let wt = typeNameOf(gRt, weapon)
-  sErgonomics = bindSlot(gRt, wt, "ErgonomicsTotal")
-  sTotalWeight = bindSlot(gRt, wt, "TotalWeight")
-  sWeight = bindSlot(gRt, wt, "Weight")
-  sRecoilTotal = bindSlot(gRt, wt, "RecoilTotal")
+  # Same reasoning as the controller, plus one more: these four are declared on
+  # base classes of the concrete weapon type, and `bindSlotOn` walks the base
+  # chain from the object rather than trusting one name to reach all of them.
+  sErgonomics = bindSlotOn(gRt, weapon, "ErgonomicsTotal", fkF32)
+  sTotalWeight = bindSlotOn(gRt, weapon, "TotalWeight", fkF32)
+  sWeight = bindSlotOn(gRt, weapon, "Weight", fkF32)
+  sRecoilTotal = bindSlotOn(gRt, weapon, "RecoilTotal", fkF32)
   info "sway  weapon: " & wt
   report("Weapon::ErgonomicsTotal", sErgonomics)
   report("Weapon::TotalWeight", sTotalWeight)
@@ -764,13 +917,13 @@ type
     y: float32
     z: float32
 
-var gAddAccel: Il2CppMethod    ## Spring::AddAcceleration, resolved once
+var bAddAccel: Binding         ## Spring::AddAcceleration, shaped
 var gSpringTried = false
 var gSpringWhy = ""
 var gActuated = false
 
 proc bindSpringMethod(spring: Il2CppPtr) =
-  if gAddAccel != nil or gSpringTried or spring == nil:
+  if bAddAccel.ok or gSpringTried or spring == nil:
     return
   gSpringTried = true
   let cls = objectClass(gRt, spring)
@@ -778,39 +931,44 @@ proc bindSpringMethod(spring: Il2CppPtr) =
     gSpringWhy = "the spring object has no class"
     warn "sway  " & gSpringWhy
     return
-  let m = findMethod(gRt, cls, "AddAcceleration", 1)
-  if m == nil:
-    gSpringWhy = typeNameOf(gRt, spring) &
-      " has no AddAcceleration taking one argument. Nothing this mod " &
-      "computes can reach the weapon."
+  let name = typeNameOf(gRt, spring)
+
+  # The shape, stated: `void AddAcceleration(Vector3)` on an instance is
+  #
+  #     RCX = this,  RDX = &value,  R8 = MethodInfo*
+  #
+  # — two slots this call fills, neither of them a float, and nothing returned.
+  # A `Vector3` is twelve bytes, which is larger than eight and not a power of
+  # two, so Win64 passes it by hidden pointer to a caller-allocated temporary
+  # rather than in a register. That is the whole assertion, and it is the reason
+  # `bindMethod` refuses this method: the shape differs from the signature.
+  #
+  # `declaredArgc` is 1 because that is how IL2CPP looks the method up — by name
+  # and by the arity C# declared, not by the arity the machine sees.
+  bAddAccel = bindRaw(gRt, cls, name, "AddAcceleration", 1, 2, 0'u32, fkVoid)
+  if not bAddAccel.ok:
+    gSpringWhy = bAddAccel.why &
+      ". Nothing this mod computes can reach the weapon."
     warn "sway  " & gSpringWhy
     return
-  gAddAccel = m
-  info "sway  actuator: " & typeNameOf(gRt, spring) & "::AddAcceleration"
+  info "sway  actuator: " & bAddAccel.why
 
 proc addAcceleration(spring: Il2CppPtr; v: Vec3) =
-  ## The one call that moves the weapon.
+  ## The one call that moves the weapon. Roughly ten nanoseconds.
   ##
-  ## Not on the fast path, and the module header says at length why: a 12-byte
-  ## value-type argument is a different call shape rather than a different
-  ## register class. `il2cpp_runtime_invoke` takes a pointer to the unboxed
-  ## value, which is the documented contract, and with the `MethodInfo*` already
-  ## in hand it is a few hundred nanoseconds rather than the ~1200 of a call
-  ## made by name through the host.
-  if gAddAccel == nil or spring == nil:
+  ## No exception out-parameter, and that is a real difference from the
+  ## reflective call this replaced: a shaped call is a direct call to the
+  ## compiled function, so a managed throw would not come back as a written
+  ## pointer. `AddAcceleration` accumulates a vector and clamps it — it has
+  ## nothing to throw — but that is a property of this method rather than of the
+  ## mechanism, and it is why the mechanism is not used for anything else here.
+  if not bAddAccel.ok or spring == nil:
     return
   var value = Vector3F(x: float32(v.x), y: float32(v.y), z: float32(v.z))
-  # Initialised at the declaration rather than assigned into: nimony will not
-  # take the address of an array it cannot prove was written.
-  var argv: array[1, Il2CppPtr] = [cast[Il2CppPtr](addr value)]
-  var exc: Il2CppException = nullPtr()
-  discard invoke(gRt, gAddAccel, spring, cast[Il2CppPtr](addr argv[0]), exc)
-  # A managed throw does not unwind through a C caller; it arrives as a written
-  # pointer. Ignoring it would turn a broken actuation into a mod that looks
-  # like it is working.
-  if exc != nil and not gActuated:
-    warn "sway  AddAcceleration threw on its first call; the weapon will " &
-         "not move"
+  var a = shaped()
+  a.addSlotPtr(spring)                          # this
+  a.addSlotPtr(cast[Il2CppPtr](addr value))     # the Vector3, by hidden pointer
+  callShapedVoid(bAddAccel, a)
 
 # ---------------------------------------------------------------------------
 # Sampling
@@ -970,13 +1128,60 @@ proc sampleArmInjury*(fractured, blacked: var bool): bool =
   fractured = eitherArm(bBodyPartBroken, hcon) and not blacked
   result = bBodyPartDestroyed.ok or bBodyPartBroken.ok
 
+proc readVec3Ret(b: Binding; self: Il2CppPtr; out1: var Vector3F): bool =
+  ## Calls a method that returns a `Vector3`, into a buffer we own.
+  ##
+  ## The shape is the one `bindRaw` was bound with: slot 0 is the caller's
+  ## twelve bytes, slot 1 is `this`. The callee writes through slot 0 and
+  ## returns that same address, so the returned pointer is checked against the
+  ## one handed over — if a build ever returned something else, that is the
+  ## assertion failing, and it is better to notice than to read the buffer
+  ## anyway.
+  out1 = Vector3F(x: 0.0'f32, y: 0.0'f32, z: 0.0'f32)
+  if not b.ok or self == nil:
+    return false
+  var a = shaped()
+  a.addSlotPtr(cast[Il2CppPtr](addr out1))   # sret: our twelve bytes
+  a.addSlotPtr(self)                         # this
+  result = callShapedPtr(b, a) == cast[Il2CppPtr](addr out1)
+
+proc bindEuler(tf: Il2CppPtr) =
+  if bEulerAngles.ok or gEulerTried or tf == nil:
+    return
+  gEulerTried = true
+  let cls = objectClass(gRt, tf)
+  if cls == nil:
+    return
+  bEulerAngles = bindRaw(gRt, cls, typeNameOf(gRt, tf), "get_eulerAngles",
+                         0, 2, 0'u32, fkPtr)
+  if bEulerAngles.ok:
+    info "sway  view angles from " & bEulerAngles.why & " (Vector3 by sret)"
+  else:
+    warn "sway  " & bEulerAngles.why
+
 proc viewAngles*(yaw, pitch: var float): bool =
   ## This frame's view angles, in degrees. The inertia oscillator is driven
   ## from where the view actually ended up rather than from raw mouse input, so
   ## sensitivity changes, controllers and any other mod that moves the view all
   ## feed it the same way.
+  ##
+  ## Read off the camera transform's `eulerAngles`, which is exactly what the
+  ## BepInEx original read. That was unreachable when this file was written —
+  ## a `Vector3` return is not a register class — and `bindRaw` is what makes it
+  ## a two-slot call with an sret buffer. The `MovementContext` backing field is
+  ## kept as the fallback for a build where the transform cannot be reached.
   yaw = 0.0
   pitch = 0.0
+  let tf = sCameraTransform.getP(pContainer)
+  if tf != nil:
+    bindEuler(tf)
+    var e = Vector3F(x: 0.0'f32, y: 0.0'f32, z: 0.0'f32)
+    if readVec3Ret(bEulerAngles, tf, e):
+      # Unity's euler order: x is pitch, y is yaw. The C# read the same two.
+      yaw = float(e.y)
+      pitch = float(e.x)
+      return true
+
   if not vRotation.ok:
     return false
   let mc = sMovement.getP(pPlayer)
@@ -987,7 +1192,13 @@ proc viewAngles*(yaw, pitch: var float): bool =
   result = true
 
 proc bodyVelocity*(): Vec3 =
+  ## The body's velocity, for the half of inertia that comes from the shooter
+  ## accelerating rather than turning. `Player::get_Velocity` first — the named
+  ## property the original read — and the scanned field only if that is gone.
   result = Zero3
+  var v = Vector3F(x: 0.0'f32, y: 0.0'f32, z: 0.0'f32)
+  if readVec3Ret(bVelocity, pPlayer, v):
+    return vec3(float(v.x), float(v.y), float(v.z))
   if not vVelocity.ok:
     return
   let mc = sMovement.getP(pPlayer)
@@ -999,26 +1210,97 @@ proc bodyVelocity*(): Vec3 =
 # The frame
 # ---------------------------------------------------------------------------
 
-proc beginFrame*(t: Tuning): bool =
-  ## Everything before the model runs: reach the game, bind whatever is newly
-  ## reachable, and put BSG's own numbers where the config says they go.
+# ---------------------------------------------------------------------------
+# The calibration
+# ---------------------------------------------------------------------------
+#
+# `driveGain` used to be an absolute constant with a paragraph of apology
+# attached. It is a trim now, and the calibration it trims is derived from the
+# spring's own `ReturnSpeed` — a number the game holds and this file already
+# captures, because section 12 needs the original to put back.
+#
+# So the conversion from the model's degrees to the game's acceleration is read
+# off the game wherever the game can be read, and falls back to this mod's
+# shipped guess at BSG's value where it cannot. Which of the two happened is in
+# the log, once, because a calibration derived from a default is a different
+# claim from one derived from a measurement.
+
+var gCalSaid = false
+
+proc springCalOf(returnSpeed, damping, accelMax: float; measured: bool;
+                 t: Tuning): SpringCal =
+  var r = returnSpeed
+  var d = damping
+  var a = accelMax
+  var m = measured
+  if r <= 0.01:
+    # Not bound, or bound to something that is not a spring constant. The
+    # shipped value is a guess and is marked as one.
+    r = ShippedReturnSpeed
+    d = ShippedDamping
+    a = ShippedAccelMax
+    m = false
+  result = calibration(r, d, a, t.springAccelPerFrame, m)
+
+proc handsCal*(t: Tuning): SpringCal =
+  ## The hands rotation spring, as the calibration sees it.
   ##
-  ## False means "not in a raid, or the chain is broken" — the caller does
-  ## nothing that frame rather than stepping the model against stale state.
-  if not gRuntimeOk:
-    return false
-  if not bindRoot():
-    return false
-  if not walk():
-    return false
-  if t.vanillaOverride:
-    walkTremorRandoms()
-  bindSpringMethod(pHandsRot)
-  for i in 0 ..< OwCount:
-    bindKnobsFor(i)
-  captureOriginals()
-  applyOverrides(t)
-  result = true
+  ## When `springOverride` is on, this mod is *writing* those constants every
+  ## frame, so the config's values are the live ones and the captured originals
+  ## are not. Getting that backwards would mis-calibrate by exactly the ratio
+  ## the player asked to change the spring by.
+  if t.springOverride:
+    return springCalOf(t.handsRotReturnSpeed, t.handsRotDamping,
+                       t.handsRotAccelerationMax, gCaptured, t)
+  if gCaptured:
+    return springCalOf(gKnobOrig[KnHandsRotReturn], gKnobOrig[KnHandsRotDamping],
+                       gKnobOrig[KnHandsRotAccelMax], true, t)
+  result = springCalOf(0.0, 0.0, 0.0, false, t)
+
+proc cameraCal*(t: Tuning): SpringCal =
+  ## The view spring. Its own return speed, which is not the weapon's — the
+  ## config ships 8 against the hands' 7 — and no acceleration clamp modelled,
+  ## because this mod does not know what the camera spring's is.
+  if t.springOverride:
+    return springCalOf(t.cameraRotReturnSpeed, t.cameraRotDamping, 0.0,
+                       gCaptured, t)
+  if gCaptured:
+    return springCalOf(gKnobOrig[KnCamRotReturn], gKnobOrig[KnCamRotDamping],
+                       0.0, true, t)
+  result = springCalOf(0.0, 0.0, 0.0, false, t)
+
+var gHandsCal = defaultCal()
+var gCameraCal = defaultCal()
+
+proc refreshCalibration*(t: Tuning) =
+  ## Recompute both calibrations, once a frame, into globals.
+  ##
+  ## Cached rather than computed at each of the two call sites, because
+  ## `handsCal` takes the whole `Tuning` and that is a kilobyte of record: the
+  ## work itself is four loads and a clamp, and the copy would be most of the
+  ## cost. Nothing here allocates.
+  gHandsCal = handsCal(t)
+  gCameraCal = cameraCal(t)
+
+proc handsCalNow*(): SpringCal = gHandsCal
+proc cameraCalNow*(): SpringCal = gCameraCal
+
+proc reportCalibration*(t: Tuning) =
+  ## Said once, the first frame the springs can be read.
+  if gCalSaid or not gCaptured:
+    return
+  gCalSaid = true
+  let c = handsCal(t)
+  if c.measured:
+    success "sway  calibration read off the live spring: ReturnSpeed " &
+            fmtNum(c.returnSpeed) & ", Damping " & fmtNum(c.damping) &
+            ", AccelerationMax " & fmtNum(c.accelMax) &
+            " — one degree of model output is " & fmtNum(t.driveGain) &
+            " degrees of weapon rotation"
+  else:
+    warn "sway  the spring's own constants could not be read; calibrating " &
+         "against this mod's shipped guess of ReturnSpeed " &
+         fmtNum(c.returnSpeed) & ". The drive is derived, but from a default"
 
 proc onWeaponChanged*() =
   ## Rebind the weapon-dependent half and re-capture BSG's defaults.
@@ -1027,8 +1309,52 @@ proc onWeaponChanged*() =
   ## class and survive; only the hands controller's class can genuinely change,
   ## which is why that is the one group cleared here.
   gWeaponSlots = false
-  sWeapon = bindSlot(gRt, "", "Weapon")   # forget the old controller's class
+  sWeapon = noSlot()          # forget the old controller's class
   gCaptured = false
+
+proc reachFrame*(): bool =
+  ## The cheap half of the frame: reach the game and find this frame's objects.
+  ##
+  ## Split from the rest because of what the caller does in between. A detour on
+  ## `LerpCamera` fires for *an* animator, and the local player is not the only
+  ## thing in a raid that has one — so the handler compares the `this` it was
+  ## given against the animator this walk found, and returns for anything else.
+  ## That comparison needs the walk and nothing after it: binding knobs and
+  ## writing thirty override values for a bot's animator would be wrong as well
+  ## as expensive.
+  ##
+  ## False means "not in a raid, or the chain is broken".
+  if not gRuntimeOk:
+    return false
+  if not bindRoot():
+    return false
+  result = walk()
+
+proc localAnimator*(): uint64 =
+  ## The address of *this* player's `ProceduralWeaponAnimation`, as found by the
+  ## walk that just ran. Compared against a hook's `this` and then forgotten:
+  ## the collector moves objects, so it is only meaningful inside the frame that
+  ## produced it.
+  result = cast[uint64](pPwa)
+
+proc finishFrame*(t: Tuning) =
+  ## The rest: bind whatever is newly reachable, and put BSG's own numbers where
+  ## the config says they go. Only ever called for the local player's animator.
+  if t.vanillaOverride:
+    walkTremorRandoms()
+  bindSpringMethod(pHandsRot)
+  for i in 0 ..< OwCount:
+    bindKnobsFor(i)
+  captureOriginals()
+  applyOverrides(t)
+  refreshCalibration(t)
+
+proc beginFrame*(t: Tuning): bool =
+  ## Both halves, for a caller that cannot tell one animator from another.
+  if not reachFrame():
+    return false
+  finishFrame(t)
+  result = true
 
 proc actuate*(hands, camera: Vec3; t: Tuning) =
   ## Model output in degrees -> the game's rotation springs.
@@ -1037,17 +1363,23 @@ proc actuate*(hands, camera: Vec3; t: Tuning) =
   ## in `model/` because it is arithmetic; this is only the push.
   ##
   ## ------------------------------------------------------------------------
-  ## `driveGain` — the one number here that has never been measured
+  ## What the calibration now rests on
   ## ------------------------------------------------------------------------
-  ## `springImpulse` multiplies by `t.driveGain`, whose shipped value of 8 was
-  ## derived analytically from the spring's return speed and damping and has
-  ## NEVER BEEN PLAYTESTED. Until this file existed that did not matter, because
-  ## nothing was pushed anywhere. It matters now: it is the entire calibration
-  ## between the model's degrees and what the springs do with them. If the whole
-  ## mod feels uniformly too strong or too weak while the sources look right
-  ## relative to each other, this is the first suspect — see
-  ## `tuning.DriveGainProvenance`.
-  if gAddAccel == nil:
+  ## `springImpulse` multiplies by the spring's own `ReturnSpeed` — read off
+  ## `HandsRotation` a few lines above, or this mod's shipped guess at it when
+  ## the field cannot be reached — and then by `driveGain`, which is a
+  ## dimensionless trim whose default of 1 means "one degree of model output is
+  ## one degree of weapon rotation".
+  ##
+  ## That is a derivation rather than the constant it replaced, and it is still
+  ## not a measurement: it assumes BSG's `Spring` integrates
+  ## `velocity += acceleration * dt` rather than `velocity += acceleration`.
+  ## The two differ by a factor of sixty at 60 fps, `springAccelPerFrame` is the
+  ## one boolean that switches between them, and `model/spring.nim` sets out the
+  ## dimensional argument for the default. The failure mode is not subtle: wrong
+  ## one way this mod does nothing visible, wrong the other it pins the weapon
+  ## against the spring's own acceleration clamp every frame.
+  if not bAddAccel.ok:
     return
   if pHandsRot != nil and sqrMagnitude(hands) > 0.0:
     addAcceleration(pHandsRot, hands)
@@ -1055,14 +1387,32 @@ proc actuate*(hands, camera: Vec3; t: Tuning) =
     addAcceleration(pCamRot, camera)
   if not gActuated:
     gActuated = true
+    let c = handsCal(t)
     success "sway  the model is now driving the weapon springs"
-    warn "sway  Drive Gain is " & (if t.driveGain == 8.0:
-           "the shipped 8.0, which was derived analytically and has never " &
-           "been playtested against a running game"
-         else:
-           "set to a value other than the shipped default") &
-         " — if the mod feels uniformly too strong or too weak, suspect it " &
-         "before the per-source amplitudes"
+    info "sway  drive: degrees x ReturnSpeed " & fmtNum(c.returnSpeed) &
+         (if c.measured: " (read off the spring)" else: " (shipped guess)") &
+         " x driveGain " & fmtNum(t.driveGain) &
+         (if c.perFrameAccel: ", per-frame acceleration form"
+          else: ", per-second acceleration form") &
+         ". Nothing here has been seen against BSG's client."
+    # All three of the spring's constants, once, and what they imply. The
+    # simulator prints the same quantities off the shipped guesses; this is the
+    # line that says what they actually are, and it is the only place the two
+    # can be compared. `model/characterise.nim` computes the rest from these.
+    let step = 1.0 / 60.0
+    var soft = c
+    soft.dampingPerSecond = true
+    info "sway  spring: ReturnSpeed " & fmtNum(c.returnSpeed) & ", Damping " &
+         fmtNum(c.damping) & ", AccelerationMax " & fmtNum(c.accelMax) &
+         (if c.measured: " (all three read off the live spring)"
+          else: " (all three are this mod's shipped guesses)")
+    info "sway  spring: resonates at " & fmtNum(naturalFreqHz(c)) &
+         " Hz, holds at most " & fmtNum(saturation(c, step)) &
+         " deg, and settles in " & fmtNum(stepResponse(c, step, 90.0).settle) &
+         " s if Damping is a per-frame fraction or " &
+         fmtNum(stepResponse(soft, step, 90.0).settle) &
+         " s if it is a per-second rate. Which of the two BSG wrote is not " &
+         "measured; one raid settles it."
 
 proc actuating*(): bool = gActuated
 proc rootWhy*(): string = gRootWhy

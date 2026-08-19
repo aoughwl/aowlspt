@@ -1,0 +1,60 @@
+{
+  "_comment": "aowl.perf. Every knob is off. That is the shipped default and it is deliberate: none of these names has ever been resolved against BSG's client, so turning one on is asking the mod to try. Each knob is {\"apply\": bool, \"value\": number}; `value` is ignored while `apply` is false. README.md says what each one costs visually and which are risky. A value outside the band in knobs.nim is refused rather than clamped, and a knob whose original value cannot be read is never written.",
+
+  "general": {
+    "_comment": "restoreWaitMs is how long the mod blocks the host thread on unload waiting for the queued restore to run on the game's thread. It has to block: the host runs on_unload, then drops every callback the mod still has queued, then frees the library, so a restore that has not run by then never runs. 0 disables the wait, which does not merely make the restore unreliable: it restores the old behaviour, in which the queued callback was dropped by dropModRegistrations microseconds later and the restore reliably did not happen, while the log said it had been queued. Set it to 0 only to reproduce that, never to save time on the way out. When the budget is spent the mod logs an error naming every setting still applied rather than a warning about a possibility.",
+    "enabled": true,
+    "requireMainThread": true,
+    "restoreOnUnload": true,
+    "restoreWaitMs": 2000,
+    "verbose": false
+  },
+
+  "hud": {
+    "_comment": "The readout. `intervalMs` is how often a window is closed and a line logged. `readUnityTime` adds a fast-path read of UnityEngine.Time as a cross-check; it is off because Unity API is main-thread-only and onUpdate is not guaranteed to be on that thread. It is refused at runtime unless the host reports its per-frame drain really is Unity's thread. Where it is on, the readout also closes its window against Time.frameCount, which is a frame count by definition; where it is off, the window uses the host's drain-firing counter and the readout says 'drain firings/s' rather than 'fps' unless the drain bound to a method this mod knows runs once per frame.",
+    "_comment_frameTimes": "`frameTimes` is the frame-time distribution: p50/p99/p99.9, a hitch count and a pacing ratio, from a sample taken every frame rather than once a second. It is on because a mean is the one statistic that cannot see a hitch, and a hitch is what a performance mod is for. It costs one queued main-thread callback per frame, measured at about 1 microsecond inside the mod on the stand-in runtime -- 64 parts per million of a 16.7 ms frame -- plus the host's own drain overhead for a non-empty queue, which is real and is not measured. The readout prints the cost every window; turn this off if you would rather not pay it. It refuses to start at all unless the host reports that its drain method runs exactly once per frame, because the interval between sub-frame firings is not a frame time and a histogram of them would report a confident p99 of nearly zero. `hitchMs` is the threshold a frame has to exceed to be counted as a hitch; 50 ms is roughly where a stall stops being a slow frame and starts being something the player sees.",
+    "enabled": true,
+    "intervalMs": 1000,
+    "readUnityTime": false,
+    "frameTimes": true,
+    "hitchMs": 50
+  },
+
+  "selftest": {
+    "enabled": true,
+    "benchIterations": 200000
+  },
+
+  "quality": {
+    "shadowDistance": { "apply": false, "value": 60.0 },
+    "shadowCascades": { "apply": false, "value": 2 },
+    "shadowResolution": { "apply": false, "value": 1 },
+    "lodBias": { "apply": false, "value": 1.0 },
+    "maximumLODLevel": { "apply": false, "value": 0 },
+    "textureMipmapLimit": { "apply": false, "value": 0 },
+    "anisotropicFiltering": { "apply": false, "value": 1 },
+    "pixelLightCount": { "apply": false, "value": 2 },
+    "particleRaycastBudget": { "apply": false, "value": 64 },
+    "softParticles": { "apply": false, "value": 0 },
+    "realtimeReflectionProbes": { "apply": false, "value": 0 },
+    "billboardsFaceCameraPosition": { "apply": false, "value": 0 },
+    "skinWeights": { "apply": false, "value": 2 },
+    "vSyncCount": { "apply": false, "value": 0 },
+    "maxQueuedFrames": { "apply": false, "value": 1 },
+    "streamingMipmapsActive": { "apply": false, "value": 1 },
+    "streamingMipmapsMemoryBudget": { "apply": false, "value": 2048.0 },
+    "asyncUploadTimeSlice": { "apply": false, "value": 4 },
+    "asyncUploadBufferSize": { "apply": false, "value": 32 },
+    "asyncUploadPersistentBuffer": { "apply": false, "value": 1 }
+  },
+
+  "app": {
+    "targetFrameRate": { "apply": false, "value": 144 }
+  },
+
+  "time": {
+    "_comment": "Both of these change how often FixedUpdate runs, which is a gameplay change as much as a performance one. Off, and the band in knobs.nim is narrow on purpose.",
+    "fixedDeltaTime": { "apply": false, "value": 0.02 },
+    "maximumDeltaTime": { "apply": false, "value": 0.1 }
+  }
+}

@@ -1,0 +1,39 @@
+{
+  "_comment": "Every string this mod puts in front of a player. Merged into locales.global.<lang> for every language the database carries -- English text in every language beats a raw key showing through on a loading screen, and it is what upstream does.",
+
+  "_keying": "The map screen does NOT print `Base.Name`. `LocationInfoPanel` localises `(location._Id + \" Name\")` and `(location._Id + \" Description\")`, so the two keys below are built from the slot's OBJECT id at load and are not written out here. `{slot}` is substituted with that object id and `{name}` / `{description}` with the config's display strings.",
+  "slotKeyed": {
+    "{slot} Name": "{name}",
+    "{slot} Description": "{description}"
+  },
+
+  "_bare": "The bare slot name, which several older UI paths still look up directly.",
+  "bare": {
+    "Suburbs": "{name}"
+  },
+
+  "_exits": "One per exit `Name` in exits.json. Without an entry the extraction panel renders the raw exit id, underscores and all -- and renaming the exit is not an option, because that name is the key the panel, the exfil controller and the raid-end ExitName all match on. The self-test checks this list against exits.json in both directions.",
+  "exits": {
+    "Helicopter": "Helicopter Pad",
+    "Icebreaker_Exit_Heli": "Helicopter Pad",
+    "Cellars": "Lower Machine Deck",
+    "Icebreaker_Exit_Cellars": "Lower Machine Deck",
+    "Gate 0": "Ice Shelf",
+    "Icebreaker_Exit_Gate0": "Ice Shelf"
+  },
+
+  "_banners": "The loading-screen banner captions. The images themselves are not served -- this ABI has no static-file route -- but a banner with a caption and no picture degrades to the default art with a caption, which is better than a broken image.",
+  "banners": {
+    "icebreaker_cover Name": "{name}",
+    "icebreaker_cover Description": "{description}",
+    "blackdiv_banner Name": "Black Division",
+    "blackdiv_banner Description": "They got here first.",
+    "wedge_banner Name": "\"The Wedge's\" Special Squadron",
+    "wedge_banner Description": "Hyper-lethal. Not negotiable."
+  },
+
+  "_zones": "The bot zone the waves in waves.json spawn into. Named here so the in-raid compass and any quest that references a zone reads as a place rather than as an identifier.",
+  "zones": {
+    "ZoneIcebreaker": "BOREAS"
+  }
+}

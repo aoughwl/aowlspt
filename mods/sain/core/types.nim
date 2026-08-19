@@ -33,6 +33,16 @@ type
     cdCreepOnEnemy       ## slow flank on an unaware enemy
     cdMeleeAttack
     cdHoldInCover        ## in cover, enemy not visible, wait them out
+    # Added by this port rather than lifted: SAIN reaches a flank through its
+    # navmesh path comparison (`EnemyPath.CanSeeLastCorner` and the flank
+    # points its cover finder produces), which needs geometry this mod cannot
+    # query. What it *can* do is the arc: a waypoint off the bearing to the
+    # enemy, converging. Same behaviour, no navmesh.
+    cdFlank
+    # SAIN's `ExtractDecisionClass`. The *decision* is expressible here; the
+    # destination is not, because exfiltration points come off a controller
+    # this mod has no binding for. See `README.md`.
+    cdExtract
 
   SquadDecision* = enum
     ## What the squad wants this bot to do. Runs *above* the combat decision:
@@ -108,6 +118,53 @@ type
     skExplosion, skDoor, skLooting, skReload, skPain, skHeal, skConversation,
     skBulletImpact
 
+  Faction* = enum
+    ## Who shoots whom, coarsely. Not read from the game: derived from the
+    ## bot's role, because the only use it has here is deciding which nearby
+    ## bots count as *this* bot's squad, and for that the role is enough.
+    facScav, facPmc, facBoss, facInfected
+
+  DecisionReason* = enum
+    ## Which rung of the ladder fired.
+    ##
+    ## This was a `string` built at the point of the check, and building it was
+    ## the only allocation left on the per-decision path -- `"grenade at " &
+    ## $distance & "m"` allocates twice per tick per bot for a line nobody
+    ## reads unless `logDecisions` is on. An enum costs a byte, says exactly
+    ## the same thing, and `reasonText` turns it into the same log line for the
+    ## one caller that wants one.
+    drNone
+    drGrenadeIncoming
+    drNoWeaponInReach
+    drWeaponNotReady
+    drNoContactSearchHeld
+    drUnattributedSoundCharge
+    drUnattributedSoundSearch
+    drUnattributedSoundFreeze
+    drNothingToDo
+    drDogFight
+    drMeleeRange
+    drHealthBelowRunAway
+    drHurtAndExposed
+    drPinnedInCover
+    drSuppressedInOpen
+    drNotYetAcquired
+    drHoldingGroundWithShot
+    drDistantTargetHeld
+    drDistantTarget
+    drEnemyVulnerable
+    drFlankStale
+    drLostContactPastSearchDelay
+    drFrozenListening
+    drCoverStale
+    drUnawareEnemyNearby
+    drKnownOutOfRange
+    drInCoverWaiting
+    drNoBetterOptionSeekCover
+    drSelfAction
+    drSquadOrder
+    drExtracting
+
 func personalityFromText*(s: string): Personality =
   case s
   of "Wreckless": pWreckless
@@ -151,6 +208,8 @@ func decisionName*(d: CombatDecision): string =
   of cdCreepOnEnemy: "CreepOnEnemy"
   of cdMeleeAttack: "MeleeAttack"
   of cdHoldInCover: "HoldInCover"
+  of cdFlank: "Flank"
+  of cdExtract: "Extract"
 
 func squadDecisionName*(d: SquadDecision): string =
   case d
@@ -166,6 +225,57 @@ func squadDecisionName*(d: SquadDecision): string =
   of sdHelp: "Help"
   of sdSearch: "Search"
   of sdGroupSearch: "GroupSearch"
+
+func reasonText*(r: DecisionReason): string =
+  ## For the log only. Never called on the decision path.
+  case r
+  of drNone: "no reason recorded"
+  of drGrenadeIncoming: "a grenade is inside the avoid radius"
+  of drNoWeaponInReach: "no weapon, enemy in reach"
+  of drWeaponNotReady: "weapon not ready"
+  of drNoContactSearchHeld: "no contact, search target held"
+  of drUnattributedSoundCharge: "charging an unattributed sound"
+  of drUnattributedSoundSearch: "searching an unattributed sound"
+  of drUnattributedSoundFreeze: "freezing at an unattributed sound"
+  of drNothingToDo: "nothing to do"
+  of drDogFight: "dogfight"
+  of drMeleeRange: "melee range"
+  of drHealthBelowRunAway: "health below the run-away threshold"
+  of drHurtAndExposed: "hurt and exposed"
+  of drPinnedInCover: "pinned in cover"
+  of drSuppressedInOpen: "suppressed in the open"
+  of drNotYetAcquired: "seen, but not yet acquired"
+  of drHoldingGroundWithShot: "holding ground with a shot"
+  of drDistantTargetHeld: "still engaging a distant target"
+  of drDistantTarget: "distant target"
+  of drEnemyVulnerable: "enemy vulnerable and close"
+  of drFlankStale: "frontal assault is not working; flanking"
+  of drLostContactPastSearchDelay: "lost contact for longer than the search delay"
+  of drFrozenListening: "frozen, listening"
+  of drCoverStale: "cover has gone stale"
+  of drUnawareEnemyNearby: "unaware enemy nearby"
+  of drKnownOutOfRange: "known but out of range"
+  of drInCoverWaiting: "in cover, waiting"
+  of drNoBetterOptionSeekCover: "no better option: seek cover"
+  of drSelfAction: "a self action needs doing"
+  of drSquadOrder: "the squad said so"
+  of drExtracting: "hurt, dry and out of reasons to stay"
+
+func factionOf*(r: BotRole): Faction =
+  case r
+  of brPmc, brRaider: facPmc
+  of brBoss, brGoon, brFollower: facBoss
+  of brZombie: facInfected
+  of brScav, brPlayerScav: facScav
+
+func hostile*(a, b: Faction): bool =
+  ## The infected are hostile to everything including each other; everything
+  ## else is hostile to a different faction and friendly to its own. Coarse on
+  ## purpose: the only thing this decides is whose position counts as a
+  ## squadmate's, and being wrong about a scav's opinion of a boss costs a
+  ## slightly wider squad rather than a wrong decision.
+  if a == facInfected or b == facInfected: return true
+  result = a != b
 
 func selfActionName*(a: SelfAction): string =
   case a
@@ -188,7 +298,15 @@ type
     ## decision core sees nothing else. That is what makes the core testable,
     ## and it is also the performance shape the port wanted -- one pass of reads
     ## per bot instead of a property fetch inside every threshold check.
-    id*: string
+    ## The identity the table is keyed on.
+    ##
+    ## `id` is the profile id, which is a managed string: reading one per bot
+    ## per tick is a UTF-16 to UTF-8 conversion and an allocation on the hot
+    ## path. The *pointer* to the enemy's `Player` is already in hand, is
+    ## stable for as long as the object lives, and compares in one instruction.
+    ## So the key is the pointer and `id` is filled once, when the entry is
+    ## created, for the log. In the pure tests the key is any distinct number.
+    key*: uint64
     valid*: bool
     isPlayer*: bool            ## the human
     alive*: bool
@@ -213,6 +331,31 @@ type
     suppressingUs*: bool       ## they are putting fire on us
     threatLevel*: float        ## 0..1, decayed; see enemy.nim
 
+    # -- The acquisition model. See `core/vision.nim`.
+    #
+    # How well this bot has *acquired* the enemy, 0..1, as distinct from
+    # whether the engine's raycast reached them. The game answers "is there a
+    # clear line"; SAIN's `EnemyVision` answers "and has this bot noticed",
+    # which is a different question with a time constant on it, and it is the
+    # single biggest difference between a bot that feels human and one that
+    # snaps onto you the frame you step out.
+    awareness*: float
+    ## Absolute time before which this bot may not act on the contact. Set once
+    ## when awareness first crosses the engage threshold; this is the reaction
+    ## delay, and it is where difficulty is actually felt.
+    reactionUntil*: float
+    ## How far the last known place could be wrong by now, in metres. Grows
+    ## with time since contact at an assumed walking speed, and is what makes a
+    ## search widen instead of pointing at a stale dot.
+    uncertainty*: float
+    ## Estimated velocity, from consecutive observations. Feeds the search's
+    ## "push past in the direction they went" phase.
+    velocity*: Vec3
+    ## How loud the last thing this bot heard from them was, 0..1 relative to
+    ## its own hearing range. Distinguishes a sprint two rooms away from a
+    ## footstep on the other side of a wall.
+    heardLoudness*: float
+
   SelfView* = object
     ## The bot's own condition.
     healthNormalized*: float   ## 1.0 = untouched
@@ -231,10 +374,29 @@ type
     weaponReady*: bool
     inCoverStatus*: CoverStatus
     coverPointDistance*: float
+    ## Where the cover point the bot is using (or heading for) actually is.
+    ## The ladder needs it to answer "retreat to *where*", and until it existed
+    ## a retreating bot was sent away from the enemy on a bearing with no
+    ## regard for whether there was anything behind it.
+    coverPosition*: Vec3
+    hasCoverPoint*: bool
     suppressionLevel*: float   ## 0..1, how pinned this bot feels
     isSprinting*: bool
     position*: Vec3
     lookDirection*: Vec3
+    ## Metres per second, from consecutive positions. Not read from the game --
+    ## `MovementContext` exposes a velocity but binding a second `Vector3`
+    ## getter to learn something two subtractions already give is the wrong
+    ## trade. Used by the flank and spread geometry and by the stall detector.
+    velocity*: Vec3
+    ## Seconds since this bot's health last fell. Derived here rather than
+    ## read: a health delta is the only damage signal this mod has, and it is a
+    ## reliable one.
+    timeSinceDamaged*: float
+    ## How much health was lost in the last second, as a fraction. Feeds the
+    ## suppression accumulator -- being hit is the strongest suppressor there
+    ## is and the only one that needs no new binding.
+    recentDamage*: float
 
   SquadView* = object
     ## The squad, from this bot's seat in it.
@@ -248,6 +410,11 @@ type
     mateInCombat*: bool
     squadSeesEnemy*: bool
     memberTookDamageRecently*: bool
+    ## Where the nearest squadmate is. Read by the flank, which sends two bots
+    ## of the same squad round opposite sides -- the cheapest squad tactic in
+    ## the mod, and it falls out of one position and a dot product.
+    nearestMatePosition*: Vec3
+    haveMate*: bool
 
   GrenadeThreat* = object
     active*: bool
@@ -257,7 +424,12 @@ type
 
   BotView* = object
     ## Everything one decision tick reads. Assembled once, read many times.
-    id*: string
+    ##
+    ## No `id` field. It was a `string`, copied out of the bot's record into a
+    ## fresh `BotView` on every decision -- a heap copy per bot per tick for
+    ## something only the debug log reads, and the log has the record in hand
+    ## anyway. The rule this file follows is that nothing on the per-decision
+    ## path owns memory.
     role*: BotRole
     personality*: Personality
     difficulty*: float         ## 0..1; easy..impossible
@@ -274,6 +446,16 @@ type
     hasSearchTarget*: bool
     searchTarget*: Vec3
     extractRequested*: bool
+    ## Seconds since the raid started, as this bot has observed them. Used only
+    ## by the extract check, which is the one decision that is about the clock
+    ## rather than about the fight.
+    raidSeconds*: float
+    ## Where the bot would go if it acted on this decision. Computed by the
+    ## ladder's geometry helpers rather than by the actuator, so that a test
+    ## can assert a bot flanks *to the correct side* and not merely that it
+    ## chose to flank.
+    moveTarget*: Vec3
+    hasMoveTarget*: bool
 
   Decision* = object
     ## The answer. Three simultaneous channels, exactly as SAIN has it: a bot
@@ -283,17 +465,24 @@ type
     combat*: CombatDecision
     squad*: SquadDecision
     self*: SelfAction
-    reason*: string            ## which check fired; for the log, not the game
+    reason*: DecisionReason    ## which check fired; for the log, not the game
     holdUntil*: float          ## do not re-decide before this time
+    ## Where this decision wants the bot to go, when it wants it anywhere. The
+    ## ladder computes it because only the ladder knows *why*; the actuator
+    ## would have to re-derive the reason to compute it.
+    moveTo*: Vec3
+    hasMove*: bool
 
 func emptyDecision*(): Decision =
-  Decision(combat: cdNone, squad: sdNone, self: saNone, reason: "",
-           holdUntil: 0.0)
+  Decision(combat: cdNone, squad: sdNone, self: saNone, reason: drNone,
+           holdUntil: 0.0, moveTo: zeroVec(), hasMove: false)
 
 func emptyEnemy*(): EnemyView =
-  EnemyView(id: "", valid: false, isPlayer: false, alive: false,
+  EnemyView(key: 0'u64, valid: false, isPlayer: false, alive: false,
             position: zeroVec(), realPosition: zeroVec(), visible: false,
             canShoot: false, heardRecently: false, timeSinceSeen: 9999.0,
             timeSinceHeard: 9999.0, seenTotal: 0.0, distance: 9999.0,
             pathDistance: 9999.0, band: pdNoEnemy, inFieldOfView: false,
-            lookingAtUs: false, isSuppressed: false, suppressingUs: false, threatLevel: 0.0)
+            lookingAtUs: false, isSuppressed: false, suppressingUs: false,
+            threatLevel: 0.0, awareness: 0.0, reactionUntil: 0.0,
+            uncertainty: 0.0, velocity: zeroVec(), heardLoudness: 0.0)

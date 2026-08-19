@@ -233,16 +233,31 @@ proc relateOne*(targetKey, kind: string; ids: seq[int]): bool =
     # because the backend's logger folds trace and debug into info.
     return false
   result = true
+  # One patch for all four difficulty blocks rather than four.
+  #
+  # The four writes were four buffered changes, four ancestor scans and four
+  # merges into the same `bots.types.<key>` document -- and `fromFaction:
+  # "savage"` names thirty-seven roles, so one relation was a hundred and
+  # forty-eight of them. Reading each block separately is still required (the
+  # four are allowed to differ, and on a stock database some do), but the
+  # *write* is one object, which is what the four merges were rebuilding
+  # anyway.
+  var patch = obj()
   for d in Difficulties:
     let path = "bots.types." & targetKey & ".difficulty." & d & ".Mind." &
                listName
-    let cur = dbRead(path)
+    let cur = dbView(path)
     var existing = ""
     if cur.ok:
       existing = cur.raw
-    if not dbPut(path, mergeIds(existing, ids)):
-      warn "morebots: could not write " & path
-      result = false
+    var mind = obj()
+    put(mind, listName, raw(mergeIds(existing, ids)))
+    var block1 = obj()
+    put(block1, "Mind", mind)
+    put(patch, d, block1)
+  if not dbPut("bots.types." & targetKey & ".difficulty", done(patch).text):
+    warn "morebots: could not write bots.types." & targetKey & ".difficulty"
+    result = false
 
 proc relate*(payload: string): int =
   ## One `morebots.faction.relate` event. Returns how many bot types it edited.
@@ -263,7 +278,23 @@ proc relate*(payload: string): int =
     error "morebots: a relation arrived with no 'toward' faction"
     return
   if factionIndex(toward) < 0:
-    warn "morebots: relation toward unknown faction '" & toward & "'"
+    # `optional: true` means "this faction belongs to a mod that may not be
+    # installed". Warning about it on every default install teaches the reader
+    # to skim warnings, which is the cost that matters -- and there is nothing
+    # for them to fix. Named at info, with the consequence, rather than
+    # silenced: a relation that did not happen is still a fact.
+    if field(doc, "optional").asBool(false):
+      info "morebots: relation toward '" & toward & "' was marked optional " &
+           "and no mod has defined that faction, so it was not applied. " &
+           "Nothing is broken; those bots simply have no opinion of each " &
+           "other. Install the mod that defines '" & toward & "', or turn " &
+           "the switch off in the asking mod's config.json to stop seeing this."
+    else:
+      warn "morebots: relation toward unknown faction '" & toward &
+           "'. Nothing was written, so the bots that were meant to become " &
+           "hostile will ignore each other. Either the faction has not been " &
+           "defined yet (morebots.faction.define arrives before " &
+           "morebots.faction.relate) or the name is a typo."
     return
   let ids = allRoleIds(toward)
   if ids.len == 0:
@@ -279,17 +310,31 @@ proc relate*(payload: string): int =
     for t in listed:
       targets.add t.asText("")
 
-  var missing = 0
+  var missing: seq[string] = @[]
   for t in targets:
     if t.len == 0:
       continue
     if relateOne(lower(t), kind, ids):
       inc result
     else:
-      inc missing
-  if missing > 0:
-    warn "morebots: " & kind & " toward '" & toward & "' skipped " & $missing &
-         " of " & $targets.len & " bot type(s) the database does not have"
+      missing.add t
+  if missing.len > 0:
+    # Named, because a count is not something a reader can check. On the real
+    # 39 MiB import the four are `assaultGroup`, `followerTagilla`,
+    # `followerGluharSnipe` and `arenaFighter` -- all four are genuine
+    # `WildSpawnType` members, and none of them has a document under
+    # `bots.types`. That is a database with no template for a role rather than
+    # a typo in the faction table, and the difference is exactly what naming
+    # them lets somebody establish.
+    var names = missing[0]
+    for i in 1 ..< missing.len:
+      names = names & ", " & missing[i]
+    warn "morebots: " & kind & " toward '" & toward & "' skipped " &
+         $missing.len & " of " & $targets.len & " bot type(s) with no " &
+         "document under bots.types -- " & names & ". They are real " &
+         "WildSpawnType roles; this database simply carries no template for " &
+         "them, so there is nothing to write the opinion into and any bot of " &
+         "that role will ignore '" & toward & "'."
 
 proc define*(payload: string): bool =
   ## One `morebots.faction.define` event.

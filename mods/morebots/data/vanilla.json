@@ -1,0 +1,1348 @@
+{
+ "_comment": "The vanilla bot-population baseline, per map, read out of a stock SPT 4.x database rather than typed from memory. mods/morebots scales FROM these numbers and never from whatever the database currently holds, so applying a multiplier twice gives the same answer as applying it once. Without a fixed baseline, a mod that reads BotMax, multiplies it and writes it back doubles the map every server restart, and the only symptom is that the game gets slower every week. `waves` is positional: entry n here is entry n of locations.<map>.base.waves.",
+ "_source": "SPT 4.x database dump; 19 location slots, all of them.",
+ "maps": {
+  "bigmap": {
+   "name": "Customs",
+   "botMax": 19,
+   "botMaxPvE": 30,
+   "maxBotPerZone": 4,
+   "botStart": 20,
+   "botStop": 1500,
+   "botSpawnCountStep": 4,
+   "escapeTimeLimit": 40,
+   "bossSpawns": 12,
+   "spawnPoints": 318,
+   "waves": [
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 1,
+     "slotsMax": 2,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 1,
+     "slotsMax": 2,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 1,
+     "slotsMax": 3,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 1,
+     "slotsMax": 1,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 1,
+     "slotsMax": 3,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "marksman",
+     "slotsMin": 0,
+     "slotsMax": 1,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "marksman",
+     "slotsMin": 1,
+     "slotsMax": 1,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "marksman",
+     "slotsMin": 0,
+     "slotsMax": 1,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "marksman",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "marksman",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 1,
+     "slotsMax": 1,
+     "timeMin": -1,
+     "timeMax": -1
+    }
+   ]
+  },
+  "develop": {
+   "name": "Arena",
+   "botMax": 5,
+   "botMaxPvE": 5,
+   "maxBotPerZone": 0,
+   "botStart": 30,
+   "botStop": 2400,
+   "botSpawnCountStep": 3,
+   "escapeTimeLimit": 60000,
+   "bossSpawns": 0,
+   "spawnPoints": 11,
+   "waves": [
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 1,
+     "slotsMax": 2,
+     "timeMin": 0,
+     "timeMax": 10
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 2,
+     "slotsMax": 3,
+     "timeMin": 10,
+     "timeMax": 120
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 3,
+     "slotsMax": 4,
+     "timeMin": 120,
+     "timeMax": 240
+    }
+   ]
+  },
+  "factory4_day": {
+   "name": "Factory",
+   "botMax": 0,
+   "botMaxPvE": 20,
+   "maxBotPerZone": 4,
+   "botStart": 0,
+   "botStop": 0,
+   "botSpawnCountStep": 3,
+   "escapeTimeLimit": 20,
+   "bossSpawns": 6,
+   "spawnPoints": 145,
+   "waves": [
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 1,
+     "slotsMax": 3,
+     "timeMin": 40,
+     "timeMax": 150
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 2,
+     "slotsMax": 4,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 2,
+     "slotsMax": 4,
+     "timeMin": 300,
+     "timeMax": 350
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 2,
+     "slotsMax": 4,
+     "timeMin": 300,
+     "timeMax": 400
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 2,
+     "slotsMax": 4,
+     "timeMin": 410,
+     "timeMax": 500
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 3,
+     "slotsMax": 4,
+     "timeMin": 460,
+     "timeMax": 510
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 1,
+     "slotsMax": 3,
+     "timeMin": 1200,
+     "timeMax": 1500
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 3,
+     "timeMin": 1600,
+     "timeMax": 1700
+    }
+   ]
+  },
+  "factory4_night": {
+   "name": "Factory",
+   "botMax": 22,
+   "botMaxPvE": 22,
+   "maxBotPerZone": 0,
+   "botStart": 0,
+   "botStop": 0,
+   "botSpawnCountStep": 3,
+   "escapeTimeLimit": 25,
+   "bossSpawns": 6,
+   "spawnPoints": 145,
+   "waves": [
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 2,
+     "slotsMax": 4,
+     "timeMin": 15,
+     "timeMax": 50
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 2,
+     "slotsMax": 4,
+     "timeMin": 0,
+     "timeMax": 5
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 2,
+     "slotsMax": 4,
+     "timeMin": 50,
+     "timeMax": 300
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 2,
+     "slotsMax": 4,
+     "timeMin": 160,
+     "timeMax": 350
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 2,
+     "slotsMax": 4,
+     "timeMin": 410,
+     "timeMax": 500
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 3,
+     "slotsMax": 4,
+     "timeMin": 460,
+     "timeMax": 510
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 1,
+     "slotsMax": 2,
+     "timeMin": 1400,
+     "timeMax": 1500
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 3,
+     "timeMin": 1600,
+     "timeMax": 1700
+    }
+   ]
+  },
+  "hideout": {
+   "name": "Hideout",
+   "botMax": 0,
+   "botMaxPvE": 0,
+   "maxBotPerZone": 0,
+   "botStart": 0,
+   "botStop": 0,
+   "botSpawnCountStep": 3,
+   "escapeTimeLimit": 99999,
+   "bossSpawns": 0,
+   "spawnPoints": 3,
+   "waves": []
+  },
+  "interchange": {
+   "name": "Interchange",
+   "botMax": 30,
+   "botMaxPvE": 30,
+   "maxBotPerZone": 2,
+   "botStart": 20,
+   "botStop": 2400,
+   "botSpawnCountStep": 4,
+   "escapeTimeLimit": 40,
+   "bossSpawns": 8,
+   "spawnPoints": 252,
+   "waves": [
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 2,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 1,
+     "slotsMax": 3,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 2,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 2,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 2,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 2,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 2,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 2,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 2,
+     "timeMin": -1,
+     "timeMax": -1
+    }
+   ]
+  },
+  "laboratory": {
+   "name": "Laboratory",
+   "botMax": 25,
+   "botMaxPvE": 25,
+   "maxBotPerZone": 5,
+   "botStart": 10,
+   "botStop": 1400,
+   "botSpawnCountStep": 3,
+   "escapeTimeLimit": 35,
+   "bossSpawns": 20,
+   "spawnPoints": 170,
+   "waves": []
+  },
+  "labyrinth": {
+   "name": "Labyrinth",
+   "botMax": 30,
+   "botMaxPvE": 30,
+   "maxBotPerZone": 4,
+   "botStart": 10,
+   "botStop": 1900,
+   "botSpawnCountStep": 4,
+   "escapeTimeLimit": 40,
+   "bossSpawns": 10,
+   "spawnPoints": 14,
+   "waves": [
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    }
+   ]
+  },
+  "lighthouse": {
+   "name": "Lighthouse",
+   "botMax": 29,
+   "botMaxPvE": 29,
+   "maxBotPerZone": 8,
+   "botStart": 20,
+   "botStop": 1900,
+   "botSpawnCountStep": 3,
+   "escapeTimeLimit": 40,
+   "bossSpawns": 19,
+   "spawnPoints": 250,
+   "waves": [
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 2,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "marksman",
+     "slotsMin": 0,
+     "slotsMax": 1,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 2,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 2,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 3,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 3,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 2,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    }
+   ]
+  },
+  "privatearea": {
+   "name": "Private Sector",
+   "botMax": 0,
+   "botMaxPvE": 0,
+   "maxBotPerZone": 0,
+   "botStart": 0,
+   "botStop": 0,
+   "botSpawnCountStep": 3,
+   "escapeTimeLimit": 0,
+   "bossSpawns": 0,
+   "spawnPoints": 0,
+   "waves": [
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 3,
+     "slotsMax": 6,
+     "timeMin": 1,
+     "timeMax": 2
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 3,
+     "slotsMax": 5,
+     "timeMin": 10,
+     "timeMax": 12
+    }
+   ]
+  },
+  "rezervbase": {
+   "name": "ReserveBase",
+   "botMax": 28,
+   "botMaxPvE": 28,
+   "maxBotPerZone": 4,
+   "botStart": 20,
+   "botStop": 1500,
+   "botSpawnCountStep": 3,
+   "escapeTimeLimit": 40,
+   "bossSpawns": 11,
+   "spawnPoints": 208,
+   "waves": [
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 1,
+     "slotsMax": 4,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 2,
+     "slotsMax": 2,
+     "timeMin": 80,
+     "timeMax": 120
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 1,
+     "slotsMax": 2,
+     "timeMin": 100,
+     "timeMax": 200
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 1,
+     "slotsMax": 3,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 2,
+     "slotsMax": 4,
+     "timeMin": 260,
+     "timeMax": 400
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 2,
+     "slotsMax": 4,
+     "timeMin": 320,
+     "timeMax": 600
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 2,
+     "slotsMax": 2,
+     "timeMin": 300,
+     "timeMax": 600
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 2,
+     "slotsMax": 4,
+     "timeMin": 480,
+     "timeMax": 800
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 2,
+     "slotsMax": 4,
+     "timeMin": 500,
+     "timeMax": 1000
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 2,
+     "slotsMax": 4,
+     "timeMin": 600,
+     "timeMax": 1000
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 2,
+     "slotsMax": 4,
+     "timeMin": 700,
+     "timeMax": 1000
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 1,
+     "slotsMax": 3,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 3,
+     "timeMin": 900,
+     "timeMax": 1600
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 1,
+     "slotsMax": 2,
+     "timeMin": 1200,
+     "timeMax": 2400
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 2,
+     "timeMin": 1200,
+     "timeMax": 2400
+    }
+   ]
+  },
+  "sandbox": {
+   "name": "Sandbox",
+   "botMax": 20,
+   "botMaxPvE": 20,
+   "maxBotPerZone": 5,
+   "botStart": 120,
+   "botStop": 1800,
+   "botSpawnCountStep": 3,
+   "escapeTimeLimit": 35,
+   "bossSpawns": 0,
+   "spawnPoints": 232,
+   "waves": [
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 1,
+     "slotsMax": 3,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 1,
+     "slotsMax": 3,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 3,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 3,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "marksman",
+     "slotsMin": 0,
+     "slotsMax": 1,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 3,
+     "timeMin": -1,
+     "timeMax": -1
+    }
+   ]
+  },
+  "sandbox_high": {
+   "name": "Sandbox",
+   "botMax": 24,
+   "botMaxPvE": 24,
+   "maxBotPerZone": 5,
+   "botStart": 120,
+   "botStop": 1800,
+   "botSpawnCountStep": 3,
+   "escapeTimeLimit": 35,
+   "bossSpawns": 8,
+   "spawnPoints": 233,
+   "waves": [
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 1,
+     "slotsMax": 3,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 1,
+     "slotsMax": 3,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 1,
+     "slotsMax": 3,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 1,
+     "slotsMax": 3,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 1,
+     "slotsMax": 3,
+     "timeMin": -1,
+     "timeMax": -1
+    }
+   ]
+  },
+  "shoreline": {
+   "name": "Shoreline",
+   "botMax": 31,
+   "botMaxPvE": 31,
+   "maxBotPerZone": 4,
+   "botStart": 20,
+   "botStop": 2700,
+   "botSpawnCountStep": 4,
+   "escapeTimeLimit": 45,
+   "bossSpawns": 14,
+   "spawnPoints": 312,
+   "waves": [
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 3,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 1,
+     "slotsMax": 3,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 2,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "marksman",
+     "slotsMin": 0,
+     "slotsMax": 1,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "marksman",
+     "slotsMin": 0,
+     "slotsMax": 1,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 3,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 3,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 3,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 1,
+     "slotsMax": 3,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 1,
+     "slotsMax": 3,
+     "timeMin": -1,
+     "timeMax": -1
+    }
+   ]
+  },
+  "suburbs": {
+   "name": "Suburbs",
+   "botMax": 0,
+   "botMaxPvE": 0,
+   "maxBotPerZone": 0,
+   "botStart": 0,
+   "botStop": 0,
+   "botSpawnCountStep": 3,
+   "escapeTimeLimit": 0,
+   "bossSpawns": 0,
+   "spawnPoints": 0,
+   "waves": [
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 3,
+     "slotsMax": 6,
+     "timeMin": 1,
+     "timeMax": 2
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 3,
+     "slotsMax": 5,
+     "timeMin": 10,
+     "timeMax": 12
+    }
+   ]
+  },
+  "tarkovstreets": {
+   "name": "Streets of Tarkov",
+   "botMax": 48,
+   "botMaxPvE": 48,
+   "maxBotPerZone": 5,
+   "botStart": 122,
+   "botStop": 2200,
+   "botSpawnCountStep": 3,
+   "escapeTimeLimit": 50,
+   "bossSpawns": 14,
+   "spawnPoints": 458,
+   "waves": [
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 1,
+     "slotsMax": 1,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 1,
+     "slotsMax": 1,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 1,
+     "slotsMax": 1,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "marksman",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 1,
+     "slotsMax": 1,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "marksman",
+     "slotsMin": 1,
+     "slotsMax": 1,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 1,
+     "slotsMax": 1,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "marksman",
+     "slotsMin": 1,
+     "slotsMax": 1,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "marksman",
+     "slotsMin": 1,
+     "slotsMax": 1,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 1,
+     "slotsMax": 1,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 1,
+     "slotsMax": 1,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 1,
+     "slotsMax": 1,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 1,
+     "slotsMax": 1,
+     "timeMin": -1,
+     "timeMax": -1
+    }
+   ]
+  },
+  "terminal": {
+   "name": "Terminal",
+   "botMax": 0,
+   "botMaxPvE": 0,
+   "maxBotPerZone": 0,
+   "botStart": 0,
+   "botStop": 0,
+   "botSpawnCountStep": 3,
+   "escapeTimeLimit": 0,
+   "bossSpawns": 0,
+   "spawnPoints": 0,
+   "waves": [
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 3,
+     "slotsMax": 6,
+     "timeMin": 1,
+     "timeMax": 2
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 3,
+     "slotsMax": 5,
+     "timeMin": 10,
+     "timeMax": 12
+    }
+   ]
+  },
+  "town": {
+   "name": "Town",
+   "botMax": 0,
+   "botMaxPvE": 0,
+   "maxBotPerZone": 0,
+   "botStart": 0,
+   "botStop": 0,
+   "botSpawnCountStep": 3,
+   "escapeTimeLimit": 0,
+   "bossSpawns": 0,
+   "spawnPoints": 0,
+   "waves": [
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 3,
+     "slotsMax": 6,
+     "timeMin": 1,
+     "timeMax": 2
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 3,
+     "slotsMax": 5,
+     "timeMin": 10,
+     "timeMax": 12
+    }
+   ]
+  },
+  "woods": {
+   "name": "Woods",
+   "botMax": 30,
+   "botMaxPvE": 30,
+   "maxBotPerZone": 4,
+   "botStart": 10,
+   "botStop": 1900,
+   "botSpawnCountStep": 4,
+   "escapeTimeLimit": 40,
+   "bossSpawns": 12,
+   "spawnPoints": 368,
+   "waves": [
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 1,
+     "slotsMax": 1,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 1,
+     "slotsMax": 1,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 2,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "marksman",
+     "slotsMin": 1,
+     "slotsMax": 1,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 0,
+     "slotsMax": 0,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 1,
+     "slotsMax": 1,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 1,
+     "slotsMax": 1,
+     "timeMin": -1,
+     "timeMax": -1
+    },
+    {
+     "wildSpawnType": "assault",
+     "slotsMin": 1,
+     "slotsMax": 1,
+     "timeMin": -1,
+     "timeMax": -1
+    }
+   ]
+  }
+ }
+}

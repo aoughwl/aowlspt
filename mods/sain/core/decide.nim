@@ -42,6 +42,8 @@ import vec
 import types
 import settings
 import toggle
+import vision
+import flank
 
 type
   DecideContext* = object
@@ -66,13 +68,30 @@ type
     ## `Random(0.66, 1.33)` at each use; drawing once per bot costs nothing per
     ## tick and still keeps two bots off the same threshold on the same frame.
     jitter*: float
+    ## Not again before, for the flank. A flank whose side is re-decided every
+    ## tick is a bot walking on the spot between two waypoints.
+    nextFlankAt*: Cooldown
+    ## When this bot first committed to a frontal engagement with its current
+    ## enemy. The flank check reads it: a fight that has been going nowhere for
+    ## `flankAfterStalledSeconds` is a fight worth changing the angle of, and
+    ## without this the bot has no way to know a fight is going nowhere.
+    engagedSince*: float
+    ## Latched. Extracting is the one decision that should not be reconsidered
+    ## when a health pack brings the bot back over a threshold: it left for
+    ## three reasons at once and one of them improving is not a reason to walk
+    ## back into the raid.
+    extracting*: Toggle
+    ## Which way this bot flanks, drawn once per flank rather than per tick.
+    flankSideHeld*: float
 
 func newContext*(jitter: float): DecideContext =
   DecideContext(previous: emptyDecision(), lastChangeAt: 0.0,
                 holdGroundUntil: 0.0, nextShiftAt: newCooldown(),
                 nextDistantShotAt: newCooldown(), endDistantShotAt: 0.0,
                 unfreezeAt: 0.0, dogFight: newToggle(false),
-                runningToCover: newToggle(false), jitter: jitter)
+                runningToCover: newToggle(false), jitter: jitter,
+                nextFlankAt: newCooldown(), engagedSince: 0.0,
+                extracting: newToggle(false), flankSideHeld: 1.0)
 
 # ---------------------------------------------------------------------------
 # Urgency
@@ -89,11 +108,18 @@ func urgency*(d: CombatDecision): int =
   of cdMeleeAttack: 90
   of cdDogFight: 85
   of cdRunAway: 80
+  # Above Retreat and below RunAway: a bot that has decided to leave the raid
+  # should not be talked out of it by a squad order or by cover looking
+  # attractive, but a knife in the face still outranks it.
+  of cdExtract: 78
   of cdRetreat: 70
   of cdSeekCover: 60
   of cdStandAndShoot: 55
   of cdThrowGrenade: 50
   of cdRushEnemy: 45
+  # Just under a rush and over a shift: changing the angle is a bigger
+  # commitment than changing the cover point and a smaller one than charging.
+  of cdFlank: 42
   of cdShiftCover: 40
   of cdCreepOnEnemy: 35
   of cdShootDistantEnemy: 30
@@ -118,6 +144,12 @@ func holdTimeFor*(d: CombatDecision; s: Settings): float =
   of cdRetreat, cdRunAway: 3.0
   of cdRushEnemy, cdCreepOnEnemy: 2.0
   of cdSearch: 4.0
+  # The longest hold in the table, and the reason is the whole point of the
+  # decision: a flank that is abandoned halfway is a bot that walked into the
+  # open for nothing. SAIN's equivalent commitment is the BigBrain action's own
+  # lifetime, which is why it does not need a number here.
+  of cdFlank: 5.0
+  of cdExtract: 8.0
   of cdFreeze: 1.0
   of cdHoldInCover: 1.5
   of cdThrowGrenade: 1.0
@@ -269,7 +301,12 @@ func combatFor*(sd: SquadDecision): CombatDecision =
   ## objects, so the mapping is made explicit here, in one place, rather than
   ## branched on inside every consumer.
   case sd
-  of sdHelp, sdRegroup, sdSurround, sdPushSuppressedEnemy: cdMoveToEngage
+  # Surround is the one order whose meaning is geometric rather than a
+  # destination, and it now has a decision that expresses it. Before `cdFlank`
+  # existed this mapped to `MoveToEngage`, which turned "surround him" into
+  # "everybody walk at him from where you are" -- the opposite of the order.
+  of sdSurround: cdFlank
+  of sdHelp, sdRegroup, sdPushSuppressedEnemy: cdMoveToEngage
   of sdRetreat, sdBoundingRetreat: cdRetreat
   of sdSuppress: cdStandAndShoot
   of sdHoldPositions: cdHoldInCover
@@ -334,6 +371,55 @@ func shallFreeze(b: BotView; s: Settings): bool =
   if e.timeSinceHeard > s.freezeMaxTimeSinceHeard: return false
   result = e.distance <= s.freezeMaxDistance
 
+func shallFlank(b: BotView; s: Settings; ctx: DecideContext): bool =
+  ## Work an angle instead of pushing the one that is not working.
+  ##
+  ## SAIN reaches a flank by comparing navmesh path lengths to points its cover
+  ## finder produced on the far side of the enemy. Neither the navmesh nor the
+  ## cover finder is reachable here, so the condition is stated in terms of
+  ## what *is*: the bot knows roughly where the enemy is, cannot currently
+  ## shoot them, has been trying for a while, and is healthy enough that the
+  ## walk is worth taking.
+  ##
+  ## The last clause is the one that makes it behaviour rather than noise. A
+  ## bot that flanks the instant it loses sight is a bot that never holds an
+  ## angle; `engagedSince` is what makes it flank because the fight has
+  ## *stalled*.
+  if not s.canFlank: return false
+  let e = b.enemy
+  if not (e.valid and e.alive): return false
+  if b.me.healthNormalized < s.flankMinHealth: return false
+  if e.threatLevel < 0.35: return false
+  # A shot available is not a fight that has stalled.
+  if e.visible and e.canShoot: return false
+  # ...but a total loss of the enemy is a search, not a flank. The bot has to
+  # still have some idea where they are.
+  if not (stillTracking(e, s) or e.timeSinceSeen < 15.0): return false
+  if e.pathDistance < s.flankMinDistance: return false
+  if e.pathDistance > s.flankMaxDistance: return false
+  if not ready(ctx.nextFlankAt, b.timeNow): return false
+  result = b.timeNow - ctx.engagedSince > s.flankAfterStalledSeconds
+
+func shallExtract(b: BotView; s: Settings; ctx: DecideContext): bool =
+  ## SAIN: `ExtractDecisionClass`. Hurt, dry, and late enough in the raid that
+  ## leaving is a plan rather than a rout.
+  ##
+  ## Latched by the caller through `ctx.extracting`, because all three inputs
+  ## are things a single first-aid kit can flip back and a bot that turns round
+  ## at the exit is worse than one that never left.
+  if ctx.extracting.value:
+    return true
+  if b.extractRequested:
+    return true
+  if b.raidSeconds < s.extractMinRaidSeconds:
+    return false
+  if b.me.healthNormalized >= s.extractHealthThreshold:
+    return false
+  # Dry: not merely a low magazine but nothing left to fill it with.
+  if b.me.hasAmmoToReload and magazineRatio(b.me) > s.extractAmmoRatio:
+    return false
+  result = true
+
 func shallShiftCover(b: BotView; s: Settings; ctx: DecideContext): bool =
   ## SAIN: the ShiftCover check. Needs a personality that shifts, a cover point
   ## in use, and either a stale sighting or a stale last-known place.
@@ -349,7 +435,7 @@ func shallShiftCover(b: BotView; s: Settings; ctx: DecideContext): bool =
   result = e.timeSinceSeen > s.shiftCoverTimeSinceSeen
 
 proc combatLayer*(ctx: var DecideContext; b: BotView; s: Settings;
-                  reason: var string): CombatDecision =
+                  reason: var DecisionReason): CombatDecision =
   ## The solo fight, as SAIN's `EnemyDecisionClass.GetDecision` ladder.
   ## First check that fires wins.
   let me = b.me
@@ -357,125 +443,265 @@ proc combatLayer*(ctx: var DecideContext; b: BotView; s: Settings;
 
   # -- reflexes, above the ladder ------------------------------------------
   if b.grenade.active and b.grenade.distance < s.grenadeAvoidDistance:
-    reason = "grenade at " & $b.grenade.distance & "m"
+    reason = drGrenadeIncoming
     return cdAvoidGrenade
 
   # SAIN's step 0: no weapon, no bullets, or mid-reload -> Retreat.
   if not me.weaponReady:
     if e.valid and e.distance < s.meleeDistance:
-      reason = "no weapon, enemy in reach"
+      reason = drNoWeaponInReach
       return cdMeleeAttack
     if e.valid and e.threatLevel > 0.0:
-      reason = "weapon not ready"
+      reason = drWeaponNotReady
       return cdRetreat
 
   # -- no enemy at all -------------------------------------------------------
   if not e.valid or not e.alive or e.threatLevel <= 0.0:
     if b.hasSearchTarget and s.willSearchForEnemy:
-      reason = "no contact, search target held"
+      reason = drNoContactSearchHeld
       return cdSearch
     if b.timeSinceLastSound < 1.0 and b.lastSound != skNone:
       # SAIN: `EHeardFromPeaceBehavior`. A noise with no owner means different
       # things to different personalities, and this is where that shows.
       case s.heardFromPeace
       of hfCharge:
-        reason = "charging an unattributed sound"
+        reason = drUnattributedSoundCharge
         return cdMoveToEngage
       of hfSearchNow:
-        reason = "searching an unattributed sound"
+        reason = drUnattributedSoundSearch
         return cdSearch
       of hfFreeze:
-        reason = "freezing at an unattributed sound"
+        reason = drUnattributedSoundFreeze
         return cdFreeze
       of hfNone:
         discard
-    reason = "nothing to do"
+    reason = drNothingToDo
     return cdNone
 
   # -- dogfight, latched -----------------------------------------------------
   updateDogFight(ctx, b, s)
   if ctx.dogFight.value:
-    reason = "dogfight"
+    reason = drDogFight
     return cdDogFight
 
   if e.distance <= s.meleeDistance and not me.weaponReady:
-    reason = "melee range"
+    reason = drMeleeRange
     return cdMeleeAttack
+
+  # -- leaving ---------------------------------------------------------------
+  # Above the health checks rather than below them: a bot that is hurt *and*
+  # out of ammunition has nothing to gain from running to cover it cannot shoot
+  # from, and SAIN puts its extract layer above the combat layer for the same
+  # reason.
+  if shallExtract(b, s, ctx):
+    reason = drExtracting
+    return cdExtract
 
   # -- badly hurt ------------------------------------------------------------
   if me.healthNormalized < s.runAwayHealthThreshold:
-    reason = "health below the run-away threshold"
+    reason = drHealthBelowRunAway
     return cdRunAway
 
   if me.healthNormalized < s.fightBackHealthThreshold and
      me.inCoverStatus != csInCover:
-    reason = "hurt and exposed"
+    reason = drHurtAndExposed
     return cdRetreat
 
   # -- pinned ----------------------------------------------------------------
   if me.suppressionLevel >= s.suppressionPinnedLevel and
      me.inCoverStatus == csInCover:
-    reason = "pinned in cover"
+    reason = drPinnedInCover
     return cdHoldInCover
   if me.suppressionLevel >= s.suppressionSeekCoverLevel and
      me.inCoverStatus != csInCover:
-    reason = "suppressed in the open"
+    reason = drSuppressedInOpen
     return cdSeekCover
+
+  # -- seen, but not yet noticed ---------------------------------------------
+  #
+  # The rung this port exists to add. The engine's raycast has reached the
+  # enemy, but this bot's own acquisition (`core/vision.nim`) has not yet
+  # crossed its engage threshold, or has and the reaction delay has not
+  # elapsed. Vanilla and the previous version of this file treated the raycast
+  # as the bot's own knowledge and fired on the frame it succeeded.
+  #
+  # What the bot does in the meantime is not "nothing": it is exactly what a
+  # person does in the half second before they have processed what they are
+  # looking at, which is to keep whatever posture they already had. In cover,
+  # stay; in the open, start moving to some.
+  if e.visible and e.alive and not e.canShoot and
+     e.distance <= s.engageDistance * s.standAndShootMaxRatio:
+    reason = drNotYetAcquired
+    return (if me.inCoverStatus == csInCover: cdHoldInCover else: cdSeekCover)
 
   # -- stand and shoot -------------------------------------------------------
   if shallStandAndShoot(b, s, ctx):
-    reason = "holding ground with a shot"
+    reason = drHoldingGroundWithShot
     return cdStandAndShoot
 
   # -- distant target, on its own cooldown -----------------------------------
   if e.visible and e.canShoot and e.distance > s.maxPointFireDistance and
      me.healthNormalized > s.fightBackHealthThreshold:
     if b.timeNow < ctx.endDistantShotAt:
-      reason = "still engaging a distant target"
+      reason = drDistantTargetHeld
       return cdShootDistantEnemy
     if ready(ctx.nextDistantShotAt, b.timeNow):
-      reason = "distant target"
+      reason = drDistantTarget
       return cdShootDistantEnemy
 
   # -- rush ------------------------------------------------------------------
   if shallRush(b, s):
-    reason = "enemy vulnerable and close"
+    reason = drEnemyVulnerable
     return cdRushEnemy
+
+  # -- flank -----------------------------------------------------------------
+  if shallFlank(b, s, ctx):
+    reason = drFlankStale
+    return cdFlank
 
   # -- search ----------------------------------------------------------------
   if s.willSearchForEnemy and not e.visible and
      e.timeSinceSeen > s.timeBeforeSearch:
-    reason = "lost contact for longer than the search delay"
+    reason = drLostContactPastSearchDelay
     return cdSearch
 
   # -- freeze ----------------------------------------------------------------
   if shallFreeze(b, s):
-    reason = "frozen, listening"
+    reason = drFrozenListening
     return cdFreeze
 
   # -- shift cover -----------------------------------------------------------
   if shallShiftCover(b, s, ctx):
-    reason = "cover has gone stale"
+    reason = drCoverStale
     return cdShiftCover
 
   # -- creep -----------------------------------------------------------------
   if e.timeSinceSeen > 2.0 and e.threatLevel > 0.3 and
      e.pathDistance < s.creepMaxDistance and not e.suppressingUs and
      s.sneaky:
-    reason = "unaware enemy nearby"
+    reason = drUnawareEnemyNearby
     return cdCreepOnEnemy
 
   # -- known but out of range ------------------------------------------------
   if e.pathDistance > s.engageDistance:
-    reason = "known but out of range"
+    reason = drKnownOutOfRange
     return cdMoveToEngage
 
   # -- SAIN's fallback -------------------------------------------------------
   if me.inCoverStatus == csInCover:
-    reason = "in cover, waiting"
+    reason = drInCoverWaiting
     return cdHoldInCover
-  reason = "no better option: seek cover"
+  reason = drNoBetterOptionSeekCover
   result = cdSeekCover
+
+# ---------------------------------------------------------------------------
+# Where the decision sends the bot
+# ---------------------------------------------------------------------------
+
+func engaging(d: CombatDecision): bool =
+  ## Whether this decision is the bot *pressing a frontal engagement*. Read by
+  ## the flank timer: the clock that decides a fight has stalled has to start
+  ## when the fight starts, and this is the definition of "started".
+  case d
+  of cdStandAndShoot, cdShootDistantEnemy, cdMoveToEngage, cdHoldInCover,
+     cdRushEnemy, cdDogFight: true
+  else: false
+
+proc moveTargetFor*(ctx: var DecideContext; d: CombatDecision; b: BotView;
+                    s: Settings; target: var Vec3): bool =
+  ## Where a decision wants the bot, as a point in the world.
+  ##
+  ## Separated from the ladder because the ladder answers *what* and this
+  ## answers *where*, and separated from the actuator because only the ladder's
+  ## reasons make the geometry decidable -- a retreat and a flank both move the
+  ## bot away from the enemy's bearing and they are not the same shape.
+  ##
+  ## Pure except for the flank side, which is latched into the context so that
+  ## a flank keeps going the way it started. That single piece of state is why
+  ## this takes `var` rather than being a `func`.
+  let me = b.me
+  let e = b.enemy
+  target = zeroVec()
+  case d
+  of cdAvoidGrenade:
+    if not b.grenade.active: return false
+    target = avoidTarget(me.position, b.grenade.position, s)
+    return true
+  of cdSeekCover:
+    if me.hasCoverPoint:
+      target = me.coverPosition
+      return true
+    # No cover set -- the usual case on a build where the cover sensor refused,
+    # which is every build so far. Falling back to "away from the enemy" is
+    # what a bot with no cover to run to should do, and it is honest: the
+    # README says the cover *points* are missing, not the cover *behaviour*.
+    if not e.valid: return false
+    target = retreatTarget(me.position, e.position, 14.0)
+    return true
+  of cdShiftCover:
+    if me.hasCoverPoint:
+      target = me.coverPosition
+      return true
+    if not b.squad.haveMate: return false
+    target = spreadTarget(me.position, b.squad.nearestMatePosition,
+                          s.squadSpreadMinDistance)
+    return true
+  of cdRetreat:
+    if not e.valid: return false
+    target = withdrawTarget(me.position, e.position, me.coverPosition,
+                            me.hasCoverPoint, 18.0)
+    return true
+  of cdRunAway:
+    if not e.valid: return false
+    target = retreatTarget(me.position, e.position, 45.0)
+    return true
+  of cdExtract:
+    # No exfiltration point is reachable from here (see `README.md`), so the
+    # destination is "away from everything this bot knows about", which is the
+    # observable half of extracting and is stated as exactly that.
+    if e.valid:
+      let threats = [e.position]
+      target = extractDirection(me.position, threats)
+    else:
+      target = vec3(me.position.x + 60.0, me.position.y, me.position.z)
+    return true
+  of cdFlank:
+    if not e.valid: return false
+    if ready(ctx.nextFlankAt, b.timeNow):
+      # The side is chosen once, when the flank begins, and held for the whole
+      # cooldown. Re-choosing it per tick is the failure this cooldown exists
+      # to prevent: the bot crosses the bearing, the "which side am I on" test
+      # flips, and it crosses back.
+      ctx.flankSideHeld = flankSide(me.position, e.position,
+                                    b.squad.nearestMatePosition,
+                                    b.squad.haveMate)
+      arm(ctx.nextFlankAt, b.timeNow, s.flankCooldown)
+    target = flankTarget(me.position, e.position, ctx.flankSideHeld, s)
+    return true
+  of cdRushEnemy, cdMeleeAttack:
+    if not e.valid: return false
+    target = e.position
+    return true
+  of cdMoveToEngage:
+    if not e.valid: return false
+    # Close to the edge of the bot's own effective range rather than onto the
+    # enemy: a bot that walks all the way in has thrown away the weapon it was
+    # moving to use.
+    target = towards(me.position, e.position,
+                     clampf(e.pathDistance - s.engageDistance * 0.8,
+                            0.0, 500.0))
+    return true
+  of cdCreepOnEnemy:
+    if not e.valid: return false
+    target = creepTarget(me.position, e.position, s)
+    return true
+  of cdSearch:
+    if not b.hasSearchTarget: return false
+    target = b.searchTarget
+    return true
+  of cdStandAndShoot, cdShootDistantEnemy, cdThrowGrenade, cdDogFight,
+     cdFreeze, cdHoldInCover, cdNone:
+    return false
 
 # ---------------------------------------------------------------------------
 # The arbiter
@@ -483,7 +709,7 @@ proc combatLayer*(ctx: var DecideContext; b: BotView; s: Settings;
 
 proc decide*(ctx: var DecideContext; b: BotView; s: Settings): Decision =
   ## One pass of the cascade, in SAIN's order, with the hold rule applied.
-  var reason = ""
+  var reason = drNone
   var combat = cdNone
   var squadAct = sdNone
   let selfAct = selfLayer(b, s)
@@ -492,7 +718,7 @@ proc decide*(ctx: var DecideContext; b: BotView; s: Settings): Decision =
     # SAIN emits `(SeekCover, None, selfAction)`: a bot doing something to
     # itself wants to be behind something while it does it.
     combat = cdSeekCover
-    reason = "self action: " & selfActionName(selfAct)
+    reason = drSelfAction
   else:
     combat = combatLayer(ctx, b, s, reason)
 
@@ -505,7 +731,7 @@ proc decide*(ctx: var DecideContext; b: BotView; s: Settings): Decision =
       let squadCombat = combatFor(squadAct)
       if squadCombat != cdNone and urgency(squadCombat) >= urgency(combat):
         combat = squadCombat
-        reason = "squad: " & squadDecisionName(squadAct)
+        reason = drSquadOrder
 
   # The hold rule. A held decision survives unless the new one is strictly more
   # urgent -- note `<=`, not `<`: an equal-urgency alternative is not a reason
@@ -520,11 +746,30 @@ proc decide*(ctx: var DecideContext; b: BotView; s: Settings): Decision =
       return held
 
   let hold = holdTimeFor(combat, s) * (0.85 + 0.3 * ctx.jitter)
+  var moveTo = zeroVec()
+  let hasMove = moveTargetFor(ctx, combat, b, s, moveTo)
   result = Decision(combat: combat, squad: squadAct, self: selfAct,
-                    reason: reason, holdUntil: b.timeNow + hold)
+                    reason: reason, holdUntil: b.timeNow + hold,
+                    moveTo: moveTo, hasMove: hasMove)
+
+  # Extracting latches on entry rather than being re-derived: `shallExtract`
+  # reads the toggle back, so this is the only place it is ever set.
+  if combat == cdExtract:
+    discard set(ctx.extracting, true, b.timeNow)
 
   if combat != prev.combat:
     ctx.lastChangeAt = b.timeNow
+
+    # The stall clock for the flank. It starts when a frontal engagement
+    # starts and is *not* restarted while one continues, which is the whole
+    # point -- a fight that has been running for eight seconds is a fight the
+    # bot should consider approaching differently.
+    if engaging(combat) and not engaging(prev.combat):
+      ctx.engagedSince = b.timeNow
+    elif not (engaging(combat) or combat == cdFlank):
+      # Contact broken off for a reason that is not a flank: the next
+      # engagement is a fresh one and gets its full patience back.
+      ctx.engagedSince = b.timeNow
     discard set(ctx.runningToCover,
                 combat == cdSeekCover or combat == cdRetreat or
                 combat == cdRunAway, b.timeNow)

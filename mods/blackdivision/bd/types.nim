@@ -42,7 +42,7 @@ proc allTypes*(): seq[BdType] =
            display: "Black Division Lead",
            description: "A team leader of Black Division.",
            templateFile: SharedTemplate, configFile: SharedConfig,
-           loadoutFile: "", isBossForStats: false),
+           loadoutFile: "loadouts/blackdivlead.json", isBossForStats: false),
     BdType(name: "blackDivAssault", id: 848421, scavRole: "BlackDiv",
            display: "Black Division Assault",
            description: "An assault member of Black Division, using rifles, " &
@@ -54,13 +54,15 @@ proc allTypes*(): seq[BdType] =
            description: "A breacher member of Black Division, focusing on " &
                         "close combat.",
            templateFile: SharedTemplate, configFile: SharedConfig,
-           loadoutFile: "", isBossForStats: false),
+           loadoutFile: "loadouts/blackdivbreacher.json",
+           isBossForStats: false),
     BdType(name: "blackDivSupport", id: 848423, scavRole: "BlackDiv",
            display: "Black Division Support",
            description: "A support member of Black Division, using heavy " &
                         "weapons to provide suppression.",
            templateFile: SharedTemplate, configFile: SharedConfig,
-           loadoutFile: "", isBossForStats: false),
+           loadoutFile: "loadouts/blackdivsupport.json",
+           isBossForStats: false),
     BdType(name: "bossWedge", id: 848424, scavRole: "Boss",
            display: "Wedge",
            description: "A hyper-lethal leader within Black Division.",
@@ -140,8 +142,16 @@ proc factionDefinition*(): string =
   put(o, "revengeRaidAmount", 3)
   result = done(o).text
 
-proc relationTypesToward*(faction: string): string =
+proc relationTypesToward*(faction: string; optional = false): string =
   ## "Black Division is hostile to <faction>."
+  ##
+  ## `optional` marks a faction that belongs to a mod which may not be
+  ## installed -- `ruaf` is the only one, and it comes from TacticalToaster's
+  ## other mod. morebots then reports the miss at info with the consequence
+  ## spelled out instead of warning about it. Without the flag every default
+  ## install logged `relation toward unknown faction 'ruaf'` at warn level, and
+  ## a warning the reader can do nothing about is a warning that teaches them
+  ## to skim the rest.
   var a = arr()
   let names = typeNames()
   for n in names:
@@ -150,6 +160,8 @@ proc relationTypesToward*(faction: string): string =
   put(o, "kind", "enemy")
   put(o, "types", a)
   put(o, "toward", faction)
+  if optional:
+    put(o, "optional", true)
   result = done(o).text
 
 proc relationFactionTowardBd*(faction: string): string =

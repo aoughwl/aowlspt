@@ -19,13 +19,21 @@
 import vec
 import types
 import settings
+import vision
+import hearing
+import rng
 
 type
   Observation* = object
     ## One tick's raw truth about one enemy, as the client layer read it.
     ## `sawThisTick` is the result of the game's own visibility test — this
     ## module decides what it *means*, not whether it happened.
-    id*: string
+    ## The identity. A pointer on the client side, any distinct number in a
+    ## test. `id` is only carried when the caller knows the entry is new --
+    ## reading a managed string per enemy per tick was the last allocation on
+    ## the perception path and it bought nothing, because the key already
+    ## answers every question the table asks.
+    key*: uint64
     alive*: bool
     isPlayer*: bool
     position*: Vec3
@@ -36,6 +44,10 @@ type
     ## not derived here: only the client layer can see their forward vector.
     lookingAtUsThisTick*: bool
     pathDistance*: float       ## negative when the client did not compute one
+    ## What the bot made of a sound from this enemy this tick, if any. Built by
+    ## `hearing.listen` in the caller, because only the caller knows where the
+    ## sound was and whether the line was clear.
+    heard*: Heard
 
   EnemyTable* = object
     ## Every enemy this bot has met, most recent first after `promote`.
@@ -54,23 +66,30 @@ func bandFor*(distance: float): PathDistance =
   elif distance <= 64.0: pdFar
   else: pdVeryFar
 
-func indexOf*(t: EnemyTable; id: string): int =
-  ## Linear. The table is a handful of entries per bot and a hash would cost
-  ## more in setup than it saves in a scan of six.
+func indexOf*(t: EnemyTable; key: uint64): int =
+  ## Linear, on an integer. The table is a handful of entries per bot and a
+  ## hash would cost more in setup than it saves in a scan of six -- and this
+  ## used to compare *strings*, which is a memcmp per entry per tick for a
+  ## question one integer compare answers.
   result = -1
   for i in 0 ..< t.items.len:
-    if t.items[i].id == id:
+    if t.items[i].key == key:
       return i
 
 proc observe*(t: var EnemyTable; obs: Observation; me: Vec3; look: Vec3;
-              s: Settings; now: float; dt: float) =
+              s: Settings; now: float; dt: float; r1: var Rng) =
   ## Fold one observation into the table.
-  var idx = indexOf(t, obs.id)
+  ##
+  ## `r1` is the bot's own stream, used for the reaction-delay draw in
+  ## `vision.updateAwareness`. Passing it in rather than owning one keeps this
+  ## module deterministic from the caller's seat, which is what the scenario
+  ## tests replay against.
+  var idx = indexOf(t, obs.key)
   if idx < 0:
     if not obs.alive:
       return                   # do not create an entry for a corpse
     var e = emptyEnemy()
-    e.id = obs.id
+    e.key = obs.key
     e.valid = true
     t.items.add e
     idx = t.items.len - 1
@@ -89,6 +108,13 @@ proc observe*(t: var EnemyTable; obs: Observation; me: Vec3; look: Vec3;
   e.band = bandFor(e.pathDistance)
 
   if obs.sawThisTick:
+    # Velocity first, from the *previous* real position, before it is
+    # overwritten. Two subtractions and a divide, and it is what the search's
+    # "push past in the direction they went" phase and the acquisition model's
+    # motion factor both read. SAIN gets the same number from a
+    # `Vector3.Distance` between consecutive `EnemyPlace` records.
+    if e.visible and dt > 0.0001:
+      e.velocity = (obs.position - e.realPosition) * (1.0 / dt)
     e.visible = true
     e.timeSinceSeen = 0.0
     e.seenTotal = e.seenTotal + dt
@@ -109,12 +135,26 @@ proc observe*(t: var EnemyTable; obs: Observation; me: Vec3; look: Vec3;
   if obs.heardThisTick:
     e.timeSinceHeard = 0.0
     e.heardRecently = true
+    e.heardLoudness = obs.heard.loudness
     if not obs.sawThisTick:
       # A heard enemy updates the *last known place* but not the real one. That
       # distinction is the reason bots in SAIN search a room rather than
       # tracking through walls, and losing it is the classic aimbot bug.
-      e.position = obs.position
-    e.threatLevel = clampf(e.threatLevel + 0.35, 0.0, 1.0)
+      #
+      # It is `obs.heard.position` rather than `obs.position` for the same
+      # reason one layer down: the heard position is where the bot *thinks* the
+      # sound came from, complete with the localisation error `hearing.listen`
+      # put on it. Using the true position here would make the whole hearing
+      # model decorative.
+      e.position = (if obs.heard.audible: obs.heard.position else: obs.position)
+      # A sound is evidence that the last known place is fresher than it was,
+      # so the uncertainty radius collapses towards the localisation error
+      # rather than to zero.
+      e.uncertainty = clampf(obs.heard.distance * s.hearingPositionError,
+                             1.0, e.uncertainty)
+    let bump = threatBump(obs.heard, skFootStep)
+    e.threatLevel = clampf(e.threatLevel + (if bump > 0.0: bump else: 0.35),
+                           0.0, 1.0)
   else:
     e.timeSinceHeard = e.timeSinceHeard + dt
     e.heardRecently = e.timeSinceHeard < s.heardTimeout
@@ -131,7 +171,14 @@ proc observe*(t: var EnemyTable; obs: Observation; me: Vec3; look: Vec3;
 
   let dir = obs.position - me
   e.inFieldOfView = angleCos(look, dir) >= s.fieldOfViewCos
-  e.canShoot = e.visible and e.seenTotal >= s.minSeenTimeToEngage
+
+  # --- acquisition. This is the line that separates this port from vanilla:
+  # `canShoot` used to be "the engine's raycast reached them and a tenth of a
+  # second has passed", which is a bot that snaps onto you the frame you clear
+  # a doorway. Now it is "this bot has noticed, and has had time to react".
+  updateAwareness(e, s, look, me, now, dt, r1)
+  decayUncertainty(e, s, dt)
+  e.canShoot = mayEngage(e, s, now)
 
   t.items[idx] = e
 
@@ -165,6 +212,10 @@ func score(e: EnemyView; s: Settings): float =
     return -1.0
   var v = e.threatLevel * 100.0
   if e.visible: v = v + 200.0
+  # An acquired enemy outranks one that is merely in line of sight but has not
+  # been noticed yet, which is what keeps a bot fighting the man it is already
+  # fighting when a second one steps into view behind him.
+  v = v + e.awareness * 60.0
   if e.suppressingUs: v = v + 150.0
   if e.isPlayer: v = v + 40.0        ## the human is the point of the raid
   if e.inFieldOfView: v = v + 25.0

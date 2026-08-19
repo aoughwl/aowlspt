@@ -67,9 +67,38 @@ proc roleId*(name: string): int =
 # Registration
 # ---------------------------------------------------------------------------
 
+var gExistKeys: seq[string] = @[]
+var gExistAnswers: seq[bool] = @[]
+
 proc botTypeExists*(key: string): bool =
-  let v = dbRead("bots.types." & key)
-  result = v.ok and v.raw.len > 1
+  ## Does the database (or this mod's buffer) hold `bots.types.<key>`?
+  ##
+  ## Memoised, and the memo is worth more than it looks. `relateOne` asks this
+  ## once per target bot type per relation, and a default install applies twelve
+  ## relations over roughly fifty types — three hundred and thirty questions
+  ## about fifty distinct keys. Each unmemoised answer copies a whole bot type
+  ## document (a few hundred kilobytes) out of the database to look at its
+  ## length. The memo turns that into fifty copies.
+  ##
+  ## Safe to memoise because the answer only ever goes from false to true, and
+  ## it is this mod that makes it do so — `writeTemplate` sets the entry.
+  for i in 0 ..< gExistKeys.len:
+    if gExistKeys[i] == key:
+      return gExistAnswers[i]
+  let v = dbView("bots.types." & key)
+  let answer = v.ok and v.raw.len > 1
+  gExistKeys.add key
+  gExistAnswers.add answer
+  result = answer
+
+proc noteBotType(key: string) =
+  ## This mod has just written `bots.types.<key>`, so it exists from now on.
+  for i in 0 ..< gExistKeys.len:
+    if gExistKeys[i] == key:
+      gExistAnswers[i] = true
+      return
+  gExistKeys.add key
+  gExistAnswers.add true
 
 proc writeTemplate*(key, templateJson: string): bool =
   ## The type document into `bots.types.<key>`. A merge, so a second mod adding
@@ -77,6 +106,8 @@ proc writeTemplate*(key, templateJson: string): bool =
   if templateJson.len == 0:
     return false
   result = dbPut("bots.types." & key, templateJson)
+  if result:
+    noteBotType(key)
 
 proc writeConfig*(key, configJson: string): int =
   ## `BotTypeConfig`, spread across `bots.config`. Returns how many sections it
@@ -122,7 +153,7 @@ proc appendToConfigList*(path, value: string) =
   ## `bots.config.bosses` and `bots.config.botRolesThatMustHaveUniqueName` are
   ## arrays, and `dbWrite` replaces an array outright — so the only safe way to
   ## add to one is to read it, check, and write the whole thing back.
-  let cur = dbRead(path)
+  let cur = dbView(path)
   var out1 = arr()
   if cur.ok and cur.raw.len > 0:
     let items = each(whole(cur.raw))
@@ -256,7 +287,7 @@ proc difficultiesJson*(): string =
   var o = obj()
   for i in 0 ..< gTypes.len:
     let key = gTypes[i].key
-    let v = dbRead("bots.types." & key & ".difficulty")
+    let v = dbView("bots.types." & key & ".difficulty")
     if v.ok and v.raw.len > 2:
       put(o, key, raw(v.raw))
   result = done(o).text

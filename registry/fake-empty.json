@@ -1,0 +1,12 @@
+{
+  "schema": "aowlspt.registry/1",
+  "registry": {
+    "id": "aowl.registry.official",
+    "name": "aowlspt official registry",
+    "description": "Every mod built in this repository, plus the lists that name them. One file with one git history, so a mod list is a document you can send someone.",
+    "revision": 2,
+    "updated": "2026-08-18"
+  },
+  "mods": [],
+  "lists": []
+}

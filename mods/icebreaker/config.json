@@ -1,48 +1,122 @@
 {
+  "_comment": "aowl.icebreaker. Rebinds the dormant `suburbs` location slot to the nuclear icebreaker BOREAS: points it at a scene, gives it exits, waves, boss spawns, a bot cap and a name, and watches raid ends for the quest crossings. Server-only -- it never enters the game's process. Every key is documented on the line above it. README.md says which of upstream's features survived and which cannot exist on this stack.",
+
+  "_assets": "This mod is code and tables. The scene bundle, the prop bundles, the culling and acoustics bakes, the navmesh and the 8MB of authored loot are ASSETS and are not shipped here; without them the slot resolves to a map the client cannot load. See README.md.",
+
+  "//slotId": "The database key of the location slot to rebind. `suburbs` is a stub BSG ships disabled with a real entry in every table keyed by location, which is why hijacking it works where inventing a new id does not. Changing this changes every path this mod writes.",
   "slotId": "suburbs",
+
+  "//slotObjectId": "The slot's MongoId. NOT interchangeable with slotId: the map screen localises `<_Id> Name` and `<_Id> Description`, so this is the id the rebrand keys are built from. Empty here would write a locale entry called \" Name\", which is a rebrand of nothing.",
   "slotObjectId": "5714dc342459777137212e0b",
 
+  "//displayName": "What the map dot and the raid summary say instead of SUBURBS.",
   "displayName": "Icebreaker",
+
+  "//description": "The card text under the name on the map screen.",
   "description": "The nuclear icebreaker BOREAS, locked in arctic ice.",
+
+  "//scenePath": "Base.Scene.path -- the bundle the client loads. Scene loading is data-driven, so this one field is the whole handoff from `the server says the map is here` to `the client loads it`. The bundle is not shipped by this mod.",
   "scenePath": "maps/icebreaker.bundle",
+
+  "//sceneRcid": "Base.Scene.rcid, the preset asset inside that bundle.",
   "sceneRcid": "icebreaker.scenespreset.asset",
 
+  "//enabled": "Whether the dot appears on the map screen at all. The slot's entry stays in the /client/locations response either way -- deleting it would break transits from other maps, which resolve their TARGET through the location list.",
   "enabled": true,
+
+  "//disabledForScav": "Player scavs cannot deploy here.",
   "disabledForScav": true,
+
+  "//disabledScavExits": "IGNORED, and kept only so an existing config does not look like it lost a setting. This is now built from `scavDisabled` in data/exits.json, so that renaming an exit cannot leave the exit list and the scav restriction disagreeing. The game's own shape for it is a comma-separated string rather than an array, which is why it looked out of place here.",
   "disabledScavExits": "Cellars,Gate 0",
+
+  "//insurance": "Insurance returns work on this map.",
   "insurance": true,
+
+  "//safeLocation": "A safe location is one you cannot lose gear on. False: this is a raid map.",
   "safeLocation": false,
+
+  "//openZones": "The bot zones the map declares, comma-separated. Every wave and boss spawn in data/waves.json must name one of these, and the self-test checks that they do -- a wave pointed at a zone the scene has no BotZone for never spawns and nothing anywhere reports it.",
   "openZones": "ZoneIcebreaker",
 
+  "//mapTables": "Write the exits, waves and boss spawns from data/. ON, and it should stay on: the suburbs stub ships `exits: []`, so with this off the map is a raid you cannot leave except by dying.",
+  "mapTables": true,
+
+  "//exitsFile": "The exit table, under data/. Its `Name` fields are the keys the exfil trigger in the scene, the extraction panel and the raid-end ExitName all match on. If a scene bundle turns out to use different trigger names, correct them in this file -- nothing in code knows them.",
+  "exitsFile": "exits.json",
+
+  "//wavesFile": "The scav waves and boss spawns, under data/. 11 waves totalling 34 bot slots as shipped, tuned for a 50-minute raid on a ship: fewer bodies than Shoreline, more pressure than Factory.",
+  "wavesFile": "waves.json",
+
+  "//bossSpawns": "Write the boss spawns from wavesFile. OFF by default: a boss on a map whose loot tables are empty is a fight for nothing. Turn it on once the authored loot is in.",
+  "bossSpawns": false,
+
+  "//spawnPointsFile": "A JSON array of SpawnPointParams records, under data/, for an install that HAS the scene. Empty by default and nothing is invented in its place -- a spawn point is nothing but coordinates, and an invented one puts the player inside the hull or under the ice. This is the one map table this port cannot ship; `aowl run mods/icebreaker` says so with the reason and with what closing it would take.",
+  "spawnPointsFile": "",
+
+  "//arcticWeather": "Ask for arctic weather and a winter season. It will be REFUSED, out loud, with the reason -- and it is a switch rather than a silent omission so that asking for it produces an explanation instead of nothing. The database's weather table is one record for the whole install and nothing in /client/weather is keyed by map, so writing a winter sky here would put snow over Customs and Streets too; and the backend refuses a second registration of an exact route, so this mod cannot answer /client/weather for its own map either.",
+  "arcticWeather": false,
+
+  "//escapeTimeLimit": "Raid length in minutes. The stub ships 0, which is a raid that ends immediately.",
   "escapeTimeLimit": 50,
+  "//escapeTimeLimitCoop": "The same for a coop raid.",
   "escapeTimeLimitCoop": 50,
+  "//escapeTimeLimitPVE": "The same for PvE.",
   "escapeTimeLimitPVE": 50,
+
+  "//minPlayers": "Lower bound of the matchmaking band. Cosmetic offline.",
   "minPlayers": 1,
+  "//maxPlayers": "Upper bound of the same band.",
   "maxPlayers": 3,
+  "//maxCoopGroup": "Largest coop group the map advertises.",
   "maxCoopGroup": 6,
+  "//requiredPlayerLevelMin": "Lowest character level the map screen offers this map to.",
   "requiredPlayerLevelMin": 0,
+  "//requiredPlayerLevelMax": "Highest.",
   "requiredPlayerLevelMax": 100,
+  "//averagePlayerLevel": "The `average level` figure on the map card. Cosmetic.",
   "averagePlayerLevel": 60,
+  "//averagePlayTime": "The `average time` figure on the map card, in minutes. Cosmetic.",
   "averagePlayTime": 50,
 
+  "//iconX": "Where the dot sits on the world map, horizontally. 91 is top-left coastal, which is where an arctic icebreaker belongs.",
   "iconX": 91,
+  "//iconY": "The same, vertically.",
   "iconY": 747,
 
+  "//botCap": "How many AI may be alive at once. Written to locations.<slot>.base.BotMax and BotMaxPvE, which is where the client reads it -- the stub ships 0, and a map with a cap of zero spawns none of the waves above. It used to be written to configs.bot.maxBotCap, a path a stock database does not have and nothing reads, so the cap was never actually set on any install.",
   "botCap": 40,
+
+  "//maxBotPerZone": "How many AI may be alive in one bot zone. This map declares one zone, so it is effectively a second cap and the lower of the two wins. Raising botCap without raising this does nothing.",
   "maxBotPerZone": 2,
+
+  "//botStop": "Seconds into the raid after which no further waves spawn. 2400 is 40 minutes of a 50-minute raid, so the last ten are yours.",
   "botStop": 2400,
 
+  "//globalLootChanceModifier": "Multiplies loose-loot spawn probability for this map. 0.27 is upstream's, tuned against its authored loot tables -- which are not shipped here, so on a stock install it multiplies an empty table by 0.27 and the answer is still empty.",
   "globalLootChanceModifier": 0.27,
+
+  "//globalContainerChanceModifier": "The same for static containers.",
   "globalContainerChanceModifier": 1.0,
 
+  "//exitLocaleKey": "IGNORED. Exit locale strings now come from data/locales.json, which is checked against data/exits.json in both directions -- an exit with no locale prints its raw id at the player, and a locale entry for an exit that no longer exists hides the next rename. Kept so an existing config does not look like it lost a setting.",
   "exitLocaleKey": "Icebreaker_Exit_Heli",
+  "//exitLocaleName": "IGNORED, as above.",
   "exitLocaleName": "Helicopter",
+
+  "//rebrandLocales": "Write the locale strings into every language the database carries. English text in every language beats a raw key showing through on a loading screen. Off, and the map dot keeps saying SUBURBS.",
   "rebrandLocales": true,
 
+  "//lockUntilQuestComplete": "Hide the map until a quest is done. This is applied at the DATABASE level and is therefore GLOBAL -- on or off for the install, not per profile. Upstream did it per profile inside its own copy of /client/locations; that route belongs to mods/tarkov here and the backend refuses a second registration of an exact route, so there is no output filter to hook. The per-profile answer is still computed and served at /icebreaker/state.",
   "lockUntilQuestComplete": false,
+
+  "//finalQuestId": "The quest that unlocks it. With lockUntilQuestComplete on and this empty, the map is left OPEN -- which is what an unauthored chain should do.",
   "finalQuestId": "",
 
+  "//crossingWatch": "Record which profiles have come back alive from this map. `Extract from the icebreaker once` is not a quest start condition any server evaluates -- Quest, Level, TraderStanding and TraderLoyalty are the whole vocabulary -- so the fact is watched and stored instead, and answered at /icebreaker/state.",
   "crossingWatch": true,
+
+  "//crossingGateQuests": "The quests gated on that crossing. The gate EVALUATION is here and answers at /icebreaker/state; the filtering of /client/quest/list is not, for the same route-ownership reason as the map lock.",
   "crossingGateQuests": [
     "e857e9c34949ecbf1cf5a5b2",
     "6a752a6bc498772c6a150baf",
@@ -52,7 +126,10 @@
     "6a7e0916b881de241018539d"
   ],
 
+  "//bundlePrefix": "The asset-bundle namespace upstream ships under. Informational; nothing here serves bundles.",
   "bundlePrefix": "manimal/",
+
+  "//bundles": "The bundle keys the client needs, served at /icebreaker/bundles. The bundles themselves are files this mod does not ship and cannot serve -- this ABI has no static-file route. Naming them is still worth doing: a client that knows which keys to expect can say WHICH one is missing instead of failing to load the scene with no reason given.",
   "bundles": [
     "manimal/hovercraft.bundle",
     "manimal/icebreaker_keypad.bundle",

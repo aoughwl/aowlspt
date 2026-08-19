@@ -3,10 +3,31 @@
   "registry": {
     "id": "aowl.registry.official",
     "name": "aowlspt official registry",
-    "description": "Every mod built in this repository, plus the lists that name them. One file with one git history, so a mod list is a document you can send someone."
+    "description": "Every mod built in this repository, plus the lists that name them. One file with one git history, so a mod list is a document you can send someone.",
+    "revision": 2,
+    "updated": "2026-08-18"
   },
 
   "mods": [
+    {
+      "id": "aowl.manager",
+      "name": "Mod Manager",
+      "author": "aowlspt",
+      "version": "1.0.0",
+      "description": "Reads this file, resolves it against your selection, and serves the result under /aowlspt/mods so the mod list can be read and changed while the game runs. It is in the registry so that it appears on its own panel and so that nothing reports it as an unmanaged stray; it is in aowl.list.core so that no list can leave it out.",
+      "pipeline": ">=0.1.0",
+      "sides": ["server", "sim"],
+      "source": { "kind": "intree", "path": "mods/manager", "url": null },
+      "artifact": { "dir": "manager", "library": "manager.dll" },
+      "upstream": null,
+      "license": "see repository",
+      "download": null,
+      "requires": [],
+      "conflicts": [],
+      "provides": ["aowl.capability.modmanager"],
+      "loadAfter": [],
+      "tags": ["core", "manager"]
+    },
     {
       "id": "aowl.tarkov",
       "name": "Tarkov Emulator",
@@ -80,7 +101,7 @@
       "requires": [],
       "conflicts": [],
       "provides": ["aowl.capability.botbrains"],
-      "loadAfter": ["aowl.morebots"],
+      "loadAfter": ["aowl.morebots", "aowl.icebreaker"],
       "tags": ["bots", "ai"]
     },
     {
@@ -106,7 +127,7 @@
       "id": "aowl.classicmovement",
       "name": "Classic Movement",
       "author": "TheBoogle (ported by savannt)",
-      "version": "1.2.0",
+      "version": "1.3.0",
       "description": "Old Tarkov movement: inertia removed, with the client and server halves in one binary split by side().",
       "pipeline": ">=0.1.0",
       "sides": ["server", "client", "sim"],
@@ -125,7 +146,7 @@
       "id": "aowl.fovfix",
       "name": "FOV Fix",
       "author": "Fontaine (ported by savannt)",
-      "version": "4.0.2",
+      "version": "4.1.0",
       "description": "Field of view that stays where you put it, including while aiming and while scoped.",
       "pipeline": ">=0.1.0",
       "sides": ["client", "sim"],
@@ -141,10 +162,29 @@
       "tags": ["client", "quality-of-life"]
     },
     {
+      "id": "aowl.perf",
+      "name": "aowl.perf",
+      "author": "savannt",
+      "version": "1.0.0",
+      "description": "Twenty-three engine-level performance settings -- shadows, LOD, textures, physics, frame pacing -- resolved by name at runtime, read back before they are written, and every one of them reversible. Everything is off in its own config as shipped, and it is in no list here for the same reason: a mod that quietly changes what the game looks like is the wrong thing to have arrive switched on.",
+      "pipeline": ">=0.1.0",
+      "sides": ["client", "sim"],
+      "source": { "kind": "intree", "path": "mods/perf", "url": null },
+      "artifact": { "dir": "perf", "library": "perf.dll" },
+      "upstream": null,
+      "license": "see repository",
+      "download": null,
+      "requires": [],
+      "conflicts": [],
+      "provides": ["aowl.capability.enginesettings"],
+      "loadAfter": [],
+      "tags": ["client", "performance"]
+    },
+    {
       "id": "com.savannt.sptsway",
       "name": "SPT-SWAY",
       "author": "savannt",
-      "version": "3.0.0",
+      "version": "3.2.0",
       "description": "Five physical sources of weapon sway -- respiration, cardiac, tremor, postural drift, weapon inertia -- summed, scaled by the shooter's condition and the weapon in their hands, and pushed into the game's rotation springs.",
       "pipeline": ">=0.1.0",
       "sides": ["client", "sim"],
@@ -167,9 +207,10 @@
       "name": "Core",
       "author": "aowlspt",
       "version": "1.0.0",
-      "description": "The server and nothing else. What an install needs to be a game rather than a pipeline.",
+      "description": "The mod manager and the game server, and nothing else. What an install needs to be a game rather than a pipeline. Every other list inherits this one, which is how aowl.manager stays in every selection without the schema needing a flag for it.",
       "inherits": [],
       "entries": [
+        { "id": "aowl.manager", "enabled": true, "note": "the thing reading this file; see registry/README.md on why it is here and never off" },
         { "id": "aowl.tarkov", "enabled": true }
       ]
     },
@@ -178,12 +219,13 @@
       "name": "Vanilla Plus",
       "author": "savannt",
       "version": "1.0.0",
-      "description": "Core, plus the three client mods that change how the game feels without changing what is in it.",
+      "description": "Core, plus the four client mods that change how the game feels without changing what is in it.",
       "inherits": ["aowl.list.core"],
       "entries": [
         { "id": "aowl.fovfix", "enabled": true },
         { "id": "com.savannt.sptsway", "enabled": true },
-        { "id": "aowl.classicmovement", "enabled": true }
+        { "id": "aowl.classicmovement", "enabled": true },
+        { "id": "aowl.perf", "enabled": true, "note": "loaded, but every knob it has is off until you turn one on; it reports frame pacing before it changes anything" }
       ]
     },
     {
@@ -210,7 +252,8 @@
       "entries": [
         { "id": "aowl.fovfix", "enabled": false, "note": "client-only; there is nothing here for it to run in" },
         { "id": "com.savannt.sptsway", "enabled": false, "note": "client-only; there is nothing here for it to run in" },
-        { "id": "aowl.classicmovement", "enabled": false, "note": "the server half only matters with the client half" }
+        { "id": "aowl.classicmovement", "enabled": false, "note": "the server half only matters with the client half" },
+        { "id": "aowl.perf", "enabled": false, "note": "client-only; a headless server has no frames to pace" }
       ]
     }
   ]

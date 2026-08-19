@@ -13,6 +13,7 @@
 import aowlspt
 import aowlspt/json
 import ".." / model/tuning
+import ".." / model/limits
 
 type
   ConfigDoc* = object
@@ -82,6 +83,7 @@ proc readTuning*(d: var ConfigDoc; t: var Tuning) =
   t.globalTimeScale = num(d, "general.rateMultiplier", t.globalTimeScale)
   t.keepVanillaSway = flag(d, "general.keepVanillaSway", t.keepVanillaSway)
   t.outputSmoothing = num(d, "general.outputSmoothingHz", t.outputSmoothing)
+  t.outputCeiling = num(d, "general.maxDeflectionDeg", t.outputCeiling)
 
   # ---- 01 respiration -----------------------------------------------
   t.respEnabled = flag(d, "respiration.enabled", t.respEnabled)
@@ -212,6 +214,8 @@ proc readTuning*(d: var ConfigDoc; t: var Tuning) =
 
   # ---- 12 springs ---------------------------------------------------------
   t.driveGain = num(d, "springs.driveGain", t.driveGain)
+  t.springAccelPerFrame = flag(d, "springs.accelerationPerFrame",
+                               t.springAccelPerFrame)
   t.springOverride = flag(d, "springs.overrideSprings", t.springOverride)
   t.handsRotDamping = num(d, "springs.handsRotationDamping", t.handsRotDamping)
   t.handsRotReturnSpeed = num(d, "springs.handsRotationReturnSpeed", t.handsRotReturnSpeed)
@@ -254,3 +258,18 @@ proc readTuning*(d: var ConfigDoc; t: var Tuning) =
   # the file's own numbers alone, which is what someone who edited the file
   # expects to happen.
   applyPreset(t, t.preset)
+
+proc clampTuning*(t: var Tuning): seq[string] =
+  ## Bring every value inside the range `model/limits` says is safe, and hand
+  ## back a sentence for each one that had to move.
+  ##
+  ## Deliberately *after* the preset, not before: a preset is as capable of
+  ## carrying a bad number as a config file is, and the value that reaches the
+  ## model is the only one worth checking. Deliberately in the game layer rather
+  ## than inside `readTuning`, because the clamping itself is arithmetic and
+  ## lives in `model/` — this is only the call and the log line.
+  result = @[]
+  let n = sanitise(t, result)
+  if n > 0 and result.len == 0:
+    result.add $n & " setting(s) were outside their safe range"
+

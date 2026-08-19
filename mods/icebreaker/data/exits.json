@@ -1,0 +1,82 @@
+{
+  "_comment": "The extraction table for the Icebreaker slot. The `suburbs` stub BSG ships has `exits: []` -- literally none -- so before this file a raid on the rebound slot was a raid you could not leave except by dying. That is the single largest content gap this mod had and it is the one gap on this map that could be closed honestly, because an exit record carries NO world coordinates: the geometry lives in the scene, and the record is matched to it by `Name`. Everything below is shape, timing and rules, all of which are ours to author.",
+
+  "_names": "The `Name` of each entry is the key the exfil trigger in the scene, the extraction panel and the raid-end `ExitName` all match on. These names are the ones upstream's own config already refers to (`Icebreaker_Exit_Heli`/Helicopter, and the Cellars / Gate 0 pair its `disabledScavExits` names). If a scene bundle turns out to use different trigger names, correct them here rather than in code -- `exitsFile` in config.json points at this file and nothing else knows the names.",
+
+  "_locale": "Every `Name` here needs a locale entry or the extraction panel prints the raw string, underscores and all. locales.json beside this file carries one for each, and the self-test checks the two lists against each other rather than trusting them to stay in step.",
+
+  "exits": [
+    {
+      "_note": "The primary PMC extraction: a helicopter off the aft deck. Always available, no cost, a long-ish exfil timer because it is the safe one.",
+      "Name": "Helicopter",
+      "Id": "",
+      "EntryPoints": "Icebreaker",
+      "Chance": 100,
+      "ChancePVE": 100,
+      "Count": 0,
+      "CountPVE": 0,
+      "EventAvailable": false,
+      "ExfiltrationTime": 25,
+      "ExfiltrationTimePVE": 25,
+      "MinTime": 0,
+      "MinTimePVE": 0,
+      "MaxTime": 0,
+      "MaxTimePVE": 0,
+      "PlayersCount": 0,
+      "PlayersCountPVE": 0,
+      "ExfiltrationType": "Individual",
+      "PassageRequirement": "None",
+      "RequirementTip": "",
+      "RequiredSlot": "FirstPrimaryWeapon"
+    },
+    {
+      "_note": "A conditional one: open for the second half of the raid only. MinTime/MaxTime are seconds remaining, counted down, which is why the window is expressed as 0..1500 on a 50-minute raid rather than as 1500..3000 elapsed.",
+      "Name": "Cellars",
+      "Id": "",
+      "EntryPoints": "Icebreaker",
+      "Chance": 75,
+      "ChancePVE": 75,
+      "Count": 0,
+      "CountPVE": 0,
+      "EventAvailable": false,
+      "ExfiltrationTime": 15,
+      "ExfiltrationTimePVE": 15,
+      "MinTime": 0,
+      "MinTimePVE": 0,
+      "MaxTime": 1500,
+      "MaxTimePVE": 1500,
+      "PlayersCount": 0,
+      "PlayersCountPVE": 0,
+      "ExfiltrationType": "Individual",
+      "PassageRequirement": "None",
+      "RequirementTip": "",
+      "RequiredSlot": "FirstPrimaryWeapon"
+    },
+    {
+      "_note": "The ice-side exit. Lower chance, so a raid where neither of the two conditional exits opened is a real and occasional outcome rather than a bug report.",
+      "Name": "Gate 0",
+      "Id": "",
+      "EntryPoints": "Icebreaker",
+      "Chance": 60,
+      "ChancePVE": 60,
+      "Count": 0,
+      "CountPVE": 0,
+      "EventAvailable": false,
+      "ExfiltrationTime": 12,
+      "ExfiltrationTimePVE": 12,
+      "MinTime": 0,
+      "MinTimePVE": 0,
+      "MaxTime": 0,
+      "MaxTimePVE": 0,
+      "PlayersCount": 0,
+      "PlayersCountPVE": 0,
+      "ExfiltrationType": "Individual",
+      "PassageRequirement": "None",
+      "RequirementTip": "",
+      "RequiredSlot": "FirstPrimaryWeapon"
+    }
+  ],
+
+  "_scavExits": "Which of the above a player scav may use. This is NOT a field on the exit -- the game reads it off `Base.DisabledScavExits`, a comma-separated string of exit names, which is why `disabledScavExits` in config.json is a string and looks out of place beside everything else. It is built from the entries here that set `scavDisabled`.",
+  "scavDisabled": ["Cellars", "Gate 0"]
+}

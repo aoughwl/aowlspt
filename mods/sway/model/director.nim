@@ -16,6 +16,7 @@ import filters
 import tuning
 import state
 import sources
+import spring
 
 type
   SwayOutput* = object
@@ -23,6 +24,8 @@ type
     hands*: Vec3
     camera*: Vec3
     multiplier*: float     ## The global multiplier that frame, for the readout.
+    raw*: Vec3             ## `hands` before the output ceiling. What the tuning asked for.
+    clipped*: bool         ## Whether the ceiling had to act this frame.
 
   SwayDirector* = object
     breath*: Respiration
@@ -54,7 +57,9 @@ template newDirector*(): SwayDirector =
     cameraFilter: OnePole(state: Vec3(x: 0.0, y: 0.0, z: 0.0), primed: false),
     last: SwayOutput(hands: Vec3(x: 0.0, y: 0.0, z: 0.0),
                      camera: Vec3(x: 0.0, y: 0.0, z: 0.0),
-                     multiplier: 1.0))
+                     multiplier: 1.0,
+                     raw: Vec3(x: 0.0, y: 0.0, z: 0.0),
+                     clipped: false))
 
 proc onWeaponChanged*(d: var SwayDirector) =
   ## A new weapon means a stale inertia state to throw away, and a smoothing
@@ -109,7 +114,8 @@ proc tick*(d: var SwayDirector; s: var ShooterState; t: Tuning;
   let dt = clampf(dtIn, 0.0005, 0.05)
 
   if not t.enabled:
-    d.last = SwayOutput(hands: Zero3, camera: Zero3, multiplier: 1.0)
+    d.last = SwayOutput(hands: Zero3, camera: Zero3, multiplier: 1.0,
+                        raw: Zero3, clipped: false)
     return d.last
 
   derive(s, t, dt)
@@ -154,17 +160,59 @@ proc tick*(d: var SwayDirector; s: var ShooterState; t: Tuning;
   handsSum = filter(d.handsFilter, handsSum, dt, cutoff)
   cameraSum = filter(d.cameraFilter, cameraSum, dt, cutoff)
 
-  d.last = SwayOutput(hands: handsSum, camera: cameraSum, multiplier: global)
+  # The ceiling, last, on the sum.
+  #
+  # Every source has its own amplitude and several have their own limits, and
+  # none of that bounds the *product*: master intensity, the ADS master, the
+  # stance multiplier, hold fatigue, the exhausted multiplier, a fracture, a
+  # blacked arm and a burst's shot charge all multiply, and a config a player
+  # can edit will eventually be edited into a weapon that leaves the screen.
+  # This is the one number that cannot be multiplied past.
+  #
+  # Applied to the sum rather than per source, and by `clampMagnitude` rather
+  # than per axis, so a clipped frame still points where the unclipped one did.
+  # The camera takes the same ceiling scaled by its coupling, because a view
+  # that is thrown around is worse than a weapon that is.
+  let ceiling = fmax(0.05, t.outputCeiling)
+  let rawHands = handsSum
+  let m2 = sqrMagnitude(handsSum)
+  var clipped = false
+  if m2 > ceiling * ceiling:
+    clipped = true
+    handsSum = clampMagnitude(handsSum, ceiling)
+  let camCeiling = fmax(0.01, ceiling * fmax(0.05, t.cameraCoupling))
+  if sqrMagnitude(cameraSum) > camCeiling * camCeiling:
+    clipped = true
+    cameraSum = clampMagnitude(cameraSum, camCeiling)
+
+  # A non-finite value can only arrive from a tuning that is itself non-finite —
+  # every operation above is a product or a sum of bounded terms otherwise — but
+  # it would reach `AddAcceleration` and put a NaN into the game's spring, which
+  # never comes back out. Refusing the frame is the only safe answer.
+  if not isFinite(handsSum) or not isFinite(cameraSum):
+    d.last = SwayOutput(hands: Zero3, camera: Zero3, multiplier: global,
+                        raw: Zero3, clipped: true)
+    reset(d.handsFilter)
+    reset(d.cameraFilter)
+    reset(d.inertia)
+    return d.last
+
+  d.last = SwayOutput(hands: handsSum, camera: cameraSum, multiplier: global,
+                      raw: rawHands, clipped: clipped)
   result = d.last
 
-proc springImpulse*(v: Vec3; t: Tuning; dt: float): Vec3 =
+proc springImpulse*(v: Vec3; t: Tuning; cal: SpringCal; dt: float): Vec3 =
   ## Model output in degrees -> the acceleration BSG's rotation springs expect.
   ##
-  ## The springs are stepped on the physics clock while the model runs on the
-  ## render clock, so the impulse is normalised to a 60 Hz frame. Without this
-  ## the whole mod would be twice as strong at 120 fps.
+  ## The whole conversion is `degrees * ReturnSpeed * driveGain`, plus a `dt`
+  ## if the spring accumulates raw acceleration rather than acceleration per
+  ## second. Under either form the spring settles at `degrees * driveGain`, at
+  ## any frame rate — which is what the old `* dt * 60` was reaching for and did
+  ## not achieve, because the gain it was paired with had been computed for the
+  ## other form. `model/spring.nim` is the derivation and
+  ## `tuning.DriveGainProvenance` is the short version.
   ##
-  ## `driveGain` is the other half of the conversion, and the one number in
-  ## this mod that has never been verified against the running game — see
-  ## `tuning.DriveGainProvenance`.
-  v * (clampf(dt, 0.0005, 0.05) * 60.0 * t.driveGain)
+  ## `cal` comes off the live spring where `game/live.nim` can read it and off
+  ## this mod's own shipped defaults where it cannot. Nothing in this file knows
+  ## which.
+  v * (impulseScale(cal, dt) * t.driveGain)

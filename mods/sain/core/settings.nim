@@ -123,6 +123,75 @@ type
     suppressionSeekCoverLevel*: float
     suppressionPinnedLevel*: float
     suppressionDecayPerSecond*: float    ## SAIN: SUP_DECAY_AMOUNT/SUP_DECAY_FREQ
+    ## How fast being under fire fills the accumulator. SAIN adds a fixed
+    ## amount per round that passes close, which needs a projectile callback;
+    ## this integrates the game's own `IsUnderFire` bool over time instead and
+    ## reaches the same shape from a sensor that exists.
+    suppressionRisePerSecond*: float
+    ## Added the instant health falls. Being hit is the strongest suppressor
+    ## there is, and it is the one this mod can measure exactly.
+    suppressionOnHit*: float
+    ## Divides the rise. Personality courage, baked in.
+    suppressionResistance*: float
+    ## Once pinned, stay pinned for at least this long. Without it a bot at the
+    ## threshold alternates between cowering and standing up at the decision
+    ## rate, which looks like a seizure.
+    suppressionPinnedMinSeconds*: float
+
+    # -- Hearing (this port's own model; see `core/hearing.nim`) -----------
+    # Multiplies every sound's range. Difficulty and personality both move it.
+    hearingAcuity*: float
+    ## How long a sound stays worth acting on.
+    soundMemorySeconds*: float
+    ## A sound with no line of sight carries this fraction of its open range.
+    ## One number rather than a material model, because the material model
+    ## needs geometry and this does not.
+    hearingOcclusionFactor*: float
+    ## How badly a distant sound is localised, as a fraction of its distance.
+    ## A shot 200 m away gives a direction, not a place, and a bot that walks
+    ## to the exact spot is a bot that has told you it is cheating.
+    hearingPositionError*: float
+
+    # -- Vision acquisition (this port's own; see `core/vision.nim`) -------
+    # Beyond this a bot does not acquire at all, whatever the raycast says.
+    sightMaxDistance*: float
+    ## Awareness gained per second at point-blank range, dead ahead.
+    sightGainPerSecond*: float
+    ## Awareness lost per second with no line of sight.
+    sightLossPerSecond*: float
+    ## Awareness at which the bot may shoot.
+    engageAwareness*: float
+    ## Awareness below which the bot drops back to not-acquired. Separate from
+    ## the engage level on purpose: one threshold is a flicker boundary.
+    dropAwareness*: float
+    ## Seconds between crossing the engage threshold and being allowed to act.
+    reactionTimeBase*: float
+    reactionTimeSpread*: float
+
+    # -- Flanking (this port's own; see `core/flank.nim`) ------------------
+    flankMinDistance*: float
+    flankMaxDistance*: float
+    ## How far off the direct bearing the waypoint sits, in metres.
+    flankArcRadius*: float
+    ## Not again before. A flank that re-decides its side every tick is a bot
+    ## walking on the spot.
+    flankCooldown*: float
+    ## How long a frontal engagement has to have failed before flanking is
+    ## considered at all.
+    flankAfterStalledSeconds*: float
+    flankMinHealth*: float
+    ## Baked in from personality: a Coward does not flank, it leaves.
+    canFlank*: bool
+
+    # -- Extract (SAIN: ExtractDecisionClass) ------------------------------
+    extractHealthThreshold*: float
+    extractAmmoRatio*: float
+    extractMinRaidSeconds*: float
+
+    # -- Squad geometry ----------------------------------------------------
+    # How far apart two bots of the same faction can be and still be treated
+    # as one squad when the game's own group is not readable.
+    squadCohesionRadius*: float
 
     # -- Personality behaviour flags, baked in by `resolvedFor` -----------
     canShiftCoverPosition*: bool
@@ -142,6 +211,13 @@ type
     ## it had no enemy at all — the input that separates a Rat freezing in a
     ## corner from a GigaChad charging the sound.
     hfNone, hfFreeze, hfSearchNow, hfCharge
+
+func narrow01(v: float): float =
+  ## Clamped away from both ends rather than to them: an engage threshold of
+  ## exactly 1.0 is a bot that never shoots and exactly 0.0 is a bot that
+  ## shoots at a rumour, and both are reachable by dividing by a courage
+  ## multiplier if nothing stops them.
+  if v < 0.02: 0.02 elif v > 0.98: 0.98 else: v
 
 func defaultSettings*(): Settings =
   ## SAIN's shipped values where they are plain constants, and a judgement call
@@ -231,6 +307,37 @@ func defaultSettings*(): Settings =
     suppressionSeekCoverLevel: 0.35,
     suppressionPinnedLevel: 0.75,
     suppressionDecayPerSecond: 1.0,
+    suppressionRisePerSecond: 1.4,
+    suppressionOnHit: 0.4,
+    suppressionResistance: 1.0,
+    suppressionPinnedMinSeconds: 1.5,
+
+    hearingAcuity: 1.0,
+    soundMemorySeconds: 25.0,
+    hearingOcclusionFactor: 0.55,
+    hearingPositionError: 0.12,
+
+    sightMaxDistance: 180.0,
+    sightGainPerSecond: 6.0,
+    sightLossPerSecond: 0.9,
+    engageAwareness: 0.55,
+    dropAwareness: 0.2,
+    reactionTimeBase: 0.35,
+    reactionTimeSpread: 0.35,
+
+    flankMinDistance: 12.0,
+    flankMaxDistance: 55.0,
+    flankArcRadius: 14.0,
+    flankCooldown: 12.0,
+    flankAfterStalledSeconds: 5.0,
+    flankMinHealth: 0.6,
+    canFlank: true,
+
+    extractHealthThreshold: 0.25,
+    extractAmmoRatio: 0.15,
+    extractMinRaidSeconds: 300.0,
+
+    squadCohesionRadius: 45.0,
 
     canShiftCoverPosition: true,
     canRushEnemyReloadHeal: true,
@@ -267,6 +374,14 @@ type
     heardFromPeace*: HeardFromPeace
     sneaky*: bool               ## SAIN: Search.Sneaky
     searchBaseTime*: float      ## SAIN: Search.SearchBaseTime
+    ## How well this bot hears. SAIN spreads the same idea over
+    ## `HearingSensitivity` and the per-personality audio ranges.
+    hearing*: float
+    ## Multiplies the reaction delay. A Timmy is slow to act on a contact it
+    ## has already seen, which is most of what makes a Timmy a Timmy.
+    reaction*: float
+    ## Whether the personality will work an angle at all, and how eagerly.
+    flankAffinity*: float
 
 func traitsFor*(p: Personality): PersonalityTraits =
   case p
@@ -276,21 +391,24 @@ func traitsFor*(p: Personality): PersonalityTraits =
                       canShiftCover: false, canRushReloadHeal: true,
                       willSearch: true, willSearchFromAudio: true,
                       heardFromPeace: hfCharge, sneaky: false,
-                      searchBaseTime: 5.0)
+                      searchBaseTime: 5.0,
+                      hearing: 0.8, reaction: 0.7, flankAffinity: 0.1)
   of pGigaChad:
     PersonalityTraits(aggression: 1.6, courage: 1.6, patience: 0.6,
                       grenadeAffinity: 1.2, coverAffinity: 0.6,
                       canShiftCover: true, canRushReloadHeal: true,
                       willSearch: true, willSearchFromAudio: true,
                       heardFromPeace: hfCharge, sneaky: false,
-                      searchBaseTime: 15.0)
+                      searchBaseTime: 15.0,
+                      hearing: 1.15, reaction: 0.55, flankAffinity: 1.3)
   of pChad:
     PersonalityTraits(aggression: 1.3, courage: 1.25, patience: 0.8,
                       grenadeAffinity: 1.1, coverAffinity: 0.85,
                       canShiftCover: true, canRushReloadHeal: true,
                       willSearch: true, willSearchFromAudio: true,
                       heardFromPeace: hfSearchNow, sneaky: false,
-                      searchBaseTime: 25.0)
+                      searchBaseTime: 25.0,
+                      hearing: 1.05, reaction: 0.8, flankAffinity: 1.1)
   of pSnappingTurtle:
     ## Holds cover, then lunges. High aggression *and* high cover affinity is
     ## not a contradiction: the whole character is that it does both.
@@ -299,35 +417,40 @@ func traitsFor*(p: Personality): PersonalityTraits =
                       canShiftCover: true, canRushReloadHeal: true,
                       willSearch: true, willSearchFromAudio: false,
                       heardFromPeace: hfFreeze, sneaky: true,
-                      searchBaseTime: 60.0)
+                      searchBaseTime: 60.0,
+                      hearing: 1.3, reaction: 0.75, flankAffinity: 0.6)
   of pRat:
     PersonalityTraits(aggression: 0.55, courage: 0.8, patience: 2.2,
                       grenadeAffinity: 0.6, coverAffinity: 1.6,
                       canShiftCover: false, canRushReloadHeal: false,
                       willSearch: false, willSearchFromAudio: false,
                       heardFromPeace: hfFreeze, sneaky: true,
-                      searchBaseTime: 120.0)
+                      searchBaseTime: 120.0,
+                      hearing: 1.45, reaction: 1.0, flankAffinity: 0.0)
   of pTimmy:
     PersonalityTraits(aggression: 0.7, courage: 0.6, patience: 0.7,
                       grenadeAffinity: 0.4, coverAffinity: 1.1,
                       canShiftCover: false, canRushReloadHeal: false,
                       willSearch: true, willSearchFromAudio: true,
                       heardFromPeace: hfFreeze, sneaky: false,
-                      searchBaseTime: 45.0)
+                      searchBaseTime: 45.0,
+                      hearing: 0.85, reaction: 1.8, flankAffinity: 0.2)
   of pCoward:
     PersonalityTraits(aggression: 0.35, courage: 0.35, patience: 1.4,
                       grenadeAffinity: 0.5, coverAffinity: 1.8,
                       canShiftCover: true, canRushReloadHeal: false,
                       willSearch: false, willSearchFromAudio: false,
                       heardFromPeace: hfFreeze, sneaky: true,
-                      searchBaseTime: 90.0)
+                      searchBaseTime: 90.0,
+                      hearing: 1.2, reaction: 1.4, flankAffinity: 0.0)
   of pNormal, pNone:
     PersonalityTraits(aggression: 1.0, courage: 1.0, patience: 1.0,
                       grenadeAffinity: 1.0, coverAffinity: 1.0,
                       canShiftCover: true, canRushReloadHeal: true,
                       willSearch: true, willSearchFromAudio: true,
                       heardFromPeace: hfNone, sneaky: false,
-                      searchBaseTime: 40.0)
+                      searchBaseTime: 40.0,
+                      hearing: 1.0, reaction: 1.0, flankAffinity: 0.8)
 
 func resolvedFor*(base: Settings; p: Personality; difficulty: float): Settings =
   ## Bake personality and difficulty into a per-bot copy.
@@ -382,6 +505,46 @@ func resolvedFor*(base: Settings; p: Personality; difficulty: float): Settings =
   # Difficulty sharpens perception rather than behaviour.
   result.minSeenTimeToEngage = base.minSeenTimeToEngage / d
   result.visionSeenTimeout = base.visionSeenTimeout * d
+
+  # --- the three models this port added, resolved the same way as the rest:
+  # once, at spawn, into plain numbers the ladder compares against.
+
+  # Hearing. Personality is the big dial and difficulty a small one, because a
+  # Rat that can hear you two rooms away is a Rat at every difficulty.
+  result.hearingAcuity =
+    base.hearingAcuity * t.hearing * (0.85 + 0.3 * difficulty)
+
+  # Vision acquisition. Difficulty belongs here more than anywhere else in the
+  # file: "harder bots" in every AI mod ever written means "they notice you
+  # sooner and shoot sooner", and saying so in two numbers is better than
+  # spreading it over twenty.
+  result.sightGainPerSecond =
+    base.sightGainPerSecond * (0.55 + 0.9 * difficulty)
+  result.reactionTimeBase =
+    base.reactionTimeBase * t.reaction * (1.6 - 1.1 * difficulty)
+  result.reactionTimeSpread =
+    base.reactionTimeSpread * t.reaction * (1.6 - 1.1 * difficulty)
+  # A braver bot commits on less information.
+  result.engageAwareness = narrow01(base.engageAwareness / t.courage)
+  result.dropAwareness = narrow01(base.dropAwareness / t.courage)
+  if result.dropAwareness >= result.engageAwareness:
+    # The two must stay apart or the pair stops being hysteresis and becomes a
+    # single threshold with two names.
+    result.dropAwareness = result.engageAwareness * 0.5
+
+  # Suppression. Courage resists it; a Coward is pinned by a near miss.
+  result.suppressionResistance = t.courage
+  result.suppressionRisePerSecond = base.suppressionRisePerSecond / t.courage
+
+  # Flanking.
+  result.canFlank = t.flankAffinity > 0.05
+  result.flankCooldown = base.flankCooldown / (0.4 + t.flankAffinity)
+  result.flankArcRadius = base.flankArcRadius * (0.6 + 0.5 * t.flankAffinity)
+  result.flankMinHealth = base.flankMinHealth / t.courage
+
+  # Extract. SAIN's own thresholds are per bot type; the courage dial reaches
+  # the same place -- a brave bot stays in a raid it is losing.
+  result.extractHealthThreshold = base.extractHealthThreshold / t.courage
 
 func rolePersonalityBias*(role: BotRole): Personality =
   ## The personality a bot gets when nothing names one.

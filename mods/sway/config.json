@@ -9,7 +9,9 @@
     "hipfireMultiplier": 1.0,
     "rateMultiplier": 1.0,
     "keepVanillaSway": true,
-    "outputSmoothingHz": 12.0
+    "outputSmoothingHz": 12.0,
+    "_maxDeflectionComment": "A hard ceiling on the model's summed output, in degrees, applied last. Not a taste setting: the stance, fatigue, injury and shot multipliers all compose by multiplication, so the worst state the game can produce is about ninety times the rested one. 1.43 degrees is where the point of aim leaves a 50 cm torso at 20 m.",
+    "maxDeflectionDeg": 6.0
   },
 
   "respiration": {
@@ -151,8 +153,9 @@
   },
 
   "springs": {
-    "_comment": "driveGain converts the model's output in degrees into the impulse BSG's springs expect. It was derived analytically and has never been playtested. If everything feels uniformly too strong or too weak, change general.masterIntensity first.",
-    "driveGain": 8.0,
+    "_comment": "driveGain is a dimensionless trim on a calibration derived from the spring's own ReturnSpeed, read off the live object: 1.0 means one degree of model output becomes one degree of weapon rotation. It replaces an absolute 8.0 that was derived analytically, never playtested, and paired with a frame-rate normalisation computed for the other of the two possible spring forms. accelerationPerFrame is that form: false means BSG's Spring does velocity += acceleration * dt, true means velocity += acceleration, and the two differ by a factor of sixty. Change accelerationPerFrame only if the mod is invisible or violent; change general.masterIntensity for anything else. See model/spring.nim.",
+    "driveGain": 1.0,
+    "accelerationPerFrame": false,
     "overrideSprings": false,
     "handsRotationDamping": 0.55,
     "handsRotationReturnSpeed": 7.0,

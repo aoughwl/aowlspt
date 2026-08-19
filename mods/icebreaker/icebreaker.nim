@@ -11,6 +11,53 @@
 ## is not part of this port.
 ##
 ## ---------------------------------------------------------------------------
+## WHAT IT CHANGES, WHAT IT ASSUMES, AND WHAT IT HAS NEVER BEEN RUN AGAINST
+## ---------------------------------------------------------------------------
+##
+## **What it changes.** Only the server's database, and only these paths:
+##
+##   * `locations.<slotId>.base` — 31 fields merged onto the dormant `suburbs`
+##     stub: its name, description, scene, time limits, player counts, map-dot
+##     coordinates, bot settings and banner list.
+##   * `locations.<slotId>.{looseLoot,staticContainers,staticLoot,staticAmmo}` —
+##     empty but structurally valid, so a raid on the slot starts rather than
+##     walking into a null loot set.
+##   * `locales.global.<every language the database has>` — eight rebrand keys,
+##     so the map dot stops saying SUBURBS.
+##   * `configs.bot.maxBotCap.<slotId>` and, if the database has one to copy,
+##     `configs.location.scavRaidTimeSettings.maps.<slotId>`.
+##
+## Plus four routes of its own under `/icebreaker/`, and a subscription to
+## `tarkov.raid.configured` / `tarkov.raid.ended` that records which profiles
+## have come back from the map. It writes nothing outside those paths and it
+## registers no route the emulator already owns.
+##
+## It also **announces the location it adds** — `aowlspt.locations.changed`
+## when the registration lands, and the same announcement again in answer to
+## `aowlspt.locations.hello`. A mod that decorates every location (SAIN sets
+## each map's `BotLocationModifier`) otherwise decorates the maps that exist
+## when *it* loads, which on a directory-walk load order silently excludes this
+## one. See "Announcing the location" below.
+##
+## **What it assumes about the client.** Nothing, in the sense that matters:
+## **this mod has no client half at all.** It never enters the game's process,
+## it opens no IL2CPP runtime, it binds no method and it has no per-frame path —
+## so there is nothing here to move onto `aowlspt/fast` and the self-test says
+## so with a number rather than a shrug. What it assumes about the *game* is
+## data-shaped and each assumption is one field: that `suburbs` is a slot the
+## client will resolve, that `Base.Scene` is the whole handoff to the client's
+## bundle loader, and that the map screen localises `<_Id> Name` and
+## `<_Id> Description` rather than printing `Base.Name`. Every one of those is
+## a field this mod writes and a reader can check at `/icebreaker/status`.
+##
+## **It has never been run against BSG's game.** Not once. The slot rebinding,
+## the scene handoff and the locale keys are upstream's design and this port's
+## reading of it; nothing here has seen a client load the scene.
+## `aowl run mods/icebreaker` builds and parses back every document offline,
+## which establishes that the JSON is JSON and the fields are the fields — and
+## establishes nothing whatever about what Tarkov does with them.
+##
+## ---------------------------------------------------------------------------
 ## WHAT A MAP MOD ACTUALLY IS
 ## ---------------------------------------------------------------------------
 ##
@@ -83,6 +130,9 @@ import std/strutils
 import aowlspt
 import aowlspt/server
 import aowlspt/json
+import ice/tables
+import ice/pending
+import aowlspt/fast    # `perfCounter` only: this mod has no fast path to bind
 
 const
   ModGuid = "aowl.icebreaker"
@@ -147,6 +197,12 @@ var cfgRebrandLocales = true
 var cfgLockUntilQuestComplete = false
 var cfgFinalQuestId = ""
 
+var cfgMapTables = true
+var cfgBossSpawns = false
+var cfgArcticWeather = false
+var cfgSpawnPointsFile = ""
+var cfgExitsFile = "exits.json"
+var cfgWavesFile = "waves.json"
 var cfgCrossingWatch = true
 var cfgGateQuests: seq[string] = @[]
 var cfgBundles: seq[string] = @[]
@@ -221,6 +277,12 @@ proc loadConfig() =
   cfgLockUntilQuestComplete = setting("lockUntilQuestComplete").asBool(false)
   cfgFinalQuestId = cfgText("finalQuestId", "")
 
+  cfgMapTables = setting("mapTables").asBool(true)
+  cfgBossSpawns = setting("bossSpawns").asBool(false)
+  cfgArcticWeather = setting("arcticWeather").asBool(false)
+  cfgSpawnPointsFile = cfgText("spawnPointsFile", "")
+  cfgExitsFile = cfgText("exitsFile", "exits.json")
+  cfgWavesFile = cfgText("wavesFile", "waves.json")
   cfgCrossingWatch = setting("crossingWatch").asBool(true)
   cfgGateQuests = textList("crossingGateQuests")
   cfgBundles = textList("bundles")
@@ -238,27 +300,51 @@ proc lastDot(s: string): int =
     if s[i] == '.':
       result = i
 
+var gDbProbed = false
+var gDbLoaded = false
+
+proc databaseLoaded(): bool =
+  ## Is there a database to write into at all?
+  ##
+  ## Asked once, and asked with a read. It used to be answered as a side effect
+  ## of the write -- `dbWrite` refusing was how this mod discovered there was no
+  ## database, which is what `gRegistered` and `/icebreaker/status` are built
+  ## on. Buffered writes cannot answer it, so it is asked directly and the two
+  ## concerns come apart: "is there a database" is a fact about the host, and
+  ## "did the write land" is a fact about the flush.
+  if not gDbProbed:
+    gDbProbed = true
+    gDbLoaded = dbRead("locations").ok
+  result = gDbLoaded
+
 proc dbPut(path: string; value: Json): Status =
-  ## Write `value` at `path`, creating the path if it is not there yet.
+  ## Buffer `value` at `path`. It reaches the database at the next `dbFlush()`.
   ##
-  ## `dbWrite` **merges into an object that already exists**: patching
-  ## `locations.suburbs.looseLoot` on a database where that member has never
-  ## been written is refused with "no such database path", which is the right
-  ## call for a patch and the wrong one for a mod that is adding a table. So a
-  ## miss falls back to merging a one-member object into the parent -- and if
-  ## the parent is missing too, into *its* parent, wrapping as it goes.
+  ## The path is created if it is not there yet -- `aowlspt/server`'s `dbWrite`
+  ## does that now, and `ice/pending.nim` folds this mod's writes into one
+  ## document per second-level path first, so the whole registration is three
+  ## calls rather than thirteen. That module's header has the measurement; the
+  ## short version is that a `dbWrite` costs the size of the database (41 MB on
+  ## an import, about 130 ms) and not the size of the patch, so thirteen small
+  ## writes were 1.5 seconds of boot.
   ##
-  ## The recursion stops one segment from the root: the root document itself
-  ## cannot be patched (an empty path locates nothing), so a database with no
-  ## top-level `locations` at all is reported rather than silently skipped.
-  if dbWrite(path, value) == Ok:
-    return Ok
-  let cut = lastDot(path)
-  if cut < 0:
+  ## The status is the one a real write would have returned: `ErrNotFound` when
+  ## there is no database, `Ok` when there is. Every caller here branches on
+  ## exactly that question and none of them branches on when the bytes landed.
+  if not databaseLoaded():
     return ErrNotFound
-  let parent = path.substr(0, cut - 1)
-  let leaf = path.substr(cut + 1)
-  result = dbPut(parent, raw("{\"" & leaf & "\":" & value.text & "}"))
+  pendPut(path, value.text)
+  result = Ok
+
+proc dbFlush() =
+  ## Write everything buffered. Called at the end of the registration and at
+  ## the top of the one route that reads a path this mod writes.
+  if not dirty():
+    return
+  let n = flush()
+  if n > 0:
+    info "icebreaker: " & $n & " database write(s) carrying " &
+         $bufferedWrites() & " buffered change(s)"
 
 proc dbPut(path: string; valueText: string): Status =
   result = dbPut(path, raw(valueText))
@@ -376,35 +462,27 @@ proc lootTables(): Status =
   st = dbPut(root & ".staticAmmo", emptyObject())
   result = st
 
-proc localeDocument(): JsonObject =
-  ## The rebrand. The map screen and the raid summaries print the *locale*
-  ## string for the slot, not `Base.Name` -- `LocationInfoPanel` does
-  ## `(location._Id + " Description").Localized()` -- so without this the dot
-  ## keeps saying SUBURBS and the card keeps advertising the commuter areas of
-  ## Tarkov underneath an Icebreaker banner.
-  result = obj()
-  put(result, cfgSlotObjectId & " Name", cfgDisplayName)
-  put(result, cfgSlotObjectId & " Description", cfgDescription)
-  put(result, "Suburbs", cfgDisplayName)
+var gTables: TableReport
 
-  # The extraction panel prints the exit's own name through the locale, and the
-  # "EXFIL01" tag beside it is generated from the point index rather than from
-  # us. With no entry the raw exit id renders, underscores and all. Renaming the
-  # exit itself is not an option: that name is the key the panel, the exfil
-  # controller and the raid-end ExitName all match on.
-  put(result, cfgExitLocaleKey, cfgExitLocaleName)
-
-  put(result, "icebreaker_cover Name", cfgDisplayName)
-  put(result, "icebreaker_cover Description", cfgDescription)
-  put(result, "blackdiv_banner Name", "Black Division")
-  put(result, "wedge_banner Name", "\"The Wedge's\" Special Squadron")
+proc localeText(): string =
+  ## Every string this mod puts in front of a player, built from
+  ## `data/locales.json`.
+  ##
+  ## It used to be eight `put` calls in this procedure. That was fine until the
+  ## exits arrived: an exit name has to have a locale entry or the extraction
+  ## panel prints the raw id, and a hard-coded list of locale keys cannot be
+  ## checked against `data/exits.json` — where two data files can be, and are,
+  ## in both directions. Moving it to data is what made
+  ## `checkLocaleCoversExits` possible at all.
+  result = localeDocument(readData("locales.json"), cfgSlotObjectId,
+                          cfgDisplayName, cfgDescription, gTables)
 
 proc rebrandLocales(): int =
   ## Written into *every* language the database carries. English text in every
   ## language beats a raw key showing through on the loading screen, and it is
   ## what upstream does.
   result = 0
-  let doc = done(localeDocument())
+  let doc = raw(localeText())
   let globals = dbRead("locales.global")
   var langs: seq[string] = @[]
   if globals.ok and globals.raw.len > 0:
@@ -416,6 +494,117 @@ proc rebrandLocales(): int =
   for lang in langs:
     if dbPut("locales.global." & lang, doc) == Ok:
       inc result
+
+# ---------------------------------------------------------------------------
+# Announcing the location
+# ---------------------------------------------------------------------------
+#
+# A location is not only a row in `locations`. Other mods *decorate* every
+# location: SAIN sets each map's `BotLocationModifier` to 1 so its own
+# difficulty maths is not fought by BSG's per-map skew, and it does that by
+# reading `locations` and writing onto every map it finds. Which maps it finds
+# is decided by the host's load order, and the host's load order is a directory
+# walk -- so on the install `tools/allmods.nim` measures, SAIN loaded three
+# positions before this mod, `locations.suburbs` did not exist yet, and a
+# player raiding the Icebreaker got stock bot behaviour with nothing logged
+# anywhere. Both mods were correct alone. Neither could see the other.
+#
+# The fix is on both sides and neither side depends on the order:
+#
+#   * this mod **announces** `aowlspt.locations.changed` after its writes have
+#     reached the database, naming the slot. A decorator that loaded first is
+#     already subscribed and decorates the slot now.
+#   * this mod **answers** `aowlspt.locations.hello` with the same
+#     announcement. A decorator that loads later asks, and gets told -- which
+#     it needs even though it could read the slot out of the database itself,
+#     because the answer is also how it learns that a location it can see is
+#     one somebody is claiming to own.
+#
+# The event names are deliberately not `icebreaker.*` or `sain.*`. This is a
+# contract between "a mod that adds a location" and "a mod that decorates
+# every location", and the next map mod in this tree should be able to join it
+# by emitting one event.
+
+proc populationBaseline(): JsonObject =
+  ## What this map's numbers are **before any other mod scales them**.
+  ##
+  ## `mods/morebots` raises every map's bot cap and wave slots, and it computes
+  ## them from a shipped `data/vanilla.json` rather than from the live values,
+  ## because the database persists and a live-value multiply compounds on every
+  ## restart -- 30 becomes 45, then 68, then 101, and nothing logs. That file
+  ## covers the nineteen slots a stock database ships, and for `suburbs` it
+  ## holds the dormant stub: `botMax: 0` and two placeholder waves. So a player
+  ## who installs both and asks for `horde` gets a busier raid on eighteen maps
+  ## and stock numbers here, and morebots cannot fix that from its side -- the
+  ## numbers it would have to scale from are the ones this mod just wrote.
+  ##
+  ## This mod does know them, exactly, because it writes them from its own
+  ## shipped data on every boot. Saying so is a dozen lines and it is the only
+  ## place the answer exists. The shape is an entry in morebots'
+  ## `data/vanilla.json`; a mod that has never heard of morebots omits the
+  ## member and morebots names the map as unscaled rather than guessing.
+  ##
+  ## Only the two `slots` fields are declared per wave. They are the only
+  ## fields morebots writes, and it copies every other field of the live record
+  ## through untouched, so declaring more would be describing work nobody does.
+  result = obj()
+  put(result, "name", cfgDisplayName)
+  put(result, "botMax", cfgBotCap)
+  put(result, "botMaxPvE", cfgBotCap)
+  put(result, "maxBotPerZone", cfgMaxBotPerZone)
+  var waves = arr()
+  let wavesText = readData(cfgWavesFile)
+  # A throwaway report: `waveList` counts what it builds, and counting the same
+  # waves a second time into `gTables` would make the boot line claim twice the
+  # waves this mod actually wrote.
+  var scratch = TableReport(exits: 0, scavDisabled: 0, waves: 0, waveSlots: 0,
+                            bosses: 0, localeKeys: 0, problems: 0)
+  let live = whole(waveList(wavesText, cfgOpenZones, scratch))
+  if isArray(live):
+    for w in each(live):
+      var e = obj()
+      put(e, "slotsMin", child(w, "slots_min").asInt(0))
+      put(e, "slotsMax", child(w, "slots_max").asInt(0))
+      add(waves, done(e))
+  put(result, "waves", waves)
+
+proc announcement(): JsonObject =
+  ## The payload, built separately from the emit so the self-test can check it
+  ## on a host with no other mod to hear it. A subscriber reads `locations` and
+  ## nothing else has to be understood, which is what makes this joinable.
+  ##
+  ## `population` is the optional second half of the contract: a decorator that
+  ## scales bot counts needs to know what this map's numbers were before it
+  ## touched them, and no subscriber can work that out by reading the database
+  ## after the fact. See `populationBaseline` above.
+  var ids = arr()
+  add(ids, cfgSlotId)
+  var pop = obj()
+  put(pop, cfgSlotId, populationBaseline())
+  result = obj()
+  put(result, "guid", ModGuid)
+  put(result, "reason", "registered")
+  put(result, "locations", ids)
+  put(result, "population", pop)
+
+proc announceLocation(): Status =
+  ## Say that `cfgSlotId` is here. Called after `dbFlush`, never before: an
+  ## announcement a subscriber cannot read back is worse than none, because the
+  ## subscriber's only sane response is to skip the map.
+  result = broadcast("aowlspt.locations.changed", announcement())
+
+proc onLocationsHello(payload: string): string =
+  ## A decorator that loaded after this mod did, asking who owns a location.
+  ##
+  ## Answered unconditionally rather than only the first time, for the reason
+  ## `morebots.onHello` gives: two decorators both want an answer, and the
+  ## second one's announcement is the only one it will ever see. Not answered
+  ## when the registration failed -- there is no location to decorate then, and
+  ## naming one that is not in the database would send the asker looking for it.
+  result = ""
+  if not gRegistered:
+    return ""
+  discard announceLocation()
 
 # ---------------------------------------------------------------------------
 # Crossings
@@ -486,6 +675,7 @@ proc onStatus(url, body, session: string): string =
   put(o, "botCap", cfgBotCap)
   put(o, "crossingsRecorded", gCrossings)
   put(o, "registered", gRegistered)
+  dbFlush()
   let registered = dbRead(basePath() & ".Scene.path")
   put(o, "sceneInDatabase", registered.ok)
   result = done(o).text
@@ -540,6 +730,139 @@ proc onCrossings(url, body, session: string): string =
 # Load
 # ---------------------------------------------------------------------------
 
+proc writeMapTables(): bool =
+  ## The exits, the waves and the boss spawns — the three tables that turn a
+  ## registered slot into a map you can actually play a raid on.
+  ##
+  ## The `suburbs` stub ships `exits: []` and two placeholder waves, so before
+  ## this the rebound slot was a dot on the map screen that opened onto a raid
+  ## with nobody in it and no way out. See `ice/tables.nim` for why these three
+  ## are shippable and `SpawnPointParams` is not.
+  ##
+  ## Written as whole arrays, which is right: `dbWrite` replaces an array rather
+  ## than merging into one, and these tables are this mod's to own on this slot.
+  ## The slot is dormant in every stock database, so there is nobody else's work
+  ## here to preserve.
+  gTables = TableReport(exits: 0, scavDisabled: 0, waves: 0, waveSlots: 0,
+                        bosses: 0, localeKeys: 0, problems: 0)
+  if not cfgMapTables:
+    info "icebreaker: mapTables is off, so the exits, waves and boss spawns " &
+         "were not written. The slot keeps whatever it already had, which on " &
+         "a stock database is no exits at all."
+    return false
+  result = false
+  let base1 = basePath()
+
+  let exitsText = readData(cfgExitsFile)
+  let exits = exitList(exitsText, gTables)
+  if exits.len > 2:
+    if dbPut(base1 & ".exits", raw(exits)) == Ok:
+      result = true
+    let scav = scavDisabledString(exitsText, gTables)
+    discard dbPut(base1 & ".DisabledScavExits", raw(quoted(scav)))
+
+  let wavesText = readData(cfgWavesFile)
+  let waves = waveList(wavesText, cfgOpenZones, gTables)
+  if waves.len > 2:
+    if dbPut(base1 & ".waves", raw(waves)) == Ok:
+      result = true
+
+  if cfgBossSpawns:
+    let bosses = bossList(wavesText, cfgOpenZones, gTables)
+    if bosses.len > 2:
+      discard dbPut(base1 & ".BossLocationSpawn", raw(bosses))
+  else:
+    info "icebreaker: bossSpawns is off (the default). A boss on a map whose " &
+         "loot tables are empty is a fight for nothing; turn it on once you " &
+         "have dropped the authored loot in."
+
+  checkLocaleCoversExits(readData("locales.json"), exitsText, gTables)
+  # Counts the locale strings into the same report, so one line covers every
+  # table this mod owns rather than three quarters of them.
+  discard localeText()
+
+  if gTables.problems > 0:
+    warn "icebreaker: " & $gTables.problems & " problem(s) in the map " &
+         "tables; run `aowl run mods/icebreaker` for the detail"
+  else:
+    success "icebreaker: map tables written -- " & describe(gTables)
+
+var gSlotWasThere = false
+var gSlotSpawnPoints = -1
+  ## What the database held for the slot *before* this mod wrote anything: was
+  ## there a slot at all, and how many spawn points did it come with. -1 means
+  ## "not asked yet", which is not the same as "none".
+
+proc probeSlot() =
+  ## The one assumption in this mod that is about a table it did not write.
+  ##
+  ## Everything in this file's header rests on `suburbs` being a dormant slot
+  ## BSG already ships: that is what makes `GetLocation("suburbs")`, the raid
+  ## configuration, insurance and the scav timings resolve with no patching.
+  ## `dbPut` *creates* a path that is not there, so on a database with no such
+  ## slot this mod used to report "suburbs rebound to Icebreaker" while
+  ## actually inventing a location out of the 31 fields below -- no spawn
+  ## points, and no entry in any of the sibling tables keyed by location. That
+  ## is a different and much weaker claim, and it should be said rather than
+  ## discovered in a raid.
+  let stub = dbRead(basePath())
+  gSlotWasThere = stub.ok and stub.raw.len > 0
+  gSlotSpawnPoints = 0
+  if gSlotWasThere:
+    let existing = field(stub.raw, "SpawnPointParams")
+    if exists(existing) and isArray(existing):
+      gSlotSpawnPoints = count(existing)
+    info "icebreaker: locations." & cfgSlotId & " is in this database with " &
+         $keys(whole(stub.raw)).len & " base field(s) and " &
+         $gSlotSpawnPoints & " spawn point(s); rebinding it"
+  else:
+    warn "icebreaker: locations." & cfgSlotId & " is NOT in this database, " &
+         "so this is not a rebind of a dormant slot -- it is a new location " &
+         "made of the fields this mod writes and nothing else. Every table " &
+         "keyed by location (spawn points, insurance, scav timings) has no " &
+         "entry for it, and the client has to resolve an id BSG never " &
+         "shipped. That is the failure mode this mod exists to avoid; check " &
+         "that the database is a real dump and that slotId names a slot it has."
+
+proc writeSpawnPoints(): bool =
+  ## The one table that cannot be shipped, and the refusal said out loud.
+  ##
+  ## `spawnPointsFile` lets an install that *has* the scene supply the array.
+  ## Nothing is invented when it is absent: an invented spawn point puts the
+  ## player inside the hull.
+  result = false
+  if gSlotSpawnPoints > 0 and cfgSpawnPointsFile.len == 0:
+    # The refusal below is a claim about this database, not a constant, and on
+    # a database whose stub already carries spawn points it would be false.
+    # Measured every boot rather than asserted once: `SpawnPointParams` is
+    # empty on every stub in the dumps this was checked against (suburbs,
+    # terminal, town, privatearea all ship zero), and a dump where it is not is
+    # a dump where this mod has nothing to refuse.
+    success "icebreaker: the " & cfgSlotId & " slot already carries " &
+            $gSlotSpawnPoints & " spawn point(s), so nothing is missing here " &
+            "and nothing was written over them"
+    return false
+  if cfgSpawnPointsFile.len > 0:
+    let text = readData(cfgSpawnPointsFile)
+    if text.len > 2 and isArray(whole(text)):
+      let n = count(whole(text))
+      if dbPut(basePath() & ".SpawnPointParams", raw(text)) == Ok:
+        success "icebreaker: " & $n & " spawn point(s) loaded from data/" &
+                cfgSpawnPointsFile
+        return true
+    warn "icebreaker: spawnPointsFile names data/" & cfgSpawnPointsFile &
+         ", which is missing or is not a JSON array. Nothing was written -- " &
+         "an invented spawn point is worse than none."
+  warn "icebreaker: " & spawnPointsNote()
+
+proc refuseWeather() =
+  ## An arctic map on a stack whose sky is a constant. Refused with the reason
+  ## rather than shipped as a switch that does nothing.
+  if not cfgArcticWeather:
+    return
+  error "icebreaker: arcticWeather is on and this mod cannot honour it. " &
+        weatherNote()
+
 proc registerLocation(): Status =
   ## Always returns `Ok`, and that is deliberate.
   ##
@@ -549,6 +872,7 @@ proc registerLocation(): Status =
   ## routes down with it, so a status endpoint could not even be asked what
   ## went wrong. It degrades instead: the failure is logged once, `gRegistered`
   ## records it, and `/icebreaker/status` answers `false` for anyone who asks.
+  probeSlot()
   let st = dbPut(basePath(), done(locationBase()))
   if st != Ok:
     gRegistered = false
@@ -568,21 +892,73 @@ proc registerLocation(): Status =
          "files over locations." & cfgSlotId & ".{looseLoot,staticLoot," &
          "staticContainers} to replace them"
 
-  # The alive-bot cap. An unlisted map falls through to the shared default,
-  # which on this map truncates the late trigger waves -- squads arriving short,
-  # and half-built bots where a spawn was cut off partway. 40 is the trigger
-  # table's own ceiling.
-  if dbPut("configs.bot.maxBotCap." & cfgSlotId, $cfgBotCap) == Ok:
-    info "icebreaker: alive-bot cap for " & cfgSlotId & " set to " & $cfgBotCap
-  else:
-    info "icebreaker: no bot config in this database; the cap was not written"
+  discard writeMapTables()
+  discard writeSpawnPoints()
+  refuseWeather()
+
+  # The alive-bot cap, written where something actually reads it.
+  #
+  # This used to write `configs.bot.maxBotCap.<slot>` and log a shrug when that
+  # failed, which it always did: a stock SPT 4.x database has no top-level
+  # `configs` object at all, so the write had nowhere to land and the cap was
+  # never set on any install, ever. The stub ships `BotMax: 0` and
+  # `MaxBotPerZone: 0`, and a map with a cap of zero is a map with no bots on
+  # it -- so the whole wave table above would have been written into a location
+  # that could not spawn a single one of them.
+  #
+  # `locations.<slot>.base.BotMax` is the field the client reads, and
+  # /client/locations serves it verbatim. The old path is still written after
+  # it, because an install that does have a `configs` object is not this mod's
+  # to break.
+  var caps = obj()
+  put(caps, "BotMax", cfgBotCap)
+  put(caps, "BotMaxPvE", cfgBotCap)
+  if dbPut(basePath(), done(caps)) == Ok:
+    info "icebreaker: alive-bot cap for " & cfgSlotId & " set to " & $cfgBotCap &
+         " in locations." & cfgSlotId & ".base (BotMax/BotMaxPvE), which is " &
+         "where the client reads it"
+  discard dbPut("configs.bot.maxBotCap." & cfgSlotId, $cfgBotCap)
 
   # Scav raid timings are keyed by map id; without an entry the lookup misses.
-  let factory = dbRead("configs.location.scavRaidTimeSettings.maps.factory4_day")
-  if factory.ok and factory.raw.len > 0:
-    discard dbPut("configs.location.scavRaidTimeSettings.maps." & cfgSlotId,
-                  factory.raw)
-    info "icebreaker: scav raid timings cloned from factory4_day"
+  #
+  # The donor is not hard-coded to `factory4_day` any more, and the miss is not
+  # silent any more. `configs` is a table this mod did not write: SPT's dump
+  # has it, the emulator's database does not, and the 39 MiB import this was
+  # checked against has no top-level `configs` object at all -- so the clone
+  # never once happened on that install and said nothing about it. Preferring
+  # factory4_day when it is there keeps the old behaviour exactly; falling back
+  # to whatever map the table does carry is what makes it work on a dump that
+  # is keyed differently; and saying so when the table is absent is what turns
+  # "the timings are wrong and nobody knows why" into one line at boot.
+  const TimingRoot = "configs.location.scavRaidTimeSettings.maps"
+  var donor = ""
+  var donorRaw = ""
+  let preferred = dbRead(TimingRoot & ".factory4_day")
+  if preferred.ok and preferred.raw.len > 0:
+    donor = "factory4_day"
+    donorRaw = preferred.raw
+  else:
+    let all = dbRead(TimingRoot)
+    if all.ok and all.raw.len > 0:
+      let doc = whole(all.raw)
+      if doc.isObject:
+        for id in doc.keys():
+          if id == cfgSlotId:
+            continue
+          let entry = child(doc, id)
+          if isObject(entry):
+            donor = id
+            donorRaw = raw(entry)
+            break
+  if donor.len > 0:
+    discard dbPut(TimingRoot & "." & cfgSlotId, donorRaw)
+    info "icebreaker: scav raid timings cloned from " & donor
+  else:
+    info "icebreaker: this database has no " & TimingRoot & " table, so " &
+         "there were no scav raid timings to clone for " & cfgSlotId &
+         ". A player scav raid on the slot falls back to whatever the server " &
+         "does for a map it has no timings for; on the emulator that is the " &
+         "normal case and not a problem."
 
   if cfgRebrandLocales:
     let n = rebrandLocales()
@@ -603,15 +979,328 @@ proc registerLocation(): Status =
            cfgFinalQuestId & " is complete. Per-profile locking needs a " &
            "route filter this ABI does not have; /icebreaker/state carries " &
            "the per-session answer"
+  dbFlush()
+  # After the flush, so that a decorator woken by this can read the slot back.
+  # See "Announcing the location" above for why this exists at all.
+  if gRegistered:
+    discard announceLocation()
   result = Ok
+
+# ---------------------------------------------------------------------------
+# The self-test
+# ---------------------------------------------------------------------------
+#
+#     aowl run mods/icebreaker                # --side sim
+#
+# Before this existed, `aowl run mods/icebreaker` printed one line -- "icebreaker
+# is a server mod" -- and stopped. That was true and it was also the whole
+# output, so nothing about this mod was checkable without a backend and a
+# database. Every document below is built out of config and arithmetic, which
+# means all of it *is* checkable with neither.
+#
+# **There is no client half and there are no IL2CPP bindings.** This mod's whole
+# content is database writes and four routes: it rebinds the dormant `suburbs`
+# location slot, points it at a scene, rebrands its locale strings and watches
+# raid events. None of that runs in the game's process, so there is no per-frame
+# path, nothing to bind, and nothing to move onto `aowlspt/fast`. What is
+# measured instead is the cost of the work this mod *does* do per request and
+# per raid end, on the same `perfCounter` clock a client mod measures a frame
+# with -- because "there is no hot path here" is a claim, and a claim with a
+# number beside it is a better one.
+
+proc checkDoc(name: string; text: string; wantMembers: int): int =
+  ## One built document, parsed back with `aowlspt/json` and counted.
+  ##
+  ## Round-tripping is the point: these documents are assembled by string
+  ## concatenation in `aowlspt/server`'s builder, so an unescaped quote in a
+  ## config value produces text that is not JSON at all and would be written
+  ## into the database as garbage. `keys` refuses to parse it here instead.
+  result = 0
+  let ks = keys(whole(text))
+  if ks.len != wantMembers:
+    error "  " & name & ": parsed back with " & $ks.len &
+          " members, expected " & $wantMembers &
+          " -- a config value probably contains something that broke the JSON"
+    return 1
+  success "  " & name & ": " & $ks.len & " members, " & $text.len & " bytes"
+
+proc simSelfTest(): Status =
+  info "Icebreaker self-test (--side sim)"
+  var bad = 0
+
+  # --- the documents, all of which are pure config plus arithmetic.
+  bad = bad + checkDoc("locations." & cfgSlotId & ".base",
+                       done(locationBase()).text, 31)
+  bad = bad + checkDoc("/icebreaker/status", onStatus("", "", "sim"), 13)
+  bad = bad + checkDoc("/icebreaker/bundles", onBundles("", "", "sim"), 1)
+  bad = bad + checkDoc("/icebreaker/state", onState("", "", "sim-session"), 5)
+  bad = bad + checkDoc("/icebreaker/crossings", onCrossings("", "", "sim"), 1)
+  bad = bad + checkDoc("aowlspt.locations.changed", done(announcement()).text, 4)
+
+  # --- the population baseline the announcement carries.
+  #
+  # Checked against the tables this mod actually writes rather than against
+  # itself: a baseline that disagrees with the waves on the map is worse than
+  # no baseline at all, because morebots would scale from it and write numbers
+  # that are wrong by a fixed factor with nothing to compare them to.
+  block popCheck:
+    let pop = child(whole(done(announcement()).text), "population")
+    let mine = child(pop, cfgSlotId)
+    if not mine.found:
+      error "  the location announcement carries no population baseline for " &
+            cfgSlotId & ", so morebots cannot apply its preset to this map " &
+            "and every other map in the install would be scaled while this " &
+            "one stayed at stock"
+      inc bad
+      break popCheck
+    let cap = child(mine, "botMax").asInt(0)
+    let zone = child(mine, "maxBotPerZone").asInt(0)
+    let ws = child(mine, "waves")
+    var slots = 0
+    for w in each(ws):
+      slots = slots + child(w, "slotsMax").asInt(0)
+    if cap != cfgBotCap or zone != cfgMaxBotPerZone:
+      error "  the announced baseline says botMax " & $cap & " / perZone " &
+            $zone & " and this mod writes " & $cfgBotCap & " / " &
+            $cfgMaxBotPerZone
+      inc bad
+      break popCheck
+    # Against the wave list this mod builds from its own data file, and -- on a
+    # host that has actually written the tables -- against what it wrote. In
+    # the simulator there is no database, so `gTables` is still zero and only
+    # the first comparison is available; checking a zero against a real count
+    # would fail every offline run for the wrong reason.
+    var scratch2 = TableReport(exits: 0, scavDisabled: 0, waves: 0,
+                               waveSlots: 0, bosses: 0, localeKeys: 0,
+                               problems: 0)
+    discard waveList(readData(cfgWavesFile), cfgOpenZones, scratch2)
+    var wroteWaves = scratch2.waves
+    var wroteSlots = scratch2.waveSlots
+    if gTables.waves > 0:
+      wroteWaves = gTables.waves
+      wroteSlots = gTables.waveSlots
+    if count(ws) != wroteWaves or slots != wroteSlots:
+      error "  the announced baseline has " & $count(ws) & " wave(s) and " &
+            $slots & " slot(s); this mod writes " & $wroteWaves & " and " &
+            $wroteSlots & ". A decorator scaling from a baseline that does " &
+            "not match the map writes numbers that are wrong by a constant " &
+            "factor and looks like it worked"
+      inc bad
+      break popCheck
+    success "  the announcement declares this map's stock population -- cap " &
+            $cap & ", per-zone " & $zone & ", " & $count(ws) & " wave(s) " &
+            "totalling " & $slots & " slot(s) -- which is the only place " &
+            "that answer exists: morebots scales from a shipped baseline and " &
+            "its baseline for this slot is the dormant stub, and reading the " &
+            "live values instead would compound on every restart"
+
+  # The announcement is only worth anything if a subscriber can get the slot id
+  # back out of it, so that is what is checked rather than that it parses.
+  let announced = child(whole(done(announcement()).text), "locations")
+  if not exists(announced) or not isArray(announced) or
+     count(announced) != 1 or at(announced, 0).asText("") != cfgSlotId:
+    error "  the location announcement does not name " & cfgSlotId &
+          " in a `locations` array; a decorator subscribed to " &
+          "aowlspt.locations.changed would learn nothing from it"
+    inc bad
+  else:
+    success "  aowlspt.locations.changed names " & cfgSlotId &
+            ", so a mod that decorates every location -- SAIN's per-map " &
+            "BotLocationModifier is the one this was built for -- reaches " &
+            "this map whether it loaded before this mod or after it"
+
+  # --- the map tables, which are the difference between a dot on the map
+  # screen and a raid. This is the part `checkDoc` cannot express: the counts
+  # matter, and so does whether the exits and the locale strings agree with
+  # each other. A table that half-loaded is the failure mode -- a map with two
+  # of its three exits still lets you extract, so nothing looks wrong.
+  gTables = TableReport(exits: 0, scavDisabled: 0, waves: 0, waveSlots: 0,
+                        bosses: 0, localeKeys: 0, problems: 0)
+  let exitsText = readData(cfgExitsFile)
+  let wavesText = readData(cfgWavesFile)
+  let localesText = readData("locales.json")
+
+  let exitsDoc = exitList(exitsText, gTables)
+  let scavStr = scavDisabledString(exitsText, gTables)
+  let wavesDoc = waveList(wavesText, cfgOpenZones, gTables)
+  let bossDoc = bossList(wavesText, cfgOpenZones, gTables)
+  let localeDoc = localeDocument(localesText, cfgSlotObjectId, cfgDisplayName,
+                                 cfgDescription, gTables)
+  checkLocaleCoversExits(localesText, exitsText, gTables)
+
+  if gTables.exits == 0:
+    error "  no exits loaded. The suburbs stub ships an empty exit list, so " &
+          "this is a raid you cannot leave except by dying -- which is the " &
+          "single largest gap this mod had and the one it can close"
+    inc bad
+  if gTables.waves == 0:
+    error "  no waves loaded; the map has the stub's two placeholders and " &
+          "nothing else on it"
+    inc bad
+  if gTables.problems > 0:
+    error "  " & $gTables.problems & " problem(s) in the shipped map tables"
+    bad = bad + gTables.problems
+  else:
+    success "  map tables: " & describe(gTables)
+    info "    every exit has a name, a chance in 0..100, a non-zero " &
+         "exfiltration timer and all " & $ExitFields.len & " fields the " &
+         "client indexes; every wave names a role a wave may legally carry " &
+         "and spawns into `" & cfgOpenZones & "`, the zone this location " &
+         "declares; every boss record carries all " & $BossSpawnFields.len &
+         " fields including the four whose almost-right spellings " &
+         "(BossDifficulty, IsBossPlayer, IsRandomTimeSpawn, " &
+         "BossEscortDifficulty) deserialise to nothing without a word"
+
+  # Every built table parsed back, because they are assembled by string
+  # concatenation and a stray quote in a config value is text that is not JSON.
+  if count(whole(exitsDoc)) != gTables.exits:
+    error "  the exit array did not round-trip: built " & $gTables.exits &
+          " and parsed back " & $count(whole(exitsDoc))
+    inc bad
+  if count(whole(wavesDoc)) != gTables.waves:
+    error "  the wave array did not round-trip"
+    inc bad
+  if keys(whole(localeDoc)).len != gTables.localeKeys:
+    error "  the locale document did not round-trip"
+    inc bad
+  else:
+    success "  " & $gTables.localeKeys & " locale string(s) built from " &
+            "data/locales.json and parsed back, covering the slot name and " &
+            "description, the bare `Suburbs` key, every exit name, the " &
+            "banner captions and the bot zone"
+  if scavStr.len == 0:
+    warn "  no exits are closed to player scavs"
+  else:
+    info "  DisabledScavExits -> \"" & scavStr & "\" (a comma-separated " &
+         "string, not an array; that is the game's shape and it is why the " &
+         "config key for it looks out of place)"
+  if bossDoc.len > 2 and not cfgBossSpawns:
+    info "  " & $gTables.bosses & " boss spawn(s) are shipped and are OFF " &
+         "(bossSpawns is false): a boss on a map whose loot tables are empty " &
+         "is a fight for nothing"
+
+  # --- and the two tables that are not shipped, said here rather than only in
+  # README.md, because the output is what somebody reads first.
+  warn "  " & spawnPointsNote()
+  warn "  " & lootNote()
+  warn "  " & weatherNote()
+
+  # The scene is the single field that turns "the server says the map is here"
+  # into "the client loads it", so it is checked by name rather than counted.
+  let scene = done(sceneObject()).text
+  if field(scene, "path").asText("").len == 0 or
+     field(scene, "rcid").asText("").len == 0:
+    error "  Base.Scene has an empty path or rcid; the client would have " &
+          "nothing to load and the map would be a dot that opens onto nothing"
+    inc bad
+  else:
+    success "  Base.Scene -> " & field(scene, "path").asText("") & " / " &
+            field(scene, "rcid").asText("")
+
+  # The locale rebrand is keyed on the slot's *object* id, not its string id,
+  # because that is what `LocationInfoPanel` localises. An empty one would
+  # write `" Name"` into every language.
+  if cfgSlotObjectId.len == 0:
+    error "  slotObjectId is empty; the locale keys would be \" Name\" and " &
+          "\" Description\", which is a rebrand of nothing"
+    inc bad
+  else:
+    success "  locale keys \"" & cfgSlotObjectId & " Name\" and \"" &
+            cfgSlotObjectId & " Description\", plus the bare \"Suburbs\""
+
+  # --- the database. On the simulator there is none, and that is the answer.
+  let probe = dbRead("locations." & cfgSlotId)
+  if probe.ok:
+    info "  a database is attached; registering into it"
+    discard registerLocation()
+  else:
+    warn "  no database on this host (" & lastError() & "), so nothing was " &
+         "written. That is what the server half needs and what the simulator " &
+         "does not have -- registerLocation degrades to a logged failure and " &
+         "/icebreaker/status answers registered:false, which is the same " &
+         "behaviour as a backend started without --db."
+
+  # --- the crossing watch, which is the one piece of state this mod keeps.
+  if storeReady():
+    gCurrentLocation = cfgSlotId
+    var payload = obj()
+    put(payload, "profile", "selftest-profile")
+    discard onRaidEnded(done(payload).text)
+    if hasCrossed("selftest-profile"):
+      success "  a raid end on " & cfgSlotId &
+              " recorded a crossing and it read back"
+    else:
+      error "  a raid end on " & cfgSlotId & " did not record a crossing"
+      inc bad
+    # A raid end on a different map must not count, or every quest gated on
+    # coming back from the icebreaker unlocks on the first Customs run.
+    gCurrentLocation = "bigmap"
+    var other = obj()
+    put(other, "profile", "selftest-elsewhere")
+    discard onRaidEnded(done(other).text)
+    if hasCrossed("selftest-elsewhere"):
+      error "  a raid end on bigmap was recorded as a crossing of " & cfgSlotId
+      inc bad
+    else:
+      success "  a raid end on another map was correctly ignored"
+    gCurrentLocation = ""
+  else:
+    warn "  no persistent store on this host, so the crossing watch could " &
+         "not be exercised; on a host without one the gates reopen every boot"
+
+  # --- what this mod does not ship, said in the output rather than only in the
+  # module comment, because the output is what somebody reads first.
+  info "  not shipped, and why:"
+  info "    the scene bundle, the prop bundles, the navmesh and acoustics " &
+       "bakes -- assets, not code; " & $cfgBundles.len &
+       " bundle key(s) are named at /icebreaker/bundles so a client can say " &
+       "which one is missing"
+  info "    the authored loot tables -- 8MB of extracted coordinates; empty " &
+       "but valid tables are seeded so a raid starts, and dropping the real " &
+       "files over the same paths needs no code change because dbWrite merges"
+  info "    the banner images -- this ABI has no static-file route, so the " &
+       "banner entries are written and the pictures are the install's problem"
+  info "    per-profile map locking and quest visibility -- /client/locations " &
+       "and /client/quest/list belong to mods/tarkov and the backend refuses " &
+       "a second registration of an exact route; the per-session answers are " &
+       "served at /icebreaker/state instead"
+
+  # --- cost. There is no frame here; there is a request.
+  const Iterations = 2000
+  let t0 = perfCounter()
+  var i = 0
+  var total = 0
+  while i < Iterations:
+    total = total + done(locationBase()).text.len
+    inc i
+  let per = nanosBetween(t0, perfCounter()) div int64(Iterations)
+  info "  cost: building the location base document is " & $per &
+       " ns (" & $(total div Iterations) & " bytes). There is no per-frame " &
+       "path in this mod at all -- it is a server mod, it never enters the " &
+       "game's process, and it has nothing to bind. The comparable number " &
+       "for a client mod is docs/PERF.md's 6-10 ns per bound call."
+
+  if bad == 0:
+    success "Icebreaker self-test: every document built and parsed back"
+    result = Ok
+  else:
+    error "Icebreaker self-test: " & $bad & " problem(s)"
+    result = ErrGeneric
 
 proc onLoad(): Status =
   loadConfig()
   success ModName & " " & ModVersion & " loaded on " & hostName()
+  if side() == sideSim:
+    return simSelfTest()
   if side() != sideServer:
     info "icebreaker is a server mod; the scene and its assets are the " &
          "client's half and are not code"
     return Ok
+
+  # Subscribed before the location is registered, so that a decorator which
+  # loaded earlier and is still on the stack cannot ask a question this mod is
+  # not yet listening for.
+  discard onEvent("aowlspt.locations.hello", onLocationsHello)
 
   discard registerLocation()
 

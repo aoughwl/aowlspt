@@ -20,6 +20,18 @@
 ##  * **The set is kept, not rebuilt.** Points persist across ticks and are
 ##    re-scored against the enemy's new position; SAIN rebuilds far more often
 ##    than the world changes.
+##
+## **Where the points come from is `core/probe.nim`**, and it did not exist
+## until recently. Everything in this file has been written, tested and
+## unreachable since the first version of the mod, for the single reason that
+## nothing produced a `CoverPoint`: a candidate needs a raycast, a raycast is a
+## Unity call, and there was no legal thread to make one from. There is now.
+## `probe.planProbe` says where to look, `client/coverprobe.nim` casts the rays
+## from inside an `onMainThread` job, and `probe.ingest` merges the answers
+## into a `CoverSet` -- keeping each point's *identity* across samples, which
+## is what makes the dwell hysteresis in `choose` below mean anything at all.
+## Nothing in this file changed to make that work, which is the part worth
+## noticing.
 
 import vec
 import types

@@ -13,6 +13,53 @@
 ## camping the Labs extracts.
 ##
 ## ---------------------------------------------------------------------------
+## WHAT IT CHANGES, WHAT IT ASSUMES, AND WHAT IT HAS NEVER BEEN RUN AGAINST
+## ---------------------------------------------------------------------------
+##
+## **What it changes.** On the **server**, through morebots and `dbWrite`:
+## six bot type documents and their loadout overlays, one faction definition,
+## eleven hostility relations (which are edits to the difficulty documents'
+## `ENEMY_BOT_TYPES` lists), one locale string, three achievements, and the
+## spawn tables on ten maps — rebuilt at the end of every raid so the next one
+## is not the last one again. It writes nothing outside those paths.
+##
+## On the **client**, nothing at all — deliberately, and it says so out loud
+## rather than by omission. The client half is a **read-only watch**: every few
+## seconds it walks the world's alive-player list on the fast path and reports
+## how many Black Division bots are in the raid and how far the nearest is.
+## That is not a consolation prize; see `bd/watch.nim`. Every part of *making*
+## the squad arrive is server data, and before this file nothing could tell a
+## squad that never spawned from one that spawned 700 m away — both read as
+## "the mod does nothing".
+##
+## An earlier revision of this file had a client half that logged one line about
+## what could not be done and then did nothing. Everything in that line was true
+## and it was being used as a reason to ship an inert side, which is a different
+## claim.
+##
+## **What it assumes about the client.** Nine members, every one bound against
+## the object it is reached on rather than against a name, because the chain is
+## subclasses and generics throughout (`List<IPlayer>` has no name `findClass`
+## accepts). One thing is asserted rather than inferred and it is guarded:
+## `get_Position` returns a twelve-byte `Vector3` that Win64 hands back through
+## a hidden pointer, bound with `bindRaw` only after the runtime confirms a
+## value type of a non-register size — with even the object-header size
+## calibrated from `System.Int32` and `System.Double` rather than assumed.
+##
+## The one identification assumption is stated at its call site too: a Black
+## Division bot is recognised by its **first name**, from this mod's own shipped
+## `data/types/*.json`, because the six role ids cannot reach the client (see
+## below) and a nickname can. It is a strong signal and not a proof — another
+## mod could in principle put "Anvil" in a name table — so the watch reports how
+## many matched rather than asserting who they are.
+##
+## **It has never been run against BSG's game.** Not once. Every `EFT.` name in
+## `bd/watch.nim` is from the pre-1.0 C# surface; post-1.0 is a different build.
+## `aowl run mods/blackdivision` checks the data, drives the whole registration
+## with no backend, exercises the Win64 shape rule exhaustively and prints the
+## binding report offline — and establishes nothing whatever about the names.
+##
+## ---------------------------------------------------------------------------
 ## How this reaches morebots
 ## ---------------------------------------------------------------------------
 ##
@@ -46,8 +93,10 @@
 ## loadouts, hostility, the locale string, the achievements, and the spawn tables
 ## — including re-rolling them at the end of every raid.
 ##
-## **Client (`sideClient`).** Nothing but a line in the log, and that is not this
-## port being lazy. See below.
+## **Client (`sideClient`).** A read-only watch for the squad this mod spawns —
+## see `bd/watch.nim`. It writes nothing into the game, because everything the
+## original changed there needs a mechanism post-1.0 does not have; the reasons
+## are below and none of them is this port being lazy.
 ##
 ## ---------------------------------------------------------------------------
 ## What is deliberately missing, and why
@@ -77,7 +126,12 @@
 ## suppressed night vision for Black Division bots. It was already dead upstream
 ## — `BotOwner_0` was removed in SPT 4.1.2, so it could no longer tell which bot
 ## it was looking at, and the shipped version returns unconditionally. There is
-## nothing to port, and `hook()` could not override a return value if there were.
+## nothing to port. And the second half of what this comment used to say was
+## wrong and is corrected rather than quietly deleted: `hookArgs` + `stopWith`
+## **can** override a return value now. What is still missing is knowing *which
+## instance* the method fired on, so the only night-vision suppression
+## expressible here would apply to every bot in the raid — which is worse than
+## leaving it alone.
 ##
 ## **The WTT libraries.** `WTT-ServerCommonLib` supplied three services and all
 ## three are done here directly, because each turned out to be one `dbWrite`:
@@ -104,6 +158,10 @@ import bd/data
 import bd/dbpath
 import bd/types
 import bd/spawns
+import bd/validate
+import bd/watch
+import aowlspt/game    # `whenReady` -- the client half waits for a world
+import aowlspt/fast    # `perfCounter` -- the clock the watch reports on
 
 const
   ModGuid = "aowl.blackdivision"
@@ -115,6 +173,12 @@ var gArmory = false
 var gCsGas = false
 var gAchievements = true
 var gSawMorebots = false
+var gHostileScavs = true
+var gHostileRogues = true
+var gHostilePmcs = true
+var gHostileInfected = true
+var gHostileRuaf = true
+var gRevenge = true
 
 # Declared empty and filled in `readConfig`, not initialised here. A global in a
 # `--app:lib` build whose initialiser is a *call* is silently left zeroed —
@@ -196,19 +260,39 @@ proc applyLoadouts() =
     discard broadcast("morebots.type.overlay", overlayFor(pair, patch))
     info "blackdivision: CS-gas grenades added to Wedge and the raiders"
 
-proc applyRelations() =
-  ## Eleven relations, and the order within them does not matter — but both
-  ## directions of each pairing do. Black Division against the world, and the
-  ## world against Black Division.
-  let enemies = ["savage", "rogues", "usec", "bear", "infected"]
+proc applyRelations(): int =
+  ## Both directions of each pairing, and each one behind its own switch.
+  ##
+  ## The switches are per *faction group* rather than per relation, because
+  ## "should Black Division fight the scavs" is a question a player has an
+  ## opinion about and "should relation seven of eleven be applied" is not.
+  ##
+  ## Turning one off stops this mod asking. It does not un-ask: `ENEMY_BOT_TYPES`
+  ## is a union that several mods write into and this one does not own it, so
+  ## removing an id would be this mod deciding on somebody else's behalf. That
+  ## is stated in config.json rather than left to be discovered.
+  result = 0
+  var enemies: seq[string] = @[]
+  if gHostileScavs: enemies.add "savage"
+  if gHostileRogues: enemies.add "rogues"
+  if gHostilePmcs:
+    enemies.add "usec"
+    enemies.add "bear"
+  if gHostileInfected: enemies.add "infected"
   for f in enemies:
     discard broadcast("morebots.faction.relate", relationTypesToward(f))
     discard broadcast("morebots.faction.relate", relationFactionTowardBd(f))
-  discard broadcast("morebots.faction.relate", relationRevengeOwn())
-  # Optional, and asked for unconditionally: a relation naming a faction that
+    result = result + 2
+  if gRevenge:
+    discard broadcast("morebots.faction.relate", relationRevengeOwn())
+    inc result
+  # Optional, and asked for without checking: a relation naming a faction that
   # does not exist is a warning in morebots' log and nothing else, which is a
   # better trade than this mod trying to detect another mod it cannot see.
-  discard broadcast("morebots.faction.relate", relationTypesToward("ruaf"))
+  if gHostileRuaf:
+    discard broadcast("morebots.faction.relate",
+                      relationTypesToward("ruaf", optional = true))
+    inc result
 
 # ---------------------------------------------------------------------------
 # The things morebots is not responsible for
@@ -218,13 +302,21 @@ proc applyLocales() =
   ## `ScavRole/BlackDiv` is what the kill feed and the end-of-raid screen show
   ## instead of the raw role name. One string, and without it a player sees
   ## `ScavRole/BlackDiv` written out literally.
+  ## Both files in one write. Two writes into the same path cost twice the size
+  ## of the database and produce the document a single merged patch produces --
+  ## see `bd/spawns.nim` for the measurement.
+  var d = newDoc()
   let en = readData("locales/en.json")
   if en.len > 2:
-    discard dbPut("locales.global.en", en)
+    for m in members(whole(en)):
+      setRaw(d, m.name, m.value)
   if gAchievements:
     let ach = readData("locales/achievements-en.json")
     if ach.len > 2:
-      discard dbPut("locales.global.en", ach)
+      for m in members(whole(ach)):
+        setRaw(d, m.name, m.value)
+  if d.fields.len > 0:
+    discard dbPut("locales.global.en", text(d))
 
 proc applyAchievements() =
   ## Three hidden kill-count achievements — 4, 12 and 50 Black Division
@@ -280,13 +372,45 @@ proc onMorebotsReady(payload: string): string =
   info "blackdivision: morebots is up; registering Black Division"
   # Order matters here and only here: the faction must exist before a relation
   # can name it, and a bot type must exist before a relation can edit it.
+  let t0 = perfCounter()
   discard broadcast("morebots.faction.define", factionDefinition())
   registerTypes()
+  let tTypes = perfCounter()
   applyLoadouts()
-  applyRelations()
+  let tLoadouts = perfCounter()
+  let rel = applyRelations()
+  let tRelations = perfCounter()
+  debugLog $rel & " hostility relation(s) applied"
+
+  # "I have finished registering." morebots buffers every write a dependent
+  # causes and folds them into two `dbWrite` calls; this is what tells it the
+  # burst is over, so the database is complete *before* the backend starts
+  # listening rather than one server tick after. A morebots that has never
+  # heard of this event ignores it and flushes on its own timer instead, so
+  # sending it is safe against any version.
+  discard broadcast("morebots.flush", objOf("guid", ModGuid))
+  let tFlush = perfCounter()
+
   applyLocales()
   applyAchievements()
+  let tData = perfCounter()
   rerollSpawns("load")
+  let tSpawns = perfCounter()
+
+  # Printed every load rather than behind the debug switch. This mod's
+  # registration was fifty seconds of one 41 MB document being copied four
+  # hundred times, and the only reason it went unnoticed for so long is that
+  # nothing ever said how long it took.
+  info "blackdivision: registered in " &
+       $int(nanosBetween(t0, tSpawns) div 1_000_000'i64) & " ms (types " &
+       $int(nanosBetween(t0, tTypes) div 1_000_000'i64) & ", loadouts " &
+       $int(nanosBetween(tTypes, tLoadouts) div 1_000_000'i64) &
+       ", relations " &
+       $int(nanosBetween(tLoadouts, tRelations) div 1_000_000'i64) &
+       ", flush " & $int(nanosBetween(tRelations, tFlush) div 1_000_000'i64) &
+       ", locales+achievements " &
+       $int(nanosBetween(tFlush, tData) div 1_000_000'i64) & ", spawns " &
+       $int(nanosBetween(tData, tSpawns) div 1_000_000'i64) & ")"
   result = ""
 
 proc onRaidEnded(payload: string): string =
@@ -326,16 +450,120 @@ proc readConfig() =
   if dbg.ok and dbg.raw.len > 1:
     gDebug = field(dbg.raw, "logs").asBool(false)
 
+  # One `setting()` per top-level key and the nesting read out of the raw text,
+  # for the same reason as `debug` above: the config reader takes a single
+  # top-level name and a dotted one is ErrNotFound on every host.
+  let host1 = setting("hostility")
+  if host1.ok and host1.raw.len > 1:
+    let h = whole(host1.raw)
+    gHostileScavs = child(h, "scavs").asBool(true)
+    gHostileRogues = child(h, "rogues").asBool(true)
+    gHostilePmcs = child(h, "pmcs").asBool(true)
+    gHostileInfected = child(h, "infected").asBool(true)
+    gHostileRuaf = child(h, "ruaf").asBool(true)
+    gRevenge = child(h, "revenge").asBool(true)
+
   let spawns = setting("spawns")
   if spawns.ok and spawns.raw.len > 1:
     gConfig = readSpawnConfig(spawns.raw)
   else:
     warn "blackdivision: no 'spawns' in config.json; using the defaults"
 
+# ---------------------------------------------------------------------------
+# The client half
+# ---------------------------------------------------------------------------
+#
+# Read-only, and see `bd/watch.nim` for why that is the useful thing rather than
+# the consolation prize. Everything that *makes* the squad arrive is server data
+# in `bd/spawns.nim`; whether it arrived is a fact about a live raid, and before
+# this the mod had no way to tell a squad that never spawned from one that
+# spawned 700 m away on the far side of Streets. Both read as "the mod does
+# nothing".
+
+var gWatchIntervalMs = 5000
+var gLastWatchMs = 0'i64
+var gWatchBound = false
+var gWatchReported = false
+var gSeenOurs = false
+var gWorld = whenReady("EFT.GameWorld")
+
+proc sightingJson(s: Sighting): string =
+  var names = arr()
+  for i in 0 ..< s.names.len:
+    add(names, s.names[i])
+  var o = obj()
+  put(o, "ok", s.ok)
+  put(o, "aiAlive", s.aiAlive)
+  put(o, "ours", s.ours)
+  put(o, "unreadableNicknames", s.unreadable)
+  put(o, "haveDistance", s.haveDistance)
+  put(o, "nearest", s.nearest)
+  put(o, "scanNs", int(s.scanNs))
+  put(o, "names", names)
+  result = done(o).text
+
+proc watchTick() =
+  if not gWatchBound:
+    if not openWatch():
+      return
+    loadNames()
+    watchBind()
+    gWatchBound = true
+  let now = nowMs()
+  if gLastWatchMs != 0'i64 and now - gLastWatchMs < int64(gWatchIntervalMs):
+    return
+  gLastWatchMs = now
+
+  let s = runWatch()
+  if not s.ok:
+    return
+  if not gWatchReported:
+    gWatchReported = true
+    watchReport()
+  if s.ours > 0:
+    if not gSeenOurs:
+      gSeenOurs = true
+      success "blackdivision: the squad is in the raid -- " & describe(s)
+    else:
+      info "blackdivision: " & describe(s)
+    discard emit("blackdivision.client.present", sightingJson(s))
+  else:
+    debugLog describe(s)
+
+proc onMorebotsCensus(payload: string): string =
+  ## `mods/morebots` publishes a census of every alive bot by spawn type. This
+  ## mod cares about one line of it: whether any *custom* spawn type reached the
+  ## client. If one ever did, the six role ids below would mean something on the
+  ## client and the identification in `bd/watch.nim` could stop going through
+  ## nicknames -- so it is worth noticing rather than assuming for ever.
+  if field(payload, "customSpawnTypes").asInt(0) > 0:
+    warn "blackdivision: morebots reports a custom spawn type reached the " &
+         "client. That contradicts what both mods' module comments say is " &
+         "possible post-1.0; the nickname match in bd/watch.nim could be " &
+         "replaced by a role match if it holds up."
+  result = ""
+
 proc onLoadClient(): Status =
-  info "blackdivision: nothing runs on the client post-1.0 — the six roles " &
-       "cannot be added to WildSpawnType without managed assemblies, and the " &
-       "hunt layer needs BigBrain. The faction is entirely server-side."
+  ## What the original client half did -- six `WildSpawnType` members appended
+  ## by a prepatcher, and a BigBrain hunt layer -- is still out of reach
+  ## post-1.0 and is still said plainly. What is not out of reach is observing
+  ## whether the squad this mod spawns actually turned up, and that is what runs
+  ## here. It writes nothing into the game.
+  gWatchIntervalMs = setting("watchIntervalMs").asInt(5000)
+  if gWatchIntervalMs < 500:
+    gWatchIntervalMs = 500
+  loadNames()
+  discard onEvent("morebots.client.census", onMorebotsCensus)
+  info "blackdivision: the client half cannot add the six role ids to " &
+       "WildSpawnType (native constants, switch tables already compiled) and " &
+       "has no BigBrain to host the hunt layer -- see the module comment. " &
+       "What it does instead is watch for the squad by the " & $nameCount() &
+       " first name(s) in this mod's own bot templates, every " &
+       $gWatchIntervalMs & " ms, read-only."
+  if nameCount() == 0:
+    warn "blackdivision: no first names were loaded from data/types/, so the " &
+         "watch cannot recognise anything. Check that data/ shipped beside " &
+         "the binary."
   Ok
 
 proc onLoadServer(): Status =
@@ -354,10 +582,363 @@ proc onLoadServer(): Status =
   discard afterMs(3000, checkMorebots)
   Ok
 
+# ---------------------------------------------------------------------------
+# The self-test
+# ---------------------------------------------------------------------------
+#
+#     aowl run mods/blackdivision            # --side sim
+#
+# Before this existed the simulator ran the server half and printed "waiting for
+# morebots", then unloaded with "never registered" -- which is the *correct*
+# behaviour with no morebots present and is also no information at all about
+# whether this mod works.
+#
+# Three halves are checked here, because the mod has three:
+#
+#  * **The data.** Six bot types, their templates, their loadouts, the locale
+#    and the achievements are files shipped beside the binary. A missing or
+#    malformed one is a bot that spawns with fallback appearance, and it is
+#    decidable here rather than in a raid.
+#  * **The registration.** morebots is not present under the simulator, so the
+#    handshake is driven by hand: this mod is told `morebots.ready` and every
+#    document it then broadcasts is built and parsed back.
+#  * **The client watch.** Its bindings are reported, its Win64 shape rule is
+#    exercised exhaustively, and its name table is checked against the files it
+#    came from. `selfTestRuntime` in config.json points it at any
+#    `GameAssembly.dll` for a real binding report offline.
+
+proc simSelfTest(): Status =
+  info "Black Division self-test (--side sim)"
+  var bad = 0
+
+  seedRandom(nowMs())
+  readConfig()
+
+  # --- the data files, each one named so a miss is actionable.
+  let all = allTypes()
+  var files: seq[string] = @[]
+  for t in all:
+    var have = false
+    for f in files:
+      if f == t.templateFile: have = true
+    if not have: files.add t.templateFile
+    have = false
+    for f in files:
+      if f == t.configFile: have = true
+    if not have: files.add t.configFile
+    if t.loadoutFile.len > 0:
+      have = false
+      for f in files:
+        if f == t.loadoutFile: have = true
+      if not have: files.add t.loadoutFile
+  files.add "locales/en.json"
+  files.add "achievements/BD_achievements.json"
+  var missing = 0
+  for f in files:
+    let text = readData(f)
+    if text.len == 0:
+      error "  data/" & f & " is missing or empty"
+      inc missing
+    elif keys(whole(text)).len == 0 and each(whole(text)).len == 0:
+      error "  data/" & f & " is not a JSON object or array"
+      inc missing
+  if missing == 0:
+    success "  all " & $files.len & " shipped data file(s) read and parsed"
+  else:
+    error "  " & $missing & " of " & $files.len & " data file(s) unusable; " &
+          "bots would spawn with fallback appearance and loadouts"
+    bad = bad + missing
+
+  # --- and now what is *in* them, which is the part a parse cannot answer.
+  #
+  # Parsing says the bytes are JSON. It says nothing about whether the faction
+  # is complete, and an incomplete faction still spawns -- see the header of
+  # bd/validate.nim. So: every template id checked for shape, every equipment
+  # slot checked against the fourteen the game has, every pool checked for a
+  # weight that can actually roll, every chance checked against a pool, every
+  # name checked for a duplicate. Counts are printed rather than a verdict,
+  # because "ok" cannot tell forty loadouts from three.
+  var rep = Report(files: 0, equipmentSlots: 0, equipmentIds: 0, modRoots: 0,
+                   modRefs: 0, ammoCalibers: 0, ammoRounds: 0, chanceKeys: 0,
+                   names: 0, badIds: 0, badSlots: 0, badWeights: 0,
+                   orphanChances: 0, orphanPools: 0, duplicates: 0,
+                   problems: 0)
+
+  var templates: seq[string] = @[]
+  for t in all:
+    if not templates.contains(t.templateFile):
+      templates.add t.templateFile
+  for tf in templates:
+    inc rep.files
+    checkTemplate("data/" & tf, readData(tf), rep)
+
+  # A loadout is checked against the chances of the template it lands on, so
+  # a chance the template already carries is not reported as missing.
+  var sharedChances = chanceKeysOf(readData(SharedTemplate))
+  for t in all:
+    if t.loadoutFile.len == 0:
+      continue
+    inc rep.files
+    var tmplChances = sharedChances
+    if t.templateFile != SharedTemplate:
+      tmplChances = chanceKeysOf(readData(t.templateFile))
+    checkLoadout("data/" & t.loadoutFile, readData(t.loadoutFile),
+                 tmplChances, rep)
+  inc rep.files
+  checkLoadout("data/loadouts/armory-blackdivassault.json",
+               readData("loadouts/armory-blackdivassault.json"),
+               sharedChances, rep)
+
+  inc rep.files
+  checkAchievements("data/achievements/BD_achievements.json",
+                    readData("achievements/BD_achievements.json"),
+                    readData("locales/achievements-en.json"), rep)
+
+  # Every role has a distinct id and a distinct name, or the faction graph
+  # disagrees with itself: `relate` resolves a name to an id, and two names
+  # sharing an id makes one of them unreachable.
+  var seenIds: seq[int] = @[]
+  var seenNames: seq[string] = @[]
+  for t in all:
+    var dupId = false
+    for i in seenIds:
+      if i == t.id: dupId = true
+    if dupId:
+      error "  two roles share the WildSpawnType id " & $t.id
+      inc rep.duplicates
+      inc rep.problems
+    else:
+      seenIds.add t.id
+    if seenNames.contains(t.name):
+      error "  two roles are both called " & t.name
+      inc rep.duplicates
+      inc rep.problems
+    else:
+      seenNames.add t.name
+    if t.loadoutFile.len == 0:
+      warn "  " & t.name & " has no loadout file, so it wears whatever the " &
+           "shared template carries -- which for this mod is nothing"
+      inc rep.problems
+
+  info "  data: " & summarise(rep)
+  if rep.problems == 0:
+    success "  every template id is well-formed, every equipment slot is one " &
+            "of the " & $EquipmentSlots.len & " the game has, every pool has " &
+            "a weight that can roll, and no id or name is used twice"
+  else:
+    error "  " & $rep.problems & " content problem(s): " & $rep.badIds &
+          " malformed id(s), " & $rep.badSlots & " unknown slot(s), " &
+          $rep.badWeights & " unrollable pool(s), " & $rep.duplicates &
+          " duplicate(s). These do not crash anything -- they make the " &
+          "faction quietly worse, which is why they are checked here"
+    bad = bad + rep.problems
+  if rep.orphanChances > 0 or rep.orphanPools > 0:
+    info "  " & $rep.orphanChances & " chance(s) with no pool beside them " &
+         "and " & $rep.orphanPools & " pool(s) with no chance beside them; " &
+         "both inherit from the shared template, which is legal and is worth " &
+         "seeing"
+
+  # --- the spawn config, which is the whole of what makes the squad arrive.
+  if gConfig.huntMaps.len == 0:
+    error "  no hunt maps configured; the squad has nowhere to spawn and the " &
+          "mod would do nothing at all"
+    inc bad
+  else:
+    success "  " & $gConfig.huntMaps.len & " hunt map(s), " &
+            $gConfig.chance & "% chance, squads of " & $gConfig.minHuntSize &
+            ".." & $gConfig.maxHuntSize & ", arriving between " &
+            $gConfig.minTimeTenths & "/10 and " & $gConfig.maxTimeTenths &
+            "/10 of the way through the raid"
+
+  # --- the spawn-point guard, exercised on both branches rather than described.
+  #
+  # An empty `SpawnPointParams` is the difference between a squad and a record.
+  # A location slot that is in the database and has nowhere to put a bot takes
+  # a BossLocationSpawn entry without complaint and never fires, which is the
+  # failure this mod's whole self-test exists to catch: installed, silent, and
+  # indistinguishable from never having reached the map.
+  var withPoints = 0
+  var noPoints: seq[string] = @[]
+  for m in gConfig.huntMaps:
+    if not locationExists(m):
+      continue
+    if spawnable(m):
+      inc withPoints
+    else:
+      noPoints.add m
+  if noPoints.len == 0:
+    success "  every hunt map this database has can host a spawn (" &
+            $withPoints & " checked); a map whose SpawnPointParams is present " &
+            "and empty is refused rather than written to"
+  else:
+    var names = noPoints[0]
+    for i in 1 ..< noPoints.len:
+      names = names & ", " & noPoints[i]
+    info "  " & $noPoints.len & " hunt map(s) refused for an empty " &
+         "SpawnPointParams (" & names & ") and " & $withPoints & " accepted"
+
+  # --- the registration, driven by hand because morebots is not here.
+  discard onMorebotsReady("")
+  if gRegistered:
+    success "  the morebots.ready handshake registered " & $all.len &
+            " bot type(s), the faction, the loadouts and the relations"
+  else:
+    error "  the morebots.ready handshake did not register"
+    inc bad
+
+  # --- the client watch.
+  var runtimePath = setting("selfTestRuntime").asText("")
+  if runtimePath.len >= 2 and runtimePath[0] == '"' and
+     runtimePath[runtimePath.len - 1] == '"':
+    runtimePath = runtimePath.substr(1, runtimePath.len - 2)
+  var opened = false
+  if runtimePath.len > 0:
+    opened = openWatchAt(runtimePath, "aowl-blackdivision-selftest")
+    if opened:
+      info "  bound " & runtimePath & " for the watch binding report"
+    else:
+      warn "  selfTestRuntime " & runtimePath & " could not be loaded"
+  if not opened:
+    opened = openWatch()
+  if not opened:
+    warn "  no IL2CPP runtime in this process -- aowlspt-sim is a managed " &
+         "host and GameAssembly.dll is not loaded. Every watch binding will " &
+         "refuse for that reason, which is the correct answer here. Set " &
+         "\"selfTestRuntime\" in config.json to a GameAssembly.dll for a " &
+         "real report offline."
+
+  # The name table is the whole of the client half's identification, and it is
+  # this mod's own data rather than a guess about the game -- so it is fully
+  # checkable here, and a positive *and* a negative case are both run.
+  loadNames()
+  if nameCount() == 0:
+    error "  the watch loaded no first names; it could not recognise a " &
+          "Black Division bot if one stood in front of it"
+    inc bad
+  else:
+    success "  the watch knows " & $nameCount() & " first name(s) from " &
+            $nameFileCount() & " template file(s)"
+    if not isOurName("Anvil"):
+      error "  a name from this mod's own table was not recognised"
+      inc bad
+    if not isOurName("anvil"):
+      error "  the name match is case-sensitive; the game's casing would miss"
+      inc bad
+    if isOurName("Nikita"):
+      error "  a name that is not in this mod's table was recognised as ours"
+      inc bad
+    if isOurName(""):
+      error "  an empty nickname was recognised as ours"
+      inc bad
+
+  # The Win64 rule, exhaustively, with no runtime involved. This is the half of
+  # the shaped-call guard that decides *whether* the shaped path is taken, and
+  # it is a pure function of a size -- so both branches are shown to work here
+  # rather than only on a machine with Tarkov on it.
+  var ruleBad = 0
+  var sz = 1
+  while sz <= 24:
+    let want = (sz != 1 and sz != 2 and sz != 4 and sz != 8 and sz <= 16)
+    if shapedSizeAccepted(sz) != want:
+      error "  guard: a " & $sz & "-byte aggregate is classified wrongly"
+      inc ruleBad
+    inc sz
+  if shapedSizeAccepted(0) or shapedSizeAccepted(-4):
+    error "  guard: the rule accepted a nonsensical size"
+    inc ruleBad
+  if ruleBad == 0:
+    success "  the Win64 hidden-pointer rule accepts 3, 5, 6, 7 and 9..16 " &
+            "bytes and refuses 1, 2, 4, 8 and anything past 16 -- so a " &
+            "Vector3 takes the shaped path and a float does not"
+  else:
+    bad = bad + ruleBad
+
+  calibrateHeader()
+  if headerBytes() < 0:
+    warn "  the value-type size convention could not be calibrated from this " &
+         "runtime, so get_Position will refuse the shaped path and distances " &
+         "will not be reported. Expected with no runtime attached."
+  else:
+    info "  value-type instance sizes include a " & $headerBytes() &
+         "-byte header on this runtime, calibrated from System.Int32 and " &
+         "System.Double rather than assumed"
+    if shapedRetSizeOk("System.Int32") or shapedRetSizeOk("System.String"):
+      error "  guard: a register-sized value type or a reference was " &
+            "accepted for the hidden-return-pointer shape"
+      inc bad
+    else:
+      success "  the type half of the guard refuses System.Int32 (register " &
+              "sized) and System.String (a reference)"
+
+  watchBind()
+  watchReport()
+  let s = runWatch()
+  info "  watch: " & describe(s)
+
+  info "  refusals that are permanent on any post-1.0 client, with the reason:"
+  info "    the six role ids -- WildSpawnType is native constants with its " &
+       "switch tables already compiled; there is no managed " &
+       "Assembly-CSharp.dll to rewrite and no pre-load window to do it in. " &
+       "The ids stay server-side, where the difficulty documents and the " &
+       "faction graph are written in them, and the client half identifies " &
+       "the squad by this mod's own nickname table instead."
+  info "    HuntTargetLayer, AdvAssaultTarget, HuntManager -- BigBrain custom " &
+       "layers and Unity MonoBehaviours hosted by a BepInEx that does not " &
+       "exist here. The timing and placement half of the hunt survives, " &
+       "because that lives in the spawn table."
+  info "    BDNvgPatch -- already dead upstream (BotOwner_0 was removed in " &
+       "SPT 4.1.2, so it could no longer tell which bot it was looking at). " &
+       "A hook here is told a method's declared arguments and not `this`, so " &
+       "the only thing it could do is suppress night vision for every bot in " &
+       "the raid, which is worse than leaving it alone."
+  info "    WTT-ContentBackport's item and appearance templates -- content, " &
+       "not code. Without them the bots spawn and fight with fallback " &
+       "appearance, which is cosmetic rather than a crash."
+
+  # --- cost, on the same clock a client mod times a frame with.
+  const Iterations = 2000
+  let t0 = perfCounter()
+  var i = 0
+  while i < Iterations:
+    discard runWatch()
+    inc i
+  let per = nanosBetween(t0, perfCounter()) div int64(Iterations)
+  if s.ok:
+    success "  watch cost " & $per & " ns per scan over " & $Iterations &
+            " scans, on " & $s.aiAlive & " AI"
+  else:
+    info "  watch cost " & $per & " ns per scan over " & $Iterations &
+         " scans, none of which found a world. That is the guard: what the " &
+         "watch costs outside a raid. It is not per-frame work either way -- " &
+         "it runs every " & $gWatchIntervalMs & " ms."
+  info "  for comparison, docs/PERF.md measures one boxed host call at " &
+       "950-1235 ns; the same walk on the boxed path would be ~250 us for a " &
+       "raid's worth of bots, which is why it is not on it"
+
+  if bad == 0:
+    success "Black Division self-test: data, registration and the client " &
+            "watch all check out with no backend and no game attached"
+    result = Ok
+  else:
+    error "Black Division self-test: " & $bad & " problem(s)"
+    result = ErrGeneric
+
 proc onLoad(): Status =
-  if side() == sideClient:
-    return onLoadClient()
-  result = onLoadServer()
+  case side()
+  of sideClient: result = onLoadClient()
+  of sideSim: result = simSelfTest()
+  else: result = onLoadServer()
+
+proc onUpdate(elapsedMs: int64): Status =
+  ## The client half only. The server half is entirely event-driven and has
+  ## nothing per-tick to do.
+  if side() != sideClient:
+    return Ok
+  if gWorld.ready():
+    success "blackdivision: the game world is up; watching for the squad"
+  if gWorld.fired:
+    watchTick()
+  Ok
 
 proc onUnload(): Status =
   if side() != sideClient and not gRegistered:
@@ -372,4 +953,5 @@ exportMod(
   sptRange = "*",
   sides = {sideServer, sideClient, sideSim},
   onLoad = onLoad,
+  onUpdate = onUpdate,
   onUnload = onUnload)

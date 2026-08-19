@@ -59,5 +59,9 @@
   "unAimSpeedY": 4.5,
   "unAimSpeedZ": 4.5,
 
-  "verifyHooks": true
+  "verifyHooks": true,
+
+  "//selfTestRuntime": "A GameAssembly.dll for `aowl run` to bind against, so the self-test reports real bindings offline. Empty means the process, which under aowlspt-sim has no runtime at all. tests/mockil2cpp/GameAssembly.dll is the stand-in aowl test uses; a real client will load but very likely refuse il2cpp_init out of process.",
+  "selfTestRuntime": "tests/mockil2cpp/GameAssembly.dll",
+  "selfTestDataDir": ""
 }

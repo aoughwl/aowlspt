@@ -10,10 +10,14 @@
 ## the mod writes on top. Keeping that order means a number you see on screen
 ## can be traced down this file in the direction the signal actually travels.
 ##
-## Ranges from the C# `AcceptableValueRange` are recorded in the comments rather
-## than enforced. A JSON config has no slider to constrain, and silently
-## clamping a number a user typed is worse than letting them see what it does —
-## but the sane band is still worth writing down.
+## Ranges from the C# `AcceptableValueRange` are recorded in the comments here
+## and **enforced** by `model/limits.nim`, which parses none of this: the same
+## numbers are written out there as a table, and the self-test sweeps every one
+## of them for the value at which the model stops behaving. This file used to
+## say the ranges were deliberately not enforced, on the grounds that silently
+## clamping a number a user typed is worse than letting them see what it does.
+## The second half of that is right and the conclusion was not — the clamp says
+## every value it moved, by name, with both numbers.
 
 type
   Preset* = enum
@@ -36,6 +40,11 @@ type
     outputSmoothing*: float         ## 0..60 Hz. Low-pass on everything the model produces, before the springs.
                                     ## The anti-jitter knob: lower is smoother and eventually mushy, higher lets
                                     ## sharp detail like the pulse spike and the tremor through. 0 disables it.
+    outputCeiling*: float           ## 0.2..20 degrees. Hard ceiling on the model's summed output, applied last.
+                                    ## Not a taste setting: it is the guarantee that no combination of the other
+                                    ## hundred-odd numbers can rotate the weapon off the screen. 1.43 degrees is
+                                    ## where the point of aim leaves a 50 cm torso at 20 m, so anything above a
+                                    ## few degrees is already unplayable and this only stops it being absurd.
 
     # ================= 01 Respiration =================================
     respEnabled*: bool              ## Chest movement from breathing. The slow, dominant wander.
@@ -170,7 +179,14 @@ type
     cameraInertiaShare*: float      ## 0..3. Inertia's share.
 
     # ================= 12 Springs (advanced) ==========================
-    driveGain*: float               ## 0.1..60. See `DriveGainProvenance` below before touching this.
+    driveGain*: float               ## 0.1..4. A dimensionless trim on a calibration derived from the spring's
+                                    ## own ReturnSpeed -- 1 means one degree of model output becomes one degree
+                                    ## of weapon rotation. See `DriveGainProvenance` below before touching it.
+    springAccelPerFrame*: bool      ## Which way BSG's Spring integrates AddAcceleration: false (the default) is
+                                    ## `velocity += acceleration * dt`, true is `velocity += acceleration`. The
+                                    ## two differ by a factor of 1/dt -- sixty at 60 fps -- and this is the one
+                                    ## value to change if the mod is invisible or violent. `model/spring.nim`
+                                    ## says why the default is what it is.
     springOverride*: bool           ## Take over BSG's spring constants. Off leaves them exactly as shipped.
     handsRotDamping*: float         ## 0..1. Higher settles the weapon faster.
     handsRotReturnSpeed*: float     ## 0.1..60. How hard the weapon is pulled back to centre.
@@ -212,19 +228,40 @@ type
     verboseLogging*: bool           ## Chatty console output. Useful when a value is not doing what you expect.
 
 const DriveGainProvenance* = """
-Drive Gain converts the model's output in *degrees* into the impulse BSG's
-rotation springs expect from AddAcceleration. It is the calibration between the
-physics and the game, not a taste setting.
+Drive Gain is a dimensionless trim on a calibration this mod now derives rather
+than guesses.
 
-The shipped value of 8 was derived analytically -- from the spring's return
-speed and damping, solving for the steady-state deflection a given acceleration
-produces -- and has NEVER BEEN PLAYTESTED. It is the one number in this mod
-that is a calculation rather than a measurement, and it is the first thing to
-suspect if the whole mod feels uniformly too strong or too weak while the
-individual sources look right relative to each other.
+The calibration is: impulse = degrees * the spring's own ReturnSpeed, and the
+spring settles at exactly `degrees * driveGain`. ReturnSpeed is read off the
+live HandsRotation spring when it can be reached and falls back to 7.0, this
+mod's own shipped value for it, when it cannot -- the log says which. So the
+default is 1.0 and it means "one degree of model output is one degree of weapon
+rotation".
 
-If it does feel wrong: change Master Intensity first. Only come here if the
-weapon feels like it is fighting the spring rather than riding it.
+That replaces a shipped 8.0 which was an absolute multiplier, derived
+analytically, never playtested, and paired with a per-frame `* dt * 60`
+normalisation computed for the *other* of the two possible spring forms. The two
+mistakes very nearly cancelled: at 60 fps the old path delivered 1.14x the
+intended degrees. At 120 fps it delivered 0.57x, and at 30 fps 2.3x. The mod was
+frame-rate dependent in exactly the way the comment on that line said it was not.
+
+What is still assumed, and it is one boolean: whether BSG's Spring integrates
+`velocity += acceleration` or `velocity += acceleration * dt`. Those differ by a
+factor of 1/dt -- sixty at 60 fps. `springAccelPerFrame` is that boolean, the
+default is the second, and `model/spring.nim` sets out the dimensional argument
+for it. The failure is unmistakable rather than subtle: wrong one way the mod
+does nothing visible at all, wrong the other it pins the weapon against its
+acceleration clamp every frame.
+
+If the mod feels uniformly too strong or too weak but the sources look right
+relative to each other, change Master Intensity. Come here only if it feels like
+nothing is happening, or like the weapon is fighting the spring rather than
+riding it -- those are the two symptoms of the boolean being wrong, and the trim
+cannot fix either.
+
+Nothing in this paragraph has been seen against BSG's client. It is a
+computation over a stated spring, checked offline against that spring, which is
+a different thing from a measurement and a better thing than a guess.
 """
 
 template defaultTuning*(): Tuning =
@@ -247,7 +284,7 @@ template defaultTuning*(): Tuning =
   Tuning(
     enabled: true, preset: psCustom, masterIntensity: 1.0, adsMaster: 1.0,
     hipMaster: 1.0, globalTimeScale: 1.0, keepVanillaSway: true,
-    outputSmoothing: 12.0,
+    outputSmoothing: 12.0, outputCeiling: 6.0,
 
     respEnabled: true, respAmplitude: 1.0, respRateRest: 14.0,
     respRateExhausted: 32.0, respInhaleFraction: 0.35,
@@ -297,7 +334,8 @@ template defaultTuning*(): Tuning =
     cameraCoupling: 0.10, cameraRespShare: 0.75, cameraHeartShare: 0.45,
     cameraTremorShare: 0.04, cameraDriftShare: 0.45, cameraInertiaShare: 0.12,
 
-    driveGain: 8.0, springOverride: false, handsRotDamping: 0.55,
+    driveGain: 1.0, springAccelPerFrame: false,
+    springOverride: false, handsRotDamping: 0.55,
     handsRotReturnSpeed: 7.0, handsRotAccelerationMax: 12.0,
     handsRotInputIntensity: 1.0, handsRotSoftness: 1.0, handsPosDamping: 0.55,
     handsPosReturnSpeed: 7.0, cameraRotDamping: 0.6,
@@ -349,6 +387,7 @@ proc realistic(t: var Tuning) =
   t.masterIntensity = 1.0
   t.globalTimeScale = 1.0
   t.outputSmoothing = 12.0
+  t.outputCeiling = 6.0
   t.adsMaster = 1.0
   t.hipMaster = 1.0
   t.keepVanillaSway = true
@@ -441,6 +480,7 @@ proc cinematic(t: var Tuning) =
   t.inertiaFrequency = 1.6
   t.inertiaDamping = 0.4
   t.inertiaMaxDeflection = 9.0
+  t.outputCeiling = 12.0        # the one preset that deliberately wants big
   t.cameraCoupling = 0.45
 
 proc marksman(t: var Tuning) =

@@ -50,31 +50,54 @@
 ##
 ## ## What this file still cannot do, stated rather than approximated
 ##
-##  * **It is not on Unity's main thread.** `onUpdate` runs on the host's own
-##    attached thread. Reading managed fields from it is fine; issuing movement
-##    and steering calls that end in Unity APIs is not something any host here
-##    can currently make legal -- `invoke_main` queues onto the host's thread,
-##    not Unity's, and says so in `docs/IL2CPP.md`. The driving calls below are
-##    written and will run; whether the engine tolerates them from this thread
-##    is the one thing that needs the game to answer, and no comment here should
-##    be read as claiming it has been.
-##  * **Cover points have no source.** `core/cover.nim` scores cover points; the
-##    points come from raycasts this mod does not do, so `CoverSet` stays empty
-##    and `inCoverStatus` stays `csFarFromCover`. The cover decisions therefore
-##    never fire. That is a missing sensor, not a missing decision.
-##  * **Bleeds, fractures and squads are not read.** Both need walking a generic
-##    collection (`IEffect` lists, `BotsGroup` members), and a generic
-##    instantiation is exactly what `findClass` cannot name. `List<T>` is
-##    reachable only because an *instance* of it turns up in hand; an effect
-##    list does not, because reaching it is itself the generic call.
+##  * **It is not on Unity's main thread, and that sentence has narrowed.**
+##    `onUpdate` runs on the host's own attached thread. Reading managed fields
+##    from it is fine; issuing movement and steering calls that end in Unity
+##    APIs is the open question. What changed is the second half of what this
+##    used to say: `invoke_main` no longer merely queues onto the host's
+##    thread. The host detours a per-frame method and drains from inside it, so
+##    `onMainThread` reaches Unity's thread on a build where one of its
+##    candidates binds, and `call("aowlspt.host::main_thread")` says whether it
+##    has actually fired. `client/coverprobe.nim` was the first thing in this
+##    mod to use that, because a raycast has no other legal home; the driving
+##    calls are the second, and that row is no longer open. See "Driving on
+##    Unity's thread" at the foot of this file for the ring, and `core/sig.nim`
+##    for the declared-signature gate every one of them now passes before it is
+##    bound. What is still **not** claimed is that the calls then work: nothing
+##    in this repo has ever executed one against BSG's client.
+##  * **Cover points now have a source, and it is not in this file.**
+##    `core/cover.nim` scores cover points and always could; what it lacked was
+##    points, because producing one means a raycast and a raycast is a Unity
+##    call. `client/coverprobe.nim` makes those calls from inside an
+##    `onMainThread` job and `core/probe.nim` folds the answers back in, so
+##    `CoverSet` fills and `inCoverStatus` leaves `csFarFromCover`. Two things
+##    still have to be true for that to happen in a raid and both are asked
+##    rather than assumed: `UnityEngine.Physics::Raycast` must resolve with the
+##    signature this mod reads, and the host's per-frame drain must have
+##    actually fired. Either one absent and the behaviour is exactly what it
+##    was -- an empty set, and the ladder falling through to the rungs below.
+##  * **Bleeds and fractures are not read.** They need walking the health
+##    controller's effect collection, which is a generic instantiation with no
+##    name `findClass` accepts and no instance in hand to bind from. `List<T>`
+##    is reachable only because an *instance* of one turns up in hand; an
+##    effect list does not, because reaching it is itself the generic call.
+##  * **The squad is no longer a stub, and is not read either.** Enumerating
+##    `BotsGroup` needs five guessed member names on an unseen class. What is
+##    read is the group's *pointer*, as an identity, and `core/squad.nim`
+##    partitions this mod's own bot table by it -- with faction and proximity
+##    as the fallback when even that one getter refuses. See `README.md`.
 
 import aowlspt
 import aowlspt/game
 import aowlspt/il2cpp
+import aowlspt/fast
 import ".." / core / vec
 import ".." / core / types
 import ".." / core / enemy
+import ".." / core / hearing
 import live
+import coverprobe
+import mainthread
 
 # The type surface used for the *capability probe only*. Resolved on first use,
 # because a type resolved at load time is a false negative: the game has not
@@ -115,6 +138,11 @@ proc probe*(): Capability =
                  "path is unavailable"
     return gCapability
   bindAll()
+  # The cover sensor, resolved on the same first tick every other binding is.
+  # It is two Unity statics rather than an EFT member, and it refuses the same
+  # way: by name, with the signature the runtime reported. See
+  # `client/coverprobe.nim` for why a matching arity is not enough.
+  bindProbe()
   let world = worldObject()
   if world == nil:
     gCapability = capReadOnly
@@ -147,6 +175,17 @@ proc announce*() =
   of capFull:
     success "sain: driving bots (" & gProbeNote & ")"
   report()
+  # Two lines, always, and separate. The first is whether the engine will
+  # answer a raycast at all; the second is whether this mod is allowed to ask
+  # from the thread it is on. Either one absent means no cover points, and a
+  # log that ran them together could not say which.
+  info "sain: " & probeState()
+  # Asked here rather than read here: `announce` runs on the first tick the
+  # world resolves, which is before the driver's own two-second poll has ever
+  # fired, and a report that said "not asked yet" would be reporting this
+  # function's ordering rather than the host's answer.
+  discard refreshMainThread(nowMs())
+  info "sain: main thread -- " & mainThreadNote()
 
 proc capable*(): bool = gCapability == capFull
 
@@ -163,10 +202,14 @@ type
     ## state on. `gcPlayer` is this mod's own IL2CPP GC handle on the bot's
     ## `Player`, taken at attach and freed at detach.
     ##
-    ## It is *not* a host `Handle`. The host's handle is an index into the
-    ## host's table and there is no ABI entry point that turns one into the raw
-    ## pointer the fast path needs, so the fast path has to start from a pointer
-    ## this mod obtained itself. See the note at the top of `live.nim`.
+    ## It is *not* a host `Handle`, and the distinction outlived the reason for
+    ## it. It used to be that nothing could turn a host handle into the raw
+    ## pointer the fast path needs; ABI revision 3's `pointerOf` can, and the
+    ## spawn hook uses it. What a host handle still cannot do is *last*: the
+    ## host reclaims it when the handler returns. So the pointer is taken
+    ## inside the handler and immediately turned into one of these -- an IL2CPP
+    ## GC handle this mod owns, which is the only legal way to keep an object
+    ## across frames. See the note at the top of `live.nim`.
     id*: string
     role*: BotRole
     gcPlayer*: uint32
@@ -255,15 +298,22 @@ proc isAI*(player: Il2CppPtr): bool =
   callBoolOn(gB.pIsAI, player, false)
 
 proc isAlive*(player: Il2CppPtr): bool =
-  ## Death detection.
+  ## Death detection, **the fallback**.
   ##
-  ## This is polled rather than hooked, and the reason is worth naming: the
-  ## natural hook is `Player::OnDead`, but `hookArgs` reports a method's
-  ## *declared* arguments and not the instance it was called on, so a death
-  ## hook fires knowing that a player died and not which one. The host computes
-  ## `this` (`thisOf` in its own `invoke.nim`) and does not surface it. Until it
-  ## does, one bound bool read per bot per tick is the honest answer -- it costs
-  ## about ten nanoseconds and it cannot be wrong.
+  ## This used to be the only way. The natural hook is `Player::OnDead`, but
+  ## `hookArgs` reported a method's *declared* arguments and not the instance
+  ## it was called on, so a death hook fired knowing that a player died and not
+  ## which one. The host computed `this` and did not surface it, so one bound
+  ## bool read per bot per decision was the honest answer: it could not be
+  ## wrong, and it cost two bound calls -- `get_HealthController` and this --
+  ## for a fact that changes once in a bot's life.
+  ##
+  ## ABI revision 3's `pointerOf`, reached through `game.thisPointer`, surfaces
+  ## it. `sain.installHooks` now detours `OnDead` and `driver.setDeathHooked`
+  ## turns this off. It stays for the case that is still real: a host older
+  ## than revision 3, a host with no managed heap, or a build where none of the
+  ## death-method names patches. The mod's own self-test measures what it costs
+  ## when it is on, so the trade is a number rather than an opinion.
   let hc = callObj(gB.pHealth, player)
   if hc == nil:
     return true
@@ -285,12 +335,22 @@ const
 proc readHealth(l: BotLive): float =
   ## Health as a fraction.
   ##
-  ## `GetBodyPartHealth` takes an enum and returns a value struct, so it is
-  ## refused by the fast path twice over: an enum argument has no register class
-  ## the runtime will state, and a 12-byte struct return is a hidden-pointer
-  ## call shape rather than a register class. `il2cpp_runtime_invoke` boxes the
-  ## result and the two floats come out of the box by name, which needs no
-  ## assumption about where the runtime puts a boxed value's payload.
+  ## **The one read left on the reflective path**, and left there on purpose.
+  ##
+  ## `GetBodyPartHealth` takes an enum and returns a value struct, so its shaped
+  ## form would be three slots -- hidden return pointer, `this`, the enum -- and
+  ## `live.tryShaped` could express it. What it could not do is *read* the
+  ## result: with the callee writing into a caller buffer there is no boxed
+  ## object, so `Current` and `Maximum` would have to be pulled out by offset,
+  ## and a field offset inside a value type is the one number in this area that
+  ## nothing here can check. `il2cpp_runtime_invoke` boxes the result instead
+  ## and `il2cpp_field_get_value` reads the two floats *by name*, which needs no
+  ## assumption at all.
+  ##
+  ## The cost is one managed allocation and one reflective call per bot per
+  ## decision -- roughly a third of what reading a bot costs now that the three
+  ## Vector3 reads are shaped. Worth revisiting if a profile says so; not worth
+  ## a second unverifiable layout assumption before then.
   result = 1.0
   if l.player == nil:
     return
@@ -331,15 +391,18 @@ proc readSelf*(b: BotHandle; l: BotLive): SelfView =
     canHeal: false, canUseStims: false, canDoSurgery: false,
     ammoInMagazine: 30, magazineSize: 30, hasAmmoToReload: false,
     weaponReady: true, inCoverStatus: csFarFromCover, coverPointDistance: 99.0,
+    coverPosition: zeroVec(), hasCoverPoint: false,
     suppressionLevel: 0.0, isSprinting: false, position: zeroVec(),
-    lookDirection: vec3(1.0, 0.0, 0.0))
+    lookDirection: vec3(1.0, 0.0, 0.0), velocity: zeroVec(),
+    timeSinceDamaged: 9999.0, recentDamage: 0.0)
   if not l.ok:
     return
 
-  # --- position and facing. Two reflective calls, and two of the three managed
-  # allocations this mod makes per bot per tick: a Vector3 return is boxed, and
-  # so is the health struct below. Everything else on this path allocates
-  # nothing at all.
+  # --- position and facing. Two shaped fast calls: the hidden return pointer
+  # is a stack buffer in `live.readVec`, so these allocate nothing at all and
+  # cost about what a bound call costs. They were the two most expensive reads
+  # on this path when they went through `il2cpp_runtime_invoke`, which boxed a
+  # Vector3 per read.
   result.position = readVec(gB.pPosition, l.player)
   result.lookDirection = readVec(gB.pLookDir, l.player)
 
@@ -354,15 +417,19 @@ proc readSelf*(b: BotHandle; l: BotLive): SelfView =
   if l.owner == nil:
     return
 
-  # --- suppression. `IsUnderFire` is a bool rather than a level, so it is
-  # mapped to the ends of the range. SAIN's own suppression is an accumulator
-  # over incoming rounds, which is a sensor this mod does not have -- the
-  # thresholds in `settings` still work against 0 and 1, they just have no
-  # middle.
+  # --- suppression. `IsUnderFire` is a bool rather than a level, and mapping it
+  # straight onto 0 and 1 -- which is what this used to do -- made both
+  # thresholds in `settings.nim` meaningless: a bot was never merely
+  # suppressed, only pinned, and it un-pinned on the frame the flag cleared.
+  #
+  # The bool is carried through raw here and `core/suppress.nim` integrates it
+  # over time in the driver, along with the health delta. The level in this
+  # struct is filled in by the driver after that pass, which is why it is left
+  # at zero rather than set from the flag.
   let mem = callObj(gB.boMemory, l.owner)
   if mem != nil:
-    if callBoolOn(gB.memUnderFire, mem, false):
-      result.suppressionLevel = 1.0
+    result.suppressionLevel = (if callBoolOn(gB.memUnderFire, mem, false):
+                                 1.0 else: 0.0)
 
   # --- weapon
   let wm = callObj(gB.boWeapon, l.owner)
@@ -404,10 +471,18 @@ proc observeEnemy*(b: BotHandle; l: BotLive; now: float): Observation =
   ## the enemy selection -- so this reads its answer rather than repeating it.
   ## That is the sensing/logic split `docs/IL2CPP.md` recommends profiling
   ## before rewriting: the raycast is in the engine and costs what it costs.
-  result = Observation(id: "", alive: false, isPlayer: false,
+  ##
+  ## **The profile id is not read at all any more.** It used to be, per tick,
+  ## and the comment here used to say what the fix would be if it ever showed
+  ## up in a profile: key on the person pointer instead. That is what this now
+  ## does -- and once the key is a pointer, the string has no remaining reader,
+  ## so it is gone rather than merely cached. That removes the last managed
+  ## allocation from the per-decision path.
+  result = Observation(key: 0'u64, alive: false, isPlayer: false,
                        position: zeroVec(), sawThisTick: false,
                        heardThisTick: false, firedAtUsThisTick: false,
-                       lookingAtUsThisTick: false, pathDistance: -1.0)
+                       lookingAtUsThisTick: false, pathDistance: -1.0,
+                       heard: nothingHeard())
   if not l.ok or l.owner == nil:
     return
   let mem = callObj(gB.boMemory, l.owner)
@@ -419,24 +494,63 @@ proc observeEnemy*(b: BotHandle; l: BotLive; now: float): Observation =
   let person = callObj(gB.enPerson, goal)
   if person == nil:
     return
-  # The id is read per tick here, unlike the bot's own, because the goal enemy
-  # can change between ticks and the enemy table is keyed on it. It is one
-  # bound call plus a string copy; if it ever shows up in a profile the fix is
-  # to key on the person *pointer* for the tick and only stringify on a change.
-  result.id = readManagedString(callObj(gB.pProfileId, person))
-  if result.id.len == 0:
-    return
+  result.key = cast[uint64](person)
   result.alive = true
   result.isPlayer = not callBoolOn(gB.pIsAI, person, true)
   result.position = readVec(gB.enPosition, goal)
   result.sawThisTick = callBoolOn(gB.enVisible, goal, false)
-  # `heardThisTick` and `firedAtUsThisTick` have no direct reads here: EFT's
-  # sound events arrive through a listener the host cannot subscribe to from
-  # native code, and `lookingAtUsThisTick` needs the enemy's own forward vector
-  # against us, which is a second Vector3 read per enemy per tick. Left false
-  # rather than derived: `core/enemy` treats "not heard" as decaying memory,
-  # which is the correct behaviour for a sensor that is absent rather than
-  # silent.
+  # `firedAtUsThisTick` and `lookingAtUsThisTick` still have no direct read.
+  # `heardThisTick` does now, but not from here: it is derived in the driver
+  # from the enemy's own motion through `core/hearing`, because only the driver
+  # holds the previous position to difference against.
+
+proc groupKeyOf*(l: BotLive): uint64 =
+  ## `BotOwner.BotsGroup` as an identity, never dereferenced.
+  ##
+  ## Zero means the binding refused, which `core/squad.nim` reads as "partition
+  ## by faction and proximity instead". The pointer is not held across frames
+  ## and does not need to be: it is compared against other bots' pointers read
+  ## on the same tick, and a collector that moved the group would move every
+  ## bot's view of it together.
+  result = 0'u64
+  if not l.ok or l.owner == nil:
+    return
+  let g = callObj(gB.boBotsGroup, l.owner)
+  if g == nil:
+    return
+  result = cast[uint64](g)
+
+proc nearestGrenade*(world: Il2CppPtr; at: Vec3; within: float;
+                     found: var Vec3): bool =
+  ## The closest live grenade to a point, if the world will name any.
+  ##
+  ## Called once per tick for the whole raid rather than once per bot: the list
+  ## is empty on essentially every tick of a raid, and an empty list is one
+  ## bound `get_Count` -- about ten nanoseconds -- which is the right price for
+  ## making the highest-urgency decision in the ladder reachable at all.
+  result = false
+  found = zeroVec()
+  if world == nil:
+    return
+  let list = grenadeList(world)
+  if list == nil:
+    return
+  let n = grenadeCount(list)
+  if n <= 0:
+    return
+  var bestSqr = within * within
+  var i = 0
+  while i < n:
+    let g = grenadeAt(list, i)
+    inc i
+    if g == nil:
+      continue
+    let p = grenadePosition(g)
+    let d = sqrDistance(at, p)
+    if d < bestSqr:
+      bestSqr = d
+      found = p
+      result = true
 
 # ---------------------------------------------------------------------------
 # Driving a bot
@@ -453,8 +567,17 @@ type
     lookAt*: Vec3
     hasLookTarget*: bool
     shoot*: bool
-    ## The self action, mapped to the game call that performs it.
-    selfCall*: string
+    ## The self action, carried as the enum rather than as the name of the
+    ## call that performs it.
+    ##
+    ## It was a `string` -- `"reload"`, `"firstaid"` -- compared by value in
+    ## `applySelf`. That was harmless while an actuation lived and died inside
+    ## one call on one thread, and it is not harmless now that one crosses to
+    ## Unity's thread through a fixed ring: a nimony string is a heap object
+    ## with a length, and handing one between two threads through a shared
+    ## array is exactly the kind of thing that works in a test and tears in a
+    ## raid. Every field of an `Actuation` is now a scalar.
+    selfAct*: SelfAction
 
 func actuationFor*(d: Decision; b: BotView): Actuation =
   ## Pure: the decision-to-intent mapping, with no game calls in it.
@@ -463,62 +586,67 @@ func actuationFor*(d: Decision; b: BotView): Actuation =
   ## update loop. Most of them differ only in where the bot goes, how fast, and
   ## whether it is shooting, so the mapping is a function rather than a class
   ## hierarchy, and it is testable for the same reason `core/` is.
-  var a = Actuation(sprint: false, moveTo: zeroVec(), hasMoveTarget: false,
+  ##
+  ## **The destination comes from the decision, not from here.** This function
+  ## used to set `hasMoveTarget` while leaving `moveTo` at the origin for four
+  ## of its cases -- `SeekCover`, `ShiftCover`, `Retreat` and `AvoidGrenade`
+  ## all told the game to walk to world zero -- and it could not do better,
+  ## because only the ladder knows whether a bot is moving *to* something or
+  ## *away* from it. `decide.moveTargetFor` answers that, in `core/`, where it
+  ## is testable; this reads the answer.
+  var a = Actuation(sprint: false, moveTo: d.moveTo,
+                    hasMoveTarget: d.hasMove,
                     lookAt: b.enemy.position, hasLookTarget: b.enemy.valid,
-                    shoot: false, selfCall: "")
+                    shoot: false, selfAct: saNone)
   case d.combat
   of cdStandAndShoot, cdShootDistantEnemy, cdDogFight:
     a.shoot = true
   of cdSeekCover, cdShiftCover, cdRetreat:
     a.sprint = d.combat != cdShiftCover
-    a.hasMoveTarget = true
     a.shoot = d.combat == cdRetreat and b.enemy.visible
-  of cdRunAway:
+  of cdRunAway, cdExtract:
     a.sprint = true
-    a.hasMoveTarget = true
     a.hasLookTarget = false
   of cdRushEnemy:
     a.sprint = true
-    a.moveTo = b.enemy.position
-    a.hasMoveTarget = true
     a.shoot = b.enemy.visible
+  of cdFlank:
+    # Not sprinting: a flank is a move the bot wants to survive, and sprinting
+    # in EFT means a lowered weapon and a great deal of noise. Looking at the
+    # enemy's last known place while moving sideways is the whole posture.
+    a.sprint = false
+    a.shoot = b.enemy.visible and b.enemy.canShoot
   of cdMoveToEngage, cdCreepOnEnemy:
     a.sprint = d.combat == cdMoveToEngage
-    a.moveTo = b.enemy.position
-    a.hasMoveTarget = true
   of cdSearch:
-    a.moveTo = b.searchTarget
-    a.hasMoveTarget = b.hasSearchTarget
+    discard
   of cdAvoidGrenade:
     a.sprint = true
-    a.hasMoveTarget = true
     a.hasLookTarget = false
   of cdMeleeAttack:
     a.sprint = true
-    a.moveTo = b.enemy.position
-    a.hasMoveTarget = true
   of cdFreeze, cdHoldInCover, cdNone:
     discard
   of cdThrowGrenade:
     a.lookAt = b.enemy.position
     a.hasLookTarget = true
 
-  case d.self
-  of saReload: a.selfCall = "reload"
-  of saFirstAid: a.selfCall = "firstaid"
-  of saStims: a.selfCall = "stims"
-  of saSurgery: a.selfCall = "surgery"
-  of saNone: discard
+  a.selfAct = d.self
   result = a
 
-proc applySelf(l: BotLive; which: string): int =
+proc applySelf(l: BotLive; which: SelfAction): int =
   ## The self actions, each one bound call on a component two bound calls away.
   ## All three are no-argument voids, which is the one shape the fast path is
   ## unambiguously best at -- 6.5 ns measured, against ~1000 through the host.
+  ##
+  ## Each of the four is gated on its declared signature: `withGate(..,
+  ## dsNoArgs)` in `live.bindAll` means "found at arity zero" now also means
+  ## "declares no parameters", which is what `callVoidOn` handing over a null
+  ## argument array requires and what nothing checked before.
   result = 0
   if l.owner == nil:
     return
-  if which == "reload":
+  if which == saReload:
     let wm = callObj(gB.boWeapon, l.owner)
     if wm == nil: return
     let rl = callObj(gB.wmReload, wm)
@@ -528,17 +656,17 @@ proc applySelf(l: BotLive; which: string): int =
   let med = callObj(gB.boMedecine, l.owner)
   if med == nil:
     return
-  if which == "firstaid":
+  if which == saFirstAid:
     let fa = callObj(gB.medFirstAid, med)
     if fa != nil and callVoidOn(gB.faApply, fa): result = 1
-  elif which == "stims":
+  elif which == saStims:
     let stim = callObj(gB.medStims, med)
     if stim != nil and callVoidOn(gB.stimApply, stim): result = 1
-  elif which == "surgery":
+  elif which == saSurgery:
     let surg = callObj(gB.medSurgery, med)
     if surg != nil and callVoidOn(gB.surgApply, surg): result = 1
 
-proc apply*(b: BotHandle; l: BotLive; a: Actuation): int =
+proc applyTo*(l: BotLive; a: Actuation): int =
   ## Push an actuation into the game. Returns how many calls were made, which is
   ## what the driver budgets against.
   ##
@@ -546,18 +674,34 @@ proc apply*(b: BotHandle; l: BotLive; a: Actuation): int =
   ## lives in the driver, because it is the driver that holds the previous
   ## actuation. Here the rule is only: one call per thing that changed.
   ##
-  ## Three of the five calls are on the fast path. The two that are not are the
-  ## two that take a `Vector3`, which Win64 passes by hidden pointer -- a
-  ## different call shape rather than a different register class, which is
-  ## precisely what `aowlspt/fast` says it does not cover. Those go through
-  ## `il2cpp_runtime_invoke` with the argument array built by hand; see
-  ## `live.callVec`.
+  ## All five calls are on the fast path, and two of them only because this mod
+  ## states their shape: `GoToPoint` and `LookToPoint` take a `Vector3`, which
+  ## Win64 passes by hidden pointer -- a different call *shape* rather than a
+  ## different register class, so `fast.bindRaw` is given the slot count
+  ## directly. `live.callVec` carries the reasoning and the reflective
+  ## fallback for a build where the guards do not hold.
+  ##
+  ## **And every one of the five is now gated on its declared signature.**
+  ## `live.resolveOn` reads the runtime's own parameter types back and compares
+  ## them against `core/sig.checkDrive` before anything is bound, so a
+  ## `GoToPoint` whose first argument is not a `Vector3` -- which
+  ## `il2cpp_class_get_method_from_name` will happily hand back, because it
+  ## matches on arity -- refuses by name and this function makes no call on
+  ## that channel at all. A refused channel returns zero calls, and the log
+  ## says which channel and what the bot does instead.
+  ##
+  ## **Which thread this runs on is the caller's business and is not free.**
+  ## `postDrive` below is the path a raid takes: the order is queued on the
+  ## host's thread and executed inside an `onMainThread` job. This function is
+  ## what that job calls, and it is also what the host-thread fallback calls.
+  ## It must therefore touch no bot table and take no lock, which it does not:
+  ## every pointer in it comes from its arguments.
   if not capable() or not l.ok:
     return 0
   var calls = 0
 
-  if a.selfCall.len > 0:
-    calls = calls + applySelf(l, a.selfCall)
+  if a.selfAct != saNone:
+    calls = calls + applySelf(l, a.selfAct)
 
   if l.owner == nil:
     return calls
@@ -584,3 +728,221 @@ proc apply*(b: BotHandle; l: BotLive; a: Actuation): int =
       inc calls
 
   result = calls
+
+# ---------------------------------------------------------------------------
+# Driving on Unity's thread
+# ---------------------------------------------------------------------------
+#
+# The open item this file has carried since it was written, and the reason it
+# stayed open: a raycast is a read that answers a bool, and a movement order is
+# a command with a lifetime. `client/coverprobe.nim` moved the first kind onto
+# Unity's thread and this moves the second, and the two are not the same piece
+# of work.
+#
+# ## Why it has to move
+#
+# `Mover.GoToPoint` ends in `NavMeshAgent.SetDestination`, and
+# `Steering.LookToPoint` ends in writing a `Transform`. Both are Unity APIs,
+# and Unity's APIs are not merely undefined off the player loop -- most of them
+# check the thread and throw, and a managed throw crossing a native frame does
+# not unwind: it comes back as a written exception pointer, which `live.reflect`
+# does read and which the *shaped* fast path has nowhere to put. So the previous
+# arrangement was not "unknown, probably fine". It was a known hazard that had
+# never been executed, and those two read the same in a log.
+#
+# ## The shape, which is the cover sampler's and is not
+#
+# Same skeleton: a fixed ring written by the host's thread, drained inside an
+# `onMainThread` job. Three differences, each forced by this being a command
+# rather than a sample.
+#
+#  1. **There are many in flight, not one.** A sample is rationed to ten a
+#     second for the whole raid because a raycast costs the engine something.
+#     An order is issued only when a decision *changed*, which in a working
+#     raid is a handful a second across every bot, so the ring is drained
+#     whole on each job rather than one entry at a time. It is bounded at
+#     `DriveQueueSize`, and a full ring **drops** and counts rather than
+#     blocking the decision thread or growing.
+#  2. **The bot may have died between the post and the drain.** The order
+#     carries the bot's IL2CPP GC handle rather than a pointer, and the handle
+#     is resolved on the game's thread. A dead bot's handle answers null and
+#     the order is discarded -- the same reason `drainCoverSample` looks its
+#     bot up by id rather than by index.
+#  3. **A stale order is worse than no order.** A destination is about where
+#     the bot was when the decision was made. One frame of staleness is 16 ms
+#     and is nothing; a queue that had backed up by a second would be steering
+#     bots to where their enemies used to be. So an order older than
+#     `OrderStaleSeconds` is dropped and counted, and that count is in the
+#     state line next to the drops.
+#
+# ## Why the ring is safe across the two threads
+#
+# One producer (the host's thread, in `driver.tickBot`) and one consumer
+# (Unity's, in the job). The producer writes a slot and *then* advances
+# `gDriveWrite`; the consumer reads strictly below `gDriveWrite` and then
+# advances `gDriveRead`. Neither index is ever written by both. An aligned
+# 64-bit store is not torn on x64, which is the same and only assumption the
+# death ring makes. The producer refuses to write when the ring is full, so a
+# slot is never overwritten while the consumer may be reading it.
+#
+# What is *not* claimed: that the lazy bindings underneath are safe to resolve
+# concurrently. They are not, and nothing needs them to be. The five driving
+# members are called from exactly one thread in a session -- Unity's when the
+# queue is in use, the host's when the fallback is -- and the two are chosen
+# once, at the top of `driver.tickBot`, never mixed. The components on the way
+# there (`AIData`, `BotOwner`) are resolved by `readSelf` on the host's thread
+# before any order can exist, because a bot is read before it is decided about.
+
+const
+  DriveQueueSize = 32
+    ## Orders in flight. Eight bots a tick at 10 Hz is eighty a second in the
+    ## worst case where every one of them changes its mind every tick, and a
+    ## frame at 60 fps drains everything posted in the last 100 ms. Thirty-two
+    ## is four times the per-tick budget; a ring this deep filling up means the
+    ## drain is not running, which is what the drop counter is for.
+  OrderStaleSeconds = 0.35
+    ## Past this an order is discarded rather than executed. Twenty frames at
+    ## 60 fps: long enough that an ordinary hitch does not throw orders away,
+    ## short enough that a bot is never sent where it was half a second ago.
+
+type
+  DriveOrder* = object
+    ## One actuation, addressed by GC handle rather than by pointer, with
+    ## nothing in it that is not a scalar.
+    gcPlayer*: uint32
+    postedAt*: float
+    sprint*: bool
+    hasMove*: bool
+    hasLook*: bool
+    shoot*: bool
+    selfAct*: SelfAction
+    moveTo*: Vec3
+    lookAt*: Vec3
+
+func emptyOrder(): DriveOrder =
+  DriveOrder(gcPlayer: 0'u32, postedAt: 0.0, sprint: false, hasMove: false,
+             hasLook: false, shoot: false, selfAct: saNone,
+             moveTo: zeroVec(), lookAt: zeroVec())
+
+var gDriveRing: array[DriveQueueSize, DriveOrder]
+var gDriveWrite = 0
+var gDriveRead = 0
+var gDriveDropped = 0
+var gDriveStale = 0
+var gDriveGone = 0
+var gDriveRun = 0
+var gDriveCalls = 0
+var gDriveNs = 0'i64
+var gDriveHostThread = 0
+
+proc initDriveQueue*() =
+  ## Zero the ring, its indices and its counters.
+  ##
+  ## Called from `driver.setPreset`, and again by the self-test between its
+  ## phases. The explicit zeroing is not strictly needed -- every field of a
+  ## `DriveOrder` has zero for its empty value -- and it is here because
+  ## `live.nim`'s note about a nimony `--app:lib` global initialised by a call
+  ## is exactly the kind of thing that is true until it is not.
+  ##
+  ## The **counters** are reset too, and that is the part that matters outside
+  ## a raid: the benchmark below posts twenty thousand orders that no bot could
+  ## ever have received, and leaving those in the drop and dead-bot totals
+  ## would put a number in the state line that describes a benchmark rather
+  ## than a session.
+  var i = 0
+  while i < DriveQueueSize:
+    gDriveRing[i] = emptyOrder()
+    inc i
+  gDriveWrite = 0
+  gDriveRead = 0
+  gDriveDropped = 0
+  gDriveStale = 0
+  gDriveGone = 0
+  gDriveRun = 0
+  gDriveCalls = 0
+  gDriveNs = 0'i64
+  gDriveHostThread = 0
+
+proc postDrive*(b: BotHandle; a: Actuation; nowSeconds: float): bool =
+  ## Queue one order. The host's thread, and the only writer.
+  ##
+  ## False means the ring was full, which is counted rather than retried: an
+  ## order that could not be posted this tick is about a decision the bot has
+  ## already made, and the next tick posts the current one instead. Retrying a
+  ## stale order is the failure this queue exists to avoid.
+  if b.gcPlayer == 0'u32:
+    return false
+  if gDriveWrite - gDriveRead >= DriveQueueSize:
+    gDriveDropped = gDriveDropped + 1
+    return false
+  let slot = gDriveWrite mod DriveQueueSize
+  gDriveRing[slot] = DriveOrder(
+    gcPlayer: b.gcPlayer, postedAt: nowSeconds, sprint: a.sprint,
+    hasMove: a.hasMoveTarget, hasLook: a.hasLookTarget, shoot: a.shoot,
+    selfAct: a.selfAct, moveTo: a.moveTo, lookAt: a.lookAt)
+  # Last, and after the slot: this is what the game's thread reads to know the
+  # slot is there to read. The same ordering `gProbeBusy` has, for the same
+  # reason.
+  gDriveWrite = gDriveWrite + 1
+  result = true
+
+proc runDrives*(nowSeconds: float): int =
+  ## Execute everything queued. **Unity's thread, and nothing else's.**
+  ##
+  ## Returns the number of game calls made, which is what the driver reports.
+  ## Nothing here allocates, nothing here logs, nothing here touches the bot
+  ## table -- the counters are plain increments on this thread's own globals,
+  ## read for a log line rather than for a decision.
+  result = 0
+  if gDriveRead >= gDriveWrite:
+    return
+  let t0 = perfCounter()
+  var calls = 0
+  while gDriveRead < gDriveWrite:
+    let o = gDriveRing[gDriveRead mod DriveQueueSize]
+    gDriveRead = gDriveRead + 1
+    if nowSeconds - o.postedAt > OrderStaleSeconds:
+      gDriveStale = gDriveStale + 1
+      continue
+    let p = target(o.gcPlayer)
+    if p == nil:
+      # The bot died between the post and this frame. Its handle answers null
+      # and there is nothing to drive.
+      gDriveGone = gDriveGone + 1
+      continue
+    var l = noBot()
+    l.player = p
+    let ai = callObj(gB.pAIData, p)
+    if ai != nil:
+      l.owner = callObj(gB.aiBotOwner, ai)
+    l.ok = true
+    var a = Actuation(sprint: o.sprint, moveTo: o.moveTo,
+                      hasMoveTarget: o.hasMove, lookAt: o.lookAt,
+                      hasLookTarget: o.hasLook, shoot: o.shoot,
+                      selfAct: o.selfAct)
+    calls = calls + applyTo(l, a)
+  gDriveNs = gDriveNs + nanosBetween(t0, perfCounter())
+  gDriveRun = gDriveRun + 1
+  gDriveCalls = gDriveCalls + calls
+  result = calls
+
+proc noteHostThreadDrive*(calls: int) =
+  ## Count a drive made on the host's own thread, so the state line can say
+  ## which path a session actually took rather than which one it prefers.
+  gDriveHostThread = gDriveHostThread + 1
+  gDriveCalls = gDriveCalls + calls
+
+proc drivePending*(): int = gDriveWrite - gDriveRead
+proc driveDropped*(): int = gDriveDropped
+proc driveStale*(): int = gDriveStale
+proc driveGone*(): int = gDriveGone
+proc driveRuns*(): int = gDriveRun
+proc driveCalls*(): int = gDriveCalls
+proc driveHostThreadRuns*(): int = gDriveHostThread
+
+proc driveCostNs*(): int64 =
+  ## What one drain cost on the game's own clock, averaged over the drains that
+  ## did something. -1 when none has run -- which is the answer against any
+  ## runtime with no bots in it, and is the answer this mod has today.
+  if gDriveRun <= 0: return -1'i64
+  result = gDriveNs div int64(gDriveRun)

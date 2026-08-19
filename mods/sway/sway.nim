@@ -14,21 +14,29 @@
 ##
 ## Layout:
 ##
-##     model/vec.nim       Vec3 and the scalar helpers Mathf used to provide
-##     model/noise.nim     band-limited value noise
-##     model/filters.nim   one-pole low-pass and the DC blocker
-##     model/tuning.nim    every tunable, and the presets
-##     model/state.nim     the shooter, as data
-##     model/sources.nim   the five sources
-##     model/director.nim  the signal chain
-##     game/binding.nim    one scalar on a game object: field or property
-##     game/live.nim       the walk from the world to the springs, and back
-##     sway.nim            this file: config, hooks, and the frame
+##     model/vec.nim          Vec3 and the scalar helpers Mathf used to provide
+##     model/fmt.nim          numbers as text, for a log line
+##     model/noise.nim        band-limited value noise
+##     model/filters.nim      one-pole low-pass and the DC blocker
+##     model/tuning.nim       every tunable, and the presets
+##     model/limits.nim       the range each tunable may hold, and the clamp
+##     model/state.nim        the shooter, as data
+##     model/sources.nim      the five sources
+##     model/director.nim     the signal chain
+##     model/spring.nim       BSG's rotation spring, as arithmetic, and the
+##                            closed form of what it does with a step
+##     model/characterise.nim what the model does, measured — including the
+##                            spring's own transient and the limiter's clamp
+##     game/binding.nim       one scalar on a game object: field or property
+##     game/live.nim          the walk from the world to the springs, and back
+##     sway.nim               this file: config, hooks, and the frame
 ##
 ## Nothing under `model/` imports `aowlspt`. That is deliberate and it is the
 ## whole reason the split exists: the model is pure arithmetic over two records,
-## so `aowlspt-sim` can tick it with no game in the process, and a change to the
-## physics can be checked in under a second rather than by loading a raid.
+## so `aowlspt-sim` can tick it with no game in the process. It is also what
+## makes `model/characterise.nim` possible — the model can be driven with
+## synthetic input traces and its output bounded, offline, in a second, which is
+## the only way anything about this mod's *behaviour* has ever been checked.
 ##
 ## ---------------------------------------------------------------------------
 ## What reaches the game, and how
@@ -57,43 +65,98 @@
 ## collector moves objects and a cached pointer is a use-after-free waiting for
 ## its moment.
 ##
-## **What is still not reachable, said plainly:**
+## **Which patch shape, and why each.** All three of them are on this mod now,
+## and they were chosen by what each firing costs:
 ##
-## * **The `EPhysicalCondition` mask.** It is the argument to
-##   `PhysicalConditionUpdated`, and `hookArgs` would hand it over — except that
-##   the host encodes an argument it does not recognise as a *reference*, and
-##   an enum is a value type. It would call `il2cpp_gchandle_new` on the small
-##   integer `2`. So this mod does not ask for that method's arguments. The one
-##   thing the mask carried that nothing else exposes is the neurological
-##   tremor condition (stims, shock), so `neuroTremor` stays false; arm
-##   fractures and blacked limbs are read straight off the health controller
-##   instead, which the original could not do.
-## * **`LerpCamera`'s own `dt`.** Same reason it is not asked for: the frame
-##   delta is measured with `perfCounter` between detour firings instead, which
-##   is the same clock and costs twenty nanoseconds.
-## * **The view angles and the body velocity** are `Vector2`/`Vector3`
-##   properties, and a value-type *return* is unreachable on either path. They
-##   are read off the backing field instead, found by scanning `MovementContext`
-##   for a vector field with the right name and shape, once. The field it
-##   settled on is in the log.
+## * `LerpCamera` is a **typed postfix** (`hookReturnTyped`, ~37 ns) where the
+##   host offers one. That restores the BepInEx original's ordering — it used a
+##   Harmony postfix, so its impulse landed after BSG's own effectors had run —
+##   which the JSON patch could not buy at any acceptable price: a JSON postfix
+##   is 440 ns watching and 2.2 µs with arguments, and this fires every frame.
+##   The fallback on an older host is the plain **prefix** `hook`, which is a
+##   name comparison and lands the impulse a frame's ordering earlier against
+##   BSG's contribution. `AddAcceleration` accumulates rather than sets, so that
+##   is an ordering difference and not a different result.
+## * The typed frame also carries `this`, at no cost, and that fixed a real bug
+##   rather than saving a microsecond. `LerpCamera` runs on *an* animator, and
+##   bots have animators too; every firing used to step the whole model. The
+##   handler now walks to `MainPlayer`'s animator and returns for anything else
+##   — six loads and a comparison — so the model is stepped once a frame rather
+##   than once per animator per frame.
+## * `PhysicalConditionUpdated` is a **typed prefix**, and it hands over the
+##   `EPhysicalCondition` mask it is called with. See below.
 ##
-## Nothing here has ever run against Tarkov.
+## **What is still not reachable, said plainly:** `LerpCamera`'s own `dt`. Not
+## because it cannot be read — a typed frame would hand it over — but because
+## the interval between two firings of the detour is the same delta measured on
+## the same clock the fast path reports its own cost on, it costs twenty
+## nanoseconds, and it is correct on the fallback path too. The list used to be
+## longer; the rest of it is below, in the past tense.
+##
+## **What was on that list and no longer is.**
+##
+## * *A `Vector3` argument or return.* `bindRaw` binds a method by its native
+##   slot shape rather than by its signature, which is what a 12-byte struct
+##   passed and returned by hidden pointer needs. So `AddAcceleration`, the
+##   camera transform's `eulerAngles` and the player's `Velocity` are ordinary
+##   fast-path calls. `bindMethod` still refuses all three, and is still right
+##   to: `classifyType` asks the runtime whether a type is a value type and
+##   refuses every one that is, because a value type wider than eight bytes is
+##   not passed in a register at all. That refusal was re-derived against the
+##   current `aowlspt/fast` rather than assumed from an older mock run.
+## * *The `EPhysicalCondition` mask.* This paragraph used to say that `hookArgs`
+##   would encode an argument it did not recognise as a *reference* and call
+##   `il2cpp_gchandle_new` on the small integer `2`, so this mod did not ask for
+##   that method's arguments and `neuroTremor` stayed permanently false. **That
+##   is no longer true of the host.** An enum now arrives as a plain number, in
+##   both directions, on both the JSON path and the typed one. So the mask is
+##   read from the hook, `neuroTremor` — the stim-and-shock tremor condition,
+##   which nothing else on the player exposes — is live for the first time, and
+##   the arm flags are the mask's and the health controller's together rather
+##   than the health controller's alone.
+##
+## ---------------------------------------------------------------------------
+## What is known about how this behaves, and what is not
+## ---------------------------------------------------------------------------
+##
+## **Nothing here has ever run against Tarkov.** That has not changed and this
+## file will keep saying so.
+##
+## What *has* changed is that "never playtested" is no longer the same sentence
+## as "unknown". `model/characterise.nim` drives the model through step
+## responses, flicks, sixty-second envelopes at three levels of exhaustion, four
+## frame rates, a jittered frame clock, every preset, and a sweep of every
+## tunable that can destabilise it — and asserts bounds in degrees of point-of-aim
+## error, which convert to centimetres at a range. `aowl run mods/sway` runs all
+## of it and fails loudly. Every number this mod reports about itself comes from
+## that, from the model, and not from the game.
+##
+## The one thing that still cannot be settled offline is which way BSG's
+## `Spring` integrates the acceleration this mod hands it. That is one boolean,
+## `springAccelPerFrame`, it is worth a factor of sixty, and `model/spring.nim`
+## sets out the dimensional argument for the default. Everything downstream of
+## it — the drive gain — is derived from the spring's own `ReturnSpeed`, read
+## off the live object.
 
 import std/strutils
 import aowlspt
 import aowlspt/game
 import model/vec
+import model/fmt
 import model/tuning
+import model/limits
 import model/state
 import model/sources
 import model/director
+import model/spring
+import model/characterise
 import game/config
 import game/live
 
 const
   ModGuid = "com.savannt.sptsway"
   ModName = "SPT-SWAY"
-  ModVersion = "3.1.0"
+  ModVersion = "3.2.0"
 
 # ---------------------------------------------------------------------------
 # The model
@@ -129,7 +192,10 @@ var gWeaponChanges = 0
 var gWeaponChangesSeen = 0
 var gConditionChanges = 0
 var gConditionChangesSeen = 0
+var gConditionMask = 0
+var gConditionMaskKnown = false
 var gFrames = 0
+var gForeignFrames = 0
 
 var gHooksInstalled = false
 var gStarted = false
@@ -138,29 +204,7 @@ var gLastReadoutMs = 0'i64
 var gLastFrameTicks = 0'i64
 var gInjuryReadable = false
 var gSaidIdle = false
-
-# ---------------------------------------------------------------------------
-# Formatting
-# ---------------------------------------------------------------------------
-
-proc f3(v: float): string =
-  ## Three decimal places. `$` on a float here prints the full repr, which for
-  ## a readout of a dozen numbers per line is unreadable.
-  var neg = false
-  var x = v
-  if x < 0.0:
-    neg = true
-    x = -x
-  let scaled = int(x * 1000.0 + 0.5)
-  let whole = scaled div 1000
-  let frac = scaled mod 1000
-  var f = $frac
-  while f.len < 3:
-    f = "0" & f
-  result = (if neg: "-" else: "") & $whole & "." & f
-
-proc fmtVec(v: Vec3): string =
-  "p " & f3(v.x) & "  y " & f3(v.y) & "  r " & f3(v.z)
+var gTypedFrames = false
 
 # ---------------------------------------------------------------------------
 # The frame
@@ -181,36 +225,60 @@ proc drainEvents() =
 
   if gConditionChangesSeen < gConditionChanges:
     gConditionChangesSeen = gConditionChanges
-    if not gInjuryReadable:
-      # No health controller to ask, so all that arrived is "something
-      # changed" — the mask itself is the hooked method's argument and this
-      # mod does not read it (see the header). Clearing the flags is the honest
+    if not gInjuryReadable and not gConditionMaskKnown:
+      # No health controller to ask and no mask from the hook, so all that
+      # arrived is "something changed". Clearing the flags is the honest
       # response: claiming a fracture the player does not have would multiply
       # their sway by 2.4 for no reason.
       applyCondition(gState, 0, false, gTuning.injuryEnabled)
 
 proc sampleInjury() =
-  ## Arm state, read rather than inferred from a hook.
+  ## Arm state. From the hook's own `EPhysicalCondition` mask where the host
+  ## delivered one, and from the health controller for the part the mask cannot
+  ## answer.
+  ##
+  ## The two are not alternatives. The mask says which arms are *damaged* and
+  ## whether the neurological tremor condition is set — and it is the only thing
+  ## anywhere that says the second. The health controller distinguishes a
+  ## fracture from a destroyed limb, which the mask's single "damaged" bit
+  ## cannot. `applyCondition` owns the decoding, in `model/`, so the rule that a
+  ## damaged but not destroyed arm means a fracture lives with the rest of the
+  ## physics rather than here.
   var fractured = false
   var blacked = false
   gInjuryReadable = sampleArmInjury(fractured, blacked)
-  if not gInjuryReadable:
+
+  var mask = 0
+  if gConditionMaskKnown:
+    mask = gConditionMask
+  if gInjuryReadable and (fractured or blacked):
+    mask = mask or PcLeftArmDamaged
+  if not gInjuryReadable and not gConditionMaskKnown:
     return
-  # `applyCondition` owns the decoding, in `model/`, so the rule that a damaged
-  # but not destroyed arm means a fracture lives with the rest of the physics
-  # rather than here. It takes BSG's bitmask, so the two booleans are put back
-  # into one.
-  let mask = (if fractured or blacked: PcLeftArmDamaged else: 0)
   applyCondition(gState, mask, blacked, gTuning.injuryEnabled)
 
-proc onFrame() =
+proc onFrame(self: uint64) =
   ## One rendered frame: reach the game, sample it, step the model, push the
   ## result into the springs.
-  if not beginFrame(gTuning):
+  ##
+  ## `self` is the animator this firing was for, or 0 on a host that cannot say.
+  ## Anything that is not the local player's animator is dropped here, before
+  ## anything is bound, written or integrated.
+  if not reachFrame():
     return
+  if self != 0'u64:
+    let mine = localAnimator()
+    if mine != 0'u64 and self != mine:
+      inc gForeignFrames
+      return
+
+  inc gFrames
+  finishFrame(gTuning)
+  reportCalibration(gTuning)
 
   # The frame delta, measured between two firings of this detour on the same
-  # clock the fast path reports its own cost on.
+  # clock the fast path reports its own cost on. Taken after the guard above,
+  # so a bot's animator cannot shorten the local player's frame.
   let dt = frameDelta(gLastFrameTicks)
 
   drainEvents()
@@ -224,13 +292,13 @@ proc onFrame() =
 
   let o = tick(gDirector, gState, gTuning, dt)
 
-  # `springImpulse` is in `model/` because it is arithmetic — degrees to the
-  # acceleration the springs expect, normalised to a 60 Hz frame so the mod is
-  # not twice as strong at 120 fps. It carries `driveGain`, the one constant in
-  # this mod that was calculated rather than measured; `live.actuate` says so
-  # again at the point it first matters.
-  actuate(springImpulse(o.hands, gTuning, dt),
-          springImpulse(o.camera, gTuning, dt), gTuning)
+  # `springImpulse` is in `model/` because it is arithmetic: degrees times the
+  # spring's own `ReturnSpeed` times `driveGain`, which is a trim rather than
+  # the unverified absolute constant it used to be. `live.handsCal` reads the
+  # spring's constants off the live object; `model/spring.nim` is the
+  # derivation and states the one thing still assumed.
+  actuate(springImpulse(o.hands, gTuning, handsCalNow(), dt),
+          springImpulse(o.camera, gTuning, cameraCalNow(), dt), gTuning)
 
 # ---------------------------------------------------------------------------
 # Hooks
@@ -240,6 +308,36 @@ proc onFrame() =
 # proc touch its enclosing scope without being made a closure, and a closure is
 # not a plain function pointer so it could not cross the C ABI anyway.
 
+proc firstInt(json: string; out1: var int): bool =
+  ## The first integer in a JSON array, for the `hookArgs` fallback path.
+  ##
+  ## Not a parser. The payload is `[2]` or `[2,true]` and the host is its only
+  ## producer, so a scan for the first run of digits is the whole job — and an
+  ## enum now arrives as exactly that, which is the change this path exists to
+  ## take advantage of.
+  out1 = 0
+  var i = 0
+  var neg = false
+  while i < json.len and (json[i] < '0' or json[i] > '9'):
+    if json[i] == '-':
+      neg = true
+    elif json[i] != '[' and json[i] != ' ':
+      return false
+    inc i
+  if i >= json.len:
+    return false
+  var n = 0
+  while i < json.len and json[i] >= '0' and json[i] <= '9':
+    n = n * 10 + (ord(json[i]) - ord('0'))
+    inc i
+  out1 = (if neg: -n else: n)
+  result = true
+
+proc noteCondition(mask: int) =
+  inc gConditionChanges
+  gConditionMask = mask
+  gConditionMaskKnown = true
+
 proc onShotFired(target: string) =
   inc gShots
 
@@ -247,18 +345,61 @@ proc onWeaponInit(target: string) =
   inc gWeaponChanges
 
 proc onConditionUpdated(target: string) =
+  ## The last-resort form: something changed, and nothing says what.
   inc gConditionChanges
 
+proc onConditionArgs(target, args: string): HookResult =
+  ## The JSON form. `PhysicalConditionUpdated` fires when a limb state changes,
+  ## which is a handful of times a raid, so 2 µs of payload here is free — this
+  ## is exactly the case `docs/MODDING.md` says to use `hookArgs` for.
+  var m = 0
+  if firstInt(memberRaw(args, "args"), m):
+    noteCondition(m)
+  else:
+    inc gConditionChanges
+  carryOn()
+
+proc onConditionTyped(f: PatchFrame): TypedResult =
+  ## The typed form. One register read, no payload, no handle.
+  var ok = false
+  let m = argInt(f, 0, ok)
+  if ok:
+    noteCondition(int(m))
+  else:
+    inc gConditionChanges
+  frameContinue()
+
 proc onLerpCamera(target: string) =
-  inc gFrames
-  onFrame()
+  ## The fallback frame handler: no `this`, so every animator's firing steps the
+  ## model. Correct for a raid with one animator in it and wrong for any other,
+  ## which is why the typed form is preferred and why installing this one says
+  ## so.
+  onFrame(0'u64)
+
+proc onLerpTyped(f: PatchFrame): TypedResult =
+  ## The frame, with `this` in hand. A postfix: the original has run, BSG's own
+  ## effectors have had their say, and this mod's impulse lands after them —
+  ## which is what the BepInEx build did and what the JSON patch could not
+  ## afford.
+  onFrame(selfPointer(f))
+  frameContinue()
 
 proc installHooks() =
-  ## Four detours, each reported individually. A method that cannot be patched
-  ## costs that one signal; the C# original would have failed to load.
+  ## Four detours, each reported individually, each taking the cheapest shape
+  ## this host offers. A method that cannot be patched costs that one signal;
+  ## the C# original would have failed to load.
   if gHooksInstalled:
     return
   gHooksInstalled = true
+
+  gTypedFrames = typedPatchesReady()
+  if gTypedFrames:
+    info "sway  the host offers typed patches; using them on the frame and " &
+         "on the condition mask"
+  else:
+    warn "sway  this host has no typed patches (ABI revision 4). Falling back " &
+         "to the JSON forms, and the frame handler cannot tell the local " &
+         "player's animator from a bot's"
 
   if hook("EFT.Player::OnMakingShot", onShotFired) == Ok:
     info "hooked EFT.Player::OnMakingShot"
@@ -271,29 +412,51 @@ proc installHooks() =
   else:
     warn "weapon changes will not reset the inertia state: " & lastError()
 
-  if hook("EFT.Animations.ProceduralWeaponAnimation::PhysicalConditionUpdated",
-          onConditionUpdated) == Ok:
-    info "hooked ProceduralWeaponAnimation::PhysicalConditionUpdated"
-  else:
+  # The condition mask, in order of preference. All three end at the same
+  # place; only the first two carry the mask, and only the mask carries the
+  # neurological tremor condition.
+  const CondTarget =
+    "EFT.Animations.ProceduralWeaponAnimation::PhysicalConditionUpdated"
+  var condOk = false
+  if gTypedFrames:
+    if hookTyped(CondTarget, onConditionTyped) == Ok:
+      condOk = true
+      info "hooked PhysicalConditionUpdated (typed; the mask is read from " &
+           "the register it arrives in)"
+  if not condOk:
+    if hookArgs(CondTarget, onConditionArgs) == Ok:
+      condOk = true
+      info "hooked PhysicalConditionUpdated (JSON arguments; the mask arrives " &
+           "as a number)"
+  if not condOk:
+    if hook(CondTarget, onConditionUpdated) == Ok:
+      condOk = true
+      warn "hooked PhysicalConditionUpdated without its argument: arm injury " &
+           "comes from the health controller only, and the stim tremor " &
+           "condition cannot be seen at all"
+  if not condOk:
     warn "arm injury will not be noticed: " & lastError()
 
   # LerpCamera runs every rendered frame, on Unity's main thread, and this is
-  # where the whole mod happens: sample, step, actuate.
-  #
-  # Two honest differences from the BepInEx original. It used a Harmony
-  # **postfix**, so its impulse landed after BSG's own effectors had run;
-  # aowlspt's patch is an entry detour and the host ignores the
-  # prefix/postfix distinction, so ours lands before them. `AddAcceleration`
-  # accumulates rather than sets, so that is one frame of ordering against
-  # BSG's contribution rather than a different result. And it resolved the
-  # player from the `this` the patch handed it; this one walks from the world
-  # to `MainPlayer`, which reaches the same object and is why the local player's
-  # animator is the only one driven — bots run the same animator and driving
-  # their sway from this model would be both wrong and expensive.
-  if hook("EFT.Animations.ProceduralWeaponAnimation::LerpCamera",
-          onLerpCamera) == Ok:
-    info "hooked ProceduralWeaponAnimation::LerpCamera"
-  else:
+  # where the whole mod happens: sample, step, actuate. A typed postfix first,
+  # because that is the shape the BepInEx original had and it is now affordable;
+  # the prefix if the host cannot.
+  const FrameTarget = "EFT.Animations.ProceduralWeaponAnimation::LerpCamera"
+  var frameOk = false
+  if gTypedFrames:
+    if hookReturnTyped(FrameTarget, onLerpTyped) == Ok:
+      frameOk = true
+      success "hooked LerpCamera as a typed postfix — the impulse lands after " &
+              "BSG's own effectors, as it did under BepInEx"
+    elif hookTyped(FrameTarget, onLerpTyped) == Ok:
+      frameOk = true
+      info "hooked LerpCamera as a typed prefix (a postfix was refused: " &
+           lastError() & ")"
+  if not frameOk:
+    if hook(FrameTarget, onLerpCamera) == Ok:
+      frameOk = true
+      info "hooked LerpCamera as a plain prefix"
+  if not frameOk:
     error "the model has no frame to run on: " & lastError() &
           ". Nothing will move."
 
@@ -308,10 +471,11 @@ proc publish() =
   ## Now it is a courtesy, so it moved to the host's tick: emitting an event and
   ## writing a file on every rendered frame would cost more than the physics.
   let o = gDirector.last
-  var payload = "{\"hands\":[" & f3(o.hands.x) & "," & f3(o.hands.y) & "," &
-                f3(o.hands.z) & "],\"camera\":[" & f3(o.camera.x) & "," &
-                f3(o.camera.y) & "," & f3(o.camera.z) & "],\"multiplier\":" &
-                f3(o.multiplier) & ",\"actuating\":" &
+  var payload = "{\"hands\":[" & fmt3(o.hands.x) & "," & fmt3(o.hands.y) & "," &
+                fmt3(o.hands.z) & "],\"camera\":[" & fmt3(o.camera.x) & "," &
+                fmt3(o.camera.y) & "," & fmt3(o.camera.z) & "],\"multiplier\":" &
+                fmt3(o.multiplier) & ",\"clipped\":" &
+                (if o.clipped: "true" else: "false") & ",\"actuating\":" &
                 (if actuating(): "true" else: "false") & "}"
   discard emit("sway.output", payload)
   if storeReady():
@@ -328,18 +492,23 @@ proc readout() =
   let s = gState
   let d = gDirector
   info "sway  aiming " & (if s.isAiming: "yes" else: "no") &
-       "  support " & f3(s.supportFactor) &
-       "  handling " & f3(s.handlingFactor)
-  info "sway  stamina " & f3(s.stamina) & "  oxy " & f3(s.oxygen) &
-       "  arms " & f3(s.armStamina) & "  exertion " & f3(s.exertion)
-  info "sway  ergo " & f3(s.ergonomics) & "  weight " & f3(s.weightKg) &
-       " kg  recoil " & f3(s.recoilStat) &
-       "  fracture " & (if s.armFractured: "yes" else: "no")
-  info "sway  breath " & f3(d.breath.rateBpm) & " bpm  phase " &
-       f3(d.breath.phase) & "  pulse " & f3(d.heart.bpm) & " bpm"
-  info "sway  multiplier " & f3(d.last.multiplier)
+       "  support " & fmt3(s.supportFactor) &
+       "  handling " & fmt3(s.handlingFactor)
+  info "sway  stamina " & fmt3(s.stamina) & "  oxy " & fmt3(s.oxygen) &
+       "  arms " & fmt3(s.armStamina) & "  exertion " & fmt3(s.exertion)
+  info "sway  ergo " & fmt3(s.ergonomics) & "  weight " & fmt3(s.weightKg) &
+       " kg  recoil " & fmt3(s.recoilStat) &
+       "  fracture " & (if s.armFractured: "yes" else: "no") &
+       "  tremor " & (if s.neuroTremor: "yes" else: "no")
+  info "sway  breath " & fmt3(d.breath.rateBpm) & " bpm  phase " &
+       fmt3(d.breath.phase) & "  pulse " & fmt3(d.heart.bpm) & " bpm"
+  info "sway  multiplier " & fmt3(d.last.multiplier) &
+       (if d.last.clipped: "  (output at its ceiling)" else: "")
   info "sway  hands  " & fmtVec(d.last.hands)
   info "sway  camera " & fmtVec(d.last.camera)
+  if gForeignFrames > 0:
+    info "sway  frames driven " & $gFrames & ", firings for another " &
+         "animator dropped " & $gForeignFrames
 
 # ---------------------------------------------------------------------------
 # Mod entry points
@@ -359,6 +528,14 @@ proc onLoad(): Status =
     info "preset: " & presetName(gTuning.preset) &
          " (it overwrites the values in config.json)"
 
+  # Every value, brought inside the range the offline characterisation found it
+  # is stable in — and every one that had to move, said out loud. A JSON file
+  # has no slider to constrain it, so this is the only thing standing between a
+  # typo and a spring integrating a NaN.
+  let clamps = clampTuning(gTuning)
+  for m in clamps:
+    warn "sway  " & m
+
   reset(gDirector.heart, gTuning)
 
   success ModName & " " & ModVersion & " loaded on " & hostName()
@@ -375,59 +552,70 @@ proc onLoad(): Status =
   Ok
 
 proc simSelfTest() =
-  ## `aowl run mods/sway` ends here. It is not a demo: it is the only place the
-  ## model is exercised end to end without a game, and it fails loudly if a
-  ## source has been broken.
+  ## `aowl run mods/sway` ends here, and this is the only thing that has ever
+  ## established anything about how this mod behaves.
+  ##
+  ## It is not a demo and it is not a smoke test. It drives the model through
+  ## `model/characterise.nim` — step responses against the closed form of the
+  ## oscillator the inertia source claims to be *and* of the game's own rotation
+  ## spring, the spring's clamp and saturation, the 131-entry limiter tables and
+  ## what the clamp does to a config full of infinities, a mouse flick,
+  ## sixty-second envelopes at three levels of exhaustion, four frame rates, a
+  ## jittered frame clock, a thirty-round burst, every shipped preset, the
+  ## spring calibration, and a sweep of every tunable that can destabilise it —
+  ## and it fails if any measured number leaves its band.
+  ##
+  ## It ends with a block that asserts nothing: the model's behaviour in the
+  ## units a raid can contradict — settling time, overshoot, steady-state
+  ## amplitude at rest and at full exertion — and the short list of what one
+  ## raid would settle. That block exists so that a player can say which number
+  ## is wrong instead of saying that it feels off.
   ##
   ## Note what it does *not* touch: nothing in `game/`. The model takes a state
   ## record and a tuning record and returns two vectors, and that is still true
   ## now that something is on the other end of it.
-  var t = defaultTuning()
-  var s = freshState()
-  var d = newDirector()
-  reset(d.heart, t)
+  let cal = defaultCal()
+  info "sim  characterising the model against the shipped tuning"
+  info "sim  spring assumed: ReturnSpeed " & fmtNum(cal.returnSpeed) &
+       ", Damping " & fmtNum(cal.damping) &
+       ", acceleration " &
+       (if cal.perFrameAccel: "per frame" else: "per second") &
+       " (see model/spring.nim)"
 
-  # A shooter halfway through a sprint, aiming, with a heavy rifle. Exactly the
-  # case where every source is contributing at once.
-  s.isAiming = true
-  s.stamina = 0.35
-  s.oxygen = 0.55
-  s.armStamina = 0.6
-  s.weightKg = 5.2
-  s.ergonomics = 38.0
-  s.moveSpeed = 1.4
+  var rep = characterise(cal, true)
 
-  var peak = 0.0
-  var peakImpulse = 0.0
   var i = 0
-  const Frames = 600            # ten seconds at 60 fps: two full breaths
-  while i < Frames:
-    drive(d.inertia, float(i) * 0.7, 0.0, Zero3, s, t, 1.0 / 60.0)
-    let o = tick(d, s, t, 1.0 / 60.0)
-    let m = magnitude(o.hands)
-    if m > peak:
-      peak = m
-    let im = magnitude(springImpulse(o.hands, t, 1.0 / 60.0))
-    if im > peakImpulse:
-      peakImpulse = im
+  while i < rep.summaryFrom:
+    let c = rep.checks[i]
+    if c.banded and not c.ok:
+      error "sim  " & line(c)
+    else:
+      info "sim  " & line(c)
     inc i
 
-  info "sim  " & $Frames & " frames of a spent shooter aiming a 5.2 kg rifle"
-  info "sim  peak hands deflection " & f3(peak) & " deg"
-  info "sim  peak spring impulse " & f3(peakImpulse) &
-       " (degrees x driveGain " & f3(t.driveGain) & ", never playtested)"
-  info "sim  breath " & f3(d.breath.rateBpm) & " bpm, pulse " &
-       f3(d.heart.bpm) & " bpm, exertion " & f3(s.exertion)
-  info "sim  handling " & f3(s.handlingFactor) & ", support " &
-       f3(s.supportFactor) & ", multiplier " & f3(d.last.multiplier)
+  info "sim  stable ranges, swept:"
+  for p in rep.ranges:
+    if p.ok:
+      info "sim    " & line(p)
+    else:
+      error "sim    " & line(p)
 
-  if peak <= 0.0:
-    error "sim  the model produced nothing; a source is broken"
-  elif peak > 20.0:
-    error "sim  the model produced " & f3(peak) &
-          " degrees, which is not sway, it is a catapult"
+  # And last, because it is the part written for a reader rather than for a
+  # gate: the model's behaviour in the units a raid can contradict, and the
+  # short list of what one raid would settle. Nothing here is asserted.
+  info "sim  ================ the model, as numbers a raid can argue with ==="
+  while i < rep.checks.len:
+    info "sim  " & line(rep.checks[i])
+    inc i
+
+  if rep.failures == 0 and rep.rangeFailures == 0:
+    success "sim  " & $rep.checks.len & " measurements and " &
+            $rep.ranges.len & " parameter sweeps, all inside their bounds. " &
+            "This is the model, not the game: nothing here has run against " &
+            "BSG's client."
   else:
-    success "sim  the model is live and inside its sane band"
+    error "sim  " & $rep.failures & " measurement(s) and " &
+          $rep.rangeFailures & " parameter range(s) outside their bounds"
 
 proc onUpdate(elapsedMs: int64): Status =
   inc gTicks
@@ -440,6 +628,14 @@ proc onUpdate(elapsedMs: int64): Status =
 
   if side() != sideClient:
     return Ok
+
+  # The static-field probe, above the raid gate on purpose. It needs a runtime
+  # and nothing else, and everything below `world.ready()` waits for an
+  # animator that only exists in a raid — so put here it runs on every client
+  # boot, and put below it would go on being a code path nothing had executed.
+  # `openRuntime` is idempotent and is called again below for the hooks.
+  if openRuntime():
+    probeStaticRoot()
 
   if world.ready():
     success "the weapon animator is up"
@@ -482,7 +678,8 @@ proc onUpdate(elapsedMs: int64): Status =
 
 proc onUnload(): Status =
   info ModName & " unloaded after " & $gTicks & " ticks and " & $gFrames &
-       " rendered frames"
+       " rendered frames (" & $gForeignFrames & " firings were another " &
+       "animator's and were dropped)"
   Ok
 
 exportMod(

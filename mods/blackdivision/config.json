@@ -1,18 +1,78 @@
 {
+  "_comment": "aowl.blackdivision. A hostile PMC faction of six roles that hunts the player across ten maps and camps the Labs extracts. Everything it does is server-side database writing through mods/morebots; the client half is a read-only watch that reports whether the squad turned up. Every key below is documented on the line above it. README.md says which of the original's features survived post-1.0 and which cannot.",
+
+  "//debug": "Extra per-registration logging: one line per bot type, per loadout, per relation. Off by default because it is 25 lines at every load and says nothing a working install needs to hear.",
   "debug": {
     "logs": false
   },
+
+  "//achievements": "Load the three hidden kill-count achievements (4, 12 and 50 Black Division operators, each unlocking a Ragman loyalty-4 assortment) and their locale strings. Upstream ships this data and never loads it -- the call is commented out in its Mod.cs -- so it is here behind a switch rather than shipped dead. Running twice does not give six achievements; the ids are filtered out and re-appended.",
   "achievements": true,
+
+  "//armoryLoadouts": "Swap the assault role onto the WTT-Armory weapon pool. Requires WTT-Armory to be installed: every one of the eleven template ids in that loadout is one of its items, and with it absent the assault role's primary-weapon pool is EMPTY and those bots spawn unarmed. `aowl run mods/blackdivision` names the ids it cannot verify. Upstream detected the mod by GUID; there is no mod-list query in this plugin API, so it is a switch and you are the one who knows what you installed.",
   "armoryLoadouts": false,
+
+  "//csGasGrenades": "Give Wedge and the raiders a CS-gas canister in pockets and secured container, at a weight high enough that they always have one. Requires the Manimal CS-gas mod; without it the id resolves to nothing and the slot is simply empty, which is harmless rather than broken.",
   "csGasGrenades": false,
+
+  "//hostility": "Who Black Division shoots and who shoots back. Each entry applies BOTH directions of the pairing -- an enemy list is one bot's opinion, not a relationship -- and each is a set of edits to ENEMY_BOT_TYPES inside the four difficulty blocks of every affected bot type. Turning one off does not un-write a previous run's edits; the lists are a union and this mod does not own them.",
+  "hostility": {
+    "//scavs": "Scavs, scav bosses, smugglers, bloodhounds and raiders (the `savage` faction: 37 roles).",
+    "scavs": true,
+    "//rogues": "The Lighthouse rogues and the Knight/Big Pipe/Bird Eye trio.",
+    "rogues": true,
+    "//pmcs": "USEC and BEAR. Turning this off does NOT make Black Division friendly to you -- the template's DEFAULT_*_BEHAVIOUR is AlwaysEnemies, which is a separate and stronger statement. It only stops them fighting AI PMCs.",
+    "pmcs": true,
+    "//infected": "The infected roles, if this build has them.",
+    "infected": true,
+    "//ruaf": "The RUAF faction from TacticalToaster's other mod, applied only if a faction by that name turns out to exist. Asking for a relation toward a faction nobody defined is one warning line in morebots' log and nothing else, which is a better trade than this mod trying to detect a mod it cannot see.",
+    "ruaf": true,
+    "//revenge": "Black Division avenges its own dead: a bot that watches a squadmate die goes looking for whoever did it.",
+    "revenge": true
+  },
+
+  "//watchIntervalMs": "How often the client half looks for Black Division bots in the raid. Read-only; it writes nothing into the game. Floored at 500.",
+  "watchIntervalMs": 5000,
+
+  "//selfTestRuntime": "A GameAssembly.dll for `aowl run` to bind the watch against, so the binding report is a real answer offline. Empty means the process, which under aowlspt-sim has no runtime at all.",
+  "selfTestRuntime": "",
+
+  "//spawns": "Where and when the squad turns up. All of it is rewritten into locations.<map>.base.BossLocationSpawn at load and again at the end of every raid, so two raids on the same map are not the same raid. This mod's own entries are removed and rebuilt each time; anybody else's are copied through untouched.",
   "spawns": {
+    "//enabled": "The roaming hunt on the maps listed below. Turning it off also REMOVES this mod's previous entries from the database, because the database persists and a switch that only stops adding would leave the last raid's squads in place for ever.",
+    "enabled": true,
+
+    "//labsEvent": "Wedge with an escort of three to six raiders in the three Labs interior zones, on a `labsStartChance` roll.",
+    "labsEvent": true,
+
+    "//labsGateAmbushes": "A breacher-led team waiting at a Labs extraction trigger when you go for the door, rather than wandering the map for forty minutes first. The two gates roll independently, so the interesting case -- one gate watched and the other not -- actually happens.",
+    "labsGateAmbushes": true,
+
+    "//showOnMap": "Put a marker for the squad on the map screen (ShowOnTarkovMap). False, and it should be: this faction is a hunt, and a hunt you can read off the pre-raid screen is a patrol.",
+    "showOnMap": false,
+
+    "//chance": "Percent chance the hunt squad exists at all on a given map in a given raid. 0 to 100. At 25 you meet them in roughly one raid in four per map.",
     "chance": 25,
+
+    "//minTime": "Earliest arrival, as a fraction of the raid's own EscapeTimeLimit. 0.1 is one tenth of the way in.",
     "minTime": 0.1,
+
+    "//maxTime": "Latest arrival, same units. The roll between the two is biased LOW (smallest of three draws), because a squad that arrives in the first third is the event and a uniform roll puts half of them past the point where you have already extracted.",
     "maxTime": 0.8,
+
+    "//minHuntSize": "Smallest squad, leader included.",
     "minHuntSize": 3,
+
+    "//maxHuntSize": "Largest squad, leader included. Squads are mixed: the lead runs 45% of them, the assault 30%, the support 15% and the breacher the rest, and the escort is never the same role as the leader.",
     "maxHuntSize": 5,
+
+    "//labsGateChances": "Percent chance that ONE gate ambush exists this raid. Rolled once per gate, so at 20 both gates are watched about one raid in twenty-five and neither about two in three.",
     "labsGateChances": 20,
+
+    "//labsStartChance": "Percent chance of the Wedge event in Labs.",
     "labsStartChance": 15,
+
+    "//huntMaps": "Which maps the hunt reaches, by database key. A key this database does not have is skipped without complaint -- a partial database dump is an ordinary state, not a fault. Remove a map to be left alone on it.",
     "huntMaps": [
       "bigmap",
       "tarkovstreets",

@@ -10,7 +10,9 @@
 ##     1.2.3   =1.2.3    exactly
 ##     >=  >  <=  <      comparison
 ##     ~1.2.3            >=1.2.3 <1.3.0
-##     ^1.2.3            >=1.2.3 <2.0.0, and <0.3.0 when the major is 0
+##     ^1.2.3            >=1.2.3 <2.0.0
+##     ^0.2.3            >=0.2.3 <0.3.0 -- for a 0.x major the *minor* is the
+##                       breaking component, so caret pins it
 ##     ">=1.2.3 <2.0.0"  space-separated terms are ANDed
 ##
 ## `||` is refused rather than approximated. So is a version with fewer than

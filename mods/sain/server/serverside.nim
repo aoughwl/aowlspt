@@ -14,7 +14,10 @@
 ## `BotLocationModifier` per map that scales accuracy, sight gain, scattering
 ## and vision distance. SAIN does its own difficulty maths and those multipliers
 ## fight it, so the server sets all four to 1 and makes SAIN's numbers
-## authoritative.
+## authoritative. On **every** location, including the ones a mod that loads
+## after this one creates -- which is why there is a handshake here rather than
+## a single pass at load; see the block comment above
+## `neutraliseLocationModifiers`.
 ##
 ## **3. Serving the preset.** SAIN's server mod hosts the preset store and a web
 ## editor. This port serves the resolved preset as JSON on one route, which is
@@ -45,26 +48,160 @@ proc patchBrains() =
   ## the emulator's, for instance, or a fresh install with no dump -- answers
   ## `ErrNotFound`, and that is reported once rather than treated as a failure:
   ## a server with no bot config is a server with no bots to mis-brain.
+  #
+  # The three tables go in as **one** write, and the reason is the cost model
+  # rather than tidiness: the backend holds the database as one text document
+  # and a patch splices into it, so a `dbWrite` costs the size of the database
+  # -- around 130 ms on a 41 MB import -- however small the patch is. Three
+  # writes of forty bytes cost four hundred milliseconds of boot. One patch
+  # shaped like the paths reaches the same three members, because a merge
+  # recurses into an object member present on both sides.
   var applied = 0
   var missing = 0
 
-  if dbWrite("configs.pmc.pmcType", brainPatch().text) == Ok: inc applied
-  else: inc missing
-  if dbWrite("configs.bot.assaultBrainType",
-             """{"assault":1,"pmcBot":0}""") == Ok: inc applied
-  else: inc missing
-  if dbWrite("configs.bot.playerScavBrainType",
-             """{"pmcBot":1,"assault":0}""") == Ok: inc applied
-  else: inc missing
+  # Reads, not writes, decide what the log says. `dbWrite` *creates* a path the
+  # database has never held and reports Ok either way, so the old count of Ok
+  # statuses said "forced 3" on a database that carried none of the three. A
+  # probe can tell the difference between forcing a table and inventing one.
+  let probes = ["configs.pmc.pmcType", "configs.bot.assaultBrainType",
+                "configs.bot.playerScavBrainType"]
+  for p in probes:
+    if not dbRead(p).ok:
+      inc missing
+  applied = probes.len
+
+  let patch = "{\"pmc\":{\"pmcType\":" & brainPatch().text &
+              "},\"bot\":{\"assaultBrainType\":{\"assault\":1,\"pmcBot\":0}," &
+              "\"playerScavBrainType\":{\"pmcBot\":1,\"assault\":0}}}"
+  if dbWrite("configs", patch) != Ok:
+    warn "sain: could not write the brain tables"
+    applied = 0
+    missing = probes.len
 
   if applied > 0:
     info "sain: forced " & $applied & " brain table(s) to a brain SAIN drives"
   if missing > 0:
-    info "sain: " & $missing & " brain table(s) are not in this database; " &
-         "nothing to force (this is normal on the emulator)"
+    info "sain: " & $missing & " of those table(s) were not in this database " &
+         "and were created. That is the normal case on the emulator and on " &
+         "the 39 MiB import this was checked against -- neither carries a " &
+         "top-level `configs` object at all -- and it means the brain forcing " &
+         "reaches nothing here: it is SPT's bot generator that reads these " &
+         "paths, and there is not one on this server. The write is kept " &
+         "because an install that does have the tables is one where it works, " &
+         "and this is the only honest thing to say about the one that does not."
+
+# ---------------------------------------------------------------------------
+# The per-map difficulty skew
+# ---------------------------------------------------------------------------
+#
+# This used to be one procedure that read `locations`, wrote
+# `BotLocationModifier` onto every map it found, and was finished. That is
+# correct exactly once -- at the instant it runs -- and the instant it runs is
+# decided by the host's load order, which is a directory walk. A mod that
+# *adds* a location loads before or after this one by accident, and when it
+# loads after, its map has no modifier, no line is logged, and a player raiding
+# it gets BSG's difficulty skew fighting SAIN's own maths. `tools/allmods.nim`
+# found exactly that against `mods/icebreaker`: `locations.suburbs` is created
+# three positions later in the load order and never got one.
+#
+# The property that has to hold is "every location carries a neutral modifier,
+# whoever made it and whenever they made it", and it has to hold under any
+# order, because the order is not a thing either mod can see. So the work is
+# split in two:
+#
+#   * a **sweep** over whatever locations exist when this mod loads, which is
+#     the old behaviour and covers every mod that loaded first; and
+#   * a **subscription** to `aowlspt.locations.changed`, which covers every mod
+#     that loads afterwards. A mod that creates or rebinds a location says so,
+#     and every decorator that cares hears it.
+#
+# Plus the other half of the handshake, `aowlspt.locations.hello`: this mod
+# asks once at load, and anything that owns a location answers by announcing
+# it. That covers the third case -- a map mod that loaded first but wrote its
+# location later than its own `on_load` -- and it makes the contract symmetric,
+# so neither side has to be the one that loads first. It is the same shape as
+# `morebots.hello` / `morebots.ready`, deliberately: this repository already
+# has one order-independent handshake and a second one that worked differently
+# would be a second thing to learn.
+#
+# The handler runs on the announcing mod's stack, inside its `on_load`. That is
+# supported -- events are synchronous and nest -- and it is also why the
+# handler does the targeted thing rather than the cheap-to-write thing: it
+# reads only the locations the announcement names and writes one patch,
+# instead of pulling the whole `locations` subtree (tens of MB on an imported
+# database) back through a nested delivery.
+
+proc neutralPatch(): string =
+  result = """{"AccuracySpeed":1,"GainSight":1,"Scattering":1,""" &
+           """"VisibleDistance":1,"MarksmanAccuratyCoef":1}"""
+
+proc isNeutral(base1: JsonRef): bool =
+  ## Does this location's base already carry the five neutralised numbers?
+  ##
+  ## Only used to decide whether a *re*-announcement is worth a write. The
+  ## sweep at load does not ask: keeping "every map has this field" true by
+  ## construction is worth one merge, and reasoning about what a previous run
+  ## left behind is how the bug above happened in the first place.
+  result = false
+  let m = child(base1, "BotLocationModifier")
+  if not exists(m) or not isObject(m):
+    return false
+  let names = ["AccuracySpeed", "GainSight", "Scattering", "VisibleDistance",
+               "MarksmanAccuratyCoef"]
+  for n in names:
+    let f = child(m, n)
+    if not exists(f) or f.asFloat(0.0) != 1.0:
+      return false
+  result = true
+
+var gNeutralised: seq[string] = @[]
+  ## Every location id this mod has written a modifier onto. `/sain/status`
+  ## serves the count, so "which maps did SAIN actually reach" is answerable
+  ## from outside instead of inferred from the log -- which is the question the
+  ## missing `suburbs` modifier could not be asked.
+
+proc recorded(id: string): bool =
+  result = false
+  for k in gNeutralised:
+    if k == id:
+      return true
+
+proc neutralisedCount*(): int = gNeutralised.len
+proc neutralisedAt*(i: int): string =
+  ## By index rather than as a seq: returning the sequence and iterating the
+  ## result is not a borrow nimony will take.
+  result = ""
+  if i >= 0 and i < gNeutralised.len:
+    result = gNeutralised[i]
+
+proc writeModifiers(ids: seq[string]): int =
+  ## One `dbWrite` for however many maps, and the reason is the cost model
+  ## rather than tidiness: the backend holds the database as one text document
+  ## and a patch splices into it, so a `dbWrite` costs the size of the database
+  ## -- around 130 ms on a 41 MB import -- however small the patch is. Nineteen
+  ## maps used to be nineteen calls and 2.5 seconds of boot. A single
+  ## `locations` patch nesting all nineteen reaches exactly the same members,
+  ## because a merge recurses into an object member present on both sides.
+  result = 0
+  if ids.len == 0:
+    return 0
+  var patch = obj()
+  for id in ids:
+    var base1 = obj()
+    put(base1, "BotLocationModifier", raw(neutralPatch()))
+    var m = obj()
+    put(m, "base", base1)
+    put(patch, id, m)
+  if dbWrite("locations", done(patch).text) != Ok:
+    warn "sain: could not write the per-map difficulty modifiers"
+    return 0
+  for id in ids:
+    if not recorded(id):
+      gNeutralised.add id
+  result = ids.len
 
 proc neutraliseLocationModifiers() =
-  ## Set every map's `BotLocationModifier` to 1.
+  ## Set the `BotLocationModifier` to 1 on every map that exists right now.
   ##
   ## Enumerating the locations from the database rather than hard-coding a map
   ## list: a server with a modded map gets the same treatment, and a server with
@@ -72,19 +209,88 @@ proc neutraliseLocationModifiers() =
   ## there.
   let locations = dbRead("locations")
   if not locations.ok or locations.raw.len == 0:
-    info "sain: no locations in the database; per-map modifiers left alone"
+    info "sain: no locations in the database yet; per-map modifiers will be " &
+         "applied to each map as the mod that owns it announces it"
     return
   let doc = whole(locations.raw)
   if not doc.isObject:
     return
-  let ids = doc.keys()
-  const flat = """{"AccuracySpeed":1,"GainSight":1,"Scattering":1,""" &
-               """"VisibleDistance":1,"MarksmanAccuratyCoef":1}"""
-  var count = 0
-  for id in ids:
-    if dbWrite("locations." & id & ".base.BotLocationModifier", flat) == Ok:
-      inc count
-  info "sain: neutralised the difficulty skew on " & $count & " map(s)"
+  var ids: seq[string] = @[]
+  var notMaps = 0
+  for id in doc.keys():
+    # `locations` is a table this mod did not write and does not own, and the
+    # only thing it may assume about a member is what it can check. A member
+    # with no `base` object is not a map, and writing
+    # `locations.<x>.base.BotLocationModifier` onto one invents a path nothing
+    # will ever read -- the same class of mistake as writing a bot relation
+    # toward a faction the database has never heard of.
+    let entry = child(doc, id)
+    if not isObject(entry):
+      inc notMaps
+      continue
+    let base1 = child(entry, "base")
+    if not exists(base1) or not isObject(base1):
+      inc notMaps
+      continue
+    ids.add id
+  let n = writeModifiers(ids)
+  if n > 0:
+    info "sain: neutralised the difficulty skew on " & $n & " map(s)"
+  if notMaps > 0:
+    info "sain: " & $notMaps & " member(s) of `locations` carry no `base` " &
+         "object and were left alone; they are not maps"
+
+proc onLocationsChanged(payload: string): string =
+  ## `aowlspt.locations.changed`: a mod has created or rebound a location.
+  ##
+  ## The payload names them -- `{"guid":...,"locations":["suburbs"]}` -- and an
+  ## announcement that names none is answered with a full sweep, so a mod that
+  ## only manages to say "something changed" still gets its map decorated.
+  result = ""
+  let doc = whole(payload)
+  let named = child(doc, "locations")
+  var announced: seq[string] = @[]
+  if exists(named) and isArray(named):
+    for it in each(named):
+      let s = it.asText("")
+      if s.len > 0:
+        announced.add s
+  let who = child(doc, "guid").asText("a mod")
+  if announced.len == 0:
+    neutraliseLocationModifiers()
+    return ""
+  var todo: seq[string] = @[]
+  var absent = 0
+  for id in announced:
+    let b = dbRead("locations." & id & ".base")
+    if not b.ok or b.raw.len == 0:
+      # Announced and not there: the announcing mod has buffered its write and
+      # not flushed it. Nothing to decorate yet, and saying so is better than a
+      # write that creates half a location out of one field.
+      inc absent
+      continue
+    if isNeutral(whole(b.raw)):
+      continue
+    todo.add id
+  let n = writeModifiers(todo)
+  if n > 0:
+    info "sain: " & who & " announced " & $announced.len & " location(s); " &
+         "neutralised the difficulty skew on " & $n & " of them"
+  if absent > 0:
+    warn "sain: " & who & " announced " & $absent & " location(s) that are " &
+         "not in the database, so they were left alone. A mod that buffers " &
+         "its database writes should announce after it flushes them."
+
+proc watchForNewLocations() =
+  ## Subscribe first, then sweep, then ask. In that order, because a mod that
+  ## answers the hello answers it synchronously on this stack, and the handler
+  ## has to be in place before the question is asked.
+  discard onEvent("aowlspt.locations.changed", onLocationsChanged)
+  neutraliseLocationModifiers()
+  var hello = obj()
+  put(hello, "guid", "aowl.sain")
+  put(hello, "wants", "locations")
+  discard broadcast("aowlspt.locations.hello", hello)
 
 # ---------------------------------------------------------------------------
 # Routes
@@ -97,6 +303,17 @@ proc onStatus(url, body, session: string): string =
   put(o, "engageDistance", gPreset.base.engageDistance)
   put(o, "timeBeforeSearch", gPreset.base.timeBeforeSearch)
   put(o, "roles", gPreset.byRole.len)
+  # How many maps actually carry a neutralised modifier, rather than how many
+  # existed when this mod loaded. A map created by a mod that loads later shows
+  # up here once it has announced itself, so the number answers "did SAIN reach
+  # every map on this install" instead of "did SAIN run".
+  put(o, "mapsNeutralised", neutralisedCount())
+  var maps = arr()
+  var i = 0
+  while i < neutralisedCount():
+    add(maps, neutralisedAt(i))
+    inc i
+  put(o, "maps", maps)
   result = done(o).text
 
 proc onPreset(url, body, session: string): string =
@@ -127,7 +344,10 @@ proc startServer*(p: Preset) =
   if p.patchBrains:
     patchBrains()
   if p.neutraliseLocationModifiers:
-    neutraliseLocationModifiers()
+    # Not `neutraliseLocationModifiers()` on its own any more: that decorates
+    # the maps that exist at this instant, and which maps those are is decided
+    # by a directory walk. See the block comment above.
+    watchForNewLocations()
   discard serve("/sain/status", onStatus)
   discard serve("/sain/preset", onPreset)
   success "sain: server half ready"

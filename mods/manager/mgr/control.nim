@@ -33,16 +33,27 @@
 ##     -> `aowlspt.host.mods.listed`
 ##        {"mods":[{"guid","name","version","path","live","hotReloadable"}]}
 ##
-## **The mod half of that is implemented here and is complete.** The host half
-## is not written yet in either host, and cannot be written from a mod: an event
-## emitted by a mod is delivered to *subscribers*, and neither
-## `backend/aowlbackend.nim` nor `host/Aowlspt.Host.Il2Cpp/aowlhost.nim`
-## subscribes to anything. The exact patch each host needs is written out in
-## `host/Aowlspt.Overlay/README.md` under "What the rest of the tree needs to
-## change"; `host/common/modhost.nim` already carries the hard part
-## (`unloadOne`/`loadOne`/`unloadByGuid` behind `setModTeardown`).
+## **Both halves exist.** The mod half is this file. The host half is
+## `host/common/modcontrol.nim`, and both hosts drive it:
+## `backend/aowlbackend.nim` calls `controlInit` before `loadAll` and `drain`
+## in its serve loop, on top of `host/common/modhost.nim`'s `unloadOne` and the
+## teardown it requires; `host/Aowlspt.Host.Il2Cpp/aowlhost.nim` calls
+## `startModControl` after its mods are up and `modcontrol.drain` in its tick
+## loop, against its own loader's `unloadOne` and `dropModRegistrations`. So
+## enabling and disabling a mod while the game runs works on the server and in
+## the game.
 ##
-## Until a host answers, this degrades honestly: `requestLoad` and
+## **What this file talks to is still only the server's host.** The events below
+## are delivered to subscribers *in this process*, and the client host is a
+## different process — so `controlState()`, `liveKnown()` and every `ModState`
+## here describe the backend and nothing else. The client host is reached the
+## other way round: it polls `/aowlspt/mods/client` (see `manager.nim`) and
+## applies the answer itself through `modcontrol.applyDesired`. This module
+## never learns what happened over there, which is why `isLive` for a
+## client-only mod is the *backend's* answer — "not loaded here" — and why the
+## panel's `live` column is still the server's view.
+##
+## Where no host answers, this degrades honestly: `requestLoad` and
 ## `requestUnload` return `aoDeferred` with a sentence saying the change is
 ## recorded and takes effect on restart, and `liveKnown()` stays false so the
 ## panel says "unknown" rather than inventing a state. A manager that reports
@@ -56,8 +67,11 @@
 ##  * `unload` must run the mod's `on_unload`, drop its routes, its event
 ##    subscriptions and its timers, and free the library — a mod whose routes
 ##    survive its unload is still serving, and the manager would report it gone.
-##    That is exactly what `modhost.unloadOne` does, given the teardown the
-##    IL2CPP host already has as `dropModRegistrations`.
+##    That is exactly what `modhost.unloadOne` does, given a teardown. The
+##    backend installs one; the IL2CPP host does the same work in its own
+##    `unloadOne`, which runs `on_unload`, calls `dropModRegistrations` to take
+##    out that mod's subscriptions, queued callbacks and detours, and only then
+##    frees the library.
 ##  * A mod that cannot be torn down safely (no `mfHotReloadable`, a patch that
 ##    cannot be reverted) must answer `ok:false, deferred:true` rather than
 ##    being unloaded anyway. "Takes effect on restart" is a fine answer; a
@@ -83,10 +97,45 @@
 ## If the host would rather add ABI functions than events, the shape needed is
 ## the same three calls and one capability probe; only the transport changes,
 ## and only this file.
+##
+## ---------------------------------------------------------------------------
+## What is *not* here
+## ---------------------------------------------------------------------------
+##
+## Nothing in this file knows about the client host, and that is the design
+## rather than an omission. A process boundary cannot be crossed by an event, so
+## the client host asks over HTTP instead, on its own timer, and this manager
+## answers the same resolution it would have answered anyone. It is a second
+## *reader* of the decisions, not a second decider — which is why adding it cost
+## one route in `manager.nim` and not one line here.
 
 import aowlspt
 import aowlspt/server
 import aowlspt/json
+import aowlspt/sync
+
+## ## Which of these hold the mod's lock, and which are held under it
+##
+## The manager runs one lock over all of its own state (`aowlspt/sync`; the
+## whole discipline is written down in the header of `manager.nim`). This
+## module sits on both sides of it, and the split is not arbitrary:
+##
+##  * **Entry points from a host thread** -- the four event handlers -- take the
+##    lock themselves, because nothing above them is holding it. They take it
+##    for the table work and drop it before emitting or logging.
+##  * **Readers** -- `controlState`, `isLive`, `needsRestart`, `hostMessage`,
+##    `isPending`, `liveKnown` -- assume it is *already* held, because every
+##    caller is a route inside the guarded region. They must not take it: it is
+##    documented non-reentrant.
+##  * **`requestLoad` and `requestUnload` are called without it**, from
+##    `applySelection`, which gives the lock up for exactly this. They take it
+##    around their own reads and writes and never hold it across `broadcast`.
+##
+## That last rule is the one with teeth. `broadcast` is delivered synchronously
+## and the host answers a load or an unload by emitting
+## `aowlspt.host.mods.result` -- which lands in `onResult`, on this thread,
+## wanting the same lock. Holding it across the emit is a self-deadlock, and it
+## is one that only happens on the hosts that answer quickly.
 
 type
   ControlState* = enum
@@ -139,6 +188,8 @@ proc controlHost*(): string = gHostText
 proc recentResults*(): seq[string] = gLastResults
 
 proc liveKnown*(): bool =
+  ## Assumes the mod lock is held; every caller is inside a guarded region.
+  ##
   ## True only once a host has answered `aowlspt.host.mods.list`. Everything
   ## that reports "is this mod running" has to consult this first: with no
   ## answer the truthful value is *unknown*, and a panel that renders unknown as
@@ -286,26 +337,39 @@ proc requestList*() =
   ## said it can control mods — one that cannot is also one that has never been
   ## asked to keep a list, and a request that produces no reply would leave
   ## `liveKnown()` false forever, which is already what it is.
-  if gState != csPresent:
+  ##
+  ## Called *without* the lock: the emit below is answered by the host, and on
+  ## a host that answers it synchronously the answer arrives in `onListed` on
+  ## this thread.
+  var present = false
+  withModLock:
+    present = gState == csPresent
+  if not present:
     return
   var req = obj()
   put(req, "from", "aowl.manager")
   discard broadcast("aowlspt.host.mods.list", req)
 
 proc onCapabilities(payload: string): string =
+  ## An entry point: it arrives on whichever thread the host emitted from.
   let doc = whole(payload)
   let canControl = doc.field("control").asBool(false)
-  gHostText = doc.field("host").asText("a host") & " " &
-              doc.field("version").asText("")
-  if canControl and doc.field("unload").asBool(false):
-    gState = csPresent
-    success "manager: live mod control is available (" & gHostText & ")"
-    # Straight into a list: the capability answer says the host *can* say what
-    # is running, and every honest thing the panel prints needs to know it.
+  let present = canControl and doc.field("unload").asBool(false)
+  var text = ""
+  withModLock:
+    gHostText = doc.field("host").asText("a host") & " " &
+                doc.field("version").asText("")
+    text = gHostText
+    gState = (if present: csPresent else: csAbsent)
+  if present:
+    success "manager: live mod control is available (" & text & ")"
+    # Straight into a list, and *outside* the lock: the capability answer says
+    # the host can say what is running, and every honest thing the panel prints
+    # needs to know it -- but the host may answer `listed` on this thread, into
+    # a handler that would want the lock this one was still holding.
     requestList()
   else:
-    gState = csAbsent
-    info "manager: " & gHostText & " answered the control probe but cannot " &
+    info "manager: " & text & " answered the control probe but cannot " &
          "unload mods; selection changes will need a restart"
   result = ""
 
@@ -316,6 +380,10 @@ proc onListed(payload: string): string =
   let doc = whole(payload)
   let rows = each(doc.field("mods"))
   var next: seq[ModState] = @[]
+  var count = 0
+  # Explicit rather than `withModLock`, because the region has a `continue` in
+  # it and the template's body must be left the way it was entered.
+  lockMod()
   for r in rows:
     let guid = r.field("guid").asText("")
     if guid.len == 0:
@@ -338,7 +406,9 @@ proc onListed(payload: string): string =
                       message: wasMessage)
   gStates = next
   gListKnown = true
-  info "manager: the host reports " & $gStates.len & " loaded mods"
+  count = gStates.len
+  unlockMod()
+  info "manager: the host reports " & $count & " loaded mods"
   result = ""
 
 proc onResult(payload: string): string =
@@ -348,32 +418,42 @@ proc onResult(payload: string): string =
   let ok = doc.field("ok").asBool(false)
   let deferred = doc.field("deferred").asBool(false)
   let err = doc.field("error").asText("")
+  # An entry point, and the one most likely to arrive while a route is reading
+  # the same table: the host answers a load or an unload from its own thread,
+  # or from the thread that asked, some milliseconds later.
   if ok:
-    note action & " " & guid & ": done"
+    withModLock:
+      note action & " " & guid & ": done"
+      # The host did it, so the manager's picture of what is running is now one
+      # entry out of date and it is cheaper to fix it here than to re-list.
+      let at = ensureState(guid)
+      gStates[at].live = action == "load"
+      gStates[at].restart = false
+      gStates[at].pending = false
+      gStates[at].message = ""
     success "manager: " & action & " " & guid
-    # The host did it, so the manager's picture of what is running is now one
-    # entry out of date and it is cheaper to fix it here than to re-list.
-    let at = ensureState(guid)
-    gStates[at].live = action == "load"
-    gStates[at].restart = false
-    gStates[at].pending = false
-    gStates[at].message = ""
   elif deferred:
-    note action & " " & guid & ": deferred to restart (" & err & ")"
+    withModLock:
+      note action & " " & guid & ": deferred to restart (" & err & ")"
+      markRestart(guid, err)
     warn "manager: " & guid & " cannot be " & action & "ed while running: " & err
-    markRestart(guid, err)
   else:
-    note action & " " & guid & ": failed (" & err & ")"
+    withModLock:
+      note action & " " & guid & ": failed (" & err & ")"
+      # A failure is not a deferral, but it has the same consequence for the
+      # row: what you asked for is not what is running, and the panel must not
+      # show it as if it were.
+      markRestart(guid, err)
     error "manager: " & action & " " & guid & " failed: " & err
-    # A failure is not a deferral, but it has the same consequence for the row:
-    # what you asked for is not what is running, and the panel must not show it
-    # as if it were.
-    markRestart(guid, err)
   result = ""
 
 proc onProbeTimeout(payload: string): string =
-  if gState == csUnknown:
-    gState = csAbsent
+  var silence = false
+  withModLock:
+    if gState == csUnknown:
+      gState = csAbsent
+      silence = true
+  if silence:
     info "manager: no host answered the control probe, so this host has no " &
          "live enable/disable. Selection changes are saved and take effect " &
          "when the host restarts."
@@ -398,14 +478,18 @@ proc controlInit*(probeMs: int) =
   if wait < 1: wait = 1
   discard afterMs(wait, onProbeTimeout)
 
-proc unavailableMessage(): string =
-  if gState == csUnknown:
+proc unavailableMessage(state: ControlState): string =
+  ## Takes the state rather than reading it. Both callers already hold a
+  ## snapshot of it, and a message that re-reads a global describes a state the
+  ## answer beside it was not computed from.
+  if state == csUnknown:
     return "the host has not answered the control probe yet; the change is " &
            "saved and will be in effect at the latest on the next start"
   result = "this host has no live mod control, so the change is saved and " &
            "takes effect when it restarts"
 
 proc requestLoad*(guid, artifactDir, artifactLib: string): ApplyResult =
+  ## Called **without** the mod lock -- see the note at the top of this file.
   if artifactDir.len == 0 or artifactLib.len == 0:
     return ApplyResult(outcome: aoRefused,
                        message: guid & " has no `artifact` block in the " &
@@ -415,35 +499,56 @@ proc requestLoad*(guid, artifactDir, artifactLib: string): ApplyResult =
     return ApplyResult(outcome: aoRefused,
                        message: "the host did not say where mods live, so " &
                                 guid & " cannot be located")
-  if gState != csPresent:
-    return ApplyResult(outcome: aoDeferred, message: unavailableMessage())
+  # One look at the shared table, one snapshot, and then nothing held. The
+  # decision is made from the snapshot rather than by reading the globals again
+  # further down: between two reads a `listed` can arrive and turn "not there"
+  # into "there", and an answer assembled from both halves describes a state
+  # that never existed.
+  var state = csUnknown
+  var alreadyThere = false
+  withModLock:
+    state = gState
+    alreadyThere = gListKnown and isLive(guid)
+    if state == csPresent and alreadyThere:
+      clearRestart(guid)
+  if state != csPresent:
+    return ApplyResult(outcome: aoDeferred, message: unavailableMessage(state))
   # Already there, and the host said so itself. Answering `applied` without
   # sending anything is the idempotence `/apply` depends on: it states the whole
   # desired set every time, and a load per already-loaded mod per apply would be
   # a burst of host work for nothing.
-  if gListKnown and isLive(guid):
-    clearRestart(guid)
+  if alreadyThere:
     return ApplyResult(outcome: aoApplied, message: guid & " is already loaded")
   var req = obj()
   put(req, "guid", guid)
   put(req, "path", path)
+  # Emitted with nothing held: the host answers a load by emitting, and a host
+  # that answers immediately lands in `onResult` on this thread.
   if broadcast("aowlspt.host.mods.load", req) != Ok:
     return ApplyResult(outcome: aoRefused,
                        message: "the load request could not be emitted: " &
                                 lastError())
-  markRequested(guid)
+  withModLock:
+    markRequested(guid)
   result = ApplyResult(outcome: aoRequested,
                        message: "asked the host to load " & path)
 
 proc requestUnload*(guid: string): ApplyResult =
-  if gState != csPresent:
-    return ApplyResult(outcome: aoDeferred, message: unavailableMessage())
+  ## Called **without** the mod lock, for the same reason as the load side.
+  var state = csUnknown
+  var notThere = false
+  withModLock:
+    state = gState
+    notThere = gListKnown and not isLive(guid)
+    if state == csPresent and notThere:
+      clearRestart(guid)
+  if state != csPresent:
+    return ApplyResult(outcome: aoDeferred, message: unavailableMessage(state))
   # Not there. Same reasoning as the load side, and the more important half:
   # without it, every `/apply` would ask the host to unload every mod the
   # registry knows and the player has switched off — which is a stream of
   # "there was nothing there" results that reads like a fault.
-  if gListKnown and not isLive(guid):
-    clearRestart(guid)
+  if notThere:
     return ApplyResult(outcome: aoApplied, message: guid & " is not loaded")
   var req = obj()
   put(req, "guid", guid)
@@ -451,6 +556,7 @@ proc requestUnload*(guid: string): ApplyResult =
     return ApplyResult(outcome: aoRefused,
                        message: "the unload request could not be emitted: " &
                                 lastError())
-  markRequested(guid)
+  withModLock:
+    markRequested(guid)
   result = ApplyResult(outcome: aoRequested,
                        message: "asked the host to unload " & guid)

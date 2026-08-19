@@ -17,6 +17,7 @@
 import vec
 import types
 import settings
+import flank
 
 type
   SearchPhase* = enum
@@ -25,6 +26,13 @@ type
     spLookAround       ## arrived; scan from here
     spAdvancePast      ## push through, past the point, in the same direction
     spFlankGuess       ## try the obvious flank
+    ## The widest guess: a point on the far side of the uncertainty circle. A
+    ## search that has failed three narrower guesses is looking for someone who
+    ## moved, and how far they could have moved is exactly what `uncertainty`
+    ## has been accumulating since contact was lost. SAIN reaches something
+    ## similar by asking its cover finder for points around the last known
+    ## place; this asks the arithmetic instead.
+    spSweepWide
     spGiveUp
 
   SearchState* = object
@@ -40,17 +48,27 @@ type
     arrived*: bool
     progressStalled*: bool
     lastDistance*: float
+    ## How far the last known place could be wrong by, at the moment the search
+    ## started. Carried rather than recomputed so that a search does not widen
+    ## under its own feet while the bot walks -- the radius that matters is the
+    ## one at the moment contact was lost, plus what has elapsed since.
+    radius*: float
+    ## Which way the wide sweep goes. Drawn once per search from the bot's own
+    ## stream by the caller, so two bots searching the same room take opposite
+    ## halves of it.
+    side*: float
 
 func newSearch*(): SearchState =
   SearchState(phase: spIdle, target: zeroVec(), origin: zeroVec(),
               startedAt: 0.0, phaseStartedAt: 0.0, drift: zeroVec(),
-              arrived: false, progressStalled: false, lastDistance: 0.0)
+              arrived: false, progressStalled: false, lastDistance: 0.0,
+              radius: 6.0, side: 1.0)
 
 func active*(s: SearchState): bool =
   s.phase != spIdle and s.phase != spGiveUp
 
 proc begin*(st: var SearchState; from1: Vec3; lastKnown: Vec3; drift: Vec3;
-            now: float) =
+            now: float; radius: float = 6.0; side: float = 1.0) =
   ## Start, or restart, a search at a place.
   ##
   ## Restarting is the common case: every fresh sound or glimpse moves the
@@ -65,6 +83,11 @@ proc begin*(st: var SearchState; from1: Vec3; lastKnown: Vec3; drift: Vec3;
   st.arrived = false
   st.progressStalled = false
   st.lastDistance = distance(from1, lastKnown)
+  # Floored rather than taken raw: a search whose radius is zero has no wide
+  # phase at all, and the phase exists precisely for the case where the bot has
+  # been wrong three times already.
+  st.radius = clampf(radius, 6.0, 60.0)
+  st.side = (if side >= 0.0: 1.0 else: -1.0)
 
 proc cancel*(st: var SearchState) =
   st.phase = spIdle
@@ -76,7 +99,8 @@ func nextPhase*(p: SearchPhase): SearchPhase =
   of spMoveToLastKnown: spLookAround
   of spLookAround: spAdvancePast
   of spAdvancePast: spFlankGuess
-  of spFlankGuess: spGiveUp
+  of spFlankGuess: spSweepWide
+  of spSweepWide: spGiveUp
   of spGiveUp: spGiveUp
 
 func targetFor*(st: SearchState; botPos: Vec3): Vec3 =
@@ -90,7 +114,11 @@ func targetFor*(st: SearchState; botPos: Vec3): Vec3 =
   of spAdvancePast:
     let dir = (if sqrMagnitude(st.drift) > 0.01: normalized(st.drift)
                else: normalized(flat(st.target - st.origin)))
-    result = st.target + dir * 12.0
+    # As far past the point as the enemy could plausibly have got, rather than
+    # a fixed twelve metres. Someone lost thirty seconds ago is a long way
+    # further on than someone lost three seconds ago, and walking twelve metres
+    # in both cases is what makes a search look scripted.
+    result = st.target + dir * clampf(st.radius, 8.0, 30.0)
   of spFlankGuess:
     # Ninety degrees off the approach, on the side the bot is already nearer to,
     # so the flank does not cross the open ground it just crossed.
@@ -98,7 +126,9 @@ func targetFor*(st: SearchState; botPos: Vec3): Vec3 =
     let left = vec3(-approach.z, 0.0, approach.x)
     let toBot = flat(botPos - st.target)
     let side = (if dot(left, toBot) >= 0.0: left else: left * -1.0)
-    result = st.target + side * 10.0
+    result = st.target + side * clampf(st.radius * 0.6, 8.0, 20.0)
+  of spSweepWide:
+    result = searchWideTarget(st.target, st.origin, st.radius, st.side)
   else:
     result = st.target
 
@@ -144,6 +174,10 @@ proc advance*(st: var SearchState; botPos: Vec3; s: Settings; now: float) =
       st.target = targetFor(st, botPos)
       st.phaseStartedAt = now
     of spFlankGuess:
+      st.phase = spSweepWide
+      st.target = targetFor(st, botPos)
+      st.phaseStartedAt = now
+    of spSweepWide:
       st.phase = spGiveUp
     else:
       discard
@@ -157,4 +191,5 @@ func phaseName*(p: SearchPhase): string =
   of spLookAround: "LookAround"
   of spAdvancePast: "AdvancePast"
   of spFlankGuess: "FlankGuess"
+  of spSweepWide: "SweepWide"
   of spGiveUp: "GiveUp"

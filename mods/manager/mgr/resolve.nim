@@ -103,17 +103,45 @@ proc dropLast(s: var seq[string]) =
     keep.add s[i]
   s = keep
 
+proc cyclePath(stack: seq[string]; repeated: string): string =
+  ## The cycle itself, written out: `a -> b -> a`. Named rather than described,
+  ## because "one of your lists inherits itself" sends a person to read four
+  ## documents and "aowl.list.a -> aowl.list.b -> aowl.list.a" sends them to the
+  ## line that is wrong.
+  var at = -1
+  for i in 0 ..< stack.len:
+    if stack[i] == repeated and at < 0:
+      at = i
+  if at < 0:
+    at = 0
+  result = ""
+  for i in at ..< stack.len:
+    if result.len > 0: result.add " -> "
+    result.add stack[i]
+  if result.len > 0: result.add " -> "
+  result.add repeated
+
 proc flattenInto(reg: Registry; listId: string; stack: var seq[string];
                  seen: var seq[string]; entries: var seq[Merged];
-                 problems: var seq[string]) =
+                 problems: var seq[string]; cycled: var bool) =
   ## Depth-first over `inherits`, parents before the child's own entries.
   ##
   ## `stack` is the current path and is checked **before** `seen`: with the two
   ## the other way round, a diamond (two lists inheriting one parent) would be
   ## reported as a cycle, and a real cycle would be silently ignored.
+  ##
+  ## A cycle sets `cycled` and the *caller* throws the whole flattening away.
+  ## Breaking the edge and carrying on -- which is what this did until the
+  ## rules were read against it -- leaves a list that resolves to *something*,
+  ## and what that something is depends on which of the two lists the selection
+  ## happened to name first. `registry/README.md` step 1 says the list is
+  ## rejected entire and named, and that is a rule worth having precisely
+  ## because the alternative is a plausible-looking answer nobody can predict.
   if stack.contains(listId):
-    problems.add "list " & listId & " inherits itself, directly or through " &
-                 "another list; the whole list is rejected"
+    cycled = true
+    problems.add "a list inheritance cycle: " & cyclePath(stack, listId) &
+                 ". Nothing in that chain is applied; fix the `inherits` of " &
+                 "one of them."
     return
   if seen.contains(listId):
     return
@@ -125,7 +153,7 @@ proc flattenInto(reg: Registry; listId: string; stack: var seq[string];
   seen.add listId
   let inherits = reg.lists[idx].inherits
   for parent in inherits:
-    flattenInto(reg, parent, stack, seen, entries, problems)
+    flattenInto(reg, parent, stack, seen, entries, problems, cycled)
   let own = reg.lists[idx].entries
   for e in own:
     mergeEntry(entries, e.id, e.enabled, listId, false)
@@ -172,7 +200,18 @@ proc resolve*(reg: Registry; lists: seq[string]; overrideIds: seq[string];
   for listId in lists:
     var stack: seq[string] = @[]
     var seen: seq[string] = @[]
-    flattenInto(reg, listId, stack, seen, merged, result.problems)
+    # Into a scratch buffer first, so that a cycle discovered half way down can
+    # take the whole flattening with it rather than leaving behind the entries
+    # that were merged before it was found.
+    var staged: seq[Merged] = @[]
+    var cycled = false
+    flattenInto(reg, listId, stack, seen, staged, result.problems, cycled)
+    if cycled:
+      result.problems.add "the active list " & listId &
+                          " contributes nothing because of that cycle"
+      continue
+    for m in staged:
+      mergeEntry(merged, m.id, m.enabled, m.fromList, m.explicit)
 
   # ---- 3: the user's own decisions, last, over everything. An override for a
   # mod no active list mentions *adds* it: enabling something outside your lists

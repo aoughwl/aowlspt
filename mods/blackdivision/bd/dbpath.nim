@@ -32,51 +32,19 @@ import std/strutils
 import aowlspt
 import aowlspt/server
 
-proc quoteKey(s: string): string =
-  result = "\""
-  for ch in s:
-    if ch == '"' or ch == '\\':
-      result.add '\\'
-    result.add ch
-  result.add "\""
-
 proc pathParts*(path: string): seq[string] =
   result = @[]
   for p in split(path, '.'):
     if p.len > 0:
       result.add p
 
-proc joinParts(parts: seq[string]; upto: int): string =
-  result = ""
-  for i in 0 ..< upto:
-    if i > 0:
-      result.add "."
-    result.add parts[i]
-
-proc wrapFrom(parts: seq[string]; fromIndex: int; inner: string): string =
-  ## `inner`, nested inside the path segments from `fromIndex` onwards.
-  result = inner
-  var i = parts.len - 1
-  while i >= fromIndex:
-    result = "{" & quoteKey(parts[i]) & ":" & result & "}"
-    dec i
-
 proc dbPut*(path, patchJson: string): bool =
-  ## `dbWrite`, but it also works the first time.
-  if dbWrite(path, patchJson) == Ok:
-    return true
-  let parts = pathParts(path)
-  if parts.len <= 1:
-    # Nothing above it to attach to: the root is not writable.
-    return false
-  var depth = parts.len - 1
-  while depth >= 1:
-    let prefix = joinParts(parts, depth)
-    let existing = dbRead(prefix)
-    if existing.ok:
-      return dbWrite(prefix, wrapFrom(parts, depth, patchJson)) == Ok
-    dec depth
-  result = false
-
-# Worth promoting: `dbWrite` that creates is what every mod adding content to
-# the database needs, and every one of them will otherwise write this file.
+  ## `dbWrite`, which now also works the first time.
+  ##
+  ## This used to walk the path itself, finding the deepest prefix that existed
+  ## and wrapping the rest into it. Three mods had written that same walk under
+  ## three names, so it moved into `aowlspt/server`'s `dbWrite` and this is a
+  ## forward. Kept as a name rather than deleted because it reads as what it
+  ## means at twenty call sites, and because a `bool` is what those call sites
+  ## want.
+  result = dbWrite(path, patchJson) == Ok

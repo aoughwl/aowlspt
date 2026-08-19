@@ -42,6 +42,7 @@
 
 import aowlspt
 import aowlspt/il2cpp
+import aowlspt/fast
 import ".." / core / vec
 import ".." / core / types
 import ".." / core / settings
@@ -49,10 +50,16 @@ import ".." / core / decide
 import ".." / core / enemy
 import ".." / core / search
 import ".." / core / cover
+import ".." / core / probe
 import ".." / core / rng
+import ".." / core / hearing
+import ".." / core / suppress
+import ".." / core / squad
 import ".." / preset / preset
 import bridge
 import live
+import coverprobe
+import mainthread
 
 const
   ScanIntervalMs = 500'i64
@@ -73,12 +80,67 @@ type
     searchState: SearchState
     coverSet: CoverSet
     rng: Rng
+    ## The suppression accumulator. See `core/suppress.nim` for why the game's
+    ## `IsUnderFire` bool is integrated here rather than used directly.
+    sup: Suppression
+    ## The identity of the enemy this bot had last tick. Compared against the
+    ## pointer the game hands back so that the enemy's profile-id string -- the
+    ## last allocation on the perception path -- is read once per enemy rather
+    ## than once per tick.
+    enemyKey: uint64
+    ## `BotOwner.BotsGroup` as an identity, or 0 when that binding refused.
+    groupKey: uint64
+    ## Where this bot was on the previous decision, for the velocity estimate.
+    ## Two subtractions rather than a second bound `Vector3` getter.
+    prevPosition: Vec3
+    lastHealth: float
+    lastDamagedAt: float
+    ## `BotOwner.AimingData` as an identity, cached.
+    ##
+    ## The aim postfix in `sain.nim` is handed the aim component as `this`, so
+    ## attributing a reading to a bot means holding the component's address to
+    ## compare against. It is derived with one bound call, and only when the
+    ## table has no fresh reading under the address already held -- which in a
+    ## raid where the hook is working is never. Zero means "not derived yet";
+    ## it is not held across a detach, because `spawnBot` builds a fresh state.
+    aimKey: uint64
+    ## The last readiness this bot's aim component reported, and when.
+    ##
+    ## `aimAt` is a `perfCounter` reading taken on the *game's* thread inside
+    ## the handler, which is why it is ticks rather than `gTimeSeconds`: the
+    ## handler has no business reading this module's clock, and the two threads
+    ## would race on it if it did.
+    aimReady: bool
+    aimAt: int64
+    ## Damage told to us by the hook and not yet credited to the accumulator.
+    ## Summed on the drain, spent on the next decision, cleared either way.
+    pendingDamage: float
+    seesEnemy: bool
+    inCombat: bool
     lastDecisionAt: float
     lastAppliedCombat: CombatDecision
+    # Where the bot was last *told* to go, and when.
+    #
+    # Applying only on a decision change was right while every decision had at
+    # most one destination -- the enemy. It stopped being right the moment
+    # `decide.moveTargetFor` started producing a destination that moves *within*
+    # a decision: a search advances through its phases, a flank recomputes its
+    # arc as the bot travels, and a bot told once would walk to the first
+    # waypoint and stop there for the rest of the search.
+    lastAppliedMove: Vec3
+    lastApplyAt: float
     ## Where the bot was when it last thought. Kept so the scheduler can band
     ## it by distance to the player without a game read for a bot it is about
     ## to decide not to tick -- which would defeat the whole point.
     lastPosition: Vec3
+    ## When this bot's cover set was last sampled, and from where.
+    ##
+    ## Both are staleness tests rather than bookkeeping. Cover is geometry and
+    ## geometry does not move, so a set stays good until the *bot* moves --
+    ## which is why the position matters more than the clock here, and why a
+    ## bot standing still is never re-sampled at all.
+    coverAt: float
+    coverFrom: Vec3
     alive: bool
 
 var gBots: seq[BotState] = @[]
@@ -92,12 +154,333 @@ var gLastScanAt = 0'i64
 var gAttached = 0
 var gDetached = 0
 
+## The human's previous position and the time it was taken, for the hearing
+## model. This is the whole sensor: a player who moved eight metres in one
+## second was sprinting, and sprinting is loud. `core/hearing.nim` says why
+## deriving the sound beats waiting for an event this mod cannot subscribe to.
+var gPlayerPrev = zeroVec()
+var gPlayerSprint = false
+var gPlayerSound = emptySound()
+
+## The nearest grenade to the *raid*, sampled once per tick rather than once
+## per bot. Distance to it is then per bot and free.
+var gGrenadeAt = zeroVec()
+var gGrenadeLive = false
+
+## The ally table, rebuilt in place each tick. `gAlliesN` is how many entries
+## are live; the sequence itself only ever grows, to the raid's high-water
+## mark, so a steady-state tick allocates nothing.
+var gAllies: seq[Ally] = @[]
+var gAlliesN = 0
+
+## Peak per-tick cost, in bots considered, for the stats line.
+var gPeakConsidered = 0
+
+## Whether a detour on the game's own death notification took.
+##
+## When it did, `tickBot` stops asking every bot every tick whether it is still
+## alive -- which was two bound calls per bot per decision, and the largest
+## single piece of per-bot game work this mod did that was not about deciding
+## anything. When it did not, the poll stays, because the alternative is a mod
+## that never notices a bot died.
+var gDeathHooked = false
+
+proc setDeathHooked*(v: bool) = gDeathHooked = v
+proc deathHooked*(): bool = gDeathHooked
+
+const DeathQueueSize = 64
+  ## A fixed ring, because the alternative is allocating on the game's thread.
+  ## Sixty-four deaths between two ticks is far past anything a raid produces;
+  ## an overflow drops the oldest, and the health poll is not the fallback for
+  ## that -- the *next* `liveOf` for that bot returns a null target, which is
+  ## also death, half a second later.
+
+## Written by the hook handler, drained by `tick`.
+##
+## **These are two different threads.** The handler runs on whichever thread
+## called the game's method -- Unity's -- and `tick` runs on the host's own
+## attached thread. What makes a plain array safe here is that the only shared
+## mutable state is one write index and 64 aligned 64-bit words: an aligned
+## 64-bit store is not torn on x64, the writer only ever moves the index
+## forward, and the reader only ever consumes up to the index it read once. The
+## worst outcome of losing the race is a death noticed one tick later, which is
+## the same 16 ms the poll would have cost. Nothing here allocates, and nothing
+## here calls back into the mod.
+var gDeadRing: array[DeathQueueSize, uint64]
+var gDeadWrite = 0
+var gDeadRead = 0
+
+proc noteDeath*(who: uint64) =
+  ## Called from the death hook, on the game's thread, with the address of the
+  ## player that died. Records and returns: identifying *which bot* that is
+  ## means walking the bot table, and walking the bot table on the game's
+  ## thread while the host's thread is compacting it is the one thing this
+  ## queue exists to avoid.
+  if who == 0'u64:
+    return
+  gDeadRing[gDeadWrite mod DeathQueueSize] = who
+  gDeadWrite = gDeadWrite + 1
+
+# ---------------------------------------------------------------------------
+# The aim reading, and why it is a table rather than a queue
+# ---------------------------------------------------------------------------
+#
+# `sain.nim` puts a typed postfix on the bot aim component's readiness getter.
+# That method is called by the game once per bot per frame, which is the rate
+# the whole typed path exists for -- and it is also the rate that rules out the
+# shape `noteDeath` uses. A queue drained once per tick would take sixty
+# entries per bot per second and the drain would be O(entries x bots); a death
+# queue can be that shape because deaths per tick are almost always zero.
+#
+# So the reading is not queued, it is *stored*. A fixed, direct-mapped table
+# keyed on the aim component's address: the handler computes one index, writes
+# three aligned 64-bit words and returns. Nothing is scanned, nothing is
+# allocated, and there is no drain at all.
+#
+# **Direct-mapped, with no probing, deliberately.** Two components that land on
+# the same slot means one of them overwrites the other, and the loser reads no
+# fresh entry for itself -- which `aimGateFor` treats as "no reading", and the
+# bot shoots exactly as it does on a host with no hook at all. A probe sequence
+# would trade that for a loop on the game's thread and a worse failure when it
+# ran off the end. Failing open is the correct failure for a gate that can only
+# ever *withhold* a shot.
+#
+# **Two threads, again.** The handler runs on whichever thread the game called
+# the aim from; `tickBot` runs on the host's. The shared state is three aligned
+# 64-bit words per slot, and an aligned 64-bit store is not torn on x64. A
+# reader that catches a half-updated slot sees a key that does not match its
+# own -- because the key is written last -- and treats it as no reading.
+
+const AimSlots = 64
+  ## A power of two so the index is a mask rather than a divide, and far more
+  ## than the forty-odd bots a raid runs, so collisions are rare rather than
+  ## structural.
+
+var gAimAt: array[AimSlots, int64]      ## `perfCounter` ticks, game thread
+var gAimReady: array[AimSlots, uint64]  ## 1 when the aim had settled
+var gAimKey: array[AimSlots, uint64]    ## the component address; written last
+var gAimHooked = false
+var gAimGated = 0
+  ## How many times a shot was withheld because the aim had not settled. The
+  ## one number that says whether this sensor is doing anything.
+
+proc setAimHooked*(v: bool) = gAimHooked = v
+proc aimHooked*(): bool = gAimHooked
+
+func aimSlotOf(key: uint64): int =
+  ## The low four bits of an object address are alignment and carry no
+  ## information, so they are shifted out before the mask.
+  int((key shr 4) and uint64(AimSlots - 1))
+
+proc noteAim*(who: uint64; ready: bool) =
+  ## Called from the aim postfix, on the game's thread, with the aim
+  ## component's address and the readiness it just returned.
+  ##
+  ## Three stores and a return. It does not touch the bot table, does not call
+  ## the game, does not allocate and does not log: everything that has to look
+  ## at a bot happens on the host's thread, in `aimGateFor`.
+  if who == 0'u64:
+    return
+  let i = aimSlotOf(who)
+  gAimAt[i] = perfCounter()
+  gAimReady[i] = (if ready: 1'u64 else: 0'u64)
+  # Last, and that order is load-bearing: a reader matches on the key, so the
+  # key must never name a slot whose reading is still the previous component's.
+  gAimKey[i] = who
+
+const AimFreshNs = 300_000_000'i64
+  ## How old a reading may be and still gate a shot: 300 ms.
+  ##
+  ## Long enough that a bot whose aim component was not asked for a few frames
+  ## is not un-gated by a hitch, short enough that a bot whose component was
+  ## replaced -- or whose slot was taken by a collision -- returns to the
+  ## un-hooked behaviour within a fifth of a second rather than being silently
+  ## stopped from shooting for the rest of the raid.
+
+proc aimReadingFor(key: uint64; ready: var bool): bool =
+  ## The stored reading for one aim component, if there is a fresh one.
+  ##
+  ## False means "no reading", which every caller must treat as "do not gate".
+  ## That is the whole safety argument for this sensor: it is only ever
+  ## consulted to *withhold* a shot the decision already ordered, so an absent
+  ## reading leaves the mod behaving exactly as it does without the hook.
+  ready = false
+  if key == 0'u64 or not gAimHooked:
+    return false
+  let i = aimSlotOf(key)
+  if gAimKey[i] != key:
+    return false
+  if nanosBetween(gAimAt[i], perfCounter()) > AimFreshNs:
+    return false
+  ready = gAimReady[i] != 0'u64
+  result = true
+
+# ---------------------------------------------------------------------------
+# Damage, told rather than inferred
+# ---------------------------------------------------------------------------
+#
+# A ring, like the deaths, and for the same reason: a hit is an *event*, it
+# happens rarely enough per tick that a queue is the cheap shape, and the
+# matching it needs -- an address against every bot's -- is work that belongs
+# on the host's thread rather than inside a method the game is in the middle
+# of.
+#
+# The rate is worth stating precisely, because `README.md` used to get it
+# wrong. Damage is not per bot per frame. It is per *hit*: zero on the
+# overwhelming majority of ticks, and a burst of a dozen in the tick where a
+# full-auto magazine goes into a squad. That distribution is exactly the one a
+# JSON payload is worst at -- affordable on average, a spike precisely when the
+# frame is already the busiest it will be all raid.
+
+const DamageQueueSize = 64
+  ## Overflowing drops the oldest, and the consequence is small and stated: a
+  ## bot is suppressed by the hits that fit rather than by all of them, and the
+  ## health delta in `feed` still accounts for the rest at the next decision.
+
+var gDmgWho: array[DamageQueueSize, uint64]
+var gDmgAmount: array[DamageQueueSize, float]
+var gDmgWrite = 0
+var gDmgRead = 0
+var gDmgHooked = false
+var gDmgEvents = 0
+
+proc setDamageHooked*(v: bool) = gDmgHooked = v
+proc damageHooked*(): bool = gDmgHooked
+
+proc noteDamage*(who: uint64; amount: float) =
+  ## Called from the damage postfix, on the game's thread, with the victim's
+  ## address and how much it lost -- or 0.0 when the method's declared shape
+  ## carried no number this mod was willing to read.
+  ##
+  ## A zero-amount event is still recorded, and that is the point of accepting
+  ## one: "this bot was hit, now" is most of what suppression wants, and it is
+  ## exact. `drainDamage` turns it into the smallest step the accumulator has.
+  if who == 0'u64:
+    return
+  gDmgWho[gDmgWrite mod DamageQueueSize] = who
+  gDmgAmount[gDmgWrite mod DamageQueueSize] = amount
+  gDmgWrite = gDmgWrite + 1
+
+# ---------------------------------------------------------------------------
+# Cover: sampled on Unity's thread, decided on this one
+# ---------------------------------------------------------------------------
+#
+# The last sensor in this mod to be built, and the only one whose reading is
+# taken by *calling the engine* rather than by reading a managed field. That
+# one difference decides everything about its shape.
+#
+# **Why it cannot be read inline.** `Physics.Raycast` touches Unity's scene
+# state, and doing that from a thread that is not the player loop is not a
+# wrong number, it is a crash. `onMainThread` reaches the right thread now --
+# the host detours a per-frame method and drains from inside it -- so the
+# sample goes there and the *decision* stays here, where it has always been:
+# `core/probe.nim` plans the sample and folds the answers back in, both as
+# arithmetic over numbers, and `core/cover.nim` scores what comes out exactly
+# as it already did.
+#
+# **The budget, stated and enforced.** One sample is in flight at a time, and
+# one is posted at most every `CoverSampleIntervalMs`. That is the whole
+# rationing, and its important property is what it is *not* proportional to:
+#
+#   * A sample is at most `RaysPerSample` raycasts plus at most
+#     `ProbeCandidates` navmesh samples -- 16 and 8 with the constants
+#     `core/probe.nim` holds, and fewer in the common case, because a candidate
+#     whose chest ray is clear costs one ray and nothing else.
+#   * At one sample per 100 ms that is at most 240 engine calls a second, which
+#     is four a frame at 60 fps, landing in bursts of 24 on one frame in six.
+#   * **None of those numbers contains the number of bots.** Forty bots cost
+#     the same per frame as four; what they cost is refresh *latency*, exactly
+#     as the decision budget in this file trades the same way. A bot's set is
+#     re-sampled every `bots * 100 ms` in the worst case, and geometry does not
+#     move in four seconds.
+#
+# **Why it is safe across the two threads.** The same argument as the aim
+# table, and narrower. There is one job at a time; the host's thread writes the
+# plan and then sets `gProbeBusy`, the game's thread writes the answers and
+# then sets `gProbeDone`, and each flag is written *after* the data it
+# describes. Neither side touches the bot table from the other's thread: the
+# job knows nothing but eight rays.
+#
+# **Why it can be posted at all.** `mainthread.refreshMainThread` asks the host
+# whether its drain has actually fired. Until it answers yes, no sample is ever
+# posted and the cover decisions stay exactly as unreachable as they were --
+# which is also what happens on a build where `Physics::Raycast` refused.
+
+const
+  CoverSampleIntervalMs = 100'i64
+    ## The rate limit, and the entire frame budget of this sensor. See above
+    ## for what it buys; the short version is that it is a rate rather than a
+    ## per-bot cost, so it does not grow with the raid.
+  CoverResampleMoved = 9.0
+    ## Squared metres. A bot that has moved three metres since its set was
+    ## sampled is asking about different geometry; one that has not is not.
+  CoverResampleAfter = 6.0
+    ## Seconds. The backstop for a bot that has not moved but whose world has
+    ## -- a door, a car, a wall that came down.
+  CoverJobTimeout = 2.0
+    ## How long a posted sample may stay outstanding before it is abandoned.
+    ##
+    ## A drain that never runs would otherwise wedge this sensor for the
+    ## session with no symptom but silence. Two seconds is far past any frame
+    ## and the recovery is to post the next one.
+
+var gProbePlan = emptyPlan()
+var gProbeAnswers = emptyAnswers()
+var gProbeBot = ""
+var gProbeBusy = false
+var gProbeDone = false
+var gProbePostedAt = -999.0
+var gProbeCursor = 0
+var gProbeIngested = 0
+var gProbeAbandoned = 0
+var gProbeGatedOffThread = 0
+
+## Driving: queued here, executed on Unity's thread.
+##
+## The counterpart of `coverJob` below and the last thing in this mod to move.
+## `client/bridge.nim` carries the whole argument for why an order crosses
+## threads through a fixed ring; what lives here is the two decisions the
+## driver owns -- when a job is posted, and what happens on a host that never
+## confirms a Unity thread.
+##
+## **One job per tick, not one per order.** A job costs a slot in the host's
+## scheduler and a trip through `invoke_main`; an order costs a few bound
+## calls. So the ring is filled by the whole tick's worth of bots and drained
+## once, which makes the per-frame cost of driving proportional to the number
+## of *frames* rather than to the number of bots -- the same property the
+## decision budget has and for the same reason.
+var gDriveJobs = 0
+var gDriveGated = 0
+var gDrivePosted = 0
+
+proc driveJob(payload: string): string =
+  ## Everything queued, on Unity's thread. Two statements and no state of its
+  ## own: `runDrives` owns the ring and the counters.
+  discard runDrives(gTimeSeconds)
+  result = ""
+
+proc coverJob(payload: string): string =
+  ## The whole of what runs on Unity's thread.
+  ##
+  ## Two statements: take the sample, then say it is taken. The order is
+  ## load-bearing -- `gProbeDone` is what the host's thread reads to know the
+  ## answers are complete, so it must be written after them.
+  runSample(gProbePlan, gProbeAnswers)
+  gProbeDone = true
+  result = ""
+
 ## The human player, held the same way a bot is: one GC handle, resolved to a
 ## pointer once per tick. Everything in `decisionInterval` is keyed off distance
 ## to this position, so a stale one would mis-band every bot in the raid.
 var gHumanHandle = 0'u32
 
-proc setPreset*(p: Preset) = gPreset = p
+proc setPreset*(p: Preset) =
+  gPreset = p
+  # The order ring, zeroed explicitly. Every field of a `DriveOrder` has zero
+  # for its empty value, so the loader would leave it correct anyway -- and
+  # `live.nim`'s note about a nimony `--app:lib` global is exactly the kind of
+  # thing that is true until it is not.
+  initDriveQueue()
 
 proc indexOfBot(id: string): int =
   result = -1
@@ -129,11 +512,44 @@ proc spawnBot*(id: string; spawnType: string; difficulty: float) =
     ctx: newContext(nextFloat(r)),
     enemies: newEnemyTable(), searchState: newSearch(),
     coverSet: newCoverSet(), rng: r,
+    sup: newSuppression(), enemyKey: 0'u64, groupKey: 0'u64,
+    prevPosition: zeroVec(), lastHealth: -1.0, lastDamagedAt: -9999.0,
+    aimKey: 0'u64, aimReady: false, aimAt: 0'i64, pendingDamage: 0.0,
+    seesEnemy: false, inCombat: false,
     lastDecisionAt: 0.0, lastAppliedCombat: cdNone,
-    lastPosition: zeroVec(), alive: true)
+    lastAppliedMove: zeroVec(), lastApplyAt: -999.0,
+    lastPosition: zeroVec(), coverAt: -999.0, coverFrom: zeroVec(),
+    alive: true)
   if gPreset.logDecisions:
     debug "sain: " & id & " spawned as " & roleName(role) & "/" &
           personalityName(personality)
+
+proc attachPointer*(id: string; player: Il2CppPtr) =
+  ## Give a registered bot its IL2CPP handle **now**, from an address a hook
+  ## just handed over.
+  ##
+  ## This is what ABI revision 3 bought. Before it, the spawn hook knew a bot
+  ## had activated and could not turn its host `Handle` into the pointer the
+  ## fast path needs, so it registered the bot by profile id and the 2 Hz world
+  ## scan attached the handle up to half a second later -- half a second in
+  ## which the bot existed, was decided about, and was decided about *from
+  ## defaults*, because there was nothing to read it through. Now the handle is
+  ## taken on the frame the bot spawns and its first decision reads the game.
+  ##
+  ## A GC handle rather than `pinHandle`: this mod already re-resolves the
+  ## handle to an address once per tick (`liveOf`), which is the cheap half of
+  ## what pinning buys, and pinning would hold every bot in a raid immovable
+  ## for the session. `aowlspt.pinHandle` says as much at its own call site.
+  let i = indexOfBot(id)
+  if i < 0:
+    return
+  var st = gBots[i]
+  if st.handle.gcPlayer != 0'u32:
+    return
+  attach(st.handle, player)
+  gBots[i] = st
+  if st.handle.gcPlayer != 0'u32:
+    inc gAttached
 
 proc despawnBot*(id: string) =
   ## Compact in place. A raid that spawns and kills a few hundred bots would
@@ -227,10 +643,10 @@ proc scanWorld(nowMillis: int64) =
       spawnBot(id, "", 0.5)
     attachBot(id, p)
 
-proc updatePlayerPosition() =
-  ## One handle lookup and one reflective `Vector3` read per tick, for the whole
-  ## raid, rather than per bot. Everything the scheduler does with distance is
-  ## keyed off this.
+proc updatePlayerPosition(dt: float) =
+  ## One handle lookup and two bound reads per tick, for the whole raid, rather
+  ## than per bot. Everything the scheduler does with distance is keyed off
+  ## this -- and so, now, is every bot's hearing.
   if gHumanHandle == 0'u32:
     return
   let p = target(gHumanHandle)
@@ -240,9 +656,172 @@ proc updatePlayerPosition() =
     drop(gHumanHandle)
     gHumanHandle = 0'u32
     return
+  gPlayerPrev = gPlayerPosition
   gPlayerPosition = readVec(gB.pPosition, p)
+  let mc = callObj(gB.pMovement, p)
+  if mc != nil:
+    gPlayerSprint = callBoolOn(gB.mcSprint, mc, false)
+  # The sound the human just made, derived rather than received. One
+  # `motionSound` for the raid; every bot then asks `listen` whether it heard
+  # it, which is arithmetic on the stack.
+  gPlayerSound = motionSound(gPlayerPrev, gPlayerPosition, dt, gPlayerSprint,
+                             gTimeSeconds, cast[uint64](p))
+
+proc updateGrenades() =
+  ## Sample the world's grenade list once per tick. Empty on essentially every
+  ## tick of a raid, and an empty list is one bound `get_Count`.
+  gGrenadeLive = false
+  if not capable():
+    return
+  let world = worldObject()
+  if world == nil:
+    return
+  var at = zeroVec()
+  # 40 m is well past any avoid radius: the point is to find the nearest one
+  # once, not to filter per bot, and the per-bot threshold is applied in the
+  # ladder against `grenadeAvoidDistance`.
+  if nearestGrenade(world, gPlayerPosition, 40.0, at):
+    gGrenadeAt = at
+    gGrenadeLive = true
+
+proc rebuildAllies() =
+  ## One pass over the bot table, into the shape `core/squad.nim` queries.
+  ##
+  ## In place: entries are overwritten rather than a new sequence built, so a
+  ## steady-state raid allocates nothing here. The sequence grows once, to the
+  ## raid's high-water mark of live bots.
+  gAlliesN = 0
+  var i = 0
+  while i < gBots.len:
+    let st = gBots[i]
+    inc i
+    if not st.alive:
+      continue
+    let a = Ally(key: hashSeed(st.handle.id, 0'u64), groupKey: st.groupKey,
+                 role: st.handle.role, position: st.lastPosition,
+                 health: st.lastHealth, alive: true,
+                 seesEnemy: st.seesEnemy, inCombat: st.inCombat,
+                 lastDamagedAt: st.lastDamagedAt)
+    if gAlliesN < gAllies.len:
+      gAllies[gAlliesN] = a
+    else:
+      gAllies.add a
+    gAlliesN = gAlliesN + 1
 
 proc setPlayerPosition*(p: Vec3) = gPlayerPosition = p
+
+proc wantsCoverSample(st: BotState): bool =
+  ## Whether this bot is worth a sample.
+  ##
+  ## Two gates, and both of them are about not spending engine calls on a bot
+  ## that will not use the answer. A bot with no enemy is not going to cover;
+  ## a bot whose set was taken from where it is standing already has the
+  ## answer. `README.md` says what this misses: a bot that walks into a
+  ## building without its decision being about cover keeps a set sampled
+  ## outside it until it moves three metres, which it will.
+  if not st.alive:
+    return false
+  let e = primaryView(st.enemies)
+  if not e.valid:
+    return false
+  if gTimeSeconds - st.coverAt >= CoverResampleAfter:
+    return true
+  result = sqrDistance(st.lastPosition, st.coverFrom) > CoverResampleMoved
+
+proc postCoverSample() =
+  ## Pick the next bot that wants a sample and queue one, at the fixed rate.
+  ##
+  ## Round-robin from `gProbeCursor`, so a bot at the end of the table is not
+  ## starved by the ones in front of it -- the same shape and the same reason
+  ## as the decision budget above.
+  if gProbeBusy or not probeReady():
+    return
+  if gTimeSeconds - gProbePostedAt < float(int(CoverSampleIntervalMs)) / 1000.0:
+    return
+  let mt = mainThread()
+  if not mt.bound:
+    # The host has not confirmed a Unity thread. Not an error and not a
+    # refusal: the drain reports `bound` only once it has *fired*, so early in
+    # a session this is "not yet". Counted, so the state line can tell "not
+    # yet" from "never".
+    gProbeGatedOffThread = gProbeGatedOffThread + 1
+    return
+  var scanned = 0
+  while scanned < gBots.len:
+    let i = gProbeCursor
+    gProbeCursor = gProbeCursor + 1
+    if gProbeCursor >= gBots.len:
+      gProbeCursor = 0
+    inc scanned
+    var st = gBots[i]
+    if not wantsCoverSample(st):
+      continue
+    let e = primaryView(st.enemies)
+    # The ring is rotated by this bot's own stream so that two bots pinned in
+    # the same corner do not propose the same eight points and then both run to
+    # whichever scored highest.
+    let plan = planProbe(st.lastPosition, e.position, st.settings,
+                         int(nextFloat(st.rng) * 8.0) and 7)
+    if not plan.valid:
+      continue
+    gBots[i] = st
+    gProbePlan = plan
+    gProbeAnswers = emptyAnswers()
+    gProbeBot = st.handle.id
+    gProbeDone = false
+    # Last, and after the plan: the game's thread reads the plan and this is
+    # what says the plan is there to read.
+    gProbeBusy = true
+    gProbePostedAt = gTimeSeconds
+    if onMainThread(coverJob) != Ok:
+      # The queue refused. Undo rather than wait for the timeout, so the next
+      # tick tries again instead of losing two seconds to a job nobody took.
+      gProbeBusy = false
+    return
+
+proc drainCoverSample() =
+  ## Fold a finished sample into its bot's set, on the thread that owns the
+  ## table.
+  ##
+  ## The bot is found by id rather than by index: it may have died between the
+  ## post and the drain, and compacting the table moved everything after it.
+  ## A sample whose bot is gone is dropped, which costs one wasted sample.
+  if not gProbeBusy:
+    return
+  if not gProbeDone:
+    if gTimeSeconds - gProbePostedAt > CoverJobTimeout:
+      gProbeBusy = false
+      gProbeAbandoned = gProbeAbandoned + 1
+    return
+  gProbeBusy = false
+  gProbeDone = false
+  let i = indexOfBot(gProbeBot)
+  if i < 0:
+    return
+  var st = gBots[i]
+  discard ingest(st.coverSet, gProbePlan, gProbeAnswers, st.settings,
+                 gTimeSeconds)
+  st.coverAt = gTimeSeconds
+  st.coverFrom = gProbePlan.botPos
+  gBots[i] = st
+  gProbeIngested = gProbeIngested + 1
+
+proc coverStats*(): string =
+  ## What the sensor did, in the terms the budget above is stated in.
+  if not probeReady():
+    return "cover sampling off -- " & raycastWhy()
+  result = "cover: " & $samplesTaken() & " samples, " & $raysCast() & " rays, " &
+           $navSamples() & " navmesh queries, " & $gProbeIngested &
+           " folded in, " & $gProbeAbandoned & " abandoned"
+  let ns = sampleCostNs()
+  if ns >= 0'i64:
+    result = result & ", " & $ns & " ns a sample on the game's thread"
+  else:
+    result = result & ", nothing measured: no sample has been taken"
+  if gProbeGatedOffThread > 0:
+    result = result & "; " & $gProbeGatedOffThread &
+             " posts held back while the host's main-thread drain had not " &
+             "fired"
 
 # ---------------------------------------------------------------------------
 # One bot's tick
@@ -262,28 +841,52 @@ proc decisionInterval(s: Settings; distanceToPlayer: float): float =
   else:
     result = base
 
-proc buildView(st: BotState; me: SelfView): BotView =
+proc buildView(st: BotState; me: SelfView; heard: Heard): BotView =
   ## Flatten this bot's state into the record the core reads.
   ##
   ## Copies rather than references, and that is the design: the core cannot
   ## reach back into anything, which is what makes it testable and what would
   ## make it safe to run off the main thread.
   let e = primaryView(st.enemies)
-  var sq = SquadView(
-    memberCount: 1, aliveCount: 1, isLeader: true, leaderAlive: true,
-    leaderDistance: 0.0, nearestMateDistance: 9999.0, mateNeedsHelp: false,
-    mateInCombat: false, squadSeesEnemy: false,
-    memberTookDamageRecently: false)
+
+  # The squad, from this mod's own table rather than from a binding. One pass
+  # over the live bots; see `core/squad.nim` for why that is both cheaper and
+  # more available than enumerating `BotsGroup`.
+  let mine = Ally(key: hashSeed(st.handle.id, 0'u64), groupKey: st.groupKey,
+                  role: st.handle.role, position: me.position,
+                  health: me.healthNormalized, alive: true,
+                  seesEnemy: st.seesEnemy, inCombat: st.inCombat,
+                  lastDamagedAt: st.lastDamagedAt)
+  let sq = squadViewFor(mine, gAllies, gAlliesN, st.settings, gTimeSeconds)
+
+  # The grenade, from the raid-level sample. Distance is per bot and is two
+  # subtractions.
+  var gren = GrenadeThreat(active: false, position: zeroVec(),
+                           distance: 999.0, secondsToDetonation: 0.0)
+  if gGrenadeLive:
+    let d = distance(me.position, gGrenadeAt)
+    if d < st.settings.grenadeAvoidDistance * 2.0:
+      gren = GrenadeThreat(active: true, position: gGrenadeAt, distance: d,
+                           # No fuse is readable, and inventing one would make
+                           # the avoid decision depend on a number this mod
+                           # made up. The ladder only tests `active` and
+                           # `distance`, so the fuse stays at zero and is not
+                           # used by anything.
+                           secondsToDetonation: 0.0)
+
   result = BotView(
-    id: st.handle.id, role: st.handle.role, personality: st.personality,
+    role: st.handle.role, personality: st.personality,
     difficulty: 0.5, timeNow: gTimeSeconds, me: me, enemy: e,
     enemyCount: liveCount(st.enemies), squad: sq,
-    grenade: GrenadeThreat(active: false, position: zeroVec(),
-                           distance: 999.0, secondsToDetonation: 0.0),
-    lastSound: skNone, lastSoundPosition: zeroVec(), lastSoundDistance: 0.0,
-    timeSinceLastSound: 999.0,
+    grenade: gren,
+    lastSound: (if heard.audible: gPlayerSound.kind else: skNone),
+    lastSoundPosition: heard.position,
+    lastSoundDistance: heard.distance,
+    timeSinceLastSound: (if heard.audible: gTimeSeconds - gPlayerSound.at
+                         else: 999.0),
     hasSearchTarget: active(st.searchState),
-    searchTarget: st.searchState.target, extractRequested: false)
+    searchTarget: st.searchState.target, extractRequested: false,
+    raidSeconds: gTimeSeconds, moveTarget: zeroVec(), hasMoveTarget: false)
 
 proc tickBot(index: int): bool =
   ## One bot's whole decision, start to finish. False when the bot has died and
@@ -301,27 +904,115 @@ proc tickBot(index: int): bool =
   # This frame's pointers. One `gc_handle_get_target` plus two bound property
   # calls; every read below runs off them with no further indirection.
   let l = liveOf(st.handle)
-  if l.ok and not isAlive(l.player):
+  # The death poll, and the reason it is now behind a flag.
+  #
+  # This was unconditional: `get_HealthController` then `get_IsAlive`, two
+  # bound calls per bot per decision, for a fact that changes once in a bot's
+  # life. It was written that way because `hookArgs` reported a method's
+  # declared arguments and not the instance it was called on, so a hook on
+  # `Player::OnDead` fired knowing that *a* player died and not which one --
+  # and one bound bool per bot was the honest answer to that.
+  #
+  # `thisPointer` answers it directly, so when the hook took, this goes away.
+  # When it did not, the poll is still the only thing that cannot be wrong.
+  if l.ok and not gDeathHooked and not isAlive(l.player):
     return false
 
-  let me = readSelf(st.handle, l)
+  var me = readSelf(st.handle, l)
+
+  # --- velocity, from the previous decision rather than from a second bound
+  # `Vector3` getter. Two subtractions and a divide against a ~10 ns call plus
+  # a second binding to keep working across a client update.
+  if st.lastDecisionAt > 0.0 and dt > 0.0001:
+    me.velocity = (me.position - st.prevPosition) * (1.0 / dt)
+  st.prevPosition = me.position
+
+  # --- suppression. `readSelf` leaves the raw `IsUnderFire` bool in
+  # `suppressionLevel`; the accumulator turns it into a level with a time
+  # constant, and returns the health delta on the way past.
+  let underFire = me.suppressionLevel > 0.5
+  let enemyLooking = primaryView(st.enemies).lookingAtUs
+
+  # Hits the damage hook told us about since the last decision, handed to
+  # `feed` rather than credited separately. `core/suppress.nim` says why that
+  # distinction is not cosmetic: the two readings have to go through one rise
+  # and one decay decision, or the same hit is worth different amounts
+  # depending on which host the mod is running on.
+  let told = st.pendingDamage
+  st.pendingDamage = 0.0
+
+  let damage = feed(st.sup, underFire, enemyLooking, me.healthNormalized,
+                    st.settings, gTimeSeconds, dt, told)
+  me.suppressionLevel = effectiveLevel(st.sup, st.settings)
+  me.recentDamage = damage
+  me.timeSinceDamaged = timeSinceDamaged(st.sup, gTimeSeconds)
+  if damage > 0.0:
+    st.lastDamagedAt = gTimeSeconds
+
   st.lastDecisionAt = gTimeSeconds
   st.lastPosition = me.position
+  st.lastHealth = me.healthNormalized
+  st.groupKey = groupKeyOf(l)
+
+  # --- hearing. The human's motion sound was derived once for the raid; this
+  # asks whether *this* bot heard it, with its own acuity and its own
+  # localisation error. `occluded` is approximated by "no line of sight to the
+  # primary enemy", which is the only occlusion signal available without a
+  # raycast this mod cannot make -- and is stated in `README.md` as such.
+  var heard = nothingHeard()
+  if gPlayerSound.kind != skNone:
+    let occluded = not primaryView(st.enemies).visible
+    heard = listen(gPlayerSound, me.position, st.settings, occluded,
+                   gTimeSeconds, st.rng)
 
   # Perception. The game has already done the visibility work; this folds its
   # answer into the bot's own memory, which is what decays, forgets and ranks.
   if l.ok:
-    let obs = observeEnemy(st.handle, l, gTimeSeconds)
-    if obs.id.len > 0:
+    var obs = observeEnemy(st.handle, l, gTimeSeconds)
+    if obs.key != 0'u64:
+      st.enemyKey = obs.key
+      # A sound attributed to the *same* enemy the game has selected is folded
+      # in as a hearing of them. One that belongs to somebody else is left for
+      # the unattributed-sound branch of the ladder, which is what
+      # `EHeardFromPeaceBehavior` is for.
+      if heard.audible and gPlayerSound.key == obs.key:
+        obs.heardThisTick = true
+        obs.heard = heard
       observe(st.enemies, obs, me.position, me.lookDirection, st.settings,
-              gTimeSeconds, dt)
+              gTimeSeconds, dt, st.rng)
 
   # `forget` is cheap and compacting, and running it here rather than on its own
   # timer means a bot never scans entries it has already stopped believing in.
   forget(st.enemies, st.settings)
   discard choosePrimary(st.enemies, st.settings)
 
-  var view = buildView(st, me)
+  let primary = primaryView(st.enemies)
+  st.seesEnemy = primary.visible
+  st.inCombat = primary.valid and primary.threatLevel > 0.15
+
+  # --- cover, as an *input* to the ladder rather than as an afterthought.
+  #
+  # This is the half of the sample-then-decide split that runs here. The
+  # sampler wrote points into this bot's set on some earlier tick, on Unity's
+  # thread, knowing nothing about decisions; `choose` picked one at the end of
+  # the last decision, knowing nothing about the engine. All this does is read
+  # the answer, and it is what finally moves `inCoverStatus` off
+  # `csFarFromCover`.
+  #
+  # `statusFor` has been written and unreachable since the first version of
+  # this mod. It bands the distance to the chosen point exactly as SAIN's
+  # `CoverStatus` does, and every rung of the ladder that reads
+  # `me.inCoverStatus` -- the pinned-in-cover branch, the shift-cover check,
+  # the hold-in-cover fallthrough -- has been comparing against a constant
+  # until now.
+  if st.coverSet.chosen >= 0 and st.coverSet.chosen < st.coverSet.points.len:
+    let held = st.coverSet.points[st.coverSet.chosen]
+    me.coverPosition = held.position
+    me.hasCoverPoint = true
+    me.coverPointDistance = distance(me.position, held.position)
+    me.inCoverStatus = statusFor(me.coverPointDistance, st.settings)
+
+  var view = buildView(st, me, heard)
   let d = decide(st.ctx, view, st.settings)
   inc gDecisionsMade
 
@@ -331,8 +1022,13 @@ proc tickBot(index: int): bool =
   if d.combat == cdSearch:
     if not active(st.searchState):
       let e = view.enemy
-      begin(st.searchState, me.position, e.position,
-            e.realPosition - e.position, gTimeSeconds)
+      # The drift is the enemy's own estimated velocity now, rather than the
+      # difference between two positions that are equal whenever the enemy is
+      # visible -- which was every time this ran, so the drift was always zero
+      # and the "push past in the direction they went" phase pushed nowhere.
+      let side = (if nextFloat(st.rng) < 0.5: -1.0 else: 1.0)
+      begin(st.searchState, me.position, e.position, e.velocity,
+            gTimeSeconds, e.uncertainty, side)
     advance(st.searchState, me.position, st.settings, gTimeSeconds)
   elif active(st.searchState):
     cancel(st.searchState)
@@ -350,24 +1046,197 @@ proc tickBot(index: int): bool =
   # Only act on a change. A bot already sprinting to cover does not need to be
   # told again every tick, and each telling is at best a bound call and at worst
   # a reflective one with a boxed Vector3 argument.
-  if d.combat != st.lastAppliedCombat:
-    let a = actuationFor(d, view)
-    gCallsMade = gCallsMade + apply(st.handle, l, a)
-    st.lastAppliedCombat = d.combat
+  #
+  # "A change" is now two things rather than one: a different decision, or the
+  # same decision wanting the bot somewhere materially different. The second
+  # clause is rate-limited and distance-limited together -- at least half a
+  # second and at least two metres -- because a destination that drifts by
+  # centimetres as the bot walks is not news, and re-issuing `GoToPoint` every
+  # tick would both cost calls and interrupt the game's own pathing.
+  const RestateAfter = 0.5
+  const RestateMoved = 4.0        ## squared metres
+  var restate = d.combat != st.lastAppliedCombat
+  if (not restate) and d.hasMove:
+    if gTimeSeconds - st.lastApplyAt >= RestateAfter and
+       sqrDistance(d.moveTo, st.lastAppliedMove) > RestateMoved:
+      restate = true
+  if restate:
+    var a = actuationFor(d, view)
+
+    # The aim gate. The decision has ordered a shot; the game's own aim
+    # component says whether the aim has settled, and a bot that fires before
+    # it has is the spraying-from-the-hip behaviour SAIN exists to remove.
+    #
+    # It can only ever *withhold*. There is no branch here that makes a bot
+    # shoot when the ladder did not ask it to, and a bot with no fresh reading
+    # -- the hook refused, the component moved, the slot collided -- behaves
+    # exactly as it did before this sensor existed. That asymmetry is what
+    # makes a guessed member name safe to act on at all.
+    if a.shoot and gAimHooked and l.ok and l.owner != nil:
+      var ready = false
+      var have = aimReadingFor(st.aimKey, ready)
+      if not have:
+        # No reading under the address held. Re-derive it -- one bound call --
+        # and try once more. This is the only place `AimingData` is asked for,
+        # and in a raid where the hook is working it runs once per bot and
+        # then never again.
+        let ad = callObj(gB.boAiming, l.owner)
+        if ad != nil:
+          st.aimKey = cast[uint64](ad)
+          have = aimReadingFor(st.aimKey, ready)
+      if have and not ready:
+        a.shoot = false
+        gAimGated = gAimGated + 1
+
+    # The one place a decision becomes a game call, and the one place this mod
+    # chooses a thread for it.
+    #
+    # **Queued when the host has confirmed Unity's thread**, executed inside
+    # `driveJob` on the next frame. The order costs 16 ms of latency, which for
+    # a destination a bot walks to over several seconds is nothing, and it buys
+    # the thing this mod could not previously claim: `GoToPoint` and
+    # `LookToPoint` reaching Unity from the player loop rather than from a
+    # worker.
+    #
+    # **Made inline when it has not**, which is exactly what this mod did
+    # before the queue existed, and is a fallback rather than a preference. It
+    # is here because the alternative is a host with no per-frame drain driving
+    # no bots at all, and a bot that never moves is a worse answer than a call
+    # whose legality has never been established either way. `config.json` can
+    # turn it off -- `driveFromHostThread: false` -- and the state line says
+    # which path the session took, counted, so a log is enough to tell them
+    # apart afterwards.
+    var told = true
+    if mainThread().bound:
+      if postDrive(st.handle, a, gTimeSeconds):
+        gDrivePosted = gDrivePosted + 1
+      else:
+        # The ring was full, so this bot was *not* told. Saying it was would
+        # latch `lastAppliedCombat` to a decision the game never heard and the
+        # bot would stand on the old order until it changed its mind again.
+        # Leaving the latch alone makes the next tick restate.
+        told = false
+      # `gCallsMade` is not advanced here. It counts calls *made*, and the
+      # calls this order becomes are counted by `runDrives` on the thread that
+      # makes them. Counting them twice would be the flattering answer.
+    elif gPreset.driveFromHostThread:
+      let made = applyTo(l, a)
+      noteHostThreadDrive(made)
+      gCallsMade = gCallsMade + made
+    else:
+      gDriveGated = gDriveGated + 1
+    if told:
+      st.lastAppliedCombat = d.combat
+      st.lastAppliedMove = d.moveTo
+      st.lastApplyAt = gTimeSeconds
     if gPreset.logDecisions:
       debug "sain: " & st.handle.id & " -> " & decisionName(d.combat) &
             " / " & squadDecisionName(d.squad) & " / " &
-            selfActionName(d.self) & "  (" & d.reason & ")"
+            selfActionName(d.self) & "  (" & reasonText(d.reason) & ")"
 
   gBots[index] = st
   result = true
 
+proc drainDamage() =
+  ## Turn the addresses the damage hook queued into suppression, once per tick,
+  ## on the host's own thread where the bot table is safe to touch.
+  ##
+  ## Bots outer, events inner -- the reverse of `drainDeaths`, and the reason
+  ## is the rate. A death queue holds at most one or two entries, so resolving
+  ## every bot's handle once per entry costs nothing. A damage queue can hold a
+  ## dozen in a bad tick, and `target` is a call into the runtime; walking the
+  ## bots once and the queue once per bot resolves each handle exactly once
+  ## however many hits landed.
+  if gDmgRead >= gDmgWrite:
+    return
+  if gDmgWrite - gDmgRead > DamageQueueSize:
+    # Overflowed: the oldest entries are gone. Skip to what is still there
+    # rather than reading round the ring and crediting a stale address.
+    gDmgRead = gDmgWrite - DamageQueueSize
+  let first = gDmgRead
+  let last = gDmgWrite
+  var i = 0
+  while i < gBots.len:
+    var st = gBots[i]
+    if st.handle.gcPlayer != 0'u32:
+      let p = target(st.handle.gcPlayer)
+      if p != nil:
+        let who = cast[uint64](p)
+        var j = first
+        while j < last:
+          if gDmgWho[j mod DamageQueueSize] == who:
+            let amount = gDmgAmount[j mod DamageQueueSize]
+            # A hit with no readable amount is credited as the smallest step
+            # the accumulator has rather than as nothing: the event is exact
+            # even when the magnitude is not, and treating "hit for an unknown
+            # amount" as "not hit" would be the one reading here that is
+            # actually wrong.
+            st.pendingDamage = st.pendingDamage +
+                               (if amount > 0.0: amount else: 0.01)
+            gDmgEvents = gDmgEvents + 1
+          j = j + 1
+        gBots[i] = st
+    inc i
+  gDmgRead = last
+
+proc drainDeaths() =
+  ## Turn the addresses the death hook queued into bots, once per tick, on the
+  ## host's own thread where the bot table is safe to touch.
+  ##
+  ## Matching is by address: `liveOf` resolves each bot's GC handle to this
+  ## frame's pointer anyway, and comparing two pointers is one instruction. It
+  ## is O(deaths x bots), and deaths per tick is almost always zero.
+  while gDeadRead < gDeadWrite:
+    if gDeadWrite - gDeadRead > DeathQueueSize:
+      # Overflowed: the oldest entries are gone. Skip to what is still there
+      # rather than reading round the ring and matching a stale address.
+      gDeadRead = gDeadWrite - DeathQueueSize
+    let who = gDeadRing[gDeadRead mod DeathQueueSize]
+    gDeadRead = gDeadRead + 1
+    if who == 0'u64:
+      continue
+    var i = 0
+    while i < gBots.len:
+      let st = gBots[i]
+      if st.handle.gcPlayer != 0'u32:
+        let p = target(st.handle.gcPlayer)
+        if p != nil and cast[uint64](p) == who:
+          # Compact on the spot: `despawnBot` releases the handle, and the
+          # cursor it fixes up is not in use here.
+          let id = st.handle.id
+          despawnBot(id)
+          if gPreset.logDecisions:
+            debug "sain: " & id & " died (told, not polled)"
+          break
+      inc i
+
 proc tick*(elapsedMs: int64) =
   ## Called from `onUpdate`. Constant cost in the number of bots.
-  gTimeSeconds = gTimeSeconds + float(int(elapsedMs)) / 1000.0
-  updatePlayerPosition()
+  var dt = float(int(elapsedMs)) / 1000.0
+  if dt < 0.001: dt = 0.001
+  gTimeSeconds = gTimeSeconds + dt
+  updatePlayerPosition(dt)
   if gBots.len == 0:
     return
+  # Three raid-level passes, once each per tick rather than once per bot. The
+  # ally table is the expensive one and it is O(bots); the grenade sample is one
+  # bound call when the list is empty, which is almost always.
+  rebuildAllies()
+  updateGrenades()
+  drainDeaths()
+  drainDamage()
+  # The cover sample: fold in whatever Unity's thread finished, then queue at
+  # most one more.
+  #
+  # The drain touches one bot. The post is O(bots) in the worst case -- a tick
+  # where nobody wants a sample walks the whole table looking -- and that is
+  # affordable for one reason worth stating rather than assuming: the rate
+  # limit is checked *before* the walk, so the walk happens ten times a second
+  # rather than sixty, and it is a comparison of two floats per bot with no
+  # game call in it. `rebuildAllies` above is O(bots) every tick and costs
+  # more.
+  drainCoverSample()
+  postCoverSample()
   let budget = gPreset.base.maxBotsPerTick
   var considered = 0
   var scanned = 0
@@ -395,12 +1264,27 @@ proc tick*(elapsedMs: int64) =
       died = gBots[i].handle.id
       break
     inc considered
+  if considered > gPeakConsidered:
+    gPeakConsidered = considered
   if died.len > 0:
     despawnBot(died)
+  # Last in the tick, after every bot that was going to change its mind has:
+  # one job for the whole tick's orders. Posted only when there is something to
+  # drain, so a raid in which nothing changed costs no scheduler slot at all.
+  if drivePending() > 0 and mainThread().bound:
+    if onMainThread(driveJob) == Ok:
+      gDriveJobs = gDriveJobs + 1
 
 proc scan*(nowMillis: int64) =
   ## The discovery half of the tick, kept separate so `onUpdate` can call it
   ## before `tick` and so the sim can skip it.
+  ##
+  ## The main-thread question is asked here rather than in `tick` for the same
+  ## reason the world scan is: it is a host call at about a microsecond, its
+  ## answer changes at most once in a session, and `refreshMainThread` is
+  ## itself rate-limited to once every two seconds until it answers yes.
+  ## Nothing posts a cover sample before it does.
+  discard refreshMainThread(nowMillis)
   scanWorld(nowMillis)
 
 proc releaseAll*() =
@@ -414,7 +1298,44 @@ proc releaseAll*() =
     drop(gHumanHandle)
     gHumanHandle = 0'u32
 
+proc driveStats*(): string =
+  ## Which thread drove, how much, and everything that did not get driven. The
+  ## counters are separate on purpose: "queued" and "executed" differing by
+  ## more than one tick's worth means the drain is not running, and that is not
+  ## visible in a single total.
+  if mainThread().bound:
+    result = "driving on Unity's thread: " & $gDrivePosted &
+             " orders queued, " & $driveRuns() & " drains in " & $gDriveJobs &
+             " jobs, " & $driveCalls() & " game calls"
+  elif gPreset.driveFromHostThread:
+    result = "driving on the host's own thread (Unity's not confirmed): " &
+             $driveHostThreadRuns() & " actuations, " & $driveCalls() &
+             " game calls. That is what this mod did before the queue " &
+             "existed and it has never been shown safe or unsafe"
+  else:
+    result = "not driving (Unity's thread not confirmed, " &
+             "driveFromHostThread off): " & $gDriveGated &
+             " actuations withheld. Bots decide and do not move"
+  # The ring's own counters, on every path, because the two that matter are
+  # failures rather than totals: a drop means the drain stopped running, and a
+  # stale order means it ran too late to be worth running.
+  result = result & " -- ring: " & $drivePending() & " pending, " &
+           $driveDropped() & " dropped (full), " & $driveStale() &
+           " stale, " & $driveGone() & " for bots that had died"
+  let ns = driveCostNs()
+  if ns >= 0'i64:
+    result = result & ", " & $ns & " ns a drain"
+  else:
+    result = result & ", nothing measured: no drain has run"
+
 proc stats*(): string =
   result = $gBots.len & " bots, " & $gDecisionsMade & " decisions, " &
            $gCallsMade & " game calls, " & $gAttached & " attached, " &
-           $gDetached & " released"
+           $gDetached & " released, " & $gPeakConsidered &
+           " bots in the busiest tick, death " &
+           (if gDeathHooked: "hooked" else: "polled") &
+           ", aim " & (if gAimHooked: "hooked (" & $gAimGated &
+                       " shots withheld)" else: "not hooked") &
+           ", damage " & (if gDmgHooked: "hooked (" & $gDmgEvents &
+                          " hits told)" else: "inferred from health") &
+           ", " & coverStats() & ", " & driveStats()

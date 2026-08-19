@@ -66,6 +66,12 @@ type
     description*: string
     inherits*: seq[string]
     entries*: seq[ListEntry]
+    ## True for a list the player wrote, merged in from the selection store by
+    ## `withLocalLists` rather than read out of the manifest. Resolution does
+    ## not look at this and must not: a local list is a list. It is here so a
+    ## UI can say which of your lists a registry refresh is able to replace,
+    ## which is a question with a real answer and a bad guess.
+    local*: bool
 
   Registry* = object
     ok*: bool
@@ -106,6 +112,89 @@ proc textList(j: JsonRef): seq[string] =
     if s.len > 0:
       result.add s
 
+# ---------------------------------------------------------------------------
+# Did all of the bytes arrive?
+# ---------------------------------------------------------------------------
+#
+# `aowlspt/json` is a *scanner*: `field` walks the text and hands back whatever
+# it finds, so a truncated document does not fail to parse -- it parses as
+# whatever survived the truncation. A `mods.json` cut in half by a failed
+# `git checkout`, a full disk or an interrupted download therefore reads as a
+# perfectly valid registry with fewer mods in it than the publisher wrote, and
+# `parseRegistry` used to hand that back with `ok = true`.
+#
+# That is the same class of bug as the truncated selection store, and worse in
+# its consequences: the manager resolves against the surviving half, every mod
+# that fell off the end becomes "no active list mentions it", and the selection
+# document written beside the mods names the survivors. The next start loads
+# exactly those. Nobody is told anything.
+#
+# So the raw text is checked for structural wholeness *before* a single field
+# is read out of it. This is not a parser -- a second parser would be a second
+# thing to disagree with `aowlspt/json`. It answers one question: did all of
+# the bytes arrive.
+#
+# It lives here rather than in `selection.nim`, which asked it first, because
+# both callers need the identical answer and two copies of a balance-counter
+# are two chances to fix a bug once.
+
+proc isJsonWs*(ch: char): bool =
+  result = ch == ' ' or ch == '\t' or ch == '\n' or ch == '\r'
+
+proc wholeJsonObject*(raw: string): bool =
+  ## Whether `raw` is one complete, balanced JSON object with nothing after it.
+  var i = 0
+  while i < raw.len and isJsonWs(raw[i]):
+    inc i
+  if i >= raw.len or raw[i] != '{':
+    return false
+  var depth = 0
+  var inStr = false
+  var esc = false
+  while i < raw.len:
+    let ch = raw[i]
+    if ord(ch) == 0:
+      # A NUL is not something any writer here produces, and a value that has
+      # picked one up has been through something that does not handle text.
+      return false
+    if inStr:
+      if esc:
+        esc = false
+      elif ch == '\\':
+        esc = true
+      elif ch == '"':
+        inStr = false
+    else:
+      if ch == '"': inStr = true
+      elif ch == '{' or ch == '[': inc depth
+      elif ch == '}' or ch == ']':
+        dec depth
+        if depth < 0: return false
+        if depth == 0:
+          # Only whitespace may follow the outermost object.
+          var k = i + 1
+          while k < raw.len:
+            if not isJsonWs(raw[k]): return false
+            inc k
+          return true
+    inc i
+  # Ran off the end inside the document: the bytes stop before the object does.
+  result = false
+
+proc stripBom*(text: string): string =
+  ## A UTF-8 byte-order mark off the front of a document.
+  ##
+  ## The host's `readTextFile` strips one; this module has its own reader and
+  ## did not, so a `mods.json` saved by a Windows editor read as "not a JSON
+  ## object" and the whole registry went missing. Stripped here too, because
+  ## "which of the two readers opened this file" is not something a player can
+  ## be expected to know, and because a BOM is a *transport* artefact rather
+  ## than something the document says.
+  if text.len >= 3 and ord(text[0]) == 0xEF and ord(text[1]) == 0xBB and
+     ord(text[2]) == 0xBF:
+    return text.substr(3, text.len - 1)
+  result = text
+
 proc readTextFile*(path: string): string =
   ## `readFile` is `{.raises.}` in nimony, so every call is wrapped. The empty
   ## string is the failure, and the caller turns it into a message that names
@@ -113,7 +202,7 @@ proc readTextFile*(path: string): string =
   ## twenty-minute problem instead of a ten-second one.
   result = ""
   try:
-    result = readFile(path)
+    result = stripBom(readFile(path))
   except:
     result = ""
 
@@ -177,7 +266,7 @@ proc readMod(j: JsonRef; warnings: var seq[string]): ModEntry =
 
 proc readList(j: JsonRef; warnings: var seq[string]): ModList =
   result = ModList(id: "", name: "", author: "", version: "", description: "",
-                   inherits: @[], entries: @[])
+                   inherits: @[], entries: @[], local: false)
   result.id = textOf(j.field("id"), "")
   if result.id.len == 0:
     warnings.add "a list entry has no id and was skipped"
@@ -207,6 +296,16 @@ proc parseRegistry*(text, path: string): Registry =
   result.path = path
   if text.len == 0:
     result.error = "could not read " & path
+    return
+  if not wholeJsonObject(text):
+    # Checked before any field is read. `aowlspt/json` scans, so a manifest cut
+    # short parses as a smaller manifest rather than failing -- and a smaller
+    # manifest is a mod list nobody chose. See the note above `wholeJsonObject`.
+    result.error = path & " is not one complete JSON object -- truncated, or " &
+                   "not a registry at all. Nothing was read out of it: a " &
+                   "manifest that stops half way through parses as a shorter " &
+                   "manifest, and resolving against that would quietly drop " &
+                   "every mod after the cut."
     return
   let doc = whole(text)
   if not doc.exists or not doc.isObject:
@@ -250,6 +349,16 @@ proc parseRegistry*(text, path: string): Registry =
       continue
     result.lists.add entry
 
+  if result.mods.len == 0:
+    # Valid, well-formed, and describes nothing. It is not an error -- the file
+    # says what it says -- but it is never what anybody meant, and it is the
+    # input that makes a resolution come back empty with no fault anywhere to
+    # explain it. Named here so that `selectionWriteFault` in `manager.nim` has
+    # something to refuse on, and so the panel says it rather than showing an
+    # empty table.
+    result.warnings.add path & " parses but has no mods in it, so nothing can " &
+                        "resolve from it"
+
   result.ok = true
   result.error = ""
 
@@ -259,6 +368,44 @@ proc loadRegistry*(path: string): Registry =
 # ---------------------------------------------------------------------------
 # Lookup
 # ---------------------------------------------------------------------------
+
+const MaxIdBytes* = 80
+  ## The panel's fixed row field -- `registry/README.md`, "What the in-game
+  ## panel needs from an entry". `registry/validate.nim` refuses a longer id in
+  ## a manifest; this is the same number, applied to an id that arrives from
+  ## somewhere else.
+
+proc idFault*(id: string): string =
+  ## "" when `id` is shaped like a mod or list id, and a sentence naming the
+  ## fault when it is not.
+  ##
+  ## Checked by every route that takes an id, *before* the id is looked up --
+  ## not instead of it. A lookup already refuses anything the registry does not
+  ## have, but it refuses it by quoting the id back into an error body, a log
+  ## line and, on the routes that set an override or write a list, into the
+  ## player's selection store. Four kilobytes of quotes, backslashes and NULs
+  ## should not travel that far to arrive at the same "no", and a store key or
+  ## a panel row is not the place to find out that it did.
+  ##
+  ## The charset is the registry's own: ids are reverse-DNS, `[A-Za-z0-9._-]`,
+  ## and nothing in this pipeline has ever produced anything else. Bytes above
+  ## 0x7F are refused by the same rule, which also disposes of "is this valid
+  ## UTF-8" -- an id is not text that needs an encoding, it is a name.
+  if id.len == 0:
+    return "no id was given"
+  if id.len > MaxIdBytes:
+    return "an id of " & $id.len & " bytes is not an id; the limit is " &
+           $MaxIdBytes & " bytes, which is what the panel can draw"
+  for i in 0 ..< id.len:
+    let ch = id[i]
+    let okChar = (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or
+                 (ch >= '0' and ch <= '9') or ch == '.' or ch == '_' or
+                 ch == '-'
+    if not okChar:
+      return "an id may only contain letters, digits, `.`, `_` and `-`; " &
+             "there is a byte (0x" & $ord(ch) & ") at position " & $i &
+             " that is none of those"
+  result = ""
 
 proc findMod*(reg: Registry; id: string; outIndex: var int): bool =
   outIndex = -1

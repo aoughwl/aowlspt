@@ -69,6 +69,19 @@ type
     setter*: Binding
     why*: string        ## what was found, or why nothing was
 
+proc noSlot*(): Slot =
+  Slot(kind: skNone, fb: FieldBinding(ok: false, why: "", target: "",
+       offset: 0'i32, kind: fkNone, bindNs: 0'i64),
+       getter: Binding(ok: false, why: "", target: "",
+                       fn: nullPtr(), info: nullPtr(), argc: 0'i32,
+                       slots: 0'i32, mask: 0'u32, ret: fkNone,
+                       isStatic: false, bindNs: 0'i64),
+       setter: Binding(ok: false, why: "", target: "",
+                       fn: nullPtr(), info: nullPtr(), argc: 0'i32,
+                       slots: 0'i32, mask: 0'u32, ret: fkNone,
+                       isStatic: false, bindNs: 0'i64),
+       why: "")
+
 proc bindSlot*(rt: Il2Cpp; owner, member: string; wantWrite = false): Slot =
   ## Binds `member` on `owner`, field first.
   ##
@@ -76,17 +89,7 @@ proc bindSlot*(rt: Il2Cpp; owner, member: string; wantWrite = false): Slot =
   ## two spellings was tried and what the runtime said about each, because a
   ## member that quietly reads zero forever is the failure mode this whole file
   ## exists to make impossible.
-  result = Slot(kind: skNone, fb: FieldBinding(ok: false, why: "", target: "",
-                offset: 0'i32, kind: fkNone, bindNs: 0'i64),
-                getter: Binding(ok: false, why: "", target: "",
-                                fn: nullPtr(), info: nullPtr(), argc: 0'i32,
-                                slots: 0'i32, mask: 0'u32, ret: fkNone,
-                                isStatic: false, bindNs: 0'i64),
-                setter: Binding(ok: false, why: "", target: "",
-                                fn: nullPtr(), info: nullPtr(), argc: 0'i32,
-                                slots: 0'i32, mask: 0'u32, ret: fkNone,
-                                isStatic: false, bindNs: 0'i64),
-                why: "")
+  result = noSlot()
   if owner.len == 0:
     result.why = member & ": no owning type (the object it lives on was null)"
     return
@@ -111,6 +114,53 @@ proc bindSlot*(rt: Il2Cpp; owner, member: string; wantWrite = false): Slot =
   # does not exist, when the usual cause is that it is a property.
   result.why = owner & "::" & member & " — not a field (" & result.fb.why &
                ") and not a property (" & result.getter.why & ")"
+
+proc bindSlotOn*(rt: Il2Cpp; obj: Il2CppPtr; member: string; kind: FastKind;
+                 wantWrite = false): Slot =
+  ## The same, bound against a **live object's own class** instead of a name.
+  ##
+  ## `bindSlot` reaches its type through `findClass`, which takes a qualified
+  ## name — and there are types in this game that no name reaches. A nested
+  ## class is the one that matters here: `Player.FirearmController` is
+  ## `FirearmController` with `Player`'s namespace as far as the C API is
+  ## concerned, so the obvious `EFT.FirearmController` finds nothing and the
+  ## whole weapon group would silently bind to zero members. A generic
+  ## instantiation is the same problem with a worse name.
+  ##
+  ## `bindOnObject` starts from the object's own class and walks its base chain,
+  ## so there is no name to be wrong about. The cost is that it cannot infer:
+  ## the caller states the return's register class, which is why this takes a
+  ## `kind` and `bindSlot` does not.
+  ##
+  ## The order is deliberately the reverse of `bindSlot`'s. There, the field is
+  ## tried first because it is the cheaper read. Here, the accessor is tried
+  ## first because it is the one that works at all when the class cannot be
+  ## named — the field path below still needs a name, and is only a fallback for
+  ## a nameable type whose member happens to be a field.
+  result = noSlot()
+  if obj == nil:
+    result.why = member & ": no object to bind against"
+    return
+
+  var none: seq[FastKind] = @[]
+  result.getter = bindOnObject(rt, obj, "get_" & member, none, kind)
+  if result.getter.ok:
+    result.kind = skMethod
+    result.why = result.getter.why
+    if wantWrite:
+      var one: seq[FastKind] = @[]
+      one.add kind
+      result.setter = bindOnObject(rt, obj, "set_" & member, one, fkVoid)
+      if not result.setter.ok:
+        result.why = result.why & "; read-only (" & result.setter.why & ")"
+    return
+
+  let named = typeNameOf(rt, obj)
+  let accessorWhy = result.getter.why
+  result = bindSlot(rt, named, member, wantWrite)
+  if not result.bound():
+    result.why = result.why & "; and not on the object itself (" &
+                 accessorWhy & ")"
 
 proc bound*(s: Slot): bool = s.kind != skNone
 

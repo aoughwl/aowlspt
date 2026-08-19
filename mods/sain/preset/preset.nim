@@ -46,6 +46,24 @@ type
     patchBrains*: bool
     neutraliseLocationModifiers*: bool
     logDecisions*: bool
+    ## Whether the five driving calls may be made from the host's own thread
+    ## when the host has not confirmed that `onMainThread` reaches Unity's.
+    ##
+    ## This is the mod's oldest open question given a switch rather than an
+    ## assumption. `GoToPoint` ends in a `NavMeshAgent` and `LookToPoint` in a
+    ## `Transform`, and Unity checks the thread on most of that surface -- so
+    ## the honest default is the same one `client/coverprobe.nim` takes and
+    ## the cover sampler has always taken: do not call, and say so. What makes
+    ## it a switch rather than a rule is that the *cost* is different. A cover
+    ## sample not taken loses one sensor; an actuation not made means bots
+    ## think and never move, which on a host with no per-frame drain is the
+    ## whole mod doing nothing visible.
+    ##
+    ## Default **true**, because that is what this mod did before the queue
+    ## existed and a change of default would silently stop bots moving on
+    ## every host that has not grown the drain. `driveStats()` says which path
+    ## a session actually took, so a log distinguishes the two.
+    driveFromHostThread*: bool
 
 const RoleCount = 8      ## must match the number of `BotRole` members
 
@@ -187,7 +205,9 @@ proc loadPreset*(): Preset =
     patchBrains: doc.field("server.patchBrains").asBool(true),
     neutraliseLocationModifiers:
       doc.field("server.neutraliseLocationModifiers").asBool(true),
-    logDecisions: doc.field("logDecisions").asBool(false))
+    logDecisions: doc.field("logDecisions").asBool(false),
+    driveFromHostThread:
+      doc.field("driveFromHostThread").asBool(true))
 
   # The difficulty scale is folded in here rather than at every spawn: a bot
   # spawning gets `resolvedFor(preset.byRole[role], personality, scale)` and
