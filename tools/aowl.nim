@@ -972,6 +972,25 @@ proc cmdTest(e: Env): int =
          quoted(joinPath(testsDir, "detour_race.c"))):
     discard run(e, "a patch installed and removed under live callers never " &
                    "answers wrongly", quoted(raceExe))
+    # And the same run again with the test's own park switched off, so the
+    # engine is alone with the fourteen-byte prologue write. That write is not
+    # atomic -- a thread entering the function while it is going in executes
+    # half of one instruction and half of another -- and `aowl_hook_arm` and
+    # `aowl_hook_remove` now suspend every other thread in the process across
+    # it, retry until nobody is standing in the bytes, and fall back to the
+    # unparked write rather than ever spinning forever.
+    #
+    # This mode asserts the prologue fault count is zero, which the first mode
+    # cannot: there the test parks the workers itself and would report zero
+    # whatever the engine did. Built against the engine before the park went
+    # in, it reports 368 prologue faults and fails; with the park, none over
+    # ~14000 install/remove cycles against the control's 20000 -- same order,
+    # which is what makes the zero worth having. Threads are found with
+    # `ntdll!NtGetNextThread`; the `CreateToolhelp32Snapshot` fallback costs two
+    # milliseconds a park and got the same run 52 cycles, so the mode also
+    # checks that it raced.
+    discard run(e, "the engine's own park keeps live callers out of the " &
+                   "prologue it rewrites", quoted(raceExe) & " --engine-park")
 
   heading "IL2CPP host"
   let haveHost = buildIl2CppHost(e)
@@ -1682,6 +1701,40 @@ proc cmdTest(e: Env): int =
       discard run(e, "every mod has a true registry entry",
                   quoted(joinPath(outDir, "aowl-regcheck.exe")) &
                   " --repo " & quoted(e.repo))
+
+  # And the same argument one level up, for a document rather than a manifest.
+  # `docs/EMULATOR-COVERAGE.md` used to be rebuilt by hand from four shell
+  # commands plus a three-bucket split joined by hand on top of them, and the
+  # failure mode was the worst kind: the table does not become obviously wrong,
+  # it becomes quietly out of date while still reading as measured. Two of the
+  # four numbers had drifted the last time anybody re-ran them.
+  #
+  # `tools/coverage.nim` derives all of it -- the four sweeps in nimony by
+  # reading the files, and the split from `docs/coverage-rows.json` joined
+  # against `mods/tarkov/tarkov.nim` -- and `--check` writes nothing and fails
+  # if the document on disk is not what it would write. It also cross-checks the
+  # rows against the code in both directions, which is the half that earns its
+  # place here: a row claiming a route nothing registers, and a registered route
+  # no row mentions, are both errors, and the first run of it found eleven
+  # operations the hand join had wrong.
+  #
+  # Cheap, and last, for the same reason as the registry check: a build that
+  # gets this far and fails here has a stale document and nothing else.
+  heading "The coverage document against the emulator"
+  block:
+    let outDir = joinPath(e.repo, "installer\\build")
+    discard ensureDir(outDir)
+    var cmd = quoted(nimonyExe(e))
+    cmd.add " c"
+    cmd.add abiInclude(e)
+    cmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
+    cmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
+    cmd.add " -o:" & quoted(joinPath(outDir, "coverage.exe"))
+    cmd.add " " & quoted(joinPath(e.repo, "tools\\coverage.nim"))
+    if run(e, "aowl-coverage builds", cmd, e.repo):
+      discard run(e, "docs/EMULATOR-COVERAGE.md is what the code says it is",
+                  quoted(joinPath(outDir, "coverage.exe")) &
+                  " --repo " & quoted(e.repo) & " --check")
 
   heading "Result"
   if failures > 0:

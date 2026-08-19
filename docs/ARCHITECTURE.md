@@ -254,9 +254,18 @@ the single translation unit nimony emits.
   release. See [IMPORTDB.md](IMPORTDB.md).
 - The 189 trampolines in `aowlspt_fast.h` were enumerated once and are checked
   in; there is no generator step in the build.
-- `docs/EMULATOR-COVERAGE.md` is rebuilt by re-running the four shell commands
-  its own "How it was derived" section states, over `reference/` and
-  `mods/tarkov`, and joining the two halves by hand.
+- The generated regions of `docs/EMULATOR-COVERAGE.md`, by
+  `tools/coverage.nim` (`aowl-coverage`). It computes the four sweeps that
+  document's "How it was derived" section states — in nimony, by reading
+  `reference/spt-4.1-surface.txt` and `mods/tarkov` — and it derives the
+  served / empty / absent split from `docs/coverage-rows.json`, one row per
+  callback method, joined against the routes `mods/tarkov/tarkov.nim` actually
+  registers. The row file is the only hand-maintained half and it is
+  cross-checked both ways: a route no row names, a row naming a route nothing
+  serves, a callback method with no row and a row naming no callback method are
+  all errors. `aowl test` runs `aowl-coverage --check`, which writes nothing and
+  fails if the document on disk is stale. The prose around the two marked
+  regions is hand-written and the generator never touches it.
 
 ## The server: a poller, sixteen workers, and a lock per session
 

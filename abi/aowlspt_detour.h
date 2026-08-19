@@ -47,6 +47,13 @@
  * function, and a refusal a mod author can read beats a rewrite nobody has
  * checked.
  *
+ * **Why the process stops while the bytes move.** Fourteen bytes is not an
+ * atomic store, so a thread entering the function mid-write executes half of
+ * one instruction and half of another. Every other thread in the process is
+ * therefore suspended across the write and checked for standing in the bytes;
+ * see the long note above `aowl_hook_arm`, which is mostly about what may and
+ * may not be called while they are stopped.
+ *
  * The refusals are kept apart from each other on purpose. "I do not know this
  * instruction", "I know it and it cannot move", and "the function is shorter
  * than the jump" are three different problems -- the first is a gap in this
@@ -59,6 +66,7 @@
 #define AOWLSPT_DETOUR_H
 
 #include <windows.h>
+#include <tlhelp32.h>
 #include <stdint.h>
 #include <stdlib.h>
 #include <string.h>
@@ -828,6 +836,365 @@ static int32_t aowl_hook_prepare(void* handle, void* target, void* detour) {
     return aowl_hook_prepare_ex(handle, target, detour, 0);
 }
 
+/* ------------------------------------------------------------------ *
+ * The prologue is rewritten with the rest of the process standing still
+ *
+ * The jump is fourteen bytes and no store is fourteen bytes wide, so the
+ * rewrite is not atomic: a thread that enters the function while it is going in
+ * executes the head of the new jump followed by the tail of an instruction that
+ * is no longer there, or the head of an old instruction followed by half a
+ * pointer. It faults, or worse it does not. `tests/detour_race.c` counted this
+ * separately from the trampoline races -- `g_faultsPatch` -- and with six
+ * threads calling the target it is not a rare window either: over a thousand
+ * faults in a three-second run, which is why that test used to park the workers
+ * itself just to be able to see the race it was actually about.
+ *
+ * There are two ways to close it. One is to make the patch atomic: five bytes
+ * (`jmp rel32`) written with a single `lock cmpxchg`-width store, reaching an
+ * island near the target that holds the real fourteen. That needs an island
+ * within +/-2 GB, needs the prologue to hold five stealable bytes rather than
+ * fourteen, and quietly changes the decoder's contract. The other is to stop
+ * the threads while the bytes move, which is what this does -- it is the same
+ * thing every shipping detour engine on Windows does, and it costs nothing at
+ * all on the firing path.
+ *
+ * **Suspending is two steps and the second is not optional.** `SuspendThread`
+ * *requests* a suspension and returns; the thread is not off the processor
+ * until something makes the kernel wait for it. `GetThreadContext` is that
+ * something, and it is also the only way to ask where the thread stopped --
+ * which is the other half, because a thread parked *inside* the bytes resumes
+ * into the middle of the jump that replaced them and executes exactly the
+ * half-instruction the park exists to prevent. So: suspend everybody, look, and
+ * if anyone is standing in `[target, target + stolen)` let them all go and try
+ * again. The real stolen length, not `AOWL_MAX_STOLEN` -- the window is what
+ * decides how often somebody is standing in it, and a window twice the true
+ * size turns this loop into the bottleneck.
+ *
+ * **Nothing in the park window may take a user-mode lock, and that is the whole
+ * design constraint.** A suspended thread keeps whatever it held. If it held
+ * the process heap lock, or the loader lock, or a CRT lock, and the arming
+ * thread then called something that wants the same lock, the arming thread
+ * waits for a thread that cannot run -- a hard hang of the game with no thread
+ * to blame it on and no way to debug it, because the debugger's own threads are
+ * suspended too. So everything that can block is done *before* anybody is
+ * stopped: the trampoline, the site and the stub are built in
+ * `aowl_hook_prepare_ex`, and resolving `NtGetNextThread`, walking the thread
+ * list and opening every handle all happen in `aowl_park_begin` before the
+ * first `SuspendThread`. `CreateToolhelp32Snapshot`, the fallback enumeration,
+ * allocates and takes locks all over the place; taking it with the process
+ * already frozen would be the deadlock, and the same is true of
+ * `GetProcAddress` if the resolve were left until the handles were in hand.
+ *
+ * What is left inside the window is the suspend sweep itself -- `SuspendThread`
+ * and `GetThreadContext` per thread -- and then `VirtualProtect`, the byte
+ * stores, and `VirtualProtect` back.
+ *
+ * **Is `VirtualProtect` safe there?** Yes, and the reason is worth writing
+ * down rather than assuming. It is a thin wrapper over `NtProtectVirtualMemory`
+ * -- it takes no CRT lock, no heap lock and no loader lock, so there is no
+ * user-mode lock for a suspended thread to be holding against it. The locks it
+ * does take are the kernel's address-space locks, and a user-mode thread cannot
+ * be suspended while holding one: a suspend is delivered at a kernel APC
+ * boundary, so a thread inside a memory syscall finishes that syscall and
+ * releases the lock before it stops. The one caveat is instrumentation --
+ * Application Verifier, some anti-cheat and some profilers hook the Win32 layer
+ * and can put a user-mode lock underneath it -- and there is nothing this file
+ * can do about that beyond keeping the call count in the window at two.
+ * `FlushInstructionCache` is a syscall too, but it is done *after* the resume
+ * because it does not need to be inside; x86 instruction caches are coherent
+ * with stores, so the flush is a formality and its position is free.
+ *
+ * **What one install costs, because live mod control pays it.** A park happens
+ * on every arm and every disarm, and both are reached from a mod-manager click
+ * while the game is running -- so this is a product number, not a test artifact.
+ * Measured on this machine (`--engine-park` in `tests/detour_race.c`, and a
+ * scratch harness at fixed thread counts):
+ *
+ *     enumeration, NtGetNextThread     ~0.8 us per thread   (outside the freeze)
+ *     enumeration, Toolhelp fallback   ~2 ms flat           (outside the freeze)
+ *     suspend + context + resume       ~11 us per thread    (inside the freeze)
+ *
+ * So on a process with 65 threads, one park is ~0.9 ms of which ~0.7 ms is the
+ * freeze, and one arm-plus-disarm is ~1.8 ms. A Unity client runs somewhere
+ * around fifty to a hundred threads, so a mod toggling ten patches off and on
+ * costs tens of milliseconds and freezes the world for under a millisecond at a
+ * time. That is a hitch, not a hang, and it is the price of the write being
+ * safe. On the Toolhelp fallback the same toggle costs an extra ~4 ms per
+ * patch, all of it outside the freeze: slower to click, not jerkier to play.
+ *
+ * The per-thread constant is why the enumeration was worth changing and the
+ * suspend sweep is not: 11 us per thread is three syscalls that have to happen,
+ * where the 2 ms was a machine-wide snapshot of ten thousand threads to find
+ * sixty. Under `tests/detour_race.c` -- six threads saturating the CPU -- the
+ * change took the run from 50 install/remove cycles in three seconds to
+ * thirteen or fourteen thousand, which is what makes the zero it reports mean
+ * anything.
+ *
+ * **It must never hang the game.** The retry loop is bounded at
+ * `AOWL_PARK_RETRIES`. On exhaustion every thread is resumed and the write goes
+ * ahead unparked -- today's behaviour, with today's small chance of a torn
+ * prologue -- rather than spinning forever or refusing the hook. That is a
+ * deliberate ranking: a mod that will not arm, or a client that freezes on a
+ * mod-manager click, is a worse outcome than a race that is now rare rather
+ * than constant, and the giveup is counted (`aowl_hook_park_giveups`) so it is
+ * a number somebody can look at rather than a silent downgrade.
+ *
+ * Every thread that was suspended is resumed on every path out, including the
+ * error paths -- `aowl_park_close` is called even when `VirtualProtect` fails.
+ * A leaked suspend count is a permanently frozen game thread, which presents as
+ * a hung client rather than as a bug in this file.
+ *
+ * Two things this does not cover, on purpose. A thread created *after* the
+ * enumeration is not parked; the window for one to be spawned and reach this
+ * exact function inside the microseconds the write takes is not worth a second
+ * enumeration with the process already frozen. And a process with more than
+ * `AOWL_PARK_MAX` threads is not parked at all -- the handle array is a stack
+ * local because it must not be a heap allocation, and overflowing it falls back
+ * to the unparked write the same way exhaustion does.
+ * ------------------------------------------------------------------ */
+
+#define AOWL_PARK_MAX     512   /* threads; 4 KB of stack for the handles   */
+#define AOWL_PARK_RETRIES 64    /* then write unparked rather than hang      */
+
+/* What a park needs on every thread it stops: suspend it, read where it
+ * stopped, and -- because the ntdll enumeration hands back handles rather than
+ * thread ids -- ask a handle which thread it is, so the caller's own can be
+ * dropped from the list. */
+#define AOWL_PARK_ACCESS (THREAD_SUSPEND_RESUME | THREAD_GET_CONTEXT | \
+                          THREAD_QUERY_LIMITED_INFORMATION)
+
+#define AOWL_PARK_ENUM_NONE     0
+#define AOWL_PARK_ENUM_NT       1   /* ntdll!NtGetNextThread                  */
+#define AOWL_PARK_ENUM_TOOLHELP 2   /* CreateToolhelp32Snapshot, the fallback */
+
+typedef struct AowlPark {
+    HANDLE  threads[AOWL_PARK_MAX];
+    uint8_t stopped[AOWL_PARK_MAX];  /* this park suspended it, so this park
+                                        resumes it -- and nothing it did not */
+    int32_t count;
+} AowlPark;
+
+/* Off only for the harness that has to show the race is real; see
+ * `tests/detour_race.c --no-park`. Nothing in the host touches it. */
+static int32_t g_parkEnabled = 1;
+static void    aowl_hook_set_park(int32_t on) { g_parkEnabled = on ? 1 : 0; }
+static int32_t aowl_hook_park_enabled(void) { return g_parkEnabled; }
+
+/* Counted rather than assumed: "the park never had to retry" and "the park
+ * never ran" answer identically from outside, and a giveup is the one case
+ * where the engine knowingly writes into running threads. */
+static volatile LONG aowl_park_retries = 0;
+static volatile LONG aowl_park_giveups = 0;
+static int32_t aowl_hook_park_retries(void) { return (int32_t)aowl_park_retries; }
+static int32_t aowl_hook_park_giveups(void) { return (int32_t)aowl_park_giveups; }
+
+/* Which enumeration actually ran. Reported rather than assumed for the same
+ * reason as everything else here: the fallback costs milliseconds where the
+ * fast path costs tens of microseconds, so a machine that silently took it is a
+ * machine whose mod toggles feel different, and "which one ran" should never be
+ * a guess. */
+static int32_t g_parkEnum = AOWL_PARK_ENUM_NONE;
+static int32_t aowl_hook_park_enum(void) { return g_parkEnum; }
+static const char* aowl_hook_park_enum_text(void) {
+    switch (g_parkEnum) {
+        case AOWL_PARK_ENUM_NT:       return "ntdll!NtGetNextThread";
+        case AOWL_PARK_ENUM_TOOLHELP: return "CreateToolhelp32Snapshot";
+        default:                      return "none";
+    }
+}
+
+static void aowl_park_resume(AowlPark* p) {
+    for (int32_t i = 0; i < p->count; i++) {
+        if (!p->stopped[i]) continue;
+        ResumeThread(p->threads[i]);
+        p->stopped[i] = 0;
+    }
+}
+
+/* Resume anything still stopped, then give the handles back. Safe to call on a
+ * park that never started, which is what makes it the single exit path. */
+static void aowl_park_close(AowlPark* p) {
+    aowl_park_resume(p);
+    for (int32_t i = 0; i < p->count; i++) CloseHandle(p->threads[i]);
+    p->count = 0;
+}
+
+/* ntdll!NtGetNextThread -- undocumented, present since Windows 8.1, and the
+ * reason a park is affordable on a live game.
+ *
+ *   NTSTATUS NtGetNextThread(HANDLE process, HANDLE thread, ACCESS_MASK access,
+ *                            ULONG attributes, ULONG flags, HANDLE* next)
+ *
+ * Pass NULL for the first call and the previous handle after that, and it walks
+ * this process's thread list, opening each one at the access asked for. It is
+ * resolved once and cached, with `GetModuleHandleW` rather than `LoadLibrary`:
+ * ntdll is mapped into every process before any of our code runs, so there is
+ * nothing to load and no loader work to do. The resolve happens on the
+ * enumeration path, which is before any thread is suspended -- like everything
+ * else here that could block.
+ *
+ * Undocumented means it can be absent, which is why the Toolhelp path below
+ * stays. It does not mean unstable: the signature has not moved in a decade and
+ * every debugger on Windows walks threads this way. A wrong guess about it
+ * fails at `GetProcAddress` or returns an error status, and both land on the
+ * fallback rather than on a wrong list. */
+typedef LONG (NTAPI *AowlNtGetNextThread)(HANDLE, HANDLE, ACCESS_MASK,
+                                          ULONG, ULONG, HANDLE*);
+static AowlNtGetNextThread g_ntGetNextThread = NULL;
+static int32_t g_ntGetNextThreadResolved = 0;
+
+static AowlNtGetNextThread aowl_nt_get_next_thread(void) {
+    if (!g_ntGetNextThreadResolved) {
+        HMODULE ntdll = GetModuleHandleW(L"ntdll.dll");
+        if (ntdll)
+            g_ntGetNextThread = (AowlNtGetNextThread)(void*)
+                GetProcAddress(ntdll, "NtGetNextThread");
+        g_ntGetNextThreadResolved = 1;
+    }
+    return g_ntGetNextThread;
+}
+
+/* Opens every thread of this process except the caller's, the fast way. 1 when
+ * the array holds them, 0 when the export is missing or the walk produced
+ * nothing -- in which case the caller tries Toolhelp. */
+static int32_t aowl_park_collect_nt(AowlPark* p) {
+    AowlNtGetNextThread getNext = aowl_nt_get_next_thread();
+    if (!getNext) return 0;
+
+    const HANDLE self = GetCurrentProcess();
+    const DWORD  me   = GetCurrentThreadId();
+    HANDLE prev = NULL;
+    for (;;) {
+        HANDLE h = NULL;
+        /* Every NTSTATUS that is not success is negative, STATUS_NO_MORE_ENTRIES
+         * among them, so the ordinary end of the walk and a real failure end it
+         * the same way. That is deliberate: what follows uses the list only to
+         * hold threads out of the bytes, and a list that is short by one thread
+         * is not a smaller version of the right answer, it is the wrong one. A
+         * walk that ends early with some threads collected still parks those --
+         * the alternative is not parking at all -- but a walk that collected
+         * none falls through to the fallback below. */
+        if (getNext(self, prev, AOWL_PARK_ACCESS, 0, 0, &h) < 0) break;
+        if (p->count >= AOWL_PARK_MAX) {
+            CloseHandle(h);
+            aowl_park_close(p);
+            return 0;
+        }
+        p->stopped[p->count] = 0;
+        p->threads[p->count++] = h;
+        /* The next call needs this handle open; it stays open in the array
+         * until `aowl_park_close`, so there is nothing extra to track. */
+        prev = h;
+    }
+    if (p->count == 0) return 0;
+
+    /* The caller is one of this process's threads, so it is in the list, and a
+     * handle is not an id -- `GetThreadId` is the question, and asking it is
+     * why `AOWL_PARK_ACCESS` includes QUERY_LIMITED_INFORMATION. Suspending
+     * ourselves would be a hang with no thread left able to undo it. */
+    for (int32_t i = 0; i < p->count; i++) {
+        if (GetThreadId(p->threads[i]) != me) continue;
+        CloseHandle(p->threads[i]);
+        p->threads[i] = p->threads[p->count - 1];
+        p->count--;
+        break;
+    }
+    return 1;
+}
+
+/* The same list, the documented way, for a system without the export.
+ *
+ * Kept because "undocumented" and "always present" are not the same claim, and
+ * the cost of being wrong about it is that no install parks at all. It is a
+ * real fallback and not a rehearsal: it fills the same array, and the suspend
+ * loop below cannot tell which of the two filled it.
+ *
+ * What it costs is why it is second. `CreateToolhelp32Snapshot` snapshots the
+ * threads of **every process on the machine** -- some ten thousand of them on
+ * an ordinary desktop -- and this walk then throws all but ours away. Measured
+ * on this machine that is ~2 ms per park, flat, against ~50 us for the walk
+ * above at 65 threads, and a park happens on every arm and on every disarm.
+ * Both costs are outside the freeze; see the note above `aowl_hook_arm`. */
+static int32_t aowl_park_collect_toolhelp(AowlPark* p) {
+    const DWORD me  = GetCurrentThreadId();
+    const DWORD pid = GetCurrentProcessId();
+    HANDLE snap = CreateToolhelp32Snapshot(TH32CS_SNAPTHREAD, 0);
+    if (snap == INVALID_HANDLE_VALUE) return 0;
+    THREADENTRY32 te;
+    te.dwSize = sizeof(te);
+    if (Thread32First(snap, &te)) {
+        do {
+            /* The snapshot is machine-wide however it is asked for, so the
+             * owner has to be checked on every entry -- suspending another
+             * process's threads is not a bug this file would survive. */
+            if (te.dwSize < FIELD_OFFSET(THREADENTRY32, th32OwnerProcessID) +
+                            sizeof(te.th32OwnerProcessID)) continue;
+            if (te.th32OwnerProcessID != pid) continue;
+            if (te.th32ThreadID == me) continue;
+            if (p->count >= AOWL_PARK_MAX) {
+                CloseHandle(snap);
+                aowl_park_close(p);
+                return 0;
+            }
+            HANDLE h = OpenThread(AOWL_PARK_ACCESS, FALSE, te.th32ThreadID);
+            /* A thread that exited between the snapshot and here, or one this
+             * process may not open, is simply not parked. */
+            if (h) { p->stopped[p->count] = 0; p->threads[p->count++] = h; }
+        } while (Thread32Next(snap, &te));
+    }
+    CloseHandle(snap);
+    return 1;
+}
+
+/* Stops every other thread in the process outside `[target, target + stolen)`.
+ * Returns 1 when the process is frozen and clear of the bytes, 0 when it is
+ * not -- and 0 is not an error: the caller writes anyway. Either way the caller
+ * must call `aowl_park_close`. */
+static int32_t aowl_park_begin(AowlPark* p, void* target, int32_t stolen) {
+    p->count = 0;
+    if (!g_parkEnabled) return 0;
+
+    /* --- Everything that can allocate or block happens here, before the first
+     * SuspendThread below: the export resolve, the enumeration, and every
+     * handle open. --- */
+    if (aowl_park_collect_nt(p)) {
+        g_parkEnum = AOWL_PARK_ENUM_NT;
+    } else if (aowl_park_collect_toolhelp(p)) {
+        g_parkEnum = AOWL_PARK_ENUM_TOOLHELP;
+    } else {
+        return 0;
+    }
+    if (p->count == 0) return 0;   /* single-threaded: the write is alone */
+
+    const uintptr_t lo = (uintptr_t)target;
+    const uintptr_t hi = lo + (uintptr_t)(stolen > 0 ? stolen : AOWL_JMP_SIZE);
+    CONTEXT c;
+    for (int32_t attempt = 0; attempt < AOWL_PARK_RETRIES; attempt++) {
+        int32_t clear = 1;
+        for (int32_t i = 0; i < p->count; i++) {
+            if (SuspendThread(p->threads[i]) == (DWORD)-1) continue;
+            p->stopped[i] = 1;
+            memset(&c, 0, sizeof(c));
+            c.ContextFlags = CONTEXT_CONTROL;
+            /* The context is what actually makes the kernel wait, so it is
+             * fetched for every thread even when one has already been found in
+             * the way -- skipping the rest would leave them requested but not
+             * stopped. */
+            if (GetThreadContext(p->threads[i], &c) &&
+                (uintptr_t)c.Rip >= lo && (uintptr_t)c.Rip < hi) clear = 0;
+        }
+        if (clear) return 1;
+        aowl_park_resume(p);
+        InterlockedIncrement(&aowl_park_retries);
+        /* Outside the suspension, always: a yield with the process frozen is a
+         * yield to nobody. */
+        Sleep(0);
+    }
+    InterlockedIncrement(&aowl_park_giveups);
+    aowl_park_close(p);
+    return 0;
+}
+
 /* The second half: the jump goes in, and the patch is live from here. */
 static int32_t aowl_hook_arm(void* handle) {
     AowlHook* h = (AowlHook*)handle;
@@ -836,9 +1203,16 @@ static int32_t aowl_hook_arm(void* handle) {
     int32_t stolen = h->stolen;
     void* detour = h->detour;
 
+    /* Nothing below this line until `aowl_park_close` may allocate, lock or
+     * block; see the note above. */
+    AowlPark park;
+    aowl_park_begin(&park, t, stolen);
+
     DWORD old = 0;
-    if (!VirtualProtect(t, (SIZE_T)stolen, PAGE_EXECUTE_READWRITE, &old))
+    if (!VirtualProtect(t, (SIZE_T)stolen, PAGE_EXECUTE_READWRITE, &old)) {
+        aowl_park_close(&park);
         return -4;
+    }
 
     aowl_write_jmp_abs(t, detour);
     /* Bytes between the jump and the end of the last stolen instruction are
@@ -848,6 +1222,7 @@ static int32_t aowl_hook_arm(void* handle) {
     for (int32_t k = AOWL_JMP_SIZE; k < stolen; k++) t[k] = 0xCC;
 
     VirtualProtect(t, (SIZE_T)stolen, old, &old);
+    aowl_park_close(&park);
     FlushInstructionCache(GetCurrentProcess(), t, (SIZE_T)stolen);
 
     h->installed = 1;
@@ -869,10 +1244,19 @@ static int32_t aowl_hook_remove(void* handle) {
 
     DWORD old = 0;
     uint8_t* t = (uint8_t*)h->target;
-    if (!VirtualProtect(t, (SIZE_T)h->stolen, PAGE_EXECUTE_READWRITE, &old))
+    /* The same park as the arm, and for the same reason: putting the original
+     * bytes back is the identical non-atomic fourteen-byte write in the other
+     * direction. Same rule below the line -- nothing that allocates, locks or
+     * blocks until `aowl_park_close`. */
+    AowlPark park;
+    aowl_park_begin(&park, t, h->stolen);
+    if (!VirtualProtect(t, (SIZE_T)h->stolen, PAGE_EXECUTE_READWRITE, &old)) {
+        aowl_park_close(&park);
         return -4;
+    }
     memcpy(t, h->original, (size_t)h->stolen);
     VirtualProtect(t, (SIZE_T)h->stolen, old, &old);
+    aowl_park_close(&park);
     FlushInstructionCache(GetCurrentProcess(), t, (SIZE_T)h->stolen);
 
     /* The trampoline is *retired*, not freed -- see `aowl_tramp_alloc`. A

@@ -123,6 +123,7 @@ tools/aowllaunch.nim     aowlspt-launch: start the game with the host inside it
 tools/il2cppprobe.nim    what a post-1.0 client exposes
 tools/hostharness.nim    run the client host with no game
 tools/aowlprobe.nim      call a backend route with the game's wire framing
+tools/coverage.nim       aowl-coverage: generate and check EMULATOR-COVERAGE.md
 tools/emutest.nim        drive the emulator through the client's boot sequence
 tools/realtest.nim       the emulator against a database imported from SPT
 tools/livectl.nim        turn a mod off and on again on a running backend
@@ -158,6 +159,7 @@ docs/BACKEND.md          writing a backend mod, and the wire protocol
 docs/IL2CPP.md           why there is no BepInEx underneath the client host
 docs/EMULATOR.md         what the Tarkov emulator implements, and refuses
 docs/EMULATOR-COVERAGE.md  the gap list: every client operation, served or not
+docs/coverage-rows.json  its input: one row per callback method, hand-maintained
 docs/IMPORTDB.md         building a real database out of an SPT install
 docs/MODMANAGER.md       enabling and disabling mods while everything is running
 docs/PERF.md             what a client-side call costs, measured

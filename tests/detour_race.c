@@ -51,10 +51,40 @@
  * would never have returned. Against the engine as it is: none of either, over
  * twenty thousand install/remove cycles and a hundred million calls.
  *
- * It is wired into `aowl test`, beside the line that compiles and runs
- * `detour_test.c`, so every one of its verdicts has to be one that holds under
- * a loaded machine as well as an idle one. The command at the top of this file
- * runs it on its own.
+ * ## Three modes, because a park has to be shown to be doing something
+ *
+ * The fourteen-byte prologue write is not atomic, and both this file and the
+ * engine now know how to stop the threads across it. Which one does it is a
+ * command-line argument, and all three arrangements are real runs:
+ *
+ *   * default -- this file parks its workers, `aowl_hook_set_park(0)` tells the
+ *     engine not to. Every verdict this file has ever produced came from this
+ *     arrangement and it is unchanged.
+ *   * `--engine-park` -- this file parks nothing and the engine parks the
+ *     process. `g_faultsPatch` is asserted to be zero here and nowhere else.
+ *   * `--no-park` -- neither. The control: it says what the write costs
+ *     unguarded, and therefore what the other two modes' zeroes are worth.
+ *
+ * Measured on this machine, three-second runs: default 0 prologue faults over
+ * 20000 install/remove cycles, `--engine-park` 0 over 13282 and again over
+ * 14876, `--no-park` 357 and 502 over 20000. Built against the engine as it was
+ * before the park went in, `--engine-park` reports 368 and fails, which is that
+ * check having teeth. The trampoline and wrong-answer verdicts are zero in
+ * every one of those runs.
+ *
+ * The three cycle counts being the same order is the point, and it took work.
+ * The first version of the park enumerated threads with
+ * `CreateToolhelp32Snapshot`, which snapshots every thread on the machine, and
+ * `--engine-park` managed 52 cycles against the control's 20000 -- and zero
+ * faults over 52 rewrites is thin evidence about a race that is rare per
+ * rewrite. With `ntdll!NtGetNextThread` it is thirteen to fifteen thousand
+ * against 20000: still short, because a park is not free, but no longer a
+ * different experiment.
+ *
+ * The first two are wired into `aowl test`, beside the line that compiles and
+ * runs `detour_test.c`, so every one of their verdicts has to be one that holds
+ * under a loaded machine as well as an idle one. The command at the top of this
+ * file runs it on its own.
  */
 
 #include <stdio.h>
@@ -122,12 +152,12 @@ int64_t race_decoy(int64_t x) {
  *    fourteen bytes, which is a different and older problem: the jump that
  *    replaces a prologue is fourteen bytes and no store is that wide, so a
  *    thread entering the function while those bytes are going in executes half
- *    of one instruction and half of another. Nothing in this change addresses
- *    it -- closing it needs either a five-byte atomic patch through an island
- *    or a thread suspension around every arm and disarm -- so it is counted
- *    and reported rather than asserted to be zero. Counting it is the point:
- *    without the split, the number it contributes hides whether the race this
- *    file *is* about was fixed.
+ *    of one instruction and half of another. This used to be counted and
+ *    reported rather than asserted on, because the engine did nothing about it
+ *    and the park that hid it lived down in this file. The engine now parks the
+ *    process itself, so in `--engine-park` this number is **asserted to be
+ *    zero** and it is the whole point of that mode. `--no-park` turns both
+ *    parks off and prints what the write costs unguarded, which is the control.
  */
 static volatile LONG g_faults = 0;
 static volatile LONG g_faultsTramp = 0;
@@ -165,9 +195,10 @@ static volatile LONG g_calls  = 0;
  *     zero.
  *
  * A torn prologue would land in the second bucket, and would be the one thing
- * in it that is not a trampoline problem. It has never been seen to: the park
- * below holds every worker out of the bytes being rewritten, and `prologue`
- * faults come back zero run after run for the same reason. So the rewrite
+ * in it that is not a trampoline problem. It has never been seen to: whichever
+ * park is in force holds every worker out of the bytes being rewritten, and
+ * `prologue` faults come back zero run after run for the same reason. So the
+ * rewrite
  * window is kept, and printed, and attached to every wrong answer that is
  * logged -- but as evidence, not as an allowance. `g_rewriteSeq` is odd for
  * precisely as long as the target's first bytes are torn; a worker samples it
@@ -320,14 +351,31 @@ static DWORD WINAPI worker(LPVOID arg) {
  * The fourteen-byte jump is written with ordinary stores and no store is
  * fourteen bytes wide, so a thread that enters the function while it is going
  * in executes the tail of one instruction as if it were the head of another.
- * That is a real race and it is not this file's -- it belongs to
- * `aowl_hook_arm` and `aowl_hook_remove`, it predates everything here, and
- * closing it needs a five-byte atomic patch through an island near the target
- * or a suspension in the engine itself. Left in, it accounts for well over a
- * thousand faults a run and drowns out the count that is being asserted on.
+ * This note used to say that closing that race needed "a five-byte atomic
+ * patch through an island near the target or a suspension in the engine
+ * itself", and that until one of those existed the park had to live here --
+ * because left in, the race accounts for well over a thousand faults a run and
+ * drowns out the count this file is actually asserting on. What happened is the
+ * second of the two: `aowl_hook_arm` and `aowl_hook_remove` now enumerate the
+ * process's threads, suspend them, and retry until nobody's RIP is inside the
+ * bytes about to move. The prototype below is what that engine code was written
+ * from -- the two-step suspend, the RIP check, the retry -- and it is kept, for
+ * three reasons.
  *
- * So the test parks the workers across the byte write and lets them go again
- * immediately. What that removes is exactly the prologue race and nothing
+ * It is the **control**. `--no-park` turns both this park and the engine's off
+ * and reports what the unguarded write costs, which is the only way to know
+ * that `--engine-park` reporting zero means anything.
+ *
+ * It is the **default**, unchanged, so the trampoline-lifetime verdicts this
+ * file has always produced keep being produced by exactly the arrangement that
+ * produced them before: in the default mode the engine's park is switched off
+ * and this one does the work, so the numbers are comparable across the change.
+ *
+ * And it parks *only the workers*, where the engine parks every other thread in
+ * the process -- which here is the same set, but only because this test has no
+ * other threads.
+ *
+ * What either park removes is exactly the prologue race and nothing
  * else: a thread parked *inside* a trampoline stays inside it while the
  * removal retires that trampoline, a thread parked between the generation load
  * and the dispatcher stays there while the slot is released and reused, and
@@ -335,10 +383,22 @@ static DWORD WINAPI worker(LPVOID arg) {
  * wider than it would be otherwise.
  * ------------------------------------------------------------------ */
 
+/* Which park is in force. Set from the command line in `main`:
+ *
+ *   (none)          this file's park; the engine's is switched off. The
+ *                   arrangement every previous run of this test used.
+ *   --engine-park   this file's park is a no-op and the engine's does the work.
+ *                   The mode that asserts `g_faultsPatch == 0`.
+ *   --no-park       neither. Nothing is asserted about the prologue; the number
+ *                   is printed, and it is the evidence the gate has teeth.
+ */
+static int g_testPark = 1;
+
 static HANDLE g_workers[16];
 static int    g_workerCount = 0;
 
 static void unpark(void) {
+    if (!g_testPark) return;
     for (int i = 0; i < g_workerCount; i++)
         if (g_workers[i]) ResumeThread(g_workers[i]);
 }
@@ -360,10 +420,20 @@ static LONG g_parkRetries = 0;
  * never been stopped. So the park is retried until no worker is standing in
  * the rewrite: suspend, look, and if anybody is in the way let them all go and
  * try again. That is what a detour engine has to do to make an install safe
- * against running threads, and it is written out here rather than in
- * `aowl_hook_arm` on purpose -- see the note on `g_faultsPatch`.
+ * against running threads, and it is now what `aowl_hook_arm` does -- with two
+ * differences that matter there and not here. The engine has to *find* the
+ * threads, where this file was handed their handles when it created them, and
+ * how it finds them turned out to matter more than anything else about the
+ * park: `ntdll!NtGetNextThread` walks this process's threads and costs under a
+ * microsecond each, where `CreateToolhelp32Snapshot` snapshots every thread on
+ * the machine and costs two milliseconds a park, which was the difference
+ * between `--engine-park` racing 52 cycles and racing 14876. And the engine has
+ * to bound its retries, because a loop that never gives up is a frozen game.
+ * This one may spin: six workers it created itself will always clear
+ * eventually, and if they did not, a hung test is a result.
  */
 static void park(void* fn) {
+    if (!g_testPark) return;
     const uintptr_t lo = (uintptr_t)fn;
     /* The exact bytes the install will rewrite, not `AOWL_MAX_STOLEN`: the
      * window is what decides how often a worker is standing in it, and a
@@ -425,8 +495,28 @@ static int cycle(void* fn) {
     return 1;
 }
 
-int main(void) {
-    printf("aowlspt detour race\n\n");
+int main(int argc, char** argv) {
+    /* Three arrangements of the same run; see `g_testPark`. The engine's park
+     * is switched *off* in the default mode on purpose -- with both parks on
+     * the run would still be clean, and a mode that cannot distinguish which
+     * park did the work is not a control for either. */
+    int enginePark = 0;
+    const char* mode = "the test parks the workers, the engine does not";
+    for (int i = 1; i < argc; i++) {
+        if (strcmp(argv[i], "--engine-park") == 0) {
+            g_testPark = 0; enginePark = 1;
+            mode = "the engine parks the process, the test does not";
+        } else if (strcmp(argv[i], "--no-park") == 0) {
+            g_testPark = 0; enginePark = 0;
+            mode = "nobody parks anything -- the control";
+        } else {
+            printf("unknown option %s\n", argv[i]);
+            return 2;
+        }
+    }
+    aowl_hook_set_park(enginePark);
+
+    printf("aowlspt detour race -- %s\n\n", mode);
 
     PVOID veh = AddVectoredExceptionHandler(1, race_veh);
     check("the fault handler is installed", veh != NULL);
@@ -483,6 +573,12 @@ int main(void) {
     printf("      %ld of %ld calls were in flight across a rewrite, "
            "%ld prologue faults\n",
            (long)g_callsIn, (long)g_calls, (long)g_faultsPatch);
+    printf("      engine park: %s via %s, %d retries, %d giveups "
+           "(retry bound %d)\n",
+           aowl_hook_park_enabled() ? "on" : "off",
+           aowl_hook_park_enum_text(),
+           aowl_hook_park_retries(), aowl_hook_park_giveups(),
+           AOWL_PARK_RETRIES);
     printf("      trampolines handed out %d in %d block(s)\n",
            aowl_tramp_count(), aowl_tramp_blocks());
     printf("      stale firings caught by the generation: %d\n",
@@ -515,7 +611,20 @@ int main(void) {
     if (g_attachFail)
         printf("      attach refused: %d (%s)\n", g_attachFail,
                aowl_hook_error_text(g_attachFail));
-    check("the run actually raced (cycles)", cycles > 100);
+    /* The bound is lower with the engine parking because a cycle carries four
+     * parks -- an arm and a disarm for each of the two hooks -- and a park is
+     * an enumeration plus a suspend-and-look sweep over every thread in the
+     * process. Most of that is outside the suspension by construction, so it is
+     * a slower install rather than a longer freeze; the cost table is in the
+     * note above `aowl_hook_arm`.
+     *
+     * 2000 is low enough to survive a loaded machine and high enough to fail if
+     * the enumeration ever regresses to the Toolhelp fallback, which managed 52
+     * cycles in the same three seconds. A mode that raced two orders of
+     * magnitude less than the control it is compared against is the reason this
+     * bound is checked at all. */
+    check("the run actually raced (cycles)",
+          cycles > (enginePark ? 2000 : 100));
     check("the run actually raced (calls)", g_calls > 100000);
     check("no firing reached a trampoline that was gone or not its own",
           g_faultsTramp == 0);
@@ -526,6 +635,16 @@ int main(void) {
      * serving. The split is there to name the mechanism in the output, not to
      * excuse either half. */
     check("no call was answered by another hook's code", g_wrongForeign == 0);
+    /* The engine's park, asserted on only in the mode that leaves the engine
+     * alone with the problem. In the default mode this file's own park makes it
+     * zero and the check would prove nothing about the engine; in `--no-park`
+     * it is expected to be large and is printed rather than asserted, because
+     * "the unguarded write tore at least once in three seconds" is evidence and
+     * not a contract. Against the engine before the park went in, this mode
+     * reports thousands and this line fails, which is the point of it. */
+    if (enginePark)
+        check("the engine's park held every thread out of the bytes it rewrote",
+              g_faultsPatch == 0);
     check("no call was answered by a suppressed or torn firing",
           g_wrongOther == 0);
     /* Bounded, and the number says by how much: a run of 20000 installs takes
