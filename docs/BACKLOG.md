@@ -46,8 +46,11 @@ it says that instead.
 Items that are **wrong**, not merely missing. Each carries its evidence. These
 are separated out because they need dispatching rather than deciding.
 
-**This section was nine items, then four, and is now three.** Eight of the
-original nine have been fixed in code since it was written; they are listed under
+**This section was nine items, then four, then three, and is now one** --
+`B11`, the only one that is a process rather than a defect. B4's three README
+paragraphs and B10's four documents are all corrected in place, and B2 closed
+itself when the code moved rather than by anyone dispatching it. The originals
+have been fixed in code since this was written; they are listed under
 [Closed since this list was written](#closed-since-this-list-was-written) at the
 end, with the file-and-line proof, rather than deleted — a backlog that quietly
 loses its own history stops being checkable.
@@ -57,23 +60,42 @@ It said `aowl test`'s "patch fired" check was red because on msys2 ucrt64 gcc
 15.2 the stand-in's `Tick` and `Hurt` compiled to prologues the detour engine
 would not relocate. `docs/MODDING.md:1285-1294` now retracts that in place, and
 a `hostharness` run against `tests/mockil2cpp/GameAssembly.dll` on 2026-08-19
-answers **all 24 verdicts green**, including *"a compiled method was detoured
+answers **all 27 verdicts green**, including *"a compiled method was detoured
 and the patch fired"* and *"patched EFT.Player::Tick (14 bytes) … the hook fired
 on all 3 calls"*. If it goes red on another toolchain it is still a stand-in
 artefact — but it is no longer the expected outcome.
 
 ### B4. Two mod READMEs describe gaps in `mods/tarkov` that are closed
 
-Cross-mod gap claims age badly. This was three; icebreaker's has since been
-corrected in place (`mods/icebreaker/README.md:120-125` now says why the old
-paragraph stopped being true). Two are still standing and still read as current:
+Cross-mod gap claims age badly. **This was three and is now none** -- all three
+are corrected in place, and the entries below record what they used to say
+because a backlog that quietly loses its own history stops being checkable.
+
+The lesson is the one G3 is about, and it is worth more than the two paragraphs:
+**both claims were true when written**, and both survived months because their
+subject could not see them. A gap in `mods/tarkov` recorded in
+`mods/blackdivision/README.md` is a gap nobody maintaining `mods/tarkov` will
+ever re-read. That is why `mods/tarkov` has a README of its own now (G3) rather
+than the paragraphs merely having been fixed again.
+
+What they said, and what is true:
 
 | claim | where | what the code says now |
 |---|---|---|
-| "The emulator does not read loadouts. `mods/tarkov`'s bot generator reads exactly `firstName`, `health.BodyParts[0]` and `appearance.…[0]` … and nothing else — no `inventory`, no `chances`" | `mods/blackdivision/README.md:133-135` (**still there on 2026-08-19**) | `mods/tarkov/emu/bots.nim` rolls `inventory.equipment` per slot against `chances.equipment` and resolves `inventory.mods` breadth-first, and now also fills the rig, pockets and pack from `inventory.items` against the `generation.items` counts. `docs/EMULATOR-COVERAGE.md` records the change. |
-| "`/client/game/bot/limit` cannot be changed. `mods/tarkov` answers it with the literal string `30` and it is not backed by any database path." | `mods/morebots/README.md:143-144` (**still there on 2026-08-19**) | `mods/tarkov/tarkov.nim` reads `locations.<loc>.base.BotMax` / `BotMaxPvE`, with `gDefaultBotLimit` a setting rather than a literal. |
+| "The emulator does not read loadouts. `mods/tarkov`'s bot generator reads exactly `firstName`, `health.BodyParts[0]` and `appearance.…[0]` … and nothing else — no `inventory`, no `chances`" | `mods/blackdivision/README.md:133-135` (**struck through in place 2026-08-19**) | `mods/tarkov/emu/bots.nim` rolls `inventory.equipment` per slot against `chances.equipment` and resolves `inventory.mods` breadth-first, and now also fills the rig, pockets and pack from `inventory.items` against the `generation.items` counts. `docs/EMULATOR-COVERAGE.md` records the change. |
+| "`/client/game/bot/limit` cannot be changed. `mods/tarkov` answers it with the literal string `30` and it is not backed by any database path." | `mods/morebots/README.md:143-144` (**struck through in place 2026-08-19**) | `mods/tarkov/tarkov.nim` reads `locations.<loc>.base.BotMax` / `BotMaxPvE`, with `gDefaultBotLimit` a setting rather than a literal. |
 
-*Cost: an hour for both. Each is a README paragraph.*
+Both corrected 2026-08-19. The loadout paragraph now records that the generator
+builds from `inventory.equipment` (a weight map per slot, not a list) and the
+three chance tables, and keeps the three details that were guessed wrong first:
+the chance tables are three rather than one `chances.mods`; a mod slot name
+appears in **either casing** in stock data, so an exact-key lookup silently
+misses; and a weight of zero means never, so a pool summing to zero must produce
+nothing rather than element zero. The bot-limit paragraph now records that
+`onBotLimit` asks the map -- `BotMaxPvE` first, since this server is only ever
+PvE -- and reads the map id from the query *and* the body, because the client
+has spelled it both ways across builds and getting it wrong is a silent fall
+back to the default.
 
 ### B10. One document still describes bugs that have been fixed
 
@@ -81,12 +103,24 @@ The code moved and the prose did not. This reads as current and is not, which is
 worse than an absent note: it tells a reader to work around something that is no
 longer there.
 
-**This was four documents and is now one.** Three were corrected in place and
-are listed below the line with what they say now.
+**This was four documents and is now none.** All four were corrected in place
+and are listed below the line with what they say now.
 
-| document | what it still says | what is true |
-|---|---|---|
-| `docs/PERF.md:292-297` | `writePtr` skips IL2CPP's write barrier "because `il2cpp_gc_wbarrier_set_field` is not in the binding", and static fields "need `il2cpp_class_get_static_field_data` to reach. `bindField` refuses them" | **both are done, not merely unblocked.** `writePtr` routes reference stores through the barrier and `bindStaticField` exists (`fast.nim:1213`, readers/writers taking no object, `writePtrRaw` at `:1356`, `barrierReady` at `:1153`). `tools/hostharness.nim` asserts both against the stand-in *and* against the stand-in's own counters: *"a reference field was stored through the collector's write barrier (2 call(s) counted by the runtime)"*, *"a static field was read through its own binding and agreed with the boxed path (2 static-block lookup(s) counted by the runtime)"*, *"an instance binding and a static binding each refused the other's field"*. Re-run 2026-08-19 |
+`docs/PERF.md:292-297` was the last, and it said `writePtr` skips the write
+barrier "because `il2cpp_gc_wbarrier_set_field` is not in the binding" and that
+`bindField` refuses static fields. Both are done rather than merely unblocked:
+`writePtr` routes reference stores through the barrier, `writePtrRaw` is the
+opt-out and `barrierReady` says which you are getting; `bindStaticField` reads
+static fields with readers that take **no object**, because a static and an
+instance field share an offset space and only the type system can catch the
+confusion. The page now says so, and says why the stand-in deliberately puts
+`Player::SpawnCount` and `Player::Health` at the same offset 16.
+
+The reason that row mattered more than its size: `tools/hostharness.nim`
+asserts both against the stand-in *and against the stand-in's own counters* --
+*"a reference field was stored through the collector's write barrier (2 call(s)
+counted by the runtime)"*. One alone proves nothing, because a stand-in without
+the export leaves the binding silently on a plain store.
 
 Corrected since this row was written, and kept rather than deleted:
 
@@ -140,9 +174,14 @@ most of a generator.
 
 That sentence, in those words, appears at the top of `docs/ARCHITECTURE.md`,
 `docs/INSTALL.md`, `docs/IL2CPP.md`, `docs/MODDING.md`, `docs/DEBUGGING.md`,
-`docs/PERF.md`, `docs/MODMANAGER.md`, all five mod READMEs that have one, the
-overlay README, and the module header of every client-side mod. It is the most
-repeated sentence in the project.
+`docs/PERF.md`, `docs/MODMANAGER.md`, all ten mod READMEs, the overlay README,
+and the module header of every client-side mod. It is the most repeated
+sentence in the project.
+
+It used to say *five* mod READMEs, because five was how many existed. All ten
+`mods/*` have one as of 2026-08-19, and `mods/manager`'s was the last to be
+given the sentence -- fittingly, since the half of that mod a player actually
+touches is the half nothing drives.
 
 `docs/INSTALL.md`, "What has actually been tested", puts it as a table, and the table is the honest summary
 of the whole repository:
@@ -162,18 +201,18 @@ the last person who did:
 
 | gate | checks | how |
 |---|---:|---|
-| `emutest`, against `tests/fixtures/emu-full.json` | **532** | `emutest.exe --root <stage> --backend … --port <n>` |
-| `realtest`, against the 39.40 MiB imported database | **134**, 1 skipped | `realtest.exe --root <stage> --db build\db\db.json …` |
+| `emutest`, against `tests/fixtures/emu-full.json` | **541** | `emutest.exe --root <stage> --backend … --port <n>` |
+| `realtest`, against the 39.40 MiB imported database | **144**, 1 skipped | `realtest.exe --root <stage> --db build\db\db.json …` |
 | `soak`, 24 closed play cycles | **915** | `soak.exe --root <stage> … --cycles 24` |
-| `fuzzwire` | **150** | `fuzzwire.exe --root <stage> …` |
+| `fuzzwire` | **152** | `fuzzwire.exe --root <stage> …` |
 | `wstest`, the notifier websocket | **62** | `wstest.exe --root <stage> …` |
 | `framelen`, hostile `Content-Length` framing | **102** | `framelen.exe --root <stage> …` |
-| `livectl`, live mod control | **211** | `livectl.exe --root <stage> …` |
+| `livectl`, live mod control | **213** | `livectl.exe --root <stage> …` |
 | `modreport`, the client host's ledger | **27** | `installer\build\modreport.exe` |
 | `modclient`, the manager reading it | **90** | `installer\build\modclient.exe` |
-| `detour_race`, a patch under live callers | **10** | `tests\detour_race.exe` |
+| `detour_race`, a patch under live callers | **11** | `tests\detour_race.exe` |
 | `dbrace`, concurrent readers and writers | **2** | `backend\bin\dbrace.exe` |
-| `hostharness` against the stand-in runtime | **24** assertions | `hostharness.exe <stage> --runtime tests\mockil2cpp\GameAssembly.dll` |
+| `hostharness` against the stand-in runtime | **27** assertions | `hostharness.exe <stage> --runtime tests\mockil2cpp\GameAssembly.dll` |
 | `fakeregistry --check`, document + transport | **27**, 1 skipped | `python registry\fakeregistry.py --check --regcheck …` (44 with `--manager`, which needs a staged manager) |
 
 **`tools/firstrun.nim` could not be re-run**, and the reason is itself a
@@ -435,7 +474,7 @@ Every row here has been re-checked against `D:\SPT` and `build/db/db.json` on
 | **`staticAmmo` is imported and unread** | `docs/IMPORTDB.md:132-136` | Explicitly *named as not expressible*: the table imports fine, and nothing consumes it — `expandAmmoBox` picks from the box template's own filter instead. *"The data is imported so that the day someone wires it up, the table is already where they would look."* **Re-checked 2026-08-19: still true.** `staticAmmo` appears 13 times in `build/db/db.json` (one per map that has one) and `mods/tarkov` names it only in comments and in `raid.nim`'s check that it is *stripped* from `/client/locations`. | A day in `mods/tarkov/emu`. |
 | **Seventeen file groups not imported** | `docs/IMPORTDB.md`, "The last row, itemised" | This row said *"nine tables … ~9 MB"* and **both halves were wrong.** The nine were real, and **eight more file groups nobody had listed** were in the etcetera at the end of it: `locations/*/statics.json`, `locations/*/allExtracts.json`, Ragman's `suits.json` / `bearsuits.json` / `usecsuits.json`, `templates/archivedQuests.json`, `templates/customAchievements.json`, `templates/customisationStorage.json`, `traders/*/services.json` and `server.json`. Measured on `D:\SPT` on 2026-08-19: **11,246,992 bytes (11.25 MB) across 71 files that nothing reads**, plus **50,423,639 bytes (50.42 MB) of other-language locales**, which are not a gap at all — they are one `--locales` flag away. Reason given for the rest is still *"the emulator has no route that reads them"*, which makes it a consequence of Group F rather than a cause. **Re-checked: still true**, and the importer now says so mechanically — `checkReadPaths` (`tools/importdb.nim:669`) walks the 29 paths `mods/tarkov` reads with a literal spelling and asserts each against the document it just wrote, instead of a sentence asserting it. | Follows the routes. |
 | ~~**Trader healing (`RestoreHealth`)**~~ | `mods/tarkov/emu/health.nim` | **Done, and it was never blocked.** This row said *"needs the treatment price table"* and named an importer change. The table was in the database the whole time: `globals.config.Health.HealPrice` and `Effects.<name>.RemovePrice`, times the trader's `loyaltyLevels[n].heal_price_coef`. Nothing had to be imported. | Was: importer row. Actually: nobody had looked. |
-| **`--loose all` makes one response 560 MB** | `docs/IMPORTDB.md`, *Why loose loot is opt-in* | **The reason this row used to give is retired.** It said the problem was `jsondb` — *"it is held as one text document, indexed by byte offset, and `dbWrite` replaces the whole thing"* — and that has been fixed: a `db_patch` of an existing value went from **171 ms to 6.1 ms**. What actually makes loose loot opt-in is `/client/locations`, which splices the whole `locations` subtree into one answer. Measured 2026-08-19: `aowl-importdb --from D:\SPT --loose all --no-check` produces **616,032,908 bytes (587.49 MiB)** in 13.1 s, and one `aowlprobe http://127.0.0.1:<port>/client/locations` against a backend on it returns a **560 MB body** (19.1 s wall including writing it out; `docs/IMPORTDB.md` measures 10.8 s server-side). Nothing fails — `realtest` passes all 134 checks against that database — it is one response the client makes to draw the map list. **So this row does not belong to the importer or to `backend/`. It belongs to `mods/tarkov`**, and the fix is a `/client/locations` that answers the map list without the loot in it. | A route change in `mods/tarkov`, not a new jsondb. |
+| ~~**`--loose all` makes one response 560 MB**~~ **— fixed 2026-08-19** | `mods/tarkov/emu/raid.nim:40-110`, `:403-460`; was `docs/IMPORTDB.md`, *Why loose loot is opt-in* | **Done, in the place this row said it belonged.** `/client/locations` no longer splices the `locations` subtree in verbatim: `raid.nim` builds the map list from each map's `_Id` → `base` and nothing else — which is exactly what `LocationsGenerateAllResponse` asks for — with the key list cached after the first request, and `paths` carried through when the database has one. `base` still goes out byte for byte, so `morebots`' and `icebreaker`'s writes into `locations.<map>.base` still arrive. The absence is asserted rather than assumed: `raid.selfCheckRaid` runs the builder over a literal fixture that deliberately carries a map's `looseLoot` and a `staticAmmo` table and fails the load if either appears in the body, and it runs at load out of `emu/selfchecks.nim:133` — `emutest`'s own `/aowlspt/tarkov/selfcheck` check is green in the 541-check run above. **What this row used to say is kept:** the reason *it* gave was already a retirement of an earlier one — it said the problem was `jsondb`, *"it is held as one text document, indexed by byte offset, and `dbWrite` replaces the whole thing"*, and that had been fixed (a `db_patch` of an existing value went from **171 ms to 6.1 ms**); what actually made loose loot opt-in was this route. Measured 2026-08-19, before the fix: `aowl-importdb --from D:\SPT --loose all --no-check` produces **616,032,908 bytes (587.49 MiB)** in 13.1 s, and one `aowlprobe http://127.0.0.1:<port>/client/locations` against a backend on it returned a **560 MB body** (19.1 s wall including writing it out; `docs/IMPORTDB.md` measures 10.8 s server-side). Nothing failed then either — `realtest` passed all 134 checks against that database. **The 560 MB has not been re-measured against the new route**; what has been measured is that the loot is gone from the body. | Was: a route change in `mods/tarkov`. Done. |
 | **31 templates render as their id** | `docs/IMPORTDB.md` | No `<id> Name` in the English locale. *"ugly and not broken"*. **Re-checked 2026-08-19** by re-running the import: *"templates with a localised name: 4642 of 4673"* — 4673 − 4642 = 31, still exactly 31. | Source data. |
 | **Quest kill qualifiers** *(re-checked; unchanged)* | `docs/EMULATOR.md`, "What it is not" | `distance`, `weapon`, `daytime`, `equipment` inside a `Kills` condition. When present and non-empty **the kill is not credited at all**, because *"crediting a kill whose qualifier could not be checked hands out progress that was not earned"*. The raid report does not carry the qualifiers. | Blocks completion of qualified-kill quests. Needs either a richer raid report or a client-side sensor. |
 | **Selling with no handbook price** *(re-checked; unchanged)* | `docs/EMULATOR.md`, "The request does not get to do the arithmetic" | *"refused, not paid at zero. The item is gone either way."* | Data. |
@@ -541,7 +580,7 @@ Beyond the 60:
 - **No gate for the client half of live mod control** —
   `docs/MODMANAGER.md`, "The test", and `docs/ARCHITECTURE.md:570-574`. *"nothing drives a
   manager against it."* The server half is proved every run by `tools/livectl.nim`
-  — **211 checks**, re-run 2026-08-19, up from the forty that document used to
+  — **213 checks**, re-run 2026-08-19, up from the forty that document used to
   quote. The client half is wired end to end and the *wire* is gated at both
   ends (`modreport`, 27; `modclient`, 90), but what neither establishes is that
   the query string reaches the backend: that is `aowl_ov_sync_start` and the
@@ -670,8 +709,9 @@ Beyond the 60:
 - **No automated store rollback** — `host/common/modstore.nim:86-88` keeps a
   three-generation `.hist` ring and there is no revert path in `host/common/`.
   To use one you stop the server and copy the file by hand.
-- **B4, B10 and B11 above** belong here too, and are at the top because they are
-  wrong rather than absent.
+- **B11 above** belongs here too, and is at the top of that section because it
+  is a process that will keep producing wrong statements rather than a single
+  wrong statement. B4 and B10 are closed.
 
 ---
 
@@ -788,18 +828,25 @@ here but the decision.
 **Until this is decided, the registry is metadata only and no mod is
 distributable through it.**
 
-### G3. Five mods have no README
+### ~~G3. Five mods have no README~~ — closed 2026-08-19
 
-`classicmovement`, `fov`, `manager`, `sway` and `tarkov` — half the mod set,
-including the two largest (`tarkov` at 33 modules, `manager` at 8) — have no
-`README.md`. Their module headers are excellent and carry the gap lists in full;
-the question is whether that is where they belong.
+This said `classicmovement`, `fov`, `manager`, `sway` and `tarkov` — half the mod
+set, including the two largest (`tarkov`, which it counted at 33 modules, and
+`manager` at 8) — had no `README.md`, and that their module headers carried the
+gap lists instead. **All ten directories under `mods/` now have a `README.md`**,
+checked one at a time on 2026-08-19: `blackdivision`, `classicmovement`, `fov`,
+`icebreaker`, `manager`, `morebots`, `perf`, `sain`, `sway`, `tarkov`. The three
+that landed today are `tarkov`, `sway` and `manager`. The module count in the old
+wording was also stale: `mods/tarkov` is **37 modules under `emu/` plus
+`tarkov.nim`**, not 33.
 
-The concrete cost is visible in **B4**: gaps in `mods/tarkov` are recorded only
-in *other mods'* READMEs, where nobody maintaining `mods/tarkov` will see them
-go stale. `mods/sway` in particular has no gap record outside its source at all —
-`springAccelPerFrame`, the highest-value unknown in the project, is documented in
-`model/spring.nim` and `model/tuning.nim` and nowhere a reader would look first.
+The reason it mattered is kept, because it is what the READMEs are for and is
+still the failure mode to watch: the concrete cost was visible in **B4**, where
+gaps in `mods/tarkov` were recorded only in *other mods'* READMEs, and nobody
+maintaining `mods/tarkov` was going to see them go stale. `mods/sway` had no gap
+record outside its source at all — `springAccelPerFrame`, the highest-value
+unknown in the project, lived in `model/spring.nim` and `model/tuning.nim` and
+nowhere a reader would look first. Both now have a README that says so.
 
 ---
 
@@ -846,30 +893,40 @@ produces it, and the commands are named beside the numbers.
 
 ---
 
-## Top seven, by what they unblock
+## Top four, by what they unblock
 
-Ranked by how much stops being unknown per unit of work — not by size. Seven of
-the nine entries this list used to carry have been done; what is left is
-genuinely short, which is the point of re-deriving it.
+Ranked by how much stops being unknown per unit of work — not by size. This was
+nine entries, then seven, and is now four. **Three of the four are not mine to
+do**: two are a raid and one is a decision. What is left that is work is one
+item, and that is the honest state of the project rather than a flattering one.
 
 | # | Item | Reason | Unblocks | Cost |
 |---|---|---|---|---|
 | 1 | **Run the game once and read the log** | playtest | S1–S15 at once, eight Group-B name rows, and the right to make any claim at all about the client | one afternoon |
-| 2 | **Put `modrace` in `aowl test`** | just work | the only proof that a mod cannot be freed under a worker. It is written, it builds (with `-p:host\common`, which `dbrace`'s flag set does not carry), and running it is a clean before-and-after — but `grep -n modrace tools/aowl.nim` finds nothing, so nothing runs it and the fix it proves is one refactor from silently regressing | one entry in `tools/aowl.nim` |
-| 3 | **SWAY's `springAccelPerFrame`** | playtest | the entire calibration of the mod — a factor of sixty, and the difference between invisible and a catapult | ten seconds of a raid |
-| 4 | **Stop `/client/locations` splicing the loot** | just work | `--loose all` as a supported configuration. One response is 560 MB and 10.8 s on a 587 MiB database; the `dbWrite` cost this was blamed on is gone (171 ms → 6.1 ms) and the splice is what is left | a route in `mods/tarkov` |
-| 5 | **B10 — `PERF.md:292-297`** | broken | stops one document telling a reader that the write barrier and static fields are unreachable, four days after both landed and were asserted in the gate | one paragraph |
-| 6 | **B11 — generate `EMULATOR-COVERAGE.md`** | broken | every headline number about the emulator. Two of its four derivation commands had drifted when re-run for this pass, which is the argument | a day |
-| 7 | **G2 — decide the download question** | owner | mod distribution, or the honest deletion of `download`. Either answer is progress; the open state is the only bad one. Its SHA-256 prerequisite no longer exists | one conversation |
+| 2 | **SWAY's `springAccelPerFrame`** | playtest | the entire calibration of the mod — a factor of sixty, and the difference between invisible and a catapult | ten seconds of a raid |
+| 3 | **B11 — generate `EMULATOR-COVERAGE.md`** | broken | every headline number about the emulator. Two of its four derivation commands had drifted when re-run for this pass, which is the argument | a day |
+| 4 | **G2 — decide the download question** | owner | mod distribution, or the honest deletion of `download`. Either answer is progress; the open state is the only bad one. Its SHA-256 prerequisite no longer exists | one conversation |
 
-Two notes on the ranking. **Item 1 is not first by a small margin.** It is the
+Three notes on the ranking. **Item 1 is not first by a small margin.** It is the
 only item on the list that changes what is *knowable* rather than what is done,
-and it costs less than any of the others. And **the two items that used to sit
-at 2 and 4 — `writePtr`'s write barrier and `bindField` on a static field —
-are gone from this table because they are done**, which is what a top-eight
-list is for. What replaced them at 2 and 4 is the same failure one step later:
-work that landed and then was not wired to anything that would notice it
-breaking.
+and it costs less than any of the others.
+
+**Three rows left this table on 2026-08-19, and they are worth naming because
+of what they had in common.** `modrace` was *"written, it builds, and
+`grep -n modrace tools/aowl.nim` finds nothing"* — it is a gate phase now, with
+`tickrace`, `regrace`, `dbrace` and `detour_race` beside it. `/client/locations`
+no longer splices the loot: the list is built from `_Id` → `base` and
+`selfCheckRaid` refuses the load if `looseLoot` or `spawnpoints` appear in the
+body. B10's last document is corrected. All three were the same failure — work
+that landed and was then not wired to anything that would notice it breaking —
+and the two before them at 2 and 4, `writePtr`'s barrier and `bindField` on a
+static field, were the same failure one step earlier.
+
+**What that leaves is not a shorter list of the same kind of thing.** Of the
+four rows above, one is a generator, two are a raid, and one is a decision
+about what `download` is for. Plenty of work remains further down this document
+— the non-atomic 14-byte prologue write is still the sharpest of it — but
+nothing left at the top of the list is blocked on somebody reading more code.
 
 ---
 
@@ -897,7 +954,7 @@ against a changelog.
 | A generic instantiation has no name `findClass` accepts | reachable without a name | `fast.nim:644` `bindOnObject`, and `bindInClass` |
 | `airdrop` loot table missing | served | `mods/tarkov/tarkov.nim:785`, route at `:1292` |
 | `prestige` unserved | served | `mods/tarkov/tarkov.nim:1346` |
-| B2. `aowl test`'s "patch fired" check is red | green, and the caveat retracted | `docs/MODDING.md:1285-1294`; `hostharness --runtime tests\mockil2cpp\GameAssembly.dll` re-run 2026-08-19 — 24 of 24 verdicts, *"a compiled method was detoured and the patch fired"* among them |
+| B2. `aowl test`'s "patch fired" check is red | green, and the caveat retracted | `docs/MODDING.md:1285-1294`; `hostharness --runtime tests\mockil2cpp\GameAssembly.dll` re-run 2026-08-19 — 27 of 27 verdicts, *"a compiled method was detoured and the patch fired"* among them |
 | No `everyMain` | `everyMain` / `stopMainRepeats` | `aowl/src/aowlspt.nim:474` and `:524`; the harness asserts *"everyMain fired 78 times on thread 24476, the game's own, and never more than once per frame (456 frames)"* and *"stopMainRepeats stopped a running everyMain chain"* |
 | `bindField` refuses static fields | `bindStaticField`, with its own reader and writer types | `fast.nim:1213`; asserted three ways — the value agrees with the boxed path *and* the runtime counted the static-block lookups, an instance binding and a static binding each refuse the other's field, and a static write lands in the runtime's own block |
 | `writePtr` skips IL2CPP's write barrier | it routes through `il2cpp_gc_wbarrier_set_field`; `writePtrRaw` is the opt-out and `barrierReady` says which you have | `fast.nim` (`writePtrRaw` at `:1142` and `:1356`, `barrierReady` at `:1153`); the stand-in now exports the barrier *and counts calls*, and the gate asserts both the mod's line and the runtime's counter — *"a reference field was stored through the collector's write barrier (2 call(s) counted by the runtime)"* |

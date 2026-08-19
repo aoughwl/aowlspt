@@ -391,7 +391,7 @@ realtest --root <stage> --db <scratch>\*\db.json --backend aowlspt-backend.exe
 | `/client/locations` round trip | 247 ms | 395 ms | **10,786 ms** |
 | backend working set, at rest | 104.9 MiB | — | **653.3 MiB** |
 | … after serving items, globals, locale, locations | 202.5 MiB | — | **1,362.8 MiB** |
-| `realtest` | 134 checks, 1 skipped | 134 checks, 1 skipped | 134 checks, 1 skipped |
+| `realtest` | **144** checks, 1 skipped | 134 checks, 1 skipped *(not re-run)* | 134 checks, 1 skipped *(not re-run)* |
 
 Working set with `Start-Process … -PassThru` and `$p.WorkingSet64` after a
 `/client/game/keepalive` answered and again after the four bodies above; the
@@ -469,12 +469,12 @@ statement about what those tools are for, not a defect in the import:
   realtest --root <stage> --db <scratch>\db.json
            --backend backend\bin\aowlspt-backend.exe --port 6997
 
-  ok    the emulator answered all 134 checks against real data (1 skipped)
-        39 MiB database, boot to first answer 1112 ms
+  ok    the emulator answered all 144 checks against real data (1 skipped)
+        39 MiB database, boot to first answer 513 ms
         4673 templates, 4288 handbook entries, 31550 locale strings
         12 traders, 5790 assort items, 431 offers priced in roubles at loyalty 1
         558 quests, 2636 conditions, 220 recipes, 28 hideout areas
-        19 maps, 1826 loot items over 3 of them
+        19 maps, 1700 loot items over 3 of them
   ```
 
   The one skip is a real scav case's reward roll: level 1 of area 14 takes

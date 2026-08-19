@@ -35,6 +35,17 @@ Proved by, all re-run 2026-08-19:
 `--root`; point it at a scratch directory of your own, not at a shared build
 tree.
 
+And the sentence that stands over everything in this repository, which applies
+to this mod more sharply than to most: **nothing here has ever run against
+BSG's client. Not once.** The four tools above prove the server half -- the
+resolution, the document, the wire, live enable and disable under load. The
+client half is wired end to end and both ends of the *wire* are gated
+(`modreport`, `modclient`), but the panel a player would actually press is
+driven by hand only: nothing establishes that a toggle in the overlay reaches
+`aowl_ov_sync_start`, reaches the backend, and comes back. Every sentence below
+about what *the player* sees is therefore an argument from the code, not an
+observation.
+
 ---
 
 ## 1. The selection document

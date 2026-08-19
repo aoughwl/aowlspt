@@ -1222,13 +1222,13 @@ sections for *Healing at a trader*, *The scav case*, *The gym* and
 
 | suite | was | now |
 |---|---|---|
-| `emutest` (fixture) | 404 | **532** |
-| `realtest` (39 MiB real database) | 94 | **139**, one skipped |
+| `emutest` (fixture) | 404 | **541** |
+| `realtest` (39 MiB real database) | 94 | **144**, one skipped |
 | `soak` | 864 | **915** |
 | `fuzzwire` | 149 | **152** |
 
 All four re-run on 2026-08-19 against a scratch stage and confirmed at those
-numbers; `emutest`'s own last line is *"the emulator answered all 532 checks"*.
+numbers; `emutest`'s own last line is *"the emulator answered all 541 checks"*.
 Its sections now run: Boot · Creating a profile · Selecting and starting ·
 Static tables · Traders · Inventory · Nothing may contain itself · Trading ·
 Trader loyalty · The flea market · Quests and the hideout · Production ·
