@@ -165,16 +165,31 @@
  * writing frames onto one socket interleave into a stream neither side can
  * parse. One critical section covers every websocket write and the close of a
  * websocket connection, so a socket is never closed out from under a send in
- * flight. On the **close** path the poller takes it with
- * `TryEnterCriticalSection` and defers to its next wakeup if it is busy: a
- * connection that closes one poll round later closes just as dead, and there is
- * nothing to be gained by waiting for it. On the **write** path it does wait —
- * every pong, close and refusal the poller sends goes out through
- * `aowl_ws_send`, which enters the section outright, and so does
- * `aowl_ws_adopt` on a worker thread at the 101. What keeps that bounded is
- * `AOWL_WS_SEND_MS`, which is short for exactly this reason. This used to say
- * the poller must not wait on a worker for any reason; that is the rule for the
- * close, not for the whole lock.
+ * flight.
+ *
+ * **The poller does not wait on it, on any path.** Not on the close, where it
+ * has always used `TryEnterCriticalSection` and deferred to its next wakeup,
+ * and not on the write, where it used to. That is a rule about which thread is
+ * asking rather than about which call it makes, so it is enforced where the
+ * thread is known — `aowl_ws_send` compares the calling thread against the
+ * poller's — and not at the call sites, which are several frames inside nimony
+ * composing a pong. A worker still waits, up to `AOWL_WS_SEND_MS` per stall, because a
+ * worker is a thread whose job is to wait for one client.
+ *
+ * What that rule is worth is visible in what it forbids. This lock is one lock
+ * for every websocket, and a worker holds it across a `send` to a peer that
+ * may not be reading — so a blocking poller was one non-reading notifier
+ * client away from stopping the *server*: no accepts, no reads on any
+ * connection, no deadlines, until that push gave up. And it does not give up
+ * at `AOWL_WS_SEND_MS`: that deadline restarts on every byte the peer accepts,
+ * so a client dribbling one byte at a time holds it open indefinitely. A held
+ * connection stalling the whole server is precisely the failure the poller was
+ * written to remove, rebuilt one lock lower down.
+ *
+ * A frame the poller cannot write immediately is queued on the connection
+ * (`AOWL_WS_PEND_CAP`) and goes out at the next wakeup, `AOWL_WS_RETRY_MS`
+ * later; a close it cannot make is retried on the same clock. Nothing is
+ * dropped for being unlucky with a lock.
  */
 
 #ifndef AOWLSPT_NET_H
@@ -412,18 +427,14 @@ static void aowl_net_shutdown_recv(uint64_t sock) {
     if (sock) shutdown((SOCKET)sock, SD_RECEIVE);
 }
 
-/* Nothing calls this. It was kept for `wire.nim` and the probe tools, whose
- * client sockets are blocking and want an overall timeout -- but `wire.nim`
- * sets `SO_RCVTIMEO` itself, inline in its own `{.emit.}` block, and the probe
- * tools import only the zlib entry points. The server's own sockets are
- * non-blocking and get their deadlines from the poller. Named as dead rather
- * than quietly deleted: whether it goes or gains its caller back is a code
- * decision, not a comment one. */
-static int32_t aowl_net_set_timeout(uint64_t sock, int32_t ms) {
-    DWORD t = (DWORD)ms;
-    return setsockopt((SOCKET)sock, SOL_SOCKET, SO_RCVTIMEO,
-                      (const char*)&t, sizeof(t)) == 0 ? 1 : 0;
-}
+/* `aowl_net_set_timeout` was here, and is gone. It set `SO_RCVTIMEO` for
+ * `wire.nim` and the probe tools; `wire.nim` sets that option itself, inline
+ * in its own `{.emit.}` block, the probe tools import only the zlib entry
+ * points, and the server's own sockets are non-blocking and get their
+ * deadlines from the poller. It had no caller in this repo and no reason to
+ * gain one -- a client that wants a receive timeout is one `setsockopt` away
+ * from it and does not need a wrapper in the server's header to find it.
+ * `aowl_net_recv` above is *not* in the same position: `wire.nim` uses it. */
 
 /* ------------------------------------------------------------------ *
  * Per-session serialisation
@@ -701,12 +712,37 @@ static void aowl_session_unlock(int32_t slot) {
      * closes. A dead notifier therefore costs at most two of these. */
 
 #define AOWL_WS_SEND_MS 250
-    /* How long a websocket write waits for a peer that has stopped reading.
-     * Far shorter than `AOWL_SEND_DEADLINE_MS` because this write is under the
-     * websocket lock, which the poller wants to take in order to close a
-     * connection: a notification the client will not read must not be able to
-     * hold the read path up for thirty seconds. On loopback a frame this size
-     * never blocks against a client that is alive at all. */
+    /* How long a **worker's** websocket write waits for a peer that has
+     * stopped reading. Far shorter than `AOWL_SEND_DEADLINE_MS` because this
+     * write is under the websocket lock, which the poller wants to take: a
+     * notification the client will not read must not be able to hold the read
+     * path up for thirty seconds. On loopback a frame this size never blocks
+     * against a client that is alive at all.
+     *
+     * It is not, and never was, a bound on how long the lock is held. The wait
+     * inside `aowl_net_send_within` is a deadline *per stall*: every byte the
+     * peer accepts resets it. A client that reads one byte every 200 ms keeps
+     * a worker inside a single `aowl_ws_send` for as long as it cares to, and
+     * that is what made "the poller waits for at most 250 ms" wrong rather
+     * than merely tight. The poller no longer waits at all -- see
+     * `aowl_ws_send`. */
+
+#define AOWL_WS_RETRY_MS 5
+    /* How long a queued frame, or a close the write lock was busy for, waits
+     * for the poller to come back round. It is a cap on the poll timeout for
+     * those connections only, so it costs a wakeup on a connection that is
+     * mid-close and nothing at all on the rest. Five milliseconds is far below
+     * anything a player perceives and far above the cost of the wakeup. */
+
+#define AOWL_WS_PEND_CAP 256
+    /* Bytes of already-composed frame the poller may leave queued on one
+     * connection when the write lock is busy. Sized for control frames, which
+     * is what the read path composes: a pong or a close is at most 2 + 125
+     * bytes, so this holds two of them. It is a fixed field rather than an
+     * allocation because it is server-composed bytes with a hard ceiling, not
+     * something a client can grow; 1024 connections cost 256 KB of BSS and no
+     * malloc on the read path. A poller-thread send that does not fit is
+     * refused rather than queued -- see `aowl_ws_send`. */
 
 typedef struct {
     SOCKET s;
@@ -737,6 +773,18 @@ typedef struct {
     char* wsMsg;        /* accumulated continuation payload */
     int32_t wsMsgLen;
     int32_t wsMsgCap;
+
+    /* Frames the poller composed (through nimony) and could not put on the
+     * wire at the moment it had them, because the write lock was held by a
+     * worker or because the peer's window was full. Written and read only by
+     * the poller thread, which is what makes them safe without a lock of their
+     * own. `wsClosing` is the connection the poller has decided to close and
+     * has not managed to yet: it owes the peer whatever is in `wsPend` and
+     * then a `closesocket`, and it is retried every wakeup rather than left
+     * for the idle timer. */
+    char wsPend[AOWL_WS_PEND_CAP];
+    int32_t wsPendLen;
+    int wsClosing;
 } AowlConn;
 
 static uint64_t g_listenSock = 0;
@@ -867,6 +915,8 @@ static int32_t aowl_conn_take(SOCKET s) {
     c->wsMsgLen = 0;
     c->wsMsgCap = 0;
     c->wsMsgOp = 0;
+    c->wsPendLen = 0;
+    c->wsClosing = 0;
     c->inUse = 1;
     return idx;
 }
@@ -1134,9 +1184,10 @@ static ULONGLONG aowl_conn_deadline(AowlConn* c, ULONGLONG now) {
  * into a stream neither side can parse, and a socket closed under a send in
  * flight is a use-after-close; one lock covers both. Three things take it: a
  * push from a worker (rare), `aowl_ws_adopt` from a worker at the 101, and the
- * poller -- blocking, in `aowl_ws_send`, when it answers a ping or a close, and
- * with `TryEnterCriticalSection` in `aowl_ws_drop` when it closes one. Only the
- * last of those declines to wait; this used to say the poller never waits.
+ * poller, in `aowl_ws_send` when it answers a ping or a close and in
+ * `aowl_ws_drop` when it closes one. The two worker paths wait for it; neither
+ * poller path does. See `aowl_ws_send` for how that is enforced and the head of
+ * this file for what it costs when it is not.
  *
  * The lock order is **nimony's lock, then this one, never the reverse**. Every
  * call from here into nimony -- a ping to echo, a close, a violation, an idle
@@ -1184,11 +1235,138 @@ static int64_t aowl_ws_adopt(uint64_t sock) {
     return ticket;
 }
 
+/* Which thread is in here, and which connection it is answering for.
+ *
+ * The poller may not wait -- not on the lock and not on a peer -- and the
+ * calls it makes into nimony come back into `aowl_ws_send` several frames
+ * deep, so the rule cannot be enforced at the call sites: a pong is composed
+ * inside `aowlspt_nim_ws_control`, which the poller reached from
+ * `aowl_ws_pump`, and nothing at that depth knows which thread it is on.
+ * Asking *which thread is this* is the enforcement, and it covers a poller
+ * path added later without that path having to remember anything.
+ *
+ * It is a thread id rather than a thread-local flag, and that is not a style
+ * choice: `__declspec(thread)` is **ignored with a warning** by the ucrt64 gcc
+ * this repo builds with, so a thread-local written by the poller would be a
+ * plain global read by all sixteen workers -- the exact opposite of the rule
+ * it was there to keep, arrived at silently. `GetCurrentThreadId` is a read
+ * out of the TEB and cannot be got wrong by a compiler flag.
+ *
+ * `g_pollCur` is the connection the poller is currently pumping or timing out.
+ * Only the poller writes it and only the poller reads it, so it needs no
+ * synchronisation of its own; it is what gives a deferred frame somewhere to
+ * wait, since the poller owns that connection's watch entry for the whole
+ * call. */
+static DWORD g_pollTid = 0;
+static AowlConn* g_pollCur = NULL;
+
+/* Frames the poller had to queue rather than write. Counted so a test can
+ * tell "the deferral worked" from "the case never arose"; nothing reads it to
+ * make a decision. */
+static volatile LONG g_wsDeferred = 0;
+
+/* One pass of `send` with no waiting at all: returns how many bytes went, 0
+ * included, or -1 if the socket is gone. The count matters -- a frame written
+ * halfway and then abandoned is a stream neither end can parse, so the
+ * remainder is queued rather than dropped. */
+static int32_t aowl_ws_write_nowait(SOCKET s, const char* p, int32_t len) {
+    int32_t sent = 0;
+    while (sent < len) {
+        int n = send(s, p + sent, len - sent, 0);
+        if (n > 0) { sent += n; continue; }
+        if (n == 0) return -1;
+        if (WSAGetLastError() == WSAEWOULDBLOCK) return sent;
+        return -1;
+    }
+    return sent;
+}
+
+/* Queues bytes for the next wakeup. Poller thread only. -1 means they do not
+ * fit, which the caller reports as a failed send rather than pretending. */
+static int32_t aowl_ws_defer(AowlConn* c, const char* p, int32_t len) {
+    if (c == NULL || len <= 0) return -1;
+    if (len > AOWL_WS_PEND_CAP - c->wsPendLen) return -1;
+    memcpy(c->wsPend + c->wsPendLen, p, (size_t)len);
+    c->wsPendLen += len;
+    InterlockedIncrement(&g_wsDeferred);
+    return len;
+}
+
+/* Tries to put whatever is queued on the wire. Returns 1 for "nothing left",
+ * 0 for "still queued, try again", -1 for "the socket is gone". Poller thread
+ * only, and never waits: the lock is tried, and the write is one pass. */
+static int aowl_ws_flush_pending(AowlConn* c) {
+    if (c->wsPendLen == 0) return 1;
+    if (c->s == INVALID_SOCKET) { c->wsPendLen = 0; return -1; }
+    if (!TryEnterCriticalSection(&g_wsCs)) return 0;
+    int32_t n = aowl_ws_write_nowait(c->s, c->wsPend, c->wsPendLen);
+    LeaveCriticalSection(&g_wsCs);
+    if (n < 0) { c->wsPendLen = 0; return -1; }
+    if (n > 0) {
+        int32_t left = c->wsPendLen - n;
+        if (left > 0) memmove(c->wsPend, c->wsPend + n, (size_t)left);
+        c->wsPendLen = left;
+    }
+    return c->wsPendLen == 0 ? 1 : 0;
+}
+
 /* The one way a websocket frame reaches the wire. `buf` is bytes nimony has
  * already framed. Returns the count sent, or -1 for "there is no such live
- * connection, or it would not take them". */
+ * connection, or it would not take them".
+ *
+ * There are two of it, and which one runs is decided by the thread rather than
+ * by the caller:
+ *
+ *   * **A worker** -- a push from a mod, or `aowl_ws_adopt`'s sibling at the
+ *     101 -- takes the lock and waits, up to `AOWL_WS_SEND_MS` per stall, for
+ *     a peer that is not reading. A worker is a thread whose job is to wait
+ *     for a client; blocking one is what the pool is for.
+ *   * **The poller** never waits. It tries the lock, and it writes in one
+ *     pass; anything it cannot put on the wire right now is queued on the
+ *     connection and goes out at the next wakeup, a few milliseconds later.
+ *     This is the rule that used to be stated and not kept: every pong, close
+ *     and refusal the poller sends came through here and blocked, so a worker
+ *     pushing a notification at a client that had stopped reading stopped the
+ *     *whole server* -- no accepts, no reads on any connection, no deadlines
+ *     -- for as long as that push took. Which is not `AOWL_WS_SEND_MS`; see
+ *     the note there.
+ *
+ * Queuing preserves order: once anything is queued on a connection, later
+ * frames for it are queued too rather than overtaking it on a lock that has
+ * since come free. A poller-thread frame for some *other* connection (nothing
+ * composes one today) has no queue to go in and is refused if the lock is
+ * busy, which the caller sees as a send that failed. */
 static int32_t aowl_ws_send(int64_t ticket, const void* buf, int32_t len) {
     if (ticket <= 0 || len <= 0) return -1;
+
+    if (GetCurrentThreadId() == g_pollTid) {
+        AowlConn* c = g_pollCur;
+        int mine = (c != NULL && c->inUse && c->ws && c->wsTicket == ticket);
+        if (mine && c->wsPendLen > 0)
+            return aowl_ws_defer(c, (const char*)buf, len);
+        if (!TryEnterCriticalSection(&g_wsCs))
+            return mine ? aowl_ws_defer(c, (const char*)buf, len) : -1;
+        int32_t n = -1;
+        if (mine) {
+            n = aowl_ws_write_nowait(c->s, (const char*)buf, len);
+        } else {
+            for (int32_t i = 0; i < AOWL_NET_MAX_CONNS; i++) {
+                AowlConn* o = &g_conns[i];
+                if (!o->inUse || !o->ws || o->wsTicket != ticket) continue;
+                n = aowl_ws_write_nowait(o->s, (const char*)buf, len);
+                break;
+            }
+        }
+        LeaveCriticalSection(&g_wsCs);
+        if (n < 0) return -1;
+        if (n == len) return len;
+        /* Partly written. The rest must follow it, in order, or the peer is
+         * reading half a frame. */
+        if (!mine) return -1;
+        if (aowl_ws_defer(c, (const char*)buf + n, len - n) < 0) return -1;
+        return len;
+    }
+
     int32_t sent = -1;
     EnterCriticalSection(&g_wsCs);
     for (int32_t i = 0; i < AOWL_NET_MAX_CONNS; i++) {
@@ -1517,7 +1695,20 @@ static int aowl_conn_read_hot(AowlConn* c) {
  * `benchbackend` does not print; what the run shows is a request with no
  * answer, however that happens to be worded.) The
  * server's behaviour is unchanged; what changes is that it now says so. */
-static __declspec(thread) int aowl_final_req = 0;
+/* `__thread`, not `__declspec(thread)`, and this had to change: the ucrt64
+ * gcc this repo builds with **ignores** `__declspec(thread)` and says so as a
+ * warning nobody was reading, which made this flag a plain global shared by
+ * all sixteen workers. One worker answering request 512 of its connection then
+ * set it for every worker, and whichever connections happened to be answered
+ * in that window were told `Connection: close` on a request that was not their
+ * last -- the same lost request this comment describes, arrived at from the
+ * other side. The MSVC spelling is kept for a compiler that wants it. */
+#if defined(__GNUC__)
+#  define AOWL_TLS __thread
+#else
+#  define AOWL_TLS __declspec(thread)
+#endif
+static AOWL_TLS int aowl_final_req = 0;
 
 static int aowl_conn_final(void) { return aowl_final_req; }
 
@@ -1555,14 +1746,28 @@ static int aowl_serve_one(AowlConn* c) {
 }
 
 /* Closing a websocket, which is the one close that has to be coordinated: a
- * push may be inside `send` on this very socket. Returns 0 for "the write lock
- * was busy, try again next round" -- the poller never waits on a worker, and a
- * connection that closes one wakeup later closes just as dead. */
+ * push may be inside `send` on this very socket.
+ *
+ * The body runs with the lock held. Whatever the poller still owes the peer --
+ * a close frame it composed while the lock was busy -- goes out here, in one
+ * non-blocking pass, immediately before the socket is closed: it is the last
+ * moment there is a socket to write it to. A peer whose window is full does
+ * not get it, and that is the right answer rather than a wait, since it is a
+ * peer that has stopped reading and is about to be closed on.
+ *
+ * `aowl_ws_drop` returns 0 for "the write lock was busy, try again next round"
+ * -- the poller never waits, and a connection that closes one wakeup later
+ * closes just as dead. `aowl_ws_drop_blocking` is the same thing for a worker,
+ * which may wait and must: a worker that gave up here would close the socket
+ * outside the lock, under a push that is inside `send` on it. */
 static void aowl_conn_drop(int32_t idx);
-static int aowl_ws_drop(int32_t idx) {
+static void aowl_ws_drop_locked(int32_t idx) {
     AowlConn* c = &g_conns[idx];
-    if (!TryEnterCriticalSection(&g_wsCs)) return 0;
     int64_t ticket = c->wsTicket;
+    if (c->wsPendLen > 0 && c->s != INVALID_SOCKET)
+        (void)aowl_ws_write_nowait(c->s, c->wsPend, c->wsPendLen);
+    c->wsPendLen = 0;
+    c->wsClosing = 0;
     c->ws = 0;
     c->wsTicket = 0;
     if (c->s != INVALID_SOCKET) {
@@ -1573,7 +1778,17 @@ static int aowl_ws_drop(int32_t idx) {
     /* Outside the lock, so the order stays nimony-then-C. */
     aowlspt_nim_ws_gone(ticket);
     aowl_conn_drop(idx);
+}
+
+static int aowl_ws_drop(int32_t idx) {
+    if (!TryEnterCriticalSection(&g_wsCs)) return 0;
+    aowl_ws_drop_locked(idx);
     return 1;
+}
+
+static void aowl_ws_drop_blocking(int32_t idx) {
+    EnterCriticalSection(&g_wsCs);
+    aowl_ws_drop_locked(idx);
 }
 
 static DWORD WINAPI aowl_net_worker(LPVOID param) {
@@ -1606,7 +1821,15 @@ static DWORD WINAPI aowl_net_worker(LPVOID param) {
                 u_long nb = 1;
                 ioctlsocket(c->s, FIONBIO, &nb);
                 if (c->len > 0 && !aowl_ws_pump(c)) {
-                    if (!aowl_ws_drop(idx)) aowl_conn_drop(idx);
+                    /* Blocking, because this is a worker and because the
+                     * alternative was worse: this used to fall back to
+                     * `aowl_conn_drop` when the try failed, which closes the
+                     * socket *outside* the lock -- and by this point nimony
+                     * has already registered the ticket, so a push could be
+                     * inside `send` on the handle being closed. A worker is
+                     * allowed to wait; that is the whole difference between it
+                     * and the poller. */
+                    aowl_ws_drop_blocking(idx);
                     break;
                 }
                 c->deadline = aowl_conn_deadline(c, GetTickCount64());
@@ -1690,6 +1913,11 @@ static void aowl_watch_remove(int32_t at) {
 static DWORD WINAPI aowl_net_poller(LPVOID param) {
     (void)param;
     static WSAPOLLFD fds[AOWL_NET_MAX_CONNS + 2];
+    /* Set once, read many frames deep: every `aowl_ws_send` reached from this
+     * thread -- through nimony composing a pong, a close or a refusal -- takes
+     * the path that does not wait. See `aowl_ws_send`. */
+    g_pollTid = GetCurrentThreadId();
+    g_pollCur = NULL;
     while (InterlockedCompareExchange(&g_netRunning, 1, 1) == 1) {
         ULONGLONG now = GetTickCount64();
 
@@ -1719,6 +1947,11 @@ static DWORD WINAPI aowl_net_poller(LPVOID param) {
             fds[n].revents = 0;
             n++;
             int left = c->deadline > now ? (int)(c->deadline - now) : 0;
+            /* A connection with a frame queued, or one that owes a close, is
+             * not waiting for the peer to say something -- it is waiting for
+             * this thread to come back round. Its deadline is irrelevant to
+             * that, so it caps the poll instead. */
+            if (c->wsPendLen > 0 || c->wsClosing) left = AOWL_WS_RETRY_MS;
             if (left < timeout) timeout = left;
         }
 
@@ -1774,9 +2007,13 @@ static DWORD WINAPI aowl_net_poller(LPVOID param) {
                      * acted on here, and the only thing that leaves this
                      * thread is a call into nimony to compose a pong, a close
                      * or a pushed answer. See the head of this file. */
+                    if (c->wsClosing) continue;   /* the retry pass owns it */
+                    g_pollCur = c;
                     int wrc = aowl_ws_pump(c);
+                    g_pollCur = NULL;
                     if (wrc <= 0 ||
                         (rev & (POLLERR | POLLHUP | POLLNVAL))) {
+                        c->wsClosing = 1;
                         if (aowl_ws_drop(idx)) aowl_watch_remove(i);
                         continue;
                     }
@@ -1828,11 +2065,16 @@ static DWORD WINAPI aowl_net_poller(LPVOID param) {
                  * expiry pings, the second closes if the ping went unanswered.
                  * `aowlspt_nim_ws_idle` composes the ping, like every other
                  * byte. */
-                if (aowlspt_nim_ws_idle(c->wsTicket, c->wsPinged) != 0) {
+                if (c->wsClosing) continue;   /* the retry pass owns it */
+                g_pollCur = c;
+                int32_t keepWs = aowlspt_nim_ws_idle(c->wsTicket, c->wsPinged);
+                g_pollCur = NULL;
+                if (keepWs != 0) {
                     c->wsPinged = 1;
                     c->deadline = aowl_conn_deadline(c, now);
                     continue;
                 }
+                c->wsClosing = 1;
                 if (aowl_ws_drop(idx)) aowl_watch_remove(i);
                 continue;
             }
@@ -1851,6 +2093,31 @@ static DWORD WINAPI aowl_net_poller(LPVOID param) {
              * what the old loop did. */
             aowl_watch_remove(i);
             aowl_conn_drop(idx);
+        }
+
+        /* What the write lock was busy for last time.
+         *
+         * Two things end up here: a frame the poller composed and could not
+         * write (a pong, or a close it owes the peer), and a websocket it has
+         * decided to close and could not. Both are retried every wakeup, and
+         * the poll timeout above is capped while either is outstanding, so
+         * "next wakeup" is milliseconds rather than the idle timer. Before
+         * this, a close that lost the try was left to the *next thing that
+         * happened* on that connection, which on a peer that had gone quiet
+         * was `AOWL_WS_IDLE_MS` away. */
+        for (int32_t i = g_watchCount - 1; i >= 0; i--) {
+            int32_t idx = g_watch[i];
+            AowlConn* c = &g_conns[idx];
+            if (!c->ws) continue;
+            if (c->wsClosing) {
+                if (aowl_ws_drop(idx)) aowl_watch_remove(i);
+                continue;
+            }
+            if (c->wsPendLen == 0) continue;
+            if (aowl_ws_flush_pending(c) < 0) {
+                c->wsClosing = 1;
+                if (aowl_ws_drop(idx)) aowl_watch_remove(i);
+            }
         }
 
         /* Connections the workers have finished with. */
@@ -1884,6 +2151,8 @@ static int32_t aowl_net_serve(int32_t port, int32_t workers) {
         g_conns[i].wsMsgCap = 0;
         g_conns[i].wsMsgLen = 0;
         g_conns[i].wsMsgOp = 0;
+        g_conns[i].wsPendLen = 0;
+        g_conns[i].wsClosing = 0;
         g_freeList[g_freeCount++] = i;
     }
     g_readyCount = 0;

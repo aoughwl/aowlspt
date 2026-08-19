@@ -206,11 +206,32 @@ rebuild are the last section of [PERF-SERVER.md](PERF-SERVER.md).
   game's own routes, and asserts the frame — plus the refusals, a client that
   vanishes without closing, and a hundred idle websockets held open while
   ordinary requests are timed behind them.
+
+  **The poller never waits on the websocket write lock.** There is one lock for
+  every websocket, a worker holds it across the `send` of a push, and the
+  poller needs it for every pong and close it answers — so a poller that waited
+  for it was one non-reading notifier client away from stopping the whole
+  server: no accepts, no reads on any connection, no deadlines, for as long as
+  that push took. It used to wait. Now a frame it cannot write is queued on the
+  connection and goes out a few milliseconds later, and a close it cannot make
+  is retried on the same clock; nothing is dropped for being unlucky with a
+  lock. `tests/ws_stall.c` is the reproducer — it holds the lock with real
+  pushes at a client that has stopped reading and times ordinary requests
+  through the middle of it. It is not in `aowl test` yet (wiring it needs an
+  edit to `tools/aowl.nim`); build and run it by hand:
+
+  ```
+  gcc -O1 -Iabi -o tests/ws_stall.exe tests/ws_stall.c -lws2_32 -lz
+  tests/ws_stall.exe --port 7127
+  ```
+
+  Against the header before the fix it reports one ordinary request in a
+  two-second window and no answer to it; after, eighteen, none slower than a
+  millisecond.
 - Keep-alive, so a session is one connection rather than thousands. A
   connection is closed after 512 requests anyway, so no client can hold one of
   the poller's slots for the life of the process. A worker lingers on a
-  connection it has just answered for a couple of milliseconds before giving it
-  up, because a client in mid-session has its next request on the wire within
+  connection it has just answered for ten milliseconds before giving it up, because a client in mid-session has its next request on the wire within
   microseconds and two thread handoffs a request is real money — but only while
   the ready queue is empty and another worker is free.
 - Three receive deadlines, not one timeout: 5 s idle between requests on a

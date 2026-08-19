@@ -54,10 +54,12 @@ proc cNetRunning(): int32 {.importc: "aowl_net_running", nodecl.}
 proc cNetSend(sock: uint64; buf: HostPtr; len: int32): int32 {.
   importc: "aowl_net_send", nodecl.}
 proc cNetLastError(): int32 {.importc: "aowl_net_last_error", nodecl.}
-# `aowl_net_recv` and `aowl_net_set_timeout` are gone from here: this file no
-# longer reads a socket. The poller in `aowlspt_net.h` does that, and hands
-# down a complete request. They are still in the header for `wire.nim`, whose
-# client sockets are blocking.
+# `aowl_net_recv` is gone from here: this file no longer reads a socket. The
+# poller in `aowlspt_net.h` does that, and hands down a complete request. It is
+# still in the header for `wire.nim`, whose client sockets are blocking.
+# `aowl_net_set_timeout` was named here too and is gone from the header as
+# well: it had no caller anywhere in this repo, and `wire.nim` sets
+# `SO_RCVTIMEO` itself, inline in its own `{.emit.}` block.
 proc cSessionLock(id: HostPtr; len: int32): int32 {.
   importc: "aowl_session_lock", nodecl.}
 proc cSessionUnlock(slot: int32) {.
@@ -166,8 +168,8 @@ const
     ## The other half is the amplification. Sixty-four kilobytes of zlib expand
     ## to sixty-four megabytes of one repeated byte, and a ceiling set where a
     ## bomb like that still fits is a ceiling that buys nothing: the pool is
-    ## eight workers, so it is eight of whatever this number is, in flight, for
-    ## the price of half a megabyte on the wire. Sixteen megabytes is far above
+    ## sixteen workers, so it is sixteen of whatever this number is, in flight,
+    ## for the price of half a megabyte on the wire. Sixteen megabytes is far above
     ## the largest request the game makes -- `match/local/end` posts the whole
     ## profile document and that is single-digit megabytes for a full stash --
     ## and low enough that the bomb is refused rather than served.

@@ -1578,6 +1578,39 @@ proc cmdTest(e: Env): int =
                     "backend\\bin\\aowlspt-backend.exe")) &
                   " --port 6982")
 
+      # And the failure `wstest` cannot see, because it is not about the
+      # websocket at all: one notifier client that stops reading used to stop
+      # **the whole HTTP server**. Every pong, close and refusal the poller
+      # sends went through a blocking enter on the one registry lock, and the
+      # holder that matters is a worker inside `send`. `AOWL_WS_SEND_MS` does
+      # not bound that -- its deadline is per stall and resets on every byte the
+      # peer accepts -- so a peer that reads slowly holds it open indefinitely.
+      # A poller asleep on that lock is not in `WSAPoll`: no accepts, no reads
+      # on any connection, no deadlines. Measured against the engine as it was:
+      # one ordinary request in a two-second window, and it never got an answer.
+      #
+      # `tests/ws_stall.c` plays the nimony side itself and runs the real
+      # server, pushing 4 MB frames at a client that will not read while
+      # ordinary requests are timed straight through the middle. Against the
+      # pre-fix header it reports 14 checks and 2 failures, deterministically.
+      # It compiles against both, so it can be pointed at an older header to
+      # see it fail.
+      #
+      # Note the peer must genuinely not read: a *reading* peer defeats the
+      # stall entirely, because Windows grows the receive buffer and swallows
+      # tens of megabytes without ever blocking the sender. That is written up
+      # in the file, and it is why the harness is 400 lines rather than 40.
+      block:
+        let wsStallExe = joinPath(e.repo, "tests\\ws_stall.exe")
+        if run(e, "compile ws_stall.c",
+               "gcc -O1 -I" & quoted(joinPath(e.repo, "abi")) &
+               " -o " & quoted(wsStallExe) &
+               " " & quoted(joinPath(e.repo, "tests\\ws_stall.c")) &
+               " -lws2_32 -lz", e.repo):
+          discard run(e, "one websocket client that stops reading cannot stop " &
+                         "the server",
+                      quoted(wsStallExe) & " --port 6984")
+
       # And the same emulator over a long session: 24 closed loops of ordinary
       # play, each ending where it started, so every check is an equality
       # rather than a trend. It found the three bugs a single-pass test cannot
