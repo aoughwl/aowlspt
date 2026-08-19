@@ -574,6 +574,27 @@ proc buildLiveCtl(e: Env): bool =
   cmd.add " " & quoted(joinPath(e.repo, "tools\\livectl.nim"))
   result = run(e, "livectl", cmd, e.repo)
 
+proc buildOvSync(e: Env): bool =
+  ## `ovsync`: the *client* half of live mod control, over the real worker
+  ## thread out of `abi/aowlspt_overlay.h`. It wants more paths than any other
+  ## gate here because it is the only program that holds all three pieces at
+  ## once -- `wire.nim` to drive the manager, `modcontrol.nim` to read what
+  ## comes back, and `aowloverlay.nim` to be the thing that fetches it.
+  let outDir = joinPath(e.repo, "installer\\build")
+  discard ensureDir(outDir)
+  var cmd = quoted(nimonyExe(e))
+  cmd.add " c"
+  cmd.add abiInclude(e)
+  cmd.add " --passL:-lws2_32 --passL:-lz"
+  cmd.add " -p:" & quoted(joinPath(e.repo, "backend"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "host\\common"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "host\\Aowlspt.Overlay"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
+  cmd.add " -o:" & quoted(joinPath(outDir, "ovsync.exe"))
+  cmd.add " " & quoted(joinPath(e.repo, "tests\\ovsync\\ovsync.nim"))
+  result = run(e, "ovsync", cmd, e.repo)
+
 proc buildAllMods(e: Env): bool =
   ## `allmods`: every mod the registry names, in one backend at once. Same
   ## shape as `emutest` -- it drives the server over the real wire, so it wants
@@ -1603,6 +1624,37 @@ proc cmdTest(e: Env): int =
                   " --backend " & quoted(joinPath(e.repo,
                     "backend\\bin\\aowlspt-backend.exe")) &
                   " --port 6979")
+
+    # And the half of the same feature that runs in the *game*. Everything
+    # above this line stays inside the backend's process: `livectl` drives the
+    # manager over a socket it opens itself, and `modreport`/`modclient` write
+    # out one end of the client wire and read it with the other. None of them
+    # ever asks whether the poll the client host actually makes arrives.
+    #
+    # This one does, with the real worker thread: `aowl_ov_start` creates it,
+    # `aowl_ov_sync_start` points it at the client route, and what the checks
+    # read is `modcontrol.parseDesired` over whatever `aowl_ov_sync_take` hands
+    # back. A mod is toggled through the manager's own route and the assertion
+    # is that the new answer turns up in the parsed set on the client side --
+    # then the other direction, with `reportPath`'s query string carried up by
+    # the same worker and read back out of the manager's ledger.
+    #
+    # Its own root, staged by the tool itself rather than here: it is the one
+    # gate that must be runnable against a directory that did not exist a
+    # second ago, and the registry it needs -- one client-only mod, so that the
+    # client resolution and the panel's differ by construction -- is its
+    # fixture and not this file's business.
+    if haveManager and buildOvSync(e):
+      discard run(e, "the client host's poll reaches the backend and the " &
+                     "answer comes back into what it will act on",
+                  quoted(joinPath(e.repo, "installer\\build\\ovsync.exe")) &
+                  " --root " & quoted(joinPath(e.repo,
+                    "installer\\build\\ovsyncstage")) &
+                  " --backend " & quoted(joinPath(e.repo,
+                    "backend\\bin\\aowlspt-backend.exe")) &
+                  " --manager " & quoted(joinPath(e.repo,
+                    "mods\\manager\\bin\\manager.dll")) &
+                  " --port 7057")
 
     # And every mod in the registry, in one backend, which is the configuration
     # a player installs and the one nothing above this line has ever run.

@@ -1051,11 +1051,22 @@ static int32_t aowl_ov_http(const wchar_t* verb, const wchar_t* path,
          * handed 439 bytes starting `78 9C` and would find no rows in them, and
          * the panel would silently fall back to read-only.
          *
-         * The header asks the backend not to. It is ignored by the backend as it
-         * stands today -- that is a change that has to be made there, and it is
-         * written up in this directory's README -- so the check in the worker
-         * names it in the status line rather than letting it look like a network
-         * failure. */
+         * The header asks the backend not to, and this comment used to say that
+         * asking was futile: "it is ignored by the backend as it stands today
+         * -- that is a change that has to be made there". **The change was
+         * made.** `backend/aowlbackend.nim:515-520` sets `req.identity` when
+         * `identity` is asked for without `deflate`, and every `sendResponse`
+         * on the mod-control routes passes `not req.identity` as its compress
+         * flag.
+         *
+         * So this header is now load-bearing rather than aspirational, and that
+         * is worth stating plainly: if that branch is ever narrowed, this feed
+         * goes silent with no error anywhere -- the worker drops any body whose
+         * first byte is 0x78 and reports it as a status line, which reads like a
+         * network problem and is not one. `tests/ovsync` asserts the body comes
+         * back uncompressed by name, so the regression has a name too. The check
+         * in the worker below still names it in the status line for the case
+         * where somebody points this at a backend that does compress. */
         const wchar_t* hdr =
             body ? L"Content-Type: application/json\r\nAccept-Encoding: identity\r\n"
                  : L"Accept-Encoding: identity\r\n";

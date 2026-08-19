@@ -13,10 +13,20 @@
 ## than reasoned about.
 ##
 ## What this does **not** establish: that the path reaches the backend. That is
-## `aowl_ov_sync_start` and the overlay's worker thread. That half has been
-## driven by hand -- the host staged against a stand-in server that serves the
-## `aowlspt.clientset/1` body and records the query strings it is handed -- and
-## has no gate of its own.
+## `aowl_ov_sync_start` and the overlay's worker thread, and this used to add
+## that the half "has no gate of its own". **It has one now**: `tests/ovsync`,
+## 24 checks, which starts a real backend with the manager on it, starts the
+## real worker out of `abi/aowlspt_overlay.h`, toggles a mod through the
+## manager's route and asserts the new answer arrives in `parseDesired`'s
+## output -- then carries `reportPath`'s query string up the same worker and
+## finds it again in the manager's ledger.
+##
+## The division of labour is still worth keeping straight, because it is why
+## both files exist. This one writes one end of the wire and reads it with the
+## other, so it can be exhaustive about **shapes** cheaply and with no ports.
+## `ovsync` is expensive and is exhaustive about nothing -- it establishes the
+## single fact no amount of shape-checking here can: that the string this file
+## builds arrives.
 ##
 ## Wired into `aowl test` under "The mod manager's rules". To run it alone:
 ##

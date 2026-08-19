@@ -46,8 +46,10 @@ it says that instead.
 Items that are **wrong**, not merely missing. Each carries its evidence. These
 are separated out because they need dispatching rather than deciding.
 
-**This section was nine items, then four, then three, and is now one** --
-`B11`, the only one that is a process rather than a defect. B4's three README
+**This section was nine items, then four, then three, then one, and is now
+none.** `B11` was the last, and it was the only one that was a process rather
+than a defect -- which is why it was closed by writing a program rather than by
+correcting a sentence. B4's three README
 paragraphs and B10's four documents are all corrected in place, and B2 closed
 itself when the code moved rather than by anyone dispatching it. The originals
 have been fixed in code since this was written; they are listed under
@@ -135,7 +137,7 @@ Corrected since this row was written, and kept rather than deleted:
 
 *Cost: one paragraph, in a file this document does not own.*
 
-### B11. `EMULATOR-COVERAGE.md` is rebuilt by hand
+### ~~B11. `EMULATOR-COVERAGE.md` is rebuilt by hand~~ — closed 2026-08-19
 
 `docs/ARCHITECTURE.md` says so in the "what is generated" list: the coverage
 table is rebuilt by re-running the four shell commands its own "How it was
@@ -164,7 +166,33 @@ the table does not become obviously wrong, it becomes quietly out of date while
 still reading as measured. The four commands are already written down, which is
 most of a generator.
 
-*Cost: a day. A `tools/coverage.nim` that runs the four and writes the table.*
+**Done, and it cost an afternoon.** `tools/coverage.nim` (`aowl-coverage`)
+computes all four sweeps in nimony by reading the files -- nothing shells out --
+and derives the served / empty / absent split from `docs/coverage-rows.json`,
+one row per callback method, joined against the routes `tarkov.nim` actually
+registers. **The bucket is not stored**: it is worked out from which handler
+each route is bound to, so rebinding one to `onEmptyObject` moves the headline
+with nobody editing a number. Two marked regions of the document are rewritten
+in place and the prose between them survives byte for byte; `--check` writes
+nothing and fails, and `aowl test` runs it after `aowl-regcheck`.
+
+Parsing the existing tables was tried first and **cannot** work, which is worth
+more than the generator: the eleven per-operation tables carry **174**
+operations against the reference's 211, and `GetRaidTime` appears in two of
+them -- so the document's own sentence that every in-scope operation appears in
+exactly one row was false. Keying rows to `Class.Method` instead makes the
+input checkable in both directions: a method with no row and a row naming no
+method are both errors, which a prose table can never be.
+
+**The first run found eleven operations the hand join had wrong**, and the split
+moved 127/24/60 to **125/25/61**. Three had no row at all (`Match.PutMetrics`,
+`Match.EventDisconnect`, `Game.GetCurrentGroup`); eight were recorded as served
+and shaped and are answered by a stock stub. Two moved the other way. None of
+the eleven was a change to the emulator -- every one was the join being wrong.
+
+Four of the eight are a behaviour claim rather than bookkeeping, and are their
+own row below: `/client/mail/dialog/read`, `/pin`, `/unpin` and `/remove` are
+all `onNullData`.
 
 ---
 
@@ -597,15 +625,54 @@ Beyond the 60:
 
 **In the host and the ABI**
 
-- **No gate for the client half of live mod control** —
-  `docs/MODMANAGER.md`, "The test", and `docs/ARCHITECTURE.md:570-574`. *"nothing drives a
-  manager against it."* The server half is proved every run by `tools/livectl.nim`
-  — **213 checks**, re-run 2026-08-19, up from the forty that document used to
-  quote. The client half is wired end to end and the *wire* is gated at both
-  ends (`modreport`, 27; `modclient`, 90), but what neither establishes is that
+- ~~**No gate for the client half of live mod control**~~ — **closed
+  2026-08-19.** This row said the server half was proved every run by
+  `tools/livectl.nim` (**213 checks**) and both ends of the *wire* by
+  `modreport` (27) and `modclient` (90), but that nothing established *"that
   the query string reaches the backend: that is `aowl_ov_sync_start` and the
-  overlay's worker thread, driven by hand only. This is the gate that would
-  settle S12 without a raid.
+  overlay's worker thread, driven by hand only"*, and called itself **the gate
+  that would settle S12 without a raid**.
+
+  `tests/ovsync` is that gate: **24 checks**, in `aowl test`. Nothing in the
+  loop is stood in for — a real backend on its own root and port, the real
+  worker thread reached through `host/Aowlspt.Overlay/aowloverlay.nim` (the
+  same two calls the IL2CPP host makes), and the real reader,
+  `modcontrol.parseDesired`. The program's own socket drives the *manager* and
+  never reads the feed. The assertion is the round trip in both directions: a
+  mod is toggled through `/aowlspt/mods/disable/…`, a new body is waited for,
+  and the check is on `DesiredMod.enabled` after parsing — then back the other
+  way, `reportPath` building `?hs=…&sq=…&r=…`, carried up by the same worker
+  and found again in the manager's ledger with this process's session,
+  sequence and outcome letters.
+
+  Its fixture is built so a feed accidentally wired to `/panel` **fails**: one
+  of its three mods is client-only, so the client resolution and the panel's
+  differ by construction. Red-cased both ways — a dead port fails 18 of 24 with
+  `silentPolls: 0`, which is the proof nothing reached the backend at all, and
+  a root staged without `manager.dll` fails 17 of 23 differently, on a live
+  transport carrying a 404.
+
+  **Three things it found that the documents had wrong**, all now corrected in
+  place:
+
+  1. `abi/aowlspt_overlay.h` said `Accept-Encoding: identity` *"is ignored by
+     the backend as it stands today -- that is a change that has to be made
+     there"*. It was made: `backend/aowlbackend.nim:515-520` honours it. That
+     header is load-bearing rather than aspirational, and it is the only reason
+     the feed works — the worker drops any body whose first byte is `0x78`. If
+     that branch is ever narrowed the feed goes silent with no error anywhere,
+     which is why the gate asserts the body came back uncompressed *by name*.
+  2. **The feed publishes a 404 verbatim** and bumps its serial: it checks
+     transport only, as documented. So the entire guard between a routing
+     failure and a client host unloading every mod it has is `parseDesired`'s
+     schema/`ok`/`count`/`complete` quartet — by design, and it holds, but the
+     feed's safety is one function deep and in a different module from the
+     fetch.
+  3. The worker starts and even **draws** in a plain console process with no
+     game: the throwaway D3D11 probe device succeeds. So the "a host that
+     cannot draw still obeys the manager" path — the reason the worker was
+     moved ahead of the swap-chain capture — is the branch this gate does *not*
+     exercise on this machine, and seeing it needs a machine with no D3D11.
 - ~~**The client host never reports its outcome back to the manager**~~ —
   **closed on both sides.** The host reports on the poll it already makes
   (`host/common/modcontrol.nim`, proved by `tests/modreport`, 27 checks) and the
@@ -650,9 +717,38 @@ Beyond the 60:
   and it does not build with the flag set `dbrace` gets — it needs
   `-p:host\common` as well. A proof nobody runs is the same as no proof, and
   this is the second time that sentence has had to be written about this item.
-- **The 14-byte prologue write is not atomic** — `abi/aowlspt_detour.h`. A
-  thread entering a method mid-patch can execute half of one instruction and
-  half of another. Pre-existing and orthogonal to the lifetime work above.
+- ~~**The 14-byte prologue write is not atomic**~~ — **closed 2026-08-19.**
+  `aowl_hook_arm` and `aowl_hook_remove` suspend every other thread in the
+  process across the write and retry until nobody's RIP is inside the bytes.
+  The row's own two options were *"a 5-byte atomic patch through a near island
+  … or thread suspension with RIP fix-up inside the engine"*; it is the second,
+  and the prototype it was measured against had been sitting in
+  `tests/detour_race.c` the whole time. Measured, six saturating workers:
+  **517 prologue faults over 20000 install/remove cycles unparked, 0 over
+  14080 parked**, with 77.4M of 79.6M calls in flight across a rewrite. Built
+  against the engine as it was, the new `--engine-park` mode reports 368 and
+  exits 1 — the gate fails against the old code, which is the only thing that
+  makes it a gate.
+
+  Two costs the row did not anticipate, both now in the header. **The freeze is
+  not free**: the suspend/`GetThreadContext` sweep is inside it at ~11 us a
+  thread, so a park on a 65-thread client is ~0.7 ms stopped and an
+  arm-plus-disarm ~1.8 ms. A hitch, not a hang — but the header had claimed the
+  window held only two `VirtualProtect`s and a byte write, and that was wrong.
+  And **enumeration decided the evidence**: `CreateToolhelp32Snapshot` walks
+  every thread on the machine, ~2 ms idle and nearer 15 ms under load, which
+  held the gate to fifty cycles — and fifty rewrites proves very little about a
+  race that is rare per rewrite. `ntdll!NtGetNextThread` took it to 14000, with
+  Toolhelp kept as the fallback.
+
+  What is *not* closed: a thread created after the enumeration is not parked,
+  and the 64-retry give-up path has never executed, so its fallback to the
+  unparked write is correct by inspection and not by test. Both are deliberate
+  — re-enumerating with the process frozen is the deadlock, and proving a
+  counter increments is not worth a synthetic thread that sits in a prologue
+  forever.
+
+  The history, kept:
 
   **The rate this row used to quote — "~1 in 140,000 calls" — is not
   reproducible and is withdrawn.** `detour_race` parks its workers across the
@@ -666,10 +762,11 @@ Beyond the 60:
   for the real engine and it is much larger: `tests/detour_race.c` records that
   leaving the workers running accounts for "well over a thousand faults a run".
 
-  Closing it needs either a 5-byte atomic patch through a near island — which
-  moves `AOWL_JMP_SIZE`, the decoder's minimum, the `-9` "already ours"
-  detection and every test with it — or thread suspension with RIP fix-up
-  inside the engine. Both are decisions, not fixes.
+  Closing it was said to need either a 5-byte atomic patch through a near island
+  — which would have moved `AOWL_JMP_SIZE`, the decoder's minimum, the `-9`
+  "already ours" detection and every test with it — or thread suspension with
+  RIP fix-up inside the engine. That framing was right, and the second option
+  turned out to cost nothing structural at all.
 - **Load order is not honoured on the client** — `docs/MODMANAGER.md`, "What came of it".
   *"It has not mattered because the client-side mods do not depend on one another;
   when it does, the fix is to sort by the order the backend already computes."*
@@ -913,19 +1010,19 @@ produces it, and the commands are named beside the numbers.
 
 ---
 
-## Top four, by what they unblock
+## Top three, by what they unblock
 
 Ranked by how much stops being unknown per unit of work — not by size. This was
-nine entries, then seven, and is now four. **Three of the four are not mine to
-do**: two are a raid and one is a decision. What is left that is work is one
-item, and that is the honest state of the project rather than a flattering one.
+nine entries, then seven, then four, and is now three. **None of the three is
+work.** Two are a raid and one is a decision, and that is the honest state of
+the top of this list rather than a flattering one: what remains at the top is
+not blocked on anybody writing anything.
 
 | # | Item | Reason | Unblocks | Cost |
 |---|---|---|---|---|
 | 1 | **Run the game once and read the log** | playtest | S1–S15 at once, eight Group-B name rows, and the right to make any claim at all about the client | one afternoon |
 | 2 | **SWAY's `springAccelPerFrame`** | playtest | the entire calibration of the mod — a factor of sixty, and the difference between invisible and a catapult | ten seconds of a raid |
-| 3 | **B11 — generate `EMULATOR-COVERAGE.md`** | broken | every headline number about the emulator. Two of its four derivation commands had drifted when re-run for this pass, which is the argument | a day |
-| 4 | **G2 — decide the download question** | owner | mod distribution, or the honest deletion of `download`. Either answer is progress; the open state is the only bad one. Its SHA-256 prerequisite no longer exists | one conversation |
+| 3 | **G2 — decide the download question** | owner | mod distribution, or the honest deletion of `download`. Either answer is progress; the open state is the only bad one. Its SHA-256 prerequisite no longer exists | one conversation |
 
 Three notes on the ranking. **Item 1 is not first by a small margin.** It is the
 only item on the list that changes what is *knowable* rather than what is done,
@@ -943,10 +1040,12 @@ and the two before them at 2 and 4, `writePtr`'s barrier and `bindField` on a
 static field, were the same failure one step earlier.
 
 **What that leaves is not a shorter list of the same kind of thing.** Of the
-four rows above, one is a generator, two are a raid, and one is a decision
-about what `download` is for. Plenty of work remains further down this document
-— the non-atomic 14-byte prologue write is still the sharpest of it — but
-nothing left at the top of the list is blocked on somebody reading more code.
+three rows above, two are a raid and one is a decision about what `download` is
+for. The fourth, B11's generator, was written the same day this was and is
+gone from the table for the usual reason. Plenty of work remains further down this document
+— though the non-atomic 14-byte prologue write, which was the sharpest of it
+when this was written, is closed as of the same day — but nothing left at the
+top of the list is blocked on somebody reading more code.
 
 ---
 
