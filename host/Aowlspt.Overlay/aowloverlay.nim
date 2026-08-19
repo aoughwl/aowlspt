@@ -98,10 +98,20 @@ proc overlayFrameNs*(): int32 =
   ## moving average over roughly the last hundred drawn frames, measured with
   ## QPC around the build-and-draw inside the `Present` hook.
   ##
-  ## Zero while the panel is closed, which is the truthful answer -- a hidden
-  ## panel is one `if` in the hook and nothing else. Worth logging once after a
-  ## raid: an overlay inside a game's present loop should be made to say what it
-  ## costs rather than be asked.
+  ## **Not** zeroed when the panel closes -- only `overlayStart` clears it -- so
+  ## after a close it goes on reporting the last thing that was measured. That
+  ## is deliberate, and it is what makes this worth logging once after a raid:
+  ## an overlay inside a game's present loop should be made to say what it
+  ## costs rather than be asked, and the question is asked when the panel is
+  ## already shut. The other side of it is that a reading taken just after the
+  ## panel is *reopened* is still the previous opening's; the panel labels that
+  ## `was` on its title bar, and a caller here can only wait the half second it
+  ## takes the average to settle.
+  ##
+  ## This used to say the figure was zero while the panel was closed and that a
+  ## hidden panel was one `if` in the hook; neither was quite the case. A hidden
+  ## frame is cheap but not free -- the frame counter, the reentrancy guard and
+  ## the swap-chain bind all run before the visible test.
   cOvFrameNs()
 
 proc overlayFrameNsMax*(): int32 =

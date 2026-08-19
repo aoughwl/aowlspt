@@ -288,7 +288,16 @@ static void    aowl_ov_on_toggle(AowlOvToggleFn fn, void* user);
  * A hidden frame is cheap but it is not free: the frame counter, the `inDraw`
  * guard and `aowl_ov_bind` all run before the visible test. This used to say
  * both figures were 0 while the panel was closed and that a hidden panel was
- * one `if`; neither was quite the case. */
+ * one `if`; neither was quite the case.
+ *
+ * Keeping them across a close is the point rather than an oversight: what a
+ * player wants is the cost of the panel they had open in a raid, read out of
+ * the log afterwards, and zeroing on close would hand them a 0 for exactly
+ * that question. The price is that a *reopened* panel reads out the previous
+ * opening's numbers, which the title bar labels `was` until this opening has
+ * put `AOWL_OV_COST_SETTLE` frames into the average. A caller sampling these
+ * two functions has the same question and the same answer is available: they
+ * are live only if the panel has been open for more than half a second. */
 static int32_t aowl_ov_frame_ns(void);
 /* The integer factor the panel is drawn at: 1 below about 1300 lines, 2 above,
  * 3 above 2500. The font is an 8x16 atlas sampled POINT/CLAMP, so an integer
@@ -806,6 +815,8 @@ typedef struct AowlOvState {
     /* --- cost --- */
     LARGE_INTEGER qpcFreq;
     int32_t       drawn;        /* frames actually drawn; render thread only */
+    int32_t       openDrawn;    /* ...of them, since the panel was last opened */
+    int32_t       wasVisible;   /* the render thread's own edge detector       */
     int32_t       maxVtx;       /* the busiest frame's vertex count, ever */
     int32_t       vtxDropped;   /* vertices the cap refused (a whole quad
                                    counts 6); must stay 0                  */
@@ -851,6 +862,31 @@ static int32_t aowl_ov_status(char* buf, int32_t cap) {
 static void aowl_ov_on_toggle(AowlOvToggleFn fn, void* user) {
     g_ov.toggleFn = fn;
     g_ov.toggleUser = user;
+}
+
+/* `_snprintf` does not always terminate on the Microsoft CRT. Every narrow
+ * formatted string in this file goes through here, so that the exception does
+ * not have to be remembered at forty call sites.
+ *
+ * It sits up here, next to `aowl_ov_copy`, rather than down among the text
+ * helpers where it was: nine call sites -- the worker's request building, the
+ * protected-mod refusal, and the two hook failures -- reached `_snprintf`
+ * directly and terminated by hand or by having a format that cannot fill the
+ * buffer, and the only thing standing between them and the wrapper was that
+ * the wrapper was defined further down the file than the worker. Being safe
+ * because the format happens to be short is a property of today's format
+ * string, not of the code.
+ *
+ * `_snwprintf` is still called directly, once per command kind, for the
+ * request path: this wrapper is narrow and that path is wide. All five write
+ * the same buffer and exactly one of them runs, so they terminate it once,
+ * together, on the line after the chain. */
+static void aowl_ov_fmt(char* out, int32_t cap, const char* fmt, ...) {
+    va_list ap;
+    va_start(ap, fmt);
+    _vsnprintf(out, (size_t)cap - 1, fmt, ap);
+    va_end(ap);
+    out[cap - 1] = 0;
 }
 
 /* ================================================================== *
@@ -1901,28 +1937,29 @@ static DWORD WINAPI aowl_ov_worker(LPVOID unused) {
                  * request -- so the reply carries both the new row and the
                  * per-mod outcome of trying. */
                 _snwprintf(path, 224, L"/aowlspt/mods/toggle/%ls", warg);
-                _snprintf(jbody, sizeof(jbody), "{\"enabled\":%s}",
-                          cmd.enabled ? "true" : "false");
-                jbody[sizeof(jbody) - 1] = 0;
+                aowl_ov_fmt(jbody, (int32_t)sizeof(jbody), "{\"enabled\":%s}",
+                            cmd.enabled ? "true" : "false");
                 postBody = jbody;
                 verb = L"POST";
-                _snprintf(what, sizeof(what), "%s %s",
-                          cmd.enabled ? "enable" : "disable", cmd.guid);
+                aowl_ov_fmt(what, (int32_t)sizeof(what), "%s %s",
+                            cmd.enabled ? "enable" : "disable", cmd.guid);
             } else if (cmd.kind == AOWL_CMD_CLEAR) {
                 _snwprintf(path, 224, L"/aowlspt/mods/clear/%ls", warg);
-                _snprintf(what, sizeof(what), "clear override on %s", cmd.guid);
+                aowl_ov_fmt(what, (int32_t)sizeof(what), "clear override on %s",
+                            cmd.guid);
             } else if (cmd.kind == AOWL_CMD_SELECT) {
                 _snwprintf(path, 224, L"/aowlspt/mods/select/%ls", warg);
-                _snprintf(what, sizeof(what), "select list %s", cmd.guid);
+                aowl_ov_fmt(what, (int32_t)sizeof(what), "select list %s", cmd.guid);
             } else if (cmd.kind == AOWL_CMD_RELOAD) {
                 _snwprintf(path, 224, L"/aowlspt/mods/reload");
-                _snprintf(what, sizeof(what), "reload the registry");
+                aowl_ov_fmt(what, (int32_t)sizeof(what), "reload the registry");
             } else {
                 _snwprintf(path, 224, L"/aowlspt/mods/apply");
-                _snprintf(what, sizeof(what), "apply the selection");
+                aowl_ov_fmt(what, (int32_t)sizeof(what), "apply the selection");
             }
+            /* The one `_snwprintf` that ran above, terminated here for all
+             * five. `what` is `aowl_ov_fmt`'s now and terminates itself. */
             path[223] = 0;
-            what[sizeof(what) - 1] = 0;
 
             rc = aowl_ov_fetch(verb, path, postBody, buf, (int32_t)sizeof(buf));
             if (rc > 0) {
@@ -2567,7 +2604,17 @@ static void aowl_ov_restore(ID3D11DeviceContext* c, AowlOvSaved* s) {
  * has nothing to say about, because "unknown, and here is why" is the fact this
  * pane exists to carry. */
 #define AOWL_OV_DETAIL_H  100   /* the selected row, explained */
-#define AOWL_OV_LEGEND_H  40    /* two lines: the keys, and the markers */
+/* Two lines -- the keys, and the markers -- which is what they take on a panel
+ * wide enough to hold them. It is the floor, not the height: `aowl_ov_build`
+ * measures both strings against the room and gives each up to
+ * `AOWL_OV_LEGEND_MAX` lines. */
+#define AOWL_OV_LEGEND_H  40
+#define AOWL_OV_LEGEND_MAX 3
+/* Drawn frames this opening has to contribute before the frame cost on the
+ * title bar stops being labelled as the previous opening's. One EWMA time
+ * constant at 1/32 -- about half a second at 60 Hz -- after which the old
+ * session's number carries about a third of the weight and falling. */
+#define AOWL_OV_COST_SETTLE  32
 
 static const uint32_t AOWL_OV_BG     = AOWL_RGBA(14, 16, 20, 232);
 #define AOWL_OV_EDGE      AOWL_RGBA(120, 160, 200, 255)
@@ -2620,9 +2667,14 @@ static void aowl_ov_textn(float x, float y, const char* s, uint32_t col,
 /* Word-wrapped text. Returns the number of lines drawn, and stops at
  * `maxLines` -- the manager's sentences are one line by design and its error
  * strings are three, so this exists for the long ones rather than for all of
- * them. Newlines in the source break the line too. */
-static int32_t aowl_ov_wrap(float x, float y, const char* s, uint32_t col,
-                            int32_t cols, int32_t maxLines) {
+ * them. Newlines in the source break the line too.
+ *
+ * `draw` is 0 for a caller that only wants the count. The legend has to know
+ * how tall it is before the body is laid out, and then draw the same text into
+ * the room it reserved; the two answers cannot be allowed to disagree, so they
+ * are one function rather than one rule written twice. */
+static int32_t aowl_ov_wrap_ex(float x, float y, const char* s, uint32_t col,
+                               int32_t cols, int32_t maxLines, int32_t draw) {
     char line[224];
     int32_t used = 0;
     int32_t i = 0;
@@ -2657,7 +2709,7 @@ static int32_t aowl_ov_wrap(float x, float y, const char* s, uint32_t col,
                 }
             }
         }
-        aowl_ov_text(x, y + (float)(used * AOWL_OV_LINE_H), line, col);
+        if (draw) aowl_ov_text(x, y + (float)(used * AOWL_OV_LINE_H), line, col);
         used++;
         i += take;
         while (s[i] == ' ') i++;
@@ -2666,18 +2718,16 @@ static int32_t aowl_ov_wrap(float x, float y, const char* s, uint32_t col,
     return used;
 }
 
-/* `_snprintf` does not always terminate on the Microsoft CRT. Nearly every
- * formatted string in this file goes through here so that the exception does
- * not have to be remembered at thirty call sites. Nine call sites still reach
- * `_snprintf` directly -- the worker's request building and two fixed-format
- * failure messages -- and those terminate by hand or by having a format that
- * cannot fill the buffer. New code should use this rather than join them. */
-static void aowl_ov_fmt(char* out, int32_t cap, const char* fmt, ...) {
-    va_list ap;
-    va_start(ap, fmt);
-    _vsnprintf(out, (size_t)cap - 1, fmt, ap);
-    va_end(ap);
-    out[cap - 1] = 0;
+static int32_t aowl_ov_wrap(float x, float y, const char* s, uint32_t col,
+                            int32_t cols, int32_t maxLines) {
+    return aowl_ov_wrap_ex(x, y, s, col, cols, maxLines, 1);
+}
+
+/* How many lines the same text would take. Nothing is drawn and nothing is
+ * measured a second way: it is `aowl_ov_wrap` with its one `aowl_ov_text` call
+ * switched off. */
+static int32_t aowl_ov_wrap_lines(const char* s, int32_t cols, int32_t maxLines) {
+    return aowl_ov_wrap_ex(0.0f, 0.0f, s, 0u, cols, maxLines, 0);
 }
 
 /* ------------------------------------------------------------------ *
@@ -2822,9 +2872,8 @@ static void aowl_ov_act_toggle(const char* guid) {
                          "switch it off: it is what serves this panel, and "
                          "nothing running could switch it back on. Take it out "
                          "of the install if you mean it.");
-            _snprintf(g_ov.applyWhat, sizeof(g_ov.applyWhat),
-                      "refused: disable %s (protected)", guid);
-            g_ov.applyWhat[sizeof(g_ov.applyWhat) - 1] = 0;
+            aowl_ov_fmt(g_ov.applyWhat, (int32_t)sizeof(g_ov.applyWhat),
+                        "refused: disable %s (protected)", guid);
             g_ov.resultCount = 0;
             LeaveCriticalSection(&g_ov.cs);
             g_ov.dataSerial++;
@@ -3655,6 +3704,10 @@ static uint32_t aowl_ov_signature(void) {
     aowl_ov_sig_add(&h, g_ov.backendPort);
     aowl_ov_sig_add(&h, g_ov.dispAvgNs);
     aowl_ov_sig_add(&h, g_ov.dispMaxNs);
+    /* A flag, not a count: the title bar says `was` while the cost is still
+     * the previous opening's, and without this the frame that stops being true
+     * can land on a cache hit and leave the word up. */
+    aowl_ov_sig_add(&h, g_ov.openDrawn < AOWL_OV_COST_SETTLE ? 1 : 0);
     aowl_ov_sig_add(&h, g_ov.dispRttMs);
     aowl_ov_sig_add(&h, g_ov.dispStaleS);
     /* Never zero: zero is what `aowl_ov_bind` writes to force the next frame to
@@ -3666,10 +3719,15 @@ static uint32_t aowl_ov_signature(void) {
  * everything it decides is either geometry or a queued command. */
 static void aowl_ov_build(void) {
     float x = (float)AOWL_OV_PANEL_X, y = (float)AOWL_OV_PANEL_Y;
-    float w, h, bodyY, bodyH, innerW;
+    float w, h, bodyY, bodyH, innerW, legendH;
     int32_t vis[AOWL_OV_MAX_MODS];
     int32_t visN, rows, counts[AOWL_VIEW_COUNT];
     char buf[256];
+    /* The legend, built before the body so that its height is known, drawn
+     * after it. `legNote` is the marker legend or, when something went wrong,
+     * what went wrong -- they share the line and so they share the buffer. */
+    char legKeys[224], legNote[256];
+    int32_t legCols = 0, legKeyN = 1, legNoteN = 1;
     uint32_t healthCol = AOWL_OV_DIM;
 
     aowl_ov_snapshot();
@@ -3721,6 +3779,7 @@ static void aowl_ov_build(void) {
     innerW = w - 2.0f * AOWL_OV_PAD;
     bodyY = y + (float)AOWL_OV_HEAD_H;
     bodyH = h - (float)AOWL_OV_HEAD_H - (float)AOWL_OV_LEGEND_H;
+    legendH = (float)AOWL_OV_LEGEND_H;
 
     visN = aowl_ov_visible_rows(vis);
     counts[AOWL_VIEW_MODS] = g_ov.sModCount;
@@ -3752,6 +3811,90 @@ static void aowl_ov_build(void) {
             g_ov.sel[AOWL_VIEW_MODS] = visN > 0 ? visN - 1 : 0;
     }
 
+    /* --- how tall the legend has to be, before the body takes the rest ---
+     *
+     * `AOWL_OV_LEGEND_H` reserves two lines, which is what these two strings
+     * take at 115 columns -- the default 940-wide panel -- and not what they
+     * take anywhere narrower. The room is `innerW / AOWL_OV_CW`: 115 at the
+     * default, 87 at the 800x520 the test host resizes to mid-run, and 57 at
+     * the 480 floor `aowl_ov_build` clamps to. The marker legend is 106
+     * characters and the mods view's key legend is 95, so at the floor both
+     * were being cut in half by `aowl_ov_textn` -- and the whole argument for
+     * printing a legend on every view is that the player has not learnt the
+     * markers yet. A legend that loses its second half loses exactly the
+     * marker nobody knows.
+     *
+     * So the legend is measured and wrapped rather than clipped, and the body
+     * is given what is left. On a wide panel this changes nothing: one line
+     * each, `legendH == AOWL_OV_LEGEND_H`, the same layout as before. At the
+     * floor it costs the body two rows, which is the right way round -- a row
+     * you cannot see is one scroll away, and a marker you cannot see is not.
+     *
+     * The alternatives were worse in ways worth writing down. Shortening the
+     * legend to 57 columns means deleting two of the five markers, which is
+     * the same loss with none of the room. Raising the 480 floor to the ~870
+     * the untouched legend needs makes the panel wider than the window it is
+     * clamped for: the floor exists so a small window gets a usable panel, and
+     * a panel hanging off the right edge is not one.
+     *
+     * Measured here, after the input block, because a TAB or an F in this
+     * frame changes which legend this frame prints. `rows` above -- the page
+     * size PgUp/PgDn used a moment ago -- was computed from the two-line
+     * reservation and is not re-derived: it is one keypress, in the one frame
+     * a view changes, and it is followed by a rebuild. */
+    {
+        int32_t maxN;
+        legCols = (int32_t)(innerW / AOWL_OV_CW);
+        if (g_ov.view == AOWL_VIEW_MODS)
+            aowl_ov_fmt(legKeys, (int32_t)sizeof(legKeys),
+                        "TAB view  UP/DN move  SPACE toggle  C clear  "
+                        "F filter [%s]  A apply  R reload  INS/ESC close",
+                        aowl_ov_filter_name(g_ov.filter));
+        else if (g_ov.view == AOWL_VIEW_LISTS)
+            aowl_ov_fmt(legKeys, (int32_t)sizeof(legKeys),
+                        "TAB view  UP/DN move  ENTER activate this list  "
+                        "A apply  R reload  INS/ESC close");
+        else
+            aowl_ov_fmt(legKeys, (int32_t)sizeof(legKeys),
+                        "TAB view  UP/DN move  1-4 jump  A apply  R reload  "
+                        "INS/ESC close");
+        /* The second line is the marker legend, *unless* something went wrong
+         * -- in which case it is what went wrong, on every view. An error you
+         * have to change view to see is an error nobody sees, and the gestures
+         * that fail (a refusal from the manager, a backend that is not there)
+         * are made from the MODS view where the ISSUES tab is just a number.
+         *
+         * Which is also why no action here changes the view. Yanking the panel
+         * to another pane because a keypress was refused loses the row the
+         * player had selected, to tell them something a line of text can. */
+        aowl_ov_copy(legNote, (int32_t)sizeof(legNote),
+                     g_ov.sLastError[0] ? g_ov.sLastError :
+                     "* your override   ~ asked, no answer yet   "
+                     "! game disagrees   ON*/OFF* takes a restart   "
+                     "dim = not running");
+        /* Never past the body's last two rows. A manager refusal is a couple
+         * of hundred characters and would otherwise be entitled to eat a short
+         * panel whole; past this it wraps to what fits and `aowl_ov_wrap`
+         * marks the cut with `..`, which is the one truncation that says so. */
+        maxN = (int32_t)((h - (float)AOWL_OV_HEAD_H - (float)(2 * AOWL_OV_ROW_H)
+                          - (float)(AOWL_OV_LEGEND_H - 2 * AOWL_OV_LINE_H))
+                         / (float)AOWL_OV_LINE_H);
+        if (maxN > 2 * AOWL_OV_LEGEND_MAX) maxN = 2 * AOWL_OV_LEGEND_MAX;
+        if (maxN < 2) maxN = 2;
+        legKeyN = aowl_ov_wrap_lines(legKeys, legCols, AOWL_OV_LEGEND_MAX);
+        if (legKeyN > maxN - 1) legKeyN = maxN - 1;
+        legNoteN = aowl_ov_wrap_lines(legNote, legCols, AOWL_OV_LEGEND_MAX);
+        if (legNoteN > maxN - legKeyN) legNoteN = maxN - legKeyN;
+        legendH = (float)(AOWL_OV_LEGEND_H - 2 * AOWL_OV_LINE_H
+                          + (legKeyN + legNoteN) * AOWL_OV_LINE_H);
+        bodyH = h - (float)AOWL_OV_HEAD_H - legendH;
+        rows = (int32_t)((bodyH - (float)AOWL_OV_LINE_H) / AOWL_OV_ROW_H);
+        if (g_ov.view == AOWL_VIEW_MODS)
+            rows = (int32_t)((bodyH - (float)AOWL_OV_LINE_H
+                              - (float)AOWL_OV_DETAIL_H) / AOWL_OV_ROW_H);
+        if (rows < 1) rows = 1;
+    }
+
     /* --- chrome --- */
     aowl_ov_rect(x, y, w, h, AOWL_OV_BG);
     aowl_ov_rect(x, y, w, (float)AOWL_OV_TITLE_H, AOWL_OV_TITLEBG);
@@ -3771,9 +3914,20 @@ static void aowl_ov_build(void) {
          * are dropped from the average deliberately (they are start-up, not the
          * overlay), and the display is refreshed twice a second, so there is a
          * moment after the panel opens with nothing to report -- and `0.0 us`
-         * would be a claim rather than a gap. */
+         * would be a claim rather than a gap.
+         *
+         * `was`, until this opening has put a time constant's worth of frames
+         * into the average. Neither figure is cleared when the panel closes --
+         * that is deliberate, and the reason is on `aowl_ov_frame_ns` -- so a
+         * reopened panel has the last session's numbers on its title bar and no
+         * way to tell that from a measurement of what is on screen now. One
+         * word fixes that, and it is the honest one: they are what the cost
+         * *was*, the last time this panel was up. (`peak` never comes down at
+         * all: it is the worst frame since `aowl_ov_start`, across every
+         * opening, which is what makes it worth reading.) */
         if (g_ov.dispAvgNs > 0)
-            aowl_ov_fmt(cost, sizeof(cost), "%d.%d us  peak %d.%d",
+            aowl_ov_fmt(cost, sizeof(cost), "%s%d.%d us  peak %d.%d",
+                        g_ov.openDrawn < AOWL_OV_COST_SETTLE ? "was " : "",
                         g_ov.dispAvgNs / 1000, (g_ov.dispAvgNs / 100) % 10,
                         g_ov.dispMaxNs / 1000, (g_ov.dispMaxNs / 100) % 10);
         else
@@ -3830,52 +3984,15 @@ static void aowl_ov_build(void) {
      * on screen is a keyboard interface nobody can use, and this one is being
      * driven by somebody whose mouse is busy pointing a rifle. */
     {
-        float ly = y + h - (float)AOWL_OV_LEGEND_H + 4.0f;
-        int32_t cols = (int32_t)(innerW / AOWL_OV_CW);
+        /* Built and measured above; here it is only placed. Both lines are
+         * wrapped rather than clipped -- see the note by the measurement. */
+        float ly = y + h - legendH + 4.0f;
         aowl_ov_rect(x + 1.0f, ly - 4.0f, w - 2.0f, 1.0f, AOWL_OV_EDGE);
-        if (g_ov.view == AOWL_VIEW_MODS)
-            aowl_ov_fmt(buf, sizeof(buf),
-                        "TAB view  UP/DN move  SPACE toggle  C clear  "
-                        "F filter [%s]  A apply  R reload  INS/ESC close",
-                        aowl_ov_filter_name(g_ov.filter));
-        else if (g_ov.view == AOWL_VIEW_LISTS)
-            aowl_ov_fmt(buf, sizeof(buf),
-                        "TAB view  UP/DN move  ENTER activate this list  "
-                        "A apply  R reload  INS/ESC close");
-        else
-            aowl_ov_fmt(buf, sizeof(buf),
-                        "TAB view  UP/DN move  1-4 jump  A apply  R reload  INS/ESC close");
-        aowl_ov_textn(x + AOWL_OV_PAD, ly, buf, AOWL_OV_TEXT, cols);
-        /* The second line is the marker legend, *unless* something went wrong
-         * -- in which case it is what went wrong, on every view. An error you
-         * have to change view to see is an error nobody sees, and the gestures
-         * that fail (a refusal from the manager, a backend that is not there)
-         * are made from the MODS view where the ISSUES tab is just a number.
-         *
-         * Which is also why no action here changes the view. Yanking the panel
-         * to another pane because a keypress was refused loses the row the
-         * player had selected, to tell them something a line of text can. */
-        if (g_ov.sLastError[0])
-            aowl_ov_textn(x + AOWL_OV_PAD, ly + (float)AOWL_OV_LINE_H,
-                          g_ov.sLastError, AOWL_OV_ERR, cols);
-        else {
-            aowl_ov_fmt(buf, sizeof(buf),
-                        /* 106 characters. The room is `innerW / AOWL_OV_CW`:
-                         * 115 columns at the default 940-wide panel and 87 at
-                         * the 800x520 the test host resizes to, but 57 at the
-                         * 480 floor `aowl_ov_build` clamps to -- and there
-                         * `aowl_ov_textn` clips it. This used to say the room
-                         * was 107 at the narrowest panel this draws at, which
-                         * matches none of those and was never re-derived. A
-                         * marker legend that runs off the right edge loses the
-                         * marker nobody knows yet, so on a small panel that is
-                         * a real gap and not only a wording one. */
-                        "* your override   ~ asked, no answer yet   "
-                        "! game disagrees   ON*/OFF* takes a restart   "
-                        "dim = not running");
-            aowl_ov_textn(x + AOWL_OV_PAD, ly + (float)AOWL_OV_LINE_H, buf,
-                          AOWL_OV_FAINT, cols);
-        }
+        aowl_ov_wrap(x + AOWL_OV_PAD, ly, legKeys, AOWL_OV_TEXT,
+                     legCols, legKeyN);
+        aowl_ov_wrap(x + AOWL_OV_PAD, ly + (float)(legKeyN * AOWL_OV_LINE_H),
+                     legNote, g_ov.sLastError[0] ? AOWL_OV_ERR : AOWL_OV_FAINT,
+                     legCols, legNoteN);
     }
 
     /* A click that reached nothing is dropped here rather than saved for the
@@ -4156,6 +4273,15 @@ static HRESULT STDMETHODCALLTYPE aowl_ov_present(IDXGISwapChain* sc, UINT sync,
      * otherwise reenter the shared vertex scratch. */
     if (InterlockedCompareExchange(&g_ov.inDraw, 1, 0) == 0) {
         g_ov.frames++;
+        /* Opened again. `avgNs`/`maxNs` are deliberately *not* cleared here --
+         * see the note on `aowl_ov_frame_ns` -- so this counts what this
+         * opening has contributed, which is what says whether the figure on
+         * the title bar is this session's or the last one's. The edge is
+         * detected here rather than in `aowl_ov_set_visible` because the
+         * toggle key and ESC write `visible` directly, and a counter that only
+         * the API path reset would be right for the one caller nobody uses. */
+        if (g_ov.visible && !g_ov.wasVisible) g_ov.openDrawn = 0;
+        g_ov.wasVisible = g_ov.visible;
         if (aowl_ov_bind(sc) && g_ov.visible) {
             /* What one frame of this costs, measured rather than asserted. The
              * overlay is drawn inside the present loop of a game people play
@@ -4187,6 +4313,7 @@ static HRESULT STDMETHODCALLTYPE aowl_ov_present(IDXGISwapChain* sc, UINT sync,
                  *
                  * `drawn` is the render thread's own counter, so no atomics. */
                 g_ov.drawn++;
+                g_ov.openDrawn++;
                 if (g_ov.drawn > 8) {
                     /* An EWMA at 1/32, which settles in about a hundred frames
                      * -- long enough not to flicker, short enough that a change
@@ -4368,6 +4495,8 @@ static int32_t aowl_ov_start(int32_t toggleVk, int32_t backendPort) {
     g_ov.maxNs = 0;
     g_ov.avgBuildNs = 0;
     g_ov.drawn = 0;
+    g_ov.openDrawn = 0;
+    g_ov.wasVisible = 0;
     g_ov.drawSig = 0;
     g_ov.needUpload = 1;
     g_ov.builds = 0;
@@ -4415,7 +4544,8 @@ static int32_t aowl_ov_start(int32_t toggleVk, int32_t backendPort) {
     int32_t rc = aowl_hook_install(g_ov.presentHook, present, (void*)aowl_ov_present);
     if (rc != 0) {
         char msg[96];
-        _snprintf(msg, sizeof(msg), "could not hook Present (detour error %d)", rc);
+        aowl_ov_fmt(msg, (int32_t)sizeof(msg),
+                    "could not hook Present (detour error %d)", rc);
         aowl_ov_fail(msg);
         return 0;
     }
@@ -4430,7 +4560,8 @@ static int32_t aowl_ov_start(int32_t toggleVk, int32_t backendPort) {
          * is not acceptable, so the Present hook comes back out too. */
         aowl_hook_remove(g_ov.presentHook);
         char msg[96];
-        _snprintf(msg, sizeof(msg), "could not hook ResizeBuffers (detour error %d)", rc);
+        aowl_ov_fmt(msg, (int32_t)sizeof(msg),
+                    "could not hook ResizeBuffers (detour error %d)", rc);
         aowl_ov_fail(msg);
         return 0;
     }

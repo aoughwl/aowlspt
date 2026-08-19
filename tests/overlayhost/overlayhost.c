@@ -336,6 +336,272 @@ static int count_overlay_pixels(void) {
 }
 
 /* ------------------------------------------------------------------ *
+ * Reading the panel back
+ *
+ * The BMPs prove the panel drew; they do not prove *what* it drew, and the one
+ * thing a screenshot is worst at is a line of text that is two characters
+ * short of what it should say. So this decodes the back buffer back into
+ * characters, against `aowl_ov_font` -- the same 8x16 table the overlay
+ * uploads -- and hands the caller a string it can `strstr`.
+ *
+ * It is exact, not approximate. The font is sampled POINT/CLAMP at one texel
+ * per pixel and a glyph texel is opaque, so a lit pixel is the text colour
+ * itself and the 16 bytes a cell decodes to either equal a glyph's bytes or do
+ * not. Nothing is scaled: the caller checks `aowl_ov_scale() == 1` first.
+ * ------------------------------------------------------------------ */
+
+#define OCR_BLANK_RUN 4     /* blank cells that end a run; the legend uses 3 */
+#define OCR_MIN_RUN   6     /* glyphs before a run counts as a line of text */
+
+/* Every run of text drawn in `col`, one per line, in the order they appear
+ * down the screen.
+ *
+ * Whitespace is collapsed to single spaces, so that a caller can compare
+ * against the source string regardless of where a wrap fell: `aowl_ov_wrap`
+ * breaks on a space and drops it, so a wrapped sentence and its unwrapped self
+ * differ only in runs of spaces.
+ *
+ * The scan is every pixel column, not every eighth: the panel draws text at
+ * the left margin, centred on tabs and right-aligned on the title bar, and the
+ * title bar is where the frame cost is. A run that starts on the wrong
+ * alignment dies on its first cell -- eight columns of two different glyphs do
+ * not spell a third -- so the misaligned starts cost time and produce nothing.
+ */
+static int panel_read_text(char* out, int cap, uint32_t col) {
+    ID3D11Texture2D* bb = NULL;
+    D3D11_TEXTURE2D_DESC td, sd;
+    ID3D11Texture2D* stage = NULL;
+    D3D11_MAPPED_SUBRESOURCE map;
+    uint8_t* lit = NULL;
+    int n = 0;
+    if (cap > 0) out[0] = 0;
+    if (FAILED(IDXGISwapChain_GetBuffer(swap, 0, &AOWL_IID_ID3D11Texture2D, (void**)&bb)))
+        return 0;
+    ID3D11Texture2D_GetDesc(bb, &td);
+    sd = td;
+    sd.Usage = D3D11_USAGE_STAGING;
+    sd.BindFlags = 0;
+    sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    sd.MiscFlags = 0;
+    if (FAILED(ID3D11Device_CreateTexture2D(dev, &sd, NULL, &stage))) {
+        ID3D11Texture2D_Release(bb);
+        return 0;
+    }
+    ID3D11DeviceContext_CopyResource(ctx, (ID3D11Resource*)stage, (ID3D11Resource*)bb);
+    if (SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource*)stage, 0,
+                                          D3D11_MAP_READ, 0, &map))) {
+        const uint8_t* base = (const uint8_t*)map.pData;
+        UINT W = td.Width, H = td.Height, ux, uy;
+        uint8_t want[3];
+        want[0] = (uint8_t)(col & 0xFF);
+        want[1] = (uint8_t)((col >> 8) & 0xFF);
+        want[2] = (uint8_t)((col >> 16) & 0xFF);
+        lit = (uint8_t*)malloc((size_t)W * H);
+        if (lit) {
+            /* One pass for "is this pixel the text colour", so the run scan is
+             * table lookups. The font is sampled POINT/CLAMP at one texel per
+             * pixel onto integer positions and a glyph texel is opaque, so a
+             * lit pixel is the text colour exactly; one step of tolerance per
+             * channel and no more, because a near miss would mean the sampler
+             * is filtering, which is itself worth failing on. */
+            for (uy = 0; uy < H; uy++) {
+                const uint8_t* src = base + (size_t)uy * map.RowPitch;
+                uint8_t* dst = lit + (size_t)uy * W;
+                for (ux = 0; ux < W; ux++) {
+                    const uint8_t* q = src + (size_t)ux * 4;
+                    dst[ux] = (uint8_t)(q[0] + 1 >= want[0] && q[0] <= want[0] + 1 &&
+                                        q[1] + 1 >= want[1] && q[1] <= want[1] + 1 &&
+                                        q[2] + 1 >= want[2] && q[2] <= want[2] + 1);
+                }
+            }
+            for (uy = 0; (int)uy + AOWL_OV_CH <= (int)H; uy++) {
+                for (ux = 0; (int)ux + AOWL_OV_CW <= (int)W; ux++) {
+                    char line[512];
+                    int len = 0, blanks = 0, cells = 0;
+                    UINT cx = ux;
+                    while ((int)cx + AOWL_OV_CW <= (int)W) {
+                        uint8_t rows[AOWL_OV_CH];
+                        int r, b, g, blank = 1, hit = -1;
+                        for (r = 0; r < AOWL_OV_CH; r++) {
+                            const uint8_t* row = lit + (size_t)(uy + r) * W + cx;
+                            uint8_t bits = 0;
+                            for (b = 0; b < AOWL_OV_CW; b++)
+                                if (row[b]) bits |= (uint8_t)(0x80u >> b);
+                            rows[r] = bits;
+                            if (bits) blank = 0;
+                        }
+                        if (blank) {
+                            if (++blanks >= OCR_BLANK_RUN) break;
+                        } else {
+                            for (g = 0; g < 95; g++)
+                                if (memcmp(rows, aowl_ov_font[g], AOWL_OV_CH) == 0) {
+                                    hit = g;
+                                    break;
+                                }
+                            if (hit < 0) break;
+                            if (blanks && len && len < (int)sizeof(line) - 1)
+                                line[len++] = ' ';
+                            blanks = 0;
+                            if (len < (int)sizeof(line) - 1)
+                                line[len++] = (char)(32 + hit);
+                        }
+                        cells++;
+                        cx += AOWL_OV_CW;
+                    }
+                    line[len] = 0;
+                    if (len >= OCR_MIN_RUN && n + len + 2 < cap) {
+                        memcpy(out + n, line, (size_t)len);
+                        n += len;
+                        out[n++] = '\n';
+                        out[n] = 0;
+                        /* Past what this run consumed. Two runs one pixel
+                         * apart would otherwise both be recorded and the
+                         * buffer would fill with near-duplicates. */
+                        ux += (UINT)(cells * AOWL_OV_CW) - 1;
+                    }
+                }
+            }
+            free(lit);
+        }
+        ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource*)stage, 0);
+    }
+    ID3D11Texture2D_Release(stage);
+    ID3D11Texture2D_Release(bb);
+    return n;
+}
+
+/* The one line of `buf` that contains `needle`, copied into `out`. NULL when
+ * no line does. */
+static const char* read_line_with(const char* buf, const char* needle,
+                                  char* out, int cap) {
+    const char* at = strstr(buf, needle);
+    const char* s;
+    const char* e;
+    int len;
+    if (!at) return NULL;
+    for (s = at; s > buf && s[-1] != '\n'; s--) { }
+    for (e = at; *e && *e != '\n'; e++) { }
+    len = (int)(e - s);
+    if (len > cap - 1) len = cap - 1;
+    memcpy(out, s, (size_t)len);
+    out[len] = 0;
+    return out;
+}
+
+/* The frame cost on the title bar, read back the same way.
+ *
+ * `avgNs` and `maxNs` are deliberately not cleared when the panel closes -- a
+ * player wants the cost of the panel they had open in a raid, and zeroing on
+ * close would answer that with 0 -- so a reopened panel puts the previous
+ * opening's numbers on its title bar. The overlay labels them `was` until this
+ * opening has put `AOWL_OV_COST_SETTLE` frames into the average.
+ *
+ * Both halves are checked, and the second is the one that matters: a label
+ * that never came down would pass the first check and would be a lie for the
+ * rest of the raid.
+ */
+static int check_cost_label(int wantWas) {
+    static char faint[16384];
+    char line[512];
+    char m[256];
+    if (aowl_ov_scale() != 1) return 1;
+    panel_read_text(faint, (int)sizeof(faint), AOWL_OV_FAINT);
+    if (!read_line_with(faint, " us peak ", line, (int)sizeof(line))) {
+        bad("no frame cost on the title bar to read");
+        return 0;
+    }
+    if (wantWas && !strstr(line, "was ")) {
+        _snprintf(m, sizeof(m), "the reopened panel shows `%s` -- the previous "
+                  "opening's average, unlabelled", line);
+        m[sizeof(m) - 1] = 0;
+        bad(m);
+        return 0;
+    }
+    if (!wantWas && strstr(line, "was ")) {
+        _snprintf(m, sizeof(m), "the frame cost is still labelled `was` long "
+                  "after the panel reopened: `%s`", line);
+        m[sizeof(m) - 1] = 0;
+        bad(m);
+        return 0;
+    }
+    _snprintf(m, sizeof(m), "the title bar reads `%s` %s the reopen", line,
+              wantWas ? "just after" : "well after");
+    m[sizeof(m) - 1] = 0;
+    ok(m);
+    return 1;
+}
+
+/* The legend, read back off the screen rather than assumed.
+ *
+ * This is the check that the marker legend is *whole*. It used to be printed
+ * with `aowl_ov_textn`, which clips: 106 characters into the 57 columns the
+ * 480-wide floor leaves is the legend cut in half, and the half it loses is
+ * the markers a new player has not learnt. Run this host with
+ * `--size 520x400` and the panel is at that floor.
+ *
+ * The strings below are literals on purpose. Deriving them from the header
+ * would make this a check that the header agrees with itself. */
+static int check_legend(void)
+{
+    static const char* kMarkers =
+        "* your override ~ asked, no answer yet ! game disagrees "
+        "ON*/OFF* takes a restart dim = not running";
+    static const char* kKeysHead =
+        "TAB view UP/DN move SPACE toggle C clear F filter [";
+    static const char* kKeysTail = "] A apply R reload INS/ESC close";
+    static char faint[8192], text[8192];
+    int good = 1;
+    char m[256];
+
+    if (aowl_ov_scale() != 1) {
+        printf("      legend readback skipped: the panel is drawn at %dx\n",
+               aowl_ov_scale());
+        return 1;
+    }
+    /* `aowl_ov_build` clamps the panel to 480x220 and does not shrink past it,
+     * so a window smaller than the panel's origin plus that floor gets a panel
+     * that hangs off the edge -- the legend is then missing from the back
+     * buffer because it was never inside it, which is a different fact from
+     * the one this checks. Said out loud rather than skipped quietly. */
+    if ((int)winW < AOWL_OV_PANEL_X + 480 || (int)winH < AOWL_OV_PANEL_Y + 220) {
+        printf("      legend readback skipped: a %ux%u window is smaller than "
+               "the panel's 480x220 floor at %d,%d, so the legend is off the "
+               "back buffer rather than clipped in it\n",
+               winW, winH, AOWL_OV_PANEL_X, AOWL_OV_PANEL_Y);
+        return 1;
+    }
+    panel_read_text(faint, (int)sizeof(faint), AOWL_OV_FAINT);
+    panel_read_text(text, (int)sizeof(text), AOWL_OV_TEXT);
+    /* Wrapped lines are separate lines on screen and one sentence in the
+     * legend, so the newlines go before the compare. */
+    { char* q; for (q = faint; *q; q++) if (*q == '\n') *q = ' '; }
+    { char* q; for (q = text;  *q; q++) if (*q == '\n') *q = ' '; }
+
+    if (strstr(faint, kMarkers)) {
+        _snprintf(m, sizeof(m),
+                  "the whole marker legend reads back off the back buffer, "
+                  "all %d characters of it, in a %ux%u window",
+                  (int)strlen(kMarkers), winW, winH);
+        m[sizeof(m) - 1] = 0;
+        ok(m);
+    } else {
+        bad("the marker legend is not on screen in full -- it was clipped or "
+            "it did not draw");
+        printf("      wanted: %s\n", kMarkers);
+        printf("      faint text read back:\n%s\n", faint);
+        good = 0;
+    }
+    if (strstr(text, kKeysHead) && strstr(text, kKeysTail))
+        ok("the key legend is on screen from `TAB view` to `INS/ESC close`");
+    else {
+        bad("the key legend is not on screen in full");
+        printf("      text read back:\n%s\n", text);
+        good = 0;
+    }
+    return good;
+}
+
+/* ------------------------------------------------------------------ *
  * main
  * ------------------------------------------------------------------ */
 
@@ -557,6 +823,7 @@ int main(int argc, char** argv) {
     int32_t keyRow = 0, keyWas = 0, keySelOk = 0, keyToggled = 0;
     char    keyGuid[80] = {0};
     int32_t tabbedToLists = 0, tabbedRound = 0;
+    int legendChecked = 0, legendOk = 0, costLabelOk = -1;
     int32_t filterWas = -1, filterMoved = 0;
     int32_t listRow = -1;
     char    listId[64] = {0};
@@ -600,6 +867,13 @@ int main(int argc, char** argv) {
                 if (shoot(path)) ok("wrote 01-mods.bmp");
             }
             if (f == 34) drewPixels = count_overlay_pixels();
+            /* Before the first gesture: a refusal puts its sentence in the
+             * legend's second line in place of the markers, and after that
+             * there is no marker legend on screen to check. */
+            if (f == 35 && !legendChecked) {
+                legendChecked = 1;
+                legendOk = check_legend();
+            }
 
             /* --- pick a row with the keyboard and toggle it --------------
              *
@@ -906,6 +1180,18 @@ int main(int argc, char** argv) {
              * It is still not evidence about Tarkov: a subclass cannot see
              * `GetAsyncKeyState`, DirectInput or `GetRawInputBuffer` polling.
              * See "Input" in host/Aowlspt.Overlay/README.md. */
+            /* Close and reopen, well before the end, so that the frame cost
+             * on the title bar can be read in both states. Everything the
+             * script gestures at is done by now. */
+            if (f == 180) PostMessageW(hwnd, WM_KEYDOWN, VK_INSERT, 0);
+            if (f == 184) {
+                if (aowl_ov_visible())
+                    bad("INSERT did not close the panel at frame 180");
+                PostMessageW(hwnd, WM_KEYDOWN, VK_INSERT, 0);
+            }
+            if (f == 188) costLabelOk = check_cost_label(1);
+            if (f == 250) costLabelOk = check_cost_label(0) && costLabelOk;
+
             if (f == frames - 6) PostMessageW(hwnd, WM_KEYDOWN, VK_INSERT, 0);
             if (f == frames - 2 && shotDir) {
                 _snprintf(path, sizeof(path), "%s\\11-hidden.bmp", shotDir);
@@ -953,6 +1239,17 @@ int main(int argc, char** argv) {
         else { char m[96]; _snprintf(m, sizeof(m),
                  "the panel drew %d panel-coloured pixels (expected > 400)", drewPixels);
                bad(m); }
+        if (costLabelOk == -1)
+            bad("the frame cost was never read off the title bar -- the "
+                "close-and-reopen never happened, so that check proved "
+                "nothing");
+        else if (!costLabelOk)
+            bad("the frame cost label after a reopen is wrong (reported above)");
+        if (!legendChecked)
+            bad("the legend was never read back off the screen -- the panel "
+                "was not up at frame 35, so that check proved nothing");
+        else if (!legendOk)
+            bad("the legend readback failed (reported above)");
         if (resizeOk == 1) ok("ResizeBuffers succeeded with the overlay hooked");
         else bad("ResizeBuffers failed with the overlay hooked");
         if (aowl_ov_visible() == 0) ok("the toggle key turned the panel on and off again "

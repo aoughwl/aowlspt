@@ -103,7 +103,16 @@ typedef struct AowlHook {
                                    goes                                    */
 #define AOWL_INSN_SHORT     3   /* not an instruction property: the function
                                    ends before the jump would fit           */
-#define AOWL_INSN_FAR       4   /* a RIP-relative disp32 no longer reaches   */
+
+/* There is deliberately no code here for "a RIP-relative displacement no
+ * longer reaches". That is the one refusal a decode cannot produce: whether a
+ * disp32 still fits depends on where the trampoline was allocated, which is
+ * not known until `aowl_tramp_alloc` has run and the bytes are being copied.
+ * `aowl_copy_relocated` is where it is discovered and `aowl_hook_prepare_ex`
+ * turns it straight into -8. An `AOWL_INSN_FAR` did sit here, wired into
+ * `aowl_why_to_rc` and assigned by nothing, so the only way to reach -8 was
+ * the path that never consulted it -- a refusal reason that could not be
+ * reported is one nobody can act on. */
 
 /* The result of decoding one instruction. `len` is 0 when this decoder does
  * not recognise the instruction or cannot relocate it, and `why` says which.
@@ -765,7 +774,8 @@ static int32_t aowl_why_to_rc(int32_t why) {
     switch (why) {
         case AOWL_INSN_RELATIVE: return -6;
         case AOWL_INSN_SHORT:    return -7;
-        case AOWL_INSN_FAR:      return -8;
+        /* No case for -8: see the note by the AOWL_INSN_* codes -- a decode
+         * cannot know how far away the trampoline will land. */
         default:                 return -2;
     }
 }

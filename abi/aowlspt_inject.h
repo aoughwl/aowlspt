@@ -35,6 +35,16 @@
 
 #include <windows.h>
 #include <stdint.h>
+/* `calloc`/`free` for the launch record and for the mutable command line
+ * `CreateProcess` insists on; `strlen`/`memcpy` for building it. Named here
+ * rather than relied on: on the UCRT headers `windows.h` reaches `string.h`
+ * and `stdlib.h` on its own -- `gcc -H` shows the chain -- which is why this
+ * has always compiled with neither line present. That is a property of one
+ * toolchain's headers and not of this file, and the day it stops being true
+ * the failure is `calloc` implicitly declared as returning `int`, which on a
+ * 64-bit target truncates the pointer rather than refusing to build. */
+#include <stdlib.h>
+#include <string.h>
 
 typedef struct AowlLaunch {
     uint32_t pid;

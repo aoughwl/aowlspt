@@ -207,7 +207,7 @@ below is from one run against one registry — the counts in it move whenever
  verdict loaded   decided by aowl.list.vanillaplus   your override no   running no   restart yes
  --------------------------------------------------------------------------------
  TAB view  UP/DN move  SPACE toggle  C clear  F filter [all]  A apply  R reload  INS/ESC close
- * your override   ~ asked, no answer yet   ON*/OFF* takes a restart   dim = not running
+ * your override   ~ asked, no answer yet   ! game disagrees   ON*/OFF* takes a restart   dim = not running
 ```
 
 | view | what it answers |
@@ -232,6 +232,24 @@ through the wrapper is the manager's own: a decision's `reason`, a list's
 and would have lost its second half in silence. "The panel prints what the
 manager said" is only true if the reader can tell which sentences they are
 getting all of, so the last line now ends in `..` when there is more.
+
+**The legend is the one thing that is wrapped rather than clipped.** The room a
+line has is `innerW / 8`: 115 columns on the default 940-wide panel, 87 on the
+800x520 the test host resizes to, and 57 at the 480-wide floor `aowl_ov_build`
+clamps to on a small window. The marker legend is 106 characters and the MODS
+key legend is 95, so at that floor both used to be cut in half by
+`aowl_ov_textn` — and the whole reason a legend is printed on every view is that
+the reader has not learnt the markers yet, so the half it lost was the half it
+was for. Both lines are now measured against the room and wrapped, and the
+legend takes the height it needs out of the body: two lines on a wide panel,
+exactly as before, four at the floor. It costs the list two rows there, which is
+the right way round — a row you cannot see is one scroll away, a marker you
+cannot see is not.
+
+Shortening the legend to 57 columns would have meant deleting two of the five
+markers, which is the same loss with none of the room; raising the floor to the
+≈870 the unwrapped legend needs would have made the panel wider than the window
+the floor exists to serve.
 
 ### Why the keyboard
 
@@ -481,8 +499,21 @@ On an NVIDIA RTX 2060 SUPER, against a live backend:
 ```
 
 Between 9 and 19 µs run to run on a machine that is also compiling things —
-call it 0.06 to 0.11% of a 16.7 ms frame — and **only while the panel is open**;
-closed, it is one `if` in the hook. The 4K figure is not a typo and not luck:
+call it 0.06 to 0.11% of a 16.7 ms frame — and it is the cost of the panel
+being *open*. A closed panel is not free, though it is close: the frame
+counter, the reentrancy guard and the swap-chain bind all run before the
+visible test, and only the build and the draw are behind it.
+
+Neither figure is cleared when the panel closes. That is the point rather than
+an oversight — the number worth having is the cost of the panel you had open in
+a raid, read out of the log afterwards, and zeroing on close would answer that
+question with a 0. The price is that a *reopened* panel starts out showing the
+previous opening's average, so the title bar prints it as `was 9.8 us  peak
+102.3` until this opening has put `AOWL_OV_COST_SETTLE` frames into it — about
+half a second. `peak` never comes down at all: it is the worst frame since
+`aowl_ov_start`, across every opening, which is what makes it worth reading.
+The test host closes and reopens the panel mid-run and reads that word back off
+the back buffer, in both states. The 4K figure is not a typo and not luck:
 the cost is dominated by how often the geometry is rebuilt rather than by how
 much of it there is, and 64 rows on a 4K panel scroll to about the same number
 of *visible* rows as 13 on a 1080p one.
@@ -686,6 +717,36 @@ gesture was left stranded in the worker's queue**.
 is not there, so a `--shot shots-4k` on a clean checkout used to run the whole
 script, report every check as passing, and write not one BMP — and the BMPs are
 the only evidence that the panel drew what the checks say it drew.
+
+### Reading the panel back off the back buffer
+
+The BMPs prove the panel drew. They do not prove *what* it drew, and a
+screenshot is worst at exactly the failure that matters here: a line of text two
+characters short of what it should say. So the headless run also decodes the
+back buffer back into characters, against `aowl_ov_font` — the same 8x16 table
+the overlay uploads — and checks the strings.
+
+It is exact rather than approximate. The atlas is sampled `POINT/CLAMP` at one
+texel per pixel onto integer positions and a glyph texel is opaque, so a lit
+pixel is the text colour itself and a cell's sixteen bytes either equal a
+glyph's or do not. Two things are read that way:
+
+* the legend, at `--size 520x400` — the 480 floor — where the whole 106-character
+  marker legend and the whole key legend have to come back off the screen. Built
+  against the header as it was before the wrap went in, this reads back
+  `* your override ~ asked, no answer yet ! game disag..` and fails, which is
+  what the check is for.
+* the frame cost on the title bar, after the run closes and reopens the panel:
+  `was ...` immediately after the reopen, and no `was` two hundred frames later.
+  Both halves, because a label that never came down would pass the first check
+  and be a lie for the rest of the raid.
+
+Neither is skipped quietly. At 2x or 3x scale the readback says so and passes;
+in a window too small to hold the 480x220 floor it says that instead, because a
+legend that is off the back buffer is a different fact from one clipped inside
+it. And if the panel was not up when the readback was due, that is a failure and
+not a pass — a check that passes because the thing it checks never happened is
+the failure this whole file is arranged against.
 
 With a backend, so the click is checked end to end. `--control` picks which of
 the manager's three control states the stand-in answers in:
