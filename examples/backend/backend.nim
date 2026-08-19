@@ -4,9 +4,28 @@
 ## backend mod uses: read its own config, patch the SPT database, serve a
 ## dynamic route, and reach anything the ABI does not name through `call`.
 ##
-## Build:  pwsh tools/aowlspt-build.ps1 -Mod examples/backend
-## Try it: aowlspt-sim examples/backend --side server --db examples/backend/testdb.json \
-##           --stubs examples/backend/stubs.json --route /aowlspt/backend/status
+## ## What it changes, exactly
+##
+## One item: `templates.items.5447a9cd4bdc2dbd208b4567` — the M4A1 — whose
+## `_props.Weight` it multiplies by `weightMultiplier` from `config.json`
+## (0.5 as shipped, so the rifle ends up half its weight). It touches nothing
+## else, and `dbPatch` merges, so every sibling property of that item is left
+## exactly as it was.
+##
+## **The change is to the database the server holds in memory, for the life of
+## that server process.** Nothing here rewrites SPT's JSON on disk; restart the
+## server without the mod and the item is back to what it always was. It is
+## still a live change to a running install — a raid started with this loaded
+## has a half-weight M4A1 in it — so it is `examples/` and the installer
+## deliberately does not stage it into a real game.
+##
+## Build:  aowl build-mod examples/backend
+## Try it: aowl run examples/backend
+##         (or drive the simulator directly, for the db and stub fixtures:
+##          aowlspt-sim examples/backend --side server
+##            --db examples/backend/testdb.json
+##            --stubs examples/backend/stubs.json
+##            --route /aowlspt/backend/status)
 
 import std/strutils
 import aowlspt
@@ -19,6 +38,38 @@ var
 # Config
 # ---------------------------------------------------------------------------
 
+proc parseNumber(raw: string; value: var float): bool =
+  ## A bare JSON number out of a string, or false.
+  ##
+  ## A tiny hand parse: both callers get a bare number back from the host —
+  ## a config value and a database value — and pulling in a whole JSON reader to
+  ## turn "0.5" into a float would be the tail wagging the dog. `aowlspt/json`
+  ## is there when a document has structure worth walking; see
+  ## `examples/gameserver`, which reads the same weight through it.
+  ##
+  ## Exponent notation is refused rather than half-read: nothing writes `1e-3`
+  ## into a weight, and a parser that stopped at the `e` would answer 1.0 with
+  ## every appearance of success.
+  value = 0.0
+  var seenDot = false
+  var scale = 0.1
+  var any = false
+  for ch in raw:
+    if ch >= '0' and ch <= '9':
+      any = true
+      if seenDot:
+        value = value + float(ord(ch) - ord('0')) * scale
+        scale = scale * 0.1
+      else:
+        value = value * 10.0 + float(ord(ch) - ord('0'))
+    elif ch == '.' and not seenDot:
+      seenDot = true
+    elif ch == ' ' or ch == '"':
+      discard
+    else:
+      return false
+  result = any
+
 proc readConfig() =
   ## Config is JSON on disk next to the mod. Reading a missing key is not an
   ## error worth failing the load over — the default stands and we say so once.
@@ -28,28 +79,8 @@ proc readConfig() =
     info "no weightMultiplier configured, using " & $weightMultiplier
     return
 
-  # A tiny hand parse: the value arrives as a bare JSON number, and pulling in a
-  # whole JSON reader to turn "0.5" into a float would be the tail wagging the dog.
   var value = 0.0
-  var seenDot = false
-  var scale = 0.1
-  var ok = false
-  for ch in raw:
-    if ch >= '0' and ch <= '9':
-      ok = true
-      if seenDot:
-        value = value + float(ord(ch) - ord('0')) * scale
-        scale = scale * 0.1
-      else:
-        value = value * 10.0 + float(ord(ch) - ord('0'))
-    elif ch == '.':
-      seenDot = true
-    elif ch == ' ' or ch == '"':
-      discard
-    else:
-      ok = false
-      break
-
+  let ok = parseNumber(raw, value)
   if ok and value > 0.0:
     weightMultiplier = value
     info "weightMultiplier = " & $weightMultiplier
@@ -75,7 +106,21 @@ proc applyDatabaseChanges() =
 
   info "current weight: " & current
 
-  let patchSt = dbPatch(SampleItem, """{"_props":{"Weight":0.5}}""")
+  # The multiplier is applied to the weight that is actually there, rather than
+  # a constant being written over it. That is the difference between a mod and a
+  # mod that happens to agree with the database it was written against: another
+  # mod may have already changed this weight, and a mod that writes `0.5`
+  # regardless has silently undone it. It also means the config value does
+  # something — a `weightMultiplier` that is read at load and then ignored is a
+  # setting whose name is a lie.
+  var before = 0.0
+  if not parseNumber(current, before):
+    warn "the weight at " & SampleItem & " is not a number (" & current &
+         "), so there is nothing to scale"
+    return
+
+  let wanted = before * weightMultiplier
+  let patchSt = dbPatch(SampleItem, """{"_props":{"Weight":""" & $wanted & "}}")
   if patchSt != Ok:
     warn "weight patch failed: " & lastError()
     return
@@ -83,12 +128,33 @@ proc applyDatabaseChanges() =
   inc itemsPatched
 
   # Read it back. "dbPatch returned Ok" only says the call succeeded; reading
-  # the value again is what proves the live object graph actually changed.
+  # the value again is what proves the live object graph actually changed. And
+  # the value is checked rather than printed: a patch that landed somewhere else
+  # in the document, or not at all, still answers a weight here.
   var after = ""
-  if dbGet(SampleItem & "._props.Weight", after) == Ok:
-    success "weight " & current & " -> " & after
+  if dbGet(SampleItem & "._props.Weight", after) != Ok:
+    warn "the weight could not be read back after patching: " & lastError()
+    return
+  # Compared with a tolerance, and not because floating point is vague. The
+  # value went out as decimal digits and comes back as decimal digits, and
+  # rebuilding 1.75 by adding 1 + 7/10 + 5/100 does not land on the same double
+  # that 3.5 * 0.5 produced. An exact test here fails on a patch that worked
+  # perfectly, which is a check that cries wolf at exactly the moment somebody
+  # is deciding whether to trust it.
+  var got = 0.0
+  var diff = 0.0
+  if parseNumber(after, got):
+    diff = got - wanted
+    if diff < 0.0:
+      diff = -diff
   else:
-    success "patched weight of " & SampleItem
+    diff = 1.0e9
+  if diff <= 0.0001 + wanted * 0.0001:
+    success "weight " & current & " -> " & after & " (x" &
+            $weightMultiplier & ")"
+  else:
+    warn "the weight reads " & after & " after patching it to " & $wanted &
+         ", so the patch did not land where it was aimed"
 
 # ---------------------------------------------------------------------------
 # Lifecycle

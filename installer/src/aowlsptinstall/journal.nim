@@ -19,6 +19,12 @@ type
     source*: string
     payload*: string
     tarkovVersion*: string
+    ## What `payload.json` called itself: the aowlspt release this install was
+    ## made from. Recorded because nothing else in a finished install says --
+    ## the binaries carry no version resource and the payload directory it came
+    ## from may be long gone -- and "which build is this" is the first question
+    ## asked about an install that misbehaves.
+    payloadVersion*: string
     installedAt*: string
     ## "full" when the target directory is entirely this installer's -- it
     ## holds a client that was mirrored from the source. "overlay" when the
@@ -33,10 +39,11 @@ type
 proc journalPath*(target: string): string =
   result = joinPath(target, JournalName)
 
-proc newJournal*(target, source, payload, tarkovVersion, stamp,
+proc newJournal*(target, source, payload, tarkovVersion, payloadVersion, stamp,
                  mode: string): Journal =
   result = Journal(path: journalPath(target), source: source, payload: payload,
-                   tarkovVersion: tarkovVersion, installedAt: stamp,
+                   tarkovVersion: tarkovVersion,
+                   payloadVersion: payloadVersion, installedAt: stamp,
                    mode: mode, paths: @[])
 
 proc render*(j: Journal): string =
@@ -46,6 +53,8 @@ proc render*(j: Journal): string =
   result.add "source " & j.source & "\n"
   result.add "payload " & j.payload & "\n"
   result.add "tarkov " & j.tarkovVersion & "\n"
+  if j.payloadVersion.len > 0:
+    result.add "aowlspt " & j.payloadVersion & "\n"
   result.add "mode " & j.mode & "\n"
   if j.installedAt.len > 0:
     result.add "installed " & j.installedAt & "\n"
@@ -58,7 +67,8 @@ proc save*(j: Journal): FsResult =
 
 proc load*(target: string): Journal =
   result = Journal(path: journalPath(target), source: "", payload: "",
-                   tarkovVersion: "", installedAt: "", mode: "", paths: @[])
+                   tarkovVersion: "", payloadVersion: "", installedAt: "",
+                   mode: "", paths: @[])
   var text = ""
   if not readTextFile(result.path, text):
     return
@@ -77,6 +87,8 @@ proc load*(target: string): Journal =
       result.payload = value
     elif key == "tarkov":
       result.tarkovVersion = value
+    elif key == "aowlspt":
+      result.payloadVersion = value
     elif key == "installed":
       result.installedAt = value
     elif key == "mode":

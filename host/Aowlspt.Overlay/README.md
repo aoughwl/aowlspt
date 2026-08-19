@@ -1,7 +1,18 @@
 # The in-game overlay
 
-An interactive mod panel drawn inside `EscapeFromTarkov.exe`: press a key, see
-what is loaded, click a row to enable or disable it.
+An interactive mod manager drawn inside `EscapeFromTarkov.exe`: press `INSERT`
+and get every mod in the registry with the manager's own verdict and reason, the
+named lists and what switching to one would mean, the conflicts and unmet
+requirements before you apply rather than after, and the per-mod outcome of the
+last thing you changed. Driven from the keyboard, because in a raid the mouse
+belongs to the game.
+
+**Nothing in it has ever been drawn into BSG's client.** Everything below is
+verified against `tests/overlayhost/overlayhost.exe` — a D3D11 application that
+stands in for Tarkov — and against a real `aowlspt-backend` running the real
+`mods/manager`. That is a strong test of everything except the one thing that
+matters most, which is whether Tarkov's own render and input paths behave the
+way this assumes. See "limits" and the report.
 
 Pre-1.0 this would have been forty lines of `OnGUI`. Post-1.0 is IL2CPP, so
 there is no `MonoBehaviour` to attach and no managed UI to call into — the
@@ -61,9 +72,18 @@ pipeline state to set and restore.
 The font is 8x16 Consolas, rasterised at build time by `fontgen.c` into a 1-bit
 table, and the shaders are DXBC bytecode compiled at build time by
 `shadergen.c`. Neither reads a file, wakes GDI, or loads `d3dcompiler` inside
-the game process. Regenerate both with `.\build.ps1 -Regen` and paste the
-results back into the header; they are checked in so a machine with a different
-Consolas cannot silently change the font.
+the game process.
+
+Regenerating them is deliberately *not* part of `aowl build`: the output is
+checked in, so a machine with a different Consolas cannot silently change the
+font. When the font or the shaders really do need to change, run the two
+generators by hand from `tests/overlayhost` and paste the results back into
+`abi/aowlspt_overlay.h`:
+
+```
+gcc -O2 fontgen.c   -o fontgen.exe   -lgdi32        && ./fontgen.exe   > font.inc
+gcc -O2 shadergen.c -o shadergen.exe -ld3dcompiler  && ./shadergen.exe > shaders.inc
+```
 
 ### Render state
 
@@ -105,91 +125,473 @@ The overlay draws its own cursor rather than calling `ShowCursor`: the game
 keeps its own show-count in a raid and fighting it leaves the cursor stuck after
 the panel closes.
 
-**Limits.** A wndproc subclass cannot intercept `GetAsyncKeyState`, DirectInput,
-or `GetRawInputBuffer` polling. If Tarkov reads any input that way, that input
-still reaches the game while the panel is open. This is unverified against the
-real client — see "risks" in the report.
+### What is actually established about input, and what is not
+
+Stated plainly, because this is the half of the overlay with the least evidence
+behind it and the most ways to be wrong.
+
+**Established.** A wndproc subclass is a mechanism that exists on a post-1.0
+IL2CPP client: `SetWindowLongPtrW` is a `user32` call on an `HWND`, it has
+nothing to do with Mono, managed assemblies, BepInEx or Harmony, and the swap
+chain hands us the `HWND` on the first frame. Keys, clicks, the wheel and raw
+mouse deltas all arrive at the subclass and are acted on, and every key is
+swallowed rather than passed down while the panel is open. `overlayhost.exe`
+drives the entire scripted session — open, walk, `SPACE`, `TAB`, `ENTER`, `F`,
+`C`, a click, a wheel notch, close — through the procedure the overlay
+installed.
+
+One step of that is deliberately **posted** rather than sent: the close at
+`frames - 6` goes through `PostMessageW`, so it sits in the thread's message
+queue and reaches the subclass only because `DispatchMessageW` routes it through
+whatever is in `GWLP_WNDPROC`. `SendMessageW` calls the procedure directly and
+proves only that the body works; the posted key is what shows the subclass is on
+the path a real keystroke takes.
+
+**Not established, and not inventable from here.**
+
+- **Nothing has been driven into BSG's client.** Every claim above is against a
+  D3D11 test application. It is a strong test of the mechanism and no test at
+  all of Tarkov's own input arrangement.
+- **A subclass cannot intercept `GetAsyncKeyState`, DirectInput, or
+  `GetRawInputBuffer` polling.** These read device state directly and never
+  touch a window procedure. Anything Tarkov reads that way still reaches the
+  game while the panel is open — so a `W` pressed to scroll a list could also
+  walk the player forward.
+- **There is no hook for that today, and one is not being pretended into
+  existence.** Covering it means detouring `user32!GetAsyncKeyState` (and
+  friends) with `abi/aowlspt_detour.h`, which the repo does have. It is not done
+  here because a detour that lies to the *whole process* about the keyboard is a
+  much larger claim than a subclass, it would have to be right about which keys
+  and for exactly how long, and there is no way to find out whether it is needed
+  without a run against the real client. Doing it blind would be adding a
+  failure mode to guard against a problem nobody has observed.
+
+**What the design does about it instead**, without assuming the answer:
+
+- **The panel is not the only way out.** `INSERT` is handled *outside* the
+  `visible` check, so the toggle works on the same message path whether the
+  panel is open or shut, and `ESC` closes as well. Neither depends on anything
+  the panel is drawing.
+- **The mouse is a real second interface, not decoration.** Rows, row buttons
+  and tabs are all clickable, and raw mouse deltas are integrated into the
+  overlay's own cursor precisely because the game locks the system one in a
+  raid. If keyboard interception turns out to leak, the mouse path does not
+  share the failure.
+- **Nothing destructive is one keypress away.** The gesture that mattered —
+  switching off the mod serving the panel — is refused locally, and every other
+  change is a request the manager answers and the panel reports rather than
+  assumes.
+
+If a run against the real client shows keys leaking through, the fix is a
+`GetAsyncKeyState` detour gated on `aowl_ov_visible()`, and it belongs in this
+header. Until then this section says what it knows.
+
+## The panel
+
+Four views over one registry, and the interface is the keyboard. The capture
+below is from one run against one registry — the counts in it move whenever
+`registry/mods.json` does, so read the shape rather than the numbers.
+
+```
+ aowlspt :: mod manager                     50.1 us  peak 127.9  backend :7336  0ms
+ [MODS 13] LISTS 4  ISSUES 0  APPLY 2
+ 2 of 9 registry mods resolve on the server side | control present | lists aowl.list.vanillaplus
+    mod                        version  verdict       decided by
+    Mod Manager                1.0.0    loaded        aowl.list.core          [KEEP]
+  * Tarkov Emulator            0.1.0    loaded        override                [ ON ]
+    Classic Movement           1.3.0    loaded        aowl.list.vanillaplus   [ ON *]
+    FOV Fix                    4.1.0    wrong-side    -                       [ OFF]
+ --------------------------------------------------------------------------------
+ aowl.classicmovement  1.3.0
+ enabled by aowl.list.vanillaplus
+ verdict loaded   decided by aowl.list.vanillaplus   your override no   running no   restart yes
+ --------------------------------------------------------------------------------
+ TAB view  UP/DN move  SPACE toggle  C clear  F filter [all]  A apply  R reload  INS/ESC close
+ * your override   ~ asked, no answer yet   ON*/OFF* takes a restart   dim = not running
+```
+
+| view | what it answers |
+|---|---|
+| **MODS** | every mod, its verdict, and the manager's own sentence saying why. The detail pane under the list is `reason`, `from` and `explicit`, verbatim |
+| **LISTS** | the named lists, which are active, what each one contains, and what its `inherits` chain is. `ENTER` makes one active |
+| **ISSUES** | conflicts, unmet requirements, cycles, pipeline exclusions and registry faults — *before* you apply |
+| **APPLY** | the outcome of the last change, per mod: `applied` / `requested` / `deferred` / `refused`, with the host's own message |
+
+**Nothing on any of them is composed here.** `verdict`, `reason`, `from`,
+`explicit`, `control`, `inEffect`, `outcome`, `message` and the manager's
+`summary` are printed as the manager wrote them. `mgr/resolve.nim` already
+worked out why a mod is or is not loading, in one place, against the rules in
+`registry/README.md`; a second opinion formed in C, one poll behind, could only
+ever disagree with the real one.
+
+**And when one of them does not fit, it says so.** A single-line field that runs
+past its column has always ended in `..`; a *wrapped* paragraph did not — it
+stopped at `maxLines` and read as a complete sentence. Every string that goes
+through the wrapper is the manager's own: a decision's `reason`, a list's
+`description`, and `managerContradiction()`, which is three hundred characters
+and would have lost its second half in silence. "The panel prints what the
+manager said" is only true if the reader can tell which sentences they are
+getting all of, so the last line now ends in `..` when there is more.
+
+### Why the keyboard
+
+Tarkov captures the cursor and reads the mouse through raw input. The overlay
+does integrate raw deltas into a cursor of its own — that is what the `WM_INPUT`
+case is for — and the mouse works: rows, row buttons and tabs are all clickable.
+But the gesture a player can actually perform mid-raid is a keypress, so every
+action has a key, and **the keys are printed on screen on every view**. A
+keyboard interface whose keys are not visible is a keyboard interface nobody can
+use.
+
+| key | what it does |
+|---|---|
+| `INSERT` | open / close. `ESC` closes |
+| `TAB`, `LEFT`/`RIGHT`, `1`–`4` | change view |
+| `UP`/`DOWN` (or `W`/`S`), `PGUP`/`PGDN`, `HOME`/`END`, wheel | move the cursor |
+| `SPACE` / `ENTER` | toggle the selected mod, or activate the selected list |
+| `C` | clear your override on this row and let the lists decide again |
+| `F` | cycle the mods filter: all → loading → not loading → yours |
+| `A` | apply the current selection, and jump to APPLY to read what happened |
+| `R` | re-read `registry/mods.json` from disk |
+
+Keys are recorded on the *window* thread into a lock-free ring and acted on by
+the *render* thread once a frame. Not acted on in the wndproc, and not for
+tidiness: the UI state a keypress changes is read by the render thread every
+frame, so doing the work there would mean either a lock the window procedure can
+block on — a window that stops pumping while the GPU is busy is a window Windows
+shows the player as "not responding" — or a cursor that moves halfway through a
+frame's layout.
+
+Every key is swallowed while the panel is open, so `WASD` does not walk the
+player into a wall behind a menu.
+
+### The override, and clearing it
+
+A row marked `*` is one **you** decided rather than a list — `explicit` on the
+manager's decision. That is the difference between "Raid Night turns SAIN on"
+and "you turned SAIN on", and it survives switching lists, which is why it needs
+to be visible and undoable. `C` sends `/aowlspt/mods/clear/<id>` and the row
+goes back to whatever the active lists say, with the manager's new `reason` and
+`from` in the detail pane a moment later.
+
+### The row with no button
+
+A row the manager marks `protected` draws `KEEP` instead of `ON`/`OFF`, and
+`SPACE` on it is refused locally with a sentence rather than sent.
+
+This is not caution, it is a fixed failure. `mods/manager` serves every route
+this panel speaks, and `POST /aowlspt/mods/toggle/aowl.manager {"enabled":false}`
+used to be a request it honoured: it dropped itself from the selection,
+re-resolved, and — on a host with live control, which `aowlspt-backend` has —
+unloaded itself. Its routes went with it, the next poll got `no route`, and
+nothing left in the running game could put it back; the selection on disk now
+said it was off, so a restart did not help either. That is exactly what happened
+the first time the test host walked to row zero and pressed `SPACE`, and
+`tests/overlayhost/ovstage` had to be re-staged by hand.
+
+`mods/manager` now enforces the rule at all three doors — `routeDisable`,
+`routeToggle` (only when the requested state is *off*), and `applySelection`,
+which skips `requestUnload` for a protected mod even when the selection store
+was hand-edited or a registry's lists simply stopped naming it — and answers
+`"protected": true|false` on every panel row.
+
+So this file does not know the manager's name. It reads the flag, draws `KEEP`
+from it, and refuses the gesture locally so that a protected row does not cost a
+round trip to be told no. The earlier version compared against a literal
+`"aowl.manager"` and was marked in the header as a stopgap for the reason it has
+stopped being one: a header that hardcodes the manager's name is a header that
+has to be edited when the manager is renamed, and it could only ever protect the
+one mod somebody thought of. When the rule grows to cover a second mod, nothing
+here changes.
+
+Two details the flag is read with care for:
+
+- **Only in the direction that is refused.** The manager takes
+  `{"enabled":true}` on a protected mod like any other row, so a protected mod
+  that is somehow off must still be switchable back on — the button comes back
+  when the row is off.
+- **A reply that omits `protected` leaves the flag alone**, rather than
+  defaulting to false. An older manager on the other end must not silently grow
+  a button that ends the session it is drawn in.
+- **The row is still selectable.** It has no button; it is not inert. Clicking
+  it moves the cursor to it so the detail pane below explains it, the same as
+  any other row. The draw loop used to `continue` out of the protected branch
+  before the row-select hit test, so the protected row was the one row the mouse
+  could not reach — and with the shipped registry `aowl.manager` is row zero,
+  which made that the first row anybody clicks. Refusing the *toggle* is the
+  rule; refusing to explain the row was a bug.
+
+**All of it is now checked, and it was not before.** The `protected` chain runs
+manager → capture → stand-in → panel, and the middle two links were broken:
+`panel.golden.json` was taken before `mods/manager` grew the flag, so it carried
+no `protected` key on any row and did not include the manager's own row at all,
+and `fakebackend.py`'s hand-written rows never had one either. With no protected
+row anywhere in any fixture, the test host printed *"nothing protected was on
+screen, so the refusal path was not exercised"* and passed. So:
+
+- `realbackend.py` checks `protected` is a bool on every row, that at least one
+  row has it and not every row does, that the manager **refuses**
+  `{"enabled":false}` on it with a printable sentence and leaves the row on, and
+  that `{"enabled":true}` is still accepted — then clears the override it just
+  set, so the capture is not a fixture that disagrees with a fresh install.
+- `fakebackend.py`'s hand-written rows carry a protected `aowl.manager`, and its
+  toggle refuses the *off* direction the way `routeToggle` does. A stand-in that
+  honoured it would let a regression in the panel pass silently: the POST would
+  go out, the row would flip, and nothing in the run would notice.
+- `overlayhost.exe` turns the note into a **failure** when a backend answered
+  and no row came back protected, and adds the two mouse gestures: a click where
+  the button would be does nothing, and a click on the row still selects it.
+
+## The scale
+
+The panel is laid out in *panel units* and drawn at an integer factor — 1 below
+about 1,300 lines of back buffer, 2 above, 3 above 2,500.
+
+An 8x16 bitmap font on a 3,840x2,160 back buffer is a 940-pixel panel of
+two-millimetre text in the corner of a 32-inch monitor: legible in a screenshot,
+useless in a raid. The factor is integer because the atlas is sampled
+`POINT/CLAMP`, so every texel becomes an NxN block of identical pixels and the
+glyphs stay exactly as crisp as they are at 1x; a fractional scale would need a
+filter and would turn 8x16 Consolas into grey mush.
+
+It is applied in one place — `aowl_ov_vert`, the single function every position
+in the file flows through — so every layout constant, column offset and hit test
+above it stays in panel units. The cursor comes *down* by the factor for hit
+testing rather than the rectangles going up: one divide instead of four
+multiplies, and no rounding for the two to disagree about.
+
+Verified at 3840x2160 with a full 64-mod table (`--size 3840x2160 --fill 55`):
+18 rows on screen, 9,840 of 24,576 vertices, nothing dropped, and a frame cost
+inside the 9–19 µs band the run-to-run figures below sit in. Read the frame
+cost off "What a frame costs" below rather than off this line — a single number
+here would read as a constant, and it is a measurement on a busy machine.
 
 ## The backend
 
-The schema is no longer provisional. `mods/manager` is the thing on the other
-end, and it serves two routes written for this panel specifically:
+`mods/manager` is the thing on the other end. The panel reads **four** of its
+routes on a timer and drives **five** more on a keypress, because a mod manager
+needs four different answers and the manager already serves each of them. Only
+one of the five is a `POST` — the toggle, which carries a body; the rest say all
+they need to in the path:
+
+| route | how often | what the panel takes from it |
+|---|---|---|
+| `GET /aowlspt/mods/panel` | 1 s | the rows: `guid`, `name`, `version`, `enabled`, `live`, `restart`, `verdict`, `reason`, plus `control`, `liveKnown`, `summary`, `side` |
+| `GET /aowlspt/mods/list` | 1 s | `from` and `explicit` per row, and `order` — which list decided this, and was it you |
+| `GET /aowlspt/mods/lists` | 3 s | the named lists, `active`, and each list's `inherits` and `entries` |
+| `GET /aowlspt/mods/conflicts` | 3 s | `excluded` (id, verdict, reason) and `problems` |
+| `POST /aowlspt/mods/toggle/<id>` | on `SPACE` | `{"enabled":…}`; reply carries `row`, `control` and a whole `apply` |
+| `GET /aowlspt/mods/clear/<id>` | on `C` | reply carries `decision`, `control` and `inEffect` |
+| `GET /aowlspt/mods/select/<list>` | on `ENTER` | make one list the active list |
+| `GET /aowlspt/mods/apply` | on `A` | `requested`, `deferred`, `restartRequired`, `note`, `results[]` |
+| `GET /aowlspt/mods/reload` | on `R` | re-read the registry from disk |
+
+The two slow routes are also fetched immediately after any command, because a
+command is exactly the thing that changes them. A route that fails leaves its
+own table alone — that is not politeness, it is that a panel which empties
+itself when one GET times out is a panel telling the player their mods vanished.
+
+`control`, `deferred` and `inEffect` come back on the change replies, and all
+three are shown: `control` on the status line and on APPLY, `deferred` and
+`restartRequired` as their own numbers, `inEffect` and the manager's `note`
+printed verbatim. **The panel never says a change took effect.** It says what
+the manager said.
+
+### The JSON reader is now a structural one
+
+The old reader searched the whole body for `"key"` at any depth and treated
+every `{`…`}` pair as a row. That worked exactly as long as every reply was one
+flat array of flat objects, and it is not sound on the routes above:
+
+- `/lists` nests an `entries` array inside each list, so a brace-pair scan reads
+  an *entry* as a *list*;
+- `/apply` nests `results` inside the wrapper, and `/toggle` nests both `row`
+  and `apply`;
+- `apply.results[].message` carries a Windows path, so the body contains `\\`
+  and `\"` escapes that a scanner which does not understand strings walks
+  straight through.
+
+So there are now four primitives — skip a value, find a member of *this* object,
+start an array, step an array — each bounded by `end` on every read, and
+everything else is written in terms of them. It is still not a JSON parser: it
+builds no tree, allocates nothing, and renders anything outside ASCII 32..126 as
+`?` because that is what the font atlas has. `tests/overlayhost/jsontest.exe`
+covers it directly, on bodies captured from the real manager.
+
+One rule is new and load-bearing: **a body is checked for balance before any of
+it is believed.** `aowl_ov_http` truncates at its buffer, and a truncated object
+parses perfectly well as a shorter one — `{"mods":[{"guid":"aowl.sa` is a row
+for a mod called `aowl.sa`, which would appear on the panel and be togglable. A
+short body is now dropped whole, which also means a cut-off `/lists` no longer
+blanks the LISTS view for one poll.
+
+### When the backend is not there
+
+The panel is usable with the backend down, absent, or slow, and none of it can
+block a frame: the render thread never touches a socket, never waits on the
+worker, and draws from a snapshot it copies only when the worker says something
+moved.
+
+The title bar says which of four states it is in — `no backend (read-only)`,
+`not answering`, `stale 11s` with the age, or `backend :7336 0ms` with the last
+request's round trip — and every view stays navigable on whatever was last
+heard, plus whatever the client host pushed in through `overlaySetMod`.
+
+Two things had to change to make that true, and both were found by pointing the
+test host at a closed port:
+
+- **WinHTTP costs two seconds against a dead port**, measured, and no knob
+  reaches it: not `WinHttpSetTimeouts(300, 500, 500, 1200)`, not
+  `WINHTTP_OPTION_CONNECT_RETRIES` at 1, not `WINHTTP_OPTION_CONNECT_TIMEOUT` at
+  400 or 100. So the worker never lets a gesture queue behind one. While nothing
+  is answering it polls only `/panel`, on a backoff that doubles to four
+  seconds, and a keypress made in that state is **refused on the spot** with the
+  reason, rather than sent. Before that change, three keypresses were still
+  sitting in the queue five seconds after they were made — with the panel
+  drawing happily at full rate and saying nothing about it.
+- **The WinHTTP session is opened once and kept.** It used to be opened and
+  closed per request, and `WinHttpOpen` with `WINHTTP_ACCESS_TYPE_DEFAULT_PROXY`
+  runs proxy detection each time. It is `WINHTTP_ACCESS_TYPE_NO_PROXY` now,
+  which is also simply correct: the far end is `127.0.0.1`, which no proxy has
+  ever been the route to.
+
+### What a frame costs
+
+Measured with QPC around the build-and-draw inside the `Present` hook, with the
+first eight drawn frames dropped — the vertex buffer's first `Map` allocates,
+the font texture is cold, and on a WARP device the first draw compiles, so
+counting them reports start-up rather than the overlay. Shown on the title bar,
+and available to the host as `overlayFrameNs()` / `overlayFrameNsMax()`.
+
+`tests/overlayhost/overlayhost.exe` prints it on every run, with the device it
+measured on beside it, so a change that makes it ten times worse shows up in the
+diff of a build log. It is reported rather than asserted against a threshold:
+what a threshold would catch is the machine being busy, which is not a bug in
+the overlay.
+
+On an NVIDIA RTX 2060 SUPER, against a live backend:
 
 ```
-GET  /aowlspt/mods/panel        the rows
-POST /aowlspt/mods/toggle/<id>  {"enabled":true|false}
+960x600, 13 rows       9233 ns average (2418 laying out geometry, 6815 of D3D11)
+                       geometry rebuilt on 33 of 274 drawn frames (12%)
+                       7038 of 24576 vertices
+
+3840x2160, 64 rows     8899 ns average (2499 laying out geometry, 6400 of D3D11)
+                       9840 of 24576 vertices, none dropped
 ```
 
-```json
-{"ok":true,"schema":"aowlspt.panel/1","side":"server","control":"absent",
- "liveKnown":false,"summary":"1 of 8 registry mods resolve on the server side",
- "mods":[
-   {"guid":"aowl.sain","id":"aowl.sain","name":"SAIN","version":"0.1.0",
-    "enabled":true,"live":null,"restart":false,
-    "verdict":"loaded","reason":"enabled by aowl.list.core"}]}
-```
+Between 9 and 19 µs run to run on a machine that is also compiling things —
+call it 0.06 to 0.11% of a 16.7 ms frame — and **only while the panel is open**;
+closed, it is one `if` in the hook. The 4K figure is not a typo and not luck:
+the cost is dominated by how often the geometry is rebuilt rather than by how
+much of it there is, and 64 rows on a 4K panel scroll to about the same number
+of *visible* rows as 13 on a 1080p one.
 
-| field | what the panel does with it |
-|---|---|
-| `guid` / `id` | the same string, by rule (`registry/README.md`); the row key |
-| `name`, `version` | the row's text |
-| `enabled` | what the manager's selection **resolves to** — the button's state |
-| `live` | what the host says is **running**. `null` means nobody knows, and the panel leaves the row's own value alone |
-| `restart` | this mod, on this change, only takes effect on a restart — the `*` |
-| `verdict`, `reason` | not drawn yet; there for a row that wants to say why |
+#### The geometry cache
 
-`mods` is the last key and has to stay there: the reader skips to it and then
-takes every `{`…`}` after it as a row, so a wrapper field placed after the array
-would be read as part of the last row.
+It was 61 µs before, and two thirds of that was the CPU laying seven thousand
+vertices out one glyph at a time. It was doing that on every frame, and on all
+but a handful writing exactly what was already there: a mod panel changes when a
+key is pressed, when the mouse moves, or when a poll lands, which is a few
+frames a second out of several hundred.
 
-### Why the manager grew a route rather than the C growing a parser
+So everything that can change what is drawn goes into one 32-bit signature —
+`dataSerial`, the view, the filter, the cursor and scroll offsets, the mouse, the
+back buffer size and scale, the reachability lights. When it matches the last
+built frame's and no input is waiting, `aowl_ov_build` returns having done
+nothing and `aowl_ov_draw` skips both `Map`s: a DYNAMIC buffer keeps its
+contents unless something discards them, and nothing else in the process has a
+handle to ours. The measured effect is 61 µs → 9 µs, with the geometry rebuilt
+on 12% of frames.
+
+Two things have to be right, and both are easy to get wrong:
+
+- **Input is checked before the signature.** `aowl_ov_keys` runs *inside* the
+  build, so a frame that skipped the build would swallow a keypress rather than
+  defer it. A pending key, click or wheel notch forces a rebuild.
+- **Displayed numbers that tick on their own are held still.** The frame cost on
+  the title bar changes every frame by construction; left in the signature it
+  would invalidate the cache on every frame and the cache would cost more than
+  it saved. It, the last request's round trip and the `stale 11s` age are
+  refreshed twice a second, which is as often as anybody can read them.
+
+The remaining `D3D11` third is the `Draw` and the fifty-odd `*Get*`/`*Set*`
+calls that save and restore the game's pipeline state. That is the price of
+drawing inside somebody else's `Present` and it does not get smaller by drawing
+less. The worst-frame figure swings between 150 µs and 5 ms run to run and is
+dominated by whatever else the machine is doing; `--shot` runs inflate it
+further, because a staging-texture readback after `Present` stalls the next
+frame's `Map`.
+
+
+### Why the manager did not have to grow four more routes
 
 The rule this directory was written under is in `abi/aowlspt_overlay.h`: if the
 schema settles into something the small reader cannot handle, parse it in nimony
-with `aowl/src/aowlspt/json.nim` and push rows in through `overlaySetMod`. It
-was weighed and not taken, for a reason that is about *where the code would
-have to live* rather than about JSON. That parser would run in the **client**
-host, which has no HTTP client and no poll loop of its own — so it would mean a
-second worker thread in nimony beside the one already here, `aowlspt_net` pulled
-into a DLL injected mid-startup, and every line of it in
+with `aowl/src/aowlspt/json.nim` and push rows in through `overlaySetMod`. That
+was weighed again for this work and still not taken, for a reason that is about
+*where the code would have to live* rather than about JSON. That parser would
+run in the **client** host, which has no HTTP client and no poll loop of its own
+— so it would mean a second worker thread in nimony beside the one already here,
+`aowlspt_net` pulled into a DLL injected mid-startup, and every line of it in
 `host/Aowlspt.Host.Il2Cpp`, which this work does not own.
 
-The manager's own routes were also the wrong shape for a panel and right for a
-script: `/aowlspt/mods/list` nests a decision object per mod, carries no version
-on the row, and would need a second request to `/describe/<id>` per row to get
-one. So the manager — which this work does own — grew one flattened view. The
-cost was one route there and eight lines here.
+What changed is the other half of that trade. `/aowlspt/mods/panel` exists
+because the reader could not walk `/list`'s shape — and now it can. `/list`,
+`/lists`, `/conflicts` and every change reply are read as they already are, with
+no change to `mods/manager` at all. The panel route stays, because it is the one
+place `version`, `live` and `restart` appear on a row together, and reading two
+routes and merging by guid is a GET against a loopback socket on a worker
+thread.
+
+That is the shape worth keeping: **the manager was not asked for a wider view of
+anything.** The one thing it is asked for is below, and it is a safety property,
+not a schema.
 
 ### What a toggle does now, end to end
 
-1. The click flips the row locally and marks it `pending` (`~`), so the button
-   answers immediately, and queues a command for the worker thread.
+1. `SPACE` (or a click on the row button) flips the row locally and marks it
+   `pending` (`~`), so the panel answers immediately, and queues a command for
+   the worker thread.
 2. The worker POSTs `/aowlspt/mods/toggle/<guid>` with `{"enabled":…}`.
 3. The manager sets your override, re-resolves the registry, and calls its own
    `/apply` path: for every mod in the resolved set a `load`, for every mod it
    knows and no longer wants an `unload`, each through `mgr/control.nim`.
 4. `control.nim` emits `aowlspt.host.mods.load` / `.unload` to the host and gets
    back a per-mod `requested` → `applied` | `deferred` | `refused`.
-5. The next poll (forced immediately after the POST) brings the answer back as
-   `live` and `restart` on that row.
+5. The reply carries all of it: the new `row`, the `control` state, and the
+   whole `apply` object. The row updates on the spot and the per-mod outcomes
+   land on the APPLY view, each with the host's own message. The next poll —
+   forced immediately after the POST — confirms it.
 
-Which is why the `*` is no longer a constant. It used to mean "a native mod
-cannot be unloaded from under a running raid, so this is for next launch" — a
-true statement about the whole panel, printed on every row that was ever
-clicked. It now means *the manager asked about this mod and this was the
-answer*: a mod the host really did unload live comes back `live:false,
-restart:false` and greys out instead.
+Which is why the `*` is not a constant. It used to mean "a native mod cannot be
+unloaded from under a running raid, so this is for next launch" — a true
+statement about the whole panel, printed on every row that was ever clicked. It
+now means *the manager asked about this mod and this was the answer*: a mod the
+host really did unload live comes back `live:false, restart:false` and greys out
+instead.
 
-**No host answers those events yet**, so today every answer is `deferred` and
-every clicked row stars. That is a fact about the tree, not about this design —
-see below.
+**Both sides are real now, by different routes.** On the server,
+`aowlspt-backend` answers the control protocol, so a run against it comes back
+`control=present`, `liveKnown=1`, and outcomes of `applied` and `requested`
+rather than `deferred`. Inside the game, the client host polls
+`/aowlspt/mods/client/<hostversion>` through this header's own sync feed and
+loads or unloads client-side mods to match what the manager decided.
+
+What has *not* been built is the client telling the manager what happened, so
+`control` and `live` on this panel are the **server's** answer about
+**server-side** mods, and a client-side row's restart marker can be wrong. See
+"the client side never reports its outcome back" below; the panel keeps the two
+apart rather than blurring them.
 
 With no backend — port 0, or nothing listening — the panel is read-only and
 lists what the host pushed in through `overlaySetMod`, which is what is actually
 running in this process and the one source that cannot be stale. Those rows are
 marked `hostPushed` and the backend can never lower their `loaded`: the manager
 runs on the *server* side and has never heard of a client-only mod, so its
-`live:false` is not evidence about one.
+`live:false` is not evidence about one. A guid can be both — a registry mod that
+the client host also loaded — and the panel merges the two rather than choosing.
+
 
 ## Using it from the client host
 
@@ -215,12 +617,91 @@ game hanging on a black screen at startup, not as an error.
 
 ## Testing without the game
 
+`aowl build` builds all four test binaries beside their sources in
+`tests/overlayhost` — `buildOverlayTests` in `tools/aowl.nim` — and runs
+`jsontest.exe` as it goes. There is no script here any more; the repo has one
+toolchain.
+
 ```
-.\build.ps1              # build + headless run, screenshots into tests\overlayhost\shots
-.\build.ps1 -Backend     # also run the stand-in backend and check the POST arrives
-.\build.ps1 -Real        # first drive the real backend with the real manager
-.\build.ps1 -Control present   # which control state the stand-in answers in
-.\build.ps1 -Interactive # a visible window; INSERT toggles, ESC closes
+installer\build\aowl.exe build   # overlayhost, jsontest, linkprobe, overlaynimtest
+```
+
+Then run them from `tests/overlayhost`:
+
+```
+overlayhost.exe --headless --shot shots   # the headless run; BMPs into shots/
+overlayhost.exe                           # a visible window; INSERT opens it
+overlaynimtest.exe                        # the nimony boundary
+jsontest.exe                              # the JSON reader, on real manager bodies
+```
+
+Four configurations, and all four are checks rather than demonstrations:
+
+```
+overlayhost.exe --headless --port 7370                       a live backend
+overlayhost.exe --headless --size 3840x2160 --fill 55 ...    4K, a full table
+overlayhost.exe --headless                                   no backend at all
+overlayhost.exe --headless --port 7399                       a port with nothing on it
+```
+
+`--fill N` pushes N synthetic rows with names as long as the fields allow, up to
+the table's 64; `--size WxH` opens the window at a real resolution. Together
+they are the case nobody had tried — 64 mods on a 4K panel — and what they prove
+is that the fixed vertex buffer has room: 9,840 of 24,576, nothing dropped. The
+two failure configurations are not skipped-and-assumed: with no port the panel
+must *refuse* a keypress rather than flip a row nothing can confirm, and with a
+dead port it must leave nothing stranded in the worker's queue. Both are
+asserted.
+
+`jsontest.exe` needs no graphics library at all, so building it doubles as a
+second check that this header adds no link-time dependency. By hand it is one
+line:
+
+```
+gcc -O1 -Wno-unused-function -I../../abi jsontest.c -o jsontest.exe
+```
+
+It is worth having. `overlayhost.exe` covers the reader end to end, which is the
+right test and a slow one: a D3D11 device, a window, a live backend and four
+seconds of wall clock, and when a field comes out wrong it says so as a missing
+column in a bitmap. `jsontest.exe` runs the same functions directly on bodies
+captured from the real `mods/manager` over the real `aowlspt-backend` — no
+device, no sockets, no timing — and checks the tables they fill, including the
+cases the old brace-scanning reader got wrong: a nested `entries` array, a key
+that exists only at depth, a `}` inside a string, and an escaped Windows path in
+an apply message.
+
+The headless run is a scripted session of the whole manager, driven through the
+window procedure the overlay installed, with keys: open, walk to a row with
+`HOME`/`DOWN`, `SPACE`, `TAB` through all four views, `ENTER` on a list that is
+not active, `F`, a mouse click on a row button, `C`, a resize, and then a
+hundred quiet frames so the frame-cost average settles rather than reporting
+start-up. It writes eleven BMPs and checks the cursor landed where the arrows
+aimed, that each `TAB` changed view, that the filter moved, that the click still
+hits the button — the button geometry moved when the panel was widened, and a
+hard-coded x was silently landing in the `decided by` column — and that **no
+gesture was left stranded in the worker's queue**.
+
+`--shot <dir>` creates the directory. `shoot()` fails quietly against one that
+is not there, so a `--shot shots-4k` on a clean checkout used to run the whole
+script, report every check as passing, and write not one BMP — and the BMPs are
+the only evidence that the panel drew what the checks say it drew.
+
+With a backend, so the click is checked end to end. `--control` picks which of
+the manager's three control states the stand-in answers in:
+
+```
+python fakebackend.py 7261 --control absent --golden
+overlayhost.exe --headless --shot shots --port 7261
+```
+
+`--golden` serves `panel.golden.json` — bytes the *real* manager produced —
+rather than the hand-written rows. That capture is re-taken by driving the real
+backend with the real manager:
+
+```
+installer\build\aowl.exe build-mod mods\manager
+python realbackend.py 7283
 ```
 
 Two backends, because they prove different halves and neither one proves both.
@@ -237,8 +718,47 @@ with, not a one-way latch. It writes what it saw to `panel.golden.json`.
 `tests/overlayhost/fakebackend.py` serves that capture — the real manager's
 bytes — to the overlay, and adds the one thing a capture cannot carry: what
 happens between the POST and the next GET, in each of the manager's three
-control states (`absent`, `present`, `stubborn`). It does **not** deflate its
-answers, which is the only reason the overlay can read it today.
+control states (`absent`, `present`, `stubborn`). It does not deflate its
+answers; neither does `aowlspt-backend` when asked, so the same reader works
+against both.
+
+It now serves `/list`, `/lists`, `/conflicts`, `/apply`, `/clear/<id>` and
+`/select/<list>` as well, in the manager's own shapes — `decisionJson` for a
+`/list` row, `routeLists` for a list, `changeReply` for a clear,
+`applySelection` for an apply. A stand-in that serves only `/panel` proves the
+easy quarter: no `from`, no `explicit`, no lists, and nothing about what was
+excluded.
+
+**The client host's report is in every fixture, and so is its absence.**
+`realbackend.py` polls `/aowlspt/mods/client/1.0.0?hs=..&sq=..&r=..&more=1` with
+a hand-written report before it captures — four records through the real parser,
+six registry mods deliberately left out — so `panel.golden.json` carries a real
+ledger and `fakebackend.py --golden` replays it. The hand-written rows carry
+their own, including one guid (`aowl.sway`) that `overlayhost.exe` also pushes
+in through `aowl_ov_set_mod`, which is the only way to test the rule that lets
+the manager lower a host-pushed row. `aowl.fovfix` is pushed in for the same
+reason on the golden side, because it is in the shipped registry and therefore
+in the capture.
+
+Both fixtures leave rows with **no** client keys, and the test host fails if
+either side of that is missing: no answered row, no unanswered row, no
+disagreeing row, or no host-pushed row lowered by a record are each a failure
+rather than a note. A fixture that carries none of the states a check is written
+against passes without testing anything, which is how the `protected` path went
+six fixture combinations without being exercised once.
+
+**The most useful run is against the real thing**, which now works end to end.
+Copy the control-wired stage another agent maintains, point a backend at the
+copy, and run:
+
+```
+robocopy installer\build\ctlstage tests\overlayhost\ovstage /E
+backend\bin\aowlspt-backend.exe --root tests\overlayhost\ovstage --port 7336
+overlayhost.exe --headless --shot shots --port 7336
+```
+
+Do not run it against `installer\build\ctlstage` itself — the run changes the
+selection, and that stage belongs to somebody else.
 
 `tests/overlayhost/overlayhost.c` is a D3D11 application that stands in for
 Tarkov: a window, a device, a swap chain, a scene, a present loop. The overlay
@@ -259,121 +779,190 @@ Three things it proves rather than merely exercises:
   `HRESULT` is checked. Without the overlay dropping its render target view
   first this returns `DXGI_ERROR_INVALID_CALL` — the most common way an overlay
   breaks a game.
-- **The rows on the panel came from the manager.** With `--port`, the run clicks
-  the first row the *backend* contributed rather than a fixed index — the rows
-  the test host pushes in are named after mods the registry does not have, so a
-  fixed index would be clicking something the manager cannot answer about. It
-  then checks the row changed state, that it came back either starred or greyed
-  (the manager's answer, whichever it was — what would be wrong is the field
-  never moving off the host's default), and that no host-pushed row was greyed
-  out by the backend.
+- **The rows on the panel came from the manager.** With `--port`, the run acts
+  on the first row the *backend* contributed rather than a fixed index — the
+  rows the test host pushes in are named after mods the registry does not have,
+  so a fixed index would be toggling something the manager cannot answer about.
+  It then checks that every backend row carries a `verdict` and a `reason`, that
+  at least one carries a `from` (which only `/list` can supply, so an overlay
+  that quietly stopped reading it fails here), that the lists came back with
+  their nested entries walked, that per-mod outcomes reached the APPLY view, and
+  that no host-pushed row was greyed out by the backend.
+- **The manager's own row is never toggled.** Not squeamishness: the first
+  version of this script walked to row zero and pressed `SPACE`, which disabled
+  `aowl.manager`, which unloaded it, which took every route with it — and the
+  rest of that run reported an empty backend while the staged install needed
+  re-creating. The overlay refuses that gesture now, and the test picks
+  something else, because a refusal is not a toggle.
 
 `tests/overlayhost/overlaynimtest.nim` covers the other boundary: that nimony
 binds the header the way the rest of the repo binds C, that a nimony build needs
 no extra link library, and that a nimony `string` survives the trip to
 `const char*`.
 
-## What the rest of the tree needs to change
+## What the rest of the tree still needs
 
-Four things, all outside this directory and none made here. The first two are
-what makes the overlay appear at all; the last two are what makes the toggle
-mean something.
+Everything this directory once needed has landed:
 
-1. **`host/Aowlspt.Host.Il2Cpp/aowlhost.nim`** — `import aowloverlay`, then
-   call `overlayStart` on the boot thread after the mod loop and
-   `overlaySetMod` once per loaded mod.
-2. **`tools/aowl.nim`** — add `-p:host\Aowlspt.Overlay` to `buildIl2CppHost`'s
-   command so the import resolves, and a `buildOverlayTests` alongside the other
-   test builds if the headless run should be part of `aowl test`.
+- **`host/Aowlspt.Host.Il2Cpp/aowlhost.nim`** imports `aowloverlay` and calls
+  `overlayStart(VkInsert, readBackendPort())` on the boot thread after the mod
+  loop, then `overlaySetMod` once per loaded mod. A failure there is a warning,
+  not a failed host.
+- **`tools/aowl.nim`** passes `-p:host\Aowlspt.Overlay` to `buildIl2CppHost` so
+  that import resolves, and `buildOverlayTests` builds `overlayhost.exe`,
+  `linkprobe.exe` and `overlaynimtest.exe` as part of `aowl build`.
+- **`backend/aowlbackend.nim`** honours `Accept-Encoding: identity`. `parseHead`
+  sets `r.identity` only when `identity` is asked for and `deflate` is not, and
+  the route call sites pass `not req.identity` to `sendResponse`. The game
+  client never sends the header, so its path is byte-identical; the overlay's
+  WinHTTP worker does, and gets a body it can read.
+- **`mods/manager` refuses to unload a protected mod** at all three doors, and
+  answers `protected` on every panel row — so this file no longer hardcodes the
+  manager's guid. See "the row with no button".
+- **The client host applies the manager's decisions live.** It polls
+  `/aowlspt/mods/client/<hostversion>` every `modSyncMs` through this header's
+  own sync feed and loads or unloads client-side mods to match, proven with a
+  real toggle unloading a mod from a running host and a second one bringing it
+  back — including the mod's `on_unload` running rather than the library being
+  freed underneath it.
 
-### 3. `backend/aowlbackend.nim` must not deflate the panel body
+The last of that list to close was the loop back the other way, and it closed
+outside this directory. It is written up here because the panel is where the
+difference between the two hosts is visible.
 
-`sendResponse` compresses **every** response body, unconditionally, with no
-`Content-Encoding` header, because that is what the Tarkov client expects. The
-overlay's WinHTTP client gets 439 bytes starting `78 9C`, finds no rows in them,
-and falls back to read-only — silently, unless you know to look for it. It has
-no inflater and should not grow one: `zlib` is not in any DLL the header can
-resolve by name, and linking one would make the injected host depend on it.
+### The client side reports its outcome back — on the poll it already makes
 
-The change is a header the client already sends. In `parseHead`, beside
-`content-length` and `cookie`:
+**Owner: `host/common/modcontrol.nim` (the host half) and
+`mods/manager/mgr/clientreport.nim` (the manager half). Closed; kept here
+because the panel is where the difference shows.**
 
-```nim
-elif name == "accept-encoding":
-  # The game client never sends this and always wants the framed body. Anything
-  # that does ask — the in-game overlay's WinHTTP worker, curl, a browser
-  # looking at /aowlspt/mods — gets what it asked for.
-  r.identity = find(toLowerAscii(value), "identity") >= 0
-```
+The sync feed used to be a one-way control loop: the host read what it should be
+running, made itself match, and said nothing, so the manager's `live` and
+`restart` for a client-side row were the server guessing about a process it
+cannot see. The answer now rides the query string of that same poll —
+`?hs=<process>&sq=<n>&r=<guid>~<want><outcome>[~<code>]` — one row per guid the
+backend named, carrying the last thing the client host actually did about it.
+`docs/MODMANAGER.md` has the wire; `host/common/modcontrol.nim` has it in full.
 
-with `identity*: bool` on `Request`, and at the one call site that serves a
-route:
+What that changed for this panel, without a line of this header moving:
 
-```nim
-sendResponse(sock, "200 OK", body, not req.identity, req.keepAlive)
-```
+- **`live` on a client-side row is a fact where the host has sent one.** The
+  manager arbitrates in `clientreport.liveVerdict` — running when either host
+  says so, not running when every host that *could* be running it has said so,
+  and `null` otherwise — so a client-only mod is no longer answered for by the
+  server's inventory. A client mod the client host has just unloaded now reads
+  as stopped on the next poll rather than staying up until its row is pushed
+  again.
+- **`restart` on a client-side row is a fact where the host has sent one.** A
+  `d` (refused live, holds on restart) raises the `*`; so does an `s` or an `r`,
+  because what is running is not what was asked for. Only where the client host
+  has said nothing does `rowRestart` fall back to comparing this selection with
+  the one the manager started with.
+- **`running unknown` still means unknown, and is still drawn.** There is
+  deliberately no encoding for "no answer yet": a truncated report (`more=1`), an
+  older host and a host that has not polled all converge on *absence*, and the
+  manager may only narrow a row on a record it actually received. The row's
+  `live` stays `null` there, which this header already reads as "leave the row
+  alone", which is what keeps `hostPushed` authoritative.
 
-Nothing else changes: the client does not send the header, so its path is
-byte-identical. Until this lands the overlay reports the deflated answer by
-name in `overlayStatus()` rather than looking like a network failure, and
-`tests/overlayhost/realbackend.py` inflates it itself so the schema is still
-checked against the real manager.
+Everything `control=present` in the screenshots and numbers above is still the
+**backend's** answer about **server-side** mods: `control` and `liveKnown` are
+about the event channel, and the client host is not on it. That distinction is
+the kind this panel should not blur, so it is still drawn — `decided by` says
+`client host` on a row the client host pushed, and the detail pane says
+`running unknown` rather than `no` when nothing authoritative has spoken.
 
-### 4. A host has to answer `aowlspt.host.mods.*`
+### What the game's own host says, on the panel
 
-`mods/manager/mgr/control.nim` implements the whole mod half of an event
-protocol for live load/unload — probe, capabilities, load, unload, list, result
-— and the protocol is written out at the top of that file. **Nothing subscribes
-to it.** `hostEventEmit` in `backend/aowlbackend.nim` delivers only to `gSubs`,
-which mods fill in; the host itself is not a subscriber and cannot become one
-through the public API.
+The manager sends `clientLive`, `clientWant`, `clientOutcome` and `clientCode`
+on the rows it has an answer for, and `clientHost` / `clientSession` /
+`clientSeq` / `clientRows` / `clientMore` on the wrapper. The panel reads all of
+it. What it does with it:
 
-`host/common/modhost.nim` already has the hard half: `unloadOne` runs the mod's
-`on_unload`, calls the teardown the host registered with `setModTeardown`, and
-then frees the library — in that order, which is the whole of the danger — and
-the IL2CPP host's `dropModRegistrations` is such a teardown. What is missing is
-the wiring. In each host:
+- **The status line has a `game` segment**: `not reporting`, `4 rows`, or
+  `4 rows +more`. It is the only thing on the panel that says how much of the
+  other host's answer has actually arrived.
+- **The detail pane always carries a line about the game**, including — and
+  especially — for a row nothing has said anything about. Four sentences, and
+  three of them are kinds of unknown:
+  - a record: `in the game: running | not running   the client host wanted it
+    on and says skipped [nofile] -- it is not installed on the client side`.
+    The slug stays visible next to the sentence on purpose: a player reporting
+    a problem should have something greppable to quote, and the sentence is
+    what tells them whether to look for it.
+  - `clientMore`: the rotation has not reached this row and will.
+  - a complete report that did not mention it: it may not run on that side.
+  - `clientHost:false`: **the host in this process** has not reported. Not "no
+    game is running" — this panel is drawn inside the game, so that is never
+    the explanation, and a sentence that said it would send a player to check
+    something they are already looking at.
+- **`!` in the marker column** where the client host's answer disagrees with
+  the switch beside it, drawn only from a record. Silence is not a
+  disagreement; marking it would put a `!` on every client mod the first time a
+  report arrived in instalments.
+- **The row is not greyed for silence.** `clientKnown` is set only where the
+  keys are present and *cleared* where they are not, so a row whose record has
+  gone (a new game process, a guid the registry stopped naming) goes back to
+  unknown and keeps what it last knew instead of falling to "off".
 
-```nim
-# In hostEventEmit, before the delivery loop:
-if n.len > 18 and n.substr(0, 17) == "aowlspt.host.mods.":
-  hostModsControl(from1, n, body)
-# ... and then deliver to gSubs as it does today, so the request also reaches
-# any other mod that wants to see it.
-```
+`/aowlspt/mods/clientreport` is deliberately **not** polled. The panel route
+already carries the per-row facts and the four wrapper counts, and the one
+question the ledger would additionally answer — `silentPolls`, "is a client host
+polling and saying nothing?" — is answered for free by the overlay existing at
+all: the host doing the polling is the process this panel is drawn in. A fifth
+GET a second, against a body bounded by the manager's 256-row table, to
+re-derive that would be paying frame budget for a fact already in hand. It is
+still the right place to send somebody who wants the rows `/panel` filters out.
 
-`hostModsControl` answers by emitting **from the host**, which needs an emit
-that excludes nobody — `hostEventEmit` skips the emitter by `modIndex`, and the
-host is not a mod:
+### The rule the `loaded` column now follows
 
-```nim
-proc emitFromHost(name, payload: string) =
-  let subs = gSubs          # a snapshot: a subscriber list can change under an
-  for i in 0 ..< subs.len:  # unload, and iterating the live one is a crash
-    if subs[i].name == name: discard cInvokeCallback(...)
-```
+`aowl_ov_set_mod` used to pin `loaded` at 1. That was wrong in a way that only
+showed up once the host started pushing rows in both directions: `aowlhost.nim`
+calls it again with `enabled:false` the moment `unloadByGuid` succeeds — a row
+marked stopped is more use than a row that vanished — and the panel went on
+saying `running yes` about a mod that had been taken out, for the rest of the
+session, with no backend needed to produce the lie. `loaded` follows the flag
+now, and the row says `unloaded` in its own verdict.
 
-Four rules, and each one is a bug if it is missed:
+The other half was the reader. A host-pushed row ignoring the manager's `live`
+was right when `live` was the server side guessing about a process it could not
+see. It is not right where the row carries `clientLive`: that is the same host
+that pushed the row, answering again through the backend one poll later, and
+later wins. So a non-null `live` may lower a host-pushed row **exactly where
+`clientLive` is present**, and may not otherwise. Both directions are checked,
+because each one is a different lie: refuse it always and an unloaded mod reads
+as running forever; allow it always and every client-side mod greys out the
+moment the panel reaches a backend.
 
-- **`probe` → `capabilities` immediately**, with `control:true, unload:true`
-  only if `setModTeardown` has actually been called. A host that answers `true`
-  and then cannot unload is worse than one that answers `false`.
-- **`unload` must not happen inside the emit.** `broadcast` is synchronous, so
-  the stack at that moment runs through the requesting mod's route handler;
-  `FreeLibrary` there is a return into unmapped memory. Queue the guid, do it on
-  the host's own loop, then emit `result`. Refuse to unload the requester, and
-  refuse to unload the manager.
-- **Exactly one `result` per request, including failures.** Silence is
-  indistinguishable from a host that never implemented this, and the manager
-  sits in `csUnknown` forever.
-- **`load` is idempotent** and `list` answers `{"mods":[{guid,name,version,path,
-  live,hotReloadable}]}`. The manager states the whole desired set on every
-  apply rather than a diff, because a diff from a stale picture loads a mod
-  twice.
+### Two hosts, two mechanisms, one panel
 
-The manager needs no change when this lands, and neither does this header: the
-`deferred` outcomes become `applied`, `live` stops being `null`, and the rows
-start greying out instead of starring.
+This section used to say that nothing anywhere answered
+`aowlspt.host.mods.*` and that every outcome was therefore `deferred`. Both
+halves have since been built, and they were built differently — which is worth
+writing down, because the panel shows the results of both side by side and they
+do not mean the same thing.
+
+- **The server** answers the event protocol in `mgr/control.nim` directly:
+  `backend/aowlbackend.nim` installs the teardown and drives `modcontrol`, so
+  `/apply` and `/toggle` come back `applied` and `requested`, `control` is
+  `present`, and `live` on a server-side row is a fact.
+- **The client** does not answer the event protocol at all. It polls
+  `/aowlspt/mods/client/<hostversion>` through this header's own sync feed
+  (`aowl_ov_sync_start` / `overlaySyncTake`), makes itself match, and hangs what
+  came of the *previous* answer on the next request's query string. It is a
+  poll with a receipt on it, not a conversation: the manager is told, but only
+  when the host next asks, and only about the guids that fit in a 191-character
+  path.
+
+The panel's job here is not to reconcile them but to keep them apart. A row's
+`decided by` says `client host` when the client host pushed it; a row the
+manager has never heard of cannot be toggled from here and the manager says so
+in its own words; and `running` reads `unknown` rather than `no` when nothing
+authoritative has spoken about it. `hostPushed` is the rule underneath all
+three, and it survives the report: the manager's `live` is `null` rather than
+`false` for a mod nobody entitled to answer has answered about, so the row this
+process pushed in is never lowered by a silence — only by the client host's own
+later word about it, which arrives on the row as `clientLive`.
 
 No new link libraries. Everything the header needs from `d3d11.dll` and
 `winhttp.dll` is resolved with `GetProcAddress` at runtime; every COM call goes

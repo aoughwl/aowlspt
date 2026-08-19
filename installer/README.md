@@ -74,15 +74,23 @@ release, a source that already has a mod loader in it — is a *block*, which
 
 ```
 mirror  D:\Games\Tarkov  ->  D:\Aowlspt   (without BattlEye, ConsistencyInfo, ...)
-copy    payload\runtime  ->  D:\Aowlspt
-copy    payload\client   ->  D:\Aowlspt
 copy    payload\aowlspt  ->  D:\Aowlspt\aowlspt
+copy    payload\aowlspt\registry\mods.json  ->  D:\Aowlspt\aowlspt\registry\mods.json
+write   D:\Aowlspt\aowlspt\mods\manager\config.json   (the default mod list)
 write   D:\Aowlspt\aowlspt\backend.json
 ```
 
 That list is printed before anything happens, and `plan` prints it without
 doing anything at all. It is not an approximation of what `install` does — it
-is the same list, executed.
+is the same list, executed, in the order it is printed.
+
+Every step after the mirror is conditional on the payload actually carrying that
+part, which is how the same program lays down a full install and an
+overlay-only one without a second code path. A payload `aowl payload` produces
+carries only `aowlspt/`, so those are the steps you will see; the installer also
+still honours `payload\runtime` and `payload\client` if a payload has them, and
+skips each silently when it does not. `backend.json` is written only when the
+payload names a `backendUrl`.
 
 ### Mirroring, and the sharp edge in it
 
@@ -97,8 +105,11 @@ destination rather than opening it — but it cannot be careful on behalf of
 every tool that touches the install afterwards.
 
 So everything a mod loader or patcher could plausibly rewrite is copied even
-when the rest is linked: the executables, `UnityPlayer.dll`,
-`GameAssembly.dll`, `Managed/`, `il2cpp_data/`, `Plugins/`, `boot.config`.
+when the rest is linked — the `hot` list in `installer/src/aowlsptinstall.nim`:
+`EscapeFromTarkov.exe`, `UnityPlayer.dll`, `GameAssembly.dll`, `baselib.dll`,
+`UnityCrashHandler64.exe`, and under `EscapeFromTarkov_Data/`: `Managed/`,
+`il2cpp_data/`, `Plugins/`, `Resources/`, `globalgamemanagers` and
+`boot.config`.
 A few hundred megabytes out of 78 GB, which buys back nearly all of the speed
 and none of the risk. `--copy` turns linking off entirely.
 
@@ -128,10 +139,10 @@ reporting *"no registry found. Looked at: ..."* and manages nothing -- on an
 install that is otherwise complete. So two more things go in.
 
 **The registry** (`registry/mods.json`: every mod that exists, and every named
-list of them) is copied to `<target>owlsptegistry\mods.json`, which is one
+list of them) is copied to `<target>/aowlspt/registry/mods.json`, which is one
 of the places the manager searches, and is inside the one directory this
 installer owns and can therefore remove again. It comes out of the payload --
-`payloadowlsptegistry\mods.json` first, then `payloadegistry\mods.json`
+`payload/aowlspt/registry/mods.json` first, then `payload/registry/mods.json`
 -- or from `--registry PATH`, which may name the file or the directory holding
 it. A `--registry` that names nothing does *not* fall back to the payload's:
 installing a registry other than the one you asked for is how somebody spends an

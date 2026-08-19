@@ -14,7 +14,10 @@ import std/private/oscommons
 import std/windows/winlean
 import std/widestrs
 
-export fileExists, dirExists, symlinkExists
+# `Handle` is re-exported for the held-handle facility at the bottom of this
+# module: a caller that keeps a file open has to be able to name what it is
+# keeping open.
+export fileExists, dirExists, symlinkExists, Handle
 
 type
   FsResult* = object
@@ -26,6 +29,7 @@ const
   ErrPathNotFound* = 3'i32
   ErrAccessDenied* = 5'i32
   ErrNotSameDevice* = 17'i32
+  ErrSharingViolation* = 32'i32
 
 proc good(): FsResult =
   result = FsResult(ok: true, err: 0'i32)
@@ -355,6 +359,29 @@ proc removeTree*(p: string): FsResult =
 # --------------------------------------------------------------- text
 
 proc readTextFile*(p: string; into: var string): bool =
+  ## Every text file this project reads comes through here, and **a UTF-8 BOM
+  ## is dropped**, which is not a nicety.
+  ##
+  ## Notepad writes one by default, and so does PowerShell's
+  ## `Set-Content -Encoding utf8`. Three bytes, `EF BB BF`, invisible in every
+  ## editor -- and every JSON reader here scans from byte zero, so the document
+  ## does not parse and the caller sees an empty or missing value rather than
+  ## an error about encoding.
+  ##
+  ## What that cost, before this line existed: a BOM on a mod manager's
+  ## `config.json` made its `activeLists` read as empty, so nothing resolved,
+  ## so it wrote a selection file naming **only itself** -- and the next start
+  ## loaded one mod out of ten, silently, with no error anywhere. The manager
+  ## is built to refuse that state loudly; it could not, because it could not
+  ## tell "the config named no lists" from "the config did not parse". A
+  ## `regcheck` run on a BOM'd registry answered "it did not parse, or the top
+  ## level is not an object", which is at least loud but still names the wrong
+  ## cause.
+  ##
+  ## Fixed here rather than in each reader because there are three config
+  ## readers alone (backend, client host, simulator) and the same hazard is on
+  ## the registry, the selection file and the database. A reader that wants the
+  ## exact bytes should not be using a proc called `readTextFile`.
   into = ""
   var f: File
   if not open(f, p, fmRead):
@@ -368,6 +395,213 @@ proc readTextFile*(p: string; into: var string): bool =
       result = false
   finally:
     close(f)
+  if result and into.len >= 3 and
+     into[0] == '\xEF' and into[1] == '\xBB' and into[2] == '\xBF':
+    into = into.substr(3, into.len - 1)
+
+# ------------------------------------------------- files held open
+#
+# A file that is opened, read or written, and closed again on every touch, when
+# the process does that thousands of times to the same file.
+#
+# The cost of `CreateFileW` is not the directory lookup. On a machine with
+# real-time antivirus -- which is to say, on a player's machine -- opening a
+# file that has been *modified* since it was last opened makes the scanner read
+# and scan it before the handle comes back. Measured here on a 3 KB file: 35 us
+# to open and read it when nothing has changed, 890 us when the previous
+# operation wrote it. The backend's profile store does exactly that, read after
+# write, once per inventory move.
+#
+# Keeping the handle open removes the open, and with it the rescan: the same
+# read costs 3 us and the write 19 us. Nothing else changes -- every read still
+# goes to the file through the operating system's cache, so another process
+# writing the same file is seen exactly as it is now. That is the reason this
+# is a held handle rather than an in-memory copy of the contents: a cache of
+# the bytes would be faster still and would be wrong, because the client host
+# and the backend run at the same time against one store.
+
+proc openHeld*(p: string; create: bool): Handle =
+  ## A handle to keep. Read and write access, and shared every way -- read,
+  ## write and delete -- because the other host may want any of those while
+  ## this one holds the file, and a handle that made them fail would turn a
+  ## shared store into an intermittent error on whichever side asked second.
+  ##
+  ## What a held handle follows is the *file*, not the path. Another process
+  ## rewriting the contents in place is seen; another process replacing the
+  ## file at that path is not -- this handle stays on the old one.
+  ##
+  ## That last part is not academic any more: the store commits by renaming a
+  ## temporary over the key, which is exactly such a replacement. It handles it
+  ## in the only two ways that work -- the handle it wrote the temporary with
+  ## *becomes* the key's handle after the rename, and any handle it had for the
+  ## key before is closed before the rename, because Windows will not replace a
+  ## file this process still has open. See `modstore.commitNow`.
+  let w = toWide(p)
+  result = createFileW(w.toWideCString, GENERIC_READ or GENERIC_WRITE,
+                       FILE_SHARE_READ or FILE_SHARE_WRITE or FILE_SHARE_DELETE,
+                       nil, (if create: OPEN_ALWAYS else: OPEN_EXISTING),
+                       FILE_ATTRIBUTE_NORMAL, Handle(0))
+
+proc heldValid*(h: Handle): bool =
+  result = h != INVALID_HANDLE_VALUE and h != Handle(0)
+
+proc heldClose*(h: Handle) =
+  if heldValid(h):
+    discard closeHandle(h)
+
+proc heldRead*(h: Handle; into: var string): bool =
+  ## The whole file, from the beginning, however the pointer was left.
+  into = ""
+  if not heldValid(h):
+    return false
+  # `lpDistanceToMoveHigh` is not optional in these bindings, so the move is
+  # the 64-bit form with a zero high word rather than the 32-bit one.
+  var hi: LONG = 0'i32
+  discard setFilePointer(h, 0'i32, addr hi, FILE_BEGIN)
+  var high32: DWORD = 0'u32
+  let low32 = getFileSize(h, addr high32)
+  if high32 != DWORD(0) or low32 == DWORD(0xFFFFFFFF'u32):
+    return false
+  let size = int(low32)
+  if size == 0:
+    return true
+  let dest = beginStore(into, size)
+  var got = 0'i32
+  let okRead = readFile(h, dest, int32(size), addr got, nil)
+  endStore(into)
+  if okRead == WINBOOL(0) or int(got) != size:
+    into = ""
+    return false
+  result = true
+
+proc heldWrite*(h: Handle; content: string): bool =
+  ## Overwrites from the beginning and truncates to what was written, which is
+  ## what `CREATE_ALWAYS` would have done -- without the create.
+  if not heldValid(h):
+    return false
+  # `lpDistanceToMoveHigh` is not optional in these bindings, so the move is
+  # the 64-bit form with a zero high word rather than the 32-bit one.
+  var hi: LONG = 0'i32
+  discard setFilePointer(h, 0'i32, addr hi, FILE_BEGIN)
+  var put = 0'i32
+  if content.len > 0:
+    if writeFile(h, readRawData(content), int32(content.len), addr put,
+                 nil) == WINBOOL(0):
+      return false
+    if int(put) != content.len:
+      return false
+  result = setEndOfFile(h) != WINBOOL(0)
+
+# ------------------------------------------------- durable replacement
+#
+# What `heldWrite` above does is overwrite a file in place. That is fast and it
+# is *not* a commit: between the first byte landing and `setEndOfFile`
+# returning, the file on disk is neither the old value nor the new one, and a
+# process killed in that window leaves it that way for good. For a store whose
+# only contents are player profiles, that is the one failure that cannot be
+# repaired afterwards.
+#
+# The three calls below are what makes a write a commit instead:
+#
+#  * `flushHeld` -- `FlushFileBuffers`, so the bytes are on the medium before
+#    anything points at them. Windows guarantees the *rename* is atomic
+#    (a directory entry replacement, journalled on NTFS); it does not
+#    guarantee the file's data was written first. Without the flush, a power
+#    cut can leave the new name pointing at a file whose contents never made
+#    it -- the rename is metadata and metadata is journalled ahead of data.
+#  * `replaceFileAt` -- `MoveFileExW` with `MOVEFILE_REPLACE_EXISTING`. A
+#    reader opening the destination sees either the whole old file or the
+#    whole new one; there is no instant at which it sees a mixture.
+#    `MOVEFILE_WRITE_THROUGH` makes the call wait for the directory change
+#    itself to reach the disk, so a crash *after* it returns cannot undo it.
+#  * the retry -- the replace fails if some other process holds the
+#    destination open without `FILE_SHARE_DELETE`, and on a player's machine
+#    that other process is a virus scanner holding it for a few milliseconds
+#    after the last write. Retrying briefly turns a sporadic lost save into a
+#    slightly slower one. It is a small fixed number of attempts, not a loop:
+#    a destination held open indefinitely is an error the caller must see.
+
+proc flushFileBuffers(hFile: Handle): WINBOOL {.
+  importc: "FlushFileBuffers", stdcall, dynlib: "kernel32", sideEffect.}
+
+proc getCurrentProcessId(): int32 {.
+  importc: "GetCurrentProcessId", stdcall, dynlib: "kernel32", sideEffect.}
+
+proc lastFsError*(): int32 =
+  ## `GetLastError`, for a caller that wants the code in its own message.
+  result = getLastError()
+
+proc heldFlush*(h: Handle): bool =
+  ## The written bytes, on the medium. Not the same as "written": `WriteFile`
+  ## returning means the cache has them.
+  if not heldValid(h):
+    return false
+  result = flushFileBuffers(h) != WINBOOL(0)
+
+proc replaceFileAt*(src, dst: string): FsResult =
+  ## `src` becomes `dst`, atomically, replacing whatever was there.
+  ##
+  ## Both paths must be on the same volume -- they are, because the caller puts
+  ## its temporary file in a subdirectory of the destination's own directory.
+  ## `MoveFileExW` would silently fall back to a copy across volumes only with
+  ## `MOVEFILE_COPY_ALLOWED`, which is deliberately not passed: a copy is not
+  ## atomic and a silent one would be the bug this whole proc exists to stop.
+  let ws = toWide(src)
+  let wd = toWide(dst)
+  let flags = MOVEFILE_REPLACE_EXISTING or MOVEFILE_WRITE_THROUGH
+  var attempt = 0
+  while attempt < 6:
+    if moveFileExW(ws.toWideCString, wd.toWideCString, flags) != WINBOOL(0):
+      return good()
+    let e = getLastError()
+    if e != ErrAccessDenied and e != ErrSharingViolation:
+      return FsResult(ok: false, err: e)
+    inc attempt
+    sleep(DWORD(2))
+  result = bad()
+
+proc processId*(): int =
+  ## This process's id, for the store's lock file. A number a player can find
+  ## in Task Manager is the whole point of putting it there.
+  result = int(getCurrentProcessId())
+
+proc openExclusive*(p: string): Handle =
+  ## A file this process holds and no second process can take.
+  ##
+  ## Shared for reading so the process that loses can read the pid inside and
+  ## say who has it; shared for nothing else, so a second writer fails at the
+  ## open. `FILE_FLAG_DELETE_ON_CLOSE` is what makes it a lock rather than a
+  ## litter: the kernel closes the handle however the process ends --
+  ## including `TerminateProcess` and including a bugcheck -- so there is no
+  ## such thing as a stale lock left behind by a crash, and therefore no
+  ## "delete this file to continue" step for a player to get wrong.
+  let w = toWide(p)
+  result = createFileW(w.toWideCString, GENERIC_READ or GENERIC_WRITE,
+                       FILE_SHARE_READ, nil, CREATE_ALWAYS,
+                       FILE_ATTRIBUTE_NORMAL or FILE_FLAG_DELETE_ON_CLOSE,
+                       Handle(0))
+
+proc readShared*(p: string; into: var string): bool =
+  ## Read a file that another process holds open for writing. `readTextFile`
+  ## goes through `open`, which asks for sharing this cannot get; this asks for
+  ## exactly what the holder allows.
+  into = ""
+  let w = toWide(p)
+  let h = createFileW(w.toWideCString, GENERIC_READ,
+                      FILE_SHARE_READ or FILE_SHARE_WRITE or FILE_SHARE_DELETE,
+                      nil, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, Handle(0))
+  if not heldValid(h):
+    return false
+  result = heldRead(h, into)
+  heldClose(h)
+
+proc nowMs*(): int64 =
+  ## Wall clock in milliseconds. Used only to space out the store's history
+  ## snapshots, so it wants to be cheap and monotonic-enough rather than exact.
+  var ft = default(FILETIME)
+  getSystemTimeAsFileTime(ft)
+  let ticks = (uint64(ft.dwHighDateTime) shl 32) or uint64(ft.dwLowDateTime)
+  result = int64(ticks div 10_000'u64)
 
 proc writeTextFile*(p, content: string): FsResult =
   ## As with `copyFileAt`, an existing destination is removed rather than

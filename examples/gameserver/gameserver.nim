@@ -5,6 +5,29 @@
 ## The point of reading this next to `examples/highlevel` is that they are the
 ## same shape. One reaches into a running game, the other answers HTTP, and
 ## both are a nimony file that names things and hands back values.
+##
+## ## What it changes, exactly
+##
+## Two paths in the database, and nothing else:
+##
+##   `aowlspt.demo.created`  a path of its own that the database never held.
+##                           Its own corner; nothing else reads it.
+##   `templates.items.5447a9cd4bdc2dbd208b4567._props.Weight`
+##                           the M4A1's weight, multiplied by
+##                           `weightMultiplier` from `config.json` (0.5 as
+##                           shipped, so the rifle ends up half its weight).
+##
+## **The change is to the database the server holds in memory, for the life of
+## that server process.** Nothing here rewrites SPT's JSON on disk, so a restart
+## without the mod puts the item back. It is still live while the server is up,
+## which is why `examples/` is not staged into a real install — `aowl run` and
+## the backend's own stage are where this is meant to run.
+##
+## And it multiplies **on every load**: this mod loaded twice, or reloaded by
+## the mod manager, halves that weight twice. A mod that wanted to be idempotent
+## would have to record the original somewhere it owns and scale from that; this
+## one is a demonstration of `dbWrite`, and says so rather than pretending the
+## question does not arise.
 
 import std/strutils
 import aowlspt
@@ -102,7 +125,24 @@ proc onLoad(): Status =
     put(patch, "_props", done(props))
     if dbWrite(SampleItem, done(patch)) == Ok:
       let after = dbRead(SampleItem & "._props.Weight")
-      success "weight " & $before.asFloat() & " -> " & $after.asFloat()
+      # The value is checked, not just printed. "dbWrite returned Ok" says the
+      # call succeeded; a patch that merged into the wrong place leaves the
+      # weight exactly as it was, and a line that printed "3.5 -> 3.5" as a
+      # success would be reporting a failure in the voice of a success.
+      #
+      # With a tolerance, and not because floating point is vague: the number
+      # went out as decimal digits and came back as decimal digits, and the
+      # double rebuilt from those digits is not always the double that was
+      # written. An exact test fails on a patch that worked.
+      let wanted = before.asFloat() * weightMultiplier
+      var diff = after.asFloat() - wanted
+      if diff < 0.0:
+        diff = -diff
+      if after.ok and diff <= 0.0001 + wanted * 0.0001:
+        success "weight " & $before.asFloat() & " -> " & $after.asFloat()
+      else:
+        warn "weight reads " & after.asText() & " after patching it to " &
+             $wanted & ", so the patch did not land where it was aimed"
       # And the sibling must still be there — that is what "merge" means.
       let sibling = dbRead(SampleItem & "._props.Name")
       if sibling.ok:

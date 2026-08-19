@@ -266,7 +266,7 @@ proc testJournal() =
   discard ensureDir(root)
 
   var j = newJournal(root, "D:\\Games\\Tarkov", "D:\\payload", "1.1.0.46777",
-                     "", "full")
+                     "0.1.0", "", "full")
   j.paths.add joinPath(root, "aowlspt")
   j.paths.add joinPath(root, "BepInEx")
   check("save", journal.save(j).ok)
@@ -276,12 +276,30 @@ proc testJournal() =
   checkEq("source survives", back.source, "D:\\Games\\Tarkov")
   checkEq("payload survives", back.payload, "D:\\payload")
   checkEq("version survives", back.tarkovVersion, "1.1.0.46777")
+  # The aowlspt release, not the client's version. These are two different
+  # numbers on the same line of the report and swapping them would be invisible
+  # in any test that only looked at one, so both are asserted here.
+  checkEq("the release survives", back.payloadVersion, "0.1.0")
   checkEq("mode survives", back.mode, "full")
   check("paths survive", back.paths.len == 2)
   checkEq("first path survives", back.paths[0], joinPath(root, "aowlspt"))
 
   let missing = journal.load(joinPath(tempRoot(), "nothing-here"))
   check("a missing journal loads as empty", missing.paths.len == 0)
+
+  # An install made before the release number was recorded. The field is
+  # absent, not wrong, and `aowlspt-verify` says so as a warning rather than a
+  # failure -- so the loader has to distinguish "no line" from "empty line" and
+  # not invent a version for it.
+  var old = newJournal(root, "D:\\Games\\Tarkov", "D:\\payload",
+                       "1.1.0.46777", "", "", "full")
+  old.paths.add joinPath(root, "aowlspt")
+  check("a journal with no release saves", journal.save(old).ok)
+  let readBack = journal.load(root)
+  checkEq("and comes back with none rather than a guess",
+          readBack.payloadVersion, "")
+  checkEq("while the rest of it is intact", readBack.tarkovVersion,
+          "1.1.0.46777")
 
   discard winfs.removeTree(root)
 

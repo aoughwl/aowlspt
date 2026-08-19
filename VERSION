@@ -1,0 +1,26 @@
+# The version of this repository, and of everything `aowl release` produces
+# from it. One line, no syntax. The first line that is neither blank nor a
+# comment is the version; nothing else here is parsed.
+#
+# What it means: the bundle. Every appearance of it elsewhere is derived and
+# none of them is typed a second time --
+#
+#   aowlspt-<v>-<date>.zip        the archive's name
+#   aowlspt-<v>/VERSION           a copy of this file, inside it
+#   aowlspt-<v>/payload/payload.json   its "version", patched in as the archive
+#                                 is built, so the installer reads it
+#   <target>\aowlspt-install.txt  written there by `aowlspt-install` from that
+#                                 field, so a finished install can still say
+#                                 which build it is
+#   MANIFEST.sha256, CHANGELOG.md their headings
+#
+# What it is not: a Tarkov version (that is `targetTarkovVersion` in
+# payload.json, and it moves when the game does), and not a mod version (those
+# are in registry/mods.json and move independently).
+#
+# The working copy of installer/payload/payload.json is per-machine and
+# .gitignore'd, so its "version" drifts. `aowl release` says so and overrides
+# it; an install made straight out of installer/payload will report whatever
+# that file said, which is one of the ways to tell a development install from
+# a released one.
+0.1.0

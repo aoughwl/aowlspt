@@ -460,7 +460,12 @@ proc cmdInstall(o: Options): int =
     return 1
 
   let mode = if p.wholeTarget: "full" else: "overlay"
-  var j = newJournal(target, install.root, pay.root, $install.version, "", mode)
+  # `pay.version` rather than a constant here: the release number lives in
+  # `VERSION` at the top of the repo, `aowl release` copies it into the
+  # `payload.json` that goes in the archive, and this is where it stops being a
+  # property of the download and becomes a property of the install.
+  var j = newJournal(target, install.root, pay.root, $install.version,
+                     pay.version, "", mode)
   for c in stats.created:
     j.paths.add c
   let saved = journal.save(j)
@@ -489,6 +494,8 @@ proc cmdVerify(o: Options): int =
   line "  source    " & j.source
   line "  payload   " & j.payload
   line "  tarkov    " & j.tarkovVersion
+  if j.payloadVersion.len > 0:
+    line "  aowlspt   " & j.payloadVersion
   if j.mode.len > 0:
     line "  mode      " & j.mode
 

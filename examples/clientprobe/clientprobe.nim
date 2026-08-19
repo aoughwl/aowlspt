@@ -79,21 +79,43 @@ proc probeAll() =
     else:
       warn "Add failed: " & lastError()
 
+    # A string argument and a string return: the one case where the value
+    # crosses a managed allocation in each direction rather than sitting in a
+    # register. It comes back as JSON, so the quotes are part of it.
     var greeting = ""
     if call("EFT.Player::Greet", "[\"operator\"]", greeting) == Ok:
-      success "Greet: " & greeting
+      if find(greeting, "hello operator") >= 0:
+        success "Greet: " & greeting
+      else:
+        warn "Greet returned " & greeting & ", expected \"hello operator\""
     else:
       warn "Greet failed: " & lastError()
 
+    # A `System.Single`, and the value is the assertion rather than the status.
+    # A float bound as an integer travels in RCX instead of XMM0 and its result
+    # is read out of RAX, which answers a number -- so "Scale returned Ok" is
+    # exactly the thing that stays true while the answer is wrong. The mock
+    # doubles, so 2.5 is 5.0 and nothing else.
     var scaled = ""
     if call("EFT.Player::Scale", "[2.5]", scaled) == Ok:
-      success "Scale(2.5) = " & scaled
+      if scaled == "5.0":
+        success "Scale(2.5) = " & scaled
+      else:
+        warn "Scale(2.5) returned " & scaled & ", expected 5.0"
     else:
       warn "Scale failed: " & lastError()
 
+    # A `System.Boolean`, for the same reason: a bool is one byte in AL and the
+    # rest of the register is undefined, so a host reading the whole register
+    # answers "true" for very nearly any bool-returning method. The mock negates
+    # what it is given, so `true` must come back `false` -- which is also the
+    # answer a host that dropped the argument would fail to produce.
     var flag = ""
     if call("EFT.Player::SetFlag", "[true]", flag) == Ok:
-      success "SetFlag(true) = " & flag
+      if flag == "false":
+        success "SetFlag(true) = " & flag
+      else:
+        warn "SetFlag(true) returned " & flag & ", expected false"
     else:
       warn "SetFlag failed: " & lastError()
 
@@ -125,7 +147,18 @@ proc probeAll() =
       else:
         warn "the patch fired " & $tickHookFired & " times, expected 3"
     else:
-      warn "could not patch: " & lastError()
+      # One detour per method, across every mod in the process. In the gate's
+      # stage `examples/highlevel` is loaded first and hooks this same method,
+      # so the refusal here is the engine's rule working rather than anything
+      # wrong -- and it is said in those words, because "could not patch" on
+      # its own has sent people looking at the detour engine for a collision in
+      # the mods directory.
+      let why = lastError()
+      if find(why, "already patched") >= 0:
+        info "EFT.Player::Tick is already detoured by another mod in this " &
+             "stage, so this probe has nothing to patch: " & why
+      else:
+        warn "could not patch: " & why
 
   info "probe complete: " & $found & " resolved, " & $missing & " missing"
 

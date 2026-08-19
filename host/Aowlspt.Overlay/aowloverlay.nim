@@ -50,11 +50,18 @@ proc cOvRunning(): int32 {.importc: "aowl_ov_running", nodecl.}
 proc cOvVisible(): int32 {.importc: "aowl_ov_visible", nodecl.}
 proc cOvSetVisible(on: int32) {.importc: "aowl_ov_set_visible", nodecl.}
 proc cOvFrames(): int32 {.importc: "aowl_ov_frames", nodecl.}
+proc cOvFrameNs(): int32 {.importc: "aowl_ov_frame_ns", nodecl.}
+proc cOvFrameNsMax(): int32 {.importc: "aowl_ov_frame_ns_max", nodecl.}
 proc cOvStatus(buf: ptr char; cap: int32): int32 {.
   importc: "aowl_ov_status", nodecl.}
 proc cOvSetMod(guid, name, version: cstring; enabled: int32) {.
   importc: "aowl_ov_set_mod", nodecl.}
 proc cOvClearMods() {.importc: "aowl_ov_clear_mods", nodecl.}
+proc cOvSyncStart(path: cstring; intervalMs: int32) {.
+  importc: "aowl_ov_sync_start", nodecl.}
+proc cOvSyncPending(): int32 {.importc: "aowl_ov_sync_pending", nodecl.}
+proc cOvSyncTake(buf: ptr char; cap: int32): int32 {.
+  importc: "aowl_ov_sync_take", nodecl.}
 
 # --------------------------------------------------------------- public
 
@@ -86,6 +93,22 @@ proc overlayFrames*(): int32 =
   ## use -- worth logging, because everything else will look fine.
   cOvFrames()
 
+proc overlayFrameNs*(): int32 =
+  ## What one frame of the panel costs the game, in nanoseconds: an exponential
+  ## moving average over roughly the last hundred drawn frames, measured with
+  ## QPC around the build-and-draw inside the `Present` hook.
+  ##
+  ## Zero while the panel is closed, which is the truthful answer -- a hidden
+  ## panel is one `if` in the hook and nothing else. Worth logging once after a
+  ## raid: an overlay inside a game's present loop should be made to say what it
+  ## costs rather than be asked.
+  cOvFrameNs()
+
+proc overlayFrameNsMax*(): int32 =
+  ## The worst single frame since the overlay started. Never lowered: an average
+  ## hides a stutter by construction, and the stutter is what a player notices.
+  cOvFrameNsMax()
+
 proc overlaySetMod*(guid, name, version: string; enabled: bool) =
   ## Tells the panel about one loaded mod. This is the read-only fallback: with
   ## no backend reachable the panel still lists what is actually running in this
@@ -102,6 +125,44 @@ proc overlaySetMod*(guid, name, version: string; enabled: bool) =
             if enabled: 1'i32 else: 0'i32)
 
 proc overlayClearMods*() = cOvClearMods()
+
+proc overlaySyncStart*(path: string; intervalMs: int32) =
+  ## Ask the overlay's worker thread to fetch `path` from the backend every
+  ## `intervalMs`, and to keep the newest whole body for `overlaySyncTake`.
+  ##
+  ## This is how the client host reaches the backend without gaining an HTTP
+  ## client, a worker thread or a socket library of its own -- all three already
+  ## exist here, for the panel, and the alternative was a second copy of each
+  ## inside a DLL that is injected into a process mid-startup.
+  ##
+  ## Call it after `overlayStart`, and call it even when `overlayStart` returned
+  ## false: a failure there means the overlay cannot *draw*, and the worker
+  ## thread is running regardless.
+  var p = path
+  cOvSyncStart(toCString(p), intervalMs)
+
+proc overlaySyncTake*(): string =
+  ## The newest body the feed fetched, once. Empty when nothing has arrived
+  ## since the last call -- which is the normal answer on all but one poll in
+  ## sixty, and is also the answer when the backend is down, unreachable or
+  ## answering rubbish. A caller that acts only on a non-empty result therefore
+  ## does nothing at all when the far end is unhappy, which is the behaviour
+  ## live mod control needs and not merely the one it tolerates.
+  result = ""
+  let n = cOvSyncPending()
+  if n <= 0:
+    return
+  # One byte more than the body, for the terminator the C side writes.
+  var buf = newSeq[char](n + 1)
+  let got = cOvSyncTake(addr buf[0], int32(n + 1))
+  if got <= 0'i32:
+    # 0 is "another caller got there first", -1 is "it grew between the two
+    # calls". Both mean: nothing this time, try again on the next tick.
+    return
+  var i = 0
+  while i < int(got):
+    result.add buf[i]
+    inc i
 
 proc overlayStatus*(): string =
   ## One line, meant to be logged verbatim: either what the overlay is doing or

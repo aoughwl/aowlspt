@@ -1,7 +1,7 @@
 ## The smallest mod that exercises every part of the ABI it can reach.
 ##
-## Build:  pwsh tools/aowlspt-build.ps1 -Mod examples/hello
-## Run:    aowlspt-sim examples/hello --side server --route /aowlspt/hello
+## Build:  aowl build-mod examples/hello
+## Run:    aowl run examples/hello
 ##
 ## It works unchanged on the server, in the client, and in the simulator — the
 ## capabilities that exist on only one side are guarded by `side()`.
@@ -27,7 +27,14 @@ proc onLoad(): Status =
         # Echo the body back so a caller can see the request survived the round
         # trip: SPT compresses request and response, so "it returned 200" alone
         # does not prove the payload arrived intact.
-        """{"ok":true,"from":"nimony","echo":""" & body & "}")
+        #
+        # An empty body is spelled `null` rather than pasted in as nothing: a
+        # GET arrives here with no body at all, and `"echo":` followed by the
+        # closing brace is not JSON. The client parses what a route hands back,
+        # so a malformed answer is an error at the caller with nothing here to
+        # connect it to.
+        """{"ok":true,"from":"nimony","echo":""" &
+          (if body.len > 0: body else: "null") & "}")
     if st != Ok:
       warn "could not register route: " & lastError()
 
