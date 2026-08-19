@@ -49,6 +49,7 @@ import std/strutils
 import aowlspt
 import aowlspt/server
 import aowlspt/json
+import numbers
 import profile
 
 const
@@ -214,8 +215,8 @@ proc addSkill*(commonJson, id: string; rawGain: float; c: SkillCurve;
     d = parseObject(list.items[at])
   else:
     setText(d, "Id", id)
-    setNumber(d, "Progress", 0.0)
-    setNumber(d, "PointsEarnedDuringSession", 0.0)
+    setRaw(d, "Progress", numText(0.0))
+    setRaw(d, "PointsEarnedDuringSession", numText(0.0))
     setNumber(d, "LastAccess", nowSeconds)
 
   let already = get(d, "PointsEarnedDuringSession").asFloat(0.0)
@@ -227,7 +228,10 @@ proc addSkill*(commonJson, id: string; rawGain: float; c: SkillCurve;
   var progress = get(d, "Progress").asFloat(0.0) + granted
   if progress > MaxSkillProgress:
     progress = MaxSkillProgress
-  setNumber(d, "Progress", progress)
+  # Through `numText`, like every other float this server stores. Skill
+  # progress is added to on every raid for the life of a character, which makes
+  # it the accumulator most exposed to binary drift: see `emu/numbers`.
+  setRaw(d, "Progress", numText(progress))
   setNumber(d, "PointsEarnedDuringSession", already + granted)
   setNumber(d, "LastAccess", nowSeconds)
   if at >= 0:
@@ -278,7 +282,7 @@ proc resetSession*(commonJson: string): string =
     var d = parseObject(list.items[i])
     if not d.ok:
       continue
-    setNumber(d, "PointsEarnedDuringSession", 0.0)
+    setRaw(d, "PointsEarnedDuringSession", numText(0.0))
     list.replaceAt(i, text(d))
   result = text(list)
 
@@ -359,6 +363,7 @@ proc applyRaidMastering*(preJson, playedJson: string; cap: int): string =
       delta = cap
     if at >= 0:
       var d = parseObject(list.items[at])
+      # Mastering progress is a whole number of points, not a float.
       setNumber(d, "Progress", before + delta)
       list.replaceAt(at, text(d))
     else:

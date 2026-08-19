@@ -130,3 +130,48 @@ proc handbookPrice*(tpl: string): int =
   for entry in list:
     if entry.field("Id").asText("") == tpl:
       return entry.field("Price").asInt(0)
+
+proc handbookCategories*(tpl: string): seq[string] =
+  ## Every handbook category an item is in: the one its entry names, then that
+  ## category's parent, and so on to the root of the tree.
+  ##
+  ## Empty when the handbook has no entry for the template, and the caller must
+  ## be able to tell that from "in no excluded category" -- the two are the same
+  ## list and they are not the same fact. `traderRefuses` in `emu/repair` treats
+  ## an item the handbook does not place as one it cannot judge, and repairs it,
+  ## which is the forgiving direction and is named there.
+  ##
+  ## The walk is what makes an exclusion mean anything. A trader's
+  ## `excluded_category` names a *branch* -- "Gear", "Weapons" -- and an item
+  ## sits several levels below it, so matching only the category the item's own
+  ## entry names refuses nothing at all on real data, where the leaf categories
+  ## are the ones items are filed under and the named ones are three levels up.
+  ##
+  ## Bounded by the size of the category table, because `ParentId` is data: a
+  ## handbook with a loop in it must return a list rather than spin.
+  result = @[]
+  let hb = dbRead("templates.handbook")
+  if not hb.ok or hb.raw.len == 0:
+    return
+  var current = ""
+  let items = each(field(hb.raw, "Items"))
+  for entry in items:
+    if entry.field("Id").asText("") == tpl:
+      current = entry.field("ParentId").asText("")
+      break
+  if current.len == 0:
+    return
+  let cats = each(field(hb.raw, "Categories"))
+  var steps = 0
+  while current.len > 0 and steps <= cats.len:
+    result.add current
+    var next = ""
+    for c in cats:
+      if c.field("Id").asText("") == current:
+        next = c.field("ParentId").asText("")
+        break
+    if next == current:
+      # A category that is its own parent. One entry, not an infinite tree.
+      return
+    current = next
+    inc steps

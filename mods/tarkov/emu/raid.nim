@@ -38,10 +38,195 @@ proc keepsGear*(r: RaidResult): bool =
   of rrKilled, rrMissingInAction: false
   else: true
 
+# ---------------------------------------------------------------------------
+# The map list
+# ---------------------------------------------------------------------------
+#
+# `/client/locations` is the screen that lists nineteen maps, and it used to
+# answer with the whole `locations` subtree spliced in verbatim:
+#
+#     let v = dbRead("locations")
+#     put(o, "locations", if v.ok: raw(v.raw) else: emptyObject())
+#
+# That is every map's `base` **and** its `staticContainers`, `staticLoot`,
+# `staticAmmo` and `looseLoot` -- the floor of every map in the game, sent to
+# draw a menu. Measured (`docs/IMPORTDB.md`): 12.5 MB and 247 ms on a default
+# import, and **560 MiB and 10.8 seconds** on one imported with loose loot, out
+# of a 1.3 GB process. Nothing failed. It simply cost that, every time the
+# client opened the map list, and it is the single reason loose loot has to be
+# opted into per map.
+#
+# What the client actually wants is narrower than what it was being sent, and
+# the reference says so exactly. `LocationsGenerateAllResponse` in the SPT 4.x
+# surface dump (`reference/spt-4.1-surface.txt`) is
+#
+#     prop Dictionary<MongoId, LocationBase> Locations
+#     prop List<Path> Paths
+#
+# -- a map from a map's **`_Id`** to its **`base`**, and nothing else. Not the
+# wrapper object the database keys by directory name, and not one byte of loot.
+# `Path` is `{Source, Destination, Event}` and both ends of it are `_Id`s,
+# which is the second and independent piece of evidence that this route speaks
+# `_Id` rather than directory name: a transit graph written in `_Id`s is
+# unreadable against a map list keyed by anything else.
+#
+# So this route answers map *descriptions*, and `looseLoot` belongs to
+# `/client/location/getLocalloot`, which already asks one map at a time.
+#
+# ## What is deliberately still sent
+#
+# `base` goes out **verbatim**, byte for byte, and that is the whole of the
+# compatibility story with the rest of this repository. `mods/morebots` writes
+# `BotMax`, `MaxBotPerZone` and `waves[].slots_min/max` into
+# `locations.<map>.base`; `mods/icebreaker` writes `BotMax`/`BotMaxPvE` and
+# per-map `Enabled`/`Locked` into the same object. Both say in their own
+# comments that they write there *because* `/client/locations` carries it to
+# the client. Every one of those fields is inside `base`, so every one of them
+# still arrives.
+#
+# SPT clears `base.Loot` before sending. This does not, because it does not
+# have to: `Loot` is `[]` in all nineteen stock `base.json` files (measured),
+# nothing in this emulator ever writes it, and clearing it would mean parsing
+# and re-emitting 1.36 MB per request to blank a field that is already blank.
+#
+# ## Enumerating the maps, and the one cost that could not be removed
+#
+# Building the list needs the map *names*, and the plugin ABI has `db_get` for
+# a dotted path and no sibling that lists an object's members
+# (`abi/aowlspt_abi.h`). So the names can only come from reading `locations`
+# whole -- exactly the read this section exists to stop doing.
+#
+# It is therefore done **once**, lazily, and cached: the key list plus each
+# map's `_Id` is a few hundred bytes and does not change while the server runs.
+# Every request after the first is nineteen small `dbRead`s of
+# `locations.<map>.base`, which the backend's index answers without walking the
+# document.
+#
+# The honest cost of that: **a map added to the database after this server has
+# answered its first `/client/locations` is not listed until the server is
+# restarted.** No mod in this repository does that -- mods patch existing maps
+# at load, before any request -- and the alternative is paying the full read on
+# every request, which is the defect being fixed. If the ABI ever grows a key
+# enumeration, this cache stops being necessary and should go.
+
+type
+  LocationIndex* = object
+    ## The map keys of the `locations` table, and the `_Id` each one carries.
+    ## Two parallel sequences rather than a table: nineteen entries, looked up
+    ## a handful of times per raid.
+    ok*: bool
+    names*: seq[string]   ## the database key -- the directory the map came from
+    ids*: seq[string]     ## `base._Id`, or "" for a map whose base has none
+
+proc buildLocationIndex*(d: LootDb): LocationIndex =
+  ## Every member of `locations` that has a `base`, in document order.
+  ##
+  ## The `base` test is what keeps this a list of *maps*. `locations` is not
+  ## only maps: `locations.paths` is the transit graph, an array, and a route
+  ## that listed it as a twentieth map would put an unloadable entry on the
+  ## player's map screen.
+  result = LocationIndex(ok: false, names: @[], ids: @[])
+  let names = keys(whole(sub(d, "locations")))
+  for name in names:
+    let id = whole(sub(d, "locations." & name & ".base._Id")).asText("")
+    if id.len > 0:
+      result.names.add name
+      result.ids.add id
+    elif sub(d, "locations." & name & ".base").len > 0:
+      # A map whose base carries no `_Id`. It is listed under its database key
+      # rather than dropped: a key the client may not recognise costs that one
+      # map, and dropping it costs that one map *and* leaves nothing to see.
+      result.names.add name
+      result.ids.add ""
+  result.ok = true
+
+proc resolveLocation*(idx: LocationIndex; id: string): string =
+  ## The database key for a map named either way round. Empty when the table
+  ## has no such map -- never a guess.
+  if id.len == 0:
+    return ""
+  for name in idx.names:
+    if name == id:
+      return id
+  var i = 0
+  while i < idx.ids.len:
+    if idx.ids[i] == id:
+      return idx.names[i]
+    inc i
+  result = ""
+
+proc locationsBody*(d: LootDb; idx: LocationIndex): string =
+  ## `{locations: {<_Id>: base}, paths: [...]}` -- the whole of what the client
+  ## reads from `/client/locations`.
+  var maps = obj()
+  var i = 0
+  while i < idx.names.len:
+    let base = sub(d, "locations." & idx.names[i] & ".base")
+    if base.len > 0:
+      var key = idx.ids[i]
+      if key.len == 0:
+        key = idx.names[i]
+      put(maps, key, raw(base))
+    inc i
+  var o = obj()
+  put(o, "locations", maps)
+  # `paths` is the map-to-map transit graph -- `{Source, Destination, Event}`
+  # with `_Id`s at both ends. It was the literal `[]` here with nothing behind
+  # it, which is the shape the weather constant had: a mod shipping transits
+  # had nowhere to put them and could not register `/client/locations` either,
+  # because the backend refuses a second registration of a path. So it reads
+  # `locations.paths`, and the constant is the fallback rather than the only
+  # answer.
+  #
+  # It is still `[]` on every database this repository produces. SPT keeps the
+  # graph in `database/locations/base.json` -- a 2 KB sibling of the per-map
+  # directories, `{locations: {}, paths: [...]}` -- and `aowl importdb` does
+  # not import it, so nothing lands at `locations.paths` today. An empty graph
+  # means the client offers no transit between maps, which is a missing feature
+  # and not a wrong answer.
+  let paths = sub(d, "locations.paths")
+  put(o, "paths", if paths.len > 0: raw(paths) else: emptyArray())
+  result = done(o).text
+
+var gLocations = LocationIndex(ok: false, names: @[], ids: @[])
+
+proc liveLocationIndex*(): LocationIndex =
+  ## The index over the host's database, built on first use. See the note above
+  ## on why this is cached and what that costs.
+  if not gLocations.ok:
+    gLocations = buildLocationIndex(liveDb())
+    info "the locations table lists " & $gLocations.names.len & " map(s)"
+  result = gLocations
+
+proc liveLocationsBody*(): string =
+  ## What `/client/locations` answers with.
+  result = locationsBody(liveDb(), liveLocationIndex())
+
+proc canonicalLocation*(id: string): string =
+  ## The database key for a map the client named. `id` unchanged when the table
+  ## does not have it, because every reader below answers "nothing here" for an
+  ## unknown map and that is a better failure than substituting a map.
+  ##
+  ## The direct hit is tried first and costs one indexed `dbRead`, so the
+  ## ordinary case -- the client sending `bigmap`, which is what it sends --
+  ## never touches the index and never triggers its one-off build.
+  let direct = dbRead("locations." & id & ".base")
+  if direct.ok and direct.raw.len > 0:
+    return id
+  let name = resolveLocation(liveLocationIndex(), id)
+  if name.len > 0:
+    return name
+  result = id
+
 proc locationBase*(id: string): string =
-  ## A map's static description. Looked up by both `_Id` and name, because the
-  ## client asks by one and databases key by the other.
-  let byKey = dbRead("locations." & id & ".base")
+  ## A map's static description. Looked up by both `_Id` and name, because
+  ## `/client/locations` hands the client a list keyed by `_Id` and
+  ## `/client/location/getLocalloot` is asked by name.
+  ##
+  ## This comment used to say exactly that and the code did only half of it --
+  ## one lookup, by name. Nothing failed: an `_Id` simply found no base, and a
+  ## raid started with the default 40-minute timer on a map with no loot.
+  let byKey = dbRead("locations." & canonicalLocation(id) & ".base")
   if byKey.ok and byKey.raw.len > 0:
     return byKey.raw
   result = ""
@@ -54,18 +239,24 @@ proc localLoot*(locationId: string; nowSeconds: int;
   ## not -- an empty map loads and plays, which is a great deal better than a
   ## client that cannot enter a raid at all because the server had nothing to
   ## say about the floor.
-  let base = locationBase(locationId)
+  # The client normally names a map the way the database keys it (`bigmap`),
+  # and that is one indexed read. It may also name it by `_Id`, which is how
+  # `/client/locations` lists it, and that used to find no base at all: the
+  # raid loaded with the default timer and an empty floor. Resolving once here
+  # means every read below is against the key the database actually uses.
+  let name = canonicalLocation(locationId)
+  let base = locationBase(name)
   var o = obj()
-  put(o, "Id", locationId)
-  put(o, "Name", locationId)
+  put(o, "Id", name)
+  put(o, "Name", name)
   # Seeded from the raid id, so the floor of a given raid is reproducible from
   # a bug report. Falling back to the map name when there is no raid id keeps it
   # deterministic rather than empty -- the same map then has the same loot every
   # time, which is worse for play and better than nothing to debug.
   var seed = raidId
   if seed.len == 0:
-    seed = locationId
-  put(o, "Loot", raw(lootFor(locationId, seed)))
+    seed = name
+  put(o, "Loot", raw(lootFor(name, seed)))
   put(o, "transitionParameters", jnull())
   if base.len > 0:
     let esc = field(base, "EscapeTimeLimit")
@@ -89,9 +280,59 @@ proc raidConfiguration*(body: string): string =
   put(o, "side", field(body, "side").asText("Pmc"))
   result = done(o).text
 
-proc weather*(nowSeconds: int): string =
-  ## One weather record, valid and dull. The client refuses to start a raid
-  ## without one, and a variable sky is content rather than pipeline.
+proc weatherFrom*(stored: string; nowSeconds: int): string =
+  ## The sky, out of `stored` when there is one and dull when there is not.
+  ##
+  ## ## `weather` is a mod extension point, and this is the note that says so
+  ##
+  ## Write the **whole response** to the database path `weather` and it is what
+  ## the client gets:
+  ##
+  ##     dbWrite("weather", """{"season": 3, "acceleration": 0,
+  ##                            "weather": {"temp": -14, "cloud": 0.8,
+  ##                                        "rain": 2, "rain_intensity": 0.4,
+  ##                                        "wind_speed": 6, "fog": 0.3}}""")
+  ##
+  ## Only `timestamp`, `time` and `date` are filled in here, because those three
+  ## have to be *now* and cannot be written into a static table. Everything else
+  ## is taken as written: this does not average, clamp or second-guess a mod's
+  ## numbers.
+  ##
+  ## Why it is a path at all. This used to be a constant with nothing behind it,
+  ## which meant a mod shipping arctic weather had nowhere to put it. It could
+  ## not register `/client/weather` either -- the backend refuses a second
+  ## registration of a path, correctly -- so the whole feature was unreachable
+  ## through no fault of the mod. A constant is a fine default and a bad only
+  ## answer.
+  ##
+  ## And why the path is not SPT's own weather file. `aowl importdb`
+  ## deliberately does not import `configs/weather.json`, and that decision is
+  ## right: that file is the *generator's settings* -- `presetWeights.SUNNY.
+  ## clouds` is a weight in a table something rolls against -- not the rendered
+  ## `{season, acceleration, weather}` the client reads. Importing it would put
+  ## a table of weights where a response goes, and the client would read a
+  ## weight as a temperature. The fallback below is the shipped answer until
+  ## something *renders* weather; a mod that wants real weather writes the
+  ## rendered thing here.
+  if stored.len > 0:
+    var o = parseObject(stored)
+    if o.ok:
+      var inner = parseObject(getRaw(o, "weather"))
+      if not inner.ok:
+        inner = newDoc()
+      setNumber(inner, "timestamp", nowSeconds)
+      if not has(inner, "time"):
+        setText(inner, "time", "")
+      if not has(inner, "date"):
+        setText(inner, "date", "")
+      setRaw(o, "weather", text(inner))
+      if not has(o, "acceleration"):
+        setNumber(o, "acceleration", 0)
+      if not has(o, "season"):
+        setNumber(o, "season", 1)
+      setText(o, "time", "")
+      setText(o, "date", "")
+      return text(o)
   var w = obj()
   put(w, "timestamp", nowSeconds)
   put(w, "cloud", 0.0)
@@ -112,3 +353,137 @@ proc weather*(nowSeconds: int): string =
   put(o, "weather", w)
   put(o, "season", 1)
   result = done(o).text
+
+proc weather*(nowSeconds: int): string =
+  ## What `/client/weather` answers with: the database's `weather` when it has
+  ## one, and the constant above when it does not.
+  let stored = dbRead("weather")
+  result = weatherFrom(if stored.ok: stored.raw else: "", nowSeconds)
+
+# ---------------------------------------------------------------------------
+# The checks
+# ---------------------------------------------------------------------------
+#
+# Two things in this module are arithmetic over a table and are reachable from
+# `emutest` only as "a response arrived":
+#
+# - **what `/client/locations` leaves out.** The defect this replaced was not a
+#   wrong answer, it was a right answer that carried the whole game's loot with
+#   it. No request the client makes says "and nothing else came back", so the
+#   only place that can be asserted is here, against a fixture that carries a
+#   map's `looseLoot` and a `staticAmmo` table and then checks they are absent
+#   from the body. A test written on a fixture without loot would pass on a
+#   route that still sent all of it.
+# - **the weather fallback.** The fixtures carry no `weather`, so every route
+#   test sees the constant and none of them can tell the constant apart from a
+#   mod's table being ignored. Both halves are checked here from literals.
+
+const
+  ChkLocations = """{"locations":{
+    "bigmap": {"base": {"_Id": "56f40101d2720b2a4d8b45d6", "Name": "Customs",
+                        "BotMax": 12, "Loot": []},
+               "staticAmmo": {"Caliber762x39": [{"tpl": "ammo1"}]},
+               "looseLoot": {"spawnpointsForced": [],
+                             "spawnpoints": [{"template": {"Id": "sp1"}}]}},
+    "factory4_day": {"base": {"_Id": "55f2d3fd4bdc2d5f408b4567",
+                              "Name": "Factory"}},
+    "nameless": {"base": {"Name": "a map whose base carries no _Id"}},
+    "paths": [{"Source": "55f2d3fd4bdc2d5f408b4567",
+               "Destination": "56f40101d2720b2a4d8b45d6", "Event": false}]
+  }}"""
+    ## Four members under `locations`, and only three of them are maps.
+
+  ChkNoPaths = """{"locations":{
+    "bigmap": {"base": {"_Id": "56f40101d2720b2a4d8b45d6", "Name": "Customs"}}
+  }}"""
+
+  ChkWeather = """{"season": 3, "acceleration": 5,
+                   "weather": {"temp": -14, "cloud": 0.8, "timestamp": 1}}"""
+
+proc selfCheckRaid*(into: var seq[string]): bool =
+  ## Pure, over the literals above. True when it added nothing.
+  let before = into.len
+  let d = textDb(ChkLocations)
+  let idx = buildLocationIndex(d)
+
+  # The map list is the maps, and `paths` is not one of them.
+  if idx.names.len != 3:
+    into.add "raid: the map index lists " & $idx.names.len &
+             " map(s) out of a table with three and a paths array"
+  for name in idx.names:
+    if name == "paths":
+      into.add "raid: the transit graph was listed as a map, which puts an " &
+               "entry on the map screen that cannot be loaded"
+
+  let body = locationsBody(d, idx)
+  let maps = field(body, "locations")
+  let listed = keys(maps)
+  if listed.len != 3:
+    into.add "raid: /client/locations listed " & $listed.len & " map(s)"
+
+  # Keyed by `_Id`, which is what `LocationsGenerateAllResponse` says and what
+  # `paths` is written in. The map with no `_Id` keeps its database key rather
+  # than vanishing.
+  if not maps.field("56f40101d2720b2a4d8b45d6").found:
+    into.add "raid: the map list is not keyed by _Id"
+  if maps.field("bigmap").found:
+    into.add "raid: the map list is keyed by directory name, which no `paths` " &
+             "entry can be resolved against"
+  if not maps.field("nameless").found:
+    into.add "raid: a map whose base has no _Id was dropped from the list " &
+             "rather than listed under its database key"
+
+  # What the route is *for*: the descriptions, without the loot. Checked as an
+  # absence, because that is what the defect was.
+  if not body.contains("\"Customs\"") or not body.contains("\"Factory\""):
+    into.add "raid: the map list lost a map description"
+  if body.contains("looseLoot") or body.contains("spawnpoints"):
+    into.add "raid: /client/locations still carries looseLoot, which is the " &
+             "560 MiB this route was answering with"
+  if body.contains("staticAmmo") or body.contains("Caliber762x39"):
+    into.add "raid: /client/locations still carries staticAmmo"
+  if body.len >= sub(d, "locations").len:
+    into.add "raid: the map list is no smaller than the whole locations " &
+             "subtree it was cut down from"
+
+  # The transit graph, out of the table when there is one and empty when there
+  # is not -- never invented.
+  if count(field(body, "paths")) != 1:
+    into.add "raid: the transit graph did not survive the map list"
+  let bare = textDb(ChkNoPaths)
+  let bareBody = locationsBody(bare, buildLocationIndex(bare))
+  if field(bareBody, "paths").raw != "[]":
+    into.add "raid: a database with no transit graph answered " &
+             field(bareBody, "paths").raw & " rather than an empty list"
+
+  # Naming a map either way round, and refusing to guess at a third.
+  if resolveLocation(idx, "bigmap") != "bigmap":
+    into.add "raid: a map named by its database key did not resolve"
+  if resolveLocation(idx, "56f40101d2720b2a4d8b45d6") != "bigmap":
+    into.add "raid: a map named by _Id resolved to " &
+             resolveLocation(idx, "56f40101d2720b2a4d8b45d6")
+  if resolveLocation(idx, "no_such_map") != "":
+    into.add "raid: an unknown map resolved to " &
+             resolveLocation(idx, "no_such_map") & " rather than to nothing"
+
+  # The weather fallback, which is what every server without a `weather` table
+  # answers with, and the extension point that overrides it.
+  let dull = weatherFrom("", 4242)
+  if field(dull, "weather.temp").asInt(-1) != 18:
+    into.add "raid: the weather fallback answered " &
+             $field(dull, "weather.temp").asInt(-1) & " degrees"
+  if field(dull, "weather.timestamp").asInt(0) != 4242:
+    into.add "raid: the weather fallback did not stamp the current time"
+  if not field(dull, "season").found or not field(dull, "acceleration").found:
+    into.add "raid: the weather fallback is missing a field the client reads"
+
+  let modded = weatherFrom(ChkWeather, 99)
+  if field(modded, "weather.temp").asInt(0) != -14:
+    into.add "raid: a mod's weather was overridden by the constant, which " &
+             "makes the database path decoration"
+  if field(modded, "season").asInt(0) != 3:
+    into.add "raid: a mod's season did not survive"
+  if field(modded, "weather.timestamp").asInt(0) != 99:
+    into.add "raid: a mod's stale timestamp was served instead of now"
+
+  result = into.len == before

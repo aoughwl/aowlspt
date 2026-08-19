@@ -550,16 +550,19 @@ proc killCredit*(cond, victimsJson, location, exitStatus: string;
 # Rewards
 # ---------------------------------------------------------------------------
 
-proc rewardsOf*(tpl, state: string): seq[Reward] =
-  ## A template's rewards for one outcome. `value` is read as a float because
-  ## the live templates write it as a string on some entries and a number on
-  ## others, and `asFloat` reads `"1"` as 1 -- which is the whole reason not to
-  ## read it with `asInt` off a raw member.
+proc rewardList*(node: JsonRef): seq[Reward] =
+  ## A `Reward` array, flattened to what a caller can act on. `value` is read as
+  ## a float because the live templates write it as a string on some entries and
+  ## a number on others, and `asFloat` reads `"1"` as 1 -- which is the whole
+  ## reason not to read it with `asInt` off a raw member.
+  ##
+  ## Split out from `rewardsOf` because a quest keeps its rewards **per
+  ## outcome** -- `rewards.Success`, `rewards.Fail` -- and an achievement keeps
+  ## a single flat list: the reference has `Quest.Rewards` as a
+  ## `QuestRewards` of named groups and `Achievement.Rewards` as a plain
+  ## `IEnumerable<Reward>`. Same element, two containers.
   result = @[]
-  if tpl.len == 0:
-    return
-  let node = field(tpl, "rewards." & state)
-  if not node.found:
+  if not node.found or not isArray(node):
     return
   let elems = each(node)
   for e in elems:
@@ -571,6 +574,13 @@ proc rewardsOf*(tpl, state: string): seq[Reward] =
     if its.found and isArray(its):
       r.items = its.raw()
     result.add r
+
+proc rewardsOf*(tpl, state: string): seq[Reward] =
+  ## A quest template's rewards for one outcome.
+  result = @[]
+  if tpl.len == 0:
+    return
+  result = rewardList(field(tpl, "rewards." & state))
 
 proc traderOf*(tpl: string): string =
   ## Who gave the quest. The sender of the reward message, and the trader whose

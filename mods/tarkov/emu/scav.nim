@@ -27,6 +27,7 @@ import std/strutils
 import aowlspt
 import aowlspt/server
 import aowlspt/json
+import store
 import ids
 import profile
 import inventory
@@ -232,11 +233,17 @@ proc newScavRecord(pmc: Profile; scavId: string; salt, nowSeconds: int): string 
   put(p, "Prestige", obj())
   result = done(p).text
 
+proc loadRecord(pmcId: string; usable: var bool): string =
+  ## The scav's own document, and whether the key could be read. "" with
+  ## `usable` true means there is genuinely no scav yet, which is what makes one
+  ## get created; "" with `usable` false means there is one and it could not be
+  ## read, and creating over that discards the cooldown and the character. See
+  ## `emu/store`.
+  result = readKey(scavKey(pmcId), usable)
+
 proc loadRecord(pmcId: string): string =
-  let stored = load(scavKey(pmcId))
-  if not stored.ok or stored.raw.len == 0:
-    return ""
-  result = stored.raw
+  var usable = true
+  result = loadRecord(pmcId, usable)
 
 proc saveRecord(pmcId, recordJson: string): bool =
   result = save(scavKey(pmcId), recordJson) == Ok
@@ -471,3 +478,48 @@ proc endScavRaid*(pmc: var Profile; playedScav: string; survived: bool;
   setNumber(pmc, "Info.SavageLockTime", until)
   setNumber(pmc, "Info.LastTimePlayedAsSavage", nowSeconds)
   result = true
+
+# ---------------------------------------------------------------------------
+# Selling the scav's run to Fence
+# ---------------------------------------------------------------------------
+
+proc sellAllAction*(name: string): bool =
+  ## `ItemEventActions.SELL_ALL_FROM_SAVAGE`. The reference dump carries the
+  ## enum's member names and not their values, so this is the wire spelling the
+  ## client uses -- the same convention `emu/personal` and `emu/gym` state.
+  result = name == "SellAllFromSavage"
+
+proc refuseSellAll*(action: JsonRef; ch: var Change) =
+  ## "Sell all to Fence" on the scav's results screen, refused by name.
+  ##
+  ## **This one is not blocked on data.** The handbook prices are loaded, Fence
+  ## is in `traders` with his `PriceModifier` and his loyalty levels, and
+  ## `emu/mail` can pay roubles. What is missing is *the items*: there is
+  ## nothing left in the scav to sell by the time this request can arrive.
+  ##
+  ## `endScavRaid` above moves everything a surviving scav carried into the PMC
+  ## stash, in real cells, at `/client/match/local/end` -- which the client
+  ## posts before it draws the screen this button is on. And that is not an
+  ## accident to be undone here: the scav has no stash of its own *by design*
+  ## (see this file's header, and `docs/BACKLOG.md`'s Group F), so there is no
+  ## second inventory this could sell out of. Selling "everything in the scav's
+  ## inventory" against the document this server serves would sell the player's
+  ## whole stash, because the stash is spliced into it.
+  ##
+  ## So: refused, and the player is told the loot is already home rather than
+  ## watching a button do nothing. The consequence is one lost convenience --
+  ## the items are in the stash and have to be sold from there.
+  ##
+  ## The request carries one member, `TotalValue`, and **it is the client's
+  ## arithmetic, not the server's.** It is logged in the refusal rather than
+  ## acted on: a server that paid out a number the client chose, for items it
+  ## never saw, would be taking dictation. Nothing here could check it even if
+  ## the items were present in a form this could price.
+  let claimed = action.field("totalValue").asInt(0)
+  ch.problems.add "selling the scav's run to Fence is not something this " &
+                  "server does: everything your scav survived with was moved " &
+                  "into your stash when the raid ended, so there is nothing " &
+                  "left in the scav to sell" &
+                  (if claimed > 0: " (your client valued it at " & $claimed &
+                                   "); sell it from the stash instead"
+                   else: "; sell it from the stash instead")

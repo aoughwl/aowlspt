@@ -89,6 +89,90 @@ proc descendantsOf*(inv: Inventory; rootId: string): seq[string] =
       result.add k
       stack.add k
 
+proc rootOf*(inv: Inventory; id: string): string =
+  ## The topmost ancestor of an item: walk `parentId` until something has none.
+  ##
+  ## Bounded by the size of the list, because a profile that already carries a
+  ## cycle -- one written before the check below existed, or handed back by a
+  ## client -- must make this return an answer rather than spin. The answer in
+  ## that case is the last id seen, which is wrong and is still an answer.
+  result = id
+  var steps = 0
+  while steps <= inv.items.len:
+    let at = indexOf(inv, result)
+    if at < 0:
+      return
+    let parent = field(inv.items.items[at], "parentId").asText("")
+    if parent.len == 0:
+      return
+    result = parent
+    inc steps
+
+proc wouldCycle*(inv: Inventory; movingId, destId: string): bool =
+  ## Would putting `movingId` inside `destId` make it its own ancestor?
+  ##
+  ## This is the check that was missing, and its absence destroyed profiles
+  ## from one ordinary-looking request. `{"Action":"Move","item":X,"to":
+  ## {"id":X}}` wrote `parentId: X` onto X and answered `err:0` -- and the same
+  ## request naming the **stash** and something the stash holds made the
+  ## inventory's root its own descendant. The client draws the stash by walking
+  ## `parentId` down from the root, so what it draws afterwards is nothing, and
+  ## nothing can undo it: the drag that would fix it has to reach an item the
+  ## client can no longer see.
+  ##
+  ## So: walk up from the destination. If the item being moved is anywhere on
+  ## that path -- including *being* the destination -- the move closes a loop.
+  if movingId.len == 0 or destId.len == 0:
+    return false
+  if movingId == destId:
+    return true
+  var cur = destId
+  var steps = 0
+  while steps <= inv.items.len:
+    if cur == movingId:
+      return true
+    let at = indexOf(inv, cur)
+    if at < 0:
+      return false
+    let parent = field(inv.items.items[at], "parentId").asText("")
+    if parent.len == 0:
+      return false
+    cur = parent
+    inc steps
+  # Ran out of steps, which means the list already has a cycle in it. Refusing
+  # is the safe answer: the alternative is adding a second one.
+  result = true
+
+proc isRootContainer*(inv: Inventory; id: string): bool =
+  ## Is this one of the containers the profile is built on?
+  ##
+  ## They are exactly the items with **no parent** -- the stash, the equipment
+  ## root, the quest raid and quest stash containers and the sorting table --
+  ## and that is how `emu/market` identifies them too, so neither module has to
+  ## carry a list of ids that a profile template could change out from under it.
+  ##
+  ## The reason this is a separate question from `wouldCycle`: putting the
+  ## stash inside the *equipment* root closes no loop at all. It passes every
+  ## cycle check there is, and it still leaves a client that draws the stash by
+  ## walking `parentId` down from the root with nothing to draw, and no drag
+  ## that could undo it. `ApplyInventoryChanges` had the same hole and it was
+  ## closed there first; `Move` and `Swap` are the other two ways in.
+  if id.len == 0:
+    return false
+  let at = indexOf(inv, id)
+  if at < 0:
+    return false
+  result = field(inv.items.items[at], "parentId").asText("").len == 0
+
+proc wouldUproot*(inv: Inventory; movingId, destId: string): bool =
+  ## Would this move give one of those containers a parent? A destination of
+  ## nothing is not a move at all -- `applyLocation` leaves `parentId` alone
+  ## when `to.id` is empty -- so it is only an uprooting when there is somewhere
+  ## for it to go.
+  if destId.len == 0:
+    return false
+  result = isRootContainer(inv, movingId)
+
 # ---------------------------------------------------------------------------
 # The operations
 # ---------------------------------------------------------------------------
@@ -115,6 +199,14 @@ proc doMove*(inv: var Inventory; action: JsonRef; ch: var Change): bool =
   let idx = indexOf(inv, id)
   if idx < 0:
     ch.problems.add "move: no such item " & id
+    return false
+  let dest = action.field("to").field("id").asText("")
+  if wouldCycle(inv, id, dest):
+    ch.problems.add "move: that would put " & id & " inside itself"
+    return false
+  if wouldUproot(inv, id, dest):
+    ch.problems.add "move: " & id & " is one of the containers this profile " &
+                    "is built on and does not go inside anything"
     return false
   var d = itemAt(inv, idx)
   applyLocation(d, action.field("to"))
@@ -283,6 +375,22 @@ proc doSwap*(inv: var Inventory; action: JsonRef; ch: var Change): bool =
   if i1 < 0 or i2 < 0:
     ch.problems.add "swap: one of those items is not here"
     return false
+  # Both destinations, against the tree as it is now. Checking the pair against
+  # the state *after* the swap would be more exact and is not worth it: the
+  # destructive cases -- either item landing inside the other's subtree -- are
+  # all caught here, and a swap is two moves the client has already drawn.
+  if wouldCycle(inv, id1, action.field("to").field("id").asText("")) or
+     wouldCycle(inv, id2, action.field("to2").field("id").asText("")):
+    ch.problems.add "swap: that would put an item inside itself"
+    return false
+  # And the same uprooting check on both halves. A swap of the stash with
+  # something hanging off the equipment root closes no loop and destroys the
+  # profile exactly as thoroughly.
+  if wouldUproot(inv, id1, action.field("to").field("id").asText("")) or
+     wouldUproot(inv, id2, action.field("to2").field("id").asText("")):
+    ch.problems.add "swap: that would move one of the containers this " &
+                    "profile is built on and they do not go inside anything"
+    return false
   var a = itemAt(inv, i1)
   var b = itemAt(inv, i2)
   applyLocation(a, action.field("to"))
@@ -326,6 +434,180 @@ proc doTransfer*(inv: var Inventory; action: JsonRef; ch: var Change): bool =
   result = true
 
 # ---------------------------------------------------------------------------
+# The client's own batch
+# ---------------------------------------------------------------------------
+#
+# `ApplyInventoryChanges` is the action the client sends when it has rearranged
+# the stash itself -- the sort button, and the tidy-up after a raid. It does not
+# describe *operations*; it hands back **whole items**, already in their new
+# places, and says "make it look like this".
+#
+# Which is exactly the request this server is not allowed to believe. An item
+# document carries `upd.StackObjectsCount` and `_tpl` alongside the position,
+# and a body that says "this stack of 12 roubles is now a stack of 12000000, and
+# by the way it moved two cells left" is a well-formed sort. So the rule is a
+# **whitelist**: the position and the handful of cosmetic `upd` members the
+# client legitimately owns are taken, and everything else on the entry is left
+# as the profile has it. An entry claiming a different template or a different
+# stack size is refused outright rather than partially applied, because a client
+# sending one is either out of step or lying and neither is a state to merge.
+#
+# The shape is marked *(unverified)* on purpose: the reference dump has an
+# `APPLY_INVENTORY_CHANGES` action in `ItemEventActions` and **no request DTO**
+# for it anywhere in `Models.Eft.*`, so the member names below are the client's
+# well-known ones and not something the dump confirms. Both casings are read.
+#
+# `deletedItems` is refused rather than honoured, for the same reason: a delete
+# arm on a batch endpoint whose shape cannot be checked against the reference is
+# a way to lose a stash from one malformed body, and the client has `Remove` --
+# which is checked -- for everything it actually needs to throw away.
+
+proc updWhitelist(): seq[string] =
+  ## The `upd` members a client's own layout pass may set. Every one of them is
+  ## something the player toggles by hand and nothing on the list has a price,
+  ## a count or a durability in it.
+  result = @["Tag", "Foldable", "Togglable", "PinLockState", "Map"]
+
+proc stackCountOf(j: JsonRef): int =
+  let upd = j.field("upd")
+  if not upd.found:
+    return -1
+  let v = upd.field("StackObjectsCount")
+  if not v.found:
+    return -1
+  result = v.asInt(-1)
+
+proc doApplyChanges*(inv: var Inventory; action: JsonRef;
+                     ch: var Change): bool =
+  var entries = action.field("changedItems")
+  if not entries.found:
+    entries = action.field("ChangedItems")
+  var removed = action.field("deletedItems")
+  if not removed.found:
+    removed = action.field("DeletedItems")
+  if removed.found and isArray(removed) and count(removed) > 0:
+    ch.problems.add "apply: this server does not delete items from a batch; " &
+                    "use Remove"
+    return false
+  if not entries.found or not isArray(entries):
+    ch.problems.add "apply: nothing to apply"
+    return false
+
+  # ---- verify everything, including the tree the batch would produce ------
+  #
+  # The cycle check is done against a *simulated* parent map rather than one
+  # entry at a time, because a batch can be a legal rotation -- A into B while B
+  # moves out of A -- that each single step would refuse, and an illegal one
+  # whose steps are each individually fine. Only the finished tree tells them
+  # apart, and only checking the finished tree lets the whole batch be refused
+  # instead of half-applied.
+  var ids: seq[string] = @[]
+  var parents: seq[string] = @[]
+  for i in 0 ..< inv.items.len:
+    ids.add field(inv.items.items[i], "_id").asText("")
+    parents.add field(inv.items.items[i], "parentId").asText("")
+
+  var touched: seq[int] = @[]
+  let list = each(entries)
+  for e in list:
+    let id = e.field("_id").asText("")
+    if id.len == 0:
+      ch.problems.add "apply: an entry named no item"
+      return false
+    let at = indexOf(inv, id)
+    if at < 0:
+      # A batch may not *create* an item. Everything the client can legitimately
+      # have made by now already exists here, and an entry for something that
+      # does not is a client working from a profile this server never wrote.
+      ch.problems.add "apply: no such item " & id
+      return false
+    let tpl = e.field("_tpl").asText("")
+    if tpl.len > 0 and tpl != field(inv.items.items[at], "_tpl").asText(""):
+      ch.problems.add "apply: " & id & " is not a " & tpl & " here"
+      return false
+    let claimed = stackCountOf(e)
+    if claimed >= 0 and claimed != stackCount(itemAt(inv, at)):
+      ch.problems.add "apply: that would change the stack on " & id &
+                      " from " & $stackCount(itemAt(inv, at)) & " to " &
+                      $claimed
+      return false
+    let parent = e.field("parentId")
+    if parent.found:
+      parents[at] = parent.asText("")
+    touched.add at
+
+  if touched.len == 0:
+    ch.problems.add "apply: nothing to apply"
+    return false
+
+  for at in touched:
+    var steps = 0
+    var cur = parents[at]
+    while cur.len > 0 and steps <= ids.len:
+      if cur == ids[at]:
+        ch.problems.add "apply: that layout would put " & ids[at] &
+                        " inside itself"
+        return false
+      var next = ""
+      for k in 0 ..< ids.len:
+        if ids[k] == cur:
+          next = parents[k]
+      cur = next
+      inc steps
+    if steps > ids.len:
+      ch.problems.add "apply: that layout has a loop in it"
+      return false
+
+  # And the five containers a profile is built on stay where they are.
+  #
+  # The cycle check above does not catch this and it is the same class of
+  # damage: those five are exactly the items with no parent, and putting the
+  # stash inside the *equipment* root closes no loop at all while still leaving
+  # a client that draws the stash by walking down from the root with nothing to
+  # draw. `emu/market` already defines the roots this way, for the same reason.
+  for at in touched:
+    if parents[at].len > 0 and
+       field(inv.items.items[at], "parentId").asText("").len == 0:
+      ch.problems.add "apply: " & ids[at] &
+                      " is one of the containers this profile is built on " &
+                      "and does not go inside anything"
+      return false
+
+  # ---- act ---------------------------------------------------------------
+  let names = updWhitelist()
+  for e in list:
+    let id = e.field("_id").asText("")
+    let at = indexOf(inv, id)
+    if at < 0:
+      continue
+    var d = itemAt(inv, at)
+    let parent = e.field("parentId")
+    if parent.found:
+      setText(d, "parentId", parent.asText(""))
+    let slot = e.field("slotId")
+    if slot.found:
+      setText(d, "slotId", slot.asText(""))
+    let loc = e.field("location")
+    if loc.found and not isNull(loc):
+      setRaw(d, "location", raw(loc))
+    elif loc.found:
+      remove(d, "location")
+    let upd = e.field("upd")
+    if upd.found:
+      var kept = parseObject(getRaw(d, "upd"))
+      if not kept.ok:
+        kept = newDoc()
+      for name in names:
+        let v = upd.field(name)
+        if v.found:
+          setRaw(kept, name, raw(v))
+      setRaw(d, "upd", text(kept))
+    inv.items.replaceAt(at, text(d))
+    inv.dirty = true
+    ch.changed.add text(d)
+  result = true
+
+# ---------------------------------------------------------------------------
 # Dispatch
 # ---------------------------------------------------------------------------
 
@@ -346,6 +628,7 @@ proc applyAction*(inv: var Inventory; action: JsonRef; ch: var Change;
   of "Toggle": result = doToggle(inv, action, ch)
   of "Tag": result = doTag(inv, action, ch)
   of "Swap": result = doSwap(inv, action, ch)
+  of "ApplyInventoryChanges": result = doApplyChanges(inv, action, ch)
   of "Examine", "ReadEncyclopedia":
     let id = action.field("item").asText("")
     var tpl = id

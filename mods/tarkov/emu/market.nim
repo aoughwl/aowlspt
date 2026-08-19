@@ -13,6 +13,15 @@
 ## hundred small records. The cache is rebuilt when it expires, which is also
 ## how offers get fresh expiry timestamps.
 ##
+## **The cap is shared, and the search is not capped.** The list is bounded --
+## see `TraderSharePercent` -- and a bound filled from one source before the
+## other gets a turn is not a bound, it is a preference nobody wrote down: the
+## traders' assorts used to fill it entirely, so on a real database the flea was
+## the trader screens over again and nothing that was not already on one could
+## be bought anywhere. Half the cap each now, and a search that names one
+## template materialises an offer for it whether or not the rebuild reached it,
+## because a cap applied before the filter is a cap on the *answer*.
+##
 ## **Money is stacks, not a balance.** Buying goes through `takePayment` in
 ## `emu/trading`, unchanged and for the same reason: the request names which
 ## stacks to pay from, every one of them is verified before anything is taken,
@@ -38,6 +47,8 @@ import std/strutils
 import aowlspt
 import aowlspt/server
 import aowlspt/json
+import numbers
+import store
 import ids
 import templates
 import inventory
@@ -61,6 +72,46 @@ const
   ## would produce a response the client spends longer parsing than the raid
   ## takes to load, and no player scrolls past the first few pages of a
   ## category. The cap is per *rebuild*, and the search filters within it.
+
+  TraderSharePercent = 50
+  ## How much of the cap the traders' own stock may take.
+  ##
+  ## This number is here because leaving it out was a bug, and a quiet one.
+  ## `offersFromTraders` used to fill the whole cap and `offersFromHandbook`
+  ## ran afterwards against a list that was already full -- so against a real
+  ## 39 MiB database the flea was **600 rows of Prapor, Therapist and Skier
+  ## stock and not one generated offer**, and since no trader sells a bolt or a
+  ## screw nut at any loyalty level, in any currency, in any barter, neither
+  ## did the flea. Most hideout stage materials were then obtainable only by
+  ## raiding for them, which is not the game's economy and which nothing
+  ## announced.
+  ##
+  ## A ratio rather than "generate first" or "raise the cap":
+  ##
+  ## - Generating first inverts the same bug -- the handbook is forty times the
+  ##   size of every assort put together, so the traders would get nothing and
+  ##   the flea would stop showing the one half of it whose prices are real
+  ##   data rather than derived.
+  ## - Raising the cap does not fix it at all. Whatever the cap is, one source
+  ##   filling it first empties the other, and the client pages the list: it
+  ##   asks for fifteen rows at a time, so a bigger pool costs every request
+  ##   more and shows the player nothing extra.
+  ## - Interleaving the two sources is what a ratio *is*, once the shares are
+  ##   fixed; the ratio is the part that can be stated and checked.
+  ##
+  ## Half and half, with either side taking the slack the other cannot use, so
+  ## a database with one trader still fills the market off the handbook and a
+  ## database with no handbook still fills it off the traders. The split is not
+  ## a number recovered from the game -- the real flea's composition is a live
+  ## player population and there is nothing in the dump that determines it --
+  ## so it is stated here as a choice rather than presented as data.
+
+  MinTargetedOffers = 1
+  ## How many offers a search naming one template guarantees for it. See
+  ## `ensureOffersFor`: the cap is applied when the market is *built*, and a
+  ## cap applied before the filter is the same bug wearing a different hat --
+  ## the player searches for a screw nut, the unfiltered pool never had one,
+  ## and the market answers "nobody is selling that" about an item it prices.
 
   DefaultSaleMinutes* = 30
   ## How long a competitively priced player offer sits before it sells.
@@ -137,6 +188,11 @@ var gOffers: seq[Offer] = @[]
 var gCategories: seq[Category] = @[]
 var gBuiltAt = 0
 var gBuilt = false
+var gTargeted = 0
+  ## How many offers were added *after* the rebuild, by a search that named one
+  ## template the built market had no row for. Counted so the pool cannot grow
+  ## without bound over a long session: past a second capful the market is
+  ## rebuilt, which drops them all and starts the count again.
 
 proc configureMarket*(spreadPercent, offerHours, maxOffers,
                       saleMinutes: int) =
@@ -236,11 +292,19 @@ const SellerNames = ["Kappa", "Zryachiy", "Tagilla", "Reshala", "Killa",
                      "Glukhar", "Sanitar", "Shturman", "Kaban", "Partisan",
                      "Cultist", "Knight", "BigPipe", "BirdEye"]
 
-proc sellerFor(tpl: string; index: int): string =
-  ## A stable seller per offer. Not a player database -- the client only ever
-  ## renders the nickname and the rating, and inventing a persistent population
-  ## of fake traders would be state to keep for something nothing reads back.
-  result = SellerNames[(hashOf(tpl) + index) mod SellerNames.len]
+proc sellerFor(tpl: string): string =
+  ## A stable seller per *template*. Not a player database -- the client only
+  ## ever renders the nickname and the rating, and inventing a persistent
+  ## population of fake traders would be state to keep for something nothing
+  ## reads back.
+  ##
+  ## Per template and not per position in the list, which it used to be. The
+  ## seller is what the price is wobbled from, so a seller that depended on
+  ## where the offer happened to land meant the same screw nut was priced one
+  ## way by a rebuild and another way by the targeted lookup in
+  ## `ensureOffersFor` -- a market with two prices for one item, differing by
+  ## nothing a player could see.
+  result = SellerNames[hashOf(tpl) mod SellerNames.len]
 
 proc ratingFor(seller: string): float =
   ## 0.0 .. 6.0, stable per seller, because the rating column must not change
@@ -313,8 +377,16 @@ proc inCategory(leaf, wanted: string): bool =
     inc depth
   result = false
 
-proc offersFromTraders(nowSec: int; out1: var seq[Offer]) =
-  ## Every trader's stock, as flea offers.
+proc traderCandidates(nowSec: int; onlyTpl: string; cand: var seq[Offer];
+                      first, last: var seq[int]) =
+  ## Every trader's stock, as flea offers, grouped by trader: trader `t`'s
+  ## offers are `cand[first[t] ..< last[t]]`. Grouped rather than concatenated
+  ## because the caller takes a *share* of them and has to take it round-robin
+  ## -- a flat list in document order is how Prapor came to own the flea.
+  ##
+  ## `onlyTpl` empty means every template; naming one is the targeted lookup in
+  ## `ensureOffersFor`, and it is the same code so that an offer found that way
+  ## is identical to the one a rebuild would have produced.
   ##
   ## Only offers whose requirement is a single currency. A barter offer -- "two
   ## bolts for a bandage" -- has no price, and the flea sorts and filters on
@@ -324,8 +396,8 @@ proc offersFromTraders(nowSec: int; out1: var seq[Offer]) =
   ## is where they can be honoured.
   let ids = traderIds()
   for tid in ids:
-    if out1.len >= gMaxOffers:
-      return
+    first.add cand.len
+    last.add cand.len
     let base = dbRead("traders." & tid & ".base")
     var nickname = tid
     var currency = CurrencyRoubles
@@ -343,8 +415,6 @@ proc offersFromTraders(nowSec: int; out1: var seq[Offer]) =
     let loyalties = a.field("loyal_level_items")
     let items = each(a.field("items"))
     for it in items:
-      if out1.len >= gMaxOffers:
-        return
       # Root items only. A scope that is part of a rifle in the assort is not
       # something the trader sells separately, and listing it would sell the
       # player a duplicate of a part they already bought attached.
@@ -353,6 +423,8 @@ proc offersFromTraders(nowSec: int; out1: var seq[Offer]) =
       let offerItemId = it.field("_id").asText("")
       let tpl = it.field("_tpl").asText("")
       if tpl.len == 0 or offerItemId.len == 0:
+        continue
+      if onlyTpl.len > 0 and tpl != onlyTpl:
         continue
 
       let req = scheme.child(offerItemId).at(0).at(0)
@@ -383,50 +455,125 @@ proc offersFromTraders(nowSec: int; out1: var seq[Offer]) =
       # wins -- it is what the trading screen bills.
       if not isCurrency(o.currency):
         o.currency = currency
-      out1.add o
+      cand.add o
+      last[last.len - 1] = cand.len
 
-proc offersFromHandbook(nowSec: int; out1: var seq[Offer]) =
-  ## The rest of the market: player offers for everything the handbook prices.
+proc generatedOffer(nowSec: int; tpl, category: string; base: int): Offer =
+  ## One invented player offer for a template the handbook prices. Split out of
+  ## the handbook pass so that the pass and the targeted lookup produce the same
+  ## row for the same template -- a search that materialises a different offer
+  ## from the one a rebuild would have made is a market with two prices.
+  let seller = sellerFor(tpl)
+  let stackLimit = itemStackLimit(tpl)
+  var count = 1
+  if stackLimit > 1:
+    count = 1 + (hashOf(tpl) mod 3)
+    if count > stackLimit: count = stackLimit
+  result = Offer(id: newId(), tpl: tpl, itemsJson: "", rootId: "",
+                 sellerId: "", seller: seller, memberType: MemberTypePlayer,
+                 rating: ratingFor(seller), ratingGrowing: true,
+                 price: spreadPrice(seller, tpl, base) * count,
+                 currency: CurrencyRoubles, loyalty: 1, quantity: count,
+                 unlimited: false, sellInOnePiece: count > 1,
+                 startTime: nowSec, endTime: nowSec + gOfferHours * 3600,
+                 category: category, name: "", nameKnown: false)
+  result.sellerId = hex(int64(hashOf(seller)), 24)
+  result.rootId = newId()
+  result.itemsJson = syntheticItems(tpl, count, result.rootId)
+
+proc pricedEntry(e: JsonRef; tpl: var string; base: var int): bool =
+  ## Is this handbook entry one an offer can be made from? Its own proc because
+  ## the handbook is walked twice per rebuild -- once to count what is eligible,
+  ## so the stride below can be worked out, and once to take every nth of them
+  ## -- and the two walks agreeing is the whole of the arithmetic.
+  tpl = e.field("Id").asText("")
+  base = e.field("Price").asInt(0)
+  if tpl.len == 0 or base <= 0:
+    return false
+  # Currency itself is in the handbook. An offer selling roubles for roubles
+  # is a row every search matches and nobody wants.
+  if isCurrency(tpl):
+    return false
+  result = true
+
+proc handbookEligible(): int =
+  ## How many offers the handbook could supply. Read before the shares are
+  ## worked out, so that a database whose handbook is smaller than the
+  ## handbook's share hands what it cannot use back to the traders instead of
+  ## leaving the market short.
+  result = 0
+  let hb = dbRead("templates.handbook.Items")
+  if not hb.ok or hb.raw.len == 0:
+    return
+  var tpl = ""
+  var base = 0
+  for e in each(whole(hb.raw)):
+    if pricedEntry(e, tpl, base):
+      inc result
+
+proc offersFromHandbook(nowSec: int; out1: var seq[Offer]; quota: int;
+                        stocked: seq[string]) =
+  ## The generated half of the market: player offers for what the handbook
+  ## prices, up to `quota`.
   ##
-  ## One pass. `handbookPrice` in `emu/templates` scans the whole table per
-  ## call, which is right for the one lookup a sale needs and wrong by a factor
-  ## of the table size here.
+  ## **Spread over the whole handbook, not the first `quota` entries of it.**
+  ## The handbook is written in category order, so taking a prefix gives a
+  ## market that is entirely ammunition -- the same failure as taking the
+  ## traders in document order, one level down. Every nth eligible entry is
+  ## taken instead, n chosen so the last one taken is near the end of the table.
+  ##
+  ## `stocked` is the templates the trader half of the list already carries. A
+  ## generated offer for one of those buys the player nothing they could not
+  ## already get from the trader screen, and the offers that are worth spending
+  ## the quota on are exactly the ones no trader has -- which is the whole
+  ## finding this split came out of. When a skipped entry costs the market an
+  ## offer the next eligible entry takes its place, so the quota is still spent.
+  ##
+  ## One pass over the table, twice. `handbookPrice` in `emu/templates` scans
+  ## the whole table per call, which is right for the one lookup a sale needs
+  ## and wrong by a factor of the table size here.
+  if quota <= 0:
+    return
   let hb = dbRead("templates.handbook.Items")
   if not hb.ok or hb.raw.len == 0:
     return
   let entries = each(whole(hb.raw))
-  var index = 0
+  var tpl = ""
+  var base = 0
+  var eligible = 0
   for e in entries:
-    if out1.len >= gMaxOffers:
+    if pricedEntry(e, tpl, base):
+      inc eligible
+  if eligible == 0:
+    return
+  var step = eligible div quota
+  if step < 1:
+    step = 1
+
+  var index = 0     ## how many eligible entries have been seen
+  var due = 0       ## the eligible index the next offer is taken at
+  var taken = 0
+  for e in entries:
+    if taken >= quota:
       return
-    let tpl = e.field("Id").asText("")
-    let base = e.field("Price").asInt(0)
-    if tpl.len == 0 or base <= 0:
+    if not pricedEntry(e, tpl, base):
       continue
-    # Currency itself is in the handbook. An offer selling roubles for roubles
-    # is a row every search matches and nobody wants.
-    if isCurrency(tpl):
-      continue
-    let seller = sellerFor(tpl, index)
-    let stackLimit = itemStackLimit(tpl)
-    var count = 1
-    if stackLimit > 1:
-      count = 1 + (hashOf(tpl) mod 3)
-      if count > stackLimit: count = stackLimit
-    var o = Offer(id: newId(), tpl: tpl, itemsJson: "", rootId: "",
-                  sellerId: "", seller: seller, memberType: MemberTypePlayer,
-                  rating: ratingFor(seller), ratingGrowing: true,
-                  price: spreadPrice(seller, tpl, base) * count,
-                  currency: CurrencyRoubles, loyalty: 1, quantity: count,
-                  unlimited: false, sellInOnePiece: count > 1,
-                  startTime: nowSec, endTime: nowSec + gOfferHours * 3600,
-                  category: parentText(e.field("ParentId")), name: "",
-                  nameKnown: false)
-    o.sellerId = hex(int64(hashOf(seller)), 24)
-    o.rootId = newId()
-    o.itemsJson = syntheticItems(tpl, count, o.rootId)
-    out1.add o
+    let mine = index >= due
     inc index
+    if not mine:
+      continue
+    var already = false
+    for s in stocked:
+      if s == tpl:
+        already = true
+        break
+    if already:
+      # `due` deliberately not advanced: the next eligible entry is taken in
+      # this one's place rather than the slot being lost.
+      continue
+    out1.add generatedOffer(nowSec, tpl, parentText(e.field("ParentId")), base)
+    inc taken
+    due = index + step - 1
 
 proc categoryOf(tpl: string): string =
   ## The handbook parent of one template. Used for the offers that did not come
@@ -442,16 +589,59 @@ proc categoryOf(tpl: string): string =
   result = ""
 
 proc rebuild(nowSec: int) =
+  ## The cap, shared out. See `TraderSharePercent` for why it is shared at all.
   var built: seq[Offer] = @[]
   loadCategories()
-  offersFromTraders(nowSec, built)
-  offersFromHandbook(nowSec, built)
+
+  var cand: seq[Offer] = @[]
+  var firstOf: seq[int] = @[]
+  var lastOf: seq[int] = @[]
+  traderCandidates(nowSec, "", cand, firstOf, lastOf)
+
+  # The traders' share, and the slack. Neither source is *made* to use its half:
+  # the handbook's half goes to the traders when there is no handbook, and the
+  # traders' half goes to the handbook when the assorts are small -- which is
+  # every server running on `tests/fixtures`, where both sources fit twice over
+  # and the split never binds at all.
+  var traderQuota = (gMaxOffers * TraderSharePercent) div 100
+  if traderQuota > cand.len:
+    traderQuota = cand.len
+  let hbEligible = handbookEligible()
+  if gMaxOffers - traderQuota > hbEligible:
+    traderQuota = gMaxOffers - hbEligible
+    if traderQuota > cand.len:
+      traderQuota = cand.len
+  if traderQuota < 0:
+    traderQuota = 0
+
+  # Round-robin, one offer per trader per pass. In document order the first two
+  # or three traders in a real database spend the whole share between them and
+  # every trader after them is absent from the flea entirely; a pass at a time
+  # gives each of them the same number of rows until it runs out of stock.
+  var round1 = 0
+  var more = true
+  while more and built.len < traderQuota:
+    more = false
+    for t in 0 ..< firstOf.len:
+      if built.len >= traderQuota:
+        break
+      let at = firstOf[t] + round1
+      if at < lastOf[t]:
+        built.add cand[at]
+        more = true
+    inc round1
+
   # Trader offers were built before the handbook was read, so their category is
   # filled in here rather than looked up inside that loop.
+  var stocked: seq[string] = @[]
   for i in 0 ..< built.len:
     if built[i].category.len == 0 and built[i].memberType == MemberTypeTrader:
       built[i].category = categoryOf(built[i].tpl)
+    stocked.add built[i].tpl
+
+  offersFromHandbook(nowSec, built, gMaxOffers - built.len, stocked)
   gOffers = built
+  gTargeted = 0
   gBuiltAt = nowSec
   gBuilt = true
 
@@ -462,6 +652,96 @@ proc ensureMarket*(nowSec: int) =
   if gBuilt and nowSec < gBuiltAt + gOfferHours * 3600:
     return
   rebuild(nowSec)
+
+proc isCategoryId(id: string): bool =
+  for c in gCategories:
+    if c.id == id:
+      return true
+  result = false
+
+proc ensureOffersFor*(tpl: string; nowSec: int) =
+  ## Makes sure a search that names one template has something to find.
+  ##
+  ## **The cap is applied when the market is built, and the filter runs after
+  ## it.** That is the same bug as the one the trader/handbook split fixes,
+  ## one layer up: however the shares are divided, the pool is a few hundred
+  ## rows out of thousands of templates, so a player searching for a screw nut
+  ## by id -- which is what `linkedSearchId` and an item id in `handbookId` are
+  ## -- gets "nobody is selling that" about an item the handbook prices and a
+  ## trader stocks. A page cap is a page cap; a *search* cap is a lie.
+  ##
+  ## So a search for one template materialises what the rebuild did not reach:
+  ## every currency-priced trader offer for it, and one generated offer if the
+  ## handbook has a price. They go into `gOffers` rather than into a temporary
+  ## list because the client's next request is `RagFairBuyOffer` naming the id
+  ## it was shown, and `findOffer` has to be able to find it.
+  ##
+  ## Also when the only offers for it have been bought out: an offer with
+  ## nothing left is filtered out of the search, and without this the flea
+  ## would answer "nobody is selling that" for the rest of the twelve hours to
+  ## the next rebuild -- and a hideout stage that asks for ten of something
+  ## could not be supplied by a market that lists three. The seller lists
+  ## another, at the same price: everything about a generated offer is derived
+  ## from the template id, so there is no second price for it to appear at.
+  ##
+  ## Which does mean the flea's supply of a template is not exhaustible, and
+  ## `buyOffer` says the opposite about *one offer id* -- deliberately, and the
+  ## two are not in conflict. An offer id that keeps answering "yes" is an
+  ## infinite supply of a thing for one payment's worth of checking; a fresh
+  ## offer is a fresh row at a fresh price with the stock counted down again,
+  ## and every purchase is still paid for at the offer's own price out of stacks
+  ## the profile is verified to hold. What is unbounded here is the *market*,
+  ## which is what a market with sellers in it is; what is bounded is any one
+  ## offer, which is what stops the same row being bought twice.
+  if tpl.len == 0:
+    return
+  # A handbook *category* id is the ordinary case for `handbookId` and it is not
+  # a template. Answered from the category table, which is already in memory, so
+  # that the common search does not pay for the walks below.
+  if isCategoryId(tpl):
+    return
+  # And an id the item table has never heard of is not a template either. One
+  # member scan, and it is what keeps this cheap for a client that is not
+  # asking in good faith: without it, any 24-character string in `handbookId`
+  # bought a walk of every trader's assort and of the whole handbook, from a
+  # request that costs nothing to send.
+  if not itemExists(tpl):
+    return
+  var have = 0
+  for o in gOffers:
+    if o.tpl == tpl and (o.unlimited or o.quantity > 0):
+      inc have
+      if have >= MinTargetedOffers:
+        return
+
+  # Past a second capful of these, start again rather than grow for ever. A
+  # session that searches for a thousand different templates is a session whose
+  # pool would otherwise be a thousand rows longer than the cap says.
+  if gTargeted >= gMaxOffers:
+    rebuild(nowSec)
+    for o in gOffers:
+      if o.tpl == tpl and (o.unlimited or o.quantity > 0):
+        return
+
+  var cand: seq[Offer] = @[]
+  var firstOf: seq[int] = @[]
+  var lastOf: seq[int] = @[]
+  traderCandidates(nowSec, tpl, cand, firstOf, lastOf)
+  let cat = categoryOf(tpl)
+  for o in cand:
+    var withCat = o
+    withCat.category = cat
+    gOffers.add withCat
+    inc gTargeted
+
+  # And one from the handbook, if it prices this template. `handbookPrice` and
+  # `categoryOf` are each a walk of the table, which is the cost this module
+  # goes to some trouble to keep out of the rebuild -- here it is paid once per
+  # template ever searched for, and never again while the market stands.
+  let base = handbookPrice(tpl)
+  if base > 0:
+    gOffers.add generatedOffer(nowSec, tpl, cat, base)
+    inc gTargeted
 
 proc nameOf(index: int): string =
   ## The localised name of an offer's item, fetched at most once per offer.
@@ -495,17 +775,28 @@ proc nameOf(index: int): string =
 
 proc marketKey*(profileId: string): string = StoreKeyPrefix & profileId
 
-proc playerDoc*(profileId: string): Doc =
-  ## `{"rating":..,"offers":[..]}`. A profile that has never listed anything has
-  ## no key at all, which is the normal first-run case and not a fault.
-  let stored = load(marketKey(profileId))
-  if stored.ok and stored.raw.len > 0:
-    var d = parseObject(stored.raw)
+proc playerDoc*(profileId: string; usable: var bool): Doc =
+  ## `{"rating":..,"offers":[..]}`, and whether the key could be read.
+  ##
+  ## A profile that has never listed anything has no key at all, which is the
+  ## normal first-run case and not a fault. A key that is there and unreadable
+  ## is a fault, and answering it as "no offers" would let the next listing
+  ## write one offer over every offer the player has items tied up in -- and the
+  ## items in a listed offer are *out of the profile*, so that is the items
+  ## gone. See `emu/store`.
+  let raw1 = readKey(marketKey(profileId), usable)
+  if raw1.len > 0:
+    var d = parseObject(raw1)
     if d.ok:
       return d
   result = newDoc()
-  setNumber(result, "rating", 0.0)
+  setRaw(result, "rating", numText(0.0))
   setRaw(result, "offers", "[]")
+
+proc playerDoc*(profileId: string): Doc =
+  ## For the read-only callers.
+  var usable = true
+  result = playerDoc(profileId, usable)
 
 proc savePlayerDoc(profileId: string; d: Doc): bool =
   result = save(marketKey(profileId), text(d)) == Ok
@@ -523,7 +814,7 @@ proc playerRating*(profileId: string): float =
 proc setPlayerOffers(profileId: string; offers: List; rating: float): bool =
   var d = playerDoc(profileId)
   setRaw(d, "offers", text(offers))
-  setNumber(d, "rating", rating)
+  setRaw(d, "rating", numText(rating))
   result = savePlayerDoc(profileId, d)
 
 proc playerOfferRecords(profileId: string; nickname: string;
@@ -714,6 +1005,16 @@ proc searchResult*(body, profileId, nickname: string; nowSec: int): string =
   ensureMarket(nowSec)
   let f = readFilter(body)
 
+  # A search that names one template must be able to find it, whether or not the
+  # rebuild's cap reached it. All three of these are the client asking for one
+  # item rather than for a category: `linkedSearchId` is the "offers for this"
+  # button, an item id in `handbookId` is the same thing from the item screen,
+  # and a template id typed into the box is a player pasting one out of a wiki.
+  ensureOffersFor(f.linkedTpl, nowSec)
+  ensureOffersFor(f.category, nowSec)
+  if f.text.len == 24:
+    ensureOffersFor(f.text, nowSec)
+
   # Candidates: the generated market plus this player's own listings. Indices
   # into `gOffers` are carried alongside so `nameOf` can cache into the record
   # that stays; -1 marks an offer that is not in the cache.
@@ -788,6 +1089,11 @@ proc marketPrice*(body: string; nowSec: int): string =
   var tpl = field(body, "templateId").asText("")
   if tpl.len == 0:
     tpl = field(body, "templateid").asText("")
+  # The same materialisation the search does, for the same reason: the number
+  # shown on the item screen has to be the number the flea will charge, and
+  # falling through to the handbook for a template the cap did not reach quotes
+  # a price no offer is actually at.
+  ensureOffersFor(tpl, nowSec)
   var lowest = 0
   var highest = 0
   var total = 0
@@ -894,6 +1200,27 @@ proc buyOffer*(inv: var Inventory; action: JsonRef; stashId, profileId,
     var scheme = pr.field("items")
     if not scheme.found:
       scheme = pr.field("scheme_items")
+
+    # **The price is the offer's, not the request's.** `takePayment` verifies
+    # that the stacks named hold what the request claims they hold -- it has no
+    # idea what the thing being bought costs, so on its own it let a body naming
+    # one rouble buy a 60000-rouble offer, `err:0`, item delivered. Summed by
+    # template so paying out of three stacks still works.
+    let owed = o.price * count
+    var offered = 0
+    let paid = each(scheme)
+    for pe in paid:
+      let at = indexOf(inv, pe.field("id").asText(""))
+      if at < 0:
+        continue
+      if field(inv.items.items[at], "_tpl").asText("") != o.currency:
+        continue
+      offered = offered + pe.field("count").asInt(0)
+    if offered < owed:
+      ch.problems.add "that offer costs " & $owed & " and the payment covers " &
+                      $offered
+      return false
+
     if not takePayment(inv, scheme, ch):
       return false
     let perOffer = if o.sellInOnePiece: o.quantity else: 1
@@ -902,18 +1229,28 @@ proc buyOffer*(inv: var Inventory; action: JsonRef; stashId, profileId,
 
     # The stock goes down. Without this the same one-of-a-kind offer can be
     # bought until the cache next rebuilds -- the client keeps showing the row
-    # it was given, and a server that answers "yes" every time is an infinite
-    # supply of anything with a handbook price.
+    # it was given, and a server that answers "yes" every time to one offer id
+    # is an infinite supply of anything with a handbook price.
+    #
+    # An offer sold in one piece is *spent*, not decremented: "in one piece"
+    # means the lot goes whole, and it was already paid for whole -- `perOffer`
+    # above hands over the entire quantity for the entire price. Taking one off
+    # the count instead left a lot of three that could be bought three times,
+    # three items each. Nobody got anything for nothing, which is why it was
+    # quiet, but nine items came out of an offer for three.
     if not o.unlimited:
       for i in 0 ..< gOffers.len:
         if gOffers[i].id == offerId:
-          gOffers[i].quantity = gOffers[i].quantity - count
+          if o.sellInOnePiece:
+            gOffers[i].quantity = 0
+          else:
+            gOffers[i].quantity = gOffers[i].quantity - count
           if gOffers[i].quantity < 0:
             gOffers[i].quantity = 0
           break
   result = true
 
-proc addOffer*(inv: var Inventory; action: JsonRef; profileId: string;
+proc addOffer*(inv: var Inventory; action: JsonRef; profileId, stashId: string;
                ch: var Change; nowSec: int): bool =
   ## `RagFairAddOffer`: the player lists something.
   ##
@@ -925,6 +1262,35 @@ proc addOffer*(inv: var Inventory; action: JsonRef; profileId: string;
   if ids.len == 0:
     ch.problems.add "an offer with no items in it is not an offer"
     return false
+
+  # Only things *in the stash* may be listed, and that is not a tidiness rule.
+  #
+  # `RagFairAddOffer` naming the stash itself was accepted -- `err:0`, no
+  # warning -- and listing an item takes it and everything under it out of the
+  # profile. The stash is everything under it. The answer came back with
+  # `Inventory.stash` naming an item that was no longer in `items`, and every
+  # rouble and every purchase went with it.
+  #
+  # The five containers a profile is built on are exactly the items with no
+  # `parentId`, so "walk up and see where you land" catches all of them without
+  # this module needing to know their ids -- and it catches equipped gear too,
+  # which hangs off the equipment root rather than the stash and is not for
+  # sale either.
+  for e in ids:
+    let id = e.asText("")
+    if id.len == 0:
+      continue
+    let at = indexOf(inv, id)
+    if at < 0:
+      # Reported by the per-item pass below, which says which one.
+      continue
+    if field(inv.items.items[at], "parentId").asText("").len == 0:
+      ch.problems.add "that is a container the inventory is built on, " &
+                      "not something to sell"
+      return false
+    if stashId.len > 0 and rootOf(inv, id) != stashId:
+      ch.problems.add "only what is in the stash can be listed"
+      return false
 
   let req = action.field("requirements").at(0)
   let currency = req.field("_tpl").asText(CurrencyRoubles)
@@ -992,7 +1358,96 @@ proc addOffer*(inv: var Inventory; action: JsonRef; profileId: string;
 
 proc isRagfairAction*(kind: string): bool =
   result = kind == "RagFairBuyOffer" or kind == "RagFairAddOffer" or
-           kind == "RagFairRemoveOffer"
+           kind == "RagFairRemoveOffer" or kind == "RagFairRenewOffer"
+
+proc maxRenewHours*(): int =
+  ## `globals.config.RagFair.maxRenewOfferTimeInHour`, 48 in this database.
+  ##
+  ## Read rather than assumed, and defaulted to zero rather than to a number:
+  ## a database that does not say how long an offer may be renewed for is one
+  ## this server cannot bound a renewal against, and `renewOffer` refuses on it
+  ## by name. Guessing 48 there would let a client extend an offer for as long
+  ## as it liked on any database that happened to be missing the field.
+  let v = dbRead("globals.config.RagFair.maxRenewOfferTimeInHour")
+  if not v.ok:
+    return 0
+  result = whole(v.raw).asInt(0)
+
+proc renewOffer*(action: JsonRef; profileId: string; ch: var Change;
+                 nowSec: int): bool =
+  ## `RagFairRenewOffer` -- `ExtendOfferRequestData`, which is `{offerId,
+  ## renewalTime}` with `renewalTime` in hours.
+  ##
+  ## What it does is move one offer's `endTime` forward. What it deliberately
+  ## does **not** do is charge for it, and that is worth stating rather than
+  ## leaving to be noticed:
+  ##
+  ## **This server charges nothing to renew, because it charges nothing to
+  ## list.** `addOffer` above takes no listing fee and no flea tax; a renewal
+  ## fee would be the only money this market ever took from a seller. The
+  ## database has one number that is plainly about the price --
+  ## `RagFair.renewPricePerHour`, which is `0.5` here -- and nothing in it or in
+  ## the reference dump says whether that is roubles per hour or a percentage of
+  ## the asking price per hour. Those two readings differ by four orders of
+  ## magnitude on an ordinary offer, and picking one would be inventing a price
+  ## rather than reading one. The consequence for the player is that renewals
+  ## are free on this server. That is more generous than the game, it is stated
+  ## here and in `docs/EMULATOR-COVERAGE.md`, and it is not an oversight.
+  ##
+  ## Everything the database *does* decide is enforced: the offer must be the
+  ## player's, it must not have expired already, and the extension may not
+  ## exceed `maxRenewOfferTimeInHour`.
+  let offerId = action.field("offerId").asText("")
+  if offerId.len == 0:
+    ch.problems.add "that request names no offer to renew"
+    return false
+  let hours = action.field("renewalTime").asInt(0)
+  if hours <= 0:
+    ch.problems.add "renewing an offer for " & $hours & " hours is not a " &
+                    "renewal"
+    return false
+  let cap = maxRenewHours()
+  if cap <= 0:
+    ch.problems.add "this server's database does not say how long an offer " &
+                    "may be renewed for, so it will not renew one; the offer " &
+                    "was left as it is and will expire on time"
+    return false
+  if hours > cap:
+    ch.problems.add "an offer may be renewed for " & $cap &
+                    " hours at a time and that asked for " & $hours
+    return false
+
+  let list = playerOffers(profileId)
+  var keep = newList()
+  var hit = false
+  for i in 0 ..< list.len:
+    let e = whole(list.items[i])
+    if e.field("_id").asText("") != offerId:
+      keep.add list.items[i]
+      continue
+    let endTime = e.field("endTime").asInt(0)
+    if endTime <= nowSec:
+      # Kept in the list rather than dropped: `settleOffers` owns expiry and
+      # owes the items back, and a renewal path that quietly deleted an expired
+      # offer would owe them to nobody.
+      keep.add list.items[i]
+      ch.problems.add "that offer has already expired; it cannot be renewed"
+      return false
+    var rec = parseObject(list.items[i])
+    if not rec.ok:
+      keep.add list.items[i]
+      ch.problems.add "that offer could not be read, so it was not renewed"
+      return false
+    setNumber(rec, "endTime", endTime + hours * 3600)
+    keep.add text(rec)
+    hit = true
+  if not hit:
+    ch.problems.add "there is no offer " & offerId & " to renew"
+    return false
+  result = setPlayerOffers(profileId, keep, playerRating(profileId))
+  if not result:
+    ch.problems.add "the renewal could not be recorded; the offer was left " &
+                    "as it is"
 
 proc removeOffer*(action: JsonRef; profileId: string; ch: var Change;
                   nowSec: int): bool =
@@ -1022,9 +1477,11 @@ proc applyRagfair*(inv: var Inventory; action: JsonRef; stashId, profileId,
   of "RagFairBuyOffer":
     result = buyOffer(inv, action, stashId, profileId, nickname, ch, nowSec)
   of "RagFairAddOffer":
-    result = addOffer(inv, action, profileId, ch, nowSec)
+    result = addOffer(inv, action, profileId, stashId, ch, nowSec)
   of "RagFairRemoveOffer":
     result = removeOffer(action, profileId, ch, nowSec)
+  of "RagFairRenewOffer":
+    result = renewOffer(action, profileId, ch, nowSec)
   else:
     ch.problems.add "unhandled flea action: " &
                     action.field("Action").asText("")

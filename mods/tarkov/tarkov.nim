@@ -46,12 +46,25 @@ import emu/trading
 import emu/bots
 import emu/mail
 import emu/insurance
+import emu/dialogue
 import emu/market
 import emu/production
 import emu/skills
 import emu/scav
 import emu/redeem
 import emu/notify
+import emu/personal
+import emu/builds
+import emu/loot
+import emu/health
+import emu/repair
+import emu/notes
+import emu/achievements
+import emu/repeatable
+import emu/gym
+import emu/customise
+import emu/decorate
+import emu/selfchecks
 
 const
   ModGuid = "aowl.tarkov"
@@ -65,7 +78,14 @@ var gStartingRoubles = 500000
 var gInsurancePercent = 10
 var gInsuranceHours = 24
 var gScavCooldownSeconds = 900
+var gDefaultBotLimit = 30
+var gFenceKarmaExtract = 0.01
+var gFenceKarmaDeath = 0.0
 var gRaidId = ""
+var gSelfCheckFailures: seq[string] = @[]
+  ## Every load-time check that did not hold, for `/aowlspt/tarkov/selfcheck`.
+  ## Empty is the ordinary state and is also an answer: it is the difference
+  ## between "this mod loaded" and "nothing is listening".
 
 proc nowSeconds(): int =
   ## Wall-clock seconds. The host gives monotonic milliseconds since it started,
@@ -179,6 +199,15 @@ proc onProfileSelect(url, body, session: string): string =
   ## a body naming a profile that does not exist is refused rather than bound --
   ## binding it would produce "no profile" on every request after this one, far
   ## from the cause.
+  ##
+  ## **Any session may select any profile, on purpose.** There is no credential
+  ## in this protocol to check one against: the client authenticates at the
+  ## launcher and the game then talks to a backend it reaches over loopback,
+  ## with a session id it chose itself. A server that refused would be refusing
+  ## the only caller there is. If this ever listens on anything but loopback,
+  ## that is where the check belongs -- at the socket, in `backend/`, not here,
+  ## because an ownership test built out of the session id is a test the caller
+  ## supplies both sides of.
   let wanted = field(body, "uid").asText("")
   var id = wanted
   if id.len == 0:
@@ -339,6 +368,15 @@ proc onItemsMoving(url, body, session: string): string =
   if not p.ok:
     return failure(1, "no profile on this session")
 
+  # Where this profile's write counter stood when this request read it, checked
+  # again at the moment of the write -- see `saveIfUnchanged` and the limitation
+  # named there.
+  #
+  # Taken *after* `currentProfile`, because that catches the hideout up and may
+  # save the profile itself; taking it before would have every request that
+  # burned a minute of fuel refuse its own write.
+  let asRead = profileVersion(p.id)
+
   let actions = field(body, "data")
   var inv = openInventory(p.field("Inventory.items").raw())
   if not inv.items.ok:
@@ -348,6 +386,7 @@ proc onItemsMoving(url, body, session: string): string =
   var examined: seq[string] = @[]
   var earned = 0
   var touchedProfile = false
+  var questTouched = false
   let list = each(actions)
   for a in list:
     # Quests and the hideout are edits to the *profile*, not to the item list,
@@ -359,7 +398,29 @@ proc onItemsMoving(url, body, session: string): string =
     let qa = questAction(kind)
     let ha = hideoutAction(kind)
     let pa = productionAction(kind)
-    if qa != qaNone:
+    let pe = personalAction(kind)
+    let hx = healthAction(kind)
+    let rp = repairAction(kind)
+    let nt = noteAction(kind)
+    if nt != naNone:
+      if applyNotes(p, inv, nt, a, nowSeconds(), ch):
+        touchedProfile = true
+    elif rp != reNone:
+      # Repair before everything else, because `Repair` names its item in
+      # `target` rather than in `item` and the generic dispatch would take it
+      # for an unknown action and drop it silently.
+      if applyRepair(p, inv, rp, a, ch):
+        touchedProfile = true
+    elif hx != hxNone:
+      if applyHealth(p, inv, hx, a, ch):
+        touchedProfile = true
+    elif pe != peNone:
+      # Insurance, the wishlist, favourites, pins and hotkeys. Tested first
+      # because two of them -- `PinLock` and `Bind` -- name an item the generic
+      # inventory dispatch would otherwise happily handle as an unknown action.
+      if applyPersonal(p, inv, pe, a, gInsurancePercent, ch):
+        touchedProfile = true
+    elif qa != qaNone:
       # The profile-aware entry point rather than the array-only one. Every
       # condition worth evaluating -- level, trader standing, what has actually
       # been handed over -- is about the profile, so a version that only sees
@@ -367,22 +428,33 @@ proc onItemsMoving(url, body, session: string): string =
       # nothing is worse than one that will not complete.
       var gained = 0
       var problem = ""
-      if applyQuestOnProfile(p, qa, a, nowSeconds(), gained, problem):
+      var note1 = ""
+      if applyQuestOnProfile(p, qa, a, nowSeconds(), gained, problem, note1):
         earned = earned + gained
         touchedProfile = true
+        questTouched = true
       if problem.len > 0:
         ch.problems.add problem
+      if note1.len > 0:
+        # Applied, and worth telling the player about anyway -- a quest the
+        # database has no template for is one whose conditions were not checked
+        # and whose rewards do not exist. That used to be an `err:0` with
+        # nothing in it and a line in a log nobody reads.
+        ch.problems.add note1
     elif ha != haNone:
-      var problem = ""
-      let updated = applyHideout(p.field("Hideout.Areas").raw(), ha, a,
-                                 nowSeconds(), problem)
-      if problem.len > 0:
-        ch.problems.add problem
-      else:
-        setRaw(p, "Hideout.Areas", updated)
+      # The profile-aware entry point, not the array-only one: an upgrade needs
+      # items out of the stash, a level in another area and a loyalty level with
+      # a trader, and none of those is in `Hideout.Areas`.
+      if applyHideoutOnProfile(p, inv, ha, a, nowSeconds(), ch):
         touchedProfile = true
     elif pa != paNone:
       if applyProduction(p, inv, pa, a, nowSeconds(), ch):
+        touchedProfile = true
+    elif kind == "RepeatableQuestChange":
+      # A reroll. Before the generic dispatch because it names its quest in
+      # `qid` rather than in `item`, and it edits both the profile (the
+      # standing it costs) and the item list (the money it costs).
+      if changeQuest(p, inv, a, nowSeconds(), ch):
         touchedProfile = true
     elif isRagfairAction(kind):
       discard applyRagfair(inv, a, p.stashId, p.id, p.nickname, ch,
@@ -392,13 +464,62 @@ proc onItemsMoving(url, body, session: string): string =
       # `fromOwner: {type:"Mail"}`. Tested before the generic move, because the
       # item it names is not in the inventory yet.
       discard redeem(inv, p.id, p.stashId, a, ch)
+    elif gymAction(kind):
+      # The gym's workout. Before the generic dispatch because it names no item
+      # at all -- `results` and an event id -- and the inventory would take it
+      # for an unknown action and drop it in silence, which is a player working
+      # out for nothing.
+      if applyGym(p, a, nowSeconds(), ch):
+        touchedProfile = true
+    elif customiseAction(kind):
+      # Setting a head, a suite, a dog tag or a voice. Also nameless as far as
+      # the item list is concerned, and also a write the client asks for by id,
+      # which is why `emu/customise` checks every one of them against the table
+      # rather than copying it into the profile.
+      if applyCustomisation(p, a, ch):
+        touchedProfile = true
+    elif decorateAction(kind) != daNone:
+      # The hideout's own wardrobe: a floor, a wall, a ceiling, a target, a
+      # mannequin's pose, or the shooting range's score. Nameless as far as the
+      # item list is concerned -- an offer id, a map of poses, or a bare number
+      # -- so the generic dispatch would take each of them for an unknown action
+      # and drop it in silence, which is a player redecorating and watching
+      # nothing change.
+      let da = decorateAction(kind)
+      var changed = false
+      if da == daApply:
+        changed = applyDecoration(p, a, ch)
+      elif da == daPose:
+        changed = applyMannequinPose(p, a, ch)
+      else:
+        changed = recordShootingRange(p, a, ch)
+      if changed:
+        touchedProfile = true
+    elif sellAllAction(kind):
+      # Refused by name. There is nothing left in the scav to sell by the time
+      # this can arrive -- see `emu/scav`'s `refuseSellAll` for the whole of it.
+      refuseSellAll(a, ch)
     elif kind == "TradingConfirm":
-      discard applyTrading(inv, a, p.stashId, ch)
+      if applyTrading(p, inv, a, ch):
+        # A trade moves `TradersInfo.<id>.salesSum` and re-derives the loyalty
+        # level from it, so the profile has changed even when the item list is
+        # all the client asked about.
+        touchedProfile = true
     else:
       discard applyAction(inv, a, ch, examined)
 
   if earned > 0:
     addExperience(p, earned)
+
+  if questTouched:
+    # Handing a quest in moves the level, the trader standing and the quest
+    # status an achievement condition reads, so this is the second moment an
+    # achievement can become true. Not run on every item event: the table is a
+    # few hundred entries and a stash is dragged in thousands of times a
+    # session.
+    var earnedAchievements: seq[string] = @[]
+    if awardAchievements(p, nowSeconds(), earnedAchievements) > 0:
+      touchedProfile = true
 
   if inv.dirty:
     setRaw(p, "Inventory.items", text(inv.items))
@@ -413,10 +534,24 @@ proc onItemsMoving(url, body, session: string): string =
       setBool(enc, tpl, true)
     setRaw(p, "Encyclopedia", text(enc))
   if inv.dirty or examined.len > 0 or touchedProfile:
+    if profileVersion(p.id) != asRead:
+      # Somebody else wrote this profile while this request was working from
+      # it. Two distinct answers rather than one, because "the disk refused"
+      # and "you were overtaken" are different problems and a single message
+      # for both sends whoever reads the log looking in the wrong place.
+      discardRedemptions()
+      return failure(1, "another request changed this profile while this one " &
+                        "was being handled; nothing was applied")
     if not saveProfile(p):
       # A redemption that took an item out of the mailbox and then failed to
       # save the profile would lose it. The mailbox edits are staged until the
       # profile is on disk, and dropped if it is not.
+      #
+      # Two reasons to be here and one answer. Either the write failed, or the
+      # profile changed underneath this request while it was working -- and in
+      # both cases the client has to be told the action did not happen, because
+      # the alternative is telling it the action happened and throwing the
+      # result away.
       discardRedemptions()
       return failure(1, "could not save the profile: " & lastError())
   commitRedemptions()
@@ -467,6 +602,13 @@ proc onAchievementList(url, body, session: string): string =
 proc onLocale(url, body, session: string): string =
   ## `/client/locale/en` -- the language is the last path segment.
   let lang = pathAfter(url, "/client/locale/")
+  # This is the only place the client says what language it is playing in, and
+  # the trader mail this server composes has to be written in it -- an
+  # insurance return is stored as text, so resolving it into English once is
+  # English forever. Remembered against the profile rather than the session
+  # because the sweep that posts a matured return runs with nobody logged in.
+  # A failed write costs English mail, not a locale, so it is discarded.
+  discard rememberLanguage(profileFor(session), lang)
   result = envelope(raw(locale(if lang.len > 0: lang else: "en")))
 
 proc onMenuLocale(url, body, session: string): string =
@@ -507,6 +649,20 @@ proc onEmptyObject(url, body, session: string): string =
   inc gRequests
   result = envelope(emptyObject())
 
+proc onActivityPeriods(url, body, session: string): string =
+  ## The dailies, the weekly and the scav's, generated rather than stored --
+  ## `emu/repeatable` says how, and why there is nothing to store.
+  ##
+  ## The route's own spelling is the client's, typo included: it asks for
+  ## `/client/repeatalbeQuests/activityPeriods` and a server that serves the
+  ## correctly-spelled path serves nothing at all.
+  var p = currentProfile(session)
+  if not p.ok:
+    # A session with no profile is the launcher poking the server before anyone
+    # has selected a character. An empty list is what it expects.
+    return envelope("[]")
+  result = envelope(activityPeriods(p, nowSeconds()))
+
 proc onEmptyArray(url, body, session: string): string =
   inc gRequests
   result = envelope(emptyArray())
@@ -518,6 +674,236 @@ proc onNullData(url, body, session: string): string =
 proc onOkStatus(url, body, session: string): string =
   inc gRequests
   result = envelope(objOf("status", "ok"))
+
+proc onFriendList(url, body, session: string): string =
+  ## `GetFriendListDataResponse` is an **object** of three lists, not a list.
+  ## This answered `[]` for as long as it existed, which the client parses
+  ## without complaint and then indexes `Friends` on.
+  inc gRequests
+  var o = obj()
+  put(o, "Friends", arr())
+  put(o, "Ignore", arr())
+  put(o, "InIgnoreList", arr())
+  result = envelope(o)
+
+proc onChatServerList(url, body, session: string): string =
+  ## One chat server: this one. `ChatServer` in the reference -- the client
+  ## reads `Regions` and `Chats` off whichever entry it picks, so both have to
+  ## be present and empty rather than absent.
+  var srv = obj()
+  put(srv, "_id", "aowlspt00000000000000000")
+  put(srv, "RegistrationId", 20)
+  put(srv, "DateTime", nowSeconds())
+  put(srv, "IsDeveloper", true)
+  put(srv, "Regions", arr())
+  put(srv, "VersionId", "bgkidft87ddd")
+  put(srv, "Ip", "127.0.0.1")
+  put(srv, "Port", 6969)
+  put(srv, "Chats", arr())
+  var a = arr()
+  a.add srv
+  result = envelope(a)
+
+proc onSelfCheck(url, body, session: string): string =
+  ## `/aowlspt/tarkov/selfcheck` -- did this build's own arithmetic hold?
+  ##
+  ## The one route that answers whether the *rest* of them exist. Not in the
+  ## client's namespace and never sent to the client: it is here so that a tool,
+  ## a gate or a person can tell "this mod refused to load, and here is which
+  ## check failed" apart from "nothing is listening", which are the same 404
+  ## otherwise.
+  ##
+  ## Deliberately not wrapped in the client's `{err, errmsg, data}` envelope --
+  ## nothing in the client asks for this, and an envelope would invite something
+  ## to treat it as a game route.
+  inc gRequests
+  var fails = arr()
+  for f in gSelfCheckFailures:
+    fails.add jstr(f)
+  var o = obj()
+  put(o, "ok", gSelfCheckFailures.len == 0)
+  put(o, "failures", fails)
+  result = text(done(o))
+
+proc onAchievementStatistic(url, body, session: string): string =
+  ## `CompletedAchievementsResponse` is `{elements: {id: count}}`. `{}` gave the
+  ## achievements screen a null to enumerate, and an empty map gave it a screen
+  ## where nothing had ever been obtained -- which was true until achievements
+  ## were awarded and is not any more.
+  ##
+  ## Counted over every profile the store holds, because that is the population
+  ## this server has. See `completedStatistics` for why that is the honest
+  ## reading of a number the reference names and does not define.
+  inc gRequests
+  var ids: seq[string] = @[]
+  let all = allProfileIds()
+  for id in all:
+    let p = loadProfile(id)
+    if not p.ok:
+      continue
+    let names = keys(p.field("Achievements"))
+    for n in names:
+      ids.add n
+  result = envelope(objOf("elements", raw(completedStatistics(ids))))
+
+proc onPrestigeList(url, body, session: string): string =
+  ## `GetPrestigeResponse` is `{elements: [...]}`, not a bare array.
+  inc gRequests
+  result = envelope(objOf("elements", raw(table("templates.prestige", "[]"))))
+
+proc onCustomizationStorage(url, body, session: string): string =
+  ## What clothing the profile owns. An object with a `suites` list -- an empty
+  ## array here is a null `suites` in the character screen.
+  let p = currentProfile(session)
+  var o = obj()
+  put(o, "_id", p.id)
+  put(o, "suites", arr())
+  result = envelope(o)
+
+proc onGameMode(url, body, session: string): string =
+  ## `GameModeResponse`. Asked at boot, before the profile list, and this server
+  ## has one mode.
+  var o = obj()
+  put(o, "gameMode", "regular")
+  put(o, "backendUrl", "")
+  result = envelope(o)
+
+proc onProfileStatus(url, body, session: string): string =
+  ## `GetProfileStatusResponseData`: one entry per character the account can
+  ## play, PMC and scav, each saying it is not currently in a raid.
+  ##
+  ## `Free` is the status the client reads as "you may enter a raid". A missing
+  ## entry for the scav is a scav button that does nothing.
+  let p = currentProfile(session)
+  var list = arr()
+  if p.ok:
+    var pmc = obj()
+    put(pmc, "profileid", p.id)
+    put(pmc, "profileToken", jnull())
+    put(pmc, "status", "Free")
+    put(pmc, "sid", "")
+    put(pmc, "ip", "")
+    put(pmc, "port", 0)
+    list.add pmc
+    let scav = p.scavId
+    if scav.len > 0:
+      var sc = obj()
+      put(sc, "profileid", scav)
+      put(sc, "profileToken", jnull())
+      put(sc, "status", "Free")
+      put(sc, "sid", "")
+      put(sc, "ip", "")
+      put(sc, "port", 0)
+      list.add sc
+  var o = obj()
+  put(o, "maxPveCountExceeded", false)
+  put(o, "profiles", list)
+  result = envelope(o)
+
+proc onTrue(url, body, session: string): string =
+  inc gRequests
+  result = envelope(raw("true"))
+
+proc onTrader(url, body, session: string): string =
+  ## `/client/trading/api/getTrader/<id>` -- one trader's base, where
+  ## `traderSettings` is all of them. A trader the database does not have is a
+  ## refusal rather than an empty object: an empty object is a trader with no
+  ## currency and no loyalty levels, which the screen draws as a broken one.
+  inc gRequests
+  let id = pathAfter(url, "/client/trading/api/getTrader/")
+  let base = traderBase(id)
+  if base.len == 0:
+    return failure(1, "no such trader: " & id)
+  result = envelope(raw(base))
+
+proc onItemPrices(url, body, session: string): string =
+  ## `GetItemPricesResponse`: `{supplyNextTime, prices, currencyCourses}`.
+  ##
+  ## `prices` is what the trader screen divides by to show a flea comparison, so
+  ## a missing key is a division on a null. The prices are the handbook's, which
+  ## is the same table the flea builds its own offers off -- one source, so the
+  ## comparison the screen draws agrees with the offers behind it.
+  inc gRequests
+  var prices = obj()
+  let hb = dbRead("templates.handbook.Items")
+  if hb.ok:
+    for entry in each(whole(hb.raw)):
+      let tpl = entry.field("Id").asText("")
+      if tpl.len > 0:
+        put(prices, tpl, entry.field("Price").asInt(0))
+  var courses = obj()
+  # The handbook is where the game keeps the exchange rate; a currency it does
+  # not price is left out rather than given an invented one.
+  let usd = handbookPrice(Dollars)
+  if usd > 0: put(courses, "usd", usd)
+  let eur = handbookPrice(Euros)
+  if eur > 0: put(courses, "eur", eur)
+  var o = obj()
+  put(o, "supplyNextTime", nowSeconds() + 3600)
+  put(o, "prices", prices)
+  put(o, "currencyCourses", courses)
+  result = envelope(o)
+
+proc onAirdropLoot(url, body, session: string): string =
+  ## What is in a crate. Generated by the same loot generator the floor of a
+  ## raid uses, seeded from the container id the client names, so two clients
+  ## opening the same crate see the same contents and a bug report can be
+  ## replayed from the id in it.
+  inc gRequests
+  let container = field(body, "containerId").asText("")
+  var o = obj()
+  put(o, "icon", "Common")
+  put(o, "container", raw(lootFor("airdrop", if container.len > 0: container
+                                             else: gRaidId)))
+  result = envelope(o)
+
+proc onBuildsList(url, body, session: string): string =
+  inc gRequests
+  let p = currentProfile(session)
+  if not p.ok:
+    # Still all three lists. A client without a profile selected asks for this
+    # too, and the shape it gets must not depend on that.
+    var o = obj()
+    put(o, "equipmentBuilds", arr())
+    put(o, "weaponBuilds", arr())
+    put(o, "magazineBuilds", arr())
+    return envelope(o)
+  result = envelope(raw(buildsJson(p.id)))
+
+proc saveOneBuild(session, kind, body: string): string =
+  let p = currentProfile(session)
+  if not p.ok:
+    return failure(1, "no profile on this session")
+  var problem = ""
+  let id = saveBuild(p.id, kind, body, problem)
+  if id.len == 0:
+    return failure(1, problem)
+  result = envelope(objOf("id", id))
+
+proc onBuildWeapon(url, body, session: string): string =
+  inc gRequests
+  result = saveOneBuild(session, "weaponBuilds", body)
+
+proc onBuildEquipment(url, body, session: string): string =
+  inc gRequests
+  result = saveOneBuild(session, "equipmentBuilds", body)
+
+proc onBuildMagazine(url, body, session: string): string =
+  inc gRequests
+  result = saveOneBuild(session, "magazineBuilds", body)
+
+proc onBuildDelete(url, body, session: string): string =
+  ## A delete of a build that is not there is refused rather than answered
+  ## "done": it means the client's list and the server's disagree, and a
+  ## cheerful answer leaves them disagreeing.
+  inc gRequests
+  let p = currentProfile(session)
+  if not p.ok:
+    return failure(1, "no profile on this session")
+  let id = field(body, "id").asText(field(body, "Id").asText(""))
+  if not removeBuild(p.id, id):
+    return failure(1, "no such build: " & id)
+  result = envelopeNull()
 
 proc onNotifierChannel(url, body, session: string): string =
   ## The client opens a notification channel and polls it. Answering with a
@@ -532,10 +918,21 @@ proc onNotifierChannel(url, body, session: string): string =
   result = envelope(notifier)
 
 proc onNotifierPoll(url, body, session: string): string =
-  ## Long-polled by the client. Answering immediately -- with news if there is
-  ## any, and a ping if there is not -- rather than holding the connection: a
-  ## held connection occupies one of a fixed number of accept workers, and four
-  ## players idling in the menu would take the whole pool.
+  ## The same URL the client upgrades to a websocket, answered as a poll for
+  ## every client that does not.
+  ##
+  ## A request carrying `Upgrade: websocket` never reaches this handler at all
+  ## -- the backend answers `101` and holds the connection, and `deliver`
+  ## pushes down it. What arrives here is a client that asked for the channel
+  ## as an ordinary request, and it gets what it always got: news if there is
+  ## any, a ping if there is not, immediately rather than held.
+  ##
+  ## Both paths stay, and this one is not a legacy. A client mid-login, one
+  ## whose socket has just dropped, and every tool that drives this server over
+  ## `wire.nim` are all in exactly this state, and a notification that had
+  ## nowhere to go while a socket was reconnecting would be a notification
+  ## lost. `deliver` queues whatever it could not push, so the next poll
+  ## carries it.
   let queued = take(session)
   if queued.len > 0:
     return envelope(raw(queued))
@@ -607,6 +1004,13 @@ proc onMatchEnd(url, body, session: string): string =
       return failure(1, "could not finish the scav raid")
     for problem in scavProblems:
       warn "scav raid: " & problem
+    # Scav karma. Applied after the gear has been brought home and before the
+    # single save, so a raid that failed to save does not leave the standing
+    # moved for a raid whose loot was thrown away.
+    if applyScavKarma(p, keepsGear(outcome), gFenceKarmaExtract,
+                      gFenceKarmaDeath):
+      info "Fence standing is now " &
+           $p.field("TradersInfo." & FenceId & ".standing").asFloat(0.0)
     if not saveProfile(p):
       return failure(1, "could not save the profile after the scav raid")
     success "scav raid ended: " & $brought & " item(s) brought home"
@@ -637,11 +1041,60 @@ proc onMatchEnd(url, body, session: string): string =
   # which is exactly what makes them eligible.
   let lost = lostAfterRaid(p.text, raw(played))
   if lost.len > 0:
-    let goods = itemsById(p.text, lost)
     let due = nowSeconds() + gInsuranceHours * 3600
-    if queueReturn(p.id, "54cb50c76803fa8b248b4571", goods, due):
-      info $lost.len & " insured item(s) will be returned in " &
-           $gInsuranceHours & "h"
+    let where = raidLocation(body)
+    # One queue entry per **insuring trader**, not one for everybody. The
+    # profile records who covered each item and this used to ignore it and post
+    # the lot from Prapor; now that the message is the trader's own words, a
+    # Therapist-insured rig arriving with Prapor's "my dogs found it" is a
+    # visible lie rather than an invisible detail.
+    #
+    # Every id that is settled one way or the other comes out of the profile's
+    # `InsuredItems` below. Nothing used to, and the cost of that was a raid
+    # paying out gear that the raid before it had already paid out: the item is
+    # not in the profile the client hands back -- it is in the post, or still
+    # queued -- so the next raid's `lostAfterRaid` finds it "lost" all over
+    # again. See `emu/insurance.withoutInsured` for why queueing, and not
+    # delivery or collection, is the moment that owns the removal.
+    var settled: seq[string] = @[]
+    for trader in insuringTraders(p.text, lost):
+      let mine = idsForTrader(p.text, lost, trader)
+      let goods = itemsById(p.text, mine)
+      if goods.len == 0 or goods == "[]":
+        # Covered ids with no item behind them in the pre-raid profile: sold,
+        # eaten, or otherwise gone from the stash between raids, which nothing
+        # in this server takes out of `InsuredItems`. There is nothing to post
+        # and nobody to post it, so the cover is discharged quietly -- left in
+        # place it would ask the same unanswerable question at the end of every
+        # raid the player ever plays, and send a "my guys are on it" message
+        # each time.
+        info $mine.len & " insured item(s) covered by " & trader &
+             " are not in the profile at all; nothing to return"
+        for id in mine:
+          settled.add id
+        continue
+      if queueReturn(p.id, trader, goods, due, where, nowSeconds()):
+        for id in mine:
+          settled.add id
+        info $mine.len & " insured item(s) will be returned by " & trader &
+             " in " & $gInsuranceHours & "h"
+        # And the trader says so now, if the database gives them the words for
+        # it. Nothing is sent when it does not: there is no wording of this
+        # server's own to fall back to and inventing one is not on the table.
+        discard announceStart(p.id, trader, where, nowSeconds())
+      else:
+        # The queue could not be written. The cover stays on those ids on
+        # purpose: nothing is owed to the player yet, so the loss must remain
+        # claimable rather than being quietly cancelled by a failed write.
+        warn "could not queue " & $mine.len & " insured item(s) for return " &
+             "by " & trader & "; the cover on them stands"
+    if settled.len > 0:
+      # Written to the profile that is about to be saved -- the one the client
+      # played the raid with -- because that is the profile the *next* raid
+      # will be compared against.
+      updated.setTopLevel("InsuredItems",
+                          withoutInsured(updated.field("InsuredItems").raw(),
+                                         settled))
 
   # Quest progress out of the raid: the counters the client accumulated, the
   # kills it did not count, and every quest that is now ready to hand in.
@@ -650,6 +1103,12 @@ proc onMatchEnd(url, body, session: string): string =
   discard advanceQuestsAfterRaid(updated, p.text, raidLocation(body),
                                  field(body, "exit").asText("Left"),
                                  nowSeconds())
+
+  # And whatever the raid just earned. After the quest pass rather than before
+  # it: an achievement condition can name a quest status, and the status the
+  # raid produced has only just been written.
+  var earnedAchievements: seq[string] = @[]
+  discard awardAchievements(updated, nowSeconds(), earnedAchievements)
 
   if not saveProfile(updated):
     return failure(1, "could not save the profile after the raid")
@@ -667,16 +1126,25 @@ proc onMatchGroup(url, body, session: string): string =
   result = envelope(objOf("squad", arr()))
 
 proc onWeather(url, body, session: string): string =
+  ## The sky. A constant -- temperature 18, season 1 -- until now, and that was
+  ## fine as a default and wrong as the only answer: a weather mod had nothing
+  ## to write into, and could not register a route of its own either, because
+  ## the backend refuses a second registration of the same path. So the constant
+  ## moved behind a database path and stayed the fallback.
   inc gRequests
   result = envelope(raw(weather(nowSeconds())))
 
 proc onLocations(url, body, session: string): string =
+  ## The map list. Descriptions only -- see `emu/raid` for what the client
+  ## reads from this and what it was being sent instead.
+  ##
+  ## This was `dbRead("locations")` spliced in whole, which is every map's
+  ## `base` *and* every map's loot: 12.5 MB and 247 ms on a default import,
+  ## 560 MiB and 10.8 s on one with loose loot, for a screen listing nineteen
+  ## maps. `looseLoot` now belongs to `/client/location/getLocalloot`, which
+  ## already asks one map at a time.
   inc gRequests
-  let v = dbRead("locations")
-  var o = obj()
-  put(o, "locations", if v.ok: raw(v.raw) else: emptyObject())
-  put(o, "paths", arr())
-  result = envelope(o)
+  result = envelope(raw(liveLocationsBody()))
 
 # ---------------------------------------------------------------------------
 # Bots
@@ -695,16 +1163,71 @@ proc onBotGenerate(url, body, session: string): string =
   info "generated " & $generated & " bot(s) in " & $int(took) & "ms"
   result = envelope(raw(batch))
 
+proc queryValue(url, name: string): string =
+  ## One `?name=value` out of a url. Written here rather than in `aowlspt/json`
+  ## because it is two routes worth of need and no route on this server takes a
+  ## query it cannot also take in its body.
+  var at = find(url, "?" & name & "=")
+  if at < 0:
+    at = find(url, "&" & name & "=")
+  if at < 0:
+    return ""
+  var i = at + name.len + 2
+  result = ""
+  while i < url.len and url[i] != '&':
+    result.add url[i]
+    inc i
+
 proc onBotLimit(url, body, session: string): string =
+  ## How many bots the client may have alive on this map at once.
+  ##
+  ## This was the literal `30`, for every map, with no database path behind it
+  ## at all -- so a mod shipping real population data (19 maps, 154 waves, a
+  ## summed cap of 341) had all of it land in the database and none of it reach
+  ## the client. The map is now asked, and the constant is what answers when the
+  ## database has nothing to say about it.
+  ##
+  ## `BotMax` is the field the location base carries; `BotMaxPvE` is the PvE
+  ## variant, and this server is only ever PvE, so it wins where both are
+  ## present. The map comes from the query (`?location=factory4_day`) or from
+  ## the body, because the client has spelled it both ways across builds and
+  ## reading it wrong is a silent fall back to the default.
   inc gRequests
-  result = envelope(raw("30"))
+  var loc = queryValue(url, "location")
+  if loc.len == 0:
+    loc = field(body, "location").asText("")
+  if loc.len == 0:
+    loc = field(body, "locationId").asText("")
+  if loc.len > 0:
+    let pve = dbRead("locations." & loc & ".base.BotMaxPvE")
+    if pve.ok and pve.asInt(0) > 0:
+      return envelope(raw($pve.asInt(0)))
+    let cap = dbRead("locations." & loc & ".base.BotMax")
+    if cap.ok and cap.asInt(0) > 0:
+      return envelope(raw($cap.asInt(0)))
+  result = envelope(raw($gDefaultBotLimit))
 
 proc onBotDifficulty(url, body, session: string): string =
+  ## The brain settings for one role at one difficulty.
+  ##
+  ## The client asks `?type=assault&difficulty=normal`; this answered
+  ## `bots.core` regardless, which is one set of settings for every bot in the
+  ## game. `difficultyOf` reads the role's own block and falls back to
+  ## `bots.core`, so a database with no per-role settings behaves exactly as it
+  ## did.
   inc gRequests
-  let v = dbRead("bots.core")
-  if v.ok:
-    return envelope(raw(v.raw))
-  result = envelope(emptyObject())
+  var role = queryValue(url, "type")
+  if role.len == 0:
+    role = field(body, "type").asText("")
+  var level = queryValue(url, "difficulty")
+  if level.len == 0:
+    level = field(body, "difficulty").asText("normal")
+  if role.len == 0:
+    let v = dbRead("bots.core")
+    if v.ok:
+      return envelope(raw(v.raw))
+    return envelope(emptyObject())
+  result = envelope(raw(difficultyOf(role, level)))
 
 # ---------------------------------------------------------------------------
 # Mail
@@ -753,6 +1276,27 @@ proc onHideoutSettings(url, body, session: string): string =
   inc gRequests
   result = envelope(raw(table("hideout.settings", "{}")))
 
+proc onHideoutCustomisation(url, body, session: string): string =
+  ## `GetHideoutCustomisation`. The offers the hideout screen draws: 38 globals
+  ## -- 11 floors, 10 walls, 8 ceilings, 9 shooting-range targets -- and 47
+  ## poster and statuette slots, straight out of `hideout.customisation`.
+  ##
+  ## This answered `[]` until the table was read. That was wrong twice over: the
+  ## reference's `HideoutCustomisation` is an **object** of `Globals` and
+  ## `Slots` rather than an array, and the table has been imported and populated
+  ## all along. *(The URL is the one already in use here; the shape is the
+  ## reference DTO's.)*
+  inc gRequests
+  result = envelope(raw(hideoutCustomisationTable()))
+
+proc onQteList(url, body, session: string): string =
+  ## `GetQteList`. The gym's minigame, out of `hideout.qte` -- one entry in this
+  ## database, and it answered the empty array until the workout was served.
+  ## Empty when the database has none, which is a hideout with no bench rather
+  ## than a menu that will not open.
+  inc gRequests
+  result = envelope(raw(qteTable()))
+
 proc onRagfairFind(url, body, session: string): string =
   inc gRequests
   let p = currentProfile(session)
@@ -767,7 +1311,16 @@ proc onInsuranceCost(url, body, session: string): string =
   ## off the handbook, so a server with no handbook quotes nothing rather than
   ## quoting zero -- a free premium makes insuring strictly better than not,
   ## which is a decision the player should be making.
+  ##
+  ## `items` is a list of the player's **item ids**, not template ids -- the
+  ## client is naming the things in its stash. Priced by looking each one up in
+  ## the profile and taking its `_tpl`; a string that is not in the profile is
+  ## used as a template id directly, which is what a caller with a template in
+  ## hand means and costs nothing to allow. Reading the id as a template was a
+  ## quote of nothing for every real request, which reads as "insurance is
+  ## free" on the screen that offers it.
   inc gRequests
+  let p = currentProfile(session)
   let traders = each(field(body, "traders"))
   let itemIds = each(field(body, "items"))
   var out1 = obj()
@@ -777,11 +1330,21 @@ proc onInsuranceCost(url, body, session: string): string =
       continue
     var perItem = obj()
     for it in itemIds:
-      let tpl = it.asText("")
+      let named = it.asText("")
+      if named.len == 0:
+        continue
+      var tpl = named
+      if p.ok:
+        let owned = each(p.field("Inventory.items"))
+        for o in owned:
+          if o.field("_id").asText("") == named:
+            tpl = o.field("_tpl").asText(named)
       let price = handbookPrice(tpl)
       let premium = premiumFor(price, gInsurancePercent)
       if premium > 0:
-        put(perItem, tpl, premium)
+        # Keyed by what the client asked about, so it can match the answer back
+        # to the row it drew.
+        put(perItem, named, premium)
     put(out1, tid, perItem)
   result = envelope(out1)
 
@@ -807,9 +1370,11 @@ proc sweep(payload: string): string =
     if posted + settled > 0:
       info "sweep: " & $posted & " insurance, " & $settled & " offer(s) for " &
            profiles[i]
-      # One note, not one per item: the client opens the inbox from it, and the
-      # inbox is where the detail already is.
-      push(sessions[i], newMessageNote("", "", 5, nowSeconds()))
+      # No note from here any more. Each of those insurance returns and settled
+      # offers arrives as a message through `emu/mail.deliver`, which notifies
+      # at the point the message is written -- so a summary note here would be
+      # a second badge for mail the player has already been told about, and one
+      # that names no dialog to open.
   result = ""
 
 proc registerRoutes() =
@@ -834,6 +1399,13 @@ proc registerRoutes() =
   discard serve("/client/game/profile/nickname/change", onNicknameChange)
   discard serve("/client/game/profile/savage/regenerate", onSavageRegenerate)
   discard serve("/client/game/profile/voice/change", onOkStatus)
+  discard serve("/client/game/mode", onGameMode)
+  discard serve("/client/profile/status", onProfileStatus)
+  # `GetProfileSettings` answers a bare `true`; the client only checks that the
+  # call succeeded.
+  discard serve("/client/profile/settings", onTrue)
+  discard serve("/client/game/profile/search", onEmptyArray)
+  discard serve("/client/profile/view", onEmptyObject)
 
   # Static tables
   discard serve("/client/items", onItems)
@@ -847,7 +1419,7 @@ proc registerRoutes() =
   discard serve("/client/settings", onSettings)
   discard serve("/client/quest/list", onQuestList)
   discard serve("/client/achievement/list", onAchievementList)
-  discard serve("/client/achievement/statistic", onEmptyObject)
+  discard serve("/client/achievement/statistic", onAchievementStatistic)
 
   # The inventory, and the traders
   discard serve("/client/game/profile/items/moving", onItemsMoving)
@@ -855,26 +1427,40 @@ proc registerRoutes() =
   discard servePrefix("/client/trading/api/getTraderAssort/", onTraderAssort)
   discard servePrefix("/client/trading/api/getUserAssortPrice/",
                       onTraderUserAssort)
-  discard serve("/client/trading/customization/storage", onEmptyArray)
+  discard servePrefix("/client/trading/api/getTrader/", onTrader)
+  discard serve("/client/trading/customization/storage", onCustomizationStorage)
+  discard servePrefix("/client/items/prices/", onItemPrices)
 
   # Raids
   discard serve("/client/raid/configuration", onRaidConfiguration)
   discard serve("/client/location/getLocalloot", onLocalLoot)
+  discard serve("/client/location/getAirdropLoot", onAirdropLoot)
   discard serve("/client/locations", onLocations)
   discard serve("/client/match/local/start", onMatchStart)
   discard serve("/client/match/local/end", onMatchEnd)
   discard serve("/client/match/available", onMatchAvailable)
   discard serve("/client/match/group/current", onMatchGroup)
+  discard serve("/client/match/group/status", onMatchGroup)
+  discard serve("/client/match/group/exit_from_menu", onNullData)
+  discard serve("/client/match/exit", onNullData)
   discard serve("/client/weather", onWeather)
 
   # Hideout, flea market, insurance
   discard serve("/client/hideout/areas", onHideoutAreas)
   discard serve("/client/hideout/production/recipes", onHideoutRecipes)
   discard serve("/client/hideout/settings", onHideoutSettings)
-  discard serve("/client/hideout/qte/list", onEmptyArray)
+  discard serve("/client/hideout/qte/list", onQteList)
   discard serve("/client/ragfair/find", onRagfairFind)
   discard serve("/client/ragfair/itemMarketPrice", onRagfairPrice)
   discard serve("/client/insurance/items/list/cost", onInsuranceCost)
+  discard serve("/client/hideout/customization/offer/list",
+                onHideoutCustomisation)
+  # `StorePlayerOfferTaxAmount` -- the client asks the server to remember the
+  # tax it just quoted, then lists the offer. This server prices a listing from
+  # the offer itself, so there is nothing to remember and the answer is the one
+  # the client checks for.
+  discard serve("/client/ragfair/offerfees", onTrue)
+  discard serve("/client/reports/ragfair/send", onNullData)
 
   # The menu's supporting cast
   discard serve("/client/notifier/channel/create", onNotifierChannel)
@@ -890,24 +1476,42 @@ proc registerRoutes() =
 
   # Bots
   discard serve("/client/game/bot/generate", onBotGenerate)
-  discard serve("/client/game/bot/limit", onBotLimit)
-  discard serve("/client/game/bot/difficulty", onBotDifficulty)
-  discard serve("/client/friend/list", onEmptyArray)
+  # Prefix, not exact: both of these carry a query string
+  # (`?location=`, `?type=&difficulty=`) and an exact route does
+  # not match a url with one on the end.
+  discard servePrefix("/client/game/bot/limit", onBotLimit)
+  discard servePrefix("/client/game/bot/difficulty",
+                      onBotDifficulty)
+  discard serve("/client/friend/list", onFriendList)
   discard serve("/client/friend/request/list/inbox", onEmptyArray)
   discard serve("/client/friend/request/list/outbox", onEmptyArray)
-  discard serve("/client/builds/list", onEmptyObject)
+  discard serve("/client/chatServer/list", onChatServerList)
   discard serve("/client/survey", onEmptyObject)
-  discard serve("/client/prestige/list", onEmptyArray)
+  discard serve("/client/survey/view", onNullData)
+  discard serve("/client/survey/opinion", onNullData)
+  discard serve("/client/prestige/list", onPrestigeList)
   discard serve("/client/putMetrics", onNullData)
+  discard serve("/client/getMetrics", onEmptyObject)
   discard serve("/client/analytics/event-disabled", onNullData)
-  discard serve("/client/repeatalbeQuests/activityPeriods", onEmptyArray)
+  discard serve("/client/repeatalbeQuests/activityPeriods", onActivityPeriods)
+  # The client talks to the server about itself: crash notes, release notes and
+  # its own log stream. Each is fire-and-forget and each retries when it 404s.
+  discard serve("/client/log", onNullData)
+  discard serve("/client/bsgLogging", onNullData)
+  discard serve("/client/releaseNotes", onNullData)
+
+  # Saved builds -- weapon presets, equipment loadouts, magazine templates.
+  discard serve("/client/builds/list", onBuildsList)
+  discard serve("/client/builds/weapon/save", onBuildWeapon)
+  discard serve("/client/builds/equipment/save", onBuildEquipment)
+  discard serve("/client/builds/magazine/save", onBuildMagazine)
+  discard serve("/client/builds/delete", onBuildDelete)
 
 proc onLoad(): Status =
   if side() != sideServer:
     info "the emulator is a server mod; nothing to do on this side"
     return Ok
 
-  seedIds(nowMs())
   gEdition = setting("edition").asText("standard")
   gDefaultSide = setting("defaultSide").asText("Usec")
   gNowSeconds = setting("epochBase").asInt(1700000000)
@@ -915,6 +1519,19 @@ proc onLoad(): Status =
   gInsurancePercent = setting("insurancePercent").asInt(10)
   gInsuranceHours = setting("insuranceReturnHours").asInt(24)
   gScavCooldownSeconds = setting("scavCooldownSeconds").asInt(900)
+  # What `/client/game/bot/limit` answers for a map the database says nothing
+  # about. It was a literal in the route; it is a default here, which is the
+  # difference between a value somebody can change and one they cannot.
+  gDefaultBotLimit = setting("defaultBotLimit").asInt(30)
+  # Fence's standing per scav raid. The reference gives the requirement and not
+  # the rate -- see the note at the foot of `emu/traders` for where the default
+  # comes from and why it is a setting rather than a constant.
+  gFenceKarmaExtract = setting("fenceKarmaOnScavExtract").asFloat(0.01)
+  gFenceKarmaDeath = setting("fenceKarmaOnScavDeath").asFloat(0.0)
+  # The inbox is bounded. Both are "off" at zero or below, for anyone who wants
+  # the whole history -- see the header of `emu/mail`.
+  configureMail(setting("mailKeepHours").asInt(72),
+                setting("mailKeepCollected").asInt(1))
   configureMarket(setting("fleaSpreadPercent").asInt(20),
                   setting("fleaOfferHours").asInt(12),
                   setting("fleaMaxOffers").asInt(600),
@@ -924,6 +1541,43 @@ proc onLoad(): Status =
     error "this host has no persistent store; profiles cannot be kept " &
           "(host api " & $hostApiSize() & " bytes, this mod expects " &
           $expectedApiSize() & ")"
+    return ErrUnsupported
+
+  # After the store check and before any route can hand out an id. A server that
+  # cannot establish a fresh run number does not start: see `emu/ids` for the
+  # profile corruption that came of guessing one from the clock.
+  if not initIds():
+    error "this server cannot issue unique item ids; refusing to start"
+    return ErrUnsupported
+
+  # The modules that can prove themselves without a database, a host or a
+  # profile do it now, and this server does not start if one of them cannot.
+  # See `emu/selfchecks` for what runs and why a failure is fatal rather than a
+  # log line -- four of these checks existed and nothing called any of them,
+  # which is how a check comes to be counted as coverage without being any.
+  let selfFails = selfCheckFailures()
+
+  # One route either way, and it is registered *before* the gate below decides
+  # whether there will be any others.
+  #
+  # A mod that refuses to serve and a mod that is serving fine look identical
+  # from outside -- every route 404s in the first case, and a caller cannot tell
+  # that from a backend that has not finished starting, a mod that was never
+  # selected, or a wrong port. The log says which, and nothing in a test reads
+  # the log. So this answers on both paths: `{ok: true, failures: []}` when the
+  # arithmetic held, and `{ok: false, failures: [...]}` naming every check that
+  # did not when it refused. It is deliberately outside `/client/`, because it
+  # is not part of the client's protocol and must never be mistaken for it.
+  gSelfCheckFailures = selfFails
+  if serve("/aowlspt/tarkov/selfcheck", onSelfCheck) != Ok:
+    warn "no self-check route on this host: " & lastError()
+
+  if selfFails.len > 0:
+    for f in selfFails:
+      error "self-check: " & f
+    error "this build fails its own arithmetic; refusing to serve"
+    error "the reason is readable at /aowlspt/tarkov/selfcheck, which is the " &
+          "only route this mod registered"
     return ErrUnsupported
 
   registerRoutes()

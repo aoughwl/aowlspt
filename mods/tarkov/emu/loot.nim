@@ -880,10 +880,34 @@ proc generateLoot*(d: LootDb; cfg: LootConfig;
 
   let p = buildPresets(d)
   var out1 = newList()
-  let statics = staticContainers(d, p, r, cfg, locationId, containerMul, budget)
+
+  # The budget, shared out, and it is the same rule the flea's offer cap
+  # follows: **a bounded list filled from one source before the other gets a
+  # turn is not a bound, it is a preference nobody stated.** The containers are
+  # walked first and were handed the whole of `maxItems`, so a map whose crates
+  # alone can spend it -- a big map with a generous `staticLootMultiplier`, or
+  # anyone who raises the multiplier because they want more loot -- would come
+  # back with the crates full and **no loose loot at all**: no jackets, no floor
+  # spawns, nothing to pick up on the way past, and no log line saying why.
+  #
+  # Half each, with the containers' unspent half handed on to the loose pass.
+  # The other direction cannot arise, because the containers run first; and on
+  # every real map measured so far neither half binds at all -- three maps out
+  # of the imported database produce 1,826 items between them against a budget
+  # of 20,000 -- so this is a bound on a pathological table rather than a change
+  # to what a map holds.
+  var staticShare = budget div 2
+  if staticShare < 1:
+    staticShare = budget
+  var staticBudget = staticShare
+  let statics = staticContainers(d, p, r, cfg, locationId, containerMul,
+                                 staticBudget)
   for e in statics:
     out1.add e
-  let loose = looseLoot(d, p, r, cfg, locationId, looseMul, budget)
+  # `staticBudget` is what that pass did *not* spend, so the sum of the two
+  # halves is still exactly `maxItems`.
+  var looseBudget = budget - staticShare + staticBudget
+  let loose = looseLoot(d, p, r, cfg, locationId, looseMul, looseBudget)
   for e in loose:
     out1.add e
   result = text(out1)

@@ -7,6 +7,13 @@
   "insurancePercent": 10,
   "insuranceReturnHours": 24,
   "scavCooldownSeconds": 900,
+  "defaultBotLimit": 30,
+
+  "fenceKarmaOnScavExtract": 0.01,
+  "fenceKarmaOnScavDeath": 0.0,
+
+  "mailKeepHours": 72,
+  "mailKeepCollected": 1,
 
   "lootEnabled": true,
   "staticLootMultiplier": 1.0,

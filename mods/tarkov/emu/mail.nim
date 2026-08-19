@@ -10,6 +10,28 @@
 ## the profile document: the inbox grows without bound over a campaign, and
 ## every request that touches the profile would carry it.
 ##
+## The inbox is **bounded**, and it did not used to be. Emptying a message
+## leaves it in place on purpose -- `rewardCollected: true`, `hasRewards:
+## false` -- so the player keeps the record of where the items came from. But
+## nothing ever removed one, and a soak of 200 play cycles grew `mail.<id>` by
+## 53133 bytes, about 267 per withdrawn-and-collected flea offer, monotonically
+## for the life of the profile. Every request that opens the inbox carries all
+## of it, and the same soak measured average request latency going from 797 us
+## to 105 ms as it grew.
+##
+## What is dropped is only ever a **collected** message, and only the older
+## ones: `mailKeepCollected` of them are kept per dialog (one by default) and
+## the rest go, along with any collected message older than `mailKeepHours`.
+## Both are off at zero or below, for anyone who wants the whole history.
+##
+## Per dialog rather than overall, because the inbox screen shows one row per
+## sender with the *newest* message as its preview -- so the second-newest
+## emptied "your offer was withdrawn" is not on any screen the client draws,
+## and the items it is a record of are in the stash where the player put them.
+## A message still holding items is never dropped at any age or count: the
+## mailbox is the only place those items exist. Nor is an ordinary message with
+## no attachments, which is the only record of what a trader said.
+##
 ## Redeeming an attachment **is** implemented, and the shape of a message is
 ## what makes it possible. A message that carries items owns a container: an id
 ## in `items.stash`, with every root reward item parented onto it and slotted
@@ -27,7 +49,9 @@ import std/strutils
 import aowlspt
 import aowlspt/server
 import aowlspt/json
+import store
 import ids
+import notify
 
 const KeyPrefix* = "mail."
 
@@ -46,15 +70,36 @@ type
 
 proc mailKey*(profileId: string): string = KeyPrefix & profileId
 
-proc loadMail*(profileId: string): List =
-  ## Every message for a profile, oldest first. An empty inbox is `[]`, not an
-  ## error: a new profile has one.
-  let stored = load(mailKey(profileId))
-  if not stored.ok or stored.raw.len == 0:
+var gKeepHours = 72
+var gKeepCollected = 1
+
+proc configureMail*(keepHours, keepCollected: int) =
+  ## From the mod's config. Zero or fewer turns either rule off.
+  gKeepHours = keepHours
+  gKeepCollected = keepCollected
+
+proc loadMail*(profileId: string; usable: var bool): List =
+  ## Every message for a profile, oldest first, and whether the inbox could be
+  ## read at all.
+  ##
+  ## An empty inbox is `[]`, not an error: a new profile has one. An inbox that
+  ## is *there* and unreadable is a different answer, and the difference matters
+  ## because every writer here rewrites the whole list -- see `emu/store`. The
+  ## mailbox is also the only place a redeemed reward exists before it is
+  ## redeemed, so overwriting it loses items outright.
+  let raw1 = readKey(mailKey(profileId), usable)
+  if raw1.len == 0:
     return newList()
-  result = parseArray(stored.raw)
+  result = parseArray(raw1)
   if not result.ok:
     result = newList()
+
+proc loadMail*(profileId: string): List =
+  ## For the read-only callers: the inbox screen, the dialog view, the
+  ## attachment list. A failure shows an empty inbox for one request and is
+  ## logged; it writes nothing.
+  var usable = true
+  result = loadMail(profileId, usable)
 
 proc saveMail*(profileId: string; messages: List): bool =
   result = save(mailKey(profileId), text(messages)) == Ok
@@ -128,14 +173,109 @@ proc newMessage*(sender, text1: string; kind: MessageKind; nowSeconds: int;
     setNumber(result, "maxStorageTime", 259200)
   setBool(result, "systemData", false)
 
+proc collected(messageJson: string): bool =
+  ## Has this message been emptied? `rewardCollected` is set by
+  ## `removeAttachments` when the last item leaves, and it is the only mark that
+  ## distinguishes "the player already has this" from "this is still owed".
+  let m = whole(messageJson)
+  if not m.field("rewardCollected").asBool(false):
+    return false
+  # Belt and braces: a message that still reports rewards is not reclaimable
+  # whatever the other flag says. The two disagreeing means a bug somewhere
+  # else, and the safe reading of a bug here is "keep the items".
+  result = not m.field("hasRewards").asBool(false)
+
+proc prune*(messages: List; nowSeconds: int): List =
+  ## Drops collected messages: those past the keep window, and those beyond the
+  ## per-dialog allowance. Order is preserved, and nothing that still holds
+  ## items is ever dropped.
+  ##
+  ## `nowSeconds` of zero or less means "no clock here" and skips the age rule
+  ## -- `removeAttachments` runs this on the write that empties a message and
+  ## has no clock to hand. The count rule is the one that bounds the store, and
+  ## it holds either way.
+  result = messages
+  var drop: seq[bool] = @[]
+  var any = false
+  for i in 0 ..< messages.len:
+    let can = collected(messages.items[i])
+    if can:
+      any = true
+    drop.add false
+  if not any:
+    return
+
+  if gKeepHours > 0 and nowSeconds > 0:
+    let cutoff = nowSeconds - gKeepHours * 3600
+    for i in 0 ..< messages.len:
+      if collected(messages.items[i]) and
+         field(messages.items[i], "dt").asInt(0) < cutoff:
+        drop[i] = true
+
+  if gKeepCollected > 0:
+    # Newest first, so the allowance is spent on the messages the inbox screen
+    # can actually reach. `deliver` appends, so document order is oldest first.
+    var senders: seq[string] = @[]
+    var seen: seq[int] = @[]
+    var i = messages.len - 1
+    while i >= 0:
+      if not drop[i] and collected(messages.items[i]):
+        let uid = field(messages.items[i], "uid").asText("")
+        var at = -1
+        for k in 0 ..< senders.len:
+          if senders[k] == uid:
+            at = k
+        if at < 0:
+          senders.add uid
+          seen.add 1
+        else:
+          seen[at] = seen[at] + 1
+          if seen[at] > gKeepCollected:
+            drop[i] = true
+      dec i
+
+  var out1 = newList()
+  for i in 0 ..< messages.len:
+    if not drop[i]:
+      out1.add messages.items[i]
+  result = out1
+
 proc deliver*(profileId, sender, text1: string; kind: MessageKind;
               nowSeconds: int; attachments: string = ""): bool =
   ## Appends a message and saves. The whole inbox is rewritten, which is the
   ## right trade at inbox sizes and the wrong one at a hundred thousand -- if
   ## that ever matters, the fix is a key per message, not a partial write.
-  var messages = loadMail(profileId)
+  ##
+  ## Pruned on the way through, because this is the one place the inbox grows
+  ## and doing it here means the bound holds without a sweep that has to know
+  ## which profiles exist.
+  var usable = true
+  let existing = loadMail(profileId, usable)
+  if not usable:
+    # The inbox is there and could not be read. Delivering into an empty list
+    # would replace it -- with a quest reward or an insurance return in it, that
+    # is the player's items gone. Refusing means the caller keeps the item where
+    # it is and can try again.
+    return false
+  var messages = prune(existing, nowSeconds)
   messages.add newMessage(sender, text1, kind, nowSeconds, attachments)
   result = saveMail(profileId, messages)
+
+  # And tell the player, if there is one logged in.
+  #
+  # This is the source of the notification rather than a sweep over what
+  # changed, and the difference is what makes the notifier worth having: a
+  # quest reward, an insurance return and a sold flea offer all arrive here,
+  # and the badge appears when the message does instead of up to a minute
+  # later. It is after the save on purpose -- a notification for a message that
+  # failed to persist sends the player to an inbox that does not have it.
+  #
+  # The push cannot fail in a way this cares about: with no websocket open it
+  # goes on the poll's queue, and with nobody logged in it goes nowhere, which
+  # is correct. So the result is discarded rather than checked.
+  if result:
+    discard notifyProfile(profileId,
+                          newMessageNote(sender, "", ord(kind), nowSeconds))
 
 proc dialogList*(profileId: string): string =
   ## The inbox screen: one entry per sender, with the newest message as its
@@ -194,7 +334,13 @@ proc dialogView*(profileId, dialogId: string): string =
       continue
     if m.field("hasRewards").asBool(false):
       withRewards = true
-    out1.add messages.items[i]
+    # `raw`, not the bare string. `out1` is a JsonArray, and its `add(string)`
+    # overload *quotes* what it is given: adding the message text directly put
+    # `"{\"_id\":\"...\"}"` on the wire -- an array of strings where the
+    # client expects an array of message objects. It parses without complaint
+    # and then renders an empty dialog, because every element is a string with
+    # no `_id`, no `text` and no `items`.
+    out1.add raw(messages.items[i])
   var o = obj()
   put(o, "messages", out1)
   put(o, "profiles", arr())
@@ -209,7 +355,11 @@ proc allAttachments*(profileId: string): string =
     let m = whole(messages.items[i])
     if m.field("hasRewards").asBool(false) and
        not m.field("rewardCollected").asBool(false):
-      out1.add messages.items[i]
+      # `raw` for the same reason as in `dialogView`: without it the "collect
+      # all" screen was answered `{"messages":["{\"_id\":\"...\"}"]}` --
+      # JSON strings, not objects -- and the screen listed nothing to collect
+      # while the inbox badge said there was.
+      out1.add raw(messages.items[i])
   var o = obj()
   put(o, "messages", out1)
   put(o, "profiles", arr())
@@ -261,7 +411,10 @@ proc removeAttachments*(profileId, messageId: string;
   ## and something else does: a redeemed item keeps its id, so `emu/redeem`
   ## refuses to bring across an item the profile already has. Identity is the
   ## guard here, not ordering, because ordering cannot be both ways at once.
-  var messages = loadMail(profileId)
+  var usable = true
+  var messages = loadMail(profileId, usable)
+  if not usable:
+    return false
   let mi = indexOfMessage(messages, messageId)
   if mi < 0:
     return false
@@ -291,4 +444,9 @@ proc removeAttachments*(profileId, messageId: string;
     setBool(m, "rewardCollected", true)
     setBool(m, "hasRewards", false)
   messages.replaceAt(mi, text(m))
-  result = saveMail(profileId, messages)
+  # And the write that empties a message is the write that can reclaim the last
+  # one: without pruning here the newly-collected message and the one it
+  # replaces both sit in the store until the *next* delivery, which is one
+  # message of permanent slack per profile and shows up as a store that never
+  # quite comes back to the size it was.
+  result = saveMail(profileId, prune(messages, 0))

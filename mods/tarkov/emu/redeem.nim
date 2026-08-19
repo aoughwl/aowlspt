@@ -148,7 +148,12 @@ proc redeem*(inv: var Inventory; profileId, stashId: string; action: JsonRef;
     ch.problems.add "a mail move named no message or no item"
     return false
 
-  var messages = loadMail(profileId)
+  var usable = true
+  var messages = loadMail(profileId, usable)
+  if not usable:
+    # The mailbox is there and could not be read. Staging a removal against an
+    # empty list would commit an empty mailbox over a full one.
+    return false
   let mi = indexOfMessage(messages, messageId)
   if mi < 0:
     ch.problems.add "there is no message " & messageId

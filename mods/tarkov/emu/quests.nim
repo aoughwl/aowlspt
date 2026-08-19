@@ -38,6 +38,8 @@ import ids
 import profile
 import mail
 import questcond
+import traders
+import repeatable
 
 type
   QuestAction* = enum
@@ -83,6 +85,26 @@ proc questTemplate*(qid: string): string =
     return v.raw
   result = ""
 
+proc questTemplate*(p: Profile; qid: string; nowSeconds: int): string =
+  ## The database's template, or -- when there is none -- the one
+  ## `emu/repeatable` computes for a daily this profile currently has.
+  ##
+  ## This one lookup is the whole integration. A repeatable quest is an
+  ## ordinary quest whose template happens to be a function of the profile and
+  ## the clock rather than a row in a table, so accepting one, handing items to
+  ## one and completing one all go through the code that was already here and
+  ## already tested: the same condition evaluator, the same counters, the same
+  ## reward payout, the same refusals. Nothing below this line knows the
+  ## difference.
+  ##
+  ## The database is asked first, so a real quest can never be shadowed by a
+  ## generated one -- the generated ids come out of a seeded stream and a
+  ## collision with a real quest id would otherwise silently replace it.
+  let direct = questTemplate(qid)
+  if direct.len > 0:
+    return direct
+  result = questTemplateFor(p, qid, nowSeconds)
+
 proc rewardExperience*(qid, state: string): int =
   ## Experience from a quest's own reward table, when the database has one.
   ## Zero when it does not -- a quest with no known rewards still completes,
@@ -100,25 +122,6 @@ proc rewardExperience*(qid, state: string): int =
 # Editing the profile around a quest
 # ---------------------------------------------------------------------------
 
-proc setTopLevel(p: var Profile; name, rawValue: string) =
-  ## Sets a top-level member of the profile, adding it when it is missing.
-  ##
-  ## `profile.setRaw` replaces a value that is already there and does nothing
-  ## when it is not, which is right for a path into a document nobody promised
-  ## a shape for -- and wrong for `TaskConditionCounters` on a profile that
-  ## predates this module, where "nothing happened" means every counter written
-  ## this raid is dropped without a word. The fallback re-serialises the top
-  ## level through `Doc`, which keeps every other member as the raw text it
-  ## already was.
-  if p.field(name).found:
-    setRaw(p, name, rawValue)
-    return
-  var d = parseObject(p.text)
-  if not d.ok:
-    return
-  setRaw(d, name, rawValue)
-  p.text = text(d)
-
 proc counters(p: Profile): string =
   let c = p.field("TaskConditionCounters")
   if c.found and isObject(c):
@@ -134,29 +137,7 @@ proc questLabel(qid, tpl: string): string =
     return n
   result = qid
 
-proc addStanding(p: var Profile; traderId: string; delta: float) =
-  ## Moves one trader's standing, leaving every other field of their entry --
-  ## `salesSum`, `unlocked`, `nextResupply` -- exactly as it was.
-  if traderId.len == 0 or delta == 0.0:
-    return
-  var info = parseObject(p.field("TradersInfo").raw())
-  if not info.ok:
-    info = newDoc()
-  var t = parseObject(getRaw(info, traderId))
-  if not t.ok:
-    t = newDoc()
-    # A trader the profile has no entry for still has to start somewhere, and
-    # the client reads all four of these before it draws the trader at all.
-    setNumber(t, "loyaltyLevel", 1)
-    setNumber(t, "salesSum", 0)
-    setBool(t, "unlocked", true)
-    setBool(t, "disabled", false)
-  let current = get(t, "standing").asFloat(0.0)
-  setNumber(t, "standing", current + delta)
-  setRaw(info, traderId, text(t))
-  setTopLevel(p, "TradersInfo", text(info))
-
-proc freshIds(itemsJson: string): string =
+proc freshIds*(itemsJson: string): string =
   ## Re-ids a reward item tree, keeping its shape.
   ##
   ## The ids in a quest template are fixed: every player who completes the
@@ -236,24 +217,27 @@ proc unlockFollowUps(p: var Profile; qid: string; nowSeconds: int): int =
   if changed:
     setTopLevel(p, "Quests", text(list))
 
-proc grantRewards(p: var Profile; qid, tpl, state: string; nowSeconds: int;
-                  experience: var int): seq[string] =
-  ## Pays a quest out. Returns the notes worth logging -- reward kinds that
-  ## were read and not applied, named rather than dropped, because a player
-  ## missing an unlocked trader assort needs the reason to exist somewhere.
+proc grantRewardList*(p: var Profile; rewards: seq[Reward];
+                      sender, label: string; kind: MessageKind;
+                      nowSeconds: int; experience: var int): seq[string] =
+  ## Pays out a list of rewards, whatever produced it. Returns the notes worth
+  ## logging -- reward kinds that were read and not applied, named rather than
+  ## dropped, because a player missing an unlocked trader assort needs the
+  ## reason to exist somewhere.
+  ##
+  ## Shared with `emu/achievements`, which pays the same `Reward` shape out of a
+  ## different table: the reference gives an achievement a `Rewards` list of the
+  ## same type a quest has, and two copies of this arithmetic is two places for
+  ## the next reward kind to be forgotten.
   result = @[]
   experience = 0
-  if tpl.len == 0:
-    return
-  let trader = traderOf(tpl)
   var attachments = newList()
-  let rewards = rewardsOf(tpl, state)
   for r in rewards:
     case r.kind
     of "Experience":
       experience = experience + int(r.value)
     of "TraderStanding":
-      let who = if r.target.len > 0: r.target else: trader
+      let who = if r.target.len > 0: r.target else: sender
       addStanding(p, who, r.value)
     of "Item":
       if r.items.len > 0:
@@ -264,18 +248,10 @@ proc grantRewards(p: var Profile; qid, tpl, state: string; nowSeconds: int;
       # Unlocking a trader is an edit to `TradersInfo.<id>.unlocked`, and it is
       # applied: it is one field, and a locked trader is a quest chain the
       # player cannot continue.
-      var info = parseObject(p.field("TradersInfo").raw())
-      if info.ok and r.target.len > 0:
-        var t = parseObject(getRaw(info, r.target))
-        if not t.ok:
-          t = newDoc()
-          setNumber(t, "loyaltyLevel", 1)
-          setNumber(t, "salesSum", 0)
-          setNumber(t, "standing", 0)
-          setBool(t, "disabled", false)
+      if r.target.len > 0:
+        var t = traderEntry(p, r.target)
         setBool(t, "unlocked", true)
-        setRaw(info, r.target, text(t))
-        setTopLevel(p, "TradersInfo", text(info))
+        putTraderEntry(p, r.target, t)
     else:
       # AssortmentUnlock, Skill, StashRows, ProductionScheme, and whatever the
       # next patch adds. Each needs a system this module does not own, and a
@@ -284,33 +260,68 @@ proc grantRewards(p: var Profile; qid, tpl, state: string; nowSeconds: int;
                  (if r.target.len > 0: " (" & r.target & ")" else: "")
 
   if attachments.len > 0:
-    let kind = if state == "Fail": mkQuestFail
-               elif state == "Started": mkQuestStart
-               else: mkQuestSuccess
-    let label = questLabel(qid, tpl)
     # Items go through the post rather than into the stash. The stash has no
     # room reserved for them, a full stash would lose them, and the mailbox is
-    # where the game itself puts a quest reward.
-    if not deliver(p.id, trader, label, kind, nowSeconds, text(attachments)):
+    # where the game itself puts a reward.
+    if not deliver(p.id, sender, label, kind, nowSeconds, text(attachments)):
       result.add "the reward items for " & label & " could not be delivered"
+
+proc grantRewards(p: var Profile; qid, tpl, state: string; nowSeconds: int;
+                  experience: var int): seq[string] =
+  ## One quest's payout for one outcome.
+  result = @[]
+  experience = 0
+  if tpl.len == 0:
+    return
+  let kind = if state == "Fail": mkQuestFail
+             elif state == "Started": mkQuestStart
+             else: mkQuestSuccess
+  result = grantRewardList(p, rewardsOf(tpl, state), traderOf(tpl),
+                           questLabel(qid, tpl), kind, nowSeconds, experience)
 
 # ---------------------------------------------------------------------------
 # The actions
 # ---------------------------------------------------------------------------
 
-proc handedOver(body: JsonRef): int =
+proc handedOver(p: Profile; body: JsonRef): int =
   ## How many items a `QuestHandover` carried. One per entry when an entry does
   ## not say -- a handover with no count is one item, and reading it as zero
   ## makes a five-item condition unreachable.
+  ##
+  ## **Clamped to what the profile holds.** The count used to be taken from the
+  ## request as written, so a body naming one item with `count: 9999` finished a
+  ## "hand over five" condition -- and its reward -- while five items' worth of
+  ## nothing left the stash. The credit now cannot exceed the item's own
+  ## `StackObjectsCount`, which is the number the inventory actions in the same
+  ## batch are about to remove.
   result = 0
   let items = body.field("items")
   if not items.found:
     return 1
+  let owned = each(field(p.text, "Inventory.items"))
   let list = each(items)
   for i in list:
-    let n = i.field("count").asInt(1)
-    result = result + (if n > 0: n else: 1)
-  if result == 0:
+    var n = i.field("count").asInt(1)
+    if n < 1:
+      n = 1
+    let id = i.field("id").asText("")
+    if id.len > 0:
+      # An id the profile does not have credits nothing: it is either an item
+      # already handed over in an earlier request or one that was never there.
+      var have = 0
+      for it in owned:
+        if it.field("_id").asText("") == id:
+          have = it.field("upd.StackObjectsCount").asInt(1)
+          if have < 1:
+            have = 1
+      if n > have:
+        n = have
+    result = result + n
+  if list.len == 0:
+    # No entries at all is the old shorthand for "one item", and it predates
+    # the counts. An entry that resolved to nothing is *not* that: it is an id
+    # the profile does not hold, and crediting one for it would put the loophole
+    # straight back.
     result = 1
 
 proc requiredFor(tpl, condIdent: string): int =
@@ -334,21 +345,29 @@ proc requiredFor(tpl, condIdent: string): int =
 
 proc applyQuestOnProfile*(p: var Profile; action: QuestAction; body: JsonRef;
                           nowSeconds: int; experience: var int;
-                          problem: var string): bool =
+                          problem: var string; note: var string): bool =
   ## One quest action, guarded and paid. Returns whether the profile changed;
   ## `problem` is set on a refusal and is what the client shows the player.
+  ##
+  ## `note` is the other half: the action *was* applied and the player should
+  ## still hear about it. There is one of those and it matters -- a quest the
+  ## database has no template for is accepted, because a server with no quest
+  ## table still has to let a client play, and none of its conditions were
+  ## checked and none of its rewards exist. Answering `err:0` with nothing in
+  ## it is how a player ends up wondering where the reward went.
   ##
   ## `experience` is an out-parameter rather than an edit to `Info.Experience`
   ## because a batch of item-event actions accumulates experience from several
   ## sources and adds it once -- adding it here as well would pay it twice.
   experience = 0
   problem = ""
+  note = ""
   let qid = body.field("qid").asText("")
   if qid.len == 0:
     problem = "that quest action names no quest"
     return false
 
-  let tpl = questTemplate(qid)
+  let tpl = questTemplate(p, qid, nowSeconds)
   let label = questLabel(qid, tpl)
   var list = parseArray(p.field("Quests").raw())
   if not list.ok:
@@ -368,12 +387,24 @@ proc applyQuestOnProfile*(p: var Profile; action: QuestAction; body: JsonRef;
       problem = "cannot accept " & label & ": " & reason
       return false
     if tpl.len == 0:
-      warn "accepting " & qid & ": the database has no template for it, so " &
-           "its start conditions were not checked"
+      note = "accepted " & qid & ", but this server has no template for it: " &
+             "its start conditions were not checked and its rewards do not " &
+             "exist here"
+      warn note
     elif unchecked > 0:
       warn "accepting " & label & ": " & $unchecked &
            " start condition(s) are of a kind this server does not evaluate"
     setState(list, qid, "Started", nowSeconds)
+    if tpl.len > 0 and questTemplate(qid).len == 0:
+      # A generated quest -- a daily, a weekly, the scav's. Marked on the entry
+      # so that `pruneExpiredRepeatables` can recognise its own and nothing
+      # else: the whole reason it is safe to delete a finished quest's record is
+      # that this flag says the server invented it in the first place.
+      let at = findQuest(list, qid)
+      if at >= 0:
+        var d = parseObject(list.items[at])
+        setBool(d, "sptRepeatable", true)
+        list.replaceAt(at, text(d))
     setTopLevel(p, "Quests", text(list))
     # Some quests hand over an item at the start -- a key, a marker. Paid here
     # so the player has it before they are asked to use it.
@@ -398,8 +429,9 @@ proc applyQuestOnProfile*(p: var Profile; action: QuestAction; body: JsonRef;
       problem = "cannot complete " & label & ": " & reason
       return false
     if tpl.len == 0:
-      warn "completing " & qid & ": the database has no template for it, so " &
-           "nothing was checked and nothing is paid"
+      note = "completed " & qid & ", but this server has no template for it: " &
+             "nothing was checked and nothing is paid"
+      warn note
     elif unchecked > 0:
       warn "completing " & label & ": " & $unchecked &
            " finish condition(s) are of a kind this server does not evaluate"
@@ -433,7 +465,7 @@ proc applyQuestOnProfile*(p: var Profile; action: QuestAction; body: JsonRef;
       problem = "a handover for " & label & " that names no condition"
       return false
 
-    let given = handedOver(body)
+    let given = handedOver(p, body)
     let need = requiredFor(tpl, cond)
     let sofar = counterValue(p.text, cond) + given
     setTopLevel(p, "TaskConditionCounters",
@@ -488,6 +520,57 @@ proc raidLocation*(body: string): string =
     name.add ch
   result = name
 
+proc pruneExpiredRepeatables*(p: var Profile; nowSeconds: int): int =
+  ## Drops the profile's record of generated quests that are finished *and* no
+  ## longer offered. Returns how many went.
+  ##
+  ## Three dailies a day, kept forever, is a profile document that grows for the
+  ## life of the character -- and this server reads and writes the whole
+  ## document on every request, so growth there is latency on everything.
+  ## `emu/mail` is bounded for exactly this reason and the measurement is in
+  ## EMULATOR.md.
+  ##
+  ## Three guards, and each of them is the difference between a bound and a
+  ## bug:
+  ##
+  ## - only entries carrying `sptRepeatable`, which this module writes itself
+  ##   when it accepts one. A quest from the database is never touched.
+  ## - only `Success` or `Fail`. A daily the player is halfway through is state
+  ##   they earned, and it survives the day it was offered for -- it becomes a
+  ##   quest with no template, which is a case `questTemplate` already handles.
+  ## - only ids that are **not** currently offered, which is the check that a
+  ##   quest cannot be pruned and then re-accepted for its reward again.
+  result = 0
+  var list = parseArray(p.field("Quests").raw())
+  if not list.ok or list.len == 0:
+    return 0
+  var anyGenerated = false
+  for i in 0 ..< list.len:
+    if field(list.items[i], "sptRepeatable").asBool(false):
+      anyGenerated = true
+  if not anyGenerated:
+    # The common case, and it costs one pass rather than a generation of every
+    # set for every profile that has never seen a daily.
+    return 0
+  let offered = currentIds(p, nowSeconds)
+  var kept = newList()
+  for i in 0 ..< list.len:
+    let entry = whole(list.items[i])
+    let status = entry.field("status").asText("")
+    if entry.field("sptRepeatable").asBool(false) and
+       (status == "Success" or status == "Fail"):
+      let qid = entry.field("qid").asText("")
+      var current = false
+      for id in offered:
+        if id == qid:
+          current = true
+      if not current:
+        inc result
+        continue
+    kept.add list.items[i]
+  if result > 0:
+    setTopLevel(p, "Quests", text(kept))
+
 proc advanceQuestsAfterRaid*(p: var Profile; beforeText, location,
                              exitStatus: string; nowSeconds: int): int =
   ## Folds a raid's results into the quest state. Returns the number of quests
@@ -514,7 +597,7 @@ proc advanceQuestsAfterRaid*(p: var Profile; beforeText, location,
     if entry.field("status").asText("") != "Started":
       continue
     let qid = entry.field("qid").asText("")
-    let tpl = questTemplate(qid)
+    let tpl = questTemplate(p, qid, nowSeconds)
     if tpl.len == 0:
       continue
     let conds = conditionsOf(tpl, cgFinish)
@@ -547,7 +630,7 @@ proc advanceQuestsAfterRaid*(p: var Profile; beforeText, location,
     if status != "Started" and status != "AvailableForFinish":
       continue
     let qid = entry.field("qid").asText("")
-    let tpl = questTemplate(qid)
+    let tpl = questTemplate(p, qid, nowSeconds)
     if tpl.len == 0:
       continue
     var reason = ""
@@ -568,6 +651,15 @@ proc advanceQuestsAfterRaid*(p: var Profile; beforeText, location,
       success questLabel(qid, tpl) & " is ready to hand in"
   if changed:
     setTopLevel(p, "Quests", text(list))
+
+  # And the bound. A raid is the right moment: it is a write of the profile
+  # anyway, it is the only thing that reliably happens between one day's
+  # dailies and the next, and it is rare enough that regenerating the sets to
+  # answer "is this one still offered" costs nothing anybody can measure.
+  let dropped = pruneExpiredRepeatables(p, nowSeconds)
+  if dropped > 0:
+    info "dropped " & $dropped & " finished repeatable quest(s) that are no " &
+         "longer offered"
 
 # ---------------------------------------------------------------------------
 # The unguarded entry point
