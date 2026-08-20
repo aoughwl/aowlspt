@@ -1693,8 +1693,34 @@ static int aowl_ws_pump(AowlConn* c) {
          * turn of this loop, which costs one `recv` and no correctness. */
         int32_t want = AOWL_CONN_CHUNK;
         if (!aowl_conn_reserve(c, c->len + want)) return 0;
-        int n = c->ssl ? aowl_tls_read_once(c->ssl, c->buf + c->len, want)
-                       : recv(c->s, c->buf + c->len, want, 0);
+        int n;
+        if (c->ssl) {
+            /* One `SSL` object, and OpenSSL forbids a read and a write on it at
+             * the same time: `SSL_read` and `SSL_write` share the record layer's
+             * state, and a worker pushing a notification (a broadcast at raid
+             * entry is the case that bites) is inside `SSL_write` under `g_wsCs`
+             * on this very handle. The notifier is the *only* connection where
+             * that overlap is possible -- it stays on the poller's watch list
+             * and keeps being read here while a worker may push to it, whereas
+             * every request connection is owned by one thread at a time. On a
+             * plain socket a concurrent `recv`/`send` is fine and this does not
+             * apply; there is no lock on that path.
+             *
+             * So the read joins the write under `g_wsCs`. The poller must never
+             * wait on that lock (see `aowl_ws_send`), so a `TryEnter` that loses
+             * to a worker's in-flight push is treated exactly like a would-block:
+             * the frames stay on the socket, this wakeup returns "keep", and the
+             * still-asserted `POLLRDNORM` brings the poller straight back once
+             * the push has let the lock go. Without this the two `SSL` calls
+             * raced and corrupted the record state -- a silent native crash the
+             * moment a push and a client-side teardown coincided, which is raid
+             * entry. */
+            if (!TryEnterCriticalSection(&g_wsCs)) return 1;
+            n = aowl_tls_read_once(c->ssl, c->buf + c->len, want);
+            LeaveCriticalSection(&g_wsCs);
+        } else {
+            n = recv(c->s, c->buf + c->len, want, 0);
+        }
         if (n > 0) { c->len += n; continue; }
         if (n == 0) return 0;                       /* peer closed the socket */
         if (WSAGetLastError() == WSAEWOULDBLOCK) return 1;
