@@ -48,6 +48,139 @@ import perfphase
 # defines, so a host that has no websocket must not be made to link it.
 {.emit: """#include "aowlspt_notify.h" """.}
 
+# ------------------------------------------------------------- crash report
+#
+# The one thing a native access violation does not do on its own is say where.
+# A Nim exception is caught and logged with a stack; a use-after-free or a null
+# deref in the C net engine (`aowlspt_net.h`) is a first-chance SEH exception on
+# a raw `CreateThread` worker or the poller, with no `__try` above it -- gcc has
+# none -- so the process simply vanishes. That is exactly the shape of the raid
+# entry crash: the log's last line is an ordinary request and then nothing.
+#
+# This installs a last-resort filter that fires only for a *genuinely unhandled*
+# fault -- `SetUnhandledExceptionFilter`, not a first-chance VEH, so the guarded
+# faults elsewhere in this repo (`aowl_seh_veh`, `mr_veh`, which recover and
+# continue) are never mistaken for a crash. It writes the faulting instruction
+# as module+offset (the map file turns that into a symbol), the address that was
+# touched, the offending thread, and a short return-address stack -- to stderr
+# and to the same log file as everything else -- and then lets the process die.
+# `RtlCaptureStackBackTrace` and `GetModuleHandleExA` are all it uses; a crash
+# handler must not allocate, take a lock, or load `dbghelp`, and this does none.
+{.emit: """
+#include <stdio.h>
+
+static char aowl_crash_logpath[1024];
+static void aowl_crash_set_logpath(const char* p, int32_t n) {
+    int i = 0;
+    if (n > (int)sizeof(aowl_crash_logpath) - 1)
+        n = (int)sizeof(aowl_crash_logpath) - 1;
+    for (; i < n; i++) aowl_crash_logpath[i] = p[i];
+    aowl_crash_logpath[i] = 0;
+}
+
+/* stderr first -- it needs nothing and survives a log path that could not be
+ * opened -- then the log, appended so the crash lands under the last request
+ * the poller managed to write. No buffering games: flush each, since the next
+ * thing to run is the default terminator. */
+static void aowl_crash_write(const char* s) {
+    fputs(s, stderr);
+    fflush(stderr);
+    if (aowl_crash_logpath[0]) {
+        FILE* f = fopen(aowl_crash_logpath, "a");
+        if (f) { fputs(s, f); fflush(f); fclose(f); }
+    }
+}
+
+/* The basename of a module path, so the report reads `aowlspt-backend.exe+0x..`
+ * rather than an absolute path per frame. */
+static const char* aowl_crash_basename(const char* p, DWORD n) {
+    const char* b = p;
+    for (DWORD i = 0; i < n; i++)
+        if (p[i] == '\\' || p[i] == '/') b = p + i + 1;
+    return b;
+}
+
+/* Resolve an address to `module+offset`, writing the module basename into
+ * `nameOut` (which must hold MAX_PATH). Offset is returned; the name is `?` and
+ * the offset the raw address when the address is in no loaded module. */
+static uintptr_t aowl_crash_resolve(void* addr, char* nameOut) {
+    HMODULE m = NULL;
+    nameOut[0] = '?'; nameOut[1] = 0;
+    if (GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                           GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                           (LPCSTR)addr, &m) && m) {
+        char path[MAX_PATH];
+        DWORD n = GetModuleFileNameA(m, path, (DWORD)sizeof(path));
+        if (n > 0) {
+            const char* base = aowl_crash_basename(path, n);
+            int i = 0;
+            while (base[i] && i < MAX_PATH - 1) { nameOut[i] = base[i]; i++; }
+            nameOut[i] = 0;
+        }
+        return (uintptr_t)addr - (uintptr_t)m;
+    }
+    return (uintptr_t)addr;
+}
+
+static LONG WINAPI aowl_crash_filter(EXCEPTION_POINTERS* ep) {
+    EXCEPTION_RECORD* er = ep->ExceptionRecord;
+    CONTEXT* c = ep->ContextRecord;
+    void* rip = (void*)(uintptr_t)c->Rip;
+    DWORD code = er->ExceptionCode;
+
+    char modname[MAX_PATH];
+    uintptr_t off = aowl_crash_resolve(rip, modname);
+
+    const char* kind =
+        code == EXCEPTION_ACCESS_VIOLATION ? "ACCESS_VIOLATION" :
+        code == EXCEPTION_IN_PAGE_ERROR    ? "IN_PAGE_ERROR" :
+        code == EXCEPTION_ILLEGAL_INSTRUCTION ? "ILLEGAL_INSTRUCTION" :
+        code == EXCEPTION_STACK_OVERFLOW   ? "STACK_OVERFLOW" : "exception";
+    void* addr = er->NumberParameters >= 2
+        ? (void*)(uintptr_t)er->ExceptionInformation[1] : NULL;
+    long rw = er->NumberParameters >= 1 ? (long)er->ExceptionInformation[0] : -1;
+
+    char line[1024];
+    snprintf(line, sizeof(line),
+        "\n*** aowlspt-backend FATAL %s (0x%08lx) ***\n"
+        "    at   %p  %s+0x%llx\n"
+        "    %s address %p  (thread %lu)\n",
+        kind, (unsigned long)code,
+        rip, modname, (unsigned long long)off,
+        rw == 0 ? "reading" : rw == 1 ? "writing" : rw == 8 ? "executing"
+                                                            : "touching",
+        addr, (unsigned long)GetCurrentThreadId());
+    aowl_crash_write(line);
+
+    /* Return addresses only -- no symbol lookup, no dbghelp. Each is
+     * module+offset, which the .map the build emits turns into a function. */
+    void* frames[24];
+    USHORT got = RtlCaptureStackBackTrace(0, 24, frames, NULL);
+    for (USHORT i = 0; i < got; i++) {
+        char fn[MAX_PATH];
+        uintptr_t fo = aowl_crash_resolve(frames[i], fn);
+        char fl[600];
+        snprintf(fl, sizeof(fl), "    [%2u] %p  %s+0x%llx\n",
+                 (unsigned)i, frames[i], fn, (unsigned long long)fo);
+        aowl_crash_write(fl);
+    }
+    aowl_crash_write("*** end crash report; process terminating ***\n\n");
+
+    /* Terminate here rather than falling through to WER: a headless loopback
+     * server that pops a Windows Error Reporting dialog is a server that hangs
+     * dead instead of dying, and the main session is waiting to relaunch it. */
+    return EXCEPTION_EXECUTE_HANDLER;
+}
+
+static void aowl_crash_install(void) {
+    SetUnhandledExceptionFilter(aowl_crash_filter);
+}
+""".}
+
+proc cCrashInstall() {.importc: "aowl_crash_install", nodecl.}
+proc cCrashSetLog(p: HostPtr; n: int32) {.importc: "aowl_crash_set_logpath",
+                                          nodecl.}
+
 proc cNetServe(port, workers: int32): int32 {.importc: "aowl_net_serve", nodecl.}
 # Bind the listening port and hold it, without listening on it yet. This is the
 # first thing `main` does that can fail, and it is deliberately separate from
@@ -1745,6 +1878,13 @@ proc main(): int =
   let logPath = joinPath(gRoot, "aowlspt-backend.log")
   openLog(logPath, HostName & " " & HostVersion & "\n" &
                    "root " & gRoot & "\n\n")
+
+  # Before anything that spawns a thread or answers a request: a native fault in
+  # the C net engine has no Nim handler above it and would otherwise leave the
+  # log ending on an ordinary request with no cause. This makes the next such
+  # crash name its own faulting address. See the emit block above.
+  cCrashSetLog(cast[HostPtr](readRawData(logPath)), int32(logPath.len))
+  cCrashInstall()
 
   console.heading "aowlspt-backend"
   console.line "  root  " & gRoot
