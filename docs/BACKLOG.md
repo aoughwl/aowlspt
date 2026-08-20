@@ -229,7 +229,7 @@ the last person who did:
 
 | gate | checks | how |
 |---|---:|---|
-| `emutest`, against `tests/fixtures/emu-full.json` | **577** | `emutest.exe --root <stage> --backend … --port <n>` |
+| `emutest`, against `tests/fixtures/emu-full.json` | **596** | `emutest.exe --root <stage> --backend … --port <n>` |
 | `realtest`, against the 39.40 MiB imported database | **168**, 1 skipped | `realtest.exe --root <stage> --db build\db\db.json …` |
 | `soak`, 24 closed play cycles | **915** | `soak.exe --root <stage> … --cycles 24` |
 | `fuzzwire` | **152** | `fuzzwire.exe --root <stage> …` |
@@ -1176,3 +1176,156 @@ item by item. Where something could not be verified it is marked as unverified
 rather than dropped; where a claim in one file contradicts another, both are
 quoted rather than one being chosen; and where the code has since moved, the old
 claim is struck with the file and line that moved it rather than deleted.*
+
+---
+
+## 2026-08-20: the capture changed what is knowable
+
+Everything above was written while the real backend's traffic was unreadable.
+It is readable now, in both directions, and that moves a number of items from
+"blocked on a playtest" to "checked against what the backend actually did".
+
+**What was solved.** Post-1.0 wraps every body -- request and response -- in a
+length-keyed byte shuffle that carries no key, and encrypts responses only,
+AES-192-CBC with an in-band IV under a key that is a plain 24-character ASCII
+literal in the client. `docs/WIRE.md` is the description; `tools/bsgwire.py`
+and `tools/bsgaes.py` are the implementation. All 171 encrypted bodies in
+`mods/tarkov/data/capture/raid1` decrypt, and 149 request bodies decode.
+
+**The bug it exposed, which was the important part.** The server never
+unshuffled a request body. A shuffled body is not zlib-framed, so it fell
+through `inflateBody`'s pass-through branch and reached handlers as noise --
+with a 200, and nothing in the log. Every route that ignores its request body
+kept working, which is most of the menu, so the client got all the way to
+character selection against a server that had never read anything it was sent.
+Fixed in `backend/wire.nim` and `aowlbackend.nim`; gated by
+`tests/bsgwiretest.nim` against the real bodies.
+
+That is worth stating as a lesson rather than an entry: **the failure had no
+symptom at the layer it occurred at.** A gate that round-tripped our own
+shuffle would have passed against the broken server, because the defect was in
+*when* the server unwrapped, not in the arithmetic.
+
+**Closed, with the evidence now in hand.**
+
+| was | is |
+|---|---|
+| `onMatchEnd` read `exit` and `profile` | The client sends `results.result` and `results.profile` (seq 204). Three read sites corrected; every raid used to end by discarding a 76 KB profile and logging that the client had sent none. |
+| `doSplit` read `item` | The client sends `splitItem` (seq 318). Every split failed. |
+| `ReadEncyclopedia` shared the `Examine` branch | It sends `ids`, an array, and it can be empty (seq 341). Now its own branch. |
+| `raidLocation` split `serverId` on `'.'` | Post-1.0 `serverId` is `TUTORIAL_1891947_20_08_2026_01_20_33` -- no map in it, no dot. The map is now remembered from `raid/configuration` / `match/local/start` and persisted per session (`emu/sessions.enterRaid`), because the raid result never names it. |
+| `onMatchStart` read nothing and answered a pre-1.0 shape | It answers `{serverId, serverSettings, profile, locationLoot, transition, excludedBosses}` (seq 158). `locationLoot` is why post-1.0 never calls `getLocalloot`. |
+| Seven menu routes 404ed | Served from `data/post1/`, BSG's own answers: main quests and their notes, variable groups, tapes, subtitle tracks, quest chains, metrics config. |
+| `/client/quest/complete` was unserved | Served. Its key is `questId`, not the `qid` the item-event path uses (seq 202). |
+| `locations.paths` was always `[]` | BSG's 18-edge transit graph, used when the database has none. `emu/raid.nim` says why. |
+| *"`raidClock` has never been run against BSG's client, so which time field it posts is unknown"* | It posts `timeAndWeatherSettings.hourOfDay` -- exactly the camelCase names `emu/raid.nim` already looked for (seq 156). |
+
+**Newly open, and named rather than left implied.**
+
+- `/client/dialogue` is 13 MB of static post-1.0 dialogue trees and is not
+  served. Too large to check in beside the other tables; it needs its own
+  decision about where such data lives.
+- `/client/match/join` -- the online raid path -- is still unserved. The capture
+  shows a second raid entered this way, and `profile/status` answers 305 bytes
+  with `status: "MatchWait"` and a `profileToken` while one is pending, against
+  193 bytes and `"Free"` otherwise. The pending state is now specified and not
+  implemented.
+- ETags. 36 requests in the capture carry `If-None-Match` and all 36 were
+  answered 304. Nothing in this repository emits an ETag, so a menu reload
+  costs megabytes that cost the real backend nothing.
+- `/client/tutor-game/profile` carries a profile and is not a static table;
+  `tutor-game/check` answers `false` here because this server has no tutorial
+  raid to run.
+- The database delta is measured in `docs/POST1-DATA-DELTA.md`. The headline is
+  reassuring -- the pre-1.0 import is additive-compatible, no property the
+  emulator reads has been removed -- but 1,154 item templates and five maps
+  exist post-1.0 that it does not know about.
+
+### Response shapes: specified against the real backend, not yet applied
+
+`docs/CAPTURE-RESPONSES.md` compares every route's answer against BSG's. Some
+of what it found was applied the same night; the rest is below, with the reason
+it was left. **Each of these is now a known-exact contract, not a guess** --
+which is the only reason it is safe to leave them: the next session can apply
+them without re-deriving anything.
+
+Applied: `seasonal-perks` keys `commonPerks`/`personalPerks` -> `common`/
+`personal` (four captures agree; the old names were derived from C# backing
+fields, which is a reasonable guess and wrong); `profileChanges.improvements`
+`{}` -> `[]`, which rides on every inventory action; `/client/friends` three
+keys -> six; `/client/quest/list` object -> array, with `tools/realtest.nim`'s
+reader migrated with it.
+
+Left, and why:
+
+- **`/client/customization/storage` sends an object where BSG sends an array**
+  of `{id, source, type}`, 49 entries. Ranked second by the report and not
+  applied: the emulator has no per-suite `type`, so the array would have to be
+  synthesised, and an array of wrong elements is not better than an object of
+  right ones. Needs the customization table read properly first.
+- **`/client/items/prices/{id}`'s `currencyCourses` is keyed by currency name**
+  (`usd`, `eur`) where BSG keys it by **template id** with exchange rates --
+  `{"5449016a…":1, "569668774bdc2da2298b4568":138.55, …}`, roubles included at
+  1. Every lookup misses on every trade screen. Small and mechanical; left only
+  because it was found late.
+- **`/client/battle-pass/active` answers `null`** where BSG always sends
+  `{"battlePasses":[…]}`. `{"battlePasses":[]}` is very likely the right
+  no-battle-pass answer and was not applied without a way to see the screen.
+- **`/client/season/active` answers `{}`** where BSG sends `{"season":{…}}`.
+  Same reasoning.
+- **`/client/game/config` is missing `availableGameModes`**, `purchasedGames`,
+  `sessionMode`, `ndaFree`, `isGameSynced`, `linkedPlatforms`, `backend.Lobby`
+  and `backend.Static`, and sends an extra `ndid`.
+- **Envelope B.** Five routes -- `/client/metadata`, `/client/game/start`,
+  `/v2/client/game/profiles/`, `/client/game/keepalive`, `/v2/client/shop/status`
+  -- answer with a *different* envelope: `{data, err:null, errmsg:null,
+  status:null, errLog:{}, error:{code:null,message:null}}`, where `err` is
+  **null** rather than the integer `0`. This server sends the ordinary envelope
+  on all five. It is a strict subset so it probably deserialises, but "probably"
+  is doing real work in that sentence.
+- **`/v2/client/game/profiles/` sends one game-mode key where BSG sends three.**
+  The real empty-account body is `{"pve":{"status":"locked"}, "pvp-season":{…,
+  "status":"empty"}, "regular":{"SeasonalInfo":null,"status":"empty"}}`. Note
+  what that proves and what it does not: it is the response *before* a profile
+  exists (seq 048 precedes the profile creation at 092), so it says nothing
+  about a populated slot -- which is exactly the thing two sessions have now
+  failed to make render. What it does prove is that a slot can be as small as
+  `{"status":"locked"}`, which makes "cut the slot object down and add fields
+  back one at a time" a cheap experiment rather than a shot in the dark.
+- **`bots.base` has 16 keys against BSG's 26** (seq 160), missing all ten
+  post-1.0 additions, so every generated bot lacks them.
+
+### The gate itself was wrong in two places, and had been for a while
+
+Neither of these was found by reading the gate. They were found by a change that
+made the gate run far enough to reach them.
+
+**`fuzzwire` and `allmods` both looked for a log line the backend stopped
+writing.** Both waited for `listening on 127.0.0.1:<port>`; the backend writes
+`listening on <scheme>://127.0.0.1:<port>`, and has since it learned to serve
+TLS. So `itIsListening` was permanently false, `waitUntilServing` always timed
+out, and both gates reported *"the backend did not come up"* against a server
+that was answering every request correctly -- which is exactly the failure mode
+they exist to catch, aimed at themselves. Both now match on `://127.0.0.1:`,
+which is what the two spellings have in common.
+
+**`realtest` asserted the opposite of a deliberate fix.** It checked that
+`/client/menu/locale/en` answers its strings *without* a `menu` wrapper. Post-1.0
+requires the wrapper -- `data` deserialises into `EFT.BackendMenuLocale`, whose
+only field is `menu` -- and `onMenuLocale` has wrapped it, with the reason in a
+comment, since the menu-boot work. The check now asserts the wrapper is there
+**and** that there are strings under it, because "there is a `menu` key" would
+pass on a wrapper round nothing.
+
+And one process note that cost an hour: **a test binary can be stale while the
+mod is fresh.** `soak` and `fuzzwire` were rebuilt by the gate but run by hand
+from `installer/build/` afterwards, and the hand runs were reproducing a bug
+that had already been fixed -- the body in the log was the old shape because the
+binary that sent it was the old binary. When a gate and a hand run disagree,
+check the timestamps before believing either.
+
+**Still true, and worth repeating because this section could be read as
+"tested".** Nothing here was confirmed by running the game. It was confirmed
+against a recording of the real backend, which is a different and weaker thing:
+it proves what BSG answered on one day for one account, not that this server's
+answers satisfy the client.

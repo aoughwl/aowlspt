@@ -7,8 +7,8 @@
   "_driveFromHostThread": "Whether the five driving calls (GoToPoint, Sprint, LookToPoint, Shoot, and the self-actions) may be made from the host's own thread on a host whose onMainThread drain has never fired. When the drain has fired they are queued and executed on Unity's thread regardless, which is what they need. Set false to withhold them instead: bots then decide and do not move, which is the safe direction and the visibly broken one. Either way /sain/status and the log say which path the session took.",
   "driveFromHostThread": true,
 
-  "_selfTestRuntime": "Only read on the sim side, by the binding self-test. Points at a runtime implementing the IL2CPP C API so that client/live.nim can be exercised with no game: tests/mockil2cpp builds one. Remove it and the self-test reports that every binding refused for want of a runtime, which is also a correct answer.",
-  "selfTestRuntime": "tests/mockil2cpp/GameAssembly.dll",
+  "_selfTestRuntime": "A GameAssembly.dll for the `--side sim` self-test to bind against, so it reports real bindings offline. Empty -- which is what ships -- means the process, and under aowlspt-sim there is no runtime at all. It must be an ABSOLUTE path: a relative one resolves against whatever directory the host was started in, which in an install is the game's own directory, and it is refused with that reason. `aowl test` and `aowl run` set AOWLSPT_SELFTEST_RUNTIME to the stand-in runtime tests/mockil2cpp builds, which is why this key is empty here and nothing ships a fixture path into an install.",
+  "selfTestRuntime": "",
 
   "global": {
     "engageDistance": 70.0,

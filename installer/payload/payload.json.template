@@ -18,5 +18,9 @@
   "kind": "full",
 
   "//": "Written to <target>/aowlspt/backend.json for the client to read.",
-  "backendUrl": "https://127.0.0.1:6969"
+  "//": "https:// with no port is the real post-1.0 shape: the client talks",
+  "//": "HTTPS on a hardcoded 443, so the launcher starts the backend with",
+  "//": "--tls on 443 and this url carries no port. Use http://127.0.0.1:PORT",
+  "//": "for plain-HTTP development instead.",
+  "backendUrl": "https://127.0.0.1/"
 }

@@ -218,6 +218,7 @@ import aowlspt/server   # `setting` — configGet with a typed reader on top
 import aowlspt/il2cpp   # the runtime's own C API, for signature checks
 import aowlspt/fast     # bind once, call in ~10 ns — docs/PERF.md
 import aowlspt/json     # reading the host's main-thread report
+import aowlspt/fixture  # where a self-test's runtime path may come from
 
 const
   ModGuid = "aowl.fovfix"
@@ -1833,7 +1834,10 @@ proc simSelfTest(): Status =
     return ErrGeneric
 
   # --- the client half.
-  var runtimePath = cfgText("selfTestRuntime", "")
+  let wanted = selfTestRuntime(cfgText("selfTestRuntime", ""))
+  if wanted.refusal.len > 0:
+    warn "  " & wanted.refusal
+  let runtimePath = wanted.path
   if runtimePath.len > 0:
     rt = openIl2Cpp(runtimePath)
     if not rt.loaded:
@@ -1841,9 +1845,11 @@ proc simSelfTest(): Status =
            "(error " & $rt.lastError & "); falling back to the process"
     else:
       rtOpen = true
-      let dd = cfgText("selfTestDataDir", "")
-      if dd.len > 0:
-        rt.setDataDir(dd)
+      let wantedDd = selfTestDataDir(cfgText("selfTestDataDir", ""))
+      if wantedDd.refusal.len > 0:
+        warn "  " & wantedDd.refusal
+      if wantedDd.path.len > 0:
+        rt.setDataDir(wantedDd.path)
       if rt.init("aowl-fovfix-selftest") == nil:
         warn "  " & runtimePath & " loaded but il2cpp_init returned no " &
              "domain, so it has no type universe to search. That is the " &
@@ -1857,8 +1863,9 @@ proc simSelfTest(): Status =
       warn "  no IL2CPP runtime in this process -- aowlspt-sim is a managed " &
            "host and GameAssembly.dll is not loaded. Every binding below " &
            "will refuse for that reason, which is the correct answer here. " &
-           "Set \"selfTestRuntime\" in config.json to a GameAssembly.dll to " &
-           "get a real report offline."
+           "Set AOWLSPT_SELFTEST_RUNTIME, or \"selfTestRuntime\" in " &
+           "config.json, to an ABSOLUTE path to a GameAssembly.dll to get a " &
+           "real report offline; `aowl run` sets it to the stand-in runtime."
 
   info "  bindings, in the order the frame path takes them:"
   discard bindFovStatics()

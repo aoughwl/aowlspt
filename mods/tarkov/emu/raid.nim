@@ -270,9 +270,6 @@ proc localLoot*(locationId: string; nowSeconds: int;
   # means every read below is against the key the database actually uses.
   let name = canonicalLocation(locationId)
   let base = locationBase(name)
-  var o = obj()
-  put(o, "Id", name)
-  put(o, "Name", name)
   # Seeded from the raid id, so the floor of a given raid is reproducible from
   # a bug report. Falling back to the map name when there is no raid id keeps it
   # deterministic rather than empty -- the same map then has the same loot every
@@ -280,16 +277,34 @@ proc localLoot*(locationId: string; nowSeconds: int;
   var seed = raidId
   if seed.len == 0:
     seed = name
-  put(o, "Loot", raw(lootFor(name, seed)))
-  put(o, "transitionParameters", jnull())
   if base.len > 0:
-    let esc = field(base, "EscapeTimeLimit")
-    if esc.found:
-      put(o, "EscapeTimeLimit", esc.asInt(40))
+    # The wire `locationLoot` is the WHOLE `LocationBase` (capture seq 158:
+    # 107 members -- SpawnPointParams, waves, exits, BossLocationSpawn, doors,
+    # transits, areas, limits, ...) with `Loot` filled in. Post-1.0 never calls
+    # `/client/location/getLocalloot`, so this is the only place the client is
+    # ever told where the exits and spawns are: emitting the six-field subset it
+    # used to meant a raid with no exits, no spawn points and no waves. Start
+    # from the base document and overlay only the dynamic members.
+    var d = parseObject(base)
+    setRaw(d, "Loot", lootFor(name, seed))
+    setRaw(d, "transitionParameters", "null")
+    setNumber(d, "UnixDateTime", nowSeconds)
+    # `Id`/`Name` are already in the base; guarantee them for a base that omits
+    # one rather than trusting every imported map to carry both.
+    if not has(d, "Id"): setText(d, "Id", name)
+    if not has(d, "Name"): setText(d, "Name", name)
+    result = text(d)
   else:
+    # No base in the database: an empty-but-valid map that still loads and plays,
+    # far better than a client that cannot enter a raid at all.
+    var o = obj()
+    put(o, "Id", name)
+    put(o, "Name", name)
+    put(o, "Loot", raw(lootFor(name, seed)))
+    put(o, "transitionParameters", jnull())
     put(o, "EscapeTimeLimit", 40)
-  put(o, "UnixDateTime", nowSeconds)
-  result = done(o).text
+    put(o, "UnixDateTime", nowSeconds)
+    result = done(o).text
 
 proc raidConfiguration*(body: string): string =
   ## Echoed back with the ids the client needs. The client sends its own choice

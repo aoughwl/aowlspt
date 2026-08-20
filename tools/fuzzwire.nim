@@ -745,7 +745,15 @@ proc itIsListening(): bool =
   var text = ""
   if not readTextFile(logPath(), text):
     return false
-  result = find(text, "listening on 127.0.0.1:" & $gPort) >= 0
+  ## The scheme is part of that line and this used to not allow for one.
+  ## `aowlbackend` writes `listening on <scheme>://127.0.0.1:<port>`, and it
+  ## gained the scheme when it learned to serve TLS. The old pattern --
+  ## `listening on 127.0.0.1:` -- stopped matching the moment that landed, so
+  ## `itIsListening` was permanently false and every run of this tool ended in
+  ## "it never answered", against a server that was answering perfectly well.
+  ## Matched on `://127.0.0.1:<port>` now, which is what the two spellings have
+  ## in common.
+  result = find(text, "://127.0.0.1:" & $gPort) >= 0
 
 proc waitUntilServing(tries: int): string =
   ## "" when the backend **this tool started** is the one now serving, and
@@ -1462,7 +1470,7 @@ proc main(): int =
 
   heading "Counts that are lies"
   if phaseRuns("counts that are lies", uid, moneyId, stashId):
-    let neg = move("{\"Action\":\"Split\",\"item\":\"" & moneyId &
+    let neg = move("{\"Action\":\"Split\",\"splitItem\":\"" & moneyId &
       "\",\"newItem\":\"cccccccccccccccccccccccc\",\"count\":-5," &
       "\"container\":{\"id\":\"" & stashId & "\",\"container\":\"hideout\"," &
       "\"location\":{\"x\":6,\"y\":6,\"r\":\"Horizontal\"}}}")
@@ -1470,7 +1478,7 @@ proc main(): int =
           warned(neg, "not a split") or warned(neg, "count"), neg.body)
     discard afterCase("a split of -5")
 
-    let over = move("{\"Action\":\"Split\",\"item\":\"" & moneyId &
+    let over = move("{\"Action\":\"Split\",\"splitItem\":\"" & moneyId &
       "\",\"newItem\":\"dddddddddddddddddddddddd\",\"count\":99999999," &
       "\"container\":{\"id\":\"" & stashId & "\",\"container\":\"hideout\"," &
       "\"location\":{\"x\":7,\"y\":6,\"r\":\"Horizontal\"}}}")
@@ -1600,7 +1608,7 @@ proc main(): int =
     while r < 4:
       let s = openRaw()
       if s != 0'u64:
-        let body = "{\"data\":[{\"Action\":\"Split\",\"item\":\"" & moneyId &
+        let body = "{\"data\":[{\"Action\":\"Split\",\"splitItem\":\"" & moneyId &
           "\",\"newItem\":\"eeeeeeeeeeeeeeeeeeeeeee" & $r &
           "\",\"count\":100,\"container\":{\"id\":\"" & stashId &
           "\",\"container\":\"hideout\",\"location\":{\"x\":" & $r &

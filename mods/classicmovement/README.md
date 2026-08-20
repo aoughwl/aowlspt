@@ -218,9 +218,13 @@ In descending order of how likely a raid is to embarrass it.
 ## 4. Reading the log
 
 `aowl run mods/classicmovement` runs the whole self-test with no game attached.
-With `selfTestRuntime` pointing at `tests/mockil2cpp/GameAssembly.dll` — which is
-what it points at by default — the binding half becomes a real answer offline,
-and the guard block below it is exercised rather than described:
+With a runtime to bind against — `aowl run` and `aowl test` set
+`AOWLSPT_SELFTEST_RUNTIME` to the stand-in `tests/mockil2cpp/GameAssembly.dll`
+they build — the binding half becomes a real answer offline, and the guard block
+below it is exercised rather than described. (`selfTestRuntime` in `config.json`
+does the same for a runtime of your own, and takes an **absolute** path only: it
+ships into installs, and a relative path there would name whatever the game's
+own working directory happened to hold.)
 
 ```
 info    the guards, exercised rather than described:

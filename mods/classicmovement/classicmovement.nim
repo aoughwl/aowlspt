@@ -220,6 +220,7 @@ import aowlspt/server
 import aowlspt/json     # reading the hook payload, which is an object now
 import aowlspt/il2cpp   # the runtime's own metadata, for signature checks
 import aowlspt/fast     # bind once, call in ~10 ns — docs/PERF.md
+import aowlspt/fixture  # where a self-test's runtime path may come from
 
 const
   ModGuid = "aowl.classicmovement"
@@ -2471,10 +2472,10 @@ proc simSelfTest(): Status =
   info "    " & text
 
   # --- the client half.
-  var runtimePath = setting("selfTestRuntime").asText("")
-  if runtimePath.len >= 2 and runtimePath[0] == '"' and
-     runtimePath[runtimePath.len - 1] == '"':
-    runtimePath = runtimePath.substr(1, runtimePath.len - 2)
+  let wanted = selfTestRuntime(setting("selfTestRuntime").asText(""))
+  if wanted.refusal.len > 0:
+    warn "  " & wanted.refusal
+  let runtimePath = wanted.path
 
   if runtimePath.len > 0:
     rt = openIl2Cpp(runtimePath)
@@ -2491,12 +2492,11 @@ proc simSelfTest(): Status =
       # printed as one; in the game the runtime is already up and none of this
       # runs.
       rtOpen = true
-      var dataDirCfg = setting("selfTestDataDir").asText("")
-      if dataDirCfg.len >= 2 and dataDirCfg[0] == '"' and
-         dataDirCfg[dataDirCfg.len - 1] == '"':
-        dataDirCfg = dataDirCfg.substr(1, dataDirCfg.len - 2)
-      if dataDirCfg.len > 0:
-        rt.setDataDir(dataDirCfg)
+      let wantedDd = selfTestDataDir(setting("selfTestDataDir").asText(""))
+      if wantedDd.refusal.len > 0:
+        warn "  " & wantedDd.refusal
+      if wantedDd.path.len > 0:
+        rt.setDataDir(wantedDd.path)
       if rt.init("aowl-classicmovement-selftest") == nil:
         warn "  " & runtimePath & " loaded but il2cpp_init returned no " &
              "domain, so it has no type universe to search. That is the " &
@@ -2510,8 +2510,9 @@ proc simSelfTest(): Status =
       warn "  no IL2CPP runtime in this process -- aowlspt-sim is a managed " &
            "host and GameAssembly.dll is not loaded. Every binding below " &
            "will refuse for that reason, which is the correct answer here. " &
-           "Set \"selfTestRuntime\" in config.json to a GameAssembly.dll to " &
-           "get a real report offline."
+           "Set AOWLSPT_SELFTEST_RUNTIME, or \"selfTestRuntime\" in " &
+           "config.json, to an ABSOLUTE path to a GameAssembly.dll to get a " &
+           "real report offline; `aowl run` sets it to the stand-in runtime."
 
   info "  bindings, in the order the frame path takes them:"
   discard bindSmoothStatics()

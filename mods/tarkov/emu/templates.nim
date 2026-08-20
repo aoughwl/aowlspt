@@ -40,6 +40,42 @@ proc handbook*(): string =
 
 proc customization*(): string = table("templates.customization", "{}")
 proc quests*(): string = table("templates.quests", "{}")
+
+var gQuestArray = ""
+var gQuestArrayBuilt = false
+
+proc questList*(): string =
+  ## The quest templates as an **array**, which is what `/client/quest/list`
+  ## answers with.
+  ##
+  ## `templates.quests` is stored keyed by quest id, because every other reader
+  ## of it wants a lookup. The client does not: the real backend sends a bare
+  ## array (capture seq 130, 262, 444), and an object where an array is
+  ## expected deserialises to nothing, which is a quest journal with no quests
+  ## in it and no error anywhere.
+  ##
+  ## Built once. It is half a megabyte, it does not change while the server is
+  ## up, and it is asked for on every menu load.
+  if gQuestArrayBuilt:
+    return gQuestArray
+  gQuestArrayBuilt = true
+  # Not named `raw`: that is a proc in `aowlspt/server`, used two lines below
+  # to splice a member in without reparsing it, and a local of the same name
+  # shadows it.
+  let stored = quests()
+  let doc = whole(stored)
+  if not isObject(doc):
+    # Already an array, or absent. Passed through: a database that stores this
+    # the way the client wants it is not a case to correct.
+    gQuestArray = if stored.len > 0: stored else: "[]"
+    return gQuestArray
+  var a = arr()
+  let ms = members(doc)
+  for m in ms:
+    a.add raw(m.value)
+  gQuestArray = done(a).text
+  result = gQuestArray
+
 proc achievements*(): string = table("templates.achievements", "[]")
 proc locations*(): string = table("locations", "{}")
 

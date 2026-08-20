@@ -1,0 +1,1322 @@
+[
+ {
+  "seq": "014",
+  "url": "/launcher/game/start?launcherVersion=15.0.0.4595",
+  "kind": "plain-zlib",
+  "file": "014.json"
+ },
+ {
+  "seq": "019",
+  "url": "/client/metadata",
+  "kind": "wrapped-json",
+  "file": "019.json"
+ },
+ {
+  "seq": "020",
+  "url": "/client/libraries",
+  "kind": "plain-json",
+  "file": "020.json"
+ },
+ {
+  "seq": "024",
+  "url": "/client/game/mode",
+  "kind": "wrapped-aes",
+  "file": "024.json"
+ },
+ {
+  "seq": "026",
+  "url": "/client/game/start",
+  "kind": "wrapped-aes",
+  "file": "026.json"
+ },
+ {
+  "seq": "028",
+  "url": "/client/game/version/validate",
+  "kind": "wrapped-aes",
+  "file": "028.json"
+ },
+ {
+  "seq": "030",
+  "url": "/client/menu/locale/en",
+  "kind": "wrapped-aes",
+  "file": "030.json"
+ },
+ {
+  "seq": "033",
+  "url": "/client/languages",
+  "kind": "wrapped-aes",
+  "file": "033.json"
+ },
+ {
+  "seq": "034",
+  "url": "/client/game/config",
+  "kind": "wrapped-aes",
+  "file": "034.json"
+ },
+ {
+  "seq": "037",
+  "url": "/client/settings",
+  "kind": "wrapped-aes",
+  "file": "037.json"
+ },
+ {
+  "seq": "038",
+  "url": "/client/putHWMetrics",
+  "kind": "wrapped-aes",
+  "file": "038.json"
+ },
+ {
+  "seq": "043",
+  "url": "/client/locale/en",
+  "kind": "wrapped-aes",
+  "file": "043.json"
+ },
+ {
+  "seq": "044",
+  "url": "/client/seasonal-perks/list",
+  "kind": "wrapped-aes",
+  "file": "044.json"
+ },
+ {
+  "seq": "045",
+  "url": "/client/items",
+  "kind": "wrapped-aes",
+  "file": "045.json"
+ },
+ {
+  "seq": "046",
+  "url": "/client/customization",
+  "kind": "wrapped-aes",
+  "file": "046.json"
+ },
+ {
+  "seq": "048",
+  "url": "/v2/client/game/profiles/",
+  "kind": "wrapped-aes",
+  "file": "048.json"
+ },
+ {
+  "seq": "068",
+  "url": "/client/customization",
+  "kind": "empty",
+  "file": null
+ },
+ {
+  "seq": "069",
+  "url": "/client/items",
+  "kind": "empty",
+  "file": null
+ },
+ {
+  "seq": "070",
+  "url": "/client/settings",
+  "kind": "wrapped-aes",
+  "file": "070.json"
+ },
+ {
+  "seq": "071",
+  "url": "/client/trading/api/traderSettings",
+  "kind": "wrapped-aes",
+  "file": "071.json"
+ },
+ {
+  "seq": "072",
+  "url": "/client/prestige/list",
+  "kind": "wrapped-aes",
+  "file": "072.json"
+ },
+ {
+  "seq": "073",
+  "url": "/client/quest/getMainQuestsList",
+  "kind": "wrapped-aes",
+  "file": "073.json"
+ },
+ {
+  "seq": "074",
+  "url": "/client/quest/getMainQuestNotesList",
+  "kind": "wrapped-aes",
+  "file": "074.json"
+ },
+ {
+  "seq": "075",
+  "url": "/client/variable/group",
+  "kind": "wrapped-aes",
+  "file": "075.json"
+ },
+ {
+  "seq": "076",
+  "url": "/client/dialogue",
+  "kind": "wrapped-aes",
+  "file": "076.json"
+ },
+ {
+  "seq": "077",
+  "url": "/client/tape/list",
+  "kind": "wrapped-aes",
+  "file": "077.json"
+ },
+ {
+  "seq": "078",
+  "url": "/client/subtitle-track/list",
+  "kind": "wrapped-aes",
+  "file": "078.json"
+ },
+ {
+  "seq": "079",
+  "url": "/client/seasonal-perks/list",
+  "kind": "wrapped-aes",
+  "file": "079.json"
+ },
+ {
+  "seq": "080",
+  "url": "/client/season/active",
+  "kind": "wrapped-aes",
+  "file": "080.json"
+ },
+ {
+  "seq": "081",
+  "url": "/client/battle-pass/active",
+  "kind": "wrapped-aes",
+  "file": "081.json"
+ },
+ {
+  "seq": "082",
+  "url": "/client/handbook/templates",
+  "kind": "wrapped-aes",
+  "file": "082.json"
+ },
+ {
+  "seq": "083",
+  "url": "/client/game/profile/list",
+  "kind": "wrapped-aes",
+  "file": "083.json"
+ },
+ {
+  "seq": "084",
+  "url": "/client/globals",
+  "kind": "wrapped-aes",
+  "file": "084.json"
+ },
+ {
+  "seq": "086",
+  "url": "/client/customization/storage",
+  "kind": "wrapped-aes",
+  "file": "086.json"
+ },
+ {
+  "seq": "088",
+  "url": "/client/game/profile/nickname/reserved",
+  "kind": "wrapped-aes",
+  "file": "088.json"
+ },
+ {
+  "seq": "090",
+  "url": "/client/game/profile/nickname/validate",
+  "kind": "wrapped-aes",
+  "file": "090.json"
+ },
+ {
+  "seq": "092",
+  "url": "/client/game/profile/create",
+  "kind": "wrapped-aes",
+  "file": "092.json"
+ },
+ {
+  "seq": "094",
+  "url": "/client/customization/storage",
+  "kind": "wrapped-aes",
+  "file": "094.json"
+ },
+ {
+  "seq": "096",
+  "url": "/client/game/profile/list",
+  "kind": "wrapped-aes",
+  "file": "096.json"
+ },
+ {
+  "seq": "098",
+  "url": "/client/game/profile/select",
+  "kind": "wrapped-aes",
+  "file": "098.json"
+ },
+ {
+  "seq": "100",
+  "url": "/client/profile/status",
+  "kind": "wrapped-aes",
+  "file": "100.json"
+ },
+ {
+  "seq": "107",
+  "url": "/client/hideout/settings",
+  "kind": "wrapped-aes",
+  "file": "107.json"
+ },
+ {
+  "seq": "108",
+  "url": "/client/hideout/qte/list",
+  "kind": "wrapped-aes",
+  "file": "108.json"
+ },
+ {
+  "seq": "109",
+  "url": "/client/hideout/customization/offer/list",
+  "kind": "wrapped-aes",
+  "file": "109.json"
+ },
+ {
+  "seq": "110",
+  "url": "/client/hideout/areas",
+  "kind": "wrapped-aes",
+  "file": "110.json"
+ },
+ {
+  "seq": "111",
+  "url": "/client/hideout/production/recipes",
+  "kind": "wrapped-aes",
+  "file": "111.json"
+ },
+ {
+  "seq": "112",
+  "url": "/client/game/token/issue",
+  "kind": "wrapped-aes",
+  "file": "112.json"
+ },
+ {
+  "seq": "118",
+  "url": "/client/notifier/channel/create",
+  "kind": "wrapped-aes",
+  "file": "118.json"
+ },
+ {
+  "seq": "122",
+  "url": "/client/profile/status",
+  "kind": "wrapped-aes",
+  "file": "122.json"
+ },
+ {
+  "seq": "123",
+  "url": "/client/builds/list",
+  "kind": "wrapped-aes",
+  "file": "123.json"
+ },
+ {
+  "seq": "124",
+  "url": "/client/friends",
+  "kind": "wrapped-aes",
+  "file": "124.json"
+ },
+ {
+  "seq": "126",
+  "url": "/client/achievement/statistic",
+  "kind": "wrapped-aes",
+  "file": "126.json"
+ },
+ {
+  "seq": "130",
+  "url": "/client/quest/list",
+  "kind": "wrapped-aes",
+  "file": "130.json"
+ },
+ {
+  "seq": "131",
+  "url": "/client/weather",
+  "kind": "wrapped-aes",
+  "file": "131.json"
+ },
+ {
+  "seq": "132",
+  "url": "/client/ending/list",
+  "kind": "wrapped-aes",
+  "file": "132.json"
+ },
+ {
+  "seq": "133",
+  "url": "/client/achievement/list?completed=True",
+  "kind": "wrapped-aes",
+  "file": "133.json"
+ },
+ {
+  "seq": "134",
+  "url": "/client/locations",
+  "kind": "wrapped-aes",
+  "file": "134.json"
+ },
+ {
+  "seq": "136",
+  "url": "/client/mail/dialog/list",
+  "kind": "wrapped-aes",
+  "file": "136.json"
+ },
+ {
+  "seq": "146",
+  "url": "/client/quest/chains",
+  "kind": "wrapped-aes",
+  "file": "146.json"
+ },
+ {
+  "seq": "148",
+  "url": "/client/tutor-game/check",
+  "kind": "wrapped-aes",
+  "file": "148.json"
+ },
+ {
+  "seq": "150",
+  "url": "/client/tutor-game/profile",
+  "kind": "wrapped-aes",
+  "file": "150.json"
+ },
+ {
+  "seq": "152",
+  "url": "/client/match/group/current",
+  "kind": "wrapped-aes",
+  "file": "152.json"
+ },
+ {
+  "seq": "154",
+  "url": "/client/getMetricsConfig",
+  "kind": "wrapped-aes",
+  "file": "154.json"
+ },
+ {
+  "seq": "156",
+  "url": "/client/raid/configuration",
+  "kind": "wrapped-aes",
+  "file": "156.json"
+ },
+ {
+  "seq": "158",
+  "url": "/client/match/local/start",
+  "kind": "wrapped-aes",
+  "file": "158.json"
+ },
+ {
+  "seq": "160",
+  "url": "/client/game/bot/generate",
+  "kind": "wrapped-aes",
+  "file": "160.json"
+ },
+ {
+  "seq": "168",
+  "url": "/client/game/keepalive",
+  "kind": "plain-zlib",
+  "file": "168.json"
+ },
+ {
+  "seq": "172",
+  "url": "/client/game/keepalive",
+  "kind": "plain-zlib",
+  "file": "172.json"
+ },
+ {
+  "seq": "176",
+  "url": "/client/game/keepalive",
+  "kind": "plain-zlib",
+  "file": "176.json"
+ },
+ {
+  "seq": "179",
+  "url": "/client/game/keepalive",
+  "kind": "plain-zlib",
+  "file": "179.json"
+ },
+ {
+  "seq": "184",
+  "url": "/client/game/keepalive",
+  "kind": "plain-zlib",
+  "file": "184.json"
+ },
+ {
+  "seq": "191",
+  "url": "/client/game/keepalive",
+  "kind": "plain-zlib",
+  "file": "191.json"
+ },
+ {
+  "seq": "200",
+  "url": "/client/game/keepalive",
+  "kind": "plain-zlib",
+  "file": "200.json"
+ },
+ {
+  "seq": "202",
+  "url": "/client/quest/complete",
+  "kind": "wrapped-aes",
+  "file": "202.json"
+ },
+ {
+  "seq": "204",
+  "url": "/client/match/local/end",
+  "kind": "wrapped-aes",
+  "file": "204.json"
+ },
+ {
+  "seq": "208",
+  "url": "/client/game/profile/list",
+  "kind": "wrapped-aes",
+  "file": "208.json"
+ },
+ {
+  "seq": "209",
+  "url": "/client/putMetrics",
+  "kind": "wrapped-aes",
+  "file": "209.json"
+ },
+ {
+  "seq": "224",
+  "url": "/client/items",
+  "kind": "empty",
+  "file": null
+ },
+ {
+  "seq": "225",
+  "url": "/client/variable/group",
+  "kind": "empty",
+  "file": null
+ },
+ {
+  "seq": "226",
+  "url": "/client/quest/getMainQuestNotesList",
+  "kind": "empty",
+  "file": null
+ },
+ {
+  "seq": "227",
+  "url": "/client/dialogue",
+  "kind": "empty",
+  "file": null
+ },
+ {
+  "seq": "228",
+  "url": "/client/customization",
+  "kind": "empty",
+  "file": null
+ },
+ {
+  "seq": "229",
+  "url": "/client/globals",
+  "kind": "empty",
+  "file": null
+ },
+ {
+  "seq": "230",
+  "url": "/client/settings",
+  "kind": "wrapped-aes",
+  "file": "230.json"
+ },
+ {
+  "seq": "231",
+  "url": "/client/trading/api/traderSettings",
+  "kind": "wrapped-aes",
+  "file": "231.json"
+ },
+ {
+  "seq": "232",
+  "url": "/client/prestige/list",
+  "kind": "empty",
+  "file": null
+ },
+ {
+  "seq": "233",
+  "url": "/client/quest/getMainQuestsList",
+  "kind": "empty",
+  "file": null
+ },
+ {
+  "seq": "234",
+  "url": "/client/subtitle-track/list",
+  "kind": "empty",
+  "file": null
+ },
+ {
+  "seq": "235",
+  "url": "/client/tape/list",
+  "kind": "empty",
+  "file": null
+ },
+ {
+  "seq": "236",
+  "url": "/client/seasonal-perks/list",
+  "kind": "wrapped-aes",
+  "file": "236.json"
+ },
+ {
+  "seq": "237",
+  "url": "/client/season/active",
+  "kind": "wrapped-aes",
+  "file": "237.json"
+ },
+ {
+  "seq": "248",
+  "url": "/client/handbook/templates",
+  "kind": "empty",
+  "file": null
+ },
+ {
+  "seq": "249",
+  "url": "/client/friends",
+  "kind": "wrapped-aes",
+  "file": "249.json"
+ },
+ {
+  "seq": "250",
+  "url": "/client/achievement/statistic",
+  "kind": "empty",
+  "file": null
+ },
+ {
+  "seq": "251",
+  "url": "/client/weather",
+  "kind": "wrapped-aes",
+  "file": "251.json"
+ },
+ {
+  "seq": "252",
+  "url": "/client/battle-pass/active",
+  "kind": "wrapped-aes",
+  "file": "252.json"
+ },
+ {
+  "seq": "253",
+  "url": "/client/builds/list",
+  "kind": "wrapped-aes",
+  "file": "253.json"
+ },
+ {
+  "seq": "254",
+  "url": "/client/achievement/list?completed=True",
+  "kind": "empty",
+  "file": null
+ },
+ {
+  "seq": "255",
+  "url": "/client/locations",
+  "kind": "empty",
+  "file": null
+ },
+ {
+  "seq": "256",
+  "url": "/client/ending/list",
+  "kind": "wrapped-aes",
+  "file": "256.json"
+ },
+ {
+  "seq": "257",
+  "url": "/client/tutor-game/check",
+  "kind": "wrapped-aes",
+  "file": "257.json"
+ },
+ {
+  "seq": "260",
+  "url": "/client/customization/storage",
+  "kind": "wrapped-aes",
+  "file": "260.json"
+ },
+ {
+  "seq": "262",
+  "url": "/client/quest/list",
+  "kind": "wrapped-aes",
+  "file": "262.json"
+ },
+ {
+  "seq": "263",
+  "url": "/client/mail/dialog/list",
+  "kind": "wrapped-aes",
+  "file": "263.json"
+ },
+ {
+  "seq": "266",
+  "url": "/client/game/profile/select",
+  "kind": "wrapped-aes",
+  "file": "266.json"
+ },
+ {
+  "seq": "267",
+  "url": "/client/quest/chains",
+  "kind": "wrapped-aes",
+  "file": "267.json"
+ },
+ {
+  "seq": "270",
+  "url": "/client/profile/status",
+  "kind": "wrapped-aes",
+  "file": "270.json"
+ },
+ {
+  "seq": "271",
+  "url": "/client/repeatalbeQuests/activityPeriods",
+  "kind": "wrapped-aes",
+  "file": "271.json"
+ },
+ {
+  "seq": "273",
+  "url": "/client/game/profile/list",
+  "kind": "wrapped-aes",
+  "file": "273.json"
+ },
+ {
+  "seq": "275",
+  "url": "/client/game/profile/select",
+  "kind": "wrapped-aes",
+  "file": "275.json"
+ },
+ {
+  "seq": "277",
+  "url": "/client/profile/status",
+  "kind": "wrapped-aes",
+  "file": "277.json"
+ },
+ {
+  "seq": "283",
+  "url": "/client/hideout/settings",
+  "kind": "empty",
+  "file": null
+ },
+ {
+  "seq": "284",
+  "url": "/client/hideout/production/recipes",
+  "kind": "empty",
+  "file": null
+ },
+ {
+  "seq": "285",
+  "url": "/client/hideout/areas",
+  "kind": "wrapped-aes",
+  "file": "285.json"
+ },
+ {
+  "seq": "286",
+  "url": "/client/hideout/qte/list",
+  "kind": "empty",
+  "file": null
+ },
+ {
+  "seq": "287",
+  "url": "/client/hideout/customization/offer/list",
+  "kind": "wrapped-aes",
+  "file": "287.json"
+ },
+ {
+  "seq": "291",
+  "url": "/client/notifier/channel/create",
+  "kind": "wrapped-aes",
+  "file": "291.json"
+ },
+ {
+  "seq": "292",
+  "url": "/client/profile/status",
+  "kind": "wrapped-aes",
+  "file": "292.json"
+ },
+ {
+  "seq": "293",
+  "url": "/client/server/list",
+  "kind": "wrapped-aes",
+  "file": "293.json"
+ },
+ {
+  "seq": "297",
+  "url": "/client/match/group/current",
+  "kind": "wrapped-aes",
+  "file": "297.json"
+ },
+ {
+  "seq": "298",
+  "url": "/client/survey",
+  "kind": "wrapped-aes",
+  "file": "298.json"
+ },
+ {
+  "seq": "299",
+  "url": "/v2/client/shop/status",
+  "kind": "wrapped-aes",
+  "file": "299.json"
+ },
+ {
+  "seq": "301",
+  "url": "/client/game/profile/items/moving",
+  "kind": "wrapped-aes",
+  "file": "301.json"
+ },
+ {
+  "seq": "303",
+  "url": "/client/game/profile/items/moving",
+  "kind": "wrapped-aes",
+  "file": "303.json"
+ },
+ {
+  "seq": "305",
+  "url": "/client/builds/weapon/save",
+  "kind": "wrapped-aes",
+  "file": "305.json"
+ },
+ {
+  "seq": "310",
+  "url": "/client/checkVersion",
+  "kind": "wrapped-aes",
+  "file": "310.json"
+ },
+ {
+  "seq": "311",
+  "url": "/client/ragfair/find",
+  "kind": "wrapped-aes",
+  "file": "311.json"
+ },
+ {
+  "seq": "317",
+  "url": "/client/items/prices/54cb57776803fa99248b456e",
+  "kind": "wrapped-aes",
+  "file": "317.json"
+ },
+ {
+  "seq": "318",
+  "url": "/client/game/profile/items/moving",
+  "kind": "wrapped-aes",
+  "file": "318.json"
+ },
+ {
+  "seq": "320",
+  "url": "/client/trading/api/getTraderAssort/54cb57776803fa99248b456e",
+  "kind": "wrapped-aes",
+  "file": "320.json"
+ },
+ {
+  "seq": "322",
+  "url": "/client/items/prices/5ac3b934156ae10c4430e83c",
+  "kind": "wrapped-aes",
+  "file": "322.json"
+ },
+ {
+  "seq": "324",
+  "url": "/client/trading/api/getTraderAssort/5ac3b934156ae10c4430e83c",
+  "kind": "wrapped-aes",
+  "file": "324.json"
+ },
+ {
+  "seq": "326",
+  "url": "/client/game/profile/items/moving",
+  "kind": "wrapped-aes",
+  "file": "326.json"
+ },
+ {
+  "seq": "328",
+  "url": "/client/trading/api/getTraderAssort/54cb57776803fa99248b456e",
+  "kind": "wrapped-aes",
+  "file": "328.json"
+ },
+ {
+  "seq": "331",
+  "url": "/client/game/profile/items/moving",
+  "kind": "wrapped-aes",
+  "file": "331.json"
+ },
+ {
+  "seq": "333",
+  "url": "/client/trading/api/getTraderAssort/54cb57776803fa99248b456e",
+  "kind": "wrapped-aes",
+  "file": "333.json"
+ },
+ {
+  "seq": "335",
+  "url": "/client/items/prices/579dc571d53a0658a154fbec",
+  "kind": "wrapped-aes",
+  "file": "335.json"
+ },
+ {
+  "seq": "337",
+  "url": "/client/trading/api/getTraderAssort/579dc571d53a0658a154fbec",
+  "kind": "wrapped-aes",
+  "file": "337.json"
+ },
+ {
+  "seq": "339",
+  "url": "/client/trading/api/getTraderAssort/5ac3b934156ae10c4430e83c",
+  "kind": "wrapped-aes",
+  "file": "339.json"
+ },
+ {
+  "seq": "341",
+  "url": "/client/game/profile/items/moving",
+  "kind": "wrapped-aes",
+  "file": "341.json"
+ },
+ {
+  "seq": "343",
+  "url": "/client/ragfair/find",
+  "kind": "wrapped-aes",
+  "file": "343.json"
+ },
+ {
+  "seq": "345",
+  "url": "/client/ragfair/find",
+  "kind": "wrapped-aes",
+  "file": "345.json"
+ },
+ {
+  "seq": "347",
+  "url": "/client/ragfair/find",
+  "kind": "wrapped-aes",
+  "file": "347.json"
+ },
+ {
+  "seq": "350",
+  "url": "/client/game/keepalive",
+  "kind": "plain-zlib",
+  "file": "350.json"
+ },
+ {
+  "seq": "351",
+  "url": "/client/ragfair/find",
+  "kind": "wrapped-aes",
+  "file": "351.json"
+ },
+ {
+  "seq": "353",
+  "url": "/client/game/profile/items/moving",
+  "kind": "wrapped-aes",
+  "file": "353.json"
+ },
+ {
+  "seq": "355",
+  "url": "/client/insurance/items/list/cost",
+  "kind": "wrapped-aes",
+  "file": "355.json"
+ },
+ {
+  "seq": "357",
+  "url": "/client/game/profile/items/moving",
+  "kind": "wrapped-aes",
+  "file": "357.json"
+ },
+ {
+  "seq": "359",
+  "url": "/client/builds/equipment/save",
+  "kind": "wrapped-aes",
+  "file": "359.json"
+ },
+ {
+  "seq": "361",
+  "url": "/client/ragfair/find",
+  "kind": "wrapped-aes",
+  "file": "361.json"
+ },
+ {
+  "seq": "363",
+  "url": "/client/trading/api/getTraderAssort/54cb57776803fa99248b456e",
+  "kind": "wrapped-aes",
+  "file": "363.json"
+ },
+ {
+  "seq": "365",
+  "url": "/client/insurance/items/list/cost",
+  "kind": "wrapped-aes",
+  "file": "365.json"
+ },
+ {
+  "seq": "368",
+  "url": "/client/raid/configuration",
+  "kind": "wrapped-aes",
+  "file": "368.json"
+ },
+ {
+  "seq": "369",
+  "url": "/client/match/group/invite/cancel-all",
+  "kind": "wrapped-aes",
+  "file": "369.json"
+ },
+ {
+  "seq": "371",
+  "url": "/client/match/group/invite/cancel-all",
+  "kind": "wrapped-aes",
+  "file": "371.json"
+ },
+ {
+  "seq": "373",
+  "url": "/client/raid/configuration",
+  "kind": "wrapped-aes",
+  "file": "373.json"
+ },
+ {
+  "seq": "376",
+  "url": "/client/match/group/exit_from_menu",
+  "kind": "wrapped-aes",
+  "file": "376.json"
+ },
+ {
+  "seq": "377",
+  "url": "/client/match/available",
+  "kind": "wrapped-aes",
+  "file": "377.json"
+ },
+ {
+  "seq": "379",
+  "url": "/client/match/join",
+  "kind": "wrapped-aes",
+  "file": "379.json"
+ },
+ {
+  "seq": "381",
+  "url": "/client/profile/status",
+  "kind": "wrapped-aes",
+  "file": "381.json"
+ },
+ {
+  "seq": "384",
+  "url": "/client/profile/status",
+  "kind": "wrapped-aes",
+  "file": "384.json"
+ },
+ {
+  "seq": "386",
+  "url": "/client/game/keepalive",
+  "kind": "plain-zlib",
+  "file": "386.json"
+ },
+ {
+  "seq": "388",
+  "url": "/client/profile/status",
+  "kind": "wrapped-aes",
+  "file": "388.json"
+ },
+ {
+  "seq": "390",
+  "url": "/client/getMetricsConfig",
+  "kind": "wrapped-aes",
+  "file": "390.json"
+ },
+ {
+  "seq": "394",
+  "url": "/client/putLoadMetrics",
+  "kind": "wrapped-aes",
+  "file": "394.json"
+ },
+ {
+  "seq": "398",
+  "url": "/client/game/profile/list",
+  "kind": "wrapped-aes",
+  "file": "398.json"
+ },
+ {
+  "seq": "399",
+  "url": "/client/putMetrics",
+  "kind": "wrapped-aes",
+  "file": "399.json"
+ },
+ {
+  "seq": "402",
+  "url": "/client/libraries-extra",
+  "kind": "bare-aes",
+  "file": "402.json"
+ },
+ {
+  "seq": "404",
+  "url": "/client/game/keepalive",
+  "kind": "plain-zlib",
+  "file": "404.json"
+ },
+ {
+  "seq": "418",
+  "url": "/client/customization",
+  "kind": "empty",
+  "file": null
+ },
+ {
+  "seq": "420",
+  "url": "/client/variable/group",
+  "kind": "empty",
+  "file": null
+ },
+ {
+  "seq": "421",
+  "url": "/client/trading/api/traderSettings",
+  "kind": "wrapped-aes",
+  "file": "421.json"
+ },
+ {
+  "seq": "422",
+  "url": "/client/quest/getMainQuestsList",
+  "kind": "empty",
+  "file": null
+ },
+ {
+  "seq": "423",
+  "url": "/client/prestige/list",
+  "kind": "empty",
+  "file": null
+ },
+ {
+  "seq": "424",
+  "url": "/client/globals",
+  "kind": "empty",
+  "file": null
+ },
+ {
+  "seq": "425",
+  "url": "/client/quest/getMainQuestNotesList",
+  "kind": "empty",
+  "file": null
+ },
+ {
+  "seq": "426",
+  "url": "/client/items",
+  "kind": "empty",
+  "file": null
+ },
+ {
+  "seq": "427",
+  "url": "/client/subtitle-track/list",
+  "kind": "empty",
+  "file": null
+ },
+ {
+  "seq": "428",
+  "url": "/client/tape/list",
+  "kind": "empty",
+  "file": null
+ },
+ {
+  "seq": "429",
+  "url": "/client/dialogue",
+  "kind": "empty",
+  "file": null
+ },
+ {
+  "seq": "430",
+  "url": "/client/seasonal-perks/list",
+  "kind": "wrapped-aes",
+  "file": "430.json"
+ },
+ {
+  "seq": "434",
+  "url": "/client/settings",
+  "kind": "wrapped-aes",
+  "file": "434.json"
+ },
+ {
+  "seq": "438",
+  "url": "/client/season/active",
+  "kind": "wrapped-aes",
+  "file": "438.json"
+ },
+ {
+  "seq": "440",
+  "url": "/client/handbook/templates",
+  "kind": "empty",
+  "file": null
+ },
+ {
+  "seq": "441",
+  "url": "/client/builds/list",
+  "kind": "wrapped-aes",
+  "file": "441.json"
+ },
+ {
+  "seq": "442",
+  "url": "/client/friends",
+  "kind": "wrapped-aes",
+  "file": "442.json"
+ },
+ {
+  "seq": "443",
+  "url": "/client/achievement/statistic",
+  "kind": "empty",
+  "file": null
+ },
+ {
+  "seq": "444",
+  "url": "/client/quest/list",
+  "kind": "wrapped-aes",
+  "file": "444.json"
+ },
+ {
+  "seq": "445",
+  "url": "/client/weather",
+  "kind": "wrapped-aes",
+  "file": "445.json"
+ },
+ {
+  "seq": "446",
+  "url": "/client/battle-pass/active",
+  "kind": "wrapped-aes",
+  "file": "446.json"
+ },
+ {
+  "seq": "451",
+  "url": "/client/ending/list",
+  "kind": "wrapped-aes",
+  "file": "451.json"
+ },
+ {
+  "seq": "452",
+  "url": "/client/locations",
+  "kind": "empty",
+  "file": null
+ },
+ {
+  "seq": "453",
+  "url": "/client/achievement/list?completed=True",
+  "kind": "empty",
+  "file": null
+ },
+ {
+  "seq": "454",
+  "url": "/client/tutor-game/check",
+  "kind": "wrapped-aes",
+  "file": "454.json"
+ },
+ {
+  "seq": "457",
+  "url": "/client/customization/storage",
+  "kind": "wrapped-aes",
+  "file": "457.json"
+ },
+ {
+  "seq": "458",
+  "url": "/client/mail/dialog/list",
+  "kind": "wrapped-aes",
+  "file": "458.json"
+ },
+ {
+  "seq": "460",
+  "url": "/client/quest/chains",
+  "kind": "wrapped-aes",
+  "file": "460.json"
+ },
+ {
+  "seq": "462",
+  "url": "/client/repeatalbeQuests/activityPeriods",
+  "kind": "wrapped-aes",
+  "file": "462.json"
+ },
+ {
+  "seq": "465",
+  "url": "/client/putLoadMetrics",
+  "kind": "wrapped-aes",
+  "file": "465.json"
+ },
+ {
+  "seq": "466",
+  "url": "/client/game/profile/select",
+  "kind": "wrapped-aes",
+  "file": "466.json"
+ },
+ {
+  "seq": "468",
+  "url": "/client/profile/status",
+  "kind": "wrapped-aes",
+  "file": "468.json"
+ },
+ {
+  "seq": "470",
+  "url": "/client/game/profile/items/moving",
+  "kind": "wrapped-aes",
+  "file": "470.json"
+ },
+ {
+  "seq": "472",
+  "url": "/client/game/profile/list",
+  "kind": "wrapped-aes",
+  "file": "472.json"
+ },
+ {
+  "seq": "474",
+  "url": "/client/game/profile/select",
+  "kind": "wrapped-aes",
+  "file": "474.json"
+ },
+ {
+  "seq": "476",
+  "url": "/client/profile/status",
+  "kind": "wrapped-aes",
+  "file": "476.json"
+ },
+ {
+  "seq": "482",
+  "url": "/client/hideout/settings",
+  "kind": "empty",
+  "file": null
+ },
+ {
+  "seq": "483",
+  "url": "/client/hideout/customization/offer/list",
+  "kind": "wrapped-aes",
+  "file": "483.json"
+ },
+ {
+  "seq": "484",
+  "url": "/client/hideout/qte/list",
+  "kind": "empty",
+  "file": null
+ },
+ {
+  "seq": "485",
+  "url": "/client/hideout/areas",
+  "kind": "wrapped-aes",
+  "file": "485.json"
+ },
+ {
+  "seq": "486",
+  "url": "/client/hideout/production/recipes",
+  "kind": "empty",
+  "file": null
+ },
+ {
+  "seq": "491",
+  "url": "/client/profile/status",
+  "kind": "wrapped-aes",
+  "file": "491.json"
+ },
+ {
+  "seq": "492",
+  "url": "/client/notifier/channel/create",
+  "kind": "wrapped-aes",
+  "file": "492.json"
+ },
+ {
+  "seq": "493",
+  "url": "/client/server/list",
+  "kind": "wrapped-aes",
+  "file": "493.json"
+ },
+ {
+  "seq": "494",
+  "url": "/client/match/group/current",
+  "kind": "wrapped-aes",
+  "file": "494.json"
+ },
+ {
+  "seq": "499",
+  "url": "/client/match/group/current",
+  "kind": "wrapped-aes",
+  "file": "499.json"
+ },
+ {
+  "seq": "500",
+  "url": "/client/survey",
+  "kind": "wrapped-aes",
+  "file": "500.json"
+ },
+ {
+  "seq": "501",
+  "url": "/v2/client/shop/status",
+  "kind": "wrapped-aes",
+  "file": "501.json"
+ },
+ {
+  "seq": "502",
+  "url": "/client/putLoadMetrics",
+  "kind": "wrapped-aes",
+  "file": "502.json"
+ },
+ {
+  "seq": "504",
+  "url": "/client/match/group/invite/cancel-all",
+  "kind": "wrapped-aes",
+  "file": "504.json"
+ },
+ {
+  "seq": "506",
+  "url": "/client/game/logout",
+  "kind": "wrapped-aes",
+  "file": "506.json"
+ }
+]

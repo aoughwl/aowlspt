@@ -63,6 +63,16 @@ proc check(what: string; condition: bool; detail = "") =
 proc call(path, body: string): Response =
   result = request(gPort, path, body, Session)
 
+proc callAs(session, path, body: string): Response =
+  ## A request carrying a session this suite chose rather than the one every
+  ## other call here shares.
+  ##
+  ## The launcher's whole claim is that a profile can be bound to a token
+  ## *before* a client exists, and that the token is the profile's own id -- so
+  ## proving it means asking as that id, from a caller that never selected
+  ## anything.
+  result = request(gPort, path, body, session)
+
 proc expectIn(what, path, body, want: string): Response =
   let r = call(path, body)
   if not r.ok:
@@ -851,6 +861,35 @@ proc main(): int =
     return 1
   ok "the backend is serving on " & $gPort
 
+  # -- the launcher, before there is anything to launch ----------------------
+  #
+  # These have to answer at the one moment nothing else here can be asked
+  # anything: no profile, no session, no token. That is the state a person is
+  # in the first time they install this, and it is the state the launcher has
+  # to be able to describe.
+  heading "The launcher, on an empty store"
+  let ping0 = call("/aowlspt/tarkov/launcher/ping", "")
+  check("the launcher can tell there is a server here",
+        ping0.ok and ping0.contains("\"ok\":true") and
+        ping0.contains("\"server\":\"aowlspt\""), ping0.body)
+  check("and that it has nothing to play yet",
+        ping0.contains("\"profiles\":0"), ping0.body)
+  let empty0 = call("/aowlspt/tarkov/launcher/profiles", "")
+  check("an empty profile list is an answer rather than a failure",
+        empty0.ok and empty0.contains("\"ok\":true") and
+        empty0.contains("\"profiles\":[]"), empty0.body)
+  let nobody = call("/aowlspt/tarkov/launcher/profile/select",
+                    "{\"id\":\"cccccccccccccccccccccccc\"}")
+  check("selecting a profile that is not there is refused, not bound",
+        nobody.ok and nobody.contains("\"ok\":false"), nobody.body)
+  let tooShort = call("/aowlspt/tarkov/launcher/profile/create",
+                      "{\"nickname\":\"ab\",\"side\":\"Usec\"}")
+  check("and a nickname the client would refuse is refused here first",
+        tooShort.ok and tooShort.contains("\"ok\":false"), tooShort.body)
+  check("nothing was created by either refusal",
+        call("/aowlspt/tarkov/launcher/ping", "").contains("\"profiles\":0"),
+        call("/aowlspt/tarkov/launcher/profiles", "").body)
+
   # -- the client's boot sequence, in order ---------------------------------
 
   heading "Boot"
@@ -925,7 +964,7 @@ proc main(): int =
 
   let splitId = "bbbbbbbbbbbbbbbbbbbbbbbb"
   let split = call("/client/game/profile/items/moving",
-    "{\"data\":[{\"Action\":\"Split\",\"item\":\"" & moneyId &
+    "{\"data\":[{\"Action\":\"Split\",\"splitItem\":\"" & moneyId &
     "\",\"newItem\":\"" & splitId & "\",\"count\":100000," &
     "\"container\":{\"id\":\"" & moneyId &
     "\",\"container\":\"hideout\",\"location\":{\"x\":2,\"y\":0," &
@@ -2013,7 +2052,7 @@ proc main(): int =
   check("the test could rebuild the played profile", played.len > 100,
         $played.len & " bytes")
   let ended = call("/client/match/local/end",
-    "{\"exit\":\"Survived\",\"profile\":" & played & "}")
+    "{\"results\":{\"result\":\"Survived\",\"profile\":" & played & "}}")
   check("the raid result is accepted", ended.ok and ended.contains("\"err\":0"),
         ended.body)
   discard expectIn("and the raid experience stuck",
@@ -2021,8 +2060,8 @@ proc main(): int =
 
   discard expectIn("a raid result for another profile is refused",
                    "/client/match/local/end",
-                   "{\"exit\":\"Survived\",\"profile\":{\"_id\":" &
-                   "\"cccccccccccccccccccccccc\"}}", "different profile")
+                   "{\"results\":{\"result\":\"Survived\",\"profile\":{\"_id\":" &
+                   "\"cccccccccccccccccccccccc\"}}}", "different profile")
 
   heading "Skills"
   # A raid result *is* a profile, so the server that believes its skill numbers
@@ -2040,7 +2079,7 @@ proc main(): int =
     "{\"Id\":\"Endurance\",\"Progress\":" & $(start0 + 60) &
     ",\"PointsEarnedDuringSession\":0,\"LastAccess\":0}")
   let bigEnd = call("/client/match/local/end",
-                    "{\"exit\":\"Survived\",\"profile\":" & bigClaim & "}")
+                    "{\"results\":{\"result\":\"Survived\",\"profile\":" & bigClaim & "}}")
   check("a raid's skill claim is accepted", bigEnd.ok, bigEnd.body)
   let afterBig = endurance(call("/client/game/profile/list", "").body)
   check("and moves the skill", afterBig > start0,
@@ -2057,7 +2096,7 @@ proc main(): int =
       "{\"Id\":\"Endurance\",\"Progress\":" & $(was + 10) &
       ",\"PointsEarnedDuringSession\":0,\"LastAccess\":0}")
     discard call("/client/match/local/end",
-                 "{\"exit\":\"Survived\",\"profile\":" & claim & "}")
+                 "{\"results\":{\"result\":\"Survived\",\"profile\":" & claim & "}}")
     small = small + (endurance(call("/client/game/profile/list", "").body) - was)
     inc round1
   # The exploit shape, and the reason `grantedFor` integrates a point at a time:
@@ -2079,7 +2118,7 @@ proc main(): int =
     "{\"Id\":\"Endurance\",\"Progress\":" & $(was2 + 100000) &
     ",\"PointsEarnedDuringSession\":0,\"LastAccess\":0}")
   discard call("/client/match/local/end",
-               "{\"exit\":\"Survived\",\"profile\":" & absurd & "}")
+               "{\"results\":{\"result\":\"Survived\",\"profile\":" & absurd & "}}")
   let granted = endurance(call("/client/game/profile/list", "").body) - was2
   check("an absurd claim is capped rather than honoured",
         granted > 0 and granted <= 100,
@@ -2100,11 +2139,11 @@ proc main(): int =
   # of the real stash -- the scav's own document has no stash, so this is the
   # one join that makes a scav run worth playing.
   let brought = call("/client/match/local/end",
-    "{\"exit\":\"Survived\",\"profile\":{\"_id\":\"" & scavId &
+    "{\"results\":{\"result\":\"Survived\",\"profile\":{\"_id\":\"" & scavId &
     "\",\"Inventory\":{\"equipment\":\"" & gearId & "\",\"items\":[" &
     "{\"_id\":\"" & gearId & "\",\"_tpl\":\"55d7217a4bdc2d86028b456d\"}," &
     "{\"_id\":\"5ca1a5a5a5a5a5a5a5a5a5a1\",\"_tpl\":\"5710c24ad2720bc3458b45a3\"," &
-    "\"parentId\":\"" & gearId & "\",\"slotId\":\"FirstPrimaryWeapon\"}]}}}")
+    "\"parentId\":\"" & gearId & "\",\"slotId\":\"FirstPrimaryWeapon\"}]}}}}")
   check("a scav raid result is accepted", brought.ok and
         brought.contains("\"err\":0"), brought.body)
   let home = call("/client/game/profile/list", "")
@@ -2122,11 +2161,11 @@ proc main(): int =
                         find(deadScav.body, "\"_id\":\"" & scavId & "\""),
                         "equipment")
   let died = call("/client/match/local/end",
-    "{\"exit\":\"Killed\",\"profile\":{\"_id\":\"" & scavId &
+    "{\"results\":{\"result\":\"Killed\",\"profile\":{\"_id\":\"" & scavId &
     "\",\"Inventory\":{\"equipment\":\"" & deadGear & "\",\"items\":[" &
     "{\"_id\":\"" & deadGear & "\",\"_tpl\":\"55d7217a4bdc2d86028b456d\"}," &
     "{\"_id\":\"5ca1a5a5a5a5a5a5a5a5a5a2\",\"_tpl\":\"590c657e86f77412b013051d\"," &
-    "\"parentId\":\"" & deadGear & "\",\"slotId\":\"FirstPrimaryWeapon\"}]}}}")
+    "\"parentId\":\"" & deadGear & "\",\"slotId\":\"FirstPrimaryWeapon\"}]}}}}")
   check("a dead scav's raid result is accepted too", died.ok, died.body)
   check("and brings nothing home",
         not call("/client/game/profile/list", "").contains(
@@ -2376,8 +2415,8 @@ proc main(): int =
           find(lostIt, "{\"_id\":\"" & fenceId & "\"") < 0,
           $lostIt.len & " bytes")
     let died = call("/client/match/local/end",
-      "{\"exit\":\"Killed\",\"location\":\"bigmap\",\"profile\":" &
-      lostIt & "}")
+      "{\"location\":\"bigmap\",\"results\":{\"result\":\"Killed\",\"profile\":" &
+      lostIt & "}}")
     check("a raid the insured items did not come out of is accepted",
           died.ok and died.contains("\"err\":0"), died.body)
     check("and they really are gone from the stash",
@@ -2459,7 +2498,7 @@ proc main(): int =
           hurt.len > 100 and find(hurt, "\"Current\":10") >= 0,
           $hurt.len & " bytes")
     discard call("/client/match/local/end",
-                 "{\"exit\":\"Survived\",\"profile\":" & hurt & "}")
+                 "{\"results\":{\"result\":\"Survived\",\"profile\":" & hurt & "}}")
 
     let buyKit2 = call("/client/game/profile/items/moving",
       "{\"data\":[{\"Action\":\"TradingConfirm\",\"type\":\"buy_from_trader\"," &
@@ -2539,7 +2578,7 @@ proc main(): int =
     check("the test could make the profile thirsty", thirsty.len > 100,
           $thirsty.len & " bytes")
     discard call("/client/match/local/end",
-                 "{\"exit\":\"Survived\",\"profile\":" & thirsty & "}")
+                 "{\"results\":{\"result\":\"Survived\",\"profile\":" & thirsty & "}}")
 
     let drank = call("/client/game/profile/items/moving",
       "{\"data\":[{\"Action\":\"Eat\",\"item\":\"" & bottleId &
@@ -2602,7 +2641,7 @@ proc main(): int =
           beaten.len > whole1.len and find(beaten, "Contusion") >= 0 and
           find(beaten, "\"Current\":25") >= 0, $beaten.len & " bytes")
     discard call("/client/match/local/end",
-                 "{\"exit\":\"Survived\",\"profile\":" & beaten & "}")
+                 "{\"results\":{\"result\":\"Survived\",\"profile\":" & beaten & "}}")
 
     let hurtDoc = profileOf(call("/client/game/profile/list", "").body, uid)
     check("and the raid brought the fracture home with it",
@@ -2832,7 +2871,7 @@ proc main(): int =
           withGear.len > beforeGear.len and findFrom(withGear, gunId, 0) > 0,
           $withGear.len & " bytes")
     discard call("/client/match/local/end",
-                 "{\"exit\":\"Survived\",\"profile\":" & withGear & "}")
+                 "{\"results\":{\"result\":\"Survived\",\"profile\":" & withGear & "}}")
 
     # **The client drives the wear.** This is the whole reason there is no
     # server-side degradation on the raid path: the raid result carries the
@@ -3202,7 +3241,7 @@ proc main(): int =
           levelled.len > 100 and findFrom(levelled, "\"Level\":2", 0) > 0,
           $levelled.len & " bytes")
     discard call("/client/match/local/end",
-                 "{\"exit\":\"Survived\",\"profile\":" & levelled & "}")
+                 "{\"results\":{\"result\":\"Survived\",\"profile\":" & levelled & "}}")
     let afterAch = profileOf(call("/client/game/profile/list", "").body, uid)
     check("the achievement whose condition is met and checkable is awarded",
           findFrom(afterAch, "ach_level_two", 0) > 0,
@@ -3226,7 +3265,7 @@ proc main(): int =
     # Again. An award that fires once per raid is an experience tap.
     let secondDoc = profileOf(call("/client/game/profile/list", "").body, uid)
     discard call("/client/match/local/end",
-                 "{\"exit\":\"Survived\",\"profile\":" & secondDoc & "}")
+                 "{\"results\":{\"result\":\"Survived\",\"profile\":" & secondDoc & "}}")
     let afterSecond = profileOf(call("/client/game/profile/list", "").body, uid)
     check("a second raid does not award it again",
           numberAt(afterSecond, find(afterSecond, "\"Info\":"),
@@ -3275,10 +3314,10 @@ proc main(): int =
                            find(karmaList.body, "\"_id\":\"" & karmaScav & "\""),
                            "equipment")
     discard call("/client/match/local/end",
-      "{\"exit\":\"Survived\",\"profile\":{\"_id\":\"" & karmaScav &
+      "{\"results\":{\"result\":\"Survived\",\"profile\":{\"_id\":\"" & karmaScav &
       "\",\"Inventory\":{\"equipment\":\"" & karmaGear & "\",\"items\":[" &
       "{\"_id\":\"" & karmaGear &
-      "\",\"_tpl\":\"55d7217a4bdc2d86028b456d\"}]}}}")
+      "\",\"_tpl\":\"55d7217a4bdc2d86028b456d\"}]}}}}")
     let karmaAfter = traderEntry(
       profileOf(call("/client/game/profile/list", "").body, uid),
       "579dc571d53a0658a154fbec")
@@ -3306,13 +3345,13 @@ proc main(): int =
                            find(killList1.body, "\"_id\":\"" & killScav1 & "\""),
                            "equipment")
     discard call("/client/match/local/end",
-      "{\"exit\":\"Survived\",\"profile\":{\"_id\":\"" & killScav1 &
+      "{\"results\":{\"result\":\"Survived\",\"profile\":{\"_id\":\"" & killScav1 &
       "\",\"Stats\":{\"Eft\":{\"Victims\":[" &
       "{\"Side\":\"Savage\",\"Role\":\"assault\",\"BodyPart\":\"Head\"}," &
       "{\"Side\":\"Savage\",\"Role\":\"assault\",\"BodyPart\":\"Chest\"}]}}," &
       "\"Inventory\":{\"equipment\":\"" & killGear1 & "\",\"items\":[" &
       "{\"_id\":\"" & killGear1 &
-      "\",\"_tpl\":\"55d7217a4bdc2d86028b456d\"}]}}}")
+      "\",\"_tpl\":\"55d7217a4bdc2d86028b456d\"}]}}}}")
     let killed1 = traderEntry(
       profileOf(call("/client/game/profile/list", "").body, uid),
       "579dc571d53a0658a154fbec")
@@ -3332,12 +3371,12 @@ proc main(): int =
                            find(killList2.body, "\"_id\":\"" & killScav2 & "\""),
                            "equipment")
     discard call("/client/match/local/end",
-      "{\"exit\":\"Survived\",\"profile\":{\"_id\":\"" & killScav2 &
+      "{\"results\":{\"result\":\"Survived\",\"profile\":{\"_id\":\"" & killScav2 &
       "\",\"Stats\":{\"Eft\":{\"Victims\":[" &
       "{\"Side\":\"Bear\",\"Role\":\"bear\",\"BodyPart\":\"Head\"}]}}," &
       "\"Inventory\":{\"equipment\":\"" & killGear2 & "\",\"items\":[" &
       "{\"_id\":\"" & killGear2 &
-      "\",\"_tpl\":\"55d7217a4bdc2d86028b456d\"}]}}}")
+      "\",\"_tpl\":\"55d7217a4bdc2d86028b456d\"}]}}}}")
     let killed2 = traderEntry(
       profileOf(call("/client/game/profile/list", "").body, uid),
       "579dc571d53a0658a154fbec")
@@ -3357,13 +3396,13 @@ proc main(): int =
                            find(killList3.body, "\"_id\":\"" & killScav3 & "\""),
                            "equipment")
     discard call("/client/match/local/end",
-      "{\"exit\":\"Survived\",\"profile\":{\"_id\":\"" & killScav3 &
+      "{\"results\":{\"result\":\"Survived\",\"profile\":{\"_id\":\"" & killScav3 &
       "\",\"Stats\":{\"Eft\":{\"Victims\":[" &
       "{\"Side\":\"Savage\",\"Role\":\"gifter\",\"BodyPart\":\"Head\"}," &
       "{\"Side\":\"Savage\",\"Role\":\"bossKilla\",\"BodyPart\":\"Head\"}]}}," &
       "\"Inventory\":{\"equipment\":\"" & killGear3 & "\",\"items\":[" &
       "{\"_id\":\"" & killGear3 &
-      "\",\"_tpl\":\"55d7217a4bdc2d86028b456d\"}]}}}")
+      "\",\"_tpl\":\"55d7217a4bdc2d86028b456d\"}]}}}}")
     let killed3 = traderEntry(
       profileOf(call("/client/game/profile/list", "").body, uid),
       "579dc571d53a0658a154fbec")
@@ -3381,12 +3420,12 @@ proc main(): int =
                            find(killList4.body, "\"_id\":\"" & killScav4 & "\""),
                            "equipment")
     discard call("/client/match/local/end",
-      "{\"exit\":\"Killed\",\"profile\":{\"_id\":\"" & killScav4 &
+      "{\"results\":{\"result\":\"Killed\",\"profile\":{\"_id\":\"" & killScav4 &
       "\",\"Stats\":{\"Eft\":{\"Victims\":[" &
       "{\"Side\":\"Savage\",\"Role\":\"assault\",\"BodyPart\":\"Head\"}]}}," &
       "\"Inventory\":{\"equipment\":\"" & killGear4 & "\",\"items\":[" &
       "{\"_id\":\"" & killGear4 &
-      "\",\"_tpl\":\"55d7217a4bdc2d86028b456d\"}]}}}")
+      "\",\"_tpl\":\"55d7217a4bdc2d86028b456d\"}]}}}}")
     let killed4 = traderEntry(
       profileOf(call("/client/game/profile/list", "").body, uid),
       "579dc571d53a0658a154fbec")
@@ -4369,7 +4408,7 @@ proc main(): int =
           starved.len > 100 and find(starved, "\"Current\":20") >= 0,
           $starved.len & " bytes")
     discard call("/client/match/local/end",
-                 "{\"exit\":\"Survived\",\"profile\":" & starved & "}")
+                 "{\"results\":{\"result\":\"Survived\",\"profile\":" & starved & "}}")
     let tiredList = call("/client/game/profile/list", "").body
     let tiredEndurance = skillOf(tiredList, "Endurance")
     let tired = call("/client/game/profile/items/moving",
@@ -4759,6 +4798,54 @@ proc main(): int =
 
   # -- the part that only a restart can prove -------------------------------
 
+  heading "A profile made before the game starts"
+
+  # What a launcher does: create a character over HTTP with no client running,
+  # and keep the token it is handed. Placed last of the sections that run
+  # against the first server, so that the second profile it adds cannot change
+  # what any earlier check reads out of a profile list.
+  #
+  # The voice in this body is a *Usec* voice on a Bear character, and it is
+  # wrong on purpose. A launcher offers a voice picker, the table decides which
+  # voices a side may have, and the question is what a server does when those
+  # two disagree at the moment a character is being made: refusing the whole
+  # profile would leave a person unable to create one at all, so the voice is
+  # dropped and the side's default kept. The character below must exist and
+  # must speak as `Bear_1`.
+  let madeBody = call("/aowlspt/tarkov/launcher/profile/create",
+                      "{\"nickname\":\"AowlLauncher\",\"side\":\"Bear\"," &
+                      "\"voice\":\"cust_voice_usec_2\"}").body
+  check("the launcher created a profile", find(madeBody, "\"ok\":true") >= 0,
+        madeBody)
+  let token = jsonText(madeBody, "token")
+  check("and handed back a MongoId to put on the command line",
+        token.len == 24, token)
+  check("which is the profile's own id and not a third thing to keep in step",
+        token.len == 24 and find(madeBody, "\"id\":\"" & token & "\"") >= 0,
+        madeBody)
+  check("the side the launcher asked for is the side the character got",
+        find(madeBody, "\"side\":\"Bear\"") >= 0, madeBody)
+  check("a voice the table will not give that side costs the voice, not the " &
+        "profile",
+        find(madeBody, "\"voice\":\"Bear_1\"") >= 0, madeBody)
+  let taken = call("/aowlspt/tarkov/launcher/profile/create",
+                   "{\"nickname\":\"AowlTest\",\"side\":\"Usec\"}")
+  check("a nickname the client already took is refused to the launcher too",
+        taken.ok and taken.contains("\"ok\":false"), taken.body)
+  let listed = call("/aowlspt/tarkov/launcher/profiles", "")
+  check("both characters are on the launcher's list",
+        listed.contains("AowlLauncher") and listed.contains("AowlTest"),
+        listed.body)
+  # The other half, and the one that matters: a profile the launcher made has
+  # to be a profile the *game* can see, not a second kind of record beside it.
+  discard expectIn("and the game sees the launcher's character as a profile",
+                   "/client/game/profile/list", "", "AowlLauncher")
+  let reselect = call("/aowlspt/tarkov/launcher/profile/select",
+                      "{\"id\":\"" & token & "\"}")
+  check("selecting it again hands back the same token",
+        reselect.ok and reselect.contains("\"ok\":true") and
+        reselect.contains("\"token\":\"" & token & "\""), reselect.body)
+
   heading "Across a restart"
 
   # The last thing this server is told before it is switched off: the client is
@@ -4832,6 +4919,25 @@ proc main(): int =
     cSpawnKill(proc2)
     return 1
   ok "restarted"
+
+  # The token was minted by a server that no longer exists. Nothing re-selects
+  # anything here and no launcher is run again -- which is the whole point: a
+  # token that had to be re-issued after every backend restart would be a token
+  # nobody could put on a shortcut.
+  check("the launcher's character survived the restart",
+        call("/aowlspt/tarkov/launcher/profiles", "")
+          .contains("AowlLauncher"), "AowlLauncher is gone")
+  let asToken = callAs(token, "/client/game/config", "")
+  check("and the token still names it to a client that has selected nothing",
+        asToken.ok and
+        asToken.contains("\"activeProfileId\":\"" & token & "\""),
+        asToken.body)
+  let pingAfter = call("/aowlspt/tarkov/launcher/ping", "")
+  check("and the launcher counts both characters on the second server",
+        pingAfter.contains("\"profiles\":2"), pingAfter.body)
+  let listAs = callAs(token, "/client/game/profile/list", "")
+  check("and its profile list answers with that character",
+        listAs.ok and listAs.contains("AowlLauncher"), listAs.body)
 
   # The same question of the second server. It loaded a config this run rewrote
   # and a store this run filled, and a self-check that held on the first boot
@@ -5099,8 +5205,8 @@ proc main(): int =
     check("the test could put victims in the profile the client hands back",
           countOf(played, "\"Distance\":") == 2, "victims not injected")
     let back = call("/client/match/local/end",
-      "{\"exit\":\"Survived\",\"location\":\"bigmap\",\"profile\":" &
-      played & "}")
+      "{\"location\":\"bigmap\",\"results\":{\"result\":\"Survived\",\"profile\":" &
+      played & "}}")
     check("the raid with two scav kills in it is accepted", back.ok, back.body)
 
     let afterKills = call("/client/game/profile/list", "")
@@ -5169,8 +5275,8 @@ proc main(): int =
       "[{\"Side\":\"Savage\",\"Role\":\"assault\",\"BodyPart\":\"Head\"," &
       "\"Distance\":40.0,\"Location\":\"bigmap\"}]")
     discard call("/client/match/local/end",
-      "{\"exit\":\"Survived\",\"location\":\"bigmap\",\"profile\":" &
-      dayPlayed1 & "}")
+      "{\"location\":\"bigmap\",\"results\":{\"result\":\"Survived\",\"profile\":" &
+      dayPlayed1 & "}}")
     let dayAfter1 = call("/client/game/profile/list", "").body
     check("a raid that runs out of the window before it ends is still refused",
           find(dayAfter1, "\"c_nightowl\"") < 0,
@@ -5187,8 +5293,8 @@ proc main(): int =
       "[{\"Side\":\"Savage\",\"Role\":\"assault\",\"BodyPart\":\"Head\"," &
       "\"Distance\":40.0,\"Location\":\"bigmap\"}]")
     discard call("/client/match/local/end",
-      "{\"exit\":\"Survived\",\"location\":\"bigmap\",\"profile\":" &
-      dayPlayed2 & "}")
+      "{\"location\":\"bigmap\",\"results\":{\"result\":\"Survived\",\"profile\":" &
+      dayPlayed2 & "}}")
     let dayAfter2 = call("/client/game/profile/list", "").body
     let nightAt = find(dayAfter2, "\"c_nightowl\"")
     check("but one whose whole span is inside the window is credited",

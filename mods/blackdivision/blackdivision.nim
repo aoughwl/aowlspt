@@ -183,6 +183,7 @@ import bd/validate
 import bd/watch
 import aowlspt/game    # `whenReady` -- the client half waits for a world
 import aowlspt/fast    # `perfCounter` -- the clock the watch reports on
+import aowlspt/fixture # where a self-test's runtime path may come from
 
 const
   ModGuid = "aowl.blackdivision"
@@ -904,10 +905,10 @@ proc simSelfTest(): Status =
     inc bad
 
   # --- the client watch.
-  var runtimePath = setting("selfTestRuntime").asText("")
-  if runtimePath.len >= 2 and runtimePath[0] == '"' and
-     runtimePath[runtimePath.len - 1] == '"':
-    runtimePath = runtimePath.substr(1, runtimePath.len - 2)
+  let wanted = selfTestRuntime(setting("selfTestRuntime").asText(""))
+  if wanted.refusal.len > 0:
+    warn "  " & wanted.refusal
+  let runtimePath = wanted.path
   var opened = false
   if runtimePath.len > 0:
     opened = openWatchAt(runtimePath, "aowl-blackdivision-selftest")
@@ -921,8 +922,8 @@ proc simSelfTest(): Status =
     warn "  no IL2CPP runtime in this process -- aowlspt-sim is a managed " &
          "host and GameAssembly.dll is not loaded. Every watch binding will " &
          "refuse for that reason, which is the correct answer here. Set " &
-         "\"selfTestRuntime\" in config.json to a GameAssembly.dll for a " &
-         "real report offline."
+         "AOWLSPT_SELFTEST_RUNTIME, or \"selfTestRuntime\" in config.json, " &
+         "to an ABSOLUTE path to a GameAssembly.dll for a real report offline."
 
   # The name table is the whole of the client half's identification, and it is
   # this mod's own data rather than a guess about the game -- so it is fully

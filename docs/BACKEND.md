@@ -128,6 +128,36 @@ is the two-byte zlib header, not a guess.
 **The session id is a 24-character hex MongoId.** Anything else is rejected
 before a route sees it, so a malformed id is not reported as some mod's bug.
 
+## HTTPS, for the real client
+
+A post-1.0 Escape From Tarkov client talks to its backend over **HTTPS on port
+443** and *disables* certificate validation — so a self-signed certificate is
+accepted, any CN. The default backend is plain HTTP (every test tool speaks that
+and must keep working); `--tls` is what a real client needs.
+
+```
+aowlspt-backend --tls                 # HTTPS on 443, self-signed cert
+aowlspt-backend --tls --port 8443     # a spare port, for testing
+aowlspt-backend --gen-cert            # write the cert+key and exit
+```
+
+- **The certificate lives beside the backend**, as `aowlspt-tls-cert.pem` and
+  `aowlspt-tls-key.pem` in `--root` (override with `--cert` / `--key`). It is
+  generated with `openssl` on the first `--tls` run if it is not already there,
+  so `openssl.exe` needs to be on `PATH` (or in the ucrt64 `bin`) for that one
+  step; a run with the PEMs already present needs no openssl at all. `--gen-cert`
+  is the explicit one-time step.
+- **OpenSSL 3 is loaded at runtime**, not linked: `libssl-3-x64.dll` and
+  `libcrypto-3-x64.dll` (from the msys2 ucrt64 toolchain) are found by name via
+  `LoadLibraryA`, so a `--tls` build needs them **beside `aowlspt-backend.exe`
+  or on `PATH`**. A plain-HTTP run never touches OpenSSL, and a `--tls` run that
+  cannot find the DLLs says so rather than failing to start with no reason.
+- **TLS is a transport shim only.** It terminates in `aowlspt_tls.h` /
+  `aowlspt_net.h`, under the poller; everything above the byte stream — the zlib
+  framing, the router, the database, the mod API — is unchanged, and all of
+  `/client/*` is reachable, not one route. Test it with a client that skips
+  verification the way the game does: `curl -k https://127.0.0.1:8443/...`.
+
 ## Merging, and why it matters
 
 `dbWrite` merges recursively, and **creates a path that is not there**. Refusing

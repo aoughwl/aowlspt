@@ -123,6 +123,8 @@ tools/aowllaunch.nim     aowlspt-launch: start the game with the host inside it
 tools/il2cppprobe.nim    what a post-1.0 client exposes
 tools/hostharness.nim    run the client host with no game
 tools/aowlprobe.nim      call a backend route with the game's wire framing
+tools/bsgwire.py         decode a captured body — the shuffle, the zlib, the AES
+tools/bsgaes.py          the AES bsgwire needs, stdlib only, FIPS-197 checked
 tools/coverage.nim       aowl-coverage: generate and check EMULATOR-COVERAGE.md
 tools/emutest.nim        drive the emulator through the client's boot sequence
 tools/realtest.nim       the emulator against a database imported from SPT
@@ -156,6 +158,7 @@ docs/INSTALL.md          getting from a vanilla install to a modded one
 docs/ABI.md              the contract, and the decisions behind it
 docs/MODDING.md          writing a client mod, top to bottom
 docs/BACKEND.md          writing a backend mod, and the wire protocol
+docs/WIRE.md             what a post-1.0 client actually puts on the wire
 docs/IL2CPP.md           why there is no BepInEx underneath the client host
 docs/EMULATOR.md         what the Tarkov emulator implements, and refuses
 docs/EMULATOR-COVERAGE.md  the gap list: every client operation, served or not
@@ -166,6 +169,9 @@ docs/PERF.md             what a client-side call costs, measured
 docs/PERF-SERVER.md      what a request costs, measured
 docs/DEBUGGING.md        the three levels, cheapest first
 docs/BACKLOG.md          everything not done, triaged: broken, blocked, playtest, open
+docs/CAPTURE-GAP.md      the real client's routes against the ones we serve
+docs/CAPTURE-TIMELINE.md what the client does, in order, over a whole session
+docs/POST1-DATA-DELTA.md the pre-1.0 database against post-1.0's own data
 reference/               SPT's public API surface, dumped per version
 tests/abi_layout.*       the ABI's layout, checked against the C header
 tests/mockil2cpp         a stand-in IL2CPP runtime exporting the same C API

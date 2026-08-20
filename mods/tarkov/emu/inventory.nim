@@ -232,7 +232,13 @@ proc doSplit*(inv: var Inventory; action: JsonRef; ch: var Change): bool =
   ## Splitting makes a *new* item with its own id, and the client has already
   ## picked that id -- it is in the request. Generating one here instead would
   ## leave the two copies disagreeing about what the item is called.
-  let id = action.field("item").asText("")
+  # `splitItem`, not `item`. Split is the one item action that does not name
+  # its subject the way every other one does, which is exactly why this was
+  # wrong: the two lines under it read `newItem` and `container` and are
+  # correct, so the handler looked right and failed on every split.
+  # Confirmed against seq 318 of `data/capture/raid1`:
+  # `{Action: "Split", splitItem, newItem, container: {id, container}, count}`.
+  let id = action.field("splitItem").asText("")
   let idx = indexOf(inv, id)
   if idx < 0:
     ch.problems.add "split: no such item " & id
@@ -611,6 +617,18 @@ proc doApplyChanges*(inv: var Inventory; action: JsonRef;
 # Dispatch
 # ---------------------------------------------------------------------------
 
+proc templateOf(inv {.byref.}: Inventory; id: string): string =
+  ## The template an examined id refers to, falling back to the id itself.
+  ##
+  ## The fallback is deliberate: the client examines items it has seen but does
+  ## not own -- on a trader's shelf, in a flea offer -- and for those the id it
+  ## sends already *is* a template id. Refusing the ones that are not in the
+  ## inventory would lose exactly the examinations that unlock the handbook.
+  result = id
+  let idx = indexOf(inv, id)
+  if idx >= 0:
+    result = field(inv.items.items[idx], "_tpl").asText(id)
+
 proc applyAction*(inv: var Inventory; action: JsonRef; ch: var Change;
                   examined: var seq[string]): bool =
   ## One action. An unknown action is *not* an error: the client sends actions
@@ -629,13 +647,22 @@ proc applyAction*(inv: var Inventory; action: JsonRef; ch: var Change;
   of "Tag": result = doTag(inv, action, ch)
   of "Swap": result = doSwap(inv, action, ch)
   of "ApplyInventoryChanges": result = doApplyChanges(inv, action, ch)
-  of "Examine", "ReadEncyclopedia":
-    let id = action.field("item").asText("")
-    var tpl = id
-    let idx = indexOf(inv, id)
-    if idx >= 0:
-      tpl = field(inv.items.items[idx], "_tpl").asText(id)
-    examined.add tpl
+  of "Examine":
+    examined.add templateOf(inv, action.field("item").asText(""))
+    result = true
+  of "ReadEncyclopedia":
+    # Not a spelling of `Examine`. The client sends `ids`, an array, and it can
+    # be empty -- seq 341 of `data/capture/raid1` is exactly
+    # `{"Action":"ReadEncyclopedia","ids":[]}`. Sharing the `Examine` branch
+    # read `item`, found nothing, and then recorded the empty string as a
+    # template the player had examined.
+    let ids = action.field("ids")
+    if isArray(ids):
+      let elems = each(ids)
+      for e in elems:
+        let id = e.asText("")
+        if id.len > 0:
+          examined.add templateOf(inv, id)
     result = true
   else:
     ch.problems.add "unhandled action: " & kind

@@ -513,11 +513,24 @@ proc raidLocation*(body: string): string =
   let server = field(body, "serverId").asText("")
   if server.len == 0:
     return ""
+  # `bigmap.1700000000` -- but **only** when there is a dot to split on.
+  #
+  # Post-1.0 spells `serverId` differently and does not put the map in it at
+  # all: `TUTORIAL_1891947_20_08_2026_01_20_33` (capture seq 204), a mode and
+  # an account and a timestamp. Returning everything up to the first dot used
+  # to hand that whole string back as a map name, so every `Location`
+  # condition compared against a map that does not exist and quietly failed.
+  # No dot now means no map, and the caller is expected to have remembered one
+  # -- see `raidMapFor` and `emu/sessions.enterRaid`.
   var name = ""
+  var sawDot = false
   for ch in server:
     if ch == '.':
+      sawDot = true
       break
     name.add ch
+  if not sawDot:
+    return ""
   result = name
 
 proc pruneExpiredRepeatables*(p: var Profile; nowSeconds: int): int =

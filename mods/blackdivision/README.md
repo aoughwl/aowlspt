@@ -234,5 +234,7 @@ and checks, per `bd/validate.nim`:
 
 It also drives the whole `morebots.ready` handshake with no backend, exercises
 the client watch's Win64 hidden-pointer rule exhaustively, and prints the
-binding report offline. `selfTestRuntime` in `config.json` points it at a
-`GameAssembly.dll` for a real binding answer without the game running.
+binding report offline. `AOWLSPT_SELFTEST_RUNTIME` — which `aowl run` and
+`aowl test` set to the stand-in runtime — or `selfTestRuntime` in `config.json`
+points it at a `GameAssembly.dll` for a real binding answer without the game
+running. Absolute paths only: that config key ships into installs.

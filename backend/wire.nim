@@ -110,6 +110,111 @@ proc bytesAt*(b {.byref.}: seq[byte]; start, len: int): string =
   copyMem(dest, cast[pointer](cast[uint](addr b[0]) + uint(start)), len)
   endStore(result)
 
+# --------------------------------------------------------------------------- #
+# The BSG envelope                                                             #
+#                                                                              #
+# A post-1.0 client does not put `zlib(json)` on the wire the way a pre-1.0    #
+# one did. It wraps it:                                                        #
+#                                                                              #
+#     wire = shuffle_L( [int32 LE size][payload of `size` bytes][junk] )       #
+#                                                                              #
+# `shuffle_L` is a Fisher-Yates permutation whose swap indices come from a     #
+# linear congruential sequence, stepped by the buffer's own length. **The      #
+# length is the only key**, so this is obfuscation rather than encryption and  #
+# either side can undo it. It is the same permutation this repository already  #
+# applied to `/client/metadata` response bodies -- the discovery is not the    #
+# permutation but that it is on *every* route, in both directions.             #
+#                                                                              #
+# The trailing junk is the tail of the client's send buffer, left unwritten.   #
+# It is not covered by `size` and carries nothing. It is also why the same     #
+# logical request appears on the wire at ten different lengths: the junk       #
+# length varies, and the length picks the permutation. That is the whole       #
+# explanation for a capture in which `/client/weather` and `/client/keepalive` #
+# post byte-identical bodies -- both are the empty request, and they collided  #
+# on a length.                                                                 #
+#                                                                              #
+# Why this matters to the server rather than being a curiosity: a body that    #
+# arrives shuffled is not zlib-framed, so it flows through `inflateBody`'s     #
+# pass-through branch and reaches the route handler as noise. Every route that #
+# ignores its request body still works, which is why a client can boot all the #
+# way to the main menu against a server that has never once read what it was   #
+# sent -- and why the first thing to break is the first thing that matters:    #
+# creating a profile, moving an item, ending a raid.                           #
+# --------------------------------------------------------------------------- #
+
+const
+  BsgMod = 0x8ED7A18D'i64
+  BsgMul = 1624453'i64
+  BsgAdd = 1023920427'i64
+  BsgSeed = 0x65F6D'i64
+  BsgStartMod = 0xAAB
+
+proc bsgSwapIndex(i, start: int): int =
+  ## The client builds a table of these and indexes it; the table is a pure
+  ## function of the position, so this computes the entry instead.
+  ##
+  ## Not a micro-optimisation. The table is `len + len mod 0xAAB` entries of
+  ## 64-bit arithmetic, which for the 76 KB body that `/client/match/local/end`
+  ## posts is a 600 KB allocation per request, to be read once and thrown away.
+  ## The closed form allocates nothing. `bsgEnvelopeSelftest` asserts the two
+  ## agree.
+  ##
+  ## The product cannot overflow: the multiplicand is bounded by the body
+  ## length plus 0x65F6D, so for any body this server will accept it stays
+  ## below 2^43.
+  let t = (BsgMul * (BsgSeed + int64(i + start)) + BsgAdd) mod BsgMod
+  result = int(t mod int64(i))
+
+proc bsgUnshuffle*(b: var seq[byte]; len: int) =
+  ## Wire order -> buffer order, in place. Ascending.
+  if len <= 1:
+    return
+  let start = len mod BsgStartMod
+  var i = 1
+  while i < len:
+    let j = bsgSwapIndex(i, start)
+    let t = b[i]
+    b[i] = b[j]
+    b[j] = t
+    inc i
+
+proc bsgShuffle*(b: var seq[byte]; len: int) =
+  ## Buffer order -> wire order, in place. The descending exact inverse.
+  if len <= 1:
+    return
+  let start = len mod BsgStartMod
+  var i = len - 1
+  while i >= 1:
+    let j = bsgSwapIndex(i, start)
+    let t = b[i]
+    b[i] = b[j]
+    b[j] = t
+    dec i
+
+proc bsgUnwrap*(b: var seq[byte]; len: int; payloadLen: var int): bool =
+  ## Unshuffles `b` in place and reports the payload, which begins at byte 4.
+  ##
+  ## Returns false -- leaving `b` unshuffled-but-modified -- when the result
+  ## does not look like an envelope. The caller must therefore treat a false
+  ## return as "this buffer is now scrambled, use your own copy", which is what
+  ## `inflateBody` does. Sizing it any other way would mean copying every body
+  ## twice on the common path to protect the rare one.
+  ##
+  ## The size check is what keeps a body that was never enveloped from being
+  ## accepted as one: an unenveloped buffer unshuffles to noise, and noise has
+  ## a one-in-a-few-hundred-million chance of leading with a size word that is
+  ## both positive and inside the buffer.
+  payloadLen = 0
+  if len < 5:
+    return false
+  bsgUnshuffle(b, len)
+  let size = int(b[0]) or (int(b[1]) shl 8) or (int(b[2]) shl 16) or
+             (int(b[3]) shl 24)
+  if size <= 0 or size > len - 4:
+    return false
+  payloadLen = size
+  result = true
+
 proc readMem*(p: WirePtr; len: int32): string =
   ## A host buffer as a string, in one `copyMem`.
   ##

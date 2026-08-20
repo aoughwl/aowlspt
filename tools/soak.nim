@@ -614,7 +614,7 @@ var gStore1Sizes: seq[int] = @[]
 
 proc endRaid(doc: string; outcome: string): Response =
   result = timed("/client/match/local/end",
-                 "{\"exit\":\"" & outcome & "\",\"profile\":" & doc & "}")
+                 "{\"results\":{\"result\":\"" & outcome & "\",\"profile\":" & doc & "}}")
 
 proc enterRaid() =
   ## The four requests the client makes on the way in. Sent every cycle rather

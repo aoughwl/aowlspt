@@ -647,7 +647,11 @@ proc waitForListening(root: string; tries: int; text: var string): bool =
   while i < tries:
     text = ""
     if readTextFile(logPathOf(root), text):
-      if findAt(text, "listening on 127.0.0.1:", 0) >= 0:
+      # `://127.0.0.1:` rather than `listening on 127.0.0.1:`: the
+      # backend writes the scheme into that line and has done since it
+      # learned to serve TLS, so the old pattern never matched and this
+      # gate reported a healthy server as one that never came up.
+      if findAt(text, "://127.0.0.1:", 0) >= 0:
         # One more read a moment later: `loaded` lines for the last mod and the
         # `listening` line are written from the same thread in order, so this
         # is only about the file's tail reaching disk.

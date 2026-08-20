@@ -66,6 +66,7 @@ import aowlspt/game
 import aowlspt/json
 import aowlspt/fast
 import aowlspt/il2cpp
+import aowlspt/fixture # where a self-test's runtime path may come from
 import core/vec
 import core/types
 import core/probe
@@ -787,11 +788,12 @@ proc runBindingSelfTest(): int =
   ## ideal adversary here: nearly every binding in the table *should* refuse
   ## against it, and the assertion is that they all refuse the same honest way.
   ## Set `selfTestRuntime` in `config.json` to its `GameAssembly.dll`.
-  var runtimePath = ""
-  discard configGet("selfTestRuntime", runtimePath)
-  if runtimePath.len >= 2 and runtimePath[0] == '"' and
-     runtimePath[runtimePath.len - 1] == '"':
-    runtimePath = runtimePath.substr(1, runtimePath.len - 2)
+  var configured = ""
+  discard configGet("selfTestRuntime", configured)
+  let wanted = selfTestRuntime(configured)
+  if wanted.refusal.len > 0:
+    warn "sain: " & wanted.refusal
+  let runtimePath = wanted.path
 
   var bad = 0
 
@@ -825,7 +827,8 @@ proc runBindingSelfTest(): int =
     info "sain: no IL2CPP runtime in this process -- aowlspt-sim is a " &
          "managed host and GameAssembly.dll is not loaded, so every binding " &
          "would refuse for that reason, which is the correct answer here. " &
-         "Set \"selfTestRuntime\" in config.json to a GameAssembly.dll " &
+         "Set AOWLSPT_SELFTEST_RUNTIME, or \"selfTestRuntime\" in " &
+         "config.json, to an ABSOLUTE path to a GameAssembly.dll " &
          "(tests/mockil2cpp builds one) for a real binding report offline."
     return bad
 

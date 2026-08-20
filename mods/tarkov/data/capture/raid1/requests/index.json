@@ -1,0 +1,2143 @@
+[
+ {
+  "seq": "007",
+  "method": "POST",
+  "url": "/launcher/analytics?launcherVersion=15.0.0.4595&provider=bsg",
+  "reqlen": 66,
+  "requestId": null,
+  "ifNoneMatch": false,
+  "kind": "plain-zlib",
+  "file": "007.json"
+ },
+ {
+  "seq": "014",
+  "method": "POST",
+  "url": "/launcher/game/start?launcherVersion=15.0.0.4595",
+  "reqlen": 1530,
+  "requestId": null,
+  "ifNoneMatch": false,
+  "kind": "redacted",
+  "note": "carries an account token or a machine fingerprint; not checked in"
+ },
+ {
+  "seq": "019",
+  "method": "POST",
+  "url": "/client/metadata",
+  "reqlen": 49,
+  "requestId": null,
+  "ifNoneMatch": false,
+  "kind": "plain-json",
+  "file": "019.json"
+ },
+ {
+  "seq": "020",
+  "method": "POST",
+  "url": "/client/libraries",
+  "reqlen": 29925,
+  "requestId": null,
+  "ifNoneMatch": false,
+  "kind": "redacted",
+  "note": "carries an account token or a machine fingerprint; not checked in"
+ },
+ {
+  "seq": "024",
+  "method": "POST",
+  "url": "/client/game/mode",
+  "reqlen": 47,
+  "requestId": "1",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "024.json"
+ },
+ {
+  "seq": "026",
+  "method": "POST",
+  "url": "/client/game/start",
+  "reqlen": 22,
+  "requestId": "2",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "026.json"
+ },
+ {
+  "seq": "028",
+  "method": "POST",
+  "url": "/client/game/version/validate",
+  "reqlen": 117,
+  "requestId": "3",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "028.json"
+ },
+ {
+  "seq": "030",
+  "method": "GET",
+  "url": "/client/menu/locale/en",
+  "reqlen": 0,
+  "requestId": "4",
+  "ifNoneMatch": false,
+  "kind": "empty"
+ },
+ {
+  "seq": "033",
+  "method": "GET",
+  "url": "/client/languages",
+  "reqlen": 0,
+  "requestId": "5",
+  "ifNoneMatch": false,
+  "kind": "empty"
+ },
+ {
+  "seq": "034",
+  "method": "POST",
+  "url": "/client/game/config",
+  "reqlen": 23,
+  "requestId": "6",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "034.json"
+ },
+ {
+  "seq": "037",
+  "method": "GET",
+  "url": "/client/settings",
+  "reqlen": 0,
+  "requestId": "7",
+  "ifNoneMatch": false,
+  "kind": "empty"
+ },
+ {
+  "seq": "038",
+  "method": "POST",
+  "url": "/client/putHWMetrics",
+  "reqlen": 6214,
+  "requestId": "8",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "038.json"
+ },
+ {
+  "seq": "043",
+  "method": "GET",
+  "url": "/client/locale/en",
+  "reqlen": 0,
+  "requestId": "10",
+  "ifNoneMatch": false,
+  "kind": "empty"
+ },
+ {
+  "seq": "044",
+  "method": "POST",
+  "url": "/client/seasonal-perks/list",
+  "reqlen": 24,
+  "requestId": "9",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "044.json"
+ },
+ {
+  "seq": "045",
+  "method": "GET",
+  "url": "/client/items",
+  "reqlen": 0,
+  "requestId": "11",
+  "ifNoneMatch": false,
+  "kind": "empty"
+ },
+ {
+  "seq": "046",
+  "method": "GET",
+  "url": "/client/customization",
+  "reqlen": 0,
+  "requestId": "12",
+  "ifNoneMatch": false,
+  "kind": "empty"
+ },
+ {
+  "seq": "048",
+  "method": "POST",
+  "url": "/v2/client/game/profiles/",
+  "reqlen": 19,
+  "requestId": "13",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "048.json"
+ },
+ {
+  "seq": "068",
+  "method": "GET",
+  "url": "/client/customization",
+  "reqlen": 0,
+  "requestId": "15",
+  "ifNoneMatch": true,
+  "kind": "empty"
+ },
+ {
+  "seq": "069",
+  "method": "GET",
+  "url": "/client/items",
+  "reqlen": 0,
+  "requestId": "14",
+  "ifNoneMatch": true,
+  "kind": "empty"
+ },
+ {
+  "seq": "070",
+  "method": "GET",
+  "url": "/client/settings",
+  "reqlen": 0,
+  "requestId": "17",
+  "ifNoneMatch": false,
+  "kind": "empty"
+ },
+ {
+  "seq": "071",
+  "method": "GET",
+  "url": "/client/trading/api/traderSettings",
+  "reqlen": 0,
+  "requestId": "18",
+  "ifNoneMatch": false,
+  "kind": "empty"
+ },
+ {
+  "seq": "072",
+  "method": "GET",
+  "url": "/client/prestige/list",
+  "reqlen": 0,
+  "requestId": "19",
+  "ifNoneMatch": false,
+  "kind": "empty"
+ },
+ {
+  "seq": "073",
+  "method": "GET",
+  "url": "/client/quest/getMainQuestsList",
+  "reqlen": 0,
+  "requestId": "20",
+  "ifNoneMatch": false,
+  "kind": "empty"
+ },
+ {
+  "seq": "074",
+  "method": "GET",
+  "url": "/client/quest/getMainQuestNotesList",
+  "reqlen": 0,
+  "requestId": "21",
+  "ifNoneMatch": false,
+  "kind": "empty"
+ },
+ {
+  "seq": "075",
+  "method": "GET",
+  "url": "/client/variable/group",
+  "reqlen": 0,
+  "requestId": "22",
+  "ifNoneMatch": false,
+  "kind": "empty"
+ },
+ {
+  "seq": "076",
+  "method": "GET",
+  "url": "/client/dialogue",
+  "reqlen": 0,
+  "requestId": "23",
+  "ifNoneMatch": false,
+  "kind": "empty"
+ },
+ {
+  "seq": "077",
+  "method": "GET",
+  "url": "/client/tape/list",
+  "reqlen": 0,
+  "requestId": "24",
+  "ifNoneMatch": false,
+  "kind": "empty"
+ },
+ {
+  "seq": "078",
+  "method": "GET",
+  "url": "/client/subtitle-track/list",
+  "reqlen": 0,
+  "requestId": "25",
+  "ifNoneMatch": false,
+  "kind": "empty"
+ },
+ {
+  "seq": "079",
+  "method": "POST",
+  "url": "/client/seasonal-perks/list",
+  "reqlen": 25,
+  "requestId": "26",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "079.json"
+ },
+ {
+  "seq": "080",
+  "method": "POST",
+  "url": "/client/season/active",
+  "reqlen": 20,
+  "requestId": "27",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "080.json"
+ },
+ {
+  "seq": "081",
+  "method": "POST",
+  "url": "/client/battle-pass/active",
+  "reqlen": 26,
+  "requestId": "28",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "081.json"
+ },
+ {
+  "seq": "082",
+  "method": "GET",
+  "url": "/client/handbook/templates",
+  "reqlen": 0,
+  "requestId": "29",
+  "ifNoneMatch": false,
+  "kind": "empty"
+ },
+ {
+  "seq": "083",
+  "method": "POST",
+  "url": "/client/game/profile/list",
+  "reqlen": 21,
+  "requestId": "30",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "083.json"
+ },
+ {
+  "seq": "084",
+  "method": "GET",
+  "url": "/client/globals",
+  "reqlen": 0,
+  "requestId": "16",
+  "ifNoneMatch": false,
+  "kind": "empty"
+ },
+ {
+  "seq": "086",
+  "method": "POST",
+  "url": "/client/customization/storage",
+  "reqlen": 27,
+  "requestId": "31",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "086.json"
+ },
+ {
+  "seq": "088",
+  "method": "POST",
+  "url": "/client/game/profile/nickname/reserved",
+  "reqlen": 22,
+  "requestId": "32",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "088.json"
+ },
+ {
+  "seq": "090",
+  "method": "POST",
+  "url": "/client/game/profile/nickname/validate",
+  "reqlen": 50,
+  "requestId": "33",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "090.json"
+ },
+ {
+  "seq": "092",
+  "method": "POST",
+  "url": "/client/game/profile/create",
+  "reqlen": 135,
+  "requestId": "34",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "092.json"
+ },
+ {
+  "seq": "094",
+  "method": "POST",
+  "url": "/client/customization/storage",
+  "reqlen": 18,
+  "requestId": "35",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "094.json"
+ },
+ {
+  "seq": "096",
+  "method": "POST",
+  "url": "/client/game/profile/list",
+  "reqlen": 24,
+  "requestId": "36",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "096.json"
+ },
+ {
+  "seq": "098",
+  "method": "POST",
+  "url": "/client/game/profile/select",
+  "reqlen": 53,
+  "requestId": "37",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "098.json"
+ },
+ {
+  "seq": "100",
+  "method": "POST",
+  "url": "/client/profile/status",
+  "reqlen": 25,
+  "requestId": "38",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "100.json"
+ },
+ {
+  "seq": "107",
+  "method": "GET",
+  "url": "/client/hideout/settings",
+  "reqlen": 0,
+  "requestId": "39",
+  "ifNoneMatch": false,
+  "kind": "empty"
+ },
+ {
+  "seq": "108",
+  "method": "GET",
+  "url": "/client/hideout/qte/list",
+  "reqlen": 0,
+  "requestId": "40",
+  "ifNoneMatch": false,
+  "kind": "empty"
+ },
+ {
+  "seq": "109",
+  "method": "GET",
+  "url": "/client/hideout/customization/offer/list",
+  "reqlen": 0,
+  "requestId": "42",
+  "ifNoneMatch": false,
+  "kind": "empty"
+ },
+ {
+  "seq": "110",
+  "method": "GET",
+  "url": "/client/hideout/areas",
+  "reqlen": 0,
+  "requestId": "41",
+  "ifNoneMatch": false,
+  "kind": "empty"
+ },
+ {
+  "seq": "111",
+  "method": "GET",
+  "url": "/client/hideout/production/recipes",
+  "reqlen": 0,
+  "requestId": "43",
+  "ifNoneMatch": false,
+  "kind": "empty"
+ },
+ {
+  "seq": "112",
+  "method": "POST",
+  "url": "/client/game/token/issue",
+  "reqlen": 22,
+  "requestId": "44",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "112.json"
+ },
+ {
+  "seq": "118",
+  "method": "POST",
+  "url": "/client/notifier/channel/create",
+  "reqlen": 26,
+  "requestId": "46",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "118.json"
+ },
+ {
+  "seq": "122",
+  "method": "POST",
+  "url": "/client/profile/status",
+  "reqlen": 21,
+  "requestId": "47",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "122.json"
+ },
+ {
+  "seq": "123",
+  "method": "POST",
+  "url": "/client/builds/list",
+  "reqlen": 27,
+  "requestId": "48",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "123.json"
+ },
+ {
+  "seq": "124",
+  "method": "POST",
+  "url": "/client/friends",
+  "reqlen": 22,
+  "requestId": "50",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "124.json"
+ },
+ {
+  "seq": "126",
+  "method": "GET",
+  "url": "/client/achievement/statistic",
+  "reqlen": 0,
+  "requestId": "51",
+  "ifNoneMatch": false,
+  "kind": "empty"
+ },
+ {
+  "seq": "130",
+  "method": "POST",
+  "url": "/client/quest/list",
+  "reqlen": 46,
+  "requestId": "49",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "130.json"
+ },
+ {
+  "seq": "131",
+  "method": "POST",
+  "url": "/client/weather",
+  "reqlen": 23,
+  "requestId": "53",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "131.json"
+ },
+ {
+  "seq": "132",
+  "method": "POST",
+  "url": "/client/ending/list",
+  "reqlen": 18,
+  "requestId": "54",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "132.json"
+ },
+ {
+  "seq": "133",
+  "method": "GET",
+  "url": "/client/achievement/list?completed=True",
+  "reqlen": 0,
+  "requestId": "52",
+  "ifNoneMatch": false,
+  "kind": "empty"
+ },
+ {
+  "seq": "134",
+  "method": "GET",
+  "url": "/client/locations",
+  "reqlen": 0,
+  "requestId": "55",
+  "ifNoneMatch": false,
+  "kind": "empty"
+ },
+ {
+  "seq": "136",
+  "method": "POST",
+  "url": "/client/mail/dialog/list",
+  "reqlen": 45,
+  "requestId": "56",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "136.json"
+ },
+ {
+  "seq": "146",
+  "method": "POST",
+  "url": "/client/quest/chains",
+  "reqlen": 19,
+  "requestId": "57",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "146.json"
+ },
+ {
+  "seq": "148",
+  "method": "POST",
+  "url": "/client/tutor-game/check",
+  "reqlen": 47,
+  "requestId": "58",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "148.json"
+ },
+ {
+  "seq": "150",
+  "method": "POST",
+  "url": "/client/tutor-game/profile",
+  "reqlen": 20,
+  "requestId": "59",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "150.json"
+ },
+ {
+  "seq": "152",
+  "method": "POST",
+  "url": "/client/match/group/current",
+  "reqlen": 26,
+  "requestId": "60",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "152.json"
+ },
+ {
+  "seq": "154",
+  "method": "POST",
+  "url": "/client/getMetricsConfig",
+  "reqlen": 21,
+  "requestId": "61",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "154.json"
+ },
+ {
+  "seq": "156",
+  "method": "POST",
+  "url": "/client/raid/configuration",
+  "reqlen": 512,
+  "requestId": "62",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "156.json"
+ },
+ {
+  "seq": "158",
+  "method": "POST",
+  "url": "/client/match/local/start",
+  "reqlen": 134,
+  "requestId": "63",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "158.json"
+ },
+ {
+  "seq": "160",
+  "method": "POST",
+  "url": "/client/game/bot/generate",
+  "reqlen": 137,
+  "requestId": "64",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "160.json"
+ },
+ {
+  "seq": "168",
+  "method": "POST",
+  "url": "/client/game/keepalive",
+  "reqlen": 23,
+  "requestId": "65",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "168.json"
+ },
+ {
+  "seq": "172",
+  "method": "POST",
+  "url": "/client/game/keepalive",
+  "reqlen": 18,
+  "requestId": "66",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "172.json"
+ },
+ {
+  "seq": "176",
+  "method": "POST",
+  "url": "/client/game/keepalive",
+  "reqlen": 24,
+  "requestId": "67",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "176.json"
+ },
+ {
+  "seq": "179",
+  "method": "POST",
+  "url": "/client/game/keepalive",
+  "reqlen": 19,
+  "requestId": "68",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "179.json"
+ },
+ {
+  "seq": "184",
+  "method": "POST",
+  "url": "/client/game/keepalive",
+  "reqlen": 25,
+  "requestId": "69",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "184.json"
+ },
+ {
+  "seq": "191",
+  "method": "POST",
+  "url": "/client/game/keepalive",
+  "reqlen": 20,
+  "requestId": "70",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "191.json"
+ },
+ {
+  "seq": "200",
+  "method": "POST",
+  "url": "/client/game/keepalive",
+  "reqlen": 26,
+  "requestId": "71",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "200.json"
+ },
+ {
+  "seq": "202",
+  "method": "POST",
+  "url": "/client/quest/complete",
+  "reqlen": 59,
+  "requestId": "72",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "202.json"
+ },
+ {
+  "seq": "204",
+  "method": "POST",
+  "url": "/client/match/local/end",
+  "reqlen": 14800,
+  "requestId": "73",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "204.json"
+ },
+ {
+  "seq": "208",
+  "method": "POST",
+  "url": "/client/game/profile/list",
+  "reqlen": 22,
+  "requestId": "75",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "208.json"
+ },
+ {
+  "seq": "209",
+  "method": "POST",
+  "url": "/client/putMetrics",
+  "reqlen": 1469,
+  "requestId": "74",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "209.json"
+ },
+ {
+  "seq": "224",
+  "method": "GET",
+  "url": "/client/items",
+  "reqlen": 0,
+  "requestId": "76",
+  "ifNoneMatch": true,
+  "kind": "empty"
+ },
+ {
+  "seq": "225",
+  "method": "GET",
+  "url": "/client/variable/group",
+  "reqlen": 0,
+  "requestId": "84",
+  "ifNoneMatch": true,
+  "kind": "empty"
+ },
+ {
+  "seq": "226",
+  "method": "GET",
+  "url": "/client/quest/getMainQuestNotesList",
+  "reqlen": 0,
+  "requestId": "83",
+  "ifNoneMatch": true,
+  "kind": "empty"
+ },
+ {
+  "seq": "227",
+  "method": "GET",
+  "url": "/client/dialogue",
+  "reqlen": 0,
+  "requestId": "85",
+  "ifNoneMatch": true,
+  "kind": "empty"
+ },
+ {
+  "seq": "228",
+  "method": "GET",
+  "url": "/client/customization",
+  "reqlen": 0,
+  "requestId": "77",
+  "ifNoneMatch": true,
+  "kind": "empty"
+ },
+ {
+  "seq": "229",
+  "method": "GET",
+  "url": "/client/globals",
+  "reqlen": 0,
+  "requestId": "78",
+  "ifNoneMatch": true,
+  "kind": "empty"
+ },
+ {
+  "seq": "230",
+  "method": "GET",
+  "url": "/client/settings",
+  "reqlen": 0,
+  "requestId": "79",
+  "ifNoneMatch": false,
+  "kind": "empty"
+ },
+ {
+  "seq": "231",
+  "method": "GET",
+  "url": "/client/trading/api/traderSettings",
+  "reqlen": 0,
+  "requestId": "80",
+  "ifNoneMatch": false,
+  "kind": "empty"
+ },
+ {
+  "seq": "232",
+  "method": "GET",
+  "url": "/client/prestige/list",
+  "reqlen": 0,
+  "requestId": "81",
+  "ifNoneMatch": true,
+  "kind": "empty"
+ },
+ {
+  "seq": "233",
+  "method": "GET",
+  "url": "/client/quest/getMainQuestsList",
+  "reqlen": 0,
+  "requestId": "82",
+  "ifNoneMatch": true,
+  "kind": "empty"
+ },
+ {
+  "seq": "234",
+  "method": "GET",
+  "url": "/client/subtitle-track/list",
+  "reqlen": 0,
+  "requestId": "87",
+  "ifNoneMatch": true,
+  "kind": "empty"
+ },
+ {
+  "seq": "235",
+  "method": "GET",
+  "url": "/client/tape/list",
+  "reqlen": 0,
+  "requestId": "86",
+  "ifNoneMatch": true,
+  "kind": "empty"
+ },
+ {
+  "seq": "236",
+  "method": "POST",
+  "url": "/client/seasonal-perks/list",
+  "reqlen": 23,
+  "requestId": "88",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "236.json"
+ },
+ {
+  "seq": "237",
+  "method": "POST",
+  "url": "/client/season/active",
+  "reqlen": 18,
+  "requestId": "89",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "237.json"
+ },
+ {
+  "seq": "248",
+  "method": "GET",
+  "url": "/client/handbook/templates",
+  "reqlen": 0,
+  "requestId": "91",
+  "ifNoneMatch": true,
+  "kind": "empty"
+ },
+ {
+  "seq": "249",
+  "method": "POST",
+  "url": "/client/friends",
+  "reqlen": 25,
+  "requestId": "93",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "249.json"
+ },
+ {
+  "seq": "250",
+  "method": "GET",
+  "url": "/client/achievement/statistic",
+  "reqlen": 0,
+  "requestId": "94",
+  "ifNoneMatch": true,
+  "kind": "empty"
+ },
+ {
+  "seq": "251",
+  "method": "POST",
+  "url": "/client/weather",
+  "reqlen": 20,
+  "requestId": "96",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "251.json"
+ },
+ {
+  "seq": "252",
+  "method": "POST",
+  "url": "/client/battle-pass/active",
+  "reqlen": 24,
+  "requestId": "90",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "252.json"
+ },
+ {
+  "seq": "253",
+  "method": "POST",
+  "url": "/client/builds/list",
+  "reqlen": 19,
+  "requestId": "92",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "253.json"
+ },
+ {
+  "seq": "254",
+  "method": "GET",
+  "url": "/client/achievement/list?completed=True",
+  "reqlen": 0,
+  "requestId": "95",
+  "ifNoneMatch": true,
+  "kind": "empty"
+ },
+ {
+  "seq": "255",
+  "method": "GET",
+  "url": "/client/locations",
+  "reqlen": 0,
+  "requestId": "98",
+  "ifNoneMatch": true,
+  "kind": "empty"
+ },
+ {
+  "seq": "256",
+  "method": "POST",
+  "url": "/client/ending/list",
+  "reqlen": 26,
+  "requestId": "97",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "256.json"
+ },
+ {
+  "seq": "257",
+  "method": "POST",
+  "url": "/client/tutor-game/check",
+  "reqlen": 43,
+  "requestId": "99",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "257.json"
+ },
+ {
+  "seq": "260",
+  "method": "POST",
+  "url": "/client/customization/storage",
+  "reqlen": 27,
+  "requestId": "100",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "260.json"
+ },
+ {
+  "seq": "262",
+  "method": "POST",
+  "url": "/client/quest/list",
+  "reqlen": 40,
+  "requestId": "101",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "262.json"
+ },
+ {
+  "seq": "263",
+  "method": "POST",
+  "url": "/client/mail/dialog/list",
+  "reqlen": 49,
+  "requestId": "102",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "263.json"
+ },
+ {
+  "seq": "266",
+  "method": "POST",
+  "url": "/client/game/profile/select",
+  "reqlen": 57,
+  "requestId": "103",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "266.json"
+ },
+ {
+  "seq": "267",
+  "method": "POST",
+  "url": "/client/quest/chains",
+  "reqlen": 18,
+  "requestId": "104",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "267.json"
+ },
+ {
+  "seq": "270",
+  "method": "POST",
+  "url": "/client/profile/status",
+  "reqlen": 24,
+  "requestId": "105",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "270.json"
+ },
+ {
+  "seq": "271",
+  "method": "POST",
+  "url": "/client/repeatalbeQuests/activityPeriods",
+  "reqlen": 19,
+  "requestId": "106",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "271.json"
+ },
+ {
+  "seq": "273",
+  "method": "POST",
+  "url": "/client/game/profile/list",
+  "reqlen": 25,
+  "requestId": "107",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "273.json"
+ },
+ {
+  "seq": "275",
+  "method": "POST",
+  "url": "/client/game/profile/select",
+  "reqlen": 54,
+  "requestId": "108",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "275.json"
+ },
+ {
+  "seq": "277",
+  "method": "POST",
+  "url": "/client/profile/status",
+  "reqlen": 26,
+  "requestId": "109",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "277.json"
+ },
+ {
+  "seq": "283",
+  "method": "GET",
+  "url": "/client/hideout/settings",
+  "reqlen": 0,
+  "requestId": "110",
+  "ifNoneMatch": true,
+  "kind": "empty"
+ },
+ {
+  "seq": "284",
+  "method": "GET",
+  "url": "/client/hideout/production/recipes",
+  "reqlen": 0,
+  "requestId": "114",
+  "ifNoneMatch": true,
+  "kind": "empty"
+ },
+ {
+  "seq": "285",
+  "method": "GET",
+  "url": "/client/hideout/areas",
+  "reqlen": 0,
+  "requestId": "112",
+  "ifNoneMatch": false,
+  "kind": "empty"
+ },
+ {
+  "seq": "286",
+  "method": "GET",
+  "url": "/client/hideout/qte/list",
+  "reqlen": 0,
+  "requestId": "111",
+  "ifNoneMatch": true,
+  "kind": "empty"
+ },
+ {
+  "seq": "287",
+  "method": "GET",
+  "url": "/client/hideout/customization/offer/list",
+  "reqlen": 0,
+  "requestId": "113",
+  "ifNoneMatch": false,
+  "kind": "empty"
+ },
+ {
+  "seq": "291",
+  "method": "POST",
+  "url": "/client/notifier/channel/create",
+  "reqlen": 21,
+  "requestId": "115",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "291.json"
+ },
+ {
+  "seq": "292",
+  "method": "POST",
+  "url": "/client/profile/status",
+  "reqlen": 27,
+  "requestId": "116",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "292.json"
+ },
+ {
+  "seq": "293",
+  "method": "POST",
+  "url": "/client/server/list",
+  "reqlen": 22,
+  "requestId": "117",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "293.json"
+ },
+ {
+  "seq": "297",
+  "method": "POST",
+  "url": "/client/match/group/current",
+  "reqlen": 28,
+  "requestId": "118",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "297.json"
+ },
+ {
+  "seq": "298",
+  "method": "POST",
+  "url": "/client/survey",
+  "reqlen": 23,
+  "requestId": "119",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "298.json"
+ },
+ {
+  "seq": "299",
+  "method": "POST",
+  "url": "/v2/client/shop/status",
+  "reqlen": 18,
+  "requestId": "120",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "299.json"
+ },
+ {
+  "seq": "301",
+  "method": "POST",
+  "url": "/client/game/profile/items/moving",
+  "reqlen": 211,
+  "requestId": "121",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "301.json"
+ },
+ {
+  "seq": "303",
+  "method": "POST",
+  "url": "/client/game/profile/items/moving",
+  "reqlen": 196,
+  "requestId": "122",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "303.json"
+ },
+ {
+  "seq": "305",
+  "method": "POST",
+  "url": "/client/builds/weapon/save",
+  "reqlen": 817,
+  "requestId": "123",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "305.json"
+ },
+ {
+  "seq": "310",
+  "method": "POST",
+  "url": "/client/checkVersion",
+  "reqlen": 20,
+  "requestId": "124",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "310.json"
+ },
+ {
+  "seq": "311",
+  "method": "POST",
+  "url": "/client/ragfair/find",
+  "reqlen": 287,
+  "requestId": "125",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "311.json"
+ },
+ {
+  "seq": "317",
+  "method": "POST",
+  "url": "/client/items/prices/54cb57776803fa99248b456e",
+  "reqlen": 21,
+  "requestId": "127",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "317.json"
+ },
+ {
+  "seq": "318",
+  "method": "POST",
+  "url": "/client/game/profile/items/moving",
+  "reqlen": 380,
+  "requestId": "126",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "318.json"
+ },
+ {
+  "seq": "320",
+  "method": "POST",
+  "url": "/client/trading/api/getTraderAssort/54cb57776803fa99248b456e",
+  "reqlen": 22,
+  "requestId": "128",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "320.json"
+ },
+ {
+  "seq": "322",
+  "method": "POST",
+  "url": "/client/items/prices/5ac3b934156ae10c4430e83c",
+  "reqlen": 28,
+  "requestId": "129",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "322.json"
+ },
+ {
+  "seq": "324",
+  "method": "POST",
+  "url": "/client/trading/api/getTraderAssort/5ac3b934156ae10c4430e83c",
+  "reqlen": 23,
+  "requestId": "130",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "324.json"
+ },
+ {
+  "seq": "326",
+  "method": "POST",
+  "url": "/client/game/profile/items/moving",
+  "reqlen": 171,
+  "requestId": "131",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "326.json"
+ },
+ {
+  "seq": "328",
+  "method": "POST",
+  "url": "/client/trading/api/getTraderAssort/54cb57776803fa99248b456e",
+  "reqlen": 24,
+  "requestId": "132",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "328.json"
+ },
+ {
+  "seq": "331",
+  "method": "POST",
+  "url": "/client/game/profile/items/moving",
+  "reqlen": 192,
+  "requestId": "133",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "331.json"
+ },
+ {
+  "seq": "333",
+  "method": "POST",
+  "url": "/client/trading/api/getTraderAssort/54cb57776803fa99248b456e",
+  "reqlen": 25,
+  "requestId": "134",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "333.json"
+ },
+ {
+  "seq": "335",
+  "method": "POST",
+  "url": "/client/items/prices/579dc571d53a0658a154fbec",
+  "reqlen": 20,
+  "requestId": "135",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "335.json"
+ },
+ {
+  "seq": "337",
+  "method": "POST",
+  "url": "/client/trading/api/getTraderAssort/579dc571d53a0658a154fbec",
+  "reqlen": 26,
+  "requestId": "136",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "337.json"
+ },
+ {
+  "seq": "339",
+  "method": "POST",
+  "url": "/client/trading/api/getTraderAssort/5ac3b934156ae10c4430e83c",
+  "reqlen": 21,
+  "requestId": "137",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "339.json"
+ },
+ {
+  "seq": "341",
+  "method": "POST",
+  "url": "/client/game/profile/items/moving",
+  "reqlen": 93,
+  "requestId": "138",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "341.json"
+ },
+ {
+  "seq": "343",
+  "method": "POST",
+  "url": "/client/ragfair/find",
+  "reqlen": 262,
+  "requestId": "139",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "343.json"
+ },
+ {
+  "seq": "345",
+  "method": "POST",
+  "url": "/client/ragfair/find",
+  "reqlen": 269,
+  "requestId": "140",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "345.json"
+ },
+ {
+  "seq": "347",
+  "method": "POST",
+  "url": "/client/ragfair/find",
+  "reqlen": 264,
+  "requestId": "141",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "347.json"
+ },
+ {
+  "seq": "350",
+  "method": "POST",
+  "url": "/client/game/keepalive",
+  "reqlen": 18,
+  "requestId": "142",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "350.json"
+ },
+ {
+  "seq": "351",
+  "method": "POST",
+  "url": "/client/ragfair/find",
+  "reqlen": 265,
+  "requestId": "143",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "351.json"
+ },
+ {
+  "seq": "353",
+  "method": "POST",
+  "url": "/client/game/profile/items/moving",
+  "reqlen": 150,
+  "requestId": "144",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "353.json"
+ },
+ {
+  "seq": "355",
+  "method": "POST",
+  "url": "/client/insurance/items/list/cost",
+  "reqlen": 96,
+  "requestId": "145",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "355.json"
+ },
+ {
+  "seq": "357",
+  "method": "POST",
+  "url": "/client/game/profile/items/moving",
+  "reqlen": 124,
+  "requestId": "146",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "357.json"
+ },
+ {
+  "seq": "359",
+  "method": "POST",
+  "url": "/client/builds/equipment/save",
+  "reqlen": 1766,
+  "requestId": "147",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "359.json"
+ },
+ {
+  "seq": "361",
+  "method": "POST",
+  "url": "/client/ragfair/find",
+  "reqlen": 262,
+  "requestId": "148",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "361.json"
+ },
+ {
+  "seq": "363",
+  "method": "POST",
+  "url": "/client/trading/api/getTraderAssort/54cb57776803fa99248b456e",
+  "reqlen": 27,
+  "requestId": "149",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "363.json"
+ },
+ {
+  "seq": "365",
+  "method": "POST",
+  "url": "/client/insurance/items/list/cost",
+  "reqlen": 264,
+  "requestId": "150",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "365.json"
+ },
+ {
+  "seq": "368",
+  "method": "POST",
+  "url": "/client/raid/configuration",
+  "reqlen": 508,
+  "requestId": "151",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "368.json"
+ },
+ {
+  "seq": "369",
+  "method": "POST",
+  "url": "/client/match/group/invite/cancel-all",
+  "reqlen": 23,
+  "requestId": "152",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "369.json"
+ },
+ {
+  "seq": "371",
+  "method": "POST",
+  "url": "/client/match/group/invite/cancel-all",
+  "reqlen": 18,
+  "requestId": "153",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "371.json"
+ },
+ {
+  "seq": "373",
+  "method": "POST",
+  "url": "/client/raid/configuration",
+  "reqlen": 504,
+  "requestId": "154",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "373.json"
+ },
+ {
+  "seq": "376",
+  "method": "POST",
+  "url": "/client/match/group/exit_from_menu",
+  "reqlen": 19,
+  "requestId": "155",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "376.json"
+ },
+ {
+  "seq": "377",
+  "method": "POST",
+  "url": "/client/match/available",
+  "reqlen": 25,
+  "requestId": "156",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "377.json"
+ },
+ {
+  "seq": "379",
+  "method": "POST",
+  "url": "/client/match/join",
+  "reqlen": 1214,
+  "requestId": "157",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "379.json"
+ },
+ {
+  "seq": "381",
+  "method": "POST",
+  "url": "/client/profile/status",
+  "reqlen": 26,
+  "requestId": "158",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "381.json"
+ },
+ {
+  "seq": "384",
+  "method": "POST",
+  "url": "/client/profile/status",
+  "reqlen": 21,
+  "requestId": "159",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "384.json"
+ },
+ {
+  "seq": "386",
+  "method": "POST",
+  "url": "/client/game/keepalive",
+  "reqlen": 27,
+  "requestId": "160",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "386.json"
+ },
+ {
+  "seq": "388",
+  "method": "POST",
+  "url": "/client/profile/status",
+  "reqlen": 22,
+  "requestId": "161",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "388.json"
+ },
+ {
+  "seq": "390",
+  "method": "POST",
+  "url": "/client/getMetricsConfig",
+  "reqlen": 28,
+  "requestId": "162",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "390.json"
+ },
+ {
+  "seq": "394",
+  "method": "POST",
+  "url": "/client/putLoadMetrics",
+  "reqlen": 102,
+  "requestId": "163",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "394.json"
+ },
+ {
+  "seq": "398",
+  "method": "POST",
+  "url": "/client/game/profile/list",
+  "reqlen": 18,
+  "requestId": "165",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "398.json"
+ },
+ {
+  "seq": "399",
+  "method": "POST",
+  "url": "/client/putMetrics",
+  "reqlen": 1423,
+  "requestId": "164",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "399.json"
+ },
+ {
+  "seq": "402",
+  "method": "POST",
+  "url": "/client/libraries-extra",
+  "reqlen": 7980,
+  "requestId": null,
+  "ifNoneMatch": false,
+  "kind": "redacted",
+  "note": "carries an account token or a machine fingerprint; not checked in"
+ },
+ {
+  "seq": "404",
+  "method": "POST",
+  "url": "/client/game/keepalive",
+  "reqlen": 25,
+  "requestId": "166",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "404.json"
+ },
+ {
+  "seq": "418",
+  "method": "GET",
+  "url": "/client/customization",
+  "reqlen": 0,
+  "requestId": "168",
+  "ifNoneMatch": true,
+  "kind": "empty"
+ },
+ {
+  "seq": "420",
+  "method": "GET",
+  "url": "/client/variable/group",
+  "reqlen": 0,
+  "requestId": "175",
+  "ifNoneMatch": true,
+  "kind": "empty"
+ },
+ {
+  "seq": "421",
+  "method": "GET",
+  "url": "/client/trading/api/traderSettings",
+  "reqlen": 0,
+  "requestId": "171",
+  "ifNoneMatch": false,
+  "kind": "empty"
+ },
+ {
+  "seq": "422",
+  "method": "GET",
+  "url": "/client/quest/getMainQuestsList",
+  "reqlen": 0,
+  "requestId": "173",
+  "ifNoneMatch": true,
+  "kind": "empty"
+ },
+ {
+  "seq": "423",
+  "method": "GET",
+  "url": "/client/prestige/list",
+  "reqlen": 0,
+  "requestId": "172",
+  "ifNoneMatch": true,
+  "kind": "empty"
+ },
+ {
+  "seq": "424",
+  "method": "GET",
+  "url": "/client/globals",
+  "reqlen": 0,
+  "requestId": "169",
+  "ifNoneMatch": true,
+  "kind": "empty"
+ },
+ {
+  "seq": "425",
+  "method": "GET",
+  "url": "/client/quest/getMainQuestNotesList",
+  "reqlen": 0,
+  "requestId": "174",
+  "ifNoneMatch": true,
+  "kind": "empty"
+ },
+ {
+  "seq": "426",
+  "method": "GET",
+  "url": "/client/items",
+  "reqlen": 0,
+  "requestId": "167",
+  "ifNoneMatch": true,
+  "kind": "empty"
+ },
+ {
+  "seq": "427",
+  "method": "GET",
+  "url": "/client/subtitle-track/list",
+  "reqlen": 0,
+  "requestId": "178",
+  "ifNoneMatch": true,
+  "kind": "empty"
+ },
+ {
+  "seq": "428",
+  "method": "GET",
+  "url": "/client/tape/list",
+  "reqlen": 0,
+  "requestId": "177",
+  "ifNoneMatch": true,
+  "kind": "empty"
+ },
+ {
+  "seq": "429",
+  "method": "GET",
+  "url": "/client/dialogue",
+  "reqlen": 0,
+  "requestId": "176",
+  "ifNoneMatch": true,
+  "kind": "empty"
+ },
+ {
+  "seq": "430",
+  "method": "POST",
+  "url": "/client/seasonal-perks/list",
+  "reqlen": 20,
+  "requestId": "179",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "430.json"
+ },
+ {
+  "seq": "434",
+  "method": "GET",
+  "url": "/client/settings",
+  "reqlen": 0,
+  "requestId": "170",
+  "ifNoneMatch": false,
+  "kind": "empty"
+ },
+ {
+  "seq": "438",
+  "method": "POST",
+  "url": "/client/season/active",
+  "reqlen": 26,
+  "requestId": "180",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "438.json"
+ },
+ {
+  "seq": "440",
+  "method": "GET",
+  "url": "/client/handbook/templates",
+  "reqlen": 0,
+  "requestId": "182",
+  "ifNoneMatch": true,
+  "kind": "empty"
+ },
+ {
+  "seq": "441",
+  "method": "POST",
+  "url": "/client/builds/list",
+  "reqlen": 27,
+  "requestId": "183",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "441.json"
+ },
+ {
+  "seq": "442",
+  "method": "POST",
+  "url": "/client/friends",
+  "reqlen": 22,
+  "requestId": "185",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "442.json"
+ },
+ {
+  "seq": "443",
+  "method": "GET",
+  "url": "/client/achievement/statistic",
+  "reqlen": 0,
+  "requestId": "186",
+  "ifNoneMatch": true,
+  "kind": "empty"
+ },
+ {
+  "seq": "444",
+  "method": "POST",
+  "url": "/client/quest/list",
+  "reqlen": 46,
+  "requestId": "184",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "444.json"
+ },
+ {
+  "seq": "445",
+  "method": "POST",
+  "url": "/client/weather",
+  "reqlen": 23,
+  "requestId": "188",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "445.json"
+ },
+ {
+  "seq": "446",
+  "method": "POST",
+  "url": "/client/battle-pass/active",
+  "reqlen": 21,
+  "requestId": "181",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "446.json"
+ },
+ {
+  "seq": "451",
+  "method": "POST",
+  "url": "/client/ending/list",
+  "reqlen": 18,
+  "requestId": "189",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "451.json"
+ },
+ {
+  "seq": "452",
+  "method": "GET",
+  "url": "/client/locations",
+  "reqlen": 0,
+  "requestId": "190",
+  "ifNoneMatch": true,
+  "kind": "empty"
+ },
+ {
+  "seq": "453",
+  "method": "GET",
+  "url": "/client/achievement/list?completed=True",
+  "reqlen": 0,
+  "requestId": "187",
+  "ifNoneMatch": true,
+  "kind": "empty"
+ },
+ {
+  "seq": "454",
+  "method": "POST",
+  "url": "/client/tutor-game/check",
+  "reqlen": 46,
+  "requestId": "191",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "454.json"
+ },
+ {
+  "seq": "457",
+  "method": "POST",
+  "url": "/client/customization/storage",
+  "reqlen": 19,
+  "requestId": "192",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "457.json"
+ },
+ {
+  "seq": "458",
+  "method": "POST",
+  "url": "/client/mail/dialog/list",
+  "reqlen": 46,
+  "requestId": "193",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "458.json"
+ },
+ {
+  "seq": "460",
+  "method": "POST",
+  "url": "/client/quest/chains",
+  "reqlen": 20,
+  "requestId": "194",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "460.json"
+ },
+ {
+  "seq": "462",
+  "method": "POST",
+  "url": "/client/repeatalbeQuests/activityPeriods",
+  "reqlen": 26,
+  "requestId": "195",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "462.json"
+ },
+ {
+  "seq": "465",
+  "method": "POST",
+  "url": "/client/putLoadMetrics",
+  "reqlen": 103,
+  "requestId": "196",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "465.json"
+ },
+ {
+  "seq": "466",
+  "method": "POST",
+  "url": "/client/game/profile/select",
+  "reqlen": 61,
+  "requestId": "197",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "466.json"
+ },
+ {
+  "seq": "468",
+  "method": "POST",
+  "url": "/client/profile/status",
+  "reqlen": 22,
+  "requestId": "198",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "468.json"
+ },
+ {
+  "seq": "470",
+  "method": "POST",
+  "url": "/client/game/profile/items/moving",
+  "reqlen": 275,
+  "requestId": "199",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "470.json"
+ },
+ {
+  "seq": "472",
+  "method": "POST",
+  "url": "/client/game/profile/list",
+  "reqlen": 23,
+  "requestId": "200",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "472.json"
+ },
+ {
+  "seq": "474",
+  "method": "POST",
+  "url": "/client/game/profile/select",
+  "reqlen": 52,
+  "requestId": "201",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "474.json"
+ },
+ {
+  "seq": "476",
+  "method": "POST",
+  "url": "/client/profile/status",
+  "reqlen": 24,
+  "requestId": "202",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "476.json"
+ },
+ {
+  "seq": "482",
+  "method": "GET",
+  "url": "/client/hideout/settings",
+  "reqlen": 0,
+  "requestId": "203",
+  "ifNoneMatch": true,
+  "kind": "empty"
+ },
+ {
+  "seq": "483",
+  "method": "GET",
+  "url": "/client/hideout/customization/offer/list",
+  "reqlen": 0,
+  "requestId": "206",
+  "ifNoneMatch": false,
+  "kind": "empty"
+ },
+ {
+  "seq": "484",
+  "method": "GET",
+  "url": "/client/hideout/qte/list",
+  "reqlen": 0,
+  "requestId": "204",
+  "ifNoneMatch": true,
+  "kind": "empty"
+ },
+ {
+  "seq": "485",
+  "method": "GET",
+  "url": "/client/hideout/areas",
+  "reqlen": 0,
+  "requestId": "205",
+  "ifNoneMatch": false,
+  "kind": "empty"
+ },
+ {
+  "seq": "486",
+  "method": "GET",
+  "url": "/client/hideout/production/recipes",
+  "reqlen": 0,
+  "requestId": "207",
+  "ifNoneMatch": true,
+  "kind": "empty"
+ },
+ {
+  "seq": "491",
+  "method": "POST",
+  "url": "/client/profile/status",
+  "reqlen": 25,
+  "requestId": "209",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "491.json"
+ },
+ {
+  "seq": "492",
+  "method": "POST",
+  "url": "/client/notifier/channel/create",
+  "reqlen": 19,
+  "requestId": "208",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "492.json"
+ },
+ {
+  "seq": "493",
+  "method": "POST",
+  "url": "/client/server/list",
+  "reqlen": 20,
+  "requestId": "210",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "493.json"
+ },
+ {
+  "seq": "494",
+  "method": "POST",
+  "url": "/client/match/group/current",
+  "reqlen": 26,
+  "requestId": "211",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "494.json"
+ },
+ {
+  "seq": "499",
+  "method": "POST",
+  "url": "/client/match/group/current",
+  "reqlen": 21,
+  "requestId": "212",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "499.json"
+ },
+ {
+  "seq": "500",
+  "method": "POST",
+  "url": "/client/survey",
+  "reqlen": 27,
+  "requestId": "213",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "500.json"
+ },
+ {
+  "seq": "501",
+  "method": "POST",
+  "url": "/v2/client/shop/status",
+  "reqlen": 22,
+  "requestId": "214",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "501.json"
+ },
+ {
+  "seq": "502",
+  "method": "POST",
+  "url": "/client/putLoadMetrics",
+  "reqlen": 110,
+  "requestId": "215",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "502.json"
+ },
+ {
+  "seq": "504",
+  "method": "POST",
+  "url": "/client/match/group/invite/cancel-all",
+  "reqlen": 23,
+  "requestId": "216",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "504.json"
+ },
+ {
+  "seq": "506",
+  "method": "POST",
+  "url": "/client/game/logout",
+  "reqlen": 18,
+  "requestId": "217",
+  "ifNoneMatch": false,
+  "kind": "wrapped-zlib",
+  "file": "506.json"
+ }
+]

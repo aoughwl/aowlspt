@@ -725,8 +725,10 @@ and `akFloat` for a damage amount are classifications, and against the old mock
 neither could have been made at all.
 
 **The binding half** is exercised against `tests/mockil2cpp`, a runtime
-implementing the same C API over a small type universe. Point `selfTestRuntime`
-in `config.json` at its `GameAssembly.dll` (`aowl test` builds it). Three
+implementing the same C API over a small type universe. `aowl test` and `aowl
+run` build it and hand it over in `AOWLSPT_SELFTEST_RUNTIME`; `selfTestRuntime`
+in `config.json` does the same for a runtime of your own, as an **absolute**
+path only — that key ships into installs, so a relative one is refused. Three
 things are checked there, and they are the three that matter about a file whose
 whole content is names from a build nobody has seen:
 

@@ -13,158 +13,51 @@
 ##
 ## It refuses to launch a client the host cannot work in, and says why, rather
 ## than starting a game that will quietly have no mods in it.
+##
+## ---------------------------------------------------------------------------
+## This is the front end
+## ---------------------------------------------------------------------------
+##
+## There is no GUI launcher and there is not going to be one, so the console is
+## the whole of the interface: it checks the install, starts the server, asks
+## which profile to play, starts the game, and then becomes a live view of the
+## two logs. Those four phases are `bootView`, `pickProfile`, `clientView` and
+## `runLogView` below, and each of them has one rule in common.
+##
+## **Nothing on the screen advances on a timer.** Every mark that fills in is a
+## fact that was observed: the port answered, the backend's own log said
+## `listening on 127.0.0.1:6970`, the log said `3 mod(s) selected` and then said
+## `loaded` three times, `CreateProcess` returned, the injected host wrote
+## `host running`. A spinner that turns while nothing happens is worse than no
+## spinner, because it is a claim -- and the failure this launcher exists to
+## make legible is precisely "it looks like it is working and it is not". Where
+## something cannot be known, the screen says so and shows the last log line
+## instead of inventing a percentage.
+##
+## The other rule is that all four phases degrade. `aowlterm` decides whether
+## this is a VT console, a console without VT, or not a console at all; the
+## views ask it and take one of three paths. A launcher whose output is being
+## redirected into a file for somebody to read on Discord must produce a file
+## with no escape codes in it, and a launcher in an 80x10 window must produce
+## something legible in an 80x10 window. Both are checked in `runLogView`.
 
 import std/[strutils, syncio, cmdline]
 import aowlsptinstall/[winfs, log, eft]
+import "../host/common/jsonpath"
+import aowlterm
+import aowlsession
 
 {.emit: """#include <stdlib.h>""".}
 {.emit: """#include <string.h>""".}
 {.emit: """#include "aowlspt_shim.h" """.}
 {.emit: """#include "aowlspt_inject.h" """.}
 
-# ---------------------------------------------------------------------------
-# Asking the backend whether it is ready
-# ---------------------------------------------------------------------------
-#
-# This used to be `Sleep(1200)` and a liveness check, and a fixed sleep is wrong
-# at both ends of the range it is trying to cover. On a machine where the
-# backend is up in 600 ms it wastes half a second of every launch. On the
-# machine this was measured on it was **fifty-two seconds short**: the default
-# mod set against an imported database took 54 s to answer, so the client came
-# up, asked for `/client/game/config`, got nothing, and sat at the menu with
-# neither log saying why. No constant fixes that, because what is being waited
-# for is not a duration -- it is an event, and the event is observable.
-#
-# It is observable *exactly*, as it happens. `aowlspt-backend` calls
-# `aowl_net_serve` only after `loadAll` returns, so the listening socket does
-# not exist until every mod has finished loading. A successful connect is
-# therefore not an approximation of readiness; it is readiness. The GET on top
-# of it is the second half of the same question -- listening is not answering,
-# and a server that has bound the port but cannot route is a state worth
-# telling apart from one that can.
-#
-# ## Why winsock is loaded at run time
-#
-# `aowl build` builds this file with `buildTool`, which passes the ABI include
-# path and both source trees and does **not** pass `-lws2_32`. That rule lives
-# in `tools/aowl.nim`, which this file does not own, and a change there would
-# have to be made for every tool built by the same rule. `GetProcAddress` costs
-# eight lookups once per launch and needs nothing from the build.
-#
-# The declarations come from `<windows.h>`, which has already pulled in
-# `winsock.h` by the time this compiles. `aowlspt_net.h` is deliberately *not*
-# included: it includes `winsock2.h`, and winsock2 after windows.h is the
-# redefinition mess every Windows codebase meets once. Winsock 1.1 has a TCP
-# connect, which is all of what is wanted here.
-
 {.emit: """
-typedef SOCKET (WINAPI *aowl_fn_socket)(int, int, int);
-typedef int (WINAPI *aowl_fn_connect)(SOCKET, const struct sockaddr*, int);
-typedef int (WINAPI *aowl_fn_send)(SOCKET, const char*, int, int);
-typedef int (WINAPI *aowl_fn_recv)(SOCKET, char*, int, int);
-typedef int (WINAPI *aowl_fn_closesocket)(SOCKET);
-typedef int (WINAPI *aowl_fn_setsockopt)(SOCKET, int, int, const char*, int);
-typedef int (WINAPI *aowl_fn_wsastartup)(WORD, LPWSADATA);
-typedef u_short (WINAPI *aowl_fn_htons)(u_short);
-typedef u_long (WINAPI *aowl_fn_htonl)(u_long);
-
-static HMODULE aowl_ws = NULL;
-static aowl_fn_socket      aowl_p_socket;
-static aowl_fn_connect     aowl_p_connect;
-static aowl_fn_send        aowl_p_send;
-static aowl_fn_recv        aowl_p_recv;
-static aowl_fn_closesocket aowl_p_closesocket;
-static aowl_fn_setsockopt  aowl_p_setsockopt;
-static aowl_fn_htons       aowl_p_htons;
-static aowl_fn_htonl       aowl_p_htonl;
-
-/* Resolved once. Returns 0 when winsock is not there at all, which is not a
- * state a Windows machine reaches -- but a probe that cannot tell "no answer"
- * from "no sockets" would report a working backend as broken. */
-static int aowl_ws_ready(void) {
-  aowl_fn_wsastartup startup;
-  WSADATA wsa;
-  if (aowl_ws != NULL) return 1;
-  aowl_ws = LoadLibraryA("ws2_32.dll");
-  if (aowl_ws == NULL) return 0;
-  startup            = (aowl_fn_wsastartup)(void*)GetProcAddress(aowl_ws, "WSAStartup");
-  aowl_p_socket      = (aowl_fn_socket)(void*)GetProcAddress(aowl_ws, "socket");
-  aowl_p_connect     = (aowl_fn_connect)(void*)GetProcAddress(aowl_ws, "connect");
-  aowl_p_send        = (aowl_fn_send)(void*)GetProcAddress(aowl_ws, "send");
-  aowl_p_recv        = (aowl_fn_recv)(void*)GetProcAddress(aowl_ws, "recv");
-  aowl_p_closesocket = (aowl_fn_closesocket)(void*)GetProcAddress(aowl_ws, "closesocket");
-  aowl_p_setsockopt  = (aowl_fn_setsockopt)(void*)GetProcAddress(aowl_ws, "setsockopt");
-  aowl_p_htons       = (aowl_fn_htons)(void*)GetProcAddress(aowl_ws, "htons");
-  aowl_p_htonl       = (aowl_fn_htonl)(void*)GetProcAddress(aowl_ws, "htonl");
-  if (startup == NULL || aowl_p_socket == NULL || aowl_p_connect == NULL ||
-      aowl_p_send == NULL || aowl_p_recv == NULL ||
-      aowl_p_closesocket == NULL || aowl_p_setsockopt == NULL ||
-      aowl_p_htons == NULL || aowl_p_htonl == NULL) {
-    aowl_ws = NULL;
-    return 0;
-  }
-  if (startup(MAKEWORD(2, 2), &wsa) != 0) {
-    aowl_ws = NULL;
-    return 0;
-  }
-  return 1;
-}
-
-/* 0  nothing is listening on the port yet
- * 1  connected, and an HTTP response came back
- * -1 winsock could not be loaded, so this cannot be asked at all
- *
- * The session cookie is a well-formed 24-character id because the backend
- * refuses a malformed one before any route sees it. It does not have to name a
- * real profile: what is being established is that the server parses a request
- * and answers, and any status line proves that. Matching on `HTTP/` rather than
- * on the body, because the body comes back zlib-framed and inflating it here
- * would mean linking zlib for one comparison. */
-static int aowl_backend_answers(int32_t port) {
-  SOCKET s;
-  struct sockaddr_in a;
-  const char *req;
-  char buf[64];
-  int n;
-  DWORD t;
-  if (!aowl_ws_ready()) return -1;
-  s = aowl_p_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
-  if (s == INVALID_SOCKET) return 0;
-  memset(&a, 0, sizeof(a));
-  a.sin_family = AF_INET;
-  a.sin_port = aowl_p_htons((unsigned short)port);
-  a.sin_addr.s_addr = aowl_p_htonl(INADDR_LOOPBACK);
-  if (aowl_p_connect(s, (struct sockaddr*)&a, (int)sizeof(a)) == SOCKET_ERROR) {
-    aowl_p_closesocket(s);
-    return 0;
-  }
-  /* Bounded, because a backend mid-flush holds the database lock and a probe
-   * that blocks for ever on it would hang the launcher rather than the poll. */
-  t = 3000;
-  aowl_p_setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&t, sizeof(t));
-  req = "GET /aowlspt/status HTTP/1.1\r\n"
-        "Host: 127.0.0.1\r\n"
-        "Cookie: PHPSESSID=000000000000000000000001\r\n"
-        "Content-Length: 0\r\n"
-        "Connection: close\r\n\r\n";
-  if (aowl_p_send(s, req, (int)strlen(req), 0) == SOCKET_ERROR) {
-    aowl_p_closesocket(s);
-    return 0;
-  }
-  memset(buf, 0, sizeof(buf));
-  n = aowl_p_recv(s, buf, (int)sizeof(buf) - 1, 0);
-  aowl_p_closesocket(s);
-  if (n <= 0) return 0;
-  return (strstr(buf, "HTTP/") != NULL) ? 1 : 0;
-}
-
 static int64_t aowl_launch_now_ms(void) {
   return (int64_t)GetTickCount64();
 }
 """.}
 
-proc cBackendAnswers(port: int32): int32 {.
-  importc: "aowl_backend_answers", nodecl.}
 proc cNowMs(): int64 {.importc: "aowl_launch_now_ms", nodecl.}
 
 type LaunchPtr = nil pointer
@@ -185,9 +78,47 @@ proc cLaunchWait(p: LaunchPtr; ms: int32): int32 {.
   importc: "aowl_launch_wait", nodecl.}
 proc cSpawn(exe, workDir, cmdLine: cstring): uint64 {.
   importc: "aowl_spawn", nodecl.}
+proc cSpawnQuiet(exe, workDir, cmdLine: cstring): uint64 {.
+  importc: "aowl_spawn_quiet", nodecl.}
 proc cSpawnAlive(h: uint64): int32 {.importc: "aowl_spawn_alive", nodecl.}
 proc cSpawnKill(h: uint64) {.importc: "aowl_spawn_kill", nodecl.}
 proc cSleepMs(ms: int32) {.importc: "aowl_sys_sleep", nodecl.}
+
+# ---------------------------------------------------------------------------
+# Which port the client will actually talk to
+# ---------------------------------------------------------------------------
+#
+# The launcher does not get to choose this. `aowlspt/backend.json` is what the
+# **client** reads -- the installer writes it, naming the backend it installed,
+# and the game asks that url for everything. So the port this launcher starts a
+# backend on is not a preference of the launcher's: it is a fact about the
+# install, and reading it from anywhere else is how the two came to disagree.
+#
+# What that cost, on a real playtest: an install whose `backend.json` said 6970,
+# and a launcher whose default was a *hardcoded* 6969. It started its backend on
+# 6969, told the player so, and the client went to 6970. On that machine 6969 is
+# a stock SPT server, so the launcher's backend sat there unused while the whole
+# session talked to somebody else's server. Nothing said so.
+#
+# `--port N` is therefore checked rather than obeyed. A port that disagrees with
+# `backend.json` is refused outright, because there is no reading of it that
+# ends well: it starts a server the client will not use, and leaves the client
+# talking to whatever else happens to hold the port it does use. Saying so and
+# stopping is the only honest answer. `--allow-port-mismatch` is the way to mean
+# it anyway -- a separate flag rather than `--force`, which is about the client
+# being the wrong runtime and would be given for entirely unrelated reasons.
+#
+# The scheme also decides the transport. A post-1.0 client talks HTTPS on a
+# hardcoded 443, so `https://` in `backend.json` means the backend is started
+# with `--tls` and the client is handed an https url; `http://` is plain, for
+# development and the tests. Both the port and the scheme come from that one
+# url, parsed once in `aowlsession.parseBackendUrl` -- the same reader the rest
+# of this uses, so the launcher and the file cannot come to disagree about
+# either. That parser also fixes the "last run of digits" rule that read the
+# `1` out of `https://127.0.0.1/` and called it a port.
+
+proc backendJsonPath(root: string): string =
+  joinPath(root, "aowlspt\\backend.json")
 
 const Usage = """
 aowlspt-launch -- start Tarkov with the aowlspt host inside it
@@ -197,16 +128,47 @@ aowlspt-launch -- start Tarkov with the aowlspt host inside it
 Options
   --root PATH    the aowlspt install (default: the directory this exe is in)
   --exe NAME     executable to start (default: EscapeFromTarkov.exe)
-  --args "..."   extra command line for the game
+  --args "..."   extra command line for the game, appended to the one this
+                 builds from backend.json and the chosen profile
+  --profile ID   play this profile id and do not ask
+  --new NAME     create a profile called NAME and play it
+  --side SIDE    Usec or Bear, for --new (default Usec)
+  --no-profile   start the client with no -token, so it logs in on its own
   --wait         stay open until the game exits
   --no-backend   do not start the backend server
-  --port N       backend port (default 6969)
+  --no-logs      do not show the live log view; exit once the game is up
+  --logs         start nothing: open the log view on this install's two logs.
+                 For watching a session somebody else started -- `q` closes
+                 this window and stops nothing.
+  --client-window
+                 open a second console window for the client log as well
+  --port N       backend port. Normally read from backend.json's backendUrl --
+                 the one the client talks to. An explicit :PORT in that url
+                 wins; otherwise the default is by scheme: 443 for https, 6969
+                 for http. A --port that disagrees is refused rather than
+                 obeyed, and in TLS mode a --port other than 443 is warned
+                 about, because the client hardcodes 443.
+  --allow-port-mismatch
+                 start the backend on a --port backend.json disagrees with
+                 anyway. The client will still use backend.json's port.
   --backend-wait N
                  seconds to wait for the backend to answer before starting the
                  client (default 300, 0 to not wait at all)
+  --plain        no cursor movement, no colour, no repainting: one line per
+                 thing that happened. Redirected output is always this.
+  --ascii        box drawing in ASCII, for a console font with no line glyphs
   --dry-run      report what would happen and start nothing
   --force        launch even if the client looks wrong for this host
   -h, --help     this
+
+Transport is read from backend.json's backendUrl: https:// starts the backend
+with --tls (HTTPS, what a real post-1.0 client needs) and hands the client an
+https url; http:// is plain, for development and the tests.
+
+Inside the log view
+  q  stop the backend and quit      d  detach, leaving everything running
+  tab  swap the focused pane        f  give the focused pane the whole window
+  space  pause following            pgup/pgdn, up/down, home/end  scroll
 """
 
 type
@@ -217,14 +179,37 @@ type
     wait: bool
     force: bool
     noBackend: bool
+    noLogs: bool
+    logsOnly: bool
+    clientWindow: bool
+    plain: bool
+    ascii: bool
+    profileId: string
+    newProfile: string
+    side: string
+    noProfile: bool
     port: int
+      ## Only meaningful when `portGiven`. The port actually used is resolved
+      ## in `main`, once `root` is known and `backend.json` can be read.
+    portGiven: bool
+    allowPortMismatch: bool
     backendWait: int
+    tailPath: string
+      ## `--tail`: this process is a second console window showing one log.
+      ## Not in the usage text because nobody types it; see `--client-window`.
+    tailTitle: string
     help: bool
 
 proc parseArgs(): Options =
   result = Options(root: "", exeName: "EscapeFromTarkov.exe", extraArgs: "",
-                   wait: false, force: false, noBackend: false, port: 6969,
-                   backendWait: 300, help: false)
+                   wait: false, force: false, noBackend: false, noLogs: false,
+                   logsOnly: false,
+                   clientWindow: false, plain: false, ascii: false,
+                   profileId: "", newProfile: "", side: "Usec",
+                   noProfile: false, port: 0,
+                   portGiven: false, allowPortMismatch: false,
+                   backendWait: 300, tailPath: "", tailTitle: "log",
+                   help: false)
   var i = 1
   let n = paramCount()
   while i <= n:
@@ -238,10 +223,37 @@ proc parseArgs(): Options =
     elif a == "--args":
       inc i
       if i <= n: result.extraArgs = paramStr(i)
+    elif a == "--profile":
+      inc i
+      if i <= n: result.profileId = paramStr(i)
+    elif a == "--new":
+      inc i
+      if i <= n: result.newProfile = paramStr(i)
+    elif a == "--side":
+      inc i
+      if i <= n: result.side = paramStr(i)
+    elif a == "--tail":
+      inc i
+      if i <= n: result.tailPath = paramStr(i)
+    elif a == "--tail-title":
+      inc i
+      if i <= n: result.tailTitle = paramStr(i)
+    elif a == "--no-profile":
+      result.noProfile = true
     elif a == "--wait":
       result.wait = true
     elif a == "--no-backend":
       result.noBackend = true
+    elif a == "--no-logs":
+      result.noLogs = true
+    elif a == "--logs":
+      result.logsOnly = true
+    elif a == "--client-window":
+      result.clientWindow = true
+    elif a == "--plain":
+      result.plain = true
+    elif a == "--ascii":
+      result.ascii = true
     elif a == "--port":
       inc i
       if i <= n:
@@ -251,7 +263,11 @@ proc parseArgs(): Options =
           if ch >= '0' and ch <= '9':
             v = v * 10 + (ord(ch) - ord('0'))
             any = true
-        if any: result.port = v
+        if any:
+          result.port = v
+          result.portGiven = true
+    elif a == "--allow-port-mismatch":
+      result.allowPortMismatch = true
     elif a == "--backend-wait":
       inc i
       if i <= n:
@@ -274,10 +290,1063 @@ proc parseArgs(): Options =
       result.root = a
     inc i
 
+# ---------------------------------------------------------------------------
+# Small formatting
+# ---------------------------------------------------------------------------
+
+proc secsText(ms: int64): string =
+  ## `4.2s`, `1m 04s`. Tenths below a minute because that is the range in which
+  ## a difference of a tenth is something the reader is watching for.
+  if ms < 0'i64: return "0.0s"
+  if ms < 60000'i64:
+    let tenths = int(ms div 100'i64)
+    return $(tenths div 10) & "." & $(tenths mod 10) & "s"
+  let secs = int(ms div 1000'i64)
+  let m = secs div 60
+  let s = secs mod 60
+  result = $m & "m " & (if s < 10: "0" else: "") & $s & "s"
+
+proc sizeText(bytes: int64): string =
+  if bytes <= 0'i64: return "0 B"
+  if bytes < 1024'i64: return $int(bytes) & " B"
+  if bytes < 1048576'i64: return $int(bytes div 1024'i64) & " KB"
+  let mb10 = int(bytes div 104858'i64)
+  result = $(mb10 div 10) & "." & $(mb10 mod 10) & " MB"
+
+const
+  MarkDone = 0
+  MarkActive = 1
+  MarkPending = 2
+  MarkFailed = 3
+
+proc markGlyph(kind: int): string =
+  if termAscii():
+    case kind
+    of MarkDone: "ok"
+    of MarkActive: ">>"
+    of MarkFailed: "!!"
+    else: "  "
+  else:
+    case kind
+    of MarkDone: "✔ "
+    of MarkActive: "▸ "
+    of MarkFailed: "✖ "
+    else: "  "
+
+proc markColour(kind: int): int =
+  case kind
+  of MarkDone: ColGreen
+  of MarkActive: ColCyan
+  of MarkFailed: ColRed
+  else: ColDim
+
+proc stepRow(kind: int; name, detail: string; width: int): Row =
+  result = newRow()
+  result.put "  "
+  result.putIn markColour(kind), markGlyph(kind)
+  result.put " "
+  result.putIn (if kind == MarkPending: ColDim else: ColDefault), name
+  result.padTo 20
+  let room = width - result.width - 2
+  if room > 4 and detail.len > 0:
+    result.putIn (if kind == MarkFailed: ColRed else: ColDim), fit(detail, room)
+
+proc logRow(l: LogLine; width: int): Row =
+  result = newRow()
+  result.put "  "
+  if l.stamp.len > 0:
+    result.putIn ColDim, fit(l.stamp, 9)
+    result.padTo 12
+  let name = levelName(l.level)
+  if name.len > 0:
+    result.putIn levelOf(l.level), name
+  result.padTo (if l.stamp.len > 0: 18 else: 8)
+  let room = width - result.width - 1
+  if room > 4:
+    result.putIn (if l.level == lvError: ColRed else: ColDefault),
+                 fit(l.text, room)
+
+# ---------------------------------------------------------------------------
+# What the backend's own log says about how far it has got
+# ---------------------------------------------------------------------------
+#
+# Every field here is read out of a sentence the backend wrote about itself.
+# Nothing is inferred from elapsed time, and the two numbers that make a
+# progress bar -- how many mods are being loaded and how many have loaded --
+# both come from the log rather than from counting DLLs on disk. Counting the
+# files would have been easy and would have been wrong: an install with eleven
+# mod libraries and three selected loads three, and a bar that filled to 3/11
+# and stopped would read as a hang.
+
+type
+  BootState = object
+    portFree: bool
+    dbBytes: int64
+    dbLoaded: bool
+    modsTotal: int
+    modsTotalKnown: bool
+    modsLoaded: int
+    lastLoaded: string
+    listening: bool
+    errors: int
+    lastError: string
+
+proc numberBefore(text, phrase: string): int =
+  ## The number immediately in front of `phrase`, as in `3 mod(s) selected`.
+  result = 0
+  let at = find(text, phrase)
+  if at <= 0: return
+  var i = at - 1
+  while i >= 0 and text[i] == ' ': dec i
+  var digits = ""
+  while i >= 0 and text[i] >= '0' and text[i] <= '9':
+    digits = $text[i] & digits
+    dec i
+  for ch in digits:
+    result = result * 10 + (ord(ch) - ord('0'))
+
+proc scanBoot(t: Tail): BootState =
+  result = BootState(portFree: false, dbBytes: 0'i64, dbLoaded: false,
+                     modsTotal: 0, modsTotalKnown: false, modsLoaded: 0,
+                     lastLoaded: "", listening: false, errors: 0,
+                     lastError: "")
+  for l in t.lines:
+    let s = l.text
+    if l.level == lvError:
+      inc result.errors
+      result.lastError = s
+    if startsWith(s, "port ") and find(s, "is free") > 0:
+      result.portFree = true
+    elif startsWith(s, "database loaded from"):
+      result.dbLoaded = true
+      let open = find(s, "(")
+      if open > 0:
+        var v = 0'i64
+        var i = open + 1
+        while i < s.len and s[i] >= '0' and s[i] <= '9':
+          v = v * 10'i64 + int64(ord(s[i]) - ord('0'))
+          inc i
+        result.dbBytes = v
+    elif find(s, "mod(s) selected") > 0:
+      result.modsTotal = numberBefore(s, "mod(s) selected")
+      result.modsTotalKnown = true
+    elif startsWith(s, "loaded ") and l.level == lvOk:
+      inc result.modsLoaded
+      result.lastLoaded = s.substr(len("loaded "))
+    elif startsWith(s, "listening on"):
+      result.listening = true
+
+# ---------------------------------------------------------------------------
+# What the injected host's log says
+# ---------------------------------------------------------------------------
+
+type
+  HostState = object
+    wroteAnything: bool
+    guardAnswered: bool
+    runtimeUp: bool
+    running: bool
+    modsLoaded: int
+    errors: int
+    lastError: string
+
+proc scanHost(t: Tail): HostState =
+  result = HostState(wroteAnything: t.lines.len > 0, guardAnswered: false,
+                     runtimeUp: false, running: false, modsLoaded: 0,
+                     errors: 0, lastError: "")
+  for l in t.lines:
+    let s = l.text
+    if l.level == lvError:
+      inc result.errors
+      result.lastError = s
+    if find(s, "BattlEye") > 0 and find(s, "guard") > 0:
+      result.guardAnswered = true
+    elif find(s, "IL2CPP is up after") >= 0 or
+         find(s, "IL2CPP runtime bound") >= 0:
+      result.runtimeUp = true
+    elif startsWith(s, "host running"):
+      result.running = true
+    elif startsWith(s, "loaded ") and l.level == lvOk:
+      inc result.modsLoaded
+
+# ---------------------------------------------------------------------------
+# The boot view
+# ---------------------------------------------------------------------------
+
+proc bootRows(b: BootState; answered: bool; elapsed: int64; port: int;
+              tls: bool; t: Tail; width, logRows: int): seq[Row] =
+  result = @[]
+  var head = newRow()
+  head.put "  "
+  head.putIn ColWhite, "starting the server"
+  head.padTo width - 10
+  head.putIn ColDim, secsText(elapsed)
+  result.add head
+  result.add newRow()
+
+  result.add stepRow((if b.portFree: MarkDone else: MarkActive),
+                     "port " & $port,
+                     (if b.portFree: "claimed" else: "asking for it"), width)
+
+  let dbMark =
+    if b.dbLoaded: MarkDone
+    elif b.portFree: MarkActive
+    else: MarkPending
+  result.add stepRow(dbMark, "database",
+                     (if b.dbLoaded: sizeText(b.dbBytes) & " read" else: ""),
+                     width)
+
+  var modMark = MarkPending
+  if b.dbLoaded: modMark = MarkActive
+  if b.modsTotalKnown and b.modsLoaded >= b.modsTotal and b.modsTotal > 0:
+    modMark = MarkDone
+  var modDetail = ""
+  if b.modsTotalKnown:
+    let barWidth = 14
+    var filled = 0
+    if b.modsTotal > 0:
+      filled = (b.modsLoaded * barWidth) div b.modsTotal
+    modDetail = bar(filled, barWidth) & "  " & $b.modsLoaded & " of " &
+                $b.modsTotal
+    if b.lastLoaded.len > 0 and modMark == MarkActive:
+      modDetail.add "   " & b.lastLoaded
+  elif b.dbLoaded:
+    # The count is not knowable yet, and a bar drawn against a guess is the one
+    # thing this view will not do.
+    modDetail = "reading the load order"
+  result.add stepRow(modMark, "mods", modDetail, width)
+
+  result.add stepRow((if b.listening: MarkDone
+                      elif modMark == MarkDone: MarkActive
+                      else: MarkPending),
+                     "listening",
+                     (if b.listening: "127.0.0.1:" & $port &
+                        (if tls: " (TLS)" else: "") else: ""), width)
+  # In TLS mode the launcher cannot probe HTTPS, so readiness *is* the backend's
+  # own "listening" line rather than a request coming back -- and the label says
+  # which, so a green tick never claims more than was actually observed.
+  result.add stepRow((if answered: MarkDone
+                      elif b.listening: MarkActive
+                      else: MarkPending),
+                     (if tls: "ready" else: "answering"),
+                     (if answered:
+                        (if tls: "the backend logged it is listening on TLS"
+                         else: "/aowlspt/tarkov/selfcheck came back")
+                      else: ""), width)
+  if b.errors > 0:
+    result.add stepRow(MarkFailed, $b.errors & " error(s)", b.lastError, width)
+
+  if logRows > 0:
+    result.add newRow()
+    var sep = newRow()
+    sep.put "  "
+    sep.putIn ColDim, rule(width - 4)
+    result.add sep
+    var first = t.lines.len - logRows
+    if first < 0: first = 0
+    for i in first ..< t.lines.len:
+      result.add logRow(t.lines[i], width)
+    var pad = logRows - (t.lines.len - first)
+    while pad > 0:
+      result.add newRow()
+      dec pad
+
+proc waitForBackend(root: string; port: int; tls: bool; backendProc: uint64;
+                    limitSecs: int; logPath: string;
+                    died, answered, probeBroken: var bool) =
+  ## Poll until the backend is ready, showing its own progress while it does.
+  ##
+  ## "Ready" is observed two different ways, because the launcher speaks plain
+  ## HTTP and cannot open a TLS request. In plain mode readiness is a request
+  ## coming back -- an answer beats a corpse, a dead process is not waited for.
+  ## In TLS mode it is the backend's own `listening on ...` line in the log,
+  ## which it writes only after `aowl_net_serve_tls` binds -- the same event,
+  ## reported by the process that owns it rather than probed from outside.
+  died = false
+  answered = false
+  probeBroken = false
+  var tail = newTail(logPath)
+  let began = cNowMs()
+  var panel = newPanel()
+  var w = 0
+  var h = 0
+  termSize(w, h)
+  if w <= 0: w = 100
+  if w > 120: w = 120
+  var logRows = 6
+  if not fitsInWindow(9 + logRows + 2):
+    logRows = 0
+  let painting = fitsInWindow(11) and termMode() == tmFull
+  var lastNote = 0'i64
+  var lastPaint = -1000'i64
+
+  while true:
+    let waited = cNowMs() - began
+    if limitSecs > 0 and waited >= int64(limitSecs) * 1000'i64:
+      break
+    discard tail.pump()
+    if tls:
+      # Cannot probe HTTPS, so the log is the signal. The `listening` line is
+      # written after the TLS bind, so it means exactly what an answered request
+      # would in plain mode -- with the process-alive check still underneath, so
+      # a backend that died before it logged anything is not waited for.
+      let b = scanBoot(tail)
+      if b.listening:
+        answered = true
+      elif backendProc != 0'u64 and cSpawnAlive(backendProc) == 0'i32:
+        died = true
+    else:
+      # Asked before the liveness check on purpose. If the backend this launcher
+      # started lost a race for the port to one somebody else had already
+      # started, the process is gone and the port answers -- and the client
+      # cares about the port. An answer wins over a corpse.
+      let r = answers(port)
+      if r == 1:
+        answered = true
+      elif r < 0:
+        probeBroken = true
+      elif backendProc != 0'u64 and cSpawnAlive(backendProc) == 0'i32:
+        died = true
+
+    if painting:
+      if waited - lastPaint >= 100'i64 or answered or died or probeBroken:
+        lastPaint = waited
+        let b = scanBoot(tail)
+        panel.paint bootRows(b, answered, waited, port, tls, tail, w, logRows)
+    else:
+      # No repainting here: this is the redirected case, and the only useful
+      # thing to write into a file is a line whenever something changed.
+      if waited - lastNote >= 5000'i64:
+        lastNote = waited
+        let b = scanBoot(tail)
+        var what = "starting"
+        if b.listening:
+          what = (if tls: "listening on TLS -- ready" else:
+                  "listening, waiting for it to answer")
+        elif b.modsTotalKnown:
+          what = "loading mods, " & $b.modsLoaded & " of " & $b.modsTotal
+        elif b.dbLoaded: what = "database read, reading the load order"
+        line "  " & secsText(waited) & " -- " & what
+        flushOut()
+
+    if answered or died or probeBroken:
+      break
+    if interrupted():
+      break
+    sleepMs 120
+
+  if painting:
+    # One last paint so the finished state is what is left in the scrollback,
+    # then let ordinary output carry on underneath it.
+    discard tail.pump()
+    let b = scanBoot(tail)
+    panel.paint bootRows(b, answered, cNowMs() - began, port, tls, tail, w, logRows)
+    panel.settle()
+
+# ---------------------------------------------------------------------------
+# Choosing a profile
+# ---------------------------------------------------------------------------
+
+proc profileLabel(p: Profile): string =
+  result = (if p.nickname.len > 0: p.nickname else: "(no nickname)")
+  var bits = ""
+  if p.side.len > 0: bits = p.side
+  if p.level > 0:
+    if bits.len > 0: bits.add " "
+    bits.add "level " & $p.level
+  if bits.len > 0: result.add "  " & bits
+
+proc drawProfiles(list: ProfileList) =
+  ## Printed rather than painted: this stays in the scrollback, and the answer
+  ## the player types has to stay next to the list they typed it from.
+  let n = list.items.len
+  echo ""
+  sayColoured ColWhite, "  Profiles"
+  sayColoured ColDim, "  " & rule(52)
+  if n == 0:
+    sayColoured ColDim, "  there are none yet"
+  for i in 0 ..< n:
+    var r = newRow()
+    r.put "   "
+    r.putIn ColCyan, $(i + 1)
+    r.put "  "
+    r.putIn ColDefault, profileLabel(list.items[i])
+    r.padTo 44
+    r.putIn ColDim, list.items[i].id
+    echo r.text
+  sayColoured ColDim, "  " & rule(52)
+
+proc readAnswer(prompt: string; into: var string): bool =
+  ## False at end of input. `stdin` may be a file -- a launcher driven from a
+  ## script is a reasonable thing to be -- and the difference between "typed
+  ## nothing" and "there is nobody there" decides whether a default is taken or
+  ## the launcher stops.
+  var r = newRow()
+  r.put "  "
+  r.putIn ColCyan, prompt
+  r.put " "
+  echo ""
+  write(stdout, r.text)
+  flushFile(stdout)
+  into = ""
+  result = readLine(stdin, into)
+  into = strip(into)
+
+proc pickProfile(o: Options; port: int; root: string;
+                 chosen: var Profile; reason: var string;
+                 viaRoute: var bool): bool =
+  ## True when there is a profile to start the game with. `reason` says why not
+  ## when there is not -- and it is always a sentence about *this* install
+  ## rather than "no profile found". `viaRoute` says whether the profiles came
+  ## from the backend (so the caller can `select` on it) or off disk (so it
+  ## cannot).
+  reason = ""
+  viaRoute = false
+  chosen = Profile(id: "", token: "", nickname: "", side: "", level: 0,
+                   edition: "", lastPlayed: 0)
+
+  var list = listProfiles(port, root)
+  viaRoute = list.source == psRoute
+  if list.error.len > 0:
+    reason = list.error
+    return false
+  if list.note.len > 0:
+    warn list.note
+
+  # `--profile` is matched against the list rather than trusted, so that a
+  # mistyped id fails here with the list in front of the player instead of at
+  # the game's login screen with nothing to go on.
+  if o.profileId.len > 0:
+    for p in list.items:
+      if p.id == o.profileId:
+        chosen = p
+        ok "profile " & profileLabel(p) & " (" & p.id & ")"
+        return true
+    reason = "no profile with id " & o.profileId & " in this install"
+    return false
+
+  if o.newProfile.len > 0:
+    if list.source == psStore:
+      reason = "a profile cannot be created without the backend's launcher " &
+               "routes; this list came off disk because it has none"
+      return false
+    var made = Profile(id: "", token: "", nickname: "", side: "", level: 0,
+                       edition: "", lastPlayed: 0)
+    let err = createProfile(port, o.newProfile, o.side, made)
+    if err.len > 0:
+      reason = err
+      return false
+    chosen = made
+    ok "created " & profileLabel(made) & " (" & made.id & ")"
+    return true
+
+  drawProfiles(list)
+  if list.source == psStore:
+    sayColoured ColDim,
+      "  this list came off disk, so `new` is not available here"
+
+  # Not a console: no picker. One profile is unambiguous and is taken with a
+  # line saying so; more than one is not, and guessing which character somebody
+  # meant to play is not a guess worth making.
+  if not stdinIsConsole():
+    if list.items.len == 1:
+      chosen = list.items[0]
+      ok "one profile in this install, so it was taken without asking: " &
+         profileLabel(chosen)
+      return true
+    reason = "input is not a terminal, so there is nobody to ask which of " &
+             $list.items.len & " profiles to play. Pass --profile <id>."
+    return false
+
+  while true:
+    var prompt = "play which?"
+    if list.items.len > 0:
+      prompt = "play which? [1-" & $list.items.len & "]"
+    if list.source == psRoute:
+      prompt.add "  (n = new, q = quit)"
+    else:
+      prompt.add "  (q = quit)"
+    var answer = ""
+    if not readAnswer(prompt, answer):
+      reason = "input ended before a profile was chosen"
+      return false
+    if answer == "q" or answer == "Q":
+      reason = "you chose to quit"
+      return false
+    if (answer == "n" or answer == "N") and list.source == psRoute:
+      var nick = ""
+      if not readAnswer("nickname:", nick): return false
+      if nick.len < 3:
+        err "a nickname needs at least three characters"
+        continue
+      var sideAnswer = ""
+      if not readAnswer("side? [Usec/Bear]", sideAnswer): return false
+      var side = "Usec"
+      if toLowerAscii(sideAnswer) == "bear" or toLowerAscii(sideAnswer) == "b":
+        side = "Bear"
+      var made = Profile(id: "", token: "", nickname: "", side: "", level: 0,
+                         edition: "", lastPlayed: 0)
+      let e = createProfile(port, nick, side, made)
+      if e.len > 0:
+        err e
+        continue
+      chosen = made
+      ok "created " & profileLabel(made) & " (" & made.id & ")"
+      return true
+    if answer.len == 0 and list.items.len == 1:
+      chosen = list.items[0]
+      return true
+    var idx = 0
+    var any = false
+    for ch in answer:
+      if ch >= '0' and ch <= '9':
+        idx = idx * 10 + (ord(ch) - ord('0'))
+        any = true
+      else:
+        any = false
+        break
+    if any and idx >= 1 and idx <= list.items.len:
+      chosen = list.items[idx - 1]
+      ok "playing " & profileLabel(chosen) & " (" & chosen.id & ")"
+      return true
+    # A 24-character id typed straight in, for a list too long to count down.
+    for p in list.items:
+      if p.id == answer:
+        chosen = p
+        return true
+    err "that is not one of the choices"
+
+# ---------------------------------------------------------------------------
+# The client view
+# ---------------------------------------------------------------------------
+
+proc clientRows(h: HostState; alive: bool; elapsed: int64; pid: int;
+                t: Tail; width, logRows: int): seq[Row] =
+  result = @[]
+  var head = newRow()
+  head.put "  "
+  head.putIn ColWhite, "starting the client"
+  head.padTo width - 10
+  head.putIn ColDim, secsText(elapsed)
+  result.add head
+  result.add newRow()
+  result.add stepRow(MarkDone, "process", "pid " & $pid & ", host injected",
+                     width)
+  result.add stepRow((if not alive: MarkFailed
+                      elif h.wroteAnything: MarkDone else: MarkActive),
+                     "host log",
+                     (if not alive: "the client exited"
+                      elif h.wroteAnything: $t.lines.len & " lines"
+                      else: "waiting for the first line"), width)
+  result.add stepRow((if h.runtimeUp: MarkDone
+                      elif h.wroteAnything: MarkActive else: MarkPending),
+                     "IL2CPP runtime",
+                     (if h.runtimeUp: "up" else:
+                        "the game brings this up on its own; a cold launch " &
+                        "takes a while"), width)
+  result.add stepRow((if h.running: MarkDone
+                      elif h.runtimeUp: MarkActive else: MarkPending),
+                     "host",
+                     (if h.running: $h.modsLoaded & " client mod(s) loaded"
+                      else: ""), width)
+  if h.errors > 0:
+    result.add stepRow(MarkFailed, $h.errors & " error(s)", h.lastError, width)
+  if logRows > 0:
+    result.add newRow()
+    var sep = newRow()
+    sep.put "  "
+    sep.putIn ColDim, rule(width - 4)
+    result.add sep
+    var first = t.lines.len - logRows
+    if first < 0: first = 0
+    for i in first ..< t.lines.len:
+      result.add logRow(t.lines[i], width)
+    var pad = logRows - (t.lines.len - first)
+    while pad > 0:
+      result.add newRow()
+      dec pad
+
+proc watchClient(launch: LaunchPtr; hostLog: string; limitMs: int64;
+                 exited: var bool) =
+  ## Until the host says it is running, or the client dies, or the time is up.
+  ## Whichever happens, the last thing painted is what actually happened.
+  exited = false
+  var tail = newTail(hostLog)
+  let began = cNowMs()
+  var panel = newPanel()
+  var w = 0
+  var h = 0
+  termSize(w, h)
+  if w <= 0: w = 100
+  if w > 120: w = 120
+  var logRows = 6
+  if not fitsInWindow(8 + logRows + 2): logRows = 0
+  let painting = fitsInWindow(10) and termMode() == tmFull
+  var lastNote = 0'i64
+  let pid = int(cLaunchPid(launch))
+
+  while true:
+    let waited = cNowMs() - began
+    discard tail.pump()
+    let st = scanHost(tail)
+    let alive = cLaunchAlive(launch) != 0'i32
+    if not alive: exited = true
+    if painting:
+      panel.paint clientRows(st, alive, waited, pid, tail, w, logRows)
+    elif waited - lastNote >= 5000'i64:
+      lastNote = waited
+      var what = "waiting for the host's first log line"
+      if st.running: what = "host running"
+      elif st.runtimeUp: what = "IL2CPP up, host binding"
+      elif st.wroteAnything: what = "host started, waiting for the runtime"
+      line "  " & secsText(waited) & " -- " & what
+      flushOut()
+    if st.running or exited or waited >= limitMs:
+      if painting:
+        panel.paint clientRows(st, alive, waited, pid, tail, w, logRows)
+        panel.settle()
+      return
+    if interrupted():
+      if painting: panel.settle()
+      return
+    sleepMs 120
+
+# ---------------------------------------------------------------------------
+# The live log view
+# ---------------------------------------------------------------------------
+#
+# ## One window, split, rather than two windows
+#
+# The obvious alternative -- give the client its own console -- was tried on
+# paper and loses on four counts, and `--client-window` exists so that anyone
+# who disagrees can have it without arguing.
+#
+#  1. **The client has no console to give.** It is a Unity GUI process started
+#     suspended and injected; it writes a *file*, and nothing it does goes to a
+#     handle anybody could inherit. A second window would therefore be a second
+#     copy of this launcher tailing that file (which is exactly what
+#     `--client-window` starts). It is a whole extra process to make one pane
+#     into one window.
+#  2. **The question is nearly always a comparison.** "The client asked for
+#     `/client/game/config` and the server said what?" Answering that in two
+#     windows means alt-tabbing between two scroll positions and matching
+#     timestamps by eye. Side by side, with both clocks in view, it is one
+#     glance -- and both logs stamp every line with milliseconds since *their
+#     own* start, so the comparison is one the reader has to make and the layout
+#     should help with.
+#  3. **A second window can be closed on its own**, and a player who closes it
+#     has silently lost half of their instrumentation with nothing to say so.
+#     Worse, closing a console window kills the process in it; if that process
+#     were the one holding the backend, closing the "client log" window would
+#     stop the server.
+#  4. **The game is fullscreen.** Both windows are behind it either way, so the
+#     supposed benefit of a separate window -- putting it on a second monitor --
+#     applies equally to the single one, which can be moved to a second monitor
+#     as a whole.
+#
+# What the split does give up is width, and that is a real cost on an 80-column
+# console. `f` answers it: one keystroke gives the focused pane the whole
+# window, and another gives it back. That is the benefit of a dedicated window
+# without any of the four costs above.
+
+proc borderCell(title: string; n: int; focused: bool): Row =
+  ## Exactly `n` columns of horizontal rule with a title sunk into it. Exactly,
+  ## because it is one segment of a border that has to meet the next one.
+  result = newRow()
+  let h = bxH()
+  result.putIn ColDim, h
+  if n > 3:
+    result.putIn (if focused: ColWhite else: ColDim), fit(" " & title & " ", n - 2)
+  while result.width < n:
+    result.putIn ColDim, h
+
+proc drawPane(t: Tail; scroll, rows, width: int; into: var seq[Row]) =
+  ## `rows` lines of `t`, ending `scroll` lines from the newest. Padded to
+  ## exactly `rows` so that the caller's loop does not have to know how many
+  ## lines there were -- an empty pane is an empty pane, not a short frame.
+  into = @[]
+  let n = t.lines.len
+  var last = n - scroll
+  if last > n: last = n
+  if last < 0: last = 0
+  var first = last - rows
+  if first < 0: first = 0
+  for i in first ..< last:
+    var r = newRow()
+    let l = t.lines[i]
+    if l.stamp.len > 0:
+      r.putIn ColDim, fit(l.stamp, 8)
+      r.padTo 9
+    let nm = levelName(l.level)
+    if nm.len > 0:
+      r.putIn levelOf(l.level), nm
+    r.padTo (if l.stamp.len > 0: 15 else: 6)
+    let room = width - r.width
+    if room > 2:
+      r.putIn (if l.level == lvError: ColRed
+               elif l.level == lvWarn: ColYellow
+               else: ColDefault), fit(l.text, room)
+    into.add r
+  while into.len < rows:
+    into.add newRow()
+
+proc padded(s: string; n: int): string =
+  result = s
+  while result.len < n: result.add ' '
+
+proc streamText(tag: string; l: LogLine): string =
+  ## `server  [985ms] warn   the message`.
+  ##
+  ## The level is written out rather than being carried by the colour alone.
+  ## This is the form that ends up in a redirected file, where there is no
+  ## colour -- and a warning that reads exactly like an ordinary line is a
+  ## warning nobody will find in three hundred lines of boot log. Built by
+  ## padding a plain string rather than through `Row`, because `Row` may hold
+  ## escapes and this line must be able to promise it holds none.
+  result = padded(tag, 8)
+  if l.stamp.len > 0:
+    result = padded(result & "[" & l.stamp & "]", 8 + 11)
+  else:
+    result = padded(result, 8 + 11)
+  let nm = levelName(l.level)
+  if nm.len > 0: result.add nm
+  result = padded(result, 8 + 11 + 6)
+  result.add l.text
+
+proc streamLogs(server, client: var Tail; backendProc: uint64;
+                launch: LaunchPtr; keys, owned: bool) =
+  ## The view for a console that cannot be painted, and for output that is not
+  ## a console at all. Same two logs, one line each as they arrive, tagged with
+  ## which side said it -- so a redirected launcher produces a file that is
+  ## worth reading rather than a file full of `ESC[2J`.
+  line ""
+  heading "Logs"
+  note "server and client, interleaved as they arrive"
+  note (if owned: "Ctrl+C stops the backend and quits"
+        else: "Ctrl+C quits; this stops nothing")
+  flushOut()
+  var seenServer = 0
+  var seenClient = 0
+  while true:
+    discard server.pump()
+    discard client.pump()
+    while seenServer < server.lines.len:
+      let l = server.lines[seenServer]
+      inc seenServer
+      sayColoured levelOf(l.level), streamText("server", l)
+    while seenClient < client.lines.len:
+      let l = client.lines[seenClient]
+      inc seenClient
+      sayColoured levelOf(l.level), streamText("client", l)
+    if interrupted():
+      return
+    if keys:
+      let k = pollKey()
+      if k == ord('q') or k == ord('Q'): return
+    if owned:
+      # Only when this launcher started them. `--logs` attaches to somebody
+      # else's session, and "there is nothing running" is a state to sit in and
+      # report, not a reason to close the window somebody opened to watch for
+      # the thing starting.
+      let clientGone = launch == nil or cLaunchAlive(launch) == 0'i32
+      let backendGone = backendProc == 0'u64 or cSpawnAlive(backendProc) == 0'i32
+      if clientGone and backendGone:
+        line "  both the client and the backend have exited"
+        return
+    sleepMs 250
+
+proc runLogView(root: string; who: string; backendProc: uint64;
+                launch: LaunchPtr; owned: bool; detached: var bool) =
+  ## Two panes, live, until `q` or `d` or Ctrl+C, or until both processes are
+  ## gone. `detached` says which: on `d` the backend is left running.
+  detached = false
+  var server = newTail(joinPath(root, "aowlspt\\aowlspt-backend.log"))
+  var client = newTail(joinPath(root, "aowlspt\\aowlspt-host.log"))
+
+  var w = 0
+  var h = 0
+  termSize(w, h)
+  if termMode() != tmFull or not stdinIsConsole() or w < 40 or h < 12:
+    if termMode() == tmFull and stdinIsConsole():
+      warn "the window is " & $w & "x" & $h & ", which is too small for the " &
+           "split view; falling back to one line per entry"
+    streamLogs(server, client, backendProc, launch, stdinIsConsole(), owned)
+    return
+
+  var focus = 0        ## 0 server, 1 client
+  var solo = false
+  var paused = false
+  var confirmQuit = false
+  var scrollServer = 0
+  var scrollClient = 0
+  enterFullScreen()
+  rawMode true
+  drainKeys()
+  let began = cNowMs()
+
+  while true:
+    termSize(w, h)
+    if w <= 0: w = 80
+    if h <= 0: h = 25
+    # One column short of the window, deliberately. A glyph written into the
+    # last cell of a line leaves the console in the deferred-wrap state, and
+    # what happens next is host-specific: conhost and Windows Terminal cancel it
+    # on the carriage return that follows, and some wrap first and scroll the
+    # whole frame by a line every frame. Giving up one column costs nothing and
+    # makes the frame the same everywhere.
+    w = w - 1
+    discard server.pump()
+    discard client.pump()
+    if not paused:
+      scrollServer = 0
+      scrollClient = 0
+
+    let bodyH = h - 5
+    if bodyH < 3 or w < 40:
+      # Resized under us into something that cannot hold the view. Leave
+      # cleanly rather than draw a broken frame.
+      rawMode false
+      leaveFullScreen()
+      warn "the window became too small for the split view"
+      streamLogs(server, client, backendProc, launch, true, owned)
+      return
+
+    let clientAlive = launch != nil and cLaunchAlive(launch) != 0'i32
+    let backendAlive = backendProc != 0'u64 and cSpawnAlive(backendProc) != 0'i32
+
+    var f = newFrame(w, h)
+
+    # Header
+    var head = newRow()
+    head.put " "
+    head.putIn ColWhite, "aowlspt"
+    head.put "  "
+    head.putIn ColDim, bxV()
+    head.put " "
+    head.putIn (if who.len > 0: ColCyan else: ColDim),
+               (if who.len > 0: who elif owned: "no profile" else: "attached")
+    head.put " "
+    head.putIn ColDim, bxV()
+    head.put " "
+    head.putIn (if backendAlive: ColGreen else: ColRed),
+               (if backendAlive: "server up" else: "server down")
+    head.put " "
+    head.putIn ColDim, bxV()
+    head.put " "
+    head.putIn (if clientAlive: ColGreen else: ColRed),
+               (if clientAlive: "client up" else: "client exited")
+    head.padTo w - 10
+    head.putIn ColDim, secsText(cNowMs() - began)
+    f.addRow head
+
+    # Panes.
+    #
+    # The arithmetic is written out rather than fudged with `padTo`, because a
+    # frame whose columns are one out looks like a rendering bug and is
+    # actually an off-by-one that will drift with the window width. Split:
+    #   1 + (leftW+2) + 1 + (rightW+2) + 1 == w
+    # Solo:
+    #   1 + (soloW+2) + 1 == w
+    var leftW = 0
+    var rightW = 0
+    if solo:
+      leftW = w - 4
+    else:
+      leftW = (w - 7) div 2
+      rightW = (w - 7) - leftW
+
+    let serverTitle = "server  " & $server.lines.len & " lines" &
+                      (if scrollServer > 0: "  back " & $scrollServer else: "")
+    let clientTitle = "client  " & $client.lines.len & " lines" &
+                      (if scrollClient > 0: "  back " & $scrollClient else: "")
+
+    var top = newRow()
+    top.putIn ColDim, bxTL()
+    if solo:
+      top.putRow borderCell((if focus == 0: serverTitle else: clientTitle),
+                            leftW + 2, true)
+    else:
+      top.putRow borderCell(serverTitle, leftW + 2, focus == 0)
+      top.putIn ColDim, bxTD()
+      top.putRow borderCell(clientTitle, rightW + 2, focus == 1)
+    top.putIn ColDim, bxTR()
+    f.addRow top
+
+    var leftRows: seq[Row] = @[]
+    var rightRows: seq[Row] = @[]
+    if solo:
+      if focus == 0: drawPane(server, scrollServer, bodyH, leftW, leftRows)
+      else: drawPane(client, scrollClient, bodyH, leftW, leftRows)
+    else:
+      drawPane(server, scrollServer, bodyH, leftW, leftRows)
+      drawPane(client, scrollClient, bodyH, rightW, rightRows)
+
+    for i in 0 ..< bodyH:
+      var r = newRow()
+      r.putIn ColDim, bxV()
+      r.put " "
+      r.putRow leftRows[i]
+      r.padTo 2 + leftW
+      if not solo:
+        r.put " "
+        r.putIn ColDim, bxV()
+        r.put " "
+        r.putRow rightRows[i]
+      r.padTo w - 1
+      r.putIn ColDim, bxV()
+      f.addRow r
+
+    var bottom = newRow()
+    bottom.putIn ColDim, bxBL()
+    if solo:
+      bottom.putIn ColDim, rule(leftW + 2)
+    else:
+      bottom.putIn ColDim, rule(leftW + 2)
+      bottom.putIn ColDim, bxTU()
+      bottom.putIn ColDim, rule(rightW + 2)
+    bottom.putIn ColDim, bxBR()
+    f.addRow bottom
+
+    var help = newRow()
+    help.put " "
+    if confirmQuit:
+      help.putIn ColYellow,
+        "the game is still running and will lose its server -- q again to " &
+        "stop it anyway, d to leave everything running, any other key to stay"
+    else:
+      help.putIn ColDim, "q quit   d detach   tab swap   f full   space " &
+                         (if paused: "follow" else: "pause") &
+                         "   pgup/pgdn scroll"
+      if paused:
+        help.put "   "
+        help.putIn ColYellow, "paused"
+    f.addRow help
+    endFrame(f)
+
+    # Keys
+    var acted = false
+    while true:
+      let k = pollKey()
+      if k == 0: break
+      acted = true
+      if k == ord('q') or k == ord('Q'):
+        if clientAlive and not confirmQuit:
+          confirmQuit = true
+        else:
+          rawMode false
+          leaveFullScreen()
+          return
+      elif k == ord('d') or k == ord('D'):
+        rawMode false
+        leaveFullScreen()
+        detached = true
+        return
+      elif k == 9:  # tab
+        focus = 1 - focus
+        confirmQuit = false
+      elif k == ord('f') or k == ord('F'):
+        solo = not solo
+        confirmQuit = false
+      elif k == ord(' '):
+        paused = not paused
+        confirmQuit = false
+      elif k == KeyPageUp or k == KeyUp:
+        paused = true
+        let step = (if k == KeyUp: 1 else: bodyH - 1)
+        if focus == 0: scrollServer = scrollServer + step
+        else: scrollClient = scrollClient + step
+        confirmQuit = false
+      elif k == KeyPageDown or k == KeyDown:
+        let step = (if k == KeyDown: 1 else: bodyH - 1)
+        if focus == 0:
+          scrollServer = scrollServer - step
+          if scrollServer < 0: scrollServer = 0
+        else:
+          scrollClient = scrollClient - step
+          if scrollClient < 0: scrollClient = 0
+        confirmQuit = false
+      elif k == KeyHome:
+        paused = true
+        if focus == 0: scrollServer = server.lines.len
+        else: scrollClient = client.lines.len
+      elif k == KeyEnd:
+        paused = false
+        scrollServer = 0
+        scrollClient = 0
+      else:
+        confirmQuit = false
+    if acted:
+      # Clamp after the fact rather than in every branch above.
+      if scrollServer > server.lines.len: scrollServer = server.lines.len
+      if scrollClient > client.lines.len: scrollClient = client.lines.len
+
+    if interrupted():
+      clearInterrupt()
+      if clientAlive and not confirmQuit:
+        confirmQuit = true
+      else:
+        rawMode false
+        leaveFullScreen()
+        return
+    if owned and not clientAlive and not backendAlive:
+      rawMode false
+      leaveFullScreen()
+      line "  both the client and the backend have exited"
+      return
+    sleepMs 100
+
+proc runTailWindow(path, title: string) =
+  ## `--tail`: this process is the second console `--client-window` opened. One
+  ## log, full width, and nothing else -- it starts nothing and stops nothing,
+  ## so closing this window costs only the window.
+  discard termStart()
+  var t = newTail(path)
+  var seen = 0
+  sayColoured ColWhite, "  " & title
+  sayColoured ColDim, "  " & path
+  sayColoured ColDim, "  this window only shows the log. Closing it stops nothing."
+  echo ""
+  while true:
+    discard t.pump()
+    while seen < t.lines.len:
+      let l = t.lines[seen]
+      inc seen
+      var r = newRow()
+      if l.stamp.len > 0:
+        r.putIn ColDim, l.stamp
+        r.padTo 12
+      let nm = levelName(l.level)
+      if nm.len > 0: r.putIn levelOf(l.level), nm
+      r.padTo 19
+      r.putIn (if l.level == lvError: ColRed else: ColDefault), l.text
+      echo r.text
+    if interrupted(): return
+    sleepMs 250
+
+# ---------------------------------------------------------------------------
+
+proc banner(root: string) =
+  if termMode() != tmFull: return
+  echo ""
+  var r = newRow()
+  r.put "  "
+  r.putIn ColCyan, "aowlspt"
+  r.put "  "
+  r.putIn ColDim, "launch"
+  echo r.text
+
 proc main(): int =
   let o = parseArgs()
   if o.help:
     echo Usage
+    return 0
+
+  discard termStart()
+  if o.plain: forcePlain()
+  if o.ascii: forceAscii()
+
+  if o.tailPath.len > 0:
+    runTailWindow(o.tailPath, o.tailTitle)
     return 0
 
   var root = o.root
@@ -295,6 +1364,17 @@ proc main(): int =
 
   let exePath = joinPath(root, o.exeName)
   let hostDll = joinPath(root, "aowlspt\\aowlspt-host-il2cpp.dll")
+
+  banner(root)
+
+  if o.logsOnly:
+    # Before every check below it, on purpose. `--logs` is what somebody runs
+    # when a session is already going wrong, and refusing to show them the logs
+    # because the install looks odd would withhold the one thing that says why.
+    var detachedOnly = false
+    runLogView(root, "", 0'u64, nil, false, detachedOnly)
+    termRestore()
+    return 0
 
   heading "Install"
   if not fileExists(exePath):
@@ -339,23 +1419,97 @@ proc main(): int =
            "--force if you know what you are doing."
       return 1
 
+  # Resolved here rather than at parse time: it is a property of the install,
+  # and which install this is has only just been worked out.
+  heading "Backend URL"
+  let cfgPath = backendJsonPath(root)
+  let cfg = readBackendConfig(root)
+  # The scheme is the transport. https -> the backend serves TLS and the client
+  # is handed an https url; http -> plain, for development and the tests. When
+  # backend.json names no url at all, the honest default for a real install is
+  # TLS on 443 -- but it is a guess, and it says so.
+  var https = cfg.https
+  var port = cfg.port
+  if not cfg.found:
+    https = true
+    port = TlsPort
+    warn "no backendUrl in " & cfgPath & "; assuming https://127.0.0.1/ " &
+         "(TLS on 443), which is what a real post-1.0 client needs. Set " &
+         "backendUrl if this install is meant for plain HTTP."
+  if o.portGiven:
+    if cfg.found and cfg.port != o.port:
+      if o.allowPortMismatch:
+        warn "--port " & $o.port & " disagrees with " & cfgPath & " (" &
+             cfg.url & "), which resolves to port " & $cfg.port & ". " &
+             "Continuing because --allow-port-mismatch was given: the backend " &
+             "will bind " & $o.port & " and the client will still use " &
+             $cfg.port & "."
+      else:
+        err "--port " & $o.port & " disagrees with " & cfgPath
+        note cfgPath & " (" & cfg.url & ") resolves to port " & $cfg.port &
+             ", and the client reads that file, not this flag. Starting a " &
+             "backend on " & $o.port & " would leave the game talking to " &
+             "whatever else holds " & $cfg.port & " -- on a machine with a " &
+             "stock SPT server, that is the stock server."
+        note "change backendUrl in " & cfgPath & " to use port " & $o.port &
+             ", or pass --allow-port-mismatch if a backend on " & $o.port &
+             " is what you want regardless."
+        return 1
+    port = o.port
+  # For https the client's port is not negotiable: it talks to 443 whatever the
+  # url or this flag says, because its own url regex stops at the first colon.
+  # A --port other than 443 in TLS mode binds the backend somewhere the real
+  # client will never look, so it is worth one line either way.
+  if https and o.portGiven and o.port != TlsPort:
+    warn "--port " & $o.port & " has no effect on a real post-1.0 client in " &
+         "TLS mode: it talks HTTPS on a hardcoded 443 and ignores any port in " &
+         "the url. The backend will bind " & $port & ", but the client will " &
+         "look for 443."
+
+  let scheme = (if https: "https" else: "http")
+  if o.portGiven:
+    line "  " & scheme & ", port " & $port & " (--port)"
+  elif cfg.found:
+    line "  " & scheme & ", port " & $port & " (from " & cfgPath &
+         ", which is what the client reads)"
+  else:
+    line "  " & scheme & ", port " & $port & " (assumed)"
+  if https:
+    line "  TLS: the backend will serve HTTPS and the client will be handed " &
+         "an https url"
+
+  var backendUrl = cfg.url
+  if backendUrl.len == 0:
+    backendUrl = "https://127.0.0.1/"
+    warn "no backendUrl in " & cfgPath & "; the client will be told " &
+         backendUrl & ", which is a guess"
+
   if dryRun():
     heading "Dry run"
     let be = joinPath(root, "aowlspt\\aowlspt-backend.exe")
     if o.noBackend:
       line "  would start   no backend (--no-backend was given)"
-      let already = cBackendAnswers(int32(o.port))
-      if already == 1'i32:
-        line "  would find    a backend already answering on 127.0.0.1:" &
-             $o.port
-      elif already == 0'i32:
-        line "  would find    nothing answering on 127.0.0.1:" & $o.port &
-             " -- start one by hand first"
+      if https:
+        line "  would find    a backend on 127.0.0.1:" & $port & " over TLS " &
+             "-- the launcher speaks plain HTTP and cannot probe HTTPS, so " &
+             "this is not checked"
+      else:
+        let already = answers(port)
+        if already == 1:
+          line "  would find    a backend already answering on 127.0.0.1:" & $port
+        elif already == 0:
+          line "  would find    nothing answering on 127.0.0.1:" & $port &
+               " -- start one by hand first"
     elif fileExists(be):
-      line "  would start   " & be & " --port " & $o.port
+      line "  would start   " & be & " --port " & $port &
+           (if https: " --tls" else: "")
       if o.backendWait > 0:
-        line "  would wait    until it answers on 127.0.0.1:" & $o.port &
-             ", up to " & $o.backendWait & "s"
+        if https:
+          line "  would wait    until it logs it is listening on TLS, up to " &
+               $o.backendWait & "s"
+        else:
+          line "  would wait    until it answers on 127.0.0.1:" & $port &
+               ", up to " & $o.backendWait & "s"
       else:
         line "  would wait    not at all (--backend-wait 0)"
     else:
@@ -364,13 +1518,32 @@ proc main(): int =
       # "there is no backend in this install" -- and the real launch would go
       # on to start a client with nothing to talk to.
       warn "  no backend at " & be & "; the client would start alone"
+    if o.noProfile:
+      line "  would ask     nothing about profiles (--no-profile)"
+    elif o.profileId.len > 0:
+      line "  would play    " & o.profileId & " (--profile)"
+    elif https:
+      line "  would ask     which profile, read from the store on disk -- the " &
+           "launcher cannot use the backend's profile routes over TLS"
+    else:
+      let l = listProfiles(port, root)
+      if l.error.len > 0:
+        line "  would ask     which profile, but: " & l.error
+      else:
+        line "  would ask     which of " & $l.items.len & " profile(s) to play"
+        if l.note.len > 0:
+          note l.note
     line "  would start   " & exePath
+    line "  would pass    " &
+         clientCommandLine(backendUrl, "<the chosen profile>", o.extraArgs)
     line "  would inject  " & hostDll
     line "  nothing was started."
     return 0
 
   # The backend goes up first. The client tries to reach it as soon as it
-  # starts, so starting them the other way round is a race the client loses.
+  # starts, so starting them the other way round is a race the client loses --
+  # and the profile list has to be asked for before the client is started at
+  # all, because the answer goes on its command line.
   var backendProc = 0'u64
   let backendExe = joinPath(root, "aowlspt\\aowlspt-backend.exe")
   if o.noBackend:
@@ -378,76 +1551,62 @@ proc main(): int =
     # is not responsible for the server -- so it says what is there and starts
     # the client either way, which is the whole point of the flag.
     heading "Backend"
-    if cBackendAnswers(int32(o.port)) == 1'i32:
-      ok "a backend is already answering on 127.0.0.1:" & $o.port
+    if https:
+      note "a backend on 127.0.0.1:" & $port & " over TLS was assumed but not " &
+           "probed: the launcher speaks plain HTTP and --no-backend was given, " &
+           "so none will be started. The client will have no server unless one " &
+           "is already up on TLS."
+    elif answers(port) == 1:
+      ok "a backend is already answering on 127.0.0.1:" & $port
     else:
-      warn "nothing is answering on 127.0.0.1:" & $o.port &
+      warn "nothing is answering on 127.0.0.1:" & $port &
            " and --no-backend was given, so none will be started. The client " &
            "will have no server to talk to unless one comes up on its own."
-  if not o.noBackend:
+  else:
     heading "Backend"
     if not fileExists(backendExe):
       warn "no backend at " & backendExe & "; starting the client alone"
     else:
       var be = backendExe
       var bd = joinPath(root, "aowlspt")
-      var bc = "\"" & backendExe & "\" --root \"" & bd & "\" --port " & $o.port
-      backendProc = cSpawn(toCString(be), toCString(bd), toCString(bc))
+      # `--port` is passed even in TLS mode (443, or the explicit url port), and
+      # `--tls` makes the backend terminate HTTPS on it with its self-signed
+      # cert -- which is what a real post-1.0 client needs.
+      var bc = "\"" & backendExe & "\" --root \"" & bd & "\" --port " & $port
+      # Quiet, not `aowl_spawn`. The backend used to be given a console of its
+      # own, which is a second window nobody asked for and which duplicates,
+      # badly, the pane it now has in the log view -- and closing that window
+      # killed the server. Its log file is the same text and outlives the run.
+      if https: bc.add " --tls"
+      backendProc = cSpawnQuiet(toCString(be), toCString(bd), toCString(bc))
       if backendProc == 0'u64:
         err "could not start the backend"
         return 1
-      ok "backend started on port " & $o.port
+      # Not `ok`, and not "started". All that is known here is that
+      # `CreateProcess` returned a handle: the backend may already have exited
+      # on a bad database, a held port or a mod that throws on load. It printed
+      # `ok backend started on port N` for a process that was **already dead**,
+      # and then sat waiting five minutes for it. The next step is the one that
+      # can say "started", because it asks the port.
+      line "  spawned " & backendExe & "; --port " & $port &
+           (if https: " --tls" else: "")
 
-      # Wait for an *answer*, not for a duration.
-      #
-      # The client asks for `/client/game/config` almost as soon as it is
-      # resumed, and a client that asks before the server can answer sits at
-      # the menu with nothing in either log to say why. What that costs is not
-      # a constant: the backend reads a 41 MB database and then loads every mod
-      # in the install, and how long a mod takes to load is the mod's business.
-      # So this polls the port until something answers, and checks the process
-      # is still there on every pass -- "not answering yet" and "died on the
-      # way up" look identical from outside, and only one of them is worth
-      # waiting for.
+      # Wait for an *answer*, not for a duration. See `waitForBackend`: what is
+      # being waited for is an event, and the event is observable exactly as it
+      # happens -- the backend calls `aowl_net_serve` only after every mod has
+      # finished loading, so a successful request is not an approximation of
+      # readiness, it is readiness.
       if o.backendWait <= 0:
         note "not waiting for the backend (--backend-wait 0); the client may " &
              "come up before the server can answer it"
       else:
-        line "  waiting for the backend to answer on 127.0.0.1:" & $o.port &
-             " (up to " & $o.backendWait & "s)"
-        let began = cNowMs()
-        var answered = false
+        line ""
         var died = false
+        var answered = false
         var probeBroken = false
-        var lastNote = 0'i64
-        while true:
-          let waitedMs = cNowMs() - began
-          if waitedMs >= int64(o.backendWait) * 1000'i64:
-            break
-          # Asked before the liveness check on purpose. If the backend this
-          # launcher started lost a race for the port to one somebody else had
-          # already started, the process is gone and the port answers -- and
-          # the client cares about the port. An answer wins over a corpse.
-          let r = cBackendAnswers(int32(o.port))
-          if r == 1'i32:
-            answered = true
-            break
-          if r < 0'i32:
-            probeBroken = true
-            break
-          if cSpawnAlive(backendProc) == 0'i32:
-            died = true
-            break
-          # Said out loud rather than left as a silent pause. A launcher that
-          # prints one line and then stops for ten seconds reads as a hang, and
-          # the person watching it has no way to tell that from one.
-          if waitedMs - lastNote >= 5000'i64:
-            lastNote = waitedMs
-            line "  still loading -- " & $int(waitedMs div 1000'i64) &
-                 "s so far. The backend reads the database and loads every " &
-                 "installed mod before it opens the port."
-          cSleepMs(200'i32)
-
+        waitForBackend(root, port, https, backendProc, o.backendWait,
+                       joinPath(root, "aowlspt\\aowlspt-backend.log"),
+                       died, answered, probeBroken)
         if died:
           err "the backend exited while starting; see " &
               joinPath(root, "aowlspt\\aowlspt-backend.log")
@@ -457,7 +1616,10 @@ proc main(): int =
                "whether it is ready could not be checked. Starting the " &
                "client anyway."
         elif answered:
-          ok "backend answered after " & $int(cNowMs() - began) & " ms"
+          if https:
+            ok "the backend is listening on 127.0.0.1:" & $port & " over TLS"
+          else:
+            ok "the backend is answering on 127.0.0.1:" & $port
         else:
           warn "the backend has not answered after " & $o.backendWait &
                "s and is still running. Starting the client anyway -- it may " &
@@ -465,18 +1627,78 @@ proc main(): int =
           note "see " & joinPath(root, "aowlspt\\aowlspt-backend.log") &
                " for what it is doing, or raise --backend-wait"
 
+  # --- the profile -----------------------------------------------------------
+  var token = ""
+  var who = ""
+  if o.noProfile:
+    heading "Profile"
+    note "--no-profile: the client is started with no -token and will log in " &
+         "on its own"
+  else:
+    heading "Profile"
+    if https:
+      # The launcher's own HTTP client is plain-only, so over TLS it cannot ask
+      # the backend for the profile list or create/select one; it reads the
+      # store on disk instead. Said once, here, so the store-source note that
+      # follows is not a surprise.
+      note "over TLS the launcher reads profiles from the store on disk: it " &
+           "speaks plain HTTP and cannot reach the backend's profile routes. " &
+           "Creating a profile from here needs a plain-HTTP (http://) backend."
+    var chosen = Profile(id: "", token: "", nickname: "", side: "", level: 0,
+                         edition: "", lastPlayed: 0)
+    var why = ""
+    var viaRoute = false
+    if pickProfile(o, port, root, chosen, why, viaRoute):
+      token = chosen.token
+      who = profileLabel(chosen)
+      # Rebind the session to this profile before the client arrives on it --
+      # for a listed profile as much as a freshly made one. The token to launch
+      # with is whatever `select` hands back, not the id the launcher held.
+      if viaRoute:
+        var bound = Profile(id: "", token: "", nickname: "", side: "",
+                            level: 0, edition: "", lastPlayed: 0)
+        let se = selectProfile(port, chosen.id, bound)
+        if se.len > 0:
+          err "could not select the profile on the server: " & se
+          note "the client would arrive on a session the server has not bound " &
+               "to this profile, and sit at the menu. This is a backend fault, " &
+               "not a launcher one -- see aowlspt-backend.log."
+          if backendProc != 0'u64:
+            cSpawnKill(backendProc)
+            line "  backend stopped"
+          return 1
+        token = bound.token
+        if bound.nickname.len > 0: who = profileLabel(bound)
+    else:
+      err "no profile to play: " & why
+      note "the client needs a -token to log in, and a made-up one is a " &
+           "session the server has never heard of -- the game would reach the " &
+           "menu and stay there. Pass --profile <id>, or --new <name> to " &
+           "create one, or --no-profile to start the client without one."
+      if backendProc != 0'u64:
+        cSpawnKill(backendProc)
+        line "  backend stopped"
+      return 1
+
   heading "Launching"
+  let cmdLine = clientCommandLine(backendUrl, token, o.extraArgs)
+  # Whole, not fitted. It is long, and it is the one line somebody will be
+  # asked to paste when the client comes up talking to the wrong server.
+  line "  " & cmdLine
+
   let launch = cLaunchNew()
   if launch == nil:
     err "out of memory"
+    if backendProc != 0'u64: cSpawnKill(backendProc)
     return 1
 
   var e = exePath
   var w = root
-  var cmd = o.extraArgs
+  var cmd = cmdLine
   if cLaunchStart(launch, toCString(e), toCString(w), toCString(cmd)) == 0'i32:
     err "could not start " & exePath & " (error " & $int(cLaunchError(launch)) & ")"
     cLaunchFree(launch)
+    if backendProc != 0'u64: cSpawnKill(backendProc)
     return 1
   ok "started suspended, pid " & $int(cLaunchPid(launch))
 
@@ -489,6 +1711,7 @@ proc main(): int =
     cLaunchKill(launch)
     cLaunchClose(launch)
     cLaunchFree(launch)
+    if backendProc != 0'u64: cSpawnKill(backendProc)
     return 1
   ok "host injected"
 
@@ -497,30 +1720,61 @@ proc main(): int =
     cLaunchKill(launch)
     cLaunchClose(launch)
     cLaunchFree(launch)
+    if backendProc != 0'u64: cSpawnKill(backendProc)
     return 1
   ok "client resumed"
 
+  let hostLog = joinPath(root, "aowlspt\\aowlspt-host.log")
   line ""
-  line "  The host writes " & joinPath(root, "aowlspt\\aowlspt-host.log") & "."
-  line "  It waits for the game to bring IL2CPP up before it can resolve"
-  line "  anything, which on a cold launch takes a while."
+  var clientExited = false
+  # Bounded, and the bound is not a deadline for the game -- it is how long
+  # this view waits before handing over to the log view, which shows the same
+  # thing with more room. A cold IL2CPP launch is minutes.
+  watchClient(launch, hostLog, 90000'i64, clientExited)
 
-  if o.wait:
-    heading "Waiting"
-    discard cLaunchWait(launch, -1'i32)
-    line "  the client exited"
-    if backendProc != 0'u64:
-      cSpawnKill(backendProc)
-      line "  backend stopped"
+  if clientExited:
+    warn "the client exited while starting; see " & hostLog
+
+  if o.clientWindow:
+    # The second window, for anyone who wants it. It is another copy of this
+    # executable in `--tail` mode: it starts nothing, holds nothing, and
+    # closing it costs only the window.
+    var selfExe = absolutePathOf(paramStr(0))
+    var selfDir = parentOf(selfExe)
+    var tailCmd = "\"" & selfExe & "\" --tail \"" & hostLog &
+                  "\" --tail-title \"client -- aowlspt-host.log\""
+    if cSpawn(toCString(selfExe), toCString(selfDir), toCString(tailCmd)) == 0'u64:
+      warn "could not open a second window for the client log"
+
+  if o.noLogs:
+    line "  the server writes " & joinPath(root, "aowlspt\\aowlspt-backend.log")
+    line "  the host writes   " & hostLog
+    if o.wait:
+      heading "Waiting"
+      discard cLaunchWait(launch, -1'i32)
+      line "  the client exited"
+      if backendProc != 0'u64:
+        cSpawnKill(backendProc)
+        line "  backend stopped"
   else:
-    # A moment's grace so an immediate crash is reported here rather than
-    # leaving the launcher claiming success.
-    if cLaunchWait(launch, 3000'i32) == 1'i32:
-      warn "the client exited within three seconds of starting"
-      warn "check " & joinPath(root, "aowlspt\\aowlspt-host.log")
+    var detached = false
+    runLogView(root, who, backendProc, launch, true, detached)
+    if detached:
+      line ""
+      ok "detached: the game and the backend are still running"
+      note "the logs are at " & joinPath(root, "aowlspt\\aowlspt-backend.log") &
+           " and " & hostLog
+    else:
+      if backendProc != 0'u64 and cSpawnAlive(backendProc) != 0'i32:
+        cSpawnKill(backendProc)
+        line "  backend stopped"
+      if cLaunchAlive(launch) != 0'i32:
+        note "the game is still running. It has no server now -- close it, or " &
+             "start the launcher again with --no-backend once one is up."
 
   cLaunchClose(launch)
   cLaunchFree(launch)
+  termRestore()
   result = 0
 
 quit(main())

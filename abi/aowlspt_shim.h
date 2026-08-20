@@ -31,6 +31,7 @@
 #include <stddef.h>
 #include <stdlib.h>
 #include <string.h>
+#include <setjmp.h>
 
 #include "aowlspt_abi.h"
 
@@ -44,6 +45,37 @@
 
 static void*    aowl_p_v    (void* f)                                     { return ((void*(*)(void))f)(); }
 static void*    aowl_p_p    (void* f, void* a)                            { return ((void*(*)(void*))f)(a); }
+/* A one-pointer-arg call that returns NULL instead of taking the process down
+ * when it faults. IL2CPP's `il2cpp_class_get_name` on a class handed back by a
+ * blind enumeration (or by `classFromName` with an empty namespace) can
+ * dereference into an unmapped page on the real client; a raw call there kills
+ * the game. GCC (unlike MSVC) has no `__try`, so an access violation is caught
+ * with a Vectored Exception Handler that `longjmp`s back here. Diagnostic-path
+ * use only -- every real call site still goes through the unguarded helper, and
+ * the longjmp-past-a-held-lock risk is why this is not on any hot path. */
+static __thread jmp_buf aowl_seh_jmp;
+static __thread int      aowl_seh_active = 0;
+static LONG CALLBACK aowl_seh_veh(PEXCEPTION_POINTERS ep) {
+    if (aowl_seh_active &&
+        ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+        aowl_seh_active = 0;
+        longjmp(aowl_seh_jmp, 1);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+static void* aowl_p_p_seh(void* f, void* a) {
+    static volatile LONG installed = 0;
+    if (InterlockedCompareExchange(&installed, 1, 0) == 0)
+        AddVectoredExceptionHandler(1, aowl_seh_veh);
+    void* r = 0;
+    aowl_seh_active = 1;
+    if (setjmp(aowl_seh_jmp) == 0)
+        r = ((void*(*)(void*))f)(a);
+    else
+        r = 0;
+    aowl_seh_active = 0;
+    return r;
+}
 static void*    aowl_p_pp   (void* f, void* a, void* b)                   { return ((void*(*)(void*,void*))f)(a,b); }
 static void*    aowl_p_ppp  (void* f, void* a, void* b, void* c)          { return ((void*(*)(void*,void*,void*))f)(a,b,c); }
 static void*    aowl_p_pppp (void* f, void* a, void* b, void* c, void* d) { return ((void*(*)(void*,void*,void*,void*))f)(a,b,c,d); }
@@ -595,6 +627,32 @@ static int32_t aowl_is_code_pointer(void* p) {
     if (mbi.State != MEM_COMMIT) return 0;
     return (mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
                            PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)) != 0;
+}
+
+/* Whether `size` bytes starting at `p` are safe to read -- committed, not a
+ * guard page, and carrying a readable protection. `aowl_read_ptr` dereferences
+ * a pointer the runtime handed back, and on a real client `findMethod` can
+ * return a non-NULL value that is not a readable `MethodInfo` (the first
+ * per-frame candidate `EFT.MainApplication::Update` is unverified on post-1.0);
+ * a raw `memcpy` from it faults and takes the game down. This is the same
+ * VirtualQuery guard `aowl_is_code_pointer` uses, for reads rather than code. */
+static int32_t aowl_is_readable(void* p, int32_t size) {
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!p || size <= 0) return 0;
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0) return 0;
+    if (mbi.State != MEM_COMMIT) return 0;
+    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return 0;
+    if (!(mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                         PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                         PAGE_EXECUTE_WRITECOPY))) return 0;
+    /* the whole range has to lie inside this one committed region */
+    {
+        uintptr_t start = (uintptr_t)mbi.BaseAddress;
+        uintptr_t end   = start + (uintptr_t)mbi.RegionSize;
+        uintptr_t need  = (uintptr_t)p + (uintptr_t)size;
+        if (need < (uintptr_t)p) return 0;   /* overflow */
+        return need <= end ? 1 : 0;
+    }
 }
 
 /* Reading a pointer field out of a runtime struct by byte offset. Used for

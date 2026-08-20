@@ -69,3 +69,13 @@ build/db/
 # names an absolute path from one machine, which is the other half of why a
 # clone must not have it.
 mods/aowlspt-selection.json
+
+# The capture's bulk data tables. `mods/tarkov/data/capture/raid1/responses`
+# holds the real backend's answers, decoded; the small ones are contracts and
+# are reviewed, but fifteen of them are BSG's own data tables -- 18 MB of
+# `/client/items`, 13 MB of `/client/dialogue` -- and those are regenerated
+# from the .saz rather than stored. `tools/bsgwire.py extract` rebuilds them.
+mods/tarkov/data/capture/raid1/responses/large/
+
+# Python bytecode from tools/*.py
+__pycache__/

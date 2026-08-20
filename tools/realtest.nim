@@ -1156,13 +1156,25 @@ proc main(): int =
   for k in menuKeys:
     if k == "menu":
       menuWrapped = true
-  # The menu locale is small -- two dozen strings, the login errors and the
-  # buttons around them -- so the assertion is that the wrapper came off, not
-  # that it is large: a size threshold picked by eye reported a correct import
-  # as a bug the first time this was run.
-  check("the menu locale answers its strings rather than a wrapper round them",
-        menuKeys.len > 5 and not menuWrapped,
-        $menuKeys.len & " keys, wrapper " & $menuWrapped)
+  # The wrapper is required, and this check used to assert the opposite.
+  #
+  # Pre-1.0 put the string map straight on `data`. Post-1.0 deserialises `data`
+  # into `EFT.BackendMenuLocale`, whose only field is `menu`, and
+  # `ConvertToLocale` then reads `this.menu` -- so a flat map leaves `menu`
+  # null and the client null-refs, surfacing far away as a preloader-UI crash.
+  # `onMenuLocale` wraps for that reason and says so.
+  #
+  # The strings are still checked, one level down, because "there is a `menu`
+  # key" would pass on a wrapper round nothing -- which is the same bug in a
+  # better disguise.
+  var innerKeys: seq[string] = @[]
+  var innerVals: seq[int] = @[]
+  if menuWrapped:
+    members(menuR.body, memberValue(menuR.body, dataAt(menuR), "menu"),
+            innerKeys, innerVals)
+  check("the menu locale answers its strings under the `menu` the client reads",
+        menuWrapped and innerKeys.len > 5,
+        "wrapper " & $menuWrapped & ", " & $innerKeys.len & " strings under it")
   let langR = call("/client/languages", "")
   check("the language list answers the languages the database has",
         langR.ok and langR.body.len > 20, langR.body)
@@ -1295,9 +1307,20 @@ proc main(): int =
   heading "Quests, against the traders and the templates"
   # =========================================================================
   let questsR = timed("quest list", "/client/quest/list", "")
+  # An array of quest objects, each carrying its own `_id` -- not the id-keyed
+  # object the database stores them in. That is what the real backend sends
+  # (capture seq 130, 262, 444) and what `emu/templates.questList` now builds.
+  #
+  # `questKeys` and `questVals` keep their old meaning -- an id and an offset to
+  # the quest object at that id -- so everything below this reads the same as it
+  # did when the route answered an object.
   var questKeys: seq[string] = @[]
   var questVals: seq[int] = @[]
-  members(questsR.body, dataAt(questsR), questKeys, questVals)
+  for qAt in elements(questsR.body, dataAt(questsR)):
+    let qid = textField(questsR.body, qAt, "_id")
+    if qid.len > 0:
+      questKeys.add qid
+      questVals.add qAt
   var questIds = initHashSet[string]()
   for k in questKeys:
     incl(questIds, k)
@@ -2596,8 +2619,8 @@ proc main(): int =
           fought.len > doc3.len,
           "the profile has no Stats.Eft.Victims to put them in")
     let ended2 = call("/client/match/local/end",
-      "{\"exit\":\"" & killOut & "\",\"location\":\"" & killMap &
-      "\",\"profile\":" & fought & "}")
+      "{\"location\":\"" & killMap &
+      "\",\"results\":{\"result\":\"" & killOut & "\",\"profile\":" & fought & "}}")
     check("the raid carrying three kills is accepted", ended2.ok,
           why(ended2))
     listR = call("/client/game/profile/list", "")
@@ -2672,9 +2695,9 @@ proc main(): int =
     let realScav = textField(listR.body, profAt, "savage")
     check("the profile carries a scav to play", realScav.len == 24, realScav)
     discard call("/client/match/local/end",
-      "{\"exit\":\"Killed\",\"profile\":{\"_id\":\"" & realScav &
+      "{\"results\":{\"result\":\"Killed\",\"profile\":{\"_id\":\"" & realScav &
       "\",\"Stats\":{\"Eft\":{\"Victims\":[" &
-      "{\"Side\":\"Savage\",\"Role\":\"assault\",\"BodyPart\":\"Head\"}]}}}}")
+      "{\"Side\":\"Savage\",\"Role\":\"assault\",\"BodyPart\":\"Head\"}]}}}}}")
     listR = call("/client/game/profile/list", "")
     profAt = profileOf(listR.body, uid)
     let fenceAfter = slice(listR.body,
@@ -3008,7 +3031,7 @@ proc main(): int =
       check("a played profile can be handed back carrying what was found",
             carried.len > doc2.len, "the profile has no Inventory.items")
       let home = call("/client/match/local/end",
-                      "{\"exit\":\"Survived\",\"profile\":" & carried & "}")
+                      "{\"results\":{\"result\":\"Survived\",\"profile\":" & carried & "}}")
       listR = call("/client/game/profile/list", "")
       profAt = profileOf(listR.body, uid)
       var brought = true
@@ -3270,7 +3293,7 @@ proc main(): int =
           $played.len & " bytes")
     let endBegan = micros()
     let ended = call("/client/match/local/end",
-                     "{\"exit\":\"Survived\",\"profile\":" & played & "}")
+                     "{\"results\":{\"result\":\"Survived\",\"profile\":" & played & "}}")
     let endUs = micros() - endBegan
     check("the raid result is accepted", ended.ok and
           ended.contains("\"err\":0"), ended.body)
@@ -3429,7 +3452,7 @@ proc main(): int =
           doc2.len > 1000 and findAt(doc2, pricedEffect, 0) > 0,
           $doc2.len & " bytes")
     discard call("/client/match/local/end",
-                 "{\"exit\":\"Survived\",\"profile\":" & doc2 & "}")
+                 "{\"results\":{\"result\":\"Survived\",\"profile\":" & doc2 & "}}")
     listR = call("/client/game/profile/list", "")
     profAt = profileOf(listR.body, uid)
     var purse = moneyIn(listR.body, profAt)
@@ -3502,7 +3525,7 @@ proc main(): int =
       var doc3 = listR.body.substr(profAt, endOf(listR.body, profAt) - 1)
       doc3 = withPartHealth(doc3, hurtPart, hurtMax - 7)
       discard call("/client/match/local/end",
-                   "{\"exit\":\"Survived\",\"profile\":" & doc3 & "}")
+                   "{\"results\":{\"result\":\"Survived\",\"profile\":" & doc3 & "}}")
       listR = call("/client/game/profile/list", "")
       profAt = profileOf(listR.body, uid)
       let before2 = moneyIn(listR.body, profAt)

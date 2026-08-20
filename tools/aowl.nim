@@ -136,6 +136,34 @@ proc prepareEnv(e: Env) =
 proc nimonyExe(e: Env): string =
   result = joinPath(e.nimony, "bin\\nimony.exe")
 
+proc armSelfTestFixture(e: Env): bool =
+  ## Point the mods' `--side sim` binding self-tests at the stand-in runtime,
+  ## for every child process this run starts.
+  ##
+  ## They used to be pointed at it by `selfTestRuntime` in each mod's own
+  ## `config.json`, holding the repository-relative path
+  ## `tests/mockil2cpp/GameAssembly.dll`. That is a development fixture living
+  ## in a file `aowl payload` copies verbatim into the installer payload and
+  ## from there into a player's game, and what it steers is a `LoadLibrary` of
+  ## a second `GameAssembly.dll`. It fired on nothing only because the relative
+  ## path resolved to nothing outside a checkout -- safe by accident.
+  ##
+  ## So the fixture is set by the harness that owns it, in the environment, and
+  ## as an absolute path; the committed configs carry the key empty.
+  ## `aowlspt/fixture` is the other half: a mod refuses a relative path
+  ## outright, so a fixture cannot steer a real client however a `config.json`
+  ## reaches one.
+  let mock = joinPath(e.repo, "tests\\mockil2cpp\\GameAssembly.dll")
+  if not fileExists(mock):
+    return false
+  try:
+    putEnv("AOWLSPT_SELFTEST_RUNTIME", mock)
+  except:
+    warn "could not set AOWLSPT_SELFTEST_RUNTIME; the offline binding " &
+         "reports will run against the process instead of the stand-in runtime"
+    return false
+  result = true
+
 # --------------------------------------------------------------- mods
 
 proc sourceOf(modPath: string): string =
@@ -938,6 +966,31 @@ proc cmdDoctor(e: Env): int =
   ok "the toolchain is fit to build with"
   result = 0
 
+proc stageTarkovData(e: Env; dest: string) =
+  ## The tarkov mod's `data/` into a test stage, beside its library.
+  ##
+  ## Not optional decoration. The emulator refuses to start a raid without
+  ## `data/post1/serversettings.json` and answers seven menu routes out of
+  ## that directory, so a stage with the library and not the data is a server
+  ## that loads and then refuses -- which reads as a code failure and is a
+  ## packaging one. Every stage that copies `tarkov.dll` calls this, because
+  ## the one that did not was the one that failed.
+  ##
+  ## `data/capture` is skipped. It is a recording of the real backend kept to
+  ## check this server against, not anything the server serves, and it is tens
+  ## of megabytes -- most of it regenerated rather than stored.
+  let src = joinPath(e.repo, "mods\\tarkov\\data")
+  if not isDirectory(src):
+    return
+  var files: seq[string] = @[]
+  var dirs: seq[string] = @[]
+  collectEntries(src, files, dirs)
+  for f in files:
+    if startsWith(normSep(f), "capture\\"):
+      continue
+    discard copyFileAt(joinPath(src, f),
+      joinPath(joinPath(dest, "mods\\tarkov\\data"), f))
+
 proc cmdTest(e: Env): int =
   dropStaleCaches(e)
   heading "ABI layout (C)"
@@ -1356,6 +1409,7 @@ proc cmdTest(e: Env): int =
       discard copyFileAt(
         joinPath(e.repo, "mods\\tarkov\\bin\\tarkov.dll"),
         joinPath(flStage, "mods\\tarkov\\tarkov.dll"))
+      stageTarkovData(e, flStage)
       if fileExists(joinPath(e.repo, "mods\\tarkov\\config.json")):
         discard copyFileAt(
           joinPath(e.repo, "mods\\tarkov\\config.json"),
@@ -1447,6 +1501,37 @@ proc cmdTest(e: Env): int =
       discard run(e, "every registration is reached by the handler it named",
                   quoted(regRaceExe))
 
+    # And the wire format the post-1.0 client actually speaks, against bodies
+    # it actually sent.
+    #
+    # This gate exists because the failure it covers is silent. A post-1.0
+    # client wraps every request body in a length-keyed byte shuffle; the
+    # server did not unwrap it, so bodies arrived as noise with a 200 and no
+    # warning, and every route that ignores its body kept working. The client
+    # reached the character-selection screen against a server that had never
+    # read a single thing it was sent.
+    #
+    # It runs against `mods/tarkov/data/capture/raid1`, 149 real bodies from a
+    # live session, rather than against round-tripped synthetic ones -- a
+    # synthetic round trip through our own `bsgShuffle` passed against the
+    # broken server too, because it never touched the decision about *when* to
+    # unwrap. One of those 149 is why: seq 458's shuffled form happens to open
+    # with a valid zlib header, so a server that trusts the header reads it as
+    # a plain stream, fails, and gives up.
+    let wireExe = joinPath(e.repo, "installer\\build\\bsgwiretest.exe")
+    var bwCmd = quoted(nimonyExe(e))
+    bwCmd.add " c"
+    bwCmd.add abiInclude(e)
+    bwCmd.add " --passL:-lws2_32 --passL:-lz"
+    bwCmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
+    bwCmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
+    bwCmd.add " -p:" & quoted(joinPath(e.repo, "backend"))
+    bwCmd.add " -o:" & quoted(wireExe)
+    bwCmd.add " " & quoted(joinPath(e.repo, "tests\\bsgwiretest.nim"))
+    if run(e, "bsgwiretest builds", bwCmd, e.repo):
+      discard run(e, "every captured request body decodes the way the server " &
+                     "decodes it", quoted(wireExe) & " " & quoted(e.repo))
+
     # And the emulator, driven the way the client drives it: the boot sequence
     # in order, then a restart to prove the profile store is a store rather
     # than a cache.
@@ -1458,6 +1543,7 @@ proc cmdTest(e: Env): int =
       discard copyFileAt(
         joinPath(e.repo, "mods\\tarkov\\bin\\tarkov.dll"),
         joinPath(estage, "mods\\tarkov\\tarkov.dll"))
+      stageTarkovData(e, estage)
       if fileExists(joinPath(e.repo, "mods\\tarkov\\config.json")):
         discard copyFileAt(
           joinPath(e.repo, "mods\\tarkov\\config.json"),
@@ -1506,6 +1592,7 @@ proc cmdTest(e: Env): int =
         discard copyFileAt(
           joinPath(e.repo, "mods\\tarkov\\bin\\tarkov.dll"),
           joinPath(rstage, "mods\\tarkov\\tarkov.dll"))
+        stageTarkovData(e, rstage)
         if fileExists(joinPath(e.repo, "mods\\tarkov\\config.json")):
           discard copyFileAt(
             joinPath(e.repo, "mods\\tarkov\\config.json"),
@@ -1535,6 +1622,7 @@ proc cmdTest(e: Env): int =
       discard copyFileAt(
         joinPath(e.repo, "mods\\tarkov\\bin\\tarkov.dll"),
         joinPath(fstage, "mods\\tarkov\\tarkov.dll"))
+      stageTarkovData(e, fstage)
       if fileExists(joinPath(e.repo, "mods\\tarkov\\config.json")):
         discard copyFileAt(
           joinPath(e.repo, "mods\\tarkov\\config.json"),
@@ -1564,6 +1652,7 @@ proc cmdTest(e: Env): int =
       discard copyFileAt(
         joinPath(e.repo, "mods\\tarkov\\bin\\tarkov.dll"),
         joinPath(wstage, "mods\\tarkov\\tarkov.dll"))
+      stageTarkovData(e, wstage)
       if fileExists(joinPath(e.repo, "mods\\tarkov\\config.json")):
         discard copyFileAt(
           joinPath(e.repo, "mods\\tarkov\\config.json"),
@@ -1626,6 +1715,7 @@ proc cmdTest(e: Env): int =
       discard copyFileAt(
         joinPath(e.repo, "mods\\tarkov\\bin\\tarkov.dll"),
         joinPath(sstage, "mods\\tarkov\\tarkov.dll"))
+      stageTarkovData(e, sstage)
       if fileExists(joinPath(e.repo, "mods\\tarkov\\config.json")):
         discard copyFileAt(
           joinPath(e.repo, "mods\\tarkov\\config.json"),
@@ -1706,6 +1796,7 @@ proc cmdTest(e: Env): int =
       discard copyFileAt(
         joinPath(e.repo, "mods\\tarkov\\bin\\tarkov.dll"),
         joinPath(lstage, "mods\\tarkov\\tarkov.dll"))
+      stageTarkovData(e, lstage)
       if fileExists(joinPath(e.repo, "mods\\tarkov\\config.json")):
         discard copyFileAt(
           joinPath(e.repo, "mods\\tarkov\\config.json"),
@@ -1937,11 +2028,47 @@ proc cmdTest(e: Env): int =
   # builds" is not the bar -- each one has to load through the ABI and survive a
   # few ticks. Several carry their own self-tests and run them here.
   heading "Mods through the simulator"
+  # The stand-in runtime, in the environment, for the self-tests that want one.
+  # See `armSelfTestFixture`: this is the fixture the mods' `config.json` used
+  # to carry as a repository-relative path, which is a development path in a
+  # file that ships into a player's install.
+  let armed = armSelfTestFixture(e)
+  if not armed:
+    warn "no stand-in runtime at tests\\mockil2cpp\\GameAssembly.dll; the " &
+         "offline binding reports below run against the process"
   let realMods = modDirs(e)
   for m in realMods:
     if buildMod(e, m) and fileExists(sim):
       discard run(e, "sim " & baseName(m),
                   quoted(sim) & " " & quoted(m) & " --side sim --ticks 3")
+
+  # And the assertion that the fixture actually reached one of them.
+  #
+  # Without this the environment is exactly the shape of bug this change was
+  # made to remove: if `AOWLSPT_SELFTEST_RUNTIME` stopped being read, or
+  # stopped being inherited by the simulator, every self-test above would still
+  # pass -- they warn and fall back to the process, which is a legitimate
+  # answer -- and the binding coverage would be gone with nothing saying so.
+  # So one of them is run again with its output read, and the line that only
+  # appears when a runtime was loaded and started is required.
+  if armed and fileExists(sim):
+    let fovDir = joinPath(e.repo, "mods\\fov")
+    var report = ""
+    var code = -1
+    try:
+      let (o, c) = execCmdEx(quoted(sim) & " " & quoted(fovDir) &
+                             " --side sim --ticks 3", workingDir = e.repo)
+      report = o
+      code = c
+    except:
+      report = ""
+    if code == 0 and find(report, "bound and started") >= 0:
+      ok "the offline binding reports ran against the stand-in runtime"
+    else:
+      err "the stand-in runtime was set in AOWLSPT_SELFTEST_RUNTIME but no " &
+          "self-test bound it (exit " & $code & "); the binding reports above " &
+          "are against the process and prove less than they look like they do"
+      inc failures
 
   # The registry is the only file that claims to know every mod that exists,
   # and until now nothing checked the claim. Both halves of getting it wrong
@@ -2037,6 +2164,10 @@ proc cmdRun(e: Env; modPath: string; simArgs: string = ""): int =
   if not fileExists(sim):
     err "aowlspt-sim is not built. Run: aowl build-hosts"
     return 1
+  # A mod's `--side sim` self-test can ask for a runtime to bind against. The
+  # stand-in one lives in the repository, so it is this command's business to
+  # hand it over rather than the mod's config's -- see `armSelfTestFixture`.
+  discard armSelfTestFixture(e)
   var cmd = quoted(sim) & " " & quoted(absolutePathOf(modPath))
   if find(simArgs, "--side") < 0:
     cmd.add " --side sim"
@@ -2110,6 +2241,13 @@ proc cmdPayload(e: Env): int =
       var dataDirs: seq[string] = @[]
       collectEntries(dataDir, dataFiles, dataDirs)
       for f in dataFiles:
+        # `data/capture` is a recording of the real backend, kept to check this
+        # server against. It is not anything the server serves, and it is tens of
+        # megabytes -- most of it regenerated rather than stored, so a payload
+        # built on one machine would carry it and one built on another would not.
+        # Skipped by name rather than by size, because "large" is not the reason.
+        if startsWith(normSep(f), "capture\\"):
+          continue
         let to2 = joinPath(joinPath(joinPath(joinPath(dest, "mods"),
                                              baseName(m)), "data"), f)
         if copyFileAt(joinPath(dataDir, f), to2).ok:

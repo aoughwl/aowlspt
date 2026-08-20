@@ -550,7 +550,7 @@ This is the piece that makes the rest make sense.
 The game needs a server, and SPT's targets a pre-1.0 client. So there is one
 here — `mods/tarkov`, guid `aowl.tarkov` — and it is an ordinary mod. It imports
 `aowlspt`, `aowlspt/server` and `aowlspt/json` and **nothing else**. It has no
-private door into the host. It registers its 95 routes with the same `serve`
+private door into the host. It registers its 99 routes with the same `serve`
 and `servePrefix` any mod uses, persists profiles through the same `save`/`load`
 every mod gets, and is loaded by the same `modhost.loadMod` as everything else.
 Its `exportMod` declares `sides = {sideServer, sideSim}`.
