@@ -25,6 +25,7 @@ import aowlspt/server
 import aowlspt/json
 import ids
 import numbers
+import starter
 
 const
   KeyPrefix* = "profile."
@@ -257,8 +258,11 @@ proc newProfileText*(id, nickname, sideName, edition: string;
   put(inventory, "favoriteItems", arr())
 
   var skills = obj()
-  put(skills, "Common", arr())
-  put(skills, "Mastering", arr())
+  # The 54 Common skills and the one Mastering entry a fresh standard-edition
+  # profile carries (capture seq 096), all at Progress 0. An empty list here is
+  # not fatal but leaves the Skills screen blank; the client renders from these.
+  put(skills, "Common", raw(StarterSkillsCommon))
+  put(skills, "Mastering", raw(StarterSkillsMastering))
   put(skills, "Points", 0)
 
   var stats = obj()
@@ -278,7 +282,10 @@ proc newProfileText*(id, nickname, sideName, edition: string;
   put(stats, "Eft", eft)
 
   var hideout = obj()
-  put(hideout, "Areas", arr())
+  # All 27 hideout areas at their standard-edition starting levels (capture seq
+  # 096): the stash starts at level 1, the rest unbuilt. An empty Areas list
+  # leaves the hideout screen with nothing to draw and no stash area to key on.
+  put(hideout, "Areas", raw(StarterHideoutAreas))
   put(hideout, "Improvements", obj())
   # The two maps `emu/decorate` writes: which floor, wall, ceiling and target
   # the hideout wears, and which pose each mannequin is in. Empty rather than
@@ -310,8 +317,16 @@ proc newProfileText*(id, nickname, sideName, edition: string;
   put(p, "TaskConditionCounters", obj())
   put(p, "InsuredItems", arr())
   put(p, "Hideout", hideout)
-  put(p, "Bonuses", arr())
+  # The two bonuses a fresh standard profile carries (capture seq 096): the
+  # StashSize bonus (which is what gives the stash its grid) and the starting
+  # weapon-modification unlock. Without the StashSize bonus the stash renders at
+  # its base template size.
+  put(p, "Bonuses", raw(StarterBonuses))
   put(p, "Notes", objOf("Notes", arr()))
+  # Starting quests are left empty on purpose: capture 096 shows two intro
+  # quests pre-started, but those ids are game-version specific and pre-starting
+  # a quest the emulator's quest tables may not carry risks a broken hand-in.
+  # The client draws all available quests from /client/quest/list regardless.
   put(p, "Quests", arr())
   put(p, "ConditionCounters", objOf("Counters", arr()))
   var ragfair = obj()
@@ -326,6 +341,26 @@ proc newProfileText*(id, nickname, sideName, edition: string;
   put(p, "moneyTransferLimitData", obj())
   put(p, "Achievements", arr())
   put(p, "Prestige", arr())
+  # Post-1.0 top-level members the client's Profile DTO reads (capture seq 096).
+  # Empty is the fresh-profile state; the point is that the key is present, so a
+  # read of `profile.Variables[...]` or the seasonal/battle-pass screens find a
+  # collection to index rather than null.
+  put(p, "Variables", obj())
+  put(p, "CompletableItems", arr())
+  put(p, "UnlockedLocations", arr())
+  # Ending carries {current, achieved}.
+  var ending = obj()
+  put(ending, "current", "")
+  put(ending, "achieved", arr())
+  put(p, "Ending", ending)
+  put(p, "QuestNotes", obj())
+  put(p, "ReadQuestData", arr())
+  put(p, "SeasonalPerks", arr())
+  put(p, "SeasonalPerkEffectParameters", obj())
+  put(p, "SeasonalRewards", arr())
+  put(p, "BattlePassProgress", arr())
+  put(p, "BattlePassUniversalDocumentBalance", 0)
+  put(p, "battlePassDocumentLimitData", obj())
   result = done(p).text
 
 # ---------------------------------------------------------------------------

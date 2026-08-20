@@ -201,11 +201,17 @@ proc onGameConfig(url, body, session: string): string =
   put(backend, "Trading", BackendUrl)
   put(backend, "Messaging", BackendUrl)
   put(backend, "RagFair", BackendUrl)
+  # `Lobby` and `Static` are read by the client too (matchmaking lobby and the
+  # asset CDN). Point both at this backend so nothing reaches for the real
+  # BSG hosts; the client never validates that they answer.
+  put(backend, "Lobby", BackendUrl)
+  put(backend, "Static", BackendUrl)
   var o = obj()
   put(o, "aid", if p.ok: p.field("aid").asInt(0) else: 0)
   put(o, "lang", "en")
   put(o, "languages", raw(languages()))
   put(o, "ndid", session)
+  put(o, "ndaFree", false)
   put(o, "taxonomy", 341)
   put(o, "activeProfileId", p.id)
   put(o, "backend", backend)
@@ -214,6 +220,23 @@ proc onGameConfig(url, body, session: string): string =
   put(o, "totalInGame", 0)
   put(o, "reportAvailable", false)
   put(o, "twitchEventMember", false)
+  # Post-1.0 game-mode / ownership fields. The client's GameConfigResponse reads
+  # each of these by name to decide which mode tiles are shown and whether the
+  # account is fully synced. `purchasedGames`/`availableGameModes` are small
+  # fixed dicts it indexes; a missing key here reads as "not owned" at best and
+  # a null-deref at worst on the mode-select screen.
+  put(o, "sessionMode", "regular")
+  var purchased = obj()
+  put(purchased, "eft", true)
+  put(purchased, "arena", false)
+  put(o, "purchasedGames", purchased)
+  put(o, "isGameSynced", true)
+  put(o, "linkedPlatforms", raw("[]"))
+  var modes = obj()
+  put(modes, "regular", true)
+  put(modes, "pve", false)
+  put(modes, "pvp-season", true)
+  put(o, "availableGameModes", modes)
   result = envelope(o)
 
 proc onGameStart(url, body, session: string): string =
@@ -336,6 +359,18 @@ proc onProfilesV2(url, body, session: string): string =
   # slot. The dict key "regular" binds that slot to the mode; the value's own
   # field casing is what remains (see characterSlot).
   result = envelope(modes)
+
+proc onShopStatus(url, body, session: string): string =
+  ## `/v2/client/shop/status` -- the in-game-store account summary. The client
+  ## reads `aid`, `labels` and `tarcoins` by name (capture seq 501); an empty
+  ## object is a KeyNotFound on the store screen. There is no store here, so the
+  ## wallet is empty and there are no labels, but the shape is the real one.
+  let p = currentProfile(session)
+  var o = obj()
+  put(o, "aid", if p.ok: p.field("aid").asInt(0) else: 0)
+  put(o, "labels", raw("[]"))
+  put(o, "tarcoins", 0)
+  result = envelope(o)
 
 proc onProfileSelect(url, body, session: string): string =
   ## Binds this session to a profile. The id comes out of the request body, and
@@ -1312,9 +1347,10 @@ proc onCancelAllInvites(url, body, session: string): string =
   ## `/client/match/group/invite/cancel-all`. There are no groups here, so
   ## there is nothing to cancel and that is a success rather than a refusal --
   ## the client sends this on the way into a raid and a failure would read as
-  ## a raid it could not enter.
+  ## a raid it could not enter. The wire answer is the literal `true`
+  ## (capture seq 504), not null.
   inc gRequests
-  result = envelopeNull()
+  result = envelope(raw("true"))
 
 proc onQuestComplete(url, body, session: string): string =
   ## `POST /client/quest/complete` -- post-1.0's own hand-in route.
@@ -1408,12 +1444,22 @@ proc onItemPrices(url, body, session: string): string =
       if tpl.len > 0:
         put(prices, tpl, entry.field("Price").asInt(0))
   var courses = obj()
-  # The handbook is where the game keeps the exchange rate; a currency it does
-  # not price is left out rather than given an invented one.
+  # `currencyCourses` is keyed by the currency's own item TEMPLATE ID, not by a
+  # name like "usd" (capture seq 317): the client looks the rate up by the tpl
+  # of the currency an offer is priced in. Keying it "usd"/"eur" meant every
+  # lookup missed and the flea comparison fell back to a rouble rate of 1. The
+  # handbook is where the game keeps the rate; a currency it does not price is
+  # left out rather than given an invented one. Roubles are the unit: 1.
+  const RoublesTpl = "5449016a4bdc2d6f028b456f"
+  put(courses, RoublesTpl, 1)
   let usd = handbookPrice(Dollars)
-  if usd > 0: put(courses, "usd", usd)
+  if usd > 0: put(courses, Dollars, usd)
   let eur = handbookPrice(Euros)
-  if eur > 0: put(courses, "eur", eur)
+  if eur > 0: put(courses, Euros, eur)
+  # GP coin (the collector currency); included when the handbook prices it.
+  const GpCoin = "5d235b4d86f7742e017bc88a"
+  let gp = handbookPrice(GpCoin)
+  if gp > 0: put(courses, GpCoin, gp)
   var o = obj()
   put(o, "supplyNextTime", nowSeconds() + 3600)
   put(o, "prices", prices)
@@ -1829,9 +1875,50 @@ proc onMatchAvailable(url, body, session: string): string =
   inc gRequests
   result = envelope(raw("true"))
 
-proc onMatchGroup(url, body, session: string): string =
+proc onMatchJoin(url, body, session: string): string =
+  ## `/client/match/join` -- the online-matchmaking join (capture seq 379). The
+  ## answer is `{maxPveCountExceeded, profiles:[MatchProfile], estimate}`, and
+  ## every field is one the client reads by name; a 404 here returns the raw
+  ## `{"err":"no route"}` body, whose string `err` throws the typed
+  ## `MatchGroupStatusResponse` deserialise (an HTTPParsingResponseException)
+  ## rather than being handled as a server error. There is no matchmaking server
+  ## behind this emulator, so the one profile it puts in `MatchWait` is the
+  ## player's own; the offline raid the client actually plays goes through
+  ## `/client/match/local/start`, which is unaffected.
   inc gRequests
-  result = envelope(objOf("squad", arr()))
+  let p = currentProfile(session)
+  let loc = field(body, "location").asText("")
+  var prof = obj()
+  put(prof, "profileid", if p.ok: p.id else: "")
+  put(prof, "profileToken", session)
+  put(prof, "status", "MatchWait")
+  put(prof, "ip", "")
+  put(prof, "port", 0)
+  put(prof, "sid", "")
+  put(prof, "version", if p.ok: p.field("Info.GameVersion").asText("live") else: "live")
+  put(prof, "location", loc)
+  put(prof, "raidMode", "Online")
+  put(prof, "mode", "deathmatch")
+  put(prof, "shortId", jnull())
+  put(prof, "additional_info", jnull())
+  var profiles = arr()
+  profiles.add done(prof)
+  var o = obj()
+  put(o, "maxPveCountExceeded", false)
+  put(o, "profiles", profiles)
+  put(o, "estimate", 0)
+  result = envelope(o)
+
+proc onMatchGroup(url, body, session: string): string =
+  ## `/client/match/group/current` -- `GroupMatchRaidSettings` on the wire is
+  ## `{squad:[], raidSettings:null}`. The client reads `raidSettings` by name to
+  ## restore a pending group raid; omitting the key is a KeyNotFound where it
+  ## reads null. There is no group here, so both are empty.
+  inc gRequests
+  var o = obj()
+  put(o, "squad", arr())
+  put(o, "raidSettings", jnull())
+  result = envelope(o)
 
 proc onWeather(url, body, session: string): string =
   ## The sky. A constant -- temperature 18, season 1 -- until now, and that was
@@ -2198,7 +2285,7 @@ proc registerRoutes() =
   # was stuck on "loading profile data" because this 404'd. `servePrefix` covers
   # the trailing slash the client sends.
   discard servePrefix("/v2/client/game/profiles", onProfilesV2)
-  discard servePrefix("/v2/client/shop/status", onEmptyObject)
+  discard servePrefix("/v2/client/shop/status", onShopStatus)
   discard serve("/client/game/profile/select", onProfileSelect)
   discard serve("/client/game/profile/create", onProfileCreate)
   discard serve("/client/game/profile/nickname/validate", onNicknameValidate)
@@ -2269,6 +2356,7 @@ proc registerRoutes() =
   discard serve("/client/match/local/start", onMatchStart)
   discard serve("/client/match/local/end", onMatchEnd)
   discard serve("/client/match/available", onMatchAvailable)
+  discard serve("/client/match/join", onMatchJoin)
   discard serve("/client/match/group/current", onMatchGroup)
   discard serve("/client/match/group/status", onMatchGroup)
   discard serve("/client/match/group/exit_from_menu", onNullData)
@@ -2316,7 +2404,9 @@ proc registerRoutes() =
   discard serve("/client/friend/request/list/inbox", onEmptyArray)
   discard serve("/client/friend/request/list/outbox", onEmptyArray)
   discard serve("/client/chatServer/list", onChatServerList)
-  discard serve("/client/survey", onEmptyObject)
+  # No active survey: the wire answer is `data:null` (capture seq 500), not an
+  # empty object -- the client null-checks the survey before reading it.
+  discard serve("/client/survey", onNullData)
   discard serve("/client/survey/view", onNullData)
   discard serve("/client/survey/opinion", onNullData)
   discard serve("/client/prestige/list", onPrestigeList)

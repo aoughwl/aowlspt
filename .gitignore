@@ -69,3 +69,7 @@ build/db/
 # names an absolute path from one machine, which is the other half of why a
 # clone must not have it.
 mods/aowlspt-selection.json
+
+# validation scratch (agent worktree)
+.test-root/
+.validate/

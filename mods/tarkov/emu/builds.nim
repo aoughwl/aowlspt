@@ -110,6 +110,13 @@ proc saveBuild*(profileId, kind, body: string; problem: var string): string =
   var entry = newDoc()
   setText(entry, "Id", id)
   setText(entry, "Name", name)
+  # `type` is a discriminator the client reads on every build to route it to the
+  # right list on the loadout screen (capture seq 441): "weapon"/"equipment"/
+  # "magazine". A build without it is dropped from the screen it belongs on.
+  setText(entry, "type",
+    (if kind == "weaponBuilds": "weapon"
+     elif kind == "equipmentBuilds": "equipment"
+     else: "magazine"))
   let root = field(body, "Root").asText(field(body, "root").asText(""))
   if root.len > 0:
     setText(entry, "Root", root)
