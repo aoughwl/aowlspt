@@ -57,13 +57,18 @@ import perfphase
 # none -- so the process simply vanishes. That is exactly the shape of the raid
 # entry crash: the log's last line is an ordinary request and then nothing.
 #
-# This installs a last-resort filter that fires only for a *genuinely unhandled*
-# fault -- `SetUnhandledExceptionFilter`, not a first-chance VEH, so the guarded
-# faults elsewhere in this repo (`aowl_seh_veh`, `mr_veh`, which recover and
-# continue) are never mistaken for a crash. It writes the faulting instruction
-# as module+offset (the map file turns that into a symbol), the address that was
-# touched, the offending thread, and a short return-address stack -- to stderr
-# and to the same log file as everything else -- and then lets the process die.
+# This installs two handlers that share one report body. A first-chance vectored
+# handler catches the terminal codes -- including a heap-corruption fast-fail
+# (`STATUS_HEAP_CORRUPTION` / `__fastfail`), which the runtime terminates on
+# WITHOUT ever calling an unhandled-exception filter, so the filter alone caught
+# nothing and the process just vanished. It logs and returns `CONTINUE_SEARCH`,
+# never swallowing, so the repo's deliberate-and-recovered handlers
+# (`aowl_seh_veh`, `mr_veh`, neither armed in the serving backend) still work and
+# a real fault still dies. A `SetUnhandledExceptionFilter` remains as the
+# last-resort catch for an ordinary unhandled fault that was not a fast-fail, and
+# terminates without a WER dialog. Each writes the faulting instruction as
+# module+offset (the map file turns that into a symbol), the touched address, the
+# thread, and a return-address stack -- to stderr and the backend log.
 # `RtlCaptureStackBackTrace` and `GetModuleHandleExA` are all it uses; a crash
 # handler must not allocate, take a lock, or load `dbghelp`, and this does none.
 {.emit: """
@@ -122,7 +127,18 @@ static uintptr_t aowl_crash_resolve(void* addr, char* nameOut) {
     return (uintptr_t)addr;
 }
 
-static LONG WINAPI aowl_crash_filter(EXCEPTION_POINTERS* ep) {
+/* STATUS codes the SDK headers do not always define. */
+#ifndef STATUS_HEAP_CORRUPTION
+#  define STATUS_HEAP_CORRUPTION 0xC0000374L
+#endif
+#ifndef STATUS_STACK_BUFFER_OVERRUN
+#  define STATUS_STACK_BUFFER_OVERRUN 0xC0000409L   /* __fastfail lands here */
+#endif
+
+/* The whole report: what faulted, where (module+offset), the touched address,
+ * the thread, and a return-address backtrace. Shared by the first-chance VEH
+ * and the last-resort filter. `origin` says which caught it. */
+static void aowl_crash_report(EXCEPTION_POINTERS* ep, const char* origin) {
     EXCEPTION_RECORD* er = ep->ExceptionRecord;
     CONTEXT* c = ep->ContextRecord;
     void* rip = (void*)(uintptr_t)c->Rip;
@@ -132,20 +148,22 @@ static LONG WINAPI aowl_crash_filter(EXCEPTION_POINTERS* ep) {
     uintptr_t off = aowl_crash_resolve(rip, modname);
 
     const char* kind =
-        code == EXCEPTION_ACCESS_VIOLATION ? "ACCESS_VIOLATION" :
-        code == EXCEPTION_IN_PAGE_ERROR    ? "IN_PAGE_ERROR" :
-        code == EXCEPTION_ILLEGAL_INSTRUCTION ? "ILLEGAL_INSTRUCTION" :
-        code == EXCEPTION_STACK_OVERFLOW   ? "STACK_OVERFLOW" : "exception";
+        code == EXCEPTION_ACCESS_VIOLATION     ? "ACCESS_VIOLATION" :
+        (DWORD)STATUS_HEAP_CORRUPTION == code  ? "HEAP_CORRUPTION" :
+        (DWORD)STATUS_STACK_BUFFER_OVERRUN == code ? "STACK_BUFFER_OVERRUN/fastfail" :
+        code == EXCEPTION_IN_PAGE_ERROR        ? "IN_PAGE_ERROR" :
+        code == EXCEPTION_ILLEGAL_INSTRUCTION  ? "ILLEGAL_INSTRUCTION" :
+        code == EXCEPTION_STACK_OVERFLOW       ? "STACK_OVERFLOW" : "exception";
     void* addr = er->NumberParameters >= 2
         ? (void*)(uintptr_t)er->ExceptionInformation[1] : NULL;
     long rw = er->NumberParameters >= 1 ? (long)er->ExceptionInformation[0] : -1;
 
     char line[1024];
     snprintf(line, sizeof(line),
-        "\n*** aowlspt-backend FATAL %s (0x%08lx) ***\n"
+        "\n*** aowlspt-backend FATAL %s (0x%08lx, %s) ***\n"
         "    at   %p  %s+0x%llx\n"
         "    %s address %p  (thread %lu)\n",
-        kind, (unsigned long)code,
+        kind, (unsigned long)code, origin,
         rip, modname, (unsigned long long)off,
         rw == 0 ? "reading" : rw == 1 ? "writing" : rw == 8 ? "executing"
                                                             : "touching",
@@ -164,15 +182,62 @@ static LONG WINAPI aowl_crash_filter(EXCEPTION_POINTERS* ep) {
                  (unsigned)i, frames[i], fn, (unsigned long long)fo);
         aowl_crash_write(fl);
     }
-    aowl_crash_write("*** end crash report; process terminating ***\n\n");
+    aowl_crash_write("*** end crash report ***\n\n");
+}
 
-    /* Terminate here rather than falling through to WER: a headless loopback
-     * server that pops a Windows Error Reporting dialog is a server that hangs
-     * dead instead of dying, and the main session is waiting to relaunch it. */
+/* First-chance VEH. This is the half that catches the class the filter cannot:
+ * a heap-corruption fast-fail (`STATUS_HEAP_CORRUPTION` / the `__fastfail` that
+ * `STATUS_STACK_BUFFER_OVERRUN` rides in on) is terminated by the runtime
+ * WITHOUT ever consulting `SetUnhandledExceptionFilter`, so the last logged line
+ * is an ordinary request and the process is simply gone -- the exact signature
+ * the retest saw. A vectored handler runs at first-chance, before that.
+ *
+ * Three rules keep it from doing harm on a shared exception path:
+ *   * it acts only on the terminal codes and returns `CONTINUE_SEARCH` for
+ *     everything else, so a benign C++ throw or debugger event passes through;
+ *   * it NEVER converts or swallows -- always `CONTINUE_SEARCH` -- so the repo's
+ *     deliberate-and-recovered handlers (`aowl_seh_veh`, `mr_veh`, neither of
+ *     which is even armed in the serving backend) still get their fault and the
+ *     process still dies for a real one;
+ *   * a re-entrancy latch and a small cap stop a corruption that repeats on
+ *     every thread from recursing through the logger or filling the log. */
+static volatile LONG aowl_crash_inveh = 0;
+static volatile LONG aowl_crash_count = 0;
+
+static LONG CALLBACK aowl_crash_veh(EXCEPTION_POINTERS* ep) {
+    DWORD code = ep->ExceptionRecord->ExceptionCode;
+    if (code != EXCEPTION_ACCESS_VIOLATION &&
+        code != (DWORD)STATUS_HEAP_CORRUPTION &&
+        code != (DWORD)STATUS_STACK_BUFFER_OVERRUN &&
+        code != EXCEPTION_IN_PAGE_ERROR &&
+        code != EXCEPTION_ILLEGAL_INSTRUCTION &&
+        code != EXCEPTION_STACK_OVERFLOW)
+        return EXCEPTION_CONTINUE_SEARCH;
+    if (InterlockedCompareExchange(&aowl_crash_inveh, 1, 0) != 0)
+        return EXCEPTION_CONTINUE_SEARCH;
+    if (InterlockedIncrement(&aowl_crash_count) <= 3)
+        aowl_crash_report(ep, "first-chance");
+    InterlockedExchange(&aowl_crash_inveh, 0);
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+/* Last resort: a genuinely unhandled fault that was NOT a fast-fail. Reached
+ * only if the VEH let it through (it always does) and nothing recovered it. It
+ * terminates rather than falling through to WER, so a headless loopback server
+ * dies cleanly instead of hanging on an error dialog the main session cannot
+ * dismiss. */
+static LONG WINAPI aowl_crash_filter(EXCEPTION_POINTERS* ep) {
+    if (InterlockedCompareExchange(&aowl_crash_inveh, 1, 0) == 0) {
+        if (InterlockedIncrement(&aowl_crash_count) <= 3)
+            aowl_crash_report(ep, "unhandled");
+        InterlockedExchange(&aowl_crash_inveh, 0);
+    }
+    aowl_crash_write("*** process terminating ***\n\n");
     return EXCEPTION_EXECUTE_HANDLER;
 }
 
 static void aowl_crash_install(void) {
+    AddVectoredExceptionHandler(1, aowl_crash_veh);
     SetUnhandledExceptionFilter(aowl_crash_filter);
 }
 """.}

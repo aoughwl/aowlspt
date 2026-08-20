@@ -318,7 +318,16 @@ static DWORD WINAPI push_thread(LPVOID p) {
 }
 
 static void make_big(void) {
-    int32_t payload = 4 * 1024 * 1024;
+    /* A realistic notification, not the 4 MB monster this once was. That size
+     * existed to fill the socket buffer and force the old worker-side send to
+     * *block* under the write lock -- the stall this test was written around.
+     * There is no worker-side send any more: a push is appended to the
+     * connection's `wsOut` (bounded by `AOWL_WS_OUT_CAP`) and the poller drains
+     * it, so a frame larger than that bound is refused rather than queued, and a
+     * 4 MB push would simply never reach the queue this now checks. Eight
+     * kilobytes is above any notification the game makes and well inside the
+     * bound, so the pushes go through the queue and the drain is exercised. */
+    int32_t payload = 8 * 1024;
     g_bigLen = 10 + payload;
     g_big = (char*)malloc((size_t)g_bigLen);
     memset(g_big, 'x', (size_t)g_bigLen);
@@ -385,10 +394,16 @@ int main(int argc, char** argv) {
     int calls = (int)InterlockedCompareExchange(&g_pushCalls, 0, 0);
     int pushWorst = (int)InterlockedCompareExchange(&g_pushWorst, 0, 0);
     printf("      %d pushes into a client that will not read, "
-           "the slowest holding the lock %d ms (AOWL_WS_SEND_MS is %d)\n",
-           calls, pushWorst, (int)AOWL_WS_SEND_MS);
-    ok("the pushes really are stuck on the lock",
-       calls > 0 && pushWorst >= AOWL_WS_SEND_MS - 40);
+           "the slowest taking %d ms\n", calls, pushWorst);
+    /* The invariant is now the opposite of what it once was. A worker no longer
+     * writes the socket at all: `aowl_ws_send` off the poller thread appends the
+     * frame to the connection's `wsOut` and returns, so a push at a client that
+     * will not read is a bounded memcpy, never a blocking send. It must not
+     * approach `AOWL_WS_SEND_MS` -- if it does, a worker is waiting on a peer
+     * somewhere it should not be, which is the concurrent-SSL hazard this
+     * removed. */
+    ok("a push at a client that will not read never blocks the worker",
+       calls > 0 && pushWorst < 150);
     printf("      %d ordinary requests during the stall, slowest %d ms\n",
            made, worst);
     ok("every ordinary request during the stall was answered",
@@ -420,13 +435,17 @@ int main(int argc, char** argv) {
     ok("the close frame was not dropped", op == 0x8);
     ok("and it carried a status", op == 0x8 && blen == 2);
 
-#if defined(AOWL_WS_PEND_CAP)
-    printf("      %ld frames were queued rather than written\n",
-           (long)InterlockedCompareExchange(&g_wsDeferred, 0, 0));
-    ok("the queue is what carried them",
-       InterlockedCompareExchange(&g_wsDeferred, 0, 0) > 0);
+#if defined(AOWL_WS_OUT_CAP)
+    /* The push went onto the connection's outbound queue -- the buffer a
+     * non-poller thread appends to and the poller alone drains onto the wire.
+     * That queue existing and having carried the pushes is the mechanism that
+     * keeps a worker off the `SSL` handle the poller is reading. */
+    printf("      %ld pushes went onto the outbound queue for the poller\n",
+           (long)InterlockedCompareExchange(&g_wsQueued, 0, 0));
+    ok("the outbound queue is what carried them",
+       InterlockedCompareExchange(&g_wsQueued, 0, 0) > 0);
 #else
-    printf("      (this build has no queue -- the poller waits instead)\n");
+    printf("      (this build has no outbound queue)\n");
 #endif
 
     /* The server is unchanged. */
