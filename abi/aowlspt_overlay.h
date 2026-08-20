@@ -109,6 +109,7 @@
 #include <stdint.h>
 #include <string.h>
 #include <stdio.h>
+#include <stdlib.h>       /* strtod, for a float control's value */
 #include <stdarg.h>
 
 #include "aowlspt_detour.h"
@@ -615,13 +616,19 @@ typedef enum AowlOvCmdKind {
     AOWL_CMD_CLEAR,        /* GET  /clear/<id>                  */
     AOWL_CMD_SELECT,       /* GET  /select/<list-id>            */
     AOWL_CMD_APPLY,        /* GET  /apply                       */
-    AOWL_CMD_RELOAD        /* GET  /reload                      */
+    AOWL_CMD_RELOAD,       /* GET  /reload                      */
+    AOWL_CMD_SPAGE,        /* GET  a settings page's controls   */
+    AOWL_CMD_SSET          /* POST one settings edit            */
 } AowlOvCmdKind;
 
 typedef struct AowlOvCmd {
     int32_t kind;
-    char    guid[80];      /* the mod id, or the list id, or ""  */
-    int32_t enabled;
+    char    guid[80];      /* the mod id, or the list id, or the page id */
+    int32_t enabled;       /* the bool arg, or isMod for a settings page */
+    /* Only the settings commands use these. `SPAGE` leaves them empty; `SSET`
+     * carries the one row it is changing, as its key and a JSON literal. */
+    char    skey[80];
+    char    sval[96];
 } AowlOvCmd;
 
 /* Which pane is on screen. */
@@ -644,6 +651,71 @@ typedef enum AowlOvFilter {
     AOWL_FILTER_OVERRIDDEN,
     AOWL_FILTER_COUNT
 } AowlOvFilter;
+
+/* ================================================================== *
+ * Settings mode
+ *
+ * The overlay has a second face: the revamped in-game settings screen the F12
+ * key is really for. The mod-manager views above answer "what is loaded"; this
+ * answers "what can I change". It is a left-hand page nav -- one page per loaded
+ * mod, then the whole SPT server config surface -- and a right-hand column of
+ * controls drawn from the schema each page serves. The two faces share every
+ * primitive (the vertex buffer, the font, the input ring, the worker) and are
+ * switched with the header toggle or F2.
+ *
+ * The schema comes over the same worker thread as everything else: a mod's page
+ * is `GET /aowlspt/settings/<guid>` (a mod already serves its own declared
+ * schema there, current values folded in), and the SPT pages come from the
+ * settings hub -- an index at `/aowlspt/settings/spt/index` and one page at
+ * `/aowlspt/settings/spt/page/<id>`. An edit on an implemented row POSTs the one
+ * key back to the mod's page, which persists it into `config.json`; every SPT
+ * row, and every mod row a mod flagged `implemented:false`, is drawn greyed with
+ * a NOT-IMPL badge and cannot be changed, because nothing behind it would act on
+ * the change yet. That honesty is a hard requirement, not a nicety. */
+
+#define AOWL_OV_MAX_SPAGES   48    /* mod pages + 28 SPT pages + margin */
+#define AOWL_OV_MAX_SITEMS   420   /* controls on the one loaded page   */
+#define AOWL_OV_SOPT_MAX     10    /* enum choices kept per control     */
+
+typedef enum AowlOvSKind {
+    AOWL_S_BOOL = 0,
+    AOWL_S_INT,
+    AOWL_S_FLOAT,
+    AOWL_S_ENUM,
+    AOWL_S_STRING,
+    AOWL_S_KEYBIND,
+    AOWL_S_NESTED      /* an SPT list/dict, listed for completeness, raw only */
+} AowlOvSKind;
+
+/* One page in the left nav. `isMod` decides where its controls are fetched
+ * from; `count`/`done` come from the index so the nav can show "3/6 done"
+ * without loading the page. -1 means the index did not say. */
+typedef struct AowlOvSPage {
+    char    id[80];
+    char    label[48];
+    int32_t isMod;
+    int32_t count;
+    int32_t done;
+} AowlOvSPage;
+
+/* One control. Fixed-size, like every other table the render thread walks: the
+ * worker fills it under the lock and the render thread reads a snapshot. `raw`
+ * is the value as a JSON literal (`1.5`, `true`, `"M"`) -- what an edit POSTs
+ * back -- and `value` is the same thing formatted for the row. */
+typedef struct AowlOvSItem {
+    char    key[80];
+    char    label[64];
+    int32_t kind;
+    char    value[64];
+    char    raw[64];
+    float   lo, hi, step;
+    int32_t hasRange;
+    char    opts[AOWL_OV_SOPT_MAX][28];
+    int32_t optCount;
+    char    category[64];
+    char    desc[192];
+    int32_t implemented;
+} AowlOvSItem;
 
 typedef struct AowlOvState {
     /* --- lifecycle --- */
@@ -685,6 +757,7 @@ typedef struct AowlOvState {
     volatile LONG visible;
     volatile LONG mx, my;
     volatile LONG clickDown;     /* set by WM_LBUTTONDOWN, cleared on consume */
+    volatile LONG mouseHeld;     /* the left button is down right now (for sliders) */
     volatile LONG cursorLocked;  /* the game is using raw input; we integrate deltas */
     volatile LONG wheel;         /* accumulated WM_MOUSEWHEEL notches */
 
@@ -710,6 +783,18 @@ typedef struct AowlOvState {
     int32_t          resultCount;
     AowlOvCmd        cmds[AOWL_OV_MAX_CMDS];
     int32_t          cmdCount;
+
+    /* --- settings mode, worker side (under `cs`) --- */
+    AowlOvSPage      pages[AOWL_OV_MAX_SPAGES];    /* the merged nav: mods then SPT */
+    int32_t          pageCount;
+    AowlOvSPage      sptPages[AOWL_OV_MAX_SPAGES]; /* the SPT half, as the hub gave it */
+    int32_t          sptPageCount;
+    int32_t          sptGot;        /* the SPT index has answered at least once */
+    AowlOvSItem      items[AOWL_OV_MAX_SITEMS];    /* the one loaded page's controls */
+    int32_t          itemCount;
+    char             itemsPage[80]; /* which page id `items` holds ("" = none)   */
+    int32_t          itemsErr;      /* the last page fetch failed */
+    int32_t          itemsImpl;     /* implemented count on the loaded page */
 
     /* The wrapper scalars every reply carries, kept because the panel is
      * required to show what the backend said rather than a paraphrase. */
@@ -790,9 +875,29 @@ typedef struct AowlOvState {
     int32_t      sClientHost, sClientSeq, sClientRows, sClientMore;
     char         sClientSession[20];
 
+    /* The settings-mode snapshot, same discipline as the tables above. */
+    AowlOvSPage  sPages[AOWL_OV_MAX_SPAGES];
+    int32_t      sPageCount;
+    AowlOvSItem  sItems[AOWL_OV_MAX_SITEMS];
+    int32_t      sItemCount;
+    char         sItemsPage[80];
+    int32_t      sItemsErr, sItemsImpl;
+
     int32_t view;
     int32_t filter;
     int32_t scale;         /* 1, 2 or 3 -- see aowl_ov_scale */
+
+    /* --- settings mode, render side --- */
+    int32_t settings;          /* 0 = mod manager, 1 = the settings screen */
+    int32_t selPage, topPage;  /* the nav cursor and its scroll             */
+    int32_t selItem, topItem;  /* the control cursor and its scroll         */
+    char    curPage[80];       /* the page id the render thread wants loaded */
+    int32_t curPageIsMod;
+    int32_t editItem;          /* the row being text/keybind-edited, or -1   */
+    char    editBuf[64];       /* the in-progress edit text                  */
+    int32_t capturing;         /* a keybind row is waiting for the next key  */
+    int32_t dragItem;          /* the slider being dragged, or -1            */
+    float   dragVal;           /* its live value while the button is held    */
 
     /* --- the geometry cache ---
      *
@@ -1813,6 +1918,207 @@ static void aowl_ov_read_reply(const char* body, int32_t len, const char* what) 
 /* Fills `out` and returns its length, or -1. Sets the reachability light and
  * the status line as a side effect, because every caller wants both and the
  * one thing worse than a wrong answer here is a stale "backend up". */
+/* ------------------------------------------------------------------ *
+ * Settings schema readers
+ *
+ * The same structural walker as the mod-control readers above, turned on the
+ * two shapes the settings screen fetches: a mod's page is a flat array of
+ * control objects, and an SPT page is one object with a `settings` array and a
+ * `nested` array. Both feed the one `items` table.
+ * ------------------------------------------------------------------ */
+
+static const char* aowl_ov_jraw(const char* v, const char* end,
+                                char* out, int32_t cap) {
+    const char* ve;
+    int32_t n;
+    out[0] = 0;
+    if (!v) return NULL;
+    v = aowl_ov_jws(v, end);
+    ve = aowl_ov_jval_end(v, end);
+    n = (int32_t)(ve - v);
+    if (n < 0) n = 0;
+    if (n > cap - 1) n = cap - 1;
+    memcpy(out, v, (size_t)n);
+    out[n] = 0;
+    return ve;
+}
+
+static float aowl_ov_jfloat(const char* v, const char* end, float dflt) {
+    char tmp[48];
+    int32_t i = 0;
+    if (!v) return dflt;
+    v = aowl_ov_jws(v, end);
+    while (v < end && i < 47 &&
+           (*v == '-' || *v == '+' || *v == '.' || *v == 'e' || *v == 'E' ||
+            (*v >= '0' && *v <= '9'))) tmp[i++] = *v++;
+    tmp[i] = 0;
+    if (!i) return dflt;
+    return (float)strtod(tmp, NULL);
+}
+
+static int32_t aowl_ov_skind(const char* t) {
+    if (!strcmp(t, "bool"))    return AOWL_S_BOOL;
+    if (!strcmp(t, "int"))     return AOWL_S_INT;
+    if (!strcmp(t, "float"))   return AOWL_S_FLOAT;
+    if (!strcmp(t, "enum"))    return AOWL_S_ENUM;
+    if (!strcmp(t, "string"))  return AOWL_S_STRING;
+    if (!strcmp(t, "keybind")) return AOWL_S_KEYBIND;
+    return AOWL_S_NESTED;    /* an SPT list/dict, or a type we do not draw */
+}
+
+/* `raw`, unquoted, for a row's display cell. Numbers and bools pass through;
+ * strings, enums and keybinds lose their surrounding quotes. */
+static void aowl_ov_sval_display(AowlOvSItem* si) {
+    if ((si->kind == AOWL_S_STRING || si->kind == AOWL_S_ENUM ||
+         si->kind == AOWL_S_KEYBIND) && si->raw[0] == '"') {
+        int32_t n = (int32_t)strlen(si->raw);
+        if (n >= 2 && si->raw[n - 1] == '"') {
+            memmove(si->value, si->raw + 1, (size_t)(n - 2));
+            si->value[n - 2] = 0;
+            return;
+        }
+    }
+    aowl_ov_copy(si->value, (int32_t)sizeof(si->value), si->raw);
+}
+
+/* One control object into one slot. Returns 1 on a usable row. */
+static int32_t aowl_ov_read_one_item(const char* it, const char* end,
+                                     AowlOvSItem* si) {
+    const char* v;
+    char t[24];
+    memset(si, 0, sizeof(*si));
+    si->lo = 0.0f; si->hi = 0.0f; si->step = 0.0f;
+    si->hasRange = 0; si->optCount = 0; si->implemented = 1;
+
+    aowl_ov_jput(it, end, "key", si->key, (int32_t)sizeof(si->key));
+    if (!si->key[0]) return 0;
+    aowl_ov_jput(it, end, "label", si->label, (int32_t)sizeof(si->label));
+    if (!si->label[0]) aowl_ov_copy(si->label, (int32_t)sizeof(si->label), si->key);
+
+    t[0] = 0;
+    v = aowl_ov_jmem(it, end, "type");
+    if (v) aowl_ov_jtext(v, end, t, (int32_t)sizeof(t));
+    si->kind = aowl_ov_skind(t);
+
+    /* The value, then the default as its fallback -- an SPT row carries neither
+     * and stays blank, which is right for a row nobody can edit. */
+    v = aowl_ov_jmem(it, end, "value");
+    if (!v) v = aowl_ov_jmem(it, end, "default");
+    if (v) aowl_ov_jraw(v, end, si->raw, (int32_t)sizeof(si->raw));
+    aowl_ov_sval_display(si);
+
+    v = aowl_ov_jmem(it, end, "min");
+    if (v) { si->lo = aowl_ov_jfloat(v, end, 0.0f); si->hasRange = 1; }
+    v = aowl_ov_jmem(it, end, "max");
+    if (v) { si->hi = aowl_ov_jfloat(v, end, 0.0f); si->hasRange = 1; }
+    v = aowl_ov_jmem(it, end, "step");
+    if (v) si->step = aowl_ov_jfloat(v, end, 0.0f);
+    if (si->hasRange && si->hi <= si->lo) si->hasRange = 0;
+    if (si->step <= 0.0f)
+        si->step = (si->kind == AOWL_S_FLOAT) ? 0.01f : 1.0f;
+
+    v = aowl_ov_jmem(it, end, "options");
+    if (v) {
+        const char* o;
+        for (o = aowl_ov_jarr(v, end); o && si->optCount < AOWL_OV_SOPT_MAX;
+             o = aowl_ov_jnext(o, end))
+            aowl_ov_jtext(o, end, si->opts[si->optCount++], 28);
+    }
+    aowl_ov_jput(it, end, "category", si->category, (int32_t)sizeof(si->category));
+    aowl_ov_jput(it, end, "description", si->desc, (int32_t)sizeof(si->desc));
+    v = aowl_ov_jmem(it, end, "implemented");
+    if (v) si->implemented = aowl_ov_jbool(v, end, 1);
+    return 1;
+}
+
+/* Fill `items` from a page body -- a bare array (a mod's schema) or an object
+ * carrying `settings` and `nested` (an SPT page). Called under `cs`. */
+static void aowl_ov_read_items(const char* body, int32_t len) {
+    const char* end = body + len;
+    const char* p = aowl_ov_jws(body, end);
+    const char* arr;
+    g_ov.itemCount = 0;
+    g_ov.itemsImpl = 0;
+    if (p >= end) return;
+
+    if (*p == '[') {
+        arr = aowl_ov_jarr(p, end);
+    } else {
+        arr = aowl_ov_jmem(p, end, "settings");
+        arr = arr ? aowl_ov_jarr(arr, end) : NULL;
+    }
+    for (; arr && g_ov.itemCount < AOWL_OV_MAX_SITEMS; arr = aowl_ov_jnext(arr, end)) {
+        AowlOvSItem* si = &g_ov.items[g_ov.itemCount];
+        if (aowl_ov_read_one_item(arr, end, si)) {
+            if (si->implemented) g_ov.itemsImpl++;
+            g_ov.itemCount++;
+        }
+    }
+    /* SPT `nested` rows: lists and dicts, edited as raw JSON elsewhere, listed
+     * here for completeness and always not-implemented. */
+    if (*p == '{') {
+        const char* nst = aowl_ov_jmem(p, end, "nested");
+        nst = nst ? aowl_ov_jarr(nst, end) : NULL;
+        for (; nst && g_ov.itemCount < AOWL_OV_MAX_SITEMS; nst = aowl_ov_jnext(nst, end)) {
+            AowlOvSItem* si = &g_ov.items[g_ov.itemCount];
+            const char* v;
+            char ty[40];
+            if (!aowl_ov_read_one_item(nst, end, si)) continue;
+            si->kind = AOWL_S_NESTED;
+            si->implemented = 0;
+            ty[0] = 0;
+            v = aowl_ov_jmem(nst, end, "type");
+            if (v) aowl_ov_jtext(v, end, ty, (int32_t)sizeof(ty));
+            if (ty[0]) aowl_ov_copy(si->value, (int32_t)sizeof(si->value), ty);
+            if (!si->desc[0])
+                aowl_ov_copy(si->desc, (int32_t)sizeof(si->desc),
+                             "a nested list/dictionary; edited as raw JSON, "
+                             "not implemented in aowlspt yet");
+            g_ov.itemCount++;
+        }
+    }
+}
+
+/* The SPT page index: `{"pages":[{"id","label","count","done"}...]}`. Called
+ * under `cs`. */
+static void aowl_ov_read_spt_index(const char* body, int32_t len) {
+    const char* end = body + len;
+    const char* pg = aowl_ov_jmem(body, end, "pages");
+    pg = pg ? aowl_ov_jarr(pg, end) : NULL;
+    g_ov.sptPageCount = 0;
+    for (; pg && g_ov.sptPageCount < AOWL_OV_MAX_SPAGES; pg = aowl_ov_jnext(pg, end)) {
+        AowlOvSPage* P = &g_ov.sptPages[g_ov.sptPageCount];
+        const char* v;
+        memset(P, 0, sizeof(*P));
+        aowl_ov_jput(pg, end, "id", P->id, (int32_t)sizeof(P->id));
+        if (!P->id[0]) continue;
+        aowl_ov_jput(pg, end, "label", P->label, (int32_t)sizeof(P->label));
+        if (!P->label[0]) aowl_ov_copy(P->label, (int32_t)sizeof(P->label), P->id);
+        P->isMod = 0;
+        v = aowl_ov_jmem(pg, end, "count"); P->count = v ? aowl_ov_jint(v, end, -1) : -1;
+        v = aowl_ov_jmem(pg, end, "done");  P->done  = v ? aowl_ov_jint(v, end, -1) : -1;
+        g_ov.sptPageCount++;
+    }
+    g_ov.sptGot = 1;
+}
+
+/* Merge the nav: one page per loaded mod (its guid is its fetch key), then the
+ * SPT pages the hub described. Called under `cs` whenever either half moves. */
+static void aowl_ov_rebuild_pages(void) {
+    int32_t i;
+    g_ov.pageCount = 0;
+    for (i = 0; i < g_ov.modCount && g_ov.pageCount < AOWL_OV_MAX_SPAGES; i++) {
+        AowlOvSPage* P = &g_ov.pages[g_ov.pageCount++];
+        memset(P, 0, sizeof(*P));
+        aowl_ov_copy(P->id, (int32_t)sizeof(P->id), g_ov.mods[i].guid);
+        aowl_ov_copy(P->label, (int32_t)sizeof(P->label),
+                     g_ov.mods[i].name[0] ? g_ov.mods[i].name : g_ov.mods[i].guid);
+        P->isMod = 1; P->count = -1; P->done = -1;
+    }
+    for (i = 0; i < g_ov.sptPageCount && g_ov.pageCount < AOWL_OV_MAX_SPAGES; i++)
+        g_ov.pages[g_ov.pageCount++] = g_ov.sptPages[i];
+}
+
 static int32_t aowl_ov_fetch(const wchar_t* verb, const wchar_t* path,
                              const char* body, char* out, int32_t cap) {
     int32_t rc;
@@ -1845,6 +2151,53 @@ static int32_t aowl_ov_fetch(const wchar_t* verb, const wchar_t* path,
     InterlockedExchange(&g_ov.everOk, 1);
     InterlockedExchange(&g_ov.lastOkTick, (LONG)GetTickCount());
     return rc;
+}
+
+/* Load one settings page's controls into `items`. `isMod` picks the route: a
+ * mod serves its own schema at `/aowlspt/settings/<guid>`, the SPT pages come
+ * from the hub. Runs on the worker; publishes under `cs` and bumps the serial
+ * so the render thread snapshots it. */
+static void aowl_ov_settings_load(const char* pageId, int32_t isMod,
+                                  char* buf, int32_t cap) {
+    wchar_t path[224];
+    wchar_t warg[96];
+    int32_t i = 0, rc;
+    for (; pageId[i] && i < 95; i++) warg[i] = (wchar_t)(unsigned char)pageId[i];
+    warg[i] = 0;
+    if (isMod) _snwprintf(path, 224, L"/aowlspt/settings/%ls", warg);
+    else       _snwprintf(path, 224, L"/aowlspt/settings/spt/page/%ls", warg);
+    path[223] = 0;
+
+    rc = aowl_ov_fetch(L"GET", path, NULL, buf, cap);
+    EnterCriticalSection(&g_ov.cs);
+    aowl_ov_copy(g_ov.itemsPage, (int32_t)sizeof(g_ov.itemsPage), pageId);
+    if (rc > 0 && (unsigned char)buf[0] != 0x78 && aowl_ov_jwhole(buf, rc)) {
+        aowl_ov_read_items(buf, rc);
+        g_ov.itemsErr = 0;
+    } else {
+        g_ov.itemCount = 0;
+        g_ov.itemsImpl = 0;
+        g_ov.itemsErr = 1;
+    }
+    LeaveCriticalSection(&g_ov.cs);
+    g_ov.dataSerial++;
+}
+
+/* POST one edit to the mod that owns the page, then reload the page so the row
+ * shows the value the file actually kept rather than the one we hoped for. */
+static void aowl_ov_settings_set(const AowlOvCmd* cmd, char* buf, int32_t cap) {
+    wchar_t path[224];
+    wchar_t warg[96];
+    char jbody[256];
+    int32_t i = 0;
+    for (; cmd->guid[i] && i < 95; i++) warg[i] = (wchar_t)(unsigned char)cmd->guid[i];
+    warg[i] = 0;
+    _snwprintf(path, 224, L"/aowlspt/settings/%ls", warg);
+    path[223] = 0;
+    aowl_ov_fmt(jbody, (int32_t)sizeof(jbody), "{\"key\":\"%s\",\"value\":%s}",
+                cmd->skey, cmd->sval);
+    (void)aowl_ov_fetch(L"POST", path, jbody, buf, cap);
+    aowl_ov_settings_load(cmd->guid, 1, buf, cap);
 }
 
 static DWORD WINAPI aowl_ov_worker(LPVOID unused) {
@@ -1915,6 +2268,17 @@ static DWORD WINAPI aowl_ov_worker(LPVOID unused) {
             for (int32_t i = 0; i < g_ov.modCount; i++) g_ov.mods[i].pending = 0;
             LeaveCriticalSection(&g_ov.cs);
             g_ov.dataSerial++;
+            have = 0;
+        }
+
+        /* Settings-mode commands are their own shape -- a page load or a
+         * single-row POST -- and are handled before the mod-control path so the
+         * reply parsing below never sees them. */
+        if (have && cmd.kind == AOWL_CMD_SPAGE) {
+            aowl_ov_settings_load(cmd.guid, cmd.enabled, buf, (int32_t)sizeof(buf));
+            have = 0;
+        } else if (have && cmd.kind == AOWL_CMD_SSET) {
+            aowl_ov_settings_set(&cmd, buf, (int32_t)sizeof(buf));
             have = 0;
         }
 
@@ -2065,6 +2429,28 @@ static DWORD WINAPI aowl_ov_worker(LPVOID unused) {
                 LeaveCriticalSection(&g_ov.cs);
                 g_ov.dataSerial++;
             }
+
+            /* The settings screen's page index. The SPT surface is a fixed
+             * catalogue the hub serves once; a 404 (no hub loaded) just leaves
+             * the nav as the mod pages, which is a coherent screen on its own.
+             * Re-tried until it answers, then held. */
+            if (!g_ov.sptGot) {
+                rc = aowl_ov_fetch(L"GET", L"/aowlspt/settings/spt/index", NULL,
+                                   buf, (int32_t)sizeof(buf));
+                if (rc > 0 && (unsigned char)buf[0] != 0x78 &&
+                    aowl_ov_jwhole(buf, rc)) {
+                    EnterCriticalSection(&g_ov.cs);
+                    aowl_ov_read_spt_index(buf, rc);
+                    LeaveCriticalSection(&g_ov.cs);
+                }
+            }
+            /* The nav is mods first, then SPT. Rebuilt here so a mod loaded or
+             * unloaded since the last pass, or an index that just arrived, is
+             * reflected without the render thread ever touching the mod table. */
+            EnterCriticalSection(&g_ov.cs);
+            aowl_ov_rebuild_pages();
+            LeaveCriticalSection(&g_ov.cs);
+            g_ov.dataSerial++;
         }
 
         /* The mod-sync feed. Its own timer, because it is a different question
@@ -2196,6 +2582,38 @@ static void aowl_ov_queue_cmd(int32_t kind, const char* arg, int32_t enabled) {
 
 static void aowl_ov_queue(const char* guid, int32_t enabled) {
     aowl_ov_queue_cmd(AOWL_CMD_TOGGLE, guid, enabled);
+}
+
+/* The two settings-mode requests. They fully populate the slot (the shared
+ * queue slot may hold a previous edit's key/value) and are silent when there is
+ * no backend -- the settings screen says so itself rather than through the
+ * mod-manager's error line. */
+static void aowl_ov_queue_spage(const char* pageId, int32_t isMod) {
+    if (g_ov.backendPort <= 0) return;
+    EnterCriticalSection(&g_ov.cs);
+    if (g_ov.cmdCount < AOWL_OV_MAX_CMDS) {
+        AowlOvCmd* c = &g_ov.cmds[g_ov.cmdCount++];
+        memset(c, 0, sizeof(*c));
+        c->kind = AOWL_CMD_SPAGE;
+        aowl_ov_copy(c->guid, (int32_t)sizeof(c->guid), pageId ? pageId : "");
+        c->enabled = isMod;
+    }
+    LeaveCriticalSection(&g_ov.cs);
+}
+
+static void aowl_ov_queue_sset(const char* pageId, const char* key,
+                               const char* val) {
+    if (g_ov.backendPort <= 0) return;
+    EnterCriticalSection(&g_ov.cs);
+    if (g_ov.cmdCount < AOWL_OV_MAX_CMDS) {
+        AowlOvCmd* c = &g_ov.cmds[g_ov.cmdCount++];
+        memset(c, 0, sizeof(*c));
+        c->kind = AOWL_CMD_SSET;
+        aowl_ov_copy(c->guid, (int32_t)sizeof(c->guid), pageId ? pageId : "");
+        aowl_ov_copy(c->skey, (int32_t)sizeof(c->skey), key ? key : "");
+        aowl_ov_copy(c->sval, (int32_t)sizeof(c->sval), val ? val : "");
+    }
+    LeaveCriticalSection(&g_ov.cs);
 }
 
 /* ================================================================== *
@@ -2771,6 +3189,15 @@ static void aowl_ov_snapshot(void) {
     g_ov.sClientRows = g_ov.clientRows;
     g_ov.sClientMore = g_ov.clientMore;
     memcpy(g_ov.sClientSession, g_ov.clientSession, sizeof(g_ov.clientSession));
+
+    /* The settings screen's two tables, same copy-under-lock discipline. */
+    g_ov.sPageCount = g_ov.pageCount;
+    memcpy(g_ov.sPages, g_ov.pages, sizeof(AowlOvSPage) * (size_t)g_ov.pageCount);
+    g_ov.sItemCount = g_ov.itemCount;
+    memcpy(g_ov.sItems, g_ov.items, sizeof(AowlOvSItem) * (size_t)g_ov.itemCount);
+    memcpy(g_ov.sItemsPage, g_ov.itemsPage, sizeof(g_ov.sItemsPage));
+    g_ov.sItemsErr = g_ov.itemsErr;
+    g_ov.sItemsImpl = g_ov.itemsImpl;
     LeaveCriticalSection(&g_ov.cs);
 }
 
@@ -2948,6 +3375,9 @@ static void aowl_ov_move(int32_t view, int32_t delta, int32_t count) {
     g_ov.sel[view] = s;
 }
 
+/* Defined below, next to the settings screen it drives. */
+static void aowl_ov_settings_key(LONG vk, int32_t page);
+
 /* Drains the ring and turns it into actions. Runs on the render thread, once
  * per frame, so a key pressed between two frames is never lost and a key held
  * down repeats at the OS repeat rate rather than at the frame rate. `page` is
@@ -2957,6 +3387,16 @@ static void aowl_ov_keys(int32_t page, const int32_t* vis, int32_t visN) {
     while (aowl_ov_pop_key(&vk)) {
         int32_t view = g_ov.view;
         int32_t count = aowl_ov_row_count(view, vis, visN);
+
+        /* F2 flips between the mod manager and the settings screen, in either
+         * direction, and any in-progress edit is dropped rather than carried
+         * across. It is checked before the mode branch so it works from both. */
+        if (vk == VK_F2) {
+            g_ov.settings = !g_ov.settings;
+            g_ov.editItem = -1; g_ov.capturing = 0; g_ov.dragItem = -1;
+            continue;
+        }
+        if (g_ov.settings) { aowl_ov_settings_key(vk, page); continue; }
 
         if (vk == VK_TAB || vk == VK_RIGHT) {
             g_ov.view = (view + 1) % AOWL_VIEW_COUNT;
@@ -3655,6 +4095,566 @@ static void aowl_ov_view_apply(float x, float y, float w, float bodyH,
  *    can read them.
  */
 
+/* ================================================================== *
+ * The settings screen
+ *
+ * A left-hand page nav and a right-hand column of controls, drawn from the
+ * schema the worker fetched. Every edit is optimistic on the row and authored
+ * by a POST the worker sends; a not-implemented row (all of SPT, and any key a
+ * mod flagged) is greyed and inert. The colours are the panel's Tarkov-dark
+ * palette, the same one the manager views use.
+ * ================================================================== */
+
+/* Write a number back into a row, formatted the way the type wants it: an int
+ * with no point, a float minimally. Touches the render thread's own snapshot
+ * copy, which the next fetch overwrites with what the file kept. */
+static void aowl_ov_s_fmt_num(AowlOvSItem* si, float v) {
+    char t[48];
+    if (si->kind == AOWL_S_INT) {
+        aowl_ov_fmt(t, (int32_t)sizeof(t), "%d",
+                    (int32_t)(v < 0 ? v - 0.5f : v + 0.5f));
+    } else {
+        aowl_ov_fmt(t, (int32_t)sizeof(t), "%.6g", (double)v);
+    }
+    aowl_ov_copy(si->raw, (int32_t)sizeof(si->raw), t);
+    aowl_ov_copy(si->value, (int32_t)sizeof(si->value), t);
+}
+
+static void aowl_ov_s_commit(AowlOvSItem* si) {
+    /* The page id is the loaded page, which for a mod is its guid -- exactly the
+     * route the edit POSTs to. SPT rows never reach here (they are inert). */
+    aowl_ov_queue_sset(g_ov.sItemsPage, si->key, si->raw);
+}
+
+static void aowl_ov_s_toggle_bool(AowlOvSItem* si) {
+    int32_t on = (si->raw[0] == 't' || si->raw[0] == '1');
+    aowl_ov_copy(si->raw, (int32_t)sizeof(si->raw), on ? "false" : "true");
+    aowl_ov_copy(si->value, (int32_t)sizeof(si->value), si->raw);
+    aowl_ov_s_commit(si);
+}
+
+static void aowl_ov_s_cycle_enum(AowlOvSItem* si, int32_t dir) {
+    int32_t idx = 0, i;
+    if (si->optCount <= 0) return;
+    for (i = 0; i < si->optCount; i++)
+        if (!strcmp(si->opts[i], si->value)) { idx = i; break; }
+    idx = (idx + dir + si->optCount) % si->optCount;
+    aowl_ov_fmt(si->raw, (int32_t)sizeof(si->raw), "\"%s\"", si->opts[idx]);
+    aowl_ov_copy(si->value, (int32_t)sizeof(si->value), si->opts[idx]);
+    aowl_ov_s_commit(si);
+}
+
+static void aowl_ov_s_adjust(AowlOvSItem* si, int32_t dir) {
+    float cur = (float)strtod(si->raw, NULL);
+    float step = si->step > 0.0f ? si->step
+               : (si->kind == AOWL_S_INT ? 1.0f : 0.01f);
+    cur += (float)dir * step;
+    if (si->hasRange) {
+        if (cur < si->lo) cur = si->lo;
+        if (cur > si->hi) cur = si->hi;
+    }
+    aowl_ov_s_fmt_num(si, cur);
+    aowl_ov_s_commit(si);
+}
+
+/* A Unity KeyCode-ish name for a virtual key, for a keybind capture. The names
+ * are not authoritative -- the keybind rows that exist today are all
+ * not-implemented -- but they are the right shape for the day one is wired. */
+static void aowl_ov_vk_name(LONG vk, char* out, int32_t cap) {
+    if (vk >= 'A' && vk <= 'Z') { out[0] = (char)vk; out[1] = 0; return; }
+    if (vk >= '0' && vk <= '9') { out[0] = (char)vk; out[1] = 0; return; }
+    if (vk >= VK_F1 && vk <= VK_F12) {
+        aowl_ov_fmt(out, cap, "F%d", (int32_t)(vk - VK_F1 + 1)); return;
+    }
+    switch (vk) {
+    case VK_SPACE:   aowl_ov_copy(out, cap, "Space"); return;
+    case VK_TAB:     aowl_ov_copy(out, cap, "Tab"); return;
+    case VK_SHIFT: case VK_LSHIFT:   aowl_ov_copy(out, cap, "LeftShift"); return;
+    case VK_CONTROL: case VK_LCONTROL: aowl_ov_copy(out, cap, "LeftControl"); return;
+    case VK_MENU: case VK_LMENU:     aowl_ov_copy(out, cap, "LeftAlt"); return;
+    case VK_OEM_3:   aowl_ov_copy(out, cap, "BackQuote"); return;
+    case VK_OEM_MINUS: aowl_ov_copy(out, cap, "Minus"); return;
+    case VK_OEM_PLUS:  aowl_ov_copy(out, cap, "Equals"); return;
+    default: aowl_ov_fmt(out, cap, "Key%d", (int32_t)vk); return;
+    }
+}
+
+/* A printable character for a virtual key, for the string editor. Uppercase and
+ * digits only -- there is no shift state here, and config strings are short
+ * tokens rather than prose. 0 means "not a character key". */
+static char aowl_ov_vk_char(LONG vk) {
+    if (vk >= 'A' && vk <= 'Z') return (char)vk;
+    if (vk >= '0' && vk <= '9') return (char)vk;
+    if (vk == VK_SPACE)      return ' ';
+    if (vk == VK_OEM_MINUS)  return '-';
+    if (vk == VK_OEM_PERIOD) return '.';
+    if (vk == VK_OEM_2)      return '/';
+    return 0;
+}
+
+/* The number of controls the item list can show, given the room the detail
+ * strip leaves it. Shared by the render and the key handler so PgUp/PgDn move
+ * by exactly what is on screen. */
+#define AOWL_OV_SDETAIL_H 62
+
+static int32_t aowl_ov_settings_rows(float bodyH) {
+    int32_t r = (int32_t)((bodyH - 2.0f * (float)AOWL_OV_LINE_H
+                           - (float)AOWL_OV_SDETAIL_H) / (float)AOWL_OV_ROW_H);
+    return r < 1 ? 1 : r;
+}
+
+/* The settings screen's keyboard. Text and keybind capture take a key before
+ * navigation does; otherwise the arrows move the cursor and adjust the control,
+ * Tab and [ ] change page, and Space/Enter activates. Everything it changes is
+ * either the render thread's own cursor or a snapshot row it then POSTs. */
+static void aowl_ov_settings_key(LONG vk, int32_t page) {
+    int32_t n = g_ov.sItemCount;
+    AowlOvSItem* si = (g_ov.selItem >= 0 && g_ov.selItem < n)
+                        ? &g_ov.sItems[g_ov.selItem] : NULL;
+    int32_t canEdit = si && si->implemented && g_ov.curPageIsMod &&
+                      si->kind != AOWL_S_NESTED;
+
+    /* --- an edit in progress eats the key ------------------------------- */
+    if (g_ov.editItem >= 0 && g_ov.editItem < n) {
+        AowlOvSItem* e = &g_ov.sItems[g_ov.editItem];
+        if (g_ov.capturing && e->kind == AOWL_S_KEYBIND) {
+            char nm[32];
+            if (vk == VK_ESCAPE) { g_ov.capturing = 0; g_ov.editItem = -1; return; }
+            aowl_ov_vk_name(vk, nm, (int32_t)sizeof(nm));
+            aowl_ov_fmt(e->raw, (int32_t)sizeof(e->raw), "\"%s\"", nm);
+            aowl_ov_copy(e->value, (int32_t)sizeof(e->value), nm);
+            aowl_ov_s_commit(e);
+            g_ov.capturing = 0; g_ov.editItem = -1;
+            return;
+        }
+        if (e->kind == AOWL_S_STRING) {
+            char ch;
+            int32_t L;
+            if (vk == VK_RETURN) {
+                aowl_ov_fmt(e->raw, (int32_t)sizeof(e->raw), "\"%s\"", g_ov.editBuf);
+                aowl_ov_copy(e->value, (int32_t)sizeof(e->value), g_ov.editBuf);
+                aowl_ov_s_commit(e);
+                g_ov.editItem = -1;
+                return;
+            }
+            if (vk == VK_ESCAPE) { g_ov.editItem = -1; return; }
+            if (vk == VK_BACK) {
+                L = (int32_t)strlen(g_ov.editBuf);
+                if (L > 0) g_ov.editBuf[L - 1] = 0;
+                return;
+            }
+            ch = aowl_ov_vk_char(vk);
+            if (ch) {
+                L = (int32_t)strlen(g_ov.editBuf);
+                if (L < (int32_t)sizeof(g_ov.editBuf) - 1) {
+                    g_ov.editBuf[L] = ch; g_ov.editBuf[L + 1] = 0;
+                }
+            }
+            return;
+        }
+    }
+
+    /* --- navigation ------------------------------------------------------ */
+    if (vk == VK_UP   || vk == 'W') { if (g_ov.selItem > 0) g_ov.selItem--; return; }
+    if (vk == VK_DOWN || vk == 'S') { if (g_ov.selItem < n - 1) g_ov.selItem++; return; }
+    if (vk == VK_PRIOR) { g_ov.selItem -= page; if (g_ov.selItem < 0) g_ov.selItem = 0; return; }
+    if (vk == VK_NEXT)  { g_ov.selItem += page;
+                          if (g_ov.selItem > n - 1) g_ov.selItem = n - 1;
+                          if (g_ov.selItem < 0) g_ov.selItem = 0; return; }
+    if (vk == VK_HOME) { g_ov.selItem = 0; return; }
+    if (vk == VK_END)  { g_ov.selItem = n > 0 ? n - 1 : 0; return; }
+    if (vk == VK_TAB) {
+        if (g_ov.sPageCount > 0)
+            g_ov.selPage = (g_ov.selPage + 1) % g_ov.sPageCount;
+        return;
+    }
+    if (vk == VK_OEM_4) { if (g_ov.selPage > 0) g_ov.selPage--; return; }          /* [ */
+    if (vk == VK_OEM_6) { if (g_ov.selPage < g_ov.sPageCount - 1) g_ov.selPage++; return; } /* ] */
+
+    if (!canEdit) return;
+    /* --- change the selected control ------------------------------------ */
+    if (vk == VK_LEFT) {
+        if (si->kind == AOWL_S_BOOL) aowl_ov_s_toggle_bool(si);
+        else if (si->kind == AOWL_S_ENUM) aowl_ov_s_cycle_enum(si, -1);
+        else if (si->kind == AOWL_S_INT || si->kind == AOWL_S_FLOAT)
+            aowl_ov_s_adjust(si, -1);
+        return;
+    }
+    if (vk == VK_RIGHT) {
+        if (si->kind == AOWL_S_BOOL) aowl_ov_s_toggle_bool(si);
+        else if (si->kind == AOWL_S_ENUM) aowl_ov_s_cycle_enum(si, +1);
+        else if (si->kind == AOWL_S_INT || si->kind == AOWL_S_FLOAT)
+            aowl_ov_s_adjust(si, +1);
+        return;
+    }
+    if (vk == VK_SPACE || vk == VK_RETURN) {
+        if (si->kind == AOWL_S_BOOL) aowl_ov_s_toggle_bool(si);
+        else if (si->kind == AOWL_S_ENUM) aowl_ov_s_cycle_enum(si, +1);
+        else if (si->kind == AOWL_S_KEYBIND) {
+            g_ov.editItem = g_ov.selItem; g_ov.capturing = 1;
+        } else if (si->kind == AOWL_S_STRING) {
+            g_ov.editItem = g_ov.selItem; g_ov.capturing = 0;
+            aowl_ov_copy(g_ov.editBuf, (int32_t)sizeof(g_ov.editBuf), si->value);
+        }
+        return;
+    }
+}
+
+static void aowl_ov_view_settings(float x, float y, float w, float bodyH) {
+    const float leftW = 208.0f;
+    float rx = x + (float)AOWL_OV_PAD + leftW + 12.0f;
+    float rrEdge = x + w + (float)AOWL_OV_PAD;       /* right inner edge */
+    float rw = rrEdge - rx;
+    int32_t rcols = (int32_t)(rw / (float)AOWL_OV_CW);
+    float ctlW = 156.0f;
+    float ctlX = rrEdge - ctlW;
+    float scaleK = (float)(g_ov.scale > 0 ? g_ov.scale : 1);
+    float mxp = (float)g_ov.mx / scaleK;
+    int32_t pc = g_ov.sPageCount;
+    int32_t navRows = (int32_t)((bodyH - (float)AOWL_OV_LINE_H) / (float)AOWL_OV_ROW_H);
+    int32_t iRows = aowl_ov_settings_rows(bodyH);
+    int32_t i;
+    AowlOvSPage* P;
+    int32_t loaded;
+    float ny, cy;
+    if (navRows < 1) navRows = 1;
+
+    /* --- keep the page cursor sane and request its controls once ---------- */
+    if (g_ov.selPage >= pc) g_ov.selPage = pc > 0 ? pc - 1 : 0;
+    if (g_ov.selPage < 0) g_ov.selPage = 0;
+    if (pc > 0) {
+        P = &g_ov.sPages[g_ov.selPage];
+        if (strcmp(g_ov.curPage, P->id) != 0) {
+            aowl_ov_copy(g_ov.curPage, (int32_t)sizeof(g_ov.curPage), P->id);
+            g_ov.curPageIsMod = P->isMod;
+            g_ov.selItem = 0; g_ov.topItem = 0;
+            g_ov.editItem = -1; g_ov.capturing = 0; g_ov.dragItem = -1;
+            aowl_ov_queue_spage(P->id, P->isMod);
+        }
+    }
+
+    /* --- the left nav ----------------------------------------------------- */
+    if (g_ov.topPage > g_ov.selPage) g_ov.topPage = g_ov.selPage;
+    if (g_ov.selPage - g_ov.topPage >= navRows)
+        g_ov.topPage = g_ov.selPage - navRows + 1;
+    if (g_ov.topPage > pc - navRows) g_ov.topPage = pc - navRows;
+    if (g_ov.topPage < 0) g_ov.topPage = 0;
+
+    aowl_ov_text(x + (float)AOWL_OV_PAD, y, "pages", AOWL_OV_FAINT);
+    aowl_ov_rect(x + (float)AOWL_OV_PAD + leftW + 5.0f, y, 1.0f, bodyH, AOWL_OV_EDGE);
+    ny = y + (float)AOWL_OV_LINE_H;
+    if (pc == 0) {
+        aowl_ov_wrap(x + (float)AOWL_OV_PAD, ny,
+                     g_ov.backendPort > 0
+                       ? "no pages yet -- waiting for the backend to describe "
+                         "the mod and SPT settings surface"
+                       : "no pages -- the settings screen needs a backend to "
+                         "read the schema from",
+                     AOWL_OV_DIM, 24, 4);
+    }
+    for (i = 0; i < navRows && g_ov.topPage + i < pc; i++) {
+        int32_t at = g_ov.topPage + i;
+        AowlOvSPage* Q = &g_ov.sPages[at];
+        int32_t hot = aowl_ov_hit(x + 1.0f, ny, leftW + (float)AOWL_OV_PAD,
+                                  (float)AOWL_OV_ROW_H);
+        uint32_t col;
+        if (at == g_ov.selPage)
+            aowl_ov_rect(x + 1.0f, ny, leftW + (float)AOWL_OV_PAD,
+                         (float)AOWL_OV_ROW_H, AOWL_OV_SELBG);
+        else if (hot)
+            aowl_ov_rect(x + 1.0f, ny, leftW + (float)AOWL_OV_PAD,
+                         (float)AOWL_OV_ROW_H, AOWL_OV_ROWALT);
+        /* Mods read in the panel's text colour; the SPT surface -- none of it
+         * backed yet -- is dimmed, which is the same "not running" language the
+         * manager uses. */
+        col = Q->isMod ? AOWL_OV_TEXT : AOWL_OV_DIM;
+        aowl_ov_textn(x + (float)AOWL_OV_PAD, ny + 3.0f,
+                      Q->label, col, (int32_t)((leftW - 24.0f) / AOWL_OV_CW));
+        if (!Q->isMod)
+            aowl_ov_text(x + (float)AOWL_OV_PAD + leftW - 18.0f, ny + 3.0f,
+                         "NI", AOWL_OV_WARN);
+        if (hot && g_ov.clickDown) {
+            g_ov.selPage = at;
+            InterlockedExchange(&g_ov.clickDown, 0);
+        }
+        ny += (float)AOWL_OV_ROW_H;
+    }
+
+    /* --- the right pane header ------------------------------------------- */
+    P = (g_ov.selPage < pc) ? &g_ov.sPages[g_ov.selPage] : NULL;
+    loaded = (P && strcmp(g_ov.sItemsPage, P->id) == 0 && !g_ov.sItemsErr);
+    cy = y;
+    {
+        char hdr[192];
+        if (!P) {
+            aowl_ov_text(rx, cy, "settings", AOWL_OV_FAINT);
+        } else if (g_ov.sItemsErr && strcmp(g_ov.sItemsPage, P->id) == 0) {
+            aowl_ov_fmt(hdr, (int32_t)sizeof(hdr), "%s", P->label);
+            aowl_ov_textn(rx, cy, hdr, AOWL_OV_ACCENT, rcols);
+        } else if (!loaded) {
+            aowl_ov_fmt(hdr, (int32_t)sizeof(hdr), "%s   loading...", P->label);
+            aowl_ov_textn(rx, cy, hdr, AOWL_OV_DIM, rcols);
+        } else if (P->isMod) {
+            aowl_ov_fmt(hdr, (int32_t)sizeof(hdr),
+                        "%s   --   %d settings, %d implemented", P->label,
+                        g_ov.sItemCount, g_ov.sItemsImpl);
+            aowl_ov_textn(rx, cy, hdr, AOWL_OV_ACCENT, rcols);
+        } else {
+            aowl_ov_fmt(hdr, (int32_t)sizeof(hdr),
+                        "%s   --   %d values, none implemented yet", P->label,
+                        g_ov.sItemCount);
+            aowl_ov_textn(rx, cy, hdr, AOWL_OV_WARN, rcols);
+        }
+    }
+    cy += (float)AOWL_OV_LINE_H + 2.0f;
+
+    if (P && g_ov.sItemsErr && strcmp(g_ov.sItemsPage, P->id) == 0) {
+        aowl_ov_wrap(rx, cy,
+                     "could not read this page's settings. The backend answered, "
+                     "but not with a schema -- the mod may not be loaded, or its "
+                     "settings route may be missing.", AOWL_OV_ERR, rcols, 4);
+        return;
+    }
+    if (!loaded) return;
+
+    /* --- the controls ---------------------------------------------------- */
+    {
+        int32_t n = g_ov.sItemCount;
+        float itemsBottom = y + bodyH - (float)AOWL_OV_SDETAIL_H;
+
+        if (g_ov.selItem >= n) g_ov.selItem = n > 0 ? n - 1 : 0;
+        if (g_ov.selItem < 0) g_ov.selItem = 0;
+        if (g_ov.topItem > g_ov.selItem) g_ov.topItem = g_ov.selItem;
+        if (g_ov.selItem - g_ov.topItem >= iRows)
+            g_ov.topItem = g_ov.selItem - iRows + 1;
+        if (g_ov.topItem > n - iRows) g_ov.topItem = n - iRows;
+        if (g_ov.topItem < 0) g_ov.topItem = 0;
+
+        if (n == 0)
+            aowl_ov_text(rx, cy, "this page declares no settings", AOWL_OV_DIM);
+
+        for (i = 0; i < iRows && g_ov.topItem + i < n; i++) {
+            int32_t at = g_ov.topItem + i;
+            AowlOvSItem* si = &g_ov.sItems[at];
+            float ry = cy + (float)(i * AOWL_OV_ROW_H);
+            int32_t isSel = (at == g_ov.selItem);
+            int32_t canEdit = si->implemented && P->isMod &&
+                              si->kind != AOWL_S_NESTED;
+            uint32_t lblCol = si->implemented ? AOWL_OV_TEXT : AOWL_OV_DIM;
+            float cx = ctlX, cyy = ry + 3.0f;
+            int32_t rowHot = aowl_ov_hit(rx - 2.0f, ry, rw, (float)AOWL_OV_ROW_H);
+
+            /* A hairline where the category changes -- grouping without
+             * spending a row, so one item is exactly one selectable row. */
+            if (at > 0 && strcmp(si->category, g_ov.sItems[at - 1].category) != 0)
+                aowl_ov_rect(rx - 2.0f, ry, rw, 1.0f, AOWL_OV_FAINT);
+
+            if (isSel)
+                aowl_ov_rect(rx - 2.0f, ry, rw, (float)AOWL_OV_ROW_H, AOWL_OV_SELBG);
+            else if (rowHot && canEdit)
+                aowl_ov_rect(rx - 2.0f, ry, rw, (float)AOWL_OV_ROW_H, AOWL_OV_ROWALT);
+
+            aowl_ov_textn(rx, cyy, si->label, lblCol,
+                          (int32_t)((ctlX - rx - 8.0f) / AOWL_OV_CW));
+
+            /* Clicking any editable row selects it, so the keyboard follows the
+             * mouse. The controls below may also consume the click. */
+            if (rowHot && g_ov.clickDown) g_ov.selItem = at;
+
+            switch (si->kind) {
+            case AOWL_S_BOOL: {
+                float bw = 52.0f, bh = (float)(AOWL_OV_ROW_H - 6);
+                int32_t on = (si->raw[0] == 't' || si->raw[0] == '1');
+                int32_t hot = canEdit && aowl_ov_hit(cx, ry + 3.0f, bw, bh);
+                aowl_ov_rect(cx, ry + 3.0f, bw, bh,
+                             hot ? AOWL_OV_HOT
+                                 : (!canEdit ? AOWL_OV_ROWALT
+                                    : (on ? AOWL_OV_ON : AOWL_OV_OFF)));
+                aowl_ov_frame_rect(cx, ry + 3.0f, bw, bh, 1.0f,
+                                   canEdit ? AOWL_OV_EDGE : AOWL_OV_FAINT);
+                aowl_ov_text(cx + (on ? 16.0f : 13.0f), ry + 4.0f,
+                             on ? "ON" : "OFF",
+                             canEdit ? AOWL_OV_TEXT : AOWL_OV_FAINT);
+                if (hot && g_ov.clickDown) {
+                    g_ov.selItem = at;
+                    InterlockedExchange(&g_ov.clickDown, 0);
+                    aowl_ov_s_toggle_bool(si);
+                }
+                break;
+            }
+            case AOWL_S_INT:
+            case AOWL_S_FLOAT: {
+                if (si->hasRange) {
+                    float sw = 104.0f, sh = 4.0f;
+                    float sy = ry + (float)AOWL_OV_ROW_H / 2.0f - sh / 2.0f;
+                    float cur = (g_ov.dragItem == at) ? g_ov.dragVal
+                                                      : (float)strtod(si->raw, NULL);
+                    float t = (cur - si->lo) / (si->hi - si->lo);
+                    uint32_t fill = canEdit ? AOWL_OV_ACCENT : AOWL_OV_FAINT;
+                    if (t < 0.0f) t = 0.0f; if (t > 1.0f) t = 1.0f;
+                    aowl_ov_rect(cx, sy, sw, sh, AOWL_OV_PANEBG);
+                    aowl_ov_rect(cx, sy, sw * t, sh, fill);
+                    aowl_ov_rect(cx + sw * t - 3.0f, ry + 4.0f, 6.0f,
+                                 (float)(AOWL_OV_ROW_H - 8),
+                                 canEdit ? AOWL_OV_TEXT : AOWL_OV_FAINT);
+                    aowl_ov_textn(cx + sw + 8.0f, cyy, si->value,
+                                  canEdit ? AOWL_OV_TEXT : AOWL_OV_DIM,
+                                  (int32_t)((rrEdge - (cx + sw + 8.0f)) / AOWL_OV_CW));
+                    if (canEdit) {
+                        int32_t hot = aowl_ov_hit(cx - 4.0f, ry, sw + 8.0f,
+                                                  (float)AOWL_OV_ROW_H);
+                        if (g_ov.mouseHeld && (hot || g_ov.dragItem == at)) {
+                            float nt = (mxp - cx) / sw;
+                            float nv;
+                            if (nt < 0.0f) nt = 0.0f; if (nt > 1.0f) nt = 1.0f;
+                            nv = si->lo + nt * (si->hi - si->lo);
+                            if (si->step > 0.0f)
+                                nv = si->lo +
+                                     (float)((int32_t)((nv - si->lo) / si->step +
+                                                       0.5f)) * si->step;
+                            if (nv < si->lo) nv = si->lo;
+                            if (nv > si->hi) nv = si->hi;
+                            g_ov.dragItem = at;
+                            g_ov.selItem = at;
+                            g_ov.dragVal = nv;
+                            aowl_ov_s_fmt_num(si, nv);
+                            InterlockedExchange(&g_ov.clickDown, 0);
+                        } else if (g_ov.dragItem == at && !g_ov.mouseHeld) {
+                            aowl_ov_s_fmt_num(si, g_ov.dragVal);
+                            aowl_ov_s_commit(si);
+                            g_ov.dragItem = -1;
+                        }
+                    }
+                } else {
+                    /* No range: a value with a minus/plus pair. */
+                    float bw = 20.0f, bh = (float)(AOWL_OV_ROW_H - 6);
+                    float minusX = cx, plusX = cx + ctlW - bw;
+                    int32_t hm = canEdit && aowl_ov_hit(minusX, ry + 3.0f, bw, bh);
+                    int32_t hp = canEdit && aowl_ov_hit(plusX, ry + 3.0f, bw, bh);
+                    aowl_ov_rect(minusX, ry + 3.0f, bw, bh,
+                                 hm ? AOWL_OV_HOT : AOWL_OV_ROWALT);
+                    aowl_ov_frame_rect(minusX, ry + 3.0f, bw, bh, 1.0f,
+                                       canEdit ? AOWL_OV_EDGE : AOWL_OV_FAINT);
+                    aowl_ov_text(minusX + 6.0f, ry + 4.0f, "-",
+                                 canEdit ? AOWL_OV_TEXT : AOWL_OV_FAINT);
+                    aowl_ov_rect(plusX, ry + 3.0f, bw, bh,
+                                 hp ? AOWL_OV_HOT : AOWL_OV_ROWALT);
+                    aowl_ov_frame_rect(plusX, ry + 3.0f, bw, bh, 1.0f,
+                                       canEdit ? AOWL_OV_EDGE : AOWL_OV_FAINT);
+                    aowl_ov_text(plusX + 6.0f, ry + 4.0f, "+",
+                                 canEdit ? AOWL_OV_TEXT : AOWL_OV_FAINT);
+                    aowl_ov_textn(minusX + bw + 8.0f, cyy, si->value[0] ? si->value : "-",
+                                  canEdit ? AOWL_OV_TEXT : AOWL_OV_DIM,
+                                  (int32_t)((plusX - (minusX + bw + 8.0f)) / AOWL_OV_CW));
+                    if (hm && g_ov.clickDown) {
+                        g_ov.selItem = at; InterlockedExchange(&g_ov.clickDown, 0);
+                        aowl_ov_s_adjust(si, -1);
+                    } else if (hp && g_ov.clickDown) {
+                        g_ov.selItem = at; InterlockedExchange(&g_ov.clickDown, 0);
+                        aowl_ov_s_adjust(si, +1);
+                    }
+                }
+                break;
+            }
+            case AOWL_S_ENUM: {
+                float bw = 16.0f;
+                float lX = cx, rX = cx + ctlW - bw;
+                int32_t hl = canEdit && aowl_ov_hit(lX, ry + 3.0f, bw, (float)(AOWL_OV_ROW_H - 6));
+                int32_t hr = canEdit && aowl_ov_hit(rX, ry + 3.0f, bw, (float)(AOWL_OV_ROW_H - 6));
+                aowl_ov_text(lX, ry + 3.0f, "<", canEdit ? (hl ? AOWL_OV_ACCENT : AOWL_OV_TEXT) : AOWL_OV_FAINT);
+                aowl_ov_text(rX, ry + 3.0f, ">", canEdit ? (hr ? AOWL_OV_ACCENT : AOWL_OV_TEXT) : AOWL_OV_FAINT);
+                aowl_ov_textn(lX + bw + 4.0f, cyy, si->value[0] ? si->value : "-",
+                              canEdit ? AOWL_OV_TEXT : AOWL_OV_DIM,
+                              (int32_t)((rX - (lX + bw + 4.0f)) / AOWL_OV_CW));
+                if (hl && g_ov.clickDown) {
+                    g_ov.selItem = at; InterlockedExchange(&g_ov.clickDown, 0);
+                    aowl_ov_s_cycle_enum(si, -1);
+                } else if (hr && g_ov.clickDown) {
+                    g_ov.selItem = at; InterlockedExchange(&g_ov.clickDown, 0);
+                    aowl_ov_s_cycle_enum(si, +1);
+                }
+                break;
+            }
+            case AOWL_S_STRING:
+            case AOWL_S_KEYBIND: {
+                int32_t editing = (g_ov.editItem == at);
+                float bw = ctlW;
+                const char* shown = editing ? g_ov.editBuf : si->value;
+                uint32_t bcol = editing ? AOWL_OV_SELBG
+                               : (!canEdit ? AOWL_OV_PANEBG : AOWL_OV_ROWALT);
+                int32_t hot = canEdit && aowl_ov_hit(cx, ry + 3.0f, bw, (float)(AOWL_OV_ROW_H - 6));
+                aowl_ov_rect(cx, ry + 3.0f, bw, (float)(AOWL_OV_ROW_H - 6), bcol);
+                aowl_ov_frame_rect(cx, ry + 3.0f, bw, (float)(AOWL_OV_ROW_H - 6), 1.0f,
+                                   canEdit ? AOWL_OV_EDGE : AOWL_OV_FAINT);
+                if (editing && si->kind == AOWL_S_KEYBIND)
+                    aowl_ov_text(cx + 5.0f, ry + 4.0f, "press a key...", AOWL_OV_WARN);
+                else {
+                    char tb[80];
+                    aowl_ov_fmt(tb, (int32_t)sizeof(tb), "%s%s",
+                                shown[0] ? shown : (editing ? "" : "-"),
+                                editing && si->kind == AOWL_S_STRING ? "_" : "");
+                    aowl_ov_textn(cx + 5.0f, ry + 4.0f, tb,
+                                  canEdit ? AOWL_OV_TEXT : AOWL_OV_DIM,
+                                  (int32_t)((bw - 8.0f) / AOWL_OV_CW));
+                }
+                if (hot && g_ov.clickDown) {
+                    g_ov.selItem = at;
+                    InterlockedExchange(&g_ov.clickDown, 0);
+                    g_ov.editItem = at;
+                    if (si->kind == AOWL_S_KEYBIND) g_ov.capturing = 1;
+                    else {
+                        g_ov.capturing = 0;
+                        aowl_ov_copy(g_ov.editBuf, (int32_t)sizeof(g_ov.editBuf),
+                                     si->value);
+                    }
+                }
+                break;
+            }
+            case AOWL_S_NESTED:
+            default:
+                aowl_ov_textn(cx, cyy, si->value[0] ? si->value : "raw JSON",
+                              AOWL_OV_FAINT,
+                              (int32_t)((rrEdge - cx) / AOWL_OV_CW));
+                break;
+            }
+
+            /* The not-implemented badge, right at the row's edge -- the one
+             * mark the user asked to be unmistakable. */
+            if (!si->implemented)
+                aowl_ov_text(rrEdge - 3.0f * AOWL_OV_CW, ry + 3.0f, "NI",
+                             AOWL_OV_WARN);
+            (void)itemsBottom;
+        }
+    }
+
+    /* --- the detail strip: the selected control, explained --------------- */
+    {
+        float dy = y + bodyH - (float)AOWL_OV_SDETAIL_H;
+        aowl_ov_rect(rx - 2.0f, dy, rw, (float)AOWL_OV_SDETAIL_H, AOWL_OV_PANEBG);
+        aowl_ov_rect(rx - 2.0f, dy, rw, 1.0f, AOWL_OV_EDGE);
+        dy += 4.0f;
+        if (g_ov.selItem < g_ov.sItemCount) {
+            AowlOvSItem* si = &g_ov.sItems[g_ov.selItem];
+            char line[256];
+            aowl_ov_fmt(line, (int32_t)sizeof(line), "%s%s%s", si->key,
+                        si->category[0] ? "   " : "", si->category);
+            aowl_ov_textn(rx, dy, line, AOWL_OV_ACCENT, rcols);
+            dy += (float)AOWL_OV_LINE_H;
+            if (!si->implemented) {
+                aowl_ov_fmt(line, (int32_t)sizeof(line), "NOT IMPLEMENTED YET -- %s",
+                            si->desc[0] ? si->desc
+                                        : "read but not acted on in aowlspt yet");
+                aowl_ov_wrap(rx, dy, line, AOWL_OV_WARN, rcols, 2);
+            } else if (si->desc[0]) {
+                aowl_ov_wrap(rx, dy, si->desc, AOWL_OV_DIM, rcols, 2);
+            } else {
+                aowl_ov_text(rx, dy, "editable; changes are saved to config.json",
+                             AOWL_OV_DIM);
+            }
+        }
+    }
+}
+
 /* Refreshed on a timer rather than per frame -- see above. */
 static void aowl_ov_refresh_display(void) {
     DWORD now = GetTickCount();
@@ -3710,6 +4710,26 @@ static uint32_t aowl_ov_signature(void) {
     aowl_ov_sig_add(&h, g_ov.openDrawn < AOWL_OV_COST_SETTLE ? 1 : 0);
     aowl_ov_sig_add(&h, g_ov.dispRttMs);
     aowl_ov_sig_add(&h, g_ov.dispStaleS);
+    /* The settings screen's own cursor and edit state, so a change on it -- a
+     * page picked, a row selected, a slider dragged, a text box opened -- forces
+     * the same rebuild the manager views get. `mouseHeld` is here rather than in
+     * the manager set because only a slider reads it every frame. */
+    aowl_ov_sig_add(&h, g_ov.settings);
+    aowl_ov_sig_add(&h, g_ov.selPage);
+    aowl_ov_sig_add(&h, g_ov.topPage);
+    aowl_ov_sig_add(&h, g_ov.selItem);
+    aowl_ov_sig_add(&h, g_ov.topItem);
+    aowl_ov_sig_add(&h, g_ov.editItem);
+    aowl_ov_sig_add(&h, g_ov.capturing);
+    aowl_ov_sig_add(&h, g_ov.dragItem);
+    aowl_ov_sig_add(&h, (int32_t)g_ov.mouseHeld);
+    aowl_ov_sig_add(&h, (int32_t)(g_ov.dragVal * 1000.0f));
+    /* The in-progress text, so a keystroke that only changes the edit buffer
+     * still rebuilds the frame it lands on. */
+    {
+        int32_t k;
+        for (k = 0; g_ov.editBuf[k]; k++) aowl_ov_sig_add(&h, g_ov.editBuf[k]);
+    }
     /* Never zero: zero is what `aowl_ov_bind` writes to force the next frame to
      * rebuild after a device change. */
     return h ? h : 1u;
@@ -3797,18 +4817,28 @@ static void aowl_ov_build(void) {
 
     /* Input, before anything is drawn, so a keypress lands on this frame. The
      * wheel scrolls the current view by three rows a notch, which is what every
-     * other list on Windows does. */
-    aowl_ov_keys(rows, vis, visN);
+     * other list on Windows does. In settings mode the page size is the control
+     * list's, and the wheel moves the selected control. */
+    aowl_ov_keys(g_ov.settings ? aowl_ov_settings_rows(bodyH) : rows, vis, visN);
     {
         LONG notches = InterlockedExchange(&g_ov.wheel, 0);
-        if (notches)
-            aowl_ov_move(g_ov.view, -3 * (int32_t)notches,
-                         aowl_ov_row_count(g_ov.view, vis, visN));
-        /* The filter may have changed under the cursor. */
-        visN = aowl_ov_visible_rows(vis);
-        counts[AOWL_VIEW_MODS] = g_ov.sModCount;
-        if (g_ov.sel[AOWL_VIEW_MODS] >= visN)
-            g_ov.sel[AOWL_VIEW_MODS] = visN > 0 ? visN - 1 : 0;
+        if (g_ov.settings) {
+            if (notches) {
+                g_ov.selItem -= 3 * (int32_t)notches;
+                if (g_ov.selItem < 0) g_ov.selItem = 0;
+                if (g_ov.selItem >= g_ov.sItemCount)
+                    g_ov.selItem = g_ov.sItemCount > 0 ? g_ov.sItemCount - 1 : 0;
+            }
+        } else {
+            if (notches)
+                aowl_ov_move(g_ov.view, -3 * (int32_t)notches,
+                             aowl_ov_row_count(g_ov.view, vis, visN));
+            /* The filter may have changed under the cursor. */
+            visN = aowl_ov_visible_rows(vis);
+            counts[AOWL_VIEW_MODS] = g_ov.sModCount;
+            if (g_ov.sel[AOWL_VIEW_MODS] >= visN)
+                g_ov.sel[AOWL_VIEW_MODS] = visN > 0 ? visN - 1 : 0;
+        }
     }
 
     /* --- how tall the legend has to be, before the body takes the rest ---
@@ -3845,7 +4875,11 @@ static void aowl_ov_build(void) {
     {
         int32_t maxN;
         legCols = (int32_t)(innerW / AOWL_OV_CW);
-        if (g_ov.view == AOWL_VIEW_MODS)
+        if (g_ov.settings)
+            aowl_ov_fmt(legKeys, (int32_t)sizeof(legKeys),
+                        "TAB page  [ ] page  UP/DN row  LEFT/RIGHT change  "
+                        "SPACE edit  F2 mod manager  INS/ESC close");
+        else if (g_ov.view == AOWL_VIEW_MODS)
             aowl_ov_fmt(legKeys, (int32_t)sizeof(legKeys),
                         "TAB view  UP/DN move  SPACE toggle  C clear  "
                         "F filter [%s]  A apply  R reload  INS/ESC close",
@@ -3867,7 +4901,13 @@ static void aowl_ov_build(void) {
          * Which is also why no action here changes the view. Yanking the panel
          * to another pane because a keypress was refused loses the row the
          * player had selected, to tell them something a line of text can. */
-        aowl_ov_copy(legNote, (int32_t)sizeof(legNote),
+        if (g_ov.settings)
+            aowl_ov_copy(legNote, (int32_t)sizeof(legNote),
+                         "NI = not implemented yet (read-only)   "
+                         "dim = SPT surface, not backed by aowlspt   "
+                         "edits save to config.json");
+        else
+            aowl_ov_copy(legNote, (int32_t)sizeof(legNote),
                      g_ov.sLastError[0] ? g_ov.sLastError :
                      "* your override   ~ asked, no answer yet   "
                      "! game disagrees   ON*/OFF* takes a restart   "
@@ -3899,7 +4939,29 @@ static void aowl_ov_build(void) {
     aowl_ov_rect(x, y, w, h, AOWL_OV_BG);
     aowl_ov_rect(x, y, w, (float)AOWL_OV_TITLE_H, AOWL_OV_TITLEBG);
     aowl_ov_frame_rect(x, y, w, h, 1.0f, AOWL_OV_EDGE);
-    aowl_ov_text(x + AOWL_OV_PAD, y + 5.0f, "aowlspt  ::  mod manager", AOWL_OV_TEXT);
+    aowl_ov_text(x + AOWL_OV_PAD, y + 5.0f, "aowlspt", AOWL_OV_ACCENT);
+    /* The two faces, as a clickable toggle right in the title bar, so the way
+     * across is always visible and never a key nobody was told about. F2 does
+     * the same from the keyboard. */
+    {
+        float tx = x + AOWL_OV_PAD + 8.0f * AOWL_OV_CW;
+        static const char* modes[2] = { " MANAGER ", " SETTINGS " };
+        int32_t m;
+        for (m = 0; m < 2; m++) {
+            int32_t on = (g_ov.settings == m);
+            float tw = (float)(strlen(modes[m]) * AOWL_OV_CW);
+            int32_t hot = aowl_ov_hit(tx, y + 2.0f, tw, (float)(AOWL_OV_TITLE_H - 4));
+            aowl_ov_rect(tx, y + 2.0f, tw, (float)(AOWL_OV_TITLE_H - 4),
+                         on ? AOWL_OV_SELBG : (hot ? AOWL_OV_HOT : AOWL_OV_PANEBG));
+            aowl_ov_text(tx, y + 5.0f, modes[m], on ? AOWL_OV_TEXT : AOWL_OV_DIM);
+            if (hot && g_ov.clickDown) {
+                g_ov.settings = m;
+                g_ov.editItem = -1; g_ov.capturing = 0; g_ov.dragItem = -1;
+                InterlockedExchange(&g_ov.clickDown, 0);
+            }
+            tx += tw + 4.0f;
+        }
+    }
     {
         float tw;
         char cost[48];
@@ -3935,6 +4997,29 @@ static void aowl_ov_build(void) {
         aowl_ov_text(x + w - AOWL_OV_PAD - tw - 16.0f
                      - (float)(strlen(cost) * AOWL_OV_CW), y + 5.0f,
                      cost, AOWL_OV_FAINT);
+    }
+
+    if (g_ov.settings) {
+        /* The settings screen's own sub-header, where the tabs and status line
+         * would be: how the nav is made up, so the SPT half is never a surprise. */
+        float sy = y + (float)AOWL_OV_TITLE_H;
+        int32_t mods = 0, spt = 0, k;
+        char line[192];
+        for (k = 0; k < g_ov.sPageCount; k++)
+            if (g_ov.sPages[k].isMod) mods++; else spt++;
+        aowl_ov_rect(x + 1.0f, sy, w - 2.0f,
+                     (float)(AOWL_OV_TABS_H + AOWL_OV_STAT_H), AOWL_OV_PANEBG);
+        aowl_ov_fmt(line, (int32_t)sizeof(line),
+                    "in-game settings  |  %d mod pages  |  %d SPT config pages "
+                    "(all not implemented yet)", mods, spt);
+        aowl_ov_textn(x + AOWL_OV_PAD, sy + 3.0f, line, AOWL_OV_DIM,
+                      (int32_t)(innerW / AOWL_OV_CW));
+        aowl_ov_textn(x + AOWL_OV_PAD, sy + 3.0f + (float)AOWL_OV_TABS_H,
+                      "every mod config value and the whole SPT server config "
+                      "surface -- pick a page on the left, change a control on "
+                      "the right", AOWL_OV_FAINT, (int32_t)(innerW / AOWL_OV_CW));
+        aowl_ov_view_settings(x, bodyY, innerW, bodyH);
+        goto settings_body_done;
     }
 
     aowl_ov_tabs(x, y + (float)AOWL_OV_TITLE_H, w, counts);
@@ -3977,6 +5062,8 @@ static void aowl_ov_build(void) {
         aowl_ov_view_issues(x, bodyY, innerW, bodyH, rows);
     else
         aowl_ov_view_apply(x, bodyY, innerW, bodyH, rows);
+
+settings_body_done:
 
     /* --- the legend ---
      *
@@ -4143,6 +5230,7 @@ static LRESULT CALLBACK aowl_ov_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
         case WM_LBUTTONDOWN:
         case WM_LBUTTONDBLCLK:
             InterlockedExchange(&g_ov.clickDown, 1);
+            InterlockedExchange(&g_ov.mouseHeld, 1);
             return 0;
         case WM_MOUSEWHEEL:
             /* One notch is WHEEL_DELTA, and a high-resolution wheel sends
@@ -4153,6 +5241,11 @@ static LRESULT CALLBACK aowl_ov_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
                                    (LONG)GET_WHEEL_DELTA_WPARAM(wp) / WHEEL_DELTA);
             return 0;
         case WM_LBUTTONUP:
+            /* The render thread ends a slider drag when it sees this fall to 0.
+             * Cleared here rather than on consume, unlike `clickDown`, because a
+             * held button is a state and a click is an event. */
+            InterlockedExchange(&g_ov.mouseHeld, 0);
+            return 0;
         case WM_RBUTTONDOWN:
         case WM_RBUTTONUP:
         case WM_MBUTTONDOWN:
@@ -4480,6 +5573,23 @@ static int32_t aowl_ov_start(int32_t toggleVk, int32_t backendPort) {
     QueryPerformanceFrequency(&g_ov.qpcFreq);
     g_ov.view = AOWL_VIEW_MODS;
     g_ov.filter = AOWL_FILTER_ALL;
+    /* The settings screen starts closed, on no page, with nothing being edited.
+     * -1 rather than 0 for the edit cursors: 0 is a valid row. */
+    g_ov.settings = 0;
+    g_ov.selPage = 0; g_ov.topPage = 0;
+    g_ov.selItem = 0; g_ov.topItem = 0;
+    g_ov.editItem = -1;
+    g_ov.dragItem = -1;
+    g_ov.capturing = 0;
+    g_ov.curPage[0] = 0;
+    g_ov.itemsPage[0] = 0;
+    g_ov.sItemsPage[0] = 0;
+    g_ov.editBuf[0] = 0;
+    g_ov.pageCount = 0;
+    g_ov.sptPageCount = 0;
+    g_ov.sptGot = 0;
+    g_ov.itemCount = 0;
+    g_ov.mouseHeld = 0;
     /* -1, not 0: zero is a sequence number the client host really sends on its
      * first report, and a panel that started at zero would read "seq 0" as an
      * answer before anybody had spoken. */

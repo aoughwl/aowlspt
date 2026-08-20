@@ -496,6 +496,12 @@ proc moreBotsSchema(): seq[Setting] =
                description = "The alive-bot cap the census compares against; 0 reports the count without judging it")]
 
 proc onMoreBotsSettings(url, body, session: string): string =
+  ## GET serves the schema; a POST body persists one edit into config.json. The
+  ## value is read fresh at the next load — this mod reads its settings inline
+  ## rather than through a single reloadable config, so the write is saved but
+  ## not made live here.
+  if body.len > 0:
+    discard applySettingFromBody(body)
   result = declaredSchemaJson().text
 
 proc registerRoutes() =

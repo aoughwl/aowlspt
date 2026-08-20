@@ -2513,6 +2513,11 @@ proc tarkovSchema(): seq[Setting] =
                hi = 1000, category = "Skills")]
 
 proc onTarkovSettings(url, body, session: string): string =
+  ## GET serves the emulator's schema; a POST body persists one edit into
+  ## config.json. The emulator reads these at load, so the write is saved and
+  ## takes effect next start rather than live.
+  if body.len > 0:
+    discard applySettingFromBody(body)
   result = declaredSchemaJson().text
 
 proc onLoad(): Status =

@@ -33,8 +33,9 @@
 ## mods a capability at a time, and a key whose value is carried but not yet
 ## acted on is drawn greyed with that reason rather than pretended to work.
 
-import ".." / aowlspt            # configSet, Status, Ok
+import ".." / aowlspt            # configSet, Status, Ok, ErrBadArg
 import "." / server              # Json, JsonObject, obj, put, arr, jstr, setting, asText/Float/Int/Bool
+import "." / json                # field, raw, asText, exists — for the edit a POST carries
 
 # ---------------------------------------------------------------------------
 # The schema
@@ -209,3 +210,23 @@ proc applySetting*(key, valueJson: string): Status =
   ## `loadConfig` again) rather than this function applying it, because only the
   ## mod knows which of its runtime writes a given key feeds.
   result = configSet(key, valueJson)
+
+proc applySettingFromBody*(body: string): Status =
+  ## The edit a settings-UI POST carries, applied. The body is
+  ## `{"key":"<configKey>","value":<literal>}` — the F12 overlay's write-back
+  ## shape — where `value` is a JSON literal (`1.5`, `true`, `"KeypadMultiply"`).
+  ## The key is one of this mod's own config keys and the value is persisted
+  ## verbatim, quotes and all, into `config.json`.
+  ##
+  ## `ErrBadArg` when the body is not that shape, so a route handler can serve
+  ## the schema back regardless and the panel simply shows the unchanged value.
+  ## A mod that wants the new value live re-reads its config after this returns
+  ## `Ok` — the same rule as `applySetting`, and for the same reason.
+  let k = field(body, "key")
+  let v = field(body, "value")
+  if not k.exists or not v.exists:
+    return ErrBadArg
+  let key = k.asText("")
+  if key.len == 0:
+    return ErrBadArg
+  result = applySetting(key, v.raw)

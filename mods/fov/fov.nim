@@ -449,7 +449,12 @@ proc fovSchema(): seq[Setting] =
                 description = "Assert each detour bound before trusting it")]
 
 proc onFovSettings(url, body, session: string): string =
-  ## The declared schema with current values folded in, for the settings UI.
+  ## GET: the declared schema with current values folded in, for the settings
+  ## UI. POST: the one edit the panel is writing back — applied to config.json,
+  ## then re-read so the effect is live and the returned schema shows the saved
+  ## value.
+  if body.len > 0 and applySettingFromBody(body) == Ok:
+    loadConfig()
   result = declaredSchemaJson().text
 
 # ---------------------------------------------------------------------------

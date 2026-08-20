@@ -611,6 +611,9 @@ proc blackDivisionSchema(): seq[Setting] =
                description = "How often the client half looks for the squad; read-only, floored at 500")]
 
 proc onBlackDivisionSettings(url, body, session: string): string =
+  ## GET serves the schema; a POST body applies one edit, then re-reads config.
+  if body.len > 0 and applySettingFromBody(body) == Ok:
+    readConfig()
   result = declaredSchemaJson().text
 
 proc onLoadServer(): Status =

@@ -1183,6 +1183,11 @@ proc sainSchema(): seq[Setting] =
                 description = "Verbose per-bot decision logging")]
 
 proc onSainSettings(url, body, session: string): string =
+  ## GET serves the schema; a POST body persists one edit into config.json. SAIN
+  ## reads its settings inline, so the write is saved and applied at the next
+  ## load rather than made live here.
+  if body.len > 0:
+    discard applySettingFromBody(body)
   result = declaredSchemaJson().text
 
 proc onLoad(): Status =

@@ -310,6 +310,9 @@ proc classicMovementSchema(): seq[Setting] =
                 description = "Assert each detour bound before trusting it")]
 
 proc onClassicMovementSettings(url, body, session: string): string =
+  ## GET serves the schema; a POST body applies one edit, then re-reads config.
+  if body.len > 0 and applySettingFromBody(body) == Ok:
+    loadConfig()
   result = declaredSchemaJson().text
 
 proc serverLoad(): Status =
