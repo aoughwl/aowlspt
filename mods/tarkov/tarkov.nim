@@ -1943,7 +1943,19 @@ proc onLocations(url, body, session: string): string =
   ## 560 MiB and 10.8 s on one with loose loot, for a screen listing nineteen
   ## maps. `looseLoot` now belongs to `/client/location/getLocalloot`, which
   ## already asks one map at a time.
+  ##
+  ## Prefer the full post-1.0 location list when the `locations` post-1.0 table
+  ## is installed: it carries the 24 maps the real client expects, including the
+  ## ones SPT's database has no `_Id` for at all -- Terminal (`Terminal_ui`
+  ## 6925a2c38bdebd9e2302692e), the Sandbox variants, Icebreaker, Labyrinth,
+  ## laboratory_dark, Lighthouse2. Without them the deploy screen lists nothing
+  ## the client can select and a lookup of a post-1.0-only map id throws
+  ## KeyNotFound. The SPT-db build (19 maps, and where mods write their per-map
+  ## `base` fields) is the fallback when the table is absent.
   inc gRequests
+  let post1Locations = post1Table("locations")
+  if post1Locations.len > 0:
+    return envelope(raw(post1Locations))
   result = envelope(raw(liveLocationsBody()))
 
 # ---------------------------------------------------------------------------
