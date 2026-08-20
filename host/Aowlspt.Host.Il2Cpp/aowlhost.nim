@@ -78,6 +78,11 @@ import invoke
 {.emit: """#include "aowlspt_live.h" """.}
 {.emit: """#include "aowlspt_hostboot.h" """.}
 {.emit: """#include "aowlspt_beclient.h" """.}
+## The Unity-main-thread bridge: statically-resolved per-frame detour targets
+## for this build, verified byte-for-byte before use, so `invoke_main` can be
+## drained on Unity's own thread even when the runtime hands back no usable
+## `MethodInfo.methodPointer`. See `aowlspt_bridge.h`.
+{.emit: """#include "aowlspt_bridge.h" """.}
 {.emit: """#include "aowlspt_detour.h" """.}
 ## The typed patch frame. Included here as well as through `aowlspt_abi.h`
 ## because this file names its pool directly; the include guard makes the second
@@ -313,6 +318,18 @@ var cBecRestartSeen {.importc: "aowl_bec_restart_seen", nodecl.}: int32
 proc cBeArmed(): int32 {.importc: "aowl_be_guard_armed", nodecl.}
 proc cBeModule(): int32 {.importc: "aowl_be_guard_module", nodecl.}
 proc cBeAnswered(): int32 {.importc: "aowl_be_guard_answered", nodecl.}
+
+# The Unity-main-thread bridge's statically-resolved per-frame targets. Each
+# returns a verified code pointer into GameAssembly.dll or nil (wrong build,
+# module not mapped, or prologue mismatch), so `bindMainDrain` can fall through
+# to its by-name candidates. See `aowlspt_bridge.h`.
+proc cBridgeTargetCount(): int32 {.importc: "aowl_bridge_target_count", nodecl.}
+proc cBridgeTargetAt(i: int32): Il2CppPtr {.
+  importc: "aowl_bridge_target_at", nodecl.}
+proc cBridgeTargetPerFrame(i: int32): int32 {.
+  importc: "aowl_bridge_target_perframe", nodecl.}
+proc cBridgeTargetName(i: int32): Il2CppPtr {.
+  importc: "aowl_bridge_target_name", nodecl.}
 proc cBeOpened(): int32 {.importc: "aowl_be_guard_opened", nodecl.}
 
 # The IL2CPP readiness flag, armed in the same constructor and set on the
@@ -1494,6 +1511,55 @@ proc takeDue(due: var seq[Pending]) =
       cMqSetCount(int32(w))
   cMqUnlock()
 
+proc bridgeProof(tid: int) =
+  ## The proof that the drain runs on Unity's own thread: from here, make a real
+  ## managed IL2CPP call -- the kind that faults from any thread but Unity's.
+  ##
+  ## This runs only when a per-frame method was detoured, i.e. only on Unity's
+  ## main thread. The same operations issued from the host's boot thread crash
+  ## this client (the runtime's GC and managed heap are affine to the Unity
+  ## thread), which is the whole reason the bridge exists; issued from here they
+  ## return a value, and that value is the proof.
+  ##
+  ## Two calls, in order of how game-like they are and how likely they resolve:
+  ##   1. `UnityEngine.Time::get_frameCount` -- a static getter that reads live
+  ##      Unity state and boxes an int. Only invoked if it resolves to a real,
+  ##      executable `methodPointer`, so a build that does not populate that
+  ##      field skips it rather than faulting on a null call.
+  ##   2. boxing a `System.Int32` -- a pure managed-heap allocation, the exact
+  ##      operation that faults from a foreign thread, and one that needs no
+  ##      method pointer at all. A successful round-trip is itself the proof.
+  var reported = false
+  let timeCls = findClass(gRt, "UnityEngine.Time")
+  if timeCls != nil:
+    let m = findMethod(gRt, timeCls, "get_frameCount", 0)
+    if m != nil and methodPointer(gRt, m) != nil:
+      var exc: Il2CppException = nullPtr()
+      let res = gRt.invoke(m, cast[Il2CppObject](0), cast[Il2CppPtr](0), exc)
+      if exc == nil and res != nil:
+        let boxed = gRt.objectUnbox(res)
+        if boxed != nil:
+          okLog "il2cpp bridge: ran managed call on Unity thread " & $tid &
+                ", result=UnityEngine.Time.get_frameCount() = " &
+                $cReadI32(boxed)
+          reported = true
+  if not reported:
+    let i32 = findClass(gRt, "System.Int32")
+    if i32 != nil:
+      let cell = cCellNew()
+      cCellSetI32(cell, 424242'i32)
+      let boxed = gRt.valueBox(i32, cell)
+      cCellFree(cell)
+      if boxed != nil:
+        let back = gRt.objectUnbox(boxed)
+        okLog "il2cpp bridge: ran managed call on Unity thread " & $tid &
+              ", result=boxed System.Int32 round-trip = " &
+              $(if back != nil: cReadI32(back) else: 0'i32)
+        reported = true
+  if not reported:
+    okLog "il2cpp bridge: on Unity thread " & $tid &
+          ", but no managed call could be resolved to prove it"
+
 proc runDue(due: var seq[Pending]) =
   ## Runs what `takeDue` lifted out, **outside** the lock.
   ##
@@ -1514,7 +1580,11 @@ proc runDue(due: var seq[Pending]) =
              ", the host's own thread and not Unity's; a callback queued " &
              "with invoke_main must not touch a Unity object"
       else:
-        okLog "invoke_main self-test ran on thread " & $int(cThreadId())
+        let tid = int(cThreadId())
+        okLog "invoke_main self-test ran on thread " & $tid
+        # On Unity's own thread now, so a real managed call is safe -- and the
+        # same call from the host thread crashes the client. This is the proof.
+        bridgeProof(tid)
     else:
       # A reference on the owning mod, held across the callback.
       #
@@ -2219,6 +2289,64 @@ proc hostPatchTyped(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
   ## is made where the type still exists: in `aowlspt_live.h`, on the way in.
   installPatch(ctx, target, targetLen, kind, cb, user, true)
 
+proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
+                 perFrame: bool; verbose: bool): bool =
+  ## Installs the host's own per-frame drain detour on the code pointer `fn`,
+  ## through the same slot table and detour engine a mod's `patch` uses. Shared
+  ## by both of `bindMainDrain`'s paths: the verified static targets from
+  ## `aowlspt_bridge.h` (where `meth` is nil, since the drain firing path indexes
+  ## by slot and never reads it) and the by-name runtime candidates (where `meth`
+  ## is the resolved `MethodInfo`).
+  ##
+  ## Same lock as `installPatch`, for the same reason: this claims a slot and
+  ## writes its row, and a mod's `patch` on another thread does too. It is the
+  ## host's own hook, and it is not exempt from the rule.
+  tablesLock()
+  let claimed = cHookClaim()
+  if claimed < 0'i32:
+    tablesUnlock()
+    warn "no free patch slots for the main-thread drain"
+    return false
+  let hook = cHookNew()
+  if hook == nil:
+    cHookRelease(claimed)
+    tablesUnlock()
+    return false
+
+  var targetBytes = newSeq[byte](spec.len + 1)
+  for k in 0 ..< spec.len:
+    targetBytes[k] = byte(spec[k])
+  targetBytes[spec.len] = 0'u8
+  while gPatches.len <= int(claimed):
+    gPatches.add deadPatch()
+  gPatches[int(claimed)] = Patch(hook: hook, cb: cast[Il2CppPtr](0),
+                     user: cast[Il2CppPtr](0), target: spec,
+                     targetC: targetBytes, live: true, meth: meth,
+                     wantArgs: false, canSkip: false, modIndex: -1,
+                     isDrain: true, isPostfix: false, typed: false,
+                     kinds: @[], retKind: 0'u8, frameFlags: 0'u32)
+  let rc = cHookAttachAt(hook, fn, claimed)
+  if rc != 0'i32:
+    gPatches[int(claimed)] = deadPatch()
+    cHookFree(hook)
+    cHookRelease(claimed)
+    tablesUnlock()
+    if verbose:
+      info "cannot drain from " & spec & ": " &
+           readCString(cHookErrorText(rc))
+    return false
+
+  gDrainSlot = int(claimed)
+  tablesUnlock()
+  gDrainMethod = spec
+  gDrainPerFrame = perFrame
+  okLog "main-thread drain bound to " & spec & " (" &
+        $int(cHookStolen(hook)) & " bytes)" &
+        (if gDrainPerFrame: "" else:
+           "; it runs more than once a frame, so its firing count is not a " &
+           "frame count")
+  return true
+
 proc bindMainDrain(verbose: bool): bool =
   ## Detours a method Unity calls once per frame on its main thread, so that
   ## `invoke_main` can be drained from *there* rather than from the host's own
@@ -2272,20 +2400,47 @@ proc bindMainDrain(verbose: bool): bool =
   if not gReady:
     return false
 
+  # The verified static targets come first, because they are the reliable path
+  # on this build: `aowlspt_bridge.h` resolves a per-frame method's code pointer
+  # as a fixed RVA into GameAssembly.dll and checks its prologue byte-for-byte
+  # before handing it back, exactly as the BE-bypass patches do. This sidesteps
+  # the runtime resolution below, which on this build returns no usable
+  # `MethodInfo.methodPointer` for any of the by-name candidates. On any other
+  # build the prologue guard fails and each returns nil, so the by-name path
+  # still runs -- safe by default, never a bind aimed at the wrong bytes.
+  let staticCount = cBridgeTargetCount()
+  for i in 0 ..< int(staticCount):
+    let fn = cBridgeTargetAt(int32(i))
+    if fn == nil:
+      continue
+    let spec = readCString(cBridgeTargetName(int32(i)))
+    let pf = cBridgeTargetPerFrame(int32(i)) != 0'i32
+    if attachDrain(spec, fn, cast[Il2CppMethod](0), pf, verbose):
+      return true
+
   # Built here rather than as a module-level `seq`: a global whose initialiser
   # is a call is silently left zeroed in an `--app:lib` build.
+  #
+  # The by-name fallback, for a build the static table does not cover. The first
+  # two names are the post-1.0 root application MonoBehaviour and the raid tick
+  # listener -- the same methods the static table hardcodes for this build, so a
+  # future build with a populated `methodPointer` field binds by name without a
+  # new RVA. The engine methods after them are last-resort: present whenever
+  # their module is, but their compiled bodies may be shorter than a jump.
   var candidates: seq[string] = @[]
-  candidates.add "EFT.MainApplication::Update"
+  candidates.add "EFT.TarkovApplication::Update"
+  candidates.add "EFT.GameWorldUnityTickListener::Update"
   candidates.add "EFT.GameWorld::Update"
   candidates.add "UnityEngine.UI.CanvasUpdateRegistry::PerformUpdate"
   candidates.add "UnityEngine.Time::get_deltaTime"
 
-  # Whether each candidate runs once per frame, in the same order. The first
-  # three are the player loop calling a method it calls once; the last is a
-  # property anything may read, several times a frame, which is why it is the
+  # Whether each candidate runs once per frame, in the same order. All but the
+  # last are the player loop calling a method it calls once; `get_deltaTime` is
+  # a property anything may read, several times a frame, which is why it is the
   # last resort. A mod is told this through `aowlspt.host::main_thread` so it
   # can say "frames" only when that is what it is counting.
   var perFrame: seq[bool] = @[]
+  perFrame.add true
   perFrame.add true
   perFrame.add true
   perFrame.add true
@@ -2316,55 +2471,9 @@ proc bindMainDrain(verbose: bool): bool =
       if verbose: info "no usable code pointer for " & spec
       continue
 
-    # Same lock as `installPatch`, for the same reason: this claims a slot and
-    # writes its row, and a mod's `patch` on another thread does too. It is the
-    # host's own hook, and it is not exempt from the rule.
-    tablesLock()
-    let claimed = cHookClaim()
-    if claimed < 0'i32:
-      tablesUnlock()
-      warn "no free patch slots for the main-thread drain"
-      return false
-    let hook = cHookNew()
-    if hook == nil:
-      cHookRelease(claimed)
-      tablesUnlock()
-      return false
-
-    var targetBytes = newSeq[byte](spec.len + 1)
-    for k in 0 ..< spec.len:
-      targetBytes[k] = byte(spec[k])
-    targetBytes[spec.len] = 0'u8
-    while gPatches.len <= int(claimed):
-      gPatches.add deadPatch()
-    gPatches[int(claimed)] = Patch(hook: hook, cb: cast[Il2CppPtr](0),
-                       user: cast[Il2CppPtr](0), target: spec,
-                       targetC: targetBytes, live: true, meth: m,
-                       wantArgs: false, canSkip: false, modIndex: -1,
-                       isDrain: true, isPostfix: false, typed: false,
-                       kinds: @[], retKind: 0'u8, frameFlags: 0'u32)
-    let rc = cHookAttachAt(hook, fn, claimed)
-    if rc != 0'i32:
-      gPatches[int(claimed)] = deadPatch()
-      cHookFree(hook)
-      cHookRelease(claimed)
-      tablesUnlock()
-      if verbose:
-        info "cannot drain from " & spec & ": " &
-             readCString(cHookErrorText(rc))
-      continue
-
-    let slot = claimed
-    gDrainSlot = int(slot)
-    tablesUnlock()
-    gDrainMethod = spec
-    gDrainPerFrame = candidateIndex < perFrame.len and perFrame[candidateIndex]
-    okLog "main-thread drain bound to " & spec & " (" &
-          $int(cHookStolen(hook)) & " bytes)" &
-          (if gDrainPerFrame: "" else:
-             "; it runs more than once a frame, so its firing count is not a " &
-             "frame count")
-    return true
+    let pf = candidateIndex < perFrame.len and perFrame[candidateIndex]
+    if attachDrain(spec, fn, m, pf, verbose):
+      return true
 
   result = false
 
@@ -3252,6 +3361,12 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       nextBindTry = now + 5000'u64
       if bindMainDrain(false):
         okLog "the main-thread drain bound late, on " & gDrainMethod
+        # The boot self-test already ran -- on this host thread, because nothing
+        # was bound then. Queue a fresh one so the managed-call proof actually
+        # fires on Unity's thread now that there is a drain to carry it. This is
+        # the only path that reaches the raid-only fallback target, so without it
+        # that target would bind without ever proving itself.
+        enqueue(cast[Il2CppPtr](0), cast[Il2CppPtr](0), now, -1, true)
 
     let fires = int(cMqFireCount())
     if fires != gLastFire:

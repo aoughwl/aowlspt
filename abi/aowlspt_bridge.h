@@ -1,0 +1,185 @@
+/* aowlspt_bridge.h -- getting host-side work onto Unity's main thread.
+ *
+ * ## The problem this closes
+ *
+ * `il2cpp_runtime_invoke` from the host's own injected thread crashes this
+ * client. IL2CPP/Unity managed code -- the GC, the managed heap, every Unity
+ * object -- is affine to the Unity **main thread** (the one that runs the
+ * player loop). A managed call, a box, or a field read issued from a foreign
+ * thread faults inside the runtime. The host boots on a thread of its own, so
+ * everything it wants to do to a live game object is on the wrong thread.
+ *
+ * The fix already lives in `host/Aowlspt.Host.Il2Cpp/aowlhost.nim`: detour a
+ * method Unity calls once per frame on its main thread and drain the
+ * `invoke_main` queue from inside the detour (`bindMainDrain` / `mainDrain`).
+ * A closure pushed from any thread then runs, on the Unity thread, the next
+ * frame. What was missing was a per-frame method the host could actually get a
+ * usable code pointer for.
+ *
+ * ## Why the by-name path was not enough, and what this adds
+ *
+ * `bindMainDrain` resolves a method by name through the runtime
+ * (`il2cpp_class_from_name` -> `il2cpp_class_get_method_from_name` -> read
+ * `MethodInfo.methodPointer`). On this hardened build that returned nothing
+ * usable for every candidate it tried -- and one candidate, `EFT.
+ * MainApplication`, does not even exist: the post-1.0 root application
+ * MonoBehaviour is **`EFT.TarkovApplication`**, and the old list named the
+ * pre-1.0 type. Two failure modes, one file: the wrong name, and a
+ * `MethodInfo.methodPointer` field this build does not populate the way the
+ * reader assumes (the BE client's own methods show the same null in the
+ * decrypted metadata's `methodPointers` table, so the field being null is a
+ * property of this build, not of the reader).
+ *
+ * So this header resolves the target the same way the BE-bypass RVAs in
+ * `aowlspt_beclient.h` were resolved: **statically**, as a fixed RVA into
+ * `GameAssembly.dll` for this exact client build, verified byte-for-byte
+ * against the compiled prologue before it is ever used. No metadata read, no
+ * `methodPointer` field, no runtime resolution -- the same mechanism that made
+ * the BE patches reliable when live detours were not.
+ *
+ * ## The target
+ *
+ *   `EFT.TarkovApplication::Update`  @ RVA 0x977B10  (imagebase 0x180000000,
+ *   build 1.1.0.1.46777, in the `il2cpp` PE section at VA 0x628000+).
+ *
+ * It is the root application MonoBehaviour's per-frame `Update`. It is the best
+ * of the candidates on all four counts a drain target needs:
+ *   - once per frame,
+ *   - on the Unity main thread only (a MonoBehaviour `Update` is a player-loop
+ *     callback and runs nowhere else),
+ *   - alive for the whole session, menu to desktop (the application root
+ *     outlives every scene, unlike `GameWorld`, which exists only in a raid),
+ *   - and its compiled prologue relocates cleanly -- `push rbx ; sub rsp,0x20 ;
+ *     mov rbx,[rcx+0x110] ; test rbx,rbx`, sixteen bytes with no RIP-relative
+ *     operand and no relative branch, which is exactly what the detour engine's
+ *     length decoder in `aowlspt_detour.h` needs to steal a whole number of
+ *     instructions for the trampoline.
+ *
+ * How the RVA was found: the decrypted `global-metadata.dat` gives the method's
+ * token RID within `Assembly-CSharp`, and the module's `Il2CppCodeGenModule.
+ * methodPointers` table in `GameAssembly.dll`'s `.data` maps RID -> code RVA,
+ * exactly as Il2CppDumper does. `EFT.TarkovApplication` is type index 7933; its
+ * `Update` resolves to 0x977B10 and its `LateUpdate` to the adjacent 0x977C80,
+ * the tight monotonic clustering a real compiler emits for one type's methods.
+ *
+ * A secondary, raid-only target -- `EFT.GameWorldUnityTickListener::Update` @
+ * RVA 0x251C6C0 -- is included as a fallback: it is present only inside a raid,
+ * but a raid is where a mod most wants the main thread, and binding it late
+ * beats not binding at all if the primary's prologue ever fails its guard.
+ *
+ * ## Safe by default
+ *
+ * Every target checks the bytes it expects before it is handed out. On any
+ * other build the prologue will not match, and this returns NULL -- the host
+ * then falls through to its by-name candidates and, failing those, to the
+ * existing host-thread behaviour, which is the documented fallback. A wrong
+ * offset is a missed bind, never a corrupted game. Nothing here writes to the
+ * game; it only *locates and verifies* a function pointer. The detour itself is
+ * installed by the host through the same `aowl_hook_*` engine and slot table a
+ * mod's patch uses, so it inherits that engine's thread-park write safety.
+ *
+ * RVAs are for imagebase 0x180000000 and build 1.1.0.1.46777.
+ */
+
+#ifndef AOWLSPT_BRIDGE_H
+#define AOWLSPT_BRIDGE_H
+
+#include <windows.h>
+#include <stdint.h>
+#include <string.h>
+
+/* One statically-resolved per-frame target: a name for the log, its RVA, and
+ * the leading bytes of its compiled prologue that pin it to this build. The
+ * signature is deliberately long enough to include a build-specific field
+ * displacement (the `mov rbx,[rcx+0x110]` disp32 / the `cmp [rip+..]` disp32),
+ * so a same-shaped but different function on another build fails the guard. */
+typedef struct AowlBridgeTarget {
+    const char*         name;
+    uint32_t            rva;
+    const unsigned char sig[16];
+    int32_t             siglen;
+    int32_t             perFrame;   /* runs once per frame (1) or more (0) */
+} AowlBridgeTarget;
+
+/* Diagnostics, read by the host after it asks for a target. */
+static int32_t aowl_bridge_base_found = 0;  /* GameAssembly.dll located        */
+static int32_t aowl_bridge_sig_ok     = 0;  /* a target's prologue matched      */
+static int32_t aowl_bridge_last_rva   = 0;  /* the RVA last handed out (or 0)   */
+
+/* The targets, most-preferred first. Primary is whole-session; the secondary is
+ * raid-only and only reached if the primary's guard fails on a future build. */
+static const AowlBridgeTarget aowl_bridge_targets[] = {
+    /* EFT.TarkovApplication::Update @ 0x977B10
+     * 40 53          push rbx
+     * 48 83 EC 20    sub  rsp, 0x20
+     * 48 8B 99 10 01 00 00   mov rbx, [rcx+0x110]
+     * 48 85 DB       test rbx, rbx                                          */
+    { "EFT.TarkovApplication::Update", 0x977B10u,
+      { 0x40,0x53, 0x48,0x83,0xEC,0x20, 0x48,0x8B,0x99,0x10,0x01,0x00,0x00,
+        0x48,0x85,0xDB }, 16, 1 },
+
+    /* EFT.GameWorldUnityTickListener::Update @ 0x251C6C0 (raid only)
+     * 40 57          push rdi
+     * 48 83 EC 20    sub  rsp, 0x20
+     * 80 3D D0 68 BA 04 00   cmp byte [rip+0x4BA68D0], 0                    */
+    { "EFT.GameWorldUnityTickListener::Update", 0x251C6C0u,
+      { 0x40,0x57, 0x48,0x83,0xEC,0x20, 0x80,0x3D,0xD0,0x68,0xBA,0x04,0x00 },
+      13, 1 },
+};
+
+#define AOWL_BRIDGE_TARGET_COUNT \
+    ((int32_t)(sizeof(aowl_bridge_targets) / sizeof(aowl_bridge_targets[0])))
+
+/* The i'th target's verified code pointer, or NULL.
+ *
+ * NULL means one of: GameAssembly.dll is not mapped yet, the index is out of
+ * range, the RVA does not resolve to committed executable memory, or -- the
+ * common case on any build but this one -- the prologue bytes there are not the
+ * ones recorded. Every one of those is a reason to move on to the next target
+ * or to the host's by-name path, and none is a reason to write anything. */
+static void* aowl_bridge_target_at(int32_t i) {
+    HMODULE ga;
+    const AowlBridgeTarget* t;
+    unsigned char* p;
+    MEMORY_BASIC_INFORMATION mbi;
+
+    if (i < 0 || i >= AOWL_BRIDGE_TARGET_COUNT) return NULL;
+    ga = GetModuleHandleA("GameAssembly.dll");
+    if (!ga) return NULL;
+    aowl_bridge_base_found = 1;
+
+    t = &aowl_bridge_targets[i];
+    p = (unsigned char*)ga + t->rva;
+
+    /* The bytes have to be readable+executable before they are compared: a bad
+     * RVA can land in an uncommitted or data page, and memcmp there faults. */
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0) return NULL;
+    if (mbi.State != MEM_COMMIT) return NULL;
+    if (!(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                         PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+        return NULL;
+
+    if (t->siglen > 0 && memcmp(p, t->sig, (size_t)t->siglen) != 0) return NULL;
+
+    aowl_bridge_sig_ok = 1;
+    aowl_bridge_last_rva = (int32_t)t->rva;
+    return (void*)p;
+}
+
+/* Whether the i'th target runs once per frame (1) or more often (0). Read
+ * alongside `aowl_bridge_target_at` so the host can tell a mod, through
+ * `aowlspt.host::main_thread`, whether the drain's firing count is a frame
+ * count. */
+static int32_t aowl_bridge_target_perframe(int32_t i) {
+    if (i < 0 || i >= AOWL_BRIDGE_TARGET_COUNT) return 0;
+    return aowl_bridge_targets[i].perFrame;
+}
+
+static const char* aowl_bridge_target_name(int32_t i) {
+    if (i < 0 || i >= AOWL_BRIDGE_TARGET_COUNT) return "";
+    return aowl_bridge_targets[i].name;
+}
+
+static int32_t aowl_bridge_target_count(void) { return AOWL_BRIDGE_TARGET_COUNT; }
+
+#endif /* AOWLSPT_BRIDGE_H */
