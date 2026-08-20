@@ -278,7 +278,12 @@ proc giveItem*(inv: var Inventory; tpl, stashId: string; count: int;
     setText(d, "parentId", stashId)
     setText(d, "slotId", "hideout")
     setRaw(d, "location", locationJson(places[k]))
-    if sizes[k] > 1:
+    # `upd.StackObjectsCount` is always present, even on a stack of one: the
+    # real backend sends it on every `items.new` entry, and the post-1.0 client
+    # builds the item's stack component from it -- a new item with no `upd` is
+    # one it cannot construct, which is a purchase that never lands and a buy
+    # button that spins.
+    block:
       var upd = newDoc()
       setNumber(upd, "StackObjectsCount", sizes[k])
       setRaw(d, "upd", text(upd))

@@ -139,5 +139,9 @@ proc locationJson*(p: Placement): string =
   var o = obj()
   put(o, "x", p.x)
   put(o, "y", p.y)
-  put(o, "r", if p.rotated: "Vertical" else: "Horizontal")
+  # An integer, not the name: post-1.0 deserialises `location.r` into the
+  # `ItemRotation` enum from the number the real backend sends (`0`/`1`), and a
+  # profile-changes item the client cannot place is a purchase that spins
+  # forever. `markOccupied` above already reads either form.
+  put(o, "r", if p.rotated: 1 else: 0)
   result = done(o).text

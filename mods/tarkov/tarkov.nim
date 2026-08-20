@@ -725,6 +725,30 @@ proc itemEventResponse(p: Profile; ch: Change): string =
   # without a reload.
   put(changes, "traderRelations", raw(p.field("TradersInfo").raw()))
 
+  # The rest of what the real backend puts on *every* item-event response. They
+  # were missing, and while a lenient deserialiser fills a missing array with an
+  # empty one, `moneyTransferLimitData` is not an array: post-1.0's trade-confirm
+  # handler reads it to redraw the money-transfer-limit gauge after a purchase,
+  # and a null there is a NullReference inside the apply -- which surfaces as a
+  # buy that spins forever, because the operation the button awaits never
+  # completes. Sent with safe, faithful defaults (shapes taken from a real
+  # captured buy) so the apply has everything it reaches for.
+  put(changes, "changedHideoutStashes", arr())
+  put(changes, "repeatableQuests", arr())
+  put(changes, "recipeUnlocked", arr())
+  put(changes, "completableItems", arr())
+  put(changes, "readQuestData", arr())
+  put(changes, "newQuestNotes", arr())
+  put(changes, "variableValues", arr())
+  put(changes, "seasonalRewards", arr())
+  put(changes, "battlePassUniversalDocumentBalance", jnull())
+  var moneyLimit = obj()
+  put(moneyLimit, "nextResetTime", nowSeconds() + 86400)
+  put(moneyLimit, "remainingLimit", 1000000)
+  put(moneyLimit, "totalLimit", 1000000)
+  put(moneyLimit, "resetInterval", 86400)
+  put(changes, "moneyTransferLimitData", moneyLimit)
+
   var byProfile = obj()
   put(byProfile, p.id, changes)
 
@@ -996,6 +1020,14 @@ proc onLocale(url, body, session: string): string =
   # because the sweep that posts a matured return runs with nobody logged in.
   # A failed write costs English mail, not a locale, so it is discarded.
   discard rememberLanguage(profileFor(session), lang)
+  # Prefer the real post-1.0 locale (the decoded client capture, ~33k keys) when
+  # it is deployed: SPT's pre-1.0 table is missing most post-1.0 UI strings, so
+  # without it the client shows raw key paths -- map names as `Icebreaker`,
+  # settings hovers as `Settings/Graphics/PostFxOff`, and so on. The SPT table
+  # remains the fallback and the source for the mail this server composes.
+  let post1Locale = post1Table("locale_" & (if lang.len > 0: lang else: "en"))
+  if post1Locale.len > 0:
+    return envelope(raw(post1Locale))
   result = envelope(raw(locale(if lang.len > 0: lang else: "en")))
 
 proc onMenuLocale(url, body, session: string): string =
@@ -1005,6 +1037,9 @@ proc onMenuLocale(url, body, session: string): string =
   ## (surfacing far away as a preloader-UI crash), so the map is wrapped under
   ## `menu`. Pre-1.0 put the map straight on `data`; this is the post-1.0 shape.
   let lang = pathAfter(url, "/client/menu/locale/")
+  let post1Menu = post1Table("menulocale_" & (if lang.len > 0: lang else: "en"))
+  if post1Menu.len > 0:
+    return envelope(objOf("menu", raw(post1Menu)))
   result = envelope(objOf("menu", raw(menuLocale(if lang.len > 0: lang else: "en"))))
 
 proc onSettings(url, body, session: string): string =
