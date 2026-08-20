@@ -3361,6 +3361,12 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       nextBindTry = now + 5000'u64
       if bindMainDrain(false):
         okLog "the main-thread drain bound late, on " & gDrainMethod
+        # The boot self-test already ran -- on this host thread, because nothing
+        # was bound then. Queue a fresh one so the managed-call proof actually
+        # fires on Unity's thread now that there is a drain to carry it. This is
+        # the only path that reaches the raid-only fallback target, so without it
+        # that target would bind without ever proving itself.
+        enqueue(cast[Il2CppPtr](0), cast[Il2CppPtr](0), now, -1, true)
 
     let fires = int(cMqFireCount())
     if fires != gLastFire:
