@@ -303,6 +303,79 @@ proc sideToInt(side: string): int =
   of "Savage": 4
   else: 1
 
+proc buildPvr(p: Profile; pvr: var JsonObject): bool =
+  ## Assemble a MINIMAL but VALID `EFT.PlayerVisualRepresentation` for the
+  ## character-select slot: enough for the screen to show the nickname and render
+  ## a 3D character (in default clothes), no more. Returns `false` when the
+  ## profile is missing any piece the doll needs, so `characterSlot` can fall back
+  ## to a null PVR (a selectable-but-nameless slot) rather than emit a value that
+  ## might abort the dictionary deserialize and RE-LOCK the slot.
+  ##
+  ## Wire shape (from the decrypted 1.1.0.1.46777 global-metadata; the client's
+  ## `[JsonProperty]` names, NOT the C# field names):
+  ##   EFT.PlayerVisualRepresentationDescriptor carries
+  ##     [JsonProperty("Info")]          -> JsonType.PlayerInfo
+  ##     [JsonProperty("Customization")] -> the body/face descriptor
+  ##     [JsonProperty("Equipment")]     -> { Id, Items }
+  ##   JsonType.PlayerInfo has NO field-level JsonProperty overrides -> every key
+  ##   is the PascalCase field name (Nickname/Side/Level/MemberCategory/
+  ##   GameVersion/...). We send only the five the visual needs; missing fields
+  ##   default, which does not throw.
+  ##
+  ## `Side` goes out as the profile's STRING form ("Usec"/"Bear"/"Savage"): the
+  ## profile wire proves the client's `EPlayerSide` converter reads that string
+  ## (SPT's mirror models `VisualInfo.Side` as `String` too). This is the one
+  ## slot field that is an int -- there the field takes an int converter; here in
+  ## PlayerInfo it is the string form.
+  let nick = p.nickname
+  let head  = p.field("Customization.Head").asText("")
+  let body  = p.field("Customization.Body").asText("")
+  let feet  = p.field("Customization.Feet").asText("")
+  let hands = p.field("Customization.Hands").asText("")
+  let equip = p.field("Inventory.equipment").asText("")
+  # Fail-safe gate: refuse (-> null PVR) unless every visual piece is present.
+  # This guards against a half-populated profile; it CANNOT guard against a wrong
+  # wire-type guess, which is why the shapes above are taken from ground truth.
+  if nick.len == 0 or head.len == 0 or body.len == 0 or feet.len == 0 or
+     hands.len == 0 or equip.len == 0:
+    return false
+
+  var info = obj()
+  put(info, "Nickname", nick)
+  put(info, "Side", p.side)
+  put(info, "Level", p.level)
+  put(info, "MemberCategory", p.field("Info.MemberCategory").asInt(0))
+  put(info, "GameVersion", p.field("Info.GameVersion").asText("standard"))
+
+  # Customization descriptor: the four body/face slots the doll is built from
+  # (Head/Body/Feet/Hands). Voice/DogTag are gameplay, not visual, and the match
+  # customization descriptor omits them.
+  var cust = obj()
+  put(cust, "Head", head)
+  put(cust, "Body", body)
+  put(cust, "Feet", feet)
+  put(cust, "Hands", hands)
+
+  # MINIMAL Equipment: the inventory equipment ROOT item only, no worn gear. `Id`
+  # resolves to a real item inside `Items`, so the model builder finds the root
+  # and renders a default-clothed body; a full-gear doll is the follow-up once
+  # this is proven. The RISK the task flags lives here -- an item the deserialiser
+  # rejects aborts the slot -- so we send nothing but the well-known default-
+  # inventory root tpl (55d7217a...), the same tpl the profile generator uses for
+  # this exact item, as a bare {_id,_tpl} FlatItem.
+  var rootItem = obj()
+  put(rootItem, "_id", equip)
+  put(rootItem, "_tpl", "55d7217a4bdc2d86028b456d")
+  var equipObj = obj()
+  put(equipObj, "Id", equip)
+  put(equipObj, "Items", raw("[" & done(rootItem).text & "]"))
+
+  pvr = obj()
+  put(pvr, "Info", info)
+  put(pvr, "Customization", cust)
+  put(pvr, "Equipment", equipObj)
+  result = true
+
 proc characterSlot(p: Profile): JsonObject =
   ## One `EFT.CharacterSelectionProfileData` value for the post-1.0
   ## character-select screen. The wire keys are NOT the C# field names -- they
@@ -330,14 +403,19 @@ proc characterSlot(p: Profile): JsonObject =
   put(o, "accountType", p.field("Info.AccountType").asInt(0))
   put(o, "aid", p.field("aid").asInt(0))
   put(o, "gameVersion", p.field("Info.GameVersion").asText("live"))
-  # PlayerVisualRepresentation is left null for now: a throw ANYWHERE in the
-  # value (e.g. a FlatItem the Equipment deserialiser rejects) aborts the whole
-  # dictionary deserialize and re-locks the slot. `get_HasProfile` only needs
-  # `status==2` + non-empty `uid`, and `OnJsonDeserialize` builds the 3D model
-  # only when the PVR is present (null-guarded), so a null PVR is a selectable
-  # character without a doll -- exactly the safe first step. The model gets
-  # wired back once the slot is confirmed binding.
-  put(o, "PlayerVisualRepresentation", jnull())
+  # PlayerVisualRepresentation drives the nickname + 3D doll on the slot. A throw
+  # ANYWHERE in this value (e.g. a FlatItem the Equipment deserialiser rejects)
+  # aborts the whole dictionary deserialize and re-locks the slot -- so `buildPvr`
+  # is fail-safe: it emits a PVR only when it can build a clean, minimal one from
+  # the profile, else returns false and we send the null it sent before (a
+  # selectable-but-nameless slot). `get_HasProfile` only needs `status==2` +
+  # non-empty `uid`, and the model builder is null-guarded on the PVR, so the
+  # null fallback can never itself lock the slot.
+  var pvr = obj()
+  if buildPvr(p, pvr):
+    put(o, "PlayerVisualRepresentation", pvr)
+  else:
+    put(o, "PlayerVisualRepresentation", jnull())
   put(o, "SeasonalInfo", jnull())
   put(o, "unlockedProductionRecipe", raw("[]"))
   put(o, "unlockedRules", raw("[]"))
