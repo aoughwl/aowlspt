@@ -358,6 +358,17 @@ proc localLoot*(locationId: string; nowSeconds: int;
       setBool(d, "SavageForceOfflineRaidInPVE", false)
     if not has(d, "SavageForceOnlineRaidInPVE"):
       setBool(d, "SavageForceOnlineRaidInPVE", false)
+    # Make the scav waves actually spawn in an offline raid. BSG's real
+    # `LocationBase` is written for the online server, which owns bot spawning:
+    # several maps ship `BotMax: 0` (e.g. factory4_day) and a zero `BotStop`
+    # spawn window, because online those come from the matchmaker, not the map.
+    # Offline, the client spawns from these numbers, so `BotMax: 0` is a raid
+    # with no scavs at all -- only the bosses, which spawn off `BossLocationSpawn`
+    # on their own path, come (which is why Tagilla turns up on an otherwise
+    # empty Factory). Force a sane cap and an open spawn window when the map
+    # zeroes them, so the eight waves the map already defines actually fire.
+    if get(d, "BotMax").asInt(0) <= 0: setNumber(d, "BotMax", 16)
+    if get(d, "BotStop").asInt(0) <= 0: setNumber(d, "BotStop", 21600)
     result = text(d)
   else:
     # No base in the database: an empty-but-valid map that still loads and plays,
