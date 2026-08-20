@@ -18,6 +18,7 @@ import aowlspt/json
 import ids
 import loot
 import questcond
+import post1
 
 type
   RaidResult* = enum
@@ -185,7 +186,29 @@ proc locationsBody*(d: LootDb; idx: LocationIndex): string =
   # not import it, so nothing lands at `locations.paths` today. An empty graph
   # means the client offers no transit between maps, which is a missing feature
   # and not a wrong answer.
-  let paths = sub(d, "locations.paths")
+  # The transit graph: which maps you can walk from to which. The database
+  # first, then BSG's own.
+  #
+  # SPT keeps the graph in `database/locations/base.json`, a 2 KB sibling of
+  # the per-map directories, and `aowl importdb` does not import it -- so
+  # `locations.paths` is `[]` on every database this repository produces, and
+  # the client is told there is no transit anywhere. That is a wrong answer
+  # rather than a missing feature: the maps have transit exits, and a client
+  # that reaches one and is told it leads nowhere has been lied to.
+  #
+  # `data/post1/locationpaths.json` is the real backend's graph for this build
+  # -- 18 edges over 10 maps (capture seq 134) -- used when the database has
+  # none. The database still wins when it has one, so importing the graph
+  # properly later replaces this without another change here.
+  #
+  # An edge naming a map this server does not have is left in deliberately.
+  # The client resolves transits against the location list it was just sent in
+  # the same body, so an unknown destination is an edge it ignores; dropping
+  # such edges here would mean re-deriving the same conclusion with less
+  # information.
+  var paths = sub(d, "locations.paths")
+  if paths.len == 0 or paths == "[]":
+    paths = post1Table("locationpaths")
   put(o, "paths", if paths.len > 0: raw(paths) else: emptyArray())
   result = done(o).text
 
@@ -386,6 +409,35 @@ proc raidClock*(cfgBody: string): RaidClock =
     return
   result = RaidClock(known: true, startHour: hour, spanHours: span)
 
+proc civilFromDays(z0: int): (int, int, int) =
+  ## Days since 1970-01-01 -> (year, month, day). Howard Hinnant's algorithm.
+  var z = z0 + 719468
+  let era = (if z >= 0: z else: z - 146096) div 146097
+  let doe = z - era * 146097
+  let yoe = (doe - doe div 1460 + doe div 36524 - doe div 146096) div 365
+  let y = yoe + era * 400
+  let doy = doe - (365 * yoe + yoe div 4 - yoe div 100)
+  let mp = (5 * doy + 2) div 153
+  let d = doy - (153 * mp + 2) div 5 + 1
+  let m = (if mp < 10: mp + 3 else: mp - 9)
+  result = ((if m <= 2: y + 1 else: y), m, d)
+
+proc p2(n: int): string = (if n < 10: "0" else: "") & $n
+
+proc wxDate(ts: int): string =
+  ## "yyyy-MM-dd" -- what the weather serializer parses with ParseExact. An
+  ## empty string (what this used to send) is a FormatException in
+  ## `EFT.Weather.WeatherSerializer.Deserialize` that stalls the menu load.
+  let (y, m, d) = civilFromDays(ts div 86400)
+  result = $y & "-" & p2(m) & "-" & p2(d)
+
+proc wxTime(ts: int): string =
+  ## "HH:mm:ss"
+  let s = ((ts mod 86400) + 86400) mod 86400
+  result = p2(s div 3600) & ":" & p2((s mod 3600) div 60) & ":" & p2(s mod 60)
+
+proc wxDateTime(ts: int): string = wxDate(ts) & " " & wxTime(ts)
+
 proc weatherFrom*(stored: string; nowSeconds: int): string =
   ## The sky, out of `stored` when there is one and dull when there is not.
   ##
@@ -428,16 +480,16 @@ proc weatherFrom*(stored: string; nowSeconds: int): string =
         inner = newDoc()
       setNumber(inner, "timestamp", nowSeconds)
       if not has(inner, "time"):
-        setText(inner, "time", "")
+        setText(inner, "time", wxDateTime(nowSeconds))
       if not has(inner, "date"):
-        setText(inner, "date", "")
+        setText(inner, "date", wxDate(nowSeconds))
       setRaw(o, "weather", text(inner))
       if not has(o, "acceleration"):
-        setNumber(o, "acceleration", 0)
+        setNumber(o, "acceleration", 7)
       if not has(o, "season"):
         setNumber(o, "season", 1)
-      setText(o, "time", "")
-      setText(o, "date", "")
+      setText(o, "time", wxTime(nowSeconds))
+      setText(o, "date", wxDate(nowSeconds))
       return text(o)
   var w = obj()
   put(w, "timestamp", nowSeconds)
@@ -450,12 +502,12 @@ proc weatherFrom*(stored: string; nowSeconds: int): string =
   put(w, "fog", 0.0)
   put(w, "temp", 18)
   put(w, "pressure", 760)
-  put(w, "time", "")
-  put(w, "date", "")
+  put(w, "time", wxDateTime(nowSeconds))
+  put(w, "date", wxDate(nowSeconds))
   var o = obj()
-  put(o, "acceleration", 0)
-  put(o, "time", "")
-  put(o, "date", "")
+  put(o, "acceleration", 7)
+  put(o, "time", wxTime(nowSeconds))
+  put(o, "date", wxDate(nowSeconds))
   put(o, "weather", w)
   put(o, "season", 1)
   result = done(o).text
@@ -552,15 +604,36 @@ proc selfCheckRaid*(into: var seq[string]): bool =
     into.add "raid: the map list is no smaller than the whole locations " &
              "subtree it was cut down from"
 
-  # The transit graph, out of the table when there is one and empty when there
-  # is not -- never invented.
+  # The transit graph: the database's when it has one, BSG's own when it has
+  # not, and empty when neither is installed.
+  #
+  # This used to assert that a database with no graph answers `[]`, on the
+  # ground that a graph must never be invented. That is still the rule -- what
+  # changed is that `data/post1/locationpaths.json` is not an invention. It is
+  # the real backend's own 18 edges for this build, and answering `[]` when it
+  # is installed is a client told there is no transit anywhere while the maps
+  # it is standing on have transit exits.
+  #
+  # So the check is now two claims, and the **first** is the one that protects
+  # the original rule: a database that carries a graph must have that graph
+  # answered, not the fallback. Getting that backwards would silently override
+  # a real import with a canned table.
   if count(field(body, "paths")) != 1:
     into.add "raid: the transit graph did not survive the map list"
+  let dbPaths = sub(d, "locations.paths")
+  if dbPaths.len > 0 and dbPaths != "[]" and
+     field(body, "paths").raw != dbPaths:
+    into.add "raid: a database with a transit graph had it replaced by " &
+             field(body, "paths").raw
   let bare = textDb(ChkNoPaths)
   let bareBody = locationsBody(bare, buildLocationIndex(bare))
-  if field(bareBody, "paths").raw != "[]":
+  let fallbackPaths = post1Table("locationpaths")
+  let wantBare = if fallbackPaths.len > 0: fallbackPaths else: "[]"
+  if field(bareBody, "paths").raw != wantBare:
     into.add "raid: a database with no transit graph answered " &
-             field(bareBody, "paths").raw & " rather than an empty list"
+             field(bareBody, "paths").raw & " rather than " &
+             (if fallbackPaths.len > 0: "the installed post-1.0 graph"
+              else: "an empty list")
 
   # Naming a map either way round, and refusing to guess at a third.
   if resolveLocation(idx, "bigmap") != "bigmap":

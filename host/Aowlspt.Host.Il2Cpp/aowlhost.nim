@@ -77,6 +77,7 @@ import invoke
 ## binary that includes it have to define them. See `aowlspt_live.h`.
 {.emit: """#include "aowlspt_live.h" """.}
 {.emit: """#include "aowlspt_hostboot.h" """.}
+{.emit: """#include "aowlspt_beclient.h" """.}
 {.emit: """#include "aowlspt_detour.h" """.}
 ## The typed patch frame. Included here as well as through `aowlspt_abi.h`
 ## because this file names its pool directly; the include guard makes the second
@@ -300,6 +301,28 @@ proc cHookAttach(p, target: Il2CppPtr): int32 {.importc: "aowl_hook_attach", nod
 proc cHookRemove(p: Il2CppPtr): int32 {.importc: "aowl_hook_remove", nodecl.}
 proc cHookStolen(p: Il2CppPtr): int32 {.importc: "aowl_hook_stolen", nodecl.}
 proc cHookCapacity(): int32 {.importc: "aowl_hook_capacity", nodecl.}
+
+# The BattlEye service guard, armed in the C constructor before this file's
+# `hostMain` exists as a running thread. `aowlspt_beguard.h` says why it cannot
+# wait for the boot thread and why it patches an import table rather than a
+# function. All this side does is read what it did, once there is a log.
+proc cBecNeuter(): int32 {.importc: "aowl_beclient_neuter", nodecl.}
+var cBecBaseFound {.importc: "aowl_bec_base_found", nodecl.}: int32
+var cBecIsInstSeen {.importc: "aowl_bec_isinst_seen", nodecl.}: int32
+var cBecRestartSeen {.importc: "aowl_bec_restart_seen", nodecl.}: int32
+proc cBeArmed(): int32 {.importc: "aowl_be_guard_armed", nodecl.}
+proc cBeModule(): int32 {.importc: "aowl_be_guard_module", nodecl.}
+proc cBeAnswered(): int32 {.importc: "aowl_be_guard_answered", nodecl.}
+proc cBeOpened(): int32 {.importc: "aowl_be_guard_opened", nodecl.}
+
+# The IL2CPP readiness flag, armed in the same constructor and set on the
+# game's own thread when `il2cpp_init` returns. `aowlspt_il2cppready.h` has
+# why this is watched rather than polled for.
+proc cIl2Ready(): int32 {.importc: "aowl_il2_is_ready", nodecl.}
+proc cIl2Armed(): int32 {.importc: "aowl_il2_guard_armed", nodecl.}
+proc cIl2Seen(): int32 {.importc: "aowl_il2_guard_seen", nodecl.}
+proc cIl2Rc(): int32 {.importc: "aowl_il2_guard_rc", nodecl.}
+proc cIl2Calls(): int32 {.importc: "aowl_il2_guard_calls", nodecl.}
 ## How many slots the engine has live, and how many it has back on its free
 ## list. Both are read only by `aowlspt.host::table_stats`; they exist because
 ## "the slot was reclaimed" is otherwise unobservable from outside the engine,
@@ -2666,26 +2689,84 @@ proc startModControl() =
 # --------------------------------------------------------------- runtime
 
 proc waitForIl2Cpp(timeoutMs: int): bool =
-  ## The host is injected before the game has built its runtime, so this polls
-  ## rather than assuming. Two things have to be true: the module is present,
-  ## and `il2cpp_domain_get` returns a domain -- the module appears well before
-  ## the domain does, so checking only for the module would attach to nothing.
+  ## The host is injected before the game has built its runtime, so this waits.
+  ##
+  ## What it waits *on* is the correction of a crash. This used to poll
+  ## `il2cpp_domain_get` until it answered, on the reasoning -- written in the
+  ## comment that was here -- that the module appears well before the domain
+  ## does, so the module alone is not enough to go on. The first half of that
+  ## is true. The conclusion drawn from it was not: `il2cpp_domain_get` before
+  ## `il2cpp_init` has run does not return nil, it reads a global that has not
+  ## been written and faults inside the runtime. On the first real client this
+  ## took the game down, with our own frame directly above the runtime's in
+  ## `Player.log`. There is nothing here that can be polled, because *asking is
+  ## the unsafe act*.
+  ##
+  ## So the signal comes from the other side: `aowlspt_il2cppready.h` arms a
+  ## replacement for `GetProcAddress` in `UnityPlayer.dll`'s import table in
+  ## the DLL constructor, and sets a flag when the `il2cpp_init` it handed out
+  ## returns. Until that flag is set this touches nothing in the runtime -- not
+  ## even to open it, since `openIl2Cpp` resolves exports and there is no need
+  ## to have them before there is a domain to use them on.
   var waited = 0
   var nextNote = 10000
+  # Said as soon as it is known, not at the end.
+  #
+  # The timeout report below carries the same numbers, and on the first real
+  # client it never printed once: the game exited in under ten seconds, so the
+  # only line that would have explained why was one the process did not live
+  # long enough to write. A diagnosis that is only produced after a two-minute
+  # wait is not available for any failure that is faster than two minutes --
+  # which is most of them.
+  var toldInit = 0
   while waited < timeoutMs:
-    if not gRt.loaded:
-      gRt = openIl2Cpp("")
-    if gRt.loaded:
-      let d = domainGet(gRt)
-      if d != nil:
-        gDomain = d
-        return true
+    if cIl2Calls() != toldInit:
+      toldInit = cIl2Calls()
+      if cIl2Rc() != 0:
+        okLog "il2cpp_init returned " & $cIl2Rc() & " after " & $waited & "ms"
+      else:
+        fail "il2cpp_init returned 0 after " & $waited & "ms, which is a " &
+             "failure: the runtime did not initialise. Nothing will resolve, " &
+             "and this is the game's own failure rather than the host's"
+    if cIl2Ready() != 0:
+      if not gRt.loaded:
+        gRt = openIl2Cpp("")
+      if gRt.loaded:
+        # Safe now, and only now. A nil here is a real answer rather than a
+        # fault, and is reported as one instead of being retried forever.
+        let d = domainGet(gRt)
+        if d != nil:
+          gDomain = d
+          okLog "IL2CPP is up after " & $(waited div 100 * 100) & "ms: " &
+                "il2cpp_init returned " & $cIl2Rc() & " and was handed out " &
+                $cIl2Seen() & " time(s)"
+          return true
+        fail "il2cpp_init returned " & $cIl2Rc() & " but there is no domain; " &
+             "refusing to call into the runtime"
+        return false
+      fail "il2cpp_init has run but GameAssembly.dll could not be opened"
+      return false
     cSleep(100'i32)
     waited = waited + 100
     if waited >= nextNote:
-      # Otherwise a slow launch is indistinguishable from a hung host.
-      info "still waiting for the runtime (" & $(waited div 1000) & "s)"
+      # Otherwise a slow launch is indistinguishable from a hung host -- and
+      # since the arming is what makes this terminate, say whether it happened.
+      if cIl2Armed() == 0:
+        warn "still waiting for the runtime (" & $(waited div 1000) & "s), " &
+             "and nothing is watching for it: the il2cpp_init lookup was " &
+             "never armed, so this will wait out its timeout"
+      else:
+        info "still waiting for the runtime (" & $(waited div 1000) & "s)"
       nextNote = nextNote + 10000
+  # Not just "it did not come up": what was watched, whether the watch was
+  # armed, and what the runtime said the last time it was asked to initialise.
+  # A zero here is `il2cpp_init` reporting failure, which is a different
+  # problem from a slow disk and must not read like one.
+  fail "the runtime did not come up: the il2cpp_init lookup was " &
+       (if cIl2Armed() != 0: "armed" else: "NOT armed") &
+       ", init was handed out " & $cIl2Seen() & " time(s), called " &
+       $cIl2Calls() & " time(s), and last returned " & $cIl2Rc() &
+       " (non-zero is success)"
   result = false
 
 proc readWaitMs(): int =
@@ -2715,6 +2796,103 @@ proc readWaitMs(): int =
   if any:
     result = v
 
+# ------------------------------------------------------- backend key dump
+#
+# One-shot, diagnostic: read the client's baked HTTP body-crypto material so a
+# captured session can be decrypted offline. Post-1.0 encrypts /client/game/*
+# response bodies with AES (see reference_post1_aes_layer); the key and IV pool
+# live as static byte[] fields on the global `HTTPTransportManager`. The three
+# reads below (byte_at / read_ptr / is_readable) are the same C shims il2cpp.nim
+# uses; they are re-declared here because that module keeps them file-private.
+proc hByteAt(p: Il2CppPtr; i: uint64): uint8 {.importc: "aowl_byte_at", nodecl.}
+proc hReadPtr(p: Il2CppPtr; off: int32): Il2CppPtr {.importc: "aowl_read_ptr", nodecl.}
+proc hReadable(p: Il2CppPtr; size: int32): int32 {.importc: "aowl_is_readable", nodecl.}
+
+proc il2ByteArrayHex(arrPtr: Il2CppPtr): string =
+  ## An IL2CPP `byte[]` as hex: element count at +0x18, data at +0x20. Every
+  ## read is VirtualQuery-guarded to its FULL extent first -- a raw read past a
+  ## committed region faults on the host thread and takes the whole game down
+  ## (which is exactly what an under-guarded first attempt did).
+  if arrPtr == nullPtr() or hReadable(arrPtr, 0x20'i32) == 0'i32:
+    return "<unreadable>"
+  let n = int(cast[uint](hReadPtr(arrPtr, 0x18'i32)))
+  if n < 0 or n > 8192: return "<len " & $n & ">"
+  if hReadable(arrPtr, int32(0x20 + n)) == 0'i32:
+    return "<data unreadable, len " & $n & ">"
+  const digits = "0123456789abcdef"
+  result = ""
+  for i in 0 ..< n:
+    let b = hByteAt(arrPtr, uint64(0x20 + i))
+    result.add digits[int(b shr 4'u8)]
+    result.add digits[int(b and 0xF'u8)]
+
+proc staticFieldPtr(cls: Il2CppClass; fieldName: string): Il2CppPtr =
+  ## No `runtimeClassInit` here: it RUNS the managed static constructor, and on
+  ## the host's own (non-Unity) thread that faults and kills the game. By the
+  ## time this runs the client has long since initialised the class itself, so
+  ## the static data is already there to read -- these are pure C-API reads.
+  okLog "keydump: findField " & fieldName
+  let f = findField(gRt, cls, fieldName)
+  okLog "keydump: findField returned"
+  if f == nullPtr():
+    warn "keydump: field " & fieldName & " not found"
+    return nullPtr()
+  let sdata = staticFieldData(gRt, cls)
+  okLog "keydump: staticFieldData returned"
+  if sdata == nullPtr():
+    warn "keydump: no static data for " & fieldName
+    return nullPtr()
+  let off = fieldOffset(gRt, f)
+  okLog "keydump: " & fieldName & " off=" & $off
+  if off < 0 or off > 65536: return nullPtr()
+  if hReadable(sdata, int32(off + 8)) == 0'i32:
+    warn "keydump: static slot for " & fieldName & " unreadable"
+    return nullPtr()
+  result = hReadPtr(sdata, int32(off))
+
+proc dumpBackendKey() =
+  okLog "keydump: starting"
+  var count = 0
+  let assemblies = domainGetAssemblies(gRt, gDomain, count)
+  if assemblies == nil: return
+  # Find the class by ENUMERATING real classes (imageGetClass by index) and
+  # matching the name -- classFromName with an empty namespace handed back bogus
+  # non-NULL pointers whose name read faulted. Every class from imageGetClass is
+  # a real one, so className on it is safe (guarded anyway).
+  var cls: Il2CppClass = nullPtr()
+  for i in 0 ..< count:
+    let image = assemblyGetImage(gRt, assemblyAt(assemblies, i))
+    if image == nil: continue
+    if imageGetName(gRt, image) != "Assembly-CSharp.dll": continue
+    let cc = imageGetClassCount(gRt, image)
+    okLog "keydump: scanning " & $cc & " classes in Assembly-CSharp"
+    for k in 0 ..< cc:
+      let c = imageGetClass(gRt, image, k)
+      if c == nullPtr() or hReadable(c, 8'i32) == 0'i32: continue
+      if classNameSafe(gRt, c) == "HTTPTransportManager":
+        cls = c
+        break
+    break
+  if cls == nullPtr():
+    warn "keydump: HTTPTransportManager not found by enumeration"
+    return
+  okLog "keydump: found HTTPTransportManager, reading statics"
+  let keyPtr = staticFieldPtr(cls, "_key")
+  okLog "KEYDUMP _key: " & il2ByteArrayHex(keyPtr)
+  let poolPtr = staticFieldPtr(cls, "_ivPool")
+  if poolPtr == nullPtr() or hReadable(poolPtr, 0x28'i32) == 0'i32:
+    warn "keydump: _ivPool unreadable"
+  else:
+    let n = int(cast[uint](hReadPtr(poolPtr, 0x18'i32)))
+    okLog "KEYDUMP _ivPool outer-len: " & $n
+    # As a flat byte[] (in case the pool is one contiguous buffer):
+    okLog "KEYDUMP _ivPool flat: " & il2ByteArrayHex(poolPtr)
+    # As a jagged byte[][] (elements are byte[] pointers at +0x20 + i*8):
+    if n > 0 and n <= 64 and hReadable(poolPtr, int32(0x20 + n * 8)) != 0'i32:
+      for i in 0 ..< n:
+        let inner = hReadPtr(poolPtr, int32(0x20 + i * 8))
+        okLog "KEYDUMP _ivPool[" & $i & "]: " & il2ByteArrayHex(inner)
+
 proc reportRuntime() =
   let gaps = missingEssential(gRt)
   if gaps.len > 0:
@@ -2722,6 +2900,22 @@ proc reportRuntime() =
       fail "essential IL2CPP entry point missing: " & g
     return
   okLog "IL2CPP runtime bound, all essential entry points present"
+
+  # Neuter the BattlEye anti-cheat validation gate now that GameAssembly.dll is
+  # mapped (two static .text byte patches; see aowlspt_beclient.h). Without it
+  # the client shows "Anticheat loading failed / Game restart required" when the
+  # menu reaches online play and quits. This is separate from the BE service
+  # guard armed in the constructor.
+  let becLanded = cBecNeuter()
+  if cBecBaseFound == 0:
+    warn "anti-cheat: GameAssembly.dll not found; BE client gate not patched"
+  elif becLanded >= 2:
+    okLog "anti-cheat: BE client validation gate neutered (2/2 patches)"
+  else:
+    warn "anti-cheat: only " & $becLanded & "/2 BE patches landed" &
+         " (IsInstanceSuccessfully seen=" & $cBecIsInstSeen &
+         ", OnRequestRestart seen=" & $cBecRestartSeen &
+         "); offsets may not match this client build"
 
   var count = 0
   let assemblies = domainGetAssemblies(gRt, gDomain, count)
@@ -2869,6 +3063,39 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
     "directory " & gDir & "\n" &
     "thread " & $int(gHostThreadId) & "\n\n")
 
+  # The first thing said, because it is the first thing that happened and
+  # because a client that does not start says nothing else. The guard ran in
+  # the constructor, long before this log existed; these are its counters.
+  #
+  # Four states, and they are deliberately not collapsed into "on" and "off".
+  # No UnityPlayer.dll at all is `hostharness` and the stand-in runtime, where
+  # there is correctly nothing to do. The module present with none of the four
+  # imports is a client without BSG's guard -- a different client, or a version
+  # that dropped it -- and is also nothing to do. The module present with the
+  # imports and nothing patched is a *failure*, and it is the one that must not
+  # look like the other two, because the symptom is the game refusing to start
+  # with no explanation anywhere.
+  if cBeModule() == 0:
+    info "no UnityPlayer.dll in this process, so BSG's BattlEye service " &
+         "guard is not a question here"
+  elif cBeArmed() == 0:
+    info "UnityPlayer.dll imports none of the service-manager calls BSG's " &
+         "BattlEye guard uses; nothing was patched and nothing needed to be"
+  elif cBeArmed() < 4:
+    warn "BSG's BattlEye service guard: only " & $cBeArmed() & " of 4 " &
+         "import slots were patched. The client may still refuse to start, " &
+         "and if it does, that is why"
+  else:
+    okLog "BSG's BattlEye service guard is answered from inside the process " &
+          "(4 import slots); BattlEye is not installed, started or loaded"
+
+  # The same constructor, the other patch. Reported separately and before the
+  # wait, because if this did not arm the wait cannot succeed and the reason
+  # has to be on the line above the symptom rather than 120 seconds below it.
+  if cIl2Armed() == 0 and cBeModule() != 0:
+    warn "the il2cpp_init lookup could not be armed; the runtime will be " &
+         "reported as unavailable however long the game takes to come up"
+
   # Before a single mod is loaded, because the loader refuses an unload it has
   # no teardown for and the manager is told so in the capabilities reply.
   # `dropModRegistrations` is this host's half: subscriptions, queued
@@ -2995,6 +3222,17 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   var lastTick = cNowMs()
   gLastFireMs = lastTick
   var nextBindTry = lastTick + 5000'u64
+  # One-shot backend-key dump, deferred until the client has reached its menu
+  # and initialised HTTPTransportManager on its own -- reading (or worse,
+  # force-initialising) it right after il2cpp_init faults and kills the game.
+  var keyDumpAt = lastTick + 20000'u64
+  var keyDumped = false
+  # Backend-key runtime dump left in but disabled: reading IL2CPP class metadata
+  # from the host's own thread faults too readily on the real client, even behind
+  # VEH-guarded name reads. Ground-truth response shapes come from offline
+  # analysis of the decrypted metadata + binary disassembly instead.
+  discard keyDumpAt
+  discard keyDumped
   while true:
     cSleep(16'i32)
     let now = cNowMs()
