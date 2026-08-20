@@ -771,20 +771,14 @@ static void aowl_session_unlock(int32_t slot) {
      * closes. A dead notifier therefore costs at most two of these. */
 
 #define AOWL_WS_SEND_MS 250
-    /* How long a **worker's** websocket write waits for a peer that has
-     * stopped reading. Far shorter than `AOWL_SEND_DEADLINE_MS` because this
-     * write is under the websocket lock, which the poller wants to take: a
-     * notification the client will not read must not be able to hold the read
-     * path up for thirty seconds. On loopback a frame this size never blocks
-     * against a client that is alive at all.
-     *
-     * It is not, and never was, a bound on how long the lock is held. The wait
-     * inside `aowl_net_send_within` is a deadline *per stall*: every byte the
-     * peer accepts resets it. A client that reads one byte every 200 ms keeps
-     * a worker inside a single `aowl_ws_send` for as long as it cares to, and
-     * that is what made "the poller waits for at most 250 ms" wrong rather
-     * than merely tight. The poller no longer waits at all -- see
-     * `aowl_ws_send`. */
+    /* Vestigial. It was how long a **worker's** websocket write waited for a
+     * peer that had stopped reading, back when a worker wrote the socket itself.
+     * No worker writes a websocket any more: a push is appended to the
+     * connection's `wsOut` under `g_wsCs` and the poller alone puts it on the
+     * wire, because OpenSSL forbids a concurrent read and write on one `SSL` and
+     * corrupted its heap when a push met the poller's read (see `aowl_ws_send`).
+     * So nothing waits per-stall on a websocket write now, and this constant has
+     * no live use; it is kept only so the reasoning above stays on the record. */
 
 #define AOWL_WS_RETRY_MS 5
     /* How long a queued frame, or a close the write lock was busy for, waits
@@ -792,6 +786,18 @@ static void aowl_session_unlock(int32_t slot) {
      * those connections only, so it costs a wakeup on a connection that is
      * mid-close and nothing at all on the rest. Five milliseconds is far below
      * anything a player perceives and far above the cost of the wakeup. */
+
+#define AOWL_WS_OUT_CAP (256 * 1024)
+    /* Bytes of pushed notification frames one connection may have queued for the
+     * poller to send on its behalf -- the buffer a worker appends to rather than
+     * writing the `SSL` itself. Sized for the largest notification the game
+     * makes (a `new_message` with rewards is a few hundred bytes; this is three
+     * orders of magnitude of headroom) and counted against `AOWL_NET_MAX_BUFFERED`
+     * like every other byte held on a client's behalf. A push that would cross
+     * it is refused, not truncated: the mod that asked has its own poll queue to
+     * fall back to, and half a frame on the wire is worse than a frame delivered
+     * a poll later. Distinct from `wsPend` below, which is control frames the
+     * poller composed for itself; this is data another thread handed it. */
 
 #define AOWL_WS_PEND_CAP 256
     /* Bytes of already-composed frame the poller may leave queued on one
@@ -857,6 +863,21 @@ typedef struct {
     char wsPend[AOWL_WS_PEND_CAP];
     int32_t wsPendLen;
     int wsClosing;
+
+    /* Notification frames a *non-poller* thread (a request worker, a timer, the
+     * serve loop) wants pushed down this websocket. They are appended here --
+     * under `g_wsCs`, so they do not race the poller draining the same buffer --
+     * and put on the wire by the poller in its pending pass, because the poller
+     * is the ONE thread that may ever call `SSL_read`/`SSL_write` on a
+     * connection's `SSL` handle. OpenSSL forbids a concurrent read and write on
+     * one handle and corrupts its heap when it gets one; routing every push
+     * through the poller makes that overlap structurally impossible rather than
+     * merely locked against. Grown on demand and bounded by `AOWL_WS_OUT_CAP`;
+     * a push that would exceed it is refused, which the mod reads as "no socket"
+     * and falls back to its poll queue for. See `aowl_ws_send`. */
+    char* wsOut;
+    int32_t wsOutLen;
+    int32_t wsOutCap;
 } AowlConn;
 
 static uint64_t g_listenSock = 0;
@@ -959,8 +980,22 @@ static void aowl_ws_free_msg(AowlConn* c) {
     c->wsMsgOp = 0;
 }
 
+/* The outbound push queue, freed with the connection like every other buffer
+ * it holds and counted the same way. Poller thread or a drop under `g_wsCs`
+ * only. */
+static void aowl_ws_free_out(AowlConn* c) {
+    if (c->wsOut) {
+        InterlockedExchangeAdd64(&g_bufBytes, -(LONG64)c->wsOutCap);
+        free(c->wsOut);
+        c->wsOut = NULL;
+        c->wsOutCap = 0;
+    }
+    c->wsOutLen = 0;
+}
+
 static void aowl_conn_free_buf(AowlConn* c) {
     aowl_ws_free_msg(c);
+    aowl_ws_free_out(c);
     if (c->buf) {
         InterlockedExchangeAdd64(&g_bufBytes, -(LONG64)c->cap);
         free(c->buf);
@@ -1000,6 +1035,9 @@ static int32_t aowl_conn_take(SOCKET s) {
     c->wsMsgOp = 0;
     c->wsPendLen = 0;
     c->wsClosing = 0;
+    c->wsOut = NULL;
+    c->wsOutLen = 0;
+    c->wsOutCap = 0;
     c->inUse = 1;
     return idx;
 }
@@ -1355,6 +1393,12 @@ static AowlConn* g_pollCur = NULL;
  * make a decision. */
 static volatile LONG g_wsDeferred = 0;
 
+/* Frames a non-poller thread appended to a connection's `wsOut` for the poller
+ * to send -- every push now, since a worker no longer writes the socket. Same
+ * purpose as `g_wsDeferred`: a test can tell "the push went through the queue"
+ * from "no push ever reached it", and nothing branches on it. */
+static volatile LONG g_wsQueued = 0;
+
 /* One pass of `send` with no waiting at all: returns how many bytes went, 0
  * included, or -1 if the socket is gone. The count matters -- a frame written
  * halfway and then abandoned is a stream neither end can parse, so the
@@ -1402,32 +1446,90 @@ static int aowl_ws_flush_pending(AowlConn* c) {
     return c->wsPendLen == 0 ? 1 : 0;
 }
 
+/* Append one pushed frame to a connection's outbound queue, growing it. Called
+ * from a non-poller thread with `g_wsCs` held, so it cannot race the poller
+ * draining the same buffer in `aowl_ws_flush_out`. Returns 1 on success, 0 if
+ * the frame would cross `AOWL_WS_OUT_CAP` or the global buffer bound or a
+ * `realloc` fails -- in every one of those the caller reports the push as not
+ * delivered and the mod falls back to its poll queue, which is a frame arriving
+ * a poll later rather than a frame torn in half or a bound quietly broken. */
+static int aowl_ws_enqueue_out(AowlConn* c, const char* p, int32_t len) {
+    if (len <= 0) return 0;
+    int64_t want = (int64_t)c->wsOutLen + len;
+    if (want > (int64_t)AOWL_WS_OUT_CAP) return 0;
+    if ((int32_t)want > c->wsOutCap) {
+        int32_t next = c->wsOutCap > 0 ? c->wsOutCap : 4096;
+        while (next < (int32_t)want) next *= 2;
+        LONG64 delta = (LONG64)next - (LONG64)c->wsOutCap;
+        if (InterlockedExchangeAdd64(&g_bufBytes, delta) + delta >
+            (LONG64)AOWL_NET_MAX_BUFFERED) {
+            InterlockedExchangeAdd64(&g_bufBytes, -delta);
+            return 0;
+        }
+        char* np = (char*)realloc(c->wsOut, (size_t)next);
+        if (!np) { InterlockedExchangeAdd64(&g_bufBytes, -delta); return 0; }
+        c->wsOut = np;
+        c->wsOutCap = next;
+    }
+    memcpy(c->wsOut + c->wsOutLen, p, (size_t)len);
+    c->wsOutLen = (int32_t)want;
+    InterlockedIncrement(&g_wsQueued);
+    return 1;
+}
+
+/* The poller putting a connection's queued pushes on the wire. Same shape and
+ * same rules as `aowl_ws_flush_pending` -- poller thread only, one non-blocking
+ * pass under a tried lock, the unsent tail kept in order for the next wakeup --
+ * but over the growable push queue rather than the fixed control buffer. This
+ * is where a worker's notification actually reaches `SSL_write`, on the one
+ * thread allowed to touch the handle. */
+static int aowl_ws_flush_out(AowlConn* c) {
+    if (c->wsOutLen == 0) return 1;
+    if (c->s == INVALID_SOCKET) { c->wsOutLen = 0; return -1; }
+    if (!TryEnterCriticalSection(&g_wsCs)) return 0;
+    int32_t n = aowl_ws_write_nowait(c->s, c->wsOut, c->wsOutLen);
+    LeaveCriticalSection(&g_wsCs);
+    if (n < 0) { c->wsOutLen = 0; return -1; }
+    if (n > 0) {
+        int32_t left = c->wsOutLen - n;
+        if (left > 0) memmove(c->wsOut, c->wsOut + n, (size_t)left);
+        c->wsOutLen = left;
+    }
+    return c->wsOutLen == 0 ? 1 : 0;
+}
+
 /* The one way a websocket frame reaches the wire. `buf` is bytes nimony has
  * already framed. Returns the count sent, or -1 for "there is no such live
  * connection, or it would not take them".
  *
  * There are two of it, and which one runs is decided by the thread rather than
- * by the caller:
+ * by the caller -- and the split is the whole of why a websocket no longer
+ * crashes the server:
  *
- *   * **A worker** -- a push from a mod, or `aowl_ws_adopt`'s sibling at the
- *     101 -- takes the lock and waits, up to `AOWL_WS_SEND_MS` per stall, for
- *     a peer that is not reading. A worker is a thread whose job is to wait
- *     for a client; blocking one is what the pool is for.
- *   * **The poller** never waits. It tries the lock, and it writes in one
- *     pass; anything it cannot put on the wire right now is queued on the
- *     connection and goes out at the next wakeup, a few milliseconds later.
- *     This is the rule that used to be stated and not kept: every pong, close
- *     and refusal the poller sends came through here and blocked, so a worker
- *     pushing a notification at a client that had stopped reading stopped the
- *     *whole server* -- no accepts, no reads on any connection, no deadlines
- *     -- for as long as that push took. Which is not `AOWL_WS_SEND_MS`; see
- *     the note there.
+ *   * **The poller** is the only thread that ever touches a connection's `SSL`
+ *     handle. It never waits: it tries the lock and writes in one pass, and
+ *     anything it cannot put on the wire right now is queued on the connection
+ *     (a control frame in `wsPend`) and goes out at the next wakeup.
+ *   * **Any other thread** -- a request worker pushing a notification, a timer,
+ *     the serve loop -- does *not* write the socket. It appends the frame to
+ *     the connection's outbound queue (`wsOut`, under `g_wsCs`) and wakes the
+ *     poller, which drains it in `aowl_ws_flush_out`. This is not an
+ *     optimisation, it is a correctness rule: OpenSSL forbids a concurrent
+ *     `SSL_read` and `SSL_write` on one handle and corrupts its own heap when
+ *     it gets them, and the notifier is the one connection the poller keeps
+ *     *reading* while another thread would push to it. A worker that called
+ *     `SSL_write` here raced the poller's `SSL_read` -- a silent heap-corruption
+ *     fast-fail (`STATUS_HEAP_CORRUPTION`, which does not even reach an
+ *     unhandled-exception filter) exactly when a push met a client-side
+ *     teardown, i.e. raid entry and logout. Routing the push through the poller
+ *     removes the overlap outright rather than serialising it and hoping every
+ *     path took the lock.
  *
- * Queuing preserves order: once anything is queued on a connection, later
- * frames for it are queued too rather than overtaking it on a lock that has
- * since come free. A poller-thread frame for some *other* connection (nothing
- * composes one today) has no queue to go in and is refused if the lock is
- * busy, which the caller sees as a send that failed. */
+ * Queuing preserves order within each queue: later frames wait behind earlier
+ * ones rather than overtaking on a lock that has since come free. A push the
+ * queue cannot take (over `AOWL_WS_OUT_CAP`, or the global bound) is refused,
+ * which the caller reports as "no socket" and the mod answers from its own poll
+ * queue -- a frame a poll later, never a frame torn in half. */
 static int32_t aowl_ws_send(int64_t ticket, const void* buf, int32_t len) {
     if (ticket <= 0 || len <= 0) return -1;
 
@@ -1459,15 +1561,20 @@ static int32_t aowl_ws_send(int64_t ticket, const void* buf, int32_t len) {
         return len;
     }
 
+    /* A non-poller thread: queue the frame for the poller and wake it. The
+     * append is under `g_wsCs` so it does not race the poller draining `wsOut`;
+     * the SSL write itself happens later, on the poller thread, in
+     * `aowl_ws_flush_out`. No `SSL` call is made from here, which is the point. */
     int32_t sent = -1;
     EnterCriticalSection(&g_wsCs);
     for (int32_t i = 0; i < AOWL_NET_MAX_CONNS; i++) {
         AowlConn* c = &g_conns[i];
         if (!c->inUse || !c->ws || c->wsTicket != ticket) continue;
-        sent = aowl_net_send_within((uint64_t)c->s, buf, len, AOWL_WS_SEND_MS);
+        sent = aowl_ws_enqueue_out(c, (const char*)buf, len) ? len : -1;
         break;
     }
     LeaveCriticalSection(&g_wsCs);
+    if (sent > 0) aowl_wake_poller();
     return sent;
 }
 
@@ -1892,9 +1999,19 @@ static void aowl_conn_drop(int32_t idx);
 static void aowl_ws_drop_locked(int32_t idx) {
     AowlConn* c = &g_conns[idx];
     int64_t ticket = c->wsTicket;
-    if (c->wsPendLen > 0 && c->s != INVALID_SOCKET)
-        (void)aowl_ws_write_nowait(c->s, c->wsPend, c->wsPendLen);
+    /* Whatever the poller still owes the peer goes out here, in one pass, while
+     * the socket is still open and the lock still held: the control frames it
+     * composed (`wsPend`) and then any pushes a worker queued (`wsOut`). A peer
+     * whose window is full misses them, which is the right answer for a
+     * connection about to close rather than a wait. */
+    if (c->s != INVALID_SOCKET) {
+        if (c->wsPendLen > 0)
+            (void)aowl_ws_write_nowait(c->s, c->wsPend, c->wsPendLen);
+        if (c->wsOutLen > 0)
+            (void)aowl_ws_write_nowait(c->s, c->wsOut, c->wsOutLen);
+    }
     c->wsPendLen = 0;
+    c->wsOutLen = 0;
     c->wsClosing = 0;
     c->ws = 0;
     c->wsTicket = 0;
@@ -2089,7 +2206,8 @@ static DWORD WINAPI aowl_net_poller(LPVOID param) {
              * not waiting for the peer to say something -- it is waiting for
              * this thread to come back round. Its deadline is irrelevant to
              * that, so it caps the poll instead. */
-            if (c->wsPendLen > 0 || c->wsClosing) left = AOWL_WS_RETRY_MS;
+            if (c->wsPendLen > 0 || c->wsOutLen > 0 || c->wsClosing)
+                left = AOWL_WS_RETRY_MS;
             if (left < timeout) timeout = left;
         }
 
@@ -2279,16 +2397,18 @@ static DWORD WINAPI aowl_net_poller(LPVOID param) {
             aowl_conn_drop(idx);
         }
 
-        /* What the write lock was busy for last time.
+        /* What the write lock was busy for last time, and the pushes another
+         * thread handed this one.
          *
-         * Two things end up here: a frame the poller composed and could not
-         * write (a pong, or a close it owes the peer), and a websocket it has
-         * decided to close and could not. Both are retried every wakeup, and
-         * the poll timeout above is capped while either is outstanding, so
-         * "next wakeup" is milliseconds rather than the idle timer. Before
-         * this, a close that lost the try was left to the *next thing that
-         * happened* on that connection, which on a peer that had gone quiet
-         * was `AOWL_WS_IDLE_MS` away. */
+         * Three things end up here: a control frame the poller composed and
+         * could not write (a pong, or a close it owes the peer); a notification
+         * a worker queued in `wsOut` for the poller to send on its behalf; and
+         * a websocket the poller has decided to close and could not. All are
+         * retried every wakeup, and the poll timeout above is capped while any
+         * is outstanding, so "next wakeup" is milliseconds rather than the idle
+         * timer. The `wsOut` drain is the *only* place a pushed frame reaches
+         * `SSL_write`, and it is on this thread -- which is the whole reason a
+         * push from a worker no longer races the read here. */
         for (int32_t i = g_watchCount - 1; i >= 0; i--) {
             int32_t idx = g_watch[i];
             AowlConn* c = &g_conns[idx];
@@ -2297,8 +2417,12 @@ static DWORD WINAPI aowl_net_poller(LPVOID param) {
                 if (aowl_ws_drop(idx)) aowl_watch_remove(i);
                 continue;
             }
-            if (c->wsPendLen == 0) continue;
-            if (aowl_ws_flush_pending(c) < 0) {
+            if (c->wsPendLen > 0 && aowl_ws_flush_pending(c) < 0) {
+                c->wsClosing = 1;
+                if (aowl_ws_drop(idx)) aowl_watch_remove(i);
+                continue;
+            }
+            if (c->wsOutLen > 0 && aowl_ws_flush_out(c) < 0) {
                 c->wsClosing = 1;
                 if (aowl_ws_drop(idx)) aowl_watch_remove(i);
             }
@@ -2456,6 +2580,9 @@ static int32_t aowl_net_serve_impl(int32_t port, int32_t workers) {
         g_conns[i].wsMsgOp = 0;
         g_conns[i].wsPendLen = 0;
         g_conns[i].wsClosing = 0;
+        g_conns[i].wsOut = NULL;
+        g_conns[i].wsOutLen = 0;
+        g_conns[i].wsOutCap = 0;
         g_freeList[g_freeCount++] = i;
     }
     g_readyCount = 0;
