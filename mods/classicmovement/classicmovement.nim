@@ -217,6 +217,7 @@
 import aowlspt
 import aowlspt/game
 import aowlspt/server
+import aowlspt/settings # the F12 settings schema this mod declares
 import aowlspt/json     # reading the hook payload, which is an object now
 import aowlspt/il2cpp   # the runtime's own metadata, for signature checks
 import aowlspt/fast     # bind once, call in ~10 ns — docs/PERF.md
@@ -279,7 +280,44 @@ proc onGetConfig(url, body, session: string): string =
   ## break a client written against the original protocol.
   result = done(configDocument()).text
 
+# ---------------------------------------------------------------------------
+# The F12 settings schema
+# ---------------------------------------------------------------------------
+#
+# Every key loadConfig reads, declared so the in-game settings screen can draw a
+# control per key. All are booleans. NostalgiaMode is carried on the wire but
+# upstream stopped supporting it and it is not ported, so it is declared
+# implemented = false with that reason.
+
+proc classicMovementSchema(): seq[Setting] =
+  result = @[
+    boolSetting("NoInertia", "No inertia", true, category = "Movement",
+                description = "Restore the pre-inertia instant movement feel"),
+    boolSetting("QuickTilting", "Quick tilting", true, category = "Movement",
+                description = "Faster lean transitions"),
+    boolSetting("DoBushesSlowYouDown", "Bushes slow you down", false,
+                category = "Movement"),
+    boolSetting("BotsUseOldMovement", "Bots use old movement", true,
+                category = "Movement"),
+    boolSetting("DoesAimingSlowYouDown", "Aiming slows you down", true,
+                category = "Movement"),
+    boolSetting("RemoveJitteryRotation", "Remove jittery rotation", false,
+                category = "Movement"),
+    boolSetting("NostalgiaMode", "Nostalgia mode", false, category = "Movement",
+                implemented = false,
+                description = "Served on the config route but not ported; upstream stopped supporting it and it does nothing"),
+    boolSetting("verifyHooks", "Verify hooks at load", true, category = "Advanced",
+                description = "Assert each detour bound before trusting it")]
+
+proc onClassicMovementSettings(url, body, session: string): string =
+  ## GET serves the schema; a POST body applies one edit, then re-reads config.
+  if body.len > 0 and applySettingFromBody(body) == Ok:
+    loadConfig()
+  result = declaredSchemaJson().text
+
 proc serverLoad(): Status =
+  declareSettings(classicMovementSchema())
+  discard serve("/aowlspt/settings/" & ModGuid, onClassicMovementSettings)
   if serve(ConfigRoute, onGetConfig) != Ok:
     error "could not register " & ConfigRoute & ": " & lastError()
     return ErrGeneric

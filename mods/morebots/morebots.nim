@@ -208,6 +208,7 @@
 import std/strutils
 import aowlspt
 import aowlspt/server
+import aowlspt/settings # the F12 settings schema this mod declares
 import aowlspt/json
 import bots/spawntypes
 import bots/dbpath
@@ -470,7 +471,42 @@ proc onHello(payload: string): string =
   debugLog "hello from " & field(payload, "guid").asText("a mod")
   result = announce("")
 
+# ---------------------------------------------------------------------------
+# The F12 settings schema
+# ---------------------------------------------------------------------------
+#
+# The flat top-level scalar keys this mod reads through `setting()`. The
+# `population` object is the headline feature but is a nested document read
+# whole out of its raw text, not a scalar control, so it is not declared here.
+# `increaseBotCapAmount` is read but writes to a database path nothing on this
+# stack reads, so it is declared implemented = false with that reason.
+
+proc moreBotsSchema(): seq[Setting] =
+  result = @[
+    boolSetting("enableDebugLogs", "Debug logs", false, category = "Debug",
+                description = "One line per registration, overlay and relation"),
+    intSetting("increaseBotCapAmount", "Increase bot cap amount", 0,
+               lo = 0, hi = 50, category = "Population", implemented = false,
+               description = "Deprecated: writes bots.config.maxBotCap, which nothing on this stack reads; use population instead"),
+    intSetting("censusIntervalMs", "Census interval (ms)", 5000,
+               lo = 500, hi = 60000, step = 500, category = "Census",
+               description = "How often the client half counts the bots that arrived; read-only, floored at 500"),
+    intSetting("expectedBotCap", "Expected bot cap", 0, lo = 0, hi = 200,
+               category = "Census",
+               description = "The alive-bot cap the census compares against; 0 reports the count without judging it")]
+
+proc onMoreBotsSettings(url, body, session: string): string =
+  ## GET serves the schema; a POST body persists one edit into config.json. The
+  ## value is read fresh at the next load — this mod reads its settings inline
+  ## rather than through a single reloadable config, so the write is saved but
+  ## not made live here.
+  if body.len > 0:
+    discard applySettingFromBody(body)
+  result = declaredSchemaJson().text
+
 proc registerRoutes() =
+  declareSettings(moreBotsSchema())
+  discard serve("/aowlspt/settings/" & ModGuid, onMoreBotsSettings)
   discard serve("/morebotsapi/getfactions", onGetFactions)
   discard serve("/morebotsapi/getrevenges", onGetRevenges)
   discard serve("/morebotsapi/updaterevenge", onUpdateRevenge)

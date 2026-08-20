@@ -428,8 +428,22 @@ selection, and serves the answer — including *why* a mod is not loading — un
 the game. Post-1.0 there is no `MonoBehaviour` to attach and no managed UI to
 call, so it is drawn by hand from a detour on `IDXGISwapChain::Present` — the
 same place Steam and Discord draw. The IL2CPP host starts it after its mods are
-up; Insert toggles it. See
+up; **F12** opens it (the settings key). See
 [host/Aowlspt.Overlay/README.md](host/Aowlspt.Overlay/README.md).
+
+## In-game settings (F12) and the config schema
+
+F12 opens an in-game settings panel. A mod declares its settings once with the
+`aowlspt/settings` API — `declareSettings(@[floatSetting(...), boolSetting(...),
+keybindSetting(..., implemented = false)])` — and the panel draws the right
+control per value, marks anything aowlspt does not yet back **not implemented
+yet**, persists edits back to `config.json`, and hot-applies them. The same
+screen carries the Tarkov emulator's own settings and the full SPT server config
+surface (`reference/spt-config-settings.json`, 28 pages / 323 values). The panel
+is the hand-drawn overlay rather than Tarkov's real IL2CPP settings screen,
+because live managed UI construction crashes this client — the full reasoning,
+the reverse-engineering of the real screen, and the schema API reference are in
+[docs/SETTINGS.md](docs/SETTINGS.md).
 
 ## Ports
 

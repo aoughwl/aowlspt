@@ -33,6 +33,7 @@ type
 const
   VkInsert* = 0x2D'i32
   VkF9* = 0x78'i32
+  VkF12* = 0x7B'i32   ## the settings key: F12 opens the in-game settings panel
   VkHome* = 0x24'i32
 
 # --------------------------------------------------------------- C surface
