@@ -272,7 +272,18 @@ proc onProfileList(url, body, session: string): string =
   ## behaviour rather than something to avoid.
   var a = arr()
   let all = allProfileIds()
+  # Deduplicate by id. `allProfileIds` reads the store directory, and anything
+  # that parses to a profile there -- a stray backup a careless hand left beside
+  # the real file, a half-written temp -- would otherwise be listed as a second
+  # profile with the same `_id`. The client's own profile prep does a
+  # `SingleOrDefault` over this list and throws "Sequence contains more than one
+  # matching element" on the duplicate, which reads as a menu crash far from its
+  # cause. One entry per id, whatever the store dir happens to hold.
+  var seenIds: seq[string] = @[]
   for id in all:
+    if id in seenIds:
+      continue
+    seenIds.add id
     let p = loadProfile(id)
     if p.ok:
       a.add raw(p.text)
