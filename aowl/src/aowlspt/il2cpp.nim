@@ -98,6 +98,8 @@ proc readPtr(p: Il2CppPtr; off: int32): Il2CppPtr {.
   importc: "aowl_read_ptr", nodecl.}
 proc isCodePtr(p: Il2CppPtr): int32 {.
   importc: "aowl_is_code_pointer", nodecl.}
+proc isReadable(p: Il2CppPtr; size: int32): int32 {.
+  importc: "aowl_is_readable", nodecl.}
 proc wordAt(p: Il2CppPtr; i: uint64): uint16 {.importc: "aowl_word_at", nodecl.}
 
 # ---------------------------------------------------------------------------
@@ -347,6 +349,16 @@ proc classFromName*(rt: Il2Cpp; image: Il2CppImage;
 proc className*(rt: Il2Cpp; c: Il2CppClass): string =
   if not rt.has(eClassGetName): return ""
   result = readCString(tpP(rt.fns[ord(eClassGetName)], c))
+
+proc tpPSeh(f, a: Il2CppPtr): Il2CppPtr {.importc: "aowl_p_p_seh", nodecl.}
+proc classNameSafe*(rt: Il2Cpp; c: Il2CppClass): string =
+  ## `className` that returns "" instead of faulting when `c` is a class handed
+  ## back by a blind enumeration that is not safe to dereference. For scanning
+  ## every class in an image to find one by name; see the host's key dump.
+  if not rt.has(eClassGetName): return ""
+  let p = tpPSeh(rt.fns[ord(eClassGetName)], c)
+  if p == nullPtr(): return ""
+  result = readCString(p)
 
 proc classNamespace*(rt: Il2Cpp; c: Il2CppClass): string =
   if not rt.has(eClassGetNamespace): return ""
@@ -623,6 +635,13 @@ proc methodPointer*(rt: Il2Cpp; m: Il2CppMethod): Il2CppPtr =
   ## caller gets nothing rather than a patch aimed at the middle of a struct.
   result = cast[Il2CppPtr](0)
   if m == nil:
+    return
+  # Before dereferencing `m` at all: a real client can hand back a non-nil
+  # method handle that is not a readable `MethodInfo` (an unverified type name
+  # resolving to something that is not one), and the raw read below faults on
+  # it and takes the game down rather than returning nothing. `MethodInfo`'s
+  # first field is one pointer, so eight bytes is what has to be readable.
+  if isReadable(m, 8'i32) == 0'i32:
     return
   let p = readPtr(m, 0'i32)
   if p == nil:

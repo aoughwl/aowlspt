@@ -88,7 +88,7 @@ The four derivation commands reproduce, run 2026-08-19:
 |---|---:|
 | the `Callbacks` sweep over `reference/spt-4.1-surface.txt` | **226** methods |
 | the `ItemEventActions` sweep over the same file | **55** fields |
-| `grep -oE 'serve(Prefix)?\("[^"]+"' mods/tarkov/tarkov.nim` | **95** routes |
+| `grep -oE 'serve(Prefix)?\("[^"]+"' mods/tarkov/tarkov.nim` | **99** routes |
 | `grep -rn 'of "' mods/tarkov/emu/*.nim` | **152** arms |
 
 Of the 226 callbacks, 15 are SPT's own plumbing (the launcher, mod bundles, the
@@ -97,8 +97,8 @@ operations**, split:
 
 | | operations |
 |---|---:|
-| served, and shaped against the reference DTO | 125 |
-| served, deliberately empty or flattened | 25 |
+| served, and shaped against the reference DTO | 129 |
+| served, deliberately empty or flattened | 21 |
 | not served | 61 |
 
 **That split is generated, not a hand join.** `tools/coverage.nim` writes it out
@@ -116,6 +116,46 @@ request — it fails three screens later, on a null the client dereferenced
 because the server said everything was fine. That is why `emu/builds` ships
 three empty lists rather than `{}`, and why the coverage doc has a *was
 mis-shaped* marker at all.
+
+### Before the game starts
+
+Five of those 99 routes are not the client's at all. `/aowlspt/tarkov/selfcheck`
+is one (§7); the other four are the **launcher's**, and they exist because of a
+gap the coverage table cannot show: the client is handed its session on the
+command line as `-token=<24 hex>` and carries it as `Cookie: PHPSESSID=<token>`
+from its first request onwards, so *which profile is being played* has to be
+decided before any `/client/` route is called. Every one of those routes already
+needs the answer.
+
+| route | body | answers |
+|---|---|---|
+| `/aowlspt/tarkov/launcher/ping` | — | `{"ok":true,"server","version","edition","defaultSide","profiles":N}` |
+| `/aowlspt/tarkov/launcher/profiles` | — | `{"ok":true,"profiles":[...]}` |
+| `/aowlspt/tarkov/launcher/profile/create` | `{"nickname","side","voice","edition"}` | `{"ok":true,"token":"<24 hex>","profile":{...}}` |
+| `/aowlspt/tarkov/launcher/profile/select` | `{"id":"<24 hex>"}` | `{"ok":true,"token":"<24 hex>","profile":{...}}` |
+
+Three things about that table are load-bearing.
+
+**The token is the profile id.** Not a third identifier mapped onto one: create
+and select both bind the session to itself, and `emu/sessions` persists the
+binding — so a token minted before the first launch is still the profile the
+client is playing after the server has been restarted under it, with nothing
+re-selected. `emutest` proves exactly that across its restart.
+
+**These are not `/launcher/*`.** SPT has a launcher API and this is not it. Its
+4.1 shape is `LauncherV2Callbacks` in `reference/spt-4.1-surface.txt`, keyed on
+a **username** with no counterpart here, and that dump carries no route urls at
+all — so the paths would be guesses. Wearing another server's url with a
+different body underneath invites a caller that speaks the real protocol and
+fails on the third field. Nothing in this tree speaks SPT's launcher API, and
+SPT's own launcher wants a great deal more from a server than profiles before it
+will drive one, so compatibility here would be a claim rather than a feature.
+
+**A caller must send `Accept-Encoding: identity`.** The backend zlib-deflates
+every response by default because that is what the game expects and does not say
+so in a header; a launcher that omits the header gets a body starting `78 9c`.
+Request bodies may be plain — `inflateBody` passes through anything that does
+not look framed — so a launcher needs no zlib at all in either direction.
 
 **A gap's stated reason is the part to distrust.** Seven operations this project
 recorded as "blocked on data the importer does not bring" were closed by

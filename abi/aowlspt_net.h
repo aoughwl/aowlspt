@@ -218,6 +218,13 @@
  * getting `aowl_lock`/`aowl_unlock` unchanged. */
 #include "aowlspt_lock.h"
 
+/* The TLS transport shim. When the server is started in `--tls` mode every
+ * accepted connection carries an `SSL` handle and the `recv`/`send` calls below
+ * become `SSL_read`/`SSL_write`; in the default plain-HTTP mode nothing here
+ * touches OpenSSL. See `aowlspt_tls.h` for how want-read/want-write fold into
+ * this file's existing `WSAEWOULDBLOCK` handling. */
+#include "aowlspt_tls.h"
+
 /* ------------------------------------------------------------------ *
  * What nimony provides
  * ------------------------------------------------------------------ *
@@ -284,6 +291,22 @@ static int32_t aowl_net_last_error(void) {
     return (int32_t)WSAGetLastError();
 }
 
+/* 1 once the server has been started in `--tls` mode. Read on every read and
+ * every send so that the plain-HTTP path pays a single predictable branch and
+ * is otherwise byte-for-byte what it was; the test suites run against that path
+ * and must stay unchanged. */
+static int g_tlsMode = 0;
+
+/* The `SSL` handle for a socket, or NULL. `aowl_net_send_within` and
+ * `aowl_ws_write_nowait` are handed only a socket (the response path comes down
+ * from nimony with no connection in hand), so they look the handle up here. It
+ * is a scan of the connection table, but only ever taken in `--tls` mode, on a
+ * loopback server whose realistic connection count is single digits; the
+ * websocket send path already scans the same table for the same reason. Defined
+ * after the table below; forward-declared here because the send helpers precede
+ * it. */
+static void* aowl_ssl_for_sock(SOCKET s);
+
 /* Binds to loopback only.
  *
  * That is a deliberate default rather than a placeholder: this backend serves
@@ -291,7 +314,7 @@ static int32_t aowl_net_last_error(void) {
  * listens on every interface by accident is how a LAN party becomes an
  * incident. Nothing here takes an address argument, so there is no flag to get
  * wrong. */
-static uint64_t aowl_net_listen(int32_t port, int32_t backlog) {
+static uint64_t aowl_net_bind(int32_t port) {
     SOCKET s = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
     if (s == INVALID_SOCKET) return 0;
 
@@ -349,13 +372,44 @@ static uint64_t aowl_net_listen(int32_t port, int32_t backlog) {
         WSASetLastError(err);
         return 0;
     }
-    if (listen(s, backlog) == SOCKET_ERROR) {
+    return (uint64_t)s;
+}
+
+/* `listen` is split off from the bind for one reason: *when* each of them is
+ * allowed to happen.
+ *
+ * The bind is the collision test -- with `SO_EXCLUSIVEADDRUSE` above, a port
+ * somebody else holds fails here with `WSAEADDRINUSE` -- and the backend wants
+ * that answer before it registers a route or loads a mod, so that a failure to
+ * start reads as a failure to start rather than as 150 lines of successful mod
+ * output with an error under them.
+ *
+ * The `listen` must **not** move that early. A listening socket completes a
+ * client's `connect` from the kernel backlog whether or not anything ever
+ * calls `accept`, and `aowllaunch` (and `soak`, and `aowlspt-verify`) treat a
+ * successful connect as "the backend is up". Listening before the mods are
+ * loaded would make every one of those tools believe a server that cannot yet
+ * answer them. So the port is *reserved* early and *served* at the same moment
+ * it always was. */
+static int32_t aowl_net_listen_on(uint64_t sock, int32_t backlog) {
+    if (listen((SOCKET)sock, backlog) == SOCKET_ERROR) {
         int err = WSAGetLastError();
-        closesocket(s);
         WSASetLastError(err);
         return 0;
     }
-    return (uint64_t)s;
+    return 1;
+}
+
+static uint64_t aowl_net_listen(int32_t port, int32_t backlog) {
+    uint64_t s = aowl_net_bind(port);
+    if (!s) return 0;
+    if (!aowl_net_listen_on(s, backlog)) {
+        int err = WSAGetLastError();
+        closesocket((SOCKET)s);
+        WSASetLastError(err);
+        return 0;
+    }
+    return s;
 }
 
 static uint64_t aowl_net_accept(uint64_t server) {
@@ -384,8 +438,13 @@ static int32_t aowl_net_send_within(uint64_t sock, const void* buf, int32_t len,
     const char* p = (const char*)buf;
     int32_t sent = 0;
     ULONGLONG deadline = 0;
+    void* ssl = aowl_ssl_for_sock((SOCKET)sock);
     while (sent < len) {
-        int n = send((SOCKET)sock, p + sent, len - sent, 0);
+        /* `aowl_tls_write_once` returns the same shape as `send` -- >0 taken,
+         * a would-block mapped to `WSAEWOULDBLOCK`, a fatal to a non-block
+         * error -- so the wait-for-writable loop below is reused unchanged. */
+        int n = ssl ? aowl_tls_write_once(ssl, p + sent, len - sent)
+                    : send((SOCKET)sock, p + sent, len - sent, 0);
         if (n > 0) {
             sent += n;
             deadline = 0;
@@ -758,6 +817,19 @@ typedef struct {
     ULONGLONG deadline;
     int inUse;
 
+    /* -- TLS ------------------------------------------------------------- *
+     *
+     * `ssl` is the per-connection OpenSSL handle, NULL for a plain connection
+     * and for every connection when the server is not in `--tls` mode. `tlsUp`
+     * is set once the handshake completes; until then the poller drives
+     * `SSL_do_handshake` instead of reading requests. `tlsWantWrite` records a
+     * mid-handshake `SSL_ERROR_WANT_WRITE`, so the poller adds `POLLWRNORM` to
+     * this one connection's poll events until the handshake settles -- the one
+     * TLS signal the plain `recv`/`send` re-poll machinery has no analogue for. */
+    void* ssl;
+    int tlsUp;
+    int tlsWantWrite;
+
     /* -- websocket ------------------------------------------------------- *
      *
      * `wsReq` is set by the framing when the header block carries
@@ -794,6 +866,14 @@ static AowlConn g_conns[AOWL_NET_MAX_CONNS];
 static int32_t g_freeList[AOWL_NET_MAX_CONNS];
 static int32_t g_freeCount = 0;
 static volatile LONG64 g_bufBytes = 0;
+
+/* Forward-declared up by the send helpers; see the note there. */
+static void* aowl_ssl_for_sock(SOCKET s) {
+    if (!g_tlsMode) return NULL;
+    for (int32_t i = 0; i < AOWL_NET_MAX_CONNS; i++)
+        if (g_conns[i].inUse && g_conns[i].s == s) return g_conns[i].ssl;
+    return NULL;
+}
 
 /* Ready: complete requests waiting for a worker. Handback: connections a
  * worker has finished with, waiting for the poller to watch them again. Both
@@ -907,6 +987,9 @@ static int32_t aowl_conn_take(SOCKET s) {
     c->declared = 0;
     c->served = 0;
     c->deadline = GetTickCount64() + AOWL_HEAD_MS;
+    c->ssl = NULL;
+    c->tlsUp = 0;
+    c->tlsWantWrite = 0;
     c->wsReq = 0;
     c->ws = 0;
     c->wsPinged = 0;
@@ -923,6 +1006,12 @@ static int32_t aowl_conn_take(SOCKET s) {
 
 static void aowl_conn_drop(int32_t idx) {
     AowlConn* c = &g_conns[idx];
+    /* Before the socket is closed: `aowl_tls_conn_free` writes a best-effort
+     * close_notify, which needs the socket still open. It never blocks. */
+    if (c->ssl) {
+        aowl_tls_conn_free(c->ssl);
+        c->ssl = NULL;
+    }
     if (c->s != INVALID_SOCKET) {
         closesocket(c->s);
         c->s = INVALID_SOCKET;
@@ -1139,7 +1228,8 @@ static int aowl_conn_read(AowlConn* c) {
         if (want <= 0) return 1;
         if (want > 65536) want = 65536;
         if (!aowl_conn_reserve(c, c->len + want)) return 0;
-        int n = recv(c->s, c->buf + c->len, want, 0);
+        int n = c->ssl ? aowl_tls_read_once(c->ssl, c->buf + c->len, want)
+                       : recv(c->s, c->buf + c->len, want, 0);
         if (n > 0) {
             c->len += n;
             aowl_frame(c);
@@ -1271,8 +1361,10 @@ static volatile LONG g_wsDeferred = 0;
  * remainder is queued rather than dropped. */
 static int32_t aowl_ws_write_nowait(SOCKET s, const char* p, int32_t len) {
     int32_t sent = 0;
+    void* ssl = aowl_ssl_for_sock(s);
     while (sent < len) {
-        int n = send(s, p + sent, len - sent, 0);
+        int n = ssl ? aowl_tls_write_once(ssl, p + sent, len - sent)
+                    : send(s, p + sent, len - sent, 0);
         if (n > 0) { sent += n; continue; }
         if (n == 0) return -1;
         if (WSAGetLastError() == WSAEWOULDBLOCK) return sent;
@@ -1601,7 +1693,8 @@ static int aowl_ws_pump(AowlConn* c) {
          * turn of this loop, which costs one `recv` and no correctness. */
         int32_t want = AOWL_CONN_CHUNK;
         if (!aowl_conn_reserve(c, c->len + want)) return 0;
-        int n = recv(c->s, c->buf + c->len, want, 0);
+        int n = c->ssl ? aowl_tls_read_once(c->ssl, c->buf + c->len, want)
+                       : recv(c->s, c->buf + c->len, want, 0);
         if (n > 0) { c->len += n; continue; }
         if (n == 0) return 0;                       /* peer closed the socket */
         if (WSAGetLastError() == WSAEWOULDBLOCK) return 1;
@@ -1662,7 +1755,8 @@ static int aowl_conn_read_hot(AowlConn* c) {
         if (want <= 0) return 1;
         if (want > 65536) want = 65536;
         if (!aowl_conn_reserve(c, c->len + want)) return 0;
-        int n = recv(c->s, c->buf + c->len, want, 0);
+        int n = c->ssl ? aowl_tls_read_once(c->ssl, c->buf + c->len, want)
+                       : recv(c->s, c->buf + c->len, want, 0);
         if (n > 0) {
             c->len += n;
             aowl_frame(c);
@@ -1720,6 +1814,14 @@ static int aowl_serve_one(AowlConn* c) {
     int32_t total = c->need;
     if (total < 0 || total > c->len) total = c->len;
     aowl_final_req = (c->served + 1 >= AOWL_KEEPALIVE_MAX) ? 1 : 0;
+    if (g_aowl_trace_init || getenv("AOWL_NET_TRACE")) {
+        char line[128]; int m = 0;
+        for (; m < 127 && m < c->len && c->buf[m] != '\r' && c->buf[m] != '\n'; m++)
+            line[m] = c->buf[m];
+        line[m] = 0;
+        aowl_trace("serve sock=%llu served=%d tls=%d bytes=%d req=[%s]",
+                   (unsigned long long)c->s, c->served, c->ssl ? 1 : 0, total, line);
+    }
     int32_t keep = aowlspt_nim_handle((uint64_t)c->s, c->buf, total,
                                       c->headEnd, c->sep);
     aowl_final_req = 0;
@@ -1895,6 +1997,10 @@ static DWORD WINAPI aowl_net_worker(LPVOID param) {
             u_long nonblocking = 1;
             ioctlsocket(c->s, FIONBIO, &nonblocking);
             c->deadline = aowl_conn_deadline(c, GetTickCount64());
+            if (c->ssl)
+                aowl_trace("handback sock=%llu idx=%d served=%d len=%d pending=%d",
+                           (unsigned long long)c->s, idx, c->served, c->len,
+                           aowl_tls_pending(c->ssl));
             aowl_push_handback(idx);
             break;
         }
@@ -1944,6 +2050,12 @@ static DWORD WINAPI aowl_net_poller(LPVOID param) {
             AowlConn* c = &g_conns[g_watch[i]];
             fds[n].fd = c->s;
             fds[n].events = POLLRDNORM;
+            /* A TLS handshake mid-flight that asked for the socket to be
+             * writable is the one thing the request loop never waits on -- so
+             * it is added here for that one connection until the handshake
+             * settles. On loopback this is all but never taken. */
+            if (c->ssl && !c->tlsUp && c->tlsWantWrite)
+                fds[n].events = (SHORT)(POLLRDNORM | POLLWRNORM);
             fds[n].revents = 0;
             n++;
             int left = c->deadline > now ? (int)(c->deadline - now) : 0;
@@ -1986,6 +2098,19 @@ static DWORD WINAPI aowl_net_poller(LPVOID param) {
                         closesocket(s);
                         continue;
                     }
+                    if (g_tlsMode) {
+                        /* A TLS connection: attach a server-role `SSL` now, on
+                         * the non-blocking socket, and let the poller drive the
+                         * handshake below before it reads a request. A handle
+                         * that cannot be made is dropped rather than watched. */
+                        void* ssl = aowl_tls_accept_new(s);
+                        if (!ssl) { aowl_conn_drop(idx); continue; }
+                        g_conns[idx].ssl = ssl;
+                        g_conns[idx].tlsUp = 0;
+                        g_conns[idx].tlsWantWrite = 0;
+                        aowl_trace("accept sock=%llu idx=%d (tls)",
+                                   (unsigned long long)s, idx);
+                    }
                     g_conns[idx].deadline =
                         aowl_conn_deadline(&g_conns[idx], now);
                     g_watch[g_watchCount++] = idx;
@@ -2022,7 +2147,40 @@ static DWORD WINAPI aowl_net_poller(LPVOID param) {
                     c->deadline = aowl_conn_deadline(c, now);
                     continue;
                 }
+                if (c->ssl && !c->tlsUp) {
+                    /* Not reading a request yet: this connection is still in
+                     * the TLS handshake. Drive it a step and re-poll. A
+                     * want-write is recorded so the poll set adds `POLLWRNORM`
+                     * for it above; a want-read is the ordinary case. */
+                    int hs = aowl_tls_do_handshake(c->ssl);
+                    if (hs < 0) {
+                        aowl_trace("handshake FATAL sock=%llu idx=%d",
+                                   (unsigned long long)c->s, idx);
+                        aowl_watch_remove(i);
+                        aowl_conn_drop(idx);
+                        continue;
+                    }
+                    if (hs != 1) {
+                        c->tlsWantWrite = (hs == 2);
+                        c->deadline = aowl_conn_deadline(c, now);
+                        continue;
+                    }
+                    aowl_trace("handshake DONE sock=%llu idx=%d",
+                               (unsigned long long)c->s, idx);
+                    /* Handshake done. Fall straight through to a read rather
+                     * than waiting for the next wakeup: the client is entitled
+                     * to have put its first request bytes in the same TLS
+                     * record flight as its Finished, and those are already
+                     * decrypted inside OpenSSL where a socket poll cannot see
+                     * them -- `aowl_conn_read` drains them via `SSL_read`. */
+                    c->tlsUp = 1;
+                    c->tlsWantWrite = 0;
+                }
                 int rc = aowl_conn_read(c);
+                if (c->ssl)
+                    aowl_trace("pollread sock=%llu idx=%d rc=%d len=%d complete=%d pending=%d",
+                               (unsigned long long)c->s, idx, rc, c->len,
+                               aowl_conn_complete(c) ? 1 : 0, aowl_tls_pending(c->ssl));
                 if (rc <= 0) {
                     if (rc < 0)
                         /* Body bytes had, not bytes buffered. `rc < 0` is only
@@ -2135,7 +2293,123 @@ static DWORD WINAPI aowl_net_poller(LPVOID param) {
     return 0;
 }
 
-static int32_t aowl_net_serve(int32_t port, int32_t workers) {
+/* Take the port before doing anything else, and hold it.
+ *
+ * This is the whole of the fix for a startup that discovered the collision
+ * last. `aowl_net_serve` used to be the first thing that touched a socket, and
+ * it runs after the routes are registered and after every mod's `on_load` --
+ * so a port that was already taken produced a log that reads as a hundred and
+ * fifty lines of a healthy server followed by one line of failure at the
+ * bottom, which is exactly the shape of a log that gets blamed on the last mod
+ * that spoke. `aowlspt-verify` had it right from the start: say the port is
+ * free before claiming anything else is.
+ *
+ * The socket is kept in `g_listenSock` and `aowl_net_serve` adopts it, so the
+ * port is held continuously from here to the serve loop. Nothing between the
+ * two can lose it to another process. */
+static int32_t aowl_net_reserve(int32_t port) {
+    if (!aowl_net_startup()) return 0;
+    if (g_listenSock) return 1;
+    g_listenSock = aowl_net_bind(port);
+    return g_listenSock ? 1 : 0;
+}
+
+/* Which process is listening on a loopback TCP port, if that can be found out.
+ *
+ * Worth the code because of what the answer nearly always is. SPT's server
+ * defaults to 6969, an SPT install is mandatory for the database import, and
+ * so *every* user who leaves SPT running meets this collision. "Port 6969 is
+ * in use" sends them looking; "SPT.Server.exe is holding it" does not.
+ *
+ * `iphlpapi.dll` is loaded at run time rather than linked, for the reason
+ * `aowllaunch.nim` loads winsock that way: the build rule that compiles this
+ * translation unit lives in `tools/aowl.nim` and passes `-lws2_32 -lz` and
+ * nothing else, and one `GetProcAddress` on a path that only runs when the
+ * server is about to exit is cheaper than a link-flag change every caller
+ * would have to make.
+ *
+ * Every step of this is allowed to fail and the failures are not equivalent,
+ * which is why the pid and the path are reported separately. The table lookup
+ * needs no privilege and nearly always works. `OpenProcess` on a service, or
+ * on a process owned by another user, legitimately does not -- so a caller can
+ * get a pid with no path, and must say only what it actually learned. Nothing
+ * here guesses a name from a port number.
+ *
+ * Returns the owning pid, or 0 if it could not be determined. `out` receives
+ * the full image path, or an empty string. */
+static int32_t aowl_net_port_holder(int32_t port, char* out, int32_t outLen) {
+    typedef DWORD (WINAPI *AowlGetExtTcpTable)(PVOID, PDWORD, BOOL, ULONG,
+                                               ULONG, ULONG);
+    typedef BOOL (WINAPI *AowlQueryImageName)(HANDLE, DWORD, LPSTR, PDWORD);
+    /* Declared here rather than by including <iphlpapi.h>: the two fields this
+     * reads have been stable since Windows XP SP2, and the header drags in a
+     * dependency the build does not otherwise have. */
+    typedef struct {
+        DWORD dwState;
+        DWORD dwLocalAddr;
+        DWORD dwLocalPort;
+        DWORD dwRemoteAddr;
+        DWORD dwRemotePort;
+        DWORD dwOwningPid;
+    } AowlTcpRowOwnerPid;
+    typedef struct {
+        DWORD dwNumEntries;
+        AowlTcpRowOwnerPid table[1];
+    } AowlTcpTableOwnerPid;
+
+    if (out && outLen > 0) out[0] = 0;
+
+    HMODULE ip = LoadLibraryA("iphlpapi.dll");
+    if (!ip) return 0;
+    AowlGetExtTcpTable getTable =
+        (AowlGetExtTcpTable)(void*)GetProcAddress(ip, "GetExtendedTcpTable");
+    if (!getTable) { FreeLibrary(ip); return 0; }
+
+    DWORD pid = 0;
+    DWORD size = 0;
+    /* 3 is `TCP_TABLE_OWNER_PID_LISTENER`. Listeners only: a client socket
+     * with an ephemeral local port equal to ours is not what is holding it. */
+    if (getTable(NULL, &size, FALSE, AF_INET, 3, 0) == ERROR_INSUFFICIENT_BUFFER
+        && size > 0) {
+        char* buf = (char*)malloc((size_t)size);
+        if (buf) {
+            if (getTable(buf, &size, FALSE, AF_INET, 3, 0) == NO_ERROR) {
+                AowlTcpTableOwnerPid* t = (AowlTcpTableOwnerPid*)buf;
+                unsigned short want = htons((unsigned short)port);
+                for (DWORD i = 0; i < t->dwNumEntries; i++) {
+                    if ((unsigned short)(t->table[i].dwLocalPort & 0xFFFF)
+                        == want) {
+                        pid = t->table[i].dwOwningPid;
+                        break;
+                    }
+                }
+            }
+            free(buf);
+        }
+    }
+    FreeLibrary(ip);
+    if (!pid) return 0;
+
+    /* `PROCESS_QUERY_LIMITED_INFORMATION`, which is the access right that
+     * works across an integrity boundary for exactly this question. */
+    HANDLE h = OpenProcess(0x1000, FALSE, pid);
+    if (h) {
+        HMODULE k32 = GetModuleHandleA("kernel32.dll");
+        AowlQueryImageName q = k32
+            ? (AowlQueryImageName)(void*)GetProcAddress(
+                  k32, "QueryFullProcessImageNameA")
+            : NULL;
+        if (q && out && outLen > 1) {
+            DWORD n = (DWORD)(outLen - 1);
+            if (q(h, 0, out, &n)) out[n] = 0;
+            else out[0] = 0;
+        }
+        CloseHandle(h);
+    }
+    return (int32_t)pid;
+}
+
+static int32_t aowl_net_serve_impl(int32_t port, int32_t workers) {
     if (!aowl_net_startup()) return 0;
 
     InitializeCriticalSection(&g_netCs);
@@ -2145,6 +2419,9 @@ static int32_t aowl_net_serve(int32_t port, int32_t workers) {
         g_conns[i].s = INVALID_SOCKET;
         g_conns[i].buf = NULL;
         g_conns[i].inUse = 0;
+        g_conns[i].ssl = NULL;
+        g_conns[i].tlsUp = 0;
+        g_conns[i].tlsWantWrite = 0;
         g_conns[i].ws = 0;
         g_conns[i].wsTicket = 0;
         g_conns[i].wsMsg = NULL;
@@ -2164,8 +2441,21 @@ static int32_t aowl_net_serve(int32_t port, int32_t workers) {
     g_readySem = CreateSemaphore(NULL, 0, AOWL_NET_MAX_CONNS, NULL);
     if (!g_readySem) return 0;
 
-    g_listenSock = aowl_net_listen(port, 128);
-    if (!g_listenSock) return 0;
+    /* Adopt the socket `aowl_net_reserve` bound, if there is one. The bind is
+     * where a port collision is refused and that has already happened by now;
+     * all that is left is to start listening on it. A caller that never
+     * reserved (`tests/ws_stall.c`, and anything else that calls this
+     * directly) still gets the bind here. */
+    if (g_listenSock) {
+        if (!aowl_net_listen_on(g_listenSock, 128)) {
+            closesocket((SOCKET)g_listenSock);
+            g_listenSock = 0;
+            return 0;
+        }
+    } else {
+        g_listenSock = aowl_net_listen(port, 128);
+        if (!g_listenSock) return 0;
+    }
     aowl_net_set_nonblocking((SOCKET)g_listenSock);
 
     if (workers < 1) workers = 1;
@@ -2183,6 +2473,45 @@ static int32_t aowl_net_serve(int32_t port, int32_t workers) {
         return 0;
     }
     return 1;
+}
+
+/* Plain HTTP -- the default, and the one the test suites speak. `g_tlsMode` is
+ * cleared so every accepted connection stays a raw socket and the read/send
+ * helpers take the untouched `recv`/`send` path. */
+static int32_t aowl_net_serve(int32_t port, int32_t workers) {
+    g_tlsMode = 0;
+    return aowl_net_serve_impl(port, workers);
+}
+
+/* HTTPS. The server `SSL_CTX` is built from the PEM cert+key first, so a bad or
+ * missing certificate fails the start with a nameable reason (`aowl_tls_error`)
+ * rather than after the listen. Once it is up every accepted connection carries
+ * a TLS handshake and `SSL_read`/`SSL_write`, and the HTTP loop above runs
+ * unchanged over the decrypted stream. Returns 0 without starting anything if
+ * the context cannot be built. */
+static int32_t aowl_net_serve_tls(int32_t port, int32_t workers,
+                                  const char* certPath, const char* keyPath) {
+    if (!aowl_tls_server_init(certPath, keyPath)) return 0;
+    g_tlsMode = 1;
+    if (!aowl_net_serve_impl(port, workers)) {
+        g_tlsMode = 0;
+        return 0;
+    }
+    return 1;
+}
+
+/* Whether the OpenSSL DLLs and a server context are in hand, and the last
+ * reason they were not -- so the backend can turn a failed `--tls` start into a
+ * diagnostic. `aowl_tls_error` is defined in `aowlspt_tls.h`. */
+static int32_t aowl_net_tls_ready(void) { return g_tls.ctx != NULL ? 1 : 0; }
+static const char* aowl_net_tls_error(void) { return aowl_tls_error(); }
+static int32_t aowl_net_tls_error_len(void) { return (int32_t)strlen(aowl_tls_error()); }
+
+/* Generate a self-signed cert+key with `openssl.exe` if they are not already
+ * there. Exposed for the backend's startup step; see `aowlspt_tls.h`. */
+static int32_t aowl_net_tls_gencert(const char* openssl, const char* certPath,
+                                    const char* keyPath) {
+    return (int32_t)aowl_tls_gencert(openssl, certPath, keyPath);
 }
 
 static void aowl_net_stop(void) {

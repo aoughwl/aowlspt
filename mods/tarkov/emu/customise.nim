@@ -619,10 +619,16 @@ proc selfCheckCustomisation*(into: var seq[string]): bool =
              "present; every check below it would fail against nothing"
   if live.len > 0:
     let sides = @["Usec", "Bear"]
-    let slots = @["Head", "Body", "Feet", "Hands", "DogTag"]
+    # Same order as `defaultCustomisation`: Head, Body, Feet, Hands, Voice,
+    # DogTag. `Voice` is skipped here -- it is a voice node, not a wearable
+    # slot, and is validated in its own pass below; without the skip the index
+    # into `defaults` would misalign and DogTag would be checked against the
+    # voice id.
+    let slots = @["Head", "Body", "Feet", "Hands", "Voice", "DogTag"]
     for s in sides:
       let defaults = defaultCustomisation(s)
       for k in 0 ..< slots.len:
+        if slots[k] == "Voice": continue
         var problem = ""
         if not slotAllowed(live, defaults[k], s, "standard", slots[k], problem):
           into.add "customisation: the " & s & " default " & slots[k] &

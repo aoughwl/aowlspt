@@ -27,6 +27,21 @@
 #include <windows.h>
 #include <stdint.h>
 
+/* The one thing that cannot wait for the thread. A post-1.0 client refuses to
+ * start unless the BattlEye service is running, and it decides that before
+ * Unity brings IL2CPP up -- so before the boot thread below has run a single
+ * instruction. `aowlspt_beguard.h` explains the check, the evidence for it,
+ * and why it is answered by patching one module's import table from here
+ * rather than by the detour engine from there. */
+#include "aowlspt_beguard.h"
+
+/* And the other thing that cannot wait, for the opposite reason. The host has
+ * to know when IL2CPP has finished initialising, and the only safe way to know
+ * is to watch `UnityPlayer.dll` look `il2cpp_init` up -- which it does long
+ * after this runs, but through a pointer that has to be in place before it
+ * runs. `aowlspt_il2cppready.h` has the crash that established this. */
+#include "aowlspt_il2cppready.h"
+
 /* The `aowl_sys_*` helpers this used to carry now live in `aowlspt_shim.h`:
  * the backend needs them too and does not want the constructor below, which
  * calls a symbol only the client host defines. */
@@ -42,7 +57,16 @@ static DWORD WINAPI aowl_host_thread(LPVOID param) {
 
 __attribute__((constructor))
 static void aowl_host_boot(void) {
-    HANDLE t = CreateThread(NULL, 0, aowl_host_thread, NULL, 0, NULL);
+    HANDLE t;
+    /* Before the thread, and deliberately: the injector resumes the game's
+     * main thread as soon as `LoadLibrary` returns, and the thread created
+     * below does not start until the loader lock is released. Anything the
+     * guard has to beat has to be beaten here. It reads PE headers and writes
+     * pointers -- no loader call, nothing that can wait -- which is the whole
+     * reason it is safe in a constructor when nothing else here is. */
+    aowl_be_guard_arm();
+    aowl_il2_ready_arm();
+    t = CreateThread(NULL, 0, aowl_host_thread, NULL, 0, NULL);
     if (t) CloseHandle(t);
 }
 

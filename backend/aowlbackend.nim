@@ -49,6 +49,28 @@ import perfphase
 {.emit: """#include "aowlspt_notify.h" """.}
 
 proc cNetServe(port, workers: int32): int32 {.importc: "aowl_net_serve", nodecl.}
+# Bind the listening port and hold it, without listening on it yet. This is the
+# first thing `main` does that can fail, and it is deliberately separate from
+# `aowl_net_serve`: see `reservePort` below for why the two halves are that far
+# apart, and `aowlspt_net.h` for why the `listen` may not move up here with the
+# bind.
+proc cNetReserve(port: int32): int32 {.importc: "aowl_net_reserve", nodecl.}
+proc cNetPortHolder(port: int32; buf: ptr char; cap: int32): int32 {.
+  importc: "aowl_net_port_holder", nodecl.}
+# The TLS half of the serve loop. `aowl_net_serve_tls` builds the OpenSSL server
+# context from the PEM cert+key, sets the poller into TLS mode, and starts it --
+# everything above the byte stream (framing, routing, the database, the mod API)
+# is the same as the plain path, because TLS is a transport shim under it. See
+# `aowlspt_tls.h` for why the OpenSSL DLLs are loaded by name at runtime rather
+# than linked, and `aowlspt_net.h` for how the handshake folds into the WSAPoll
+# loop. `cNetTlsError` is the reason a `--tls` start failed, for the log.
+proc cNetServeTls(port, workers: int32; cert, key: cstring): int32 {.
+  importc: "aowl_net_serve_tls", nodecl.}
+proc cNetTlsError(): cstring {.importc: "aowl_net_tls_error", nodecl.}
+proc cNetTlsErrorLen(): int32 {.importc: "aowl_net_tls_error_len", nodecl.}
+proc cNetTlsReady(): int32 {.importc: "aowl_net_tls_ready", nodecl.}
+proc cNetTlsGenCert(openssl, cert, key: cstring): int32 {.
+  importc: "aowl_net_tls_gencert", nodecl.}
 proc cNetStop() {.importc: "aowl_net_stop", nodecl.}
 proc cNetRunning(): int32 {.importc: "aowl_net_running", nodecl.}
 proc cNetSend(sock: uint64; buf: HostPtr; len: int32): int32 {.
@@ -216,50 +238,44 @@ proc gRequests(): int = int(cReqRead())
 # cross from the mod's buffer into a string and then into a byte buffer, and
 # doing either of those a byte at a time costs more than deflating it.
 
-proc inflateBody(raw {.byref.}: seq[byte]; rawLen: int; into: var string): bool =
-  ## Inflates when the body looks framed, passes it through when it does not.
+proc inflateInto(src: WirePtr; len: int; into: var string): bool =
+  ## One zlib stream into a string, growing the destination rather than
+  ## guessing its size once.
   ##
-  ## `byref` on the buffer is not a micro-optimisation: a by-value `seq`
-  ## parameter copies the whole request body on entry, and this is called with
-  ## the raw receive buffer.
+  ## Sized to the body, then grown on failure -- rather than 64x with a 64 KB
+  ## floor, which is what this used to do unconditionally.
+  ##
+  ## The floor was the expensive half. Every request the client makes carries a
+  ## body of a few hundred bytes, so every one of them allocated and zeroed
+  ## 64 KB to inflate 200 bytes into, and the allocation cost more than the
+  ## inflate did. 16x covers JSON of this shape in a single pass; the retry is
+  ## what keeps the cases it does not cover slower rather than refused, and the
+  ## ceiling is still there so a malformed length cannot become an allocation
+  ## attack.
+  ##
+  ## The buffer is allocated once and re-allocated across the loop rather than
+  ## inside it, and the length handed to `inflate` is **the buffer's own**
+  ## rather than the `cap` it was asked for. That is not style. A `var dst`
+  ## declared inside the loop is destroyed at the end of every iteration, and
+  ## the replacement did not behave as its `cap` claimed: every body that
+  ## inflated to more than 65,536 bytes was refused with a 400, deterministically
+  ## and only on a retry -- so a request whose first guess was big enough went
+  ## through and the same bytes compressed better did not.
+  ## `/client/match/local/end` posts the whole profile document, which is past
+  ## 64 KB for any real profile, so this was a client that could not come back
+  ## from a raid rather than anything a fuzzer had to find. Reading the length
+  ## off the buffer makes the two impossible to disagree.
   into = ""
-  if rawLen <= 0:
-    return true
-  let src = cast[WirePtr](addr raw[0])
-  if cZlibFramed(src, int32(rawLen)) == 0'i32:
-    into = fromBytes(raw, rawLen)
-    return true
-  # Sized to the body, then grown on failure -- rather than 64x with a 64 KB
-  # floor, which is what this used to do unconditionally.
-  #
-  # The floor was the expensive half. Every request the client makes carries a
-  # body of a few hundred bytes, so every one of them allocated and zeroed
-  # 64 KB to inflate 200 bytes into, and the allocation cost more than the
-  # inflate did. 16x covers JSON of this shape in a single pass; the retry is
-  # what keeps the cases it does not cover slower rather than refused, and the
-  # ceiling is still there so a malformed length cannot become an allocation
-  # attack.
-  #
-  # The buffer is allocated once and re-allocated across the loop rather than
-  # inside it, and the length handed to `inflate` is **the buffer's own**
-  # rather than the `cap` it was asked for. That is not style. A `var dst`
-  # declared inside the loop is destroyed at the end of every iteration, and
-  # the replacement did not behave as its `cap` claimed: every body that
-  # inflated to more than 65,536 bytes was refused with a 400, deterministically
-  # and only on a retry -- so a request whose first guess was big enough went
-  # through and the same bytes compressed better did not. `/client/match/local/end`
-  # posts the whole profile document, which is past 64 KB for any real profile,
-  # so this was a client that could not come back from a raid rather than
-  # anything a fuzzer had to find. Reading the length off the buffer makes the
-  # two impossible to disagree.
-  var cap = rawLen * 16
+  if len <= 0:
+    return false
+  var cap = len * 16
   if cap < 4096: cap = 4096
   if cap > MaxBodyBytes: cap = MaxBodyBytes
   var dst = newSeq[byte](cap)
   var tries = 0
   while tries < 4:
     let room = dst.len
-    let n = cZlibInflate(src, int32(rawLen),
+    let n = cZlibInflate(src, int32(len),
                          cast[WirePtr](addr dst[0]), int32(room))
     if n >= 0'i32:
       into = fromBytes(dst, int(n))
@@ -271,6 +287,77 @@ proc inflateBody(raw {.byref.}: seq[byte]; rawLen: int; into: var string): bool 
     dst = newSeq[byte](grown)
     inc tries
   result = false
+
+proc inflateBody(raw {.byref.}: seq[byte]; rawLen: int; into: var string): bool =
+  ## A request body, in whatever the client wrapped it in.
+  ##
+  ## `byref` on the buffer is not a micro-optimisation: a by-value `seq`
+  ## parameter copies the whole request body on entry, and this is called with
+  ## the raw receive buffer.
+  ##
+  ## Three shapes reach this, and they have to be tried in this order:
+  ##
+  ##   1. plain `zlib(json)` -- a pre-1.0 client, and every tool in this repo
+  ##   2. the post-1.0 **envelope**: a length-keyed byte shuffle over
+  ##      `[int32 size][zlib(json)]`, or over raw JSON on the `libraries`
+  ##      routes. See `wire.bsgUnwrap`.
+  ##   3. neither -- `/client/metadata` posts plain JSON -- passed through
+  ##
+  ## The envelope is what was missing, and its absence did not look like a bug.
+  ## A shuffled body is not zlib-framed, so it took the pass-through branch and
+  ## reached the route handler as noise, with a 200 and no warning. Every route
+  ## that ignores its request body still worked, which is most of the menu; the
+  ## client booted to the character screen against a server that had never read
+  ## anything it was sent. What broke was creating a profile, moving an item,
+  ## ending a raid.
+  ##
+  ## **`looksFramed` is a guess and is treated as one.** It reads two bytes, so
+  ## roughly one shuffled body in five hundred opens with a valid zlib header
+  ## by chance -- and one does, in the 149-body capture this is tested against
+  ## (`/client/mail/dialog/list`, seq 458, whose shuffled form begins `78 da`).
+  ## Deciding on the header alone sent that body down the plain path, where the
+  ## inflate failed, and then out of the function as noise. So the header only
+  ## picks the order to try things in; a failed inflate falls through to the
+  ## envelope rather than out.
+  into = ""
+  if rawLen <= 0:
+    return true
+  let src = cast[WirePtr](addr raw[0])
+  let looksFramed = cZlibFramed(src, int32(rawLen)) != 0'i32
+
+  if looksFramed and inflateInto(src, rawLen, into):
+    return true
+
+  # The envelope, on a copy: unwrapping is destructive and the pass-through
+  # below still needs the original bytes.
+  var unwrapped = newSeq[byte](rawLen)
+  copyMem(addr unwrapped[0], addr raw[0], rawLen)
+  var payloadLen = 0
+  if bsgUnwrap(unwrapped, rawLen, payloadLen):
+    let payload = cast[WirePtr](cast[uint](addr unwrapped[0]) + 4'u)
+    if inflateInto(payload, payloadLen, into):
+      return true
+    # An envelope over raw JSON rather than over a zlib stream. The `libraries`
+    # routes post their payload that way.
+    into = bytesAt(unwrapped, 4, payloadLen)
+    return true
+
+  if not looksFramed and inflateInto(src, rawLen, into):
+    # Framed-looking bodies were already tried above; this catches the reverse
+    # collision, where a plain zlib body's header happens not to validate.
+    return true
+
+  if looksFramed:
+    # It announced itself as a zlib stream, it is not one, and it is not an
+    # envelope either. Refused rather than passed through: passing it through
+    # is how a body becomes noise the handler cannot tell from an empty
+    # request, which is the whole failure this function was rewritten to stop.
+    return false
+
+  # Not framed and not enveloped -- `/client/metadata` posts plain JSON. The
+  # body is what it is.
+  into = fromBytes(raw, rawLen)
+  result = true
 
 proc deflateBody(text {.byref.}: string; into: var seq[byte];
                  outLen: var int): bool =
@@ -618,16 +705,23 @@ proc matchRoute(url: string; into: var Route): bool =
   ## arrived, which is the only sensible reading of "unloaded while serving".
   result = false
   var bestLen = -1
+  # Match on the PATH only: the client appends query strings (`?completed=True`,
+  # `&retry=1`, conditional-GET params) and an exact `==` against the full url
+  # then 404s a route that is really registered -- which the client retries
+  # forever, stalling the load. The handler still receives the full `req.url`.
+  var path = url
+  let q = find(url, "?")
+  if q >= 0: path = url.substr(0, q - 1)
   cRegRead()
   for i in 0 ..< gRoutes.len:
     if gRoutes[i].kind == RouteStatic:
-      if gRoutes[i].url == url:
+      if gRoutes[i].url == path:
         into = gRoutes[i]
         cRegReadEnd()
         return true
     else:
-      if url.len >= gRoutes[i].url.len and
-         url.substr(0, gRoutes[i].url.len - 1) == gRoutes[i].url:
+      if path.len >= gRoutes[i].url.len and
+         path.substr(0, gRoutes[i].url.len - 1) == gRoutes[i].url:
         if gRoutes[i].url.len > bestLen:
           bestLen = gRoutes[i].url.len
           into = gRoutes[i]
@@ -870,6 +964,7 @@ proc handleRequest(sock: uint64; buf: HostPtr; len: int32;
     return (if req.keepAlive: 1'i32 else: 0'i32)
 
   if websocket.isUpgrade(head):
+    modhost.info("WS UPGRADE " & req.url & " session=" & req.session)
     # A websocket, and this is the fork in the whole request path.
     #
     # It is answered here rather than by a route on purpose: which URL carries
@@ -894,6 +989,14 @@ proc handleRequest(sock: uint64; buf: HostPtr; len: int32;
   let matched = matchRoute(req.url, route)
   perfAdd(PhaseMatch, tMatch)
   if not matched:
+    # Said out loud, because the only other party who learns about it is the
+    # client -- and the client's answer to a 404 is to carry on, retry, or draw
+    # an empty screen. A route the game asks for and this server does not have
+    # was therefore invisible from here: `docs/EMULATOR-COVERAGE.md` can say
+    # which *SPT* operations are unserved, and it cannot say which URLs a real
+    # build actually calls, because the reference dump carries no URLs at all.
+    # One warn per unmatched url turns a playtest into that list.
+    modhost.warn "no route for " & req.verb & " " & req.url
     sendResponse(sock, "404 Not Found",
                  "{\"err\":\"no route\",\"url\":" &
                  jsonQuoted(req.url) & "}", not req.identity, req.keepAlive)
@@ -965,6 +1068,9 @@ proc handleRequest(sock: uint64; buf: HostPtr; len: int32;
 
   var body = ""
   let tRoute = perfNow()
+  # DIAGNOSTIC: every dispatched request, so a menu that stalls names what it
+  # was last waiting on. Remove once the freeze is understood.
+  modhost.info("REQ " & req.verb & " " & req.url)
   let served1 = runRoute(route, req, body)
   perfAdd(PhaseRoute, tRoute)
   modhost.modLeave(route.modIndex)
@@ -972,7 +1078,17 @@ proc handleRequest(sock: uint64; buf: HostPtr; len: int32;
     cSessionUnlock(slot)
 
   if served1:
-    sendResponse(sock, "200 OK", body, not req.identity, req.keepAlive)
+    # `/client/metadata` must go out uncompressed, whatever the request asked
+    # for. It is read during `il2cpp_init` by a regex that scans the raw bytes
+    # for `"value":"..."` -- it does not inflate, and the real BSG server sends
+    # this one endpoint un-gzipped too (the captured response is 414 bytes of
+    # plain shuffled JSON, and the client's request carries no Accept-Encoding).
+    # Deflate it and the client cannot find the value, and `il2cpp_init` fails
+    # at ~100 ms exactly as if there were no server at all. Every other route
+    # keeps the default (deflate unless the caller sent `identity`).
+    let raw = req.url == "/client/metadata" or req.url == "/client/libraries"
+    sendResponse(sock, "200 OK", body,
+                 (not raw) and (not req.identity), req.keepAlive)
   else:
     sendResponse(sock, "500 Internal Server Error",
                  "{\"err\":\"the route handler failed\"}",
@@ -1445,7 +1561,15 @@ aowlspt-backend -- the game backend
   aowlspt-backend [--root PATH] [--port N]
 
   --root PATH   the install (default: the directory this exe is in)
-  --port N      listen port, loopback only (default 6969)
+  --port N      listen port, loopback only (default 6969, or 443 with --tls)
+  --tls         serve HTTPS instead of plain HTTP -- what a real post-1.0 client
+                needs. Terminates TLS on port 443 (override with --port) using a
+                self-signed cert generated on first use; the client does not
+                validate it. The default stays plain HTTP so the test suites are
+                unaffected.
+  --cert PATH   TLS certificate PEM (default <root>/aowlspt-tls-cert.pem)
+  --key PATH    TLS private key PEM (default <root>/aowlspt-tls-key.pem)
+  --gen-cert    generate the self-signed cert+key and exit, without serving
   --db PATH     database JSON to load (default <root>/db.json)
   --once        serve until one request has been handled, then exit
   --perf        accumulate per-phase timings and print them at exit
@@ -1461,12 +1585,91 @@ aowlspt-backend -- the game backend
   -h, --help    this
 """
 
+proc portHolder(port: int): string =
+  ## Who is listening on `port`, in words, or `""` if that could not be found
+  ## out. Never a guess: an empty answer here means the line is left off, not
+  ## that it is filled in with the process most likely to be there.
+  # Zeroed explicitly: nimony refuses to take the address of an uninitialised
+  # array, and is right to -- the C side nul-terminates what it writes, but a
+  # path it could not read leaves the rest of this untouched.
+  var buf: array[512, char] = default(array[512, char])
+  let pid = int(cNetPortHolder(int32(port), addr buf[0], 512'i32))
+  if pid == 0:
+    return ""
+  var path = ""
+  var i = 0
+  while i < 512 and buf[i] != '\0':
+    path.add buf[i]
+    inc i
+  if path.len > 0:
+    result = path & " (pid " & $pid & ")"
+  else:
+    # `OpenProcess` is allowed to fail on a service or another user's process.
+    # A pid alone still ends the search -- Task Manager takes it.
+    result = "pid " & $pid
+
+proc reservePort(): bool =
+  ## Take the listening port, before anything else in this process is started.
+  ##
+  ## This used to happen at the *end* of startup, inside `aowl_net_serve`,
+  ## after every route was registered and every mod's `on_load` had run. The
+  ## work was wasted, which is the smaller half of the problem. The larger half
+  ## is what it did to the log: a playtest run that could not have the port
+  ## produced a hundred and fifty lines of a server coming up perfectly,
+  ## followed at 312 ms by one line saying the port was taken -- a shape that
+  ## reads as "the last mod broke it", and gets debugged that way.
+  ##
+  ## Only the bind moves up here. The `listen` stays where it was, because a
+  ## listening socket answers `connect` from the kernel backlog with nobody
+  ## accepting, and `aowllaunch`, `soak` and `aowlspt-verify` all read a
+  ## successful connect as "the backend is up". See `aowlspt_net.h`.
+  if cNetReserve(int32(gPort)) != 0'i32:
+    modhost.okLog "port " & $gPort & " is free"
+    console.line "  port  " & $gPort
+    return true
+
+  let e = int(cNetLastError())
+  if e == WsaAddrInUse or e == WsaAccess:
+    console.err "port " & $gPort & " is already in use"
+    let who = portHolder(gPort)
+    if who.len > 0:
+      # A path beats every guess that could be made from the port number, so
+      # when there is one it is the whole of the answer.
+      console.line "  held by " & who
+      modhost.fail "port " & $gPort & " is already in use, held by " & who
+    else:
+      # Named as SPT because that is overwhelmingly what it is and the reader
+      # has no reason to know the two servers share a default. An SPT install
+      # is *required* for the database import (docs/INSTALL.md step 5), so
+      # anyone who leaves its server running meets this on their first launch.
+      console.line "  another server -- SPT's own (it defaults to 6969 too)," &
+                   " or an earlier"
+      console.line "  aowlspt-backend -- already holds 127.0.0.1:" & $gPort & "."
+      modhost.fail "port " & $gPort & " is already in use"
+    console.line "  Close it, or start this one with --port N."
+    return false
+
+  console.err "could not bind port " & $gPort & " (error " & $e & ")"
+  modhost.fail "could not bind " & $gPort & " (error " & $e & ")"
+  result = false
+
 proc main(): int =
   var root = ""
   var dbPath = ""
   var once = false
   var selftest = false
   var noLock = false
+  # TLS. `tlsMode` serves HTTPS (what a real post-1.0 client needs, on port 443
+  # by default); the default stays plain HTTP so `emutest`/`realtest` and every
+  # other tool keep speaking the wire they always did. `portSet` lets `--tls`
+  # pick 443 only when `--port` did not already choose one. `certPath`/`keyPath`
+  # default to PEM files beside the backend; `genCertOnly` is the one-time setup
+  # step that writes them and exits without serving.
+  var tlsMode = false
+  var portSet = false
+  var genCertOnly = false
+  var certPath = ""
+  var keyPath = ""
   var i = 1
   let n = paramCount()
   while i <= n:
@@ -1483,7 +1686,20 @@ proc main(): int =
           if ch >= '0' and ch <= '9':
             v = v * 10 + (ord(ch) - ord('0'))
             any = true
-        if any: gPort = v
+        if any:
+          gPort = v
+          portSet = true
+    elif a == "--tls":
+      tlsMode = true
+    elif a == "--cert":
+      inc i
+      if i <= n: certPath = paramStr(i)
+    elif a == "--key":
+      inc i
+      if i <= n: keyPath = paramStr(i)
+    elif a == "--gen-cert":
+      genCertOnly = true
+      tlsMode = true
     elif a == "--db":
       inc i
       if i <= n: dbPath = paramStr(i)
@@ -1533,6 +1749,56 @@ proc main(): int =
   console.heading "aowlspt-backend"
   console.line "  root  " & gRoot
   console.line "  log   " & logPath
+
+  # TLS setup, before anything that would be wasted work if it fails.
+  #
+  # The default port for the real client is 443: post-1.0 EFT talks to its
+  # backend over HTTPS on a hardcoded 443 and disables certificate validation,
+  # so any self-signed cert is accepted. Plain HTTP keeps its 6969 default. A
+  # `--port` on the command line wins over both.
+  if tlsMode and not portSet:
+    gPort = 443
+  if certPath.len == 0:
+    certPath = joinPath(gRoot, "aowlspt-tls-cert.pem")
+  if keyPath.len == 0:
+    keyPath = joinPath(gRoot, "aowlspt-tls-key.pem")
+
+  if tlsMode:
+    # Generate the self-signed cert+key with `openssl.exe` when they are not
+    # already there (or always, for `--gen-cert`). The client does not validate,
+    # so the CN is irrelevant; `aowl_net_tls_gencert` uses localhost. openssl is
+    # taken from PATH, with the ucrt64 install this repo builds against as a
+    # fallback so a from-source run needs nothing arranged.
+    let haveCert = fileExists(certPath) and fileExists(keyPath)
+    if genCertOnly or not haveCert:
+      var openssl = "openssl"
+      const ucrtOpenssl = "C:\\msys64\\ucrt64\\bin\\openssl.exe"
+      if fileExists(ucrtOpenssl):
+        openssl = ucrtOpenssl
+      console.line "  tls   generating a self-signed certificate"
+      let rc = cNetTlsGenCert(toCString(openssl), toCString(certPath),
+                              toCString(keyPath))
+      if rc != 0'i32 or not (fileExists(certPath) and fileExists(keyPath)):
+        console.err "could not generate a TLS certificate with openssl"
+        console.line "  tried " & openssl & " (rc " & $int(rc) & ")."
+        console.line "  Generate it by hand, e.g.:"
+        console.line "    openssl req -x509 -newkey rsa:2048 -nodes -days 3650 \\"
+        console.line "      -subj \"/CN=localhost\" -keyout \"" & keyPath &
+                     "\" -out \"" & certPath & "\""
+        modhost.fail "TLS certificate generation failed"
+        return 1
+      modhost.okLog "generated TLS certificate " & certPath
+    console.line "  tls   cert " & certPath
+    console.line "  tls   key  " & keyPath
+    if genCertOnly:
+      # A setup step, not a run: the cert is on disk, say so and stop.
+      console.ok "TLS certificate ready"
+      return 0
+  # Before the database, before the store, before a single mod. The port is the
+  # one thing this process needs that another process can be holding, and it is
+  # the cheapest of all of them to check.
+  if not reservePort():
+    return 1
 
   if dbPath.len == 0:
     dbPath = joinPath(gRoot, "db.json")
@@ -1668,7 +1934,25 @@ proc main(): int =
   # `AOWL_NET_MAX_BUFFERED` (64 MiB), both in `aowlspt_net.h`. So this is the
   # concurrency limit on doing work, which is the only thing a thread was ever
   # needed for.
-  if cNetServe(int32(gPort), 16'i32) == 0'i32:
+  # TLS or plain, chosen once here. The two calls are the same but for the
+  # transport: `cNetServeTls` builds the OpenSSL server context from the cert
+  # generated above and puts the poller into TLS mode; everything the HTTP loop
+  # does above the byte stream is identical. A TLS context that fails to build
+  # (a bad cert, or the OpenSSL DLLs not found) is not a port collision, so it
+  # is reported with the reason the shim gives rather than a winsock number.
+  let started =
+    if tlsMode: cNetServeTls(int32(gPort), 16'i32,
+                             toCString(certPath), toCString(keyPath))
+    else: cNetServe(int32(gPort), 16'i32)
+  if started == 0'i32:
+    if tlsMode and cNetTlsReady() == 0'i32:
+      # The listen never happened: the OpenSSL context could not be built. Its
+      # own error names why (missing DLLs, an unreadable cert, a mismatched
+      # key) far better than a winsock code, which here would be a stale zero.
+      let msg = readBytes(cast[HostPtr](cNetTlsError()), cNetTlsErrorLen())
+      console.err "could not start TLS: " & msg
+      modhost.fail "could not start TLS: " & msg
+      return 1
     # A port collision is the ordinary way this fails, and it deserves to be
     # said in those words rather than as a number. It is what happens when the
     # last backend has not quite exited, when SPT's own server is up, and on
@@ -1676,18 +1960,13 @@ proc main(): int =
     # it is a tool somewhere else reporting a connect timeout, which sends
     # whoever reads it looking in the wrong place.
     let e = int(cNetLastError())
-    if e == WsaAddrInUse or e == WsaAccess:
-      console.err "port " & $gPort & " is already in use"
-      console.line "  another server -- an earlier aowlspt-backend, or SPT's" &
-                   " own -- already holds"
-      console.line "  127.0.0.1:" & $gPort & ". Close it, or start this one" &
-                   " with --port."
-      modhost.fail "port " & $gPort & " is already in use"
-    else:
-      console.err "could not listen on port " & $gPort & " (error " & $e & ")"
-      modhost.fail "could not listen on " & $gPort & " (error " & $e & ")"
+    console.err "could not listen on port " & $gPort & " (error " & $e & ")"
+    modhost.fail "could not listen on " & $gPort & " (error " & $e & ")"
     return 1
-  # Written only now, and only from the bind's own result.
+  # Written only now, and only from the socket's own result -- the bind is
+  # `reservePort`'s, several hundred milliseconds earlier, and it deliberately
+  # does not write this line. What is claimed here is *listening*, and that is
+  # true from the statement above and not before it.
   #
   # It reads like a log line and it is an interface: `allmods`, `fuzzwire`,
   # `livectl`, `soak`, `wstest` and `aowlspt-verify` all decide the server is
@@ -1695,8 +1974,13 @@ proc main(): int =
   # a bind that had quietly attached to somebody else's port -- see
   # `SO_EXCLUSIVEADDRUSE` in `aowlspt_net.h` -- and every one of those tools
   # then waited on a server that was never going to answer them.
-  modhost.okLog "listening on 127.0.0.1:" & $gPort
-  console.line "  port  " & $gPort
+  # The scheme is named so a reader can tell a TLS run from a plain one, but the
+  # word `listening` is kept verbatim: `allmods`, `fuzzwire`, `livectl`, `soak`,
+  # `wstest` and `aowlspt-verify` all wait for exactly that string to decide the
+  # server is up.
+  let scheme = if tlsMode: "https" else: "http"
+  modhost.okLog "listening on " & scheme & "://127.0.0.1:" & $gPort
+  console.line "  port  " & $gPort & (if tlsMode: " (TLS)" else: "")
   console.line ""
   console.line "  serving. Ctrl-C to stop."
 

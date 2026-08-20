@@ -88,16 +88,22 @@ proc defaultCustomisation*(sideName: string): seq[string] =
   ## whole of `newProfileText` is: a profile that only exists when a 40MB
   ## template table is loaded is a profile that cannot be tested. The load-time
   ## check is what ties the literals to the table when there is one.
+  # Order: Head, Body, Feet, Hands, Voice, DogTag. Post-1.0 requires a `Voice`
+  # entry in the Customization dictionary -- the menu load does `dict["Voice"]`
+  # and throws KeyNotFoundException without it, which stalls the profile load
+  # forever. It is a customization template id, distinct from `Info.Voice`.
   if sideName == "Bear":
     return @["5cc084dd14c02e000b0550a3",  # DefaultBearHead
              "5cc0858d14c02e000c6bea66",  # DefaultBearBody
              "5cc085bb14c02e000e67a5c5",  # DefaultBearFeet
              "5cc0876314c02e000c6bea6b",  # DefaultBearHands
+             "5fc6151b0b735e7b024c76eb",  # DefaultBearVoice
              "674731c8bafff850080488bb"]  # dogtag_bear_default
   result = @["5cde96047d6c8b20b577f016",  # DefaultUsecHead
              "5cde95d97d6c8b647a3769b0",  # DefaultUsecBody
              "5cde95ef7d6c8b04713c4f2d",  # DefaulUsecFeet (the table's spelling)
              "5cde95fa7d6c8b04737c2d13",  # DefaultUsecHands
+             "5fc615110b735e7b024c76ea",  # DefaultUsecVoice
              "674731d1170146228c0d222a"]  # dogtag_usec_default
 
 proc defaultVoice*(sideName: string): string =
@@ -184,7 +190,8 @@ proc newProfileText*(id, nickname, sideName, edition: string;
   put(customization, "Body", look[1])
   put(customization, "Feet", look[2])
   put(customization, "Hands", look[3])
-  put(customization, "DogTag", look[4])
+  put(customization, "Voice", look[4])
+  put(customization, "DogTag", look[5])
 
   var health = obj()
   put(health, "Hydration", healthPart(100, 100))
@@ -245,7 +252,7 @@ proc newProfileText*(id, nickname, sideName, edition: string;
   put(inventory, "questRaidItems", questRaid)
   put(inventory, "questStashItems", questStash)
   put(inventory, "sortingTable", sorting)
-  put(inventory, "hideoutAreaStashes", obj())
+  put(inventory, "hideoutAreaStashes", arr())
   put(inventory, "fastPanel", obj())
   put(inventory, "favoriteItems", arr())
 
@@ -280,9 +287,13 @@ proc newProfileText*(id, nickname, sideName, edition: string;
   # because `setRaw` on a profile does nothing to a path that does not exist,
   # so an absent block is a write that vanishes.
   put(hideout, "Customization", obj())
-  put(hideout, "MannequinPoses", obj())
+  put(hideout, "MannequinPoses", arr())
   put(hideout, "Production", obj())
-  put(hideout, "Seed", obj())
+  # Post-1.0 deserialises Hideout.Seed as a STRING (a 32-hex hideout RNG seed);
+  # SPT's pre-1.0 profile had it as an object, which makes the client throw
+  # "Unexpected token: StartObject. Path '[0].Hideout.Seed'" on the profile list
+  # and never finish loading the menu.
+  put(hideout, "Seed", "a1b2c3d4e5f6a7b8c9d0e1f2a3b4c5d6")
   put(hideout, "sptUpdateLastRunTimestamp", nowSeconds)
 
   var p = obj()
@@ -311,10 +322,10 @@ proc newProfileText*(id, nickname, sideName, edition: string;
   put(p, "RagfairInfo", ragfair)
   put(p, "TradersInfo", obj())
   put(p, "UnlockedInfo", objOf("unlockedProductionRecipe", arr()))
-  put(p, "WishList", obj())
+  put(p, "WishList", arr())
   put(p, "moneyTransferLimitData", obj())
-  put(p, "Achievements", obj())
-  put(p, "Prestige", obj())
+  put(p, "Achievements", arr())
+  put(p, "Prestige", arr())
   result = done(p).text
 
 # ---------------------------------------------------------------------------

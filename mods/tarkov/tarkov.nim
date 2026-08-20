@@ -69,10 +69,23 @@ import emu/gym
 import emu/customise
 import emu/decorate
 import emu/selfchecks
+import emu/metadata
+import emu/post1
 
 const
   ModGuid = "aowl.tarkov"
+  ModVersion = "0.1.0"
   ServerName = "aowlspt"
+  # The url the client reaches this backend on -- what `backend.json`'s
+  # `backendUrl` hands the client. Several responses (game/mode's `backendUrl`,
+  # game/config's per-service urls) echo it back so the client knows which
+  # server to build its next request against. An EMPTY value here is not
+  # harmless: the client feeds it straight into `new Uri(...)` and post-1.0
+  # throws `Invalid URI: The hostname could not be parsed`, which surfaces far
+  # away as a null-ref in `InitPreloaderUI`. No trailing slash -- the client's
+  # host regex wants a bare host. Kept in sync with `backend.json` by hand;
+  # loopback is the only address this server ever answers on.
+  BackendUrl = "https://127.0.0.1"
 
 var gRequests = 0
 var gEdition = "standard"
@@ -138,15 +151,56 @@ proc currentProfile(session: string): Profile =
 # Launcher and login
 # ---------------------------------------------------------------------------
 
+proc onMetadata(url, body, session: string): string =
+  ## `/client/metadata` -- the very first thing post-1.0 `GameAssembly.dll` asks
+  ## for, from inside `il2cpp_init`, before any session exists. The client sends
+  ## `{"version":"<ver>","key":"<decimal>"}`; the answer is that version's
+  ## section layout, shuffled so the client's own deshuffle (keyed by the subKey
+  ## its `key` encodes) reproduces the raw layout. See `emu/metadata`.
+  ##
+  ## This answer is NOT the standard `/client/*` envelope, and it must not be
+  ## fabricated: a wrong layout does not fail here, it fails much later and much
+  ## more confusingly when the client tries to decrypt its metadata with it. So
+  ## a missing blob is logged, by version, and answered with an error envelope.
+  ##
+  ## The framing (zlib vs identity) is left to the backend, exactly as for every
+  ## other route -- there is no encoding special-case here. The backend deflates
+  ## by default and sends the body raw only when the request carried
+  ## `Accept-Encoding: identity` (see `backend/aowlbackend.nim`). So a client
+  ## that cannot inflate this early answer gets a raw one *iff* it asks with that
+  ## header, which is the same contract every other route already relies on; this
+  ## route adds no assumption of its own about how the il2cpp_init client frames.
+  inc gRequests
+  info("client/metadata HIT: body.len=" & $body.len & " session=" & session)
+  let version = field(body, "version").asText("")
+  let keyField = field(body, "key")
+  let keyText = if keyField.isText: keyField.asText("") else: keyField.raw
+  let requestKey = parseDecU32(keyText)
+
+  let blob = loadBlob(version)
+  if not blob.ok:
+    error("client/metadata: no blob for version '" & version &
+          "' -- install mods/tarkov/data/metadata/" & version &
+          ".json with tools/metablob.py (nothing is fabricated here)")
+    return metaError("no metadata blob for version " & version)
+
+  var subKey = -1
+  result = answerMetadata(blob, requestKey, subKey)
+  if subKey < 0:
+    error("client/metadata: could not recover a subKey for version '" &
+          version & "' from key '" & keyText &
+          "' (internalKey " & $blob.internalKey &
+          ") -- the installed blob may be for a different build")
+
 proc onGameConfig(url, body, session: string): string =
   ## What the client reads before anything else: who it is talking to, and the
   ## backend urls it should use for the rest of the session.
   let p = currentProfile(session)
   var backend = obj()
-  put(backend, "Main", "")
-  put(backend, "Trading", "")
-  put(backend, "Messaging", "")
-  put(backend, "RagFair", "")
+  put(backend, "Main", BackendUrl)
+  put(backend, "Trading", BackendUrl)
+  put(backend, "Messaging", BackendUrl)
+  put(backend, "RagFair", BackendUrl)
   var o = obj()
   put(o, "aid", if p.ok: p.field("aid").asInt(0) else: 0)
   put(o, "lang", "en")
@@ -205,6 +259,83 @@ proc onProfileList(url, body, session: string): string =
       if sc.len > 0:
         a.add raw(sc)
   result = envelope(a)
+
+proc sideToInt(side: string): int =
+  ## `EFT.EPlayerSide` on the wire is an int, not the profile's "Usec"/"Bear"
+  ## string: Usec=1, Bear=2, Savage=4.
+  case side
+  of "Bear": 2
+  of "Savage": 4
+  else: 1
+
+proc characterSlot(p: Profile): JsonObject =
+  ## One `EFT.CharacterSelectionProfileData` value for the post-1.0
+  ## character-select screen. The wire keys are NOT the C# field names -- they
+  ## come from the client's `[JsonProperty]` attributes (decoded from the
+  ## decrypted metadata): `uid` (the profile id, and the gate: `get_HasProfile`
+  ## is `status==2 && uid != ""`), `status` (the `ECharacterSelectionProfileStatus`
+  ## int, 2 = Available), `side` (`EPlayerSide` int), and camelCase for the rest.
+  ## `PlayerVisualRepresentation` (PascalCase) is the model descriptor; it is
+  ## null-guarded client-side, so a wrong Equipment costs the 3D doll, not the
+  ## slot.
+  var o = obj()
+  put(o, "uid", p.id)
+  # `status` is a STRING through EGameMode's sibling `EnumConverter`, NOT an int:
+  # ECharacterSelectionProfileStatus maps Available->"available" (Locked->"locked",
+  # Empty->"empty", InRaid->"in_raid"). An int `2` has no mapping, so it defaulted
+  # to Locked(0) and the slot stayed un-clickable no matter the field casing.
+  put(o, "status", "available")
+  put(o, "side", sideToInt(p.side))
+  put(o, "nickname", p.nickname)
+  put(o, "lowerNickname", p.field("Info.LowerNickname").asText(toLowerAscii(p.nickname)))
+  put(o, "nicknamePref", "")
+  put(o, "level", p.level)
+  put(o, "prestigeLevel", 0)
+  put(o, "memberCategory", p.field("Info.MemberCategory").asInt(0))
+  put(o, "accountType", p.field("Info.AccountType").asInt(0))
+  put(o, "aid", p.field("aid").asInt(0))
+  put(o, "gameVersion", p.field("Info.GameVersion").asText("live"))
+  # PlayerVisualRepresentation is left null for now: a throw ANYWHERE in the
+  # value (e.g. a FlatItem the Equipment deserialiser rejects) aborts the whole
+  # dictionary deserialize and re-locks the slot. `get_HasProfile` only needs
+  # `status==2` + non-empty `uid`, and `OnJsonDeserialize` builds the 3D model
+  # only when the PVR is present (null-guarded), so a null PVR is a selectable
+  # character without a doll -- exactly the safe first step. The model gets
+  # wired back once the slot is confirmed binding.
+  put(o, "PlayerVisualRepresentation", jnull())
+  put(o, "SeasonalInfo", jnull())
+  put(o, "unlockedProductionRecipe", raw("[]"))
+  put(o, "unlockedRules", raw("[]"))
+  put(o, "unlockedTraderDialogues", raw("[]"))
+  put(o, "unlockedTraders", raw("[]"))
+  result = o
+
+proc onProfilesV2(url, body, session: string): string =
+  ## `/v2/client/game/profiles/` -- the character-select bootstrap. Post-1.0
+  ## deserialises `data` into `Dictionary<EGameMode, CharacterSelectionProfileData>`
+  ## and drives `RunCharacterSelectionFlow` from it -- NOT the flat profile array
+  ## `/client/game/profile/list` returns (a JSON array deserialises into an empty
+  ## dictionary, which is the blank character screen). The key is the game-mode
+  ## int: "0" = Regular (the `_pvpSlotView`), "1" = Pve, "2" = PvpSeason. This
+  ## server has one regular profile, so it fills slot "0"; the other slots stay
+  ## empty (a "create a character" prompt), which is correct.
+  var modes = obj()
+  let all = allProfileIds()
+  for id in all:
+    let p = loadProfile(id)
+    if p.ok:
+      # EGameMode's custom `EnumConverter` maps values to attribute wire strings
+      # ("regular"/"pve"/"pvp-season"), NOT the enum name or number -- and a key
+      # not in that map THROWS, aborting the whole dictionary and re-locking every
+      # slot (which is why "0" and "Regular" both failed). "regular" = the PvP
+      # slot; this server's one profile fills it.
+      put(modes, "regular", characterSlot(p))
+      break
+  # Enveloped: a bare dictionary renders NOTHING (the client wraps this in
+  # JsonResponse<T> and reads `.data`), while the envelope renders the Regular
+  # slot. The dict key "regular" binds that slot to the mode; the value's own
+  # field casing is what remains (see characterSlot).
+  result = envelope(modes)
 
 proc onProfileSelect(url, body, session: string): string =
   ## Binds this session to a profile. The id comes out of the request body, and
@@ -334,6 +465,189 @@ proc onVoiceChange(url, body, session: string): string =
   result = envelope(objOf("status", "ok"))
 
 # ---------------------------------------------------------------------------
+# The launcher's profile bootstrap
+# ---------------------------------------------------------------------------
+#
+# Four routes that exist so a **profile can be chosen before the game starts**.
+#
+# The client is given its session on the command line -- `-token=<24 hex>` --
+# and carries it as `Cookie: PHPSESSID=<token>` on every request after that.
+# So something has to decide which profile is being played *before* a single
+# `/client/` route is ever called, and nothing in the client's own protocol can
+# do it: every one of those routes already needs the answer.
+#
+# **Why these are not `/launcher/*`.** SPT has a launcher API and this is not
+# it. Its 4.1 shape is in `reference/spt-4.1-surface.txt` as
+# `LauncherV2Callbacks` -- `Register`, `Login`, `Profiles`, `Profile`, `Remove`,
+# `Wipe`, `Types`, `Mods`, `ModPages`, `Ping`, `CompatibleVersion` -- keyed on a
+# **username** that has no counterpart here, and the dump carries no route urls
+# at all, so the paths would be guesses. Wearing another server's url with a
+# different body underneath is worse than an honest name: it invites a caller
+# that speaks the real protocol and fails on the third field. Nothing in this
+# tree speaks SPT's launcher API and SPT's own launcher needs a great deal more
+# than profiles from a server before it will drive one, so compatibility here
+# would be a claim rather than a feature. These sit beside
+# `/aowlspt/tarkov/selfcheck` instead, in this server's own namespace, for the
+# same reason that one does: it is not part of the client's protocol and must
+# never be mistaken for it.
+#
+# **The token is the profile id.** Not a third identifier mapped to one -- the
+# session is bound to itself here, `bindSession(id, id)`, so a launcher that
+# holds a profile id holds everything it needs and there is no second thing to
+# keep in step across a restart. `emu/sessions` persists the binding, which is
+# what makes a profile created before the first launch still be the profile the
+# client is playing after the server has been restarted under it.
+#
+# **No envelope.** These answer `{"ok":true,...}` or `{"ok":false,"error":...}`,
+# not the client's `{err, errmsg, data}` -- see `onSelfCheck` for why a route
+# outside `/client/` must not look like one inside it.
+
+proc launcherReply(o: JsonObject): string = text(done(o))
+
+proc launcherRefusal(message: string): string =
+  ## A refusal the launcher can put in front of a person. `ok:false` rather
+  ## than a 4xx: the backend's status codes belong to the pipeline, and a mod
+  ## that could only refuse by returning a 200 with a bad body would be a mod
+  ## whose failures read as successes.
+  var o = obj()
+  put(o, "ok", false)
+  put(o, "error", message)
+  result = launcherReply(o)
+
+proc launcherProfile(id: string): JsonObject =
+  ## One row of the launcher's profile list.
+  ##
+  ## `readable` is the field worth explaining: a profile whose document is on
+  ## disk and cannot be parsed still has an id, and a list that silently omitted
+  ## it would tell a player their character is gone. It is listed, marked, and
+  ## left for them to choose against -- which is what SPT's own `MiniProfile`
+  ## does with `InvalidOrUnloadableProfile`.
+  let p = loadProfile(id)
+  var o = obj()
+  put(o, "id", id)
+  put(o, "token", id)
+  put(o, "readable", p.ok)
+  put(o, "nickname", p.nickname)
+  put(o, "side", p.side)
+  put(o, "level", p.level)
+  put(o, "experience", p.experience)
+  put(o, "voice", p.field("Info.Voice").asText(""))
+  put(o, "edition", p.field("Info.GameVersion").asText(""))
+  put(o, "registered", p.field("Info.RegistrationDate").asInt(0))
+  result = o
+
+proc onLauncherPing(url, body, session: string): string =
+  ## Is there a server here, and does it have anything to play?
+  ##
+  ## Separate from `/aowlspt/tarkov/selfcheck`, which answers whether this
+  ## build's arithmetic held. A launcher wants a different question answered --
+  ## "can I offer this person a profile" -- and the two have different answers
+  ## on a server that loaded fine and has no profiles yet.
+  inc gRequests
+  var o = obj()
+  put(o, "ok", true)
+  put(o, "server", ServerName)
+  put(o, "version", ModVersion)
+  put(o, "edition", gEdition)
+  put(o, "defaultSide", gDefaultSide)
+  put(o, "profiles", allProfileIds().len)
+  result = launcherReply(o)
+
+proc onLauncherProfiles(url, body, session: string): string =
+  ## Every profile, as much of each as a launcher can draw a row from. An empty
+  ## list is the first-run answer and is not a failure: `ok` stays true.
+  inc gRequests
+  var a = arr()
+  let all = allProfileIds()
+  for id in all:
+    a.add launcherProfile(id)
+  var o = obj()
+  put(o, "ok", true)
+  put(o, "profiles", a)
+  result = launcherReply(o)
+
+proc onLauncherCreate(url, body, session: string): string =
+  ## A new PMC, made before the game is running, and the token to launch it
+  ## with.
+  ##
+  ## The same `createProfile` the client's own character screen goes through --
+  ## deliberately, because two ways of building a profile is two profile shapes
+  ## and only one of them gets fixed when the client changes.
+  ##
+  ## The nickname floor is three characters, matching
+  ## `/client/game/profile/nickname/validate`: a launcher that let a two-letter
+  ## name through would create a profile the client then refuses to rename.
+  inc gRequests
+  let nickname = field(body, "nickname").asText("")
+  var sideName = field(body, "side").asText(gDefaultSide)
+  let voice = field(body, "voice").asText("")
+  var edition = field(body, "edition").asText(gEdition)
+  if nickname.len < 3:
+    return launcherRefusal("a profile needs a nickname of at least three " &
+                           "characters")
+  if nicknameTaken(nickname):
+    return launcherRefusal("that nickname is taken")
+  if sideName != "Bear" and sideName != "Usec":
+    sideName = gDefaultSide
+  if edition.len == 0:
+    edition = gEdition
+  var p = createProfile(nickname, sideName, edition, nowSeconds(),
+                        gStartingRoubles)
+  if not p.ok:
+    return launcherRefusal("could not save the new profile: " & lastError())
+  # The voice is optional and its failure is not. `applyVoice` checks the id
+  # against the real customization table, which a server started without a
+  # database does not have -- and refusing the whole profile because the voice
+  # could not be looked up would make a launcher that offers voices unable to
+  # create a profile at all. The character already has its side's default.
+  if voice.len > 0:
+    var problem = ""
+    if applyVoice(p, voice, problem):
+      if not saveProfile(p):
+        return launcherRefusal("could not save the profile's voice")
+    elif problem.len > 0:
+      warn "the launcher asked for voice " & voice & ": " & problem
+  # Bound to itself, which is what makes the returned token enough on its own.
+  bindSession(p.id, p.id)
+  success "the launcher created profile " & p.id & " (" & nickname & ", " &
+          sideName & ")"
+  discard broadcast("tarkov.profile.created", objOf("id", p.id))
+  var o = obj()
+  put(o, "ok", true)
+  put(o, "token", p.id)
+  put(o, "profile", launcherProfile(p.id))
+  result = launcherReply(o)
+
+proc onLauncherSelect(url, body, session: string): string =
+  ## The token for a profile that already exists, and the binding that makes it
+  ## work.
+  ##
+  ## A launcher could pass a profile id straight to `-token` without calling
+  ## this, and for a profile this route or `onLauncherCreate` made it would
+  ## work -- the binding is already there. It would *not* work for one the
+  ## client's own character screen created, whose session is whatever id that
+  ## run was launched with. So the launcher calls this and does not have to know
+  ## which kind it is holding.
+  inc gRequests
+  var id = field(body, "id").asText("")
+  if id.len == 0:
+    id = field(body, "token").asText("")
+  if id.len == 0:
+    return launcherRefusal("that request named no profile")
+  if not isMongoId(id):
+    return launcherRefusal("that is not a profile id: " & id)
+  let p = loadProfile(id)
+  if not p.ok:
+    return launcherRefusal("no such profile: " & id)
+  bindSession(id, id)
+  info "the launcher selected profile " & id & " (" & p.nickname & ")"
+  var o = obj()
+  put(o, "ok", true)
+  put(o, "token", id)
+  put(o, "profile", launcherProfile(id))
+  result = launcherReply(o)
+
+# ---------------------------------------------------------------------------
 # The item event: everything the player does by dragging something
 # ---------------------------------------------------------------------------
 
@@ -366,7 +680,10 @@ proc itemEventResponse(p: Profile; ch: Change): string =
   put(changes, "builds", arr())
   put(changes, "items", items)
   put(changes, "production", jnull())
-  put(changes, "improvements", obj())
+  # `[]`, not `{}`. BSG sends an array here, and this rides on the response to
+  # every single inventory action, so the wrong container type is wrong
+  # thousands of times a session rather than once.
+  put(changes, "improvements", arr())
   put(changes, "skills", skills)
   put(changes, "health", raw(p.field("Health").raw()))
   # The real trader standings, so a quest reward that moved one is visible
@@ -628,7 +945,9 @@ proc onCustomization(url, body, session: string): string =
 proc onLanguages(url, body, session: string): string =
   envelope(raw(languages()))
 proc onQuestList(url, body, session: string): string =
-  envelope(raw(quests()))
+  ## An array, not the id-keyed object the database stores. See
+  ## `emu/templates.questList`.
+  envelope(raw(questList()))
 proc onAchievementList(url, body, session: string): string =
   envelope(objOf("elements", raw(achievements())))
 
@@ -645,8 +964,13 @@ proc onLocale(url, body, session: string): string =
   result = envelope(raw(locale(if lang.len > 0: lang else: "en")))
 
 proc onMenuLocale(url, body, session: string): string =
+  ## Post-1.0 deserialises this `data` into `EFT.BackendMenuLocale`, whose sole
+  ## field is `menu`; `ConvertToLocale` then reads `this.menu`. A flat map at
+  ## `data` leaves `menu` null and the client null-refs in `ConvertToLocale`
+  ## (surfacing far away as a preloader-UI crash), so the map is wrapped under
+  ## `menu`. Pre-1.0 put the map straight on `data`; this is the post-1.0 shape.
   let lang = pathAfter(url, "/client/menu/locale/")
-  result = envelope(raw(menuLocale(if lang.len > 0: lang else: "en")))
+  result = envelope(objOf("menu", raw(menuLocale(if lang.len > 0: lang else: "en"))))
 
 proc onSettings(url, body, session: string): string =
   let v = dbRead("settings")
@@ -678,6 +1002,16 @@ proc onCheckVersion(url, body, session: string): string =
 # rather than scattered because that is what they have in common: the answer is
 # "nothing, successfully".
 
+proc onLibraries(url, body, session: string): string =
+  ## `/client/libraries` -- a native early-bootstrap POST (its URL is in
+  ## GameAssembly, not the managed metadata, like `/client/metadata`). The
+  ## client uploads a ~30 KB manifest of its own libraries and BSG replies with
+  ## a BARE `{}` -- not the `{err,data}` envelope. A wrapped answer leaves the
+  ## client's native parser waiting and the main thread hangs at the loading
+  ## screen. Verified against a real capture: body is exactly `{}`.
+  inc gRequests
+  result = "{}"
+
 proc onEmptyObject(url, body, session: string): string =
   inc gRequests
   result = envelope(emptyObject())
@@ -708,6 +1042,58 @@ proc onOkStatus(url, body, session: string): string =
   inc gRequests
   result = envelope(objOf("status", "ok"))
 
+proc onBattlePassActive(url, body, session: string): string =
+  ## `/client/battle-pass/active` -- an OBJECT `{battlePasses:[...]}`, not null.
+  ## No active battle pass -> empty list. Null data risks a deref on the client.
+  inc gRequests
+  result = envelope(objOf("battlePasses", arr()))
+
+proc onEndingList(url, body, session: string): string =
+  ## `/client/ending/list` -- an OBJECT `{elements:[...]}` of raid-ending
+  ## descriptors, not a 404. Empty elements is a valid "no custom endings".
+  inc gRequests
+  result = envelope(objOf("elements", arr()))
+
+proc onDialogue(url, body, session: string): string =
+  ## `/client/dialogue` -- deserialised into `EFT.Dialogs.TraderDialogsDTO`, an
+  ## OBJECT with an `elements` array (the trader dialog trees), NOT a bare array.
+  ## The real answer is ~2.5 MB of every trader's dialog; an empty `elements` is
+  ## a valid "no trader conversations yet", which is correct for a fresh profile
+  ## and, crucially, deserialises without throwing (a bare array threw
+  ## HTTPParsingResponseException and looped the whole post-select load).
+  inc gRequests
+  result = envelope(objOf("elements", arr()))
+
+proc onSeasonalPerks(url, body, session: string): string =
+  ## `/client/seasonal-perks/list` -- deserialised into
+  ## `EFT.SeasonalPerks.SeasonalPerksData`, which is an OBJECT with two perk
+  ## lists, not an array. Empty lists mean no seasonal modifiers, which is the
+  ## correct answer outside a seasonal event.
+  ##
+  ## The keys are `common` and `personal`. They used to be `commonPerks` and
+  ## `personalPerks`, derived from the C# backing-field names `_commonPerks` and
+  ## `_personalPerks` -- a reasonable guess, and wrong. Four captures of this
+  ## route agree on the short names (seq 044, 079, 236, 430), which is what a
+  ## `[JsonProperty]` on the field does to a backing-field name.
+  inc gRequests
+  var o = obj()
+  put(o, "common", arr())
+  put(o, "personal", arr())
+  result = envelope(o)
+
+proc onSeasonActive(url, body, session: string): string =
+  ## `/client/season/active` -- whether a seasonal event (Halloween, New Year)
+  ## is running. None, so an empty object.
+  inc gRequests
+  result = envelope(emptyObject())
+
+proc onTokenIssue(url, body, session: string): string =
+  ## `/client/game/token/issue` -- issues a session token the client keeps for
+  ## the rest of the session. There is no auth here (see `onProfileSelect`), so
+  ## echoing the session id back as the token is enough for the client to hold.
+  inc gRequests
+  result = envelope(objOf("token", session))
+
 proc onFriendList(url, body, session: string): string =
   ## `GetFriendListDataResponse` is an **object** of three lists, not a list.
   ## This answered `[]` for as long as it existed, which the client parses
@@ -717,6 +1103,12 @@ proc onFriendList(url, body, session: string): string =
   put(o, "Friends", arr())
   put(o, "Ignore", arr())
   put(o, "InIgnoreList", arr())
+  # Six keys, not three. The other three are post-1.0 additions (seq 124, 249,
+  # 442) and an absent one is a null the client indexes, which is the same
+  # failure the first three were added to fix.
+  put(o, "steamFriendList", arr())
+  put(o, "incomingRequestList", arr())
+  put(o, "sentRequestList", arr())
   result = envelope(o)
 
 proc onChatServerList(url, body, session: string): string =
@@ -785,20 +1177,41 @@ proc onPrestigeList(url, body, session: string): string =
   result = envelope(objOf("elements", raw(table("templates.prestige", "[]"))))
 
 proc onCustomizationStorage(url, body, session: string): string =
-  ## What clothing the profile owns. An object with a `suites` list -- an empty
-  ## array here is a null `suites` in the character screen.
-  let p = currentProfile(session)
-  var o = obj()
-  put(o, "_id", p.id)
-  put(o, "suites", arr())
-  result = envelope(o)
+  ## What customisation the profile owns: heads, voices, gestures, poses,
+  ## suites, dog tags and hideout decoration.
+  ##
+  ## An **array** of `{id, source, type}`, not an object with a `suites` list.
+  ## The real backend answers 49 entries for a fresh account, every one of them
+  ## `source: "default"` (capture seq 086 and 094), and later 62 once a
+  ## preorder edition adds its own 13 with `source: "preorder"`. The object
+  ## this used to send deserialises to nothing at all, so the character screen
+  ## drew whatever it drew for an empty wardrobe.
+  ##
+  ## The 49 defaults are served from `data/post1/customizationstorage.json`
+  ## because they are not derivable from the database this server has: SPT's
+  ## `templates.customization` says what each id *is*, not which of them an
+  ## account starts owning, and the split between the two is a property of the
+  ## account rather than of the item.
+  ##
+  ## What this does **not** do is grow. Everything a player buys or unlocks
+  ## should appear here and does not, because nothing tracks it yet -- so this
+  ## is the starting wardrobe, permanently. That is a smaller lie than the
+  ## previous one and it is still a lie; it is in the backlog rather than in a
+  ## comment nobody reads.
+  inc gRequests
+  let owned = post1Table("customizationstorage")
+  if owned.len == 0:
+    return failure(1, "the post-1.0 table 'customizationstorage' is not " &
+                      "installed, so this server cannot say what the profile " &
+                      "is wearing")
+  result = envelope(raw(owned))
 
 proc onGameMode(url, body, session: string): string =
   ## `GameModeResponse`. Asked at boot, before the profile list, and this server
   ## has one mode.
   var o = obj()
   put(o, "gameMode", "regular")
-  put(o, "backendUrl", "")
+  put(o, "backendUrl", BackendUrl)
   result = envelope(o)
 
 proc onProfileStatus(url, body, session: string): string =
@@ -831,6 +1244,136 @@ proc onProfileStatus(url, body, session: string): string =
   var o = obj()
   put(o, "maxPveCountExceeded", false)
   put(o, "profiles", list)
+  result = envelope(o)
+
+# ---------------------------------------------------------------------------
+# Post-1.0 static tables
+# ---------------------------------------------------------------------------
+#
+# Seven routes the client asks for on every menu load that have no pre-1.0
+# equivalent, so the SPT-derived database cannot answer them and they were not
+# served at all. A 404 here is not harmless: the client retries and then sits
+# on the loading screen. See `emu/post1` and `data/post1/README.md`.
+#
+# A missing table is a **refusal**, not an empty answer. An empty chapter list
+# and an absent one look the same to the client, and only one of them is true;
+# answering `[]` would turn a broken install into a game that quietly has no
+# main quests.
+
+proc post1Route(name, what: string): string =
+  ## A post-1.0 list route backed by an optional installed table. When the table
+  ## is absent the answer is an empty SUCCESS, not a failure: these routes
+  ## (subtitle tracks, tapes, variable groups, main-quest lists, ...) are not
+  ## essential to reach the menu, and the client RETRIES an `err:1` envelope
+  ## forever -- which stalls the post-character-select load. An empty array is a
+  ## valid "nothing here" for every one of them.
+  let text = post1Table(name)
+  if text.len == 0:
+    return envelope(emptyArray())
+  result = envelope(raw(text))
+
+proc onMainQuestsList(url, body, session: string): string =
+  inc gRequests
+  result = post1Route("mainquests", "the main quest chapters")
+
+proc onMainQuestNotesList(url, body, session: string): string =
+  inc gRequests
+  result = post1Route("mainquestnotes", "the main quest notes")
+
+proc onVariableGroup(url, body, session: string): string =
+  inc gRequests
+  result = post1Route("variablegroups", "the variable groups")
+
+proc onTapeList(url, body, session: string): string =
+  inc gRequests
+  result = post1Route("tapes", "the tape list")
+
+proc onSubtitleTrackList(url, body, session: string): string =
+  inc gRequests
+  result = post1Route("subtitletracks", "the subtitle tracks")
+
+proc onQuestChains(url, body, session: string): string =
+  inc gRequests
+  result = post1Route("questchains", "the quest chains")
+
+proc onMetricsConfig(url, body, session: string): string =
+  inc gRequests
+  result = post1Route("metricsconfig", "the metrics configuration")
+
+proc onTutorGameCheck(url, body, session: string): string =
+  ## Whether to launch the tutorial. Answered `false`: this server has no
+  ## tutorial raid to run, and the real backend's `true` sends the client into
+  ## one -- `match/local/start` with `mode: "TUTORIAL"` -- which is a raid this
+  ## emulator would have to be able to finish.
+  inc gRequests
+  result = envelope(objOf("launchTutorGame", raw("false")))
+
+proc onCancelAllInvites(url, body, session: string): string =
+  ## `/client/match/group/invite/cancel-all`. There are no groups here, so
+  ## there is nothing to cancel and that is a success rather than a refusal --
+  ## the client sends this on the way into a raid and a failure would read as
+  ## a raid it could not enter.
+  inc gRequests
+  result = envelopeNull()
+
+proc onQuestComplete(url, body, session: string): string =
+  ## `POST /client/quest/complete` -- post-1.0's own hand-in route.
+  ##
+  ## Pre-1.0 completed a quest only through the item-event batch, as a
+  ## `QuestComplete` action carrying `qid`. Post-1.0 also has this, a route of
+  ## its own with a different spelling: the body is `{"questId": "..."}`
+  ## (capture seq 202) and the answer is `{quests, questsStatus}` -- the quest
+  ## list as it now stands, in the same element shape `/client/quest/list`
+  ## uses, plus a status list. It fires during the raid-exit transition, so a
+  ## 404 here loses a completion at the moment it is earned.
+  ##
+  ## The spelling is the whole trap. `applyQuestOnProfile` reads `qid`, so
+  ## handing it this body unchanged names no quest and refuses, which is the
+  ## same shape of bug as reading `exit` where the client sends
+  ## `results.result`. It is renamed once, here, rather than teaching the quest
+  ## code a second name for the same thing.
+  inc gRequests
+  var p = currentProfile(session)
+  if not p.ok:
+    return failure(1, "no profile on this session")
+  let questId = field(body, "questId").asText("")
+  if questId.len == 0:
+    return failure(1, "quest/complete named no quest")
+
+  var gained = 0
+  var problem = ""
+  var note1 = ""
+  # The profile-aware entry point, for the reason the item-event path uses it:
+  # a version that only sees the quest array cannot check a level, a trader
+  # standing or what was actually handed over, and a quest that pays out for
+  # nothing is worse than one that will not complete.
+  # Built and reparsed rather than string-spliced: `questId` comes off the
+  # wire, and the builder is what knows how to escape it.
+  let questBody = whole(done(objOf("qid", questId)).text)
+  if applyQuestOnProfile(p, qaComplete, questBody,
+                         nowSeconds(), gained, problem, note1):
+    if gained > 0:
+      addExperience(p, gained)
+    if not saveProfile(p):
+      return failure(1, "could not save the profile after completing " & questId)
+    success "quest completed: " & questId
+  if problem.len > 0:
+    warn "quest/complete refused " & questId & ": " & problem
+    return failure(1, problem)
+  if note1.len > 0:
+    warn "quest/complete: " & note1
+
+  var o = obj()
+  # The array form, like `/client/quest/list` -- the real backend's answer here
+  # is a list of quest objects (13 of them at capture seq 202), the same element
+  # shape that route uses. It sends the quests that are now relevant rather than
+  # all of them; sending all of them is a superset and the client filters by
+  # status, which is an approximation and is written down as one.
+  put(o, "quests", raw(questList()))
+  # Empty, and honestly so. `questsStatus` was empty in the capture too, and
+  # this server has nothing to put in it that it has not already written into
+  # the profile's own `Quests` array.
+  put(o, "questsStatus", arr())
   result = envelope(o)
 
 proc onTrue(url, body, session: string): string =
@@ -983,6 +1526,13 @@ proc onRaidConfiguration(url, body, session: string): string =
   # with the five members the client needs back and the clock is not among
   # them.
   gRaidClock = raidClock(body)
+  # The map, remembered against the session. `raid/configuration` and
+  # `match/local/start` are the only two places the client ever names it -- the
+  # raid result does not -- so whichever of them arrives, the map is kept. See
+  # `emu/sessions.enterRaid`.
+  let configured = field(cfg, "location").asText("")
+  if configured.len > 0:
+    enterRaid(session, configured, field(body, "raidMode").asText(""))
   info "raid configured: " & field(cfg, "location").asText("?") & " as " &
        field(cfg, "side").asText("?")
   discard broadcast("tarkov.raid.configured", raw(cfg))
@@ -994,24 +1544,109 @@ proc onLocalLoot(url, body, session: string): string =
   result = envelope(raw(localLoot(loc, nowSeconds(), gRaidId)))
 
 proc onMatchStart(url, body, session: string): string =
+  ## Entering a raid. The response carries the **whole map**.
+  ##
+  ## This used to answer `{serverId, serverSettings, status, notifier}` with an
+  ## `aiAmount`/`aiDifficulty` settings object, which is the pre-1.0 shape.
+  ## What the post-1.0 backend really sends (capture seq 158, 18,769 bytes on
+  ## the wire) is
+  ##
+  ##     {serverId, serverSettings, profile, locationLoot, transition,
+  ##      excludedBosses}
+  ##
+  ## with `locationLoot` the complete location document -- spawn points, exits,
+  ## waves, boss spawns, loot -- and `serverSettings` a pair of
+  ## `TraderServerSettings` and `BTRServerSettings` that has nothing in common
+  ## with the old one. `status` and `notifier` are not sent at all.
+  ##
+  ## That is the answer to a question this repository had open: post-1.0 never
+  ## calls `/client/location/getLocalloot`, which is why that route is served
+  ## and never exercised. The loot comes back here instead, once, and the
+  ## client does not ask again.
+  ##
+  ## **Modelled on a tutorial raid**, because that is the only `match/local/
+  ## start` in the capture. The two settings blocks are static game config and
+  ## are very unlikely to differ per mode, but that is reasoning rather than
+  ## evidence and it is written down here rather than assumed away.
   inc gRequests
+  # The seven fields the client sends were read by nothing at all before, which
+  # is how the map came to be unknown at the end of the raid. Real body:
+  # `{serverId, location, timeVariant, mode, playerSide, transitionType,
+  # transition}`.
+  let startLocation = field(body, "location").asText("")
+  let startMode = field(body, "mode").asText("")
+  if startLocation.len > 0:
+    enterRaid(session, startLocation, startMode)
+
   # The per-raid skill counter resets here rather than at the end: the raid the
   # player is entering is the one whose gains are capped.
   var starting = currentProfile(session)
   if starting.ok and startRaidSkills(starting):
     discard saveProfile(starting)
-  var settings = obj()
-  put(settings, "aiAmount", "AsOnline")
-  put(settings, "aiDifficulty", "AsOnline")
-  put(settings, "bossEnabled", true)
-  put(settings, "scavWars", false)
-  put(settings, "taggedAndCursed", false)
+
+  # The id `raid/configuration` set, when there is one. Not a fresh id: it is
+  # the seed `localLoot` lays the map out from, so minting a new one here would
+  # give the raid a different map from the one the configuration screen just
+  # described, and would do it only sometimes -- whenever the two happened to
+  # be called in the other order.
+  let raidId = if gRaidId.len > 0: gRaidId else: newId()
   var o = obj()
-  put(o, "serverId", newId())
-  put(o, "serverSettings", settings)
-  put(o, "status", "busy")
-  put(o, "notifier", objOf("server", ServerName))
+  put(o, "serverId", raidId)
+  let settings = post1Table("serversettings")
+  if settings.len > 0:
+    put(o, "serverSettings", raw(settings))
+  else:
+    # Refused rather than faked. The BTR settings alone are fifteen tuned
+    # numbers; an empty object here is a client that spawns a BTR with a move
+    # speed of zero, which is a stranger bug than a missing raid.
+    return failure(1, "the post-1.0 table 'serversettings' is not installed, " &
+                      "so a raid cannot be started")
+  # `null`, exactly as the real backend sends it. The client already has the
+  # profile; this member is for a transit continuation, which this server does
+  # not do.
+  put(o, "profile", jnull())
+  if startLocation.len > 0:
+    put(o, "locationLoot",
+        raw(localLoot(startLocation, nowSeconds(), raidId)))
+  else:
+    warn "match/local/start named no location, so the raid gets no map"
+  var transition = obj()
+  put(transition, "transitionType", field(body, "transitionType").asInt(0))
+  put(transition, "transitionRaidId", raidId)
+  put(transition, "transitionCount", 0)
+  put(transition, "visitedLocations", arr())
+  put(o, "transition", transition)
+  put(o, "excludedBosses", arr())
   result = envelope(o)
+
+proc raidMapFor(session, body: string): string =
+  ## Which map the raid that is ending was on.
+  ##
+  ## The body first, when it names one, then the map the session recorded on
+  ## the way in.
+  ##
+  ## That order is the opposite of what it looks like it should be, so it is
+  ## worth saying why. A post-1.0 client does not put the map in the raid
+  ## result at all -- `match/local/end` is `{serverId, results,
+  ## lostInsuredItems, transferItems, locationTransit}` and `serverId` is a
+  ## mode, an account and a timestamp -- so in production this reads the
+  ## session every time and the first branch never fires. Where it does fire is
+  ## a pre-1.0 client, which did carry `location`, and a caller that states the
+  ## map explicitly. In both of those the body is the more specific statement
+  ## about *this* raid, and preferring the remembered value would quietly
+  ## override it with whatever map the session was last told about.
+  ##
+  ## Empty is a real answer and is left as one. A raid whose map is unknown
+  ## must not be scored against a guess: `advanceQuestsAfterRaid` treats "" as
+  ## "no location qualifier matched", which loses the map-specific progress of
+  ## that one raid. Guessing loses it *and* credits the wrong map.
+  result = raidLocation(body)
+  if result.len == 0:
+    result = raidLocationFor(session)
+    if result.len == 0:
+      warn "the raid that just ended has no map: the result body does not " &
+           "carry one and the session did not record one, so map-qualified " &
+           "quest progress from it is lost"
 
 proc onMatchEnd(url, body, session: string): string =
   ## The client hands back the profile it played the raid with. Taking it is
@@ -1023,10 +1658,32 @@ proc onMatchEnd(url, body, session: string): string =
   if not p.ok:
     return failure(1, "no profile on this session")
 
-  let outcome = parseResult(field(body, "exit").asText("Left"))
-  let played = field(body, "profile")
+  # `results.result` and `results.profile`, not `exit` and `profile`.
+  #
+  # This was wrong for as long as it existed and it could not have been caught
+  # from the inside: `field` is a root-anchored dotted path rather than a
+  # recursive search, so both lookups simply missed, the guard below fired, and
+  # the server logged a tidy sentence saying the client had sent no profile. It
+  # had sent 76 KB of one. Every raid ended with nothing carried home -- no
+  # loot, no health, no quest progress, no stats -- and the log said the client
+  # was at fault.
+  #
+  # The names are from a capture of the real backend: seq 204 of
+  # `data/capture/raid1`, whose `results` object is
+  # `{profile, result, killerId, killerAid, exitName, inSession, favorite,
+  # playTime}`. `exitName` is the extract's name; `result` is the outcome word
+  # `parseResult` already understood.
+  let results = field(body, "results")
+  let outcome = parseResult(results.field("result").asText("Left"))
+  let played = results.field("profile")
   if not played.found or not isObject(played):
-    warn "match/end carried no profile; the raid changed nothing"
+    # What it *did* carry, not just what it did not. A refusal that names only
+    # the thing it wanted is how the previous version of this bug survived: the
+    # server said the client had sent no profile, the client had sent 76 KB of
+    # one, and the log gave nobody a reason to doubt the server.
+    warn "match/end carried no results.profile; the raid changed nothing. " &
+         "the body begins: " &
+         (if body.len > 160: body.substr(0, 159) & "..." else: body)
     return envelopeNull()
 
   let playedId = played.field("_id").asText("")
@@ -1090,7 +1747,7 @@ proc onMatchEnd(url, body, session: string): string =
   let lost = lostAfterRaid(p.text, raw(played))
   if lost.len > 0:
     let due = nowSeconds() + gInsuranceHours * 3600
-    let where = raidLocation(body)
+    let where = raidMapFor(session, body)
     # One queue entry per **insuring trader**, not one for everybody. The
     # profile records who covered each item and this used to ignore it and post
     # the lot from Prapor; now that the message is the trader's own words, a
@@ -1148,8 +1805,8 @@ proc onMatchEnd(url, body, session: string): string =
   # kills it did not count, and every quest that is now ready to hand in.
   # Rewards are *not* paid here -- the `QuestComplete` the player sends pays
   # them, and paying here as well would pay them twice.
-  discard advanceQuestsAfterRaid(updated, p.text, raidLocation(body),
-                                 field(body, "exit").asText("Left"),
+  discard advanceQuestsAfterRaid(updated, p.text, raidMapFor(session, body),
+                                 results.field("result").asText("Left"),
                                  nowSeconds(), gRaidClock)
 
   # And whatever the raid just earned. After the quest pass rather than before
@@ -1160,7 +1817,10 @@ proc onMatchEnd(url, body, session: string): string =
 
   if not saveProfile(updated):
     return failure(1, "could not save the profile after the raid")
-  success "raid ended: " & field(body, "exit").asText("Left") & " for " &
+  # Only now. A raid whose result failed to save is still a raid in progress,
+  # and dropping the map here would make the retry worse than the failure.
+  leaveRaid(session)
+  success "raid ended: " & results.field("result").asText("Left") & " for " &
           p.nickname
   discard broadcast("tarkov.raid.ended", objOf("profile", p.id))
   result = envelopeNull()
@@ -1518,6 +2178,10 @@ proc registerRoutes() =
   ## Every route, in one place, in the order the client calls them. Reading this
   ## list top to bottom is reading the client's boot sequence.
 
+  # IL2CPP metadata bootstrap -- the earliest call of all, from inside
+  # `il2cpp_init`, before there is a session. See `onMetadata`.
+  discard serve("/client/metadata", onMetadata)
+
   # Login and session
   discard serve("/client/game/config", onGameConfig)
   discard serve("/client/game/start", onGameStart)
@@ -1529,6 +2193,12 @@ proc registerRoutes() =
 
   # Profiles
   discard serve("/client/game/profile/list", onProfileList)
+  # Post-1.0 loads the character-select profile list from a versioned path (with
+  # a trailing slash) as well as the classic one. Same profile array; the client
+  # was stuck on "loading profile data" because this 404'd. `servePrefix` covers
+  # the trailing slash the client sends.
+  discard servePrefix("/v2/client/game/profiles", onProfilesV2)
+  discard servePrefix("/v2/client/shop/status", onEmptyObject)
   discard serve("/client/game/profile/select", onProfileSelect)
   discard serve("/client/game/profile/create", onProfileCreate)
   discard serve("/client/game/profile/nickname/validate", onNicknameValidate)
@@ -1537,11 +2207,21 @@ proc registerRoutes() =
   discard serve("/client/game/profile/savage/regenerate", onSavageRegenerate)
   discard serve("/client/game/profile/voice/change", onVoiceChange)
   discard serve("/client/game/mode", onGameMode)
+  # The launcher's own bootstrap, outside `/client/` -- see the note above
+  # `onLauncherPing` for why these are not `/launcher/*`. Registered with the
+  # rest rather than beside the self-check, because a server that refused to
+  # serve the game must not offer to make a profile for it either.
+  discard serve("/aowlspt/tarkov/launcher/ping", onLauncherPing)
+  discard serve("/aowlspt/tarkov/launcher/profiles", onLauncherProfiles)
+  discard serve("/aowlspt/tarkov/launcher/profile/create", onLauncherCreate)
+  discard serve("/aowlspt/tarkov/launcher/profile/select", onLauncherSelect)
+
   discard serve("/client/profile/status", onProfileStatus)
   # `GetProfileSettings` answers a bare `true`; the client only checks that the
   # call succeeded.
   discard serve("/client/profile/settings", onTrue)
   discard serve("/client/game/profile/search", onEmptyArray)
+  discard serve("/client/libraries", onLibraries)
   discard serve("/client/profile/view", onEmptyObject)
 
   # Static tables
@@ -1567,6 +2247,19 @@ proc registerRoutes() =
   discard servePrefix("/client/trading/api/getTrader/", onTrader)
   discard serve("/client/trading/customization/storage", onCustomizationStorage)
   discard servePrefix("/client/items/prices/", onItemPrices)
+
+  # Post-1.0 tables and stubs, none of which pre-1.0 had
+  discard serve("/client/dialogue", onDialogue)
+  discard serve("/client/quest/getMainQuestsList", onMainQuestsList)
+  discard serve("/client/quest/getMainQuestNotesList", onMainQuestNotesList)
+  discard serve("/client/variable/group", onVariableGroup)
+  discard serve("/client/tape/list", onTapeList)
+  discard serve("/client/subtitle-track/list", onSubtitleTrackList)
+  discard serve("/client/quest/chains", onQuestChains)
+  discard serve("/client/getMetricsConfig", onMetricsConfig)
+  discard serve("/client/quest/complete", onQuestComplete)
+  discard serve("/client/tutor-game/check", onTutorGameCheck)
+  discard serve("/client/match/group/invite/cancel-all", onCancelAllInvites)
 
   # Raids
   discard serve("/client/raid/configuration", onRaidConfiguration)
@@ -1628,7 +2321,19 @@ proc registerRoutes() =
   discard serve("/client/survey/opinion", onNullData)
   discard serve("/client/prestige/list", onPrestigeList)
   discard serve("/client/putMetrics", onNullData)
+  discard serve("/client/putHWMetrics", onNullData)
+  discard serve("/client/putLoadMetrics", onNullData)
   discard serve("/client/getMetrics", onEmptyObject)
+  # Post-1.0 renamed a handful of routes and added a few. These are the ones a
+  # real 1.1.0 client asks for on the way to the main menu that the pre-1.0
+  # spellings above miss; each was a 404 the client retried and then stalled on.
+  discard serve("/client/seasonal-perks/list", onSeasonalPerks)
+  discard serve("/client/season/active", onSeasonActive)
+  discard serve("/client/battle-pass/active", onBattlePassActive)
+  discard serve("/client/ending/list", onEndingList)
+  discard serve("/client/game/token/issue", onTokenIssue)
+  discard serve("/client/customization/storage", onCustomizationStorage)
+  discard serve("/client/friends", onFriendList)
   discard serve("/client/analytics/event-disabled", onNullData)
   discard serve("/client/repeatalbeQuests/activityPeriods", onActivityPeriods)
   # The client talks to the server about itself: crash notes, release notes and
@@ -1742,7 +2447,7 @@ exportMod(
   guid = ModGuid,
   name = "Tarkov Emulator",
   author = "aowlspt",
-  version = "0.1.0",
+  version = ModVersion,
   sptRange = "*",
   sides = {sideServer, sideSim},
   onLoad = onLoad,
