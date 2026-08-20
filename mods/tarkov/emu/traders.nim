@@ -53,6 +53,41 @@ proc emptyAssort(): string =
   put(o, "loyal_level_items", obj())
   result = done(o).text
 
+proc stampRequirementTypes*(barterRaw: string): string =
+  ## Post-1.0 stamps every barter-scheme requirement with a `type`
+  ## discriminator -- `"ItemRequirement"` for the ordinary "hand over N of a
+  ## template" cost. SPT's database, which is where our assorts come from,
+  ## predates it and omits the field entirely: a requirement is just
+  ## `{count, _tpl}`.
+  ##
+  ## The post-1.0 client will not confirm a purchase whose cost carries no
+  ## type. The trade screen opens, the offer draws, and the buy button spins
+  ## forever with no error on either side -- the client is waiting to classify
+  ## a requirement it cannot, and nothing it receives back moves it on. So the
+  ## field is stamped onto every requirement here, at serve time, leaving the
+  ## stored assort exactly as the database holds it.
+  let root = whole(barterRaw)
+  if not isObject(root):
+    return barterRaw
+  var o = obj()
+  for offerId in keys(root):
+    var armsArr = arr()
+    for arm in each(field(root, offerId)):
+      var reqArr = arr()
+      for req in each(arm):
+        var r = obj()
+        # `type` first, then the requirement's own fields verbatim -- numbers
+        # stay numbers because each value is copied as the raw text it was.
+        put(r, "type", "ItemRequirement")
+        for k in keys(req):
+          if k == "type":
+            continue
+          put(r, k, raw(field(req, k).raw()))
+        reqArr.add r
+      armsArr.add reqArr
+    put(o, offerId, armsArr)
+  result = done(o).text
+
 proc traderAssort*(id: string; resupplyAt: int): string =
   let v = dbRead("traders." & id & ".assort")
   if not v.ok or v.raw.len == 0:
@@ -61,12 +96,14 @@ proc traderAssort*(id: string; resupplyAt: int): string =
   # database when it is there and stamped here when it is not, because a
   # missing one shows as a stock timer that has already expired.
   let existing = field(v.raw, "nextResupply")
-  if existing.found:
-    return v.raw
   var o = obj()
-  put(o, "nextResupply", resupplyAt)
+  if existing.found:
+    put(o, "nextResupply", raw(existing.raw()))
+  else:
+    put(o, "nextResupply", resupplyAt)
   put(o, "items", raw(field(v.raw, "items").raw()))
-  put(o, "barter_scheme", raw(field(v.raw, "barter_scheme").raw()))
+  put(o, "barter_scheme",
+      raw(stampRequirementTypes(field(v.raw, "barter_scheme").raw())))
   put(o, "loyal_level_items", raw(field(v.raw, "loyal_level_items").raw()))
   result = done(o).text
 

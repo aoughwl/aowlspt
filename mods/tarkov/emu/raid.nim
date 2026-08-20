@@ -293,6 +293,26 @@ proc localLoot*(locationId: string; nowSeconds: int;
     # one rather than trusting every imported map to carry both.
     if not has(d, "Id"): setText(d, "Id", name)
     if not has(d, "Name"): setText(d, "Name", name)
+    # Post-1.0 `LocationBase` members the SPT-era `base.json` predates. The real
+    # backend sends all of them in the `match/local/start` `locationLoot`
+    # (capture seq 158); an imported base carries none. They matter because the
+    # client deserialises this into `LocationBase` and then walks it while it
+    # builds the raid: `areas` (the infiltration zones) is a collection it
+    # iterates, and a *missing* member deserialises to a null collection, which
+    # is a NullReference during `LocalGameMatching` -- and the visible symptom of
+    # that is the Ready button doing nothing, because the fault is swallowed by
+    # the async state machine that click kicked off. Filled only when the base
+    # omits them, so a database that already carries the real values keeps them.
+    if not has(d, "areas"): setRaw(d, "areas", "{}")
+    if not has(d, "ExitZones"): setText(d, "ExitZones", "")
+    if not has(d, "HighLevelLocationId"): setText(d, "HighLevelLocationId", "")
+    if not has(d, "ForceOfflineRaidInPVE"): setBool(d, "ForceOfflineRaidInPVE", false)
+    if not has(d, "HiddenWhenLockedByQuest"): setBool(d, "HiddenWhenLockedByQuest", false)
+    if not has(d, "LockedByQuest"): setBool(d, "LockedByQuest", false)
+    if not has(d, "SavageForceOfflineRaidInPVE"):
+      setBool(d, "SavageForceOfflineRaidInPVE", false)
+    if not has(d, "SavageForceOnlineRaidInPVE"):
+      setBool(d, "SavageForceOnlineRaidInPVE", false)
     result = text(d)
   else:
     # No base in the database: an empty-but-valid map that still loads and plays,
