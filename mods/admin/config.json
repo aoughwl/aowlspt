@@ -1,0 +1,19 @@
+{
+  "_comment": "Admin / cheat menu. These are the INITIAL toggle states, read at load and seeded into the F6 menu; after you change a toggle in the menu it lives in the mod's own state, not here. Defaults per the brief: ESP and God mode on, everything else off. Keys mirror the F12 settings schema in admin.nim.",
+
+  "esp": true,
+  "godmode": true,
+  "infiniteStamina": false,
+  "noRecoil": false,
+  "noWeight": false,
+  "instantHeal": false,
+  "unlimitedAmmo": false,
+  "thermalVision": false,
+  "nightVision": false,
+  "fly": false,
+  "teleport": false,
+  "timeOfDay": false,
+
+  "_espMaxDistance": "Do not box players farther than this many metres from you. 400 is a sane raid default; raise it for open maps.",
+  "espMaxDistance": 400.0
+}
