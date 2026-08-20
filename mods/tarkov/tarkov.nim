@@ -1826,6 +1826,19 @@ proc onMatchEnd(url, body, session: string): string =
     return failure(1, "that raid result is for a different profile")
 
   var updated = Profile(id: p.id, text: raw(played), ok: true)
+  # This post-1.0 client hands back only the *in-raid character* at raid end --
+  # on a death especially, the body it POSTs has the equipment tree and nothing
+  # else: no `stash`, no hideout, no mail. `updated` above is the whole profile
+  # replaced by that body, so taking it whole would delete the player's entire
+  # stash and every base equipment slot -- after which the menu cannot build the
+  # character and hangs on the loading logo, and the stash is simply gone. When
+  # the handed-back inventory carries no stash, keep the stored inventory whole;
+  # the raid's XP, stats and quest progress below still apply from `played`.
+  let raidCarriedFullInventory = played.field("Inventory.stash").asText("").len > 0
+  if not raidCarriedFullInventory:
+    setRaw(updated, "Inventory", p.field("Inventory").raw())
+    warn "match/end: the raid body carried no stash, so the stored inventory " &
+         "was kept intact rather than replaced (gear is not lost this raid)"
   # Skills are applied as a delta against the pre-raid profile and run through
   # the game's curve, rather than believed as sent. The client's numbers are the
   # client's.
@@ -1842,7 +1855,10 @@ proc onMatchEnd(url, body, session: string): string =
   # the *pre-raid* profile, because the post-raid one no longer has the items --
   # which is exactly what makes them eligible.
   let lost = lostAfterRaid(p.text, raw(played))
-  if lost.len > 0:
+  # Only when the raid actually handed back a full inventory: if it did not, the
+  # stored inventory was kept whole above and nothing was lost from the stash, so
+  # every stash item would otherwise read as "lost" and be posted to insurance.
+  if raidCarriedFullInventory and lost.len > 0:
     let due = nowSeconds() + gInsuranceHours * 3600
     let where = raidMapFor(session, body)
     # One queue entry per **insuring trader**, not one for everybody. The
