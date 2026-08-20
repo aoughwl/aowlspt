@@ -255,6 +255,40 @@ proc locationBase*(id: string): string =
     return byKey.raw
   result = ""
 
+proc post1LocationBase*(id: string): string =
+  ## The full post-1.0 `LocationBase` for a map, out of the installed
+  ## `data/post1/locations` table.
+  ##
+  ## That table (24 real maps, capture seq 134) carries the members the SPT-era
+  ## `base.json` predates and that a playable raid cannot do without:
+  ## `SpawnPointParams` (Factory 160, Customs 318, Ground Zero 57 -- the points
+  ## the player and the bots spawn on), `exits`/`ExitZones` (the extracts),
+  ## `waves` and `MinMaxBots`. The SPT-db base has none of them, so a raid built
+  ## from it has no spawn and no exit and the client throws while it walks the
+  ## `LocationBase` -- the "a task failed" the raid build reports.
+  ##
+  ## Matched by the map's `Id` (what `match/local/start` names, e.g.
+  ## "factory4_day"/"Sandbox_start") first, then by the `_Id` the table is keyed
+  ## on. "" when the table is not installed or has no such map, so the SPT-db
+  ## path below stays the fallback.
+  if id.len == 0:
+    return ""
+  let table = post1Table("locations")
+  if table.len == 0:
+    return ""
+  let locs = field(table, "locations")
+  if not locs.found:
+    return ""
+  for k in keys(locs):
+    let entry = locs.field(k)
+    if entry.field("Id").asText("") == id:
+      return entry.raw
+  # No `Id` matched; the caller may have named the map by its `_Id` key.
+  let byKey = locs.field(id)
+  if byKey.found and byKey.raw.len > 0:
+    return byKey.raw
+  result = ""
+
 proc localLoot*(locationId: string; nowSeconds: int;
                 raidId: string = ""): string =
   ## What is lying on the floor when the raid starts.
@@ -269,7 +303,18 @@ proc localLoot*(locationId: string; nowSeconds: int;
   # raid loaded with the default timer and an empty floor. Resolving once here
   # means every read below is against the key the database actually uses.
   let name = canonicalLocation(locationId)
-  let base = locationBase(name)
+  # The real post-1.0 base first, when the post1 locations table is installed:
+  # it carries SpawnPointParams/exits/waves, which the SPT-db base does not, and
+  # which the client needs to build a raid at all. The SPT-db base is the
+  # fallback for a map the table has no entry for. `locationId` is tried before
+  # the canonicalised `name` because the table is keyed and tagged by the id the
+  # client sends (`Sandbox_start`), which for a post-1.0-only map the SPT db has
+  # never heard of and `canonicalLocation` leaves unchanged anyway.
+  var base = post1LocationBase(locationId)
+  if base.len == 0 and name != locationId:
+    base = post1LocationBase(name)
+  if base.len == 0:
+    base = locationBase(name)
   # Seeded from the raid id, so the floor of a given raid is reproducible from
   # a bug report. Falling back to the map name when there is no raid id keeps it
   # deterministic rather than empty -- the same map then has the same loot every
