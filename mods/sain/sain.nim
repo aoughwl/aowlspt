@@ -67,6 +67,8 @@ import aowlspt/json
 import aowlspt/fast
 import aowlspt/il2cpp
 import aowlspt/fixture # where a self-test's runtime path may come from
+import aowlspt/server   # `serve` -- the settings route this mod registers
+import aowlspt/settings # the F12 settings schema this mod declares
 import core/vec
 import core/types
 import core/probe
@@ -1161,7 +1163,31 @@ proc runDriveQueueSelfTest(): int =
   info "sain: " & driveStats()
   result = bad
 
+proc sainSchema(): seq[Setting] =
+  ## The flat top-level scalar keys SAIN reads from config.json. The `global`,
+  ## `roles` and `server` blocks are nested documents resolved into a Preset
+  ## rather than scalar controls, so their members are not declared here.
+  result = @[
+    boolSetting("enabled", "Enable SAIN", true, category = "AI",
+                description = "Master switch; when off the mod loads and does nothing"),
+    enumSetting("difficulty", "Difficulty", "default",
+                @["easy", "lessdifficult", "default", "harderpmcs",
+                  "veryhard", "deathwish"], category = "AI",
+                description = "Scales bot aggression across every role"),
+    stringSetting("forcePersonality", "Force personality", "", category = "AI",
+                  description = "Force every bot to one personality; empty means auto-assign by role"),
+    boolSetting("driveFromHostThread", "Drive from host thread", true,
+                category = "Advanced",
+                description = "Allow the driving calls from the host thread on a host whose main-thread drain never fired; false withholds them so bots decide but do not move"),
+    boolSetting("logDecisions", "Log decisions", false, category = "Advanced",
+                description = "Verbose per-bot decision logging")]
+
+proc onSainSettings(url, body, session: string): string =
+  result = declaredSchemaJson().text
+
 proc onLoad(): Status =
+  declareSettings(sainSchema())
+  discard serve("/aowlspt/settings/aowl.sain", onSainSettings)
   gPreset = loadPreset()
   if not gPreset.enabled:
     warn "sain: disabled in config.json"

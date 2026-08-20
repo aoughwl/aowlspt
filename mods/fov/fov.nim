@@ -215,6 +215,7 @@
 import aowlspt
 import aowlspt/game
 import aowlspt/server   # `setting` — configGet with a typed reader on top
+import aowlspt/settings # the F12 settings schema this mod declares
 import aowlspt/il2cpp   # the runtime's own C API, for signature checks
 import aowlspt/fast     # bind once, call in ~10 ns — docs/PERF.md
 import aowlspt/json     # reading the host's main-thread report
@@ -389,6 +390,67 @@ proc loadConfig() =
          $cfgMaxBaseFov & "); using 50..75 as upstream does"
     cfgMinBaseFov = 50
     cfgMaxBaseFov = 75
+
+# ---------------------------------------------------------------------------
+# The F12 settings schema
+# ---------------------------------------------------------------------------
+#
+# What loadConfig reads, declared so the in-game settings screen can draw a
+# control per key. `implemented` mirrors the module comment exactly: three
+# writes reach the game (the FOV multipliers, the FOV-scale fix, the
+# sensitivity table), and everything else is read, reported and carried but not
+# yet acted on — so it is declared `implemented = false` with the missing
+# capability named, rather than drawn as if it worked.
+
+proc fovSchema(): seq[Setting] =
+  result = @[
+    floatSetting("opticFovMulti", "Optic FOV multiplier", 1.0,
+                 lo = 0.1, hi = 2.0, step = 0.01, category = "FOV",
+                 description = "FOV scale while aiming a magnified sight"),
+    floatSetting("nonOpticFovMulti", "Non-optic FOV multiplier", 1.0,
+                 lo = 0.1, hi = 2.0, step = 0.01, category = "FOV",
+                 description = "FOV scale while aiming iron sights / reflex"),
+    boolSetting("enableFovScaleFix", "FOV scale fix", false, category = "FOV",
+                description = "Replace Player.CalculateScaleValueByFov with a constant"),
+    floatSetting("fovScale", "FOV scale value", 1.0, lo = 0.1, hi = 3.0,
+                 step = 0.01, category = "FOV"),
+    intSetting("maxBaseFov", "Max base FOV", 110, lo = 30, hi = 140,
+               category = "FOV", implemented = false,
+               description = "Read; the FOV-range slider patch is not expressible yet"),
+    intSetting("minBaseFov", "Min base FOV", 30, lo = 10, hi = 120,
+               category = "FOV", implemented = false,
+               description = "Read; the FOV-range slider patch is not expressible yet"),
+
+    boolSetting("changeMouseSensitivity", "Scale mouse sensitivity", true,
+                category = "Sensitivity",
+                description = "Replace get_GetCurrentSensitivity with a magnification lookup"),
+    floatSetting("oneSensMulti", "1x sensitivity", 0.75, lo = 0.0, hi = 2.0,
+                 step = 0.01, category = "Sensitivity"),
+    floatSetting("fourSensMulti", "4x sensitivity", 0.2, lo = 0.0, hi = 2.0,
+                 step = 0.01, category = "Sensitivity"),
+    floatSetting("highSensMulti", "High-mag sensitivity", 0.01, lo = 0.0,
+                 hi = 2.0, step = 0.001, category = "Sensitivity"),
+
+    keybindSetting("zoomToggleKey", "Toggle-zoom key", "M",
+                   category = "Toggle zoom", implemented = false,
+                   description = "Read; needs KeyCode-enum name mapping, not yet expressible"),
+    boolSetting("holdToZoom", "Hold to zoom", true, category = "Toggle zoom",
+                implemented = false, description = "Read; toggle-zoom is not wired yet"),
+
+    floatSetting("rifleCameraZOffset", "Rifle camera Z offset", 0.025,
+                 lo = -0.2, hi = 0.2, step = 0.005, category = "Camera",
+                 implemented = false,
+                 description = "Read; the camera-offset write is not expressible yet"),
+    floatSetting("rifleAimSpeedZ", "Rifle aim speed Z", 3.0, lo = 0.0, hi = 10.0,
+                 step = 0.1, category = "Camera", implemented = false,
+                 description = "Read; the aim-speed write is not expressible yet"),
+
+    boolSetting("verifyHooks", "Verify hooks at load", true, category = "Advanced",
+                description = "Assert each detour bound before trusting it")]
+
+proc onFovSettings(url, body, session: string): string =
+  ## The declared schema with current values folded in, for the settings UI.
+  result = declaredSchemaJson().text
 
 # ---------------------------------------------------------------------------
 # The magnification -> sensitivity table
@@ -1979,6 +2041,8 @@ var gElapsedMs = 0'i64
 
 proc onLoad(): Status =
   loadConfig()
+  declareSettings(fovSchema())
+  discard serve("/aowlspt/settings/" & ModGuid, onFovSettings)
   success ModName & " " & ModVersion & " loaded on " & hostName()
   if side() == sideSim:
     return simSelfTest()

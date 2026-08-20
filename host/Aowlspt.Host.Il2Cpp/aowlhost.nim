@@ -3154,8 +3154,13 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # for it. A failure is a warning: a host that loses its overlay still runs
   # every mod, and a game that will not start because a panel would not draw is
   # a worse trade than no panel.
-  if overlayStart(VkInsert, int32(readBackendPort())):
-    okLog "overlay ready (Insert toggles it)"
+  # F12 opens the in-game settings panel (the revamped settings screen), matching
+  # the BepInEx/SPT muscle memory where F12 opened the mod-config manager. The
+  # panel is the D3D11 Present overlay — the one injection technique proven stable
+  # on this client (static byte-patch / hand-drawn overlay), rather than the
+  # crash-prone live-managed IL2CPP settings UI. See the F12 spike notes.
+  if overlayStart(VkF12, int32(readBackendPort())):
+    okLog "overlay ready (F12 opens settings)"
     for i in 0 ..< modhost.modCount():
       if modhost.modIsLive(i):
         overlaySetMod(modhost.modGuidOf(i), modhost.modNameOf(i),

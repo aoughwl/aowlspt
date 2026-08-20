@@ -174,6 +174,7 @@
 import std/strutils
 import aowlspt
 import aowlspt/server
+import aowlspt/settings # the F12 settings schema this mod declares
 import aowlspt/json
 import bd/data
 import bd/dbpath
@@ -588,9 +589,35 @@ proc onLoadClient(): Status =
          "the binary."
   Ok
 
+# ---------------------------------------------------------------------------
+# The F12 settings schema
+# ---------------------------------------------------------------------------
+#
+# The flat top-level scalar keys this mod reads through `setting()`. The
+# `debug`, `hostility` and `spawns` objects are read whole out of their raw text
+# rather than as scalar controls, so their nested members are not declared here.
+
+proc blackDivisionSchema(): seq[Setting] =
+  result = @[
+    boolSetting("achievements", "Load achievements", true, category = "Faction",
+                description = "Load the three hidden kill-count achievements and their locale strings"),
+    boolSetting("armoryLoadouts", "WTT-Armory loadouts", false,
+                category = "Faction",
+                description = "Swap the assault role onto the WTT-Armory weapon pool; requires WTT-Armory installed"),
+    boolSetting("csGasGrenades", "CS-gas grenades", false, category = "Faction",
+                description = "Give the raiders a CS-gas canister; requires the Manimal CS-gas mod"),
+    intSetting("watchIntervalMs", "Watch interval (ms)", 5000,
+               lo = 500, hi = 60000, step = 500, category = "Watch",
+               description = "How often the client half looks for the squad; read-only, floored at 500")]
+
+proc onBlackDivisionSettings(url, body, session: string): string =
+  result = declaredSchemaJson().text
+
 proc onLoadServer(): Status =
   seedRandom(nowMs())
   readConfig()
+  declareSettings(blackDivisionSchema())
+  discard serve("/aowlspt/settings/" & ModGuid, onBlackDivisionSettings)
   discard onEvent("morebots.ready", onMorebotsReady)
   discard onEvent("tarkov.raid.ended", onRaidEnded)
   info "blackdivision " & ModVersion & " loaded, waiting for morebots (" &

@@ -35,6 +35,7 @@
 import std/strutils
 import aowlspt
 import aowlspt/server
+import aowlspt/settings # the F12 settings schema this emulator declares
 import aowlspt/json
 import emu/ids
 import emu/profile
@@ -2444,6 +2445,76 @@ proc registerRoutes() =
   discard serve("/client/builds/magazine/save", onBuildMagazine)
   discard serve("/client/builds/delete", onBuildDelete)
 
+# ---------------------------------------------------------------------------
+# The F12 settings schema
+# ---------------------------------------------------------------------------
+#
+# The emulator's own settings page. Every key here is read by the emulator at
+# load (in `onLoad` below) or by an `emu/*` module through `setting()` -- the
+# loot keys in `emu/loot`, the skill caps in `emu/skills`. All drive the
+# emulator's behaviour, so all are declared implemented.
+
+proc tarkovSchema(): seq[Setting] =
+  result = @[
+    enumSetting("edition", "Game edition", "standard",
+                @["standard", "left-behind", "prepare-for-escape",
+                  "edge-of-darkness", "unheard"], category = "Emulator",
+                description = "Starting edition applied to a fresh profile"),
+    enumSetting("defaultSide", "Default side", "Usec", @["Usec", "Bear"],
+                category = "Emulator"),
+    intSetting("startingRoubles", "Starting roubles", 500000,
+               lo = 0, hi = 100000000, step = 1000, category = "Emulator"),
+    intSetting("epochBase", "Epoch base (seconds)", 1700000000,
+               category = "Emulator",
+               description = "The Unix time the emulator's clock starts from"),
+
+    intSetting("insurancePercent", "Insurance return chance (%)", 10,
+               lo = 0, hi = 100, category = "Insurance"),
+    intSetting("insuranceReturnHours", "Insurance return delay (hours)", 24,
+               lo = 0, hi = 168, category = "Insurance"),
+
+    intSetting("scavCooldownSeconds", "Scav cooldown (seconds)", 900,
+               lo = 0, hi = 86400, step = 60, category = "Scav"),
+    floatSetting("fenceKarmaOnScavExtract", "Fence karma on scav extract", 0.01,
+                 lo = -1.0, hi = 1.0, step = 0.01, category = "Scav"),
+    floatSetting("fenceKarmaOnScavDeath", "Fence karma on scav death", 0.0,
+                 lo = -1.0, hi = 1.0, step = 0.01, category = "Scav"),
+
+    intSetting("defaultBotLimit", "Default bot limit", 30, lo = 0, hi = 200,
+               category = "Bots",
+               description = "Bot limit for a map the database says nothing about"),
+
+    intSetting("mailKeepHours", "Mail keep (hours)", 72, lo = 0, hi = 8760,
+               category = "Mail",
+               description = "Inbox age bound; 0 or below keeps the whole history"),
+    intSetting("mailKeepCollected", "Keep collected mail", 1, lo = 0, hi = 1,
+               category = "Mail"),
+
+    intSetting("fleaSpreadPercent", "Flea price spread (%)", 20, lo = 0, hi = 100,
+               category = "Flea Market"),
+    intSetting("fleaOfferHours", "Flea offer duration (hours)", 12,
+               lo = 1, hi = 168, category = "Flea Market"),
+    intSetting("fleaMaxOffers", "Flea max offers", 600, lo = 1, hi = 10000,
+               category = "Flea Market"),
+    intSetting("fleaSaleMinutes", "Flea sale time (minutes)", 30, lo = 0,
+               hi = 1440, category = "Flea Market"),
+
+    boolSetting("lootEnabled", "Loot enabled", true, category = "Loot"),
+    floatSetting("staticLootMultiplier", "Static loot multiplier", 1.0,
+                 lo = 0.0, hi = 10.0, step = 0.1, category = "Loot"),
+    floatSetting("looseLootMultiplier", "Loose loot multiplier", 1.0,
+                 lo = 0.0, hi = 10.0, step = 0.1, category = "Loot"),
+    intSetting("maxLootItems", "Max loot items", 20000, lo = 0, hi = 200000,
+               step = 1000, category = "Loot"),
+
+    floatSetting("skillMaxPerRaid", "Skill max per raid", 100.0, lo = 0.0,
+                 hi = 1000.0, step = 1.0, category = "Skills"),
+    intSetting("masteringMaxPerRaid", "Mastering max per raid", 100, lo = 0,
+               hi = 1000, category = "Skills")]
+
+proc onTarkovSettings(url, body, session: string): string =
+  result = declaredSchemaJson().text
+
 proc onLoad(): Status =
   if side() != sideServer:
     info "the emulator is a server mod; nothing to do on this side"
@@ -2473,6 +2544,11 @@ proc onLoad(): Status =
                   setting("fleaOfferHours").asInt(12),
                   setting("fleaMaxOffers").asInt(600),
                   setting("fleaSaleMinutes").asInt(30))
+
+  # The emulator's own settings page, registered before the store gate below so
+  # it answers even on a host where the emulator refuses to serve anything else.
+  declareSettings(tarkovSchema())
+  discard serve("/aowlspt/settings/" & ModGuid, onTarkovSettings)
 
   if not storeReady():
     error "this host has no persistent store; profiles cannot be kept " &
