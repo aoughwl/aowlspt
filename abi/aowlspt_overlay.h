@@ -113,6 +113,14 @@
 #include <stdarg.h>
 
 #include "aowlspt_detour.h"
+#include "aowlspt_admin.h"   /* the admin/cheat HUD's shared-memory surface */
+
+/* The admin/cheat HUD's shared region, mapped in `aowl_ov_start`. NULL until
+ * then, and NULL forever if the OS refuses the mapping -- in which case every
+ * admin draw below is a no-op and the game is untouched. The mod (mods/admin)
+ * maps the same region by name and publishes the projected ESP frame + toggles
+ * into it; this file only reads it and draws. */
+static AowlAdminShared* g_ov_admin = NULL;
 
 /* ================================================================== *
  * Public surface
@@ -5202,6 +5210,26 @@ static LRESULT CALLBACK aowl_ov_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
             InterlockedExchange(&g_ov.visible, g_ov.visible ? 0 : 1);
             return 0;                       /* swallowed: never reaches the game */
         }
+        /* The admin HUD's own keys, handled outside the panel's `visible` block
+         * because the HUD is independent of the mod-manager panel. F6 toggles
+         * the menu whether or not the panel is up; the navigation keys are
+         * swallowed only while the menu is open, so gameplay keys reach the game
+         * the rest of the time. */
+        if ((int32_t)wp == VK_F6) {
+            aowl_admin_menu_toggle(g_ov_admin);
+            return 0;
+        }
+        if (g_ov_admin && aowl_admin_menu_open(g_ov_admin)) {
+            switch ((int32_t)wp) {
+                case VK_UP:    aowl_admin_menu_move(g_ov_admin, -1); return 0;
+                case VK_DOWN:  aowl_admin_menu_move(g_ov_admin, +1); return 0;
+                case VK_RETURN:
+                case VK_SPACE:
+                case VK_LEFT:
+                case VK_RIGHT: aowl_admin_menu_activate(g_ov_admin); return 0;
+                case VK_ESCAPE: aowl_admin_menu_toggle(g_ov_admin); return 0;
+            }
+        }
     }
 
     if (g_ov.visible) {
@@ -5364,6 +5392,119 @@ static int32_t aowl_ov_bind(IDXGISwapChain* sc) {
     return 1;
 }
 
+/* ================================================================== *
+ * The admin / cheat HUD
+ *
+ * A HUD drawn on the game's own frame, inside this same Present hook, from the
+ * shared region the mod publishes. It is NOT the mod-manager panel above -- it
+ * has no backend, no rows, no keyboard-driven list -- it is ESP boxes and a
+ * small F6 toggle menu, the standard shape of an in-game cheat overlay. It
+ * reuses the overlay's proven D3D11 pipeline and 8x16 font rather than standing
+ * up a second one, because a HUD and a panel want exactly the same primitives.
+ *
+ * Everything here is read-only against the shared region and bounded, and every
+ * entry is guarded on `g_ov_admin` being mapped, so an absent or stale producer
+ * is a HUD that draws nothing rather than a fault.
+ * ================================================================== */
+
+static uint32_t aowl_ov_admin_side_col(int32_t side) {
+    switch (side) {
+        case AOWL_ADM_SIDE_FRIEND: return AOWL_RGBA(90, 175, 110, 255);
+        case AOWL_ADM_SIDE_ENEMY:  return AOWL_RGBA(224, 92, 92, 255);
+        case AOWL_ADM_SIDE_SCAV:   return AOWL_RGBA(224, 184, 80, 255);
+        case AOWL_ADM_SIDE_BOSS:   return AOWL_RGBA(230, 120, 220, 255);
+        default:                   return AOWL_RGBA(210, 214, 220, 255);
+    }
+}
+
+/* Whether the HUD wants to draw this frame: the menu is open, or ESP is on and
+ * the mod says it is in a raid. Cheap, so it gates the whole build path in
+ * Present without measuring anything. */
+static int32_t aowl_ov_admin_active(void) {
+    if (!g_ov_admin || g_ov_admin->magic != AOWL_ADM_MAGIC) return 0;
+    if (aowl_admin_menu_open(g_ov_admin)) return 1;
+    if (aowl_admin_toggle_get(g_ov_admin, AOWL_ADM_ESP) && g_ov_admin->inRaid)
+        return 1;
+    return 0;
+}
+
+/* The consumer's stable copy of the frame, taken under the seqlock. Static
+ * because the render thread is the only reader and a per-frame stack copy of a
+ * 256-entity frame is a needless 10 KB memmove on the stack. */
+static AowlAdminShared g_ovAdminSnap;
+
+/* Append the HUD's geometry into the overlay's vertex scratch, to be flushed by
+ * the one `aowl_ov_draw` the Present body already issues. ESP is drawn in true
+ * back-buffer pixels (scale forced to 1, since the mod already projected to
+ * pixels); the menu is drawn at the panel's integer scale so its text is legible
+ * at 4K. */
+static void aowl_ov_admin_append(void) {
+    if (!g_ov_admin || g_ov_admin->magic != AOWL_ADM_MAGIC) return;
+    int32_t savedScale = g_ov.scale;
+
+    /* ---- ESP boxes, in true pixels ---- */
+    if (aowl_admin_toggle_get(g_ov_admin, AOWL_ADM_ESP) && g_ov_admin->inRaid) {
+        if (aowl_admin_snapshot(g_ov_admin, &g_ovAdminSnap)) {
+            g_ov.scale = 1;
+            for (int32_t i = 0; i < g_ovAdminSnap.count; i++) {
+                AowlAdminEntity* e = &g_ovAdminSnap.ents[i];
+                if (!(e->flags & AOWL_ADM_F_ONSCREEN)) continue;
+                float h = e->bottom - e->top;
+                if (h < 2.0f || h > (float)g_ov.bbH) continue;
+                float w = h * 0.42f;
+                float l = e->cx - w * 0.5f;
+                uint32_t col = aowl_ov_admin_side_col(e->side);
+                aowl_ov_frame_rect(l, e->top, w, h, 1.0f, col);
+                /* Health bar down the left edge, when the mod could read it. */
+                if (e->maxHealth > 0.0f && e->health >= 0.0f) {
+                    float frac = e->health / e->maxHealth;
+                    if (frac < 0.0f) frac = 0.0f;
+                    if (frac > 1.0f) frac = 1.0f;
+                    float bh = h * frac;
+                    aowl_ov_rect(l - 4.0f, e->top, 2.0f, h, AOWL_RGBA(30, 30, 30, 200));
+                    aowl_ov_rect(l - 4.0f, e->top + (h - bh), 2.0f, bh,
+                                 AOWL_RGBA(80, 200, 110, 255));
+                }
+                /* Distance under the feet. */
+                {
+                    char db[24];
+                    _snprintf(db, sizeof(db), "%dm", (int)e->distance);
+                    db[sizeof(db) - 1] = 0;
+                    aowl_ov_text(l, e->bottom + 2.0f, db, col);
+                }
+                if (e->name[0])
+                    aowl_ov_text(l, e->top - (float)AOWL_OV_CH - 1.0f, e->name, col);
+            }
+        }
+    }
+
+    /* ---- The F6 menu, at panel scale ---- */
+    if (aowl_admin_menu_open(g_ov_admin)) {
+        g_ov.scale = (g_ov.bbH >= 2500) ? 3 : (g_ov.bbH >= 1300) ? 2 : 1;
+        float rowH = (float)AOWL_OV_CH + 5.0f;
+        float mw = 250.0f;
+        float mx = 18.0f, my = 70.0f;
+        float mh = rowH * (float)(AOWL_ADM_COUNT + 2) + 8.0f;
+        aowl_ov_rect(mx, my, mw, mh, AOWL_OV_BG);
+        aowl_ov_frame_rect(mx, my, mw, mh, 1.0f, AOWL_OV_EDGE);
+        aowl_ov_text(mx + 8.0f, my + 6.0f, "ADMIN  (F6)", AOWL_OV_ACCENT);
+        for (int32_t i = 0; i < AOWL_ADM_COUNT; i++) {
+            float ry = my + rowH * (float)(i + 1) + 6.0f;
+            if (i == (int32_t)g_ov_admin->menuSel)
+                aowl_ov_rect(mx + 2.0f, ry - 1.0f, mw - 4.0f, rowH, AOWL_OV_SELBG);
+            uint32_t col; const char* st;
+            if (!aowl_admin_capable(g_ov_admin, i)) { col = AOWL_OV_DIM; st = "n/a"; }
+            else if (aowl_admin_toggle_get(g_ov_admin, i)) { col = AOWL_OV_ON; st = "ON"; }
+            else { col = AOWL_OV_OFF; st = "off"; }
+            aowl_ov_text(mx + 10.0f, ry + 2.0f, aowl_admin_mode_name(i), AOWL_OV_TEXT);
+            aowl_ov_text(mx + mw - 44.0f, ry + 2.0f, st, col);
+        }
+    }
+
+    g_ov.scale = savedScale;
+    g_ov.needUpload = 1;   /* the vertex buffer changed, so it must re-upload   */
+}
+
 static HRESULT STDMETHODCALLTYPE aowl_ov_present(IDXGISwapChain* sc, UINT sync,
                                                  UINT flags) {
     AowlPresentFn orig = (AowlPresentFn)g_ov.presentOrig;
@@ -5397,7 +5538,13 @@ static HRESULT STDMETHODCALLTYPE aowl_ov_present(IDXGISwapChain* sc, UINT sync,
          * the API path reset would be right for the one caller nobody uses. */
         if (g_ov.visible && !g_ov.wasVisible) g_ov.openDrawn = 0;
         g_ov.wasVisible = g_ov.visible;
-        if (aowl_ov_bind(sc) && g_ov.visible) {
+        int32_t adminOn = aowl_ov_admin_active();
+        /* Tell the mod the resolution it must project to, every frame the swap
+         * chain is bound, so its screen coordinates match this back buffer even
+         * across a resize. */
+        if (g_ov_admin && aowl_ov_bind(sc))
+            aowl_admin_set_screen(g_ov_admin, (int32_t)g_ov.bbW, (int32_t)g_ov.bbH);
+        if (aowl_ov_bind(sc) && (g_ov.visible || adminOn)) {
             /* What one frame of this costs, measured rather than asserted. The
              * overlay is drawn inside the present loop of a game people play
              * competitively, so "it is cheap" is a claim that has to have a
@@ -5408,7 +5555,20 @@ static HRESULT STDMETHODCALLTYPE aowl_ov_present(IDXGISwapChain* sc, UINT sync,
              * split behind it. */
             LARGE_INTEGER t0, tb, t1;
             QueryPerformanceCounter(&t0);
-            aowl_ov_build();
+            /* The manager panel builds only when it is visible. The admin HUD
+             * is independent: it draws when the F6 menu is open or ESP is live,
+             * whether or not the panel is up. When both are on, the geometry
+             * cache is defeated (drawSig = 0) so the per-frame ESP is not held
+             * back by the panel's "nothing changed" fast path. */
+            if (g_ov.visible) {
+                if (adminOn) g_ov.drawSig = 0;
+                aowl_ov_build();
+            } else {
+                g_ov.vtxCount = 0;
+                g_ov.scale = (g_ov.bbH >= 2500) ? 3 : (g_ov.bbH >= 1300) ? 2 : 1;
+                g_ov.needUpload = 1;
+            }
+            if (adminOn) aowl_ov_admin_append();
             QueryPerformanceCounter(&tb);
             aowl_ov_draw(sc);
             QueryPerformanceCounter(&t1);
@@ -5594,6 +5754,10 @@ static int32_t aowl_ov_start(int32_t toggleVk, int32_t backendPort) {
      * it or it would come up already dead. */
     InterlockedExchange(&g_ov.broken, 0);
     InitializeCriticalSection(&g_ov.cs);
+    /* Map the admin/cheat HUD's shared region. Failure is not fatal: a NULL
+     * pointer makes every admin draw a no-op, so a host with no admin mod loaded
+     * simply has an overlay with no HUD. */
+    if (!g_ov_admin) g_ov_admin = aowl_admin_map();
     g_ov.toggleVk = toggleVk ? toggleVk : VK_INSERT;
     g_ov.backendPort = backendPort;
     QueryPerformanceFrequency(&g_ov.qpcFreq);
