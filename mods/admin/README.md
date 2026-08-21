@@ -60,33 +60,46 @@ Present hook, independent of the mod-manager panel's visibility:
 Verified to compile via the D3D11 test stand-in (`tests/overlayhost`), which is
 how the repo tests `aowlspt_overlay.h`.
 
-### The data path (field-offset framework; offsets are the live-iteration part)
+### The data path (real, verified names for build 1.1.0.1.46777)
 
-`adm/data.nim` walks the world by field offset only: the GameWorld singleton (a
-static field, read via `staticFieldData` + offset with no class-ctor run), its
-player list (`List<T>` `_items`/`_size` + the il2cpp array element base — ABI
-constants), each player's position / side / AI flag, and the camera's
-view-projection matrix. It projects each player and publishes the boxes.
+`adm/data.nim` walks the world by field offset only, and the names it uses were
+**verified against the decrypted global-metadata** for this exact build with
+`tools/il2cpp_resolve.py` (the resolver that reproduces the BE-bypass RVAs
+byte-for-byte) plus a field dumper over the same metadata. Offsets still resolve
+*by name* at runtime, so a mismatch degrades rather than misreads.
 
-**The offsets/field names are the live-iteration parameters.** They resolve *by
-name* through reflection (a correct name → the right offset for this build), and
-every one degrades to "unavailable" on a miss: ESP shows nothing, God mode is
-off, the menu still opens. The names are the pre-1.0 surface and unconfirmed
-against build 46777 — the metadata dump (or a live probe) fills them in one
-place, the `const` block at the top of `adm/data.nim`:
+Confirmed and wired:
 
-| parameter | current | meaning |
+| member | verified name | use |
 |---|---|---|
-| `SingletonClass`/`SingletonField` | `EFT.GameWorld` / `Instance` | the GameWorld singleton static field |
-| `PlayersField` | `RegisteredPlayers` | the world's player list |
-| `PosField`/`SideField`/`IsAiField` | `Position`/`Side`/`IsAI` | per-player fields |
-| `VpMatrixField` | *(empty)* | the camera view-projection matrix source — **required for boxes to project** |
-| `GodHealthField` | *(empty)* | the health float God mode pins each frame |
-| `StaminaField` | *(empty)* | the stamina float to pin |
+| `EFT.GameWorld` | `RegisteredPlayers` / `AllAlivePlayersList` (List<>), `MainPlayer` | the player walk |
+| `EFT.Player` | `<CameraPosition>k__BackingField` (Vector3), `<AIData>k__BackingField`, `Physical`, `_healthController` | position, AI flag, stamina, health |
+| `Stamina` | `Current`, `TotalCapacity` | infinite stamina |
+| `EFT.CameraControl.CameraManager` | static `instance`, `<Camera>k__BackingField` | the camera |
+| `EFT.Player::ApplyDamageInfo` | RVA `0x731480` (prologue `48 89 5C 24 20 …`) | God mode byte-patch |
+| `EFT.Player::ReceiveDamage` | RVA `0x6F8D10` | alt God mode target |
 
-Empty = unresolved, so on an un-dumped build the menu opens and every mode reads
-"unavailable" or (for ESP) shows no boxes until `VpMatrixField` and the player
-fields are confirmed. That is the safe-by-default contract.
+**What works now, and the two documented gates:**
+
+- **God mode — works.** A revertible static byte-patch on `ApplyDamageInfo`
+  (`xor eax,eax; ret`), resolved by RVA, applied from any thread with no world
+  needed. It is *global* (all players take no damage — the local player is the
+  point, bots are a side effect); a player-scoped version needs the
+  health-controller body-part layout. Reverted on unload.
+- **ESP data + stamina — real names, gated on two runtime-resolution steps** that
+  degrade safely (ESP dark, never a crash):
+  1. **The GameWorld singleton** lives in `Comfort.Common.Singleton<GameWorld>.
+     _instance` — a static on a *generic instantiation*, which `findClass`
+     cannot name. Acquiring it needs the generics API or the bridge's
+     Unity-thread reflection. Until then there is no player list.
+  2. **The camera VP matrix** — `UnityEngine.Camera` has no managed matrix field;
+     it is read from the native camera (managed `Camera` + `0x10` → native, then
+     `+ VpNativeOff`). `VpNativeOff` is the one UnityPlayer-side offset not in
+     il2cpp metadata, validated at runtime (finite, bounded) so a wrong value is
+     rejected, not drawn. Set it from a UnityPlayer dump / in-raid scan.
+
+  Both gates are one-line `const` edits at the top of `adm/data.nim`; when they
+  land, ESP boxes project with no other change.
 
 ## Safety guards
 

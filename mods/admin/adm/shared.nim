@@ -67,6 +67,9 @@ proc cProject(m: ptr cfloat; x, y, z: cfloat; w, h: int32;
               sx, sy: ptr cfloat): int32 {.importc: "aowl_admin_project", nodecl.}
 proc cMatMul(a, b, outp: ptr cfloat) {.importc: "aowl_admin_mat_mul", nodecl.}
 
+proc cGodmode(on: int32; rva: uint32): int32 {.importc: "aowl_admin_godmode", nodecl.}
+proc cGodOn(): int32 {.importc: "aowl_admin_god_is_on", nodecl.}
+proc cGameAsm(): int32 {.importc: "aowl_admin_gameasm_present", nodecl.}
 proc cGetW(s: AdminRegion): int32 {.importc: "aowl_admin_get_w", nodecl.}
 proc cGetH(s: AdminRegion): int32 {.importc: "aowl_admin_get_h", nodecl.}
 proc cRp(o: pointer; off: int32): pointer {.importc: "aowl_admin_rp", nodecl.}
@@ -117,6 +120,13 @@ proc frameAdd*(s: AdminRegion; cx, top, bottom, health, maxHealth, distance: flo
 
 proc frameCommit*(s: AdminRegion) =
   if s != nil: cFrameCommit(s)
+
+proc godmodePatch*(on: bool; rva: uint32): bool =
+  ## Apply (or revert) the God mode byte-patch on the damage function at `rva`.
+  ## Returns whether the patch is now in the requested state.
+  cGodmode((if on: 1'i32 else: 0'i32), rva) != 0'i32
+proc godmodeIsOn*(): bool = cGodOn() != 0'i32
+proc gameAssemblyPresent*(): bool = cGameAsm() != 0'i32
 
 proc hudWidth*(s: AdminRegion): int =
   ## The back-buffer width the overlay last drew at, or 0 before the first frame.

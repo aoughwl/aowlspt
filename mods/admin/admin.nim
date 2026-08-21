@@ -164,11 +164,13 @@ proc onUpdate(elapsedMs: int64): Status =
 
   collectAndPublish(gRegion, cfgEspMaxDistance, w, h)
 
-  if toggleOn(gRegion, admGodmode): applyGodmode()
+  # God mode is a static byte-patch, applied/reverted to match the toggle (the
+  # call is idempotent, so running it every frame just holds the state).
+  setGodmode(toggleOn(gRegion, admGodmode))
   if toggleOn(gRegion, admStamina): applyStamina()
 
   publishCapability()
-  setStatus(gRegion, dataStatus())
+  setStatus(gRegion, dataStatus() & "  " & godStatus())
 
   if not gReported and gTick > 200:
     gReported = true
@@ -200,8 +202,10 @@ proc onLoad(): Status =
   result = Ok
 
 proc onUnload(): Status =
-  ## The shared region is a file mapping shared with the overlay; it is left
-  ## mapped (the overlay may still be drawing). Toggles simply stop being read.
+  ## Revert the God mode patch so unloading the mod restores the game's own
+  ## damage code. The shared region is a file mapping shared with the overlay; it
+  ## is left mapped (the overlay may still be drawing).
+  setGodmode(false)
   result = Ok
 
 exportMod(

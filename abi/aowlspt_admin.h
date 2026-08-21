@@ -367,6 +367,56 @@ static void aowl_admin_wf(void* o, int32_t off, float v) {
 }
 
 /* ------------------------------------------------------------------ *
+ * God mode: a revertible static byte-patch on the damage function's native
+ * code, resolved by RVA (the BE-bypass technique). No managed call, no Unity
+ * thread. The RVA comes from tools/il2cpp_resolve.py against this build; the
+ * patch overwrites the prologue with `xor eax,eax ; ret` so the method returns
+ * 0/void immediately, and restores the saved bytes when God mode is turned off.
+ *
+ * NOTE this is GLOBAL -- it neuters the damage applier for every player, so the
+ * local player takes no damage (the point) and so do bots (a side effect). A
+ * player-scoped version needs the health-controller body-part layout; this is
+ * the reliable, coordinator-endorsed option that works from any thread today.
+ * ------------------------------------------------------------------ */
+
+static unsigned char aowl_admin_god_saved[3];
+static int32_t       aowl_admin_god_patched = 0;
+
+static int32_t aowl_admin_godmode(int32_t on, uint32_t rva) {
+    HMODULE ga = GetModuleHandleA("GameAssembly.dll");
+    if (!ga || rva == 0) return 0;
+    unsigned char* p = (unsigned char*)ga + rva;
+    static const unsigned char patch[3] = { 0x31, 0xC0, 0xC3 }; /* xor eax,eax;ret */
+    DWORD old = 0;
+    if (on && !aowl_admin_god_patched) {
+        /* Refuse if the site does not look like a real prologue (already
+         * patched, or a wrong RVA on a future build): first byte 0x48/0x40/etc. */
+        if (p[0] == 0x31) { aowl_admin_god_patched = 1; return 1; }
+        if (!(p[0] == 0x48 || p[0] == 0x40 || p[0] == 0x53 || p[0] == 0x55 ||
+              p[0] == 0x56 || p[0] == 0x57)) return 0;
+        if (!VirtualProtect(p, 3, PAGE_EXECUTE_READWRITE, &old)) return 0;
+        memcpy(aowl_admin_god_saved, p, 3);
+        memcpy(p, patch, 3);
+        VirtualProtect(p, 3, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), p, 3);
+        aowl_admin_god_patched = 1;
+        return 1;
+    } else if (!on && aowl_admin_god_patched) {
+        if (!VirtualProtect(p, 3, PAGE_EXECUTE_READWRITE, &old)) return 0;
+        memcpy(p, aowl_admin_god_saved, 3);
+        VirtualProtect(p, 3, old, &old);
+        FlushInstructionCache(GetCurrentProcess(), p, 3);
+        aowl_admin_god_patched = 0;
+        return 1;
+    }
+    return aowl_admin_god_patched;
+}
+static int32_t aowl_admin_god_is_on(void) { return aowl_admin_god_patched; }
+static int32_t aowl_admin_gameasm_present(void) {
+    return GetModuleHandleA("GameAssembly.dll") ? 1 : 0;
+}
+
+/* ------------------------------------------------------------------ *
  * Projection helpers, runnable either side. `m` is a Unity Matrix4x4 product
  * (projection * worldToCamera) in column-major order: element (row r, col c) is
  * m[c*4 + r]. clip = M*(x,y,z,1); in front of the camera when clip.w > 0.
