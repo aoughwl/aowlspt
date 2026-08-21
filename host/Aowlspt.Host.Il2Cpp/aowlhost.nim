@@ -3873,20 +3873,24 @@ proc reportRuntime() =
          ", OnRequestRestart seen=" & $cBecRestartSeen &
          "); offsets may not match this client build"
 
-  # Exit-hang fix: with no BsgLauncher, the menu Exit blocks forever on the
-  # launcher handoff. Redirect ExitApplication to a clean ExitProcess(0) (a
-  # static .text byte patch, same discipline as the BE neuter above). Fail-safe:
-  # if the prologue does not match this build, nothing is written.
-  if cUxExitNeuter() != 0'i32:
-    okLog "exit fix: menu Exit redirected to ExitProcess(0) (was hanging on the " &
-          "absent-launcher handshake)"
+  # Exit-hang fix: with no BsgLauncher, confirming Exit spins forever on an
+  # exit-loading screen (the async shutdown started at the confirm-accept lambda
+  # never completes). Redirect the confirm-accept lambda (primary) and
+  # ExitApplication (backstop) to a clean ExitProcess(0) -- static .text byte
+  # patches, same discipline as the BE neuter above, firing before the async
+  # work. Fail-safe: a site whose prologue does not match this build is skipped.
+  let exitLanded = cUxExitNeuter()
+  if exitLanded >= 1'i32:
+    okLog "exit fix: confirmed Exit redirected to ExitProcess(0) (" &
+          $exitLanded & "/2 sites; primary = the confirm-accept lambda, before " &
+          "the async exit-loading shutdown that was hanging)"
   elif cUxBaseFound == 0:
     warn "exit fix: GameAssembly.dll not found; Exit still hangs"
   elif cUxExitSeen == 0:
-    warn "exit fix: ExitApplication prologue did not match this build; " &
-         "Exit not patched (Exit still hangs, nothing worse)"
+    warn "exit fix: no exit prologue matched this build; Exit not patched " &
+         "(Exit still hangs, nothing worse)"
   else:
-    warn "exit fix: ExitApplication prologue matched but the patch write failed"
+    warn "exit fix: an exit prologue matched but the patch write failed"
 
   var count = 0
   let assemblies = domainGetAssemblies(gRt, gDomain, count)
