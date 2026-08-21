@@ -382,6 +382,16 @@ static void aowl_admin_wf(void* o, int32_t off, float v) {
 static unsigned char aowl_admin_god_saved[3];
 static int32_t       aowl_admin_god_patched = 0;
 
+/* The EXACT prologue bytes `ApplyDamageInfo` opens with on build 1.1.0.1.46777,
+ * verified against the real D:/Games/Tarkov/GameAssembly.dll:
+ *   48 89 5C 24 20   mov [rsp+0x20], rbx
+ * The patch overwrites the first three (48 89 5C) with `xor eax,eax; ret`; the
+ * trailing 24 20 are unreachable after the ret. If the live bytes are NOT this
+ * exact sequence, the RVA is wrong for this client and the patch is REFUSED --
+ * writing anyway would corrupt whatever code is really there, which is exactly
+ * the boot crash this guard exists to prevent. */
+static const unsigned char AOWL_ADMIN_GOD_EXPECT[5] = { 0x48, 0x89, 0x5C, 0x24, 0x20 };
+
 static int32_t aowl_admin_godmode(int32_t on, uint32_t rva) {
     HMODULE ga = GetModuleHandleA("GameAssembly.dll");
     if (!ga || rva == 0) return 0;
@@ -389,11 +399,17 @@ static int32_t aowl_admin_godmode(int32_t on, uint32_t rva) {
     static const unsigned char patch[3] = { 0x31, 0xC0, 0xC3 }; /* xor eax,eax;ret */
     DWORD old = 0;
     if (on && !aowl_admin_god_patched) {
-        /* Refuse if the site does not look like a real prologue (already
-         * patched, or a wrong RVA on a future build): first byte 0x48/0x40/etc. */
-        if (p[0] == 0x31) { aowl_admin_god_patched = 1; return 1; }
-        if (!(p[0] == 0x48 || p[0] == 0x40 || p[0] == 0x53 || p[0] == 0x55 ||
-              p[0] == 0x56 || p[0] == 0x57)) return 0;
+        /* Never dereference the target without checking the page is mapped and
+         * readable first -- a wrong module base or a not-yet-mapped section is a
+         * fault otherwise. */
+        if (!aowl_admin_readable(p, 8)) return 0;
+        /* Already patched (a previous session left it) -- treat as done. */
+        if (p[0] == 0x31 && p[1] == 0xC0 && p[2] == 0xC3) {
+            aowl_admin_god_patched = 1; return 1;
+        }
+        /* Byte-verify the EXACT prologue before writing. A mismatch means the
+         * RVA is not `ApplyDamageInfo` on this build: refuse rather than corrupt. */
+        if (memcmp(p, AOWL_ADMIN_GOD_EXPECT, 5) != 0) return 0;
         if (!VirtualProtect(p, 3, PAGE_EXECUTE_READWRITE, &old)) return 0;
         memcpy(aowl_admin_god_saved, p, 3);
         memcpy(p, patch, 3);
@@ -402,6 +418,7 @@ static int32_t aowl_admin_godmode(int32_t on, uint32_t rva) {
         aowl_admin_god_patched = 1;
         return 1;
     } else if (!on && aowl_admin_god_patched) {
+        if (!aowl_admin_readable(p, 8)) { aowl_admin_god_patched = 0; return 0; }
         if (!VirtualProtect(p, 3, PAGE_EXECUTE_READWRITE, &old)) return 0;
         memcpy(p, aowl_admin_god_saved, 3);
         VirtualProtect(p, 3, old, &old);

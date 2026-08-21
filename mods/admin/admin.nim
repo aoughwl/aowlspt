@@ -164,10 +164,17 @@ proc onUpdate(elapsedMs: int64): Status =
 
   collectAndPublish(gRegion, cfgEspMaxDistance, w, h)
 
-  # God mode is a static byte-patch, applied/reverted to match the toggle (the
-  # call is idempotent, so running it every frame just holds the state).
-  setGodmode(toggleOn(gRegion, admGodmode))
-  if toggleOn(gRegion, admStamina): applyStamina()
+  # God mode patches live combat code, so it is DEFERRED: applied only in an
+  # actual raid (a live GameWorld), never at boot or the menu -- patching a
+  # damage function while the client is still settling is both pointless and the
+  # prime suspect for the boot crash. Outside a raid the patch is held reverted.
+  # (The byte-patch itself also byte-verifies the exact prologue before writing,
+  # so even a wrong RVA on a future build refuses rather than corrupts.)
+  if dataInRaid():
+    setGodmode(toggleOn(gRegion, admGodmode))
+    if toggleOn(gRegion, admStamina): applyStamina()
+  else:
+    setGodmode(false)
 
   publishCapability()
   setStatus(gRegion, dataStatus() & "  " & godStatus())
