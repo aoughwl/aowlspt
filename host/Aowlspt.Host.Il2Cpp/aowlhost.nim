@@ -122,11 +122,19 @@ static void* aowl_brand_newstring_guarded(void* a) {
 
 # ------------------------------------------------- image CDN redirect
 #
+# SUPERSEDED, AND KEPT ONLY AS A PROBE. `docs/timbuktu/IMAGE-LOADING-RE2.md`
+# settles this: against THIS emulator the client resolves nothing, because our
+# `backend.Static` is the IP literal `https://127.0.0.1` and there is no name to
+# look up. The CDN host below is what the *real* BSG server hands out in the raid
+# capture, not what this client dials here. The images fail one layer lower --
+# `DownloadTexture2D` builds a bare `UnityWebRequest` with no `certificateHandler`
+# and Unity rejects our self-signed cert in the TLS handshake, so the request
+# never becomes HTTP. The fix is `tools/imagecache.py`, which fills the client's
+# own `Application.temporaryCachePath` cache that `LoadTextureWithCache` checks
+# before it touches the network at all. Leave this hook off.
+#
 # Post-1.0 fetches trader avatars / handbook & quest icons from `/files/*`
-# resolved against BSG's asset CDN host (`s3-prod.escapefromtarkov.com`, per the
-# raid capture's `backend.Static`). No server-config field we send redirects it
-# (see `docs/timbuktu/IMAGE-LOADING-RE.md`), so offline that host is unreachable
-# and the images spin forever with not one request reaching our backend.
+# resolved against `backend.Static`.
 #
 # This installs an inline hook on the `getaddrinfo` family (via the same detour
 # engine the il2cpp method patches use, `aowl_hook_install` -> a trampoline that
@@ -135,9 +143,9 @@ static void* aowl_brand_newstring_guarded(void* a) {
 # other host resolves normally.
 #
 # It also RECORDS every hostname the client resolves, first sight only, which
-# the host tick loop logs. That is the confirmation the headless RE could not
-# get: one live run names the exact host:port the image loader dials, settling
-# whether the target below is right (or naming the real one).
+# the host tick loop logs. One live run has now answered that: it logged ZERO
+# hostnames, for images and for the working `/client/*` traffic alike, which is
+# the proof that this configuration never uses the resolver.
 #
 # Flag-gated (`imageCdnRedirect`, default off) and fail-safe: a missing export
 # or a failed install leaves DNS untouched; a non-target host is never rewritten.
