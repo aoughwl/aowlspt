@@ -1,0 +1,7 @@
+# Vanilla 4K ships ONLY the generator + template + docs. Everything the
+# generator produces on the user's machine is local and NEVER committed --
+# it is derived from BSG-copyrighted game assets the user owns.
+assets/
+work/
+tools/
+manifest.json
