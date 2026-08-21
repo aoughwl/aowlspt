@@ -486,6 +486,26 @@ proc localLoot*(locationId: string; nowSeconds: int;
         openZones.add z
     if openZones.len > 0: setText(d, "OpenZones", openZones)
 
+    # Spawn-lock. `BotLocationModifier` runs the client's anti-spawn-in-sight
+    # system: every bot spawn point within `LockSpawnCheckRadius` (120 m on
+    # Factory) of a player is locked and cannot place a bot. Factory's whole
+    # playable area is smaller than 120 m, so the instant the player is in it
+    # every `BotZone` point stays locked for the rest of the raid and no scav
+    # wave can put a bot down -- while the boss spawns anyway, because
+    # `BossLocationSpawn` places through a trigger that does not consult this
+    # radius. That is exactly the live symptom: Tagilla fights, `bot/generate`
+    # keeps handing out assault bots, but not one reaches the map. Zero the lock
+    # so an offline wave can place a scav regardless of how close the player is;
+    # per-map, only the modifier the base already carries is touched.
+    if has(d, "BotLocationModifier"):
+      var blm = parseObject(get(d, "BotLocationModifier").raw())
+      if blm.ok:
+        setNumber(blm, "LockSpawnCheckRadius", 0)
+        setNumber(blm, "LockSpawnCheckRadiusPvE", 0)
+        setNumber(blm, "LockSpawnStartTime", 0)
+        setNumber(blm, "LockSpawnStartTimePvE", 0)
+        setRaw(d, "BotLocationModifier", text(blm))
+
     result = text(d)
   else:
     # No base in the database: an empty-but-valid map that still loads and plays,
