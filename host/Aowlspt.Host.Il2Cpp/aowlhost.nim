@@ -569,16 +569,25 @@ proc cUxCloseHook(): int32 {.importc: "aowl_uxpatch_close_hook", nodecl.}
 proc cUxCloseArm(rearmed: ptr int32): int32 {.
   importc: "aowl_uxpatch_close_arm", nodecl.}
 proc cUxCloseHwnd(): uint64 {.importc: "aowl_uxpatch_close_hwnd", nodecl.}
+proc cUxCloseTid(): uint64 {.importc: "aowl_uxpatch_close_tid", nodecl.}
 proc cUxCloseCtrlArm(): int32 {.importc: "aowl_uxpatch_close_ctrl_arm", nodecl.}
 var cUxCloseSeen {.importc: "aowl_ux_close_seen", nodecl.}: int32
-# The OS-close subclass is armed CONTINUOUSLY from the host tick loop, not once.
-# The game window does not exist at il2cpp-init time (so a boot-only arm never
-# installs), and entering a raid re-creates the window and re-installs Unity's
-# own WndProc (so a once-armed subclass is silently lost mid-session -- which is
-# exactly why closing the window in a raid still hung). These track what has
-# been logged so the steady state is quiet.
+# The OS-close fix is checked from the host tick loop, not armed once: the game
+# window does not exist at il2cpp-init time, so a boot-only attempt installs
+# nothing at all.
+#
+# It is NOT a WndProc subclass any more. Re-subclassing from this thread to
+# survive the raid's window re-creation crashed the client -- swapping another
+# thread's WndProc is unsupported and races its pump. The hooks are thread-scoped
+# SetWindowsHookEx (WH_GETMESSAGE + WH_CALLWNDPROC) on the game's UI thread, so
+# a re-created window on the same thread is covered with nothing re-armed and
+# NOTHING WRITTEN per tick. See `aowlspt_uxpatch.h`.
+#
+# `osCloseFix` gates the whole thing so a bad interaction can be turned off
+# without a rebuild. Default OFF while this is being re-proven live.
+var gOsCloseFix = false
 var gCloseEverArmed = false
-var gCloseLoggedRearms = 0'i32
+var gCloseWarned = false
 proc cUxVersionTarget(): Il2CppPtr {.
   importc: "aowl_uxpatch_version_target", nodecl.}
 proc cUxVersionLabelOffset(): int32 {.
@@ -4369,30 +4378,36 @@ proc reportRuntime() =
   # OS-close hang fix (Fix 1b): the Exit-button patch above only covers the
   # in-game Exit flow. Closing the window via the title-bar X, taskbar Close, or
   # Alt+F4 posts WM_CLOSE to Unity's window proc, which funnels into the SAME
-  # hanging async shutdown by a different caller. Subclass the game's top window
-  # so those messages hard-exit (ExitProcess(0)) before any async work starts.
-  # Fail-safe: if no owned window is found the hook is simply skipped.
+  # hanging async shutdown by a different caller. Catch those messages on the
+  # game's UI thread and hard-exit (ExitProcess(0)) before any async work starts.
   #
   # LIVE FINDING: at this point (il2cpp init) the game's top-level window does
-  # NOT exist yet, so EnumWindows finds nothing and the hook was skipped for the
-  # whole session -- the confirmed root cause of "window-X still hangs". The
-  # arming is therefore a RETRY: this first attempt is best-effort and quiet on
-  # failure, and the host tick loop keeps calling `cUxCloseHook()` (idempotent --
-  # it stores the original proc once and no-ops once hooked) until the window
-  # exists, logging the success line then.
+  # NOT exist yet, so there is no UI thread to hook and this first attempt is
+  # expected to do nothing -- it is best-effort and quiet on failure, with the
+  # host tick loop carrying the real arm.
   #
-  # The message-independent console-control path is armed once here; it costs
-  # nothing on a GUI launch with no console and covers the close routes that
-  # never become a window message at all.
-  discard cUxCloseCtrlArm()
-  let closeHooked = cUxCloseHook()
-  if closeHooked == 1'i32:
-    gCloseEverArmed = true
-    okLog "exit fix: OS-close hook installed at boot -- window-close (X / " &
-          "taskbar / Alt+F4) redirected to ExitProcess(0) via WndProc subclass"
+  # Gated on `osCloseFix` (default OFF): the previous implementation of this fix
+  # crashed the client, so it must be switchable without a rebuild while it is
+  # being re-proven.
+  gOsCloseFix = readBoolKey("osCloseFix")
+  if not gOsCloseFix:
+    info "exit fix: osCloseFix is off; the OS window-close path is untouched " &
+         "(the in-game Exit button is still patched). Set \"osCloseFix\": true " &
+         "in aowlspt-host.json to arm it."
   else:
-    info "exit fix: game window not up yet; OS-close hook will be retried from " &
-         "the host tick loop until it arms (Exit button is already patched)"
+    # The message-independent console-control path is armed once here; it costs
+    # nothing on a GUI launch with no console and covers the close routes that
+    # never become a window message at all.
+    discard cUxCloseCtrlArm()
+    if cUxCloseHook() == 1'i32:
+      gCloseEverArmed = true
+      okLog "exit fix: OS-close hooks installed at boot on UI thread " &
+            $cUxCloseTid() & " -- window-close (X / taskbar / Alt+F4) exits " &
+            "via ExitProcess(0)"
+    else:
+      info "exit fix: game window not up yet; the OS-close hooks will be " &
+           "installed from the host tick loop once the UI thread exists " &
+           "(Exit button is already patched)"
 
   var count = 0
   let assemblies = domainGetAssemblies(gRt, gDomain, count)
@@ -4892,45 +4907,41 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
     let elapsed = int64(now - lastTick)
     lastTick = now
 
-    # OS-close hook: armed and RE-armed here, for the whole session.
+    # OS-close hooks, checked here for the whole session (see `aowlspt_uxpatch.h`
+    # for the three-step history that led to this shape).
     #
-    # Two live findings drove this. First, the game's top-level window does not
-    # exist at il2cpp-init time, where the subclass used to be installed exactly
-    # once -- EnumWindows found nothing and it was never installed at all.
-    # Second, once that was fixed by retrying, closing the window IN A RAID
-    # still hung: entering a raid switches display mode, which re-creates
-    # Unity's window (new HWND) and re-installs Unity's own WndProc, so a
-    # once-armed subclass is quietly gone by the time the user clicks the X.
+    # This is a CHECK, not a re-install. The hooks are thread-scoped, so once
+    # they are on the game's UI thread they cover every window that thread pumps
+    # -- including the one the raid re-creates. All this does per tick is find
+    # the main window and compare its thread id with the one already hooked; if
+    # they match it returns having written nothing, anywhere. The only case that
+    # installs anything is a genuinely different UI thread id, which should never
+    # happen in a normal session and is logged loudly if it does.
     #
-    # So this never stops. Every second it re-checks every top-level window this
-    # process owns and re-subclasses any that is not currently carrying our proc,
-    # chaining to whatever proc it finds there now. Cheap (one EnumWindows over
-    # our own windows plus a GetWindowLongPtrW each) and a no-op in the steady
-    # state, so it is quiet: it only logs the first arm and any RE-arm, which is
-    # itself the evidence that the raid transition stole the window.
-    if now >= nextCloseTry:
-      nextCloseTry = now + 1000'u64
+    # The previous version wrote to windows every tick (re-subclassing across
+    # threads) and killed the client eight seconds into boot. Nothing here writes
+    # in the steady state, and nothing writes to a window at all.
+    if gOsCloseFix and now >= nextCloseTry:
+      nextCloseTry = now + 2000'u64
       var rearmed = 0'i32
       let armed = cUxCloseArm(addr rearmed)
-      if rearmed > 0'i32:
+      if rearmed != 0'i32:
         if not gCloseEverArmed:
           gCloseEverArmed = true
-          okLog "exit fix: OS-close hook installed on window 0x" &
-                hexOf(cUxCloseHwnd()) & " (" & $armed & " window(s) covered) " &
-                "-- window X / taskbar Close / Alt+F4 now exit via " &
+          okLog "exit fix: OS-close hooks installed on UI thread " &
+                $cUxCloseTid() & " (main window 0x" & hexOf(cUxCloseHwnd()) &
+                ") -- window X / taskbar Close / Alt+F4 now exit via " &
                 "ExitProcess(0) instead of the hanging async shutdown"
         else:
-          okLog "exit fix: OS-close hook re-armed on window 0x" &
-                hexOf(cUxCloseHwnd()) & " (previous subclass was replaced or " &
-                "the window was re-created -- typically the raid's display-mode " &
-                "change); " & $armed & " window(s) now covered"
-        gCloseLoggedRearms = gCloseLoggedRearms + rearmed
-      elif not gCloseEverArmed and now >= closeGiveUpAt and
-           gCloseLoggedRearms == 0'i32:
-        gCloseLoggedRearms = 1'i32   # log this once, but keep trying
-        warn "exit fix: no top-level game window appeared within 5 minutes; " &
-             "OS-close hook not installed yet (window-X may still hang; the " &
-             "Exit button is patched). Still retrying."
+          okLog "exit fix: OS-close hooks moved to UI thread " &
+                $cUxCloseTid() & " (main window 0x" & hexOf(cUxCloseHwnd()) &
+                ") -- the game's UI thread changed; the hooks follow it"
+      elif armed == 0'i32 and not gCloseEverArmed and not gCloseWarned and
+           now >= closeGiveUpAt:
+        gCloseWarned = true          # say it once, but keep checking
+        warn "exit fix: no main game window appeared within 5 minutes; the " &
+             "OS-close hooks are not installed yet (window-X may still hang; " &
+             "the Exit button is patched). Still checking."
     # Log any newly-seen resolver host from the image-CDN hook. Drained here, on
     # the host thread, because the hook fires on the game's DNS thread where
     # opening a log file mid-resolve is not safe. First sight only, so this is

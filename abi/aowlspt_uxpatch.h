@@ -58,36 +58,29 @@
  * -> hang on the exit-loading screen. Rather than chase and byte-patch that
  * managed WndProc/Quit chain (build-specific, several methods, and the hang is
  * inside async continuations that are awkward to neuter), we cut it off at the
- * cleanest choke point: the WIN32 window message itself. We SUBCLASS the game's
- * top-level window (SetWindowLongPtrW GWLP_WNDPROC) with a tiny native proc that,
- * on WM_CLOSE / WM_QUIT / WM_ENDSESSION, calls `ExitProcess(0)` immediately --
- * terminating cleanly before Unity ever sees the close and before any async
- * shutdown can start. Every other message is forwarded to the original proc via
- * CallWindowProcW, so the window behaves normally until it is closed. This one
- * hook covers the X button, taskbar Close, and Alt+F4 (all arrive as WM_CLOSE),
- * plus session logoff/shutdown.
+ * cleanest choke point: the WIN32 window message itself. `ExitProcess(0)` on the
+ * close message terminates cleanly before Unity ever acts on it and before any
+ * async shutdown can start, covering the X button, taskbar Close, Alt+F4 and
+ * session logoff/shutdown.
  *
- * Fail-safe: the window is located by walking this process's own top-level
- * windows (GetWindowThreadProcessId == GetCurrentProcessId) preferring a visible
- * one; if none is found the hook is simply not installed (Exit-button fix still
- * works, OS-close still hangs -- nothing worse). Arming is idempotent: the
- * original proc is stored once and a second call is a no-op. ExitProcess is a
- * clean native terminate that cannot itself hang.
+ * HOW that is done has changed three times under live evidence, and the current
+ * answer is NOT a WndProc subclass. The full history and the mechanism now in
+ * use are documented at the implementation below ("Fix 1b" section); in short:
  *
- * LIVE FINDING (root cause of "window-X still hangs"): at il2cpp-init time --
- * the one moment the host used to call this -- the game's top-level window does
- * not exist yet, so EnumWindows found nothing and the hook was never installed
- * for the entire session. The install is therefore RETRIED from the host tick
- * loop until it succeeds; this function is designed for exactly that (cheap,
- * idempotent, no state written on failure).
+ *   1. A one-shot subclass at il2cpp-init never installed at all -- the game's
+ *      top-level window does not exist that early, so EnumWindows found nothing.
+ *   2. Retrying the subclass from the host tick loop fixed the menu case but not
+ *      the raid case: entering a raid re-creates the window and re-installs
+ *      Unity's own proc, so the subclass was silently gone.
+ *   3. Re-subclassing continuously to compensate CRASHED the client -- swapping
+ *      another thread's WndProc is unsupported and races its pump.
  *
- * LIVE FINDING #2 (root cause of "closing the window IN A RAID still hangs"):
- * one successful arm is not enough either. Entering a raid changes display mode,
- * Unity re-creates its top-level window and re-installs its own WndProc, and the
- * once-armed subclass is silently gone by the time the user clicks the X. So the
- * arm is CONTINUOUS and covers EVERY top-level window this process owns -- see
- * `aowl_uxpatch_close_arm` below, called about once a second from the host tick
- * loop, plus the message-independent console-control handler beside it.
+ * So there is no subclass any more. Nobody's WndProc is modified. The close
+ * messages are observed with thread-scoped `SetWindowsHookExW` hooks
+ * (WH_GETMESSAGE + WH_CALLWNDPROC) on the game's UI thread -- the supported way
+ * to act on the messages of a window you do not own -- with the
+ * message-independent console-control handler beside it. The whole feature is
+ * behind the `osCloseFix` config flag.
  *
  * Each entry is overwritten with, at its first byte:
  *     31 C9                 xor ecx, ecx           ; uExitCode = 0
@@ -211,215 +204,220 @@ static int32_t aowl_uxpatch_exit_neuter(void) {
     aowl_ux_exit_ok = landed;
     return landed;
 }
-
 /* ------------------------------------------------------------------ *
- * Fix 1b: OS window-close -> ExitProcess(0) (WndProc subclass)
+ * Fix 1b: OS window-close -> ExitProcess(0)
+ *         (thread-scoped message hooks -- NOT a WndProc subclass)
  * ------------------------------------------------------------------ */
 
-/* LIVE FINDING #2 (raid): with the retry above, the hook armed at the menu --
- * and closing the window IN A RAID still hung. A once-armed, once-verified
- * subclass is not enough on Unity:
+/* LIVE FINDING #2 (raid): a once-armed subclass is not enough. It armed at the
+ * menu, and closing the window IN A RAID still hung, because entering a raid
+ * changes display mode: Unity destroys and re-creates its top-level window (a
+ * new HWND) and re-installs its own WndProc. By the time the user clicks the X,
+ * our proc is on a dead window or has been overwritten.
  *
- *   * entering a raid changes display mode (windowed -> exclusive/borderless
- *     fullscreen), and Unity DESTROYS and RE-CREATES its top-level window across
- *     that transition. The new HWND is not the one we subclassed, so our proc
- *     was never on the window the user actually clicks the X of; and
- *   * Unity re-installs its own WndProc on the (new) window as part of bringing
- *     input up, which would blow our subclass away even if the HWND survived.
+ * LIVE FINDING #3 (CRASH -- why this is no longer a subclass at all): the
+ * obvious fix, re-subclassing from the host tick loop, KILLED THE CLIENT a few
+ * seconds into boot. The log ends immediately after the second re-arm line, on
+ * a third distinct HWND. The cause is that `SetWindowLongPtrW(GWLP_WNDPROC)` on
+ * a window owned by ANOTHER thread is not supported: Windows documents
+ * subclassing as a same-thread operation, and swapping the proc pointer from the
+ * host thread races the owning thread's pump -- a message can be dispatched
+ * against a half-swapped pair, or `CallWindowProcW` can chain into a proc that
+ * has already been replaced or freed. Doing it every second, across up to eight
+ * windows including hidden helper/IME/message-only windows that were never the
+ * game's UI, made that race a certainty. (The original one-shot install survived
+ * only because it wrote once, very early, to one window.)
  *
- * Either way the old code stopped after its single success (`gCloseHookArmed`)
- * and never noticed. So arming is now CONTINUOUS and PLURAL:
+ * So the subclass is GONE. Nobody's WndProc is modified any more. Instead we use
+ * the mechanism Windows provides for exactly this -- observing another thread's
+ * messages without owning its windows:
  *
- *   * every top-level window owned by this process is subclassed, not just the
- *     first visible one -- a raid may run on a second/different window, and a
- *     hidden-then-shown window is caught the moment it appears;
- *   * the host tick loop re-runs the arm every ~1s. For each window it compares
- *     `GetWindowLongPtrW(GWLP_WNDPROC)` against OUR proc. Equal -> nothing to
- *     do. Different -> somebody replaced us (or this is a brand-new window):
- *     store THAT proc as the new original for this window and subclass again.
- *   * `aowl_ux_close_proc` is NEVER stored as an "original" -- the arm refuses
- *     it explicitly -- so the chain can never recurse into itself.
- *   * dead windows are dropped from the table so a churned HWND does not leak a
- *     slot or get a stale original called on it.
+ *   * `SetWindowsHookExW(WH_GETMESSAGE, ..., NULL, tid)` sees messages POSTED to
+ *     that thread as its pump retrieves them -- the title-bar X and taskbar
+ *     Close arrive here as `WM_CLOSE`, Alt+F4 as a posted `WM_SYSCOMMAND`.
+ *   * `SetWindowsHookExW(WH_CALLWNDPROC, ..., NULL, tid)` sees messages SENT to
+ *     that thread's windows before the proc runs -- the X button's
+ *     `WM_SYSCOMMAND`/`SC_CLOSE`, which `DefWindowProc` sends before it turns
+ *     into `WM_CLOSE`, arrives here.
  *
- * The table is written only by the tick thread and read by the window threads.
- * A slot's hwnd/orig are filled BEFORE the slot is published (count bumped
- * last, behind a barrier), so a proc running concurrently either does not see
- * the slot at all or sees it complete -- never half-written.
+ * Both are IN-PROCESS, THREAD-SCOPED hooks (hMod = NULL, an explicit thread id),
+ * which is a fully supported configuration; the callbacks run ON the UI thread,
+ * so there is no cross-thread write anywhere. They observe, they do not replace:
+ * anything that is not a close is passed straight to `CallNextHookEx` and the
+ * game never knows they exist. A close calls `ExitProcess(0)` -- from the UI
+ * thread, before Unity's quit path can start the async shutdown that hangs.
  *
- * The close set is widened too, as a second belt: `WM_SYSCOMMAND`/`SC_CLOSE` is
- * what Alt+F4 and the title-bar X actually deliver, and only DefWindowProc turns
- * it into WM_CLOSE. A WndProc that handles SC_CLOSE itself (Unity's does, in
- * some modes, calling straight into Application.Quit) would never produce the
- * WM_CLOSE we were waiting for. Catching SC_CLOSE closes that gap without
- * depending on anyone else's message translation. */
+ * Because a thread hook covers the THREAD, not one HWND, the raid's window
+ * re-creation is a non-event: the new window is pumped by the same UI thread and
+ * is covered the instant it exists, with nothing re-armed and nothing written.
+ * The arm is re-checked only against the UI thread id, and in the steady state
+ * it does exactly one `GetWindowThreadProcessId` and returns -- no writes at all,
+ * which is the property the crashing version lacked.
+ *
+ * Window choice is conservative now: only the MAIN visible, unowned top-level
+ * window (largest area wins if several qualify) -- never "all of them". The
+ * hidden helper windows that the previous version happily subclassed are ignored.
+ *
+ * The `SC_CLOSE` insight from that version is kept, and is the reason
+ * WH_CALLWNDPROC is installed alongside WH_GETMESSAGE: a WndProc that handles
+ * `SC_CLOSE` itself and calls straight into `Application.Quit` never produces the
+ * `WM_CLOSE` a posted-message-only hook would be waiting for.
+ *
+ * Fail-safe throughout: if no window is found yet, nothing is installed and the
+ * caller retries. If `SetWindowsHookExW` fails, nothing is installed and OS-close
+ * behaves exactly as it did before this file existed. Nothing else in the process
+ * is modified either way, and the Exit-button byte patch is entirely independent.
+ * The whole feature is behind the `osCloseFix` config flag so it can be turned
+ * off without a rebuild. */
 
 /* Diagnostics, read by the host after arming. */
-static int32_t aowl_ux_close_hooked = 0;  /* at least one subclass installed   */
+static int32_t aowl_ux_close_hooked = 0;  /* hooks are installed               */
 static int32_t aowl_ux_close_seen   = 0;  /* a candidate window was found      */
-static int32_t aowl_ux_close_rearms = 0;  /* times we re-took a replaced proc  */
+static int32_t aowl_ux_close_rearms = 0;  /* times the UI thread changed       */
 
-/* The windows we have subclassed and, per window, the proc we displaced. Small
- * and fixed: a Unity game has one or two top-level windows, and the cap makes
- * the table lock-free-safe (no reallocation) and bounded. */
-#define AOWL_UX_CLOSE_MAX 8
-typedef struct {
-    HWND    hwnd;
-    WNDPROC orig;
-} AowlUxCloseSlot;
-static AowlUxCloseSlot aowl_ux_close_slots[AOWL_UX_CLOSE_MAX];
-static volatile LONG   aowl_ux_close_n = 0;
+/* The installed hooks and the UI thread they cover. */
+static HHOOK aowl_ux_hook_getmsg = NULL;
+static HHOOK aowl_ux_hook_cwp    = NULL;
+static DWORD aowl_ux_hook_tid    = 0;
 
-/* The most recently (re-)armed window, for the host's log line. */
+/* The main window we picked the thread from, for the host's log line. */
 static HWND aowl_ux_close_hwnd = NULL;
 
-/* Our replacement window proc: terminate cleanly the instant the window is
- * asked to close -- the X button, taskbar Close and Alt+F4 arrive as
- * WM_SYSCOMMAND/SC_CLOSE and (after DefWindowProc) WM_CLOSE, and a session end
- * as WM_ENDSESSION. Anything else is forwarded to whatever proc this window had
- * when we took it. ExitProcess never returns, so the close cases fall off the
- * end of the world rather than into Unity's hanging async shutdown. */
-static LRESULT CALLBACK aowl_ux_close_proc(HWND h, UINT msg,
-                                           WPARAM wp, LPARAM lp) {
-    LONG i, n;
-    if (msg == WM_CLOSE || msg == WM_QUIT || msg == WM_ENDSESSION) {
-        ExitProcess(0);
-    }
-    if (msg == WM_SYSCOMMAND && (wp & 0xFFF0) == SC_CLOSE) {
-        ExitProcess(0);
-    }
-    n = aowl_ux_close_n;
-    for (i = 0; i < n && i < AOWL_UX_CLOSE_MAX; i++) {
-        if (aowl_ux_close_slots[i].hwnd == h) {
-            WNDPROC o = aowl_ux_close_slots[i].orig;
-            /* Never chain into ourselves, whatever ended up in the table. */
-            if (o && o != aowl_ux_close_proc)
-                return CallWindowProcW(o, h, msg, wp, lp);
-            break;
-        }
-    }
-    return DefWindowProcW(h, msg, wp, lp);
+/* Is this message the user asking the process to go away?
+ *
+ * `SC_CLOSE` is masked with 0xFFF0 because the low four bits of a
+ * `WM_SYSCOMMAND` wParam carry mouse/accelerator detail, not the command. */
+static int aowl_ux_is_close_msg(UINT msg, WPARAM wp) {
+    if (msg == WM_CLOSE || msg == WM_QUIT || msg == WM_ENDSESSION) return 1;
+    if (msg == WM_SYSCOMMAND && (wp & 0xFFF0) == SC_CLOSE) return 1;
+    return 0;
 }
 
-/* Collect this process's top-level windows. lp points at a small collector. */
-typedef struct { HWND w[AOWL_UX_CLOSE_MAX]; int n; } AowlUxCloseFound;
+/* WH_GETMESSAGE: posted messages, seen as the UI thread's pump retrieves them.
+ * Runs on the UI thread. Observation only -- everything that is not a close is
+ * forwarded untouched. */
+static LRESULT CALLBACK aowl_ux_getmsg_hook(int code, WPARAM wp, LPARAM lp) {
+    if (code == HC_ACTION && lp) {
+        MSG* m = (MSG*)lp;
+        if (aowl_ux_is_close_msg(m->message, m->wParam))
+            ExitProcess(0);
+    }
+    return CallNextHookEx(NULL, code, wp, lp);
+}
+
+/* WH_CALLWNDPROC: sent messages, seen before the target proc runs. Runs on the
+ * UI thread. This is the one that catches the X button's SC_CLOSE. */
+static LRESULT CALLBACK aowl_ux_cwp_hook(int code, WPARAM wp, LPARAM lp) {
+    if (code == HC_ACTION && lp) {
+        CWPSTRUCT* c = (CWPSTRUCT*)lp;
+        if (aowl_ux_is_close_msg(c->message, c->wParam))
+            ExitProcess(0);
+    }
+    return CallNextHookEx(NULL, code, wp, lp);
+}
+
+/* Pick the MAIN game window: a visible, unowned top-level window of this
+ * process, largest area winning if there is more than one. Deliberately narrow
+ * -- the hidden helper/IME/message-only windows the previous version subclassed
+ * are exactly what we must not touch. lp is a HWND* receiving the choice. */
 static BOOL CALLBACK aowl_ux_close_enum(HWND h, LPARAM lp) {
     DWORD pid = 0;
-    AowlUxCloseFound* f = (AowlUxCloseFound*)lp;
+    HWND* out = (HWND*)lp;
+    RECT r;
     GetWindowThreadProcessId(h, &pid);
     if (pid != GetCurrentProcessId()) return TRUE;
-    aowl_ux_close_seen = 1;
-    if (f->n < AOWL_UX_CLOSE_MAX) f->w[f->n++] = h;
-    return (f->n < AOWL_UX_CLOSE_MAX) ? TRUE : FALSE;
-}
-
-/* Find the table slot for `h`, or -1. */
-static int aowl_ux_close_slot_of(HWND h) {
-    LONG i, n = aowl_ux_close_n;
-    for (i = 0; i < n && i < AOWL_UX_CLOSE_MAX; i++)
-        if (aowl_ux_close_slots[i].hwnd == h) return (int)i;
-    return -1;
-}
-
-/* Drop slots whose window no longer exists, so HWND churn (the raid's
- * fullscreen re-create) cannot leak the table or leave a stale original behind.
- * Tick-thread only. */
-static void aowl_ux_close_compact(void) {
-    LONG i, n = aowl_ux_close_n, keep = 0;
-    for (i = 0; i < n && i < AOWL_UX_CLOSE_MAX; i++) {
-        if (aowl_ux_close_slots[i].hwnd && IsWindow(aowl_ux_close_slots[i].hwnd)) {
-            if (keep != i) aowl_ux_close_slots[keep] = aowl_ux_close_slots[i];
-            keep++;
+    if (!IsWindowVisible(h)) return TRUE;
+    if (GetWindow(h, GW_OWNER) != NULL) return TRUE;   /* a tool/dialog window */
+    if (!GetWindowRect(h, &r)) return TRUE;
+    {
+        long area = (long)(r.right - r.left) * (long)(r.bottom - r.top);
+        if (area <= 0) return TRUE;
+        aowl_ux_close_seen = 1;
+        if (*out == NULL) { *out = h; return TRUE; }
+        {
+            RECT o;
+            if (GetWindowRect(*out, &o)) {
+                long oa = (long)(o.right - o.left) * (long)(o.bottom - o.top);
+                if (area > oa) *out = h;
+            }
         }
     }
-    if (keep != n) {
-        MemoryBarrier();
-        aowl_ux_close_n = keep;
-    }
+    return TRUE;
 }
 
-/* Arm (or RE-arm) the close hook on every top-level window this process owns.
+/* Arm (or re-arm) the close hooks on the game's UI thread.
  *
- * Call this repeatedly -- it is designed to be a ~1s tick. Cheap: one
- * EnumWindows over this process's own windows plus one GetWindowLongPtrW per
- * window, and it writes nothing when everything is already ours.
+ * Designed to be called repeatedly from the host tick loop. In the steady state
+ * -- the UI thread unchanged -- it does one EnumWindows plus one thread-id
+ * comparison and WRITES NOTHING; there is no per-tick modification of any window
+ * or proc anywhere in the process.
  *
- * Returns the number of windows now carrying our proc (0 if none exist yet).
- * `*rearmed`, when non-NULL, receives the number of windows subclassed by THIS
- * call -- non-zero means a fresh install or that somebody had replaced us, and
- * is what the host logs. Fail-safe: a window we cannot subclass is skipped and
- * left exactly as it was. */
+ * Returns 1 if the hooks are installed on the current UI thread, else 0.
+ * `*rearmed`, when non-NULL, receives 1 if THIS call installed them (a first
+ * arm, or a re-arm because the UI thread id changed), which is what the host
+ * logs. Fail-safe: on any failure nothing is installed and nothing is changed. */
 static int32_t aowl_uxpatch_close_arm(int32_t* rearmed) {
-    AowlUxCloseFound found;
-    int i, armed = 0, fresh = 0;
+    HWND  main_wnd = NULL;
+    DWORD tid = 0;
+    HHOOK hg, hc;
 
     if (rearmed) *rearmed = 0;
-    found.n = 0;
-    aowl_ux_close_compact();
-    EnumWindows(aowl_ux_close_enum, (LPARAM)&found);
-    if (found.n == 0) return 0;          /* no window yet; caller retries      */
 
-    for (i = 0; i < found.n; i++) {
-        HWND h = found.w[i];
-        WNDPROC cur = (WNDPROC)(uintptr_t)GetWindowLongPtrW(h, GWLP_WNDPROC);
-        int slot;
+    EnumWindows(aowl_ux_close_enum, (LPARAM)&main_wnd);
+    if (main_wnd == NULL) return 0;      /* no window yet; caller retries      */
 
-        if (cur == aowl_ux_close_proc) { armed++; continue; }  /* still ours   */
+    tid = GetWindowThreadProcessId(main_wnd, NULL);
+    if (tid == 0) return 0;
 
-        /* Either a window we have never seen, or one whose proc was replaced
-         * (Unity re-installing its own after a mode change). Whatever is there
-         * NOW is the correct thing to chain to -- and it is by construction not
-         * our proc, since we just tested that. */
-        slot = aowl_ux_close_slot_of(h);
-        if (slot < 0) {
-            LONG n = aowl_ux_close_n;
-            if (n >= AOWL_UX_CLOSE_MAX) continue;   /* table full; leave it be */
-            slot = (int)n;
-            aowl_ux_close_slots[slot].hwnd = h;
-            aowl_ux_close_slots[slot].orig = (cur != aowl_ux_close_proc) ? cur : NULL;
-            MemoryBarrier();                        /* publish complete slot   */
-            aowl_ux_close_n = n + 1;
-        } else {
-            aowl_ux_close_slots[slot].orig = (cur != aowl_ux_close_proc) ? cur : NULL;
-            MemoryBarrier();
-        }
-
-        SetWindowLongPtrW(h, GWLP_WNDPROC, (LONG_PTR)(uintptr_t)aowl_ux_close_proc);
-        if ((WNDPROC)(uintptr_t)GetWindowLongPtrW(h, GWLP_WNDPROC)
-                != aowl_ux_close_proc)
-            continue;                    /* refused; nothing changed for it    */
-
-        aowl_ux_close_hwnd = h;
-        armed++; fresh++;
+    /* Steady state: same UI thread, hooks already up. Nothing to do, and --
+     * critically -- nothing written. A thread hook already covers any window
+     * that thread creates later, including the raid's re-created one. */
+    if (tid == aowl_ux_hook_tid && aowl_ux_hook_getmsg != NULL) {
+        aowl_ux_close_hwnd = main_wnd;
+        return 1;
     }
 
-    if (armed > 0) aowl_ux_close_hooked = 1;
-    if (fresh > 0) aowl_ux_close_rearms += fresh;
-    if (rearmed) *rearmed = (int32_t)fresh;
-    return (int32_t)armed;
+    /* The UI thread changed (or this is the first arm). Install on the new
+     * thread FIRST, so a failure leaves the old hooks in place rather than
+     * leaving the process uncovered. */
+    hg = SetWindowsHookExW(WH_GETMESSAGE, aowl_ux_getmsg_hook, NULL, tid);
+    hc = SetWindowsHookExW(WH_CALLWNDPROC, aowl_ux_cwp_hook, NULL, tid);
+    if (hg == NULL && hc == NULL) {
+        return aowl_ux_close_hooked;     /* unchanged; keep whatever we had    */
+    }
+
+    if (aowl_ux_hook_getmsg) UnhookWindowsHookEx(aowl_ux_hook_getmsg);
+    if (aowl_ux_hook_cwp)    UnhookWindowsHookEx(aowl_ux_hook_cwp);
+    aowl_ux_hook_getmsg = hg;
+    aowl_ux_hook_cwp    = hc;
+    if (aowl_ux_hook_tid != 0) aowl_ux_close_rearms++;
+    aowl_ux_hook_tid    = tid;
+    aowl_ux_close_hwnd  = main_wnd;
+    aowl_ux_close_hooked = 1;
+    if (rearmed) *rearmed = 1;
+    return 1;
 }
 
-/* Back-compat one-shot wrapper for the boot-time attempt: 1 if at least one
- * window is now carrying our proc, else 0. */
+/* Back-compat one-shot wrapper for the boot-time attempt. */
 static int32_t aowl_uxpatch_close_hook(void) {
-    return aowl_uxpatch_close_arm(NULL) > 0 ? 1 : 0;
+    return aowl_uxpatch_close_arm(NULL);
 }
 
-/* The window most recently (re-)armed, as an integer, for the host's log line
- * ("installed on window 0x..."). 0 until the hook arms. */
+/* The main window whose thread we hooked, as an integer, for the host's log
+ * line. 0 until the hooks arm. */
 static uint64_t aowl_uxpatch_close_hwnd(void) {
     return (uint64_t)(uintptr_t)aowl_ux_close_hwnd;
 }
 
-/* How many windows currently carry our proc, for the host's log line. */
-static int32_t aowl_uxpatch_close_count(void) { /* reserved for diagnostics */
-    return (int32_t)aowl_ux_close_n;
+/* The UI thread id the hooks are installed on, for the host's log line. */
+static uint64_t aowl_uxpatch_close_tid(void) {
+    return (uint64_t)aowl_ux_hook_tid;
 }
 
 /* A second, message-INDEPENDENT close path: the console control handler.
  *
- * The WndProc subclass above covers everything that arrives as a window
- * message. It cannot cover a close that never becomes one -- a console
+ * The message hooks above cover everything that arrives as a window message.
+ * They cannot cover a close that never becomes one -- a console
  * CTRL_CLOSE_EVENT (when a console is attached, e.g. launched from a terminal),
  * a CTRL_LOGOFF/CTRL_SHUTDOWN, or Ctrl+C/Ctrl+Break. Those funnel through the
  * console control handler instead, which Windows calls on its own thread with
