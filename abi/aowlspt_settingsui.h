@@ -13,6 +13,14 @@
  * until the live read-only probe logs a known stock label at it -- that content
  * match is what validates the offset before any write is ever attempted (Phase 2+).
  *
+ * PHASE 1.5 UPDATE (from the live Phase-1 log): `Show` fires correctly on the
+ * Unity thread and the tab fields below all resolve, but at `Show` time every
+ * tab's `_createdControls` (0x88) is still NULL -- the controls are built later,
+ * lazily, by `SettingsScreen::EnsureTabInitialized`. The probe therefore now
+ * ALSO hooks that method as a POSTFIX (target + prologue in `aowlspt_bridge.h`)
+ * and walks the one tab that call just built. `Show` stays hooked as the
+ * arming/thread confirmation it already proved itself to be.
+ *
  * The detour target itself (SettingsScreen::Show @ RVA 0x171FA00) is already
  * verified and handed out by `aowl_bridge_settings_target_at` in
  * `aowlspt_bridge.h`; this header adds only the layout the probe reads once it is
@@ -78,6 +86,47 @@
 /* LocalizedText wrapper + TextMeshProUGUI text-backing string. */
 #define AOWL_SUI_LOCTEXT_LIST      0x078
 #define AOWL_SUI_TMP_MTEXT         0x0E0
+
+/* ESettingsGroup -> the typed tab field the game itself loads for that group.
+ *
+ * NOT guessed: read straight off `SettingsScreen::EnsureTabInitialized`
+ * (0x171FF10), whose body is a 5-way switch on the group argument and whose
+ * arms load exactly these offsets (see the target comment in
+ * `aowlspt_bridge.h`). That agreement between the metadata field offsets above
+ * and the compiled code is an independent confirmation of both.
+ *
+ *   0 graphics -> 0x0F8   1 game -> 0x0F0   2 sound -> 0x108
+ *   3 controls -> 0x110   4 postfx -> 0x100
+ *
+ * Returns -1 for a group outside 0..4, which the probe treats as "walk nothing"
+ * rather than reading a made-up offset. */
+static int32_t aowl_sui_group_tab_offset(int32_t group) {
+    switch (group) {
+    case 0: return AOWL_SUI_SS_GRAPHICSTAB;
+    case 1: return AOWL_SUI_SS_GAMETAB;
+    case 2: return AOWL_SUI_SS_SOUNDTAB;
+    case 3: return AOWL_SUI_SS_CONTROLSTAB;
+    case 4: return AOWL_SUI_SS_POSTFXTAB;
+    default: return -1;
+    }
+}
+
+/* The same mapping's human name, for the log line. "?" outside 0..4. */
+static const char* aowl_sui_group_name(int32_t group) {
+    switch (group) {
+    case 0: return "graphics";
+    case 1: return "game";
+    case 2: return "sound";
+    case 3: return "controls";
+    case 4: return "postfx";
+    default: return "?";
+    }
+}
+
+/* How many ESettingsGroup values this mapping covers -- the probe uses it to
+ * size its "logged this group already" bitset. */
+#define AOWL_SUI_GROUP_COUNT 5
+static int32_t aowl_sui_group_count(void) { return AOWL_SUI_GROUP_COUNT; }
 
 /* Accessors (importc'd by the Nim probe). Individual functions rather than a
  * table so a fault names the exact hop and the header stays self-documenting. */

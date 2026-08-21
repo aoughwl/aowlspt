@@ -30,6 +30,20 @@ proc cSuiOffCtrlText(): int32 {.importc: "aowl_sui_off_ctrl_text", nodecl.}
 proc cSuiOffCtrlValue(): int32 {.importc: "aowl_sui_off_ctrl_value", nodecl.}
 proc cSuiOffLocTextList(): int32 {.importc: "aowl_sui_off_loctext_list", nodecl.}
 proc cSuiOffTmpMText(): int32 {.importc: "aowl_sui_off_tmp_mtext", nodecl.}
+## ESettingsGroup -> tab field offset / name, read off `EnsureTabInitialized`'s
+## own switch (see aowlspt_settingsui.h). -1 / "?" outside 0..4.
+proc cSuiGroupTabOffset(group: int32): int32 {.
+  importc: "aowl_sui_group_tab_offset", nodecl.}
+proc cSuiGroupName(group: int32): Il2CppPtr {.
+  importc: "aowl_sui_group_name", nodecl.}
+
+## Phase 1.5 target: the tab BUILDER, hooked postfix.
+proc cBridgeSettingsTabTargetCount(): int32 {.
+  importc: "aowl_bridge_settingstab_target_count", nodecl.}
+proc cBridgeSettingsTabTargetAt(i: int32): Il2CppPtr {.
+  importc: "aowl_bridge_settingstab_target_at", nodecl.}
+proc cBridgeSettingsTabTargetName(i: int32): Il2CppPtr {.
+  importc: "aowl_bridge_settingstab_target_name", nodecl.}
 
 # The slot/flag/guard globals (gSettingsUiSlot / gSettingsUiProbe /
 # gSettingsUiDone) are declared in aowlhost.nim beside the other detour slots.
@@ -199,5 +213,132 @@ proc bindSettingsUiProbe(verbose: bool): bool =
     if attachDrain(spec, fn, cast[Il2CppMethod](0), false, verbose, 4'i32):
       okLog "settings-UI probe (Phase 1) armed on " & spec &
             "; open the in-game settings screen to log its control tree"
+      return true
+  result = false
+
+# ---------------------------------------------------------------------------
+# PHASE 1.5 -- the walk that actually finds controls
+#
+# Phase 1 proved the mechanism and disproved the timing: `Show` fires on the
+# Unity thread with a readable `this`, but every tab's `_createdControls` is
+# still null there. Controls are built lazily by
+# `SettingsScreen::EnsureTabInitialized(this, ESettingsGroup)`, which `OpenGroup`
+# calls on every tab switch (and which returns early, via a HashSet at +0x138,
+# once a group has been built).
+#
+# So this is a POSTFIX detour (kind=7) on that method: the entry registers are
+# still the entry registers (the thunk saved them), so RCX is `this` and EDX is
+# the group -- but the body has already run, so the tab's controls EXIST. The
+# group tells us exactly which tab field to read, so we walk that one tab rather
+# than re-guessing all five.
+#
+# Still read-only, still reflection-free, still every hop cIsReadable-guarded,
+# still capped -- and now the whole body runs inside the VEH/SEH guard, so a
+# fault cannot take the settings screen (or the client) down with it.
+# ---------------------------------------------------------------------------
+
+## Log each group at most once, so clicking back and forth between tabs (which
+## re-fires this every time) does not flood the log with the same census.
+var gSuiGroupsLogged: array[8, bool]
+## Total firings, for the one-line "fired" trace on the first call only.
+var gSuiTabFires = 0
+
+proc suiTabInitBody(a: Il2CppPtr): Il2CppPtr {.
+    exportc: "aowl_settingstab_body", cdecl.} =
+  ## The whole Phase-1.5 walk, called ONLY through `aowl_settingstab_body_guarded`
+  ## so any fault inside -- including a read of a valid-looking pointer to an
+  ## invalid next pointer, which `cIsReadable` cannot catch -- is trapped and the
+  ## settings screen survives. `a` is the detour `regs`. Returns a non-nil
+  ## sentinel on clean completion; the guard returns nil if it faulted. Writes
+  ## nothing, ever.
+  let regs = a
+  let tid = int(cThreadId())
+  let onHost = (tid == int(gHostThreadId))
+  let selfPtr = cRegsInt(regs, 0'i32)          # RCX = this (SettingsScreen)
+  # EDX = the ESettingsGroup argument. `cRegsInt` hands back the full 64-bit RDX,
+  # so take the low 32 as the game does (`mov esi, edx`) and reinterpret rather
+  # than convert -- a plain int32() of a value above 0x7FFFFFFF would overflow.
+  let group = cast[int32](uint32(cRegsInt(regs, 1'i32) and 0xFFFFFFFF'u64))
+  inc gSuiTabFires
+  if gSuiTabFires == 1:
+    okLog "settings probe: EnsureTabInitialized (postfix) first fired on thread " &
+          $tid & " (host thread " & $int(gHostThreadId) & ")" &
+          (if onHost: " -- host thread (unexpected, NOT Unity's)"
+           else: " -- Unity's main thread") & "; this=0x" & hexOf(selfPtr)
+  if onHost or selfPtr == 0'u64:
+    return cast[Il2CppPtr](1)
+
+  let gname = readCString(cSuiGroupName(group))
+  let off = cSuiGroupTabOffset(group)
+  if off < 0'i32:
+    okLog "settings probe: EnsureTabInitialized group=" & $int(group) &
+          " is outside the known 0..4 mapping; nothing walked (no write)"
+    return cast[Il2CppPtr](1)
+  if group >= 0'i32 and int(group) < gSuiGroupsLogged.len and
+     gSuiGroupsLogged[int(group)]:
+    return cast[Il2CppPtr](1)     # already censused this tab; stay quiet
+
+  let self = cast[Il2CppPtr](selfPtr)
+  if cIsReadable(self, off + 8'i32) == 0'i32:
+    okLog "settings probe: this not readable at the tab field 0x" &
+          hexOf(uint64(off)) & " for group=" & gname & "; aborting (no write)"
+    return cast[Il2CppPtr](1)
+  let tab = cReadPtrAt(self, off)
+  if tab == nil:
+    okLog "settings probe: group=" & gname & " tab field (0x" &
+          hexOf(uint64(off)) & ") is still null after EnsureTabInitialized"
+    return cast[Il2CppPtr](1)
+
+  if group >= 0'i32 and int(group) < gSuiGroupsLogged.len:
+    gSuiGroupsLogged[int(group)] = true
+  okLog "settings probe: tab built -- group=" & gname & " (" & $int(group) &
+        ") tab=0x" & hexOf(cast[uint64](tab)) & " klass=0x" &
+        hexOf(cast[uint64](cReadPtrAt(tab, 0'i32)))
+  suiWalkTab(tab, gname)
+  return cast[Il2CppPtr](1)
+
+# The VEH/SEH guard thunk, the same mechanism botdiag/botcap use: `aowl_p_p_seh`
+# (abi/aowlspt_shim.h) arms a vectored exception handler + setjmp, calls the
+# body, and returns nil instead of letting an access violation propagate. A
+# probe fault must NEVER reach the settings screen, so the WHOLE body goes
+# through here.
+{.emit: """
+extern void* aowl_settingstab_body(void* a);
+static void* aowl_settingstab_body_guarded(void* a) {
+    return aowl_p_p_seh((void*)aowl_settingstab_body, a);
+}
+""".}
+proc cSettingsTabBodyGuarded(a: Il2CppPtr): Il2CppPtr {.
+  importc: "aowl_settingstab_body_guarded", nodecl.}
+
+proc settingsTabInitFired(regs: Il2CppPtr) =
+  ## Dispatched by slot identity from `patchReturned` (the POSTFIX half) for the
+  ## kind=7 detour. Runs the walk under the VEH/SEH guard and logs the catch if
+  ## it faulted, so the settings screen keeps working either way.
+  if cSettingsTabBodyGuarded(regs) == nil:
+    okLog "settings probe: fault caught in the tab walk -- the VEH guard kept " &
+          "the settings screen alive (nothing was written)"
+
+proc bindSettingsTabProbe(verbose: bool): bool =
+  ## Installs the read-only POSTFIX detour (kind=7) on
+  ## `SettingsScreen::EnsureTabInitialized` from the verified static target in
+  ## `aowlspt_bridge.h`. Shares the `settingsUiProbe` flag with the Phase-1 `Show`
+  ## hook; binds nothing on a build whose prologue does not match.
+  if gSettingsTabSlot >= 0:
+    return true
+  if not gReady or gDisableDrain:
+    return false
+  let count = cBridgeSettingsTabTargetCount()
+  for i in 0 ..< int(count):
+    let fn = cBridgeSettingsTabTargetAt(int32(i))
+    if fn == nil:
+      if verbose:
+        info "settings tab-init target " & $i & " did not verify on this build"
+      continue
+    let spec = readCString(cBridgeSettingsTabTargetName(int32(i)))
+    if attachDrain(spec, fn, cast[Il2CppMethod](0), false, verbose, 7'i32, true):
+      okLog "settings-UI control probe (Phase 1.5) armed POSTFIX on " & spec &
+            "; open Settings and click each tab -- every control's label, klass " &
+            "and value-widget pointer is logged as the tab is built"
       return true
   result = false
