@@ -93,6 +93,10 @@ import invoke
 ## `EFT.GameWorld::RegisterPlayer` detour target. Offsets/target only; the walk
 ## is in `botdiag.nim` (included below). See `aowlspt_botdiag.h`.
 {.emit: """#include "aowlspt_botdiag.h" """.}
+## OFFLINE SCAV-CAP LIFT: the MaxBots (+0xC0) offset + the verified
+## `EFT.BotSpawner::AddPlayer` detour target + the guarded int32 read/write. The
+## one field poke is in `botcap.nim` (included below). See `aowlspt_botcap.h`.
+{.emit: """#include "aowlspt_botcap.h" """.}
 ## Phase 1 native-settings probe: static field offsets for walking the live
 ## SettingsScreen control tree read-only. Offsets only; the walk is in
 ## `settingsui.nim` (included below). See `aowlspt_settingsui.h`.
@@ -851,6 +855,14 @@ var gBotDiagFires = 0
 ## fault-prone read) runs exactly once, after the list has had a few
 ## registrations to stabilise, and never again.
 var gBotDiagCensusDone = false
+## OFFLINE SCAV-CAP LIFT (kind=6 detour on `EFT.BotSpawner::AddPlayer`): its slot,
+## opt-in flag (`unlimitedBots`), and a one-shot guard so the field poke fires at
+## most once per raid. Declared here beside the other detour slots; the single
+## int32 field write itself lives in `botcap.nim` (included below), which reuses
+## this file's guarded primitives + the VEH/SEH guard.
+var gBotCapSlot = -1
+var gBotCap = false
+var gBotCapDone = false
 ## Phase 1 native-settings probe (kind=4 detour on `SettingsScreen::Show`): its
 ## slot, opt-in flag (`settingsUiProbe`), and once-per-open guard. Declared here
 ## beside the other detour slots; the walk itself lives in `settingsui.nim`
@@ -2413,6 +2425,11 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
   if i == gBotDiagSlot:
     botDiagRegisterFired(regs)
     return 0'i32
+  # OFFLINE SCAV-CAP LIFT: the one-shot BotSpawner.MaxBots=0 poke, by identity. It
+  # writes one int32 and must never suppress the original AddPlayer.
+  if i == gBotCapSlot:
+    botCapAddPlayerFired(regs)
+    return 0'i32
   # Phase 1 native-settings probe: the read-only control-tree walk, by identity.
   if i == gSettingsUiSlot:
     settingsUiProbeFired(regs)
@@ -2783,7 +2800,7 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
   ## is not exempt from the rule.
   let what = (if kind == 1: "render-phase" elif kind == 2: "settings-probe"
               elif kind == 3: "version-brand" elif kind == 5: "botdiag"
-              elif kind == 4: "settings-ui-probe"
+              elif kind == 4: "settings-ui-probe" elif kind == 6: "botcap"
               else: "main-thread")
   tablesLock()
   let claimed = cHookClaim()
@@ -2835,19 +2852,22 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
     gBotDiagSlot = int(claimed)
   elif kind == 4:
     gSettingsUiSlot = int(claimed)
+  elif kind == 6:
+    gBotCapSlot = int(claimed)
   else:
     gDrainSlot = int(claimed)
   tablesUnlock()
   if kind == 1:
     gRenderMethod = spec
-  elif kind == 2 or kind == 3 or kind == 4 or kind == 5:
+  elif kind == 2 or kind == 3 or kind == 4 or kind == 5 or kind == 6:
     discard
   else:
     gDrainMethod = spec
     gDrainPerFrame = perFrame
   okLog what & " bound to " & spec & " (" &
         $int(cHookStolen(hook)) & " bytes)" &
-        (if perFrame or kind == 2 or kind == 3 or kind == 4 or kind == 5: "" else:
+        (if perFrame or kind == 2 or kind == 3 or kind == 4 or kind == 5 or
+            kind == 6: "" else:
            "; it runs more than once a frame, so its firing count is not a " &
            "frame count")
   return true
@@ -3501,6 +3521,12 @@ proc bindVersionBrand(verbose: bool): bool =
 ## verified `EFT.GameWorld::RegisterPlayer` target. Defines `botDiagRegisterFired`
 ## (dispatched by slot identity in `patchFired`) and `bindBotDiag`.
 include "botdiag.nim"
+## OFFLINE SCAV-CAP LIFT. Kept in its own file to avoid colliding with concurrent
+## host work; `include`d (not imported) so it shares this file's guarded raw
+## primitives, `cRegsInt`, logging, `attachDrain`, the VEH/SEH guard, and the
+## verified `EFT.BotSpawner::AddPlayer` target. Defines `botCapAddPlayerFired`
+## (dispatched by slot identity in `patchFired`) and `bindBotCap`.
+include "botcap.nim"
 ## Phase 1 native-settings control-tree probe. Kept in its own file to avoid
 ## colliding with concurrent host work; `include`d (not imported) so it shares
 ## this file's guarded raw-read primitives, logging, `attachDrain`, and the
@@ -4415,6 +4441,13 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "will log each bot/player registration and enumerate the registered " &
          "list (nickname, side/role, alive-state, position) during an offline " &
          "raid -- it answers spawned-but-frozen vs absent. NO write is performed."
+  gBotCap = readBoolKey("unlimitedBots")
+  if gBotCap:
+    info "unlimitedBots is set: a kind=6 detour on EFT.BotSpawner.AddPlayer will " &
+         "poke BotSpawner.MaxBots=0 (unlimited) once at offline-raid init, lifting " &
+         "the cap that defers the scav wave pool (bosses bypass it via " &
+         "IgnoreMaxBots; scavs do not). One guarded int32 write on the Unity " &
+         "thread; fail-safe -- no write if the build/pointer does not check out."
   gSettingsUiProbe = readBoolKey("settingsUiProbe")
   if gSettingsUiProbe:
     info "settingsUiProbe is set: a read-only detour on SettingsScreen.Show " &
@@ -4496,6 +4529,13 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       if gBotDiag and not bindBotDiag(true):
         info "botdiag did not arm (EFT.GameWorld.RegisterPlayer unverified on " &
              "this build, or drain disabled)"
+
+      # OFFLINE SCAV-CAP LIFT (opt-in). BotSpawner.AddPlayer is static code, so the
+      # detour installs now and never fires until an offline raid init reaches it;
+      # then it pokes MaxBots=0 once. Fail-safe if the prologue does not match.
+      if gBotCap and not bindBotCap(true):
+        info "botcap did not arm (EFT.BotSpawner.AddPlayer unverified on this " &
+             "build, or drain disabled)"
 
   let modsDir = joinPath(gDir, "mods")
   # The runtime may not have come up, and that deliberately does not stop this:
