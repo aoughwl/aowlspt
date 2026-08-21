@@ -137,10 +137,14 @@ Options
   --pick         show the launcher's own profile picker before starting the
                  game. OFF by default: the game has its own character-select
                  screen, and asking twice is the same choice made twice. With
-                 this off (the default) the client starts with no -token and
-                 the in-game screen is the single place a profile is chosen.
+                 this off (the default) the launcher picks a profile without
+                 asking -- the one you played last, else the most recent -- and
+                 binds it, so the session is authenticated and the in-game
+                 screen is the only thing that asks you anything.
   --no-profile   start the client with no -token, so it logs in on its own.
-                 This is now the default; the flag is kept for scripts.
+                 The backend binds no session for a tokenless client, so this
+                 is the first-run/character-creation path only -- it cannot
+                 reach an existing character.
   --wait         stay open until the game exits
   --no-backend   do not start the backend server
   --no-logs      do not show the live log view; exit once the game is up
@@ -1676,14 +1680,24 @@ proc main(): int =
       # on to start a client with nothing to talk to.
       warn "  no backend at " & be & "; the client would start alone"
     let dExplicit = o.profileId.len > 0 or o.newProfile.len > 0
-    let dPromptless = o.noProfile or (not o.pick and not dExplicit)
-    if dPromptless:
-      if o.noProfile:
-        line "  would ask     nothing about profiles (--no-profile)"
+    let dAuto = not o.noProfile and not o.pick and not dExplicit
+    if o.noProfile:
+      line "  would ask     nothing about profiles, and bind none (--no-profile)"
+    elif dAuto:
+      line "  would ask     nothing"
+      let l = listProfiles(port, root)
+      if l.error.len > 0:
+        line "  would play    nothing -- " & l.error & " -- so no -token"
       else:
-        line "  would ask     nothing; the client starts with no -token and " &
-             "you pick your character on the game's own screen (pass --pick " &
-             "for the launcher's picker)"
+        var dChosen = Profile(id: "", token: "", nickname: "", side: "",
+                              level: 0, edition: "", lastPlayed: 0)
+        var dWhy = ""
+        if autoProfile(l, readLastProfile(root), dChosen, dWhy):
+          line "  would play    " & profileLabel(dChosen) & " (" & dChosen.id &
+               ") -- " & dWhy & ", bound with -token before launch"
+        else:
+          line "  would play    nothing -- " & dWhy & " -- so no -token, and " &
+               "the game's own character creation runs"
     elif o.profileId.len > 0:
       line "  would play    " & o.profileId & " (--profile)"
     elif o.newProfile.len > 0:
@@ -1802,59 +1816,78 @@ proc main(): int =
   var token = ""
   var who = ""
   # The game has its own character-select screen (served by the tarkov mod's
-  # `/v2/client/game/profiles/` and `/client/game/profile/select`), and it
-  # shows on every boot regardless of the -token. A launcher picker on top of
-  # it is the same choice made twice -- the redundant second selector a player
-  # hits. So by default the launcher does NOT ask: it starts the client with no
-  # -token and lets the in-game screen be the single place a profile is chosen.
-  # A specific profile can still be pre-bound with `--profile`/`--new` (for
-  # scripts), and the old TUI picker is back under `--pick`.
+  # `/v2/client/game/profiles/` and `/client/game/profile/select`), and it shows
+  # on every boot regardless of the -token. A launcher picker on top of it is
+  # the same choice made twice -- the redundant second selector a player hits.
+  # So by default the launcher does NOT ask.
+  #
+  # **It does still bind.** Not asking is not the same as not selecting, and an
+  # earlier attempt at this conflated the two: it defaulted to the no-token boot
+  # path, and the client failed with "Client not authenticated". The reason is
+  # in the emulator, and it is not subtle. `-token=<id>` is the *only* thing
+  # that gives the client a `PHPSESSID` cookie (`clientCommandLine`, and
+  # `aowlbackend.parseHead` reads the session from that cookie and nowhere
+  # else). With no token the backend sees an empty session on every request --
+  # the live log said exactly that, `client/metadata HIT: body.len=49
+  # session=` -- and `tarkov.currentProfile` maps an empty session to no
+  # profile: `profileFor("")` is "", and its only fallback fires when the
+  # install holds exactly one profile *and* the session id is non-empty (it has
+  # to be, since the fallback works by `bindSession`ing it). So every
+  # `/client/` route answers "no profile on this session" and the client stops
+  # at authentication, before the character-select screen it was supposed to
+  # reach. The in-game screen cannot rescue this either: `onProfilesV2` fills
+  # the one "regular" slot from the first readable profile and `break`s, so it
+  # is not a multi-profile chooser to begin with.
+  #
+  # What the player actually wanted was one selector, not zero sessions. So the
+  # default auto-selects -- silently, from what is on record -- and pre-binds it
+  # through the same `selectProfile` call the interactive picker uses, so the
+  # bound-session path is identical whether or not anybody was asked. Zero
+  # profiles is the one case that still boots with no token: there is nothing to
+  # bind, and the game's own character-creation flow is the intended first run.
   let explicitProfile = o.profileId.len > 0 or o.newProfile.len > 0
-  let promptless = o.noProfile or (not o.pick and not explicitProfile)
-  if promptless:
-    heading "Profile"
-    if o.noProfile:
-      note "--no-profile: the client is started with no -token and will log " &
-           "in on its own"
+  let autoSelect = not o.noProfile and not o.pick and not explicitProfile
+  heading "Profile"
+  if https and not o.noProfile:
+    # The launcher's own HTTP client is plain-only, so over TLS it cannot ask
+    # the backend for the profile list or create/select one; it reads the
+    # store on disk instead. Said once, here, so the store-source note that
+    # follows is not a surprise.
+    note "over TLS the launcher reads profiles from the store on disk: it " &
+         "speaks plain HTTP and cannot reach the backend's profile routes. " &
+         "Creating a profile from here needs a plain-HTTP (http://) backend."
+  var chosen = Profile(id: "", token: "", nickname: "", side: "", level: 0,
+                       edition: "", lastPlayed: 0)
+  var haveChoice = false
+  var viaRoute = false
+  var why = ""
+  if o.noProfile:
+    note "--no-profile: the client is started with no -token and will log " &
+         "in on its own. The backend binds no session for it, so this is the " &
+         "first-run/character-creation path, not a way into an existing " &
+         "character."
+  elif autoSelect:
+    let list = listProfiles(port, root)
+    viaRoute = list.source == psRoute
+    if list.error.len > 0:
+      # Not fatal: a backend with no profile route and no store on disk is an
+      # install with nothing to select, which is the first-run case.
+      warn list.error
+      note "nothing to select, so the client starts with no -token and the " &
+           "game's own character-creation flow runs"
     else:
-      note "the client is started with no -token; pick your character on the " &
-           "game's own character-select screen. Pass --pick for the launcher's " &
-           "picker, or --profile <id> to pre-select one."
+      if list.note.len > 0: warn list.note
+      var reason = ""
+      if autoProfile(list, readLastProfile(root), chosen, reason):
+        haveChoice = true
+        ok "playing " & profileLabel(chosen) & " (" & chosen.id & ") -- " &
+           reason & "; pass --pick to choose, or --profile <id>"
+      else:
+        note reason & ", so the client starts with no -token and the game's " &
+             "own character-creation flow runs"
   else:
-    heading "Profile"
-    if https:
-      # The launcher's own HTTP client is plain-only, so over TLS it cannot ask
-      # the backend for the profile list or create/select one; it reads the
-      # store on disk instead. Said once, here, so the store-source note that
-      # follows is not a surprise.
-      note "over TLS the launcher reads profiles from the store on disk: it " &
-           "speaks plain HTTP and cannot reach the backend's profile routes. " &
-           "Creating a profile from here needs a plain-HTTP (http://) backend."
-    var chosen = Profile(id: "", token: "", nickname: "", side: "", level: 0,
-                         edition: "", lastPlayed: 0)
-    var why = ""
-    var viaRoute = false
     if pickProfile(o, port, root, chosen, why, viaRoute):
-      token = chosen.token
-      who = profileLabel(chosen)
-      # Rebind the session to this profile before the client arrives on it --
-      # for a listed profile as much as a freshly made one. The token to launch
-      # with is whatever `select` hands back, not the id the launcher held.
-      if viaRoute:
-        var bound = Profile(id: "", token: "", nickname: "", side: "",
-                            level: 0, edition: "", lastPlayed: 0)
-        let se = selectProfile(port, chosen.id, bound)
-        if se.len > 0:
-          err "could not select the profile on the server: " & se
-          note "the client would arrive on a session the server has not bound " &
-               "to this profile, and sit at the menu. This is a backend fault, " &
-               "not a launcher one -- see aowlspt-backend.log."
-          if backendProc != 0'u64:
-            cSpawnKill(backendProc)
-            line "  backend stopped"
-          return 1
-        token = bound.token
-        if bound.nickname.len > 0: who = profileLabel(bound)
+      haveChoice = true
     else:
       err "no profile to play: " & why
       note "the client needs a -token to log in, and a made-up one is a " &
@@ -1865,6 +1898,41 @@ proc main(): int =
         cSpawnKill(backendProc)
         line "  backend stopped"
       return 1
+
+  # One binding path for both ways of arriving at a profile. Rebind the session
+  # to it before the client arrives on it -- for an auto-selected profile as
+  # much as a listed or a freshly made one. The token to launch with is whatever
+  # `select` hands back, not the id the launcher held.
+  if haveChoice:
+    token = chosen.token
+    who = profileLabel(chosen)
+    if viaRoute:
+      var bound = Profile(id: "", token: "", nickname: "", side: "",
+                          level: 0, edition: "", lastPlayed: 0)
+      let se = selectProfile(port, chosen.id, bound)
+      if se.len > 0:
+        err "could not select the profile on the server: " & se
+        note "the client would arrive on a session the server has not bound " &
+             "to this profile, and sit at the menu. This is a backend fault, " &
+             "not a launcher one -- see aowlspt-backend.log."
+        if backendProc != 0'u64:
+          cSpawnKill(backendProc)
+          line "  backend stopped"
+        return 1
+      token = bound.token
+      if bound.nickname.len > 0: who = profileLabel(bound)
+    if token.len == 0:
+      # Belt and braces. A chosen profile whose token came back empty would
+      # launch a client with no cookie and fail as "Client not authenticated" at
+      # the game's own login -- far from here, and looking like a client bug.
+      err "the profile was chosen but there is no token to launch with"
+      if backendProc != 0'u64:
+        cSpawnKill(backendProc)
+        line "  backend stopped"
+      return 1
+    # Remembered *after* the bind succeeded, so a profile that could not be
+    # selected does not become the one the next boot prefers.
+    noteLastProfile(root, chosen.id)
 
   heading "Launching"
   let cmdLine = clientCommandLine(backendUrl, token, o.extraArgs)
