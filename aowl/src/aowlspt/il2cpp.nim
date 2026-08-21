@@ -134,9 +134,16 @@ type
     ## Appended rather than inserted: the enum's order is the order of
     ## `EntryNames`, and moving an existing member renames every entry
     ## after it without changing a line of this file.
-    eMethodGetFlags
+    eMethodGetFlags,
+    ## Managed-array construction, appended for the same append-only reason.
+    ## `il2cpp_array_new(elementClass, length)` returns an `Il2CppArray*`; it is
+    ## what lets a mod hand a `byte[]` to a managed method — e.g. building the
+    ## replacement image bytes for `ImageConversion.LoadImage` (see
+    ## `mods/textures`). Not `Essential`: a mod that never constructs an array
+    ## does not need it, and a build that stripped it is still hostable.
+    eArrayNew
 
-const NumEntries* = 62
+const NumEntries* = 63
 
 const EntryNames*: array[NumEntries, string] = [
   "il2cpp_set_data_dir", "il2cpp_set_config_dir", "il2cpp_init",
@@ -170,7 +177,8 @@ const EntryNames*: array[NumEntries, string] = [
   "il2cpp_free",
   "il2cpp_class_from_il2cpp_type", "il2cpp_field_get_flags",
   "il2cpp_class_get_static_field_data", "il2cpp_gc_wbarrier_set_field",
-  "il2cpp_method_get_flags"
+  "il2cpp_method_get_flags",
+  "il2cpp_array_new"
 ]
 
 ## The entry points the host cannot work without, as opposed to the ones it
@@ -493,6 +501,20 @@ proc objectNew*(rt: Il2Cpp; c: Il2CppClass): Il2CppObject =
 proc objectClass*(rt: Il2Cpp; obj: Il2CppObject): Il2CppClass =
   if not rt.has(eObjectGetClass): return nullPtr()
   result = tpP(rt.fns[ord(eObjectGetClass)], obj)
+
+proc arrayNew*(rt: Il2Cpp; elementClass: Il2CppClass; count: int): Il2CppPtr =
+  ## Allocate a managed 1-D array of `elementClass` with `count` elements, e.g.
+  ## a `byte[]` from the `System.Byte` class. Returns null if the runtime did
+  ## not export `il2cpp_array_new`, if the class is null, or if `count` is
+  ## negative — the caller then does nothing, which is the safe outcome.
+  ##
+  ## The element data of the returned `Il2CppArray*` begins at the standard
+  ## 64-bit IL2CPP array header size (32 bytes: `Il2CppObject{klass, monitor}`
+  ## 16 + `bounds` 8 + `max_length` 8) past the pointer. A caller filling it
+  ## writes `count` bytes from that offset, which stays inside the allocation.
+  if not rt.has(eArrayNew) or elementClass == nil or count < 0:
+    return nullPtr()
+  result = tpPZ(rt.fns[ord(eArrayNew)], elementClass, uint64(count))
 
 proc valueBox*(rt: Il2Cpp; c: Il2CppClass; data: Il2CppPtr): Il2CppObject =
   if not rt.has(eValueBox): return nullPtr()

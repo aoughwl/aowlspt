@@ -29,12 +29,15 @@
 ## HAS IT RUN AGAINST BSG'S CLIENT? No.
 ## ---------------------------------------------------------------------------
 ##
-## Not once. The two target method names are Unity's own and stable, but whether
-## they detour by name on the hardened 1.1.0.1.46777 build is unverified (see the
-## bridge header on null `methodPointer`s), and the pixel-upload path is not yet
-## expressible. `aowl run mods/textures` proves the manifest, the lookup, the
-## VRAM budget arithmetic and the safe-refusal path with no runtime in the
-## process at all.
+## Not once. The upload path is implemented end to end (byte[] via
+## il2cpp_array_new, decode via ImageConversion.LoadImage, in-place on the Unity
+## thread), but two things only the live client can confirm: whether the two
+## targets detour by name on the hardened 1.1.0.1.46777 build (see the bridge
+## header on null `methodPointer`s — a static RVA is the fallback), and that the
+## bound LoadImage is the byte[] overload. `aowl run mods/textures` proves the
+## manifest, the lookup, the VRAM budget arithmetic and the safe-refusal path
+## with no runtime in the process at all; `probeUpload` reports the rest at arm
+## time in a raid.
 
 import std/strutils
 import aowlspt
@@ -205,9 +208,9 @@ proc simSelfTest(): Status =
         fit2k > 0 and fit4k > 0 and fit4k < fit2k,
         "2K fit " & $fit2k & ", 4K fit " & $fit4k)
 
-  check("the swap path cannot upload yet and says so",
-        not canUpload(),
-        "canUpload() is true but the byte[]/LoadImage path is not bound")
+  check("the swap path is inert until armed on the client",
+        not canUpload() and not swapArmed(),
+        "the swap armed on the sim side, where there is no game to swap against")
 
   if gFailures == 0:
     success "selftest  all checks passed (" & $entryCount() & " replacements)"

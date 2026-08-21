@@ -42,14 +42,32 @@
 ## build, resolved the same way the bridge resolved `TarkovApplication::Update`.
 
 import std/strutils
+import std/syncio
 import aowlspt
 import aowlspt/game
+import aowlspt/il2cpp
+import aowlspt/fast
 import manifest
 
 const
   # The two interception points, matching the original plugin.
   TgtLoadAsset* = "UnityEngine.AssetBundle::LoadAsset"
   TgtReqAsset*  = "UnityEngine.AssetBundleRequest::get_asset"
+
+# The raw byte copy into a freshly-allocated IL2CPP byte[]. Kept as a local
+# `{.emit.}` so the whole upload path lives in this mod and adds nothing to the
+# shared shim the host and the other worktrees are editing. `arr` is an
+# `Il2CppArray*`; on 64-bit its element data begins 32 bytes in (the array
+# header: `Il2CppObject{klass, monitor}` 16 + `bounds` 8 + `max_length` 8). The
+# array was allocated with `n` elements, so writing `n` bytes from that offset
+# stays inside the allocation whatever the header size turns out to be.
+{.emit: """
+#include <string.h>
+static void aowl_tex_fill(void* arr, const void* src, unsigned long long n) {
+  if (arr && src && n) memcpy((char*)arr + 32, src, (size_t)n);
+}
+""".}
+proc texFill(arr, src: Il2CppPtr; n: uint64) {.importc: "aowl_tex_fill", nodecl.}
 
 # --------------------------------------------------------------------------
 # VRAM budgeting
@@ -89,6 +107,7 @@ var gSwapped: int64 = 0       ## textures actually swapped (0 until gCanUpload)
 var gWithinBudget: int64 = 0  ## matches that fit the VRAM budget
 var gRefusedBudget: int64 = 0 ## matches dropped because the budget was spent
 var gLastMatchName = ""
+var gUploadFailReported = false
 
 proc swapArmed*(): bool = gArmed
 proc canUpload*(): bool = gCanUpload
@@ -98,6 +117,116 @@ proc setFilter*(minConf: float; enabledCats: string) =
   ## ",Metal,Wood,". Empty means every category the manifest carries.
   gMinConf = minConf
   gCatFilter = enabledCats
+
+# --------------------------------------------------------------------------
+# The upload path — building a Texture2D from image bytes on the Unity thread
+# --------------------------------------------------------------------------
+#
+# A mod DLL runs in the game's process, so `openIl2Cpp()` binds the already-
+# loaded `GameAssembly.dll` and the mod reaches the runtime directly — the same
+# way `mods/fov` does. That is what makes the swap possible with no host ABI
+# change: `il2cpp_array_new` (exposed through `aowlspt/il2cpp`) builds the
+# managed `byte[]`, and `UnityEngine.ImageConversion::LoadImage` decodes the PNG/
+# JPG into the returned `Texture2D` **in place** — so the object every material
+# already references becomes the high-res image, and there is no return handle to
+# replace. All of it runs inside the postfix, which fires on the Unity main
+# thread (the game calls the AssetBundle load path there), the one thread on
+# which a texture may be created and uploaded.
+
+var gRt = Il2Cpp(handle: cast[Il2CppPtr](0), loaded: false, lastError: 0'i32,
+                 missing: @[])
+var gByteClass: Il2CppPtr = cast[Il2CppPtr](0)
+var gLoadImage: Binding            ## ImageConversion::LoadImage(Texture2D, byte[])
+var gLoadImageTex: Binding         ## Texture2D::LoadImage(byte[]) — older fallback
+
+proc readFileBinary(path: string; into: var string): bool =
+  ## Reads a whole binary file (a JPG/PNG) without a raising call. `open` (the
+  ## bool overload) opens `"rb"`, and `readBuffer` is non-raising; a raising
+  ## `readAll` in a `--app:lib` mod is exactly what to avoid.
+  var f: File
+  if not open(f, path, fmRead):
+    return false
+  into = ""
+  var chunk = newString(65536)
+  let dst = cast[pointer](slice(chunk).data)
+  while true:
+    let n = readBuffer(f, dst, 65536)
+    if n <= 0:
+      break
+    if n == 65536:
+      into.add chunk
+    else:
+      into.add substr(chunk, 0, n - 1)
+  close(f)
+  result = into.len > 0
+
+proc probeUpload() =
+  ## Decides `gCanUpload`, once, at arm time. Every capability is checked rather
+  ## than assumed: the runtime export, the `System.Byte` class, a LoadImage
+  ## binding, and the host's live-pointer capability (needed to turn the returned
+  ## texture handle into an address). Any one missing leaves `gCanUpload` false
+  ## and the mod matches-only.
+  gRt = openIl2Cpp()
+  if not gRt.loaded:
+    warn "textures  the IL2CPP runtime is not bound; upload disabled (match-only)"
+    return
+  if not gRt.has(eArrayNew):
+    warn "textures  this runtime does not export il2cpp_array_new; upload " &
+         "disabled (match-only)"
+    return
+  gByteClass = findClass(gRt, "System.Byte")
+  if gByteClass == nil:
+    warn "textures  System.Byte did not resolve; upload disabled (match-only)"
+    return
+  # The extension form first (current Unity), then the deprecated instance form.
+  gLoadImage = bindMethod(gRt, "UnityEngine.ImageConversion", "LoadImage", 2)
+  if not gLoadImage.ok:
+    gLoadImageTex = bindMethod(gRt, "UnityEngine.Texture2D", "LoadImage", 1)
+  if not gLoadImage.ok and not gLoadImageTex.ok:
+    warn "textures  neither ImageConversion.LoadImage nor Texture2D.LoadImage " &
+         "bound; upload disabled (match-only)"
+    return
+  if not livePointersReady():
+    warn "textures  the host does not expose live object pointers (revision 3); " &
+         "upload disabled (match-only)"
+    return
+  gCanUpload = true
+  info "textures  upload path READY: byte[] via il2cpp_array_new, decode via " &
+       (if gLoadImage.ok: "ImageConversion.LoadImage(Texture2D, byte[])"
+        else: "Texture2D.LoadImage(byte[])")
+
+proc buildAndSwap(idx: int; obj: GameObj): bool =
+  ## Reads the replacement image, builds a managed `byte[]`, and decodes it into
+  ## the returned texture in place. Returns true only when LoadImage confirmed it
+  ## took the data. Every failure is a clean false — the game keeps its texture.
+  var address: uint64 = 0
+  if pointerOf(obj.handle, address) != Ok or address == 0'u64:
+    return false
+  let texPtr = cast[Il2CppPtr](address)
+
+  var bytes = ""
+  if not readFileBinary(resolvedPath(idx), bytes) or bytes.len == 0:
+    return false
+
+  let arr = arrayNew(gRt, gByteClass, bytes.len)
+  if arr == nil:
+    return false
+  let sl = slice(bytes)
+  if cast[uint](sl.data) == 0'u:
+    return false
+  texFill(arr, cast[Il2CppPtr](sl.data), uint64(bytes.len))
+
+  if gLoadImage.ok:
+    var a = noArgs()
+    addPtr(a, texPtr)
+    addPtr(a, arr)
+    result = callBool(gLoadImage, nullPtr(), a)
+  elif gLoadImageTex.ok:
+    var a = noArgs()
+    addPtr(a, arr)
+    result = callBool(gLoadImageTex, texPtr, a)
+  else:
+    result = false
 
 # --------------------------------------------------------------------------
 # The postfix — one body, both targets
@@ -140,19 +269,30 @@ proc onTextureReturn(target, args: string): HookResult =
     inc gRefusedBudget
     return keepResult()
 
+  inc gWithinBudget
   if not gCanUpload:
     # The name matched and it fits the budget — everything but the pixels. This
-    # is the observable proof the wiring is correct ahead of the capability.
-    inc gWithinBudget
+    # is the observable proof the wiring is correct when the runtime cannot yet
+    # build the byte[] (probeUpload said why at arm time).
     return keepResult()
 
-  # --- the swap itself, once the capability lands -------------------------
-  # var newHandle: Handle
-  # if buildTextureFromFile(resolvedPath(idx), newHandle):
-  #   gResidentBytes += cost
-  #   inc gSwapped
-  #   return replaceResult("{\"handle\":" & $uint64(newHandle) & "}")
-  inc gWithinBudget
+  # --- the swap: decode the replacement into the returned texture in place ---
+  # LoadImage mutates the Texture2D the game just handed back, so every material
+  # already pointing at it now shows the high-res image and there is no return
+  # handle to replace. keepResult() is therefore correct on success too.
+  if buildAndSwap(idx, obj):
+    gResidentBytes = gResidentBytes + cost
+    inc gSwapped
+    if gSwapped <= 5'i64 or (gSwapped mod 25'i64) == 0'i64:
+      info "textures  swapped " & name & " (" & entryCat(idx) & ", " &
+           entryMap(idx) & "); resident " &
+           $(gResidentBytes div (1024'i64 * 1024'i64)) & " MB of " &
+           $(gBudgetBytes div (1024'i64 * 1024'i64)) & " MB"
+  elif not gUploadFailReported:
+    gUploadFailReported = true
+    warn "textures  the first upload of " & name & " did not take (LoadImage " &
+         "returned false or the file was unreadable); further failures are " &
+         "silent. The game keeps its stock texture."
   result = keepResult()
 
 # --------------------------------------------------------------------------
@@ -168,6 +308,10 @@ proc armSwap*(budgetMB: int; tier: string): bool =
   gBudgetBytes = int64(budgetMB) * 1024'i64 * 1024'i64
   gResidentBytes = 0
   var bound = 0
+
+  # Decide whether the pixels can actually be uploaded before installing the
+  # hooks, so the arm log tells the truth about what will happen on a match.
+  probeUpload()
 
   let s1 = hookReturn(TgtLoadAsset, onTextureReturn, withArgs = false)
   if s1 == Ok:
@@ -187,10 +331,13 @@ proc armSwap*(budgetMB: int; tier: string): bool =
          " — async bundle-load swaps are off"
 
   gArmed = bound > 0
-  if gArmed and not gCanUpload:
-    warn "textures  ARMED for matching only: the mod will report every texture " &
-         "it would swap, but the byte[]/ImageConversion.LoadImage upload path " &
-         "is not yet bound on the mod ABI, so stock pixels are kept. See swap.nim."
+  if gArmed and gCanUpload:
+    success "textures  ARMED with upload: matched textures are decoded into the " &
+            "game's own Texture2D on the Unity thread, bounded by the VRAM budget"
+  elif gArmed:
+    warn "textures  ARMED for matching only: the upload path is unavailable " &
+         "(probeUpload said why above), so matched textures are reported but " &
+         "stock pixels are kept"
   result = gArmed
 
 proc swapStats*(): string =

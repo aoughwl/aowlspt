@@ -79,3 +79,6 @@ mods/tarkov/data/capture/raid1/responses/large/
 
 # Python bytecode from tools/*.py
 __pycache__/
+
+# Texture mod: the assembled image pack (rebuilt by pipeline/build_pack.py --copy)
+mods/textures/data/pack/
