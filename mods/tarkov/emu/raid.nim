@@ -289,7 +289,12 @@ proc post1LocationBase*(id: string): string =
     return byKey.raw
   result = ""
 
-proc botZonesFor(base: JsonRef): seq[string] =
+proc botZonesFor(spawnPointParams: JsonRef): seq[string] =
+  ## Takes the map's `SpawnPointParams` array itself rather than the whole
+  ## `LocationBase`, so a caller that already holds the base as a parsed `Doc`
+  ## can hand over just that one member instead of re-serialising a document
+  ## that is megabytes wide.
+  ##
   ## The zones an assault scav can actually spawn in on this map: the distinct
   ## `BotZoneName` of every `SpawnPointParams` point that admits a `Bot` of the
   ## `Savage` side. A scav wave whose `SpawnPoints` names a zone with no such
@@ -297,7 +302,7 @@ proc botZonesFor(base: JsonRef): seq[string] =
   ## An empty name is a real zone -- the map's default, which is all Ground Zero
   ## (`Sandbox`) tags its bot points with -- and is kept as `""`.
   result = @[]
-  let spp = base.field("SpawnPointParams")
+  let spp = spawnPointParams
   if not spp.isArray:
     return
   let n = count(spp)
@@ -481,6 +486,126 @@ proc offlineScavWaves(zones: seq[string]): string =
   a.add oneWave(number, 360, 420, trickle, trickle * 2, useZones[0])
   result = done(a).text
 
+proc tuneOfflineSpawns*(d: var Doc) =
+  ## Turn one `LocationBase` document into one that populates an offline raid.
+  ##
+  ## ## Why this is a proc and not four lines inside `localLoot`
+  ##
+  ## It used to be inline in `localLoot`, and that is the bug this exists to
+  ## fix. `localLoot` builds `match/local/start`'s `locationLoot`, which is one
+  ## of *two* places the client is handed a `LocationBase`; the other is
+  ## `/client/locations`, which `tarkov.onLocations` was answering with
+  ## `post1Table("locations")` **verbatim**. The evidence that the client builds
+  ## its wave scenario from the latter is exact rather than circumstantial: with
+  ## `localLoot` serving four negative-time waves of span 4, a live Factory raid
+  ## logged
+  ##   `Checking spawn on max bots v1 _maxBots:0  toDelay:0 toSpawn:2`
+  ## once and only once -- and `factory4_day`'s own untouched `waves[]` contains
+  ## exactly one wave with a negative time, `number 1, -1/-1, slots 2/4`, whose
+  ## span of 2 yields precisely `toSpawn:2`. The client was reading the raw
+  ## table and had never seen `localLoot`'s waves at all. That also explains why
+  ## the earlier `MaxBotPerZone` raise changed nothing.
+  ##
+  ## So the tuning lives here and both servers apply it.
+  ##
+  ## ## What it changes
+  ##
+  ## BSG's `waves[]` is tuned for an online raid and leaves an offline one
+  ## nearly empty of assault scavs: `factory4_day` ships `BotStart`/`BotStop`/
+  ## `BotMax` all 0 (no spawn window, no bot budget) and one immediate wave
+  ## against seven that only land after forty seconds to twenty-eight minutes.
+  ## The boss still comes because `BossLocationSpawn` is a separate path that
+  ## consults none of this -- exactly the symptom seen live: Tagilla fights, no
+  ## scavs roam. The boss path, the PMC `BossLocationSpawn` entries and the loot
+  ## are untouched here.
+  let zones = botZonesFor(whole(getRaw(d, "SpawnPointParams")))
+  setRaw(d, "waves", offlineScavWaves(zones))
+  setNumber(d, "BotStart", 0)
+  setNumber(d, "BotStop", 86400)
+  # Budgets. These are the two throttles that can silently eat the waves above:
+  # `BotMax` is the map-wide alive cap and `MaxBotPerZone` the per-`BotZone`
+  # one. Factory's own base ships `BotMax = 0` and `MaxBotPerZone = 4` -- with
+  # all 19 of its savage spawn points in a single zone named `BotZone`, a
+  # 4-per-zone cap alone would hold the map to four scavs however many waves
+  # were served. Raise both to fit the ~16-20 the seed waves now request. (The
+  # host additionally pokes the client's `_maxBots` to 0 = unlimited, which the
+  # AI trace confirms; these served numbers are the belt to that's braces.)
+  if get(d, "BotMax").asInt(0) < 30: setNumber(d, "BotMax", 30)
+  if get(d, "BotMaxPvE").asInt(0) < 30: setNumber(d, "BotMaxPvE", 30)
+  # Per zone: enough that a one-zone map (Factory) is not capped below the seed
+  # total, without letting a ten-zone map pile 24 bots into each.
+  var zoneCount = zones.len
+  if zoneCount < 1: zoneCount = 1
+  var perZone = 24 div zoneCount
+  if perZone < 8: perZone = 8
+  if perZone > 24: perZone = 24
+  if get(d, "MaxBotPerZone").asInt(0) < perZone:
+    setNumber(d, "MaxBotPerZone", perZone)
+  # `OpenZones` must name the zones the waves point at, or the wave has no open
+  # zone to spawn into. Built from the same real bot zones; left as the base's
+  # own when every bot point is unzoned (`""`, e.g. Ground Zero).
+  var openZones = ""
+  for z in zones:
+    if z.len > 0:
+      if openZones.len > 0: openZones.add ","
+      openZones.add z
+  if openZones.len > 0: setText(d, "OpenZones", openZones)
+  # Spawn-lock. `BotLocationModifier` runs the client's anti-spawn-in-sight
+  # system: every bot spawn point within `LockSpawnCheckRadius` (120 m on
+  # Factory) of a player is locked and cannot place a bot. Factory's whole
+  # playable area is smaller than 120 m, so the instant the player is in it
+  # every `BotZone` point would stay locked for the rest of the raid -- while
+  # the boss spawns anyway, because `BossLocationSpawn` places through a trigger
+  # that does not consult this radius. Zero the lock so an offline wave can
+  # place a scav regardless of how close the player is; per-map, only the
+  # modifier the base already carries is touched.
+  if has(d, "BotLocationModifier"):
+    var blm = parseObject(get(d, "BotLocationModifier").raw())
+    if blm.ok:
+      setNumber(blm, "LockSpawnCheckRadius", 0)
+      setNumber(blm, "LockSpawnCheckRadiusPvE", 0)
+      setNumber(blm, "LockSpawnStartTime", 0)
+      setNumber(blm, "LockSpawnStartTimePvE", 0)
+      setRaw(d, "BotLocationModifier", text(blm))
+
+var gTunedLocations: string = ""
+
+proc post1LocationsTuned*(): string =
+  ## The post-1.0 `locations` table with every map's spawn tuning applied --
+  ## what `/client/locations` must answer with.
+  ##
+  ## This is the payload the client actually builds its wave scenario from (see
+  ## `tuneOfflineSpawns` for the proof), so serving the table verbatim served
+  ## BSG's online-tuned waves no matter what `match/local/start` said later.
+  ##
+  ## Computed once and cached: the table is the biggest document the server
+  ## owns and the deploy screen asks for it more than once per session, so
+  ## re-tuning 24 maps per request would put the cost back where the
+  ## `looseLoot` split took it out of. "" when the table is not installed, so
+  ## the caller keeps its SPT-db fallback.
+  if gTunedLocations.len > 0:
+    return gTunedLocations
+  let table = post1Table("locations")
+  if table.len == 0:
+    return ""
+  var top = parseObject(table)
+  if not top.ok:
+    return table
+  let locs = field(table, "locations")
+  if not locs.found:
+    return table
+  var tuned = newDoc()
+  for k in keys(locs):
+    var one = parseObject(locs.field(k).raw)
+    if one.ok:
+      tuneOfflineSpawns(one)
+      setRaw(tuned, k, text(one))
+    else:
+      setRaw(tuned, k, locs.field(k).raw)
+  setRaw(top, "locations", text(tuned))
+  gTunedLocations = text(top)
+  result = gTunedLocations
+
 proc localLoot*(locationId: string; nowSeconds: int;
                 raidId: string = ""): string =
   ## What is lying on the floor when the raid starts.
@@ -564,60 +689,7 @@ proc localLoot*(locationId: string; nowSeconds: int;
     # map's own `SpawnPointParams` (the zones scavs can actually stand in), so
     # this stays per-map correct rather than a Factory-only constant. The boss
     # path and the loot are untouched.
-    let baseJson = whole(base)
-    let zones = botZonesFor(baseJson)
-    setRaw(d, "waves", offlineScavWaves(zones))
-    setNumber(d, "BotStart", 0)
-    setNumber(d, "BotStop", 86400)
-    # Budgets. These are the two throttles that can silently eat the waves
-    # above: `BotMax` is the map-wide alive cap and `MaxBotPerZone` the
-    # per-`BotZone` one. Factory's own base ships `BotMax = 0` and
-    # `MaxBotPerZone = 4` -- with all 19 of its savage spawn points in a single
-    # zone named `BotZone`, a 4-per-zone cap alone would hold the map to four
-    # scavs no matter how many waves are served. Raise both to fit the ~16-20
-    # the seed waves now request. (The host additionally pokes the client's
-    # `_maxBots` to 0 = unlimited, which the AI trace confirms; these served
-    # numbers are the belt to that's braces, and stay sane rather than absurd.)
-    if baseJson.field("BotMax").asInt(0) < 30: setNumber(d, "BotMax", 30)
-    if baseJson.field("BotMaxPvE").asInt(0) < 30: setNumber(d, "BotMaxPvE", 30)
-    # Per zone: enough that a one-zone map (Factory) is not capped below the
-    # seed total, without letting a ten-zone map pile 24 bots into each.
-    var zoneCount = zones.len
-    if zoneCount < 1: zoneCount = 1
-    var perZone = 24 div zoneCount
-    if perZone < 8: perZone = 8
-    if perZone > 24: perZone = 24
-    if baseJson.field("MaxBotPerZone").asInt(0) < perZone:
-      setNumber(d, "MaxBotPerZone", perZone)
-    # `OpenZones` must name the zones the waves point at, or the wave has no open
-    # zone to spawn into. Built from the same real bot zones; left as the base's
-    # own when every bot point is unzoned (`""`, e.g. Ground Zero).
-    var openZones = ""
-    for z in zones:
-      if z.len > 0:
-        if openZones.len > 0: openZones.add ","
-        openZones.add z
-    if openZones.len > 0: setText(d, "OpenZones", openZones)
-
-    # Spawn-lock. `BotLocationModifier` runs the client's anti-spawn-in-sight
-    # system: every bot spawn point within `LockSpawnCheckRadius` (120 m on
-    # Factory) of a player is locked and cannot place a bot. Factory's whole
-    # playable area is smaller than 120 m, so the instant the player is in it
-    # every `BotZone` point stays locked for the rest of the raid and no scav
-    # wave can put a bot down -- while the boss spawns anyway, because
-    # `BossLocationSpawn` places through a trigger that does not consult this
-    # radius. That is exactly the live symptom: Tagilla fights, `bot/generate`
-    # keeps handing out assault bots, but not one reaches the map. Zero the lock
-    # so an offline wave can place a scav regardless of how close the player is;
-    # per-map, only the modifier the base already carries is touched.
-    if has(d, "BotLocationModifier"):
-      var blm = parseObject(get(d, "BotLocationModifier").raw())
-      if blm.ok:
-        setNumber(blm, "LockSpawnCheckRadius", 0)
-        setNumber(blm, "LockSpawnCheckRadiusPvE", 0)
-        setNumber(blm, "LockSpawnStartTime", 0)
-        setNumber(blm, "LockSpawnStartTimePvE", 0)
-        setRaw(d, "BotLocationModifier", text(blm))
+    tuneOfflineSpawns(d)
 
     result = text(d)
   else:

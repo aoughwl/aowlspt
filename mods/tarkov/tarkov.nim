@@ -2180,7 +2180,16 @@ proc onLocations(url, body, session: string): string =
   ## KeyNotFound. The SPT-db build (19 maps, and where mods write their per-map
   ## `base` fields) is the fallback when the table is absent.
   inc gRequests
-  let post1Locations = post1Table("locations")
+  ## The table goes out through `post1LocationsTuned`, not verbatim. This is the
+  ## payload the client builds its scav wave scenario from -- proven live: a
+  ## Factory raid logged exactly one `toSpawn:2`, which is the span of
+  ## `factory4_day`'s single negative-time base wave (`slots 2/4`), while
+  ## `match/local/start` was serving four waves of span 4 that the client never
+  ## looked at. Serving this route verbatim was therefore serving BSG's
+  ## online-tuned waves regardless of anything `localLoot` did. The tuning is
+  ## computed once and cached, so this route stays the cheap one it was made
+  ## into.
+  let post1Locations = post1LocationsTuned()
   if post1Locations.len > 0:
     return envelope(raw(post1Locations))
   result = envelope(raw(liveLocationsBody()))
