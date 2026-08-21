@@ -88,6 +88,25 @@ proc stampRequirementTypes*(barterRaw: string): string =
     put(o, offerId, armsArr)
   result = done(o).text
 
+const gUnlockAllOffers* = true
+  ## Sell a trader's whole stock from loyalty level 1. This is a sandbox server;
+  ## the user wants everything unlocked. Flip to false to restore real loyalty
+  ## gating.
+
+proc allLoyaltyOne(loyalRaw: string): string =
+  ## Every offer at loyalty level 1. `loyal_level_items` maps an offer id to the
+  ## level it needs; rewriting every value to 1 unlocks the lot -- client-side
+  ## nothing greys out, and server-side `offerLoyalty` then returns 1, which
+  ## every profile meets, so `buyFromTrader` allows the purchase. No profile or
+  ## character-level edit, so nothing here can break the menu boot.
+  let root = whole(loyalRaw)
+  if not isObject(root):
+    return loyalRaw
+  var o = obj()
+  for offerId in keys(root):
+    put(o, offerId, 1)
+  result = done(o).text
+
 proc traderAssort*(id: string; resupplyAt: int): string =
   let v = dbRead("traders." & id & ".assort")
   if not v.ok or v.raw.len == 0:
@@ -104,7 +123,9 @@ proc traderAssort*(id: string; resupplyAt: int): string =
   put(o, "items", raw(field(v.raw, "items").raw()))
   put(o, "barter_scheme",
       raw(stampRequirementTypes(field(v.raw, "barter_scheme").raw())))
-  put(o, "loyal_level_items", raw(field(v.raw, "loyal_level_items").raw()))
+  let loyal = field(v.raw, "loyal_level_items").raw()
+  put(o, "loyal_level_items",
+      raw(if gUnlockAllOffers: allLoyaltyOne(loyal) else: loyal))
   result = done(o).text
 
 proc traderExists*(id: string): bool =
