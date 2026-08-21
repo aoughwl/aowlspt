@@ -1073,12 +1073,13 @@ var gSettingsUiDone = false
 ## Shares the `settingsUiProbe` flag with the Phase-1 hook. The walk lives in
 ## `settingsui.nim` (included below) and NEVER writes.
 var gSettingsTabSlot = -1
-## Phase 1.6 native-settings CONTROL census (kind=8 POSTFIX detour on
-## `SettingsTab::OnTabSelected`): its slot. Phase 1.5 proved the tab objects are
-## real but their `_createdControls` is still null at tab-init; the controls are
-## created by OnFirstSelect -> CreateControls, which only OnTabSelected triggers.
-## Shares the `settingsUiProbe` flag. The walk lives in `settingsui.nim` and
-## NEVER writes.
+## Phase 1.7 native-settings CONTROL poll (kind=8 PREFIX tick on
+## `GameSettingsTab::Update`): its slot. The Phase-1.6 hook on
+## `SettingsTab::OnTabSelected` never fired -- that method has zero callers in
+## this build -- so the probe stopped chasing the trigger and takes a
+## Unity-thread heartbeat instead, re-reading each registered tab's control list
+## on a throttle. Shares the `settingsUiProbe` flag. The poll lives in
+## `settingsui.nim` and NEVER writes.
 var gSettingsSelSlot = -1
 
 ## DIRECT-INVOCATION proof ladder (kind=8 POSTFIX detour on
@@ -2660,6 +2661,10 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
   if i == gSettingsUiSlot:
     settingsUiProbeFired(regs)
     return 0'i32
+  # Phase 1.7 control poll: a throttled Unity-thread heartbeat, read-only.
+  if i == gSettingsSelSlot:
+    settingsTickFired(regs)
+    return 0'i32
   if i < 0 or i >= gPatches.len:
     return 0'i32
   if not gPatches[i].live:
@@ -2757,9 +2762,6 @@ proc patchReturned(slot: int32; regs: Il2CppPtr): int32 {.
   # Phase 1.6 control census, same reasoning: a host drain (meth == nil) that
   # must read AFTER the original ran, because the original is what creates the
   # controls. Returns 0 -- this never changes a result.
-  if i == gSettingsSelSlot:
-    settingsTabSelectedFired(regs)
-    return 0'i32
   # The direct-invocation proof ladder, by identity and on the same terms: a
   # host drain (meth == nil) that must run AFTER the original, because the
   # original is what builds the controls the ladder clones. Returns 0 -- it
@@ -3048,7 +3050,7 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
               elif kind == 3: "version-brand" elif kind == 5: "botdiag"
               elif kind == 4: "settings-ui-probe" elif kind == 6: "botcap"
               elif kind == 7: "settings-tab-probe"
-              elif kind == 8: "settings-sel-probe"
+              elif kind == 8: "settings-tick-probe"
               elif kind == 9: "managed-invoke-probe"
               elif kind == 12: "botai"
               else: "main-thread")
@@ -4856,9 +4858,9 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       # Phase 1.6: the walk that actually reads the controls, on the POSTFIX of
       # `SettingsTab::OnTabSelected` -- its own target, shared with nothing, so
       # it always arms regardless of what claims EnsureTabInitialized below.
-      if gSettingsUiProbe and not bindSettingsSelProbe(true):
-        info "the settings control census did not verify " &
-             "SettingsTab.OnTabSelected on this build"
+      if gSettingsUiProbe and not bindSettingsTickProbe(true):
+        info "the settings control poll did not verify " &
+             "GameSettingsTab.Update on this build"
 
       # The direct-invocation proof ladder (opt-in, default OFF). It shares
       # `SettingsScreen::EnsureTabInitialized` with the Phase-1.5 group->tab
