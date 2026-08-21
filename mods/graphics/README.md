@@ -93,8 +93,26 @@ $env:PATH="C:\msys64\ucrt64\bin;$env:PATH"
   bright-pass bloom, main grade, state save/restore), the config → `gfx_apply`
   wire, the settings schema. Safe-by-default: any failure latches `broken` and
   Present becomes a pass-through.
-- **Pending live validation:** confirming the hook lands on the game's real swap
-  chain (use `diag`), tuning defaults against real raids, and Present-hook
-  ordering vs. the overlay (graphics is started after the overlay so it grades
-  first and the UI draws on top — verify in-game).
+- **Pending live validation:** tuning defaults against real raids. Use
+  `diag: true` (red tint) to confirm the grade lands on the real frame at a
+  glance.
 - **Pending the bridge:** the in-engine HDR path and depth-based SSAO.
+
+## Present-hook coexistence (why it now works)
+
+The detour engine refuses a **second** hook on the same DXGI `Present` function
+(`aowlspt_detour.h` returns error -9 when it sees our own jump stub already
+there). The overlay boots first and takes that hook, so graphics' own
+`aowl_hook_install` was failing with "could not hook Present". Fixed by not
+hooking twice:
+
+- **Overlay present:** graphics runs in *driven mode* — no hook of its own. The
+  overlay calls a registered pre-present callback (`aowl_gfx_grade`) at the top
+  of its Present hook, once per frame, before drawing its UI. Grade first, UI on
+  top. A matching pre-resize callback drops graphics' back-buffer refs before a
+  resize (same DXGI_ERROR_INVALID_CALL hazard the overlay already guards).
+- **Overlay absent** (it is being retired for native settings): graphics owns
+  its own Present hook via `aowl_gfx_start`.
+
+The host picks the path at boot with `overlayRunning()`. Both are safe-by-default
+— any failure latches `broken` and the frame passes through untouched.
