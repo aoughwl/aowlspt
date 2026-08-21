@@ -566,12 +566,19 @@ var cUxExitSeen {.importc: "aowl_ux_exit_seen", nodecl.}: int32
 # taskbar Close, Alt+F4) terminates cleanly instead of entering the same hanging
 # async shutdown the Exit-button fix bypasses. See `aowlspt_uxpatch.h`.
 proc cUxCloseHook(): int32 {.importc: "aowl_uxpatch_close_hook", nodecl.}
+proc cUxCloseArm(rearmed: ptr int32): int32 {.
+  importc: "aowl_uxpatch_close_arm", nodecl.}
 proc cUxCloseHwnd(): uint64 {.importc: "aowl_uxpatch_close_hwnd", nodecl.}
+proc cUxCloseCtrlArm(): int32 {.importc: "aowl_uxpatch_close_ctrl_arm", nodecl.}
 var cUxCloseSeen {.importc: "aowl_ux_close_seen", nodecl.}: int32
-# The game window does not exist at il2cpp-init time, so the OS-close subclass
-# is armed by RETRY from the host tick loop. This records whether it is armed so
-# the retry stops (and logs) exactly once.
-var gCloseHookArmed = false
+# The OS-close subclass is armed CONTINUOUSLY from the host tick loop, not once.
+# The game window does not exist at il2cpp-init time (so a boot-only arm never
+# installs), and entering a raid re-creates the window and re-installs Unity's
+# own WndProc (so a once-armed subclass is silently lost mid-session -- which is
+# exactly why closing the window in a raid still hung). These track what has
+# been logged so the steady state is quiet.
+var gCloseEverArmed = false
+var gCloseLoggedRearms = 0'i32
 proc cUxVersionTarget(): Il2CppPtr {.
   importc: "aowl_uxpatch_version_target", nodecl.}
 proc cUxVersionLabelOffset(): int32 {.
@@ -1028,6 +1035,13 @@ var gBotCapDone = false
 var gSettingsUiSlot = -1
 var gSettingsUiProbe = false
 var gSettingsUiDone = false
+## Phase 1.5 native-settings CONTROL probe (kind=7 POSTFIX detour on
+## `SettingsScreen::EnsureTabInitialized`): its slot. Phase 1 showed the tabs'
+## `_createdControls` lists do not exist yet at `Show`; they are built lazily by
+## this method, so the walk that actually reads controls hangs off its POSTFIX.
+## Shares the `settingsUiProbe` flag with the Phase-1 hook. The walk lives in
+## `settingsui.nim` (included below) and NEVER writes.
+var gSettingsTabSlot = -1
 
 ## Whether the fragile static-RVA drain path may be used at all. OFF by default:
 ## it bound a real-but-wrong function on the live client and crashed the game, so
@@ -2679,6 +2693,13 @@ proc patchReturned(slot: int32; regs: Il2CppPtr): int32 {.
   if i == gVersionSlot:
     versionBrandFired(regs)
     return 0'i32
+  # Phase 1.5 native-settings control probe, by identity and for the same reason:
+  # a host drain (meth == nil) whose whole point is to read AFTER the original
+  # ran, because the original is what builds the tab's controls. Returns 0, so
+  # the caller gets exactly what the game produced -- this never changes a result.
+  if i == gSettingsTabSlot:
+    settingsTabInitFired(regs)
+    return 0'i32
   if i < 0 or i >= gPatches.len:
     return 0'i32
   if not gPatches[i].live:
@@ -2959,6 +2980,7 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
   let what = (if kind == 1: "render-phase" elif kind == 2: "settings-probe"
               elif kind == 3: "version-brand" elif kind == 5: "botdiag"
               elif kind == 4: "settings-ui-probe" elif kind == 6: "botcap"
+              elif kind == 7: "settings-tab-probe"
               else: "main-thread")
   tablesLock()
   let claimed = cHookClaim()
@@ -3012,12 +3034,15 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
     gSettingsUiSlot = int(claimed)
   elif kind == 6:
     gBotCapSlot = int(claimed)
+  elif kind == 7:
+    gSettingsTabSlot = int(claimed)
   else:
     gDrainSlot = int(claimed)
   tablesUnlock()
   if kind == 1:
     gRenderMethod = spec
-  elif kind == 2 or kind == 3 or kind == 4 or kind == 5 or kind == 6:
+  elif kind == 2 or kind == 3 or kind == 4 or kind == 5 or kind == 6 or
+       kind == 7:
     discard
   else:
     gDrainMethod = spec
@@ -3025,7 +3050,7 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
   okLog what & " bound to " & spec & " (" &
         $int(cHookStolen(hook)) & " bytes)" &
         (if perFrame or kind == 2 or kind == 3 or kind == 4 or kind == 5 or
-            kind == 6: "" else:
+            kind == 6 or kind == 7: "" else:
            "; it runs more than once a frame, so its firing count is not a " &
            "frame count")
   return true
@@ -4355,9 +4380,14 @@ proc reportRuntime() =
   # failure, and the host tick loop keeps calling `cUxCloseHook()` (idempotent --
   # it stores the original proc once and no-ops once hooked) until the window
   # exists, logging the success line then.
+  #
+  # The message-independent console-control path is armed once here; it costs
+  # nothing on a GUI launch with no console and covers the close routes that
+  # never become a window message at all.
+  discard cUxCloseCtrlArm()
   let closeHooked = cUxCloseHook()
   if closeHooked == 1'i32:
-    gCloseHookArmed = true
+    gCloseEverArmed = true
     okLog "exit fix: OS-close hook installed at boot -- window-close (X / " &
           "taskbar / Alt+F4) redirected to ExitProcess(0) via WndProc subclass"
   else:
@@ -4613,11 +4643,12 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "thread; fail-safe -- no write if the build/pointer does not check out."
   gSettingsUiProbe = readBoolKey("settingsUiProbe")
   if gSettingsUiProbe:
-    info "settingsUiProbe is set: a read-only detour on SettingsScreen.Show " &
-         "will walk the live control tree (tabs -> controls -> labels) and log " &
-         "each control's label, il2cpp type pointer and value-widget pointer " &
-         "when you open the settings screen (Phase 1 -- validates the field " &
-         "offsets live; NO write is ever performed)"
+    info "settingsUiProbe is set: read-only detours on SettingsScreen.Show " &
+         "(Phase 1, arming/thread proof) and a POSTFIX on " &
+         "SettingsScreen.EnsureTabInitialized (Phase 1.5, the walk that reads " &
+         "controls -- they do not exist yet at Show) will log every control's " &
+         "label, il2cpp klass pointer and value-widget pointer as each tab is " &
+         "built. Open Settings and click each tab. NO write is ever performed."
   gVersionBrand = readBoolKey("uxVersionBrand")
   gVersionWrite = readBoolKey("uxVersionBrandWrite")
   if gVersionWrite:
@@ -4697,6 +4728,14 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       # now and fires the first time the user opens the settings screen.
       if gSettingsUiProbe and not bindSettingsUiProbe(true):
         info "the settings-UI probe did not verify SettingsScreen.Show on this build"
+
+      # Phase 1.5: the hook that actually reads controls. `Show` above proved the
+      # mechanism but fires BEFORE any tab's controls exist; they are built
+      # lazily by EnsureTabInitialized, so the walk hangs off that method's
+      # POSTFIX. Same flag, same read-only discipline, separate slot.
+      if gSettingsUiProbe and not bindSettingsTabProbe(true):
+        info "the settings control probe did not verify " &
+             "SettingsScreen.EnsureTabInitialized on this build"
 
       # Version-label brand (opt-in). Static code, so it installs now and fires
       # when PreloaderUI.Awake runs on its way to the menu. Fail-safe if the
@@ -4853,25 +4892,45 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
     let elapsed = int64(now - lastTick)
     lastTick = now
 
-    # OS-close hook retry (root cause of "the window X still hangs"): the game's
-    # top-level window does not exist at il2cpp-init time, where this used to be
-    # armed exactly once, so EnumWindows found nothing and the subclass was never
-    # installed. Retry here, on a slow cadence, until it lands -- the call is
-    # cheap (one EnumWindows over this process's own windows) and idempotent
-    # (the original proc is stored once). Give up after ~5 minutes so a build
-    # where the window never appears does not poll forever.
-    if not gCloseHookArmed and now >= nextCloseTry:
-      nextCloseTry = now + 500'u64
-      if cUxCloseHook() == 1'i32:
-        gCloseHookArmed = true
-        okLog "exit fix: OS-close hook installed on window 0x" &
-              hexOf(cUxCloseHwnd()) & " -- window X / taskbar Close / Alt+F4 " &
-              "now exit via ExitProcess(0) instead of the hanging async shutdown"
-      elif now >= closeGiveUpAt:
-        gCloseHookArmed = true   # stop retrying; nothing worse than before
+    # OS-close hook: armed and RE-armed here, for the whole session.
+    #
+    # Two live findings drove this. First, the game's top-level window does not
+    # exist at il2cpp-init time, where the subclass used to be installed exactly
+    # once -- EnumWindows found nothing and it was never installed at all.
+    # Second, once that was fixed by retrying, closing the window IN A RAID
+    # still hung: entering a raid switches display mode, which re-creates
+    # Unity's window (new HWND) and re-installs Unity's own WndProc, so a
+    # once-armed subclass is quietly gone by the time the user clicks the X.
+    #
+    # So this never stops. Every second it re-checks every top-level window this
+    # process owns and re-subclasses any that is not currently carrying our proc,
+    # chaining to whatever proc it finds there now. Cheap (one EnumWindows over
+    # our own windows plus a GetWindowLongPtrW each) and a no-op in the steady
+    # state, so it is quiet: it only logs the first arm and any RE-arm, which is
+    # itself the evidence that the raid transition stole the window.
+    if now >= nextCloseTry:
+      nextCloseTry = now + 1000'u64
+      var rearmed = 0'i32
+      let armed = cUxCloseArm(addr rearmed)
+      if rearmed > 0'i32:
+        if not gCloseEverArmed:
+          gCloseEverArmed = true
+          okLog "exit fix: OS-close hook installed on window 0x" &
+                hexOf(cUxCloseHwnd()) & " (" & $armed & " window(s) covered) " &
+                "-- window X / taskbar Close / Alt+F4 now exit via " &
+                "ExitProcess(0) instead of the hanging async shutdown"
+        else:
+          okLog "exit fix: OS-close hook re-armed on window 0x" &
+                hexOf(cUxCloseHwnd()) & " (previous subclass was replaced or " &
+                "the window was re-created -- typically the raid's display-mode " &
+                "change); " & $armed & " window(s) now covered"
+        gCloseLoggedRearms = gCloseLoggedRearms + rearmed
+      elif not gCloseEverArmed and now >= closeGiveUpAt and
+           gCloseLoggedRearms == 0'i32:
+        gCloseLoggedRearms = 1'i32   # log this once, but keep trying
         warn "exit fix: no top-level game window appeared within 5 minutes; " &
-             "OS-close hook not installed (window-X may still hang; the Exit " &
-             "button is patched)"
+             "OS-close hook not installed yet (window-X may still hang; the " &
+             "Exit button is patched). Still retrying."
     # Log any newly-seen resolver host from the image-CDN hook. Drained here, on
     # the host thread, because the hook fires on the game's DNS thread where
     # opening a log file mid-resolve is not safe. First sight only, so this is
