@@ -46,10 +46,47 @@ Field offsets within the structs (v31, this build):
   Il2CppMethodDefinition: nameIndex@0, token@24 (uint32)
   Il2CppImageDefinition: nameIndex@0, assemblyIndex@4, typeStart@8, typeCount@12
 
+## Field offsets (added -- Phase 0 of native settings)
+
+Method RVAs live in per-image `methodPointers`; FIELD offsets do NOT live in
+global-metadata at all. They live in `GameAssembly.dll` via the registration
+struct `Il2CppMetadataRegistration.fieldOffsets` -- an `int32*[]` indexed by
+`typeDefinitionIndex`, each entry pointing to that type's `int32[]` of per-field
+byte offsets. The field NAMES + type indices come from metadata `fields`
+(prop 11, `Il2CppFieldDefinition` = nameIndex@0, typeIndex@4, token@8, 12 bytes),
+sliced by the type's `fieldStart@32`/`field_count@68` in `Il2CppTypeDefinition`.
+
+We locate `Il2CppMetadataRegistration` by a self-checking signature scan of
+`.data`/`.rdata`: it is the ONLY 8-aligned site where u32@+0x50 (fieldOffsetsCount)
+== NTYPES and u32@+0x60 (typeDefinitionsSizesCount) == NTYPES with valid image
+pointers at +0x58 and +0x68. The static struct layout (64-bit) is a run of
+`{int32 count; void* ptr}` pairs: genericClasses(0x00), genericInsts(0x10),
+genericMethodTable(0x20), types(0x30), methodSpecs(0x40), fieldOffsets(0x50),
+typeDefinitionsSizes(0x60), metadataUsages(0x70).
+
+Static-vs-instance + field TYPE come from the field's `Il2CppType` (in
+`metadataRegistration.types`, index = FieldDefinition.typeIndex): a 16-byte
+struct `{void* data; u32 bits; ...}` where `bits & 0xFFFF` = attrs
+(FIELD_ATTRIBUTE_STATIC = 0x10), `(bits>>16)&0xFF` = the Il2CppTypeEnum. For a
+CLASS/VALUETYPE type, `data` is the referenced typeDefinitionIndex, so field
+type names resolve back to real class names (and the parent chain walks the same
+way: `types[typedef.parentIndex@16].data` = the base type's typeDefinitionIndex).
+
+BUILT-IN SELF-CHECK: `System.String` must show `_stringLength` @ +0x10 and
+`_firstChar` @ +0x14 (the exact layout the live version-brand raw write relied
+on). `verify-fields` asserts it, the same way `verify-be` asserts the BE RVAs.
+
 Usage:
   il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> find <substr>
   il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> type <idx>...
   il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> verify-be
+  il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> fields <TypeName>
+        # every field (incl. inherited) with offset + static/inst + type;
+        # <TypeName> is an exact full name or a unique substring
+  il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> verify-fields
+        # System.String _stringLength@0x10 / _firstChar@0x14 self-check
+  il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> settings-table
+        # the SettingsScreen/SettingControl offset table Phase 1 will probe
 """
 import struct, sys
 
@@ -204,6 +241,158 @@ class Resolver:
             if needle in full.lower():
                 yield t, full
 
+    # ---- field-offset resolution (Il2CppMetadataRegistration.fieldOffsets) ----
+
+    # Il2CppTypeEnum -> short name; primitives are exact, the rest a category.
+    TENUM = {1: "void", 2: "bool", 3: "char", 4: "sbyte", 5: "byte", 6: "short",
+             7: "ushort", 8: "int", 9: "uint", 0xa: "long", 0xb: "ulong",
+             0xc: "float", 0xd: "double", 0xe: "string", 0xf: "ptr",
+             0x11: "valuetype", 0x12: "class", 0x13: "var", 0x14: "array",
+             0x15: "genericinst", 0x16: "typedref", 0x18: "IntPtr",
+             0x19: "UIntPtr", 0x1b: "fnptr", 0x1c: "object", 0x1d: "szarray",
+             0x1e: "mvar"}
+
+    def _fields_meta(self):
+        # metadata `fields` = property 11 (Il2CppFieldDefinition, 12 bytes)
+        self.FLD_OFF = struct.unpack_from("<i", self.m, 8 + 11*8)[0]
+
+    def _find_metadata_registration(self):
+        """Signature scan: the unique .data/.rdata site with fieldOffsetsCount
+        (+0x50) and typeDefinitionsSizesCount (+0x60) both == NTYPES and valid
+        image pointers following each. Returns the struct VA."""
+        N = self.NTYPES
+        cand = []
+        for name, vs, vz, raw, rz in self.SEC:
+            if name not in (".data", ".rdata", ".data1"):
+                continue
+            for fo in range(raw, raw + (rz & ~7) - 0x28, 8):
+                if struct.unpack_from("<I", self.b, fo)[0] != N:
+                    continue
+                p1 = struct.unpack_from("<Q", self.b, fo + 8)[0]
+                if self.v2f(p1) is None:
+                    continue
+                if struct.unpack_from("<I", self.b, fo + 0x10)[0] != N:
+                    continue
+                p2 = struct.unpack_from("<Q", self.b, fo + 0x18)[0]
+                if self.v2f(p2) is None:
+                    continue
+                cand.append(self.f2v(fo) - 0x50)
+        if len(cand) != 1:
+            sys.exit("metadata-registration scan found %d candidates (want 1); "
+                     "field-offset layout may differ on this build" % len(cand))
+        self.MREG = cand[0]
+        self.TYPES_PTR = self.rq(self.MREG + 0x38)   # types[] (Il2CppType*[])
+        self.FOFF_PTR = self.rq(self.MREG + 0x58)    # fieldOffsets (int32*[])
+
+    def _ensure_fields(self):
+        if not hasattr(self, "FOFF_PTR"):
+            self._fields_meta()
+            self._find_metadata_registration()
+
+    def _typename_va(self, tva, depth=0):
+        """Readable name of the Il2CppType at VA `tva`."""
+        if tva is None or depth > 4:
+            return "?"
+        bits = struct.unpack_from("<I", self.b, self.v2f(tva) + 8)[0]
+        te = (bits >> 16) & 0xFF
+        data = self.rq(tva)
+        if te in (0x11, 0x12) and data is not None and data < self.NTYPES:
+            return self.tname(data)[1]
+        if te == 0x1d and data is not None:      # szarray: data -> element type
+            return self._typename_va(data, depth+1) + "[]"
+        if te == 0x0f and data is not None:      # ptr
+            return self._typename_va(data, depth+1) + "*"
+        if te == 0x15 and data is not None:      # genericinst -> Il2CppGenericClass
+            return self._genericinst_name(data, depth)
+        return self.TENUM.get(te, hex(te))
+
+    def _genericinst_name(self, gc_va, depth=0):
+        # Il2CppGenericClass { Il2CppType* type; GenericContext{ class_inst*,
+        #                       method_inst* }; Il2CppClass* cached_class }
+        gd = self.rq(gc_va)                      # Il2CppType* of the generic def
+        class_inst = self.rq(gc_va + 8)          # Il2CppGenericInst* (class args)
+        gdata = self.rq(gd) if gd is not None else None
+        base = self.tname(gdata)[1] if (gdata is not None and gdata < self.NTYPES) \
+            else "?"
+        base = base.split("`")[0]
+        args = []
+        if class_inst:
+            argc = struct.unpack_from("<Q", self.b, self.v2f(class_inst))[0]
+            argv = self.rq(class_inst + 8)
+            for i in range(min(argc, 6)):
+                args.append(self._typename_va(self.rq(argv + i*8), depth+1))
+        return "%s<%s>" % (base, ",".join(args))
+
+    def field_typename(self, tidx):
+        return self._typename_va(self.rq(self.TYPES_PTR + tidx*8))
+
+    def field_is_static(self, tidx):
+        tva = self.rq(self.TYPES_PTR + tidx*8)
+        attrs = struct.unpack_from("<I", self.b, self.v2f(tva) + 8)[0] & 0xFFFF
+        return bool(attrs & 0x10)
+
+    def declared_fields(self, t):
+        """[(name, offset, is_static, typename)] for fields DECLARED on type t."""
+        self._ensure_fields()
+        bb = self.TD_OFF + t*self.TDS
+        fs = struct.unpack_from("<i", self.m, bb+32)[0]
+        fc = struct.unpack_from("<H", self.m, bb+68)[0]
+        entry = self.rq(self.FOFF_PTR + t*8)
+        base = self.v2f(entry) if entry else None
+        out = []
+        for i in range(fc):
+            ni, ti = struct.unpack_from("<ii", self.m, self.FLD_OFF + (fs+i)*12)
+            off = struct.unpack_from("<i", self.b, base + i*4)[0] if base else None
+            out.append((self.s(ni), off, self.field_is_static(ti),
+                        self.field_typename(ti)))
+        return out
+
+    def parent_type(self, t):
+        """typeDefinitionIndex of t's base class, or None."""
+        self._ensure_fields()
+        par = struct.unpack_from("<i", self.m, self.TD_OFF + t*self.TDS + 16)[0]
+        if par < 0:
+            return None
+        tva = self.rq(self.TYPES_PTR + par*8)
+        if tva is None:
+            return None
+        bits = struct.unpack_from("<I", self.b, self.v2f(tva) + 8)[0]
+        if ((bits >> 16) & 0xFF) not in (0x11, 0x12):
+            return None
+        data = self.rq(tva)
+        return data if (data is not None and 0 <= data < self.NTYPES) else None
+
+    def all_fields(self, t):
+        """Fields including inherited: [(declaring_full, name, off, static, ty)],
+        base classes first."""
+        chain = []
+        cur = t
+        seen = set()
+        while cur is not None and cur not in seen:
+            seen.add(cur)
+            chain.append(cur)
+            cur = self.parent_type(cur)
+        rows = []
+        for ct in reversed(chain):
+            ns, nm = self.tname(ct)
+            full = (ns + "." + nm) if ns else nm
+            for name, off, st, ty in self.declared_fields(ct):
+                rows.append((full, name, off, st, ty))
+        return rows
+
+    def find_one(self, name):
+        """Exact full-name match, else unique substring match; else exit."""
+        hits = list(self.find(name))
+        exact = [(t, f) for t, f in hits if f == name or f.split(".")[-1] == name]
+        if len(exact) == 1:
+            return exact[0][0]
+        if len(hits) == 1:
+            return hits[0][0]
+        if not hits:
+            sys.exit("no type matches %r" % name)
+        sys.exit("ambiguous %r matches: %s" %
+                 (name, ", ".join(f for _, f in hits[:12])))
+
 
 def main():
     if len(sys.argv) < 4:
@@ -237,6 +426,61 @@ def main():
                     print("   %-24s rid=%d got=%s exp=%s %s" %
                           (nm, rid, hex(got) if got else None, hex(known[nm]), m))
             print("ALL BE RVAs REPRODUCED" if ok else "RESOLVER WRONG")
+    elif cmd == "fields":
+        t = R.find_one(sys.argv[4])
+        R._ensure_fields()
+        ns, nm = R.tname(t)
+        full = (ns + "." + nm) if ns else nm
+        print("FIELDS", t, full, " image=", R.image_of_type(t))
+        print("  MetadataRegistration @ %s  fieldOffsets @ %s" %
+              (hex(R.MREG) if hasattr(R, "MREG") else "?",
+               hex(R.FOFF_PTR) if hasattr(R, "FOFF_PTR") else "?"))
+        print("  %-8s %-6s %-34s %-38s %s" %
+              ("Offset", "Kind", "Field", "FieldType", "DeclaredBy"))
+        for decl, name, off, st, ty in R.all_fields(t):
+            print("  %-8s %-6s %-34s %-38s %s" %
+                  (hex(off) if off is not None else "?",
+                   "STATIC" if st else "inst", name, ty, decl))
+    elif cmd == "verify-fields":
+        t = R.find_one("System.String")
+        want = {"_stringLength": 0x10, "_firstChar": 0x14}
+        got = {name: off for _, name, off, st, _ in R.all_fields(t)
+               if name in want and not st}
+        ok = all(got.get(k) == v for k, v in want.items())
+        for k, v in want.items():
+            g = got.get(k)
+            print("   %-16s got=%s exp=%s %s" %
+                  (k, hex(g) if g is not None else None, hex(v),
+                   "OK" if g == v else "MISMATCH"))
+        print("STRING LAYOUT SELF-CHECK PASSED" if ok else "RESOLVER WRONG")
+        if not ok:
+            sys.exit(1)
+    elif cmd == "settings-table":
+        # the offsets Phase 1 of native-settings will probe. Names are matched
+        # against EFT.UI.Settings.* full names to avoid ambiguity.
+        targets = [
+            "EFT.UI.Settings.SettingsScreen",
+            "EFT.UI.Settings.SettingsTab",
+            "EFT.UI.Settings.SettingControl",
+            "EFT.UI.Settings.SettingFloatSlider",
+            "EFT.UI.Settings.SettingToggle",
+            "EFT.UI.Settings.SettingDropDown",
+            "EFT.UI.Settings.SettingSelectSlider",
+        ]
+        print("%-22s %-34s %-8s %-6s %-38s %s" %
+              ("Type", "Field", "Offset", "Kind", "FieldType", "DeclaredBy"))
+        for name in targets:
+            try:
+                t = R.find_one(name)
+            except SystemExit:
+                print("%-22s <unresolved>" % name.split(".")[-1])
+                continue
+            short = name.split(".")[-1]
+            # own declared fields only for the table (inherited shown under base)
+            for fname, off, st, ty in R.declared_fields(t):
+                print("%-22s %-34s %-8s %-6s %-38s %s" %
+                      (short, fname, hex(off) if off is not None else "?",
+                       "STATIC" if st else "inst", ty, short))
 
 
 if __name__ == "__main__":
