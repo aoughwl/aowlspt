@@ -881,8 +881,18 @@ proc generateProfile*(t: BotTables; base: string; req: BotRequest;
 
   var info = parseObject(field(base, "Info"))
   setText(info, "Nickname", pickName(t, index))
+  # Side follows the role. A PMC role MUST carry a PMC side or the client's
+  # boss-spawn scenario (which is how SPT injects PMCs -- a `BossLocationSpawn`
+  # with `BossName`=`pmcBEAR`/`pmcUSEC`) refuses to place it: a profile that says
+  # `Role=pmcUSEC` but `Side=Savage` is self-contradictory and the bot is
+  # generated into the pool but never instantiated. `pmcBEAR`/`pmcbot` are BEAR,
+  # `pmcUSEC` is USEC, everything else (assault, marksman, bosses, followers) is
+  # `Savage`.
+  let roleLc = toLowerAscii(req.role)
   setText(info, "Side",
-          if toLowerAscii(req.role) == "pmcbot": "Bear" else: "Savage")
+          if roleLc == "pmcbear" or roleLc == "pmcbot": "Bear"
+          elif roleLc == "pmcusec": "Usec"
+          else: "Savage")
   # **Not `Voice`.** `Info` on the client's `BotBase` has no such member; the
   # voice is a `Nullable<MongoId>` on `Customization` and is written there.
   # Removed rather than merely not written, so that a base carrying the old

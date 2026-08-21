@@ -387,103 +387,68 @@ proc offlineScavWaves(zones: seq[string]): string =
   a.add oneWave(number, 360, 420, 1, 3, refillZone)
   result = done(a).text
 
-proc oneBossGroup(role, zone: string; escort, time: int): JsonObject =
-  ## One AI group in BSG's `BossLocationSpawn` shape -- the exact envelope the
-  ## real backend used to populate an offline raid.
+proc onePmcWave(role, escortAmount: string): JsonObject =
+  ## One PMC group in BSG's `BossLocationSpawn` shape, byte-faithful to SPT's
+  ## proven offline recipe (`assets/configs/pmc.json` `customPmcWaves`, pushed
+  ## onto `location.BossLocationSpawn` by `PmcWaveGenerator.applyWaveChangesToMap`).
   ##
-  ## Capture raid1 seq 158 (a real Sandbox/tutorial raid) filled the whole map
-  ## from FIVE `BossLocationSpawn` entries whose `BossName`/`BossEscortType` was
-  ## `assaultTutorial` -- a plain wild-spawn role, not a real boss -- with
-  ## `IgnoreMaxBots: true` and `Time: -1`, while the single `waves[]` entry was
-  ## inert (`time_min/max = -1`, `slots = 0`). So `BossName` is a `WildSpawnType`
-  ## and a bare "assault" (scav) or "pmcBEAR"/"pmcUSEC" (PMC) is as valid there
-  ## as `bossTagilla`; the boss-spawn scenario is what actually runs in a local
-  ## raid. `IgnoreMaxBots` bypasses the `BotMax` budget and `Time = -1` fires the
-  ## group at raid start.
+  ## PMCs are the ONE population SPT injects through `BossLocationSpawn`, and it
+  ## is the same boss-spawn scenario that already places Tagilla live -- so this
+  ## path is the one with direct evidence of working. `BossName`/`BossEscortType`
+  ## are `pmcUSEC`/`pmcBEAR` exactly (not sptBear/exUsec); `BossZone` is EMPTY,
+  ## which means "any open zone" and is what SPT ships; `IgnoreMaxBots` bypasses
+  ## the `BotMax` budget; `Time = -1` fires at raid start. `BossEscortAmount` is
+  ## a weighted CSV the client samples ("0,0,1,1,2" => mostly 1, sometimes 0/2).
+  ##
+  ## NOTE: a `pmcBEAR`/`pmcUSEC` bot MUST come back from `bot/generate` with the
+  ## matching PMC `Side` (Bear/Usec) -- see `emu/bots.generateProfile`. A PMC
+  ## role carrying `Side: Savage` is generated into the pool but never placed.
   var w = obj()
   put(w, "BossChance", 100)
   put(w, "BossDifficult", "normal")
-  # BSG serialises the escort count as a STRING ("2"), not a number -- match it.
-  put(w, "BossEscortAmount", $escort)
+  put(w, "BossEscortAmount", escortAmount)   # weighted CSV, sampled by client
   put(w, "BossEscortDifficult", "normal")
   put(w, "BossEscortType", role)
   put(w, "BossName", role)
   put(w, "BossPlayer", false)
-  put(w, "BossZone", zone)
+  put(w, "BossZone", "")                      # empty => any open zone (SPT)
   put(w, "IgnoreMaxBots", true)
   put(w, "RandomTimeSpawn", false)
+  # Superset of spawn modes so the entry is not filtered out whatever mode the
+  # local session runs in; Tagilla's own entry carries the same three and places.
   var modes = arr()
   modes.add "regular"
   modes.add "pve"
   modes.add "pvp-season"
   put(w, "SpawnMode", modes)
   put(w, "Supports", jnull())
-  put(w, "Time", time)
+  put(w, "Time", -1)
   put(w, "TriggerId", "")
   put(w, "TriggerName", "")
   result = w
 
-proc bossSpawnZones(existing: JsonRef; fallback: seq[string]): seq[string] =
-  ## The zones an offline scav group can actually be placed in. The map's own
-  ## `BossLocationSpawn` entries already name zones the boss-spawn scenario
-  ## accepts (Factory's Tagilla uses `"BotZone"`), and those are the safest
-  ## targets -- in the capture the `BossZone` names (`ZoneSandbox`...) did not
-  ## even appear among the `SpawnPointParams` `BotZoneName`s, so a boss zone is
-  ## resolved by the map's scene rather than by `SpawnPointParams`. Prefer the
-  ## distinct `BossZone` of the existing entries; fall back to the SpawnPoint
-  ## bot zones, then to the unnamed default.
-  result = @[]
-  if existing.isArray:
-    var i = 0
-    while i < count(existing):
-      let z = at(existing, i).field("BossZone").asText("")
-      var seen = false
-      for e in result:
-        if e == z: seen = true
-      if not seen: result.add z
-      inc i
-  if result.len == 0:
-    result = fallback
-  if result.len == 0:
-    result = @[""]
-
-proc offlineBossScavs(existing: JsonRef; fallbackZones: seq[string]): string =
-  ## Populate an offline raid the way the real backend does: through the
-  ## `BossLocationSpawn` scenario, not `waves[]`.
+proc offlinePmcWaves(existing: JsonRef): string =
+  ## The map's own `BossLocationSpawn` (Tagilla &c.) with PMC groups appended,
+  ## following SPT's `customPmcWaves` recipe exactly.
   ##
-  ## This is the real root cause of "only the boss spawns". In a LOCAL raid the
-  ## client runs the boss-spawn scenario against `BossLocationSpawn`, which is
-  ## why Tagilla appears -- but the wave scenario that `waves[]` feeds does not
-  ## drive the offline population (capture raid1: the sole wave was inert while
-  ## five boss entries filled the map). Rewriting `waves[]`, opening the budget
-  ## and zeroing the spawn-lock therefore changed nothing live. Adding scav
-  ## groups through the same `BossLocationSpawn` path the boss already uses is
-  ## what actually puts scavs on the map.
-  ##
-  ## The map's existing boss entries (Tagilla &c.) are preserved and come first;
-  ## scav and PMC groups are appended -- several immediate, then timed refills.
-  ## PMC roles (`pmcBEAR`/`pmcUSEC`) are the ones the map's own
-  ## `BotLocationModifier.AdditionalHostilitySettings` already names, so they are
-  ## valid `WildSpawnType`s on this exact data.
+  ## Scavs are deliberately NOT injected here. SPT never spawns plain `assault`
+  ## scavs through `BossLocationSpawn` -- they come from the map `waves[]` -- and
+  ## `BossName="assault"` was disproven live (only the real boss spawned). So the
+  ## boss path carries bosses and PMCs; scavs remain the wave system's job (set
+  ## up in `localLoot`). USEC is weighted ~60% (SPT `pmc.isUsec = 60`).
   var a = arr()
   if existing.isArray:
     var i = 0
     while i < count(existing):
       a.add raw(at(existing, i).raw)
       inc i
-  let zones = bossSpawnZones(existing, fallbackZones)
-  # Immediate scav groups, one per real bot zone (cycled), so the map is
-  # populated the moment the raid loads.
-  var n = 0
-  while n < 5:
-    a.add oneBossGroup("assault", zones[n mod zones.len], 3, -1)
-    inc n
-  # A couple of PMCs at the start, then scav refills so the map does not go quiet.
-  a.add oneBossGroup("pmcBEAR", zones[0], 1, -1)
-  a.add oneBossGroup("pmcUSEC", if zones.len > 1: zones[1] else: zones[0], 1, -1)
-  a.add oneBossGroup("assault", zones[0], 2, 120)
-  a.add oneBossGroup("assault", if zones.len > 1: zones[1] else: zones[0], 2, 240)
-  a.add oneBossGroup("assault", zones[0], 2, 420)
+  # A small, staggered CSV of escort sizes so the PMC count varies raid to raid
+  # without ever flooding a small map like Factory.
+  a.add onePmcWave("pmcUSEC", "0,1,1,2")
+  a.add onePmcWave("pmcUSEC", "1,1,2,3")
+  a.add onePmcWave("pmcBEAR", "0,1,1,2")
+  a.add onePmcWave("pmcUSEC", "1,2")
+  a.add onePmcWave("pmcBEAR", "1,2")
   result = done(a).text
 
 proc localLoot*(locationId: string; nowSeconds: int;
@@ -570,16 +535,14 @@ proc localLoot*(locationId: string; nowSeconds: int;
     let baseJson = whole(base)
     let zones = botZonesFor(baseJson)
     setRaw(d, "waves", offlineScavWaves(zones))
-    # The decisive one. Capture raid1 proves post-1.0 populates an offline raid
-    # through the `BossLocationSpawn` scenario, NOT `waves[]`: the real backend
-    # filled the map from five boss entries carrying a regular `assaultTutorial`
-    # role while the lone wave was inert. In a local raid the client runs the
-    # boss-spawn scenario (which is why Tagilla spawns on an otherwise empty
-    # Factory) but the wave scenario does not drive the population -- so every
-    # wave/budget/spawn-lock fix above left the map scavless. Add assault groups
-    # through the same boss path, preserving the map's real bosses.
+    # PMCs, the SPT way: appended to `BossLocationSpawn` as `pmcUSEC`/`pmcBEAR`
+    # entries (SPT `PmcWaveGenerator` + `configs/pmc.json customPmcWaves`). This
+    # rides the boss-spawn scenario -- the same path that places Tagilla live --
+    # so it is the population mechanism with direct evidence of working offline.
+    # Scavs are NOT put here: SPT drives plain `assault` scavs through `waves[]`
+    # (rewritten just above), and `BossName="assault"` was disproven live.
     setRaw(d, "BossLocationSpawn",
-           offlineBossScavs(baseJson.field("BossLocationSpawn"), zones))
+           offlinePmcWaves(baseJson.field("BossLocationSpawn")))
     setNumber(d, "BotStart", 0)
     setNumber(d, "BotStop", 86400)
     if baseJson.field("BotMax").asInt(0) < 20: setNumber(d, "BotMax", 20)
