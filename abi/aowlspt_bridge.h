@@ -366,79 +366,59 @@ static int32_t aowl_bridge_settingstab_target_count(void) {
 }
 
 /* ------------------------------------------------------------------ *
- * The settings CONTROL-CREATION target (Phase 1.6) -- where the list is filled
+ * The settings-screen TICK target (Phase 1.7) -- a Unity-thread heartbeat
  *
- * `EFT.UI.Settings.SettingsTab::OnTabSelected` @ RVA 0x171BDA0 (VA 0x18171BDA0).
+ * `EFT.UI.Settings.GameSettingsTab::Update` @ RVA 0x1703680 (VA 0x181703680).
  *
- * WHY: Phase 1.5 hooked `EnsureTabInitialized` and the live log proved the tab
- * OBJECTS are real and handed to us on the Unity thread -- but every tab's
- * `_createdControls` (+0x88) still read NULL. The offset was never wrong. The
- * disassembly settles it three ways:
+ * WHY A TICK AND NOT A TRIGGER. Phase 1.6 hooked `SettingsTab::OnTabSelected`
+ * and it NEVER FIRED across five real tab clicks. The reason is now proven: a
+ * full-section cross-reference scan of the 81MB `il2cpp` segment (where the
+ * generated code actually lives -- NOT `.text`) finds **zero** callers of
+ * 0x171BDA0. It is dead code in this build. The same scan finds zero direct
+ * callers of every tab's Show / OnFirstSelect / CreateControls too, because they
+ * are all vtable-dispatched -- so "who calls it" cannot be answered statically,
+ * and each guess costs a full deploy-and-click cycle to disprove.
  *
- *   * `SettingsTab::CleanupCreatedControls` (0x171BE50) -- declared on the BASE
- *     and used by every derived tab -- does `mov r9, [rdi+0x88]`. So 0x88 is the
- *     created-controls list, it is a BASE field, and it is therefore at the same
- *     offset in GameSettingsTab / GraphicsSettingsTab / PostFXSettingsTab /
- *     SoundSettingsTab / ControlSettingsTab alike. The differing klass pointers
- *     in the live log are just derived types; single inheritance puts the base
- *     fields first, so they share this offset. NOT a per-type layout problem.
- *   * Nothing in `GameSettingsTab` writes [this+0x88] at all -- not Awake, not
- *     Show, not OnFirstSelect, not CreateControls. The write lives in the
- *     GENERIC `SettingsTab::CreateControl<T>` (no RVA in metadata: generic), so
- *     the list is allocated when the FIRST control is created.
- *   * `SettingsTab::OnTabSelected` is what triggers that creation, and it is the
- *     ONLY thing that does:
+ * So we stop guessing the trigger and take a heartbeat instead. This is a
+ * MonoBehaviour `Update`: Unity's runtime drives it every frame while the game
+ * settings tab component is enabled, so it is a guaranteed Unity-main-thread
+ * tick for as long as the settings screen is up, and it costs nothing when the
+ * screen is closed (it simply is not called). From it the probe re-reads each
+ * registered tab's `_createdControls` on a throttle and reports the census the
+ * first time it becomes non-empty -- whatever ends up filling it, whenever.
  *
- *         cmp  byte [rcx+0x90], 0        ; "first select done?" flag
- *         mov  rbx, rcx
- *         jne  skip
- *           mov  rdx, [rcx]              ; klass
- *           mov  byte [rcx+0x90], 1      ; mark done
- *           mov  rax, [rdx+0x2C8]        ; vtable slot -> OnFirstSelect
- *           call rax                     ; -> CreateControls -> fills +0x88
- *         skip:
- *           mov  rax, [rdx+0x2D8]        ; vtable slot -> OnSelect
- *           jmp  rax                     ; TAIL JUMP
+ * Hooked PREFIX: we want the tick, not the method's result, and a prefix is the
+ * cheaper of the two. RCX = the GameSettingsTab (unused; the probe walks the
+ * registry, not `this`).
  *
- *     `SettingsTab::Close` (0x171BDF0) is the mirror image: it tests
- *     [rcx+0x88], calls CleanupCreatedControls, and resets [rbx+0x90] to 0 --
- *     confirming 0x90 is the first-select latch and 0x88 the list.
- *
- * So the controls exist only after a tab is actually SELECTED, and this method
- * is the moment. Hooked POSTFIX: RCX = the SettingsTab itself (exactly the
- * object to walk, no group indirection needed). The tail `jmp rax` into
- * OnSelect is harmless to a postfix -- OnSelect's own `ret` returns through our
- * thunk, so we simply run after BOTH have finished, which is later still and
- * strictly safer.
- *
- * Prologue, byte-verified against GameAssembly.dll -- and the cleanest steal of
- * any target here, because NOTHING in it is RIP-relative:
- *   40 53                   push rbx
- *   48 83 EC 20             sub  rsp, 0x20
- *   80 B9 90 00 00 00 00    cmp  byte [rcx+0x90], 0
- *   48 8B D9                mov  rbx, rcx
- * = 2+4+7+3 = 16 exactly, ending immediately before `75 1A` (jne), so the steal
- * lands on an instruction boundary and is position-independent.
+ * Prologue, byte-verified against GameAssembly.dll:
+ *   40 57                   push rdi
+ *   48 83 EC 40             sub  rsp, 0x40
+ *   80 3D E2 AC 9B 05 00    cmp  byte [rip+0x59BACE2], 0
+ *   48 8B F9                mov  rdi, rcx
+ * = 2+4+7+3 = 16 exactly, ending immediately before `75 4B` (jne). The single
+ * RIP-relative operand is the same class-init `cmp` every other target here
+ * carries, which the detour copier fixes up.
  */
-static const AowlBridgeTarget aowl_bridge_settingstabsel_targets[] = {
-    { "EFT.UI.Settings.SettingsTab::OnTabSelected", 0x171BDA0u,
-      { 0x40,0x53, 0x48,0x83,0xEC,0x20,
-        0x80,0xB9,0x90,0x00,0x00,0x00,0x00, 0x48,0x8B,0xD9 }, 16, 0 },
+static const AowlBridgeTarget aowl_bridge_settingstick_targets[] = {
+    { "EFT.UI.Settings.GameSettingsTab::Update", 0x1703680u,
+      { 0x40,0x57, 0x48,0x83,0xEC,0x40,
+        0x80,0x3D,0xE2,0xAC,0x9B,0x05,0x00, 0x48,0x8B,0xF9 }, 16, 0 },
 };
-#define AOWL_BRIDGE_SETTINGSTABSEL_TARGET_COUNT \
-    ((int32_t)(sizeof(aowl_bridge_settingstabsel_targets) / \
-               sizeof(aowl_bridge_settingstabsel_targets[0])))
+#define AOWL_BRIDGE_SETTINGSTICK_TARGET_COUNT \
+    ((int32_t)(sizeof(aowl_bridge_settingstick_targets) / \
+               sizeof(aowl_bridge_settingstick_targets[0])))
 
-static void* aowl_bridge_settingstabsel_target_at(int32_t i) {
+static void* aowl_bridge_settingstick_target_at(int32_t i) {
     HMODULE ga;
     const AowlBridgeTarget* t;
     unsigned char* p;
     MEMORY_BASIC_INFORMATION mbi;
-    if (i < 0 || i >= AOWL_BRIDGE_SETTINGSTABSEL_TARGET_COUNT) return NULL;
+    if (i < 0 || i >= AOWL_BRIDGE_SETTINGSTICK_TARGET_COUNT) return NULL;
     ga = GetModuleHandleA("GameAssembly.dll");
     if (!ga) return NULL;
     aowl_bridge_base_found = 1;
-    t = &aowl_bridge_settingstabsel_targets[i];
+    t = &aowl_bridge_settingstick_targets[i];
     p = (unsigned char*)ga + t->rva;
     if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0) return NULL;
     if (mbi.State != MEM_COMMIT) return NULL;
@@ -450,12 +430,12 @@ static void* aowl_bridge_settingstabsel_target_at(int32_t i) {
     aowl_bridge_last_rva = (int32_t)t->rva;
     return (void*)p;
 }
-static const char* aowl_bridge_settingstabsel_target_name(int32_t i) {
-    if (i < 0 || i >= AOWL_BRIDGE_SETTINGSTABSEL_TARGET_COUNT) return "";
-    return aowl_bridge_settingstabsel_targets[i].name;
+static const char* aowl_bridge_settingstick_target_name(int32_t i) {
+    if (i < 0 || i >= AOWL_BRIDGE_SETTINGSTICK_TARGET_COUNT) return "";
+    return aowl_bridge_settingstick_targets[i].name;
 }
-static int32_t aowl_bridge_settingstabsel_target_count(void) {
-    return AOWL_BRIDGE_SETTINGSTABSEL_TARGET_COUNT;
+static int32_t aowl_bridge_settingstick_target_count(void) {
+    return AOWL_BRIDGE_SETTINGSTICK_TARGET_COUNT;
 }
 
 /* The i'th target's verified code pointer, or NULL.

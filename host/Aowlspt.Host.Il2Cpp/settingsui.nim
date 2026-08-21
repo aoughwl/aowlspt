@@ -39,13 +39,13 @@ proc cSuiGroupName(group: int32): Il2CppPtr {.
 proc cSuiOffFirstSelected(): int32 {.
   importc: "aowl_sui_off_firstselected", nodecl.}
 
-## Phase 1.6 target: the tab SELECTION point, where the controls get created.
+## Phase 1.7 target: the Unity-thread heartbeat we poll from.
 proc cBridgeSettingsSelTargetCount(): int32 {.
-  importc: "aowl_bridge_settingstabsel_target_count", nodecl.}
+  importc: "aowl_bridge_settingstick_target_count", nodecl.}
 proc cBridgeSettingsSelTargetAt(i: int32): Il2CppPtr {.
-  importc: "aowl_bridge_settingstabsel_target_at", nodecl.}
+  importc: "aowl_bridge_settingstick_target_at", nodecl.}
 proc cBridgeSettingsSelTargetName(i: int32): Il2CppPtr {.
-  importc: "aowl_bridge_settingstabsel_target_name", nodecl.}
+  importc: "aowl_bridge_settingstick_target_name", nodecl.}
 
 ## Phase 1.5 target: the tab BUILDER, hooked postfix.
 proc cBridgeSettingsTabTargetCount(): int32 {.
@@ -297,7 +297,12 @@ proc suiTabInitBody(a: Il2CppPtr): Il2CppPtr {.
     return cast[Il2CppPtr](1)
   if group >= 0'i32 and int(group) < gSuiGroupsLogged.len and
      gSuiGroupsLogged[int(group)]:
-    return cast[Il2CppPtr](1)     # already censused this tab; stay quiet
+    # Already announced this tab. But this call IS a tab click (OpenGroup ->
+    # ShowScreen -> EnsureTabInitialized runs every time, early-returning via the
+    # HashSet at +0x138), so it is a free Unity-thread poll opportunity: re-read
+    # the registered tabs in case the controls have appeared since.
+    suiPollRegisteredTabs()
+    return cast[Il2CppPtr](1)
 
   let self = cast[Il2CppPtr](selfPtr)
   if cIsReadable(self, off + 8'i32) == 0'i32:
@@ -327,9 +332,7 @@ proc suiTabInitBody(a: Il2CppPtr): Il2CppPtr {.
   # OnFirstSelect fires. So walk here only on the off-chance a build populates it
   # early, and stay quiet rather than repeating "list is null" for every tab --
   # the Phase-1.6 hook on OnTabSelected is what actually reports the controls.
-  if cIsReadable(tab, cSuiOffCreatedCtrls() + 8'i32) != 0'i32 and
-     cReadPtrAt(tab, cSuiOffCreatedCtrls()) != nil:
-    suiWalkTab(tab, gname)
+  suiPollRegisteredTabs()
   return cast[Il2CppPtr](1)
 
 # The VEH/SEH guard thunk, the same mechanism botdiag/botcap use: `aowl_p_p_seh`
@@ -379,113 +382,188 @@ proc bindSettingsTabProbe(verbose: bool): bool =
   result = false
 
 # ---------------------------------------------------------------------------
-# PHASE 1.6 -- the walk that finally SEES the controls
+# PHASE 1.7 -- stop chasing the trigger; take a heartbeat and LOOK
 #
-# Phase 1.5 was right about the object and wrong about the moment. Live, it
-# handed us real tab objects on the Unity thread -- and `_createdControls`
-# (+0x88) still read null on every one of them. The offset was never the
-# problem; three pieces of disassembly say so (full write-up in
-# `aowlspt_bridge.h`):
+# Three live rounds have now disproved one trigger guess each:
+#   * `Show` fires before any controls exist (Phase 1);
+#   * `EnsureTabInitialized` hands over real tab objects whose control list is
+#     still null, and it PRE-WARMS all five tabs the moment the screen opens,
+#     unprompted (Phase 1.5);
+#   * `SettingsTab::OnTabSelected` never fired AT ALL across five real tab
+#     clicks (Phase 1.6). A full cross-reference of the 81MB `il2cpp` segment --
+#     the section the generated code actually lives in, `.text` holds none of
+#     it -- finds ZERO callers of it. It is dead code in this build. The same
+#     scan finds zero direct callers of every tab's Show / OnFirstSelect /
+#     CreateControls, because they are all vtable-dispatched. So no static
+#     cross-reference can name the trigger, and every further guess costs a
+#     whole deploy-and-click cycle to disprove.
 #
-#   * `SettingsTab::CleanupCreatedControls`, declared on the BASE and shared by
-#     every derived tab, reads `[rdi+0x88]`. So 0x88 is right AND it is a base
-#     field -- the derived tabs' differing klass pointers do not move it, since
-#     IL2CPP lays base fields first.
-#   * NOTHING in GameSettingsTab ever writes [this+0x88]. The write is in the
-#     generic `SettingsTab::CreateControl<T>`, which runs per control created.
-#   * `SettingsTab::OnTabSelected` is the sole trigger: it tests the first-select
-#     latch at +0x90, sets it, and virtual-calls OnFirstSelect -> CreateControls,
-#     which is what creates the controls in the first place.
+# So this stops asking WHEN and simply LOOKS, repeatedly, from a Unity-thread
+# heartbeat (`GameSettingsTab::Update`, which Unity drives every frame for as
+# long as the settings screen is up). Two jobs, both pure reads:
 #
-# So the list is null until a tab is actually SELECTED, and this is that moment.
-# A POSTFIX here (kind=8) runs once the controls exist. RCX is the SettingsTab
-# itself, so there is no group indirection at all -- we walk exactly the object
-# we were handed, and name it from the registry the Phase-1.5 hook fills.
+#   1. POLL -- re-read each registered tab's `_createdControls` (+0x88) on a
+#      throttle and log the full census the first time it is non-empty.
+#      Whatever fills it, and whenever, we see it.
+#   2. FIND -- if a tab has been polled `cSuiScanAfter` times and 0x88 is STILL
+#      null, scan that tab object's fields once and report every slot shaped
+#      like a populated `List<T>`, decoding the first element through the known
+#      control-label chain. If the controls live at some other offset, this
+#      prints that offset AND the label proving it -- which ends the guessing
+#      for good, from a single run, still without reflection.
 #
-# Same discipline throughout: read-only, reflection-free, every hop
-# cIsReadable-guarded, capped, whole body under the VEH/SEH guard.
+# Read-only throughout, every hop cIsReadable-guarded, every loop capped, the
+# whole body under the VEH/SEH guard, gated on `settingsUiProbe`.
 # ---------------------------------------------------------------------------
 
-## Tabs already censused, by object pointer, so re-selecting a tab (which fires
-## OnTabSelected every time) logs its controls once and then stays quiet.
-var gSuiSelWalked: array[16, uint64]
-var gSuiSelWalkedN = 0
-var gSuiSelFires = 0
+## Poll every Nth tick, so the per-frame cost is a counter increment almost
+## always, and a handful of guarded reads a few times a second at most.
+const cSuiTickEvery = 20
+## After this many polls with the list still null, run the one-shot field scan.
+const cSuiScanAfter = 3
+## Field-scan window over the tab object: offsets 0x10 .. 0x200, 8-byte steps.
+const cSuiScanFrom = 0x10
+const cSuiScanTo = 0x200
+## Most List-shaped candidates reported per tab, so a pathological object cannot
+## turn one scan into a hundred log lines.
+const cSuiMaxCandidates = 12
 
-proc suiNameForTab(tab: uint64): string =
-  ## The tab's group name from the Phase-1.5 registry, or a pointer-shaped
-  ## fallback when this tab was selected without EnsureTabInitialized having
-  ## registered it (possible if the screen is re-opened and rebuilt).
+var gSuiTicks = 0
+## Per-group: whether its census has been logged, how many times it has been
+## polled, and whether its one-shot field scan has already run.
+var gSuiCensused: array[8, bool]
+var gSuiPolls: array[8, int]
+var gSuiScanned: array[8, bool]
+
+proc suiListAt(obj: Il2CppPtr; off: int32; size: var int32): Il2CppPtr =
+  ## If `obj+off` looks like a POPULATED `List<T>`, return its backing array and
+  ## set `size`; otherwise nil. "Looks like" is deliberately strict, because the
+  ## point of the scan is to report signal rather than noise: the slot must be a
+  ## readable pointer, `_size` (+0x18) must be a small positive count, `_items`
+  ## (+0x10) must be a readable array object, and that array's element count
+  ## (+0x18, right before the inline elements at +0x20) must be at least
+  ## `_size`. All pure reads, each one guarded.
+  size = 0'i32
+  if cIsReadable(obj, off + 8'i32) == 0'i32:
+    return nil
+  let lst = cReadPtrAt(obj, off)
+  if lst == nil or cIsReadable(lst, cSuiOffListSize() + 4'i32) == 0'i32:
+    return nil
+  let n = cReadI32At(suiPtrAdd(lst, cSuiOffListSize()))
+  if n <= 0'i32 or n > 512'i32:
+    return nil
+  let arr = cReadPtrAt(lst, cSuiOffListItems())
+  if arr == nil or cIsReadable(arr, cSuiOffArrElems() + 8'i32) == 0'i32:
+    return nil
+  let maxLen = cReadI32At(suiPtrAdd(arr, 0x18'i32))
+  if maxLen < n or maxLen > 4096'i32:
+    return nil
+  size = n
+  result = arr
+
+proc suiScanTabFields(tabPtr: Il2CppPtr; tabName: string) =
+  ## ONE-SHOT empirical field scan: report every offset in the tab object that
+  ## holds a populated List, with the first element's klass and -- decisively --
+  ## whatever the control-label chain decodes at that element. A slot that
+  ## prints a real settings label IS the created-controls list, whatever offset
+  ## it turns out to live at. Reads only; writes nothing.
+  okLog "settings probe: FIELD SCAN of tab=" & tabName & " obj=0x" &
+        hexOf(cast[uint64](tabPtr)) & " -- _createdControls (0x" &
+        hexOf(uint64(cSuiOffCreatedCtrls())) & ") is still null after " &
+        $cSuiScanAfter & " polls, so every List-shaped field is reported here"
+  var found = 0
+  var off = int32(cSuiScanFrom)
+  while off < int32(cSuiScanTo) and found < cSuiMaxCandidates:
+    var n = 0'i32
+    let arr = suiListAt(tabPtr, off, n)
+    if arr != nil:
+      var detail = ""
+      let slot = suiPtrAdd(arr, cSuiOffArrElems())
+      if cIsReadable(slot, 8'i32) != 0'i32:
+        let elem0 = cReadPtrAt(slot, 0'i32)
+        if elem0 != nil and cIsReadable(elem0, 8'i32) != 0'i32:
+          let ek = cast[uint64](cReadPtrAt(elem0, 0'i32))
+          let lbl = suiReadControlLabel(elem0)
+          detail = " elem0=0x" & hexOf(cast[uint64](elem0)) &
+                   " klass=0x" & hexOf(ek) &
+                   (if lbl.len > 0:
+                      " label='" & lbl & "'  <== LOOKS LIKE THE CONTROL LIST"
+                    else: " (no label decoded here)")
+      okLog "settings probe:   candidate list at +0x" & hexOf(uint64(off)) &
+            " size=" & $int(n) & detail
+      inc found
+    off = off + 8'i32
+  if found == 0:
+    okLog "settings probe:   no List-shaped field anywhere in 0x" &
+          hexOf(uint64(cSuiScanFrom)) & "..0x" & hexOf(uint64(cSuiScanTo)) &
+          " -- this tab holds no populated collection at all yet"
+  else:
+    okLog "settings probe:   field scan done -- " & $found &
+          " candidate(s); the one printing a real label is the control list"
+
+proc suiPollRegisteredTabs() =
+  ## Re-read every registered tab's control list. Logs a tab's census once, the
+  ## first time it is non-empty, and falls back to the one-shot field scan for a
+  ## tab that stays stubbornly null. Shared by the frame tick and by the
+  ## `EnsureTabInitialized` postfix, so tab CLICKS poll too, not only frames.
   for g in 0 ..< gSuiTabPtr.len:
-    if gSuiTabPtr[g] != 0'u64 and gSuiTabPtr[g] == tab:
-      return readCString(cSuiGroupName(int32(g)))
-  result = "tab@0x" & hexOf(tab)
+    let raw = gSuiTabPtr[g]
+    if raw == 0'u64 or gSuiCensused[g]:
+      continue
+    let tab = cast[Il2CppPtr](raw)
+    let name = readCString(cSuiGroupName(int32(g)))
+    var n = 0'i32
+    let arr = suiListAt(tab, cSuiOffCreatedCtrls(), n)
+    if arr != nil:
+      gSuiCensused[g] = true
+      okLog "settings probe: controls APPEARED for tab=" & name & " after " &
+            $gSuiPolls[g] & " poll(s) -- walking them now"
+      suiWalkTab(tab, name)
+    else:
+      gSuiPolls[g] = gSuiPolls[g] + 1
+      if gSuiPolls[g] >= cSuiScanAfter and not gSuiScanned[g]:
+        gSuiScanned[g] = true
+        suiScanTabFields(tab, name)
 
-proc suiTabSelBody(a: Il2CppPtr): Il2CppPtr {.
-    exportc: "aowl_settingssel_body", cdecl.} =
-  ## The Phase-1.6 walk, called ONLY through `aowl_settingssel_body_guarded`.
-  ## Fired from the POSTFIX of `SettingsTab::OnTabSelected`, so OnFirstSelect ->
-  ## CreateControls has already run and the +0x88 list is populated. `a` is the
-  ## detour `regs`; RCX is the SettingsTab. Returns a non-nil sentinel on clean
+proc suiTickBody(a: Il2CppPtr): Il2CppPtr {.
+    exportc: "aowl_settingstick_body", cdecl.} =
+  ## The throttled heartbeat body, called ONLY through the VEH/SEH guard. `a` is
+  ## the detour `regs`; nothing in it is read, because the poll walks the
+  ## registry rather than `this`. Returns a non-nil sentinel on clean
   ## completion. Writes nothing, ever.
-  let regs = a
   let tid = int(cThreadId())
-  let onHost = (tid == int(gHostThreadId))
-  let tabRaw = cRegsInt(regs, 0'i32)           # RCX = this (SettingsTab)
-  inc gSuiSelFires
-  if gSuiSelFires == 1:
-    okLog "settings probe: OnTabSelected (postfix) first fired on thread " &
-          $tid & " (host thread " & $int(gHostThreadId) & ")" &
-          (if onHost: " -- host thread (unexpected, NOT Unity's)"
-           else: " -- Unity's main thread")
-  if onHost or tabRaw == 0'u64:
+  if tid == int(gHostThreadId):
     return cast[Il2CppPtr](1)
-
-  # Already censused this tab object? Then nothing to say.
-  for i in 0 ..< gSuiSelWalkedN:
-    if gSuiSelWalked[i] == tabRaw:
-      return cast[Il2CppPtr](1)
-
-  let tab = cast[Il2CppPtr](tabRaw)
-  if cIsReadable(tab, cSuiOffCreatedCtrls() + 8'i32) == 0'i32:
-    okLog "settings probe: selected tab 0x" & hexOf(tabRaw) &
-          " is not readable to its control list; skipped (no write)"
+  inc gSuiTicks
+  if (gSuiTicks mod cSuiTickEvery) != 0:
     return cast[Il2CppPtr](1)
-
-  let name = suiNameForTab(tabRaw)
-  let klass = cast[uint64](cReadPtrAt(tab, 0'i32))
-  let firstSel = (if cIsReadable(tab, cSuiOffFirstSelected() + 1'i32) != 0'i32:
-                    int(cReadI32At(suiPtrAdd(tab, cSuiOffFirstSelected())) and
-                        0xFF'i32)
-                  else: -1)
-  okLog "settings probe: tab SELECTED -- " & name & " tab=0x" & hexOf(tabRaw) &
-        " klass=0x" & hexOf(klass) & " firstSelectLatch=" & $firstSel
-  if gSuiSelWalkedN < gSuiSelWalked.len:
-    gSuiSelWalked[gSuiSelWalkedN] = tabRaw
-    inc gSuiSelWalkedN
-  suiWalkTab(tab, name)
+  if gSuiTicks == cSuiTickEvery:
+    okLog "settings probe: Unity-thread tick is live on thread " & $tid &
+          " -- polling each registered tab's control list from here"
+  suiPollRegisteredTabs()
   return cast[Il2CppPtr](1)
 
 # The VEH/SEH guard thunk -- same mechanism as every other host detour body.
 {.emit: """
-extern void* aowl_settingssel_body(void* a);
-static void* aowl_settingssel_body_guarded(void* a) {
-    return aowl_p_p_seh((void*)aowl_settingssel_body, a);
+extern void* aowl_settingstick_body(void* a);
+static void* aowl_settingstick_body_guarded(void* a) {
+    return aowl_p_p_seh((void*)aowl_settingstick_body, a);
 }
 """.}
-proc cSettingsSelBodyGuarded(a: Il2CppPtr): Il2CppPtr {.
-  importc: "aowl_settingssel_body_guarded", nodecl.}
+proc cSettingsTickBodyGuarded(a: Il2CppPtr): Il2CppPtr {.
+  importc: "aowl_settingstick_body_guarded", nodecl.}
 
-proc settingsTabSelectedFired(regs: Il2CppPtr) =
-  ## Dispatched by slot identity from `patchReturned` for the kind=8 detour.
-  if cSettingsSelBodyGuarded(regs) == nil:
-    okLog "settings probe: fault caught in the selected-tab walk -- the VEH " &
-          "guard kept the settings screen alive (nothing was written)"
+proc settingsTickFired(regs: Il2CppPtr) =
+  ## Dispatched by slot identity from `patchFired` for the kind=8 tick detour.
+  if cSettingsTickBodyGuarded(regs) == nil:
+    okLog "settings probe: fault caught in the tick poll -- the VEH guard kept " &
+          "the settings screen alive (nothing was written)"
 
-proc bindSettingsSelProbe(verbose: bool): bool =
-  ## Installs the read-only POSTFIX detour (kind=8) on
-  ## `SettingsTab::OnTabSelected`. Shares the `settingsUiProbe` flag with the
-  ## Phase-1/1.5 hooks; binds nothing on a build whose prologue does not match.
+proc bindSettingsTickProbe(verbose: bool): bool =
+  ## Installs the read-only PREFIX tick (kind=8) on `GameSettingsTab::Update`.
+  ## Reuses the slot the dead Phase-1.6 `OnTabSelected` hook held, so this costs
+  ## no new slot. Shares the `settingsUiProbe` flag; binds nothing on a build
+  ## whose prologue does not match.
   if gSettingsSelSlot >= 0:
     return true
   if not gReady or gDisableDrain:
@@ -495,12 +573,14 @@ proc bindSettingsSelProbe(verbose: bool): bool =
     let fn = cBridgeSettingsSelTargetAt(int32(i))
     if fn == nil:
       if verbose:
-        info "settings tab-select target " & $i & " did not verify on this build"
+        info "settings tick target " & $i & " did not verify on this build"
       continue
     let spec = readCString(cBridgeSettingsSelTargetName(int32(i)))
-    if attachDrain(spec, fn, cast[Il2CppMethod](0), false, verbose, 8'i32, true):
-      okLog "settings-UI CONTROL census (Phase 1.6) armed POSTFIX on " & spec &
-            "; the controls are created on first select, so clicking each tab " &
-            "now logs every control's label, klass and value-widget pointer"
+    if attachDrain(spec, fn, cast[Il2CppMethod](0), false, verbose, 8'i32):
+      okLog "settings-UI CONTROL poll (Phase 1.7) armed on " & spec &
+            "; it polls every registered tab's control list once per " &
+            $cSuiTickEvery & " frames while Settings is open, and field-scans " &
+            "any tab that stays empty -- so the controls get reported whenever " &
+            "they appear, whatever creates them"
       return true
   result = false
