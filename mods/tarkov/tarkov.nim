@@ -99,6 +99,49 @@ var gSelfCheckFailures: seq[string] = @[]
   ## Empty is the ordinary state and is also an answer: it is the difference
   ## between "this mod loaded" and "nothing is listening".
 
+var gFilesPng = ""
+  ## The bytes served for every `/files/*` request -- a tiny valid PNG.
+  ##
+  ## Post-1.0 fetches its trader avatars, handbook icons, quest images and
+  ## document pictures from `/files/<kind>/<id>.png|jpg` (capture: the trader
+  ## base carries `"avatar":"/files/trader/avatar/<id>.jpg"`). Those images are
+  ## not in this emulator's data set -- there is no image directory at all -- so
+  ## a real one cannot be served. The failure mode of NOT answering is the worst
+  ## one: a `/files/*` 404 makes the client retry the image on a timer and sit
+  ## on a spinner (the traders screen never settled, the mode-select portrait
+  ## took a minute or two). A valid placeholder answered immediately ends the
+  ## retry storm -- the avatar draws grey instead of spinning forever, which is
+  ## the difference between a usable screen and a stuck one. Built once at load
+  ## from `PlaceholderPngHex`; read-only on the worker threads after that, like
+  ## every other global here.
+
+const PlaceholderPngHex =
+  "89504e470d0a1a0a0000000d4948445200000010000000100802000000909168" &
+  "36000000144944415478da63702011308c6a18d5307c350000144ac00104416c" &
+  "550000000049454e44ae426082"
+  ## A 16x16 opaque dark-grey PNG, 77 bytes. Hand-decoded rather than embedded
+  ## as raw bytes so the source stays plain ASCII and no editor or line-ending
+  ## normalisation can corrupt a binary blob in the middle of a `.nim` file.
+
+proc hexNibble(c: char): int =
+  if c >= '0' and c <= '9': ord(c) - ord('0')
+  elif c >= 'a' and c <= 'f': ord(c) - ord('a') + 10
+  elif c >= 'A' and c <= 'F': ord(c) - ord('A') + 10
+  else: -1
+
+proc decodeHex(s: string): string =
+  ## Even-length hex to bytes. A stray non-hex character ends the decode rather
+  ## than guessing -- the input here is a compile-time constant, so this only
+  ## ever runs on the one string above.
+  result = ""
+  var i = 0
+  while i + 1 < s.len:
+    let hi = hexNibble(s[i])
+    let lo = hexNibble(s[i + 1])
+    if hi < 0 or lo < 0: break
+    result.add char(hi * 16 + lo)
+    i = i + 2
+
 proc nowSeconds(): int =
   ## Wall-clock seconds. The host gives monotonic milliseconds since it started,
   ## which is the right clock for timing and the wrong one for a registration
@@ -681,6 +724,17 @@ proc onCheckVersion(url, body, session: string): string =
 proc onEmptyObject(url, body, session: string): string =
   inc gRequests
   result = envelope(emptyObject())
+
+proc onFiles(url, body, session: string): string =
+  ## Every `/files/*` binary asset -- trader avatars, handbook icons, quest and
+  ## document images. This emulator has no image set, so one placeholder answers
+  ## all of them. The point is not the picture; it is that the answer is
+  ## immediate and valid, so the client stops retrying and the screen settles.
+  ## The backend recognises the `/files/` path and sends these bytes raw and
+  ## un-deflated with an `image/png` Content-Type (see `sendResponse` there);
+  ## the handler's only job is to hand over the bytes.
+  inc gRequests
+  result = gFilesPng
 
 proc onActivityPeriods(url, body, session: string): string =
   ## The dailies, the weekly and the scav's, generated rather than stored --
@@ -1544,6 +1598,13 @@ proc registerRoutes() =
   discard serve("/client/game/profile/search", onEmptyArray)
   discard serve("/client/profile/view", onEmptyObject)
 
+  # Binary assets. The client fetches trader avatars, handbook icons and quest
+  # images from `/files/*` and, when they 404, retries on a timer and stalls the
+  # screen (the traders list never settled, the mode-select portrait took a
+  # minute or two). One prefix route answers every one of them with a
+  # placeholder PNG so the retry storm never starts. See `onFiles`.
+  discard servePrefix("/files/", onFiles)
+
   # Static tables
   discard serve("/client/items", onItems)
   discard serve("/client/globals", onGlobals)
@@ -1648,6 +1709,9 @@ proc onLoad(): Status =
   if side() != sideServer:
     info "the emulator is a server mod; nothing to do on this side"
     return Ok
+
+  # Decode the placeholder image once, before any route can be asked for it.
+  gFilesPng = decodeHex(PlaceholderPngHex)
 
   gEdition = setting("edition").asText("standard")
   gDefaultSide = setting("defaultSide").asText("Usec")

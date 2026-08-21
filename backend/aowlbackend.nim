@@ -543,7 +543,8 @@ proc parseHead(head: string; r: var Request; contentLength: var int): bool =
   result = true
 
 proc sendResponse(sock: uint64; status: string; body {.byref.}: string;
-                  compress: bool; keepAlive = false) =
+                  compress: bool; keepAlive = false;
+                  contentType = "application/json") =
   var payload: seq[byte] = @[]
   var payloadLen = 0
   var compressed = false
@@ -558,7 +559,7 @@ proc sendResponse(sock: uint64; status: string; body {.byref.}: string;
   perfAdd(PhaseDeflate, tDeflate)
 
   var head = "HTTP/1.1 " & status & "\r\n"
-  head.add "Content-Type: application/json\r\n"
+  head.add "Content-Type: " & contentType & "\r\n"
   head.add "Content-Length: " & $payloadLen & "\r\n"
   head.add(if keepAlive: "Connection: keep-alive\r\n"
            else: "Connection: close\r\n")
@@ -972,7 +973,25 @@ proc handleRequest(sock: uint64; buf: HostPtr; len: int32;
     cSessionUnlock(slot)
 
   if served1:
-    sendResponse(sock, "200 OK", body, not req.identity, req.keepAlive)
+    # A `/files/*` request is a binary asset (a trader avatar, a handbook icon,
+    # a quest image). The client fetches these with an ordinary image request
+    # and decodes the raw bytes -- it does NOT inflate them the way it does a
+    # `/client/*` body, and it reads the picture from the bytes themselves, not
+    # from a header. So this path must go out uncompressed and with an image
+    # Content-Type; deflate it or label it `application/json` and the texture
+    # never decodes, which is a spinning avatar the client retries forever.
+    # Everything else keeps the default (deflate unless the caller sent
+    # `identity`, `application/json`).
+    var fpath = req.url
+    let q = find(fpath, "?")
+    if q >= 0: fpath = fpath.substr(0, q - 1)
+    if fpath.len >= 7 and fpath.substr(0, 6) == "/files/":
+      # The bytes the `/files/` handler returns are a PNG whatever extension the
+      # url carried (the client sniffs the format from the magic bytes, not the
+      # header or the path), so the honest Content-Type is `image/png`.
+      sendResponse(sock, "200 OK", body, false, req.keepAlive, "image/png")
+    else:
+      sendResponse(sock, "200 OK", body, not req.identity, req.keepAlive)
   else:
     sendResponse(sock, "500 Internal Server Error",
                  "{\"err\":\"the route handler failed\"}",
