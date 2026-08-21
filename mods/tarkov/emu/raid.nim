@@ -422,6 +422,32 @@ proc offlineScavWaves(zones: seq[string]): string =
   ##
   ## `MaxBotPerZone` and `BotMax` (set on the base) cap how many are alive at
   ## once, so a generous wave list does not over-spawn.
+  ## ## How many bots a wave actually asks for
+  ##
+  ## The live client's own AI trace is the oracle here. A wave served as
+  ## `slots_min = 2 / slots_max = 4` produced, verbatim:
+  ##
+  ##   `Checking spawn on max bots v1 _maxBots:0  toDelay:0 toSpawn:2`
+  ##   `Activate bots: Side:Savage Type:assault ... spawnPoints:2`
+  ##
+  ## Two bots out of a 2..4 request. That is the SPAN, not either endpoint:
+  ## `LocalGame::ModifySettings` (0xAD12A0) multiplies both slot numbers by 1.5
+  ## and hands them to `ToBotAmountSlots(BotAmount, min, max)` (0x6D9B70),
+  ## whose `AsOnline` arm (+0x6D9D30) computes
+  ##   `trunc((max' - min') * WAVE_COEF_MID(1.4) * 0.5 + 0.5)`
+  ## with `min' = 1.5*slots_min`, `max' = 1.5*slots_max`. For 2/4:
+  ##   span' = 1.5*(4-2) = 3 ; 3 * 1.4 * 0.5 + 0.5 = 2.6 ; trunc -> **2**.
+  ## Exactly the `toSpawn:2` observed. So `slots_min == slots_max` yields ZERO
+  ## and the absolute values are discarded -- only `slots_max - slots_min`
+  ## counts. Collapsing the constants, for a raw span `S`:
+  ##   `toSpawn = trunc(1.05 * S + 0.5)`, i.e. **toSpawn == S** for S in 1..9.
+  ##
+  ## The waves below therefore use `slots_min = S`, `slots_max = 2*S`, so the
+  ## span is `S` under the span model *and* the plain `RandomInclude(min,max)`
+  ## reading (the fallback if some other arm than `AsOnline` is taken) still
+  ## returns at least `S`. Either way a wave is worth >= S scavs.
+  const perWave = 4      ## S: bots requested per seed wave. trunc(1.05*4+0.5)=4.
+  const trickle = 3      ## S for the timer-arm bonus waves.
   var useZones = zones
   if useZones.len == 0:
     useZones = @[""]
@@ -429,29 +455,30 @@ proc offlineScavWaves(zones: seq[string]): string =
   var number = 0
   # The seed. Negative time, so these take `Run(1)` -- dispatched synchronously
   # while the raid is still loading, which is how BSG seeds a map and the one
-  # arm that does not depend on the timer service. Two at minimum so a one-zone
-  # map (Factory) still gets a handful; four at most so the up-front
-  # `bot/generate` budget (the sum of `slots_max` over the table) stays where it
-  # was rather than ballooning.
+  # arm that does not depend on the timer service. Four at minimum so a
+  # one-zone map (Factory) still gets 4 * 4 = 16 scavs on the floor at raid
+  # start; one per zone beyond that, capped at eight so a many-zoned map does
+  # not blow the up-front `bot/generate` budget.
   var seeds = useZones.len
-  if seeds < 2: seeds = 2
-  if seeds > 4: seeds = 4
+  if seeds < 4: seeds = 4
+  if seeds > 8: seeds = 8
   while number < seeds:
-    a.add oneWave(number, -1, -1, 2, 4, useZones[number mod useZones.len])
+    a.add oneWave(number, -1, -1, perWave, perWave * 2,
+                  useZones[number mod useZones.len])
     inc number
   # The trickle. Non-negative, so these take `Run(2)`'s timer arm: a bonus if
   # that arm works offline and harmless if it does not. Staggered from 20 s so
   # a swept map does not go quiet after the seed.
   var early = useZones.len
-  if early < 4: early = 4
-  if early > 8: early = 8
+  if early < 6: early = 6
+  if early > 10: early = 10
   var i = 0
   while i < early:
     let zone = useZones[(seeds + i) mod useZones.len]
-    a.add oneWave(number, 20 + i * 20, 40 + i * 20, 1, 3, zone)
+    a.add oneWave(number, 20 + i * 30, 40 + i * 30, trickle, trickle * 2, zone)
     inc i
     inc number
-  a.add oneWave(number, 360, 420, 1, 3, useZones[0])
+  a.add oneWave(number, 360, 420, trickle, trickle * 2, useZones[0])
   result = done(a).text
 
 proc localLoot*(locationId: string; nowSeconds: int;
@@ -542,9 +569,26 @@ proc localLoot*(locationId: string; nowSeconds: int;
     setRaw(d, "waves", offlineScavWaves(zones))
     setNumber(d, "BotStart", 0)
     setNumber(d, "BotStop", 86400)
-    if baseJson.field("BotMax").asInt(0) < 20: setNumber(d, "BotMax", 20)
-    if baseJson.field("BotMaxPvE").asInt(0) < 20: setNumber(d, "BotMaxPvE", 20)
-    if baseJson.field("MaxBotPerZone").asInt(0) < 4: setNumber(d, "MaxBotPerZone", 4)
+    # Budgets. These are the two throttles that can silently eat the waves
+    # above: `BotMax` is the map-wide alive cap and `MaxBotPerZone` the
+    # per-`BotZone` one. Factory's own base ships `BotMax = 0` and
+    # `MaxBotPerZone = 4` -- with all 19 of its savage spawn points in a single
+    # zone named `BotZone`, a 4-per-zone cap alone would hold the map to four
+    # scavs no matter how many waves are served. Raise both to fit the ~16-20
+    # the seed waves now request. (The host additionally pokes the client's
+    # `_maxBots` to 0 = unlimited, which the AI trace confirms; these served
+    # numbers are the belt to that's braces, and stay sane rather than absurd.)
+    if baseJson.field("BotMax").asInt(0) < 30: setNumber(d, "BotMax", 30)
+    if baseJson.field("BotMaxPvE").asInt(0) < 30: setNumber(d, "BotMaxPvE", 30)
+    # Per zone: enough that a one-zone map (Factory) is not capped below the
+    # seed total, without letting a ten-zone map pile 24 bots into each.
+    var zoneCount = zones.len
+    if zoneCount < 1: zoneCount = 1
+    var perZone = 24 div zoneCount
+    if perZone < 8: perZone = 8
+    if perZone > 24: perZone = 24
+    if baseJson.field("MaxBotPerZone").asInt(0) < perZone:
+      setNumber(d, "MaxBotPerZone", perZone)
     # `OpenZones` must name the zones the waves point at, or the wave has no open
     # zone to spawn into. Built from the same real bot zones; left as the base's
     # own when every bot point is unzoned (`""`, e.g. Ground Zero).
