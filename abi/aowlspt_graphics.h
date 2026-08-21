@@ -195,6 +195,29 @@ typedef struct AowlGfxState {
 
 static AowlGfxState g_gfx;
 
+/* One-time bring-up of the params critical section (and the default grade).
+ *
+ * The graphics *mod* pushes its grade at its own load time via
+ * call("aowlspt.host::gfx_apply", ...), and the host loads mods (mods' onLoad
+ * runs) BEFORE it calls aowl_gfx_start_driven / aowl_gfx_start. So a
+ * `gfx_apply` -> aowl_gfx_set_params_json can reach `g_gfx.cs` before `start`
+ * ran InitializeCriticalSection on it. Entering a zero-initialised
+ * CRITICAL_SECTION is undefined (a zeroed LockCount reads as "held", so the
+ * caller waits on a NULL semaphore and can hang) -- reproducibly, on some
+ * builds. So every entry point that touches `g_gfx.cs` ensures it exists first,
+ * exactly once, race-free. Defaults are seeded here too, so a grade the mod
+ * pushed before `start` survives (start no longer re-clobbers it). */
+static INIT_ONCE g_gfx_once = INIT_ONCE_STATIC_INIT;
+static BOOL CALLBACK aowl_gfx_once_cb(PINIT_ONCE o, PVOID param, PVOID* ctx) {
+    (void)o; (void)param; (void)ctx;
+    InitializeCriticalSection(&g_gfx.cs);
+    g_gfx.params = aowl_gfx_defaults();
+    return TRUE;
+}
+static void aowl_gfx_ensure_init(void) {
+    InitOnceExecuteOnce(&g_gfx_once, aowl_gfx_once_cb, NULL, NULL);
+}
+
 /* The default HLSL, embedded so the module always has something to run even if
  * the on-disk shader file is missing. Kept byte-identical in spirit to
  * mods/graphics/shaders/Post.hlsl; that file is the source of truth for edits.
@@ -273,6 +296,7 @@ static int32_t aowl_gfx_status(char* buf, int32_t cap) {
 
 static void aowl_gfx_set_params(const AowlGfxParams* p) {
     if (!p) return;
+    aowl_gfx_ensure_init();
     EnterCriticalSection(&g_gfx.cs);
     g_gfx.params = *p;
     LeaveCriticalSection(&g_gfx.cs);
@@ -308,6 +332,7 @@ static int aowl_gfx_jnum(const char* json, const char* key, float* out) {
 
 static void aowl_gfx_set_params_json(const char* json) {
     if (!json) return;
+    aowl_gfx_ensure_init();
     AowlGfxParams p;
     EnterCriticalSection(&g_gfx.cs);
     p = g_gfx.params;                 /* start from current, patch what's present */
@@ -808,8 +833,8 @@ static void* aowl_gfx_release_ptr(void)  { return (void*)aowl_gfx_release_size_e
 static int32_t aowl_gfx_start_driven(void) {
     if (InterlockedCompareExchange(&g_gfx.started, 1, 0) != 0) return 1;
     InterlockedExchange(&g_gfx.broken, 0);
-    InitializeCriticalSection(&g_gfx.cs);
-    g_gfx.params = aowl_gfx_defaults();
+    aowl_gfx_ensure_init();   /* cs + defaults, once; a grade the mod already
+                               * pushed before this call is preserved. */
     aowl_gfx_note("driven by the overlay Present hook; waiting for the first frame");
     return 1;
 }
@@ -821,8 +846,7 @@ static int32_t aowl_gfx_start_driven(void) {
 static int32_t aowl_gfx_start(void) {
     if (InterlockedCompareExchange(&g_gfx.started, 1, 0) != 0) return 1;
     InterlockedExchange(&g_gfx.broken, 0);
-    InitializeCriticalSection(&g_gfx.cs);
-    g_gfx.params = aowl_gfx_defaults();
+    aowl_gfx_ensure_init();   /* cs + defaults, once (see aowl_gfx_ensure_init) */
     aowl_gfx_note("starting");
 
     void* present = NULL; void* resize = NULL;
@@ -868,6 +892,8 @@ static void aowl_gfx_stop(void) {
     if (g_gfx.dev)      { ID3D11Device_Release(g_gfx.dev); g_gfx.dev = NULL; }
     g_gfx.deviceReady = 0;
     DeleteCriticalSection(&g_gfx.cs);
+    /* Allow a later start to bring the cs back up (InitOnce is one-shot). */
+    InitOnceInitialize(&g_gfx_once);
     InterlockedExchange(&g_gfx.started, 0);
 }
 

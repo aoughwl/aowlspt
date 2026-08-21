@@ -89,11 +89,217 @@ import invoke
 ## code pointer the host postfix-detours to rewrite the label on the Unity
 ## thread). See `aowlspt_uxpatch.h`.
 {.emit: """#include "aowlspt_uxpatch.h" """.}
+## READ-ONLY GameWorld bot/player census: static field offsets + the verified
+## `EFT.GameWorld::RegisterPlayer` detour target. Offsets/target only; the walk
+## is in `botdiag.nim` (included below). See `aowlspt_botdiag.h`.
+{.emit: """#include "aowlspt_botdiag.h" """.}
+## OFFLINE SCAV-CAP LIFT: the MaxBots (+0xC0) offset + the verified
+## `EFT.BotSpawner::AddPlayer` detour target + the guarded int32 read/write. The
+## one field poke is in `botcap.nim` (included below). See `aowlspt_botcap.h`.
+{.emit: """#include "aowlspt_botcap.h" """.}
+
+## BOT AI ACTIVATION RESCUE: the guarded static target + field offsets for the one
+## bool poke that releases `BotWeaponManager.IsReady`, the gate `BotOwner::
+## UpdateManual` checks before it will ever call `BotOwner::Activate`. The detour
+## body is in `botai.nim` (included below). See `aowlspt_botai.h`.
+{.emit: """#include "aowlspt_botai.h" """.}
+## Phase 1 native-settings probe: static field offsets for walking the live
+## SettingsScreen control tree read-only. Offsets only; the walk is in
+## `settingsui.nim` (included below). See `aowlspt_settingsui.h`.
+{.emit: """#include "aowlspt_settingsui.h" """.}
+## DIRECT managed invocation by static RVA: the build-pinned target table, the
+## IL2CPP calling convention (documented there with disassembled evidence from
+## the game's own call sites), the typed call thunks, and the runtime's
+## allocation exports. Table and thunks only; the proof ladder that drives them
+## is in `invoke2.nim` (included below). See `aowlspt_invoke2.h`.
+{.emit: """#include "aowlspt_invoke2.h" """.}
+## The in-game, Unity-native debug overlay: the F3 info panel and the
+## in-world AI markers. Target table, call thunks, guarded scalar stores,
+## the toggle key and the frame-rate estimate. See `aowlspt_debugui.h`.
+{.emit: """#include "aowlspt_debugui.h" """.}
 {.emit: """#include "aowlspt_detour.h" """.}
 ## The typed patch frame. Included here as well as through `aowlspt_abi.h`
 ## because this file names its pool directly; the include guard makes the second
 ## one free.
 {.emit: """#include "aowlspt_frame.h" """.}
+
+## A C thunk that runs the Nim `settingsMetaProbe` (exported as
+## `aowl_settings_meta_probe`) under the VEH+setjmp guard, once per STEP so each
+## risky op is guarded independently -- a fault in one does not hide the others.
+## The step is stashed in a global the Nim probe reads, because `aowl_p_p_seh`
+## passes a single argument. Taking a Nim proc's address as a plain pointer is
+## not expressible in nimony, but in C the exported proc's address is ordinary.
+{.emit: """
+extern void* aowl_settings_meta_probe(void* a);
+static int g_aowl_probe_step = 0;
+static void* aowl_settings_meta_probe_guarded(void* a, int step) {
+    g_aowl_probe_step = step;
+    return aowl_p_p_seh((void*)aowl_settings_meta_probe, a);
+}
+static int aowl_probe_step_get(void) { return g_aowl_probe_step; }
+
+/* Guarded wrapper for the version brand's il2cpp_string_new allocation: the Nim
+ * `brandNewStringImpl` (exported as `aowl_brand_newstring`) allocates the branded
+ * String from a global the Nim side set; this runs it under the VEH guard so even
+ * that runtime alloc cannot take the client down. */
+extern void* aowl_brand_newstring(void* a);
+static void* aowl_brand_newstring_guarded(void* a) {
+    return aowl_p_p_seh((void*)aowl_brand_newstring, a);
+}
+""".}
+
+# ------------------------------------------------- image CDN redirect
+#
+# Post-1.0 fetches trader avatars / handbook & quest icons from `/files/*`
+# resolved against BSG's asset CDN host (`s3-prod.escapefromtarkov.com`, per the
+# raid capture's `backend.Static`). No server-config field we send redirects it
+# (see `docs/timbuktu/IMAGE-LOADING-RE.md`), so offline that host is unreachable
+# and the images spin forever with not one request reaching our backend.
+#
+# This installs an inline hook on the `getaddrinfo` family (via the same detour
+# engine the il2cpp method patches use, `aowl_hook_install` -> a trampoline that
+# still calls the original) and, for the asset-CDN hostname only, resolves it to
+# `127.0.0.1` -- where the emulator backend answers `/regular/files/*`. Every
+# other host resolves normally.
+#
+# It also RECORDS every hostname the client resolves, first sight only, which
+# the host tick loop logs. That is the confirmation the headless RE could not
+# get: one live run names the exact host:port the image loader dials, settling
+# whether the target below is right (or naming the real one).
+#
+# Flag-gated (`imageCdnRedirect`, default off) and fail-safe: a missing export
+# or a failed install leaves DNS untouched; a non-target host is never rewritten.
+{.emit: """
+typedef int (__stdcall *AowlGaiW_t)(const wchar_t*, const wchar_t*, const void*, void**);
+typedef int (__stdcall *AowlGaiA_t)(const char*, const char*, const void*, void**);
+
+static int        g_cdn_enabled   = 0;
+static AowlGaiW_t g_cdn_gaiw_orig = 0;
+static AowlGaiA_t g_cdn_gaia_orig = 0;
+
+#define AOWL_CDN_MAX_SEEN 64
+static CRITICAL_SECTION g_cdn_lock;
+static int  g_cdn_lock_init = 0;
+static char g_cdn_seen[AOWL_CDN_MAX_SEEN][256];
+static int  g_cdn_seen_redir[AOWL_CDN_MAX_SEEN];
+static int  g_cdn_seen_count = 0;   /* distinct hosts recorded          */
+static int  g_cdn_drained    = 0;   /* how many the host has logged     */
+
+static void aowl_cdn_lock_ensure(void){
+    if(!g_cdn_lock_init){ InitializeCriticalSection(&g_cdn_lock); g_cdn_lock_init=1; }
+}
+static char aowl_cdn_lc(char c){ return (c>='A'&&c<='Z') ? (char)(c+32) : c; }
+static int aowl_cdn_ends_with(const char* s, const char* suf){
+    int ls=0, lf=0; while(s[ls]) ls++; while(suf[lf]) lf++;
+    if(lf>ls) return 0;
+    for(int i=0;i<lf;i++){ if(aowl_cdn_lc(s[ls-lf+i])!=aowl_cdn_lc(suf[i])) return 0; }
+    return 1;
+}
+static int aowl_cdn_starts_with(const char* s, const char* pre){
+    for(int i=0;pre[i];i++){ if(aowl_cdn_lc(s[i])!=aowl_cdn_lc(pre[i])) return 0; }
+    return 1;
+}
+/* The S3 asset-CDN family under escapefromtarkov.com (s3-prod and any regional
+ * s3-* variant). Narrow on purpose: gw-pvp, lobby and the wsn-* notifier hosts
+ * are NOT redirected. The seen-log below catches anything this misses. */
+static int aowl_cdn_is_target(const char* host){
+    if(!host || !host[0]) return 0;
+    if(!aowl_cdn_ends_with(host, "escapefromtarkov.com")) return 0;
+    return aowl_cdn_starts_with(host, "s3");
+}
+static void aowl_cdn_w2u(const wchar_t* w, char* out, int cap){
+    int i=0; if(!w){ out[0]=0; return; }
+    for(; w[i] && i<cap-1; i++) out[i]=(w[i]<128)?(char)w[i]:'?';
+    out[i]=0;
+}
+static void aowl_cdn_record(const char* host, int redirected){
+    if(!host || !host[0]) return;
+    aowl_cdn_lock_ensure();
+    EnterCriticalSection(&g_cdn_lock);
+    int found=0;
+    for(int i=0;i<g_cdn_seen_count;i++){
+        int eq=1, k=0; const char* a=g_cdn_seen[i];
+        for(;a[k]||host[k];k++){ if(aowl_cdn_lc(a[k])!=aowl_cdn_lc(host[k])){eq=0;break;} }
+        if(eq){ found=1; break; }
+    }
+    if(!found && g_cdn_seen_count < AOWL_CDN_MAX_SEEN){
+        int k=0; for(; host[k] && k<255; k++) g_cdn_seen[g_cdn_seen_count][k]=host[k];
+        g_cdn_seen[g_cdn_seen_count][k]=0;
+        g_cdn_seen_redir[g_cdn_seen_count]=redirected;
+        g_cdn_seen_count++;
+    }
+    LeaveCriticalSection(&g_cdn_lock);
+}
+static int __stdcall aowl_cdn_gaiw(const wchar_t* node, const wchar_t* svc,
+                                   const void* hints, void** res){
+    char host[256]; aowl_cdn_w2u(node, host, (int)sizeof(host));
+    int redir = (g_cdn_enabled && aowl_cdn_is_target(host));
+    aowl_cdn_record(host, redir);
+    if(redir && g_cdn_gaiw_orig) return g_cdn_gaiw_orig(L"127.0.0.1", svc, hints, res);
+    if(g_cdn_gaiw_orig)          return g_cdn_gaiw_orig(node, svc, hints, res);
+    return -1;
+}
+static int __stdcall aowl_cdn_gaia(const char* node, const char* svc,
+                                   const void* hints, void** res){
+    char host[256]; int i=0; if(node){ for(; node[i] && i<255; i++) host[i]=node[i]; } host[i]=0;
+    int redir = (g_cdn_enabled && aowl_cdn_is_target(host));
+    aowl_cdn_record(host, redir);
+    if(redir && g_cdn_gaia_orig) return g_cdn_gaia_orig("127.0.0.1", svc, hints, res);
+    if(g_cdn_gaia_orig)          return g_cdn_gaia_orig(node, svc, hints, res);
+    return -1;
+}
+static void aowl_cdn_set_enabled(int on){ g_cdn_enabled = on ? 1 : 0; }
+/* Install inline hooks. Returns a bitmask: 1=GetAddrInfoW, 2=getaddrinfo. */
+static int aowl_cdn_install(void){
+    aowl_cdn_lock_ensure();
+    int mask=0;
+    HMODULE ws = GetModuleHandleW(L"ws2_32.dll");
+    if(!ws) ws = LoadLibraryW(L"ws2_32.dll");
+    if(!ws) return 0;
+    void* fw = (void*)GetProcAddress(ws, "GetAddrInfoW");
+    if(fw){ void* h=aowl_hook_new();
+        if(h){ if(aowl_hook_install(h, fw, (void*)aowl_cdn_gaiw)==0){
+                    g_cdn_gaiw_orig=(AowlGaiW_t)((AowlHook*)h)->trampoline; mask|=1;
+               } else aowl_hook_free(h); } }
+    void* fa = (void*)GetProcAddress(ws, "getaddrinfo");
+    if(fa){ void* h=aowl_hook_new();
+        if(h){ if(aowl_hook_install(h, fa, (void*)aowl_cdn_gaia)==0){
+                    g_cdn_gaia_orig=(AowlGaiA_t)((AowlHook*)h)->trampoline; mask|=2;
+               } else aowl_hook_free(h); } }
+    return mask;
+}
+/* Pop one not-yet-logged host for the tick loop. 1 + fills out/redir, else 0. */
+static int aowl_cdn_take_new(char* out, int cap, int* redir){
+    int got=0;
+    aowl_cdn_lock_ensure();
+    EnterCriticalSection(&g_cdn_lock);
+    if(g_cdn_drained < g_cdn_seen_count){
+        int idx=g_cdn_drained, k=0;
+        for(; g_cdn_seen[idx][k] && k<cap-1; k++) out[k]=g_cdn_seen[idx][k];
+        out[k]=0; *redir=g_cdn_seen_redir[idx];
+        g_cdn_drained++; got=1;
+    }
+    LeaveCriticalSection(&g_cdn_lock);
+    return got;
+}
+/* Same pop, but returning a pointer to a private static buffer instead of
+ * filling a caller buffer -- the Nim tick loop is the only caller and it is one
+ * thread, so a static is safe here and it keeps the Nim side free of a
+ * stack array nimony cannot prove initialised. NULL when nothing is pending. */
+static char g_cdn_take_buf[256];
+static const char* aowl_cdn_take_new_str(int* redir){
+    if(aowl_cdn_take_new(g_cdn_take_buf, (int)sizeof(g_cdn_take_buf), redir))
+        return g_cdn_take_buf;
+    return 0;
+}
+""".}
+
+proc cCdnInstall(): int32 {.importc: "aowl_cdn_install", nodecl.}
+proc cCdnSetEnabled(on: int32) {.importc: "aowl_cdn_set_enabled", nodecl.}
+proc cCdnTakeNewStr(redir: ptr int32): cstring {.
+  importc: "aowl_cdn_take_new_str", nodecl.}
+
+var gImageCdnRedirect = false
 
 # --------------------------------------------------- the main-thread handoff
 #
@@ -372,10 +578,38 @@ proc cBeAnswered(): int32 {.importc: "aowl_be_guard_answered", nodecl.}
 proc cUxExitNeuter(): int32 {.importc: "aowl_uxpatch_exit_neuter", nodecl.}
 var cUxBaseFound {.importc: "aowl_ux_base_found", nodecl.}: int32
 var cUxExitSeen {.importc: "aowl_ux_exit_seen", nodecl.}: int32
+# Fix 1b: subclass the game's top window so an OS-driven close (X button,
+# taskbar Close, Alt+F4) terminates cleanly instead of entering the same hanging
+# async shutdown the Exit-button fix bypasses. See `aowlspt_uxpatch.h`.
+proc cUxCloseHook(): int32 {.importc: "aowl_uxpatch_close_hook", nodecl.}
+proc cUxCloseArm(rearmed: ptr int32): int32 {.
+  importc: "aowl_uxpatch_close_arm", nodecl.}
+proc cUxCloseHwnd(): uint64 {.importc: "aowl_uxpatch_close_hwnd", nodecl.}
+proc cUxCloseTid(): uint64 {.importc: "aowl_uxpatch_close_tid", nodecl.}
+proc cUxCloseCtrlArm(): int32 {.importc: "aowl_uxpatch_close_ctrl_arm", nodecl.}
+var cUxCloseSeen {.importc: "aowl_ux_close_seen", nodecl.}: int32
+# The OS-close fix is checked from the host tick loop, not armed once: the game
+# window does not exist at il2cpp-init time, so a boot-only attempt installs
+# nothing at all.
+#
+# It is NOT a WndProc subclass any more. Re-subclassing from this thread to
+# survive the raid's window re-creation crashed the client -- swapping another
+# thread's WndProc is unsupported and races its pump. The hooks are thread-scoped
+# SetWindowsHookEx (WH_GETMESSAGE + WH_CALLWNDPROC) on the game's UI thread, so
+# a re-created window on the same thread is covered with nothing re-armed and
+# NOTHING WRITTEN per tick. See `aowlspt_uxpatch.h`.
+#
+# `osCloseFix` gates the whole thing so a bad interaction can be turned off
+# without a rebuild. Default OFF while this is being re-proven live.
+var gOsCloseFix = false
+var gCloseEverArmed = false
+var gCloseWarned = false
 proc cUxVersionTarget(): Il2CppPtr {.
   importc: "aowl_uxpatch_version_target", nodecl.}
 proc cUxVersionLabelOffset(): int32 {.
   importc: "aowl_uxpatch_version_label_offset", nodecl.}
+proc cUxWritePtr(p: Il2CppPtr; off: int32; value: Il2CppPtr): int32 {.
+  importc: "aowl_uxpatch_write_ptr", nodecl.}
 
 # The Unity-main-thread bridge's statically-resolved per-frame targets. Each
 # returns a verified code pointer into GameAssembly.dll or nil (wrong build,
@@ -411,6 +645,26 @@ proc cInIl2cpp(p: Il2CppPtr): int32 {.
   importc: "aowl_in_il2cpp_section", nodecl.}
 proc cIl2cppRvaOf(p: Il2CppPtr): int64 {.
   importc: "aowl_il2cpp_rva_of", nodecl.}
+## VEH+setjmp fault guard: calls `f(a)` with a vectored exception handler armed,
+## and returns whatever `f` returned -- or NULL if `f` faulted with an access
+## violation, the game surviving instead of dying. `f` therefore returns a
+## non-nil sentinel on success so the caller can tell "faulted" from "returned
+## nil". Used to probe which managed operation faults on this protected build
+## without taking the client down. See `aowl_p_p_seh` in `aowlspt_shim.h`.
+proc cSehCall(f, a: Il2CppPtr): Il2CppPtr {.importc: "aowl_p_p_seh", nodecl.}
+## Runs one STEP of `settingsMetaProbe(a)` under the VEH guard (see the emit
+## thunk near the includes). Returns the probe's non-nil sentinel on completion,
+## or nil if that step faulted -- the game surviving either way.
+proc cMetaProbeGuarded(a: Il2CppPtr; step: int32): Il2CppPtr {.
+  importc: "aowl_settings_meta_probe_guarded", nodecl.}
+proc cProbeStep(): int32 {.importc: "aowl_probe_step_get", nodecl.}
+proc cReadI32At(p: Il2CppPtr): int32 {.importc: "aowl_read_i32", nodecl.}
+proc cWordAt(p: Il2CppPtr; i: uint64): uint16 {.importc: "aowl_word_at", nodecl.}
+## Runs `brandNewStringImpl` (which allocates the branded `System.String` via
+## `il2cpp_string_new`) under the VEH guard, so even that runtime alloc cannot
+## crash the client: nil on a fault, and the caller leaves the stock version.
+proc cBrandNewStringGuarded(a: Il2CppPtr): Il2CppPtr {.
+  importc: "aowl_brand_newstring_guarded", nodecl.}
 proc cBeOpened(): int32 {.importc: "aowl_be_guard_opened", nodecl.}
 
 # The IL2CPP readiness flag, armed in the same constructor and set on the
@@ -775,7 +1029,92 @@ var gSettingsProbeDone = false
 ## static Exit fix ships on regardless.
 var gVersionSlot = -1
 var gVersionBrand = false
+var gVersionWrite = false
 var gVersionBranded = false
+
+## READ-ONLY GameWorld bot/player census (kind=5 detour on
+## `EFT.GameWorld::RegisterPlayer`): its slot, opt-in flag (`botDiag`), and a
+## fire counter used to throttle the full-list enumerate. Declared here beside
+## the other detour slots; the walk itself lives in `botdiag.nim` (included
+## below), which reuses this file's guarded raw-read primitives. NEVER writes.
+var gBotDiagSlot = -1
+var gBotDiag = false
+var gBotDiagFires = 0
+## One-shot guard for the full-list census. The per-registration detour now does
+## only minimal single-hop work; the whole-list walk (the expensive, most
+## fault-prone read) runs exactly once, after the list has had a few
+## registrations to stabilise, and never again.
+var gBotDiagCensusDone = false
+## OFFLINE SCAV-CAP LIFT (kind=6 detour on `EFT.BotSpawner::AddPlayer`): its slot,
+## opt-in flag (`unlimitedBots`), and a one-shot guard so the field poke fires at
+## most once per raid. Declared here beside the other detour slots; the single
+## int32 field write itself lives in `botcap.nim` (included below), which reuses
+## this file's guarded primitives + the VEH/SEH guard.
+var gBotCapSlot = -1
+var gBotCap = false
+var gBotCapDone = false
+## BOT AI ACTIVATION RESCUE (kind=12 detour on `EFT.BotOwner::PreActivate`): its
+## slot, opt-in flag (`botAiActivate`), a fire counter (how many bots reached
+## PreActivate at all) and a poke counter (how many needed the gate released).
+## Declared here beside the other detour slots; the single guarded byte write
+## itself lives in `botai.nim` (included below), which reuses this file's guarded
+## primitives + the VEH/SEH guard.
+var gBotAiSlot = -1
+var gBotAi = false
+var gBotAiFires = 0
+var gBotAiPokes = 0
+## Phase 1 native-settings probe (kind=4 detour on `SettingsScreen::Show`): its
+## slot, opt-in flag (`settingsUiProbe`), and once-per-open guard. Declared here
+## beside the other detour slots; the walk itself lives in `settingsui.nim`
+## (included below), which reuses this file's guarded raw-read primitives.
+var gSettingsUiSlot = -1
+var gSettingsUiProbe = false
+var gSettingsUiDone = false
+## Phase 1.5 native-settings CONTROL probe (kind=7 POSTFIX detour on
+## `SettingsScreen::EnsureTabInitialized`): its slot. Phase 1 showed the tabs'
+## `_createdControls` lists do not exist yet at `Show`; they are built lazily by
+## this method, so the walk that actually reads controls hangs off its POSTFIX.
+## Shares the `settingsUiProbe` flag with the Phase-1 hook. The walk lives in
+## `settingsui.nim` (included below) and NEVER writes.
+var gSettingsTabSlot = -1
+## Phase 1.7 native-settings CONTROL poll (kind=8 PREFIX tick on
+## `GameSettingsTab::Update`): its slot. The Phase-1.6 hook on
+## `SettingsTab::OnTabSelected` never fired -- that method has zero callers in
+## this build -- so the probe stopped chasing the trigger and takes a
+## Unity-thread heartbeat instead, re-reading each registered tab's control list
+## on a throttle. Shares the `settingsUiProbe` flag. The poll lives in
+## `settingsui.nim` and NEVER writes.
+var gSettingsSelSlot = -1
+
+## DIRECT-INVOCATION proof ladder (kind=8 POSTFIX detour on
+## `SettingsScreen::EnsureTabInitialized`): its slot and opt-in flag
+## (`managedInvokeProbe`). It shares that target with the Phase-1.5 control probe
+## (kind=7), so the two are mutually exclusive -- this one arms first when its
+## flag is set and the control probe then skips itself, because two detours on
+## one function would have the second overwrite the first's trampoline. The
+## ladder itself lives in `invoke2.nim` (included below) and calls managed
+## methods DIRECTLY at their RVA, with no reflection anywhere.
+var gMi2Slot = -1
+var gMi2Probe = false
+
+## THE IN-GAME DEBUG OVERLAY (kind=10 PREFIX detour on `EFT.UI.PreloaderUI::
+## Update`): its slot and its two opt-in flags. `debugUi` is the F3 info panel,
+## `debugEsp` the in-world AI markers; either one arms the detour, because both
+## are drawn from the same per-frame Unity-thread body. Default OFF.
+##
+## `gDebugEspSlot` is a SECOND, read-only kind=11 detour whose only job is to
+## cache the live `EFT.GameWorld` pointer from `RegisterPlayer`. It shares that
+## target with botdiag (kind=5), so it is armed only when botdiag did not take
+## it -- two detours on one function would have the second overwrite the first's
+## trampoline. When botdiag owns the target it feeds the cache itself.
+##
+## The overlay itself lives in `debugui.nim` (included below), which reuses this
+## file's guarded raw primitives, botdiag's GameWorld offsets and readers, and
+## invoke2's verified managed-call thunks.
+var gDebugUiSlot = -1
+var gDebugEspSlot = -1
+var gDebugUi = false
+var gDebugEsp = false
 
 ## Whether the fragile static-RVA drain path may be used at all. OFF by default:
 ## it bound a real-but-wrong function on the live client and crashed the game, so
@@ -2326,6 +2665,40 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
   if i == gSettingsSlot:
     settingsProbeFired(regs)
     return 0'i32
+  # READ-ONLY GameWorld bot/player census, likewise by identity: it enumerates
+  # the registered players and only logs -- it must never suppress the original.
+  if i == gBotDiagSlot:
+    botDiagRegisterFired(regs)
+    return 0'i32
+  # OFFLINE SCAV-CAP LIFT: the one-shot BotSpawner.MaxBots=0 poke, by identity. It
+  # writes one int32 and must never suppress the original AddPlayer.
+  if i == gBotCapSlot:
+    botCapAddPlayerFired(regs)
+    return 0'i32
+  # BOT AI ACTIVATION RESCUE: the per-bot WeaponManager.IsReady poke, by identity.
+  # It writes one byte and must never suppress the original PreActivate.
+  if i == gBotAiSlot:
+    botAiPreActivateFired(regs)
+    return 0'i32
+  # Phase 1 native-settings probe: the read-only control-tree walk, by identity.
+  if i == gSettingsUiSlot:
+    settingsUiProbeFired(regs)
+    return 0'i32
+  # Phase 1.7 control poll: a throttled Unity-thread heartbeat, read-only.
+  if i == gSettingsSelSlot:
+    settingsTickFired(regs)
+    return 0'i32
+  # THE DEBUG OVERLAY, by identity and before anything generic: it fires once a
+  # frame, so it must not walk the patch table to find itself. It draws into UI
+  # objects it cloned and never suppresses PreloaderUI's own Update.
+  if i == gDebugUiSlot:
+    debugUiFired(regs)
+    return 0'i32
+  # The overlay's GameWorld cache: one register read, nothing walked, never a
+  # suppression of RegisterPlayer.
+  if i == gDebugEspSlot:
+    debugEspRegisterFired(regs)
+    return 0'i32
   if i < 0 or i >= gPatches.len:
     return 0'i32
   if not gPatches[i].live:
@@ -2412,6 +2785,23 @@ proc patchReturned(slot: int32; regs: Il2CppPtr): int32 {.
   # falling through to the meth-driven code below.
   if i == gVersionSlot:
     versionBrandFired(regs)
+    return 0'i32
+  # Phase 1.5 native-settings control probe, by identity and for the same reason:
+  # a host drain (meth == nil) whose whole point is to read AFTER the original
+  # ran, because the original is what builds the tab's controls. Returns 0, so
+  # the caller gets exactly what the game produced -- this never changes a result.
+  if i == gSettingsTabSlot:
+    settingsTabInitFired(regs)
+    return 0'i32
+  # Phase 1.6 control census, same reasoning: a host drain (meth == nil) that
+  # must read AFTER the original ran, because the original is what creates the
+  # controls. Returns 0 -- this never changes a result.
+  # The direct-invocation proof ladder, by identity and on the same terms: a
+  # host drain (meth == nil) that must run AFTER the original, because the
+  # original is what builds the controls the ladder clones. Returns 0 -- it
+  # never changes what the game produced.
+  if i == gMi2Slot:
+    mi2LadderFired(regs)
     return 0'i32
   if i < 0 or i >= gPatches.len:
     return 0'i32
@@ -2691,7 +3081,15 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
   ## mod's `patch` on another thread does too. It is the host's own hook, and it
   ## is not exempt from the rule.
   let what = (if kind == 1: "render-phase" elif kind == 2: "settings-probe"
-              elif kind == 3: "version-brand" else: "main-thread")
+              elif kind == 3: "version-brand" elif kind == 5: "botdiag"
+              elif kind == 4: "settings-ui-probe" elif kind == 6: "botcap"
+              elif kind == 7: "settings-tab-probe"
+              elif kind == 8: "settings-tick-probe"
+              elif kind == 9: "managed-invoke-probe"
+              elif kind == 10: "debug-overlay"
+              elif kind == 11: "debug-overlay-world"
+              elif kind == 12: "botai"
+              else: "main-thread")
   tablesLock()
   let claimed = cHookClaim()
   if claimed < 0'i32:
@@ -2738,19 +3136,41 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
     gSettingsSlot = int(claimed)
   elif kind == 3:
     gVersionSlot = int(claimed)
+  elif kind == 5:
+    gBotDiagSlot = int(claimed)
+  elif kind == 4:
+    gSettingsUiSlot = int(claimed)
+  elif kind == 6:
+    gBotCapSlot = int(claimed)
+  elif kind == 7:
+    gSettingsTabSlot = int(claimed)
+  elif kind == 8:
+    gSettingsSelSlot = int(claimed)
+  elif kind == 9:
+    gMi2Slot = int(claimed)
+  elif kind == 10:
+    gDebugUiSlot = int(claimed)
+  elif kind == 11:
+    gDebugEspSlot = int(claimed)
+  elif kind == 12:
+    gBotAiSlot = int(claimed)
   else:
     gDrainSlot = int(claimed)
   tablesUnlock()
   if kind == 1:
     gRenderMethod = spec
-  elif kind == 2 or kind == 3:
+  elif kind == 2 or kind == 3 or kind == 4 or kind == 5 or kind == 6 or
+       kind == 7 or kind == 8 or kind == 9 or kind == 10 or
+       kind == 11 or kind == 12:
     discard
   else:
     gDrainMethod = spec
     gDrainPerFrame = perFrame
   okLog what & " bound to " & spec & " (" &
         $int(cHookStolen(hook)) & " bytes)" &
-        (if perFrame or kind == 2 or kind == 3: "" else:
+        (if perFrame or kind == 2 or kind == 3 or kind == 4 or kind == 5 or
+            kind == 6 or kind == 7 or kind == 8 or kind == 9 or
+            kind == 10 or kind == 11 or kind == 12: "" else:
            "; it runs more than once a frame, so its firing count is not a " &
            "frame count")
   return true
@@ -3055,6 +3475,88 @@ proc bindRenderDrain(verbose: bool): bool =
 
   result = false
 
+## Carries between independently-guarded steps: `object_class` and the resolved
+## `System.Int32` class, each set in its own step and read by a later one, so a
+## step that faults simply leaves its carry nil and the dependent step skips.
+var gProbeCls: Il2CppClass = cast[Il2CppClass](0)
+var gProbeI32: Il2CppClass = cast[Il2CppClass](0)
+
+proc settingsMetaProbe(a: Il2CppPtr): Il2CppPtr {.
+    exportc: "aowl_settings_meta_probe", cdecl.} =
+  ## One RISKY managed op, selected by the step the C thunk stashed, run under the
+  ## VEH guard so a fault here is caught and the game survives. Each op brackets
+  ## itself with flushing logs; the guard returning nil means this step faulted.
+  ## Steps are independent (own guard each), so P3 faulting does not hide P4/P5.
+  let this = cast[Il2CppObject](a)
+  let step = int(cProbeStep())
+
+  if step == 2:
+    # object_class (reads this+0, shown readable) then the class name (the first
+    # real metadata dereference).
+    okLog "il2cpp settings probe P2: about to object_class(this)"
+    let cls = gRt.objectClass(this)
+    gProbeCls = cls
+    okLog "il2cpp settings probe P2: object_class = 0x" & hexOf(cast[uint64](cls))
+    if cls != nil:
+      okLog "il2cpp settings probe P2: about to read class name"
+      let cn = gRt.classNamespace(cls)
+      let nm = gRt.className(cls)
+      okLog "il2cpp settings probe P2: class = " &
+            (if cn.len > 0: cn & "." else: "") & nm
+  elif step == 3:
+    # findClass System.Int32: domain -> assemblies -> classFromName traversal.
+    # This was the unlogged first op that took the client down before.
+    okLog "il2cpp settings probe P3: about to findClass System.Int32"
+    let i32 = findClass(gRt, "System.Int32")
+    gProbeI32 = i32
+    okLog "il2cpp settings probe P3: findClass System.Int32 = 0x" &
+          hexOf(cast[uint64](i32))
+  elif step == 4:
+    # value_box: a managed-heap GC allocation. If P3 worked but this faults,
+    # managed construction is the limit and STEP3 must repurpose, not build.
+    if gProbeI32 == nil:
+      okLog "il2cpp settings probe P4: skipped (System.Int32 did not resolve)"
+    else:
+      okLog "il2cpp settings probe P4: about to value_box(System.Int32, 1337)"
+      let cell = cCellNew()
+      cCellSetI32(cell, 1337'i32)
+      let boxed = gRt.valueBox(gProbeI32, cell)
+      cCellFree(cell)
+      okLog "il2cpp settings probe P4: value_box = 0x" & hexOf(cast[uint64](boxed))
+      if boxed != nil:
+        let back = gRt.objectUnbox(boxed)
+        okLog "il2cpp settings probe P4: box round-trip = " &
+              $(if back != nil: cReadI32At(back) else: 0'i32) &
+              " -> managed construction (object_new/value_box) works here"
+  elif step == 5:
+    # The field iterator: object_class -> il2cpp_class_get_fields. The protected
+    # build that hid method pointers may also refuse this.
+    if gProbeCls == nil:
+      okLog "il2cpp settings probe P5: skipped (object_class was nil)"
+    else:
+      okLog "il2cpp settings probe P5: about to iterate SettingsScreen fields"
+      var c = gProbeCls
+      var depth = 0
+      var logged = 0
+      while c != nil and depth < 5 and logged < 50:
+        var iter: Il2CppIter = cast[Il2CppIter](0)
+        while logged < 50:
+          let f = gRt.nextField(c, iter)
+          if f == nil:
+            break
+          let fnm = gRt.fieldName(f)
+          let ft = gRt.fieldType(f)
+          let tn = (if ft != nil: gRt.typeName(ft) else: "?")
+          let off = gRt.fieldOffset(f)
+          okLog "il2cpp settings probe P5:   +0x" & hexOf(uint64(off)) &
+                " " & fnm & " : " & tn
+          inc logged
+        c = gRt.classParent(c)
+        inc depth
+      okLog "il2cpp settings probe P5: field walk done (" & $logged & " fields)"
+
+  return cast[Il2CppPtr](1)
+
 proc settingsProbeFired(regs: Il2CppPtr) =
   ## Experiment A, fired from the read-only detour on `SettingsScreen::Show`.
   ##
@@ -3081,77 +3583,42 @@ proc settingsProbeFired(regs: Il2CppPtr) =
         (if selfPtr != 0'u64 and cIsReadable(cast[Il2CppPtr](selfPtr), 0x20'i32) != 0'i32:
            " (readable)" else: " (this not readable)")
 
-  # The heavier work runs once. Everything below is on the Unity thread (proven
-  # above), where the runtime API is safe -- the same reads that fault on the
-  # host thread. Still fully read-only: it constructs one throwaway boxed int and
-  # walks the screen's fields; it writes nothing to the game.
+  # The heavier work runs once, split so the log says exactly which operation
+  # faults. The previous version crashed here with no line between "Show fired"
+  # and the crash, because its first op was `findClass` (a domain/assembly
+  # traversal) and there was no log before it.
   if onHost or gSettingsProbeDone or selfPtr == 0'u64:
     return
   gSettingsProbeDone = true
-  let this = cast[Il2CppObject](selfPtr)
 
-  # STEP 1 -- the managed-bridge proof, HERE on the confirmed Unity thread.
-  # Boxing a System.Int32 is a managed-heap GC allocation; if it round-trips,
-  # il2cpp_object_new / il2cpp_value_box / il2cpp_runtime_invoke and field ops
-  # are all available on this thread, which is what unblocks instantiating new
-  # controls rather than only repurposing existing ones.
-  block:
-    let i32 = findClass(gRt, "System.Int32")
-    if i32 != nil:
-      let cell = cCellNew()
-      cCellSetI32(cell, 1337'i32)
-      let boxed = gRt.valueBox(i32, cell)
-      cCellFree(cell)
-      if boxed != nil:
-        let back = gRt.objectUnbox(boxed)
-        okLog "il2cpp settings probe STEP1: managed box round-trip on the " &
-              "Unity thread = " &
-              $(if back != nil: cReadI32(back) else: 0'i32) &
-              " -> il2cpp_object_new/value_box/runtime_invoke are available " &
-              "here; instantiation is unblocked"
-      else:
-        okLog "il2cpp settings probe STEP1: value_box returned nil (managed " &
-              "construction may be limited; field-write repurposing still ok)"
+  # P1 -- the STEP3 primitive, and the one that actually matters: a plain raw
+  # field read of the SettingsScreen. No metadata, no box, no invoke -- pure
+  # memory, pre-checked with `cIsReadable` (a VirtualQuery, not a faulting
+  # dereference), so it cannot crash. Retargeting an existing control's value
+  # field (the fov/sain primitive the audit named as STEP3's real path) is
+  # exactly this read plus a write, so if this succeeds that path is open.
+  if cIsReadable(cast[Il2CppPtr](selfPtr), 0x60'i32) != 0'i32:
+    var line = "il2cpp settings probe P1 (raw field read, the STEP3 primitive):"
+    for k in 0 ..< 10:
+      let off = int32(k * 8)
+      let w = cReadPtrAt(cast[Il2CppPtr](selfPtr), off)
+      line.add " +" & hexOf(uint64(off)) & "=0x" & hexOf(cast[uint64](w))
+    okLog line
+    okLog "il2cpp settings probe P1: raw field read on SettingsScreen SUCCEEDED" &
+          " -> the field read/write path STEP3 needs is available here"
+  else:
+    okLog "il2cpp settings probe P1: SettingsScreen this is not readable for 0x60"
 
-  # STEP 2 -- read the screen structure. Walk the SettingsScreen class and its
-  # bases, logging each field's name, offset and declared type, and flagging the
-  # ones that look like the tab list / control collections a mod injects into.
-  block:
-    let cls = gRt.objectClass(this)
-    if cls == nil:
-      okLog "il2cpp settings probe STEP2: object_class(this) was nil"
-    else:
-      var c = cls
-      var depth = 0
-      var logged = 0
-      while c != nil and depth < 5 and logged < 60:
-        let cn = gRt.classNamespace(c)
-        let nm = gRt.className(c)
-        okLog "il2cpp settings probe STEP2: class " &
-              (if cn.len > 0: cn & "." else: "") & nm
-        var iter: Il2CppIter = cast[Il2CppIter](0)
-        while logged < 60:
-          let f = gRt.nextField(c, iter)
-          if f == nil:
-            break
-          let fnm = gRt.fieldName(f)
-          let ft = gRt.fieldType(f)
-          let tn = (if ft != nil: gRt.typeName(ft) else: "?")
-          let off = gRt.fieldOffset(f)
-          # Flag likely-interesting fields for the injection step. Type names keep
-          # their source casing, so match them as written.
-          let flag =
-            if find(tn, "Tab") >= 0 or find(tn, "Control") >= 0 or
-               find(tn, "List`1") >= 0 or find(tn, "[]") >= 0: "  <-- collection?"
-            else: ""
-          okLog "il2cpp settings probe STEP2:   +0x" & hexOf(uint64(off)) &
-                " " & fnm & " : " & tn & flag
-          inc logged
-        c = gRt.classParent(c)
-        inc depth
-      okLog "il2cpp settings probe STEP2: field walk complete (" & $logged &
-            " fields); open a tab (OpenGroup) so CreateControls populates the " &
-            "control lists, then STEP3 targets the flagged collection"
+  # P2..P5 -- the RISKY managed metadata ops, each under its OWN VEH guard so a
+  # fault in one (say findClass) does not hide the status of the others. The
+  # guard returns nil on a fault; each op also brackets itself with flushing logs.
+  for step in 2 .. 5:
+    let r = cMetaProbeGuarded(cast[Il2CppPtr](selfPtr), int32(step))
+    if r == nil:
+      okLog "il2cpp settings probe: P" & $step & " FAULTED (the VEH guard kept " &
+            "the game alive); see its 'about to' line above for the exact op"
+  okLog "il2cpp settings probe: metadata steps done. If P1 succeeded, the field " &
+        "read/write path STEP3 needs is available regardless of P2..P5"
 
 proc bindSettingsProbe(verbose: bool): bool =
   ## Installs the read-only Experiment-A detour on `SettingsScreen::Show`, from
@@ -3177,67 +3644,156 @@ proc bindSettingsProbe(verbose: bool): bool =
       return true
   result = false
 
+proc looksLikeVersion(s: string): bool =
+  ## A version-ish string: has a digit and a dot, is short, and is otherwise
+  ## printable ASCII. Used to pick the version String field out of a component's
+  ## fields without hard-coding an offset that a future build would move.
+  if s.len == 0 or s.len > 64:
+    return false
+  var hasDigit = false
+  var hasDot = false
+  for ch in s:
+    if ch >= '0' and ch <= '9': hasDigit = true
+    elif ch == '.': hasDot = true
+    elif ord(ch) < 0x20 or ord(ch) > 0x7E: return false
+  result = hasDigit and hasDot
+
+## Set by `versionBrandFired` and read by `brandNewStringImpl`, because the
+## guarded alloc thunk passes only one pointer and the string is easier carried
+## in a global than marshalled through it.
+var gBrandText: string = ""
+
+proc brandNewStringImpl(a: Il2CppPtr): Il2CppPtr {.
+    exportc: "aowl_brand_newstring", cdecl.} =
+  ## Allocates the branded `System.String` from `gBrandText`. Run under the VEH
+  ## guard by `cBrandNewStringGuarded`, so a fault in `il2cpp_string_new` on this
+  ## protected build returns nil rather than crashing. `a` is unused.
+  result = newString(gRt, gBrandText)
+
+proc rawReadVersionString(p: Il2CppPtr): string =
+  ## Reads a candidate `System.String` at `p` by its FIXED runtime layout, with
+  ## no reflection and no runtime accessor -- the P1 primitive extended: length
+  ## is the int32 at `+0x10`, the UTF-16 chars are inline at `+0x14`. Every read
+  ## is `aowl_is_readable`-guarded, so a slot that is not a String just yields ""
+  ## and is skipped. Only the BMP is decoded (ASCII in practice for a version).
+  result = ""
+  if p == nil or cIsReadable(p, 0x14'i32) == 0'i32:
+    return
+  let n = cReadI32At(cast[Il2CppPtr](cast[uint64](p) + 0x10'u64))
+  if n <= 0'i32 or n > 64'i32:
+    return
+  let chars = cast[Il2CppPtr](cast[uint64](p) + 0x14'u64)
+  if cIsReadable(chars, int32(n) * 2'i32) == 0'i32:
+    return
+  for i in 0 ..< int(n):
+    let c = cWordAt(chars, uint64(i))
+    if c == 0'u16 or c > 0x7E'u16:
+      # Non-ASCII or embedded NUL: not the plain version label we want; bail so a
+      # wrong slot cannot masquerade as a short string.
+      return ""
+    result.add char(c)
+
 proc versionBrandFired(regs: Il2CppPtr) =
   ## Fired from the POSTFIX detour on `EFT.UI.PreloaderUI::Awake`, on the Unity
-  ## main thread (Awake is a MonoBehaviour callback), *after* the original set the
-  ## bottom-left version label. Rewrites that label to "aowlspt <U+2014> <version>".
+  ## main thread, *after* the original set the bottom-left version label.
   ##
-  ## Everything is guarded and the whole thing runs at most once: a fault here is
-  ## on the Unity thread during boot, so it must never dereference anything it has
-  ## not checked is readable, and it bails on any doubt -- an unbranded version is
-  ## the acceptable failure, a crashed boot is not. The label component is the
-  ## reference field at `this + 0x20` (Awake's `set_text` receiver); its text is
-  ## read and written through the runtime's own get_text/set_text, resolved on the
-  ## component's actual class (which walks the hierarchy, so it works whether the
-  ## label is a TMP_Text or a UnityEngine.UI.Text).
+  ## Staged and crash-proof by construction, because a fault here is on the Unity
+  ## thread during boot:
+  ##
+  ##   * READ-ONLY probe (always): log the firing thread and whether `this + 0x20`
+  ##     (Awake's `set_text` receiver, the label component) is readable, then scan
+  ##     the component's pointer slots reading each as a `System.String` by its
+  ##     FIXED layout (length @ +0x10, UTF-16 chars @ +0x14) and log any whose
+  ##     content looks like a version. NO reflection: the live verdict is that
+  ##     `il2cpp_object_get_class` / `il2cpp_class_get_name` (and every reflection
+  ##     accessor) FAULT even on the Unity thread on this build, so the target is
+  ##     found by CONTENT, not by class.
+  ##   * FIELD-WRITE brand (opt-in `uxVersionBrandWrite`): allocate a branded
+  ##     `System.String` (under the VEH guard, so even the alloc cannot crash) and
+  ##     write its pointer straight into that slot by offset -- NO `runtime_invoke`,
+  ##     NO `findMethod`, NO `objectClass`; a raw field write is what `fov`/`sain`
+  ##     do. The write slot is VirtualQuery-guarded before the store.
+  ##
+  ## Every dereference is `aowl_is_readable`-guarded and the whole thing runs at
+  ## most once. Any doubt -> leave the stock version, never crash.
   if gVersionBranded:
     return
+  gVersionBranded = true          # once only, whatever the outcome below
+
+  let tid = int(cThreadId())
+  let onHost = (tid == int(gHostThreadId))
+  okLog "version probe: PreloaderUI.Awake postfix fired on thread " & $tid &
+        (if onHost: " (HOST thread -- unexpected; NOT Unity's)"
+         else: " (NOT the host thread -> Unity's main thread)")
+
   let selfRaw = cRegsInt(regs, 0'i32)          # RCX = the PreloaderUI `this`
   if selfRaw == 0'u64:
+    warn "version probe: `this` is null; nothing to read"
     return
   let self = cast[Il2CppPtr](selfRaw)
   let off = cUxVersionLabelOffset()
   if cIsReadable(self, off + 8'i32) == 0'i32:
+    warn "version probe: this+0x" & hexOf(uint64(off)) & " is not readable"
     return
   let label = hReadPtr(self, off)
-  if label == nil or cIsReadable(label, 0x10'i32) == 0'i32:
+  if label == nil or cIsReadable(label, 0x20'i32) == 0'i32:
+    warn "version probe: label component (this+0x" & hexOf(uint64(off)) &
+         ") is null or not readable"
     return
-  let cls = objectClass(gRt, label)
-  if cls == nil:
+  okLog "version probe: label component at this+0x" & hexOf(uint64(off)) &
+        " is readable; scanning its String slots by raw layout (no reflection)"
+
+  # Raw scan for the text-backing String on the component. Read each pointer slot
+  # and interpret it as a System.String by its FIXED layout (length @ +0x10,
+  # UTF-16 chars @ +0x14) -- NO objectClass/className, because runtime reflection
+  # is dead on this build (the settings-probe verdict). The version String is
+  # found by CONTENT (`looksLikeVersion`), which is self-validating: a slot whose
+  # bytes are not a short version-looking ASCII string is skipped, so a wrong slot
+  # cannot be mistaken for the target.
+  var textField = -1
+  var textVal = ""
+  var o = 0x10
+  while o <= 0x180:
+    if cIsReadable(label, int32(o + 8)) != 0'i32:
+      let fp = hReadPtr(label, int32(o))
+      let s = rawReadVersionString(fp)
+      if s.len > 0 and looksLikeVersion(s):
+        okLog "version probe: String slot +0x" & hexOf(uint64(o)) &
+              " = \"" & s & "\"  <-- version-looking"
+        if textField < 0:
+          textField = o
+          textVal = s
+    o = o + 8
+
+  if not gVersionWrite:
+    okLog "version probe: read-only (set uxVersionBrandWrite to attempt a " &
+          "field-write brand; no managed write was performed)"
     return
-  let getM = findMethod(gRt, cls, "get_text", 0)
-  let setM = findMethod(gRt, cls, "set_text", 1)
-  if getM == nil or setM == nil:
+
+  # ---- opt-in field-write brand: guarded newString + raw field store ----
+  if textField < 0:
+    warn "version brand: no version-looking String slot found on the label " &
+         "component; not writing (stock version left in place)"
     return
-  var e1: Il2CppException = nullPtr()
-  let cur = gRt.invoke(getM, label, cast[Il2CppPtr](0), e1)
-  if e1 != nil:
+  if textVal.startsWith("aowlspt"):
+    return                                      # already ours
+  # "aowlspt <U+2014 em dash> <version>", em dash as explicit UTF-8 bytes so the
+  # source stays ASCII; il2cpp_string_new takes UTF-8. The alloc runs under the
+  # VEH guard (`cBrandNewStringGuarded`), so even il2cpp_string_new cannot crash.
+  gBrandText = "aowlspt \xE2\x80\x94 " & textVal
+  let ns = cBrandNewStringGuarded(cast[Il2CppPtr](0))
+  if ns == nil or cIsReadable(ns, 0x14'i32) == 0'i32:
+    warn "version brand: guarded newString failed/faulted or returned an " &
+         "unreadable String; not writing (stock version left in place)"
     return
-  var curStr = ""
-  if cur != nil:
-    curStr = readString(gRt, cur)
-  if curStr.len == 0:
-    return                                      # not populated yet; leave it
-  if curStr.startsWith("aowlspt"):
-    gVersionBranded = true                      # already ours; nothing to do
-    return
-  # "aowlspt <U+2014 em dash> <version>". The dash is written as its explicit
-  # UTF-8 bytes so the source stays ASCII and no toolchain guesses an encoding;
-  # `il2cpp_string_new` takes UTF-8 and the runtime renders it as an em dash.
-  let branded = "aowlspt \xE2\x80\x94 " & curStr
-  let ns = newString(gRt, branded)
-  if ns == nil:
-    return
-  let a = cArgsNew(1)
-  if a == nil:
-    return
-  cArgsSetRef(a, 0, ns)
-  var e2: Il2CppException = nullPtr()
-  discard gRt.invoke(setM, label, cArgsPtr(a), e2)
-  cArgsFree(a)
-  if e2 == nil:
-    gVersionBranded = true
-    okLog "version label branded: \"" & branded & "\""
+  okLog "version brand: allocated branded String ok; writing it into label " &
+        "slot +0x" & hexOf(uint64(textField))
+  if cUxWritePtr(label, int32(textField), ns) != 0'i32:
+    okLog "version brand: slot +0x" & hexOf(uint64(textField)) &
+          " set to \"" & gBrandText & "\" (raw field write, no reflection)"
+  else:
+    warn "version brand: field slot +0x" & hexOf(uint64(textField)) &
+         " was not safely writable; left unchanged"
 
 proc bindVersionBrand(verbose: bool): bool =
   ## Installs the POSTFIX detour on `EFT.UI.PreloaderUI::Awake` from the verified
@@ -3258,9 +3814,53 @@ proc bindVersionBrand(verbose: bool): bool =
   if attachDrain("EFT.UI.PreloaderUI::Awake", fn, cast[Il2CppMethod](0),
                  false, verbose, 3'i32, true):
     okLog "version brand armed on EFT.UI.PreloaderUI::Awake (postfix); the " &
-          "bottom-left version label will read \"aowlspt — <version>\""
+          "bottom-left version label will read \"aowlspt â€” <version>\""
     return true
   result = false
+
+## READ-ONLY GameWorld bot/player census. Kept in its own file to avoid colliding
+## with concurrent host work; `include`d (not imported) so it shares this file's
+## guarded raw-read primitives, `cRegsInt`, logging, `attachDrain`, and the
+## verified `EFT.GameWorld::RegisterPlayer` target. Defines `botDiagRegisterFired`
+## (dispatched by slot identity in `patchFired`) and `bindBotDiag`.
+include "botdiag.nim"
+## OFFLINE SCAV-CAP LIFT. Kept in its own file to avoid colliding with concurrent
+## host work; `include`d (not imported) so it shares this file's guarded raw
+## primitives, `cRegsInt`, logging, `attachDrain`, the VEH/SEH guard, and the
+## verified `EFT.BotSpawner::AddPlayer` target. Defines `botCapAddPlayerFired`
+## (dispatched by slot identity in `patchFired`) and `bindBotCap`.
+include "botcap.nim"
+## BOT AI ACTIVATION RESCUE. Kept in its own file to avoid colliding with
+## concurrent host work; `include`d (not imported) so it shares this file's
+## guarded raw primitives, `cRegsInt`, logging, `attachDrain`, the VEH/SEH guard,
+## and the verified `EFT.BotOwner::PreActivate` target. Defines
+## `botAiPreActivateFired` (dispatched by slot identity in `patchFired`) and
+## `bindBotAi`.
+include "botai.nim"
+## Phase 1 native-settings control-tree probe. Kept in its own file to avoid
+## colliding with concurrent host work; `include`d (not imported) so it shares
+## this file's guarded raw-read primitives, logging, `attachDrain`, and the
+## verified `SettingsScreen::Show` target. Defines `settingsUiProbeFired`
+## (dispatched by slot identity in `patchFired`) and `bindSettingsUiProbe`.
+include "settingsui.nim"
+## The DIRECT-INVOCATION proof ladder. Kept in its own file to avoid colliding
+## with concurrent host work; `include`d (not imported) so it shares this file's
+## guarded raw primitives, `cRegsInt`, logging, `attachDrain`, the VEH/SEH guard,
+## the verified `SettingsScreen::EnsureTabInitialized` target -- and, because it
+## comes AFTER `settingsui.nim`, that file's `suiReadString` and settings-tree
+## offsets. Defines `mi2LadderFired` (dispatched by slot identity in
+## `patchReturned`) and `bindManagedInvoke`.
+include "invoke2.nim"
+
+## The in-game, Unity-native debug overlay (the F3 panel + in-world AI markers).
+## `include`d rather than imported, and LAST, because it stands on everything
+## above it: this file's guarded raw primitives and `attachDrain`, botdiag's
+## GameWorld offsets and guarded readers (`bdOk`-style hops, `bdIsAI`,
+## `bdCollectAlive`), and invoke2's verified managed-call thunks (`Instantiate`,
+## `SetParentAndAlign`, `get_gameObject`). Defines `debugUiFired`,
+## `debugEspRegisterFired`, `duNoteGameWorld`, `bindDebugUi` and
+## `bindDebugEspWorld`.
+include "debugui.nim"
 
 proc hostEventSubscribe(ctx: Il2CppPtr; name: Il2CppPtr; nameLen: int32;
                         cb: Il2CppPtr; user: Il2CppPtr): int32 {.
@@ -3892,20 +4492,58 @@ proc reportRuntime() =
          ", OnRequestRestart seen=" & $cBecRestartSeen &
          "); offsets may not match this client build"
 
-  # Exit-hang fix: with no BsgLauncher, the menu Exit blocks forever on the
-  # launcher handoff. Redirect ExitApplication to a clean ExitProcess(0) (a
-  # static .text byte patch, same discipline as the BE neuter above). Fail-safe:
-  # if the prologue does not match this build, nothing is written.
-  if cUxExitNeuter() != 0'i32:
-    okLog "exit fix: menu Exit redirected to ExitProcess(0) (was hanging on the " &
-          "absent-launcher handshake)"
+  # Exit-hang fix: with no BsgLauncher, confirming Exit spins forever on an
+  # exit-loading screen (the async shutdown started at the confirm-accept lambda
+  # never completes). Redirect the confirm-accept lambda (primary) and
+  # ExitApplication (backstop) to a clean ExitProcess(0) -- static .text byte
+  # patches, same discipline as the BE neuter above, firing before the async
+  # work. Fail-safe: a site whose prologue does not match this build is skipped.
+  let exitLanded = cUxExitNeuter()
+  if exitLanded >= 1'i32:
+    okLog "exit fix: confirmed Exit redirected to ExitProcess(0) (" &
+          $exitLanded & "/2 sites; primary = the confirm-accept lambda, before " &
+          "the async exit-loading shutdown that was hanging)"
   elif cUxBaseFound == 0:
     warn "exit fix: GameAssembly.dll not found; Exit still hangs"
   elif cUxExitSeen == 0:
-    warn "exit fix: ExitApplication prologue did not match this build; " &
-         "Exit not patched (Exit still hangs, nothing worse)"
+    warn "exit fix: no exit prologue matched this build; Exit not patched " &
+         "(Exit still hangs, nothing worse)"
   else:
-    warn "exit fix: ExitApplication prologue matched but the patch write failed"
+    warn "exit fix: an exit prologue matched but the patch write failed"
+
+  # OS-close hang fix (Fix 1b): the Exit-button patch above only covers the
+  # in-game Exit flow. Closing the window via the title-bar X, taskbar Close, or
+  # Alt+F4 posts WM_CLOSE to Unity's window proc, which funnels into the SAME
+  # hanging async shutdown by a different caller. Catch those messages on the
+  # game's UI thread and hard-exit (ExitProcess(0)) before any async work starts.
+  #
+  # LIVE FINDING: at this point (il2cpp init) the game's top-level window does
+  # NOT exist yet, so there is no UI thread to hook and this first attempt is
+  # expected to do nothing -- it is best-effort and quiet on failure, with the
+  # host tick loop carrying the real arm.
+  #
+  # Gated on `osCloseFix` (default OFF): the previous implementation of this fix
+  # crashed the client, so it must be switchable without a rebuild while it is
+  # being re-proven.
+  gOsCloseFix = readBoolKey("osCloseFix")
+  if not gOsCloseFix:
+    info "exit fix: osCloseFix is off; the OS window-close path is untouched " &
+         "(the in-game Exit button is still patched). Set \"osCloseFix\": true " &
+         "in aowlspt-host.json to arm it."
+  else:
+    # The message-independent console-control path is armed once here; it costs
+    # nothing on a GUI launch with no console and covers the close routes that
+    # never become a window message at all.
+    discard cUxCloseCtrlArm()
+    if cUxCloseHook() == 1'i32:
+      gCloseEverArmed = true
+      okLog "exit fix: OS-close hooks installed at boot on UI thread " &
+            $cUxCloseTid() & " -- window-close (X / taskbar / Alt+F4) exits " &
+            "via ExitProcess(0)"
+    else:
+      info "exit fix: game window not up yet; the OS-close hooks will be " &
+           "installed from the host tick loop once the UI thread exists " &
+           "(Exit button is already patched)"
 
   var count = 0
   let assemblies = domainGetAssemblies(gRt, gDomain, count)
@@ -4030,15 +4668,15 @@ proc takeModSet() =
 
   # The raid-state gate for the graphics post-process rides this same poll. Read
   # it only from a document parseDesired accepted (above), and only act on a
-  # change — the grade turns on in a raid and the menu stays stock. An older
+  # change â€” the grade turns on in a raid and the menu stays stock. An older
   # manager omits the field, parseInRaid returns false, and the last known
   # state is kept (default: not in raid, so raidOnly leaves the menu untouched).
   var raid = gInRaidLast
   if modcontrol.parseInRaid(doc, raid) and raid != gInRaidLast:
     gInRaidLast = raid
     graphicsSetInRaid(raid)
-    info "graphics: backend reports " & (if raid: "IN RAID — grading the world"
-                                         else: "in menu — post-process off")
+    info "graphics: backend reports " & (if raid: "IN RAID â€” grading the world"
+                                         else: "in menu â€” post-process off")
 
 proc runPending() =
   ## The host thread's half.
@@ -4141,11 +4779,102 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
     info "bridgeSettingsProbe is set: a read-only detour on SettingsScreen.Show " &
          "will log the thread it fires on when you open the settings screen " &
          "(Experiment A -- confirms a detour reaches the Unity thread)"
+  gBotDiag = readBoolKey("botDiag")
+  if gBotDiag:
+    info "botDiag is set: a READ-ONLY detour on EFT.GameWorld.RegisterPlayer " &
+         "will log each bot/player registration and enumerate the registered " &
+         "list (nickname, side/role, alive-state, position) during an offline " &
+         "raid -- it answers spawned-but-frozen vs absent. NO write is performed."
+  gBotCap = readBoolKey("unlimitedBots")
+  if gBotCap:
+    info "unlimitedBots is set: a kind=6 detour on EFT.BotSpawner.AddPlayer will " &
+         "poke BotSpawner.MaxBots=0 (unlimited) once at offline-raid init, lifting " &
+         "the cap that defers the scav wave pool (bosses bypass it via " &
+         "IgnoreMaxBots; scavs do not). One guarded int32 write on the Unity " &
+         "thread; fail-safe -- no write if the build/pointer does not check out."
+  gBotAi = readBoolKey("botAiActivate")
+  if gBotAi:
+    info "botAiActivate is set: a kind=12 detour on EFT.BotOwner.PreActivate will " &
+         "release BotWeaponManager.IsReady (one guarded byte per bot) -- the gate " &
+         "BotOwner.UpdateManual checks before it will call BotOwner.Activate. " &
+         "Without it a bot whose weapon change never completes stays in " &
+         "_botState=1 forever: standing at its spawn, brain never ticking, knife " &
+         "in hand and primary slung. Activate is NOT called by us and _botState " &
+         "is NOT written; the game still runs its own NavMesh check and its own " &
+         "Activate on its own schedule. Fail-safe -- no write if the " &
+         "build/pointer does not check out."
+  gSettingsUiProbe = readBoolKey("settingsUiProbe")
+  if gSettingsUiProbe:
+    info "settingsUiProbe is set: read-only detours on SettingsScreen.Show " &
+         "(Phase 1, arming/thread proof) and a POSTFIX on " &
+         "SettingsScreen.EnsureTabInitialized (Phase 1.5, the walk that reads " &
+         "controls -- they do not exist yet at Show) will log every control's " &
+         "label, il2cpp klass pointer and value-widget pointer as each tab is " &
+         "built. Open Settings and click each tab. NO write is ever performed."
+  gMi2Probe = readBoolKey("managedInvokeProbe")
+  if gMi2Probe:
+    info "managedInvokeProbe is set: a POSTFIX detour on " &
+         "SettingsScreen.EnsureTabInitialized will run a five-step ladder that " &
+         "calls managed IL2CPP methods DIRECTLY at their static RVA -- no " &
+         "reflection, no runtime_invoke. Steps: (1) instance getters, " &
+         "(2) statics, (3) il2cpp_object_new, (4) GameObject::.ctor + " &
+         "AddComponent routes, (5) clone a live settings label and retarget it. " &
+         "Every step is separately VEH-guarded and logged BEGIN/END, so a fault " &
+         "names its step and cannot crash the client. It takes over the " &
+         "EnsureTabInitialized hook from the Phase-1.5 control probe."
+  # The in-game debug overlay. Two flags, one detour: either of them arms the
+  # per-frame PreloaderUI hook, because the panel and the markers are drawn from
+  # the same body. The LAYOUT is read here too, so a bad config file is a boot-log
+  # line rather than a surprise the first time the key is pressed.
+  gDebugUi = readBoolKey("debugUi")
+  gDebugEsp = readBoolKey("debugEsp")
+  if gDebugUi or gDebugEsp:
+    duLoadLayout()
+    info "debugUi/debugEsp is set: a per-frame detour on EFT.UI.PreloaderUI." &
+         "Update (the Unity main thread) will draw a Minecraft-F3-style info " &
+         "panel" &
+         (if gDebugEsp: " and in-world markers over every registered AI bot"
+          else: "") &
+         " out of Unity UI labels CLONED from the client's own version label " &
+         "(Object::Instantiate -- no reflection, no object creation). Press " &
+         (if gDuCfg.toggleVk == 0x72: "F3" else: "VK " & $gDuCfg.toggleVk) &
+         " in game to toggle it; layout is " & gDuCfg.source &
+         " and is re-read on every toggle-on, so it can be edited live. The " &
+         "whole body is VEH-guarded and writes only into labels it created."
   gVersionBrand = readBoolKey("uxVersionBrand")
+  gVersionWrite = readBoolKey("uxVersionBrandWrite")
+  if gVersionWrite:
+    gVersionBrand = true          # the write path needs the probe armed
   if gVersionBrand:
     info "uxVersionBrand is set: a postfix detour on PreloaderUI.Awake will " &
-         "brand the bottom-left version label as \"aowlspt — <version>\" on the " &
-         "Unity thread (fail-safe: unbranded if the build or timing does not match)"
+         "probe the version label on the Unity thread" &
+         (if gVersionWrite:
+            " and (uxVersionBrandWrite) attempt a field-write brand to " &
+            "\"aowlspt <em dash> <version>\" -- no runtime_invoke"
+          else:
+            " (read-only: logs thread, readability, class, and String fields; " &
+            "no managed write)") &
+         " (fail-safe: unbranded if the build or timing does not match)"
+
+  # Image CDN redirect (opt-in). Independent of IL2CPP -- it hooks ws2_32, which
+  # is up from the start -- so it installs here rather than waiting for the
+  # runtime. Off by default; when on, it steers the BSG asset-CDN host to this
+  # backend and logs every hostname the client resolves (drained in the tick
+  # loop) so a live run confirms the exact image host. Fail-safe: a failed
+  # install leaves DNS untouched.
+  gImageCdnRedirect = readBoolKey("imageCdnRedirect")
+  if gImageCdnRedirect:
+    cCdnSetEnabled(1'i32)
+    let mask = int(cCdnInstall())
+    if mask == 0:
+      warn "imageCdnRedirect is set but no getaddrinfo export could be hooked; " &
+           "image CDN requests will not be redirected"
+    else:
+      okLog "imageCdnRedirect is set: getaddrinfo hooked (" &
+            (if (mask and 1) != 0: "GetAddrInfoW " else: "") &
+            (if (mask and 2) != 0: "getaddrinfo " else: "") &
+            "); s3-*.escapefromtarkov.com -> 127.0.0.1, and every resolved host " &
+            "is logged once to confirm the real image host"
 
   let waitMs = readWaitMs()
   info "waiting for the IL2CPP runtime (up to " & $(waitMs div 1000) & "s)"
@@ -4187,12 +4916,79 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       if gSettingsProbe and not bindSettingsProbe(true):
         info "the settings probe did not verify SettingsScreen.Show on this build"
 
+      # Phase 1 native-settings control-tree probe. Static code, so it installs
+      # now and fires the first time the user opens the settings screen.
+      if gSettingsUiProbe and not bindSettingsUiProbe(true):
+        info "the settings-UI probe did not verify SettingsScreen.Show on this build"
+
+      # Phase 1.5: the hook that actually reads controls. `Show` above proved the
+      # mechanism but fires BEFORE any tab's controls exist; they are built
+      # lazily by EnsureTabInitialized, so the walk hangs off that method's
+      # POSTFIX. Same flag, same read-only discipline, separate slot.
+      # Phase 1.6: the walk that actually reads the controls, on the POSTFIX of
+      # `SettingsTab::OnTabSelected` -- its own target, shared with nothing, so
+      # it always arms regardless of what claims EnsureTabInitialized below.
+      if gSettingsUiProbe and not bindSettingsTickProbe(true):
+        info "the settings control poll did not verify " &
+             "GameSettingsTab.Update on this build"
+
+      # The direct-invocation proof ladder (opt-in, default OFF). It shares
+      # `SettingsScreen::EnsureTabInitialized` with the Phase-1.5 group->tab
+      # registry below, so it arms FIRST and that registry then skips itself:
+      # two detours on one function would have the second overwrite the first's
+      # trampoline. Only the registry is given up -- the Phase-1.6 control walk
+      # above is on a different target and keeps running, falling back to
+      # naming tabs by klass when the registry is absent.
+      if gMi2Probe and not bindManagedInvoke(true):
+        info "the managed-invoke probe did not verify " &
+             "SettingsScreen.EnsureTabInitialized on this build"
+
+      if gSettingsUiProbe and gMi2Slot < 0 and not bindSettingsTabProbe(true):
+        info "the settings control probe did not verify " &
+             "SettingsScreen.EnsureTabInitialized on this build"
+
       # Version-label brand (opt-in). Static code, so it installs now and fires
       # when PreloaderUI.Awake runs on its way to the menu. Fail-safe if the
       # prologue does not match or if Awake already ran before this armed.
       if gVersionBrand and not bindVersionBrand(true):
         info "version brand did not arm (PreloaderUI.Awake unverified on this " &
              "build, or drain disabled)"
+
+      # READ-ONLY bot/player census (opt-in). GameWorld.RegisterPlayer is static
+      # code, so the detour installs now and simply never fires until an offline
+      # raid starts and players/bots begin registering. Fail-safe if the prologue
+      # does not match on this build.
+      if gBotDiag and not bindBotDiag(true):
+        info "botdiag did not arm (EFT.GameWorld.RegisterPlayer unverified on " &
+             "this build, or drain disabled)"
+
+      # OFFLINE SCAV-CAP LIFT (opt-in). BotSpawner.AddPlayer is static code, so the
+      # detour installs now and never fires until an offline raid init reaches it;
+      # then it pokes MaxBots=0 once. Fail-safe if the prologue does not match.
+      if gBotCap and not bindBotCap(true):
+        info "botcap did not arm (EFT.BotSpawner.AddPlayer unverified on this " &
+             "build, or drain disabled)"
+
+      # BOT AI ACTIVATION RESCUE (opt-in). BotOwner.PreActivate is static code, so
+      # the detour installs now and never fires until an offline raid activates a
+      # bot; then it releases that bot's WeaponManager.IsReady. Fail-safe if the
+      # prologue does not match.
+      if gBotAi and not bindBotAi(true):
+        info "botai did not arm (EFT.BotOwner.PreActivate unverified on this " &
+             "build, or drain disabled)"
+
+      # THE IN-GAME DEBUG OVERLAY (opt-in). PreloaderUI::Update is static code,
+      # so the detour installs now and starts ticking as soon as the preloader
+      # is up -- but it draws NOTHING until the toggle key is pressed. The
+      # GameWorld cache is armed only when botdiag did not take
+      # `GameWorld::RegisterPlayer`; when it did, botdiag feeds the cache and
+      # this correctly installs nothing.
+      if gDebugUi or gDebugEsp:
+        if not bindDebugUi(true):
+          info "the debug overlay did not arm (EFT.UI.PreloaderUI.Update " &
+               "unverified on this build, or drain disabled)"
+        elif gDebugEsp:
+          discard bindDebugEspWorld(true)
 
   let modsDir = joinPath(gDir, "mods")
   # The runtime may not have come up, and that deliberately does not stop this:
@@ -4213,7 +5009,7 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # a worse trade than no panel.
   # F12 opens the in-game settings panel (the revamped settings screen), matching
   # the BepInEx/SPT muscle memory where F12 opened the mod-config manager. The
-  # panel is the D3D11 Present overlay — the one injection technique proven stable
+  # panel is the D3D11 Present overlay â€” the one injection technique proven stable
   # on this client (static byte-patch / hand-drawn overlay), rather than the
   # crash-prone live-managed IL2CPP settings UI. See the F12 spike notes.
   if overlayStart(VkF12, int32(readBackendPort())):
@@ -4227,7 +5023,7 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
 
   # Full-frame post-process (aowl.graphics). Both this and the overlay want to
   # detour DXGI Present, and the detour engine refuses a second hook on the same
-  # function (error -9) — so they cannot each install one. When the overlay is
+  # function (error -9) â€” so they cannot each install one. When the overlay is
   # up it owns the Present hook, and graphics runs from the overlay's pre-present
   # callback: grade the raw frame first, overlay UI composites on top. When the
   # overlay is absent (it is being retired for native settings), graphics owns
@@ -4237,13 +5033,13 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
     if graphicsStartDriven():
       overlaySetPrePresent(graphicsGradePtr())
       overlaySetPreResize(graphicsReleasePtr())
-      okLog "graphics post-process ready (via the overlay Present hook) — " &
+      okLog "graphics post-process ready (via the overlay Present hook) â€” " &
             graphicsStatus()
     else:
       warn "the graphics post-process did not start: " & graphicsStatus()
   else:
     if graphicsStart():
-      okLog "graphics post-process ready (own Present hook) — " & graphicsStatus()
+      okLog "graphics post-process ready (own Present hook) â€” " & graphicsStatus()
     else:
       warn "the graphics post-process did not start: " & graphicsStatus()
 
@@ -4307,6 +5103,9 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   gLastFireMs = lastTick
   var nextBindTry = lastTick + 5000'u64
   var nextRenderTry = lastTick + 5000'u64
+  # OS-close subclass retry clock (see the tick-loop block below).
+  var nextCloseTry = lastTick
+  let closeGiveUpAt = lastTick + 300000'u64
   # One-shot backend-key dump, deferred until the client has reached its menu
   # and initialised HTTPTransportManager on its own -- reading (or worse,
   # force-initialising) it right after il2cpp_init faults and kills the game.
@@ -4323,6 +5122,55 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
     let now = cNowMs()
     let elapsed = int64(now - lastTick)
     lastTick = now
+
+    # OS-close hooks, checked here for the whole session (see `aowlspt_uxpatch.h`
+    # for the three-step history that led to this shape).
+    #
+    # This is a CHECK, not a re-install. The hooks are thread-scoped, so once
+    # they are on the game's UI thread they cover every window that thread pumps
+    # -- including the one the raid re-creates. All this does per tick is find
+    # the main window and compare its thread id with the one already hooked; if
+    # they match it returns having written nothing, anywhere. The only case that
+    # installs anything is a genuinely different UI thread id, which should never
+    # happen in a normal session and is logged loudly if it does.
+    #
+    # The previous version wrote to windows every tick (re-subclassing across
+    # threads) and killed the client eight seconds into boot. Nothing here writes
+    # in the steady state, and nothing writes to a window at all.
+    if gOsCloseFix and now >= nextCloseTry:
+      nextCloseTry = now + 2000'u64
+      var rearmed = 0'i32
+      let armed = cUxCloseArm(addr rearmed)
+      if rearmed != 0'i32:
+        if not gCloseEverArmed:
+          gCloseEverArmed = true
+          okLog "exit fix: OS-close hooks installed on UI thread " &
+                $cUxCloseTid() & " (main window 0x" & hexOf(cUxCloseHwnd()) &
+                ") -- window X / taskbar Close / Alt+F4 now exit via " &
+                "ExitProcess(0) instead of the hanging async shutdown"
+        else:
+          okLog "exit fix: OS-close hooks moved to UI thread " &
+                $cUxCloseTid() & " (main window 0x" & hexOf(cUxCloseHwnd()) &
+                ") -- the game's UI thread changed; the hooks follow it"
+      elif armed == 0'i32 and not gCloseEverArmed and not gCloseWarned and
+           now >= closeGiveUpAt:
+        gCloseWarned = true          # say it once, but keep checking
+        warn "exit fix: no main game window appeared within 5 minutes; the " &
+             "OS-close hooks are not installed yet (window-X may still hang; " &
+             "the Exit button is patched). Still checking."
+    # Log any newly-seen resolver host from the image-CDN hook. Drained here, on
+    # the host thread, because the hook fires on the game's DNS thread where
+    # opening a log file mid-resolve is not safe. First sight only, so this is
+    # near-always a no-op; the point is the one-time confirmation of which host
+    # the image loader dials.
+    if gImageCdnRedirect:
+      var redir = 0'i32
+      while true:
+        let seen = cCdnTakeNewStr(addr redir)
+        if seen == nil: break
+        let hostName = $seen
+        okLog "image-cdn: client resolved " & hostName &
+              (if redir != 0: " -> redirected to 127.0.0.1" else: " (not redirected)")
 
     # Retry while nothing is bound. The first candidate that is worth having is
     # a game type, and the game's own types come up long after the runtime

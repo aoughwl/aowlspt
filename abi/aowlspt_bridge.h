@@ -287,6 +287,157 @@ static int32_t aowl_bridge_settings_target_count(void) {
     return AOWL_BRIDGE_SETTINGS_TARGET_COUNT;
 }
 
+/* ------------------------------------------------------------------ *
+ * The settings CONTROL-TREE target (Phase 1.5)
+ *
+ * `EFT.UI.Settings.SettingsScreen::EnsureTabInitialized` @ RVA 0x171FF10
+ * (VA 0x18171FF10, token 0x060172c8 -- `docs/SETTINGS.md`).
+ *
+ * WHY THIS AND NOT `Show`: the live Phase-1 run proved `Show` fires correctly on
+ * the Unity thread with a readable `this`, but that EVERY tab's
+ * `_createdControls` list was still null there -- the controls do not exist yet
+ * at `Show` time. This method is the lazy builder: `OpenGroup` (0x1720C80)
+ * tail-calls into 0x1720DE0, which `call`s 0x18171FF10 and only AFTERWARDS
+ * assigns `_currentTab` (+0x118). So the tab's controls exist when this returns,
+ * and this runs on EVERY tab switch, not just the first.
+ *
+ * SIGNATURE (read off the disassembly, not assumed):
+ *   RCX = `this` (SettingsScreen)      -- `mov rbx, rcx` at +0x13
+ *   EDX = `ESettingsGroup group`       -- `mov esi, edx` at +0x0E
+ * The body is a 5-way switch on that group, and each arm loads exactly one of
+ * the typed tab fields this probe already knows -- which cross-validates the
+ * metadata-derived offsets in `aowlspt_settingsui.h` against real code:
+ *   group 0 -> [this+0x0F8] graphics    group 1 -> [this+0x0F0] game
+ *   group 2 -> [this+0x108] sound       group 3 -> [this+0x110] controls
+ *   group 4 -> [this+0x100] postfx
+ * The tail (0x18171FF4E entry check / 0x1817202A9 exit) is a HashSet at
+ * [this+0x138]: `Contains(group)` on entry returns early, and the group is added
+ * on the way out. So the FIRST call for a group builds it; later calls are
+ * cheap. Either way the tab is built by the time it returns -- which is why the
+ * probe hooks this POSTFIX.
+ *
+ * Prologue, byte-verified against GameAssembly.dll (16 bytes, ending on an
+ * instruction boundary):
+ *   40 53             push rbx
+ *   56                push rsi
+ *   48 83 EC 58       sub  rsp, 0x58
+ *   80 3D FC E4 99 05 00   cmp byte [rip+0x599E4FC], 0
+ *   8B F2             mov  esi, edx
+ * = 2+1+4+7+2 = 16 exactly. The next instruction (`48 8B D9  mov rbx,rcx`) is
+ * untouched. The one RIP-relative operand is the `cmp`, which the detour copier
+ * fixes up exactly as it already does for `Show` (same instruction, same place).
+ */
+static const AowlBridgeTarget aowl_bridge_settingstab_targets[] = {
+    { "EFT.UI.Settings.SettingsScreen::EnsureTabInitialized", 0x171FF10u,
+      { 0x40,0x53, 0x56, 0x48,0x83,0xEC,0x58,
+        0x80,0x3D,0xFC,0xE4,0x99,0x05,0x00, 0x8B,0xF2 }, 16, 0 },
+};
+#define AOWL_BRIDGE_SETTINGSTAB_TARGET_COUNT \
+    ((int32_t)(sizeof(aowl_bridge_settingstab_targets) / \
+               sizeof(aowl_bridge_settingstab_targets[0])))
+
+static void* aowl_bridge_settingstab_target_at(int32_t i) {
+    HMODULE ga;
+    const AowlBridgeTarget* t;
+    unsigned char* p;
+    MEMORY_BASIC_INFORMATION mbi;
+    if (i < 0 || i >= AOWL_BRIDGE_SETTINGSTAB_TARGET_COUNT) return NULL;
+    ga = GetModuleHandleA("GameAssembly.dll");
+    if (!ga) return NULL;
+    aowl_bridge_base_found = 1;
+    t = &aowl_bridge_settingstab_targets[i];
+    p = (unsigned char*)ga + t->rva;
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0) return NULL;
+    if (mbi.State != MEM_COMMIT) return NULL;
+    if (!(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                         PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+        return NULL;
+    if (t->siglen > 0 && memcmp(p, t->sig, (size_t)t->siglen) != 0) return NULL;
+    aowl_bridge_sig_ok = 1;
+    aowl_bridge_last_rva = (int32_t)t->rva;
+    return (void*)p;
+}
+static const char* aowl_bridge_settingstab_target_name(int32_t i) {
+    if (i < 0 || i >= AOWL_BRIDGE_SETTINGSTAB_TARGET_COUNT) return "";
+    return aowl_bridge_settingstab_targets[i].name;
+}
+static int32_t aowl_bridge_settingstab_target_count(void) {
+    return AOWL_BRIDGE_SETTINGSTAB_TARGET_COUNT;
+}
+
+/* ------------------------------------------------------------------ *
+ * The settings-screen TICK target (Phase 1.7) -- a Unity-thread heartbeat
+ *
+ * `EFT.UI.Settings.GameSettingsTab::Update` @ RVA 0x1703680 (VA 0x181703680).
+ *
+ * WHY A TICK AND NOT A TRIGGER. Phase 1.6 hooked `SettingsTab::OnTabSelected`
+ * and it NEVER FIRED across five real tab clicks. The reason is now proven: a
+ * full-section cross-reference scan of the 81MB `il2cpp` segment (where the
+ * generated code actually lives -- NOT `.text`) finds **zero** callers of
+ * 0x171BDA0. It is dead code in this build. The same scan finds zero direct
+ * callers of every tab's Show / OnFirstSelect / CreateControls too, because they
+ * are all vtable-dispatched -- so "who calls it" cannot be answered statically,
+ * and each guess costs a full deploy-and-click cycle to disprove.
+ *
+ * So we stop guessing the trigger and take a heartbeat instead. This is a
+ * MonoBehaviour `Update`: Unity's runtime drives it every frame while the game
+ * settings tab component is enabled, so it is a guaranteed Unity-main-thread
+ * tick for as long as the settings screen is up, and it costs nothing when the
+ * screen is closed (it simply is not called). From it the probe re-reads each
+ * registered tab's `_createdControls` on a throttle and reports the census the
+ * first time it becomes non-empty -- whatever ends up filling it, whenever.
+ *
+ * Hooked PREFIX: we want the tick, not the method's result, and a prefix is the
+ * cheaper of the two. RCX = the GameSettingsTab (unused; the probe walks the
+ * registry, not `this`).
+ *
+ * Prologue, byte-verified against GameAssembly.dll:
+ *   40 57                   push rdi
+ *   48 83 EC 40             sub  rsp, 0x40
+ *   80 3D E2 AC 9B 05 00    cmp  byte [rip+0x59BACE2], 0
+ *   48 8B F9                mov  rdi, rcx
+ * = 2+4+7+3 = 16 exactly, ending immediately before `75 4B` (jne). The single
+ * RIP-relative operand is the same class-init `cmp` every other target here
+ * carries, which the detour copier fixes up.
+ */
+static const AowlBridgeTarget aowl_bridge_settingstick_targets[] = {
+    { "EFT.UI.Settings.GameSettingsTab::Update", 0x1703680u,
+      { 0x40,0x57, 0x48,0x83,0xEC,0x40,
+        0x80,0x3D,0xE2,0xAC,0x9B,0x05,0x00, 0x48,0x8B,0xF9 }, 16, 0 },
+};
+#define AOWL_BRIDGE_SETTINGSTICK_TARGET_COUNT \
+    ((int32_t)(sizeof(aowl_bridge_settingstick_targets) / \
+               sizeof(aowl_bridge_settingstick_targets[0])))
+
+static void* aowl_bridge_settingstick_target_at(int32_t i) {
+    HMODULE ga;
+    const AowlBridgeTarget* t;
+    unsigned char* p;
+    MEMORY_BASIC_INFORMATION mbi;
+    if (i < 0 || i >= AOWL_BRIDGE_SETTINGSTICK_TARGET_COUNT) return NULL;
+    ga = GetModuleHandleA("GameAssembly.dll");
+    if (!ga) return NULL;
+    aowl_bridge_base_found = 1;
+    t = &aowl_bridge_settingstick_targets[i];
+    p = (unsigned char*)ga + t->rva;
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0) return NULL;
+    if (mbi.State != MEM_COMMIT) return NULL;
+    if (!(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                         PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+        return NULL;
+    if (t->siglen > 0 && memcmp(p, t->sig, (size_t)t->siglen) != 0) return NULL;
+    aowl_bridge_sig_ok = 1;
+    aowl_bridge_last_rva = (int32_t)t->rva;
+    return (void*)p;
+}
+static const char* aowl_bridge_settingstick_target_name(int32_t i) {
+    if (i < 0 || i >= AOWL_BRIDGE_SETTINGSTICK_TARGET_COUNT) return "";
+    return aowl_bridge_settingstick_targets[i].name;
+}
+static int32_t aowl_bridge_settingstick_target_count(void) {
+    return AOWL_BRIDGE_SETTINGSTICK_TARGET_COUNT;
+}
+
 /* The i'th target's verified code pointer, or NULL.
  *
  * NULL means one of: GameAssembly.dll is not mapped yet, the index is out of

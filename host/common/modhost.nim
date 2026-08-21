@@ -455,6 +455,19 @@ proc setLogSink*(fn: LogSinkFn) =
   ## before, and a host that installs one still gets the file if it opened one.
   gLogSink = fn
 
+proc fmtElapsed*(ms: int): string =
+  ## Milliseconds since start as `h:mm:ss.mmm`, so a log a person reads shows a
+  ## clock rather than a raw millisecond count. `aowlterm` already splits the
+  ## stamp on `"] "`, so it displays this verbatim with no change.
+  let h = ms div 3600000
+  let m = (ms div 60000) mod 60
+  let s = (ms div 1000) mod 60
+  let mm = ms mod 1000
+  func p2(n: int): string = (if n < 10: "0" else: "") & $n
+  func p3(n: int): string =
+    (if n < 100: (if n < 10: "00" else: "0") else: "") & $n
+  result = $h & ":" & p2(m) & ":" & p2(s) & "." & p3(mm)
+
 proc logLine*(level, msg: string) =
   ## Opened, written and closed per line, never buffered. A host that takes the
   ## process down with it is a host whose log has to survive that.
@@ -462,7 +475,7 @@ proc logLine*(level, msg: string) =
     gLogSink(level, msg)
   if gLogPath.len == 0:
     return
-  let text = "[" & $int(elapsedMs()) & "ms] " & level & "  " & msg & "\n"
+  let text = "[" & fmtElapsed(int(elapsedMs())) & "] " & level & "  " & msg & "\n"
   var f: File
   if open(f, gLogPath, fmAppend):
     try:

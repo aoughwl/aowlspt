@@ -221,13 +221,11 @@ proc simLine(level, msg: string) =
     inc gErrors
   if gQuiet and not (lv == "error" or lv == "warn"):
     return
-  var stamp = $int(elapsedMs())
-  while stamp.len < 6:
-    stamp = " " & stamp
+  let stamp = fmtElapsed(int(elapsedMs()))
   var pad = level
   while pad.len < 5:
     pad.add ' '
-  let text = "[" & stamp & "ms] " & pad & " " & msg
+  let text = "[" & stamp & "] " & pad & " " & msg
   # Flushed on every line, and stdout flushed before anything goes to stderr.
   # stdout is block-buffered when it is a pipe -- which is what `aowl test`
   # gives it -- while stderr is not, so without this a warning lands in the
