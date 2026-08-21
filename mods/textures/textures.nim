@@ -275,7 +275,9 @@ proc onLoad(): Status =
   configureSwap(gCfg.swapMode, gCfg.vramBudgetMB, tierName(),
                 gCfg.hookAsync, gCfg.armDelayMs)
   info "textures  will arm in mode '" & gCfg.swapMode & "' ~" &
-       $(gCfg.armDelayMs div 1000) & "s after load, once the Unity drain is live"
+       $(gCfg.armDelayMs div 1000) & "s after load, once the game's assemblies " &
+       "are up (drain-independent — the postfix runs on the Unity thread because " &
+       "the game calls LoadAsset there)"
   Ok
 
 proc onUpdate(elapsedMs: int64): Status =

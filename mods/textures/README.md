@@ -126,8 +126,12 @@ now built to avoid both:
 On top of that, the mod is **crash-proof by construction**:
 
 1. **Nothing during boot.** Arming is *deferred* (`armDelayMs`, default 15 s) and
-   waits until the host's Unity main-thread drain is live — so no hook exists
-   during the boot bundle-load storm, which is where the crash was.
+   waits until the IL2CPP runtime's metadata is queryable (a well-known Unity
+   type resolves) — so no hook exists during the boot bundle-load storm, which is
+   where the crash was. This gate is **drain-independent**: on this build the
+   host's per-frame drain binds no method, and the `LoadAsset` postfix does not
+   need it (the game calls `LoadAsset` on the Unity thread, so the postfix runs
+   there for free).
 2. **A staged `swapMode` ladder** (`off` → `probe` → `match` → `full`), so the
    hook install, the per-asset name-match, and the pixel upload can each be
    enabled and confirmed independently. **Ships in `off`.**

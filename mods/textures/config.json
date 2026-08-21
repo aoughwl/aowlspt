@@ -7,7 +7,7 @@
   "_swapModeComment": "Crash-proofing escalation ladder. The first live test crashed the game at boot, so the mod ships in 'off'. off: install nothing (game boots, mod just reports). probe: install the VERIFIED LoadAsset hook and count firings only — proves the hook installs and fires without touching any asset. match: also name-match returned textures against the manifest (still no pixels). full: also upload the replacement texture. Move up ONE rung at a time and confirm the game still boots to the menu at each step.",
   "swapMode": "off",
 
-  "_armDelayMsComment": "How long after the mod loads before hooks are installed. Deferred well past the boot bundle-load storm (where the crash was); the mod also waits until the host's Unity main-thread drain is live (in a scene, not loading). 0 disables the time delay but the drain gate still applies.",
+  "_armDelayMsComment": "How long after the mod loads before hooks are installed. Deferred well past the boot bundle-load storm (where the crash was); the mod also waits until the IL2CPP runtime's metadata is queryable (a well-known Unity type resolves). This is drain-INDEPENDENT: on this build the host's per-frame drain binds no method, and the LoadAsset postfix does not need it (the game calls LoadAsset on the Unity thread, so the postfix runs there for free). 0 arms as soon as the runtime is ready.",
   "armDelayMs": 15000,
 
   "_hookAsyncComment": "Also hook UnityEngine.AssetBundleRequest::get_asset (async loads). OFF: on build 1.1.0.1.46777 that method is a tail-jump virtual-dispatch thunk (48 8B 11 ... 48 FF E0), which is unsafe to postfix-detour. Leave off unless you have verified it on your build.",

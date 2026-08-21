@@ -8,8 +8,11 @@
 ##
 ## 1. **Nothing during boot.** Arming is deferred: no hook is installed until the
 ##    game is well past the boot bundle-load storm (`maybeArm`, driven from
-##    `onUpdate` after a delay and, when the host can tell us, once the Unity
-##    main-thread drain is live — i.e. we are in a scene, not loading).
+##    `onUpdate` after a delay and once the IL2CPP runtime's metadata is
+##    queryable). The gate is drain-independent — on this build the host's
+##    per-frame drain binds nothing, and a native `hookReturn` on `LoadAsset`
+##    does not need it: the game calls `LoadAsset` on the Unity thread, so the
+##    postfix (and its `il2cpp_array_new` + `LoadImage`) runs there for free.
 ##
 ## 2. **Verify the target before patching.** A wrong code pointer is the worst
 ##    failure: the detour engine would relocate whatever bytes are there and the
@@ -41,7 +44,6 @@ import std/strutils
 import std/syncio
 import aowlspt
 import aowlspt/game
-import aowlspt/json
 import aowlspt/il2cpp
 import aowlspt/fast
 import manifest
@@ -129,7 +131,6 @@ var gResidentBytes: int64 = 0
 var gTier = "2K"
 var gArmDelayMs = 15000'i64   ## how long after load before arming (past boot)
 var gLoadedAtMs = 0'i64
-var gRequireDrain = true      ## only arm once the host's Unity drain is live
 
 var gMinConf = 0.0
 var gCatFilter = ""
@@ -392,27 +393,30 @@ proc installVerified(spec: string; expect: array[16, uint8]): bool =
   warn "textures  hookReturn refused " & spec & ": " & lastError()
   result = false
 
-proc drainBound(): bool =
-  ## Whether the host's Unity main-thread drain has actually fired — the host's
-  ## own "are we past loading and in a live scene" signal. Answered even before
-  ## the runtime is up, so it is safe to poll. Same query the perf mod uses.
-  var raw = ""
-  let empty = "[]"
-  if call("aowlspt.host::main_thread", empty, raw) != Ok:
+proc runtimeReady(): bool =
+  ## Drain-INDEPENDENT readiness: the IL2CPP runtime is up and its metadata is
+  ## queryable. This is the correct "are we past boot enough to install" signal
+  ## on this build, where the host's per-frame drain never binds a method — so
+  ## the drain is NOT usable as a liveness gate. `hookReturn` does not need the
+  ## drain anyway: it is a native inline detour on `LoadAsset`'s own code, and
+  ## the game calls `LoadAsset` on the Unity thread, so the postfix runs there
+  ## for free. A well-known Unity type resolving means the assemblies are loaded
+  ## and metadata queries are safe — which is all the install and the postfix
+  ## require.
+  if not gRt.loaded:
+    gRt = openIl2Cpp()
+  if not gRt.loaded:
     return false
-  result = asBool(field(raw, "bound"), false)
+  result = findClass(gRt, "UnityEngine.AssetBundle") != nil
 
 proc readyToArm(): bool =
-  ## True once we are safely past boot: the delay has elapsed and, when we can
-  ## tell, the host's Unity main-thread drain is live (i.e. we are in a scene,
-  ## not in the boot bundle-load storm).
+  ## True once the arm delay has elapsed (clearing the boot bundle-load storm)
+  ## and the runtime's metadata is queryable. No drain dependency.
   if gMode == ModeOff:
     return false
   if nowMs() - gLoadedAtMs < gArmDelayMs:
     return false
-  if gRequireDrain and not drainBound():
-    return false
-  result = true
+  result = runtimeReady()
 
 proc maybeArm*(): bool =
   ## Called every tick from onUpdate. Installs the verified hook(s) exactly once,
@@ -423,13 +427,9 @@ proc maybeArm*(): bool =
     return false
   if not readyToArm():
     return false
+  # readyToArm() only returns true once runtimeReady() has opened the runtime and
+  # a well-known type resolved, so gRt is loaded here.
   gArmTried = true
-
-  gRt = openIl2Cpp()
-  if not gRt.loaded:
-    warn "textures  the IL2CPP runtime is not bound; cannot arm (staying a no-op)"
-    gMode = ModeOff
-    return false
 
   if gMode >= ModeFull:
     probeUpload()
