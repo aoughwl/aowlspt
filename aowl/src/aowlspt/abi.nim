@@ -16,13 +16,14 @@
 
 const
   AbiVersion* = 1'u32
-  AbiRevision* = 5'u32
+  AbiRevision* = 6'u32
 
   HostApiSizeRev1* = 168'i32
   HostApiSizeRev2* = 192'i32
   HostApiSizeRev3* = 208'i32
   HostApiSizeRev4* = 216'i32
   HostApiSizeRev5* = 224'i32
+  HostApiSizeRev6* = 232'i32
     ## How large `HostApi` was at each revision, as literals.
     ##
     ## A capability test has to be against the boundary the capability appeared
@@ -248,6 +249,15 @@ type
     # session", which is a normal answer and the mod's cue to fall back rather
     # than a failure.
     notifyPush*: proc (ctx: pointer; session, payload: AowlSlice): Status {.cdecl.}
+
+    # -- revision 6 ---------------------------------------------------------
+    # Run `cb` on Unity's thread DURING rendering, where immediate-mode
+    # `UnityEngine.GL` drawing rasterizes -- for native ESP and GL HUDs, which
+    # `invokeMain` (the update phase) is on the right thread but the wrong point
+    # in the frame to draw from. `ErrUnsupported` means no render-phase drain is
+    # bound on this host/build/scene; a mod gates on
+    # `call("aowlspt.host::render_thread")` -> `bound:true` and draws only then.
+    invokeRender*: proc (ctx: pointer; cb: CallbackFn; user: pointer): Status {.cdecl.}
 
   ModInfo* {.bycopy.} = object
     size*: int32

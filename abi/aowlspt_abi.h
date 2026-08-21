@@ -57,7 +57,7 @@ extern "C" {
 
 /* Additive revision within version 1. A host may expose a higher revision than
  * a mod was built against; the mod uses struct `size` to tell what is present. */
-#define AOWLSPT_ABI_REVISION 5u
+#define AOWLSPT_ABI_REVISION 6u
 
 #if defined(_WIN32)
 #  define AOWLSPT_CALL __cdecl
@@ -560,6 +560,32 @@ typedef struct AowlHostApi {
      * inside the game process and none in the simulator. */
     AowlStatus (AOWLSPT_CALL *notify_push)(
         void* ctx, AowlSlice session, AowlSlice payload);
+
+    /* -- render-phase main-thread callback (revision 6) --------------------
+     *
+     * `invoke_main` runs `cb` on Unity's main thread in the UPDATE phase, which
+     * is the right thread but the wrong point in the frame for immediate-mode
+     * `UnityEngine.GL` drawing: GL only rasterizes during the RENDER phase, and
+     * post-1.0 has no `OnGUI`. So an ESP box or a GL HUD queued with
+     * `invoke_main` is on the correct thread and draws nothing.
+     *
+     * `invoke_render` runs `cb` on Unity's thread DURING rendering -- the host
+     * detours a render-phase per-frame method and drains a second queue from
+     * inside it -- so `GL.*` issued from `cb` lands on the frame being drawn.
+     * This is what a native ESP or GL-HUD mod uses.
+     *
+     *   * `AOWLSPT_OK` -- queued for the next render.
+     *   * `AOWLSPT_ERR_UNSUPPORTED` -- no render-phase drain is bound: the host
+     *     could not detour a render point on this build, or the game is not yet
+     *     in a scene that has one (the callback the drain rides is raid-time).
+     *     A mod gates on `call("aowlspt.host::render_thread")` -> `bound:true`
+     *     and, until then, does not draw. This is a normal answer, not a bug.
+     *
+     * A host with no IL2CPP render loop (the backend, the simulator) leaves this
+     * null and reports the revision-5 `size`; a client checks `size` before
+     * calling it, exactly as for every appended entry. */
+    AowlStatus (AOWLSPT_CALL *invoke_render)(
+        void* ctx, AowlCallbackFn cb, void* user);
 } AowlHostApi;
 
 /* How large `AowlHostApi` was at each revision.
@@ -577,7 +603,8 @@ typedef struct AowlHostApi {
 #define AOWLSPT_HOSTAPI_SIZE_REV2 ((int32_t)offsetof(AowlHostApi, handle_pointer))
 #define AOWLSPT_HOSTAPI_SIZE_REV3 ((int32_t)offsetof(AowlHostApi, patch_typed))
 #define AOWLSPT_HOSTAPI_SIZE_REV4 ((int32_t)offsetof(AowlHostApi, notify_push))
-#define AOWLSPT_HOSTAPI_SIZE_REV5 ((int32_t)sizeof(AowlHostApi))
+#define AOWLSPT_HOSTAPI_SIZE_REV5 ((int32_t)offsetof(AowlHostApi, invoke_render))
+#define AOWLSPT_HOSTAPI_SIZE_REV6 ((int32_t)sizeof(AowlHostApi))
 
 /* One consequence of `size` being a *watermark* rather than a set, which was
  * latent until revision 5 and is not any more.
