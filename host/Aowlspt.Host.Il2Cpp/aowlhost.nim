@@ -733,6 +733,14 @@ var gAllowStaticBridge = false
 ## that crashes the game is worse than no bridge, so one flag turns it all off.
 var gDisableDrain = false
 
+## Default-off diagnostic: when `aowlspt-host.json` sets `bridgeUiProbe`, the
+## update-drain self-test also instantiates two Unity UI GameObjects on the Unity
+## thread and parents one under the other -- the foundation capability for native
+## settings-screen injection. Off by default so it never runs unless asked; when
+## on it runs once, on the drain thread, and only after the managed-call proof
+## has shown that thread is really Unity's.
+var gUiProbe = false
+
 # ------------------------------------------------------- logging, helpers
 #
 # `info`/`warn`/`fail`/`okLog`, the clock they stamp with, `readBytes` and
@@ -1616,6 +1624,85 @@ proc takeDue(due: var seq[Pending]) =
       cMqSetCount(int32(w))
   cMqUnlock()
 
+proc makeProbeGo(goCls: Il2CppClass; ctor: Il2CppMethod;
+                 name: string): Il2CppObject =
+  ## One named `UnityEngine.GameObject`, created and constructed on whatever
+  ## thread the caller is on. `uiProbe` calls it only from the Unity drain
+  ## thread. A top-level proc rather than a nested one so it captures nothing.
+  let go = objectNew(gRt, goCls)
+  if go == nil:
+    return cast[Il2CppObject](0)
+  let s = newString(gRt, name)
+  let a = cArgsNew(1)
+  cArgsSetRef(a, 0, s)
+  var exc: Il2CppException = nullPtr()
+  discard gRt.invoke(ctor, go, cArgsPtr(a), exc)
+  cArgsFree(a)
+  if exc != nil:
+    return cast[Il2CppObject](0)
+  return go
+
+proc uiProbe(tid: int) =
+  ## Default-off proof of the capability native settings-screen injection is
+  ## built on: instantiating Unity UI objects on the Unity thread and parenting
+  ## one under another. It runs only when `bridgeUiProbe` is set, and only from
+  ## inside `bridgeProof`, which is already gated to the real drain thread -- so
+  ## every runtime call here is on Unity's own thread, where object creation and
+  ## `Transform.SetParent` are safe and off which they fault.
+  ##
+  ## It is self-contained: it makes two `UnityEngine.GameObject`s and parents the
+  ## child under the parent's transform, so it proves both primitives without
+  ## needing to find a live screen in the scene. A mod does the same two calls,
+  ## parenting under a real screen's transform instead of a second probe object.
+  ## The two objects are left in the scene (a one-shot diagnostic leaks nothing
+  ## that matters); a mod destroys or keeps its own.
+  let goCls = findClass(gRt, "UnityEngine.GameObject")
+  let trCls = findClass(gRt, "UnityEngine.Transform")
+  if goCls == nil or trCls == nil:
+    okLog "il2cpp ui probe: UnityEngine.GameObject/Transform did not resolve"
+    return
+  runtimeClassInit(gRt, goCls)
+  let ctor = findMethod(gRt, goCls, ".ctor", 1)
+  let getTransform = findMethod(gRt, goCls, "get_transform", 0)
+  let setParent = findMethod(gRt, trCls, "SetParent", 1)
+  if ctor == nil or getTransform == nil or setParent == nil or
+     methodPointer(gRt, ctor) == nil or methodPointer(gRt, getTransform) == nil or
+     methodPointer(gRt, setParent) == nil:
+    okLog "il2cpp ui probe: GameObject.ctor/get_transform/SetParent did not " &
+          "resolve to callable code on this build"
+    return
+
+  let parent = makeProbeGo(goCls, ctor, "aowlspt_probe_parent")
+  let child = makeProbeGo(goCls, ctor, "aowlspt_probe_child")
+  if parent == nil or child == nil:
+    okLog "il2cpp ui probe: GameObject instantiation returned nil on Unity " &
+          "thread " & $tid
+    return
+
+  # get_transform on both (returns a Transform reference, not boxed).
+  var e1: Il2CppException = nullPtr()
+  let parentTr = gRt.invoke(getTransform, parent, cast[Il2CppPtr](0), e1)
+  var e2: Il2CppException = nullPtr()
+  let childTr = gRt.invoke(getTransform, child, cast[Il2CppPtr](0), e2)
+  if e1 != nil or e2 != nil or parentTr == nil or childTr == nil:
+    okLog "il2cpp ui probe: instantiated GameObjects on Unity thread " & $tid &
+          " but get_transform failed"
+    return
+
+  # child.transform.SetParent(parent.transform).
+  let a = cArgsNew(1)
+  cArgsSetRef(a, 0, parentTr)
+  var e3: Il2CppException = nullPtr()
+  discard gRt.invoke(setParent, childTr, cArgsPtr(a), e3)
+  cArgsFree(a)
+  if e3 != nil:
+    okLog "il2cpp ui probe: instantiated + got transforms on Unity thread " &
+          $tid & " but SetParent threw"
+    return
+  okLog "il2cpp ui probe: instantiated two UnityEngine.GameObjects on Unity " &
+        "thread " & $tid & " and parented one under the other's transform -- " &
+        "native UI instantiation + parenting works on the Unity thread"
+
 proc bridgeProof(tid: int) =
   ## The proof that the drain runs on Unity's own thread: from here, make a real
   ## managed IL2CPP call -- the kind that faults from any thread but Unity's.
@@ -1664,6 +1751,10 @@ proc bridgeProof(tid: int) =
   if not reported:
     okLog "il2cpp bridge: on Unity thread " & $tid &
           ", but no managed call could be resolved to prove it"
+  # The UI-instantiation proof, only when explicitly enabled. Runs here because
+  # `bridgeProof` is already on the confirmed drain thread.
+  if gUiProbe:
+    uiProbe(tid)
 
 proc renderProof(tid: int) =
   ## The render-phase proof: a self-test entry drained from inside the
@@ -3225,15 +3316,15 @@ proc readStaticBridgeEnabled(): bool =
   elif i < text.len and text[i] >= '1' and text[i] <= '9':
     result = true
 
-proc readDrainDisabled(): bool =
-  ## `aowlspt-host.json` key `bridgeDisableDrain`. Non-zero/true turns off every
-  ## per-frame detour (the master kill-switch); absent or 0 keeps the default
-  ## by-name drain. Same shallow read as `readStaticBridgeEnabled`.
+proc readBoolKey(key: string): bool =
+  ## A shallow boolean read of one `aowlspt-host.json` key: true, or a non-zero
+  ## leading digit, is true; absent or 0/false is false. Shared by the bridge's
+  ## diagnostic flags, none of which is worth a JSON parser.
   result = false
   var text = ""
   if not readTextFile(joinPath(gDir, "aowlspt-host.json"), text):
     return
-  let needle = "\"bridgeDisableDrain\""
+  let needle = "\"" & key & "\""
   let at = find(text, needle)
   if at < 0:
     return
@@ -3244,6 +3335,8 @@ proc readDrainDisabled(): bool =
     result = true
   elif i < text.len and text[i] >= '1' and text[i] <= '9':
     result = true
+
+proc readDrainDisabled(): bool = readBoolKey("bridgeDisableDrain")
 
 proc readWaitMs(): int =
   ## `aowlspt-host.json` beside the DLL, key `waitForRuntimeMs`.
@@ -3595,6 +3688,11 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   if gDisableDrain:
     warn "bridgeDisableDrain is set: no per-frame detour will be installed; " &
          "invoke_main runs on the host thread and invoke_render is unavailable"
+  gUiProbe = readBoolKey("bridgeUiProbe")
+  if gUiProbe:
+    info "bridgeUiProbe is set: the drain self-test will also instantiate and " &
+         "parent Unity UI GameObjects on the Unity thread once, to prove the " &
+         "native settings-injection path"
 
   let waitMs = readWaitMs()
   info "waiting for the IL2CPP runtime (up to " & $(waitMs div 1000) & "s)"
