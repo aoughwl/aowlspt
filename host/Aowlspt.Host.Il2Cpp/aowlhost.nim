@@ -101,6 +101,12 @@ import invoke
 ## SettingsScreen control tree read-only. Offsets only; the walk is in
 ## `settingsui.nim` (included below). See `aowlspt_settingsui.h`.
 {.emit: """#include "aowlspt_settingsui.h" """.}
+## DIRECT managed invocation by static RVA: the build-pinned target table, the
+## IL2CPP calling convention (documented there with disassembled evidence from
+## the game's own call sites), the typed call thunks, and the runtime's
+## allocation exports. Table and thunks only; the proof ladder that drives them
+## is in `invoke2.nim` (included below). See `aowlspt_invoke2.h`.
+{.emit: """#include "aowlspt_invoke2.h" """.}
 {.emit: """#include "aowlspt_detour.h" """.}
 ## The typed patch frame. Included here as well as through `aowlspt_abi.h`
 ## because this file names its pool directly; the include guard makes the second
@@ -1042,6 +1048,17 @@ var gSettingsUiDone = false
 ## Shares the `settingsUiProbe` flag with the Phase-1 hook. The walk lives in
 ## `settingsui.nim` (included below) and NEVER writes.
 var gSettingsTabSlot = -1
+
+## DIRECT-INVOCATION proof ladder (kind=8 POSTFIX detour on
+## `SettingsScreen::EnsureTabInitialized`): its slot and opt-in flag
+## (`managedInvokeProbe`). It shares that target with the Phase-1.5 control probe
+## (kind=7), so the two are mutually exclusive -- this one arms first when its
+## flag is set and the control probe then skips itself, because two detours on
+## one function would have the second overwrite the first's trampoline. The
+## ladder itself lives in `invoke2.nim` (included below) and calls managed
+## methods DIRECTLY at their RVA, with no reflection anywhere.
+var gMi2Slot = -1
+var gMi2Probe = false
 
 ## Whether the fragile static-RVA drain path may be used at all. OFF by default:
 ## it bound a real-but-wrong function on the live client and crashed the game, so
@@ -2700,6 +2717,13 @@ proc patchReturned(slot: int32; regs: Il2CppPtr): int32 {.
   if i == gSettingsTabSlot:
     settingsTabInitFired(regs)
     return 0'i32
+  # The direct-invocation proof ladder, by identity and on the same terms: a
+  # host drain (meth == nil) that must run AFTER the original, because the
+  # original is what builds the controls the ladder clones. Returns 0 -- it
+  # never changes what the game produced.
+  if i == gMi2Slot:
+    mi2LadderFired(regs)
+    return 0'i32
   if i < 0 or i >= gPatches.len:
     return 0'i32
   if not gPatches[i].live:
@@ -2981,6 +3005,7 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
               elif kind == 3: "version-brand" elif kind == 5: "botdiag"
               elif kind == 4: "settings-ui-probe" elif kind == 6: "botcap"
               elif kind == 7: "settings-tab-probe"
+              elif kind == 8: "managed-invoke-probe"
               else: "main-thread")
   tablesLock()
   let claimed = cHookClaim()
@@ -3036,13 +3061,15 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
     gBotCapSlot = int(claimed)
   elif kind == 7:
     gSettingsTabSlot = int(claimed)
+  elif kind == 8:
+    gMi2Slot = int(claimed)
   else:
     gDrainSlot = int(claimed)
   tablesUnlock()
   if kind == 1:
     gRenderMethod = spec
   elif kind == 2 or kind == 3 or kind == 4 or kind == 5 or kind == 6 or
-       kind == 7:
+       kind == 7 or kind == 8:
     discard
   else:
     gDrainMethod = spec
@@ -3050,7 +3077,7 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
   okLog what & " bound to " & spec & " (" &
         $int(cHookStolen(hook)) & " bytes)" &
         (if perFrame or kind == 2 or kind == 3 or kind == 4 or kind == 5 or
-            kind == 6 or kind == 7: "" else:
+            kind == 6 or kind == 7 or kind == 8: "" else:
            "; it runs more than once a frame, so its firing count is not a " &
            "frame count")
   return true
@@ -3716,6 +3743,14 @@ include "botcap.nim"
 ## verified `SettingsScreen::Show` target. Defines `settingsUiProbeFired`
 ## (dispatched by slot identity in `patchFired`) and `bindSettingsUiProbe`.
 include "settingsui.nim"
+## The DIRECT-INVOCATION proof ladder. Kept in its own file to avoid colliding
+## with concurrent host work; `include`d (not imported) so it shares this file's
+## guarded raw primitives, `cRegsInt`, logging, `attachDrain`, the VEH/SEH guard,
+## the verified `SettingsScreen::EnsureTabInitialized` target -- and, because it
+## comes AFTER `settingsui.nim`, that file's `suiReadString` and settings-tree
+## offsets. Defines `mi2LadderFired` (dispatched by slot identity in
+## `patchReturned`) and `bindManagedInvoke`.
+include "invoke2.nim"
 
 proc hostEventSubscribe(ctx: Il2CppPtr; name: Il2CppPtr; nameLen: int32;
                         cb: Il2CppPtr; user: Il2CppPtr): int32 {.
@@ -4649,6 +4684,17 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "controls -- they do not exist yet at Show) will log every control's " &
          "label, il2cpp klass pointer and value-widget pointer as each tab is " &
          "built. Open Settings and click each tab. NO write is ever performed."
+  gMi2Probe = readBoolKey("managedInvokeProbe")
+  if gMi2Probe:
+    info "managedInvokeProbe is set: a POSTFIX detour on " &
+         "SettingsScreen.EnsureTabInitialized will run a five-step ladder that " &
+         "calls managed IL2CPP methods DIRECTLY at their static RVA -- no " &
+         "reflection, no runtime_invoke. Steps: (1) instance getters, " &
+         "(2) statics, (3) il2cpp_object_new, (4) GameObject::.ctor + " &
+         "AddComponent routes, (5) clone a live settings label and retarget it. " &
+         "Every step is separately VEH-guarded and logged BEGIN/END, so a fault " &
+         "names its step and cannot crash the client. It takes over the " &
+         "EnsureTabInitialized hook from the Phase-1.5 control probe."
   gVersionBrand = readBoolKey("uxVersionBrand")
   gVersionWrite = readBoolKey("uxVersionBrandWrite")
   if gVersionWrite:
@@ -4733,7 +4779,15 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       # mechanism but fires BEFORE any tab's controls exist; they are built
       # lazily by EnsureTabInitialized, so the walk hangs off that method's
       # POSTFIX. Same flag, same read-only discipline, separate slot.
-      if gSettingsUiProbe and not bindSettingsTabProbe(true):
+      # The direct-invocation proof ladder (opt-in). It shares
+      # EnsureTabInitialized with the Phase-1.5 control probe below, so it arms
+      # FIRST and that probe then skips itself: two detours on one function
+      # would have the second overwrite the first's trampoline.
+      if gMi2Probe and not bindManagedInvoke(true):
+        info "the managed-invoke probe did not verify " &
+             "SettingsScreen.EnsureTabInitialized on this build"
+
+      if gSettingsUiProbe and gMi2Slot < 0 and not bindSettingsTabProbe(true):
         info "the settings control probe did not verify " &
              "SettingsScreen.EnsureTabInitialized on this build"
 
