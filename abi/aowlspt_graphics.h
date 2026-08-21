@@ -99,6 +99,7 @@ typedef struct AowlGfxParams {
     float vignetteRadius;
     float bloom;           /* 0/1 enable the bloom pre-pass */
     float diag;            /* 1 = red-tint blit test */
+    float raidOnly;        /* 1 = grade only in-raid, pass-through in the menu */
 } AowlGfxParams;
 
 static AowlGfxParams aowl_gfx_defaults(void) {
@@ -123,6 +124,7 @@ static AowlGfxParams aowl_gfx_defaults(void) {
     p.vignetteRadius = 1.0f;
     p.bloom = 1.0f;
     p.diag = 0.0f;
+    p.raidOnly = 1.0f;           /* menu stays stock by default */
     return p;
 }
 
@@ -136,6 +138,13 @@ typedef struct AowlGfxState {
 
     CRITICAL_SECTION cs;             /* guards params */
     AowlGfxParams    params;
+
+    /* Raid-state gate. `inRaid` is pushed by the host from the backend's poll
+     * signal (definitive: the tarkov mod knows raid start/end). `gateAmount`
+     * ramps 0..1 toward the gate target on the render thread so the effect
+     * fades in/out over a few frames instead of popping. */
+    volatile LONG    inRaid;
+    float            gateAmount;
 
     /* hooks */
     void* presentHook;
@@ -196,7 +205,7 @@ static const char* AOWL_GFX_HLSL =
 "float _Temperature;float _Tint;float _Tonemapper;float _TonemapStrength;"
 "float _Lift;float _Gamma;float _Gain;float _Shadows;"
 "float _Highlights;float _Sharpness;float _Vignette;float _BloomStrength;"
-"float2 _TexelSize;float _VignetteRadius;float _Diag;}\n"
+"float2 _TexelSize;float _VignetteRadius;float _Diag;float _GateAmount;}\n"
 "Texture2D _Source:register(t0);Texture2D _Bloom:register(t1);SamplerState _Samp:register(s0);\n"
 "struct VSOut{float4 pos:SV_POSITION;float2 uv:TEXCOORD0;};\n"
 "VSOut VSMain(uint id:SV_VertexID){VSOut o;o.uv=float2((id<<1)&2,id&2);"
@@ -232,7 +241,7 @@ static const char* AOWL_GFX_HLSL =
 "c=LGG(c,_Lift,_Gamma,_Gain);c=(c-0.18)*_Contrast+0.18;c=max(c,0.0);"
 "float l=Luma(c);c=lerp(l.xxx,c,_Saturation);"
 "float2 dd=i.uv-0.5;float vig=1.0-_Vignette*smoothstep(_VignetteRadius*0.5,_VignetteRadius,length(dd)*1.4142);c*=saturate(vig);"
-"return float4(L2S(c),1.0);}\n"
+"return float4(lerp(src,L2S(c),_GateAmount),1.0);}\n"
 "float4 PSBright(VSOut i):SV_Target{float3 c=S2L(_Source.Sample(_Samp,i.uv).rgb);float l=Luma(c);"
 "return float4(c*smoothstep(0.7,1.05,l),1.0);}\n"
 "float4 PSBlur(VSOut i):SV_Target{float2 dir=_TexelSize;float3 s=_Source.Sample(_Samp,i.uv).rgb*0.227027;"
@@ -322,8 +331,17 @@ static void aowl_gfx_set_params_json(const char* json) {
     aowl_gfx_jnum(json, "vignetteRadius",  &p.vignetteRadius);
     aowl_gfx_jnum(json, "bloom",           &p.bloom);
     aowl_gfx_jnum(json, "diag",            &p.diag);
+    aowl_gfx_jnum(json, "raidOnly",        &p.raidOnly);
     aowl_gfx_set_params(&p);
 }
+
+/* The raid-state gate signal, pushed by the host from the backend poll. 1 =
+ * in a raid (grade), 0 = menu / loading / unknown (pass-through when raidOnly).
+ * A plain interlocked write; the render thread reads it each frame. */
+static void aowl_gfx_set_in_raid(int32_t on) {
+    InterlockedExchange(&g_gfx.inRaid, on ? 1 : 0);
+}
+static int32_t aowl_gfx_in_raid(void) { return g_gfx.inRaid; }
 
 /* ---------------------------------------------------------------- COM GUIDs */
 static const GUID AOWL_GFX_IID_Tex2D =
@@ -368,7 +386,7 @@ static int aowl_gfx_make_pipeline(void) {
     }
 
     D3D11_BUFFER_DESC bd; memset(&bd, 0, sizeof(bd));
-    bd.ByteWidth = sizeof(float) * 20;   /* 5 float4 registers */
+    bd.ByteWidth = sizeof(float) * 24;   /* 6 float4 registers */
     bd.Usage = D3D11_USAGE_DYNAMIC;
     bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
@@ -538,7 +556,8 @@ static void aowl_gfx_restore(ID3D11DeviceContext* c, AowlGfxSaved* s) {
     if (s->vb) ID3D11Buffer_Release(s->vb);
 }
 
-static void aowl_gfx_upload_cb(const AowlGfxParams* p, float texW, float texH) {
+static void aowl_gfx_upload_cb(const AowlGfxParams* p, float texW, float texH,
+                               float gate) {
     D3D11_MAPPED_SUBRESOURCE m;
     if (FAILED(ID3D11DeviceContext_Map(g_gfx.ctx, (ID3D11Resource*)g_gfx.cb, 0,
                                        D3D11_MAP_WRITE_DISCARD, 0, &m))) return;
@@ -548,6 +567,7 @@ static void aowl_gfx_upload_cb(const AowlGfxParams* p, float texW, float texH) {
     f[8]=p->lift; f[9]=p->gamma; f[10]=p->gain; f[11]=p->shadows;
     f[12]=p->highlights; f[13]=p->sharpness; f[14]=p->vignette; f[15]=p->bloomStrength;
     f[16]=1.0f/texW; f[17]=1.0f/texH; f[18]=p->vignetteRadius; f[19]=p->diag;
+    f[20]=gate; f[21]=0.0f; f[22]=0.0f; f[23]=0.0f;
     ID3D11DeviceContext_Unmap(g_gfx.ctx, (ID3D11Resource*)g_gfx.cb, 0);
 }
 
@@ -620,7 +640,25 @@ static void aowl_gfx_render(IDXGISwapChain* sc) {
     EnterCriticalSection(&g_gfx.cs);
     p = g_gfx.params;
     LeaveCriticalSection(&g_gfx.cs);
-    if (p.enabled < 0.5f) return;    /* nothing to do; leave the frame alone */
+
+    /* Raid-state gate. The effect is on only when enabled AND (raidOnly is off,
+     * or the host says we are in a raid). `diag` forces it on regardless, so the
+     * red-tint blit test works anywhere. `gateAmount` ramps toward the target a
+     * step per frame so the grade fades in/out rather than popping at the menu
+     * <-> raid boundary; at 0 the frame is left completely untouched (a true
+     * pass-through, and the cheapest path). */
+    int wantOn = (p.enabled >= 0.5f) &&
+                 (p.diag >= 0.5f || p.raidOnly < 0.5f || g_gfx.inRaid);
+    float target = wantOn ? 1.0f : 0.0f;
+    if (g_gfx.gateAmount < target) {
+        g_gfx.gateAmount += 0.08f;
+        if (g_gfx.gateAmount > target) g_gfx.gateAmount = target;
+    } else if (g_gfx.gateAmount > target) {
+        g_gfx.gateAmount -= 0.08f;
+        if (g_gfx.gateAmount < target) g_gfx.gateAmount = target;
+    }
+    if (g_gfx.gateAmount <= 0.001f) return;   /* fully passed through */
+    float gate = g_gfx.gateAmount;
 
     /* (re)build size-dependent targets */
     ID3D11Texture2D* bb = NULL;
@@ -644,19 +682,19 @@ static void aowl_gfx_render(IDXGISwapChain* sc) {
         UINT hw = g_gfx.bbW / 2 > 0 ? g_gfx.bbW / 2 : 1;
         UINT hh = g_gfx.bbH / 2 > 0 ? g_gfx.bbH / 2 : 1;
         /* bright pass: sceneCopy -> bloomA (texel size = full res source) */
-        aowl_gfx_upload_cb(&p, (float)g_gfx.bbW, (float)g_gfx.bbH);
+        aowl_gfx_upload_cb(&p, (float)g_gfx.bbW, (float)g_gfx.bbH, gate);
         aowl_gfx_fullscreen(c, g_gfx.psBright, g_gfx.bloomARtv, g_gfx.sceneSrv, NULL, hw, hh);
         /* blur H: bloomA -> bloomB (texel = half res, x only) */
         AowlGfxParams hp = p; /* reuse cb, but blur reads _TexelSize as direction */
-        aowl_gfx_upload_cb(&hp, (float)hw, 1.0e30f);   /* 1/x = 1/hw, 1/y ~ 0 => horizontal */
+        aowl_gfx_upload_cb(&hp, (float)hw, 1.0e30f, gate);   /* 1/x = 1/hw, 1/y ~ 0 => horizontal */
         aowl_gfx_fullscreen(c, g_gfx.psBlur, g_gfx.bloomBRtv, g_gfx.bloomASrv, NULL, hw, hh);
         /* blur V: bloomB -> bloomA (y only) */
-        aowl_gfx_upload_cb(&hp, 1.0e30f, (float)hh);
+        aowl_gfx_upload_cb(&hp, 1.0e30f, (float)hh, gate);
         aowl_gfx_fullscreen(c, g_gfx.psBlur, g_gfx.bloomARtv, g_gfx.bloomBSrv, NULL, hw, hh);
     }
 
     /* main pass: sceneCopy (+ bloomA) -> back buffer */
-    aowl_gfx_upload_cb(&p, (float)g_gfx.bbW, (float)g_gfx.bbH);
+    aowl_gfx_upload_cb(&p, (float)g_gfx.bbW, (float)g_gfx.bbH, gate);
     aowl_gfx_fullscreen(c, g_gfx.psMain, g_gfx.bbRtv, g_gfx.sceneSrv,
                         doBloom ? g_gfx.bloomASrv : g_gfx.blackSrv, g_gfx.bbW, g_gfx.bbH);
 

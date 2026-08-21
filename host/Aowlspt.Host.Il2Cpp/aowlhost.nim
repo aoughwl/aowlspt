@@ -3718,6 +3718,10 @@ var gSyncMs = 0
 ## -- the one a host has before it has decided anything -- and starting equal to
 ## it would suppress the first report this host ever makes.
 var gSyncPath = ""
+## Last raid-state the backend poll reported, so `graphicsSetInRaid` is called
+## only on a change. Starts false: before any raid signal the menu is stock and
+## the graphics gate (raidOnly) leaves it that way.
+var gInRaidLast = false
 var gReportSeq = -1
 var gReportNextMs = 0'u64
 
@@ -3804,6 +3808,18 @@ proc takeModSet() =
     gSyncError = ""
     okLog "the backend's client mod set is readable again"
   applyDesired(want, joinPath(gDir, "mods"))
+
+  # The raid-state gate for the graphics post-process rides this same poll. Read
+  # it only from a document parseDesired accepted (above), and only act on a
+  # change — the grade turns on in a raid and the menu stays stock. An older
+  # manager omits the field, parseInRaid returns false, and the last known
+  # state is kept (default: not in raid, so raidOnly leaves the menu untouched).
+  var raid = gInRaidLast
+  if modcontrol.parseInRaid(doc, raid) and raid != gInRaidLast:
+    gInRaidLast = raid
+    graphicsSetInRaid(raid)
+    info "graphics: backend reports " & (if raid: "IN RAID — grading the world"
+                                         else: "in menu — post-process off")
 
 proc runPending() =
   ## The host thread's half.

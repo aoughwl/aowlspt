@@ -3,6 +3,9 @@
 
   "enabled": true,
 
+  "//raidOnly": "When true (default), the grade runs ONLY inside a raid; the main menu and 2D UI screens stay stock. The raid signal comes from the backend (the tarkov mod knows raid start/end). Set false to grade everywhere, including the menu — also the escape hatch if you run without the backend/manager, since without the signal the gate stays closed.",
+  "raidOnly": true,
+
   "//tonemapper": "0 = none, 1 = AgX (filmic, neutral highlights — default), 2 = ACES. tonemapStrength blends the look 0..1.",
   "tonemapper": 1,
   "tonemapStrength": 0.85,

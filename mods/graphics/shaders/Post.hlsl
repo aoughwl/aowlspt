@@ -55,6 +55,9 @@ cbuffer Params : register(b0)
     float2 _TexelSize;   // 1/width, 1/height
     float _VignetteRadius; // 0..1.5
     float _Diag;         // 1 => red tint diagnostic (confirms the blit lands)
+    // c5
+    float _GateAmount;   // 0..1 raid-state fade: 0 = pass-through, 1 = full grade
+    float3 _pad5;
 }
 
 Texture2D    _Source : register(t0); // the game back buffer (LDR sRGB)
@@ -226,8 +229,9 @@ float4 PSMain(VSOut i) : SV_Target
     float vig = 1.0 - _Vignette * smoothstep(_VignetteRadius * 0.5, _VignetteRadius, length(d) * 1.4142);
     c *= saturate(vig);
 
-    // 11. back to display
-    return float4(LinearToSRGB(c), 1.0);
+    // 11. back to display, blended by the raid-state gate (0 = untouched frame,
+    //     1 = full grade; ramped on the CPU so menu<->raid fades, never pops)
+    return float4(lerp(src, LinearToSRGB(c), _GateAmount), 1.0);
 }
 
 // ===========================================================================

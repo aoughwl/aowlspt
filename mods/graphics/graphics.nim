@@ -53,6 +53,7 @@ const
 type
   Grade = object
     enabled: bool
+    raidOnly: bool
     tonemapper: int
     tonemapStrength: float
     exposure: float
@@ -73,7 +74,7 @@ type
     diag: bool
 
 proc defaultGrade(): Grade =
-  Grade(enabled: true, tonemapper: 1, tonemapStrength: 0.85, exposure: 0.0,
+  Grade(enabled: true, raidOnly: true, tonemapper: 1, tonemapStrength: 0.85, exposure: 0.0,
         contrast: 1.05, saturation: 1.05, temperature: 0.0, tint: 0.0,
         lift: 0.0, gamma: 1.0, gain: 1.0, shadows: 0.0, highlights: 1.1,
         sharpness: 0.35, bloom: true, bloomStrength: 0.35, vignette: 0.18,
@@ -84,6 +85,7 @@ var gGrade = defaultGrade()
 proc loadConfig() =
   gGrade = defaultGrade()
   gGrade.enabled        = setting("enabled").asBool(gGrade.enabled)
+  gGrade.raidOnly       = setting("raidOnly").asBool(gGrade.raidOnly)
   gGrade.tonemapper     = setting("tonemapper").asInt(gGrade.tonemapper)
   gGrade.tonemapStrength = setting("tonemapStrength").asFloat(gGrade.tonemapStrength)
   gGrade.exposure       = setting("exposure").asFloat(gGrade.exposure)
@@ -117,6 +119,7 @@ proc paramsJson(g: Grade): string =
   ## Bools go out as 0/1 so the C reader's number path handles them uniformly.
   result = "{" &
     "\"enabled\":" & (if g.enabled: "1" else: "0") &
+    ",\"raidOnly\":" & (if g.raidOnly: "1" else: "0") &
     ",\"tonemapper\":" & $g.tonemapper &
     ",\"tonemapStrength\":" & f(g.tonemapStrength) &
     ",\"exposure\":" & f(g.exposure) &
@@ -154,6 +157,11 @@ proc schema(): seq[Setting] =
     boolSetting("enabled", "Enable post-process", true,
                 category = "Post-process",
                 description = "Master switch. Off = the game renders untouched."),
+    boolSetting("raidOnly", "Raid only (menu stays stock)", true,
+                category = "Post-process",
+                description = "Grade only in-raid; the menu and 2D UI stay " &
+                    "stock. Off = grade everywhere (also needed if you run " &
+                    "without the backend, which is what supplies the raid signal)."),
     enumSetting("tonemapper", "Tonemapper", "1", @["0", "1", "2"],
                 category = "Tonemap",
                 description = "0 none, 1 AgX (filmic, neutral highlights), 2 ACES."),
