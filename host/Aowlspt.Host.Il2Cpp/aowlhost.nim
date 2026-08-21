@@ -97,6 +97,12 @@ import invoke
 ## `EFT.BotSpawner::AddPlayer` detour target + the guarded int32 read/write. The
 ## one field poke is in `botcap.nim` (included below). See `aowlspt_botcap.h`.
 {.emit: """#include "aowlspt_botcap.h" """.}
+
+## BOT AI ACTIVATION RESCUE: the guarded static target + field offsets for the one
+## bool poke that releases `BotWeaponManager.IsReady`, the gate `BotOwner::
+## UpdateManual` checks before it will ever call `BotOwner::Activate`. The detour
+## body is in `botai.nim` (included below). See `aowlspt_botai.h`.
+{.emit: """#include "aowlspt_botai.h" """.}
 ## Phase 1 native-settings probe: static field offsets for walking the live
 ## SettingsScreen control tree read-only. Offsets only; the walk is in
 ## `settingsui.nim` (included below). See `aowlspt_settingsui.h`.
@@ -1043,6 +1049,16 @@ var gBotDiagCensusDone = false
 var gBotCapSlot = -1
 var gBotCap = false
 var gBotCapDone = false
+## BOT AI ACTIVATION RESCUE (kind=12 detour on `EFT.BotOwner::PreActivate`): its
+## slot, opt-in flag (`botAiActivate`), a fire counter (how many bots reached
+## PreActivate at all) and a poke counter (how many needed the gate released).
+## Declared here beside the other detour slots; the single guarded byte write
+## itself lives in `botai.nim` (included below), which reuses this file's guarded
+## primitives + the VEH/SEH guard.
+var gBotAiSlot = -1
+var gBotAi = false
+var gBotAiFires = 0
+var gBotAiPokes = 0
 ## Phase 1 native-settings probe (kind=4 detour on `SettingsScreen::Show`): its
 ## slot, opt-in flag (`settingsUiProbe`), and once-per-open guard. Declared here
 ## beside the other detour slots; the walk itself lives in `settingsui.nim`
@@ -2635,6 +2651,11 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
   if i == gBotCapSlot:
     botCapAddPlayerFired(regs)
     return 0'i32
+  # BOT AI ACTIVATION RESCUE: the per-bot WeaponManager.IsReady poke, by identity.
+  # It writes one byte and must never suppress the original PreActivate.
+  if i == gBotAiSlot:
+    botAiPreActivateFired(regs)
+    return 0'i32
   # Phase 1 native-settings probe: the read-only control-tree walk, by identity.
   if i == gSettingsUiSlot:
     settingsUiProbeFired(regs)
@@ -3029,6 +3050,7 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
               elif kind == 7: "settings-tab-probe"
               elif kind == 8: "settings-sel-probe"
               elif kind == 9: "managed-invoke-probe"
+              elif kind == 12: "botai"
               else: "main-thread")
   tablesLock()
   let claimed = cHookClaim()
@@ -3088,13 +3110,15 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
     gSettingsSelSlot = int(claimed)
   elif kind == 9:
     gMi2Slot = int(claimed)
+  elif kind == 12:
+    gBotAiSlot = int(claimed)
   else:
     gDrainSlot = int(claimed)
   tablesUnlock()
   if kind == 1:
     gRenderMethod = spec
   elif kind == 2 or kind == 3 or kind == 4 or kind == 5 or kind == 6 or
-       kind == 7 or kind == 8 or kind == 9:
+       kind == 7 or kind == 8 or kind == 9 or kind == 12:
     discard
   else:
     gDrainMethod = spec
@@ -3102,7 +3126,8 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
   okLog what & " bound to " & spec & " (" &
         $int(cHookStolen(hook)) & " bytes)" &
         (if perFrame or kind == 2 or kind == 3 or kind == 4 or kind == 5 or
-            kind == 6 or kind == 7 or kind == 8 or kind == 9: "" else:
+            kind == 6 or kind == 7 or kind == 8 or kind == 9 or
+            kind == 12: "" else:
            "; it runs more than once a frame, so its firing count is not a " &
            "frame count")
   return true
@@ -3746,7 +3771,7 @@ proc bindVersionBrand(verbose: bool): bool =
   if attachDrain("EFT.UI.PreloaderUI::Awake", fn, cast[Il2CppMethod](0),
                  false, verbose, 3'i32, true):
     okLog "version brand armed on EFT.UI.PreloaderUI::Awake (postfix); the " &
-          "bottom-left version label will read \"aowlspt — <version>\""
+          "bottom-left version label will read \"aowlspt â€” <version>\""
     return true
   result = false
 
@@ -3762,6 +3787,13 @@ include "botdiag.nim"
 ## verified `EFT.BotSpawner::AddPlayer` target. Defines `botCapAddPlayerFired`
 ## (dispatched by slot identity in `patchFired`) and `bindBotCap`.
 include "botcap.nim"
+## BOT AI ACTIVATION RESCUE. Kept in its own file to avoid colliding with
+## concurrent host work; `include`d (not imported) so it shares this file's
+## guarded raw primitives, `cRegsInt`, logging, `attachDrain`, the VEH/SEH guard,
+## and the verified `EFT.BotOwner::PreActivate` target. Defines
+## `botAiPreActivateFired` (dispatched by slot identity in `patchFired`) and
+## `bindBotAi`.
+include "botai.nim"
 ## Phase 1 native-settings control-tree probe. Kept in its own file to avoid
 ## colliding with concurrent host work; `include`d (not imported) so it shares
 ## this file's guarded raw-read primitives, logging, `attachDrain`, and the
@@ -4583,15 +4615,15 @@ proc takeModSet() =
 
   # The raid-state gate for the graphics post-process rides this same poll. Read
   # it only from a document parseDesired accepted (above), and only act on a
-  # change — the grade turns on in a raid and the menu stays stock. An older
+  # change â€” the grade turns on in a raid and the menu stays stock. An older
   # manager omits the field, parseInRaid returns false, and the last known
   # state is kept (default: not in raid, so raidOnly leaves the menu untouched).
   var raid = gInRaidLast
   if modcontrol.parseInRaid(doc, raid) and raid != gInRaidLast:
     gInRaidLast = raid
     graphicsSetInRaid(raid)
-    info "graphics: backend reports " & (if raid: "IN RAID — grading the world"
-                                         else: "in menu — post-process off")
+    info "graphics: backend reports " & (if raid: "IN RAID â€” grading the world"
+                                         else: "in menu â€” post-process off")
 
 proc runPending() =
   ## The host thread's half.
@@ -4707,6 +4739,17 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "the cap that defers the scav wave pool (bosses bypass it via " &
          "IgnoreMaxBots; scavs do not). One guarded int32 write on the Unity " &
          "thread; fail-safe -- no write if the build/pointer does not check out."
+  gBotAi = readBoolKey("botAiActivate")
+  if gBotAi:
+    info "botAiActivate is set: a kind=12 detour on EFT.BotOwner.PreActivate will " &
+         "release BotWeaponManager.IsReady (one guarded byte per bot) -- the gate " &
+         "BotOwner.UpdateManual checks before it will call BotOwner.Activate. " &
+         "Without it a bot whose weapon change never completes stays in " &
+         "_botState=1 forever: standing at its spawn, brain never ticking, knife " &
+         "in hand and primary slung. Activate is NOT called by us and _botState " &
+         "is NOT written; the game still runs its own NavMesh check and its own " &
+         "Activate on its own schedule. Fail-safe -- no write if the " &
+         "build/pointer does not check out."
   gSettingsUiProbe = readBoolKey("settingsUiProbe")
   if gSettingsUiProbe:
     info "settingsUiProbe is set: read-only detours on SettingsScreen.Show " &
@@ -4854,6 +4897,14 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
         info "botcap did not arm (EFT.BotSpawner.AddPlayer unverified on this " &
              "build, or drain disabled)"
 
+      # BOT AI ACTIVATION RESCUE (opt-in). BotOwner.PreActivate is static code, so
+      # the detour installs now and never fires until an offline raid activates a
+      # bot; then it releases that bot's WeaponManager.IsReady. Fail-safe if the
+      # prologue does not match.
+      if gBotAi and not bindBotAi(true):
+        info "botai did not arm (EFT.BotOwner.PreActivate unverified on this " &
+             "build, or drain disabled)"
+
   let modsDir = joinPath(gDir, "mods")
   # The runtime may not have come up, and that deliberately does not stop this:
   # a client mod that only logs, schedules and talks to the backend works
@@ -4873,7 +4924,7 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # a worse trade than no panel.
   # F12 opens the in-game settings panel (the revamped settings screen), matching
   # the BepInEx/SPT muscle memory where F12 opened the mod-config manager. The
-  # panel is the D3D11 Present overlay — the one injection technique proven stable
+  # panel is the D3D11 Present overlay â€” the one injection technique proven stable
   # on this client (static byte-patch / hand-drawn overlay), rather than the
   # crash-prone live-managed IL2CPP settings UI. See the F12 spike notes.
   if overlayStart(VkF12, int32(readBackendPort())):
@@ -4887,7 +4938,7 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
 
   # Full-frame post-process (aowl.graphics). Both this and the overlay want to
   # detour DXGI Present, and the detour engine refuses a second hook on the same
-  # function (error -9) — so they cannot each install one. When the overlay is
+  # function (error -9) â€” so they cannot each install one. When the overlay is
   # up it owns the Present hook, and graphics runs from the overlay's pre-present
   # callback: grade the raw frame first, overlay UI composites on top. When the
   # overlay is absent (it is being retired for native settings), graphics owns
@@ -4897,13 +4948,13 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
     if graphicsStartDriven():
       overlaySetPrePresent(graphicsGradePtr())
       overlaySetPreResize(graphicsReleasePtr())
-      okLog "graphics post-process ready (via the overlay Present hook) — " &
+      okLog "graphics post-process ready (via the overlay Present hook) â€” " &
             graphicsStatus()
     else:
       warn "the graphics post-process did not start: " & graphicsStatus()
   else:
     if graphicsStart():
-      okLog "graphics post-process ready (own Present hook) — " & graphicsStatus()
+      okLog "graphics post-process ready (own Present hook) â€” " & graphicsStatus()
     else:
       warn "the graphics post-process did not start: " & graphicsStatus()
 
