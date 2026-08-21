@@ -1,0 +1,4110 @@
+{
+"_schemaStatus":"reconciled to aowlspt.resourcepack v1",
+"schema":"aowlspt.resourcepack",
+"schemaVersion":1,
+"name":"ambientCG Overhaul",
+"version":"1.0.0",
+"author":"savannt",
+"description":"Revamped, non-Tarkov-style PBR surface textures sourced from ambientCG (CC0). Replaces metal, wood, concrete, brick, fabric and ground surfaces with clean, high-detail physically-based materials.",
+"capabilities":[
+"textures"
+],
+"textures":[
+{
+"name":"airductmetal",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.593
+},
+{
+"name":"am_rock_01_d",
+"file":"assets/Ground/Rocks 011/Rocks011_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"am_rock_01_g",
+"file":"assets/Ground/Rocks 011/Rocks011_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"am_rock_01_n",
+"file":"assets/Ground/Rocks 011/Rocks011_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"am_rock_07_d",
+"file":"assets/Ground/Rocks 007/Rocks007_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"am_rock_07_n",
+"file":"assets/Ground/Rocks 007/Rocks007_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"am_rock_08_d",
+"file":"assets/Ground/Rocks 008/Rocks008_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"am_rock_08_n",
+"file":"assets/Ground/Rocks 008/Rocks008_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"arena_metal_01_g",
+"file":"assets/Metal/Metal 001/Metal001_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.636
+},
+{
+"name":"arena_metal_01_n",
+"file":"assets/Metal/Metal 001/Metal001_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.636
+},
+{
+"name":"barrier_concrete",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.593
+},
+{
+"name":"barrier_concrete2",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.643
+},
+{
+"name":"block_concrete_01_d",
+"file":"assets/Concrete/Concrete 010/Concrete010_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.714
+},
+{
+"name":"block_concrete_01_g",
+"file":"assets/Concrete/Concrete 010/Concrete010_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.714
+},
+{
+"name":"block_concrete_01_n",
+"file":"assets/Concrete/Concrete 010/Concrete010_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.714
+},
+{
+"name":"block_concrete_02_d",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.714
+},
+{
+"name":"block_concrete_02_g",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.714
+},
+{
+"name":"block_concrete_02_n",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.714
+},
+{
+"name":"brick_dirty",
+"file":"assets/Brick/Bricks 002/Bricks002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Brick",
+"tier":"2K",
+"conf":0.5
+},
+{
+"name":"brick_floor",
+"file":"assets/Brick/Bricks 002/Bricks002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Brick",
+"tier":"2K",
+"conf":0.5
+},
+{
+"name":"brick_house_dif",
+"file":"assets/Brick/Bricks 002/Bricks002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Brick",
+"tier":"2K",
+"conf":0.5
+},
+{
+"name":"brick_house_nrm",
+"file":"assets/Brick/Bricks 002/Bricks002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Brick",
+"tier":"2K",
+"conf":0.5
+},
+{
+"name":"brick_mask2",
+"file":"assets/Brick/Bricks 002/Bricks002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Brick",
+"tier":"2K",
+"conf":0.7
+},
+{
+"name":"brick_mask3",
+"file":"assets/Brick/Bricks 037/Bricks037_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Brick",
+"tier":"2K",
+"conf":0.7
+},
+{
+"name":"brick_trash_set_d2",
+"file":"assets/Brick/Bricks 002/Bricks002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Brick",
+"tier":"2K",
+"conf":0.518
+},
+{
+"name":"brick_trash_set_n",
+"file":"assets/Brick/Bricks 002/Bricks002_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Brick",
+"tier":"2K",
+"conf":0.5
+},
+{
+"name":"bricks_pallet_d",
+"file":"assets/Brick/Bricks 002/Bricks002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Brick",
+"tier":"2K",
+"conf":0.545
+},
+{
+"name":"bricks_pallet_n",
+"file":"assets/Brick/Bricks 002/Bricks002_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Brick",
+"tier":"2K",
+"conf":0.545
+},
+{
+"name":"bricks_red",
+"file":"assets/Brick/Bricks 002/Bricks002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Brick",
+"tier":"2K",
+"conf":0.632
+},
+{
+"name":"bricks_red2",
+"file":"assets/Brick/Bricks 002/Bricks002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Brick",
+"tier":"2K",
+"conf":0.7
+},
+{
+"name":"bricks_red_nrm",
+"file":"assets/Brick/Bricks 002/Bricks002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Brick",
+"tier":"2K",
+"conf":0.522
+},
+{
+"name":"bricks_white",
+"file":"assets/Brick/Bricks 002/Bricks002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Brick",
+"tier":"2K",
+"conf":0.571
+},
+{
+"name":"bricks_white_orange_02",
+"file":"assets/Brick/Bricks 002/Bricks002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Brick",
+"tier":"2K",
+"conf":0.516
+},
+{
+"name":"carpet2_d",
+"file":"assets/Fabric/Carpet 001/Carpet001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Fabric",
+"tier":"2K",
+"conf":0.75
+},
+{
+"name":"carpet2_d_#9262444",
+"file":"assets/Fabric/Carpet 014/Carpet014_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Fabric",
+"tier":"2K",
+"conf":0.518
+},
+{
+"name":"carpet2_m",
+"file":"assets/Fabric/Carpet 001/Carpet001.png",
+"map":"metalness/preview",
+"cat":"Fabric",
+"tier":"2K",
+"conf":0.75
+},
+{
+"name":"carpet2_n",
+"file":"assets/Fabric/Carpet 001/Carpet001_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Fabric",
+"tier":"2K",
+"conf":0.75
+},
+{
+"name":"carpet2_n_#9261840",
+"file":"assets/Fabric/Carpet 014/Carpet014_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Fabric",
+"tier":"2K",
+"conf":0.593
+},
+{
+"name":"carpet_d",
+"file":"assets/Fabric/Carpet 001/Carpet001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Fabric",
+"tier":"2K",
+"conf":0.8
+},
+{
+"name":"carpet_d_#9261778",
+"file":"assets/Fabric/Carpet 001/Carpet001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Fabric",
+"tier":"2K",
+"conf":0.538
+},
+{
+"name":"carpet_h",
+"file":"assets/Fabric/Carpet 001/Carpet001_2K-JPG_Displacement.jpg",
+"map":"height",
+"cat":"Fabric",
+"tier":"2K",
+"conf":0.8
+},
+{
+"name":"carpet_h_#9262763",
+"file":"assets/Fabric/Carpet 003/Carpet003_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Fabric",
+"tier":"2K",
+"conf":0.538
+},
+{
+"name":"carpet_indoor_7_d",
+"file":"assets/Fabric/Carpet 001/Carpet001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Fabric",
+"tier":"2K",
+"conf":0.5
+},
+{
+"name":"carpet_indoor_7_g",
+"file":"assets/Fabric/Carpet 001/Carpet001_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Fabric",
+"tier":"2K",
+"conf":0.5
+},
+{
+"name":"carpet_inside_d",
+"file":"assets/Fabric/Carpet 001/Carpet001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Fabric",
+"tier":"2K",
+"conf":0.545
+},
+{
+"name":"carpet_n",
+"file":"assets/Fabric/Carpet 001/Carpet001_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Fabric",
+"tier":"2K",
+"conf":0.8
+},
+{
+"name":"carpet_n_#9261848",
+"file":"assets/Fabric/Carpet 014/Carpet014_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Fabric",
+"tier":"2K",
+"conf":0.615
+},
+{
+"name":"carpet_nice",
+"file":"assets/Fabric/Carpet 001/Carpet001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Fabric",
+"tier":"2K",
+"conf":0.6
+},
+{
+"name":"carpet_nice_nrm",
+"file":"assets/Fabric/Carpet 001/Carpet001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Fabric",
+"tier":"2K",
+"conf":0.5
+},
+{
+"name":"carpet_outside_d",
+"file":"assets/Fabric/Carpet 001/Carpet001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Fabric",
+"tier":"2K",
+"conf":0.522
+},
+{
+"name":"carpets",
+"file":"assets/Fabric/Carpet 001/Carpet001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Fabric",
+"tier":"2K",
+"conf":0.75
+},
+{
+"name":"carpets_3",
+"file":"assets/Fabric/Carpet 003/Carpet003_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Fabric",
+"tier":"2K",
+"conf":0.778
+},
+{
+"name":"cast_concrete",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"chair_fabric_n",
+"file":"assets/Fabric/Fabric 001/Fabric001_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Fabric",
+"tier":"2K",
+"conf":0.571
+},
+{
+"name":"chair_wood1_d",
+"file":"assets/Wood/Wood 013/Wood013_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.556
+},
+{
+"name":"chair_wood1_g",
+"file":"assets/Wood/Wood 013/Wood013_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.556
+},
+{
+"name":"chair_wood1_n",
+"file":"assets/Wood/Wood 013/Wood013_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.556
+},
+{
+"name":"chairs_wood2_d",
+"file":"assets/Wood/Wood 021/Wood021_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.526
+},
+{
+"name":"chairs_wood2_g",
+"file":"assets/Wood/Wood 021/Wood021_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.526
+},
+{
+"name":"chairs_wood2_n",
+"file":"assets/Wood/Wood 021/Wood021_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.526
+},
+{
+"name":"city_brick_mask",
+"file":"assets/Brick/Painted Bricks 001/PaintedBricks001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Brick",
+"tier":"2K",
+"conf":0.516
+},
+{
+"name":"city_broken_brick_01_d",
+"file":"assets/Brick/Painted Bricks 001/PaintedBricks001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Brick",
+"tier":"2K",
+"conf":0.556
+},
+{
+"name":"city_broken_brick_01_g",
+"file":"assets/Brick/Painted Bricks 001/PaintedBricks001_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Brick",
+"tier":"2K",
+"conf":0.556
+},
+{
+"name":"city_broken_brick_01_n",
+"file":"assets/Brick/Painted Bricks 001/PaintedBricks001_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Brick",
+"tier":"2K",
+"conf":0.556
+},
+{
+"name":"city_carpet_2_d",
+"file":"assets/Fabric/Carpet 001/Carpet001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Fabric",
+"tier":"2K",
+"conf":0.545
+},
+{
+"name":"city_carpet_2_g",
+"file":"assets/Fabric/Carpet 001/Carpet001_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Fabric",
+"tier":"2K",
+"conf":0.545
+},
+{
+"name":"city_carpet_2_n",
+"file":"assets/Fabric/Carpet 001/Carpet001_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Fabric",
+"tier":"2K",
+"conf":0.545
+},
+{
+"name":"city_carpet_8_d",
+"file":"assets/Fabric/Carpet 001/Carpet001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Fabric",
+"tier":"2K",
+"conf":0.545
+},
+{
+"name":"city_carpet_8_g",
+"file":"assets/Fabric/Carpet 001/Carpet001_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Fabric",
+"tier":"2K",
+"conf":0.545
+},
+{
+"name":"city_carpet_d",
+"file":"assets/Fabric/Carpet 001/Carpet001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Fabric",
+"tier":"2K",
+"conf":0.6
+},
+{
+"name":"city_carpet_d2",
+"file":"assets/Fabric/Carpet 001/Carpet001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Fabric",
+"tier":"2K",
+"conf":0.522
+},
+{
+"name":"city_carpet_nrm",
+"file":"assets/Fabric/Carpet 001/Carpet001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Fabric",
+"tier":"2K",
+"conf":0.5
+},
+{
+"name":"city_carpets_2",
+"file":"assets/Fabric/Carpet 001/Carpet001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Fabric",
+"tier":"2K",
+"conf":0.522
+},
+{
+"name":"city_castlebrick_04",
+"file":"assets/Brick/Painted Bricks 001/PaintedBricks001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Brick",
+"tier":"2K",
+"conf":0.514
+},
+{
+"name":"city_concrete_d",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"city_concrete_fresh_01_d",
+"file":"assets/Concrete/Concrete 010/Concrete010_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.606
+},
+{
+"name":"city_concrete_fresh_01_g",
+"file":"assets/Concrete/Concrete 010/Concrete010_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.606
+},
+{
+"name":"city_concrete_fresh_01_n",
+"file":"assets/Concrete/Concrete 010/Concrete010_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.606
+},
+{
+"name":"city_concrete_n",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"city_concrete_r",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"city_concrete_slab_01",
+"file":"assets/Concrete/Concrete 010/Concrete010_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.625
+},
+{
+"name":"city_concrete_slab_d",
+"file":"assets/Concrete/Concrete 042 A/Concrete042A_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.6
+},
+{
+"name":"city_concrete_slab_g",
+"file":"assets/Concrete/Concrete 042 A/Concrete042A_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.6
+},
+{
+"name":"city_concrete_slab_n",
+"file":"assets/Concrete/Concrete 042 A/Concrete042A_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.6
+},
+{
+"name":"city_concrete_wall_d",
+"file":"assets/Concrete/Concrete 042 A/Concrete042A_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.6
+},
+{
+"name":"city_concrete_wall_n",
+"file":"assets/Concrete/Concrete 042 A/Concrete042A_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.6
+},
+{
+"name":"city_dirtwhitecarpet_01",
+"file":"assets/Fabric/Carpet 001/Carpet001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Fabric",
+"tier":"2K",
+"conf":0.5
+},
+{
+"name":"city_floorwood_01_d",
+"file":"assets/Wood/Wood 013/Wood013_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.5
+},
+{
+"name":"city_floorwood_01_g",
+"file":"assets/Wood/Wood 013/Wood013_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.5
+},
+{
+"name":"city_floorwood_01_n",
+"file":"assets/Wood/Wood 013/Wood013_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.5
+},
+{
+"name":"city_grass_02_d",
+"file":"assets/Ground/Grass 002/Grass002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"city_grass_02_n",
+"file":"assets/Ground/Grass 002/Grass002_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"city_grass_03_d",
+"file":"assets/Ground/Grass 003/Grass003_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"city_grass_03_n",
+"file":"assets/Ground/Grass 003/Grass003_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"city_metal_d",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.56
+},
+{
+"name":"city_painted_metal_gray",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.632
+},
+{
+"name":"city_painted_metal_gray_nrm",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.571
+},
+{
+"name":"city_rich_wood_01_d",
+"file":"assets/Wood/Wood 013/Wood013_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.5
+},
+{
+"name":"city_rich_wood_01_g",
+"file":"assets/Wood/Wood 013/Wood013_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.5
+},
+{
+"name":"city_rich_wood_01_n",
+"file":"assets/Wood/Wood 013/Wood013_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.5
+},
+{
+"name":"city_white_brick_3x3_d",
+"file":"assets/Brick/Painted Bricks 003/PaintedBricks003_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Brick",
+"tier":"2K",
+"conf":0.5
+},
+{
+"name":"city_white_brick_3x3_g",
+"file":"assets/Brick/Painted Bricks 003/PaintedBricks003_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Brick",
+"tier":"2K",
+"conf":0.5
+},
+{
+"name":"city_white_brick_3x3_n",
+"file":"assets/Brick/Painted Bricks 003/PaintedBricks003_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Brick",
+"tier":"2K",
+"conf":0.5
+},
+{
+"name":"city_wood_01",
+"file":"assets/Wood/Wood 013/Wood013_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.632
+},
+{
+"name":"city_wood_01_nm",
+"file":"assets/Wood/Wood 013/Wood013_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.545
+},
+{
+"name":"city_wood_board_01_d",
+"file":"assets/Wood/Wood Floor 041/WoodFloor041_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.533
+},
+{
+"name":"city_wood_board_01_g",
+"file":"assets/Wood/Wood Floor 041/WoodFloor041_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.533
+},
+{
+"name":"city_wood_board_01_n",
+"file":"assets/Wood/Wood Floor 041/WoodFloor041_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.533
+},
+{
+"name":"city_wood_floor_01_d",
+"file":"assets/Wood/Wood Floor 041/WoodFloor041_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.733
+},
+{
+"name":"city_wood_floor_01_g",
+"file":"assets/Wood/Wood Floor 041/WoodFloor041_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.733
+},
+{
+"name":"city_wood_floor_01_n",
+"file":"assets/Wood/Wood Floor 041/WoodFloor041_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.733
+},
+{
+"name":"city_wooden_ceiling_01_d",
+"file":"assets/Wood/Wood Siding 005/WoodSiding005_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.514
+},
+{
+"name":"city_wooden_ceiling_01_g",
+"file":"assets/Wood/Wood Siding 005/WoodSiding005_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.514
+},
+{
+"name":"city_wooden_ceiling_01_n",
+"file":"assets/Wood/Wood Siding 005/WoodSiding005_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.514
+},
+{
+"name":"city_wooden_door_old_01_g",
+"file":"assets/Wood/Wood Floor 041/WoodFloor041_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.514
+},
+{
+"name":"clean_concrete",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.64
+},
+{
+"name":"clean_concrete_02_decal_n",
+"file":"assets/Concrete/Concrete 042 A/Concrete042A_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.629
+},
+{
+"name":"concrete5_2",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.818
+},
+{
+"name":"concrete5_nmp",
+"file":"assets/Concrete/Concrete 015/Concrete015_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.75
+},
+{
+"name":"concrete_block_nrm",
+"file":"assets/Concrete/Concrete 042 C/Concrete042C_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.6
+},
+{
+"name":"concrete_broken",
+"file":"assets/Concrete/Concrete 044 B/Concrete044B_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"concrete_broken01_nrm",
+"file":"assets/Concrete/Concrete 010/Concrete010_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.625
+},
+{
+"name":"concrete_bunker_01_d",
+"file":"assets/Concrete/Concrete 010/Concrete010_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.69
+},
+{
+"name":"concrete_bunker_01_n",
+"file":"assets/Concrete/Concrete 010/Concrete010_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.69
+},
+{
+"name":"concrete_bunker_03_d",
+"file":"assets/Concrete/Concrete 003/Concrete003_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.69
+},
+{
+"name":"concrete_bunker_03_n",
+"file":"assets/Concrete/Concrete 003/Concrete003_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.69
+},
+{
+"name":"concrete_bunker_mask_01",
+"file":"assets/Concrete/Concrete 010/Concrete010_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.588
+},
+{
+"name":"concrete_clean2",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.692
+},
+{
+"name":"concrete_clean2_nrm",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.6
+},
+{
+"name":"concrete_clean_02_d",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.714
+},
+{
+"name":"concrete_clean_02_decal_d",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.588
+},
+{
+"name":"concrete_clean_02_n",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.714
+},
+{
+"name":"concrete_cracks",
+"file":"assets/Concrete/Concrete 042 A/Concrete042A_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"concrete_cracks_nrm",
+"file":"assets/Concrete/Concrete 042 A/Concrete042A_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.581
+},
+{
+"name":"concrete_ddn",
+"file":"assets/Concrete/Concrete 044 D/Concrete044D_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.75
+},
+{
+"name":"concrete_depot_mask",
+"file":"assets/Concrete/Concrete 042 A/Concrete042A_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.581
+},
+{
+"name":"concrete_depot_mask2",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.581
+},
+{
+"name":"concrete_dirty_floor_01_d",
+"file":"assets/Concrete/Concrete 010/Concrete010_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.588
+},
+{
+"name":"concrete_dirty_floor_01_g",
+"file":"assets/Concrete/Concrete 010/Concrete010_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.588
+},
+{
+"name":"concrete_dirty_floor_02_n",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.588
+},
+{
+"name":"concrete_dust_dif",
+"file":"assets/Concrete/Concrete 044 D/Concrete044D_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.621
+},
+{
+"name":"concrete_dust_nrm",
+"file":"assets/Concrete/Concrete 044 D/Concrete044D_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.621
+},
+{
+"name":"concrete_fence3_d",
+"file":"assets/Concrete/Concrete 003/Concrete003_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.692
+},
+{
+"name":"concrete_fence3_n",
+"file":"assets/Concrete/Concrete 003/Concrete003_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.692
+},
+{
+"name":"concrete_fence4",
+"file":"assets/Concrete/Concrete 004/Concrete004_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.692
+},
+{
+"name":"concrete_fence4_n",
+"file":"assets/Concrete/Concrete 004/Concrete004_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.692
+},
+{
+"name":"concrete_fence4_paint",
+"file":"assets/Concrete/Concrete 042 A/Concrete042A_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.606
+},
+{
+"name":"concrete_fence5",
+"file":"assets/Concrete/Concrete 015/Concrete015_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.692
+},
+{
+"name":"concrete_fence5_n",
+"file":"assets/Concrete/Concrete 015/Concrete015_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.692
+},
+{
+"name":"concrete_floor",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.64
+},
+{
+"name":"concrete_floor_02",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.714
+},
+{
+"name":"concrete_floor_02_nrm",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.625
+},
+{
+"name":"concrete_pillar_nm",
+"file":"assets/Concrete/Concrete 042 A/Concrete042A_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.6
+},
+{
+"name":"concrete_rough_01_d",
+"file":"assets/Concrete/Concrete 010/Concrete010_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.714
+},
+{
+"name":"concrete_rough_01_n",
+"file":"assets/Concrete/Concrete 010/Concrete010_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.714
+},
+{
+"name":"concrete_sand_mask2",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.6
+},
+{
+"name":"concrete_set2_d2",
+"file":"assets/Concrete/Concrete 022/Concrete022_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.741
+},
+{
+"name":"concrete_set2_n",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.75
+},
+{
+"name":"concrete_set_d",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.696
+},
+{
+"name":"concrete_set_n",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.696
+},
+{
+"name":"concrete_smooth_d",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.615
+},
+{
+"name":"concrete_structures_01_d",
+"file":"assets/Concrete/Concrete 010/Concrete010_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.606
+},
+{
+"name":"concrete_structures_01_g",
+"file":"assets/Concrete/Concrete 010/Concrete010_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.606
+},
+{
+"name":"concrete_structures_01_n",
+"file":"assets/Concrete/Concrete 010/Concrete010_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.606
+},
+{
+"name":"concrete_structures_02_d",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.606
+},
+{
+"name":"concrete_structures_02_g",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.606
+},
+{
+"name":"concrete_structures_02_n",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.606
+},
+{
+"name":"concrete_tiles_diff",
+"file":"assets/Concrete/Concrete 044 D/Concrete044D_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.581
+},
+{
+"name":"concrete_trims_d",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.64
+},
+{
+"name":"concrete_urn",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.696
+},
+{
+"name":"concrete_urn_n",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.696
+},
+{
+"name":"concrete_wall_burnt",
+"file":"assets/Concrete/Concrete 042 A/Concrete042A_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.581
+},
+{
+"name":"concrete_wall_gloss",
+"file":"assets/Concrete/Concrete 042 A/Concrete042A_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.581
+},
+{
+"name":"concrete_wall_nrm",
+"file":"assets/Concrete/Concrete 042 A/Concrete042A_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.621
+},
+{
+"name":"concrete_wire_d",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"concrete_wire_n",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"concreteceiling",
+"file":"assets/Concrete/Concrete 042 C/Concrete042C_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"concretefloor",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"concreteplate_tile",
+"file":"assets/Concrete/Concrete 042 A/Concrete042A_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.6
+},
+{
+"name":"concretewall",
+"file":"assets/Concrete/Concrete 042 A/Concrete042A_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.75
+},
+{
+"name":"corrugated_rust_metal_sheet_d",
+"file":"assets/Metal/Corrugated Steel 005/CorrugatedSteel005_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.622
+},
+{
+"name":"corrugated_rust_metal_sheet_g",
+"file":"assets/Metal/Corrugated Steel 005/CorrugatedSteel005_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.622
+},
+{
+"name":"corrugated_rust_metal_sheet_n",
+"file":"assets/Metal/Corrugated Steel 005/CorrugatedSteel005_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.622
+},
+{
+"name":"corrugated_rust_metal_sheet_t",
+"file":"assets/Metal/Corrugated Steel 005/CorrugatedSteel005_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.596
+},
+{
+"name":"custom_concrete_var2_d",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.581
+},
+{
+"name":"custom_metal_panel_01_d",
+"file":"assets/Metal/Metal Plates 001/MetalPlates001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.571
+},
+{
+"name":"custom_metal_panel_01_g",
+"file":"assets/Metal/Metal Plates 001/MetalPlates001_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.571
+},
+{
+"name":"custom_metal_panel_01_n",
+"file":"assets/Metal/Metal Plates 001/MetalPlates001_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.571
+},
+{
+"name":"decal_bricks_d",
+"file":"assets/Brick/Bricks 002/Bricks002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Brick",
+"tier":"2K",
+"conf":0.571
+},
+{
+"name":"decal_bricks_n",
+"file":"assets/Brick/Bricks 002/Bricks002_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Brick",
+"tier":"2K",
+"conf":0.571
+},
+{
+"name":"decal_concrete",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.64
+},
+{
+"name":"decal_concrete2_nrm",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.6
+},
+{
+"name":"decal_concrete3",
+"file":"assets/Concrete/Concrete 003/Concrete003_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.692
+},
+{
+"name":"decal_concrete_d3",
+"file":"assets/Concrete/Concrete 003/Concrete003_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.643
+},
+{
+"name":"decal_concrete_n3",
+"file":"assets/Concrete/Concrete 003/Concrete003_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.643
+},
+{
+"name":"decal_wood2",
+"file":"assets/Wood/Wood 021/Wood021_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.556
+},
+{
+"name":"door_metall02",
+"file":"assets/Metal/Metal 002/Metal002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"door_metall02_nrm",
+"file":"assets/Metal/Metal 002/Metal002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.56
+},
+{
+"name":"door_wood1",
+"file":"assets/Wood/Wood 013/Wood013_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.588
+},
+{
+"name":"door_wood1_n",
+"file":"assets/Wood/Wood 013/Wood013_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.588
+},
+{
+"name":"door_wood2",
+"file":"assets/Wood/Wood 021/Wood021_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.588
+},
+{
+"name":"door_wood2_n",
+"file":"assets/Wood/Wood 021/Wood021_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.588
+},
+{
+"name":"door_wood3_d",
+"file":"assets/Wood/Wood 003/Wood003_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.588
+},
+{
+"name":"door_wood3_n",
+"file":"assets/Wood/Wood 003/Wood003_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.588
+},
+{
+"name":"fabric_chair",
+"file":"assets/Fabric/Fabric 001/Fabric001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Fabric",
+"tier":"2K",
+"conf":0.571
+},
+{
+"name":"fabric_folds_02_n",
+"file":"assets/Fabric/Fabric 002/Fabric002_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Fabric",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"fan_wooddesign_d",
+"file":"assets/Wood/Wood Siding 005/WoodSiding005_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.518
+},
+{
+"name":"fan_wooddesign_g",
+"file":"assets/Wood/Wood Siding 005/WoodSiding005_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.518
+},
+{
+"name":"fan_wooddesign_n",
+"file":"assets/Wood/Wood Siding 005/WoodSiding005_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.518
+},
+{
+"name":"fence_concrete2",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.692
+},
+{
+"name":"fence_concrete2_lod3_d",
+"file":"assets/Concrete/Concrete 023/Concrete023_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.645
+},
+{
+"name":"fence_concrete2_lod3_n",
+"file":"assets/Concrete/Concrete 023/Concrete023_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.645
+},
+{
+"name":"fence_concrete2_n",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.692
+},
+{
+"name":"fence_concrete_01_d",
+"file":"assets/Concrete/Concrete 010/Concrete010_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.714
+},
+{
+"name":"fence_concrete_01_decal_d",
+"file":"assets/Concrete/Concrete 010/Concrete010_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.588
+},
+{
+"name":"fence_concrete_01_decal_n",
+"file":"assets/Concrete/Concrete 010/Concrete010_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.588
+},
+{
+"name":"fence_concrete_01_g",
+"file":"assets/Concrete/Concrete 010/Concrete010_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.714
+},
+{
+"name":"fence_concrete_01_n",
+"file":"assets/Concrete/Concrete 010/Concrete010_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.714
+},
+{
+"name":"fence_concrete_d",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.64
+},
+{
+"name":"fence_concrete_n",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.64
+},
+{
+"name":"fence_metall",
+"file":"assets/Metal/Sheet Metal 001/SheetMetal001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.56
+},
+{
+"name":"fence_wood_01_dif",
+"file":"assets/Wood/Wood 013/Wood013_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.5
+},
+{
+"name":"fence_wood_01_nrm",
+"file":"assets/Wood/Wood 013/Wood013_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.5
+},
+{
+"name":"fence_wood_02_dif",
+"file":"assets/Wood/Wood 021/Wood021_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.5
+},
+{
+"name":"fence_wood_02_nrm",
+"file":"assets/Wood/Wood 021/Wood021_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.5
+},
+{
+"name":"fence_wood_03_dif",
+"file":"assets/Wood/Wood 003/Wood003_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.5
+},
+{
+"name":"fence_wood_03_nrm",
+"file":"assets/Wood/Wood 003/Wood003_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.5
+},
+{
+"name":"firewood_d",
+"file":"assets/Wood/Wood 003/Wood003_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.533
+},
+{
+"name":"firewood_g",
+"file":"assets/Wood/Wood 003/Wood003_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.533
+},
+{
+"name":"firewood_n",
+"file":"assets/Wood/Wood 003/Wood003_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.533
+},
+{
+"name":"floor_metal_grate_rust_01_n",
+"file":"assets/Metal/Metal Plates 001/MetalPlates001_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.564
+},
+{
+"name":"fresh_bricks_d",
+"file":"assets/Brick/Bricks 002/Bricks002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Brick",
+"tier":"2K",
+"conf":0.571
+},
+{
+"name":"fresh_bricks_g",
+"file":"assets/Brick/Bricks 002/Bricks002_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Brick",
+"tier":"2K",
+"conf":0.571
+},
+{
+"name":"fresh_bricks_n",
+"file":"assets/Brick/Bricks 002/Bricks002_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Brick",
+"tier":"2K",
+"conf":0.571
+},
+{
+"name":"gate_metal_red",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.552
+},
+{
+"name":"gate_metall",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.615
+},
+{
+"name":"gate_metall_n",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.615
+},
+{
+"name":"grass",
+"file":"assets/Ground/Grass 001/Grass001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.769
+},
+{
+"name":"grass01_atlas",
+"file":"assets/Ground/Grass 001/Grass001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"grass03_atlas",
+"file":"assets/Ground/Grass 003/Grass003_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"grass11",
+"file":"assets/Ground/Grass 001/Grass001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.8
+},
+{
+"name":"grass1_1",
+"file":"assets/Ground/Grass 001/Grass001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.75
+},
+{
+"name":"grass2_d",
+"file":"assets/Ground/Grass 002/Grass002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.857
+},
+{
+"name":"grass2_n",
+"file":"assets/Ground/Grass 002/Grass002_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.857
+},
+{
+"name":"grass3_d",
+"file":"assets/Ground/Grass 003/Grass003_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.857
+},
+{
+"name":"grass3_n",
+"file":"assets/Ground/Grass 003/Grass003_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.857
+},
+{
+"name":"grass4_d",
+"file":"assets/Ground/Grass 004/Grass004_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.857
+},
+{
+"name":"grass4_n",
+"file":"assets/Ground/Grass 004/Grass004_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.857
+},
+{
+"name":"grass5_512_d",
+"file":"assets/Ground/Grass 001/Grass001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"grass5_512_n",
+"file":"assets/Ground/Grass 001/Grass001_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"grass5_d",
+"file":"assets/Ground/Grass 001/Grass001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.714
+},
+{
+"name":"grass5_n",
+"file":"assets/Ground/Grass 001/Grass001_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.714
+},
+{
+"name":"grass6_d",
+"file":"assets/Ground/Grass 001/Grass001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.714
+},
+{
+"name":"grass6_d_02",
+"file":"assets/Ground/Grass 002/Grass002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.737
+},
+{
+"name":"grass6_n",
+"file":"assets/Ground/Grass 001/Grass001_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.714
+},
+{
+"name":"grass_02_512",
+"file":"assets/Ground/Grass 001/Grass001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.7
+},
+{
+"name":"grass_02_d",
+"file":"assets/Ground/Grass 002/Grass002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.875
+},
+{
+"name":"grass_02_n",
+"file":"assets/Ground/Grass 002/Grass002_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.875
+},
+{
+"name":"grass_new01",
+"file":"assets/Ground/Grass 001/Grass001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.737
+},
+{
+"name":"grass_new3",
+"file":"assets/Ground/Grass 003/Grass003_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"gravel",
+"file":"assets/Ground/Gravel 020/Gravel020_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.8
+},
+{
+"name":"gravel2_nrm",
+"file":"assets/Ground/Gravel 020/Gravel020_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.7
+},
+{
+"name":"gravel_dirt_02",
+"file":"assets/Ground/Gravel 020/Gravel020_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.696
+},
+{
+"name":"gravel_ground_01_d",
+"file":"assets/Ground/Ground 001/Ground001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.64
+},
+{
+"name":"gravel_ground_01_n",
+"file":"assets/Ground/Ground 001/Ground001_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.64
+},
+{
+"name":"gravel_ground_03_d",
+"file":"assets/Ground/Gravel 023/Gravel023_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.64
+},
+{
+"name":"gravel_ground_03_n",
+"file":"assets/Ground/Gravel 023/Gravel023_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.64
+},
+{
+"name":"grey_wood_d",
+"file":"assets/Wood/Wood 003/Wood003_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.5
+},
+{
+"name":"ground_02_nmp",
+"file":"assets/Ground/Ground 020/Ground020_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.727
+},
+{
+"name":"ground_04_nmp",
+"file":"assets/Ground/Ground 024/Ground024_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.727
+},
+{
+"name":"ground_gravel_02_d",
+"file":"assets/Ground/Gravel 020/Gravel020_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.64
+},
+{
+"name":"ground_gravel_02_n",
+"file":"assets/Ground/Gravel 020/Gravel020_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.64
+},
+{
+"name":"ground_gravel_03_d",
+"file":"assets/Ground/Gravel 023/Gravel023_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.64
+},
+{
+"name":"ground_new01",
+"file":"assets/Ground/Ground 001/Ground001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.762
+},
+{
+"name":"ground_stones_01_d",
+"file":"assets/Brick/Ground 107/Ground107_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Brick",
+"tier":"2K",
+"conf":0.56
+},
+{
+"name":"ground_stones_01_n",
+"file":"assets/Brick/Ground 107/Ground107_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Brick",
+"tier":"2K",
+"conf":0.56
+},
+{
+"name":"lab_wood_floor_dif",
+"file":"assets/Wood/Wood Floor 007/WoodFloor007_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.6
+},
+{
+"name":"lab_wood_floor_dif_#9406679",
+"file":"assets/Wood/Wood Floor 007/WoodFloor007_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.564
+},
+{
+"name":"lab_wood_floor_gloss",
+"file":"assets/Wood/Wood Floor 007/WoodFloor007_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.562
+},
+{
+"name":"lab_wood_floor_gloss_#9406719",
+"file":"assets/Wood/Wood Floor 007/WoodFloor007_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.537
+},
+{
+"name":"lab_wood_floor_nrm",
+"file":"assets/Wood/Wood Floor 007/WoodFloor007_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.6
+},
+{
+"name":"lab_wood_floor_nrm_#9406685",
+"file":"assets/Wood/Wood Floor 008/WoodFloor008_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.564
+},
+{
+"name":"labyrinth_brick_old_d",
+"file":"assets/Brick/Painted Bricks 001/PaintedBricks001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Brick",
+"tier":"2K",
+"conf":0.514
+},
+{
+"name":"labyrinth_brick_old_mask",
+"file":"assets/Brick/Painted Bricks 001/PaintedBricks001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Brick",
+"tier":"2K",
+"conf":0.5
+},
+{
+"name":"labyrinth_brick_old_moss_d",
+"file":"assets/Brick/Painted Bricks 001/PaintedBricks001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Brick",
+"tier":"2K",
+"conf":0.5
+},
+{
+"name":"labyrinth_brick_old_moss_n",
+"file":"assets/Brick/Painted Bricks 001/PaintedBricks001_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Brick",
+"tier":"2K",
+"conf":0.5
+},
+{
+"name":"labyrinth_brick_old_n",
+"file":"assets/Brick/Painted Bricks 001/PaintedBricks001_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Brick",
+"tier":"2K",
+"conf":0.514
+},
+{
+"name":"ladder_concrete_n",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.615
+},
+{
+"name":"lighthouse_wooden_siding_01_d",
+"file":"assets/Wood/Wood Siding 005/WoodSiding005_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.55
+},
+{
+"name":"lighthouse_wooden_siding_01_g",
+"file":"assets/Wood/Wood Siding 005/WoodSiding005_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.55
+},
+{
+"name":"lighthouse_wooden_siding_01_n",
+"file":"assets/Wood/Wood Siding 005/WoodSiding005_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.55
+},
+{
+"name":"metal",
+"file":"assets/Metal/Metal 001/Metal001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.769
+},
+{
+"name":"metal 1[albedo]",
+"file":"assets/Metal/Metal 041 A/Metal041A_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.583
+},
+{
+"name":"metal2",
+"file":"assets/Metal/Metal 002/Metal002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.857
+},
+{
+"name":"metal3_nmp",
+"file":"assets/Metal/Metal 003/Metal003_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"metal4",
+"file":"assets/Metal/Metal 014/Metal014_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.857
+},
+{
+"name":"metal4_nrm",
+"file":"assets/Metal/Metal 014/Metal014_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"metal_barrel_4_d",
+"file":"assets/Metal/Metal 014/Metal014_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.545
+},
+{
+"name":"metal_barrel_4_g",
+"file":"assets/Metal/Metal 014/Metal014_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.545
+},
+{
+"name":"metal_barrel_4_n",
+"file":"assets/Metal/Metal 014/Metal014_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.545
+},
+{
+"name":"metal_barrel_5_d",
+"file":"assets/Metal/Metal 005/Metal005_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.545
+},
+{
+"name":"metal_corrugated_tube_d",
+"file":"assets/Metal/Corrugated Steel 005/CorrugatedSteel005_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.615
+},
+{
+"name":"metal_corrugated_tube_g",
+"file":"assets/Metal/Corrugated Steel 005/CorrugatedSteel005_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.615
+},
+{
+"name":"metal_corrugated_tube_n",
+"file":"assets/Metal/Corrugated Steel 005/CorrugatedSteel005_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.615
+},
+{
+"name":"metal_door2_d",
+"file":"assets/Metal/Metal 002/Metal002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.632
+},
+{
+"name":"metal_door2_n",
+"file":"assets/Metal/Metal 002/Metal002_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.632
+},
+{
+"name":"metal_door_d",
+"file":"assets/Metal/Metal 001/Metal001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.556
+},
+{
+"name":"metal_door_n",
+"file":"assets/Metal/Metal 001/Metal001_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.556
+},
+{
+"name":"metal_dye",
+"file":"assets/Metal/Metal 001/Metal001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.588
+},
+{
+"name":"metal_grate_new",
+"file":"assets/Metal/Metal Plates 001/MetalPlates001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.552
+},
+{
+"name":"metal_grate_nrm",
+"file":"assets/Metal/Metal Plates 001/MetalPlates001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.552
+},
+{
+"name":"metal_grate_rust2",
+"file":"assets/Metal/Metal Plates 001/MetalPlates001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.581
+},
+{
+"name":"metal_hole",
+"file":"assets/Metal/Metal Plates 001/MetalPlates001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.583
+},
+{
+"name":"metal_painted_panel_02",
+"file":"assets/Metal/Metal Plates 001/MetalPlates001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.556
+},
+{
+"name":"metal_rack_d",
+"file":"assets/Metal/Metal 041 A/Metal041A_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.632
+},
+{
+"name":"metal_rack_g",
+"file":"assets/Metal/Metal 041 A/Metal041A_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.632
+},
+{
+"name":"metal_rack_n",
+"file":"assets/Metal/Metal 041 A/Metal041A_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.632
+},
+{
+"name":"metal_rack_t",
+"file":"assets/Metal/Metal 041 A/Metal041A_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.571
+},
+{
+"name":"metal_rumpled",
+"file":"assets/Metal/Metal Plates 001/MetalPlates001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.593
+},
+{
+"name":"metal_rust5",
+"file":"assets/Metal/Metal 005/Metal005_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.632
+},
+{
+"name":"metal_table",
+"file":"assets/Metal/Metal 041 A/Metal041A_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.6
+},
+{
+"name":"metall_apartment1_d",
+"file":"assets/Metal/Metal Plates 001/MetalPlates001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.645
+},
+{
+"name":"metall_apartment1_n",
+"file":"assets/Metal/Metal Plates 001/MetalPlates001_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.645
+},
+{
+"name":"metall_boil",
+"file":"assets/Metal/Metal 041 B/Metal041B_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.6
+},
+{
+"name":"metall_kran_d",
+"file":"assets/Metal/Metal 041 A/Metal041A_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.6
+},
+{
+"name":"metall_kran_n",
+"file":"assets/Metal/Metal 041 A/Metal041A_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.6
+},
+{
+"name":"metall_list01",
+"file":"assets/Metal/Metal 001/Metal001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"metall_list01_nrm",
+"file":"assets/Metal/Metal Plates 001/MetalPlates001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.581
+},
+{
+"name":"metall_list_red01",
+"file":"assets/Metal/Metal Plates 001/MetalPlates001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.581
+},
+{
+"name":"metall_painter_red01",
+"file":"assets/Metal/Metal Plates 001/MetalPlates001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.647
+},
+{
+"name":"metall_painter_red01_nrm",
+"file":"assets/Metal/Metal Plates 001/MetalPlates001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.579
+},
+{
+"name":"metall_patch_gl",
+"file":"assets/Metal/Metal Plates 001/MetalPlates001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.552
+},
+{
+"name":"metall_rust01",
+"file":"assets/Metal/Metal 001/Metal001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"metall_rust01_#9406950",
+"file":"assets/Metal/Metal Plates 006/MetalPlates006_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.556
+},
+{
+"name":"metall_rust01_#9407832",
+"file":"assets/Metal/Metal Plates 008/MetalPlates008_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.556
+},
+{
+"name":"metall_rust01_#9409536",
+"file":"assets/Metal/Metal Plates 006/MetalPlates006_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.556
+},
+{
+"name":"metall_rust01_#9411608",
+"file":"assets/Metal/Metal Plates 008/MetalPlates008_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.556
+},
+{
+"name":"metall_rust01_512",
+"file":"assets/Metal/Metal 011/Metal011_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.64
+},
+{
+"name":"metall_rust01_nrm",
+"file":"assets/Metal/Metal Plates 001/MetalPlates001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.581
+},
+{
+"name":"metalroof_d",
+"file":"assets/Metal/Metal 001/Metal001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.588
+},
+{
+"name":"net_fabric_diff",
+"file":"assets/Fabric/Fabric 001/Fabric001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Fabric",
+"tier":"2K",
+"conf":0.5
+},
+{
+"name":"net_fabric_nrm",
+"file":"assets/Fabric/Fabric 001/Fabric001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Fabric",
+"tier":"2K",
+"conf":0.522
+},
+{
+"name":"oldconcrete_2k_albedo",
+"file":"assets/Concrete/Concrete 042 A/Concrete042A_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.606
+},
+{
+"name":"oldconcrete_2k_normal",
+"file":"assets/Concrete/Concrete 042 A/Concrete042A_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.606
+},
+{
+"name":"painet_gray_metal",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.625
+},
+{
+"name":"painet_green_metal",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.606
+},
+{
+"name":"painet_green_metal_g",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.606
+},
+{
+"name":"paint_metal_d",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.769
+},
+{
+"name":"paint_metal_d_vp_blue",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.556
+},
+{
+"name":"paint_metal_damage_d",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.606
+},
+{
+"name":"paint_metal_damage_g",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.606
+},
+{
+"name":"paint_metal_damage_n",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.606
+},
+{
+"name":"paint_metal_damage_t",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.571
+},
+{
+"name":"paint_metal_g",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.769
+},
+{
+"name":"paint_metal_n",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.769
+},
+{
+"name":"paint_metal_pipe_d",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.645
+},
+{
+"name":"paint_metal_pipe_g",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.645
+},
+{
+"name":"paint_metal_pipe_n",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.645
+},
+{
+"name":"paint_metal_pipe_t",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.606
+},
+{
+"name":"paint_metal_t",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.714
+},
+{
+"name":"painted_metal_d_fin",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.706
+},
+{
+"name":"painted_metal_gray",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.727
+},
+{
+"name":"painted_metal_gray_gloss",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.615
+},
+{
+"name":"painted_metal_gray_nrm",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.649
+},
+{
+"name":"painted_metal_mask_vp",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"painted_metal_n_fin",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.706
+},
+{
+"name":"persian_carpet_01-03_d",
+"file":"assets/Fabric/Carpet 003/Carpet003_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Fabric",
+"tier":"2K",
+"conf":0.621
+},
+{
+"name":"persian_carpet_02_n",
+"file":"assets/Fabric/Carpet 001/Carpet001_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Fabric",
+"tier":"2K",
+"conf":0.538
+},
+{
+"name":"playground_1024_nrm",
+"file":"assets/Ground/Ground 024/Ground024_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.643
+},
+{
+"name":"plywood",
+"file":"assets/Wood/Wood 003/Wood003_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.571
+},
+{
+"name":"plywood_sign_d",
+"file":"assets/Wood/Wood Siding 005/WoodSiding005_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.56
+},
+{
+"name":"porebrick",
+"file":"assets/Brick/Painted Bricks 001/PaintedBricks001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Brick",
+"tier":"2K",
+"conf":0.56
+},
+{
+"name":"porebrick_02",
+"file":"assets/Brick/Bricks 002/Bricks002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Brick",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"porebrick_n",
+"file":"assets/Brick/Painted Bricks 001/PaintedBricks001_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Brick",
+"tier":"2K",
+"conf":0.56
+},
+{
+"name":"red_carpet_d",
+"file":"assets/Fabric/Carpet 001/Carpet001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Fabric",
+"tier":"2K",
+"conf":0.632
+},
+{
+"name":"reserve_concrete_g",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.593
+},
+{
+"name":"reserve_concrete_n",
+"file":"assets/Concrete/Concrete 002/Concrete002_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Concrete",
+"tier":"2K",
+"conf":0.593
+},
+{
+"name":"reserve_woodsiding_d",
+"file":"assets/Wood/Wood Siding 005/WoodSiding005_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.645
+},
+{
+"name":"reserve_woodsiding_g",
+"file":"assets/Wood/Wood Siding 005/WoodSiding005_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.645
+},
+{
+"name":"reserve_woodsiding_n",
+"file":"assets/Wood/Wood Siding 005/WoodSiding005_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.645
+},
+{
+"name":"reserve_woodsidingwhite_d",
+"file":"assets/Wood/Wood Siding 005/WoodSiding005_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.556
+},
+{
+"name":"rock01_a",
+"file":"assets/Ground/Rocks 011/Rocks011_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.75
+},
+{
+"name":"rock01_ao",
+"file":"assets/Ground/Rocks 011/Rocks011_2K-JPG_AmbientOcclusion.jpg",
+"map":"ao",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.857
+},
+{
+"name":"rock01_lod_ao",
+"file":"assets/Ground/Rocks 011/Rocks011_2K-JPG_AmbientOcclusion.jpg",
+"map":"ao",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"rock01_lod_n",
+"file":"assets/Ground/Rocks 011/Rocks011_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"rock01_n",
+"file":"assets/Ground/Rocks 011/Rocks011_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.857
+},
+{
+"name":"rock02_ao",
+"file":"assets/Ground/Rocks 007/Rocks007_2K-JPG_AmbientOcclusion.jpg",
+"map":"ao",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.714
+},
+{
+"name":"rock02_n",
+"file":"assets/Ground/Rocks 007/Rocks007_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.714
+},
+{
+"name":"rock03_ao",
+"file":"assets/Ground/Rocks 007/Rocks007_2K-JPG_AmbientOcclusion.jpg",
+"map":"ao",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.714
+},
+{
+"name":"rock03_n",
+"file":"assets/Ground/Rocks 007/Rocks007_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.714
+},
+{
+"name":"rock05_ao",
+"file":"assets/Ground/Rocks 007/Rocks007_2K-JPG_AmbientOcclusion.jpg",
+"map":"ao",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.714
+},
+{
+"name":"rock05_n",
+"file":"assets/Ground/Rocks 007/Rocks007_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.714
+},
+{
+"name":"rock06_ao",
+"file":"assets/Ground/Rocks 007/Rocks007_2K-JPG_AmbientOcclusion.jpg",
+"map":"ao",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.714
+},
+{
+"name":"rock06_n",
+"file":"assets/Ground/Rocks 007/Rocks007_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.714
+},
+{
+"name":"rock07_a",
+"file":"assets/Ground/Rocks 007/Rocks007_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.75
+},
+{
+"name":"rock07_ao",
+"file":"assets/Ground/Rocks 007/Rocks007_2K-JPG_AmbientOcclusion.jpg",
+"map":"ao",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.857
+},
+{
+"name":"rock07_lod_ao",
+"file":"assets/Ground/Rocks 007/Rocks007_2K-JPG_AmbientOcclusion.jpg",
+"map":"ao",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"rock07_lod_n",
+"file":"assets/Ground/Rocks 007/Rocks007_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"rock07_n",
+"file":"assets/Ground/Rocks 007/Rocks007_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.857
+},
+{
+"name":"rock08_a",
+"file":"assets/Ground/Rocks 008/Rocks008_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.75
+},
+{
+"name":"rock08_ao",
+"file":"assets/Ground/Rocks 008/Rocks008_2K-JPG_AmbientOcclusion.jpg",
+"map":"ao",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.857
+},
+{
+"name":"rock08_lod_ao",
+"file":"assets/Ground/Rocks 008/Rocks008_2K-JPG_AmbientOcclusion.jpg",
+"map":"ao",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"rock08_lod_n",
+"file":"assets/Ground/Rocks 008/Rocks008_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"rock08_n",
+"file":"assets/Ground/Rocks 008/Rocks008_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.857
+},
+{
+"name":"rock09_ao",
+"file":"assets/Ground/Rocks 007/Rocks007_2K-JPG_AmbientOcclusion.jpg",
+"map":"ao",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.714
+},
+{
+"name":"rock09_n",
+"file":"assets/Ground/Rocks 007/Rocks007_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.714
+},
+{
+"name":"rock10_ao",
+"file":"assets/Ground/Rocks 007/Rocks007_2K-JPG_AmbientOcclusion.jpg",
+"map":"ao",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.714
+},
+{
+"name":"rock10_n",
+"file":"assets/Ground/Rocks 007/Rocks007_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.714
+},
+{
+"name":"rock11_a",
+"file":"assets/Ground/Rocks 011/Rocks011_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.75
+},
+{
+"name":"rock11_ao",
+"file":"assets/Ground/Rocks 011/Rocks011_2K-JPG_AmbientOcclusion.jpg",
+"map":"ao",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.857
+},
+{
+"name":"rock11_lod_ao",
+"file":"assets/Ground/Rocks 011/Rocks011_2K-JPG_AmbientOcclusion.jpg",
+"map":"ao",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"rock11_lod_n",
+"file":"assets/Ground/Rocks 011/Rocks011_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"rock12_ao",
+"file":"assets/Ground/Rocks 011/Rocks011_2K-JPG_AmbientOcclusion.jpg",
+"map":"ao",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.714
+},
+{
+"name":"rock12_n",
+"file":"assets/Ground/Rocks 011/Rocks011_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.714
+},
+{
+"name":"rock13_ao",
+"file":"assets/Ground/Rocks 011/Rocks011_2K-JPG_AmbientOcclusion.jpg",
+"map":"ao",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.714
+},
+{
+"name":"rock13_n",
+"file":"assets/Ground/Rocks 011/Rocks011_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.714
+},
+{
+"name":"rock14_ao",
+"file":"assets/Ground/Rocks 011/Rocks011_2K-JPG_AmbientOcclusion.jpg",
+"map":"ao",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.714
+},
+{
+"name":"rock14_n",
+"file":"assets/Ground/Rocks 011/Rocks011_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.714
+},
+{
+"name":"rock15_ao",
+"file":"assets/Ground/Rocks 011/Rocks011_2K-JPG_AmbientOcclusion.jpg",
+"map":"ao",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.714
+},
+{
+"name":"rock15_n",
+"file":"assets/Ground/Rocks 011/Rocks011_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.714
+},
+{
+"name":"rock16_ao",
+"file":"assets/Ground/Rocks 011/Rocks011_2K-JPG_AmbientOcclusion.jpg",
+"map":"ao",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.714
+},
+{
+"name":"rock16_n",
+"file":"assets/Ground/Rocks 011/Rocks011_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.714
+},
+{
+"name":"rockgr_01_ao",
+"file":"assets/Ground/Rocks 011/Rocks011_2K-JPG_AmbientOcclusion.jpg",
+"map":"ao",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.706
+},
+{
+"name":"rockgr_01_n",
+"file":"assets/Ground/Rocks 011/Rocks011_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.706
+},
+{
+"name":"rockgr_07_ao",
+"file":"assets/Ground/Rocks 007/Rocks007_2K-JPG_AmbientOcclusion.jpg",
+"map":"ao",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.706
+},
+{
+"name":"rockgr_07_n",
+"file":"assets/Ground/Rocks 007/Rocks007_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.706
+},
+{
+"name":"rockgr_08_ao",
+"file":"assets/Ground/Rocks 008/Rocks008_2K-JPG_AmbientOcclusion.jpg",
+"map":"ao",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.706
+},
+{
+"name":"rockgr_08_n",
+"file":"assets/Ground/Rocks 008/Rocks008_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.706
+},
+{
+"name":"rockgr_11_ao",
+"file":"assets/Ground/Rocks 011/Rocks011_2K-JPG_AmbientOcclusion.jpg",
+"map":"ao",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.706
+},
+{
+"name":"rockgr_11_n",
+"file":"assets/Ground/Rocks 011/Rocks011_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.706
+},
+{
+"name":"rocksmall01_a",
+"file":"assets/Ground/Rocks 011/Rocks011_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"rocksmall01_ao",
+"file":"assets/Ground/Rocks 011/Rocks011_2K-JPG_AmbientOcclusion.jpg",
+"map":"ao",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.737
+},
+{
+"name":"rocksmall01_n",
+"file":"assets/Ground/Rocks 011/Rocks011_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.737
+},
+{
+"name":"rottenwood2_d",
+"file":"assets/Wood/Wood 021/Wood021_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.556
+},
+{
+"name":"rottenwood2_n",
+"file":"assets/Wood/Wood 021/Wood021_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.556
+},
+{
+"name":"rust_metal_01_d",
+"file":"assets/Metal/Sheet Metal 001/SheetMetal001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.692
+},
+{
+"name":"rust_metal_01_d_vp",
+"file":"assets/Metal/Sheet Metal 001/SheetMetal001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.581
+},
+{
+"name":"rust_metal_01_g",
+"file":"assets/Metal/Sheet Metal 001/SheetMetal001_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.692
+},
+{
+"name":"rust_metal_01_n",
+"file":"assets/Metal/Sheet Metal 001/SheetMetal001_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.692
+},
+{
+"name":"rust_painet_maetall01_nrm",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.55
+},
+{
+"name":"rust_painet_maetall01_nrm_02",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.558
+},
+{
+"name":"rust_painet_maetall02_nrm",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.55
+},
+{
+"name":"rust_painet_maetall02_nrm_01",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.558
+},
+{
+"name":"rust_painet_red_maetall",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.632
+},
+{
+"name":"rust_painet_red_maetall_2",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.6
+},
+{
+"name":"rust_painet_red_maetall_nrm",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.571
+},
+{
+"name":"rust_painet_white_maetall01",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.571
+},
+{
+"name":"rust_painet_white_maetall01_02",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.578
+},
+{
+"name":"rusty_painted_metal_sheet_01_d",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.605
+},
+{
+"name":"rusty_painted_metal_sheet_01_g",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.605
+},
+{
+"name":"rusty_painted_metal_sheet_01_n",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.605
+},
+{
+"name":"sand_grass_02_d",
+"file":"assets/Ground/Grass 002/Grass002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"sand_grass_02_n",
+"file":"assets/Ground/Grass 002/Grass002_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Ground",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"saw_wood_planks_d",
+"file":"assets/Wood/Planks 020/Planks020_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.5
+},
+{
+"name":"saw_wood_planks_g",
+"file":"assets/Wood/Planks 020/Planks020_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.5
+},
+{
+"name":"saw_wood_planks_n",
+"file":"assets/Wood/Planks 020/Planks020_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.5
+},
+{
+"name":"shop_carpet_dif",
+"file":"assets/Fabric/Carpet 001/Carpet001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Fabric",
+"tier":"2K",
+"conf":0.5
+},
+{
+"name":"shop_carpet_nrm",
+"file":"assets/Fabric/Carpet 001/Carpet001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Fabric",
+"tier":"2K",
+"conf":0.5
+},
+{
+"name":"stained_metal_sheet_g",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.588
+},
+{
+"name":"stained_metal_sheet_n",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.588
+},
+{
+"name":"striped_metal",
+"file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.571
+},
+{
+"name":"table_planks_d",
+"file":"assets/Wood/Planks 020/Planks020_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.571
+},
+{
+"name":"table_planks_g",
+"file":"assets/Wood/Planks 020/Planks020_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.571
+},
+{
+"name":"table_planks_n",
+"file":"assets/Wood/Planks 020/Planks020_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.571
+},
+{
+"name":"vases_metallic_02",
+"file":"assets/Metal/Sheet Metal 002/SheetMetal002_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Metal",
+"tier":"2K",
+"conf":0.6
+},
+{
+"name":"wakeboard_01_d",
+"file":"assets/Wood/Bark 001/Bark001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.526
+},
+{
+"name":"wakeboard_01_g",
+"file":"assets/Wood/Bark 001/Bark001_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.526
+},
+{
+"name":"wakeboard_01_n",
+"file":"assets/Wood/Bark 001/Bark001_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.526
+},
+{
+"name":"wakeboard_02_d",
+"file":"assets/Wood/Wood 021/Wood021_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.526
+},
+{
+"name":"wakeboard_02_g",
+"file":"assets/Wood/Wood 021/Wood021_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.526
+},
+{
+"name":"wakeboard_02_n",
+"file":"assets/Wood/Wood 021/Wood021_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.526
+},
+{
+"name":"wood1",
+"file":"assets/Wood/Wood 013/Wood013_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.833
+},
+{
+"name":"wood1_nrm",
+"file":"assets/Wood/Wood 013/Wood013_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.625
+},
+{
+"name":"wood2",
+"file":"assets/Wood/Wood 021/Wood021_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.833
+},
+{
+"name":"wood2_nrm",
+"file":"assets/Wood/Wood 021/Wood021_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.625
+},
+{
+"name":"wood_albedo",
+"file":"assets/Wood/Wood Floor 007/WoodFloor007_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.522
+},
+{
+"name":"wood_board01_nrm",
+"file":"assets/Wood/Wood Floor 041/WoodFloor041_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.571
+},
+{
+"name":"wood_board01_psd",
+"file":"assets/Wood/Wood Floor 041/WoodFloor041_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.571
+},
+{
+"name":"wood_box_d",
+"file":"assets/Wood/Wood 003/Wood003_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.533
+},
+{
+"name":"wood_box_n",
+"file":"assets/Wood/Wood 003/Wood003_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.533
+},
+{
+"name":"wood_cafe_d",
+"file":"assets/Wood/Wood 003/Wood003_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.5
+},
+{
+"name":"wood_cafe_gloss",
+"file":"assets/Wood/Wood Floor 007/WoodFloor007_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.518
+},
+{
+"name":"wood_ceil_d2",
+"file":"assets/Wood/Wood 021/Wood021_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.526
+},
+{
+"name":"wood_ceil_g",
+"file":"assets/Wood/Wood 003/Wood003_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.5
+},
+{
+"name":"wood_floor",
+"file":"assets/Wood/Wood Floor 007/WoodFloor007_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.818
+},
+{
+"name":"wood_floor_d",
+"file":"assets/Wood/Wood Floor 007/WoodFloor007_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.818
+},
+{
+"name":"wood_floor_d_#9260998",
+"file":"assets/Wood/Wood Floor 008/WoodFloor008_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.667
+},
+{
+"name":"wood_floor_g",
+"file":"assets/Wood/Wood Floor 007/WoodFloor007_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.818
+},
+{
+"name":"wood_floor_gl",
+"file":"assets/Wood/Wood Floor 007/WoodFloor007_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.72
+},
+{
+"name":"wood_floor_n",
+"file":"assets/Wood/Wood Floor 007/WoodFloor007_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.818
+},
+{
+"name":"wood_floor_n_#9260571",
+"file":"assets/Wood/Wood Floor 051/WoodFloor051_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.727
+},
+{
+"name":"wood_floor_nrm",
+"file":"assets/Wood/Wood Floor 007/WoodFloor007_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.692
+},
+{
+"name":"wood_floor_nrm2",
+"file":"assets/Wood/Wood Floor 052/WoodFloor052_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.741
+},
+{
+"name":"wood_furniture01",
+"file":"assets/Wood/Wood Floor 041/WoodFloor041_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.571
+},
+{
+"name":"wood_furniture02",
+"file":"assets/Wood/Wood Floor 052/WoodFloor052_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.571
+},
+{
+"name":"wood_furniture03",
+"file":"assets/Wood/Wood Floor 034/WoodFloor034_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.571
+},
+{
+"name":"wood_furniture03_90_nrm",
+"file":"assets/Wood/Wood Floor 039/WoodFloor039_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.514
+},
+{
+"name":"wood_furniture05",
+"file":"assets/Wood/Wood Floor 035/WoodFloor035_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.571
+},
+{
+"name":"wood_normal",
+"file":"assets/Wood/Wood Floor 007/WoodFloor007_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.522
+},
+{
+"name":"wood_nrm",
+"file":"assets/Wood/Wood 003/Wood003_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.533
+},
+{
+"name":"wood_planks_d2",
+"file":"assets/Wood/Planks 020/Planks020_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.609
+},
+{
+"name":"wood_planks_n2",
+"file":"assets/Wood/Planks 020/Planks020_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.609
+},
+{
+"name":"wood_planks_s",
+"file":"assets/Wood/Planks 020/Planks020_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.6
+},
+{
+"name":"wood_sarai",
+"file":"assets/Wood/Wood Siding 005/WoodSiding005_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.522
+},
+{
+"name":"wood_sarai_nrm",
+"file":"assets/Wood/Wood Siding 005/WoodSiding005_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.518
+},
+{
+"name":"woodbox",
+"file":"assets/Wood/Wood 003/Wood003_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.571
+},
+{
+"name":"woodbox_nrm",
+"file":"assets/Wood/Wood Floor 007/WoodFloor007_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.522
+},
+{
+"name":"wooden_fence_01_d",
+"file":"assets/Wood/Wood 013/Wood013_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.545
+},
+{
+"name":"wooden_fence_01_g",
+"file":"assets/Wood/Wood 013/Wood013_2K-JPG_Roughness.jpg",
+"map":"roughness",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.545
+},
+{
+"name":"wooden_fence_01_n",
+"file":"assets/Wood/Wood 013/Wood013_2K-JPG_NormalDX.jpg",
+"map":"normal",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.545
+},
+{
+"name":"woodplanefloor",
+"file":"assets/Wood/Wood Floor 007/WoodFloor007_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Wood",
+"tier":"2K",
+"conf":0.692
+},
+{
+"name":"yard_brick_red1_d",
+"file":"assets/Brick/Painted Bricks 001/PaintedBricks001_2K-JPG_Color.jpg",
+"map":"albedo",
+"cat":"Brick",
+"tier":"2K",
+"conf":0.516
+}
+]
+}

@@ -1,0 +1,12 @@
+{
+"_schemaStatus":"reconciled to aowlspt.resourcepack v1",
+"_note":"TEMPLATE. This is NOT a usable pack. Run generate.ps1 on your own machine to extract + upscale YOUR Tarkov textures; that writes the real manifest.json (with textures[] filled) next to this file. This pack ships ZERO game assets.",
+"schema":"aowlspt.resourcepack",
+"schemaVersion":1,
+"name":"Vanilla 4K",
+"version":"1.0.0",
+"author":"savannt",
+"description":"Your own stock Tarkov textures, extracted from your local install and AI-upscaled to 4K. Same look as vanilla, sharper. Generated on your machine - no copyrighted assets are distributed.",
+"capabilities":["textures"],
+"textures":[]
+}
