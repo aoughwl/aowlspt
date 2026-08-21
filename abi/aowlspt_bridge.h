@@ -279,4 +279,37 @@ static const char* aowl_bridge_target_name(int32_t i) {
 
 static int32_t aowl_bridge_target_count(void) { return AOWL_BRIDGE_TARGET_COUNT; }
 
+/* Whether a pointer lands inside GameAssembly.dll's `il2cpp` PE section -- the
+ * 85 MB section at RVA 0x628000 (size 0x510FA6C) that holds every AOT method
+ * body (see the header comment and METADATA-RE.md). A real compiled method
+ * pointer is in here; a vtable slot, a data pointer or a runtime stub is not.
+ * This is the discriminator that makes scanning a `MethodInfo` for "the field
+ * that holds the code" safe to act on: an executable page alone is not enough
+ * (the CRT and UnityPlayer have plenty), but an executable pointer *into the
+ * il2cpp section* is a compiled managed method with very high confidence. */
+#define AOWL_IL2CPP_SEC_RVA  0x628000u
+#define AOWL_IL2CPP_SEC_SIZE 0x510FA6Cu
+static int32_t aowl_in_il2cpp_section(void* p) {
+    HMODULE ga;
+    uintptr_t base, lo, hi, x;
+    if (!p) return 0;
+    ga = GetModuleHandleA("GameAssembly.dll");
+    if (!ga) return 0;
+    base = (uintptr_t)ga;
+    lo = base + AOWL_IL2CPP_SEC_RVA;
+    hi = lo + AOWL_IL2CPP_SEC_SIZE;
+    x = (uintptr_t)p;
+    return (x >= lo && x < hi) ? 1 : 0;
+}
+
+/* The `il2cpp`-section RVA of a pointer, or -1 if it is not in that section --
+ * for logging a found pointer as an RVA the way every other address in this
+ * project is written. */
+static int64_t aowl_il2cpp_rva_of(void* p) {
+    HMODULE ga;
+    if (!aowl_in_il2cpp_section(p)) return -1;
+    ga = GetModuleHandleA("GameAssembly.dll");
+    return (int64_t)((uintptr_t)p - (uintptr_t)ga);
+}
+
 #endif /* AOWLSPT_BRIDGE_H */
