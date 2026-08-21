@@ -113,6 +113,43 @@ var gSelfCheckFailures: seq[string] = @[]
   ## Empty is the ordinary state and is also an answer: it is the difference
   ## between "this mod loaded" and "nothing is listening".
 
+var gFilesPng = ""
+  ## The bytes served for every `/files/*` (and CDN-prefixed `/regular/files/*`)
+  ## request -- a tiny valid PNG.
+  ##
+  ## Post-1.0 fetches its trader avatars, handbook/quest icons and document
+  ## pictures from `/files/<kind>/<id>.png|jpg`. Those images are not in this
+  ## emulator's data set, so a real one cannot be served. A `/files/*` 404 makes
+  ## the client retry on a timer and sit on a spinner; a valid placeholder
+  ## answered immediately ends that. Built once at load from `PlaceholderPngHex`;
+  ## read-only on the worker threads after that.
+
+const PlaceholderPngHex =
+  "89504e470d0a1a0a0000000d4948445200000010000000100802000000909168" &
+  "36000000144944415478da63702011308c6a18d5307c350000144ac00104416c" &
+  "550000000049454e44ae426082"
+  ## A 16x16 opaque dark-grey PNG, 77 bytes. Hand-decoded rather than embedded as
+  ## raw bytes so the source stays plain ASCII and no editor or line-ending
+  ## normalisation can corrupt a binary blob in the middle of a `.nim` file.
+
+proc hexNibble(c: char): int =
+  if c >= '0' and c <= '9': ord(c) - ord('0')
+  elif c >= 'a' and c <= 'f': ord(c) - ord('a') + 10
+  elif c >= 'A' and c <= 'F': ord(c) - ord('A') + 10
+  else: -1
+
+proc decodeHex(s: string): string =
+  ## Even-length hex to bytes. A stray non-hex character ends the decode rather
+  ## than guessing -- the input here is a compile-time constant.
+  result = ""
+  var i = 0
+  while i + 1 < s.len:
+    let hi = hexNibble(s[i])
+    let lo = hexNibble(s[i + 1])
+    if hi < 0 or lo < 0: break
+    result.add char(hi * 16 + lo)
+    i = i + 2
+
 proc nowSeconds(): int =
   ## Wall-clock seconds. The host gives monotonic milliseconds since it started,
   ## which is the right clock for timing and the wrong one for a registration
@@ -1175,6 +1212,17 @@ proc onLibraries(url, body, session: string): string =
 proc onEmptyObject(url, body, session: string): string =
   inc gRequests
   result = envelope(emptyObject())
+
+proc onFiles(url, body, session: string): string =
+  ## Every `/files/*` (and CDN-prefixed `/regular/files/*`) binary asset --
+  ## trader avatars, handbook/quest icons, document images. This emulator has no
+  ## image set, so one placeholder answers all of them; the point is that the
+  ## answer is immediate and valid so the client stops retrying and the screen
+  ## settles. The backend recognises the path and sends these bytes raw and
+  ## un-deflated with an `image/png` Content-Type; the handler just hands over
+  ## the bytes.
+  inc gRequests
+  result = gFilesPng
 
 proc onActivityPeriods(url, body, session: string): string =
   ## The dailies, the weekly and the scav's, generated rather than stored --
@@ -2473,6 +2521,16 @@ proc registerRoutes() =
   discard serve("/client/libraries", onLibraries)
   discard serve("/client/profile/view", onEmptyObject)
 
+  # Binary assets. The client fetches trader avatars, handbook icons and quest
+  # images from `/files/*` and, when they 404, retries on a timer and stalls the
+  # screen. One prefix route answers every one of them with a placeholder PNG.
+  # Post-1.0 resolves these against its asset-CDN base, whose url carries a
+  # `/regular` path prefix, so once the host redirects that CDN host here the
+  # requests arrive as `/regular/files/...` -- registered alongside the bare
+  # `/files/` spelling so both resolve. See `onFiles`.
+  discard servePrefix("/files/", onFiles)
+  discard servePrefix("/regular/files/", onFiles)
+
   # Static tables
   discard serve("/client/items", onItems)
   discard serve("/client/globals", onGlobals)
@@ -2680,6 +2738,9 @@ proc onLoad(): Status =
   if side() != sideServer:
     info "the emulator is a server mod; nothing to do on this side"
     return Ok
+
+  # Decode the placeholder image once, before any route can be asked for it.
+  gFilesPng = decodeHex(PlaceholderPngHex)
 
   gEdition = setting("edition").asText("standard")
   gDefaultSide = setting("defaultSide").asText("Usec")

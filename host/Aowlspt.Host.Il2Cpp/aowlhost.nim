@@ -120,6 +120,149 @@ static void* aowl_brand_newstring_guarded(void* a) {
 }
 """.}
 
+# ------------------------------------------------- image CDN redirect
+#
+# Post-1.0 fetches trader avatars / handbook & quest icons from `/files/*`
+# resolved against BSG's asset CDN host (`s3-prod.escapefromtarkov.com`, per the
+# raid capture's `backend.Static`). No server-config field we send redirects it
+# (see `docs/timbuktu/IMAGE-LOADING-RE.md`), so offline that host is unreachable
+# and the images spin forever with not one request reaching our backend.
+#
+# This installs an inline hook on the `getaddrinfo` family (via the same detour
+# engine the il2cpp method patches use, `aowl_hook_install` -> a trampoline that
+# still calls the original) and, for the asset-CDN hostname only, resolves it to
+# `127.0.0.1` -- where the emulator backend answers `/regular/files/*`. Every
+# other host resolves normally.
+#
+# It also RECORDS every hostname the client resolves, first sight only, which
+# the host tick loop logs. That is the confirmation the headless RE could not
+# get: one live run names the exact host:port the image loader dials, settling
+# whether the target below is right (or naming the real one).
+#
+# Flag-gated (`imageCdnRedirect`, default off) and fail-safe: a missing export
+# or a failed install leaves DNS untouched; a non-target host is never rewritten.
+{.emit: """
+typedef int (__stdcall *AowlGaiW_t)(const wchar_t*, const wchar_t*, const void*, void**);
+typedef int (__stdcall *AowlGaiA_t)(const char*, const char*, const void*, void**);
+
+static int        g_cdn_enabled   = 0;
+static AowlGaiW_t g_cdn_gaiw_orig = 0;
+static AowlGaiA_t g_cdn_gaia_orig = 0;
+
+#define AOWL_CDN_MAX_SEEN 64
+static CRITICAL_SECTION g_cdn_lock;
+static int  g_cdn_lock_init = 0;
+static char g_cdn_seen[AOWL_CDN_MAX_SEEN][256];
+static int  g_cdn_seen_redir[AOWL_CDN_MAX_SEEN];
+static int  g_cdn_seen_count = 0;   /* distinct hosts recorded          */
+static int  g_cdn_drained    = 0;   /* how many the host has logged     */
+
+static void aowl_cdn_lock_ensure(void){
+    if(!g_cdn_lock_init){ InitializeCriticalSection(&g_cdn_lock); g_cdn_lock_init=1; }
+}
+static char aowl_cdn_lc(char c){ return (c>='A'&&c<='Z') ? (char)(c+32) : c; }
+static int aowl_cdn_ends_with(const char* s, const char* suf){
+    int ls=0, lf=0; while(s[ls]) ls++; while(suf[lf]) lf++;
+    if(lf>ls) return 0;
+    for(int i=0;i<lf;i++){ if(aowl_cdn_lc(s[ls-lf+i])!=aowl_cdn_lc(suf[i])) return 0; }
+    return 1;
+}
+static int aowl_cdn_starts_with(const char* s, const char* pre){
+    for(int i=0;pre[i];i++){ if(aowl_cdn_lc(s[i])!=aowl_cdn_lc(pre[i])) return 0; }
+    return 1;
+}
+/* The S3 asset-CDN family under escapefromtarkov.com (s3-prod and any regional
+ * s3-* variant). Narrow on purpose: gw-pvp, lobby and the wsn-* notifier hosts
+ * are NOT redirected. The seen-log below catches anything this misses. */
+static int aowl_cdn_is_target(const char* host){
+    if(!host || !host[0]) return 0;
+    if(!aowl_cdn_ends_with(host, "escapefromtarkov.com")) return 0;
+    return aowl_cdn_starts_with(host, "s3");
+}
+static void aowl_cdn_w2u(const wchar_t* w, char* out, int cap){
+    int i=0; if(!w){ out[0]=0; return; }
+    for(; w[i] && i<cap-1; i++) out[i]=(w[i]<128)?(char)w[i]:'?';
+    out[i]=0;
+}
+static void aowl_cdn_record(const char* host, int redirected){
+    if(!host || !host[0]) return;
+    aowl_cdn_lock_ensure();
+    EnterCriticalSection(&g_cdn_lock);
+    int found=0;
+    for(int i=0;i<g_cdn_seen_count;i++){
+        int eq=1, k=0; const char* a=g_cdn_seen[i];
+        for(;a[k]||host[k];k++){ if(aowl_cdn_lc(a[k])!=aowl_cdn_lc(host[k])){eq=0;break;} }
+        if(eq){ found=1; break; }
+    }
+    if(!found && g_cdn_seen_count < AOWL_CDN_MAX_SEEN){
+        int k=0; for(; host[k] && k<255; k++) g_cdn_seen[g_cdn_seen_count][k]=host[k];
+        g_cdn_seen[g_cdn_seen_count][k]=0;
+        g_cdn_seen_redir[g_cdn_seen_count]=redirected;
+        g_cdn_seen_count++;
+    }
+    LeaveCriticalSection(&g_cdn_lock);
+}
+static int __stdcall aowl_cdn_gaiw(const wchar_t* node, const wchar_t* svc,
+                                   const void* hints, void** res){
+    char host[256]; aowl_cdn_w2u(node, host, (int)sizeof(host));
+    int redir = (g_cdn_enabled && aowl_cdn_is_target(host));
+    aowl_cdn_record(host, redir);
+    if(redir && g_cdn_gaiw_orig) return g_cdn_gaiw_orig(L"127.0.0.1", svc, hints, res);
+    if(g_cdn_gaiw_orig)          return g_cdn_gaiw_orig(node, svc, hints, res);
+    return -1;
+}
+static int __stdcall aowl_cdn_gaia(const char* node, const char* svc,
+                                   const void* hints, void** res){
+    char host[256]; int i=0; if(node){ for(; node[i] && i<255; i++) host[i]=node[i]; } host[i]=0;
+    int redir = (g_cdn_enabled && aowl_cdn_is_target(host));
+    aowl_cdn_record(host, redir);
+    if(redir && g_cdn_gaia_orig) return g_cdn_gaia_orig("127.0.0.1", svc, hints, res);
+    if(g_cdn_gaia_orig)          return g_cdn_gaia_orig(node, svc, hints, res);
+    return -1;
+}
+static void aowl_cdn_set_enabled(int on){ g_cdn_enabled = on ? 1 : 0; }
+/* Install inline hooks. Returns a bitmask: 1=GetAddrInfoW, 2=getaddrinfo. */
+static int aowl_cdn_install(void){
+    aowl_cdn_lock_ensure();
+    int mask=0;
+    HMODULE ws = GetModuleHandleW(L"ws2_32.dll");
+    if(!ws) ws = LoadLibraryW(L"ws2_32.dll");
+    if(!ws) return 0;
+    void* fw = (void*)GetProcAddress(ws, "GetAddrInfoW");
+    if(fw){ void* h=aowl_hook_new();
+        if(h){ if(aowl_hook_install(h, fw, (void*)aowl_cdn_gaiw)==0){
+                    g_cdn_gaiw_orig=(AowlGaiW_t)((AowlHook*)h)->trampoline; mask|=1;
+               } else aowl_hook_free(h); } }
+    void* fa = (void*)GetProcAddress(ws, "getaddrinfo");
+    if(fa){ void* h=aowl_hook_new();
+        if(h){ if(aowl_hook_install(h, fa, (void*)aowl_cdn_gaia)==0){
+                    g_cdn_gaia_orig=(AowlGaiA_t)((AowlHook*)h)->trampoline; mask|=2;
+               } else aowl_hook_free(h); } }
+    return mask;
+}
+/* Pop one not-yet-logged host for the tick loop. 1 + fills out/redir, else 0. */
+static int aowl_cdn_take_new(char* out, int cap, int* redir){
+    int got=0;
+    aowl_cdn_lock_ensure();
+    EnterCriticalSection(&g_cdn_lock);
+    if(g_cdn_drained < g_cdn_seen_count){
+        int idx=g_cdn_drained, k=0;
+        for(; g_cdn_seen[idx][k] && k<cap-1; k++) out[k]=g_cdn_seen[idx][k];
+        out[k]=0; *redir=g_cdn_seen_redir[idx];
+        g_cdn_drained++; got=1;
+    }
+    LeaveCriticalSection(&g_cdn_lock);
+    return got;
+}
+""".}
+
+proc cCdnInstall(): int32 {.importc: "aowl_cdn_install", nodecl.}
+proc cCdnSetEnabled(on: int32) {.importc: "aowl_cdn_set_enabled", nodecl.}
+proc cCdnTakeNew(outp: cstring; cap: int32; redir: ptr int32): int32 {.
+  importc: "aowl_cdn_take_new", nodecl.}
+
+var gImageCdnRedirect = false
+
 # --------------------------------------------------- the main-thread handoff
 #
 # `invoke_main` used to mean "the host's own attached thread", which is not the
@@ -4344,6 +4487,26 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
             "no managed write)") &
          " (fail-safe: unbranded if the build or timing does not match)"
 
+  # Image CDN redirect (opt-in). Independent of IL2CPP -- it hooks ws2_32, which
+  # is up from the start -- so it installs here rather than waiting for the
+  # runtime. Off by default; when on, it steers the BSG asset-CDN host to this
+  # backend and logs every hostname the client resolves (drained in the tick
+  # loop) so a live run confirms the exact image host. Fail-safe: a failed
+  # install leaves DNS untouched.
+  gImageCdnRedirect = readBoolKey("imageCdnRedirect")
+  if gImageCdnRedirect:
+    cCdnSetEnabled(1'i32)
+    let mask = int(cCdnInstall())
+    if mask == 0:
+      warn "imageCdnRedirect is set but no getaddrinfo export could be hooked; " &
+           "image CDN requests will not be redirected"
+    else:
+      okLog "imageCdnRedirect is set: getaddrinfo hooked (" &
+            (if (mask and 1) != 0: "GetAddrInfoW " else: "") &
+            (if (mask and 2) != 0: "getaddrinfo " else: "") &
+            "); s3-*.escapefromtarkov.com -> 127.0.0.1, and every resolved host " &
+            "is logged once to confirm the real image host"
+
   let waitMs = readWaitMs()
   info "waiting for the IL2CPP runtime (up to " & $(waitMs div 1000) & "s)"
   if not waitForIl2Cpp(waitMs):
@@ -4520,6 +4683,23 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
     let now = cNowMs()
     let elapsed = int64(now - lastTick)
     lastTick = now
+
+    # Log any newly-seen resolver host from the image-CDN hook. Drained here, on
+    # the host thread, because the hook fires on the game's DNS thread where
+    # opening a log file mid-resolve is not safe. First sight only, so this is
+    # near-always a no-op; the point is the one-time confirmation of which host
+    # the image loader dials.
+    if gImageCdnRedirect:
+      var seenBuf: array[256, char]
+      var redir = 0'i32
+      while cCdnTakeNew(cast[cstring](addr seenBuf[0]), 256'i32, addr redir) != 0:
+        var hostName = ""
+        var i = 0
+        while i < 256 and seenBuf[i] != '\0':
+          hostName.add seenBuf[i]
+          inc i
+        okLog "image-cdn: client resolved " & hostName &
+              (if redir != 0: " -> redirected to 127.0.0.1" else: " (not redirected)")
 
     # Retry while nothing is bound. The first candidate that is worth having is
     # a game type, and the game's own types come up long after the runtime
