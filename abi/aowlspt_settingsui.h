@@ -1,0 +1,99 @@
+/* aowlspt_settingsui.h -- Phase 1 field offsets for the native SettingsScreen
+ * control-tree probe.
+ *
+ * READ-ONLY. This header carries nothing but the static field offsets the host's
+ * settings-UI probe walks, exposed as small accessor functions (the same shape
+ * as `aowl_uxpatch_version_label_offset`) so the compiled host literally uses the
+ * numbers recorded here and a future build's different layout is a one-file edit.
+ *
+ * The offsets come from the offline field-offset tool (Phase 0,
+ * `tools/il2cpp_resolve.py settings-table`, build 1.1.0.1.46777, imagebase
+ * 0x180000000) which reads `Il2CppMetadataRegistration.fieldOffsets` and is
+ * cross-checked against `System.String` (0x10/0x14). Every one is a CANDIDATE
+ * until the live read-only probe logs a known stock label at it -- that content
+ * match is what validates the offset before any write is ever attempted (Phase 2+).
+ *
+ * The detour target itself (SettingsScreen::Show @ RVA 0x171FA00) is already
+ * verified and handed out by `aowl_bridge_settings_target_at` in
+ * `aowlspt_bridge.h`; this header adds only the layout the probe reads once it is
+ * on the Unity thread with `this` = the live SettingsScreen.
+ *
+ * ## The walk (all reads cIsReadable-guarded on the host/Nim side)
+ *
+ *   SettingsScreen (this)
+ *     + 0x118  _currentTab           -> SettingsTab
+ *     + 0xF0   _gameSettingsScreen    (typed tab field)
+ *     + 0xF8   _graphicsSettingsScreen
+ *     + 0x100  _postFXSettingsScreen
+ *     + 0x108  _soundSettingsScreen
+ *     + 0x110  _controlsSettingsTabScreen
+ *
+ *   SettingsTab
+ *     + 0x88   _createdControls  -> List<SettingControl>
+ *
+ *   List<T>  (fixed IL2CPP layout, same as every generic List)
+ *     + 0x10   _items  -> T[]          (array object)
+ *     + 0x18   _size   -> int32 count
+ *   T[]  elements are inline starting at  + 0x20  (8 bytes each, a pointer)
+ *
+ *   SettingControl
+ *     + 0x80   Text   -> LocalizedText (label wrapper)
+ *     + 0xA8   value widget (NumberSlider / UpdatableToggle / DropDownBox,
+ *              per subclass) -- logged raw this phase, not decoded
+ *     + 0x00   klass (Il2CppObject header) -> the control's il2cpp type pointer,
+ *              logged raw so slider/toggle/dropdown can later be told apart by
+ *              matching known type pointers, no reflection
+ *
+ *   LocalizedText
+ *     + 0x78   List<TextMeshProUGUI>   (the same List layout above)
+ *   TextMeshProUGUI
+ *     + 0xE0   m_text -> System.String  (length @ +0x10, UTF-16 chars @ +0x14)
+ */
+
+#ifndef AOWLSPT_SETTINGSUI_H
+#define AOWLSPT_SETTINGSUI_H
+
+#include <stdint.h>
+
+/* SettingsScreen tab fields. */
+#define AOWL_SUI_SS_CURRENTTAB     0x118
+#define AOWL_SUI_SS_GAMETAB        0x0F0
+#define AOWL_SUI_SS_GRAPHICSTAB    0x0F8
+#define AOWL_SUI_SS_POSTFXTAB      0x100
+#define AOWL_SUI_SS_SOUNDTAB       0x108
+#define AOWL_SUI_SS_CONTROLSTAB    0x110
+
+/* SettingsTab. */
+#define AOWL_SUI_TAB_CREATEDCTRLS  0x088
+
+/* List<T> raw layout + array element base. */
+#define AOWL_SUI_LIST_ITEMS        0x010
+#define AOWL_SUI_LIST_SIZE         0x018
+#define AOWL_SUI_ARR_ELEMS         0x020
+
+/* SettingControl. */
+#define AOWL_SUI_CTRL_TEXT         0x080
+#define AOWL_SUI_CTRL_VALUE        0x0A8
+
+/* LocalizedText wrapper + TextMeshProUGUI text-backing string. */
+#define AOWL_SUI_LOCTEXT_LIST      0x078
+#define AOWL_SUI_TMP_MTEXT         0x0E0
+
+/* Accessors (importc'd by the Nim probe). Individual functions rather than a
+ * table so a fault names the exact hop and the header stays self-documenting. */
+static int32_t aowl_sui_off_currenttab(void)  { return AOWL_SUI_SS_CURRENTTAB; }
+static int32_t aowl_sui_off_gametab(void)      { return AOWL_SUI_SS_GAMETAB; }
+static int32_t aowl_sui_off_graphicstab(void)  { return AOWL_SUI_SS_GRAPHICSTAB; }
+static int32_t aowl_sui_off_postfxtab(void)    { return AOWL_SUI_SS_POSTFXTAB; }
+static int32_t aowl_sui_off_soundtab(void)     { return AOWL_SUI_SS_SOUNDTAB; }
+static int32_t aowl_sui_off_controlstab(void)  { return AOWL_SUI_SS_CONTROLSTAB; }
+static int32_t aowl_sui_off_createdctrls(void) { return AOWL_SUI_TAB_CREATEDCTRLS; }
+static int32_t aowl_sui_off_list_items(void)   { return AOWL_SUI_LIST_ITEMS; }
+static int32_t aowl_sui_off_list_size(void)    { return AOWL_SUI_LIST_SIZE; }
+static int32_t aowl_sui_off_arr_elems(void)    { return AOWL_SUI_ARR_ELEMS; }
+static int32_t aowl_sui_off_ctrl_text(void)    { return AOWL_SUI_CTRL_TEXT; }
+static int32_t aowl_sui_off_ctrl_value(void)   { return AOWL_SUI_CTRL_VALUE; }
+static int32_t aowl_sui_off_loctext_list(void) { return AOWL_SUI_LOCTEXT_LIST; }
+static int32_t aowl_sui_off_tmp_mtext(void)    { return AOWL_SUI_TMP_MTEXT; }
+
+#endif /* AOWLSPT_SETTINGSUI_H */
