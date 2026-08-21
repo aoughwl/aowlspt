@@ -68,6 +68,7 @@ import modhost
 import modcontrol
 import jsonpath
 import aowloverlay
+import aowlgraphics
 import invoke
 
 {.emit: """#include "aowlspt_shim.h" """.}
@@ -1225,6 +1226,18 @@ proc hostCall(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
     var report = mainThreadReport()
     return cOutCopy(outPtr, outLen, cast[Il2CppPtr](toCString(report)),
                     int32(report.len))
+
+  # The graphics mod pushes its grade here. The args are a compact JSON object
+  # of post-process params; the host forwards them, verbatim, to the native
+  # post-process module. Answered without the runtime because the renderer lives
+  # entirely in D3D11 and has nothing to do with IL2CPP being up.
+  if spec == "aowlspt.host::gfx_apply":
+    graphicsApplyJson(argText)
+    var ack = "{\"ok\":true,\"running\":" &
+              (if graphicsRunning(): "true" else: "false") &
+              ",\"frames\":" & $int(graphicsFrames()) & "}"
+    return cOutCopy(outPtr, outLen, cast[Il2CppPtr](toCString(ack)),
+                    int32(ack.len))
 
   if not gReady:
     gLastError = "the IL2CPP runtime is not up yet"
@@ -3167,6 +3180,17 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
                       modhost.modVersionOf(i), true)
   else:
     warn "the overlay did not start: " & overlayStatus()
+
+  # Full-frame post-process (aowl.graphics). Started AFTER the overlay on
+  # purpose: both detour DXGI Present through the same trampoline engine, and
+  # installing graphics last makes it the outer hook — it regrades the raw game
+  # frame, then the trampoline reaches the overlay, which draws its UI crisp on
+  # top of the graded image. A failure here is a missing effect, never fatal:
+  # the C side latches broken and the detour becomes a pass-through.
+  if graphicsStart():
+    okLog "graphics post-process ready — " & graphicsStatus()
+  else:
+    warn "the graphics post-process did not start: " & graphicsStatus()
 
   # The mods are up, so the host can start answering the manager. Before this
   # point a control request is ignored rather than queued.

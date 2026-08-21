@@ -1,0 +1,42 @@
+{
+  "_comment": "aowl.graphics — full-frame post-process (AgX tonemap + color grade + sharpen + bloom + vignette). The RENDERING runs client-side in the host (abi/aowlspt_graphics.h) over the DXGI back buffer; this file is only the control surface. Keys are flat so the F12 settings UI and the write-back path both address them directly. See README.md for what each does and the screen-space caveat (this grades the shipped LDR frame, it is not a literal replacement of BSG's HDR tonemapper).",
+
+  "enabled": true,
+
+  "//tonemapper": "0 = none, 1 = AgX (filmic, neutral highlights — default), 2 = ACES. tonemapStrength blends the look 0..1.",
+  "tonemapper": 1,
+  "tonemapStrength": 0.85,
+
+  "//exposure": "EV bias applied before the tonemap look. 0 = neutral.",
+  "exposure": 0.0,
+
+  "contrast": 1.05,
+  "saturation": 1.05,
+
+  "//temperature": "White balance. temperature -1..1 (cool..warm), tint -1..1 (green..magenta).",
+  "temperature": 0.0,
+  "tint": 0.0,
+
+  "//lgg": "Lift/Gamma/Gain — shadows offset, midtone power, highlight scale.",
+  "lift": 0.0,
+  "gamma": 1.0,
+  "gain": 1.0,
+
+  "//legacy": "shadows (additive lift) and highlights (pre-tonemap roll-off) match the original TarkovGraphics knobs.",
+  "shadows": 0.0,
+  "highlights": 1.1,
+
+  "//sharpness": "CAS-style contrast-adaptive sharpening, 0..1.",
+  "sharpness": 0.35,
+
+  "//bloom": "bloom enables the bright-pass blur; bloomStrength is the composite amount 0..2.",
+  "bloom": true,
+  "bloomStrength": 0.35,
+
+  "//vignette": "vignette strength 0..1; vignetteRadius 0.5..1.5 (larger = darkening starts further out).",
+  "vignette": 0.18,
+  "vignetteRadius": 1.0,
+
+  "//diag": "Red-tint the frame to confirm the post-process blit lands on the right back buffer. Turn off for normal play.",
+  "diag": false
+}

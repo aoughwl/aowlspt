@@ -362,6 +362,7 @@ proc buildIl2CppHost(e: Env): bool =
   cmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
   cmd.add " -p:" & quoted(joinPath(e.repo, "host\\common"))
   cmd.add " -p:" & quoted(joinPath(e.repo, "host\\Aowlspt.Overlay"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "host\\Aowlspt.Graphics"))
   cmd.add " -o:" & quoted(outPath)
   cmd.add " " & quoted(source)
   if not run(e, "aowlspt-host-il2cpp", cmd, dir):
