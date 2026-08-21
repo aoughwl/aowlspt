@@ -403,6 +403,10 @@ proc cUxVersionLabelOffset(): int32 {.
   importc: "aowl_uxpatch_version_label_offset", nodecl.}
 proc cUxWritePtr(p: Il2CppPtr; off: int32; value: Il2CppPtr): int32 {.
   importc: "aowl_uxpatch_write_ptr", nodecl.}
+proc cUxVersionUpdateTarget(): Il2CppPtr {.
+  importc: "aowl_uxpatch_version_update_target", nodecl.}
+proc cUxWriteByte(p: Il2CppPtr; off: int32; val: int32): int32 {.
+  importc: "aowl_uxpatch_write_byte", nodecl.}
 
 # The Unity-main-thread bridge's statically-resolved per-frame targets. Each
 # returns a verified code pointer into GameAssembly.dll or nil (wrong build,
@@ -824,6 +828,12 @@ var gVersionSlot = -1
 var gVersionBrand = false
 var gVersionWrite = false
 var gVersionBranded = false
+## Per-frame version brand (PreloaderUI.Update): log the detour-live line once and
+## the branded-result line once, and cache the branded String so the alloc happens
+## once rather than every frame.
+var gBrandLogged = false
+var gBrandDoneLogged = false
+var gBrandedStr: Il2CppPtr = cast[Il2CppPtr](0)
 
 ## Whether the fragile static-RVA drain path may be used at all. OFF by default:
 ## it bound a real-but-wrong function on the live client and crashed the game, so
@@ -3322,106 +3332,90 @@ proc rawReadVersionString(p: Il2CppPtr): string =
     result.add char(c)
 
 proc versionBrandFired(regs: Il2CppPtr) =
-  ## Fired from the POSTFIX detour on `EFT.UI.PreloaderUI::Awake`, on the Unity
-  ## main thread, *after* the original set the bottom-left version label.
+  ## Fired from the per-frame PREFIX detour on `EFT.UI.PreloaderUI::Update`, on the
+  ## Unity main thread. Re-applies the "aowlspt" brand to the bottom-left version
+  ## label every frame until it sticks. The visible label is an
+  ## `EFT.UI.LocalizedText` driving a `List<TextMeshProUGUI>`, and TMP caches its
+  ## mesh, so a one-shot write neither reaches the renderer nor survives the locale
+  ## re-push -- hooking Update fixes both (re-apply + force the mesh dirty).
   ##
-  ## Staged and crash-proof by construction, because a fault here is on the Unity
-  ## thread during boot:
+  ## Entirely RAW pointer walks + raw writes, NO reflection (dead on this build:
+  ## `il2cpp_object_get_class`/`il2cpp_class_get_name` fault even on the Unity
+  ## thread), every dereference `aowl_is_readable`-guarded, the string alloc under
+  ## the VEH guard. Object graph (offsets resolved offline from the metadata
+  ## fieldOffsets table by `tools/il2cpp_resolve.py`):
   ##
-  ##   * READ-ONLY probe (always): log the firing thread and whether `this + 0x20`
-  ##     (Awake's `set_text` receiver, the label component) is readable, then scan
-  ##     the component's pointer slots reading each as a `System.String` by its
-  ##     FIXED layout (length @ +0x10, UTF-16 chars @ +0x14) and log any whose
-  ##     content looks like a version. NO reflection: the live verdict is that
-  ##     `il2cpp_object_get_class` / `il2cpp_class_get_name` (and every reflection
-  ##     accessor) FAULT even on the Unity thread on this build, so the target is
-  ##     found by CONTENT, not by class.
-  ##   * FIELD-WRITE brand (opt-in `uxVersionBrandWrite`): allocate a branded
-  ##     `System.String` (under the VEH guard, so even the alloc cannot crash) and
-  ##     write its pointer straight into that slot by offset -- NO `runtime_invoke`,
-  ##     NO `findMethod`, NO `objectClass`; a raw field write is what `fov`/`sain`
-  ##     do. The write slot is VirtualQuery-guarded before the store.
+  ##   this (PreloaderUI) +0x20 -> EFT.UI.LocalizedText
+  ##     +0x78 -> List<TextMeshProUGUI>   (_items @ +0x10, _size @ +0x18)
+  ##       item[i] @ _items +0x20 + i*8 -> TextMeshProUGUI
+  ##         m_text @ +0xE0 (System.String), m_havePropertiesChanged @ +0x378 (bool)
   ##
-  ## Every dereference is `aowl_is_readable`-guarded and the whole thing runs at
-  ## most once. Any doubt -> leave the stock version, never crash.
-  if gVersionBranded:
-    return
-  gVersionBranded = true          # once only, whatever the outcome below
-
-  let tid = int(cThreadId())
-  let onHost = (tid == int(gHostThreadId))
-  okLog "version probe: PreloaderUI.Awake postfix fired on thread " & $tid &
-        (if onHost: " (HOST thread -- unexpected; NOT Unity's)"
-         else: " (NOT the host thread -> Unity's main thread)")
-
+  ## The target TMP is confirmed by CONTENT (`m_text` `looksLikeVersion`) before a
+  ## write, so a wrong hop is skipped, not written. Any doubt -> stock version.
   let selfRaw = cRegsInt(regs, 0'i32)          # RCX = the PreloaderUI `this`
   if selfRaw == 0'u64:
-    warn "version probe: `this` is null; nothing to read"
     return
   let self = cast[Il2CppPtr](selfRaw)
-  let off = cUxVersionLabelOffset()
-  if cIsReadable(self, off + 8'i32) == 0'i32:
-    warn "version probe: this+0x" & hexOf(uint64(off)) & " is not readable"
-    return
-  let label = hReadPtr(self, off)
-  if label == nil or cIsReadable(label, 0x20'i32) == 0'i32:
-    warn "version probe: label component (this+0x" & hexOf(uint64(off)) &
-         ") is null or not readable"
-    return
-  okLog "version probe: label component at this+0x" & hexOf(uint64(off)) &
-        " is readable; scanning its String slots by raw layout (no reflection)"
+  if not gBrandLogged:
+    gBrandLogged = true
+    let tid = int(cThreadId())
+    okLog "version brand: PreloaderUI.Update detour live on thread " & $tid &
+          (if tid == int(gHostThreadId): " (HOST -- unexpected)"
+           else: " (Unity main thread)") &
+          (if gVersionWrite: "; write armed" else: "; read-only (uxVersionBrandWrite off)")
 
-  # Raw scan for the text-backing String on the component. Read each pointer slot
-  # and interpret it as a System.String by its FIXED layout (length @ +0x10,
-  # UTF-16 chars @ +0x14) -- NO objectClass/className, because runtime reflection
-  # is dead on this build (the settings-probe verdict). The version String is
-  # found by CONTENT (`looksLikeVersion`), which is self-validating: a slot whose
-  # bytes are not a short version-looking ASCII string is skipped, so a wrong slot
-  # cannot be mistaken for the target.
-  var textField = -1
-  var textVal = ""
-  var o = 0x10
-  while o <= 0x180:
-    if cIsReadable(label, int32(o + 8)) != 0'i32:
-      let fp = hReadPtr(label, int32(o))
-      let s = rawReadVersionString(fp)
-      if s.len > 0 and looksLikeVersion(s):
-        okLog "version probe: String slot +0x" & hexOf(uint64(o)) &
-              " = \"" & s & "\"  <-- version-looking"
-        if textField < 0:
-          textField = o
-          textVal = s
-    o = o + 8
-
-  if not gVersionWrite:
-    okLog "version probe: read-only (set uxVersionBrandWrite to attempt a " &
-          "field-write brand; no managed write was performed)"
+  # Walk this+0x20 -> LocalizedText -> List<TMP> -> items array.
+  if cIsReadable(self, 0x28'i32) == 0'i32:
+    return
+  let label = hReadPtr(self, 0x20'i32)                     # LocalizedText
+  if label == nil or cIsReadable(label, 0x80'i32) == 0'i32:
+    return
+  let list = hReadPtr(label, 0x78'i32)                     # List<TextMeshProUGUI>
+  if list == nil or cIsReadable(list, 0x20'i32) == 0'i32:
+    return
+  let items = hReadPtr(list, 0x10'i32)                     # TMP[] backing array
+  let size = cReadI32At(cast[Il2CppPtr](cast[uint64](list) + 0x18'u64))  # _size
+  if items == nil or size <= 0'i32 or size > 64'i32:
+    return
+  if cIsReadable(items, 0x20'i32 + size * 8'i32) == 0'i32:
     return
 
-  # ---- opt-in field-write brand: guarded newString + raw field store ----
-  if textField < 0:
-    warn "version brand: no version-looking String slot found on the label " &
-         "component; not writing (stock version left in place)"
-    return
-  if textVal.startsWith("aowlspt"):
-    return                                      # already ours
-  # "aowlspt <U+2014 em dash> <version>", em dash as explicit UTF-8 bytes so the
-  # source stays ASCII; il2cpp_string_new takes UTF-8. The alloc runs under the
-  # VEH guard (`cBrandNewStringGuarded`), so even il2cpp_string_new cannot crash.
-  gBrandText = "aowlspt \xE2\x80\x94 " & textVal
-  let ns = cBrandNewStringGuarded(cast[Il2CppPtr](0))
-  if ns == nil or cIsReadable(ns, 0x14'i32) == 0'i32:
-    warn "version brand: guarded newString failed/faulted or returned an " &
-         "unreadable String; not writing (stock version left in place)"
-    return
-  okLog "version brand: allocated branded String ok; writing it into label " &
-        "slot +0x" & hexOf(uint64(textField))
-  if cUxWritePtr(label, int32(textField), ns) != 0'i32:
-    okLog "version brand: slot +0x" & hexOf(uint64(textField)) &
-          " set to \"" & gBrandText & "\" (raw field write, no reflection)"
-  else:
-    warn "version brand: field slot +0x" & hexOf(uint64(textField)) &
-         " was not safely writable; left unchanged"
+  var brandedThisPass = 0
+  var foundVersion = 0
+  for i in 0 ..< int(size):
+    let tmp = hReadPtr(items, int32(0x20 + i * 8))         # TextMeshProUGUI
+    if tmp == nil or cIsReadable(tmp, 0x380'i32) == 0'i32:
+      continue
+    let cur = rawReadVersionString(hReadPtr(tmp, 0xE0'i32))  # m_text
+    if cur.len == 0 or cur.startsWith("aowlspt"):
+      continue                                             # empty or already ours
+    if not looksLikeVersion(cur):
+      continue                                             # not the version TMP
+    inc foundVersion
+    if not gVersionWrite:
+      continue                                             # read-only: just count
+    # Allocate the branded String once (rooted by the first m_text write, so it
+    # survives GC afterwards); "aowlspt <em dash> <version>", em dash as UTF-8.
+    if gBrandedStr == nil or cIsReadable(gBrandedStr, 0x14'i32) == 0'i32:
+      gBrandText = "aowlspt \xE2\x80\x94 " & cur
+      gBrandedStr = cBrandNewStringGuarded(cast[Il2CppPtr](0))
+    if gBrandedStr == nil:
+      continue
+    if cUxWritePtr(tmp, 0xE0'i32, gBrandedStr) != 0'i32:
+      # Flag the text mesh dirty so TMP rebuilds it with the new m_text next frame.
+      discard cUxWriteByte(tmp, 0x378'i32, 1'i32)          # m_havePropertiesChanged
+      inc brandedThisPass
+
+  if not gBrandDoneLogged:
+    if brandedThisPass > 0:
+      gBrandDoneLogged = true
+      okLog "version brand: wrote branded m_text + dirty flag to " &
+            $brandedThisPass & " TextMeshProUGUI label(s) -> \"" & gBrandText &
+            "\" (raw walk, no reflection)"
+    elif foundVersion > 0 and not gVersionWrite:
+      gBrandDoneLogged = true
+      okLog "version brand: found " & $foundVersion & " version TextMeshProUGUI " &
+            "label(s) via the raw walk; set uxVersionBrandWrite to brand them"
 
 proc bindVersionBrand(verbose: bool): bool =
   ## Installs the POSTFIX detour on `EFT.UI.PreloaderUI::Awake` from the verified
@@ -3434,15 +3428,20 @@ proc bindVersionBrand(verbose: bool): bool =
     return true
   if not gReady or gDisableDrain:
     return false
-  let fn = cUxVersionTarget()
+  # PreloaderUI.Update, not Awake: the label is a LocalizedText driving a
+  # List<TextMeshProUGUI> whose mesh is cached, so the brand has to be re-applied
+  # per frame (and the TMP flagged dirty) to reach the renderer and survive the
+  # locale re-push -- see `versionBrandFired`. A per-frame PREFIX detour.
+  let fn = cUxVersionUpdateTarget()
   if fn == nil:
     if verbose:
-      info "version brand: PreloaderUI.Awake did not verify on this build"
+      info "version brand: PreloaderUI.Update did not verify on this build"
     return false
-  if attachDrain("EFT.UI.PreloaderUI::Awake", fn, cast[Il2CppMethod](0),
-                 false, verbose, 3'i32, true):
-    okLog "version brand armed on EFT.UI.PreloaderUI::Awake (postfix); the " &
-          "bottom-left version label will read \"aowlspt — <version>\""
+  if attachDrain("EFT.UI.PreloaderUI::Update", fn, cast[Il2CppMethod](0),
+                 true, verbose, 3'i32, false):
+    okLog "version brand armed on EFT.UI.PreloaderUI::Update (per-frame); the " &
+          "bottom-left version label will read \"aowlspt — <version>\" when " &
+          "uxVersionBrandWrite is set"
     return true
   result = false
 

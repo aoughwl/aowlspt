@@ -213,6 +213,41 @@ static int32_t aowl_uxpatch_version_label_offset(void) {
     return AOWL_UX_VERSION_LABEL_OFF;
 }
 
+/* PreloaderUI.Update @ RVA 0x1569F20 -- the per-frame re-apply hook for the
+ * version brand. Awake sets the label once and early; the visible text is an
+ * EFT.UI.LocalizedText driving a List<TextMeshProUGUI>, and TMP caches its mesh,
+ * so a one-shot raw write at Awake neither reaches the renderer nor survives the
+ * locale re-push. Hooking Update lets the host re-apply the brand to each TMP's
+ * m_text (and flag it dirty) every frame until it sticks. Same verify-then-hand-
+ * out contract; NULL on a prologue mismatch. */
+#define AOWL_UX_PRELOADER_UPDATE_RVA 0x1569F20u
+static void* aowl_uxpatch_version_update_target(void) {
+    HMODULE ga;
+    unsigned char* p;
+    MEMORY_BASIC_INFORMATION mbi;
+    /* PreloaderUI.Update prologue (16 bytes):
+     * 48 8B C4          mov rax, rsp
+     * 48 89 58 10       mov [rax+0x10], rbx
+     * 48 89 70 20       mov [rax+0x20], rsi
+     * 48 89 48 08       mov [rax+0x08], rcx
+     * 57                push rdi                                            */
+    static const unsigned char sig[16] = {
+        0x48,0x8B,0xC4, 0x48,0x89,0x58,0x10, 0x48,0x89,0x70,0x20,
+        0x48,0x89,0x48,0x08, 0x57 };
+    ga = GetModuleHandleA("GameAssembly.dll");
+    if (!ga) return NULL;
+    aowl_ux_base_found = 1;
+    p = (unsigned char*)ga + AOWL_UX_PRELOADER_UPDATE_RVA;
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0) return NULL;
+    if (mbi.State != MEM_COMMIT) return NULL;
+    if (!(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                         PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+        return NULL;
+    if (memcmp(p, sig, 16) != 0) return NULL;
+    aowl_ux_ver_sig_ok = 1;
+    return (void*)p;
+}
+
 /* A pointer-sized field write at `p + off`, but only if that 8-byte slot is
  * inside one committed, writable region -- the write mirror of
  * `aowl_is_readable`. Used by the version brand's field-write path to set a
@@ -239,6 +274,24 @@ static int32_t aowl_uxpatch_write_ptr(void* p, int32_t off, void* value) {
         if (need > end) return 0;
     }
     memcpy(at, &value, sizeof(void*));
+    return 1;
+}
+
+/* A single-byte write at `p + off`, same committed-writable guard as the pointer
+ * store above. Used to set TMP_Text.m_havePropertiesChanged (a bool) so the text
+ * mesh rebuilds after m_text is overwritten. 1 on success, 0 if not writable. */
+static int32_t aowl_uxpatch_write_byte(void* p, int32_t off, int32_t val) {
+    MEMORY_BASIC_INFORMATION mbi;
+    char* at;
+    if (!p) return 0;
+    at = (char*)p + off;
+    if (VirtualQuery(at, &mbi, sizeof(mbi)) == 0) return 0;
+    if (mbi.State != MEM_COMMIT) return 0;
+    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return 0;
+    if (!(mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY |
+                         PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+        return 0;
+    *at = (char)(val & 0xFF);
     return 1;
 }
 
