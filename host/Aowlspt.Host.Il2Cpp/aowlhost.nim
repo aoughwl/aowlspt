@@ -89,6 +89,10 @@ import invoke
 ## code pointer the host postfix-detours to rewrite the label on the Unity
 ## thread). See `aowlspt_uxpatch.h`.
 {.emit: """#include "aowlspt_uxpatch.h" """.}
+## READ-ONLY GameWorld bot/player census: static field offsets + the verified
+## `EFT.GameWorld::RegisterPlayer` detour target. Offsets/target only; the walk
+## is in `botdiag.nim` (included below). See `aowlspt_botdiag.h`.
+{.emit: """#include "aowlspt_botdiag.h" """.}
 {.emit: """#include "aowlspt_detour.h" """.}
 ## The typed patch frame. Included here as well as through `aowlspt_abi.h`
 ## because this file names its pool directly; the include guard makes the second
@@ -824,6 +828,15 @@ var gVersionSlot = -1
 var gVersionBrand = false
 var gVersionWrite = false
 var gVersionBranded = false
+
+## READ-ONLY GameWorld bot/player census (kind=5 detour on
+## `EFT.GameWorld::RegisterPlayer`): its slot, opt-in flag (`botDiag`), and a
+## fire counter used to throttle the full-list enumerate. Declared here beside
+## the other detour slots; the walk itself lives in `botdiag.nim` (included
+## below), which reuses this file's guarded raw-read primitives. NEVER writes.
+var gBotDiagSlot = -1
+var gBotDiag = false
+var gBotDiagFires = 0
 
 ## Whether the fragile static-RVA drain path may be used at all. OFF by default:
 ## it bound a real-but-wrong function on the live client and crashed the game, so
@@ -2374,6 +2387,11 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
   if i == gSettingsSlot:
     settingsProbeFired(regs)
     return 0'i32
+  # READ-ONLY GameWorld bot/player census, likewise by identity: it enumerates
+  # the registered players and only logs -- it must never suppress the original.
+  if i == gBotDiagSlot:
+    botDiagRegisterFired(regs)
+    return 0'i32
   if i < 0 or i >= gPatches.len:
     return 0'i32
   if not gPatches[i].live:
@@ -2739,7 +2757,8 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
   ## mod's `patch` on another thread does too. It is the host's own hook, and it
   ## is not exempt from the rule.
   let what = (if kind == 1: "render-phase" elif kind == 2: "settings-probe"
-              elif kind == 3: "version-brand" else: "main-thread")
+              elif kind == 3: "version-brand" elif kind == 5: "botdiag"
+              else: "main-thread")
   tablesLock()
   let claimed = cHookClaim()
   if claimed < 0'i32:
@@ -2786,19 +2805,21 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
     gSettingsSlot = int(claimed)
   elif kind == 3:
     gVersionSlot = int(claimed)
+  elif kind == 5:
+    gBotDiagSlot = int(claimed)
   else:
     gDrainSlot = int(claimed)
   tablesUnlock()
   if kind == 1:
     gRenderMethod = spec
-  elif kind == 2 or kind == 3:
+  elif kind == 2 or kind == 3 or kind == 5:
     discard
   else:
     gDrainMethod = spec
     gDrainPerFrame = perFrame
   okLog what & " bound to " & spec & " (" &
         $int(cHookStolen(hook)) & " bytes)" &
-        (if perFrame or kind == 2 or kind == 3: "" else:
+        (if perFrame or kind == 2 or kind == 3 or kind == 5: "" else:
            "; it runs more than once a frame, so its firing count is not a " &
            "frame count")
   return true
@@ -3445,6 +3466,13 @@ proc bindVersionBrand(verbose: bool): bool =
           "bottom-left version label will read \"aowlspt — <version>\""
     return true
   result = false
+
+## READ-ONLY GameWorld bot/player census. Kept in its own file to avoid colliding
+## with concurrent host work; `include`d (not imported) so it shares this file's
+## guarded raw-read primitives, `cRegsInt`, logging, `attachDrain`, and the
+## verified `EFT.GameWorld::RegisterPlayer` target. Defines `botDiagRegisterFired`
+## (dispatched by slot identity in `patchFired`) and `bindBotDiag`.
+include "botdiag.nim"
 
 proc hostEventSubscribe(ctx: Il2CppPtr; name: Il2CppPtr; nameLen: int32;
                         cb: Il2CppPtr; user: Il2CppPtr): int32 {.
@@ -4329,6 +4357,12 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
     info "bridgeSettingsProbe is set: a read-only detour on SettingsScreen.Show " &
          "will log the thread it fires on when you open the settings screen " &
          "(Experiment A -- confirms a detour reaches the Unity thread)"
+  gBotDiag = readBoolKey("botDiag")
+  if gBotDiag:
+    info "botDiag is set: a READ-ONLY detour on EFT.GameWorld.RegisterPlayer " &
+         "will log each bot/player registration and enumerate the registered " &
+         "list (nickname, side/role, alive-state, position) during an offline " &
+         "raid -- it answers spawned-but-frozen vs absent. NO write is performed."
   gVersionBrand = readBoolKey("uxVersionBrand")
   gVersionWrite = readBoolKey("uxVersionBrandWrite")
   if gVersionWrite:
@@ -4390,6 +4424,14 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       if gVersionBrand and not bindVersionBrand(true):
         info "version brand did not arm (PreloaderUI.Awake unverified on this " &
              "build, or drain disabled)"
+
+      # READ-ONLY bot/player census (opt-in). GameWorld.RegisterPlayer is static
+      # code, so the detour installs now and simply never fires until an offline
+      # raid starts and players/bots begin registering. Fail-safe if the prologue
+      # does not match on this build.
+      if gBotDiag and not bindBotDiag(true):
+        info "botdiag did not arm (EFT.GameWorld.RegisterPlayer unverified on " &
+             "this build, or drain disabled)"
 
   let modsDir = joinPath(gDir, "mods")
   # The runtime may not have come up, and that deliberately does not stop this:

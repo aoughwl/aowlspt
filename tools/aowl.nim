@@ -2342,7 +2342,15 @@ proc cmdPayload(e: Env): int =
       "should be running, so a mod switched off in the manager is switched " &
       "off in the game without a restart. 0 turns it off, and it needs " &
       "backendPort.\",\n" &
-      "  \"modSyncMs\": 3000\n" &
+      "  \"modSyncMs\": 3000,\n" &
+      "\n" &
+      "  \"//botDiag\": \"READ-ONLY diagnostic. When true, a detour on " &
+      "EFT.GameWorld.RegisterPlayer logs each bot/player registration and " &
+      "enumerates the registered list (nickname, side/role, alive-state, " &
+      "position) during an offline raid, to answer whether AI bots are " &
+      "actually spawned (but maybe frozen) or truly absent. It never writes " &
+      "game state, renders, or affects gameplay. Default false.\",\n" &
+      "  \"botDiag\": false\n" &
       "}\n")
 
   let staged = failures - failuresAtEntry
