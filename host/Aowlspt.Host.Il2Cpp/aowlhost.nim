@@ -107,6 +107,10 @@ import invoke
 ## allocation exports. Table and thunks only; the proof ladder that drives them
 ## is in `invoke2.nim` (included below). See `aowlspt_invoke2.h`.
 {.emit: """#include "aowlspt_invoke2.h" """.}
+## The in-game, Unity-native debug overlay: the F3 info panel and the
+## in-world AI markers. Target table, call thunks, guarded scalar stores,
+## the toggle key and the frame-rate estimate. See `aowlspt_debugui.h`.
+{.emit: """#include "aowlspt_debugui.h" """.}
 {.emit: """#include "aowlspt_detour.h" """.}
 ## The typed patch frame. Included here as well as through `aowlspt_abi.h`
 ## because this file names its pool directly; the include guard makes the second
@@ -1075,6 +1079,25 @@ var gSettingsSelSlot = -1
 ## methods DIRECTLY at their RVA, with no reflection anywhere.
 var gMi2Slot = -1
 var gMi2Probe = false
+
+## THE IN-GAME DEBUG OVERLAY (kind=10 PREFIX detour on `EFT.UI.PreloaderUI::
+## Update`): its slot and its two opt-in flags. `debugUi` is the F3 info panel,
+## `debugEsp` the in-world AI markers; either one arms the detour, because both
+## are drawn from the same per-frame Unity-thread body. Default OFF.
+##
+## `gDebugEspSlot` is a SECOND, read-only kind=11 detour whose only job is to
+## cache the live `EFT.GameWorld` pointer from `RegisterPlayer`. It shares that
+## target with botdiag (kind=5), so it is armed only when botdiag did not take
+## it -- two detours on one function would have the second overwrite the first's
+## trampoline. When botdiag owns the target it feeds the cache itself.
+##
+## The overlay itself lives in `debugui.nim` (included below), which reuses this
+## file's guarded raw primitives, botdiag's GameWorld offsets and readers, and
+## invoke2's verified managed-call thunks.
+var gDebugUiSlot = -1
+var gDebugEspSlot = -1
+var gDebugUi = false
+var gDebugEsp = false
 
 ## Whether the fragile static-RVA drain path may be used at all. OFF by default:
 ## it bound a real-but-wrong function on the live client and crashed the game, so
@@ -2639,6 +2662,17 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
   if i == gSettingsUiSlot:
     settingsUiProbeFired(regs)
     return 0'i32
+  # THE DEBUG OVERLAY, by identity and before anything generic: it fires once a
+  # frame, so it must not walk the patch table to find itself. It draws into UI
+  # objects it cloned and never suppresses PreloaderUI's own Update.
+  if i == gDebugUiSlot:
+    debugUiFired(regs)
+    return 0'i32
+  # The overlay's GameWorld cache: one register read, nothing walked, never a
+  # suppression of RegisterPlayer.
+  if i == gDebugEspSlot:
+    debugEspRegisterFired(regs)
+    return 0'i32
   if i < 0 or i >= gPatches.len:
     return 0'i32
   if not gPatches[i].live:
@@ -3029,6 +3063,8 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
               elif kind == 7: "settings-tab-probe"
               elif kind == 8: "settings-sel-probe"
               elif kind == 9: "managed-invoke-probe"
+              elif kind == 10: "debug-overlay"
+              elif kind == 11: "debug-overlay-world"
               else: "main-thread")
   tablesLock()
   let claimed = cHookClaim()
@@ -3088,13 +3124,17 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
     gSettingsSelSlot = int(claimed)
   elif kind == 9:
     gMi2Slot = int(claimed)
+  elif kind == 10:
+    gDebugUiSlot = int(claimed)
+  elif kind == 11:
+    gDebugEspSlot = int(claimed)
   else:
     gDrainSlot = int(claimed)
   tablesUnlock()
   if kind == 1:
     gRenderMethod = spec
   elif kind == 2 or kind == 3 or kind == 4 or kind == 5 or kind == 6 or
-       kind == 7 or kind == 8 or kind == 9:
+       kind == 7 or kind == 8 or kind == 9 or kind == 10 or kind == 11:
     discard
   else:
     gDrainMethod = spec
@@ -3102,7 +3142,8 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
   okLog what & " bound to " & spec & " (" &
         $int(cHookStolen(hook)) & " bytes)" &
         (if perFrame or kind == 2 or kind == 3 or kind == 4 or kind == 5 or
-            kind == 6 or kind == 7 or kind == 8 or kind == 9: "" else:
+            kind == 6 or kind == 7 or kind == 8 or kind == 9 or
+            kind == 10 or kind == 11: "" else:
            "; it runs more than once a frame, so its firing count is not a " &
            "frame count")
   return true
@@ -3776,6 +3817,16 @@ include "settingsui.nim"
 ## offsets. Defines `mi2LadderFired` (dispatched by slot identity in
 ## `patchReturned`) and `bindManagedInvoke`.
 include "invoke2.nim"
+
+## The in-game, Unity-native debug overlay (the F3 panel + in-world AI markers).
+## `include`d rather than imported, and LAST, because it stands on everything
+## above it: this file's guarded raw primitives and `attachDrain`, botdiag's
+## GameWorld offsets and guarded readers (`bdOk`-style hops, `bdIsAI`,
+## `bdCollectAlive`), and invoke2's verified managed-call thunks (`Instantiate`,
+## `SetParentAndAlign`, `get_gameObject`). Defines `debugUiFired`,
+## `debugEspRegisterFired`, `duNoteGameWorld`, `bindDebugUi` and
+## `bindDebugEspWorld`.
+include "debugui.nim"
 
 proc hostEventSubscribe(ctx: Il2CppPtr; name: Il2CppPtr; nameLen: int32;
                         cb: Il2CppPtr; user: Il2CppPtr): int32 {.
@@ -4726,6 +4777,25 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "Every step is separately VEH-guarded and logged BEGIN/END, so a fault " &
          "names its step and cannot crash the client. It takes over the " &
          "EnsureTabInitialized hook from the Phase-1.5 control probe."
+  # The in-game debug overlay. Two flags, one detour: either of them arms the
+  # per-frame PreloaderUI hook, because the panel and the markers are drawn from
+  # the same body. The LAYOUT is read here too, so a bad config file is a boot-log
+  # line rather than a surprise the first time the key is pressed.
+  gDebugUi = readBoolKey("debugUi")
+  gDebugEsp = readBoolKey("debugEsp")
+  if gDebugUi or gDebugEsp:
+    duLoadLayout()
+    info "debugUi/debugEsp is set: a per-frame detour on EFT.UI.PreloaderUI." &
+         "Update (the Unity main thread) will draw a Minecraft-F3-style info " &
+         "panel" &
+         (if gDebugEsp: " and in-world markers over every registered AI bot"
+          else: "") &
+         " out of Unity UI labels CLONED from the client's own version label " &
+         "(Object::Instantiate -- no reflection, no object creation). Press " &
+         (if gDuCfg.toggleVk == 0x72: "F3" else: "VK " & $gDuCfg.toggleVk) &
+         " in game to toggle it; layout is " & gDuCfg.source &
+         " and is re-read on every toggle-on, so it can be edited live. The " &
+         "whole body is VEH-guarded and writes only into labels it created."
   gVersionBrand = readBoolKey("uxVersionBrand")
   gVersionWrite = readBoolKey("uxVersionBrandWrite")
   if gVersionWrite:
@@ -4853,6 +4923,19 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       if gBotCap and not bindBotCap(true):
         info "botcap did not arm (EFT.BotSpawner.AddPlayer unverified on this " &
              "build, or drain disabled)"
+
+      # THE IN-GAME DEBUG OVERLAY (opt-in). PreloaderUI::Update is static code,
+      # so the detour installs now and starts ticking as soon as the preloader
+      # is up -- but it draws NOTHING until the toggle key is pressed. The
+      # GameWorld cache is armed only when botdiag did not take
+      # `GameWorld::RegisterPlayer`; when it did, botdiag feeds the cache and
+      # this correctly installs nothing.
+      if gDebugUi or gDebugEsp:
+        if not bindDebugUi(true):
+          info "the debug overlay did not arm (EFT.UI.PreloaderUI.Update " &
+               "unverified on this build, or drain disabled)"
+        elif gDebugEsp:
+          discard bindDebugEspWorld(true)
 
   let modsDir = joinPath(gDir, "mods")
   # The runtime may not have come up, and that deliberately does not stop this:

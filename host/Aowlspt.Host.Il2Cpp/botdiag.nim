@@ -331,6 +331,15 @@ proc botDiagRegisterFired(regs: Il2CppPtr) =
   ## guard: if anything inside faults, the guard traps it, we log the catch, and
   ## execution returns cleanly to the game so raid entry cannot be crashed by the
   ## diagnostic.
+  # Hand the live GameWorld to the debug overlay before anything else. botdiag
+  # and the overlay both want `RegisterPlayer`, and only one detour can own a
+  # function -- so when botdiag has it, botdiag is the one that feeds the cache
+  # and `bindDebugEspWorld` installs nothing. One register read, no walk, and it
+  # happens whether or not the census body below faults.
+  if int(cThreadId()) != int(gHostThreadId):
+    let gwRaw = cRegsInt(regs, 0'i32)
+    if gwRaw != 0'u64:
+      duNoteGameWorld(cast[Il2CppPtr](gwRaw))
   if cBotDiagBodyGuarded(regs) == nil:
     okLog "botdiag: fault caught, skipped -- the VEH guard kept raid entry alive"
 
