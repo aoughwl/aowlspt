@@ -73,6 +73,55 @@ effectively infeasible to make stable on this client today.** Per the project's
 own rule ("do NOT build the whole UI on an unproven-unstable path"), the panel
 is the **overlay-as-settings** fallback.
 
+> ### 1a. SUPERSEDED — native injection is now proven VIABLE (2026-08)
+>
+> The conclusion above was refuted live. The three "why not" reasons all assumed
+> managed work happens on the **host** thread; the fix was to get onto the Unity
+> thread, not to avoid managed work. See `abi/aowlspt_bridge.h` and the
+> `il2cpp` bridge in `host/Aowlspt.Host.Il2Cpp/aowlhost.nim`.
+>
+> **What changed.** A **static-RVA** detour (BE-style, byte-verified, no runtime
+> metadata read) on `SettingsScreen::Show` @ RVA `0x171FA00` was installed and
+> **fired on the Unity main thread** on a live client, game alive:
+> *"SettingsScreen.Show fired on thread 18156 (host thread 14760) ... Unity's
+> main thread ... this=0x1b1d0f88bd0 (readable)."* So a detour DOES reach the
+> Unity thread on a user action, and from inside it the whole runtime API
+> (`il2cpp_runtime_invoke` / `object_new` / `value_box` / field walk) is safe --
+> the reads that fault on the host thread do not fault here. Reasons 1-3 are
+> answered; reason 4 (F-key) never applied (the overlay already toggles F12).
+>
+> **The RVAs are trustworthy.** The offline resolver `tools/il2cpp_resolve.py`
+> (type -> image -> that image's `Il2CppCodeGenModule.methodPointers[rid-1]`)
+> reproduces all five BE-bypass RVAs and every VA in this table byte-for-byte.
+> The earlier "the methodPointers table is null / unreliable" belief was a
+> module-mapping bug: `BattlEye.BEClient` is in `Assembly-CSharp-firstpass.dll`
+> (table base `0x186BF1380`), not `Assembly-CSharp.dll`.
+>
+> **Injection targets (all `Assembly-CSharp.dll`, RVAs from imagebase
+> 0x180000000, this build):**
+>
+> | Type | Member | RVA |
+> |---|---|---|
+> | `EFT.UI.Settings.GameSettingsTab` | `CreateControls` | 0x1703FB0 |
+> | `EFT.UI.Settings.GameSettingsTab` | `ShowFieldOfView` (FOV row builder) | 0x17066A0 |
+> | `EFT.UI.Settings.SettingFloatSlider` | `BindTo` (2 overloads) | 0x16FB4C0 / 0x16FB810 |
+> | `EFT.UI.Settings.SettingFloatSlider` | `.ctor` | 0xCFD7D0 |
+> | `EFT.UI.Settings.SettingsScreen` | `Show` / `OpenGroup` | 0x171FA00 / 0x1720C80 |
+>
+> Tab types (type indices): SettingsTab 15717 (abstract `CreateControl`),
+> GameSettingsTab 15697, GraphicsSettingsTab 15711, SoundSettingsTab 15720,
+> ControlSettingsTab 15683, PostFXSettingsTab 15715. Control types:
+> SettingControl 15652, SettingFloatSlider 15662, SettingToggle 15677,
+> SettingDropDown 15659, SettingSelectSlider 15668.
+>
+> **Status.** Bridge confirmed (managed box round-trips on the Unity thread).
+> Field walk of the live `SettingsScreen` (STEP 2) reads the tab/control layout.
+> Next: hook `GameSettingsTab::CreateControls` postfix and add one row (an FOV
+> slider bound to the `fov` mod's config key) -- the whole thing gated behind the
+> detour (touches only the screen the user opened), one control at a time,
+> fail-safe (any offset/bind failure -> log + skip, never corrupt the screen).
+> The overlay-as-settings below remains the fallback for anything not yet wired.
+
 ### The chosen technique: overlay-as-settings (proven stable)
 
 `abi/aowlspt_overlay.h` already draws a panel by hand inside a hooked
