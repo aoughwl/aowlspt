@@ -177,6 +177,57 @@ step it refuses and why.
 None of this has been done against BSG's client. The host has been run against a
 stand-in runtime that exports the same C API, which is a different claim.
 
+### Making the client's own AI/spawn logs appear
+
+The client already narrates the whole offline spawn path — wave to zone to spawn
+point to placement — and names the exact rung that gave up. It just throws the
+narration away before it reaches a file, which is why chasing scav spawning by
+inference took as many rounds as it did.
+
+`D:\Aowlspt\Logging.config` is a plain JSON list of `{fileName, minLevel}` rules
+and it is the whole of the filter. `LogConfiguration::.ctor` (`0x27cb0a0`) calls
+`LoadRulesWithCache` (`0x27cb6d0`), which is `File.Exists` → compare
+`FileInfo.LastWriteTime` against the cached one → `File.ReadAllText` → JSON →
+`ValidateAndFilterRules` (`0x27cc8e0`). `WriteRules` (`0x27cbec0`) runs only when
+the file is missing or unparseable, so an edited file is honoured rather than
+clobbered, and bumping its mtime is what forces the re-read.
+
+Each rule's level lands in `AbstractLogger._minLogLevel` at **+0x24**, and the
+gate is nothing more than
+
+```
+AbstractLogger::IsEnabled(this, lvl)      ; 0x27c8140
+    cmp edx, dword ptr [rcx + 0x24]
+    setge al
+```
+
+with `LogInfo` (`0x27c8f60`) passing `edx = 2`. Levels are Trace=0, Debug=1,
+Information=2, Warning=3, Error=4, Critical=5 — the order the config file's own
+`info` field lists. Every spawn diagnostic is an `AILogger` **Information** row,
+`AILogger`'s category is `aiData`, and the stock install ships `aiData` at
+**Error**. Information(2) is not ≥ Error(4), so all of them are dropped. That is
+the entire reason `Logs\<ts>\* aiData_000.log` holds one line and never the
+interesting ones.
+
+The AI logger classes map 1:1 onto the config's `fileName` keys — `AILogger` to
+`aiData`, `AIDecisionLogger` to `ai_decision`, `AIMoveLogger` to `aiMoveData`,
+and so on — so the fix is a data edit with no code in it at all:
+
+```
+python tools/ailog.py on     --root D:\Aowlspt     # before the run
+python tools/ailog.py off    --root D:\Aowlspt     # after
+python tools/ailog.py show   --root D:\Aowlspt
+```
+
+`on` touches only the `minLevel` of `aiData`, `spawns`, `spawn-system` and
+`botProfiles`, leaves the other rules byte-identical, and saves the old levels
+next to the file so `off` restores them exactly. It takes effect at the next
+client start.
+
+Leave `aiVision`, `aiMoveData`, `aiCoversData` and `aiLooting` alone. They fire
+per bot per frame, and at Trace they bury the handful of rows you actually want
+under gigabytes of the rows you do not.
+
 ## Reading a failure
 
 **The mod does not load.** The host logs why before it gives up, and the order of
