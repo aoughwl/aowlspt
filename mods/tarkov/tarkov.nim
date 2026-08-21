@@ -87,6 +87,34 @@ const
   # host regex wants a bare host. Kept in sync with `backend.json` by hand;
   # loopback is the only address this server ever answers on.
   BackendUrl = "https://127.0.0.1"
+  # The url the client fetches *assets* from -- `backend.Static`, the asset CDN
+  # base that every `/files/...` request is resolved against. Plain HTTP, and on
+  # purpose.
+  #
+  # `/client/*` goes over the managed HTTP stack, which post-1.0 configures to
+  # accept any certificate, so HTTPS with a self-signed cert is fine there.
+  # Assets do not: they are fetched with `UnityWebRequest`, through Unity's own
+  # transport, and the client's call sites never assign a `certificateHandler`
+  # (proven in `EFT.<DownloadTexture2D>d__218::MoveNext`, RVA 0xA7FF70 -- the
+  # request is built at +0xA8018F with none). Unity therefore validates our
+  # certificate, rejects it, and never sends the request; the error branch
+  # returns null *without logging*, so a trader avatar that fails this way is an
+  # infinite spinner and a silent client log. The only trace is a `handshake
+  # FATAL` line on the server side.
+  #
+  # There is nothing a server can do to make that client accept its certificate.
+  # So the asset base offers no certificate at all: the backend opens a second,
+  # plain-HTTP listener (`--asset-port`, default 80) serving the same `/files/`
+  # and `/regular/files/` routes, and this url names it. No TLS handshake
+  # happens, so no TLS validation can fail, and *every* `UnityWebRequest` asset
+  # fetch works -- including bundles and anything a mod adds later, not just the
+  # icons `tools/imagecache.py` pre-seeds into Unity's own cache.
+  #
+  # Portless, which means port 80 -- keep it in step with the backend's
+  # `--asset-port` default. If that port has to move (IIS, the Hyper-V port
+  # reservation), both this and the backend flag move together; the client is
+  # given whatever this says.
+  AssetUrl = "http://127.0.0.1"
 
 var gRequests = 0
 var gEdition = "standard"
@@ -243,7 +271,13 @@ proc onGameConfig(url, body, session: string): string =
   # asset CDN). Point both at this backend so nothing reaches for the real
   # BSG hosts; the client never validates that they answer.
   put(backend, "Lobby", BackendUrl)
-  put(backend, "Static", BackendUrl)
+  # `Static` alone is http, and it is the only one that may be: it is the base
+  # every asset fetch is resolved against, and those go through Unity's
+  # transport, which validates our self-signed certificate and drops the
+  # request in silence. See `AssetUrl`. The five above stay on HTTPS -- they are
+  # `/client/*` traffic on the managed stack, which does accept it, and moving
+  # them would be a change to the one thing that already works.
+  put(backend, "Static", AssetUrl)
   var o = obj()
   put(o, "aid", if p.ok: p.field("aid").asInt(0) else: 0)
   put(o, "lang", "en")

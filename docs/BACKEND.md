@@ -158,6 +158,38 @@ aowlspt-backend --gen-cert            # write the cert+key and exit
   `/client/*` is reachable, not one route. Test it with a client that skips
   verification the way the game does: `curl -k https://127.0.0.1:8443/...`.
 
+## The asset port, and why it is not HTTPS
+
+Under `--tls` the backend opens a **second listener, plain HTTP, on port 80**
+(`--asset-port N`; `--asset-port 0` turns it off). It is the same server — same
+routes, same router, same worker pool — reached over a socket that never
+negotiates TLS.
+
+It exists because of a client bug, not a preference. `/client/*` goes over the
+client's *managed* HTTP stack, which post-1.0 configures to accept any
+certificate; that is why the self-signed cert works. **Assets do not.** Every
+`/files/*` fetch — trader avatars, quest and handbook icons, document images,
+bundles — is a `UnityWebRequest`, through Unity's own transport, and the
+client's call sites never assign a `certificateHandler`
+(`EFT.<DownloadTexture2D>d__218::MoveNext`, RVA `0xA7FF70`; the request is built
+at `+0xA8018F` with none). Unity therefore validates the certificate, rejects
+it, and **never sends the request**. The error branch returns null *without
+logging*, so the symptom is an icon that spins forever and a client log with
+nothing in it; the only trace is a `handshake FATAL` line on the server side.
+
+No server can make that client accept its certificate. So the asset base offers
+none: the tarkov mod's `backend.Static` names `http://127.0.0.1`, this listener
+answers it, and no handshake — and so no validation — ever happens. The other
+five backend urls (`Main`, `Trading`, `Messaging`, `RagFair`, `Lobby`) stay on
+HTTPS; they are the traffic that already works.
+
+Port 80 is the default because a bare `http://127.0.0.1` names it, and a
+portless url keeps clear of the client's host parsing. If something already
+holds 80 (IIS, the Hyper-V/WinNAT reserved ranges), the backend says so and
+carries on serving `/client/*`; move it with `--asset-port N` **and** move the
+mod's `AssetUrl` to `http://127.0.0.1:N` to match — the client is given whatever
+that constant says.
+
 ## Merging, and why it matters
 
 `dbWrite` merges recursively, and **creates a path that is not there**. Refusing

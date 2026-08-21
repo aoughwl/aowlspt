@@ -264,6 +264,14 @@ proc cNetPortHolder(port: int32; buf: ptr char; cap: int32): int32 {.
 # loop. `cNetTlsError` is the reason a `--tls` start failed, for the log.
 proc cNetServeTls(port, workers: int32; cert, key: cstring): int32 {.
   importc: "aowl_net_serve_tls", nodecl.}
+# The second listener, always plain HTTP, for the asset routes. See
+# `g_listenSock2` in `aowlspt_net.h` for the whole of why it exists: Unity's
+# `UnityWebRequest` asset fetches validate our self-signed certificate and are
+# never sent, silently. Binds *and* listens; returns 0 on any failure, having
+# started nothing, which the caller reports as a lost asset route rather than a
+# failed server.
+proc cNetListenPlain(port: int32): int32 {.
+  importc: "aowl_net_listen_plain", nodecl.}
 proc cNetTlsError(): cstring {.importc: "aowl_net_tls_error", nodecl.}
 proc cNetTlsErrorLen(): int32 {.importc: "aowl_net_tls_error_len", nodecl.}
 proc cNetTlsReady(): int32 {.importc: "aowl_net_tls_ready", nodecl.}
@@ -1790,6 +1798,13 @@ aowlspt-backend -- the game backend
                 self-signed cert generated on first use; the client does not
                 validate it. The default stays plain HTTP so the test suites are
                 unaffected.
+  --asset-port N
+                with --tls, also listen on N in PLAIN HTTP for the asset routes
+                (default 80; 0 turns it off). The client fetches `/files/*` with
+                Unity's own transport, which validates our self-signed cert and
+                drops the request without logging anything -- so those fetches
+                are served over http instead, where no validation happens. The
+                mod's `Static` backend url must name the same port.
   --cert PATH   TLS certificate PEM (default <root>/aowlspt-tls-cert.pem)
   --key PATH    TLS private key PEM (default <root>/aowlspt-tls-key.pem)
   --gen-cert    generate the self-signed cert+key and exit, without serving
@@ -1893,6 +1908,13 @@ proc main(): int =
   var genCertOnly = false
   var certPath = ""
   var keyPath = ""
+  # The plain-HTTP asset listener. 80 is the default because it is the port a
+  # bare `http://127.0.0.1` names, which is what the tarkov mod puts in
+  # `backend.Static` -- keeping the url portless keeps it out of reach of the
+  # client's host parsing. `--asset-port 0` turns it off; anything else moves
+  # it, and the mod's `AssetUrl` has to be moved to match.
+  var assetPort = 80
+  var assetPortSet = false
   var i = 1
   let n = paramCount()
   while i <= n:
@@ -1912,6 +1934,18 @@ proc main(): int =
         if any:
           gPort = v
           portSet = true
+    elif a == "--asset-port":
+      inc i
+      if i <= n:
+        var v = 0
+        var any = false
+        for ch in paramStr(i):
+          if ch >= '0' and ch <= '9':
+            v = v * 10 + (ord(ch) - ord('0'))
+            any = true
+        if any:
+          assetPort = v
+          assetPortSet = true
     elif a == "--tls":
       tlsMode = true
     elif a == "--cert":
@@ -2211,6 +2245,42 @@ proc main(): int =
   let scheme = if tlsMode: "https" else: "http"
   modhost.okLog "listening on " & scheme & "://127.0.0.1:" & $gPort
   console.line "  port  " & $gPort & (if tlsMode: " (TLS)" else: "")
+
+  # The plain-HTTP asset listener, opened only in TLS mode -- a plain run is
+  # already entirely plain and has nothing to gain from a second socket on the
+  # same terms.
+  #
+  # Opened *after* the main listener is up, so a server that could not start at
+  # all never leaves a bound port behind, and never fatal: losing this port
+  # costs the asset fetches that are not already in the client's own cache, and
+  # costs nothing else. `/client/*` is unaffected either way -- it goes over
+  # TLS on `gPort` and the client accepts our certificate there.
+  #
+  # 80 is very often held on a Windows box (IIS, the WinNAT/Hyper-V reservation,
+  # Skype's old habit), so the failure is a normal thing to meet rather than an
+  # exotic one, and it says what to do about it.
+  if tlsMode and assetPort > 0:
+    if cNetListenPlain(int32(assetPort)) != 0'i32:
+      modhost.okLog "asset listener on http://127.0.0.1:" & $assetPort
+      console.line "  asset " & $assetPort & " (plain HTTP)"
+    else:
+      let who = portHolder(assetPort)
+      console.err "could not listen on asset port " & $assetPort &
+                  (if who.len > 0: ", held by " & who else: "")
+      console.line "    Assets (trader and quest icons, bundles) are fetched by"
+      console.line "    Unity's own transport, which rejects this server's"
+      console.line "    self-signed certificate silently -- so without this"
+      console.line "    plain-HTTP port only assets already in the client's"
+      console.line "    local cache will appear."
+      console.line "    Pick a free port with --asset-port N, and set the tarkov"
+      console.line "    mod's AssetUrl to http://127.0.0.1:N to match."
+      modhost.warn "asset port " & $assetPort & " unavailable" &
+                   (if who.len > 0: " (held by " & who & ")" else: "") &
+                   "; uncached asset fetches will fail"
+  elif tlsMode and assetPortSet:
+    console.line "  asset disabled (--asset-port 0)"
+    modhost.warn "asset listener disabled; uncached asset fetches will fail"
+
   console.line ""
   console.line "  serving. Ctrl-C to stop."
 
