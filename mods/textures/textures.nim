@@ -58,6 +58,9 @@ const
 type
   Settings = object
     enabled: bool
+    swapMode: string         ## "off" | "probe" | "match" | "full"
+    hookAsync: bool          ## also hook get_asset (a thunk on this build)
+    armDelayMs: int          ## how long after load before arming (past boot)
     quality: string          ## "off" | "2k" | "4k"
     vramBudgetMB: int
     minConfidence: float
@@ -71,7 +74,8 @@ type
     packRoot: string         ## where the replacement images live on disk
 
 proc defaultSettings(): Settings =
-  Settings(enabled: true, quality: "2k", vramBudgetMB: 1024,
+  Settings(enabled: true, swapMode: "off", hookAsync: false, armDelayMs: 15000,
+           quality: "2k", vramBudgetMB: 1024,
            minConfidence: 0.5, logMatches: true,
            catMetal: true, catWood: true, catConcrete: true,
            catBrick: true, catFabric: true, catGround: false,
@@ -89,6 +93,9 @@ proc sText(key: string; d: string): string = setting(key).asText(d)
 proc loadConfig() =
   gCfg = defaultSettings()
   gCfg.enabled = sBool("enabled", gCfg.enabled)
+  gCfg.swapMode = sText("swapMode", gCfg.swapMode)
+  gCfg.hookAsync = sBool("hookAsync", gCfg.hookAsync)
+  gCfg.armDelayMs = sInt("armDelayMs", gCfg.armDelayMs)
   gCfg.quality = sText("quality", gCfg.quality)
   gCfg.vramBudgetMB = sInt("vramBudgetMB", gCfg.vramBudgetMB)
   gCfg.minConfidence = sFloat("minConfidence", gCfg.minConfidence)
@@ -124,6 +131,15 @@ proc texturesSchema(): seq[Setting] =
     boolSetting("enabled", "Enable texture replacement", true,
                 category = "General",
                 description = "Master switch. Off means stock textures, no hooks."),
+    enumSetting("swapMode", "Swap mode", "off",
+                @["off", "probe", "match", "full"], category = "General",
+                description = "Escalation ladder. off: install nothing. probe: install the verified LoadAsset hook, count firings only (proves the hook is safe). match: also name-match against the manifest (no pixels). full: also upload the replacement texture. Escalate one rung at a time."),
+    intSetting("armDelayMs", "Arm delay (ms)", 15000, lo = 0, hi = 120000,
+               step = 1000, category = "General",
+               description = "How long after load before hooks are installed. Deferred past the boot bundle-load storm, which is where the naive version crashed. The mod also waits for the Unity main-thread drain to be live."),
+    boolSetting("hookAsync", "Hook async loads (get_asset)", false,
+                category = "General", implemented = false,
+                description = "Off: on build 1.1.0.1.46777 AssetBundleRequest::get_asset resolves to a tail-jump thunk, which is unsafe to postfix. Only enable once verified on your build."),
     enumSetting("quality", "Quality tier", "2k", @["off", "2k", "4k"],
                 category = "General",
                 description = "2K is shipped; 4K needs the 4K pack downloaded and degrades to 2K when absent."),
@@ -244,24 +260,31 @@ proc onLoad(): Status =
     info "textures is client-only; nothing to do on this side"
     return Ok
 
-  if not gCfg.enabled:
-    info "textures  disabled in config; no hooks installed"
-    return Ok
-  if gCfg.quality == "off":
-    info "textures  quality is off; no hooks installed"
+  if not gCfg.enabled or gCfg.quality == "off" or gCfg.swapMode == "off":
+    info "textures  swapMode=off (or disabled): no hooks will be installed, " &
+         "the game uses stock textures. Escalate with swapMode probe -> match " &
+         "-> full in config.json once boot is confirmed stable."
     return Ok
   if entryCount() == 0:
     return Ok   # already warned; stay a NO-OP
 
+  # Nothing is armed here. Arming is deferred to onUpdate so no hook is
+  # installed during the boot bundle-load storm — that is where the first live
+  # test crashed. `configureSwap` only records the intent.
   setFilter(gCfg.minConfidence, catAllowList())
-  discard armSwap(gCfg.vramBudgetMB, tierName())
+  configureSwap(gCfg.swapMode, gCfg.vramBudgetMB, tierName(),
+                gCfg.hookAsync, gCfg.armDelayMs)
+  info "textures  will arm in mode '" & gCfg.swapMode & "' ~" &
+       $(gCfg.armDelayMs div 1000) & "s after load, once the Unity drain is live"
   Ok
 
 proc onUpdate(elapsedMs: int64): Status =
   if side() != sideClient:
     return Ok
   inc gTicks
+  # Deferred, verified arming: a no-op every tick until it is safe, then once.
   if not swapArmed():
+    discard maybeArm()
     return Ok
   let now = nowMs()
   if now - gLastReadoutMs >= 10000'i64:

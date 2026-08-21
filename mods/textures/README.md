@@ -52,21 +52,23 @@ each reading the returned `Texture2D`, matching it **by name**, and swapping
 `__result` for a `Texture2D` built from a loose image via `LoadImage` + `Apply`.
 
 The aowlspt host exposes exactly the primitive those patches used —
-`hookReturn`, a postfix x64 detour that is handed the return value and may
-replace it. So `swap.nim` installs the same two interceptions:
+`hookReturn`, a postfix x64 detour that is handed the return value. So `swap.nim`
+installs the interception on the sync bundle load:
 
 ```
-UnityEngine.AssetBundle::LoadAsset         (sync bundle load)
-UnityEngine.AssetBundleRequest::get_asset  (async bundle load)
+UnityEngine.AssetBundle::LoadAsset         (sync bundle load — hooked)
+UnityEngine.AssetBundleRequest::get_asset  (async — OFF: a thunk on this build)
 ```
 
 The postfix reads the returned object, calls `get_name` on it, lowercases,
-looks the name up in the manifest, and — on a hit within the VRAM budget — is
-positioned to build the replacement `Texture2D` and `replaceResult` with it.
-Crucially, these methods run **on the Unity main thread** (the game calls them
+looks the name up in the manifest, and — on a hit within the VRAM budget —
+decodes the replacement **into the returned `Texture2D` in place** (so every
+material already referencing it updates; there is no return handle to replace).
+Crucially, `LoadAsset` runs **on the Unity main thread** (the game calls it
 there), which is the only thread on which a texture may legally be created and
-uploaded — so the swap site satisfies the thread affinity for free, and the
-bridge's per-frame drain (`onMainThread`) is available for any deferred work.
+uploaded — so the swap site satisfies the thread affinity for free. The
+**async `get_asset` path is off by default**: on build 1.1.0.1.46777 it resolves
+to a tail-jump thunk (see *Crash-proofing* below).
 
 ## What works today vs what the live client must confirm
 
@@ -74,9 +76,9 @@ bridge's per-frame drain (`onMainThread`) is available for any deferred work.
 |---|---|
 | Offline pipeline + curated 512-entry tiered manifest | **working** (committed output) |
 | Manifest load, name lookup, VRAM budgeting | **working** (`aowl run` self-test) |
-| Postfix hook registration on the two targets | **coded**, NO-OP if the detour can't bind |
-| Name-match of intercepted textures against the manifest | **coded** — runs live once hooks bind |
-| Building a `Texture2D` from image bytes and swapping it | **implemented** (see below) |
+| Prologue-verified LoadAsset hook, deferred past boot | **coded** — refuses on mismatch, NO-OP |
+| Name-match of intercepted textures against the manifest | **coded** — `match`/`full` modes |
+| Building a `Texture2D` from image bytes and swapping it | **implemented** — `full` mode |
 
 **The upload path is now implemented end to end, entirely mod-side.** A mod DLL
 runs in the game process, so `openIl2Cpp()` binds the loaded `GameAssembly.dll`
@@ -101,14 +103,48 @@ pixels. No host ABI change was needed: the only library change is the additive
 `eArrayNew` runtime-table entry, and the byte-copy is a local `{.emit.}` in
 `swap.nim` (so nothing the host or other worktrees are editing is touched).
 
-**What the live client must still confirm:** (a) whether the two targets
-**detour by name** on the hardened 1.1.0.1.46777 build — `abi/aowlspt_bridge.h`
-notes `MethodInfo.methodPointer` is null for many methods, so a by-name `patch`
-can fail; if it does, `armSwap` NO-OPs and the durable fix is a static RVA for
-`UnityEngine.AssetBundle::LoadAsset` (resolvable with
-`tools/il2cpp_resolve.py`). (b) that the bound `LoadImage` is the `byte[]`
-overload and not a `NativeArray<byte>` one — the mod's arm log names which method
-it bound, so this is a one-line live check.
+## Crash-proofing (the first live test crashed at boot)
+
+The naive version loaded fine and then crashed the game before the menu.
+Investigation against the real `D:/Games/Tarkov/GameAssembly.dll` (build
+1.1.0.1.46777) with `tools/il2cpp_resolve.py` found two hazards, and the mod is
+now built to avoid both:
+
+- **`AssetBundleRequest::get_asset` @ RVA `0xb196c0` is a tail-jump virtual-
+  dispatch thunk** (`48 8B 11 … 48 FF E0`), not a real method body. Postfix-
+  detouring a thunk is unsafe, so the async path is **off by default**
+  (`hookAsync`). Only `AssetBundle::LoadAsset` (RVA `0x5250100`/`0x5250340`, a
+  clean relocatable prologue) is hooked.
+- **A wrong code pointer corrupts the game.** The host resolves a patch target
+  by name → `MethodInfo.methodPointer`, which the bridge showed is null (or
+  unreliable) for many methods on this build. Patching a wrong address makes the
+  game run corruption on the next bundle load. So before installing, the mod
+  resolves the method exactly as the host will and **byte-verifies its prologue**
+  against the known-good bytes for this build (`LoadAssetProlog` in `swap.nim`).
+  A mismatch or a null pointer **aborts the install** — no patch, no crash.
+
+On top of that, the mod is **crash-proof by construction**:
+
+1. **Nothing during boot.** Arming is *deferred* (`armDelayMs`, default 15 s) and
+   waits until the host's Unity main-thread drain is live — so no hook exists
+   during the boot bundle-load storm, which is where the crash was.
+2. **A staged `swapMode` ladder** (`off` → `probe` → `match` → `full`), so the
+   hook install, the per-asset name-match, and the pixel upload can each be
+   enabled and confirmed independently. **Ships in `off`.**
+3. **Every pointer is guarded** — `VirtualQuery`-checked committed-and-readable
+   before it is read — and the upload runs only in `full` mode, only after
+   arming (never during boot), only within the VRAM budget. Any failure keeps
+   the stock texture.
+
+**Escalation:** set `swapMode` to `probe` first (installs the verified hook,
+counts firings, touches no asset — proves the install is safe). If the game
+still boots, move to `match` (name-match, no pixels), then `full` (upload). One
+rung at a time.
+
+**What the live client still reports:** whether `LoadAsset`'s prologue verifies
+(the arm log prints the bytes and the verdict), and — in `full` mode — that the
+bound `LoadImage` is the `byte[]` overload not a `NativeArray<byte>` one (the arm
+log names the method). If verification refuses, the mod NO-OPs and logs why.
 
 ## VRAM
 
@@ -129,6 +165,9 @@ covers huge screen area and is the heaviest surface class on VRAM.
 | key | default | meaning |
 |---|---|---|
 | `enabled` | `true` | master switch; off installs no hooks |
+| `swapMode` | `"off"` | escalation ladder: `off` / `probe` / `match` / `full` |
+| `armDelayMs` | `15000` | delay before arming, to clear the boot bundle storm |
+| `hookAsync` | `false` | also hook `get_asset` (a thunk on this build — leave off) |
 | `quality` | `"2k"` | `off` / `2k` / `4k` (4K degrades to 2K when absent) |
 | `vramBudgetMB` | `1024` | hard resident-VRAM cap |
 | `minConfidence` | `0.5` | runtime name-match confidence floor |
