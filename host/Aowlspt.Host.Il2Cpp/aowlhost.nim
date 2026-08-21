@@ -2360,6 +2360,14 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
            "frame count")
   return true
 
+const gBridgeEnabled* = false
+  ## The per-frame `TarkovApplication::Update` detour BINDS but crashes the live
+  ## client within seconds (the drain never fires, the game dies -- verified
+  ## 2026-08-20): the 16-byte prologue steal/relocation corrupts Update. Kept off
+  ## by default so the host stays stable (the queue falls back to the host thread,
+  ## exactly as before the bridge existed); flip to true only once the detour is
+  ## proven not to crash. Graphics/overlay do NOT need this -- they hook D3D11.
+
 proc bindMainDrain(verbose: bool): bool =
   ## Detours a method Unity calls once per frame on its main thread, so that
   ## `invoke_main` can be drained from *there* rather than from the host's own
@@ -3254,7 +3262,10 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       # indexes `gPatches` by slot, so the host's own hook has to claim slot 0
       # before a mod can claim it. Failing here is not fatal -- the queue keeps
       # running on this thread, which is what it did before any of this existed.
-      if not bindMainDrain(true):
+      if not gBridgeEnabled:
+        info "main-thread bridge disabled (unstable detour, see gBridgeEnabled);" &
+             " invoke_main runs on the host's own thread"
+      elif not bindMainDrain(true):
         warn "no per-frame method could be detoured, so invoke_main runs on " &
              "the host's own thread (" & $int(gHostThreadId) & ") and not " &
              "Unity's; a callback that touches a Unity object is unsafe"
@@ -3381,7 +3392,7 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
     # a game type, and the game's own types come up long after the runtime
     # does -- resolving once at boot would report a false negative for the rest
     # of the session. Quiet after the first attempt: the reasons do not change.
-    if gDrainSlot < 0 and gReady and now >= nextBindTry:
+    if gBridgeEnabled and gDrainSlot < 0 and gReady and now >= nextBindTry:
       nextBindTry = now + 5000'u64
       if bindMainDrain(false):
         okLog "the main-thread drain bound late, on " & gDrainMethod
