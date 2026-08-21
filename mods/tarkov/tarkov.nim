@@ -2547,7 +2547,13 @@ proc registerRoutes() =
   # screen (the traders list never settled, the mode-select portrait took a
   # minute or two). One prefix route answers every one of them with a
   # placeholder PNG so the retry storm never starts. See `onFiles`.
+  #
+  # Post-1.0 resolves these against its asset-CDN base, whose url carries a
+  # `/regular` path prefix, so once the host's `imageCdnRedirect` steers that
+  # CDN host here the requests arrive as `/regular/files/...`. Registered
+  # alongside the bare `/files/` spelling so both resolve.
   discard servePrefix("/files/", onFiles)
+  discard servePrefix("/regular/files/", onFiles)
 
   # Static tables
   discard serve("/client/items", onItems)
