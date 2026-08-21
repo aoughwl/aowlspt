@@ -375,6 +375,16 @@ proc cBridgeRenderTargetAt(i: int32): Il2CppPtr {.
   importc: "aowl_bridge_render_target_at", nodecl.}
 proc cBridgeRenderTargetName(i: int32): Il2CppPtr {.
   importc: "aowl_bridge_render_target_name", nodecl.}
+# Probing a live MethodInfo for where (if anywhere) an executable code pointer
+# sits on this build, when offset 0 (`methodPointer`) reads null.
+proc cReadPtrAt(p: Il2CppPtr; off: int32): Il2CppPtr {.
+  importc: "aowl_read_ptr", nodecl.}
+proc cIsReadable(p: Il2CppPtr; size: int32): int32 {.
+  importc: "aowl_is_readable", nodecl.}
+proc cInIl2cpp(p: Il2CppPtr): int32 {.
+  importc: "aowl_in_il2cpp_section", nodecl.}
+proc cIl2cppRvaOf(p: Il2CppPtr): int64 {.
+  importc: "aowl_il2cpp_rva_of", nodecl.}
 proc cBeOpened(): int32 {.importc: "aowl_be_guard_opened", nodecl.}
 
 # The IL2CPP readiness flag, armed in the same constructor and set on the
@@ -740,6 +750,21 @@ var gDisableDrain = false
 ## on it runs once, on the drain thread, and only after the managed-call proof
 ## has shown that thread is really Unity's.
 var gUiProbe = false
+
+## Default-off aggressive resolution: when `aowlspt-host.json` sets
+## `bridgeDeepScan`, and offset 0 of a candidate's live `MethodInfo` reads null,
+## the host scans the rest of the struct for an executable pointer INTO the
+## il2cpp section and, if it finds one, hooks it. This is the decisive attempt at
+## the one build where `methodPointer` is null: the code pointer may be stored at
+## a different offset (`virtualMethodPointer`, an invoker) that hardening left
+## populated. It can crash if the found pointer is a wrong-but-real function, so
+## it is opt-in; the always-on diagnostic below logs the layout either way.
+var gDeepScan = false
+## How many live-MethodInfo layout dumps have been written. Capped so the first
+## bind pass dumps every candidate (there are only a handful) and the five-second
+## retry loop does not repeat them forever.
+var gMethodInfoDumps = 0
+const MethodInfoDumpCap = 8
 
 # ------------------------------------------------------- logging, helpers
 #
@@ -2646,6 +2671,87 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
            "frame count")
   return true
 
+proc hexOf(v: uint64): string =
+  ## Lowercase hex of a machine word, no `0x`. A local helper because a live
+  ## MethodInfo dump wants pointer values and the codebase's other hex writers
+  ## are fixed-width session ids.
+  const digits = "0123456789abcdef"
+  if v == 0'u64:
+    return "0"
+  var x = v
+  var s = ""
+  while x > 0'u64:
+    s = $digits[int(x and 0xF'u64)] & s
+    x = x shr 4
+  return s
+
+proc dumpMethodInfo(m: Il2CppMethod; spec: string) =
+  ## One guarded dump of a live `MethodInfo`'s first nine words, so that a build
+  ## where offset 0 (`methodPointer`) reads null still yields the one fact that
+  ## decides everything: whether ANY field holds an executable pointer into the
+  ## il2cpp section, and at what offset. Read is gated by `aowl_is_readable`
+  ## (a VirtualQuery, not a faulting dereference), so it is safe on the host
+  ## thread even for a handle that is not the struct it is assumed to be.
+  if m == nil or cIsReadable(m, 0x48'i32) == 0'i32:
+    info "deep-probe: MethodInfo for " & spec & " is not readable"
+    return
+  var line = "deep-probe: MethodInfo " & spec & " ="
+  for k in 0 ..< 9:
+    let off = int32(k * 8)
+    let p = cReadPtrAt(m, off)
+    let insec = cInIl2cpp(p) != 0'i32
+    let code = cIsCodePointer(p) != 0'i32
+    var tag = ""
+    if insec:
+      tag = "(il2cpp+0x" & hexOf(uint64(cIl2cppRvaOf(p))) & ")"
+    elif code:
+      tag = "(exec)"
+    line.add " +" & hexOf(uint64(off)) & "=0x" & hexOf(cast[uint64](p)) & tag
+  okLog line
+
+proc scanMethodPointer(m: Il2CppMethod; foundOff: var int): Il2CppPtr =
+  ## The first field of a live `MethodInfo` that holds an executable pointer INTO
+  ## the il2cpp section -- the code pointer, wherever this build put it. Offset 0
+  ## first (the ordinary `methodPointer`), then 0x08 (`virtualMethodPointer`),
+  ## then the rest. An executable page alone is not trusted; the pointer must be
+  ## in the il2cpp section, which is where compiled managed bodies live and where
+  ## a data or stub pointer is not. Returns nil when no field qualifies.
+  result = cast[Il2CppPtr](0)
+  foundOff = -1
+  if m == nil or cIsReadable(m, 0x48'i32) == 0'i32:
+    return
+  for k in 0 ..< 9:
+    let off = int32(k * 8)
+    let p = cReadPtrAt(m, off)
+    if cIsCodePointer(p) != 0'i32 and cInIl2cpp(p) != 0'i32:
+      foundOff = int(off)
+      return p
+
+proc resolveDrainPointer(m: Il2CppMethod; spec: string;
+                         verbose: bool): Il2CppPtr =
+  ## The full per-candidate resolution used by both binders: the ordinary
+  ## `methodPointer` (offset 0, executable-checked), and -- only when that is
+  ## null -- a one-shot diagnostic dump plus, if `bridgeDeepScan` is set, a scan
+  ## of the rest of the struct for an executable il2cpp pointer to hook instead.
+  result = methodPointer(gRt, m)
+  if result != nil:
+    return
+  if gMethodInfoDumps < MethodInfoDumpCap:
+    inc gMethodInfoDumps
+    dumpMethodInfo(m, spec)
+  if gDeepScan:
+    var off = -1
+    let scanned = scanMethodPointer(m, off)
+    if scanned != nil:
+      warn "deep-scan: " & spec & " has an executable il2cpp pointer at " &
+           "MethodInfo+0x" & hexOf(uint64(off)) & " -> il2cpp+0x" &
+           hexOf(uint64(cIl2cppRvaOf(scanned))) & "; hooking it (may crash if " &
+           "it is a wrong-but-real function -- bridgeDeepScan opted in)"
+      return scanned
+  if verbose:
+    info "no usable code pointer for " & spec
+  return cast[Il2CppPtr](0)
+
 proc bindMainDrain(verbose: bool): bool =
   ## Detours a method Unity calls once per frame on its main thread, so that
   ## `invoke_main` can be drained from *there* rather than from the host's own
@@ -2757,9 +2863,8 @@ proc bindMainDrain(verbose: bool): bool =
     if m == nil:
       if verbose: info typePart & " has no " & member
       continue
-    let fn = methodPointer(gRt, m)
+    let fn = resolveDrainPointer(m, spec, verbose)
     if fn == nil:
-      if verbose: info "no usable code pointer for " & spec
       continue
 
     let pf = candidateIndex < perFrame.len and perFrame[candidateIndex]
@@ -2833,9 +2938,8 @@ proc bindRenderDrain(verbose: bool): bool =
     if m == nil:
       if verbose: info typePart & " has no " & member
       continue
-    let fn = methodPointer(gRt, m)
+    let fn = resolveDrainPointer(m, spec, verbose)
     if fn == nil:
-      if verbose: info "no usable code pointer for " & spec
       continue
     if attachDrain(spec, fn, m, true, verbose, true):
       return true
@@ -3693,6 +3797,11 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
     info "bridgeUiProbe is set: the drain self-test will also instantiate and " &
          "parent Unity UI GameObjects on the Unity thread once, to prove the " &
          "native settings-injection path"
+  gDeepScan = readBoolKey("bridgeDeepScan")
+  if gDeepScan:
+    warn "bridgeDeepScan is set: when methodPointer is null the host will scan " &
+         "the live MethodInfo for an executable il2cpp pointer and hook it -- " &
+         "the decisive attempt on this build, and one that may crash"
 
   let waitMs = readWaitMs()
   info "waiting for the IL2CPP runtime (up to " & $(waitMs div 1000) & "s)"
