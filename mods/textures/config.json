@@ -1,0 +1,28 @@
+{
+  "_comment": "aowl.textures — high-res PBR texture replacement. The mod is safe-by-default: with no manifest, no bound hook, or no upload capability, it does nothing and the game uses stock textures. Every key here is declared in textures.nim's settings schema and editable from the F12 panel.",
+
+  "_enabledComment": "Master switch. False installs no hooks at all.",
+  "enabled": true,
+
+  "_qualityComment": "off | 2k | 4k. 2K is the shipped tier. 4K needs the 4K ambientcg pack downloaded (only 2K is present today) and degrades to 2K when a 4K map is absent.",
+  "quality": "2k",
+
+  "_vramBudgetMBComment": "Hard cap on replacement-texture VRAM. A 2K RGBA32 texture with mips is ~22 MB, so 1024 MB is ~46 resident textures. The manifest is the candidate set; this is the resident cap. Raise it only if you have the headroom.",
+  "vramBudgetMB": 1024,
+
+  "_minConfidenceComment": "Runtime floor on name-match confidence, on top of the already-curated manifest. 0.5 matches the original plugin.",
+  "minConfidence": 0.5,
+
+  "logMatches": true,
+
+  "_categoriesComment": "Per-surface toggles. Ground is off by default: terrain covers huge screen area and is the heaviest on VRAM.",
+  "catMetal": true,
+  "catWood": true,
+  "catConcrete": true,
+  "catBrick": true,
+  "catFabric": true,
+  "catGround": false,
+
+  "_packRootComment": "Absolute path to where the replacement images live. The committed manifest stores paths relative to the TarkovTextures root (e.g. ambientcg/Metal/.../Foo_2K-JPG_Color.jpg), so packRoot must point at that root — or at a self-contained pack assembled by build_pack.py --copy, whose manifest is pack-relative. Empty falls back to the mod's own data/pack. For deployment see README.md: run build_pack.py --copy <install>/mods/textures/data/pack and set packRoot to that (or leave empty to use the data/pack fallback).",
+  "packRoot": "C:/Users/savant/Projects/TarkovTextures"
+}
