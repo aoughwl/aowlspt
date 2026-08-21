@@ -68,6 +68,7 @@ import modhost
 import modcontrol
 import jsonpath
 import aowloverlay
+import aowlgraphics
 import invoke
 
 {.emit: """#include "aowlspt_shim.h" """.}
@@ -83,6 +84,11 @@ import invoke
 ## drained on Unity's own thread even when the runtime hands back no usable
 ## `MethodInfo.methodPointer`. See `aowlspt_bridge.h`.
 {.emit: """#include "aowlspt_bridge.h" """.}
+## Two small client-side UX fixes: the Exit-hang byte patch (static .text, like
+## the BE neuter) and the version-label brand target (a verified PreloaderUI.Awake
+## code pointer the host postfix-detours to rewrite the label on the Unity
+## thread). See `aowlspt_uxpatch.h`.
+{.emit: """#include "aowlspt_uxpatch.h" """.}
 {.emit: """#include "aowlspt_detour.h" """.}
 ## The typed patch frame. Included here as well as through `aowlspt_abi.h`
 ## because this file names its pool directly; the include guard makes the second
@@ -372,6 +378,22 @@ var cBecRestartSeen {.importc: "aowl_bec_restart_seen", nodecl.}: int32
 proc cBeArmed(): int32 {.importc: "aowl_be_guard_armed", nodecl.}
 proc cBeModule(): int32 {.importc: "aowl_be_guard_module", nodecl.}
 proc cBeAnswered(): int32 {.importc: "aowl_be_guard_answered", nodecl.}
+
+# The two UX fixes. `aowl_uxpatch_exit_neuter` is a static .text byte patch that
+# redirects EFT.TarkovApplication.ExitApplication to ExitProcess(0), so the menu
+# Exit closes the game instead of hanging on the absent-launcher handshake.
+# `aowl_uxpatch_version_target` hands back the verified PreloaderUI.Awake code
+# pointer for the host to postfix-detour (the label rewrite is on the Unity
+# thread). See `aowlspt_uxpatch.h`.
+proc cUxExitNeuter(): int32 {.importc: "aowl_uxpatch_exit_neuter", nodecl.}
+var cUxBaseFound {.importc: "aowl_ux_base_found", nodecl.}: int32
+var cUxExitSeen {.importc: "aowl_ux_exit_seen", nodecl.}: int32
+proc cUxVersionTarget(): Il2CppPtr {.
+  importc: "aowl_uxpatch_version_target", nodecl.}
+proc cUxVersionLabelOffset(): int32 {.
+  importc: "aowl_uxpatch_version_label_offset", nodecl.}
+proc cUxWritePtr(p: Il2CppPtr; off: int32; value: Il2CppPtr): int32 {.
+  importc: "aowl_uxpatch_write_ptr", nodecl.}
 
 # The Unity-main-thread bridge's statically-resolved per-frame targets. Each
 # returns a verified code pointer into GameAssembly.dll or nil (wrong build,
@@ -775,6 +797,18 @@ var gSettingsProbe = false
 ## The heavier probe work (managed box proof + field walk) runs once, not every
 ## time the user reopens settings.
 var gSettingsProbeDone = false
+
+## The version-label brand: a POSTFIX detour on `EFT.UI.PreloaderUI::Awake`, its
+## slot, the opt-in flag, and a once-only guard. When armed and the detour fires
+## on the Unity thread (Awake is a MonoBehaviour callback), the handler rewrites
+## the bottom-left version label to "aowlspt <U+2014> <version>" after the
+## original set it. Opt-in (`uxVersionBrand`) because it is the first managed
+## write from a host detour; default-off keeps the shared host safe, and the
+## static Exit fix ships on regardless.
+var gVersionSlot = -1
+var gVersionBrand = false
+var gVersionWrite = false
+var gVersionBranded = false
 
 ## Whether the fragile static-RVA drain path may be used at all. OFF by default:
 ## it bound a real-but-wrong function on the live client and crashed the game, so
@@ -1412,6 +1446,18 @@ proc hostCall(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
     var report = mainThreadReport()
     return cOutCopy(outPtr, outLen, cast[Il2CppPtr](toCString(report)),
                     int32(report.len))
+
+  # The graphics mod pushes its grade here. The args are a compact JSON object
+  # of post-process params; the host forwards them, verbatim, to the native
+  # post-process module. Answered without the runtime because the renderer lives
+  # entirely in D3D11 and has nothing to do with IL2CPP being up.
+  if spec == "aowlspt.host::gfx_apply":
+    graphicsApplyJson(argText)
+    var ack = "{\"ok\":true,\"running\":" &
+              (if graphicsRunning(): "true" else: "false") &
+              ",\"frames\":" & $int(graphicsFrames()) & "}"
+    return cOutCopy(outPtr, outLen, cast[Il2CppPtr](toCString(ack)),
+                    int32(ack.len))
 
   if spec == "aowlspt.host::render_thread":
     var report = renderThreadReport()
@@ -2394,6 +2440,12 @@ proc patchReturned(slot: int32; regs: Il2CppPtr): int32 {.
   ## since had its way with everything else. Harmony's postfix has the same
   ## property for by-value parameters and this host cannot do better.
   let i = int(slot)
+  # The version-brand postfix, by identity, before the generic postfix path --
+  # it is a host drain (meth == nil), so it must be handled here rather than
+  # falling through to the meth-driven code below.
+  if i == gVersionSlot:
+    versionBrandFired(regs)
+    return 0'i32
   if i < 0 or i >= gPatches.len:
     return 0'i32
   if not gPatches[i].live:
@@ -2654,7 +2706,8 @@ proc hostPatchTyped(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
   installPatch(ctx, target, targetLen, kind, cb, user, true)
 
 proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
-                 perFrame: bool; verbose: bool; kind: int32): bool =
+                 perFrame: bool; verbose: bool; kind: int32;
+                 postfix: bool = false): bool =
   ## Installs one of the host's own detours on the code pointer `fn`, through the
   ## same slot table and detour engine a mod's `patch` uses. Shared by the update
   ## drain, the render drain and the settings probe: the verified static targets
@@ -2671,7 +2724,7 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
   ## mod's `patch` on another thread does too. It is the host's own hook, and it
   ## is not exempt from the rule.
   let what = (if kind == 1: "render-phase" elif kind == 2: "settings-probe"
-              else: "main-thread")
+              elif kind == 3: "version-brand" else: "main-thread")
   tablesLock()
   let claimed = cHookClaim()
   if claimed < 0'i32:
@@ -2694,8 +2747,13 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
                      user: cast[Il2CppPtr](0), target: spec,
                      targetC: targetBytes, live: true, meth: meth,
                      wantArgs: false, canSkip: false, modIndex: -1,
-                     isDrain: true, isPostfix: false, typed: false,
+                     isDrain: true, isPostfix: postfix, typed: false,
                      kinds: @[], retKind: 0'u8, frameFlags: 0'u32)
+  # A postfix drain (the version brand) must arm the engine's postfix path before
+  # the jump lands, exactly as a mod's postfix patch does -- so the thunk routes
+  # the firing to `patchReturned` (after the original) rather than `patchFired`.
+  if postfix:
+    cHookSetPostfix(claimed, 1'i32)
   let rc = cHookAttachAt(hook, fn, claimed)
   if rc != 0'i32:
     gPatches[int(claimed)] = deadPatch()
@@ -2711,22 +2769,33 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
     gRenderDrainSlot = int(claimed)
   elif kind == 2:
     gSettingsSlot = int(claimed)
+  elif kind == 3:
+    gVersionSlot = int(claimed)
   else:
     gDrainSlot = int(claimed)
   tablesUnlock()
   if kind == 1:
     gRenderMethod = spec
-  elif kind == 2:
+  elif kind == 2 or kind == 3:
     discard
   else:
     gDrainMethod = spec
     gDrainPerFrame = perFrame
   okLog what & " bound to " & spec & " (" &
         $int(cHookStolen(hook)) & " bytes)" &
-        (if perFrame or kind == 2: "" else:
+        (if perFrame or kind == 2 or kind == 3: "" else:
            "; it runs more than once a frame, so its firing count is not a " &
            "frame count")
   return true
+
+const gBridgeEnabled* = true
+  ## The earlier static-RVA detour crashed the live client (the RVA was a real
+  ## function but NOT the code Unity runs as Update -- this build's metadata
+  ## methodPointers table does not hold the live pointer). The bridge now
+  ## resolves BY NAME via the runtime's own `MethodInfo.methodPointer` (the path
+  ## `fov`/`sain` already use), and is fail-safe: null/non-executable binds
+  ## nothing and the queue falls back to the host thread -- it cannot crash by
+  ## default. `bridgeDisableDrain` in `aowlspt-host.json` is the real off-switch.
 
 proc hexOf(v: uint64): string =
   ## Lowercase hex of a machine word, no `0x`. A local helper because a live
@@ -3186,6 +3255,144 @@ proc bindSettingsProbe(verbose: bool): bool =
       okLog "settings probe armed on " & spec &
             "; open the in-game settings screen to fire it"
       return true
+  result = false
+
+proc looksLikeVersion(s: string): bool =
+  ## A version-ish string: has a digit and a dot, is short, and is otherwise
+  ## printable ASCII. Used to pick the version String field out of a component's
+  ## fields without hard-coding an offset that a future build would move.
+  if s.len == 0 or s.len > 64:
+    return false
+  var hasDigit = false
+  var hasDot = false
+  for ch in s:
+    if ch >= '0' and ch <= '9': hasDigit = true
+    elif ch == '.': hasDot = true
+    elif ord(ch) < 0x20 or ord(ch) > 0x7E: return false
+  result = hasDigit and hasDot
+
+proc versionBrandFired(regs: Il2CppPtr) =
+  ## Fired from the POSTFIX detour on `EFT.UI.PreloaderUI::Awake`, on the Unity
+  ## main thread, *after* the original set the bottom-left version label.
+  ##
+  ## Staged and crash-proof by construction, because a fault here is on the Unity
+  ## thread during boot:
+  ##
+  ##   * READ-ONLY probe (always): log the firing thread, whether `this + 0x20`
+  ##     (Awake's `set_text` receiver, the label component) is readable, and the
+  ##     component's class -- then scan the component's fields for managed
+  ##     `System.String`s and log the version-looking one's offset and value.
+  ##     Nothing is written; this isolates "does the postfix reach the Unity
+  ##     thread and read cleanly" from "does a managed write crash".
+  ##   * FIELD-WRITE brand (opt-in `uxVersionBrandWrite`): allocate a branded
+  ##     `System.String` and write its pointer straight into that field by offset
+  ##     -- NO `runtime_invoke` and NO `findMethod` (both faulted on this
+  ##     protected build; a raw field write is what `fov`/`sain` do). The write
+  ##     slot is VirtualQuery-guarded before the store.
+  ##
+  ## Every dereference is `aowl_is_readable`-guarded, class-name reads go through
+  ## the SEH-guarded `classNameSafe`, and the whole thing runs at most once. Any
+  ## doubt -> leave the stock version, never crash.
+  if gVersionBranded:
+    return
+  gVersionBranded = true          # once only, whatever the outcome below
+
+  let tid = int(cThreadId())
+  let onHost = (tid == int(gHostThreadId))
+  okLog "version probe: PreloaderUI.Awake postfix fired on thread " & $tid &
+        (if onHost: " (HOST thread -- unexpected; NOT Unity's)"
+         else: " (NOT the host thread -> Unity's main thread)")
+
+  let selfRaw = cRegsInt(regs, 0'i32)          # RCX = the PreloaderUI `this`
+  if selfRaw == 0'u64:
+    warn "version probe: `this` is null; nothing to read"
+    return
+  let self = cast[Il2CppPtr](selfRaw)
+  let off = cUxVersionLabelOffset()
+  if cIsReadable(self, off + 8'i32) == 0'i32:
+    warn "version probe: this+0x" & hexOf(uint64(off)) & " is not readable"
+    return
+  let label = hReadPtr(self, off)
+  if label == nil or cIsReadable(label, 0x20'i32) == 0'i32:
+    warn "version probe: label component (this+0x" & hexOf(uint64(off)) &
+         ") is null or not readable"
+    return
+  let lcls = objectClass(gRt, label)
+  let lname = (if lcls == nil: "<null>" else: classNameSafe(gRt, lcls))
+  okLog "version probe: label component at this+0x" & hexOf(uint64(off)) &
+        " is readable, class=" & lname
+
+  # Read-only scan for managed String fields on the component, to locate the
+  # text-backing String (its offset moves between builds, so it is found rather
+  # than assumed). Every step is guarded; classNameSafe swallows a bogus class.
+  var textField = -1
+  var textVal = ""
+  var o = 0x10
+  while o <= 0x180:
+    if cIsReadable(label, int32(o + 8)) != 0'i32:
+      let fp = hReadPtr(label, int32(o))
+      if fp != nil and cIsReadable(fp, 0x18'i32) != 0'i32:
+        let fcls = objectClass(gRt, fp)
+        if fcls != nil and classNameSafe(gRt, fcls) == "String":
+          let s = readString(gRt, fp)
+          if s.len > 0 and s.len <= 64:
+            okLog "version probe: String field +0x" & hexOf(uint64(o)) &
+                  " = \"" & s & "\""
+            if textField < 0 and looksLikeVersion(s):
+              textField = o
+              textVal = s
+    o = o + 8
+
+  if not gVersionWrite:
+    okLog "version probe: read-only (set uxVersionBrandWrite to attempt a " &
+          "field-write brand; no managed write was performed)"
+    return
+
+  # ---- opt-in field-write brand: newString + raw field store, no invoke ----
+  if textField < 0:
+    warn "version brand: no version-looking String field found on the label " &
+         "component; not writing (stock version left in place)"
+    return
+  if textVal.startsWith("aowlspt"):
+    return                                      # already ours
+  # "aowlspt <U+2014 em dash> <version>", em dash as explicit UTF-8 bytes so the
+  # source stays ASCII; il2cpp_string_new takes UTF-8.
+  let branded = "aowlspt \xE2\x80\x94 " & textVal
+  let ns = newString(gRt, branded)
+  if ns == nil or cIsReadable(ns, 0x14'i32) == 0'i32:
+    warn "version brand: newString failed or returned an unreadable String; " &
+         "not writing"
+    return
+  okLog "version brand: allocated branded String ok; writing it into label " &
+        "field +0x" & hexOf(uint64(textField))
+  if cUxWritePtr(label, int32(textField), ns) != 0'i32:
+    okLog "version brand: field +0x" & hexOf(uint64(textField)) &
+          " set to \"" & branded & "\" (field write, no set_text call)"
+  else:
+    warn "version brand: field slot +0x" & hexOf(uint64(textField)) &
+         " was not safely writable; left unchanged"
+
+proc bindVersionBrand(verbose: bool): bool =
+  ## Installs the POSTFIX detour on `EFT.UI.PreloaderUI::Awake` from the verified
+  ## static target in `aowlspt_uxpatch.h`. Opt-in (`uxVersionBrand`); like the
+  ## drains it binds nothing on a build whose prologue does not match, so it is a
+  ## no-op rather than a hazard on any other build. If PreloaderUI.Awake already
+  ## ran before this armed, the label is simply left unbranded (fail-safe) --
+  ## there is no crash and nothing else is affected.
+  if gVersionSlot >= 0:
+    return true
+  if not gReady or gDisableDrain:
+    return false
+  let fn = cUxVersionTarget()
+  if fn == nil:
+    if verbose:
+      info "version brand: PreloaderUI.Awake did not verify on this build"
+    return false
+  if attachDrain("EFT.UI.PreloaderUI::Awake", fn, cast[Il2CppMethod](0),
+                 false, verbose, 3'i32, true):
+    okLog "version brand armed on EFT.UI.PreloaderUI::Awake (postfix); the " &
+          "bottom-left version label will read \"aowlspt — <version>\""
+    return true
   result = false
 
 proc hostEventSubscribe(ctx: Il2CppPtr; name: Il2CppPtr; nameLen: int32;
@@ -3818,6 +4025,25 @@ proc reportRuntime() =
          ", OnRequestRestart seen=" & $cBecRestartSeen &
          "); offsets may not match this client build"
 
+  # Exit-hang fix: with no BsgLauncher, confirming Exit spins forever on an
+  # exit-loading screen (the async shutdown started at the confirm-accept lambda
+  # never completes). Redirect the confirm-accept lambda (primary) and
+  # ExitApplication (backstop) to a clean ExitProcess(0) -- static .text byte
+  # patches, same discipline as the BE neuter above, firing before the async
+  # work. Fail-safe: a site whose prologue does not match this build is skipped.
+  let exitLanded = cUxExitNeuter()
+  if exitLanded >= 1'i32:
+    okLog "exit fix: confirmed Exit redirected to ExitProcess(0) (" &
+          $exitLanded & "/2 sites; primary = the confirm-accept lambda, before " &
+          "the async exit-loading shutdown that was hanging)"
+  elif cUxBaseFound == 0:
+    warn "exit fix: GameAssembly.dll not found; Exit still hangs"
+  elif cUxExitSeen == 0:
+    warn "exit fix: no exit prologue matched this build; Exit not patched " &
+         "(Exit still hangs, nothing worse)"
+  else:
+    warn "exit fix: an exit prologue matched but the patch write failed"
+
   var count = 0
   let assemblies = domainGetAssemblies(gRt, gDomain, count)
   if assemblies == nil:
@@ -4036,6 +4262,20 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
     info "bridgeSettingsProbe is set: a read-only detour on SettingsScreen.Show " &
          "will log the thread it fires on when you open the settings screen " &
          "(Experiment A -- confirms a detour reaches the Unity thread)"
+  gVersionBrand = readBoolKey("uxVersionBrand")
+  gVersionWrite = readBoolKey("uxVersionBrandWrite")
+  if gVersionWrite:
+    gVersionBrand = true          # the write path needs the probe armed
+  if gVersionBrand:
+    info "uxVersionBrand is set: a postfix detour on PreloaderUI.Awake will " &
+         "probe the version label on the Unity thread" &
+         (if gVersionWrite:
+            " and (uxVersionBrandWrite) attempt a field-write brand to " &
+            "\"aowlspt <em dash> <version>\" -- no runtime_invoke"
+          else:
+            " (read-only: logs thread, readability, class, and String fields; " &
+            "no managed write)") &
+         " (fail-safe: unbranded if the build or timing does not match)"
 
   let waitMs = readWaitMs()
   info "waiting for the IL2CPP runtime (up to " & $(waitMs div 1000) & "s)"
@@ -4058,7 +4298,10 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       # indexes `gPatches` by slot, so the host's own hook has to claim slot 0
       # before a mod can claim it. Failing here is not fatal -- the queue keeps
       # running on this thread, which is what it did before any of this existed.
-      if not bindMainDrain(true):
+      if not gBridgeEnabled:
+        info "main-thread bridge disabled (unstable detour, see gBridgeEnabled);" &
+             " invoke_main runs on the host's own thread"
+      elif not bindMainDrain(true):
         warn "no per-frame method could be detoured, so invoke_main runs on " &
              "the host's own thread (" & $int(gHostThreadId) & ") and not " &
              "Unity's; a callback that touches a Unity object is unsafe"
@@ -4073,6 +4316,13 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       # now and fires the first time the user opens the settings screen.
       if gSettingsProbe and not bindSettingsProbe(true):
         info "the settings probe did not verify SettingsScreen.Show on this build"
+
+      # Version-label brand (opt-in). Static code, so it installs now and fires
+      # when PreloaderUI.Awake runs on its way to the menu. Fail-safe if the
+      # prologue does not match or if Awake already ran before this armed.
+      if gVersionBrand and not bindVersionBrand(true):
+        info "version brand did not arm (PreloaderUI.Awake unverified on this " &
+             "build, or drain disabled)"
 
   let modsDir = joinPath(gDir, "mods")
   # The runtime may not have come up, and that deliberately does not stop this:
@@ -4104,6 +4354,28 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
                       modhost.modVersionOf(i), true)
   else:
     warn "the overlay did not start: " & overlayStatus()
+
+  # Full-frame post-process (aowl.graphics). Both this and the overlay want to
+  # detour DXGI Present, and the detour engine refuses a second hook on the same
+  # function (error -9) — so they cannot each install one. When the overlay is
+  # up it owns the Present hook, and graphics runs from the overlay's pre-present
+  # callback: grade the raw frame first, overlay UI composites on top. When the
+  # overlay is absent (it is being retired for native settings), graphics owns
+  # its own Present hook. Either way a failure is a missing effect, never fatal:
+  # the C side latches broken and the pass becomes a no-op.
+  if overlayRunning():
+    if graphicsStartDriven():
+      overlaySetPrePresent(graphicsGradePtr())
+      overlaySetPreResize(graphicsReleasePtr())
+      okLog "graphics post-process ready (via the overlay Present hook) — " &
+            graphicsStatus()
+    else:
+      warn "the graphics post-process did not start: " & graphicsStatus()
+  else:
+    if graphicsStart():
+      okLog "graphics post-process ready (own Present hook) — " & graphicsStatus()
+    else:
+      warn "the graphics post-process did not start: " & graphicsStatus()
 
   # The mods are up, so the host can start answering the manager. Before this
   # point a control request is ignored rather than queued.
@@ -4186,7 +4458,7 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
     # a game type, and the game's own types come up long after the runtime
     # does -- resolving once at boot would report a false negative for the rest
     # of the session. Quiet after the first attempt: the reasons do not change.
-    if gDrainSlot < 0 and gReady and now >= nextBindTry:
+    if gBridgeEnabled and gDrainSlot < 0 and gReady and now >= nextBindTry:
       nextBindTry = now + 5000'u64
       if bindMainDrain(false):
         okLog "the main-thread drain bound late, on " & gDrainMethod
