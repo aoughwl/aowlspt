@@ -73,6 +73,18 @@ import emu/selfchecks
 const
   ModGuid = "aowl.tarkov"
   ServerName = "aowlspt"
+  BackendUrl = "https://127.0.0.1"
+    ## The base every backend url in `/client/game/config` points at -- this
+    ## server. The client resolves the session's Trading/RagFair/Messaging
+    ## endpoints against it AND, crucially, resolves `/files/*` image urls
+    ## (trader avatars, handbook icons, quest images) against `backend.Static`.
+    ## Leave `Static` unset and the client falls back to its baked default (the
+    ## real BSG asset CDN, `s3-prod.escapefromtarkov.com`), which is unreachable
+    ## here -- so the image never loads, the avatar spins forever, and nothing
+    ## is ever requested from this backend (the live symptom: zero `GET /files/`
+    ## in the log while the traders screen span). Pointing `Static` here is what
+    ## makes the image request arrive at all. No port: the client reaches this
+    ## backend's TLS listener on 443, the same base the main routes use.
 
 var gRequests = 0
 var gEdition = "standard"
@@ -186,10 +198,18 @@ proc onGameConfig(url, body, session: string): string =
   ## backend urls it should use for the rest of the session.
   let p = currentProfile(session)
   var backend = obj()
-  put(backend, "Main", "")
-  put(backend, "Trading", "")
-  put(backend, "Messaging", "")
-  put(backend, "RagFair", "")
+  put(backend, "Main", BackendUrl)
+  put(backend, "Trading", BackendUrl)
+  put(backend, "Messaging", BackendUrl)
+  put(backend, "RagFair", BackendUrl)
+  # `Lobby` and `Static` are read by the client too -- the matchmaking lobby and
+  # the asset CDN. Point both at this backend so nothing reaches for the real
+  # BSG hosts. `Static` is the one that was missing: it is the base the client
+  # resolves every `/files/*` image against, so without it the trader avatars,
+  # handbook icons and quest images went to the real S3 CDN and spun forever
+  # while this backend saw not a single `/files/` request. See `BackendUrl`.
+  put(backend, "Lobby", BackendUrl)
+  put(backend, "Static", BackendUrl)
   var o = obj()
   put(o, "aid", if p.ok: p.field("aid").asInt(0) else: 0)
   put(o, "lang", "en")
