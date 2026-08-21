@@ -40,6 +40,40 @@ const
   ## stack works with or without an item database loaded.
   Roubles* = "5449016a4bdc2d6f028b456f"
 
+  ## The equipment root every character hangs its worn gear off.
+  DefaultInventoryTpl* = "55d7217a4bdc2d86028b456d"
+
+  ## Pockets, and **not optional**.
+  ##
+  ## `EFT.Player::HasMarkOfUnknown` (GameAssembly RVA 0x726c40) is the reason.
+  ## It walks
+  ##
+  ##     Player.InventoryController        (virtual, vtable slot +0xa68)
+  ##       .Inventory                      (+0x100)
+  ##       .Equipment                      (+0x18)
+  ##       .Slots[8]                       (+0x90, array; index 8 is Pockets in
+  ##                                        EFT.InventoryLogic.EquipmentSlot)
+  ##       .ContainedItem                  (virtual get_ContainedItem)
+  ##       .Slots                          (+0x80, the pocket sub-slots)
+  ##
+  ## and every one of those loads is followed by `test rax,rax / je 0x726e5f`,
+  ## where 0x726e5f is the throw-NullReference helper. In particular the
+  ## `ContainedItem` at +0x726d51 is checked and **thrown on**, so a Pockets slot
+  ## with nothing in it is not "no mark of unknown", it is an exception.
+  ##
+  ## `BotsGroup..ctor` calls `IsPlayerEnemy` over every player in the raid, which
+  ## reaches this through `BotsGroupMarkOfUnknown.HasMarkOfUnknown`. The throw
+  ## unwinds out of `BotSpawner.GetGroupAndSetEnemies`, so the bot being
+  ## activated never reaches `GameWorld.RegisterPlayer` -- which is exactly the
+  ## "the server generates 28 bots and three ever appear" symptom, once per bot,
+  ## forever, because our profile had an equipment root with nothing on it.
+  ##
+  ## `627a4e6b255f7527fb05a0f6` is the post-1.0 pockets with `SpecialSlot1..3`,
+  ## which is where a `MarkOfUnknown` (a `SpecItem`) actually lives -- so the
+  ## walk above terminates the way the client expects rather than on an empty
+  ## `Slots` array it never meant to see.
+  PocketsTpl* = "627a4e6b255f7527fb05a0f6"
+
 type
   Profile* = object
     ## A loaded profile. `text` is the whole document; `id` is cached because
@@ -208,8 +242,16 @@ proc newProfileText*(id, nickname, sideName, edition: string;
   var items = arr()
   var equipItem = obj()
   put(equipItem, "_id", equipment)
-  put(equipItem, "_tpl", "55d7217a4bdc2d86028b456d")
+  put(equipItem, "_tpl", DefaultInventoryTpl)
   items.add equipItem
+  # Pockets. See `PocketsTpl` above for why this is load-bearing and not
+  # cosmetic: without it every bot activation in a raid throws.
+  var pocketsItem = obj()
+  put(pocketsItem, "_id", newId())
+  put(pocketsItem, "_tpl", PocketsTpl)
+  put(pocketsItem, "parentId", equipment)
+  put(pocketsItem, "slotId", "Pockets")
+  items.add pocketsItem
   var stashItem = obj()
   put(stashItem, "_id", stash)
   put(stashItem, "_tpl", StandardStash)
@@ -363,6 +405,62 @@ proc newProfileText*(id, nickname, sideName, edition: string;
   put(p, "battlePassDocumentLimitData", obj())
   result = done(p).text
 
+proc replaceValue(text, path, newValue: string): string =
+  ## Replaces the value at a dotted path, leaving the rest of the document
+  ## byte-for-byte. Text surgery rather than reserialisation: the profile holds
+  ## fields this emulator does not model, and a round trip through a builder
+  ## would drop every one of them.
+  ##
+  ## Defined here rather than beside the other editing helpers because
+  ## `ensurePockets` below runs on every load and has to exist before
+  ## `readProfile` does.
+  let target = field(text, path)
+  if not target.found:
+    return text
+  result = text.substr(0, target.first - 1) & newValue &
+           text.substr(target.last + 1)
+
+proc ensurePockets*(p: var Profile): bool =
+  ## Puts a Pockets item on the equipment root of a profile that has none, and
+  ## says whether it had to.
+  ##
+  ## Repairs a profile that was created before this was known to matter. New
+  ## profiles get pockets in `newProfileText`; profiles already on disk were
+  ## written with a bare equipment root, and those are the ones a player has --
+  ## so a fix that only reaches new characters fixes nobody. See `PocketsTpl`
+  ## for what the client does with a missing one.
+  ##
+  ## In memory only: the repaired document is what every route serves from this
+  ## load onward, and the next ordinary whole-document write persists it. Saving
+  ## from inside a read would put a write on every request thread that merely
+  ## looked at a profile, which is the concurrency the version counter below
+  ## exists to complain about.
+  result = false
+  if not p.ok or p.text.len == 0:
+    return
+  let equipment = p.field("Inventory.equipment").asText("")
+  if equipment.len == 0:
+    return
+  let itemsRef = p.field("Inventory.items")
+  if not itemsRef.isArray:
+    return
+  let existing = itemsRef.each()
+  for it in existing:
+    if it.child("slotId").asText("") == "Pockets" and
+       it.child("parentId").asText("") == equipment:
+      return
+  var list = parseArray(itemsRef)
+  if not list.ok:
+    return
+  var d = newDoc()
+  setText(d, "_id", newId())
+  setText(d, "_tpl", PocketsTpl)
+  setText(d, "parentId", equipment)
+  setText(d, "slotId", "Pockets")
+  list.add d
+  p.text = replaceValue(p.text, "Inventory.items", text(list))
+  result = true
+
 # ---------------------------------------------------------------------------
 # Persistence
 # ---------------------------------------------------------------------------
@@ -403,6 +501,8 @@ proc readProfile*(id: string; why: var ProfileRead): Profile =
     result.text = stored.raw
     result.ok = true
     why = prLoaded
+    if ensurePockets(result):
+      info "profile " & id & " had no Pockets item; added one (see PocketsTpl)"
     return
   if not stored.ok and not stored.missing:
     why = prUnreadable
@@ -540,17 +640,6 @@ proc nicknameTaken*(name: string): bool =
 # ---------------------------------------------------------------------------
 # Editing
 # ---------------------------------------------------------------------------
-
-proc replaceValue(text, path, newValue: string): string =
-  ## Replaces the value at a dotted path, leaving the rest of the document
-  ## byte-for-byte. Text surgery rather than reserialisation: the profile holds
-  ## fields this emulator does not model, and a round trip through a builder
-  ## would drop every one of them.
-  let target = field(text, path)
-  if not target.found:
-    return text
-  result = text.substr(0, target.first - 1) & newValue &
-           text.substr(target.last + 1)
 
 proc setNumber*(p: var Profile; path: string; value: int) =
   p.text = replaceValue(p.text, path, $value)

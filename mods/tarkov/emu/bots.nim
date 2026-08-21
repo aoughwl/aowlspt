@@ -188,6 +188,14 @@ const
     ## together are the 96 one bot used to be allowed, split rather than
     ## raised -- nothing here is a licence to build a bigger bot.
 
+const
+  PocketsTpl = "627a4e6b255f7527fb05a0f6"
+    ## The post-1.0 pockets, with `SpecialSlot1..3`. Spelled out here rather
+    ## than imported from `emu/profile` so that the bot generator does not take
+    ## a dependency on the player-profile module for one string. See the note in
+    ## `emu/profile.nim` beside its copy for why a character without this does
+    ## not spawn.
+
 proc equipmentSlots(): seq[string] =
   ## The 14 slots the game has, in the order the real database writes them.
   ##
@@ -547,6 +555,7 @@ proc addLoadout(t: BotTables; items: var List; equipmentId: string;
   # after every slot is decided, because a bot's rig has to *exist* before there
   # is anywhere to put anything, and the equipment roll is what decides that.
   var carried: seq[Container] = @[]
+  var gotPockets = false
   for slot in slots:
     let pool = equipment.field(slot)
     if not pool.found:
@@ -566,12 +575,29 @@ proc addLoadout(t: BotTables; items: var List; equipmentId: string;
     # "this bot has no rifle".
     let itemId = newId()
     items.add botItem(itemId, tpl, equipmentId, slot)
+    if slot == "Pockets":
+      gotPockets = true
     if slot == "TacticalVest" or slot == "Pockets" or slot == "Backpack":
       carried.add openContainer(itemId, slot, tpl)
     if isWeaponSlot(slot):
       addMods(t, inv, chances, items, itemId, tpl, true, r, weaponBudget)
     else:
       addMods(t, inv, chances, items, itemId, tpl, false, r, gearBudget)
+
+  # Pockets is the one slot that is not allowed to come out empty.
+  #
+  # Every other slot is a roll: a bot with no helmet is a bot with no helmet.
+  # `Pockets` is different because the client dereferences it unconditionally --
+  # `EFT.Player::HasMarkOfUnknown` reads `Equipment.Slots[8].ContainedItem` and
+  # throws NullReference when it is null, and `BotsGroup..ctor` runs that over
+  # every player in the raid while the bot is being activated. A bot whose
+  # pockets roll failed does not spawn without pockets; it does not spawn at
+  # all, and takes the activation with it. So a database that names no pockets
+  # pool, or a chance roll that came up short, still gets pockets.
+  if not gotPockets:
+    let pocketsId = newId()
+    items.add botItem(pocketsId, PocketsTpl, equipmentId, "Pockets")
+    carried.add openContainer(pocketsId, "Pockets", PocketsTpl)
 
   # And what is in them. A separate budget from the mod tree's: a bot with a
   # heavily modded rifle should still have something in its pockets, and one

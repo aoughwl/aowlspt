@@ -881,6 +881,33 @@ typedef struct {
 } AowlConn;
 
 static uint64_t g_listenSock = 0;
+
+/* A second listening socket, always **plain HTTP**, whatever `g_tlsMode` says.
+ *
+ * This exists for one reason, and it is a client bug rather than a design
+ * preference. Post-1.0 EFT fetches `/client/*` over its managed HTTP stack,
+ * which it configures to accept any certificate -- so the self-signed cert on
+ * the TLS listener is fine there. But every *asset* fetch (trader and quest
+ * icons, and everything else the client pulls with a `UnityWebRequest`) goes
+ * through Unity's own transport, and those call sites never assign a
+ * `certificateHandler`. Unity therefore validates the certificate, the
+ * handshake is rejected, and the request is never sent; the error branch
+ * returns null without logging, so the UI spins forever with nothing in any
+ * log but a `handshake FATAL` line on our side.
+ *
+ * There is no server-side fix for a client that will not accept our cert. The
+ * fix is to not offer one: serve the asset routes over plain HTTP on a second
+ * port and point the client's asset base url at `http://`. TLS never happens,
+ * so TLS validation never fails.
+ *
+ * It is a second *socket*, not a second poller or a second server. Everything
+ * downstream of `accept` already branches on the per-connection `c->ssl`
+ * handle rather than on `g_tlsMode` -- the reads, the sends, the websocket
+ * pump -- so a connection accepted here with `ssl == NULL` takes the plain
+ * path throughout with no other change. In particular this adds no second
+ * thread touching an `SSL`: these connections have none, and the poller
+ * remains the only thread that drives a handshake. */
+static uint64_t g_listenSock2 = 0;
 static volatile LONG g_netRunning = 0;
 
 static AowlConn g_conns[AOWL_NET_MAX_CONNS];
@@ -2159,9 +2186,57 @@ static void aowl_watch_remove(int32_t at) {
     g_watchCount--;
 }
 
+/* Drain one listening socket's backlog into the watch list.
+ *
+ * Lifted out of the poller unchanged so the second, always-plain listener can
+ * reuse it; `useTls` is the only thing the two callers disagree about, and it
+ * is passed rather than read from `g_tlsMode` because the plain listener must
+ * stay plain in a process whose main listener is doing TLS. Only ever called
+ * on the poller thread. */
+static void aowl_net_accept_from(SOCKET listener, int useTls, ULONGLONG now) {
+    for (;;) {
+        SOCKET s = accept(listener, NULL, NULL);
+        if (s == INVALID_SOCKET) break;
+        aowl_net_set_nonblocking(s);
+        /* Both only bite in blocking mode, which is the mode a worker puts
+         * the socket into while the connection is hot: the receive timeout is
+         * the grace window, and the send timeout is what stops a client that
+         * asks for the item table and then stops reading it from owning a
+         * worker for good. */
+        DWORD rcvTo = AOWL_HOT_GRACE_MS;
+        setsockopt(s, SOL_SOCKET, SO_RCVTIMEO, (const char*)&rcvTo,
+                   sizeof(rcvTo));
+        DWORD sndTo = AOWL_SEND_DEADLINE_MS;
+        setsockopt(s, SOL_SOCKET, SO_SNDTIMEO, (const char*)&sndTo,
+                   sizeof(sndTo));
+        int32_t idx = aowl_conn_take(s);
+        if (idx < 0) {
+            /* Past the connection limit. Refused now rather than left in the
+             * backlog to time out later. */
+            closesocket(s);
+            continue;
+        }
+        if (useTls) {
+            /* A TLS connection: attach a server-role `SSL` now, on the
+             * non-blocking socket, and let the poller drive the handshake
+             * below before it reads a request. A handle that cannot be made
+             * is dropped rather than watched. */
+            void* ssl = aowl_tls_accept_new(s);
+            if (!ssl) { aowl_conn_drop(idx); continue; }
+            g_conns[idx].ssl = ssl;
+            g_conns[idx].tlsUp = 0;
+            g_conns[idx].tlsWantWrite = 0;
+            aowl_trace("accept sock=%llu idx=%d (tls)",
+                       (unsigned long long)s, idx);
+        }
+        g_conns[idx].deadline = aowl_conn_deadline(&g_conns[idx], now);
+        g_watch[g_watchCount++] = idx;
+    }
+}
+
 static DWORD WINAPI aowl_net_poller(LPVOID param) {
     (void)param;
-    static WSAPOLLFD fds[AOWL_NET_MAX_CONNS + 2];
+    static WSAPOLLFD fds[AOWL_NET_MAX_CONNS + 3];
     /* Set once, read many frames deep: every `aowl_ws_send` reached from this
      * thread -- through nimony composing a pong, a close or a refusal -- takes
      * the path that does not wait. See `aowl_ws_send`. */
@@ -2183,6 +2258,14 @@ static DWORD WINAPI aowl_net_poller(LPVOID param) {
         if (g_listenSock) {
             listenAt = n;
             fds[n].fd = (SOCKET)g_listenSock;
+            fds[n].events = POLLRDNORM;
+            fds[n].revents = 0;
+            n++;
+        }
+        int32_t listen2At = -1;
+        if (g_listenSock2) {
+            listen2At = n;
+            fds[n].fd = (SOCKET)g_listenSock2;
             fds[n].events = POLLRDNORM;
             fds[n].revents = 0;
             n++;
@@ -2218,48 +2301,12 @@ static DWORD WINAPI aowl_net_poller(LPVOID param) {
         if (r > 0) {
             if (fds[0].revents) aowl_wake_drain();
 
-            if (listenAt >= 0 && (fds[listenAt].revents & POLLRDNORM)) {
-                for (;;) {
-                    SOCKET s = accept((SOCKET)g_listenSock, NULL, NULL);
-                    if (s == INVALID_SOCKET) break;
-                    aowl_net_set_nonblocking(s);
-                    /* Both only bite in blocking mode, which is the mode a
-                     * worker puts the socket into while the connection is
-                     * hot: the receive timeout is the grace window, and the
-                     * send timeout is what stops a client that asks for the
-                     * item table and then stops reading it from owning a
-                     * worker for good. */
-                    DWORD rcvTo = AOWL_HOT_GRACE_MS;
-                    setsockopt(s, SOL_SOCKET, SO_RCVTIMEO,
-                               (const char*)&rcvTo, sizeof(rcvTo));
-                    DWORD sndTo = AOWL_SEND_DEADLINE_MS;
-                    setsockopt(s, SOL_SOCKET, SO_SNDTIMEO,
-                               (const char*)&sndTo, sizeof(sndTo));
-                    int32_t idx = aowl_conn_take(s);
-                    if (idx < 0) {
-                        /* Past the connection limit. Refused now rather than
-                         * left in the backlog to time out later. */
-                        closesocket(s);
-                        continue;
-                    }
-                    if (g_tlsMode) {
-                        /* A TLS connection: attach a server-role `SSL` now, on
-                         * the non-blocking socket, and let the poller drive the
-                         * handshake below before it reads a request. A handle
-                         * that cannot be made is dropped rather than watched. */
-                        void* ssl = aowl_tls_accept_new(s);
-                        if (!ssl) { aowl_conn_drop(idx); continue; }
-                        g_conns[idx].ssl = ssl;
-                        g_conns[idx].tlsUp = 0;
-                        g_conns[idx].tlsWantWrite = 0;
-                        aowl_trace("accept sock=%llu idx=%d (tls)",
-                                   (unsigned long long)s, idx);
-                    }
-                    g_conns[idx].deadline =
-                        aowl_conn_deadline(&g_conns[idx], now);
-                    g_watch[g_watchCount++] = idx;
-                }
-            }
+            if (listenAt >= 0 && (fds[listenAt].revents & POLLRDNORM))
+                aowl_net_accept_from((SOCKET)g_listenSock, g_tlsMode, now);
+            /* The second listener is plain HTTP even when the first is doing
+             * TLS -- that is the whole point of it; see `g_listenSock2`. */
+            if (listen2At >= 0 && (fds[listen2At].revents & POLLRDNORM))
+                aowl_net_accept_from((SOCKET)g_listenSock2, 0, now);
 
             /* Readable connections, walked back to front so removing one does
              * not move an entry we have not looked at yet. */
@@ -2462,6 +2509,34 @@ static int32_t aowl_net_reserve(int32_t port) {
     if (g_listenSock) return 1;
     g_listenSock = aowl_net_bind(port);
     return g_listenSock ? 1 : 0;
+}
+
+/* Open the second, always-plain listener on `port`. See `g_listenSock2` for
+ * why it exists.
+ *
+ * Bind *and* listen here, unlike the main socket, which splits the two so a
+ * port collision is refused before the mods load. This one is opened at the
+ * same moment the main serve starts, so there is nothing to gain by splitting
+ * it -- and a failure here is not fatal to the server: the TLS listener still
+ * answers `/client/*`, and the caller reports the loss of the asset route
+ * rather than refusing to start. Returns 0 on any failure, having left
+ * `g_listenSock2` at 0 so the poller simply never watches it.
+ *
+ * Safe to call before or after `aowl_net_serve*`: the poller re-reads
+ * `g_listenSock2` at the top of every wakeup. Calling it before is what the
+ * backend does, so the port is answering from the first accept. */
+static int32_t aowl_net_listen_plain(int32_t port) {
+    if (!aowl_net_startup()) return 0;
+    if (g_listenSock2) return 1;
+    uint64_t s = aowl_net_bind(port);
+    if (!s) return 0;
+    if (!aowl_net_listen_on(s, 128)) {
+        closesocket((SOCKET)s);
+        return 0;
+    }
+    aowl_net_set_nonblocking((SOCKET)s);
+    g_listenSock2 = s;
+    return 1;
 }
 
 /* Which process is listening on a loopback TCP port, if that can be found out.
@@ -2675,6 +2750,10 @@ static void aowl_net_stop(void) {
     if (g_listenSock) {
         closesocket((SOCKET)g_listenSock);
         g_listenSock = 0;
+    }
+    if (g_listenSock2) {
+        closesocket((SOCKET)g_listenSock2);
+        g_listenSock2 = 0;
     }
     aowl_wake_poller();
     if (g_pollThread) {
