@@ -74,6 +74,13 @@
  * original proc is stored once and a second call is a no-op. ExitProcess is a
  * clean native terminate that cannot itself hang.
  *
+ * LIVE FINDING (root cause of "window-X still hangs"): at il2cpp-init time --
+ * the one moment the host used to call this -- the game's top-level window does
+ * not exist yet, so EnumWindows found nothing and the hook was never installed
+ * for the entire session. The install is therefore RETRIED from the host tick
+ * loop until it succeeds; this function is designed for exactly that (cheap,
+ * idempotent, no state written on failure).
+ *
  * Each entry is overwritten with, at its first byte:
  *     31 C9                 xor ecx, ecx           ; uExitCode = 0
  *     48 B8 <ExitProcess>   mov rax, imm64
@@ -280,6 +287,12 @@ static int32_t aowl_uxpatch_close_hook(void) {
         aowl_ux_close_orig = prev;
     aowl_ux_close_hooked = 1;
     return 1;
+}
+
+/* The window we hooked, as an integer, for the host's log line ("installed on
+ * window 0x..."). 0 until the hook arms. */
+static uint64_t aowl_uxpatch_close_hwnd(void) {
+    return (uint64_t)(uintptr_t)aowl_ux_close_hwnd;
 }
 
 /* ------------------------------------------------------------------ *

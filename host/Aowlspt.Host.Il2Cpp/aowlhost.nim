@@ -413,7 +413,12 @@ var cUxExitSeen {.importc: "aowl_ux_exit_seen", nodecl.}: int32
 # taskbar Close, Alt+F4) terminates cleanly instead of entering the same hanging
 # async shutdown the Exit-button fix bypasses. See `aowlspt_uxpatch.h`.
 proc cUxCloseHook(): int32 {.importc: "aowl_uxpatch_close_hook", nodecl.}
+proc cUxCloseHwnd(): uint64 {.importc: "aowl_uxpatch_close_hwnd", nodecl.}
 var cUxCloseSeen {.importc: "aowl_ux_close_seen", nodecl.}: int32
+# The game window does not exist at il2cpp-init time, so the OS-close subclass
+# is armed by RETRY from the host tick loop. This records whether it is armed so
+# the retry stops (and logs) exactly once.
+var gCloseHookArmed = false
 proc cUxVersionTarget(): Il2CppPtr {.
   importc: "aowl_uxpatch_version_target", nodecl.}
 proc cUxVersionLabelOffset(): int32 {.
@@ -4189,17 +4194,22 @@ proc reportRuntime() =
   # hanging async shutdown by a different caller. Subclass the game's top window
   # so those messages hard-exit (ExitProcess(0)) before any async work starts.
   # Fail-safe: if no owned window is found the hook is simply skipped.
+  #
+  # LIVE FINDING: at this point (il2cpp init) the game's top-level window does
+  # NOT exist yet, so EnumWindows finds nothing and the hook was skipped for the
+  # whole session -- the confirmed root cause of "window-X still hangs". The
+  # arming is therefore a RETRY: this first attempt is best-effort and quiet on
+  # failure, and the host tick loop keeps calling `cUxCloseHook()` (idempotent --
+  # it stores the original proc once and no-ops once hooked) until the window
+  # exists, logging the success line then.
   let closeHooked = cUxCloseHook()
   if closeHooked == 1'i32:
-    okLog "exit fix: window-close (X / taskbar / Alt+F4) redirected to " &
-          "ExitProcess(0) via WndProc subclass (covers the OS-close path the " &
-          "Exit-button patch does not)"
-  elif cUxCloseSeen == 0:
-    warn "exit fix: no top-level game window found yet; OS-close hook not " &
-         "installed (window-X may still hang; Exit button is patched)"
+    gCloseHookArmed = true
+    okLog "exit fix: OS-close hook installed at boot -- window-close (X / " &
+          "taskbar / Alt+F4) redirected to ExitProcess(0) via WndProc subclass"
   else:
-    warn "exit fix: found the game window but the WndProc subclass failed; " &
-         "OS-close may still hang (Exit button is patched)"
+    info "exit fix: game window not up yet; OS-close hook will be retried from " &
+         "the host tick loop until it arms (Exit button is already patched)"
 
   var count = 0
   let assemblies = domainGetAssemblies(gRt, gDomain, count)
@@ -4650,6 +4660,9 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   gLastFireMs = lastTick
   var nextBindTry = lastTick + 5000'u64
   var nextRenderTry = lastTick + 5000'u64
+  # OS-close subclass retry clock (see the tick-loop block below).
+  var nextCloseTry = lastTick
+  let closeGiveUpAt = lastTick + 300000'u64
   # One-shot backend-key dump, deferred until the client has reached its menu
   # and initialised HTTPTransportManager on its own -- reading (or worse,
   # force-initialising) it right after il2cpp_init faults and kills the game.
@@ -4666,6 +4679,26 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
     let now = cNowMs()
     let elapsed = int64(now - lastTick)
     lastTick = now
+
+    # OS-close hook retry (root cause of "the window X still hangs"): the game's
+    # top-level window does not exist at il2cpp-init time, where this used to be
+    # armed exactly once, so EnumWindows found nothing and the subclass was never
+    # installed. Retry here, on a slow cadence, until it lands -- the call is
+    # cheap (one EnumWindows over this process's own windows) and idempotent
+    # (the original proc is stored once). Give up after ~5 minutes so a build
+    # where the window never appears does not poll forever.
+    if not gCloseHookArmed and now >= nextCloseTry:
+      nextCloseTry = now + 500'u64
+      if cUxCloseHook() == 1'i32:
+        gCloseHookArmed = true
+        okLog "exit fix: OS-close hook installed on window 0x" &
+              hexOf(cUxCloseHwnd()) & " -- window X / taskbar Close / Alt+F4 " &
+              "now exit via ExitProcess(0) instead of the hanging async shutdown"
+      elif now >= closeGiveUpAt:
+        gCloseHookArmed = true   # stop retrying; nothing worse than before
+        warn "exit fix: no top-level game window appeared within 5 minutes; " &
+             "OS-close hook not installed (window-X may still hang; the Exit " &
+             "button is patched)"
 
     # Retry while nothing is bound. The first candidate that is worth having is
     # a game type, and the game's own types come up long after the runtime
