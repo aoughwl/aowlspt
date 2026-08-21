@@ -38,6 +38,9 @@ proc cGfxRunning(): int32 {.importc: "aowl_gfx_running", nodecl.}
 proc cGfxFrames(): int32 {.importc: "aowl_gfx_frames", nodecl.}
 proc cGfxStatus(buf: ptr char; cap: int32): int32 {.importc: "aowl_gfx_status", nodecl.}
 proc cGfxSetParamsJson(json: cstring) {.importc: "aowl_gfx_set_params_json", nodecl.}
+proc cGfxStartDriven(): int32 {.importc: "aowl_gfx_start_driven", nodecl.}
+proc cGfxGradePtr(): pointer {.importc: "aowl_gfx_grade_ptr", nodecl.}
+proc cGfxReleasePtr(): pointer {.importc: "aowl_gfx_release_ptr", nodecl.}
 
 # --------------------------------------------------------------- public
 
@@ -47,6 +50,22 @@ proc graphicsStart*(): bool =
   ## second call is a no-op returning true. False means the post-process cannot
   ## draw (the game still renders normally).
   cGfxStart() != 0'i32
+
+proc graphicsStartDriven*(): bool =
+  ## Start WITHOUT installing a Present hook. Used when the overlay already owns
+  ## the DXGI Present detour (the engine refuses a second hook on the same
+  ## function). The host then registers `graphicsGradePtr()` /
+  ## `graphicsReleasePtr()` with the overlay so grading runs from the overlay's
+  ## Present hook. Safe to call twice.
+  cGfxStartDriven() != 0'i32
+
+proc graphicsGradePtr*(): pointer =
+  ## Opaque pointer to the C grade callback, to hand to `overlaySetPrePresent`.
+  cGfxGradePtr()
+
+proc graphicsReleasePtr*(): pointer =
+  ## Opaque pointer to the C release-on-resize callback, for `overlaySetPreResize`.
+  cGfxReleasePtr()
 
 proc graphicsStop*() =
   ## Only for a host that unloads itself. Removing a `Present` detour while the

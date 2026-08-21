@@ -3181,16 +3181,27 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   else:
     warn "the overlay did not start: " & overlayStatus()
 
-  # Full-frame post-process (aowl.graphics). Started AFTER the overlay on
-  # purpose: both detour DXGI Present through the same trampoline engine, and
-  # installing graphics last makes it the outer hook — it regrades the raw game
-  # frame, then the trampoline reaches the overlay, which draws its UI crisp on
-  # top of the graded image. A failure here is a missing effect, never fatal:
-  # the C side latches broken and the detour becomes a pass-through.
-  if graphicsStart():
-    okLog "graphics post-process ready — " & graphicsStatus()
+  # Full-frame post-process (aowl.graphics). Both this and the overlay want to
+  # detour DXGI Present, and the detour engine refuses a second hook on the same
+  # function (error -9) — so they cannot each install one. When the overlay is
+  # up it owns the Present hook, and graphics runs from the overlay's pre-present
+  # callback: grade the raw frame first, overlay UI composites on top. When the
+  # overlay is absent (it is being retired for native settings), graphics owns
+  # its own Present hook. Either way a failure is a missing effect, never fatal:
+  # the C side latches broken and the pass becomes a no-op.
+  if overlayRunning():
+    if graphicsStartDriven():
+      overlaySetPrePresent(graphicsGradePtr())
+      overlaySetPreResize(graphicsReleasePtr())
+      okLog "graphics post-process ready (via the overlay Present hook) — " &
+            graphicsStatus()
+    else:
+      warn "the graphics post-process did not start: " & graphicsStatus()
   else:
-    warn "the graphics post-process did not start: " & graphicsStatus()
+    if graphicsStart():
+      okLog "graphics post-process ready (own Present hook) — " & graphicsStatus()
+    else:
+      warn "the graphics post-process did not start: " & graphicsStatus()
 
   # The mods are up, so the host can start answering the manager. Before this
   # point a control request is ignored rather than queued.

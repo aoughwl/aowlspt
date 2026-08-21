@@ -742,10 +742,44 @@ static int aowl_gfx_capture_vtable(void** outPresent, void** outResize) {
     return ok;
 }
 
+/* ---------------------------------------------------------------- driven mode
+ * When the overlay already owns the Present hook (the detour engine refuses a
+ * second hook on the same dxgi function), the post-process runs from the
+ * overlay's pre-present callback instead of its own detour. These are the entry
+ * points for that path: `aowl_gfx_grade` does one frame of grading given the
+ * live swap chain, `aowl_gfx_release_size_extern` drops the back-buffer refs
+ * before a resize, and the two `*_ptr` accessors hand the host a plain function
+ * pointer to register with the overlay (a `void*` crosses the nimony host
+ * cleanly; a cast to a proc type would not). */
+static void aowl_gfx_grade(IDXGISwapChain* sc) {
+    if (!g_gfx.started || g_gfx.broken || !sc) return;
+    if (InterlockedCompareExchange(&g_gfx.inPresent, 1, 0) != 0) return;
+    aowl_gfx_render(sc);
+    InterlockedExchange(&g_gfx.inPresent, 0);
+}
+static void aowl_gfx_release_size_extern(IDXGISwapChain* sc) {
+    (void)sc;
+    aowl_gfx_release_size();
+}
+static void* aowl_gfx_grade_ptr(void)   { return (void*)aowl_gfx_grade; }
+static void* aowl_gfx_release_ptr(void)  { return (void*)aowl_gfx_release_size_extern; }
+
+/* Start WITHOUT installing a hook. The overlay drives grading via the pointers
+ * above. Only the state + params are set up; the device comes up lazily on the
+ * first `aowl_gfx_grade`. */
+static int32_t aowl_gfx_start_driven(void) {
+    if (InterlockedCompareExchange(&g_gfx.started, 1, 0) != 0) return 1;
+    InterlockedExchange(&g_gfx.broken, 0);
+    InitializeCriticalSection(&g_gfx.cs);
+    g_gfx.params = aowl_gfx_defaults();
+    aowl_gfx_note("driven by the overlay Present hook; waiting for the first frame");
+    return 1;
+}
+
 /* ---------------------------------------------------------------- lifecycle
  * Must NOT be called from DllMain (device + window under the loader lock). The
- * host boot thread is the right caller, AFTER overlayStart so the two Present
- * hooks chain in the right order (see the header top). */
+ * host boot thread is the right caller. Used only when NO overlay owns Present;
+ * otherwise the host uses aowl_gfx_start_driven + the overlay callbacks. */
 static int32_t aowl_gfx_start(void) {
     if (InterlockedCompareExchange(&g_gfx.started, 1, 0) != 0) return 1;
     InterlockedExchange(&g_gfx.broken, 0);

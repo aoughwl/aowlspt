@@ -63,6 +63,8 @@ proc cOvSyncStart(path: cstring; intervalMs: int32) {.
 proc cOvSyncPending(): int32 {.importc: "aowl_ov_sync_pending", nodecl.}
 proc cOvSyncTake(buf: ptr char; cap: int32): int32 {.
   importc: "aowl_ov_sync_take", nodecl.}
+proc cOvSetPrePresent(fn: pointer) {.importc: "aowl_ov_set_pre_present", nodecl.}
+proc cOvSetPreResize(fn: pointer) {.importc: "aowl_ov_set_pre_resize", nodecl.}
 
 # --------------------------------------------------------------- public
 
@@ -174,6 +176,20 @@ proc overlaySyncTake*(): string =
   while i < int(got):
     result.add buf[i]
     inc i
+
+proc overlaySetPrePresent*(fn: pointer) =
+  ## Register a callback the overlay invokes at the top of its Present hook,
+  ## once per frame, before it draws its UI — the seam the full-frame
+  ## post-process grades through when it cannot own Present itself. `fn` is a
+  ## plain C function pointer `void(*)(IDXGISwapChain*)`, carried as an opaque
+  ## `pointer` because nimony will not cast between `pointer` and a proc type.
+  cOvSetPrePresent(fn)
+
+proc overlaySetPreResize*(fn: pointer) =
+  ## Register a callback the overlay invokes before it lets the game resize the
+  ## swap chain, so the post-process can drop its back-buffer references first
+  ## (the same DXGI_ERROR_INVALID_CALL hazard the overlay guards for its own).
+  cOvSetPreResize(fn)
 
 proc overlayStatus*(): string =
   ## One line, meant to be logged verbatim: either what the overlay is doing or

@@ -931,6 +931,20 @@ typedef struct AowlOvState {
 
 static AowlOvState g_ov;
 
+/* ---- optional Present/Resize observers (the graphics post-process) --------
+ * The full-frame post-process (abi/aowlspt_graphics.h) cannot install its own
+ * Present detour when the overlay already has one: the detour engine refuses a
+ * second hook on the same dxgi function (error -9). So instead the overlay
+ * calls these back, giving the post-process a place to grade the raw frame
+ * BEFORE the overlay draws its UI on top, and a place to drop its back-buffer
+ * references before a resize. Both are plain C function pointers set from the
+ * host; NULL when nothing registered, which is the overlay-only case. Stored as
+ * `void*` because that is what crosses the nimony host cleanly. */
+static void* g_ov_prePresent = NULL;   /* void (*)(IDXGISwapChain*) */
+static void* g_ov_preResize  = NULL;   /* void (*)(IDXGISwapChain*) */
+static void aowl_ov_set_pre_present(void* fn) { g_ov_prePresent = fn; }
+static void aowl_ov_set_pre_resize(void* fn)  { g_ov_preResize  = fn; }
+
 static void aowl_ov_fail(const char* why) {
     /* One writer wins and the rest are dropped: the first failure is the
      * interesting one, and a later one is usually a consequence of it. */
@@ -5366,6 +5380,14 @@ static HRESULT STDMETHODCALLTYPE aowl_ov_present(IDXGISwapChain* sc, UINT sync,
      * otherwise reenter the shared vertex scratch. */
     if (InterlockedCompareExchange(&g_ov.inDraw, 1, 0) == 0) {
         g_ov.frames++;
+        /* Grade the finished frame first, so the overlay's UI (drawn below)
+         * composites crisp on top of the graded image. Runs every frame, even
+         * when the panel is hidden -- the post-process is not the panel. It
+         * acquires the game device from `sc` itself and saves/restores the
+         * pipeline state it touches, so the overlay's own bind/draw below still
+         * sees the game's state. */
+        if (g_ov_prePresent)
+            ((void (*)(IDXGISwapChain*))g_ov_prePresent)(sc);
         /* Opened again. `avgNs`/`maxNs` are deliberately *not* cleared here --
          * see the note on `aowl_ov_frame_ns` -- so this counts what this
          * opening has contributed, which is what says whether the figure on
@@ -5450,6 +5472,10 @@ static HRESULT STDMETHODCALLTYPE aowl_ov_resize(IDXGISwapChain* sc, UINT count,
      * `broken` is set, because the RTV may have been created before the
      * failure. */
     if (g_ov.swap == sc) aowl_ov_release_targets();
+    /* The post-process pins the back buffer too (its RTV + scene copy); it must
+     * drop those before the resize for the same DXGI_ERROR_INVALID_CALL reason. */
+    if (g_ov_preResize)
+        ((void (*)(IDXGISwapChain*))g_ov_preResize)(sc);
     HRESULT hr = orig(sc, count, w, h, fmt, flags);
     return hr;
 }
