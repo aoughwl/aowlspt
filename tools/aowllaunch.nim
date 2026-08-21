@@ -130,10 +130,17 @@ Options
   --exe NAME     executable to start (default: EscapeFromTarkov.exe)
   --args "..."   extra command line for the game, appended to the one this
                  builds from backend.json and the chosen profile
-  --profile ID   play this profile id and do not ask
-  --new NAME     create a profile called NAME and play it
+  --profile ID   bind this profile id server-side before launch (the game's
+                 own character-select still shows, this just pre-selects)
+  --new NAME     create a profile called NAME and bind it before launch
   --side SIDE    Usec or Bear, for --new (default Usec)
-  --no-profile   start the client with no -token, so it logs in on its own
+  --pick         show the launcher's own profile picker before starting the
+                 game. OFF by default: the game has its own character-select
+                 screen, and asking twice is the same choice made twice. With
+                 this off (the default) the client starts with no -token and
+                 the in-game screen is the single place a profile is chosen.
+  --no-profile   start the client with no -token, so it logs in on its own.
+                 This is now the default; the flag is kept for scripts.
   --wait         stay open until the game exits
   --no-backend   do not start the backend server
   --no-logs      do not show the live log view; exit once the game is up
@@ -188,6 +195,10 @@ type
     newProfile: string
     side: string
     noProfile: bool
+    pick: bool
+      ## `--pick`: restore the launcher's own TUI profile picker. Off by
+      ## default -- the launcher boots straight to the game, whose in-game
+      ## character-select is the single place a profile is chosen.
     port: int
       ## Only meaningful when `portGiven`. The port actually used is resolved
       ## in `main`, once `root` is known and `backend.json` can be read.
@@ -206,7 +217,7 @@ proc parseArgs(): Options =
                    logsOnly: false,
                    clientWindow: false, plain: false, ascii: false,
                    profileId: "", newProfile: "", side: "Usec",
-                   noProfile: false, port: 0,
+                   noProfile: false, pick: false, port: 0,
                    portGiven: false, allowPortMismatch: false,
                    backendWait: 300, tailPath: "", tailTitle: "log",
                    help: false)
@@ -240,6 +251,8 @@ proc parseArgs(): Options =
       if i <= n: result.tailTitle = paramStr(i)
     elif a == "--no-profile":
       result.noProfile = true
+    elif a == "--pick":
+      result.pick = true
     elif a == "--wait":
       result.wait = true
     elif a == "--no-backend":
@@ -1518,10 +1531,19 @@ proc main(): int =
       # "there is no backend in this install" -- and the real launch would go
       # on to start a client with nothing to talk to.
       warn "  no backend at " & be & "; the client would start alone"
-    if o.noProfile:
-      line "  would ask     nothing about profiles (--no-profile)"
+    let dExplicit = o.profileId.len > 0 or o.newProfile.len > 0
+    let dPromptless = o.noProfile or (not o.pick and not dExplicit)
+    if dPromptless:
+      if o.noProfile:
+        line "  would ask     nothing about profiles (--no-profile)"
+      else:
+        line "  would ask     nothing; the client starts with no -token and " &
+             "you pick your character on the game's own screen (pass --pick " &
+             "for the launcher's picker)"
     elif o.profileId.len > 0:
       line "  would play    " & o.profileId & " (--profile)"
+    elif o.newProfile.len > 0:
+      line "  would create  " & o.newProfile & " (--new) and play it"
     elif https:
       line "  would ask     which profile, read from the store on disk -- the " &
            "launcher cannot use the backend's profile routes over TLS"
@@ -1630,10 +1652,25 @@ proc main(): int =
   # --- the profile -----------------------------------------------------------
   var token = ""
   var who = ""
-  if o.noProfile:
+  # The game has its own character-select screen (served by the tarkov mod's
+  # `/v2/client/game/profiles/` and `/client/game/profile/select`), and it
+  # shows on every boot regardless of the -token. A launcher picker on top of
+  # it is the same choice made twice -- the redundant second selector a player
+  # hits. So by default the launcher does NOT ask: it starts the client with no
+  # -token and lets the in-game screen be the single place a profile is chosen.
+  # A specific profile can still be pre-bound with `--profile`/`--new` (for
+  # scripts), and the old TUI picker is back under `--pick`.
+  let explicitProfile = o.profileId.len > 0 or o.newProfile.len > 0
+  let promptless = o.noProfile or (not o.pick and not explicitProfile)
+  if promptless:
     heading "Profile"
-    note "--no-profile: the client is started with no -token and will log in " &
-         "on its own"
+    if o.noProfile:
+      note "--no-profile: the client is started with no -token and will log " &
+           "in on its own"
+    else:
+      note "the client is started with no -token; pick your character on the " &
+           "game's own character-select screen. Pass --pick for the launcher's " &
+           "picker, or --profile <id> to pre-select one."
   else:
     heading "Profile"
     if https:
