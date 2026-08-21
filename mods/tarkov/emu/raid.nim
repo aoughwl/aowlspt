@@ -405,9 +405,25 @@ proc offlineScavWaves(zones: seq[string]): string =
   ##     +0xad3fdf / +0xad3fee. It is `waves.Select(...).OrderBy(...).ToArray()`
   ##     (`Init`, 0x2554f50), one output per input, so a non-empty `waves[]` is
   ##     enough; `Init` is also what sets `Enabled` (+0x50) true.
-  ##   * `slots_min`/`slots_max` become `BotsCount` via
-  ##     `MyExtensions.RandomInclude` in `<Init>b__15_0` (0x2556300), and a wave
-  ##     with `BotsCount == 0` is dropped at +0x6cf395. Both are kept >= 1.
+  ##   * `slots_min`/`slots_max` do **not** mean what they look like. Before the
+  ##     scenario ever sees them, `LocalGame.ModifySettings` (0xad12a0) rewrites
+  ##     both: it scales each by 1.5, then sets *both* to
+  ##     `BotAmountExtensions.ToBotAmountSlots(BotAmount, min, max)`
+  ##     (0x6d9b70). For `BotAmount.AsOnline` -- which is what the client sends
+  ##     in `botSettings` for a Practice raid -- that lands on the handler at
+  ##     +0x6d9d30, which computes
+  ##
+  ##         BotsCount = (int)((max - min) * WAVE_COEF_MID * 0.5f + 0.5f)
+  ##
+  ##     reading `WAVE_COEF_MID` from `GlobalConfiguration+0xd8`. So the wave's
+  ##     bot count depends **only on the span `slots_max - slots_min`**; the
+  ##     absolute numbers are thrown away, and `slots_min == slots_max` yields
+  ##     exactly zero. `<Init>b__15_0`'s `RandomInclude(slots_min, slots_max)`
+  ##     then rolls between two equal numbers, so `BotsCount` is deterministic.
+  ##     A wave with `BotsCount == 0` is dropped at +0x6cf395 without a word.
+  ##     The spans below are wide enough to place a squad rather than a pair,
+  ##     and `slots_min` is kept >= 1 so the count is still non-zero if a future
+  ##     build drops the coefficient step and rolls the range directly.
   ##   * `BotPreset` is `Enum.Parse`d, case-sensitively, into `BotDifficulty`
   ##     at +0x255651c -- an unknown string throws inside an async and the wave
   ##     vanishes silently. `"normal"` is a real member.
@@ -437,7 +453,7 @@ proc offlineScavWaves(zones: seq[string]): string =
   if seeds < 2: seeds = 2
   if seeds > 4: seeds = 4
   while number < seeds:
-    a.add oneWave(number, -1, -1, 2, 4, useZones[number mod useZones.len])
+    a.add oneWave(number, -1, -1, 1, 7, useZones[number mod useZones.len])
     inc number
   # The trickle. Non-negative, so these take `Run(2)`'s timer arm: a bonus if
   # that arm works offline and harmless if it does not. Staggered from 20 s so
@@ -448,10 +464,10 @@ proc offlineScavWaves(zones: seq[string]): string =
   var i = 0
   while i < early:
     let zone = useZones[(seeds + i) mod useZones.len]
-    a.add oneWave(number, 20 + i * 20, 40 + i * 20, 1, 3, zone)
+    a.add oneWave(number, 20 + i * 20, 40 + i * 20, 1, 5, zone)
     inc i
     inc number
-  a.add oneWave(number, 360, 420, 1, 3, useZones[0])
+  a.add oneWave(number, 360, 420, 1, 5, useZones[0])
   result = done(a).text
 
 proc localLoot*(locationId: string; nowSeconds: int;
