@@ -1,75 +1,61 @@
-## Admin / cheat menu -- a native, client-side admin panel for post-1.0 EFT.
+## Admin / cheat menu -- a fully native, client-side admin panel for post-1.0
+## Escape From Tarkov (IL2CPP build 1.1.0.1.46777).
 ##
 ## ---------------------------------------------------------------------------
-## WHAT THIS IS, AND THE ONE RULE THAT SHAPES ALL OF IT
+## THE ARCHITECTURE, AND WHY IT IS THIS ONE
 ## ---------------------------------------------------------------------------
 ##
-## Press **F6** to toggle an in-game admin menu with independently togglable
-## cheat modes. ESP and God mode are ON by default; the rest are off. Every mode
-## is a toggle the menu owns and this file reads.
+## Press **F6** for an in-game admin menu of togglable cheat modes; ESP and God
+## mode default ON, the rest off. It is fully native and uses **no** managed
+## Unity-thread bridge, because on this client build that bridge is dead: the
+## anti-cheat strips the per-frame `MethodInfo.methodPointer`, so calling a
+## managed game method is not available. Two things still work, and this mod is
+## built entirely on them:
 ##
-## The rule that shapes every line below: **a managed IL2CPP call may only be
-## made from Unity's own thread.** Calling one from the host's thread crashes
-## this client, established repeatedly across this repo. So all of this mod's
-## per-frame work -- reading the world for ESP, freezing health for God mode,
-## capping stamina, and (where it lands) drawing -- runs inside `everyMain`,
-## which the host drains from a per-frame game method, i.e. on Unity's thread.
-## And it runs there **only after** the host confirms that drain has actually
-## fired (`aowlspt.host::main_thread` -> `bound:true`); until then this mod
-## touches nothing managed. That gate is the whole safety story: no bound Unity
-## thread, no cheat, no crash -- the menu still opens and every mode reads
-## "unavailable".
+##   * **Reading/writing object memory by field offset.** `il2cpp_field_get_offset`
+##     is a metadata query, not a stripped method, so resolving a field's offset
+##     and reading `*(T*)(object + offset)` works -- from any thread. That is the
+##     ESP data pass (`adm/data.nim`) and the God mode / stamina writes.
+##
+##   * **Drawing inside the game's own `IDXGISwapChain::Present`.** The overlay
+##     already hooks Present once; the ESP boxes and the F6 menu are drawn there
+##     as a HUD on the frame (`abi/aowlspt_overlay.h` + `abi/aowlspt_admin.h`),
+##     the same place Steam/Discord/RivaTuron and the graphics post-process draw.
+##     This is a HUD, not the vetoed mod-manager panel.
+##
+## The two halves rendezvous through a named shared-memory region
+## (`abi/aowlspt_admin.h`): this mod publishes the projected entities + toggles'
+## capability into it (on the host's `on_update`, since a memory read needs no
+## particular thread), and the overlay's Present hook reads it and draws. The F6
+## keypress and menu navigation are handled in the overlay's WndProc, writing the
+## toggles this mod then reads.
 ##
 ## ---------------------------------------------------------------------------
-## THE SPLIT: WHAT IS REAL, WHAT IS PENDING
+## WHAT IS REAL, WHAT NEEDS THE OFFSET DUMP
 ## ---------------------------------------------------------------------------
 ##
-## Everything here renders and runs through the **game's own runtime on Unity's
-## thread** -- there is deliberately no use of the host's hand-drawn D3D11
-## overlay. That has a consequence worth stating up front, because half of this
-## file depends on it:
+##   * **The whole native pipeline is real and complete:** shared region, the
+##     Present-hook HUD (ESP boxes + F6 menu), the WndProc input, the publish
+##     path, and the field-offset read/write framework.
+##   * **The specific offsets/field names are the live-iteration parameters.**
+##     `adm/data.nim` resolves them *by name* through reflection (so a correct
+##     name yields the right offset for this build), and every one degrades to
+##     "unavailable" on a miss -- ESP shows nothing, God mode is off, the menu
+##     still opens. The names are the pre-1.0 surface and unconfirmed against
+##     build 46777; the metadata dump (or a live probe) fills them in one place.
+##     `adminDiag()`/the region's status line report exactly what resolved.
 ##
-##   * **Runs now (managed writes/reads on Unity's thread):** the toggle
-##     framework, F6/arrow/enter input (via `GetAsyncKeyState`, which is not a
-##     managed call and is safe from any thread), God mode (incoming-damage
-##     suppression on the local player), infinite stamina, and the ESP *data*
-##     pass -- walking the world, projecting every player to screen with the
-##     camera's own view-projection matrix. Each is armed only when every
-##     binding it needs resolved, and reports "unavailable" otherwise.
-##
-##   * **Pending a render-phase Unity hook:** the actual *pixels*. Native ESP
-##     lines and the F6 menu need to run during the engine's render/GUI phase to
-##     paint -- `GL` immediate mode only draws inside camera rendering, and there
-##     is no `MonoBehaviour`/`OnGUI` to attach post-1.0 (see docs/IL2CPP.md).
-##     The host's main-thread drain fires in the *Update* phase, not the render
-##     phase, so a `GL` call from here is on the right thread at the wrong time.
-##     `adm/render` binds the engine's drawing surface and is called every frame,
-##     but it can only paint once the bridge (or a detour of a render-phase
-##     method) gives this mod a callback during rendering. That interface is
-##     defined in `adm/render.nim` and this file codes against it; what is
-##     missing is the host delivering the callback in the render phase. Until
-##     then the ESP geometry and menu layout are computed and logged every
-##     frame, and `adminDiag()` reports exactly what bound and what did not.
-##
-## **Nothing here has been run against BSG's live client.** Every `EFT.`/Unity
-## name is from the pre-1.0 surface; post-1.0 is a different build. A wrong name
-## is a refused binding with a `why` line and a mode that reads "unavailable",
-## never a wrong write or a crash. `adminDiag()` prints every binding's own
-## account of itself.
+## Nothing here can crash the game: every read is address-checked, every mode is
+## capability-gated, and an absent region or runtime is a no-op.
 
 import std/strutils
 import aowlspt
-import aowlspt/il2cpp
-import aowlspt/fast
-import aowlspt/game
 import aowlspt/server
 import aowlspt/settings
 import aowlspt/json
 
-import "adm" / state
-import "adm" / world
-import "adm" / cheats
-import "adm" / render
+import "adm" / shared
+import "adm" / data
 
 const
   ModGuid = "aowl.admin"
@@ -78,207 +64,144 @@ const
   ModVersion = "1.0.0"
 
 # ---------------------------------------------------------------------------
-# Configuration -- the default toggle states, mirrored by the F12 schema
+# Config -- the initial toggle states + ESP range
 # ---------------------------------------------------------------------------
-#
-# Filled in `onLoad`, never at declaration: a nimony `--app:lib` global
-# initialised by a call is left zeroed (docs/MODDING.md), and these are read
-# through the host.
 
-var cfgEspDefault = true
-var cfgGodDefault = true
-var cfgStaminaDefault = false
-var cfgNoRecoilDefault = false
-var cfgNoWeightDefault = false
-var cfgInstaHealDefault = false
-var cfgAmmoDefault = false
-var cfgThermalDefault = false
-var cfgNightVisDefault = false
-var cfgFlyDefault = false
-var cfgTeleportDefault = false
-var cfgTimeDefault = false
 var cfgEspMaxDistance = 400.0
 
 proc cfgBool(key: string; default: bool): bool =
   setting(key).asBool(default)
 
-proc loadConfig() =
-  cfgEspDefault = cfgBool("esp", true)
-  cfgGodDefault = cfgBool("godmode", true)
-  cfgStaminaDefault = cfgBool("infiniteStamina", false)
-  cfgNoRecoilDefault = cfgBool("noRecoil", false)
-  cfgNoWeightDefault = cfgBool("noWeight", false)
-  cfgInstaHealDefault = cfgBool("instantHeal", false)
-  cfgAmmoDefault = cfgBool("unlimitedAmmo", false)
-  cfgThermalDefault = cfgBool("thermalVision", false)
-  cfgNightVisDefault = cfgBool("nightVision", false)
-  cfgFlyDefault = cfgBool("fly", false)
-  cfgTeleportDefault = cfgBool("teleport", false)
-  cfgTimeDefault = cfgBool("timeOfDay", false)
+var gRegion: AdminRegion
+
+proc applyConfigToggles() =
+  ## config.json is the initial state at load. seedDefaults sets ESP+God on the
+  ## first time any process maps the region; then this overlays the config so a
+  ## fresh launch honours the file. After load the F6 menu owns the toggles.
+  if gRegion == nil: return
+  adminSeedDefaults(gRegion)
+  setToggle(gRegion, admEsp,       cfgBool("esp", true))
+  setToggle(gRegion, admGodmode,   cfgBool("godmode", true))
+  setToggle(gRegion, admStamina,   cfgBool("infiniteStamina", false))
+  setToggle(gRegion, admNoRecoil,  cfgBool("noRecoil", false))
+  setToggle(gRegion, admNoWeight,  cfgBool("noWeight", false))
+  setToggle(gRegion, admInstaHeal, cfgBool("instantHeal", false))
+  setToggle(gRegion, admAmmo,      cfgBool("unlimitedAmmo", false))
+  setToggle(gRegion, admThermal,   cfgBool("thermalVision", false))
+  setToggle(gRegion, admNightVis,  cfgBool("nightVision", false))
+  setToggle(gRegion, admFly,       cfgBool("fly", false))
+  setToggle(gRegion, admTeleport,  cfgBool("teleport", false))
+  setToggle(gRegion, admTimeOfDay, cfgBool("timeOfDay", false))
   cfgEspMaxDistance = setting("espMaxDistance").asFloat(400.0)
 
-proc seedToggles() =
-  ## The config values are the initial toggle states. After the menu changes a
-  ## toggle it lives in `adm/state`, not here.
-  setToggle(tgEsp, cfgEspDefault)
-  setToggle(tgGod, cfgGodDefault)
-  setToggle(tgStamina, cfgStaminaDefault)
-  setToggle(tgNoRecoil, cfgNoRecoilDefault)
-  setToggle(tgNoWeight, cfgNoWeightDefault)
-  setToggle(tgInstaHeal, cfgInstaHealDefault)
-  setToggle(tgAmmo, cfgAmmoDefault)
-  setToggle(tgThermal, cfgThermalDefault)
-  setToggle(tgNightVis, cfgNightVisDefault)
-  setToggle(tgFly, cfgFlyDefault)
-  setToggle(tgTeleport, cfgTeleportDefault)
-  setToggle(tgTime, cfgTimeDefault)
-
 # ---------------------------------------------------------------------------
-# The F12 settings schema
+# The F12 settings schema (client-only route; the F6 menu is the live control)
 # ---------------------------------------------------------------------------
-#
-# Declared so the modes also appear on the F12 settings screen. NOTE: a
-# client-only mod's route is not served on the backend, so its F12 page may read
-# "could not read this page" (docs/SETTINGS.md) -- the authoritative control is
-# the F6 menu. The schema is still declared, both for completeness and for the
-# day the client host serves its own settings surface.
 
 proc adminSchema(): seq[Setting] =
   result = @[
     boolSetting("esp", "ESP", true, category = "Visuals",
-                description = "Boxes, distance and side-colour on every player"),
+                description = "Boxes and side-colour on every player (F6 menu)"),
     boolSetting("godmode", "God mode", true, category = "Combat",
-                description = "Suppress incoming damage to the local player"),
-    boolSetting("infiniteStamina", "Infinite stamina", false,
-                category = "Movement"),
-    boolSetting("noRecoil", "No recoil / sway", false, category = "Combat"),
+                description = "Pin the local player's health (F6 menu)"),
+    boolSetting("infiniteStamina", "Infinite stamina", false, category = "Movement"),
+    boolSetting("noRecoil", "No recoil / sway", false, category = "Combat",
+                implemented = false, description = "Read; write not bound yet"),
     boolSetting("noWeight", "No weight", false, category = "Movement",
-                implemented = false,
-                description = "Read; the encumbrance write is not bound yet"),
+                implemented = false, description = "Read; write not bound yet"),
     boolSetting("instantHeal", "Instant heal", false, category = "Combat",
-                implemented = false,
-                description = "Read; per-body-part heal not bound yet"),
+                implemented = false, description = "Read; write not bound yet"),
     boolSetting("unlimitedAmmo", "Unlimited ammo", false, category = "Combat",
-                implemented = false,
-                description = "Read; magazine write not bound yet"),
+                implemented = false, description = "Read; write not bound yet"),
     boolSetting("thermalVision", "Thermal vision", false, category = "Visuals",
-                implemented = false,
-                description = "Read; vision-mode toggle not bound yet"),
+                implemented = false, description = "Read; write not bound yet"),
     boolSetting("nightVision", "Night vision", false, category = "Visuals",
-                implemented = false,
-                description = "Read; vision-mode toggle not bound yet"),
+                implemented = false, description = "Read; write not bound yet"),
     boolSetting("fly", "Fly / noclip", false, category = "Movement",
-                implemented = false,
-                description = "Read; movement-state override not bound yet"),
+                implemented = false, description = "Read; write not bound yet"),
     boolSetting("teleport", "Teleport to marker", false, category = "Movement",
-                implemented = false,
-                description = "Read; position write not bound yet"),
+                implemented = false, description = "Read; write not bound yet"),
     boolSetting("timeOfDay", "Set time of day", false, category = "World",
-                implemented = false,
-                description = "Read; game-date-time write not bound yet"),
+                implemented = false, description = "Read; write not bound yet"),
     floatSetting("espMaxDistance", "ESP max distance (m)", 400.0,
                  lo = 10.0, hi = 2000.0, step = 10.0, category = "Visuals")]
 
 proc onAdminSettings(url, body, session: string): string =
   if body.len > 0 and applySettingFromBody(body) == Ok:
-    loadConfig()
-    seedToggles()
+    applyConfigToggles()
   result = declaredSchemaJson().text
 
 # ---------------------------------------------------------------------------
-# The main-thread gate
+# Capability -- what the mod could actually arm, so the menu is honest
 # ---------------------------------------------------------------------------
 
-var gBound = false
-var gAskedAt = 0'i64
-
-proc mainThreadBound(nowMs: int64): bool =
-  ## True once the host's per-frame drain has actually fired on Unity's thread.
-  ## Re-asked every two seconds until affirmative; never asked again after.
-  if gBound:
-    return true
-  if nowMs - gAskedAt < 2000'i64 and gAskedAt != 0'i64:
-    return false
-  gAskedAt = nowMs
-  var raw = ""
-  if call("aowlspt.host::main_thread", "[]", raw) != Ok:
-    return false
-  gBound = asBool(field(raw, "bound"), false)
-  result = gBound
+proc publishCapability() =
+  var cap = 0'u32
+  if dataResolved():  cap = cap or (1'u32 shl admEsp)
+  if godCapable():    cap = cap or (1'u32 shl admGodmode)
+  if staminaCapable(): cap = cap or (1'u32 shl admStamina)
+  # Every other mode is not bound on this build; left 0 => drawn "unavailable".
+  setCapability(gRegion, cap)
 
 # ---------------------------------------------------------------------------
-# The per-frame tick, on Unity's thread
+# The per-frame pass, on the host thread (memory reads need no Unity thread)
 # ---------------------------------------------------------------------------
 
 var gTick = 0'i64
 var gReported = false
 
-proc everyFrame(payload: string): string =
-  ## Runs once per drain on the game's thread -- but only touches the runtime
-  ## once the drain is confirmed. Everything managed is behind `gBound`.
+proc onUpdate(elapsedMs: int64): Status =
+  if gRegion == nil:
+    return Ok
   gTick = gTick + 1
-  let now = nowMs()
+  discard dataOpen()
 
-  # Input is a Win32 read; safe on any thread, so it runs whether or not the
-  # runtime is up. This is what makes the menu open even with no game world.
-  pollInput()
+  # Screen size the overlay is drawing at, so projection matches the boxes.
+  var w = hudWidth(gRegion)
+  var h = hudHeight(gRegion)
+  if w <= 0: w = 1920
+  if h <= 0: h = 1080
 
-  if not mainThreadBound(now):
-    return ""
+  collectAndPublish(gRegion, cfgEspMaxDistance, w, h)
 
-  # From here down is Unity's thread, confirmed. Bind the runtime once.
-  if not worldReady():
-    discard openWorld()
-    return ""
+  if toggleOn(gRegion, admGodmode): applyGodmode()
+  if toggleOn(gRegion, admStamina): applyStamina()
 
-  # Collect the world snapshot when anything that reads it is on: ESP or the
-  # menu want the entity list, and God mode / stamina want the local-player
-  # pointer the same pass resolves. Cheap-refused if nothing bound.
-  if toggleOn(tgEsp) or menuVisible() or toggleOn(tgGod) or toggleOn(tgStamina):
-    collectEsp(cfgEspMaxDistance)
+  publishCapability()
+  setStatus(gRegion, dataStatus())
 
-  # Apply the frame-resident cheats. Each is a no-op unless its toggle is on and
-  # its binding resolved; each sets its own capability bit.
-  applyCheats()
-
-  # Hand the frame to the renderer. Native drawing paints only in the render
-  # phase (pending); until then this computes and logs the geometry.
-  renderFrame()
-
-  if not gReported and gTick > 120:
+  if not gReported and gTick > 200:
     gReported = true
-    info "admin: " & adminDiag()
-
-  result = ""
+    info "admin: " & dataStatus()
+  result = Ok
 
 # ---------------------------------------------------------------------------
 # Lifecycle
 # ---------------------------------------------------------------------------
 
 proc onLoad(): Status =
-  loadConfig()
-  seedToggles()
+  gRegion = adminMap()
+  if gRegion == nil:
+    warn ModName & ": could not map the shared HUD region; the menu and ESP " &
+         "are unavailable this session (the game is otherwise untouched)"
+    declareSettings(adminSchema())
+    return Ok
+
+  applyConfigToggles()
   declareSettings(adminSchema())
   discard serve("/aowlspt/settings/" & ModGuid, onAdminSettings)
 
-  # God mode's damage hook is installed once, at load, on Unity's thread when it
-  # fires -- but the *hook registration* itself is a host call, safe here.
-  installGodmode()
-
   if side() == sideClient:
-    if everyMain(everyFrame) == Ok:
-      info ModName & " " & ModVersion &
-           " loaded; F6 opens the admin menu (ESP + God mode on by default)"
-    else:
-      warn ModName & ": the host has no Unity-thread drain to run on; " &
-           "cheats stay off (menu input still works)"
+    info ModName & " " & ModVersion &
+         " loaded; F6 opens the admin menu (ESP + God mode on by default). " &
+         "Cheats resolve by field offset -- see adminDiag() for what bound."
   else:
-    info ModName & " loaded on a non-client side; it does nothing here"
+    info ModName & " loaded on a non-client side; the HUD does nothing here"
   result = Ok
 
 proc onUnload(): Status =
-  discard stopMainRepeats()
-  removeGodmode()
+  ## The shared region is a file mapping shared with the overlay; it is left
+  ## mapped (the overlay may still be drawing). Toggles simply stop being read.
   result = Ok
 
 exportMod(
@@ -289,4 +212,5 @@ exportMod(
   sptRange = "*",
   sides = {sideClient, sideSim},
   onLoad = onLoad,
+  onUpdate = onUpdate,
   onUnload = onUnload)

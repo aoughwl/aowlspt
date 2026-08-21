@@ -1,146 +1,124 @@
 # Admin / cheat menu
 
-An in-game admin panel for post-1.0 Escape From Tarkov (IL2CPP build
-`1.1.0.1.46777`), running as a native aowlspt client mod. Press **F6** to toggle
-the menu; **ESP** and **God mode** are ON by default, every other mode is off.
+A fully native, client-side admin panel for post-1.0 Escape From Tarkov (IL2CPP
+build `1.1.0.1.46777`). Press **F6** for an in-game menu of togglable cheat
+modes; **ESP** and **God mode** default ON, the rest off.
 
 ```
-aowl build-mod mods/admin
+aowl build-mod mods/admin      # the mod
+aowl build                     # host + overlay (the native HUD lives here)
 ```
 
-## The one rule everything is built around
+## Why fully native (no managed bridge)
 
-**A managed IL2CPP call is only legal from Unity's own thread.** Making one from
-the host's thread crashes this client. So all of this mod's per-frame work — the
-ESP world walk, God mode, stamina — runs inside `everyMain`, which the host
-drains from a per-frame game method (i.e. on Unity's thread), and **only after**
-the host confirms that drain has actually fired (`aowlspt.host::main_thread` →
-`bound:true`). Until that gate is affirmative the mod touches nothing managed:
-the menu still opens (its input is a `GetAsyncKeyState` read, not a managed
-call), and every mode reads "unavailable". No bound Unity thread → no cheat → no
-crash.
+On this build the anti-cheat strips the per-frame `MethodInfo.methodPointer`, so
+the managed Unity-thread bridge is dead: **you cannot call a game method**. Two
+capabilities remain, and this mod is built entirely on them:
 
-## Strategy: managed reflection on the Unity thread, not raw memory
+- **Field-offset memory reads/writes.** `il2cpp_field_get_offset` is a metadata
+  query, not a stripped method, so resolving a field's offset once and reading
+  `*(T*)(object + offset)` works — from any thread. That is the ESP data pass and
+  the God mode / stamina writes.
+- **Drawing in the game's own `IDXGISwapChain::Present`.** The overlay hooks
+  Present exactly once; the ESP boxes and F6 menu are drawn there as a HUD on the
+  frame — the same place Steam/Discord and the graphics post-process draw. This
+  is a HUD, **not** the mod-manager panel.
 
-Two implementations were possible: (1) run cheat logic on the Unity thread via
-the host's main-thread bridge and reach the game through the IL2CPP runtime, or
-(2) a classic internal cheat reading `GameAssembly.dll` memory through hardcoded
-struct offsets.
+So there is no `everyMain`, no `il2cpp_runtime_invoke`, no Unity thread anywhere.
 
-**This mod uses strategy 1.** The reason is concrete: this repo has *no* offset
-tooling and *no* stored offsets — no `dump_types.py`, no GameWorld/Player/
-HealthController/Camera offset table anywhere. Everything in aowlspt reaches the
-game by IL2CPP reflection (`il2cpp_field_get_offset` → `object+offset`) and bound
-managed calls, and the main-thread bridge that makes that safe per-frame is
-already merged. Strategy 2 would have meant first building an offset dumper from
-decrypted metadata — a separate project — for a fragility (fixed offsets break
-every patch) the reflection path does not have. The proven client mods (`fov`,
-`sain`, `morebots`) all take strategy 1; this follows them.
+## The two halves and how they meet
 
-Godmode's *native byte-patch* alternative (like the BE-bypass in
-`abi/aowlspt_beclient.h`) was considered and is the right tool once the damage
-method's RVA on this exact build is known — but that RVA is not in the repo, so
-godmode is done as a managed damage-suppression hook instead, which needs no RVA
-and degrades gracefully.
+| half | where | thread |
+|---|---|---|
+| **data + cheats** | `mods/admin` (`adm/data.nim`) | host `on_update` — memory reads need no particular thread |
+| **render** | the overlay's Present hook (`abi/aowlspt_overlay.h`) | the D3D11 render thread |
 
-## The split: what is real, what is pending
+They rendezvous through a **named shared-memory region** (`abi/aowlspt_admin.h`,
+`Local\aowlspt_admin_shared_v3`) both map by name: the mod publishes a
+seqlock-protected frame of pre-projected entities + the capability mask; the
+overlay reads it and draws. The overlay also writes its back-buffer size into the
+region each frame so the mod projects to the exact resolution the boxes draw at.
+The **F6 keypress and menu navigation** are handled in the overlay's WndProc,
+which flips the toggles the mod then reads — so the menu the overlay draws and
+the mod's behaviour are always one shared state.
 
-Because rendering must go through the **game's own** rendering (never the host's
-D3D11 overlay), the work divides along the frame's phases:
+### The render path (real, compiles, testable)
 
-### Runs now — managed reads/writes on Unity's thread
+`abi/aowlspt_overlay.h` gains an admin HUD drawn inside its existing single
+Present hook, independent of the mod-manager panel's visibility:
 
-| piece | how |
-|---|---|
-| Toggle framework + F6 menu state | `adm/state.nim` — pure state + `GetAsyncKeyState` input, safe from any thread |
-| ESP **data** pass | `adm/world.nim` — `GameWorld.Instance` → `AllAlivePlayersList` → each `Player`'s `get_Position`/`get_IsAI`/`get_Side`, plus the camera's `worldToCameraMatrix`×`projectionMatrix`, projected to screen |
-| God mode | `adm/cheats.nim` — a prefix hook on the damage method, suppressing only the local player's hits while the toggle is on |
-| Infinite stamina | `adm/cheats.nim` — per-frame write of the local player's `Physical.Stamina.Current` back to full |
+- `aowl_ov_admin_append()` — ESP boxes (side-coloured, health bar, distance,
+  name) in true back-buffer pixels, and the F6 menu at panel scale, using the
+  overlay's own proven D3D11 pipeline and 8×16 font.
+- present body — draws the HUD when the F6 menu is open or ESP is live in a raid,
+  forcing a rebuild so per-frame ESP is not held by the panel's geometry cache.
+- WndProc — F6 toggles the menu (independent of the panel); ↑/↓ move,
+  Enter/Space/←/→ toggle the selected mode, only while the menu is open.
+- coexists with the graphics post-process's `g_ov_prePresent` slot: the HUD is an
+  additive draw *inside* the overlay body, not a second Present hook.
 
-Each is armed only when every binding it needs resolved, sets its own capability
-flag, and reports "unavailable" otherwise. `adminDiag()` (logged ~2 s after a
-raid starts) prints every binding's own account.
+Verified to compile via the D3D11 test stand-in (`tests/overlayhost`), which is
+how the repo tests `aowlspt_overlay.h`.
 
-### Pending — the pixels
+### The data path (field-offset framework; offsets are the live-iteration part)
 
-The actual **drawing** is the pending part, and honestly so. Native Unity
-rendering is *render/GUI-phase* work: `GL` immediate mode only rasterises inside
-camera rendering, and post-1.0 there is no `MonoBehaviour`/`OnGUI` to receive a
-GUI event (see `docs/IL2CPP.md`). The host's bridge drains in the **Update**
-phase, so a `GL`/`GUI` call from `everyMain` is on the right thread at the wrong
-point in the frame and paints nothing.
+`adm/data.nim` walks the world by field offset only: the GameWorld singleton (a
+static field, read via `staticFieldData` + offset with no class-ctor run), its
+player list (`List<T>` `_items`/`_size` + the il2cpp array element base — ABI
+constants), each player's position / side / AI flag, and the camera's
+view-projection matrix. It projects each player and publishes the boxes.
 
-`adm/render.nim` is therefore written **against the interface it needs** — a
-callback that fires *during rendering* on Unity's thread — and reports every
-frame whether that callback exists yet (`renderReady()` / `setRenderPhase()`):
+**The offsets/field names are the live-iteration parameters.** They resolve *by
+name* through reflection (a correct name → the right offset for this build), and
+every one degrades to "unavailable" on a miss: ESP shows nothing, God mode is
+off, the menu still opens. The names are the pre-1.0 surface and unconfirmed
+against build 46777 — the metadata dump (or a live probe) fills them in one
+place, the `const` block at the top of `adm/data.nim`:
 
-- the ESP geometry is computed and counted every frame (proving the data pass
-  works even with nothing on screen);
-- the menu is laid out and logged to `Player.log` (so it is observable now);
-- `UnityEngine.GL` is *probed* so the diag says whether the drawing surface is
-  even present on this client.
+| parameter | current | meaning |
+|---|---|---|
+| `SingletonClass`/`SingletonField` | `EFT.GameWorld` / `Instance` | the GameWorld singleton static field |
+| `PlayersField` | `RegisteredPlayers` | the world's player list |
+| `PosField`/`SideField`/`IsAiField` | `Position`/`Side`/`IsAI` | per-player fields |
+| `VpMatrixField` | *(empty)* | the camera view-projection matrix source — **required for boxes to project** |
+| `GodHealthField` | *(empty)* | the health float God mode pins each frame |
+| `StaminaField` | *(empty)* | the stamina float to pin |
 
-The moment a render-phase drain lands — either the bridge growing a render-phase
-queue, or a detour of a render-phase method once its name is confirmed on a live
-build — `drawEspGL`/`drawMenu` already have the geometry and the surface and go
-live with **no change to the rest of the mod**. The menu's text rows are the one
-piece that additionally needs a GUI context (IMGUI), which is the genuinely
-absent post-1.0 surface; the ESP boxes need only `GL`.
-
-## The object-model path (unverified against BSG's live client)
-
-Every name below is from the pre-1.0 C# surface; post-1.0 is a different build.
-A wrong name is a refused binding with a `why` line and a mode that reads
-"unavailable" — never a wrong write or a crash.
-
-- **ESP:** `EFT.GameWorld::get_Instance` (static) → `get_MainPlayer`,
-  `get_AllAlivePlayersList` → `List<>::get_Count`/`get_Item` → per player
-  `get_Position` (a `Vector3`, read by its native hidden-return-pointer shape,
-  exactly as `mods/morebots` does), `get_IsAI`, `get_Side`. Camera via
-  `UnityEngine.Camera::get_main`, falling back to
-  `EFT.CameraControl.CameraManager::get_Instance`→`get_Camera`; then
-  `get_worldToCameraMatrix` and `get_projectionMatrix` (`Matrix4x4`, same shaped
-  read), multiplied to a world→clip matrix and projected in `world.nim`.
-- **God mode:** a prefix hook (`hookArgs` + suppression) on the first of
-  `EFT.Player::ApplyDamageInfo`, `EFT.Player::ReceiveDamage`,
-  `EFT.HealthSystem.ActiveHealthController::ApplyDamage` that binds; the
-  suppression value is chosen from the method's real declared return type.
-- **Stamina:** `EFT.Player::get_Physical` → `EFT.Player.Physical::get_Stamina` →
-  the `Current` field on the stamina value (`GStruct.StaminaValues` — the struct
-  name is a guess and refuses cleanly if wrong).
+Empty = unresolved, so on an un-dumped build the menu opens and every mode reads
+"unavailable" or (for ESP) shows no boxes until `VpMatrixField` and the player
+fields are confirmed. That is the safe-by-default contract.
 
 ## Safety guards
 
-- **Main-thread gate** — no managed call until `aowlspt.host::main_thread`
-  reports `bound:true`.
-- **Graceful degradation** — every binding is guarded; a refusal disables the
-  mode and marks it "unavailable" rather than guessing. An empty world, no
-  camera, or a wrong name is a menu that does nothing, never a fault.
-- **God mode is scoped** — it suppresses damage only when `this` is the local
-  player, so bots still take hits and the raid still behaves.
-- **Value-type reads are shape-checked** — `Vector3`/`Matrix4x4` are read by the
-  Win64 hidden-return-pointer ABI, into oversized buffers so a larger-than-
-  expected value type cannot overrun.
-- **Read-only ESP** — the world pass writes nothing into the game.
+- **Every memory read is address-checked** (`VirtualQuery`, committed +
+  readable + in-region) before dereference, so a wrong offset or a moved object
+  is a zero, never a fault.
+- **Seqlock** on the published frame — a half-written frame is retried, not
+  drawn.
+- **Capability-gated** — a mode whose field did not resolve is drawn dim and its
+  toggle does nothing.
+- **No managed calls** anywhere — the thing that crashes this client is never
+  done.
+- **Absent region / runtime** — a no-op HUD and an untouched game.
 
 ## The toggles
 
 `ESP`, `God mode` (both on by default), `Infinite stamina`, `No recoil/sway`,
 `No weight`, `Instant heal`, `Unlimited ammo`, `Thermal vision`, `Night vision`,
-`Fly/noclip`, `Teleport to marker`, `Set time of day`. The first two plus
-stamina are wired; the rest are declared, read from config/F12, and reported
-"unavailable" until their managed writes are bound — the safe-by-default
-contract.
-
-Menu keys: **F6** open/close · **↑/↓** move · **Enter/Space/←/→** toggle the
-selected mode. Defaults live in `config.json` and the F12 schema in `admin.nim`;
-after you change a toggle in the menu it lives in the mod's own state.
+`Fly/noclip`, `Teleport to marker`, `Set time of day`. ESP + God mode + stamina
+have their write/read paths wired (capability follows whether the field
+resolved); the rest are declared, read from config/F12, and drawn "unavailable"
+until their offsets land. Defaults live in `config.json` and the F12 schema;
+after load the F6 menu owns them.
 
 ## Files
 
-- `admin.nim` — entry, config, F12 schema, the main-thread gate, the per-frame tick.
-- `adm/state.nim` — toggles, capability flags, menu, keyboard.
-- `adm/world.nim` — the ESP data pass and projection.
-- `adm/cheats.nim` — God mode and stamina.
-- `adm/render.nim` — native rendering, gated on the pending render-phase hook.
+- `abi/aowlspt_admin.h` — the shared-memory surface: toggles, the ESP frame,
+  projection, guarded raw field reads, screen-size handoff.
+- `abi/aowlspt_overlay.h` — the native HUD (ESP + F6 menu) inside the Present
+  hook (additive edits, marked).
+- `admin.nim` — map the region, seed/apply config, the `on_update` data+cheats
+  pass, the F12 schema.
+- `adm/shared.nim` — the nimony face of `aowlspt_admin.h`.
+- `adm/data.nim` — the field-offset ESP data pass + God mode / stamina writes.
 - `config.json` — initial toggle states.
