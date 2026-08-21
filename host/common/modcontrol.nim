@@ -788,6 +788,15 @@ proc jsonBool(doc, key: string; into: var bool): bool =
     return true
   result = false
 
+proc parseInRaid*(doc: string; into: var bool): bool =
+  ## Reads the backend's `inRaid` flag out of a client-set poll response. The
+  ## manager folds it into the same body `parseDesired` validates, so a caller
+  ## reads it only after `parseDesired` has accepted the document. Returns false
+  ## (leaving `into` untouched) when the field is absent — an older manager, or a
+  ## body that never carried it — so the caller keeps its last known state rather
+  ## than guessing.
+  jsonBool(doc, "inRaid", into)
+
 proc jsonInt(doc, key: string; into: var int): bool =
   var raw = ""
   if not pathGet(doc, key, raw):

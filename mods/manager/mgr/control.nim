@@ -459,6 +459,33 @@ proc onProbeTimeout(payload: string): string =
          "when the host restarts."
   result = ""
 
+# ---------------------------------------------------------------------------
+# Raid state, relayed to the client host for the graphics post-process gate
+# ---------------------------------------------------------------------------
+#
+# The tarkov mod broadcasts `tarkov.raid.started` when the 3D world begins
+# loading (POST /client/match/local/start) and `tarkov.raid.ended` on the way
+# out (POST /client/match/local/end). The manager is already the thing the
+# client host polls for its mod set, so it is the natural place to fold in one
+# more bit of state: whether a raid is in progress. The client host reads
+# `inRaid` out of that same poll response and gates the graphics post-process on
+# it, so the grade lands on the raid world and the menu stays stock. No new
+# endpoint, no new poll — it rides the request that is already being made.
+
+var gInRaid = false
+
+proc raidActive*(): bool =
+  ## Whether a raid is in progress, for `routeClient` to report as `inRaid`.
+  gInRaid
+
+proc onRaidStarted(payload: string): string =
+  gInRaid = true
+  result = ""
+
+proc onRaidEnded(payload: string): string =
+  gInRaid = false
+  result = ""
+
 proc controlInit*(probeMs: int) =
   ## Subscribe, probe, and arm the timeout that turns silence into an answer.
   ##
@@ -469,6 +496,9 @@ proc controlInit*(probeMs: int) =
   discard onEvent("aowlspt.host.mods.capabilities", onCapabilities)
   discard onEvent("aowlspt.host.mods.result", onResult)
   discard onEvent("aowlspt.host.mods.listed", onListed)
+  # Raid state from the tarkov mod, relayed to the client host via routeClient.
+  discard onEvent("tarkov.raid.started", onRaidStarted)
+  discard onEvent("tarkov.raid.ended", onRaidEnded)
 
   var probe = obj()
   put(probe, "from", "aowl.manager")

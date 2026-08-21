@@ -1674,6 +1674,10 @@ proc onMatchStart(url, body, session: string): string =
   let startMode = field(body, "mode").asText("")
   if startLocation.len > 0:
     enterRaid(session, startLocation, startMode)
+  # The definitive raid-entry signal: the 3D world is loading now. The manager
+  # relays this to the client host so the graphics post-process grades the raid
+  # world and leaves the menu stock. Paired with `tarkov.raid.ended` below.
+  discard broadcast("tarkov.raid.started", objOf("location", startLocation))
 
   # The per-raid skill counter resets here rather than at the end: the raid the
   # player is entering is the one whose gains are capped.
