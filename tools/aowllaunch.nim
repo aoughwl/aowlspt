@@ -130,10 +130,21 @@ Options
   --exe NAME     executable to start (default: EscapeFromTarkov.exe)
   --args "..."   extra command line for the game, appended to the one this
                  builds from backend.json and the chosen profile
-  --profile ID   play this profile id and do not ask
-  --new NAME     create a profile called NAME and play it
+  --profile ID   bind this profile id server-side before launch (the game's
+                 own character-select still shows, this just pre-selects)
+  --new NAME     create a profile called NAME and bind it before launch
   --side SIDE    Usec or Bear, for --new (default Usec)
-  --no-profile   start the client with no -token, so it logs in on its own
+  --pick         show the launcher's own profile picker before starting the
+                 game. OFF by default: the game has its own character-select
+                 screen, and asking twice is the same choice made twice. With
+                 this off (the default) the launcher picks a profile without
+                 asking -- the one you played last, else the most recent -- and
+                 binds it, so the session is authenticated and the in-game
+                 screen is the only thing that asks you anything.
+  --no-profile   start the client with no -token, so it logs in on its own.
+                 The backend binds no session for a tokenless client, so this
+                 is the first-run/character-creation path only -- it cannot
+                 reach an existing character.
   --wait         stay open until the game exits
   --no-backend   do not start the backend server
   --no-logs      do not show the live log view; exit once the game is up
@@ -188,6 +199,10 @@ type
     newProfile: string
     side: string
     noProfile: bool
+    pick: bool
+      ## `--pick`: restore the launcher's own TUI profile picker. Off by
+      ## default -- the launcher boots straight to the game, whose in-game
+      ## character-select is the single place a profile is chosen.
     port: int
       ## Only meaningful when `portGiven`. The port actually used is resolved
       ## in `main`, once `root` is known and `backend.json` can be read.
@@ -206,7 +221,7 @@ proc parseArgs(): Options =
                    logsOnly: false,
                    clientWindow: false, plain: false, ascii: false,
                    profileId: "", newProfile: "", side: "Usec",
-                   noProfile: false, port: 0,
+                   noProfile: false, pick: false, port: 0,
                    portGiven: false, allowPortMismatch: false,
                    backendWait: 300, tailPath: "", tailTitle: "log",
                    help: false)
@@ -240,6 +255,8 @@ proc parseArgs(): Options =
       if i <= n: result.tailTitle = paramStr(i)
     elif a == "--no-profile":
       result.noProfile = true
+    elif a == "--pick":
+      result.pick = true
     elif a == "--wait":
       result.wait = true
     elif a == "--no-backend":
@@ -912,6 +929,128 @@ proc watchClient(launch: LaunchPtr; hostLog: string; limitMs: int64;
     sleepMs 120
 
 # ---------------------------------------------------------------------------
+# The backend watchdog
+# ---------------------------------------------------------------------------
+#
+# A backend death used to be a silent hang: the process the launcher started on
+# 127.0.0.1:443 would vanish -- a native fault in the C net engine, a fast-fail
+# on a corrupt heap -- and the game, which reaches that server for everything,
+# would simply stop making progress with nothing on screen to say why. "It
+# crashed again", with no crash anyone could see.
+#
+# The watchdog makes that self-healing. Once the backend is started, the run
+# loops below poll it (every `WdCheckMs`) for as long as the game is alive; if it
+# has died, they respawn it with *exactly* the command line it was started with
+# and carry on, so the game only ever sees the server blink and reconnect. The
+# backend truncates its own log on each boot and the tail follows the reset, so
+# the log view stays coherent across a restart.
+#
+# It is bounded, on purpose. A backend that dies the instant it comes up would,
+# without a bound, be fork-bombed forever. So a restart streak that does not stay
+# up for `WdStableMs` is counted, and after `WdMaxRapid` rapid deaths the
+# watchdog gives up and flips `givenUp` -- which the views turn into a loud,
+# unmistakable "BACKEND DOWN" the player actually sees, rather than one more
+# silent stall. A backend that had been healthy for a while resets the streak, so
+# one crash after an hour of play is not held against it.
+
+type
+  Watchdog = object
+    exe, workDir, cmdLine, logPath: string
+    port: int
+    active: bool        ## true once we own a backend to keep alive
+    handle: uint64      ## current process handle, 0 when none/dead
+    restarts: int       ## how many times it has been respawned
+    fails: int          ## consecutive rapid deaths (reset once it stays up)
+    lastStartMs: int64
+    lastCheckMs: int64
+    givenUp: bool       ## bound hit: stop restarting, surface a hard error
+
+const
+  WdCheckMs = 2000'i64    ## how often the run loops poll for a death
+  WdStableMs = 20000'i64  ## up this long => the rapid-death streak is forgiven
+  WdMaxRapid = 5          ## give up after this many rapid deaths in a row
+
+var gWd = Watchdog(exe: "", workDir: "", cmdLine: "", logPath: "", port: 0,
+                   active: false, handle: 0'u64, restarts: 0, fails: 0,
+                   lastStartMs: 0'i64, lastCheckMs: 0'i64, givenUp: false)
+
+proc wdArm(exe, workDir, cmdLine, logPath: string; port: int; handle: uint64) =
+  ## Remember what the backend was started as, so the watchdog can restart it
+  ## byte-for-byte. Called once, right after the initial spawn.
+  gWd.exe = exe
+  gWd.workDir = workDir
+  gWd.cmdLine = cmdLine
+  gWd.logPath = logPath
+  gWd.port = port
+  gWd.handle = handle
+  gWd.active = true
+  gWd.lastStartMs = cNowMs()
+  gWd.lastCheckMs = cNowMs()
+
+proc wdAlive(): bool =
+  gWd.handle != 0'u64 and cSpawnAlive(gWd.handle) != 0'i32
+
+proc wdPoll(clientAlive: bool): bool =
+  ## Keep the owned backend alive while the game runs; return its current
+  ## aliveness. Rate-limited to `WdCheckMs` -- between polls it just reports the
+  ## live handle, so the header stays honest without hammering the check.
+  if not gWd.active or gWd.givenUp:
+    return wdAlive()
+  let now = cNowMs()
+  if now - gWd.lastCheckMs < WdCheckMs:
+    return wdAlive()
+  gWd.lastCheckMs = now
+  if gWd.handle != 0'u64 and cSpawnAlive(gWd.handle) != 0'i32:
+    return true
+  # The backend is gone.
+  if not clientAlive:
+    # No game left to serve, so do not resurrect a server nobody is talking to:
+    # let it stay down and let the caller's "both gone" exit fire.
+    return false
+  let lived = now - gWd.lastStartMs
+  if lived >= WdStableMs:
+    gWd.fails = 0   # it had been healthy; treat this as a fresh incident
+  inc gWd.fails
+  if gWd.fails > WdMaxRapid:
+    gWd.givenUp = true
+    err "BACKEND DOWN -- aowlspt-backend died " & $gWd.fails & " times in " &
+        "quick succession and will not be restarted again. The game cannot " &
+        "reach its server on 127.0.0.1:" & $gWd.port & "."
+    note "see " & gWd.logPath & " (and any aowlspt-backend.log.fatal beside " &
+         "it) for why. Quit with q, fix it, then relaunch."
+    return false
+  # Restart with exactly the command line it was started with.
+  var e = gWd.exe
+  var w = gWd.workDir
+  var c = gWd.cmdLine
+  let h = cSpawnQuiet(toCString(e), toCString(w), toCString(c))
+  gWd.handle = h
+  gWd.lastStartMs = now
+  inc gWd.restarts
+  if h == 0'u64:
+    err "backend died -- restart #" & $gWd.restarts &
+        " could not be spawned (CreateProcess failed)"
+    return false
+  warn "backend died -- restarting (restart #" & $gWd.restarts &
+       ", on 127.0.0.1:" & $gWd.port & ")"
+  return true
+
+proc wdBackendAlive(backendProc: uint64; owned, clientAlive: bool): bool =
+  ## The single place the run loops ask "is the server up?". When this launcher
+  ## owns the backend the answer runs through the watchdog (which may restart it
+  ## as a side effect); otherwise it is a plain liveness check on the handle it
+  ## was given -- `--logs` attaches to somebody else's server and never restarts.
+  if owned and gWd.active:
+    wdPoll(clientAlive)
+  else:
+    backendProc != 0'u64 and cSpawnAlive(backendProc) != 0'i32
+
+proc wdCurrentHandle(backendProc: uint64): uint64 =
+  ## The handle to kill/probe now -- the watchdog's, if it has been restarting,
+  ## else the original.
+  if gWd.active: gWd.handle else: backendProc
+
+# ---------------------------------------------------------------------------
 # The live log view
 # ---------------------------------------------------------------------------
 #
@@ -1048,9 +1187,12 @@ proc streamLogs(server, client: var Tail; backendProc: uint64;
       # else's session, and "there is nothing running" is a state to sit in and
       # report, not a reason to close the window somebody opened to watch for
       # the thing starting.
-      let clientGone = launch == nil or cLaunchAlive(launch) == 0'i32
-      let backendGone = backendProc == 0'u64 or cSpawnAlive(backendProc) == 0'i32
-      if clientGone and backendGone:
+      let clientAlive = launch != nil and cLaunchAlive(launch) != 0'i32
+      # The watchdog runs here too: a redirected/plain session keeps a
+      # self-healing backend exactly as the painted view does, and prints its
+      # restart lines inline where they are readable in the file.
+      let backendUp = wdBackendAlive(backendProc, owned, clientAlive)
+      if (not clientAlive) and (not backendUp):
         line "  both the client and the backend have exited"
         return
     sleepMs 250
@@ -1112,7 +1254,8 @@ proc runLogView(root: string; who: string; backendProc: uint64;
       return
 
     let clientAlive = launch != nil and cLaunchAlive(launch) != 0'i32
-    let backendAlive = backendProc != 0'u64 and cSpawnAlive(backendProc) != 0'i32
+    # Through the watchdog when owned: this poll is what restarts a dead backend.
+    let backendAlive = wdBackendAlive(backendProc, owned, clientAlive)
 
     var f = newFrame(w, h)
 
@@ -1128,8 +1271,18 @@ proc runLogView(root: string; who: string; backendProc: uint64;
     head.put " "
     head.putIn ColDim, bxV()
     head.put " "
-    head.putIn (if backendAlive: ColGreen else: ColRed),
-               (if backendAlive: "server up" else: "server down")
+    var srvCol = ColGreen
+    var srvText = "server up"
+    if gWd.givenUp:
+      srvCol = ColRed
+      srvText = "SERVER DOWN"
+    elif not backendAlive:
+      srvCol = ColRed
+      srvText = "server down"
+    elif gWd.active and gWd.restarts > 0:
+      srvCol = ColYellow
+      srvText = "server up (restarted x" & $gWd.restarts & ")"
+    head.putIn srvCol, srvText
     head.put " "
     head.putIn ColDim, bxV()
     head.put " "
@@ -1209,7 +1362,15 @@ proc runLogView(root: string; who: string; backendProc: uint64;
 
     var help = newRow()
     help.put " "
-    if confirmQuit:
+    if gWd.givenUp:
+      # The hard, user-facing error. The backend is gone for good and the game
+      # cannot reach its server; say so loudly and say what to do, rather than
+      # leave the player staring at a frozen game.
+      help.putIn ColRed,
+        "BACKEND DOWN -- the game cannot reach its server on 127.0.0.1:" &
+        $gWd.port & " and auto-restart gave up. See the server pane / " &
+        "aowlspt-backend.log. Press q to quit and relaunch."
+    elif confirmQuit:
       help.putIn ColYellow,
         "the game is still running and will lose its server -- q again to " &
         "stop it anyway, d to leave everything running, any other key to stay"
@@ -1518,10 +1679,29 @@ proc main(): int =
       # "there is no backend in this install" -- and the real launch would go
       # on to start a client with nothing to talk to.
       warn "  no backend at " & be & "; the client would start alone"
+    let dExplicit = o.profileId.len > 0 or o.newProfile.len > 0
+    let dAuto = not o.noProfile and not o.pick and not dExplicit
     if o.noProfile:
-      line "  would ask     nothing about profiles (--no-profile)"
+      line "  would ask     nothing about profiles, and bind none (--no-profile)"
+    elif dAuto:
+      line "  would ask     nothing"
+      let l = listProfiles(port, root)
+      if l.error.len > 0:
+        line "  would play    nothing -- " & l.error & " -- so no -token"
+      else:
+        var dChosen = Profile(id: "", token: "", nickname: "", side: "",
+                              level: 0, edition: "", lastPlayed: 0)
+        var dWhy = ""
+        if autoProfile(l, readLastProfile(root), dChosen, dWhy):
+          line "  would play    " & profileLabel(dChosen) & " (" & dChosen.id &
+               ") -- " & dWhy & ", bound with -token before launch"
+        else:
+          line "  would play    nothing -- " & dWhy & " -- so no -token, and " &
+               "the game's own character creation runs"
     elif o.profileId.len > 0:
       line "  would play    " & o.profileId & " (--profile)"
+    elif o.newProfile.len > 0:
+      line "  would create  " & o.newProfile & " (--new) and play it"
     elif https:
       line "  would ask     which profile, read from the store on disk -- the " &
            "launcher cannot use the backend's profile routes over TLS"
@@ -1582,6 +1762,11 @@ proc main(): int =
       if backendProc == 0'u64:
         err "could not start the backend"
         return 1
+      # Arm the watchdog with exactly these spawn arguments. From here on, if the
+      # backend dies while the game is alive, the run loops restart it from this
+      # -- the player never sees the crash, only a brief "server restarting".
+      wdArm(be, bd, bc, joinPath(root, "aowlspt\\aowlspt-backend.log"), port,
+            backendProc)
       # Not `ok`, and not "started". All that is known here is that
       # `CreateProcess` returned a handle: the backend may already have exited
       # on a bad database, a held port or a mod that throws on load. It printed
@@ -1630,45 +1815,79 @@ proc main(): int =
   # --- the profile -----------------------------------------------------------
   var token = ""
   var who = ""
+  # The game has its own character-select screen (served by the tarkov mod's
+  # `/v2/client/game/profiles/` and `/client/game/profile/select`), and it shows
+  # on every boot regardless of the -token. A launcher picker on top of it is
+  # the same choice made twice -- the redundant second selector a player hits.
+  # So by default the launcher does NOT ask.
+  #
+  # **It does still bind.** Not asking is not the same as not selecting, and an
+  # earlier attempt at this conflated the two: it defaulted to the no-token boot
+  # path, and the client failed with "Client not authenticated". The reason is
+  # in the emulator, and it is not subtle. `-token=<id>` is the *only* thing
+  # that gives the client a `PHPSESSID` cookie (`clientCommandLine`, and
+  # `aowlbackend.parseHead` reads the session from that cookie and nowhere
+  # else). With no token the backend sees an empty session on every request --
+  # the live log said exactly that, `client/metadata HIT: body.len=49
+  # session=` -- and `tarkov.currentProfile` maps an empty session to no
+  # profile: `profileFor("")` is "", and its only fallback fires when the
+  # install holds exactly one profile *and* the session id is non-empty (it has
+  # to be, since the fallback works by `bindSession`ing it). So every
+  # `/client/` route answers "no profile on this session" and the client stops
+  # at authentication, before the character-select screen it was supposed to
+  # reach. The in-game screen cannot rescue this either: `onProfilesV2` fills
+  # the one "regular" slot from the first readable profile and `break`s, so it
+  # is not a multi-profile chooser to begin with.
+  #
+  # What the player actually wanted was one selector, not zero sessions. So the
+  # default auto-selects -- silently, from what is on record -- and pre-binds it
+  # through the same `selectProfile` call the interactive picker uses, so the
+  # bound-session path is identical whether or not anybody was asked. Zero
+  # profiles is the one case that still boots with no token: there is nothing to
+  # bind, and the game's own character-creation flow is the intended first run.
+  let explicitProfile = o.profileId.len > 0 or o.newProfile.len > 0
+  let autoSelect = not o.noProfile and not o.pick and not explicitProfile
+  heading "Profile"
+  if https and not o.noProfile:
+    # The launcher's own HTTP client is plain-only, so over TLS it cannot ask
+    # the backend for the profile list or create/select one; it reads the
+    # store on disk instead. Said once, here, so the store-source note that
+    # follows is not a surprise.
+    note "over TLS the launcher reads profiles from the store on disk: it " &
+         "speaks plain HTTP and cannot reach the backend's profile routes. " &
+         "Creating a profile from here needs a plain-HTTP (http://) backend."
+  var chosen = Profile(id: "", token: "", nickname: "", side: "", level: 0,
+                       edition: "", lastPlayed: 0)
+  var haveChoice = false
+  var viaRoute = false
+  var why = ""
   if o.noProfile:
-    heading "Profile"
-    note "--no-profile: the client is started with no -token and will log in " &
-         "on its own"
+    note "--no-profile: the client is started with no -token and will log " &
+         "in on its own. The backend binds no session for it, so this is the " &
+         "first-run/character-creation path, not a way into an existing " &
+         "character."
+  elif autoSelect:
+    let list = listProfiles(port, root)
+    viaRoute = list.source == psRoute
+    if list.error.len > 0:
+      # Not fatal: a backend with no profile route and no store on disk is an
+      # install with nothing to select, which is the first-run case.
+      warn list.error
+      note "nothing to select, so the client starts with no -token and the " &
+           "game's own character-creation flow runs"
+    else:
+      if list.note.len > 0: warn list.note
+      var reason = ""
+      if autoProfile(list, readLastProfile(root), chosen, reason):
+        haveChoice = true
+        ok "playing " & profileLabel(chosen) & " (" & chosen.id & ") -- " &
+           reason & "; pass --pick to choose, or --profile <id>"
+      else:
+        note reason & ", so the client starts with no -token and the game's " &
+             "own character-creation flow runs"
   else:
-    heading "Profile"
-    if https:
-      # The launcher's own HTTP client is plain-only, so over TLS it cannot ask
-      # the backend for the profile list or create/select one; it reads the
-      # store on disk instead. Said once, here, so the store-source note that
-      # follows is not a surprise.
-      note "over TLS the launcher reads profiles from the store on disk: it " &
-           "speaks plain HTTP and cannot reach the backend's profile routes. " &
-           "Creating a profile from here needs a plain-HTTP (http://) backend."
-    var chosen = Profile(id: "", token: "", nickname: "", side: "", level: 0,
-                         edition: "", lastPlayed: 0)
-    var why = ""
-    var viaRoute = false
     if pickProfile(o, port, root, chosen, why, viaRoute):
-      token = chosen.token
-      who = profileLabel(chosen)
-      # Rebind the session to this profile before the client arrives on it --
-      # for a listed profile as much as a freshly made one. The token to launch
-      # with is whatever `select` hands back, not the id the launcher held.
-      if viaRoute:
-        var bound = Profile(id: "", token: "", nickname: "", side: "",
-                            level: 0, edition: "", lastPlayed: 0)
-        let se = selectProfile(port, chosen.id, bound)
-        if se.len > 0:
-          err "could not select the profile on the server: " & se
-          note "the client would arrive on a session the server has not bound " &
-               "to this profile, and sit at the menu. This is a backend fault, " &
-               "not a launcher one -- see aowlspt-backend.log."
-          if backendProc != 0'u64:
-            cSpawnKill(backendProc)
-            line "  backend stopped"
-          return 1
-        token = bound.token
-        if bound.nickname.len > 0: who = profileLabel(bound)
+      haveChoice = true
     else:
       err "no profile to play: " & why
       note "the client needs a -token to log in, and a made-up one is a " &
@@ -1679,6 +1898,41 @@ proc main(): int =
         cSpawnKill(backendProc)
         line "  backend stopped"
       return 1
+
+  # One binding path for both ways of arriving at a profile. Rebind the session
+  # to it before the client arrives on it -- for an auto-selected profile as
+  # much as a listed or a freshly made one. The token to launch with is whatever
+  # `select` hands back, not the id the launcher held.
+  if haveChoice:
+    token = chosen.token
+    who = profileLabel(chosen)
+    if viaRoute:
+      var bound = Profile(id: "", token: "", nickname: "", side: "",
+                          level: 0, edition: "", lastPlayed: 0)
+      let se = selectProfile(port, chosen.id, bound)
+      if se.len > 0:
+        err "could not select the profile on the server: " & se
+        note "the client would arrive on a session the server has not bound " &
+             "to this profile, and sit at the menu. This is a backend fault, " &
+             "not a launcher one -- see aowlspt-backend.log."
+        if backendProc != 0'u64:
+          cSpawnKill(backendProc)
+          line "  backend stopped"
+        return 1
+      token = bound.token
+      if bound.nickname.len > 0: who = profileLabel(bound)
+    if token.len == 0:
+      # Belt and braces. A chosen profile whose token came back empty would
+      # launch a client with no cookie and fail as "Client not authenticated" at
+      # the game's own login -- far from here, and looking like a client bug.
+      err "the profile was chosen but there is no token to launch with"
+      if backendProc != 0'u64:
+        cSpawnKill(backendProc)
+        line "  backend stopped"
+      return 1
+    # Remembered *after* the bind succeeded, so a profile that could not be
+    # selected does not become the one the next boot prefers.
+    noteLastProfile(root, chosen.id)
 
   heading "Launching"
   let cmdLine = clientCommandLine(backendUrl, token, o.extraArgs)
@@ -1751,10 +2005,22 @@ proc main(): int =
     line "  the host writes   " & hostLog
     if o.wait:
       heading "Waiting"
+      # Wait on the client, but keep the watchdog turning so the backend is
+      # still restarted under `--no-logs --wait` -- the same self-healing the
+      # log view gives, without the view.
+      while cLaunchAlive(launch) != 0'i32:
+        discard wdPoll(true)
+        if gWd.givenUp:
+          err "BACKEND DOWN -- auto-restart gave up; the game has no server " &
+              "on 127.0.0.1:" & $port & ". See " &
+              joinPath(root, "aowlspt\\aowlspt-backend.log")
+          break
+        cSleepMs 500
       discard cLaunchWait(launch, -1'i32)
       line "  the client exited"
-      if backendProc != 0'u64:
-        cSpawnKill(backendProc)
+      let h = wdCurrentHandle(backendProc)
+      if h != 0'u64:
+        cSpawnKill(h)
         line "  backend stopped"
   else:
     var detached = false
@@ -1765,8 +2031,9 @@ proc main(): int =
       note "the logs are at " & joinPath(root, "aowlspt\\aowlspt-backend.log") &
            " and " & hostLog
     else:
-      if backendProc != 0'u64 and cSpawnAlive(backendProc) != 0'i32:
-        cSpawnKill(backendProc)
+      let h = wdCurrentHandle(backendProc)
+      if h != 0'u64 and cSpawnAlive(h) != 0'i32:
+        cSpawnKill(h)
         line "  backend stopped"
       if cLaunchAlive(launch) != 0'i32:
         note "the game is still running. It has no server now -- close it, or " &

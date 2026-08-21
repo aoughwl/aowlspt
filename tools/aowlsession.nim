@@ -590,6 +590,79 @@ proc selectProfile*(port: int; id: string; into: var Profile): string =
   result = ""
 
 # ---------------------------------------------------------------------------
+# The "last played" marker
+# ---------------------------------------------------------------------------
+#
+# The launcher auto-selects a profile rather than asking, and with more than one
+# profile in the install "which one" has to be answered from something. Nothing
+# on the wire answers it: the launcher's profile row carries `registered`, which
+# is a creation date, and the emulator does not record a last-login stamp on the
+# profile document. So the launcher records its own, next to `backend.json`, at
+# the moment it binds a profile for a launch.
+#
+# It is a *hint*, not state: a missing, unreadable or stale marker only changes
+# which profile the auto-select lands on, never whether the launch is bound at
+# all. That is why nothing here fails loudly -- a marker that could break a
+# launch would be worse than no marker.
+
+proc lastProfilePath*(root: string): string =
+  joinPath(root, "aowlspt\\launcher-last-profile.txt")
+
+proc readLastProfile*(root: string): string =
+  ## The profile id this launcher last started the game on, or "" when there is
+  ## none on record or what is on record is not an id.
+  result = ""
+  var text = ""
+  if not readTextFile(lastProfilePath(root), text):
+    return ""
+  let id = strip(text)
+  if isHexId(id): result = id
+
+proc noteLastProfile*(root, id: string) =
+  ## Records `id` as the profile to prefer next time. Best-effort on purpose:
+  ## see above.
+  if not isHexId(id): return
+  discard ensureDir(joinPath(root, "aowlspt"))
+  discard writeTextFile(lastProfilePath(root), id & "\n")
+
+proc autoProfile*(list: ProfileList; lastId: string; chosen: var Profile;
+                  reason: var string): bool =
+  ## Which profile to play when nobody is being asked.
+  ##
+  ## The order is "the one you played last, then the one you most recently
+  ## made, then the furthest along" -- each step a fact on record rather than a
+  ## preference, so the same install picks the same character every boot. An
+  ## unreadable profile is never auto-selected: it is a character the player
+  ## would be dropped into with no inventory, and it is exactly the case the
+  ## picker exists to let them choose *against*.
+  chosen = Profile(id: "", token: "", nickname: "", side: "", level: 0,
+                   edition: "", lastPlayed: 0)
+  reason = ""
+  var usable: seq[Profile] = @[]
+  for p in list.items:
+    if p.id.len > 0: usable.add p
+  if usable.len == 0:
+    reason = "there are no profiles in this install yet"
+    return false
+  if lastId.len > 0:
+    for p in usable:
+      if p.id == lastId:
+        chosen = p
+        reason = "the profile you played last"
+        return true
+  var best = usable[0]
+  var many = usable.len > 1
+  for i in 1 ..< usable.len:
+    let p = usable[i]
+    if p.lastPlayed > best.lastPlayed or
+       (p.lastPlayed == best.lastPlayed and p.level > best.level):
+      best = p
+  chosen = best
+  reason = if many: "the most recent of " & $usable.len & " profiles"
+           else: "the only profile in this install"
+  result = true
+
+# ---------------------------------------------------------------------------
 # The client's command line
 # ---------------------------------------------------------------------------
 
