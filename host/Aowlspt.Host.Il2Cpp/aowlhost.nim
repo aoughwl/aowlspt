@@ -742,6 +742,9 @@ var gRenderProven = false
 ## injection. `gSettingsProbe` is the opt-in.
 var gSettingsSlot = -1
 var gSettingsProbe = false
+## The heavier probe work (managed box proof + field walk) runs once, not every
+## time the user reopens settings.
+var gSettingsProbeDone = false
 
 ## Whether the fragile static-RVA drain path may be used at all. OFF by default:
 ## it bound a real-but-wrong function on the live client and crashed the game, so
@@ -3011,6 +3014,78 @@ proc settingsProbeFired(regs: Il2CppPtr) =
         "; SettingsScreen this=0x" & hexOf(selfPtr) &
         (if selfPtr != 0'u64 and cIsReadable(cast[Il2CppPtr](selfPtr), 0x20'i32) != 0'i32:
            " (readable)" else: " (this not readable)")
+
+  # The heavier work runs once. Everything below is on the Unity thread (proven
+  # above), where the runtime API is safe -- the same reads that fault on the
+  # host thread. Still fully read-only: it constructs one throwaway boxed int and
+  # walks the screen's fields; it writes nothing to the game.
+  if onHost or gSettingsProbeDone or selfPtr == 0'u64:
+    return
+  gSettingsProbeDone = true
+  let this = cast[Il2CppObject](selfPtr)
+
+  # STEP 1 -- the managed-bridge proof, HERE on the confirmed Unity thread.
+  # Boxing a System.Int32 is a managed-heap GC allocation; if it round-trips,
+  # il2cpp_object_new / il2cpp_value_box / il2cpp_runtime_invoke and field ops
+  # are all available on this thread, which is what unblocks instantiating new
+  # controls rather than only repurposing existing ones.
+  block:
+    let i32 = findClass(gRt, "System.Int32")
+    if i32 != nil:
+      let cell = cCellNew()
+      cCellSetI32(cell, 1337'i32)
+      let boxed = gRt.valueBox(i32, cell)
+      cCellFree(cell)
+      if boxed != nil:
+        let back = gRt.objectUnbox(boxed)
+        okLog "il2cpp settings probe STEP1: managed box round-trip on the " &
+              "Unity thread = " &
+              $(if back != nil: cReadI32(back) else: 0'i32) &
+              " -> il2cpp_object_new/value_box/runtime_invoke are available " &
+              "here; instantiation is unblocked"
+      else:
+        okLog "il2cpp settings probe STEP1: value_box returned nil (managed " &
+              "construction may be limited; field-write repurposing still ok)"
+
+  # STEP 2 -- read the screen structure. Walk the SettingsScreen class and its
+  # bases, logging each field's name, offset and declared type, and flagging the
+  # ones that look like the tab list / control collections a mod injects into.
+  block:
+    let cls = gRt.objectClass(this)
+    if cls == nil:
+      okLog "il2cpp settings probe STEP2: object_class(this) was nil"
+    else:
+      var c = cls
+      var depth = 0
+      var logged = 0
+      while c != nil and depth < 5 and logged < 60:
+        let cn = gRt.classNamespace(c)
+        let nm = gRt.className(c)
+        okLog "il2cpp settings probe STEP2: class " &
+              (if cn.len > 0: cn & "." else: "") & nm
+        var iter: Il2CppIter = cast[Il2CppIter](0)
+        while logged < 60:
+          let f = gRt.nextField(c, iter)
+          if f == nil:
+            break
+          let fnm = gRt.fieldName(f)
+          let ft = gRt.fieldType(f)
+          let tn = (if ft != nil: gRt.typeName(ft) else: "?")
+          let off = gRt.fieldOffset(f)
+          # Flag likely-interesting fields for the injection step. Type names keep
+          # their source casing, so match them as written.
+          let flag =
+            if find(tn, "Tab") >= 0 or find(tn, "Control") >= 0 or
+               find(tn, "List`1") >= 0 or find(tn, "[]") >= 0: "  <-- collection?"
+            else: ""
+          okLog "il2cpp settings probe STEP2:   +0x" & hexOf(uint64(off)) &
+                " " & fnm & " : " & tn & flag
+          inc logged
+        c = gRt.classParent(c)
+        inc depth
+      okLog "il2cpp settings probe STEP2: field walk complete (" & $logged &
+            " fields); open a tab (OpenGroup) so CreateControls populates the " &
+            "control lists, then STEP3 targets the flagged collection"
 
 proc bindSettingsProbe(verbose: bool): bool =
   ## Installs the read-only Experiment-A detour on `SettingsScreen::Show`, from
