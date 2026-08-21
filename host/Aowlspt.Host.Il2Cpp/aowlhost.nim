@@ -89,6 +89,18 @@ import invoke
 ## one free.
 {.emit: """#include "aowlspt_frame.h" """.}
 
+## A C thunk that runs the Nim `settingsMetaProbe` (exported as
+## `aowl_settings_meta_probe`) under the VEH+setjmp guard. Taking a Nim proc's
+## address as a plain pointer is not expressible in nimony, but in C the exported
+## proc is an ordinary function whose address is `&aowl_settings_meta_probe`, so
+## the guarded call is assembled here and called from Nim by name.
+{.emit: """
+extern void* aowl_settings_meta_probe(void* a);
+static void* aowl_settings_meta_probe_guarded(void* a) {
+    return aowl_p_p_seh((void*)aowl_settings_meta_probe, a);
+}
+""".}
+
 # --------------------------------------------------- the main-thread handoff
 #
 # `invoke_main` used to mean "the host's own attached thread", which is not the
@@ -391,6 +403,19 @@ proc cInIl2cpp(p: Il2CppPtr): int32 {.
   importc: "aowl_in_il2cpp_section", nodecl.}
 proc cIl2cppRvaOf(p: Il2CppPtr): int64 {.
   importc: "aowl_il2cpp_rva_of", nodecl.}
+## VEH+setjmp fault guard: calls `f(a)` with a vectored exception handler armed,
+## and returns whatever `f` returned -- or NULL if `f` faulted with an access
+## violation, the game surviving instead of dying. `f` therefore returns a
+## non-nil sentinel on success so the caller can tell "faulted" from "returned
+## nil". Used to probe which managed operation faults on this protected build
+## without taking the client down. See `aowl_p_p_seh` in `aowlspt_shim.h`.
+proc cSehCall(f, a: Il2CppPtr): Il2CppPtr {.importc: "aowl_p_p_seh", nodecl.}
+## Runs `settingsMetaProbe(a)` under the VEH guard (see the emit thunk near the
+## includes). Returns the probe's non-nil sentinel on completion, or nil if it
+## faulted -- the game surviving either way.
+proc cMetaProbeGuarded(a: Il2CppPtr): Il2CppPtr {.
+  importc: "aowl_settings_meta_probe_guarded", nodecl.}
+proc cReadI32At(p: Il2CppPtr): int32 {.importc: "aowl_read_i32", nodecl.}
 proc cBeOpened(): int32 {.importc: "aowl_be_guard_opened", nodecl.}
 
 # The IL2CPP readiness flag, armed in the same constructor and set on the
@@ -2989,6 +3014,76 @@ proc bindRenderDrain(verbose: bool): bool =
 
   result = false
 
+proc settingsMetaProbe(a: Il2CppPtr): Il2CppPtr {.
+    exportc: "aowl_settings_meta_probe", cdecl.} =
+  ## The RISKY managed metadata operations, run under `cSehCall`'s VEH guard by
+  ## `settingsProbeFired`. Each op is bracketed by a flushing `okLog`, so if one
+  ## faults the last "about to" line on disk names it exactly, and the guard
+  ## returns the game to safety. Returns a non-nil sentinel on full completion;
+  ## the guard returns nil on a fault. Split into P2..P5 in rising order of how
+  ## much runtime machinery each touches, so the crash localises to one op.
+  let this = cast[Il2CppObject](a)
+
+  # P2 -- object_class + class name. object_class reads `this+0` (already shown
+  # readable); the name read dereferences the class, the first real metadata read.
+  okLog "il2cpp settings probe P2: about to object_class(this)"
+  let cls = gRt.objectClass(this)
+  okLog "il2cpp settings probe P2: object_class = 0x" & hexOf(cast[uint64](cls))
+  if cls != nil:
+    okLog "il2cpp settings probe P2: about to read class name"
+    let cn = gRt.classNamespace(cls)
+    let nm = gRt.className(cls)
+    okLog "il2cpp settings probe P2: class = " &
+          (if cn.len > 0: cn & "." else: "") & nm
+
+  # P3 -- findClass System.Int32: a domain -> assemblies -> classFromName
+  # traversal. This was the unlogged first op that took the client down before.
+  okLog "il2cpp settings probe P3: about to findClass System.Int32"
+  let i32 = findClass(gRt, "System.Int32")
+  okLog "il2cpp settings probe P3: findClass System.Int32 = 0x" &
+        hexOf(cast[uint64](i32))
+
+  # P4 -- value_box: a managed-heap GC allocation. If P3 worked but this faults,
+  # basic managed construction is the limit and STEP3 must repurpose, not build.
+  if i32 != nil:
+    okLog "il2cpp settings probe P4: about to value_box(System.Int32, 1337)"
+    let cell = cCellNew()
+    cCellSetI32(cell, 1337'i32)
+    let boxed = gRt.valueBox(i32, cell)
+    cCellFree(cell)
+    okLog "il2cpp settings probe P4: value_box = 0x" & hexOf(cast[uint64](boxed))
+    if boxed != nil:
+      let back = gRt.objectUnbox(boxed)
+      okLog "il2cpp settings probe P4: box round-trip = " &
+            $(if back != nil: cReadI32At(back) else: 0'i32) &
+            " -> managed construction (object_new/value_box) works here"
+
+  # P5 -- the field iterator: object_class -> il2cpp_class_get_fields. The
+  # protected build that hid method pointers may also refuse this.
+  if cls != nil:
+    okLog "il2cpp settings probe P5: about to iterate SettingsScreen fields"
+    var c = cls
+    var depth = 0
+    var logged = 0
+    while c != nil and depth < 5 and logged < 50:
+      var iter: Il2CppIter = cast[Il2CppIter](0)
+      while logged < 50:
+        let f = gRt.nextField(c, iter)
+        if f == nil:
+          break
+        let fnm = gRt.fieldName(f)
+        let ft = gRt.fieldType(f)
+        let tn = (if ft != nil: gRt.typeName(ft) else: "?")
+        let off = gRt.fieldOffset(f)
+        okLog "il2cpp settings probe P5:   +0x" & hexOf(uint64(off)) &
+              " " & fnm & " : " & tn
+        inc logged
+      c = gRt.classParent(c)
+      inc depth
+    okLog "il2cpp settings probe P5: field walk done (" & $logged & " fields)"
+
+  return cast[Il2CppPtr](1)
+
 proc settingsProbeFired(regs: Il2CppPtr) =
   ## Experiment A, fired from the read-only detour on `SettingsScreen::Show`.
   ##
@@ -3015,77 +3110,42 @@ proc settingsProbeFired(regs: Il2CppPtr) =
         (if selfPtr != 0'u64 and cIsReadable(cast[Il2CppPtr](selfPtr), 0x20'i32) != 0'i32:
            " (readable)" else: " (this not readable)")
 
-  # The heavier work runs once. Everything below is on the Unity thread (proven
-  # above), where the runtime API is safe -- the same reads that fault on the
-  # host thread. Still fully read-only: it constructs one throwaway boxed int and
-  # walks the screen's fields; it writes nothing to the game.
+  # The heavier work runs once, split so the log says exactly which operation
+  # faults. The previous version crashed here with no line between "Show fired"
+  # and the crash, because its first op was `findClass` (a domain/assembly
+  # traversal) and there was no log before it.
   if onHost or gSettingsProbeDone or selfPtr == 0'u64:
     return
   gSettingsProbeDone = true
-  let this = cast[Il2CppObject](selfPtr)
 
-  # STEP 1 -- the managed-bridge proof, HERE on the confirmed Unity thread.
-  # Boxing a System.Int32 is a managed-heap GC allocation; if it round-trips,
-  # il2cpp_object_new / il2cpp_value_box / il2cpp_runtime_invoke and field ops
-  # are all available on this thread, which is what unblocks instantiating new
-  # controls rather than only repurposing existing ones.
-  block:
-    let i32 = findClass(gRt, "System.Int32")
-    if i32 != nil:
-      let cell = cCellNew()
-      cCellSetI32(cell, 1337'i32)
-      let boxed = gRt.valueBox(i32, cell)
-      cCellFree(cell)
-      if boxed != nil:
-        let back = gRt.objectUnbox(boxed)
-        okLog "il2cpp settings probe STEP1: managed box round-trip on the " &
-              "Unity thread = " &
-              $(if back != nil: cReadI32(back) else: 0'i32) &
-              " -> il2cpp_object_new/value_box/runtime_invoke are available " &
-              "here; instantiation is unblocked"
-      else:
-        okLog "il2cpp settings probe STEP1: value_box returned nil (managed " &
-              "construction may be limited; field-write repurposing still ok)"
+  # P1 -- the STEP3 primitive, and the one that actually matters: a plain raw
+  # field read of the SettingsScreen. No metadata, no box, no invoke -- pure
+  # memory, pre-checked with `cIsReadable` (a VirtualQuery, not a faulting
+  # dereference), so it cannot crash. Retargeting an existing control's value
+  # field (the fov/sain primitive the audit named as STEP3's real path) is
+  # exactly this read plus a write, so if this succeeds that path is open.
+  if cIsReadable(cast[Il2CppPtr](selfPtr), 0x60'i32) != 0'i32:
+    var line = "il2cpp settings probe P1 (raw field read, the STEP3 primitive):"
+    for k in 0 ..< 10:
+      let off = int32(k * 8)
+      let w = cReadPtrAt(cast[Il2CppPtr](selfPtr), off)
+      line.add " +" & hexOf(uint64(off)) & "=0x" & hexOf(cast[uint64](w))
+    okLog line
+    okLog "il2cpp settings probe P1: raw field read on SettingsScreen SUCCEEDED" &
+          " -> the field read/write path STEP3 needs is available here"
+  else:
+    okLog "il2cpp settings probe P1: SettingsScreen this is not readable for 0x60"
 
-  # STEP 2 -- read the screen structure. Walk the SettingsScreen class and its
-  # bases, logging each field's name, offset and declared type, and flagging the
-  # ones that look like the tab list / control collections a mod injects into.
-  block:
-    let cls = gRt.objectClass(this)
-    if cls == nil:
-      okLog "il2cpp settings probe STEP2: object_class(this) was nil"
-    else:
-      var c = cls
-      var depth = 0
-      var logged = 0
-      while c != nil and depth < 5 and logged < 60:
-        let cn = gRt.classNamespace(c)
-        let nm = gRt.className(c)
-        okLog "il2cpp settings probe STEP2: class " &
-              (if cn.len > 0: cn & "." else: "") & nm
-        var iter: Il2CppIter = cast[Il2CppIter](0)
-        while logged < 60:
-          let f = gRt.nextField(c, iter)
-          if f == nil:
-            break
-          let fnm = gRt.fieldName(f)
-          let ft = gRt.fieldType(f)
-          let tn = (if ft != nil: gRt.typeName(ft) else: "?")
-          let off = gRt.fieldOffset(f)
-          # Flag likely-interesting fields for the injection step. Type names keep
-          # their source casing, so match them as written.
-          let flag =
-            if find(tn, "Tab") >= 0 or find(tn, "Control") >= 0 or
-               find(tn, "List`1") >= 0 or find(tn, "[]") >= 0: "  <-- collection?"
-            else: ""
-          okLog "il2cpp settings probe STEP2:   +0x" & hexOf(uint64(off)) &
-                " " & fnm & " : " & tn & flag
-          inc logged
-        c = gRt.classParent(c)
-        inc depth
-      okLog "il2cpp settings probe STEP2: field walk complete (" & $logged &
-            " fields); open a tab (OpenGroup) so CreateControls populates the " &
-            "control lists, then STEP3 targets the flagged collection"
+  # P2..P5 -- the RISKY managed metadata ops, run under a VEH guard so a fault is
+  # caught and logged instead of crashing. Each op inside is bracketed by a
+  # flushing log, so the last "about to" line on disk names the op that faulted.
+  let r = cMetaProbeGuarded(cast[Il2CppPtr](selfPtr))
+  if r == nil:
+    okLog "il2cpp settings probe: the guarded metadata probe FAULTED at the " &
+          "last 'about to' op logged above; the VEH guard kept the game alive. " &
+          "STEP3 will use the raw field-read/write path (P1), which is unaffected"
+  else:
+    okLog "il2cpp settings probe: guarded metadata probe completed without fault"
 
 proc bindSettingsProbe(verbose: bool): bool =
   ## Installs the read-only Experiment-A detour on `SettingsScreen::Show`, from
