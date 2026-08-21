@@ -40,7 +40,8 @@ proc main =
   # Revision 3 appended `handlePointer` and `handlePin`; 192 was revision 2.
   # Revision 4 appended `patchTyped`; 208 was revision 3.
   # Revision 5 appended `notifyPush`; 216 was revision 4.
-  check "sizeof(HostApi)", sizeof(HostApi), 224
+  # Revision 6 appended `invokeRender`; 224 was revision 5.
+  check "sizeof(HostApi)", sizeof(HostApi), 232
 
   # The per-revision boundaries a mod tests a capability against. Literals, and
   # deliberately so -- they must not move when the struct does -- which is why
@@ -50,6 +51,7 @@ proc main =
   check "HostApiSizeRev3", int(HostApiSizeRev3), 208
   check "HostApiSizeRev4", int(HostApiSizeRev4), 216
   check "HostApiSizeRev5", int(HostApiSizeRev5), 224
+  check "HostApiSizeRev6", int(HostApiSizeRev6), 232
 
   # int32 size + 2 uint32 (12) + 4 pad + 5 slices (80) + 2 uint32 (8).
   check "sizeof(ModInfo)", sizeof(ModInfo), 104
@@ -76,7 +78,7 @@ proc main =
   check "flagBits(both)", int(flagBits({mfHotReloadable, mfThreadSafe})), 3
 
   check "AbiVersion", int(AbiVersion), 1
-  check "AbiRevision", int(AbiRevision), 5
+  check "AbiRevision", int(AbiRevision), 6
 
   # The typed patch frame. Its fields are read directly by a mod's accessors,
   # so its layout is ABI in the same sense `HostApi`'s is.

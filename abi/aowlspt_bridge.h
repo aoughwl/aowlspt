@@ -130,6 +130,103 @@ static const AowlBridgeTarget aowl_bridge_targets[] = {
 #define AOWL_BRIDGE_TARGET_COUNT \
     ((int32_t)(sizeof(aowl_bridge_targets) / sizeof(aowl_bridge_targets[0])))
 
+/* ------------------------------------------------------------------ *
+ * Render-phase targets
+ *
+ * The update-phase drain above runs inside `TarkovApplication.Update`, which is
+ * the Unity main thread but the *wrong point in the frame* for immediate-mode
+ * drawing: `UnityEngine.GL` calls only rasterize during the RENDER phase, and
+ * post-1.0 has no `OnGUI`. So a mod that draws ESP boxes or a GL HUD from the
+ * update drain is on the right thread at the wrong time and nothing appears.
+ *
+ * These targets are per-frame methods Unity calls during the render phase, on
+ * the main thread, where `GL.*` issued from a detour lands on the frame being
+ * drawn. Same discipline as the update targets: a fixed RVA, verified against
+ * the compiled prologue, NULL on any other build.
+ *
+ *   Primary: `OnRenderObjectManager::OnRenderObject` @ RVA 0x1F46910.
+ *   `OnRenderObject` is Unity's canonical immediate-mode-GL callback -- it fires
+ *   once per active camera during rendering, after the scene is drawn, which is
+ *   exactly where GL line/box drawing for ESP belongs. This type is a
+ *   purpose-built manager (it also holds `OnRenderObjectConnectorAdd/Remove` and
+ *   `FindAndAddOnRenderObjectConnectors`), so it is the render-dispatch object
+ *   the game keeps alive for the whole of gameplay rather than a per-entity
+ *   component. Prologue `push rbp ; sub rsp,0x20 ; cmp byte[rip+..],0 ;
+ *   mov rbp,rcx` -- relocatable (the RIP-relative displacement is fixed up by
+ *   the detour engine's copier).
+ *
+ *   Secondary: `EFT.CameraControl.CameraLodBiasController::OnPostRender` @ RVA
+ *   0x1263B10. `OnPostRender` fires on a script attached to a camera, right
+ *   after that camera finishes rendering -- the classic ESP overlay point. This
+ *   one rides the main game camera's LOD controller, so it is a raid-time
+ *   fallback if the primary's guard ever fails on a future build.
+ *
+ * Which of these actually fires every frame is the one thing that cannot be
+ * settled by static analysis; both are verified to exist and to be relocatable,
+ * and the host tries them in order, so the reliable one wins at runtime.
+ */
+static const AowlBridgeTarget aowl_bridge_render_targets[] = {
+    /* OnRenderObjectManager::OnRenderObject @ 0x1F46910
+     * 40 55          push rbp
+     * 48 83 EC 20    sub  rsp, 0x20
+     * 80 3D 83 A8 17 05 00   cmp byte [rip+0x517A883], 0
+     * 48 8B E9       mov  rbp, rcx                                          */
+    { "OnRenderObjectManager::OnRenderObject", 0x1F46910u,
+      { 0x40,0x55, 0x48,0x83,0xEC,0x20, 0x80,0x3D,0x83,0xA8,0x17,0x05,0x00,
+        0x48,0x8B,0xE9 }, 16, 1 },
+
+    /* EFT.CameraControl.CameraLodBiasController::OnPostRender @ 0x1263B10
+     * 48 83 EC 38    sub  rsp, 0x38
+     * 48 8B 05 4D F7 E6 05   mov rax, [rip+0x5E6F74D]
+     * 0F 29 74 24 20 movaps [rsp+0x20], xmm6                               */
+    { "EFT.CameraControl.CameraLodBiasController::OnPostRender", 0x1263B10u,
+      { 0x48,0x83,0xEC,0x38, 0x48,0x8B,0x05,0x4D,0xF7,0xE6,0x05,
+        0x0F,0x29,0x74,0x24,0x20 }, 16, 1 },
+};
+
+#define AOWL_BRIDGE_RENDER_TARGET_COUNT \
+    ((int32_t)(sizeof(aowl_bridge_render_targets) / \
+               sizeof(aowl_bridge_render_targets[0])))
+
+/* The i'th render-phase target's verified code pointer, or NULL. Identical
+ * checks to `aowl_bridge_target_at`; a separate function so the host can keep
+ * the two drains -- update and render -- entirely independent. */
+static void* aowl_bridge_render_target_at(int32_t i) {
+    HMODULE ga;
+    const AowlBridgeTarget* t;
+    unsigned char* p;
+    MEMORY_BASIC_INFORMATION mbi;
+
+    if (i < 0 || i >= AOWL_BRIDGE_RENDER_TARGET_COUNT) return NULL;
+    ga = GetModuleHandleA("GameAssembly.dll");
+    if (!ga) return NULL;
+    aowl_bridge_base_found = 1;
+
+    t = &aowl_bridge_render_targets[i];
+    p = (unsigned char*)ga + t->rva;
+
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0) return NULL;
+    if (mbi.State != MEM_COMMIT) return NULL;
+    if (!(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                         PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+        return NULL;
+
+    if (t->siglen > 0 && memcmp(p, t->sig, (size_t)t->siglen) != 0) return NULL;
+
+    aowl_bridge_sig_ok = 1;
+    aowl_bridge_last_rva = (int32_t)t->rva;
+    return (void*)p;
+}
+
+static const char* aowl_bridge_render_target_name(int32_t i) {
+    if (i < 0 || i >= AOWL_BRIDGE_RENDER_TARGET_COUNT) return "";
+    return aowl_bridge_render_targets[i].name;
+}
+
+static int32_t aowl_bridge_render_target_count(void) {
+    return AOWL_BRIDGE_RENDER_TARGET_COUNT;
+}
+
 /* The i'th target's verified code pointer, or NULL.
  *
  * NULL means one of: GameAssembly.dll is not mapped yet, the index is out of

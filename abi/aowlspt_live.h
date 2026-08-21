@@ -36,6 +36,9 @@ extern int32_t aowlspt_nim_handle_pin(void* ctx, uint64_t handle,
  * this host and no other. */
 extern int32_t aowlspt_nim_patch_typed(void* ctx, void* target, int32_t targetLen,
                                        int32_t kind, void* cb, void* user);
+/* Revision 6's render-phase callback, here for the same reason: it needs an
+ * IL2CPP render loop to detour, which is this host and no other. */
+extern int32_t aowlspt_nim_invoke_render(void* ctx, void* cb, void* user);
 
 /* Both write through an out-parameter and return a status, rather than
  * returning the address, so that "no address for that handle" is a code the
@@ -108,6 +111,43 @@ static void aowl_hostapi_arm_typed(void* p) {
     if (!b) return;
     b->api.patch_typed = aowl_host_patch_typed;
     b->api.size        = AOWLSPT_HOSTAPI_SIZE_REV4;
+}
+
+/* Revision 6: the render-phase callback.
+ *
+ * `invoke_render` sits at the end of the struct, past `notify_push` (revision
+ * 5), which the client host does not implement. The watermark rule is that
+ * `size` may only reach an entry when every entry below it is real -- so to
+ * claim `invoke_render` this must first fill the `notify_push` slot it is
+ * skipping. It does exactly what the note at the bottom of this file said a host
+ * growing past revision 4 would have to: install an `ErrUnsupported` stub for
+ * the entry it does not implement, then raise `size` last. The client host has
+ * no notifier socket, so its `notify_push` honestly answers `ErrUnsupported` --
+ * the same answer a size-4 `notifyReady()` conveyed, now said through the entry
+ * instead of through the watermark. */
+static AowlStatus AOWLSPT_CALL aowl_host_invoke_render(void* ctx,
+                                                       AowlCallbackFn cb,
+                                                       void* user) {
+    return (AowlStatus)aowlspt_nim_invoke_render(ctx, (void*)cb, user);
+}
+
+static AowlStatus AOWLSPT_CALL aowl_host_notify_unsupported(void* ctx,
+                                                            AowlSlice session,
+                                                            AowlSlice payload) {
+    (void)ctx; (void)session; (void)payload;
+    return AOWLSPT_ERR_UNSUPPORTED;
+}
+
+/* Armed only when a render-phase drain is available on this build. Called after
+ * `arm_typed`; `size` only ever grows. If the render drain never binds this is
+ * not called, `size` stays at revision 4/5, and a mod's read of `invoke_render`
+ * is gated off by the watermark -- the honest "no render loop here". */
+static void aowl_hostapi_arm_render(void* p) {
+    AowlHostBlock* b = (AowlHostBlock*)p;
+    if (!b) return;
+    if (!b->api.notify_push) b->api.notify_push = aowl_host_notify_unsupported;
+    b->api.invoke_render = aowl_host_invoke_render;
+    b->api.size          = AOWLSPT_HOSTAPI_SIZE_REV6;
 }
 
 /* Where the client host stops, and why 216 against a mod's 224 is not a bug.

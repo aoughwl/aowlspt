@@ -182,10 +182,44 @@ static AowlStatus AOWLSPT_CALL aowl_bench_cb(void* user, AowlSlice payload,
 }
 static void* aowl_bench_cb_ptr(void) { return (void*)aowl_bench_cb; }
 static int32_t aowl_bench_hit_count(void) { return (int32_t)aowl_bench_hits; }
+
+/* The render-phase queue. A second, independent queue drained from inside a
+ * RENDER-phase Unity callback rather than the update-phase one -- because
+ * immediate-mode `GL` drawing only rasterizes during render, so an ESP box or a
+ * GL HUD has to be issued there, not from `TarkovApplication.Update`. Same shape
+ * as the queue above, its own counter/owner/fire count so the two drains never
+ * touch each other's state; it shares the one process lock (`aowl_lock`), which
+ * is uncontended and already guards the update queue's `gPending`. */
+static volatile LONG aowl_rq_count = 0;
+static volatile LONG aowl_rq_tid = 0;
+static volatile LONG aowl_rq_alien = 0;
+static LONG aowl_rq_fires = 0;
+
+static void aowl_rq_set_count(int32_t n) { aowl_rq_count = (LONG)n; }
+static int32_t aowl_rq_get_count(void) { return (int32_t)aowl_rq_count; }
+static uint32_t aowl_rq_thread(void) { return (uint32_t)aowl_rq_tid; }
+static int32_t aowl_rq_fire_count(void) { return (int32_t)aowl_rq_fires; }
+
+static int32_t aowl_rq_enter(void) {
+    LONG me = (LONG)GetCurrentThreadId();
+    LONG owner = aowl_rq_tid;
+    if (owner == 0) {
+        InterlockedCompareExchange(&aowl_rq_tid, me, 0);
+        owner = aowl_rq_tid;
+    }
+    if (owner != me) { InterlockedIncrement(&aowl_rq_alien); return 0; }
+    aowl_rq_fires++;
+    return aowl_rq_count != 0;
+}
 """.}
 
 proc cMqLock() {.importc: "aowl_lock", nodecl.}
 proc cMqUnlock() {.importc: "aowl_unlock", nodecl.}
+proc cRqSetCount(n: int32) {.importc: "aowl_rq_set_count", nodecl.}
+proc cRqCount(): int32 {.importc: "aowl_rq_get_count", nodecl.}
+proc cRqThread(): uint32 {.importc: "aowl_rq_thread", nodecl.}
+proc cRqFireCount(): int32 {.importc: "aowl_rq_fire_count", nodecl.}
+proc cRqEnter(): int32 {.importc: "aowl_rq_enter", nodecl.}
 
 # ------------------------------------------------------- the host's tables
 #
@@ -278,6 +312,10 @@ proc cHostApiArmLive(p: Il2CppPtr) {.importc: "aowl_hostapi_arm_live", nodecl.}
 ## are separate capabilities -- see `aowlspt_live.h`. Called right after it, so
 ## `size` only ever grows.
 proc cHostApiArmTyped(p: Il2CppPtr) {.importc: "aowl_hostapi_arm_typed", nodecl.}
+## Revision 6's `invoke_render`, armed after the pair above so `size` only grows.
+## The entry is always real; it answers `ErrUnsupported` until a render-phase
+## drain binds. See `aowl_hostapi_arm_render` in `aowlspt_live.h`.
+proc cHostApiArmRender(p: Il2CppPtr) {.importc: "aowl_hostapi_arm_render", nodecl.}
 
 ## The typed patch frame: a pooled, borrowed view of the thunk's saved
 ## registers, handed to a mod instead of a JSON payload. `aowlspt_frame.h` has
@@ -331,6 +369,13 @@ proc cBridgeTargetPerFrame(i: int32): int32 {.
   importc: "aowl_bridge_target_perframe", nodecl.}
 proc cBridgeTargetName(i: int32): Il2CppPtr {.
   importc: "aowl_bridge_target_name", nodecl.}
+# The render-phase equivalents, for `bindRenderDrain`.
+proc cBridgeRenderTargetCount(): int32 {.
+  importc: "aowl_bridge_render_target_count", nodecl.}
+proc cBridgeRenderTargetAt(i: int32): Il2CppPtr {.
+  importc: "aowl_bridge_render_target_at", nodecl.}
+proc cBridgeRenderTargetName(i: int32): Il2CppPtr {.
+  importc: "aowl_bridge_render_target_name", nodecl.}
 proc cBeOpened(): int32 {.importc: "aowl_be_guard_opened", nodecl.}
 
 # The IL2CPP readiness flag, armed in the same constructor and set on the
@@ -515,6 +560,14 @@ var gPending: seq[Pending] = @[]
 var gDue: seq[Pending] = @[]
 var gDraining = false
 
+## The render-phase queue and its own drain buffer, mirroring the update queue
+## above. Separate storage so the two phases never share an entry; the same lock
+## (`cMqLock`) guards both, as it guards every other table here. `invoke_render`
+## fills this one, and the render-phase detour drains it during rendering.
+var gRenderPending: seq[Pending] = @[]
+var gRenderDue: seq[Pending] = @[]
+var gRenderDraining = false
+
 # --------------------------------------------------------- the frame bench
 #
 # What a mod pays per frame, measured on the thread that actually pays it.
@@ -658,6 +711,36 @@ var gStallReported = false
 var gLastFire = 0
 var gLastFireMs = 0'u64
 var gDrainStalled = false
+
+## The render-phase drain's slot, method and proof, mirroring the update drain's
+## fields above. `-1` until a render-phase target binds. Kept entirely separate
+## from `gDrainSlot`: the two detours are two rows in the same engine slot table,
+## and the firing path checks each by identity.
+var gRenderDrainSlot = -1
+var gRenderMethod = ""
+var gRenderProven = false
+
+## Whether the fragile static-RVA drain path may be used at all. OFF by default:
+## it bound a real-but-wrong function on the live client and crashed the game, so
+## the by-name runtime path is the only one used unless `aowlspt-host.json` sets
+## `bridgeStaticRva` to a non-zero value. Read once at boot.
+var gAllowStaticBridge = false
+
+## The master kill-switch: when `aowlspt-host.json` sets `bridgeDisableDrain`,
+## NO drain of any kind is installed -- not by name, not by RVA. `invoke_main`
+## and `invoke_render` then run/refuse on the host thread exactly as they did
+## before any bridge existed, and the game runs entirely detour-free. This is the
+## escape hatch for a build where even the by-name detour proves unsafe: a bridge
+## that crashes the game is worse than no bridge, so one flag turns it all off.
+var gDisableDrain = false
+
+## Default-off diagnostic: when `aowlspt-host.json` sets `bridgeUiProbe`, the
+## update-drain self-test also instantiates two Unity UI GameObjects on the Unity
+## thread and parents one under the other -- the foundation capability for native
+## settings-screen injection. Off by default so it never runs unless asked; when
+## on it runs once, on the drain thread, and only after the managed-call proof
+## has shown that thread is really Unity's.
+var gUiProbe = false
 
 # ------------------------------------------------------- logging, helpers
 #
@@ -1093,6 +1176,21 @@ proc mainThreadReport(): string =
            ",\"otherThreadFires\":" & $int(cMqAlienFires()) &
            ",\"stalled\":" & (if gDrainStalled: "true" else: "false") & "}"
 
+proc renderThreadReport(): string =
+  ## What `call("aowlspt.host::render_thread")` answers -- the render-phase
+  ## drain's mirror of `main_thread`. A GL/ESP mod gates on `bound` here before
+  ## it queues render work with `invoke_render`: true only once a render-phase
+  ## target has bound *and* fired, so a mod never draws into a drain that has
+  ## proved nothing. `renderThreadId` is the thread the render callback runs on;
+  ## it equals `mainThreadId` on the built-in pipeline (update and render share
+  ## Unity's main thread) and the mod does not need to care that it does.
+  let bound = gRenderDrainSlot >= 0 and cRqFireCount() > 0
+  result = "{\"bound\":" & (if bound: "true" else: "false") &
+           ",\"method\":\"" & gRenderMethod & "\"" &
+           ",\"renderThreadId\":" & $int(cRqThread()) &
+           ",\"hostThreadId\":" & $int(gHostThreadId) &
+           ",\"renderFrames\":" & $int(cRqFireCount()) & "}"
+
 proc tableStatsReport(): string =
   ## Every table this host keeps, by size, in one reply.
   ##
@@ -1255,6 +1353,11 @@ proc hostCall(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
               ",\"frames\":" & $int(graphicsFrames()) & "}"
     return cOutCopy(outPtr, outLen, cast[Il2CppPtr](toCString(ack)),
                     int32(ack.len))
+
+  if spec == "aowlspt.host::render_thread":
+    var report = renderThreadReport()
+    return cOutCopy(outPtr, outLen, cast[Il2CppPtr](toCString(report)),
+                    int32(report.len))
 
   if not gReady:
     gLastError = "the IL2CPP runtime is not up yet"
@@ -1493,6 +1596,16 @@ proc enqueue(cb, user: Il2CppPtr; dueMs: uint64; modIndex: int;
   cMqSetCount(int32(gPending.len))
   cMqUnlock()
 
+proc enqueueRender(cb, user: Il2CppPtr; modIndex: int; selfTest: bool) =
+  ## The only way into `gRenderPending`, from any thread. Same lock and count
+  ## discipline as `enqueue`, on the render storage. No `dueMs`: render work is
+  ## for the next render, not a wall-clock deadline, so it is queued due-now.
+  cMqLock()
+  gRenderPending.add Pending(cb: cb, user: user, dueMs: 0'u64,
+                             modIndex: modIndex, selfTest: selfTest)
+  cRqSetCount(int32(gRenderPending.len))
+  cMqUnlock()
+
 proc takeDue(due: var seq[Pending]) =
   ## Moves everything due out of `gPending` into `due`, under the lock.
   ##
@@ -1523,6 +1636,85 @@ proc takeDue(due: var seq[Pending]) =
       shrink(gPending, w)
       cMqSetCount(int32(w))
   cMqUnlock()
+
+proc makeProbeGo(goCls: Il2CppClass; ctor: Il2CppMethod;
+                 name: string): Il2CppObject =
+  ## One named `UnityEngine.GameObject`, created and constructed on whatever
+  ## thread the caller is on. `uiProbe` calls it only from the Unity drain
+  ## thread. A top-level proc rather than a nested one so it captures nothing.
+  let go = objectNew(gRt, goCls)
+  if go == nil:
+    return cast[Il2CppObject](0)
+  let s = newString(gRt, name)
+  let a = cArgsNew(1)
+  cArgsSetRef(a, 0, s)
+  var exc: Il2CppException = nullPtr()
+  discard gRt.invoke(ctor, go, cArgsPtr(a), exc)
+  cArgsFree(a)
+  if exc != nil:
+    return cast[Il2CppObject](0)
+  return go
+
+proc uiProbe(tid: int) =
+  ## Default-off proof of the capability native settings-screen injection is
+  ## built on: instantiating Unity UI objects on the Unity thread and parenting
+  ## one under another. It runs only when `bridgeUiProbe` is set, and only from
+  ## inside `bridgeProof`, which is already gated to the real drain thread -- so
+  ## every runtime call here is on Unity's own thread, where object creation and
+  ## `Transform.SetParent` are safe and off which they fault.
+  ##
+  ## It is self-contained: it makes two `UnityEngine.GameObject`s and parents the
+  ## child under the parent's transform, so it proves both primitives without
+  ## needing to find a live screen in the scene. A mod does the same two calls,
+  ## parenting under a real screen's transform instead of a second probe object.
+  ## The two objects are left in the scene (a one-shot diagnostic leaks nothing
+  ## that matters); a mod destroys or keeps its own.
+  let goCls = findClass(gRt, "UnityEngine.GameObject")
+  let trCls = findClass(gRt, "UnityEngine.Transform")
+  if goCls == nil or trCls == nil:
+    okLog "il2cpp ui probe: UnityEngine.GameObject/Transform did not resolve"
+    return
+  runtimeClassInit(gRt, goCls)
+  let ctor = findMethod(gRt, goCls, ".ctor", 1)
+  let getTransform = findMethod(gRt, goCls, "get_transform", 0)
+  let setParent = findMethod(gRt, trCls, "SetParent", 1)
+  if ctor == nil or getTransform == nil or setParent == nil or
+     methodPointer(gRt, ctor) == nil or methodPointer(gRt, getTransform) == nil or
+     methodPointer(gRt, setParent) == nil:
+    okLog "il2cpp ui probe: GameObject.ctor/get_transform/SetParent did not " &
+          "resolve to callable code on this build"
+    return
+
+  let parent = makeProbeGo(goCls, ctor, "aowlspt_probe_parent")
+  let child = makeProbeGo(goCls, ctor, "aowlspt_probe_child")
+  if parent == nil or child == nil:
+    okLog "il2cpp ui probe: GameObject instantiation returned nil on Unity " &
+          "thread " & $tid
+    return
+
+  # get_transform on both (returns a Transform reference, not boxed).
+  var e1: Il2CppException = nullPtr()
+  let parentTr = gRt.invoke(getTransform, parent, cast[Il2CppPtr](0), e1)
+  var e2: Il2CppException = nullPtr()
+  let childTr = gRt.invoke(getTransform, child, cast[Il2CppPtr](0), e2)
+  if e1 != nil or e2 != nil or parentTr == nil or childTr == nil:
+    okLog "il2cpp ui probe: instantiated GameObjects on Unity thread " & $tid &
+          " but get_transform failed"
+    return
+
+  # child.transform.SetParent(parent.transform).
+  let a = cArgsNew(1)
+  cArgsSetRef(a, 0, parentTr)
+  var e3: Il2CppException = nullPtr()
+  discard gRt.invoke(setParent, childTr, cArgsPtr(a), e3)
+  cArgsFree(a)
+  if e3 != nil:
+    okLog "il2cpp ui probe: instantiated + got transforms on Unity thread " &
+          $tid & " but SetParent threw"
+    return
+  okLog "il2cpp ui probe: instantiated two UnityEngine.GameObjects on Unity " &
+        "thread " & $tid & " and parented one under the other's transform -- " &
+        "native UI instantiation + parenting works on the Unity thread"
 
 proc bridgeProof(tid: int) =
   ## The proof that the drain runs on Unity's own thread: from here, make a real
@@ -1572,14 +1764,50 @@ proc bridgeProof(tid: int) =
   if not reported:
     okLog "il2cpp bridge: on Unity thread " & $tid &
           ", but no managed call could be resolved to prove it"
+  # The UI-instantiation proof, only when explicitly enabled. Runs here because
+  # `bridgeProof` is already on the confirmed drain thread.
+  if gUiProbe:
+    uiProbe(tid)
 
-proc runDue(due: var seq[Pending]) =
+proc renderProof(tid: int) =
+  ## The render-phase proof: a self-test entry drained from inside the
+  ## render-phase detour. It records the thread and fire count, and confirms the
+  ## `UnityEngine.GL` immediate-mode API is reachable from here -- which is the
+  ## capability this drain exists to give ESP and GL-HUD mods. `GL.PushMatrix`
+  ## then `GL.PopMatrix` is a balanced no-op that draws nothing and leaves the
+  ## matrix stack as it found it, so it is safe to run every time the proof
+  ## fires; a build that will not resolve the pair logs that instead of calling
+  ## a null pointer.
+  var proven = false
+  let glCls = findClass(gRt, "UnityEngine.GL")
+  if glCls != nil:
+    let push = findMethod(gRt, glCls, "PushMatrix", 0)
+    let pop = findMethod(gRt, glCls, "PopMatrix", 0)
+    if push != nil and pop != nil and
+       methodPointer(gRt, push) != nil and methodPointer(gRt, pop) != nil:
+      var exc: Il2CppException = nullPtr()
+      discard gRt.invoke(push, cast[Il2CppObject](0), cast[Il2CppPtr](0), exc)
+      if exc == nil:
+        discard gRt.invoke(pop, cast[Il2CppObject](0), cast[Il2CppPtr](0), exc)
+        okLog "il2cpp render bridge: ran UnityEngine.GL PushMatrix/PopMatrix " &
+              "on the Unity render-phase thread " & $tid &
+              " -- immediate-mode GL is reachable for ESP/HUD drawing"
+        proven = true
+  if not proven:
+    okLog "il2cpp render bridge: drained on the Unity render-phase thread " &
+          $tid & " (UnityEngine.GL did not resolve to prove the GL path)"
+
+proc runDue(due: var seq[Pending]; isRender: bool) =
   ## Runs what `takeDue` lifted out, **outside** the lock.
   ##
   ## Outside it on purpose: a callback is a mod's code, it may take as long as
   ## it likes, and it may call `invoke_main` again. Running it with the lock
   ## held would block every other thread behind whatever it does. Taking the
   ## work out first is the same shape the backend's timer queue uses.
+  ##
+  ## `isRender` selects which queue's self-test proof this is: the render drain
+  ## proves the GL path, the update drain proves the managed-call path. Only the
+  ## proof differs; a mod's callback is dispatched identically either way.
   for p in due:
     if p.selfTest:
       # The proof, and the reason it is an entry in the queue rather than a
@@ -1588,15 +1816,28 @@ proc runDue(due: var seq[Pending]) =
       # Says where, and -- when nothing bound -- what that means. A mod author
       # reading this log should not have to know that thread 21728 is the
       # host's own to know the callback was not on Unity's.
-      if gDrainSlot < 0:
-        warn "invoke_main self-test ran on thread " & $int(cThreadId()) &
-             ", the host's own thread and not Unity's; a callback queued " &
-             "with invoke_main must not touch a Unity object"
+      # The managed call in the proof is ONLY safe on the actual drain thread --
+      # the one the detour fired on and claimed. A slot being bound is NOT enough:
+      # when a drain is bound but never fires (a wrong-but-live target, or a
+      # method the game does not call), the host's tick loop drains this very
+      # queue on its OWN thread as a fallback, and a managed call there faults
+      # exactly as the live client did. So the proof is gated on being on the
+      # claimed drain thread, not on `slot >= 0`. `cMqThread`/`cRqThread` are the
+      # thread the drain claimed, or 0 if it has never fired.
+      let tid = int(cThreadId())
+      let owner = (if isRender: int(cRqThread()) else: int(cMqThread()))
+      if owner == 0 or owner != tid:
+        warn (if isRender: "render " else: "invoke_main ") &
+             "self-test ran on thread " & $tid &
+             ", the host's own thread and not Unity's drain thread; no managed " &
+             "call was made (the drain is bound but has not fired on its own " &
+             "thread, or nothing is bound)"
+      elif isRender:
+        renderProof(tid)
       else:
-        let tid = int(cThreadId())
         okLog "invoke_main self-test ran on thread " & $tid
-        # On Unity's own thread now, so a real managed call is safe -- and the
-        # same call from the host thread crashes the client. This is the proof.
+        # Genuinely on the drain's own thread now, so a real managed call is
+        # safe -- the same call from the host thread crashes the client. Proof.
         bridgeProof(tid)
     else:
       # A reference on the owning mod, held across the callback.
@@ -1642,7 +1883,49 @@ proc drainDue() =
   ## for their own seq rather than sharing one that would need a lock.
   var due: seq[Pending] = @[]
   takeDue(due)
-  runDue(due)
+  runDue(due, false)
+
+proc renderTakeDue(due: var seq[Pending]) =
+  ## `takeDue` for the render queue: lifts everything due out of `gRenderPending`
+  ## and compacts what is left, under the lock, republishing the render count so
+  ## `cRqEnter`'s lock-free empty check stays honest. A carbon copy of `takeDue`
+  ## on the render storage; the two queues are identical in shape and separate in
+  ## state on purpose.
+  shrink(due, 0)
+  cMqLock()
+  if gRenderPending.len > 0:
+    let now = cNowMs()
+    var w = 0
+    for r in 0 ..< gRenderPending.len:
+      let p = gRenderPending[r]
+      if p.dueMs <= now:
+        due.add p
+      else:
+        if w != r:
+          gRenderPending[w] = p
+        inc w
+    if w != gRenderPending.len:
+      shrink(gRenderPending, w)
+      cRqSetCount(int32(w))
+  cMqUnlock()
+
+proc renderDrain() =
+  ## The render-phase drain, called from inside a RENDER-phase Unity callback
+  ## (see `bindRenderDrain`). Same shape as `mainDrain`: `cRqEnter` answers "is
+  ## this my thread and is there anything to do" in a handful of instructions,
+  ## and only a frame with render work queued reaches the drain. GL issued from a
+  ## callback run here lands on the frame being drawn.
+  if cRqEnter() == 0'i32:
+    return
+  if gRenderDraining:
+    var due: seq[Pending] = @[]
+    renderTakeDue(due)
+    runDue(due, true)
+    return
+  gRenderDraining = true
+  renderTakeDue(gRenderDue)
+  runDue(gRenderDue, true)
+  gRenderDraining = false
 
 proc runFrameBench()
 
@@ -1669,7 +1952,7 @@ proc mainDrain() =
     return
   gDraining = true
   takeDue(gDue)
-  runDue(gDue)
+  runDue(gDue, false)
   gDraining = false
 
 const BenchModIndex = 0x7FFF0
@@ -1961,6 +2244,11 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
   # scanning: it fires on every frame of the game and must not walk anything.
   if i == gDrainSlot:
     mainDrain()
+    return 0'i32
+  # The render-phase drain, likewise by identity: a second detour on a
+  # render-phase method that drains the render queue where GL drawing lands.
+  if i == gRenderDrainSlot:
+    renderDrain()
     return 0'i32
   if i < 0 or i >= gPatches.len:
     return 0'i32
@@ -2303,22 +2591,27 @@ proc hostPatchTyped(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
   installPatch(ctx, target, targetLen, kind, cb, user, true)
 
 proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
-                 perFrame: bool; verbose: bool): bool =
-  ## Installs the host's own per-frame drain detour on the code pointer `fn`,
-  ## through the same slot table and detour engine a mod's `patch` uses. Shared
-  ## by both of `bindMainDrain`'s paths: the verified static targets from
-  ## `aowlspt_bridge.h` (where `meth` is nil, since the drain firing path indexes
-  ## by slot and never reads it) and the by-name runtime candidates (where `meth`
-  ## is the resolved `MethodInfo`).
+                 perFrame: bool; verbose: bool; isRender: bool): bool =
+  ## Installs one of the host's own per-frame drain detours on the code pointer
+  ## `fn`, through the same slot table and detour engine a mod's `patch` uses.
+  ## Shared by both of `bindMainDrain`'s paths and by `bindRenderDrain`: the
+  ## verified static targets from `aowlspt_bridge.h` (where `meth` is nil, since
+  ## the drain firing path indexes by slot and never reads it) and the by-name
+  ## runtime candidates (where `meth` is the resolved `MethodInfo`).
+  ##
+  ## `isRender` chooses which drain this is -- which slot/method globals it sets
+  ## and which phase the firing path routes it to. The mechanics are identical;
+  ## only the two rows of bookkeeping differ.
   ##
   ## Same lock as `installPatch`, for the same reason: this claims a slot and
   ## writes its row, and a mod's `patch` on another thread does too. It is the
   ## host's own hook, and it is not exempt from the rule.
+  let what = (if isRender: "render-phase" else: "main-thread")
   tablesLock()
   let claimed = cHookClaim()
   if claimed < 0'i32:
     tablesUnlock()
-    warn "no free patch slots for the main-thread drain"
+    warn "no free patch slots for the " & what & " drain"
     return false
   let hook = cHookNew()
   if hook == nil:
@@ -2349,24 +2642,31 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
            readCString(cHookErrorText(rc))
     return false
 
-  gDrainSlot = int(claimed)
+  if isRender:
+    gRenderDrainSlot = int(claimed)
+  else:
+    gDrainSlot = int(claimed)
   tablesUnlock()
-  gDrainMethod = spec
-  gDrainPerFrame = perFrame
-  okLog "main-thread drain bound to " & spec & " (" &
+  if isRender:
+    gRenderMethod = spec
+  else:
+    gDrainMethod = spec
+    gDrainPerFrame = perFrame
+  okLog what & " drain bound to " & spec & " (" &
         $int(cHookStolen(hook)) & " bytes)" &
-        (if gDrainPerFrame: "" else:
+        (if perFrame: "" else:
            "; it runs more than once a frame, so its firing count is not a " &
            "frame count")
   return true
 
-const gBridgeEnabled* = false
-  ## The per-frame `TarkovApplication::Update` detour BINDS but crashes the live
-  ## client within seconds (the drain never fires, the game dies -- verified
-  ## 2026-08-20): the 16-byte prologue steal/relocation corrupts Update. Kept off
-  ## by default so the host stays stable (the queue falls back to the host thread,
-  ## exactly as before the bridge existed); flip to true only once the detour is
-  ## proven not to crash. Graphics/overlay do NOT need this -- they hook D3D11.
+const gBridgeEnabled* = true
+  ## The earlier static-RVA detour crashed the live client (the RVA was a real
+  ## function but NOT the code Unity runs as Update -- this build's metadata
+  ## methodPointers table does not hold the live pointer). The bridge now
+  ## resolves BY NAME via the runtime's own `MethodInfo.methodPointer` (the path
+  ## `fov`/`sain` already use), and is fail-safe: null/non-executable binds
+  ## nothing and the queue falls back to the host thread -- it cannot crash by
+  ## default. `bridgeDisableDrain` in `aowlspt-host.json` is the real off-switch.
 
 proc bindMainDrain(verbose: bool): bool =
   ## Detours a method Unity calls once per frame on its main thread, so that
@@ -2420,34 +2720,26 @@ proc bindMainDrain(verbose: bool): bool =
     return true
   if not gReady:
     return false
+  if gDisableDrain:
+    return false
 
-  # The verified static targets come first, because they are the reliable path
-  # on this build: `aowlspt_bridge.h` resolves a per-frame method's code pointer
-  # as a fixed RVA into GameAssembly.dll and checks its prologue byte-for-byte
-  # before handing it back, exactly as the BE-bypass patches do. This sidesteps
-  # the runtime resolution below, which on this build returns no usable
-  # `MethodInfo.methodPointer` for any of the by-name candidates. On any other
-  # build the prologue guard fails and each returns nil, so the by-name path
-  # still runs -- safe by default, never a bind aimed at the wrong bytes.
-  let staticCount = cBridgeTargetCount()
-  for i in 0 ..< int(staticCount):
-    let fn = cBridgeTargetAt(int32(i))
-    if fn == nil:
-      continue
-    let spec = readCString(cBridgeTargetName(int32(i)))
-    let pf = cBridgeTargetPerFrame(int32(i)) != 0'i32
-    if attachDrain(spec, fn, cast[Il2CppMethod](0), pf, verbose):
-      return true
-
+  # By NAME first, and by default the only path -- because it uses the *runtime's
+  # own* `MethodInfo.methodPointer`, which is the pointer the game actually calls
+  # every frame. The static RVA path below was tried on the live client and, even
+  # with a byte-verified prologue, it bound a real function that Unity never
+  # reached as `Update`: the drain never fired and the game crashed seconds later
+  # when that other function ran with a corrupted prologue. The lesson is that on
+  # this hardened build the decrypted metadata's `methodPointers` table does not
+  # hold the live code pointer, so a fixed RVA out of it is the wrong target.
+  #
+  # The by-name path cannot make that mistake: if the runtime hands back a null
+  # or non-executable pointer it binds nothing and the game runs detour-free,
+  # which is the stable floor. The first two names are the post-1.0 root
+  # application MonoBehaviour and the raid tick listener; the engine methods
+  # after them are last-resort.
+  #
   # Built here rather than as a module-level `seq`: a global whose initialiser
   # is a call is silently left zeroed in an `--app:lib` build.
-  #
-  # The by-name fallback, for a build the static table does not cover. The first
-  # two names are the post-1.0 root application MonoBehaviour and the raid tick
-  # listener -- the same methods the static table hardcodes for this build, so a
-  # future build with a populated `methodPointer` field binds by name without a
-  # new RVA. The engine methods after them are last-resort: present whenever
-  # their module is, but their compiled bodies may be shorter than a jump.
   var candidates: seq[string] = @[]
   candidates.add "EFT.TarkovApplication::Update"
   candidates.add "EFT.GameWorldUnityTickListener::Update"
@@ -2493,8 +2785,96 @@ proc bindMainDrain(verbose: bool): bool =
       continue
 
     let pf = candidateIndex < perFrame.len and perFrame[candidateIndex]
-    if attachDrain(spec, fn, m, pf, verbose):
+    if attachDrain(spec, fn, m, pf, verbose, false):
       return true
+
+  # Static-RVA last resort, OFF by default. It is kept only for a build where the
+  # runtime genuinely will not populate `methodPointer` at all *and* where the
+  # metadata `methodPointers` table has been confirmed to hold live pointers --
+  # which this build is NOT (see the crash note above). It is never reached
+  # unless `aowlspt-host.json` sets `bridgeStaticRva` to a non-zero value, and
+  # even then only after every by-name candidate has failed. A mod author turning
+  # it on is opting into the fragile path with eyes open.
+  if gAllowStaticBridge:
+    let staticCount = cBridgeTargetCount()
+    for i in 0 ..< int(staticCount):
+      let fn = cBridgeTargetAt(int32(i))
+      if fn == nil:
+        continue
+      let spec = readCString(cBridgeTargetName(int32(i)))
+      let pf = cBridgeTargetPerFrame(int32(i)) != 0'i32
+      warn "binding the main-thread drain by STATIC RVA (" & spec & "); this " &
+           "path crashed the live client once and is enabled only because " &
+           "bridgeStaticRva is set"
+      if attachDrain(spec, fn, cast[Il2CppMethod](0), pf, verbose, false):
+        return true
+
+  result = false
+
+proc bindRenderDrain(verbose: bool): bool =
+  ## Detours a RENDER-phase per-frame method so `invoke_render`'s queue drains
+  ## where immediate-mode `GL` drawing rasterizes -- the second half of the
+  ## bridge, for ESP boxes and GL HUDs that the update-phase drain cannot draw.
+  ##
+  ## By NAME first, and by default the only path, for the same reason as
+  ## `bindMainDrain`: the runtime's `MethodInfo.methodPointer` is the pointer the
+  ## game actually calls, whereas a fixed RVA out of the decrypted metadata's
+  ## `methodPointers` table bound a real-but-wrong function on the live client and
+  ## crashed it. If the runtime hands back nothing usable, this binds nothing and
+  ## `invoke_render` reports the render thread as unavailable -- the stable floor.
+  ## There is deliberately no host-thread fallback: a GL call off the render
+  ## thread does nothing useful and can fault, so if no render target binds the
+  ## queue is simply not offered.
+  ##
+  ## Candidates, most-preferred first: `OnRenderObjectManager::OnRenderObject`
+  ## (Unity's immediate-mode-GL callback, dispatched by a purpose-built manager
+  ## kept alive through gameplay) then `EFT.CameraControl.CameraLodBiasController::
+  ## OnPostRender` (the main game camera's post-render, a raid-time fallback).
+  if gRenderDrainSlot >= 0:
+    return true
+  if not gReady:
+    return false
+  if gDisableDrain:
+    return false
+
+  var candidates: seq[string] = @[]
+  candidates.add "OnRenderObjectManager::OnRenderObject"
+  candidates.add "EFT.CameraControl.CameraLodBiasController::OnPostRender"
+
+  for spec in candidates:
+    let sep = find(spec, "::")
+    if sep < 0:
+      continue
+    let typePart = spec.substr(0, sep - 1)
+    let member = spec.substr(sep + 2)
+    let cls = findClass(gRt, typePart)
+    if cls == nil:
+      if verbose: info "no render candidate " & typePart & " in this build"
+      continue
+    let m = findMethod(gRt, cls, member, -1)
+    if m == nil:
+      if verbose: info typePart & " has no " & member
+      continue
+    let fn = methodPointer(gRt, m)
+    if fn == nil:
+      if verbose: info "no usable code pointer for " & spec
+      continue
+    if attachDrain(spec, fn, m, true, verbose, true):
+      return true
+
+  # Static-RVA last resort, OFF by default -- the same fragile, once-crashed path
+  # as in `bindMainDrain`, reached only when `bridgeStaticRva` is set.
+  if gAllowStaticBridge:
+    let count = cBridgeRenderTargetCount()
+    for i in 0 ..< int(count):
+      let fn = cBridgeRenderTargetAt(int32(i))
+      if fn == nil:
+        continue
+      let spec = readCString(cBridgeRenderTargetName(int32(i)))
+      warn "binding the render-phase drain by STATIC RVA (" & spec & "); this " &
+           "path is enabled only because bridgeStaticRva is set"
+      if attachDrain(spec, fn, cast[Il2CppMethod](0), true, verbose, true):
+        return true
 
   result = false
 
@@ -2572,6 +2952,27 @@ proc hostInvokeMain(ctx: Il2CppPtr; cb: Il2CppPtr; user: Il2CppPtr): int32 {.
   enqueue(cb, user, cNowMs(), int(cast[uint](ctx)), false)
   result = StatusOk
 
+proc hostInvokeRender(ctx: Il2CppPtr; cb: Il2CppPtr; user: Il2CppPtr): int32 {.
+    exportc: "aowlspt_nim_invoke_render", cdecl.} =
+  ## Queued for the RENDER-phase drain: `cb` runs on Unity's thread during
+  ## rendering, where `GL.*` immediate-mode drawing lands on the frame. This is
+  ## what ESP and GL-HUD mods use instead of `invoke_main`, whose callback is on
+  ## the same thread but in the update phase where GL draws nothing.
+  ##
+  ## Refused when no render-phase target is bound, rather than queued into a
+  ## drain that will never run: a mod should gate on
+  ## `call("aowlspt.host::render_thread")`, and refusing here keeps the queue
+  ## from growing without a drainer if it does not. The BSG render callback the
+  ## drain rides is raid-time, so on the menu this returns unavailable.
+  if cb == nil:
+    return ErrBadArg
+  if gRenderDrainSlot < 0:
+    gLastError = "no render-phase drain is bound (no GL render point could be " &
+                 "detoured on this build, or the game is not in a raid yet)"
+    return ErrUnsupported
+  enqueueRender(cb, user, int(cast[uint](ctx)), false)
+  result = StatusOk
+
 proc hostSchedule(ctx: Il2CppPtr; delayMs: int32; cb: Il2CppPtr;
                   user: Il2CppPtr): int32 {.
     exportc: "aowlspt_nim_schedule", cdecl.} =
@@ -2613,6 +3014,13 @@ proc armLive(hostBlock: Il2CppPtr) =
   # and `patch_typed` needs the detour engine, and `size` is a statement about
   # what was filled rather than about which header this was built from.
   cHostApiArmTyped(hostBlock)
+  # And revision 6, `invoke_render`. Armed unconditionally: the entry is always a
+  # real function, and it answers `ErrUnsupported` on its own until a render-phase
+  # drain binds (which is typically raid-time). Arming it here rather than when
+  # the render drain binds means a mod loaded in the menu already has the entry
+  # and can start using it the moment `call("aowlspt.host::render_thread")` turns
+  # true, without the host block having to be rebuilt.
+  cHostApiArmRender(hostBlock)
 
 proc dropModRegistrations(index: int) =
   ## Everything the mod at `index` left in this host, dropped before its library
@@ -2641,6 +3049,15 @@ proc dropModRegistrations(index: int) =
       keptPending.add pend
   gPending = keptPending
   cMqSetCount(int32(gPending.len))
+  # The render queue holds function pointers into the same libraries, so it is
+  # rebuilt under the same lock -- a render callback left behind after its mod is
+  # freed is a jump into unmapped memory on the render thread.
+  var keptRender: seq[Pending] = @[]
+  for pend in gRenderPending:
+    if pend.modIndex != index:
+      keptRender.add pend
+  gRenderPending = keptRender
+  cRqSetCount(int32(gRenderPending.len))
   cMqUnlock()
 
   # The detours, under the lock: this releases slots back to the engine while
@@ -2898,6 +3315,50 @@ proc waitForIl2Cpp(timeoutMs: int): bool =
        $cIl2Calls() & " time(s), and last returned " & $cIl2Rc() &
        " (non-zero is success)"
   result = false
+
+proc readStaticBridgeEnabled(): bool =
+  ## `aowlspt-host.json` beside the DLL, key `bridgeStaticRva`. Non-zero opts
+  ## into the fragile static-RVA drain path (default off); absent or 0 keeps the
+  ## safe by-name-only behaviour. A boolean read the same shallow way the other
+  ## host settings are, so it needs no JSON parser.
+  result = false
+  var text = ""
+  if not readTextFile(joinPath(gDir, "aowlspt-host.json"), text):
+    return
+  let needle = "\"bridgeStaticRva\""
+  let at = find(text, needle)
+  if at < 0:
+    return
+  var i = at + needle.len
+  while i < text.len and (text[i] == ' ' or text[i] == ':' or text[i] == '\t'):
+    inc i
+  # true, or any non-zero digit
+  if i < text.len and text[i] == 't':
+    result = true
+  elif i < text.len and text[i] >= '1' and text[i] <= '9':
+    result = true
+
+proc readBoolKey(key: string): bool =
+  ## A shallow boolean read of one `aowlspt-host.json` key: true, or a non-zero
+  ## leading digit, is true; absent or 0/false is false. Shared by the bridge's
+  ## diagnostic flags, none of which is worth a JSON parser.
+  result = false
+  var text = ""
+  if not readTextFile(joinPath(gDir, "aowlspt-host.json"), text):
+    return
+  let needle = "\"" & key & "\""
+  let at = find(text, needle)
+  if at < 0:
+    return
+  var i = at + needle.len
+  while i < text.len and (text[i] == ' ' or text[i] == ':' or text[i] == '\t'):
+    inc i
+  if i < text.len and text[i] == 't':
+    result = true
+  elif i < text.len and text[i] >= '1' and text[i] <= '9':
+    result = true
+
+proc readDrainDisabled(): bool = readBoolKey("bridgeDisableDrain")
 
 proc readWaitMs(): int =
   ## `aowlspt-host.json` beside the DLL, key `waitForRuntimeMs`.
@@ -3241,6 +3702,20 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
 
   storeInit(gDir)
 
+  gAllowStaticBridge = readStaticBridgeEnabled()
+  if gAllowStaticBridge:
+    warn "bridgeStaticRva is set: the drain may fall back to the static-RVA " &
+         "path, which crashed the live client once -- use only for diagnosis"
+  gDisableDrain = readDrainDisabled()
+  if gDisableDrain:
+    warn "bridgeDisableDrain is set: no per-frame detour will be installed; " &
+         "invoke_main runs on the host thread and invoke_render is unavailable"
+  gUiProbe = readBoolKey("bridgeUiProbe")
+  if gUiProbe:
+    info "bridgeUiProbe is set: the drain self-test will also instantiate and " &
+         "parent Unity UI GameObjects on the Unity thread once, to prove the " &
+         "native settings-injection path"
+
   let waitMs = readWaitMs()
   info "waiting for the IL2CPP runtime (up to " & $(waitMs div 1000) & "s)"
   if not waitForIl2Cpp(waitMs):
@@ -3269,6 +3744,13 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
         warn "no per-frame method could be detoured, so invoke_main runs on " &
              "the host's own thread (" & $int(gHostThreadId) & ") and not " &
              "Unity's; a callback that touches a Unity object is unsafe"
+      # The render-phase drain, tried once here and retried in the tick loop.
+      # Its primary target rides a render callback that may only be alive in a
+      # raid, so a boot failure is expected in the menu and is not warned about;
+      # the tick loop binds it when the game reaches a scene that has it.
+      if not bindRenderDrain(true):
+        info "no render-phase point bound yet; invoke_render (GL/ESP drawing) " &
+             "is unavailable until a raid brings up a render callback to detour"
 
   let modsDir = joinPath(gDir, "mods")
   # The runtime may not have come up, and that deliberately does not stop this:
@@ -3371,6 +3853,7 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   var lastTick = cNowMs()
   gLastFireMs = lastTick
   var nextBindTry = lastTick + 5000'u64
+  var nextRenderTry = lastTick + 5000'u64
   # One-shot backend-key dump, deferred until the client has reached its menu
   # and initialised HTTPTransportManager on its own -- reading (or worse,
   # force-initialising) it right after il2cpp_init faults and kills the game.
@@ -3402,6 +3885,17 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
         # the only path that reaches the raid-only fallback target, so without it
         # that target would bind without ever proving itself.
         enqueue(cast[Il2CppPtr](0), cast[Il2CppPtr](0), now, -1, true)
+
+    # The render-phase drain, retried on the same cadence: its render callback is
+    # typically raid-time, so it usually binds here rather than at boot. When it
+    # binds, queue a render self-test so the GL-path proof fires on the render
+    # thread. `nextBindTry` is shared with the update retry above -- both are
+    # cheap and neither needs its own clock.
+    if gRenderDrainSlot < 0 and gReady and now >= nextRenderTry:
+      nextRenderTry = now + 5000'u64
+      if bindRenderDrain(false):
+        okLog "the render-phase drain bound late, on " & gRenderMethod
+        enqueueRender(cast[Il2CppPtr](0), cast[Il2CppPtr](0), -1, true)
 
     let fires = int(cMqFireCount())
     if fires != gLastFire:

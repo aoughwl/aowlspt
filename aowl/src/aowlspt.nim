@@ -504,12 +504,19 @@ proc tickTrampoline(user: pointer; payload: AowlSlice;
     if repeat == 0 or not hostReady():
       releaseTickLocked(idx)
       repeat = 0
-  if repeat < 0:
+  if repeat == -1:
     if gHost.invokeMain(gHost.ctx, tickTrampoline, user) != Ok:
       # The host refused to queue. Give the slot back rather than leaving a
       # repeat marked live that nothing will ever fire again -- a chain that
       # has silently stopped is worse than one that stopped and freed itself,
       # because `scheduledSlots()` is how a mod notices.
+      releaseTick(idx)
+  elif repeat == -2:
+    # `everyRender`: re-arm onto the render-phase queue. If the host refuses --
+    # which it does the moment a raid ends and the render callback goes away --
+    # release the slot rather than leave a dead chain marked live.
+    if gHost.size < HostApiSizeRev6 or gHost.invokeRender == nil or
+       gHost.invokeRender(gHost.ctx, tickTrampoline, user) != Ok:
       releaseTick(idx)
   elif repeat > 0:
     discard gHost.schedule(gHost.ctx, int32(repeat), tickTrampoline, user)
@@ -815,7 +822,55 @@ proc stopMainRepeats*(): int =
   result = 0
   withTickLock:
     for i in 0 ..< gTickRepeat.len:
-      if gTickRepeat[i] < 0:
+      if gTickRepeat[i] == -1:
+        gTickRepeat[i] = 0
+        inc result
+
+proc renderReady*(): bool =
+  ## Whether this host offers `invokeRender` -- a render-phase main-thread queue
+  ## where immediate-mode `UnityEngine.GL` drawing lands. True only on a host
+  ## whose `HostApi` reaches revision 6 AND that has actually bound a render
+  ## point; a mod should still gate on `call("aowlspt.host::render_thread")` ->
+  ## `bound:true` before drawing, because the render callback the host rides is
+  ## typically raid-time and is not up in the menu.
+  if not hostReady(): return false
+  result = gHost.size >= HostApiSizeRev6 and gHost.invokeRender != nil
+
+proc onRenderThread*(handler: TickHandler): Status =
+  ## Run `handler` once on Unity's thread DURING rendering -- the point in the
+  ## frame where `GL.*` rasterizes. Safe from any thread. `ErrUnsupported` if the
+  ## host has no render-phase drain bound.
+  if not hostReady(): return ErrBadArg
+  if not renderReady(): return ErrUnsupported
+  let slot = claimTick(handler, 0)
+  result = gHost.invokeRender(gHost.ctx, tickTrampoline, toCookie(slot))
+  if result != Ok:
+    releaseTick(slot)
+
+proc everyRender*(handler: TickHandler): Status =
+  ## Run `handler` on Unity's render-phase thread once per render, re-arming
+  ## itself each time -- the `everyMain` of the render phase, for a native ESP
+  ## box or a GL HUD that has to be drawn every frame where GL actually paints.
+  ##
+  ## Same slot-reuse and same next-drain re-arm as `everyMain`; the only
+  ## difference is the queue. Refuses with `ErrUnsupported` on a host with no
+  ## render drain, and stops itself (releasing its slot) the moment the host
+  ## starts refusing the re-arm -- which is what happens when a raid ends and the
+  ## render callback goes away. Stop it deliberately with `stopRenderRepeats`.
+  if not hostReady(): return ErrBadArg
+  if not renderReady(): return ErrUnsupported
+  let slot = claimTick(handler, -2)
+  result = gHost.invokeRender(gHost.ctx, tickTrampoline, toCookie(slot))
+  if result != Ok:
+    releaseTick(slot)
+
+proc stopRenderRepeats*(): int =
+  ## Stops every `everyRender` chain this mod started, and says how many. Same
+  ## next-firing semantics as `stopMainRepeats`, on the render marker.
+  result = 0
+  withTickLock:
+    for i in 0 ..< gTickRepeat.len:
+      if gTickRepeat[i] == -2:
         gTickRepeat[i] = 0
         inc result
 

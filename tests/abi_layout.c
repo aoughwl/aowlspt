@@ -31,7 +31,7 @@ int main(void)
     CHECK("sizeof(AowlSlice)", sizeof(AowlSlice), 16);
     CHECK("sizeof(AowlBuffer)", sizeof(AowlBuffer), 16);
     CHECK("sizeof(AowlHostInfo)", sizeof(AowlHostInfo), 120);
-    CHECK("sizeof(AowlHostApi)", sizeof(AowlHostApi), 224);
+    CHECK("sizeof(AowlHostApi)", sizeof(AowlHostApi), 232);
     /* The typed patch frame. A mod reads this struct's fields directly rather
      * than through accessor function pointers -- that is what makes an argument
      * read a load instead of a cross-module indirect call -- so its layout is
@@ -56,11 +56,14 @@ int main(void)
           offsetof(AowlHostApi, handle_pointer), 192);
     CHECK("offsetof(AowlHostApi, handle_pin)",
           offsetof(AowlHostApi, handle_pin), 200);
-    /* Revision 4 appended `patch_typed`, revision 5 `notify_push`. */
+    /* Revision 4 appended `patch_typed`, revision 5 `notify_push`, revision 6
+     * `invoke_render`. */
     CHECK("offsetof(AowlHostApi, patch_typed)",
           offsetof(AowlHostApi, patch_typed), 208);
     CHECK("offsetof(AowlHostApi, notify_push)",
           offsetof(AowlHostApi, notify_push), 216);
+    CHECK("offsetof(AowlHostApi, invoke_render)",
+          offsetof(AowlHostApi, invoke_render), 224);
 
     /* The per-revision sizes, which are what a mod tests a capability against.
      * They are literals in `aowl/src/aowlspt/abi.nim` -- they have to be, since
@@ -72,6 +75,7 @@ int main(void)
     CHECK("AOWLSPT_HOSTAPI_SIZE_REV3", AOWLSPT_HOSTAPI_SIZE_REV3, 208);
     CHECK("AOWLSPT_HOSTAPI_SIZE_REV4", AOWLSPT_HOSTAPI_SIZE_REV4, 216);
     CHECK("AOWLSPT_HOSTAPI_SIZE_REV5", AOWLSPT_HOSTAPI_SIZE_REV5, 224);
+    CHECK("AOWLSPT_HOSTAPI_SIZE_REV6", AOWLSPT_HOSTAPI_SIZE_REV6, 232);
 
     CHECK("offsetof(AowlHostInfo, host_name)", offsetof(AowlHostInfo, host_name), 16);
     CHECK("offsetof(AowlHostInfo, encodings)", offsetof(AowlHostInfo, encodings), 80);
@@ -86,7 +90,7 @@ int main(void)
     CHECK("offsetof(AowlModApi, state_load)", offsetof(AowlModApi, state_load), 48);
 
     CHECK("AOWLSPT_ABI_VERSION", AOWLSPT_ABI_VERSION, 1);
-    CHECK("AOWLSPT_ABI_REVISION", AOWLSPT_ABI_REVISION, 5);
+    CHECK("AOWLSPT_ABI_REVISION", AOWLSPT_ABI_REVISION, 6);
     CHECK("AOWLSPT_SIDE_SIM", AOWLSPT_SIDE_SIM, 3);
     CHECK("AOWLSPT_PATCH_SKIP", AOWLSPT_PATCH_SKIP, 1);
 
