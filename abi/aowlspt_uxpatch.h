@@ -40,6 +40,40 @@
  * reaches it, it also cleanly quits). Both are native, no managed dependency,
  * and cannot themselves hang.
  *
+ * ## Fix 1b -- Closing the OS window hangs too (this file, a WndProc subclass)
+ *
+ * The Exit-BUTTON patch (Fix 1) intercepts the confirm-accept lambda, but that
+ * is only reached from the in-game menu "Exit" flow. Closing the window any
+ * OTHER way -- the title-bar X, right-click-taskbar-Close, Alt+F4 -- never runs
+ * that lambda. Windows posts WM_CLOSE to the game's top window; Unity's window
+ * proc turns that into `Application.Quit`, which funnels into the SAME async
+ * exit-loading shutdown (logout / save / matchmaker-leave / launcher handoff)
+ * that hangs forever with no BsgLauncher. So the OS-close path hangs exactly
+ * like the pre-fix Exit button did, and the .text patch above does not cover it
+ * because a different caller (Unity's WndProc, not the confirm lambda) reaches
+ * the hang.
+ *
+ * RE of the path: WM_CLOSE -> Unity/GameAssembly window proc -> Application.Quit
+ * -> EFT quit -> the async shutdown state-machine (the same one Fix 1 bypasses)
+ * -> hang on the exit-loading screen. Rather than chase and byte-patch that
+ * managed WndProc/Quit chain (build-specific, several methods, and the hang is
+ * inside async continuations that are awkward to neuter), we cut it off at the
+ * cleanest choke point: the WIN32 window message itself. We SUBCLASS the game's
+ * top-level window (SetWindowLongPtrW GWLP_WNDPROC) with a tiny native proc that,
+ * on WM_CLOSE / WM_QUIT / WM_ENDSESSION, calls `ExitProcess(0)` immediately --
+ * terminating cleanly before Unity ever sees the close and before any async
+ * shutdown can start. Every other message is forwarded to the original proc via
+ * CallWindowProcW, so the window behaves normally until it is closed. This one
+ * hook covers the X button, taskbar Close, and Alt+F4 (all arrive as WM_CLOSE),
+ * plus session logoff/shutdown.
+ *
+ * Fail-safe: the window is located by walking this process's own top-level
+ * windows (GetWindowThreadProcessId == GetCurrentProcessId) preferring a visible
+ * one; if none is found the hook is simply not installed (Exit-button fix still
+ * works, OS-close still hangs -- nothing worse). Arming is idempotent: the
+ * original proc is stored once and a second call is a no-op. ExitProcess is a
+ * clean native terminate that cannot itself hang.
+ *
  * Each entry is overwritten with, at its first byte:
  *     31 C9                 xor ecx, ecx           ; uExitCode = 0
  *     48 B8 <ExitProcess>   mov rax, imm64
@@ -161,6 +195,91 @@ static int32_t aowl_uxpatch_exit_neuter(void) {
     landed += aowl_ux_patch_exit_site(base + AOWL_UX_EXITAPP_RVA, ep);
     aowl_ux_exit_ok = landed;
     return landed;
+}
+
+/* ------------------------------------------------------------------ *
+ * Fix 1b: OS window-close -> ExitProcess(0) (WndProc subclass)
+ * ------------------------------------------------------------------ */
+
+/* Diagnostics, read by the host after arming. */
+static int32_t aowl_ux_close_hooked = 0;  /* subclass installed          */
+static int32_t aowl_ux_close_seen   = 0;  /* a candidate window was found */
+
+/* The window we subclassed and its original proc, stored once so arming is
+ * idempotent and so we can forward non-close messages unchanged. */
+static HWND    aowl_ux_close_hwnd = NULL;
+static WNDPROC aowl_ux_close_orig = NULL;
+
+/* Our replacement window proc: terminate cleanly the instant the window is
+ * asked to close (X button, taskbar Close, Alt+F4 all post WM_CLOSE), or on a
+ * session end. Anything else is forwarded to the game's original proc. This
+ * returns into nothing on the close messages -- ExitProcess never returns. */
+static LRESULT CALLBACK aowl_ux_close_proc(HWND h, UINT msg,
+                                           WPARAM wp, LPARAM lp) {
+    if (msg == WM_CLOSE || msg == WM_QUIT || msg == WM_ENDSESSION) {
+        ExitProcess(0);
+    }
+    if (aowl_ux_close_orig)
+        return CallWindowProcW(aowl_ux_close_orig, h, msg, wp, lp);
+    return DefWindowProcW(h, msg, wp, lp);
+}
+
+/* EnumWindows callback: pick a top-level window owned by THIS process. Prefer a
+ * visible one (the actual game window), but remember any as a fallback. lp is a
+ * HWND* receiving the choice. */
+static BOOL CALLBACK aowl_ux_close_enum(HWND h, LPARAM lp) {
+    DWORD pid = 0;
+    HWND* out = (HWND*)lp;
+    GetWindowThreadProcessId(h, &pid);
+    if (pid != GetCurrentProcessId()) return TRUE;
+    aowl_ux_close_seen = 1;
+    if (*out == NULL) *out = h;          /* fallback: first owned window     */
+    if (IsWindowVisible(h)) {            /* preferred: the visible game window */
+        *out = h;
+        return FALSE;                    /* stop; we found the real one       */
+    }
+    return TRUE;
+}
+
+/* Subclass the game's top-level window so an OS-driven close terminates cleanly
+ * instead of entering the hanging async shutdown. Idempotent: once hooked, a
+ * repeat call is a no-op and returns 1. Returns 1 if the hook is (or was
+ * already) installed, 0 if no owned window could be found or the subclass write
+ * failed (in which case nothing is changed -- OS-close still hangs, but the
+ * Exit-button fix is untouched and no state is corrupted). Safe to call more
+ * than once; call it once the game window exists (i.e. at/after menu boot). */
+static int32_t aowl_uxpatch_close_hook(void) {
+    HWND target;
+    WNDPROC prev;
+
+    if (aowl_ux_close_hooked && aowl_ux_close_hwnd &&
+        IsWindow(aowl_ux_close_hwnd))
+        return 1;                        /* already ours                     */
+
+    target = NULL;
+    EnumWindows(aowl_ux_close_enum, (LPARAM)&target);
+    if (target == NULL) return 0;        /* no window yet; caller may retry   */
+
+    /* Install our proc and remember the original. Use the W variant to match
+     * Unity's Unicode window class so CallWindowProcW dispatches correctly. */
+    aowl_ux_close_hwnd = target;
+    prev = (WNDPROC)(uintptr_t)SetWindowLongPtrW(target, GWLP_WNDPROC,
+                                                 (LONG_PTR)(uintptr_t)aowl_ux_close_proc);
+    if (prev == NULL) {
+        /* SetWindowLongPtrW returns 0 on failure; but 0 could also be a prior
+         * value. Treat a genuine failure (our proc not in place) as unhooked. */
+        if ((WNDPROC)(uintptr_t)GetWindowLongPtrW(target, GWLP_WNDPROC)
+                != aowl_ux_close_proc) {
+            aowl_ux_close_hwnd = NULL;
+            return 0;
+        }
+    }
+    /* Do not overwrite a previously-saved original with our own proc if this is
+     * a redundant call that slipped past the guard above. */
+    if (prev != aowl_ux_close_proc)
+        aowl_ux_close_orig = prev;
+    aowl_ux_close_hooked = 1;
+    return 1;
 }
 
 /* ------------------------------------------------------------------ *

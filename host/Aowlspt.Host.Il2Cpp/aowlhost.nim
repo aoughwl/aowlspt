@@ -405,6 +405,11 @@ proc cBeAnswered(): int32 {.importc: "aowl_be_guard_answered", nodecl.}
 proc cUxExitNeuter(): int32 {.importc: "aowl_uxpatch_exit_neuter", nodecl.}
 var cUxBaseFound {.importc: "aowl_ux_base_found", nodecl.}: int32
 var cUxExitSeen {.importc: "aowl_ux_exit_seen", nodecl.}: int32
+# Fix 1b: subclass the game's top window so an OS-driven close (X button,
+# taskbar Close, Alt+F4) terminates cleanly instead of entering the same hanging
+# async shutdown the Exit-button fix bypasses. See `aowlspt_uxpatch.h`.
+proc cUxCloseHook(): int32 {.importc: "aowl_uxpatch_close_hook", nodecl.}
+var cUxCloseSeen {.importc: "aowl_ux_close_seen", nodecl.}: int32
 proc cUxVersionTarget(): Il2CppPtr {.
   importc: "aowl_uxpatch_version_target", nodecl.}
 proc cUxVersionLabelOffset(): int32 {.
@@ -4151,6 +4156,24 @@ proc reportRuntime() =
          "(Exit still hangs, nothing worse)"
   else:
     warn "exit fix: an exit prologue matched but the patch write failed"
+
+  # OS-close hang fix (Fix 1b): the Exit-button patch above only covers the
+  # in-game Exit flow. Closing the window via the title-bar X, taskbar Close, or
+  # Alt+F4 posts WM_CLOSE to Unity's window proc, which funnels into the SAME
+  # hanging async shutdown by a different caller. Subclass the game's top window
+  # so those messages hard-exit (ExitProcess(0)) before any async work starts.
+  # Fail-safe: if no owned window is found the hook is simply skipped.
+  let closeHooked = cUxCloseHook()
+  if closeHooked == 1'i32:
+    okLog "exit fix: window-close (X / taskbar / Alt+F4) redirected to " &
+          "ExitProcess(0) via WndProc subclass (covers the OS-close path the " &
+          "Exit-button patch does not)"
+  elif cUxCloseSeen == 0:
+    warn "exit fix: no top-level game window found yet; OS-close hook not " &
+         "installed (window-X may still hang; Exit button is patched)"
+  else:
+    warn "exit fix: found the game window but the WndProc subclass failed; " &
+         "OS-close may still hang (Exit button is patched)"
 
   var count = 0
   let assemblies = domainGetAssemblies(gRt, gDomain, count)
