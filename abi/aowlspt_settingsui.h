@@ -71,8 +71,24 @@
 #define AOWL_SUI_SS_SOUNDTAB       0x108
 #define AOWL_SUI_SS_CONTROLSTAB    0x110
 
-/* SettingsTab. */
+/* SettingsTab.
+ *
+ * PHASE 1.6 -- 0x88 CONFIRMED AGAINST COMPILED CODE, and confirmed to be a BASE
+ * field. `SettingsTab::CleanupCreatedControls` (0x171BE50) is declared on the
+ * base and used by every derived tab, and it reads `mov r9, [rdi+0x88]`.
+ * `SettingsTab::Close` (0x171BDF0) tests the same `[rcx+0x88]`. IL2CPP lays base
+ * fields first under single inheritance, so GameSettingsTab /
+ * GraphicsSettingsTab / PostFXSettingsTab / SoundSettingsTab /
+ * ControlSettingsTab ALL carry it here despite their differing klass pointers.
+ * The live "reads null" was never a per-type layout difference -- it was timing.
+ *
+ * 0x90 is the first-select latch that gates creation: OnTabSelected tests it,
+ * sets it, and calls OnFirstSelect (-> CreateControls -> the generic
+ * CreateControl<T>, which is what actually allocates and fills the 0x88 list);
+ * Close resets it to 0. So the list is null until the tab is SELECTED, and the
+ * probe walks it from OnTabSelected's POSTFIX. */
 #define AOWL_SUI_TAB_CREATEDCTRLS  0x088
+#define AOWL_SUI_TAB_FIRSTSELECTED 0x090
 
 /* List<T> raw layout + array element base. */
 #define AOWL_SUI_LIST_ITEMS        0x010
@@ -137,6 +153,7 @@ static int32_t aowl_sui_off_postfxtab(void)    { return AOWL_SUI_SS_POSTFXTAB; }
 static int32_t aowl_sui_off_soundtab(void)     { return AOWL_SUI_SS_SOUNDTAB; }
 static int32_t aowl_sui_off_controlstab(void)  { return AOWL_SUI_SS_CONTROLSTAB; }
 static int32_t aowl_sui_off_createdctrls(void) { return AOWL_SUI_TAB_CREATEDCTRLS; }
+static int32_t aowl_sui_off_firstselected(void) { return AOWL_SUI_TAB_FIRSTSELECTED; }
 static int32_t aowl_sui_off_list_items(void)   { return AOWL_SUI_LIST_ITEMS; }
 static int32_t aowl_sui_off_list_size(void)    { return AOWL_SUI_LIST_SIZE; }
 static int32_t aowl_sui_off_arr_elems(void)    { return AOWL_SUI_ARR_ELEMS; }

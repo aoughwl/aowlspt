@@ -36,6 +36,16 @@ proc cSuiGroupTabOffset(group: int32): int32 {.
   importc: "aowl_sui_group_tab_offset", nodecl.}
 proc cSuiGroupName(group: int32): Il2CppPtr {.
   importc: "aowl_sui_group_name", nodecl.}
+proc cSuiOffFirstSelected(): int32 {.
+  importc: "aowl_sui_off_firstselected", nodecl.}
+
+## Phase 1.6 target: the tab SELECTION point, where the controls get created.
+proc cBridgeSettingsSelTargetCount(): int32 {.
+  importc: "aowl_bridge_settingstabsel_target_count", nodecl.}
+proc cBridgeSettingsSelTargetAt(i: int32): Il2CppPtr {.
+  importc: "aowl_bridge_settingstabsel_target_at", nodecl.}
+proc cBridgeSettingsSelTargetName(i: int32): Il2CppPtr {.
+  importc: "aowl_bridge_settingstabsel_target_name", nodecl.}
 
 ## Phase 1.5 target: the tab BUILDER, hooked postfix.
 proc cBridgeSettingsTabTargetCount(): int32 {.
@@ -243,6 +253,17 @@ var gSuiGroupsLogged: array[8, bool]
 ## Total firings, for the one-line "fired" trace on the first call only.
 var gSuiTabFires = 0
 
+## The group -> live tab-object / klass registry, filled by the
+## `EnsureTabInitialized` postfix below.
+##
+## Two jobs. It lets the Phase-1.6 `OnTabSelected` walk NAME the tab it is handed
+## (that hook gets the SettingsTab directly and has no group argument), and it is
+## the live klass-pointer census: each concrete tab type has its own klass, so
+## printing them here is how we confirm type identity at runtime without ever
+## touching reflection. Indexed by ESettingsGroup (0..4).
+var gSuiTabPtr: array[8, uint64]
+var gSuiTabKlass: array[8, uint64]
+
 proc suiTabInitBody(a: Il2CppPtr): Il2CppPtr {.
     exportc: "aowl_settingstab_body", cdecl.} =
   ## The whole Phase-1.5 walk, called ONLY through `aowl_settingstab_body_guarded`
@@ -291,10 +312,24 @@ proc suiTabInitBody(a: Il2CppPtr): Il2CppPtr {.
 
   if group >= 0'i32 and int(group) < gSuiGroupsLogged.len:
     gSuiGroupsLogged[int(group)] = true
+  let klass = cast[uint64](cReadPtrAt(tab, 0'i32))
+  # Register the tab object + its klass under its group. This is what lets the
+  # Phase-1.6 OnTabSelected walk -- which is handed the SettingsTab and no group
+  # -- print a real tab NAME, and it doubles as the live klass census.
+  if group >= 0'i32 and int(group) < gSuiTabPtr.len:
+    gSuiTabPtr[int(group)] = cast[uint64](tab)
+    gSuiTabKlass[int(group)] = klass
   okLog "settings probe: tab built -- group=" & gname & " (" & $int(group) &
-        ") tab=0x" & hexOf(cast[uint64](tab)) & " klass=0x" &
-        hexOf(cast[uint64](cReadPtrAt(tab, 0'i32)))
-  suiWalkTab(tab, gname)
+        ") tab=0x" & hexOf(cast[uint64](tab)) & " klass=0x" & hexOf(klass)
+  # The controls do NOT exist yet at this point -- proven live, and proven in the
+  # disassembly (see aowlspt_bridge.h): the +0x88 list is allocated by the
+  # generic CreateControl<T>, which only runs once the tab is SELECTED and
+  # OnFirstSelect fires. So walk here only on the off-chance a build populates it
+  # early, and stay quiet rather than repeating "list is null" for every tab --
+  # the Phase-1.6 hook on OnTabSelected is what actually reports the controls.
+  if cIsReadable(tab, cSuiOffCreatedCtrls() + 8'i32) != 0'i32 and
+     cReadPtrAt(tab, cSuiOffCreatedCtrls()) != nil:
+    suiWalkTab(tab, gname)
   return cast[Il2CppPtr](1)
 
 # The VEH/SEH guard thunk, the same mechanism botdiag/botcap use: `aowl_p_p_seh`
@@ -340,5 +375,132 @@ proc bindSettingsTabProbe(verbose: bool): bool =
       okLog "settings-UI control probe (Phase 1.5) armed POSTFIX on " & spec &
             "; open Settings and click each tab -- every control's label, klass " &
             "and value-widget pointer is logged as the tab is built"
+      return true
+  result = false
+
+# ---------------------------------------------------------------------------
+# PHASE 1.6 -- the walk that finally SEES the controls
+#
+# Phase 1.5 was right about the object and wrong about the moment. Live, it
+# handed us real tab objects on the Unity thread -- and `_createdControls`
+# (+0x88) still read null on every one of them. The offset was never the
+# problem; three pieces of disassembly say so (full write-up in
+# `aowlspt_bridge.h`):
+#
+#   * `SettingsTab::CleanupCreatedControls`, declared on the BASE and shared by
+#     every derived tab, reads `[rdi+0x88]`. So 0x88 is right AND it is a base
+#     field -- the derived tabs' differing klass pointers do not move it, since
+#     IL2CPP lays base fields first.
+#   * NOTHING in GameSettingsTab ever writes [this+0x88]. The write is in the
+#     generic `SettingsTab::CreateControl<T>`, which runs per control created.
+#   * `SettingsTab::OnTabSelected` is the sole trigger: it tests the first-select
+#     latch at +0x90, sets it, and virtual-calls OnFirstSelect -> CreateControls,
+#     which is what creates the controls in the first place.
+#
+# So the list is null until a tab is actually SELECTED, and this is that moment.
+# A POSTFIX here (kind=8) runs once the controls exist. RCX is the SettingsTab
+# itself, so there is no group indirection at all -- we walk exactly the object
+# we were handed, and name it from the registry the Phase-1.5 hook fills.
+#
+# Same discipline throughout: read-only, reflection-free, every hop
+# cIsReadable-guarded, capped, whole body under the VEH/SEH guard.
+# ---------------------------------------------------------------------------
+
+## Tabs already censused, by object pointer, so re-selecting a tab (which fires
+## OnTabSelected every time) logs its controls once and then stays quiet.
+var gSuiSelWalked: array[16, uint64]
+var gSuiSelWalkedN = 0
+var gSuiSelFires = 0
+
+proc suiNameForTab(tab: uint64): string =
+  ## The tab's group name from the Phase-1.5 registry, or a pointer-shaped
+  ## fallback when this tab was selected without EnsureTabInitialized having
+  ## registered it (possible if the screen is re-opened and rebuilt).
+  for g in 0 ..< gSuiTabPtr.len:
+    if gSuiTabPtr[g] != 0'u64 and gSuiTabPtr[g] == tab:
+      return readCString(cSuiGroupName(int32(g)))
+  result = "tab@0x" & hexOf(tab)
+
+proc suiTabSelBody(a: Il2CppPtr): Il2CppPtr {.
+    exportc: "aowl_settingssel_body", cdecl.} =
+  ## The Phase-1.6 walk, called ONLY through `aowl_settingssel_body_guarded`.
+  ## Fired from the POSTFIX of `SettingsTab::OnTabSelected`, so OnFirstSelect ->
+  ## CreateControls has already run and the +0x88 list is populated. `a` is the
+  ## detour `regs`; RCX is the SettingsTab. Returns a non-nil sentinel on clean
+  ## completion. Writes nothing, ever.
+  let regs = a
+  let tid = int(cThreadId())
+  let onHost = (tid == int(gHostThreadId))
+  let tabRaw = cRegsInt(regs, 0'i32)           # RCX = this (SettingsTab)
+  inc gSuiSelFires
+  if gSuiSelFires == 1:
+    okLog "settings probe: OnTabSelected (postfix) first fired on thread " &
+          $tid & " (host thread " & $int(gHostThreadId) & ")" &
+          (if onHost: " -- host thread (unexpected, NOT Unity's)"
+           else: " -- Unity's main thread")
+  if onHost or tabRaw == 0'u64:
+    return cast[Il2CppPtr](1)
+
+  # Already censused this tab object? Then nothing to say.
+  for i in 0 ..< gSuiSelWalkedN:
+    if gSuiSelWalked[i] == tabRaw:
+      return cast[Il2CppPtr](1)
+
+  let tab = cast[Il2CppPtr](tabRaw)
+  if cIsReadable(tab, cSuiOffCreatedCtrls() + 8'i32) == 0'i32:
+    okLog "settings probe: selected tab 0x" & hexOf(tabRaw) &
+          " is not readable to its control list; skipped (no write)"
+    return cast[Il2CppPtr](1)
+
+  let name = suiNameForTab(tabRaw)
+  let klass = cast[uint64](cReadPtrAt(tab, 0'i32))
+  let firstSel = (if cIsReadable(tab, cSuiOffFirstSelected() + 1'i32) != 0'i32:
+                    int(cReadI32At(suiPtrAdd(tab, cSuiOffFirstSelected())) and
+                        0xFF'i32)
+                  else: -1)
+  okLog "settings probe: tab SELECTED -- " & name & " tab=0x" & hexOf(tabRaw) &
+        " klass=0x" & hexOf(klass) & " firstSelectLatch=" & $firstSel
+  if gSuiSelWalkedN < gSuiSelWalked.len:
+    gSuiSelWalked[gSuiSelWalkedN] = tabRaw
+    inc gSuiSelWalkedN
+  suiWalkTab(tab, name)
+  return cast[Il2CppPtr](1)
+
+# The VEH/SEH guard thunk -- same mechanism as every other host detour body.
+{.emit: """
+extern void* aowl_settingssel_body(void* a);
+static void* aowl_settingssel_body_guarded(void* a) {
+    return aowl_p_p_seh((void*)aowl_settingssel_body, a);
+}
+""".}
+proc cSettingsSelBodyGuarded(a: Il2CppPtr): Il2CppPtr {.
+  importc: "aowl_settingssel_body_guarded", nodecl.}
+
+proc settingsTabSelectedFired(regs: Il2CppPtr) =
+  ## Dispatched by slot identity from `patchReturned` for the kind=8 detour.
+  if cSettingsSelBodyGuarded(regs) == nil:
+    okLog "settings probe: fault caught in the selected-tab walk -- the VEH " &
+          "guard kept the settings screen alive (nothing was written)"
+
+proc bindSettingsSelProbe(verbose: bool): bool =
+  ## Installs the read-only POSTFIX detour (kind=8) on
+  ## `SettingsTab::OnTabSelected`. Shares the `settingsUiProbe` flag with the
+  ## Phase-1/1.5 hooks; binds nothing on a build whose prologue does not match.
+  if gSettingsSelSlot >= 0:
+    return true
+  if not gReady or gDisableDrain:
+    return false
+  let count = cBridgeSettingsSelTargetCount()
+  for i in 0 ..< int(count):
+    let fn = cBridgeSettingsSelTargetAt(int32(i))
+    if fn == nil:
+      if verbose:
+        info "settings tab-select target " & $i & " did not verify on this build"
+      continue
+    let spec = readCString(cBridgeSettingsSelTargetName(int32(i)))
+    if attachDrain(spec, fn, cast[Il2CppMethod](0), false, verbose, 8'i32, true):
+      okLog "settings-UI CONTROL census (Phase 1.6) armed POSTFIX on " & spec &
+            "; the controls are created on first select, so clicking each tab " &
+            "now logs every control's label, klass and value-widget pointer"
       return true
   result = false

@@ -365,6 +365,99 @@ static int32_t aowl_bridge_settingstab_target_count(void) {
     return AOWL_BRIDGE_SETTINGSTAB_TARGET_COUNT;
 }
 
+/* ------------------------------------------------------------------ *
+ * The settings CONTROL-CREATION target (Phase 1.6) -- where the list is filled
+ *
+ * `EFT.UI.Settings.SettingsTab::OnTabSelected` @ RVA 0x171BDA0 (VA 0x18171BDA0).
+ *
+ * WHY: Phase 1.5 hooked `EnsureTabInitialized` and the live log proved the tab
+ * OBJECTS are real and handed to us on the Unity thread -- but every tab's
+ * `_createdControls` (+0x88) still read NULL. The offset was never wrong. The
+ * disassembly settles it three ways:
+ *
+ *   * `SettingsTab::CleanupCreatedControls` (0x171BE50) -- declared on the BASE
+ *     and used by every derived tab -- does `mov r9, [rdi+0x88]`. So 0x88 is the
+ *     created-controls list, it is a BASE field, and it is therefore at the same
+ *     offset in GameSettingsTab / GraphicsSettingsTab / PostFXSettingsTab /
+ *     SoundSettingsTab / ControlSettingsTab alike. The differing klass pointers
+ *     in the live log are just derived types; single inheritance puts the base
+ *     fields first, so they share this offset. NOT a per-type layout problem.
+ *   * Nothing in `GameSettingsTab` writes [this+0x88] at all -- not Awake, not
+ *     Show, not OnFirstSelect, not CreateControls. The write lives in the
+ *     GENERIC `SettingsTab::CreateControl<T>` (no RVA in metadata: generic), so
+ *     the list is allocated when the FIRST control is created.
+ *   * `SettingsTab::OnTabSelected` is what triggers that creation, and it is the
+ *     ONLY thing that does:
+ *
+ *         cmp  byte [rcx+0x90], 0        ; "first select done?" flag
+ *         mov  rbx, rcx
+ *         jne  skip
+ *           mov  rdx, [rcx]              ; klass
+ *           mov  byte [rcx+0x90], 1      ; mark done
+ *           mov  rax, [rdx+0x2C8]        ; vtable slot -> OnFirstSelect
+ *           call rax                     ; -> CreateControls -> fills +0x88
+ *         skip:
+ *           mov  rax, [rdx+0x2D8]        ; vtable slot -> OnSelect
+ *           jmp  rax                     ; TAIL JUMP
+ *
+ *     `SettingsTab::Close` (0x171BDF0) is the mirror image: it tests
+ *     [rcx+0x88], calls CleanupCreatedControls, and resets [rbx+0x90] to 0 --
+ *     confirming 0x90 is the first-select latch and 0x88 the list.
+ *
+ * So the controls exist only after a tab is actually SELECTED, and this method
+ * is the moment. Hooked POSTFIX: RCX = the SettingsTab itself (exactly the
+ * object to walk, no group indirection needed). The tail `jmp rax` into
+ * OnSelect is harmless to a postfix -- OnSelect's own `ret` returns through our
+ * thunk, so we simply run after BOTH have finished, which is later still and
+ * strictly safer.
+ *
+ * Prologue, byte-verified against GameAssembly.dll -- and the cleanest steal of
+ * any target here, because NOTHING in it is RIP-relative:
+ *   40 53                   push rbx
+ *   48 83 EC 20             sub  rsp, 0x20
+ *   80 B9 90 00 00 00 00    cmp  byte [rcx+0x90], 0
+ *   48 8B D9                mov  rbx, rcx
+ * = 2+4+7+3 = 16 exactly, ending immediately before `75 1A` (jne), so the steal
+ * lands on an instruction boundary and is position-independent.
+ */
+static const AowlBridgeTarget aowl_bridge_settingstabsel_targets[] = {
+    { "EFT.UI.Settings.SettingsTab::OnTabSelected", 0x171BDA0u,
+      { 0x40,0x53, 0x48,0x83,0xEC,0x20,
+        0x80,0xB9,0x90,0x00,0x00,0x00,0x00, 0x48,0x8B,0xD9 }, 16, 0 },
+};
+#define AOWL_BRIDGE_SETTINGSTABSEL_TARGET_COUNT \
+    ((int32_t)(sizeof(aowl_bridge_settingstabsel_targets) / \
+               sizeof(aowl_bridge_settingstabsel_targets[0])))
+
+static void* aowl_bridge_settingstabsel_target_at(int32_t i) {
+    HMODULE ga;
+    const AowlBridgeTarget* t;
+    unsigned char* p;
+    MEMORY_BASIC_INFORMATION mbi;
+    if (i < 0 || i >= AOWL_BRIDGE_SETTINGSTABSEL_TARGET_COUNT) return NULL;
+    ga = GetModuleHandleA("GameAssembly.dll");
+    if (!ga) return NULL;
+    aowl_bridge_base_found = 1;
+    t = &aowl_bridge_settingstabsel_targets[i];
+    p = (unsigned char*)ga + t->rva;
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0) return NULL;
+    if (mbi.State != MEM_COMMIT) return NULL;
+    if (!(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                         PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+        return NULL;
+    if (t->siglen > 0 && memcmp(p, t->sig, (size_t)t->siglen) != 0) return NULL;
+    aowl_bridge_sig_ok = 1;
+    aowl_bridge_last_rva = (int32_t)t->rva;
+    return (void*)p;
+}
+static const char* aowl_bridge_settingstabsel_target_name(int32_t i) {
+    if (i < 0 || i >= AOWL_BRIDGE_SETTINGSTABSEL_TARGET_COUNT) return "";
+    return aowl_bridge_settingstabsel_targets[i].name;
+}
+static int32_t aowl_bridge_settingstabsel_target_count(void) {
+    return AOWL_BRIDGE_SETTINGSTABSEL_TARGET_COUNT;
+}
+
 /* The i'th target's verified code pointer, or NULL.
  *
  * NULL means one of: GameAssembly.dll is not mapped yet, the index is out of

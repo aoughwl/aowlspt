@@ -1051,6 +1051,13 @@ var gSettingsUiDone = false
 ## Shares the `settingsUiProbe` flag with the Phase-1 hook. The walk lives in
 ## `settingsui.nim` (included below) and NEVER writes.
 var gSettingsTabSlot = -1
+## Phase 1.6 native-settings CONTROL census (kind=8 POSTFIX detour on
+## `SettingsTab::OnTabSelected`): its slot. Phase 1.5 proved the tab objects are
+## real but their `_createdControls` is still null at tab-init; the controls are
+## created by OnFirstSelect -> CreateControls, which only OnTabSelected triggers.
+## Shares the `settingsUiProbe` flag. The walk lives in `settingsui.nim` and
+## NEVER writes.
+var gSettingsSelSlot = -1
 
 ## Whether the fragile static-RVA drain path may be used at all. OFF by default:
 ## it bound a real-but-wrong function on the live client and crashed the game, so
@@ -2709,6 +2716,12 @@ proc patchReturned(slot: int32; regs: Il2CppPtr): int32 {.
   if i == gSettingsTabSlot:
     settingsTabInitFired(regs)
     return 0'i32
+  # Phase 1.6 control census, same reasoning: a host drain (meth == nil) that
+  # must read AFTER the original ran, because the original is what creates the
+  # controls. Returns 0 -- this never changes a result.
+  if i == gSettingsSelSlot:
+    settingsTabSelectedFired(regs)
+    return 0'i32
   if i < 0 or i >= gPatches.len:
     return 0'i32
   if not gPatches[i].live:
@@ -2990,6 +3003,7 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
               elif kind == 3: "version-brand" elif kind == 5: "botdiag"
               elif kind == 4: "settings-ui-probe" elif kind == 6: "botcap"
               elif kind == 7: "settings-tab-probe"
+              elif kind == 8: "settings-sel-probe"
               else: "main-thread")
   tablesLock()
   let claimed = cHookClaim()
@@ -3045,13 +3059,15 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
     gBotCapSlot = int(claimed)
   elif kind == 7:
     gSettingsTabSlot = int(claimed)
+  elif kind == 8:
+    gSettingsSelSlot = int(claimed)
   else:
     gDrainSlot = int(claimed)
   tablesUnlock()
   if kind == 1:
     gRenderMethod = spec
   elif kind == 2 or kind == 3 or kind == 4 or kind == 5 or kind == 6 or
-       kind == 7:
+       kind == 7 or kind == 8:
     discard
   else:
     gDrainMethod = spec
@@ -3059,7 +3075,7 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
   okLog what & " bound to " & spec & " (" &
         $int(cHookStolen(hook)) & " bytes)" &
         (if perFrame or kind == 2 or kind == 3 or kind == 4 or kind == 5 or
-            kind == 6 or kind == 7: "" else:
+            kind == 6 or kind == 7 or kind == 8: "" else:
            "; it runs more than once a frame, so its firing count is not a " &
            "frame count")
   return true
@@ -4748,6 +4764,10 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       # mechanism but fires BEFORE any tab's controls exist; they are built
       # lazily by EnsureTabInitialized, so the walk hangs off that method's
       # POSTFIX. Same flag, same read-only discipline, separate slot.
+      if gSettingsUiProbe and not bindSettingsSelProbe(true):
+        info "the settings control census did not verify " &
+             "SettingsTab.OnTabSelected on this build"
+
       if gSettingsUiProbe and not bindSettingsTabProbe(true):
         info "the settings control probe did not verify " &
              "SettingsScreen.EnsureTabInitialized on this build"
