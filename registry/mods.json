@@ -217,6 +217,25 @@
       "provides": [],
       "loadAfter": ["aowl.tarkov", "aowl.icebreaker"],
       "tags": ["travel", "locations", "content"]
+    },
+    {
+      "id": "aowl.textures",
+      "name": "Textures",
+      "author": "savannt",
+      "version": "1.0.0",
+      "description": "High-res PBR texture replacement — the IL2CPP port of TarkovTextures. An offline pipeline curates ambientcg PBR sets into a VRAM-tiered name->replacement manifest; the client mod name-matches intercepted AssetBundle texture loads against it through the host's postfix detour. Name-matching runs live; the pixel-upload path waits on a byte[]/ImageConversion.LoadImage capability, and until then the mod NO-OPs to stock textures.",
+      "pipeline": ">=0.1.0",
+      "sides": ["client", "sim"],
+      "source": { "kind": "intree", "path": "mods/textures", "url": null },
+      "artifact": { "dir": "textures", "library": "textures.dll" },
+      "upstream": { "name": "TarkovTextures", "author": "savannt", "url": null },
+      "license": "see repository",
+      "download": null,
+      "requires": [],
+      "conflicts": [],
+      "provides": [],
+      "loadAfter": [],
+      "tags": ["client", "graphics", "textures"]
     }
   ],
 
@@ -244,7 +263,8 @@
         { "id": "aowl.fovfix", "enabled": true },
         { "id": "com.savannt.sptsway", "enabled": true },
         { "id": "aowl.classicmovement", "enabled": true },
-        { "id": "aowl.perf", "enabled": true, "note": "loaded, but every knob it has is off until you turn one on; it reports frame pacing before it changes anything" }
+        { "id": "aowl.perf", "enabled": true, "note": "loaded, but every knob it has is off until you turn one on; it reports frame pacing before it changes anything" },
+        { "id": "aowl.textures", "enabled": true, "note": "curated 2K PBR replacements, bounded by a VRAM budget; NO-OPs to stock textures until the upload capability lands" }
       ]
     },
     {
