@@ -87,6 +87,34 @@ const
   # host regex wants a bare host. Kept in sync with `backend.json` by hand;
   # loopback is the only address this server ever answers on.
   BackendUrl = "https://127.0.0.1"
+  # The url the client fetches *assets* from -- `backend.Static`, the asset CDN
+  # base that every `/files/...` request is resolved against. Plain HTTP, and on
+  # purpose.
+  #
+  # `/client/*` goes over the managed HTTP stack, which post-1.0 configures to
+  # accept any certificate, so HTTPS with a self-signed cert is fine there.
+  # Assets do not: they are fetched with `UnityWebRequest`, through Unity's own
+  # transport, and the client's call sites never assign a `certificateHandler`
+  # (proven in `EFT.<DownloadTexture2D>d__218::MoveNext`, RVA 0xA7FF70 -- the
+  # request is built at +0xA8018F with none). Unity therefore validates our
+  # certificate, rejects it, and never sends the request; the error branch
+  # returns null *without logging*, so a trader avatar that fails this way is an
+  # infinite spinner and a silent client log. The only trace is a `handshake
+  # FATAL` line on the server side.
+  #
+  # There is nothing a server can do to make that client accept its certificate.
+  # So the asset base offers no certificate at all: the backend opens a second,
+  # plain-HTTP listener (`--asset-port`, default 80) serving the same `/files/`
+  # and `/regular/files/` routes, and this url names it. No TLS handshake
+  # happens, so no TLS validation can fail, and *every* `UnityWebRequest` asset
+  # fetch works -- including bundles and anything a mod adds later, not just the
+  # icons `tools/imagecache.py` pre-seeds into Unity's own cache.
+  #
+  # Portless, which means port 80 -- keep it in step with the backend's
+  # `--asset-port` default. If that port has to move (IIS, the Hyper-V port
+  # reservation), both this and the backend flag move together; the client is
+  # given whatever this says.
+  AssetUrl = "http://127.0.0.1"
 
 var gRequests = 0
 var gEdition = "standard"
@@ -112,6 +140,43 @@ var gSelfCheckFailures: seq[string] = @[]
   ## Every load-time check that did not hold, for `/aowlspt/tarkov/selfcheck`.
   ## Empty is the ordinary state and is also an answer: it is the difference
   ## between "this mod loaded" and "nothing is listening".
+
+var gFilesPng = ""
+  ## The bytes served for every `/files/*` (and CDN-prefixed `/regular/files/*`)
+  ## request -- a tiny valid PNG.
+  ##
+  ## Post-1.0 fetches its trader avatars, handbook/quest icons and document
+  ## pictures from `/files/<kind>/<id>.png|jpg`. Those images are not in this
+  ## emulator's data set, so a real one cannot be served. A `/files/*` 404 makes
+  ## the client retry on a timer and sit on a spinner; a valid placeholder
+  ## answered immediately ends that. Built once at load from `PlaceholderPngHex`;
+  ## read-only on the worker threads after that.
+
+const PlaceholderPngHex =
+  "89504e470d0a1a0a0000000d4948445200000010000000100802000000909168" &
+  "36000000144944415478da63702011308c6a18d5307c350000144ac00104416c" &
+  "550000000049454e44ae426082"
+  ## A 16x16 opaque dark-grey PNG, 77 bytes. Hand-decoded rather than embedded as
+  ## raw bytes so the source stays plain ASCII and no editor or line-ending
+  ## normalisation can corrupt a binary blob in the middle of a `.nim` file.
+
+proc hexNibble(c: char): int =
+  if c >= '0' and c <= '9': ord(c) - ord('0')
+  elif c >= 'a' and c <= 'f': ord(c) - ord('a') + 10
+  elif c >= 'A' and c <= 'F': ord(c) - ord('A') + 10
+  else: -1
+
+proc decodeHex(s: string): string =
+  ## Even-length hex to bytes. A stray non-hex character ends the decode rather
+  ## than guessing -- the input here is a compile-time constant.
+  result = ""
+  var i = 0
+  while i + 1 < s.len:
+    let hi = hexNibble(s[i])
+    let lo = hexNibble(s[i + 1])
+    if hi < 0 or lo < 0: break
+    result.add char(hi * 16 + lo)
+    i = i + 2
 
 proc nowSeconds(): int =
   ## Wall-clock seconds. The host gives monotonic milliseconds since it started,
@@ -206,7 +271,13 @@ proc onGameConfig(url, body, session: string): string =
   # asset CDN). Point both at this backend so nothing reaches for the real
   # BSG hosts; the client never validates that they answer.
   put(backend, "Lobby", BackendUrl)
-  put(backend, "Static", BackendUrl)
+  # `Static` alone is http, and it is the only one that may be: it is the base
+  # every asset fetch is resolved against, and those go through Unity's
+  # transport, which validates our self-signed certificate and drops the
+  # request in silence. See `AssetUrl`. The five above stay on HTTPS -- they are
+  # `/client/*` traffic on the managed stack, which does accept it, and moving
+  # them would be a change to the one thing that already works.
+  put(backend, "Static", AssetUrl)
   var o = obj()
   put(o, "aid", if p.ok: p.field("aid").asInt(0) else: 0)
   put(o, "lang", "en")
@@ -1175,6 +1246,17 @@ proc onLibraries(url, body, session: string): string =
 proc onEmptyObject(url, body, session: string): string =
   inc gRequests
   result = envelope(emptyObject())
+
+proc onFiles(url, body, session: string): string =
+  ## Every `/files/*` (and CDN-prefixed `/regular/files/*`) binary asset --
+  ## trader avatars, handbook/quest icons, document images. This emulator has no
+  ## image set, so one placeholder answers all of them; the point is that the
+  ## answer is immediate and valid so the client stops retrying and the screen
+  ## settles. The backend recognises the path and sends these bytes raw and
+  ## un-deflated with an `image/png` Content-Type; the handler just hands over
+  ## the bytes.
+  inc gRequests
+  result = gFilesPng
 
 proc onActivityPeriods(url, body, session: string): string =
   ## The dailies, the weekly and the scav's, generated rather than stored --
@@ -2473,6 +2555,16 @@ proc registerRoutes() =
   discard serve("/client/libraries", onLibraries)
   discard serve("/client/profile/view", onEmptyObject)
 
+  # Binary assets. The client fetches trader avatars, handbook icons and quest
+  # images from `/files/*` and, when they 404, retries on a timer and stalls the
+  # screen. One prefix route answers every one of them with a placeholder PNG.
+  # Post-1.0 resolves these against its asset-CDN base, whose url carries a
+  # `/regular` path prefix, so once the host redirects that CDN host here the
+  # requests arrive as `/regular/files/...` -- registered alongside the bare
+  # `/files/` spelling so both resolve. See `onFiles`.
+  discard servePrefix("/files/", onFiles)
+  discard servePrefix("/regular/files/", onFiles)
+
   # Static tables
   discard serve("/client/items", onItems)
   discard serve("/client/globals", onGlobals)
@@ -2680,6 +2772,9 @@ proc onLoad(): Status =
   if side() != sideServer:
     info "the emulator is a server mod; nothing to do on this side"
     return Ok
+
+  # Decode the placeholder image once, before any route can be asked for it.
+  gFilesPng = decodeHex(PlaceholderPngHex)
 
   gEdition = setting("edition").asText("standard")
   gDefaultSide = setting("defaultSide").asText("Usec")
