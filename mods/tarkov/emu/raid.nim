@@ -334,7 +334,11 @@ proc oneWave(number, tmin, tmax, smin, smax: int; zone: string): JsonObject =
   ## member the client's `WildSpawnWave` reads is present, so nothing
   ## deserialises to a null: `SpawnMode` lists all three modes so the wave is
   ## never filtered out by the session's mode, `WildSpawnType`/`BotSide` make it
-  ## a scav, and `time_min`/`time_max` are real positive seconds.
+  ## a scav.
+  ##
+  ## `time_min`/`time_max` are seconds, and their *sign* selects which of the
+  ## client's two dispatch arms the wave takes -- see `offlineScavWaves`. A
+  ## negative pair is not a disabled wave; it is the wave that spawns at once.
   var w = obj()
   put(w, "BotPreset", "normal")
   put(w, "BotSide", "Savage")
@@ -356,35 +360,98 @@ proc oneWave(number, tmin, tmax, smin, smax: int; zone: string): JsonObject =
 
 proc offlineScavWaves(zones: seq[string]): string =
   ## Fresh assault waves that fill the map with scavs early and reliably,
-  ## replacing BSG's online-tuned table. That table does not populate an offline
-  ## raid: `factory4_day`'s first assault wave is at 40-150 s and its second is
-  ## `time_min/time_max = -1/-1`, which never fires -- so a swept map stays empty
-  ## of scavs while the boss (a separate `BossLocationSpawn` path) still comes.
+  ## replacing BSG's online-tuned table.
   ##
-  ## One early wave per real bot zone, staggered from `t=0`, so different parts
-  ## of the map fill inside the first ~90 s; then two refills so it does not go
-  ## quiet. `MaxBotPerZone` and `BotMax` (set on the base) cap how many are alive
-  ## at once, so a generous wave list does not over-spawn.
+  ## ## Which arm of the client actually places a wave
+  ##
+  ## This used to say that `factory4_day`'s `time_min/time_max = -1/-1` wave
+  ## "never fires". That was read off the data and it is **wrong**, and it is
+  ## the reason four attempts at this bug missed. Disassembling
+  ## `EFT.WavesSpawnScenario.<Run>d__17::MoveNext` (RVA 0x2556840 in
+  ## `GameAssembly.dll`, build 1.1.0.1.46777) shows `Run` takes a *spawn mode*
+  ## and splits the wave list on the sign of the wave's rolled time:
+  ##
+  ##   * `Run(1)` -- `comiss xmm7(0.0f), [wave+0x20]; jbe skip` at +0x2556ad6:
+  ##     only waves with **`Time < 0`**, and it invokes the spawn delegate
+  ##     **immediately and synchronously**, gathering the tasks into a
+  ##     `Task.WhenAll` that `LocalBotsSpawnInitialization` awaits before the
+  ##     raid starts. No timer, no scheduler.
+  ##   * `Run(2)` -- `comiss` + `ja skip` at +0x2556b24: only waves with
+  ##     **`Time >= 0`**, and each one is merely *registered* with
+  ##     `TimerManager.MakeTimer(TimeSpan.FromSeconds(Time))`
+  ##     (`StaticManager.Instance` + 0x28) plus an `UpdatedEventHandler`; the
+  ##     spawn delegate runs only when that timer elapses.
+  ##
+  ## `EFT.LocalGame.<LocalBotsSpawnInitialization>d__12::MoveNext` calls
+  ## `Run(1)` at +0xad3ff9, awaits it, then `Run(2)` at +0xad40c4.
+  ##
+  ## So `-1/-1` is not a dead wave -- it is the *only* wave that is placed
+  ## without depending on the raid's timer service. The previous version of
+  ## this proc emitted nothing but non-negative times, which put every single
+  ## scav wave on the timer arm, and live the count of
+  ## `GameWorld::RegisterPlayer` calls never moved past the boss and his two
+  ## escorts. Seeding with negative-time waves takes the arm that is proven to
+  ## place bots and costs nothing if the timer arm works too.
+  ##
+  ## ## What the rest of the shape has to satisfy
+  ##
+  ## Every gate between here and a placed scav, with the address that proves
+  ## it, so the next person does not have to re-derive them:
+  ##
+  ##   * `Location.OldSpawn` (+0x192) must be true, or both `Run` calls are
+  ##     skipped -- +0xad3fc2. Left as the base has it; every map but Terminal
+  ##     ships `true`.
+  ##   * `WavesSpawnScenario.SpawnWaves` must be non-null and non-empty --
+  ##     +0xad3fdf / +0xad3fee. It is `waves.Select(...).OrderBy(...).ToArray()`
+  ##     (`Init`, 0x2554f50), one output per input, so a non-empty `waves[]` is
+  ##     enough; `Init` is also what sets `Enabled` (+0x50) true.
+  ##   * `slots_min`/`slots_max` become `BotsCount` via
+  ##     `MyExtensions.RandomInclude` in `<Init>b__15_0` (0x2556300), and a wave
+  ##     with `BotsCount == 0` is dropped at +0x6cf395. Both are kept >= 1.
+  ##   * `BotPreset` is `Enum.Parse`d, case-sensitively, into `BotDifficulty`
+  ##     at +0x255651c -- an unknown string throws inside an async and the wave
+  ##     vanishes silently. `"normal"` is a real member.
+  ##   * `SpawnPoints` becomes `SpawnWave.SpawnAreaName` verbatim and is matched
+  ##     by **exact ordinal string equality** against the scene `BotZone`
+  ##     object's `UnityEngine.Object.name`
+  ##     (`<>c__DisplayClass67_0::<ActivateBotsByWave>b__0`, 0x6ce730); no
+  ##     match and the client logs `Can't spawn wave cause can'f find zone with
+  ##     name:{0}   _openZones:{1}` and places nothing (+0x6cf98f). The names
+  ##     come from the map's own `SpawnPointParams[].BotZoneName`, which is the
+  ##     same spelling BSG's own `waves[]` use.
+  ##
+  ## `MaxBotPerZone` and `BotMax` (set on the base) cap how many are alive at
+  ## once, so a generous wave list does not over-spawn.
   var useZones = zones
   if useZones.len == 0:
     useZones = @[""]
-  # At least six early waves so a one-zone map (Factory) keeps a steady trickle
-  # rather than one wave and silence; at most ten so a many-zone map does not
-  # queue a huge list. Zones are cycled, so every zone that exists gets a wave
-  # before any repeats.
-  var early = useZones.len
-  if early < 6: early = 6
-  if early > 10: early = 10
   var a = arr()
   var number = 0
-  while number < early:
-    let zone = useZones[number mod useZones.len]
-    a.add oneWave(number, number * 8, number * 8 + 20, 1, 3, zone)
+  # The seed. Negative time, so these take `Run(1)` -- dispatched synchronously
+  # while the raid is still loading, which is how BSG seeds a map and the one
+  # arm that does not depend on the timer service. Two at minimum so a one-zone
+  # map (Factory) still gets a handful; four at most so the up-front
+  # `bot/generate` budget (the sum of `slots_max` over the table) stays where it
+  # was rather than ballooning.
+  var seeds = useZones.len
+  if seeds < 2: seeds = 2
+  if seeds > 4: seeds = 4
+  while number < seeds:
+    a.add oneWave(number, -1, -1, 2, 4, useZones[number mod useZones.len])
     inc number
-  a.add oneWave(number, 180, 240, 1, 3, useZones[0])
-  inc number
-  let refillZone = if useZones.len > 1: useZones[1] else: useZones[0]
-  a.add oneWave(number, 360, 420, 1, 3, refillZone)
+  # The trickle. Non-negative, so these take `Run(2)`'s timer arm: a bonus if
+  # that arm works offline and harmless if it does not. Staggered from 20 s so
+  # a swept map does not go quiet after the seed.
+  var early = useZones.len
+  if early < 4: early = 4
+  if early > 8: early = 8
+  var i = 0
+  while i < early:
+    let zone = useZones[(seeds + i) mod useZones.len]
+    a.add oneWave(number, 20 + i * 20, 40 + i * 20, 1, 3, zone)
+    inc i
+    inc number
+  a.add oneWave(number, 360, 420, 1, 3, useZones[0])
   result = done(a).text
 
 proc localLoot*(locationId: string; nowSeconds: int;
@@ -457,13 +524,15 @@ proc localLoot*(locationId: string; nowSeconds: int;
     if not has(d, "SavageForceOnlineRaidInPVE"):
       setBool(d, "SavageForceOnlineRaidInPVE", false)
     # Scav waves. BSG's `waves[]` is tuned for an online raid and leaves an
-    # offline one empty of assault scavs: `factory4_day` ships
-    # `BotStart`/`BotStop`/`BotMax` all 0 (no spawn window, no bot budget) and a
-    # first wave at 40-150 s followed by a `-1/-1` wave that never fires. The
-    # boss still comes because `BossLocationSpawn` is a separate path, which is
-    # exactly the symptom seen live: Tagilla fights, no scavs roam.
+    # offline one nearly empty of assault scavs: `factory4_day` ships
+    # `BotStart`/`BotStop`/`BotMax` all 0 (no spawn window, no bot budget) and
+    # one immediate wave against six that only land after five to twenty-five
+    # minutes. The boss still comes because `BossLocationSpawn` is a separate
+    # path that does not consult any of this, which is exactly the symptom seen
+    # live: Tagilla fights, no scavs roam.
     #
-    # Rewrite the waves to fire from `t=0` across the map's real bot zones, and
+    # Rewrite the waves to seed the map's real bot zones at raid start (see
+    # `offlineScavWaves` for which client arm actually places them), and
     # open the spawn budget and window so they are allowed to. Sourced from the
     # map's own `SpawnPointParams` (the zones scavs can actually stand in), so
     # this stays per-map correct rather than a Factory-only constant. The boss
