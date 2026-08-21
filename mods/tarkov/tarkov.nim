@@ -245,9 +245,12 @@ proc onGameConfig(url, body, session: string): string =
   put(backend, "Trading", BackendUrl)
   put(backend, "Messaging", BackendUrl)
   put(backend, "RagFair", BackendUrl)
-  # `Lobby` and `Static` are read by the client too (matchmaking lobby and the
-  # asset CDN). Point both at this backend so nothing reaches for the real
-  # BSG hosts; the client never validates that they answer.
+  # `Lobby` and `Static` are read by the client too -- the matchmaking lobby and
+  # the asset CDN. Point both at this backend so nothing reaches for the real
+  # BSG hosts. `Static` is the one that was missing: it is the base the client
+  # resolves every `/files/*` image against, so without it the trader avatars,
+  # handbook icons and quest images went to the real S3 CDN and spun forever
+  # while this backend saw not a single `/files/` request. See `BackendUrl`.
   put(backend, "Lobby", BackendUrl)
   put(backend, "Static", BackendUrl)
   var o = obj()
