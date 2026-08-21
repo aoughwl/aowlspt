@@ -841,6 +841,11 @@ var gVersionBranded = false
 var gBotDiagSlot = -1
 var gBotDiag = false
 var gBotDiagFires = 0
+## One-shot guard for the full-list census. The per-registration detour now does
+## only minimal single-hop work; the whole-list walk (the expensive, most
+## fault-prone read) runs exactly once, after the list has had a few
+## registrations to stabilise, and never again.
+var gBotDiagCensusDone = false
 ## Phase 1 native-settings probe (kind=4 detour on `SettingsScreen::Show`): its
 ## slot, opt-in flag (`settingsUiProbe`), and once-per-open guard. Declared here
 ## beside the other detour slots; the walk itself lives in `settingsui.nim`

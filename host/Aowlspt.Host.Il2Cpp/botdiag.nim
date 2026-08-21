@@ -56,12 +56,30 @@ proc bdPtrAdd(p: Il2CppPtr; off: int32): Il2CppPtr =
   ## `cReadI32At`/`cReadF32At` (which read at the pointer they are given).
   cast[Il2CppPtr](cast[uint64](p) + uint64(off))
 
+proc bdSanePtr(p: Il2CppPtr): bool =
+  ## Cheap plausibility gate: a real IL2CPP object pointer lives in canonical
+  ## user-space, well above the null page and below the non-canonical hole. A
+  ## mapped-but-garbage field can still point somewhere absurd (a small integer
+  ## mistaken for a pointer, a kernel address); this rejects those BEFORE the
+  ## VirtualQuery so we never even probe a nonsense address. Not proof of
+  ## validity -- the SEH guard around the whole body is that -- just a first cull.
+  let v = cast[uint64](p)
+  result = v >= 0x10000'u64 and v < 0x00007FFFFFFFFFFF'u64
+
+proc bdOk(p: Il2CppPtr; size: int32): bool =
+  ## One gate for every pointer hop: non-null, in a plausible user-space range,
+  ## AND page-readable for `size` bytes (VirtualQuery, never a faulting deref).
+  ## Even so, a valid-looking pointer to an invalid NEXT pointer can still fault
+  ## on the following hop's deref -- that residual risk is why the entire botdiag
+  ## body runs under the VEH/SEH guard (`aowl_botdiag_body_guarded`).
+  result = p != nil and bdSanePtr(p) and cIsReadable(p, size) != 0'i32
+
 proc bdReadString(p: Il2CppPtr): string =
   ## Decode a `System.String` at `p` by its FIXED IL2CPP layout (length int32 at
   ## +0x10, UTF-16 chars inline at +0x14), no reflection. Every read guarded, so
   ## a non-String slot yields "". BMP only; non-ASCII becomes '?'.
   result = ""
-  if p == nil or cIsReadable(p, 0x14'i32) == 0'i32:
+  if not bdOk(p, 0x14'i32):
     return
   let n = cReadI32At(bdPtrAdd(p, 0x10'i32))
   if n <= 0'i32 or n > int32(cBdMaxNick):
@@ -89,13 +107,13 @@ proc bdSideName(side: int32): string =
 
 proc bdReadNickname(player: Il2CppPtr): string =
   ## player.Profile(+0x9C0) -> Info(+0x48) -> Nickname(+0x10) String. Guarded.
-  if player == nil or cIsReadable(player, cBdOffPlProfile() + 8'i32) == 0'i32:
+  if not bdOk(player, cBdOffPlProfile() + 8'i32):
     return ""
   let profile = cReadPtrAt(player, cBdOffPlProfile())
-  if profile == nil or cIsReadable(profile, cBdOffProfInfo() + 8'i32) == 0'i32:
+  if not bdOk(profile, cBdOffProfInfo() + 8'i32):
     return ""
   let info = cReadPtrAt(profile, cBdOffProfInfo())
-  if info == nil or cIsReadable(info, cBdOffInfoNickname() + 8'i32) == 0'i32:
+  if not bdOk(info, cBdOffInfoNickname() + 8'i32):
     return ""
   result = bdReadString(cReadPtrAt(info, cBdOffInfoNickname()))
 
@@ -104,20 +122,19 @@ proc bdReadSideRole(player: Il2CppPtr; side, role: var int32) =
   ## Role(+0x10 int32). Leaves the out params at a sentinel if unreadable.
   side = -1'i32
   role = -1'i32
-  if player == nil or cIsReadable(player, cBdOffPlProfile() + 8'i32) == 0'i32:
+  if not bdOk(player, cBdOffPlProfile() + 8'i32):
     return
   let profile = cReadPtrAt(player, cBdOffPlProfile())
-  if profile == nil or cIsReadable(profile, cBdOffProfInfo() + 8'i32) == 0'i32:
+  if not bdOk(profile, cBdOffProfInfo() + 8'i32):
     return
   let info = cReadPtrAt(profile, cBdOffProfInfo())
-  if info == nil:
+  if not bdOk(info, cBdOffInfoSettings() + 8'i32):
     return
   if cIsReadable(bdPtrAdd(info, cBdOffInfoSide()), 4'i32) != 0'i32:
     side = cReadI32At(bdPtrAdd(info, cBdOffInfoSide()))
-  if cIsReadable(info, cBdOffInfoSettings() + 8'i32) == 0'i32:
-    return
   let settings = cReadPtrAt(info, cBdOffInfoSettings())
-  if settings != nil and cIsReadable(bdPtrAdd(settings, cBdOffSetRole()), 4'i32) != 0'i32:
+  if settings != nil and bdSanePtr(settings) and
+     cIsReadable(bdPtrAdd(settings, cBdOffSetRole()), 4'i32) != 0'i32:
     role = cReadI32At(bdPtrAdd(settings, cBdOffSetRole()))
 
 proc bdReadPos(player: Il2CppPtr; ok: var bool): string =
@@ -125,10 +142,11 @@ proc bdReadPos(player: Il2CppPtr; ok: var bool): string =
   ## "(x, y, z)". `ok` is false (and result "?") if any hop is unreadable.
   ok = false
   result = "?"
-  if player == nil or cIsReadable(player, cBdOffPlMoveCtx() + 8'i32) == 0'i32:
+  if not bdOk(player, cBdOffPlMoveCtx() + 8'i32):
     return
   let mc = cReadPtrAt(player, cBdOffPlMoveCtx())
-  if mc == nil or cIsReadable(bdPtrAdd(mc, cBdOffMcPrevPos()), 12'i32) == 0'i32:
+  if not bdSanePtr(mc) or mc == nil or
+     cIsReadable(bdPtrAdd(mc, cBdOffMcPrevPos()), 12'i32) == 0'i32:
     return
   let x = cReadF32At(bdPtrAdd(mc, cBdOffMcPrevPos()))
   let y = cReadF32At(bdPtrAdd(mc, cBdOffMcPrevPos() + 4'i32))
@@ -140,13 +158,14 @@ proc bdReadPos(player: Il2CppPtr; ok: var bool): string =
 
 proc bdIsYou(player: Il2CppPtr): bool =
   ## player.IsYourPlayer (+0xB89 bool). False if unreadable.
-  if player == nil or cIsReadable(bdPtrAdd(player, cBdOffPlIsYou()), 1'i32) == 0'i32:
+  if not bdSanePtr(player) or player == nil or
+     cIsReadable(bdPtrAdd(player, cBdOffPlIsYou()), 1'i32) == 0'i32:
     return false
   result = (cReadI32At(bdPtrAdd(player, cBdOffPlIsYou())) and 0xFF'i32) != 0'i32
 
 proc bdIsAI(player: Il2CppPtr): bool =
   ## player.AIData (+0xA00) non-null => AI-controlled. False if unreadable.
-  if player == nil or cIsReadable(player, cBdOffPlAiData() + 8'i32) == 0'i32:
+  if not bdOk(player, cBdOffPlAiData() + 8'i32):
     return false
   result = cReadPtrAt(player, cBdOffPlAiData()) != nil
 
@@ -154,14 +173,14 @@ proc bdCollectAlive(gw: Il2CppPtr): seq[uint64] =
   ## Snapshot the pointers in GameWorld.AllAlivePlayersList (+0x1C8), capped, so a
   ## registered player's alive-state is a membership test with no per-player call.
   result = @[]
-  if gw == nil or cIsReadable(gw, cBdOffAliveList() + 8'i32) == 0'i32:
+  if not bdOk(gw, cBdOffAliveList() + 8'i32):
     return
   let lst = cReadPtrAt(gw, cBdOffAliveList())
-  if lst == nil or cIsReadable(lst, cBdOffListSize() + 4'i32) == 0'i32:
+  if not bdOk(lst, cBdOffListSize() + 4'i32):
     return
   let arr = cReadPtrAt(lst, cBdOffListItems())
   let size = cReadI32At(bdPtrAdd(lst, cBdOffListSize()))
-  if arr == nil or size <= 0'i32:
+  if not bdSanePtr(arr) or arr == nil or size <= 0'i32:
     return
   let n = (if size > int32(cBdMaxPlayers): int32(cBdMaxPlayers) else: size)
   for i in 0 ..< int(n):
@@ -169,7 +188,7 @@ proc bdCollectAlive(gw: Il2CppPtr): seq[uint64] =
     if cIsReadable(slot, 8'i32) == 0'i32:
       continue
     let pl = cReadPtrAt(slot, 0'i32)
-    if pl != nil:
+    if pl != nil and bdSanePtr(pl):
       result.add cast[uint64](pl)
 
 proc bdDescribePlayer(player: Il2CppPtr; alive: seq[uint64]): string =
@@ -196,17 +215,17 @@ proc bdDescribePlayer(player: Il2CppPtr; alive: seq[uint64]): string =
 proc bdEnumerate(gw: Il2CppPtr; reason: string) =
   ## Walk GameWorld.RegisteredPlayers (+0x1D0) and log the full census: total,
   ## you vs AI, and each entry. Read-only, capped, every hop guarded.
-  if gw == nil or cIsReadable(gw, cBdOffRegPlayers() + 8'i32) == 0'i32:
+  if not bdOk(gw, cBdOffRegPlayers() + 8'i32):
     okLog "botdiag: GameWorld=0x" & hexOf(cast[uint64](gw)) &
           " not readable for RegisteredPlayers -- skipping (" & reason & ")"
     return
   let lst = cReadPtrAt(gw, cBdOffRegPlayers())
-  if lst == nil or cIsReadable(lst, cBdOffListSize() + 4'i32) == 0'i32:
+  if not bdOk(lst, cBdOffListSize() + 4'i32):
     okLog "botdiag: RegisteredPlayers list null/unreadable (" & reason & ")"
     return
   let arr = cReadPtrAt(lst, cBdOffListItems())
   let size = cReadI32At(bdPtrAdd(lst, cBdOffListSize()))
-  if arr == nil or size <= 0'i32:
+  if not bdSanePtr(arr) or arr == nil or size <= 0'i32:
     okLog "botdiag: GameWorld has 0 registered players (size=" & $int(size) &
           ", " & reason & ") -- bots are ABSENT so far"
     return
@@ -221,7 +240,7 @@ proc bdEnumerate(gw: Il2CppPtr; reason: string) =
     if cIsReadable(slot, 8'i32) == 0'i32:
       continue
     let pl = cReadPtrAt(slot, 0'i32)
-    if pl == nil:
+    if pl == nil or not bdSanePtr(pl):
       continue
     if bdIsYou(pl):
       inc youCount
@@ -238,11 +257,27 @@ proc bdEnumerate(gw: Il2CppPtr; reason: string) =
   okLog "botdiag: census done -- " & $shown & " entries logged, " &
         $alive.len & " in AllAlivePlayersList. Read-only, nothing written."
 
-proc botDiagRegisterFired(regs: Il2CppPtr) =
-  ## Fired from the read-only kind=5 detour on `EFT.GameWorld::RegisterPlayer`,
-  ## on the Unity main thread. RCX = the live GameWorld (`this`), RDX = the
-  ## IPlayer being registered. Logs the incoming player (definitive per-spawn
-  ## evidence) and, throttled, the whole registered census. Writes nothing.
+## When the one-shot full census may run: NOT on the first few registrations
+## (the just-spawned player and the list itself can still be mid-construction --
+## reading Profile/Info/Nickname off a half-built IPlayer is the prime raid-entry
+## crash), but once enough have fired that the list has settled. Runs exactly
+## once (guarded by `gBotDiagCensusDone`).
+const cBdCensusAfter = 8
+
+proc botDiagBodyImpl(a: Il2CppPtr): Il2CppPtr {.
+    exportc: "aowl_botdiag_body", cdecl.} =
+  ## The ENTIRE RegisterPlayer diagnostic body, run under the VEH/SEH guard
+  ## (`aowl_botdiag_body_guarded`) so ANY fault inside -- including a guarded read
+  ## of a valid-looking pointer to an INVALID next pointer, which `cIsReadable`
+  ## cannot catch -- is trapped and the raid load survives. `a` is the detour
+  ## `regs`. Returns a non-nil sentinel on clean completion; the C guard returns
+  ## nil if it faulted, and the caller logs the catch. Writes nothing.
+  ##
+  ## Per-call work is deliberately MINIMAL: only the incoming player's single-hop
+  ## AI/you flags plus running counts. The expensive whole-list walk (which reads
+  ## every registered player's Profile chain, the fault-prone part) is a ONE-SHOT
+  ## deferred until the list has settled -- never per-registration on the hot path.
+  let regs = a
   let tid = int(cThreadId())
   let onHost = (tid == int(gHostThreadId))
   let gwRaw = cRegsInt(regs, 0'i32)          # RCX = GameWorld (this)
@@ -253,19 +288,51 @@ proc botDiagRegisterFired(regs: Il2CppPtr) =
           " (host thread " & $int(gHostThreadId) & ")" &
           (if onHost: " -- host thread (unexpected)" else: " -- Unity thread")
   if onHost:
-    return
+    return cast[Il2CppPtr](1)
   let gw = cast[Il2CppPtr](gwRaw)
   let incoming = cast[Il2CppPtr](plRaw)
-  if incoming != nil and cIsReadable(incoming, cBdOffPlProfile() + 8'i32) != 0'i32:
-    okLog "botdiag: RegisterPlayer #" & $gBotDiagFires & " incoming player 0x" &
-          hexOf(plRaw) & " -- " & bdDescribePlayer(incoming, bdCollectAlive(gw))
+  # Minimal per-call line: single-hop AI/you flags only. No Profile/Info/Nickname
+  # or list enumeration here -- those are the reads that fault on a partially
+  # constructed player during load, so they are kept off the per-registration path.
+  if incoming != nil and bdSanePtr(incoming):
+    let ai = bdIsAI(incoming)
+    let you = bdIsYou(incoming)
+    okLog "botdiag: RegisterPlayer #" & $gBotDiagFires & " incoming 0x" &
+          hexOf(plRaw) &
+          (if you: " YOU" elif ai: " AI" else: " (human?)")
   else:
-    okLog "botdiag: RegisterPlayer #" & $gBotDiagFires & " incoming player 0x" &
-          hexOf(plRaw) & " not readable (registered but layout differs?)"
-  # Full census on the first registration and every 5th thereafter -- bounded
-  # log volume, still shows the list growing as bots spawn over the raid.
-  if gBotDiagFires == 1 or (gBotDiagFires mod 5) == 0:
-    bdEnumerate(gw, "after registration #" & $gBotDiagFires)
+    okLog "botdiag: RegisterPlayer #" & $gBotDiagFires & " incoming 0x" &
+          hexOf(plRaw) & " not a sane pointer -- skipped"
+  # The full census runs EXACTLY ONCE, after the list has had a few
+  # registrations to stabilise -- never on the fragile first spawn, never per
+  # call. Still shows how many bots are registered vs you, with roles/positions.
+  if not gBotDiagCensusDone and gBotDiagFires >= cBdCensusAfter:
+    gBotDiagCensusDone = true
+    bdEnumerate(gw, "one-shot census at registration #" & $gBotDiagFires)
+  return cast[Il2CppPtr](1)
+
+# The VEH/SEH guard thunk. `aowl_p_p_seh` (abi/aowlspt_shim.h) arms a vectored
+# exception handler + setjmp, calls the body, and returns nil instead of letting
+# an access violation propagate -- the exact mechanism the settings-probe P2..P5
+# steps use. A botdiag fault must NEVER reach the game, so the whole body goes
+# through here.
+{.emit: """
+extern void* aowl_botdiag_body(void* a);
+static void* aowl_botdiag_body_guarded(void* a) {
+    return aowl_p_p_seh((void*)aowl_botdiag_body, a);
+}
+""".}
+proc cBotDiagBodyGuarded(a: Il2CppPtr): Il2CppPtr {.
+  importc: "aowl_botdiag_body_guarded", nodecl.}
+
+proc botDiagRegisterFired(regs: Il2CppPtr) =
+  ## Fired from the read-only kind=5 detour on `EFT.GameWorld::RegisterPlayer`,
+  ## on the Unity main thread. Runs the whole diagnostic body under the VEH/SEH
+  ## guard: if anything inside faults, the guard traps it, we log the catch, and
+  ## execution returns cleanly to the game so raid entry cannot be crashed by the
+  ## diagnostic.
+  if cBotDiagBodyGuarded(regs) == nil:
+    okLog "botdiag: fault caught, skipped -- the VEH guard kept raid entry alive"
 
 proc bindBotDiag(verbose: bool): bool =
   ## Installs the read-only kind=5 detour on `EFT.GameWorld::RegisterPlayer` from
