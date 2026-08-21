@@ -912,6 +912,128 @@ proc watchClient(launch: LaunchPtr; hostLog: string; limitMs: int64;
     sleepMs 120
 
 # ---------------------------------------------------------------------------
+# The backend watchdog
+# ---------------------------------------------------------------------------
+#
+# A backend death used to be a silent hang: the process the launcher started on
+# 127.0.0.1:443 would vanish -- a native fault in the C net engine, a fast-fail
+# on a corrupt heap -- and the game, which reaches that server for everything,
+# would simply stop making progress with nothing on screen to say why. "It
+# crashed again", with no crash anyone could see.
+#
+# The watchdog makes that self-healing. Once the backend is started, the run
+# loops below poll it (every `WdCheckMs`) for as long as the game is alive; if it
+# has died, they respawn it with *exactly* the command line it was started with
+# and carry on, so the game only ever sees the server blink and reconnect. The
+# backend truncates its own log on each boot and the tail follows the reset, so
+# the log view stays coherent across a restart.
+#
+# It is bounded, on purpose. A backend that dies the instant it comes up would,
+# without a bound, be fork-bombed forever. So a restart streak that does not stay
+# up for `WdStableMs` is counted, and after `WdMaxRapid` rapid deaths the
+# watchdog gives up and flips `givenUp` -- which the views turn into a loud,
+# unmistakable "BACKEND DOWN" the player actually sees, rather than one more
+# silent stall. A backend that had been healthy for a while resets the streak, so
+# one crash after an hour of play is not held against it.
+
+type
+  Watchdog = object
+    exe, workDir, cmdLine, logPath: string
+    port: int
+    active: bool        ## true once we own a backend to keep alive
+    handle: uint64      ## current process handle, 0 when none/dead
+    restarts: int       ## how many times it has been respawned
+    fails: int          ## consecutive rapid deaths (reset once it stays up)
+    lastStartMs: int64
+    lastCheckMs: int64
+    givenUp: bool       ## bound hit: stop restarting, surface a hard error
+
+const
+  WdCheckMs = 2000'i64    ## how often the run loops poll for a death
+  WdStableMs = 20000'i64  ## up this long => the rapid-death streak is forgiven
+  WdMaxRapid = 5          ## give up after this many rapid deaths in a row
+
+var gWd = Watchdog(exe: "", workDir: "", cmdLine: "", logPath: "", port: 0,
+                   active: false, handle: 0'u64, restarts: 0, fails: 0,
+                   lastStartMs: 0'i64, lastCheckMs: 0'i64, givenUp: false)
+
+proc wdArm(exe, workDir, cmdLine, logPath: string; port: int; handle: uint64) =
+  ## Remember what the backend was started as, so the watchdog can restart it
+  ## byte-for-byte. Called once, right after the initial spawn.
+  gWd.exe = exe
+  gWd.workDir = workDir
+  gWd.cmdLine = cmdLine
+  gWd.logPath = logPath
+  gWd.port = port
+  gWd.handle = handle
+  gWd.active = true
+  gWd.lastStartMs = cNowMs()
+  gWd.lastCheckMs = cNowMs()
+
+proc wdAlive(): bool =
+  gWd.handle != 0'u64 and cSpawnAlive(gWd.handle) != 0'i32
+
+proc wdPoll(clientAlive: bool): bool =
+  ## Keep the owned backend alive while the game runs; return its current
+  ## aliveness. Rate-limited to `WdCheckMs` -- between polls it just reports the
+  ## live handle, so the header stays honest without hammering the check.
+  if not gWd.active or gWd.givenUp:
+    return wdAlive()
+  let now = cNowMs()
+  if now - gWd.lastCheckMs < WdCheckMs:
+    return wdAlive()
+  gWd.lastCheckMs = now
+  if gWd.handle != 0'u64 and cSpawnAlive(gWd.handle) != 0'i32:
+    return true
+  # The backend is gone.
+  if not clientAlive:
+    # No game left to serve, so do not resurrect a server nobody is talking to:
+    # let it stay down and let the caller's "both gone" exit fire.
+    return false
+  let lived = now - gWd.lastStartMs
+  if lived >= WdStableMs:
+    gWd.fails = 0   # it had been healthy; treat this as a fresh incident
+  inc gWd.fails
+  if gWd.fails > WdMaxRapid:
+    gWd.givenUp = true
+    err "BACKEND DOWN -- aowlspt-backend died " & $gWd.fails & " times in " &
+        "quick succession and will not be restarted again. The game cannot " &
+        "reach its server on 127.0.0.1:" & $gWd.port & "."
+    note "see " & gWd.logPath & " (and any aowlspt-backend.log.fatal beside " &
+         "it) for why. Quit with q, fix it, then relaunch."
+    return false
+  # Restart with exactly the command line it was started with.
+  var e = gWd.exe
+  var w = gWd.workDir
+  var c = gWd.cmdLine
+  let h = cSpawnQuiet(toCString(e), toCString(w), toCString(c))
+  gWd.handle = h
+  gWd.lastStartMs = now
+  inc gWd.restarts
+  if h == 0'u64:
+    err "backend died -- restart #" & $gWd.restarts &
+        " could not be spawned (CreateProcess failed)"
+    return false
+  warn "backend died -- restarting (restart #" & $gWd.restarts &
+       ", on 127.0.0.1:" & $gWd.port & ")"
+  return true
+
+proc wdBackendAlive(backendProc: uint64; owned, clientAlive: bool): bool =
+  ## The single place the run loops ask "is the server up?". When this launcher
+  ## owns the backend the answer runs through the watchdog (which may restart it
+  ## as a side effect); otherwise it is a plain liveness check on the handle it
+  ## was given -- `--logs` attaches to somebody else's server and never restarts.
+  if owned and gWd.active:
+    wdPoll(clientAlive)
+  else:
+    backendProc != 0'u64 and cSpawnAlive(backendProc) != 0'i32
+
+proc wdCurrentHandle(backendProc: uint64): uint64 =
+  ## The handle to kill/probe now -- the watchdog's, if it has been restarting,
+  ## else the original.
+  if gWd.active: gWd.handle else: backendProc
+
+# ---------------------------------------------------------------------------
 # The live log view
 # ---------------------------------------------------------------------------
 #
@@ -1048,9 +1170,12 @@ proc streamLogs(server, client: var Tail; backendProc: uint64;
       # else's session, and "there is nothing running" is a state to sit in and
       # report, not a reason to close the window somebody opened to watch for
       # the thing starting.
-      let clientGone = launch == nil or cLaunchAlive(launch) == 0'i32
-      let backendGone = backendProc == 0'u64 or cSpawnAlive(backendProc) == 0'i32
-      if clientGone and backendGone:
+      let clientAlive = launch != nil and cLaunchAlive(launch) != 0'i32
+      # The watchdog runs here too: a redirected/plain session keeps a
+      # self-healing backend exactly as the painted view does, and prints its
+      # restart lines inline where they are readable in the file.
+      let backendUp = wdBackendAlive(backendProc, owned, clientAlive)
+      if (not clientAlive) and (not backendUp):
         line "  both the client and the backend have exited"
         return
     sleepMs 250
@@ -1112,7 +1237,8 @@ proc runLogView(root: string; who: string; backendProc: uint64;
       return
 
     let clientAlive = launch != nil and cLaunchAlive(launch) != 0'i32
-    let backendAlive = backendProc != 0'u64 and cSpawnAlive(backendProc) != 0'i32
+    # Through the watchdog when owned: this poll is what restarts a dead backend.
+    let backendAlive = wdBackendAlive(backendProc, owned, clientAlive)
 
     var f = newFrame(w, h)
 
@@ -1128,8 +1254,18 @@ proc runLogView(root: string; who: string; backendProc: uint64;
     head.put " "
     head.putIn ColDim, bxV()
     head.put " "
-    head.putIn (if backendAlive: ColGreen else: ColRed),
-               (if backendAlive: "server up" else: "server down")
+    var srvCol = ColGreen
+    var srvText = "server up"
+    if gWd.givenUp:
+      srvCol = ColRed
+      srvText = "SERVER DOWN"
+    elif not backendAlive:
+      srvCol = ColRed
+      srvText = "server down"
+    elif gWd.active and gWd.restarts > 0:
+      srvCol = ColYellow
+      srvText = "server up (restarted x" & $gWd.restarts & ")"
+    head.putIn srvCol, srvText
     head.put " "
     head.putIn ColDim, bxV()
     head.put " "
@@ -1209,7 +1345,15 @@ proc runLogView(root: string; who: string; backendProc: uint64;
 
     var help = newRow()
     help.put " "
-    if confirmQuit:
+    if gWd.givenUp:
+      # The hard, user-facing error. The backend is gone for good and the game
+      # cannot reach its server; say so loudly and say what to do, rather than
+      # leave the player staring at a frozen game.
+      help.putIn ColRed,
+        "BACKEND DOWN -- the game cannot reach its server on 127.0.0.1:" &
+        $gWd.port & " and auto-restart gave up. See the server pane / " &
+        "aowlspt-backend.log. Press q to quit and relaunch."
+    elif confirmQuit:
       help.putIn ColYellow,
         "the game is still running and will lose its server -- q again to " &
         "stop it anyway, d to leave everything running, any other key to stay"
@@ -1582,6 +1726,11 @@ proc main(): int =
       if backendProc == 0'u64:
         err "could not start the backend"
         return 1
+      # Arm the watchdog with exactly these spawn arguments. From here on, if the
+      # backend dies while the game is alive, the run loops restart it from this
+      # -- the player never sees the crash, only a brief "server restarting".
+      wdArm(be, bd, bc, joinPath(root, "aowlspt\\aowlspt-backend.log"), port,
+            backendProc)
       # Not `ok`, and not "started". All that is known here is that
       # `CreateProcess` returned a handle: the backend may already have exited
       # on a bad database, a held port or a mod that throws on load. It printed
@@ -1751,10 +1900,22 @@ proc main(): int =
     line "  the host writes   " & hostLog
     if o.wait:
       heading "Waiting"
+      # Wait on the client, but keep the watchdog turning so the backend is
+      # still restarted under `--no-logs --wait` -- the same self-healing the
+      # log view gives, without the view.
+      while cLaunchAlive(launch) != 0'i32:
+        discard wdPoll(true)
+        if gWd.givenUp:
+          err "BACKEND DOWN -- auto-restart gave up; the game has no server " &
+              "on 127.0.0.1:" & $port & ". See " &
+              joinPath(root, "aowlspt\\aowlspt-backend.log")
+          break
+        cSleepMs 500
       discard cLaunchWait(launch, -1'i32)
       line "  the client exited"
-      if backendProc != 0'u64:
-        cSpawnKill(backendProc)
+      let h = wdCurrentHandle(backendProc)
+      if h != 0'u64:
+        cSpawnKill(h)
         line "  backend stopped"
   else:
     var detached = false
@@ -1765,8 +1926,9 @@ proc main(): int =
       note "the logs are at " & joinPath(root, "aowlspt\\aowlspt-backend.log") &
            " and " & hostLog
     else:
-      if backendProc != 0'u64 and cSpawnAlive(backendProc) != 0'i32:
-        cSpawnKill(backendProc)
+      let h = wdCurrentHandle(backendProc)
+      if h != 0'u64 and cSpawnAlive(h) != 0'i32:
+        cSpawnKill(h)
         line "  backend stopped"
       if cLaunchAlive(launch) != 0'i32:
         note "the game is still running. It has no server now -- close it, or " &

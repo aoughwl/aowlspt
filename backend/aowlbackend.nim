@@ -75,12 +75,57 @@ import perfphase
 #include <stdio.h>
 
 static char aowl_crash_logpath[1024];
+static char aowl_crash_markerpath[1040];
 static void aowl_crash_set_logpath(const char* p, int32_t n) {
     int i = 0;
     if (n > (int)sizeof(aowl_crash_logpath) - 1)
         n = (int)sizeof(aowl_crash_logpath) - 1;
     for (; i < n; i++) aowl_crash_logpath[i] = p[i];
     aowl_crash_logpath[i] = 0;
+    /* The marker is a tiny sibling file next to the log. It is what survives a
+     * heap-corruption fast-fail: the append-to-log path below goes through the
+     * CRT and a corrupt heap can make fopen itself fail, but the marker is
+     * written with raw Win32 (CreateFile/WriteFile/FlushFileBuffers), touches no
+     * CRT heap, and is force-flushed to the medium before the process dies. Its
+     * mere existence after the process is gone means "it crashed" rather than
+     * "it was killed" -- the launcher watchdog and a human both read it that
+     * way. Delete any stale one from a previous run here at startup so a fresh
+     * boot never inherits an old crash's marker. */
+    {
+        int j = 0;
+        for (; j < i && j < (int)sizeof(aowl_crash_markerpath) - 8; j++)
+            aowl_crash_markerpath[j] = aowl_crash_logpath[j];
+        const char* suffix = ".fatal";
+        for (int k = 0; suffix[k]; k++) aowl_crash_markerpath[j++] = suffix[k];
+        aowl_crash_markerpath[j] = 0;
+        DeleteFileA(aowl_crash_markerpath);
+    }
+}
+
+/* Raw-Win32 marker write. No CRT, no heap, no locks: safe on a corrupt heap,
+ * which is exactly when it is needed. Force the bytes to the medium with
+ * FlushFileBuffers before returning, because the very next thing to run is the
+ * process terminator and a buffered write would be lost. */
+static void aowl_crash_marker(const char* kind, DWORD code, void* rip) {
+    if (!aowl_crash_markerpath[0]) return;
+    HANDLE h = CreateFileA(aowl_crash_markerpath, GENERIC_WRITE, 0, NULL,
+                           CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) return;
+    char line[512];
+    int len = snprintf(line, sizeof(line),
+        "aowlspt-backend FATAL %s (0x%08lx) at %p thread %lu\n",
+        kind, (unsigned long)code, rip, (unsigned long)GetCurrentThreadId());
+    if (len > 0) {
+        DWORD wrote = 0;
+        WriteFile(h, line, (DWORD)len, &wrote, NULL);
+    }
+    FlushFileBuffers(h);
+    CloseHandle(h);
+}
+
+/* Cleared on a clean shutdown so a marker never lingers past an orderly exit. */
+static void aowl_crash_clear_marker(void) {
+    if (aowl_crash_markerpath[0]) DeleteFileA(aowl_crash_markerpath);
 }
 
 /* stderr first -- it needs nothing and survives a log path that could not be
@@ -144,9 +189,6 @@ static void aowl_crash_report(EXCEPTION_POINTERS* ep, const char* origin) {
     void* rip = (void*)(uintptr_t)c->Rip;
     DWORD code = er->ExceptionCode;
 
-    char modname[MAX_PATH];
-    uintptr_t off = aowl_crash_resolve(rip, modname);
-
     const char* kind =
         code == EXCEPTION_ACCESS_VIOLATION     ? "ACCESS_VIOLATION" :
         (DWORD)STATUS_HEAP_CORRUPTION == code  ? "HEAP_CORRUPTION" :
@@ -157,6 +199,13 @@ static void aowl_crash_report(EXCEPTION_POINTERS* ep, const char* origin) {
     void* addr = er->NumberParameters >= 2
         ? (void*)(uintptr_t)er->ExceptionInformation[1] : NULL;
     long rw = er->NumberParameters >= 1 ? (long)er->ExceptionInformation[0] : -1;
+
+    /* The survivable breadcrumb, written before anything that could touch a
+     * corrupt heap. If everything below is lost to the fast-fail, this remains. */
+    aowl_crash_marker(kind, code, rip);
+
+    char modname[MAX_PATH];
+    uintptr_t off = aowl_crash_resolve(rip, modname);
 
     char line[1024];
     snprintf(line, sizeof(line),
@@ -245,6 +294,7 @@ static void aowl_crash_install(void) {
 proc cCrashInstall() {.importc: "aowl_crash_install", nodecl.}
 proc cCrashSetLog(p: HostPtr; n: int32) {.importc: "aowl_crash_set_logpath",
                                           nodecl.}
+proc cCrashClearMarker() {.importc: "aowl_crash_clear_marker", nodecl.}
 
 proc cNetServe(port, workers: int32): int32 {.importc: "aowl_net_serve", nodecl.}
 # Bind the listening port and hold it, without listening on it yet. This is the
@@ -2271,7 +2321,12 @@ proc main(): int =
   # not still be holding a player's profile open.
   storeClose()
   storeUnlock()
-  modhost.okLog "stopped after " & $gRequests() & " requests"
+  # An orderly exit: leave a clear breadcrumb and drop the crash marker, so the
+  # only thing that ever leaves a `.fatal` file behind is a genuine fault. A
+  # reader (or the launcher watchdog) can then tell "it crashed" from "it was
+  # stopped/killed" without guessing.
+  cCrashClearMarker()
+  modhost.okLog "backend exiting cleanly after " & $gRequests() & " requests"
   console.line ""
   console.line "  stopped after " & $gRequests() & " requests"
   perfDump()
