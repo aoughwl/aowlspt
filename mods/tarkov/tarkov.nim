@@ -2174,6 +2174,18 @@ proc onBotGenerate(url, body, session: string): string =
   var generated = 0
   let batch = generate(body, generated)
   let took = nowMs() - started
+  # Log WHAT the client asked for, not just how many we made. The request's
+  # `conditions` name the roles/counts/difficulties the client's own spawn
+  # scenarios intend to place -- so if scavs/PMCs generate but never appear, this
+  # line says whether the client even requested them (a placement gap) or not (a
+  # mis-shaped `BossLocationSpawn`/`waves[]` the client ignored).
+  var wanted = ""
+  for c in each(field(body, "conditions")):
+    if wanted.len > 0: wanted.add ", "
+    wanted.add c.field("Role").asText("?") & "x" &
+               $c.field("Limit").asInt(0) & "/" &
+               c.field("Difficulty").asText("?")
+  info "bot/generate requested: [" & wanted & "]"
   info "generated " & $generated & " bot(s) in " & $int(took) & "ms"
   result = envelope(raw(batch))
 
