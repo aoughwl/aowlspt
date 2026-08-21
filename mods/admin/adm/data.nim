@@ -55,6 +55,7 @@
 import aowlspt
 import aowlspt/il2cpp
 import aowlspt/fast
+import aowlspt/game    # whenReady/ready -- the boot-safe readiness poll
 import shared
 
 # il2cpp x64 memory layout -- ABI constants, stable across builds.
@@ -98,6 +99,8 @@ var gLive = false
 var gStatus = "not attempted"
 var gInRaid = false
 var gLastCount = 0
+var gRuntimeUp = false
+var gWorldReady: WhenReady
 
 proc dataOpen*(): bool =
   if gLive: return true
@@ -106,7 +109,22 @@ proc dataOpen*(): bool =
     gStatus = "GameAssembly not up yet"
     return false
   gLive = true
+  # Declared here rather than at its var, because a nimony --app:lib global
+  # initialised by a call/template is left zeroed.
+  gWorldReady = whenReady("EFT.GameWorld")
   result = true
+
+proc dataReady*(): bool =
+  ## The gate that makes this whole file boot-safe. Until the game's assemblies
+  ## are actually loaded (`EFT.GameWorld` resolves), NOTHING here calls the
+  ## runtime -- no findClass, no field probe, no byte-patch -- because doing so
+  ## during il2cpp start-up is exactly what faults the client (docs/IL2CPP.md,
+  ## aowlspt_il2cppready.h). `ready` is the host's own boot-safe poll; it fires
+  ## once, and we latch it into a level so every tick after can trust it.
+  if not gLive: return false
+  if gRuntimeUp: return true
+  if ready(gWorldReady): gRuntimeUp = true
+  result = gRuntimeUp
 
 proc dataInRaid*(): bool = gInRaid
 proc dataStatus*(): string = gStatus
@@ -212,6 +230,12 @@ proc playersList(world: Il2CppPtr): Il2CppPtr =
 proc collectAndPublish*(s: AdminRegion; maxDistance: float; bbW, bbH: int) =
   if not gLive:
     setInRaid(s, false); return
+  # Boot-safe gate: no runtime call until the assemblies are up. This is the
+  # guard that keeps the mod from faulting during il2cpp start-up.
+  if not dataReady():
+    setInRaid(s, false)
+    gStatus = "runtime not ready yet (waiting for game assemblies)"
+    return
   let world = worldSingleton()
   gInRaid = (world != nil)
   setInRaid(s, gInRaid)
@@ -321,7 +345,7 @@ proc staminaCapable*(): bool =
   gLive and gInRaid and gPhysOff >= 0 and gStamOff >= 0 and gStamCurOff >= 0
 
 proc applyStamina*() =
-  if not gLive: return
+  if not gLive or not dataReady(): return
   let world = worldSingleton()
   if world == nil: return
   if gMainOff < 0: return
