@@ -179,7 +179,7 @@ function Invoke-Manifest {
   }
   $tpl = Get-Content -Raw -Path $template | ConvertFrom-Json
 
-  $overrides = New-Object System.Collections.ArrayList
+  $textures = New-Object System.Collections.ArrayList
   Get-ChildItem -Path $upDir -Recurse -Filter *.png | ForEach-Object {
     $rel  = "assets/" + ($_.FullName.Substring($upDir.Length).TrimStart('\','/') -replace '\\','/')
     $name = [System.IO.Path]::GetFileNameWithoutExtension($_.Name).ToLower()
@@ -192,16 +192,17 @@ function Invoke-Manifest {
       '_m$'        { 'metalness' }
       default      { 'albedo' }
     }
-    [void]$overrides.Add([ordered]@{
+    [void]$textures.Add([ordered]@{
       name = $name; file = $rel; map = $map; cat = "Vanilla"; tier = "4K"; conf = 1.0
     })
   }
 
-  $tpl.overrides = $overrides
+  # Emit final aowlspt.resourcepack v1 shape: textures[] rows, capabilities array.
+  $tpl.textures = $textures
   $tpl.PSObject.Properties.Remove('_note') 2>$null
   # Serialise with generous depth; PS 5.1 ConvertTo-Json needs -Depth.
   ($tpl | ConvertTo-Json -Depth 8) | Out-File -Encoding utf8 $manifest
-  Info "Wrote $manifest with $($overrides.Count) overrides"
+  Info "Wrote $manifest with $($textures.Count) textures"
 }
 
 # ---------------------------------------------------------------------------

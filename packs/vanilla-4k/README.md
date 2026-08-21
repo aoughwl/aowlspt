@@ -1,8 +1,8 @@
 # Vanilla 4K — aowlspt resource pack (GENERATOR)
 
-> **SCHEMA: PROVISIONAL** — the generated `manifest.json` conforms to the
-> provisional resource-pack schema in [`../RESOURCE_PACK_SCHEMA.md`](../RESOURCE_PACK_SCHEMA.md).
-> Reconcile to `feat-resource-packs/RESOURCE_PACKS.md` before public release.
+> **SCHEMA: `aowlspt.resourcepack` v1** — the template and the generated
+> `manifest.json` are reconciled to the final schema (see
+> [`../RESOURCE_PACK_SCHEMA.md`](../RESOURCE_PACK_SCHEMA.md)).
 
 Your **own** stock Tarkov textures, extracted from your local install and
 AI-upscaled to 4K. Same vanilla look — just sharper. Nothing here changes the
@@ -61,8 +61,8 @@ Run a single stage with `-Stage upscale` etc. to resume after an interruption.
 
 After `-Stage all` completes, this directory (`generate.ps1` +
 `manifest.json` + `assets/`) is a complete resource pack. Copy it into your SPT
-install's resource-packs location (per the `feat-resource-packs` loader docs —
-path finalised when that branch lands). Until then, the `mods/textures` mod can
+install's resource-packs location per the `feat-resource-packs` loader
+(`mods/resourcepacks/RESOURCE_PACKS.md`). The `mods/textures` mod can also
 consume it: point its `config.json` `packRoot` at this pack's `assets/`.
 
 ## Honest status — what is DONE vs NOT DONE
@@ -75,8 +75,9 @@ consume it: point its `config.json` `packRoot` at this pack's `assets/`.
   - **`upscale` stage** — the Real-ESRGAN invocation, resume/skip, and per-file
     failure handling are fully implemented.
   - **`manifest` stage** — fully implemented and TESTED: walks `assets/**`,
-    infers the map channel from BSG's `_d/_n/_g/_ao/_h/_m` suffix, writes a
-    schema-conformant `manifest.json`.
+    infers the map channel from BSG's `_d/_n/_g/_ao/_h/_m` suffix, writes an
+    `aowlspt.resourcepack` v1 `manifest.json` (`capabilities:["textures"]` +
+    `textures[]` rows).
 - **NOT DONE YET (marked in the script):**
   - **`extract` stage** — the extractor invocation is wired for
     AssetStudioModCLI's intended CLI form, but the exact flags and the set of
@@ -86,9 +87,9 @@ consume it: point its `config.json` `packRoot` at this pack's `assets/`.
     and (c) note AssetRipper uses a different export flow than AssetStudioModCLI.
     The script prints a `NOT-DONE-YET` warning at this stage.
 
-## Schema reconciliation (do before release)
+## Schema
 
-When `feat-resource-packs/RESOURCE_PACKS.md` finalises the schema: update the
-header fields in `manifest.template.json` and the `manifest` stage of
-`generate.ps1` to match, and drop the `_schemaStatus` note. The per-asset
-`overrides` rows already mirror the client mod's match shape.
+Reconciled to `aowlspt.resourcepack` v1: `manifest.template.json` and the
+`manifest` stage of `generate.ps1` emit `capabilities:["textures"]` and
+`textures[]` rows (`name`/`file`/`map`/`cat`/`tier`/`conf`), matching the final
+schema in `feat-resource-packs/mods/resourcepacks/RESOURCE_PACKS.md`.

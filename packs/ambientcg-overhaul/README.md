@@ -1,9 +1,9 @@
 # ambientCG Overhaul — aowlspt resource pack
 
-> **SCHEMA: PROVISIONAL** — this pack's `manifest.json` conforms to the
-> provisional resource-pack schema in [`../RESOURCE_PACK_SCHEMA.md`](../RESOURCE_PACK_SCHEMA.md).
-> Reconcile to `feat-resource-packs/RESOURCE_PACKS.md` before public release
-> (see "Schema reconciliation" below).
+> **SCHEMA: `aowlspt.resourcepack` v1** — this pack's `manifest.json` is
+> reconciled to the final schema (see
+> [`../RESOURCE_PACK_SCHEMA.md`](../RESOURCE_PACK_SCHEMA.md)). Regenerate any time
+> with `.\assemble.ps1 -RegenManifest`.
 
 A revamped, **non-Tarkov-style** PBR surface overhaul. Replaces metal, wood,
 concrete, brick, fabric, and ground surfaces with clean, high-detail
@@ -11,8 +11,8 @@ physically-based materials from [ambientCG](https://ambientcg.com). This is a
 deliberately different aesthetic from stock BSG textures — brighter, sharper,
 more "studio PBR" than "grimy Tarkov".
 
-- **Kind:** textures
-- **Assets:** 512 curated overrides (Metal, Wood, Concrete, Brick, Fabric, Ground)
+- **Capabilities:** `["textures"]`
+- **Assets:** 512 curated texture rows (Metal, Wood, Concrete, Brick, Fabric, Ground)
 - **Tier:** 2K (JPG PBR maps: albedo / normal / roughness / AO / etc.)
 - **License:** CC0-1.0 — public domain, freely redistributable
   (see [`LICENSE-ASSETS.txt`](LICENSE-ASSETS.txt))
@@ -23,7 +23,7 @@ The ambientCG images total **~2.2 GB**, far too large to commit. So git holds:
 
 | Committed | Assembled on demand (not committed) |
 |-----------|--------------------------------------|
-| `manifest.json` (512 overrides, ~84 KB) | `assets/**` — the 512 image files |
+| `manifest.json` (512 texture rows, ~84 KB) | `assets/**` — the 512 image files |
 | `assemble.ps1`, `assemble_pack.py` | |
 | README + license | |
 
@@ -52,28 +52,16 @@ Requirement: **Python 3** on `PATH`. No other dependency.
 
 1. Assemble the pack (above), so `assets/` is populated.
 2. Copy the whole `ambientcg-overhaul/` directory into your SPT install's
-   resource-packs location (per the `feat-resource-packs` loader docs — path TBD
-   until that lands; today the `mods/textures` mod consumes an equivalent
-   manifest, see next section).
+   resource-packs location per the `feat-resource-packs` loader
+   (`mods/resourcepacks/RESOURCE_PACKS.md`).
 3. Enable it and boot.
 
-### Bridging to today's `mods/textures` mod
+### Bridging to the `mods/textures` mod
 
-Until the `feat-resource-packs` loader ships, the existing `mods/textures` mod
-can consume these same assets directly: point its `config.json` `packRoot` at
-this pack's `assets/` directory and its `data/manifest.json` is the same override
-table (this pack's `manifest.json` is `mods/textures/data/manifest.json` wrapped
-with pack metadata and `assets/`-relative paths). Regenerate the wrapped manifest
-any time with `.\assemble.ps1 -RegenManifest`.
-
-## Schema reconciliation (do before release)
-
-When `feat-resource-packs/RESOURCE_PACKS.md` finalizes the manifest schema:
-
-1. Diff its field names against `../RESOURCE_PACK_SCHEMA.md`.
-2. Rename the header fields in `assemble_pack.py`'s `regen_manifest()` to match.
-3. Re-run `.\assemble.ps1 -RegenManifest` to emit the reconciled `manifest.json`.
-4. Remove the `_schemaStatus` note field once conformant.
-
-The per-asset `overrides` rows (`name`/`file`/`map`/`cat`/`tier`/`conf`) already
-mirror what the client mod matches on, so they should port unchanged.
+The existing `mods/textures` mod can consume these same assets directly: point
+its `config.json` `packRoot` at this pack's `assets/` directory. This pack's
+`manifest.json` is `mods/textures/data/manifest.json` wrapped in the
+`aowlspt.resourcepack` v1 shape with `assets/`-relative paths — the per-asset
+`textures[]` rows (`name`/`file`/`map`/`cat`/`tier`/`conf`) are identical to what
+the mod matches on. Regenerate the wrapped manifest any time with
+`.\assemble.ps1 -RegenManifest`.

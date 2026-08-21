@@ -43,25 +43,23 @@ def regen_manifest():
     """Rebuild manifest.json from the mods/textures curated manifest."""
     with open(SRC_MANIFEST, "r", encoding="utf-8") as fh:
         src = json.load(fh)
-    overrides = []
+    textures = []
     for e in src["entries"]:
         f = e["file"].replace("\\", "/")
         if f.startswith("ambientcg/"):
             f = f[len("ambientcg/"):]
-        overrides.append({
+        textures.append({
             "name": e["name"],
-            "file": "assets/" + f,
+            "file": "assets/" + f,   # pack-relative; loader resolves it
             "map":  e["map"],
             "cat":  e["cat"],
             "tier": e["tier"],
             "conf": e["conf"],
         })
     manifest = {
-        "_schemaStatus": ("PROVISIONAL - reconcile to "
-                          "feat-resource-packs/RESOURCE_PACKS.md before release"),
-        "schema": "aowlspt.resource-pack",
+        "_schemaStatus": "reconciled to aowlspt.resourcepack v1",
+        "schema": "aowlspt.resourcepack",
         "schemaVersion": 1,
-        "id": "ambientcg-overhaul",
         "name": "ambientCG Overhaul",
         "version": "1.0.0",
         "author": "savannt",
@@ -69,16 +67,13 @@ def regen_manifest():
                         "from ambientCG (CC0). Replaces metal, wood, concrete, "
                         "brick, fabric and ground surfaces with clean, high-detail "
                         "physically-based materials."),
-        "license": "CC0-1.0",
-        "kind": "textures",
-        "assetRoot": "assets",
-        "quality": src.get("tier", "2K").lower(),
-        "overrides": overrides,
+        "capabilities": ["textures"],
+        "textures": textures,
     }
     with open(PACK_MANIFEST, "w", encoding="utf-8") as fh:
         json.dump(manifest, fh, indent=0, separators=(",", ":"))
         fh.write("\n")
-    print(f"regenerated {PACK_MANIFEST}: {len(overrides)} overrides")
+    print(f"regenerated {PACK_MANIFEST}: {len(textures)} textures")
 
 
 def main():
@@ -119,7 +114,7 @@ def main():
         return 2
 
     copied = skipped = missing = 0
-    for ov in manifest["overrides"]:
+    for ov in manifest["textures"]:
         dst = os.path.join(HERE, ov["file"].replace("/", os.sep))
         src = os.path.join(src_root, src_rel_for(ov["file"]).replace("/", os.sep))
         if not os.path.isfile(src):
@@ -134,7 +129,7 @@ def main():
         copied += 1
 
     print(f"assemble: copied {copied}, skipped {skipped}, missing {missing}, "
-          f"total {len(manifest['overrides'])}")
+          f"total {len(manifest['textures'])}")
     if missing:
         print("WARNING: some source images were missing; pack is incomplete.",
               file=sys.stderr)

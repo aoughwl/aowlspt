@@ -1,17 +1,15 @@
 {
-"_schemaStatus":"PROVISIONAL - reconcile to feat-resource-packs/RESOURCE_PACKS.md before release",
-"schema":"aowlspt.resource-pack",
+"_schemaStatus":"reconciled to aowlspt.resourcepack v1",
+"schema":"aowlspt.resourcepack",
 "schemaVersion":1,
-"id":"ambientcg-overhaul",
 "name":"ambientCG Overhaul",
 "version":"1.0.0",
 "author":"savannt",
 "description":"Revamped, non-Tarkov-style PBR surface textures sourced from ambientCG (CC0). Replaces metal, wood, concrete, brick, fabric and ground surfaces with clean, high-detail physically-based materials.",
-"license":"CC0-1.0",
-"kind":"textures",
-"assetRoot":"assets",
-"quality":"2k",
-"overrides":[
+"capabilities":[
+"textures"
+],
+"textures":[
 {
 "name":"airductmetal",
 "file":"assets/Metal/Painted Metal 004/PaintedMetal004_2K-JPG_Color.jpg",
