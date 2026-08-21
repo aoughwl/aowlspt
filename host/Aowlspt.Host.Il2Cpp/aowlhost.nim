@@ -109,6 +109,15 @@ static void* aowl_settings_meta_probe_guarded(void* a, int step) {
     return aowl_p_p_seh((void*)aowl_settings_meta_probe, a);
 }
 static int aowl_probe_step_get(void) { return g_aowl_probe_step; }
+
+/* Guarded wrapper for the version brand's il2cpp_string_new allocation: the Nim
+ * `brandNewStringImpl` (exported as `aowl_brand_newstring`) allocates the branded
+ * String from a global the Nim side set; this runs it under the VEH guard so even
+ * that runtime alloc cannot take the client down. */
+extern void* aowl_brand_newstring(void* a);
+static void* aowl_brand_newstring_guarded(void* a) {
+    return aowl_p_p_seh((void*)aowl_brand_newstring, a);
+}
 """.}
 
 # --------------------------------------------------- the main-thread handoff
@@ -443,6 +452,12 @@ proc cMetaProbeGuarded(a: Il2CppPtr; step: int32): Il2CppPtr {.
   importc: "aowl_settings_meta_probe_guarded", nodecl.}
 proc cProbeStep(): int32 {.importc: "aowl_probe_step_get", nodecl.}
 proc cReadI32At(p: Il2CppPtr): int32 {.importc: "aowl_read_i32", nodecl.}
+proc cWordAt(p: Il2CppPtr; i: uint64): uint16 {.importc: "aowl_word_at", nodecl.}
+## Runs `brandNewStringImpl` (which allocates the branded `System.String` via
+## `il2cpp_string_new`) under the VEH guard, so even that runtime alloc cannot
+## crash the client: nil on a fault, and the caller leaves the stock version.
+proc cBrandNewStringGuarded(a: Il2CppPtr): Il2CppPtr {.
+  importc: "aowl_brand_newstring_guarded", nodecl.}
 proc cBeOpened(): int32 {.importc: "aowl_be_guard_opened", nodecl.}
 
 # The IL2CPP readiness flag, armed in the same constructor and set on the
@@ -3271,6 +3286,41 @@ proc looksLikeVersion(s: string): bool =
     elif ord(ch) < 0x20 or ord(ch) > 0x7E: return false
   result = hasDigit and hasDot
 
+## Set by `versionBrandFired` and read by `brandNewStringImpl`, because the
+## guarded alloc thunk passes only one pointer and the string is easier carried
+## in a global than marshalled through it.
+var gBrandText: string = ""
+
+proc brandNewStringImpl(a: Il2CppPtr): Il2CppPtr {.
+    exportc: "aowl_brand_newstring", cdecl.} =
+  ## Allocates the branded `System.String` from `gBrandText`. Run under the VEH
+  ## guard by `cBrandNewStringGuarded`, so a fault in `il2cpp_string_new` on this
+  ## protected build returns nil rather than crashing. `a` is unused.
+  result = newString(gRt, gBrandText)
+
+proc rawReadVersionString(p: Il2CppPtr): string =
+  ## Reads a candidate `System.String` at `p` by its FIXED runtime layout, with
+  ## no reflection and no runtime accessor -- the P1 primitive extended: length
+  ## is the int32 at `+0x10`, the UTF-16 chars are inline at `+0x14`. Every read
+  ## is `aowl_is_readable`-guarded, so a slot that is not a String just yields ""
+  ## and is skipped. Only the BMP is decoded (ASCII in practice for a version).
+  result = ""
+  if p == nil or cIsReadable(p, 0x14'i32) == 0'i32:
+    return
+  let n = cReadI32At(cast[Il2CppPtr](cast[uint64](p) + 0x10'u64))
+  if n <= 0'i32 or n > 64'i32:
+    return
+  let chars = cast[Il2CppPtr](cast[uint64](p) + 0x14'u64)
+  if cIsReadable(chars, int32(n) * 2'i32) == 0'i32:
+    return
+  for i in 0 ..< int(n):
+    let c = cWordAt(chars, uint64(i))
+    if c == 0'u16 or c > 0x7E'u16:
+      # Non-ASCII or embedded NUL: not the plain version label we want; bail so a
+      # wrong slot cannot masquerade as a short string.
+      return ""
+    result.add char(c)
+
 proc versionBrandFired(regs: Il2CppPtr) =
   ## Fired from the POSTFIX detour on `EFT.UI.PreloaderUI::Awake`, on the Unity
   ## main thread, *after* the original set the bottom-left version label.
@@ -3278,21 +3328,22 @@ proc versionBrandFired(regs: Il2CppPtr) =
   ## Staged and crash-proof by construction, because a fault here is on the Unity
   ## thread during boot:
   ##
-  ##   * READ-ONLY probe (always): log the firing thread, whether `this + 0x20`
-  ##     (Awake's `set_text` receiver, the label component) is readable, and the
-  ##     component's class -- then scan the component's fields for managed
-  ##     `System.String`s and log the version-looking one's offset and value.
-  ##     Nothing is written; this isolates "does the postfix reach the Unity
-  ##     thread and read cleanly" from "does a managed write crash".
+  ##   * READ-ONLY probe (always): log the firing thread and whether `this + 0x20`
+  ##     (Awake's `set_text` receiver, the label component) is readable, then scan
+  ##     the component's pointer slots reading each as a `System.String` by its
+  ##     FIXED layout (length @ +0x10, UTF-16 chars @ +0x14) and log any whose
+  ##     content looks like a version. NO reflection: the live verdict is that
+  ##     `il2cpp_object_get_class` / `il2cpp_class_get_name` (and every reflection
+  ##     accessor) FAULT even on the Unity thread on this build, so the target is
+  ##     found by CONTENT, not by class.
   ##   * FIELD-WRITE brand (opt-in `uxVersionBrandWrite`): allocate a branded
-  ##     `System.String` and write its pointer straight into that field by offset
-  ##     -- NO `runtime_invoke` and NO `findMethod` (both faulted on this
-  ##     protected build; a raw field write is what `fov`/`sain` do). The write
-  ##     slot is VirtualQuery-guarded before the store.
+  ##     `System.String` (under the VEH guard, so even the alloc cannot crash) and
+  ##     write its pointer straight into that slot by offset -- NO `runtime_invoke`,
+  ##     NO `findMethod`, NO `objectClass`; a raw field write is what `fov`/`sain`
+  ##     do. The write slot is VirtualQuery-guarded before the store.
   ##
-  ## Every dereference is `aowl_is_readable`-guarded, class-name reads go through
-  ## the SEH-guarded `classNameSafe`, and the whole thing runs at most once. Any
-  ## doubt -> leave the stock version, never crash.
+  ## Every dereference is `aowl_is_readable`-guarded and the whole thing runs at
+  ## most once. Any doubt -> leave the stock version, never crash.
   if gVersionBranded:
     return
   gVersionBranded = true          # once only, whatever the outcome below
@@ -3317,30 +3368,29 @@ proc versionBrandFired(regs: Il2CppPtr) =
     warn "version probe: label component (this+0x" & hexOf(uint64(off)) &
          ") is null or not readable"
     return
-  let lcls = objectClass(gRt, label)
-  let lname = (if lcls == nil: "<null>" else: classNameSafe(gRt, lcls))
   okLog "version probe: label component at this+0x" & hexOf(uint64(off)) &
-        " is readable, class=" & lname
+        " is readable; scanning its String slots by raw layout (no reflection)"
 
-  # Read-only scan for managed String fields on the component, to locate the
-  # text-backing String (its offset moves between builds, so it is found rather
-  # than assumed). Every step is guarded; classNameSafe swallows a bogus class.
+  # Raw scan for the text-backing String on the component. Read each pointer slot
+  # and interpret it as a System.String by its FIXED layout (length @ +0x10,
+  # UTF-16 chars @ +0x14) -- NO objectClass/className, because runtime reflection
+  # is dead on this build (the settings-probe verdict). The version String is
+  # found by CONTENT (`looksLikeVersion`), which is self-validating: a slot whose
+  # bytes are not a short version-looking ASCII string is skipped, so a wrong slot
+  # cannot be mistaken for the target.
   var textField = -1
   var textVal = ""
   var o = 0x10
   while o <= 0x180:
     if cIsReadable(label, int32(o + 8)) != 0'i32:
       let fp = hReadPtr(label, int32(o))
-      if fp != nil and cIsReadable(fp, 0x18'i32) != 0'i32:
-        let fcls = objectClass(gRt, fp)
-        if fcls != nil and classNameSafe(gRt, fcls) == "String":
-          let s = readString(gRt, fp)
-          if s.len > 0 and s.len <= 64:
-            okLog "version probe: String field +0x" & hexOf(uint64(o)) &
-                  " = \"" & s & "\""
-            if textField < 0 and looksLikeVersion(s):
-              textField = o
-              textVal = s
+      let s = rawReadVersionString(fp)
+      if s.len > 0 and looksLikeVersion(s):
+        okLog "version probe: String slot +0x" & hexOf(uint64(o)) &
+              " = \"" & s & "\"  <-- version-looking"
+        if textField < 0:
+          textField = o
+          textVal = s
     o = o + 8
 
   if not gVersionWrite:
@@ -3348,26 +3398,27 @@ proc versionBrandFired(regs: Il2CppPtr) =
           "field-write brand; no managed write was performed)"
     return
 
-  # ---- opt-in field-write brand: newString + raw field store, no invoke ----
+  # ---- opt-in field-write brand: guarded newString + raw field store ----
   if textField < 0:
-    warn "version brand: no version-looking String field found on the label " &
+    warn "version brand: no version-looking String slot found on the label " &
          "component; not writing (stock version left in place)"
     return
   if textVal.startsWith("aowlspt"):
     return                                      # already ours
   # "aowlspt <U+2014 em dash> <version>", em dash as explicit UTF-8 bytes so the
-  # source stays ASCII; il2cpp_string_new takes UTF-8.
-  let branded = "aowlspt \xE2\x80\x94 " & textVal
-  let ns = newString(gRt, branded)
+  # source stays ASCII; il2cpp_string_new takes UTF-8. The alloc runs under the
+  # VEH guard (`cBrandNewStringGuarded`), so even il2cpp_string_new cannot crash.
+  gBrandText = "aowlspt \xE2\x80\x94 " & textVal
+  let ns = cBrandNewStringGuarded(cast[Il2CppPtr](0))
   if ns == nil or cIsReadable(ns, 0x14'i32) == 0'i32:
-    warn "version brand: newString failed or returned an unreadable String; " &
-         "not writing"
+    warn "version brand: guarded newString failed/faulted or returned an " &
+         "unreadable String; not writing (stock version left in place)"
     return
   okLog "version brand: allocated branded String ok; writing it into label " &
-        "field +0x" & hexOf(uint64(textField))
+        "slot +0x" & hexOf(uint64(textField))
   if cUxWritePtr(label, int32(textField), ns) != 0'i32:
-    okLog "version brand: field +0x" & hexOf(uint64(textField)) &
-          " set to \"" & branded & "\" (field write, no set_text call)"
+    okLog "version brand: slot +0x" & hexOf(uint64(textField)) &
+          " set to \"" & gBrandText & "\" (raw field write, no reflection)"
   else:
     warn "version brand: field slot +0x" & hexOf(uint64(textField)) &
          " was not safely writable; left unchanged"
