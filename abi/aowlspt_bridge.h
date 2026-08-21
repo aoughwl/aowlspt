@@ -18,24 +18,32 @@
  *
  * ## Why the by-name path was not enough, and what this adds
  *
- * `bindMainDrain` resolves a method by name through the runtime
+ * `bindMainDrain`'s by-name path resolves a method through the runtime
  * (`il2cpp_class_from_name` -> `il2cpp_class_get_method_from_name` -> read
- * `MethodInfo.methodPointer`). On this hardened build that returned nothing
- * usable for every candidate it tried -- and one candidate, `EFT.
- * MainApplication`, does not even exist: the post-1.0 root application
- * MonoBehaviour is **`EFT.TarkovApplication`**, and the old list named the
- * pre-1.0 type. Two failure modes, one file: the wrong name, and a
- * `MethodInfo.methodPointer` field this build does not populate the way the
- * reader assumes (the BE client's own methods show the same null in the
- * decrypted metadata's `methodPointers` table, so the field being null is a
- * property of this build, not of the reader).
+ * `MethodInfo.methodPointer`). On this build that returned nothing usable for
+ * every candidate -- but NOT because the metadata is protected. Two real
+ * reasons: one candidate, `EFT.MainApplication`, does not exist post-1.0 (the
+ * root application MonoBehaviour is **`EFT.TarkovApplication`**); and, decisive,
+ * `bindMainDrain` runs on the host's own boot thread, and reading IL2CPP
+ * class/method metadata off the Unity main thread returns bogus pointers and
+ * faults (see the repo memory `project_post1_menu_boot`). So `findClass` /
+ * `findMethod` handed back garbage and `methodPointer` read garbage -> null.
+ * That is a wrong-thread artifact, not proof of protected metadata.
  *
- * So this header resolves the target the same way the BE-bypass RVAs in
- * `aowlspt_beclient.h` were resolved: **statically**, as a fixed RVA into
- * `GameAssembly.dll` for this exact client build, verified byte-for-byte
- * against the compiled prologue before it is ever used. No metadata read, no
- * `methodPointer` field, no runtime resolution -- the same mechanism that made
- * the BE patches reliable when live detours were not.
+ * The decrypted metadata's per-module `methodPointers` tables are in fact
+ * INTACT and reliable on this build. Proof: this file's resolver reproduces all
+ * five BE-bypass RVAs in `aowlspt_beclient.h` byte-for-byte (they live in the
+ * `Assembly-CSharp-firstpass.dll` module, table base 0x186BF1380 -- an EARLIER
+ * misread used `Assembly-CSharp.dll`'s table for every type and so missed them,
+ * which is where the false "the table is null for BE" note used to be), and it
+ * reproduces every VA in `docs/SETTINGS.md` (SettingsScreen.Show 0x171FA00,
+ * OpenGroup 0x1720C80, ...). Two independent ground truths, exact.
+ *
+ * So resolution is **static**, offline, the same mechanism as the BE patches:
+ * type -> its image (from the metadata images table) -> that image's
+ * `Il2CppCodeGenModule.methodPointers` -> `[token_rid - 1]` -> code RVA, then
+ * byte-verify the prologue against `GameAssembly.dll` before use. No runtime
+ * metadata read, no off-thread hazard.
  *
  * ## The target
  *
@@ -225,6 +233,58 @@ static const char* aowl_bridge_render_target_name(int32_t i) {
 
 static int32_t aowl_bridge_render_target_count(void) {
     return AOWL_BRIDGE_RENDER_TARGET_COUNT;
+}
+
+/* ------------------------------------------------------------------ *
+ * The settings-injection probe target
+ *
+ * `EFT.UI.Settings.SettingsScreen::Show` @ RVA 0x171FA00 -- the method that
+ * builds the settings UI, called on the Unity main thread when the user opens
+ * the settings screen. A read-only detour here is the decisive test of native
+ * settings injection: it fires on a definite user action, so if it fires at all
+ * it fires on the Unity thread, and its `this` is the live `SettingsScreen`
+ * whose children a mod would parent a control into. Validated: RVA and prologue
+ * match `docs/SETTINGS.md` (VA 0x18171FA00) exactly.
+ *
+ * Prologue `push rbx ; sub rsp,0x20 ; cmp byte[rip+..],0 ; mov rbx,rcx` --
+ * relocatable (the RIP-relative displacement is fixed up by the detour copier).
+ */
+static const AowlBridgeTarget aowl_bridge_settings_targets[] = {
+    { "EFT.UI.Settings.SettingsScreen::Show", 0x171FA00u,
+      { 0x40,0x53, 0x48,0x83,0xEC,0x20, 0x80,0x3D,0x0C,0xEA,0x99,0x05,0x00,
+        0x48,0x8B,0xD9 }, 16, 0 },
+};
+#define AOWL_BRIDGE_SETTINGS_TARGET_COUNT \
+    ((int32_t)(sizeof(aowl_bridge_settings_targets) / \
+               sizeof(aowl_bridge_settings_targets[0])))
+
+static void* aowl_bridge_settings_target_at(int32_t i) {
+    HMODULE ga;
+    const AowlBridgeTarget* t;
+    unsigned char* p;
+    MEMORY_BASIC_INFORMATION mbi;
+    if (i < 0 || i >= AOWL_BRIDGE_SETTINGS_TARGET_COUNT) return NULL;
+    ga = GetModuleHandleA("GameAssembly.dll");
+    if (!ga) return NULL;
+    aowl_bridge_base_found = 1;
+    t = &aowl_bridge_settings_targets[i];
+    p = (unsigned char*)ga + t->rva;
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0) return NULL;
+    if (mbi.State != MEM_COMMIT) return NULL;
+    if (!(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                         PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+        return NULL;
+    if (t->siglen > 0 && memcmp(p, t->sig, (size_t)t->siglen) != 0) return NULL;
+    aowl_bridge_sig_ok = 1;
+    aowl_bridge_last_rva = (int32_t)t->rva;
+    return (void*)p;
+}
+static const char* aowl_bridge_settings_target_name(int32_t i) {
+    if (i < 0 || i >= AOWL_BRIDGE_SETTINGS_TARGET_COUNT) return "";
+    return aowl_bridge_settings_targets[i].name;
+}
+static int32_t aowl_bridge_settings_target_count(void) {
+    return AOWL_BRIDGE_SETTINGS_TARGET_COUNT;
 }
 
 /* The i'th target's verified code pointer, or NULL.

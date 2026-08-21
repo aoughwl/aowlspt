@@ -376,6 +376,12 @@ proc cBridgeRenderTargetAt(i: int32): Il2CppPtr {.
   importc: "aowl_bridge_render_target_at", nodecl.}
 proc cBridgeRenderTargetName(i: int32): Il2CppPtr {.
   importc: "aowl_bridge_render_target_name", nodecl.}
+proc cBridgeSettingsTargetCount(): int32 {.
+  importc: "aowl_bridge_settings_target_count", nodecl.}
+proc cBridgeSettingsTargetAt(i: int32): Il2CppPtr {.
+  importc: "aowl_bridge_settings_target_at", nodecl.}
+proc cBridgeSettingsTargetName(i: int32): Il2CppPtr {.
+  importc: "aowl_bridge_settings_target_name", nodecl.}
 # Probing a live MethodInfo for where (if anywhere) an executable code pointer
 # sits on this build, when offset 0 (`methodPointer`) reads null.
 proc cReadPtrAt(p: Il2CppPtr; off: int32): Il2CppPtr {.
@@ -729,6 +735,14 @@ var gDrainStalled = false
 var gRenderDrainSlot = -1
 var gRenderMethod = ""
 var gRenderProven = false
+
+## Experiment A: a read-only detour on `SettingsScreen::Show`, its slot and the
+## host thread it must NOT run on. Default-off (`bridgeSettingsProbe`); when it
+## fires it logs the thread so the coordinator can confirm a detour reaches the
+## Unity thread on a user action -- the decisive test for native settings
+## injection. `gSettingsProbe` is the opt-in.
+var gSettingsSlot = -1
+var gSettingsProbe = false
 
 ## Whether the fragile static-RVA drain path may be used at all. OFF by default:
 ## it bound a real-but-wrong function on the live client and crashed the game, so
@@ -2275,6 +2289,10 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
   if i == gRenderDrainSlot:
     renderDrain()
     return 0'i32
+  # Experiment A: the read-only settings probe, likewise by identity.
+  if i == gSettingsSlot:
+    settingsProbeFired(regs)
+    return 0'i32
   if i < 0 or i >= gPatches.len:
     return 0'i32
   if not gPatches[i].live:
@@ -2616,22 +2634,24 @@ proc hostPatchTyped(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
   installPatch(ctx, target, targetLen, kind, cb, user, true)
 
 proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
-                 perFrame: bool; verbose: bool; isRender: bool): bool =
-  ## Installs one of the host's own per-frame drain detours on the code pointer
-  ## `fn`, through the same slot table and detour engine a mod's `patch` uses.
-  ## Shared by both of `bindMainDrain`'s paths and by `bindRenderDrain`: the
-  ## verified static targets from `aowlspt_bridge.h` (where `meth` is nil, since
-  ## the drain firing path indexes by slot and never reads it) and the by-name
-  ## runtime candidates (where `meth` is the resolved `MethodInfo`).
+                 perFrame: bool; verbose: bool; kind: int32): bool =
+  ## Installs one of the host's own detours on the code pointer `fn`, through the
+  ## same slot table and detour engine a mod's `patch` uses. Shared by the update
+  ## drain, the render drain and the settings probe: the verified static targets
+  ## from `aowlspt_bridge.h` (where `meth` is nil, since the firing path indexes
+  ## by slot and never reads it) and the by-name candidates (where `meth` is the
+  ## resolved `MethodInfo`).
   ##
-  ## `isRender` chooses which drain this is -- which slot/method globals it sets
-  ## and which phase the firing path routes it to. The mechanics are identical;
-  ## only the two rows of bookkeeping differ.
+  ## `kind` chooses which detour this is -- 0 update drain, 1 render drain,
+  ## 2 settings probe -- i.e. which slot/method globals it sets and which route
+  ## the firing path takes. The mechanics are identical; only the bookkeeping
+  ## differs.
   ##
-  ## Same lock as `installPatch`, for the same reason: this claims a slot and
-  ## writes its row, and a mod's `patch` on another thread does too. It is the
-  ## host's own hook, and it is not exempt from the rule.
-  let what = (if isRender: "render-phase" else: "main-thread")
+  ## Same lock as `installPatch`: this claims a slot and writes its row, and a
+  ## mod's `patch` on another thread does too. It is the host's own hook, and it
+  ## is not exempt from the rule.
+  let what = (if kind == 1: "render-phase" elif kind == 2: "settings-probe"
+              else: "main-thread")
   tablesLock()
   let claimed = cHookClaim()
   if claimed < 0'i32:
@@ -2667,19 +2687,23 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
            readCString(cHookErrorText(rc))
     return false
 
-  if isRender:
+  if kind == 1:
     gRenderDrainSlot = int(claimed)
+  elif kind == 2:
+    gSettingsSlot = int(claimed)
   else:
     gDrainSlot = int(claimed)
   tablesUnlock()
-  if isRender:
+  if kind == 1:
     gRenderMethod = spec
+  elif kind == 2:
+    discard
   else:
     gDrainMethod = spec
     gDrainPerFrame = perFrame
-  okLog what & " drain bound to " & spec & " (" &
+  okLog what & " bound to " & spec & " (" &
         $int(cHookStolen(hook)) & " bytes)" &
-        (if perFrame: "" else:
+        (if perFrame or kind == 2: "" else:
            "; it runs more than once a frame, so its firing count is not a " &
            "frame count")
   return true
@@ -2890,16 +2914,19 @@ proc bindMainDrain(verbose: bool): bool =
       continue
 
     let pf = candidateIndex < perFrame.len and perFrame[candidateIndex]
-    if attachDrain(spec, fn, m, pf, verbose, false):
+    if attachDrain(spec, fn, m, pf, verbose, 0'i32):
       return true
 
-  # Static-RVA last resort, OFF by default. It is kept only for a build where the
-  # runtime genuinely will not populate `methodPointer` at all *and* where the
-  # metadata `methodPointers` table has been confirmed to hold live pointers --
-  # which this build is NOT (see the crash note above). It is never reached
-  # unless `aowlspt-host.json` sets `bridgeStaticRva` to a non-zero value, and
-  # even then only after every by-name candidate has failed. A mod author turning
-  # it on is opting into the fragile path with eyes open.
+  # Static-RVA path (Experiment B), OFF by default. The address is now KNOWN
+  # correct: the offline resolver that produced `TarkovApplication::Update` @
+  # 0x977B10 reproduces all five BE-bypass RVAs and every SETTINGS.md VA exactly,
+  # so this is not a guess. It stays opt-in because the earlier crash on this
+  # exact target is unexplained -- either the trampolined detour engine on this
+  # client, or `Update` not ticking in the menu where it was tried. Run
+  # `bridgeSettingsProbe` first: if that read-only detour fires on the Unity
+  # thread without crashing, the engine is fine and this should fire in a raid.
+  # Reached only when `bridgeStaticRva` is set, after by-name (which fails
+  # off-thread) has been tried.
   if gAllowStaticBridge:
     let staticCount = cBridgeTargetCount()
     for i in 0 ..< int(staticCount):
@@ -2908,10 +2935,9 @@ proc bindMainDrain(verbose: bool): bool =
         continue
       let spec = readCString(cBridgeTargetName(int32(i)))
       let pf = cBridgeTargetPerFrame(int32(i)) != 0'i32
-      warn "binding the main-thread drain by STATIC RVA (" & spec & "); this " &
-           "path crashed the live client once and is enabled only because " &
-           "bridgeStaticRva is set"
-      if attachDrain(spec, fn, cast[Il2CppMethod](0), pf, verbose, false):
+      warn "binding the main-thread drain by validated STATIC RVA (" & spec &
+           "); bridgeStaticRva is set (Experiment B)"
+      if attachDrain(spec, fn, cast[Il2CppMethod](0), pf, verbose, 0'i32):
         return true
 
   result = false
@@ -2963,7 +2989,7 @@ proc bindRenderDrain(verbose: bool): bool =
     let fn = resolveDrainPointer(m, spec, verbose)
     if fn == nil:
       continue
-    if attachDrain(spec, fn, m, true, verbose, true):
+    if attachDrain(spec, fn, m, true, verbose, 1'i32):
       return true
 
   # Static-RVA last resort, OFF by default -- the same fragile, once-crashed path
@@ -2977,9 +3003,59 @@ proc bindRenderDrain(verbose: bool): bool =
       let spec = readCString(cBridgeRenderTargetName(int32(i)))
       warn "binding the render-phase drain by STATIC RVA (" & spec & "); this " &
            "path is enabled only because bridgeStaticRva is set"
-      if attachDrain(spec, fn, cast[Il2CppMethod](0), true, verbose, true):
+      if attachDrain(spec, fn, cast[Il2CppMethod](0), true, verbose, 1'i32):
         return true
 
+  result = false
+
+proc settingsProbeFired(regs: Il2CppPtr) =
+  ## Experiment A, fired from the read-only detour on `SettingsScreen::Show`.
+  ##
+  ## The whole point is the thread: `Show` is only ever called when the user
+  ## opens the settings screen, and the settings UI runs on Unity's main thread,
+  ## so if this fires at all it fires there. Comparing to the host boot thread is
+  ## the proof: a thread id that is NOT the host's is Unity's, which means a
+  ## static detour DOES reach the Unity thread on a user action -- the capability
+  ## native settings injection needs. This reads `this` (RCX) as a bare pointer
+  ## and logs it; it makes no managed call and writes nothing, so it is safe
+  ## whatever thread it lands on.
+  let tid = int(cThreadId())
+  let selfPtr = cRegsInt(regs, 0'i32)   # RCX = `this`, the live SettingsScreen
+  let onHost = (tid == int(gHostThreadId))
+  okLog "il2cpp settings probe: SettingsScreen.Show fired on thread " & $tid &
+        " (host thread " & $int(gHostThreadId) & "); " &
+        (if onHost:
+           "this IS the host thread -- NOT Unity's, unexpected"
+         else:
+           "this is NOT the host thread -> it is Unity's main thread, so a " &
+           "static detour reaches the Unity thread on a user action and native " &
+           "settings injection is VIABLE") &
+        "; SettingsScreen this=0x" & hexOf(selfPtr) &
+        (if selfPtr != 0'u64 and cIsReadable(cast[Il2CppPtr](selfPtr), 0x20'i32) != 0'i32:
+           " (readable)" else: " (this not readable)")
+
+proc bindSettingsProbe(verbose: bool): bool =
+  ## Installs the read-only Experiment-A detour on `SettingsScreen::Show`, from
+  ## the verified static target in `aowlspt_bridge.h`. Opt-in (`bridgeSettingsProbe`),
+  ## and like the drains it binds nothing on a build whose prologue does not
+  ## match. The detour sits on static code, so it installs as soon as
+  ## GameAssembly is mapped and fires the first time the user opens settings.
+  if gSettingsSlot >= 0:
+    return true
+  if not gReady or gDisableDrain:
+    return false
+  let count = cBridgeSettingsTargetCount()
+  for i in 0 ..< int(count):
+    let fn = cBridgeSettingsTargetAt(int32(i))
+    if fn == nil:
+      if verbose:
+        info "settings probe target " & $i & " did not verify on this build"
+      continue
+    let spec = readCString(cBridgeSettingsTargetName(int32(i)))
+    if attachDrain(spec, fn, cast[Il2CppMethod](0), false, verbose, 2'i32):
+      okLog "settings probe armed on " & spec &
+            "; open the in-game settings screen to fire it"
+      return true
   result = false
 
 proc hostEventSubscribe(ctx: Il2CppPtr; name: Il2CppPtr; nameLen: int32;
@@ -3808,8 +3884,9 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
 
   gAllowStaticBridge = readStaticBridgeEnabled()
   if gAllowStaticBridge:
-    warn "bridgeStaticRva is set: the drain may fall back to the static-RVA " &
-         "path, which crashed the live client once -- use only for diagnosis"
+    warn "bridgeStaticRva is set (Experiment B): the drain will bind to the " &
+         "validated static RVA of TarkovApplication.Update (0x977B10); run " &
+         "bridgeSettingsProbe first to confirm the detour engine on this client"
   gDisableDrain = readDrainDisabled()
   if gDisableDrain:
     warn "bridgeDisableDrain is set: no per-frame detour will be installed; " &
@@ -3824,6 +3901,11 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
     warn "bridgeDeepScan is set: when methodPointer is null the host will scan " &
          "the live MethodInfo for an executable il2cpp pointer and hook it -- " &
          "the decisive attempt on this build, and one that may crash"
+  gSettingsProbe = readBoolKey("bridgeSettingsProbe")
+  if gSettingsProbe:
+    info "bridgeSettingsProbe is set: a read-only detour on SettingsScreen.Show " &
+         "will log the thread it fires on when you open the settings screen " &
+         "(Experiment A -- confirms a detour reaches the Unity thread)"
 
   let waitMs = readWaitMs()
   info "waiting for the IL2CPP runtime (up to " & $(waitMs div 1000) & "s)"
@@ -3860,6 +3942,10 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       if not bindRenderDrain(true):
         info "no render-phase point bound yet; invoke_render (GL/ESP drawing) " &
              "is unavailable until a raid brings up a render callback to detour"
+      # Experiment A: the read-only settings probe. Static code, so it installs
+      # now and fires the first time the user opens the settings screen.
+      if gSettingsProbe and not bindSettingsProbe(true):
+        info "the settings probe did not verify SettingsScreen.Show on this build"
 
   let modsDir = joinPath(gDir, "mods")
   # The runtime may not have come up, and that deliberately does not stop this:
