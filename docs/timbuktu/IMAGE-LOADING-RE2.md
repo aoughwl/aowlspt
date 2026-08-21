@@ -385,3 +385,131 @@ If an icon still spins, get its URL from `Load texture at :` in the run's
 `output_000.log` and check whether that exact path exists under
 `%LOCALAPPDATA%\Temp\Battlestate Games\EscapeFromTarkov\files\`; a missing file
 there is a gap in the source set, not a regression in the loader.
+
+---
+
+# 6. The general fix: the whole class, not the icons
+
+The cache seeding above fixes the assets we happen to have bytes for. It cannot
+fix an asset that was never seeded. So the question was: what *else* fails this
+way, and can the class be closed at the source?
+
+## 6.1 Audit — every `UnityWebRequest` in the assembly
+
+Enumerated exhaustively by taking xrefs over `.text` + `il2cpp` to every
+constructor and every surviving static factory:
+
+```
+python xref2.py 55dd220 55dd2b0 55dd4b0 55dd6f0 55df080 55df020 \
+                55d9ea0 55d9fa0 55da5f0 55dfac0 55dfbc0 252e480
+```
+
+This build ships **no** `UnityWebRequest::Get/Post/Put/Head` statics (stripped),
+**no** `UnityEngine.Caching` type at all, and **no** `DownloadHandlerTexture`.
+The only entry points are the three ctors, `UnityWebRequestAssetBundle::
+GetAssetBundle`, `UnityWebRequestMultimedia::GetAudioClip`, and
+`UnityWebRequestTexture::GetTexture` (which has *zero* managed callers). Eight
+distinct sites in the whole assembly.
+
+**The headline: `UnityWebRequest::set_certificateHandler` (`0x55DF080`),
+`SetCertificateHandler` (`0x55DF020`) and `EFT.ClientCertificateHandler::.ctor`
+(`0x252E480`) have zero call sites anywhere in compiled code.** No path in this
+client ever attaches a certificate handler.
+`EFT.ClientCertificateHandler::ValidateCertificate` exists at `0x252E3D0` and is
+dead. So "has a cert handler?" is *no* for every row below, without exception.
+
+| Class::Method | MoveNext RVA | UWR site | local cache / `file://` first? | verdict against a self-signed HTTPS server |
+|---|---|---|---|---|
+| `ClientBackendSession::DownloadTexture2D` | `0xA7FF70` | ctor `+0xA8018F`, Send `+0xA80277` | no | **silent fail** — the known one |
+| `ClientBackendSession::LoadTextureWithCache` | `0xA84C50` | via the above | **yes** — Resources `+0xA84E9D`, `File.Exists` `+0xA84EEF` then `file://` at `+0xA852FC`/`+0xA85349` | fails only on a cache miss, then `SetResult(null)` `+0xA854C8` |
+| `Communications.LongPollingRequest::Request` | `0xD680E0` | ctor `+0xD6845D`, Send `+0xD689B2` | no | **silent-ish fail** — the notifier long-poll *fallback*. Logs at `+0xD6930E` but never recovers. Its url comes from `LongPollingRequestAbstract::GetUri` (`0xD6A620`), a static singleton field at `+0x28` — **not** `BackendUrls` |
+| `UnityWebDiagnostics::Execute` | `0x139FBB0` | ctor `+0x13A00C7`, Send `+0x13A0335` | no | **fails** — and it is the connection *diagnostic* (`HTTPTransportManager::RunConnectionDiagnostics` `0x1B799A0`), so it will always corroborate a network fault that is not one |
+| `UnityWebSender::WaitResponse` | `0x1B81600` | ctor `+0x1B8186A` | no | **would fail all `/client/*`** if this transport were ever selected — see 6.4 |
+| `UnityWebSender::ExecuteOperationCoroutine` | `0x1B80B80` | Send `+0x1B80D23` | — | same |
+| `AssetsManager.LoadBundleManifestOperation::Coroutine` | `0x1919430` | `GetAssetBundle` `+0x1919747` | url is `Path.Combine` `+0x19196D0` | **safe** — local path, no TLS |
+| `BundleBytesLoadOperation::Coroutine` | `0x191C670` | `GetAssetBundle` `+0x191C738` | `file://` base, `Concat` `+0x191C72E` | **safe** |
+| `BundleLoadOperation::Coroutine` | `0x191D2B0` | `GetAssetBundle` `+0x191D6B0` | `file://` | **safe** |
+| `Matchmaker.MatchmakerIntroVideoScreen::LoadAudio` | `0x1784490` | ctor `+0x1784835` | `AssetsEnvironment::GetStreamingAssetsFileUrl` `0x252D020` at `+0x1784778` | **safe** |
+
+Ragfair icons, banners, prestige/achievement/hideout art are **not** separate
+paths: `RagfairIconsLoader::GetIcon` `0x13AFB30` / `::LoadAvatar` `0x13AFC10` to
+`::LoadTexture` `0x13AFE00` to `Utils::LoadIconSprite` `0x1D1B010`, and the whole
+`LoadTexture*` family has exactly three call sites (`0xA84689`, `0xA849E5`,
+`0xA85349`). They all funnel into `LoadTextureMain` `0xA6E8D0` and inherit its
+verdict. Videos use `GetStreamingAssetsFileUrl` and are local.
+
+## 6.2 Which config field the asset loader reads — `Static`
+
+Confirmed byte-for-byte in `<LoadTextureMain>d__216::MoveNext`:
+
+```
++0xA849AC  test rcx, rcx              ; session
++0xA849B5  mov  rax, [rcx+0xD0]       ; ClientBackendSession._backendUrls
++0xA849C5  mov  r10, [rax+0x10]       ; .Main
++0xA849C9  mov  rdx, [rax+0x38]       ; .Static
++0xA849D2  cmp  dword [rdx+0x10], 0   ; Static.Length
++0xA849D6  jbe  +0xA849DB             ; empty -> keep Main
++0xA849D8  mov  r10, rdx              ; a non-empty Static WINS
++0xA849E5  call 0x180A6EAB0           ; LoadTextureWithCache
+```
+
+`_backendUrls` is at `ClientBackendSession+0xD0`; `JsonType.BackendUrls` is
+`{ Main@0x10, Messaging@0x18, Trading@0x20, RagFair@0x28, Lobby@0x30,
+Static@0x38 }`. `Main` is the fallback *only* when `Static` is empty — so a
+non-empty `Static` is authoritative and the other five may stay on https.
+
+**No scheme forcing anywhere on these paths.** The url is a bare
+`String::Concat(baseUrl, url)` at `+0xA84F07`, handed to the ctor unmodified;
+`EftClientBackendSession::.ctor` only trims a trailing `/` or `\`
+(`0xA8BE20`–`0xA8BE65`, store `0xA8BEBF`). An `http://` value in `Static` is
+used verbatim. That is what makes the fix possible at all.
+
+## 6.3 Bundles do not touch the backend
+
+`BundlesManager::get_DownloadingUrl` (`0x692A50`) reads `+0x28`;
+`get_LoadingUrl` (`0x6F1680`) reads `+0x30`, which the ctor (`0x191B700`) sets
+at `+0x191B91A` to the same string with a 7-character scheme prefix stripped.
+That string comes from `AssetsEnvironment::GetDownloadingUrl` (`0x252CDA0`),
+built at `+0x252CE1D` from `Application::get_streamingAssetsPath` — i.e.
+`file://...\EscapeFromTarkov_Data\StreamingAssets\Windows\`. The metadata carries
+`file://` (lit 26747), `file:///` (26748) and the StreamingAssets path (8995),
+and **no** bundle CDN literal at all.
+
+**So bundles are local file reads and always were.** They are not a TLS victim,
+and no second config field needs pointing anywhere. For resource packs this is
+the load-bearing fact: mod-shipped bundles must reach the client through
+`StreamingAssets`, **not** through an HTTP route — serving them over the asset
+port would work only if something first pointed a bundle url at it, and nothing
+does.
+
+## 6.4 Two cautions this turned up
+
+* **The managed stack is not blanket-permissive.**
+  `HttpWebSender::OnCertificateValidation` (`0x1B7C970`) returns `true` at
+  `+0x1B7CA1A` *only when `sslPolicyErrors == 0`*; on any error it logs and
+  returns `false` (`xor al,al`, `+0x1B7CAE5`). `/client/*` works today because
+  the stack reports zero policy errors, not because the callback accepts
+  anything. Do not treat "the managed stack accepts self-signed" as an
+  invariant.
+* **`UnityWebSender` is a live alternative transport.**
+  `HTTPTransportManager::get__webSender` (`0x1B792E0`) resolves the sender from
+  a static singleton slot (`static+0x20`); three exist — `HttpWebSender`
+  (managed), `UnityWebSender`, `WsWebSender`. If anything ever selects
+  `UnityWebSender`, *all* backend traffic acquires the same certificate-handler
+  hole as the texture loader.
+
+## 6.5 The fix that follows
+
+Serve the asset routes over plain HTTP so no handshake, and therefore no
+validation, ever happens:
+
+* `--asset-port N` on the backend (default **80**, `0` disables), active only
+  under `--tls`. A second listening socket, always plain, sharing the one
+  poller and the one route table — see `g_listenSock2` in `abi/aowlspt_net.h`.
+* `backend.Static` = `http://127.0.0.1` in the tarkov mod's `onGameConfig`
+  (`AssetUrl`). The other five urls stay on the https base.
+
+The cache seeding of section 5 stays, and composes: it short-circuits at
+`File.Exists` before any socket, so a seeded asset still loads from disk with no
+request at all, and an unseeded one now gets an immediate answer over http
+instead of hanging on a handshake that is never accepted.
