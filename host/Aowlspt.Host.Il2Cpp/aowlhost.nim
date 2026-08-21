@@ -376,6 +376,8 @@ proc cUxVersionTarget(): Il2CppPtr {.
   importc: "aowl_uxpatch_version_target", nodecl.}
 proc cUxVersionLabelOffset(): int32 {.
   importc: "aowl_uxpatch_version_label_offset", nodecl.}
+proc cUxWritePtr(p: Il2CppPtr; off: int32; value: Il2CppPtr): int32 {.
+  importc: "aowl_uxpatch_write_ptr", nodecl.}
 
 # The Unity-main-thread bridge's statically-resolved per-frame targets. Each
 # returns a verified code pointer into GameAssembly.dll or nil (wrong build,
@@ -772,6 +774,7 @@ var gSettingsProbe = false
 ## static Exit fix ships on regardless.
 var gVersionSlot = -1
 var gVersionBrand = false
+var gVersionWrite = false
 var gVersionBranded = false
 
 ## Whether the fragile static-RVA drain path may be used at all. OFF by default:
@@ -3102,67 +3105,120 @@ proc bindSettingsProbe(verbose: bool): bool =
       return true
   result = false
 
+proc looksLikeVersion(s: string): bool =
+  ## A version-ish string: has a digit and a dot, is short, and is otherwise
+  ## printable ASCII. Used to pick the version String field out of a component's
+  ## fields without hard-coding an offset that a future build would move.
+  if s.len == 0 or s.len > 64:
+    return false
+  var hasDigit = false
+  var hasDot = false
+  for ch in s:
+    if ch >= '0' and ch <= '9': hasDigit = true
+    elif ch == '.': hasDot = true
+    elif ord(ch) < 0x20 or ord(ch) > 0x7E: return false
+  result = hasDigit and hasDot
+
 proc versionBrandFired(regs: Il2CppPtr) =
   ## Fired from the POSTFIX detour on `EFT.UI.PreloaderUI::Awake`, on the Unity
-  ## main thread (Awake is a MonoBehaviour callback), *after* the original set the
-  ## bottom-left version label. Rewrites that label to "aowlspt <U+2014> <version>".
+  ## main thread, *after* the original set the bottom-left version label.
   ##
-  ## Everything is guarded and the whole thing runs at most once: a fault here is
-  ## on the Unity thread during boot, so it must never dereference anything it has
-  ## not checked is readable, and it bails on any doubt -- an unbranded version is
-  ## the acceptable failure, a crashed boot is not. The label component is the
-  ## reference field at `this + 0x20` (Awake's `set_text` receiver); its text is
-  ## read and written through the runtime's own get_text/set_text, resolved on the
-  ## component's actual class (which walks the hierarchy, so it works whether the
-  ## label is a TMP_Text or a UnityEngine.UI.Text).
+  ## Staged and crash-proof by construction, because a fault here is on the Unity
+  ## thread during boot:
+  ##
+  ##   * READ-ONLY probe (always): log the firing thread, whether `this + 0x20`
+  ##     (Awake's `set_text` receiver, the label component) is readable, and the
+  ##     component's class -- then scan the component's fields for managed
+  ##     `System.String`s and log the version-looking one's offset and value.
+  ##     Nothing is written; this isolates "does the postfix reach the Unity
+  ##     thread and read cleanly" from "does a managed write crash".
+  ##   * FIELD-WRITE brand (opt-in `uxVersionBrandWrite`): allocate a branded
+  ##     `System.String` and write its pointer straight into that field by offset
+  ##     -- NO `runtime_invoke` and NO `findMethod` (both faulted on this
+  ##     protected build; a raw field write is what `fov`/`sain` do). The write
+  ##     slot is VirtualQuery-guarded before the store.
+  ##
+  ## Every dereference is `aowl_is_readable`-guarded, class-name reads go through
+  ## the SEH-guarded `classNameSafe`, and the whole thing runs at most once. Any
+  ## doubt -> leave the stock version, never crash.
   if gVersionBranded:
     return
+  gVersionBranded = true          # once only, whatever the outcome below
+
+  let tid = int(cThreadId())
+  let onHost = (tid == int(gHostThreadId))
+  okLog "version probe: PreloaderUI.Awake postfix fired on thread " & $tid &
+        (if onHost: " (HOST thread -- unexpected; NOT Unity's)"
+         else: " (NOT the host thread -> Unity's main thread)")
+
   let selfRaw = cRegsInt(regs, 0'i32)          # RCX = the PreloaderUI `this`
   if selfRaw == 0'u64:
+    warn "version probe: `this` is null; nothing to read"
     return
   let self = cast[Il2CppPtr](selfRaw)
   let off = cUxVersionLabelOffset()
   if cIsReadable(self, off + 8'i32) == 0'i32:
+    warn "version probe: this+0x" & hexOf(uint64(off)) & " is not readable"
     return
   let label = hReadPtr(self, off)
-  if label == nil or cIsReadable(label, 0x10'i32) == 0'i32:
+  if label == nil or cIsReadable(label, 0x20'i32) == 0'i32:
+    warn "version probe: label component (this+0x" & hexOf(uint64(off)) &
+         ") is null or not readable"
     return
-  let cls = objectClass(gRt, label)
-  if cls == nil:
+  let lcls = objectClass(gRt, label)
+  let lname = (if lcls == nil: "<null>" else: classNameSafe(gRt, lcls))
+  okLog "version probe: label component at this+0x" & hexOf(uint64(off)) &
+        " is readable, class=" & lname
+
+  # Read-only scan for managed String fields on the component, to locate the
+  # text-backing String (its offset moves between builds, so it is found rather
+  # than assumed). Every step is guarded; classNameSafe swallows a bogus class.
+  var textField = -1
+  var textVal = ""
+  var o = 0x10
+  while o <= 0x180:
+    if cIsReadable(label, int32(o + 8)) != 0'i32:
+      let fp = hReadPtr(label, int32(o))
+      if fp != nil and cIsReadable(fp, 0x18'i32) != 0'i32:
+        let fcls = objectClass(gRt, fp)
+        if fcls != nil and classNameSafe(gRt, fcls) == "String":
+          let s = readString(gRt, fp)
+          if s.len > 0 and s.len <= 64:
+            okLog "version probe: String field +0x" & hexOf(uint64(o)) &
+                  " = \"" & s & "\""
+            if textField < 0 and looksLikeVersion(s):
+              textField = o
+              textVal = s
+    o = o + 8
+
+  if not gVersionWrite:
+    okLog "version probe: read-only (set uxVersionBrandWrite to attempt a " &
+          "field-write brand; no managed write was performed)"
     return
-  let getM = findMethod(gRt, cls, "get_text", 0)
-  let setM = findMethod(gRt, cls, "set_text", 1)
-  if getM == nil or setM == nil:
+
+  # ---- opt-in field-write brand: newString + raw field store, no invoke ----
+  if textField < 0:
+    warn "version brand: no version-looking String field found on the label " &
+         "component; not writing (stock version left in place)"
     return
-  var e1: Il2CppException = nullPtr()
-  let cur = gRt.invoke(getM, label, cast[Il2CppPtr](0), e1)
-  if e1 != nil:
-    return
-  var curStr = ""
-  if cur != nil:
-    curStr = readString(gRt, cur)
-  if curStr.len == 0:
-    return                                      # not populated yet; leave it
-  if curStr.startsWith("aowlspt"):
-    gVersionBranded = true                      # already ours; nothing to do
-    return
-  # "aowlspt <U+2014 em dash> <version>". The dash is written as its explicit
-  # UTF-8 bytes so the source stays ASCII and no toolchain guesses an encoding;
-  # `il2cpp_string_new` takes UTF-8 and the runtime renders it as an em dash.
-  let branded = "aowlspt \xE2\x80\x94 " & curStr
+  if textVal.startsWith("aowlspt"):
+    return                                      # already ours
+  # "aowlspt <U+2014 em dash> <version>", em dash as explicit UTF-8 bytes so the
+  # source stays ASCII; il2cpp_string_new takes UTF-8.
+  let branded = "aowlspt \xE2\x80\x94 " & textVal
   let ns = newString(gRt, branded)
-  if ns == nil:
+  if ns == nil or cIsReadable(ns, 0x14'i32) == 0'i32:
+    warn "version brand: newString failed or returned an unreadable String; " &
+         "not writing"
     return
-  let a = cArgsNew(1)
-  if a == nil:
-    return
-  cArgsSetRef(a, 0, ns)
-  var e2: Il2CppException = nullPtr()
-  discard gRt.invoke(setM, label, cArgsPtr(a), e2)
-  cArgsFree(a)
-  if e2 == nil:
-    gVersionBranded = true
-    okLog "version label branded: \"" & branded & "\""
+  okLog "version brand: allocated branded String ok; writing it into label " &
+        "field +0x" & hexOf(uint64(textField))
+  if cUxWritePtr(label, int32(textField), ns) != 0'i32:
+    okLog "version brand: field +0x" & hexOf(uint64(textField)) &
+          " set to \"" & branded & "\" (field write, no set_text call)"
+  else:
+    warn "version brand: field slot +0x" & hexOf(uint64(textField)) &
+         " was not safely writable; left unchanged"
 
 proc bindVersionBrand(verbose: bool): bool =
   ## Installs the POSTFIX detour on `EFT.UI.PreloaderUI::Awake` from the verified
@@ -4051,10 +4107,19 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "will log the thread it fires on when you open the settings screen " &
          "(Experiment A -- confirms a detour reaches the Unity thread)"
   gVersionBrand = readBoolKey("uxVersionBrand")
+  gVersionWrite = readBoolKey("uxVersionBrandWrite")
+  if gVersionWrite:
+    gVersionBrand = true          # the write path needs the probe armed
   if gVersionBrand:
     info "uxVersionBrand is set: a postfix detour on PreloaderUI.Awake will " &
-         "brand the bottom-left version label as \"aowlspt — <version>\" on the " &
-         "Unity thread (fail-safe: unbranded if the build or timing does not match)"
+         "probe the version label on the Unity thread" &
+         (if gVersionWrite:
+            " and (uxVersionBrandWrite) attempt a field-write brand to " &
+            "\"aowlspt <em dash> <version>\" -- no runtime_invoke"
+          else:
+            " (read-only: logs thread, readability, class, and String fields; " &
+            "no managed write)") &
+         " (fail-safe: unbranded if the build or timing does not match)"
 
   let waitMs = readWaitMs()
   info "waiting for the IL2CPP runtime (up to " & $(waitMs div 1000) & "s)"

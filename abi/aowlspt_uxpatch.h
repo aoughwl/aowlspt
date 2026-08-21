@@ -58,19 +58,30 @@
  * `this + 0x20` (from Awake's `mov rbx,rcx ; ... ; mov rbp,[rbx+0x20]` feeding
  * the `set_text` receiver).
  *
- * Branding it cleanly means a managed edit on the Unity main thread (safe), not
- * a static byte patch: the version text is a runtime-allocated managed String
- * built from a global-metadata string literal, present nowhere in
- * GameAssembly.dll, so there is nothing static to overwrite. This header only
- * *locates and verifies* the PreloaderUI.Awake code pointer (exactly like
- * `aowl_bridge_settings_target_at`); the host installs a POSTFIX detour there
- * and, after the original has set the label, reads the label's text and rewrites
- * it to "aowlspt <U+2014> <version>" via the runtime's own get_text/set_text.
- * PreloaderUI.Awake is a MonoBehaviour callback, so the detour fires on the
- * Unity thread and the managed edit is safe. Fail-safe: the prologue is verified
- * before the pointer is handed out, and the host guards every dereference and
- * skips on any doubt, so a wrong offset or a missed firing is an unbranded
- * version, never a crash.
+ * The version text is a runtime-allocated managed String built from a
+ * global-metadata string literal, present nowhere in GameAssembly.dll, so there
+ * is nothing static to overwrite -- branding is a managed edit on the Unity
+ * thread. This header only *locates and verifies* the PreloaderUI.Awake code
+ * pointer (like `aowl_bridge_settings_target_at`); the host installs a POSTFIX
+ * detour there.
+ *
+ * LIVE FINDING (this build): a managed WRITE via `il2cpp_runtime_invoke`
+ * (get_text/set_text) from inside the detour CRASHES the client, even though the
+ * same postfix reaches the Unity thread and a read-only detour (the settings
+ * probe) is fine -- runtime_invoke needs a MethodInfo/method-pointer this build
+ * protects. So the host does NOT use runtime_invoke. Instead the postfix handler
+ * (`versionBrandFired`) runs in two stages: a READ-ONLY probe that logs the
+ * thread, the readability of `this + 0x20` (the label component), its class, and
+ * the component's `System.String` fields; and an opt-in FIELD-WRITE brand that
+ * allocates a branded String and stores its pointer straight into the
+ * text-backing field by offset -- no runtime_invoke, no findMethod, the same
+ * kind of raw field write `fov`/`sain` use. `aowl_uxpatch_write_ptr` below is
+ * the VirtualQuery-guarded store for that path.
+ *
+ * Fail-safe throughout: the prologue is verified before the pointer is handed
+ * out, every dereference is `aowl_is_readable`-guarded, and any doubt leaves the
+ * stock version -- a wrong offset, a missed firing, or an unwritable slot is an
+ * unbranded version, never a crash.
  */
 
 #ifndef AOWLSPT_UXPATCH_H
@@ -192,6 +203,35 @@ static void* aowl_uxpatch_version_target(void) {
 
 static int32_t aowl_uxpatch_version_label_offset(void) {
     return AOWL_UX_VERSION_LABEL_OFF;
+}
+
+/* A pointer-sized field write at `p + off`, but only if that 8-byte slot is
+ * inside one committed, writable region -- the write mirror of
+ * `aowl_is_readable`. Used by the version brand's field-write path to set a
+ * component's text-backing String field WITHOUT calling a managed method
+ * (runtime_invoke faulted on this protected build; a raw field write is what
+ * `fov`/`sain` do). Returns 1 on success, 0 if the slot is not safely writable
+ * (in which case nothing is written and the caller leaves the stock version). */
+static int32_t aowl_uxpatch_write_ptr(void* p, int32_t off, void* value) {
+    MEMORY_BASIC_INFORMATION mbi;
+    char* at;
+    if (!p) return 0;
+    at = (char*)p + off;
+    if (VirtualQuery(at, &mbi, sizeof(mbi)) == 0) return 0;
+    if (mbi.State != MEM_COMMIT) return 0;
+    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return 0;
+    if (!(mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY |
+                         PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+        return 0;
+    {
+        uintptr_t start = (uintptr_t)mbi.BaseAddress;
+        uintptr_t end   = start + (uintptr_t)mbi.RegionSize;
+        uintptr_t need  = (uintptr_t)at + (uintptr_t)sizeof(void*);
+        if (need < (uintptr_t)at) return 0;
+        if (need > end) return 0;
+    }
+    memcpy(at, &value, sizeof(void*));
+    return 1;
 }
 
 #endif /* AOWLSPT_UXPATCH_H */
