@@ -70,6 +70,32 @@ bloom 0.35, vignette 0.18. Neutral-plus: cleaner highlights and a touch of
 contrast/sharpness over stock, nothing garish. Everything is in `config.json`
 and editable live from the F12 settings panel.
 
+## Raid-state gate (menu stays stock)
+
+By default (`raidOnly: true`) the grade runs **only in a raid**; the main menu
+and 2D UI screens render stock. The post-process is at Present level and has no
+game-state knowledge, so the signal comes from the backend, which knows raid
+state definitively:
+
+```
+tarkov mod                         manager mod                 client host                graphics module
+POST /client/match/local/start  →  onRaidStarted (cache)   →   /aowlspt/mods/client   →   aowl_gfx_set_in_raid(1)
+  broadcast tarkov.raid.started     put "inRaid":true            poll (~3s) parseInRaid     gate ramps 0→1 (fade in)
+POST /client/match/local/end    →  onRaidEnded (cache)     →   same poll               →   aowl_gfx_set_in_raid(0)
+  broadcast tarkov.raid.ended       put "inRaid":false                                       gate ramps 1→0 (fade out)
+```
+
+- The `inRaid` flag rides the mod-set poll the host **already** makes — no new
+  endpoint, no new thread.
+- The transition is a per-frame ramp of a `_GateAmount` blend (0 = untouched
+  frame, 1 = full grade), so it fades over ~12 frames instead of popping — and
+  it lands during the raid's black loading screen anyway.
+- Safe-by-default: the gate defaults to closed (menu stock). If the backend/
+  manager is absent the signal never arrives and the effect stays off — set
+  `raidOnly: false` to grade everywhere (also the no-backend escape hatch).
+- `diag: true` forces the grade on regardless of raid state, so the red-tint
+  blit test works in the menu too.
+
 ## Config / controls
 
 Flat keys in `config.json`; the F12 settings UI (settingshub) reads the schema

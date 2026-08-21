@@ -41,6 +41,7 @@ proc cGfxSetParamsJson(json: cstring) {.importc: "aowl_gfx_set_params_json", nod
 proc cGfxStartDriven(): int32 {.importc: "aowl_gfx_start_driven", nodecl.}
 proc cGfxGradePtr(): pointer {.importc: "aowl_gfx_grade_ptr", nodecl.}
 proc cGfxReleasePtr(): pointer {.importc: "aowl_gfx_release_ptr", nodecl.}
+proc cGfxSetInRaid(on: int32) {.importc: "aowl_gfx_set_in_raid", nodecl.}
 
 # --------------------------------------------------------------- public
 
@@ -87,6 +88,14 @@ proc graphicsApplyJson*(json: string) =
   ## a lock), so it can be called from the host's `call` dispatcher directly.
   var j = json
   cGfxSetParamsJson(toCString(j))
+
+proc graphicsSetInRaid*(inRaid: bool) =
+  ## Push the raid-state gate signal from the host (sourced from the backend's
+  ## poll — the tarkov mod knows raid start/end definitively). When the mod's
+  ## `raidOnly` is set (the default), the post-process grades only while this is
+  ## true and passes the frame through untouched in the menu. The C side ramps
+  ## the transition over a few frames so it fades rather than pops. Thread-safe.
+  cGfxSetInRaid(if inRaid: 1'i32 else: 0'i32)
 
 proc graphicsStatus*(): string =
   ## One line, meant to be logged verbatim: what the post-process is doing or the

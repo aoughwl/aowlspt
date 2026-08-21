@@ -1426,6 +1426,10 @@ proc routeClient(url, body, session: string): string =
       put(out1, "error", gRegistry.error)
     put(out1, "count", n)
     put(out1, "mods", a)
+    # Whether a raid is in progress, for the client host's graphics post-process
+    # gate. Sourced from the tarkov mod's raid start/end events (see
+    # mgr/control.nim). An older host ignores the field; a newer one reads it.
+    put(out1, "inRaid", raidActive())
     # Last, always. This is the terminator the reader checks for.
     put(out1, "complete", true)
     text = done(out1).text
