@@ -40,7 +40,12 @@ const
   ## real item with real children, not a flag: loot a scav picks up goes into it
   ## and comes home out of it.
   DefaultInventoryTpl = "55d7217a4bdc2d86028b456d"
-  PocketsTpl = "557ffd194bdc2d28148b457f"
+  PocketsTpl = "627a4e6b255f7527fb05a0f6"
+    ## The post-1.0 pockets, with `SpecialSlot1..3`, rather than the pre-1.0
+    ## `557ffd194bdc2d28148b457f` that has none. Same 1x4 grid either way, so
+    ## nothing about what a scav can carry changes -- but the client's
+    ## `HasMarkOfUnknown` walks the pockets item's *slot* list, and giving it the
+    ## item shape it expects there costs nothing. See `emu/profile.nim`.
 
   ## Equipment slots that are part of the character rather than gear. Their
   ## *contents* come home from a survived raid; the containers themselves do
