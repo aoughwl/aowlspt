@@ -2759,6 +2759,35 @@ proc typedFire(i: int; regs: Il2CppPtr; postfix: bool): int32 =
   # value in the frame is of the right shape or the mod chose not to claim one.
   result = (if st == PatchSkipStatus: 1'i32 else: 0'i32)
 
+var gSharedRidersLoggedPf = false
+var gSharedRidersLoggedPr = false
+
+proc logSharedRiders(half: string; i: int) =
+  ## THE DISPATCH TABLE, OBSERVED RATHER THAN INFERRED.
+  ##
+  ## One line, once per half, the first time the shared `PreloaderUI::Update`
+  ## detour fires through it. It prints the slot that actually fired next to
+  ## the CURRENT value of all three rider slot globals, and then names exactly
+  ## which riders that firing will dispatch.
+  ##
+  ## This exists because a rider that is armed, logs that it armed, and then is
+  ## never dispatched is indistinguishable from a rider that is dispatched and
+  ## does nothing -- and telling those apart cost two full deploy/launch cycles.
+  ## With this line it is one glance: if `inspect:6` and `slot=6` then dispatch
+  ## is fine and the fault is inside the rider; if `inspect:-1` the alias never
+  ## landed. Costs one boolean test per frame after the first firing, and never
+  ## allocates again.
+  okLog half & ": slot=" & $i &
+        " riders={debugui:" & $gDebugUiSlot &
+        ", modetext:" & $gModeTextSlot &
+        ", inspect:" & $gInspSlot & "}" &
+        " -> dispatches" &
+        (if i == gDebugUiSlot: " debugui" else: "") &
+        (if i == gModeTextSlot: " modetext" else: "") &
+        (if i == gInspSlot: " inspect" else: "") &
+        (if i != gDebugUiSlot and i != gModeTextSlot and i != gInspSlot:
+           " NOTHING (no rider slot matches this firing)" else: "")
+
 proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     exportc: "aowlspt_nim_patch_fired", cdecl.} =
   ## Called from the detour thunk, on the game thread, inside the patched
@@ -2838,6 +2867,9 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
   # be on at once over ONE detour and ONE trampoline. Its per-frame cost when
   # no command is queued is a single interlocked load (`aowl_insp_have`).
   if i == gDebugUiSlot or i == gModeTextSlot or i == gInspSlot:
+    if not gSharedRidersLoggedPf:
+      gSharedRidersLoggedPf = true
+      logSharedRiders("patchFired", i)
     if i == gDebugUiSlot:
       debugUiFired(regs)
     if i == gModeTextSlot:
@@ -2957,6 +2989,9 @@ proc patchReturned(slot: int32; regs: Il2CppPtr): int32 {.
   # it out here would silently kill the inspector in precisely the arming order
   # (mode-text first, inspector second) that the multiplex exists to tolerate.
   if i == gModeTextSlot or i == gDebugUiSlot or i == gInspSlot:
+    if not gSharedRidersLoggedPr:
+      gSharedRidersLoggedPr = true
+      logSharedRiders("patchReturned", i)
     if i == gDebugUiSlot:
       debugUiFired(regs)
     if i == gModeTextSlot:

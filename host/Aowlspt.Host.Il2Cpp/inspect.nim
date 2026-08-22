@@ -181,6 +181,16 @@ var gInspOff = false         ## self-disabled after too many faults
 ## to name it. Procs resolve across the whole module regardless of order;
 ## module-level `var`s do not.
 var gInspFaults = 0
+var gInspFires = 0
+  ## How many times the Unity-thread rider has actually been DISPATCHED. This
+  ## is the number that tells "the rider never ran" apart from "the rider ran
+  ## and found nothing to do" -- two failures that look identical from the
+  ## outside and which cost two live runs to distinguish. Incremented before
+  ## every early-out in `inspectFired`, so it counts dispatches, not work.
+var gInspTicks = 0
+  ## How many times the rider ran with a batch actually pending, i.e. got past
+  ## the `aowl_insp_have` gate. `gInspFires` high with `gInspTicks` zero means
+  ## the rider is dispatched fine and the HANDOFF FLAG is what is broken.
 var gInspBatch = 0
 var gInspBatchDone = -1      ## last batch Unity finished; the tick thread's cue
 
@@ -1470,6 +1480,7 @@ proc inspTick() =
     return
   if cInspHave() == 0'i32:
     return
+  inc gInspTicks
   inspRunBatch()
   cInspLock()
   gInspBatchDone = gInspBatch
@@ -1480,6 +1491,11 @@ proc inspectFired(regs: Il2CppPtr) =
   ## The rider on `EFT.UI.PreloaderUI::Update`, dispatched by slot identity from
   ## `patchFired`. RCX is the live `PreloaderUI` -- captured as the ROOT ANCHOR
   ## and otherwise untouched. This never suppresses the original.
+  ##
+  ## The counter is incremented FIRST, before any early-out, because its whole
+  ## job is to answer "was this rider dispatched at all?" -- a counter that only
+  ## advanced when the rider did work could not answer that question.
+  inc gInspFires
   if gInspOff:
     return
   let selfPtr = cRegsInt(regs, 0'i32)
@@ -1549,15 +1565,35 @@ proc inspectPoll(now: uint64) =
       iOut("aowlspt live inspector -- batch " & $gInspBatch &
            " was never picked up by Unity's thread within " &
            $int(InspStuckMs div 1000'u64) & "s.")
-      iOut("  The commands did NOT run. The usual cause is that the inspector " &
-           "is not armed: it rides EFT.UI.PreloaderUI::Update, and if neither " &
-           "the F3 overlay nor uxMenuModeText claimed that function and it did " &
-           "not verify on this build, there is nothing to run from.")
-      iOut("  Check the host log for a line starting 'live inspector armed'. " &
-           "If the client is still on a loading screen, PreloaderUI::Update is " &
-           "not ticking yet -- reach the menu and edit the file again.")
+      iOut("  The commands did NOT run.")
+      # THE THREE HYPOTHESES, SEPARATED BY MEASUREMENT rather than by prose.
+      # Every previous version of this message guessed; these counters know.
       iOut("  inspector slot = " & $gInspSlot &
-           " (-1 means nothing is armed)")
+           " (-1 means nothing is armed); rider dispatched " & $gInspFires &
+           " time(s); ran with a batch pending " & $gInspTicks & " time(s); " &
+           "self-disabled = " & $gInspOff & "; pending flag now = " &
+           $int(cInspHave()))
+      if gInspSlot < 0:
+        iOut("  DIAGNOSIS: NOT ARMED. Nothing claimed or aliased the " &
+             "EFT.UI.PreloaderUI::Update slot, so there is nothing to run " &
+             "from. Look for a line starting 'live inspector armed'.")
+      elif gInspFires == 0:
+        iOut("  DIAGNOSIS: ARMED BUT NEVER DISPATCHED. The slot is " &
+             $gInspSlot & " yet the rider has not been called once. Either " &
+             "the detour is not firing at all (still on a loading screen -- " &
+             "reach the MENU and edit the file again), or the firing half " &
+             "does not dispatch this rider. Compare against the one-shot " &
+             "'patchFired:'/'patchReturned:' rider-table line in the host " &
+             "log: it prints the firing slot beside all three rider slots.")
+      elif gInspTicks == 0:
+        iOut("  DIAGNOSIS: DISPATCHED BUT NEVER SAW THE BATCH. The rider ran " &
+             $gInspFires & " time(s) but the pending flag read 0 every time, " &
+             "so the HANDOFF is what is broken, not the detour and not the " &
+             "dispatch.")
+      else:
+        iOut("  DIAGNOSIS: the rider ran and saw a batch, but did not " &
+             "complete it -- suspect a fault that escaped the per-command " &
+             "guard. The last hop attempted is in the host log.")
       inspWriteOut()
       cInspLock()
       gInspOut = @[]
