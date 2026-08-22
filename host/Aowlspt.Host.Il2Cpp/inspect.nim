@@ -1149,6 +1149,27 @@ proc iCmdCanvas(p: Il2CppPtr) =
 
 const InspKlassMax = 128
 
+var gGoKlass: seq[uint64] = @[]
+  ## KLASS POINTERS KNOWN TO BE `UnityEngine.GameObject`.
+  ##
+  ## Learned only from sources that return a GameObject BY CONTRACT --
+  ## `Scene::GetRootGameObjects` and `Component::get_gameObject` -- never
+  ## guessed. `UnityEngine.GameObject` is sealed, so in practice this holds one
+  ## value.
+  ##
+  ## It exists because the tree walker takes TRANSFORMS, and feeding it a
+  ## GameObject reads `Transform` methods off the wrong type. The observed
+  ## fault on "[Technical Systems]" was the LUCKY outcome of that: an
+  ## unlucky one returns a plausible child count and walks into unrelated
+  ## memory, inventing a hierarchy of wrong children with wrong names and
+  ## never faulting at all. Two roots were walked before the faulting one, and
+  ## "did not fault" is not evidence that those were right.
+  ##
+  ## A blacklist rather than a Transform whitelist, deliberately: Transform has
+  ## subclasses (RectTransform, and anything the game defines), so a whitelist
+  ## would refuse legitimate objects it had not happened to see yet. Refusing
+  ## exactly what is known to be the WRONG type has no false negatives.
+
 proc iKlassOf(p: Il2CppPtr): uint64 =
   ## The Il2CppClass* every managed object carries at +0. A guarded read, so
   ## this is safe on anything.
@@ -1168,6 +1189,47 @@ proc iNoteKlass(p: Il2CppPtr) =
       return
   if gKlassSeen.len < InspKlassMax:
     gKlassSeen.add k
+
+proc iNoteGameObject(p: Il2CppPtr) =
+  ## Record this object's klass as a GameObject klass. Only ever called on
+  ## pointers a target returned as a GameObject by contract.
+  let k = iKlassOf(p)
+  if k == 0'u64:
+    return
+  for i in 0 ..< gGoKlass.len:
+    if gGoKlass[i] == k:
+      return
+  if gGoKlass.len < 16:
+    gGoKlass.add k
+
+proc iIsGameObject(p: Il2CppPtr): bool =
+  let k = iKlassOf(p)
+  if k == 0'u64:
+    return false
+  for i in 0 ..< gGoKlass.len:
+    if gGoKlass[i] == k:
+      return true
+  result = false
+
+proc iRefuseIfGameObject(p: Il2CppPtr; what: string): bool =
+  ## THE GUARD THAT MAKES THIS CLASS OF MISTAKE LOUD.
+  ##
+  ## Returns true (and explains) when `p` is a GameObject being handed to
+  ## something that wants a Transform. The point is not the crash we already
+  ## saw -- that one announced itself -- but the silent case: `Transform`
+  ## methods read off a GameObject can return a plausible child count and walk
+  ## into unrelated memory, producing a hierarchy that is entirely fictional
+  ## and never faults. A wrong answer delivered confidently is the worst thing
+  ## this instrument can do.
+  if not iIsGameObject(p):
+    return false
+  iErr(what & " was given a GameObject (klass " & iPtrU(iKlassOf(p)) & ") " &
+       "where a TRANSFORM is required. Transform methods read off a " &
+       "GameObject land on unrelated memory and can invent a plausible-looking " &
+       "hierarchy WITHOUT faulting, so this refuses rather than guessing. " &
+       "Convert it first -- every $rN is already a Transform; for a GameObject " &
+       "from elsewhere use its $gN partner.")
+  result = true
 
 proc iIsKnownKlass(v: uint64): bool =
   result = false
@@ -1308,6 +1370,9 @@ proc iChildCount(t: Il2CppPtr; n: var int): bool =
   var fn: Il2CppPtr = nil
   if not iNavFindQuiet("get_childCount", fn):
     return false
+  # Refuse the wrong TYPE before touching the object, not after.
+  if iIsGameObject(t):
+    return false
   if not iUnityAlive(t):
     return false
   iMark("Transform::get_childCount", t)
@@ -1324,10 +1389,32 @@ proc iChildAt(t: Il2CppPtr; i: int): Il2CppPtr =
   var fn: Il2CppPtr = nil
   if not iNavFindQuiet("GetChild", fn):
     return nil
+  if iIsGameObject(t):
+    return nil
   if not iUnityAlive(t):
     return nil
   iMark("Transform::GetChild", t)
   result = cast[Il2CppPtr](cInspUPI(fn, t, int32(i), nil))
+
+proc iTransformOfGameObject(go: Il2CppPtr): Il2CppPtr =
+  ## `GameObject::get_transform` @0x52A8AE0 -- the GameObject-side accessor.
+  ##
+  ## NOT `Component::get_transform`: that is a Component method, and calling it
+  ## on a GameObject is the very type confusion this exists to fix. The two
+  ## have almost the same name and completely different receivers, which is
+  ## exactly how the wrong one gets used.
+  result = nil
+  var idx = 0
+  var hits = 0
+  if not iFindTarget("GameObject::get_transform", idx, hits):
+    return
+  let fn = iTargetFn(idx)
+  if fn == nil or not iUnityAlive(go):
+    return
+  iMark("GameObject::get_transform", go)
+  let t = cast[Il2CppPtr](cInspUP(fn, go, nil))
+  if duOk(t, 0x20'i32):
+    result = t
 
 proc iGameObjectOf(p: Il2CppPtr): Il2CppPtr =
   ## The GameObject behind a Component/Transform. Almost everything downstream
@@ -1345,6 +1432,10 @@ proc iGameObjectOf(p: Il2CppPtr): Il2CppPtr =
   iMark("Component::get_gameObject", p)
   let go = cast[Il2CppPtr](cInspUP(fn, p, nil))
   if duOk(go, 0x20'i32):
+    # A GameObject by contract: record its klass so the walker can recognise
+    # and refuse one. This is why the guard is armed even in a session that
+    # never runs `roots`.
+    iNoteGameObject(go)
     result = go
 
 proc iObjName(p: Il2CppPtr): string =
@@ -1376,6 +1467,8 @@ proc iCmdChildren(toks: seq[string]) =
   var t = cast[Il2CppPtr](v)
   if not duOk(t, 0x20'i32):
     iErr("that pointer is not readable; refusing to walk it.")
+    return
+  if iRefuseIfGameObject(t, "children"):
     return
   if not iUnityAlive(t):
     iErr("that object's native half (m_CachedPtr +0x" &
@@ -1620,12 +1713,28 @@ proc iRootsOfHandle(handle: int32; label: string; into: var seq[Il2CppPtr];
     let go = cReadPtrAt(arr, cNavOffArrData() + int32(k * 8))
     if go != nil and duOk(go, 0x20'i32):
       iNoteKlass(go)
-      into.add go
-      if report:
-        iSetVar("r" & $bound, cast[uint64](go))
-        iOut("    [$r" & $bound & "] " & iPtr(go) & " name=\"" &
-             iObjName(go) & "\"   (" & label & ")")
-      inc bound
+      # These are GAMEOBJECTS by contract -- record the klass so the walker can
+      # refuse one if it ever reaches it untranslated.
+      iNoteGameObject(go)
+      # CONVERT TO A TRANSFORM HERE, ONCE, at the boundary. Everything
+      # downstream -- children, tree, parent, find -- operates on Transforms,
+      # so a $rN that meant something different from $c0 or $f1 would be a trap
+      # waiting for someone to walk into it later.
+      let t = iTransformOfGameObject(go)
+      if t == nil:
+        if report:
+          iOut("    [skip] " & iPtr(go) & " name=\"" & iObjName(go) &
+               "\" has no readable Transform")
+      else:
+        iNoteKlass(t)
+        into.add t
+        if report:
+          iSetVar("r" & $bound, cast[uint64](t))
+          iSetVar("rgo" & $bound, cast[uint64](go))
+          iOut("    [$r" & $bound & "] transform=" & iPtr(t) &
+               "  go=" & iPtr(go) & " ($rgo" & $bound & ")" &
+               "  name=\"" & iObjName(t) & "\"   (" & label & ")")
+        inc bound
     inc k
 
 proc iSceneNameOf(handle: int32): string =
@@ -1753,7 +1862,10 @@ proc iCmdRoots(toks: seq[string]) =
          "truth, not a failure to read them.")
     return
   iOut("  " & $n & " root(s) bound to $r0..$r" & $(n - 1) &
-       ". Search one with:  find NAME $r3")
+       " as TRANSFORMS -- the same kind of pointer $c0 and $f1 are, so they " &
+       "go straight into children/tree/parent/find. The GameObject of each is " &
+       "$rgo0..$rgo" & $(n - 1) & " (that is what `component` wants).")
+  iOut("  e.g.  find PvE $r9        or   children $r9")
 
 proc iCmdFind(toks: seq[string]) =
   ## `find NAME [ROOT] [BUDGET]`
@@ -1838,6 +1950,8 @@ proc iCmdFind(toks: seq[string]) =
       iErr(err)
       return
     root = cast[Il2CppPtr](v)
+    if iRefuseIfGameObject(root, "find"):
+      return
     rootExplicit = true
   else:
     root = nil    # no root named: search EVERY scene root (see below)
@@ -1928,6 +2042,8 @@ proc iCmdTree(toks: seq[string]) =
   var root = cast[Il2CppPtr](v)
   if not duOk(root, 0x20'i32):
     iErr("that pointer is not readable; refusing to walk it.")
+    return
+  if iRefuseIfGameObject(root, "tree"):
     return
   root = iToTransform(root)
   if not iUnityAlive(root):
