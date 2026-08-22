@@ -740,6 +740,20 @@ proc swPagesOnTabBuilt(tabPtr: Il2CppPtr; tabName: string; revisit: bool) =
             " on=" & (if gSwPagesOn: "true" else: "false") &
             " off=" & (if gSwOff: "true" else: "false") &
             " pages=" & $gSwPages.len &
+            # THE RE-RENDER DIAGNOSTIC. Rows were observed accumulating -- two
+            # 'aowlspt - host' rows on screen after two tab visits -- while the
+            # "lost its clones" branch never logged, which means the
+            # `renderedFor == tabKey` test was false on the SECOND visit even
+            # though the first visit ended by assigning exactly that. So print
+            # what the registry actually holds on entry: if renderedFor is 0
+            # here after a render, the assignment did not persist into the seq
+            # and the guard can never fire.
+            (if gSwPages.len > 0:
+               " renderedFor=0x" & hexOf(gSwPages[0].renderedFor) &
+               " row0.clone=0x" &
+               (if gSwPages[0].rows.len > 0: hexOf(gSwPages[0].rows[0].clone)
+                else: "-")
+             else: "") &
             " toggleKlass(before census)=0x" & hexOf(gSwKlassToggle)
   if swVisitBlocked():
     if gSwPagesOn and gSwPagesFires <= 8:
@@ -816,6 +830,26 @@ proc swPagesOnTabBuilt(tabPtr: Il2CppPtr; tabName: string; revisit: bool) =
            "' is not rendered (nothing was written)"
       i = i + 1
       continue
-    discard swRenderPage(tabPtr, parentGo, gSwPages[i])
-    gSwPages[i].renderedFor = tabKey
+    # READ, MUTATE, WRITE BACK -- do not mutate `gSwPages[i]` in place.
+    #
+    # `gSwPages[i].renderedFor = tabKey` did not persist. Measured, with the
+    # diagnostic on the entry line above: on the second visit to the same tab
+    # the registry read back `renderedFor=0x0` while `row0.clone` held a live
+    # pointer from the first render. So the row mutations survived and the
+    # scalar assignment did not -- the rows are a `seq`, whose buffer is shared
+    # by every copy, while `renderedFor` is a plain field that a copy owns.
+    # Both `gSwPages[i].field = x` and passing `gSwPages[i]` to a `var`
+    # parameter were operating on a temporary.
+    #
+    # The visible symptom was the whole page being cloned again on every tab
+    # visit -- two 'aowlspt - host' rows on screen after two visits, and the
+    # `renderedFor == tabKey` guard above never able to fire, which is also why
+    # its "lost its clones" branch never appeared in the log.
+    #
+    # This is a nimony/Nim-2 semantic difference, not a logic error, so it is
+    # fixed by not depending on the aliasing at all.
+    var pg = gSwPages[i]
+    discard swRenderPage(tabPtr, parentGo, pg)
+    pg.renderedFor = tabKey
+    gSwPages[i] = pg
     i = i + 1
