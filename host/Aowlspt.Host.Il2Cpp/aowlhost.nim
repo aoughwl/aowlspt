@@ -3883,6 +3883,13 @@ include "debugui.nim"
 ## Defines `swOnTabBuilt` (called from the settings postfix) and `swNoteFault`.
 include "settingswrite.nim"
 
+## PHASE 3 -- a per-mod settings PAGE rendered into the real settings screen, by
+## CLONING stock controls (the only reflection-free way to make a control on this
+## build) and rebinding the clones. Stands on `settingswrite.nim` for the klass
+## census and the label/value primitives, and on `invoke2.nim` for Instantiate /
+## SetParentAndAlign / SetActive. Defines `swPagesOnTabBuilt`.
+include "settingspages.nim"
+
 proc hostEventSubscribe(ctx: Il2CppPtr; name: Il2CppPtr; nameLen: int32;
                         cb: Il2CppPtr; user: Il2CppPtr): int32 {.
     exportc: "aowlspt_nim_event_subscribe", cdecl.} =
@@ -4859,6 +4866,28 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "slider's Slider.m_Value (+0x120) with its range -- and logs each " &
          "beside its label, so the offsets can be checked against what the " &
          "screen actually shows. NO value is written."
+  # PHASE 3 -- the per-mod settings pages. Default OFF, and it needs the same
+  # ShowScreen postfix, so it turns the read probe on with itself for the same
+  # reason Phase 2 does.
+  gSwPagesOn = readBoolKey("settingsPages")
+  if gSwPagesOn and not gSettingsUiProbe:
+    gSettingsUiProbe = true
+    info "settingsPages is set, so settingsUiProbe has been turned on with " &
+         "it -- the pages are rendered from the same ShowScreen postfix the " &
+         "read probe installs."
+  if gSwPagesOn:
+    info "settingsPages is set: PHASE 3. On the Game tab the host renders its " &
+         "own settings page into the REAL settings screen, by CLONING a stock " &
+         "toggle row (UnityEngine.Object::Instantiate + " &
+         "TMP_DefaultControls::SetParentAndAlign, both byte-verified direct " &
+         "calls) once per row, relabelling each clone and seeding it with " &
+         "Toggle::SetIsOnWithoutNotify so the row shows its own value without " &
+         "firing the donor setting's handler. The first page is the aowlspt " &
+         "host's own flags out of aowlspt-host.json; a row the player changes " &
+         "is read back and persisted to that file. Rows that are carried but " &
+         "not yet wired are suffixed '(not done yet)'. Nothing the GAME " &
+         "created is ever written -- only clones the host made itself -- and " &
+         "the whole thing shares the Phase-2 fault budget."
   gMi2Probe = readBoolKey("managedInvokeProbe")
   if gMi2Probe:
     info "managedInvokeProbe is set: a POSTFIX detour on " &

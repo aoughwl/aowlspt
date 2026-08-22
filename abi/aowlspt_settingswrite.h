@@ -168,4 +168,173 @@ static int32_t aowl_sw_off_slider_max(void)   { return AOWL_SW_SLIDER_MAXVALUE; 
 static int32_t aowl_sw_off_slider_whole(void) { return AOWL_SW_SLIDER_WHOLENUM; }
 static int32_t aowl_sw_off_tmp_dirty(void)    { return AOWL_SW_TMP_DIRTY; }
 
+/* ------------------------------------------------------------------ *
+ * PHASE 3 -- the four setters a rendered row needs
+ *
+ * Phase 2 established that a raw value store changes the MODEL and not the
+ * pixels: Unity repaints a Toggle from `Toggle::Set` and a Slider from
+ * `Slider::UpdateVisuals`, and a field store calls neither. For a row the host
+ * itself put on screen that is not good enough -- a cloned control must SHOW
+ * the value it is bound to, not the donor's.
+ *
+ * So Phase 3 stops storing and starts CALLING, by the route
+ * `abi/aowlspt_invoke2.h` already proved on this build: IL2CPP compiles every
+ * managed method to an ordinary native function, so the setter is called
+ * directly at its RVA with IL2CPP's convention (instance in RCX, args after it,
+ * hidden trailing MethodInfo*, floats in XMM by position). No reflection, no
+ * runtime_invoke, no MethodInfo lookup -- and none of these is a shared
+ * generic, so the NULL MethodInfo that the convention note warns about for
+ * generics is safe for every one of them.
+ *
+ * WITHOUT-NOTIFY IS THE POINT. `SetIsOnWithoutNotify` / `SetValueWithoutNotify`
+ * update the control and its visuals but do NOT raise `onValueChanged`. That
+ * matters enormously here: a clone of a stock control inherits the stock
+ * control's listener list, so seeding a cloned FOV row with `set_isOn` would
+ * fire the GAME's own FOV handler with our mod's value. The without-notify
+ * variants are how a row is seeded without the donor's behaviour running.
+ * The user's own click still goes through the game's normal path, which is
+ * exactly what we want -- that is how the edit gets back to us.
+ *
+ * RVAs resolved offline with `tools/il2cpp_resolve.py type <idx>` (Toggle =
+ * 27039, Slider = 27032, both in UnityEngine.UI.dll) and every prologue below
+ * was read straight out of GameAssembly.dll at the mapped file offset. All six
+ * land in the `il2cpp` section, which is the section generated code actually
+ * lives in -- a target that resolved into `.text` would be the wrong function.
+ * ------------------------------------------------------------------ */
+
+#define AOWL_SW_TOGGLE_SET_NONOTIFY   0
+#define AOWL_SW_TOGGLE_SET_ISON       1
+#define AOWL_SW_SLIDER_SET_NONOTIFY   2
+#define AOWL_SW_SLIDER_SET_MIN        3
+#define AOWL_SW_SLIDER_SET_MAX        4
+#define AOWL_SW_SLIDER_UPDATEVISUALS  5
+
+typedef struct AowlSwTarget {
+    const char*   name;
+    uint32_t      rva;
+    unsigned char sig[16];
+    int32_t       siglen;
+} AowlSwTarget;
+
+static const AowlSwTarget aowl_sw_targets[] = {
+    /* UnityEngine.UI.Toggle::SetIsOnWithoutNotify(bool) -- instance, 1 arg.
+     * A three-instruction thunk that zeroes the two extra parameters and
+     * tail-jumps into `Set(bool,bool,bool)`; calling the thunk is calling Set
+     * with the game's own defaults, which is precisely what we want. */
+    { "UnityEngine.UI.Toggle::SetIsOnWithoutNotify", 0x55BA440u,
+      { 0x45,0x33,0xC9,0x45,0x33,0xC0,0xE9,0x05,0x00,0x00,0x00,0xCC,0xCC,
+        0xCC,0xCC,0xCC }, 16 },
+
+    /* UnityEngine.UI.Toggle::set_isOn(bool) -- instance, 1 arg. The NOTIFYING
+     * setter, carried for completeness and NOT used to seed a clone (it would
+     * run the donor's listeners). */
+    { "UnityEngine.UI.Toggle::set_isOn", 0x55BA430u,
+      { 0x45,0x33,0xC9,0x41,0xB0,0x01,0xE9,0x15,0x00,0x00,0x00,0xCC,0xCC,
+        0xCC,0xCC,0xCC }, 16 },
+
+    /* UnityEngine.UI.Slider::SetValueWithoutNotify(float) -- instance, 1 float
+     * arg, which by the convention rides in XMM1 (position 1) with the hidden
+     * MethodInfo* in R8 (position 2). */
+    { "UnityEngine.UI.Slider::SetValueWithoutNotify", 0x55B3420u,
+      { 0x4C,0x8B,0x09,0x45,0x33,0xC0,0x49,0x8B,0x81,0x88,0x04,0x00,0x00,
+        0x4D,0x8B,0x89 }, 16 },
+
+    /* UnityEngine.UI.Slider::set_minValue / set_maxValue(float) -- instance,
+     * 1 float arg. A bound must be widened BEFORE a value outside the donor's
+     * range is set, or the Slider clamps it and the row silently shows the
+     * wrong number. */
+    { "UnityEngine.UI.Slider::set_minValue", 0x55B3250u,
+      { 0x40,0x53,0x48,0x83,0xEC,0x30,0x80,0x3D,0xD4,0x4E,0xB2,0x01,0x00,
+        0x48,0x8B,0xD9 }, 16 },
+    { "UnityEngine.UI.Slider::set_maxValue", 0x55B32D0u,
+      { 0x40,0x53,0x48,0x83,0xEC,0x30,0x80,0x3D,0x55,0x4E,0xB2,0x01,0x00,
+        0x48,0x8B,0xD9 }, 16 },
+
+    /* UnityEngine.UI.Slider::UpdateVisuals() -- instance, 0 args. The repaint
+     * on its own, for the case where the bounds moved but the value did not. */
+    { "UnityEngine.UI.Slider::UpdateVisuals", 0x55B4610u,
+      { 0x48,0x89,0x5C,0x24,0x20,0x57,0x48,0x83,0xEC,0x70,0x80,0x3D,0x17,
+        0x3B,0xB2,0x01 }, 16 },
+};
+
+#define AOWL_SW_TARGET_COUNT \
+    ((int32_t)(sizeof(aowl_sw_targets) / sizeof(aowl_sw_targets[0])))
+
+static int32_t aowl_sw_base_found = 0;
+static int32_t aowl_sw_verified   = 0;
+static int32_t aowl_sw_rejected   = 0;
+
+/* The verified code pointer for one setter, or NULL. Identical discipline to
+ * `aowl_mi2_fn`: the RVA must land in COMMITTED EXECUTABLE memory before the
+ * prologue is compared, because on another build a stale RVA can point at an
+ * uncommitted page where `memcmp` itself would fault. A mismatch returns NULL
+ * and the caller renders nothing rather than calling a wrong function. */
+static void* aowl_sw_fn(int32_t i) {
+    HMODULE ga;
+    const AowlSwTarget* t;
+    unsigned char* p;
+    MEMORY_BASIC_INFORMATION mbi;
+    if (i < 0 || i >= AOWL_SW_TARGET_COUNT) return NULL;
+    ga = GetModuleHandleA("GameAssembly.dll");
+    if (!ga) return NULL;
+    aowl_sw_base_found = 1;
+    t = &aowl_sw_targets[i];
+    p = (unsigned char*)ga + t->rva;
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0) return NULL;
+    if (mbi.State != MEM_COMMIT) return NULL;
+    if (!(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                         PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+        return NULL;
+    if (t->siglen > 0 && memcmp(p, t->sig, (size_t)t->siglen) != 0) {
+        aowl_sw_rejected++;
+        return NULL;
+    }
+    aowl_sw_verified++;
+    return (void*)p;
+}
+static const char* aowl_sw_name(int32_t i) {
+    if (i < 0 || i >= AOWL_SW_TARGET_COUNT) return "";
+    return aowl_sw_targets[i].name;
+}
+static uint32_t aowl_sw_rva(int32_t i) {
+    if (i < 0 || i >= AOWL_SW_TARGET_COUNT) return 0u;
+    return aowl_sw_targets[i].rva;
+}
+static int32_t aowl_sw_target_count(void) { return AOWL_SW_TARGET_COUNT; }
+static int32_t aowl_sw_ok_count(void)  { return aowl_sw_verified; }
+static int32_t aowl_sw_bad_count(void) { return aowl_sw_rejected; }
+
+/* The one call shape `aowlspt_invoke2.h` does not already provide: an instance
+ * method taking a single FLOAT. The float is argument position 1, so it rides
+ * in XMM1, and the hidden MethodInfo* is position 2, so it rides in R8 -- which
+ * is exactly what the C compiler emits for this prototype, which is the whole
+ * reason the thunks are written as typed calls rather than as assembly.
+ *
+ * The value is taken as a double and narrowed here, because Nim's float64 is
+ * what the caller has and an implicit narrowing at the call site is the kind of
+ * thing that is right until someone changes it. */
+static void aowl_sw_call_v_pf(void* fn, void* self, double v) {
+    typedef void (*Fn)(void*, float, void*);
+    if (!fn || !self) return;
+    ((Fn)fn)(self, (float)v, (void*)0);
+}
+
+/* An instance method with a single BOOL argument (position 1 -> DL/RDX, the
+ * MethodInfo* position 2 -> R8). `aowl_mi2_call_v_pb` has this shape already;
+ * it is restated here so the settings writer does not depend on the invoke
+ * ladder's table being armed to use its thunks. */
+static void aowl_sw_call_v_pb(void* fn, void* self, int32_t b) {
+    typedef void (*Fn)(void*, int32_t, void*);
+    if (!fn || !self) return;
+    ((Fn)fn)(self, b ? 1 : 0, (void*)0);
+}
+
+/* An instance method with no arguments at all (MethodInfo* is position 1 ->
+ * RDX). */
+static void aowl_sw_call_v_p(void* fn, void* self) {
+    typedef void (*Fn)(void*, void*);
+    if (!fn || !self) return;
+    ((Fn)fn)(self, (void*)0);
+}
+
 #endif /* AOWLSPT_SETTINGSWRITE_H */

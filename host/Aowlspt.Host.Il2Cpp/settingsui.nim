@@ -360,6 +360,10 @@ proc suiTabInitBody(a: Il2CppPtr): Il2CppPtr {.
   # `settingsRelabelProbe` or `settingsBindProbe` is set, and it disables itself
   # after two faults.
   swOnTabBuilt(tab, gname)
+  # PHASE 3 -- the per-mod settings PAGES, rendered by cloning stock controls.
+  # Same guard, same fault budget, same default-OFF discipline; it renders only
+  # onto the Game tab and only when `settingsPages` is set.
+  swPagesOnTabBuilt(tab, gname)
   return cast[Il2CppPtr](1)
 
 # The VEH/SEH guard thunk, the same mechanism botdiag/botcap use: `aowl_p_p_seh`

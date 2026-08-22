@@ -302,6 +302,113 @@ re-fetches the page so the row shows the value the file kept.
 
 ---
 
+## 6. NATIVE injection, Phase 2 and Phase 3 — writing into the real screen
+
+§1a recorded that native injection is *viable*; Phase 1 then read 78 real
+controls off the live screen (labels decoded, klass pointers censused, widget
+pointers in hand). That proved we can **see** the settings screen. Phases 2 and
+3 are about **changing** it, because the standing requirement has never moved:
+mod configuration belongs in Tarkov's own settings screen, not in our overlay.
+
+Everything below is **default OFF**, rides the ShowScreen postfix the read probe
+already installs (so it costs no extra detour), runs inside that postfix's
+existing `aowl_p_p_seh` guard, and shares one fault budget — two faults and the
+whole write side switches itself off for the session.
+
+### The primitives, and what each one can actually do
+
+| Primitive | Route | Repaints? |
+|---|---|---|
+| Label text | `il2cpp_string_new` → raw store into `TMP_Text.m_text` (+0xE0) → dirty byte (+0x378) | **yes** — TMP repaints from the flag |
+| Toggle value | raw store into `Toggle.m_IsOn` (+0x120) | no — model only |
+| Toggle value | direct call `Toggle::SetIsOnWithoutNotify` @0x55BA440 | **yes**, and fires no listener |
+| Slider value | raw store into `Slider.m_Value` (+0x120) | no — model only |
+| Slider value | direct call `Slider::SetValueWithoutNotify` @0x55B3420 | **yes**, and fires no listener |
+| New control | `Object::Instantiate` + `TMP_DefaultControls::SetParentAndAlign` | **yes** — the only reflection-free way to make one |
+
+The text row is why Phase 2a leads with relabelling: it is the one edit that is
+complete and visible through a primitive already running in production (the
+version brand and the F3 overlay both use it).
+
+**Why clone rather than construct.** The game builds a row with
+`SettingsTab::CreateControl<T>` @0x2B86E20 — one shared-generic body serving
+every `T`, with the `T` carried entirely in the hidden `MethodInfo*`. A shared
+generic is the single documented case where passing NULL for that `MethodInfo`
+is *not* safe, and obtaining a real one needs the metadata reflection that is
+dead on this build. So a row cannot be constructed; it can only be copied.
+
+**Why *without-notify*.** A clone inherits its donor's `onValueChanged`
+listeners. Seeding a cloned row with the notifying setter would run the **game's**
+handler for the stock setting the donor came from, with our mod's value. The
+without-notify variants repaint and stay quiet. The player's own click still
+travels the game's normal path — which is exactly how the edit gets back to us.
+
+### Telling the four widget types apart without reflection
+
+`il2cpp_object_get_class` and `il2cpp_class_get_name` both fault here, so a
+control's type cannot be *asked for* — it is *observed*. The klass pointer at
+`obj+0x00` is stable within one process, and the live census found exactly four
+distinct values across all 78 controls (dropdown 38, toggle 19, float slider 13,
+select slider 8). The absolute values differ per launch, so the host learns them
+per session by matching a control whose stock label is known — `'FOV:'` → float
+slider, `'Enable VoIP'` → toggle, `'Device:'` → dropdown, `'Overall volume:'` →
+select slider — and then types every other control by pointer equality alone.
+
+Every control subclass carries its widget at the **same** offset, `+0xA8`,
+because they all inherit the identical base field run and each declares exactly
+one field of its own — which is why fetching the widget needs no per-type
+dispatch, only interpreting it does.
+
+### The flags
+
+| Flag | Phase | What it does |
+|---|---|---|
+| `settingsRelabelProbe` | 2a | Rewrites the Game tab's `FOV:` row to `FOV: [aowlspt]`. Idempotent — never double-brands. |
+| `settingsBindProbe` | 2b | Reads every recognised control's live value and logs it beside its label. Writes nothing. |
+| `settingsPages` | 3 | Renders the host's own settings page into the Game tab by cloning a stock toggle row per entry. |
+
+Each turns `settingsUiProbe` on with itself, because that flag is what arms the
+hook they all run from.
+
+### Phase 3 — the page framework
+
+A page is a title plus rows; a row is a config key, a label, a kind and a value.
+That is field-for-field the subset of `aowlspt/settings.Setting` (§2) a native
+control can express — which is the point. **The schema layer already exists**:
+every mod declares one with `declareSettings` and serves it at
+`/aowlspt/settings/<guid>`. Phase 3 does not replace it; it adds a *second
+renderer* for it, the native one, alongside the overlay's.
+
+The first shipped page is the host's own flags out of `aowlspt-host.json`,
+because the host can read those without asking anyone — it needs no HTTP and so
+proves the renderer independently of the fetch. Rows that are carried but not
+yet wired are suffixed **`(not done yet)`**, the same honesty `implemented =
+false` already carries in the schema module.
+
+**The seam.** `swPageRegister` takes a fully-formed page and the renderer
+neither knows nor cares where it came from. Turning the other mods' schemas into
+native pages is therefore a fetch and a parse into that one call — wiring, not
+redesign.
+
+**Read-back.** A row the player changes is read off its clone on the next tab
+build and persisted into `aowlspt-host.json` by a key-targeted edit that mirrors
+`readBoolKey`'s shallow scan: find the key, replace the token after the colon,
+put the file back. Nothing else in the file moves.
+
+### What the first live cycle still owes
+
+Phase 2a/2b are read-and-relabel and are as proven as the primitives they reuse.
+Phase 3 renders into a live UI graph and has **not** been through a live cycle
+yet; specifically unverified are where the clones land in the tab's layout
+(they are parented to the tab's own GameObject, reached via
+`SettingsTab._rectTransform` @0x78 → `Component::get_gameObject`, which is
+correct for *being drawn* but may not be the container the layout group drives),
+and whether the clones survive a tab close/reopen. Both fail visibly and
+harmlessly: a mis-parented row is a row in the wrong place, and a destroyed
+clone re-renders on the next build.
+
+---
+
 ## How to test
 
 - **Build the schema API + a migrated mod:**
