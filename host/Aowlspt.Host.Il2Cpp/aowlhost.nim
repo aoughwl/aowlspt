@@ -154,6 +154,30 @@ import invoke
 ## still records its original bytes on first verify, which for an uncontended
 ## target is necessarily before any patch of it exists.
 {.emit: """
+/* Defined further down, after `aowlspt_navui.h` is included by inspect.nim --
+ * that table cannot be named from here, but it CAN be called from here, and a
+ * forward declaration inside one translation unit is all that takes.
+ *
+ * It has to be primed eagerly, and the reason is a measured one. The nav
+ * table's comment used to say the lazy capture was correct for it because
+ * "nothing detours either of these at all". That was false: `settingsui.nim`
+ * installs a postfix detour on `SettingsScreen::ShowScreen` (0x720DE0), which
+ * is nav target #1. So the inspector's FIRST verify of ShowScreen happened
+ * after the settings feature had already patched it, the lazy capture recorded
+ * the TRAMPOLINE as if it were the original, and `open` then rejected a
+ * perfectly correct target with
+ *
+ *     ShowScreen @0x720de0 did not verify -- the prologue does not match
+ *     actual   ff 25 00 00 00 00 ...        <- a JMP: our own detour
+ *     expected 48 89 5c 24 08 ...
+ *
+ * which is precisely the self-rejection this whole file was written to end.
+ * The lazy path's assumption -- "a target's first verify precedes its first
+ * patch" -- only holds for targets patched THROUGH a verify. A feature that
+ * patches by another route breaks it, so a contended target must be primed
+ * here whether or not the contention is obvious. */
+static void aowl_pro_prime_navui(void);
+
 static void aowl_pro_prime_all(void) {
     int32_t i;
     for (i = 0; i < aowl_du_target_count(); i++)  aowl_pro_prime(aowl_du_rva(i));
@@ -170,6 +194,9 @@ static void aowl_pro_prime_all(void) {
     aowl_pro_prime(AOWL_BN_GOTOPOINT_RVA);
     aowl_pro_prime(AOWL_BN_STOPMOVE_RVA);
     aowl_pro_prime(AOWL_BN_SETSPEED_RVA);
+    /* The inspector's UI-navigation targets. ShowScreen among them IS
+     * contended -- see the note on the forward declaration above. */
+    aowl_pro_prime_navui();
 }
 """.}
 {.emit: """#include "aowlspt_detour.h" """.}

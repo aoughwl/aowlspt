@@ -91,12 +91,26 @@
 ## can DRIVE the menu and not only read it. Verified through the prologue
 ## SNAPSHOT and additionally shape-checked against being a do-nothing stub.
 ##
-## Not added to `aowl_pro_prime_all`: that function is emitted long before this
-## file is included, so it cannot name this table. The LAZY capture inside
-## `aowl_pro_verify` is correct here for the documented reason -- a target's
-## first verify necessarily precedes its first patch, and nothing detours
-## either of these at all.
+## PRIMED EAGERLY, and this note used to say the opposite. It said the lazy
+## capture was correct here because "nothing detours either of these at all".
+## That was wrong, and it cost a live diagnosis: `settingsui.nim` puts a
+## postfix detour on `SettingsScreen::ShowScreen`, so by the time the inspector
+## first verified that target the bytes there were our own JMP, the lazy
+## snapshot recorded the trampoline as the original, and `open` refused a
+## correct target while blaming the game build.
+##
+## `aowl_pro_prime_all` is emitted before this file and so cannot NAME this
+## table -- but it can call a function that does, which is what
+## `aowl_pro_prime_navui` below is. It is defined here, where the table is
+## visible, and called from there, where the ordering guarantee lives.
 {.emit: """#include "aowlspt_navui.h" """.}
+{.emit: """
+static void aowl_pro_prime_navui(void) {
+    int32_t i;
+    for (i = 0; i < aowl_nav_target_count(); i++)
+        aowl_pro_prime(aowl_nav_target_rva(i));
+}
+""".}
 proc cNavTargetCount(): int32 {.importc: "aowl_nav_target_count", nodecl.}
 proc cNavFn(i: int32): Il2CppPtr {.importc: "aowl_nav_target_at", nodecl.}
 proc cNavName(i: int32): cstring {.importc: "aowl_nav_target_name", nodecl.}
@@ -1202,6 +1216,45 @@ proc iNoteGameObject(p: Il2CppPtr) =
   if gGoKlass.len < 16:
     gGoKlass.add k
 
+var gTfKlass: seq[uint64] = @[]
+  ## KLASS POINTERS KNOWN TO BE A `UnityEngine.Transform` (or a subclass).
+  ##
+  ## The mirror image of `gGoKlass`, and learned the same way: only from
+  ## sources that return a Transform BY CONTRACT -- `Transform::GetChild`,
+  ## the scene-root walk, and `Component::get_transform`. Never guessed.
+  ##
+  ## Unlike GameObject, Transform is NOT sealed -- RectTransform is the common
+  ## subclass and the game may define more -- so this holds several values and
+  ## is used only as a BLACKLIST: "this is definitely a Transform, and you
+  ## asked for a component". Refusing exactly what is known to be wrong has no
+  ## false negatives, which a Transform whitelist could not promise.
+  ##
+  ## It exists because `children`/`find`/`tree`/`roots` all hand back
+  ## Transforms, so a Transform is what an agent has in hand at the moment it
+  ## reaches for a component verb -- and every component verb reading a
+  ## Transform's fields gets a plausible answer rather than an error.
+
+proc iNoteTransform(p: Il2CppPtr) =
+  ## Record this object's klass as a Transform klass. Only ever called on
+  ## pointers a target returned as a Transform by contract.
+  let k = iKlassOf(p)
+  if k == 0'u64:
+    return
+  for i in 0 ..< gTfKlass.len:
+    if gTfKlass[i] == k:
+      return
+  if gTfKlass.len < 16:
+    gTfKlass.add k
+
+proc iIsTransform(p: Il2CppPtr): bool =
+  let k = iKlassOf(p)
+  if k == 0'u64:
+    return false
+  for i in 0 ..< gTfKlass.len:
+    if gTfKlass[i] == k:
+      return true
+  result = false
+
 proc iIsGameObject(p: Il2CppPtr): bool =
   let k = iKlassOf(p)
   if k == 0'u64:
@@ -1499,6 +1552,8 @@ proc iCmdChildren(toks: seq[string]) =
       iOut("    [" & $i & "] <child not readable>")
     else:
       iNoteKlass(c)
+      # A child from `Transform::GetChild` is a TRANSFORM by contract.
+      iNoteTransform(c)
       let go = iGameObjectOf(c)
       if go != nil:
         iNoteKlass(go)
@@ -1727,6 +1782,8 @@ proc iRootsOfHandle(handle: int32; label: string; into: var seq[Il2CppPtr];
                "\" has no readable Transform")
       else:
         iNoteKlass(t)
+        # `GameObject::get_transform` returns a TRANSFORM by contract.
+        iNoteTransform(t)
         into.add t
         if report:
           iSetVar("r" & $bound, cast[uint64](t))
@@ -2122,6 +2179,25 @@ proc iCmdComponent(toks: seq[string]) =
   if toks.len < 3:
     iErr("usage: component EXPR TypeName   (e.g. component $g0 Button)")
     return
+  # CLEAR `$comp` FIRST, before anything can fail.
+  #
+  # It used to keep its previous value when a lookup failed, and that is the
+  # single most dangerous thing this instrument has done. A batch reading
+  #
+  #     component <node> Button      -> NULL, "this is an ANSWER, not a crash"
+  #     click $comp                  -> pressed the PREVIOUS batch's component
+  #
+  # does not look wrong. It looks like an answer followed by an action, and the
+  # action reports a full Button field readout -- interactable, m_OnClick -- of
+  # an object that is not a Button and was never asked for. That was observed
+  # THREE times in one session: twice pressing a TMP_Text left over from an
+  # earlier batch, and once printing a complete, entirely fictional field map
+  # of a Button that does not exist. Every one of those readouts was plausible.
+  #
+  # So a failed lookup now leaves `$comp` UNBOUND, and every consumer of an
+  # unbound anchor refuses. The rule is that a stale answer must never be
+  # reachable through a name whose lookup just failed.
+  iSetVar("comp", 0'u64)
   var v = 0'u64
   var err = ""
   if not iEval(toks[1], v, err):
@@ -2229,8 +2305,30 @@ proc iCmdLabel(toks: seq[string]) =
     iErr(err)
     return
   let p = cast[Il2CppPtr](v)
+  if iRefuseIfGameObject(p, "label"):
+    return
   if not duOk(p, 0xE8'i32):
     iErr("not readable to +0xE8, so it cannot be a TMP_Text.")
+    return
+  # A TRANSFORM IS READABLE TO +0xE8 TOO, and that is the trap.
+  #
+  # `label <transform>` used to print `m_text(+0xE0) = <some pointer>` and
+  # `text = ""` -- a complete, well-formed, entirely meaningless answer, and
+  # "the label is empty" is a conclusion someone then acts on. It happened on
+  # this build while hunting the version label: the real text was
+  # "1.1.0.1.46777 | PvE" on a TextMeshProUGUI one hop away, and the empty
+  # string came from reading +0xE0 of the TRANSFORM.
+  #
+  # `children`, `find`, `tree` and `roots` all hand back TRANSFORMS, so that is
+  # the overwhelmingly likely thing to be holding. Refuse it by klass identity,
+  # learned by contract from those same walkers -- never guessed.
+  if iIsTransform(p):
+    iErr("that is a TRANSFORM (klass " & iPtrU(iKlassOf(p)) & "), not a " &
+         "TMP_Text. +0xE0 on a Transform is unrelated memory and reading it " &
+         "yields a plausible-looking empty string -- which reads as \"the " &
+         "label is empty\" and is not an answer at all. `children`, `find`, " &
+         "`tree` and `roots` all return Transforms. Resolve the text " &
+         "component first:  component " & toks[1] & " TextMeshProUGUI")
     return
   let sp = cReadPtrAt(p, 0xE0'i32)
   if iIsKnownKlass(cast[uint64](sp)):
@@ -2243,6 +2341,96 @@ proc iCmdLabel(toks: seq[string]) =
     iOut("  (null -- the label has no text object yet)")
     return
   iOut("  text = \"" & suiReadString(sp) & "\"")
+
+proc iCmdSetText(toks: seq[string]) =
+  ## `settext EXPR TEXT...` -- WRITE a label's text, through the game's own
+  ## setters, and then read it back.
+  ##
+  ## The inspector could already read every label in the game and change none
+  ## of them, and that asymmetry cost real cycles: the only way to try a text
+  ## change was to edit the host, rebuild, deploy and relaunch -- the exact
+  ## loop this instrument exists to abolish -- and the first four attempts at
+  ## the version label all failed for reasons that a single live write would
+  ## have shown in seconds.
+  ##
+  ## IT DOES NOT POKE `m_text` AND HOPE. A raw store into `m_text` appears to
+  ## work and is then silently clobbered, because `LocalizedText` re-applies
+  ## its own string on the next locale pass. So this reuses `swRelabelControl`
+  ## -- the routine `settingsRelabelProbe` already proves on this build -- which
+  ## calls `LocalizedText::SetLabelText` first, then `TMP_Text::set_text` plus
+  ## the real `set_havePropertiesChanged` repaint latch, and only falls back to
+  ## a raw store when neither setter verified. `control` is nil here because a
+  ## plain label is not a SettingControl; that route simply declines and the
+  ## TMP route does the work.
+  ##
+  ## AND IT VERIFIES BY READING BACK. "The setter returned" is not evidence.
+  ## The text is read before and after and both are printed, so a write that
+  ## was accepted and then reverted is visible as itself rather than as
+  ## success.
+  if toks.len < 3:
+    iErr("usage: settext EXPR TEXT...   (EXPR is a TMP_Text component, not a " &
+         "Transform -- resolve it with `component $gN TextMeshProUGUI`)")
+    return
+  if not iNavGate("settext"):
+    return
+  var v = 0'u64
+  var err = ""
+  if not iEval(toks[1], v, err):
+    iErr(err)
+    return
+  if v == 0'u64:
+    iErr("settext was given a NULL pointer" &
+         (if toks[1].len > 1 and toks[1][0] == '$':
+            " -- the anchor " & toks[1] & " is NOT BOUND"
+          else: "") & ". Nothing was written.")
+    return
+  let p = cast[Il2CppPtr](v)
+  if iRefuseIfGameObject(p, "settext"):
+    return
+  if iIsTransform(p):
+    iErr("that is a TRANSFORM (klass " & iPtrU(iKlassOf(p)) & "), not a " &
+         "TMP_Text -- writing text at +0xE0 of a Transform would store a " &
+         "String pointer into unrelated memory. Resolve the text component " &
+         "first:  component " & toks[1] & " TextMeshProUGUI")
+    return
+  if not duOk(p, 0xE8'i32):
+    iErr("not readable to +0xE8, so it cannot be a TMP_Text. Nothing was " &
+         "written.")
+    return
+  if not iUnityAlive(p):
+    iErr("that component's native half is NULL (destroyed object). Nothing " &
+         "was written.")
+    return
+  # Everything after the pointer is the text, spaces preserved, so a label can
+  # contain them without quoting rules nobody will remember.
+  var text = ""
+  var i = 2
+  while i < toks.len:
+    if i > 2:
+      text.add " "
+    text.add toks[i]
+    i = i + 1
+  let before = suiReadString(cReadPtrAt(p, 0xE0'i32))
+  iOut("  before = \"" & before & "\"")
+  iMark("settext: swRelabelControl", p)
+  let ok = swRelabelControl(cast[Il2CppPtr](0), p, text)
+  if not ok:
+    iErr("no write route succeeded -- neither LocalizedText::SetLabelText nor " &
+         "TMP_Text::set_text verified, and the raw m_text slot was not safely " &
+         "writable. The label is exactly as the game left it.")
+    return
+  iOut("  routes  = " & gSwLastRoutes)
+  let after = suiReadString(cReadPtrAt(p, 0xE0'i32))
+  iOut("  after  = \"" & after & "\"")
+  if after == text:
+    iOut("  VERIFIED: the label now reads what was asked for.")
+  elif after == before:
+    iOut("  !! the write was accepted but the text is UNCHANGED. Something " &
+         "re-applied the old string -- LocalizedText does exactly that on a " &
+         "locale pass. Re-apply from a per-frame hook if it has to survive.")
+  else:
+    iOut("  !! the text changed but is not what was asked for -- the game " &
+         "rewrote it between the store and this read.")
 
 proc iCmdClick(toks: seq[string]; useInvoke: bool) =
   ## `click PTR` -- EFT's own path: `Button::Press`, which re-checks IsActive
@@ -2267,7 +2455,18 @@ proc iCmdClick(toks: seq[string]; useInvoke: bool) =
   if not iEval(toks[1], v, err):
     iErr(err)
     return
+  if v == 0'u64:
+    var why = ""
+    if toks[1].len > 1 and toks[1][0] == '$':
+      why = " -- the anchor " & toks[1] & " is NOT BOUND. A `component` " &
+            "lookup that fails now leaves $comp unbound rather than stale, " &
+            "and this is that guard speaking: resolve the component first, " &
+            "and check that the lookup above actually said FOUND."
+    iErr(verb & " was given a NULL pointer" & why & ". Nothing was called.")
+    return
   let btn = cast[Il2CppPtr](v)
+  if iRefuseIfGameObject(btn, verb):
+    return
   if not duOk(btn, cNavOffOnClick() + 8'i32):
     iErr("that pointer is not readable to +0x" &
          iHexPad(uint64(cNavOffOnClick()), 3) & ", so it cannot be a Button. " &
@@ -2298,6 +2497,34 @@ proc iCmdClick(toks: seq[string]; useInvoke: bool) =
   # +0x100 holds something we have already seen as the TYPE of another object,
   # we are reading the wrong kind of object and must say so instead of
   # continuing to describe it as `m_OnClick`.
+  # THE SECOND TYPE-CONFUSION CHECK, and the one that costs a real escape.
+  #
+  # The check below catches a KLASS pointer in the m_OnClick slot. It does not
+  # catch an ordinary OBJECT of the wrong type, and that is the case that
+  # actually got through: on EFT's `DefaultUIButton`, +0x100 holds a
+  # GAMEOBJECT. It is not a klass pointer, so the check below passed it, and
+  # `UnityEvent::Invoke` was called on a GameObject. The batch ESCAPED its
+  # guard -- caught, the game survived, but the whole batch died.
+  #
+  # `DefaultUIButton` is where this comes from, and it is worth stating
+  # plainly because it governs every EFT control: it is NOT a
+  # `UnityEngine.UI.Button`. Measured, not assumed -- `GetComponent("Button")`
+  # and `GetComponent("Selectable")` both return NULL on it while
+  # `GetComponent("MonoBehaviour")` returns it, and Unity's string overload
+  # DOES match base type names (that same probe proves it). So Button's field
+  # layout is meaningless on every button in this game's menus, and this
+  # refuses instead of reading it.
+  if iIsGameObject(onClick):
+    iErr("TYPE CONFUSION: the value at +0x" &
+         iHexPad(uint64(cNavOffOnClick()), 3) & " (" & iPtr(onClick) &
+         ") is a GAMEOBJECT, not a UnityEvent -- so this component does not " &
+         "have UnityEngine.UI.Button's field layout and is NOT a Button. " &
+         "EFT's own controls (DefaultUIButton and friends) are plain " &
+         "MonoBehaviours, not Buttons: GetComponent(\"Button\") and " &
+         "GetComponent(\"Selectable\") both return NULL on them. Nothing was " &
+         "called -- calling UnityEvent::Invoke on this pointer is what made " &
+         "an earlier batch escape its guard.")
+    return
   if iIsKnownKlass(cast[uint64](onClick)):
     iErr("TYPE CONFUSION: the value at +0x" &
          iHexPad(uint64(cNavOffOnClick()), 3) & " (" & iPtr(onClick) &
@@ -2793,6 +3020,7 @@ proc iCmdHelp() =
   iOut("                                  e.g.  component $g0 Button   -> $comp")
   iOut("    rect EXPR                     RectTransform geometry probe")
   iOut("    label EXPR                    TMP_Text.m_text as a field read")
+  iOut("    settext EXPR TEXT...          WRITE a label, via the real setters")
   iOut("                                  e.g.  find PvE")
   iOut("    click EXPR                    Button::Press (checks interactable)")
   iOut("                                  e.g.  allow write | click $f1")
@@ -2952,6 +3180,8 @@ proc iExec(line: string) =
     iCmdRect(toks)
   of "label":
     iCmdLabel(toks)
+  of "settext":
+    iCmdSetText(toks)
   of "click":
     iCmdClick(toks, false)
   of "invoke":
