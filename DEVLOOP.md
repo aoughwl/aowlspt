@@ -14,6 +14,7 @@ timed with a stopwatch around the real command.
 | what | command | time |
 |---|---|---|
 | **full build, cold worktree** | `aowl build` | **18 min 25 s** (1104.7 s, ≈25 compiles, strictly serial) |
+| full build, warm, one file changed | `aowl build` | **4 min 27 s** (267.4 s) |
 | **host DLL after a one-line edit** | `aowl build host` | **48 s** |
 | host DLL, nothing changed | `aowl build host` | **0.39 s** |
 | `aowl.exe` cold | `aowl bootstrap` | 30.2 s |
@@ -23,6 +24,10 @@ timed with a stopwatch around the real command.
 **The headline: 48 s instead of 18 min 25 s — 23× — for the single most
 common change in this project.** That is what `aowl build host` buys, and the
 only reason it was not available is that nobody had written the case label.
+
+Even against a *warm* full build it is 5.6× (48 s vs 4 min 27 s), and that
+warm figure is the honest everyday comparison: 4 of those 4½ minutes are
+twenty-four other programs being checked and found already correct.
 
 Three conclusions, and every tool here follows from one of them.
 
