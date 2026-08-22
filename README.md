@@ -181,6 +181,12 @@ tests/fixtures           a small database the emulator tests buy things out of
 
 ## The edit loop
 
+**See [DEVLOOP.md](DEVLOOP.md) first** for the client-side loop — the fast path
+for "I changed one host file", the deploy check that refuses to ship a binary
+with a feature missing, launching and capturing a run without a human, and
+reading the host log. The rest of this section is the *mod* loop, which is the
+fast one and always has been.
+
 `aowl` is itself a nimony program: the thing that compiles a nimony mod is
 written in the language it compiles. The point of `aowlspt-sim` is that this
 takes about a second:

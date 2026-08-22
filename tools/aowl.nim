@@ -30,7 +30,13 @@ import aowlsptinstall/[winfs, log]
 const Usage = """
 aowl -- build, test and install aowlspt
 
-  build              hosts, installer and every example
+  build              hosts, installer and every example (~25 compiles, slow)
+  build TARGET       just one: host backend sim launch installer emutest
+                     verify probe mods examples deploy
+                     `deploy` = the four artifacts a live install takes
+  bootstrap          rebuild aowl.exe ITSELF -- `build` never does, and a
+                     worktree with no aowl.exe or a stale one runs old code
+                     while reporting ok
   build-mod PATH     compile one nimony mod into a native library
   build-hosts        aowlspt-sim (nimony) and the .NET tools left
   build-installer    aowlspt-install.exe
@@ -864,8 +870,152 @@ proc dropStaleCaches(e: Env) =
   discard ensureDir(joinPath(joinPath(e.repo, "installer"), "build"))
   discard writeTextFile(stampPath, now)
 
+proc textStamp(path: string): string =
+  ## A content hash of one file, in the same djb2 shape `abiStamp` uses and for
+  ## the same reason: a checkout or a revert restores old bytes with a new
+  ## timestamp, so "the same bytes as last time" is the question worth asking,
+  ## not "touched since".
+  var text = ""
+  if not readTextFile(path, text):
+    return ""
+  var h = 5381
+  for ch in text:
+    h = ((h * 33) + ord(ch)) and 0x3FFFFFFF
+  result = $h
+
+proc driverStampPath(e: Env): string =
+  result = joinPath(e.repo, "installer\\build\\.aowlstamp")
+
+proc driverSource(e: Env): string =
+  result = joinPath(e.repo, "tools\\aowl.nim")
+
+proc warnStaleDriver(e: Env) =
+  ## The trap this exists for, which has cost real time more than once:
+  ##
+  ## **`aowl build` does not build `aowl.exe`.** Nothing does -- there is no
+  ## target for it anywhere, and `installer/build/` is gitignored. So a fresh
+  ## worktree has *no* driver at all, and a worktree whose `aowl.exe` was
+  ## copied in from somewhere else has a driver from a different commit. Edit
+  ## `tools/aowl.nim` -- add a target, change a copy step, fix a staging bug --
+  ## run `aowl build`, and every one of the sixteen mods reports `ok` while the
+  ## change you made did not run. The build is a success and the edit did not
+  ## ship. Nothing anywhere says so.
+  ##
+  ## `aowl bootstrap` is the fix; this is the detector.
+  let exe = joinPath(e.repo, "installer\\build\\aowl.exe")
+  let now = textStamp(driverSource(e))
+  if now.len == 0:
+    return
+  var was = ""
+  discard readTextFile(driverStampPath(e), was)
+  if not fileExists(exe):
+    warn "there is no installer\\build\\aowl.exe in this worktree"
+    note "run `aowl bootstrap` -- `aowl build` never builds the driver itself"
+    return
+  if was != now:
+    warn "tools\\aowl.nim has changed since aowl.exe was last built"
+    note "this build is running the OLD driver; your change to it is not in it"
+    note "run `aowl bootstrap`, then build again"
+
+proc cmdBootstrap(e: Env): int =
+  ## Rebuild `aowl.exe` itself.
+  ##
+  ## The running image cannot be overwritten, but it can be *renamed* -- so the
+  ## new driver is compiled beside it and then swapped in by two renames, which
+  ## works whether or not this process is the one being replaced.
+  let outDir = joinPath(e.repo, "installer\\build")
+  discard ensureDir(outDir)
+  let exe = joinPath(outDir, "aowl.exe")
+  let nextExe = joinPath(outDir, "aowl-next.exe")
+  let oldExe = joinPath(outDir, "aowl.exe.old")
+  discard removeFileAt(nextExe)
+
+  var cmd = quoted(nimonyExe(e))
+  cmd.add " c"
+  cmd.add abiInclude(e)
+  cmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
+  cmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
+  cmd.add " -o:" & quoted(nextExe)
+  cmd.add " " & quoted(driverSource(e))
+  if not run(e, "aowl.exe", cmd, e.repo):
+    return 1
+  if not fileExists(nextExe):
+    err "the compile reported success but produced no aowl-next.exe"
+    return 1
+
+  if fileExists(exe):
+    discard removeFileAt(oldExe)
+    let moved = replaceFileAt(exe, oldExe)
+    if not moved.ok:
+      err "could not move the running aowl.exe aside (error " & $moved.err & ")"
+      note "the new driver is at " & nextExe & "; rename it by hand"
+      return 1
+  let placed = replaceFileAt(nextExe, exe)
+  if not placed.ok:
+    err "could not put the new aowl.exe in place (error " & $placed.err & ")"
+    return 1
+  discard writeTextFile(driverStampPath(e), textStamp(driverSource(e)))
+  ok "aowl.exe rebuilt"
+  note "the copy that is running is still the old one; the next invocation is new"
+  result = 0
+
+proc cmdBuildOne(e: Env; target: string): int =
+  ## One named target, for the loop that dominates a working day: change one
+  ## file, rebuild the one thing that contains it.
+  ##
+  ## `aowl build` runs about twenty-five compiles in series and is the right
+  ## command exactly once -- before a release, or after an ABI header changes.
+  ## For everything else it is dead time, and the measurement is stark: the
+  ## host DLL alone is a fraction of a full build, and a rebuild with nothing
+  ## changed is a fraction of a second, because nimony's incremental cache is
+  ## very good. What was missing was a way to *ask* for one target.
+  dropStaleCaches(e)
+  warnStaleDriver(e)
+  case target
+  of "host", "il2cpp":
+    result = if buildIl2CppHost(e): 0 else: 1
+  of "backend":
+    result = if buildBackend(e): 0 else: 1
+  of "sim":
+    result = if buildHosts(e): 0 else: 1
+  of "launch", "launcher":
+    result = if buildTool(e, "tools\\aowllaunch.nim", "aowlspt-launch.exe",
+                          "aowlspt-launch"): 0 else: 1
+  of "installer":
+    result = if buildInstaller(e): 0 else: 1
+  of "emutest":
+    result = if buildEmuTest(e): 0 else: 1
+  of "verify":
+    result = if buildVerifyInstall(e): 0 else: 1
+  of "probe":
+    result = if buildProbe(e): 0 else: 1
+  of "mods":
+    for m in modDirs(e):
+      discard buildMod(e, m)
+    result = if failures > 0: 1 else: 0
+  of "examples":
+    for m in exampleDirs(e):
+      discard buildMod(e, m)
+    result = if failures > 0: 1 else: 0
+  of "deploy":
+    # The four artifacts that actually go into a live install, and nothing
+    # else. This is the build that precedes `python tools\deploy.py deploy`.
+    discard buildIl2CppHost(e)
+    discard buildMod(e, joinPath(e.repo, "mods\\tarkov"))
+    discard buildBackend(e)
+    discard buildTool(e, "tools\\aowllaunch.nim", "aowlspt-launch.exe",
+                      "aowlspt-launch")
+    result = if failures > 0: 1 else: 0
+  else:
+    err "unknown build target: " & target
+    note "targets: host backend sim launch installer emutest verify probe " &
+         "mods examples deploy"
+    note "or a mod path, with `aowl build-mod mods\\tarkov`"
+    result = 1
+
 proc cmdBuild(e: Env): int =
   dropStaleCaches(e)
+  warnStaleDriver(e)
   heading "Simulator"
   discard buildHosts(e)
   discard buildDotnetTools(e)
@@ -2524,7 +2674,9 @@ proc main(): int =
   note "nimony  " & e.nimony
 
   case command
-  of "build": result = cmdBuild(e)
+  of "build":
+    result = if arg.len == 0: cmdBuild(e) else: cmdBuildOne(e, arg)
+  of "bootstrap": result = cmdBootstrap(e)
   of "build-mod":
     if arg.len == 0:
       fatal "build-mod needs a path"
