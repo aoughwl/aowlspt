@@ -166,6 +166,11 @@ const
   InspMaxDumpBytes = 512     ## bytes one `dump`/`fields`/`scan` may touch
   InspMaxWalk      = 24      ## hops one `parent` walk may take
   InspMaxLineLen   = 400     ## characters kept per output line
+  InspStuckMs      = 8000'u64
+    ## How long a handed-over batch may sit undrained before the channel gives
+    ## up on it and publishes a diagnosis. A batch normally runs on the very
+    ## next frame; seconds means nothing is running it at all, and a silent
+    ## wedge is the one failure this instrument must never have.
 
 var gInspOn = false          ## the `liveInspector` flag
 var gInspWriteOn = false     ## the `liveInspectorWrite` flag
@@ -196,6 +201,9 @@ var gInspPreloader: Il2CppPtr = nil
 
 var gInspLastText = ""       ## last command-file content, so an unchanged file costs nothing
 var gInspNextPollMs = 0'u64
+var gInspHandedMs = 0'u64
+  ## When the current batch was handed to Unity's thread, so a batch nobody
+  ## drains times out with an explanation instead of wedging the channel.
 var gInspCmdPath = ""
 var gInspOutPath = ""
 var gInspGreeted = false
@@ -1517,6 +1525,7 @@ proc inspectPoll(now: uint64) =
   if done >= 0 and done == gInspBatch and cInspHave() == 0'i32 and
      gInspOut.len > 0:
     inspWriteOut()
+    gInspHandedMs = 0'u64
     cInspLock()
     gInspBatchDone = -1
     gInspOut = @[]
@@ -1525,7 +1534,35 @@ proc inspectPoll(now: uint64) =
     return
   gInspNextPollMs = now + 250'u64
   if cInspHave() != 0'i32:
-    return                     # Unity still has the last batch
+    # Unity still has the last batch -- normally for a frame or two. If it has
+    # had it for seconds, nothing is draining it, and the channel would
+    # otherwise WEDGE SILENTLY: every later edit to the command file would be
+    # ignored with no explanation, which is the exact failure mode this whole
+    # instrument exists to abolish. So it times out and says why.
+    if gInspHandedMs != 0'u64 and now - gInspHandedMs > InspStuckMs:
+      cInspSetPending(0'i32)
+      gInspHandedMs = 0'u64
+      cInspLock()
+      gInspOut = @[]
+      gInspOutBytes = 0
+      cInspUnlock()
+      iOut("aowlspt live inspector -- batch " & $gInspBatch &
+           " was never picked up by Unity's thread within " &
+           $int(InspStuckMs div 1000'u64) & "s.")
+      iOut("  The commands did NOT run. The usual cause is that the inspector " &
+           "is not armed: it rides EFT.UI.PreloaderUI::Update, and if neither " &
+           "the F3 overlay nor uxMenuModeText claimed that function and it did " &
+           "not verify on this build, there is nothing to run from.")
+      iOut("  Check the host log for a line starting 'live inspector armed'. " &
+           "If the client is still on a loading screen, PreloaderUI::Update is " &
+           "not ticking yet -- reach the menu and edit the file again.")
+      iOut("  inspector slot = " & $gInspSlot &
+           " (-1 means nothing is armed)")
+      inspWriteOut()
+      cInspLock()
+      gInspOut = @[]
+      cInspUnlock()
+    return
   var text = ""
   if not readShared(gInspCmdPath, text):
     return
@@ -1551,6 +1588,7 @@ proc inspectPoll(now: uint64) =
   gInspBatchDone = -1
   cInspUnlock()
   cInspSetPending(1'i32)
+  gInspHandedMs = now
   info "live inspector: batch " & $gInspBatch & " (" & $cmds.len &
        " command(s)) handed to Unity's thread; answers land in " & gInspOutPath
 
