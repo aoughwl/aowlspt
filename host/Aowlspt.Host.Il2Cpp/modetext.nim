@@ -261,21 +261,25 @@ proc bindModeText(verbose: bool): bool =
   ## does not match binds nothing at all, so this is a no-op elsewhere rather
   ## than a hazard.
   ##
-  ## MUTUALLY EXCLUSIVE WITH THE DEBUG OVERLAY, and it must be: `debugui` (kind
-  ## 10) drains the SAME function, `EFT.UI.PreloaderUI::Update` @ 0x1569f20.
-  ## Two detours on one function have the second overwrite the first's
-  ## trampoline, which is the precise failure `bindDebugEspWorld` already
-  ## refuses for `GameWorld::RegisterPlayer`. Same rule here, same reason, and
-  ## the overlay wins because it was armed first and is the bigger feature.
+  ## SHARES `EFT.UI.PreloaderUI::Update` WITH THE DEBUG OVERLAY rather than
+  ## excluding it. `debugui` (kind 10) drains the SAME function @ 0x1569f20, and
+  ## two detours on one function have the second overwrite the first's
+  ## trampoline -- the precise failure `bindDebugEspWorld` refuses for
+  ## `GameWorld::RegisterPlayer`. But refusing is not the only answer to that:
+  ## `bindDebugEspWorld`'s own comment names the better one -- when the other
+  ## feature owns the target, ride on ITS firing instead of installing a second
+  ## detour. That is what happens here. If the overlay already claimed the slot,
+  ## this ALIASES `gModeTextSlot` onto it and `patchFired`/`patchReturned`
+  ## dispatch both riders from the one detour. So `debugUi`/`debugEsp` and
+  ## `uxMenuModeText` can all be on at once.
+  ##
+  ## The alias is only taken when the code pointer this feature verified is
+  ## BYTE-IDENTICAL to the one the overlay hooked. Riding on a detour that is
+  ## actually on some other function would feed `modeTextUpdateFired` an RCX
+  ## that is not a `PreloaderUI`, and every read after that would be a guess.
   if gModeTextSlot >= 0:
     return true
   if not gReady or gDisableDrain:
-    return false
-  if gDebugUiSlot >= 0:
-    warn "menu mode text: the F3 debug overlay already drains " &
-         "EFT.UI.PreloaderUI::Update, and two detours on one function would " &
-         "have the second overwrite the first's trampoline. Not binding. " &
-         "Turn off debugUi to use uxMenuModeText."
     return false
   let fn = cMtxFn(MtxTUpdate)
   if fn == nil:
@@ -292,6 +296,25 @@ proc bindModeText(verbose: bool): bool =
            " @ 0x" & hexOf(uint64(cMtxRva(MtxTSetText))) &
            " did not verify; nothing bound"
     return false
+  # THE MULTIPLEX. The overlay armed first (aowlhost arms it first), so the
+  # normal path when both are on is this one: no second detour, no second
+  # trampoline, one shared firing.
+  if gDebugUiSlot >= 0:
+    let duFn = cDuPreloaderTarget()
+    if duFn != fn:
+      warn "menu mode text: the F3 debug overlay holds a detour whose target " &
+           "(0x" & hexOf(cast[uint64](duFn)) & ") is not the " &
+           "PreloaderUI::Update this feature verified (0x" &
+           hexOf(cast[uint64](fn)) & "). Refusing to ride on it, and refusing " &
+           "to add a second detour to the same function. Nothing bound."
+      return false
+    gModeTextSlot = gDebugUiSlot
+    okLog "menu mode text armed as a RIDER on the debug overlay's existing " &
+          "EFT.UI.PreloaderUI::Update detour (slot " & $gModeTextSlot &
+          ") -- one detour, one trampoline, both features live. The " &
+          "bottom-right corner label follows the backend's `menuModeText`, " &
+          "which defaults to the logged-in character's name"
+    return true
   if attachDrain("EFT.UI.PreloaderUI::Update", fn, cast[Il2CppMethod](0),
                  false, verbose, 13'i32, true):
     okLog "menu mode text armed on EFT.UI.PreloaderUI::Update (postfix); the " &

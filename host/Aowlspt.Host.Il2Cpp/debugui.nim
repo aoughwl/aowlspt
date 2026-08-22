@@ -1712,6 +1712,28 @@ proc bindDebugUi(verbose: bool): bool =
       info "debugui: EFT.UI.PreloaderUI::Update @ 0x" &
            hexOf(uint64(cDuPreloaderRva())) & " did not verify on this build"
     return false
+  # THE SHARED `PreloaderUI::Update` HOOK, from the other side. The menu
+  # mode-text feature (kind 13) drains the same function; two detours on one
+  # function would have the second overwrite the first's trampoline. aowlhost
+  # arms the overlay first, so this branch is the unusual order -- but when
+  # mode-text did get there first, the overlay rides on ITS detour rather than
+  # installing a second one, and `patchFired`/`patchReturned` dispatch both.
+  # Aliased only on a byte-identical target, for the same reason `bindModeText`
+  # checks: riding a detour on some other function would hand `debugUiFired` an
+  # RCX that is not a PreloaderUI.
+  if gModeTextSlot >= 0:
+    if cMtxFn(0'i32) != fn:
+      warn "debugui: the menu mode-text feature holds a detour on a different " &
+           "target than the PreloaderUI::Update this verified; refusing to " &
+           "ride on it and refusing to double-detour. The overlay is not armed."
+      return false
+    gDebugUiSlot = gModeTextSlot
+    okLog "debugui armed as a RIDER on the menu mode-text feature's existing " &
+          "EFT.UI.PreloaderUI::Update detour (slot " & $gDebugUiSlot &
+          ") -- one detour, one trampoline, both features live. Press " &
+          (if gDuCfg.toggleVk == 0x72: "F3" else: "VK " & $gDuCfg.toggleVk) &
+          " in game to show the panel."
+    return true
   if attachDrain("EFT.UI.PreloaderUI::Update", fn, cast[Il2CppMethod](0),
                  true, verbose, 10'i32):
     okLog "debugui armed on EFT.UI.PreloaderUI::Update (per-frame, Unity " &

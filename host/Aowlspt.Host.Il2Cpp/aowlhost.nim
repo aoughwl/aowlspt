@@ -1143,10 +1143,14 @@ var gDebugEsp = false
 ## first build of this feature failed on. Everything else about the feature --
 ## the state machine, the guarded body and the bind -- is in `modetext.nim`.
 ##
-## Mutually exclusive with `gDebugUiSlot` above, and for the identical reason
-## stated there: both drain `EFT.UI.PreloaderUI::Update`, and two detours on one
-## function have the second overwrite the first's trampoline. The overlay is
-## armed first and wins; `bindModeText` checks and refuses.
+## SHARES ITS DETOUR WITH `gDebugUiSlot` ABOVE. Both features want
+## `EFT.UI.PreloaderUI::Update`, and two detours on one function have the second
+## overwrite the first's trampoline -- so there is exactly ONE detour on it.
+## Whichever feature arms first claims a slot; the other sets ITS slot global to
+## the SAME number and rides on the one firing. `gDebugUiSlot == gModeTextSlot`
+## is therefore the normal, correct state when both are enabled, and the two
+## dispatch points in `patchFired`/`patchReturned` call every rider whose slot
+## matches rather than picking one. Neither feature excludes the other any more.
 var gModeTextSlot = -1
 var gModeTextOn = false
 
@@ -2725,8 +2729,22 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
   # THE DEBUG OVERLAY, by identity and before anything generic: it fires once a
   # frame, so it must not walk the patch table to find itself. It draws into UI
   # objects it cloned and never suppresses PreloaderUI's own Update.
-  if i == gDebugUiSlot:
-    debugUiFired(regs)
+  #
+  # THIS IS THE SHARED `EFT.UI.PreloaderUI::Update` HOOK. The debug overlay and
+  # the menu mode-text feature both want that function, and two detours on one
+  # function have the second overwrite the first's trampoline. So there is only
+  # ever ONE detour on it: whichever feature arms first claims the slot, and the
+  # other rides on it by ALIASING its own slot global to the same number (see
+  # `bindDebugUi` / `bindModeText`). Dispatch is therefore "call every rider
+  # whose slot matches", not "else if" -- when both are on, `gDebugUiSlot ==
+  # gModeTextSlot` and both handlers run from this one firing. A slot global
+  # that is still -1 can never match a claimed slot, so a feature that is off
+  # costs one integer compare. Neither handler ever suppresses the original.
+  if i == gDebugUiSlot or i == gModeTextSlot:
+    if i == gDebugUiSlot:
+      debugUiFired(regs)
+    if i == gModeTextSlot:
+      modeTextUpdateFired(regs)
     return 0'i32
   # The overlay's GameWorld cache: one register read, nothing walked, never a
   # suppression of RegisterPlayer.
@@ -2823,8 +2841,20 @@ proc patchReturned(slot: int32; regs: Il2CppPtr): int32 {.
   # The menu mode-text postfix, by identity and for the same reason: a host
   # drain (meth == nil) on `PreloaderUI::Update`. Returns 0 -- it never changes
   # what the caller gets, it only calls a setter the game already has.
-  if i == gModeTextSlot:
-    modeTextUpdateFired(regs)
+  #
+  # The SHARED `PreloaderUI::Update` hook again, mirrored from `patchFired`. The
+  # engine routes a given slot to exactly one of the two halves depending on the
+  # postfix flag it was attached with, so at most one of these two dispatch
+  # points ever fires for a given slot -- but which one depends on which feature
+  # armed first (the overlay attaches prefix, mode-text attaches postfix), so
+  # both riders must be dispatchable from both halves. `regs` carries the
+  # argument registers saved on ENTRY in either half, so RCX is the PreloaderUI
+  # `this` here exactly as it is in the prefix.
+  if i == gModeTextSlot or i == gDebugUiSlot:
+    if i == gDebugUiSlot:
+      debugUiFired(regs)
+    if i == gModeTextSlot:
+      modeTextUpdateFired(regs)
     return 0'i32
   # Phase 1.5 native-settings control probe, by identity and for the same reason:
   # a host drain (meth == nil) whose whole point is to read AFTER the original
@@ -4979,8 +5009,10 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "will set the menu's bottom-right corner label by CALLING the game's " &
          "own PreloaderUI.SetGameModeText. The text comes from the backend's " &
          "`menuModeText` on the mod-sync poll, which defaults to the logged-in " &
-         "character's name. It needs backendPort + modSyncMs, and it refuses " &
-         "to arm while debugUi/debugEsp own the same PreloaderUI.Update hook."
+         "character's name. It needs backendPort + modSyncMs. It SHARES the " &
+         "PreloaderUI.Update detour with debugUi/debugEsp -- one detour, one " &
+         "trampoline, both features dispatched from the same firing -- so all " &
+         "three flags can be on at once."
   gVersionBrand = readBoolKey("uxVersionBrand")
   gVersionWrite = readBoolKey("uxVersionBrandWrite")
   if gVersionWrite:
@@ -5130,16 +5162,16 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
         elif gDebugEsp:
           discard bindDebugEspWorld(true)
 
-      # THE MENU'S BOTTOM-RIGHT GAME-MODE LABEL (opt-in). Bound LAST, and it has
-      # to be: it drains `EFT.UI.PreloaderUI::Update`, the same function the
-      # debug overlay above drains, and the only way it can refuse rather than
-      # overwrite the overlay's trampoline is to arm after the overlay has had
-      # its turn. Same precedence rule botdiag/debugEsp already share over
-      # `GameWorld::RegisterPlayer`.
+      # THE MENU'S BOTTOM-RIGHT GAME-MODE LABEL (opt-in). Bound LAST, and it
+      # still is: it wants `EFT.UI.PreloaderUI::Update`, the same function the
+      # debug overlay above wants. It no longer REFUSES when the overlay got
+      # there first -- it RIDES on the overlay's single detour, so both features
+      # are live together. Ordering still matters, because whoever arms first is
+      # the one that owns the trampoline and the other must be able to see the
+      # claimed slot to alias onto it.
       if gModeTextOn and not bindModeText(true):
         info "menu mode text did not arm (PreloaderUI.Update or " &
-             "SetGameModeText unverified on this build, the debug overlay " &
-             "already owns that hook, or drain disabled)"
+             "SetGameModeText unverified on this build, or drain disabled)"
 
   let modsDir = joinPath(gDir, "mods")
   # The runtime may not have come up, and that deliberately does not stop this:
