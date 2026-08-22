@@ -261,6 +261,35 @@ static const AowlNavTarget aowl_nav_targets[] = {
         0x48,0x8B,0x05,0x23,0x13,0xE1,0x01,
         0x8B,0xD9,0x48 }, 16 },
 
+    /* UnityEngine.GameObject::get_scene_Injected -- rcx = GameObject,
+     * rdx = Scene* OUT PARAM.
+     *
+     * WHY THIS EXISTS, AND WHY IT IS NOT A FALLBACK GUESS.
+     * `SceneManager` reported three loaded scenes, all with rootCount 0, on a
+     * client whose menu demonstrably has thousands of live objects. That is
+     * not a bug in the enumeration -- `GetNameInternal` and
+     * `GetIsLoadedInternal` return correct answers for the same handles, which
+     * proves handle acquisition and the by-value Scene convention are right,
+     * so `GetRootCountInternal` returning 0 is Unity's real answer. The UI
+     * simply does not live in any scene SceneManager enumerates; on this build
+     * it has been moved to the DontDestroyOnLoad scene, which
+     * `sceneCount`/`GetSceneAt` deliberately exclude.
+     *
+     * So instead of guessing, we ASK: given an object we know is alive, which
+     * scene does Unity say it belongs to? That handle then goes through the
+     * exact same root enumeration as any other. It is a real answer from the
+     * runtime, not a hierarchy climb dressed up as a scene root.
+     *
+     * The INJECTED form is used deliberately over the plain `get_scene`
+     * @0x52A9260. `get_scene` returns a 4-byte struct by value and would make
+     * us reason about the return convention again; the injected form writes
+     * through an out-pointer we supply, so there is nothing left to infer. */
+    { "UnityEngine.GameObject::get_scene_Injected", 0x52A92C0u,
+      { 0x48,0x89,0x5C,0x24,0x08,
+        0x57,
+        0x48,0x83,0xEC,0x20,
+        0x48,0x8B,0x05,0x27,0xB3,0xE2 }, 16 },
+
     { "UnityEngine.SceneManagement.Scene::GetRootGameObjects", 0x52C3ED0u,
       { 0x48,0x89,0x5C,0x24,0x10,
         0x57,

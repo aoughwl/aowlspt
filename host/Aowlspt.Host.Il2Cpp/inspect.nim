@@ -1588,97 +1588,150 @@ proc iFindFirstByName(want: string; root: Il2CppPtr; budget: int): Il2CppPtr =
 const InspMaxScenes = 24
 const InspMaxRootsPerScene = 96
 
-proc iSceneRoots(into: var seq[Il2CppPtr]; report: bool): int =
-  ## Enumerate the ROOT GameObjects of every loaded scene.
+proc iRootsOfHandle(handle: int32; label: string; into: var seq[Il2CppPtr];
+                    report: bool; bound: var int) =
+  ## Enumerate one scene's root GameObjects, given its handle.
   ##
-  ## Everything here is a plain integer call: `Scene` is a 4-byte struct
-  ## returned in EAX (verified from the disassembly -- there is no hidden sret
-  ## pointer), and the `*Internal` accessors take the handle by value. Only
-  ## `GetRootGameObjects` needs a struct-`this`, and that is a pointer to a
-  ## C-side int32.
+  ## The COUNT is taken from the returned array, not from
+  ## `GetRootCountInternal`. The array is the authority: it is what we actually
+  ## walk, so believing anything else about its length is a way to be
+  ## confidently wrong about the thing in front of us.
+  var fnRoots: Il2CppPtr = nil
+  if not iNavFindQuiet("Scene::GetRootGameObjects", fnRoots):
+    return
+  cNavSetSceneHandle(handle)
+  iMark("Scene::GetRootGameObjects", cNavSceneHandlePtr())
+  let arr = cast[Il2CppPtr](cInspUP(fnRoots, cNavSceneHandlePtr(), nil))
+  if arr == nil or not duOk(arr, cNavOffArrData() + 8'i32):
+    if report:
+      iOut("    " & label & ": no readable root array")
+    return
+  let alen = cReadI32At(cast[Il2CppPtr](cast[uint64](arr) +
+                        uint64(cNavOffArrLen())))
+  if alen < 0 or alen > InspMaxRootsPerScene:
+    if report:
+      iOut("    " & label & ": root array length " & $alen &
+           " is not credible; skipped")
+    return
+  if report and alen == 0:
+    iOut("    " & label & ": 0 roots")
+  var k = 0
+  while k < alen:
+    let go = cReadPtrAt(arr, cNavOffArrData() + int32(k * 8))
+    if go != nil and duOk(go, 0x20'i32):
+      iNoteKlass(go)
+      into.add go
+      if report:
+        iSetVar("r" & $bound, cast[uint64](go))
+        iOut("    [$r" & $bound & "] " & iPtr(go) & " name=\"" &
+             iObjName(go) & "\"   (" & label & ")")
+      inc bound
+    inc k
+
+proc iSceneNameOf(handle: int32): string =
+  result = ""
+  var fnName: Il2CppPtr = nil
+  if not iNavFindQuiet("Scene::GetNameInternal", fnName):
+    return
+  iMark("Scene::GetNameInternal", cast[Il2CppPtr](0))
+  result = suiReadString(cast[Il2CppPtr](cInspUI(fnName, handle, nil)))
+
+proc iAnchorSceneHandle(ok: var bool): int32 =
+  ## Ask Unity which scene a KNOWN-LIVE object belongs to.
+  ##
+  ## This is what reaches the objects `SceneManager` will not enumerate. On
+  ## this build the menu lives in the DontDestroyOnLoad scene, which
+  ## `sceneCount`/`GetSceneAt` exclude by design -- so every scene they DO
+  ## report has zero roots and the interesting hierarchy is invisible to them.
+  ## Asking a live object for its own scene is a real answer from the runtime,
+  ## not a hierarchy climb presented as a scene root.
+  ok = false
+  result = 0'i32
+  if gInspPreloader == nil:
+    return
+  let go = iGameObjectOf(gInspPreloader)
+  if go == nil or not iUnityAlive(go):
+    return
+  var fn: Il2CppPtr = nil
+  if not iNavFindQuiet("GameObject::get_scene_Injected", fn):
+    return
+  cNavSetSceneHandle(0'i32)
+  iMark("GameObject::get_scene_Injected", go)
+  # rcx = the GameObject, rdx = Scene* out param.
+  discard cInspUPP(fn, go, cNavSceneHandlePtr(), nil)
+  result = cReadI32At(cNavSceneHandlePtr())
+  ok = true
+
+proc iSceneRoots(into: var seq[Il2CppPtr]; report: bool): int =
+  ## Every root GameObject we can legitimately reach, from two sources:
+  ## the scenes SceneManager enumerates, and the scene a live anchor actually
+  ## belongs to (which is how DontDestroyOnLoad is reached).
   result = 0
   var fnCount: Il2CppPtr = nil
   var fnAt: Il2CppPtr = nil
-  var fnName: Il2CppPtr = nil
   var fnLoaded: Il2CppPtr = nil
   var fnRootCount: Il2CppPtr = nil
-  var fnRoots: Il2CppPtr = nil
   var rva = 0'u32
-  if not iNavFind("SceneManager::get_sceneCount", fnCount, rva):
-    return
-  if not iNavFind("SceneManager::GetSceneAt", fnAt, rva):
-    return
-  if not iNavFind("Scene::GetRootGameObjects", fnRoots, rva):
-    return
-  # Labelling is a nicety; if these do not verify the enumeration still works
-  # and simply says less. Shipping the rest beats shipping nothing.
-  discard iNavFindQuiet("Scene::GetNameInternal", fnName)
-  discard iNavFindQuiet("Scene::GetIsLoadedInternal", fnLoaded)
-  discard iNavFindQuiet("Scene::GetRootCountInternal", fnRootCount)
+  var seen: seq[int32] = @[]
 
-  iMark("SceneManager::get_sceneCount", cast[Il2CppPtr](0))
-  var n = int(int32(uint32(cInspUV(fnCount, nil) and 0xFFFFFFFF'u64)))
-  if n < 0 or n > InspMaxScenes:
-    if report:
-      iErr("sceneCount came back as " & $n & ", which is not credible; " &
-           "refusing to loop on it.")
-    return
-  if report:
-    iOut("  " & $n & " loaded scene(s)")
-  var si = 0
-  while si < n:
-    iMark("SceneManager::GetSceneAt", cast[Il2CppPtr](0))
-    let handle = int32(uint32(cInspUI(fnAt, int32(si), nil) and 0xFFFFFFFF'u64))
-    var sname = ""
-    if fnName != nil:
-      iMark("Scene::GetNameInternal", cast[Il2CppPtr](0))
-      sname = suiReadString(cast[Il2CppPtr](cInspUI(fnName, handle, nil)))
-    var loaded = true
-    if fnLoaded != nil:
-      iMark("Scene::GetIsLoadedInternal", cast[Il2CppPtr](0))
-      loaded = (cInspUI(fnLoaded, handle, nil) and 1'u64) != 0'u64
-    var rc = -1
-    if fnRootCount != nil:
-      iMark("Scene::GetRootCountInternal", cast[Il2CppPtr](0))
-      rc = int(int32(uint32(cInspUI(fnRootCount, handle, nil) and 0xFFFFFFFF'u64)))
-    if report:
-      iOut("  scene[" & $si & "] handle=" & $int(handle) & " name=\"" & sname &
-           "\" loaded=" & (if loaded: "true" else: "false") &
-           (if rc >= 0: " rootCount=" & $rc else: ""))
-    if not loaded:
-      # An unloaded scene has no roots and asking it for them is a call into
-      # native code on an object that is not there.
-      inc si
-      continue
-    cNavSetSceneHandle(handle)
-    iMark("Scene::GetRootGameObjects", cNavSceneHandlePtr())
-    let arr = cast[Il2CppPtr](cInspUP(fnRoots, cNavSceneHandlePtr(), nil))
-    if arr == nil or not duOk(arr, cNavOffArrData() + 8'i32):
+  if iNavFind("SceneManager::get_sceneCount", fnCount, rva) and
+     iNavFind("SceneManager::GetSceneAt", fnAt, rva):
+    discard iNavFindQuiet("Scene::GetIsLoadedInternal", fnLoaded)
+    discard iNavFindQuiet("Scene::GetRootCountInternal", fnRootCount)
+    iMark("SceneManager::get_sceneCount", cast[Il2CppPtr](0))
+    let n = int(int32(uint32(cInspUV(fnCount, nil) and 0xFFFFFFFF'u64)))
+    if n < 0 or n > InspMaxScenes:
       if report:
-        iOut("    (no readable root array for this scene)")
-      inc si
-      continue
-    let alen = cReadI32At(cast[Il2CppPtr](cast[uint64](arr) +
-                          uint64(cNavOffArrLen())))
-    if alen < 0 or alen > InspMaxRootsPerScene:
+        iErr("sceneCount came back as " & $n & ", which is not credible; " &
+             "refusing to loop on it.")
+    else:
       if report:
-        iOut("    (root array length " & $alen & " is not credible; skipped)")
-      inc si
-      continue
-    var k = 0
-    while k < alen:
-      let go = cReadPtrAt(arr, cNavOffArrData() + int32(k * 8))
-      if go != nil and duOk(go, 0x20'i32):
-        iNoteKlass(go)
-        into.add go
+        iOut("  " & $n & " scene(s) from SceneManager")
+      var si = 0
+      while si < n:
+        iMark("SceneManager::GetSceneAt", cast[Il2CppPtr](0))
+        let handle = int32(uint32(cInspUI(fnAt, int32(si), nil) and
+                                  0xFFFFFFFF'u64))
+        let sname = iSceneNameOf(handle)
+        var loaded = true
+        if fnLoaded != nil:
+          iMark("Scene::GetIsLoadedInternal", cast[Il2CppPtr](0))
+          loaded = (cInspUI(fnLoaded, handle, nil) and 1'u64) != 0'u64
+        var rc = -1
+        if fnRootCount != nil:
+          iMark("Scene::GetRootCountInternal", cast[Il2CppPtr](0))
+          rc = int(int32(uint32(cInspUI(fnRootCount, handle, nil) and
+                                0xFFFFFFFF'u64)))
         if report:
-          iSetVar("r" & $result, cast[uint64](go))
-          iOut("    [$r" & $result & "] " & iPtr(go) & " name=\"" &
-               iObjName(go) & "\"")
-        inc result
-      inc k
-    inc si
+          iOut("  scene[" & $si & "] handle=" & $int(handle) & " name=\"" &
+               sname & "\" loaded=" & (if loaded: "true" else: "false") &
+               (if rc >= 0: " rootCount=" & $rc else: ""))
+        if loaded:
+          seen.add handle
+          iRootsOfHandle(handle, sname, into, report, result)
+        inc si
 
+  # THE SCENE SCENEMANAGER DOES NOT LIST.
+  var haveAnchor = false
+  let ah = iAnchorSceneHandle(haveAnchor)
+  if haveAnchor:
+    var already = false
+    for i in 0 ..< seen.len:
+      if seen[i] == ah:
+        already = true
+    if not already:
+      let an = iSceneNameOf(ah)
+      if report:
+        iOut("  scene[anchor] handle=" & $int(ah) & " name=\"" & an &
+             "\"  <- the scene $preloader actually belongs to. SceneManager " &
+             "does NOT list it, which on this build is where the live UI is.")
+      iRootsOfHandle(ah, an, into, report, result)
+    elif report:
+      iOut("  ($preloader's scene, handle=" & $int(ah) &
+           ", is already listed above)")
+  elif report:
+    iOut("  (could not ask $preloader which scene it belongs to; either the " &
+         "anchor is null or GameObject::get_scene_Injected did not verify)")
 proc iCmdRoots(toks: seq[string]) =
   ## `roots` -- every root GameObject of every loaded scene, bound to $r0..$rN.
   ##
@@ -1689,11 +1742,15 @@ proc iCmdRoots(toks: seq[string]) =
   var seeded: seq[Il2CppPtr] = @[]
   iOut("  via SceneManager::get_sceneCount / GetSceneAt, " &
        "Scene::GetNameInternal / GetIsLoadedInternal / GetRootCountInternal, " &
-       "Scene::GetRootGameObjects (calls; the last one ALLOCATES)")
+       "GameObject::get_scene_Injected, Scene::GetRootGameObjects " &
+       "(calls; the last one ALLOCATES)")
   let n = iSceneRoots(seeded, true)
   if n == 0:
-    iErr("no scene roots were enumerated. If a target above did not verify, " &
-         "the reason was printed with it.")
+    iErr("no scene roots were enumerated anywhere -- neither in the scenes " &
+         "SceneManager lists nor in the scene $preloader belongs to. If a " &
+         "target did not verify, the reason was printed with it above. Note " &
+         "that scenes legitimately reporting 0 roots is Unity telling the " &
+         "truth, not a failure to read them.")
     return
   iOut("  " & $n & " root(s) bound to $r0..$r" & $(n - 1) &
        ". Search one with:  find NAME $r3")
@@ -2647,7 +2704,13 @@ proc iExec(line: string) =
   let cmd = iLower(toks[0])
   if cmd.len > 0 and cmd[0] == '#':
     return
-  iOut("> " & line)
+  # ECHO ONCE PER COMMAND, NOT ONCE PER FRAME. A frame-spanning `find` re-enters
+  # this same command every frame until it finishes, and echoing each time
+  # produced 32 identical `> find PvE` lines wrapped around the results. The
+  # echo belongs to the command being CLAIMED, not to each slice of its work.
+  if not (gFindActive and gFindOwnerIdx == gInspCurIdx and
+          gFindOwnerBatch == gInspBatch):
+    iOut("> " & line)
   case cmd
   of "help", "?":
     iCmdHelp()
