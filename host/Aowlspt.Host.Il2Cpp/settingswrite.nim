@@ -58,6 +58,10 @@ proc cSwAnchorFloat(): Il2CppPtr {.importc: "aowl_sw_anchor_float", nodecl.}
 proc cSwAnchorToggle(): Il2CppPtr {.importc: "aowl_sw_anchor_toggle", nodecl.}
 proc cSwAnchorDropdown(): Il2CppPtr {.importc: "aowl_sw_anchor_dropdown", nodecl.}
 proc cSwAnchorSelect(): Il2CppPtr {.importc: "aowl_sw_anchor_select", nodecl.}
+proc cSwAnchorCount(kind: int32): int32 {.
+  importc: "aowl_sw_anchor_count", nodecl.}
+proc cSwAnchorAt(kind, i: int32): Il2CppPtr {.
+  importc: "aowl_sw_anchor_at", nodecl.}
 
 # ---------------------------------------------------------------------------
 # Flags and fault budget
@@ -132,25 +136,56 @@ proc swKlassName(k: uint64): string =
   elif k == gSwKlassSelect: result = "select-slider"
   else: result = "?"
 
+const
+  SwKindFloat    = 0'i32
+  SwKindToggle   = 1'i32
+  SwKindDropdown = 2'i32
+  SwKindSelect   = 3'i32
+
+proc swKindName(kind: int32): string =
+  case kind
+  of SwKindFloat: result = "float-slider"
+  of SwKindToggle: result = "toggle"
+  of SwKindDropdown: result = "dropdown"
+  of SwKindSelect: result = "select-slider"
+  else: result = "?"
+
+proc swAnchorMatches(kind: int32; label: string): bool =
+  ## Does `label` match ANY known stock caption for this widget type?
+  ##
+  ## One anchor per type was not enough and the failure was visible on screen:
+  ## the only toggle anchor, 'Enable VoIP', lives on the SOUND tab, so on the
+  ## GAME tab the toggle klass was never learned, the donor fell back to the
+  ## most common klass -- the dropdown -- and the player got three rows that all
+  ## said "English".
+  result = false
+  let n = cSwAnchorCount(kind)
+  var i = 0'i32
+  while i < n:
+    if label == readCString(cSwAnchorAt(kind, i)):
+      return true
+    i = i + 1'i32
+
 proc swLearnKlass(label: string; klass: uint64) =
-  ## Teach the census from one control, if its label is an anchor and that
-  ## anchor is not already learned. Logged the first time each is learned, so
-  ## the boot log shows exactly which types this session can recognise.
+  ## Teach the census from one control. Cached for the whole SESSION, and now
+  ## fed from EVERY tab the player opens rather than only the one the pages
+  ## render on -- the klass pointers are stable within a process, so a toggle
+  ## learned on Graphics is still the toggle klass when Game is rendered.
   if klass == 0'u64 or label.len == 0:
     return
-  if gSwKlassFloat == 0'u64 and label == readCString(cSwAnchorFloat()):
+  if gSwKlassFloat == 0'u64 and swAnchorMatches(SwKindFloat, label):
     gSwKlassFloat = klass
     okLog "settings write: learned float-slider klass = 0x" & hexOf(klass) &
           " from the stock label '" & label & "'"
-  elif gSwKlassToggle == 0'u64 and label == readCString(cSwAnchorToggle()):
+  elif gSwKlassToggle == 0'u64 and swAnchorMatches(SwKindToggle, label):
     gSwKlassToggle = klass
     okLog "settings write: learned toggle klass = 0x" & hexOf(klass) &
           " from the stock label '" & label & "'"
-  elif gSwKlassDropdown == 0'u64 and label == readCString(cSwAnchorDropdown()):
+  elif gSwKlassDropdown == 0'u64 and swAnchorMatches(SwKindDropdown, label):
     gSwKlassDropdown = klass
     okLog "settings write: learned dropdown klass = 0x" & hexOf(klass) &
           " from the stock label '" & label & "'"
-  elif gSwKlassSelect == 0'u64 and label == readCString(cSwAnchorSelect()):
+  elif gSwKlassSelect == 0'u64 and swAnchorMatches(SwKindSelect, label):
     gSwKlassSelect = klass
     okLog "settings write: learned select-slider klass = 0x" & hexOf(klass) &
           " from the stock label '" & label & "'"

@@ -376,79 +376,57 @@ proc swRowContainerGo(tabPtr: Il2CppPtr; why: var string): Il2CppPtr =
         "layout group places them."
   result = contGo
 
-proc swAnyDonor(tabPtr: Il2CppPtr; kind: var string): Il2CppPtr =
-  ## A donor row when the klass census could not name a toggle.
+proc swDonorFor(tabPtr: Il2CppPtr; want: SwKind; why: var string): Il2CppPtr =
+  ## The donor to clone for a row OF THIS KIND -- and nothing else.
   ##
-  ## The census learns 'toggle' by matching the stock English label
-  ## 'Enable VoIP'. On a client whose language is not English -- or on any build
-  ## where that row moves or is renamed -- it never learns, `gSwKlassToggle`
-  ## stays 0, and Phase 3 declined with `toggleKlass=0x0`. Refusing to draw
-  ## anything because one label did not match is a worse answer than drawing a
-  ## row cloned from whatever the tab actually has: a row is a row, we relabel
-  ## it ourselves, and a row we cannot BIND is still honestly marked as such.
+  ## The previous version asked for "a donor" and, when the toggle klass was not
+  ## learned, quietly settled for the most common klass on the tab. On the Game
+  ## tab that is the DROPDOWN (16 of them), so three boolean rows were rendered
+  ## as language dropdowns all reading "English". A wrong widget is worse than
+  ## no widget: it looks like a working control and it is not one.
   ##
-  ## So: prefer the learned toggle; otherwise take the most common klass on the
-  ## tab (settings tabs are mostly toggles and sliders, so the mode is a real
-  ## row and not an oddity); otherwise the first control there is.
+  ## So the mapping is exact and there is no cross-type fallback:
+  ##   swkToggle -> the learned toggle klass
+  ##   swkSlider -> the learned float-slider klass
+  ##   swkStub   -> anything on the tab; it is a caption, not a control
+  ## If the klass this row needs has not been learned yet, this returns nil with
+  ## a reason, and the caller renders an honest note instead of a wrong control.
   result = nil
-  kind = "none"
-  let byKlass = swFindDonor(tabPtr, gSwKlassToggle)
-  if byKlass != nil:
-    kind = "learned toggle klass 0x" & hexOf(gSwKlassToggle)
-    return byKlass
-  # The most common klass on the tab.
-  #
-  # Counted by a plain double loop over the control list rather than with a
-  # scratch table: nimony insists a local be provably initialised before it is
-  # read, an `array` of counters is not, and the list is capped at
-  # `cSuiMaxControls` anyway -- so the quadratic version is both simpler and
-  # bounded by a number the probe has already measured (25-33 in practice).
-  var best = 0'u64
-  var bestN = 0
-  let lst = (if tabPtr != nil and
-                cIsReadable(tabPtr, cSuiOffCreatedCtrls() + 8'i32) != 0'i32:
-               cReadPtrAt(tabPtr, cSuiOffCreatedCtrls())
-             else: nil)
-  if lst != nil and cIsReadable(lst, cSuiOffListSize() + 4'i32) != 0'i32:
-    let arr = cReadPtrAt(lst, cSuiOffListItems())
-    let size = cReadI32At(suiPtrAdd(lst, cSuiOffListSize()))
-    if arr != nil and size > 0'i32:
-      let n = int(if size > int32(cSuiMaxControls): int32(cSuiMaxControls)
-                  else: size)
-      for i in 0 ..< n:
-        let si = suiPtrAdd(arr, cSuiOffArrElems() + int32(i) * 8'i32)
-        if cIsReadable(si, 8'i32) == 0'i32:
-          continue
-        let ci = cReadPtrAt(si, 0'i32)
-        if ci == nil or cIsReadable(ci, cSuiOffCtrlValue() + 8'i32) == 0'i32:
-          continue
-        let k = cast[uint64](cReadPtrAt(ci, 0'i32))
-        if k == 0'u64:
-          continue
-        var cnt = 0
-        for j in 0 ..< n:
-          let sj = suiPtrAdd(arr, cSuiOffArrElems() + int32(j) * 8'i32)
-          if cIsReadable(sj, 8'i32) == 0'i32:
-            continue
-          let cj = cReadPtrAt(sj, 0'i32)
-          if cj == nil or cIsReadable(cj, cSuiOffCtrlValue() + 8'i32) == 0'i32:
-            continue
-          if cast[uint64](cReadPtrAt(cj, 0'i32)) == k:
-            cnt = cnt + 1
-        if cnt > bestN:
-          bestN = cnt
-          best = k
-  if best != 0'u64:
-    let byMode = swFindDonor(tabPtr, best)
-    if byMode != nil:
-      kind = "most common klass 0x" & hexOf(best) & " (" & $bestN &
-             " row(s) of it on this tab; the toggle klass was never learned, " &
-             "so the donor is chosen by shape rather than by name)"
-      return byMode
-  let any = swFirstControl(tabPtr)
-  if any != nil:
-    kind = "the first readable control on the tab (no klass census at all)"
-    return any
+  why = ""
+  var wantKlass = 0'u64
+  var wantName = ""
+  case want
+  of swkToggle:
+    wantKlass = gSwKlassToggle
+    wantName = "toggle"
+  of swkSlider:
+    wantKlass = gSwKlassFloat
+    wantName = "float-slider"
+  of swkStub:
+    # A stub row carries text and binds to nothing, so any row shape will do --
+    # prefer a toggle for its compact look, then a slider, then whatever exists.
+    wantKlass = (if gSwKlassToggle != 0'u64: gSwKlassToggle
+                 elif gSwKlassFloat != 0'u64: gSwKlassFloat
+                 else: 0'u64)
+    wantName = "any (this row is a caption, not a control)"
+  if wantKlass == 0'u64:
+    if want == swkStub:
+      let any = swFirstControl(tabPtr)
+      if any != nil:
+        why = "the first control on the tab (caption row; no klass needed)"
+        return any
+    why = "the " & wantName & " klass has NOT been learned yet this session. " &
+          "Open Settings -> Graphics or Sound once (they carry the stock " &
+          "toggles) and come back; the census is cached for the session. " &
+          "This row is deliberately NOT drawn as some other widget."
+    return
+  let byKlass = swFindDonor(tabPtr, wantKlass)
+  if byKlass == nil:
+    why = "the " & wantName & " klass 0x" & hexOf(wantKlass) &
+          " is known but this tab has no row of that type to clone"
+    return
+  why = wantName & " klass 0x" & hexOf(wantKlass)
+  result = byKlass
 
 proc swFindDonor(tabPtr: Il2CppPtr; wantKlass: uint64): Il2CppPtr =
   ## The first control on this tab whose klass is `wantKlass` -- the row we will
@@ -641,6 +619,46 @@ proc swDumpRowGeometry(donor, clone, parentGo: Il2CppPtr) =
             " activeSelf=" & duDescribeInt(DuGoActiveSelf, parentGo) &
             " localScale=" & duDescribeVec3(DuGetLocalScale, pt)
 
+proc swCloneShowsOurText(clone: Il2CppPtr; want: string): bool =
+  ## Does this clone actually display the caption we asked for?
+  ##
+  ## Cloning and labelling are two different things and the second one can fail
+  ## quietly: the player saw a row still reading "Interface language", which is
+  ## a clone wearing its DONOR'S caption. Reading the label back is the only way
+  ## to know, and it is cheap -- one pointer chain we already have.
+  ##
+  ## Note this is read back through the SAME chain the write went through, so it
+  ## proves the store landed; it does not prove LocalizedText has not clobbered
+  ## it a frame later. That is what the per-visit re-apply is for.
+  result = false
+  if clone == nil or want.len == 0:
+    return
+  let tmp = swControlTmp(clone)
+  if tmp == nil:
+    return
+  swCrumbP("verify label of clone", clone)
+  result = suiReadString(cReadPtrAt(tmp, cSuiOffTmpMText())) == want
+
+proc swKillClone(clone: Il2CppPtr) =
+  ## Take a clone off the screen. Deactivate rather than Destroy: this is a live
+  ## UI object on the player's settings screen, `GameObject::SetActive` is
+  ## already byte-verified and in use here, and a deactivated clone is
+  ## reversible where a destroyed one is not. What matters is that a row which
+  ## does not carry OUR text is never left visible.
+  if clone == nil:
+    return
+  let fnGo = mi2Fn(Mi2GetGameObject)
+  let fnAct = mi2Fn(Mi2GoSetActive)
+  if fnGo == nil or fnAct == nil:
+    warn "settings pages: cannot switch off a mislabelled clone " &
+         "(get_gameObject/SetActive unavailable); it may remain visible " &
+         "showing the donor's caption"
+    return
+  swCrumbP("switch off mislabelled clone", clone)
+  let go = cMi2CallPP(fnGo, clone)
+  if go != nil and cIsReadable(go, 0x20'i32) != 0'i32:
+    cMi2CallVPB(fnAct, go, 0'i32)
+
 proc swRenderPage(tabPtr, parentGo: Il2CppPtr; page: var SwPage): int =
   ## Render one page's rows onto a tab. Returns how many rows were rendered.
   ##
@@ -648,51 +666,86 @@ proc swRenderPage(tabPtr, parentGo: Il2CppPtr; page: var SwPage): int =
   ## its heading and its note and stops -- which is the point of `stub`: the
   ## player sees the page exists and is told plainly that it does nothing yet.
   result = 0
-  var donorKind = ""
-  let donorToggle = swAnyDonor(tabPtr, donorKind)
-  if donorToggle == nil:
+  # A caption donor for the heading and for any row whose real widget type is
+  # not available. Captions bind to nothing, so any row shape is honest here.
+  var headWhy = ""
+  let headDonor = swDonorFor(tabPtr, swkStub, headWhy)
+  if headDonor == nil:
     warn "settings pages: DECLINED -- page '" & page.id & "' has no row on " &
-         "this tab to clone at all (tabPtr=0x" & hexOf(cast[uint64](tabPtr)) &
-         ", learned toggle klass=0x" & hexOf(gSwKlassToggle) &
-         "); nothing rendered and nothing written"
+         "this tab to clone at all (" & headWhy & ", tabPtr=0x" &
+         hexOf(cast[uint64](tabPtr)) & "); nothing rendered and nothing written"
     return
-  okLog "settings pages: page '" & page.id & "' donor=0x" &
-        hexOf(cast[uint64](donorToggle)) & " chosen by " & donorKind &
-        "; parent=0x" & hexOf(cast[uint64](parentGo))
-  # The heading, cloned from the same donor so it inherits the row styling. It
-  # is a toggle underneath, which is not ideal and IS honest: there is no label
-  # widget to clone on a settings tab that we can identify without reflection.
+  okLog "settings pages: page '" & page.id & "' heading donor=0x" &
+        hexOf(cast[uint64](headDonor)) & " (" & headWhy & "); parent=0x" &
+        hexOf(cast[uint64](parentGo)) & ". Census this session: toggle=0x" &
+        hexOf(gSwKlassToggle) & " float=0x" & hexOf(gSwKlassFloat) &
+        " dropdown=0x" & hexOf(gSwKlassDropdown) & " select=0x" &
+        hexOf(gSwKlassSelect)
   swCrumb("render the heading row for page '" & page.id & "'")
-  discard swCloneRow(donorToggle, parentGo, page.title)
+  let head = swCloneRow(headDonor, parentGo, page.title)
+  if head != nil and not swCloneShowsOurText(head, page.title):
+    warn "settings pages: the HEADING clone for page '" & page.id &
+         "' does not show '" & page.title & "'; switching it off rather than " &
+         "leaving a row wearing the donor's caption"
+    swKillClone(head)
   if page.stub:
-    discard swCloneRow(donorToggle, parentGo, page.note & cSwNotDone)
+    let note = swCloneRow(headDonor, parentGo, page.note & cSwNotDone)
+    if note != nil and not swCloneShowsOurText(note, page.note & cSwNotDone):
+      swKillClone(note)
     okLog "settings pages: page '" & page.id & "' is a STUB -- heading and " &
           "note rendered, no rows bound"
     return
   var i = 0
+  var skipped = 0
   while i < page.rows.len and result < cSwMaxRows:
     var text = page.rows[i].label
     if not page.rows[i].implemented:
       text = text & cSwNotDone
+    # THE DONOR IS CHOSEN PER ROW, BY THE ROW'S OWN KIND. A bool clones a
+    # toggle; a number clones a slider. There is no cross-type fallback.
+    var why = ""
+    var donor = swDonorFor(tabPtr, page.rows[i].kind, why)
+    var asNote = false
+    if donor == nil:
+      # The right widget is unavailable. Render an honest, clearly-marked
+      # caption rather than a wrong control the player would try to use.
+      donor = headDonor
+      asNote = true
+      text = text & "  (needs a " &
+             (if page.rows[i].kind == swkToggle: "toggle"
+              elif page.rows[i].kind == swkSlider: "slider"
+              else: "row") & " -- open Graphics or Sound once, then reopen)"
+      warn "settings pages: row '" & page.rows[i].key & "' wanted a " &
+           (if page.rows[i].kind == swkToggle: "toggle"
+            elif page.rows[i].kind == swkSlider: "slider" else: "caption") &
+           " and " & why & " It is drawn as a NOTE, not as a wrong widget."
+      skipped = skipped + 1
     swCrumb("render row " & $i & " of " & $page.rows.len & " ('" & text & "')")
-    let clone = swCloneRow(donorToggle, parentGo, text)
+    let clone = swCloneRow(donor, parentGo, text)
     if clone != nil:
-      page.rows[i].clone = cast[uint64](clone)
-      if page.rows[i].kind == swkToggle:
-        swCrumbP("swSeedToggle for row '" & text & "' clone", clone)
-        page.rows[i].seeded = swSeedToggle(clone, page.rows[i].bval)
-      result = result + 1
-      # ONE-SHOT GEOMETRY DUMP. Rows are being cloned and labelled and the user
-      # sees nothing, so the next question is WHERE they went -- and that is a
-      # question to ask the client, not to reason about. Dump the donor and the
-      # first clone side by side; every field the two share is inherited and
-      # every field that differs is ours.
+      # EVERY CLONE MUST CARRY OUR LABEL OR NOT EXIST. The player reported a
+      # stray row still reading "Interface language" -- a clone whose relabel
+      # did not take, left on screen wearing the donor's caption. Verify, and
+      # switch off anything that did not.
+      if swCloneShowsOurText(clone, text):
+        page.rows[i].clone = cast[uint64](clone)
+        if page.rows[i].kind == swkToggle and not asNote:
+          swCrumbP("swSeedToggle for row '" & text & "' clone", clone)
+          page.rows[i].seeded = swSeedToggle(clone, page.rows[i].bval)
+        result = result + 1
+      else:
+        warn "settings pages: the clone for row '" & page.rows[i].key &
+             "' does NOT show our label; it has been switched off rather " &
+             "than left on screen wearing the donor's caption"
+        swKillClone(clone)
       if not gSwGeomDumped:
         gSwGeomDumped = true
-        swDumpRowGeometry(donorToggle, clone, parentGo)
+        swDumpRowGeometry(headDonor, clone, parentGo)
     i = i + 1
   okLog "settings pages: page '" & page.id & "' rendered " & $result &
-        " row(s) of " & $page.rows.len
+        " row(s) of " & $page.rows.len &
+        (if skipped > 0: " (" & $skipped & " drawn as notes because the " &
+                         "widget type they need is not learned yet)" else: "")
 
 proc swReadBackPage(page: var SwPage) =
   ## Read every rendered row's live value and persist the ones the player

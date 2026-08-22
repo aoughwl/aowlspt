@@ -1465,43 +1465,44 @@ proc duNoRaycast(tmp: Il2CppPtr) =
     # something else re-registers it. Better than remaining clickable.
     discard cDuWriteU8(tmp, 0x3A'i32, 0'i32)
 
-proc duDropNestedCanvas(tmp, srcCanvas: Il2CppPtr): bool =
-  ## Turn OFF a `Canvas` that `Object::Instantiate` copied onto our clone.
+proc duCloneOwnsCanvas(tmp: Il2CppPtr; cv: var Il2CppPtr;
+                       cvGo: var Il2CppPtr; myGo: var Il2CppPtr): bool =
+  ## Does the canvas this clone renders on sit on the CLONE'S OWN GameObject?
   ##
-  ## This is the actual root cause of every canvas symptom chased so far. The
-  ## version label's own GameObject carries a NESTED Canvas, so each clone gets
-  ## a copy of it and reports its own canvas pointer no matter where it is
-  ## parented -- which is exactly what the live log showed after the clone was
-  ## made a sibling of the source. It was never a parenting problem.
-  ##
-  ## `Graphic.m_Canvas` (+0x60) already points at whichever Canvas the clone
-  ## renders on, so there is no component lookup to do: if that pointer is not
-  ## the source's canvas, it IS the copied one. Disabling it makes the clone
-  ## fall through to the nearest enabled ancestor canvas.
-  ##
-  ## SAFETY: this only ever disables a Canvas that (1) differs from the source's
-  ## and (2) lives on the CLONE'S OWN GameObject. Both are checked before
-  ## anything is written, so a Canvas the game owns can never be switched off by
-  ## this -- the rule in this codebase is that we write only into objects the
-  ## host itself created.
+  ## That -- not "is it the same pointer as the source's" -- is the question
+  ## that matters. `Graphic.m_Canvas` (+0x60) already names the canvas the clone
+  ## renders on, so the test is just whose object that canvas lives on.
   result = false
-  let cv = duReadPtrField(tmp, cDuOffTmpGCanvas())
-  if cv == nil or cv == srcCanvas or not duOk(cv, 0x20'i32):
-    return                              # nothing copied, or already correct
+  cv = duReadPtrField(tmp, cDuOffTmpGCanvas())
+  cvGo = nil
+  myGo = nil
+  if cv == nil or not duOk(cv, 0x20'i32):
+    return
   let fnGo = mi2Fn(Mi2GetGameObject)
   if fnGo == nil:
     return
-  let cvGo = cMi2CallPP(fnGo, cv)
-  let myGo = cMi2CallPP(fnGo, tmp)
-  if cvGo == nil or myGo == nil or cvGo != myGo:
-    # The offending canvas is NOT on our own object -- it is an ancestor's, and
-    # ancestors belong to the game. Refuse, and say so.
-    warn "debugui: clone canvas 0x" & hexOf(cast[uint64](cv)) &
-         " is not on the clone's own GameObject (canvasGo=0x" &
-         hexOf(cast[uint64](cvGo)) & " cloneGo=0x" &
-         hexOf(cast[uint64](myGo)) & "); it belongs to the game and will NOT " &
-         "be touched"
-    return
+  cvGo = cMi2CallPP(fnGo, cv)
+  myGo = cMi2CallPP(fnGo, tmp)
+  result = cvGo != nil and myGo != nil and cvGo == myGo
+
+proc duDropNestedCanvas(tmp, srcCanvas: Il2CppPtr): bool =
+  ## Turn OFF a `Canvas` that `Object::Instantiate` copied onto our clone.
+  ##
+  ## Proven live: the version label's own GameObject carries a NESTED Canvas, so
+  ## every clone got a copy and reported its own canvas pointer no matter where
+  ## it was parented. It was never a parenting problem.
+  ##
+  ## SAFETY: this disables a Canvas ONLY when that Canvas lives on the clone's
+  ## own GameObject -- an object the host itself created. A canvas belonging to
+  ## an ancestor is never touched, and that case is not an error: it is the
+  ## SUCCESS state, because falling through to a shared ancestor canvas is the
+  ## entire point of the exercise.
+  result = false
+  var cv: Il2CppPtr = nil
+  var cvGo: Il2CppPtr = nil
+  var myGo: Il2CppPtr = nil
+  if not duCloneOwnsCanvas(tmp, cv, cvGo, myGo):
+    return                              # nothing of ours to switch off
   let fnEn = cDuFn(DuSetEnabled)
   if fnEn == nil:
     warn "debugui: UnityEngine.Behaviour::set_enabled did not verify on this " &
@@ -1510,9 +1511,64 @@ proc duDropNestedCanvas(tmp, srcCanvas: Il2CppPtr): bool =
   cDuCallVPB(fnEn, cv, 0'i32)
   okLog "debugui: disabled the nested Canvas 0x" & hexOf(cast[uint64](cv)) &
         " that Instantiate copied onto our own clone (cloneGo=0x" &
-        hexOf(cast[uint64](myGo)) & "); the clone should now fall through to " &
-        "the source's canvas 0x" & hexOf(cast[uint64](srcCanvas))
+        hexOf(cast[uint64](myGo)) & "). It will now fall through to whichever " &
+        "ANCESTOR canvas its parent renders on -- which is the goal, and is " &
+        "not required to equal the source label's own nested canvas 0x" &
+        hexOf(cast[uint64](srcCanvas))
   result = true
+
+proc duCanvasVerdict(tmp: Il2CppPtr; why: var string): bool =
+  ## Is this clone on an acceptable canvas?
+  ##
+  ## THE ASSERTION THAT WAS WRONG. It used to demand that the clone's canvas
+  ## EQUAL the source label's canvas. But the source label has its own nested
+  ## canvas -- that is precisely why Instantiate copied one -- so a correctly
+  ## repaired clone lands on the shared ANCESTOR canvas instead, a different and
+  ## game-owned pointer. The live log showed exactly that (clone on 0x...620,
+  ## source on 0x...6c0, adjacent addresses, nested canvas and its parent) and
+  ## the code called the right answer a failure and refused to build.
+  ##
+  ## What actually has to be true:
+  ##   1. the clone is NOT on a canvas of its own -- no per-clone canvas, which
+  ##      is what would multiply render passes;
+  ##   2. that canvas is SCREEN SPACE (renderMode 0), not world space (2).
+  ## Landing on a game-owned ancestor canvas satisfies both and is a PASS.
+  result = false
+  why = ""
+  var cv: Il2CppPtr = nil
+  var cvGo: Il2CppPtr = nil
+  var myGo: Il2CppPtr = nil
+  let ownsIt = duCloneOwnsCanvas(tmp, cv, cvGo, myGo)
+  if cv == nil:
+    why = "the clone has no canvas yet (Graphic.m_Canvas is null)"
+    return
+  if ownsIt:
+    why = "the clone is on a canvas of its OWN (canvas 0x" &
+          hexOf(cast[uint64](cv)) & " sits on cloneGo 0x" &
+          hexOf(cast[uint64](myGo)) & "); that is a per-clone canvas and is " &
+          "exactly what must not happen"
+    return
+  var modeOk = false
+  var mode = -1'i32
+  let fnMode = cDuFn(DuCanvasMode)
+  if fnMode != nil and duOk(cv, 0x20'i32):
+    var ok = false
+    mode = duGetInt(DuCanvasMode, cv, ok)
+    modeOk = ok
+  if not modeOk:
+    why = "the clone's canvas renderMode could not be read"
+    return
+  if mode != 0'i32:
+    why = "the clone's canvas 0x" & hexOf(cast[uint64](cv)) &
+          " has renderMode=" & $int(mode) & ", not 0 (ScreenSpaceOverlay)"
+    return
+  why = "canvas 0x" & hexOf(cast[uint64](cv)) & " on a GameObject that is " &
+        "NOT the clone's (canvasGo=0x" & hexOf(cast[uint64](cvGo)) &
+        " cloneGo=0x" & hexOf(cast[uint64](myGo)) &
+        "), renderMode=0 (ScreenSpaceOverlay) -- a shared ancestor canvas, " &
+        "which is the goal"
+  result = true
+
 
 # ---------------------------------------------------------------------------
 # THE ONE-SHOT DIAGNOSTIC DUMP, continued
@@ -1643,56 +1699,39 @@ proc duBuild(preloader: Il2CppPtr): bool =
       return false
     duMakeDrawable(gDuProbe, 400.0, 20.0)
   let srcCv0 = duReadPtrField(anchor, cDuOffTmpGCanvas())
-  let probeCv = duReadPtrField(gDuProbe.tmp, cDuOffTmpGCanvas())
-  if probeCv == nil:
-    inc gDuProbeWaits
-    if gDuProbeWaits > 240:
-      gDuBuildFailed = true
-      duHide(gDuProbe)
-      warn "debugui: the probe clone's Graphic.m_Canvas never resolved after " &
-           $gDuProbeWaits & " refreshes (parent route = " & gDuParentRoute &
-           "). Refusing to build the rest of the overlay rather than put " &
-           "labels on an unknown canvas. Nothing in the game was changed."
-      return false
-    return false                       # not yet resolved; try again next frame
-  if probeCv != srcCv0:
-    # A MISMATCH IS NOT YET A VERDICT.
-    #
-    # Two things can produce it, and they want opposite responses:
-    #   * `Instantiate` copied the source's own nested Canvas onto our clone.
-    #     That is the real cause, and it is FIXABLE -- switch the copy off and
-    #     the clone falls through to the source's canvas.
-    #   * the clone is only part-initialised this frame, and Unity has not yet
-    #     re-resolved its canvas. That resolves itself and must not be punished.
-    #
-    # So: try the fix, then give it several frames to settle, and only refuse if
-    # it is still wrong afterwards. Refusing on the first frame is what made the
-    # last build report a permanent failure for a condition it could have
-    # repaired.
-    if not gDuCanvasDropTried:
-      gDuCanvasDropTried = true
-      discard duDropNestedCanvas(gDuProbe.tmp, srcCv0)
-      return false                     # re-check next frame
+  # Repair first: switch off any Canvas that Instantiate copied onto OUR clone.
+  # Proven live -- the version label carries a nested Canvas and every clone got
+  # a copy of it.
+  if not gDuCanvasDropTried:
+    gDuCanvasDropTried = true
+    if duDropNestedCanvas(gDuProbe.tmp, srcCv0):
+      return false                     # let Unity re-resolve; check next frame
+  var why = ""
+  if duCanvasVerdict(gDuProbe.tmp, why):
+    okLog "debugui: canvas assertion PASSED -- " & why &
+          ". Source label's own canvas is 0x" & hexOf(cast[uint64](srcCv0)) &
+          " (renderMode=" & duDescribeInt(DuCanvasMode, srcCv0) &
+          "); the clone is NOT required to match it, and correctly does not. " &
+          "Parent route = " & gDuParentRoute & ", scaleFactor=" &
+          duDescribeScale(duReadPtrField(gDuProbe.tmp, cDuOffTmpGCanvas())) &
+          ". One shared canvas for every label; the pool is safe to build."
+  else:
+    # Not acceptable YET. Two of the three reasons resolve themselves within a
+    # frame or two (the canvas is re-resolved by Unity after a reparent), so
+    # give it time before giving up -- refusing on the first frame is what made
+    # the previous build report a permanent failure for a healthy condition.
     inc gDuProbeWaits
     if gDuProbeWaits <= 120:
-      return false                     # still settling; look again next frame
+      return false
     gDuBuildFailed = true
     duHide(gDuProbe)
-    warn "debugui: REFUSING TO BUILD. After disabling the copied Canvas and " &
-         "waiting " & $gDuProbeWaits & " refreshes, the probe clone is still " &
-         "on canvas 0x" & hexOf(cast[uint64](probeCv)) & " (renderMode=" &
-         duDescribeInt(DuCanvasMode, probeCv) & ") while the source is on 0x" &
-         hexOf(cast[uint64](srcCv0)) & " (renderMode=" &
-         duDescribeInt(DuCanvasMode, srcCv0) & "); parent route = " &
-         gDuParentRoute & ", parentRect=[" & duDescribeRect(gDuParentRect) &
-         "]. Exactly one clone was made and it has been switched off. " &
-         "Nothing else in the game was changed."
+    warn "debugui: REFUSING TO BUILD after " & $gDuProbeWaits &
+         " refreshes -- " & why & ". Parent route = " & gDuParentRoute &
+         ", parentRect=[" & duDescribeRect(gDuParentRect) &
+         "], source label's own canvas 0x" & hexOf(cast[uint64](srcCv0)) &
+         ". Exactly one clone was made and it has been switched off; nothing " &
+         "else in the game was changed."
     return false
-  okLog "debugui: canvas assertion PASSED -- probe clone and source label are " &
-        "both on canvas 0x" & hexOf(cast[uint64](srcCv0)) & " (renderMode=" &
-        duDescribeInt(DuCanvasMode, srcCv0) & ", scaleFactor=" &
-        duDescribeScale(srcCv0) & ") via " & gDuParentRoute &
-        ". One canvas, one render pass; the rest of the pool is safe to build."
 
   let fields = duSplit(gDuCfg.panelFields, ',')
   var nPanel = fields.len

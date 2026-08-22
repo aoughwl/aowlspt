@@ -350,6 +350,7 @@ proc suiTabInitBody(a: Il2CppPtr): Il2CppPtr {.
       if tabR != nil:
         let gnameR = readCString(cSuiGroupName(group))
         swVerifyRelabel("revisit tab=" & gnameR)
+        swLearnTabKlasses(tabR)
         # `revisit = true` keeps the relabel re-asserting itself while silencing
         # the Phase-2b value census, which would otherwise print thirty lines
         # every time the player clicks a tab. Passed as an ARGUMENT and not set
@@ -402,6 +403,15 @@ proc suiTabInitBody(a: Il2CppPtr): Il2CppPtr {.
   # +0x88. A postfix here therefore sees a fully built tab -- confirmed live
   # (78 controls across game/graphics/postfx/sound).
   suiWalkTab(tab, gname)
+  # Teach the widget-klass census from THIS tab, whichever tab it is.
+  #
+  # It used to be taught only from the tab the pages render on (Game), and the
+  # only toggle anchor lives on Sound -- so `toggleKlass` was 0 at render time,
+  # the donor fell back to the most common klass (dropdown), and the player got
+  # three boolean rows drawn as language dropdowns. The klass pointers are
+  # stable within a process, so a toggle learned on Graphics is still the toggle
+  # klass when Game renders.
+  swLearnTabKlasses(tab)
   # The registry poll stays as a cheap backstop for any tab that somehow lags.
   suiPollRegisteredTabs()
   # PHASE 2 -- the WRITE side, in `settingswrite.nim`. It runs here, inside this

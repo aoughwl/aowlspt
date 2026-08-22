@@ -126,6 +126,31 @@
  * conditional on hardware: 'FOV:' and 'Enable VoIP' are always on Game,
  * 'Device:' and 'Overall volume:' always on Sound.
  * ------------------------------------------------------------------ */
+/* ONE label per type was not enough, and the failure was visible on screen.
+ *
+ * The single toggle anchor was 'Enable VoIP', which lives on the SOUND tab. The
+ * pages render on the GAME tab, so at render time `gSwKlassToggle` was still 0,
+ * the donor fell back to "most common klass on this tab" -- the DROPDOWN, 16 of
+ * them -- and the player got three rows that each said "English". A boolean
+ * setting drawn as a language dropdown is worse than no row.
+ *
+ * So each type now carries SEVERAL known labels spread across tabs, and the
+ * census keeps whichever it meets first. The live 78-control capture is the
+ * source of these: dropdown 38x, toggle 19x, float slider 13x, select slider 8x.
+ * Deliberately listed per tab so it is obvious which tab teaches what:
+ *
+ *   GAME      'FOV:' (float), 'Interface language' (dropdown)
+ *   GRAPHICS  'VSync' / 'Enable PostFX' (toggle),
+ *             'Screen resolution:' (dropdown),
+ *             'Overall graphics quality:' (select), 'Sharpness:' (float)
+ *   SOUND     'Enable VoIP' (toggle), 'Device:' (dropdown),
+ *             'Overall volume:' (select)
+ *
+ * The klass POINTERS differ per launch, so these are matched per session and
+ * then cached; the labels are the only stable thing about them. A non-English
+ * client matches none of these, which is exactly why a failed census must
+ * degrade honestly rather than silently pick the wrong widget.
+ */
 #define AOWL_SW_ANCHOR_FLOAT     "FOV:"
 #define AOWL_SW_ANCHOR_TOGGLE    "Enable VoIP"
 #define AOWL_SW_ANCHOR_DROPDOWN  "Device:"
@@ -135,6 +160,52 @@ static const char* aowl_sw_anchor_float(void)    { return AOWL_SW_ANCHOR_FLOAT; 
 static const char* aowl_sw_anchor_toggle(void)   { return AOWL_SW_ANCHOR_TOGGLE; }
 static const char* aowl_sw_anchor_dropdown(void) { return AOWL_SW_ANCHOR_DROPDOWN; }
 static const char* aowl_sw_anchor_select(void)   { return AOWL_SW_ANCHOR_SELECT; }
+
+/* The widened tables. Index 0 of each is the historical single anchor above, so
+ * nothing that already worked changes behaviour. */
+static const char* const aowl_sw_anchors_float[] = {
+    "FOV:", "Sharpness:", "Head bobbing:", "Mouse sensitivity",
+    "Aiming sensitivity", "Field of view"
+};
+static const char* const aowl_sw_anchors_toggle[] = {
+    "Enable VoIP", "VSync", "Enable PostFX", "Fullscreen", "Auto RAM Cleaner",
+    "Head bobbing", "Chromatic aberrations", "Noise"
+};
+static const char* const aowl_sw_anchors_dropdown[] = {
+    "Device:", "Interface language", "Screen resolution:", "Screen mode:",
+    "Texture quality", "Shadows quality", "Language"
+};
+static const char* const aowl_sw_anchors_select[] = {
+    "Overall volume:", "Overall graphics quality:", "Music volume:",
+    "Interface volume:"
+};
+
+#define AOWL_SW_N_FLOAT     ((int32_t)(sizeof(aowl_sw_anchors_float)    / sizeof(char*)))
+#define AOWL_SW_N_TOGGLE     ((int32_t)(sizeof(aowl_sw_anchors_toggle)   / sizeof(char*)))
+#define AOWL_SW_N_DROPDOWN     ((int32_t)(sizeof(aowl_sw_anchors_dropdown) / sizeof(char*)))
+#define AOWL_SW_N_SELECT     ((int32_t)(sizeof(aowl_sw_anchors_select)   / sizeof(char*)))
+
+/* kind: 0 = float, 1 = toggle, 2 = dropdown, 3 = select. Out-of-range returns
+ * an empty string rather than reading past the table. */
+static int32_t aowl_sw_anchor_count(int32_t kind) {
+    switch (kind) {
+    case 0: return AOWL_SW_N_FLOAT;
+    case 1: return AOWL_SW_N_TOGGLE;
+    case 2: return AOWL_SW_N_DROPDOWN;
+    case 3: return AOWL_SW_N_SELECT;
+    default: return 0;
+    }
+}
+static const char* aowl_sw_anchor_at(int32_t kind, int32_t i) {
+    if (i < 0 || i >= aowl_sw_anchor_count(kind)) return "";
+    switch (kind) {
+    case 0: return aowl_sw_anchors_float[i];
+    case 1: return aowl_sw_anchors_toggle[i];
+    case 2: return aowl_sw_anchors_dropdown[i];
+    case 3: return aowl_sw_anchors_select[i];
+    default: return "";
+    }
+}
 
 /* ------------------------------------------------------------------ *
  * The guarded byte read
