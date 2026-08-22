@@ -885,6 +885,12 @@ proc iCmdParent(start: Il2CppPtr; depth: int) =
   if iFindTarget("Object::get_name", idx, hits): fnName = iTargetFn(idx)
   if iFindTarget("Component::get_gameObject", idx, hits): fnGo = iTargetFn(idx)
   if iFindTarget("GameObject::get_activeSelf", idx, hits): fnActive = iTargetFn(idx)
+  # This walk is made of CALLS, not field reads. Say so once, up front, with
+  # the RVAs -- so if it ever escapes, the log already names every function it
+  # could have escaped in, without another cycle to find out.
+  iOut("  via Transform::get_parent, Component::get_transform, " &
+       "Object::get_name, Component::get_gameObject, " &
+       "GameObject::get_activeSelf (calls, not field reads)")
   if fnParent == nil:
     iErr("Transform::get_parent did not verify on this build; cannot walk")
     return
@@ -950,11 +956,54 @@ proc iCmdCanvas(p: Il2CppPtr) =
       iErr("that Canvas pointer is not readable")
     return
   iOut("  canvas klass = " & iPtrU(cast[uint64](cReadPtrAt(canvas, 0'i32))))
+  # WHY THESE THREE ARE CALLS AND NOT FIELD READS, AND WHY THAT MATTERS.
+  #
+  # `renderMode`, `sortingOrder` and `scaleFactor` are NOT managed fields and
+  # cannot be read the way `read $verlabel+0x60 ptr` reads one. Their prologues
+  # are the IL2CPP INTERNAL-CALL shape --
+  #
+  #     40 53              push rbx
+  #     48 83 EC 20        sub  rsp, 0x20
+  #     48 8B 05 xx xx xx xx   mov  rax, [rip+...]   <- the icall pointer cache
+  #     48 8B D9           mov  rbx, rcx
+  #
+  # -- a thin managed wrapper that forwards into Unity's C++ engine. A
+  # UnityEngine.Object's real state lives in that C++ object, reached through
+  # `m_CachedPtr` at +0x10 on the managed wrapper. There is no managed field
+  # holding a render mode to read instead; the call is the only route.
+  #
+  # Which is exactly why the liveness gate below is mandatory. If `m_CachedPtr`
+  # is 0 -- a destroyed Unity object (the "fake null" every Unity user meets),
+  # or a pointer that was never a UnityEngine.Object because the m_Canvas
+  # offset was wrong for this build -- then the native side dereferences that
+  # zero or that garbage, and the fault happens INSIDE Unity's C++ where no
+  # amount of care on our side can predict it. That is the `canvas $verlabel`
+  # escape: the field reads before it all succeeded, and then we called into
+  # native code on an object whose native half we had never checked.
+  let nativeOk = duOk(canvas, 0x18'i32)
+  let native = (if nativeOk: cReadPtrAt(canvas, 0x10'i32) else: nil)
+  iOut("  Canvas m_CachedPtr (+0x10) = " & iPtr(native) &
+       (if native == nil: "   <- NO native object" else: "   (native half is live)"))
+  if native == nil:
+    iErr("refusing to call Canvas::get_renderMode / get_sortingOrder / " &
+         "get_scaleFactor on this pointer. They are internal calls into " &
+         "Unity's C++ engine and they dereference m_CachedPtr, which is 0 " &
+         "here -- so calling them would fault inside native code. Either " &
+         "this object is a destroyed Unity object, or +0x" &
+         iHexPad(uint64(off), 2) & " is not really Graphic.m_Canvas on this " &
+         "build. The klass pointer above is the thing to check.")
+    return
   var idx = 0
   var hits = 0
+  # Every CALL announces itself with its name and RVA before it is made, so an
+  # escape in the log is instantly attributable to a call rather than to a
+  # field read -- the two fail in completely different places and want
+  # completely different fixes.
   if iFindTarget("Canvas::get_renderMode", idx, hits):
     let fn = iTargetFn(idx)
     if fn != nil:
+      iOut("  via UnityEngine.Canvas::get_renderMode @0x" &
+           iHexPad(iTargetRva(idx), 6) & " (internal call)")
       iMark(("Canvas::get_renderMode"), canvas)
       let m = cInspUP(fn, canvas, nil) and 0xFFFFFFFF'u64
       iOut("  renderMode = " & $int64(m) &
@@ -965,11 +1014,15 @@ proc iCmdCanvas(p: Il2CppPtr) =
   if iFindTarget("Canvas::get_sortingOrder", idx, hits):
     let fn = iTargetFn(idx)
     if fn != nil:
+      iOut("  via UnityEngine.Canvas::get_sortingOrder @0x" &
+           iHexPad(iTargetRva(idx), 6) & " (internal call)")
       iMark(("Canvas::get_sortingOrder"), canvas)
       iOut("  sortingOrder = " & $int(int32(uint32(cInspUP(fn, canvas, nil)))))
   if iFindTarget("Canvas::get_scaleFactor", idx, hits):
     let fn = iTargetFn(idx)
     if fn != nil:
+      iOut("  via UnityEngine.Canvas::get_scaleFactor @0x" &
+           iHexPad(iTargetRva(idx), 6) & " (internal call)")
       iMark(("Canvas::get_scaleFactor"), canvas)
       iOut("  scaleFactor = " & iFmtF(float64(cInspFP(fn, canvas, nil))))
 
