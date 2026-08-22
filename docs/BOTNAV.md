@@ -260,6 +260,20 @@ in RCX. One hook is therefore both halves of the feature:
 * **the service tick** — a bot's pending command is issued while that bot's own
   Update runs, so no pointer is ever held across frames.
 
+**Merge note — the prologue-snapshot change.** This branch was cut from
+`merge-host-all` @5858946. That branch has since gained
+`fix(host): verify prologues against ORIGINAL bytes, snapshotted before any
+detour` (699c291, `abi/aowlspt_prologue.h`), which fixes the trap where
+byte-verifying a function another feature already patched reads the
+**trampoline** and self-rejects. On merge, `aowl_botnav_verify` should be moved
+onto that shared snapshot.
+
+Nothing here is currently exposed to that trap — `UpdateManual` is detoured by
+nothing else, and `GoToPoint` / `StopMove` / `SetTargetMoveSpeed` are call
+targets that are never detoured at all — but that is a property of today's
+feature set, not a guarantee, and it is exactly the sort of thing that stops
+being true quietly.
+
 **Hook contention: none.** Nothing else in this host detours `UpdateManual`
 (kinds 0–13 are all elsewhere; the closest neighbour is `botai`, kind 12, on
 `PreActivate`). Anything that later wants `UpdateManual` must register as a RIDER
