@@ -1615,14 +1615,17 @@ proc inspectInit(dir: string) =
 proc bindInspect(verbose: bool): bool =
   ## THE THIRD RIDER on `EFT.UI.PreloaderUI::Update`.
   ##
-  ## It does not verify that function's prologue, and that is deliberate rather
-  ## than lazy. By the time this runs the F3 overlay or the menu mode-text
-  ## feature may already have written a JUMP into it, and a prologue check
-  ## against a TRAMPOLINE fails -- which is exactly the live trap currently
-  ## self-rejecting `uxMenuModeText` ("0 target(s) verified, 1 rejected"). So
-  ## when a slot is already claimed this ALIASES onto it and verifies nothing;
-  ## only when nothing has claimed it does this verify and attach its own,
-  ## against bytes that are by construction still original.
+  ## When another rider has already claimed the slot this ALIASES onto it and
+  ## does not verify at all -- there is nothing to verify, since it is not
+  ## installing a detour, only adding a dispatch arm to one that exists.
+  ##
+  ## When it DOES have to attach its own, it verifies through
+  ## `cDuPreloaderTarget`, which since the prologue-snapshot fix compares
+  ## against the ORIGINAL bytes recorded by `aowl_pro_prime_all` before any
+  ## feature bound (`abi/aowlspt_prologue.h`), not against live memory. So the
+  ## check is exact and strict and CANNOT self-reject because another feature
+  ## detoured the function first -- which was the live trap that produced
+  ## "menu mode text: 0 target(s) verified, 1 rejected" on a correct RVA.
   if gInspSlot >= 0:
     return true
   if not gReady or gDisableDrain:

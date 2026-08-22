@@ -111,6 +111,12 @@ import invoke
 ## UpdateManual` checks before it will ever call `BotOwner::Activate`. The detour
 ## body is in `botai.nim` (included below). See `aowlspt_botai.h`.
 {.emit: """#include "aowlspt_botai.h" """.}
+## NATIVE BOT NAVIGATION API: the offsets, the byte-verified
+## `EFT.BotOwner::UpdateManual` target, the guarded raw readers and the three
+## direct-call thunks (GoToPoint, StopMove, SetTargetMoveSpeed). The registry
+## and the service tick are in `botnav.nim` (included below). See
+## `aowlspt_botnav.h`, and `docs/BOTNAV.md` for the recon behind every number.
+{.emit: """#include "aowlspt_botnav.h" """.}
 ## Phase 1 native-settings probe: static field offsets for walking the live
 ## SettingsScreen control tree read-only. Offsets only; the walk is in
 ## `settingsui.nim` (included below). See `aowlspt_settingsui.h`.
@@ -156,6 +162,14 @@ static void aowl_pro_prime_all(void) {
      * is therefore in neither loop above, and it is the exact target the live
      * bug fired on. */
     aowl_pro_prime(aowl_du_preloader_update_rva());
+    /* The bot-nav API's detour target and its three call targets. Uncontended
+     * as of today, primed anyway: this table is cheap and the whole point of
+     * the eager pass is not to depend on "nothing else patches that". */
+    for (i = 0; i < aowl_botnav_target_count(); i++)
+        aowl_pro_prime(aowl_botnav_targets[i].rva);
+    aowl_pro_prime(AOWL_BN_GOTOPOINT_RVA);
+    aowl_pro_prime(AOWL_BN_STOPMOVE_RVA);
+    aowl_pro_prime(AOWL_BN_SETSPEED_RVA);
 }
 """.}
 {.emit: """#include "aowlspt_detour.h" """.}
@@ -1122,6 +1136,24 @@ var gBotAiSlot = -1
 var gBotAi = false
 var gBotAiFires = 0
 var gBotAiPokes = 0
+## NATIVE BOT NAVIGATION API (kind=15 detour on `EFT.BotOwner::UpdateManual`):
+## its slot, opt-in flag (`botNav`), a fire counter and a fault counter used to
+## self-disable. UpdateManual runs once per live bot per frame on the Unity
+## thread with RCX = the BotOwner, which makes ONE hook serve as both the live
+## bot census and the per-bot nav-command service tick -- so this feature needs
+## no enumeration, no GameWorld walk, and contends with no other detour.
+## Declared here beside the other detour slots; the registry, the command apply
+## and the direct call to `EFT.BotOwner::GoToPoint` live in `botnav.nim`
+## (included below), which reuses this file's guarded primitives + SEH guard.
+var gBotNavSlot = -1
+var gBotNav = false
+var gBotNavFires = 0
+var gBotNavFaults = 0
+var gBotNavOff = false
+var gReportBotNav = ""
+  ## The census as last put on the report path. Compared rather than assumed
+  ## because the path is only rebuilt when something changed, and a census that
+  ## has not changed is not news.
 ## Phase 1 native-settings probe (kind=4 detour on `SettingsScreen::Show`): its
 ## slot, opt-in flag (`settingsUiProbe`), and once-per-open guard. Declared here
 ## beside the other detour slots; the walk itself lives in `settingsui.nim`
@@ -2770,6 +2802,13 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
   if i == gBotAiSlot:
     botAiPreActivateFired(regs)
     return 0'i32
+  # NATIVE BOT NAVIGATION API: the per-bot registry refresh + nav-command service
+  # tick, by identity. It records the bot, and issues at most one throttled
+  # GoToPoint/StopMove/SetTargetMoveSpeed -- and must never suppress the original
+  # UpdateManual, which is the bot's entire brain.
+  if i == gBotNavSlot:
+    botNavUpdateFired(regs)
+    return 0'i32
   # Phase 1 native-settings probe: the read-only control-tree walk, by identity.
   if i == gSettingsUiSlot:
     settingsUiProbeFired(regs)
@@ -3221,6 +3260,7 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
               elif kind == 12: "botai"
               elif kind == 13: "menu-mode-text"
               elif kind == 14: "live-inspector"
+              elif kind == 15: "bot-nav"
               else: "main-thread")
   tablesLock()
   let claimed = cHookClaim()
@@ -3290,6 +3330,8 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
     gModeTextSlot = int(claimed)
   elif kind == 14:
     gInspSlot = int(claimed)
+  elif kind == 15:
+    gBotNavSlot = int(claimed)
   else:
     gDrainSlot = int(claimed)
   tablesUnlock()
@@ -3297,7 +3339,7 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
     gRenderMethod = spec
   elif kind == 2 or kind == 3 or kind == 4 or kind == 5 or kind == 6 or
        kind == 7 or kind == 8 or kind == 9 or kind == 10 or
-       kind == 11 or kind == 12 or kind == 13 or kind == 14:
+       kind == 11 or kind == 12 or kind == 13 or kind == 14 or kind == 15:
     discard
   else:
     gDrainMethod = spec
@@ -3307,7 +3349,7 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
         (if perFrame or kind == 2 or kind == 3 or kind == 4 or kind == 5 or
             kind == 6 or kind == 7 or kind == 8 or kind == 9 or
             kind == 10 or kind == 11 or kind == 12 or kind == 13 or
-            kind == 14: "" else:
+            kind == 14 or kind == 15: "" else:
            "; it runs more than once a frame, so its firing count is not a " &
            "frame count")
   return true
@@ -3974,6 +4016,14 @@ include "botcap.nim"
 ## `botAiPreActivateFired` (dispatched by slot identity in `patchFired`) and
 ## `bindBotAi`.
 include "botai.nim"
+## NATIVE BOT NAVIGATION API. Kept in its own file to avoid colliding with
+## concurrent host work; `include`d (not imported) so it shares this file's
+## guarded raw primitives, `cRegsInt`, `cNowMs`, logging, `attachDrain`, the
+## VEH/SEH guard, and the verified `EFT.BotOwner::UpdateManual` target. Defines
+## `botNavUpdateFired` (dispatched by slot identity in `patchFired`),
+## `bindBotNav`, `bnSetWanted`/`bnParseCommands` (the poll-thread intake) and
+## `botNavCensus` (the registry, carried back on the existing report).
+include "botnav.nim"
 ## Phase 1 native-settings control-tree probe. Kept in its own file to avoid
 ## colliding with concurrent host work; `include`d (not imported) so it shares
 ## this file's guarded raw-read primitives, logging, `attachDrain`, and the
@@ -4795,9 +4845,27 @@ proc publishReport(now: uint64) =
   ## reads.
   if gSyncBase.len == 0:
     return
+  # The bot registry is the THIRD reason to rebuild, and it needs to be checked
+  # here rather than anywhere else: the two reasons above are both about the mod
+  # rows, so a raid full of moving bots on a stage whose mods have long since
+  # settled would rebuild the path exactly once and then freeze -- the census
+  # would go out one time and never update again, which looks precisely like a
+  # feature that does not work.
+  #
+  # Rate-limited by the same `gReportNextMs` as the rotation, because the worker
+  # reads the path once per poll and rewriting it faster changes nothing anyone
+  # reads. Publishing here also means the census the path carries is the one the
+  # Unity thread had built as of this moment.
+  var census = ""
+  if gBotNav and not gBotNavOff:
+    census = botNavCensus()
+  let censusNew = census != gReportBotNav and now >= gReportNextMs
+  if censusNew:
+    gReportBotNav = census
+    modcontrol.reportBotNav(census)
   let fresh = modcontrol.reportSeq() != gReportSeq
   let rotate = modcontrol.reportPending() and now >= gReportNextMs
-  if not fresh and not rotate:
+  if not fresh and not rotate and not censusNew:
     return
   gReportSeq = modcontrol.reportSeq()
   gReportNextMs = now + uint64(gSyncMs)
@@ -4865,6 +4933,30 @@ proc takeModSet() =
   var wanted = ""
   if modcontrol.parseMenuModeText(doc, wanted):
     modeTextSetWanted(wanted)
+
+  # Bot navigation commands ride the same poll for the same reason, and are held
+  # to the same rule: read only from a document `parseDesired` accepted, gated
+  # for length and charset in `parseBotNav` before the command grammar ever sees
+  # them, and gated again per field in `bnParseCommands` before anything reaches
+  # a game pointer. An older manager omits the field, `parseBotNav` returns
+  # false, and no command is published -- the bots keep doing whatever their own
+  # brains decided, which is the correct thing for this feature to do when it has
+  # nothing to say.
+  #
+  # This runs on the POLL thread. It only publishes; every game-side effect
+  # happens later on the Unity thread inside the guarded per-bot tick.
+  if gBotNav and not gBotNavOff:
+    # The registry going the other way is published in `publishReport`, which is
+    # where every decision about the report path is made; nothing about it
+    # belongs here.
+    var navSpec = ""
+    if modcontrol.parseBotNav(doc, navSpec):
+      if navSpec.len == 0:
+        var none: seq[BnCmd] = @[]
+        bnSetWanted(none)
+      else:
+        let cmds = bnParseCommands(navSpec)
+        bnSetWanted(cmds)
 
 proc runPending() =
   ## The host thread's half.
@@ -4991,6 +5083,19 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "is NOT written; the game still runs its own NavMesh check and its own " &
          "Activate on its own schedule. Fail-safe -- no write if the " &
          "build/pointer does not check out."
+  gBotNav = readBoolKey("botNav")
+  if gBotNav:
+    info "botNav is set: a kind=15 detour on EFT.BotOwner.UpdateManual (once per " &
+         "live bot per frame, RCX = the BotOwner) keeps a live bot registry -- " &
+         "id, role, difficulty, position, alive-state -- and services nav " &
+         "commands sent over the existing modSyncMs poll. A command is a DIRECT " &
+         "CALL to EFT.BotOwner.GoToPoint @0x81CB40, whose NavMeshPathStatus " &
+         "return says whether the point was reachable. Every pointer hop the " &
+         "callee makes is VirtualQuery-walked BEFORE the call, the whole tick " &
+         "runs under the VEH/SEH guard, commands are re-issued on a 500 ms " &
+         "throttle (never per frame -- GoToPoint allocates a managed path), and " &
+         "the feature self-disables after 8 trapped faults. This one CALLS INTO " &
+         "and WRITES TO game objects, unlike botDiag."
   gSettingsUiProbe = readBoolKey("settingsUiProbe")
   if gSettingsUiProbe:
     info "settingsUiProbe is set: read-only detours on SettingsScreen.Show " &
@@ -5266,6 +5371,15 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       # prologue does not match.
       if gBotAi and not bindBotAi(true):
         info "botai did not arm (EFT.BotOwner.PreActivate unverified on this " &
+             "build, or drain disabled)"
+
+      # NATIVE BOT NAVIGATION API (opt-in). BotOwner.UpdateManual is static code,
+      # so the detour installs now and never fires until a raid has ticking bots;
+      # then it registers each one and services its nav commands. Fail-safe if
+      # the prologue does not match. Nothing else in this host detours
+      # UpdateManual -- anything that later wants it must ride kind 15.
+      if gBotNav and not bindBotNav(true):
+        info "botnav did not arm (EFT.BotOwner.UpdateManual unverified on this " &
              "build, or drain disabled)"
 
       # THE IN-GAME DEBUG OVERLAY (opt-in). PreloaderUI::Update is static code,
