@@ -104,7 +104,87 @@ static const AowlNavTarget aowl_nav_targets[] = {
         0x56,
         0x48,0x83,0xEC,0x20,
         0x48,0x8B,0x05,0x37,0x88,0x9B }, 16 },
+
+    /* ---- DOWNWARD TRAVERSAL. The inspector could only walk UP a parent
+     * chain, which means that from any known object it could never reach a
+     * BUTTON -- and so could never click anything. These two are what turn it
+     * from a viewer into a harness.
+     *
+     * Resolved from the DECRYPTED metadata (see docs/METADATA-DECRYPT.md) and
+     * then read back out of GameAssembly.dll twice, independently, before
+     * being written here. */
+
+    /* UnityEngine.Transform::GetChild(int) -- rcx = transform, edx = index.
+     * A real body that forwards to an icall, so the native half must be
+     * checked before calling. Returns a Transform. */
+    { "UnityEngine.Transform::GetChild", 0x52BA180u,
+      { 0x48,0x89,0x5C,0x24,0x08,
+        0x57,
+        0x48,0x83,0xEC,0x20,
+        0x48,0x8B,0x05,0x6F,0xAA,0xE1 }, 16 },
+
+    /* UnityEngine.Transform::get_childCount -- rcx = transform.
+     * INTERNAL CALL shape (`mov rax,[rip+..]` into a cached native pointer).
+     * It dereferences m_CachedPtr at +0x10 and faults inside Unity's C++ if
+     * that is null, which is unguardable from our side -- hence the liveness
+     * check every caller here performs first. */
+    { "UnityEngine.Transform::get_childCount", 0x52B9CA0u,
+      { 0x40,0x53,
+        0x48,0x83,0xEC,0x20,
+        0x48,0x8B,0x05,0x03,0xAF,0xE1,0x01,
+        0x48,0x8B,0xD9 }, 16 },
+
+    /* ---- ACTIVATION. Two routes, deliberately.
+     *
+     * `Button::Press` is the game's OWN path: it re-checks IsActive and
+     * IsInteractable itself and then fires m_OnClick, exactly as a real click
+     * does. That is what `click` uses, because reproducing the game's path is
+     * always safer than reproducing its effect.
+     *
+     * `UnityEvent::Invoke` fires a UnityEvent directly, skipping those checks.
+     * That is what `invoke` uses, for the case where a control is deliberately
+     * non-interactable but the handler still needs to run. Two commands rather
+     * than one flag, so the log says which was used. */
+    { "UnityEngine.UI.Button::Press", 0x539A7A0u,
+      { 0x40,0x53,
+        0x48,0x83,0xEC,0x20,
+        0x80,0x3D,0xCC,0xC5,0xD3,0x01,0x00,
+        0x48,0x8B,0xD9 }, 16 },
+
+    { "UnityEngine.Events.UnityEvent::Invoke", 0x52C34A0u,
+      { 0x48,0x89,0x5C,0x24,0x18,
+        0x48,0x89,0x6C,0x24,0x20,
+        0x57,
+        0x48,0x83,0xEC,0x20,
+        0x80 }, 16 },
 };
+
+/* ---- FIELD OFFSETS, corroborated by the accessors' own inlined bodies.
+ *
+ * These are not guesses from a dump; each one is confirmed by disassembling
+ * the property getter, which on this build is inlined to a single load:
+ *
+ *   Button::get_onClick          @0x691570  48 8B 81 00 01 00 00 C3
+ *                                           mov rax,[rcx+0x100]; ret
+ *   Selectable::get_interactable @0x7DC330  0F B6 81 D8 00 00 00 C3
+ *                                           movzx eax,byte [rcx+0xD8]; ret
+ *   Toggle::get_isOn             @0x66E7C0  0F B6 81 20 01 00 00 C3
+ *                                           movzx eax,byte [rcx+0x120]; ret
+ *
+ * A getter that IS the field read is the strongest possible evidence for an
+ * offset, and it means the inspector can read all three with NO CALL AT ALL --
+ * no icall, no native dereference, nothing that can fault inside Unity. */
+#define AOWL_NAV_BTN_ONCLICK     0x100  /* Button.m_OnClick -> UnityEvent    */
+#define AOWL_NAV_SEL_INTERACT    0x0D8  /* Selectable.m_Interactable  bool   */
+#define AOWL_NAV_TOG_ISON        0x120  /* Toggle.m_IsOn              bool   */
+#define AOWL_NAV_TOG_ONVALUE     0x118  /* Toggle.onValueChanged -> event    */
+#define AOWL_NAV_UOBJ_CACHEDPTR  0x010  /* UnityEngine.Object.m_CachedPtr    */
+
+static int32_t aowl_nav_off_onclick(void)   { return AOWL_NAV_BTN_ONCLICK;    }
+static int32_t aowl_nav_off_interact(void)  { return AOWL_NAV_SEL_INTERACT;   }
+static int32_t aowl_nav_off_ison(void)      { return AOWL_NAV_TOG_ISON;       }
+static int32_t aowl_nav_off_onvalue(void)   { return AOWL_NAV_TOG_ONVALUE;    }
+static int32_t aowl_nav_off_cachedptr(void) { return AOWL_NAV_UOBJ_CACHEDPTR; }
 
 #define AOWL_NAV_TARGET_COUNT \
     ((int32_t)(sizeof(aowl_nav_targets) / sizeof(aowl_nav_targets[0])))

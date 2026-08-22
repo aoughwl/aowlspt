@@ -105,6 +105,10 @@ proc cNavOffCurrentTab(): int32 {.importc: "aowl_nav_off_currenttab", nodecl.}
 proc cNavOffInitTabs(): int32 {.importc: "aowl_nav_off_inittabs", nodecl.}
 proc cNavOffFirstSel(): int32 {.importc: "aowl_nav_off_firstsel", nodecl.}
 proc cNavOffCreated(): int32 {.importc: "aowl_nav_off_created", nodecl.}
+proc cNavOffOnClick(): int32 {.importc: "aowl_nav_off_onclick", nodecl.}
+proc cNavOffInteract(): int32 {.importc: "aowl_nav_off_interact", nodecl.}
+proc cNavOffIsOn(): int32 {.importc: "aowl_nav_off_ison", nodecl.}
+proc cNavOffCachedPtr(): int32 {.importc: "aowl_nav_off_cachedptr", nodecl.}
 proc cNavReason(): int32 {.importc: "aowl_nav_last_reason", nodecl.}
 proc cNavActualValid(): int32 {.importc: "aowl_nav_actual_valid", nodecl.}
 proc cNavActualAt(i: int32): int32 {.importc: "aowl_nav_actual_at", nodecl.}
@@ -1063,6 +1067,24 @@ proc iCmdCanvas(p: Il2CppPtr) =
       iMark(("Canvas::get_scaleFactor"), canvas)
       iOut("  scaleFactor = " & iFmtF(float64(cInspFP(fn, canvas, nil))))
 
+proc iUnityAlive(p: Il2CppPtr): bool =
+  ## Is the NATIVE half of this UnityEngine.Object still there?
+  ##
+  ## Most of the tree-walking primitives on this build -- `get_childCount`,
+  ## `get_activeSelf`, `get_activeInHierarchy`, `Component::get_gameObject`,
+  ## `Component::get_transform` -- are IL2CPP internal-call wrappers. They
+  ## dereference `m_CachedPtr` at +0x10 and, when it is zero, fault INSIDE
+  ## Unity's C++ where no guard of ours can reach. A managed wrapper whose
+  ## native half is gone is Unity's famous "fake null": it is a perfectly
+  ## readable object that compares equal to null and kills the process if you
+  ## call anything on it.
+  ##
+  ## So every call into one of those goes through here first. This is a plain
+  ## guarded field read and cannot itself fault.
+  if not duOk(p, cNavOffCachedPtr() + 8'i32):
+    return false
+  result = cReadPtrAt(p, cNavOffCachedPtr()) != nil
+
 proc iNavExplain(t: int32; name: string; rva: uint32) =
   ## Say WHICH of the five ways to fail actually happened, and on a signature
   ## mismatch print the bytes side by side. "Did not verify (or is a stub)"
@@ -1128,6 +1150,296 @@ proc iNavGate(what: string): bool =
          "before this one.")
     return false
   result = true
+
+const
+  InspMaxChildren = 64     ## per `children` listing
+  InspFindBudget  = 4000   ## hard node budget for `find` -- see below
+  InspFindMaxHits = 12
+
+proc iNavFindQuiet(want: string; fn: var Il2CppPtr): bool =
+  ## Same lookup, no logging. `find` calls this thousands of times inside one
+  ## frame; the loud version would bury the answer in identical error lines.
+  fn = nil
+  for i in 0 ..< int(cNavTargetCount()):
+    if iContains(iLower(readCString(cNavName(int32(i)))), iLower(want)):
+      fn = cNavFn(int32(i))
+      return fn != nil
+  result = false
+
+proc iChildCount(t: Il2CppPtr; n: var int): bool =
+  ## `Transform::get_childCount` is an ICALL, so the liveness check is not
+  ## optional politeness -- it is the difference between an answer and a
+  ## process death.
+  n = 0
+  var fn: Il2CppPtr = nil
+  if not iNavFindQuiet("get_childCount", fn):
+    return false
+  if not iUnityAlive(t):
+    return false
+  iMark("Transform::get_childCount", t)
+  n = int(int32(uint32(cInspUP(fn, t, nil) and 0xFFFFFFFF'u64)))
+  # A negative or absurd count means we are not looking at a Transform. Refuse
+  # it rather than looping on it: an unbounded loop on the Unity thread is a
+  # hang, and a hang is the one failure this instrument must never cause.
+  if n < 0 or n > 8192:
+    n = 0
+    return false
+  result = true
+
+proc iChildAt(t: Il2CppPtr; i: int): Il2CppPtr =
+  var fn: Il2CppPtr = nil
+  if not iNavFindQuiet("GetChild", fn):
+    return nil
+  if not iUnityAlive(t):
+    return nil
+  iMark("Transform::GetChild", t)
+  result = cast[Il2CppPtr](cInspUPI(fn, t, int32(i), nil))
+
+proc iObjName(p: Il2CppPtr): string =
+  ## `Object::get_name` is a real managed body, but it still ends up in native
+  ## code, so the same liveness rule applies.
+  result = ""
+  var idx = 0
+  var hits = 0
+  if not iFindTarget("Object::get_name", idx, hits):
+    return
+  let fn = iTargetFn(idx)
+  if fn == nil or not iUnityAlive(p):
+    return
+  iMark("Object::get_name", p)
+  result = suiReadString(cast[Il2CppPtr](cInspUP(fn, p, nil)))
+
+proc iCmdChildren(toks: seq[string]) =
+  ## `children EXPR [N]` -- DOWNWARD traversal, the thing the inspector could
+  ## never do. Walking up a parent chain can never reach a Button, so without
+  ## this the instrument could look at anything and touch nothing.
+  if toks.len < 2:
+    iErr("usage: children EXPR [N]")
+    return
+  var v = 0'u64
+  var err = ""
+  if not iEval(toks[1], v, err):
+    iErr(err)
+    return
+  var t = cast[Il2CppPtr](v)
+  if not duOk(t, 0x20'i32):
+    iErr("that pointer is not readable; refusing to walk it.")
+    return
+  if not iUnityAlive(t):
+    iErr("that object's native half (m_CachedPtr +0x" &
+         iHexPad(uint64(cNavOffCachedPtr()), 2) & ") is NULL. Every child " &
+         "primitive on this build is an internal call that would dereference " &
+         "it and fault inside Unity's C++. Refusing to call. This is either a " &
+         "destroyed object or not a UnityEngine.Object at all.")
+    return
+  var count = 0
+  if not iChildCount(t, count):
+    iErr("could not read a sane child count; this is probably not a Transform.")
+    return
+  var want = InspMaxChildren
+  if toks.len > 2:
+    var n = 0'u64
+    var e2 = ""
+    if iEval(toks[2], n, e2) and int(n) > 0:
+      want = int(n)
+  if want > InspMaxChildren:
+    want = InspMaxChildren
+  iOut("  childCount = " & $count &
+       (if count > want: "  (showing first " & $want & ")" else: ""))
+  iOut("  via Transform::GetChild / get_childCount, Object::get_name (calls)")
+  var i = 0
+  while i < count and i < want:
+    let c = iChildAt(t, i)
+    if c == nil or not duOk(c, 0x20'i32):
+      iOut("    [" & $i & "] <child not readable>")
+    else:
+      var line = "    [" & $i & "] " & iPtr(c) &
+                 " name=\"" & iObjName(c) & "\""
+      iSetVar("c" & $i, cast[uint64](c))
+      iOut(line & "   ($c" & $i & ")")
+    inc i
+  let shown = min(count, want)
+  if shown > 0:
+    iOut("  each child is bound to $c0..$c" & $(shown - 1) &
+         " for the rest of this batch")
+  else:
+    iOut("  this transform has no children.")
+
+proc iCmdFind(toks: seq[string]) =
+  ## `find NAME [ROOT] [BUDGET]` -- breadth-first search of the hierarchy by
+  ## GameObject name.
+  ##
+  ## THE BUDGET IS THE WHOLE DESIGN. This runs on Unity's main thread inside
+  ## one frame, so an unbounded search is a frozen client -- and a frozen
+  ## client is worse than any wrong answer, because it takes the whole session
+  ## with it. So the walk is capped on THREE independent axes: total nodes
+  ## visited, matches collected, and children expanded per node. It reports
+  ## when it hit a cap rather than pretending the answer was complete, because
+  ## "not found within budget" and "not present" are completely different
+  ## facts and confusing them would send somebody hunting for a bug that is
+  ## really just a small budget.
+  if toks.len < 2:
+    iErr("usage: find NAME [ROOT] [BUDGET]   -- NAME is a case-insensitive substring")
+    return
+  let want = iLower(toks[1])
+  var root = gInspPreloader
+  if toks.len > 2:
+    var v = 0'u64
+    var err = ""
+    if not iEval(toks[2], v, err):
+      iErr(err)
+      return
+    root = cast[Il2CppPtr](v)
+  if root == nil:
+    iErr("no ROOT given and $preloader is null, so there is nothing to search " &
+         "from. Pass a root explicitly: find NAME $someTransform")
+    return
+  # Start from the root's transform, and climb to the hierarchy root so the
+  # search covers the whole tree rather than one branch of it.
+  var idx = 0
+  var hits = 0
+  if iFindTarget("Component::get_transform", idx, hits):
+    let fnT = iTargetFn(idx)
+    if fnT != nil and iUnityAlive(root):
+      iMark("Component::get_transform", root)
+      let t = cast[Il2CppPtr](cInspUP(fnT, root, nil))
+      if duOk(t, 0x20'i32):
+        root = t
+  if iFindTarget("Transform::get_root", idx, hits):
+    let fnR = iTargetFn(idx)
+    if fnR != nil and iUnityAlive(root):
+      iMark("Transform::get_root", root)
+      let r = cast[Il2CppPtr](cInspUP(fnR, root, nil))
+      if duOk(r, 0x20'i32):
+        root = r
+  var budget = InspFindBudget
+  if toks.len > 3:
+    var b = 0'u64
+    var e3 = ""
+    if iEval(toks[3], b, e3) and int(b) > 0:
+      budget = int(b)
+  if budget > InspFindBudget:
+    budget = InspFindBudget
+  iOut("  searching from " & iPtr(root) & " for name containing \"" &
+       toks[1] & "\" (node budget " & $budget & ")")
+  var queue: seq[Il2CppPtr] = @[]
+  queue.add root
+  var head = 0
+  var visited = 0
+  var found = 0
+  var truncated = false
+  while head < queue.len:
+    if visited >= budget:
+      truncated = true
+      break
+    if found >= InspFindMaxHits:
+      truncated = true
+      break
+    let cur = queue[head]
+    inc head
+    inc visited
+    if not duOk(cur, 0x20'i32) or not iUnityAlive(cur):
+      continue
+    let nm = iObjName(cur)
+    if nm.len > 0 and iContains(iLower(nm), want):
+      inc found
+      iSetVar("f" & $found, cast[uint64](cur))
+      iOut("    HIT " & iPtr(cur) & " name=\"" & nm & "\"   ($f" & $found & ")")
+    var n = 0
+    if iChildCount(cur, n):
+      var k = 0
+      while k < n and k < InspMaxChildren:
+        let c = iChildAt(cur, k)
+        if c != nil:
+          queue.add c
+        inc k
+  iOut("  visited " & $visited & " node(s), " & $found & " match(es)" &
+       (if truncated:
+          "  -- STOPPED EARLY on a cap. This is NOT proof the name is absent; " &
+          "raise the budget or search from a narrower root."
+        else: "  -- the subtree was searched exhaustively."))
+  if found > 0:
+    iOut("  matches are bound to $f1..$f" & $found & " for the rest of this batch")
+
+proc iCmdClick(toks: seq[string]; useInvoke: bool) =
+  ## `click PTR` -- EFT's own path: `Button::Press`, which re-checks IsActive
+  ## and IsInteractable and then fires m_OnClick exactly as a real click does.
+  ## `invoke PTR` -- fire `m_OnClick` directly via `UnityEvent::Invoke`,
+  ## skipping those checks, for a control that is deliberately not
+  ## interactable.
+  ##
+  ## AND IT VERIFIES. Reporting "clicked" because a call returned is exactly
+  ## the failure this instrument exists to abolish -- it is the same class of
+  ## claim as a missed synthetic click. So the interactable flag and the
+  ## m_OnClick pointer are read BEFORE (as plain field reads, no calls), the
+  ## call is announced, and the state is read again AFTER and reported.
+  let verb = (if useInvoke: "invoke" else: "click")
+  if toks.len < 2:
+    iErr("usage: " & verb & " PTR   -- PTR is a Button component")
+    return
+  if not iNavGate(verb):
+    return
+  var v = 0'u64
+  var err = ""
+  if not iEval(toks[1], v, err):
+    iErr(err)
+    return
+  let btn = cast[Il2CppPtr](v)
+  if not duOk(btn, cNavOffOnClick() + 8'i32):
+    iErr("that pointer is not readable to +0x" &
+         iHexPad(uint64(cNavOffOnClick()), 3) & ", so it cannot be a Button. " &
+         "Nothing was called.")
+    return
+  if not iUnityAlive(btn):
+    iErr("that Button's native half is NULL (destroyed object). Nothing was " &
+         "called.")
+    return
+  # Field reads, corroborated by the getters' own inlined bodies -- no calls,
+  # so this pre-flight can never itself be what breaks.
+  let interact = cReadI32At(cast[Il2CppPtr](cast[uint64](btn) +
+                            uint64(cNavOffInteract()))) and 0xFF'i32
+  let onClick = cReadPtrAt(btn, cNavOffOnClick())
+  iOut("  Button m_Interactable(+0x" & iHexPad(uint64(cNavOffInteract()), 3) &
+       ") = " & (if interact != 0'i32: "true" else: "false") &
+       "   m_OnClick(+0x" & iHexPad(uint64(cNavOffOnClick()), 3) & ") = " &
+       iPtr(onClick))
+  if onClick == nil:
+    iErr("m_OnClick is NULL -- this object has no click handler, so it is " &
+         "either not a Button or not wired up. Nothing was called.")
+    return
+  if not useInvoke and interact == 0'i32:
+    iErr("the Button is NOT interactable, so Button::Press would check that " &
+         "and do nothing -- a call that 'succeeds' and changes nothing is the " &
+         "worst possible outcome here. Nothing was called. Use `invoke` to " &
+         "fire m_OnClick anyway if that is really what you want.")
+    return
+  var fn: Il2CppPtr = nil
+  var rva = 0'u32
+  if useInvoke:
+    if not iNavFind("UnityEvent::Invoke", fn, rva):
+      return
+    iOut("  via UnityEngine.Events.UnityEvent::Invoke @0x" &
+         iHexPad(uint64(rva), 6) & " (call) on " & iPtr(onClick))
+    iMark("UnityEvent::Invoke", onClick)
+    discard cInspUP(fn, onClick, nil)
+  else:
+    if not iNavFind("Button::Press", fn, rva):
+      return
+    iOut("  via UnityEngine.UI.Button::Press @0x" & iHexPad(uint64(rva), 6) &
+         " (call) on " & iPtr(btn))
+    iMark("Button::Press", btn)
+    discard cInspUP(fn, btn, nil)
+  # THE AFTER-READ. Whether anything actually changed is a question about the
+  # game's state, not about our call returning.
+  let interact2 = cReadI32At(cast[Il2CppPtr](cast[uint64](btn) +
+                             uint64(cNavOffInteract()))) and 0xFF'i32
+  iOut("  returned without faulting. m_Interactable now " &
+       (if interact2 != 0'i32: "true" else: "false") &
+       (if interact2 != interact: "  (CHANGED)" else: "  (unchanged)"))
+  iOut("  NOTE: a handler that returns normally is not proof the intended " &
+       "thing happened -- most click handlers act on OTHER objects. Follow " &
+       "with `state`, or `until` on whatever the click was supposed to " &
+       "create, to confirm the effect rather than the call.")
 
 proc iCmdOpen(toks: seq[string]) =
   ## `open [GROUP]` -- EFT.UI.SettingsScreen::ShowScreen(screen, group).
@@ -1559,6 +1871,14 @@ proc iCmdHelp() =
   iOut("    open [GROUP]                  SettingsScreen::ShowScreen (async!)")
   iOut("                                  e.g.  allow write | open 0")
   iOut("    tab EXPR [0|1]                SettingsTab::set_IsSelected")
+  iOut("  -- hierarchy (children/find are READ-ONLY; click/invoke need write) --")
+  iOut("    children EXPR [N]             list child transforms, bind $c0..$cN")
+  iOut("                                  e.g.  children $preloader")
+  iOut("    find NAME [ROOT] [BUDGET]     breadth-first name search, bind $f1..")
+  iOut("                                  e.g.  find PvE")
+  iOut("    click EXPR                    Button::Press (checks interactable)")
+  iOut("                                  e.g.  allow write | click $f1")
+  iOut("    invoke EXPR                   fire m_OnClick directly, no checks")
   iOut("                                  e.g.  tab $settings@0x118 1")
   iOut("    image                         GameAssembly base + il2cpp section")
   iOut("    allow write                   arm writes/calls for this batch")
@@ -1695,10 +2015,13 @@ proc iExec(line: string) =
         discard iParseU(toks[2], d)
       iCmdParent(cast[Il2CppPtr](v), int(d))
   of "children":
-    iErr("children is not reachable on this build: Transform's child accessors " &
-         "are not in the byte-verified target tables and reflection is dead. " &
-         "Walk UP with `parent` from an object you have already verified -- " &
-         "that is how the settings-row container was reached.")
+    iCmdChildren(toks)
+  of "find":
+    iCmdFind(toks)
+  of "click":
+    iCmdClick(toks, false)
+  of "invoke":
+    iCmdClick(toks, true)
   of "open":
     iCmdOpen(toks)
   of "tab":

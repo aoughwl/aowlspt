@@ -82,3 +82,6 @@ __pycache__/
 
 # Texture mod: the assembled image pack (rebuilt by pipeline/build_pack.py --copy)
 mods/textures/data/pack/
+
+# Decrypted IL2CPP metadata cache (large, derived, never committed)
+.cache/
