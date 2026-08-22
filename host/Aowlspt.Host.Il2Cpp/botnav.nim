@@ -170,15 +170,31 @@ type
     holdMs: int64
 
 var gBnReg: array[BnMaxBots, BnEntry]
-var gBnWant: array[BnMaxCmds, BnCmd]
-var gBnWantN = 0
+
+# The command handoff is a LOCK-FREE DOUBLE BUFFER, and the shape is deliberate.
+#
+# The obvious alternative -- a flag the two sides spin on -- is not acceptable
+# here: one of the two sides is the Unity main thread inside a bot's Update, and
+# a spin on a plain `bool` that the C compiler is free to hoist out of the loop
+# turns a rare contention into a hung game. `tablesLock` is no better; it is a
+# lock a mod's `patch` also takes, and putting it on a per-frame path would couple
+# the game's frame time to whatever a mod is doing.
+#
+# So instead: the poll thread fills the buffer the Unity thread is NOT reading,
+# and only then publishes the generation. The Unity thread reads the generation
+# once, and if it moved, reads the buffer that generation names. A new publish
+# can only ever touch the other buffer, so the read cannot be torn by one writer.
+# Two publishes during a single read would be needed to catch it, and the writer
+# runs every `modSyncMs` (3 s by default) against a read that takes microseconds.
+var gBnWant: array[2, array[BnMaxCmds, BnCmd]]
+var gBnWantN: array[2, int]
 var gBnGen = 0
-  ## Bumped by the POLL thread whenever a new command set arrives.
+  ## Bumped by the POLL thread, LAST, after the buffer it names is filled. Its
+  ## low bit selects the buffer.
 var gBnApplied = -1
   ## Last generation consumed by the UNITY thread. The per-frame path reads one
   ## aligned int and, when it matches, touches the shared table not at all --
   ## the same "only when it actually changed" discipline modetext uses.
-var gBnCmdLock = false
 var gBnCensusAt = 0'i64
 var gBnCensus = ""
 var gBnCensusCursor = 0
@@ -201,38 +217,34 @@ proc bnSanePtr(p: Il2CppPtr): bool =
 # ---------------------------------------------------------------------------
 
 proc bnSetWanted*(cmds: seq[BnCmd]) =
-  ## Publish a new command set. Called from `takeModSet` on the poll thread after
-  ## `parseDesired` has accepted the document. Copies into the fixed table and
-  ## bumps the generation; the Unity thread picks it up on the next bot tick.
+  ## Publish a new command set. Called from `takeModSet` on the POLL thread after
+  ## `parseDesired` has accepted the document.
   ##
-  ## The crude spin here is deliberate: the critical section is a memcpy of at
-  ## most 16 small records and is entered at most once per poll (default every
-  ## 3 s) on one side and once per generation change on the other, so it is
-  ## never contended in practice. Taking `tablesLock` instead would put a lock a
-  ## mod's `patch` also takes onto a per-frame path, which is exactly the kind of
-  ## coupling this host avoids.
-  while gBnCmdLock:
-    discard
-  gBnCmdLock = true
+  ## Writes the buffer the Unity thread is not reading, and bumps the generation
+  ## LAST -- the generation is the publish, so it must not move until the data it
+  ## names is complete. See the note on the buffers above for why this is not a
+  ## lock.
+  let slot = (gBnGen + 1) and 1
   var n = cmds.len
   if n > BnMaxCmds:
     n = BnMaxCmds
   for i in 0 ..< n:
-    gBnWant[i] = cmds[i]
-  gBnWantN = n
+    gBnWant[slot][i] = cmds[i]
+  gBnWantN[slot] = n
   gBnGen = gBnGen + 1
-  gBnCmdLock = false
 
-proc bnTakeWanted(into: var array[BnMaxCmds, BnCmd]): int =
+proc bnTakeWanted(gen: int; into: var array[BnMaxCmds, BnCmd]): int =
   ## Unity-thread side of the handoff. Only ever called when the generation
-  ## actually moved.
-  while gBnCmdLock:
-    discard
-  gBnCmdLock = true
-  let n = gBnWantN
+  ## actually moved, and it reads the buffer THAT generation names.
+  ##
+  ## `gen` is passed in rather than re-read here so that the caller marks as
+  ## applied exactly the generation it consumed. Re-reading would let a publish
+  ## landing mid-call have the caller record a newer generation as applied than
+  ## the one it actually read, silently dropping a command set.
+  let slot = gen and 1
+  let n = gBnWantN[slot]
   for i in 0 ..< n:
-    into[i] = gBnWant[i]
-  gBnCmdLock = false
+    into[i] = gBnWant[slot][i]
   result = n
 
 proc bnParseFloat(s: string; into: var float64): bool =
@@ -410,8 +422,9 @@ proc bnApplyGeneration(now: int64) =
   ## Fold a newly-arrived command set into the registry. Runs on the Unity thread
   ## at most once per generation, not per bot and not per frame.
   var cmds: array[BnMaxCmds, BnCmd]
-  let n = bnTakeWanted(cmds)
-  gBnApplied = gBnGen
+  let gen = gBnGen
+  let n = bnTakeWanted(gen, cmds)
+  gBnApplied = gen
   for k in 0 ..< n:
     let c = cmds[k]
     for i in 0 ..< BnMaxBots:
