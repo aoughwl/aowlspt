@@ -175,7 +175,12 @@ static void* aowl_mtx_fn(int32_t i) {
     if (!(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
                          PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
         return NULL;
-    if (t->siglen > 0 && memcmp(p, t->sig, (size_t)t->siglen) != 0) {
+    /* Compared against the SNAPSHOT of the original prologue, never against
+     * live memory. The debug overlay shares this exact function and may
+     * already have written its jump over these bytes; reading them here is
+     * what made this feature reject a target that was always correct. See
+     * `aowlspt_prologue.h`. */
+    if (t->siglen > 0 && !aowl_pro_verify(t->rva, t->sig, t->siglen)) {
         aowl_mtx_rejected++;
         return NULL;
     }

@@ -1972,8 +1972,9 @@ proc bindDebugUi(verbose: bool): bool =
     return true
   if attachDrain("EFT.UI.PreloaderUI::Update", fn, cast[Il2CppMethod](0),
                  true, verbose, 10'i32):
-    okLog "debugui armed on EFT.UI.PreloaderUI::Update (per-frame, Unity " &
-          "thread). Press " &
+    okLog "debugui CLAIMED the shared EFT.UI.PreloaderUI::Update detour " &
+          "(slot " & $gDebugUiSlot & ", prefix, per-frame, Unity thread); " &
+          "uxMenuModeText will ride on this same detour if it is on. Press " &
           (if gDuCfg.toggleVk == 0x72: "F3" else: "VK " & $gDuCfg.toggleVk) &
           " in game to show the panel; layout comes from " &
           "aowlspt-debugui.json beside the host DLL and is re-read on every " &

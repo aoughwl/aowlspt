@@ -497,7 +497,10 @@ static void* aowl_du_fn(int32_t i) {
     if (!(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
                          PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
         return NULL;
-    if (t->siglen > 0 && memcmp(p, t->sig, (size_t)t->siglen) != 0) {
+    /* Against the ORIGINAL-bytes snapshot, not live memory -- see
+     * `aowlspt_prologue.h`. Symmetrical with the mode-text verifier: whichever
+     * of the two features binds second must still be able to verify. */
+    if (t->siglen > 0 && !aowl_pro_verify(t->rva, t->sig, t->siglen)) {
         aowl_du_rejected++;
         return NULL;
     }
@@ -545,8 +548,17 @@ static void* aowl_du_preloader_update_target(void) {
     if (!(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
                          PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
         return NULL;
-    if (memcmp(p, aowl_du_preloader_update_sig,
-               sizeof(aowl_du_preloader_update_sig)) != 0)
+    /* THE SHARED TARGET. This one function is wanted by the debug overlay and
+     * by the menu mode-text feature, so by the time the second of them asks,
+     * the first one's JUMP is sitting in these bytes. Comparing live memory
+     * here returned NULL to the second caller and, worse, to the alias check
+     * that decides whether the two features may share one detour -- which is
+     * exactly how a correct multiplex came out as "did not verify on this
+     * build". Against the snapshot it answers the same before and after the
+     * patch, which is the only way the sharing can work. */
+    if (!aowl_pro_verify(AOWL_DU_PRELOADER_UPDATE_RVA,
+                         aowl_du_preloader_update_sig,
+                         (int32_t)sizeof(aowl_du_preloader_update_sig)))
         return NULL;
     return (void*)p;
 }

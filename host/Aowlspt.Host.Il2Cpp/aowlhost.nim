@@ -84,6 +84,14 @@ import invoke
 ## drained on Unity's own thread even when the runtime hands back no usable
 ## `MethodInfo.methodPointer`. See `aowlspt_bridge.h`.
 {.emit: """#include "aowlspt_bridge.h" """.}
+## ORIGINAL PROLOGUE BYTES, snapshotted once before any detour is installed.
+## Included FIRST of the target-owning headers, because every one of them
+## verifies through it. Two features that share a target used to be unable to
+## both verify it -- the first one's jump landed in the very bytes the second
+## compared, so the second rejected a target that was never wrong. Every
+## prologue check now compares against the snapshot instead of live memory; the
+## check itself is unchanged and just as strict. See `aowlspt_prologue.h`.
+{.emit: """#include "aowlspt_prologue.h" """.}
 ## Two small client-side UX fixes: the Exit-hang byte patch (static .text, like
 ## the BE neuter) and the version-label brand target (a verified PreloaderUI.Awake
 ## code pointer the host postfix-detours to rewrite the label on the Unity
@@ -127,6 +135,29 @@ import invoke
 ## in-world AI markers. Target table, call thunks, guarded scalar stores,
 ## the toggle key and the frame-rate estimate. See `aowlspt_debugui.h`.
 {.emit: """#include "aowlspt_debugui.h" """.}
+## THE EAGER PROLOGUE SNAPSHOT. Defined here because it needs every target
+## table above it, and CALLED from `hostReady` before any feature binds -- that
+## ordering is the whole guarantee. Once this has run, no later verify can be
+## fooled by a detour another feature installed first, whatever order the
+## features happen to arm in.
+##
+## It walks the two tables whose targets are known to collide (the debug
+## overlay's and the mode-text feature's, which share `PreloaderUI::Update`)
+## plus that shared target itself. A table whose entries nothing else patches
+## loses nothing by being absent here: the lazy capture inside `aowl_pro_verify`
+## still records its original bytes on first verify, which for an uncontended
+## target is necessarily before any patch of it exists.
+{.emit: """
+static void aowl_pro_prime_all(void) {
+    int32_t i;
+    for (i = 0; i < aowl_du_target_count(); i++)  aowl_pro_prime(aowl_du_rva(i));
+    for (i = 0; i < aowl_mtx_target_count(); i++) aowl_pro_prime(aowl_mtx_rva(i));
+    /* The shared one, explicitly: it lives in its own single-entry table and
+     * is therefore in neither loop above, and it is the exact target the live
+     * bug fired on. */
+    aowl_pro_prime(aowl_du_preloader_update_rva());
+}
+""".}
 {.emit: """#include "aowlspt_detour.h" """.}
 ## The typed patch frame. Included here as well as through `aowlspt_abi.h`
 ## because this file names its pool directly; the include guard makes the second
@@ -659,6 +690,16 @@ proc cReadPtrAt(p: Il2CppPtr; off: int32): Il2CppPtr {.
   importc: "aowl_read_ptr", nodecl.}
 proc cIsReadable(p: Il2CppPtr; size: int32): int32 {.
   importc: "aowl_is_readable", nodecl.}
+# THE ORIGINAL-PROLOGUE SNAPSHOT (`aowlspt_prologue.h`). `cProPrimeAll` is
+# called once from `hostReady`, before the first detour is installed; the rest
+# are diagnostics so the boot log can state the snapshot's health. `aowl_pro_
+# verify` itself is called only from the C verifiers, so it is not bound here.
+proc cProPrimeAll() {.importc: "aowl_pro_prime_all", nodecl.}
+proc cProRowsUsed(): int32 {.importc: "aowl_pro_rows_used", nodecl.}
+proc cProPrimedCount(): int32 {.importc: "aowl_pro_primed_count", nodecl.}
+proc cProLazyCount(): int32 {.importc: "aowl_pro_lazy_count", nodecl.}
+proc cProBadCount(): int32 {.importc: "aowl_pro_bad_count", nodecl.}
+proc cProHave(rva: uint32): int32 {.importc: "aowl_pro_have", nodecl.}
 proc cInIl2cpp(p: Il2CppPtr): int32 {.
   importc: "aowl_in_il2cpp_section", nodecl.}
 proc cIl2cppRvaOf(p: Il2CppPtr): int64 {.
@@ -5064,6 +5105,25 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       gReady = false
     else:
       reportRuntime()
+
+      # THE PROLOGUE SNAPSHOT, and it must be here: before the first `bind*`
+      # below, therefore before the first detour exists, therefore while every
+      # target still holds its ORIGINAL bytes. Everything downstream that
+      # prologue-verifies compares against what this captures, so a feature
+      # that shares a target with a feature that armed earlier can still
+      # verify it. Doing this later would record trampolines and defeat the
+      # entire point.
+      cProPrimeAll()
+      okLog "prologue snapshot: captured the original bytes of " &
+            $int(cProRowsUsed()) & " target(s) before any detour was " &
+            "installed (" & $int(cProPrimedCount()) & " primed" &
+            (if int(cProBadCount()) > 0:
+               ", " & $int(cProBadCount()) & " unreadable and therefore " &
+               "left unverifiable"
+             else: "") & "). Every later prologue check compares against " &
+            "this, not against live memory, so two features may share one " &
+            "target and both still verify it."
+
       # Before any mod loads, and for one reason that is not about timing: the
       # detour engine hands out slots in ascending order and the firing path
       # indexes `gPatches` by slot, so the host's own hook has to claim slot 0
@@ -5169,9 +5229,21 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       # are live together. Ordering still matters, because whoever arms first is
       # the one that owns the trampoline and the other must be able to see the
       # claimed slot to alias onto it.
-      if gModeTextOn and not bindModeText(true):
-        info "menu mode text did not arm (PreloaderUI.Update or " &
-             "SetGameModeText unverified on this build, or drain disabled)"
+      if gModeTextOn:
+        if not bindModeText(true):
+          info "menu mode text did not arm (PreloaderUI.Update or " &
+               "SetGameModeText unverified on this build, or drain disabled)"
+        elif readBackendPort() <= 0:
+          # ARMED WITH NO SOURCE, said at boot rather than a minute into the
+          # menu. The label's text comes from the backend on the mod-sync poll,
+          # and with no port this host cannot ask. `backendPort` falls back to
+          # the installer's `backend.json`, so reaching here means BOTH were
+          # absent -- the hook will sit there correctly doing nothing.
+          warn "menu mode text ARMED but has NO SOURCE: there is no " &
+               "backendPort in aowlspt-host.json and no backendUrl in " &
+               "backend.json, so this host cannot ask the backend what the " &
+               "label should read and the corner will keep the game's stock " &
+               "text. Set backendPort to the backend's port to use this."
 
   let modsDir = joinPath(gDir, "mods")
   # The runtime may not have come up, and that deliberately does not stop this:

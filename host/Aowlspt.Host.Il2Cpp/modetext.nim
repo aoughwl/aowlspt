@@ -79,6 +79,16 @@ var gModeTextSelf: Il2CppPtr = nil
 var gModeTextFires = 0
 var gModeTextLogged = false       ## the one-shot identification log
 var gModeTextApplies = 0
+var gModeTextStarved = false      ## the one-shot "armed with no source" warning
+
+const ModeTextStarveFrames = 3600
+  ## Roughly a minute of menu at 60fps. If the detour has fired this many times
+  ## and the backend has still never said what the label should read, the
+  ## feature is armed and doing nothing -- which from the outside is
+  ## indistinguishable from it being broken. It says so once, loudly, rather
+  ## than leaving a silent no-op to be discovered by staring at the corner of
+  ## the screen. This host's recurring failure mode is a feature that arms and
+  ## then shows nothing, so being armed is not the same as working.
 
 proc modeTextSetWanted(s: string) =
   ## Called from the host's own tick loop (NOT the Unity thread) when the
@@ -229,6 +239,21 @@ proc modeTextUpdateFired(regs: Il2CppPtr) =
   let self = cast[Il2CppPtr](selfRaw)
   gModeTextSelf = self
 
+  # ARMED BUT STARVED. One shot, and only once the detour has demonstrably been
+  # firing for a while with nothing ever asked of it. That means the hook is
+  # healthy and the SOURCE is missing -- almost always the backend poll not
+  # reaching this host (no `backendPort` and no installer `backend.json`, or the
+  # manager mod not running) -- so it names that rather than the hook.
+  if not gModeTextStarved and gModeTextWant.len == 0 and
+     gModeTextFires >= ModeTextStarveFrames:
+    gModeTextStarved = true
+    warn "menu mode text: the PreloaderUI.Update hook has fired " &
+         $gModeTextFires & " times and the backend has never sent a " &
+         "`menuModeText`, so the corner label is still the game's stock text. " &
+         "The hook is fine; the SOURCE is missing. Check that the backend is " &
+         "reachable (backendPort in aowlspt-host.json, or backendUrl in the " &
+         "installer's backend.json) and that the manager mod is running."
+
   # The cheap early-out that keeps this off the hot path: after the one-shot
   # identification log has run, a frame with no pending change does no work at
   # all -- no read, no guard entry, no allocation.
@@ -317,7 +342,9 @@ proc bindModeText(verbose: bool): bool =
     return true
   if attachDrain("EFT.UI.PreloaderUI::Update", fn, cast[Il2CppMethod](0),
                  false, verbose, 13'i32, true):
-    okLog "menu mode text armed on EFT.UI.PreloaderUI::Update (postfix); the " &
+    okLog "menu mode text CLAIMED the shared EFT.UI.PreloaderUI::Update " &
+          "detour (slot " & $gModeTextSlot & ", postfix); the debug overlay " &
+          "will ride on this same detour if it is turned on later. The " &
           "bottom-right corner label follows the backend's `menuModeText`, " &
           "which defaults to the logged-in character's name"
     return true
