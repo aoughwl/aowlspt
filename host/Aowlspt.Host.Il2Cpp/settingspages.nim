@@ -130,6 +130,10 @@ const cSwMaxRows = 24
 var gSwPages: seq[SwPage] = @[]
 ## `settingsPages` -- Phase 3. Default OFF.
 var gSwPagesOn = false
+## How many times the entry point has been reached this session. Logged for the
+## first few so the log SHOWS the path being taken rather than leaving its
+## silence to be interpreted.
+var gSwPagesFires = 0
 
 proc swPageRegister(p: SwPage) =
   ## Add a page, replacing any page already registered under the same id. The
@@ -270,22 +274,28 @@ proc swBuildHostPage(): SwPage =
 # The renderer
 # ---------------------------------------------------------------------------
 
-proc swTabGameObject(tabPtr: Il2CppPtr): Il2CppPtr =
+proc swTabGameObject(tabPtr: Il2CppPtr; why: var string): Il2CppPtr =
   ## The tab's own GameObject, reached without reflection: `SettingsTab` derives
   ## from `UIInputNode`, which holds `_rectTransform` at +0x78 (a plain managed
   ## reference, so a raw read reaches it), and a RectTransform is a Component,
   ## so `Component::get_gameObject` -- the call `invoke2` STEP 1 proved -- turns
   ## it into the GameObject a clone can be parented under.
   result = nil
+  why = ""
   if tabPtr == nil or cIsReadable(tabPtr, 0x78'i32 + 8'i32) == 0'i32:
+    why = "the tab is not readable at _rectTransform (+0x78)"
     return
   let rect = cReadPtrAt(tabPtr, 0x78'i32)
   if rect == nil or cIsReadable(rect, 0x18'i32) == 0'i32:
+    why = "_rectTransform (+0x78) is null or unreadable"
     return
   let fnGo = mi2Fn(Mi2GetGameObject)
   if fnGo == nil:
+    why = "UnityEngine.Component::get_gameObject did not verify on this build"
     return
   result = cMi2CallPP(fnGo, rect)
+  if result == nil:
+    why = "Component::get_gameObject returned null for the tab's RectTransform"
 
 proc swFindDonor(tabPtr: Il2CppPtr; wantKlass: uint64): Il2CppPtr =
   ## The first control on this tab whose klass is `wantKlass` -- the row we will
@@ -341,10 +351,20 @@ proc swCloneRow(donor, parentGo: Il2CppPtr; text: string): Il2CppPtr =
       let fnAct = mi2Fn(Mi2GoSetActive)
       if fnAct != nil:
         cMi2CallVPB(fnAct, cloneGo, 1'i32)
-  # The label, by the Phase 2a primitive.
+  # The label, by the SAME setter-first path the relabel now uses: a clone
+  # inherits the donor's LocalizedText, which would otherwise put the donor's
+  # own localised string back over ours the moment the row is enabled.
   let tmp = swControlTmp(clone)
   if tmp != nil:
-    discard swSetTmpText(tmp, text)
+    if swRelabelControl(clone, tmp, text):
+      okLog "settings pages: cloned row '" & text & "' (control=0x" &
+            hexOf(cast[uint64](clone)) & ") labelled via " & gSwLastRoutes
+    else:
+      warn "settings pages: the clone for row '" & text & "' could not be " &
+           "labelled; it is left showing the donor's text"
+  else:
+    warn "settings pages: the clone for row '" & text & "' has no reachable " &
+         "TMP label; it is left showing the donor's text"
   result = clone
 
 proc swSeedToggle(control: Il2CppPtr; value: bool): bool =
@@ -429,7 +449,7 @@ proc swReadBackPage(page: var SwPage) =
           page.rows[i].bval = live
     i = i + 1
 
-proc swPagesOnTabBuilt(tabPtr: Il2CppPtr; tabName: string) =
+proc swPagesOnTabBuilt(tabPtr: Il2CppPtr; tabName: string; revisit: bool) =
   ## Phase 3, driven off the same ShowScreen postfix everything else here uses.
   ##
   ## Pages are rendered onto ONE tab (`game`), not spread across the stock tabs:
@@ -437,15 +457,55 @@ proc swPagesOnTabBuilt(tabPtr: Il2CppPtr; tabName: string) =
   ## place is what the player asked for. A tab of our own would be the right
   ## answer and needs a `SettingsTab` we cannot construct -- see the note at the
   ## top of this file about shared generics.
-  if gSwOff or not gSwPagesOn or tabPtr == nil:
+  ##
+  ## EVERY early return announces itself. The previous build's worst failure
+  ## mode was this feature doing nothing AND saying nothing: the banner printed
+  ## at boot, the hook demonstrably fired (Phase 2a/2b logged on the same
+  ## postfix), and across a full pass of every tab there was not one page line,
+  ## not one clone line and not one fault line. A path that declines must say
+  ## why, or it cannot be debugged from a log at all.
+  if gSwPagesOn:
+    inc gSwPagesFires
+    if gSwPagesFires <= 8:
+      okLog "settings pages: entry #" & $gSwPagesFires & " tab='" & tabName &
+            "' tabPtr=0x" & hexOf(cast[uint64](tabPtr)) &
+            " on=" & (if gSwPagesOn: "true" else: "false") &
+            " off=" & (if gSwOff: "true" else: "false") &
+            " pages=" & $gSwPages.len &
+            " toggleKlass=0x" & hexOf(gSwKlassToggle)
+  if gSwOff:
+    if gSwPagesOn and gSwPagesFires <= 8:
+      okLog "settings pages: DECLINED -- the Phase-2/3 fault budget is spent " &
+            "(gSwOff); nothing is rendered this session"
+    return
+  if not gSwPagesOn:
+    return                              # flag off: silence is the correct answer
+  if tabPtr == nil:
+    okLog "settings pages: DECLINED -- the tab pointer was nil"
     return
   if tabName != "game":
+    if gSwPagesFires <= 8:
+      okLog "settings pages: DECLINED -- pages render only onto the Game tab " &
+            "and this is '" & tabName & "' (expected; open Settings -> Game)"
     return
   let tabKey = cast[uint64](tabPtr)
+  # Learn the widget-klass census OURSELVES rather than relying on Phase 2
+  # having been switched on. Phase 3 previously depended on `settingsRelabel
+  # Probe`/`settingsBindProbe` for its klass pointers without saying so, which
+  # meant `settingsPages` alone could only ever decline.
+  swLearnTabKlasses(tabPtr)
   # The registry is rebuilt from the config each time the tab is opened, so the
   # rows show what the file currently says.
   if gSwPages.len == 0:
     swPageRegister(swBuildHostPage())
+    okLog "settings pages: registry was empty; built the host page -> " &
+          $gSwPages.len & " page(s), " &
+          (if gSwPages.len > 0: $gSwPages[0].rows.len else: "0") & " row(s)"
+  if gSwPages.len == 0:
+    warn "settings pages: DECLINED -- the page registry is STILL empty after " &
+         "building the host page. Nothing can be rendered; this is a host bug, " &
+         "not a game one, and nothing was written to the settings screen."
+    return
   var i = 0
   while i < gSwPages.len:
     # Read back BEFORE deciding whether to re-render, so a value the player
@@ -468,10 +528,12 @@ proc swPagesOnTabBuilt(tabPtr: Il2CppPtr; tabName: string) =
         continue
       okLog "settings pages: page '" & gSwPages[i].id & "' lost its clones " &
             "(the tab was rebuilt under it); re-rendering"
-    let parentGo = swTabGameObject(tabPtr)
+    var why = ""
+    let parentGo = swTabGameObject(tabPtr, why)
     if parentGo == nil:
-      okLog "settings pages: could not reach the tab's GameObject; page '" &
-            gSwPages[i].id & "' is not rendered (nothing was written)"
+      warn "settings pages: DECLINED -- could not reach the tab's GameObject (" &
+           why & "); page '" & gSwPages[i].id &
+           "' is not rendered (nothing was written)"
       i = i + 1
       continue
     discard swRenderPage(tabPtr, parentGo, gSwPages[i])

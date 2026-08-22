@@ -301,13 +301,35 @@ proc suiTabInitBody(a: Il2CppPtr): Il2CppPtr {.
 
   let gname = readCString(cSuiGroupName(group))
   let off = cSuiGroupTabOffset(group)
-  if group >= 0'i32 and int(group) < gSuiGroupsLogged.len and
-     gSuiGroupsLogged[int(group)]:
+  let alreadyLogged = (group >= 0'i32 and int(group) < gSuiGroupsLogged.len and
+                       gSuiGroupsLogged[int(group)])
+  if alreadyLogged:
     # Already announced this tab. But this call IS a tab click (OpenGroup ->
     # ShowScreen -> EnsureTabInitialized runs every time, early-returning via the
     # HashSet at +0x138), so it is a free Unity-thread poll opportunity: re-read
     # the registered tabs in case the controls have appeared since.
+    #
+    # It is ALSO the only moment Phase 2/3 can re-assert themselves on a tab the
+    # player has come back to. The original code returned here, which meant the
+    # relabel, the value read-back and the pages ran EXACTLY ONCE per tab per
+    # session and could never be re-checked or re-applied. That is what made
+    # "the model changed but the pixels did not" impossible to tell apart from
+    # "the game overwrote us a frame later": nothing ever looked again.
     suiPollRegisteredTabs()
+    let selfR = cast[Il2CppPtr](selfPtr)
+    if cIsReadable(selfR, cSuiOffCurrentTab() + 8'i32) != 0'i32:
+      let tabR = cReadPtrAt(selfR, cSuiOffCurrentTab())
+      if tabR != nil:
+        let gnameR = readCString(cSuiGroupName(group))
+        swVerifyRelabel("revisit tab=" & gnameR)
+        # `revisit = true` keeps the relabel re-asserting itself while silencing
+        # the Phase-2b value census, which would otherwise print thirty lines
+        # every time the player clicks a tab. Passed as an ARGUMENT and not set
+        # through a global on purpose: nimony forward-resolves procs across an
+        # `include` boundary but NOT variables, and this file is included before
+        # the one that would own such a global.
+        swOnTabBuilt(tabR, gnameR, true)
+        swPagesOnTabBuilt(tabR, gnameR, true)
     return cast[Il2CppPtr](1)
 
   let self = cast[Il2CppPtr](selfPtr)
@@ -359,11 +381,12 @@ proc suiTabInitBody(a: Il2CppPtr): Il2CppPtr {.
   # arming a second one (that guard is not re-entrant). It does nothing unless
   # `settingsRelabelProbe` or `settingsBindProbe` is set, and it disables itself
   # after two faults.
-  swOnTabBuilt(tab, gname)
+  swVerifyRelabel("build tab=" & gname)
+  swOnTabBuilt(tab, gname, false)
   # PHASE 3 -- the per-mod settings PAGES, rendered by cloning stock controls.
   # Same guard, same fault budget, same default-OFF discipline; it renders only
   # onto the Game tab and only when `settingsPages` is set.
-  swPagesOnTabBuilt(tab, gname)
+  swPagesOnTabBuilt(tab, gname, false)
   return cast[Il2CppPtr](1)
 
 # The VEH/SEH guard thunk, the same mechanism botdiag/botcap use: `aowl_p_p_seh`

@@ -188,6 +188,68 @@ proc swNewStringImpl(a: Il2CppPtr): Il2CppPtr {.
   ## `duNewStringImpl`.
   result = newString(gRt, gSwStrText)
 
+## The Phase-3 setter table is declared in `settingspages.nim`, which is
+## `include`d after this file; these three entries are needed HERE, by the
+## relabel, so they are declared here and the constants restated. Duplicating
+## three importc lines is cheaper than reordering two files.
+proc cSwFn2(i: int32): Il2CppPtr {.importc: "aowl_sw_fn", nodecl.}
+proc cSwName2(i: int32): Il2CppPtr {.importc: "aowl_sw_name", nodecl.}
+proc cSwCallVPP(fn, self, arg: Il2CppPtr) {.importc: "aowl_sw_call_v_pp", nodecl.}
+proc cSwCallVPB2(fn, self: Il2CppPtr; b: int32) {.
+  importc: "aowl_sw_call_v_pb", nodecl.}
+
+const
+  SwLocSetLabelText = 6'i32
+  SwTmpSetText      = 7'i32
+  SwTmpSetDirty     = 8'i32
+
+## Announce, once, which of the three repaint routes verified on this build --
+## so a relabel that does not appear can be read against what was available
+## rather than guessed at.
+var gSwRepaintLogged = false
+
+proc swRepaintCensus() =
+  if gSwRepaintLogged:
+    return
+  gSwRepaintLogged = true
+  var line = "settings write: repaint routes on this build --"
+  var i = SwLocSetLabelText
+  while i <= SwTmpSetDirty:
+    line = line & " " & readCString(cSwName2(i)) & "=" &
+           (if cSwFn2(i) != nil: "OK" else: "REJECTED")
+    i = i + 1'i32
+  okLog line
+
+proc swSetTmpTextByCall(tmp: Il2CppPtr; s: Il2CppPtr): bool =
+  ## Put an already-allocated managed String on a TMP by CALLING the property
+  ## setter, then poke the repaint through the real `set_havePropertiesChanged`
+  ## rather than the raw byte. Returns false if neither call verified.
+  result = false
+  let fnSet = cSwFn2(SwTmpSetText)
+  if fnSet != nil:
+    cSwCallVPP(fnSet, tmp, s)
+    result = true
+  let fnDirty = cSwFn2(SwTmpSetDirty)
+  if fnDirty != nil:
+    cSwCallVPB2(fnDirty, tmp, 1'i32)
+
+proc swSetLocalizedText(control: Il2CppPtr; s: Il2CppPtr): bool =
+  ## Write at the LOCALIZEDTEXT level -- `SettingControl.Text` (+0x80) ->
+  ## `EFT.UI.LocalizedText`, then `SetLabelText(String)`, the method the game's
+  ## own `UpdateLocale` calls. This is the level cause (b) would otherwise
+  ## clobber us from, and it is the setter the game itself trusts to repaint.
+  result = false
+  let fn = cSwFn2(SwLocSetLabelText)
+  if fn == nil or control == nil or s == nil:
+    return
+  if cIsReadable(control, cSuiOffCtrlText() + 8'i32) == 0'i32:
+    return
+  let locText = cReadPtrAt(control, cSuiOffCtrlText())
+  if locText == nil or cIsReadable(locText, cSuiOffLocTextList() + 8'i32) == 0'i32:
+    return
+  cSwCallVPP(fn, locText, s)
+  result = true
+
 proc swSetTmpText(tmp: Il2CppPtr; text: string): bool =
   ## Put `text` on a live TextMeshPro component by the PROVEN recipe: allocate a
   ## managed String, RAW-WRITE its pointer into `m_text` (+0xE0), then set
@@ -212,6 +274,52 @@ proc swSetTmpText(tmp: Il2CppPtr; text: string): bool =
   discard cDuWriteU8(tmp, cSwOffTmpDirty(), 1'i32)
   result = true
 
+## Names the routes the last relabel actually took, for the log line.
+var gSwLastRoutes = ""
+
+proc swRelabelControl(control, tmp: Il2CppPtr; text: string): bool =
+  ## Relabel one control by CALLING the game's own setters, with the raw store
+  ## kept only as the last resort.
+  ##
+  ## Order matters and is the whole fix:
+  ##   1. `LocalizedText::SetLabelText` -- the level the game writes at. If the
+  ##      row was reverting because LocalizedText re-applied its own string
+  ##      (cause b), writing here is writing where it writes.
+  ##   2. `TMP_Text::set_text` + `set_havePropertiesChanged` -- the real
+  ##      property setter and the real repaint latch. If the row was correct in
+  ##      the model and stale on screen (cause a), this is what rebuilds it.
+  ##   3. the raw `m_text` store + dirty byte, unchanged, for a build where
+  ##      neither prologue verifies.
+  ##
+  ## One String allocation feeds all three, so the belt and the braces cost one
+  ## allocation between them, not three.
+  result = false
+  gSwLastRoutes = ""
+  if tmp == nil or text.len == 0:
+    return
+  swRepaintCensus()
+  gSwStrText = text
+  let s = swNewStringImpl(cast[Il2CppPtr](0))
+  if s == nil or cIsReadable(s, 0x14'i32) == 0'i32:
+    warn "settings write: il2cpp_string_new returned nothing usable; the " &
+         "label is left exactly as the game wrote it"
+    return
+  if swSetLocalizedText(control, s):
+    gSwLastRoutes = gSwLastRoutes & "LocalizedText::SetLabelText "
+    result = true
+  if swSetTmpTextByCall(tmp, s):
+    gSwLastRoutes = gSwLastRoutes & "TMP_Text::set_text "
+    result = true
+  if not result:
+    if cUxWritePtr(tmp, cSuiOffTmpMText(), s) == 0'i32:
+      warn "settings write: no setter verified AND m_text (+0x" &
+           hexOf(uint64(cSuiOffTmpMText())) & ") was not safely writable; " &
+           "nothing was written"
+      return
+    discard cDuWriteU8(tmp, cSwOffTmpDirty(), 1'i32)
+    gSwLastRoutes = "raw m_text store + dirty byte (no setter verified) "
+    result = true
+
 # ---------------------------------------------------------------------------
 # PHASE 2a -- the first VISIBLE proof
 #
@@ -221,6 +329,62 @@ proc swSetTmpText(tmp: Il2CppPtr; text: string): bool =
 # not already end in it, so clicking away and back -- which re-fires the whole
 # postfix -- neither doubles the suffix nor reallocates a String.
 # ---------------------------------------------------------------------------
+
+# ---------------------------------------------------------------------------
+# THE RELABEL VERDICT
+#
+# The previous build logged a successful relabel -- and then read the new value
+# back THROUGH the new label in the same breath, so `m_text` provably held our
+# String at that instant. The row on screen still said 'FOV:'. Two completely
+# different causes produce exactly that, and no amount of reasoning separates
+# them:
+#
+#   (a) NO REPAINT. The dirty byte we poke is the wrong field, or is not enough
+#       on its own. The model is ours forever and the mesh is never rebuilt.
+#   (b) OVERWRITE. `LocalizedText` re-applies its localised string a moment
+#       later -- on enable, on a localisation refresh, on the next layout pass --
+#       and our store is gone before a single frame is drawn.
+#
+# The difference is observable and only observable: re-read `m_text` LATER. If it
+# still holds our string, the store survived and the pixels are stale -> (a). If
+# it has reverted to 'FOV:', something overwrote us -> (b).
+#
+# So the host remembers what it wrote and to which component, and re-reads it on
+# the next settings-postfix firing -- which, since this build, includes every
+# RE-VISIT to a tab, not just the first. The verdict is printed in plain words.
+# ---------------------------------------------------------------------------
+var gSwWatchTmp: Il2CppPtr = nil
+var gSwWatchWant: string = ""
+var gSwWatchChecks = 0
+const cSwMaxWatchChecks = 12
+
+proc swVerifyRelabel(occasion: string) =
+  ## Re-read the watched label and say, in words, which of the two causes this
+  ## build is suffering from. Pure read; never writes, never faults unguarded.
+  if gSwWatchTmp == nil or gSwWatchWant.len == 0:
+    return
+  if gSwWatchChecks >= cSwMaxWatchChecks:
+    return
+  gSwWatchChecks = gSwWatchChecks + 1
+  if cIsReadable(gSwWatchTmp, cSuiOffTmpMText() + 8'i32) == 0'i32:
+    okLog "settings write: VERDICT (" & occasion & ") the watched TMP at 0x" &
+          hexOf(cast[uint64](gSwWatchTmp)) & " is no longer readable -- the " &
+          "control was destroyed and rebuilt, which is itself cause (b): the " &
+          "game replaced the row under us"
+    gSwWatchTmp = nil
+    return
+  let now = suiReadString(cReadPtrAt(gSwWatchTmp, cSuiOffTmpMText()))
+  if now == gSwWatchWant:
+    okLog "settings write: VERDICT (" & occasion & ") m_text STILL HOLDS '" &
+          now & "'. The store survived, so this is cause (a) NO REPAINT -- the " &
+          "model is ours and TMP never rebuilt its mesh. The fix is the real " &
+          "setter / a forced mesh update, not the dirty byte."
+  else:
+    okLog "settings write: VERDICT (" & occasion & ") m_text has REVERTED to '" &
+          now & "' (we wrote '" & gSwWatchWant & "'). This is cause (b) " &
+          "OVERWRITE -- LocalizedText re-applied its own string over ours. " &
+          "The relabel is re-applied on every tab visit from this build, so " &
+          "watch whether it now sticks."
 
 proc swEndsWithBrand(s: string): bool =
   ## True if `s` already carries the suffix. Hand-rolled rather than
@@ -234,7 +398,7 @@ proc swEndsWithBrand(s: string): bool =
       return
   result = true
 
-proc swRelabelTab(tabPtr: Il2CppPtr; tabName: string): int =
+proc swRelabelTab(tabPtr: Il2CppPtr; tabName: string; revisit: bool): int =
   ## Walk the tab's `_createdControls` and brand the anchor control. Returns how
   ## many labels were rewritten (0 or 1 in practice -- the cap is a safety net,
   ## not an expectation).
@@ -270,18 +434,27 @@ proc swRelabelTab(tabPtr: Il2CppPtr; tabName: string): int =
     # Learn the type census from every control we pass, branded or not: this is
     # the cheapest place to do it and Phase 2b/3 need it.
     swLearnKlass(label, cast[uint64](cReadPtrAt(control, 0'i32)))
-    if label != anchor:
+    # Match the STOCK label or the label we already branded. Matching only the
+    # stock one meant that after a successful write the host could never find
+    # its own row again -- so it could never re-apply it, and could never notice
+    # that the game had put the stock string back.
+    if label != anchor and label != anchor & cSwBrandSuffix:
       continue
     if swEndsWithBrand(label):
+      gSwWatchTmp = tmp
+      gSwWatchWant = label
       okLog "settings write: tab=" & tabName & " control[" & $i & "] is already " &
-            "branded ('" & label & "'); nothing rewritten"
+            "branded ('" & label & "'); nothing rewritten (still watching it)"
       return
-    if swSetTmpText(tmp, label & cSwBrandSuffix):
+    if swRelabelControl(control, tmp, label & cSwBrandSuffix):
+      gSwWatchTmp = tmp
+      gSwWatchWant = label & cSwBrandSuffix
+      gSwWatchChecks = 0
       okLog "settings write: PHASE 2a tab=" & tabName & " control[" & $i &
             "] relabelled '" & label & "' -> '" & label & cSwBrandSuffix &
-            "' (tmp=0x" & hexOf(cast[uint64](tmp)) & ")"
+            "' (tmp=0x" & hexOf(cast[uint64](tmp)) & ") via " & gSwLastRoutes
       result = result + 1
-  if result == 0:
+  if result == 0 and not revisit:
     okLog "settings write: PHASE 2a tab=" & tabName & " has no control " &
           "labelled '" & anchor & "'; nothing was written (this is expected on " &
           "every tab but Game)"
@@ -426,7 +599,35 @@ proc swBindTab(tabPtr: Il2CppPtr; tabName: string) =
 # from the outer guard's verdict, by `swNoteFault` below.
 # ---------------------------------------------------------------------------
 
-proc swOnTabBuilt(tabPtr: Il2CppPtr; tabName: string) =
+proc swLearnTabKlasses(tabPtr: Il2CppPtr) =
+  ## Walk a tab READ-ONLY and teach the klass census from every control on it.
+  ## Phase 3 calls this for itself so that `settingsPages` does not silently
+  ## depend on a Phase 2 flag also being set -- which is exactly the kind of
+  ## undeclared coupling that turns a feature into a silent no-op.
+  if tabPtr == nil or cIsReadable(tabPtr, cSuiOffCreatedCtrls() + 8'i32) == 0'i32:
+    return
+  let lst = cReadPtrAt(tabPtr, cSuiOffCreatedCtrls())
+  if lst == nil or cIsReadable(lst, cSuiOffListSize() + 4'i32) == 0'i32:
+    return
+  let arr = cReadPtrAt(lst, cSuiOffListItems())
+  let size = cReadI32At(suiPtrAdd(lst, cSuiOffListSize()))
+  if arr == nil or size <= 0'i32:
+    return
+  let n = (if size > int32(cSuiMaxControls): int32(cSuiMaxControls) else: size)
+  for i in 0 ..< int(n):
+    let slot = suiPtrAdd(arr, cSuiOffArrElems() + int32(i) * 8'i32)
+    if cIsReadable(slot, 8'i32) == 0'i32:
+      continue
+    let control = cReadPtrAt(slot, 0'i32)
+    if control == nil or cIsReadable(control, cSuiOffCtrlValue() + 8'i32) == 0'i32:
+      continue
+    let tmp = swControlTmp(control)
+    if tmp == nil:
+      continue
+    swLearnKlass(suiReadString(cReadPtrAt(tmp, cSuiOffTmpMText())),
+                 cast[uint64](cReadPtrAt(control, 0'i32)))
+
+proc swOnTabBuilt(tabPtr: Il2CppPtr; tabName: string; revisit: bool) =
   ## Phase 2, driven off the same ShowScreen postfix the Phase-1.8 read probe
   ## uses. Does nothing at all unless a flag asks for it and the fault budget is
   ## intact.
@@ -435,8 +636,8 @@ proc swOnTabBuilt(tabPtr: Il2CppPtr; tabName: string) =
   if not (gSwRelabel or gSwBind):
     return
   if gSwRelabel:
-    discard swRelabelTab(tabPtr, tabName)
-  if gSwBind:
+    discard swRelabelTab(tabPtr, tabName, revisit)
+  if gSwBind and not revisit:
     swBindTab(tabPtr, tabName)
 
 proc swNoteFault() =

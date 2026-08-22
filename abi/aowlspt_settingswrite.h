@@ -70,6 +70,17 @@
  * works today, and why relabelling is the honest first proof that we can write
  * into the real settings screen.
  *
+ * CORRECTION, from the live run. That last paragraph is true of the version
+ * label and of the debug overlay's own clones, and it was NOT true of a settings
+ * row. The log proved `m_text` held our String (Phase 2b read the value back
+ * THROUGH the new label) and the row on screen still said 'FOV:'. A settings
+ * label is not a bare TMP: it sits behind an `EFT.UI.LocalizedText`, which
+ * re-applies its own localised string, and the raw store is behind that class's
+ * back. So the relabel now CALLS `EFT.UI.LocalizedText::SetLabelText` and
+ * `TMPro.TMP_Text::set_text` (both added to the target table below) and keeps
+ * the raw store only as the last resort on a build where neither verifies.
+ * The lesson generalises: prefer calling the managed setter to poking a field.
+ *
  * Fail-safe, like every other write in this codebase: nothing here dereferences
  * anything. The reader below VirtualQueries first and returns a miss rather than
  * faulting, and every caller on the Nim side is additionally inside the
@@ -208,6 +219,9 @@ static int32_t aowl_sw_off_tmp_dirty(void)    { return AOWL_SW_TMP_DIRTY; }
 #define AOWL_SW_SLIDER_SET_MIN        3
 #define AOWL_SW_SLIDER_SET_MAX        4
 #define AOWL_SW_SLIDER_UPDATEVISUALS  5
+#define AOWL_SW_LOC_SETLABELTEXT      6
+#define AOWL_SW_TMP_SET_TEXT          7
+#define AOWL_SW_TMP_SET_DIRTY         8
 
 typedef struct AowlSwTarget {
     const char*   name;
@@ -255,6 +269,49 @@ static const AowlSwTarget aowl_sw_targets[] = {
     { "UnityEngine.UI.Slider::UpdateVisuals", 0x55B4610u,
       { 0x48,0x89,0x5C,0x24,0x20,0x57,0x48,0x83,0xEC,0x70,0x80,0x3D,0x17,
         0x3B,0xB2,0x01 }, 16 },
+
+    /* ---- the RELABEL repaint path (added after the live failure) ----
+     *
+     * Phase 2a wrote a String into `m_text` and poked the dirty byte. The log
+     * proved the store landed -- Phase 2b read the value back THROUGH the new
+     * label in the same pass -- and the row on screen still said 'FOV:'.
+     *
+     * Two causes fit that exactly: no repaint, or an overwrite by
+     * `LocalizedText` re-applying its localised string. Both are answered by
+     * CALLING the game's own setter instead of poking a field, which is what
+     * these three are for.
+     *
+     * EFT.UI.LocalizedText::SetLabelText(String) -- instance, 1 ref arg. This
+     * is the method the game itself uses to put text on the labels behind a
+     * LocalizedText (`UpdateLocale` -> `SetLabelText`), so it does whatever
+     * this build's repaint actually is, and it writes at the LocalizedText
+     * LEVEL rather than behind its back. Resolved offline: type 14184
+     * EFT.UI.LocalizedText, rid 86384, RVA 0x140FE70, section `il2cpp`. */
+    { "EFT.UI.LocalizedText::SetLabelText", 0x140FE70u,
+      { 0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x60,0x48,0x8B,0xFA,
+        0x48,0x8B,0xD9 }, 16 },
+
+    /* TMPro.TMP_Text::set_text(String) -- instance, 1 ref arg. The real
+     * property setter: it stores m_text, marks the input source, and requests
+     * the layout/vertex rebuild that a raw field store does not. Type 25471,
+     * rid 1190, RVA 0x51BC1E0, section `il2cpp`. */
+    { "TMPro.TMP_Text::set_text", 0x51BC1E0u,
+      { 0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x80,0xB9,0xE8,
+        0x00,0x00,0x00 }, 16 },
+
+    /* TMPro.TMP_Text::set_havePropertiesChanged(bool) -- instance, 1 bool.
+     * Its first instruction is `cmp byte ptr [rcx+0x378], dl`, which is an
+     * INDEPENDENT offline confirmation that AOWL_SW_TMP_DIRTY (0x378) is the
+     * right field -- and the method does more than store the byte, which is
+     * precisely what a raw store was missing. Type 25471, rid 1320,
+     * RVA 0x51BEA30, section `il2cpp`.
+     *
+     * NOTE for anyone tempted by `TMP_Text::ForceMeshUpdate`: on this build it
+     * resolves to 0x628110, whose bytes are `C2 00 00 CC CC ...` -- a bare
+     * `ret`. It is a stripped stub and calling it does nothing at all. */
+    { "TMPro.TMP_Text::set_havePropertiesChanged", 0x51BEA30u,
+      { 0x38,0x91,0x78,0x03,0x00,0x00,0x74,0x1A,0x88,0x91,0x78,0x03,0x00,
+        0x00,0x48,0x8B }, 16 },
 };
 
 #define AOWL_SW_TARGET_COUNT \
@@ -327,6 +384,15 @@ static void aowl_sw_call_v_pb(void* fn, void* self, int32_t b) {
     typedef void (*Fn)(void*, int32_t, void*);
     if (!fn || !self) return;
     ((Fn)fn)(self, b ? 1 : 0, (void*)0);
+}
+
+/* An instance method with a single REFERENCE argument (position 1 -> RDX, the
+ * MethodInfo* position 2 -> R8). This is the shape both `SetLabelText(String)`
+ * and `set_text(String)` need. */
+static void aowl_sw_call_v_pp(void* fn, void* self, void* arg) {
+    typedef void (*Fn)(void*, void*, void*);
+    if (!fn || !self) return;
+    ((Fn)fn)(self, arg, (void*)0);
 }
 
 /* An instance method with no arguments at all (MethodInfo* is position 1 ->

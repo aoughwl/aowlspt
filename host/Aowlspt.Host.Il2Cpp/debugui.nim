@@ -487,6 +487,13 @@ type DuLabel = object
   rect: Il2CppPtr       ## its RectTransform (m_rectTransform, or get_transform)
   last: string          ## the text currently in it
   shown: bool           ## whether it is currently non-empty
+  ## The anchor + offset this label was last PLACED at. `duPlace` costs four
+  ## managed calls; a panel line that has not moved since the last refresh needs
+  ## none of them, and a panel line almost never moves.
+  pAnchor: string
+  pX: float64
+  pY: float64
+  placed: bool
 
 var gDuPanel: seq[DuLabel] = @[]
 var gDuMarks: seq[DuLabel] = @[]
@@ -575,28 +582,6 @@ proc duRectOf(tmp: Il2CppPtr): Il2CppPtr =
   let t = cDuCallPP(fn, tmp)
   if duOk(t, 0x20'i32):
     result = t
-
-proc duCanvasRootGo(anchor: Il2CppPtr): Il2CppPtr =
-  ## The GameObject of the anchor's hierarchy ROOT -- i.e. the Canvas object,
-  ## whose RectTransform spans the screen. Parenting there is what makes
-  ## "topright" mean the top right of the SCREEN rather than the top right of a
-  ## version label.
-  result = nil
-  let rect = duRectOf(anchor)
-  if rect == nil:
-    return
-  let fnRoot = cDuFn(DuGetRoot)
-  if fnRoot == nil:
-    return
-  let root = cDuCallPP(fnRoot, rect)
-  if not duOk(root, 0x20'i32):
-    return
-  let fnGo = mi2Fn(Mi2GetGameObject)
-  if fnGo == nil:
-    return
-  let go = cMi2CallPP(fnGo, root)
-  if duOk(go, 0x20'i32):
-    result = go
 
 # ---------------------------------------------------------------------------
 # Read-back helpers
@@ -739,7 +724,8 @@ proc duMakeDrawable(lab: DuLabel; w, h: float64) =
 # Returns a `DuLabel` with `tmp == nil` if any step did not happen.
 # ---------------------------------------------------------------------------
 proc duCloneLabel(anchor, rootGo: Il2CppPtr): DuLabel =
-  result = DuLabel(tmp: nil, rect: nil, last: "", shown: false)
+  result = DuLabel(tmp: nil, rect: nil, last: "", shown: false,
+                   pAnchor: "", pX: 0.0, pY: 0.0, placed: false)
   let fnInst = mi2Fn(Mi2Instantiate)
   if fnInst == nil or anchor == nil:
     return
@@ -761,7 +747,8 @@ proc duCloneLabel(anchor, rootGo: Il2CppPtr): DuLabel =
     # A label with no RectTransform cannot be positioned, and an unpositioned
     # clone sitting on top of the version label is worse than no label at all.
     return
-  result = DuLabel(tmp: clone, rect: rect, last: "", shown: false)
+  result = DuLabel(tmp: clone, rect: rect, last: "", shown: false,
+                   pAnchor: "", pX: 0.0, pY: 0.0, placed: false)
 
 proc duAnchorVec(name: string; ax, ay, px, py: var float64) =
   ## A corner name -> the anchorMin/anchorMax point on the parent (ax, ay) and
@@ -786,11 +773,15 @@ proc duAnchorVec(name: string; ax, ay, px, py: var float64) =
   else:                       # "topleft" and anything unrecognised
     ax = 0.0; ay = 1.0; px = 0.0; py = 1.0
 
-proc duPlace(lab: DuLabel; anchorName: string; x, y: float64) =
-  ## Anchor + pivot + offset, in that order. Three managed calls, and they are
-  ## only made when a label is created or moved, never per frame for a label
-  ## that has not moved.
+proc duPlace(lab: var DuLabel; anchorName: string; x, y: float64) =
+  ## Anchor + pivot + offset, in that order. FOUR managed calls -- so a label
+  ## that has not moved since the last refresh makes none of them. The panel
+  ## used to re-anchor all nine of its lines on every refresh forever, for a
+  ## layout that changes only when the config is re-read; markers genuinely do
+  ## move and pay the cost only when they actually did.
   if lab.rect == nil:
+    return
+  if lab.placed and lab.pAnchor == anchorName and lab.pX == x and lab.pY == y:
     return
   var ax = 0.0
   var ay = 1.0
@@ -805,6 +796,10 @@ proc duPlace(lab: DuLabel; anchorName: string; x, y: float64) =
   if fnMax != nil: cDuSetVec2(fnMax, lab.rect, ax, ay)
   if fnPiv != nil: cDuSetVec2(fnPiv, lab.rect, px, py)
   if fnPos != nil: cDuSetVec2(fnPos, lab.rect, x, y)
+  lab.pAnchor = anchorName
+  lab.pX = x
+  lab.pY = y
+  lab.placed = true
 
 proc duStyle(lab: DuLabel; size, r, g, b: float64) =
   ## Font size and colour by RAW FIELD WRITE -- `m_fontSize` (+0x1EC, float) and
@@ -1279,6 +1274,103 @@ proc duReadF32Field(p: Il2CppPtr; off: int32): float64 =
   if duOk(p, off + 4'i32):
     result = cReadF32At(duPtrAdd(p, off))
 
+## Where the clones were actually parented, and by which route. Logged once, so
+## the next run can be read rather than reasoned about.
+var gDuParentRoute = "?"
+var gDuParentRect: Il2CppPtr = nil
+
+proc duRectIsSane(t: Il2CppPtr): bool =
+  ## True only if `t` really is a RectTransform with a usable rect. This is the
+  ## guard the first version did not have, and its absence is the whole bug:
+  ## `Transform::get_root` on the version label lands on a plain Transform
+  ## ('Preloader UI', the OUTERMOST root), and reading RectTransform fields off a
+  ## plain Transform yields garbage -- the live dump showed w=-7268628.0 h=0.0.
+  ## A clone parented there inherits no screen-space Canvas, so Unity gives each
+  ## one its OWN world-space canvas: 33 clones became 33 extra render passes,
+  ## which is the lag, the stutter and (with the churn on top) the crash.
+  ##
+  ## `RectTransform::get_rect` is an sret call; a plain Transform does not have
+  ## the method at all, but the call is made through the RectTransform vtable-free
+  ## static RVA, so what protects us is the SANITY of the answer, not the type.
+  result = false
+  if not duOk(t, 0x20'i32):
+    return
+  var ok = false
+  duGetSret(DuGetRect, t, 4'i32, ok)
+  if not ok:
+    return
+  let w = cDuSret2()
+  let h = cDuSret3()
+  # A real UI rect: positive, finite, and not absurd. 32..16384 covers every
+  # sane canvas from a small panel to an 8K screen and excludes both the zero
+  # rect of a plain Transform and the -7,268,628 garbage the dump showed.
+  result = w > 32.0 and w < 16384.0 and h > 32.0 and h < 16384.0
+
+proc duCanvasRootGo(anchor: Il2CppPtr): Il2CppPtr =
+  ## The GameObject the clones should be parented under: the SCREEN-SPACE canvas
+  ## the version label itself renders in.
+  ##
+  ## Route 1 (preferred, and exact): `Graphic.m_Canvas` (+0x60) on the anchor is
+  ## a direct pointer to the Canvas the game already resolved for this label --
+  ## the live dump printed it, renderMode=0 (ScreenSpaceOverlay) scaleFactor 2.0.
+  ## A Canvas is a Component, so `Component::get_gameObject` turns it into the
+  ## parent GameObject, and a clone under it inherits that canvas instead of
+  ## being given one of its own.
+  ##
+  ## Route 2 (fallback): walk UP from the anchor and keep the HIGHEST ancestor
+  ## whose rect is sane, stopping before the outermost root. That is the
+  ## 'Preloader UI' at parent[3] in the dump -- localScale 2, rect 1920x1080.
+  ##
+  ## Never the outermost root, ever. That was the bug.
+  result = nil
+  let fnGo = mi2Fn(Mi2GetGameObject)
+  if fnGo == nil:
+    return
+  gDuParentRoute = "none"
+  gDuParentRect = nil
+
+  # ---- route 1: the Graphic's own Canvas ----
+  let canvas = duReadPtrField(anchor, cDuOffTmpGCanvas())
+  if duOk(canvas, 0x20'i32):
+    let cgo = cMi2CallPP(fnGo, canvas)
+    if duOk(cgo, 0x20'i32):
+      let fnT = mi2Fn(Mi2GoGetTransform)
+      if fnT != nil:
+        let ct = cMi2CallPP(fnT, cgo)
+        if duRectIsSane(ct):
+          gDuParentRoute = "Graphic.m_Canvas"
+          gDuParentRect = ct
+          return cgo
+
+  # ---- route 2: the highest SANE RectTransform ancestor ----
+  let rect = duRectOf(anchor)
+  if rect == nil:
+    return
+  let fnPar = cDuFn(DuGetParent)
+  if fnPar == nil:
+    return
+  var cur = rect
+  var best: Il2CppPtr = nil
+  var depth = 0
+  while depth < 8:
+    let par = cDuCallPP(fnPar, cur)
+    if not duOk(par, 0x20'i32):
+      break                            # cur was the outermost root; stop
+    if duRectIsSane(par):
+      best = par                       # keep climbing; the highest sane one wins
+    cur = par
+    inc depth
+  if best == nil:
+    return
+  let go = cMi2CallPP(fnGo, best)
+  if duOk(go, 0x20'i32):
+    gDuParentRoute = "highest sane RectTransform ancestor"
+    gDuParentRect = best
+    result = go
+
+# ---------------------------------------------------------------------------
+# THE ONE-SHOT DIAGNOSTIC DUMP, continued
+# ---------------------------------------------------------------------------
 proc duDumpOne(tag: string; tmp: Il2CppPtr) =
   ## Everything about one TMP label that can decide whether it draws.
   if not duOk(tmp, cDuOffTmpRect() + 8'i32):
@@ -1429,10 +1521,31 @@ proc duBuild(preloader: Il2CppPtr): bool =
       if s > 0.01 and s < 100.0:
         gDuCanvasScale = s
   duDiagDump(anchor)
+  # The CANVAS VERDICT. This is the line to read next run. A clone that landed
+  # on the SAME canvas pointer as the source is sharing the source's
+  # screen-space-overlay canvas -- one render pass for all of them. A clone with
+  # its OWN canvas pointer and renderMode=2 is the world-space regression that
+  # made 33 labels cost 33 render passes.
+  let srcCv = duReadPtrField(anchor, cDuOffTmpGCanvas())
+  let cloneCv = (if panel.len > 0: duReadPtrField(panel[0].tmp, cDuOffTmpGCanvas())
+                 elif marks.len > 0: duReadPtrField(marks[0].tmp, cDuOffTmpGCanvas())
+                 else: nil)
+  okLog "debugui: parent route = " & gDuParentRoute &
+        "; parentRect=[" & duDescribeRect(gDuParentRect) & "]" &
+        "; source canvas=0x" & hexOf(cast[uint64](srcCv)) &
+        " renderMode=" & duDescribeInt(DuCanvasMode, srcCv) &
+        "; clone canvas=0x" & hexOf(cast[uint64](cloneCv)) &
+        " renderMode=" & duDescribeInt(DuCanvasMode, cloneCv) &
+        " scaleFactor=" & duDescribeScale(cloneCv) &
+        (if cloneCv != nil and cloneCv == srcCv:
+           " -- SHARED with the source (correct: one render pass)"
+         else:
+           " -- NOT the source's canvas; the clones are on a canvas of their " &
+           "own, which is the world-space regression. Expect cost.")
   okLog "debugui: built " & $panel.len & " panel line(s) and " & $marks.len &
         " marker label(s) by cloning the client's own version label " &
-        "(Object::Instantiate + SetParentAndAlign into the canvas root); " &
-        "layout from " & gDuCfg.source
+        "(Object::Instantiate + SetParentAndAlign under " & gDuParentRoute &
+        "); layout from " & gDuCfg.source
   return true
 
 proc duHideAll() =
