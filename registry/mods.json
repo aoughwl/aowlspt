@@ -255,6 +255,25 @@
       "provides": ["aowl.capability.resourcepacks"],
       "loadAfter": [],
       "tags": ["client", "graphics", "textures", "packs"]
+    },
+    {
+      "id": "aowl.voice",
+      "name": "Voice Agents",
+      "author": "savannt",
+      "version": "0.1.0",
+      "description": "Conversational agents with voice, served entirely from the backend. An agent is an identity (persona, voice, tags, memory); a scav in a raid and your personal assistant are two rows of the same table. On top sits a radio: channels are addressable endpoints agents subscribe to, so calling an NPC on a channel and standing next to them reach the same agent through different routing, over one pipeline. Speech-to-text (whisper.cpp), reasoning and text-to-speech (piper) are each swappable by config string and each probed before use, so a missing model is reported with the exact path it looked at rather than failing silently. Default-off. The client/host side is a thin bridge that polls /aowlspt/voice/last and plays a wav; that bridge is not written yet, and there is no local LLM on this machine, so the default reasoning engine is a template responder that says so in every response it produces.",
+      "pipeline": ">=0.1.0",
+      "sides": ["server", "sim"],
+      "source": { "kind": "intree", "path": "mods/voice", "url": null },
+      "artifact": { "dir": "voice", "library": "voice.dll" },
+      "upstream": null,
+      "license": "see repository",
+      "download": null,
+      "requires": [],
+      "conflicts": [],
+      "provides": ["aowl.capability.voiceagents"],
+      "loadAfter": [],
+      "tags": ["server", "voice", "ai", "dialogue", "radio"]
     }
   ],
 

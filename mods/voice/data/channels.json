@@ -1,0 +1,42 @@
+{
+  "_comment": "The radio. A channel is an addressable endpoint that agents subscribe to; tuning to one and transmitting decides WHO answers, and after that the identical reason/speak pipeline runs that a face-to-face conversation runs. The radio adds routing, not a second pipeline.",
+
+  "_presentation": "This file is the RPG mod's data, not the core's. What a channel is called, who is on it and how it is tuned belongs here; the core only answers 'who is on channel 3 and can they hear me'.",
+
+  "_fields": {
+    "private": "true = you talking to something with no body (your assistant). Range and liveness cannot apply and are not consulted -- that one flag is the whole difference between calling your assistant and calling a scav.",
+    "rangeM": "how far the set carries, for world agents. Needs the host-side bot census (distanceM) to mean anything; see DESIGN.md §3.5.",
+    "members": "in order. The first member whose presence resolves 'ok' answers."
+  },
+
+  "channels": [
+    {
+      "id": "1",
+      "label": "Command - Aowl",
+      "private": true,
+      "rangeM": 0.0,
+      "members": ["assistant"]
+    },
+    {
+      "id": "2",
+      "label": "Open band",
+      "private": false,
+      "rangeM": 600.0,
+      "members": ["scav", "tagilla"]
+    },
+    {
+      "id": "3",
+      "label": "Factory local",
+      "private": false,
+      "rangeM": 150.0,
+      "members": ["tagilla", "scav"]
+    },
+    {
+      "id": "test",
+      "label": "Test bench",
+      "private": true,
+      "rangeM": 0.0,
+      "members": ["testagent"]
+    }
+  ]
+}
