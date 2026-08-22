@@ -107,6 +107,11 @@ import invoke
 ## SettingsScreen control tree read-only. Offsets only; the walk is in
 ## `settingsui.nim` (included below). See `aowlspt_settingsui.h`.
 {.emit: """#include "aowlspt_settingsui.h" """.}
+## Phase 2/3 native-settings WRITE side: the four widget value-field offsets, the
+## per-session klass anchors, and the guarded byte reader that the read header's
+## siblings do not provide. Offsets and one primitive only; the writes themselves
+## are in `settingswrite.nim` (included below). See `aowlspt_settingswrite.h`.
+{.emit: """#include "aowlspt_settingswrite.h" """.}
 ## DIRECT managed invocation by static RVA: the build-pinned target table, the
 ## IL2CPP calling convention (documented there with disassembled evidence from
 ## the game's own call sites), the typed call thunks, and the runtime's
@@ -3870,6 +3875,21 @@ include "invoke2.nim"
 ## `bindDebugEspWorld`.
 include "debugui.nim"
 
+## PHASE 2 -- writing into the real settings screen. `include`d LAST, after
+## `debugui.nim`, because it stands on all three of the files above it at once:
+## `settingsui.nim`'s label chain and tree offsets, `invoke2.nim`'s verified
+## managed-call thunks, and `debugui.nim`'s guarded scalar stores plus the
+## `newString` + raw-`m_text` + dirty-byte recipe that is already proven live.
+## Defines `swOnTabBuilt` (called from the settings postfix) and `swNoteFault`.
+include "settingswrite.nim"
+
+## PHASE 3 -- a per-mod settings PAGE rendered into the real settings screen, by
+## CLONING stock controls (the only reflection-free way to make a control on this
+## build) and rebinding the clones. Stands on `settingswrite.nim` for the klass
+## census and the label/value primitives, and on `invoke2.nim` for Instantiate /
+## SetParentAndAlign / SetActive. Defines `swPagesOnTabBuilt`.
+include "settingspages.nim"
+
 proc hostEventSubscribe(ctx: Il2CppPtr; name: Il2CppPtr; nameLen: int32;
                         cb: Il2CppPtr; user: Il2CppPtr): int32 {.
     exportc: "aowlspt_nim_event_subscribe", cdecl.} =
@@ -4819,6 +4839,55 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "controls -- they do not exist yet at Show) will log every control's " &
          "label, il2cpp klass pointer and value-widget pointer as each tab is " &
          "built. Open Settings and click each tab. NO write is ever performed."
+  # PHASE 2 -- the WRITE side of the native settings screen. Both default OFF,
+  # both ride the ShowScreen postfix the read probe already installs, so neither
+  # costs a detour of its own; each needs `settingsUiProbe` to be on, because
+  # that flag is what arms the hook they run from.
+  gSwRelabel = readBoolKey("settingsRelabelProbe")
+  gSwBind = readBoolKey("settingsBindProbe")
+  if (gSwRelabel or gSwBind) and not gSettingsUiProbe:
+    gSettingsUiProbe = true
+    info "settingsRelabelProbe/settingsBindProbe is set, so settingsUiProbe " &
+         "has been turned on with it -- the Phase-2 write runs from the same " &
+         "ShowScreen postfix the read probe installs, and without that hook " &
+         "there is nothing for it to run from."
+  if gSwRelabel:
+    info "settingsRelabelProbe is set: PHASE 2a. On the ShowScreen postfix the " &
+         "host finds the Game-tab control whose stock label is 'FOV:' and " &
+         "rewrites it to 'FOV: [aowlspt]' -- one il2cpp_string_new, one raw " &
+         "store into m_text (+0xE0), one dirty byte (+0x378), which is the " &
+         "same primitive the version brand and the F3 overlay use in " &
+         "production. Idempotent (it never double-brands) and self-disabling " &
+         "after two faults. Open Settings -> Game and read the FOV row."
+  if gSwBind:
+    info "settingsBindProbe is set: PHASE 2b. On the same postfix the host " &
+         "READS the live value out of every control whose widget type it has " &
+         "learned this session -- a toggle's m_IsOn (+0x120) and a float " &
+         "slider's Slider.m_Value (+0x120) with its range -- and logs each " &
+         "beside its label, so the offsets can be checked against what the " &
+         "screen actually shows. NO value is written."
+  # PHASE 3 -- the per-mod settings pages. Default OFF, and it needs the same
+  # ShowScreen postfix, so it turns the read probe on with itself for the same
+  # reason Phase 2 does.
+  gSwPagesOn = readBoolKey("settingsPages")
+  if gSwPagesOn and not gSettingsUiProbe:
+    gSettingsUiProbe = true
+    info "settingsPages is set, so settingsUiProbe has been turned on with " &
+         "it -- the pages are rendered from the same ShowScreen postfix the " &
+         "read probe installs."
+  if gSwPagesOn:
+    info "settingsPages is set: PHASE 3. On the Game tab the host renders its " &
+         "own settings page into the REAL settings screen, by CLONING a stock " &
+         "toggle row (UnityEngine.Object::Instantiate + " &
+         "TMP_DefaultControls::SetParentAndAlign, both byte-verified direct " &
+         "calls) once per row, relabelling each clone and seeding it with " &
+         "Toggle::SetIsOnWithoutNotify so the row shows its own value without " &
+         "firing the donor setting's handler. The first page is the aowlspt " &
+         "host's own flags out of aowlspt-host.json; a row the player changes " &
+         "is read back and persisted to that file. Rows that are carried but " &
+         "not yet wired are suffixed '(not done yet)'. Nothing the GAME " &
+         "created is ever written -- only clones the host made itself -- and " &
+         "the whole thing shares the Phase-2 fault budget."
   gMi2Probe = readBoolKey("managedInvokeProbe")
   if gMi2Probe:
     info "managedInvokeProbe is set: a POSTFIX detour on " &
