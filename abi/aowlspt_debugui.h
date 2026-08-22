@@ -177,6 +177,59 @@
 #define AOWL_DU_MC_PREVPOS       0x370
 #define AOWL_DU_MC_ROTATION      0x0C0
 
+/* TMPro.TMP_Text -- the fields that decide whether a label DRAWS AT ALL.
+ *
+ * These were added after the overlay built 33 clones and showed nothing. Every
+ * one of them is a way for a live, parented, correctly-positioned TMP label to
+ * render zero glyphs, and every one of them is INHERITED BY THE CLONE from the
+ * version label, which is styled for a corner of the screen and not for us:
+ *
+ *   m_enableWordWrapping  a narrow rect wraps every word onto its own line and
+ *   m_overflowMode        an Overflow mode of Ellipsis/Truncate/Masking then
+ *                         clips them away. Wrapping OFF + overflow Overflow(0)
+ *                         makes the rect's WIDTH stop mattering entirely.
+ *   m_enableAutoSizing    auto-size shrinks the text to fit the rect; against a
+ *                         collapsed rect it shrinks it to nothing.
+ *   m_maxVisibleCharacters / Words / Lines
+ *                         a typewriter/reveal effect on the source leaves these
+ *                         clamped, and a clamp of 0 is an invisible label with
+ *                         perfectly good text in `m_text`.
+ *   m_firstVisibleCharacter / m_pageToDisplay
+ *                         the same, from the other end.
+ *   m_HorizontalAlignment / m_VerticalAlignment / m_textAlignment
+ *                         the version label is bottom-anchored; a top-left panel
+ *                         wants top-left alignment or the text sits a rect-height
+ *                         away from where the anchor says it is.
+ *   m_Color (Graphic)     the CanvasRenderer tint. The alpha version label is
+ *                         drawn faint; a clone that inherits alpha 0.15 is not
+ *                         invisible but is very close to it.
+ *   m_Canvas (Graphic)    read-only here -- it is how the diagnostics name the
+ *                         canvas the clone actually landed in.
+ *
+ * Values (standard TMP enums): HorizontalAlignmentOptions.Left = 1,
+ * VerticalAlignmentOptions.Top = 256, TextAlignmentOptions.TopLeft = 257,
+ * TextOverflowModes.Overflow = 0.
+ */
+#define AOWL_DU_TMP_GCOLOR       0x028  /* Graphic m_Color -> Color (4 floats) */
+#define AOWL_DU_TMP_GRECT        0x050  /* Graphic m_RectTransform             */
+#define AOWL_DU_TMP_GCANVAS      0x060  /* Graphic m_Canvas -> Canvas          */
+#define AOWL_DU_TMP_AUTOSIZE     0x240  /* m_enableAutoSizing -> bool          */
+#define AOWL_DU_TMP_HALIGN       0x274  /* m_HorizontalAlignment -> int        */
+#define AOWL_DU_TMP_VALIGN       0x278  /* m_VerticalAlignment -> int          */
+#define AOWL_DU_TMP_TEXTALIGN    0x27C  /* m_textAlignment -> int              */
+#define AOWL_DU_TMP_WORDWRAP     0x2E0  /* m_enableWordWrapping -> bool        */
+#define AOWL_DU_TMP_OVERFLOW     0x2E8  /* m_overflowMode -> int               */
+#define AOWL_DU_TMP_FIRSTVIS     0x32C  /* m_firstVisibleCharacter -> int      */
+#define AOWL_DU_TMP_MAXVISCHARS  0x330  /* m_maxVisibleCharacters -> int       */
+#define AOWL_DU_TMP_MAXVISWORDS  0x334  /* m_maxVisibleWords -> int            */
+#define AOWL_DU_TMP_MAXVISLINES  0x338  /* m_maxVisibleLines -> int            */
+#define AOWL_DU_TMP_PAGE         0x340  /* m_pageToDisplay -> int              */
+#define AOWL_DU_TMP_MARGIN       0x348  /* m_margin -> Vector4 (l,t,r,b)       */
+
+/* System.String, for reading a name back out of a managed string. */
+#define AOWL_DU_STR_LEN          0x010
+#define AOWL_DU_STR_CHARS        0x014
+
 /* EFT.GameWorld */
 #define AOWL_DU_GW_LOCATIONID    0x0E8  /* <LocationId>k__BackingField String */
 
@@ -193,6 +246,20 @@ static int32_t aowl_du_off_tmp_rect(void)        { return AOWL_DU_TMP_RECT; }
 static int32_t aowl_du_off_mc_prevpos(void)      { return AOWL_DU_MC_PREVPOS; }
 static int32_t aowl_du_off_mc_rotation(void)     { return AOWL_DU_MC_ROTATION; }
 static int32_t aowl_du_off_gw_locationid(void)   { return AOWL_DU_GW_LOCATIONID; }
+static int32_t aowl_du_off_tmp_gcolor(void)      { return AOWL_DU_TMP_GCOLOR; }
+static int32_t aowl_du_off_tmp_gcanvas(void)     { return AOWL_DU_TMP_GCANVAS; }
+static int32_t aowl_du_off_tmp_autosize(void)    { return AOWL_DU_TMP_AUTOSIZE; }
+static int32_t aowl_du_off_tmp_halign(void)      { return AOWL_DU_TMP_HALIGN; }
+static int32_t aowl_du_off_tmp_valign(void)      { return AOWL_DU_TMP_VALIGN; }
+static int32_t aowl_du_off_tmp_textalign(void)   { return AOWL_DU_TMP_TEXTALIGN; }
+static int32_t aowl_du_off_tmp_wordwrap(void)    { return AOWL_DU_TMP_WORDWRAP; }
+static int32_t aowl_du_off_tmp_overflow(void)    { return AOWL_DU_TMP_OVERFLOW; }
+static int32_t aowl_du_off_tmp_firstvis(void)    { return AOWL_DU_TMP_FIRSTVIS; }
+static int32_t aowl_du_off_tmp_maxvischars(void) { return AOWL_DU_TMP_MAXVISCHARS; }
+static int32_t aowl_du_off_tmp_maxviswords(void) { return AOWL_DU_TMP_MAXVISWORDS; }
+static int32_t aowl_du_off_tmp_maxvislines(void) { return AOWL_DU_TMP_MAXVISLINES; }
+static int32_t aowl_du_off_tmp_page(void)        { return AOWL_DU_TMP_PAGE; }
+static int32_t aowl_du_off_tmp_margin(void)      { return AOWL_DU_TMP_MARGIN; }
 
 /* ------------------------------------------------------------------ *
  * The managed-target table
@@ -219,6 +286,27 @@ typedef struct AowlDuTarget {
 #define AOWL_DU_SET_PIVOT        5
 #define AOWL_DU_GET_TRANSFORM    6
 #define AOWL_DU_GET_ROOT         7
+/* The READ-BACK half, added for the "33 clones, nothing on screen" hunt: the
+ * overlay could WRITE a transform but had no way to ask what the transform then
+ * actually was, so a clone parked at a garbage rect was indistinguishable from a
+ * clone that was never drawn. Every one of these is read-only. */
+#define AOWL_DU_GET_ANCHOREDPOS  8
+#define AOWL_DU_GET_SIZEDELTA    9
+#define AOWL_DU_SET_SIZEDELTA    10
+#define AOWL_DU_GET_ANCHORMIN    11
+#define AOWL_DU_GET_PIVOT        12
+#define AOWL_DU_GET_RECT         13
+#define AOWL_DU_GET_LOCALSCALE   14
+#define AOWL_DU_SET_LOCALSCALE   15
+#define AOWL_DU_GET_LOCALPOS     16
+#define AOWL_DU_SET_LOCALPOS     17
+#define AOWL_DU_GET_PARENT       18
+#define AOWL_DU_GO_ACTIVESELF    19
+#define AOWL_DU_GO_ACTIVEINHIER  20
+#define AOWL_DU_GO_LAYER         21
+#define AOWL_DU_CANVAS_ORDER     22
+#define AOWL_DU_CANVAS_MODE      23
+#define AOWL_DU_CANVAS_SCALE     24
 
 static const AowlDuTarget aowl_du_targets[] = {
     /* UnityEngine.Camera::get_main -- STATIC, 0 args -> Camera. */
@@ -264,6 +352,87 @@ static const AowlDuTarget aowl_du_targets[] = {
      * is a screen corner rather than a corner of the version label. */
     { "UnityEngine.Transform::get_root", 0x52B9C50u,
       { 0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,0x4B,0xAF,0xE1,0x01,
+        0x48,0x8B,0xD9 }, 16 },
+
+    /* ---- the read-back / geometry half ----
+     *
+     * RVAs from the same per-image methodPointers resolve that produced the
+     * eight above (UnityEngine.RectTransform is type 23163, Transform 23165,
+     * GameObject 23102, Canvas 30443), and each prologue below was dumped from
+     * GameAssembly.dll rather than typed from memory. The three targets already
+     * in this table that the same dump covers (Camera::get_main,
+     * Object::Instantiate, RectTransform::set_anchoredPosition) came back
+     * byte-identical to what was already written down, which is what makes the
+     * new rows trustworthy.
+     *
+     * SHAPES, from those prologues:
+     *   a Vector2 is 8 bytes, so it is RETURNED IN RAX  -> AowlDu_U_P
+     *   a Vector3 is 12 and a Rect is 16, so both are returned through a HIDDEN
+     *     BUFFER: (retbuf in RCX, this in RDX, MethodInfo*) -> AowlDu_SRET_P
+     *     (`33 C0 / 48 8B FA / 48 89 01` -- zero, this into RDI, store into
+     *      [RCX] -- is that shape written out)
+     *   a Vector3 ARGUMENT is likewise passed BY ADDRESS in RDX
+     *     (`48 8B DA` then the address is handed to the icall) -> AowlDu_V_PPTR
+     *   an int/bool/float return is the plain (this, MethodInfo*) shape.
+     */
+    { "UnityEngine.RectTransform::get_anchoredPosition", 0x52B5430u,
+      { 0x40,0x53,0x48,0x83,0xEC,0x20,0x33,0xC0,0x48,0x8B,0xD9,0x48,0x89,
+        0x44,0x24,0x40 }, 16 },
+    { "UnityEngine.RectTransform::get_sizeDelta", 0x52B54F0u,
+      { 0x40,0x53,0x48,0x83,0xEC,0x20,0x33,0xC0,0x48,0x8B,0xD9,0x48,0x89,
+        0x44,0x24,0x40 }, 16 },
+    { "UnityEngine.RectTransform::set_sizeDelta", 0x52B5550u,
+      { 0x40,0x53,0x48,0x83,0xEC,0x30,0x48,0x8B,0x05,0x13,0xF6,0xE1,0x01,
+        0x48,0x8B,0xD9 }, 16 },
+    { "UnityEngine.RectTransform::get_anchorMin", 0x52B52B0u,
+      { 0x40,0x53,0x48,0x83,0xEC,0x20,0x33,0xC0,0x48,0x8B,0xD9,0x48,0x89,
+        0x44,0x24,0x40 }, 16 },
+    { "UnityEngine.RectTransform::get_pivot", 0x52B55B0u,
+      { 0x40,0x53,0x48,0x83,0xEC,0x20,0x33,0xC0,0x48,0x8B,0xD9,0x48,0x89,
+        0x44,0x24,0x40 }, 16 },
+    /* get_rect returns a Rect (x, y, width, height) -- the ONE call that says
+     * outright how big the label's box is after every anchor has been applied,
+     * and, on the canvas root, how big the canvas is in canvas units. */
+    { "UnityEngine.RectTransform::get_rect", 0x52B5240u,
+      { 0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,
+        0xDF,0xF8,0xE1 }, 16 },
+    { "UnityEngine.Transform::get_localScale", 0x52B8100u,
+      { 0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x33,0xC0,0x48,
+        0x8B,0xFA,0x48 }, 16 },
+    { "UnityEngine.Transform::set_localScale", 0x52B8170u,
+      { 0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,
+        0xCF,0xCA,0xE1 }, 16 },
+    { "UnityEngine.Transform::get_localPosition", 0x52B71B0u,
+      { 0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x33,0xC0,0x48,
+        0x8B,0xFA,0x48 }, 16 },
+    { "UnityEngine.Transform::set_localPosition", 0x52B7220u,
+      { 0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,
+        0xEF,0xD9,0xE1 }, 16 },
+    { "UnityEngine.Transform::get_parent", 0x52B81D0u,
+      { 0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,0xB3,0xC9,0xE1,0x01,
+        0x48,0x8B,0xD9 }, 16 },
+    { "UnityEngine.GameObject::get_activeSelf", 0x52A8C40u,
+      { 0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,0x53,0xB9,0xE2,0x01,
+        0x48,0x8B,0xD9 }, 16 },
+    { "UnityEngine.GameObject::get_activeInHierarchy", 0x52A8C90u,
+      { 0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,0x0B,0xB9,0xE2,0x01,
+        0x48,0x8B,0xD9 }, 16 },
+    { "UnityEngine.GameObject::get_layer", 0x52A8B30u,
+      { 0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,0x4B,0xBA,0xE2,0x01,
+        0x48,0x8B,0xD9 }, 16 },
+    /* The Canvas the clone landed in: its sorting order says whether anything
+     * is drawn OVER us, its render mode says whether "screen corner" even means
+     * anything, and its scale factor is the number the ESP projection has to
+     * divide by -- Screen.WorldToScreenPoint is in PIXELS, anchoredPosition is
+     * in CANVAS UNITS, and they are only the same number at scale 1. */
+    { "UnityEngine.Canvas::get_sortingOrder", 0x5584540u,
+      { 0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,0x23,0x3A,0xB5,0x01,
+        0x48,0x8B,0xD9 }, 16 },
+    { "UnityEngine.Canvas::get_renderMode", 0x5584080u,
+      { 0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,0x73,0x3E,0xB5,0x01,
+        0x48,0x8B,0xD9 }, 16 },
+    { "UnityEngine.Canvas::get_scaleFactor", 0x5584180u,
+      { 0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,0x8B,0x3D,0xB5,0x01,
         0x48,0x8B,0xD9 }, 16 },
 };
 
@@ -428,6 +597,91 @@ static int32_t aowl_du_world_to_screen(void* fn, void* cam,
     }
     return 1;
 }
+/* INSTANCE, 0 declared args -> a Vector2 (8 bytes, so returned IN RAX).
+ * `aowl_du_vec2_x/y` unpack it; the pair is returned as one uint64 rather than
+ * through statics because it is genuinely one register and nimony can hold it. */
+typedef uint64_t (*AowlDu_U_P)(void*, void*);
+static uint64_t aowl_du_call_u_p(void* fn, void* self) {
+    if (!fn || !self) return 0;
+    return ((AowlDu_U_P)fn)(self, NULL);
+}
+static double aowl_du_vec2_x(uint64_t packed) {
+    float f[2]; memcpy(f, &packed, sizeof(f)); return (double)f[0];
+}
+static double aowl_du_vec2_y(uint64_t packed) {
+    float f[2]; memcpy(f, &packed, sizeof(f)); return (double)f[1];
+}
+
+/* INSTANCE, 0 declared args -> int32 / bool / float. */
+typedef int32_t (*AowlDu_I_P)(void*, void*);
+static int32_t aowl_du_call_i_p(void* fn, void* self) {
+    if (!fn || !self) return 0;
+    return ((AowlDu_I_P)fn)(self, NULL);
+}
+typedef float (*AowlDu_F_P)(void*, void*);
+static double aowl_du_call_f_p(void* fn, void* self) {
+    if (!fn || !self) return 0.0;
+    return (double)((AowlDu_F_P)fn)(self, NULL);
+}
+
+/* INSTANCE, 0 declared args -> a struct BIGGER than 8 bytes (Vector3, Rect), so
+ * Win64 returns it through a hidden buffer: (retbuf, this, MethodInfo*).
+ *
+ * The result lands in four statics read back with `aowl_du_sret_0..3`, for the
+ * same reason `aowl_du_world_to_screen` does it: nimony cannot hand out the
+ * address of an array element, and the overlay is single-threaded. A NaN or an
+ * absurd magnitude returns 0 and leaves the statics alone, so a half-torn-down
+ * transform cannot feed a garbage number into a layout decision. */
+typedef void (*AowlDu_SRET_P)(void*, void*, void*);
+static double aowl_du_sret_out[4] = { 0.0, 0.0, 0.0, 0.0 };
+static int32_t aowl_du_call_sret_p(void* fn, void* self, int32_t nfloats) {
+    float ret[4];
+    int i;
+    if (!fn || !self) return 0;
+    if (nfloats < 1 || nfloats > 4) return 0;
+    for (i = 0; i < 4; i++) ret[i] = 0.0f;
+    ((AowlDu_SRET_P)fn)((void*)ret, self, NULL);
+    for (i = 0; i < nfloats; i++) {
+        float v = ret[i];
+        if (v != v) return 0;
+        if (v > 1.0e9f || v < -1.0e9f) return 0;
+    }
+    for (i = 0; i < nfloats; i++) aowl_du_sret_out[i] = (double)ret[i];
+    return 1;
+}
+static double aowl_du_sret_0(void) { return aowl_du_sret_out[0]; }
+static double aowl_du_sret_1(void) { return aowl_du_sret_out[1]; }
+static double aowl_du_sret_2(void) { return aowl_du_sret_out[2]; }
+static double aowl_du_sret_3(void) { return aowl_du_sret_out[3]; }
+
+/* INSTANCE, one Vector3 BY ADDRESS -> void.  (this, &value, MethodInfo*)
+ * A Vector3 is 12 bytes, which is neither 1/2/4/8, so Win64 passes it by
+ * address -- the opposite of the Vector2 setters two thunks up, and the reason
+ * they are two thunks and not one. */
+typedef void (*AowlDu_V_PPTR)(void*, void*, void*);
+static void aowl_du_call_setvec3(void* fn, void* self,
+                                 double x, double y, double z) {
+    float v[3];
+    if (!fn || !self) return;
+    v[0] = (float)x; v[1] = (float)y; v[2] = (float)z;
+    ((AowlDu_V_PPTR)fn)(self, (void*)v, NULL);
+}
+
+/* The length of a managed System.String, or -1 when the pointer is not one we
+ * can read. Used by the diagnostics to say "the write landed and the string is
+ * N characters long" without decoding it twice. */
+static int32_t aowl_du_string_len(void* s) {
+    MEMORY_BASIC_INFORMATION mbi;
+    int32_t n;
+    if (!s) return -1;
+    if (VirtualQuery(s, &mbi, sizeof(mbi)) == 0) return -1;
+    if (mbi.State != MEM_COMMIT) return -1;
+    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return -1;
+    memcpy(&n, (char*)s + AOWL_DU_STR_LEN, sizeof(n));
+    if (n < 0 || n > 0x100000) return -1;
+    return n;
+}
+
 static double aowl_du_screen_x(void) { return aowl_du_w2s_out[0]; }
 static double aowl_du_screen_y(void) { return aowl_du_w2s_out[1]; }
 static double aowl_du_screen_z(void) { return aowl_du_w2s_out[2]; }

@@ -103,6 +103,43 @@ proc cDuOffTmpRect(): int32 {.importc: "aowl_du_off_tmp_rect", nodecl.}
 proc cDuOffMcPrevPos(): int32 {.importc: "aowl_du_off_mc_prevpos", nodecl.}
 proc cDuOffMcRotation(): int32 {.importc: "aowl_du_off_mc_rotation", nodecl.}
 proc cDuOffGwLocationId(): int32 {.importc: "aowl_du_off_gw_locationid", nodecl.}
+proc cDuOffTmpGColor(): int32 {.importc: "aowl_du_off_tmp_gcolor", nodecl.}
+proc cDuOffTmpGCanvas(): int32 {.importc: "aowl_du_off_tmp_gcanvas", nodecl.}
+proc cDuOffTmpAutosize(): int32 {.importc: "aowl_du_off_tmp_autosize", nodecl.}
+proc cDuOffTmpHAlign(): int32 {.importc: "aowl_du_off_tmp_halign", nodecl.}
+proc cDuOffTmpVAlign(): int32 {.importc: "aowl_du_off_tmp_valign", nodecl.}
+proc cDuOffTmpTextAlign(): int32 {.
+  importc: "aowl_du_off_tmp_textalign", nodecl.}
+proc cDuOffTmpWordWrap(): int32 {.importc: "aowl_du_off_tmp_wordwrap", nodecl.}
+proc cDuOffTmpOverflow(): int32 {.importc: "aowl_du_off_tmp_overflow", nodecl.}
+proc cDuOffTmpFirstVis(): int32 {.importc: "aowl_du_off_tmp_firstvis", nodecl.}
+proc cDuOffTmpMaxVisChars(): int32 {.
+  importc: "aowl_du_off_tmp_maxvischars", nodecl.}
+proc cDuOffTmpMaxVisWords(): int32 {.
+  importc: "aowl_du_off_tmp_maxviswords", nodecl.}
+proc cDuOffTmpMaxVisLines(): int32 {.
+  importc: "aowl_du_off_tmp_maxvislines", nodecl.}
+proc cDuOffTmpPage(): int32 {.importc: "aowl_du_off_tmp_page", nodecl.}
+proc cDuOffTmpMargin(): int32 {.importc: "aowl_du_off_tmp_margin", nodecl.}
+
+proc cDuCallUP(fn, self: Il2CppPtr): uint64 {.
+  importc: "aowl_du_call_u_p", nodecl.}
+proc cDuVec2X(packed: uint64): float64 {.importc: "aowl_du_vec2_x", nodecl.}
+proc cDuVec2Y(packed: uint64): float64 {.importc: "aowl_du_vec2_y", nodecl.}
+proc cDuCallIP(fn, self: Il2CppPtr): int32 {.
+  importc: "aowl_du_call_i_p", nodecl.}
+proc cDuCallFP(fn, self: Il2CppPtr): float64 {.
+  importc: "aowl_du_call_f_p", nodecl.}
+proc cDuCallSretP(fn, self: Il2CppPtr; nfloats: int32): int32 {.
+  importc: "aowl_du_call_sret_p", nodecl.}
+proc cDuSret0(): float64 {.importc: "aowl_du_sret_0", nodecl.}
+proc cDuSret1(): float64 {.importc: "aowl_du_sret_1", nodecl.}
+proc cDuSret2(): float64 {.importc: "aowl_du_sret_2", nodecl.}
+proc cDuSret3(): float64 {.importc: "aowl_du_sret_3", nodecl.}
+proc cDuSetVec3(fn, self: Il2CppPtr; x, y, z: float64) {.
+  importc: "aowl_du_call_setvec3", nodecl.}
+proc cDuStringLen(s: Il2CppPtr): int32 {.
+  importc: "aowl_du_string_len", nodecl.}
 
 # ---- target indices, mirroring the AOWL_DU_* defines ----
 const
@@ -114,6 +151,23 @@ const
   DuSetPivot       = 5'i32
   DuGetTransform   = 6'i32
   DuGetRoot        = 7'i32
+  DuGetAnchoredPos = 8'i32
+  DuGetSizeDelta   = 9'i32
+  DuSetSizeDelta   = 10'i32
+  DuGetAnchorMin   = 11'i32
+  DuGetPivot       = 12'i32
+  DuGetRect        = 13'i32
+  DuGetLocalScale  = 14'i32
+  DuSetLocalScale  = 15'i32
+  DuGetLocalPos    = 16'i32
+  DuSetLocalPos    = 17'i32
+  DuGetParent      = 18'i32
+  DuGoActiveSelf   = 19'i32
+  DuGoActiveInHier = 20'i32
+  DuGoLayer        = 21'i32
+  DuCanvasOrder    = 22'i32
+  DuCanvasMode     = 23'i32
+  DuCanvasScale    = 24'i32
 
 # ---------------------------------------------------------------------------
 # Caps
@@ -447,6 +501,11 @@ var gDuRootGo: Il2CppPtr = nil
 ## botdiag when that is the one armed). Cleared when it stops being readable.
 var gDuGameWorld: Il2CppPtr = nil
 
+## The canvas scale factor, resolved once when the pool is built. See the note
+## where it is assigned: it is the pixels-to-canvas-units divisor the ESP
+## projection needs and the panel does not.
+var gDuCanvasScale = 1.0
+
 ## Whether the overlay is currently visible, and whether the markers are.
 var gDuVisible = false
 var gDuEspVisible = false
@@ -538,6 +597,138 @@ proc duCanvasRootGo(anchor: Il2CppPtr): Il2CppPtr =
   let go = cMi2CallPP(fnGo, root)
   if duOk(go, 0x20'i32):
     result = go
+
+# ---------------------------------------------------------------------------
+# Read-back helpers
+#
+# The overlay could WRITE a transform but had no way to ASK what the transform
+# then was, which is exactly why "33 clones built" and "nothing on screen" were
+# indistinguishable. Everything below is read-only and guarded; a target that did
+# not verify makes the reader return `ok=false` rather than a plausible zero.
+# ---------------------------------------------------------------------------
+proc duGetVec2(target: int32; self: Il2CppPtr; ok: var bool;
+               x, y: var float64) =
+  ok = false
+  x = 0.0
+  y = 0.0
+  let fn = cDuFn(target)
+  if fn == nil or not duOk(self, 0x20'i32):
+    return
+  let packed = cDuCallUP(fn, self)
+  x = cDuVec2X(packed)
+  y = cDuVec2Y(packed)
+  ok = true
+
+proc duGetSret(target: int32; self: Il2CppPtr; n: int32; ok: var bool) =
+  ## Fills `cDuSret0..3`. `n` is how many floats the struct has (3 for a
+  ## Vector3, 4 for a Rect).
+  ok = false
+  let fn = cDuFn(target)
+  if fn == nil or not duOk(self, 0x20'i32):
+    return
+  ok = cDuCallSretP(fn, self, n) != 0'i32
+
+proc duGetInt(target: int32; self: Il2CppPtr; ok: var bool): int32 =
+  ok = false
+  result = 0'i32
+  let fn = cDuFn(target)
+  if fn == nil or not duOk(self, 0x20'i32):
+    return
+  result = cDuCallIP(fn, self)
+  ok = true
+
+proc duGameObjectOf(comp: Il2CppPtr): Il2CppPtr =
+  result = nil
+  let fn = mi2Fn(Mi2GetGameObject)
+  if fn == nil or not duOk(comp, 0x20'i32):
+    return
+  let go = cMi2CallPP(fn, comp)
+  if duOk(go, 0x20'i32):
+    result = go
+
+proc duNameOf(obj: Il2CppPtr): string =
+  ## `UnityEngine.Object::get_name` -> a managed String -> our string. Used only
+  ## by the one-shot diagnostics, never per frame: it allocates on the managed
+  ## heap and a per-frame allocation is the one cost this overlay refuses.
+  result = ""
+  let fn = mi2Fn(Mi2GetName)
+  if fn == nil or not duOk(obj, 0x20'i32):
+    return
+  let s = cMi2CallPP(fn, obj)
+  if s == nil or cIsReadable(s, 0x14'i32) == 0'i32:
+    return
+  result = bdReadString(s)
+
+# ---------------------------------------------------------------------------
+# Making a clone actually DRAW
+#
+# A clone of the version label inherits the version label's ENTIRE styling, and
+# that styling is for a faint bottom-corner stamp, not for a panel. Six separate
+# inherited properties can each independently render a live, parented, correctly
+# positioned label as zero pixels; the header note lists them with the field
+# offsets. This applies the opposite of each, by raw field write into a component
+# THIS FILE CLONED -- never into anything the game built.
+#
+# All of it is idempotent and none of it needs a managed call, so it costs one
+# burst of stores per label per session.
+# ---------------------------------------------------------------------------
+const
+  cDuAlignLeft   = 1'i32      ## HorizontalAlignmentOptions.Left
+  cDuAlignTop    = 256'i32    ## VerticalAlignmentOptions.Top
+  cDuAlignTopLft = 257'i32    ## TextAlignmentOptions.TopLeft
+  cDuOverflowOn  = 0'i32      ## TextOverflowModes.Overflow
+  cDuIntMax      = 2147483647'i32
+
+proc duMakeDrawable(lab: DuLabel; w, h: float64) =
+  if lab.tmp == nil:
+    return
+  # Word wrap OFF and overflow Overflow: after this the rect's WIDTH cannot
+  # hide a single glyph, which removes the whole class of "the box collapsed".
+  discard cDuWriteU8(lab.tmp, cDuOffTmpWordWrap(), 0'i32)
+  discard cDuWriteI32(lab.tmp, cDuOffTmpOverflow(), cDuOverflowOn)
+  # Auto-sizing OFF, or the font size written by `duStyle` is advisory and the
+  # real size is whatever fits a box we just collapsed to a point.
+  discard cDuWriteU8(lab.tmp, cDuOffTmpAutosize(), 0'i32)
+  # Top-left alignment, to match the top-left pivot `duPlace` sets: otherwise
+  # the glyphs sit a whole rect-height below where the anchor claims they are.
+  discard cDuWriteI32(lab.tmp, cDuOffTmpHAlign(), cDuAlignLeft)
+  discard cDuWriteI32(lab.tmp, cDuOffTmpVAlign(), cDuAlignTop)
+  discard cDuWriteI32(lab.tmp, cDuOffTmpTextAlign(), cDuAlignTopLft)
+  # Nothing clipped from either end: a source label with a reveal effect leaves
+  # these clamped, and a clamp of zero is an invisible label with perfect text.
+  discard cDuWriteI32(lab.tmp, cDuOffTmpFirstVis(), 0'i32)
+  discard cDuWriteI32(lab.tmp, cDuOffTmpMaxVisChars(), cDuIntMax)
+  discard cDuWriteI32(lab.tmp, cDuOffTmpMaxVisWords(), cDuIntMax)
+  discard cDuWriteI32(lab.tmp, cDuOffTmpMaxVisLines(), cDuIntMax)
+  discard cDuWriteI32(lab.tmp, cDuOffTmpPage(), 1'i32)
+  # No margins -- the version label's margins are sized for its own corner.
+  discard cDuWriteColor(lab.tmp, cDuOffTmpMargin(), 0.0, 0.0, 0.0, 0.0)
+  # The Graphic tint the CanvasRenderer multiplies by. The alpha version label
+  # is drawn faint; a clone that inherits alpha 0.15 is not literally invisible
+  # but is indistinguishable from it against the game's background.
+  discard cDuWriteColor(lab.tmp, cDuOffTmpGColor(), 1.0, 1.0, 1.0, 1.0)
+  # A real box. `duPlace` collapses anchorMin == anchorMax to a POINT, after
+  # which the rect IS the sizeDelta -- and the sizeDelta inherited from a
+  # stretch-anchored source is routinely zero or negative.
+  let fnSize = cDuFn(DuSetSizeDelta)
+  if fnSize != nil and lab.rect != nil:
+    cDuSetVec2(fnSize, lab.rect, w, h)
+  # Identity scale and a zero local Z. `SetParentAndAlign` does NOT reset the
+  # local transform (it is `SetParent(parent, false)` plus a layer walk), so the
+  # clone arrives carrying whatever the source had.
+  let fnScale = cDuFn(DuSetLocalScale)
+  if fnScale != nil and lab.rect != nil:
+    cDuSetVec3(fnScale, lab.rect, 1.0, 1.0, 1.0)
+  let fnPos = cDuFn(DuSetLocalPos)
+  if fnPos != nil and lab.rect != nil:
+    cDuSetVec3(fnPos, lab.rect, 0.0, 0.0, 0.0)
+  # And finally: awake. `Instantiate` copies `activeSelf`, so a clone of a
+  # disabled source is a disabled clone that will never render anything.
+  let go = duGameObjectOf(lab.tmp)
+  let fnAct = mi2Fn(Mi2GoSetActive)
+  if go != nil and fnAct != nil:
+    cMi2CallVPB(fnAct, go, 1'i32)
+  discard cDuWriteU8(lab.tmp, cDuOffTmpDirty(), 1'i32)
 
 # ---------------------------------------------------------------------------
 # Making one label
@@ -1001,13 +1192,175 @@ proc duUpdateMarkers(): bool =
       else: discard
     if not b.alive:
       text.add " [dead]"
+    # Pixels -> canvas units. `gDuCanvasScale` is 1.0 when the scaler is 1 or
+    # when the canvas could not be read, so this is a no-op in the case the
+    # original code assumed and a correction in the case it did not.
+    let inv = 1.0 / gDuCanvasScale
     duPlace(gDuMarks[used], "bottomleft",
-            cDuScreenX(), cDuScreenY() + gDuCfg.espY)
+            cDuScreenX() * inv, cDuScreenY() * inv + gDuCfg.espY)
     discard duSetText(gDuMarks[used], text)
     inc used
   for i in used ..< gDuMarks.len:
     duHide(gDuMarks[i])
   result = true
+
+# ---------------------------------------------------------------------------
+# THE ONE-SHOT DIAGNOSTIC DUMP
+#
+# The rule in this codebase is that the client tells you; you do not reason from
+# source. The first build of this overlay logged "built 9 panel line(s) and 24
+# marker label(s)" and put nothing on screen, and there was no way to tell which
+# of five completely different causes it was -- a collapsed rect, a wiped
+# position, an inactive object, a hidden canvas, or a label drawn behind the game
+# -- because the code only ever wrote and never read.
+#
+# So: once, on the first successful build, dump the SOURCE label and CLONE[0]
+# side by side. The two columns next to each other are the answer: everything the
+# clone inherited shows as an identical pair, and everything the overlay changed
+# shows as a difference. Read-only, capped, and it never runs again.
+# ---------------------------------------------------------------------------
+proc duDescribeVec2(target: int32; self: Il2CppPtr): string =
+  var ok = false
+  var x = 0.0
+  var y = 0.0
+  duGetVec2(target, self, ok, x, y)
+  result = (if ok: "(" & duFmt1(x) & "," & duFmt1(y) & ")" else: "?")
+
+proc duDescribeVec3(target: int32; self: Il2CppPtr): string =
+  var ok = false
+  duGetSret(target, self, 3'i32, ok)
+  result = (if ok: "(" & duFmt2(cDuSret0()) & "," & duFmt2(cDuSret1()) & "," &
+                   duFmt2(cDuSret2()) & ")" else: "?")
+
+proc duDescribeRect(self: Il2CppPtr): string =
+  var ok = false
+  duGetSret(DuGetRect, self, 4'i32, ok)
+  result = (if ok: "x=" & duFmt1(cDuSret0()) & " y=" & duFmt1(cDuSret1()) &
+                   " w=" & duFmt1(cDuSret2()) & " h=" & duFmt1(cDuSret3())
+            else: "?")
+
+proc duDescribeInt(target: int32; self: Il2CppPtr): string =
+  var ok = false
+  let v = duGetInt(target, self, ok)
+  result = (if ok: $int(v) else: "?")
+
+proc duDescribeScale(canvas: Il2CppPtr): string =
+  let fn = cDuFn(DuCanvasScale)
+  if fn == nil or not duOk(canvas, 0x20'i32):
+    return "?"
+  result = duFmt2(cDuCallFP(fn, canvas))
+
+proc duDescribeScreen(): string =
+  let fw = mi2Fn(Mi2ScreenWidth)
+  let fh = mi2Fn(Mi2ScreenHeight)
+  if fw == nil or fh == nil:
+    return "?"
+  result = $int(cMi2CallIV(fw)) & "x" & $int(cMi2CallIV(fh))
+
+proc duReadI32Field(p: Il2CppPtr; off: int32): int32 =
+  ## A guarded int32 read at a managed field offset, or -1. `-1` is not a legal
+  ## value for any field this dump prints, so it reads as "could not look".
+  result = -1'i32
+  if duOk(p, off + 4'i32):
+    result = cReadI32At(duPtrAdd(p, off))
+
+proc duReadBoolField(p: Il2CppPtr; off: int32): int32 =
+  result = -1'i32
+  if duOk(p, off + 4'i32):
+    result = cReadI32At(duPtrAdd(p, off)) and 1'i32
+
+proc duReadPtrField(p: Il2CppPtr; off: int32): Il2CppPtr =
+  result = nil
+  if duOk(p, off + 8'i32):
+    result = cReadPtrAt(p, off)
+
+proc duReadF32Field(p: Il2CppPtr; off: int32): float64 =
+  result = 0.0
+  if duOk(p, off + 4'i32):
+    result = cReadF32At(duPtrAdd(p, off))
+
+proc duDumpOne(tag: string; tmp: Il2CppPtr) =
+  ## Everything about one TMP label that can decide whether it draws.
+  if not duOk(tmp, cDuOffTmpRect() + 8'i32):
+    info "debugui/diag " & tag & ": component not readable"
+    return
+  let rect = duRectOf(tmp)
+  let go = duGameObjectOf(tmp)
+  let canvas = duReadPtrField(tmp, cDuOffTmpGCanvas())
+  let txt = duReadPtrField(tmp, cDuOffTmpText())
+  info "debugui/diag " & tag & ": tmp=0x" & hexOf(cast[uint64](tmp)) &
+       " go=0x" & hexOf(cast[uint64](go)) &
+       " name='" & (if go != nil: duNameOf(go) else: "") & "'" &
+       " cachedPtr=0x" & hexOf(cast[uint64](duReadPtrField(tmp, 0x10'i32))) &
+       " activeSelf=" & duDescribeInt(DuGoActiveSelf, go) &
+       " activeInHierarchy=" & duDescribeInt(DuGoActiveInHier, go) &
+       " layer=" & duDescribeInt(DuGoLayer, go)
+  info "debugui/diag " & tag & ": rect=0x" & hexOf(cast[uint64](rect)) &
+       " anchoredPos=" & duDescribeVec2(DuGetAnchoredPos, rect) &
+       " sizeDelta=" & duDescribeVec2(DuGetSizeDelta, rect) &
+       " anchorMin=" & duDescribeVec2(DuGetAnchorMin, rect) &
+       " pivot=" & duDescribeVec2(DuGetPivot, rect) &
+       " localPos=" & duDescribeVec3(DuGetLocalPos, rect) &
+       " localScale=" & duDescribeVec3(DuGetLocalScale, rect) &
+       " rect=[" & duDescribeRect(rect) & "]"
+  let fontSize = duReadF32Field(tmp, cDuOffTmpFontSize())
+  let alpha = duReadF32Field(tmp, cDuOffTmpFontColor() + 12'i32)
+  let galpha = duReadF32Field(tmp, cDuOffTmpGColor() + 12'i32)
+  info "debugui/diag " & tag & ": fontSize=" & duFmt1(fontSize) &
+       " fontColor.a=" & duFmt2(alpha) & " graphicColor.a=" & duFmt2(galpha) &
+       " textPtr=0x" & hexOf(cast[uint64](txt)) &
+       " textLen=" & $int(cDuStringLen(txt)) &
+       " wordWrap=" & $int(duReadBoolField(tmp, cDuOffTmpWordWrap())) &
+       " overflow=" & $int(duReadI32Field(tmp, cDuOffTmpOverflow())) &
+       " autoSize=" & $int(duReadBoolField(tmp, cDuOffTmpAutosize())) &
+       " maxVisChars=" & $int(duReadI32Field(tmp, cDuOffTmpMaxVisChars())) &
+       " firstVis=" & $int(duReadI32Field(tmp, cDuOffTmpFirstVis())) &
+       " textAlign=" & $int(duReadI32Field(tmp, cDuOffTmpTextAlign()))
+  if canvas != nil:
+    info "debugui/diag " & tag & ": canvas=0x" & hexOf(cast[uint64](canvas)) &
+         " sortingOrder=" & duDescribeInt(DuCanvasOrder, canvas) &
+         " renderMode=" & duDescribeInt(DuCanvasMode, canvas) &
+         " scaleFactor=" & duDescribeScale(canvas)
+  else:
+    info "debugui/diag " & tag & ": Graphic.m_Canvas is NULL -- the label is " &
+         "not attached to a canvas, so it cannot draw at all"
+  # The parent chain, capped. This is what says WHERE the clone ended up, and
+  # whether anything above it is inactive or scaled to nothing.
+  var cur = rect
+  var depth = 0
+  while cur != nil and depth < 8:
+    let fnPar = cDuFn(DuGetParent)
+    if fnPar == nil:
+      break
+    let par = cDuCallPP(fnPar, cur)
+    if not duOk(par, 0x20'i32):
+      break
+    let pgo = duGameObjectOf(par)
+    info "debugui/diag " & tag & ": parent[" & $depth & "] t=0x" &
+         hexOf(cast[uint64](par)) & " name='" &
+         (if pgo != nil: duNameOf(pgo) else: "") & "'" &
+         " activeSelf=" & duDescribeInt(DuGoActiveSelf, pgo) &
+         " localScale=" & duDescribeVec3(DuGetLocalScale, par) &
+         " rect=[" & duDescribeRect(par) & "]"
+    cur = par
+    inc depth
+
+var gDuDiagDone = false
+
+proc duDiagDump(anchor: Il2CppPtr) =
+  if gDuDiagDone:
+    return
+  gDuDiagDone = true
+  var okTargets = 0
+  for i in 0 ..< int(cDuTargetCount()):
+    if cDuFn(int32(i)) != nil: inc okTargets
+  info "debugui/diag: " & $okTargets & " of " & $int(cDuTargetCount()) &
+       " managed targets verified; screen=" & duDescribeScreen()
+  duDumpOne("SOURCE(version label)", anchor)
+  if gDuPanel.len > 0:
+    duDumpOne("CLONE[0](panel line 0)", gDuPanel[0].tmp)
+  if gDuMarks.len > 0:
+    duDumpOne("CLONE[m0](marker 0)", gDuMarks[0].tmp)
 
 # ---------------------------------------------------------------------------
 # Building and tearing down the label pool
@@ -1044,6 +1397,7 @@ proc duBuild(preloader: Il2CppPtr): bool =
     if lab.tmp == nil:
       break
     duStyle(lab, gDuCfg.panelFont, gDuCfg.panelR, gDuCfg.panelG, gDuCfg.panelB)
+    duMakeDrawable(lab, 1200.0, gDuCfg.panelLine * 1.6)
     panel.add lab
   var marks: seq[DuLabel] = @[]
   for i in 0 ..< nMark:
@@ -1051,6 +1405,7 @@ proc duBuild(preloader: Il2CppPtr): bool =
     if lab.tmp == nil:
       break
     duStyle(lab, gDuCfg.espFont, gDuCfg.espR, gDuCfg.espG, gDuCfg.espB)
+    duMakeDrawable(lab, 400.0, gDuCfg.espFont * 1.6)
     marks.add lab
   if panel.len == 0 and marks.len == 0:
     gDuBuildFailed = true
@@ -1060,6 +1415,20 @@ proc duBuild(preloader: Il2CppPtr): bool =
   gDuPanel = panel
   gDuMarks = marks
   gDuBuilt = true
+  # The canvas the clones actually landed in, and its scale factor. Unity's
+  # WorldToScreenPoint answers in PIXELS; `anchoredPosition` is in CANVAS UNITS.
+  # They are the same number only when the CanvasScaler is at 1, and EFT's menu
+  # canvas is not -- so an uncorrected marker for a bot at the middle of the
+  # screen lands off the edge of it.
+  gDuCanvasScale = 1.0
+  if panel.len > 0:
+    let cv = duReadPtrField(panel[0].tmp, cDuOffTmpGCanvas())
+    let fn = cDuFn(DuCanvasScale)
+    if fn != nil and duOk(cv, 0x20'i32):
+      let s = cDuCallFP(fn, cv)
+      if s > 0.01 and s < 100.0:
+        gDuCanvasScale = s
+  duDiagDump(anchor)
   okLog "debugui: built " & $panel.len & " panel line(s) and " & $marks.len &
         " marker label(s) by cloning the client's own version label " &
         "(Object::Instantiate + SetParentAndAlign into the canvas root); " &
