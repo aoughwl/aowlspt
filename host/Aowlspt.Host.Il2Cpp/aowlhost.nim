@@ -4180,6 +4180,12 @@ include "modetext.nim"
 ## restart. See the header of `inspect.nim` for why that is the highest-leverage
 ## thing available on the client side.
 include "inspect.nim"
+## A SIXTH TAB in Tarkov's own settings screen, cloned rather than constructed.
+## LAST, because it stands on inspect.nim's Transform walkers (which reach the
+## nav table), invoke2.nim's verified call targets and settingswrite.nim's
+## label setter. Defines `modsTabTick`, driven from the same PreloaderUI::Update
+## rider everything else on that slot uses.
+include "modstab.nim"
 
 proc hostEventSubscribe(ctx: Il2CppPtr; name: Il2CppPtr; nameLen: int32;
                         cb: Il2CppPtr; user: Il2CppPtr): int32 {.
@@ -5225,6 +5231,22 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # PHASE 3 -- the per-mod settings pages. Default OFF, and it needs the same
   # ShowScreen postfix, so it turns the read probe on with itself for the same
   # reason Phase 2 does.
+  gModsOn = readBoolKey("settingsModsTab")
+  if gModsOn and not gSettingsUiProbe:
+    gSettingsUiProbe = true
+    info "settingsModsTab is set, so settingsUiProbe has been turned on with " &
+         "it -- the tab is built from the live SettingsScreen pointer that " &
+         "probe's ShowScreen postfix is what learns."
+  if gModsOn:
+    info "settingsModsTab is set: a SIXTH tab. A stock *ToggleSpawner is " &
+         "cloned into SettingsScreen/Toggles and relabelled MODS, and a stock " &
+         "tab panel is cloned beside the other five. The clone inherits the " &
+         "real ToggleGroup, so selecting it deselects the stock tab and vice " &
+         "versa through the GAME's own logic -- that part is not simulated. " &
+         "The one thing the game will not do is show our panel, because it " &
+         "switches panels by ESettingsGroup and ours is not one, so the " &
+         "panel's active state is driven from the toggle each frame (one " &
+         "guarded byte read; a call only on an edge)."
   gSwPagesOn = readBoolKey("settingsPages")
   if gSwPagesOn and not gSettingsUiProbe:
     gSettingsUiProbe = true
@@ -5310,6 +5332,13 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
     info "liveInspectorWrite is set but liveInspector is not, so the inspector " &
          "is off entirely; set liveInspector to arm it"
   gVersionBrand = readBoolKey("uxVersionBrand")
+  # Retargeted. `uxVersionBrand` keeps its name and its flag; what changed is
+  # WHERE it writes -- AlphaLabel, through the real setters -- because the old
+  # $verlabel anchor reads an EMPTY m_text and was never the on-screen label.
+  # Copied AFTER the read: an earlier copy read the flag before it was set,
+  # which is a silent always-off and exactly the class of bug this host keeps
+  # paying for.
+  gVerOn = gVersionBrand
   gVersionWrite = readBoolKey("uxVersionBrandWrite")
   if gVersionWrite:
     gVersionBrand = true          # the write path needs the probe armed

@@ -790,6 +790,11 @@ proc swPagesOnTabBuilt(tabPtr: Il2CppPtr; tabName: string; revisit: bool) =
   ## postfix), and across a full pass of every tab there was not one page line,
   ## not one clone line and not one fault line. A path that declines must say
   ## why, or it cannot be debugged from a log at all.
+  # Publish the live tab for features included after this file. Set before
+  # any early return, so a tab visit that DECLINES still hands the pointer
+  # on -- the sixth-tab feature needs the hierarchy, not this page.
+  if tabPtr != nil:
+    gSwLastTabPtr = tabPtr
   if gSwPagesOn:
     inc gSwPagesFires
     if gSwPagesFires <= 8:

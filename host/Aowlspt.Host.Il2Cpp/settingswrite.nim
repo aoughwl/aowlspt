@@ -290,6 +290,12 @@ proc swSetTmpText(tmp: Il2CppPtr; text: string): bool =
 ## Names the routes the last relabel actually took, for the log line.
 var gSwLastRoutes = ""
 
+## The SettingsTab the ShowScreen postfix last handed us, for features
+## included AFTER settingspages.nim that need to reach the live settings
+## screen. Declared here because this file is included first; a tab's PARENT
+## is the SettingsScreen, which is the only hop the sixth-tab feature needs.
+var gSwLastTabPtr: Il2CppPtr = nil
+
 proc swRelabelControl(control, tmp: Il2CppPtr; text: string): bool =
   ## Relabel one control by CALLING the game's own setters, with the raw store
   ## kept only as the last resort.

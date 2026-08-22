@@ -3521,6 +3521,18 @@ proc inspRunBatch() =
   iOut("aowlspt live inspector -- batch " & $gInspRunningBatch & " complete, " &
        $gInspOut.len & " line(s)")
 
+## `modsTabTick` and `verBrandTick` live in `modstab.nim`, included AFTER
+## this file, and ride this same PreloaderUI::Update rider rather than
+## arming a second detour on the same function -- the second would
+## overwrite the first's trampoline.
+##
+## NO FORWARD DECLARATION. There was one, and it silently broke both
+## features: nimony resolves a proc defined later in the same module on
+## its own (aowlhost.nim calls `inspectFired` from patchFired, ~700 lines
+## before this file defines it), so the explicit `proc modsTabTick()`
+## added a second, bodiless declaration and the calls bound to THAT.
+## Everything compiled, both ticks ran, and neither did anything.
+
 proc inspTick() =
   ## Called once per frame from the shared `PreloaderUI::Update` firing. The
   ## lock-free `aowl_insp_have` is the whole per-frame cost when there is
@@ -3625,6 +3637,8 @@ proc inspectFired(regs: Il2CppPtr) =
   if selfPtr != 0'u64:
     gInspPreloader = cast[Il2CppPtr](selfPtr)
   inspTick()
+  modsTabTick()
+  verBrandTick()
 
 proc inspectDrainFired() =
   ## THE IN-RAID ENTRY POINT, from the main drain's slot.
