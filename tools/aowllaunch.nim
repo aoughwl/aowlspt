@@ -132,7 +132,10 @@ Options
                  builds from backend.json and the chosen profile
   --profile ID   bind this profile id server-side before launch (the game's
                  own character-select still shows, this just pre-selects)
-  --new NAME     create a profile called NAME and bind it before launch
+  --new NAME     create a profile called NAME and bind it before launch. This
+                 is the headless quick-create, for scripts: it picks no head
+                 and no voice. The game's own character creator does, and it
+                 runs by itself when this install has no character yet.
   --side SIDE    Usec or Bear, for --new (default Usec)
   --pick         show the launcher's own profile picker before starting the
                  game. OFF by default: the game has its own character-select
@@ -140,11 +143,16 @@ Options
                  this off (the default) the launcher picks a profile without
                  asking -- the one you played last, else the most recent -- and
                  binds it, so the session is authenticated and the in-game
-                 screen is the only thing that asks you anything.
-  --no-profile   start the client with no -token, so it logs in on its own.
-                 The backend binds no session for a tokenless client, so this
-                 is the first-run/character-creation path only -- it cannot
-                 reach an existing character.
+                 screen is the only thing that asks you anything -- including
+                 which of several characters to play, and whether to make
+                 another one.
+  --no-profile   start the client with no -token at all. Diagnostic only: the
+                 token is the client's only source of the session cookie, so a
+                 tokenless client is refused at authentication before it ever
+                 reaches the character screen. The first-run path does NOT use
+                 this -- with no character in the install the launcher takes a
+                 creation session from the backend and the game's own character
+                 creator runs on a session that works.
   --wait         stay open until the game exits
   --no-backend   do not start the backend server
   --no-logs      do not show the live log view; exit once the game is up
@@ -743,6 +751,10 @@ proc pickProfile(o: Options; port: int; root: string;
     return false
 
   if o.newProfile.len > 0:
+    if list.source == psRoute and not list.creationAllowed:
+      reason = "this server will not take another character right now: " &
+               "creation is switched off, or every slot is taken"
+      return false
     if list.source == psStore:
       reason = "a profile cannot be created without the backend's launcher " &
                "routes; this list came off disk because it has none"
@@ -779,7 +791,12 @@ proc pickProfile(o: Options; port: int; root: string;
     var prompt = "play which?"
     if list.items.len > 0:
       prompt = "play which? [1-" & $list.items.len & "]"
-    if list.source == psRoute:
+    # `n` is offered only when the server says a character could actually be
+    # made -- its switch, its cap and a free slot, all decided server-side. An
+    # option that leads straight to a refusal is worse than no option, and the
+    # launcher does not hold a second opinion about the gate.
+    let canMake = list.source == psRoute and list.creationAllowed
+    if canMake:
       prompt.add "  (n = new, q = quit)"
     else:
       prompt.add "  (q = quit)"
@@ -790,7 +807,7 @@ proc pickProfile(o: Options; port: int; root: string;
     if answer == "q" or answer == "Q":
       reason = "you chose to quit"
       return false
-    if (answer == "n" or answer == "N") and list.source == psRoute:
+    if (answer == "n" or answer == "N") and canMake:
       var nick = ""
       if not readAnswer("nickname:", nick): return false
       if nick.len < 3:
@@ -1687,7 +1704,8 @@ proc main(): int =
       line "  would ask     nothing"
       let l = listProfiles(port, root)
       if l.error.len > 0:
-        line "  would play    nothing -- " & l.error & " -- so no -token"
+        line "  would play    nothing -- " & l.error & " -- so a creation " &
+             "session is taken and the game's own character creator runs"
       else:
         var dChosen = Profile(id: "", token: "", nickname: "", side: "",
                               level: 0, edition: "", lastPlayed: 0)
@@ -1696,8 +1714,8 @@ proc main(): int =
           line "  would play    " & profileLabel(dChosen) & " (" & dChosen.id &
                ") -- " & dWhy & ", bound with -token before launch"
         else:
-          line "  would play    nothing -- " & dWhy & " -- so no -token, and " &
-               "the game's own character creation runs"
+          line "  would play    nothing -- " & dWhy & " -- so a creation " &
+               "session is taken and the game's own character creator runs"
     elif o.profileId.len > 0:
       line "  would play    " & o.profileId & " (--profile)"
     elif o.newProfile.len > 0:
@@ -1869,12 +1887,12 @@ proc main(): int =
   elif autoSelect:
     let list = listProfiles(port, root)
     viaRoute = list.source == psRoute
+    var needCreator = false
     if list.error.len > 0:
       # Not fatal: a backend with no profile route and no store on disk is an
       # install with nothing to select, which is the first-run case.
       warn list.error
-      note "nothing to select, so the client starts with no -token and the " &
-           "game's own character-creation flow runs"
+      needCreator = true
     else:
       if list.note.len > 0: warn list.note
       var reason = ""
@@ -1883,8 +1901,30 @@ proc main(): int =
         ok "playing " & profileLabel(chosen) & " (" & chosen.id & ") -- " &
            reason & "; pass --pick to choose, or --profile <id>"
       else:
-        note reason & ", so the client starts with no -token and the game's " &
-             "own character-creation flow runs"
+        note reason
+        needCreator = true
+    if needCreator:
+      # Nothing to select: send the client to **its own** character creator.
+      #
+      # Not with a bare tokenless launch, which is what this used to do. The
+      # token is the only source of the `PHPSESSID` cookie the backend reads
+      # the session from, so a tokenless client is refused at authentication
+      # before it ever draws the character screen. So the launcher asks the
+      # emulator for a session that is real and simply has no character on it,
+      # and the creator's own `create` binds that session to the character it
+      # makes. One selector, in the game, and no relaunch afterwards.
+      var made = ""
+      let ce = creationSession(port, made)
+      if ce.len > 0:
+        warn "no creation session from the backend: " & ce
+        note "the client is started with no -token; if it stops at " &
+             "\"Client not authenticated\" this is why"
+      else:
+        token = made
+        who = "a new character"
+        ok "no character yet, so the game's own character creator runs. " &
+           "The character it makes is bound to this session and is playable " &
+           "straight away."
   else:
     if pickProfile(o, port, root, chosen, why, viaRoute):
       haveChoice = true

@@ -43,6 +43,13 @@
 ##        {"id":"<24 hex>"}                          ("token" accepted as alias)
 ##     -> {"ok":true,"token":"<24 hex>","profile":<row>}
 ##
+##   POST /aowlspt/tarkov/launcher/creation-session
+##        {}
+##     -> {"ok":true,"token":"<24 hex>","mode":"regular"|"pve"}
+##     A session bound to no profile, for the first run: it is what lets the
+##     client authenticate and reach its OWN character creator. Launching with
+##     no token instead does not work -- see `creationSession` below.
+##
 ## `select` rebinds the launcher's session to the profile, and is called before
 ## launch *even for a profile that was just listed*: the launch token is
 ## whatever it hands back, not the id the launcher happened to have. That token
@@ -318,6 +325,13 @@ type
     items*: seq[Profile]
     note*: string   ## why the source is what it is, when it is not the route
     error*: string  ## set only when nothing could be read at all
+    creationAllowed*: bool
+      ## Whether the server will accept a new character right now -- its
+      ## switch, its cap and a free slot, all decided server-side. The launcher
+      ## reads it rather than deciding for itself, so that "n = new" is offered
+      ## exactly when `create` would succeed. An older backend that does not
+      ## send the field, and any list read off disk, leaves this false; the
+      ## launcher says so rather than offering an option that would be refused.
 
 proc okField(body: string): bool =
   ## The `ok` in `{"ok":true,...}`. Absent counts as false: a body with no `ok`
@@ -464,7 +478,8 @@ proc profilesFromStore*(root: string; into: var seq[Profile]): string =
 proc listProfiles*(port: int; root: string): ProfileList =
   ## The route first, the store when there is no route, and a plain statement
   ## of which happened either way.
-  result = ProfileList(source: psNone, items: @[], note: "", error: "")
+  result = ProfileList(source: psNone, items: @[], note: "", error: "",
+                       creationAllowed: false)
   let r = call(port, "GET", "/aowlspt/tarkov/launcher/profiles", "", ProbeSession)
   if r.ok and r.status == 200:
     var err = ""
@@ -482,6 +497,9 @@ proc listProfiles*(port: int; root: string): ProfileList =
       if parseProfile(it, p): result.items.add p
       else: inc skipped
     result.source = psRoute
+    var allowed = ""
+    if pathGet(r.body, "creationAllowed", allowed):
+      result.creationAllowed = allowed == "true"
     if skipped > 0:
       result.note = $skipped & " entr" & (if skipped == 1: "y" else: "ies") &
                     " in the profile list carried no usable 24-character id " &
@@ -587,6 +605,35 @@ proc selectProfile*(port: int; id: string; into: var Profile): string =
     return err
   if not tokenAndRow(r.body, into):
     return "the server selected the profile but answered no token to launch with"
+  result = ""
+
+proc creationSession*(port: int; token: var string): string =
+  ## A token to launch with when there is no character to select yet, so the
+  ## client reaches its **own** character creator with a session the backend
+  ## will honour. Returns "" on success, a sentence otherwise.
+  ##
+  ## The alternative -- launch with no `-token` at all -- does not work and the
+  ## reason is not obvious: the token is the only source of the `PHPSESSID`
+  ## cookie the backend reads the session from, so a tokenless client sends an
+  ## empty session on every request and is refused at authentication, well
+  ## before the creator. See `onLauncherCreationSession` in the emulator for the
+  ## same note from the other side.
+  token = ""
+  let r = call(port, "POST", "/aowlspt/tarkov/launcher/creation-session", "{}",
+               ProbeSession)
+  if not r.ok:
+    return r.error
+  if r.status == 404:
+    return "this backend has no creation-session route (404)"
+  if r.status != 200:
+    return "the creation-session route answered " & $r.status
+  var err = ""
+  if not okEnvelope(r.body, err):
+    return err
+  var tok = ""
+  if not firstOf(r.body, @["token"], tok) or not isHexId(tok):
+    return "the server offered a creation session and no token for it"
+  token = tok
   result = ""
 
 # ---------------------------------------------------------------------------

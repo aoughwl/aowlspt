@@ -1283,6 +1283,19 @@ Left, and why:
   **null** rather than the integer `0`. This server sends the ordinary envelope
   on all five. It is a strict subset so it probably deserialises, but "probably"
   is doing real work in that sentence.
+- ~~**`/v2/client/game/profiles/` sends one game-mode key where BSG sends
+  three.**~~ **Done** (`feat-multichar`). All three keys are emitted and each is
+  resolved on its own -- `available` for the character tagged to that mode,
+  `empty` for a free slot creation is allowed in (which is the client's own
+  "+"), `locked` otherwise. That is where multi-character lives: the profile
+  carries `Info.GameMode`, and picking a slot on the character screen posts
+  `/client/game/profile/select`, which rebinds the session. `pvp-season` is
+  `locked` by default and that is a product decision, not an omission -- there
+  is no second player on this server. The ceiling is two characters, because
+  the dictionary key space is `EGameMode` and this server offers two of its
+  three values; N characters in ONE mode is not expressible in this route at
+  all and would need slot views injected into the client's UI. The note below
+  is kept for the ground truth it records.
 - **`/v2/client/game/profiles/` sends one game-mode key where BSG sends three.**
   The real empty-account body is `{"pve":{"status":"locked"}, "pvp-season":{…,
   "status":"empty"}, "regular":{"SeasonalInfo":null,"status":"empty"}}`. Note

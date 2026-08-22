@@ -930,6 +930,20 @@ proc main(): int =
   discard expectIn("the profile has a stash", "/client/game/profile/list",
                    "", "\"stash\"")
 
+  # The character screen, which is a *mode* select: one slot per EGameMode. The
+  # first character takes the `regular` slot; the `pve` slot is the "+", and the
+  # PvP-season slot is locked because this server has no second player in it.
+  # These three assertions are the whole of multi-character on the wire.
+  let slots = call("/v2/client/game/profiles/", "{}")
+  check("the character screen shows the first character in the regular slot",
+        slots.contains("\"regular\"") and slots.contains("\"available\""),
+        slots.body)
+  check("and an empty PvE slot, which is the create-a-character affordance",
+        slots.contains("\"pve\"") and slots.contains("\"empty\""), slots.body)
+  check("and the seasonal PvP slot is locked, never offered",
+        slots.contains("\"pvp-season\"") and slots.contains("\"locked\""),
+        slots.body)
+
   heading "Selecting and starting"
   discard expectIn("select binds the session", "/client/game/profile/select",
                    "{\"uid\":\"" & uid & "\"}", "\"status\":\"ok\"")
@@ -4840,6 +4854,21 @@ proc main(): int =
   # to be a profile the *game* can see, not a second kind of record beside it.
   discard expectIn("and the game sees the launcher's character as a profile",
                    "/client/game/profile/list", "", "AowlLauncher")
+  # And the point of two characters: they are on the character screen at the
+  # same time, in different mode slots, and the player picks between them
+  # there. Nothing in the launcher asks a second time.
+  let twoUp = call("/v2/client/game/profiles/", "{}")
+  check("both characters occupy a slot on the character screen",
+        twoUp.contains(uid) and twoUp.contains(token), twoUp.body)
+  check("and the screen offers no third slot at the ceiling",
+        not twoUp.contains("\"empty\""), twoUp.body)
+  # The ceiling is the client's, not a preference: the character screen is a
+  # dictionary keyed by EGameMode and this server offers two of its three keys.
+  let third = call("/client/game/profile/create",
+                   "{\"nickname\":\"AowlThird\",\"side\":\"Usec\"}")
+  check("a third character is refused, in words, rather than half-made",
+        third.contains("\"err\":1") and not third.contains("\"uid\":\""),
+        third.body)
   let reselect = call("/aowlspt/tarkov/launcher/profile/select",
                       "{\"id\":\"" & token & "\"}")
   check("selecting it again hands back the same token",
