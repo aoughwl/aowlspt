@@ -1681,6 +1681,75 @@ proc iCmdTree(toks: seq[string]) =
           "the depth here."
         else: "  -- complete."))
 
+proc iCmdRect(toks: seq[string]) =
+  ## `rect EXPR` -- RectTransform geometry, from targets already byte-verified
+  ## for the overlay. Useful for confirming that something actually happened:
+  ## a selected tile usually changes size or position, and that is a field
+  ## read rather than a screenshot.
+  if toks.len < 2:
+    iErr("usage: rect EXPR")
+    return
+  var v = 0'u64
+  var err = ""
+  if not iEval(toks[1], v, err):
+    iErr(err)
+    return
+  let p = cast[Il2CppPtr](v)
+  if not duOk(p, 0x20'i32) or not iUnityAlive(p):
+    iErr("not readable, or its native half is null; refusing to call.")
+    return
+  iOut("  klass = " & iPtrU(iKlassOf(p)) &
+       "   (a Transform that is NOT a RectTransform has no rect -- the " &
+       "outermost menu roots are plain Transforms)")
+  var idx = 0
+  var hits = 0
+  if iFindTarget("RectTransform::get_anchoredPosition", idx, hits):
+    let fn = iTargetFn(idx)
+    if fn != nil:
+      iOut("  via RectTransform::get_anchoredPosition @0x" &
+           iHexPad(iTargetRva(idx), 6) & " (call)")
+      iMark("RectTransform::get_anchoredPosition", p)
+      discard cInspUP(fn, p, nil)
+  if iFindTarget("RectTransform::get_sizeDelta", idx, hits):
+    let fn = iTargetFn(idx)
+    if fn != nil:
+      iOut("  via RectTransform::get_sizeDelta @0x" &
+           iHexPad(iTargetRva(idx), 6) & " (call)")
+      iMark("RectTransform::get_sizeDelta", p)
+      discard cInspUP(fn, p, nil)
+  iOut("  NOTE: these getters return a Vector2 BY VALUE, which the inspector's " &
+       "call shapes do not decode yet -- the calls above prove reachability " &
+       "without faulting, but the numbers are not printed. Read the backing " &
+       "fields directly with `fields` until a struct-return shape exists.")
+
+proc iCmdLabel(toks: seq[string]) =
+  ## `label EXPR` -- the text of a TMP label, read as a field.
+  ## `TMP_Text.m_text` sits at +0xE0 on this build, which is how the version
+  ## brand and the menu mode-text feature both read it.
+  if toks.len < 2:
+    iErr("usage: label EXPR")
+    return
+  var v = 0'u64
+  var err = ""
+  if not iEval(toks[1], v, err):
+    iErr(err)
+    return
+  let p = cast[Il2CppPtr](v)
+  if not duOk(p, 0xE8'i32):
+    iErr("not readable to +0xE8, so it cannot be a TMP_Text.")
+    return
+  let sp = cReadPtrAt(p, 0xE0'i32)
+  if iIsKnownKlass(cast[uint64](sp)):
+    iErr("TYPE CONFUSION: +0xE0 holds a known KLASS pointer, so this is not a " &
+         "TMP_Text. Nothing was read.")
+    return
+  iOut("  klass = " & iPtrU(iKlassOf(p)) &
+       "   m_text(+0xE0) = " & iPtr(sp))
+  if sp == nil:
+    iOut("  (null -- the label has no text object yet)")
+    return
+  iOut("  text = \"" & suiReadString(sp) & "\"")
+
 proc iCmdClick(toks: seq[string]; useInvoke: bool) =
   ## `click PTR` -- EFT's own path: `Button::Press`, which re-checks IsActive
   ## and IsInteractable and then fires m_OnClick exactly as a real click does.
@@ -2220,6 +2289,8 @@ proc iCmdHelp() =
   iOut("    find NAME [ROOT] [BUDGET]     breadth-first name search, bind $f1..")
   iOut("    find NAME in ROOTNAME         narrow by a root named, not pointed")
   iOut("    find more [BUDGET]            RESUME a search that hit its cap")
+  iOut("    rect EXPR                     RectTransform geometry probe")
+  iOut("    label EXPR                    TMP_Text.m_text as a field read")
   iOut("                                  e.g.  find PvE")
   iOut("    click EXPR                    Button::Press (checks interactable)")
   iOut("                                  e.g.  allow write | click $f1")
@@ -2365,6 +2436,10 @@ proc iExec(line: string) =
     iCmdFind(toks)
   of "tree":
     iCmdTree(toks)
+  of "rect":
+    iCmdRect(toks)
+  of "label":
+    iCmdLabel(toks)
   of "click":
     iCmdClick(toks, false)
   of "invoke":
