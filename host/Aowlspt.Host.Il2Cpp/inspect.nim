@@ -217,6 +217,20 @@ var gInspTicks = 0
   ## How many times the rider ran with a batch actually pending, i.e. got past
   ## the `aowl_insp_have` gate. `gInspFires` high with `gInspTicks` zero means
   ## the rider is dispatched fine and the HANDOFF FLAG is what is broken.
+var gKlassSeen: seq[uint64] = @[]
+  ## KLASS POINTERS OBSERVED THIS SESSION.
+  ##
+  ## Every managed object begins with a pointer to its Il2CppClass, so walking
+  ## the hierarchy hands us a klass pointer for free at every node. Keeping the
+  ## distinct ones lets a field read be sanity-checked: if a slot that is
+  ## supposed to hold a managed OBJECT contains a value we have already seen as
+  ## the TYPE of something, that field is not what we think it is and the
+  ## offset is being read off the wrong kind of object.
+  ##
+  ## This is not hypothetical. `click` on a Transform read +0x100 and got
+  ## 0x...f2f0a0, which was the RectTransform klass -- and reported it as
+  ## `m_OnClick`. Two different "Buttons" produced the identical value, which
+  ## is impossible for a real per-instance UnityEvent and was the tell.
 var gFindQueue: seq[Il2CppPtr] = @[]
 var gFindHead = 0
 var gFindWant = ""
@@ -1077,6 +1091,36 @@ proc iCmdCanvas(p: Il2CppPtr) =
       iMark(("Canvas::get_scaleFactor"), canvas)
       iOut("  scaleFactor = " & iFmtF(float64(cInspFP(fn, canvas, nil))))
 
+const InspKlassMax = 128
+
+proc iKlassOf(p: Il2CppPtr): uint64 =
+  ## The Il2CppClass* every managed object carries at +0. A guarded read, so
+  ## this is safe on anything.
+  result = 0'u64
+  if p == nil or not duOk(p, 8'i32):
+    return
+  result = cast[uint64](cReadPtrAt(p, 0'i32))
+
+proc iNoteKlass(p: Il2CppPtr) =
+  ## Remember this object's type. Called from every traversal, where klass
+  ## pointers are free.
+  let k = iKlassOf(p)
+  if k == 0'u64:
+    return
+  for i in 0 ..< gKlassSeen.len:
+    if gKlassSeen[i] == k:
+      return
+  if gKlassSeen.len < InspKlassMax:
+    gKlassSeen.add k
+
+proc iIsKnownKlass(v: uint64): bool =
+  result = false
+  if v == 0'u64:
+    return
+  for i in 0 ..< gKlassSeen.len:
+    if gKlassSeen[i] == v:
+      return true
+
 proc iUnityAlive(p: Il2CppPtr): bool =
   ## Is the NATIVE half of this UnityEngine.Object still there?
   ##
@@ -1221,6 +1265,24 @@ proc iChildAt(t: Il2CppPtr; i: int): Il2CppPtr =
   iMark("Transform::GetChild", t)
   result = cast[Il2CppPtr](cInspUPI(fn, t, int32(i), nil))
 
+proc iGameObjectOf(p: Il2CppPtr): Il2CppPtr =
+  ## The GameObject behind a Component/Transform. Almost everything downstream
+  ## -- components, activeSelf, clicking -- wants the GameObject rather than
+  ## the Transform, and having to fetch it by hand each time is exactly the
+  ## kind of step where the wrong pointer gets carried forward.
+  result = nil
+  var idx = 0
+  var hits = 0
+  if not iFindTarget("Component::get_gameObject", idx, hits):
+    return
+  let fn = iTargetFn(idx)
+  if fn == nil or not iUnityAlive(p):
+    return
+  iMark("Component::get_gameObject", p)
+  let go = cast[Il2CppPtr](cInspUP(fn, p, nil))
+  if duOk(go, 0x20'i32):
+    result = go
+
 proc iObjName(p: Il2CppPtr): string =
   ## `Object::get_name` is a real managed body, but it still ends up in native
   ## code, so the same liveness rule applies.
@@ -1279,15 +1341,22 @@ proc iCmdChildren(toks: seq[string]) =
     if c == nil or not duOk(c, 0x20'i32):
       iOut("    [" & $i & "] <child not readable>")
     else:
-      var line = "    [" & $i & "] " & iPtr(c) &
-                 " name=\"" & iObjName(c) & "\""
+      iNoteKlass(c)
+      let go = iGameObjectOf(c)
+      if go != nil:
+        iNoteKlass(go)
+        iSetVar("g" & $i, cast[uint64](go))
       iSetVar("c" & $i, cast[uint64](c))
-      iOut(line & "   ($c" & $i & ")")
+      iOut("    [" & $i & "] transform=" & iPtr(c) & " ($c" & $i & ")" &
+           "  go=" & iPtr(go) & (if go != nil: " ($g" & $i & ")" else: "") &
+           "  name=\"" & iObjName(c) & "\"")
     inc i
   let shown = min(count, want)
   if shown > 0:
-    iOut("  each child is bound to $c0..$c" & $(shown - 1) &
-         " for the rest of this batch")
+    iOut("  transforms bound to $c0..$c" & $(shown - 1) &
+         ", GameObjects to $g0..$g" & $(shown - 1) &
+         ". NOTE: these are TRANSFORMS, not components -- `click` needs the " &
+         "Button, so go through `component $g0 Button` first.")
   else:
     iOut("  this transform has no children.")
 
@@ -1361,6 +1430,7 @@ proc iFindStep(budget: int): bool =
     inc gFindVisited
     if not duOk(cur, 0x20'i32) or not iUnityAlive(cur):
       continue
+    iNoteKlass(cur)
     let nm = iObjName(cur)
     if nm.len > 0 and iContains(iLower(nm), gFindWant):
       inc gFindFound
@@ -1587,6 +1657,7 @@ proc iCmdTree(toks: seq[string]) =
     var indent = "    "
     for k in 0 ..< d:
       indent = indent & "  "
+    iNoteKlass(cur)
     var n = 0
     let okCount = iChildCount(cur, n)
     iOut(indent & (if d == 0: "" else: "+ ") & "\"" & iObjName(cur) & "\"  " &
@@ -1648,10 +1719,31 @@ proc iCmdClick(toks: seq[string]; useInvoke: bool) =
   let interact = cReadI32At(cast[Il2CppPtr](cast[uint64](btn) +
                             uint64(cNavOffInteract()))) and 0xFF'i32
   let onClick = cReadPtrAt(btn, cNavOffOnClick())
+  iOut("  target klass = " & iPtrU(iKlassOf(btn)))
   iOut("  Button m_Interactable(+0x" & iHexPad(uint64(cNavOffInteract()), 3) &
        ") = " & (if interact != 0'i32: "true" else: "false") &
        "   m_OnClick(+0x" & iHexPad(uint64(cNavOffOnClick()), 3) & ") = " &
        iPtr(onClick))
+  # THE TYPE-CONFUSION CHECK.
+  #
+  # These offsets are only meaningful on a Button. Read off a Transform they
+  # land on unrelated memory and produce values that look plausible -- which is
+  # far worse than an obvious failure, because the guard then refuses for a
+  # reason that is true but irrelevant, and the real problem stays hidden.
+  #
+  # A managed object pointer can never legitimately equal a klass pointer. If
+  # +0x100 holds something we have already seen as the TYPE of another object,
+  # we are reading the wrong kind of object and must say so instead of
+  # continuing to describe it as `m_OnClick`.
+  if iIsKnownKlass(cast[uint64](onClick)):
+    iErr("TYPE CONFUSION: the value at +0x" &
+         iHexPad(uint64(cNavOffOnClick()), 3) & " (" & iPtr(onClick) &
+         ") is a KLASS POINTER already seen as the type of another object -- " &
+         "it cannot be a per-instance UnityEvent. This pointer is almost " &
+         "certainly a Transform or GameObject, NOT a Button component: " &
+         "`children` and `find` return TRANSFORMS. Nothing was called. " &
+         "Resolve the Button first with `component " & toks[1] & " Button`.")
+    return
   if onClick == nil:
     iErr("m_OnClick is NULL -- this object has no click handler, so it is " &
          "either not a Button or not wired up. Nothing was called.")
