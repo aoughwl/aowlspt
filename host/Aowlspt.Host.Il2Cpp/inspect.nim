@@ -87,6 +87,24 @@
 
 # ---- the native half ----
 {.emit: """#include "aowlspt_inspect.h" """.}
+## UI NAVIGATION TARGETS -- `ShowScreen` and `set_IsSelected`, so the inspector
+## can DRIVE the menu and not only read it. Verified through the prologue
+## SNAPSHOT and additionally shape-checked against being a do-nothing stub.
+##
+## Not added to `aowl_pro_prime_all`: that function is emitted long before this
+## file is included, so it cannot name this table. The LAZY capture inside
+## `aowl_pro_verify` is correct here for the documented reason -- a target's
+## first verify necessarily precedes its first patch, and nothing detours
+## either of these at all.
+{.emit: """#include "aowlspt_navui.h" """.}
+proc cNavTargetCount(): int32 {.importc: "aowl_nav_target_count", nodecl.}
+proc cNavFn(i: int32): Il2CppPtr {.importc: "aowl_nav_target_at", nodecl.}
+proc cNavName(i: int32): cstring {.importc: "aowl_nav_target_name", nodecl.}
+proc cNavRva(i: int32): uint32 {.importc: "aowl_nav_target_rva", nodecl.}
+proc cNavOffCurrentTab(): int32 {.importc: "aowl_nav_off_currenttab", nodecl.}
+proc cNavOffInitTabs(): int32 {.importc: "aowl_nav_off_inittabs", nodecl.}
+proc cNavOffFirstSel(): int32 {.importc: "aowl_nav_off_firstsel", nodecl.}
+proc cNavOffCreated(): int32 {.importc: "aowl_nav_off_created", nodecl.}
 
 proc cInspLock() {.importc: "aowl_insp_lock", nodecl.}
 proc cInspUnlock() {.importc: "aowl_insp_unlock", nodecl.}
@@ -191,6 +209,9 @@ var gInspTicks = 0
   ## How many times the rider ran with a batch actually pending, i.e. got past
   ## the `aowl_insp_have` gate. `gInspFires` high with `gInspTicks` zero means
   ## the rider is dispatched fine and the HANDOFF FLAG is what is broken.
+var gInspDrainFires = 0
+  ## Dispatches that arrived on the IN-RAID anchor (the main drain) rather than
+  ## on `PreloaderUI::Update`. Non-zero means the instrument is alive in raid.
 var gInspFiredLogged = false
   ## One-shot: the rider announces its own first call, with a timestamp. That
   ## line is what makes the ORDER of events legible in the log -- specifically
@@ -209,6 +230,18 @@ var gInspPhase = 0
   ## Which part of the batch is executing: 0 idle, 1 anchor refresh,
   ## 2 a command, 3 the completion handshake. Reported when a batch escapes,
   ## so the recovery names the phase that escaped instead of guessing.
+var gInspResumeAt = 0
+  ## Where a SUSPENDED batch resumes. A batch used to be all-or-nothing inside
+  ## one tick, which made it useless for driving the UI: opening a screen takes
+  ## frames, so "open settings then read the tab" could only ever read the tab
+  ## as it was BEFORE the open.
+var gInspSuspended = false
+  ## True while a batch is parked on a `wait`/`until`. The completion handshake
+  ## is skipped while this holds, and the rider resumes the batch next frame.
+var gInspUntilLeft = 0
+  ## Frames remaining on the current `wait`/`until`. Hard-capped: a condition
+  ## that never becomes true reports a timeout and the batch CONTINUES, rather
+  ## than parking the channel forever.
 var gInspBodyMode = 0
   ## What the ONE guarded body should do this call: 0 run the current command,
   ## 1 refresh the anchors. The guard carries a single pointer, so the selector
@@ -1026,6 +1059,149 @@ proc iCmdCanvas(p: Il2CppPtr) =
       iMark(("Canvas::get_scaleFactor"), canvas)
       iOut("  scaleFactor = " & iFmtF(float64(cInspFP(fn, canvas, nil))))
 
+proc iNavFind(want: string; fn: var Il2CppPtr; rva: var uint32): bool =
+  ## Resolve one navigation target by substring, byte-verified through the
+  ## prologue snapshot AND shape-checked against being a do-nothing stub.
+  fn = nil
+  rva = 0'u32
+  for i in 0 ..< int(cNavTargetCount()):
+    if iContains(iLower(readCString(cNavName(int32(i)))), iLower(want)):
+      fn = cNavFn(int32(i))
+      rva = cNavRva(int32(i))
+      return fn != nil
+  result = false
+
+proc iNavGate(what: string): bool =
+  ## THE WRITE GATE, WITH A REASON. Navigation calls into game code and changes
+  ## what is on screen, so it needs `liveInspectorWrite` in the config AND an
+  ## explicit `allow write` in the batch. A refusal here must never be
+  ## mistakable for "the click missed" -- so it names which of the two gates is
+  ## shut and exactly how to open it.
+  if not gInspWriteOn:
+    iErr(what & " REFUSED: liveInspectorWrite is false in aowlspt-host.json. " &
+         "Nothing was called and nothing on screen changed. Set it to true " &
+         "and restart the client.")
+    return false
+  if not gInspAllowWrite:
+    iErr(what & " REFUSED: this batch has not said `allow write`. Nothing was " &
+         "called and nothing on screen changed. Put `allow write` on a line " &
+         "before this one.")
+    return false
+  result = true
+
+proc iCmdOpen(toks: seq[string]) =
+  ## `open [GROUP]` -- EFT.UI.SettingsScreen::ShowScreen(screen, group).
+  if not iNavGate("open"):
+    return
+  var fn: Il2CppPtr = nil
+  var rva = 0'u32
+  if not iNavFind("ShowScreen", fn, rva):
+    iErr("EFT.UI.SettingsScreen::ShowScreen did not verify on this build " &
+         "(or is a stub); refusing to call it.")
+    return
+  var screen = gMi2Self
+  if screen == nil:
+    iErr("no live SettingsScreen is known yet ($settings is null). The host " &
+         "learns it the first time the screen is opened by hand, so open " &
+         "Settings once manually and this will work from then on.")
+    return
+  var group = 0'u64
+  if toks.len > 1:
+    var err = ""
+    discard iEval(toks[1], group, err)
+  iOut("  via EFT.UI.SettingsScreen::ShowScreen @0x" &
+       iHexPad(uint64(rva), 6) & " (call) on " & iPtr(screen) &
+       ", group=" & $int(group))
+  iMark("SettingsScreen::ShowScreen", screen)
+  discard cInspUPI(fn, screen, int32(group), nil)
+  iOut("  ShowScreen returned. It is ASYNCHRONOUS -- the screen it asked for " &
+       "does not exist yet. Follow with `until $settings+0x118` before " &
+       "reading the tab.")
+
+proc iCmdTab(toks: seq[string]) =
+  ## `tab PTR [0|1]` -- EFT.UI.SettingsTab::set_IsSelected(tab, value).
+  if toks.len < 2:
+    iErr("usage: tab PTR [0|1]")
+    return
+  if not iNavGate("tab"):
+    return
+  var fn: Il2CppPtr = nil
+  var rva = 0'u32
+  if not iNavFind("set_IsSelected", fn, rva):
+    iErr("EFT.UI.SettingsTab::set_IsSelected did not verify on this build " &
+         "(or is a stub); refusing to call it.")
+    return
+  var v = 0'u64
+  var err = ""
+  if not iEval(toks[1], v, err):
+    iErr(err)
+    return
+  let tab = cast[Il2CppPtr](v)
+  if not duOk(tab, 0xA0'i32):
+    iErr("that tab pointer is not readable to +0xA0; refusing to call.")
+    return
+  var val = 1'u64
+  if toks.len > 2:
+    var e2 = ""
+    discard iEval(toks[2], val, e2)
+  let latchBefore = cReadPtrAt(tab, cNavOffFirstSel())
+  iOut("  via EFT.UI.SettingsTab::set_IsSelected @0x" &
+       iHexPad(uint64(rva), 6) & " (call) on " & iPtr(tab) &
+       ", value=" & $int(val))
+  iMark("SettingsTab::set_IsSelected", tab)
+  discard cInspUPI(fn, tab, int32(val), nil)
+  let latchAfter = cReadPtrAt(tab, cNavOffFirstSel())
+  iOut("  first-select latch (+0x" & iHexPad(uint64(cNavOffFirstSel()), 2) &
+       ") " & iPtrU(cast[uint64](latchBefore)) & " -> " &
+       iPtrU(cast[uint64](latchAfter)) &
+       (if latchBefore != latchAfter:
+          "   <- FIRST select: OnFirstSelect/CreateControls ran, so " &
+          "_createdControls will populate over the next frames"
+        else: "   (already selected before, no control creation)"))
+
+proc iCmdState(toks: seq[string]) =
+  ## `state` -- what is on screen right now, as FIELD READS only.
+  ##
+  ## The point of this command is that automation without verification is
+  ## worse than no automation: a failed navigation step that goes unnoticed
+  ## corrupts every step after it, and does so silently. Everything here is a
+  ## guarded field read -- no calls -- so `state` itself can never be the thing
+  ## that breaks.
+  iOut("  anchors: $preloader=" & iPtr(gInspPreloader) &
+       " $settings=" & iPtr(gMi2Self))
+  iOut("  inspector: menu anchor slot=" & $gInspSlot &
+       ", in-raid anchor slot=" & $gInspSlot2 &
+       ", dispatches=" & $gInspFires & " (of those in-raid=" &
+       $gInspDrainFires & ")")
+  if gInspPreloader == nil:
+    iOut("  menu: PreloaderUI anchor is null -- either the menu has not built " &
+         "yet, or the session is in a raid (where PreloaderUI does not tick).")
+  let ss = gMi2Self
+  if ss == nil:
+    iOut("  settings: NOT KNOWN. The host learns the SettingsScreen pointer " &
+         "the first time that screen is opened; it has not been opened this " &
+         "session. This is why the anchor is null -- not a read failure.")
+    return
+  if not duOk(ss, cNavOffInitTabs() + 8'i32):
+    iErr("the SettingsScreen pointer is not readable to +0x" &
+         iHexPad(uint64(cNavOffInitTabs()), 3) & "; reporting nothing rather " &
+         "than reporting garbage.")
+    return
+  let cur = cReadPtrAt(ss, cNavOffCurrentTab())
+  let init = cReadPtrAt(ss, cNavOffInitTabs())
+  iOut("  settings: _currentTab(+0x" & iHexPad(uint64(cNavOffCurrentTab()), 3) &
+       ")=" & iPtr(cur) & "  _initializedTabs(+0x" &
+       iHexPad(uint64(cNavOffInitTabs()), 3) & ")=" & iPtr(init))
+  if cur == nil:
+    iOut("  no tab is selected yet (the screen may still be building).")
+    return
+  if duOk(cur, 0xA0'i32):
+    iOut("  current tab: klass=" & iPtrU(cast[uint64](cReadPtrAt(cur, 0'i32))) &
+         " _createdControls(+0x" & iHexPad(uint64(cNavOffCreated()), 2) & ")=" &
+         iPtr(cReadPtrAt(cur, cNavOffCreated())) &
+         " latch(+0x" & iHexPad(uint64(cNavOffFirstSel()), 2) & ")=" &
+         iPtrU(cast[uint64](cReadPtrAt(cur, cNavOffFirstSel()))))
+
 proc iResolveCallTarget(tok: string; fn: var Il2CppPtr; label: var string): bool =
   ## `name:<substring>` picks one of the byte-verified targets; `rva:0x...`
   ## takes a raw RVA and puts it through `aowl_insp_code`, which is four
@@ -1337,6 +1513,17 @@ proc iCmdHelp() =
   iOut("    canvas EXPR                   the Graphic's cached Canvas + its mode")
   iOut("    call TARGET SIG [ARG..]       direct RVA call (needs `allow write`)")
   iOut("    targets [SUBSTR]              list byte-verified call targets")
+  iOut("  -- state + navigation (navigation needs `allow write`) --")
+  iOut("    state | where                 what screen/tab is up RIGHT NOW")
+  iOut("                                  e.g.  state")
+  iOut("    wait N                        park the batch for N frames")
+  iOut("                                  e.g.  wait 10")
+  iOut("    until EXPR [FRAMES]           park until the ptr at EXPR is non-0")
+  iOut("                                  e.g.  until $settings+0x118 120")
+  iOut("    open [GROUP]                  SettingsScreen::ShowScreen (async!)")
+  iOut("                                  e.g.  allow write | open 0")
+  iOut("    tab EXPR [0|1]                SettingsTab::set_IsSelected")
+  iOut("                                  e.g.  tab $settings@0x118 1")
   iOut("    image                         GameAssembly base + il2cpp section")
   iOut("    allow write                   arm writes/calls for this batch")
   iOut("    echo TEXT                     put a marker in the output")
@@ -1476,6 +1663,19 @@ proc iExec(line: string) =
          "are not in the byte-verified target tables and reflection is dead. " &
          "Walk UP with `parent` from an object you have already verified -- " &
          "that is how the settings-row container was reached.")
+  of "open":
+    iCmdOpen(toks)
+  of "tab":
+    iCmdTab(toks)
+  of "state", "where":
+    iCmdState(toks)
+  of "wait", "until":
+    # Handled by the batch runner itself, which has to park and resume across
+    # frames. Reaching here means the runner did not intercept it, which would
+    # be a bug in the runner rather than an unknown command -- say that plainly
+    # instead of pretending the command does not exist.
+    iErr(cmd & " was not intercepted by the batch runner; this is an internal " &
+         "inconsistency, not a bad command. Nothing was waited on.")
   of "canvas":
     if toks.len < 2:
       iErr("usage: canvas EXPR   (EXPR is a Graphic, e.g. a TextMeshProUGUI)")
@@ -1524,10 +1724,96 @@ proc inspBody(a: Il2CppPtr): Il2CppPtr {.
 # ---------------------------------------------------------------------------
 # Unity's half: run the batch.
 # ---------------------------------------------------------------------------
+const InspWaitCap = 300
+  ## Hard frame cap on any one `wait`/`until` -- about five seconds at 60fps.
+  ## A condition that never comes true must not park the channel forever; it
+  ## reports honestly and the batch CONTINUES, because the commands after a
+  ## failed wait are usually the ones that explain why it failed.
+
+var gInspWaitIdx = -1
+  ## Which command index the current wait belongs to, so re-entry can tell
+  ## "first frame of this wait" from "still waiting".
+
+proc iIsWaitCmd(line: string): bool =
+  let toks = iSplit(line)
+  if toks.len == 0:
+    return false
+  let c = iLower(toks[0])
+  result = (c == "wait" or c == "until")
+
+proc iWaitStep(line: string; idx: int): bool =
+  ## One frame's worth of a `wait`/`until`. Returns true when the batch may
+  ## move on, false to park for another frame.
+  ##
+  ##   wait N            -- park for N frames, unconditionally.
+  ##   until EXPR [N]    -- park until the pointer at EXPR reads non-zero,
+  ##                        at most N frames (default the cap).
+  ##
+  ## `until` exists because navigation is asynchronous: `ShowScreen` returns
+  ## long before the screen it asked for exists, so a script that reads
+  ## `_currentTab` on the next line reads the value from BEFORE the open. That
+  ## is not a race we can win by guessing a sleep length; it has to be a
+  ## condition that is actually tested.
+  let toks = iSplit(line)
+  let verb = iLower(toks[0])
+  let first = (gInspWaitIdx != idx)
+  if first:
+    gInspWaitIdx = idx
+    var frames = InspWaitCap
+    let argIdx = (if verb == "wait": 1 else: 2)
+    if toks.len > argIdx:
+      var n = 0'u64
+      var err = ""
+      if iEval(toks[argIdx], n, err) and int(n) > 0:
+        frames = int(n)
+    if frames > InspWaitCap:
+      frames = InspWaitCap
+    gInspUntilLeft = frames
+    if verb == "until" and toks.len < 2:
+      iErr("usage: until EXPR [FRAMES]  -- waits until the ptr at EXPR is non-zero")
+      gInspWaitIdx = -1
+      return true
+    iOut("  " & verb & ": waiting up to " & $frames & " frame(s)" &
+         (if verb == "until": " for " & toks[1] & " to read non-zero" else: ""))
+  if verb == "until":
+    var v = 0'u64
+    var err = ""
+    if iEval(toks[1], v, err):
+      var raw = 0'u64
+      var buf = default(array[8, uint8])
+      if cInspReadBytes(cast[Il2CppPtr](v), 0'i32, 8'i32,
+                        cast[ptr uint8](addr buf[0])) != 0'i32:
+        for k in 0 ..< 8:
+          raw = raw or (uint64(buf[k]) shl uint64(k * 8))
+        if raw != 0'u64:
+          iOut("  until: satisfied after " &
+               $(gInspUntilLeft.abs) & " frame(s) remaining; value = " &
+               iPtrU(raw))
+          iSetVar("_", raw)
+          gInspWaitIdx = -1
+          return true
+  dec gInspUntilLeft
+  if gInspUntilLeft <= 0:
+    # A TIMEOUT IS REPORTED, NOT SWALLOWED, and the batch goes on.
+    if verb == "until":
+      iErr("until: TIMED OUT -- " & toks[1] & " never read non-zero within " &
+           "the frame cap. The batch continues; the commands after this one " &
+           "will show what the state actually is.")
+    gInspWaitIdx = -1
+    return true
+  result = false
+
 proc inspRunBatch() =
-  gInspOut = @[]
-  gInspOutBytes = 0
-  gInspAllowWrite = false
+  # A RESUMED batch keeps everything: its output so far, its variables, and its
+  # write permission. Only a genuinely new batch starts clean. Getting this
+  # wrong would silently drop the first half of every batch that waited.
+  let resuming = gInspSuspended
+  if not resuming:
+    gInspOut = @[]
+    gInspOutBytes = 0
+    gInspAllowWrite = false
+    gInspResumeAt = 0
+  gInspSuspended = false
   # THE ANCHOR REFRESH IS NOW GUARDED. It was not, and it sits between "the
   # rider observed a pending batch" and "the rider cleared the pending flag" --
   # so anything that escaped here left the flag set forever, produced no
@@ -1541,8 +1827,9 @@ proc inspRunBatch() =
   iMark("anchor refresh (start of batch)", gInspPreloader)
   let anchorsOk = cInspGuarded(cast[Il2CppPtr](0)) != nil
   gInspBodyMode = 0
-  iOut("aowlspt live inspector -- batch " & $gInspBatch & ", " &
-       $gInspCmds.len & " command(s), on Unity thread " & $int(cThreadId()))
+  if not resuming:
+    iOut("aowlspt live inspector -- batch " & $gInspBatch & ", " &
+         $gInspCmds.len & " command(s), on Unity thread " & $int(cThreadId()))
   if not anchorsOk:
     inc gInspFaults
     iOut("  !! the anchor refresh FAULTED (caught; the game survived). " &
@@ -1550,10 +1837,22 @@ proc inspRunBatch() =
          iPtr(cInspCrumbPtr()))
     iOut("  !! anchors may be stale or missing for this batch; the commands " &
          "below still ran")
-  var i = 0
+  var i = gInspResumeAt
   while i < gInspCmds.len:
     gInspPhase = 2
     gInspCurIdx = i
+    # A `wait`/`until` parks the batch HERE and returns. The rider re-enters
+    # next frame and resumes at this same index, so the condition is retested
+    # once per frame with a hard frame cap.
+    if iIsWaitCmd(gInspCmds[i]):
+      if iWaitStep(gInspCmds[i], i):
+        inc i
+        gInspResumeAt = i
+        continue
+      gInspResumeAt = i
+      gInspSuspended = true
+      gInspPhase = 0
+      return
     iMark(("start of command: " & gInspCmds[i]), cast[Il2CppPtr](0))
     if cInspGuarded(cast[Il2CppPtr](0)) == nil:
       # THE ONE LINE THIS WHOLE FEATURE EXISTS TO MAKE POSSIBLE. A caught fault
@@ -1570,6 +1869,8 @@ proc inspRunBatch() =
              "session. Restart the client to re-arm it.")
         i = gInspCmds.len
     inc i
+  gInspResumeAt = 0
+  gInspWaitIdx = -1
   iOut("aowlspt live inspector -- batch " & $gInspBatch & " complete, " &
        $gInspOut.len & " line(s)")
 
@@ -1609,6 +1910,19 @@ proc inspTick() =
       iOut("  !! too many escapes; the live inspector is now OFF for this " &
            "session. Restart the client to re-arm it.")
     return
+  # RESUME A PARKED BATCH. The pending flag was consumed when the batch was
+  # first claimed, so this path is not gated on it -- the batch is already
+  # ours and is simply not finished.
+  if gInspSuspended:
+    gInspInFlight = gInspBatch
+    inspRunBatch()
+    gInspInFlight = -1
+    if gInspSuspended:
+      return
+    cInspLock()
+    gInspBatchDone = gInspBatch
+    cInspUnlock()
+    return
   if cInspHave() == 0'i32:
     return
   inc gInspTicks
@@ -1626,6 +1940,12 @@ proc inspTick() =
   gInspPhase = 3
   gInspInFlight = -1
   gInspPhase = 0
+  # A SUSPENDED batch is not a finished batch. Publishing the handshake here
+  # would hand a half-run batch's output to the tick thread as if it were the
+  # answer, and the rest of the commands would then run against a channel that
+  # had already been reset.
+  if gInspSuspended:
+    return
   cInspLock()
   gInspBatchDone = gInspBatch
   cInspUnlock()
@@ -1654,6 +1974,24 @@ proc inspectFired(regs: Il2CppPtr) =
   let selfPtr = cRegsInt(regs, 0'i32)
   if selfPtr != 0'u64:
     gInspPreloader = cast[Il2CppPtr](selfPtr)
+  inspTick()
+
+proc inspectDrainFired() =
+  ## THE IN-RAID ENTRY POINT, from the main drain's slot.
+  ##
+  ## Deliberately NOT `inspectFired`: on that anchor RCX is a
+  ## `TarkovApplication`, not a `PreloaderUI`, and writing it into
+  ## `gInspPreloader` would poison the `$preloader` anchor with an object of
+  ## the wrong type -- every field read off it would then be garbage that
+  ## looked plausible. So this touches no anchor at all and only drains.
+  ##
+  ## Counted separately for the same reason `gInspFires` exists: so the log can
+  ## say WHICH anchor is carrying the session rather than leaving it to be
+  ## inferred.
+  inc gInspFires
+  inc gInspDrainFires
+  if gInspOff:
+    return
   inspTick()
 
 # ---------------------------------------------------------------------------
@@ -1855,6 +2193,17 @@ proc bindInspect(verbose: bool): bool =
   ## check is exact and strict and CANNOT self-reject because another feature
   ## detoured the function first -- which was the live trap that produced
   ## "menu mode text: 0 target(s) verified, 1 rejected" on a correct RVA.
+  # THE SECOND ANCHOR, claimed first because it is the one that survives a raid
+  # load. This is an ALIAS onto the slot the bridge's main drain already holds
+  # (`EFT.TarkovApplication::Update`, which ticks for the whole session); no
+  # second detour is installed, so the documented crash history of the
+  # static-RVA path for that function is not in play here. When the bridge
+  # never bound a drain this stays -1 and the inspector is menu-only.
+  if gInspSlot2 < 0 and gDrainSlot >= 0:
+    gInspSlot2 = gDrainSlot
+    okLog "live inspector: IN-RAID anchor armed as a rider on the main " &
+          "drain's existing detour (slot " & $gInspSlot2 & ") -- commands " &
+          "will keep running after the menu goes away"
   if gInspSlot >= 0:
     return true
   if not gReady or gDisableDrain:
@@ -1873,11 +2222,15 @@ proc bindInspect(verbose: bool): bool =
   if fn == nil:
     if verbose:
       info "live inspector: EFT.UI.PreloaderUI::Update did not verify on this " &
-           "build and no other feature holds it; nothing bound"
-    return false
+           "build and no other feature holds it; the MENU anchor is not armed"
+    # Not a failure if the in-raid anchor took: the instrument still works,
+    # just not on the menu. Saying "nothing bound" when one anchor IS bound
+    # would be the same kind of confident-and-wrong message this file has
+    # already cost cycles to.
+    return gInspSlot2 >= 0
   if attachDrain("EFT.UI.PreloaderUI::Update", fn, cast[Il2CppMethod](0),
                  true, verbose, 14'i32):
     okLog "live inspector armed on EFT.UI.PreloaderUI::Update (per-frame, " &
           "Unity thread); drop commands into " & gInspCmdPath
     return true
-  result = false
+  result = gInspSlot2 >= 0

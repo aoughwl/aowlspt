@@ -263,7 +263,13 @@ proc modeTextUpdateFired(regs: Il2CppPtr) =
 
   if gModeTextFires == 1:
     let tid = int(cThreadId())
-    okLog "menu mode text: PreloaderUI.Update postfix first fired on thread " &
+    # NOT "postfix". This handler is dispatched from BOTH halves -- prefix when
+    # the debug overlay claimed the shared slot, postfix when this feature
+    # claimed it -- and the string used to say "postfix" unconditionally. That
+    # lie cost a full investigation cycle: it made a prefix-claimed slot look
+    # like a claim/fire mismatch and sent the hunt after a bug that did not
+    # exist. The half is not knowable from here, so this no longer claims it.
+    okLog "menu mode text: PreloaderUI.Update first fired on thread " &
           $tid & (if tid == int(gHostThreadId):
                     " (HOST thread -- unexpected, NOT Unity's)"
                   else: " (Unity's main thread)")

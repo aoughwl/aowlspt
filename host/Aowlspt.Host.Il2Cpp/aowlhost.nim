@@ -1237,6 +1237,11 @@ var gModeTextOn = false
 ## there, and a prologue check against a TRAMPOLINE fails -- which is the exact
 ## live trap currently self-rejecting `uxMenuModeText`. See `bindInspect`.
 var gInspSlot = -1
+var gInspSlot2 = -1
+  ## The inspector's SECOND anchor: the main drain's slot, aliased so the
+  ## instrument keeps ticking inside a raid where `PreloaderUI::Update` does
+  ## not. -1 when the bridge never bound a main drain, in which case the
+  ## inspector is menu-only and says so.
 
 ## Whether the fragile static-RVA drain path may be used at all. OFF by default:
 ## it bound a real-but-wrong function on the live client and crashed the game, so
@@ -2806,6 +2811,21 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
   # scanning: it fires on every frame of the game and must not walk anything.
   if i == gDrainSlot:
     mainDrain()
+    # THE LIVE INSPECTOR'S IN-RAID TICK. `PreloaderUI::Update` only runs in the
+    # menu, so an inspector anchored solely to it goes silent the moment a raid
+    # starts -- which is precisely where the bot, nav and ESP questions are.
+    # The main drain rides `EFT.TarkovApplication::Update`, which ticks for the
+    # whole session including raid, so the inspector rides it as a SECOND
+    # anchor. No new detour is installed: this is an alias onto a slot the
+    # bridge already claimed, the same rule the PreloaderUI multiplex follows.
+    #
+    # This branch returns immediately, so the rider chain further down never
+    # sees this slot -- the alias alone would do nothing, and the call has to
+    # be here. `inspTick` is idempotent (it drains only when a batch is
+    # pending), so being reachable from two anchors costs one interlocked load
+    # per frame and never runs a batch twice.
+    if i == gInspSlot2:
+      inspectDrainFired()
     return 0'i32
   # The render-phase drain, likewise by identity: a second detour on a
   # render-phase method that drains the render queue where GL drawing lands.
