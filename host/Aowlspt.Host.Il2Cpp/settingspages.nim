@@ -135,6 +135,12 @@ var gSwPagesOn = false
 ## silence to be interpreted.
 var gSwPagesFires = 0
 
+## EVERY clone this feature has ever put on the settings screen, so a reload can
+## take them all off again. Without this, re-reading the page file would stack a
+## fresh copy of every row on top of the last one -- and the whole point of the
+## file is that it gets reloaded dozens of times in a sitting.
+var gSwClones: seq[uint64] = @[]
+
 proc swPageRegister(p: SwPage) =
   ## Add a page, replacing any page already registered under the same id. The
   ## replace matters for the seam: a page fetched from a mod's schema route is
@@ -246,6 +252,146 @@ proc swRow(key, label: string; value, wired: bool): SwRow =
   result = SwRow(key: key, label: label, kind: swkToggle, bval: value,
                  fval: 0.0, lo: 0.0, hi: 0.0, implemented: wired,
                  clone: 0'u64, seeded: false)
+
+# ---------------------------------------------------------------------------
+# THE PAGE FILE -- data-driven, and RE-READ EVERY TIME THE SCREEN OPENS
+#
+# The layout of our settings page is not compiled in. It lives in
+# `aowlspt-settings.json` beside the host DLL and is re-read on every settings
+# screen open, so the page can be edited and re-checked in seconds instead of a
+# build -> deploy -> launch cycle. That is the same trick `aowlspt-debugui.json`
+# already uses for the F3 overlay, which is re-read on every toggle-on.
+#
+# The shape, deliberately shallow so the host needs no JSON library:
+#
+#   {
+#     "tab":   "Singleplayer",
+#     "title": "aowlspt",
+#     "rows": [
+#       { "key": "debugUi",  "label": "F3 debug panel", "kind": "toggle",
+#         "notDone": true },
+#       { "key": "",         "label": "Graphics",       "kind": "header" },
+#       { "key": "fov",      "label": "Field of view",  "kind": "slider",
+#         "min": 50, "max": 75, "value": 75 }
+#     ]
+#   }
+#
+# `kind` is one of toggle | slider | header | note. Anything else is read as a
+# note, because drawing a row we do not understand as some other widget is the
+# exact mistake that put three language dropdowns on the Game tab.
+#
+# The parser is a top-level brace scanner plus the flat key/value reader the
+# overlay already uses (`duCfgStr` / `duCfgBool` / `duCfgNum`), applied to one
+# row object at a time. Shallow by construction: a row object contains no nested
+# object, so a brace-depth counter is a complete parse of the part we care about.
+# ---------------------------------------------------------------------------
+
+## The text of the file as it was last successfully loaded. A reload is a no-op
+## unless this changes, so re-reading on every screen open costs one file read
+## and no rebuild when nothing was edited.
+var gSwFileText = ""
+var gSwFileSeen = false
+
+proc swRowObjects(text: string): seq[string] =
+  ## Every top-level `{...}` block inside the FIRST `[` ... `]` after "rows".
+  ## Capped, and it never recurses.
+  result = @[]
+  let at = find(text, "\"rows\"")
+  if at < 0:
+    return
+  var i = at
+  while i < text.len and text[i] != '[':
+    i = i + 1
+  if i >= text.len:
+    return
+  var depth = 0
+  var cur = ""
+  while i < text.len and result.len < cSwMaxRows:
+    let ch = text[i]
+    if ch == '{':
+      depth = depth + 1
+      if depth == 1:
+        cur = ""
+    if depth >= 1:
+      cur.add ch
+    if ch == '}':
+      depth = depth - 1
+      if depth == 0:
+        result.add cur
+        cur = ""
+    elif ch == ']' and depth == 0:
+      break
+    i = i + 1
+
+proc swKindOf(name: string): SwKind =
+  case name
+  of "toggle", "bool", "checkbox": result = swkToggle
+  of "slider", "float", "number":  result = swkSlider
+  else:                            result = swkStub
+
+proc swParsePage(text: string; tabName: var string): SwPage =
+  ## One page out of the file's text. Never throws, never faults: a missing key
+  ## takes its default and a malformed row simply becomes a note.
+  tabName = duCfgStr(text, "tab", "Singleplayer")
+  var rows: seq[SwRow] = @[]
+  for obj in swRowObjects(text):
+    let label = duCfgStr(obj, "label", "")
+    if label.len == 0:
+      continue                          # a row with no caption is not a row
+    let kindName = duCfgStr(obj, "kind", "note")
+    let kind = swKindOf(kindName)
+    let key = duCfgStr(obj, "key", "")
+    var r = SwRow(key: key, label: label, kind: kind,
+                  bval: duCfgBool(obj, "value", readBoolKey(key)),
+                  fval: duCfgNum(obj, "value", 0.0),
+                  lo: duCfgNum(obj, "min", 0.0),
+                  hi: duCfgNum(obj, "max", 1.0),
+                  implemented: not duCfgBool(obj, "notDone", false),
+                  clone: 0'u64, seeded: false)
+    # A row that names a config key but no explicit value takes the key's live
+    # value, so the page always shows what the config actually says.
+    if kind == swkToggle and key.len > 0 and
+       not duCfgBool(obj, "hasValue", false):
+      r.bval = readBoolKey(key)
+    rows.add r
+  result = SwPage(id: "file", title: duCfgStr(text, "title", "aowlspt"),
+                  rows: rows, stub: false,
+                  note: duCfgStr(text, "note", ""),
+                  renderedFor: 0'u64)
+
+proc swReloadPageFile(force: bool): bool =
+  ## Re-read `aowlspt-settings.json`. Returns true when the page registry
+  ## CHANGED and the screen therefore needs rebuilding.
+  ##
+  ## Called on every settings screen open, which is what makes the edit loop
+  ## fast: edit the file, re-open Settings, look. No restart, no rebuild.
+  result = false
+  let path = joinPath(gDir, "aowlspt-settings.json")
+  var text = ""
+  if not readTextFile(path, text):
+    if not gSwFileSeen:
+      gSwFileSeen = true
+      okLog "settings pages: no " & path & " -- using the built-in host page. " &
+            "Drop that file in to define the page yourself; it is re-read " &
+            "every time the settings screen is opened."
+    return
+  if not force and text == gSwFileText:
+    return                              # unchanged: nothing to rebuild
+  gSwFileText = text
+  gSwFileSeen = true
+  var tabName = ""
+  let page = swParsePage(text, tabName)
+  if page.rows.len == 0:
+    warn "settings pages: " & path & " parsed to ZERO rows. Nothing is " &
+         "rendered from it; the built-in page is used instead. Check that " &
+         "\"rows\" is an array of objects each with a \"label\"."
+    return
+  swPageRegister(page)
+  okLog "settings pages: (re)loaded " & path & " -- tab='" & tabName &
+        "' title='" & page.title & "' " & $page.rows.len &
+        " row(s). Edit the file and re-open Settings to see the change; no " &
+        "restart and no rebuild are needed."
+  result = true
 
 proc swBuildHostPage(): SwPage =
   ## The host-flags page, read fresh from `aowlspt-host.json` each time it is
@@ -500,6 +646,9 @@ proc swCloneRow(donor, parentGo: Il2CppPtr; text: string): Il2CppPtr =
         swCrumbP("GameObject::SetActive(true) for row '" & text & "' cloneGo",
                  cloneGo)
         cMi2CallVPB(fnAct, cloneGo, 1'i32)
+  # Remember it, so a reload can take it off the screen again.
+  if clone != nil:
+    gSwClones.add cast[uint64](clone)
   # The label, by the SAME setter-first path the relabel now uses: a clone
   # inherits the donor's LocalizedText, which would otherwise put the donor's
   # own localised string back over ours the moment the row is enabled.
@@ -658,6 +807,38 @@ proc swKillClone(clone: Il2CppPtr) =
   let go = cMi2CallPP(fnGo, clone)
   if go != nil and cIsReadable(go, 0x20'i32) != 0'i32:
     cMi2CallVPB(fnAct, go, 0'i32)
+
+proc swClearClones() =
+  ## Take every row we have ever added off the screen, and forget them.
+  ##
+  ## This is what makes reloading the page file safe to do repeatedly: without
+  ## it, each reload would leave the previous copy of every row in place and the
+  ## list would grow without bound. Deactivate rather than Destroy, for the same
+  ## reason `swKillClone` does -- reversible, and already byte-verified.
+  var n = 0
+  var i = 0
+  while i < gSwClones.len:
+    let c = cast[Il2CppPtr](gSwClones[i])
+    if c != nil and cIsReadable(c, 8'i32) != 0'i32:
+      swKillClone(c)
+      n = n + 1
+    i = i + 1
+  gSwClones = @[]
+  # Every page must forget where it was rendered, or it will believe it is still
+  # on screen and decline to draw itself again.
+  var p = 0
+  while p < gSwPages.len:
+    gSwPages[p].renderedFor = 0'u64
+    var r = 0
+    while r < gSwPages[p].rows.len:
+      gSwPages[p].rows[r].clone = 0'u64
+      gSwPages[p].rows[r].seeded = false
+      r = r + 1
+    p = p + 1
+  if n > 0:
+    okLog "settings pages: cleared " & $n & " previously created row(s) " &
+          "before rebuilding, so a reload replaces the page instead of " &
+          "stacking a second copy of it"
 
 proc swRenderPage(tabPtr, parentGo: Il2CppPtr; page: var SwPage): int =
   ## Render one page's rows onto a tab. Returns how many rows were rendered.
@@ -827,6 +1008,13 @@ proc swPagesOnTabBuilt(tabPtr: Il2CppPtr; tabName: string; revisit: bool) =
           ". A zero here means the stock anchor label for that type was not " &
           "found on this tab (a non-English client will do that), which is why " &
           "the donor is no longer required to be a learned toggle."
+  # HOT RELOAD. Re-read the page file on every screen open. If it changed, take
+  # the old rows off the screen first so a reload REPLACES the page instead of
+  # stacking a second copy of it -- this file is expected to be edited and
+  # reloaded dozens of times in a sitting.
+  swCrumb("re-read aowlspt-settings.json")
+  if swReloadPageFile(false):
+    swClearClones()
   # The registry is rebuilt from the config each time the tab is opened, so the
   # rows show what the file currently says.
   if gSwPages.len == 0:

@@ -1,0 +1,20 @@
+{
+  "tab": "Singleplayer",
+  "title": "aowlspt",
+  "note": "Edit this file and re-open Settings. No restart, no rebuild.",
+
+  "rows": [
+    { "key": "",              "label": "Debug",                 "kind": "header" },
+    { "key": "debugUi",       "label": "F3 debug panel",        "kind": "toggle", "notDone": true },
+    { "key": "debugEsp",      "label": "In-world AI markers",   "kind": "toggle", "notDone": true },
+    { "key": "botDiag",       "label": "Bot registration log",  "kind": "toggle", "notDone": true },
+
+    { "key": "",              "label": "Bots",                  "kind": "header" },
+    { "key": "unlimitedBots", "label": "Lift the bot cap",      "kind": "toggle", "notDone": true },
+    { "key": "botAiActivate", "label": "Bot AI activation fix", "kind": "toggle", "notDone": true },
+
+    { "key": "",              "label": "Interface",             "kind": "header" },
+    { "key": "uxVersionBrand","label": "Brand the version label","kind": "toggle", "notDone": true },
+    { "key": "osCloseFix",    "label": "OS window-close fix",   "kind": "toggle", "notDone": true }
+  ]
+}
