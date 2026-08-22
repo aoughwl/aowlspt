@@ -326,7 +326,80 @@ subprocess until it is turned on.
 
 ---
 
-## 5. What is NOT done — read this
+## 5. What was measured
+
+Run through `aowlspt-sim mods/voice --side server --route <url>[,<body>]`, with
+no game and no backend. All numbers are wall clock on this machine, 2026-08-22.
+
+| Path | Result |
+|---|---|
+| Load | 4 agents, 10 facts, 4 channels; 11 routes registered |
+| Probe | all four engines resolved and **present** — whisper-server, ggml-base.en.bin, piper.exe, the lessac voice, recorder.exe |
+| `say` (reason → speak) | **609–750 ms**, produced a real `.wav`; `ffprobe`: `pcm_s16le, 22050 Hz, 1 channel, 4.93 s` |
+| `turn` (wav → transcribe → reason → speak) | **2.67 s** including whisper-server's cold start; transcript came back correct |
+| `listen` (mic → everything) | **worked once, end to end.** The mic picked up the machine's own playback of an earlier piper wav; whisper transcribed it correctly and the agent answered and spoke. Subsequent attempts returned `recorder produced -1 bytes (exit 2): NO_DEVICES` — see §5.1. |
+| `radio/transmit` on channel 3 | routed to Tagilla, answered, spoke |
+| `radio/transmit` to a world agent with `assumeBotsPresent: false` | `{"ok":false,"status":"unknown"}` plus a note naming the missing host-side bot API — the dependency degrades honestly instead of pretending |
+| `radio/transmit` on the private channel, same config | unaffected: the assistant has no body, so range and liveness are never consulted. That is the private/world split working. |
+| Memory | two turns with `testagent` left it at 4 lines and every other agent at 0 — per-agent, isolated |
+| `radio/transmit` on a channel that does not exist | `{"ok":false,"status":"no_such_channel"}` — fails in the fiction, as designed |
+| `aowl-regcheck --repo .` | 183 checks, **3 failures, all pre-existing** (`mods/admin`, `mods/graphics`, `mods/settingshub` have no registry entry on this branch). `aowl.voice` adds no failure; it raises the unconditional "in no list" *soft warning*, which is the intended state for a mod meant to be switched on by hand. |
+
+Two things were found by running it, not by reading it, and both are fixed:
+
+* **Retrieval let the persona outshout the question.** Asking the assistant
+  "where do I extract" returned the fact tagged `assistant help aowl` ahead of
+  the one tagged `exit extract`, because the agent's own tags contributed more
+  matches than the sentence did. The utterance is now weighted 3 to 1 over the
+  agent's tags.
+* **A directly spawned whisper-server hangs every reader of our output.**
+  `CreateProcess` (which `startProcess` and `cmd /c start` both reach) passes
+  handle inheritance on, so the server holds a duplicate of our stdout pipe for
+  the rest of the session and the read end never sees EOF. The route answered
+  and then the process hung at exit — twice, reproducibly. It is now launched
+  through PowerShell's `Start-Process`, which passes `bInheritHandles = FALSE`.
+
+### 5.1 The microphone is not reliable here
+
+`record` worked once and has since returned `NO_DEVICES` (`waveInGetNumDevs()`
+returned 0). That is the recorder reporting honestly, not a silent failure, and
+`/listen` surfaces it verbatim. It is a machine/permissions condition rather than
+a code path — EFMB's own source notes the fix as *Settings → Privacy →
+Microphone → "Allow desktop apps to access your microphone"*. **The stage either
+side of it is proven**: `turn` takes a `.wav` and does everything from there, so
+the mic is the only unconfirmed link in the chain.
+
+### 5.2 emutest was not re-run against a self-built backend
+
+The gate's number could not be honestly produced. Running it needs `mods/tarkov`,
+the backend and `emutest.exe` all built from **this** worktree, and for the whole
+session this machine had up to four concurrent `aowl` builds and a dozen `gcc`
+processes belonging to other agents — and this repo's documented hazard is that
+concurrent nimony builds corrupt each other through a shared cache and fail
+naming identifiers from files nobody touched. Building into that would have
+produced a number worth nothing.
+
+Mixing binaries across branches was tried and correctly refused: staging the main
+checkout's `tarkov.dll` against this worktree gave
+`{"err":"no route","url":"/aowlspt/tarkov/selfcheck"}`, which is the cross-branch
+mismatch and not a regression. **That result is discarded, not reported.**
+
+What can be said instead: this change adds one directory under `mods/` and one
+entry to `registry/mods.json`, and touches nothing `emutest` stages — it stages
+only `mods/tarkov`, its data and `tests/fixtures/emu-full.json`. The six
+regression markers are all present (`ensurePockets`, `post1LocationsTuned`,
+`tuneOfflineSpawns`, `imageCdnRedirect`, `onFiles`, `creation-session`). The
+command to run when the machine is quiet:
+
+```
+installer\build\aowl.exe build
+installer\build\emutest.exe --root installer\build\emustage ^
+    --backend backend\bin\aowlspt-backend.exe --port 6975
+```
+
+Baseline is **18 failures**.
+
+## 6. What is NOT done — read this
 
 * **There is no local LLM.** No `.gguf` exists on this machine and none is
   downloaded by this mod. `llmEngine: "llamacpp"` is wired and will run, but it
@@ -345,5 +418,8 @@ subprocess until it is turned on.
   like EFMB's was. `store*` in the aowlspt API is the intended home; not wired.
 * **Engine processes are spawned but not supervised.** whisper-server is started
   on first use and left running; there is no health check, restart, or shutdown
-  hook.
+  hook. `curl --retry-connrefused` covers the start-up race, so a cold start
+  costs about two seconds and is not a failure -- but nothing notices if the
+  server dies.
+* **The microphone is unconfirmed on this machine** -- see §5.1.
 * **Not tested against a live raid.** Nothing here has touched the game.
