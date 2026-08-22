@@ -347,12 +347,53 @@ rather than truncated.
 6. The log prints `botnav: bot id=N GoToPoint(x, y, z) -> Complete` and the
    bot's `x/y/z` in successive censuses move toward the point.
 
-**Unverified.** None of the above has been run against the live game in this
-task — the recon is static (offline binary + metadata) and the build is
-compile-verified only. What is proven is the disassembly, the ABI, the offsets
-and the byte-verified prologues; what is not is the end-to-end behaviour, and in
-particular whether a re-issued command holds a bot against its own brain for
-useful stretches or merely nudges it.
+**Unverified.** None of the above has been run against the live game — the recon
+is static (offline binary + metadata) and the build is compile-verified only.
+What is proven is the disassembly, the ABI, the offsets, the byte-verified
+prologues, and that the whole tree builds. What is **not** proven is any
+end-to-end behaviour: whether `UpdateManual` fires as expected under our detour,
+whether the pre-flight admits real bots, and above all whether a re-issued
+command holds a bot against its own brain for useful stretches or merely nudges
+it. Treat the first live test as an experiment, not a confirmation.
+
+## A note on finding build errors in this host
+
+`aowl.exe build` buffers its **entire** output until it exits — through
+PowerShell redirection, `Out-File`, `Tee-Object` and a bash pipe alike. The host
+is the second of six stages, so a compile error there stays invisible for the
+half hour the remaining stages take, and killing the build loses the buffer
+rather than flushing it.
+
+The fast path is to invoke nimony directly with the exact flags
+`buildIl2CppHost` uses, from PowerShell, in the host directory:
+
+```powershell
+$R="<worktree>"; $N="$env:USERPROFILE\nimony"
+cd "$R\host\Aowlspt.Host.Il2Cpp"
+& "$N\bin\nimony.exe" c --app:lib "--passC:-I$R\abi" `
+  "-p:$R\aowl\src" "-p:$R\installer\src" "-p:$R\host\common" `
+  "-p:$R\host\Aowlspt.Overlay" "-p:$R\host\Aowlspt.Graphics" `
+  "-o:$R\host\Aowlspt.Host.Il2Cpp\bin\aowlspt-host-il2cpp.dll" `
+  "$R\host\Aowlspt.Host.Il2Cpp\aowlhost.nim"
+```
+
+It prints errors immediately. The standing warning that hand-invoking nimony
+"silently exits 0 producing NOTHING" is about it not *placing* the DLL (that is
+`placeLibrary`'s job — the artifact is left in `nimcache/<hash>/aowlhost.dll`),
+not about diagnostics. Use it to find the error, then run the real
+`aowl.exe build` to produce the shipped binary.
+
+Two things this build tripped over that are worth knowing before writing more
+host code:
+
+* **nimony requires definite initialisation.** `var v: array[3, float64]` whose
+  address is handed to a C function that fills it is an error — "the callee
+  writes it" is not a proof nimony accepts. Initialise explicitly.
+* **`$` does not apply to floats here.** Use `formatFloat(v, ffDecimal, 2)`,
+  which is what `botdiag.nim` already does for a Vector3.
+* A new `abi/*.h` needs its own `{.emit: """#include "..." """.}` in
+  `aowlhost.nim`'s header block, or every `importc ... nodecl` from it fails at
+  C codegen as an implicit declaration.
 
 ## 6. What is NOT reachable (honest limits)
 
