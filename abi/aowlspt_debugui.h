@@ -434,6 +434,27 @@ static const AowlDuTarget aowl_du_targets[] = {
     { "UnityEngine.Canvas::get_scaleFactor", 0x5584180u,
       { 0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,0x8B,0x3D,0xB5,0x01,
         0x48,0x8B,0xD9 }, 16 },
+
+    /* UnityEngine.UI.Graphic::set_raycastTarget(bool) -- instance, 1 bool.
+     *
+     * ADDED AFTER THE LIVE CRASH. A TextMeshProUGUI is a Graphic, and a Graphic
+     * defaults to being a RAYCAST TARGET. Every clone the overlay makes is
+     * therefore an invisible-but-clickable surface, and the panel spans a wide
+     * strip of the screen. With the panel open, a click in the menu lands on
+     * OUR label instead of the button under it -- which is exactly the report:
+     * "clicking with the panel open killed the game". A debug read-out must
+     * never eat input.
+     *
+     * The getter proves the field for anyone who prefers the raw store:
+     * `Graphic::get_raycastTarget` @0x1A180B0 is literally
+     * `movzx eax, byte [rcx+0x3A]; ret`, so m_RaycastTarget is +0x3A. We call
+     * the setter anyway -- it also runs SetRaycastDirty, which is what actually
+     * unregisters the graphic from the raycaster.
+     * Type 26949 UnityEngine.UI.Graphic, rid 231, RVA 0x53AD7F0, section
+     * `il2cpp`. */
+    { "UnityEngine.UI.Graphic::set_raycastTarget", 0x53AD7F0u,
+      { 0x48,0x89,0x5C,0x24,0x10,0x57,0x48,0x83,0xEC,0x20,0x80,0x3D,0xDA,
+        0x95,0xD2,0x01 }, 16 },
 };
 
 #define AOWL_DU_TARGET_COUNT \
@@ -525,6 +546,14 @@ static uint32_t aowl_du_preloader_update_rva(void) {
 
 /* STATIC, 0 declared args -> reference.  (MethodInfo*) */
 typedef void* (*AowlDu_P_V)(void*);
+/* An instance method with a single BOOL argument (position 1 -> DL/RDX, the
+ * hidden MethodInfo* position 2 -> R8). */
+static void aowl_du_call_v_pb(void* fn, void* self, int32_t b) {
+    typedef void (*Fn)(void*, int32_t, void*);
+    if (!fn || !self) return;
+    ((Fn)fn)(self, b ? 1 : 0, (void*)0);
+}
+
 static void* aowl_du_call_p_v(void* fn) {
     if (!fn) return NULL;
     return ((AowlDu_P_V)fn)(NULL);

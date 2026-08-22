@@ -99,6 +99,8 @@ proc cDuOffTmpText(): int32 {.importc: "aowl_du_off_tmp_text", nodecl.}
 proc cDuOffTmpFontSize(): int32 {.importc: "aowl_du_off_tmp_fontsize", nodecl.}
 proc cDuOffTmpFontColor(): int32 {.importc: "aowl_du_off_tmp_fontcolor", nodecl.}
 proc cDuOffTmpDirty(): int32 {.importc: "aowl_du_off_tmp_dirty", nodecl.}
+proc cDuCallVPB(fn, self: Il2CppPtr; b: int32) {.
+  importc: "aowl_du_call_v_pb", nodecl.}
 proc cDuOffTmpRect(): int32 {.importc: "aowl_du_off_tmp_rect", nodecl.}
 proc cDuOffMcPrevPos(): int32 {.importc: "aowl_du_off_mc_prevpos", nodecl.}
 proc cDuOffMcRotation(): int32 {.importc: "aowl_du_off_mc_rotation", nodecl.}
@@ -168,6 +170,7 @@ const
   DuCanvasOrder    = 22'i32
   DuCanvasMode     = 23'i32
   DuCanvasScale    = 24'i32
+  DuSetRaycast     = 25'i32
 
 # ---------------------------------------------------------------------------
 # Caps
@@ -181,6 +184,16 @@ const
   cDuMaxMarkers    = 48    ## hard ceiling on ESP labels, whatever the config says
   cDuMaxPlayers    = 64    ## registered players read per pass
   cDuMaxTextLen    = 160   ## characters written into one label
+
+## The `last` value a freshly cloned label starts at. It must be a string no
+## real caption can equal, because `duSetText` short-circuits on unchanged text
+## and a clone starts out carrying the DONOR'S text ("1.1.0.1.4677 | PvE").
+## With `last` initialised to "" the first `duHide` compared "" to "" , decided
+## nothing had changed, and left the donor's string on screen at the donor's
+## position -- which is the stray label parked in the middle of the screen.
+## The leading control byte is deliberate: no caption this overlay composes
+## ever begins with one, so the sentinel cannot collide with real text.
+const cDuUnset = "\x01<clone has never been written to>"
 
 # ---------------------------------------------------------------------------
 # The layout configuration
@@ -494,6 +507,10 @@ type DuLabel = object
   pX: float64
   pY: float64
   placed: bool
+  ## The clone's GameObject, so a label can be switched off entirely rather
+  ## than merely blanked, and whether it is currently on.
+  go: Il2CppPtr
+  active: bool
 
 var gDuPanel: seq[DuLabel] = @[]
 var gDuMarks: seq[DuLabel] = @[]
@@ -522,6 +539,11 @@ var gDuBuilt = false
 var gDuBuildFailed = false
 var gDuLoggedOnce = false
 var gDuFaults = 0
+## The single trial clone whose canvas decides whether the rest of the pool is
+## built at all, and how many refreshes we have waited for Unity to resolve its
+## canvas. Held across frames so a retry never clones again.
+var gDuProbe: DuLabel
+var gDuProbeWaits = 0
 
 proc duPtrAdd(p: Il2CppPtr; off: int32): Il2CppPtr =
   cast[Il2CppPtr](cast[uint64](p) + uint64(off))
@@ -713,6 +735,8 @@ proc duMakeDrawable(lab: DuLabel; w, h: float64) =
   let fnAct = mi2Fn(Mi2GoSetActive)
   if go != nil and fnAct != nil:
     cMi2CallVPB(fnAct, go, 1'i32)
+  # Never a raycast target: a debug read-out must not eat the player's clicks.
+  duNoRaycast(lab.tmp)
   discard cDuWriteU8(lab.tmp, cDuOffTmpDirty(), 1'i32)
 
 # ---------------------------------------------------------------------------
@@ -724,8 +748,9 @@ proc duMakeDrawable(lab: DuLabel; w, h: float64) =
 # Returns a `DuLabel` with `tmp == nil` if any step did not happen.
 # ---------------------------------------------------------------------------
 proc duCloneLabel(anchor, rootGo: Il2CppPtr): DuLabel =
-  result = DuLabel(tmp: nil, rect: nil, last: "", shown: false,
-                   pAnchor: "", pX: 0.0, pY: 0.0, placed: false)
+  result = DuLabel(tmp: nil, rect: nil, last: cDuUnset, shown: false,
+                   pAnchor: "", pX: 0.0, pY: 0.0, placed: false,
+                   go: nil, active: true)
   let fnInst = mi2Fn(Mi2Instantiate)
   if fnInst == nil or anchor == nil:
     return
@@ -747,8 +772,9 @@ proc duCloneLabel(anchor, rootGo: Il2CppPtr): DuLabel =
     # A label with no RectTransform cannot be positioned, and an unpositioned
     # clone sitting on top of the version label is worse than no label at all.
     return
-  result = DuLabel(tmp: clone, rect: rect, last: "", shown: false,
-                   pAnchor: "", pX: 0.0, pY: 0.0, placed: false)
+  result = DuLabel(tmp: clone, rect: rect, last: cDuUnset, shown: false,
+                   pAnchor: "", pX: 0.0, pY: 0.0, placed: false,
+                   go: cloneGo, active: true)
 
 proc duAnchorVec(name: string; ax, ay, px, py: var float64) =
   ## A corner name -> the anchorMin/anchorMax point on the parent (ax, ay) and
@@ -856,12 +882,34 @@ proc duSetText(lab: var DuLabel; text: string): bool =
   lab.shown = t.len > 0
   result = true
 
+proc duSetActive(lab: var DuLabel; on: bool) =
+  ## Switch the whole clone on or off. Called only on a CHANGE, so an idle
+  ## marker costs nothing per frame.
+  if lab.go == nil or lab.active == on:
+    return
+  let fnAct = mi2Fn(Mi2GoSetActive)
+  if fnAct == nil:
+    return
+  cMi2CallVPB(fnAct, lab.go, (if on: 1'i32 else: 0'i32))
+  lab.active = on
+
 proc duHide(lab: var DuLabel) =
-  ## Blank a label rather than deactivating its GameObject: `SetActive(false)`
-  ## is a managed call per label per frame, where an empty string is one raw
-  ## write and only when it was not already empty.
-  if lab.shown:
-    discard duSetText(lab, "")
+  ## Take a label off the screen properly.
+  ##
+  ## The old version only blanked the text, and only when `shown` was already
+  ## true -- so a clone that had never been written kept the DONOR'S caption and
+  ## the donor's position, visible, forever. That is the "1.1.0.1.4677 | PvE"
+  ## floating in the dead centre of the screen: marker 0, never assigned a bot,
+  ## never actually hidden.
+  ##
+  ## Now it clears the text (the `cDuUnset` sentinel guarantees the first call
+  ## really writes) AND deactivates the GameObject, which also takes the label
+  ## out of the canvas batch and out of the raycaster.
+  discard duSetText(lab, "")
+  duSetActive(lab, false)
+
+proc duShow(lab: var DuLabel) =
+  duSetActive(lab, true)
 
 # ---------------------------------------------------------------------------
 # Reading the world
@@ -1122,6 +1170,7 @@ proc duUpdatePanel() =
     duPlace(gDuPanel[i], gDuCfg.panelAnchor,
             gDuCfg.panelX, gDuCfg.panelY - float64(used) * gDuCfg.panelLine)
     discard duSetText(gDuPanel[i], text)
+    duShow(gDuPanel[i])
     inc used
 
 # ---------------------------------------------------------------------------
@@ -1194,6 +1243,7 @@ proc duUpdateMarkers(): bool =
     duPlace(gDuMarks[used], "bottomleft",
             cDuScreenX() * inv, cDuScreenY() * inv + gDuCfg.espY)
     discard duSetText(gDuMarks[used], text)
+    duShow(gDuMarks[used])
     inc used
   for i in used ..< gDuMarks.len:
     duHide(gDuMarks[i])
@@ -1307,21 +1357,29 @@ proc duRectIsSane(t: Il2CppPtr): bool =
   result = w > 32.0 and w < 16384.0 and h > 32.0 and h < 16384.0
 
 proc duCanvasRootGo(anchor: Il2CppPtr): Il2CppPtr =
-  ## The GameObject the clones should be parented under: the SCREEN-SPACE canvas
-  ## the version label itself renders in.
+  ## The GameObject the clones must be parented under.
   ##
-  ## Route 1 (preferred, and exact): `Graphic.m_Canvas` (+0x60) on the anchor is
-  ## a direct pointer to the Canvas the game already resolved for this label --
-  ## the live dump printed it, renderMode=0 (ScreenSpaceOverlay) scaleFactor 2.0.
-  ## A Canvas is a Component, so `Component::get_gameObject` turns it into the
-  ## parent GameObject, and a clone under it inherits that canvas instead of
-  ## being given one of its own.
+  ## ROUTE 1, and the one that is right by CONSTRUCTION rather than by lookup:
+  ## the source label's OWN PARENT. A sibling of the version label is on the
+  ## version label's canvas because it is in the version label's subtree -- there
+  ## is no canvas to resolve, nothing to get null, and nothing to be wrong about.
+  ## The live dump names it: `UpperPart`, parent[0], rect 1920x1080.
   ##
-  ## Route 2 (fallback): walk UP from the anchor and keep the HIGHEST ancestor
-  ## whose rect is sane, stopping before the outermost root. That is the
-  ## 'Preloader UI' at parent[3] in the dump -- localScale 2, rect 1920x1080.
+  ## The two previous attempts both went looking for a canvas instead, and both
+  ## landed the clones on a DIFFERENT canvas from the source:
+  ##   * `Transform::get_root` -> the outermost 'Preloader UI', a plain
+  ##     Transform, no canvas above it at all -> a world-space canvas each.
+  ##   * "highest sane RectTransform ancestor" -> 'Preloader UI' at parent[3],
+  ##     which carries the OUTER canvas, not the nested one the source draws on.
+  ##     renderMode went 2 -> 0, which is why it started rendering, but every
+  ##     text change then dirtied the whole menu canvas instead of the small
+  ##     nested one. That is the remaining stutter.
+  ## `Graphic.m_Canvas` was meant to fix that and did not take on the live run,
+  ## so it is demoted to a CROSS-CHECK: we no longer depend on it, we only
+  ## compare against it and say so.
   ##
-  ## Never the outermost root, ever. That was the bug.
+  ## Routes 2 and 3 exist so that a build where `get_parent` is unavailable
+  ## still gets something, and each says which one it used.
   result = nil
   let fnGo = mi2Fn(Mi2GetGameObject)
   if fnGo == nil:
@@ -1329,7 +1387,19 @@ proc duCanvasRootGo(anchor: Il2CppPtr): Il2CppPtr =
   gDuParentRoute = "none"
   gDuParentRect = nil
 
-  # ---- route 1: the Graphic's own Canvas ----
+  # ---- route 1: the source label's own parent -- a sibling by construction ----
+  let rect = duRectOf(anchor)
+  let fnPar = cDuFn(DuGetParent)
+  if rect != nil and fnPar != nil:
+    let par = cDuCallPP(fnPar, rect)
+    if duRectIsSane(par):
+      let go = cMi2CallPP(fnGo, par)
+      if duOk(go, 0x20'i32):
+        gDuParentRoute = "the source label's own parent (sibling of the version label)"
+        gDuParentRect = par
+        return go
+
+  # ---- route 2: the Graphic's own Canvas ----
   let canvas = duReadPtrField(anchor, cDuOffTmpGCanvas())
   if duOk(canvas, 0x20'i32):
     let cgo = cMi2CallPP(fnGo, canvas)
@@ -1338,16 +1408,12 @@ proc duCanvasRootGo(anchor: Il2CppPtr): Il2CppPtr =
       if fnT != nil:
         let ct = cMi2CallPP(fnT, cgo)
         if duRectIsSane(ct):
-          gDuParentRoute = "Graphic.m_Canvas"
+          gDuParentRoute = "Graphic.m_Canvas (route 1 was unavailable)"
           gDuParentRect = ct
           return cgo
 
-  # ---- route 2: the highest SANE RectTransform ancestor ----
-  let rect = duRectOf(anchor)
-  if rect == nil:
-    return
-  let fnPar = cDuFn(DuGetParent)
-  if fnPar == nil:
+  # ---- route 3: the highest SANE RectTransform ancestor ----
+  if rect == nil or fnPar == nil:
     return
   var cur = rect
   var best: Il2CppPtr = nil
@@ -1364,9 +1430,30 @@ proc duCanvasRootGo(anchor: Il2CppPtr): Il2CppPtr =
     return
   let go = cMi2CallPP(fnGo, best)
   if duOk(go, 0x20'i32):
-    gDuParentRoute = "highest sane RectTransform ancestor"
+    gDuParentRoute = "highest sane RectTransform ancestor (LAST RESORT -- " &
+                     "expect the clones to be on the wrong canvas)"
     gDuParentRect = best
     result = go
+
+proc duNoRaycast(tmp: Il2CppPtr) =
+  ## Take a clone out of the raycaster.
+  ##
+  ## A TextMeshProUGUI is a Graphic and a Graphic is a raycast target by
+  ## default, so every clone is an invisible clickable surface. The panel is a
+  ## 1200-unit-wide strip; with it open, a click in the menu lands on OUR label
+  ## instead of the button beneath it. That is the reported crash -- "clicking
+  ## with the panel open killed the game". A read-out must never eat input.
+  if tmp == nil:
+    return
+  let fn = cDuFn(DuSetRaycast)
+  if fn != nil:
+    cDuCallVPB(fn, tmp, 0'i32)
+  else:
+    # The setter did not verify; store the field directly. `get_raycastTarget`
+    # is `movzx eax, byte [rcx+0x3A]; ret`, so the offset is not a guess -- but
+    # the raw store skips SetRaycastDirty, so the graphic stays registered until
+    # something else re-registers it. Better than remaining clickable.
+    discard cDuWriteU8(tmp, 0x3A'i32, 0'i32)
 
 # ---------------------------------------------------------------------------
 # THE ONE-SHOT DIAGNOSTIC DUMP, continued
@@ -1475,6 +1562,59 @@ proc duBuild(preloader: Il2CppPtr): bool =
   gDuAnchorTmp = anchor
   gDuRootGo = rootGo
 
+  # ---------------------------------------------------------------------
+  # THE PROBE CLONE, and the canvas assertion.
+  #
+  # Build exactly ONE label first and check which canvas it landed on. If it is
+  # not the source's canvas, do NOT go on to build thirty-two more: that is the
+  # regression that cost the user two crashes, and one stray inactive clone is a
+  # far cheaper way to find out than thirty-three live ones.
+  #
+  # A clone's `Graphic.m_Canvas` is resolved by Unity, not by us, and is null
+  # until the graphic has been through a canvas update -- so an unresolved
+  # canvas means TRY AGAIN NEXT FRAME, not FAIL. The probe is kept in a global
+  # across those frames precisely so that retrying does not clone every frame.
+  # ---------------------------------------------------------------------
+  if gDuProbe.tmp == nil:
+    gDuProbe = duCloneLabel(anchor, rootGo)
+    if gDuProbe.tmp == nil:
+      gDuBuildFailed = true
+      warn "debugui: Object::Instantiate produced no usable label clone; the " &
+           "overlay cannot draw on this build (nothing was changed in the game)"
+      return false
+    duMakeDrawable(gDuProbe, 400.0, 20.0)
+  let srcCv0 = duReadPtrField(anchor, cDuOffTmpGCanvas())
+  let probeCv = duReadPtrField(gDuProbe.tmp, cDuOffTmpGCanvas())
+  if probeCv == nil:
+    inc gDuProbeWaits
+    if gDuProbeWaits > 240:
+      gDuBuildFailed = true
+      duHide(gDuProbe)
+      warn "debugui: the probe clone's Graphic.m_Canvas never resolved after " &
+           $gDuProbeWaits & " refreshes (parent route = " & gDuParentRoute &
+           "). Refusing to build the rest of the overlay rather than put " &
+           "labels on an unknown canvas. Nothing in the game was changed."
+      return false
+    return false                       # not yet resolved; try again next frame
+  if probeCv != srcCv0:
+    gDuBuildFailed = true
+    duHide(gDuProbe)
+    warn "debugui: REFUSING TO BUILD. The probe clone landed on canvas 0x" &
+         hexOf(cast[uint64](probeCv)) & " (renderMode=" &
+         duDescribeInt(DuCanvasMode, probeCv) & ") but the source label is on " &
+         "canvas 0x" & hexOf(cast[uint64](srcCv0)) & " (renderMode=" &
+         duDescribeInt(DuCanvasMode, srcCv0) & "); parent route = " &
+         gDuParentRoute & ", parentRect=[" & duDescribeRect(gDuParentRect) &
+         "]. Building 33 labels on a canvas that is not the source's is what " &
+         "made the client stutter and crash, so exactly one clone was made and " &
+         "it has been switched off. Nothing else in the game was changed."
+    return false
+  okLog "debugui: canvas assertion PASSED -- probe clone and source label are " &
+        "both on canvas 0x" & hexOf(cast[uint64](srcCv0)) & " (renderMode=" &
+        duDescribeInt(DuCanvasMode, srcCv0) & ", scaleFactor=" &
+        duDescribeScale(srcCv0) & ") via " & gDuParentRoute &
+        ". One canvas, one render pass; the rest of the pool is safe to build."
+
   let fields = duSplit(gDuCfg.panelFields, ',')
   var nPanel = fields.len
   if nPanel > cDuMaxPanelLines: nPanel = cDuMaxPanelLines
@@ -1484,20 +1624,40 @@ proc duBuild(preloader: Il2CppPtr): bool =
   if nMark > cDuMaxMarkers: nMark = cDuMaxMarkers
 
   var panel: seq[DuLabel] = @[]
-  for i in 0 ..< nPanel:
-    let lab = duCloneLabel(anchor, rootGo)
+  # The probe becomes panel line 0 when the panel wants one, so the assertion
+  # costs nothing; otherwise it is switched off and left alone.
+  var reused = false
+  if nPanel > 0:
+    var p0 = gDuProbe
+    duStyle(p0, gDuCfg.panelFont, gDuCfg.panelR, gDuCfg.panelG, gDuCfg.panelB)
+    duMakeDrawable(p0, 1200.0, gDuCfg.panelLine * 1.6)
+    panel.add p0
+    reused = true
+  else:
+    duHide(gDuProbe)
+  for i in (if reused: 1 else: 0) ..< nPanel:
+    var lab = duCloneLabel(anchor, rootGo)
     if lab.tmp == nil:
       break
     duStyle(lab, gDuCfg.panelFont, gDuCfg.panelR, gDuCfg.panelG, gDuCfg.panelB)
     duMakeDrawable(lab, 1200.0, gDuCfg.panelLine * 1.6)
+    # Born hidden. A fresh clone still carries the DONOR'S caption and the
+    # DONOR'S position, and the update pass only ever touches the labels it
+    # actually uses -- so anything not hidden here is a stray label sitting in
+    # the middle of the screen reading "1.1.0.1.4677 | PvE".
+    duHide(lab)
     panel.add lab
   var marks: seq[DuLabel] = @[]
   for i in 0 ..< nMark:
-    let lab = duCloneLabel(anchor, rootGo)
+    var lab = duCloneLabel(anchor, rootGo)
     if lab.tmp == nil:
       break
     duStyle(lab, gDuCfg.espFont, gDuCfg.espR, gDuCfg.espG, gDuCfg.espB)
     duMakeDrawable(lab, 400.0, gDuCfg.espFont * 1.6)
+    # Markers especially: with ESP off, or in the menu where there are no bots,
+    # `duUpdateMarkers` never assigns them, so an unhidden marker is visible
+    # forever showing the donor's text. Every one of the 24 was doing that.
+    duHide(lab)
     marks.add lab
   if panel.len == 0 and marks.len == 0:
     gDuBuildFailed = true
@@ -1521,31 +1681,28 @@ proc duBuild(preloader: Il2CppPtr): bool =
       if s > 0.01 and s < 100.0:
         gDuCanvasScale = s
   duDiagDump(anchor)
-  # The CANVAS VERDICT. This is the line to read next run. A clone that landed
-  # on the SAME canvas pointer as the source is sharing the source's
-  # screen-space-overlay canvas -- one render pass for all of them. A clone with
-  # its OWN canvas pointer and renderMode=2 is the world-space regression that
-  # made 33 labels cost 33 render passes.
-  let srcCv = duReadPtrField(anchor, cDuOffTmpGCanvas())
-  let cloneCv = (if panel.len > 0: duReadPtrField(panel[0].tmp, cDuOffTmpGCanvas())
-                 elif marks.len > 0: duReadPtrField(marks[0].tmp, cDuOffTmpGCanvas())
-                 else: nil)
+  # PLACEMENT READ-BACK. The clone starts life at the source's anchoredPosition,
+  # which on a centre-pivot parent is the middle of the screen -- that is what
+  # the user saw. So place panel line 0 for real and then ASK where it ended up,
+  # rather than assuming the write took. Intended vs actual, side by side.
+  if gDuPanel.len > 0:
+    let wantX = gDuCfg.panelX
+    let wantY = gDuCfg.panelY
+    duPlace(gDuPanel[0], gDuCfg.panelAnchor, wantX, wantY)
+    okLog "debugui: placement check, panel line 0 -- anchor='" &
+          gDuCfg.panelAnchor & "' intended anchoredPos=(" & duFmt1(wantX) &
+          "," & duFmt1(wantY) & ") actual=" &
+          duDescribeVec2(DuGetAnchoredPos, gDuPanel[0].rect) &
+          " anchorMin=" & duDescribeVec2(DuGetAnchorMin, gDuPanel[0].rect) &
+          " pivot=" & duDescribeVec2(DuGetPivot, gDuPanel[0].rect) &
+          " parentRect=[" & duDescribeRect(gDuParentRect) & "]"
   okLog "debugui: parent route = " & gDuParentRoute &
         "; parentRect=[" & duDescribeRect(gDuParentRect) & "]" &
-        "; source canvas=0x" & hexOf(cast[uint64](srcCv)) &
-        " renderMode=" & duDescribeInt(DuCanvasMode, srcCv) &
-        "; clone canvas=0x" & hexOf(cast[uint64](cloneCv)) &
-        " renderMode=" & duDescribeInt(DuCanvasMode, cloneCv) &
-        " scaleFactor=" & duDescribeScale(cloneCv) &
-        (if cloneCv != nil and cloneCv == srcCv:
-           " -- SHARED with the source (correct: one render pass)"
-         else:
-           " -- NOT the source's canvas; the clones are on a canvas of their " &
-           "own, which is the world-space regression. Expect cost.")
+        "; canvas 0x" & hexOf(cast[uint64](srcCv0)) &
+        " shared by the source and every clone (asserted before building)"
   okLog "debugui: built " & $panel.len & " panel line(s) and " & $marks.len &
-        " marker label(s) by cloning the client's own version label " &
-        "(Object::Instantiate + SetParentAndAlign under " & gDuParentRoute &
-        "); layout from " & gDuCfg.source
+        " marker label(s), all born hidden and none a raycast target; layout " &
+        "from " & gDuCfg.source
   return true
 
 proc duHideAll() =

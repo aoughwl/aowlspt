@@ -275,28 +275,179 @@ proc swBuildHostPage(): SwPage =
 # The renderer
 # ---------------------------------------------------------------------------
 
-proc swTabGameObject(tabPtr: Il2CppPtr; why: var string): Il2CppPtr =
-  ## The tab's own GameObject, reached without reflection: `SettingsTab` derives
-  ## from `UIInputNode`, which holds `_rectTransform` at +0x78 (a plain managed
-  ## reference, so a raw read reaches it), and a RectTransform is a Component,
-  ## so `Component::get_gameObject` -- the call `invoke2` STEP 1 proved -- turns
-  ## it into the GameObject a clone can be parented under.
+proc swFirstControl(tabPtr: Il2CppPtr): Il2CppPtr =
+  ## The first readable control on the tab, or nil. This is the object the rest
+  ## of the renderer navigates from, and it is the one thing on this screen the
+  ## host has PROVEN it can reach: the Phase-1.8 probe walked 25-33 of these per
+  ## tab and decoded every label off them.
+  result = nil
+  if tabPtr == nil or cIsReadable(tabPtr, cSuiOffCreatedCtrls() + 8'i32) == 0'i32:
+    return
+  let lst = cReadPtrAt(tabPtr, cSuiOffCreatedCtrls())
+  if lst == nil or cIsReadable(lst, cSuiOffListSize() + 4'i32) == 0'i32:
+    return
+  let arr = cReadPtrAt(lst, cSuiOffListItems())
+  let size = cReadI32At(suiPtrAdd(lst, cSuiOffListSize()))
+  if arr == nil or size <= 0'i32:
+    return
+  let n = (if size > int32(cSuiMaxControls): int32(cSuiMaxControls) else: size)
+  for i in 0 ..< int(n):
+    let slot = suiPtrAdd(arr, cSuiOffArrElems() + int32(i) * 8'i32)
+    if cIsReadable(slot, 8'i32) == 0'i32:
+      continue
+    let control = cReadPtrAt(slot, 0'i32)
+    if control != nil and cIsReadable(control, cSuiOffCtrlValue() + 8'i32) != 0'i32:
+      return control
+
+proc swRowContainerGo(tabPtr: Il2CppPtr; why: var string): Il2CppPtr =
+  ## The GameObject a NEW ROW must be parented under: the container the tab's
+  ## existing rows are children of.
+  ##
+  ## WHY NOT `_rectTransform`@0x78. That was the previous route and it is dead:
+  ## live, on the real screen, it reads null/unreadable, so Phase 3 declined
+  ## every time and nothing could ever be rendered. Rather than keep re-guessing
+  ## an offset, this walks from an object the host has ALREADY VERIFIED it can
+  ## reach and read -- a live SettingControl out of `_createdControls`@0x88,
+  ## the list the probe decodes 25-33 correct labels from on every tab.
+  ##
+  ##   control (a MonoBehaviour, hence a Component)
+  ##     -> Component::get_gameObject   -> the row's GameObject
+  ##     -> GameObject::get_transform   -> the row's Transform
+  ##     -> Transform::get_parent       -> the CONTAINER the rows live in
+  ##     -> Component::get_gameObject   -> what SetParentAndAlign wants
+  ##
+  ## Being the parent of a real row is what makes this the right answer rather
+  ## than a plausible one: a new child of that container is a SIBLING of the
+  ## stock rows, so the tab's own layout group positions it exactly as it
+  ## positions everything else, and it inherits the same canvas by construction.
+  ## This is the identical lesson the debug overlay learned the hard way -- reach
+  ## a container by walking from a verified live object, never by an offset that
+  ## can read null.
+  ##
+  ## Every hop names itself and its pointer on failure. A silent decline here is
+  ## what cost three cycles.
   result = nil
   why = ""
-  if tabPtr == nil or cIsReadable(tabPtr, 0x78'i32 + 8'i32) == 0'i32:
-    why = "the tab is not readable at _rectTransform (+0x78)"
-    return
-  let rect = cReadPtrAt(tabPtr, 0x78'i32)
-  if rect == nil or cIsReadable(rect, 0x18'i32) == 0'i32:
-    why = "_rectTransform (+0x78) is null or unreadable"
+  let control = swFirstControl(tabPtr)
+  if control == nil:
+    why = "the tab has no readable control in _createdControls (+0x" &
+          hexOf(uint64(cSuiOffCreatedCtrls())) & ") to navigate from"
     return
   let fnGo = mi2Fn(Mi2GetGameObject)
-  if fnGo == nil:
-    why = "UnityEngine.Component::get_gameObject did not verify on this build"
+  let fnTr = mi2Fn(Mi2GoGetTransform)
+  let fnPar = cDuFn(DuGetParent)
+  if fnGo == nil or fnTr == nil or fnPar == nil:
+    why = "a navigation target did not verify on this build (get_gameObject=" &
+          (if fnGo != nil: "OK" else: "REJECTED") & " get_transform=" &
+          (if fnTr != nil: "OK" else: "REJECTED") & " get_parent=" &
+          (if fnPar != nil: "OK" else: "REJECTED") & ")"
     return
-  result = cMi2CallPP(fnGo, rect)
-  if result == nil:
-    why = "Component::get_gameObject returned null for the tab's RectTransform"
+  let rowGo = cMi2CallPP(fnGo, control)
+  if rowGo == nil or cIsReadable(rowGo, 0x20'i32) == 0'i32:
+    why = "Component::get_gameObject(control=0x" &
+          hexOf(cast[uint64](control)) & ") gave 0x" &
+          hexOf(cast[uint64](rowGo)) & ", which is not readable"
+    return
+  let rowT = cMi2CallPP(fnTr, rowGo)
+  if rowT == nil or cIsReadable(rowT, 0x20'i32) == 0'i32:
+    why = "GameObject::get_transform(rowGo=0x" & hexOf(cast[uint64](rowGo)) &
+          ") gave 0x" & hexOf(cast[uint64](rowT)) & ", which is not readable"
+    return
+  let contT = cDuCallPP(fnPar, rowT)
+  if contT == nil or cIsReadable(contT, 0x20'i32) == 0'i32:
+    why = "Transform::get_parent(rowT=0x" & hexOf(cast[uint64](rowT)) &
+          ") gave 0x" & hexOf(cast[uint64](contT)) &
+          " -- the row appears to have no parent, which cannot be right"
+    return
+  let contGo = cMi2CallPP(fnGo, contT)
+  if contGo == nil or cIsReadable(contGo, 0x20'i32) == 0'i32:
+    why = "Component::get_gameObject(containerT=0x" &
+          hexOf(cast[uint64](contT)) & ") gave 0x" &
+          hexOf(cast[uint64](contGo)) & ", which is not readable"
+    return
+  okLog "settings pages: row container reached by walking from a live control" &
+        " -- control=0x" & hexOf(cast[uint64](control)) &
+        " rowGo=0x" & hexOf(cast[uint64](rowGo)) &
+        " rowT=0x" & hexOf(cast[uint64](rowT)) &
+        " containerT=0x" & hexOf(cast[uint64](contT)) &
+        " containerGo=0x" & hexOf(cast[uint64](contGo)) &
+        ". New rows become siblings of the stock rows, so the tab's own " &
+        "layout group places them."
+  result = contGo
+
+proc swAnyDonor(tabPtr: Il2CppPtr; kind: var string): Il2CppPtr =
+  ## A donor row when the klass census could not name a toggle.
+  ##
+  ## The census learns 'toggle' by matching the stock English label
+  ## 'Enable VoIP'. On a client whose language is not English -- or on any build
+  ## where that row moves or is renamed -- it never learns, `gSwKlassToggle`
+  ## stays 0, and Phase 3 declined with `toggleKlass=0x0`. Refusing to draw
+  ## anything because one label did not match is a worse answer than drawing a
+  ## row cloned from whatever the tab actually has: a row is a row, we relabel
+  ## it ourselves, and a row we cannot BIND is still honestly marked as such.
+  ##
+  ## So: prefer the learned toggle; otherwise take the most common klass on the
+  ## tab (settings tabs are mostly toggles and sliders, so the mode is a real
+  ## row and not an oddity); otherwise the first control there is.
+  result = nil
+  kind = "none"
+  let byKlass = swFindDonor(tabPtr, gSwKlassToggle)
+  if byKlass != nil:
+    kind = "learned toggle klass 0x" & hexOf(gSwKlassToggle)
+    return byKlass
+  # The most common klass on the tab.
+  #
+  # Counted by a plain double loop over the control list rather than with a
+  # scratch table: nimony insists a local be provably initialised before it is
+  # read, an `array` of counters is not, and the list is capped at
+  # `cSuiMaxControls` anyway -- so the quadratic version is both simpler and
+  # bounded by a number the probe has already measured (25-33 in practice).
+  var best = 0'u64
+  var bestN = 0
+  let lst = (if tabPtr != nil and
+                cIsReadable(tabPtr, cSuiOffCreatedCtrls() + 8'i32) != 0'i32:
+               cReadPtrAt(tabPtr, cSuiOffCreatedCtrls())
+             else: nil)
+  if lst != nil and cIsReadable(lst, cSuiOffListSize() + 4'i32) != 0'i32:
+    let arr = cReadPtrAt(lst, cSuiOffListItems())
+    let size = cReadI32At(suiPtrAdd(lst, cSuiOffListSize()))
+    if arr != nil and size > 0'i32:
+      let n = int(if size > int32(cSuiMaxControls): int32(cSuiMaxControls)
+                  else: size)
+      for i in 0 ..< n:
+        let si = suiPtrAdd(arr, cSuiOffArrElems() + int32(i) * 8'i32)
+        if cIsReadable(si, 8'i32) == 0'i32:
+          continue
+        let ci = cReadPtrAt(si, 0'i32)
+        if ci == nil or cIsReadable(ci, cSuiOffCtrlValue() + 8'i32) == 0'i32:
+          continue
+        let k = cast[uint64](cReadPtrAt(ci, 0'i32))
+        if k == 0'u64:
+          continue
+        var cnt = 0
+        for j in 0 ..< n:
+          let sj = suiPtrAdd(arr, cSuiOffArrElems() + int32(j) * 8'i32)
+          if cIsReadable(sj, 8'i32) == 0'i32:
+            continue
+          let cj = cReadPtrAt(sj, 0'i32)
+          if cj == nil or cIsReadable(cj, cSuiOffCtrlValue() + 8'i32) == 0'i32:
+            continue
+          if cast[uint64](cReadPtrAt(cj, 0'i32)) == k:
+            cnt = cnt + 1
+        if cnt > bestN:
+          bestN = cnt
+          best = k
+  if best != 0'u64:
+    let byMode = swFindDonor(tabPtr, best)
+    if byMode != nil:
+      kind = "most common klass 0x" & hexOf(best) & " (" & $bestN &
+             " row(s) of it on this tab; the toggle klass was never learned, " &
+             "so the donor is chosen by shape rather than by name)"
+      return byMode
+  let any = swFirstControl(tabPtr)
+  if any != nil:
+    kind = "the first readable control on the tab (no klass census at all)"
+    return any
 
 proc swFindDonor(tabPtr: Il2CppPtr; wantKlass: uint64): Il2CppPtr =
   ## The first control on this tab whose klass is `wantKlass` -- the row we will
@@ -343,12 +494,23 @@ proc swCloneRow(donor, parentGo: Il2CppPtr; text: string): Il2CppPtr =
   # Into the hierarchy. Without a parent under the Canvas a cloned UI object
   # exists but is not drawn, so this is not cosmetic.
   let fnGo = mi2Fn(Mi2GetGameObject)
-  if fnGo != nil and parentGo != nil:
+  if fnGo == nil or parentGo == nil:
+    warn "settings pages: row '" & text & "' has no parent to go under " &
+         "(get_gameObject=" & (if fnGo != nil: "OK" else: "REJECTED") &
+         " parentGo=0x" & hexOf(cast[uint64](parentGo)) &
+         "); the clone is left unparented and is NOT drawn"
+  else:
     let cloneGo = cMi2CallPP(fnGo, clone)
-    if cloneGo != nil:
+    if cloneGo == nil:
+      warn "settings pages: Component::get_gameObject on the clone for row '" &
+           text & "' returned null; it cannot be parented or shown"
+    else:
       let fnPar = mi2Fn(Mi2SetParentAlign)
       if fnPar != nil:
         cMi2CallVS2(fnPar, cloneGo, parentGo)
+      else:
+        warn "settings pages: TMP_DefaultControls::SetParentAndAlign did not " &
+             "verify on this build; row '" & text & "' cannot be placed"
       let fnAct = mi2Fn(Mi2GoSetActive)
       if fnAct != nil:
         cMi2CallVPB(fnAct, cloneGo, 1'i32)
@@ -396,14 +558,17 @@ proc swRenderPage(tabPtr, parentGo: Il2CppPtr; page: var SwPage): int =
   ## its heading and its note and stops -- which is the point of `stub`: the
   ## player sees the page exists and is told plainly that it does nothing yet.
   result = 0
-  let donorToggle = swFindDonor(tabPtr, gSwKlassToggle)
+  var donorKind = ""
+  let donorToggle = swAnyDonor(tabPtr, donorKind)
   if donorToggle == nil:
-    okLog "settings pages: page '" & page.id & "' needs a toggle to copy and " &
-          "this tab has none (klass " &
-          (if gSwKlassToggle == 0'u64: "not learned yet this session"
-           else: "learned, but absent here") &
-          "); nothing rendered"
+    warn "settings pages: DECLINED -- page '" & page.id & "' has no row on " &
+         "this tab to clone at all (tabPtr=0x" & hexOf(cast[uint64](tabPtr)) &
+         ", learned toggle klass=0x" & hexOf(gSwKlassToggle) &
+         "); nothing rendered and nothing written"
     return
+  okLog "settings pages: page '" & page.id & "' donor=0x" &
+        hexOf(cast[uint64](donorToggle)) & " chosen by " & donorKind &
+        "; parent=0x" & hexOf(cast[uint64](parentGo))
   # The heading, cloned from the same donor so it inherits the row styling. It
   # is a toggle underneath, which is not ideal and IS honest: there is no label
   # widget to clone on a settings tab that we can identify without reflection.
@@ -473,7 +638,7 @@ proc swPagesOnTabBuilt(tabPtr: Il2CppPtr; tabName: string; revisit: bool) =
             " on=" & (if gSwPagesOn: "true" else: "false") &
             " off=" & (if gSwOff: "true" else: "false") &
             " pages=" & $gSwPages.len &
-            " toggleKlass=0x" & hexOf(gSwKlassToggle)
+            " toggleKlass(before census)=0x" & hexOf(gSwKlassToggle)
   if gSwOff:
     if gSwPagesOn and gSwPagesFires <= 8:
       okLog "settings pages: DECLINED -- the Phase-2/3 fault budget is spent " &
@@ -495,6 +660,15 @@ proc swPagesOnTabBuilt(tabPtr: Il2CppPtr; tabName: string; revisit: bool) =
   # Probe`/`settingsBindProbe` for its klass pointers without saying so, which
   # meant `settingsPages` alone could only ever decline.
   swLearnTabKlasses(tabPtr)
+  if gSwPagesFires <= 8:
+    okLog "settings pages: after the census on this same tab visit -- " &
+          "toggle=0x" & hexOf(gSwKlassToggle) &
+          " float=0x" & hexOf(gSwKlassFloat) &
+          " dropdown=0x" & hexOf(gSwKlassDropdown) &
+          " select=0x" & hexOf(gSwKlassSelect) &
+          ". A zero here means the stock anchor label for that type was not " &
+          "found on this tab (a non-English client will do that), which is why " &
+          "the donor is no longer required to be a learned toggle."
   # The registry is rebuilt from the config each time the tab is opened, so the
   # rows show what the file currently says.
   if gSwPages.len == 0:
@@ -530,9 +704,9 @@ proc swPagesOnTabBuilt(tabPtr: Il2CppPtr; tabName: string; revisit: bool) =
       okLog "settings pages: page '" & gSwPages[i].id & "' lost its clones " &
             "(the tab was rebuilt under it); re-rendering"
     var why = ""
-    let parentGo = swTabGameObject(tabPtr, why)
+    let parentGo = swRowContainerGo(tabPtr, why)
     if parentGo == nil:
-      warn "settings pages: DECLINED -- could not reach the tab's GameObject (" &
+      warn "settings pages: DECLINED -- could not reach the row container (" &
            why & "); page '" & gSwPages[i].id &
            "' is not rendered (nothing was written)"
       i = i + 1
