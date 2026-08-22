@@ -198,6 +198,21 @@ var gInspFiredLogged = false
 var gInspWaitBatch = -1
   ## The batch we have already explained is waiting for the detour to start
   ## ticking, so that explanation is given once per batch and not every poll.
+var gInspInFlight = -1
+  ## The batch currently being executed on the Unity thread, or -1. If this is
+  ## still set when the rider is next entered, the previous run did NOT return
+  ## normally -- it escaped between here and the completion handshake. That is
+  ## the only way to notice an escape at all, since an escape by definition
+  ## skips whatever line was meant to record it.
+var gInspEscapes = 0
+var gInspPhase = 0
+  ## Which part of the batch is executing: 0 idle, 1 anchor refresh,
+  ## 2 a command, 3 the completion handshake. Reported when a batch escapes,
+  ## so the recovery names the phase that escaped instead of guessing.
+var gInspBodyMode = 0
+  ## What the ONE guarded body should do this call: 0 run the current command,
+  ## 1 refresh the anchors. The guard carries a single pointer, so the selector
+  ## goes in a global -- the same pattern the command index already uses.
 var gInspBatch = 0
 var gInspBatchDone = -1      ## last batch Unity finished; the tick thread's cue
 
@@ -1443,7 +1458,14 @@ proc cInspGuarded(a: Il2CppPtr): Il2CppPtr {.
 
 proc inspBody(a: Il2CppPtr): Il2CppPtr {.
     exportc: "aowl_insp_body", cdecl.} =
-  iExec(gInspCmds[gInspCurIdx])
+  ## STILL ONE `aowl_p_p_seh` PER ENTRY, AND STILL NEVER NESTED. The anchor
+  ## refresh is dispatched through this same single body rather than getting a
+  ## guard of its own precisely so that rule keeps holding: only one of the two
+  ## branches runs per guarded call, and neither branch enters the guard again.
+  if gInspBodyMode == 1:
+    iRefreshAnchors()
+  else:
+    iExec(gInspCmds[gInspCurIdx])
   result = cast[Il2CppPtr](1)
 
 # ---------------------------------------------------------------------------
@@ -1453,11 +1475,31 @@ proc inspRunBatch() =
   gInspOut = @[]
   gInspOutBytes = 0
   gInspAllowWrite = false
-  iRefreshAnchors()
+  # THE ANCHOR REFRESH IS NOW GUARDED. It was not, and it sits between "the
+  # rider observed a pending batch" and "the rider cleared the pending flag" --
+  # so anything that escaped here left the flag set forever, produced no
+  # breadcrumb (only the per-command guard writes one), incremented no fault
+  # counter and tripped no self-disable. That is exactly the silent 537-times
+  # stall that was observed: dispatched, saw the batch, never finished it, said
+  # nothing. It reads live IL2CPP object fields off pointers cached from
+  # earlier frames, which is precisely the class of thing that needs a guard.
+  gInspPhase = 1
+  gInspBodyMode = 1
+  iMark("anchor refresh (start of batch)", gInspPreloader)
+  let anchorsOk = cInspGuarded(cast[Il2CppPtr](0)) != nil
+  gInspBodyMode = 0
   iOut("aowlspt live inspector -- batch " & $gInspBatch & ", " &
        $gInspCmds.len & " command(s), on Unity thread " & $int(cThreadId()))
+  if not anchorsOk:
+    inc gInspFaults
+    iOut("  !! the anchor refresh FAULTED (caught; the game survived). " &
+         "LAST HOP: " & readCString(cInspCrumb()) & "  at " &
+         iPtr(cInspCrumbPtr()))
+    iOut("  !! anchors may be stale or missing for this batch; the commands " &
+         "below still ran")
   var i = 0
   while i < gInspCmds.len:
+    gInspPhase = 2
     gInspCurIdx = i
     iMark(("start of command: " & gInspCmds[i]), cast[Il2CppPtr](0))
     if cInspGuarded(cast[Il2CppPtr](0)) == nil:
@@ -1485,14 +1527,55 @@ proc inspTick() =
   ## discipline `mainDrain` follows.
   if gInspOff:
     return
+  # ESCAPE RECOVERY. If a batch is still marked in-flight when the rider is
+  # next entered, the previous run did not return normally -- it left through
+  # a longjmp, taking the completion handshake with it. An escape cannot log
+  # itself, by definition, so it is detected here on the following frame and
+  # reported then. Without this the channel simply stops, which is what it did.
+  if gInspInFlight >= 0:
+    let escaped = gInspInFlight
+    let phase = gInspPhase
+    gInspInFlight = -1
+    gInspPhase = 0
+    gInspBodyMode = 0
+    inc gInspEscapes
+    iOut("  !! batch " & $escaped & " ESCAPED its guard during " &
+         (if phase == 1: "the anchor refresh"
+          elif phase == 2: "command " & $(gInspCurIdx + 1) &
+                           " (" & gInspCmds[gInspCurIdx] & ")"
+          else: "the completion handshake") &
+         " -- it did not return normally. LAST HOP: " &
+         readCString(cInspCrumb()) & "  at " & iPtr(cInspCrumbPtr()))
+    iOut("  !! the channel has been recovered; whatever ran before the escape " &
+         "is above. Escapes this session: " & $gInspEscapes)
+    cInspLock()
+    gInspBatchDone = escaped
+    cInspUnlock()
+    if gInspEscapes >= InspMaxFaults:
+      gInspOff = true
+      iOut("  !! too many escapes; the live inspector is now OFF for this " &
+           "session. Restart the client to re-arm it.")
+    return
   if cInspHave() == 0'i32:
     return
   inc gInspTicks
+  # CONSUME THE FLAG BEFORE RUNNING, NOT AFTER.
+  #
+  # The flag used to be cleared on the line AFTER `inspRunBatch()`, so anything
+  # that escaped the batch skipped the clear and left the channel wedged at
+  # pending=1 for the rest of the session -- every later edit to the command
+  # file ignored, with no explanation. Claiming the batch first makes that
+  # impossible: once the rider has taken a batch, the flag is down whatever
+  # happens next, and a failure costs one batch instead of the channel.
+  cInspSetPending(0'i32)
+  gInspInFlight = gInspBatch
   inspRunBatch()
+  gInspPhase = 3
+  gInspInFlight = -1
+  gInspPhase = 0
   cInspLock()
   gInspBatchDone = gInspBatch
   cInspUnlock()
-  cInspSetPending(0'i32)
 
 proc inspectFired(regs: Il2CppPtr) =
   ## The rider on `EFT.UI.PreloaderUI::Update`, dispatched by slot identity from
@@ -1629,10 +1712,22 @@ proc inspectPoll(now: uint64) =
              $gInspFires & " time(s) but the pending flag read 0 every time, " &
              "so the HANDOFF is what is broken, not the detour and not the " &
              "dispatch.")
+      elif gInspFaults > 0 or gInspEscapes > 0:
+        iOut("  DIAGNOSIS: the rider saw the batch and did not complete it, " &
+             "and there IS recorded evidence of why: " & $gInspFaults &
+             " caught fault(s) and " & $gInspEscapes & " guard escape(s) " &
+             "this session. The last hop attempted is above.")
       else:
-        iOut("  DIAGNOSIS: the rider ran and saw a batch, but did not " &
-             "complete it -- suspect a fault that escaped the per-command " &
-             "guard. The last hop attempted is in the host log.")
+        # NO EVIDENCE MEANS NO ACCUSATION. The previous text asserted "suspect
+        # a fault that escaped the per-command guard" whenever it got this far,
+        # while self-disabled was false and no breadcrumb existed anywhere --
+        # a confident wrong answer that cost a full cycle. State only what was
+        # actually measured.
+        iOut("  DIAGNOSIS: the rider saw the batch and DECLINED before " &
+             "executing it. No fault and no guard escape was recorded, so " &
+             "this is not a crash being swallowed -- some gate between the " &
+             "pending check and execution returned early. Every such gate " &
+             "logs its reason; look for a 'declined' line above.")
       inspWriteOut()
       cInspLock()
       gInspOut = @[]
@@ -1656,6 +1751,12 @@ proc inspectPoll(now: uint64) =
       break
     cmds.add lines[i]
   if cmds.len == 0:
+    # NOT SILENT. The file changed, so the user did something and is waiting
+    # for an answer; "every line was blank or a #comment" is that answer.
+    # `#`-prefixed serial lines are skipped by design, so a file containing
+    # ONLY a bumped serial lands here and would otherwise look like a hang.
+    info "live inspector: the command file changed but parsed to 0 commands " &
+         "(every line was blank or a #comment). Nothing was queued."
     return
   inc gInspBatch
   cInspLock()
