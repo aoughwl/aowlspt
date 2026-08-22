@@ -256,6 +256,7 @@ proc swBuildHostPage(): SwPage =
   rows.add swRow("debugEsp", "In-world AI markers", readBoolKey("debugEsp"), false)
   rows.add swRow("botDiag", "Bot registration logging", readBoolKey("botDiag"), false)
   rows.add swRow("unlimitedBots", "Lift the bot cap", readBoolKey("unlimitedBots"), false)
+  rows.add swRow("botNav", "Bot navigation API", readBoolKey("botNav"), false)
   rows.add swRow("botAiActivate", "Bot AI activation rescue", readBoolKey("botAiActivate"), false)
   rows.add swRow("osCloseFix", "OS window-close fix", readBoolKey("osCloseFix"), false)
   rows.add swRow("uxVersionBrand", "Brand the version label", readBoolKey("uxVersionBrand"), false)

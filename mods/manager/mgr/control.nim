@@ -518,6 +518,69 @@ proc menuModeText*(): string =
     return gMenuModeOverride
   result = gMenuNickname
 
+var gBotNavSpec = ""
+
+proc botNavSpec*(): string = gBotNavSpec
+  ## What `routeClient` reports as `botNav`. Empty means "no commands", and the
+  ## host then leaves every bot to its own brain -- which is the right answer
+  ## before any mod has asked for anything.
+
+proc botNavSane(s: string): bool =
+  ## The same shape the host's `parseBotNav` will accept. Checked HERE too,
+  ## rather than trusting the far end to reject it: a value that cannot survive
+  ## the trip should be refused at the point a mod author can still be told about
+  ## it, and a manager that published rubbish the host silently dropped would
+  ## look exactly like a manager that was working.
+  if s.len > 512:
+    return false
+  for ch in s:
+    let o = ord(ch)
+    let okCh = (o >= ord('0') and o <= ord('9')) or
+               (o >= ord('a') and o <= ord('z')) or
+               ch == '|' or ch == ';' or ch == ',' or ch == '.' or
+               ch == '-' or ch == '+' or ch == ' '
+    if not okCh:
+      return false
+  result = true
+
+proc onBotNav(payload: string): string =
+  ## `aowlspt.bot.nav` -- `{"spec":"..."}`. An empty or absent `spec` clears the
+  ## command set, which is how a mod says "stop steering, hand the bots back".
+  ##
+  ## Last writer wins, deliberately: this is a command *set*, not a queue. Two
+  ## mods both steering the same bot would fight whatever the merge rule was, and
+  ## a rule that silently interleaved them would make that fight invisible.
+  let t = field(payload, "spec").asText("")
+  if t.len == 0:
+    gBotNavSpec = ""
+  elif botNavSane(t):
+    gBotNavSpec = t
+  result = ""
+
+var gCensusEmitted = -1
+
+proc emitBotCensusIfChanged*(count: int; census: string) =
+  ## Push the client host's bot registry onto the event bus as
+  ## `aowlspt.bot.census` -- `{"count":<n>,"census":"..."}` -- whenever a new one
+  ## has arrived, and never otherwise.
+  ##
+  ## Push rather than pull because the bus has no request/response: `broadcast`
+  ## returns a `Status`, not a reply, so a mod cannot ask for the census and a
+  ## mod that could would be polling a value that only changes when a poll
+  ## brings it. Pushing on change is the same information with none of the
+  ## spinning.
+  ##
+  ## Called OUTSIDE the mod lock, deliberately: a subscriber's handler runs on
+  ## this thread, and emitting under the lock would let any mod's census handler
+  ## deadlock the manager's client route.
+  if count == gCensusEmitted:
+    return
+  gCensusEmitted = count
+  var o = obj()
+  put(o, "count", count)
+  put(o, "census", census)
+  discard broadcast("aowlspt.bot.census", o)
+
 proc menuTextSane(s: string): bool =
   ## The same shape the host's `parseMenuModeText` will accept. Checked HERE too,
   ## rather than trusting the far end to reject it: a value that cannot survive
@@ -567,6 +630,10 @@ proc controlInit*(probeMs: int) =
   # tarkov emulator naming the character that just logged in, which is the
   # default when no mod has overridden anything.
   discard onEvent("aowlspt.menu.modeText", onMenuModeText)
+  # Bot navigation commands from a mod (see `aowl/src/aowlspt/botnav.nim`). The
+  # manager holds the set and republishes it on every client poll; the host
+  # applies it on the Unity thread inside its guarded per-bot tick.
+  discard onEvent("aowlspt.bot.nav", onBotNav)
   discard onEvent("aowlspt.menu.nickname", onMenuNickname)
 
   var probe = obj()

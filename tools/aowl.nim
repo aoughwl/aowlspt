@@ -2352,6 +2352,19 @@ proc cmdPayload(e: Env): int =
       "game state, renders, or affects gameplay. Default false.\",\n" &
       "  \"botDiag\": false,\n" &
       "\n" &
+      "  \"//botNav\": \"Native bot navigation API. When true, a detour on " &
+      "EFT.BotOwner.UpdateManual (once per live bot per frame) keeps a live bot " &
+      "registry -- id, role, difficulty, position, alive-state -- and services " &
+      "nav commands sent by a mod over the existing modSyncMs poll ('bot 7, go " &
+      "to x,y,z'). A command is a direct call to EFT.BotOwner.GoToPoint, whose " &
+      "return value says whether the point was reachable. UNLIKE botDiag this " &
+      "CALLS INTO and WRITES TO game objects: every pointer the callee would " &
+      "dereference is VirtualQuery-walked first, the whole tick runs under the " &
+      "VEH/SEH guard, commands are re-issued on a 500ms throttle rather than " &
+      "per frame, and the feature self-disables after 8 trapped faults. " &
+      "Default false.\",\n" &
+      "  \"botNav\": false,\n" &
+      "\n" &
       "  \"//uxMenuModeText\": \"When true, the main menu's BOTTOM-RIGHT " &
       "corner label (stock: 'PVE ZONE') is set by the host instead. It " &
       "defaults to the logged-in character's name, and any mod can override " &

@@ -397,6 +397,26 @@ proc reportSession*(id: string) =
   ## outcome the manager holds for this host is stale and drops back to unknown.
   gRepSession = id
 
+var gRepBotNav = ""
+
+proc reportBotNav*(census: string) =
+  ## Publish the host's live bot registry so it goes out on the next poll.
+  ##
+  ## It rides `reportPath`'s query string for the same reason the mod outcomes
+  ## do: the client host has exactly one route to the backend, that route is
+  ## already being walked every `modSyncMs`, and riding it costs nothing that is
+  ## not already being spent -- the same request, a longer path. A second channel
+  ## would need an HTTP client, a socket and a thread inside a DLL injected into
+  ## a running game.
+  ##
+  ## The census is a STATE, not an event, so repeating it is free and losing one
+  ## costs nothing: the next poll carries the current truth. That is why there is
+  ## no sequence number and no ack here, unlike the mod outcome rows.
+  ##
+  ## Format (one record per live bot, `!`-separated), built in `botnav.nim`:
+  ##     id,role,difficulty,alive,x,y,z,lastNavStatus
+  gRepBotNav = census
+
 proc reportSeq*(): int = gRepSeq
   ## Bumped whenever any row changes and never otherwise, so a caller can tell
   ## "there is something new to say" from "say the same thing again".
@@ -485,7 +505,7 @@ proc urlSafe(s: string): string =
        (ch >= '0' and ch <= '9') or ch == '.' or ch == '-' or ch == '_':
       result.add ch
 
-proc reportPath*(base: string; budget: int = ReportMaxPath): string =
+proc reportRows(base: string; budget: int): string =
   ## `base`, with everything this host has to say about the mods the backend
   ## named appended as a query string -- and never longer than `budget`.
   ##
@@ -558,6 +578,37 @@ proc reportPath*(base: string; budget: int = ReportMaxPath): string =
   result = head & body
   if gRepTruncated:
     result = result & "&more=1"
+
+proc reportPath*(base: string; budget: int = ReportMaxPath): string =
+  ## The mod-outcome report (`reportRows`, unchanged), plus the live bot registry
+  ## when there is one.
+  ##
+  ## The two are appended independently and neither can starve the other: the
+  ## census is added only out of whatever budget the rows left, and it is dropped
+  ## whole rather than truncated, because half a coordinate list is worse than
+  ## none. A host with no botnav registry produces a path byte-for-byte identical
+  ## to the one the host before this produced, so an old manager reading the
+  ## route sees exactly what it saw.
+  result = reportRows(base, budget)
+  if gRepBotNav.len == 0:
+    return
+  # NOT `urlSafe`: that one drops everything outside `[A-Za-z0-9._-]`, which
+  # would silently eat the `,` and `!` separators and hand the manager a census
+  # that parses into nonsense. The census alphabet is fixed and already
+  # query-string-legal, so the encoder here keeps exactly that and drops the
+  # rest -- the same "drop rather than escape" rule, applied to a wider set.
+  var enc = ""
+  for ch in gRepBotNav:
+    if (ch >= 'a' and ch <= 'z') or (ch >= 'A' and ch <= 'Z') or
+       (ch >= '0' and ch <= '9') or ch == '.' or ch == '-' or ch == '_' or
+       ch == ',' or ch == '!' or ch == '+':
+      enc.add ch
+  if enc.len == 0:
+    return
+  let sep = (if result.contains('?'): "&" else: "?")
+  if result.len + sep.len + 3 + enc.len > budget:
+    return
+  result = result & sep & "bn=" & enc
 
 proc replyCapabilities() =
   # `reloadNeedsRestart` is answered from what the host can actually do rather
@@ -832,6 +883,54 @@ proc parseMenuModeText*(doc: string; into: var string): bool =
     return false
   for ch in v:
     if ord(ch) < 0x20 or ord(ch) > 0x7E:
+      return false
+  into = v
+  result = true
+
+const BotNavMax* = 512
+  ## The longest `botNav` command string the host will carry. Sixteen commands
+  ## of the documented grammar fit comfortably; anything longer is a mistake or a
+  ## mischief, and either way the answer is to refuse it rather than to hand a
+  ## long unvalidated string to a parser that runs beside a live game.
+
+proc parseBotNav*(doc: string; into: var string): bool =
+  ## Reads the backend's `botNav` out of a client-set poll response -- the bot
+  ## navigation command set the host should apply on its next bot tick.
+  ##
+  ## It rides the same body `parseDesired` validates and `parseInRaid` and
+  ## `parseMenuModeText` read, for the same reason: the client host has exactly
+  ## one route to the backend and adding a second would add a second thing that
+  ## can be down. A caller reads it only after `parseDesired` has accepted the
+  ## document.
+  ##
+  ## The value is a flat scalar, not a JSON array, precisely so that ALL of its
+  ## gating happens right here in one place -- length and charset -- before any
+  ## of it reaches the command parser, let alone a game pointer. The grammar is
+  ## documented on `bnParseCommands` in `host/Aowlspt.Host.Il2Cpp/botnav.nim`:
+  ##
+  ##     "7|213.5|1.4|-58.2|2.0|1|30000;all|stop"
+  ##
+  ## Returns false, leaving `into` untouched, for every unhappy case -- the field
+  ## absent (an older manager), over-long, or carrying a character with no
+  ## business in a coordinate list. An EMPTY value is accepted and means "no
+  ## commands", which is how a caller clears the set.
+  ##
+  ## Note the deliberate asymmetry with `parseMenuModeText`, which refuses empty:
+  ## a corner label has a stock value to fall back to, whereas "no commands" is a
+  ## real and necessary state for a command channel.
+  var raw = ""
+  if not pathGet(doc, "botNav", raw):
+    return false
+  let v = strip(raw)
+  if v.len > BotNavMax:
+    return false
+  for ch in v:
+    let o = ord(ch)
+    let okCh = (o >= ord('0') and o <= ord('9')) or
+               (o >= ord('a') and o <= ord('z')) or
+               ch == '|' or ch == ';' or ch == ',' or ch == '.' or
+               ch == '-' or ch == '+' or ch == ' '
+    if not okCh:
       return false
   into = v
   result = true

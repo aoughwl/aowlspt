@@ -157,6 +157,16 @@ var gMore = false
 var gReports = 0
 var gBarePolls = 0
 var gSessions = 0
+var gBotNavCensus = ""
+  ## The client host's live bot registry as of its last poll, verbatim:
+  ## `id,role,difficulty,alive,x,y,z,lastNavStatus` per bot, `!`-separated. Held
+  ## as the raw string rather than parsed into rows because every consumer so far
+  ## wants either the whole thing or one field of one bot, and a parse here would
+  ## be a second place for the format to drift.
+var gBotNavCensusAt = 0
+  ## How many censuses have arrived. A caller can tell "no bots in the raid"
+  ## (count > 0, census empty) from "no host has ever reported" (count == 0),
+  ## which are very different answers to "where are the bots".
 var gGuid: seq[string] = @[]
 var gWant: seq[bool] = @[]
 var gOut: seq[ClientOutcome] = @[]
@@ -360,6 +370,21 @@ proc ingestClientReport*(query: string): bool =
   ## the mods.
   ##
   ## Assumes the mod lock is held.
+
+  # The bot-navigation census is read FIRST, deliberately before the session
+  # gate below. It is a plain state -- "these bots are alive at these positions
+  # right now" -- with no sequence number, no rotation and nothing to
+  # acknowledge, so none of the session bookkeeping applies to it. It also has
+  # to survive the case that has no `hs` at all: a host with the nav API on but
+  # no mod-outcome rows to report appends `?bn=...` to the bare route, and
+  # reading it after the `hs` bail would silently throw away every census such a
+  # host ever sends. Losing one costs nothing anyway -- the next poll carries the
+  # current truth -- but losing all of them would make the feature look broken.
+  var census = ""
+  if queryValue(query, "bn", census):
+    gBotNavCensus = census
+    gBotNavCensusAt = gBotNavCensusAt + 1
+
   var hs = ""
   if not queryValue(query, "hs", hs) or not isHexId(hs):
     # A poll with no session, or with one that cannot be a session. Counted,
@@ -476,6 +501,8 @@ proc clientRows*(): int = gGuid.len
 proc clientReports*(): int = gReports
 proc clientBarePolls*(): int = gBarePolls
 proc clientSessions*(): int = gSessions
+proc clientBotNav*(): string = gBotNavCensus
+proc clientBotNavCount*(): int = gBotNavCensusAt
 
 proc clientReporting*(): bool = gSession.len > 0
   ## A client host has reported at least once in this manager's life. False is

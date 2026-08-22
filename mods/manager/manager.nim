@@ -1435,9 +1435,20 @@ proc routeClient(url, body, session: string): string =
     # label alone. A mod's `setMenuModeText` override wins over the logged-in
     # character's name; see mgr/control.nim. Older hosts ignore the field.
     put(out1, "menuModeText", menuModeText())
+    # Bot navigation commands for the client host's nav API, as a flat scalar
+    # ("7|213.5|1.4|-58.2|2|1|30000;all|stop"). Empty means "no commands" and
+    # the host leaves every bot to its own brain. A flat string rather than an
+    # array so the host can gate its length and charset in one place before its
+    # grammar ever sees it -- see `parseBotNav`. Older hosts ignore the field.
+    put(out1, "botNav", botNavSpec())
     # Last, always. This is the terminator the reader checks for.
     put(out1, "complete", true)
     text = done(out1).text
+  # OUTSIDE the lock, on purpose: this runs subscribers' handlers on this thread,
+  # and a mod's census handler running under the mod lock could deadlock the very
+  # route the client host depends on. It is also a no-op unless a new census
+  # actually arrived on this poll.
+  emitBotCensusIfChanged(clientBotNavCount(), clientBotNav())
   result = text
 
 proc routeClientReport(url, body, session: string): string =
@@ -1493,6 +1504,13 @@ proc routeClientReport(url, body, session: string): string =
     # problem.
     put(o, "silentPolls", clientBarePolls())
     put(o, "sessions", clientSessions())
+    # The client host's live bot registry, verbatim as it reported it:
+    # `id,role,difficulty,alive,x,y,z,lastNavStatus` per bot, `!`-separated.
+    # `botNavPolls` is 0 until a host with the nav API on has reported at least
+    # once, which is how a reader tells "no bots in the raid" from "no host has
+    # ever said anything about bots".
+    put(o, "botNav", clientBotNav())
+    put(o, "botNavPolls", clientBotNavCount())
     put(o, "mods", a)
     text = done(o).text
   result = text
