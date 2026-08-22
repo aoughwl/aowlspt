@@ -200,6 +200,73 @@ static const AowlNavTarget aowl_nav_targets[] = {
         0x48,0x83,0xEC,0x20,
         0x48,0x8B,0x05,0x07,0xFC,0xE2 }, 16 },
 
+    /* ---- SCENE ROOTS: breaking the reachability circle.
+     *
+     * Every search the inspector can do is limited to a hierarchy it already
+     * holds a pointer into. In the menu the only live anchor is a PreloaderUI
+     * object, so `find` could only ever walk the "Preloader UI" tree -- while
+     * the mode selector and the settings screen live under a DIFFERENT scene
+     * root that the host only learns once that screen has been opened. That is
+     * circular: you need to find the tile in order to open the thing that
+     * would have told you where the tile is. Enumerating scene roots is the
+     * only way out, and it is why this is the highest-value entry in the file.
+     *
+     * THE STRUCT-RETURN QUESTION, ANSWERED FROM THE DISASSEMBLY.
+     * `Scene` is a 4-byte struct (one int32 handle). The worry with any
+     * by-value struct return on Win64 is a hidden sret pointer in RCX with the
+     * real arguments shifted right, which would silently corrupt every call.
+     * That is NOT what happens here. `GetSceneAt` starts `40 53 / 48 83 EC 20
+     * / 80 3D .. 00 / 8B D9` -- `mov ebx, ecx` reads RCX as the INDEX, not as
+     * an sret pointer -- and ends `mov eax, [rsp+0x30] / ret`, returning the
+     * handle in EAX. The sret dance exists only INSIDE, for its own icall.
+     * So these are plain integer calls.
+     *
+     * The `*Internal(int handle)` forms are used for labelling because they
+     * take the handle BY VALUE in ECX -- no struct-`this` pointer to build and
+     * nothing to box. `GetRootGameObjects()` is the exception: it is an
+     * instance method whose `this` really is a POINTER to the 4-byte handle
+     * (its body begins by dereferencing RCX), so the handle goes in a C static
+     * and its address is passed. It is preferred over
+     * `GetRootGameObjectsInternal` anyway, because the Internal form demands a
+     * `List<GameObject>` in RDX that we would have to construct ourselves.
+     *
+     * It ALLOCATES (a List and an array) and runs class-init on first use, so
+     * it belongs in an on-demand command and never in a per-frame path. */
+    { "UnityEngine.SceneManagement.SceneManager::get_sceneCount", 0x52C4830u,
+      { 0x48,0x83,0xEC,0x28,
+        0x48,0x8B,0x05,0x05,0x07,0xE1,0x01,
+        0x48,0x85,0xC0,0x75,0x18 }, 16 },
+
+    { "UnityEngine.SceneManagement.SceneManager::GetSceneAt", 0x52C4A40u,
+      { 0x40,0x53,
+        0x48,0x83,0xEC,0x20,
+        0x80,0x3D,0xFE,0x04,0xE1,0x01,0x00,
+        0x8B,0xD9,0x75 }, 16 },
+
+    { "UnityEngine.SceneManagement.Scene::GetNameInternal", 0x52C3A90u,
+      { 0x40,0x53,
+        0x48,0x83,0xEC,0x20,
+        0x48,0x8B,0x05,0x53,0x14,0xE1,0x01,
+        0x8B,0xD9,0x48 }, 16 },
+
+    { "UnityEngine.SceneManagement.Scene::GetIsLoadedInternal", 0x52C3B40u,
+      { 0x40,0x53,
+        0x48,0x83,0xEC,0x20,
+        0x48,0x8B,0x05,0xB3,0x13,0xE1,0x01,
+        0x8B,0xD9,0x48 }, 16 },
+
+    { "UnityEngine.SceneManagement.Scene::GetRootCountInternal", 0x52C3BE0u,
+      { 0x40,0x53,
+        0x48,0x83,0xEC,0x20,
+        0x48,0x8B,0x05,0x23,0x13,0xE1,0x01,
+        0x8B,0xD9,0x48 }, 16 },
+
+    { "UnityEngine.SceneManagement.Scene::GetRootGameObjects", 0x52C3ED0u,
+      { 0x48,0x89,0x5C,0x24,0x10,
+        0x57,
+        0x48,0x83,0xEC,0x20,
+        0x80,0x3D,0x3F,0x10,0xE1,0x01 }, 16 },
+
     { "UnityEngine.Events.UnityEvent::Invoke", 0x52C34A0u,
       { 0x48,0x89,0x5C,0x24,0x18,
         0x48,0x89,0x6C,0x24,0x20,
@@ -377,6 +444,35 @@ static void* aowl_nav_type_object(void* klass) {
     aowl_nav_hop = AOWL_NAV_HOP_NONE;
     return ty;
 }
+
+/* ---- MANAGED ARRAY LAYOUT, corroborated by the runtime's OWN accessors.
+ *
+ * These are not assumptions. GameAssembly.dll exports functions whose entire
+ * body is the constant in question, read straight out of the image:
+ *
+ *   il2cpp_array_length                         @0x00F2C0  8B 41 18 C3
+ *                                               mov eax,[rcx+0x18]; ret
+ *   il2cpp_array_object_header_size             @0x5B3B20  B8 20 00 00 00 C3
+ *                                               return 0x20
+ *   il2cpp_offset_of_array_length_in_array_...  @0x5B3B30  B8 18 00 00 00 C3
+ *                                               return 0x18
+ *
+ * So: int32 length at +0x18, first element at +0x20, 8 bytes per element on
+ * x64. The runtime says so itself. */
+#define AOWL_NAV_ARR_LEN   0x18
+#define AOWL_NAV_ARR_DATA  0x20
+
+static int32_t aowl_nav_off_arrlen(void)  { return AOWL_NAV_ARR_LEN;  }
+static int32_t aowl_nav_off_arrdata(void) { return AOWL_NAV_ARR_DATA; }
+
+/* `Scene::GetRootGameObjects()` is an instance method on a 4-byte struct, so
+ * its `this` is a POINTER to the handle rather than the handle itself. This
+ * static is that storage: set the handle, pass the address. One slot is enough
+ * because the call is synchronous and the inspector is single-threaded per
+ * batch. */
+static int32_t aowl_nav_scene_handle = 0;
+static void aowl_nav_set_scene_handle(int32_t h) { aowl_nav_scene_handle = h; }
+static void* aowl_nav_scene_handle_ptr(void) { return (void*)&aowl_nav_scene_handle; }
 
 static int32_t aowl_nav_off_onclick(void)   { return AOWL_NAV_BTN_ONCLICK;    }
 static int32_t aowl_nav_off_interact(void)  { return AOWL_NAV_SEL_INTERACT;   }

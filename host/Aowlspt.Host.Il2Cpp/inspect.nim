@@ -109,6 +109,11 @@ proc cNavOffOnClick(): int32 {.importc: "aowl_nav_off_onclick", nodecl.}
 proc cNavOffInteract(): int32 {.importc: "aowl_nav_off_interact", nodecl.}
 proc cNavOffIsOn(): int32 {.importc: "aowl_nav_off_ison", nodecl.}
 proc cNavOffCachedPtr(): int32 {.importc: "aowl_nav_off_cachedptr", nodecl.}
+proc cNavOffArrLen(): int32 {.importc: "aowl_nav_off_arrlen", nodecl.}
+proc cNavOffArrData(): int32 {.importc: "aowl_nav_off_arrdata", nodecl.}
+proc cNavSetSceneHandle(h: int32) {.importc: "aowl_nav_set_scene_handle", nodecl.}
+proc cNavSceneHandlePtr(): Il2CppPtr {.
+  importc: "aowl_nav_scene_handle_ptr", nodecl.}
 proc cNavIcallReady(): int32 {.importc: "aowl_nav_icall_ready", nodecl.}
 proc cNavNewString(s: cstring): Il2CppPtr {.
   importc: "aowl_mi2_string_new", nodecl.}
@@ -289,6 +294,19 @@ var gInspFiredLogged = false
 var gInspWaitBatch = -1
   ## The batch we have already explained is waiting for the detour to start
   ## ticking, so that explanation is given once per batch and not every poll.
+var gInspRunningBatch = -1
+  ## THE BATCH THE UNITY THREAD IS ACTUALLY EXECUTING.
+  ##
+  ## `gInspBatch` is the batch the HOST thread has most recently QUEUED, and
+  ## the two are not the same number once a batch can span frames: a parked
+  ## search holds the Unity thread for many frames, during which the poll can
+  ## read a new command file and increment `gInspBatch`. The completion
+  ## handshake used to publish `gInspBatchDone = gInspBatch`, which in that
+  ## window labels the FINISHED batch with the NEW batch's number -- so the
+  ## host writes out the old batch's answers as if they were the new one's,
+  ## and the real answers to the new commands are never recognised.
+  ##
+  ## Latching the number at claim time removes the race entirely.
 var gInspInFlight = -1
   ## The batch currently being executed on the Unity thread, or -1. If this is
   ## still set when the rider is next entered, the previous run did NOT return
@@ -1261,6 +1279,14 @@ const
     ## where it stopped, so a deep hierarchy costs several resumptions rather
     ## than one long freeze.
   InspFindMaxHits = 24
+  InspFindMaxFrames = 240
+    ## HOW LONG ONE SEARCH MAY HOLD THE CHANNEL. A parked batch is still an
+    ## IN-FLIGHT batch, so while a search spans frames no new command file can
+    ## be picked up. At the maximum node budget an unbounded search could hold
+    ## the channel for minutes, which from the outside is indistinguishable
+    ## from the channel being dead -- the exact failure this instrument exists
+    ## to abolish, reintroduced by the feature meant to make it nicer. Four
+    ## seconds at 60fps, then it stops and says so.
   InspTreeMaxNodes = 3000
   InspTreeMaxDepth = 16
 
@@ -1559,6 +1585,119 @@ proc iFindFirstByName(want: string; root: Il2CppPtr; budget: int): Il2CppPtr =
           queue.add c
         inc k
 
+const InspMaxScenes = 24
+const InspMaxRootsPerScene = 96
+
+proc iSceneRoots(into: var seq[Il2CppPtr]; report: bool): int =
+  ## Enumerate the ROOT GameObjects of every loaded scene.
+  ##
+  ## Everything here is a plain integer call: `Scene` is a 4-byte struct
+  ## returned in EAX (verified from the disassembly -- there is no hidden sret
+  ## pointer), and the `*Internal` accessors take the handle by value. Only
+  ## `GetRootGameObjects` needs a struct-`this`, and that is a pointer to a
+  ## C-side int32.
+  result = 0
+  var fnCount: Il2CppPtr = nil
+  var fnAt: Il2CppPtr = nil
+  var fnName: Il2CppPtr = nil
+  var fnLoaded: Il2CppPtr = nil
+  var fnRootCount: Il2CppPtr = nil
+  var fnRoots: Il2CppPtr = nil
+  var rva = 0'u32
+  if not iNavFind("SceneManager::get_sceneCount", fnCount, rva):
+    return
+  if not iNavFind("SceneManager::GetSceneAt", fnAt, rva):
+    return
+  if not iNavFind("Scene::GetRootGameObjects", fnRoots, rva):
+    return
+  # Labelling is a nicety; if these do not verify the enumeration still works
+  # and simply says less. Shipping the rest beats shipping nothing.
+  discard iNavFindQuiet("Scene::GetNameInternal", fnName)
+  discard iNavFindQuiet("Scene::GetIsLoadedInternal", fnLoaded)
+  discard iNavFindQuiet("Scene::GetRootCountInternal", fnRootCount)
+
+  iMark("SceneManager::get_sceneCount", cast[Il2CppPtr](0))
+  var n = int(int32(uint32(cInspUV(fnCount, nil) and 0xFFFFFFFF'u64)))
+  if n < 0 or n > InspMaxScenes:
+    if report:
+      iErr("sceneCount came back as " & $n & ", which is not credible; " &
+           "refusing to loop on it.")
+    return
+  if report:
+    iOut("  " & $n & " loaded scene(s)")
+  var si = 0
+  while si < n:
+    iMark("SceneManager::GetSceneAt", cast[Il2CppPtr](0))
+    let handle = int32(uint32(cInspUI(fnAt, int32(si), nil) and 0xFFFFFFFF'u64))
+    var sname = ""
+    if fnName != nil:
+      iMark("Scene::GetNameInternal", cast[Il2CppPtr](0))
+      sname = suiReadString(cast[Il2CppPtr](cInspUI(fnName, handle, nil)))
+    var loaded = true
+    if fnLoaded != nil:
+      iMark("Scene::GetIsLoadedInternal", cast[Il2CppPtr](0))
+      loaded = (cInspUI(fnLoaded, handle, nil) and 1'u64) != 0'u64
+    var rc = -1
+    if fnRootCount != nil:
+      iMark("Scene::GetRootCountInternal", cast[Il2CppPtr](0))
+      rc = int(int32(uint32(cInspUI(fnRootCount, handle, nil) and 0xFFFFFFFF'u64)))
+    if report:
+      iOut("  scene[" & $si & "] handle=" & $int(handle) & " name=\"" & sname &
+           "\" loaded=" & (if loaded: "true" else: "false") &
+           (if rc >= 0: " rootCount=" & $rc else: ""))
+    if not loaded:
+      # An unloaded scene has no roots and asking it for them is a call into
+      # native code on an object that is not there.
+      inc si
+      continue
+    cNavSetSceneHandle(handle)
+    iMark("Scene::GetRootGameObjects", cNavSceneHandlePtr())
+    let arr = cast[Il2CppPtr](cInspUP(fnRoots, cNavSceneHandlePtr(), nil))
+    if arr == nil or not duOk(arr, cNavOffArrData() + 8'i32):
+      if report:
+        iOut("    (no readable root array for this scene)")
+      inc si
+      continue
+    let alen = cReadI32At(cast[Il2CppPtr](cast[uint64](arr) +
+                          uint64(cNavOffArrLen())))
+    if alen < 0 or alen > InspMaxRootsPerScene:
+      if report:
+        iOut("    (root array length " & $alen & " is not credible; skipped)")
+      inc si
+      continue
+    var k = 0
+    while k < alen:
+      let go = cReadPtrAt(arr, cNavOffArrData() + int32(k * 8))
+      if go != nil and duOk(go, 0x20'i32):
+        iNoteKlass(go)
+        into.add go
+        if report:
+          iSetVar("r" & $result, cast[uint64](go))
+          iOut("    [$r" & $result & "] " & iPtr(go) & " name=\"" &
+               iObjName(go) & "\"")
+        inc result
+      inc k
+    inc si
+
+proc iCmdRoots(toks: seq[string]) =
+  ## `roots` -- every root GameObject of every loaded scene, bound to $r0..$rN.
+  ##
+  ## This is what makes the inspector usable from a cold menu. Without it every
+  ## search was reachability-limited to whatever tree we already had a pointer
+  ## into, which in the menu is one PreloaderUI object -- and the screens worth
+  ## driving live under a different root entirely.
+  var seeded: seq[Il2CppPtr] = @[]
+  iOut("  via SceneManager::get_sceneCount / GetSceneAt, " &
+       "Scene::GetNameInternal / GetIsLoadedInternal / GetRootCountInternal, " &
+       "Scene::GetRootGameObjects (calls; the last one ALLOCATES)")
+  let n = iSceneRoots(seeded, true)
+  if n == 0:
+    iErr("no scene roots were enumerated. If a target above did not verify, " &
+         "the reason was printed with it.")
+    return
+  iOut("  " & $n & " root(s) bound to $r0..$r" & $(n - 1) &
+       ". Search one with:  find NAME $r3")
+
 proc iCmdFind(toks: seq[string]) =
   ## `find NAME [ROOT] [BUDGET]`
   ## `find NAME in ROOTNAME [BUDGET]`   -- ROOT resolved by name
@@ -1573,7 +1712,8 @@ proc iCmdFind(toks: seq[string]) =
      gFindOwnerBatch == gInspBatch:
     inc gFindFrames
     let st = iFindStep()
-    if st == FindOutOfTime and gFindBudgetLeft > 0:
+    if st == FindOutOfTime and gFindBudgetLeft > 0 and
+       gFindFrames < InspFindMaxFrames:
       gFindSuspend = true
       return
     iFindReport(st)
@@ -1603,7 +1743,8 @@ proc iCmdFind(toks: seq[string]) =
     gFindOwnerBatch = gInspBatch
     gFindFrames = 1
     let st = iFindStep()
-    if st == FindOutOfTime and gFindBudgetLeft > 0:
+    if st == FindOutOfTime and gFindBudgetLeft > 0 and
+       gFindFrames < InspFindMaxFrames:
       gFindSuspend = true
       return
     iFindReport(st)
@@ -1642,19 +1783,12 @@ proc iCmdFind(toks: seq[string]) =
     root = cast[Il2CppPtr](v)
     rootExplicit = true
   else:
-    root = gInspPreloader
+    root = nil    # no root named: search EVERY scene root (see below)
 
-  if root == nil:
-    iErr("no ROOT given and $preloader is null, so there is nothing to " &
-         "search from. Pass a root explicitly: find NAME $someTransform")
-    return
-
-  root = iToTransform(root)
-  # ONLY climb when the caller did not choose a root. Climbing unconditionally
-  # is what made the ROOT argument appear to be ignored: every search silently
-  # restarted from the top of the hierarchy.
-  if not rootExplicit:
-    root = iHierRoot(root)
+  if rootExplicit:
+    root = iToTransform(root)
+  elif root == nil:
+    discard
 
   var budget = InspFindDefBudget
   if toks.len > budgetTok:
@@ -1666,7 +1800,33 @@ proc iCmdFind(toks: seq[string]) =
     budget = InspFindMaxBudget
 
   gFindQueue = @[]
-  gFindQueue.add root
+  var seededRoots = 0
+  if rootExplicit:
+    gFindQueue.add root
+  else:
+    # NO ROOT NAMED -> SEARCH EVERY SCENE ROOT.
+    #
+    # The old default was `$preloader` climbed to its hierarchy root, which
+    # could only ever reach the one tree the host already had a pointer into.
+    # In the menu that is the Preloader UI, and the screens actually worth
+    # driving live under a different scene root -- so the default was
+    # structurally incapable of finding them, and said "not present" about
+    # things that were merely unreachable. Seeding from every scene root is
+    # what makes a bare `find NAME` mean what a person expects.
+    seededRoots = iSceneRoots(gFindQueue, false)
+    if seededRoots == 0:
+      # Fall back rather than fail: if scene enumeration did not verify on
+      # this build, the old reachable-subtree search is still better than
+      # nothing -- but say so, so a narrow result is not mistaken for a
+      # complete one.
+      if gInspPreloader == nil:
+        iErr("scene-root enumeration is unavailable and $preloader is null, " &
+             "so there is nothing to search from. Pass a root explicitly.")
+        return
+      iOut("  NOTE: scene-root enumeration did not work, so this searches " &
+           "only the tree $preloader belongs to. A miss here is NOT proof " &
+           "the name is absent from the game.")
+      gFindQueue.add iHierRoot(iToTransform(gInspPreloader))
   gFindHead = 0
   gFindWant = iLower(want)
   gFindVisited = 0
@@ -1676,12 +1836,15 @@ proc iCmdFind(toks: seq[string]) =
   gFindOwnerIdx = gInspCurIdx
   gFindOwnerBatch = gInspBatch
   gFindFrames = 1
-  iOut("  searching from " & iPtr(root) & " name=\"" & iObjName(root) &
-       "\" for name containing \"" & want & "\" (case-insensitive; budget " &
+  iOut("  searching " &
+       (if rootExplicit: "from " & iPtr(root) & " name=\"" & iObjName(root) & "\""
+        else: "ALL " & $seededRoots & " scene root(s)") &
+       " for name containing \"" & want & "\" (case-insensitive; budget " &
        $budget & " nodes, " & $int(InspFindSliceMs) & "ms per frame, " &
        "continuing across frames automatically)")
   let st = iFindStep()
-  if st == FindOutOfTime and gFindBudgetLeft > 0:
+  if st == FindOutOfTime and gFindBudgetLeft > 0 and
+     gFindFrames < InspFindMaxFrames:
     # Out of frame time but not out of permission: park and carry on next
     # frame. Silent by design -- a progress line every frame would bury the
     # matches this is supposed to surface.
@@ -2448,7 +2611,9 @@ proc iCmdHelp() =
   iOut("                                  e.g.  children $preloader")
   iOut("    tree EXPR [DEPTH]             the subtree, indented (learn names)")
   iOut("                                  e.g.  tree $preloader 3")
-  iOut("    find NAME [ROOT] [BUDGET]     breadth-first name search, bind $f1..")
+  iOut("    roots                         every scene root -> $r0..$rN")
+  iOut("                                  e.g.  roots")
+  iOut("    find NAME [ROOT] [BUDGET]     name search; NO ROOT = ALL scenes")
   iOut("    find NAME in ROOTNAME         narrow by a root named, not pointed")
   iOut("    find more [BUDGET]            RESUME a search that hit its cap")
   iOut("    component EXPR TypeName       GameObject/Transform -> component")
@@ -2600,6 +2765,8 @@ proc iExec(line: string) =
     iCmdFind(toks)
   of "tree":
     iCmdTree(toks)
+  of "roots":
+    iCmdRoots(toks)
   of "component", "comp":
     iCmdComponent(toks)
   of "rect":
@@ -2830,7 +2997,7 @@ proc inspRunBatch() =
     inc i
   gInspResumeAt = 0
   gInspWaitIdx = -1
-  iOut("aowlspt live inspector -- batch " & $gInspBatch & " complete, " &
+  iOut("aowlspt live inspector -- batch " & $gInspRunningBatch & " complete, " &
        $gInspOut.len & " line(s)")
 
 proc inspTick() =
@@ -2881,7 +3048,7 @@ proc inspTick() =
     if gInspSuspended:
       return
     cInspLock()
-    gInspBatchDone = gInspBatch
+    gInspBatchDone = gInspRunningBatch
     cInspUnlock()
     return
   if cInspHave() == 0'i32:
@@ -2896,6 +3063,7 @@ proc inspTick() =
   # impossible: once the rider has taken a batch, the flag is down whatever
   # happens next, and a failure costs one batch instead of the channel.
   cInspSetPending(0'i32)
+  gInspRunningBatch = gInspBatch
   gInspInFlight = gInspBatch
   inspRunBatch()
   gInspPhase = 3
@@ -2908,7 +3076,7 @@ proc inspTick() =
   if gInspSuspended:
     return
   cInspLock()
-  gInspBatchDone = gInspBatch
+  gInspBatchDone = gInspRunningBatch
   cInspUnlock()
 
 proc inspectFired(regs: Il2CppPtr) =
@@ -3033,7 +3201,7 @@ proc inspectPoll(now: uint64) =
   cInspLock()
   done = gInspBatchDone
   cInspUnlock()
-  if done >= 0 and done == gInspBatch and cInspHave() == 0'i32 and
+  if done >= 0 and cInspHave() == 0'i32 and
      gInspOut.len > 0:
     inspWriteOut()
     gInspHandedMs = 0'u64
