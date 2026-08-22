@@ -66,7 +66,7 @@ proc lowerAscii(s: string): string =
     else:
       result[i] = c
 
-proc readWholeFile(path: string; into: var string): bool =
+proc readWholeFile*(path: string; into: var string): bool =
   ## Non-raising whole-file read (the bool `open` overload does not raise).
   var f: File
   if not open(f, path, fmRead):

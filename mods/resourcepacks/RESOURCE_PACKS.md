@@ -176,17 +176,32 @@ turned on deliberately.
 ## 5. Wiring into the texture mod
 
 The loader writes the resolved texture manifest (when `swapMode != off`) to
-`textureManifestOut`. To make the texture mod consume it, in the **texture mod's**
-`config.json` set:
+`textureManifestOut`, which defaults to
+`<install>/mods/resourcepacks/resolved.manifest.json`.
 
-- `packRoot` to `""` — the emitted `file` paths are absolute, so the texture
-  mod's `resolvedPath` returns them verbatim;
-- point the texture mod's manifest at `textureManifestOut` (copy/replace its
-  `data/manifest.json`, or set `textureManifestOut` to the texture mod's data
-  dir if you accept overwriting its shipped manifest).
+`aowl.textures` reads it through **one config key**, `manifestPath`. In the
+**texture mod's** `config.json`:
 
-Then raise the texture mod's `swapMode` to `probe` → `match` → `full`. The
-byte-verify, arm delay, and VRAM budget stay entirely in the texture mod.
+```jsonc
+  "packRoot":     "",                                              // the emitted file paths are absolute
+  "manifestPath": "<install>/mods/resourcepacks/resolved.manifest.json"
+```
+
+`packRoot` must be `""`: the resolved manifest's `file` values are absolute, and
+a non-empty `packRoot` would prefix them into nonsense. `manifestPath` empty
+(the shipped default) keeps the texture mod on its own committed curated
+manifest, so installing the pack loader changes nothing until you set this.
+
+Then raise the texture mod's `swapMode` to `probe` → `match` → `full`, one rung
+at a time. The byte-verify, arm delay, and VRAM budget stay entirely in the
+texture mod and are unaware a pack system exists — that is the point of the
+seam. Load order matters and the registry enforces it: `aowl.resourcepacks`
+writes the file during its `onLoad`, `aowl.textures` reads it during its, and
+`aowl.textures` carries `loadAfter: ["aowl.resourcepacks"]`.
+
+`aowl run mods/resourcepacks` proves this handoff offline: it writes
+`resolved.manifest.json` for real, reads it back, and asserts every `file` path
+in it is absolute.
 
 ## 6. Wiring into the graphics mod
 
@@ -266,5 +281,132 @@ above. Nothing else is needed — the loader owns resolution and emission.
 6. Share it: zip the `my-pack/` folder. A friend extracts it into their `packs/`.
 
 Run `aowl run mods/resourcepacks` for an offline self-test that parses the
-example packs, resolves a two-pack stack, and validates both emitted artifacts —
-no game or runtime required.
+example packs, resolves a two-pack stack, validates both emitted artifacts, and
+writes and re-reads the handoff file `aowl.textures` consumes — no game or
+runtime required.
+
+---
+
+## 9. Installing it, and the user workflow
+
+The mod is in `registry/mods.json` as `aowl.resourcepacks` and in the
+**Vanilla Plus** list, immediately before `aowl.textures`. `aowl payload` stages
+a mod's `packs/` directory alongside its `data/` and `config.json`, so the
+install ends up with:
+
+```
+<install>/mods/resourcepacks/
+    resourcepacks.dll
+    config.json                  <- what is enabled, in what order
+    packs/
+        example-textures/        <- shipped, as something to copy
+        example-grade/
+    resolved.manifest.json       <- generated; do not edit
+```
+
+**Where do I drop a pack?** Extract the pack folder (the one containing
+`manifest.json`) into `<install>/mods/resourcepacks/packs/`. Nothing else. Packs
+are read-only to this mod; it never writes inside one.
+
+**How do I enable and order them?** Either edit `config.json`'s `packs` array —
+
+```jsonc
+  "packs": [
+    { "id": "base-textures",  "enabled": true },
+    { "id": "my-overrides",   "enabled": true }   // later wins on any conflict
+  ],
+  "swapMode": "match",     // off -> probe -> match -> full
+  "driveGrade": false
+```
+
+— or drive it live over the mod's own endpoint, which is the same surface the
+future in-game page binds to (§7):
+
+```
+GET  /aowlspt/settings/aowl.resourcepacks
+POST /aowlspt/settings/aowl.resourcepacks  {"action":"toggle","id":"my-pack","enabled":true}
+POST /aowlspt/settings/aowl.resourcepacks  {"action":"reorder","order":["base-textures","my-overrides"]}
+```
+
+Order is low → high priority: the **last** pack in the list wins a conflict, as
+in Minecraft's applied-pack list. A pack dropped in but never named in config
+shows up in the GET body as available-and-disabled, so it is one toggle away.
+
+**Restart or reload?** A `POST` re-scans, re-resolves and rewrites the manifest
+immediately, as does firing the `aowl.resourcepacks.reload` event. But
+`aowl.textures` loads its manifest once, at *its* `onLoad` — so a change to the
+enabled stack reaches the game on the next start.
+
+---
+
+## 10. How pack content actually reaches the client — and what is not done
+
+This was the open question, and the answer is not the obvious one.
+
+**Loose texture replacement does not go through `StreamingAssets`, and does not
+go through HTTP either.** `aowl.textures` postfixes
+`UnityEngine.AssetBundle::LoadAsset`, and on a name match decodes a **loose
+image file it reads itself, from an ordinary path on disk**, into the returned
+`Texture2D` in place. The bytes never travel: no bundle, no URL, no listener.
+That is why a pack's images can sit inside the pack folder and simply work, and
+why the asset-port/`/files/` machinery that fixed trader avatars is irrelevant
+here — those are two unrelated pipelines that both happen to move images.
+
+**`StreamingAssets` is the constraint for a pack that ships an asset *bundle*,
+and that is the part that is not built.** From
+`docs/timbuktu/IMAGE-LOADING-RE2.md` §6.3, confirmed in the disassembly:
+`BundlesManager`'s loading url comes from `AssetsEnvironment::GetDownloadingUrl`
+→ `Application::get_streamingAssetsPath`, i.e.
+`file://<install>/EscapeFromTarkov_Data/StreamingAssets/Windows/`. The metadata
+carries no bundle CDN literal at all. So bundles are local file reads and always
+were; serving one over the asset port would work only if something first pointed
+a bundle url at it, and nothing does.
+
+On this install the tree is real and populated:
+
+```
+D:\Aowlspt\EscapeFromTarkov_Data\StreamingAssets\Windows\
+    Windows.json      <- the bundle manifest (name -> FileName, Crc, Dependencies)
+    assets\ maps\ shaders\ cubemaps\ packages\ ...
+```
+
+**And here is the landmine for that future work.** The client's boot-time
+files-checker reads `D:\Aowlspt\ConsistencyInfo` and refuses to boot with
+`Consistency ensurance failed. File size does not match` if a listed file
+changes size. That file has **10120 entries, 8080 of them under
+`StreamingAssets`** — every stock bundle is size-and-checksum pinned, so
+*replacing* a bundle in place is off the table without a re-sync. `Windows.json`
+itself is listed (`"Size":2736376`), and a new bundle has to be named in it to
+be loadable, so even the additive design touches exactly one pinned file. A
+bundle-shipping pack would therefore have to:
+
+1. write its `.bundle` files as **new** paths under `StreamingAssets/Windows/`
+   (new files are not listed and are not checked),
+2. add their entries to `Windows.json`,
+3. re-sync `Windows.json`'s `ConsistencyInfo` entry — `"<name>","Size":N,
+   "Checksum":M` where `Checksum` is the file's byte-sum mod 2^32. **There is no
+   re-sync helper in this repo yet**; nothing here writes a `ConsistencyInfo`
+   entry (the installer only *reads* the file's version, `eft.nim`, and
+   `tools/firstrun.nim` writes a synthetic stub for a fixture). Writing that
+   helper is step zero of the bundle work,
+4. and be able to undo all three on uninstall.
+
+None of that is implemented. The pack schema has no bundle entry type, the
+loader writes nothing outside its own mod directory, and it touches no file
+under `D:\Aowlspt`. That is a deliberate stopping point, not an oversight: the
+loose-texture and grade paths are complete and need none of it.
+
+### Honest status
+
+| | status |
+|---|---|
+| Pack schema, parse, validate, refuse-a-bad-pack | **working** (`aowl run mods/resourcepacks`) |
+| Stack resolution, later-wins override, per-pack enable/order | **working**, self-tested |
+| Handoff file written where `aowl.textures` reads it | **working**, self-tested end to end |
+| `aowl.textures` consuming it (`manifestPath`) | **working** offline: 1-entry example pack loads and its name resolves |
+| Registered, listed, and staged into an install by `aowl payload` | **coded**, not yet installed or run against the live client |
+| Grade packs driving `gfx_apply` | **coded**; the call path is the graphics mod's, unverified from here |
+| A pack actually changing a pixel in-game | **unproven** — needs `aowl.textures` `swapMode` raised to `full` on a live client, which is its own separate ladder |
+| Distribution packs (`packs/ambientcg-overhaul`, `packs/vanilla-4k`) | **manifests/scripts only**; neither ships assets, both need their assemble/generate step run locally first |
+| Bundle-shipping packs via `StreamingAssets` | **not started** — see above |
+| In-game native Resource Packs settings page | **not started** — §7 is the contract it will bind to |

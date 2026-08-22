@@ -12,7 +12,7 @@
   "//packsDir": "Where packs live. Empty = <modDir>/packs.",
   "packsDir": "",
 
-  "//textureManifestOut": "Where the flattened texture manifest is written for the texture mod to read. Empty = <modDir>/resolved.manifest.json. Point the texture mod's config at this path with packRoot=\"\" (the emitted file paths are absolute).",
+  "//textureManifestOut": "Where the flattened texture manifest is written for the texture mod to read. Empty = <modDir>/resolved.manifest.json. To connect it, set aowl.textures' own manifestPath to this path AND its packRoot to \"\" (the emitted file paths are absolute). Until you do, aowl.textures stays on its committed curated manifest and this file is written but unread. aowl.textures carries loadAfter aowl.resourcepacks so the file exists before it looks.",
   "textureManifestOut": "",
 
   "//packs": "Enabled set + STACK ORDER. Array order is load order, index 0 = lowest priority; a later pack overrides earlier ones on any conflicting texture name or grade key, exactly like Minecraft's applied pack list. A pack folder present on disk but absent here is available-but-disabled. Toggle/reorder via the settings endpoint or by editing this array.",

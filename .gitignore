@@ -82,3 +82,9 @@ __pycache__/
 
 # Texture mod: the assembled image pack (rebuilt by pipeline/build_pack.py --copy)
 mods/textures/data/pack/
+
+# Resource-pack loader: the flattened stack it hands to aowl.textures. Output,
+# rewritten on every load and every settings change, and it names absolute paths
+# from one machine -- exactly the shape of artifact that made the committed mod
+# selection above a bug.
+mods/resourcepacks/resolved.manifest.json

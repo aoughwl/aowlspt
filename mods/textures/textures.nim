@@ -72,6 +72,7 @@ type
     catFabric: bool
     catGround: bool
     packRoot: string         ## where the replacement images live on disk
+    manifestPath: string     ## override for the manifest to load; see below
 
 proc defaultSettings(): Settings =
   Settings(enabled: true, swapMode: "off", hookAsync: false, armDelayMs: 15000,
@@ -79,7 +80,7 @@ proc defaultSettings(): Settings =
            minConfidence: 0.5, logMatches: true,
            catMetal: true, catWood: true, catConcrete: true,
            catBrick: true, catFabric: true, catGround: false,
-           packRoot: "")
+           packRoot: "", manifestPath: "")
 
 var gCfg = defaultSettings()
 var gTicks = 0
@@ -107,6 +108,7 @@ proc loadConfig() =
   gCfg.catFabric = sBool("catFabric", gCfg.catFabric)
   gCfg.catGround = sBool("catGround", gCfg.catGround)
   gCfg.packRoot = sText("packRoot", gCfg.packRoot)
+  gCfg.manifestPath = sText("manifestPath", gCfg.manifestPath)
 
 proc tierName(): string =
   if gCfg.quality == "4k": "4K" else: "2K"
@@ -163,6 +165,9 @@ proc texturesSchema(): seq[Setting] =
     boolSetting("packRootSet", "Custom pack root", false, category = "Advanced",
                 implemented = false,
                 description = "packRoot in config.json points at the replacement images; edited there, not here."),
+    boolSetting("manifestPathSet", "Driven by resource packs", false,
+                category = "Advanced", implemented = false,
+                description = "manifestPath in config.json chooses which manifest to load; point it at aowl.resourcepacks' resolved.manifest.json to let the pack stack drive the swaps. Edited there, not here."),
   ]
 
 proc onSettings(url, body, session: string): string =
@@ -247,7 +252,19 @@ proc onLoad(): Status =
   # The manifest lives in the mod's own data dir; packRoot (where the images
   # are) defaults to the TarkovTextures tree the pipeline read from, overridable
   # in config.json for a deployed self-contained pack.
-  let manifestPath = dataDir() & "/manifest.json"
+  #
+  # `manifestPath` is the seam aowl.resourcepacks plugs into: that mod flattens
+  # the enabled pack stack into THIS format and writes it out, and pointing this
+  # key at that file is the whole integration -- the swap hook, the VRAM budget
+  # and the swapMode ladder below are untouched and unaware. Its entries carry
+  # ABSOLUTE `file` paths, which is why packRoot must be "" when it is used.
+  # Empty (the default) keeps the committed curated manifest.
+  var manifestPath = gCfg.manifestPath
+  if manifestPath.len == 0:
+    manifestPath = dataDir() & "/manifest.json"
+  else:
+    info "textures  manifest overridden: " & manifestPath &
+         " (resource-pack stack, or a hand-built manifest)"
   var root = gCfg.packRoot
   if root.len == 0:
     root = dataDir() & "/pack"     # a --copy pack, if one was assembled here

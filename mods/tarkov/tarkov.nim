@@ -178,6 +178,22 @@ var gSelfCheckFailures: seq[string] = @[]
   ## Empty is the ordinary state and is also an answer: it is the difference
   ## between "this mod loaded" and "nothing is listening".
 
+var gFilesMissing: seq[string] = @[]
+  ## Every distinct `/files/*` path this server has had to answer with the
+  ## placeholder, so a missing asset reports itself instead of showing up as an
+  ## infinite spinner nobody can name.
+  ##
+  ## A request only reaches this server when the client's own disk cache misses
+  ## (`LoadTextureWithCache` step 2 -- see `tools/imagecache.py`), so every path
+  ## recorded here is exactly a path `imagecache.py` failed to populate. The
+  ## list is the log's dedupe key, not a store: capped, because the path comes
+  ## off the wire and an unbounded set is a request-driven allocation.
+
+const FilesMissingCap = 128
+  ## How many distinct placeholder paths are remembered before the log goes
+  ## quiet. Real installs miss a handful; anything past this is a client asking
+  ## for generated names, and the log has already said so 128 times.
+
 var gFilesPng = ""
   ## The bytes served for every `/files/*` (and CDN-prefixed `/regular/files/*`)
   ## request -- a tiny valid PNG.
@@ -1550,7 +1566,22 @@ proc onFiles(url, body, session: string): string =
   ## settles. The backend recognises the path and sends these bytes raw and
   ## un-deflated with an `image/png` Content-Type; the handler just hands over
   ## the bytes.
+  ##
+  ## Reaching this handler at all means the client's own disk cache missed, so
+  ## every path that lands here is a genuinely missing image. It is logged once
+  ## per distinct path: the whole failure mode of the old silent placeholder was
+  ## that a wrong-looking Traders screen gave no name to search for. Ref's
+  ## avatar (`/files/trader/avatar/5824657996560e1be8000848.png`) was found this
+  ## way and is what `imagecache.py --fill-missing` now covers.
   inc gRequests
+  var seen = false
+  for p in gFilesMissing:
+    if p == url:
+      seen = true
+      break
+  if not seen and gFilesMissing.len < FilesMissingCap:
+    gFilesMissing.add url
+    info "no image for " & url & " -- served placeholder (run tools/imagecache.py)"
   result = gFilesPng
 
 proc onActivityPeriods(url, body, session: string): string =
