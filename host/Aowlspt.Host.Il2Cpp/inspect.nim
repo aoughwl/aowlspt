@@ -217,6 +217,16 @@ var gInspTicks = 0
   ## How many times the rider ran with a batch actually pending, i.e. got past
   ## the `aowl_insp_have` gate. `gInspFires` high with `gInspTicks` zero means
   ## the rider is dispatched fine and the HANDOFF FLAG is what is broken.
+var gFindQueue: seq[Il2CppPtr] = @[]
+var gFindHead = 0
+var gFindWant = ""
+var gFindVisited = 0
+var gFindFound = 0
+var gFindActive = false
+  ## A `find` that stopped on a cap leaves its frontier here, so `find more`
+  ## continues instead of re-walking the nodes it already rejected. Restarting
+  ## a capped search from scratch can never reach past the cap, which made the
+  ## cap message's own advice impossible to follow.
 var gInspDrainFires = 0
   ## Dispatches that arrived on the IN-RAID anchor (the main drain) rather than
   ## on `PreloaderUI::Update`. Non-zero means the instrument is alive in raid.
@@ -1153,8 +1163,24 @@ proc iNavGate(what: string): bool =
 
 const
   InspMaxChildren = 64     ## per `children` listing
-  InspFindBudget  = 4000   ## hard node budget for `find` -- see below
-  InspFindMaxHits = 12
+  InspFindDefBudget = 20000
+    ## DEFAULT nodes per `find` invocation. The old value was 4000 and, worse,
+    ## the same constant was used as the hard maximum -- so a caller who asked
+    ## for 40000 was silently clamped back to 4000 and told "node budget 4000".
+    ## A default and a ceiling are different numbers and are now separate.
+  InspFindMaxBudget = 250000
+    ## Ceiling on an explicit request. Large, because the real constraint is
+    ## not the node count -- it is not stalling the Unity thread, which the
+    ## time slice below enforces directly.
+  InspFindSliceMs = 12'u64
+    ## THE REAL BUDGET. A node count is a poor proxy for "am I about to make
+    ## the game stutter"; wall time is the actual thing that matters. One
+    ## invocation gives up after this many milliseconds and reports exactly
+    ## where it stopped, so a deep hierarchy costs several resumptions rather
+    ## than one long freeze.
+  InspFindMaxHits = 24
+  InspTreeMaxNodes = 3000
+  InspTreeMaxDepth = 16
 
 proc iNavFindQuiet(want: string; fn: var Il2CppPtr): bool =
   ## Same lookup, no logging. `find` calls this thousands of times inside one
@@ -1265,86 +1291,135 @@ proc iCmdChildren(toks: seq[string]) =
   else:
     iOut("  this transform has no children.")
 
-proc iCmdFind(toks: seq[string]) =
-  ## `find NAME [ROOT] [BUDGET]` -- breadth-first search of the hierarchy by
-  ## GameObject name.
-  ##
-  ## THE BUDGET IS THE WHOLE DESIGN. This runs on Unity's main thread inside
-  ## one frame, so an unbounded search is a frozen client -- and a frozen
-  ## client is worse than any wrong answer, because it takes the whole session
-  ## with it. So the walk is capped on THREE independent axes: total nodes
-  ## visited, matches collected, and children expanded per node. It reports
-  ## when it hit a cap rather than pretending the answer was complete, because
-  ## "not found within budget" and "not present" are completely different
-  ## facts and confusing them would send somebody hunting for a bug that is
-  ## really just a small budget.
-  if toks.len < 2:
-    iErr("usage: find NAME [ROOT] [BUDGET]   -- NAME is a case-insensitive substring")
+proc iParentName(p: Il2CppPtr): string =
+  ## The parent's name, for disambiguation. A bare `name="Background"` is
+  ## almost useless on a UI screen that has nine of them; the parent is
+  ## usually what identifies which one it is.
+  result = ""
+  var idx = 0
+  var hits = 0
+  if not iFindTarget("Transform::get_parent", idx, hits):
     return
-  let want = iLower(toks[1])
-  var root = gInspPreloader
-  if toks.len > 2:
-    var v = 0'u64
-    var err = ""
-    if not iEval(toks[2], v, err):
-      iErr(err)
-      return
-    root = cast[Il2CppPtr](v)
-  if root == nil:
-    iErr("no ROOT given and $preloader is null, so there is nothing to search " &
-         "from. Pass a root explicitly: find NAME $someTransform")
+  let fn = iTargetFn(idx)
+  if fn == nil or not iUnityAlive(p):
     return
-  # Start from the root's transform, and climb to the hierarchy root so the
-  # search covers the whole tree rather than one branch of it.
+  iMark("Transform::get_parent", p)
+  let par = cast[Il2CppPtr](cInspUP(fn, p, nil))
+  if par == nil or not duOk(par, 0x20'i32):
+    return
+  result = iObjName(par)
+
+proc iToTransform(p: Il2CppPtr): Il2CppPtr =
+  ## `get_transform` on something that is already a Transform returns itself,
+  ## so this is safe for a component or a transform alike.
+  result = p
   var idx = 0
   var hits = 0
   if iFindTarget("Component::get_transform", idx, hits):
-    let fnT = iTargetFn(idx)
-    if fnT != nil and iUnityAlive(root):
-      iMark("Component::get_transform", root)
-      let t = cast[Il2CppPtr](cInspUP(fnT, root, nil))
+    let fn = iTargetFn(idx)
+    if fn != nil and iUnityAlive(p):
+      iMark("Component::get_transform", p)
+      let t = cast[Il2CppPtr](cInspUP(fn, p, nil))
       if duOk(t, 0x20'i32):
-        root = t
+        result = t
+
+proc iHierRoot(p: Il2CppPtr): Il2CppPtr =
+  ## Climb to the top of the hierarchy. ONLY called when the caller did not
+  ## name a root -- doing it unconditionally is the bug that made every
+  ## `find X $someRoot` silently search the whole tree from the top instead,
+  ## and made the ROOT argument look like it was being ignored.
+  result = p
+  var idx = 0
+  var hits = 0
   if iFindTarget("Transform::get_root", idx, hits):
-    let fnR = iTargetFn(idx)
-    if fnR != nil and iUnityAlive(root):
-      iMark("Transform::get_root", root)
-      let r = cast[Il2CppPtr](cInspUP(fnR, root, nil))
+    let fn = iTargetFn(idx)
+    if fn != nil and iUnityAlive(p):
+      iMark("Transform::get_root", p)
+      let r = cast[Il2CppPtr](cInspUP(fn, p, nil))
       if duOk(r, 0x20'i32):
-        root = r
-  var budget = InspFindBudget
-  if toks.len > 3:
-    var b = 0'u64
-    var e3 = ""
-    if iEval(toks[3], b, e3) and int(b) > 0:
-      budget = int(b)
-  if budget > InspFindBudget:
-    budget = InspFindBudget
-  iOut("  searching from " & iPtr(root) & " for name containing \"" &
-       toks[1] & "\" (node budget " & $budget & ")")
-  var queue: seq[Il2CppPtr] = @[]
-  queue.add root
-  var head = 0
-  var visited = 0
-  var found = 0
-  var truncated = false
-  while head < queue.len:
-    if visited >= budget:
-      truncated = true
-      break
-    if found >= InspFindMaxHits:
-      truncated = true
-      break
-    let cur = queue[head]
-    inc head
-    inc visited
+        result = r
+
+proc iFindStep(budget: int): bool =
+  ## One slice of the breadth-first walk. Returns true when the frontier is
+  ## exhausted (a genuinely complete answer), false when it stopped on a cap.
+  ##
+  ## THREE INDEPENDENT CAPS, and the time one is the important one: this runs
+  ## on the Unity thread inside a single frame, so the failure to avoid is a
+  ## stalled client, which costs the whole session rather than one answer.
+  let started = cNowMs()
+  var spent = 0
+  while gFindHead < gFindQueue.len:
+    if spent >= budget:
+      return false
+    if gFindFound >= InspFindMaxHits:
+      return false
+    if (spent and 255) == 0 and cNowMs() - started > InspFindSliceMs:
+      return false
+    let cur = gFindQueue[gFindHead]
+    inc gFindHead
+    inc spent
+    inc gFindVisited
     if not duOk(cur, 0x20'i32) or not iUnityAlive(cur):
       continue
     let nm = iObjName(cur)
-    if nm.len > 0 and iContains(iLower(nm), want):
-      inc found
-      iSetVar("f" & $found, cast[uint64](cur))
-      iOut("    HIT " & iPtr(cur) & " name=\"" & nm & "\"   ($f" & $found & ")")
+    if nm.len > 0 and iContains(iLower(nm), gFindWant):
+      inc gFindFound
+      iSetVar("f" & $gFindFound, cast[uint64](cur))
+      let pn = iParentName(cur)
+      iOut("    HIT " & iPtr(cur) & " name=\"" & nm & "\"" &
+           (if pn.len > 0: "  parent=\"" & pn & "\"" else: "") &
+           "   ($f" & $gFindFound & ")")
+    var n = 0
+    if iChildCount(cur, n):
+      var k = 0
+      while k < n and k < InspMaxChildren:
+        let c = iChildAt(cur, k)
+        if c != nil:
+          gFindQueue.add c
+        inc k
+  result = true
+
+proc iFindReport(done: bool) =
+  iOut("  visited " & $gFindVisited & " node(s), " & $gFindFound &
+       " match(es), frontier " & $(gFindQueue.len - gFindHead) & " node(s)")
+  if done:
+    gFindActive = false
+    iOut("  -- the subtree was searched EXHAUSTIVELY. " &
+         (if gFindFound == 0:
+            "That name is genuinely NOT PRESENT under this root."
+          else: "Every match is listed above."))
+  else:
+    gFindActive = true
+    iOut("  -- STOPPED EARLY on a cap. This is NOT proof the name is absent. " &
+         "Continue with `find more` (it RESUMES from the frontier above and " &
+         "does not re-walk what it already rejected), or re-run with a bigger " &
+         "budget, or search from a narrower root.")
+  if gFindFound > 0:
+    iOut("  matches are bound to $f1..$f" & $gFindFound &
+         " for the rest of this batch")
+
+proc iFindFirstByName(want: string; root: Il2CppPtr; budget: int): Il2CppPtr =
+  ## Resolve a root BY NAME, so `find X in Y` does not require already knowing
+  ## Y's pointer -- which is the position everybody is in before the first
+  ## search succeeds.
+  result = nil
+  var queue: seq[Il2CppPtr] = @[]
+  queue.add root
+  var head = 0
+  var seen = 0
+  let started = cNowMs()
+  let w = iLower(want)
+  while head < queue.len and seen < budget:
+    if (seen and 255) == 0 and cNowMs() - started > InspFindSliceMs:
+      return nil
+    let cur = queue[head]
+    inc head
+    inc seen
+    if not duOk(cur, 0x20'i32) or not iUnityAlive(cur):
+      continue
+    let nm = iObjName(cur)
+    if nm.len > 0 and iContains(iLower(nm), w):
+      return cur
     var n = 0
     if iChildCount(cur, n):
       var k = 0
@@ -1353,13 +1428,187 @@ proc iCmdFind(toks: seq[string]) =
         if c != nil:
           queue.add c
         inc k
-  iOut("  visited " & $visited & " node(s), " & $found & " match(es)" &
+
+proc iCmdFind(toks: seq[string]) =
+  ## `find NAME [ROOT] [BUDGET]`
+  ## `find NAME in ROOTNAME [BUDGET]`   -- ROOT resolved by name
+  ## `find more [BUDGET]`               -- RESUME a search that hit a cap
+  ##
+  ## Matching is case-insensitive substring on the GameObject name.
+  if toks.len < 2:
+    iErr("usage: find NAME [ROOT] [BUDGET] | find NAME in ROOTNAME [BUDGET] | find more [BUDGET]")
+    return
+
+  # ---- resume ----
+  if iLower(toks[1]) == "more":
+    if not gFindActive:
+      iErr("there is no capped search to continue. Run `find NAME ...` first.")
+      return
+    var budget = InspFindDefBudget
+    if toks.len > 2:
+      var b = 0'u64
+      var e = ""
+      if iEval(toks[2], b, e) and int(b) > 0:
+        budget = int(b)
+    if budget > InspFindMaxBudget:
+      budget = InspFindMaxBudget
+    iOut("  resuming search for \"" & gFindWant & "\" from a frontier of " &
+         $(gFindQueue.len - gFindHead) & " node(s), budget " & $budget)
+    let done = iFindStep(budget)
+    iFindReport(done)
+    return
+
+  # ---- new search ----
+  let want = toks[1]
+  var root: Il2CppPtr = nil
+  var rootExplicit = false
+  var budgetTok = 3
+
+  if toks.len > 3 and iLower(toks[2]) == "in":
+    # `find X in Y` -- Y is a NAME, resolved against the whole hierarchy first.
+    var base = iToTransform(gInspPreloader)
+    if base == nil:
+      iErr("cannot resolve a root by name: $preloader is null, so there is " &
+           "nothing to search from. Pass an explicit pointer instead.")
+      return
+    base = iHierRoot(base)
+    let found = iFindFirstByName(toks[3], base, InspFindDefBudget)
+    if found == nil:
+      iErr("no object named like \"" & toks[3] & "\" was found to use as a " &
+           "root. Nothing was searched.")
+      return
+    root = found
+    rootExplicit = true
+    budgetTok = 4
+    iOut("  root \"" & toks[3] & "\" resolved to " & iPtr(root) &
+         " name=\"" & iObjName(root) & "\"")
+  elif toks.len > 2:
+    var v = 0'u64
+    var err = ""
+    if not iEval(toks[2], v, err):
+      iErr(err)
+      return
+    root = cast[Il2CppPtr](v)
+    rootExplicit = true
+  else:
+    root = gInspPreloader
+
+  if root == nil:
+    iErr("no ROOT given and $preloader is null, so there is nothing to " &
+         "search from. Pass a root explicitly: find NAME $someTransform")
+    return
+
+  root = iToTransform(root)
+  # ONLY climb when the caller did not choose a root. Climbing unconditionally
+  # is what made the ROOT argument appear to be ignored: every search silently
+  # restarted from the top of the hierarchy.
+  if not rootExplicit:
+    root = iHierRoot(root)
+
+  var budget = InspFindDefBudget
+  if toks.len > budgetTok:
+    var b = 0'u64
+    var e = ""
+    if iEval(toks[budgetTok], b, e) and int(b) > 0:
+      budget = int(b)
+  if budget > InspFindMaxBudget:
+    budget = InspFindMaxBudget
+
+  gFindQueue = @[]
+  gFindQueue.add root
+  gFindHead = 0
+  gFindWant = iLower(want)
+  gFindVisited = 0
+  gFindFound = 0
+  gFindActive = false
+  iOut("  searching from " & iPtr(root) & " name=\"" & iObjName(root) &
+       "\" for name containing \"" & want & "\" (case-insensitive; budget " &
+       $budget & " nodes, " & $int(InspFindSliceMs) & "ms slice)")
+  let done = iFindStep(budget)
+  iFindReport(done)
+
+proc iCmdTree(toks: seq[string]) =
+  ## `tree EXPR [DEPTH]` -- the subtree, indented, capped.
+  ##
+  ## "Show me what is under this" is the most common UI question and was the
+  ## one thing traversal still could not answer: `children` gives exactly one
+  ## level, and `find` needs a name you may not know yet. This is how you learn
+  ## the name.
+  if toks.len < 2:
+    iErr("usage: tree EXPR [DEPTH]")
+    return
+  var v = 0'u64
+  var err = ""
+  if not iEval(toks[1], v, err):
+    iErr(err)
+    return
+  var root = cast[Il2CppPtr](v)
+  if not duOk(root, 0x20'i32):
+    iErr("that pointer is not readable; refusing to walk it.")
+    return
+  root = iToTransform(root)
+  if not iUnityAlive(root):
+    iErr("that object's native half is NULL, so every child accessor would " &
+         "fault inside Unity's C++. Refusing to walk it.")
+    return
+  var depth = 4
+  if toks.len > 2:
+    var d = 0'u64
+    var e = ""
+    if iEval(toks[2], d, e) and int(d) > 0:
+      depth = int(d)
+  if depth > InspTreeMaxDepth:
+    depth = InspTreeMaxDepth
+  iOut("  tree from " & iPtr(root) & " name=\"" & iObjName(root) &
+       "\" (max depth " & $depth & ", max " & $InspTreeMaxNodes & " nodes)")
+  # Explicit stacks rather than recursion: recursion depth on the Unity thread
+  # is not something to leave to chance inside a detour.
+  var stackNode: seq[Il2CppPtr] = @[]
+  var stackDepth: seq[int] = @[]
+  stackNode.add root
+  stackDepth.add 0
+  var nodes = 0
+  var truncated = false
+  let started = cNowMs()
+  while stackNode.len > 0:
+    if nodes >= InspTreeMaxNodes:
+      truncated = true
+      break
+    if (nodes and 127) == 0 and cNowMs() - started > InspFindSliceMs * 2'u64:
+      truncated = true
+      break
+    let cur = stackNode[stackNode.len - 1]
+    let d = stackDepth[stackDepth.len - 1]
+    stackNode.setLen(stackNode.len - 1)
+    stackDepth.setLen(stackDepth.len - 1)
+    inc nodes
+    if not duOk(cur, 0x20'i32) or not iUnityAlive(cur):
+      continue
+    var indent = "    "
+    for k in 0 ..< d:
+      indent = indent & "  "
+    var n = 0
+    let okCount = iChildCount(cur, n)
+    iOut(indent & (if d == 0: "" else: "+ ") & "\"" & iObjName(cur) & "\"  " &
+         iPtr(cur) & (if okCount and n > 0: "  (" & $n & " child)" else: ""))
+    if d >= depth or not okCount:
+      continue
+    # Push in reverse so children print in natural order.
+    var k = n - 1
+    if k > InspMaxChildren - 1:
+      k = InspMaxChildren - 1
+    while k >= 0:
+      let c = iChildAt(cur, k)
+      if c != nil:
+        stackNode.add c
+        stackDepth.add (d + 1)
+      dec k
+  iOut("  " & $nodes & " node(s) printed" &
        (if truncated:
-          "  -- STOPPED EARLY on a cap. This is NOT proof the name is absent; " &
-          "raise the budget or search from a narrower root."
-        else: "  -- the subtree was searched exhaustively."))
-  if found > 0:
-    iOut("  matches are bound to $f1..$f" & $found & " for the rest of this batch")
+          "  -- STOPPED EARLY on a cap; this subtree is larger than the " &
+          "budget. Deepen selectively with `tree $child` rather than raising " &
+          "the depth here."
+        else: "  -- complete."))
 
 proc iCmdClick(toks: seq[string]; useInvoke: bool) =
   ## `click PTR` -- EFT's own path: `Button::Press`, which re-checks IsActive
@@ -1874,7 +2123,11 @@ proc iCmdHelp() =
   iOut("  -- hierarchy (children/find are READ-ONLY; click/invoke need write) --")
   iOut("    children EXPR [N]             list child transforms, bind $c0..$cN")
   iOut("                                  e.g.  children $preloader")
+  iOut("    tree EXPR [DEPTH]             the subtree, indented (learn names)")
+  iOut("                                  e.g.  tree $preloader 3")
   iOut("    find NAME [ROOT] [BUDGET]     breadth-first name search, bind $f1..")
+  iOut("    find NAME in ROOTNAME         narrow by a root named, not pointed")
+  iOut("    find more [BUDGET]            RESUME a search that hit its cap")
   iOut("                                  e.g.  find PvE")
   iOut("    click EXPR                    Button::Press (checks interactable)")
   iOut("                                  e.g.  allow write | click $f1")
@@ -2018,6 +2271,8 @@ proc iExec(line: string) =
     iCmdChildren(toks)
   of "find":
     iCmdFind(toks)
+  of "tree":
+    iCmdTree(toks)
   of "click":
     iCmdClick(toks, false)
   of "invoke":
@@ -2383,6 +2638,18 @@ proc inspectPoll(now: uint64) =
   ## the shell driver does with a serial number.
   if not gInspOn or gInspOff:
     return
+  # LATE ARMING OF THE IN-RAID ANCHOR. `bindInspect` runs ONCE, early. If the
+  # bridge had not yet bound its main drain at that moment, `gInspSlot2` stayed
+  # -1 for the entire session and the inspector was silently menu-only -- which
+  # is exactly what `state` reported: in-raid anchor slot=-1, in-raid
+  # dispatches=0 after 150k menu dispatches. Retrying here, on the host thread
+  # once per poll, costs one integer compare and arms the anchor whenever the
+  # drain actually appears.
+  if gInspSlot2 < 0 and gDrainSlot >= 0:
+    gInspSlot2 = gDrainSlot
+    okLog "live inspector: IN-RAID anchor armed late as a rider on the main " &
+          "drain's detour (slot " & $gInspSlot2 & "); commands will now " &
+          "survive a raid load"
   # The answer, whenever Unity has finished one.
   var done = -1
   cInspLock()
