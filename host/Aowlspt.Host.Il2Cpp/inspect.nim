@@ -109,6 +109,15 @@ proc cNavOffOnClick(): int32 {.importc: "aowl_nav_off_onclick", nodecl.}
 proc cNavOffInteract(): int32 {.importc: "aowl_nav_off_interact", nodecl.}
 proc cNavOffIsOn(): int32 {.importc: "aowl_nav_off_ison", nodecl.}
 proc cNavOffCachedPtr(): int32 {.importc: "aowl_nav_off_cachedptr", nodecl.}
+proc cNavIcallReady(): int32 {.importc: "aowl_nav_icall_ready", nodecl.}
+proc cNavNewString(s: cstring): Il2CppPtr {.
+  importc: "aowl_mi2_string_new", nodecl.}
+## The reflection-based System.Type route (il2cpp_class_from_name ->
+## class_get_type -> type_get_object) is DELIBERATELY NOT BOUND HERE. It is
+## implemented and documented in `aowlspt_navui.h`, but the string overload of
+## GetComponent needs none of it, and this build's standing verdict is that
+## most of the reflection surface faults with no probe result ever recorded.
+## Binding an unproven fallback that is never reached would be dead risk.
 proc cNavReason(): int32 {.importc: "aowl_nav_last_reason", nodecl.}
 proc cNavActualValid(): int32 {.importc: "aowl_nav_actual_valid", nodecl.}
 proc cNavActualAt(i: int32): int32 {.importc: "aowl_nav_actual_at", nodecl.}
@@ -1681,6 +1690,71 @@ proc iCmdTree(toks: seq[string]) =
           "the depth here."
         else: "  -- complete."))
 
+proc iCmdComponent(toks: seq[string]) =
+  ## `component EXPR TypeName [more...]` -- resolve a component on a
+  ## GameObject or Transform.
+  ##
+  ## THIS IS THE MISSING LINK. `children` and `find` return TRANSFORMS, and a
+  ## Transform is not a Button -- reading Button offsets off one produced a
+  ## klass pointer that was reported as `m_OnClick`. Everything that acts on a
+  ## control needs the COMPONENT, and this is the only way to get from one to
+  ## the other.
+  if toks.len < 3:
+    iErr("usage: component EXPR TypeName   (e.g. component $g0 Button)")
+    return
+  var v = 0'u64
+  var err = ""
+  if not iEval(toks[1], v, err):
+    iErr(err)
+    return
+  var target = cast[Il2CppPtr](v)
+  if not duOk(target, 0x20'i32) or not iUnityAlive(target):
+    iErr("not readable, or its native half is null; refusing to call.")
+    return
+  # THE STRING ROUTE. No Il2CppClass, no System.Type, no MethodInfo, no
+  # reflection -- only `il2cpp_string_new`, which the version brand already
+  # proves works on the Unity thread. A Transform IS a Component, so this
+  # takes exactly what `children` hands back.
+  var fn: Il2CppPtr = nil
+  var rva = 0'u32
+  if not iNavFind("GetComponent(String)", fn, rva):
+    return
+  # The wrapper's failure branch RAISES a missing-method exception, and a
+  # managed throw from inside our own call on the Unity thread is not something
+  # to discover empirically. Ask first, off the hot path.
+  if cNavIcallReady() == 0'i32:
+    iErr("the icall \"UnityEngine.Component::GetComponent(System.String)\" is " &
+         "NOT registered in this runtime, so calling the wrapper would take " &
+         "its failure branch and RAISE a missing-method exception inside the " &
+         "detour. Nothing was called.")
+    return
+  # `toCString` takes a mutable string, so the type name goes through a local.
+  var typeName = toks[2]
+  let sp = cNavNewString(toCString(typeName))
+  if sp == nil:
+    iErr("il2cpp_string_new returned null for \"" & toks[2] &
+         "\"; nothing was called.")
+    return
+  iOut("  via UnityEngine.Component::GetComponent(System.String) @0x" &
+       iHexPad(uint64(rva), 6) & " (call) on " & iPtr(target) &
+       "   type string = " & iPtr(sp))
+  iMark("Component::GetComponent(String)", target)
+  let comp = cast[Il2CppPtr](cInspUPP(fn, target, sp, nil))
+  if comp == nil:
+    iErr("GetComponent returned NULL -- this is an ANSWER, not a crash. " &
+         "Either this object genuinely has no " & toks[2] & " (it may be a " &
+         "container, with the control on a child -- try `children` then " &
+         "`component $cN " & toks[2] & "`), or Unity's SHORT-NAME match did " &
+         "not accept \"" & toks[2] & "\". Unity matches this overload by " &
+         "short type name; if you suspect the latter, try the fully-qualified " &
+         "name, e.g. UnityEngine.UI.Button.")
+    return
+  iNoteKlass(comp)
+  iSetVar("comp", cast[uint64](comp))
+  iOut("  FOUND " & toks[2] & " component = " & iPtr(comp) &
+       "  klass=" & iPtrU(iKlassOf(comp)) & "   ($comp)")
+  iOut("  bound to $comp -- e.g.  allow write   then   click $comp")
+
 proc iCmdRect(toks: seq[string]) =
   ## `rect EXPR` -- RectTransform geometry, from targets already byte-verified
   ## for the overlay. Useful for confirming that something actually happened:
@@ -2289,6 +2363,8 @@ proc iCmdHelp() =
   iOut("    find NAME [ROOT] [BUDGET]     breadth-first name search, bind $f1..")
   iOut("    find NAME in ROOTNAME         narrow by a root named, not pointed")
   iOut("    find more [BUDGET]            RESUME a search that hit its cap")
+  iOut("    component EXPR TypeName       GameObject/Transform -> component")
+  iOut("                                  e.g.  component $g0 Button   -> $comp")
   iOut("    rect EXPR                     RectTransform geometry probe")
   iOut("    label EXPR                    TMP_Text.m_text as a field read")
   iOut("                                  e.g.  find PvE")
@@ -2436,6 +2512,8 @@ proc iExec(line: string) =
     iCmdFind(toks)
   of "tree":
     iCmdTree(toks)
+  of "component", "comp":
+    iCmdComponent(toks)
   of "rect":
     iCmdRect(toks)
   of "label":

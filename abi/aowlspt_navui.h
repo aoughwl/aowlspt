@@ -151,6 +151,55 @@ static const AowlNavTarget aowl_nav_targets[] = {
         0x80,0x3D,0xCC,0xC5,0xD3,0x01,0x00,
         0x48,0x8B,0xD9 }, 16 },
 
+    /* ---- THE MISSING LINK: Transform -> Button.
+     *
+     * `children` and `find` return TRANSFORMS. A Transform is not a Button, so
+     * reading Button offsets off one produces garbage that looks plausible --
+     * which is exactly what happened: +0x100 read back the RectTransform KLASS
+     * pointer and was reported as `m_OnClick`, identically for two different
+     * objects.
+     *
+     * `Component::GetComponent(System.String)` is the route chosen over the
+     * three alternatives, and the reason is worth recording because the
+     * obvious choice is the wrong one on this build:
+     *
+     *   * GetComponent(System.Type) needs a live System.Type, which needs an
+     *     Il2CppClass*, which needs reflection -- and this project's standing
+     *     verdict is that most of the reflection surface FAULTS here. Worse,
+     *     no probe verdict for `il2cpp_class_from_name` was ever written down,
+     *     so it is an unknown, not a known-good.
+     *   * GetComponent<T> is shared generic code. `AddComponent<T>` @0x2A9AE90
+     *     does `cmp qword [rdx+0x38], 0` fourteen bytes in, so a NULL
+     *     MethodInfo faults immediately, and recovering a real one means
+     *     locating that instantiation's specific lazily-filled .data slot.
+     *   * The STRING overload needs NO klass, NO System.Type, NO MethodInfo
+     *     and NO reflection. Its only dependency is `il2cpp_string_new`, which
+     *     is already live-proven on the Unity thread by the version brand.
+     *
+     * A Transform IS a Component, so this takes what `children` already hands
+     * back, with no conversion step to get wrong.
+     *
+     *   RCX = Component* (a Transform is fine)
+     *   RDX = Il2CppString* from il2cpp_string_new("Button")
+     *   R8  = NULL MethodInfo* -- the wrapper never reads it
+     *
+     * CORROBORATED: this is an icall wrapper, and the icall name string it
+     * resolves sits at RVA 0x58F9AA0 and reads, verbatim,
+     * "UnityEngine.Component::GetComponent(System.String)". An RVA whose own
+     * code points at a string naming the method is about as strong as static
+     * confirmation gets.
+     *
+     * CAVEAT, recorded rather than glossed: Unity matches the string overload
+     * by SHORT type name, and that "Button" resolves to UnityEngine.UI.Button
+     * on this build is a RUNTIME question that no amount of metadata reading
+     * settles. The command reports a NULL return as an answer, not a failure,
+     * and suggests a fully-qualified name. */
+    { "UnityEngine.Component::GetComponent(String)", 0x52A48E0u,
+      { 0x48,0x89,0x5C,0x24,0x08,
+        0x57,
+        0x48,0x83,0xEC,0x20,
+        0x48,0x8B,0x05,0x07,0xFC,0xE2 }, 16 },
+
     { "UnityEngine.Events.UnityEvent::Invoke", 0x52C34A0u,
       { 0x48,0x89,0x5C,0x24,0x18,
         0x48,0x89,0x6C,0x24,0x20,
@@ -179,6 +228,155 @@ static const AowlNavTarget aowl_nav_targets[] = {
 #define AOWL_NAV_TOG_ISON        0x120  /* Toggle.m_IsOn              bool   */
 #define AOWL_NAV_TOG_ONVALUE     0x118  /* Toggle.onValueChanged -> event    */
 #define AOWL_NAV_UOBJ_CACHEDPTR  0x010  /* UnityEngine.Object.m_CachedPtr    */
+
+/* ------------------------------------------------------------------ *
+ * GETTING A `System.Type`, WHICH IS WHAT GetComponent NEEDS.
+ *
+ * This project's standing verdict is that IL2CPP REFLECTION IS DEAD on this
+ * build: il2cpp_object_get_class, il2cpp_class_get_name and il2cpp_value_box
+ * all fault. So nothing here assumes anything. What is established is only
+ * that the following are present in GameAssembly.dll's PE export table, which
+ * was read directly to confirm it:
+ *
+ *   il2cpp_domain_get, il2cpp_domain_get_assemblies, il2cpp_assembly_get_image,
+ *   il2cpp_class_from_name, il2cpp_class_get_type, il2cpp_type_get_object
+ *
+ * Exported is not the same as working, and this file does not pretend
+ * otherwise. The chain below is ATTEMPTED, once, from inside the inspector's
+ * per-command SEH guard, with a breadcrumb set before each hop -- so if any
+ * link faults, the caught fault names the exact hop instead of taking the
+ * client down. That is precisely the shape this instrument exists to make
+ * safe: try the risky thing under a guard that reports, rather than reason
+ * about it from the outside and guess.
+ *
+ * `il2cpp_class_from_name` in particular is already relied on elsewhere in the
+ * project (see aowlspt_bridge.h), which is the reason this route is worth
+ * trying at all rather than being dismissed with the rest of reflection.
+ * ------------------------------------------------------------------ */
+
+typedef void*  (*AowlNavDomainGet)(void);
+typedef void** (*AowlNavDomainAssemblies)(void*, size_t*);
+typedef void*  (*AowlNavAssemblyImage)(void*);
+typedef void*  (*AowlNavClassFromName)(void*, const char*, const char*);
+typedef void*  (*AowlNavClassGetType)(void*);
+typedef void*  (*AowlNavTypeGetObject)(void*);
+
+static AowlNavDomainGet        g_nav_domain_get   = 0;
+static AowlNavDomainAssemblies g_nav_assemblies   = 0;
+static AowlNavAssemblyImage    g_nav_asm_image    = 0;
+static AowlNavClassFromName    g_nav_class_byname = 0;
+static AowlNavClassGetType     g_nav_class_type   = 0;
+static AowlNavTypeGetObject    g_nav_type_object  = 0;
+static int                     g_nav_exports_done = 0;
+
+/* Which hop was last attempted, so a caught fault can name it. */
+static int32_t aowl_nav_hop = 0;
+#define AOWL_NAV_HOP_NONE       0
+#define AOWL_NAV_HOP_DOMAIN     1
+#define AOWL_NAV_HOP_ASSEMBLIES 2
+#define AOWL_NAV_HOP_IMAGE      3
+#define AOWL_NAV_HOP_CLASS      4
+#define AOWL_NAV_HOP_TYPE       5
+#define AOWL_NAV_HOP_TYPEOBJ    6
+
+static void aowl_nav_exports_init(void) {
+    HMODULE ga;
+    if (g_nav_exports_done) return;
+    g_nav_exports_done = 1;
+    ga = GetModuleHandleA("GameAssembly.dll");
+    if (!ga) return;
+    g_nav_domain_get   = (AowlNavDomainGet)(void*)GetProcAddress(ga, "il2cpp_domain_get");
+    g_nav_assemblies   = (AowlNavDomainAssemblies)(void*)GetProcAddress(ga, "il2cpp_domain_get_assemblies");
+    g_nav_asm_image    = (AowlNavAssemblyImage)(void*)GetProcAddress(ga, "il2cpp_assembly_get_image");
+    g_nav_class_byname = (AowlNavClassFromName)(void*)GetProcAddress(ga, "il2cpp_class_from_name");
+    g_nav_class_type   = (AowlNavClassGetType)(void*)GetProcAddress(ga, "il2cpp_class_get_type");
+    g_nav_type_object  = (AowlNavTypeGetObject)(void*)GetProcAddress(ga, "il2cpp_type_get_object");
+}
+
+static int32_t aowl_nav_have_type_route(void) {
+    aowl_nav_exports_init();
+    return (g_nav_domain_get && g_nav_assemblies && g_nav_asm_image &&
+            g_nav_class_byname && g_nav_class_type && g_nav_type_object) ? 1 : 0;
+}
+
+static int32_t aowl_nav_last_hop(void) { return aowl_nav_hop; }
+
+/* ---- THE PRE-FLIGHT PROBE for the string route.
+ *
+ * The GetComponent wrapper's failure branch RAISES a missing-method exception
+ * when the icall is not registered. A managed exception thrown from inside our
+ * own call, on the Unity thread, is not something to discover empirically.
+ *
+ * `il2cpp_resolve_icall` is exported and answers the question directly and
+ * off the hot path: non-NULL means the icall is registered and that branch is
+ * unreachable. Asking first costs one call; not asking risks a throw inside a
+ * detour. */
+typedef void* (*AowlNavResolveIcall)(const char*);
+static AowlNavResolveIcall g_nav_resolve_icall = 0;
+static int                 g_nav_icall_probed  = 0;
+static int32_t             g_nav_icall_ok      = 0;
+
+static int32_t aowl_nav_icall_ready(void) {
+    HMODULE ga;
+    if (g_nav_icall_probed) return g_nav_icall_ok;
+    g_nav_icall_probed = 1;
+    ga = GetModuleHandleA("GameAssembly.dll");
+    if (!ga) return 0;
+    g_nav_resolve_icall = (AowlNavResolveIcall)(void*)
+        GetProcAddress(ga, "il2cpp_resolve_icall");
+    if (!g_nav_resolve_icall) return 0;
+    g_nav_icall_ok = g_nav_resolve_icall(
+        "UnityEngine.Component::GetComponent(System.String)") ? 1 : 0;
+    return g_nav_icall_ok;
+}
+
+/* Search every loaded assembly's image for <ns>.<name>. Capped, because a
+ * corrupt count from a faulting export must not become an unbounded loop on
+ * the Unity thread -- a hang costs the whole session, a wrong answer costs one
+ * command. */
+static void* aowl_nav_find_class(const char* ns, const char* name) {
+    void* domain;
+    void** asms;
+    size_t count = 0, i;
+    aowl_nav_exports_init();
+    if (!aowl_nav_have_type_route()) return NULL;
+
+    aowl_nav_hop = AOWL_NAV_HOP_DOMAIN;
+    domain = g_nav_domain_get();
+    if (!domain) return NULL;
+
+    aowl_nav_hop = AOWL_NAV_HOP_ASSEMBLIES;
+    asms = g_nav_assemblies(domain, &count);
+    if (!asms || count == 0 || count > 512) return NULL;
+
+    for (i = 0; i < count; i++) {
+        void* img;
+        void* klass;
+        if (!asms[i]) continue;
+        aowl_nav_hop = AOWL_NAV_HOP_IMAGE;
+        img = g_nav_asm_image(asms[i]);
+        if (!img) continue;
+        aowl_nav_hop = AOWL_NAV_HOP_CLASS;
+        klass = g_nav_class_byname(img, ns, name);
+        if (klass) { aowl_nav_hop = AOWL_NAV_HOP_NONE; return klass; }
+    }
+    aowl_nav_hop = AOWL_NAV_HOP_NONE;
+    return NULL;
+}
+
+/* klass -> Il2CppType* -> System.Type object. */
+static void* aowl_nav_type_object(void* klass) {
+    void* ty;
+    aowl_nav_exports_init();
+    if (!klass || !g_nav_class_type || !g_nav_type_object) return NULL;
+    aowl_nav_hop = AOWL_NAV_HOP_TYPE;
+    ty = g_nav_class_type(klass);
+    if (!ty) { aowl_nav_hop = AOWL_NAV_HOP_NONE; return NULL; }
+    aowl_nav_hop = AOWL_NAV_HOP_TYPEOBJ;
+    ty = g_nav_type_object(ty);
+    aowl_nav_hop = AOWL_NAV_HOP_NONE;
+    return ty;
+}
 
 static int32_t aowl_nav_off_onclick(void)   { return AOWL_NAV_BTN_ONCLICK;    }
 static int32_t aowl_nav_off_interact(void)  { return AOWL_NAV_SEL_INTERACT;   }
