@@ -144,6 +144,9 @@ var gRefusedBudget: int64 = 0
 var gLastMatchName = ""
 var gUploadFailReported = false
 
+const MaxUnmatchedLogged = 40
+var gUnmatchedLogged = 0
+
 # Runtime + bindings, all resolved at arm time (post-boot), never at load.
 var gRt = Il2Cpp(handle: cast[Il2CppPtr](0), loaded: false, lastError: 0'i32,
                  missing: @[])
@@ -275,6 +278,19 @@ proc onTextureReturn(target, args: string): HookResult =
   inc gTexReturns
   let idx = lookup(name)
   if idx < 0:
+    # The single most useful thing one live run can tell us: what BSG actually
+    # names the textures it loads. The curated manifest is a NAME table, so if
+    # the namespaces disagree there will be zero matches and no other evidence
+    # of why. Log a hard-capped SAMPLE (never a storm) of the names that came
+    # back and missed, so the pipeline can be re-aimed from one run instead of
+    # guessing. Capped at MaxUnmatchedLogged for the whole session.
+    if gUnmatchedLogged < MaxUnmatchedLogged:
+      inc gUnmatchedLogged
+      info "textures  unmatched sample " & $gUnmatchedLogged & "/" &
+           $MaxUnmatchedLogged & ": \"" & name & "\""
+      if gUnmatchedLogged == MaxUnmatchedLogged:
+        info "textures  unmatched sampling stopped at " &
+             $MaxUnmatchedLogged & " names (the cap); counts keep running"
     return keepResult()
   if entryConf(idx) < gMinConf:
     return keepResult()

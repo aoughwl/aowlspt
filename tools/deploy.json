@@ -6,9 +6,7 @@
   "//4": "Markers must be literals the compiler cannot fold away -- log message",
   "//5": "text is ideal, because it is emitted verbatim and it names the feature.",
   "//6": "Add a marker the same day you add a feature; that is the whole point.",
-
   "install": "D:\\Aowlspt\\aowlspt",
-
   "artifacts": [
     {
       "name": "host",
@@ -70,6 +68,21 @@
         "aowlspt-launch",
         "host running",
         "backendUrl"
+      ]
+    },
+    {
+      "name": "textures",
+      "src": "mods/textures/bin/textures.dll",
+      "dst": "mods/textures/textures.dll",
+      "minBytes": 300000,
+      "markers": [
+        "aowl.textures",
+        "textures  manifest:",
+        "textures  verified ",
+        "textures  hooked ",
+        "textures  ARMED post-boot in mode",
+        "textures  unmatched sample",
+        "prologue MISMATCH"
       ]
     }
   ]
