@@ -182,8 +182,150 @@ static int32_t aowl_http_call(int32_t port, const char* req, int32_t reqLen,
 }
 """.}
 
+{.emit: """
+/* Who holds a port, and getting it back.
+ *
+ * The launcher used to answer "is the backend up?" with `answers()` alone --
+ * an HTTP request to the port. That question cannot tell the two cases that
+ * matter apart. A backend left over from the previous session answers it just
+ * as well as the one this launcher started, and answering it is exactly what
+ * makes the failure silent: the new backend loses the bind and dies, the
+ * launcher sees the port answering, and the game plays a whole session against
+ * a process running last week's `tarkov.dll`.
+ *
+ * So: a connect that only asks whether *anything* holds the port (TLS included,
+ * where no HTTP request is possible), a listener-table lookup that says which
+ * process holds it, and a terminate-by-pid for the one case where the answer is
+ * "an aowlspt-backend.exe nobody is using". Nothing here kills anything the
+ * caller has not first identified. */
+
+static void aowl_sess_sleep(int32_t ms) { Sleep((DWORD)ms); }
+
+/*  1 something is listening on 127.0.0.1:port
+ *  0 nothing is
+ * -1 the question could not be asked (no winsock) */
+static int32_t aowl_port_taken(int32_t port) {
+  SOCKET s;
+  struct sockaddr_in a;
+  if (!aowl_sws_ready()) return -1;
+  s = aowl_sp_socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+  if (s == INVALID_SOCKET) return -1;
+  memset(&a, 0, sizeof(a));
+  a.sin_family = AF_INET;
+  a.sin_port = aowl_sp_htons((unsigned short)port);
+  a.sin_addr.s_addr = aowl_sp_htonl(INADDR_LOOPBACK);
+  if (aowl_sp_connect(s, (struct sockaddr*)&a, (int)sizeof(a)) == SOCKET_ERROR) {
+    aowl_sp_closesocket(s);
+    return 0;
+  }
+  aowl_sp_closesocket(s);
+  return 1;
+}
+
+/* The pid listening on a loopback TCP port, or 0 if that could not be found
+ * out, with the full image path written into `out` (or left empty). The same
+ * lookup `aowl_net_port_holder` in aowlspt_net.h does, repeated here rather
+ * than shared because that header includes winsock2 and this translation unit
+ * is on winsock 1.1 through <windows.h> -- see the block above.
+ *
+ * The pid and the path fail independently and are reported independently:
+ * `OpenProcess` on a service or another user's process legitimately fails, and
+ * a caller that gets a pid with no path has learned that something holds the
+ * port and NOT that it is ours. It must not kill it. */
+static int32_t aowl_port_holder(int32_t port, char* out, int32_t outLen) {
+  typedef DWORD (WINAPI *AowlGetExtTcpTable)(PVOID, PDWORD, BOOL, ULONG,
+                                             ULONG, ULONG);
+  typedef BOOL (WINAPI *AowlQueryImageName)(HANDLE, DWORD, LPSTR, PDWORD);
+  typedef struct {
+    DWORD dwState;
+    DWORD dwLocalAddr;
+    DWORD dwLocalPort;
+    DWORD dwRemoteAddr;
+    DWORD dwRemotePort;
+    DWORD dwOwningPid;
+  } AowlSessTcpRow;
+  typedef struct {
+    DWORD dwNumEntries;
+    AowlSessTcpRow table[1];
+  } AowlSessTcpTable;
+
+  HMODULE ip;
+  AowlGetExtTcpTable getTable;
+  DWORD pid = 0;
+  DWORD size = 0;
+  HANDLE h;
+
+  if (out && outLen > 0) out[0] = 0;
+  if (!aowl_sws_ready()) return 0;   /* htons */
+  ip = LoadLibraryA("iphlpapi.dll");
+  if (!ip) return 0;
+  getTable = (AowlGetExtTcpTable)(void*)GetProcAddress(ip, "GetExtendedTcpTable");
+  if (!getTable) { FreeLibrary(ip); return 0; }
+
+  /* 3 is TCP_TABLE_OWNER_PID_LISTENER: listeners only, so a client socket that
+   * happens to have this as its ephemeral local port is not mistaken for the
+   * thing holding it. */
+  if (getTable(NULL, &size, FALSE, AF_INET, 3, 0) == ERROR_INSUFFICIENT_BUFFER
+      && size > 0) {
+    char* buf = (char*)malloc((size_t)size);
+    if (buf) {
+      if (getTable(buf, &size, FALSE, AF_INET, 3, 0) == NO_ERROR) {
+        AowlSessTcpTable* t = (AowlSessTcpTable*)buf;
+        unsigned short want = aowl_sp_htons((unsigned short)port);
+        DWORD i;
+        for (i = 0; i < t->dwNumEntries; i++) {
+          if ((unsigned short)(t->table[i].dwLocalPort & 0xFFFF) == want) {
+            pid = t->table[i].dwOwningPid;
+            break;
+          }
+        }
+      }
+      free(buf);
+    }
+  }
+  FreeLibrary(ip);
+  if (!pid) return 0;
+
+  /* 0x1000 is PROCESS_QUERY_LIMITED_INFORMATION, the access right that works
+   * across an integrity boundary for exactly this question. */
+  h = OpenProcess(0x1000, FALSE, pid);
+  if (h) {
+    HMODULE k32 = GetModuleHandleA("kernel32.dll");
+    AowlQueryImageName q = k32
+        ? (AowlQueryImageName)(void*)GetProcAddress(k32,
+                                                    "QueryFullProcessImageNameA")
+        : NULL;
+    if (q && out && outLen > 1) {
+      DWORD n = (DWORD)(outLen - 1);
+      if (q(h, 0, out, &n)) out[n] = 0;
+    }
+    CloseHandle(h);
+  }
+  return (int32_t)pid;
+}
+
+/* Terminate a pid and wait for it to actually be gone. 1 on success, 0 if it
+ * could not be opened or could not be killed -- and the caller must treat 0 as
+ * "the port is still somebody else's", never as "probably fine". */
+static int32_t aowl_kill_pid(int32_t pid, int32_t waitMs) {
+  HANDLE h;
+  if (pid <= 0) return 0;
+  h = OpenProcess(PROCESS_TERMINATE | SYNCHRONIZE, FALSE, (DWORD)pid);
+  if (!h) return 0;
+  if (!TerminateProcess(h, 0)) { CloseHandle(h); return 0; }
+  WaitForSingleObject(h, (DWORD)waitMs);
+  CloseHandle(h);
+  return 1;
+}
+""".}
+
 proc cHttpCall(port: int32; req: cstring; reqLen: int32; outBuf: pointer;
                outCap: int32): int32 {.importc: "aowl_http_call", nodecl.}
+proc cPortTaken(port: int32): int32 {.importc: "aowl_port_taken", nodecl.}
+proc cPortHolder(port: int32; buf: ptr char; cap: int32): int32 {.
+  importc: "aowl_port_holder", nodecl.}
+proc cKillPid(pid, waitMs: int32): int32 {.importc: "aowl_kill_pid", nodecl.}
+proc cSessSleep(ms: int32) {.importc: "aowl_sess_sleep", nodecl.}
 
 const
   ProbeSession* = "000000000000000000000001"
@@ -290,6 +432,139 @@ proc answers*(port: int): int =
   if r.ok: return 1
   if find(r.error, "winsock") >= 0: return -1
   result = 0
+
+# ---------------------------------------------------------------------------
+# Who holds the backend's port
+# ---------------------------------------------------------------------------
+#
+# What this exists for, in one sentence: a backend left running from the last
+# session answers every check the launcher used to make, so the launcher would
+# start the game against it and the player would test a build that has not
+# existed for hours.
+#
+# The rule the rest of this file's callers are held to is that a port is only
+# ever reclaimed when the process holding it has been *identified* -- by image
+# name, or by this launcher's own ownership marker. A pid with no readable path
+# is not identified, and an unidentified holder is a reason to stop, never a
+# reason to kill something.
+
+const BackendExeName* = "aowlspt-backend.exe"
+
+type
+  PortOwner* = object
+    asked*: bool
+      ## False when the question could not be asked at all (no winsock). Then
+      ## nothing below means anything and the caller must say so.
+    taken*: bool
+    pid*: int
+      ## 0 when the listener table could not name one.
+    path*: string
+      ## Full image path, or "" when it could not be read (a service, or
+      ## another user's process).
+    ours*: bool
+      ## The holder is an `aowlspt-backend.exe`. Only ever true off a path this
+      ## process actually read, or off the ownership marker below.
+
+proc inspectPort*(port: int): PortOwner =
+  ## Who, if anyone, is listening on 127.0.0.1:`port`.
+  result = PortOwner(asked: true, taken: false, pid: 0, path: "", ours: false)
+  let t = cPortTaken(int32(port))
+  if t < 0'i32:
+    result.asked = false
+    return
+  if t == 0'i32:
+    return
+  result.taken = true
+  var buf: array[512, char] = default(array[512, char])
+  let pid = int(cPortHolder(int32(port), addr buf[0], 512'i32))
+  if pid == 0: return
+  result.pid = pid
+  var path = ""
+  var i = 0
+  while i < 512 and buf[i] != '\0':
+    path.add buf[i]
+    inc i
+  result.path = path
+  if path.len > 0:
+    result.ours = toLowerAscii(baseName(path)) == BackendExeName
+
+proc holderText*(o: PortOwner): string =
+  ## The holder in words, for a message. Never a guess: what could not be read
+  ## is left out rather than filled in with the likeliest answer.
+  if not o.taken: return "nothing"
+  if o.path.len > 0 and o.pid != 0:
+    return o.path & " (pid " & $o.pid & ")"
+  if o.pid != 0: return "pid " & $o.pid
+  result = "a process this launcher could not identify"
+
+proc killPid*(pid: int): bool =
+  ## Terminate and wait for it to be gone. False means it is still there.
+  cKillPid(int32(pid), 4000'i32) != 0'i32
+
+proc waitPortFree*(port: int; limitMs: int): bool =
+  ## Until nothing is listening on `port`, or the time is up. A terminate is
+  ## asynchronous and the socket outlives the process by a moment; binding into
+  ## that moment is how a "successful" reclaim becomes a backend that dies on a
+  ## held port two seconds later.
+  var waited = 0
+  while waited < limitMs:
+    if cPortTaken(int32(port)) == 0'i32: return true
+    cSessSleep 100'i32
+    waited = waited + 100
+  result = cPortTaken(int32(port)) == 0'i32
+
+# ---------------------------------------------------------------------------
+# The launcher's ownership marker
+# ---------------------------------------------------------------------------
+#
+# `inspectPort` can usually name the holder from its image path, and that is
+# the primary evidence. This marker is the second: the launcher writes down
+# which pid it started a backend as, on which port, and from which launcher --
+# so a holder whose path could not be read (a backend started elevated, say) is
+# still recognisable as ours, and so the reverse leak has a name. It is a hint
+# and never a fact on its own: the pid is only ever acted on when it is also
+# the pid currently holding the port.
+
+proc backendOwnerPath*(root: string): string =
+  joinPath(root, "aowlspt\\launcher-backend.pid")
+
+proc noteBackendOwner*(root: string; pid, port: int) =
+  ## `<backend pid> <port> <launcher pid>`, written the moment the backend is
+  ## spawned. Best-effort: a marker that could fail a launch would be worse
+  ## than no marker.
+  discard ensureDir(joinPath(root, "aowlspt"))
+  discard writeTextFile(backendOwnerPath(root),
+                        $pid & " " & $port & " " & $processId() & "\n")
+
+proc clearBackendOwner*(root: string) =
+  ## Called when the launcher has stopped the backend it started. A marker left
+  ## behind after a clean shutdown would claim an ownership that has ended.
+  discard removeFileAt(backendOwnerPath(root))
+
+proc readBackendOwner*(root: string; pid, port, launcher: var int): bool =
+  ## What the last launcher recorded, if anything readable is on record.
+  pid = 0
+  port = 0
+  launcher = 0
+  var text = ""
+  if not readTextFile(backendOwnerPath(root), text): return false
+  var nums: seq[int] = @[]
+  var cur = 0
+  var any = false
+  for ch in text:
+    if ch >= '0' and ch <= '9':
+      cur = cur * 10 + (ord(ch) - ord('0'))
+      any = true
+    else:
+      if any: nums.add cur
+      cur = 0
+      any = false
+  if any: nums.add cur
+  if nums.len < 2: return false
+  pid = nums[0]
+  port = nums[1]
+  if nums.len > 2: launcher = nums[2]
+  result = pid > 0
 
 # ---------------------------------------------------------------------------
 # Profiles

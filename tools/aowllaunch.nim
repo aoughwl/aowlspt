@@ -56,9 +56,20 @@ import aowlsession
 static int64_t aowl_launch_now_ms(void) {
   return (int64_t)GetTickCount64();
 }
+
+/* The pid behind a spawn handle. The launcher needs it for one question only,
+ * and it is the question this whole port-ownership path exists for: is the
+ * process currently listening on the backend port the one this launcher just
+ * started, or somebody else's? A handle cannot be compared with the pid the
+ * listener table reports; this closes that gap. */
+static int32_t aowl_spawn_pid(uint64_t handle) {
+  if (!handle) return 0;
+  return (int32_t)GetProcessId((HANDLE)(uintptr_t)handle);
+}
 """.}
 
 proc cNowMs(): int64 {.importc: "aowl_launch_now_ms", nodecl.}
+proc cSpawnPid(h: uint64): int32 {.importc: "aowl_spawn_pid", nodecl.}
 
 type LaunchPtr = nil pointer
 
@@ -120,6 +131,14 @@ proc cSleepMs(ms: int32) {.importc: "aowl_sys_sleep", nodecl.}
 proc backendJsonPath(root: string): string =
   joinPath(root, "aowlspt\\backend.json")
 
+const AssetPort = 80
+  ## The backend's second listener in TLS mode -- always plain HTTP, serving
+  ## `/files/` to a client that will not fetch images over its own HTTPS.
+  ## `aowlbackend`'s `--asset-port` default, repeated here because the launcher
+  ## does not pass the flag and so gets that default. Checked for a stale holder
+  ## alongside the main port; a collision here is not fatal, because it is not
+  ## fatal to the backend either.
+
 const Usage = """
 aowlspt-launch -- start Tarkov with the aowlspt host inside it
 
@@ -165,6 +184,12 @@ Options
   --backend-wait N
                  seconds to wait for the backend to answer before starting the
                  client (default 300, 0 to not wait at all)
+  --no-reclaim   do not terminate an aowlspt-backend.exe left over from a
+                 previous session. The launcher normally replaces one, because
+                 a stale backend answers every check and the game would play a
+                 whole session against last week's build. With this, a held
+                 port stops the launch instead -- for deliberately running two
+                 instances, or for attaching a debugger to the old one.
   --plain        no cursor movement, no colour, no repainting: one line per
                  thing that happened. Redirected output is always this.
   --ascii        box drawing in ASCII, for a console font with no line glyphs
@@ -208,6 +233,10 @@ type
       ## in `main`, once `root` is known and `backend.json` can be read.
     portGiven: bool
     allowPortMismatch: bool
+    noReclaim: bool
+      ## `--no-reclaim`: leave a stale `aowlspt-backend.exe` alone and refuse to
+      ## launch, rather than replacing it. Never changes whether the client is
+      ## started against an unverified server -- both ways stop.
     backendWait: int
     tailPath: string
       ## `--tail`: this process is a second console window showing one log.
@@ -223,6 +252,7 @@ proc parseArgs(): Options =
                    profileId: "", newProfile: "", side: "Usec",
                    noProfile: false, pick: false, port: 0,
                    portGiven: false, allowPortMismatch: false,
+                   noReclaim: false,
                    backendWait: 300, tailPath: "", tailTitle: "log",
                    help: false)
   var i = 1
@@ -285,6 +315,8 @@ proc parseArgs(): Options =
           result.portGiven = true
     elif a == "--allow-port-mismatch":
       result.allowPortMismatch = true
+    elif a == "--no-reclaim":
+      result.noReclaim = true
     elif a == "--backend-wait":
       inc i
       if i <= n:
@@ -964,6 +996,7 @@ type
     lastStartMs: int64
     lastCheckMs: int64
     givenUp: bool       ## bound hit: stop restarting, surface a hard error
+    ownerRoot: string   ## install root, so a restart can re-record the pid
 
 const
   WdCheckMs = 2000'i64    ## how often the run loops poll for a death
@@ -972,9 +1005,11 @@ const
 
 var gWd = Watchdog(exe: "", workDir: "", cmdLine: "", logPath: "", port: 0,
                    active: false, handle: 0'u64, restarts: 0, fails: 0,
-                   lastStartMs: 0'i64, lastCheckMs: 0'i64, givenUp: false)
+                   lastStartMs: 0'i64, lastCheckMs: 0'i64, givenUp: false,
+                   ownerRoot: "")
 
-proc wdArm(exe, workDir, cmdLine, logPath: string; port: int; handle: uint64) =
+proc wdArm(exe, workDir, cmdLine, logPath, root: string; port: int;
+           handle: uint64) =
   ## Remember what the backend was started as, so the watchdog can restart it
   ## byte-for-byte. Called once, right after the initial spawn.
   gWd.exe = exe
@@ -982,6 +1017,7 @@ proc wdArm(exe, workDir, cmdLine, logPath: string; port: int; handle: uint64) =
   gWd.cmdLine = cmdLine
   gWd.logPath = logPath
   gWd.port = port
+  gWd.ownerRoot = root
   gWd.handle = handle
   gWd.active = true
   gWd.lastStartMs = cNowMs()
@@ -1031,6 +1067,11 @@ proc wdPoll(clientAlive: bool): bool =
     err "backend died -- restart #" & $gWd.restarts &
         " could not be spawned (CreateProcess failed)"
     return false
+  # The restart has a new pid, so the ownership marker has to follow it --
+  # otherwise the marker names a process that no longer exists and the next
+  # launch loses its second way of recognising a leftover as ours.
+  if gWd.ownerRoot.len > 0:
+    noteBackendOwner(gWd.ownerRoot, int(cSpawnPid(h)), gWd.port)
   warn "backend died -- restarting (restart #" & $gWd.restarts &
        ", on 127.0.0.1:" & $gWd.port & ")"
   return true
@@ -1485,6 +1526,109 @@ proc runTailWindow(path, title: string) =
     sleepMs 250
 
 # ---------------------------------------------------------------------------
+# The port, before anything is started on it
+# ---------------------------------------------------------------------------
+#
+# The bug this answers, exactly as it happened: the game was closed, the backend
+# from that session stayed running, and the next launch started a new backend
+# which printed "port already in use" and died -- while the launcher carried on
+# and started the client anyway. The client then played a whole session against
+# the old process, with an old `tarkov.dll` and none of the session's fixes in
+# it. Nothing on screen said so. Every check the launcher made *passed*, because
+# every check it made was some form of "does the port answer?" -- and a stale
+# backend answers all of them.
+#
+# So the port is now settled **before** the spawn, and the question asked is not
+# "does it answer" but "who holds it":
+#
+#   nobody                      -> start, as always
+#   an aowlspt-backend.exe      -> ours to replace: terminate it, wait for the
+#                                  socket to go, say plainly that it happened
+#   anything else, or a holder
+#   that could not be named     -> stop. Do not kill it, and do not start the
+#                                  client: a launch that fails is recoverable
+#                                  in a minute, a session played against the
+#                                  wrong server is a day of wrong conclusions.
+#
+# The third case is the one worth being strict about. `--no-reclaim` turns the
+# second into the third for anyone deliberately running two instances; it never
+# turns the third into the second.
+
+proc reclaimPort(root, what: string; port: int; noReclaim, fatal: bool): bool =
+  ## True when `port` is clear for this launcher to bind. When `fatal` is false
+  ## a foreign holder is reported and tolerated -- that is the asset listener,
+  ## which the backend itself treats as a loss of one route rather than a
+  ## reason not to serve.
+  let owner = inspectPort(port)
+  if not owner.asked:
+    warn "could not ask what holds the " & what & " port " & $port &
+         " (winsock would not load), so a stale server cannot be ruled out"
+    return true
+  if not owner.taken:
+    line "  " & what & " port " & $port & " is free"
+    return true
+
+  # Second evidence, for a holder whose image path could not be read: this
+  # launcher's own marker from the session that started it. Only ever believed
+  # when the recorded pid is the pid *currently* holding the port.
+  var ours = owner.ours
+  var fromMarker = false
+  if not ours and owner.pid != 0:
+    var mPid = 0
+    var mPort = 0
+    var mLauncher = 0
+    if readBackendOwner(root, mPid, mPort, mLauncher) and mPid == owner.pid:
+      ours = true
+      fromMarker = true
+
+  if not ours:
+    let msg = what & " port " & $port & " is held by " & holderText(owner) &
+              ", which is not an aowlspt backend"
+    if not fatal:
+      warn msg
+      note "the backend will start without its plain-HTTP asset listener; " &
+           "images served from that port will not load"
+      return true
+    err msg
+    note "the launcher does not kill a process it did not start, and it will " &
+         "not start the game against a server it did not start either -- that " &
+         "is how a session gets played against the wrong backend without " &
+         "anything saying so."
+    note "stop whatever holds " & $port & " (an SPT server, or IIS on 80), or " &
+         "point backendUrl in aowlspt\\backend.json at a free port, then " &
+         "launch again. Nothing was started."
+    return false
+
+  let whose = (if fromMarker: "recorded by this launcher as its own backend"
+               else: "an aowlspt-backend.exe")
+  if noReclaim:
+    err what & " port " & $port & " is held by " & whose & ", pid " &
+        $owner.pid & ", and --no-reclaim was given"
+    note "drop --no-reclaim to have the launcher replace it. The client is " &
+         "not being started: it would talk to that process, not to the " &
+         "backend this session would have built."
+    return false
+
+  warn what & " port " & $port & " is held by " & whose & " left over from a " &
+       "previous session (pid " & $owner.pid & ")"
+  if not killPid(owner.pid):
+    err "could not terminate pid " & $owner.pid & ", so " & $port &
+        " is still not ours"
+    note "stop it by hand (Task Manager, or `taskkill /pid " & $owner.pid &
+         " /f`) and launch again. The client was not started."
+    return false
+  if not waitPortFree(port, 5000):
+    err "pid " & $owner.pid & " was terminated but " & $port &
+        " is still held 5s later"
+    note "something else is on that port too. The client was not started, " &
+         "because it would have talked to whatever that is."
+    return false
+  ok "stale backend pid " & $owner.pid & " from a previous session -- " &
+     "terminated and replaced"
+  clearBackendOwner(root)
+  result = true
+
+# ---------------------------------------------------------------------------
 
 proc banner(root: string) =
   if termMode() != tmFull: return
@@ -1662,6 +1806,26 @@ proc main(): int =
           line "  would find    nothing answering on 127.0.0.1:" & $port &
                " -- start one by hand first"
     elif fileExists(be):
+      # The port check, reported rather than performed. This is the whole of
+      # what decides whether a real launch starts anything at all, so a dry run
+      # that left it out would answer a different question than the one asked.
+      let dOwner = inspectPort(port)
+      if not dOwner.asked:
+        line "  would check   port " & $port & " -- but winsock will not load, " &
+             "so it cannot be asked what holds it"
+      elif not dOwner.taken:
+        line "  would find    port " & $port & " free"
+      elif dOwner.ours:
+        if o.noReclaim:
+          line "  would REFUSE  port " & $port & " is held by " &
+               holderText(dOwner) & " and --no-reclaim was given"
+        else:
+          line "  would reclaim port " & $port & " from " & holderText(dOwner) &
+               " -- a stale backend, terminated and replaced"
+      else:
+        line "  would REFUSE  port " & $port & " is held by " &
+             holderText(dOwner) & ", which is not an aowlspt backend -- the " &
+             "client would not be started"
       line "  would start   " & be & " --port " & $port &
            (if https: " --tls" else: "")
       if o.backendWait > 0:
@@ -1747,6 +1911,17 @@ proc main(): int =
     if not fileExists(backendExe):
       warn "no backend at " & backendExe & "; starting the client alone"
     else:
+      # Before the spawn, not after it. See `reclaimPort`: reacting to the
+      # child's failure is what let a stale backend serve a whole session.
+      if not reclaimPort(root, "backend", port, o.noReclaim, true):
+        return 1
+      # The backend opens a second, always-plain listener on 80 in TLS mode
+      # (`--asset-port`), and a stale backend holds that one too. Not fatal --
+      # the backend itself treats it as the loss of one route -- but the same
+      # stale process is reclaimed by the same rule.
+      if https:
+        discard reclaimPort(root, "asset", AssetPort, o.noReclaim, false)
+
       var be = backendExe
       var bd = joinPath(root, "aowlspt")
       # `--port` is passed even in TLS mode (443, or the explicit url port), and
@@ -1765,8 +1940,13 @@ proc main(): int =
       # Arm the watchdog with exactly these spawn arguments. From here on, if the
       # backend dies while the game is alive, the run loops restart it from this
       # -- the player never sees the crash, only a brief "server restarting".
-      wdArm(be, bd, bc, joinPath(root, "aowlspt\\aowlspt-backend.log"), port,
-            backendProc)
+      wdArm(be, bd, bc, joinPath(root, "aowlspt\\aowlspt-backend.log"), root,
+            port, backendProc)
+      # Ownership, written down. If this launcher never gets to clear it -- the
+      # console was closed, the machine was reset -- the next one reads it and
+      # can name the leftover as ours even when the listener table gives it a
+      # pid with no readable path.
+      noteBackendOwner(root, int(cSpawnPid(backendProc)), port)
       # Not `ok`, and not "started". All that is known here is that
       # `CreateProcess` returned a handle: the backend may already have exited
       # on a bad database, a held port or a mod that throws on load. It printed
@@ -1795,6 +1975,32 @@ proc main(): int =
         if died:
           err "the backend exited while starting; see " &
               joinPath(root, "aowlspt\\aowlspt-backend.log")
+          clearBackendOwner(root)
+          return 1
+        if interrupted():
+          # Ctrl+C during the wait used to fall through to "it has not answered
+          # -- starting the client anyway", which starts a game against a server
+          # nobody waited for. An interrupt is an instruction to stop.
+          clearInterrupt()
+          err "interrupted while waiting for the backend"
+          cSpawnKill(wdCurrentHandle(backendProc))
+          clearBackendOwner(root)
+          line "  backend stopped"
+          return 1
+        # The last thing between a green tick and the bug this all exists for:
+        # the process now listening on the port must be the one just started.
+        # Everything above proves *a* server answered.
+        let holder = inspectPort(port)
+        let ourPid = int(cSpawnPid(backendProc))
+        if holder.asked and holder.taken and holder.pid != 0 and ourPid != 0 and
+           holder.pid != ourPid:
+          err "127.0.0.1:" & $port & " is held by " & holderText(holder) &
+              ", not by the backend this launcher started (pid " & $ourPid & ")"
+          note "something claimed the port between the check and the spawn. " &
+               "The client is not being started -- it would talk to that " &
+               "process. Launch again."
+          cSpawnKill(wdCurrentHandle(backendProc))
+          clearBackendOwner(root)
           return 1
         if probeBroken:
           warn "could not open a socket to ask the backend anything, so " &
@@ -1896,6 +2102,7 @@ proc main(): int =
            "create one, or --no-profile to start the client without one."
       if backendProc != 0'u64:
         cSpawnKill(backendProc)
+        clearBackendOwner(root)
         line "  backend stopped"
       return 1
 
@@ -1917,6 +2124,7 @@ proc main(): int =
              "not a launcher one -- see aowlspt-backend.log."
         if backendProc != 0'u64:
           cSpawnKill(backendProc)
+          clearBackendOwner(root)
           line "  backend stopped"
         return 1
       token = bound.token
@@ -1928,6 +2136,7 @@ proc main(): int =
       err "the profile was chosen but there is no token to launch with"
       if backendProc != 0'u64:
         cSpawnKill(backendProc)
+        clearBackendOwner(root)
         line "  backend stopped"
       return 1
     # Remembered *after* the bind succeeded, so a profile that could not be
@@ -1943,7 +2152,9 @@ proc main(): int =
   let launch = cLaunchNew()
   if launch == nil:
     err "out of memory"
-    if backendProc != 0'u64: cSpawnKill(backendProc)
+    if backendProc != 0'u64:
+      cSpawnKill(backendProc)
+      clearBackendOwner(root)
     return 1
 
   var e = exePath
@@ -1952,7 +2163,9 @@ proc main(): int =
   if cLaunchStart(launch, toCString(e), toCString(w), toCString(cmd)) == 0'i32:
     err "could not start " & exePath & " (error " & $int(cLaunchError(launch)) & ")"
     cLaunchFree(launch)
-    if backendProc != 0'u64: cSpawnKill(backendProc)
+    if backendProc != 0'u64:
+      cSpawnKill(backendProc)
+      clearBackendOwner(root)
     return 1
   ok "started suspended, pid " & $int(cLaunchPid(launch))
 
@@ -1965,7 +2178,9 @@ proc main(): int =
     cLaunchKill(launch)
     cLaunchClose(launch)
     cLaunchFree(launch)
-    if backendProc != 0'u64: cSpawnKill(backendProc)
+    if backendProc != 0'u64:
+      cSpawnKill(backendProc)
+      clearBackendOwner(root)
     return 1
   ok "host injected"
 
@@ -1974,7 +2189,9 @@ proc main(): int =
     cLaunchKill(launch)
     cLaunchClose(launch)
     cLaunchFree(launch)
-    if backendProc != 0'u64: cSpawnKill(backendProc)
+    if backendProc != 0'u64:
+      cSpawnKill(backendProc)
+      clearBackendOwner(root)
     return 1
   ok "client resumed"
 
@@ -2021,7 +2238,18 @@ proc main(): int =
       let h = wdCurrentHandle(backendProc)
       if h != 0'u64:
         cSpawnKill(h)
+        clearBackendOwner(root)
         line "  backend stopped"
+    elif backendProc != 0'u64:
+      # The reverse leak, said out loud. `--no-logs` without `--wait` returns
+      # here with the backend still running on purpose -- but a backend nobody
+      # is watching is exactly the one that is still there next time, and the
+      # marker is what lets the next launch name it as ours.
+      note "the backend is still running (pid " &
+           $int(cSpawnPid(wdCurrentHandle(backendProc))) & ") because this " &
+           "launcher was told not to watch the logs. Stop it when the game " &
+           "exits, or leave it: the next launch will recognise it as this " &
+           "launcher's and replace it."
   else:
     var detached = false
     runLogView(root, who, backendProc, launch, true, detached)
@@ -2030,11 +2258,14 @@ proc main(): int =
       ok "detached: the game and the backend are still running"
       note "the logs are at " & joinPath(root, "aowlspt\\aowlspt-backend.log") &
            " and " & hostLog
+      # The marker is deliberately left in place: the backend is still ours,
+      # and the next launch reclaiming it is the correct end to a detach.
     else:
       let h = wdCurrentHandle(backendProc)
       if h != 0'u64 and cSpawnAlive(h) != 0'i32:
         cSpawnKill(h)
         line "  backend stopped"
+      clearBackendOwner(root)
       if cLaunchAlive(launch) != 0'i32:
         note "the game is still running. It has no server now -- close it, or " &
              "start the launcher again with --no-backend once one is up."
