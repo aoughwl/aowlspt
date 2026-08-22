@@ -246,6 +246,25 @@ var gFindWant = ""
 var gFindVisited = 0
 var gFindFound = 0
 var gFindActive = false
+var gFindBudgetLeft = 0
+  ## Nodes still allowed to THIS search, carried across frames. The time slice
+  ## bounds one frame's work; this bounds the whole search. Separating them is
+  ## what lets a search span frames without ever being able to run away.
+var gFindSuspend = false
+  ## Set when a search ran out of TIME but not budget. The batch runner parks
+  ## the batch and re-enters the same command next frame, so a deep hierarchy
+  ## is walked over several frames automatically instead of making a human
+  ## type `find more` repeatedly.
+var gFindOwnerIdx = -1
+var gFindOwnerBatch = -1
+  ## Which command of which BATCH owns the in-progress search, so re-entering
+  ## that command RESUMES it instead of starting it again from the root.
+  ##
+  ## The batch number matters and is not belt-and-braces: `find more` keeps a
+  ## search alive ACROSS batches by design, so without it a later batch whose
+  ## command at the same index happened to be a different `find` would silently
+  ## resume the OLD search and report matches for the wrong name.
+var gFindFrames = 0
   ## A `find` that stopped on a cap leaves its frontier here, so `find more`
   ## continues instead of re-walking the nodes it already rejected. Restarting
   ## a capped search from scratch can never reach past the cap, which made the
@@ -1427,26 +1446,36 @@ proc iHierRoot(p: Il2CppPtr): Il2CppPtr =
       if duOk(r, 0x20'i32):
         result = r
 
-proc iFindStep(budget: int): bool =
-  ## One slice of the breadth-first walk. Returns true when the frontier is
-  ## exhausted (a genuinely complete answer), false when it stopped on a cap.
+const
+  FindDone     = 0   ## frontier exhausted -- a genuinely complete answer
+  FindOutOfTime = 1  ## this FRAME is up, but the search may continue
+  FindOutOfBudget = 2 ## the whole search's node budget is spent
+  FindEnoughHits = 3  ## the match cap was reached
+
+proc iFindStep(): int =
+  ## One FRAME's slice of the breadth-first walk.
   ##
-  ## THREE INDEPENDENT CAPS, and the time one is the important one: this runs
-  ## on the Unity thread inside a single frame, so the failure to avoid is a
-  ## stalled client, which costs the whole session rather than one answer.
+  ## Two budgets, deliberately separate, because they answer different
+  ## questions. The TIME slice bounds what one frame may do -- this runs on the
+  ## Unity thread, so the failure to avoid is a stalled client, which costs the
+  ## whole session rather than one answer. The NODE budget bounds the entire
+  ## search across however many frames it takes. Conflating them is what forced
+  ## a human to type `find more`: running out of time looked identical to
+  ## running out of permission.
   let started = cNowMs()
   var spent = 0
   while gFindHead < gFindQueue.len:
-    if spent >= budget:
-      return false
+    if gFindBudgetLeft <= 0:
+      return FindOutOfBudget
     if gFindFound >= InspFindMaxHits:
-      return false
-    if (spent and 255) == 0 and cNowMs() - started > InspFindSliceMs:
-      return false
+      return FindEnoughHits
+    if (spent and 127) == 0 and cNowMs() - started > InspFindSliceMs:
+      return FindOutOfTime
     let cur = gFindQueue[gFindHead]
     inc gFindHead
     inc spent
     inc gFindVisited
+    dec gFindBudgetLeft
     if not duOk(cur, 0x20'i32) or not iUnityAlive(cur):
       continue
     iNoteKlass(cur)
@@ -1466,23 +1495,35 @@ proc iFindStep(budget: int): bool =
         if c != nil:
           gFindQueue.add c
         inc k
-  result = true
+  result = FindDone
 
-proc iFindReport(done: bool) =
-  iOut("  visited " & $gFindVisited & " node(s), " & $gFindFound &
-       " match(es), frontier " & $(gFindQueue.len - gFindHead) & " node(s)")
-  if done:
+proc iFindReport(status: int) =
+  ## Only called when the search has actually STOPPED. Running out of time is
+  ## not stopping -- that path parks and resumes and says nothing, because a
+  ## progress report every frame would bury the answer.
+  iOut("  visited " & $gFindVisited & " node(s) over " & $gFindFrames &
+       " frame(s), " & $gFindFound & " match(es), frontier " &
+       $(gFindQueue.len - gFindHead) & " node(s)")
+  if status == FindDone:
     gFindActive = false
+    gFindOwnerIdx = -1
+    gFindOwnerBatch = -1
     iOut("  -- the subtree was searched EXHAUSTIVELY. " &
          (if gFindFound == 0:
             "That name is genuinely NOT PRESENT under this root."
           else: "Every match is listed above."))
+  elif status == FindEnoughHits:
+    gFindActive = true
+    iOut("  -- stopped at the match cap (" & $InspFindMaxHits & "). There may " &
+         "be more; `find more` continues from the frontier above.")
   else:
     gFindActive = true
-    iOut("  -- STOPPED EARLY on a cap. This is NOT proof the name is absent. " &
-         "Continue with `find more` (it RESUMES from the frontier above and " &
-         "does not re-walk what it already rejected), or re-run with a bigger " &
-         "budget, or search from a narrower root.")
+    # THE HONEST CAP MESSAGE, unchanged in substance: "not found within budget"
+    # and "not present" are different facts and must never be conflated.
+    iOut("  -- STOPPED EARLY on the NODE BUDGET. This is NOT proof the name is " &
+         "absent. Continue with `find more` (it RESUMES from the frontier " &
+         "above and does not re-walk what it already rejected), or re-run " &
+         "with a bigger budget, or search from a narrower root.")
   if gFindFound > 0:
     iOut("  matches are bound to $f1..$f" & $gFindFound &
          " for the rest of this batch")
@@ -1524,6 +1565,20 @@ proc iCmdFind(toks: seq[string]) =
   ## `find more [BUDGET]`               -- RESUME a search that hit a cap
   ##
   ## Matching is case-insensitive substring on the GameObject name.
+  # ---- AUTOMATIC CONTINUATION ----
+  # This same command index already owns a search that ran out of FRAME time.
+  # Resume it rather than restarting: re-running from the root would re-walk
+  # everything already rejected and could never make progress past the slice.
+  if gFindActive and gFindOwnerIdx == gInspCurIdx and
+     gFindOwnerBatch == gInspBatch:
+    inc gFindFrames
+    let st = iFindStep()
+    if st == FindOutOfTime and gFindBudgetLeft > 0:
+      gFindSuspend = true
+      return
+    iFindReport(st)
+    return
+
   if toks.len < 2:
     iErr("usage: find NAME [ROOT] [BUDGET] | find NAME in ROOTNAME [BUDGET] | find more [BUDGET]")
     return
@@ -1543,8 +1598,15 @@ proc iCmdFind(toks: seq[string]) =
       budget = InspFindMaxBudget
     iOut("  resuming search for \"" & gFindWant & "\" from a frontier of " &
          $(gFindQueue.len - gFindHead) & " node(s), budget " & $budget)
-    let done = iFindStep(budget)
-    iFindReport(done)
+    gFindBudgetLeft = budget
+    gFindOwnerIdx = gInspCurIdx
+    gFindOwnerBatch = gInspBatch
+    gFindFrames = 1
+    let st = iFindStep()
+    if st == FindOutOfTime and gFindBudgetLeft > 0:
+      gFindSuspend = true
+      return
+    iFindReport(st)
     return
 
   # ---- new search ----
@@ -1610,11 +1672,23 @@ proc iCmdFind(toks: seq[string]) =
   gFindVisited = 0
   gFindFound = 0
   gFindActive = false
+  gFindBudgetLeft = budget
+  gFindOwnerIdx = gInspCurIdx
+  gFindOwnerBatch = gInspBatch
+  gFindFrames = 1
   iOut("  searching from " & iPtr(root) & " name=\"" & iObjName(root) &
        "\" for name containing \"" & want & "\" (case-insensitive; budget " &
-       $budget & " nodes, " & $int(InspFindSliceMs) & "ms slice)")
-  let done = iFindStep(budget)
-  iFindReport(done)
+       $budget & " nodes, " & $int(InspFindSliceMs) & "ms per frame, " &
+       "continuing across frames automatically)")
+  let st = iFindStep()
+  if st == FindOutOfTime and gFindBudgetLeft > 0:
+    # Out of frame time but not out of permission: park and carry on next
+    # frame. Silent by design -- a progress line every frame would bury the
+    # matches this is supposed to surface.
+    gFindActive = true
+    gFindSuspend = true
+    return
+  iFindReport(st)
 
 proc iCmdTree(toks: seq[string]) =
   ## `tree EXPR [DEPTH]` -- the subtree, indented, capped.
@@ -2741,6 +2815,18 @@ proc inspRunBatch() =
         iOut("  !! too many faults; the live inspector is now OFF for this " &
              "session. Restart the client to re-arm it.")
         i = gInspCmds.len
+    # A LONG SEARCH PARKS ITSELF HERE. `find` gives up its frame after 12ms
+    # rather than stalling the client, and asks to be re-entered at the SAME
+    # index next frame. That is the difference between a search that spans
+    # frames automatically and one that makes a human type `find more` until
+    # it finishes. The command re-runs, recognises that it already owns an
+    # in-progress search, and resumes the frontier instead of restarting.
+    if gFindSuspend:
+      gFindSuspend = false
+      gInspResumeAt = i
+      gInspSuspended = true
+      gInspPhase = 0
+      return
     inc i
   gInspResumeAt = 0
   gInspWaitIdx = -1
@@ -3044,6 +3130,23 @@ proc inspectPoll(now: uint64) =
     return
   var text = ""
   let readOk = readShared(gInspCmdPath, text)
+  # STRIP A LEADING UTF-8 BOM.
+  #
+  # `Set-Content -Encoding utf8` on Windows PowerShell 5.1 -- the obvious way a
+  # Windows user writes this file -- prepends EF BB BF. Those three bytes then
+  # ride on the front of the FIRST line, so command one of every batch arrives
+  # as "﻿#1" or "﻿state" and is rejected as an unknown command while
+  # every other line works. A batch that silently loses exactly its first
+  # instruction is a nasty thing to debug from the outside.
+  #
+  # Stripped here, BEFORE the change-comparison, so the cached text and the
+  # parsed text are the same bytes and a BOM cannot cause a phantom "changed".
+  if readOk and text.len >= 3 and
+     text[0] == '\xEF' and text[1] == '\xBB' and text[2] == '\xBF':
+    var stripped = ""
+    for i in 3 ..< text.len:
+      stripped.add text[i]
+    text = stripped
   if readOk:
     inc gInspReads
   else:
