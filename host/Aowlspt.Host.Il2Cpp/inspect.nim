@@ -191,6 +191,13 @@ var gInspTicks = 0
   ## How many times the rider ran with a batch actually pending, i.e. got past
   ## the `aowl_insp_have` gate. `gInspFires` high with `gInspTicks` zero means
   ## the rider is dispatched fine and the HANDOFF FLAG is what is broken.
+var gInspFiredLogged = false
+  ## One-shot: the rider announces its own first call, with a timestamp. That
+  ## line is what makes the ORDER of events legible in the log -- specifically
+  ## whether the detour started ticking before or after a batch was handed over.
+var gInspWaitBatch = -1
+  ## The batch we have already explained is waiting for the detour to start
+  ## ticking, so that explanation is given once per batch and not every poll.
 var gInspBatch = 0
 var gInspBatchDone = -1      ## last batch Unity finished; the tick thread's cue
 
@@ -1496,6 +1503,16 @@ proc inspectFired(regs: Il2CppPtr) =
   ## job is to answer "was this rider dispatched at all?" -- a counter that only
   ## advanced when the rider did work could not answer that question.
   inc gInspFires
+  if not gInspFiredLogged:
+    gInspFiredLogged = true
+    # THE TIMESTAMP THAT MAKES THE LOG READABLE. `PreloaderUI::Update` does not
+    # tick until the client leaves the loading screen, which on a cold start is
+    # many seconds after the host has armed and after the first batch may
+    # already have been handed over. Without this line that gap is invisible and
+    # a batch that was simply EARLY looks identical to a rider that is broken.
+    okLog "live inspector: rider FIRST DISPATCHED on thread " &
+          $int(cThreadId()) & " (slot " & $gInspSlot & "); " &
+          "EFT.UI.PreloaderUI::Update is now ticking and batches will drain"
   if gInspOff:
     return
   let selfPtr = cRegsInt(regs, 0'i32)
@@ -1550,12 +1567,40 @@ proc inspectPoll(now: uint64) =
     return
   gInspNextPollMs = now + 250'u64
   if cInspHave() != 0'i32:
-    # Unity still has the last batch -- normally for a frame or two. If it has
-    # had it for seconds, nothing is draining it, and the channel would
-    # otherwise WEDGE SILENTLY: every later edit to the command file would be
-    # ignored with no explanation, which is the exact failure mode this whole
-    # instrument exists to abolish. So it times out and says why.
+    # THE EARLY-BATCH CASE, AND WHY IT IS NOT A TIMEOUT.
+    #
+    # `EFT.UI.PreloaderUI::Update` does not tick until the client is off the
+    # loading screen. On a cold start the host arms, the command file is read,
+    # and a batch is handed over MANY SECONDS before the rider is first
+    # dispatched -- measured live at 1.3s vs 15.5s. The old code started an 8s
+    # stopwatch at handover, so that first batch was declared "never picked up"
+    # SIX SECONDS BEFORE THE DETOUR HAD EVER RUN, and then DISCARDED it: it
+    # cleared the pending flag and wiped the output buffer. The commands were
+    # destroyed while the machinery underneath them was perfectly healthy, and
+    # the report blamed the dispatch.
+    #
+    # A stopwatch is the wrong instrument here. The question is not "how long
+    # has this been queued" but "has the thing that drains it run AT ALL". If
+    # the rider has never been dispatched, the batch has not yet had its
+    # chance, so it WAITS -- indefinitely, and without losing anything. The
+    # timeout below now means what it always claimed to mean: the rider is
+    # demonstrably running and STILL is not draining the queue.
+    if gInspFires == 0:
+      if gInspHandedMs != 0'u64 and now - gInspHandedMs > InspStuckMs and
+         gInspWaitBatch != gInspBatch:
+        gInspWaitBatch = gInspBatch
+        okLog "live inspector: batch " & $gInspBatch & " is QUEUED and will " &
+              "run as soon as EFT.UI.PreloaderUI::Update starts ticking -- " &
+              "the rider (slot " & $gInspSlot & ") has not been dispatched " &
+              "yet, which on a cold start just means the client is still on " &
+              "the loading screen. Nothing has been lost; reach the MENU."
+      return
     if gInspHandedMs != 0'u64 and now - gInspHandedMs > InspStuckMs:
+      # Read the flag BEFORE clearing it. The previous version cleared pending
+      # on the line above the report and then printed "pending flag now = 0",
+      # which is self-inflicted and reads as evidence of a bug that is not
+      # there.
+      let pendingAtReport = int(cInspHave())
       cInspSetPending(0'i32)
       gInspHandedMs = 0'u64
       cInspLock()
@@ -1565,26 +1610,20 @@ proc inspectPoll(now: uint64) =
       iOut("aowlspt live inspector -- batch " & $gInspBatch &
            " was never picked up by Unity's thread within " &
            $int(InspStuckMs div 1000'u64) & "s.")
-      iOut("  The commands did NOT run.")
+      iOut("  The commands did NOT run. (The rider HAS been dispatched " &
+           $gInspFires & " time(s), so this is a real stall, not a batch " &
+           "that simply arrived before the detour started ticking.)")
+      iOut("  pending flag as the timeout found it = " & $pendingAtReport)
       # THE THREE HYPOTHESES, SEPARATED BY MEASUREMENT rather than by prose.
       # Every previous version of this message guessed; these counters know.
       iOut("  inspector slot = " & $gInspSlot &
            " (-1 means nothing is armed); rider dispatched " & $gInspFires &
            " time(s); ran with a batch pending " & $gInspTicks & " time(s); " &
-           "self-disabled = " & $gInspOff & "; pending flag now = " &
-           $int(cInspHave()))
+           "self-disabled = " & $gInspOff)
       if gInspSlot < 0:
         iOut("  DIAGNOSIS: NOT ARMED. Nothing claimed or aliased the " &
              "EFT.UI.PreloaderUI::Update slot, so there is nothing to run " &
              "from. Look for a line starting 'live inspector armed'.")
-      elif gInspFires == 0:
-        iOut("  DIAGNOSIS: ARMED BUT NEVER DISPATCHED. The slot is " &
-             $gInspSlot & " yet the rider has not been called once. Either " &
-             "the detour is not firing at all (still on a loading screen -- " &
-             "reach the MENU and edit the file again), or the firing half " &
-             "does not dispatch this rider. Compare against the one-shot " &
-             "'patchFired:'/'patchReturned:' rider-table line in the host " &
-             "log: it prints the firing slot beside all three rider slots.")
       elif gInspTicks == 0:
         iOut("  DIAGNOSIS: DISPATCHED BUT NEVER SAW THE BATCH. The rider ran " &
              $gInspFires & " time(s) but the pending flag read 0 every time, " &
