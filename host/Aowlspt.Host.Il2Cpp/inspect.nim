@@ -105,6 +105,10 @@ proc cNavOffCurrentTab(): int32 {.importc: "aowl_nav_off_currenttab", nodecl.}
 proc cNavOffInitTabs(): int32 {.importc: "aowl_nav_off_inittabs", nodecl.}
 proc cNavOffFirstSel(): int32 {.importc: "aowl_nav_off_firstsel", nodecl.}
 proc cNavOffCreated(): int32 {.importc: "aowl_nav_off_created", nodecl.}
+proc cNavReason(): int32 {.importc: "aowl_nav_last_reason", nodecl.}
+proc cNavActualValid(): int32 {.importc: "aowl_nav_actual_valid", nodecl.}
+proc cNavActualAt(i: int32): int32 {.importc: "aowl_nav_actual_at", nodecl.}
+proc cNavExpectedAt(t, i: int32): int32 {.importc: "aowl_nav_expected_at", nodecl.}
 
 proc cInspLock() {.importc: "aowl_insp_lock", nodecl.}
 proc cInspUnlock() {.importc: "aowl_insp_unlock", nodecl.}
@@ -1059,16 +1063,52 @@ proc iCmdCanvas(p: Il2CppPtr) =
       iMark(("Canvas::get_scaleFactor"), canvas)
       iOut("  scaleFactor = " & iFmtF(float64(cInspFP(fn, canvas, nil))))
 
+proc iNavExplain(t: int32; name: string; rva: uint32) =
+  ## Say WHICH of the five ways to fail actually happened, and on a signature
+  ## mismatch print the bytes side by side. "Did not verify (or is a stub)"
+  ## covers five different causes and identifies none of them; every time this
+  ## project has shipped a message like that it has cost a full cycle.
+  let r = cNavReason()
+  iErr(name & " @0x" & iHexPad(uint64(rva), 6) & " did not verify -- " &
+       (if r == 1: "GameAssembly.dll is not loaded (impossible here; a bug)"
+        elif r == 2: "VirtualQuery failed on that address: the RVA is almost " &
+                     "certainly wrong for this build"
+        elif r == 3: "that page is not committed: the RVA is wrong for this build"
+        elif r == 4: "that page is not executable: the RVA points at data, " &
+                     "not code -- wrong RVA for this build"
+        elif r == 6: "the live bytes there are a STUB (ret / ret n). The RVA " &
+                     "resolves but the function does nothing, so calling it " &
+                     "would be a silent no-op. Find the real entry point."
+        elif r == 5: "the prologue does not match the expected signature"
+        else: "no reason was recorded, which is itself a bug"))
+  if cNavActualValid() != 0'i32:
+    var act = ""
+    var exp = ""
+    for i in 0 ..< 16:
+      if i > 0:
+        act.add ' '
+        exp.add ' '
+      act.add iHexPad(uint64(cNavActualAt(int32(i))), 2)
+      let e = cNavExpectedAt(t, int32(i))
+      exp.add (if e < 0: "??" else: iHexPad(uint64(e), 2))
+    iOut("    actual   " & act)
+    iOut("    expected " & exp)
+
 proc iNavFind(want: string; fn: var Il2CppPtr; rva: var uint32): bool =
   ## Resolve one navigation target by substring, byte-verified through the
   ## prologue snapshot AND shape-checked against being a do-nothing stub.
   fn = nil
   rva = 0'u32
   for i in 0 ..< int(cNavTargetCount()):
-    if iContains(iLower(readCString(cNavName(int32(i)))), iLower(want)):
+    let nm = readCString(cNavName(int32(i)))
+    if iContains(iLower(nm), iLower(want)):
       fn = cNavFn(int32(i))
       rva = cNavRva(int32(i))
-      return fn != nil
+      if fn == nil:
+        iNavExplain(int32(i), nm, rva)
+        return false
+      return true
+  iErr("no navigation target matches \"" & want & "\"")
   result = false
 
 proc iNavGate(what: string): bool =
@@ -1096,8 +1136,6 @@ proc iCmdOpen(toks: seq[string]) =
   var fn: Il2CppPtr = nil
   var rva = 0'u32
   if not iNavFind("ShowScreen", fn, rva):
-    iErr("EFT.UI.SettingsScreen::ShowScreen did not verify on this build " &
-         "(or is a stub); refusing to call it.")
     return
   var screen = gMi2Self
   if screen == nil:
@@ -1128,8 +1166,6 @@ proc iCmdTab(toks: seq[string]) =
   var fn: Il2CppPtr = nil
   var rva = 0'u32
   if not iNavFind("set_IsSelected", fn, rva):
-    iErr("EFT.UI.SettingsTab::set_IsSelected did not verify on this build " &
-         "(or is a stub); refusing to call it.")
     return
   var v = 0'u64
   var err = ""

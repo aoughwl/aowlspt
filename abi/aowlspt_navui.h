@@ -122,25 +122,84 @@ static int32_t aowl_nav_is_stub(const unsigned char* p) {
     return 0;
 }
 
+/* WHY A VERIFY FAILURE MUST NAME ITSELF.
+ *
+ * `aowl_nav_verify` has five independent ways to say no, and the first version
+ * of this file collapsed all of them into a single NULL. The caller then
+ * printed "did not verify on this build (or is a stub)" -- a message that
+ * covers a wrong RVA, an unmapped page, a non-executable page, a genuine
+ * signature mismatch and a stub, and distinguishes none of them. That is
+ * precisely the shape of message that has cost this project a full
+ * deploy/launch cycle every time it has appeared.
+ *
+ * So the reason is recorded, and so are the bytes actually found, and the
+ * caller prints both. One run now answers what previously took several. */
+#define AOWL_NAV_OK          0
+#define AOWL_NAV_NO_MODULE   1
+#define AOWL_NAV_NO_QUERY    2
+#define AOWL_NAV_NOT_COMMIT  3
+#define AOWL_NAV_NOT_EXEC    4
+#define AOWL_NAV_SIG_MISMATCH 5
+#define AOWL_NAV_STUB        6
+
+static int32_t       aowl_nav_reason = AOWL_NAV_OK;
+static unsigned char aowl_nav_actual[AOWL_PRO_MAX_BYTES];
+static int32_t       aowl_nav_actual_ok = 0;
+
 static void* aowl_nav_verify(uint32_t rva, const unsigned char* sig,
                              int32_t siglen) {
     HMODULE ga;
     unsigned char* p;
     MEMORY_BASIC_INFORMATION mbi;
 
+    aowl_nav_reason = AOWL_NAV_OK;
+    aowl_nav_actual_ok = 0;
+
     ga = GetModuleHandleA("GameAssembly.dll");
-    if (!ga) return NULL;
+    if (!ga) { aowl_nav_reason = AOWL_NAV_NO_MODULE; return NULL; }
     p = (unsigned char*)ga + rva;
 
-    if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0) return NULL;
-    if (mbi.State != MEM_COMMIT) return NULL;
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0) {
+        aowl_nav_reason = AOWL_NAV_NO_QUERY; return NULL; }
+    if (mbi.State != MEM_COMMIT) {
+        aowl_nav_reason = AOWL_NAV_NOT_COMMIT; return NULL; }
     if (!(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
-                         PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+                         PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))) {
+        aowl_nav_reason = AOWL_NAV_NOT_EXEC; return NULL; }
+
+    /* Record what is REALLY there, so a mismatch can be shown rather than
+     * merely asserted. Safe: the page passed the checks above. */
+    memcpy(aowl_nav_actual, p, AOWL_PRO_MAX_BYTES);
+    aowl_nav_actual_ok = 1;
+
+    /* THE STUB CHECK READS THE ACTUAL CODE, NOT THE SIGNATURE.
+     * The first version tested `sig` -- the bytes we EXPECT -- which can never
+     * detect a stub, because a signature copied from a real function never
+     * starts with `ret`. The whole point is to catch a target whose LIVE bytes
+     * are a stub, so it has to read `p`. */
+    if (aowl_nav_is_stub(p)) {
+        aowl_nav_stub_rejects++;
+        aowl_nav_reason = AOWL_NAV_STUB;
         return NULL;
+    }
     /* Against the SNAPSHOT, never live memory. */
-    if (siglen > 0 && !aowl_pro_verify(rva, sig, siglen)) return NULL;
-    if (aowl_nav_is_stub(sig)) { aowl_nav_stub_rejects++; return NULL; }
+    if (siglen > 0 && !aowl_pro_verify(rva, sig, siglen)) {
+        aowl_nav_reason = AOWL_NAV_SIG_MISMATCH;
+        return NULL;
+    }
     return (void*)p;
+}
+
+static int32_t aowl_nav_last_reason(void) { return aowl_nav_reason; }
+static int32_t aowl_nav_actual_valid(void) { return aowl_nav_actual_ok; }
+static int32_t aowl_nav_actual_at(int32_t i) {
+    if (i < 0 || i >= AOWL_PRO_MAX_BYTES) return -1;
+    return (int32_t)aowl_nav_actual[i];
+}
+static int32_t aowl_nav_expected_at(int32_t t, int32_t i) {
+    if (t < 0 || t >= AOWL_NAV_TARGET_COUNT) return -1;
+    if (i < 0 || i >= AOWL_PRO_MAX_BYTES) return -1;
+    return (int32_t)aowl_nav_targets[t].sig[i];
 }
 
 static void* aowl_nav_target_at(int32_t i) {
