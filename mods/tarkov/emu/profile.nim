@@ -170,8 +170,21 @@ proc bodyParts(): JsonObject =
   put(parts, "RightLeg", objOf("Health", healthPart(65, 65)))
   result = parts
 
+proc profileMode*(p: Profile): string =
+  ## Which character-select slot this profile occupies.
+  ##
+  ## The post-1.0 character screen is keyed by `EGameMode` -- one slot per mode,
+  ## `regular`/`pve`/`pvp-season` -- so "which character" and "which slot" are
+  ## the same question, and the answer has to travel with the profile the way
+  ## `Info.Side` does. Profiles written before this field existed have no tag
+  ## and are `regular`, which is where they have always shown up.
+  result = p.field("Info.GameMode").asText("")
+  if result.len == 0:
+    result = "regular"
+
 proc newProfileText*(id, nickname, sideName, edition: string;
-                     nowSeconds: int; startingRoubles: int = 500000): string =
+                     nowSeconds: int; startingRoubles: int = 500000;
+                     gameMode: string = "regular"): string =
   ## A complete, valid starting profile.
   ##
   ## Synthesised rather than copied out of the database, because the database a
@@ -194,6 +207,13 @@ proc newProfileText*(id, nickname, sideName, edition: string;
   put(info, "Experience", 0)
   put(info, "RegistrationDate", nowSeconds)
   put(info, "GameVersion", edition)
+  # Which character-select slot this profile lives in. Read back by
+  # `profileMode` above, and by nothing in the client -- the client learns the
+  # mode from the dictionary key `/v2/client/game/profiles/` files this profile
+  # under, and this field is how the server knows which key that is. An extra
+  # key in `Info` is ignored by the client's deserialiser (every other unknown
+  # one already is), so this costs the profile document nothing.
+  put(info, "GameMode", gameMode)
   put(info, "AccountType", 0)
   put(info, "MemberCategory", 0)
   put(info, "SelectedMemberCategory", 0)
@@ -613,14 +633,15 @@ proc allProfileIds*(): seq[string] =
       result.add k.substr(KeyPrefix.len)
 
 proc createProfile*(nickname, sideName, edition: string;
-                    nowSeconds: int; startingRoubles: int = 500000): Profile =
+                    nowSeconds: int; startingRoubles: int = 500000;
+                    gameMode: string = "regular"): Profile =
   ## A new profile, saved before it is returned. Saved first because the client
   ## follows `create` with `start`, and a profile that only exists in memory
   ## would work until the server restarted -- the worst kind of working.
   let id = newId()
   result = Profile(id: id, text: "", ok: false)
   result.text = newProfileText(id, nickname, sideName, edition, nowSeconds,
-                               startingRoubles)
+                               startingRoubles, gameMode)
   if not saveProfile(result):
     return Profile(id: id, text: "", ok: false)
   result.ok = true

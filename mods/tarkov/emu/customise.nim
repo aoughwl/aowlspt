@@ -410,6 +410,33 @@ proc applyVoice*(p: var Profile; voiceId: string; problem: var string): bool =
     setRaw(p, plan.paths[k], plan.values[k])
   result = plan.paths.len > 0
 
+proc applyHead*(p: var Profile; headId: string; problem: var string): bool =
+  ## The head the in-game character creator picked.
+  ##
+  ## The same door `applyVoice` uses, opened on the `head` arm of
+  ## `planCustomisation`: the entry has to exist, be under the `Head` slot and
+  ## be allowed for this side and edition. The creator's `/client/game/profile/
+  ## create` body carries `headId` and the server used to drop it on the floor,
+  ## so every character made in-game wore its side's default head no matter
+  ## which one the player had spent a minute choosing.
+  ##
+  ## A refusal here is not fatal to the create -- see the caller. It is reported
+  ## rather than swallowed, because a head that silently did not take is exactly
+  ## the class of failure this server is written against.
+  problem = ""
+  if not plainId(headId):
+    problem = "that request named no head this server can look up"
+    return false
+  let plan = planCustomisation(customisationTable(), p.side,
+                               p.field("Info.GameVersion").asText("standard"),
+                               "[{\"id\":\"" & headId & "\",\"type\":\"head\"}]")
+  if not plan.ok:
+    problem = plan.problem
+    return false
+  for k in 0 ..< plan.paths.len:
+    setRaw(p, plan.paths[k], plan.values[k])
+  result = plan.paths.len > 0
+
 # ---------------------------------------------------------------------------
 # The self-check
 # ---------------------------------------------------------------------------
