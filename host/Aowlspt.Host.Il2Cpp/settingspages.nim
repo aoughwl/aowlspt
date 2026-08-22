@@ -260,6 +260,7 @@ proc swBuildHostPage(): SwPage =
   rows.add swRow("osCloseFix", "OS window-close fix", readBoolKey("osCloseFix"), false)
   rows.add swRow("uxVersionBrand", "Brand the version label", readBoolKey("uxVersionBrand"), false)
   rows.add swRow("uxMenuModeText", "Menu corner label", readBoolKey("uxMenuModeText"), false)
+  rows.add swRow("uxVersionLabel", "Menu version label", readBoolKey("uxVersionLabel"), false)
   rows.add swRow("settingsUiProbe", "Settings-screen probe", readBoolKey("settingsUiProbe"), false)
   rows.add swRow("settingsRelabelProbe", "Settings relabel proof", readBoolKey("settingsRelabelProbe"), false)
   rows.add swRow("settingsBindProbe", "Settings value read-back", readBoolKey("settingsBindProbe"), false)

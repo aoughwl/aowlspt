@@ -2362,7 +2362,25 @@ proc cmdPayload(e: Env): int =
       "backendPort + modSyncMs (the text rides that poll), and it refuses to " &
       "arm while debugUi/debugEsp are on, because those drain the same " &
       "PreloaderUI.Update function. Default false until proven live.\",\n" &
-      "  \"uxMenuModeText\": false\n" &
+      "  \"uxMenuModeText\": false,\n" &
+      "\n" &
+      "  \"//uxVersionLabel\": \"When true, the main menu's CORNER VERSION label (stock: " &
+      "'1.1.0.1.4677 | PvE') reads 'aowlspt | aoughwl.com | <the " &
+      "client version>' instead. The version is the CLIENT'S OWN, " &
+      "read out of the running game -- no version number is hardcoded " &
+      "anywhere in the host, so this stays correct across a client " &
+      "update. The format is mod-controllable with " &
+      "aowlspt/menutext.setMenuVersionFormat, where {version} is " &
+      "substituted, and the default needs no backend at all. The host " &
+      "does this by PREFIXING the game's own " &
+      "EFT.UI.PreloaderUI.RefreshCornerLabel at its verified static " &
+      "RVA and arranging the four string fields that method composes " &
+      "the label from -- it writes no TextMeshPro field, calls no " &
+      "managed method, and binds nothing on a build whose prologue " &
+      "does not match. It does NOT touch PreloaderUI.Update, so it " &
+      "contends with debugUi / debugEsp / uxMenuModeText not at all. " &
+      "Default false until proven live.\",\n" &
+      "  \"uxVersionLabel\": false\n" &
       "}\n")
 
   let staged = failures - failuresAtEntry

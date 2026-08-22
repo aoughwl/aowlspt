@@ -1435,6 +1435,12 @@ proc routeClient(url, body, session: string): string =
     # label alone. A mod's `setMenuModeText` override wins over the logged-in
     # character's name; see mgr/control.nim. Older hosts ignore the field.
     put(out1, "menuModeText", menuModeText())
+    # The FORMAT for the corner version label (stock: "1.1.0.1.4677 | PvE").
+    # A format, never a version number -- the host substitutes {version} with
+    # the client's own, read live. Empty means "no override" and the host
+    # keeps its built-in "aowlspt | aoughwl.com | {version}". Older hosts
+    # ignore the field.
+    put(out1, "menuVersionFormat", menuVersionFormat())
     # Last, always. This is the terminator the reader checks for.
     put(out1, "complete", true)
     text = done(out1).text

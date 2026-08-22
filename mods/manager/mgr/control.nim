@@ -549,6 +549,53 @@ proc onMenuNickname(payload: string): string =
     gMenuNickname = n
   result = ""
 
+# ---------------------------------------------------------------------------
+# The main menu's CORNER VERSION LABEL format, relayed to the client host
+# ---------------------------------------------------------------------------
+#
+# Stock, that label reads "1.1.0.1.4677 | PvE". With `uxVersionLabel` on, the
+# client host makes it read "aowlspt | aoughwl.com | <the client's version>".
+#
+# What travels is a FORMAT with a `{version}` token in it -- never a version
+# number. The host substitutes the client's own version, read live off the game,
+# which is the only way this stays correct across a client update.
+#
+# There is exactly ONE input here, and no default to assemble: the host's
+# built-in default is the default. An empty override means "say nothing", the
+# field goes out empty, the host keeps its own default, and -- crucially -- an
+# install with no manager running at all still gets the right label. That is a
+# deliberate difference from `menuModeText` above, which has no useful value
+# without a logged-in character to name.
+
+var gMenuVersionOverride = ""
+
+proc menuVersionFormat*(): string =
+  ## What `routeClient` reports as `menuVersionFormat`. Empty means "no
+  ## override" and the host keeps its own default.
+  gMenuVersionOverride
+
+proc versionFormatSane(s: string): bool =
+  ## The same shape the host's `parseMenuVersionFormat` will accept, checked
+  ## HERE too for the reason `menuTextSane` gives: a value that cannot survive
+  ## the trip should be refused where a person can still be told about it.
+  if s.len == 0 or s.len > 63:
+    return false
+  for ch in s:
+    if ord(ch) < 0x20 or ord(ch) > 0x7E:
+      return false
+  result = true
+
+proc onMenuVersionFormat(payload: string): string =
+  ## `aowlspt.menu.versionFormat` — `{"format":"..."}`. An empty or absent
+  ## `format` clears the override, and the host falls back to its built-in
+  ## default rather than to a blank label.
+  let f = field(payload, "format").asText("")
+  if f.len == 0:
+    gMenuVersionOverride = ""
+  elif versionFormatSane(f):
+    gMenuVersionOverride = f
+  result = ""
+
 proc controlInit*(probeMs: int) =
   ## Subscribe, probe, and arm the timeout that turns silence into an answer.
   ##
@@ -568,6 +615,10 @@ proc controlInit*(probeMs: int) =
   # default when no mod has overridden anything.
   discard onEvent("aowlspt.menu.modeText", onMenuModeText)
   discard onEvent("aowlspt.menu.nickname", onMenuNickname)
+  # The corner VERSION label's format, same relay. See
+  # `aowl/src/aowlspt/menutext.nim`. Empty = no override = the host keeps its
+  # own default, so this channel is optional in a way `modeText` is not.
+  discard onEvent("aowlspt.menu.versionFormat", onMenuVersionFormat)
 
   var probe = obj()
   put(probe, "from", "aowl.manager")

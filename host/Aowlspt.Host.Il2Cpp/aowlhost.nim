@@ -123,6 +123,13 @@ import invoke
 ## thunk that drives it. The implementation is in `modetext.nim` (included
 ## below). See `aowlspt_modetext.h`.
 {.emit: """#include "aowlspt_modetext.h" """.}
+## The main menu's CORNER VERSION LABEL: the verified `PreloaderUI` target
+## (`RefreshCornerLabel`, the label's only composer and writer) and the field
+## offsets it composes from. No call thunk and no write helper -- the feature
+## only arranges the composer's inputs and reuses `aowl_uxpatch_write_ptr`. The
+## implementation is in `verlabel.nim` (included below). See
+## `aowlspt_verlabel.h`.
+{.emit: """#include "aowlspt_verlabel.h" """.}
 ## The in-game, Unity-native debug overlay: the F3 info panel and the
 ## in-world AI markers. Target table, call thunks, guarded scalar stores,
 ## the toggle key and the frame-rate estimate. See `aowlspt_debugui.h`.
@@ -1153,6 +1160,21 @@ var gDebugEsp = false
 ## matches rather than picking one. Neither feature excludes the other any more.
 var gModeTextSlot = -1
 var gModeTextOn = false
+
+## THE MENU'S CORNER VERSION LABEL (stock: "1.1.0.1.4677 | PvE").
+##
+## The slot and the flag live HERE for the same module-ordering reason as
+## `gModeTextSlot` above: `attachDrain` and `patchFired` are defined ABOVE
+## `verlabel.nim`'s include point and both name the slot, and module-level
+## `var`s -- unlike procs -- do not resolve backwards.
+##
+## Note what is NOT said here: there is no mutual exclusion to declare. This is
+## the kind=14 PREFIX detour on `EFT.UI.PreloaderUI::RefreshCornerLabel`, a
+## function nothing else in this host hooks. It deliberately stays off
+## `PreloaderUI::Update`, which the F3 overlay, the ESP probe and the menu mode
+## text already contend for.
+var gVerLabelSlot = -1
+var gVerLabelOn = false
 
 ## Whether the fragile static-RVA drain path may be used at all. OFF by default:
 ## it bound a real-but-wrong function on the live client and crashed the game, so
@@ -2746,6 +2768,13 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     if i == gModeTextSlot:
       modeTextUpdateFired(regs)
     return 0'i32
+  # THE CORNER VERSION LABEL, by identity: a PREFIX drain on
+  # `PreloaderUI::RefreshCornerLabel`. It arranges the fields the ORIGINAL is
+  # about to compose from and then gets out of the way -- returning 0 is the
+  # whole design, because the original is what composes and repaints.
+  if i == gVerLabelSlot:
+    verLabelRefreshFired(regs)
+    return 0'i32
   # The overlay's GameWorld cache: one register read, nothing walked, never a
   # suppression of RegisterPlayer.
   if i == gDebugEspSlot:
@@ -3160,6 +3189,7 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
               elif kind == 11: "debug-overlay-world"
               elif kind == 12: "botai"
               elif kind == 13: "menu-mode-text"
+              elif kind == 14: "menu-version-label"
               else: "main-thread")
   tablesLock()
   let claimed = cHookClaim()
@@ -3227,6 +3257,8 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
     gBotAiSlot = int(claimed)
   elif kind == 13:
     gModeTextSlot = int(claimed)
+  elif kind == 14:
+    gVerLabelSlot = int(claimed)
   else:
     gDrainSlot = int(claimed)
   tablesUnlock()
@@ -3234,7 +3266,7 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
     gRenderMethod = spec
   elif kind == 2 or kind == 3 or kind == 4 or kind == 5 or kind == 6 or
        kind == 7 or kind == 8 or kind == 9 or kind == 10 or
-       kind == 11 or kind == 12 or kind == 13:
+       kind == 11 or kind == 12 or kind == 13 or kind == 14:
     discard
   else:
     gDrainMethod = spec
@@ -3243,7 +3275,8 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
         $int(cHookStolen(hook)) & " bytes)" &
         (if perFrame or kind == 2 or kind == 3 or kind == 4 or kind == 5 or
             kind == 6 or kind == 7 or kind == 8 or kind == 9 or
-            kind == 10 or kind == 11 or kind == 12 or kind == 13: "" else:
+            kind == 10 or kind == 11 or kind == 12 or kind == 13 or
+            kind == 14: "" else:
            "; it runs more than once a frame, so its firing count is not a " &
            "frame count")
   return true
@@ -3961,6 +3994,16 @@ include "settingspages.nim"
 ## (dispatched by slot identity in `patchReturned`), `modeTextSetWanted` and
 ## `bindModeText`.
 include "modetext.nim"
+
+## The main menu's CORNER VERSION LABEL, made host/mod-controlled. `include`d
+## AFTER `modetext.nim` for one specific reason: it reads `gModeTextOn` to
+## decide whether to leave `_sessionModeText` alone (that feature owns it when
+## it is on) or to null it (nothing but the stock "PvE" drives it when it is
+## off). Unlike the mode text this hooks `PreloaderUI::RefreshCornerLabel`, not
+## `PreloaderUI::Update`, so it contends with nothing. See
+## `abi/aowlspt_verlabel.h`. Defines `verLabelRefreshFired` (dispatched by slot
+## identity in `patchFired`), `verLabelSetFormat` and `bindVerLabel`.
+include "verlabel.nim"
 
 proc hostEventSubscribe(ctx: Il2CppPtr; name: Il2CppPtr; nameLen: int32;
                         cb: Il2CppPtr; user: Il2CppPtr): int32 {.
@@ -4788,6 +4831,16 @@ proc takeModSet() =
   if modcontrol.parseMenuModeText(doc, wanted):
     modeTextSetWanted(wanted)
 
+  # The CORNER VERSION LABEL's format rides the same poll, for the same reasons
+  # again. `menuVersionFormat` is a FORMAT, not a finished string: the host
+  # substitutes `{version}` with the client's own version, read live off the
+  # game. An older manager omits the field, `parseMenuVersionFormat` returns
+  # false, and the built-in default ("aowlspt | aoughwl.com | {version}") stands
+  # -- which is the point: the label is right with no backend at all.
+  var vfmt = ""
+  if modcontrol.parseMenuVersionFormat(doc, vfmt):
+    verLabelSetFormat(vfmt)
+
 proc runPending() =
   ## The host thread's half.
   ##
@@ -5013,6 +5066,21 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "PreloaderUI.Update detour with debugUi/debugEsp -- one detour, one " &
          "trampoline, both features dispatched from the same firing -- so all " &
          "three flags can be on at once."
+  # The main menu's CORNER VERSION LABEL. Default OFF, like everything else that
+  # writes into the live UI, but it is the least invasive of them: it writes no
+  # TextMeshPro field, calls no managed method, and only arranges the inputs of
+  # the game's own corner-label composer before letting it run.
+  gVerLabelOn = readBoolKey("uxVersionLabel")
+  if gVerLabelOn:
+    info "uxVersionLabel is set: a PREFIX detour on " &
+         "EFT.UI.PreloaderUI.RefreshCornerLabel will make the corner label " &
+         "read \"" & VerLabelDefaultFormat & "\" with {version} replaced by " &
+         "the client's OWN version, read out of the game at runtime and " &
+         "never hardcoded. A mod can change the format with " &
+         "aowlspt/menutext.setMenuVersionFormat (it rides the mod-sync poll, " &
+         "so that needs backendPort + modSyncMs); the default needs neither " &
+         "and stands on its own. It contends with nothing -- it does not " &
+         "touch PreloaderUI.Update."
   gVersionBrand = readBoolKey("uxVersionBrand")
   gVersionWrite = readBoolKey("uxVersionBrandWrite")
   if gVersionWrite:
@@ -5161,6 +5229,18 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
                "unverified on this build, or drain disabled)"
         elif gDebugEsp:
           discard bindDebugEspWorld(true)
+
+      # THE CORNER VERSION LABEL (opt-in). Order does not matter for this one,
+      # and that is the whole point of where it hooks: it prefixes
+      # `EFT.UI.PreloaderUI::RefreshCornerLabel`, which NOTHING else in this
+      # host binds, aliases or verifies. It is therefore immune both to the
+      # trampoline-overwrite hazard and to the subtler trap that follows from
+      # it -- a feature that prologue-verifies a function AFTER someone else
+      # patched it reads the TRAMPOLINE bytes and self-rejects. Neither can
+      # happen to a target with exactly one interested party.
+      if gVerLabelOn and not bindVerLabel(true):
+        info "version label did not arm (PreloaderUI.RefreshCornerLabel " &
+             "unverified on this build, or drain disabled)"
 
       # THE MENU'S BOTTOM-RIGHT GAME-MODE LABEL (opt-in). Bound LAST, and it
       # still is: it wants `EFT.UI.PreloaderUI::Update`, the same function the

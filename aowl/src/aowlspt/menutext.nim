@@ -104,3 +104,82 @@ proc clearMenuModeText*(): Status =
   ## and worth calling from a mod's `onUnload`, so a mod that is switched off
   ## does not leave its label behind for the rest of the session.
   setMenuModeText("")
+
+# ---------------------------------------------------------------------------
+# The CORNER VERSION LABEL
+# ---------------------------------------------------------------------------
+#
+# The other end of the same corner. Stock, that label reads
+#
+#     1.1.0.1.4677 | PvE
+#
+# With the player's `uxVersionLabel` on, the client host makes it read
+#
+#     aowlspt | aoughwl.com | 1.1.0.1.4677
+#
+# and a mod can change that FORMAT -- not the finished string. `{version}` in
+# the format is replaced by the client's OWN version, read live off the running
+# game, so nothing a mod sends can go stale when the client updates. That is the
+# whole reason this takes a format rather than a label.
+
+const
+  VersionFormatMax* = 63
+    ## The longest format this will send. Matches `MenuVersionFormatMax` in the
+    ## client host's `modcontrol.nim` and `VerLabelMax` in its `verlabel.nim`;
+    ## all three exist so the limit is enforced at the end where it can still be
+    ## reported, and not only at the end where it can only be dropped.
+  VersionToken* = "{version}"
+    ## The one substitution a format gets. Include it to show the client's
+    ## version; leave it out for a label with no version in it, which is legal.
+  DefaultVersionFormat* = "aowlspt | aoughwl.com | " & VersionToken
+    ## What the label reads when no mod has said otherwise. Exposed so a mod's
+    ## settings page can show the real default instead of a guess at it, and so
+    ## "reset to default" can be spelled without a copied string literal. The
+    ## host carries its own copy of this and does not need to be told it -- an
+    ## install with no manager running still gets this label.
+
+proc versionFormatAcceptable*(s: string): bool =
+  ## Whether `s` is a format this will carry: non-empty, printable ASCII,
+  ## `VersionFormatMax` or fewer characters. Exposed so a mod can validate a
+  ## setting it just read and say something useful about it, rather than calling
+  ## `setMenuVersionFormat` and inferring the refusal from a label that did not
+  ## change.
+  ##
+  ## An empty string is NOT "acceptable" by this test -- it is the clear
+  ## instruction, which `setMenuVersionFormat` handles separately.
+  if s.len == 0 or s.len > VersionFormatMax:
+    return false
+  for ch in s:
+    if ord(ch) < 0x20 or ord(ch) > 0x7E:
+      return false
+  result = true
+
+proc setMenuVersionFormat*(format: string): Status =
+  ## Ask for the main menu's corner version label to be formatted as `format`,
+  ## with `{version}` replaced by the client's own version.
+  ##
+  ##     discard setMenuVersionFormat("mypack | {version}")
+  ##
+  ## Returns `Ok` when the request was broadcast, `ErrBadArg` when `format` is
+  ## not one this will carry (see `versionFormatAcceptable`). `Ok` means
+  ## "asked", not "shown": whether it appears depends on the player having set
+  ## `uxVersionLabel`, on the manager being up, and on the client having reached
+  ## its menu. None of those are things this call can know, and the honest
+  ## answer to all three is a label that stays as it was.
+  ##
+  ## `setMenuVersionFormat("")` clears this override and the label goes back to
+  ## `DefaultVersionFormat`. It is not a way to blank the label.
+  ##
+  ## LAST WRITER WINS. There is one label and one override slot; two mods both
+  ## setting it is two mods fighting over one corner of the screen, and the
+  ## manager holds whichever spoke last.
+  if format.len > 0 and not versionFormatAcceptable(format):
+    return ErrBadArg
+  result = broadcast("aowlspt.menu.versionFormat", objOf("format", format))
+
+proc clearMenuVersionFormat*(): Status =
+  ## Drop the override and go back to `DefaultVersionFormat`. Exactly
+  ## `setMenuVersionFormat("")`, named so the intent reads at the call site --
+  ## and worth calling from a mod's `onUnload`, so a mod that is switched off
+  ## does not leave its branding behind for the rest of the session.
+  setMenuVersionFormat("")

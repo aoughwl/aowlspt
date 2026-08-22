@@ -836,6 +836,47 @@ proc parseMenuModeText*(doc: string; into: var string): bool =
   into = v
   result = true
 
+const MenuVersionFormatMax* = 63
+  ## The longest corner-label FORMAT the host will carry. It matches
+  ## `VerLabelMax` in the client host's `verlabel.nim`, and that number is not
+  ## arbitrary: the host decides "is this already applied?" by reading the field
+  ## back with a reader capped at 64 characters, so a longer label would read
+  ## back as empty and be rewritten -- and reallocated -- on every composition.
+  ## The cap is what keeps the steady state allocation-free.
+
+proc parseMenuVersionFormat*(doc: string; into: var string): bool =
+  ## Reads the backend's `menuVersionFormat` out of a client-set poll response --
+  ## the FORMAT for the main menu's corner version label, stock
+  ## `1.1.0.1.4677 | PvE`.
+  ##
+  ## A FORMAT, not a finished label. The host substitutes `{version}` with the
+  ## client's own version string, read live off the game, so nothing on this
+  ## wire ever carries a version number and a client update cannot make it
+  ## stale. A format with no `{version}` in it is still legal -- it just yields
+  ## a label with no version, which somebody may genuinely want.
+  ##
+  ## It rides the same body `parseDesired` validates, `parseInRaid` reads and
+  ## `parseMenuModeText` reads, for the same reason those do: the client host
+  ## has exactly one route to the backend and a second would only be a second
+  ## thing that can be down.
+  ##
+  ## Returns false, leaving `into` untouched, for every unhappy case -- absent
+  ## (an older manager), empty, over-long, or carrying a character with no
+  ## business in a corner label. The host then keeps its BUILT-IN default,
+  ## which is the whole reason this field is optional: the label is correct
+  ## with no manager running at all.
+  var raw = ""
+  if not pathGet(doc, "menuVersionFormat", raw):
+    return false
+  let v = strip(raw)
+  if v.len == 0 or v.len > MenuVersionFormatMax:
+    return false
+  for ch in v:
+    if ord(ch) < 0x20 or ord(ch) > 0x7E:
+      return false
+  into = v
+  result = true
+
 proc jsonInt(doc, key: string; into: var int): bool =
   var raw = ""
   if not pathGet(doc, key, raw):
