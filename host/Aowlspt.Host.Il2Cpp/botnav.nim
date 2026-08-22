@@ -512,7 +512,8 @@ proc bnService(i: int; owner: Il2CppPtr; now: int64) =
     let s = gBnReg[i].pendSpeed
     gBnReg[i].pend = 0'i32
     if cBnSetSpeed(owner, s) != 0'i32:
-      okLog "botnav: bot id=" & $int(gBnReg[i].id) & " move speed -> " & $s
+      okLog "botnav: bot id=" & $int(gBnReg[i].id) & " move speed -> " &
+            formatFloat(s, ffDecimal, 2)
     # A speed change does not cancel a destination, so fall through rather than
     # return: a bot told "go there, at half speed" gets both on this same tick.
   if not gBnReg[i].hasCmd:
@@ -535,7 +536,7 @@ proc bnService(i: int; owner: Il2CppPtr; now: int64) =
        sd < BnArriveDist:
       gBnReg[i].hasCmd = false
       okLog "botnav: bot id=" & $int(gBnReg[i].id) &
-            " arrived (SDistDestination " & $sd & ")"
+            " arrived (SDistDestination " & formatFloat(sd, ffDecimal, 2) & ")"
       return
   gBnReg[i].nextIssue = now + BnReissueMs
   if gBnReg[i].sprint and gBnReg[i].issues == 0'i32:
@@ -558,7 +559,9 @@ proc bnService(i: int; owner: Il2CppPtr; now: int64) =
                 elif st == -2: "pre-flight refused (mover chain not ready)"
                 else: "status " & $int(st))
     okLog "botnav: bot id=" & $int(gBnReg[i].id) & " GoToPoint(" &
-          $gBnReg[i].cx & ", " & $gBnReg[i].cy & ", " & $gBnReg[i].cz &
+          formatFloat(gBnReg[i].cx, ffDecimal, 2) & ", " &
+          formatFloat(gBnReg[i].cy, ffDecimal, 2) & ", " &
+          formatFloat(gBnReg[i].cz, ffDecimal, 2) &
           ") -> " & what & " (issue #" & $int(gBnReg[i].issues) & ")"
   if st == 2'i32:
     # The navmesh says there is no path. Saying it again 500 ms from now will
