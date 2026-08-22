@@ -340,6 +340,23 @@ proc bindModeText(verbose: bool): bool =
           "bottom-right corner label follows the backend's `menuModeText`, " &
           "which defaults to the logged-in character's name"
     return true
+  # The LIVE INSPECTOR, the third rider, may have claimed it instead. Same
+  # rule, same reason: it claims through `cDuPreloaderTarget`, so the target
+  # identity check above already covers it -- ride, never double-detour.
+  if gInspSlot >= 0:
+    let duFn = cDuPreloaderTarget()
+    if duFn != fn:
+      warn "menu mode text: the live inspector holds a detour whose target " &
+           "(0x" & hexOf(cast[uint64](duFn)) & ") is not the " &
+           "PreloaderUI::Update this feature verified (0x" &
+           hexOf(cast[uint64](fn)) & "). Refusing to ride on it, and refusing " &
+           "to add a second detour to the same function. Nothing bound."
+      return false
+    gModeTextSlot = gInspSlot
+    okLog "menu mode text armed as a RIDER on the live inspector's existing " &
+          "EFT.UI.PreloaderUI::Update detour (slot " & $gModeTextSlot &
+          ") -- one detour, one trampoline, both features live"
+    return true
   if attachDrain("EFT.UI.PreloaderUI::Update", fn, cast[Il2CppMethod](0),
                  false, verbose, 13'i32, true):
     okLog "menu mode text CLAIMED the shared EFT.UI.PreloaderUI::Update " &

@@ -1970,6 +1970,20 @@ proc bindDebugUi(verbose: bool): bool =
           (if gDuCfg.toggleVk == 0x72: "F3" else: "VK " & $gDuCfg.toggleVk) &
           " in game to show the panel."
     return true
+  # The LIVE INSPECTOR is the third rider on this same function and can be the
+  # one that got there first. It claims through this same verified `fn`, so
+  # riding it is safe by construction -- but ride it we must, because installing
+  # a second detour would overwrite its trampoline. This is what makes the
+  # multiplex arming-order INDEPENDENT across all three riders rather than only
+  # across the original two.
+  if gInspSlot >= 0:
+    gDebugUiSlot = gInspSlot
+    okLog "debugui armed as a RIDER on the live inspector's existing " &
+          "EFT.UI.PreloaderUI::Update detour (slot " & $gDebugUiSlot &
+          ") -- one detour, one trampoline, both features live. Press " &
+          (if gDuCfg.toggleVk == 0x72: "F3" else: "VK " & $gDuCfg.toggleVk) &
+          " in game to show the panel."
+    return true
   if attachDrain("EFT.UI.PreloaderUI::Update", fn, cast[Il2CppMethod](0),
                  true, verbose, 10'i32):
     okLog "debugui CLAIMED the shared EFT.UI.PreloaderUI::Update detour " &

@@ -2949,11 +2949,20 @@ proc patchReturned(slot: int32; regs: Il2CppPtr): int32 {.
   # both riders must be dispatchable from both halves. `regs` carries the
   # argument registers saved on ENTRY in either half, so RCX is the PreloaderUI
   # `this` here exactly as it is in the prefix.
-  if i == gModeTextSlot or i == gDebugUiSlot:
+  #
+  # THE LIVE INSPECTOR is the third rider and is listed here for exactly the
+  # same reason. It attaches PREFIX when it claims the slot itself, but when it
+  # ALIASES onto a slot the mode-text feature already claimed, that slot is a
+  # POSTFIX slot -- so this is the only half that ever fires for it, and leaving
+  # it out here would silently kill the inspector in precisely the arming order
+  # (mode-text first, inspector second) that the multiplex exists to tolerate.
+  if i == gModeTextSlot or i == gDebugUiSlot or i == gInspSlot:
     if i == gDebugUiSlot:
       debugUiFired(regs)
     if i == gModeTextSlot:
       modeTextUpdateFired(regs)
+    if i == gInspSlot:
+      inspectFired(regs)
     return 0'i32
   # Phase 1.5 native-settings control probe, by identity and for the same reason:
   # a host drain (meth == nil) whose whole point is to read AFTER the original
