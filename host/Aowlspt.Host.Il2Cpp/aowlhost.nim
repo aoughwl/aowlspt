@@ -103,6 +103,12 @@ import invoke
 ## UpdateManual` checks before it will ever call `BotOwner::Activate`. The detour
 ## body is in `botai.nim` (included below). See `aowlspt_botai.h`.
 {.emit: """#include "aowlspt_botai.h" """.}
+## NATIVE BOT NAVIGATION API: the offsets, the byte-verified
+## `EFT.BotOwner::UpdateManual` target, the guarded raw readers and the three
+## direct-call thunks (GoToPoint, StopMove, SetTargetMoveSpeed). The registry
+## and the service tick are in `botnav.nim` (included below). See
+## `aowlspt_botnav.h`, and `docs/BOTNAV.md` for the recon behind every number.
+{.emit: """#include "aowlspt_botnav.h" """.}
 ## Phase 1 native-settings probe: static field offsets for walking the live
 ## SettingsScreen control tree read-only. Offsets only; the walk is in
 ## `settingsui.nim` (included below). See `aowlspt_settingsui.h`.

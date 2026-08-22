@@ -233,19 +233,12 @@ proc bnSetWanted*(cmds: seq[BnCmd]) =
   gBnWantN[slot] = n
   gBnGen = gBnGen + 1
 
-proc bnTakeWanted(gen: int; into: var array[BnMaxCmds, BnCmd]): int =
-  ## Unity-thread side of the handoff. Only ever called when the generation
-  ## actually moved, and it reads the buffer THAT generation names.
-  ##
-  ## `gen` is passed in rather than re-read here so that the caller marks as
-  ## applied exactly the generation it consumed. Re-reading would let a publish
-  ## landing mid-call have the caller record a newer generation as applied than
-  ## the one it actually read, silently dropping a command set.
-  let slot = gen and 1
-  let n = gBnWantN[slot]
-  for i in 0 ..< n:
-    into[i] = gBnWant[slot][i]
-  result = n
+# There is no "take a copy" step on the Unity side, and that is deliberate
+# rather than an omission. The double buffer already guarantees the writer is
+# never touching the slot the current generation names, so copying it into a
+# local would buy nothing and cost a 16-element array the Unity thread would
+# have to initialise on every generation change. `bnApplyGeneration` reads
+# `gBnWant[slot]` in place.
 
 proc bnParseFloat(s: string; into: var float64): bool =
   ## Small, total float reader: optional sign, digits, optional fraction. No
@@ -421,12 +414,16 @@ proc bnFind(owner: uint64; now: int64): int =
 proc bnApplyGeneration(now: int64) =
   ## Fold a newly-arrived command set into the registry. Runs on the Unity thread
   ## at most once per generation, not per bot and not per frame.
-  var cmds: array[BnMaxCmds, BnCmd]
+  # `gen` is read ONCE, here, and is what both the buffer selection and the
+  # "applied" mark are derived from. Re-reading it for the mark would let a
+  # publish landing mid-loop record a newer generation as applied than the one
+  # actually read, silently dropping a command set.
   let gen = gBnGen
-  let n = bnTakeWanted(gen, cmds)
+  let slot = gen and 1
+  let n = gBnWantN[slot]
   gBnApplied = gen
   for k in 0 ..< n:
-    let c = cmds[k]
+    let c = gBnWant[slot][k]
     for i in 0 ..< BnMaxBots:
       if not gBnReg[i].used:
         continue
@@ -475,7 +472,10 @@ proc bnRefresh(i: int; owner: Il2CppPtr; now: int64) =
   if ok != 0'i32 and bnSanePtr(pl):
     let mc = cBnReadPtr(pl, cBnOffMoveCtx(), ok)
     if ok != 0'i32 and bnSanePtr(mc):
-      var v: array[3, float64]
+      # Initialised explicitly: nimony will not take the address of a local it
+      # cannot prove was written, and "the C function fills it" is not a proof
+      # it has.
+      var v: array[3, float64] = [0.0, 0.0, 0.0]
       if cBnReadV3(mc, cBnOffPrevPos(), addr v[0]) != 0'i32:
         # "Has this bot ever actually moved?" is the empirical proof that its
         # BotMover state machine is populated -- the one hop inside
