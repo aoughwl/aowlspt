@@ -541,6 +541,10 @@ proc swCloneRow(donor, parentGo: Il2CppPtr; text: string): Il2CppPtr =
          "TMP label; it is left showing the donor's text"
   result = clone
 
+## One-shot: the toggle-seed refusal explains itself once, not once per row
+## per tab visit.
+var gSwSeedRefused = false
+
 proc swSeedToggle(control: Il2CppPtr; value: bool): bool =
   ## Show `value` on a cloned toggle. Uses `SetIsOnWithoutNotify`, NOT
   ## `set_isOn`: a clone inherits the donor's `onValueChanged` listeners, so the
@@ -552,6 +556,43 @@ proc swSeedToggle(control: Il2CppPtr; value: bool): bool =
   let widget = cReadPtrAt(control, cSuiOffCtrlValue())
   if widget == nil or cIsReadable(widget, cSwOffToggleIsOn() + 4'i32) == 0'i32:
     return
+  # THE TYPE CHECK. READABLE IS NOT THE SAME AS BEING A TOGGLE.
+  #
+  # This faulted every single tab visit, and the cost was out of all proportion
+  # to the bug. The donor row is chosen by "most common klass on the tab", which
+  # on the Game tab is a DROPDOWN, not a toggle -- the log says so itself
+  # ("the toggle klass was never learned"). Seeding a toggle into a dropdown
+  # clone called `Toggle::SetIsOnWithoutNotify` on an object with a completely
+  # different layout, and it faulted inside the game.
+  #
+  # The VEH guard caught it and the screen survived, so this looked survivable.
+  # It was not. The guard unwinds the WHOLE tab-walk body, so everything after
+  # `swRenderPage` was skipped -- including `renderedFor = tabKey`. The
+  # re-render guard therefore never armed, and the page cloned itself again on
+  # every visit: two 'aowlspt - host' rows on screen after two visits, then
+  # four. A caught fault that silently costs a later statement is far more
+  # expensive than a crash, because nothing points at it.
+  #
+  # So: refuse unless the widget's klass IS the learned toggle klass. Not
+  # readable -- IDENTICAL. Klass identity is the only type evidence available
+  # (reflection is dead on this build) and it is exactly how `swKlassName` and
+  # the Phase 2b reader already decide what a control is.
+  let wk = cast[uint64](cReadPtrAt(widget, 0'i32))
+  if gSwKlassToggle == 0'u64 or wk != gSwKlassToggle:
+    if not gSwSeedRefused:
+      gSwSeedRefused = true
+      okLog "settings pages: NOT seeding a toggle value -- the cloned row's " &
+            "widget klass is 0x" & hexOf(wk) & " and the learned toggle klass " &
+            "is 0x" & hexOf(gSwKlassToggle) &
+            (if gSwKlassToggle == 0'u64:
+               " (never learned: no stock toggle row was found on this tab, " &
+               "which a non-English client will also do)"
+             else: " (the donor is not a toggle)") &
+            ". Calling Toggle::SetIsOnWithoutNotify on it FAULTS, and the " &
+            "caught fault used to abort the rest of the page render -- which " &
+            "is what made the page clone itself on every tab visit. The row " &
+            "is left showing the donor's value; that is cosmetic and safe."
+    return false
   let fn = swFn(SwToggleNoNotify)
   if fn == nil:
     # Fall back to the raw store: the model will be right even though the
@@ -700,11 +741,28 @@ proc swReadBackPage(page: var SwPage) =
   ## display: the click went through the game's own toggle path, and this is
   ## where the result comes back to us.
   ##
-  ## Only rows this page actually seeded are read: a row whose clone failed has
-  ## `clone == 0` and is skipped rather than guessed at.
+  ## ONLY ROWS THIS PAGE ACTUALLY SEEDED ARE READ. That sentence was already
+  ## here and the code did not implement it: it tested `clone != 0` only, and
+  ## `seeded` -- set from `swSeedToggle`'s return at render time -- was written
+  ## and never read.
+  ##
+  ## Harmless while every row got seeded. The moment seeding started REFUSING
+  ## (a clone whose widget is not a toggle, which is every row on a tab whose
+  ## donor is a dropdown), the read-back began comparing our intended value
+  ## against the DONOR's value, concluding the player had changed it, and
+  ## persisting that into `aowlspt-host.json`. Observed: `uxVersionBrand`
+  ## silently flipped true -> false, and a `botNav` key written that the host
+  ## does not even read.
+  ##
+  ## Writing a user's config file from a value we never wrote is the worst
+  ## class of bug in this feature -- it is invisible, it survives restarts, and
+  ## it makes a FEATURE look broken later for reasons that have nothing to do
+  ## with that feature. A row we did not seed has no opinion, so it gets no
+  ## vote.
   var i = 0
   while i < page.rows.len:
-    if page.rows[i].clone != 0'u64 and page.rows[i].kind == swkToggle:
+    if page.rows[i].clone != 0'u64 and page.rows[i].seeded and
+       page.rows[i].kind == swkToggle:
       let control = cast[Il2CppPtr](page.rows[i].clone)
       swCrumbP("read back row '" & page.rows[i].key & "' clone", control)
       var ok = false
@@ -852,4 +910,20 @@ proc swPagesOnTabBuilt(tabPtr: Il2CppPtr; tabName: string; revisit: bool) =
     discard swRenderPage(tabPtr, parentGo, pg)
     pg.renderedFor = tabKey
     gSwPages[i] = pg
+    # ISOLATE WHICH HALF FAILS. `pg` is what we just built; `gSwPages[i]` is
+    # what the registry holds one statement later. If they disagree, the
+    # element assignment itself is the no-op and no amount of read-modify-write
+    # will fix it. If they agree here but the value is gone by the next tab
+    # visit, something is resetting the registry between visits instead.
+    if gSwPagesFires <= 8:
+      okLog "settings pages: write-back check -- local pg.renderedFor=0x" &
+            hexOf(pg.renderedFor) & " registry gSwPages[i].renderedFor=0x" &
+            hexOf(gSwPages[i].renderedFor) &
+            "  local rows=" & $pg.rows.len &
+            " registry rows=" & $gSwPages[i].rows.len &
+            "  local row0.clone=0x" &
+            (if pg.rows.len > 0: hexOf(pg.rows[0].clone) else: "-") &
+            " registry row0.clone=0x" &
+            (if gSwPages[i].rows.len > 0: hexOf(gSwPages[i].rows[0].clone)
+             else: "-")
     i = i + 1

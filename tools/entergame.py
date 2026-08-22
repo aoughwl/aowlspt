@@ -129,11 +129,45 @@ def main():
               file=sys.stderr)
         return 2
 
-    # Already past it? The slots stay in the hierarchy all session, so their
-    # PRESENCE proves nothing -- only the screen's active state does.
-    if not a.list and screen_active(menu) == 0:
-        print("the mode selector is not up -- already past it.")
-        return 0
+    # WAIT FOR THE SELECTOR TO COME UP, and do not confuse "gone" with
+    # "not yet".
+    #
+    # `CharacterSelectionScreen` EXISTS in the hierarchy while the client is
+    # still loading, and it is INACTIVE until the menu is ready. An earlier
+    # version checked once and read 0, announced "already past it", and
+    # returned success -- against a client that was still on its way to the
+    # selector. Everything after that ran on the wrong screen: the settings
+    # toggle was pressed, returned cleanly, and no settings page ever rendered,
+    # because we were never in the menu at all. A wrong answer delivered
+    # confidently, which is the exact failure this whole toolchain is built to
+    # avoid.
+    #
+    # So: poll until it goes ACTIVE. Only conclude "already past" if it was
+    # active at some point and then went away, or if we time out having never
+    # seen it while the slots are present -- and say which of those happened.
+    seen_up = False
+    while time.time() < deadline:
+        st = screen_active(menu)
+        if st == 1:
+            seen_up = True
+            break
+        if st is None and seen_up:
+            break
+        time.sleep(2)
+    if not a.list and not seen_up:
+        # Never observed active. Distinguish the two honest possibilities
+        # instead of picking the flattering one.
+        st = screen_active(menu)
+        if st == 0:
+            print("the mode selector never became active within %gs. Either "
+                  "this session was already past it, or the client is still "
+                  "loading -- those look identical from here, so nothing was "
+                  "pressed. Re-run if the client was still starting."
+                  % a.timeout)
+            return 0
+        print("!! could not determine the mode selector's state (screen not "
+              "found). Nothing was pressed.", file=sys.stderr)
+        return 2
 
     out = run_batch(["find CharacterSlotView %s 120000" % menu], timeout=120)
     slots = HIT.findall(out)
