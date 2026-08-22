@@ -182,7 +182,16 @@ proc modsParentOf(t: Il2CppPtr): Il2CppPtr =
   if par != nil and duOk(par, 0x20'i32):
     result = par
 
-proc modsComponent(go: Il2CppPtr; typeName: string): Il2CppPtr =
+proc modsComponent(comp: Il2CppPtr; typeName: string): Il2CppPtr =
+  ## PASS A COMPONENT (a Transform will do), NOT a GameObject.
+  ##
+  ## `GetComponent` is declared on `UnityEngine.Component`, and a GameObject
+  ## is not one. Handing it a GameObject returns NULL every time -- no fault,
+  ## no complaint, just nothing. That single mistake broke BOTH features in
+  ## this file at once and reported itself as two unrelated symptoms: "the
+  ## cloned tab button has no AnimatedToggle" and "AlphaLabel has no
+  ## TextMeshProUGUI". The inspector's `component` verb works because what
+  ## it is given is a Transform, which IS a Component.
   ## `Component::GetComponent(System.String)` -- the reflection-free way from a
   ## GameObject to a component on this build. Unity matches by SHORT type name
   ## and, measured, by BASE type names too, which is why "AnimatedToggle"
@@ -192,7 +201,7 @@ proc modsComponent(go: Il2CppPtr; typeName: string): Il2CppPtr =
   ## missing-method exception, and a managed throw from inside a detour is not
   ## something to discover empirically.
   result = nil
-  if go == nil or not duOk(go, 0x20'i32):
+  if comp == nil or not duOk(comp, 0x20'i32):
     return
   var fn: Il2CppPtr = nil
   var rva = 0'u32
@@ -204,7 +213,7 @@ proc modsComponent(go: Il2CppPtr; typeName: string): Il2CppPtr =
   let sp = cNavNewString(toCString(name))
   if sp == nil:
     return
-  result = cast[Il2CppPtr](cInspUPP(fn, go, sp, nil))
+  result = cast[Il2CppPtr](cInspUPP(fn, comp, sp, nil))
 
 proc modsLabelTab(toggleRoot: Il2CppPtr; text: string) =
   ## Relabel the cloned tab button. The label lives at
@@ -225,10 +234,7 @@ proc modsLabelTab(toggleRoot: Il2CppPtr; text: string) =
   let label = modsChildNamed(sizeLabel, "Label")
   if label == nil:
     return
-  let go = iGameObjectOf(label)
-  if go == nil:
-    return
-  let tmp = modsComponent(go, "TextMeshProUGUI")
+  let tmp = modsComponent(label, "TextMeshProUGUI")
   if tmp == nil:
     okLog "mods tab: the cloned tab's Label has no TextMeshProUGUI; it keeps " &
           "the donor's caption (cosmetic only)"
@@ -294,9 +300,7 @@ proc modsTabBuild(): bool =
   if tabCloneT != nil:
     let inner = iChildAt(tabCloneT, 0)
     if inner != nil:
-      let innerGo = iGameObjectOf(inner)
-      if innerGo != nil:
-        gModsToggle = modsComponent(innerGo, "AnimatedToggle")
+      gModsToggle = modsComponent(inner, "AnimatedToggle")
   if gModsToggle == nil:
     modsNoteFault("the cloned tab button has no AnimatedToggle, so its " &
                   "selected state cannot be read; the panel would never show")
@@ -333,9 +337,15 @@ proc modsTabTickBody() =
   if not gModsOn or gModsFaults >= ModsMaxFaults:
     return
   if not gModsBuilt:
-    # Build lazily, and only while the settings screen is actually live. Capped
-    # so a build that cannot succeed does not retry every frame forever.
-    if gMi2Self != nil and gModsTried < 8:
+    # Build lazily, and only once the settings screen has actually been opened.
+    #
+    # GATE ON THE SAME POINTER THE BUILD USES. This said `gMi2Self` while
+    # `modsTabBuild` had already been retargeted to `gSwLastTabPtr`, so the
+    # gate tested a pointer nothing sets in this configuration and the build
+    # was never ATTEMPTED -- no tab, no fault, no log line, nothing to debug.
+    # A guard that names a different thing from the code it guards is a silent
+    # feature-off switch.
+    if gSwLastTabPtr != nil and gModsTried < 8:
       discard modsTabBuild()
     return
   if gModsToggle == nil or gModsPanel == nil:
@@ -500,12 +510,8 @@ proc verBrandResolve(): Il2CppPtr =
   if not iUnityAlive(alpha):
     gVerWhy = "AlphaLabel exists but its native half is null (not live yet)"
     return
-  let go = iGameObjectOf(alpha)
-  if go == nil:
-    gVerWhy = "AlphaLabel has no reachable GameObject"
-    return
   gVerWhy = "AlphaLabel has no TextMeshProUGUI"
-  result = modsComponent(go, "TextMeshProUGUI")
+  result = modsComponent(alpha, "TextMeshProUGUI")
   if result != nil:
     gVerWhy = ""
 
