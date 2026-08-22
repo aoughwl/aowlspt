@@ -256,8 +256,10 @@ file manifest, which a modified install fails by definition.
 Useful flags:
 
 - `--list ID` — the mod list a fresh install starts with. The default is
-  `aowl.list.vanillaplus`: the game server plus the three mods that change how
-  the game feels without changing what is in it. `--list aowl.list.raidnight`
+  `aowl.list.vanillaplus`: the game server plus the mods that change how the
+  game feels without changing what is in it (as of registry revision 2 that is
+  five: the FOV fix, classic movement, sway, the performance settings and the
+  texture pack). `--list aowl.list.raidnight`
   turns the bots up; `--list none` leaves the mod manager's own default alone.
 - `--overlay` — do not mirror a client; only (re)write the payload into a target
   that already has one. What you want when you have rebuilt the mods and do not
@@ -463,7 +465,7 @@ installer\build\aowlprobe.exe http://127.0.0.1:6969/aowlspt/mods/enable/aowl.sai
 
 Plain `curl` will not do: bodies are zlib-framed in both directions, which is
 why `aowlprobe` exists. See [registry/README.md](../registry/README.md) for the
-lists and the resolution rules, and press **Insert** in game for the overlay.
+lists and the resolution rules, and press **F12** in game for the overlay.
 
 Your own choices live in the mod manager's store, not in the registry and not in
 `config.json`. The `--list` you installed with is the seed for the first run and
