@@ -2350,7 +2350,19 @@ proc cmdPayload(e: Env): int =
       "position) during an offline raid, to answer whether AI bots are " &
       "actually spawned (but maybe frozen) or truly absent. It never writes " &
       "game state, renders, or affects gameplay. Default false.\",\n" &
-      "  \"botDiag\": false\n" &
+      "  \"botDiag\": false,\n" &
+      "\n" &
+      "  \"//uxMenuModeText\": \"When true, the main menu's BOTTOM-RIGHT " &
+      "corner label (stock: 'PVE ZONE') is set by the host instead. It " &
+      "defaults to the logged-in character's name, and any mod can override " &
+      "it with aowlspt/menutext.setMenuModeText. The host does this by " &
+      "CALLING the game's own EFT.UI.PreloaderUI.SetGameModeText at its " &
+      "verified static RVA -- not by poking a TextMeshPro field -- and binds " &
+      "nothing at all on a build whose prologue does not match. It needs " &
+      "backendPort + modSyncMs (the text rides that poll), and it refuses to " &
+      "arm while debugUi/debugEsp are on, because those drain the same " &
+      "PreloaderUI.Update function. Default false until proven live.\",\n" &
+      "  \"uxMenuModeText\": false\n" &
       "}\n")
 
   let staged = failures - failuresAtEntry

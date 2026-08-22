@@ -118,6 +118,11 @@ import invoke
 ## allocation exports. Table and thunks only; the proof ladder that drives them
 ## is in `invoke2.nim` (included below). See `aowlspt_invoke2.h`.
 {.emit: """#include "aowlspt_invoke2.h" """.}
+## The main menu's bottom-right GAME MODE label: the verified `PreloaderUI`
+## targets (`Update`, `SetGameModeText`, `RefreshCornerLabel`) and the one call
+## thunk that drives it. The implementation is in `modetext.nim` (included
+## below). See `aowlspt_modetext.h`.
+{.emit: """#include "aowlspt_modetext.h" """.}
 ## The in-game, Unity-native debug overlay: the F3 info panel and the
 ## in-world AI markers. Target table, call thunks, guarded scalar stores,
 ## the toggle key and the frame-rate estimate. See `aowlspt_debugui.h`.
@@ -1128,6 +1133,22 @@ var gDebugUiSlot = -1
 var gDebugEspSlot = -1
 var gDebugUi = false
 var gDebugEsp = false
+
+## THE MENU'S BOTTOM-RIGHT GAME-MODE LABEL (stock: "PVE ZONE").
+##
+## The slot and the flag live HERE rather than in `modetext.nim`, because
+## `attachDrain` and `patchReturned` are both defined ABOVE that file's include
+## point and both need to name the slot. Procs resolve across the whole module
+## regardless of order; module-level `var`s do not, which is exactly what the
+## first build of this feature failed on. Everything else about the feature --
+## the state machine, the guarded body and the bind -- is in `modetext.nim`.
+##
+## Mutually exclusive with `gDebugUiSlot` above, and for the identical reason
+## stated there: both drain `EFT.UI.PreloaderUI::Update`, and two detours on one
+## function have the second overwrite the first's trampoline. The overlay is
+## armed first and wins; `bindModeText` checks and refuses.
+var gModeTextSlot = -1
+var gModeTextOn = false
 
 ## Whether the fragile static-RVA drain path may be used at all. OFF by default:
 ## it bound a real-but-wrong function on the live client and crashed the game, so
@@ -2799,6 +2820,12 @@ proc patchReturned(slot: int32; regs: Il2CppPtr): int32 {.
   if i == gVersionSlot:
     versionBrandFired(regs)
     return 0'i32
+  # The menu mode-text postfix, by identity and for the same reason: a host
+  # drain (meth == nil) on `PreloaderUI::Update`. Returns 0 -- it never changes
+  # what the caller gets, it only calls a setter the game already has.
+  if i == gModeTextSlot:
+    modeTextUpdateFired(regs)
+    return 0'i32
   # Phase 1.5 native-settings control probe, by identity and for the same reason:
   # a host drain (meth == nil) whose whole point is to read AFTER the original
   # ran, because the original is what builds the tab's controls. Returns 0, so
@@ -3102,6 +3129,7 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
               elif kind == 10: "debug-overlay"
               elif kind == 11: "debug-overlay-world"
               elif kind == 12: "botai"
+              elif kind == 13: "menu-mode-text"
               else: "main-thread")
   tablesLock()
   let claimed = cHookClaim()
@@ -3167,6 +3195,8 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
     gDebugEspSlot = int(claimed)
   elif kind == 12:
     gBotAiSlot = int(claimed)
+  elif kind == 13:
+    gModeTextSlot = int(claimed)
   else:
     gDrainSlot = int(claimed)
   tablesUnlock()
@@ -3174,7 +3204,7 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
     gRenderMethod = spec
   elif kind == 2 or kind == 3 or kind == 4 or kind == 5 or kind == 6 or
        kind == 7 or kind == 8 or kind == 9 or kind == 10 or
-       kind == 11 or kind == 12:
+       kind == 11 or kind == 12 or kind == 13:
     discard
   else:
     gDrainMethod = spec
@@ -3183,7 +3213,7 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
         $int(cHookStolen(hook)) & " bytes)" &
         (if perFrame or kind == 2 or kind == 3 or kind == 4 or kind == 5 or
             kind == 6 or kind == 7 or kind == 8 or kind == 9 or
-            kind == 10 or kind == 11 or kind == 12: "" else:
+            kind == 10 or kind == 11 or kind == 12 or kind == 13: "" else:
            "; it runs more than once a frame, so its firing count is not a " &
            "frame count")
   return true
@@ -3889,6 +3919,18 @@ include "settingswrite.nim"
 ## census and the label/value primitives, and on `invoke2.nim` for Instantiate /
 ## SetParentAndAlign / SetActive. Defines `swPagesOnTabBuilt`.
 include "settingspages.nim"
+
+## The main menu's bottom-right GAME MODE label ("PVE ZONE" on a stock client),
+## made host/mod-controlled. `include`d after `debugui.nim` for one specific
+## reason: it drains the SAME function the debug overlay drains
+## (`EFT.UI.PreloaderUI::Update`) and must be able to see `gDebugUiSlot` to
+## refuse rather than overwrite the overlay's trampoline. It sets the text by
+## CALLING the game's own `PreloaderUI::SetGameModeText` at its static RVA --
+## not by writing `TMP.m_text` -- so it does not inherit the Phase-2a repaint
+## problem. See `abi/aowlspt_modetext.h`. Defines `modeTextUpdateFired`
+## (dispatched by slot identity in `patchReturned`), `modeTextSetWanted` and
+## `bindModeText`.
+include "modetext.nim"
 
 proc hostEventSubscribe(ctx: Il2CppPtr; name: Il2CppPtr; nameLen: int32;
                         cb: Il2CppPtr; user: Il2CppPtr): int32 {.
@@ -4706,6 +4748,16 @@ proc takeModSet() =
     info "graphics: backend reports " & (if raid: "IN RAID â€” grading the world"
                                          else: "in menu â€” post-process off")
 
+  # The menu's bottom-right game-mode label rides this same poll, for exactly
+  # the reasons `inRaid` does: the client host has one way to reach the backend
+  # and it is already using it, so a second channel would be a second thing that
+  # can be down. Read only from a document `parseDesired` accepted, so a partial
+  # or wrong-schema answer can never move the label. An older manager omits the
+  # field, `parseMenuModeText` returns false, and the stock "PVE ZONE" stays.
+  var wanted = ""
+  if modcontrol.parseMenuModeText(doc, wanted):
+    modeTextSetWanted(wanted)
+
 proc runPending() =
   ## The host thread's half.
   ##
@@ -4918,6 +4970,17 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          " in game to toggle it; layout is " & gDuCfg.source &
          " and is re-read on every toggle-on, so it can be edited live. The " &
          "whole body is VEH-guarded and writes only into labels it created."
+  # The main menu's bottom-right game-mode label. Default OFF until proven live:
+  # it is the first thing this host does that CALLS a managed method on the
+  # Unity thread as a feature rather than as a probe.
+  gModeTextOn = readBoolKey("uxMenuModeText")
+  if gModeTextOn:
+    info "uxMenuModeText is set: a postfix detour on EFT.UI.PreloaderUI.Update " &
+         "will set the menu's bottom-right corner label by CALLING the game's " &
+         "own PreloaderUI.SetGameModeText. The text comes from the backend's " &
+         "`menuModeText` on the mod-sync poll, which defaults to the logged-in " &
+         "character's name. It needs backendPort + modSyncMs, and it refuses " &
+         "to arm while debugUi/debugEsp own the same PreloaderUI.Update hook."
   gVersionBrand = readBoolKey("uxVersionBrand")
   gVersionWrite = readBoolKey("uxVersionBrandWrite")
   if gVersionWrite:
@@ -5066,6 +5129,17 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
                "unverified on this build, or drain disabled)"
         elif gDebugEsp:
           discard bindDebugEspWorld(true)
+
+      # THE MENU'S BOTTOM-RIGHT GAME-MODE LABEL (opt-in). Bound LAST, and it has
+      # to be: it drains `EFT.UI.PreloaderUI::Update`, the same function the
+      # debug overlay above drains, and the only way it can refuse rather than
+      # overwrite the overlay's trampoline is to arm after the overlay has had
+      # its turn. Same precedence rule botdiag/debugEsp already share over
+      # `GameWorld::RegisterPlayer`.
+      if gModeTextOn and not bindModeText(true):
+        info "menu mode text did not arm (PreloaderUI.Update or " &
+             "SetGameModeText unverified on this build, the debug overlay " &
+             "already owns that hook, or drain disabled)"
 
   let modsDir = joinPath(gDir, "mods")
   # The runtime may not have come up, and that deliberately does not stop this:

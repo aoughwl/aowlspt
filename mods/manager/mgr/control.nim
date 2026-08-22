@@ -486,6 +486,69 @@ proc onRaidEnded(payload: string): string =
   gInRaid = false
   result = ""
 
+# ---------------------------------------------------------------------------
+# The main menu's bottom-right game-mode label, relayed to the client host
+# ---------------------------------------------------------------------------
+#
+# A stock post-1.0 menu reads "PVE ZONE" down there. The client host can now put
+# anything short there instead, by calling the game's own
+# `PreloaderUI::SetGameModeText`. What it should say is a question only this side
+# can answer, so this is where the answer is assembled — and it rides `inRaid`'s
+# poll for `inRaid`'s reasons: the host has one route to the backend, it is
+# already using it, and a second channel would be a second thing that can break.
+#
+# Two inputs, and the precedence between them is the whole design:
+#
+#   1. `aowlspt.menu.modeText`  -- an OVERRIDE, pushed by any mod. Wins.
+#   2. `aowlspt.menu.nickname`  -- the DEFAULT: the logged-in character's name,
+#      pushed by the tarkov emulator when a session binds to a profile.
+#
+# A mod pushing an empty string CLEARS its override and the nickname comes back.
+# That matters: "set it back to normal" must be expressible, and a mod that is
+# unloaded mid-session should not be able to leave a stale label behind forever.
+
+var gMenuModeOverride = ""
+var gMenuNickname = ""
+
+proc menuModeText*(): string =
+  ## What `routeClient` reports as `menuModeText`. Empty means "say nothing" --
+  ## the host then leaves the stock label exactly where it is, which is the
+  ## right answer before anyone has logged in.
+  if gMenuModeOverride.len > 0:
+    return gMenuModeOverride
+  result = gMenuNickname
+
+proc menuTextSane(s: string): bool =
+  ## The same shape the host's `parseMenuModeText` will accept. Checked HERE too,
+  ## rather than trusting the far end to reject it: a value that cannot survive
+  ## the trip should be refused at the point a person can still be told about it,
+  ## and a manager that published rubbish the host silently dropped would look
+  ## exactly like a manager that was working.
+  if s.len == 0 or s.len > 48:
+    return false
+  for ch in s:
+    if ord(ch) < 0x20 or ord(ch) > 0x7E:
+      return false
+  result = true
+
+proc onMenuModeText(payload: string): string =
+  ## `aowlspt.menu.modeText` — `{"text":"..."}`. An empty or absent `text`
+  ## clears the override rather than blanking the label.
+  let t = field(payload, "text").asText("")
+  if t.len == 0:
+    gMenuModeOverride = ""
+  elif menuTextSane(t):
+    gMenuModeOverride = t
+  result = ""
+
+proc onMenuNickname(payload: string): string =
+  ## `aowlspt.menu.nickname` — `{"nickname":"..."}`, from the tarkov emulator
+  ## when a session binds to a profile. The DEFAULT only; an override still wins.
+  let n = field(payload, "nickname").asText("")
+  if menuTextSane(n):
+    gMenuNickname = n
+  result = ""
+
 proc controlInit*(probeMs: int) =
   ## Subscribe, probe, and arm the timeout that turns silence into an answer.
   ##
@@ -499,6 +562,12 @@ proc controlInit*(probeMs: int) =
   # Raid state from the tarkov mod, relayed to the client host via routeClient.
   discard onEvent("tarkov.raid.started", onRaidStarted)
   discard onEvent("tarkov.raid.ended", onRaidEnded)
+  # The menu's bottom-right game-mode label, same relay. `modeText` is the
+  # mod-facing override (see `aowl/src/aowlspt/menutext.nim`); `nickname` is the
+  # tarkov emulator naming the character that just logged in, which is the
+  # default when no mod has overridden anything.
+  discard onEvent("aowlspt.menu.modeText", onMenuModeText)
+  discard onEvent("aowlspt.menu.nickname", onMenuNickname)
 
   var probe = obj()
   put(probe, "from", "aowl.manager")

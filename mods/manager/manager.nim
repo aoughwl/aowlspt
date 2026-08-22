@@ -1430,6 +1430,11 @@ proc routeClient(url, body, session: string): string =
     # gate. Sourced from the tarkov mod's raid start/end events (see
     # mgr/control.nim). An older host ignores the field; a newer one reads it.
     put(out1, "inRaid", raidActive())
+    # What the main menu's bottom-right corner label should say (stock: "PVE
+    # ZONE"). Empty means "nothing to say", and the host then leaves the stock
+    # label alone. A mod's `setMenuModeText` override wins over the logged-in
+    # character's name; see mgr/control.nim. Older hosts ignore the field.
+    put(out1, "menuModeText", menuModeText())
     # Last, always. This is the terminator the reader checks for.
     put(out1, "complete", true)
     text = done(out1).text
