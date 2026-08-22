@@ -11,12 +11,18 @@ PowerShell or not at all.
 Taken 2026-08-22 on the i9-10850K (20 logical cores), in a fresh worktree,
 timed with a stopwatch around the real command.
 
-| what | time |
-|---|---|
-| **full `aowl build`, cold worktree** | **~19 min** (≈25 compiles, strictly serial) |
-| one target cold (`aowl.exe`, a mid-size program) | **30 s** |
-| the same target, nothing changed | **0.27 s** |
-| CPU used by one build, all 20 cores | **30–40 %** |
+| what | command | time |
+|---|---|---|
+| **full build, cold worktree** | `aowl build` | **18 min 25 s** (1104.7 s, ≈25 compiles, strictly serial) |
+| **host DLL after a one-line edit** | `aowl build host` | **48 s** |
+| host DLL, nothing changed | `aowl build host` | **0.39 s** |
+| `aowl.exe` cold | `aowl bootstrap` | 30.2 s |
+| `aowl.exe`, nothing changed | — | 0.27 s |
+| CPU used by one build, of 20 cores | — | 30–40 % |
+
+**The headline: 48 s instead of 18 min 25 s — 23× — for the single most
+common change in this project.** That is what `aowl build host` buys, and the
+only reason it was not available is that nobody had written the case label.
 
 Three conclusions, and every tool here follows from one of them.
 
@@ -25,9 +31,15 @@ Three conclusions, and every tool here follows from one of them.
    asks for twenty-five programs when you changed one. The fix is not a faster
    compiler; it is a way to name one target. That is `aowl build <target>`.
 
+   One honest caveat on the 48 s: it is what a change to `aowlhost.nim` itself
+   costs, and that file is the host's root module, so changing it invalidates
+   everything downstream of it. A change to a *leaf* module the host imports is
+   cheaper. There is no configuration that makes editing the root module cheap,
+   and 48 s is close to the floor for a 1.5 MB native DLL.
+
 2. **A build uses a third of the machine.** It is one nimony at a time, and
    nimony is largely single-threaded. Sixty percent of a 20-core box sits idle
-   through a nineteen-minute build.
+   through an eighteen-minute build.
 
 3. **Concurrent builds in separate worktrees are safe.** This was measured, not
    assumed: three agents' builds ran simultaneously through this work and all
@@ -108,6 +120,11 @@ project repeatedly and is invisible at every step except a human playing.
 The marker list is data, in `tools/deploy.json`. **Add a marker the same day
 you add a feature.** A good marker is a log-message literal: the compiler emits
 it verbatim and it names the feature. Currently 19 for the host DLL.
+
+One thing to expect: `check` run *while a build is in flight* will report the
+target as "not built", because `buildIl2CppHost` deletes its output before
+compiling (deliberately — a leftover output makes `placeLibrary` return early
+and ship the stale binary). That is the tool being right, not a false alarm.
 
 It verifies everything before it copies anything (a new host against an old
 `tarkov.dll` is its own class of confusing bug), backs each live file up to
@@ -212,10 +229,11 @@ that was actually expensive, but the wall-clock stays.
 suspended process at start; there is no path to swapping it in a running
 client, and `docs/DEBUGGING.md` is right that every non-`--watch` host maps its
 libraries in place. So "change a host file, see the result" will always be
-build → deploy → relaunch. The floor is now roughly: `aowl build host` (tens of
-seconds warm) + `deploy.py deploy` (a second) + `harness.py run` (~90 s,
-unattended). Call it two minutes, none of it a person's attention, against the
-~10 minutes with a human in it that this replaced.
+build → deploy → relaunch. The floor is now measured: `aowl build host` 48 s +
+`deploy.py deploy` about a second + `harness.py run` ~90 s unattended. Call it
+two and a half minutes, **none of it a person's attention**, against the ~10
+minutes with a human inside it that this replaced. The remaining wall-clock is
+one compile and one game start, and neither is ours to shorten.
 
 **`aowl build` is still the right command after an ABI header change**, and it
 will still be slow, because `dropStaleCaches` correctly throws every cache away.
