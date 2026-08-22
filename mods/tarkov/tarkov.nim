@@ -169,6 +169,52 @@ const ModeRegular = "regular"
 const ModePve = "pve"
 const ModePvpSeason = "pvp-season"
 
+# The mode helpers live up here, beside the mode constants, because
+# `/client/game/config` reads them and is declared well above where these used
+# to sit. Nimony wants the declaration first.
+
+proc offeredModes(): seq[string] =
+  ## The modes this server offers. **One**, and that is the design rather than a
+  ## reduction of it.
+  ##
+  ## Everything this emulator runs is PvE, so PvE is the mode. `regular` is
+  ## BSG's PvP zone and `pvp-season` is seasonal PvP; there is no second player
+  ## here and a tile that enters a mode this server cannot run is a tile that
+  ## exists to disappoint. Screen 1 is therefore a formality with a single
+  ## enterable tile, and the real work -- picking a character -- happens on
+  ## screen 2 (`/client/game/profile/list`), which is unbounded.
+  ##
+  ## A mode not in this list is answered `locked`: a greyed tile, which is how
+  ## the real server hides a mode the account does not own (the captured account
+  ## had `"pve":{"status":"locked"}` for exactly that reason). The key is still
+  ## sent -- all three always are, because a key outside `EGameMode` throws and
+  ## aborts the whole dictionary, and one omitted is a shape the client has
+  ## never been observed to receive.
+  result = @[]
+  if gPveSlot: result.add ModePve
+  if gPvpSeasonSlot: result.add ModePvpSeason
+  # Only if the deployment has switched PvE off does the PvP zone come back, so
+  # that a server is never left with no enterable tile at all.
+  if result.len == 0: result.add ModeRegular
+
+proc defaultMode(): string =
+  ## The mode a session is on before it has said otherwise -- the boot-time
+  ## `/client/game/mode` carries `{"sessionMode":null}` (capture seq 024), so
+  ## this server picks. It used to be `regular` unconditionally, which named a
+  ## PvP mode this server does not offer and cannot run.
+  let modes = offeredModes()
+  result = modes[0]
+
+proc modeOffered(mode: string): bool =
+  # Bound to a `let` before it is walked, here and in every loop below: nimony
+  # will not borrow an iteration path out of a call's temporary.
+  let modes = offeredModes()
+  for m in modes:
+    if m == mode:
+      return true
+  result = false
+
+
 var gSessionMode = ""
   ## The mode the client last told this server it is on, via
   ## `/client/game/mode`. One player, one client, one mode at a time -- the same
@@ -358,7 +404,7 @@ proc onGameConfig(url, body, session: string): string =
   # account is fully synced. `purchasedGames`/`availableGameModes` are small
   # fixed dicts it indexes; a missing key here reads as "not owned" at best and
   # a null-deref at worst on the mode-select screen.
-  put(o, "sessionMode", if gSessionMode.len > 0: gSessionMode else: ModeRegular)
+  put(o, "sessionMode", if gSessionMode.len > 0: gSessionMode else: defaultMode())
   var purchased = obj()
   put(purchased, "eft", true)
   put(purchased, "arena", false)
@@ -372,10 +418,19 @@ proc onGameConfig(url, body, session: string): string =
   # its slot is. These were three literals -- `pve:false` while the emulator
   # runs nothing but PvE, and `pvp-season:true` on a server with no second
   # player in it. Both were backwards.
+  # Which mode tiles the client draws at all, kept in exact step with
+  # `offeredModes` -- a mode advertised here and answered `locked` on screen 1
+  # is a tile that exists to be refused, and one NOT advertised here cannot be
+  # entered however good its entry is.
+  #
+  # `regular` used to be hardcoded `true`. It is BSG's PvP zone and this server
+  # cannot run it, so it is now false unless PvE has been switched off. The
+  # captured real account had `"pve":false` for a mode it did not own, so a
+  # false here is a shape the client is known to handle.
   var modes = obj()
-  put(modes, "regular", true)
-  put(modes, "pve", gPveSlot)
-  put(modes, "pvp-season", gPvpSeasonSlot)
+  put(modes, "regular", modeOffered(ModeRegular))
+  put(modes, "pve", modeOffered(ModePve))
+  put(modes, "pvp-season", modeOffered(ModePvpSeason))
   put(o, "availableGameModes", modes)
   result = envelope(o)
 
@@ -516,6 +571,14 @@ proc buildPvr(p: Profile; pvr: var JsonObject): bool =
   result = true
 
 proc characterSlot(p: Profile): JsonObject =
+  ## **UNUSED, and kept only as the record of a disproven guess.** Do not wire
+  ## this back into `/v2/client/game/profiles/`: the real server sends two
+  ## fields there and nothing in that dictionary holds a character. See
+  ## `modeSlot` for what actually goes on the wire, and `profileInMode` for the
+  ## capture evidence. If the character screen ever needs a rendered doll it
+  ## will be on `/client/game/profile/list`, which already sends whole profile
+  ## documents and needs none of this.
+  ##
   ## One `EFT.CharacterSelectionProfileData` value for the post-1.0
   ## character-select screen. The wire keys are NOT the C# field names -- they
   ## come from the client's `[JsonProperty]` attributes (decoded from the
@@ -602,24 +665,6 @@ proc characterSlot(p: Profile): JsonObject =
 # third is PvP and is off; see `gPvpSeasonSlot`. That lock is a `status:"locked"`
 # entry on screen 1 and is unrelated to how many characters exist.
 
-proc offeredModes(): seq[string] =
-  ## The modes this server puts on the character screen at all, in the order the
-  ## screen reads them. A mode not in this list is answered `locked`, which is a
-  ## greyed tile rather than a missing one -- a key omitted entirely renders as
-  ## an empty "create here" prompt, which would be the opposite of the intent.
-  result = @[ModeRegular]
-  if gPveSlot: result.add ModePve
-  if gPvpSeasonSlot: result.add ModePvpSeason
-
-proc modeOffered(mode: string): bool =
-  # Bound to a `let` before it is walked, here and in every loop below: nimony
-  # will not borrow an iteration path out of a call's temporary.
-  let modes = offeredModes()
-  for m in modes:
-    if m == mode:
-      return true
-  result = false
-
 proc profileInMode(mode: string): Profile =
   ## A character tagged to this mode, for the mode tile's preview on SCREEN 1.
   ##
@@ -684,41 +729,40 @@ proc firstFreeMode(): string =
       return m
   result = ""
 
-proc vacantSlot(status: string): JsonObject =
-  ## A slot with no character in it -- `empty` (the "+", which is what the
-  ## client renders as its own create-a-character affordance; there is no
-  ## separate "add character" request, this value IS the button) or `locked`
-  ## (a greyed tile for a mode this server will not offer).
+proc modeSlot(enterable: bool): JsonObject =
+  ## One entry in the game-mode dictionary, in **the shape the real server
+  ## sends**. `data/capture/raid1/responses/048.json`, verbatim, is the whole of
+  ## what BSG puts in one of these:
   ##
-  ## Every field `characterSlot` sends is sent here too, zeroed. A slot value
-  ## that omits keys the deserialiser expects can throw, and a throw ANYWHERE in
-  ## this dictionary aborts the whole of it and re-locks every slot, including
-  ## the one with a character in it -- so a vacant slot is a full shape with
-  ## nothing in it, not a short one.
+  ##     "pve":     {"status": "locked"}
+  ##     "regular": {"SeasonalInfo": null, "status": "empty"}
   ##
-  ## `status` is a parameter rather than something the caller patches
-  ## afterwards, because `put` on this JSON builder APPENDS: a second
-  ## `put(o, "status", ...)` would emit the key twice and leave which one wins
-  ## to whichever parser reads it.
+  ## Two fields. This used to send eighteen -- uid, nickname, level, side, aid,
+  ## a whole `PlayerVisualRepresentation` doll -- on the belief that these
+  ## entries were character slots. They are not; there is no field here that can
+  ## hold a character, which is why one character appeared on all three tiles
+  ## (the client paints the bound profile over every tile and ignores this).
+  ##
+  ## Only the two status values ever observed on the wire are used. `available`
+  ## was ours, invented, and an unrecognised value in a field the client may read
+  ## through an enum converter is the exact failure this file has been bitten by
+  ## before -- a throw anywhere in this dictionary aborts the whole of it and
+  ## re-locks every tile.
+  ##
+  ##   `empty`  -- enterable. The captured account had `regular` answered
+  ##               `empty` with no character anywhere on the account, and the
+  ##               client entered it and went on to the character screen. It
+  ##               means "no character tagged to this mode", not "press + here".
+  ##   `locked` -- a greyed tile, which is how the real server hides a mode the
+  ##               account does not own.
+  ##
+  ## `status` is a parameter rather than something the caller patches afterwards,
+  ## because `put` on this JSON builder APPENDS: a second `put(o, "status", ...)`
+  ## would emit the key twice and leave which one wins to whichever parser reads
+  ## it.
   var o = obj()
-  put(o, "uid", "")
-  put(o, "status", status)
-  put(o, "side", 0)
-  put(o, "nickname", "")
-  put(o, "lowerNickname", "")
-  put(o, "nicknamePref", "")
-  put(o, "level", 0)
-  put(o, "prestigeLevel", 0)
-  put(o, "memberCategory", 0)
-  put(o, "accountType", 0)
-  put(o, "aid", 0)
-  put(o, "gameVersion", gEdition)
-  put(o, "PlayerVisualRepresentation", jnull())
   put(o, "SeasonalInfo", jnull())
-  put(o, "unlockedProductionRecipe", raw("[]"))
-  put(o, "unlockedRules", raw("[]"))
-  put(o, "unlockedTraderDialogues", raw("[]"))
-  put(o, "unlockedTraders", raw("[]"))
+  put(o, "status", if enterable: "empty" else: "locked")
   result = o
 
 
@@ -772,13 +816,7 @@ proc onProfilesV2(url, body, session: string): string =
   # it is walked for the same borrow reason as the loops above.
   let keys = @[ModeRegular, ModePve, ModePvpSeason]
   for mode in keys:
-    let p = profileInMode(mode)
-    if p.ok and modeOffered(mode):
-      put(modes, mode, characterSlot(p))
-    elif creationAllowedIn(mode):
-      put(modes, mode, vacantSlot("empty"))
-    else:
-      put(modes, mode, vacantSlot("locked"))
+    put(modes, mode, modeSlot(modeOffered(mode)))
   # Enveloped: a bare dictionary renders NOTHING (the client wraps this in
   # JsonResponse<T> and reads `.data`).
   result = envelope(modes)
@@ -1557,6 +1595,96 @@ proc onQuestList(url, body, session: string): string =
 proc onAchievementList(url, body, session: string): string =
   envelope(objOf("elements", raw(achievements())))
 
+# --------------------------------------------------------------- mode names
+#
+# The three mode tiles are labelled from the locale, by key, and **this server
+# serves the locale** -- so naming them needs no host patch and no client edit.
+# The real table has:
+#
+#     "EGameMode/Regular":"PVP ZONE"
+#     "EGameMode/Pve":"PVE ZONE"
+#     "EGameMode/PvpSeason":"PVP SEASON"
+#
+# and the deployed `db.json` has **none of them** (`grep -o
+# 'EGameMode/[A-Za-z]*":"' db.json` finds nothing), which is why the tiles read
+# as raw-ish fallbacks -- "PvE zone", "PvE", "PvP season" -- instead of wording
+# anybody chose. `PveFirstTime/Message` in that same table already says
+# "Welcome to the PVE ZONE game mode", so the modal and the tile it names
+# currently disagree.
+#
+# Corrected by splice rather than by rebuilding the table: the locale is one raw
+# JSON string of about 3.5 MB that this server hands straight out, and parsing
+# and re-emitting it to fix three keys would cost far more than it buys. Fixing
+# the shipped `data/post1/locale_en.json` instead would be a 3.5 MB single-line
+# blob in every diff of this repo forever, and would still leave every install
+# already on disk wrong.
+#
+# **What is actually broken.** The table ships all three keys, but with
+#
+#     "EGameMode/Regular":"PVE ZONE"
+#
+# so the PvP zone and the PvE zone are BOTH labelled "PVE ZONE" -- which is
+# precisely the muddle on the reported screen. (An earlier note of mine said the
+# keys were missing entirely; that was a `grep` of `db.json`, which is the wrong
+# file -- post-1.0 locale comes from the mod's own post1 table.)
+
+const ModeNameRegular = "PVP ZONE"
+const ModeNamePve = "PVE ZONE"
+const ModeNamePvpSeason = "PVP SEASON"
+
+proc setLocaleKey(text, key, value: string): string =
+  ## `text` with `"key":"..."` set to `value` -- replaced where the key is
+  ## already there, inserted after the opening brace where it is not.
+  ##
+  ## A raw-string edit, not a parse. Both halves are exact-match splices on a
+  ## quoted key, so neither can produce a duplicate key: which of two identical
+  ## keys wins is up to whichever parser reads it, and that is not a thing to
+  ## leave to chance in a 3.5 MB table nobody will read again.
+  ##
+  ## The value is written as a bare JSON string, so it must not need escaping.
+  ## Everything here is upper-case ASCII.
+  let needle = "\"" & key & "\":\""
+  let at = find(text, needle)
+  if at < 0:
+    if text.len > 2 and text[0] == '{':
+      return "{\"" & key & "\":\"" & value & "\"," & text.substr(1)
+    return text
+  # Not `from`: keyword.
+  let valAt = at + needle.len
+  let shut = find(text, "\"", valAt)
+  if shut < 0:
+    return text
+  result = text.substr(0, valAt - 1) & value & text.substr(shut)
+
+var gModeLocaleName = ""
+var gModeLocaleText = ""
+  ## The spliced table, and which one it is. **One slot, not a table of them**:
+  ## this server plays one player in one language, and a second entry would be a
+  ## megabyte held against a language nobody is reading.
+  ##
+  ## The splice runs ONCE per language per run and every request after it is a
+  ## string compare and a copy of what was going out anyway -- so the cost this
+  ## adds to a route the client hits on every menu load is three `find`s and one
+  ## extra ~3.5 MB build at first use, and nothing at all afterwards.
+
+proc withModeNames(name, table: string): string =
+  ## `table` with the three `EGameMode/*` names set to what this server means.
+  ##
+  ## Left alone when the table is not a JSON object at all: an install with no
+  ## post-1.0 locale answers `""`, and inventing one would hide that rather than
+  ## report it.
+  if gModeLocaleName == name and gModeLocaleText.len > 0:
+    return gModeLocaleText
+  # Not `out`: that is a keyword in nimony.
+  var spliced = table
+  if table.len > 2 and table[0] == '{':
+    spliced = setLocaleKey(spliced, "EGameMode/Regular", ModeNameRegular)
+    spliced = setLocaleKey(spliced, "EGameMode/Pve", ModeNamePve)
+    spliced = setLocaleKey(spliced, "EGameMode/PvpSeason", ModeNamePvpSeason)
+  gModeLocaleName = name
+  gModeLocaleText = spliced
+  result = spliced
+
 proc onLocale(url, body, session: string): string =
   ## `/client/locale/en` -- the language is the last path segment.
   let lang = pathAfter(url, "/client/locale/")
@@ -1572,9 +1700,10 @@ proc onLocale(url, body, session: string): string =
   # without it the client shows raw key paths -- map names as `Icebreaker`,
   # settings hovers as `Settings/Graphics/PostFxOff`, and so on. The SPT table
   # remains the fallback and the source for the mail this server composes.
-  let post1Locale = post1Table("locale_" & (if lang.len > 0: lang else: "en"))
+  let localeName = "locale_" & (if lang.len > 0: lang else: "en")
+  let post1Locale = post1Table(localeName)
   if post1Locale.len > 0:
-    return envelope(raw(post1Locale))
+    return envelope(raw(withModeNames(localeName, post1Locale)))
   result = envelope(raw(locale(if lang.len > 0: lang else: "en")))
 
 proc onMenuLocale(url, body, session: string): string =
@@ -1874,7 +2003,7 @@ proc onGameMode(url, body, session: string): string =
   if asked.len > 0 and modeOffered(asked):
     gSessionMode = asked
   elif gSessionMode.len == 0:
-    gSessionMode = ModeRegular
+    gSessionMode = defaultMode()
   var o = obj()
   put(o, "gameMode", gSessionMode)
   put(o, "backendUrl", BackendUrl)
@@ -3159,8 +3288,9 @@ proc tarkovSchema(): seq[Setting] =
                              "limit"),
     boolSetting("pveSlotEnabled", "Offer the PvE game mode", true,
                 category = "Characters",
-                description = "Whether the PvE mode tile is enterable. " &
-                              "Everything this server runs is PvE"),
+                description = "The one mode this server offers. Everything " &
+                              "it runs is PvE; switch this off and the PvP " &
+                              "zone comes back so a tile is always enterable"),
     boolSetting("pvpSeasonSlotEnabled", "Offer the seasonal PvP slot", false,
                 category = "Characters",
                 description = "Off by design: there is no second player on " &

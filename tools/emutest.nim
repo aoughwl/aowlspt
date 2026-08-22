@@ -930,19 +930,39 @@ proc main(): int =
   discard expectIn("the profile has a stash", "/client/game/profile/list",
                    "", "\"stash\"")
 
-  # The character screen, which is a *mode* select: one slot per EGameMode. The
-  # first character takes the `regular` slot; the `pve` slot is the "+", and the
-  # PvP-season slot is locked because this server has no second player in it.
-  # These three assertions are the whole of multi-character on the wire.
+  # Screen 1 is the GAME MODE select and offers exactly one enterable mode: PvE,
+  # because everything this server runs is PvE. The two PvP modes are `locked`,
+  # which is how the real server hides a mode an account cannot enter (the
+  # captured account had `"pve":{"status":"locked"}` for exactly that reason).
+  #
+  # It is NOT the character screen. Characters live on
+  # `/client/game/profile/list`, checked above and again where the roster is.
   let slots = call("/v2/client/game/profiles/", "{}")
-  check("the character screen shows the first character in the regular slot",
-        slots.contains("\"regular\"") and slots.contains("\"available\""),
-        slots.body)
-  check("and an empty PvE slot, which is the create-a-character affordance",
+  check("the mode screen offers PvE, the one mode this server can run",
         slots.contains("\"pve\"") and slots.contains("\"empty\""), slots.body)
-  check("and the seasonal PvP slot is locked, never offered",
-        slots.contains("\"pvp-season\"") and slots.contains("\"locked\""),
-        slots.body)
+  check("and both PvP modes are locked, never offered",
+        slots.contains("\"regular\"") and slots.contains("\"pvp-season\"") and
+        slots.contains("\"locked\""), slots.body)
+  # The shape is BSG's own: two fields per entry and no character in any of
+  # them. A uid here means the character slot has crept back in.
+  check("and no entry carries a character, because none of them can",
+        not slots.contains("\"uid\"") and
+        not slots.contains("\"PlayerVisualRepresentation\""), slots.body)
+  # And the mode the client is put on by default is the one that is offered.
+  discard expectIn("the session's default mode is the one mode on offer",
+                   "/client/game/config", "", "\"sessionMode\":\"pve\"")
+  # The tiles are labelled from the locale this server serves. The shipped table
+  # calls the PvP zone "PVE ZONE", so both PvP and PvE tiles read the same; the
+  # names are corrected on the way out. Skipped when the install has no
+  # post-1.0 locale table, which is a fixture without one rather than a fault.
+  let loc = call("/client/locale/en", "")
+  if loc.ok and loc.contains("\"EGameMode/"):
+    check("the PvP zone is not also called the PvE zone",
+          loc.contains("\"EGameMode/Regular\":\"PVP ZONE\""),
+          "EGameMode/Regular is still wrong")
+    check("and the one mode on offer is named",
+          loc.contains("\"EGameMode/Pve\":\"PVE ZONE\""),
+          "EGameMode/Pve is not named")
 
   heading "Selecting and starting"
   discard expectIn("select binds the session", "/client/game/profile/select",
