@@ -1,0 +1,58 @@
+# Example live-inspector batches. Copy the block you want into
+# <deploy>\aowlspt-inspect.txt (or pipe it through tools\inspect.ps1) while the
+# game is running. Nothing here rebuilds or restarts anything.
+#
+#   Get-Content .\tools\inspect-probes.txt | .\tools\inspect.ps1
+#
+# ===========================================================================
+# ORIENTATION -- always start here. `anchors` is the list of pointers this host
+# already holds, so a session begins from something verified rather than from
+# an address copied out of a log line.
+# ===========================================================================
+help
+image
+anchors
+
+# ===========================================================================
+# THE OPEN ROOT-CAUSE QUESTION FOR THE OVERLAY:
+# does the version label's Graphic carry a Canvas, and if so which one?
+#
+# A `renderMode` of 2 (WorldSpace) means a clone landed on its OWN canvas --
+# which is exactly the failure that turned 33 overlay clones into 33 render
+# passes. A renderMode of 0 (ScreenSpaceOverlay) means it is on the menu's
+# canvas, as intended.
+# ===========================================================================
+# canvas $verlabel
+# parent $verlabel 8
+# read $verlabel+0xe0 str
+# read $verlabel+0x378 u8
+
+# ===========================================================================
+# THE SETTINGS-TAB CONTAINER CHAIN. `$tab0..$tab7` are bound once a tab has
+# been built (open Settings and click a tab first). `+0x78` is the offset the
+# metadata gives for `_rectTransform` and which kept reading NULL on the live
+# object -- this is the two-line way to confirm that, instead of a rebuild.
+# ===========================================================================
+# read $tab0+0x78 ptr
+# fields $tab0 0x100
+# parent $tab0 10
+
+# ===========================================================================
+# WHEN AN OFFSET IS WRONG: dump the object and scan for the value you expect.
+# `scan` is byte-granular, so it finds fields that are not 8-aligned -- which
+# is the case a slot-aligned look would miss.
+# ===========================================================================
+# dump $verlabel 0x200
+# scan $verlabel 0x400 f32 90.0
+
+# ===========================================================================
+# CALLING GAME CODE. Needs `allow write` in the batch AND liveInspectorWrite
+# in aowlspt-host.json, because a call is not read-only.
+#   s_p  = String return, one pointer argument
+#   p_p  = pointer return, one pointer argument
+# ===========================================================================
+# targets get_name
+# allow write
+# call name:Object::get_name s_p $verlabel
+# call name:Component::get_gameObject p_p $verlabel
+# call name:GameObject::get_activeSelf b_p $_

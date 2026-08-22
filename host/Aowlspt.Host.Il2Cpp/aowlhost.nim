@@ -1195,6 +1195,17 @@ var gDebugEsp = false
 var gModeTextSlot = -1
 var gModeTextOn = false
 
+## THE LIVE INSPECTOR'S slot -- the THIRD rider on `EFT.UI.PreloaderUI::Update`,
+## declared here for the same reason `gModeTextSlot` is: `attachDrain` and
+## `patchFired` both need to name it and both are above the include point.
+##
+## It rides whichever of the two features above claimed the function, and
+## claims it itself only when neither did. It NEVER re-verifies that function's
+## prologue: by the time it arms, the other riders may have written a JUMP
+## there, and a prologue check against a TRAMPOLINE fails -- which is the exact
+## live trap currently self-rejecting `uxMenuModeText`. See `bindInspect`.
+var gInspSlot = -1
+
 ## Whether the fragile static-RVA drain path may be used at all. OFF by default:
 ## it bound a real-but-wrong function on the live client and crashed the game, so
 ## the by-name runtime path is the only one used unless `aowlspt-host.json` sets
@@ -2781,11 +2792,19 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
   # gModeTextSlot` and both handlers run from this one firing. A slot global
   # that is still -1 can never match a claimed slot, so a feature that is off
   # costs one integer compare. Neither handler ever suppresses the original.
-  if i == gDebugUiSlot or i == gModeTextSlot:
+  #
+  # THE LIVE INSPECTOR is the THIRD rider on that same function. It is listed
+  # in the same `or` chain and dispatched by the same "every rider whose slot
+  # matches" rule, so `debugUi`, `uxMenuModeText` and `liveInspector` can all
+  # be on at once over ONE detour and ONE trampoline. Its per-frame cost when
+  # no command is queued is a single interlocked load (`aowl_insp_have`).
+  if i == gDebugUiSlot or i == gModeTextSlot or i == gInspSlot:
     if i == gDebugUiSlot:
       debugUiFired(regs)
     if i == gModeTextSlot:
       modeTextUpdateFired(regs)
+    if i == gInspSlot:
+      inspectFired(regs)
     return 0'i32
   # The overlay's GameWorld cache: one register read, nothing walked, never a
   # suppression of RegisterPlayer.
@@ -3201,6 +3220,7 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
               elif kind == 11: "debug-overlay-world"
               elif kind == 12: "botai"
               elif kind == 13: "menu-mode-text"
+              elif kind == 14: "live-inspector"
               else: "main-thread")
   tablesLock()
   let claimed = cHookClaim()
@@ -3268,6 +3288,8 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
     gBotAiSlot = int(claimed)
   elif kind == 13:
     gModeTextSlot = int(claimed)
+  elif kind == 14:
+    gInspSlot = int(claimed)
   else:
     gDrainSlot = int(claimed)
   tablesUnlock()
@@ -3275,7 +3297,7 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
     gRenderMethod = spec
   elif kind == 2 or kind == 3 or kind == 4 or kind == 5 or kind == 6 or
        kind == 7 or kind == 8 or kind == 9 or kind == 10 or
-       kind == 11 or kind == 12 or kind == 13:
+       kind == 11 or kind == 12 or kind == 13 or kind == 14:
     discard
   else:
     gDrainMethod = spec
@@ -3284,7 +3306,8 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
         $int(cHookStolen(hook)) & " bytes)" &
         (if perFrame or kind == 2 or kind == 3 or kind == 4 or kind == 5 or
             kind == 6 or kind == 7 or kind == 8 or kind == 9 or
-            kind == 10 or kind == 11 or kind == 12 or kind == 13: "" else:
+            kind == 10 or kind == 11 or kind == 12 or kind == 13 or
+            kind == 14: "" else:
            "; it runs more than once a frame, so its firing count is not a " &
            "frame count")
   return true
@@ -4002,6 +4025,20 @@ include "settingspages.nim"
 ## (dispatched by slot identity in `patchReturned`), `modeTextSetWanted` and
 ## `bindModeText`.
 include "modetext.nim"
+
+## THE LIVE INSPECTOR / REPL. `include`d LAST of all, because it stands on every
+## file above it at once: `settingsui.nim`'s `suiReadString` and tab registry,
+## `invoke2.nim`'s byte-verified managed-call targets, `debugui.nim`'s `duOk`,
+## clone anchors and GameWorld cache, and `modetext.nim`'s slot -- which it may
+## have to ride on. Defines `inspectFired` (dispatched by slot identity in
+## `patchFired`, alongside the overlay and the mode-text rider), `inspectPoll`
+## (the host tick thread's file channel) and `bindInspect`.
+##
+## It is the INSTRUMENT rather than a feature: a command channel that answers a
+## question about the live object graph in seconds, with no rebuild and no
+## restart. See the header of `inspect.nim` for why that is the highest-leverage
+## thing available on the client side.
+include "inspect.nim"
 
 proc hostEventSubscribe(ctx: Il2CppPtr; name: Il2CppPtr; nameLen: int32;
                         cb: Il2CppPtr; user: Il2CppPtr): int32 {.
@@ -5054,6 +5091,28 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "PreloaderUI.Update detour with debugUi/debugEsp -- one detour, one " &
          "trampoline, both features dispatched from the same firing -- so all " &
          "three flags can be on at once."
+  # THE LIVE INSPECTOR / REPL (opt-in, default OFF). Not a feature -- the
+  # INSTRUMENT. It rides the same `PreloaderUI::Update` detour the two flags
+  # above share, so it costs no detour of its own, and its per-frame cost with
+  # nothing queued is one interlocked load.
+  gInspOn = readBoolKey("liveInspector")
+  gInspWriteOn = readBoolKey("liveInspectorWrite")
+  inspectInit(gDir)
+  if gInspOn:
+    info "liveInspector is set: drop commands into aowlspt-inspect.txt beside " &
+         "this DLL and every save with changed content runs them ON UNITY'S " &
+         "MAIN THREAD, with answers in aowlspt-inspect-out.txt and in this log " &
+         "-- no rebuild, no restart. Start with `help` and `anchors`. Every " &
+         "hop is VirtualQuery-guarded, every command runs under its own VEH " &
+         "guard, and a caught fault reports THE LAST HOP ATTEMPTED and its " &
+         "pointer. Reads only unless liveInspectorWrite is also set." &
+         (if gInspWriteOn:
+            " liveInspectorWrite IS set: a batch containing `allow write` may " &
+            "store into live managed objects and CALL game code."
+          else: "")
+  elif gInspWriteOn:
+    info "liveInspectorWrite is set but liveInspector is not, so the inspector " &
+         "is off entirely; set liveInspector to arm it"
   gVersionBrand = readBoolKey("uxVersionBrand")
   gVersionWrite = readBoolKey("uxVersionBrandWrite")
   if gVersionWrite:
@@ -5244,6 +5303,16 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
                "backend.json, so this host cannot ask the backend what the " &
                "label should read and the corner will keep the game's stock " &
                "text. Set backendPort to the backend's port to use this."
+
+      # THE LIVE INSPECTOR (opt-in). Bound LAST of the three riders on
+      # `EFT.UI.PreloaderUI::Update`, which is exactly where it wants to be:
+      # by now either of the other two has claimed the slot and this aliases
+      # onto it without re-verifying a function that may already carry their
+      # JUMP. Only when neither armed does it verify and attach its own.
+      if gInspOn and not bindInspect(true):
+        info "the live inspector did not arm (PreloaderUI.Update is neither " &
+             "claimed by another feature nor verifiable on this build, or the " &
+             "drain is disabled); the command file will not be read"
 
   let modsDir = joinPath(gDir, "mods")
   # The runtime may not have come up, and that deliberately does not stop this:
@@ -5497,6 +5566,12 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       warn gDrainMethod & " also runs on other threads; only thread " &
            $int(cMqThread()) & " drains the queue"
 
+    # THE LIVE INSPECTOR'S file channel. On this thread and not Unity's: it
+    # opens and writes files, which is not something to do on a frame. All it
+    # does here is hand a batch over and publish the answer the previous batch
+    # produced; the batch itself runs on Unity's main thread. Costs one shared
+    # file open every 250 ms while armed, and nothing at all when it is not.
+    inspectPoll(now)
     runPending()
     takeModSet()
     # Live mod control, off the emitting stack -- the only place in this host a
