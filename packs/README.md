@@ -2,10 +2,28 @@
 
 Distributable resource packs for the aowlspt resource-pack system.
 
-> **SCHEMA: `aowlspt.resourcepack` v1** — both packs are reconciled to the final
-> schema owned by branch `feat-resource-packs`
-> (`mods/resourcepacks/RESOURCE_PACKS.md`); see
+> **SCHEMA: `aowlspt.resourcepack` v1** — both packs are reconciled to the
+> schema in [`mods/resourcepacks/RESOURCE_PACKS.md`](../mods/resourcepacks/RESOURCE_PACKS.md),
+> which is now the loader's own documentation on `main`; see
 > [`RESOURCE_PACK_SCHEMA.md`](RESOURCE_PACK_SCHEMA.md) for a local quick-reference.
+
+**This directory is a staging area, not an install location.** Nothing here is
+loaded from where it sits. A pack becomes live only when its folder — the one
+holding `manifest.json` — is placed in
+`<install>/mods/resourcepacks/packs/` and enabled; see
+[§9 "Installing it, and the user workflow"](../mods/resourcepacks/RESOURCE_PACKS.md)
+for the enable/order steps and the one `aowl.textures` config key
+(`manifestPath`) that connects the stack to the swap hook.
+
+Both packs below ship **no images**. Run the pack's own assemble/generate step
+first; until you do, its `assets/` directory is empty and the loader will report
+every entry as a missing file and skip it.
+
+Checked on 2026-08-21: all **512** files named in `ambientcg-overhaul/manifest.json`
+resolve against the local `TarkovTextures` tree, so `assemble.ps1` has everything
+it needs here — it just has not been run (it writes ~2.2 GB, and `assets/` is
+gitignored by design). `vanilla-4k` has no manifest at all until `generate.ps1`
+produces one from your own install.
 
 | Pack | Kind | Assets | License | Distribution model |
 |------|------|--------|---------|--------------------|

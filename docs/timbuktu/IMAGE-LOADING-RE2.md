@@ -306,6 +306,35 @@ no source    : 3
 files including 11 of 12 trader avatars. It touches nothing but the client's own
 scratch directory and is undone by deleting that directory.
 
+#### 4.1.1 The last three, and how a fourth would announce itself
+
+The three "no source" lines above are the whole remaining hole, and one of them
+was visible in-game: **Ref**'s avatar
+(`/files/trader/avatar/5824657996560e1be8000848.png`) drew as a permanent
+spinner on the Traders screen, because SPT 3.x never shipped that trader's
+portrait and so `--src` has nothing to copy. The real BSG asset is not
+obtainable — `prod.escapefromtarkov.com` answers 403 without a session, and no
+mirror in reach carries it at the avatar's 128x128.
+
+Two changes close it, in `feat-refavatar-packs`:
+
+* **`imagecache.py --fill-missing`** writes a correctly-sized image for every
+  URL with no source rather than leaving nothing. Trader avatars borrow the
+  install's own `trader/avatar/unknown.png` — 128x128, BSG-shaped, and already
+  the game's own "no portrait" art, so Ref reads as deliberate; the other two
+  get a 128x128 plate synthesised in-process from `zlib` alone (dark gradient,
+  head-and-shoulders silhouette, thin border). Nothing BSG-owned is
+  redistributed by the repo: the fill is either generated at run time or copied
+  out of the user's own install. It still refuses to overwrite, so a genuine
+  download always wins later.
+
+* **`onFiles` now logs each distinct path it answers with the placeholder.** A
+  request only reaches the server when the client's disk cache missed, so every
+  such path is exactly a missing asset. The old failure mode was that this was
+  *silent*: the screen looked wrong and gave nobody a string to search for. Now
+  `aowlspt-backend.log` names it. Capped at 128 distinct paths, because the path
+  comes off the wire.
+
 Why this and not a server change: it removes the transport from the problem
 entirely. No TLS, no port, no certificate, no route. It is also strictly faster
 than the network path the real client uses.
@@ -353,9 +382,13 @@ Two things must both change, and neither is a one-liner:
 
 ## 5. Build status
 
-No compiled code changed. `tools/imagecache.py` is a standalone stdlib-only
-Python tool; nothing in `host/`, `backend/`, `abi/` or `mods/` was touched, so
-there is nothing to rebuild. Branch `feat-image-fix2` is cut from
+No compiled code changed *for §4.1 as originally shipped*. `tools/imagecache.py`
+is a standalone stdlib-only Python tool; nothing in `host/`, `backend/`, `abi/`
+or `mods/` was touched, so there was nothing to rebuild.
+
+§4.1.1 adds one compiled change: the placeholder logging in `onFiles`
+(`mods/tarkov/tarkov.nim`), which needs `aowl build-mod mods/tarkov`. Still
+nothing in `host/`, `backend/` or `abi/`. Branch `feat-image-fix2` is cut from
 `feat-image-cdn-redirect` (which carries the `/files/` route and the raw-bytes
 response path, and which the coordinator has already deployed).
 

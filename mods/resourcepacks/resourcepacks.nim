@@ -362,6 +362,37 @@ proc simSelfTest(): Status =
     check("the resolver reports grade contributions from the enabled stack",
           r.contributingGradePacks >= 1, "no grade pack contributed")
 
+  # The seam itself. Everything above proves the resolver; this proves the
+  # HANDOFF -- that the file aowl.textures is pointed at (`manifestPath` in its
+  # config.json) actually appears on disk, holds this stack's entries, and
+  # carries the absolute `file` paths that mod's loader needs with packRoot="".
+  # That handoff was the whole missing link: the pack system resolved correctly
+  # and wrote to a path nothing read.
+  let handoff = textureOutPath()
+  let wrote = writeTextFile(handoff, tj)
+  check("the resolved manifest is written where aowl.textures reads it", wrote,
+        "could not write " & handoff)
+  if wrote:
+    var back = ""
+    let readOk = readWholeFile(handoff, back)
+    let doc = json.whole(back)
+    check("the written manifest reads back as the same entry count",
+          readOk and isObject(doc) and isArray(child(doc, "entries")),
+          "re-read of " & handoff & " did not parse")
+    var absolute = true
+    for e in each(child(doc, "entries")):
+      let f = asText(child(e, "file"), "")
+      # An absolute Windows path (`X:/...`) or a POSIX one; a relative path here
+      # would silently resolve against the texture mod's packRoot instead.
+      if f.len < 2 or not (f[0] == '/' or (f.len > 2 and f[1] == ':')):
+        absolute = false
+        break
+    check("every entry's file path is absolute (packRoot must be \"\")",
+          absolute, "a relative path in " & handoff)
+    info "resourcepacks  handoff written: " & handoff & " (" &
+      $resolvedTexCount(r) & " entry(ies)); set aowl.textures manifestPath to " &
+      "this path and packRoot to \"\""
+
   if gFailures == 0:
     success "selftest  all checks passed (" & $packCount() & " pack(s) scanned)"
     return Ok

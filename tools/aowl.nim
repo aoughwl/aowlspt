@@ -2254,6 +2254,23 @@ proc cmdPayload(e: Env): int =
         if copyFileAt(joinPath(dataDir, f), to2).ok:
           inc copied
 
+    # And a mod's `packs/`, for the same reason and one more. `data/` is the
+    # mod's own content; `packs/` is the directory a *user* drops third-party
+    # content into, and it has to exist in the install before they can. Shipping
+    # it also carries the example packs, which are what a first pack is copied
+    # from. aowl.resourcepacks is the only mod with one today; the rule is by
+    # directory name so the next one needs no change here.
+    let packsSrc = joinPath(m, "packs")
+    if isDirectory(packsSrc):
+      var packFiles: seq[string] = @[]
+      var packDirs: seq[string] = @[]
+      collectEntries(packsSrc, packFiles, packDirs)
+      for f in packFiles:
+        let to3 = joinPath(joinPath(joinPath(joinPath(dest, "mods"),
+                                             baseName(m)), "packs"), f)
+        if copyFileAt(joinPath(packsSrc, f), to3).ok:
+          inc copied
+
     let cfg = joinPath(m, "config.json")
     if fileExists(cfg):
       discard copyFileAt(cfg,

@@ -4,8 +4,8 @@
     "id": "aowl.registry.official",
     "name": "aowlspt official registry",
     "description": "Every mod built in this repository, plus the lists that name them. One file with one git history, so a mod list is a document you can send someone.",
-    "revision": 2,
-    "updated": "2026-08-18"
+    "revision": 3,
+    "updated": "2026-08-21"
   },
 
   "mods": [
@@ -220,7 +220,7 @@
     },
     {
       "id": "aowl.textures",
-      "name": "Textures",
+      "name": "aowl.textures",
       "author": "savannt",
       "version": "1.0.0",
       "description": "High-res PBR texture replacement — the IL2CPP port of TarkovTextures. An offline pipeline curates ambientcg PBR sets into a VRAM-tiered name->replacement manifest; the client mod name-matches intercepted AssetBundle texture loads against it through the host's postfix detour. Name-matching runs live; the pixel-upload path waits on a byte[]/ImageConversion.LoadImage capability, and until then the mod NO-OPs to stock textures.",
@@ -234,8 +234,27 @@
       "requires": [],
       "conflicts": [],
       "provides": [],
-      "loadAfter": [],
+      "loadAfter": ["aowl.resourcepacks"],
       "tags": ["client", "graphics", "textures"]
+    },
+    {
+      "id": "aowl.resourcepacks",
+      "name": "aowl.resourcepacks",
+      "author": "savannt",
+      "version": "1.0.0",
+      "description": "A Minecraft-style resource-pack loader: drop a pack folder into mods/resourcepacks/packs, enable it, and order the enabled ones so later packs override earlier ones. It renders nothing itself — it flattens the enabled stack into aowl.textures' own manifest format (so that mod's byte-verified LoadAsset swap does the work, unchanged) and optionally merges the stack's colour-grade keys through the existing gfx_apply host call. Default-off: with swapMode 'off' it writes an empty manifest and nothing is ever swapped. It does not require aowl.textures — a grade-only pack needs only the graphics mod — but a texture pack does nothing without it, and aowl.textures carries loadAfter aowl.resourcepacks so the flattened manifest exists before it looks.",
+      "pipeline": ">=0.1.0",
+      "sides": ["client", "sim"],
+      "source": { "kind": "intree", "path": "mods/resourcepacks", "url": null },
+      "artifact": { "dir": "resourcepacks", "library": "resourcepacks.dll" },
+      "upstream": null,
+      "license": "see repository",
+      "download": null,
+      "requires": [],
+      "conflicts": [],
+      "provides": ["aowl.capability.resourcepacks"],
+      "loadAfter": [],
+      "tags": ["client", "graphics", "textures", "packs"]
     }
   ],
 
@@ -264,6 +283,7 @@
         { "id": "com.savannt.sptsway", "enabled": true },
         { "id": "aowl.classicmovement", "enabled": true },
         { "id": "aowl.perf", "enabled": true, "note": "loaded, but every knob it has is off until you turn one on; it reports frame pacing before it changes anything" },
+        { "id": "aowl.resourcepacks", "enabled": true, "note": "loads before aowl.textures and hands it the flattened pack stack; with no pack enabled it writes an empty manifest and changes nothing" },
         { "id": "aowl.textures", "enabled": true, "note": "curated 2K PBR replacements, bounded by a VRAM budget; NO-OPs to stock textures until the upload capability lands" }
       ]
     },

@@ -33,5 +33,8 @@
   "catGround": false,
 
   "_packRootComment": "Absolute path to where the replacement images live. The committed manifest stores paths relative to the TarkovTextures root (e.g. ambientcg/Metal/.../Foo_2K-JPG_Color.jpg), so packRoot must point at that root — or at a self-contained pack assembled by build_pack.py --copy, whose manifest is pack-relative. Empty falls back to the mod's own data/pack. For deployment see README.md: run build_pack.py --copy <install>/mods/textures/data/pack and set packRoot to that (or leave empty to use the data/pack fallback).",
-  "packRoot": "C:/Users/savant/Projects/TarkovTextures"
+  "packRoot": "C:/Users/savant/Projects/TarkovTextures",
+
+  "_manifestPathComment": "Which manifest to load. Empty (the default) uses this mod's own committed data/manifest.json. Set it to aowl.resourcepacks' resolved.manifest.json (in a deployed install, <install>/mods/resourcepacks/resolved.manifest.json) to let the resource-pack stack drive the swaps instead — that file's entries carry ABSOLUTE image paths, so packRoot must then be \"\". Nothing else changes: the same byte-verified LoadAsset hook, the same VRAM budget, the same swapMode ladder.",
+  "manifestPath": ""
 }
