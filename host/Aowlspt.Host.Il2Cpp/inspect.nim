@@ -2432,6 +2432,115 @@ proc iCmdSetText(toks: seq[string]) =
     iOut("  !! the text changed but is not what was asked for -- the game " &
          "rewrote it between the store and this read.")
 
+proc iCmdPress(toks: seq[string]) =
+  ## `press EXPR [OFFSET]` -- fire an EFT button's OnClick, which is the only
+  ## way to press anything in this game's menus.
+  ##
+  ## WHY THIS EXISTS, and it is not a convenience wrapper.
+  ##
+  ## `click`/`invoke` speak `UnityEngine.UI.Button`: interactable at +0xD8,
+  ## m_OnClick at +0x100. EFT's menus contain no such thing. Every button is an
+  ## `EFT.UI.DefaultUIButton`, whose chain is UIElement -> InteractableElement
+  ## -> ButtonFeedback -> DefaultUIButton and touches Button nowhere. Measured,
+  ## not assumed: GetComponent("Button") and GetComponent("Selectable") both
+  ## return NULL on one while GetComponent("MonoBehaviour") returns it, and
+  ## that same probe shows Unity's string overload DOES match base names.
+  ##
+  ## On that layout +0x100 is `_iconContainer`, a GAMEOBJECT -- which is
+  ## exactly what `invoke` read as m_OnClick, and calling UnityEvent::Invoke on
+  ## a GameObject is what made a batch escape its guard. The real event is
+  ## `OnClick`, a UnityEvent, at +0x120, from the field table:
+  ##
+  ##   0xa0 _onPointerClickSound bool   0xb8 _text string   0x100 _iconContainer
+  ##   0x108 _button TweenAnimatedButton   0x120 OnClick UnityEvent
+  ##
+  ## The other near miss is worth naming too, because it produced a convincing
+  ## symptom: calling `ButtonFeedback::OnPointerClick` PLAYS THE CLICK SOUND
+  ## and does nothing else -- audible feedback that feels like a successful
+  ## press while the button has not been pressed. ButtonFeedback is the sound
+  ## layer, precisely as its name says.
+  ##
+  ## The offset is overridable because DefaultUIButton is the common case, not
+  ## the only one; a control with its event elsewhere takes `press $c 0x128`.
+  if toks.len < 2:
+    iErr("usage: press EXPR [OFFSET]   -- EXPR is an EFT button component " &
+         "(component $gN DefaultUIButton); OFFSET defaults to 0x120, " &
+         "DefaultUIButton.OnClick")
+    return
+  if not iNavGate("press"):
+    return
+  var v = 0'u64
+  var err = ""
+  if not iEval(toks[1], v, err):
+    iErr(err)
+    return
+  if v == 0'u64:
+    iErr("press was given a NULL pointer" &
+         (if toks[1].len > 1 and toks[1][0] == '$':
+            " -- the anchor " & toks[1] & " is NOT BOUND"
+          else: "") & ". Nothing was called.")
+    return
+  let p = cast[Il2CppPtr](v)
+  if iRefuseIfGameObject(p, "press"):
+    return
+  if iIsTransform(p):
+    iErr("that is a TRANSFORM, not a button COMPONENT. `children`, `find` and " &
+         "`tree` all return Transforms. Resolve the component first:  " &
+         "component " & toks[1] & " DefaultUIButton")
+    return
+  var off = 0x120'i32
+  if toks.len > 2:
+    var o = 0'u64
+    var e = ""
+    if iEval(toks[2], o, e) and int(o) > 0 and int(o) < 0x400:
+      off = int32(o)
+    else:
+      iErr("that offset is not a small positive number; refusing to read a " &
+           "wild slot. Nothing was called.")
+      return
+  if not duOk(p, off + 8'i32) or not iUnityAlive(p):
+    iErr("not readable to +0x" & iHexPad(uint64(off), 3) &
+         ", or its native half is null. Nothing was called.")
+    return
+  # Name the button before pressing it. `_text` at +0xB8 is what the label
+  # reads, so the output says WHICH button was pressed rather than only that
+  # something was -- the difference between evidence and a claim.
+  var what = ""
+  if duOk(p, 0xC0'i32):
+    let tp = cReadPtrAt(p, 0xB8'i32)
+    if tp != nil and not iIsKnownKlass(cast[uint64](tp)):
+      what = suiReadString(tp)
+  let ev = cReadPtrAt(p, off)
+  iOut("  target klass = " & iPtrU(iKlassOf(p)) &
+       (if what.len > 0: "   _text(+0xB8) = \"" & what & "\"" else: "") &
+       "   OnClick(+0x" & iHexPad(uint64(off), 3) & ") = " & iPtr(ev))
+  if ev == nil:
+    iErr("that slot is NULL -- no handler is wired to this button, so " &
+         "pressing it could not do anything. Nothing was called.")
+    return
+  if iIsGameObject(ev):
+    iErr("that slot holds a GAMEOBJECT, not a UnityEvent -- on " &
+         "DefaultUIButton +0x100 is `_iconContainer` and this is what that " &
+         "mistake looks like. Did you mean the default +0x120? Nothing was " &
+         "called.")
+    return
+  if iIsKnownKlass(cast[uint64](ev)):
+    iErr("that slot holds a KLASS POINTER already seen as another object's " &
+         "type, so it cannot be a per-instance UnityEvent. Nothing was called.")
+    return
+  var fn: Il2CppPtr = nil
+  var rva = 0'u32
+  if not iNavFind("UnityEvent::Invoke", fn, rva):
+    return
+  iOut("  via UnityEngine.Events.UnityEvent::Invoke @0x" &
+       iHexPad(uint64(rva), 6) & " (call) on " & iPtr(ev))
+  iMark("press: UnityEvent::Invoke", ev)
+  discard cInspUP(fn, ev, nil)
+  iOut("  returned without faulting.")
+  iOut("  NOTE: that the handler returned is NOT proof the intended thing " &
+       "happened -- a click handler acts on OTHER objects. Confirm the " &
+       "EFFECT with `state`, `roots`, or `until`, never with this line.")
+
 proc iCmdClick(toks: seq[string]; useInvoke: bool) =
   ## `click PTR` -- EFT's own path: `Button::Press`, which re-checks IsActive
   ## and IsInteractable and then fires m_OnClick exactly as a real click does.
@@ -3022,6 +3131,7 @@ proc iCmdHelp() =
   iOut("    label EXPR                    TMP_Text.m_text as a field read")
   iOut("    settext EXPR TEXT...          WRITE a label, via the real setters")
   iOut("                                  e.g.  find PvE")
+  iOut("    press EXPR [OFF]              EFT DefaultUIButton.OnClick (+0x120)")
   iOut("    click EXPR                    Button::Press (checks interactable)")
   iOut("                                  e.g.  allow write | click $f1")
   iOut("    invoke EXPR                   fire m_OnClick directly, no checks")
@@ -3182,6 +3292,8 @@ proc iExec(line: string) =
     iCmdLabel(toks)
   of "settext":
     iCmdSetText(toks)
+  of "press":
+    iCmdPress(toks)
   of "click":
     iCmdClick(toks, false)
   of "invoke":

@@ -54,6 +54,35 @@ def diagnose():
            "\n   ".join(hits[-3:])
 
 
+class Timeout(Exception):
+    """The host did not answer THIS batch. Distinct from an empty answer."""
+
+
+def run_batch(lines, timeout=25.0, write=False):
+    """Send one batch and return its answer text.
+
+    Exposed as a function, not just a CLI, because a script that DRIVES the
+    menu is a sequence of batches whose later commands depend on pointers
+    parsed out of earlier answers -- the per-batch anchors ($f1, $comp) do not
+    survive across batches, so the pointers have to come back out to the caller.
+    """
+    if write:
+        lines = ["allow write"] + list(lines)
+    serial = int(time.time() * 1000) % 1000000
+    sentinel = "aowl-batch-%d" % serial
+    body = "#%d\n" % serial + "\n".join(lines) + "\necho %s\n" % sentinel
+    with open(CMD, "wb") as f:
+        f.write(body.encode("utf-8"))
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        out = read(OUT)
+        if sentinel in out:
+            return "\n".join(l for l in out.splitlines() if sentinel not in l)
+        time.sleep(0.15)
+    raise Timeout("no answer for batch %d within %gs. %s"
+                  % (serial, timeout, diagnose()))
+
+
 def main():
     ap = argparse.ArgumentParser(add_help=True)
     ap.add_argument("cmds", nargs="*", help="one inspector command per argument")
