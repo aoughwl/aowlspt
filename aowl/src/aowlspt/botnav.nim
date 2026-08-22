@@ -90,11 +90,22 @@
 ##   available that it is. A freshly spawned bot is therefore briefly
 ##   uncommandable, and that is deliberate.
 ##
-## * **Positions are one poll stale.** `bots()` returns the census as of the
-##   host's last report, rebuilt on the host at most every 4 seconds and carried
-##   on a poll that runs every `modSyncMs` (default 3 s). This is a control
-##   channel, not a telemetry stream; do not build anything that needs a bot's
-##   position this frame.
+## * **The census is PARTIAL and it ROTATES.** This is the constraint most likely
+##   to surprise you. The host's whole report path is capped at 191 characters —
+##   the overlay's sync worker copies it into a 192-byte field and truncates
+##   silently past that — which is nowhere near a full registry. So each census
+##   carries roughly the first five bots that fit, starting where the last one
+##   stopped, and works through the rest on later polls. Every bot is reported
+##   within a few polls and none can be starved, but **a bot missing from one
+##   census is not a bot that has left the raid**. Accumulate across censuses,
+##   keyed on `id`, and age entries out rather than treating each payload as the
+##   complete picture.
+##
+## * **Positions are stale and rounded.** They are as of the host's last report,
+##   rebuilt at most every 4 seconds, carried on a poll that runs every
+##   `modSyncMs` (default 3 s), and rounded to whole metres to fit the budget
+##   above. This is a control channel, not a telemetry stream; do not build
+##   anything that needs a bot's position this frame or to sub-metre precision.
 ##
 ## * **Last writer wins.** There is one command set. Two mods both steering the
 ##   same bot is two mods fighting, and the manager holds whichever spoke last

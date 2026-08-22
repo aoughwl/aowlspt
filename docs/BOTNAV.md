@@ -296,7 +296,20 @@ The command set is a flat scalar, not a JSON array, deliberately: it rides
 exactly one place (`parseBotNav`) before the grammar ever sees it, which is then
 gated again per field before anything reaches a game pointer.
 
-Census record, `!`-separated: `id,role,difficulty,alive,x,y,z,lastNavStatus`.
+Census record, `!`-separated: `id,role,difficulty,alive,x,y,z,lastNavStatus`,
+coordinates in whole metres.
+
+**The census is partial and rotates**, and this is a real constraint rather than
+a shortcut. `ReportMaxPath` is **191 characters for the whole path** — the
+overlay's sync worker copies it into a 192-byte field and truncates silently past
+that — which cannot hold a full registry. Each census therefore carries the bots
+that fit (about five), starting where the last one stopped, and cycles through
+the rest on later polls. Rotation rather than priority, exactly as the mod-outcome
+rows do it, so no bot is starved and nothing has to be acknowledged: each record
+is a state and repeating it is free. Consumers must accumulate across censuses
+keyed on `id` — a bot absent from one payload has not left the raid. If the mod
+rows have already eaten the budget the census is dropped whole for that poll
+rather than truncated.
 
 ## Safety, concretely
 

@@ -1095,6 +1095,10 @@ var gBotNav = false
 var gBotNavFires = 0
 var gBotNavFaults = 0
 var gBotNavOff = false
+var gReportBotNav = ""
+  ## The census as last put on the report path. Compared rather than assumed
+  ## because the path is only rebuilt when something changed, and a census that
+  ## has not changed is not news.
 ## Phase 1 native-settings probe (kind=4 detour on `SettingsScreen::Show`): its
 ## slot, opt-in flag (`settingsUiProbe`), and once-per-open guard. Declared here
 ## beside the other detour slots; the walk itself lives in `settingsui.nim`
@@ -4750,9 +4754,27 @@ proc publishReport(now: uint64) =
   ## reads.
   if gSyncBase.len == 0:
     return
+  # The bot registry is the THIRD reason to rebuild, and it needs to be checked
+  # here rather than anywhere else: the two reasons above are both about the mod
+  # rows, so a raid full of moving bots on a stage whose mods have long since
+  # settled would rebuild the path exactly once and then freeze -- the census
+  # would go out one time and never update again, which looks precisely like a
+  # feature that does not work.
+  #
+  # Rate-limited by the same `gReportNextMs` as the rotation, because the worker
+  # reads the path once per poll and rewriting it faster changes nothing anyone
+  # reads. Publishing here also means the census the path carries is the one the
+  # Unity thread had built as of this moment.
+  var census = ""
+  if gBotNav and not gBotNavOff:
+    census = botNavCensus()
+  let censusNew = census != gReportBotNav and now >= gReportNextMs
+  if censusNew:
+    gReportBotNav = census
+    modcontrol.reportBotNav(census)
   let fresh = modcontrol.reportSeq() != gReportSeq
   let rotate = modcontrol.reportPending() and now >= gReportNextMs
-  if not fresh and not rotate:
+  if not fresh and not rotate and not censusNew:
     return
   gReportSeq = modcontrol.reportSeq()
   gReportNextMs = now + uint64(gSyncMs)
@@ -4833,11 +4855,9 @@ proc takeModSet() =
   # This runs on the POLL thread. It only publishes; every game-side effect
   # happens later on the Unity thread inside the guarded per-bot tick.
   if gBotNav and not gBotNavOff:
-    # Publish the registry the Unity thread built, so it rides the NEXT poll's
-    # path back to the backend. Done here, on the poll thread, from a string the
-    # Unity thread only ever replaces wholesale -- the game side never touches
-    # the report machinery.
-    modcontrol.reportBotNav(botNavCensus())
+    # The registry going the other way is published in `publishReport`, which is
+    # where every decision about the report path is made; nothing about it
+    # belongs here.
     var navSpec = ""
     if modcontrol.parseBotNav(doc, navSpec):
       if navSpec.len == 0:

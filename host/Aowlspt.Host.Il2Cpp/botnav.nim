@@ -120,6 +120,15 @@ const
     ## again -- only rows refreshed by a live UpdateManual fire are commandable.
   BnCensusMs = 4000'i64
     ## Census rebuild cadence for the report/log. Off the per-frame path.
+  BnCensusBudget = 110
+    ## Characters of census one poll may carry. `ReportMaxPath` is 191 for the
+    ## WHOLE path -- route, mod-outcome rows and this -- because the overlay's
+    ## sync worker copies the path into a 192-byte field and truncates silently
+    ## beyond it. A record is about 20 characters, so this is roughly five bots
+    ## per poll, and the census rotates through the rest on later polls. If the
+    ## mod rows have already eaten the budget the census is dropped whole for
+    ## that poll rather than truncated: half a coordinate list is worse than
+    ## none, and the next poll carries the current truth anyway.
 
 type
   BnEntry = object
@@ -129,7 +138,8 @@ type
     diff: int32            ## BotSettings._difficulty (+0x10)
     dead: bool
     x, y, z: float64       ## MovementContext.PreviousPosition
-    moved: bool            ## position has changed at least once
+    posKnown: bool         ## x/y/z hold a real reading, not the initial zeroes
+    moved: bool            ## position has CHANGED at least once since then
     lastSeen: int64
     used: bool
     # --- active command ---
@@ -171,6 +181,9 @@ var gBnApplied = -1
 var gBnCmdLock = false
 var gBnCensusAt = 0'i64
 var gBnCensus = ""
+var gBnCensusCursor = 0
+  ## Where the next census starts. See `bnBuildCensus` -- the path budget cannot
+  ## carry the whole registry, so it rotates.
 var gBnIssued = 0
 var gBnCapWarned = false
 var gBnCallsChecked = false
@@ -314,7 +327,7 @@ proc bnParseCommands*(spec: string): seq[BnCmd] =
   ## Anything malformed is DROPPED -- that command only, not the whole set.
   result = @[]
   for raw in bnSplit(spec, ';'):
-    var part = strip(raw)
+    let part = strip(raw)
     if part.len == 0:
       continue
     if result.len >= BnMaxCmds:
@@ -322,9 +335,9 @@ proc bnParseCommands*(spec: string): seq[BnCmd] =
     let f = bnSplit(part, '|')
     if f.len < 2:
       continue
-    var c = BnCmd(id: -1, stop: false, speedOnly: false, x: 0.0, y: 0.0, z: 0.0,
-                  reach: 1.0, speed: 1.0, sprint: false,
-                  holdMs: BnDefaultHoldMs)
+    var c = BnCmd(id: -1'i32, stop: false, speedOnly: false,
+                  x: 0.0, y: 0.0, z: 0.0, reach: 1.0, speed: 1.0,
+                  sprint: false, holdMs: BnDefaultHoldMs)
     let who = strip(f[0])
     if who != "all":
       if not bnParseInt(who, c.id):
@@ -384,11 +397,13 @@ proc bnFind(owner: uint64; now: int64): int =
       if free < 0: free = i
   if free < 0:
     return -1
-  gBnReg[free] = BnEntry(owner: owner, id: -1, role: -1, diff: -1, dead: false,
-                         x: 0.0, y: 0.0, z: 0.0, moved: false, lastSeen: now,
-                         used: true, hasCmd: false, cx: 0.0, cy: 0.0, cz: 0.0,
-                         reach: 1.0, sprint: false, cmdUntil: 0, nextIssue: 0,
-                         issues: 0, status: -1, pend: 0, pendSpeed: 1.0)
+  gBnReg[free] = BnEntry(owner: owner, id: -1'i32, role: -1'i32, diff: -1'i32,
+                         dead: false, x: 0.0, y: 0.0, z: 0.0,
+                         posKnown: false, moved: false,
+                         lastSeen: now, used: true, hasCmd: false,
+                         cx: 0.0, cy: 0.0, cz: 0.0, reach: 1.0, sprint: false,
+                         cmdUntil: 0'i64, nextIssue: 0'i64, issues: 0'i32,
+                         status: -1'i32, pend: 0'i32, pendSpeed: 1.0)
   result = free
 
 proc bnApplyGeneration(now: int64) =
@@ -406,15 +421,15 @@ proc bnApplyGeneration(now: int64) =
         continue
       if c.stop:
         gBnReg[i].hasCmd = false
-        gBnReg[i].status = -1
+        gBnReg[i].status = -1'i32
         # The stop itself is issued on this bot's next tick, where UpdateManual
         # has just handed us a pointer we know is live. Nothing is CALLED from
         # here: this runs inside whichever bot happened to tick first, and its
         # BotOwner is the only one we may touch.
-        gBnReg[i].pend = 1
+        gBnReg[i].pend = 1'i32
         continue
       if c.speedOnly:
-        gBnReg[i].pend = 2
+        gBnReg[i].pend = 2'i32
         gBnReg[i].pendSpeed = c.speed
         continue
       gBnReg[i].hasCmd = true
@@ -425,8 +440,8 @@ proc bnApplyGeneration(now: int64) =
       gBnReg[i].sprint = c.sprint
       gBnReg[i].cmdUntil = now + c.holdMs
       gBnReg[i].nextIssue = now
-      gBnReg[i].issues = 0
-      gBnReg[i].status = -1
+      gBnReg[i].issues = 0'i32
+      gBnReg[i].status = -1'i32
 
 proc bnRefresh(i: int; owner: Il2CppPtr; now: int64) =
   ## Read this bot's cheap identity + position. Every hop is guarded; a hop that
@@ -454,12 +469,19 @@ proc bnRefresh(i: int; owner: Il2CppPtr; now: int64) =
         # BotMover::GoToPoint we cannot check statically (a Dictionary lookup
         # whose miss is a managed throw). We only ever command a bot that has
         # already demonstrated it can move.
-        if not gBnReg[i].moved:
+        #
+        # `posKnown` matters: without it the FIRST reading is compared against
+        # the row's initial zeroes, which is a delta of hundreds of metres for
+        # any bot not standing on the world origin -- so every bot would be
+        # declared "moved" the instant it registered and the gate would protect
+        # nothing at all. The first reading only establishes a baseline.
+        if not gBnReg[i].posKnown:
+          gBnReg[i].posKnown = true
+        elif not gBnReg[i].moved:
           let dx = v[0] - gBnReg[i].x
           let dy = v[1] - gBnReg[i].y
           let dz = v[2] - gBnReg[i].z
-          if gBnReg[i].lastSeen != 0 and
-             (dx*dx + dy*dy + dz*dz) > 0.0025:
+          if (dx*dx + dy*dy + dz*dz) > 0.0025:
             gBnReg[i].moved = true
         gBnReg[i].x = v[0]
         gBnReg[i].y = v[1]
@@ -496,13 +518,14 @@ proc bnService(i: int; owner: Il2CppPtr; now: int64) =
   let mover = cBnReadPtr(owner, cBnOffMover(), ok)
   if ok != 0'i32 and bnSanePtr(mover):
     let sd = cBnReadF32(mover, cBnOffSDist(), ok)
-    if ok != 0'i32 and gBnReg[i].issues > 0 and sd >= 0.0 and sd < BnArriveDist:
+    if ok != 0'i32 and gBnReg[i].issues > 0'i32 and sd >= 0.0 and
+       sd < BnArriveDist:
       gBnReg[i].hasCmd = false
       okLog "botnav: bot id=" & $int(gBnReg[i].id) &
             " arrived (SDistDestination " & $sd & ")"
       return
   gBnReg[i].nextIssue = now + BnReissueMs
-  if gBnReg[i].sprint and gBnReg[i].issues == 0:
+  if gBnReg[i].sprint and gBnReg[i].issues == 0'i32:
     # `sprint` is honoured as "move at full speed", not as the game's own
     # `BotOwner::Sprint`. That method sits behind an il2cpp class-init guard and
     # feeds a debug callback, whereas SetTargetMoveSpeed is the two-instruction
@@ -513,9 +536,9 @@ proc bnService(i: int; owner: Il2CppPtr; now: int64) =
   let st = cBnGoto(owner, gBnReg[i].cx, gBnReg[i].cy, gBnReg[i].cz,
                    gBnReg[i].reach, 1'i32, 0'i32)
   gBnReg[i].status = st
-  gBnReg[i].issues = gBnReg[i].issues + 1
+  gBnReg[i].issues = gBnReg[i].issues + 1'i32
   gBnIssued = gBnIssued + 1
-  if gBnReg[i].issues == 1 or (gBnReg[i].issues mod 20) == 0:
+  if gBnReg[i].issues == 1'i32 or (gBnReg[i].issues mod 20'i32) == 0'i32:
     let what = (if st == 0: "Complete" elif st == 1: "Partial"
                 elif st == 2: "Invalid (no path to that point)"
                 elif st == -1: "target unverified on this build"
@@ -529,25 +552,64 @@ proc bnService(i: int; owner: Il2CppPtr; now: int64) =
     # not change its mind; drop the command instead of spinning on it.
     gBnReg[i].hasCmd = false
 
+proc bnMetres(v: float64): string =
+  ## A coordinate as whole metres.
+  ##
+  ## Two reasons, and both are hard constraints rather than taste. First, the
+  ## whole report path may be **191 characters** (`ReportMaxPath` -- the overlay's
+  ## sync worker copies it into a 192-byte field and silently truncates beyond
+  ## that), so every digit is paid for out of a very small budget. Second, Nim's
+  ## `$` on a float can produce `1e-05` or seventeen significant digits, and the
+  ## reader at the far end handles neither -- a coordinate that arrives as
+  ## scientific notation is a bot in the wrong place, reported confidently.
+  ##
+  ## Metre precision is not a compromise for this: it is a bot's position on a
+  ## map, read for deciding where to send it next.
+  var a = v
+  if a > 1000000.0: a = 1000000.0
+  if a < -1000000.0: a = -1000000.0
+  result = $int(a)
+
 proc bnBuildCensus(now: int64) =
   ## Rebuild the compact registry string carried back to the backend/mod. Off the
   ## per-frame path (every `BnCensusMs`), so the allocation here is fine.
   ##
   ##   id,role,diff,alive,x,y,z,cmdStatus ! id,...
+  ##
+  ## ROTATES rather than dumping. The whole report path is capped at 191
+  ## characters, which is nowhere near a full registry, so each census carries
+  ## the bots that fit starting from where the last one stopped. Rotation rather
+  ## than priority, for the same reason the mod-outcome rows rotate: every bot is
+  ## reported within a few polls and no bot can be starved by a noisier
+  ## neighbour. Nothing acknowledges anything, because each record is a STATE and
+  ## repeating it is free.
   gBnCensusAt = now
   var s = ""
-  var n = 0
-  for i in 0 ..< BnMaxBots:
+  var emitted = 0
+  var k = 0
+  while k < BnMaxBots:
+    let i = (gBnCensusCursor + k) mod BnMaxBots
+    inc k
     if not gBnReg[i].used:
       continue
     if now - gBnReg[i].lastSeen > BnStaleMs:
       continue
-    if n > 0: s.add '!'
-    s.add $int(gBnReg[i].id) & "," & $int(gBnReg[i].role) & "," &
-          $int(gBnReg[i].diff) & "," & (if gBnReg[i].dead: "0" else: "1") & "," &
-          $gBnReg[i].x & "," & $gBnReg[i].y & "," & $gBnReg[i].z & "," &
-          $int(gBnReg[i].status)
-    inc n
+    let rec = $int(gBnReg[i].id) & "," & $int(gBnReg[i].role) & "," &
+              $int(gBnReg[i].diff) & "," &
+              (if gBnReg[i].dead: "0" else: "1") & "," &
+              bnMetres(gBnReg[i].x) & "," & bnMetres(gBnReg[i].y) & "," &
+              bnMetres(gBnReg[i].z) & "," & $int(gBnReg[i].status)
+    let sep = (if emitted > 0: 1 else: 0)
+    if s.len + sep + rec.len > BnCensusBudget:
+      # Start the next census here, so this bot is the first one reported rather
+      # than the one that is always cut off.
+      gBnCensusCursor = i
+      gBnCensus = s
+      return
+    if emitted > 0: s.add '!'
+    s.add rec
+    inc emitted
+  gBnCensusCursor = 0
   gBnCensus = s
 
 proc botNavCensus*(): string = gBnCensus
