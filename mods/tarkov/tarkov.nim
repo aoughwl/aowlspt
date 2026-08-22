@@ -136,6 +136,43 @@ var gRaidClock = unknownClock()
   ## conditions across eight quests could never be credited from the victim
   ## list. One raid at a time, like `gRaidId` beside it -- this server plays
   ## one player.
+var gCreationAllowed = true
+  ## The master switch over every path that can make a character: the in-game
+  ## creator, the launcher's headless `--new`, and the "+" (empty) slot on the
+  ## character screen that leads to the first of those. One flag, read by all
+  ## three, so the emulator is the single place that decides -- a launcher that
+  ## hardcoded its own answer would be a second opinion, and the two would
+  ## disagree the first time either changed.
+var gMaxCharacters = 2
+var gPveSlot = true
+  ## Whether the `pve` character slot is offered. On by default: this server is
+  ## an offline emulator and everything it runs is PvE, so the PvE slot is the
+  ## honest second character.
+var gPvpSeasonSlot = false
+  ## Whether the `pvp-season` (seasonal PvP) slot is offered. **Off by default,
+  ## and that default is the product decision, not a placeholder.** This mod
+  ## never puts a PvP mode in front of a player: there is no other player here,
+  ## a "PvP" slot would be a lie about what a raid is, and an emulator that
+  ## advertises a mode it cannot run is the exact failure mode the rest of this
+  ## file is written against. It exists as a setting only so a deployment that
+  ## is not the SPT mod can turn it on deliberately.
+
+const ModeRegular = "regular"
+const ModePve = "pve"
+const ModePvpSeason = "pvp-season"
+
+var gSessionMode = ""
+  ## The mode the client last told this server it is on, via
+  ## `/client/game/mode`. One player, one client, one mode at a time -- the same
+  ## single-session assumption `gRaidId` above already makes.
+  ##
+  ## It exists for one reason: `/client/game/profile/create` does **not** carry
+  ## the mode. Its body is `{side, nickname, headId, voiceId, seasonalPerkIds}`
+  ## (capture raid1 seq 092) and the target slot is implicit in whichever mode
+  ## tile the player entered creation from. So the mode has to be remembered
+  ## from the last thing that did name it, and `firstFreeMode` below is the
+  ## fallback for when nothing has.
+
 var gSelfCheckFailures: seq[string] = @[]
   ## Every load-time check that did not hold, for `/aowlspt/tarkov/selfcheck`.
   ## Empty is the ordinary state and is also an answer: it is the difference
@@ -297,17 +334,24 @@ proc onGameConfig(url, body, session: string): string =
   # account is fully synced. `purchasedGames`/`availableGameModes` are small
   # fixed dicts it indexes; a missing key here reads as "not owned" at best and
   # a null-deref at worst on the mode-select screen.
-  put(o, "sessionMode", "regular")
+  put(o, "sessionMode", if gSessionMode.len > 0: gSessionMode else: ModeRegular)
   var purchased = obj()
   put(purchased, "eft", true)
   put(purchased, "arena", false)
   put(o, "purchasedGames", purchased)
   put(o, "isGameSynced", true)
   put(o, "linkedPlatforms", raw("[]"))
+  # Which mode tiles the client draws at all. Kept in step with the slots
+  # `/v2/client/game/profiles/` actually fills (`offeredModes`, further down):
+  # a mode advertised here and answered `locked` there is a tile that exists to
+  # be refused, and a mode NOT advertised here cannot be entered however good
+  # its slot is. These were three literals -- `pve:false` while the emulator
+  # runs nothing but PvE, and `pvp-season:true` on a server with no second
+  # player in it. Both were backwards.
   var modes = obj()
   put(modes, "regular", true)
-  put(modes, "pve", false)
-  put(modes, "pvp-season", true)
+  put(modes, "pve", gPveSlot)
+  put(modes, "pvp-season", gPvpSeasonSlot)
   put(o, "availableGameModes", modes)
   result = envelope(o)
 
@@ -494,31 +538,160 @@ proc characterSlot(p: Profile): JsonObject =
   put(o, "unlockedTraders", raw("[]"))
   result = o
 
-proc onProfilesV2(url, body, session: string): string =
-  ## `/v2/client/game/profiles/` -- the character-select bootstrap. Post-1.0
-  ## deserialises `data` into `Dictionary<EGameMode, CharacterSelectionProfileData>`
-  ## and drives `RunCharacterSelectionFlow` from it -- NOT the flat profile array
-  ## `/client/game/profile/list` returns (a JSON array deserialises into an empty
-  ## dictionary, which is the blank character screen). The key is the game-mode
-  ## int: "0" = Regular (the `_pvpSlotView`), "1" = Pve, "2" = PvpSeason. This
-  ## server has one regular profile, so it fills slot "0"; the other slots stay
-  ## empty (a "create a character" prompt), which is correct.
-  var modes = obj()
-  let all = allProfileIds()
-  for id in all:
+# ---------------------------------------------------------------------------
+# The roster: which character is in which character-select slot
+# ---------------------------------------------------------------------------
+#
+# The post-1.0 character screen is a **mode select**, and that is the whole
+# shape of multi-character here. `/v2/client/game/profiles/` deserialises into
+# `Dictionary<EGameMode, CharacterSelectionProfileData>`, so the key space is
+# the `EGameMode` enum and nothing else -- three values, fixed in the client's
+# metadata. One character per key is therefore the ceiling this route can
+# express, and `gMaxCharacters` is bounded by it rather than by taste.
+#
+# Two of those three keys are offered by default (`regular` and `pve`), which
+# is two characters. The third is PvP and is off; see `gPvpSeasonSlot`.
+#
+# An unbounded roster inside ONE mode is not expressible in this dictionary at
+# all, and would need slot views injected into the client's own UI on the Unity
+# thread. That is not what this does, and the honest ceiling is two.
+
+proc offeredModes(): seq[string] =
+  ## The modes this server puts on the character screen at all, in the order the
+  ## screen reads them. A mode not in this list is answered `locked`, which is a
+  ## greyed tile rather than a missing one -- a key omitted entirely renders as
+  ## an empty "create here" prompt, which would be the opposite of the intent.
+  result = @[ModeRegular]
+  if gPveSlot: result.add ModePve
+  if gPvpSeasonSlot: result.add ModePvpSeason
+
+proc modeOffered(mode: string): bool =
+  # Bound to a `let` before it is walked, here and in every loop below: nimony
+  # will not borrow an iteration path out of a call's temporary.
+  let modes = offeredModes()
+  for m in modes:
+    if m == mode:
+      return true
+  result = false
+
+proc profileInMode(mode: string): Profile =
+  ## The character occupying one slot, or a not-ok profile when the slot is
+  ## free. First match wins; two profiles tagged to one mode is a store somebody
+  ## edited by hand, and showing the first beats refusing the screen.
+  result = Profile(id: "", text: "", ok: false)
+  let ids = allProfileIds()
+  for id in ids:
     let p = loadProfile(id)
-    if p.ok:
-      # EGameMode's custom `EnumConverter` maps values to attribute wire strings
-      # ("regular"/"pve"/"pvp-season"), NOT the enum name or number -- and a key
-      # not in that map THROWS, aborting the whole dictionary and re-locking every
-      # slot (which is why "0" and "Regular" both failed). "regular" = the PvP
-      # slot; this server's one profile fills it.
-      put(modes, "regular", characterSlot(p))
-      break
+    if p.ok and profileMode(p) == mode:
+      return p
+
+proc rosterCount(): int =
+  ## Characters that occupy an offered slot. Not `allProfileIds().len`: a
+  ## profile tagged to a mode this server no longer offers is still on disk and
+  ## still readable, and counting it toward the cap would lock a slot the player
+  ## can actually see in favour of one they cannot.
+  result = 0
+  let modes = offeredModes()
+  for m in modes:
+    if profileInMode(m).ok:
+      inc result
+
+proc creationAllowedIn(mode: string): bool =
+  ## Whether the "+" may be shown for one slot, and whether a create posted
+  ## against it may proceed. The same predicate for both, on purpose: a screen
+  ## that offers what the route then refuses is a screen that lies.
+  if not gCreationAllowed: return false
+  if not modeOffered(mode): return false
+  if profileInMode(mode).ok: return false
+  result = rosterCount() < gMaxCharacters
+
+proc firstFreeMode(): string =
+  ## The slot a create lands in when nothing has said which. See `gSessionMode`.
+  let modes = offeredModes()
+  for m in modes:
+    if creationAllowedIn(m):
+      return m
+  result = ""
+
+proc vacantSlot(status: string): JsonObject =
+  ## A slot with no character in it -- `empty` (the "+", which is what the
+  ## client renders as its own create-a-character affordance; there is no
+  ## separate "add character" request, this value IS the button) or `locked`
+  ## (a greyed tile for a mode this server will not offer).
+  ##
+  ## Every field `characterSlot` sends is sent here too, zeroed. A slot value
+  ## that omits keys the deserialiser expects can throw, and a throw ANYWHERE in
+  ## this dictionary aborts the whole of it and re-locks every slot, including
+  ## the one with a character in it -- so a vacant slot is a full shape with
+  ## nothing in it, not a short one.
+  ##
+  ## `status` is a parameter rather than something the caller patches
+  ## afterwards, because `put` on this JSON builder APPENDS: a second
+  ## `put(o, "status", ...)` would emit the key twice and leave which one wins
+  ## to whichever parser reads it.
+  var o = obj()
+  put(o, "uid", "")
+  put(o, "status", status)
+  put(o, "side", 0)
+  put(o, "nickname", "")
+  put(o, "lowerNickname", "")
+  put(o, "nicknamePref", "")
+  put(o, "level", 0)
+  put(o, "prestigeLevel", 0)
+  put(o, "memberCategory", 0)
+  put(o, "accountType", 0)
+  put(o, "aid", 0)
+  put(o, "gameVersion", gEdition)
+  put(o, "PlayerVisualRepresentation", jnull())
+  put(o, "SeasonalInfo", jnull())
+  put(o, "unlockedProductionRecipe", raw("[]"))
+  put(o, "unlockedRules", raw("[]"))
+  put(o, "unlockedTraderDialogues", raw("[]"))
+  put(o, "unlockedTraders", raw("[]"))
+  result = o
+
+
+proc onProfilesV2(url, body, session: string): string =
+  ## `/v2/client/game/profiles/` -- the character-select bootstrap, and the only
+  ## place multi-character is decided.
+  ##
+  ## Post-1.0 deserialises `data` into
+  ## `Dictionary<EGameMode, CharacterSelectionProfileData>` and drives
+  ## `RunCharacterSelectionFlow` from it -- NOT the flat profile array
+  ## `/client/game/profile/list` returns (a JSON array deserialises into an
+  ## empty dictionary, which is the blank character screen).
+  ##
+  ## The key is the mode's wire string through `EGameMode`'s custom
+  ## `EnumConverter` -- "regular"/"pve"/"pvp-season", NOT the enum name or its
+  ## number. A key outside that map THROWS and aborts the whole dictionary,
+  ## re-locking every slot, which is why "0" and "Regular" both failed.
+  ##
+  ## This used to fill "regular" from the first readable profile and `break`, so
+  ## a second character could never be shown and the "+" could never appear once
+  ## one existed. Now every key is emitted and resolved on its own:
+  ##
+  ##   a character is tagged to this mode  -> `available`, the playable slot
+  ##   the slot is free and creation is on -> `empty`, which IS the "+"
+  ##   otherwise                           -> `locked`, a greyed tile
+  ##
+  ## Selecting between them needs nothing further from this server: clicking a
+  ## slot posts `/client/game/profile/select`, which rebinds the session. That
+  ## is the in-game character switch, and it is why there is no second selector
+  ## in the launcher.
+  var modes = obj()
+  # Every key EGameMode has, always, and in this order. Bound to a `let` before
+  # it is walked for the same borrow reason as the loops above.
+  let keys = @[ModeRegular, ModePve, ModePvpSeason]
+  for mode in keys:
+    let p = profileInMode(mode)
+    if p.ok and modeOffered(mode):
+      put(modes, mode, characterSlot(p))
+    elif creationAllowedIn(mode):
+      put(modes, mode, vacantSlot("empty"))
+    else:
+      put(modes, mode, vacantSlot("locked"))
   # Enveloped: a bare dictionary renders NOTHING (the client wraps this in
-  # JsonResponse<T> and reads `.data`), while the envelope renders the Regular
-  # slot. The dict key "regular" binds that slot to the mode; the value's own
-  # field casing is what remains (see characterSlot).
+  # JsonResponse<T> and reads `.data`).
   result = envelope(modes)
 
 proc onShopStatus(url, body, session: string): string =
@@ -582,9 +755,28 @@ proc onProfileSelect(url, body, session: string): string =
   result = envelope(o)
 
 proc onProfileCreate(url, body, session: string): string =
-  ## Creates a PMC from the character screen's choices.
+  ## Creates a PMC from the character screen's choices -- the in-game character
+  ## creator, reached by clicking an `empty` slot on the mode select.
+  ##
+  ## The body is `{side, nickname, headId, voiceId, seasonalPerkIds}` (capture
+  ## raid1 seq 092). It carries **no mode**: the target slot is whichever one
+  ## the player entered creation from, which this server recovers from
+  ## `gSessionMode` (set by `/client/game/mode`) and falls back to the first
+  ## free slot for. That fallback is not a guess about the player's intent so
+  ## much as the only slot the create could legally have come from when there is
+  ## exactly one free.
+  ##
+  ## `headId` and `voiceId` used to be read off the wire and dropped, so a
+  ## character made in-game always wore its side's defaults however long the
+  ## player spent choosing. They are applied now, and a refusal from the
+  ## customisation table is logged rather than fatal -- the character exists and
+  ## has its side's default; failing the whole create because a server started
+  ## without a database could not look a head up would be worse than the wrong
+  ## head.
   let nickname = field(body, "nickname").asText("")
   var sideName = field(body, "side").asText(gDefaultSide)
+  let headId = field(body, "headId").asText("")
+  let voiceId = field(body, "voiceId").asText("")
   if nickname.len == 0:
     return failure(1, "a profile needs a nickname")
   if nicknameTaken(nickname):
@@ -593,12 +785,45 @@ proc onProfileCreate(url, body, session: string): string =
     return failure(255, "that nickname is taken")
   if sideName != "Bear" and sideName != "Usec":
     sideName = gDefaultSide
-  let p = createProfile(nickname, sideName, gEdition, nowSeconds(),
-                        gStartingRoubles)
+
+  # The gate, before anything is written. Refused here rather than at the
+  # screen alone, because the screen is drawn from a snapshot and this is the
+  # moment the answer has to be true.
+  if not gCreationAllowed:
+    return failure(1, "character creation is switched off on this server")
+  var mode = gSessionMode
+  if mode.len == 0 or not creationAllowedIn(mode):
+    mode = firstFreeMode()
+  if mode.len == 0:
+    if rosterCount() >= gMaxCharacters:
+      return failure(1, "this server holds its maximum of " & $gMaxCharacters &
+                        " character(s); delete one to make another")
+    return failure(1, "there is no free character slot to create into")
+
+  var p = createProfile(nickname, sideName, gEdition, nowSeconds(),
+                        gStartingRoubles, mode)
   if not p.ok:
     return failure(1, "could not save the new profile: " & lastError())
+
+  var changed = false
+  if headId.len > 0:
+    var problem = ""
+    if applyHead(p, headId, problem):
+      changed = true
+    elif problem.len > 0:
+      warn "the character creator asked for head " & headId & ": " & problem
+  if voiceId.len > 0:
+    var problem = ""
+    if applyVoice(p, voiceId, problem):
+      changed = true
+    elif problem.len > 0:
+      warn "the character creator asked for voice " & voiceId & ": " & problem
+  if changed and not saveProfile(p):
+    return failure(1, "could not save the new character's appearance")
+
   bindSession(session, p.id)
-  success "created profile " & p.id & " (" & nickname & ", " & sideName & ")"
+  success "created profile " & p.id & " (" & nickname & ", " & sideName &
+          ") in the " & mode & " slot"
   discard broadcast("tarkov.profile.created", objOf("id", p.id))
   result = envelope(objOf("uid", p.id))
 
@@ -730,6 +955,11 @@ proc launcherProfile(id: string): JsonObject =
   put(o, "voice", p.field("Info.Voice").asText(""))
   put(o, "edition", p.field("Info.GameVersion").asText(""))
   put(o, "registered", p.field("Info.RegistrationDate").asInt(0))
+  # Which character-select slot this one shows up in. The launcher does not pick
+  # a slot -- the player does, in the game -- but a list that could not say
+  # which character is which would be a list of two rows with the same everything
+  # but the nickname.
+  put(o, "mode", if p.ok: profileMode(p) else: "")
   result = o
 
 proc onLauncherPing(url, body, session: string): string =
@@ -747,6 +977,19 @@ proc onLauncherPing(url, body, session: string): string =
   put(o, "edition", gEdition)
   put(o, "defaultSide", gDefaultSide)
   put(o, "profiles", allProfileIds().len)
+  # The character-creation gate, so the launcher can honour the API's answer
+  # instead of holding an opinion of its own. `creationAllowed` here is the
+  # whole predicate -- switch, cap and a free slot -- not just the master
+  # switch, because that is the question a launcher is actually asking.
+  put(o, "creationAllowed", gCreationAllowed and firstFreeMode().len > 0)
+  put(o, "creationEnabled", gCreationAllowed)
+  put(o, "maxCharacters", gMaxCharacters)
+  put(o, "rosterCount", rosterCount())
+  var offered = arr()
+  let offeredNames = offeredModes()
+  for m in offeredNames:
+    offered.add raw(jstr(m).text)
+  put(o, "modes", offered)
   result = launcherReply(o)
 
 proc onLauncherProfiles(url, body, session: string): string =
@@ -760,6 +1003,8 @@ proc onLauncherProfiles(url, body, session: string): string =
   var o = obj()
   put(o, "ok", true)
   put(o, "profiles", a)
+  put(o, "creationAllowed", gCreationAllowed and firstFreeMode().len > 0)
+  put(o, "maxCharacters", gMaxCharacters)
   result = launcherReply(o)
 
 proc onLauncherCreate(url, body, session: string): string =
@@ -787,8 +1032,21 @@ proc onLauncherCreate(url, body, session: string): string =
     sideName = gDefaultSide
   if edition.len == 0:
     edition = gEdition
+  # The same gate the in-game creator goes through, for the same reason the two
+  # share `createProfile`: two ways to make a character is two sets of rules,
+  # and only one of them gets updated when the rules change.
+  if not gCreationAllowed:
+    return launcherRefusal("character creation is switched off on this server")
+  var mode = field(body, "mode").asText("")
+  if mode.len == 0 or not creationAllowedIn(mode):
+    mode = firstFreeMode()
+  if mode.len == 0:
+    if rosterCount() >= gMaxCharacters:
+      return launcherRefusal("this server holds its maximum of " &
+                             $gMaxCharacters & " character(s)")
+    return launcherRefusal("there is no free character slot to create into")
   var p = createProfile(nickname, sideName, edition, nowSeconds(),
-                        gStartingRoubles)
+                        gStartingRoubles, mode)
   if not p.ok:
     return launcherRefusal("could not save the new profile: " & lastError())
   # The voice is optional and its failure is not. `applyVoice` checks the id
@@ -841,6 +1099,43 @@ proc onLauncherSelect(url, body, session: string): string =
   put(o, "ok", true)
   put(o, "token", id)
   put(o, "profile", launcherProfile(id))
+  result = launcherReply(o)
+
+proc onLauncherCreationSession(url, body, session: string): string =
+  ## A token to launch with when there is **no character to select yet**.
+  ##
+  ## This exists because of a specific, expensive failure. `-token=<id>` is the
+  ## only thing that gives the client a `PHPSESSID` cookie, and the backend
+  ## reads the session from that cookie and nowhere else. Launch with no token
+  ## and every request arrives with `session=` empty; `currentProfile("")`
+  ## resolves to no profile even by its single-profile fallback (which has to
+  ## `bindSession` and cannot bind an empty id), so the client stops at "Client
+  ## not authenticated" -- *before* the character screen it was being sent to.
+  ## The first-run path therefore cannot be "launch with nothing". It has to be
+  ## "launch with a session that is real and simply has no character on it yet".
+  ##
+  ## That is what this hands back: a fresh, valid id, bound to nothing. Every
+  ## route the character creator needs -- `/client/game/mode`,
+  ## `/v2/client/game/profiles/`, `/client/customization`,
+  ## `.../customization/storage`, the nickname pair, and `create` itself --
+  ## works without a bound profile. `onProfileCreate` then binds *this* session
+  ## to the character it makes, so the player is playing it the moment the
+  ## creator closes, with no relaunch and no second selector.
+  ##
+  ## Refused, rather than issued, when creation is off: a token whose only use
+  ## is a screen the server will not honour is a token that wastes a launch.
+  inc gRequests
+  if not gCreationAllowed:
+    return launcherRefusal("character creation is switched off on this server")
+  if firstFreeMode().len == 0:
+    return launcherRefusal("every character slot on this server is taken")
+  let token = newId()
+  var o = obj()
+  put(o, "ok", true)
+  put(o, "token", token)
+  put(o, "mode", firstFreeMode())
+  info "the launcher took a creation session " & token &
+       " (no character on it yet)"
   result = launcherReply(o)
 
 # ---------------------------------------------------------------------------
@@ -1453,10 +1748,29 @@ proc onCustomizationStorage(url, body, session: string): string =
   result = envelope(raw(owned))
 
 proc onGameMode(url, body, session: string): string =
-  ## `GameModeResponse`. Asked at boot, before the profile list, and this server
-  ## has one mode.
+  ## `GameModeResponse`. Asked at boot, and again whenever the client changes
+  ## which mode tile it is working in.
+  ##
+  ## The mode it names is remembered (`gSessionMode`) because
+  ## `/client/game/profile/create` does not carry one and this is the only
+  ## request that ever says which slot the player is standing in. Both spellings
+  ## are read: the request body has been seen as `sessionMode` and as
+  ## `gameMode`, and a server that read only one of them would silently create
+  ## every character into the wrong slot.
+  ##
+  ## The answer echoes the mode back rather than the old hardcoded "regular", so
+  ## the client and this server agree on which slot is live. A mode this server
+  ## does not offer is answered with the one it does -- refusing would leave the
+  ## client on a mode with no backend behind it.
+  var asked = field(body, "sessionMode").asText("")
+  if asked.len == 0:
+    asked = field(body, "gameMode").asText("")
+  if asked.len > 0 and modeOffered(asked):
+    gSessionMode = asked
+  elif gSessionMode.len == 0:
+    gSessionMode = ModeRegular
   var o = obj()
-  put(o, "gameMode", "regular")
+  put(o, "gameMode", gSessionMode)
   put(o, "backendUrl", BackendUrl)
   result = envelope(o)
 
@@ -2555,6 +2869,8 @@ proc registerRoutes() =
   discard serve("/aowlspt/tarkov/launcher/profiles", onLauncherProfiles)
   discard serve("/aowlspt/tarkov/launcher/profile/create", onLauncherCreate)
   discard serve("/aowlspt/tarkov/launcher/profile/select", onLauncherSelect)
+  discard serve("/aowlspt/tarkov/launcher/creation-session",
+                onLauncherCreationSession)
 
   discard serve("/client/profile/status", onProfileStatus)
   # `GetProfileSettings` answers a bare `true`; the client only checks that the
@@ -2725,6 +3041,24 @@ proc tarkovSchema(): seq[Setting] =
                category = "Emulator",
                description = "The Unix time the emulator's clock starts from"),
 
+    boolSetting("characterCreationAllowed", "Allow character creation", true,
+                category = "Characters",
+                description = "Off hides the create slot in game and refuses " &
+                              "every create route"),
+    intSetting("maxCharacters", "Maximum characters", 2, lo = 1, hi = 3,
+               category = "Characters",
+               description = "The character screen is keyed by game mode, so " &
+                             "three is the ceiling the client can show"),
+    boolSetting("pveSlotEnabled", "Offer the PvE character slot", true,
+                category = "Characters",
+                description = "The second character slot. Everything this " &
+                              "server runs is PvE"),
+    boolSetting("pvpSeasonSlotEnabled", "Offer the seasonal PvP slot", false,
+                category = "Characters",
+                description = "Off by design: there is no second player on " &
+                              "this server, so a PvP slot would be a mode " &
+                              "that cannot be played"),
+
     intSetting("insurancePercent", "Insurance return chance (%)", 10,
                lo = 0, hi = 100, category = "Insurance"),
     intSetting("insuranceReturnHours", "Insurance return delay (hours)", 24,
@@ -2789,6 +3123,14 @@ proc onLoad(): Status =
   gDefaultSide = setting("defaultSide").asText("Usec")
   gNowSeconds = setting("epochBase").asInt(1700000000)
   gStartingRoubles = setting("startingRoubles").asInt(500000)
+  # The character-creation gate. Read here so every path -- the in-game "+", the
+  # create route behind it, and the launcher -- gets its answer from one place.
+  gCreationAllowed = setting("characterCreationAllowed").asBool(true)
+  gMaxCharacters = setting("maxCharacters").asInt(2)
+  if gMaxCharacters < 1: gMaxCharacters = 1
+  if gMaxCharacters > 3: gMaxCharacters = 3
+  gPveSlot = setting("pveSlotEnabled").asBool(true)
+  gPvpSeasonSlot = setting("pvpSeasonSlotEnabled").asBool(false)
   gInsurancePercent = setting("insurancePercent").asInt(10)
   gInsuranceHours = setting("insuranceReturnHours").asInt(24)
   gScavCooldownSeconds = setting("scavCooldownSeconds").asInt(900)
