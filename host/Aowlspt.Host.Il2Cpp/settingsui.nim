@@ -354,6 +354,12 @@ proc suiTabInitBody(a: Il2CppPtr): Il2CppPtr {.
   suiWalkTab(tab, gname)
   # The registry poll stays as a cheap backstop for any tab that somehow lags.
   suiPollRegisteredTabs()
+  # PHASE 2 -- the WRITE side, in `settingswrite.nim`. It runs here, inside this
+  # body, precisely so it inherits this body's `aowl_p_p_seh` guard rather than
+  # arming a second one (that guard is not re-entrant). It does nothing unless
+  # `settingsRelabelProbe` or `settingsBindProbe` is set, and it disables itself
+  # after two faults.
+  swOnTabBuilt(tab, gname)
   return cast[Il2CppPtr](1)
 
 # The VEH/SEH guard thunk, the same mechanism botdiag/botcap use: `aowl_p_p_seh`
@@ -376,7 +382,11 @@ proc settingsTabInitFired(regs: Il2CppPtr) =
   ## it faulted, so the settings screen keeps working either way.
   if cSettingsTabBodyGuarded(regs) == nil:
     okLog "settings probe: fault caught in the tab walk -- the VEH guard kept " &
-          "the settings screen alive (nothing was written)"
+          "the settings screen alive"
+    # Phase 2 may have been the half that faulted, and it is the half that
+    # writes, so it spends a fault from its budget and switches itself off once
+    # the budget is gone. The read probe is unaffected.
+    swNoteFault()
 
 proc bindSettingsTabProbe(verbose: bool): bool =
   ## Installs the read-only POSTFIX detour (kind=7) on
