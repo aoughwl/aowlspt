@@ -112,8 +112,8 @@ proc suiWalkTab(tabPtr: Il2CppPtr; tabName: string) =
   let lst = cReadPtrAt(tabPtr, cSuiOffCreatedCtrls())
   if lst == nil or cIsReadable(lst, cSuiOffListSize() + 4'i32) == 0'i32:
     okLog "settings probe: tab=" & tabName &
-          " _createdControls list is null/unreadable (tab likely not " &
-          "initialized yet -- expected before it is first opened)"
+          " _createdControls list is null/unreadable -- expected for any tab " &
+          "the user has not selected yet; only the SELECTED tab is built"
     return
   let arr = cReadPtrAt(lst, cSuiOffListItems())
   let size = cReadI32At(suiPtrAdd(lst, cSuiOffListSize()))
@@ -217,20 +217,30 @@ proc bindSettingsUiProbe(verbose: bool): bool =
   result = false
 
 # ---------------------------------------------------------------------------
-# PHASE 1.5 -- the walk that actually finds controls
+# PHASE 1.8 -- the walk at the method that actually builds the controls
 #
-# Phase 1 proved the mechanism and disproved the timing: `Show` fires on the
-# Unity thread with a readable `this`, but every tab's `_createdControls` is
-# still null there. Controls are built lazily by
-# `SettingsScreen::EnsureTabInitialized(this, ESettingsGroup)`, which `OpenGroup`
-# calls on every tab switch (and which returns early, via a HashSet at +0x138,
-# once a group has been built).
+# Phases 1 and 1.5 each cost a live cycle and each disproved a guess: at
+# `SettingsScreen::Show` no tab has controls, and at a POSTFIX on
+# `SettingsScreen::EnsureTabInitialized` they STILL do not, because that method
+# only calls each tab's `Show()` -- it builds nothing.
 #
-# So this is a POSTFIX detour (kind=7) on that method: the entry registers are
-# still the entry registers (the thunk saved them), so RCX is `this` and EDX is
-# the group -- but the body has already run, so the tab's controls EXIST. The
-# group tells us exactly which tab field to read, so we walk that one tab rather
-# than re-guessing all five.
+# The chain was then settled OFFLINE, from disassembly + metadata alone; the
+# full evidence is in `docs/timbuktu/SETTINGS-CONTROLS-RE.md` and the target
+# comment in `abi/aowlspt_bridge.h`. In one line:
+#
+#   ShowScreen(0x1720DE0) -> [tail jmp] set_IsSelected(tab, true) (0x171BCA0)
+#     -> vtable slot 0x2C8 OnFirstSelect -> CreateControls
+#       -> CreateControl<T> gshared (0x2B86E20), `mov [rsi+0x88], rdi`
+#
+# `EnsureTabInitialized` is called by ShowScreen ~50 bytes BEFORE that tail
+# jump, which is exactly why the Phase-1.5 postfix saw null. So this is the same
+# POSTFIX detour (kind=7), moved to `ShowScreen`: RCX is the SettingsScreen, EDX
+# is the group, and `_currentTab` (+0x118) -- written just before the tail jump
+# -- names the tab whose controls were just built.
+#
+# Corollary worth remembering: only the SELECTED tab is ever built, so four of
+# the five `_createdControls` lists being null is the correct steady state, not
+# a failure.
 #
 # Still read-only, still reflection-free, still every hop cIsReadable-guarded,
 # still capped -- and now the whole body runs inside the VEH/SEH guard, so a
@@ -261,7 +271,7 @@ proc suiTabInitBody(a: Il2CppPtr): Il2CppPtr {.
   let group = cast[int32](uint32(cRegsInt(regs, 1'i32) and 0xFFFFFFFF'u64))
   inc gSuiTabFires
   if gSuiTabFires == 1:
-    okLog "settings probe: EnsureTabInitialized (postfix) first fired on thread " &
+    okLog "settings probe: ShowScreen (postfix) first fired on thread " &
           $tid & " (host thread " & $int(gHostThreadId) & ")" &
           (if onHost: " -- host thread (unexpected, NOT Unity's)"
            else: " -- Unity's main thread") & "; this=0x" & hexOf(selfPtr)
@@ -270,28 +280,38 @@ proc suiTabInitBody(a: Il2CppPtr): Il2CppPtr {.
 
   let gname = readCString(cSuiGroupName(group))
   let off = cSuiGroupTabOffset(group)
-  if off < 0'i32:
-    okLog "settings probe: EnsureTabInitialized group=" & $int(group) &
-          " is outside the known 0..4 mapping; nothing walked (no write)"
-    return cast[Il2CppPtr](1)
   if group >= 0'i32 and int(group) < gSuiGroupsLogged.len and
      gSuiGroupsLogged[int(group)]:
     return cast[Il2CppPtr](1)     # already censused this tab; stay quiet
 
   let self = cast[Il2CppPtr](selfPtr)
-  if cIsReadable(self, off + 8'i32) == 0'i32:
-    okLog "settings probe: this not readable at the tab field 0x" &
-          hexOf(uint64(off)) & " for group=" & gname & "; aborting (no write)"
+  if cIsReadable(self, cSuiOffCurrentTab() + 8'i32) == 0'i32:
+    okLog "settings probe: this not readable at _currentTab (0x" &
+          hexOf(uint64(cSuiOffCurrentTab())) & ") for group=" & gname &
+          "; aborting (no write)"
     return cast[Il2CppPtr](1)
-  let tab = cReadPtrAt(self, off)
+
+  # The authoritative tab is `_currentTab` (+0x118): ShowScreen writes it at
+  # +0x1720F4E, and only THEN tail-jumps into set_IsSelected, which is what runs
+  # OnFirstSelect -> CreateControls -> CreateControl<T> and fills +0x88. At this
+  # postfix both have happened. The EDX group is kept only as a cross-check of
+  # the metadata-derived tab-field offsets; a mismatch is logged, never fatal.
+  let tab = cReadPtrAt(self, cSuiOffCurrentTab())
+  if off >= 0'i32 and cIsReadable(self, off + 8'i32) != 0'i32:
+    let byGroup = cReadPtrAt(self, off)
+    if byGroup != tab:
+      okLog "settings probe: NOTE group=" & gname & " field 0x" &
+            hexOf(uint64(off)) & " -> 0x" & hexOf(cast[uint64](byGroup)) &
+            " but _currentTab -> 0x" & hexOf(cast[uint64](tab)) &
+            "; walking _currentTab (the one just selected)"
   if tab == nil:
-    okLog "settings probe: group=" & gname & " tab field (0x" &
-          hexOf(uint64(off)) & ") is still null after EnsureTabInitialized"
+    okLog "settings probe: _currentTab is still null after ShowScreen(group=" &
+          gname & "); nothing walked (no write)"
     return cast[Il2CppPtr](1)
 
   if group >= 0'i32 and int(group) < gSuiGroupsLogged.len:
     gSuiGroupsLogged[int(group)] = true
-  okLog "settings probe: tab built -- group=" & gname & " (" & $int(group) &
+  okLog "settings probe: tab selected -- group=" & gname & " (" & $int(group) &
         ") tab=0x" & hexOf(cast[uint64](tab)) & " klass=0x" &
         hexOf(cast[uint64](cReadPtrAt(tab, 0'i32)))
   suiWalkTab(tab, gname)
@@ -321,7 +341,7 @@ proc settingsTabInitFired(regs: Il2CppPtr) =
 
 proc bindSettingsTabProbe(verbose: bool): bool =
   ## Installs the read-only POSTFIX detour (kind=7) on
-  ## `SettingsScreen::EnsureTabInitialized` from the verified static target in
+  ## `SettingsScreen::ShowScreen` from the verified static target in
   ## `aowlspt_bridge.h`. Shares the `settingsUiProbe` flag with the Phase-1 `Show`
   ## hook; binds nothing on a build whose prologue does not match.
   if gSettingsTabSlot >= 0:
@@ -337,7 +357,7 @@ proc bindSettingsTabProbe(verbose: bool): bool =
       continue
     let spec = readCString(cBridgeSettingsTabTargetName(int32(i)))
     if attachDrain(spec, fn, cast[Il2CppMethod](0), false, verbose, 7'i32, true):
-      okLog "settings-UI control probe (Phase 1.5) armed POSTFIX on " & spec &
+      okLog "settings-UI control probe (Phase 1.8) armed POSTFIX on " & spec &
             "; open Settings and click each tab -- every control's label, klass " &
             "and value-widget pointer is logged as the tab is built"
       return true

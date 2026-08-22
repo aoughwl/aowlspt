@@ -288,49 +288,66 @@ static int32_t aowl_bridge_settings_target_count(void) {
 }
 
 /* ------------------------------------------------------------------ *
- * The settings CONTROL-TREE target (Phase 1.5)
+ * The settings CONTROL-TREE target (Phase 1.8)
  *
- * `EFT.UI.Settings.SettingsScreen::EnsureTabInitialized` @ RVA 0x171FF10
- * (VA 0x18171FF10, token 0x060172c8 -- `docs/SETTINGS.md`).
+ * `EFT.UI.Settings.SettingsScreen::ShowScreen` @ RVA 0x1720DE0
+ * (VA 0x181720DE0), hooked POSTFIX.
  *
- * WHY THIS AND NOT `Show`: the live Phase-1 run proved `Show` fires correctly on
- * the Unity thread with a readable `this`, but that EVERY tab's
- * `_createdControls` list was still null there -- the controls do not exist yet
- * at `Show` time. This method is the lazy builder: `OpenGroup` (0x1720C80)
- * tail-calls into 0x1720DE0, which `call`s 0x18171FF10 and only AFTERWARDS
- * assigns `_currentTab` (+0x118). So the tab's controls exist when this returns,
- * and this runs on EVERY tab switch, not just the first.
+ * WHY THIS AND NOT `Show` OR `EnsureTabInitialized`: settled offline in
+ * `docs/timbuktu/SETTINGS-CONTROLS-RE.md`, from disassembly + metadata, after
+ * three live cycles each disproved a guess. The chain that actually builds a
+ * tab's controls is:
  *
- * SIGNATURE (read off the disassembly, not assumed):
- *   RCX = `this` (SettingsScreen)      -- `mov rbx, rcx` at +0x13
- *   EDX = `ESettingsGroup group`       -- `mov esi, edx` at +0x0E
- * The body is a 5-way switch on that group, and each arm loads exactly one of
- * the typed tab fields this probe already knows -- which cross-validates the
- * metadata-derived offsets in `aowlspt_settingsui.h` against real code:
- *   group 0 -> [this+0x0F8] graphics    group 1 -> [this+0x0F0] game
- *   group 2 -> [this+0x108] sound       group 3 -> [this+0x110] controls
- *   group 4 -> [this+0x100] postfx
- * The tail (0x18171FF4E entry check / 0x1817202A9 exit) is a HashSet at
- * [this+0x138]: `Contains(group)` on entry returns early, and the group is added
- * on the way out. So the FIRST call for a group builds it; later calls are
- * cheap. Either way the tab is built by the time it returns -- which is why the
- * probe hooks this POSTFIX.
+ *   ShowScreen 0x1720DE0
+ *     +0x1720EE0  call 0x171BCA0   set_IsSelected(oldTab, false)
+ *     +0x1720F00  call 0x171FF10   EnsureTabInitialized(this, group)
+ *                                    -- only calls each tab's Show(); builds
+ *                                       NO controls. Phase 1.5 hooked here and
+ *                                       correctly saw null.
+ *     +0x1720F4E  mov [rbx+0x118], rcx      _currentTab = the new tab
+ *     +0x1720FC1  jmp 0x171BCA0    set_IsSelected(newTab, TRUE)  <-- builds
  *
- * Prologue, byte-verified against GameAssembly.dll (16 bytes, ending on an
- * instruction boundary):
- *   40 53             push rbx
- *   56                push rsi
- *   48 83 EC 58       sub  rsp, 0x58
- *   80 3D FC E4 99 05 00   cmp byte [rip+0x599E4FC], 0
- *   8B F2             mov  esi, edx
- * = 2+1+4+7+2 = 16 exactly. The next instruction (`48 8B D9  mov rbx,rcx`) is
- * untouched. The one RIP-relative operand is the `cmp`, which the detour copier
- * fixes up exactly as it already does for `Show` (same instruction, same place).
+ *   set_IsSelected 0x171BCA0
+ *     +0x171BD1C  cmp byte [rbx+0x90], 0    IsInitialized latch
+ *     +0x171BD32  mov rax, [rdx+0x2C8]      vtable slot 25 -> OnFirstSelect
+ *     +0x171BD40  call rax
+ *
+ *   <Tab>::OnFirstSelect -> CreateControls -> CreateControl<T> (gshared,
+ *   0x2B86E20), whose +0x2B8706F does `mov [rsi+0x88], rdi` -- the one and only
+ *   write of `_createdControls`.
+ *
+ * A pattern scan of `.text` + `il2cpp` for `mov r64,[reg+0x2C8]` followed by a
+ * `+0x2D0` load finds exactly two invokers of that slot in the settings UI:
+ * `set_IsSelected` (0x171BD32) and the dead `OnTabSelected` (0x171BDBC). And a
+ * direct-E8 xref finds exactly one caller of `set_IsSelected`: ShowScreen. So
+ * ShowScreen is the only live path to control creation, and a POSTFIX here runs
+ * strictly after it -- the trailing `jmp` is a tail-call, so `set_IsSelected`'s
+ * `ret` returns through this detour's trampoline.
+ *
+ * SIGNATURE (read off the disassembly):
+ *   RCX = `this` (SettingsScreen)   -- `mov rbx, rcx` at +0x1720DF8
+ *   EDX = `ESettingsGroup group`    -- `mov esi, edx` at +0x1720DF6
+ * At postfix time `[RCX+0x118]` (`_currentTab`) is the tab whose controls were
+ * just built -- written at +0x1720F4E, before the tail-jump. EDX maps to the
+ * same tab through `aowl_sui_group_tab_offset`, which is a free cross-check.
+ *
+ * Prologue, byte-verified against GameAssembly.dll. This is the cleanest steal
+ * of any settings target: AOWL_JMP_SIZE is 14 and the first instruction
+ * boundary at or past 14 is 15, so the detour steals four instructions and NOT
+ * ONE of them is RIP-relative -- no displacement fixup at all (unlike `Show`
+ * and `EnsureTabInitialized`, whose steals both cut a `cmp byte [rip+..],0`):
+ *   48 89 5C 24 08        mov [rsp+0x08], rbx     (5)
+ *   48 89 74 24 10        mov [rsp+0x10], rsi     (5) -> 10
+ *   57                    push rdi                (1) -> 11
+ *   48 83 EC 30           sub rsp, 0x30           (4) -> 15
+ *   80 3D 2B D6 99 05 00  cmp byte [rip+..], 0    (7) -> 22   (NOT stolen)
+ * The 16-byte `sig` therefore ends one byte into that `cmp`; it is a memcmp
+ * fingerprint, not the steal length, which the length decoder computes itself.
  */
 static const AowlBridgeTarget aowl_bridge_settingstab_targets[] = {
-    { "EFT.UI.Settings.SettingsScreen::EnsureTabInitialized", 0x171FF10u,
-      { 0x40,0x53, 0x56, 0x48,0x83,0xEC,0x58,
-        0x80,0x3D,0xFC,0xE4,0x99,0x05,0x00, 0x8B,0xF2 }, 16, 0 },
+    { "EFT.UI.Settings.SettingsScreen::ShowScreen", 0x1720DE0u,
+      { 0x48,0x89,0x5C,0x24,0x08, 0x48,0x89,0x74,0x24,0x10, 0x57,
+        0x48,0x83,0xEC,0x30, 0x80 }, 16, 0 },
 };
 #define AOWL_BRIDGE_SETTINGSTAB_TARGET_COUNT \
     ((int32_t)(sizeof(aowl_bridge_settingstab_targets) / \
