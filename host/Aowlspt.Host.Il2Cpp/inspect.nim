@@ -541,7 +541,7 @@ proc iReadTyped(p: Il2CppPtr; t: string; outp: var string): bool =
   if size < 0:
     outp = "unknown type: " & t
     return false
-  var buf: array[8, uint8]
+  var buf = default(array[8, uint8])
   iMark(("read " & t & " at " & iPtr(p)), p)
   if cInspReadBytes(p, 0'i32, size, cast[ptr uint8](addr buf[0])) == 0'i32:
     outp = "not readable for " & $int(size) & " bytes at " & iPtr(p)
@@ -699,7 +699,7 @@ proc iCmdDump(p: Il2CppPtr; n: int32) =
   if span < n:
     iOut("  only " & $int(span) & " of " & $int(n) &
          " bytes are readable here; showing what is:")
-  var buf: array[InspMaxDumpBytes, uint8]
+  var buf = default(array[InspMaxDumpBytes, uint8])
   if cInspReadBytes(p, 0'i32, span, cast[ptr uint8](addr buf[0])) == 0'i32:
     iErr("read failed at " & iPtr(p))
     return
@@ -734,7 +734,7 @@ proc iCmdFields(p: Il2CppPtr; n: int32) =
        " readable bytes; classification is a GUESS from the bytes, not metadata)")
   var off = 0
   while off + 8 <= int(span):
-    var buf: array[8, uint8]
+    var buf = default(array[8, uint8])
     if cInspReadBytes(p, int32(off), 8'i32, cast[ptr uint8](addr buf[0])) == 0'i32:
       break
     var raw = 0'u64
@@ -803,7 +803,7 @@ proc iCmdScan(p: Il2CppPtr; span: int32; t, valueTok: string) =
   var hits = 0
   var off = 0
   while off + int(size) <= int(have):
-    var buf: array[8, uint8]
+    var buf = default(array[8, uint8])
     if cInspReadBytes(p, int32(off), size, cast[ptr uint8](addr buf[0])) != 0'i32:
       var raw = 0'u64
       for k in 0 ..< int(size):
@@ -1200,7 +1200,7 @@ proc iCmdWrite(toks: seq[string]) =
   elif not iParseU(toks[3], raw):
     iErr("not a value: " & toks[3])
     return
-  var buf: array[8, uint8]
+  var buf = default(array[8, uint8])
   for i in 0 ..< 8:
     buf[i] = uint8((raw shr uint64(i * 8)) and 0xFF'u64)
   iMark(("WRITE " & t & " at " & iPtr(p)), p)
@@ -1320,7 +1320,7 @@ proc iExec(line: string) =
           iOut("  " & iPtrU(v) & " as " & iLower(toks[2]) & " = " & s)
           if iLower(toks[2]) == "ptr":
             var raw = 0'u64
-            var buf: array[8, uint8]
+            var buf = default(array[8, uint8])
             if cInspReadBytes(cast[Il2CppPtr](v), 0'i32, 8'i32,
                               cast[ptr uint8](addr buf[0])) != 0'i32:
               for k in 0 ..< 8:
