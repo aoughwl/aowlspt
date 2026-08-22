@@ -4855,20 +4855,45 @@ proc main(): int =
   discard expectIn("and the game sees the launcher's character as a profile",
                    "/client/game/profile/list", "", "AowlLauncher")
   # And the point of two characters: they are on the character screen at the
-  # same time, in different mode slots, and the player picks between them
-  # there. Nothing in the launcher asks a second time.
+  # same time and the player picks between them there. Nothing in the launcher
+  # asks a second time.
+  #
+  # **The character screen is `/client/game/profile/list`, not
+  # `/v2/client/game/profiles/`.** These checks used to assert the opposite --
+  # that the roster lived in the mode dictionary, one character per `EGameMode`
+  # key, ceiling of two. The real BSG capture disproves it
+  # (`mods/tarkov/data/capture/raid1`): entries in that dictionary carry only
+  # `status` and `SeasonalInfo` and cannot hold a character at all, it is
+  # fetched **once** in a 506-request session, and `profile/list` is fetched
+  # seven times, each followed by a `select` -- including straight after a raid
+  # with no mode dictionary in between (seq 204 -> 208 -> 266).
+  let roster = call("/client/game/profile/list", "")
+  check("both characters are on the character screen at once",
+        roster.contains(uid) and roster.contains(token), roster.body)
+  # The mode dictionary is a MODE selector. It has the three EGameMode keys
+  # whatever the roster holds, and the PvP one stays locked -- which is the part
+  # that has always worked and must keep working.
   let twoUp = call("/v2/client/game/profiles/", "{}")
-  check("both characters occupy a slot on the character screen",
-        twoUp.contains(uid) and twoUp.contains(token), twoUp.body)
-  check("and the screen offers no third slot at the ceiling",
-        not twoUp.contains("\"empty\""), twoUp.body)
-  # The ceiling is the client's, not a preference: the character screen is a
-  # dictionary keyed by EGameMode and this server offers two of its three keys.
+  check("the mode screen still offers the modes, not the roster",
+        twoUp.contains("\"regular\"") and twoUp.contains("\"pve\"") and
+        twoUp.contains("\"pvp-season\""), twoUp.body)
+  check("and the PvP mode is still locked",
+        twoUp.contains("\"locked\""), twoUp.body)
+  # A third character is now made, not refused. The old ceiling of two was the
+  # mode dictionary's three keys mistaken for slots; `profile/list` is a flat
+  # array with no such limit, so the only cap left is `maxCharacters`.
   let third = call("/client/game/profile/create",
                    "{\"nickname\":\"AowlThird\",\"side\":\"Usec\"}")
-  check("a third character is refused, in words, rather than half-made",
-        third.contains("\"err\":1") and not third.contains("\"uid\":\""),
-        third.body)
+  check("a third character is made, because the roster is a list and not slots",
+        third.contains("\"uid\":\""), third.body)
+  let three = call("/client/game/profile/list", "")
+  check("and all three are on the character screen together",
+        three.contains(uid) and three.contains(token) and
+        three.contains("AowlThird"), three.body)
+  # `create` binds the session to what it just made -- that is what lets the
+  # in-game creator play its character with no relaunch. Put the session back on
+  # the character the rest of this run is written against.
+  discard call("/client/game/profile/select", "{\"uid\":\"" & uid & "\"}")
   let reselect = call("/aowlspt/tarkov/launcher/profile/select",
                       "{\"id\":\"" & token & "\"}")
   check("selecting it again hands back the same token",
@@ -4962,8 +4987,8 @@ proc main(): int =
         asToken.contains("\"activeProfileId\":\"" & token & "\""),
         asToken.body)
   let pingAfter = call("/aowlspt/tarkov/launcher/ping", "")
-  check("and the launcher counts both characters on the second server",
-        pingAfter.contains("\"profiles\":2"), pingAfter.body)
+  check("and the launcher counts all three characters on the second server",
+        pingAfter.contains("\"profiles\":3"), pingAfter.body)
   let listAs = callAs(token, "/client/game/profile/list", "")
   check("and its profile list answers with that character",
         listAs.ok and listAs.contains("AowlLauncher"), listAs.body)

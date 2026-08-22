@@ -143,7 +143,15 @@ var gCreationAllowed = true
   ## three, so the emulator is the single place that decides -- a launcher that
   ## hardcoded its own answer would be a second opinion, and the two would
   ## disagree the first time either changed.
-var gMaxCharacters = 2
+var gMaxCharacters = 8
+  ## How many characters the roster may hold. A number chosen for taste, which
+  ## it now genuinely is: it used to be pinned to 2 by the mode dictionary's
+  ## three keys, on the belief that the character screen was that dictionary.
+  ## It is not -- the character screen is `/client/game/profile/list`, a flat
+  ## unbounded array -- so nothing in the protocol argues for any particular
+  ## value. A cap remains because a store is a directory and "unbounded" there
+  ## means a create loop nobody notices; eight is more characters than anyone
+  ## plays and small enough that the list stays readable.
 var gPveSlot = true
   ## Whether the `pve` character slot is offered. On by default: this server is
   ## an offline emulator and everything it runs is PvE, so the PvE slot is the
@@ -555,22 +563,44 @@ proc characterSlot(p: Profile): JsonObject =
   result = o
 
 # ---------------------------------------------------------------------------
-# The roster: which character is in which character-select slot
+# The roster: the characters, and which mode each one plays in
 # ---------------------------------------------------------------------------
 #
-# The post-1.0 character screen is a **mode select**, and that is the whole
-# shape of multi-character here. `/v2/client/game/profiles/` deserialises into
-# `Dictionary<EGameMode, CharacterSelectionProfileData>`, so the key space is
-# the `EGameMode` enum and nothing else -- three values, fixed in the client's
-# metadata. One character per key is therefore the ceiling this route can
-# express, and `gMaxCharacters` is bounded by it rather than by taste.
+# **Post-1.0 has TWO screens, not one, and this file used to conflate them.**
+# That mistake is what capped the roster at two and put the same character on
+# every tile, so the shape is written down here rather than left to be
+# rediscovered a third time. It comes from the real BSG capture under
+# `data/capture/raid1`, not from reading the client.
 #
-# Two of those three keys are offered by default (`regular` and `pve`), which
-# is two characters. The third is PvP and is off; see `gPvpSeasonSlot`.
+#   SCREEN 1 -- the GAME MODE select, served by `/v2/client/game/profiles/`.
+#   A `Dictionary<EGameMode, ...>` whose three keys are fixed by the enum. The
+#   real server sends exactly **two fields** per entry (`responses/048.json`):
 #
-# An unbounded roster inside ONE mode is not expressible in this dictionary at
-# all, and would need slot views injected into the client's own UI on the Unity
-# thread. That is not what this does, and the honest ceiling is two.
+#       "regular": {"SeasonalInfo": null, "status": "empty"}
+#
+#   No uid, no nickname, no level, nothing nested. It is not a character list
+#   and cannot be made into one -- there is no field to put a character in.
+#
+#   SCREEN 2 -- the CHARACTER select, served by `/client/game/profile/list`.
+#   A flat, **unbounded** JSON array of whole profile documents. Clicking one
+#   posts `/client/game/profile/select` with its `uid`. This is where every
+#   character lives and it has no cap and no mode key in it at all.
+#
+# The census settles it: across the 506-request capture,
+# `/v2/client/game/profiles/` is fetched **once**, while
+# `/client/game/profile/list` is fetched **seven** times, each followed by a
+# `select` -- and coming back from a raid the client runs
+# `profile/list` -> `select` with no mode dictionary and no `/client/game/mode`
+# anywhere between them (seq 204 -> 208 -> 266).
+#
+# So the roster is bounded by taste, not by the protocol. A mode may hold as
+# many characters as `gMaxCharacters` allows; `profileMode` is *our* tag saying
+# which mode a character belongs to (real BSG profiles carry no such field), and
+# it decides which mode tile previews it -- nothing more.
+#
+# Two of the three mode keys are offered by default (`regular` and `pve`). The
+# third is PvP and is off; see `gPvpSeasonSlot`. That lock is a `status:"locked"`
+# entry on screen 1 and is unrelated to how many characters exist.
 
 proc offeredModes(): seq[string] =
   ## The modes this server puts on the character screen at all, in the order the
@@ -591,9 +621,14 @@ proc modeOffered(mode: string): bool =
   result = false
 
 proc profileInMode(mode: string): Profile =
-  ## The character occupying one slot, or a not-ok profile when the slot is
-  ## free. First match wins; two profiles tagged to one mode is a store somebody
-  ## edited by hand, and showing the first beats refusing the screen.
+  ## A character tagged to this mode, for the mode tile's preview on SCREEN 1.
+  ##
+  ## First match wins, and with a roster that may now hold several characters in
+  ## one mode that is a genuine choice rather than a tolerated oddity: screen 1
+  ## has room for exactly one character per mode and the client paints the bound
+  ## profile over the tiles anyway. Which one previews here decides nothing --
+  ## the actual roster is SCREEN 2's `/client/game/profile/list`, which carries
+  ## all of them.
   result = Profile(id: "", text: "", ok: false)
   let ids = allProfileIds()
   for id in ids:
@@ -602,27 +637,47 @@ proc profileInMode(mode: string): Profile =
       return p
 
 proc rosterCount(): int =
-  ## Characters that occupy an offered slot. Not `allProfileIds().len`: a
-  ## profile tagged to a mode this server no longer offers is still on disk and
-  ## still readable, and counting it toward the cap would lock a slot the player
-  ## can actually see in favour of one they cannot.
+  ## How many characters exist. Every profile in the store, because every one of
+  ## them is on the character screen: `/client/game/profile/list` sends the whole
+  ## array and does not filter by mode.
+  ##
+  ## This used to count *occupied mode slots* -- at most three, and in practice
+  ## two -- which is what made a third character impossible to create however
+  ## high `gMaxCharacters` was set. The cap and the mode keys are now unrelated,
+  ## because on the wire they always were.
   result = 0
-  let modes = offeredModes()
-  for m in modes:
-    if profileInMode(m).ok:
+  let ids = allProfileIds()
+  for id in ids:
+    if loadProfile(id).ok:
       inc result
 
 proc creationAllowedIn(mode: string): bool =
-  ## Whether the "+" may be shown for one slot, and whether a create posted
-  ## against it may proceed. The same predicate for both, on purpose: a screen
-  ## that offers what the route then refuses is a screen that lies.
+  ## Whether a character may be created into this mode. The same predicate is
+  ## read by the screen and by the route that a create posts to, on purpose: a
+  ## screen that offers what the route then refuses is a screen that lies.
+  ##
+  ## Note what is NOT here any more: `profileInMode(mode).ok`. A mode that
+  ## already holds a character used to refuse the next one, which is the whole
+  ## bug -- `/client/game/profile/list` is an array and one mode may hold as many
+  ## characters as the cap allows.
   if not gCreationAllowed: return false
   if not modeOffered(mode): return false
-  if profileInMode(mode).ok: return false
   result = rosterCount() < gMaxCharacters
 
 proc firstFreeMode(): string =
-  ## The slot a create lands in when nothing has said which. See `gSessionMode`.
+  ## The mode a create lands in when nothing has said which.
+  ##
+  ## The session's own mode first -- `/client/game/mode` is the last thing that
+  ## named which tile the player is standing in (see `gSessionMode`), and a
+  ## create arriving without a mode of its own came from that one. Only when the
+  ## session has named nothing usable does this fall back to the first offered
+  ## mode, which for the SPT mod is the PvE one.
+  ##
+  ## It returns "" only when creation is refused outright -- the cap is full or
+  ## the switch is off -- and no longer when "every slot is taken", because
+  ## slots are not what fills up now.
+  if gSessionMode.len > 0 and creationAllowedIn(gSessionMode):
+    return gSessionMode
   let modes = offeredModes()
   for m in modes:
     if creationAllowedIn(m):
@@ -668,8 +723,18 @@ proc vacantSlot(status: string): JsonObject =
 
 
 proc onProfilesV2(url, body, session: string): string =
-  ## `/v2/client/game/profiles/` -- the character-select bootstrap, and the only
-  ## place multi-character is decided.
+  ## `/v2/client/game/profiles/` -- the GAME MODE select. **SCREEN 1.**
+  ##
+  ## It is not the character screen and multi-character is not decided here;
+  ## that is `/client/game/profile/list` (SCREEN 2), and the note above
+  ## `profileInMode` has the capture evidence for the split. What this route
+  ## decides is which of the three mode tiles are enterable.
+  ##
+  ## The real server sends **two fields** per entry -- `status` and
+  ## `SeasonalInfo` (`data/capture/raid1/responses/048.json`). The richer shape
+  ## below is a superset, which deserialises the same; the character in it is
+  ## decoration for the tile, and the client paints the bound profile over every
+  ## tile regardless, which is why one character used to appear on all three.
   ##
   ## Post-1.0 deserialises `data` into
   ## `Dictionary<EGameMode, CharacterSelectionProfileData>` and drives
@@ -686,13 +751,21 @@ proc onProfilesV2(url, body, session: string): string =
   ## a second character could never be shown and the "+" could never appear once
   ## one existed. Now every key is emitted and resolved on its own:
   ##
-  ##   a character is tagged to this mode  -> `available`, the playable slot
-  ##   the slot is free and creation is on -> `empty`, which IS the "+"
+  ##   a character is tagged to this mode  -> `available`, an enterable tile
+  ##   the mode is offered and creation on -> `empty`, ALSO an enterable tile
   ##   otherwise                           -> `locked`, a greyed tile
   ##
-  ## Selecting between them needs nothing further from this server: clicking a
-  ## slot posts `/client/game/profile/select`, which rebinds the session. That
-  ## is the in-game character switch, and it is why there is no second selector
+  ## `empty` does NOT mean "add a character here". The capture shows `regular`
+  ## answered `{"SeasonalInfo":null,"status":"empty"}` on a brand-new account and
+  ## the client entering it and going on to the character screen; it means "no
+  ## character tagged to this mode yet". Reading it as a "+" is what produced a
+  ## mode selector pretending to be a character list.
+  ##
+  ## Picking a tile posts `/client/game/mode` and then the menu bundle, which
+  ## contains `/client/game/profile/list` -- SCREEN 2, where the character is
+  ## actually chosen with `/client/game/profile/select`. That is the in-game
+  ## character switch (the menu's own "CHANGE PROFILE" button returns to it),
+  ## and it is why there is no second selector
   ## in the launcher.
   var modes = obj()
   # Every key EGameMode has, always, and in this order. Bound to a `let` before
@@ -814,7 +887,7 @@ proc onProfileCreate(url, body, session: string): string =
     if rosterCount() >= gMaxCharacters:
       return failure(1, "this server holds its maximum of " & $gMaxCharacters &
                         " character(s); delete one to make another")
-    return failure(1, "there is no free character slot to create into")
+    return failure(1, "this server offers no mode to create a character in")
 
   var p = createProfile(nickname, sideName, gEdition, nowSeconds(),
                         gStartingRoubles, mode)
@@ -1060,7 +1133,7 @@ proc onLauncherCreate(url, body, session: string): string =
     if rosterCount() >= gMaxCharacters:
       return launcherRefusal("this server holds its maximum of " &
                              $gMaxCharacters & " character(s)")
-    return launcherRefusal("there is no free character slot to create into")
+    return launcherRefusal("this server offers no mode to create a character in")
   var p = createProfile(nickname, sideName, edition, nowSeconds(),
                         gStartingRoubles, mode)
   if not p.ok:
@@ -1144,7 +1217,9 @@ proc onLauncherCreationSession(url, body, session: string): string =
   if not gCreationAllowed:
     return launcherRefusal("character creation is switched off on this server")
   if firstFreeMode().len == 0:
-    return launcherRefusal("every character slot on this server is taken")
+    return launcherRefusal("this server holds its maximum of " &
+                           $gMaxCharacters & " character(s), or offers no " &
+                           "mode to create one in")
   let token = newId()
   var o = obj()
   put(o, "ok", true)
@@ -3076,14 +3151,16 @@ proc tarkovSchema(): seq[Setting] =
                 category = "Characters",
                 description = "Off hides the create slot in game and refuses " &
                               "every create route"),
-    intSetting("maxCharacters", "Maximum characters", 2, lo = 1, hi = 3,
+    intSetting("maxCharacters", "Maximum characters", 8, lo = 1, hi = 32,
                category = "Characters",
-               description = "The character screen is keyed by game mode, so " &
-                             "three is the ceiling the client can show"),
-    boolSetting("pveSlotEnabled", "Offer the PvE character slot", true,
+               description = "How many characters the roster may hold. The " &
+                             "character screen is a flat list, not the game " &
+                             "mode tiles, so this is taste and not a client " &
+                             "limit"),
+    boolSetting("pveSlotEnabled", "Offer the PvE game mode", true,
                 category = "Characters",
-                description = "The second character slot. Everything this " &
-                              "server runs is PvE"),
+                description = "Whether the PvE mode tile is enterable. " &
+                              "Everything this server runs is PvE"),
     boolSetting("pvpSeasonSlotEnabled", "Offer the seasonal PvP slot", false,
                 category = "Characters",
                 description = "Off by design: there is no second player on " &
@@ -3157,9 +3234,14 @@ proc onLoad(): Status =
   # The character-creation gate. Read here so every path -- the in-game "+", the
   # create route behind it, and the launcher -- gets its answer from one place.
   gCreationAllowed = setting("characterCreationAllowed").asBool(true)
-  gMaxCharacters = setting("maxCharacters").asInt(2)
+  # The clamp used to be 1..3, on the belief that the character screen was the
+  # three-key mode dictionary. It is not -- it is `/client/game/profile/list`, a
+  # flat unbounded array -- so the old ceiling was silently capping the roster at
+  # three however this was set, and at two in practice. 32 is a guard against a
+  # runaway create loop filling the store directory, not a protocol limit.
+  gMaxCharacters = setting("maxCharacters").asInt(8)
   if gMaxCharacters < 1: gMaxCharacters = 1
-  if gMaxCharacters > 3: gMaxCharacters = 3
+  if gMaxCharacters > 32: gMaxCharacters = 32
   gPveSlot = setting("pveSlotEnabled").asBool(true)
   gPvpSeasonSlot = setting("pvpSeasonSlotEnabled").asBool(false)
   gInsurancePercent = setting("insurancePercent").asInt(10)
