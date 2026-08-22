@@ -486,6 +486,76 @@ var gPort = 6969
 # the read side of it. It was a plain `var` incremented from every worker.
 proc gRequests(): int = int(cReqRead())
 
+# ------------------------------------------------------- the wire probe
+#
+# `nettrace.log` is a SOCKET trace: it records accepts, handshakes and request
+# LINES, and no body ever reaches it. That is enough to recover the order the
+# client asks things in -- which is how the two-screen character flow was found
+# -- and it is not enough to answer a single question about field names, because
+# the fields are inside bodies it does not carry.
+#
+# This is the missing half. Bodies are zlib-framed on the wire both ways, so the
+# only place a readable one exists is here, between `inflateBody` and the
+# handler: `req.body` is plain JSON at the dispatch site and the string the
+# handler returns is plain JSON before `sendResponse` deflates it.
+#
+# It is off unless the file `<root>/wireprobe.on` exists, checked ONCE at boot
+# rather than per request -- a `CreateFile` on every dispatch is real time on a
+# server that answers a hundred routes in a burst, and the answer cannot change
+# usefully mid-run anyway. Turning it on is `type nul > wireprobe.on` in the
+# install root and a restart.
+#
+# Only an allowlist of prefixes is dumped. Probing everything would put a 4 MB
+# `/client/items` and a 41 MB database read through the logger and drown the six
+# lines anybody is reading it for; and the routes that matter for a character
+# flow are all small.
+var gProbe = false
+
+const ProbeRoutes = [
+  "/client/game/mode",
+  "/client/game/config",
+  "/v2/client/game/profiles",
+  "/client/game/profile/list",
+  "/client/game/profile/select",
+  "/client/game/profile/create",
+  "/client/customization/storage",
+  "/client/game/start"
+]
+
+const ProbeCap = 6000
+  ## Characters of one body written before it is cut. A profile document runs to
+  ## tens of kilobytes and none of the questions this answers are past the first
+  ## few thousand characters; an uncapped dump would make the log unreadable in
+  ## exchange for nothing.
+
+proc probeWanted(url: string): bool =
+  ## Whether this url is on the allowlist. Prefix match, because the client
+  ## sends `/v2/client/game/profiles/` with a trailing slash and several routes
+  ## carry an id or a query after the path.
+  if not gProbe: return false
+  for p in ProbeRoutes:
+    if url.len >= p.len and url.substr(0, p.len - 1) == p:
+      return true
+  result = false
+
+proc probeCut(s: string): string =
+  ## The body, cut to `ProbeCap` and said so. Newlines are flattened: the log is
+  ## line-oriented and a body that spans lines cannot be grepped out of it.
+  var t = if s.len > ProbeCap: s.substr(0, ProbeCap - 1) & "...<cut>" else: s
+  result = ""
+  for ch in t:
+    result.add (if ch == '\n' or ch == '\r': ' ' else: ch)
+
+proc probeReq(url, session, body: string) =
+  if not probeWanted(url): return
+  modhost.info("PROBE REQ  " & url & " sess=" & session &
+               " len=" & $body.len & " body=" & probeCut(body))
+
+proc probeRes(url, body: string) =
+  if not probeWanted(url): return
+  modhost.info("PROBE RES  " & url & " len=" & $body.len &
+               " body=" & probeCut(body))
+
 # --------------------------------------------------------------- bytes
 #
 # `toBytes` / `fromBytes` live in `wire.nim` now and go through `copyMem`.
@@ -1328,7 +1398,11 @@ proc handleRequest(sock: uint64; buf: HostPtr; len: int32;
   # DIAGNOSTIC: every dispatched request, so a menu that stalls names what it
   # was last waiting on. Remove once the freeze is understood.
   modhost.info("REQ " & req.verb & " " & req.url)
+  probeReq(req.url, req.session, req.body)
   let served1 = runRoute(route, req, body)
+  # After the handler, before `sendResponse` deflates it -- this is the last
+  # point at which the answer is readable text.
+  if served1: probeRes(req.url, body)
   perfAdd(PhaseRoute, tRoute)
   modhost.modLeave(route.modIndex)
   if slot >= 0'i32:
@@ -2059,6 +2133,9 @@ proc main(): int =
   # crash name its own faulting address. See the emit block above.
   cCrashSetLog(cast[HostPtr](readRawData(logPath)), int32(logPath.len))
   cCrashInstall()
+
+  # The wire probe, decided once. See `gProbe` above.
+  gProbe = exists(joinPath(gRoot, "wireprobe.on"))
 
   console.heading "aowlspt-backend"
   console.line "  root  " & gRoot
