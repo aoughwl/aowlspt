@@ -390,6 +390,14 @@ var gVerTmp: Il2CppPtr = nil
 var gVerApplies = 0
 var gVerFrames = 0
 var gVerSaid = false
+## Faults during the WALK are counted separately from successful applies.
+## They are not the same event and must not share a budget: the first
+## version spent all eight APPLY attempts on walk faults between 20s and
+## 29s -- before the menu existed at all -- and then had nothing left for
+## the moment the label finally appeared. A feature that gives up before
+## its target exists has not failed; it was asked too early.
+var gVerWalkFaults = 0
+const VerBrandMaxWalkFaults = 40
 var gVerStock = ""
 
 proc verTrim(s: string): string =
@@ -431,15 +439,23 @@ proc verBrandCompose(stock: string): string =
   if m.len > 0:
     result = result & " | " & m
 
+## WHY the last walk gave up, so a silent nil becomes a sentence. Without
+## this the feature could fail forever saying nothing at all: resolve
+## returning nil is not a fault, so no guard reports it, and the tick just
+## quietly does nothing every frame.
+var gVerWhy = ""
+
 proc verBrandResolve(): Il2CppPtr =
   ## Walk the fixed path to the label, from the PreloaderUI the rider gives us.
   ## Each hop is checked by NAME, so a build that moved the label declines
   ## loudly instead of writing into whatever happens to sit at that index.
   result = nil
   if gInspPreloader == nil or not duOk(gInspPreloader, 0x20'i32):
+    gVerWhy = "no live PreloaderUI anchor yet"
     return
   var t = iToTransform(gInspPreloader)
   if t == nil:
+    gVerWhy = "PreloaderUI has no reachable Transform"
     return
   # LOOK DOWN, NOT UP. Measured, because the first version guessed and found
   # nothing: `Component::get_transform` on the PreloaderUI gives the SCENE ROOT
@@ -461,33 +477,59 @@ proc verBrandResolve(): Il2CppPtr =
           bottom = modsChildNamed(c, "BottomPanel")
         i = i + 1
   if bottom == nil:
+    gVerWhy = "no 'BottomPanel' under the PreloaderUI or its children"
     return
   let content = modsChildNamed(bottom, "Content")
   if content == nil:
+    gVerWhy = "no 'Content' under BottomPanel"
     return
   let upper = modsChildNamed(content, "UpperPart")
   if upper == nil:
+    gVerWhy = "no 'UpperPart' under Content"
     return
   let alpha = modsChildNamed(upper, "AlphaLabel")
   if alpha == nil:
+    gVerWhy = "no 'AlphaLabel' under UpperPart"
+    return
+  # LIVENESS BEFORE THE ICALL. `Component::get_gameObject` is an IL2CPP
+  # internal-call wrapper: it dereferences m_CachedPtr at +0x10 and, when
+  # that is zero, faults INSIDE Unity's C++ where no guard of ours reaches.
+  # Measured -- the breadcrumb named this exact hop, at 18s, on an
+  # AlphaLabel that EXISTS in the hierarchy but whose native half is not up
+  # yet. Unity's 'fake null': a perfectly good managed wrapper over nothing.
+  if not iUnityAlive(alpha):
+    gVerWhy = "AlphaLabel exists but its native half is null (not live yet)"
     return
   let go = iGameObjectOf(alpha)
   if go == nil:
+    gVerWhy = "AlphaLabel has no reachable GameObject"
     return
+  gVerWhy = "AlphaLabel has no TextMeshProUGUI"
   result = modsComponent(go, "TextMeshProUGUI")
+  if result != nil:
+    gVerWhy = ""
 
 proc verBrandTickBody() =
-  ## Cheap: one counter until the interval elapses, then at most one guarded
-  ## string read.
-  if not gVerOn or gVerApplies >= VerBrandMaxApplies:
-    return
-  inc gVerFrames
-  if gVerFrames < VerBrandEveryFrames:
-    return
-  gVerFrames = 0
+  ## The guarded half. NO THROTTLE HERE -- the entry point owns it.
+  ##
+  ## When this was split into entry + body the frame counter was left in
+  ## BOTH, and the two cancelled each other exactly: the entry counted to
+  ## 120 and reset to 0, then this incremented to 1 and returned because
+  ## 1 < 120. Every frame. The feature was armed, the guard was entered,
+  ## nothing faulted, and the label never changed -- a silent no-op with no
+  ## failure path to notice, which is the exact shape this codebase keeps
+  ## paying for. A throttle belongs on ONE side of a split, and the side
+  ## that decides whether to enter the guard is the cheap one.
   if gVerTmp == nil or not duOk(gVerTmp, 0xE8'i32):
     gVerTmp = verBrandResolve()
     if gVerTmp == nil:
+      inc gVerWalkFaults
+      if gVerWalkFaults <= 2:
+        okLog "version brand: the label is not reachable yet -- " &
+              gVerWhy & ". Retrying; this is normal before the menu is up."
+      elif gVerWalkFaults == VerBrandMaxWalkFaults:
+        warn "version brand: GIVING UP after " & $gVerWalkFaults &
+             " attempts -- " & gVerWhy & ". The label is stock."
       return                            # menu not up yet; try again later
   let cur = suiReadString(cReadPtrAt(gVerTmp, 0xE0'i32))
   if cur.len == 0:
@@ -528,7 +570,8 @@ proc modsTabTick() =
                   "recorded once both clones exist")
 
 proc verBrandTick() =
-  if not gVerOn or gVerApplies >= VerBrandMaxApplies:
+  if not gVerOn or gVerApplies >= VerBrandMaxApplies or
+     gVerWalkFaults >= VerBrandMaxWalkFaults:
     return
   inc gVerFrames
   if gVerFrames < VerBrandEveryFrames:
@@ -536,6 +579,11 @@ proc verBrandTick() =
   gVerFrames = 0
   gModsBranch = 2
   if cModsGuarded(cast[Il2CppPtr](0)) == nil:
-    inc gVerApplies                     # spend budget so a faulting label stops
-    warn "version brand: the label walk FAULTED and was caught; the game " &
-         "survived. One of the eight attempts has been spent."
+    inc gVerWalkFaults
+    # NAME THE HOP. A caught fault with no location is precisely what costs
+    # cycles here, and the breadcrumb is already being written for us.
+    if gVerWalkFaults <= 3:
+      warn "version brand: the label walk FAULTED and was caught; the game " &
+           "survived. LAST HOP: " & readCString(cInspCrumb()) & "  at " &
+           iPtr(cInspCrumbPtr()) & ". Expected before the menu exists; it " &
+           "retries (" & $gVerWalkFaults & " of " & $VerBrandMaxWalkFaults & ")"
