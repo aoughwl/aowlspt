@@ -455,6 +455,25 @@ static const AowlDuTarget aowl_du_targets[] = {
     { "UnityEngine.UI.Graphic::set_raycastTarget", 0x53AD7F0u,
       { 0x48,0x89,0x5C,0x24,0x10,0x57,0x48,0x83,0xEC,0x20,0x80,0x3D,0xDA,
         0x95,0xD2,0x01 }, 16 },
+
+    /* UnityEngine.Behaviour::set_enabled(bool) -- instance, 1 bool.
+     *
+     * THE ROOT OF THE WHOLE CANVAS SAGA. The version label's own GameObject
+     * carries a nested `Canvas`, so `Object::Instantiate` copies that Canvas
+     * onto every clone -- which is why the clone reported a DIFFERENT canvas
+     * pointer no matter what we parented it to, including the source's own
+     * parent. It was never a parenting problem.
+     *
+     * A `Canvas` is a `Behaviour`, so disabling it through this setter makes
+     * the clone's graphics fall through to the nearest enabled ancestor canvas
+     * -- the source's -- without destroying anything. Disable rather than
+     * Destroy on purpose: Destroy on a component of a live UI object is the
+     * riskier operation, and a disabled component is reversible.
+     * Type 23083 UnityEngine.Behaviour, rid 2655, RVA 0xC4C760, section
+     * `il2cpp`. */
+    { "UnityEngine.Behaviour::set_enabled", 0xC4C760u,
+      { 0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,
+        0x4F,0x7D,0x48 }, 16 },
 };
 
 #define AOWL_DU_TARGET_COUNT \

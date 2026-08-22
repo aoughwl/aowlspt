@@ -271,6 +271,33 @@ var gSuiTabFires = 0
 ## the live klass-pointer census: each concrete tab type has its own klass, so
 ## printing them here is how we confirm type identity at runtime without ever
 ## touching reflection. Indexed by ESettingsGroup (0..4).
+# ---------------------------------------------------------------------------
+# THE BREADCRUMB
+#
+# `aowl_p_p_seh` catches a fault and returns nil. That kept the settings screen
+# alive -- and told us nothing whatsoever about WHERE it faulted, so "fault
+# caught in the tab walk" appeared twice, the write side disabled itself for the
+# session, and there was no way to know which hop had done it.
+#
+# So: before every step that dereferences something the game owns, the code
+# leaves a note saying what it is about to touch and with which pointer. The
+# longjmp does not unwind this -- it is an ordinary global -- so the handler's
+# caller can read the note and name the exact hop that died.
+#
+# Declared HERE, in the first of the three settings files, because nimony
+# forward-resolves procs across an `include` boundary but NOT variables, and
+# `settingswrite.nim` and `settingspages.nim` are both included after this one.
+# ---------------------------------------------------------------------------
+var gSwCrumb = "(nothing attempted yet)"
+
+proc swCrumb(what: string) =
+  ## Leave a note about the hop that is about to happen. Cheap: one string
+  ## assignment, and this whole path runs on a tab click, never per frame.
+  gSwCrumb = what
+
+proc swCrumbP(what: string; p: Il2CppPtr) =
+  gSwCrumb = what & " ptr=0x" & hexOf(cast[uint64](p))
+
 var gSuiTabPtr: array[8, uint64]
 var gSuiTabKlass: array[8, uint64]
 
@@ -291,6 +318,7 @@ proc suiTabInitBody(a: Il2CppPtr): Il2CppPtr {.
   # than convert -- a plain int32() of a value above 0x7FFFFFFF would overflow.
   let group = cast[int32](uint32(cRegsInt(regs, 1'i32) and 0xFFFFFFFF'u64))
   inc gSuiTabFires
+  swBeginVisit()
   if gSuiTabFires == 1:
     okLog "settings probe: ShowScreen (postfix) first fired on thread " &
           $tid & " (host thread " & $int(gHostThreadId) & ")" &
@@ -408,8 +436,9 @@ proc settingsTabInitFired(regs: Il2CppPtr) =
   ## kind=7 detour. Runs the walk under the VEH/SEH guard and logs the catch if
   ## it faulted, so the settings screen keeps working either way.
   if cSettingsTabBodyGuarded(regs) == nil:
-    okLog "settings probe: fault caught in the tab walk -- the VEH guard kept " &
-          "the settings screen alive"
+    warn "settings probe: fault caught in the tab walk -- the VEH guard kept " &
+         "the settings screen alive. LAST HOP ATTEMPTED: " & gSwCrumb &
+         ". That is the operation that faulted; everything before it completed."
     # Phase 2 may have been the half that faulted, and it is the half that
     # writes, so it spends a fault from its budget and switches itself off once
     # the budget is gone. The read probe is unaffected.

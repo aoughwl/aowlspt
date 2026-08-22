@@ -72,8 +72,21 @@ var gSwBind = false
 ## body. A write path that faults twice has proved it does not understand this
 ## build, and the right response is to stop writing, not to keep trying every
 ## time the player opens a tab.
-const cSwMaxFaults = 2
+## The fault budget.
+##
+## It used to be TWO, for the whole session. Live, Phase 3 cloned two rows,
+## faulted, and the entire feature switched itself off permanently -- every
+## later tab reported "the Phase-2/3 fault budget is spent". A budget that small
+## is right for a probe that pokes one label and wrong for a renderer that
+## builds dozens of rows: one bad row must not end the session.
+##
+## So the budget is now counted PER TAB VISIT, with a much larger hard ceiling
+## across the session so a genuinely broken build still stops eventually rather
+## than faulting forever.
+const cSwMaxFaultsPerVisit = 4
+const cSwMaxFaultsTotal    = 40
 var gSwFaults = 0
+var gSwVisitFaults = 0
 var gSwOff = false
 
 ## Relabel at most this many controls per tab, so a schema or a match bug cannot
@@ -631,7 +644,7 @@ proc swOnTabBuilt(tabPtr: Il2CppPtr; tabName: string; revisit: bool) =
   ## Phase 2, driven off the same ShowScreen postfix the Phase-1.8 read probe
   ## uses. Does nothing at all unless a flag asks for it and the fault budget is
   ## intact.
-  if gSwOff or tabPtr == nil:
+  if swVisitBlocked() or tabPtr == nil:
     return
   if not (gSwRelabel or gSwBind):
     return
@@ -640,14 +653,40 @@ proc swOnTabBuilt(tabPtr: Il2CppPtr; tabName: string; revisit: bool) =
   if gSwBind and not revisit:
     swBindTab(tabPtr, tabName)
 
+proc swBeginVisit() =
+  ## Called at the top of every settings-postfix firing. Re-arms the per-visit
+  ## budget, so a tab that faulted last time gets a fresh chance this time.
+  ## Only the SESSION ceiling is permanent.
+  gSwVisitFaults = 0
+  gSwCrumb = "(nothing attempted yet on this tab visit)"
+
+proc swVisitBlocked(): bool =
+  ## True when this visit has spent its own budget, or the session ceiling has
+  ## been reached. The distinction matters: the first is temporary and the
+  ## second is not.
+  result = gSwOff or gSwVisitFaults >= cSwMaxFaultsPerVisit
+
 proc swNoteFault() =
-  ## Called when the outer VEH guard caught a fault while Phase 2 was armed.
-  ## Two is the budget: a write path that has faulted twice does not understand
-  ## this build, and the correct response is to stop writing rather than to try
-  ## again every time a tab is opened.
+  ## Called when the outer VEH guard caught a fault while Phase 2/3 was armed.
+  ##
+  ## The old rule was two faults and the feature was over for the session. That
+  ## is what happened live: two rows cloned, a fault, and everything after it
+  ## declined with "the fault budget is spent". A renderer that builds dozens of
+  ## rows needs a budget that survives one bad row, so the per-visit budget stops
+  ## only THIS visit and the session ceiling is set far higher.
   gSwFaults = gSwFaults + 1
-  if gSwFaults >= cSwMaxFaults and not gSwOff:
+  gSwVisitFaults = gSwVisitFaults + 1
+  warn "settings write: fault " & $gSwVisitFaults & " of " &
+       $cSwMaxFaultsPerVisit & " on this tab visit (" & $gSwFaults & " of " &
+       $cSwMaxFaultsTotal & " this session). LAST HOP ATTEMPTED: " & gSwCrumb
+  if gSwFaults >= cSwMaxFaultsTotal and not gSwOff:
     gSwOff = true
-    warn "settings write: DISABLED after " & $gSwFaults & " fault(s). The " &
-         "settings screen keeps working and the game keeps its own labels and " &
-         "values; nothing further is written this session."
+    warn "settings write: DISABLED after " & $gSwFaults & " fault(s) this " &
+         "session -- the session ceiling. The settings screen keeps working " &
+         "and the game keeps its own labels and values; nothing further is " &
+         "written this session."
+  elif gSwVisitFaults >= cSwMaxFaultsPerVisit:
+    warn "settings write: this TAB VISIT has spent its budget and will not " &
+         "write again until the tab is re-opened. The feature is NOT disabled " &
+         "for the session (" & $gSwFaults & " of " & $cSwMaxFaultsTotal &
+         " faults used)."

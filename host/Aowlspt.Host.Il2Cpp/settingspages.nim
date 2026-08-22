@@ -486,6 +486,7 @@ proc swCloneRow(donor, parentGo: Il2CppPtr; text: string): Il2CppPtr =
   let fnInst = mi2Fn(Mi2Instantiate)
   if fnInst == nil or donor == nil:
     return
+  swCrumbP("Object::Instantiate(donor) for row '" & text & "' donor", donor)
   let clone = cMi2CallPS1(fnInst, donor)
   if clone == nil or cIsReadable(clone, cSuiOffCtrlValue() + 8'i32) == 0'i32:
     warn "settings pages: Instantiate returned nothing usable for row '" &
@@ -500,6 +501,8 @@ proc swCloneRow(donor, parentGo: Il2CppPtr; text: string): Il2CppPtr =
          " parentGo=0x" & hexOf(cast[uint64](parentGo)) &
          "); the clone is left unparented and is NOT drawn"
   else:
+    swCrumbP("Component::get_gameObject(clone) for row '" & text & "' clone",
+             clone)
     let cloneGo = cMi2CallPP(fnGo, clone)
     if cloneGo == nil:
       warn "settings pages: Component::get_gameObject on the clone for row '" &
@@ -507,18 +510,25 @@ proc swCloneRow(donor, parentGo: Il2CppPtr; text: string): Il2CppPtr =
     else:
       let fnPar = mi2Fn(Mi2SetParentAlign)
       if fnPar != nil:
+        swCrumbP("SetParentAndAlign(cloneGo, parentGo) for row '" & text &
+                 "' cloneGo", cloneGo)
         cMi2CallVS2(fnPar, cloneGo, parentGo)
       else:
         warn "settings pages: TMP_DefaultControls::SetParentAndAlign did not " &
              "verify on this build; row '" & text & "' cannot be placed"
       let fnAct = mi2Fn(Mi2GoSetActive)
       if fnAct != nil:
+        swCrumbP("GameObject::SetActive(true) for row '" & text & "' cloneGo",
+                 cloneGo)
         cMi2CallVPB(fnAct, cloneGo, 1'i32)
   # The label, by the SAME setter-first path the relabel now uses: a clone
   # inherits the donor's LocalizedText, which would otherwise put the donor's
   # own localised string back over ours the moment the row is enabled.
+  swCrumbP("swControlTmp(clone) -- the label chain for row '" & text &
+           "' clone", clone)
   let tmp = swControlTmp(clone)
   if tmp != nil:
+    swCrumbP("relabel row '" & text & "' tmp", tmp)
     if swRelabelControl(clone, tmp, text):
       okLog "settings pages: cloned row '" & text & "' (control=0x" &
             hexOf(cast[uint64](clone)) & ") labelled via " & gSwLastRoutes
@@ -551,6 +561,85 @@ proc swSeedToggle(control: Il2CppPtr; value: bool): bool =
   cSwCallVPB(fn, widget, (if value: 1'i32 else: 0'i32))
   result = true
 
+## One-shot, so a full page does not print sixty lines.
+var gSwGeomDumped = false
+
+proc swDescribeGo(tag: string; comp: Il2CppPtr) =
+  ## Everything about one row that can decide whether it is on screen. Read-only
+  ## and every call guarded by the same `duOk`/`cIsReadable` discipline the rest
+  ## of this file uses; `comp` is a Component (a SettingControl or a TMP).
+  ##
+  ## This exists because "rows cloned and labelled" and "the user sees nothing"
+  ## are both true at once, and the difference between them is geometry we have
+  ## never once looked at. The rule in this codebase is that the client tells
+  ## you.
+  if comp == nil or cIsReadable(comp, 0x20'i32) == 0'i32:
+    okLog "settings pages/geom " & tag & ": component not readable"
+    return
+  let fnGo = mi2Fn(Mi2GetGameObject)
+  let fnTr = mi2Fn(Mi2GoGetTransform)
+  if fnGo == nil or fnTr == nil:
+    okLog "settings pages/geom " & tag & ": navigation targets unavailable"
+    return
+  swCrumbP("geom dump " & tag & " get_gameObject", comp)
+  let go = cMi2CallPP(fnGo, comp)
+  if go == nil or cIsReadable(go, 0x20'i32) == 0'i32:
+    okLog "settings pages/geom " & tag & ": no readable GameObject"
+    return
+  swCrumbP("geom dump " & tag & " get_transform", go)
+  let t = cMi2CallPP(fnTr, go)
+  okLog "settings pages/geom " & tag & ": comp=0x" & hexOf(cast[uint64](comp)) &
+        " go=0x" & hexOf(cast[uint64](go)) &
+        " name='" & duNameOf(go) & "'" &
+        " activeSelf=" & duDescribeInt(DuGoActiveSelf, go) &
+        " activeInHierarchy=" & duDescribeInt(DuGoActiveInHier, go) &
+        " layer=" & duDescribeInt(DuGoLayer, go)
+  if t != nil and cIsReadable(t, 0x20'i32) != 0'i32:
+    okLog "settings pages/geom " & tag & ": rect=[" & duDescribeRect(t) & "]" &
+          " anchoredPos=" & duDescribeVec2(DuGetAnchoredPos, t) &
+          " sizeDelta=" & duDescribeVec2(DuGetSizeDelta, t) &
+          " anchorMin=" & duDescribeVec2(DuGetAnchorMin, t) &
+          " pivot=" & duDescribeVec2(DuGetPivot, t) &
+          " localPos=" & duDescribeVec3(DuGetLocalPos, t) &
+          " localScale=" & duDescribeVec3(DuGetLocalScale, t)
+    # Two levels of parent, named. If the clone landed somewhere with a zero
+    # rect, or under something inactive, this is where it shows.
+    let fnPar = cDuFn(DuGetParent)
+    if fnPar != nil:
+      swCrumbP("geom dump " & tag & " get_parent", t)
+      let p1 = cDuCallPP(fnPar, t)
+      if p1 != nil and cIsReadable(p1, 0x20'i32) != 0'i32:
+        let p1go = cMi2CallPP(fnGo, p1)
+        okLog "settings pages/geom " & tag & ": parent[0]=0x" &
+              hexOf(cast[uint64](p1)) & " name='" &
+              (if p1go != nil: duNameOf(p1go) else: "") & "'" &
+              " activeSelf=" & duDescribeInt(DuGoActiveSelf, p1go) &
+              " rect=[" & duDescribeRect(p1) & "]" &
+              " localScale=" & duDescribeVec3(DuGetLocalScale, p1)
+
+proc swDumpRowGeometry(donor, clone, parentGo: Il2CppPtr) =
+  ## DONOR vs CLONE, side by side. Whatever differs between a row the game drew
+  ## and a row we drew is the reason ours is not visible.
+  okLog "settings pages/geom: --- donor vs clone, one shot ---"
+  swDescribeGo("DONOR(control)", donor)
+  swDescribeGo("CLONE(control)", clone)
+  let dTmp = swControlTmp(donor)
+  let cTmp = swControlTmp(clone)
+  if dTmp != nil:
+    swDescribeGo("DONOR(label TMP)", dTmp)
+  if cTmp != nil:
+    swDescribeGo("CLONE(label TMP)", cTmp)
+  let fnTr = mi2Fn(Mi2GoGetTransform)
+  if parentGo != nil and fnTr != nil and cIsReadable(parentGo, 0x20'i32) != 0'i32:
+    swCrumbP("geom dump PARENT get_transform", parentGo)
+    let pt = cMi2CallPP(fnTr, parentGo)
+    if pt != nil and cIsReadable(pt, 0x20'i32) != 0'i32:
+      okLog "settings pages/geom PARENT: go=0x" &
+            hexOf(cast[uint64](parentGo)) & " name='" & duNameOf(parentGo) &
+            "' rect=[" & duDescribeRect(pt) & "]" &
+            " activeSelf=" & duDescribeInt(DuGoActiveSelf, parentGo) &
+            " localScale=" & duDescribeVec3(DuGetLocalScale, pt)
+
 proc swRenderPage(tabPtr, parentGo: Il2CppPtr; page: var SwPage): int =
   ## Render one page's rows onto a tab. Returns how many rows were rendered.
   ##
@@ -572,6 +661,7 @@ proc swRenderPage(tabPtr, parentGo: Il2CppPtr; page: var SwPage): int =
   # The heading, cloned from the same donor so it inherits the row styling. It
   # is a toggle underneath, which is not ideal and IS honest: there is no label
   # widget to clone on a settings tab that we can identify without reflection.
+  swCrumb("render the heading row for page '" & page.id & "'")
   discard swCloneRow(donorToggle, parentGo, page.title)
   if page.stub:
     discard swCloneRow(donorToggle, parentGo, page.note & cSwNotDone)
@@ -583,12 +673,22 @@ proc swRenderPage(tabPtr, parentGo: Il2CppPtr; page: var SwPage): int =
     var text = page.rows[i].label
     if not page.rows[i].implemented:
       text = text & cSwNotDone
+    swCrumb("render row " & $i & " of " & $page.rows.len & " ('" & text & "')")
     let clone = swCloneRow(donorToggle, parentGo, text)
     if clone != nil:
       page.rows[i].clone = cast[uint64](clone)
       if page.rows[i].kind == swkToggle:
+        swCrumbP("swSeedToggle for row '" & text & "' clone", clone)
         page.rows[i].seeded = swSeedToggle(clone, page.rows[i].bval)
       result = result + 1
+      # ONE-SHOT GEOMETRY DUMP. Rows are being cloned and labelled and the user
+      # sees nothing, so the next question is WHERE they went -- and that is a
+      # question to ask the client, not to reason about. Dump the donor and the
+      # first clone side by side; every field the two share is inherited and
+      # every field that differs is ours.
+      if not gSwGeomDumped:
+        gSwGeomDumped = true
+        swDumpRowGeometry(donorToggle, clone, parentGo)
     i = i + 1
   okLog "settings pages: page '" & page.id & "' rendered " & $result &
         " row(s) of " & $page.rows.len
@@ -605,6 +705,7 @@ proc swReadBackPage(page: var SwPage) =
   while i < page.rows.len:
     if page.rows[i].clone != 0'u64 and page.rows[i].kind == swkToggle:
       let control = cast[Il2CppPtr](page.rows[i].clone)
+      swCrumbP("read back row '" & page.rows[i].key & "' clone", control)
       var ok = false
       let live = swReadToggle(control, ok)
       if ok and live != page.rows[i].bval:
@@ -639,10 +740,13 @@ proc swPagesOnTabBuilt(tabPtr: Il2CppPtr; tabName: string; revisit: bool) =
             " off=" & (if gSwOff: "true" else: "false") &
             " pages=" & $gSwPages.len &
             " toggleKlass(before census)=0x" & hexOf(gSwKlassToggle)
-  if gSwOff:
+  if swVisitBlocked():
     if gSwPagesOn and gSwPagesFires <= 8:
-      okLog "settings pages: DECLINED -- the Phase-2/3 fault budget is spent " &
-            "(gSwOff); nothing is rendered this session"
+      okLog "settings pages: DECLINED -- " &
+            (if gSwOff: "the SESSION fault ceiling has been reached; nothing " &
+                        "further is rendered this session"
+             else: "this TAB VISIT has spent its fault budget; re-open the " &
+                   "tab to try again (the feature is still armed)")
     return
   if not gSwPagesOn:
     return                              # flag off: silence is the correct answer
