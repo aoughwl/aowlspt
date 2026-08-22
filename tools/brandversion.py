@@ -43,7 +43,34 @@ from inspector import run_batch, Timeout  # noqa: E402
 ROOT = re.compile(r"\[\$r(\d+)\] transform=(0x[0-9a-fA-F]+).*name=\"([^\"]*)\"")
 TEXT = re.compile(r'text = "(.*)"')
 AFTER = re.compile(r'after  = "(.*)"')
-BRAND = "aowlspt — "
+## ASCII ONLY, deliberately. An em dash here round-tripped through the
+## inspector command file and came back as "?" -- so the label really did
+## change, the verify really did fail, and the reported reason ("the game
+## rewrote it") was wrong. Until that channel is proven 8-bit clean end to end,
+## a separator that cannot be mangled is worth more than a prettier one.
+SITE = "aoughwl.com"
+
+## Our version. NOT read from ./VERSION on purpose: that file says 0.1.0 and
+## describes the release BUNDLE, while this label is the thing a player reads
+## on the menu. Override with --version.
+OURVER = "1.0"
+
+
+def compose(stock, ourver):
+    """Build the branded label out of whatever the game actually put there.
+
+    The stock label is "<tarkov version> | <mode>", e.g.
+    "1.1.0.1.46777 | PvE". Both halves are PARSED rather than assumed, so a
+    game update or a different mode carries through untouched instead of
+    freezing a version number into a string that then quietly lies.
+    """
+    parts = [p.strip() for p in stock.split("|") if p.strip()]
+    tarkov = parts[0] if parts else "?"
+    mode = parts[1] if len(parts) > 1 else ""
+    out = "aowlspt %s | %s | tarkov %s" % (ourver, SITE, tarkov)
+    if mode:
+        out += " | " + mode
+    return out
 
 
 def preloader_root():
@@ -77,6 +104,9 @@ def main():
                     help="replace the whole label instead of prefixing it")
     ap.add_argument("--show", action="store_true",
                     help="print the current label and exit")
+    ap.add_argument("--version", default=OURVER,
+                    help="the aowlspt version shown in the label (default %s)"
+                         % OURVER)
     a = ap.parse_args()
 
     try:
@@ -104,7 +134,7 @@ def main():
         if current and current.startswith("aowlspt"):
             print("already branded; nothing to do.")
             return 0
-        want = BRAND + (current or "")
+        want = compose(current or "", a.version)
 
     out = run_batch(["settext %s %s" % (comp, want)], timeout=60, write=True)
     m = AFTER.search(out)
