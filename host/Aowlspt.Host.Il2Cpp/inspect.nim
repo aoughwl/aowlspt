@@ -250,6 +250,16 @@ var gFindActive = false
   ## continues instead of re-walking the nodes it already rejected. Restarting
   ## a capped search from scratch can never reach past the cap, which made the
   ## cap message's own advice impossible to follow.
+var gInspPolls = 0
+  ## Times `inspectPoll` has been ENTERED. If this stops advancing while the
+  ## rider keeps dispatching, the host tick thread is blocked or dead -- a
+  ## completely different fault from anything inside the poll, and one that
+  ## nothing previously distinguished.
+var gInspReads = 0            ## successful reads of the command file
+var gInspReadFails = 0        ## readShared() said no
+var gInspUnchanged = 0        ## read fine, content identical to last time
+var gInspLastQueueMs = 0'u64  ## when a batch was last handed over
+var gInspLastWatchMs = 0'u64  ## rate limit for the watchdog
 var gInspDrainFires = 0
   ## Dispatches that arrived on the IN-RAID anchor (the main drain) rather than
   ## on `PreloaderUI::Update`. Non-zero means the instrument is alive in raid.
@@ -2005,6 +2015,10 @@ proc iCmdState(toks: seq[string]) =
        ", in-raid anchor slot=" & $gInspSlot2 &
        ", dispatches=" & $gInspFires & " (of those in-raid=" &
        $gInspDrainFires & ")")
+  iOut("  channel: polls=" & $gInspPolls & " reads=" & $gInspReads &
+       " readFails=" & $gInspReadFails & " unchanged=" & $gInspUnchanged &
+       " batch=" & $gInspBatch & " ticks=" & $gInspTicks &
+       " faults=" & $gInspFaults & " escapes=" & $gInspEscapes)
   if gInspPreloader == nil:
     iOut("  menu: PreloaderUI anchor is null -- either the menu has not built " &
          "yet, or the session is in a raid (where PreloaderUI does not tick).")
@@ -2740,6 +2754,8 @@ proc inspTick() =
   ## discipline `mainDrain` follows.
   if gInspOff:
     return
+  # Watch the HOST thread from here, because a stuck poll cannot watch itself.
+  inspPollWatchdog()
   # ESCAPE RECOVERY. If a batch is still marked in-flight when the rider is
   # next entered, the previous run did not return normally -- it left through
   # a longjmp, taking the completion handshake with it. An escape cannot log
@@ -2872,6 +2888,36 @@ proc inspWriteOut() =
   for i in 0 ..< lines.len:
     okLog "inspect| " & lines[i]
 
+var gInspPollSeen = 0
+var gInspPollCheck = 0
+
+proc inspPollWatchdog() =
+  ## THE OTHER HALF OF THE WATCHDOG, and the important half.
+  ##
+  ## A poll that is BLOCKED cannot report that it is blocked -- every check
+  ## inside `inspectPoll` is unreachable in exactly the case that matters most.
+  ## So the Unity-thread rider watches the host thread instead: it counts its
+  ## own dispatches, and every ~600 of them (about ten seconds) it asks whether
+  ## `inspectPoll` has been entered at all since the last check.
+  ##
+  ## This is the check that distinguishes the two top-level causes of a dead
+  ## channel, which no previous version could tell apart:
+  ##   poll counter frozen -> the HOST TICK THREAD is stuck or dead, and
+  ##                          nothing inside the inspector is at fault
+  ##   poll counter moving -> the poll runs and is declining to queue, and its
+  ##                          own watchdog line says why
+  inc gInspPollCheck
+  if gInspPollCheck < 600:
+    return
+  gInspPollCheck = 0
+  if gInspPolls == gInspPollSeen:
+    warn "live inspector: the HOST TICK THREAD has not entered inspectPoll " &
+         "in ~600 rider frames, so the command file is not being read at all. " &
+         "The rider is fine (" & $gInspFires & " dispatches); the poll side " &
+         "is stuck. Nothing the inspector does on Unity's thread can fix " &
+         "that -- look at the host tick loop."
+  gInspPollSeen = gInspPolls
+
 proc inspectPoll(now: uint64) =
   ## On the host's own tick thread, from the tick loop. Reads the command file
   ## only when its CONTENT has changed, so an idle session costs one shared
@@ -2881,6 +2927,7 @@ proc inspectPoll(now: uint64) =
   ## on a network or editor-rewritten file is the least reliable thing about
   ## it. To run the same commands twice, change a comment line -- which is what
   ## the shell driver does with a serial number.
+  inc gInspPolls
   if not gInspOn or gInspOff:
     return
   # LATE ARMING OF THE IN-RAID ANCHOR. `bindInspect` runs ONCE, early. If the
@@ -2996,9 +3043,53 @@ proc inspectPoll(now: uint64) =
       cInspUnlock()
     return
   var text = ""
-  if not readShared(gInspCmdPath, text):
+  let readOk = readShared(gInspCmdPath, text)
+  if readOk:
+    inc gInspReads
+  else:
+    inc gInspReadFails
+  let unchanged = readOk and text == gInspLastText
+  if unchanged:
+    inc gInspUnchanged
+
+  # THE WATCHDOG. A channel that stops accepting commands and says nothing is
+  # the exact failure class this instrument exists to abolish, and it has now
+  # happened twice: once when the timeout destroyed early batches, and once
+  # when the poll stopped queueing anything at all. Both times the log was
+  # SILENT, so the only evidence was an absence, and an absence cannot be
+  # debugged.
+  #
+  # So: if the rider is demonstrably alive and no batch has been queued for a
+  # while, say so, and print the state that distinguishes the possible causes
+  # instead of leaving them to be inferred:
+  #   readFails climbing   -> the file cannot be opened (locked, moved, gone)
+  #   unchanged climbing   -> the file IS being read and looks identical, so
+  #                           either the edit is landing somewhere else or the
+  #                           content really is the same
+  #   polls not climbing   -> this line would not print at all, which is
+  #                           itself the answer: the host tick thread is stuck
+  if gInspFires > 0 and gInspLastQueueMs != 0'u64 and
+     now - gInspLastQueueMs > 10000'u64 and
+     (gInspLastWatchMs == 0'u64 or now - gInspLastWatchMs > 15000'u64):
+    gInspLastWatchMs = now
+    warn "live inspector: no batch queued for " &
+         $int((now - gInspLastQueueMs) div 1000'u64) & "s while the rider IS " &
+         "dispatching (" & $gInspFires & " fires). polls=" & $gInspPolls &
+         " reads=" & $gInspReads & " readFails=" & $gInspReadFails &
+         " unchanged=" & $gInspUnchanged &
+         " lastRead=" & $text.len & "B lastKnown=" & $gInspLastText.len & "B" &
+         " pending=" & $int(cInspHave()) & " batch=" & $gInspBatch &
+         " done=" & $gInspBatchDone & " suspended=" & $gInspSuspended &
+         " inFlight=" & $gInspInFlight & "  file=" & gInspCmdPath
+    if gInspReadFails > 0 and not readOk:
+      warn "live inspector: the command file could NOT be opened on this " &
+           "poll. If that persists the channel is dead until it can be read " &
+           "-- check the path above exists and that nothing holds it open " &
+           "without FILE_SHARE_READ."
+
+  if not readOk:
     return
-  if text == gInspLastText:
+  if unchanged:
     return
   gInspLastText = text
   var cmds: seq[string] = @[]
@@ -3027,6 +3118,7 @@ proc inspectPoll(now: uint64) =
   cInspUnlock()
   cInspSetPending(1'i32)
   gInspHandedMs = now
+  gInspLastQueueMs = now
   info "live inspector: batch " & $gInspBatch & " (" & $cmds.len &
        " command(s)) handed to Unity's thread; answers land in " & gInspOutPath
 
