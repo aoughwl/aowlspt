@@ -797,6 +797,45 @@ proc parseInRaid*(doc: string; into: var bool): bool =
   ## than guessing.
   jsonBool(doc, "inRaid", into)
 
+const MenuModeTextMax* = 48
+  ## The longest string the host will carry to the menu's corner label. The
+  ## label is one short line in a corner; a value longer than this is a mistake
+  ## or a mischief, and either way the answer is to refuse it rather than to
+  ## push it at a UI that has to lay it out.
+
+proc parseMenuModeText*(doc: string; into: var string): bool =
+  ## Reads the backend's `menuModeText` out of a client-set poll response — the
+  ## string the main menu's bottom-right corner label should show instead of the
+  ## stock "PVE ZONE".
+  ##
+  ## It rides the same body `parseDesired` validates and `parseInRaid` reads,
+  ## for the same reason: the client host has exactly one route to the backend
+  ## and adding a second would add a second thing that can be down. A caller
+  ## reads it only after `parseDesired` has accepted the document.
+  ##
+  ## Returns false, leaving `into` untouched, for every unhappy case — the field
+  ## absent (an older manager), empty, over-long, or carrying a character that
+  ## has no business in a corner label. That is deliberate and it is the whole
+  ## safety story on this side: the only thing that can move the label is a
+  ## complete document carrying a short, plain, printable string.
+  ##
+  ## PRINTABLE ASCII ONLY. Not squeamishness: the host renders this by allocating
+  ## a managed `System.String` from UTF-8 and the reader that checks it back is
+  ## ASCII-only, so anything else would be written and then read back as a
+  ## mismatch and rewritten on the next frame — a per-frame allocation loop,
+  ## which is the exact shape of a crash this host has already had once.
+  var raw = ""
+  if not pathGet(doc, "menuModeText", raw):
+    return false
+  let v = strip(raw)
+  if v.len == 0 or v.len > MenuModeTextMax:
+    return false
+  for ch in v:
+    if ord(ch) < 0x20 or ord(ch) > 0x7E:
+      return false
+  into = v
+  result = true
+
 proc jsonInt(doc, key: string; into: var int): bool =
   var raw = ""
   if not pathGet(doc, key, raw):

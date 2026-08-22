@@ -561,6 +561,16 @@ proc onProfileSelect(url, body, session: string): string =
   bindSession(session, id)
   success "session " & session & " -> profile " & id & " (" & p.nickname & ")"
 
+  # Name the character for the main menu's bottom-right corner label. The mod
+  # manager holds this and relays it to the client host on the mod-sync poll the
+  # host already makes (see mgr/control.nim), which then calls the game's own
+  # PreloaderUI.SetGameModeText. This is only the DEFAULT -- any mod's
+  # `setMenuModeText` override wins -- and the whole path is off unless the
+  # player set `uxMenuModeText` in aowlspt-host.json. A broadcast nobody is
+  # subscribed to is a no-op, so this costs nothing when the feature is off.
+  if p.nickname.len > 0:
+    discard broadcast("aowlspt.menu.nickname", objOf("nickname", p.nickname))
+
   # Insurance returns are checked at login as well as on a timer. A server that
   # was switched off when a return came due must still deliver it, and a timer
   # alone never does.
