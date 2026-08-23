@@ -1343,6 +1343,10 @@ var gModsOn = false
 ## that can read null.
 var gModsLastTabPtr: Il2CppPtr = nil
 var gModsLastTabName = ""
+## The POLLING version brand and the seasons-banner hider. Both live in
+## `modstab.nim` and ride the same detour; both default OFF.
+var gVerOn = false
+var gSeasonsOn = false
 
 var gCodeGenProbeSlot = -1
   ## THE FOURTH RIDER on `EFT.UI.PreloaderUI::Update`, armed only by
@@ -3025,7 +3029,7 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     # THE MODS TAB, the fifth rider. Aliased onto whichever slot was claimed, so
     # it costs one integer compare when it is off and never a second detour.
     if i == gModsSlot:
-      modsTabTick()
+      modsRidersTick()
     return 0'i32
   # The overlay's GameWorld cache: one register read, nothing walked, never a
   # suppression of RegisterPlayer.
@@ -3150,7 +3154,7 @@ proc patchReturned(slot: int32; regs: Il2CppPtr): int32 {.
     if i == gInspSlot:
       inspectFired(regs)
     if i == gModsSlot:
-      modsTabTick()
+      modsRidersTick()
     return 0'i32
   # Phase 1.5 native-settings control probe, by identity and for the same reason:
   # a host drain (meth == nil) whose whole point is to read AFTER the original
@@ -6604,6 +6608,41 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   gVersionWrite = readBoolKey("uxVersionBrandWrite")
   if gVersionWrite:
     gVersionBrand = true          # the write path needs the probe armed
+  # THE BRAND THAT ACTUALLY SHOWS. `uxVersionBrand` now also arms the POLLING
+  # brand in `modstab.nim`, which walks to AlphaLabel -- the label really on
+  # screen -- and writes through the game's own setters.
+  #
+  # ONLY ONE WRITER. The old Awake probe stays, flag-gated and READ-ONLY: its
+  # write half is forced off here, because two features both claiming to brand
+  # a version label is how the human was told once that this worked when it did
+  # not. Nothing is deleted; the old path simply cannot write while this is on.
+  gVerOn = readBoolKey("uxVersionBrand")
+  if gVerOn and gVersionWrite:
+    gVersionWrite = false
+    info "uxVersionBrandWrite has been turned OFF: the polling brand in " &
+         "modstab.nim owns the version label now (it walks to AlphaLabel and " &
+         "writes through LocalizedText::SetLabelText / TMP_Text::set_text). " &
+         "The old field-write probe aimed at an object whose m_text is EMPTY, " &
+         "which is why it never visibly worked; it stays armed READ-ONLY."
+  if gVerOn:
+    info "uxVersionBrand is set: the host polls for " &
+         "<PreloaderUI>/BottomPanel/Content/UpperPart/AlphaLabel -- the label " &
+         "actually on screen -- and rewrites it to \"aowlspt <ver>, " &
+         "aoughwl.com  -  tarkov <ver> | <mode>\", carrying both halves of " &
+         "the stock text through. It REFUSES to write to a label whose text " &
+         "reads empty, because an empty label is the fingerprint of the wrong " &
+         "object. It rides the shared PreloaderUI::Update detour on a " &
+         "120-frame throttle and gives up after 8 applies."
+  # THE MAIN-MENU SEASONS BANNER (`uxHideSeasons`). Default OFF.
+  gSeasonsOn = readBoolKey("uxHideSeasons")
+  if gSeasonsOn:
+    info "uxHideSeasons is set: the host switches off " &
+         "Common UI/MenuScreen/SeasonsButton -- the KORD BREACH / Season " &
+         "banner above Play -- because seasons do not apply to single-player. " &
+         "It is found STRUCTURALLY (the banner carries no matching text at " &
+         "all) and re-checked on a 120-frame throttle so a menu rebuild is " &
+         "hidden again. It only ever sets active=false, never true, and it " &
+         "does nothing at all if that child is not there."
   if gVersionBrand:
     info "uxVersionBrand is set: a postfix detour on PreloaderUI.Awake will " &
          "probe the version label on the Unity thread" &
@@ -6820,7 +6859,7 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       # on `EFT.UI.PreloaderUI::Update`, so by here any of the other four may
       # have claimed the slot and this aliases onto it for free. It never
       # attaches a detour of its own.
-      if gModsOn:
+      if gModsOn or gVerOn or gSeasonsOn:
         discard bindModsTab(true)
 
   let modsDir = joinPath(gDir, "mods")
