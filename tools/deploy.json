@@ -34,7 +34,8 @@
         "uxVersionBrand",
         "unlimitedBots",
         "invoke2",
-        "anti-cheat:"
+        "anti-cheat:",
+        "components EXPR [BaseType]"
       ]
     },
     {
