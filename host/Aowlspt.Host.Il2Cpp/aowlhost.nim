@@ -92,6 +92,16 @@ import invoke
 ## including a BE RVA known independently from `aowlspt_beclient.h`. See
 ## `aowlspt_codegen.h` for the chain and for the safety argument.
 {.emit: """#include "aowlspt_codegen.h" """.}
+## NAME -> RVA, from an index generated OFFLINE. The codeGenModule table above
+## is sound, but it is indexed by a method's token RID, and getting a RID needs
+## a readable `MethodInfo` -- which this build does not give us: 6/6 probed
+## MethodInfos were unreadable on the host thread AND 6/6 on the Unity main
+## thread, so it is not thread affinity, it is simply unavailable. Every input
+## to that resolution IS available offline, so `tools/il2cpp_nameindex.py` does
+## the whole walk on the build machine (importing `tools/il2cpp_resolve.py`
+## rather than reimplementing it) and freezes it into a sorted binary index that
+## `aowlspt_nameindex.h` binary-searches. It calls nothing in IL2CPP at all.
+{.emit: """#include "aowlspt_nameindex.h" """.}
 ## ORIGINAL PROLOGUE BYTES, snapshotted once before any detour is installed.
 ## Included FIRST of the target-owning headers, because every one of them
 ## verifies through it. Two features that share a target used to be unable to
@@ -3387,6 +3397,82 @@ proc auditCodeGen(m: Il2CppMethod; spec: string; live: Il2CppPtr) =
          "codeGenResolve must stay OFF. Running totals same=" &
          $int(cCodeGenAgreeSame()) & " diff=" & $int(cCodeGenAgreeDiff())
 
+## ## The offline name index
+##
+## `aowlspt_nameindex.h` holds the argument; this is the Nim face of it. It
+## answers exactly one question -- "what RVA does this name have" -- from a file
+## generated on the build machine, and it touches nothing in IL2CPP.
+##
+## It is NOT a binder. Turning an RVA into something safe to patch means the
+## prologue byte-verify against the startup snapshot, the `VirtualQuery` and the
+## il2cpp-section check, and that mechanism is owned by the by-RVA path. There
+## is no second copy of it here, on purpose.
+proc cNameIdxInit(dir: cstring): int32 {.importc: "aowl_nameidx_init", nodecl.}
+proc cNameIdxReady(): int32 {.importc: "aowl_nameidx_ready", nodecl.}
+proc cNameIdxCount(): int32 {.importc: "aowl_nameidx_count", nodecl.}
+proc cNameIdxReason(): cstring {.importc: "aowl_nameidx_reason", nodecl.}
+proc cNameIdxImageKey(): uint64 {.importc: "aowl_nameidx_imagekey", nodecl.}
+proc cNameIdxLookup(spec: cstring; arity: int32): uint32 {.
+  importc: "aowl_nameidx_lookup", nodecl.}
+
+var gNameIndex = false
+var gNameIdxMisses = 0
+const NameIdxMissCap = 32
+
+proc nameIndexRva(spec: string; arity: int32): uint32 =
+  ## The RVA for `spec`, or 0. `arity` is -1 for "the only overload", which
+  ## answers ONLY where the generator found exactly one -- an overloaded name
+  ## like `UnityEngine.AssetBundle::LoadAsset` (0x5250100 and 0x5250340) returns
+  ## 0 here rather than picking one, and the caller must say which it means.
+  ##
+  ## Every refusal names the check that declined, and the misses are capped so a
+  ## mod retrying a bad name cannot fill the log.
+  if not gNameIndex:
+    return 0'u32
+  if cNameIdxReady() == 0'i32:
+    if gNameIdxMisses < NameIdxMissCap:
+      inc gNameIdxMisses
+      warn "name index: cannot answer " & spec & " -- the index is not loaded: " &
+           $cNameIdxReason()
+    return 0'u32
+  # `toCString` wants a mutable string, and the C side only reads it.
+  var key = spec
+  result = cNameIdxLookup(toCString(key), arity)
+  if result == 0'u32 and gNameIdxMisses < NameIdxMissCap:
+    inc gNameIdxMisses
+    warn "name index: no entry for " & spec & " at arity " &
+         (if arity < 0: "any" else: $int(arity)) &
+         ". Either it is absent from this build, or the name is OVERLOADED " &
+         "(the any-arity form is only emitted where there is exactly one " &
+         "overload) -- name the arity explicitly. Or it was DROPPED at " &
+         "generation because two types gave the same name two different RVAs, " &
+         "in which case there is no correct answer to give."
+
+proc nameIndexResolve(spec: string; arity: int32): Il2CppPtr =
+  ## `spec` -> RVA -> a code pointer, by handing the RVA to the by-RVA binder,
+  ## which owns prologue verification and the section checks.
+  ##
+  ## `when declared` rather than a call: the by-RVA binder is landing on a
+  ## parallel branch. Until it is present ABOVE this point in the file, this
+  ## compiles to the refusal below and says so with the RVA it found, so the
+  ## index can be shown to be answering correctly before anything binds.
+  result = cast[Il2CppPtr](0)
+  let rva = nameIndexRva(spec, arity)
+  if rva == 0'u32:
+    return
+  when declared(resolveByRva):
+    result = resolveByRva(rva, arity, spec)
+    if result == nil:
+      warn "name index: " & spec & " is at il2cpp+0x" & hexOf(uint64(rva)) &
+           ", but the by-RVA binder REFUSED that address -- see its own line " &
+           "for which check declined (prologue, VirtualQuery or section). " &
+           "Nothing was patched."
+  else:
+    warn "name index: " & spec & " resolves to il2cpp+0x" & hexOf(uint64(rva)) &
+         ", but this build of the host has no by-RVA binder linked in, so the " &
+         "address is NOT being turned into a patch. This is a REFUSAL, not a " &
+         "resolution failure: the index answered."
+
 proc installPatch(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
                   kind: int32; cb: Il2CppPtr; user: Il2CppPtr;
                   typed: bool): int32 =
@@ -3482,6 +3568,19 @@ proc installPatch(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
   else:
     if gCodeGenResolve:
       fn = resolveCodeGen(m, spec, true)
+    if fn == nil and gNameIndex:
+      # Last, because it is the only source that does not consult the runtime at
+      # all: an RVA frozen offline. It cannot be wrong about THIS build without
+      # the build stamp having been wrong, and it is refused wholesale if it is.
+      #
+      # NOTE for the by-RVA work: resolving `fn` is not on its own enough to
+      # complete a patch here. Everything below still asks the runtime about
+      # `m` -- `postfixRefusal`, `frameKinds`, `methodReturnType`,
+      # `methodIsStatic` -- and on this build `m` is exactly the unreadable
+      # handle that made the index necessary. A by-name PREFIX needs only the
+      # code pointer; a by-name POSTFIX additionally needs its frame shape
+      # DECLARED by the caller, because none of those four can answer.
+      fn = nameIndexResolve(spec, -1'i32)
     if fn == nil:
       gLastError = "could not read a usable code pointer for " & spec &
                    " (methodPointer is null" &
@@ -3823,6 +3922,18 @@ proc resolveDrainPointer(m: Il2CppMethod; spec: string;
            "drain never fired; run with codeGenAudit first if that has not " &
            "been re-tested on this build."
       return viaTable
+  # Before the deep scan for the same reason `resolveCodeGen` is: this is a
+  # RESOLUTION -- an address derived offline from the metadata and stamped to
+  # this exact GameAssembly.dll -- and the scan below is a guess at "some field
+  # that looks like code".
+  if gNameIndex:
+    let viaName = nameIndexResolve(spec, -1'i32)
+    if viaName != nil:
+      warn "name index: binding the drain for " & spec & " at il2cpp+0x" &
+           hexOf(uint64(cIl2cppRvaOf(viaName))) & ", from the offline index " &
+           "(nameIndex is set). The address came from metadata, not from the " &
+           "runtime, and the by-RVA binder byte-verified its prologue."
+      return viaName
   if gDeepScan:
     var off = -1
     let scanned = scanMethodPointer(m, off)
@@ -5682,6 +5793,25 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
     info "codeGenAudit is set: whenever a method has BOTH a live methodPointer " &
          "and a codeGenModule table entry, the host will log whether the two " &
          "agree. Read-only -- it patches nothing."
+  # Default OFF, like every other resolution flag here. Loading is attempted at
+  # this point on purpose: it reads a file and the mapped PE headers, and needs
+  # neither the IL2CPP runtime nor the Unity thread, so a bad index is reported
+  # NOW rather than at first patch. GameAssembly.dll may not be mapped this
+  # early -- that is a refusal with a reason, and it is retried at first use.
+  gNameIndex = readBoolKey("nameIndex")
+  if gNameIndex:
+    if cNameIdxInit(toCString(gDir)) != 0'i32:
+      okLog "nameIndex: loaded aowlspt-names.idx -- " & $int(cNameIdxCount()) &
+            " name->RVA entries, build stamp 0x" &
+            hexOf(cNameIdxImageKey()) & " MATCHES the loaded " &
+            "GameAssembly.dll. Names resolve from metadata frozen offline; " &
+            "nothing here asks IL2CPP, which is the point, since MethodInfo " &
+            "is unreadable on this build. Every address is still prologue " &
+            "byte-verified before anything is patched."
+    else:
+      warn "nameIndex is set but the index was REFUSED: " & $cNameIdxReason() &
+           ". No name will resolve through it; nothing is degraded, and no " &
+           "address from it is being used."
   gCodeGenResolve = readBoolKey("codeGenResolve")
   if gCodeGenResolve:
     # This runs at DLL-attach, BEFORE `waiting for the IL2CPP runtime`. Asking

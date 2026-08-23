@@ -341,6 +341,58 @@ proc abiInclude(e: Env): string =
   ## The nimony hosts and tools `#include` the C shims in `abi/`.
   result = " --passC:-I" & joinPath(e.repo, "abi")
 
+proc nameIndex(e: Env, binDir: string): bool =
+  ## Regenerate `aowlspt-names.idx` beside the host DLL, and -- the part that
+  ## matters -- REFUSE to leave a stale one lying there.
+  ##
+  ## The index is name -> code RVA, frozen from one GameAssembly.dll. A stale
+  ## entry is not a missing function, it is a WRONG-BUT-MAPPED one, which is
+  ## exactly the corruption the host's safety rules exist to prevent. The host
+  ## checks the build stamp at load and refuses the whole file on mismatch, but
+  ## that is the last line, not the first: an index that silently drifts is
+  ## worse than no index, so the drift is caught HERE, at build time, where it
+  ## is cheap.
+  ##
+  ## Three outcomes, and each says which one it took:
+  ##   * inputs present  -> regenerate; a failure FAILS THE BUILD, because the
+  ##     inputs were there and generation had no business failing.
+  ##   * inputs absent, index present -> `check` it against whatever
+  ##     GameAssembly.dll is here; a mismatch FAILS THE BUILD.
+  ##   * inputs absent, no index -> say so and carry on. The host feature is
+  ##     flag-gated default OFF and refuses cleanly with a reason when the file
+  ##     is missing, so a machine without Tarkov installed can still build.
+  let gen = joinPath(e.repo, "tools\\il2cpp_nameindex.py")
+  if not fileExists(gen):
+    return true
+  let idx = joinPath(binDir, "aowlspt-names.idx")
+  var gameasm = getEnv("AOWLSPT_GAMEASM", "")
+  if gameasm.len == 0:
+    gameasm = "D:\\Games\\Tarkov\\GameAssembly.dll"
+  let meta = joinPath(e.repo, ".cache\\global-metadata.dec.dat")
+
+  if fileExists(gameasm) and fileExists(meta):
+    return run(e, "the name->RVA index",
+               "python " & quoted(gen) & " gen " & quoted(gameasm) & " " &
+               quoted(meta) & " " & quoted(idx), e.repo)
+
+  if fileExists(idx):
+    if fileExists(gameasm):
+      return run(e, "the name->RVA index still matches GameAssembly.dll",
+                 "python " & quoted(gen) & " check " & quoted(gameasm) & " " &
+                 quoted(idx), e.repo)
+    info "aowlspt-names.idx is present but GameAssembly.dll is not, so it " &
+         "could NOT be checked for staleness here. The host verifies the " &
+         "build stamp at load and refuses the whole index on mismatch."
+    return true
+
+  info "no aowlspt-names.idx generated: " &
+       (if fileExists(gameasm): "no .cache\\global-metadata.dec.dat (decrypt " &
+                                "it with tools/metablob.py)"
+        else: "no GameAssembly.dll at " & gameasm & " (set AOWLSPT_GAMEASM)") &
+       ". By-name method resolution will be unavailable; the nameIndex flag " &
+       "is default-OFF and declines with a reason, so nothing else changes."
+  return true
+
 proc buildIl2CppHost(e: Env): bool =
   let dir = joinPath(e.repo, "host\\Aowlspt.Host.Il2Cpp")
   let source = joinPath(dir, "aowlhost.nim")
@@ -366,6 +418,8 @@ proc buildIl2CppHost(e: Env): bool =
   cmd.add " -o:" & quoted(outPath)
   cmd.add " " & quoted(source)
   if not run(e, "aowlspt-host-il2cpp", cmd, dir):
+    return false
+  if not nameIndex(e, binDir):
     return false
   result = placeLibrary(dir, "aowlhost", outPath)
 
