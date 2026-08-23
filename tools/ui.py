@@ -709,6 +709,24 @@ def actuate(ptr, ctype="DefaultUIButton", timeout=60):
     did not crash. Every caller must still verify an EFFECT; that is what
     `click_text`'s `expect` predicate is for.
     """
+    # An INACTIVE GameObject accepts the call, does not fault, and the game
+    # ignores it -- so a bare "ok" here is a false positive. Measured live:
+    # MenuScreen/RaidButtonsGroup/DisconnectButton persists into a raid while
+    # inactive, and pressing it reported success twice while the client stayed
+    # in the raid. Refuse by name instead of reporting a success that is not one.
+    try:
+        go = go_of(ptr)
+        act = is_active(go) if go else None
+    except Exception:
+        go, act = None, None
+    if act is False:
+        return False, ("the control exists but its GameObject is INACTIVE "
+                       "(%s) -- nothing was pressed. It is not the control on "
+                       "screen; find the active one." % (go,))
+    if act is None:
+        # Unknown is not permission: say so, and let the caller decide.
+        pass
+
     if ctype == "AnimatedToggle":
         cmds = ["component %s %s" % (ptr, ctype),
                 "call rva:%s v_pb $comp 1" % TOGGLE_SET_ISON_RVA,
