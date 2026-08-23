@@ -49,9 +49,11 @@ slot.
 
 SEASONS
 
-`winter` is EXCLUDED by default: the library has zero snow sets (measured, 0 of 100
-match /snow|winter/), so every winter slice would be replaced by the palest available
-dirt and the map would lose its snow. Pass `--seasons all` to override, knowingly.
+`winter` was EXCLUDED because the library had zero snow sets. That is no longer true:
+the 2026-08-23 drop added 22 Snow sets (Snow001..Snow015 with A/B/C variants), and
+`WINTER_FAMILIES` below routes the winter slices to them. It is still OFF by default
+because the mapping is a judgement and no winter build has been produced or verified.
+Pass `--seasons all` (or `--seasons winter`) to build it, knowingly.
 
 Usage:
   python terrain_build.py --out ../out/terrain-pack [--source-tier auto|1K|2K|4K]
@@ -92,6 +94,44 @@ SLICE_FAMILIES = {
     9:  ('Sand',           ['Ground']),
     10: ('Pebbles_Ground', ['Gravel', 'PavingStones', 'Rock']),
     11: ('Soil_Grass',     ['Ground', 'Grass']),
+}
+
+# Winter override. 2026-08-23: the library gained 22 Snow sets, so winter is no longer
+# refused outright.
+#
+# The mean RGB of all 12 winter HQ slices WAS measured (sharedassets17.assets.resS,
+# read-only) before these were written, so this is not a guess about which layers are
+# actually white:
+#
+#   0 Grass (159,166,175)  1 Ground (183,186,193)   2 Gravel_Road_A (131,123,117)
+#   3 Forest_Ground (138,129,120)  4 Stone_Ground (143,142,140)
+#   5 Rock_Ground (116,115,114)    6 Gravel_Road_B (140,137,137)
+#   7 Gravel (166,166,168)         8 Grassy_Ground (159,166,175)
+#   9 Sand (135,117, 99)          10 Pebbles_Ground (140,138,135)
+#  11 Soil_Grass (119,118,111)
+#
+# Layers 0,1,4,6,7,8,10 are bright and neutral -- snow-covered, and the nearest Snow
+# set lands within dist 2.0..15.6. Layers 2,5,9,11 are NOT: 9 Sand is a warm brown
+# (nearest Snow is dist 43.6) and 5 Rock_Ground is dark (dist 41.1). Those keep their
+# summer families first so the colour picker can choose bare ground where the game
+# itself shows bare ground.
+#
+# What is still a JUDGEMENT: nobody has looked at the IMAGES, only their mean colour,
+# and a snow-dusted gravel road is not the same texture as a snowfield. Winter is
+# OPT-IN (`--seasons winter`) and NO winter build has been produced or verified.
+WINTER_FAMILIES = {
+    0:  ['Snow'],
+    1:  ['Snow'],
+    2:  ['Snow', 'Road', 'Gravel'],
+    3:  ['Snow', 'Ground'],
+    4:  ['Snow', 'Rock', 'Rocks'],
+    5:  ['Rock', 'Rocks', 'Snow'],
+    6:  ['Snow', 'Road', 'Gravel'],
+    7:  ['Snow', 'Gravel'],
+    8:  ['Snow'],
+    9:  ['Ground', 'Snow'],
+    10: ['Snow', 'Gravel'],
+    11: ['Ground', 'Grass', 'Snow'],
 }
 
 ARRAY_RE = re.compile(
@@ -172,8 +212,9 @@ def main():
         sys.exit(f'unknown season(s): {bad}')
     print(f'seasons: {seasons}')
     if 'winter' in seasons:
-        print('  NOTE: winter included. The ambientCG library has ZERO snow sets, so '
-              'winter ground will lose its snow.')
+        print('  NOTE: winter included. 22 Snow sets now exist, and WINTER_FAMILIES '
+              'routes the ground-plane slices to them -- but that mapping is a '
+              'JUDGEMENT and no winter build has been verified yet.')
 
     cat = acg_catalogue()
     by_fam = {}
@@ -245,6 +286,8 @@ def main():
             mip0 = tarray.level_size_dxt5(w, h)
             for i in range(depth):
                 surface, fams = SLICE_FAMILIES[i]
+                if g['season'] == 'winter':
+                    fams = WINTER_FAMILIES[i]
                 orig_fh.seek(base + i * per)
                 orig_img = tarray.decode_dxt5(orig_fh.read(mip0), w, h)
                 target_mean = mean_rgb(orig_img)

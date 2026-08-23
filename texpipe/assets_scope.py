@@ -27,11 +27,11 @@ Two constraints specific to the in-place `.resS` method:
     qualify. Anything else is refused rather than converted, because changing format
     changes size and the whole method depends on the size not changing.
 
-WOOD IS NOT AVAILABLE. The library has 16 families -- Asphalt, Bricks, Concrete,
-CorrugatedSteel, Fabric, Foliage, Grass, Gravel, Ground, Metal, PaintedPlaster,
-PavingStones, Road, Rock, Rubber, Tiles -- and ZERO wood/plank/timber sets. `wood`
-is the single largest environment keyword in the census (474 names). It is reported
-as unmatched, not substituted with concrete.
+WOOD AND SNOW ARE NOW AVAILABLE (2026-08-23 source-material drop). The library grew
+from 16 families to 26: added Bark, Carpet, MetalPlates, PaintedWood, Planks, Plaster,
+Rocks, Snow, Wood, WoodChips, WoodFloor, WoodSiding. `wood` was previously the single
+largest UNSERVED environment keyword; it is now matched. GLASS IS STILL NOT AVAILABLE
+and is still reported as a library gap, not substituted.
 
 Usage:
   python assets_scope.py --inv ../out/inv-assets.json --json ../out/worklist-assets.json
@@ -60,22 +60,22 @@ FAMILY_RULES = [
     ('concrete', ['Concrete']),
     ('beton', ['Concrete']),
     ('cement', ['Concrete']),
-    ('plaster', ['PaintedPlaster', 'Concrete']),
-    ('shtukaturka', ['PaintedPlaster', 'Concrete']),
+    ('plaster', ['PaintedPlaster', 'Plaster', 'Concrete']),
+    ('shtukaturka', ['PaintedPlaster', 'Plaster', 'Concrete']),
     ('paving', ['PavingStones']),
     ('curb', ['Concrete']),
     ('tile', ['Tiles']),
     ('plitka', ['Tiles']),
-    ('gravel', ['Gravel']),
-    ('pebble', ['Gravel', 'PavingStones']),
+    ('gravel', ['Gravel', 'Rocks']),
+    ('pebble', ['Gravel', 'Rocks', 'PavingStones']),
     ('cliff', ['Rock']),
-    ('boulder', ['Rock']),
-    ('rock', ['Rock']),
-    ('stone', ['Rock', 'PavingStones']),
+    ('boulder', ['Rock', 'Rocks']),
+    ('rock', ['Rock', 'Rocks']),
+    ('stone', ['Rock', 'Rocks', 'PavingStones']),
     ('rust', ['Metal']),
     ('steel', ['Metal', 'CorrugatedSteel']),
-    ('metall', ['Metal']),
-    ('metal', ['Metal']),
+    ('metall', ['Metal', 'MetalPlates']),
+    ('metal', ['Metal', 'MetalPlates']),
     ('iron', ['Metal']),
     ('zhelezo', ['Metal']),
     ('fence', ['Metal']),
@@ -92,6 +92,20 @@ FAMILY_RULES = [
     ('earth', ['Ground']),
     ('ground', ['Ground']),
     ('rubber', ['Rubber']),
+    # --- newly servable families (2026-08-23). Specific before generic: `parquet`
+    # and `siding` must win over the bare `wood` rule, and `bark` is tree trunk,
+    # not sawn timber.
+    ('bark', ['Bark']),
+    ('parquet', ['WoodFloor']),
+    ('paluba', ['Planks', 'Wood']),
+    ('siding', ['WoodSiding']),
+    ('plank', ['Planks', 'WoodSiding', 'Wood']),
+    ('doska', ['Planks', 'Wood']),
+    ('wood', ['Wood', 'Planks', 'WoodSiding', 'WoodFloor']),
+    ('derevo', ['Wood', 'Planks']),
+    ('snow', ['Snow']),
+    ('sneg', ['Snow']),
+    ('carpet', ['Carpet']),
     ('fabric', ['Fabric']),
     ('cloth', ['Fabric']),
     ('tarp', ['Fabric']),
@@ -99,14 +113,11 @@ FAMILY_RULES = [
 
 # Keywords that name a real environment surface we CANNOT serve. Kept separate from
 # "no keyword matched" so the gap is visible instead of blending into the noise.
+# wood/derevo/doska/plank/snow moved OUT of this list on 2026-08-23: the new source
+# material has 14 wood-family sets and 22 Snow sets, so they are matched above.
 UNSERVED = [
-    ('wood',   'no wood/plank/timber set exists in the ambientCG library'),
-    ('derevo', 'no wood/plank/timber set exists in the ambientCG library'),
-    ('doska',  'no wood/plank/timber set exists in the ambientCG library'),
-    ('plank',  'no wood/plank/timber set exists in the ambientCG library'),
     ('glass',  'no glass set exists in the ambientCG library'),
     ('steklo', 'no glass set exists in the ambientCG library'),
-    ('snow',   'no snow set exists in the ambientCG library'),
 ]
 
 # Names that are not world surfaces at all. These are substrings; a hit means OUT.
