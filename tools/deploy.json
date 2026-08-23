@@ -35,7 +35,38 @@
         "unlimitedBots",
         "invoke2",
         "anti-cheat:",
-        "components EXPR [BaseType]"
+        "components EXPR [BaseType]",
+        "SHARED RVA: ",
+        "SHAREDNESS IS UNKNOWN for this entry"
+      ]
+    },
+    {
+      "//": "The offline name->RVA index the host resolves by-name patch targets",
+      "//1": "through. It was built beside the host DLL and deployed by NOBODY,",
+      "//2": "which left the live install with whatever stale copy was last put",
+      "//3": "there by hand -- and, since format version 2, with no share counts",
+      "//4": "at all. The host refuses a version-1 index outright, so the marker",
+      "//5": "below is the magic AND the little-endian version word: an index",
+      "//6": "that cannot answer 'is this RVA shared?' never reaches an install.",
+      "name": "nameidx",
+      "src": "host/Aowlspt.Host.Il2Cpp/bin/aowlspt-names.idx",
+      "dst": "aowlspt-names.idx",
+      "minBytes": 1000000,
+      "markers": [
+        "AOWLNIDX\u0002\u0000\u0000\u0000"
+      ]
+    },
+    {
+      "//": "The human-readable half: which METHOD NAMES share a folded RVA.",
+      "//1": "The index carries the COUNT and drives every refusal; this file",
+      "//2": "only names the neighbours, and carries the same imageKey/fileHash",
+      "//3": "stamp so it can never be read as belonging to another DLL.",
+      "name": "nameidxshared",
+      "src": "host/Aowlspt.Host.Il2Cpp/bin/aowlspt-names.idx.shared",
+      "dst": "aowlspt-names.idx.shared",
+      "minBytes": 1000,
+      "markers": [
+        "AOWLSHARED1"
       ]
     },
     {

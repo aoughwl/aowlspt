@@ -37,10 +37,37 @@
  *     +0x10  u64 imageKey    -- build identity, verifiable from mapped headers
  *     +0x18  u64 fileHash    -- SHA-256(GameAssembly.dll)[0:8], build-time guard
  *     +0x20  u32 flags, u32 pad
- *   then three parallel arrays of `count`:
+ *   then FOUR parallel arrays of `count` (format version 2):
  *     u64 hash[]   ascending, UNIQUE      (binary search touches only this)
  *     u32 rva[]
  *     u32 check[]
+ *     u16 share[]  how many method keys resolve to that rva
+ *
+ * ## SHARED RVAs, and why the count is a FIELD and not a companion file
+ *
+ * The IL2CPP backend folds identical compiled bodies, so unrelated methods in
+ * different images share one address. Measured on this build: 6,261 RVAs are
+ * reached by more than one method key, 28.3% of exact keys (46,608 of 164,922)
+ * land on one, and 0x628110 -- the universal `ret 0` stub -- is shared by
+ * 6,438 methods. `Diz.Resources.EasyAssets::get_System` is one of 338 keys on
+ * 0x692A50.
+ *
+ * CALLING a shared RVA is fine: it is the right code for the receiver passed.
+ * DETOURING one is a write whose blast radius is every method that folded onto
+ * it, and nothing at run time can tell them apart. So `share[]` exists, and
+ * `aowl_nameidx_lookup_shared` hands the count to the caller.
+ *
+ *   share == 0    sharedness UNKNOWN. NEVER "unshared".
+ *   share == 1    reached by this method only.
+ *   share >= 2    that many methods resolve here (saturating at 65535).
+ *
+ * It is a field rather than a stamped sidecar because a sidecar is a second
+ * file that can go missing on its own -- which is exactly what happened: the
+ * generator wrote one, nothing deployed it, and the host had no sharedness
+ * data at all while by-name patching was live. One file, one stamp, one
+ * staleness story. A version-1 index cannot answer the question, so it is
+ * REFUSED at load by the same door that refuses a stale stamp, rather than
+ * loaded and silently read as all-unshared.
  *
  * Structure-of-arrays so the search walks a dense 8-byte-stride array instead of
  * striding a 16-byte record and pulling an rva+check into cache at every probe
@@ -124,7 +151,11 @@
 
 #define AOWL_NIDX_MAGIC0      0x4C574F41u   /* "AOWL" */
 #define AOWL_NIDX_MAGIC1      0x5844494Eu   /* "NIDX" */
-#define AOWL_NIDX_VERSION     1u
+#define AOWL_NIDX_VERSION     2u
+#define AOWL_NIDX_ENTRY       18u  /* u64 hash + u32 rva + u32 check + u16 share */
+/* Share-count sentinels. Kept in one place so the host and
+ * tools/il2cpp_nameindex.py cannot drift on what 0 means. */
+#define AOWL_NIDX_SHARE_UNKNOWN 0u
 #define AOWL_NIDX_HEADER      40u
 
 /* Caps. Nothing here loops without one. */
@@ -471,13 +502,19 @@ static int32_t aowl_nameidx_init(const char *dir) {
     count = *(uint32_t *)(buf + 12);
     if (ver != AOWL_NIDX_VERSION || count == 0 || count > AOWL_NIDX_MAX_ENTRIES) {
         HeapFree(GetProcessHeap(), 0, buf);
-        aowl_nidx_fail("aowlspt-names.idx version/count is not one this host reads");
+        aowl_nidx_fail("aowlspt-names.idx is format version 1, which carries "
+                       "NO per-entry share count -- so it cannot say whether "
+                       "an RVA is shared by many folded methods, and reading "
+                       "that silence as \"unshared\" is exactly the "
+                       "confidently-wrong answer this host refuses to give. "
+                       "(Or the entry count is out of range.) Regenerate: "
+                       "tools/il2cpp_nameindex.py gen");
         aowl_nidx_faults++;
         return 0;
     }
     /* Bound the arrays against the REAL file size before reading one entry, so
      * every later index is in range by construction rather than by a check. */
-    need = (size_t)AOWL_NIDX_HEADER + (size_t)count * 16u;
+    need = (size_t)AOWL_NIDX_HEADER + (size_t)count * (size_t)AOWL_NIDX_ENTRY;
     if ((LONGLONG)need != sz.QuadPart) {
         HeapFree(GetProcessHeap(), 0, buf);
         aowl_nidx_fail("aowlspt-names.idx size does not match its own entry "
@@ -547,15 +584,20 @@ static void aowl_nameidx_shutdown(void) {
  * header, never a method, and the generator rejects it. Touches only our own
  * validated heap buffer, so it takes no guard and -- deliberately -- adds none.
  */
-static uint32_t aowl_nameidx_lookup(const char *spec, int32_t arity) {
+static uint32_t aowl_nameidx_lookup_shared(const char *spec, int32_t arity,
+                                           uint32_t *share_out) {
     char key[AOWL_NIDX_MAX_KEY];
     int32_t n = 0, probes = 0;
     uint64_t want;
     uint32_t chk;
     const uint64_t *hashes;
     const uint32_t *rvas, *checks;
+    const uint16_t *shares;
     uint32_t lo, hi;
 
+    /* Pre-set, and never cleared on a failure path: every early return below
+     * leaves sharedness UNKNOWN, which is the answer that refuses a patch. */
+    if (share_out) *share_out = AOWL_NIDX_SHARE_UNKNOWN;
     if (!aowl_nidx_ok || !aowl_nidx_buf || !spec) return 0;
 
     while (n < AOWL_NIDX_MAX_KEY - 16 && spec[n]) { key[n] = spec[n]; n++; }
@@ -581,6 +623,8 @@ static uint32_t aowl_nameidx_lookup(const char *spec, int32_t arity) {
                                 (size_t)aowl_nidx_count * 8u);
     checks = (const uint32_t *)(aowl_nidx_buf + AOWL_NIDX_HEADER +
                                 (size_t)aowl_nidx_count * 12u);
+    shares = (const uint16_t *)(aowl_nidx_buf + AOWL_NIDX_HEADER +
+                                (size_t)aowl_nidx_count * 16u);
 
     lo = 0;
     hi = aowl_nidx_count - 1;
@@ -594,12 +638,22 @@ static uint32_t aowl_nameidx_lookup(const char *spec, int32_t arity) {
             /* The independent second hash. A primary hit on a key that is not
              * in the index would otherwise be a silent wrong address. */
             if (checks[mid] != chk) return 0;
+            if (share_out) *share_out = (uint32_t)shares[mid];
             return rvas[mid];
         }
         if (got < want) { lo = mid + 1u; }
         else { if (mid == 0) break; hi = mid - 1u; }
     }
     return 0;
+}
+
+/* The address only. Every caller that is about to WRITE (a detour) must use
+ * `aowl_nameidx_lookup_shared` and act on the count; this form is for a direct
+ * CALL, which is correct code for the receiver it is passed even when the body
+ * is folded. */
+static uint32_t aowl_nameidx_lookup(const char *spec, int32_t arity) {
+    uint32_t share = AOWL_NIDX_SHARE_UNKNOWN;
+    return aowl_nameidx_lookup_shared(spec, arity, &share);
 }
 
 #endif /* AOWLSPT_NAMEINDEX_H */

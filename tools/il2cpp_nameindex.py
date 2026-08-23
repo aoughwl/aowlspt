@@ -102,27 +102,36 @@ the index as `<out>.shared` (see `shared_sidecar`), and `lookup` prints
 
     [SHARED: N methods resolve here -- hooking this fires for all of them]
 
-Sharedness stays in the SIDECAR, not in the `.idx`, and that is a deliberate
-choice re-taken after the type keys landed. The type keys could go in-format
-because they are new KEYS in an existing key/value table -- no struct change,
-no host change, so `abi/aowlspt_nameindex.h` was untouched. A per-entry shared
-FLAG is a different thing: it is a new field in the on-disk entry, which means
-format version 2 and a matching change to `abi/aowlspt_nameindex.h`, a file
-this change does not own. The `.idx` therefore stays version 1 and the host
-keeps parsing it unchanged.
+Sharedness is IN THE INDEX, as of format version 2: a `u16 shareCount` per
+entry, in a fourth parallel array. It used to live only in the sidecar, on the
+argument that a format bump touched a file that change did not own -- and the
+result was the actual bug: `gen` wrote a sidecar, nothing deployed it, and the
+host had no sharedness data at all while by-name patching was live.
 
-What the sidecar does NOT get to be is a second staleness story. It carries
-the SAME `imageKey`/`fileHash` stamp the index header carries, and `lookup`
-refuses a sidecar whose stamp disagrees -- printing "sharedness UNKNOWN"
-rather than an answer from a sidecar that belongs to another DLL. So there is
-still one stamp and one staleness answer, in two files.
+A sidecar can go missing independently of the index. A field cannot. One file,
+one stamp, one staleness story: the host already refuses the WHOLE index on a
+stamp mismatch, and a version-1 index -- which cannot answer "is this shared?"
+-- is now refused by the same door rather than loaded and silently treated as
+all-unshared. That is the property that matters, and it is why this is a field
+and not a companion file.
 
-Teaching the host to REFUSE a shared RVA is still the right end state and is
-NOT done here.
-Recommended policy when it is: refuse a shared RVA for any PATCH target unless
-explicitly overridden, allow it for a read-only direct CALL. A call at a folded
-getter is still the right code for the receiver you pass it; a detour there is a
-write whose blast radius is every other method that folded onto it, and the host
+The sidecar is still written, demoted to a HUMAN REPORT: it holds the NAMES of
+the other methods on a shared RVA, which the index cannot (it stores hashes).
+`lookup` refuses on the index field and consults the sidecar only to say who
+else is there, so a missing sidecar degrades the explanation and never the
+refusal.
+
+shareCount semantics, identical here and in `abi/aowlspt_nameindex.h`:
+
+    0    sharedness UNKNOWN -- not a code key, or not counted. NEVER read as
+         "unshared". A patch target with 0 is REFUSED.
+    1    this RVA is reached by this method only.
+    >=2  this many method keys resolve here; saturates at 65535.
+
+The policy the host implements: refuse a shared RVA for any PATCH target unless
+explicitly overridden, allow it for a direct CALL. A call at a folded getter is
+still the right code for the receiver you pass it; a detour there is a write
+whose blast radius is every other method that folded onto it, and the host
 cannot tell them apart at runtime.
 
 ## Hash, and why a collision cannot survive generation
@@ -178,8 +187,18 @@ sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from il2cpp_resolve import Resolver, load_pe  # noqa: E402
 
 MAGIC = b"AOWLNIDX"
-VERSION = 1
+VERSION = 2
 HEADER = 40  # magic8 ver4 count4 imageKey8 fileHash8 flags4 pad4
+# v2 entry: u64 hash + u32 rva + u32 check + u16 shareCount, as four parallel
+# arrays. The share count is IN the index, not in a companion file, so there is
+# exactly ONE stamp and ONE staleness story -- see `write_shared_sidecar`.
+ENTRY = 18
+# shareCount semantics, and the host reads them identically:
+#   0  -- NOT A CODE KEY, or not counted: sharedness UNKNOWN. Never "unshared".
+#   1  -- this RVA is reached by this method only.
+#  >=2 -- this many method keys resolve to this RVA. Saturates at 65535.
+SHARE_UNKNOWN = 0
+SHARE_MAX = 0xFFFF
 
 # -- the two hashes. Independent basis AND prime, so a primary collision does
 #    not drag the check along with it.
@@ -478,6 +497,32 @@ def shared_map(keys):
     return {r: sorted(v) for r, v in by_rva.items() if len(v) > 1}, len(by_rva)
 
 
+def share_counts(keys):
+    """key -> how many METHOD keys resolve to that key's RVA.
+
+    0 means "not a code key, so sharedness is UNKNOWN" -- the `@type`/`@name`
+    families, whose values are a `.data` descriptor address and a presence
+    token, neither of which anybody detours. It is deliberately the same value
+    the host treats as UNKNOWN, so a non-code key can never read as unshared.
+
+    `/*` aliases are not COUNTED (they would double-count their own `/N` key,
+    which is what `is_method_key` exists to prevent) but they do CARRY the
+    count, because a by-name patch at arity -1 resolves through exactly that
+    alias and has to be refused for exactly the same reason.
+    """
+    by_rva = {}
+    for k, rva in keys.items():
+        if is_method_key(k):
+            by_rva[rva] = by_rva.get(rva, 0) + 1
+    out = {}
+    for k, rva in keys.items():
+        if is_method_key(k) or k.endswith("/*"):
+            out[k] = min(by_rva.get(rva, SHARE_UNKNOWN), SHARE_MAX)
+        else:
+            out[k] = SHARE_UNKNOWN
+    return out
+
+
 def shared_sidecar_path(idx_path):
     return idx_path + ".shared"
 
@@ -485,8 +530,16 @@ def shared_sidecar_path(idx_path):
 def write_shared_sidecar(path, shared, image_key, fhash, sample=8):
     """Text, one RVA per line: `0xRVA <count> <up to `sample` key names>`.
 
-    Deliberately NOT inside the .idx: the .idx stays byte-identical to what the
-    current host parses (version 1). See the module docstring.
+    NOT the host's source of truth any more, and not the host's input at all.
+    Since index version 2 the share count is a field ON THE ENTRY, so there is
+    one file, one stamp and one staleness story; the host never has to decide
+    what to believe when two stamped files disagree, because there is only one.
+
+    What this file still adds is the thing the index deliberately cannot hold:
+    the NAMES of the other methods on a shared RVA (the index stores hashes).
+    That is a report for a human deciding whether a detour is acceptable, and
+    `lookup` prints it -- but the REFUSAL is driven by the index field, so a
+    missing sidecar downgrades the explanation, never the safety.
     """
     with open(path, "w", encoding="utf8") as f:
         # THE SAME STAMP THE .idx CARRIES. A second file is a second
@@ -550,10 +603,11 @@ def report_shared(shared, distinct, keys, top=10):
 
 def pack(keys, image_key, fhash):
     """Sort by primary hash, refuse on ANY primary collision, emit SoA."""
+    shares = share_counts(keys)
     rows = []
     for k, rva in keys.items():
         kb = k.encode("utf8")
-        rows.append((h_primary(kb), h_check(kb), rva, k))
+        rows.append((h_primary(kb), h_check(kb), rva, k, shares[k]))
     rows.sort(key=lambda r: r[0])
 
     for i in range(1, len(rows)):
@@ -575,6 +629,8 @@ def pack(keys, image_key, fhash):
     out += b"".join(struct.pack("<Q", r[0]) for r in rows)
     out += b"".join(struct.pack("<I", r[2]) for r in rows)
     out += b"".join(struct.pack("<I", r[1]) for r in rows)
+    out += b"".join(struct.pack("<H", r[4]) for r in rows)
+    assert len(out) == HEADER + n * ENTRY
     return bytes(out)
 
 
@@ -584,9 +640,13 @@ def read_index(path):
         sys.exit("not an aowlspt name index: " + path)
     ver, n = struct.unpack_from("<II", b, 8)
     ikey, fhash = struct.unpack_from("<QQ", b, 16)
-    want = HEADER + n * 16
+    want = HEADER + n * ENTRY
     if ver != VERSION:
-        sys.exit("index version %d, this tool speaks %d" % (ver, VERSION))
+        sys.exit("index version %d, this tool speaks %d. Version %d carries a "
+                 "per-entry share count and version 1 does NOT -- an old index "
+                 "cannot answer 'is this RVA shared?', and answering it from "
+                 "silence would read as 'unshared'. Regenerate with `gen`."
+                 % (ver, VERSION, VERSION))
     if len(b) != want:
         sys.exit("index truncated: %d bytes, header claims %d entries (%d)"
                  % (len(b), n, want))
@@ -594,9 +654,17 @@ def read_index(path):
 
 
 def idx_lookup(b, n, key):
+    """The RVA, or None. `idx_lookup_full` also returns the share count."""
+    r = idx_lookup_full(b, n, key)
+    return None if r is None else r[0]
+
+
+def idx_lookup_full(b, n, key):
+    """(rva, shareCount) or None. shareCount 0 == UNKNOWN, never 'unshared'."""
     hs = HEADER
     rs = hs + n * 8
     cs = rs + n * 4
+    ss = cs + n * 4
     kb = key.encode("utf8")
     want, chk = h_primary(kb), h_check(kb)
     lo, hi = 0, n - 1
@@ -610,7 +678,8 @@ def idx_lookup(b, n, key):
         if got == want:
             if struct.unpack_from("<I", b, cs + mid * 4)[0] != chk:
                 return None       # primary hit, check hash disagrees -> not ours
-            return struct.unpack_from("<I", b, rs + mid * 4)[0]
+            return (struct.unpack_from("<I", b, rs + mid * 4)[0],
+                    struct.unpack_from("<H", b, ss + mid * 2)[0])
         if got < want:
             lo = mid + 1
         else:
@@ -728,7 +797,7 @@ def main():
               "Entry=0x%X CheckSum=0x%08X)" % ((ikey,) + parts))
         print("fileHash=0x%016X" % fhash)
         print("wrote %s: %d entries, %d bytes (%.2f MB)"
-              % (out, (len(blob) - HEADER) // 16, len(blob),
+              % (out, (len(blob) - HEADER) // ENTRY, len(blob),
                  len(blob) / 1048576.0))
         print("TYPE KEYS (Ns.Type::@type/0 -> static Il2CppType RVA): %d "
               "added, %d dropped as ambiguous, from %d class/valuetype "
@@ -798,29 +867,40 @@ def main():
         b, n, ikey, fh = read_index(argv[0])
         spec = argv[1]
         key = spec + "/" + (argv[2] if len(argv) > 2 else "*")
-        r = idx_lookup(b, n, key)
-        print("%s -> %s" % (key, ("0x%X" % r) if r is not None else
+        full = idx_lookup_full(b, n, key)
+        print("%s -> %s" % (key, ("0x%X" % full[0]) if full is not None else
                             "NOT FOUND (absent, or ambiguous and therefore dropped)"))
-        if r is None:
+        if full is None:
             sys.exit(1)
-        sh = read_shared_sidecar(shared_sidecar_path(argv[0]), ikey, fh)
-        if sh is None:
-            print("  [sharedness UNKNOWN -- %s is missing, unstamped, or "
-                  "belongs to a DIFFERENT DLL; re-run `gen` to get it. This "
-                  "is NOT a statement that the RVA is unshared.]"
-                  % shared_sidecar_path(argv[0]))
-            sys.exit(0)
-        hit = sh.get(r)
-        if hit:
-            cnt, sample = hit
+        r, share = full
+        # The INDEX FIELD is the authority -- one file, one stamp. The sidecar
+        # is consulted only to name the other methods, and its absence changes
+        # what can be explained, not what is refused.
+        if share == SHARE_UNKNOWN:
+            print("  [sharedness UNKNOWN -- this entry carries no share count "
+                  "(it is not a code key, or it was written by a generator "
+                  "that did not count). This is NOT a statement that the RVA "
+                  "is unshared: absence of evidence is not evidence of "
+                  "uniqueness. A DETOUR here is refused.]")
+            sys.exit(2 if refuse else 0)
+        if share >= 2:
             print("  [SHARED: %d methods resolve here -- hooking this fires for "
-                  "all of them]" % cnt)
-            print("  others here: %s%s"
-                  % (", ".join(k for k in sample if k != key),
-                     " ..." if cnt > len(sample) else ""))
+                  "all of them]" % share)
+            sh = read_shared_sidecar(shared_sidecar_path(argv[0]), ikey, fh)
+            hit = sh.get(r) if sh else None
+            if hit:
+                cnt, sample = hit
+                print("  others here: %s%s"
+                      % (", ".join(k for k in sample if k != key),
+                         " ..." if cnt > len(sample) else ""))
+            else:
+                print("  others here: unknown -- %s is missing, unstamped or "
+                      "belongs to a different DLL. The COUNT above still came "
+                      "from the index itself and stands."
+                      % shared_sidecar_path(argv[0]))
             print("  A DIRECT CALL is still correct for the receiver you pass. "
                   "A DETOUR is not: it is a write whose blast radius is all %d."
-                  % cnt)
+                  % share)
             if refuse:
                 sys.exit(2)
         else:

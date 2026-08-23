@@ -3776,12 +3776,24 @@ proc cNameIdxReason(): cstring {.importc: "aowl_nameidx_reason", nodecl.}
 proc cNameIdxImageKey(): uint64 {.importc: "aowl_nameidx_imagekey", nodecl.}
 proc cNameIdxLookup(spec: cstring; arity: int32): uint32 {.
   importc: "aowl_nameidx_lookup", nodecl.}
+proc cNameIdxLookupShared(spec: cstring; arity: int32;
+                          shareOut: ptr uint32): uint32 {.
+  importc: "aowl_nameidx_lookup_shared", nodecl.}
+  ## Same search, and it also hands back the entry's SHARE COUNT.
+  ##
+  ## 0 is UNKNOWN and is what every failure path leaves behind -- it is never
+  ## "unshared". 1 is "this method only". >= 2 is how many methods the IL2CPP
+  ## backend folded onto this one address, and a detour there fires for all of
+  ## them.
 
 var gNameIndex = false
 var gNameIdxMisses = 0
 const NameIdxMissCap = 32
 
-proc nameIndexRva(spec: string; arity: int32): uint32 =
+## Sharedness, in the three values the whole policy turns on.
+const ShareUnknown = 0'u32
+
+proc nameIndexRva(spec: string; arity: int32; share: var uint32): uint32 =
   ## The RVA for `spec`, or 0. `arity` is -1 for "the only overload", which
   ## answers ONLY where the generator found exactly one -- an overloaded name
   ## like `UnityEngine.AssetBundle::LoadAsset` (0x5250100 and 0x5250340) returns
@@ -3789,6 +3801,11 @@ proc nameIndexRva(spec: string; arity: int32): uint32 =
   ##
   ## Every refusal names the check that declined, and the misses are capped so a
   ## mod retrying a bad name cannot fill the log.
+  ##
+  ## `share` is written on EVERY path, and every failure path leaves it
+  ## `ShareUnknown` -- so a caller that forgets to look cannot be handed a
+  ## default that reads as "safe to detour".
+  share = ShareUnknown
   if not gNameIndex:
     return 0'u32
   if cNameIdxReady() == 0'i32:
@@ -3799,7 +3816,9 @@ proc nameIndexRva(spec: string; arity: int32): uint32 =
     return 0'u32
   # `toCString` wants a mutable string, and the C side only reads it.
   var key = spec
-  result = cNameIdxLookup(toCString(key), arity)
+  var sh = ShareUnknown
+  result = cNameIdxLookupShared(toCString(key), arity, addr sh)
+  share = sh
   if result == 0'u32 and gNameIdxMisses < NameIdxMissCap:
     inc gNameIdxMisses
     warn "name index: no entry for " & spec & " at arity " &
@@ -3810,18 +3829,67 @@ proc nameIndexRva(spec: string; arity: int32): uint32 =
          "generation because two types gave the same name two different RVAs, " &
          "in which case there is no correct answer to give."
 
-proc nameIndexResolve(spec: string; arity: int32): Il2CppPtr =
+proc sharedRefusal(spec: string; rva: uint32; share: uint32): string =
+  ## The sentence a refused PATCH target gets. Empty means "go ahead".
+  ##
+  ## Two refusals, and they are deliberately different sentences, because they
+  ## are different facts and a reader must not have to guess which one happened.
+  if share == ShareUnknown:
+    return "name index: REFUSING to patch " & spec & " at il2cpp+0x" &
+           hexOf(uint64(rva)) & " -- SHAREDNESS IS UNKNOWN for this entry. " &
+           "That is NOT a statement that the address is unshared: absence of " &
+           "evidence is not evidence of uniqueness, and 28.3% of exact keys " &
+           "on this build land on an RVA that several methods share. A " &
+           "detour installed here would fire for every one of them. Only a " &
+           "share count of exactly 1 permits a patch; regenerate the index " &
+           "with tools/il2cpp_nameindex.py gen if this entry has none."
+  if share >= 2'u32:
+    return "name index: REFUSING to patch " & spec & " at il2cpp+0x" &
+           hexOf(uint64(rva)) & " -- SHARED RVA: " & $int(share) &
+           " methods resolve to this one address, because the IL2CPP backend " &
+           "folded their identical bodies together. A detour is a WRITE, and " &
+           "its blast radius is all " & $int(share) & " of them; nothing at " &
+           "run time can tell one caller from another. A direct CALL here is " &
+           "still correct for the receiver you pass -- only patching is " &
+           "refused. Append !shared to the spec to override this deliberately."
+  return ""
+
+proc nameIndexResolve(spec: string; arity: int32; forPatch: bool;
+                      allowShared: bool; why: var string): Il2CppPtr =
   ## `spec` -> RVA -> a code pointer, by handing the RVA to the by-RVA binder,
   ## which owns prologue verification and the section checks.
+  ##
+  ## `forPatch` is the whole safety question. A DETOUR at an address several
+  ## methods folded onto rewrites the first bytes of code that all of them run;
+  ## a CALL at the same address is correct code for the receiver it is handed.
+  ## So the refusal is attached to the purpose, not to the address, and callers
+  ## must say which they are: there is no defaulted parameter here on purpose,
+  ## so a new call site cannot inherit "patch is fine" by saying nothing.
   ##
   ## `when declared` rather than a call: the by-RVA binder is landing on a
   ## parallel branch. Until it is present ABOVE this point in the file, this
   ## compiles to the refusal below and says so with the RVA it found, so the
   ## index can be shown to be answering correctly before anything binds.
   result = cast[Il2CppPtr](0)
-  let rva = nameIndexRva(spec, arity)
+  why = ""
+  var share = ShareUnknown
+  let rva = nameIndexRva(spec, arity, share)
   if rva == 0'u32:
     return
+  if forPatch:
+    let refusal = sharedRefusal(spec, rva, share)
+    if refusal.len > 0:
+      if allowShared:
+        warn "name index: OVERRIDE (!shared) on " & spec & " -- proceeding " &
+             "with a patch the share check refused. " & refusal
+      else:
+        warn refusal
+        why = refusal
+        return cast[Il2CppPtr](0)
+    else:
+      info "name index: " & spec & " at il2cpp+0x" & hexOf(uint64(rva)) &
+           " is reached by this method ONLY (share count 1), so a detour " &
+           "here has no other callers to hit."
   # The seam. `resolveByRva` is defined ABOVE this proc in this same file, so
   # this branch is the live one -- the `else` arm exists only so a build that
   # somehow lacked the binder would REFUSE and say so rather than silently
@@ -3873,7 +3941,19 @@ proc installPatch(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
   ## regains control, and hands the handler what it returned. Two method shapes
   ## cannot carry one and are refused here rather than installed and quietly
   ## useless -- see `postfixRefusal`.
-  let spec = readBytes(target, targetLen)
+  var spec = readBytes(target, targetLen)
+  # THE SHARED-RVA OVERRIDE, taken off the spec before anything else parses it.
+  #
+  # `Ns.Type::Method!shared` says "I know this address is folded and I want the
+  # detour anyway". It is a suffix on the SPEC rather than a host-wide flag
+  # because the decision is per target: a config switch would arm every future
+  # patch as well as the one the author was thinking about. It is only
+  # meaningful on the by-name index path -- an @0x spec is already an explicit
+  # address -- and it is logged loudly when it is used.
+  var allowShared = false
+  if spec.len > 7 and spec.substr(spec.len - 7) == "!shared":
+    allowShared = true
+    spec = spec.substr(0, spec.len - 8)
   if cb == nil:
     gLastError = "patch needs a handler"
     return ErrBadArg
@@ -4008,7 +4088,11 @@ proc installPatch(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
         # about `m`, and `m` is exactly the unreadable handle that made the
         # index necessary. That is refused just below rather than guessed, and
         # the caller must declare the shape with an `@0xRVA/<shape>` spec.
-        fn = nameIndexResolve(spec, -1'i32)
+        var whyShared = ""
+        fn = nameIndexResolve(spec, -1'i32, true, allowShared, whyShared)
+        if fn == nil and whyShared.len > 0:
+          gLastError = whyShared
+          return ErrUnsupported
         if fn != nil and isPostfix:
           let whyShape = "a POSTFIX on " & spec & " resolved through the name " &
                 "index is refused: the index gives an address, not a frame " &
@@ -4367,7 +4451,11 @@ proc resolveDrainPointer(m: Il2CppMethod; spec: string;
   # this exact GameAssembly.dll -- and the scan below is a guess at "some field
   # that looks like code".
   if gNameIndex:
-    let viaName = nameIndexResolve(spec, -1'i32)
+    # The drain is a DETOUR, so it asks as a patch: a shared RVA here would
+    # drain every method folded onto it. No override: a diagnostic drain is
+    # never worth an unbounded write.
+    var whyShared = ""
+    let viaName = nameIndexResolve(spec, -1'i32, true, false, whyShared)
     if viaName != nil:
       warn "name index: binding the drain for " & spec & " at il2cpp+0x" &
            hexOf(uint64(cIl2cppRvaOf(viaName))) & ", from the offline index " &
