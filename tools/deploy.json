@@ -38,13 +38,14 @@
         "components EXPR [BaseType]",
         "SHARED RVA: ",
         "SHAREDNESS IS UNKNOWN for this entry",
-    "mods tab: built -- a sixth tab button cloned into SettingsScreen/",
-    "hide seasons armed as RIDERS on the ",
-    "settingsModsTab is set",
-    "mods tab: pages go into ",
-    "subtab BUTTON(s) cloned into a clone of ",
-    "version brand: REFUSING to write",
-    "hide seasons: Common UI/MenuScreen/SeasonsButton switched off"
+        "mods tab: built -- a sixth tab button cloned into SettingsScreen/",
+        "hide seasons armed as RIDERS on the ",
+        "settingsModsTab is set",
+        "mods tab: pages go into ",
+        "subtab BUTTON(s) cloned into a clone of ",
+        "version brand: REFUSING to write",
+        "hide seasons: Common UI/MenuScreen/SeasonsButton switched off",
+        "mods tab armed as a RIDER on the existing EFT.UI.PreloaderUI::"
       ]
     },
     {
@@ -123,7 +124,10 @@
         "textures  hooked ",
         "textures  ARMED post-boot in mode",
         "textures  unmatched sample",
-        "prologue MISMATCH"
+        "prologue MISMATCH",
+        "textures  REDIRECT",
+        "textures  bundle redirect",
+        "Diz.Resources.EasyBundle::Load@0x2772CC0/i>x"
       ]
     }
   ]
