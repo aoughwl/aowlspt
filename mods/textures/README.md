@@ -115,13 +115,47 @@ now built to avoid both:
   detouring a thunk is unsafe, so the async path is **off by default**
   (`hookAsync`). Only `AssetBundle::LoadAsset` (RVA `0x5250100`/`0x5250340`, a
   clean relocatable prologue) is hooked.
-- **A wrong code pointer corrupts the game.** The host resolves a patch target
-  by name → `MethodInfo.methodPointer`, which the bridge showed is null (or
-  unreliable) for many methods on this build. Patching a wrong address makes the
+- **A wrong code pointer corrupts the game.** Patching a wrong address makes the
   game run corruption on the next bundle load. So before installing, the mod
-  resolves the method exactly as the host will and **byte-verifies its prologue**
-  against the known-good bytes for this build (`LoadAssetProlog` in `swap.nim`).
-  A mismatch or a null pointer **aborts the install** — no patch, no crash.
+  **byte-verifies the target's prologue** against the known-good bytes for this
+  build (`LoadAssetProlog` in `swap.nim`); a mismatch **aborts the install** —
+  no patch, no crash. The host then re-verifies the same bytes against its own
+  startup snapshot of the original code, which is the authoritative compare.
+
+- **The target is named BY STATIC RVA, not by name.** On build
+  `1.1.0.1.46777` by-name resolution is not merely unreliable, it is *dead*:
+  `findClass` and `findMethod` return **non-nil handles into unmapped memory**,
+  so `MethodInfo.methodPointer` reads null and nothing that needs a `MethodInfo`
+  can stand in for it. The spec therefore carries the address **and declares the
+  frame shape**, which with no `MethodInfo` the host cannot derive and refuses
+  to guess:
+
+  ```
+  UnityEngine.AssetBundle::LoadAsset@0x5250100/io>o!48895C24084889742410574883EC2080
+  ```
+
+  `io>o` = instance, one object argument, returns an object. Because an RVA has
+  no `MethodInfo`, the hook is installed with `hookReturnTyped` — the host
+  refuses the JSON patch ABI for an RVA rather than handing a handler an empty
+  payload.
+
+- **`match` needs a name, and gets one the same way.** The manifest is a *name*
+  table, so `match`/`full` are worthless without `UnityEngine.Object.name` —
+  which used to come from `GameObj.invoke("get_name")`, i.e. by name, i.e. dead.
+  It is now a **direct call at `get_name`'s static RVA** (`0x52AD4B0`,
+  prologue-verified, `NULL MethodInfo`), and the returned `System.String` is
+  read raw (`length` @ `0x10`, UTF-16 chars @ `0x14`) with `VirtualQuery` on
+  every hop, a `MaxNameChars` cap, and a fault budget that self-disables after
+  8 unusable answers. If that verification fails the mod says **"NO name
+  source"** and counts firings — it never silently matches zero.
+
+- **`full` still degrades.** The upload needs `il2cpp_array_new` with a
+  `System.Byte` klass and `ImageConversion.LoadImage`, both still resolved by
+  name. `probeUpload` probes the returned klass handle for *readability* (a
+  non-nil test proves nothing here, and a garbage klass handed to
+  `il2cpp_array_new` is a crash, not a declined feature), so on this build
+  `full` degrades to **match-only** and the arm log says so. `swapStats`
+  reports `"nameSource"` and `"canUpload"`.
 
 On top of that, the mod is **crash-proof by construction**:
 

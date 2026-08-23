@@ -713,11 +713,14 @@ proc maybeArm*(): bool =
     warn "textures  nothing hooked; the mod is a no-op (stock textures)"
     return false
 
+  let haveName = cast[uint](gGetNameFn) != 0'u
   let modeName = (case gMode
                   of ModeProbe: "probe (count only)"
-                  of ModeMatch: "match (name-match, no upload)"
+                  of ModeMatch: (if haveName: "match (name-match, no upload)"
+                                 else: "match requested but there is NO name source — counting only")
                   of ModeFull:  (if gCanUpload: "full (upload)"
-                                 else: "full requested but upload unavailable — match-only")
+                                 elif haveName: "full requested but upload unavailable — match-only"
+                                 else: "full requested but neither upload NOR a name source is available — counting only")
                   else: "off")
   success "textures  ARMED post-boot in mode " & modeName & "; VRAM budget " &
           $(gBudgetBytes div (1024'i64 * 1024'i64)) & " MB"
@@ -727,6 +730,8 @@ proc swapStats*(): string =
   result = "{\"mode\":" & $gMode &
            ",\"armed\":" & (if gArmed: "true" else: "false") &
            ",\"canUpload\":" & (if gCanUpload: "true" else: "false") &
+           ",\"nameSource\":" & (if cast[uint](gGetNameFn) != 0'u: "true" else: "false") &
+           ",\"nameFaults\":" & $gNameFaults &
            ",\"tier\":\"" & gTier & "\"" &
            ",\"budgetBytes\":" & $gBudgetBytes &
            ",\"residentBytes\":" & $gResidentBytes &
