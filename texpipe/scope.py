@@ -1,10 +1,29 @@
+"""Scope the SPT 4.1.2 bundle inventory. (The post-1.0 pipeline is `scope_post1.py`.)
+
+`INV` used to be hardcoded to one dead session's scratchpad directory, which meant
+this pipeline could not be re-run by anyone but that session. It now defaults to
+`out/inventory.json` beside the repo, overridable with the `TEXPIPE_INV` environment
+variable, and `load()` fails with a message that says how to regenerate it rather
+than a bare FileNotFoundError from a path nobody recognises.
+"""
 import json, collections, os, sys
-INV=r'C:\Users\savant\AppData\Local\Temp\claude\C--Users-savant-Projects\db70f9b8-6156-4536-ab1f-ffe40cf18538\scratchpad\texture-inventory\inventory.json'
-WJ=r'D:\SPT\EscapeFromTarkov_Data\StreamingAssets\Windows\Windows.json'
+
+_HERE = os.path.dirname(os.path.abspath(__file__))
+_REPO = os.path.dirname(_HERE)
+
+INV = os.environ.get('TEXPIPE_INV', os.path.join(_REPO, 'out', 'inventory.json'))
+WJ = os.environ.get(
+    'TEXPIPE_WINDOWS_JSON',
+    r'D:\SPT\EscapeFromTarkov_Data\StreamingAssets\Windows\Windows.json')
 def in_scope(b):
     if b.startswith('assets/content/weapons/'): return False
     return ('/textures/' in b) or ('location_objects' in b) or ('rock and boulders' in b)
 def load():
+    for path, how in ((INV, 'python inventory.py --out ../out/inventory.json'),
+                      (WJ, 'point TEXPIPE_WINDOWS_JSON at an SPT 4.1.2 install')):
+        if not os.path.exists(path):
+            sys.exit(f'scope.py: missing {path}\n  regenerate with: {how}\n'
+                     f'  (override with TEXPIPE_INV / TEXPIPE_WINDOWS_JSON)')
     inv=json.load(open(INV))['textures']
     wj=json.load(open(WJ))
     keys={k.lower():k for k in wj}

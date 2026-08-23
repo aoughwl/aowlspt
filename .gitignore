@@ -93,3 +93,10 @@ out/*-pack/
 out/post1-neg-*/
 out/diagnostic-pack/
 out/inv-post1-full.json
+
+# Texture pack ARTIFACTS: multi-hundred-MB .resS rewrites and patch blobs.
+# The manifests and reports beside them are small and ARE tracked.
+out/**/*.resS
+out/**/*.bundle
+out/**/blobs/
+texpipe/apply-touched-*.txt

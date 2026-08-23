@@ -1,0 +1,4751 @@
+{
+ "method": "resS-inplace",
+ "assets_untouched": "sharedassets17.assets",
+ "ress": "sharedassets17.assets.resS",
+ "ress_size": 335384064,
+ "seasons": [
+  "summer",
+  "autumn",
+  "autumn_late",
+  "spring",
+  "spring_early"
+ ],
+ "source_tier": "auto",
+ "refused_normSAO": [
+  "MicroSplatConfig_autumn_late_normSAO_LowTex_tarray",
+  "MicroSplatConfig_autumn_late_normSAO_NormalTex_tarray",
+  "MicroSplatConfig_autumn_late_normSAO_tarray",
+  "MicroSplatConfig_autumn_normSAO_LowTex_tarray",
+  "MicroSplatConfig_autumn_normSAO_NormalTex_tarray",
+  "MicroSplatConfig_autumn_normSAO_tarray",
+  "MicroSplatConfig_spring_early_normSAO_LowTex_tarray",
+  "MicroSplatConfig_spring_early_normSAO_NormalTex_tarray",
+  "MicroSplatConfig_spring_early_normSAO_tarray",
+  "MicroSplatConfig_spring_normSAO_LowTex_tarray",
+  "MicroSplatConfig_spring_normSAO_NormalTex_tarray",
+  "MicroSplatConfig_spring_normSAO_tarray",
+  "MicroSplatConfig_summer_normSAO_LowTex_tarray",
+  "MicroSplatConfig_summer_normSAO_NormalTex_tarray",
+  "MicroSplatConfig_summer_normSAO_tarray",
+  "MicroSplatConfig_winter_normSAO_LowTex_tarray",
+  "MicroSplatConfig_winter_normSAO_NormalTex_tarray",
+  "MicroSplatConfig_winter_normSAO_tarray"
+ ],
+ "skipped_season": [
+  "MicroSplatConfig_winter_diff_LowTex_tarray",
+  "MicroSplatConfig_winter_diff_NormalTex_tarray",
+  "MicroSplatConfig_winter_diff_tarray"
+ ],
+ "slices": [
+  {
+   "array": "MicroSplatConfig_autumn_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "autumn",
+   "slice": 0,
+   "surface": "Grass",
+   "families": [
+    "Grass"
+   ],
+   "acg": "Grass003",
+   "acg_res": "1K",
+   "orig_mean": [
+    61.0,
+    51.5,
+    29.3
+   ],
+   "src_mean": [
+    65.1,
+    73.3,
+    29.8
+   ],
+   "mean_dist": 22.1,
+   "offset": 62742784,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_autumn_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "autumn",
+   "slice": 1,
+   "surface": "Ground",
+   "families": [
+    "Ground"
+   ],
+   "acg": "Ground110",
+   "acg_res": "1K",
+   "orig_mean": [
+    70.0,
+    56.8,
+    43.5
+   ],
+   "src_mean": [
+    99.5,
+    90.1,
+    79.1
+   ],
+   "mean_dist": 56.9,
+   "offset": 62830192,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_autumn_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "autumn",
+   "slice": 2,
+   "surface": "Gravel_Road_A",
+   "families": [
+    "Road",
+    "Asphalt",
+    "Gravel"
+   ],
+   "acg": "Asphalt033",
+   "acg_res": "1K",
+   "orig_mean": [
+    83.6,
+    75.8,
+    72.8
+   ],
+   "src_mean": [
+    86.2,
+    81.8,
+    71.7
+   ],
+   "mean_dist": 6.7,
+   "offset": 62917600,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_autumn_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "autumn",
+   "slice": 3,
+   "surface": "Forest_Ground",
+   "families": [
+    "Ground",
+    "Foliage"
+   ],
+   "acg": "Foliage006",
+   "acg_res": "1K",
+   "orig_mean": [
+    58.9,
+    49.4,
+    29.6
+   ],
+   "src_mean": [
+    58.0,
+    85.4,
+    20.1
+   ],
+   "mean_dist": 37.3,
+   "offset": 63005008,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_autumn_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "autumn",
+   "slice": 4,
+   "surface": "Stone_Ground",
+   "families": [
+    "Rock",
+    "PavingStones",
+    "Gravel"
+   ],
+   "acg": "Rock058",
+   "acg_res": "1K",
+   "orig_mean": [
+    83.1,
+    80.2,
+    72.3
+   ],
+   "src_mean": [
+    78.3,
+    84.4,
+    90.6
+   ],
+   "mean_dist": 19.4,
+   "offset": 63092416,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_autumn_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "autumn",
+   "slice": 5,
+   "surface": "Rock_Ground",
+   "families": [
+    "Rock",
+    "Gravel"
+   ],
+   "acg": "Rock058",
+   "acg_res": "1K",
+   "orig_mean": [
+    95.4,
+    91.8,
+    88.1
+   ],
+   "src_mean": [
+    78.3,
+    84.4,
+    90.6
+   ],
+   "mean_dist": 18.7,
+   "offset": 63179824,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_autumn_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "autumn",
+   "slice": 6,
+   "surface": "Gravel_Road_B",
+   "families": [
+    "Road",
+    "Gravel",
+    "Asphalt"
+   ],
+   "acg": "Asphalt023S",
+   "acg_res": "1K",
+   "orig_mean": [
+    127.8,
+    114.5,
+    100.2
+   ],
+   "src_mean": [
+    122.3,
+    121.3,
+    113.0
+   ],
+   "mean_dist": 15.5,
+   "offset": 63267232,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_autumn_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "autumn",
+   "slice": 7,
+   "surface": "Gravel",
+   "families": [
+    "Gravel",
+    "Rock",
+    "PavingStones"
+   ],
+   "acg": "PavingStones151",
+   "acg_res": "1K",
+   "orig_mean": [
+    113.4,
+    105.7,
+    103.7
+   ],
+   "src_mean": [
+    118.3,
+    110.1,
+    98.6
+   ],
+   "mean_dist": 8.4,
+   "offset": 63354640,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_autumn_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "autumn",
+   "slice": 8,
+   "surface": "Grassy_Ground",
+   "families": [
+    "Grass",
+    "Ground"
+   ],
+   "acg": "Grass003",
+   "acg_res": "1K",
+   "orig_mean": [
+    62.7,
+    55.0,
+    41.3
+   ],
+   "src_mean": [
+    65.1,
+    73.3,
+    29.8
+   ],
+   "mean_dist": 21.8,
+   "offset": 63442048,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_autumn_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "autumn",
+   "slice": 9,
+   "surface": "Sand",
+   "families": [
+    "Ground"
+   ],
+   "acg": "Ground106",
+   "acg_res": "1K",
+   "orig_mean": [
+    117.1,
+    97.2,
+    76.0
+   ],
+   "src_mean": [
+    117.9,
+    97.6,
+    71.9
+   ],
+   "mean_dist": 4.3,
+   "offset": 63529456,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_autumn_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "autumn",
+   "slice": 10,
+   "surface": "Pebbles_Ground",
+   "families": [
+    "Gravel",
+    "PavingStones",
+    "Rock"
+   ],
+   "acg": "Rock064",
+   "acg_res": "1K",
+   "orig_mean": [
+    113.1,
+    97.6,
+    79.9
+   ],
+   "src_mean": [
+    116.7,
+    109.1,
+    71.1
+   ],
+   "mean_dist": 15.0,
+   "offset": 63616864,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_autumn_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "autumn",
+   "slice": 11,
+   "surface": "Soil_Grass",
+   "families": [
+    "Ground",
+    "Grass"
+   ],
+   "acg": "Ground110",
+   "acg_res": "1K",
+   "orig_mean": [
+    93.9,
+    78.6,
+    59.2
+   ],
+   "src_mean": [
+    99.5,
+    90.1,
+    79.1
+   ],
+   "mean_dist": 23.7,
+   "offset": 63704272,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_autumn_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "autumn",
+   "slice": 0,
+   "surface": "Grass",
+   "families": [
+    "Grass"
+   ],
+   "acg": "Grass003",
+   "acg_res": "1K",
+   "orig_mean": [
+    59.4,
+    50.1,
+    28.1
+   ],
+   "src_mean": [
+    65.1,
+    73.3,
+    29.8
+   ],
+   "mean_dist": 24.0,
+   "offset": 63791680,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_autumn_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "autumn",
+   "slice": 1,
+   "surface": "Ground",
+   "families": [
+    "Ground"
+   ],
+   "acg": "Ground110",
+   "acg_res": "1K",
+   "orig_mean": [
+    69.8,
+    56.8,
+    43.4
+   ],
+   "src_mean": [
+    99.5,
+    90.1,
+    79.1
+   ],
+   "mean_dist": 57.1,
+   "offset": 64141232,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_autumn_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "autumn",
+   "slice": 2,
+   "surface": "Gravel_Road_A",
+   "families": [
+    "Road",
+    "Asphalt",
+    "Gravel"
+   ],
+   "acg": "Asphalt016",
+   "acg_res": "1K",
+   "orig_mean": [
+    82.9,
+    75.1,
+    72.1
+   ],
+   "src_mean": [
+    77.6,
+    76.1,
+    76.3
+   ],
+   "mean_dist": 6.8,
+   "offset": 64490784,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_autumn_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "autumn",
+   "slice": 3,
+   "surface": "Forest_Ground",
+   "families": [
+    "Ground",
+    "Foliage"
+   ],
+   "acg": "Foliage006",
+   "acg_res": "1K",
+   "orig_mean": [
+    57.0,
+    47.7,
+    28.2
+   ],
+   "src_mean": [
+    58.0,
+    85.4,
+    20.1
+   ],
+   "mean_dist": 38.6,
+   "offset": 64840336,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_autumn_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "autumn",
+   "slice": 4,
+   "surface": "Stone_Ground",
+   "families": [
+    "Rock",
+    "PavingStones",
+    "Gravel"
+   ],
+   "acg": "Rock058",
+   "acg_res": "1K",
+   "orig_mean": [
+    82.1,
+    79.3,
+    71.2
+   ],
+   "src_mean": [
+    78.3,
+    84.4,
+    90.6
+   ],
+   "mean_dist": 20.4,
+   "offset": 65189888,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_autumn_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "autumn",
+   "slice": 5,
+   "surface": "Rock_Ground",
+   "families": [
+    "Rock",
+    "Gravel"
+   ],
+   "acg": "Rock058",
+   "acg_res": "1K",
+   "orig_mean": [
+    94.9,
+    91.3,
+    87.7
+   ],
+   "src_mean": [
+    78.3,
+    84.4,
+    90.6
+   ],
+   "mean_dist": 18.1,
+   "offset": 65539440,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_autumn_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "autumn",
+   "slice": 6,
+   "surface": "Gravel_Road_B",
+   "families": [
+    "Road",
+    "Gravel",
+    "Asphalt"
+   ],
+   "acg": "Asphalt023S",
+   "acg_res": "1K",
+   "orig_mean": [
+    127.2,
+    114.2,
+    99.8
+   ],
+   "src_mean": [
+    122.3,
+    121.3,
+    113.0
+   ],
+   "mean_dist": 15.8,
+   "offset": 65888992,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_autumn_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "autumn",
+   "slice": 7,
+   "surface": "Gravel",
+   "families": [
+    "Gravel",
+    "Rock",
+    "PavingStones"
+   ],
+   "acg": "PavingStones151",
+   "acg_res": "1K",
+   "orig_mean": [
+    111.4,
+    104.0,
+    101.8
+   ],
+   "src_mean": [
+    118.3,
+    110.1,
+    98.6
+   ],
+   "mean_dist": 9.7,
+   "offset": 66238544,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_autumn_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "autumn",
+   "slice": 8,
+   "surface": "Grassy_Ground",
+   "families": [
+    "Grass",
+    "Ground"
+   ],
+   "acg": "Grass003",
+   "acg_res": "1K",
+   "orig_mean": [
+    62.3,
+    54.7,
+    40.7
+   ],
+   "src_mean": [
+    65.1,
+    73.3,
+    29.8
+   ],
+   "mean_dist": 21.7,
+   "offset": 66588096,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_autumn_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "autumn",
+   "slice": 9,
+   "surface": "Sand",
+   "families": [
+    "Ground"
+   ],
+   "acg": "Ground106",
+   "acg_res": "1K",
+   "orig_mean": [
+    116.7,
+    96.7,
+    75.4
+   ],
+   "src_mean": [
+    117.9,
+    97.6,
+    71.9
+   ],
+   "mean_dist": 3.8,
+   "offset": 66937648,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_autumn_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "autumn",
+   "slice": 10,
+   "surface": "Pebbles_Ground",
+   "families": [
+    "Gravel",
+    "PavingStones",
+    "Rock"
+   ],
+   "acg": "Rock064",
+   "acg_res": "1K",
+   "orig_mean": [
+    112.5,
+    97.0,
+    79.5
+   ],
+   "src_mean": [
+    116.7,
+    109.1,
+    71.1
+   ],
+   "mean_dist": 15.3,
+   "offset": 67287200,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_autumn_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "autumn",
+   "slice": 11,
+   "surface": "Soil_Grass",
+   "families": [
+    "Ground",
+    "Grass"
+   ],
+   "acg": "Ground110",
+   "acg_res": "1K",
+   "orig_mean": [
+    92.9,
+    77.8,
+    58.3
+   ],
+   "src_mean": [
+    99.5,
+    90.1,
+    79.1
+   ],
+   "mean_dist": 25.0,
+   "offset": 67636752,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_autumn_diff_tarray",
+   "tier": "HQ",
+   "season": "autumn",
+   "slice": 0,
+   "surface": "Grass",
+   "families": [
+    "Grass"
+   ],
+   "acg": "Grass003",
+   "acg_res": "1K",
+   "orig_mean": [
+    57.7,
+    48.5,
+    27.0
+   ],
+   "src_mean": [
+    65.1,
+    73.3,
+    29.8
+   ],
+   "mean_dist": 26.0,
+   "offset": 67986304,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_autumn_diff_tarray",
+   "tier": "HQ",
+   "season": "autumn",
+   "slice": 1,
+   "surface": "Ground",
+   "families": [
+    "Ground"
+   ],
+   "acg": "Ground110",
+   "acg_res": "1K",
+   "orig_mean": [
+    69.5,
+    56.6,
+    43.2
+   ],
+   "src_mean": [
+    99.5,
+    90.1,
+    79.1
+   ],
+   "mean_dist": 57.5,
+   "offset": 69384432,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_autumn_diff_tarray",
+   "tier": "HQ",
+   "season": "autumn",
+   "slice": 2,
+   "surface": "Gravel_Road_A",
+   "families": [
+    "Road",
+    "Asphalt",
+    "Gravel"
+   ],
+   "acg": "Asphalt016",
+   "acg_res": "1K",
+   "orig_mean": [
+    82.1,
+    74.2,
+    71.3
+   ],
+   "src_mean": [
+    77.6,
+    76.1,
+    76.3
+   ],
+   "mean_dist": 7.0,
+   "offset": 70782560,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_autumn_diff_tarray",
+   "tier": "HQ",
+   "season": "autumn",
+   "slice": 3,
+   "surface": "Forest_Ground",
+   "families": [
+    "Ground",
+    "Foliage"
+   ],
+   "acg": "Foliage006",
+   "acg_res": "1K",
+   "orig_mean": [
+    55.3,
+    46.2,
+    27.0
+   ],
+   "src_mean": [
+    58.0,
+    85.4,
+    20.1
+   ],
+   "mean_dist": 39.9,
+   "offset": 72180688,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_autumn_diff_tarray",
+   "tier": "HQ",
+   "season": "autumn",
+   "slice": 4,
+   "surface": "Stone_Ground",
+   "families": [
+    "Rock",
+    "PavingStones",
+    "Gravel"
+   ],
+   "acg": "Rock058",
+   "acg_res": "1K",
+   "orig_mean": [
+    81.3,
+    78.5,
+    70.5
+   ],
+   "src_mean": [
+    78.3,
+    84.4,
+    90.6
+   ],
+   "mean_dist": 21.2,
+   "offset": 73578816,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_autumn_diff_tarray",
+   "tier": "HQ",
+   "season": "autumn",
+   "slice": 5,
+   "surface": "Rock_Ground",
+   "families": [
+    "Rock",
+    "Gravel"
+   ],
+   "acg": "Rock058",
+   "acg_res": "1K",
+   "orig_mean": [
+    94.4,
+    90.8,
+    87.3
+   ],
+   "src_mean": [
+    78.3,
+    84.4,
+    90.6
+   ],
+   "mean_dist": 17.6,
+   "offset": 74976944,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_autumn_diff_tarray",
+   "tier": "HQ",
+   "season": "autumn",
+   "slice": 6,
+   "surface": "Gravel_Road_B",
+   "families": [
+    "Road",
+    "Gravel",
+    "Asphalt"
+   ],
+   "acg": "Asphalt023S",
+   "acg_res": "1K",
+   "orig_mean": [
+    126.3,
+    113.5,
+    99.1
+   ],
+   "src_mean": [
+    122.3,
+    121.3,
+    113.0
+   ],
+   "mean_dist": 16.4,
+   "offset": 76375072,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_autumn_diff_tarray",
+   "tier": "HQ",
+   "season": "autumn",
+   "slice": 7,
+   "surface": "Gravel",
+   "families": [
+    "Gravel",
+    "Rock",
+    "PavingStones"
+   ],
+   "acg": "PavingStones151",
+   "acg_res": "1K",
+   "orig_mean": [
+    110.4,
+    103.0,
+    100.6
+   ],
+   "src_mean": [
+    118.3,
+    110.1,
+    98.6
+   ],
+   "mean_dist": 10.8,
+   "offset": 77773200,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_autumn_diff_tarray",
+   "tier": "HQ",
+   "season": "autumn",
+   "slice": 8,
+   "surface": "Grassy_Ground",
+   "families": [
+    "Grass",
+    "Ground"
+   ],
+   "acg": "Grass003",
+   "acg_res": "1K",
+   "orig_mean": [
+    61.7,
+    54.2,
+    40.2
+   ],
+   "src_mean": [
+    65.1,
+    73.3,
+    29.8
+   ],
+   "mean_dist": 22.0,
+   "offset": 79171328,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_autumn_diff_tarray",
+   "tier": "HQ",
+   "season": "autumn",
+   "slice": 9,
+   "surface": "Sand",
+   "families": [
+    "Ground"
+   ],
+   "acg": "Ground106",
+   "acg_res": "1K",
+   "orig_mean": [
+    116.2,
+    96.1,
+    74.6
+   ],
+   "src_mean": [
+    117.9,
+    97.6,
+    71.9
+   ],
+   "mean_dist": 3.6,
+   "offset": 80569456,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_autumn_diff_tarray",
+   "tier": "HQ",
+   "season": "autumn",
+   "slice": 10,
+   "surface": "Pebbles_Ground",
+   "families": [
+    "Gravel",
+    "PavingStones",
+    "Rock"
+   ],
+   "acg": "Rock064",
+   "acg_res": "1K",
+   "orig_mean": [
+    111.9,
+    96.4,
+    79.0
+   ],
+   "src_mean": [
+    116.7,
+    109.1,
+    71.1
+   ],
+   "mean_dist": 15.7,
+   "offset": 81967584,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_autumn_diff_tarray",
+   "tier": "HQ",
+   "season": "autumn",
+   "slice": 11,
+   "surface": "Soil_Grass",
+   "families": [
+    "Ground",
+    "Grass"
+   ],
+   "acg": "Ground110",
+   "acg_res": "1K",
+   "orig_mean": [
+    92.3,
+    77.2,
+    57.7
+   ],
+   "src_mean": [
+    99.5,
+    90.1,
+    79.1
+   ],
+   "mean_dist": 26.0,
+   "offset": 83365712,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_autumn_late_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "autumn_late",
+   "slice": 0,
+   "surface": "Grass",
+   "families": [
+    "Grass"
+   ],
+   "acg": "Grass003",
+   "acg_res": "1K",
+   "orig_mean": [
+    60.8,
+    50.2,
+    35.4
+   ],
+   "src_mean": [
+    65.1,
+    73.3,
+    29.8
+   ],
+   "mean_dist": 24.1,
+   "offset": 84763840,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_autumn_late_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "autumn_late",
+   "slice": 1,
+   "surface": "Ground",
+   "families": [
+    "Ground"
+   ],
+   "acg": "Ground110",
+   "acg_res": "1K",
+   "orig_mean": [
+    66.4,
+    55.7,
+    46.4
+   ],
+   "src_mean": [
+    99.5,
+    90.1,
+    79.1
+   ],
+   "mean_dist": 57.9,
+   "offset": 84851248,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_autumn_late_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "autumn_late",
+   "slice": 2,
+   "surface": "Gravel_Road_A",
+   "families": [
+    "Road",
+    "Asphalt",
+    "Gravel"
+   ],
+   "acg": "Asphalt033",
+   "acg_res": "1K",
+   "orig_mean": [
+    83.6,
+    75.8,
+    72.8
+   ],
+   "src_mean": [
+    86.2,
+    81.8,
+    71.7
+   ],
+   "mean_dist": 6.7,
+   "offset": 84938656,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_autumn_late_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "autumn_late",
+   "slice": 3,
+   "surface": "Forest_Ground",
+   "families": [
+    "Ground",
+    "Foliage"
+   ],
+   "acg": "Foliage006",
+   "acg_res": "1K",
+   "orig_mean": [
+    54.9,
+    45.1,
+    31.6
+   ],
+   "src_mean": [
+    58.0,
+    85.4,
+    20.1
+   ],
+   "mean_dist": 42.1,
+   "offset": 85026064,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_autumn_late_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "autumn_late",
+   "slice": 4,
+   "surface": "Stone_Ground",
+   "families": [
+    "Rock",
+    "PavingStones",
+    "Gravel"
+   ],
+   "acg": "Rock058",
+   "acg_res": "1K",
+   "orig_mean": [
+    83.1,
+    80.2,
+    72.3
+   ],
+   "src_mean": [
+    78.3,
+    84.4,
+    90.6
+   ],
+   "mean_dist": 19.4,
+   "offset": 85113472,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_autumn_late_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "autumn_late",
+   "slice": 5,
+   "surface": "Rock_Ground",
+   "families": [
+    "Rock",
+    "Gravel"
+   ],
+   "acg": "Rock058",
+   "acg_res": "1K",
+   "orig_mean": [
+    95.4,
+    91.8,
+    88.1
+   ],
+   "src_mean": [
+    78.3,
+    84.4,
+    90.6
+   ],
+   "mean_dist": 18.7,
+   "offset": 85200880,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_autumn_late_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "autumn_late",
+   "slice": 6,
+   "surface": "Gravel_Road_B",
+   "families": [
+    "Road",
+    "Gravel",
+    "Asphalt"
+   ],
+   "acg": "Asphalt023S",
+   "acg_res": "1K",
+   "orig_mean": [
+    127.8,
+    114.5,
+    100.2
+   ],
+   "src_mean": [
+    122.3,
+    121.3,
+    113.0
+   ],
+   "mean_dist": 15.5,
+   "offset": 85288288,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_autumn_late_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "autumn_late",
+   "slice": 7,
+   "surface": "Gravel",
+   "families": [
+    "Gravel",
+    "Rock",
+    "PavingStones"
+   ],
+   "acg": "PavingStones151",
+   "acg_res": "1K",
+   "orig_mean": [
+    113.4,
+    105.7,
+    103.7
+   ],
+   "src_mean": [
+    118.3,
+    110.1,
+    98.6
+   ],
+   "mean_dist": 8.4,
+   "offset": 85375696,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_autumn_late_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "autumn_late",
+   "slice": 8,
+   "surface": "Grassy_Ground",
+   "families": [
+    "Grass",
+    "Ground"
+   ],
+   "acg": "Grass003",
+   "acg_res": "1K",
+   "orig_mean": [
+    61.6,
+    51.3,
+    38.5
+   ],
+   "src_mean": [
+    65.1,
+    73.3,
+    29.8
+   ],
+   "mean_dist": 23.9,
+   "offset": 85463104,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_autumn_late_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "autumn_late",
+   "slice": 9,
+   "surface": "Sand",
+   "families": [
+    "Ground"
+   ],
+   "acg": "Ground106",
+   "acg_res": "1K",
+   "orig_mean": [
+    117.1,
+    97.2,
+    76.0
+   ],
+   "src_mean": [
+    117.9,
+    97.6,
+    71.9
+   ],
+   "mean_dist": 4.3,
+   "offset": 85550512,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_autumn_late_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "autumn_late",
+   "slice": 10,
+   "surface": "Pebbles_Ground",
+   "families": [
+    "Gravel",
+    "PavingStones",
+    "Rock"
+   ],
+   "acg": "Rock064",
+   "acg_res": "1K",
+   "orig_mean": [
+    113.1,
+    97.6,
+    79.9
+   ],
+   "src_mean": [
+    116.7,
+    109.1,
+    71.1
+   ],
+   "mean_dist": 15.0,
+   "offset": 85637920,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_autumn_late_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "autumn_late",
+   "slice": 11,
+   "surface": "Soil_Grass",
+   "families": [
+    "Ground",
+    "Grass"
+   ],
+   "acg": "Ground110",
+   "acg_res": "1K",
+   "orig_mean": [
+    93.9,
+    78.6,
+    59.2
+   ],
+   "src_mean": [
+    99.5,
+    90.1,
+    79.1
+   ],
+   "mean_dist": 23.7,
+   "offset": 85725328,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_autumn_late_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "autumn_late",
+   "slice": 0,
+   "surface": "Grass",
+   "families": [
+    "Grass"
+   ],
+   "acg": "Grass003",
+   "acg_res": "1K",
+   "orig_mean": [
+    59.1,
+    48.6,
+    34.1
+   ],
+   "src_mean": [
+    65.1,
+    73.3,
+    29.8
+   ],
+   "mean_dist": 25.8,
+   "offset": 85812736,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_autumn_late_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "autumn_late",
+   "slice": 1,
+   "surface": "Ground",
+   "families": [
+    "Ground"
+   ],
+   "acg": "Ground110",
+   "acg_res": "1K",
+   "orig_mean": [
+    66.1,
+    55.6,
+    46.4
+   ],
+   "src_mean": [
+    99.5,
+    90.1,
+    79.1
+   ],
+   "mean_dist": 58.0,
+   "offset": 86162288,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_autumn_late_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "autumn_late",
+   "slice": 2,
+   "surface": "Gravel_Road_A",
+   "families": [
+    "Road",
+    "Asphalt",
+    "Gravel"
+   ],
+   "acg": "Asphalt016",
+   "acg_res": "1K",
+   "orig_mean": [
+    82.9,
+    75.1,
+    72.1
+   ],
+   "src_mean": [
+    77.6,
+    76.1,
+    76.3
+   ],
+   "mean_dist": 6.8,
+   "offset": 86511840,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_autumn_late_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "autumn_late",
+   "slice": 3,
+   "surface": "Forest_Ground",
+   "families": [
+    "Ground",
+    "Foliage"
+   ],
+   "acg": "Foliage006",
+   "acg_res": "1K",
+   "orig_mean": [
+    53.1,
+    43.5,
+    30.2
+   ],
+   "src_mean": [
+    58.0,
+    85.4,
+    20.1
+   ],
+   "mean_dist": 43.4,
+   "offset": 86861392,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_autumn_late_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "autumn_late",
+   "slice": 4,
+   "surface": "Stone_Ground",
+   "families": [
+    "Rock",
+    "PavingStones",
+    "Gravel"
+   ],
+   "acg": "Rock058",
+   "acg_res": "1K",
+   "orig_mean": [
+    82.1,
+    79.3,
+    71.2
+   ],
+   "src_mean": [
+    78.3,
+    84.4,
+    90.6
+   ],
+   "mean_dist": 20.4,
+   "offset": 87210944,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_autumn_late_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "autumn_late",
+   "slice": 5,
+   "surface": "Rock_Ground",
+   "families": [
+    "Rock",
+    "Gravel"
+   ],
+   "acg": "Rock058",
+   "acg_res": "1K",
+   "orig_mean": [
+    94.9,
+    91.3,
+    87.7
+   ],
+   "src_mean": [
+    78.3,
+    84.4,
+    90.6
+   ],
+   "mean_dist": 18.1,
+   "offset": 87560496,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_autumn_late_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "autumn_late",
+   "slice": 6,
+   "surface": "Gravel_Road_B",
+   "families": [
+    "Road",
+    "Gravel",
+    "Asphalt"
+   ],
+   "acg": "Asphalt023S",
+   "acg_res": "1K",
+   "orig_mean": [
+    127.2,
+    114.2,
+    99.8
+   ],
+   "src_mean": [
+    122.3,
+    121.3,
+    113.0
+   ],
+   "mean_dist": 15.8,
+   "offset": 87910048,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_autumn_late_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "autumn_late",
+   "slice": 7,
+   "surface": "Gravel",
+   "families": [
+    "Gravel",
+    "Rock",
+    "PavingStones"
+   ],
+   "acg": "PavingStones151",
+   "acg_res": "1K",
+   "orig_mean": [
+    111.4,
+    104.0,
+    101.8
+   ],
+   "src_mean": [
+    118.3,
+    110.1,
+    98.6
+   ],
+   "mean_dist": 9.7,
+   "offset": 88259600,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_autumn_late_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "autumn_late",
+   "slice": 8,
+   "surface": "Grassy_Ground",
+   "families": [
+    "Grass",
+    "Ground"
+   ],
+   "acg": "Grass003",
+   "acg_res": "1K",
+   "orig_mean": [
+    61.3,
+    51.0,
+    37.8
+   ],
+   "src_mean": [
+    65.1,
+    73.3,
+    29.8
+   ],
+   "mean_dist": 24.0,
+   "offset": 88609152,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_autumn_late_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "autumn_late",
+   "slice": 9,
+   "surface": "Sand",
+   "families": [
+    "Ground"
+   ],
+   "acg": "Ground106",
+   "acg_res": "1K",
+   "orig_mean": [
+    116.7,
+    96.7,
+    75.4
+   ],
+   "src_mean": [
+    117.9,
+    97.6,
+    71.9
+   ],
+   "mean_dist": 3.8,
+   "offset": 88958704,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_autumn_late_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "autumn_late",
+   "slice": 10,
+   "surface": "Pebbles_Ground",
+   "families": [
+    "Gravel",
+    "PavingStones",
+    "Rock"
+   ],
+   "acg": "Rock064",
+   "acg_res": "1K",
+   "orig_mean": [
+    112.5,
+    97.0,
+    79.5
+   ],
+   "src_mean": [
+    116.7,
+    109.1,
+    71.1
+   ],
+   "mean_dist": 15.3,
+   "offset": 89308256,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_autumn_late_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "autumn_late",
+   "slice": 11,
+   "surface": "Soil_Grass",
+   "families": [
+    "Ground",
+    "Grass"
+   ],
+   "acg": "Ground110",
+   "acg_res": "1K",
+   "orig_mean": [
+    92.9,
+    77.8,
+    58.3
+   ],
+   "src_mean": [
+    99.5,
+    90.1,
+    79.1
+   ],
+   "mean_dist": 25.0,
+   "offset": 89657808,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_autumn_late_diff_tarray",
+   "tier": "HQ",
+   "season": "autumn_late",
+   "slice": 0,
+   "surface": "Grass",
+   "families": [
+    "Grass"
+   ],
+   "acg": "Grass003",
+   "acg_res": "1K",
+   "orig_mean": [
+    57.4,
+    47.0,
+    32.8
+   ],
+   "src_mean": [
+    65.1,
+    73.3,
+    29.8
+   ],
+   "mean_dist": 27.6,
+   "offset": 90007360,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_autumn_late_diff_tarray",
+   "tier": "HQ",
+   "season": "autumn_late",
+   "slice": 1,
+   "surface": "Ground",
+   "families": [
+    "Ground"
+   ],
+   "acg": "Ground110",
+   "acg_res": "1K",
+   "orig_mean": [
+    65.6,
+    55.5,
+    46.4
+   ],
+   "src_mean": [
+    99.5,
+    90.1,
+    79.1
+   ],
+   "mean_dist": 58.4,
+   "offset": 91405488,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_autumn_late_diff_tarray",
+   "tier": "HQ",
+   "season": "autumn_late",
+   "slice": 2,
+   "surface": "Gravel_Road_A",
+   "families": [
+    "Road",
+    "Asphalt",
+    "Gravel"
+   ],
+   "acg": "Asphalt016",
+   "acg_res": "1K",
+   "orig_mean": [
+    82.1,
+    74.2,
+    71.3
+   ],
+   "src_mean": [
+    77.6,
+    76.1,
+    76.3
+   ],
+   "mean_dist": 7.0,
+   "offset": 92803616,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_autumn_late_diff_tarray",
+   "tier": "HQ",
+   "season": "autumn_late",
+   "slice": 3,
+   "surface": "Forest_Ground",
+   "families": [
+    "Ground",
+    "Foliage"
+   ],
+   "acg": "Foliage006",
+   "acg_res": "1K",
+   "orig_mean": [
+    51.5,
+    42.1,
+    29.0
+   ],
+   "src_mean": [
+    58.0,
+    85.4,
+    20.1
+   ],
+   "mean_dist": 44.7,
+   "offset": 94201744,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_autumn_late_diff_tarray",
+   "tier": "HQ",
+   "season": "autumn_late",
+   "slice": 4,
+   "surface": "Stone_Ground",
+   "families": [
+    "Rock",
+    "PavingStones",
+    "Gravel"
+   ],
+   "acg": "Rock058",
+   "acg_res": "1K",
+   "orig_mean": [
+    81.3,
+    78.5,
+    70.5
+   ],
+   "src_mean": [
+    78.3,
+    84.4,
+    90.6
+   ],
+   "mean_dist": 21.2,
+   "offset": 95599872,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_autumn_late_diff_tarray",
+   "tier": "HQ",
+   "season": "autumn_late",
+   "slice": 5,
+   "surface": "Rock_Ground",
+   "families": [
+    "Rock",
+    "Gravel"
+   ],
+   "acg": "Rock058",
+   "acg_res": "1K",
+   "orig_mean": [
+    94.4,
+    90.8,
+    87.3
+   ],
+   "src_mean": [
+    78.3,
+    84.4,
+    90.6
+   ],
+   "mean_dist": 17.6,
+   "offset": 96998000,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_autumn_late_diff_tarray",
+   "tier": "HQ",
+   "season": "autumn_late",
+   "slice": 6,
+   "surface": "Gravel_Road_B",
+   "families": [
+    "Road",
+    "Gravel",
+    "Asphalt"
+   ],
+   "acg": "Asphalt023S",
+   "acg_res": "1K",
+   "orig_mean": [
+    126.3,
+    113.5,
+    99.1
+   ],
+   "src_mean": [
+    122.3,
+    121.3,
+    113.0
+   ],
+   "mean_dist": 16.4,
+   "offset": 98396128,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_autumn_late_diff_tarray",
+   "tier": "HQ",
+   "season": "autumn_late",
+   "slice": 7,
+   "surface": "Gravel",
+   "families": [
+    "Gravel",
+    "Rock",
+    "PavingStones"
+   ],
+   "acg": "PavingStones151",
+   "acg_res": "1K",
+   "orig_mean": [
+    110.4,
+    103.0,
+    100.6
+   ],
+   "src_mean": [
+    118.3,
+    110.1,
+    98.6
+   ],
+   "mean_dist": 10.8,
+   "offset": 99794256,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_autumn_late_diff_tarray",
+   "tier": "HQ",
+   "season": "autumn_late",
+   "slice": 8,
+   "surface": "Grassy_Ground",
+   "families": [
+    "Grass",
+    "Ground"
+   ],
+   "acg": "Grass003",
+   "acg_res": "1K",
+   "orig_mean": [
+    60.8,
+    50.6,
+    37.3
+   ],
+   "src_mean": [
+    65.1,
+    73.3,
+    29.8
+   ],
+   "mean_dist": 24.3,
+   "offset": 101192384,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_autumn_late_diff_tarray",
+   "tier": "HQ",
+   "season": "autumn_late",
+   "slice": 9,
+   "surface": "Sand",
+   "families": [
+    "Ground"
+   ],
+   "acg": "Ground106",
+   "acg_res": "1K",
+   "orig_mean": [
+    116.2,
+    96.1,
+    74.6
+   ],
+   "src_mean": [
+    117.9,
+    97.6,
+    71.9
+   ],
+   "mean_dist": 3.6,
+   "offset": 102590512,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_autumn_late_diff_tarray",
+   "tier": "HQ",
+   "season": "autumn_late",
+   "slice": 10,
+   "surface": "Pebbles_Ground",
+   "families": [
+    "Gravel",
+    "PavingStones",
+    "Rock"
+   ],
+   "acg": "Rock064",
+   "acg_res": "1K",
+   "orig_mean": [
+    111.9,
+    96.4,
+    79.0
+   ],
+   "src_mean": [
+    116.7,
+    109.1,
+    71.1
+   ],
+   "mean_dist": 15.7,
+   "offset": 103988640,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_autumn_late_diff_tarray",
+   "tier": "HQ",
+   "season": "autumn_late",
+   "slice": 11,
+   "surface": "Soil_Grass",
+   "families": [
+    "Ground",
+    "Grass"
+   ],
+   "acg": "Ground110",
+   "acg_res": "1K",
+   "orig_mean": [
+    92.3,
+    77.2,
+    57.7
+   ],
+   "src_mean": [
+    99.5,
+    90.1,
+    79.1
+   ],
+   "mean_dist": 26.0,
+   "offset": 105386768,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_spring_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "spring",
+   "slice": 0,
+   "surface": "Grass",
+   "families": [
+    "Grass"
+   ],
+   "acg": "Grass002",
+   "acg_res": "1K",
+   "orig_mean": [
+    49.1,
+    51.7,
+    23.3
+   ],
+   "src_mean": [
+    56.1,
+    75.0,
+    34.8
+   ],
+   "mean_dist": 26.9,
+   "offset": 150827008,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_spring_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "spring",
+   "slice": 1,
+   "surface": "Ground",
+   "families": [
+    "Ground"
+   ],
+   "acg": "Ground110",
+   "acg_res": "1K",
+   "orig_mean": [
+    78.6,
+    63.7,
+    52.3
+   ],
+   "src_mean": [
+    99.5,
+    90.1,
+    79.1
+   ],
+   "mean_dist": 43.1,
+   "offset": 150914416,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_spring_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "spring",
+   "slice": 2,
+   "surface": "Gravel_Road_A",
+   "families": [
+    "Road",
+    "Asphalt",
+    "Gravel"
+   ],
+   "acg": "Asphalt033",
+   "acg_res": "1K",
+   "orig_mean": [
+    93.5,
+    81.9,
+    71.0
+   ],
+   "src_mean": [
+    86.2,
+    81.8,
+    71.7
+   ],
+   "mean_dist": 7.4,
+   "offset": 151001824,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_spring_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "spring",
+   "slice": 3,
+   "surface": "Forest_Ground",
+   "families": [
+    "Ground",
+    "Foliage"
+   ],
+   "acg": "Foliage006",
+   "acg_res": "1K",
+   "orig_mean": [
+    61.8,
+    57.9,
+    34.5
+   ],
+   "src_mean": [
+    58.0,
+    85.4,
+    20.1
+   ],
+   "mean_dist": 31.3,
+   "offset": 151089232,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_spring_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "spring",
+   "slice": 4,
+   "surface": "Stone_Ground",
+   "families": [
+    "Rock",
+    "PavingStones",
+    "Gravel"
+   ],
+   "acg": "Rock058",
+   "acg_res": "1K",
+   "orig_mean": [
+    81.4,
+    77.7,
+    65.1
+   ],
+   "src_mean": [
+    78.3,
+    84.4,
+    90.6
+   ],
+   "mean_dist": 26.6,
+   "offset": 151176640,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_spring_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "spring",
+   "slice": 5,
+   "surface": "Rock_Ground",
+   "families": [
+    "Rock",
+    "Gravel"
+   ],
+   "acg": "Rock058",
+   "acg_res": "1K",
+   "orig_mean": [
+    85.0,
+    78.3,
+    72.0
+   ],
+   "src_mean": [
+    78.3,
+    84.4,
+    90.6
+   ],
+   "mean_dist": 20.7,
+   "offset": 151264048,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_spring_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "spring",
+   "slice": 6,
+   "surface": "Gravel_Road_B",
+   "families": [
+    "Road",
+    "Gravel",
+    "Asphalt"
+   ],
+   "acg": "Asphalt023S",
+   "acg_res": "1K",
+   "orig_mean": [
+    127.8,
+    114.5,
+    100.2
+   ],
+   "src_mean": [
+    122.3,
+    121.3,
+    113.0
+   ],
+   "mean_dist": 15.5,
+   "offset": 151351456,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_spring_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "spring",
+   "slice": 7,
+   "surface": "Gravel",
+   "families": [
+    "Gravel",
+    "Rock",
+    "PavingStones"
+   ],
+   "acg": "PavingStones151",
+   "acg_res": "1K",
+   "orig_mean": [
+    113.4,
+    105.7,
+    103.7
+   ],
+   "src_mean": [
+    118.3,
+    110.1,
+    98.6
+   ],
+   "mean_dist": 8.4,
+   "offset": 151438864,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_spring_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "spring",
+   "slice": 8,
+   "surface": "Grassy_Ground",
+   "families": [
+    "Grass",
+    "Ground"
+   ],
+   "acg": "Grass003",
+   "acg_res": "1K",
+   "orig_mean": [
+    66.0,
+    60.7,
+    41.0
+   ],
+   "src_mean": [
+    65.1,
+    73.3,
+    29.8
+   ],
+   "mean_dist": 16.9,
+   "offset": 151526272,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_spring_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "spring",
+   "slice": 9,
+   "surface": "Sand",
+   "families": [
+    "Ground"
+   ],
+   "acg": "Ground106",
+   "acg_res": "1K",
+   "orig_mean": [
+    117.1,
+    97.2,
+    76.0
+   ],
+   "src_mean": [
+    117.9,
+    97.6,
+    71.9
+   ],
+   "mean_dist": 4.3,
+   "offset": 151613680,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_spring_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "spring",
+   "slice": 10,
+   "surface": "Pebbles_Ground",
+   "families": [
+    "Gravel",
+    "PavingStones",
+    "Rock"
+   ],
+   "acg": "Rock064",
+   "acg_res": "1K",
+   "orig_mean": [
+    113.1,
+    97.6,
+    79.9
+   ],
+   "src_mean": [
+    116.7,
+    109.1,
+    71.1
+   ],
+   "mean_dist": 15.0,
+   "offset": 151701088,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_spring_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "spring",
+   "slice": 11,
+   "surface": "Soil_Grass",
+   "families": [
+    "Ground",
+    "Grass"
+   ],
+   "acg": "Ground110",
+   "acg_res": "1K",
+   "orig_mean": [
+    93.9,
+    78.6,
+    59.2
+   ],
+   "src_mean": [
+    99.5,
+    90.1,
+    79.1
+   ],
+   "mean_dist": 23.7,
+   "offset": 151788496,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_spring_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "spring",
+   "slice": 0,
+   "surface": "Grass",
+   "families": [
+    "Grass"
+   ],
+   "acg": "Grass002",
+   "acg_res": "1K",
+   "orig_mean": [
+    48.1,
+    50.8,
+    22.2
+   ],
+   "src_mean": [
+    56.1,
+    75.0,
+    34.8
+   ],
+   "mean_dist": 28.4,
+   "offset": 151875904,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_spring_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "spring",
+   "slice": 1,
+   "surface": "Ground",
+   "families": [
+    "Ground"
+   ],
+   "acg": "Ground110",
+   "acg_res": "1K",
+   "orig_mean": [
+    78.3,
+    63.4,
+    52.0
+   ],
+   "src_mean": [
+    99.5,
+    90.1,
+    79.1
+   ],
+   "mean_dist": 43.5,
+   "offset": 152225456,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_spring_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "spring",
+   "slice": 2,
+   "surface": "Gravel_Road_A",
+   "families": [
+    "Road",
+    "Asphalt",
+    "Gravel"
+   ],
+   "acg": "Asphalt033",
+   "acg_res": "1K",
+   "orig_mean": [
+    93.2,
+    81.3,
+    70.5
+   ],
+   "src_mean": [
+    86.2,
+    81.8,
+    71.7
+   ],
+   "mean_dist": 7.2,
+   "offset": 152575008,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_spring_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "spring",
+   "slice": 3,
+   "surface": "Forest_Ground",
+   "families": [
+    "Ground",
+    "Foliage"
+   ],
+   "acg": "Foliage006",
+   "acg_res": "1K",
+   "orig_mean": [
+    60.5,
+    56.9,
+    32.7
+   ],
+   "src_mean": [
+    58.0,
+    85.4,
+    20.1
+   ],
+   "mean_dist": 31.4,
+   "offset": 152924560,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_spring_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "spring",
+   "slice": 4,
+   "surface": "Stone_Ground",
+   "families": [
+    "Rock",
+    "PavingStones",
+    "Gravel"
+   ],
+   "acg": "PavingStones084",
+   "acg_res": "1K",
+   "orig_mean": [
+    80.4,
+    76.9,
+    63.6
+   ],
+   "src_mean": [
+    70.6,
+    61.0,
+    43.1
+   ],
+   "mean_dist": 27.7,
+   "offset": 153274112,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_spring_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "spring",
+   "slice": 5,
+   "surface": "Rock_Ground",
+   "families": [
+    "Rock",
+    "Gravel"
+   ],
+   "acg": "Rock058",
+   "acg_res": "1K",
+   "orig_mean": [
+    84.7,
+    77.9,
+    71.8
+   ],
+   "src_mean": [
+    78.3,
+    84.4,
+    90.6
+   ],
+   "mean_dist": 20.9,
+   "offset": 153623664,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_spring_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "spring",
+   "slice": 6,
+   "surface": "Gravel_Road_B",
+   "families": [
+    "Road",
+    "Gravel",
+    "Asphalt"
+   ],
+   "acg": "Asphalt023S",
+   "acg_res": "1K",
+   "orig_mean": [
+    127.2,
+    114.2,
+    99.8
+   ],
+   "src_mean": [
+    122.3,
+    121.3,
+    113.0
+   ],
+   "mean_dist": 15.8,
+   "offset": 153973216,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_spring_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "spring",
+   "slice": 7,
+   "surface": "Gravel",
+   "families": [
+    "Gravel",
+    "Rock",
+    "PavingStones"
+   ],
+   "acg": "PavingStones151",
+   "acg_res": "1K",
+   "orig_mean": [
+    111.4,
+    104.0,
+    101.8
+   ],
+   "src_mean": [
+    118.3,
+    110.1,
+    98.6
+   ],
+   "mean_dist": 9.7,
+   "offset": 154322768,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_spring_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "spring",
+   "slice": 8,
+   "surface": "Grassy_Ground",
+   "families": [
+    "Grass",
+    "Ground"
+   ],
+   "acg": "Grass003",
+   "acg_res": "1K",
+   "orig_mean": [
+    64.9,
+    59.5,
+    40.2
+   ],
+   "src_mean": [
+    65.1,
+    73.3,
+    29.8
+   ],
+   "mean_dist": 17.3,
+   "offset": 154672320,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_spring_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "spring",
+   "slice": 9,
+   "surface": "Sand",
+   "families": [
+    "Ground"
+   ],
+   "acg": "Ground106",
+   "acg_res": "1K",
+   "orig_mean": [
+    116.7,
+    96.7,
+    75.4
+   ],
+   "src_mean": [
+    117.9,
+    97.6,
+    71.9
+   ],
+   "mean_dist": 3.8,
+   "offset": 155021872,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_spring_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "spring",
+   "slice": 10,
+   "surface": "Pebbles_Ground",
+   "families": [
+    "Gravel",
+    "PavingStones",
+    "Rock"
+   ],
+   "acg": "Rock064",
+   "acg_res": "1K",
+   "orig_mean": [
+    112.5,
+    97.0,
+    79.5
+   ],
+   "src_mean": [
+    116.7,
+    109.1,
+    71.1
+   ],
+   "mean_dist": 15.3,
+   "offset": 155371424,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_spring_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "spring",
+   "slice": 11,
+   "surface": "Soil_Grass",
+   "families": [
+    "Ground",
+    "Grass"
+   ],
+   "acg": "Ground110",
+   "acg_res": "1K",
+   "orig_mean": [
+    92.9,
+    77.8,
+    58.3
+   ],
+   "src_mean": [
+    99.5,
+    90.1,
+    79.1
+   ],
+   "mean_dist": 25.0,
+   "offset": 155720976,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_spring_diff_tarray",
+   "tier": "HQ",
+   "season": "spring",
+   "slice": 0,
+   "surface": "Grass",
+   "families": [
+    "Grass"
+   ],
+   "acg": "Grass002",
+   "acg_res": "1K",
+   "orig_mean": [
+    47.3,
+    49.9,
+    21.4
+   ],
+   "src_mean": [
+    56.1,
+    75.0,
+    34.8
+   ],
+   "mean_dist": 29.8,
+   "offset": 156070528,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_spring_diff_tarray",
+   "tier": "HQ",
+   "season": "spring",
+   "slice": 1,
+   "surface": "Ground",
+   "families": [
+    "Ground"
+   ],
+   "acg": "Ground110",
+   "acg_res": "1K",
+   "orig_mean": [
+    77.9,
+    63.1,
+    51.8
+   ],
+   "src_mean": [
+    99.5,
+    90.1,
+    79.1
+   ],
+   "mean_dist": 44.0,
+   "offset": 157468656,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_spring_diff_tarray",
+   "tier": "HQ",
+   "season": "spring",
+   "slice": 2,
+   "surface": "Gravel_Road_A",
+   "families": [
+    "Road",
+    "Asphalt",
+    "Gravel"
+   ],
+   "acg": "Asphalt033",
+   "acg_res": "1K",
+   "orig_mean": [
+    92.8,
+    80.7,
+    69.9
+   ],
+   "src_mean": [
+    86.2,
+    81.8,
+    71.7
+   ],
+   "mean_dist": 7.0,
+   "offset": 158866784,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_spring_diff_tarray",
+   "tier": "HQ",
+   "season": "spring",
+   "slice": 3,
+   "surface": "Forest_Ground",
+   "families": [
+    "Ground",
+    "Foliage"
+   ],
+   "acg": "Foliage006",
+   "acg_res": "1K",
+   "orig_mean": [
+    59.4,
+    56.0,
+    31.4
+   ],
+   "src_mean": [
+    58.0,
+    85.4,
+    20.1
+   ],
+   "mean_dist": 31.6,
+   "offset": 160264912,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_spring_diff_tarray",
+   "tier": "HQ",
+   "season": "spring",
+   "slice": 4,
+   "surface": "Stone_Ground",
+   "families": [
+    "Rock",
+    "PavingStones",
+    "Gravel"
+   ],
+   "acg": "PavingStones084",
+   "acg_res": "1K",
+   "orig_mean": [
+    79.6,
+    76.2,
+    62.4
+   ],
+   "src_mean": [
+    70.6,
+    61.0,
+    43.1
+   ],
+   "mean_dist": 26.1,
+   "offset": 161663040,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_spring_diff_tarray",
+   "tier": "HQ",
+   "season": "spring",
+   "slice": 5,
+   "surface": "Rock_Ground",
+   "families": [
+    "Rock",
+    "Gravel"
+   ],
+   "acg": "Rock058",
+   "acg_res": "1K",
+   "orig_mean": [
+    84.2,
+    77.4,
+    71.4
+   ],
+   "src_mean": [
+    78.3,
+    84.4,
+    90.6
+   ],
+   "mean_dist": 21.3,
+   "offset": 163061168,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_spring_diff_tarray",
+   "tier": "HQ",
+   "season": "spring",
+   "slice": 6,
+   "surface": "Gravel_Road_B",
+   "families": [
+    "Road",
+    "Gravel",
+    "Asphalt"
+   ],
+   "acg": "Asphalt023S",
+   "acg_res": "1K",
+   "orig_mean": [
+    126.3,
+    113.5,
+    99.1
+   ],
+   "src_mean": [
+    122.3,
+    121.3,
+    113.0
+   ],
+   "mean_dist": 16.4,
+   "offset": 164459296,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_spring_diff_tarray",
+   "tier": "HQ",
+   "season": "spring",
+   "slice": 7,
+   "surface": "Gravel",
+   "families": [
+    "Gravel",
+    "Rock",
+    "PavingStones"
+   ],
+   "acg": "PavingStones151",
+   "acg_res": "1K",
+   "orig_mean": [
+    110.4,
+    103.0,
+    100.6
+   ],
+   "src_mean": [
+    118.3,
+    110.1,
+    98.6
+   ],
+   "mean_dist": 10.8,
+   "offset": 165857424,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_spring_diff_tarray",
+   "tier": "HQ",
+   "season": "spring",
+   "slice": 8,
+   "surface": "Grassy_Ground",
+   "families": [
+    "Grass",
+    "Ground"
+   ],
+   "acg": "Grass003",
+   "acg_res": "1K",
+   "orig_mean": [
+    64.0,
+    58.6,
+    39.6
+   ],
+   "src_mean": [
+    65.1,
+    73.3,
+    29.8
+   ],
+   "mean_dist": 17.6,
+   "offset": 167255552,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_spring_diff_tarray",
+   "tier": "HQ",
+   "season": "spring",
+   "slice": 9,
+   "surface": "Sand",
+   "families": [
+    "Ground"
+   ],
+   "acg": "Ground106",
+   "acg_res": "1K",
+   "orig_mean": [
+    116.2,
+    96.1,
+    74.6
+   ],
+   "src_mean": [
+    117.9,
+    97.6,
+    71.9
+   ],
+   "mean_dist": 3.6,
+   "offset": 168653680,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_spring_diff_tarray",
+   "tier": "HQ",
+   "season": "spring",
+   "slice": 10,
+   "surface": "Pebbles_Ground",
+   "families": [
+    "Gravel",
+    "PavingStones",
+    "Rock"
+   ],
+   "acg": "Rock064",
+   "acg_res": "1K",
+   "orig_mean": [
+    111.9,
+    96.4,
+    79.0
+   ],
+   "src_mean": [
+    116.7,
+    109.1,
+    71.1
+   ],
+   "mean_dist": 15.7,
+   "offset": 170051808,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_spring_diff_tarray",
+   "tier": "HQ",
+   "season": "spring",
+   "slice": 11,
+   "surface": "Soil_Grass",
+   "families": [
+    "Ground",
+    "Grass"
+   ],
+   "acg": "Ground110",
+   "acg_res": "1K",
+   "orig_mean": [
+    92.3,
+    77.2,
+    57.7
+   ],
+   "src_mean": [
+    99.5,
+    90.1,
+    79.1
+   ],
+   "mean_dist": 26.0,
+   "offset": 171449936,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_spring_early_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "spring_early",
+   "slice": 0,
+   "surface": "Grass",
+   "families": [
+    "Grass"
+   ],
+   "acg": "Grass003",
+   "acg_res": "1K",
+   "orig_mean": [
+    76.1,
+    67.6,
+    57.0
+   ],
+   "src_mean": [
+    65.1,
+    73.3,
+    29.8
+   ],
+   "mean_dist": 29.9,
+   "offset": 172848064,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_spring_early_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "spring_early",
+   "slice": 1,
+   "surface": "Ground",
+   "families": [
+    "Ground"
+   ],
+   "acg": "Ground110",
+   "acg_res": "1K",
+   "orig_mean": [
+    64.5,
+    54.9,
+    43.9
+   ],
+   "src_mean": [
+    99.5,
+    90.1,
+    79.1
+   ],
+   "mean_dist": 60.8,
+   "offset": 172935472,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_spring_early_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "spring_early",
+   "slice": 2,
+   "surface": "Gravel_Road_A",
+   "families": [
+    "Road",
+    "Asphalt",
+    "Gravel"
+   ],
+   "acg": "Asphalt033",
+   "acg_res": "1K",
+   "orig_mean": [
+    83.6,
+    75.8,
+    72.8
+   ],
+   "src_mean": [
+    86.2,
+    81.8,
+    71.7
+   ],
+   "mean_dist": 6.7,
+   "offset": 173022880,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_spring_early_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "spring_early",
+   "slice": 3,
+   "surface": "Forest_Ground",
+   "families": [
+    "Ground",
+    "Foliage"
+   ],
+   "acg": "Foliage001",
+   "acg_res": "1K",
+   "orig_mean": [
+    82.2,
+    74.5,
+    64.4
+   ],
+   "src_mean": [
+    77.0,
+    100.0,
+    58.2
+   ],
+   "mean_dist": 26.7,
+   "offset": 173110288,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_spring_early_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "spring_early",
+   "slice": 4,
+   "surface": "Stone_Ground",
+   "families": [
+    "Rock",
+    "PavingStones",
+    "Gravel"
+   ],
+   "acg": "Rock058",
+   "acg_res": "1K",
+   "orig_mean": [
+    83.1,
+    80.2,
+    72.3
+   ],
+   "src_mean": [
+    78.3,
+    84.4,
+    90.6
+   ],
+   "mean_dist": 19.4,
+   "offset": 173197696,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_spring_early_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "spring_early",
+   "slice": 5,
+   "surface": "Rock_Ground",
+   "families": [
+    "Rock",
+    "Gravel"
+   ],
+   "acg": "Gravel041",
+   "acg_res": "1K",
+   "orig_mean": [
+    117.3,
+    115.9,
+    115.8
+   ],
+   "src_mean": [
+    141.3,
+    138.9,
+    117.7
+   ],
+   "mean_dist": 33.3,
+   "offset": 173285104,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_spring_early_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "spring_early",
+   "slice": 6,
+   "surface": "Gravel_Road_B",
+   "families": [
+    "Road",
+    "Gravel",
+    "Asphalt"
+   ],
+   "acg": "Asphalt023S",
+   "acg_res": "1K",
+   "orig_mean": [
+    127.8,
+    114.5,
+    100.2
+   ],
+   "src_mean": [
+    122.3,
+    121.3,
+    113.0
+   ],
+   "mean_dist": 15.5,
+   "offset": 173372512,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_spring_early_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "spring_early",
+   "slice": 7,
+   "surface": "Gravel",
+   "families": [
+    "Gravel",
+    "Rock",
+    "PavingStones"
+   ],
+   "acg": "PavingStones151",
+   "acg_res": "1K",
+   "orig_mean": [
+    113.4,
+    105.7,
+    103.7
+   ],
+   "src_mean": [
+    118.3,
+    110.1,
+    98.6
+   ],
+   "mean_dist": 8.4,
+   "offset": 173459920,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_spring_early_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "spring_early",
+   "slice": 8,
+   "surface": "Grassy_Ground",
+   "families": [
+    "Grass",
+    "Ground"
+   ],
+   "acg": "Grass003",
+   "acg_res": "1K",
+   "orig_mean": [
+    75.2,
+    66.3,
+    53.4
+   ],
+   "src_mean": [
+    65.1,
+    73.3,
+    29.8
+   ],
+   "mean_dist": 26.6,
+   "offset": 173547328,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_spring_early_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "spring_early",
+   "slice": 9,
+   "surface": "Sand",
+   "families": [
+    "Ground"
+   ],
+   "acg": "Ground106",
+   "acg_res": "1K",
+   "orig_mean": [
+    117.1,
+    97.2,
+    76.0
+   ],
+   "src_mean": [
+    117.9,
+    97.6,
+    71.9
+   ],
+   "mean_dist": 4.3,
+   "offset": 173634736,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_spring_early_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "spring_early",
+   "slice": 10,
+   "surface": "Pebbles_Ground",
+   "families": [
+    "Gravel",
+    "PavingStones",
+    "Rock"
+   ],
+   "acg": "Rock064",
+   "acg_res": "1K",
+   "orig_mean": [
+    113.1,
+    97.6,
+    79.9
+   ],
+   "src_mean": [
+    116.7,
+    109.1,
+    71.1
+   ],
+   "mean_dist": 15.0,
+   "offset": 173722144,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_spring_early_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "spring_early",
+   "slice": 11,
+   "surface": "Soil_Grass",
+   "families": [
+    "Ground",
+    "Grass"
+   ],
+   "acg": "Grass003",
+   "acg_res": "1K",
+   "orig_mean": [
+    66.4,
+    54.5,
+    36.5
+   ],
+   "src_mean": [
+    65.1,
+    73.3,
+    29.8
+   ],
+   "mean_dist": 20.0,
+   "offset": 173809552,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_spring_early_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "spring_early",
+   "slice": 0,
+   "surface": "Grass",
+   "families": [
+    "Grass"
+   ],
+   "acg": "Grass003",
+   "acg_res": "1K",
+   "orig_mean": [
+    75.3,
+    66.8,
+    56.0
+   ],
+   "src_mean": [
+    65.1,
+    73.3,
+    29.8
+   ],
+   "mean_dist": 28.9,
+   "offset": 173896960,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_spring_early_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "spring_early",
+   "slice": 1,
+   "surface": "Ground",
+   "families": [
+    "Ground"
+   ],
+   "acg": "Ground110",
+   "acg_res": "1K",
+   "orig_mean": [
+    64.4,
+    54.9,
+    43.9
+   ],
+   "src_mean": [
+    99.5,
+    90.1,
+    79.1
+   ],
+   "mean_dist": 60.9,
+   "offset": 174246512,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_spring_early_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "spring_early",
+   "slice": 2,
+   "surface": "Gravel_Road_A",
+   "families": [
+    "Road",
+    "Asphalt",
+    "Gravel"
+   ],
+   "acg": "Asphalt016",
+   "acg_res": "1K",
+   "orig_mean": [
+    82.9,
+    75.1,
+    72.1
+   ],
+   "src_mean": [
+    77.6,
+    76.1,
+    76.3
+   ],
+   "mean_dist": 6.8,
+   "offset": 174596064,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_spring_early_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "spring_early",
+   "slice": 3,
+   "surface": "Forest_Ground",
+   "families": [
+    "Ground",
+    "Foliage"
+   ],
+   "acg": "Foliage001",
+   "acg_res": "1K",
+   "orig_mean": [
+    80.7,
+    72.7,
+    62.0
+   ],
+   "src_mean": [
+    77.0,
+    100.0,
+    58.2
+   ],
+   "mean_dist": 27.8,
+   "offset": 174945616,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_spring_early_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "spring_early",
+   "slice": 4,
+   "surface": "Stone_Ground",
+   "families": [
+    "Rock",
+    "PavingStones",
+    "Gravel"
+   ],
+   "acg": "Rock058",
+   "acg_res": "1K",
+   "orig_mean": [
+    82.1,
+    79.3,
+    71.2
+   ],
+   "src_mean": [
+    78.3,
+    84.4,
+    90.6
+   ],
+   "mean_dist": 20.4,
+   "offset": 175295168,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_spring_early_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "spring_early",
+   "slice": 5,
+   "surface": "Rock_Ground",
+   "families": [
+    "Rock",
+    "Gravel"
+   ],
+   "acg": "Gravel041",
+   "acg_res": "1K",
+   "orig_mean": [
+    116.6,
+    115.2,
+    114.9
+   ],
+   "src_mean": [
+    141.3,
+    138.9,
+    117.7
+   ],
+   "mean_dist": 34.3,
+   "offset": 175644720,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_spring_early_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "spring_early",
+   "slice": 6,
+   "surface": "Gravel_Road_B",
+   "families": [
+    "Road",
+    "Gravel",
+    "Asphalt"
+   ],
+   "acg": "Asphalt023S",
+   "acg_res": "1K",
+   "orig_mean": [
+    127.2,
+    114.2,
+    99.8
+   ],
+   "src_mean": [
+    122.3,
+    121.3,
+    113.0
+   ],
+   "mean_dist": 15.8,
+   "offset": 175994272,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_spring_early_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "spring_early",
+   "slice": 7,
+   "surface": "Gravel",
+   "families": [
+    "Gravel",
+    "Rock",
+    "PavingStones"
+   ],
+   "acg": "PavingStones151",
+   "acg_res": "1K",
+   "orig_mean": [
+    111.4,
+    104.0,
+    101.8
+   ],
+   "src_mean": [
+    118.3,
+    110.1,
+    98.6
+   ],
+   "mean_dist": 9.7,
+   "offset": 176343824,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_spring_early_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "spring_early",
+   "slice": 8,
+   "surface": "Grassy_Ground",
+   "families": [
+    "Grass",
+    "Ground"
+   ],
+   "acg": "Grass003",
+   "acg_res": "1K",
+   "orig_mean": [
+    73.6,
+    64.5,
+    51.1
+   ],
+   "src_mean": [
+    65.1,
+    73.3,
+    29.8
+   ],
+   "mean_dist": 24.5,
+   "offset": 176693376,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_spring_early_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "spring_early",
+   "slice": 9,
+   "surface": "Sand",
+   "families": [
+    "Ground"
+   ],
+   "acg": "Ground106",
+   "acg_res": "1K",
+   "orig_mean": [
+    116.7,
+    96.7,
+    75.4
+   ],
+   "src_mean": [
+    117.9,
+    97.6,
+    71.9
+   ],
+   "mean_dist": 3.8,
+   "offset": 177042928,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_spring_early_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "spring_early",
+   "slice": 10,
+   "surface": "Pebbles_Ground",
+   "families": [
+    "Gravel",
+    "PavingStones",
+    "Rock"
+   ],
+   "acg": "Rock064",
+   "acg_res": "1K",
+   "orig_mean": [
+    112.5,
+    97.0,
+    79.5
+   ],
+   "src_mean": [
+    116.7,
+    109.1,
+    71.1
+   ],
+   "mean_dist": 15.3,
+   "offset": 177392480,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_spring_early_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "spring_early",
+   "slice": 11,
+   "surface": "Soil_Grass",
+   "families": [
+    "Ground",
+    "Grass"
+   ],
+   "acg": "Grass003",
+   "acg_res": "1K",
+   "orig_mean": [
+    65.6,
+    53.5,
+    35.7
+   ],
+   "src_mean": [
+    65.1,
+    73.3,
+    29.8
+   ],
+   "mean_dist": 20.6,
+   "offset": 177742032,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_spring_early_diff_tarray",
+   "tier": "HQ",
+   "season": "spring_early",
+   "slice": 0,
+   "surface": "Grass",
+   "families": [
+    "Grass"
+   ],
+   "acg": "Grass003",
+   "acg_res": "1K",
+   "orig_mean": [
+    74.7,
+    66.0,
+    55.2
+   ],
+   "src_mean": [
+    65.1,
+    73.3,
+    29.8
+   ],
+   "mean_dist": 28.1,
+   "offset": 178091584,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_spring_early_diff_tarray",
+   "tier": "HQ",
+   "season": "spring_early",
+   "slice": 1,
+   "surface": "Ground",
+   "families": [
+    "Ground"
+   ],
+   "acg": "Ground110",
+   "acg_res": "1K",
+   "orig_mean": [
+    64.1,
+    54.8,
+    43.7
+   ],
+   "src_mean": [
+    99.5,
+    90.1,
+    79.1
+   ],
+   "mean_dist": 61.2,
+   "offset": 179489712,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_spring_early_diff_tarray",
+   "tier": "HQ",
+   "season": "spring_early",
+   "slice": 2,
+   "surface": "Gravel_Road_A",
+   "families": [
+    "Road",
+    "Asphalt",
+    "Gravel"
+   ],
+   "acg": "Asphalt016",
+   "acg_res": "1K",
+   "orig_mean": [
+    82.1,
+    74.2,
+    71.3
+   ],
+   "src_mean": [
+    77.6,
+    76.1,
+    76.3
+   ],
+   "mean_dist": 7.0,
+   "offset": 180887840,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_spring_early_diff_tarray",
+   "tier": "HQ",
+   "season": "spring_early",
+   "slice": 3,
+   "surface": "Forest_Ground",
+   "families": [
+    "Ground",
+    "Foliage"
+   ],
+   "acg": "Foliage001",
+   "acg_res": "1K",
+   "orig_mean": [
+    79.0,
+    70.8,
+    59.6
+   ],
+   "src_mean": [
+    77.0,
+    100.0,
+    58.2
+   ],
+   "mean_dist": 29.3,
+   "offset": 182285968,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_spring_early_diff_tarray",
+   "tier": "HQ",
+   "season": "spring_early",
+   "slice": 4,
+   "surface": "Stone_Ground",
+   "families": [
+    "Rock",
+    "PavingStones",
+    "Gravel"
+   ],
+   "acg": "Rock058",
+   "acg_res": "1K",
+   "orig_mean": [
+    81.3,
+    78.5,
+    70.5
+   ],
+   "src_mean": [
+    78.3,
+    84.4,
+    90.6
+   ],
+   "mean_dist": 21.2,
+   "offset": 183684096,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_spring_early_diff_tarray",
+   "tier": "HQ",
+   "season": "spring_early",
+   "slice": 5,
+   "surface": "Rock_Ground",
+   "families": [
+    "Rock",
+    "Gravel"
+   ],
+   "acg": "Gravel041",
+   "acg_res": "1K",
+   "orig_mean": [
+    116.1,
+    114.7,
+    114.2
+   ],
+   "src_mean": [
+    141.3,
+    138.9,
+    117.7
+   ],
+   "mean_dist": 35.1,
+   "offset": 185082224,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_spring_early_diff_tarray",
+   "tier": "HQ",
+   "season": "spring_early",
+   "slice": 6,
+   "surface": "Gravel_Road_B",
+   "families": [
+    "Road",
+    "Gravel",
+    "Asphalt"
+   ],
+   "acg": "Asphalt023S",
+   "acg_res": "1K",
+   "orig_mean": [
+    126.3,
+    113.5,
+    99.1
+   ],
+   "src_mean": [
+    122.3,
+    121.3,
+    113.0
+   ],
+   "mean_dist": 16.4,
+   "offset": 186480352,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_spring_early_diff_tarray",
+   "tier": "HQ",
+   "season": "spring_early",
+   "slice": 7,
+   "surface": "Gravel",
+   "families": [
+    "Gravel",
+    "Rock",
+    "PavingStones"
+   ],
+   "acg": "PavingStones151",
+   "acg_res": "1K",
+   "orig_mean": [
+    110.4,
+    103.0,
+    100.6
+   ],
+   "src_mean": [
+    118.3,
+    110.1,
+    98.6
+   ],
+   "mean_dist": 10.8,
+   "offset": 187878480,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_spring_early_diff_tarray",
+   "tier": "HQ",
+   "season": "spring_early",
+   "slice": 8,
+   "surface": "Grassy_Ground",
+   "families": [
+    "Grass",
+    "Ground"
+   ],
+   "acg": "Grass003",
+   "acg_res": "1K",
+   "orig_mean": [
+    72.0,
+    62.6,
+    48.7
+   ],
+   "src_mean": [
+    65.1,
+    73.3,
+    29.8
+   ],
+   "mean_dist": 22.8,
+   "offset": 189276608,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_spring_early_diff_tarray",
+   "tier": "HQ",
+   "season": "spring_early",
+   "slice": 9,
+   "surface": "Sand",
+   "families": [
+    "Ground"
+   ],
+   "acg": "Ground106",
+   "acg_res": "1K",
+   "orig_mean": [
+    116.2,
+    96.1,
+    74.6
+   ],
+   "src_mean": [
+    117.9,
+    97.6,
+    71.9
+   ],
+   "mean_dist": 3.6,
+   "offset": 190674736,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_spring_early_diff_tarray",
+   "tier": "HQ",
+   "season": "spring_early",
+   "slice": 10,
+   "surface": "Pebbles_Ground",
+   "families": [
+    "Gravel",
+    "PavingStones",
+    "Rock"
+   ],
+   "acg": "Rock064",
+   "acg_res": "1K",
+   "orig_mean": [
+    111.9,
+    96.4,
+    79.0
+   ],
+   "src_mean": [
+    116.7,
+    109.1,
+    71.1
+   ],
+   "mean_dist": 15.7,
+   "offset": 192072864,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_spring_early_diff_tarray",
+   "tier": "HQ",
+   "season": "spring_early",
+   "slice": 11,
+   "surface": "Soil_Grass",
+   "families": [
+    "Ground",
+    "Grass"
+   ],
+   "acg": "Grass003",
+   "acg_res": "1K",
+   "orig_mean": [
+    64.9,
+    52.7,
+    35.0
+   ],
+   "src_mean": [
+    65.1,
+    73.3,
+    29.8
+   ],
+   "mean_dist": 21.2,
+   "offset": 193470992,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_summer_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "summer",
+   "slice": 0,
+   "surface": "Grass",
+   "families": [
+    "Grass"
+   ],
+   "acg": "Grass003",
+   "acg_res": "1K",
+   "orig_mean": [
+    57.7,
+    64.5,
+    22.5
+   ],
+   "src_mean": [
+    65.1,
+    73.3,
+    29.8
+   ],
+   "mean_dist": 13.7,
+   "offset": 238911232,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_summer_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "summer",
+   "slice": 1,
+   "surface": "Ground",
+   "families": [
+    "Ground"
+   ],
+   "acg": "Ground110",
+   "acg_res": "1K",
+   "orig_mean": [
+    68.7,
+    62.5,
+    56.0
+   ],
+   "src_mean": [
+    99.5,
+    90.1,
+    79.1
+   ],
+   "mean_dist": 47.3,
+   "offset": 238998640,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_summer_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "summer",
+   "slice": 2,
+   "surface": "Gravel_Road_A",
+   "families": [
+    "Road",
+    "Asphalt",
+    "Gravel"
+   ],
+   "acg": "Asphalt033",
+   "acg_res": "1K",
+   "orig_mean": [
+    83.6,
+    75.8,
+    72.8
+   ],
+   "src_mean": [
+    86.2,
+    81.8,
+    71.7
+   ],
+   "mean_dist": 6.7,
+   "offset": 239086048,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_summer_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "summer",
+   "slice": 3,
+   "surface": "Forest_Ground",
+   "families": [
+    "Ground",
+    "Foliage"
+   ],
+   "acg": "Foliage006",
+   "acg_res": "1K",
+   "orig_mean": [
+    56.1,
+    53.8,
+    32.6
+   ],
+   "src_mean": [
+    58.0,
+    85.4,
+    20.1
+   ],
+   "mean_dist": 34.1,
+   "offset": 239173456,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_summer_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "summer",
+   "slice": 4,
+   "surface": "Stone_Ground",
+   "families": [
+    "Rock",
+    "PavingStones",
+    "Gravel"
+   ],
+   "acg": "Rock058",
+   "acg_res": "1K",
+   "orig_mean": [
+    83.1,
+    80.2,
+    72.3
+   ],
+   "src_mean": [
+    78.3,
+    84.4,
+    90.6
+   ],
+   "mean_dist": 19.4,
+   "offset": 239260864,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_summer_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "summer",
+   "slice": 5,
+   "surface": "Rock_Ground",
+   "families": [
+    "Rock",
+    "Gravel"
+   ],
+   "acg": "Rock058",
+   "acg_res": "1K",
+   "orig_mean": [
+    95.4,
+    91.8,
+    88.1
+   ],
+   "src_mean": [
+    78.3,
+    84.4,
+    90.6
+   ],
+   "mean_dist": 18.7,
+   "offset": 239348272,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_summer_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "summer",
+   "slice": 6,
+   "surface": "Gravel_Road_B",
+   "families": [
+    "Road",
+    "Gravel",
+    "Asphalt"
+   ],
+   "acg": "Asphalt023S",
+   "acg_res": "1K",
+   "orig_mean": [
+    127.8,
+    114.5,
+    100.2
+   ],
+   "src_mean": [
+    122.3,
+    121.3,
+    113.0
+   ],
+   "mean_dist": 15.5,
+   "offset": 239435680,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_summer_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "summer",
+   "slice": 7,
+   "surface": "Gravel",
+   "families": [
+    "Gravel",
+    "Rock",
+    "PavingStones"
+   ],
+   "acg": "PavingStones151",
+   "acg_res": "1K",
+   "orig_mean": [
+    113.4,
+    105.7,
+    103.7
+   ],
+   "src_mean": [
+    118.3,
+    110.1,
+    98.6
+   ],
+   "mean_dist": 8.4,
+   "offset": 239523088,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_summer_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "summer",
+   "slice": 8,
+   "surface": "Grassy_Ground",
+   "families": [
+    "Grass",
+    "Ground"
+   ],
+   "acg": "Grass002",
+   "acg_res": "1K",
+   "orig_mean": [
+    65.0,
+    62.1,
+    44.8
+   ],
+   "src_mean": [
+    56.1,
+    75.0,
+    34.8
+   ],
+   "mean_dist": 18.5,
+   "offset": 239610496,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_summer_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "summer",
+   "slice": 9,
+   "surface": "Sand",
+   "families": [
+    "Ground"
+   ],
+   "acg": "Ground109",
+   "acg_res": "1K",
+   "orig_mean": [
+    124.8,
+    114.9,
+    93.2
+   ],
+   "src_mean": [
+    125.7,
+    110.5,
+    84.4
+   ],
+   "mean_dist": 9.9,
+   "offset": 239697904,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_summer_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "summer",
+   "slice": 10,
+   "surface": "Pebbles_Ground",
+   "families": [
+    "Gravel",
+    "PavingStones",
+    "Rock"
+   ],
+   "acg": "PavingStones151",
+   "acg_res": "1K",
+   "orig_mean": [
+    113.2,
+    102.8,
+    89.0
+   ],
+   "src_mean": [
+    118.3,
+    110.1,
+    98.6
+   ],
+   "mean_dist": 13.0,
+   "offset": 239785312,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_summer_diff_LowTex_tarray",
+   "tier": "LQ",
+   "season": "summer",
+   "slice": 11,
+   "surface": "Soil_Grass",
+   "families": [
+    "Ground",
+    "Grass"
+   ],
+   "acg": "Grass004",
+   "acg_res": "1K",
+   "orig_mean": [
+    94.3,
+    92.8,
+    58.9
+   ],
+   "src_mean": [
+    96.4,
+    108.6,
+    48.3
+   ],
+   "mean_dist": 19.1,
+   "offset": 239872720,
+   "nbytes": 87408
+  },
+  {
+   "array": "MicroSplatConfig_summer_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "summer",
+   "slice": 0,
+   "surface": "Grass",
+   "families": [
+    "Grass"
+   ],
+   "acg": "Grass003",
+   "acg_res": "1K",
+   "orig_mean": [
+    56.6,
+    63.2,
+    21.9
+   ],
+   "src_mean": [
+    65.1,
+    73.3,
+    29.8
+   ],
+   "mean_dist": 15.4,
+   "offset": 239960128,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_summer_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "summer",
+   "slice": 1,
+   "surface": "Ground",
+   "families": [
+    "Ground"
+   ],
+   "acg": "Ground110",
+   "acg_res": "1K",
+   "orig_mean": [
+    68.3,
+    62.2,
+    55.8
+   ],
+   "src_mean": [
+    99.5,
+    90.1,
+    79.1
+   ],
+   "mean_dist": 47.9,
+   "offset": 240309680,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_summer_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "summer",
+   "slice": 2,
+   "surface": "Gravel_Road_A",
+   "families": [
+    "Road",
+    "Asphalt",
+    "Gravel"
+   ],
+   "acg": "Asphalt016",
+   "acg_res": "1K",
+   "orig_mean": [
+    82.9,
+    75.1,
+    72.1
+   ],
+   "src_mean": [
+    77.6,
+    76.1,
+    76.3
+   ],
+   "mean_dist": 6.8,
+   "offset": 240659232,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_summer_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "summer",
+   "slice": 3,
+   "surface": "Forest_Ground",
+   "families": [
+    "Ground",
+    "Foliage"
+   ],
+   "acg": "Foliage006",
+   "acg_res": "1K",
+   "orig_mean": [
+    54.3,
+    52.1,
+    31.3
+   ],
+   "src_mean": [
+    58.0,
+    85.4,
+    20.1
+   ],
+   "mean_dist": 35.4,
+   "offset": 241008784,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_summer_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "summer",
+   "slice": 4,
+   "surface": "Stone_Ground",
+   "families": [
+    "Rock",
+    "PavingStones",
+    "Gravel"
+   ],
+   "acg": "Rock058",
+   "acg_res": "1K",
+   "orig_mean": [
+    82.1,
+    79.3,
+    71.2
+   ],
+   "src_mean": [
+    78.3,
+    84.4,
+    90.6
+   ],
+   "mean_dist": 20.4,
+   "offset": 241358336,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_summer_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "summer",
+   "slice": 5,
+   "surface": "Rock_Ground",
+   "families": [
+    "Rock",
+    "Gravel"
+   ],
+   "acg": "Rock058",
+   "acg_res": "1K",
+   "orig_mean": [
+    94.9,
+    91.3,
+    87.7
+   ],
+   "src_mean": [
+    78.3,
+    84.4,
+    90.6
+   ],
+   "mean_dist": 18.1,
+   "offset": 241707888,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_summer_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "summer",
+   "slice": 6,
+   "surface": "Gravel_Road_B",
+   "families": [
+    "Road",
+    "Gravel",
+    "Asphalt"
+   ],
+   "acg": "Asphalt023S",
+   "acg_res": "1K",
+   "orig_mean": [
+    127.2,
+    114.2,
+    99.8
+   ],
+   "src_mean": [
+    122.3,
+    121.3,
+    113.0
+   ],
+   "mean_dist": 15.8,
+   "offset": 242057440,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_summer_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "summer",
+   "slice": 7,
+   "surface": "Gravel",
+   "families": [
+    "Gravel",
+    "Rock",
+    "PavingStones"
+   ],
+   "acg": "PavingStones151",
+   "acg_res": "1K",
+   "orig_mean": [
+    111.4,
+    104.0,
+    101.8
+   ],
+   "src_mean": [
+    118.3,
+    110.1,
+    98.6
+   ],
+   "mean_dist": 9.7,
+   "offset": 242406992,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_summer_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "summer",
+   "slice": 8,
+   "surface": "Grassy_Ground",
+   "families": [
+    "Grass",
+    "Ground"
+   ],
+   "acg": "Grass002",
+   "acg_res": "1K",
+   "orig_mean": [
+    64.4,
+    61.4,
+    44.1
+   ],
+   "src_mean": [
+    56.1,
+    75.0,
+    34.8
+   ],
+   "mean_dist": 18.4,
+   "offset": 242756544,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_summer_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "summer",
+   "slice": 9,
+   "surface": "Sand",
+   "families": [
+    "Ground"
+   ],
+   "acg": "Ground109",
+   "acg_res": "1K",
+   "orig_mean": [
+    124.2,
+    114.5,
+    92.5
+   ],
+   "src_mean": [
+    125.7,
+    110.5,
+    84.4
+   ],
+   "mean_dist": 9.2,
+   "offset": 243106096,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_summer_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "summer",
+   "slice": 10,
+   "surface": "Pebbles_Ground",
+   "families": [
+    "Gravel",
+    "PavingStones",
+    "Rock"
+   ],
+   "acg": "PavingStones151",
+   "acg_res": "1K",
+   "orig_mean": [
+    112.6,
+    102.3,
+    88.6
+   ],
+   "src_mean": [
+    118.3,
+    110.1,
+    98.6
+   ],
+   "mean_dist": 13.9,
+   "offset": 243455648,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_summer_diff_NormalTex_tarray",
+   "tier": "NQ",
+   "season": "summer",
+   "slice": 11,
+   "surface": "Soil_Grass",
+   "families": [
+    "Ground",
+    "Grass"
+   ],
+   "acg": "Grass004",
+   "acg_res": "1K",
+   "orig_mean": [
+    93.2,
+    91.5,
+    57.8
+   ],
+   "src_mean": [
+    96.4,
+    108.6,
+    48.3
+   ],
+   "mean_dist": 19.7,
+   "offset": 243805200,
+   "nbytes": 349552
+  },
+  {
+   "array": "MicroSplatConfig_summer_diff_tarray",
+   "tier": "HQ",
+   "season": "summer",
+   "slice": 0,
+   "surface": "Grass",
+   "families": [
+    "Grass"
+   ],
+   "acg": "Grass003",
+   "acg_res": "1K",
+   "orig_mean": [
+    55.6,
+    62.2,
+    21.3
+   ],
+   "src_mean": [
+    65.1,
+    73.3,
+    29.8
+   ],
+   "mean_dist": 16.9,
+   "offset": 244154752,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_summer_diff_tarray",
+   "tier": "HQ",
+   "season": "summer",
+   "slice": 1,
+   "surface": "Ground",
+   "families": [
+    "Ground"
+   ],
+   "acg": "Ground110",
+   "acg_res": "1K",
+   "orig_mean": [
+    67.9,
+    61.8,
+    55.4
+   ],
+   "src_mean": [
+    99.5,
+    90.1,
+    79.1
+   ],
+   "mean_dist": 48.6,
+   "offset": 245552880,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_summer_diff_tarray",
+   "tier": "HQ",
+   "season": "summer",
+   "slice": 2,
+   "surface": "Gravel_Road_A",
+   "families": [
+    "Road",
+    "Asphalt",
+    "Gravel"
+   ],
+   "acg": "Asphalt016",
+   "acg_res": "1K",
+   "orig_mean": [
+    82.1,
+    74.2,
+    71.3
+   ],
+   "src_mean": [
+    77.6,
+    76.1,
+    76.3
+   ],
+   "mean_dist": 7.0,
+   "offset": 246951008,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_summer_diff_tarray",
+   "tier": "HQ",
+   "season": "summer",
+   "slice": 3,
+   "surface": "Forest_Ground",
+   "families": [
+    "Ground",
+    "Foliage"
+   ],
+   "acg": "Foliage006",
+   "acg_res": "1K",
+   "orig_mean": [
+    52.7,
+    50.6,
+    30.1
+   ],
+   "src_mean": [
+    58.0,
+    85.4,
+    20.1
+   ],
+   "mean_dist": 36.6,
+   "offset": 248349136,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_summer_diff_tarray",
+   "tier": "HQ",
+   "season": "summer",
+   "slice": 4,
+   "surface": "Stone_Ground",
+   "families": [
+    "Rock",
+    "PavingStones",
+    "Gravel"
+   ],
+   "acg": "Rock058",
+   "acg_res": "1K",
+   "orig_mean": [
+    81.3,
+    78.5,
+    70.5
+   ],
+   "src_mean": [
+    78.3,
+    84.4,
+    90.6
+   ],
+   "mean_dist": 21.2,
+   "offset": 249747264,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_summer_diff_tarray",
+   "tier": "HQ",
+   "season": "summer",
+   "slice": 5,
+   "surface": "Rock_Ground",
+   "families": [
+    "Rock",
+    "Gravel"
+   ],
+   "acg": "Rock058",
+   "acg_res": "1K",
+   "orig_mean": [
+    94.4,
+    90.8,
+    87.3
+   ],
+   "src_mean": [
+    78.3,
+    84.4,
+    90.6
+   ],
+   "mean_dist": 17.6,
+   "offset": 251145392,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_summer_diff_tarray",
+   "tier": "HQ",
+   "season": "summer",
+   "slice": 6,
+   "surface": "Gravel_Road_B",
+   "families": [
+    "Road",
+    "Gravel",
+    "Asphalt"
+   ],
+   "acg": "Asphalt023S",
+   "acg_res": "1K",
+   "orig_mean": [
+    126.3,
+    113.5,
+    99.1
+   ],
+   "src_mean": [
+    122.3,
+    121.3,
+    113.0
+   ],
+   "mean_dist": 16.4,
+   "offset": 252543520,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_summer_diff_tarray",
+   "tier": "HQ",
+   "season": "summer",
+   "slice": 7,
+   "surface": "Gravel",
+   "families": [
+    "Gravel",
+    "Rock",
+    "PavingStones"
+   ],
+   "acg": "PavingStones151",
+   "acg_res": "1K",
+   "orig_mean": [
+    110.4,
+    103.0,
+    100.6
+   ],
+   "src_mean": [
+    118.3,
+    110.1,
+    98.6
+   ],
+   "mean_dist": 10.8,
+   "offset": 253941648,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_summer_diff_tarray",
+   "tier": "HQ",
+   "season": "summer",
+   "slice": 8,
+   "surface": "Grassy_Ground",
+   "families": [
+    "Grass",
+    "Ground"
+   ],
+   "acg": "Grass002",
+   "acg_res": "1K",
+   "orig_mean": [
+    63.2,
+    59.8,
+    43.2
+   ],
+   "src_mean": [
+    56.1,
+    75.0,
+    34.8
+   ],
+   "mean_dist": 18.7,
+   "offset": 255339776,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_summer_diff_tarray",
+   "tier": "HQ",
+   "season": "summer",
+   "slice": 9,
+   "surface": "Sand",
+   "families": [
+    "Ground"
+   ],
+   "acg": "Ground109",
+   "acg_res": "1K",
+   "orig_mean": [
+    122.1,
+    112.7,
+    90.8
+   ],
+   "src_mean": [
+    125.7,
+    110.5,
+    84.4
+   ],
+   "mean_dist": 7.7,
+   "offset": 256737904,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_summer_diff_tarray",
+   "tier": "HQ",
+   "season": "summer",
+   "slice": 10,
+   "surface": "Pebbles_Ground",
+   "families": [
+    "Gravel",
+    "PavingStones",
+    "Rock"
+   ],
+   "acg": "PavingStones151",
+   "acg_res": "1K",
+   "orig_mean": [
+    112.0,
+    101.7,
+    88.0
+   ],
+   "src_mean": [
+    118.3,
+    110.1,
+    98.6
+   ],
+   "mean_dist": 14.9,
+   "offset": 258136032,
+   "nbytes": 1398128
+  },
+  {
+   "array": "MicroSplatConfig_summer_diff_tarray",
+   "tier": "HQ",
+   "season": "summer",
+   "slice": 11,
+   "surface": "Soil_Grass",
+   "families": [
+    "Ground",
+    "Grass"
+   ],
+   "acg": "Grass004",
+   "acg_res": "1K",
+   "orig_mean": [
+    91.7,
+    90.0,
+    56.6
+   ],
+   "src_mean": [
+    96.4,
+    108.6,
+    48.3
+   ],
+   "mean_dist": 20.9,
+   "offset": 259534160,
+   "nbytes": 1398128
+  }
+ ]
+}
