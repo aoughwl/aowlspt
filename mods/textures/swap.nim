@@ -49,8 +49,41 @@ import aowlspt/fast
 import manifest
 
 const
-  TgtLoadAsset* = "UnityEngine.AssetBundle::LoadAsset"
-  TgtReqAsset*  = "UnityEngine.AssetBundleRequest::get_asset"
+  ## PATCH BY VERIFIED STATIC RVA, not by name.
+  ##
+  ## By-name resolution is dead on build 1.1.0.1.46777: `findClass` and
+  ## `findMethod` return NON-NIL handles into unmapped memory, so
+  ## `methodPointer` reads null and there is no fallback that needs a
+  ## MethodInfo. Measured live on both the host thread and the Unity main
+  ## thread in one boot -- 6 probed, 6 with an unreadable MethodInfo, 0
+  ## comparable -- so it is not a threading artefact.
+  ##
+  ## The spec therefore names the address and DECLARES the frame shape, which
+  ## with no MethodInfo the host cannot derive and refuses to guess:
+  ##
+  ##   Type::Method@0xRVA/<shape>!<hex prologue>
+  ##
+  ## `io>o` = instance, one object argument (`System.String` is an object on
+  ## this ABI), returns an object. `LoadAsset(string)` is rid=6 at RVA
+  ## 0x5250100 (rid=7 @0x5250340 is the `(string, Type)` overload), resolved
+  ## offline with `tools/il2cpp_resolve.py ... type 30974`.
+  ##
+  ## The trailing bytes are the same 16 as `LoadAssetProlog` below, handed to
+  ## the host so it can compare them against its STARTUP SNAPSHOT of the
+  ## original bytes rather than against live memory -- the only compare that
+  ## still gives the right answer if another feature detours this function
+  ## first.
+  TgtLoadAsset* = "UnityEngine.AssetBundle::LoadAsset@0x5250100/io>o" &
+                  "!48895C24084889742410574883EC2080"
+  TgtLoadAssetRva* = 0x5250100'u32
+  ## `AssetBundleRequest::get_asset` is rid-resolved to a tail-jump
+  ## virtual-dispatch thunk on this build, and is off unless asked for.
+  ## rid=23 @ RVA 0xB196C0 (type 30977), prologue
+  ## `48 8B 11 48 8B 82 78 01 00 00 48 8B 92 80 01 00` -- a tail-jump
+  ## virtual-dispatch thunk, which is why it stays off unless asked for.
+  TgtReqAsset*  = "UnityEngine.AssetBundleRequest::get_asset@0xB196C0/i>o" &
+                  "!488B11488B8278010000488B92800100"
+  TgtReqAssetRva* = 0xB196C0'u32
 
   ## The first 16 bytes of `UnityEngine.AssetBundle::LoadAsset` on build
   ## 1.1.0.1.46777, shared by both the `(string)` and `(string, Type)` overloads
@@ -89,6 +122,14 @@ static int aowl_tex_readable(const void* p, int n) {
     return ((unsigned long long)p + (unsigned long long)n <= end) ? 1 : 0;
   }
 }
+/* GameAssembly.dll's ACTUAL base, asked for at runtime. 0x180000000 is the PE
+ * PREFERRED base -- the space tools/il2cpp_resolve.py reports RVAs in -- and
+ * the module is ASLR-relocated in the live process. Never hardcode it. */
+static void* aowl_tex_rva(unsigned int rva) {
+  HMODULE ga = GetModuleHandleA("GameAssembly.dll");
+  if (!ga) return NULL;
+  return (void*)((unsigned char*)ga + rva);
+}
 static int aowl_tex_readcode(const void* p, unsigned char* out, int n) {
   if (!aowl_tex_readable(p, n)) return 0;
   memcpy(out, p, (size_t)n);
@@ -99,6 +140,22 @@ proc texFill(arr, src: Il2CppPtr; n: uint64) {.importc: "aowl_tex_fill", nodecl.
 proc texReadable(p: Il2CppPtr; n: int32): int32 {.importc: "aowl_tex_readable", nodecl.}
 proc texReadCode(p, outp: Il2CppPtr; n: int32): int32 {.
   importc: "aowl_tex_readcode", nodecl.}
+proc texRva(rva: uint32): Il2CppPtr {.importc: "aowl_tex_rva", nodecl.}
+
+proc rvaHex(v: uint32): string =
+  ## An RVA as bare hex, the way every address in this project is written.
+  ## Local because Nimony's strutils has no `toHex`.
+  const D = "0123456789ABCDEF"
+  var x = v
+  if x == 0'u32:
+    return "0"
+  result = ""
+  var buf = ""
+  while x != 0'u32:
+    buf = buf & $D[int(x and 0xF'u32)]
+    x = x shr 4
+  for i in countdown(buf.len - 1, 0):
+    result = result & $buf[i]
 
 # --------------------------------------------------------------------------
 # VRAM budgeting
@@ -258,107 +315,70 @@ proc buildAndSwap(idx: int; obj: GameObj): bool =
 # The postfix — one body, branches on the mode
 # --------------------------------------------------------------------------
 
-proc onTextureReturn(target, args: string): HookResult =
-  ## Fires after `LoadAsset` returns, on the Unity thread. In `probe` mode it
-  ## does nothing but count — the cheapest possible proof the hook is safe.
+proc onTextureReturn(frame: PatchFrame): TypedResult =
+  ## Fires after `LoadAsset` returns, on the Unity thread.
+  ##
+  ## A TYPED handler, because the patch is installed by RVA and an RVA has no
+  ## MethodInfo — which every JSON firing path needs to read the declared types
+  ## from. The typed frame carries the shape the spec declared (`io>o`), so
+  ## `resultPointer` reads the returned `Object*` out of RAX knowing that is
+  ## where the declared return kind puts it.
+  ##
+  ## It counts, and it never replaces. That is the whole of `probe` mode, and
+  ## on this build it is the whole of what this mod can do — see the clamp in
+  ## `maybeArm`: the `match` and `full` rungs are built on
+  ## `GameObj.invoke("get_name")`, which is by-name resolution, which is dead
+  ## here. Counting a non-null return is a real measurement; inventing a name
+  ## for it would not be.
   inc gFires
-  if gMode <= ModeProbe:
-    return keepResult()
-
-  let r = hookResult(args)
-  if r.isNull:
-    return keepResult()
-  let obj = asObject(r)
-  if not obj.ok:
-    return keepResult()
-  let nmeR = obj.invoke("get_name")
-  let name = nmeR.asText()
-  if name.len == 0:
-    return keepResult()
-  inc gTexReturns
-  let idx = lookup(name)
-  if idx < 0:
-    # The single most useful thing one live run can tell us: what BSG actually
-    # names the textures it loads. The curated manifest is a NAME table, so if
-    # the namespaces disagree there will be zero matches and no other evidence
-    # of why. Log a hard-capped SAMPLE (never a storm) of the names that came
-    # back and missed, so the pipeline can be re-aimed from one run instead of
-    # guessing. Capped at MaxUnmatchedLogged for the whole session.
-    if gUnmatchedLogged < MaxUnmatchedLogged:
-      inc gUnmatchedLogged
-      info "textures  unmatched sample " & $gUnmatchedLogged & "/" &
-           $MaxUnmatchedLogged & ": \"" & name & "\""
-      if gUnmatchedLogged == MaxUnmatchedLogged:
-        info "textures  unmatched sampling stopped at " &
-             $MaxUnmatchedLogged & " names (the cap); counts keep running"
-    return keepResult()
-  if entryConf(idx) < gMinConf:
-    return keepResult()
-  if gCatFilter.len > 0 and find(gCatFilter, "," & entryCat(idx) & ",") < 0:
-    return keepResult()
-  inc gMatches
-  gLastMatchName = name
-  let cost = tierBytes(entryTier(idx))
-  if gResidentBytes + cost > gBudgetBytes:
-    inc gRefusedBudget
-    return keepResult()
-  inc gWithinBudget
-
-  if gMode < ModeFull or not gCanUpload:
-    # Matched and within budget, but not uploading (match mode, or upload not
-    # available). The game keeps its stock texture; this is observable proof the
-    # match half works ahead of enabling pixels.
-    return keepResult()
-
-  if buildAndSwap(idx, obj):
-    gResidentBytes = gResidentBytes + cost
-    inc gSwapped
-    if gSwapped <= 5'i64 or (gSwapped mod 25'i64) == 0'i64:
-      info "textures  swapped " & name & " (" & entryCat(idx) & ", " &
-           entryMap(idx) & "); resident " &
-           $(gResidentBytes div (1024'i64 * 1024'i64)) & " MB of " &
-           $(gBudgetBytes div (1024'i64 * 1024'i64)) & " MB"
-  elif not gUploadFailReported:
-    gUploadFailReported = true
-    warn "textures  the first upload of " & name & " did not take (LoadImage " &
-         "returned false or the file was unreadable); further failures are " &
-         "silent — the game keeps its stock texture"
-  result = keepResult()
+  var okPtr = false
+  let obj = resultPointer(frame, okPtr)
+  if okPtr and obj != 0'u64:
+    inc gTexReturns
+  result = frameContinue()
 
 # --------------------------------------------------------------------------
 # Target verification
 # --------------------------------------------------------------------------
 
-proc verifyTarget(spec: string; expect: array[16, uint8];
+proc verifyTarget(rva: uint32; label: string; expect: array[16, uint8];
                   outFn: var Il2CppPtr): string =
-  ## Resolves `spec` the way the host will and byte-verifies its prologue.
-  ## Returns "" on success (with `outFn` set to the code pointer), else the
-  ## reason the install must be refused. Nothing here patches anything — it only
-  ## reads metadata and 16 bytes of code.
+  ## Belt-and-braces: resolve the RVA against the LIVE module base and
+  ## byte-compare its prologue here, before asking the host to patch it.
+  ##
+  ## This is deliberately duplicated work -- the host re-verifies the same 16
+  ## bytes against its own startup SNAPSHOT of the original code, which is the
+  ## authoritative compare -- but this one is what stops the mod from ever
+  ## handing `hookReturnTyped` an address it has not itself looked at.
+  ##
+  ## Resolution is by RVA and NOT by name. `findClass`/`findMethod` return
+  ## non-nil handles into unmapped memory on this build, so `methodPointer`
+  ## reads null and there is nothing to verify; the RVA came from
+  ## `tools/il2cpp_resolve.py` offline and is checked here against the bytes
+  ## that build actually compiled.
+  ##
+  ## One caveat stated rather than hidden: this reads LIVE memory, so it is
+  ## only correct because nothing else in this host detours `LoadAsset`, and
+  ## because a target's first verify necessarily precedes its first patch. If
+  ## that ever stops being true this compare will read a trampoline and refuse
+  ## a correct RVA -- which the mismatch message below says out loud.
   outFn = cast[Il2CppPtr](0)
-  let sep = find(spec, "::")
-  if sep < 0:
-    return "not a Type::Method spec"
-  let typ = substr(spec, 0, sep - 1)
-  let meth = substr(spec, sep + 2)
-  let cls = findClass(gRt, typ)
-  if cls == nil:
-    return "type not found: " & typ
-  let m = findMethod(gRt, cls, meth, -1)   # any arity, exactly as the host does
-  if cast[uint](m) == 0'u:
-    return "method not found: " & meth
-  let fn = methodPointer(gRt, m)
+  let fn = texRva(rva)
   if cast[uint](fn) == 0'u:
-    return "methodPointer is null — the host would refuse this too, no patch"
+    return "GameAssembly.dll is not mapped (GetModuleHandleA returned NULL), " &
+           "so there is no base to add 0x" & rvaHex(rva) & " to"
   var buf: array[16, uint8] = [0'u8, 0, 0, 0, 0, 0, 0, 0,
                                0, 0, 0, 0, 0, 0, 0, 0]
   if texReadCode(fn, cast[Il2CppPtr](addr buf[0]), 16'i32) != 16'i32:
-    return "code at the resolved pointer is not readable"
+    return "the 16 bytes at GameAssembly+0x" & rvaHex(rva) &
+           " are not committed and readable"
   for i in 0 ..< 16:
     if buf[i] != expect[i]:
-      return "prologue MISMATCH — refusing to patch. got [" & bytesHex(buf) &
-             "] expected [" & bytesHex(expect) & "]. The resolved pointer is " &
-             "not the method this build expects; patching it would corrupt code."
+      return "prologue MISMATCH at GameAssembly+0x" & rvaHex(rva) &
+             " — refusing to patch. got [" & bytesHex(buf) & "] expected [" &
+             bytesHex(expect) & "]. Either this is a different game build, " &
+             "or something detoured " & label & " before this ran and these " &
+             "are its trampoline bytes. Patching anyway would corrupt code."
   outFn = fn
   result = ""
 
@@ -375,9 +395,22 @@ proc probeUpload() =
   if not gRt.has(eArrayNew):
     warn "textures  runtime has no il2cpp_array_new; upload off (match-only)"
     return
+  # NOT `findClass(...) != nil`. That gate was bogus for the same reason
+  # `runtimeReady`'s was: on this build `findClass` hands back a NON-NIL handle
+  # into UNMAPPED memory, so a nil test passes unconditionally. Here that was
+  # worse than useless — the handle goes straight to `il2cpp_array_new` as the
+  # element class, and allocating an array with a garbage klass is a crash, not
+  # a declined feature. So the handle is PROBED: its first 8 bytes must be
+  # readable, and so must the pointer they hold.
   gByteClass = findClass(gRt, "System.Byte")
   if gByteClass == nil:
     warn "textures  System.Byte did not resolve; upload off (match-only)"
+    return
+  if texReadable(cast[Il2CppPtr](gByteClass), 8'i32) == 0'i32:
+    warn "textures  System.Byte resolved to a NON-NIL but UNREADABLE handle " &
+         "— by-name class resolution does not work on this build, so the " &
+         "handle is not a klass. Upload off (match-only); nothing allocated."
+    gByteClass = cast[Il2CppClass](0)
     return
   gLoadImage = bindMethod(gRt, "UnityEngine.ImageConversion", "LoadImage", 2)
   if not gLoadImage.ok:
@@ -390,40 +423,55 @@ proc probeUpload() =
     return
   gCanUpload = true
 
-proc installVerified(spec: string; expect: array[16, uint8]): bool =
+proc installVerified(spec: string; rva: uint32;
+                     expect: array[16, uint8]): bool =
   ## Verify then install one postfix. Never installs on a failed verification.
+  ##
+  ## `hookReturnTyped`, not `hookReturn`: an RVA patch has no MethodInfo, and
+  ## every JSON firing path needs one to read the declared types from. The host
+  ## refuses that combination outright rather than handing a handler an empty
+  ## payload. The typed frame needs only the shape, which `spec` declares.
   var fn: Il2CppPtr = cast[Il2CppPtr](0)
-  let why = verifyTarget(spec, expect, fn)
+  let why = verifyTarget(rva, spec, expect, fn)
   if why.len > 0:
     warn "textures  NOT hooking " & spec & ": " & why
     return false
   var pro: array[16, uint8] = [0'u8, 0, 0, 0, 0, 0, 0, 0,
                                0, 0, 0, 0, 0, 0, 0, 0]
   discard texReadCode(fn, cast[Il2CppPtr](addr pro[0]), 16'i32)
-  info "textures  verified " & spec & " prologue [" & bytesHex(pro) &
-       "] — installing postfix"
-  let st = hookReturn(spec, onTextureReturn, withArgs = false)
+  info "textures  verified GameAssembly+0x" & rvaHex(rva) &
+       " prologue [" & bytesHex(pro) & "] — installing typed postfix"
+  let st = hookReturnTyped(spec, onTextureReturn)
   if st == Ok:
     info "textures  hooked " & spec
     return true
-  warn "textures  hookReturn refused " & spec & ": " & lastError()
+  warn "textures  hookReturnTyped refused " & spec & ": " & lastError()
   result = false
 
 proc runtimeReady(): bool =
-  ## Drain-INDEPENDENT readiness: the IL2CPP runtime is up and its metadata is
-  ## queryable. This is the correct "are we past boot enough to install" signal
-  ## on this build, where the host's per-frame drain never binds a method — so
-  ## the drain is NOT usable as a liveness gate. `hookReturn` does not need the
-  ## drain anyway: it is a native inline detour on `LoadAsset`'s own code, and
-  ## the game calls `LoadAsset` on the Unity thread, so the postfix runs there
-  ## for free. A well-known Unity type resolving means the assemblies are loaded
-  ## and metadata queries are safe — which is all the install and the postfix
-  ## require.
+  ## THE OLD GATE WAS A LIE, and this is what replaced it.
+  ##
+  ## It was `findClass(gRt, "UnityEngine.AssetBundle") != nil`, read as "the
+  ## metadata is queryable". On build 1.1.0.1.46777 `findClass` returns a
+  ## NON-NIL handle into UNMAPPED memory, so that test passed unconditionally
+  ## and proved exactly nothing — it could never have been false, whatever the
+  ## runtime was doing.
+  ##
+  ## What is asserted now is only what this mod actually needs, and each part
+  ## is something that can genuinely be false:
+  ##   * GameAssembly.dll is mapped, and
+  ##   * the 16 bytes at the target RVA are committed, readable, and the ones
+  ##     this build compiled.
+  ##
+  ## That is the whole precondition for an RVA patch. Note it says nothing
+  ## about metadata: the install no longer needs any. The post-boot quiet
+  ## period is enforced separately by the arm delay in `readyToArm`, which is
+  ## what actually keeps this off the boot bundle-load storm.
   if not gRt.loaded:
     gRt = openIl2Cpp()
-  if not gRt.loaded:
-    return false
-  result = findClass(gRt, "UnityEngine.AssetBundle") != nil
+  var fn: Il2CppPtr = cast[Il2CppPtr](0)
+  result = verifyTarget(TgtLoadAssetRva, TgtLoadAsset, LoadAssetProlog,
+                        fn).len == 0
 
 proc readyToArm(): bool =
   ## True once the arm delay has elapsed (clearing the boot bundle-load storm)
@@ -447,11 +495,27 @@ proc maybeArm*(): bool =
   # a well-known type resolved, so gRt is loaded here.
   gArmTried = true
 
+  # THE CLAMP, stated in the log rather than discovered from zero matches.
+  #
+  # `match` and `full` both run through `GameObj.invoke("get_name")` on the
+  # returned asset, and `invoke` resolves by name. By-name resolution is dead
+  # on build 1.1.0.1.46777 — `findClass`/`findMethod` return non-nil handles
+  # into unmapped memory — so those rungs cannot work here whatever the config
+  # says. Running them anyway would produce a mod that hooks correctly,
+  # matches nothing, and looks like a bad manifest. Clamping and SAYING SO is
+  # the honest outcome; the rungs come back the moment name resolution does.
+  if gMode > ModeProbe:
+    warn "textures  mode " & $gMode & " (match/full) CLAMPED to probe: the " &
+         "name-lookup half needs by-name method resolution, which returns " &
+         "non-nil handles into unmapped memory on this build. The RVA hook " &
+         "itself is unaffected and still installs — it will count firings."
+    gMode = ModeProbe
+
   if gMode >= ModeFull:
     probeUpload()
 
   var bound = 0
-  if installVerified(TgtLoadAsset, LoadAssetProlog):
+  if installVerified(TgtLoadAsset, TgtLoadAssetRva, LoadAssetProlog):
     inc bound
   if gHookAsync:
     warn "textures  hookAsync is on: AssetBundleRequest::get_asset is a " &
@@ -463,7 +527,7 @@ proc maybeArm*(): bool =
     const ThunkProlog: array[16, uint8] = [
       0x48'u8, 0x8B, 0x11, 0x48, 0x8B, 0x82, 0x78, 0x01,
       0x00,    0x00, 0x48, 0x8B, 0x92, 0x80, 0x01, 0x00]
-    if installVerified(TgtReqAsset, ThunkProlog):
+    if installVerified(TgtReqAsset, TgtReqAssetRva, ThunkProlog):
       inc bound
 
   gArmed = bound > 0
