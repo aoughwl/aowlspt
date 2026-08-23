@@ -44,7 +44,10 @@
         "mods tab: pages go into ",
         "subtab BUTTON(s) cloned into a clone of ",
         "version brand: REFUSING to write",
-        "hide seasons: Common UI/MenuScreen/SeasonsButton switched off"
+        "hide seasons: Common UI/MenuScreen/SeasonsButton switched off",
+        "DID NOT TAKE on any of the ",
+        "verified by reading m_text back",
+        "hide seasons: GIVING UP after "
       ]
     },
     {
