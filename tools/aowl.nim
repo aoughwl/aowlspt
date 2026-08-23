@@ -380,12 +380,12 @@ proc nameIndex(e: Env, binDir: string): bool =
       return run(e, "the name->RVA index still matches GameAssembly.dll",
                  "python " & quoted(gen) & " check " & quoted(gameasm) & " " &
                  quoted(idx), e.repo)
-    info "aowlspt-names.idx is present but GameAssembly.dll is not, so it " &
+    note "aowlspt-names.idx is present but GameAssembly.dll is not, so it " &
          "could NOT be checked for staleness here. The host verifies the " &
          "build stamp at load and refuses the whole index on mismatch."
     return true
 
-  info "no aowlspt-names.idx generated: " &
+  note "no aowlspt-names.idx generated: " &
        (if fileExists(gameasm): "no .cache\\global-metadata.dec.dat (decrypt " &
                                 "it with tools/metablob.py)"
         else: "no GameAssembly.dll at " & gameasm & " (set AOWLSPT_GAMEASM)") &

@@ -133,6 +133,27 @@
 #define AOWL_NIDX_MAX_PROBES  64            /* log2(4e6) = 22; 64 is slack, not a limit */
 #define AOWL_NIDX_MAX_KEY     512
 #define AOWL_NIDX_MAX_FAULTS  8
+/* How many times first-use may re-ask for the mapped module before giving up.
+ * Bounded like every other loop here; one try per `ready()` call. */
+#define AOWL_NIDX_MAX_STAMP_TRIES 256
+
+/* Which check declined, so the message can name it rather than blame the
+ * headers for a module that is not mapped. */
+#define AOWL_NIDX_ST_FAULT     0   /* pre-set; survives an SEH unwind */
+#define AOWL_NIDX_ST_OK        1
+#define AOWL_NIDX_ST_NOMODULE  2
+#define AOWL_NIDX_ST_DOSSPAN   3
+#define AOWL_NIDX_ST_NOMZ      4
+#define AOWL_NIDX_ST_LFANEW    5
+#define AOWL_NIDX_ST_NTSPAN    6
+#define AOWL_NIDX_ST_NOPE      7
+
+typedef struct {
+    uint64_t key;
+    uint64_t addr;      /* the address the failing check was looking at */
+    uint32_t lfanew;
+    int32_t  status;
+} aowl_nidx_stamp_t;
 
 /* Must match tools/il2cpp_nameindex.py exactly. */
 #define AOWL_NIDX_FNV_BASIS   0xCBF29CE484222325ULL
@@ -146,12 +167,23 @@ static uint64_t       aowl_nidx_image_key = 0;
 static uint64_t       aowl_nidx_file_hash = 0;
 static int32_t        aowl_nidx_ok = 0;
 static int32_t        aowl_nidx_faults = 0;
+/* The index file can be read long before GameAssembly.dll is mapped: this host
+ * initialises at DLL-attach, ~15ms in, and the Unity player loads the IL2CPP
+ * module about a second later. That is NOT "the PE headers are unreadable" --
+ * it is "there is no module to read yet", and the two used to share one
+ * message. The file is parsed and STAGED, `aowl_nidx_ok` stays 0 so nothing
+ * resolves, and the stamp is verified on first use. */
+static int32_t        aowl_nidx_staged = 0;
+static int32_t        aowl_nidx_stamp_tries = 0;
 /* Why a refusal happened, in a sentence naming WHICH check declined. A feature
  * that declines silently is the worst outcome this project produces. */
 static char           aowl_nidx_reason[320] = "not initialised";
 
 static const char *aowl_nameidx_reason(void) { return aowl_nidx_reason; }
-static int32_t     aowl_nameidx_ready(void)  { return aowl_nidx_ok; }
+static int32_t     aowl_nameidx_ready(void);   /* defined below; may verify */
+/* Parsed and sound, but the build stamp is not verified yet because the
+ * module was not mapped. Not an error, and not usable either. */
+static int32_t     aowl_nameidx_staged(void) { return aowl_nidx_staged; }
 static int32_t     aowl_nameidx_count(void)  { return (int32_t)aowl_nidx_count; }
 static uint64_t    aowl_nameidx_imagekey(void) { return aowl_nidx_image_key; }
 static uint64_t    aowl_nameidx_filehash(void) { return aowl_nidx_file_hash; }
@@ -181,23 +213,54 @@ static uint32_t aowl_nidx_h_check(const char *s, int32_t n) {
 /* Runs under its own `aowl_p_p_seh` (see `aowl_nidx_image_key_guarded`). Every
  * hop is `aowl_is_readable`-gated first, so the guard is a backstop and not the
  * mechanism. Writes through `out`; returns non-null on success. */
+/* A bounded "append" pair, so the failure message can name the address without
+ * pulling in <stdio.h> or user32's wsprintf. */
+static void aowl_nidx_cat(char *dst, int32_t cap, int32_t *at, const char *src) {
+    int32_t i = 0;
+    while (*at < cap - 1 && src[i] && i < 512) dst[(*at)++] = src[i++];
+    dst[*at] = 0;
+}
+static void aowl_nidx_cathex(char *dst, int32_t cap, int32_t *at, uint64_t v) {
+    static const char hx[] = "0123456789ABCDEF";
+    char tmp[17];
+    int32_t d = 0;
+    aowl_nidx_cat(dst, cap, at, "0x");
+    if (v == 0) { aowl_nidx_cat(dst, cap, at, "0"); return; }
+    while (v && d < 16) { tmp[d++] = hx[v & 0xF]; v >>= 4; }
+    while (d > 0 && *at < cap - 1) dst[(*at)++] = tmp[--d];
+    dst[*at] = 0;
+}
+
 static void *aowl_nidx_image_key_probe(void *out) {
-    uint64_t *slot = (uint64_t *)out;
+    aowl_nidx_stamp_t *st = (aowl_nidx_stamp_t *)out;
     unsigned char *base = (unsigned char *)GetModuleHandleA("GameAssembly.dll");
     uint32_t e_lfanew, tds, entry, sizeimg, csum;
     unsigned char *nt;
     uint64_t k;
 
-    if (!base) return 0;
-    if (!aowl_is_readable(base, 0x40)) return 0;
-    if (base[0] != 'M' || base[1] != 'Z') return 0;
+    /* `status` is pre-set to FAULT by the caller and `addr` is updated BEFORE
+     * each read, never after: a caught access violation unwinds this whole body
+     * silently, so any bookkeeping placed after a faulting read never runs. */
+    if (!base) { st->status = AOWL_NIDX_ST_NOMODULE; return 0; }
+    st->addr = (uint64_t)(uintptr_t)base;
+    if (!aowl_is_readable(base, 0x40)) { st->status = AOWL_NIDX_ST_DOSSPAN; return 0; }
+    if (base[0] != 'M' || base[1] != 'Z') { st->status = AOWL_NIDX_ST_NOMZ; return 0; }
+
+    st->addr = (uint64_t)(uintptr_t)(base + 0x3C);
     e_lfanew = *(uint32_t *)(base + 0x3C);
-    if (e_lfanew < 0x40 || e_lfanew > 0x1000) return 0;
+    st->lfanew = e_lfanew;
+    if (e_lfanew < 0x40 || e_lfanew > 0x1000) { st->status = AOWL_NIDX_ST_LFANEW; return 0; }
 
     nt = base + e_lfanew;
-    /* 4 signature + 20 COFF + enough of the optional header to reach CheckSum. */
-    if (!aowl_is_readable(nt, 4 + 20 + 68)) return 0;
-    if (nt[0] != 'P' || nt[1] != 'E' || nt[2] != 0 || nt[3] != 0) return 0;
+    st->addr = (uint64_t)(uintptr_t)nt;
+    /* 4 signature + 20 COFF + enough of the optional header to reach CheckSum.
+     * 92 bytes, and the mapped headers are their own PAGE_READONLY region of at
+     * least one page, so this span does not straddle a region boundary -- the
+     * trap `aowl_is_readable` sets for spans that do. */
+    if (!aowl_is_readable(nt, 4 + 20 + 68)) { st->status = AOWL_NIDX_ST_NTSPAN; return 0; }
+    if (nt[0] != 'P' || nt[1] != 'E' || nt[2] != 0 || nt[3] != 0) {
+        st->status = AOWL_NIDX_ST_NOPE; return 0;
+    }
 
     tds     = *(uint32_t *)(nt + 4 + 4);        /* COFF TimeDateStamp   */
     entry   = *(uint32_t *)(nt + 24 + 16);      /* Optional AddressOfEntryPoint */
@@ -208,15 +271,121 @@ static void *aowl_nidx_image_key_probe(void *out) {
     k = (k * AOWL_NIDX_FNV_PRIME) ^ (uint64_t)entry;
     k = (k * AOWL_NIDX_FNV_PRIME) ^ (uint64_t)csum;
     if (k == 0) k = 1;   /* 0 is the "could not read" sentinel */
-    *slot = k;
+    st->key = k;
+    st->status = AOWL_NIDX_ST_OK;
     return out;
 }
 
-static uint64_t aowl_nidx_image_key_guarded(void) {
-    uint64_t k = 0;
-    /* The ONLY guard in this file, and nothing above it holds one at init. */
-    if (!aowl_p_p_seh((void *)aowl_nidx_image_key_probe, (void *)&k)) return 0;
-    return k;
+/* Runs the probe under exactly ONE guard. `aowl_p_p_seh` is NOT re-entrant --
+ * a nested arm disarms the outer one -- and this is reachable from first-use
+ * paths that may already hold a guard, so when one is held on this thread the
+ * probe is called directly and the OUTER guard covers it. Every hop inside is
+ * `aowl_is_readable`-gated anyway; the guard is a backstop, not the mechanism. */
+static void aowl_nidx_read_stamp(aowl_nidx_stamp_t *st) {
+    st->key = 0;
+    st->addr = 0;
+    st->lfanew = 0;
+    st->status = AOWL_NIDX_ST_FAULT;
+    if (aowl_seh_active) {
+        (void)aowl_nidx_image_key_probe((void *)st);
+    } else {
+        (void)aowl_p_p_seh((void *)aowl_nidx_image_key_probe, (void *)st);
+    }
+}
+
+/* Verify the staged index's build stamp against the mapped module.
+ *   1 -- verified, the index is now live
+ *   0 -- not yet: GameAssembly.dll is not mapped. Stays staged, retried later.
+ *  -1 -- refused for good; the buffer has been freed.
+ *
+ * ONLY `imageKey` is checkable here. The index also carries `fileHash`
+ * (SHA-256 of GameAssembly.dll on disk) and that is NOT reproducible from a
+ * mapped image -- the loader page-aligns and relocates sections, so the mapped
+ * bytes are not the file bytes. It stays a build-time guard, checked offline by
+ * `tools/il2cpp_nameindex.py check`, and the log says so rather than implying
+ * more was verified than was. */
+static int32_t aowl_nidx_verify_stamp(void) {
+    aowl_nidx_stamp_t st;
+    uint64_t want;
+    char msg[320];
+
+    if (!aowl_nidx_staged || !aowl_nidx_buf) {
+        aowl_nidx_fail("no staged index to verify");
+        return -1;
+    }
+    want = *(uint64_t *)(aowl_nidx_buf + 16);
+
+    if (aowl_nidx_stamp_tries >= AOWL_NIDX_MAX_STAMP_TRIES) {
+        HeapFree(GetProcessHeap(), 0, aowl_nidx_buf);
+        aowl_nidx_buf = 0; aowl_nidx_staged = 0; aowl_nidx_count = 0;
+        aowl_nidx_fail("GameAssembly.dll never became visible to "
+                       "GetModuleHandleA across every retry, so the index "
+                       "build stamp could never be verified; refusing it "
+                       "rather than trusting it unverified");
+        aowl_nidx_faults++;
+        return -1;
+    }
+    aowl_nidx_stamp_tries++;
+    aowl_nidx_read_stamp(&st);
+
+    if (st.status != AOWL_NIDX_ST_OK) {
+        if (st.status == AOWL_NIDX_ST_NOMODULE) {
+            aowl_nidx_fail("GameAssembly.dll is not mapped yet -- "
+                           "GetModuleHandleA(GameAssembly.dll) returned NULL, "
+                           "which at DLL-attach is EXPECTED and is NOT a "
+                           "header-read failure. The index file is parsed and "
+                           "STAGED; its build stamp is verified at first use, "
+                           "and nothing resolves through it until then");
+            return 0;   /* retryable: NOT a fault, NOT a refusal */
+        }
+        /* Everything else is a real read failure. Name the check and where. */
+        {
+            const char *what =
+                st.status == AOWL_NIDX_ST_DOSSPAN ? "the 0x40-byte DOS header span is unreadable at" :
+                st.status == AOWL_NIDX_ST_NOMZ    ? "no MZ signature at base+0x00, i.e." :
+                st.status == AOWL_NIDX_ST_LFANEW  ? "e_lfanew is outside 0x40..0x1000, read at" :
+                st.status == AOWL_NIDX_ST_NTSPAN  ? "the 92-byte NT-header span (signature..CheckSum) is unreadable at" :
+                st.status == AOWL_NIDX_ST_NOPE    ? "no PE\\0\\0 signature at" :
+                                                    "the read FAULTED (guard tripped) at";
+            int32_t at = 0;
+            msg[0] = 0;
+            aowl_nidx_cat(msg, (int32_t)sizeof(msg), &at,
+                          "build-stamp read failed: ");
+            aowl_nidx_cat(msg, (int32_t)sizeof(msg), &at, what);
+            aowl_nidx_cat(msg, (int32_t)sizeof(msg), &at, " ");
+            aowl_nidx_cathex(msg, (int32_t)sizeof(msg), &at, st.addr);
+            aowl_nidx_cat(msg, (int32_t)sizeof(msg), &at, " (e_lfanew=");
+            aowl_nidx_cathex(msg, (int32_t)sizeof(msg), &at, (uint64_t)st.lfanew);
+            aowl_nidx_cat(msg, (int32_t)sizeof(msg), &at,
+                          "). Refusing the index rather than trusting it "
+                          "unverified");
+        }
+        HeapFree(GetProcessHeap(), 0, aowl_nidx_buf);
+        aowl_nidx_buf = 0; aowl_nidx_staged = 0; aowl_nidx_count = 0;
+        aowl_nidx_fail(msg);
+        aowl_nidx_faults++;
+        return -1;
+    }
+
+    if (st.key != want) {
+        HeapFree(GetProcessHeap(), 0, aowl_nidx_buf);
+        aowl_nidx_buf = 0; aowl_nidx_staged = 0; aowl_nidx_count = 0;
+        /* The important refusal. A stale RVA is a wrong-but-mapped function. */
+        aowl_nidx_fail("STALE INDEX -- aowlspt-names.idx was generated from a "
+                       "DIFFERENT GameAssembly.dll than the one loaded "
+                       "(imageKey mismatch). Every RVA in it would be a "
+                       "wrong-but-mapped address, so the WHOLE index is "
+                       "refused. Regenerate it: tools/il2cpp_nameindex.py gen");
+        aowl_nidx_faults++;
+        return -1;
+    }
+
+    aowl_nidx_image_key = st.key;
+    aowl_nidx_file_hash = *(uint64_t *)(aowl_nidx_buf + 24);
+    aowl_nidx_staged = 0;
+    aowl_nidx_ok = 1;
+    aowl_nidx_reason[0] = 0;
+    return 1;
 }
 
 /* -- load ------------------------------------------------------------------ */
@@ -231,7 +400,6 @@ static int32_t aowl_nameidx_init(const char *dir) {
     DWORD got = 0;
     unsigned char *buf;
     uint32_t ver, count, i;
-    uint64_t want_key, have_key;
     size_t need;
     const uint64_t *hashes;
 
@@ -318,27 +486,9 @@ static int32_t aowl_nameidx_init(const char *dir) {
         return 0;
     }
 
-    want_key = *(uint64_t *)(buf + 16);
-    have_key = aowl_nidx_image_key_guarded();
-    if (have_key == 0) {
-        HeapFree(GetProcessHeap(), 0, buf);
-        aowl_nidx_fail("could not read GameAssembly.dll's PE headers to verify "
-                       "the index build stamp; refusing the index rather than "
-                       "trusting it unverified");
-        aowl_nidx_faults++;
-        return 0;
-    }
-    if (have_key != want_key) {
-        HeapFree(GetProcessHeap(), 0, buf);
-        /* The important refusal. A stale RVA is a wrong-but-mapped function. */
-        aowl_nidx_fail("STALE INDEX -- aowlspt-names.idx was generated from a "
-                       "DIFFERENT GameAssembly.dll than the one loaded. Every "
-                       "RVA in it would be a wrong-but-mapped address, so the "
-                       "WHOLE index is refused. Regenerate it: "
-                       "tools/il2cpp_nameindex.py gen");
-        aowl_nidx_faults++;
-        return 0;
-    }
+    /* The build stamp is NOT verified here. Verification needs the mapped
+     * module and this runs at DLL-attach, before the Unity player has loaded
+     * GameAssembly.dll -- see `aowl_nidx_verify_stamp`. */
 
     /* The generator emits ascending unique hashes; a binary search over an
      * unsorted array silently returns wrong entries rather than failing, so it
@@ -357,13 +507,26 @@ static int32_t aowl_nameidx_init(const char *dir) {
     }
 
     if (aowl_nidx_buf) HeapFree(GetProcessHeap(), 0, aowl_nidx_buf);
-    aowl_nidx_buf       = buf;
-    aowl_nidx_count     = count;
-    aowl_nidx_image_key = have_key;
-    aowl_nidx_file_hash = *(uint64_t *)(buf + 24);
-    aowl_nidx_ok        = 1;
-    aowl_nidx_reason[0] = 0;
-    return 1;
+    aowl_nidx_buf         = buf;
+    aowl_nidx_count       = count;
+    aowl_nidx_image_key   = 0;
+    aowl_nidx_file_hash   = 0;
+    aowl_nidx_ok          = 0;
+    aowl_nidx_staged      = 1;
+    aowl_nidx_stamp_tries = 0;
+    /* The file is sound. Whether it describes THIS GameAssembly.dll is decided
+     * by the stamp, attempted now and retried at first use if the module is
+     * not mapped yet. `aowl_nidx_ok` is only ever set by that check. */
+    return aowl_nidx_verify_stamp() == 1 ? 1 : 0;
+}
+
+/* Ready means VERIFIED. A staged-but-unverified index answers nothing, and
+ * asking re-attempts the stamp -- which is how an index loaded at DLL-attach
+ * goes live once GameAssembly.dll appears, without a second file read. */
+static int32_t aowl_nameidx_ready(void) {
+    if (aowl_nidx_ok) return 1;
+    if (aowl_nidx_staged) (void)aowl_nidx_verify_stamp();
+    return aowl_nidx_ok;
 }
 
 static void aowl_nameidx_shutdown(void) {
@@ -371,6 +534,7 @@ static void aowl_nameidx_shutdown(void) {
     aowl_nidx_buf = 0;
     aowl_nidx_count = 0;
     aowl_nidx_ok = 0;
+    aowl_nidx_staged = 0;
     aowl_nidx_fail("shut down");
 }
 
