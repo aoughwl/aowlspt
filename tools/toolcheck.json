@@ -1,0 +1,145 @@
+{
+  "//": "Cases for `python tools/toolcheck.py`. Data, not code, exactly like",
+  "//1": "deploy.json -- adding a case must not require touching the runner.",
+  "//2": "",
+  "//3": "FIELDS",
+  "//4": "  name     unique id",
+  "//5": "  why      the bug this case exists to stop coming back. Required.",
+  "//6": "  needs    'any' | 'menu' (client at the main menu) | 'raid' (in a raid)",
+  "//7": "  write    true if the batch needs liveInspectorWrite + 'allow write'",
+  "//8": "  batches  list of batches. SEPARATE batches on purpose: per-batch",
+  "//9": "           anchors ($comp, $f1) do NOT survive across batches, and one",
+  "//10": "          of the historical bugs was exactly that they seemed to.",
+  "//11": "  assert   regexes that MUST appear in the normalised answer",
+  "//12": "  refuse   regexes that MUST appear AND are declared to be a REFUSAL.",
+  "//13": "           Reported separately, because 'the tool correctly declined'",
+  "//14": "           is the behaviour half these bugs broke, and a case with no",
+  "//15": "           refuse entry cannot lock it in.",
+  "//16": "  deny     regexes that must NOT appear -- the WRONG answer's shape.",
+  "//17": "           A refuse case without a deny is weak: it proves the",
+  "//18": "           refusal was printed, not that no answer was also printed.",
+  "//19": "",
+  "//20": "Answers are NORMALISED before matching: every pointer becomes <PTR>,",
+  "//21": "every count-of-nodes/ms becomes <N>. Assert on names, shapes, counts",
+  "//22": "and the FORM of an answer. Never on an address -- they change per run",
+  "//23": "and an address assertion fails for a reason that is not a regression.",
+  "cases": [
+    {
+      "name": "channel-alive",
+      "why": "If the channel is dead every other case 'passes' by matching nothing. This must run first and its failure aborts the suite.",
+      "needs": "any",
+      "batches": [["echo aowl-toolcheck-alive"]],
+      "assert": ["aowl-toolcheck-alive"]
+    },
+    {
+      "name": "roots-shape",
+      "why": "`roots` is how everything is reached. Its answer shape (transform + GameObject + name, two distinct anchors) is the contract every other case depends on.",
+      "needs": "any",
+      "batches": [["roots"]],
+      "assert": [
+        "\\[\\$r\\d+\\] transform=<PTR>\\s+go=<PTR> \\(\\$rgo\\d+\\)\\s+name=\"",
+        "DontDestroyOnLoad"
+      ],
+      "deny": ["rootCount=0\\s*$"]
+    },
+    {
+      "name": "roots-lists-menu-ui",
+      "why": "The live UI is in DontDestroyOnLoad, which SceneManager excludes. Before `roots`, `find` searched only $preloader's subtree and reported names 'NOT PRESENT' that were merely unreachable.",
+      "needs": "menu",
+      "batches": [["roots"]],
+      "assert": ["name=\"Menu UI\"", "name=\"Preloader UI\""]
+    },
+    {
+      "name": "find-stopped-early-is-not-absence",
+      "why": "A bounded search that ran out of budget must SAY SO. Reporting a name as absent when the search merely stopped is a confidently-wrong answer.",
+      "needs": "menu",
+      "batches": [["find CharacterSlotView in Menu UI 400"]],
+      "refuse": ["STOPPED EARLY"],
+      "deny": ["NOT PRESENT", "searched EXHAUSTIVELY"]
+    },
+    {
+      "name": "find-exhaustive-says-so",
+      "why": "The other half of the same contract: a search that DID cover the tree must be distinguishable from one that did not, or 'not found' means nothing.",
+      "needs": "menu",
+      "batches": [["find zzz-no-such-object-zzz in Preloader UI 2000000"]],
+      "assert": ["searched EXHAUSTIVELY"],
+      "deny": ["STOPPED EARLY"]
+    },
+    {
+      "name": "component-null-is-an-answer",
+      "why": "A failed component lookup must be reported as an ANSWER, not swallowed. When it was swallowed, $comp kept the PREVIOUS batch's pointer.",
+      "needs": "any",
+      "batches": [["roots", "component $rgo0 EFT.NoSuchTypeAtAll"]],
+      "refuse": ["(?i)NULL|no such (component|type)|not found"],
+      "deny": ["\\$comp = <PTR>", "(?i)^\\s*fields of "]
+    },
+    {
+      "name": "comp-anchor-not-stale",
+      "why": "THE bug: a failed `component` left $comp holding the previous lookup's pointer, so the next `click`/`dump` acted on the wrong object and printed a complete, entirely fictional field map.",
+      "needs": "any",
+      "batches": [[
+        "roots",
+        "component $rgo0 UnityEngine.RectTransform",
+        "component $rgo0 EFT.NoSuchTypeAtAll",
+        "dump $comp"
+      ]],
+      "refuse": ["(?i)\\$comp (is|was) (not set|null|invalid|cleared)|no \\$comp"],
+      "deny": ["(?i)^\\s*\\+0x[0-9a-f]+ "]
+    },
+    {
+      "name": "gameobject-into-transform-walker-refused",
+      "why": "Feeding a GameObject to a Transform walker used to read a plausible childCount and INVENT a hierarchy of wrong children without faulting. Silence would be better; a refusal is correct.",
+      "needs": "any",
+      "batches": [["roots", "children $rgo0"]],
+      "refuse": ["(?i)REFUS|is a GameObject|expects a Transform"],
+      "deny": ["(?i)child\\s*\\d+\\s*:", "childCount="]
+    },
+    {
+      "name": "label-on-transform-is-not-empty-text",
+      "why": "`label` on a Transform reported `text = \"\"`, which reads as 'the label is empty' and is not an answer. It must say there is no text component.",
+      "needs": "menu",
+      "batches": [["roots", "label $r0"]],
+      "deny": ["text = \"\"\\s*$"],
+      "refuse": ["(?i)no (TMP_Text|text component|LocalizedText)|not a label|has no text"]
+    },
+    {
+      "name": "click-refuses-a-non-button",
+      "why": "`click`/`invoke` imposed UnityEngine.UI.Button's layout on ANY pointer, calling UnityEvent::Invoke on a GameObject and escaping the guard.",
+      "needs": "any",
+      "write": true,
+      "batches": [["roots", "click $rgo0"]],
+      "refuse": ["(?i)REFUS|not a (UnityEngine\\.UI\\.)?Button|no Button component"],
+      "deny": ["(?i)invoked|clicked ok|pressed"]
+    },
+    {
+      "name": "write-gate-holds-without-allow-write",
+      "why": "liveInspectorWrite alone must not be enough; the batch must also say `allow write`. A write that goes through without it means the gate is decorative.",
+      "needs": "any",
+      "batches": [["roots", "write $r0+0x10 i32 1"]],
+      "refuse": ["(?i)REFUS|allow write|read-only|not permitted"],
+      "deny": ["(?i)wrote |write ok"]
+    },
+    {
+      "name": "open-refusal-names-a-reason",
+      "why": "`open` rejected a CORRECT target because the prologue snapshot had recorded our own trampoline. A refusal is acceptable; a refusal with no stated reason is not, because it is indistinguishable from that bug.",
+      "needs": "menu",
+      "batches": [["open"]],
+      "deny": ["(?i)refus[a-z]*\\.?\\s*$"]
+    },
+    {
+      "name": "state-explains-every-null-anchor",
+      "why": "`state` exists to say WHY an anchor is null. An anchor listed as null with no reason sends you hunting for an object the host simply has not learned yet.",
+      "needs": "any",
+      "batches": [["state"]],
+      "assert": ["\\$preloader", "\\$settings"],
+      "deny": ["(?i)\\$settings\\s*=\\s*(null|0x0+)\\s*$"]
+    },
+    {
+      "name": "state-does-not-claim-not-in-raid-from-a-slot",
+      "why": "fact #51: `state` reported `in-raid anchor slot=-1` while a human WAS in a raid. A slot number is the anchor's binding, not the raid state, and must never be printed as if it were the raid state.",
+      "needs": "raid",
+      "batches": [["state"]],
+      "deny": ["(?i)not in (a )?raid", "(?i)in-raid anchor slot=-1"]
+    }
+  ]
+}
