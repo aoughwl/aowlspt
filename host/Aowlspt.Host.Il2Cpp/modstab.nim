@@ -123,6 +123,14 @@ var gModsLabelText: seq[string] = @[]
 ## The cap on that list: up to three TMPs per caption on this build, times the
 ## tab button plus ModsMaxSubtabs.
 const ModsMaxLabels = 24
+
+## Every cloned button, its donor and its caption, so the extra toggle a live
+## spawner spawns AFTER we built can still be reaped. The spawn happens on the
+## spawner's own schedule, which may be several frames after the clone exists,
+## so a build-time sweep alone cannot be enough.
+var gModsReapClone: seq[Il2CppPtr] = @[]
+var gModsReapDonor: seq[Il2CppPtr] = @[]
+var gModsReapCaption: seq[string] = @[]
 ## The re-assert throttle, and the count of consecutive checks that found every
 ## label intact. After ModsStableEnough of those it STOPS: a label nothing is
 ## fighting over does not need a poll for the rest of the session.
@@ -460,6 +468,67 @@ proc modsFindTmp(t: Il2CppPtr; depth: int): Il2CppPtr =
   if tmps.len > 0:
     result = tmps[0]
 
+proc modsChildCount(t: Il2CppPtr): int =
+  result = 0
+  var n = 0
+  if t != nil and iChildCount(t, n):
+    result = n
+
+proc modsReapExtraToggles(cloneT, donorT: Il2CppPtr; caption: string): int =
+  ## FACT #93. Cloning a *ToggleSpawner* clones the toggle it had ALREADY
+  ## spawned AND leaves the spawner itself live inside the clone -- so it
+  ## spawns a SECOND one, under its own default name. The result is a clone
+  ## with two toggles where the donor has one: the captioned one, and an
+  ## unlabelled rectangle beside it. That is also why one walk saw
+  ## `ControlsToggle` and another saw `AnimatedToggle`: BOTH exist, and which
+  ## you find depends on enumeration order.
+  ##
+  ## The tell was in our own log -- "2 of the clone's FOUR TextMeshProUGUI" --
+  ## and the caption check passed anyway, because counting captions says
+  ## nothing about an uncaptioned sibling. So the DONOR IS THE GROUND TRUTH FOR
+  ## COUNT TOO: the clone may not have more children than the donor.
+  ##
+  ## Which one survives is decided by OUTCOME, not by name: the child whose
+  ## subtree reads our caption is the one the player can read. Everything past
+  ## it is switched off. These are objects inside a clone WE made, which is the
+  ## only reason this is ours to switch off at all.
+  ##
+  ## Returns how many were switched off. Idempotent, capped, and it must be
+  ## re-run for a while after the build, because the spawn happens on the
+  ## spawner's own schedule and may not have happened yet when we relabel.
+  result = 0
+  let want = modsChildCount(donorT)
+  let have = modsChildCount(cloneT)
+  if want <= 0 or have <= want:
+    return
+  var keep = -1
+  var i = 0
+  while i < have and i < 8:
+    let c = iChildAt(cloneT, i)
+    if c != nil and duOk(c, 0x20'i32) and keep < 0:
+      if modsCountReading(c, caption) > 0:
+        keep = i
+    i = i + 1
+  if keep < 0:
+    keep = 0                            # nothing reads our caption; keep the
+                                        # first and let the caption check speak
+  i = 0
+  while i < have and i < 8:
+    if i != keep:
+      let c = iChildAt(cloneT, i)
+      if c != nil and duOk(c, 0x20'i32):
+        let go = iGameObjectOf(c)
+        if go != nil and modsGoActive(go) and modsSetActive(go, false):
+          result = result + 1
+    i = i + 1
+  if result > 0:
+    okLog "mods tab: switched off " & $result & " extra toggle(s) inside a " &
+          "cloned spawner -- the donor has " & $want & " child(ren) and the " &
+          "clone had " & $have & ". A *ToggleSpawner clone keeps spawning " &
+          "(fact #93), so the copy is the captioned one at index " & $keep &
+          " and the spawner's own is switched off. Without this there is an " &
+          "unlabelled rectangle beside every button we clone."
+
 proc modsCaptionOf(donorT: Il2CppPtr; count: var int): string =
   ## THE DONOR IS THE GROUND TRUTH. What caption does this stock button show,
   ## and on HOW MANY of its TextMeshProUGUI does that caption appear?
@@ -668,6 +737,66 @@ proc modsFindNamed(t: Il2CppPtr; name: string; depth: int): Il2CppPtr =
         return
     i = i + 1
 
+proc modsPruneToPath(panelT, stackT: Il2CppPtr): int =
+  ## Switch off everything in our cloned panel except the path down to the
+  ## container we render into.
+  ##
+  ## WHY, MEASURED: sweeping the row container's own children left
+  ## `Game Settings(Clone)/Container/Nickname Panel` alive -- with its warning
+  ## panel, its input field and its caption -- because that is a PANEL, not a
+  ## row, and it hangs off a node ABOVE the one we swept. "40 inherited rows
+  ## switched off" was true and insufficient.
+  ##
+  ## So this walks UP from our container to the panel root, and at every node on
+  ## that path switches off every child EXCEPT the next node down. The clone
+  ## then contains exactly one live spine and whatever we put at the bottom of
+  ## it. Bounded: at most 8 levels, 64 children each.
+  result = 0
+  var path: seq[Il2CppPtr] = @[]
+  var cur = stackT
+  var guard = 0
+  while cur != nil and guard < 8:
+    path.add cur
+    if cur == panelT:
+      break
+    cur = modsParentOf(cur)
+    guard = guard + 1
+  if path.len == 0 or path[path.len - 1] != panelT:
+    warn "mods tab: could not walk from the page container back up to the " &
+         "cloned panel within 8 levels, so the panel could NOT be pruned. " &
+         "Inherited panels above the container may still be on screen."
+    return
+  var level = path.len - 1
+  while level > 0:
+    let node = path[level]
+    let keep = path[level - 1]
+    var n = 0
+    if iChildCount(node, n):
+      var i = 0
+      while i < n and i < 64:
+        let c = iChildAt(node, i)
+        if c != nil and c != keep and duOk(c, 0x20'i32):
+          let go = iGameObjectOf(c)
+          if go != nil and modsGoActive(go) and modsSetActive(go, false):
+            result = result + 1
+        i = i + 1
+    level = level - 1
+
+proc modsActiveChildren(t: Il2CppPtr): int =
+  ## How many of `t`'s children are active. The outcome check for the sweeps.
+  result = 0
+  var n = 0
+  if t == nil or not iChildCount(t, n):
+    return
+  var i = 0
+  while i < n and i < 64:
+    let c = iChildAt(t, i)
+    if c != nil and duOk(c, 0x20'i32):
+      let go = iGameObjectOf(c)
+      if go != nil and modsGoActive(go):
+        result = result + 1
+    i = i + 1
+
 proc modsHideStockPanels(screenT, ourPanel: Il2CppPtr) =
   ## Switch off every ACTIVE stock panel beside ours, remembering exactly which,
   ## so leaving the tab can put them back.
@@ -759,6 +888,11 @@ proc modsBuildSubtabs(stripT, buttonDonorGo, donorT: Il2CppPtr;
     # inside `modsRelabelLike` is the loud one; this only counts them.
     if not modsRelabelLike(btnT, donorT, gModsPages[p].title):
       badLabels = badLabels + 1
+    discard modsReapExtraToggles(btnT, donorT, gModsPages[p].title)
+    if gModsReapClone.len < ModsMaxSubtabs + 1:
+      gModsReapClone.add btnT
+      gModsReapDonor.add donorT
+      gModsReapCaption.add gModsPages[p].title
     # THE GROUP QUESTION, MEASURED RATHER THAN ASSUMED. On the live client this
     # came back NATIVE for the tab-button donor: Instantiate remapped each
     # clone's m_Group onto the cloned group. The stock-group branch stays
@@ -889,6 +1023,12 @@ proc modsTabBuild(): bool =
          "tab is still built and still switches the panel -- it is the " &
          "CAPTION that failed, and the line above says on how many of the " &
          "donor's TextMeshProUGUI it should have landed."
+  # THE COUNT CHECK, against the donor. A caption check alone passed while an
+  # UNLABELLED second toggle sat beside ours -- fact #93.
+  discard modsReapExtraToggles(tabCloneT, donorTab, "MODS")
+  gModsReapClone.add tabCloneT
+  gModsReapDonor.add donorTab
+  gModsReapCaption.add "MODS"
   let mainToggle = modsToggleOf(tabCloneT)
   if mainToggle == nil:
     modsNoteFault("the cloned tab button has no Toggle component, so its " &
@@ -944,9 +1084,16 @@ proc modsTabBuild(): bool =
         if go != nil and modsSetActive(go, false):
           hidden = hidden + 1
       h = h + 1
-  okLog "mods tab: switched off " & $hidden & " inherited row(s) in our " &
-        "cloned panel, so the MODS body starts EMPTY instead of showing a " &
-        "second copy of Game Settings"
+  # AND EVERYTHING ABOVE IT. Sweeping the container's own children is not
+  # enough: `Game Settings(Clone)/Container/Nickname Panel` survived that sweep
+  # -- with its warning panel, input field and caption -- because it is a
+  # PANEL, not a row, hanging off a node ABOVE the one we swept. "40 inherited
+  # rows switched off" was true and insufficient.
+  let pruned = modsPruneToPath(panelT, stackT)
+  okLog "mods tab: switched off " & $hidden & " inherited row(s) inside our " &
+        "page container and " & $pruned & " inherited sibling(s) on the spine " &
+        "above it (that is where 'Nickname Panel' lived), so the MODS body " &
+        "starts EMPTY instead of showing a second copy of Game Settings"
 
   # ---- the subtab strip: ONE clone of the game's own in-panel strip ----
   let stripClone = modsClone(donorStripGo)
@@ -1007,6 +1154,21 @@ proc modsTabBuild(): bool =
       discard swRenderPage(tabPtr, gModsSubs[r].pageGo, gModsPages[r])
     r = r + 1
 
+  # THE OUTCOME CHECK ON THE CONTAINER, in the same spirit as the caption one:
+  # what the player sees in the body must be exactly what we put there -- one
+  # subtab strip plus one page container per subtab -- and nothing inherited.
+  let liveKids = modsActiveChildren(stackT)
+  let expectKids = 1 + gModsSubs.len
+  if liveKids != expectKids:
+    warn "mods tab: the page container holds " & $liveKids & " active " &
+         "child(ren) but we put exactly " & $expectKids & " there (one " &
+         "subtab strip + " & $gModsSubs.len & " page(s)). The difference is " &
+         "inherited content still on screen, or one of ours failed to " &
+         "activate. Reporting it rather than assuming the body is clean."
+  else:
+    okLog "mods tab: the page container holds exactly the " & $expectKids &
+          " child(ren) we put there (strip + " & $gModsSubs.len &
+          " page(s)); nothing inherited is left active in the body"
   gModsSel = 0
   if gModsSubs.len > 0:
     discard modsSetToggleQuiet(gModsSubs[0].toggle, true)
@@ -1049,6 +1211,16 @@ proc modsReassertLabels() =
   if gModsLabelFrames < ModsLabelEveryFrames:
     return
   gModsLabelFrames = 0
+  # THE LATE SPAWN. A *ToggleSpawner clone spawns its own toggle on its own
+  # schedule, which can be several frames after the build finished, so the
+  # build-time reap cannot be the only one. This is idempotent and does nothing
+  # once the child counts match the donor's.
+  var reaped = 0
+  var k = 0
+  while k < gModsReapClone.len and k < ModsMaxSubtabs + 1:
+    reaped = reaped + modsReapExtraToggles(gModsReapClone[k], gModsReapDonor[k],
+                                           gModsReapCaption[k])
+    k = k + 1
   var clobbered = 0
   var i = 0
   while i < gModsLabelTmp.len and i < ModsMaxLabels:
@@ -1058,7 +1230,7 @@ proc modsReassertLabels() =
         discard swRelabelControl(cast[Il2CppPtr](0), gModsLabelTmp[i],
                                  gModsLabelText[i])
     i = i + 1
-  if clobbered == 0:
+  if clobbered == 0 and reaped == 0:
     inc gModsLabelStable
     if gModsLabelStable == ModsStableEnough:
       okLog "mods tab: all " & $gModsLabelTmp.len & " label(s) have stayed " &
