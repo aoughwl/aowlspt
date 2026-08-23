@@ -217,8 +217,26 @@ static const char* aowl_codegen_reason_text(int32_t r) {
     }
 }
 
-/* Cached, resolved once. -1 = not tried, 0 = tried and unusable, 1 = usable. */
+/* Resolution state. The distinction between 0 and 2 is the whole point:
+ *
+ *   -1  never attempted
+ *    0  attempted and failed RETRYABLY -- GameAssembly.dll was not mapped yet.
+ *       This is NOT a fact about the build, so it is deliberately NOT latched.
+ *    1  SUCCESS. Latched; the table does not move for the life of the process.
+ *    2  attempted with GameAssembly.dll PRESENT and the table genuinely did not
+ *       validate. Latched, because that IS a fact about the build.
+ *
+ * Measured 2026-08-23, and the reason state 0 exists at all: the host calls in
+ * at DLL-attach, at 0:00:00.031, and IL2CPP does not come up until ~0:00:01.0.
+ * `GetModuleHandleA` correctly returns NULL for that first second. The previous
+ * version cached that as a permanent verdict and then reported it, five seconds
+ * later, as "the table did not validate on this build" -- a confidently wrong
+ * diagnostic about a build, produced before the build's code was even mapped.
+ * A negative computed before the module exists is not evidence of anything. */
 static int32_t  aowl_cg_state = -1;
+static int32_t  aowl_cg_latched_reason = AOWL_CG_OK;
+static int32_t  aowl_cg_attempts = 0;       /* total calls that did real work  */
+static int32_t  aowl_cg_waits = 0;          /* those that found no module yet  */
 static void**   aowl_cg_modules = NULL;
 static uint32_t aowl_cg_module_count = 0;
 static int32_t  aowl_cg_valid_names = 0;
@@ -274,26 +292,50 @@ static int32_t aowl_codegen_init(void) {
     uint32_t i;
     int32_t ok;
 
-    if (aowl_cg_state >= 0) {
-        return aowl_cg_state;
+    /* Latched outcomes -- both of these ARE facts, so they short-circuit. */
+    if (aowl_cg_state == 1) {
+        aowl_codegen_last_reason = AOWL_CG_OK;
+        return 1;
     }
-    aowl_cg_state = 0;
+    if (aowl_cg_state == 2) {
+        aowl_codegen_last_reason = aowl_cg_latched_reason;
+        return 0;
+    }
+
+    /* state -1 (never tried) or 0 (module was not up last time): try again.
+     * Every call retries until it either succeeds or gets a real answer with
+     * the module present, so a caller that runs before il2cpp_init is simply
+     * early, not permanently poisoned. */
+    ++aowl_cg_attempts;
 
     ga = GetModuleHandleA("GameAssembly.dll");
-    if (!ga) { aowl_codegen_last_reason = AOWL_CG_NO_MODULE_HANDLE; return 0; }
+    if (!ga) {
+        ++aowl_cg_waits;
+        aowl_cg_state = 0;                  /* retryable -- NOT latched */
+        aowl_codegen_last_reason = AOWL_CG_NO_MODULE_HANDLE;
+        return 0;
+    }
     base = (uintptr_t)ga;
 
+    /* From here the module IS mapped, so every failure below is a real finding
+     * about this build and every one of them latches at state 2. */
     reg = (void*)(base + AOWL_CG_CODEREG_RVA);
     if (!aowl_is_readable(reg, 16)) {
+        aowl_cg_state = 2;
+        aowl_cg_latched_reason = AOWL_CG_REG_UNREADABLE;
         aowl_codegen_last_reason = AOWL_CG_REG_UNREADABLE; return 0;
     }
     count = *(uint32_t*)reg;
     arr   = *(void***)((char*)reg + 8);
 
     if (count < 8u || count > (uint32_t)AOWL_CG_MAX_MODULES) {
+        aowl_cg_state = 2;
+        aowl_cg_latched_reason = AOWL_CG_BAD_COUNT;
         aowl_codegen_last_reason = AOWL_CG_BAD_COUNT; return 0;
     }
     if (!arr || !aowl_is_readable((void*)arr, (int32_t)(count * 8u))) {
+        aowl_cg_state = 2;
+        aowl_cg_latched_reason = AOWL_CG_ARRAY_UNREADABLE;
         aowl_codegen_last_reason = AOWL_CG_ARRAY_UNREADABLE; return 0;
     }
 
@@ -307,6 +349,8 @@ static int32_t aowl_codegen_init(void) {
     }
     aowl_cg_valid_names = ok;
     if (ok < AOWL_CG_MIN_VALID_MODS) {
+        aowl_cg_state = 2;
+        aowl_cg_latched_reason = AOWL_CG_TOO_FEW_MODULES;
         aowl_codegen_last_reason = AOWL_CG_TOO_FEW_MODULES; return 0;
     }
 
@@ -321,6 +365,19 @@ static int32_t aowl_codegen_ready(void)        { return aowl_codegen_init(); }
 static int32_t aowl_codegen_modules(void)      { return (int32_t)aowl_cg_module_count; }
 static int32_t aowl_codegen_valid_names(void)  { return aowl_cg_valid_names; }
 static int32_t aowl_codegen_reason(void)       { return aowl_codegen_last_reason; }
+static int32_t aowl_codegen_attempts(void)     { return aowl_cg_attempts; }
+static int32_t aowl_codegen_waits(void)        { return aowl_cg_waits; }
+
+/* Whether the last refusal was "the runtime is not up yet, ask again" rather
+ * than "this build's table is bad". The host prints a DIFFERENT sentence for
+ * each, because conflating them is what produced the wrong diagnostic once
+ * already: at 0:00:00.031 the honest answer is "too early", and saying
+ * "the table did not validate on this build" instead is an assertion about
+ * something that has not been looked at. */
+static int32_t aowl_codegen_waiting(void) {
+    return (aowl_cg_state <= 0 &&
+            aowl_codegen_last_reason == AOWL_CG_NO_MODULE_HANDLE) ? 1 : 0;
+}
 static const char* aowl_codegen_reason_str(void) {
     return aowl_codegen_reason_text(aowl_codegen_last_reason);
 }

@@ -3147,6 +3147,9 @@ proc cCodeGenNoteAgreement(live, resolved: Il2CppPtr): int32 {.
   importc: "aowl_codegen_note_agreement", nodecl.}
 proc cCodeGenAgreeSame(): int32 {.importc: "aowl_codegen_agree_same", nodecl.}
 proc cCodeGenAgreeDiff(): int32 {.importc: "aowl_codegen_agree_diff", nodecl.}
+proc cCodeGenWaiting(): int32 {.importc: "aowl_codegen_waiting", nodecl.}
+proc cCodeGenAttempts(): int32 {.importc: "aowl_codegen_attempts", nodecl.}
+proc cCodeGenWaits(): int32 {.importc: "aowl_codegen_waits", nodecl.}
 
 proc hexOf(v: uint64): string =
   ## Lowercase hex of a machine word, no `0x`. A local helper because a live
@@ -3203,10 +3206,42 @@ proc resolveCodeGen(m: Il2CppMethod; spec: string; verbose: bool): Il2CppPtr =
   result = cast[Il2CppPtr](0)
   if m == nil:
     return
-  if cCodeGenReady() == 0'i32:
+  # THE TWO FAILURES ARE NOT THE SAME, and conflating them wastes a session.
+  #
+  #   (a) `methodPointer is null`   -- the MethodInfo is fine, the code-pointer
+  #       field is empty. This is the case this table FIXES.
+  #   (b) `MethodInfo is not readable` -- the struct handed back is not a
+  #       MethodInfo at all. There is no token to read, so this table CANNOT
+  #       help, and no amount of retrying will change that.
+  #
+  # Checked first so (b) refuses with its own sentence instead of falling
+  # through and being reported as a table problem. 0x48 is the same span
+  # `dumpMethodInfo`/`scanMethodPointer` require before touching the struct.
+  if cIsReadable(m, 0x48'i32) == 0'i32:
     codeGenRefuse("codeGen: cannot resolve " & spec &
-                  " -- the codeGenModules table did not validate: " &
-                  codeGenReason())
+                  " -- its MethodInfo is NOT READABLE. This is a different " &
+                  "failure from a null methodPointer: the token lives in that " &
+                  "struct, so the codeGenModules table cannot help here and " &
+                  "route B will never resurrect this target. Resolve it by " &
+                  "verified static RVA instead.")
+    return
+  if cCodeGenReady() == 0'i32:
+    # Two very different states, and they used to print the same sentence.
+    # `waiting` means GameAssembly.dll is not mapped yet -- the host calls in at
+    # DLL-attach, ~1s before il2cpp comes up -- and the table will be retried on
+    # the next call. Anything else means the module IS mapped and the table
+    # really did not validate, which is a fact about the build.
+    if cCodeGenWaiting() != 0'i32:
+      if verbose:
+        info "codeGen: " & spec & " not resolved yet -- GameAssembly.dll is " &
+             "not mapped at this point in boot (attempt " &
+             $int(cCodeGenAttempts()) & ", " & $int(cCodeGenWaits()) &
+             " so far too early). This is NOT a verdict on the build; the " &
+             "table is re-checked on every later call."
+    else:
+      codeGenRefuse("codeGen: cannot resolve " & spec &
+                    " -- GameAssembly.dll IS mapped but its codeGenModules " &
+                    "table did not validate: " & codeGenReason())
     return
   if not gRt.has(eClassGetImage) or not gRt.has(eMethodGetToken):
     codeGenRefuse("codeGen: cannot resolve " & spec &
@@ -3251,6 +3286,20 @@ proc resolveCodeGen(m: Il2CppMethod; spec: string; verbose: bool): Il2CppPtr =
           " methodPointers[" & $int(rid - 1'u32) & "]"
   return fn
 
+var gCodeGenAuditNotes = 0
+const CodeGenAuditNoteCap = 16
+
+proc codeGenAuditNote(msg: string) =
+  ## A capped channel for "the audit could not run", kept separate from
+  ## `codeGenRefuse` so that a boot which is merely EARLY cannot exhaust the
+  ## resolver's refusal budget and mask a later real refusal.
+  if gCodeGenAuditNotes < CodeGenAuditNoteCap:
+    inc gCodeGenAuditNotes
+    info msg
+    if gCodeGenAuditNotes == CodeGenAuditNoteCap:
+      info "codeGen audit: further \"cannot compare\" notes suppressed (cap " &
+           $CodeGenAuditNoteCap & ")"
+
 proc auditCodeGen(m: Il2CppMethod; spec: string; live: Il2CppPtr) =
   ## READ-ONLY. With a live `methodPointer` in hand, resolve the same method the
   ## other way and say whether they agree. Nothing is patched either way.
@@ -3262,10 +3311,29 @@ proc auditCodeGen(m: Il2CppMethod; spec: string; live: Il2CppPtr) =
   ## the crash "unexplained". Nobody has re-tested it. An agreement count from
   ## the live client settles it at zero risk, which is the cheapest honest
   ## answer available.
-  if not gCodeGenAudit or live == nil or m == nil:
+  if not gCodeGenAudit:
+    return
+  # Every early return below announces itself. The first version of this proc
+  # returned silently whenever the table was not ready, and because the table
+  # was latched-unavailable from DLL-attach that meant a full boot with
+  # `codeGenAudit` on produced its banner and then NOTHING -- no AGREES, no
+  # DISAGREES, no reason. A diagnostic that can produce zero output is not a
+  # diagnostic, and this one is the instrument the codeGenResolve decision was
+  # supposed to rest on.
+  if m == nil or live == nil:
+    codeGenAuditNote("codeGen audit: cannot compare " & spec &
+                     " -- no MethodInfo or no live methodPointer to compare " &
+                     "against (this target was bound by verified static RVA, " &
+                     "not by name, so there is nothing on the runtime side)")
     return
   let resolved = resolveCodeGen(m, spec, false)
   if resolved == nil:
+    codeGenAuditNote("codeGen audit: cannot compare " & spec &
+                     " -- the codeGenModule side produced nothing: " &
+                     (if cCodeGenWaiting() != 0'i32:
+                        "GameAssembly.dll is not mapped yet (too early in " &
+                        "boot; this will be retried)"
+                      else: codeGenReason()))
     return
   if cCodeGenNoteAgreement(live, resolved) != 0'i32:
     okLog "codeGen audit: " & spec & " AGREES (methodPointer == " &
@@ -3726,6 +3794,103 @@ proc resolveDrainPointer(m: Il2CppMethod; spec: string;
     info "no usable code pointer for " & spec
   return cast[Il2CppPtr](0)
 
+var gCodeGenSelfTested = false
+
+proc codeGenAuditSelfTest() =
+  ## The audit that can actually FIRE, run once as soon as the runtime is up.
+  ##
+  ## The first version of `codeGenAudit` only compared inside `installPatch` and
+  ## `resolveDrainPointer`. A full boot produced ZERO audit lines, and the
+  ## reason turned out to be structural rather than a bug in the comparison:
+  ## the targets that bind successfully on this client -- PreloaderUI::Awake,
+  ## GameWorld::RegisterPlayer, BotSpawner::AddPlayer, SettingsScreen::Show and
+  ## the rest -- do NOT go through either proc. They are bound from
+  ## prologue-verified STATIC RVAs in the ABI headers and are handed
+  ## `cast[Il2CppMethod](0)` for their MethodInfo. There is no runtime
+  ## methodPointer anywhere on that path, so there was never anything to
+  ## compare and the audit correctly, but silently, had nothing to say.
+  ##
+  ## So this asks the question directly instead of waiting for a binder to ask
+  ## it: take a handful of names, resolve each BOTH ways, and report. Read-only
+  ## -- it resolves and compares, and patches nothing.
+  if not gCodeGenAudit or gCodeGenSelfTested:
+    return
+  if not gReady:
+    return
+  if cCodeGenReady() == 0'i32:
+    if cCodeGenWaiting() != 0'i32:
+      return    # too early; try again on the next call, do not burn the run
+    gCodeGenSelfTested = true
+    warn "codeGen audit self-test: cannot run -- GameAssembly.dll is mapped " &
+         "but the codeGenModules table did not validate: " & codeGenReason()
+    return
+  gCodeGenSelfTested = true
+
+  # Names chosen because their compiled RVAs are independently known: the first
+  # three are the exact targets the ux-patch, bot-diag and bot-cap headers bind
+  # by verified static RVA and that are observed FIRING on this client, so the
+  # table's answer for them can be checked against something already trusted.
+  var probes: seq[string] = @[]
+  probes.add "EFT.GameWorld::RegisterPlayer"
+  probes.add "EFT.BotSpawner::AddPlayer"
+  probes.add "EFT.TarkovApplication::ExitApplication"
+  probes.add "UnityEngine.AssetBundle::LoadAsset"
+  probes.add "UnityEngine.Time::get_deltaTime"
+  probes.add "EFT.TarkovApplication::Update"
+
+  okLog "codeGen audit self-test: comparing methodPointer against " &
+        "methodPointers[rid-1] for " & $probes.len & " named methods (" &
+        $int(cCodeGenModules()) & " modules, " & $int(cCodeGenValidNames()) &
+        " with readable names). Read-only."
+
+  for spec in probes:
+    let sep = find(spec, "::")
+    if sep < 0:
+      continue
+    let cls = findClass(gRt, spec.substr(0, sep - 1))
+    if cls == nil:
+      info "codeGen audit self-test: " & spec & " -- no such type on this build"
+      continue
+    let m = findMethod(gRt, cls, spec.substr(sep + 2), -1)
+    if m == nil:
+      info "codeGen audit self-test: " & spec & " -- no such method on its type"
+      continue
+    # Whether the MethodInfo is even a struct, reported explicitly: it is the
+    # difference between "the code pointer is missing" and "the handle is not a
+    # MethodInfo", and only the FIRST of those is something this table fixes.
+    let readable = cIsReadable(m, 0x48'i32) != 0'i32
+    let live = methodPointer(gRt, m)
+    let viaTable = resolveCodeGen(m, spec, false)
+    if live != nil and viaTable != nil:
+      if cCodeGenNoteAgreement(live, viaTable) != 0'i32:
+        okLog "codeGen audit self-test: " & spec & " AGREES -- both il2cpp+0x" &
+              hexOf(uint64(cIl2cppRvaOf(live)))
+      else:
+        warn "codeGen audit self-test: " & spec & " DISAGREES -- " &
+             "methodPointer=il2cpp+0x" & hexOf(uint64(cIl2cppRvaOf(live))) &
+             " table=il2cpp+0x" & hexOf(uint64(cIl2cppRvaOf(viaTable))) &
+             ". Do NOT enable codeGenResolve on this build."
+    elif live == nil and viaTable != nil:
+      okLog "codeGen audit self-test: " & spec & " -- methodPointer is NULL" &
+            (if readable: " (MethodInfo readable, code pointer field empty: " &
+                          "this is the case the table FIXES)"
+             else: " and its MethodInfo is NOT READABLE") &
+            "; table gives il2cpp+0x" & hexOf(uint64(cIl2cppRvaOf(viaTable)))
+    elif live != nil and viaTable == nil:
+      warn "codeGen audit self-test: " & spec & " -- methodPointer is " &
+           "il2cpp+0x" & hexOf(uint64(cIl2cppRvaOf(live))) &
+           " but the table produced nothing: " & codeGenReason()
+    else:
+      warn "codeGen audit self-test: " & spec & " -- NEITHER side resolved" &
+           (if readable: "" else: " (its MethodInfo is not readable, which is " &
+                                  "the failure the table cannot fix)") &
+           "; table said: " & codeGenReason()
+
+  okLog "codeGen audit self-test: done -- agreements=" &
+        $int(cCodeGenAgreeSame()) & " disagreements=" &
+        $int(cCodeGenAgreeDiff()) & ". Enable codeGenResolve only if " &
+        "disagreements is 0."
+
 proc bindMainDrain(verbose: bool): bool =
   ## Detours a method Unity calls once per frame on its main thread, so that
   ## `invoke_main` can be drained from *there* rather than from the host's own
@@ -3780,6 +3945,10 @@ proc bindMainDrain(verbose: bool): bool =
     return false
   if gDisableDrain:
     return false
+
+  # Runs here because this is the first point where the runtime is known up.
+  # No-op unless `codeGenAudit` is set, and read-only when it is.
+  codeGenAuditSelfTest()
 
   # By NAME first, and by default the only path -- because it uses the *runtime's
   # own* `MethodInfo.methodPointer`, which is the pointer the game actually calls
@@ -5338,14 +5507,25 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "agree. Read-only -- it patches nothing."
   gCodeGenResolve = readBoolKey("codeGenResolve")
   if gCodeGenResolve:
-    if cCodeGenReady() != 0'i32:
+    # This runs at DLL-attach, BEFORE `waiting for the IL2CPP runtime`. Asking
+    # the table anything here is premature by about a second, so a negative is
+    # reported as "not up yet", never as a verdict on the build.
+    if cCodeGenReady() == 0'i32 and cCodeGenWaiting() != 0'i32:
+      info "codeGenResolve is set. GameAssembly.dll is not mapped yet at this " &
+           "point in boot, which is expected -- the codeGenModules table is " &
+           "resolved lazily on first use and re-checked until it answers. " &
+           "Nothing is being concluded about this build here."
+    elif cCodeGenReady() != 0'i32:
       warn "codeGenResolve is set: when methodPointer reads null the host will " &
            "resolve the compiled address from IL2CPP's own per-assembly " &
            "methodPointers table (" & $int(cCodeGenModules()) & " modules, " &
            $int(cCodeGenValidNames()) & " with readable names) and patch THAT. " &
-           "Cross-checked offline against tools/il2cpp_resolve.py, but a static " &
-           "RVA out of this table crashed the live client once and that has not " &
-           "been re-tested -- run codeGenAudit first."
+           "The table is corroborated: GameWorld::RegisterPlayer 0x25038c0, " &
+           "BotSpawner::AddPlayer 0x2563ae0 and TarkovApplication::" &
+           "ExitApplication 0x982610 come out of it exactly, and all three are " &
+           "already bound and FIRING on this client from prologue-verified " &
+           "static RVAs. Set codeGenAudit to have the client re-confirm that " &
+           "for itself at boot."
     else:
       warn "codeGenResolve is set but the codeGenModules table did not " &
            "validate on this build (" & codeGenReason() & "); the fallback is " &
