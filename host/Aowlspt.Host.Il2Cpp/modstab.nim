@@ -120,6 +120,9 @@ const ModsMaxTmp = 8
 ## (the tab button), and written only at build time.
 var gModsLabelTmp: seq[Il2CppPtr] = @[]
 var gModsLabelText: seq[string] = @[]
+## The cap on that list: up to three TMPs per caption on this build, times the
+## tab button plus ModsMaxSubtabs.
+const ModsMaxLabels = 24
 ## The re-assert throttle, and the count of consecutive checks that found every
 ## label intact. After ModsStableEnough of those it STOPS: a label nothing is
 ## fighting over does not need a poll for the rest of the session.
@@ -457,67 +460,121 @@ proc modsFindTmp(t: Il2CppPtr; depth: int): Il2CppPtr =
   if tmps.len > 0:
     result = tmps[0]
 
-proc modsRelabel(t: Il2CppPtr; text: string): bool =
-  ## Relabel a button WE cloned, and PROVE IT TOOK.
+proc modsCaptionOf(donorT: Il2CppPtr; count: var int): string =
+  ## THE DONOR IS THE GROUND TRUTH. What caption does this stock button show,
+  ## and on HOW MANY of its TextMeshProUGUI does that caption appear?
   ##
-  ## The bug this exists for: the sixth tab was built, logged as built, and was
-  ## BLANK on screen. `swRelabelControl` returned true -- it had called
-  ## `TMP_Text::set_text` on a TextMeshProUGUI -- but on one that does not
-  ## render. A write that succeeds on the wrong object is indistinguishable in a
-  ## log from a write that worked, which is the exact failure mode this repo
-  ## pays for most.
+  ## Measured (fact #88): a stock tab button carries THREE TMPs reading
+  ## "CONTROLS" -- `SizeLabel` (a sizing helper) and two `SizeLabel/Label`
+  ## nodes, and it is the Label nodes the player actually reads. Writing the
+  ## first TMP that answers therefore changes a caption nobody sees.
   ##
-  ## So: try every candidate, and after each write READ `m_text` BACK. The
-  ## candidates that already carry text are tried FIRST, because a TMP with text
-  ## is by definition one that renders. If none reads back, this REFUSES and
-  ## says what it tried and what each one read -- a blank tab must never again
-  ## be reported as a built one.
-  ##
-  ## Re-applying is the caller's job (`modsReassertLabels`): LocalizedText can
-  ## clobber a store a frame or two later, which is why the version brand polls.
-  result = false
+  ## So the donor is asked how many to expect, and the clone must end up with
+  ## the same number. The most common non-empty text wins, because a button may
+  ## also carry an unrelated TMP (a hotkey hint, a badge).
+  result = ""
+  count = 0
+  var nodes: seq[Il2CppPtr] = @[]
+  var tmps: seq[Il2CppPtr] = @[]
+  modsCollectTmp(donorT, 4, nodes, tmps)
+  var i = 0
+  while i < tmps.len:
+    let ti = modsTmpText(tmps[i])
+    if ti.len > 0:
+      var c = 0
+      var j = 0
+      while j < tmps.len:
+        if modsTmpText(tmps[j]) == ti:
+          c = c + 1
+        j = j + 1
+      if c > count:
+        count = c
+        result = ti
+    i = i + 1
+
+proc modsCountReading(t: Il2CppPtr; text: string): int =
+  ## How many TMPs under `t` currently read exactly `text`. THE OUTCOME CHECK.
+  result = 0
   var nodes: seq[Il2CppPtr] = @[]
   var tmps: seq[Il2CppPtr] = @[]
   modsCollectTmp(t, 4, nodes, tmps)
-  if tmps.len == 0:
+  var i = 0
+  while i < tmps.len:
+    if modsTmpText(tmps[i]) == text:
+      result = result + 1
+    i = i + 1
+
+proc modsRelabelLike(cloneT, donorT: Il2CppPtr; text: string): bool =
+  ## Relabel a button WE cloned, and prove the CAPTION CHANGED -- not merely
+  ## that a write landed.
+  ##
+  ## FACT #88, and it is the durable lesson of this feature: the previous
+  ## version picked the first TMP already carrying text, wrote it, and read
+  ## `m_text` back. All three steps genuinely succeeded and the tab was still
+  ## blank, because the TMP it verified was `SizeLabel`, the sizing helper --
+  ## the glyphs come from the `SizeLabel/Label` nodes. "The write landed" and
+  ## "the caption changed" are different claims, and only the first was checked.
+  ##
+  ## So: take the donor's caption and its COUNT, write every clone TMP that
+  ## carries that caption (or is empty where the donor's was not), and then
+  ## assert the clone reads the new caption on the SAME NUMBER of TMPs the
+  ## donor read the old one on. One of three is a refusal, not a success.
+  result = false
+  var want = 0
+  let caption = modsCaptionOf(donorT, want)
+  var cNodes: seq[Il2CppPtr] = @[]
+  var cTmps: seq[Il2CppPtr] = @[]
+  modsCollectTmp(cloneT, 4, cNodes, cTmps)
+  if cTmps.len == 0:
     warn "mods tab: REFUSING to claim the label '" & text & "' -- there is " &
          "no TextMeshProUGUI anywhere under this clone (searched 4 levels). " &
          "Nothing was written."
     return
-  var report = ""
-  var pass = 0
-  while pass < 2 and not result:
-    var i = 0
-    while i < tmps.len:
-      let before = modsTmpText(tmps[i])
-      let wanted = (if pass == 0: before.len > 0 else: before.len == 0)
-      if wanted:
-        if swRelabelControl(cast[Il2CppPtr](0), tmps[i], text):
-          let after = modsTmpText(tmps[i])
-          if after == text:
-            gModsLabelTmp.add tmps[i]
+  if want == 0:
+    # No caption on the donor at all. Fall back to writing every candidate,
+    # and say so: an expectation we could not derive is not an expectation.
+    want = cTmps.len
+    okLog "mods tab: the donor for '" & text & "' shows no caption of its " &
+          "own, so there is no count to match; writing all " & $cTmps.len &
+          " candidate(s) and checking the outcome against that instead."
+  var wrote = 0
+  var i = 0
+  while i < cTmps.len:
+    let cur = modsTmpText(cTmps[i])
+    # Every TMP that shows the donor's caption, plus the empty ones -- a clone
+    # whose Label came out blank is exactly the case being fixed. A TMP showing
+    # something ELSE is left alone: it is not part of this caption.
+    if cur == caption or cur.len == 0 or caption.len == 0:
+      if swRelabelControl(cast[Il2CppPtr](0), cTmps[i], text):
+        if modsTmpText(cTmps[i]) == text:
+          wrote = wrote + 1
+          if gModsLabelTmp.len < ModsMaxLabels:
+            gModsLabelTmp.add cTmps[i]
             gModsLabelText.add text
-            gModsLabelStable = 0
-            okLog "mods tab: label '" & text & "' took on '" &
-                  iObjName(nodes[i]) & "' (candidate " & $i & " of " &
-                  $tmps.len & ", which " &
-                  (if before.len > 0: "already read '" & before & "'"
-                   else: "was empty") & ") via " & gSwLastRoutes &
-                  "-- verified by reading m_text back"
-            return true
-          if report.len < 400:
-            report = report & "'" & iObjName(nodes[i]) & "' wrote but read " &
-                     "back '" & after & "'; "
-        else:
-          if report.len < 400:
-            report = report & "'" & iObjName(nodes[i]) & "' refused the " &
-                     "write; "
-      i = i + 1
-    pass = pass + 1
-  warn "mods tab: the label '" & text & "' DID NOT TAKE on any of the " &
-       $tmps.len & " TextMeshProUGUI under this clone, so the control is " &
-       "BLANK on screen -- reporting it rather than claiming a built tab. " &
-       "What happened: " & report
+    i = i + 1
+  # THE OUTCOME CHECK: re-read the whole clone, not the pointers we just wrote.
+  let reads = modsCountReading(cloneT, text)
+  gModsLabelStable = 0
+  if reads >= want and reads > 0:
+    result = true
+    okLog "mods tab: caption '" & text & "' is now on " & $reads & " of the " &
+          "clone's " & $cTmps.len & " TextMeshProUGUI, matching the donor, " &
+          "which shows '" & caption & "' on " & $want &
+          ". Verified by re-reading the clone, not by trusting the write."
+  else:
+    warn "mods tab: the caption '" & text & "' DID NOT FULLY TAKE -- it reads " &
+         "on " & $reads & " of the clone's " & $cTmps.len & " TMP(s) but the " &
+         "donor shows '" & caption & "' on " & $want & ". " & $wrote &
+         " write(s) verified individually. The control is wrong or partly " &
+         "blank on screen; reporting that rather than claiming a built tab. " &
+         "(This is fact #88: a write that lands on the SIZING helper reads " &
+         "back perfectly and changes nothing the player sees.)"
+
+proc modsRelabel(t: Il2CppPtr; text: string): bool =
+  ## Relabel with no donor to compare against: the clone is its own reference.
+  ## Kept for callers that have no donor handy; everything on the build path
+  ## uses `modsRelabelLike`, which is strictly stronger.
+  result = modsRelabelLike(t, t, text)
 
 proc modsToggleIsOn(toggle: Il2CppPtr): bool =
   result = false
@@ -652,7 +709,7 @@ proc modsRestoreStockPanels() =
     i = i + 1
   gModsHidden = @[]
 
-proc modsBuildSubtabs(stripT, buttonDonorGo: Il2CppPtr;
+proc modsBuildSubtabs(stripT, buttonDonorGo, donorT: Il2CppPtr;
                       stockToggle: Il2CppPtr): int =
   ## Fill OUR cloned strip with one cloned BUTTON per page. The strip's own
   ## inherited buttons are switched off first, so what is left is exactly ours.
@@ -669,6 +726,7 @@ proc modsBuildSubtabs(stripT, buttonDonorGo: Il2CppPtr;
         if go != nil:
           discard modsSetActive(go, false)
       h = h + 1
+  var badLabels = 0
   var stockGroup: Il2CppPtr = nil
   if stockToggle != nil and duOk(stockToggle, ModsOffGroup + 8'i32):
     stockGroup = cReadPtrAt(stockToggle, ModsOffGroup)
@@ -696,9 +754,11 @@ proc modsBuildSubtabs(stripT, buttonDonorGo: Il2CppPtr;
       discard modsSetActive(btn, false)
       p = p + 1
       continue
-    if not modsRelabel(btnT, gModsPages[p].title):
-      okLog "mods tab: subtab '" & gModsPages[p].id & "' kept its donor " &
-            "caption (no reachable TMP on the clone); cosmetic only"
+    # AGAINST THE DONOR, not against itself: the donor says how many TMPs a
+    # caption must land on for the button to actually read it. The refusal
+    # inside `modsRelabelLike` is the loud one; this only counts them.
+    if not modsRelabelLike(btnT, donorT, gModsPages[p].title):
+      badLabels = badLabels + 1
     # THE GROUP QUESTION, MEASURED RATHER THAN ASSUMED. On the live client this
     # came back NATIVE for the tab-button donor: Instantiate remapped each
     # clone's m_Group onto the cloned group. The stock-group branch stays
@@ -713,6 +773,10 @@ proc modsBuildSubtabs(stripT, buttonDonorGo: Il2CppPtr;
                           pageGo: nil, lastOn: false)
     result = result + 1
     p = p + 1
+  if badLabels > 0:
+    warn "mods tab: " & $badLabels & " of " & $result & " subtab caption(s) " &
+         "did not fully take, so those subtabs read blank or wrong on screen. " &
+         "The lines above name each one."
   if result > 0:
     okLog "mods tab: " & $result & " subtab BUTTON(s) cloned into a clone of " &
           "the game's own in-panel strip (donor 'Control Settings'/Toggles/" &
@@ -817,9 +881,14 @@ proc modsTabBuild(): bool =
     modsNoteFault("could not parent the cloned tab button into the bar")
     return
   let tabCloneT = modsTransformOf(tabClone)
-  if not modsRelabel(tabCloneT, "MODS"):
-    okLog "mods tab: the cloned tab button kept its donor caption (no " &
-          "reachable TMP label); cosmetic only"
+  # The tab caption, checked AGAINST THE DONOR. `modsRelabelLike` says loudly
+  # what happened either way; a partial caption is a blank tab, so it is worth
+  # one more line here naming the consequence.
+  if not modsRelabelLike(tabCloneT, donorTab, "MODS"):
+    warn "mods tab: the sixth tab button will not read 'MODS' on screen. The " &
+         "tab is still built and still switches the panel -- it is the " &
+         "CAPTION that failed, and the line above says on how many of the " &
+         "donor's TextMeshProUGUI it should have landed."
   let mainToggle = modsToggleOf(tabCloneT)
   if mainToggle == nil:
     modsNoteFault("the cloned tab button has no Toggle component, so its " &
@@ -890,7 +959,8 @@ proc modsTabBuild(): bool =
   let stripT = modsTransformOf(stripClone)
   gModsPages = modsBuildPages()
   gModsSubs = @[]
-  let made = modsBuildSubtabs(stripT, donorButtonGo, modsToggleOf(donorTab))
+  let made = modsBuildSubtabs(stripT, donorButtonGo, donorButton,
+                              modsToggleOf(donorTab))
   if made <= 0:
     modsNoteFault("the strip yielded no usable subtab button; the panel is " &
                   "left hidden and empty rather than half-built")
@@ -981,7 +1051,7 @@ proc modsReassertLabels() =
   gModsLabelFrames = 0
   var clobbered = 0
   var i = 0
-  while i < gModsLabelTmp.len and i < ModsMaxTmp:
+  while i < gModsLabelTmp.len and i < ModsMaxLabels:
     if duOk(gModsLabelTmp[i], cSuiOffTmpMText() + 8'i32):
       if modsTmpText(gModsLabelTmp[i]) != gModsLabelText[i]:
         clobbered = clobbered + 1
@@ -1303,6 +1373,13 @@ const SeasonsEveryFrames = 120
 const SeasonsMaxFaults = 4
 
 var gSeasonsMenu: Il2CppPtr = nil       ## the MenuScreen transform, revalidated
+## The SeasonsButton GameObject itself, cached so the steady-state check costs
+## ONE ICALL and no string compare -- which is what lets it run every frame and
+## catch the banner on the FIRST frame it comes back, instead of up to two
+## seconds later. Human-reported: "I see the KORD banner for a second before it
+## disappears" on the way back from settings. Raising the poll rate would have
+## cost that string compare every frame; caching the object costs nothing.
+var gSeasonsBtnGo: Il2CppPtr = nil
 var gSeasonsFrames = 0
 var gSeasonsHidden = 0
 var gSeasonsSaid = false
@@ -1382,8 +1459,23 @@ proc seasonsTickBody() =
       return
     okLog "hide seasons: found MenuScreen; looking for its 'SeasonsButton' " &
           "child on every pass from here"
-  # BY NAME, EVERY PASS. The button is re-resolved rather than cached, so a
-  # rebuilt banner is hidden again and a destroyed one is simply not found.
+  # THE FAST PATH, taken every frame once the button is known: validate the
+  # cached GameObject without allocating, ask `activeSelf`, and hide it the
+  # frame it comes back. `modsChildNamed` compares NAMES, and reading a managed
+  # name allocates, so that walk stays on the throttle below.
+  if gSeasonsBtnGo != nil:
+    if duOk(gSeasonsBtnGo, 0x20'i32) and iUnityAlive(gSeasonsBtnGo):
+      if modsGoActive(gSeasonsBtnGo):
+        if modsSetActive(gSeasonsBtnGo, false):
+          inc gSeasonsHidden
+          if gSeasonsHidden == 2:
+            okLog "hide seasons: the banner came back after a menu rebuild " &
+                  "and was hidden again on the FIRST frame it did, from the " &
+                  "cached object -- not on the next throttled pass"
+      return
+    gSeasonsBtnGo = nil                 # destroyed; fall through and re-resolve
+  # BY NAME, on the throttled pass. The button is re-resolved rather than
+  # trusted, so a rebuilt banner is found again and a destroyed one is not.
   let btn = modsChildNamed(gSeasonsMenu, "SeasonsButton")
   if btn == nil:
     if not gSeasonsSaidMissing:
@@ -1397,6 +1489,7 @@ proc seasonsTickBody() =
   let go = iGameObjectOf(btn)
   if go == nil or not iUnityAlive(go):
     return
+  gSeasonsBtnGo = go                    # from here the fast path owns it
   if not modsGoActive(go):
     return                              # already hidden: a read, and no call
   if modsSetActive(go, false):
@@ -1467,8 +1560,19 @@ proc seasonsTick() =
   ## Throttled entry for the seasons-banner hider, on the same terms.
   if not gSeasonsOn or gSeasonsFaults >= SeasonsMaxFaults:
     return
+  # THE THROTTLE IS ADAPTIVE, and it lives here because every throttle in this
+  # file lives on the side that decides whether to enter the guard.
+  #   * button known  -> EVERY FRAME. The body's fast path is one guarded
+  #     pointer check and one `activeSelf` ICALL, with no allocation, and it is
+  #     what closes the "banner visible for a second" window.
+  #   * menu known    -> every 10 frames: a name walk over MenuScreen's
+  #     children, which allocates a string per child.
+  #   * nothing known -> the full throttle: the root enumeration allocates.
   inc gSeasonsFrames
-  if gSeasonsFrames < SeasonsEveryFrames:
+  let every = (if gSeasonsBtnGo != nil: 1
+               elif gSeasonsMenu != nil: 10
+               else: SeasonsEveryFrames)
+  if gSeasonsFrames < every:
     return
   gSeasonsFrames = 0
   gModsBranch = 3
