@@ -1272,6 +1272,12 @@ var gModeTextOn = false
 ## there, and a prologue check against a TRAMPOLINE fails -- which is the exact
 ## live trap currently self-rejecting `uxMenuModeText`. See `bindInspect`.
 var gInspSlot = -1
+
+var gCodeGenProbeSlot = -1
+  ## THE FOURTH RIDER on `EFT.UI.PreloaderUI::Update`, armed only by
+  ## `codeGenAudit`. It exists to run the codeGen self-test ON THE UNITY MAIN
+  ## THREAD, because that is the one variable in this investigation that was
+  ## never controlled -- see `codeGenAuditSelfTest`.
 var gInspSlot2 = -1
   ## The inspector's SECOND anchor: the main drain's slot, aliased so the
   ## instrument keeps ticking inside a raid where `PreloaderUI::Update` does
@@ -2932,7 +2938,8 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
   # matches" rule, so `debugUi`, `uxMenuModeText` and `liveInspector` can all
   # be on at once over ONE detour and ONE trampoline. Its per-frame cost when
   # no command is queued is a single interlocked load (`aowl_insp_have`).
-  if i == gDebugUiSlot or i == gModeTextSlot or i == gInspSlot:
+  if i == gDebugUiSlot or i == gModeTextSlot or i == gInspSlot or
+     i == gCodeGenProbeSlot:
     if not gSharedRidersLoggedPf:
       gSharedRidersLoggedPf = true
       logSharedRiders("patchFired", i)
@@ -2942,6 +2949,8 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
       modeTextUpdateFired(regs)
     if i == gInspSlot:
       inspectFired(regs)
+    if i == gCodeGenProbeSlot:
+      codeGenProbeFired()
     return 0'i32
   # The overlay's GameWorld cache: one register read, nothing walked, never a
   # suppression of RegisterPlayer.
@@ -3709,6 +3718,8 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
     gInspSlot = int(claimed)
   elif kind == 15:
     gBotNavSlot = int(claimed)
+  elif kind == 16:
+    gCodeGenProbeSlot = int(claimed)
   else:
     gDrainSlot = int(claimed)
   tablesUnlock()
@@ -3716,7 +3727,8 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
     gRenderMethod = spec
   elif kind == 2 or kind == 3 or kind == 4 or kind == 5 or kind == 6 or
        kind == 7 or kind == 8 or kind == 9 or kind == 10 or
-       kind == 11 or kind == 12 or kind == 13 or kind == 14 or kind == 15:
+       kind == 11 or kind == 12 or kind == 13 or kind == 14 or kind == 15 or
+       kind == 16:
     discard
   else:
     gDrainMethod = spec
@@ -3726,7 +3738,7 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
         (if perFrame or kind == 2 or kind == 3 or kind == 4 or kind == 5 or
             kind == 6 or kind == 7 or kind == 8 or kind == 9 or
             kind == 10 or kind == 11 or kind == 12 or kind == 13 or
-            kind == 14 or kind == 15: "" else:
+            kind == 14 or kind == 15 or kind == 16: "" else:
            "; it runs more than once a frame, so its firing count is not a " &
            "frame count")
   return true
@@ -3824,174 +3836,187 @@ proc resolveDrainPointer(m: Il2CppMethod; spec: string;
     info "no usable code pointer for " & spec
   return cast[Il2CppPtr](0)
 
-var gCodeGenSelfTested = false
-var gCodeGenSelfTestFirstMs = 0'u64
+var gCodeGenTestedHost = false
+var gCodeGenTestedUnity = false
+var gCodeGenHostBadHandles = 0
 
-const CodeGenSelfTestDelayMs = 20000'u64
-  ## How long after the runtime first looks up before the self-test is allowed
-  ## to CONCLUDE anything. Measured reason: at 1.125s every probe target came
-  ## back unresolvable, and `AssetBundle::LoadAsset` -- one of them -- resolved
-  ## fine at 46.156s in the same process. The textures mod already waits for
-  ## exactly this and calls the gate `runtimeReady`. Metadata being queryable
-  ## for a well-known type is necessary but, on this build, evidently not
-  ## sufficient, so there is a delay on top of it.
+proc codeGenProbeNames(): seq[string] =
+  ## The fixed probe set. The first three are targets the ux-patch, bot-diag and
+  ## bot-cap headers bind by verified static RVA and that are observed FIRING on
+  ## this client, so the table's answer for them is checkable against something
+  ## already trusted.
+  result = @[]
+  result.add "EFT.GameWorld::RegisterPlayer"
+  result.add "EFT.BotSpawner::AddPlayer"
+  result.add "EFT.TarkovApplication::ExitApplication"
+  result.add "UnityEngine.AssetBundle::LoadAsset"
+  result.add "UnityEngine.Time::get_deltaTime"
+  result.add "EFT.TarkovApplication::Update"
 
-const CodeGenSelfTestDeadlineMs = 180000'u64
-  ## After this long the self-test reports what it has rather than staying
-  ## silent forever. A test that never finishes is as useless as one that
-  ## lies.
-
-proc codeGenSelfTestReady(): bool =
-  ## The same readiness condition the textures mod uses (`runtimeReady`: a
-  ## well-known Unity type resolving), plus a delay. NOT the drain-bind moment,
-  ## which is ~1.1s and demonstrably too early to conclude from.
+proc codeGenAuditSelfTest(where: string) =
+  ## Resolve a fixed set of named methods BOTH ways and report. Read-only: it
+  ## resolves and compares, and patches nothing.
+  ##
+  ## `where` names the THREAD, and that is the entire point of this version.
+  ##
+  ## History, because it is the argument for the shape:
+  ##   v1 compared only inside `installPatch`/`resolveDrainPointer` -- produced
+  ##      ZERO lines, because every target that binds on this client binds from
+  ##      a verified static RVA with `cast[Il2CppMethod](0)` and never goes
+  ##      through either proc.
+  ##   v2 ran at first drain-bind, ~1.1s, and declared six MethodInfos
+  ##      unreadable. The textures mod read one of them fine at 46s.
+  ##   v3 waited 20s, then to the 180s deadline, and reported the SAME thing --
+  ##      `+0` unreadable for all six. So it is not timing; and since the
+  ##      resolver only ever dereferences 8 bytes, not span strictness either.
+  ##
+  ## What all three had in common, and what was never controlled: they ran on
+  ## the HOST'S OWN THREAD. `abi/aowlspt_bridge.h` has recorded since it was
+  ## written that "reading IL2CPP class/method metadata off the Unity main
+  ## thread returns bogus pointers and faults ... findClass / findMethod handed
+  ## back garbage and methodPointer read garbage -> null. That is a wrong-thread
+  ## artifact, not proof of protected metadata." That is this symptom exactly,
+  ## written down before this investigation started.
+  ##
+  ## So this runs TWICE -- once from the host tick thread, once from a rider on
+  ## the `PreloaderUI::Update` detour, which is Unity's own main thread -- and
+  ## the two logs are the experiment. Nothing else differs between them.
+  if not gCodeGenAudit:
+    return
   if not gReady:
-    return false
-  if findClass(gRt, "UnityEngine.AssetBundle") == nil:
-    return false
-  let now = cNowMs()
-  if gCodeGenSelfTestFirstMs == 0'u64:
-    gCodeGenSelfTestFirstMs = now
-    return false
-  result = now - gCodeGenSelfTestFirstMs >= CodeGenSelfTestDelayMs
-
-proc codeGenAuditSelfTest() =
-  ## Resolve a handful of named methods BOTH ways and report whether the two
-  ## answers agree. Read-only: it resolves and compares, and patches nothing.
-  ##
-  ## Why it exists at all: the first `codeGenAudit` only compared inside
-  ## `installPatch` and `resolveDrainPointer`, and a full boot produced ZERO
-  ## lines. The cause was structural. The targets that bind on this client --
-  ## PreloaderUI::Awake, GameWorld::RegisterPlayer, BotSpawner::AddPlayer,
-  ## SettingsScreen::Show -- go through NEITHER proc. They are bound from
-  ## prologue-verified STATIC RVAs in the ABI headers and handed
-  ## `cast[Il2CppMethod](0)`, so there is no runtime methodPointer on that path
-  ## and there was nothing to compare.
-  ##
-  ## Why it runs late: the second version ran at first drain-bind, ~1.1s, and
-  ## reported all six targets unresolvable -- a verdict contradicted 45 seconds
-  ## later, in the same process, by the textures mod reading one of those exact
-  ## MethodInfos. Concluding from a probe taken at the wrong moment is the same
-  ## error as latching a lookup taken before the module was mapped. So it now
-  ## waits, and it RETRIES rather than burning its single run on an early miss.
-  if not gCodeGenAudit or gCodeGenSelfTested:
-    return
-  if not codeGenSelfTestReady():
-    return
-  if cCodeGenReady() == 0'i32:
-    if cCodeGenWaiting() != 0'i32:
-      return    # still not mapped; retry on a later tick
-    gCodeGenSelfTested = true
-    warn "codeGen audit self-test: cannot run -- GameAssembly.dll is mapped " &
-         "but the codeGenModules table did not validate: " & codeGenReason()
     return
 
-  # Names chosen because their compiled RVAs are independently known: the first
-  # three are the exact targets the ux-patch, bot-diag and bot-cap headers bind
-  # by verified static RVA and that are observed FIRING on this client, so the
-  # table's answer for them can be checked against something already trusted.
-  var probes: seq[string] = @[]
-  probes.add "EFT.GameWorld::RegisterPlayer"
-  probes.add "EFT.BotSpawner::AddPlayer"
-  probes.add "EFT.TarkovApplication::ExitApplication"
-  probes.add "UnityEngine.AssetBundle::LoadAsset"
-  probes.add "UnityEngine.Time::get_deltaTime"
-  probes.add "EFT.TarkovApplication::Update"
+  let probes = codeGenProbeNames()
+  okLog "codeGen audit [" & where & "]: resolving " & $probes.len &
+        " named methods on this thread (tid " & $cThreadId() & "). Read-only."
 
-  # A dry pass first: unless at least one probe can be compared, or the deadline
-  # has passed, say nothing and come back later. This is what stops the test
-  # spending its one run on a moment that has no answer in it.
-  var comparable = 0
-  for spec in probes:
-    let sep = find(spec, "::")
-    if sep < 0: continue
-    let cls = findClass(gRt, spec.substr(0, sep - 1))
-    if cls == nil: continue
-    let m = findMethod(gRt, cls, spec.substr(sep + 2), -1)
-    if m == nil: continue
-    if methodPointer(gRt, m) != nil:
-      inc comparable
-
-  let waited = cNowMs() - gCodeGenSelfTestFirstMs
-  if comparable == 0 and waited < CodeGenSelfTestDeadlineMs:
-    return
-
-  gCodeGenSelfTested = true
-
-  okLog "codeGen audit self-test: comparing methodPointer against " &
-        "methodPointers[rid-1] for " & $probes.len & " named methods, " &
-        $int(waited div 1000'u64) & "s after the runtime came up (" &
-        $int(cCodeGenModules()) & " modules, " & $int(cCodeGenValidNames()) &
-        " with readable names). Read-only."
+  # THE CLASS HANDLE ITSELF, probed before any method. `findClass` returning
+  # non-nil currently gates real features -- the textures mod's `runtimeReady`
+  # and, until this build, this self-test. Whether that handle is a readable
+  # struct has never been checked, and if it is not, those gates are passing on
+  # a value that means nothing.
+  let probeCls = findClass(gRt, "UnityEngine.AssetBundle")
+  if probeCls == nil:
+    warn "codeGen audit [" & where & "]: findClass(UnityEngine.AssetBundle) " &
+         "returned NIL on this thread"
+  elif cIsReadable(probeCls, 8'i32) != 0'i32:
+    okLog "codeGen audit [" & where & "]: the CLASS handle for " &
+          "UnityEngine.AssetBundle is READABLE. spans: " &
+          probeMethodInfoSpans(probeCls)
+  else:
+    warn "codeGen audit [" & where & "]: the CLASS handle for " &
+         "UnityEngine.AssetBundle is NON-NIL BUT UNREADABLE -- so findClass " &
+         "is not a validity check, and every readiness gate in this codebase " &
+         "that treats a non-nil findClass as proof that metadata is queryable " &
+         "is passing on a value that means nothing. spans: " &
+         probeMethodInfoSpans(probeCls)
 
   var compared = 0
+  var resolvedByTable = 0
+  var badHandles = 0
+  let same0 = int(cCodeGenAgreeSame())
+  let diff0 = int(cCodeGenAgreeDiff())
+
   for spec in probes:
     let sep = find(spec, "::")
     if sep < 0:
       continue
     let cls = findClass(gRt, spec.substr(0, sep - 1))
     if cls == nil:
-      info "codeGen audit self-test: " & spec & " -- no such type on this build"
+      info "codeGen audit [" & where & "]: " & spec & " -- no such type"
       continue
     let m = findMethod(gRt, cls, spec.substr(sep + 2), -1)
     if m == nil:
-      info "codeGen audit self-test: " & spec & " -- no such method on its type"
+      info "codeGen audit [" & where & "]: " & spec & " -- no such method"
       continue
-    # Per-field spans, reported as evidence rather than summarised into a
-    # verdict. If the small spans read and the 0x48 span does not, the old
-    # blanket check was rejecting perfectly good MethodInfos at a region
-    # boundary -- which is exactly what this line is here to show or refute.
-    let spans = probeMethodInfoSpans(m)
+    let handleOk = cIsReadable(m, 8'i32) != 0'i32
+    if not handleOk:
+      inc badHandles
     let live = methodPointer(gRt, m)
     let viaTable = resolveCodeGen(m, spec, false)
+    if viaTable != nil:
+      inc resolvedByTable
     if live != nil and viaTable != nil:
       inc compared
       if cCodeGenNoteAgreement(live, viaTable) != 0'i32:
-        okLog "codeGen audit self-test: " & spec & " AGREES -- both il2cpp+0x" &
-              hexOf(uint64(cIl2cppRvaOf(live)))
+        okLog "codeGen audit [" & where & "]: " & spec &
+              " AGREES -- both il2cpp+0x" & hexOf(uint64(cIl2cppRvaOf(live)))
       else:
-        warn "codeGen audit self-test: " & spec & " DISAGREES -- " &
+        warn "codeGen audit [" & where & "]: " & spec & " DISAGREES -- " &
              "methodPointer=il2cpp+0x" & hexOf(uint64(cIl2cppRvaOf(live))) &
-             " table=il2cpp+0x" & hexOf(uint64(cIl2cppRvaOf(viaTable))) &
-             ". Do NOT enable codeGenResolve on this build."
+             " table=il2cpp+0x" & hexOf(uint64(cIl2cppRvaOf(viaTable)))
     elif live == nil and viaTable != nil:
-      okLog "codeGen audit self-test: " & spec & " -- methodPointer is NULL " &
-            "but the table resolves it to il2cpp+0x" &
+      okLog "codeGen audit [" & where & "]: " & spec & " -- methodPointer " &
+            "NULL, table resolves it to il2cpp+0x" &
             hexOf(uint64(cIl2cppRvaOf(viaTable))) &
-            ". THIS IS THE CASE ROUTE B FIXES. spans: " & spans
-    elif live != nil and viaTable == nil:
-      warn "codeGen audit self-test: " & spec & " -- methodPointer is " &
-           "il2cpp+0x" & hexOf(uint64(cIl2cppRvaOf(live))) &
-           " but the table produced nothing: " & codeGenReason() &
-           ". spans: " & spans
+            ". THIS IS THE CASE ROUTE B FIXES."
     else:
-      warn "codeGen audit self-test: " & spec & " -- neither side resolved. " &
-           "table said: " & codeGenReason() & ". spans: " & spans &
-           ". NOTE: this is not proof the target is permanently unfixable -- " &
-           "the same sentence was printed at 1.1s for a method that resolved " &
-           "fine at 46s."
+      warn "codeGen audit [" & where & "]: " & spec & " -- MethodInfo handle " &
+           (if handleOk: "readable but" else: "NOT READABLE and") &
+           " neither side resolved. spans: " & probeMethodInfoSpans(m)
 
-  # The verdict. An empty comparison is INCONCLUSIVE and must never read as a
-  # green light: `agreements=0 disagreements=0` satisfies "disagreements is 0"
-  # vacuously, and that phrasing once told a reader it was safe to proceed on
-  # the strength of zero evidence.
-  let same = int(cCodeGenAgreeSame())
-  let diff = int(cCodeGenAgreeDiff())
+  let same = int(cCodeGenAgreeSame()) - same0
+  let diff = int(cCodeGenAgreeDiff()) - diff0
+  okLog "codeGen audit [" & where & "]: " & $probes.len & " probed, " &
+        $badHandles & " with an unreadable MethodInfo, " & $resolvedByTable &
+        " resolved by the table, " & $compared & " comparable (" & $same &
+        " agreed, " & $diff & " disagreed)."
+
+  if where == "host thread":
+    gCodeGenHostBadHandles = badHandles
+    return
+
+  # The Unity-thread pass concludes, and it concludes by COMPARING ITSELF TO
+  # THE HOST-THREAD PASS. That difference -- not either number alone -- is the
+  # finding.
+  if gCodeGenTestedHost and gCodeGenHostBadHandles > 0 and badHandles == 0:
+    okLog "codeGen audit VERDICT: THREAD-DEPENDENT. On the host thread " &
+          $gCodeGenHostBadHandles & " of " & $probes.len & " MethodInfo " &
+          "handles were unreadable; on the Unity main thread " & $badHandles &
+          " were. By-name resolution WORKS here and is simply not usable off " &
+          "Unity's thread -- which is what aowlspt_bridge.h recorded all " &
+          "along. Route B then needs no metadata parser: it needs to run here."
+  elif badHandles >= probes.len:
+    warn "codeGen audit VERDICT: NOT thread-dependent -- every MethodInfo is " &
+         "unreadable on the Unity main thread too. By-name method resolution " &
+         "is genuinely unavailable on this build, so a name-to-token source " &
+         "other than a MethodInfo is required (metadata tables, or a " &
+         "generated name-to-RVA index). This is the measurement that decides."
   if diff > 0:
-    warn "codeGen audit self-test: VERDICT RED -- " & $same & " agreed, " &
-         $diff & " DISAGREED. The table does not hold the pointers the runtime " &
-         "holds on this build. Do NOT enable codeGenResolve."
+    warn "codeGen audit VERDICT: RED -- " & $diff & " disagreed on the Unity " &
+         "thread. Do NOT enable codeGenResolve."
   elif compared == 0:
-    warn "codeGen audit self-test: VERDICT INCONCLUSIVE -- nothing could be " &
-         "compared (" & $compared & " methods had both a live methodPointer " &
-         "and a table entry). This is NOT a green light: it is the absence of " &
-         "evidence, not evidence of agreement. Do not read " &
-         "\"disagreements=0\" as safe here."
+    warn "codeGen audit VERDICT: INCONCLUSIVE -- nothing could be compared " &
+         "even on the Unity main thread. This is NOT a green light; it is the " &
+         "absence of evidence, not evidence of agreement."
   else:
-    okLog "codeGen audit self-test: VERDICT GREEN -- " & $compared &
-          " methods compared, " & $same & " agreed, 0 disagreed. The table " &
-          "holds the same pointers the runtime holds on this build; " &
+    okLog "codeGen audit VERDICT: GREEN -- " & $compared & " compared, " &
+          $same & " agreed, 0 disagreed, on the Unity main thread. " &
           "codeGenResolve is corroborated."
+
+proc codeGenProbeFired() =
+  ## The Unity-main-thread arm, dispatched from the shared
+  ## `EFT.UI.PreloaderUI::Update` detour. Runs one pass, then costs a single
+  ## bool compare per frame forever after.
+  if gCodeGenTestedUnity:
+    return
+  gCodeGenTestedUnity = true
+  codeGenAuditSelfTest("Unity main thread")
+
+proc codeGenAuditHostPass() =
+  ## The host-thread arm, from the tick loop. Deliberately NOT delayed: v3
+  ## proved timing is not the variable, so a delay would only add latency.
+  if gCodeGenTestedHost or not gCodeGenAudit or not gReady:
+    return
+  if cCodeGenReady() == 0'i32:
+    if cCodeGenWaiting() != 0'i32:
+      return                      # module not mapped yet; retry next tick
+    gCodeGenTestedHost = true
+    warn "codeGen audit: cannot run -- GameAssembly.dll is mapped but the " &
+         "codeGenModules table did not validate: " & codeGenReason()
+    return
+  gCodeGenTestedHost = true
+  codeGenAuditSelfTest("host thread")
 
 proc bindMainDrain(verbose: bool): bool =
   ## Detours a method Unity calls once per frame on its main thread, so that
@@ -4638,6 +4663,60 @@ include "modetext.nim"
 ## restart. See the header of `inspect.nim` for why that is the highest-leverage
 ## thing available on the client side.
 include "inspect.nim"
+
+proc bindCodeGenProbe(verbose: bool): bool =
+  ## THE FOURTH RIDER on `EFT.UI.PreloaderUI::Update`, and the only reason it
+  ## exists is to get `codeGenAuditSelfTest` onto Unity's main thread.
+  ##
+  ## Same alias-or-attach discipline as `bindInspect`: if another feature has
+  ## already claimed that function, this ALIASES onto its slot and installs no
+  ## second detour -- because two detours on one function have the second
+  ## overwrite the first's trampoline and silently kill the first feature. Only
+  ## when nobody holds it does this verify a prologue and attach its own, and it
+  ## verifies through `cDuPreloaderTarget`, which compares against the ORIGINAL
+  ## bytes snapshotted before any feature bound, so it cannot self-reject
+  ## because someone else detoured the function first.
+  ##
+  ## Read-only rider: it never suppresses the original and never writes.
+  if gCodeGenProbeSlot >= 0:
+    return true
+  if not gCodeGenAudit:
+    return false
+  if not gReady or gDisableDrain:
+    return false
+  if gDebugUiSlot >= 0:
+    gCodeGenProbeSlot = gDebugUiSlot
+    okLog "codeGen audit armed as a RIDER on the debug overlay's existing " &
+          "EFT.UI.PreloaderUI::Update detour (slot " & $gCodeGenProbeSlot &
+          ") -- the self-test will run on Unity's main thread"
+    return true
+  if gModeTextSlot >= 0:
+    gCodeGenProbeSlot = gModeTextSlot
+    okLog "codeGen audit armed as a RIDER on the menu mode-text feature's " &
+          "existing EFT.UI.PreloaderUI::Update detour (slot " &
+          $gCodeGenProbeSlot & ")"
+    return true
+  if gInspSlot >= 0:
+    gCodeGenProbeSlot = gInspSlot
+    okLog "codeGen audit armed as a RIDER on the live inspector's existing " &
+          "EFT.UI.PreloaderUI::Update detour (slot " & $gCodeGenProbeSlot & ")"
+    return true
+  let fn = cDuPreloaderTarget()
+  if fn == nil:
+    if verbose:
+      warn "codeGen audit: EFT.UI.PreloaderUI::Update did not verify on this " &
+           "build and no other feature holds it, so the self-test cannot be " &
+           "run on Unity's main thread. The host-thread pass will still run, " &
+           "but on its own it cannot tell a wrong-thread artifact from a " &
+           "genuinely unavailable metadata path -- which is the whole question."
+    return false
+  if attachDrain("EFT.UI.PreloaderUI::Update", fn, cast[Il2CppMethod](0),
+                 true, verbose, 16'i32):
+    okLog "codeGen audit armed on EFT.UI.PreloaderUI::Update (per-frame, " &
+          "Unity thread); the self-test runs once, there, read-only"
+    return true
+  result = false
+
 
 proc hostEventSubscribe(ctx: Il2CppPtr; name: Il2CppPtr; nameLen: int32;
                         cb: Il2CppPtr; user: Il2CppPtr): int32 {.
@@ -6007,6 +6086,12 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
              "claimed by another feature nor verifiable on this build, or the " &
              "drain is disabled); the command file will not be read"
 
+      # THE CODEGEN AUDIT (opt-in, `codeGenAudit`). Armed LAST of the four
+      # riders on `EFT.UI.PreloaderUI::Update`, so by here any of the other
+      # three may have claimed the slot and this aliases onto it for free.
+      if gCodeGenAudit:
+        discard bindCodeGenProbe(true)
+
   let modsDir = joinPath(gDir, "mods")
   # The runtime may not have come up, and that deliberately does not stop this:
   # a client mod that only logs, schedules and talks to the backend works
@@ -6145,7 +6230,7 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
     # queryable, on a delay, and on there being at least one method it can
     # actually compare -- so on most ticks it returns immediately having done
     # nothing, and it logs exactly once, when it has an answer worth logging.
-    codeGenAuditSelfTest()
+    codeGenAuditHostPass()
 
     # OS-close hooks, checked here for the whole session (see `aowlspt_uxpatch.h`
     # for the three-step history that led to this shape).
