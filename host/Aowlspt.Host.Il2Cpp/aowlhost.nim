@@ -100,6 +100,44 @@ import invoke
 ## prologue check now compares against the snapshot instead of live memory; the
 ## check itself is unchanged and just as strict. See `aowlspt_prologue.h`.
 {.emit: """#include "aowlspt_prologue.h" """.}
+## PATCH BY VERIFIED STATIC RVA -- the address side of it, in C because it is
+## three Win32 calls and no Nim.
+##
+## The base is asked for AT RUNTIME, every time. `0x180000000` is only
+## GameAssembly.dll's PE *preferred* base -- the address space
+## `tools/il2cpp_resolve.py` works in -- and the module is ASLR-relocated in the
+## live process (observed at 0x7FFDB73F0000). Hardcoding the preferred base
+## would land a detour on whatever happens to be mapped there. Every RVA in
+## this project, `aowl_il2cpp_rva_of`'s included, is module-relative, so they
+## are all directly comparable to the resolver's.
+{.emit: """
+static void* aowl_rva_code_at(unsigned int rva) {
+  HMODULE ga = GetModuleHandleA("GameAssembly.dll");
+  if (!ga) return NULL;
+  return (void*)((unsigned char*)ga + rva);
+}
+static unsigned long long aowl_ga_base(void) {
+  HMODULE ga = GetModuleHandleA("GameAssembly.dll");
+  return (unsigned long long)(uintptr_t)ga;
+}
+/* Committed, EXECUTABLE, and with 16 whole bytes inside the same region --
+ * one call, because a patch-by-RVA has to answer all three before it reads a
+ * prologue, and three separate answers is three chances to check only two. */
+static int aowl_rva_is_code(unsigned int rva) {
+  MEMORY_BASIC_INFORMATION mbi;
+  void* p = aowl_rva_code_at(rva);
+  unsigned long long end;
+  if (!p) return 0;
+  if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0) return 0;
+  if (mbi.State != MEM_COMMIT) return 0;
+  if (!(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                       PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+    return 0;
+  end = (unsigned long long)(uintptr_t)mbi.BaseAddress
+      + (unsigned long long)mbi.RegionSize;
+  return ((unsigned long long)(uintptr_t)p + 16ULL <= end) ? 1 : 0;
+}
+""".}
 ## Two small client-side UX fixes: the Exit-hang byte patch (static .text, like
 ## the BE neuter) and the version-label brand target (a verified PreloaderUI.Awake
 ## code pointer the host postfix-detours to rewrite the label on the Unity
@@ -749,6 +787,16 @@ proc cProPrimedCount(): int32 {.importc: "aowl_pro_primed_count", nodecl.}
 proc cProLazyCount(): int32 {.importc: "aowl_pro_lazy_count", nodecl.}
 proc cProBadCount(): int32 {.importc: "aowl_pro_bad_count", nodecl.}
 proc cProHave(rva: uint32): int32 {.importc: "aowl_pro_have", nodecl.}
+## THE prologue verify, bound here because patch-by-RVA is its first caller on
+## the Nim side. It compares against the STARTUP SNAPSHOT, never live memory --
+## which is the whole reason a second feature can verify a function a first
+## feature already detoured. `siglen <= 0` returns 1 WITHOUT comparing
+## anything, so a caller must never report a match it did not ask for.
+proc cProVerify(rva: uint32; sig: ptr uint8; siglen: int32): int32 {.
+  importc: "aowl_pro_verify", nodecl.}
+proc cRvaCodeAt(rva: uint32): Il2CppPtr {.importc: "aowl_rva_code_at", nodecl.}
+proc cGaBase(): uint64 {.importc: "aowl_ga_base", nodecl.}
+proc cRvaIsCode(rva: uint32): int32 {.importc: "aowl_rva_is_code", nodecl.}
 proc cInIl2cpp(p: Il2CppPtr): int32 {.
   importc: "aowl_in_il2cpp_section", nodecl.}
 proc cIl2cppRvaOf(p: Il2CppPtr): int64 {.
@@ -3095,11 +3143,22 @@ proc patchReturned(slot: int32; regs: Il2CppPtr): int32 {.
     return 0'i32
   if not gPatches[i].live:
     return 0'i32
-  if gPatches[i].meth == nil:
-    return 0'i32
   gPatchFires = gPatchFires + 1
   if gPatches[i].typed:
+    # BEFORE the MethodInfo gate below, deliberately. A patch installed by RVA
+    # has no MethodInfo and never will -- and this gate used to sit above the
+    # typed dispatch, so an RVA postfix would have been installed, reported
+    # "patched", and then returned 0 on every single firing without a word.
+    # That is the silent decline this host exists not to produce. The typed
+    # path reads only `kinds`/`retKind`/`frameFlags`, all of which the RVA spec
+    # declared at registration, so it is complete without one.
     return typedFire(i, regs, true)
+  if gPatches[i].meth == nil:
+    # The JSON path genuinely cannot run without one: `describeReturn` and
+    # `applyPatchReturn` both ask the runtime for the declared types.
+    # `installPatch` refuses that combination at registration, so reaching
+    # here means a drain row, not a mod's patch.
+    return 0'i32
 
   # As on the prefix path: the whole of the table-touching part under the lock,
   # and nothing else.
@@ -3387,6 +3446,306 @@ proc auditCodeGen(m: Il2CppMethod; spec: string; live: Il2CppPtr) =
          "codeGenResolve must stay OFF. Running totals same=" &
          $int(cCodeGenAgreeSame()) & " diff=" & $int(cCodeGenAgreeDiff())
 
+# --------------------------------------------------------------------------
+# PATCH BY VERIFIED STATIC RVA
+# --------------------------------------------------------------------------
+#
+# WHY THIS EXISTS. On build 1.1.0.1.46777 by-name resolution is dead, and not
+# in the "returns nil" way that a caller can branch on: `findClass` and
+# `findMethod` both return NON-NIL handles into UNMAPPED memory. Measured in
+# one boot by a two-thread controlled experiment -- host thread tid 25552 and
+# the Unity main thread tid 24416, riding the debug overlay's real
+# `PreloaderUI::Update` detour -- both reporting `6 probed, 6 with an
+# unreadable MethodInfo, 0 comparable`. It is not thread-dependent. So
+# `methodPointer(gRt, m)` can never work here, and neither can any fallback
+# that needs a valid `MethodInfo`.
+#
+# What DOES work, measured live: a plain static RVA. So a caller may name the
+# address outright, and this is the machinery that accepts one safely.
+#
+# THE SHAPE PROBLEM, AND WHY THE CALLER MUST DECLARE IT. `installPatch`
+# normally derives `frameKinds`, `retKind`, `methodIsStatic` and
+# `postfixRefusal` from the `MethodInfo`. With no `MethodInfo` those are simply
+# unavailable, and a postfix that GUESSES the frame shape is a silently wrong
+# hook -- worse than no hook, because it looks installed. So the shape is
+# DECLARED in the spec, and an RVA patch whose shape was not declared is
+# REFUSED. There is no default.
+
+type
+  RvaSpec = object
+    ## The parse of an `@0xRVA` patch spec. `isRva` says the caller asked for
+    ## one at all; `why` non-empty says the request was malformed and names
+    ## how. The two are independent: a spec can be an RVA spec AND be wrong.
+    isRva: bool
+    why: string
+    name: string          ## the `Type::Method` part, for logs only
+    rva: uint32
+    isStatic: bool
+    kinds: seq[uint8]
+    retKind: uint8
+    retBig: bool          ## declared `V`: a value return wider than a register
+    sig: array[16, uint8]
+    siglen: int32
+
+proc argLetterKind(c: char; ok: var bool): uint8 =
+  ok = true
+  case c
+  of 'i': result = AkInt
+  of 'f': result = AkFloat
+  of 'd': result = AkDouble
+  of 'o': result = AkObject
+  of 'v': result = AkValue
+  of 'V': result = AkBigValue
+  of 'x': result = AkVoid
+  else:
+    ok = false
+    result = AkUnknown
+
+proc hexNibble(c: char; ok: var bool): int =
+  ok = true
+  if c >= '0' and c <= '9': return ord(c) - ord('0')
+  if c >= 'a' and c <= 'f': return 10 + ord(c) - ord('a')
+  if c >= 'A' and c <= 'F': return 10 + ord(c) - ord('A')
+  ok = false
+  result = 0
+
+const RvaSpecGrammar =
+  "Type::Method@0xRVA/<shape>[!<hex prologue>] where <shape> is 'i' or 's' " &
+  "(instance or static), then one letter per DECLARED argument " &
+  "(i=integer/bool/char, f=float, d=double, o=object/string/reference, " &
+  "v=small value type, V=value type wider than a register), then '>' and one " &
+  "return letter (the same set, plus x=void). Example: " &
+  "UnityEngine.AssetBundle::LoadAsset@0x5250100/io>o"
+
+proc parseRvaSpec(spec: string): RvaSpec =
+  ## Splits an `@0xRVA` spec. Every rejection says which part was wrong and
+  ## repeats the grammar, because a mod author reading a refusal in the log has
+  ## nothing else to go on.
+  result = RvaSpec(isRva: false, why: "", name: "", rva: 0'u32,
+                   isStatic: false, kinds: @[], retKind: AkUnknown,
+                   retBig: false,
+                   sig: [0'u8, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0, 0],
+                   siglen: 0'i32)
+  let at = find(spec, "@0x")
+  if at < 0:
+    return
+  result.isRva = true
+  result.name = spec.substr(0, at - 1)
+  if result.name.len == 0:
+    result.why = "patch-by-RVA: nothing before the @0x in " & spec &
+                 "; the Type::Method part is required (it is what the log " &
+                 "calls the patch). Grammar: " & RvaSpecGrammar
+    return
+  var rest = spec.substr(at + 3)
+
+  # Optional trailing signature: the prologue bytes the caller asserts. Taken
+  # off FIRST, so a stray slash inside it could never be read as the shape
+  # separator.
+  let bang = find(rest, "!")
+  if bang >= 0:
+    let hx = rest.substr(bang + 1)
+    rest = rest.substr(0, bang - 1)
+    if hx.len == 0 or (hx.len and 1) == 1:
+      result.why = "patch-by-RVA " & result.name & ": the prologue signature " &
+                   "must be an EVEN number of hex digits, got " & $hx.len &
+                   ". Grammar: " & RvaSpecGrammar
+      return
+    let nbytes = hx.len div 2
+    if nbytes > 16:
+      result.why = "patch-by-RVA " & result.name & ": the prologue signature " &
+                   "is " & $nbytes & " bytes; the snapshot holds 16, so more " &
+                   "than 16 cannot be verified and is refused rather than " &
+                   "silently truncated."
+      return
+    for k in 0 ..< nbytes:
+      var okHi = false
+      var okLo = false
+      let hi = hexNibble(hx[k * 2], okHi)
+      let lo = hexNibble(hx[k * 2 + 1], okLo)
+      if not okHi or not okLo:
+        result.why = "patch-by-RVA " & result.name & ": the prologue " &
+                     "signature contains a non-hex character at byte " & $k
+        return
+      result.sig[k] = uint8(hi * 16 + lo)
+    result.siglen = int32(nbytes)
+
+  # The shape.
+  var shape = ""
+  let slash = find(rest, "/")
+  if slash >= 0:
+    shape = rest.substr(slash + 1)
+    rest = rest.substr(0, slash - 1)
+
+  # The RVA itself.
+  if rest.len == 0 or rest.len > 8:
+    result.why = "patch-by-RVA " & result.name & ": " & rest &
+                 " is not 1..8 hex digits of RVA. Grammar: " & RvaSpecGrammar
+    return
+  var v = 0'u32
+  for k in 0 ..< rest.len:
+    var okD = false
+    let d = hexNibble(rest[k], okD)
+    if not okD:
+      result.why = "patch-by-RVA " & result.name & ": " & rest &
+                   " is not hex. Grammar: " & RvaSpecGrammar
+      return
+    v = v * 16'u32 + uint32(d)
+  if v == 0'u32:
+    result.why = "patch-by-RVA " & result.name &
+                 ": an RVA of 0 is the module header, not code."
+    return
+  result.rva = v
+
+  # THE REFUSAL THAT MATTERS. No shape, no patch -- see the block above.
+  if shape.len == 0:
+    result.why = "patch-by-RVA " & result.name & " (il2cpp+0x" &
+                 hexOf(uint64(v)) & "): REFUSED because no frame shape was " &
+                 "declared. There is no MethodInfo behind an RVA on this " &
+                 "build, so the host cannot derive whether the method is " &
+                 "static, what its arguments are, or what it returns -- and " &
+                 "guessing any of those installs a hook that is silently " &
+                 "wrong rather than absent. Declare it: " & RvaSpecGrammar
+    return
+  if shape[0] == 's':
+    result.isStatic = true
+  elif shape[0] == 'i':
+    result.isStatic = false
+  else:
+    result.why = "patch-by-RVA " & result.name & ": the shape must start " &
+                 "with i (instance) or s (static), got " & $shape[0] &
+                 ". Grammar: " & RvaSpecGrammar
+    return
+  let gt = find(shape, ">")
+  if gt < 0 or gt != shape.len - 2:
+    result.why = "patch-by-RVA " & result.name & ": the shape must end with " &
+                 "> and exactly one return letter, got " & shape &
+                 ". Grammar: " & RvaSpecGrammar
+    return
+  # Declared arguments. Capped at 16 -- far past the four register slots any
+  # patched call can use, and a bound rather than an unbounded loop over a
+  # caller-supplied string.
+  let nargs = gt - 1
+  if nargs > 16:
+    result.why = "patch-by-RVA " & result.name & ": " & $nargs &
+                 " declared arguments is past this host's cap of 16."
+    return
+  for k in 1 ..< gt:
+    var okL = false
+    let kd = argLetterKind(shape[k], okL)
+    if not okL or kd == AkVoid:
+      result.why = "patch-by-RVA " & result.name & ": " & $shape[k] &
+                   " is not an argument letter. Grammar: " & RvaSpecGrammar
+      return
+    # Exactly `frameKinds`' rule, so argument n is declared parameter n
+    # whatever the shape: past the fourth register position it is AkStack.
+    let pos = (if result.isStatic: k - 1 else: k)
+    if pos >= MaxRegArgs:
+      result.kinds.add AkStack
+    else:
+      result.kinds.add kd
+  var okR = false
+  let rk = argLetterKind(shape[shape.len - 1], okR)
+  if not okR:
+    result.why = "patch-by-RVA " & result.name & ": " &
+                 $shape[shape.len - 1] & " is not a return letter. " &
+                 "Grammar: " & RvaSpecGrammar
+    return
+  result.retKind = rk
+  result.retBig = rk == AkBigValue
+
+proc rvaPostfixRefusal(rs: RvaSpec): string =
+  ## The same two refusals `postfixRefusal` makes, decided from the DECLARED
+  ## shape instead of from a `MethodInfo`. Same reasons, same consequences:
+  ## both would install cleanly and be wrong at run time.
+  if rs.retBig:
+    return "a postfix on " & rs.name & " is refused: it was declared to " &
+           "return a value type wider than a register (V), which Win64 " &
+           "returns through a caller-allocated buffer. The host cannot read " &
+           "that buffer's layout, so a postfix there could neither report " &
+           "the result nor replace it. Use a prefix that suppresses."
+  for k in 0 ..< rs.kinds.len:
+    if rs.kinds[k] == AkStack:
+      return "a postfix on " & rs.name & " is refused: declared argument " &
+             $k & " lands on the stack, and a postfix has to CALL the " &
+             "original from inside the thunk's own frame, where the " &
+             "original would read the wrong address for it."
+  let slots = rs.kinds.len + 1 + (if rs.isStatic: 0 else: 1)
+  if slots > PostfixMaxSlots:
+    return "a postfix on " & rs.name & " is refused: its compiled call uses " &
+           $slots & " register slots (" & $rs.kinds.len &
+           " declared argument(s)" &
+           (if rs.isStatic: "" else: ", plus this") &
+           ", plus IL2CPP's trailing MethodInfo*), and past " &
+           $PostfixMaxSlots & " they arrive on the stack."
+  result = ""
+
+proc resolveByRva*(rva: uint32; sig: var array[16, uint8]; siglen: int32;
+                   label: string; why: var string): Il2CppPtr =
+  ## THE ADDRESS-SUBSTITUTION MECHANISM. Given a module-relative RVA, hand back
+  ## a code pointer that has passed every check, or nil with `why` naming the
+  ## check that failed.
+  ##
+  ## Deliberately takes an RVA and nothing else, so that any resolver which has
+  ## one -- a spec's `@0x`, or a build-time name->RVA index -- goes through the
+  ## same four gates rather than each growing its own.
+  ##
+  ## The checks, in order, and each one refuses out loud:
+  ##   MODULE BASE    -- GameAssembly.dll mapped; base read at runtime (ASLR).
+  ##   CODE PAGE      -- committed, executable, 16 whole bytes in one region.
+  ##   IL2CPP SECTION -- inside the `il2cpp` PE section, where generated code
+  ##                     lives. `.text` holds no managed method bodies.
+  ##   PROLOGUE       -- the declared bytes against the STARTUP SNAPSHOT.
+  ##
+  ## The prologue check is against the snapshot, never live memory: verifying
+  ## after another feature patched the same function reads that feature's
+  ## trampoline and self-rejects a perfectly correct RVA.
+  why = ""
+  result = cast[Il2CppPtr](0)
+  let base = cGaBase()
+  if base == 0'u64:
+    why = "patch-by-RVA " & label & ": check MODULE BASE failed -- " &
+          "GetModuleHandleA(GameAssembly.dll) returned NULL, so there is " &
+          "no base to add 0x" & hexOf(uint64(rva)) & " to. Nothing patched."
+    return
+  if cRvaIsCode(rva) == 0'i32:
+    why = "patch-by-RVA " & label & ": check CODE PAGE failed -- " &
+          "GameAssembly+0x" & hexOf(uint64(rva)) & " (base 0x" &
+          hexOf(base) & ") is not committed executable memory with 16 whole " &
+          "bytes in one region. Nothing patched."
+    return
+  let p = cRvaCodeAt(rva)
+  if p == nil:
+    why = "patch-by-RVA " & label & ": check CODE PAGE failed -- the address " &
+          "could not be formed. Nothing patched."
+    return
+  if cInIl2cpp(p) == 0'i32:
+    why = "patch-by-RVA " & label & ": check IL2CPP SECTION failed -- 0x" &
+          hexOf(uint64(rva)) & " is outside GameAssembly.dll's il2cpp PE " &
+          "section (0x628000, 0x510FA6C bytes), which is where every AOT " &
+          "managed method body lives. An RVA in .text is a native runtime " &
+          "function, not the method you named. Nothing patched."
+    return
+  if siglen > 0'i32:
+    if cProVerify(rva, addr sig[0], siglen) == 0'i32:
+      why = "patch-by-RVA " & label & ": check PROLOGUE failed -- the " &
+            "ORIGINAL bytes at il2cpp+0x" & hexOf(uint64(rva)) &
+            " (the startup SNAPSHOT, not live memory, so another feature's " &
+            "trampoline cannot be what was read) do not match the " &
+            $int(siglen) & "-byte signature the caller declared. This is " &
+            "either the wrong RVA or a different game build. Nothing patched."
+      return
+    okLog "patch-by-RVA " & label & ": prologue VERIFIED, " & $int(siglen) &
+          " byte(s), against the startup snapshot at il2cpp+0x" &
+          hexOf(uint64(rva)) & " (base 0x" & hexOf(base) & ")"
+  else:
+    # Never a green light from a comparison that compared nothing.
+    warn "patch-by-RVA " & label & ": NO prologue signature was declared, so " &
+         "NOTHING was byte-compared. il2cpp+0x" & hexOf(uint64(rva)) &
+         " passed the module, code-page and il2cpp-section checks only. " &
+         "Append the !<hex> suffix to the spec to have its original bytes " &
+         "verified."
+  result = p
+
 proc installPatch(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
                   kind: int32; cb: Il2CppPtr; user: Il2CppPtr;
                   typed: bool): int32 =
@@ -3446,65 +3805,125 @@ proc installPatch(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
                   else: "")
     return ErrUnsupported
 
-  let sep = find(spec, "::")
-  if sep < 0:
-    gLastError = "patch target must be Type::Method, got: " & spec
-    return ErrBadArg
-  let typePart = spec.substr(0, sep - 1)
-  let member = spec.substr(sep + 2)
-
-  let cls = findClass(gRt, typePart)
-  if cls == nil:
-    gLastError = "no such type: " & typePart
-    return ErrNotFound
-
-  # -1 matches any arity: a patch names a method, not a signature.
-  let m = findMethod(gRt, cls, member, -1)
-  if m == nil:
-    gLastError = "no method " & member & " on " & typePart
-    return ErrNotFound
-
-  # Resolution order, most-trusted first:
-  #   1. `MethodInfo.methodPointer` -- the pointer the runtime itself holds and
-  #      the game itself calls. Nothing beats it, so it is always tried first.
-  #   2. the declaring image's `Il2CppCodeGenModule.methodPointers[rid-1]` --
-  #      IL2CPP's own per-assembly code table, the same mechanism
-  #      `tools/il2cpp_resolve.py` uses offline. Flag-gated, default OFF.
-  #   3. refuse, naming which hop failed.
+  # PATCH BY VERIFIED STATIC RVA -- decided BEFORE the name split.
   #
-  # There is deliberately no deep-scan step here: scanning a MethodInfo for
-  # "some field that looks like code" is a guess, and `installPatch` is what
-  # every mod's `patch`/`hookReturn` goes through. The drain binder keeps its
-  # scan because it has a diagnostic purpose; a mod's patch does not.
-  var fn = methodPointer(gRt, m)
-  if fn != nil:
-    auditCodeGen(m, spec, fn)
-  else:
-    if gCodeGenResolve:
-      fn = resolveCodeGen(m, spec, true)
-    if fn == nil:
-      gLastError = "could not read a usable code pointer for " & spec &
-                   " (methodPointer is null" &
-                   (if gCodeGenResolve:
-                      " and the codeGenModule fallback also declined: " &
-                      codeGenReason()
-                    else:
-                      "; set codeGenResolve in aowlspt-host.json to try " &
-                      "IL2CPP's own per-assembly methodPointers table") & ")"
-      return ErrUnsupported
+  # An `@0x` spec never needs a class or a method lookup, and on this build it
+  # must not attempt one: `findClass` returns a NON-NIL handle into unmapped
+  # memory, so "did the type resolve" has no honest answer here and a lookup
+  # would only manufacture a confident wrong one.
+  let rs = parseRvaSpec(spec)
+  if rs.isRva and rs.why.len > 0:
+    warn rs.why
+    gLastError = rs.why
+    return ErrBadArg
 
-  # The two shapes a postfix cannot carry, checked against the method rather
-  # than against the patch kind alone: a value-type return wider than a
-  # register, which comes back through a buffer whose layout this host cannot
-  # read, and a compiled call with stack arguments, which a called original
-  # would look for in the thunk's frame. Both would install cleanly and be
-  # wrong at run time, which is why they are refused at registration with a
-  # sentence naming which one it was.
-  if isPostfix:
-    let refusal = postfixRefusal(gRt, m, spec)
-    if refusal.len > 0:
-      gLastError = refusal
+  var m: Il2CppMethod = cast[Il2CppMethod](0)
+  var fn: Il2CppPtr = cast[Il2CppPtr](0)
+  var kinds: seq[uint8] = @[]
+  var retKind = 0'u8
+  var frameFlags = 0'u32
+
+  if rs.isRva:
+    # An RVA patch has NO MethodInfo, and every JSON firing path needs one:
+    # `describeArgs`, `describeReturn` and `applyPatchReturn` all ask the
+    # runtime what the declared types are. So the JSON ABI is refused here
+    # rather than installed and quietly handing a handler an empty payload --
+    # which is exactly the silent decline this host must never produce. The
+    # typed ABI needs only the declared shape, which the spec carries.
+    if not typed:
+      let whyJson = "patch-by-RVA " & rs.name & ": REFUSED on the JSON patch " &
+                "ABI. Every JSON firing path (describeArgs, describeReturn, " &
+                "applyPatchReturn) needs a MethodInfo to read the declared " &
+                "types from, and an RVA has none -- installing anyway would " &
+                "hand the handler an empty payload and call it a hook. Use " &
+                "patch_typed / hookReturnTyped, which needs only the shape " &
+                "the spec already declares."
+      warn whyJson
+      gLastError = whyJson
       return ErrUnsupported
+    var sig = rs.sig
+    var whyRva = ""
+    fn = resolveByRva(rs.rva, sig, rs.siglen, rs.name, whyRva)
+    if fn == nil:
+      warn whyRva
+      gLastError = whyRva
+      return ErrUnsupported
+    if isPostfix:
+      let refusal = rvaPostfixRefusal(rs)
+      if refusal.len > 0:
+        warn refusal
+        gLastError = refusal
+        return ErrUnsupported
+    kinds = rs.kinds
+    retKind = rs.retKind
+    frameFlags = (if rs.isStatic: FrameFlagStatic else: 0'u32)
+  else:
+    let sep = find(spec, "::")
+    if sep < 0:
+      gLastError = "patch target must be Type::Method, got: " & spec
+      return ErrBadArg
+    let typePart = spec.substr(0, sep - 1)
+    let member = spec.substr(sep + 2)
+
+    let cls = findClass(gRt, typePart)
+    if cls == nil:
+      gLastError = "no such type: " & typePart
+      return ErrNotFound
+
+    # -1 matches any arity: a patch names a method, not a signature.
+    m = findMethod(gRt, cls, member, -1)
+    if m == nil:
+      gLastError = "no method " & member & " on " & typePart
+      return ErrNotFound
+
+    # Resolution order, most-trusted first:
+    #   1. `MethodInfo.methodPointer` -- the pointer the runtime itself holds and
+    #      the game itself calls. Nothing beats it, so it is always tried first.
+    #   2. the declaring image's `Il2CppCodeGenModule.methodPointers[rid-1]` --
+    #      IL2CPP's own per-assembly code table, the same mechanism
+    #      `tools/il2cpp_resolve.py` uses offline. Flag-gated, default OFF.
+    #   3. refuse, naming which hop failed.
+    #
+    # There is deliberately no deep-scan step here: scanning a MethodInfo for
+    # "some field that looks like code" is a guess, and `installPatch` is what
+    # every mod's `patch`/`hookReturn` goes through. The drain binder keeps its
+    # scan because it has a diagnostic purpose; a mod's patch does not.
+    fn = methodPointer(gRt, m)
+    if fn != nil:
+      auditCodeGen(m, spec, fn)
+    else:
+      if gCodeGenResolve:
+        fn = resolveCodeGen(m, spec, true)
+      if fn == nil:
+        gLastError = "could not read a usable code pointer for " & spec &
+                     " (methodPointer is null" &
+                     (if gCodeGenResolve:
+                        " and the codeGenModule fallback also declined: " &
+                        codeGenReason()
+                      else:
+                        "; set codeGenResolve in aowlspt-host.json to try " &
+                        "IL2CPP's own per-assembly methodPointers table") & ")"
+        return ErrUnsupported
+
+    # The two shapes a postfix cannot carry, checked against the method rather
+    # than against the patch kind alone: a value-type return wider than a
+    # register, which comes back through a buffer whose layout this host cannot
+    # read, and a compiled call with stack arguments, which a called original
+    # would look for in the thunk's frame. Both would install cleanly and be
+    # wrong at run time. The RVA arm above makes the same two refusals from the
+    # DECLARED shape instead.
+    if isPostfix:
+      let refusal = postfixRefusal(gRt, m, spec)
+      if refusal.len > 0:
+        gLastError = refusal
+        return ErrUnsupported
+    # The shapes, worked out once. This is the whole optimisation: `frameKinds`
+    # asks the runtime what every parameter is, here, at registration -- and the
+    # JSON path asks the same questions on every firing for an answer that
+    # cannot have changed.
+    kinds = frameKinds(gRt, m)
+    retKind = argKindOf(gRt, methodReturnType(gRt, m))
+    frameFlags = (if methodIsStatic(gRt, m): FrameFlagStatic else: 0'u32)
 
   # The slot comes from the engine, and it comes *first*.
   #
@@ -3551,13 +3970,6 @@ proc installPatch(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
   # them, so there is no "registered without arguments" state for a suppression
   # to be a mistake about.
   let wantArgs = (not typed) and (kind and 0x10'i32) != 0'i32
-  # The shapes, worked out once. This is the whole optimisation: `frameKinds`
-  # asks the runtime what every parameter is, here, at registration -- and the
-  # JSON path asks the same questions on every firing for an answer that cannot
-  # have changed.
-  let kinds = frameKinds(gRt, m)
-  let retKind = argKindOf(gRt, methodReturnType(gRt, m))
-  let frameFlags = (if methodIsStatic(gRt, m): FrameFlagStatic else: 0'u32)
   # The row is written before the hook lands, never after, and at the slot the
   # engine handed out. The table is grown with dead rows where it has to be:
   # the engine may hand back slot 3 while this table is two rows long, and a
