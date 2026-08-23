@@ -45,6 +45,7 @@ import aowlspt/server     # `setting`, `serve`
 import aowlspt/settings   # the F12 settings schema
 import manifest
 import swap
+import loadprobe
 
 const
   ModGuid = "aowl.textures"
@@ -72,6 +73,7 @@ type
     catFabric: bool
     catGround: bool
     packRoot: string         ## where the replacement images live on disk
+    probeTargets: string     ## multi-target counting probe; "" = OFF
 
 proc defaultSettings(): Settings =
   Settings(enabled: true, swapMode: "off", hookAsync: false, armDelayMs: 15000,
@@ -79,7 +81,7 @@ proc defaultSettings(): Settings =
            minConfidence: 0.5, logMatches: true,
            catMetal: true, catWood: true, catConcrete: true,
            catBrick: true, catFabric: true, catGround: false,
-           packRoot: "")
+           packRoot: "", probeTargets: "")
 
 var gCfg = defaultSettings()
 var gTicks = 0
@@ -107,6 +109,7 @@ proc loadConfig() =
   gCfg.catFabric = sBool("catFabric", gCfg.catFabric)
   gCfg.catGround = sBool("catGround", gCfg.catGround)
   gCfg.packRoot = sText("packRoot", gCfg.packRoot)
+  gCfg.probeTargets = sText("probeTargets", gCfg.probeTargets)
 
 proc tierName(): string =
   if gCfg.quality == "4k": "4K" else: "2K"
@@ -159,6 +162,10 @@ proc texturesSchema(): seq[Setting] =
     boolSetting("catFabric", "Fabric / cloth", true, category = "Categories"),
     boolSetting("catGround", "Ground / terrain", false, category = "Categories",
                 description = "Off by default: terrain covers huge screen area and is the heaviest on VRAM."),
+
+    stringSetting("probeTargets", "Load-method counting probe", "",
+                category = "Advanced",
+                description = "DIAGNOSTIC, default OFF. Empty or 'off' installs nothing. 'all', or a comma list of AssetBundle method rids (6 7 8 9 10 11 12 13 14 15 18 19), installs a count-only typed PREFIX on each and logs one ranked line every 10s: grep 'textures  loadprobe fires'. rid=6 is the control and must read 0. Requires swapMode=off (both would detour rid=6)."),
 
     boolSetting("packRootSet", "Custom pack root", false, category = "Advanced",
                 implemented = false,
@@ -260,10 +267,20 @@ proc onLoad(): Status =
     info "textures is client-only; nothing to do on this side"
     return Ok
 
+  # The counting probe is configured BEFORE the swapMode gate, deliberately:
+  # it is a DIAGNOSTIC and its whole point is to run with swapMode=off, which
+  # is the only configuration in which it is not fighting swap.nim for rid=6.
+  configureLoadProbe(gCfg.probeTargets, gCfg.swapMode, gCfg.armDelayMs)
+  if loadProbeEnabled():
+    info "textures  loadprobe: probeTargets='" & gCfg.probeTargets &
+         "' — will install count-only PREFIXes ~" &
+         $(gCfg.armDelayMs div 1000) & "s after load and report every 10s " &
+         "(grep: textures  loadprobe fires)"
+
   if not gCfg.enabled or gCfg.quality == "off" or gCfg.swapMode == "off":
-    info "textures  swapMode=off (or disabled): no hooks will be installed, " &
-         "the game uses stock textures. Escalate with swapMode probe -> match " &
-         "-> full in config.json once boot is confirmed stable."
+    info "textures  swapMode=off (or disabled): no swap hooks will be " &
+         "installed, the game uses stock textures. Escalate with swapMode " &
+         "probe -> match -> full in config.json once boot is confirmed stable."
     return Ok
   if entryCount() == 0:
     return Ok   # already warned; stay a NO-OP
@@ -284,18 +301,31 @@ proc onUpdate(elapsedMs: int64): Status =
   if side() != sideClient:
     return Ok
   inc gTicks
-  # Deferred, verified arming: a no-op every tick until it is safe, then once.
+  # The counting probe arms independently of the swap: it is meant to run with
+  # swapMode=off, where `swapArmed()` is false forever and the swap's own
+  # early-return below would otherwise never let a readout happen.
+  discard maybeArmLoadProbe()
+
+  let now = nowMs()
+  let due = now - gLastReadoutMs >= 10000'i64
+  if due:
+    gLastReadoutMs = now
+    # ONE line naming every candidate and its count, zeros included: "which
+    # ones did NOT fire" is half the result of the probe raid.
+    if loadProbeArmed():
+      info loadProbeReport()
+
+  # Deferred, verified arming of the swap: a no-op every tick until it is safe.
   if not swapArmed():
     discard maybeArm()
     return Ok
-  let now = nowMs()
-  if now - gLastReadoutMs >= 10000'i64:
-    gLastReadoutMs = now
-    if gCfg.logMatches:
-      info "textures  " & swapStats()
+  if due and gCfg.logMatches:
+    info "textures  " & swapStats()
   Ok
 
 proc onUnload(): Status =
+  if loadProbeArmed():
+    info loadProbeReport()
   info ModName & " unloaded after " & $gTicks & " ticks; " & swapStats()
   Ok
 

@@ -22,6 +22,9 @@
   "_minConfidenceComment": "Runtime floor on name-match confidence, on top of the already-curated manifest. 0.5 matches the original plugin.",
   "minConfidence": 0.5,
 
+  "_probeTargetsComment": "DIAGNOSTIC, DEFAULT OFF. The multi-target counting probe. Fact #50: a verified postfix on AssetBundle::LoadAsset (rid=6, 0x5250100) installed perfectly and fired ZERO times across a full offline raid, so post-1.0 Tarkov does not call it. Rather than re-aim one guess per raid, this installs a count-only typed PREFIX on every plausible AssetBundle entry point at once and logs one ranked line every 10s. Empty or 'off' = install nothing. 'all' = every target. Or a comma list of rids: 6 7 8 9 10 11 12 13 14 15 18 19. rid=6 is the CONTROL and must read 0 -- a non-zero there means the counting is counting everything. Requires swapMode 'off': swap.nim postfixes rid=6 and two detours on one function kill the first silently, so the probe refuses whole rather than run a contaminated measurement.",
+  "probeTargets": "",
+
   "logMatches": true,
 
   "_categoriesComment": "Per-surface toggles. Ground is off by default: terrain covers huge screen area and is the heaviest on VRAM.",
