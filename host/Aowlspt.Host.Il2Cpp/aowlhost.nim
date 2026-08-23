@@ -3767,6 +3767,10 @@ proc resolveByRva*(rva: uint32; sig: var array[16, uint8]; siglen: int32;
 ## is no second copy of it here, on purpose.
 proc cNameIdxInit(dir: cstring): int32 {.importc: "aowl_nameidx_init", nodecl.}
 proc cNameIdxReady(): int32 {.importc: "aowl_nameidx_ready", nodecl.}
+  ## NOT a plain getter: ready means the build stamp has been VERIFIED
+  ## against the mapped GameAssembly.dll, and asking re-attempts that
+  ## verification if the module was not mapped when the file was read.
+proc cNameIdxStaged(): int32 {.importc: "aowl_nameidx_staged", nodecl.}
 proc cNameIdxCount(): int32 {.importc: "aowl_nameidx_count", nodecl.}
 proc cNameIdxReason(): cstring {.importc: "aowl_nameidx_reason", nodecl.}
 proc cNameIdxImageKey(): uint64 {.importc: "aowl_nameidx_imagekey", nodecl.}
@@ -3790,8 +3794,8 @@ proc nameIndexRva(spec: string; arity: int32): uint32 =
   if cNameIdxReady() == 0'i32:
     if gNameIdxMisses < NameIdxMissCap:
       inc gNameIdxMisses
-      warn "name index: cannot answer " & spec & " -- the index is not loaded: " &
-           $cNameIdxReason()
+      warn "name index: cannot answer " & spec &
+           " -- the index is not usable: " & $cNameIdxReason()
     return 0'u32
   # `toCString` wants a mutable string, and the C side only reads it.
   var key = spec
@@ -6232,15 +6236,32 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # Default OFF, like every other resolution flag here. Loading is attempted at
   # this point on purpose: it reads a file and the mapped PE headers, and needs
   # neither the IL2CPP runtime nor the Unity thread, so a bad index is reported
-  # NOW rather than at first patch. GameAssembly.dll may not be mapped this
-  # early -- that is a refusal with a reason, and it is retried at first use.
+  # NOW rather than at first patch. GameAssembly.dll is NOT mapped this early,
+  # so the stamp cannot verify here: the file is parsed and STAGED, the index
+  # answers nothing, and the stamp is re-attempted at first use.
   gNameIndex = readBoolKey("nameIndex")
   if gNameIndex:
-    if cNameIdxInit(toCString(gDir)) != 0'i32:
+    let nidxLoaded = cNameIdxInit(toCString(gDir))
+    if nidxLoaded == 0'i32 and cNameIdxStaged() != 0'i32:
+      # GameAssembly.dll is not mapped at DLL-attach. The file is parsed and
+      # STAGED; nothing resolves through it until the stamp verifies, which is
+      # re-attempted on first use. This is not a refusal and not a fault.
+      info "nameIndex: aowlspt-names.idx is parsed and STAGED (" &
+           $int(cNameIdxCount()) & " entries), but its build stamp is NOT " &
+           "verified yet: " & $cNameIdxReason() & ". No address from it is " &
+           "usable until the stamp matches."
+    elif nidxLoaded != 0'i32:
       okLog "nameIndex: loaded aowlspt-names.idx -- " & $int(cNameIdxCount()) &
             " name->RVA entries, build stamp 0x" &
             hexOf(cNameIdxImageKey()) & " MATCHES the loaded " &
-            "GameAssembly.dll. Names resolve from metadata frozen offline; " &
+            "GameAssembly.dll. VERIFIED IN-PROCESS: the imageKey only " &
+            "(TimeDateStamp, SizeOfImage, AddressOfEntryPoint, CheckSum, read " &
+            "from the mapped PE headers). NOT verified in-process: the " &
+            "index's fileHash -- a SHA-256 of GameAssembly.dll on disk, which " &
+            "a mapped image cannot reproduce because the loader page-aligns " &
+            "and relocates sections; that one is a build-time guard, checked " &
+            "offline by tools/il2cpp_nameindex.py check. " &
+            "Names resolve from metadata frozen offline; " &
             "nothing here asks IL2CPP, which is the point, since MethodInfo " &
             "is unreadable on this build. Every address is still prologue " &
             "byte-verified before anything is patched."
