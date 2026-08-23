@@ -104,6 +104,11 @@
 ## `aowl_pro_prime_navui` below is. It is defined here, where the table is
 ## visible, and called from there, where the ordering guarantee lives.
 {.emit: """#include "aowlspt_navui.h" """.}
+## COMPONENT ENUMERATION. Included after `aowlspt_navui.h` (it reuses the array
+## offsets that file established) and after `aowlspt_nameindex.h`, which
+## `aowlhost.nim` emits far earlier -- the type table lives in the SAME index
+## file as the method table, so there is one build stamp and one artifact.
+{.emit: """#include "aowlspt_components.h" """.}
 {.emit: """
 static void aowl_pro_prime_navui(void) {
     int32_t i;
@@ -2211,10 +2216,30 @@ proc iCmdComponent(toks: seq[string]) =
   # reflection -- only `il2cpp_string_new`, which the version brand already
   # proves works on the Unity thread. A Transform IS a Component, so this
   # takes exactly what `children` hands back.
+  # PICK THE OVERLOAD FROM THE KLASS, AND SPEND NO FAULT ON THE CHOICE.
+  #
+  # `Component::GetComponent` and `GameObject::GetComponent` are different
+  # functions over different native types, and both classes carry
+  # `m_CachedPtr` at +0x10 -- so handing a GameObject to the Component
+  # overload passes `duOk`, passes `iUnityAlive`, and then faults inside
+  # Unity's C++ reading a native GameObject through a native Component
+  # layout. That was the shape of this command until now: it always called
+  # the Component overload, whatever it was given.
+  #
+  # `gGoKlass` is learned only from sources that return a GameObject BY
+  # CONTRACT, so this is a fact about the pointer, not a guess, and it is a
+  # klass compare -- it costs nothing and cannot fault.
+  let isGo = iIsGameObject(target)
+  let overload = (if isGo: "GameObject::GetComponent(String)"
+                  else: "Component::GetComponent(String)")
   var fn: Il2CppPtr = nil
   var rva = 0'u32
-  if not iNavFind("GetComponent(String)", fn, rva):
+  if not iNavFind(overload, fn, rva):
     return
+  if isGo:
+    iOut("  target is a GameObject, so the GameObject overload is used " &
+         "rather than the Component one (calling Component::GetComponent on " &
+         "a GameObject is a native type confusion that faults inside Unity).")
   # The wrapper's failure branch RAISES a missing-method exception, and a
   # managed throw from inside our own call on the Unity thread is not something
   # to discover empirically. Ask first, off the hot path.
@@ -2231,10 +2256,10 @@ proc iCmdComponent(toks: seq[string]) =
     iErr("il2cpp_string_new returned null for \"" & toks[2] &
          "\"; nothing was called.")
     return
-  iOut("  via UnityEngine.Component::GetComponent(System.String) @0x" &
+  iOut("  via UnityEngine." & overload & " @0x" &
        iHexPad(uint64(rva), 6) & " (call) on " & iPtr(target) &
        "   type string = " & iPtr(sp))
-  iMark("Component::GetComponent(String)", target)
+  iMark(overload, target)
   let comp = cast[Il2CppPtr](cInspUPP(fn, target, sp, nil))
   if comp == nil:
     iErr("GetComponent returned NULL -- this is an ANSWER, not a crash. " &
@@ -2250,6 +2275,201 @@ proc iCmdComponent(toks: seq[string]) =
   iOut("  FOUND " & toks[2] & " component = " & iPtr(comp) &
        "  klass=" & iPtrU(iKlassOf(comp)) & "   ($comp)")
   iOut("  bound to $comp -- e.g.  allow write   then   click $comp")
+
+proc cCompNameOf(klass: Il2CppPtr): int32 {.importc: "aowl_comp_name_of", nodecl.}
+proc cCompNameBuf(): cstring {.importc: "aowl_comp_name_buf", nodecl.}
+proc cCompIsKnownType(s: cstring): int32 {.
+  importc: "aowl_comp_is_known_type", nodecl.}
+proc cCompTypeRva(s: cstring): uint32 {.importc: "aowl_comp_type_rva", nodecl.}
+proc cCompMax(): int32 {.importc: "aowl_comp_max", nodecl.}
+proc cCompOffName(): int32 {.importc: "aowl_comp_off_name", nodecl.}
+proc cCompDataAt(rva: uint64): Il2CppPtr {.importc: "aowl_comp_data_at", nodecl.}
+
+proc iKlassName(k: uint64; verified: var bool): string =
+  ## The type name of an Il2CppClass, READ RAW AND THEN CHECKED.
+  ##
+  ## `il2cpp_class_get_name` is not an accessor on this build -- it is a
+  ## TLS thread-attach wrapper, which is the most likely reason calling it
+  ## faults -- so the name comes out of the struct directly. The `namespaze`
+  ## offset is measured from `il2cpp_class_get_namespace`'s own instruction
+  ## bytes; the `name` offset one slot earlier is INFERRED, and therefore is
+  ## never trusted on its own. Whatever string comes back must be a type that
+  ## exists in this build's metadata, per the offline table. If it is not,
+  ## this returns the string with `verified = false` and the caller prints it
+  ## as UNVERIFIED rather than as a type.
+  verified = false
+  result = ""
+  if k == 0'u64:
+    return
+  let kp = cast[Il2CppPtr](k)
+  if not duOk(kp, 0x20'i32):
+    return
+  iMark("Il2CppClass name/namespace raw read", kp)
+  if cCompNameOf(kp) == 0'i32:
+    return
+  result = readCString(cCompNameBuf())
+  if result.len == 0:
+    return
+  var nm = result
+  verified = cCompIsKnownType(toCString(nm)) != 0'i32
+
+proc iCmdComponents(toks: seq[string]) =
+  ## `components EXPR [BaseType]` -- LIST what an object actually has, instead
+  ## of interrogating it one type name at a time.
+  ##
+  ## `component EXPR Type` is a yes/no oracle that charges for wrong guesses:
+  ## a wrong-but-safe name is free, a wrong-and-unlucky one spends one of the
+  ## eight faults that end the session. Naming a control nobody can already
+  ## name therefore costs a session, and it has.
+  ##
+  ## THE ROUTE, which uses no reflection at all:
+  ##   `Ns.Type::@type/0` in the offline index -> static `Il2CppType*`
+  ##   -> `System.Type::GetTypeFromHandle` (a one-field struct, so a plain
+  ##      pointer in RCX)
+  ##   -> `GameObject::GetComponents(Type)` -> `Component[]`
+  ##   -> each element's klass -> a raw name read, VALIDATED against the same
+  ##      offline table.
+  ##
+  ## The default base type is `UnityEngine.Component`, which is every
+  ## component of any kind. `UnityEngine.MonoBehaviour` narrows it to scripts.
+  if toks.len < 2:
+    iErr("usage: components EXPR [BaseType]   (default base " &
+         "UnityEngine.Component; use UnityEngine.MonoBehaviour for scripts " &
+         "only). Names must be FULLY QUALIFIED here -- this is an index " &
+         "lookup, not Unity's short-name match.")
+    return
+  for i in 0 ..< 16:
+    iSetVar("k" & $i, 0'u64)
+  var v = 0'u64
+  var err = ""
+  if not iEval(toks[1], v, err):
+    iErr(err)
+    return
+  var target = cast[Il2CppPtr](v)
+  if not duOk(target, 0x20'i32) or not iUnityAlive(target):
+    iErr("not readable, or its native half is null; refusing to call. " &
+         "Nothing was called and no fault was spent.")
+    return
+
+  # `GetComponents` is a GameObject method. A Transform is not a GameObject,
+  # and calling it on one would be the same native type confusion that makes
+  # `component` fault -- so convert, rather than hope.
+  var go = target
+  if not iIsGameObject(target):
+    let g = iGameObjectOf(target)
+    if g == nil:
+      iErr("this is not a known GameObject and Component::get_gameObject " &
+           "did not return one, so there is nothing to enumerate. " &
+           "GetComponents was NOT called.")
+      return
+    go = g
+    iOut("  target is a Component/Transform; enumerating its GameObject " &
+         iPtr(go) & " instead.")
+
+  if cNameIdxReady() == 0'i32:
+    iErr("the offline name index is not loaded, so neither the base type's " &
+         "Il2CppType address nor the type-name validation is available. " &
+         "Nothing was called. Reason: " & readCString(cNameIdxReason()))
+    return
+
+  var baseName = (if toks.len >= 3: toks[2] else: "UnityEngine.Component")
+  var bn = baseName
+  let typeRva = cCompTypeRva(toCString(bn))
+  if typeRva == 0'u32:
+    iErr("\"" & baseName & "\" has no `::@type` entry in the offline index. " &
+         "Either it is not a type on this build, or its name maps to two " &
+         "different Il2CppType descriptors and was DROPPED rather than " &
+         "guessed at. Nothing was called. Check offline with:  python " &
+         "tools/il2cpp_nameindex.py type <idx> " & baseName)
+    return
+  let typeDesc = cCompDataAt(uint64(typeRva))
+  if typeDesc == nil or not duOk(typeDesc, 16'i32):
+    iErr("the index gave Il2CppType RVA 0x" & iHexPad(uint64(typeRva), 6) &
+         " for " & baseName & " but that address is not readable in this " &
+         "process. Nothing was called. (Note this resolves as DATA, not " &
+         "code -- a static Il2CppType lives in .data.)")
+    return
+
+  var fnHandle: Il2CppPtr = nil
+  var rvaHandle = 0'u32
+  if not iNavFind("Type::GetTypeFromHandle", fnHandle, rvaHandle):
+    return
+  var fnGet: Il2CppPtr = nil
+  var rvaGet = 0'u32
+  if not iNavFind("GameObject::GetComponents(Type)", fnGet, rvaGet):
+    return
+
+  iOut("  base " & baseName & "  Il2CppType @0x" &
+       iHexPad(uint64(typeRva), 6) & " = " & iPtr(typeDesc) &
+       "   (offline index, round-tripped at generation)")
+  iMark("System.Type::GetTypeFromHandle", typeDesc)
+  let tobj = cast[Il2CppPtr](cInspUP(fnHandle, typeDesc, nil))
+  if tobj == nil or not duOk(tobj, 0x20'i32):
+    iErr("GetTypeFromHandle returned " & iPtr(tobj) & ", which is not a " &
+         "usable System.Type. GetComponents was NOT called.")
+    return
+
+  iMark("GameObject::GetComponents(Type)", go)
+  let arr = cast[Il2CppPtr](cInspUPP(fnGet, go, tobj, nil))
+  if arr == nil:
+    iErr("GetComponents returned NULL -- this is an ANSWER, not a crash: " &
+         "the object has no component deriving from " & baseName & ".")
+    return
+  if not duOk(arr, cNavOffArrData() + 8'i32):
+    iErr("GetComponents returned " & iPtr(arr) & " but that is not a " &
+         "readable array header; nothing was dereferenced.")
+    return
+  var n = int(cast[uint64](cReadPtrAt(arr, cNavOffArrLen())) and 0xFFFFFFFF'u64)
+  let capped = n > int(cCompMax())
+  if n < 0: n = 0
+  if capped:
+    n = int(cCompMax())
+  iOut("  " & (if capped: "MORE THAN " else: "") & $n &
+       " component(s) on " & iPtr(go) &
+       (if capped: "  -- capped at " & $cCompMax() & "; the rest are not listed"
+        else: ""))
+
+  var unver = 0
+  for i in 0 ..< n:
+    let slot = cNavOffArrData() + int32(i * 8)
+    if not duOk(arr, slot + 8'i32):
+      iErr("element " & $i & ": the array slot is not readable; stopping here.")
+      break
+    let c = cReadPtrAt(arr, slot)
+    if c == nil:
+      iOut("    [" & $i & "] NULL")
+      continue
+    let k = iKlassOf(c)
+    var verified = false
+    let nm = iKlassName(k, verified)
+    if i < 16:
+      iSetVarP("k" & $i, c)
+    iNoteKlass(c)
+    if verified:
+      iOut("    [" & $i & "] " & nm & "   " & iPtr(c) &
+           "  klass=" & iPtrU(k) & (if i < 16: "   ($k" & $i & ")" else: ""))
+    else:
+      inc unver
+      iOut("    [" & $i & "] UNVERIFIED name " &
+           (if nm.len == 0: "(unreadable)" else: "\"" & nm & "\"") &
+           " -- NOT a type in this build's metadata, so it is NOT reported " &
+           "as a type name. " & iPtr(c) & "  klass=" & iPtrU(k) &
+           (if i < 16: "   ($k" & $i & ")" else: ""))
+  if unver > 0 and unver == n:
+    iErr("EVERY name failed validation. That is the signature of the " &
+         "Il2CppClass.name offset (0x" & iHexPad(uint64(cCompOffName()), 2) &
+         ", the one INFERRED offset in this path) being wrong for this " &
+         "build -- not of the components being exotic. The pointers above " &
+         "are still real components and still usable; only the names are " &
+         "withheld.")
+  elif unver > 0:
+    iOut("  " & $unver & " name(s) did not validate; those lines say so " &
+         "individually. A mix means those specific klasses, not the offset.")
+  if n > 0:
+    var last = n - 1
+    if last > 15: last = 15
+    iOut("  bound to $k0" & (if last > 0: "..$k" & $last else: "") &
+         " -- feed straight into  label $k0 / click $k0 / call $k0 ...")
 
 proc iCmdRect(toks: seq[string]) =
   ## `rect EXPR` -- RectTransform geometry, from targets already byte-verified
@@ -3126,6 +3346,7 @@ proc iCmdHelp() =
   iOut("    find NAME in ROOTNAME         narrow by a root named, not pointed")
   iOut("    find more [BUDGET]            RESUME a search that hit its cap")
   iOut("    component EXPR TypeName       GameObject/Transform -> component")
+  iOut("    components EXPR [BaseType]    LIST every component, named  -> $k0..")
   iOut("                                  e.g.  component $g0 Button   -> $comp")
   iOut("    rect EXPR                     RectTransform geometry probe")
   iOut("    label EXPR                    TMP_Text.m_text as a field read")
@@ -3286,6 +3507,8 @@ proc iExec(line: string) =
     iCmdRoots(toks)
   of "component", "comp":
     iCmdComponent(toks)
+  of "components", "comps":
+    iCmdComponents(toks)
   of "rect":
     iCmdRect(toks)
   of "label":

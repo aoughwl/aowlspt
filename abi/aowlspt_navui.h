@@ -302,6 +302,71 @@ static const AowlNavTarget aowl_nav_targets[] = {
         0x57,
         0x48,0x83,0xEC,0x20,
         0x80 }, 16 },
+
+    /* ---- ENUMERATING COMPONENTS, instead of guessing type names one at a
+     * time and paying a fault for the unlucky guesses. See
+     * `abi/aowlspt_components.h` for the whole argument; these are the two
+     * calls it needs.
+     *
+     * `System.Type::GetTypeFromHandle(RuntimeTypeHandle)` is how `typeof(T)`
+     * is compiled. `RuntimeTypeHandle` is a ONE-FIELD struct whose value is
+     * the `Il2CppType*`, so on Win64 it arrives as a plain pointer in RCX --
+     * there is no by-value struct dance and no sret. The body confirms it:
+     * `40 53 / 48 83 EC 20 / 80 3D .. 00` (a class-init check) then
+     * `48 8B D9` -- `mov rbx, rcx` reads RCX as the VALUE. It is static, so
+     * the trailing MethodInfo* goes in RDX, and NULL is fine: it is not a
+     * shared generic.
+     *
+     * The `Il2CppType*` itself is never searched for at runtime. It is a
+     * static address in `.data`, resolved OFFLINE by
+     * `tools/il2cpp_nameindex.py` and served from the same index the by-RVA
+     * binder already uses, under the key `Ns.Type::@type/0`.
+     *
+     * This route replaces the export chain further down this file
+     * (domain -> assemblies -> image -> class_from_name -> class_get_type ->
+     * type_get_object). Six exported calls versus one managed call at a
+     * byte-verified RVA, on a build whose standing verdict is that the
+     * exported reflection surface faults. The old chain is left in place
+     * because other commands still reference it; nothing new should use it. */
+    /* ---- THE OVERLOAD THAT WAS MISSING, AND THE FAULTS IT EXPLAINS.
+     *
+     * `component EXPR Type` has only ever called the COMPONENT overload
+     * (0x52A48E0). Handed a GameObject -- which is what `$rgoN` binds, what
+     * `component` itself leaves in `$comp` when the caller looked one up, and
+     * what several screen-walking helpers hand back -- that is a NATIVE TYPE
+     * CONFUSION: both classes carry `m_CachedPtr` at +0x10, so the liveness
+     * pre-check passes and the icall then reads a native GameObject through a
+     * native Component layout, inside Unity's C++ where no guard of ours
+     * reaches. `duOk` says yes, `iUnityAlive` says yes, and it faults anyway.
+     *
+     * That is a HYPOTHESIS for the observed "faults on one node, answers
+     * cleanly on another" and it is stated as one. What is not hypothetical is
+     * that calling the Component overload on a GameObject is wrong, that the
+     * right overload exists at 0x52A8510, and that which one to use is decided
+     * from the klass pointer for free, before anything is called. A fault that
+     * can be avoided by picking the right function should never be spent. */
+    { "UnityEngine.GameObject::GetComponent(String)", 0x52A8510u,
+      { 0x48,0x89,0x5C,0x24,0x08,
+        0x57,
+        0x48,0x83,0xEC,0x20,
+        0x48,0x8B,0x05,0x17,0xC0,0xE2 }, 16 },
+
+    { "System.Type::GetTypeFromHandle", 0x458B020u,
+      { 0x40,0x53,
+        0x48,0x83,0xEC,0x20,
+        0x80,0x3D,0xC2,0x1E,0xB4,0x02,0x00,
+        0x48,0x8B,0xD9 }, 16 },
+
+    /* `UnityEngine.GameObject::GetComponents(Type) -> Component[]`. A real
+     * managed body, not an icall and not a stub: it opens a frame and does a
+     * class-init check before delegating to `GetComponentsInternal/6`. It
+     * ALLOCATES (a Type-keyed array), so it belongs in an on-demand command
+     * and must never appear in a per-frame path. */
+    { "UnityEngine.GameObject::GetComponents(Type)", 0x52A8760u,
+      { 0x48,0x89,0x74,0x24,0x10,
+        0x57,
+        0x48,0x83,0xEC,0x40,
+        0x80,0x3D,0xEF,0xBD,0xE2,0x01 }, 16 },
 };
 
 /* ---- FIELD OFFSETS, corroborated by the accessors' own inlined bodies.
