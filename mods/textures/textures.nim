@@ -66,6 +66,7 @@ type
     vramBudgetMB: int
     minConfidence: float
     logMatches: bool
+    albedoOnly: bool         ## only albedo is colour; the rest are DATA
     catMetal: bool
     catWood: bool
     catConcrete: bool
@@ -78,7 +79,7 @@ type
 proc defaultSettings(): Settings =
   Settings(enabled: true, swapMode: "off", hookAsync: false, armDelayMs: 15000,
            quality: "2k", vramBudgetMB: 1024,
-           minConfidence: 0.5, logMatches: true,
+           minConfidence: 0.5, logMatches: true, albedoOnly: true,
            catMetal: true, catWood: true, catConcrete: true,
            catBrick: true, catFabric: true, catGround: false,
            packRoot: "", probeTargets: "")
@@ -102,6 +103,7 @@ proc loadConfig() =
   gCfg.vramBudgetMB = sInt("vramBudgetMB", gCfg.vramBudgetMB)
   gCfg.minConfidence = sFloat("minConfidence", gCfg.minConfidence)
   gCfg.logMatches = sBool("logMatches", gCfg.logMatches)
+  gCfg.albedoOnly = sBool("albedoOnly", gCfg.albedoOnly)
   gCfg.catMetal = sBool("catMetal", gCfg.catMetal)
   gCfg.catWood = sBool("catWood", gCfg.catWood)
   gCfg.catConcrete = sBool("catConcrete", gCfg.catConcrete)
@@ -152,6 +154,9 @@ proc texturesSchema(): seq[Setting] =
     floatSetting("minConfidence", "Minimum match confidence", 0.5,
                  lo = 0.0, hi = 1.0, step = 0.05, category = "General",
                  description = "Runtime floor on the name-match confidence, on top of the curated manifest."),
+    boolSetting("albedoOnly", "Swap albedo maps only", true,
+                category = "General",
+                description = "ON by default because only albedo is COLOUR. normal / roughness / ao / height / metalness are DATA and must not be gamma-decoded as sRGB. The upload path is ImageConversion.LoadImage, which decodes into the texture the game already created and takes no colour-space argument, and this mod cannot establish offline what sRGB flag each destination texture was created with. So non-albedo entries are matched, COUNTED (refusedNonAlbedo in swapStats) and not swapped. Turn this off only after verifying the colour space on your build."),
     boolSetting("logMatches", "Log matched textures", true, category = "General",
                 description = "Log each texture the mod would swap. Useful before the upload path lands."),
 
@@ -289,6 +294,7 @@ proc onLoad(): Status =
   # installed during the boot bundle-load storm — that is where the first live
   # test crashed. `configureSwap` only records the intent.
   setFilter(gCfg.minConfidence, catAllowList())
+  setAlbedoOnly(gCfg.albedoOnly)
   configureSwap(gCfg.swapMode, gCfg.vramBudgetMB, tierName(),
                 gCfg.hookAsync, gCfg.armDelayMs)
   info "textures  will arm in mode '" & gCfg.swapMode & "' ~" &
