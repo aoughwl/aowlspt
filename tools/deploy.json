@@ -38,18 +38,20 @@
         "components EXPR [BaseType]",
         "SHARED RVA: ",
         "SHAREDNESS IS UNKNOWN for this entry",
-    "mods tab: built -- a sixth tab button cloned into SettingsScreen/",
-    "hide seasons armed as RIDERS on the ",
-    "settingsModsTab is set",
-    "mods tab: pages go into ",
-    "subtab BUTTON(s) cloned into a clone of ",
-    "version brand: REFUSING to write",
-    "hide seasons: Common UI/MenuScreen/SeasonsButton switched off",
-    "DID NOT FULLY TAKE -- it reads ",
-    "TextMeshProUGUI, matching the donor",
-    "was hidden again on the FIRST frame it did",
-    "Verified by re-reading the clone, not by trusting the write",
-    "hide seasons: GIVING UP after "
+        "mods tab: built -- a sixth tab button cloned into SettingsScreen/",
+        "hide seasons armed as RIDERS on the ",
+        "settingsModsTab is set",
+        "mods tab: pages go into ",
+        "subtab BUTTON(s) cloned into a clone of ",
+        "version brand: REFUSING to write",
+        "hide seasons: Common UI/MenuScreen/SeasonsButton switched off",
+        "DID NOT FULLY TAKE -- it reads ",
+        "TextMeshProUGUI, matching the donor",
+        "was hidden again on the FIRST frame it did",
+        "Verified by re-reading the clone, not by trusting the write",
+        "hide seasons: GIVING UP after ",
+        "DID NOT TAKE on any of the ",
+        "verified by reading m_text back"
       ]
     },
     {
@@ -128,7 +130,10 @@
         "textures  hooked ",
         "textures  ARMED post-boot in mode",
         "textures  unmatched sample",
-        "prologue MISMATCH"
+        "prologue MISMATCH",
+        "textures  REDIRECT",
+        "textures  bundle redirect",
+        "Diz.Resources.EasyBundle::Load@0x2772CC0/i>x"
       ]
     }
   ]
