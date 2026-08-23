@@ -1,0 +1,500 @@
+{
+  "manifest": [
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/field_grass_d",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/field_grass_d_autumn",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/field_grass_d_autumn_late",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/field_grass_d_spring",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/field_grass_d_spring_early",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/field_grass_d_winter",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass2_d",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass2_d_autumn",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass2_d_autumn_late",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass2_d_spring",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass2_d_spring_early",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass2_d_winter",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass3_d",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass3_d_autumn",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass3_d_autumn_late",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass3_d_spring",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass3_d_spring_early",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass3_d_winter",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass4_d",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass4_d_autumn",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass4_d_autumn_late",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass4_d_spring",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass4_d_spring_early",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass4_d_winter",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass5_512_d",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass5_512_d_autumn",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass5_512_d_autumn_late",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass5_512_d_spring",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass5_512_d_spring_early",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass5_512_d_winter",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass5_d",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass5_d_autumn",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass5_d_autumn_late",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass5_d_spring",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass5_d_spring_early",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass5_d_winter",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass6_d",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass6_d_02",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass6_d_02_autumn",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass6_d_02_autumn_late",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass6_d_02_spring",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass6_d_02_spring_early",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass6_d_02_winter",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass6_d_autumn",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass6_d_autumn_late",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass6_d_spring",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass6_d_spring_early",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass6_d_winter",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass_2_roma",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass_2_roma_autumn",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass_2_roma_autumn_late",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass_2_roma_spring",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass_2_roma_spring_early",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass_2_roma_winter",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass_new_1_d",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass_new_1_d_autumn",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass_new_1_d_autumn_late",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass_new_1_d_spring",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass_new_1_d_spring_early",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass_new_1_d_winter",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass_new_2_d",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass_new_2_d_autumn",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass_new_2_d_autumn_late",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass_new_2_d_spring",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass_new_2_d_spring_early",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass_new_2_d_winter",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass_new_3_d",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass_new_3_d_autumn",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass_new_3_d_autumn_late",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass_new_3_d_spring",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass_new_3_d_spring_early",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/grass_new_3_d_winter",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/romashka",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/romashka_autumn",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/romashka_autumn_late",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/romashka_spring",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/romashka_spring_early",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/romashka_winter",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/t_krapivalittle_a",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/t_krapivalittle_a_autumn",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/t_krapivalittle_a_autumn_late",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/t_krapivalittle_a_spring",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/t_krapivalittle_a_spring_early",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/t_krapivalittle_a_winter",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/t_whitgrass_a",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/t_whitgrass_a_autumn",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/t_whitgrass_a_autumn_late",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/t_whitgrass_a_spring",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/t_whitgrass_a_spring_early",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/fbx/_outdoor/_nature/grass/t_whitgrass_a_winter",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/textures/_metal/fence_metall.bundle",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/02_custom/textures/_metal/steel_dye01.bundle",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/city_old/mesh/grass from cw/grass11",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/city_old/mesh/grass from cw/grass11_autumn",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/city_old/mesh/grass from cw/grass11_autumn_late",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/city_old/mesh/grass from cw/grass11_spring",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/city_old/mesh/grass from cw/grass11_spring_early",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/city_old/mesh/grass from cw/grass11_winter",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/city_old/mesh/grass from cw/grass1_1",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/city_old/mesh/grass from cw/grass1_1_d_autumn",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/city_old/mesh/grass from cw/grass1_1_d_autumn_late",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/city_old/mesh/grass from cw/grass1_1_d_spring",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/city_old/mesh/grass from cw/grass1_1_d_spring_early",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/city_old/mesh/grass from cw/grass1_1_d_winter",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/city_old/mesh/grass from cw/grass_cut_dry",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/city_old/mesh/grass from cw/grass_cut_dry_autumn",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/city_old/mesh/grass from cw/grass_cut_dry_autumn_late",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/city_old/mesh/grass from cw/grass_cut_dry_spring",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/city_old/mesh/grass from cw/grass_cut_dry_spring_early",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/location_objects/city_old/mesh/grass from cw/grass_cut_dry_winter",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/prefabs/levelobjects/outdoor/plastic_suitcase_set/plastic_suitcase_54_p.bundle",
+      "dependencyKeys": [
+        "assets/commonassets/physics/physicsmaterials.bundle",
+        "cubemaps",
+        "shaders"
+      ]
+    },
+    {
+      "key": "assets/content/rock and boulders3/origin/grass/grass_02_512",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/rock and boulders3/origin/grass/grass_02_512_d_autumn",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/rock and boulders3/origin/grass/grass_02_512_d_autumn_late",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/rock and boulders3/origin/grass/grass_02_512_d_spring",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/rock and boulders3/origin/grass/grass_02_512_d_spring_early",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/rock and boulders3/origin/grass/grass_02_512_d_winter",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/rock and boulders3/origin/grass/grass_02_d",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/rock and boulders3/origin/grass/grass_02_d_autumn",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/rock and boulders3/origin/grass/grass_02_d_autumn_late",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/rock and boulders3/origin/grass/grass_02_d_spring",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/rock and boulders3/origin/grass/grass_02_d_spring_early",
+      "dependencyKeys": []
+    },
+    {
+      "key": "assets/content/rock and boulders3/origin/grass/grass_02_d_winter",
+      "dependencyKeys": []
+    }
+  ]
+}

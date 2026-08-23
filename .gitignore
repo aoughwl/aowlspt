@@ -85,3 +85,11 @@ mods/textures/data/pack/
 
 # Decrypted IL2CPP metadata cache (large, derived, never committed)
 .cache/
+
+# Texture pipeline outputs: the built packs and the full inventory are derived and
+# large (post1-pack is 84 MB, inv-post1-full.json 7.5 MB). Rebuild with
+# texpipe/inventory.py + build_post1.py; see texpipe/README-post1.md.
+out/*-pack/
+out/post1-neg-*/
+out/diagnostic-pack/
+out/inv-post1-full.json
