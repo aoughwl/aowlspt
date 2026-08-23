@@ -111,6 +111,23 @@ const ModsMaxSubtabs = 5
 ## How many times the lazy build may be attempted before it gives up quietly.
 const ModsMaxBuildTries = 8
 
+## How many TextMeshProUGUI one relabel may consider. A cap, not an
+## expectation.
+const ModsMaxTmp = 8
+
+## Every label this feature has successfully written, so it can be re-asserted
+## if LocalizedText puts the donor's string back. Bounded by ModsMaxSubtabs + 1
+## (the tab button), and written only at build time.
+var gModsLabelTmp: seq[Il2CppPtr] = @[]
+var gModsLabelText: seq[string] = @[]
+## The re-assert throttle, and the count of consecutive checks that found every
+## label intact. After ModsStableEnough of those it STOPS: a label nothing is
+## fighting over does not need a poll for the rest of the session.
+var gModsLabelFrames = 0
+var gModsLabelStable = 0
+const ModsLabelEveryFrames = 60
+const ModsStableEnough = 10
+
 var gModsBuilt = false
 var gModsTried = 0
 var gModsFaults = 0
@@ -374,47 +391,133 @@ proc modsToggleOf(t: Il2CppPtr): Il2CppPtr =
     result = modsComponent(t, "Toggle")
   if result != nil:
     return
+  # BY SHAPE, ACROSS EVERY CHILD -- never `<clone>/ControlsToggle`, and never
+  # child 0 either. MEASURED (fact #87): a spawner CLONE names its toggle
+  # `AnimatedToggle`, not `ControlsToggle` like the donor does, so any walk
+  # keyed on the donor's child name misses entirely and silently. Names
+  # describe the donor; shapes describe the thing.
   var n = 0
   if not iChildCount(t, n) or n < 1:
     return
-  let inner = iChildAt(t, 0)
-  if inner == nil:
-    return
-  result = modsComponent(inner, "AnimatedToggle")
-  if result == nil:
-    result = modsComponent(inner, "Toggle")
+  var i = 0
+  while i < n and i < 8:
+    let inner = iChildAt(t, i)
+    if inner != nil and duOk(inner, 0x20'i32):
+      result = modsComponent(inner, "AnimatedToggle")
+      if result == nil:
+        result = modsComponent(inner, "Toggle")
+      if result != nil:
+        return
+    i = i + 1
 
-proc modsFindTmp(t: Il2CppPtr; depth: int): Il2CppPtr =
-  ## The first TextMeshProUGUI at or under `t`, to `depth` levels, capped at
-  ## every level. A button whose caption cannot be reached is REFUSED as a donor
-  ## rather than cloned and left showing someone else's word.
-  result = nil
-  if t == nil or depth < 0 or not duOk(t, 0x20'i32):
+proc modsCollectTmp(t: Il2CppPtr; depth: int; nodes: var seq[Il2CppPtr];
+                    tmps: var seq[Il2CppPtr]) =
+  ## EVERY TextMeshProUGUI at or under `t`, to `depth` levels. Capped hard at
+  ## `ModsMaxTmp` in total and 16 per level.
+  ##
+  ## Why all of them rather than the first: a tab button carries more than one.
+  ## On this build the one that RENDERS is not necessarily the one named
+  ## `Label` -- TMP parents its `TMP UI SubObject` submesh under the object it
+  ## renders on, and the clone that came out blank had no submesh at all, which
+  ## is the fingerprint of a TMP that was never given text. So the caller tries
+  ## each in turn and keeps the one whose text actually reads back.
+  if t == nil or depth < 0 or not duOk(t, 0x20'i32) or tmps.len >= ModsMaxTmp:
     return
-  result = modsComponent(t, "TextMeshProUGUI")
-  if result != nil or depth == 0:
+  let here = modsComponent(t, "TextMeshProUGUI")
+  if here != nil:
+    nodes.add t
+    tmps.add here
+  if depth == 0:
     return
   var n = 0
   if not iChildCount(t, n):
     return
   var i = 0
-  while i < n and i < 16:
+  while i < n and i < 16 and tmps.len < ModsMaxTmp:
     let c = iChildAt(t, i)
     if c != nil:
-      result = modsFindTmp(c, depth - 1)
-      if result != nil:
-        return
+      modsCollectTmp(c, depth - 1, nodes, tmps)
     i = i + 1
 
-proc modsRelabel(t: Il2CppPtr; text: string): bool =
-  ## Relabel a button WE cloned, by CALLING the game's setters through
-  ## `swRelabelControl`: a raw `m_text` store is put back by the LocalizedText
-  ## the clone inherited from its donor.
-  result = false
-  let tmp = modsFindTmp(t, 3)
-  if tmp == nil:
+proc modsTmpText(tmp: Il2CppPtr): string =
+  ## What this TMP's `m_text` reads right now. The offset comes from the
+  ## settings-write module's own field table, never a guess.
+  result = ""
+  if tmp == nil or not duOk(tmp, cSuiOffTmpMText() + 8'i32):
     return
-  result = swRelabelControl(cast[Il2CppPtr](0), tmp, text)
+  result = suiReadString(cReadPtrAt(tmp, cSuiOffTmpMText()))
+
+proc modsFindTmp(t: Il2CppPtr; depth: int): Il2CppPtr =
+  ## Is there ANY reachable TMP under `t`? Used only as a donor-shape assertion
+  ## before cloning; the relabel itself uses `modsCollectTmp` and tries them all.
+  result = nil
+  var nodes: seq[Il2CppPtr] = @[]
+  var tmps: seq[Il2CppPtr] = @[]
+  modsCollectTmp(t, depth, nodes, tmps)
+  if tmps.len > 0:
+    result = tmps[0]
+
+proc modsRelabel(t: Il2CppPtr; text: string): bool =
+  ## Relabel a button WE cloned, and PROVE IT TOOK.
+  ##
+  ## The bug this exists for: the sixth tab was built, logged as built, and was
+  ## BLANK on screen. `swRelabelControl` returned true -- it had called
+  ## `TMP_Text::set_text` on a TextMeshProUGUI -- but on one that does not
+  ## render. A write that succeeds on the wrong object is indistinguishable in a
+  ## log from a write that worked, which is the exact failure mode this repo
+  ## pays for most.
+  ##
+  ## So: try every candidate, and after each write READ `m_text` BACK. The
+  ## candidates that already carry text are tried FIRST, because a TMP with text
+  ## is by definition one that renders. If none reads back, this REFUSES and
+  ## says what it tried and what each one read -- a blank tab must never again
+  ## be reported as a built one.
+  ##
+  ## Re-applying is the caller's job (`modsReassertLabels`): LocalizedText can
+  ## clobber a store a frame or two later, which is why the version brand polls.
+  result = false
+  var nodes: seq[Il2CppPtr] = @[]
+  var tmps: seq[Il2CppPtr] = @[]
+  modsCollectTmp(t, 4, nodes, tmps)
+  if tmps.len == 0:
+    warn "mods tab: REFUSING to claim the label '" & text & "' -- there is " &
+         "no TextMeshProUGUI anywhere under this clone (searched 4 levels). " &
+         "Nothing was written."
+    return
+  var report = ""
+  var pass = 0
+  while pass < 2 and not result:
+    var i = 0
+    while i < tmps.len:
+      let before = modsTmpText(tmps[i])
+      let wanted = (if pass == 0: before.len > 0 else: before.len == 0)
+      if wanted:
+        if swRelabelControl(cast[Il2CppPtr](0), tmps[i], text):
+          let after = modsTmpText(tmps[i])
+          if after == text:
+            gModsLabelTmp.add tmps[i]
+            gModsLabelText.add text
+            gModsLabelStable = 0
+            okLog "mods tab: label '" & text & "' took on '" &
+                  iObjName(nodes[i]) & "' (candidate " & $i & " of " &
+                  $tmps.len & ", which " &
+                  (if before.len > 0: "already read '" & before & "'"
+                   else: "was empty") & ") via " & gSwLastRoutes &
+                  "-- verified by reading m_text back"
+            return true
+          if report.len < 400:
+            report = report & "'" & iObjName(nodes[i]) & "' wrote but read " &
+                     "back '" & after & "'; "
+        else:
+          if report.len < 400:
+            report = report & "'" & iObjName(nodes[i]) & "' refused the " &
+                     "write; "
+      i = i + 1
+    pass = pass + 1
+  warn "mods tab: the label '" & text & "' DID NOT TAKE on any of the " &
+       $tmps.len & " TextMeshProUGUI under this clone, so the control is " &
+       "BLANK on screen -- reporting it rather than claiming a built tab. " &
+       "What happened: " & report
 
 proc modsToggleIsOn(toggle: Il2CppPtr): bool =
   result = false
@@ -861,6 +964,39 @@ proc modsTabBuild(): bool =
 # ONLY on an edge. No managed allocation on this path.
 # ---------------------------------------------------------------------------
 
+proc modsReassertLabels() =
+  ## Put our captions back if LocalizedText has clobbered them.
+  ##
+  ## This is the same lesson the version brand encodes: a raw store is
+  ## re-applied over, and even a setter call can be undone when the game
+  ## re-localises a row. So the labels are re-checked -- but on a 60-frame
+  ## throttle, capped at ModsMaxTmp entries, and it SWITCHES ITSELF OFF once
+  ## ten consecutive checks have found everything intact. Reading a managed
+  ## string allocates, which is why this may not run per frame.
+  if gModsLabelStable >= ModsStableEnough or gModsLabelTmp.len == 0:
+    return
+  inc gModsLabelFrames
+  if gModsLabelFrames < ModsLabelEveryFrames:
+    return
+  gModsLabelFrames = 0
+  var clobbered = 0
+  var i = 0
+  while i < gModsLabelTmp.len and i < ModsMaxTmp:
+    if duOk(gModsLabelTmp[i], cSuiOffTmpMText() + 8'i32):
+      if modsTmpText(gModsLabelTmp[i]) != gModsLabelText[i]:
+        clobbered = clobbered + 1
+        discard swRelabelControl(cast[Il2CppPtr](0), gModsLabelTmp[i],
+                                 gModsLabelText[i])
+    i = i + 1
+  if clobbered == 0:
+    inc gModsLabelStable
+    if gModsLabelStable == ModsStableEnough:
+      okLog "mods tab: all " & $gModsLabelTmp.len & " label(s) have stayed " &
+            "put for " & $ModsStableEnough & " consecutive checks, so the " &
+            "re-assert poll has switched itself off for this session"
+  else:
+    gModsLabelStable = 0
+
 proc modsShowSubtab(sel: int) =
   ## Make `sel` the visible page. Calls only where something changes.
   var i = 0
@@ -934,6 +1070,7 @@ proc modsTabTickBody() =
         swReadBackPage(gModsPages[q])
         q = q + 1
     return                              # one edge's worth of work per frame
+  modsReassertLabels()                  # throttled, and it stops when stable
   if not gModsShown:
     return
   modsTickSubtabs()
@@ -1172,44 +1309,90 @@ var gSeasonsSaid = false
 var gSeasonsSaidMissing = false
 var gSeasonsFaults = 0
 
+## What the last MenuScreen walk actually saw, so a decline is a sentence and
+## not a silence. THIS IS THE BUG THIS BLOCK EXISTS FOR: the feature was armed,
+## the flag was true, the rider fired -- and the log contained NOT ONE LINE from
+## it after the arm banner. A path that declines without saying why is the worst
+## outcome this host produces, and it had one.
+var gSeasonsWhy = ""
+var gSeasonsPasses = 0
+var gSeasonsSaidWalk = false
+const SeasonsMaxPasses = 30
+
 proc seasonsFindMenuScreen(): Il2CppPtr =
-  ## `MenuScreen`, from the scene roots. This is the only expensive step, and it
-  ## is why the result is cached and revalidated rather than re-walked: the root
+  ## `MenuScreen`, from the scene roots. The only expensive step, which is why
+  ## the result is cached and revalidated rather than re-walked: the root
   ## enumeration allocates, and nothing that allocates may run per frame.
+  ##
+  ## It looks THREE levels down from each root, not just at direct children:
+  ## `Common UI` is a root, but a build that inserts a layer between it and
+  ## MenuScreen would otherwise make this fail while reporting nothing.
   result = nil
   var roots: seq[Il2CppPtr] = @[]
-  discard iSceneRoots(roots, false)
+  let n = iSceneRoots(roots, false)
+  if roots.len == 0:
+    gSeasonsWhy = "iSceneRoots enumerated NO roots at all (it returned " & $n &
+                  "). That is the scene-root walk failing, not the banner " &
+                  "being absent -- it needs the nav targets " &
+                  "Scene::GetRootGameObjects / GameObject::get_scene_Injected, " &
+                  "which come from the name index; check nameIndex loaded"
+    return
+  var names = ""
   var i = 0
   while i < roots.len and i < 32:
     let goT = iToTransform(roots[i])
     if goT != nil and duOk(goT, 0x20'i32):
-      let m = modsChildNamed(goT, "MenuScreen")
+      if names.len < 300:
+        names = names & "'" & iObjName(goT) & "' "
+      let m = modsFindNamed(goT, "MenuScreen", 3)
       if m != nil:
+        gSeasonsWhy = ""
         return m
     i = i + 1
+  gSeasonsWhy = "no 'MenuScreen' within 3 levels of any of the " &
+                $roots.len & " scene root(s): " & names
 
 proc seasonsTickBody() =
   if not gSeasonsOn or gSeasonsFaults >= SeasonsMaxFaults:
     return
-  # Revalidate the cached MenuScreen before trusting it; a menu rebuild
-  # destroys it and a stale Transform is a fault waiting for the next ICALL.
+  inc gSeasonsPasses
+  # Revalidate the cached MenuScreen before trusting it: a menu rebuild
+  # destroys it, and a stale Transform is a fault waiting for the next ICALL.
   if gSeasonsMenu != nil and
      (not duOk(gSeasonsMenu, 0x20'i32) or not iUnityAlive(gSeasonsMenu)):
     gSeasonsMenu = nil
   if gSeasonsMenu == nil:
     gSeasonsMenu = seasonsFindMenuScreen()
     if gSeasonsMenu == nil:
-      return                            # menu not up; normal, and cheap
+      # SAY IT. Once early, so "armed and doing nothing" is never again
+      # indistinguishable from "armed and working", and once more when it gives
+      # up. Before the main menu exists this is simply the truth.
+      if gSeasonsPasses == 2 and not gSeasonsSaidWalk:
+        gSeasonsSaidWalk = true
+        okLog "hide seasons: nothing hidden yet -- " & gSeasonsWhy &
+              ". This is expected before the main menu is up; it keeps " &
+              "looking on a " & $SeasonsEveryFrames & "-frame throttle."
+      elif gSeasonsPasses >= SeasonsMaxPasses:
+        gSeasonsOn = false
+        warn "hide seasons: GIVING UP after " & $gSeasonsPasses &
+             " passes -- " & gSeasonsWhy & ". The KORD BREACH / Season " &
+             "banner is left exactly as the game made it, and this feature " &
+             "is OFF for the session. It is announcing this rather than " &
+             "continuing to do nothing quietly."
+      return
+    okLog "hide seasons: found MenuScreen; looking for its 'SeasonsButton' " &
+          "child on every pass from here"
   # BY NAME, EVERY PASS. The button is re-resolved rather than cached, so a
   # rebuilt banner is hidden again and a destroyed one is simply not found.
   let btn = modsChildNamed(gSeasonsMenu, "SeasonsButton")
   if btn == nil:
     if not gSeasonsSaidMissing:
       gSeasonsSaidMissing = true
-      okLog "hide seasons: MenuScreen has no child named 'SeasonsButton' on " &
-            "this build. NOTHING was hidden -- there is deliberately no " &
-            "positional fallback, because hiding whatever happens to sit " &
-            "there is how the Play button disappears after a patch."
+      okLog "hide seasons: MenuScreen was reached but has NO child named " &
+            "'SeasonsButton' on this build. NOTHING was hidden -- there is " &
+            "deliberately no positional fallback, because hiding whatever " &
+            "happens to sit there is how the Play button disappears after a " &
+            "patch."
     return
   let go = iGameObjectOf(btn)
   if go == nil or not iUnityAlive(go):
@@ -1224,6 +1407,10 @@ proc seasonsTickBody() =
             "(the KORD BREACH / Season banner above Play). It is re-checked " &
             "on a throttle, so a menu rebuild hides it again; it is never " &
             "re-enabled by this host."
+  else:
+    warn "hide seasons: GameObject::SetActive(false) REFUSED on " &
+         "SeasonsButton (the target verified, the call did not run). The " &
+         "banner is untouched."
 
 # ---------------------------------------------------------------------------
 # ONE GUARDED ENTRY, THREE BRANCHES. `aowl_p_p_seh` is NOT re-entrant, so all
