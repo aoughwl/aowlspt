@@ -26,6 +26,7 @@
 
 import std/[strutils, syncio, cmdline, envvars, osproc]
 import aowlsptinstall/[winfs, log]
+import aowluicmd
 
 const Usage = """
 aowl -- build, test and install aowlspt
@@ -47,6 +48,10 @@ aowl -- build, test and install aowlspt
   release            a versioned, verifiable artifact; --mod NAME for one mod
   importdb           build the emulator's db.json from an SPT install
                      (--from D:\SPT; --help for the rest)
+  ui SUBCMD          drive the LIVE client's UI by the text a person SEES --
+                     `aowl ui help` for the verbs. Talks to a running game
+                     through the inspector channel; compiles nothing.
+  raid               enter an offline raid: `aowl raid --map factory`
   clean              remove build output
 
 Options
@@ -2705,7 +2710,8 @@ proc main(): int =
     # `release` parses its own options -- `--mod`, `--out`, `--check-only`.
     # Forwarding everything after the verb verbatim keeps this parser from
     # having to learn a second command's flags, and keeps them from drifting.
-    if command == "release" or command == "importdb":
+    if command == "release" or command == "importdb" or
+       command == "ui" or command == "raid":
       extra.add a
     elif a == "--debug":
       e.debugBuild = true
@@ -2733,12 +2739,17 @@ proc main(): int =
     echo Usage
     return (if help: 0 else: 1)
 
-  if not fileExists(nimonyExe(e)):
-    fatal "nimony not found at " & nimonyExe(e) & " (pass --nimony PATH)"
-  prepareEnv(e)
+  # `ui` and `raid` drive a RUNNING game through the inspector's text channel.
+  # They compile nothing, so demanding a toolchain checkout -- and printing
+  # two lines about it -- would only be a way to fail on a machine that is
+  # perfectly able to do the job.
+  if command != "ui" and command != "raid":
+    if not fileExists(nimonyExe(e)):
+      fatal "nimony not found at " & nimonyExe(e) & " (pass --nimony PATH)"
+    prepareEnv(e)
 
-  note "repo    " & e.repo
-  note "nimony  " & e.nimony
+    note "repo    " & e.repo
+    note "nimony  " & e.nimony
 
   case command
   of "build":
@@ -2772,6 +2783,8 @@ proc main(): int =
   of "release": result = cmdRelease(e, extra)
   of "importdb": result = cmdImportDb(e, extra)
   of "clean": result = cmdClean(e)
+  of "ui": result = cmdUi(e.repo, extra)
+  of "raid": result = cmdRaid(extra)
   else:
     err "unknown command: " & command
     echo Usage

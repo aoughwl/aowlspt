@@ -85,3 +85,8 @@ mods/textures/data/pack/
 
 # Decrypted IL2CPP metadata cache (large, derived, never committed)
 .cache/
+
+# The UI path cache is a LEARNED artifact, stamped with the game build it
+# was measured against. Committing it would ship one machine's pointers as
+# if they were facts about everyone's install.
+tools/uimap.txt
