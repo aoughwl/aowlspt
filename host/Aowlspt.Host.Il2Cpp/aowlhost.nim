@@ -1347,6 +1347,10 @@ var gModsLastTabName = ""
 ## `modstab.nim` and ride the same detour; both default OFF.
 var gVerOn = false
 var gSeasonsOn = false
+## POSTFX folded into Graphics as a subtab. Default OFF, and it is the one
+## feature in `modstab.nim` that drives the GAME's own panels rather than
+## clones of them.
+var gGfxOn = false
 
 var gCodeGenProbeSlot = -1
   ## THE FOURTH RIDER on `EFT.UI.PreloaderUI::Update`, armed only by
@@ -6634,6 +6638,21 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "object. It rides the shared PreloaderUI::Update detour on a " &
          "120-frame throttle and gives up after 8 applies."
   # THE MAIN-MENU SEASONS BANNER (`uxHideSeasons`). Default OFF.
+  gGfxOn = readBoolKey("settingsPostFxSubtab")
+  if gGfxOn and not gSettingsUiProbe:
+    gSettingsUiProbe = true
+    info "settingsPostFxSubtab is set, so settingsUiProbe has been turned on " &
+         "with it -- it needs the live SettingsScreen that probe's ShowScreen " &
+         "postfix is what learns."
+  if gGfxOn:
+    info "settingsPostFxSubtab is set: POSTFX is folded into GRAPHICS as a " &
+         "subtab. The top row loses its POSTFX button (SetActive(false) -- " &
+         "HIDDEN, never destroyed, and restored if the feature faults out) " &
+         "and both the Graphics and PostFX panels gain a cloned two-button " &
+         "strip, GRAPHICS SETTINGS | POSTFX, that switches the two STOCK " &
+         "panels. Neither panel is cloned or written to; only their active " &
+         "state is driven, because the game switches panels by ESettingsGroup " &
+         "and a subtab of ours is not one."
   gSeasonsOn = readBoolKey("uxHideSeasons")
   if gSeasonsOn:
     info "uxHideSeasons is set: the host switches off " &
@@ -6859,7 +6878,7 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       # on `EFT.UI.PreloaderUI::Update`, so by here any of the other four may
       # have claimed the slot and this aliases onto it for free. It never
       # attaches a detour of its own.
-      if gModsOn or gVerOn or gSeasonsOn:
+      if gModsOn or gVerOn or gSeasonsOn or gGfxOn:
         discard bindModsTab(true)
 
   let modsDir = joinPath(gDir, "mods")

@@ -391,9 +391,17 @@ proc modsLooksLikeTable(t: Il2CppPtr; what: var string): bool =
 
 proc modsToggleOf(t: Il2CppPtr): Il2CppPtr =
   ## The Toggle-family component for a button: on the node itself if it is a
-  ## plain button, otherwise on its first child, which is the shape a
-  ## `*ToggleSpawner` has. The concrete type is tried first and the base second,
-  ## because Unity's GetComponent(String) matches base names too.
+  ## plain button, otherwise on a CHILD -- by shape, never by the donor's child
+  ## name (fact #87: a spawner clone names its toggle `AnimatedToggle`, the
+  ## donor names it `ControlsToggle`, and which a walk finds depends on
+  ## enumeration order).
+  ##
+  ## ACTIVE CHILDREN FIRST, and this is not cosmetic. A cloned spawner ends up
+  ## with TWO toggles (fact #93) and the reap switches one OFF. Binding the
+  ## switched-off one gives a pointer whose `m_IsOn` never changes: the tab
+  ## would never hide, and a subtab would never switch a page. That is the
+  ## single most likely cause of "selecting a subtab does nothing", so the
+  ## search is ordered to make it impossible rather than unlikely.
   result = nil
   if t == nil:
     return
@@ -402,24 +410,51 @@ proc modsToggleOf(t: Il2CppPtr): Il2CppPtr =
     result = modsComponent(t, "Toggle")
   if result != nil:
     return
-  # BY SHAPE, ACROSS EVERY CHILD -- never `<clone>/ControlsToggle`, and never
-  # child 0 either. MEASURED (fact #87): a spawner CLONE names its toggle
-  # `AnimatedToggle`, not `ControlsToggle` like the donor does, so any walk
-  # keyed on the donor's child name misses entirely and silently. Names
-  # describe the donor; shapes describe the thing.
   var n = 0
   if not iChildCount(t, n) or n < 1:
     return
-  var i = 0
-  while i < n and i < 8:
-    let inner = iChildAt(t, i)
-    if inner != nil and duOk(inner, 0x20'i32):
-      result = modsComponent(inner, "AnimatedToggle")
-      if result == nil:
-        result = modsComponent(inner, "Toggle")
-      if result != nil:
-        return
-    i = i + 1
+  var pass = 0
+  while pass < 2:
+    var i = 0
+    while i < n and i < 8:
+      let inner = iChildAt(t, i)
+      if inner != nil and duOk(inner, 0x20'i32):
+        let go = iGameObjectOf(inner)
+        let live = (go != nil and modsGoActive(go))
+        if (pass == 0 and live) or (pass == 1 and not live):
+          result = modsComponent(inner, "AnimatedToggle")
+          if result == nil:
+            result = modsComponent(inner, "Toggle")
+          if result != nil:
+            if pass == 1:
+              warn "mods tab: the only Toggle under this clone is on an " &
+                   "INACTIVE object, so its m_IsOn can never change and the " &
+                   "control it drives will never respond. Binding it anyway " &
+                   "so the failure is visible rather than silent."
+            return
+      i = i + 1
+    pass = pass + 1
+
+proc modsDescribeToggle(tag: string; tog: Il2CppPtr) =
+  ## MEASURE, do not infer. Prints what a bound toggle actually is: its object's
+  ## active state, its `m_IsOn` (+0x120) and its `m_Group` (+0x110) -- fact #80.
+  ## The group pointer is what says whether exclusivity is the game's or ours,
+  ## and it was only ever measured for the TAB strip clone; this measures it for
+  ## every subtab too, which is what the next live run needs in order to answer
+  ## "are the subtabs exclusive?" without guessing.
+  if tog == nil:
+    warn "mods tab: " & tag & " -> NO TOGGLE BOUND"
+    return
+  var grp: Il2CppPtr = nil
+  if duOk(tog, ModsOffGroup + 8'i32):
+    grp = cReadPtrAt(tog, ModsOffGroup)
+  let go = iGameObjectOf(tog)
+  okLog "mods tab: " & tag & " -> toggle=" & iPtr(tog) & " objectActive=" &
+        (if go != nil and modsGoActive(go): "true" else: "FALSE") &
+        " m_IsOn=" & (if duOk(tog, ModsOffIsOn + 4'i32) and
+                         cSwReadU8(tog, ModsOffIsOn) != 0'i32: "true"
+                      else: "false") &
+        " m_Group=" & iPtr(grp)
 
 proc modsCollectTmp(t: Il2CppPtr; depth: int; nodes: var seq[Il2CppPtr];
                     tmps: var seq[Il2CppPtr]) =
@@ -888,7 +923,14 @@ proc modsBuildSubtabs(stripT, buttonDonorGo, donorT: Il2CppPtr;
     # inside `modsRelabelLike` is the loud one; this only counts them.
     if not modsRelabelLike(btnT, donorT, gModsPages[p].title):
       badLabels = badLabels + 1
+    # RE-BIND AFTER THE REAP. `tog` above was read before the extra toggle was
+    # switched off, so it may be the pointer to the object we just killed --
+    # whose m_IsOn can never change again. This is the most likely reason a
+    # subtab click changed nothing, so it is fixed by ORDER, not by hope.
     discard modsReapExtraToggles(btnT, donorT, gModsPages[p].title)
+    let live = modsToggleOf(btnT)
+    let bound = (if live != nil: live else: tog)
+    modsDescribeToggle("subtab '" & gModsPages[p].id & "' after the reap", bound)
     if gModsReapClone.len < ModsMaxSubtabs + 1:
       gModsReapClone.add btnT
       gModsReapDonor.add donorT
@@ -897,13 +939,13 @@ proc modsBuildSubtabs(stripT, buttonDonorGo, donorT: Il2CppPtr;
     # came back NATIVE for the tab-button donor: Instantiate remapped each
     # clone's m_Group onto the cloned group. The stock-group branch stays
     # because the measurement is PER DONOR and this is a different donor.
-    if duOk(tog, ModsOffGroup + 8'i32):
-      let g = cReadPtrAt(tog, ModsOffGroup)
+    if duOk(bound, ModsOffGroup + 8'i32):
+      let g = cReadPtrAt(bound, ModsOffGroup)
       if g != nil and g == stockGroup:
         gModsOwnExclusive = true
-        discard cUxWritePtr(tog, ModsOffGroup, cast[Il2CppPtr](0))
+        discard cUxWritePtr(bound, ModsOffGroup, cast[Il2CppPtr](0))
     discard modsSetActive(btn, true)
-    gModsSubs.add ModsSub(name: gModsPages[p].title, toggle: tog,
+    gModsSubs.add ModsSub(name: gModsPages[p].title, toggle: bound,
                           pageGo: nil, lastOn: false)
     result = result + 1
     p = p + 1
@@ -1030,6 +1072,7 @@ proc modsTabBuild(): bool =
   gModsReapDonor.add donorTab
   gModsReapCaption.add "MODS"
   let mainToggle = modsToggleOf(tabCloneT)
+  modsDescribeToggle("the MODS tab button after the reap", mainToggle)
   if mainToggle == nil:
     modsNoteFault("the cloned tab button has no Toggle component, so its " &
                   "selected state cannot be read; the panel would never show")
@@ -1148,27 +1191,75 @@ proc modsTabBuild(): bool =
 
   # ---- the rows, by the SAME renderer the Game-tab pages already use ----
   swLearnTabKlasses(tabPtr)
+  var rowDonorKind = ""
+  let rowDonor = swAnyDonor(tabPtr, rowDonorKind)
+  let rowDonorT = (if rowDonor != nil: iToTransform(rowDonor) else: nil)
   var r = 0
+  var rowsFixed = 0
+  var rowsBad = 0
   while r < gModsSubs.len and r < gModsPages.len:
     if gModsSubs[r].pageGo != nil:
       discard swRenderPage(tabPtr, gModsSubs[r].pageGo, gModsPages[r])
+      # RE-ASSERT EVERY ROW'S CAPTION ACROSS ALL ITS TMPs.
+      #
+      # `swCloneRow` labels through `swControlTmp` -- ONE TextMeshProUGUI --
+      # which is the same trap as fact #88: the write lands and the row still
+      # reads the donor's caption, which is why every row on every page read
+      # 'Interface language'. That renderer is shared with the Game-tab pages,
+      # so rather than change its behaviour underneath that feature, this
+      # re-labels the clones it produced, using the donor-count rule.
+      if rowDonorT != nil:
+        var q = 0
+        while q < gModsPages[r].rows.len and q < cSwMaxRows:
+          let ctrl = cast[Il2CppPtr](gModsPages[r].rows[q].clone)
+          if ctrl != nil and duOk(ctrl, 0x20'i32):
+            var text = gModsPages[r].rows[q].label
+            if not gModsPages[r].rows[q].implemented:
+              text = text & cSwNotDone
+            let rowT = iToTransform(ctrl)
+            if rowT != nil:
+              if modsRelabelLike(rowT, rowDonorT, text):
+                rowsFixed = rowsFixed + 1
+              else:
+                rowsBad = rowsBad + 1
+          q = q + 1
     r = r + 1
+  okLog "mods tab: re-asserted " & $rowsFixed & " row caption(s) across " &
+        "every TextMeshProUGUI they carry (" & $rowsBad & " did not take), " &
+        "using the row donor chosen by " & rowDonorKind &
+        ". Without this the rows keep the donor's caption -- which is why " &
+        "every row on every page read 'Interface language' while the write " &
+        "reported success."
 
   # THE OUTCOME CHECK ON THE CONTAINER, in the same spirit as the caption one:
   # what the player sees in the body must be exactly what we put there -- one
   # subtab strip plus one page container per subtab -- and nothing inherited.
+  # THE OUTCOME CHECK, CORRECTED. The previous version expected all five
+  # children active and warned on the CORRECT state -- strip plus exactly ONE
+  # visible page. Expecting five would mean every page showing at once. A wrong
+  # assert is worse than none: it trains us to ignore the warnings that are
+  # right.
+  #
+  # Two separate claims, so a failure says which:
+  #   * TOTAL children of ours: strip + one container per subtab;
+  #   * ACTIVE children: the strip + exactly one page.
+  let totalKids = modsChildCount(stackT)
   let liveKids = modsActiveChildren(stackT)
-  let expectKids = 1 + gModsSubs.len
-  if liveKids != expectKids:
-    warn "mods tab: the page container holds " & $liveKids & " active " &
-         "child(ren) but we put exactly " & $expectKids & " there (one " &
-         "subtab strip + " & $gModsSubs.len & " page(s)). The difference is " &
-         "inherited content still on screen, or one of ours failed to " &
-         "activate. Reporting it rather than assuming the body is clean."
+  let wantTotal = stockN + 1 + gModsSubs.len
+  let wantLive = 2
+  if liveKids != wantLive:
+    warn "mods tab: the page container shows " & $liveKids & " active " &
+         "child(ren); it should show exactly " & $wantLive & " -- the subtab " &
+         "strip and ONE page. More means several pages are visible at once; " &
+         "fewer means the selected page never came on."
   else:
-    okLog "mods tab: the page container holds exactly the " & $expectKids &
-          " child(ren) we put there (strip + " & $gModsSubs.len &
-          " page(s)); nothing inherited is left active in the body"
+    okLog "mods tab: the body shows exactly the subtab strip and ONE of the " &
+          $gModsSubs.len & " page(s), which is the correct steady state"
+  if totalKids != wantTotal:
+    okLog "mods tab: the page container has " & $totalKids & " child(ren); " &
+          $stockN & " inherited (switched off) + 1 strip + " & $gModsSubs.len &
+          " page(s) = " & $wantTotal & " was expected. A difference here is " &
+          "the game adding or removing something, not a failure by itself."
   gModsSel = 0
   if gModsSubs.len > 0:
     discard modsSetToggleQuiet(gModsSubs[0].toggle, true)
@@ -1254,20 +1345,44 @@ proc modsShowSubtab(sel: int) =
   gModsSel = sel
 
 proc modsTickSubtabs() =
-  ## Which subtab did the player just turn ON? Read every subtab's `m_IsOn` and
-  ## act only on a RISING edge -- correct whether the clones ended up on their
-  ## own ToggleGroup (measured: they did, for the tab-button donor, so the group
-  ## turns the others off for us) or on none at all (we do it ourselves).
+  ## Drive the visible page from the subtab toggles.
+  ##
+  ## TWO WAYS IN, because relying only on a rising edge is relying on never
+  ## missing one -- and a missed edge is a body that never changes again, which
+  ## is exactly what the player reported:
+  ##   1. a RISING edge: the subtab just turned on. Correct whether the clones
+  ##      share a ToggleGroup (it turns the others off for us) or not.
+  ##   2. a STEADY-STATE disagreement: exactly one subtab reads on and it is
+  ##      not the page we are showing. This catches a selection that changed
+  ##      without us seeing the transition -- and it is idempotent, because it
+  ##      only fires while the two disagree.
+  ## Both are guarded byte reads; `modsShowSubtab` is the only thing that calls
+  ## anything, and only where something differs.
   var rising = -1
+  var onCount = 0
+  var onlyOn = -1
   var i = 0
   while i < gModsSubs.len:
     let on = modsToggleIsOn(gModsSubs[i].toggle)
-    if on and not gModsSubs[i].lastOn:
-      rising = i
+    if on:
+      onCount = onCount + 1
+      onlyOn = i
+      if not gModsSubs[i].lastOn:
+        rising = i
     gModsSubs[i].lastOn = on
     i = i + 1
   if rising >= 0 and rising != gModsSel:
     modsShowSubtab(rising)
+    return
+  if onCount == 1 and onlyOn != gModsSel:
+    modsShowSubtab(onlyOn)
+    return
+  if onCount == 0 and gModsSel >= 0 and gModsSel < gModsSubs.len:
+    # Nothing is selected at all -- the group allows switching off, or our
+    # clones have no group. Put the current page's own toggle back on rather
+    # than leaving the body with no page and no way to choose one.
+    discard modsSetToggleQuiet(gModsSubs[gModsSel].toggle, true)
+    gModsSubs[gModsSel].lastOn = true
 
 proc modsTabTickBody() =
   if not gModsOn or gModsFaults >= ModsMaxFaults:
@@ -1301,7 +1416,16 @@ proc modsTabTickBody() =
               " stock panel(s) were switched off for it and are switched back " &
               "on when MODS is deselected"
     else:
-      discard modsSetActive(gModsPanel, false)
+      # OURS OFF FIRST, THEIRS BACK ON SECOND, and the order is deliberate: the
+      # symptom the player reported was BOTH panels drawn at once after leaving
+      # MODS. Restoring theirs while ours is still active is exactly that
+      # picture, and it is what happens if the hide is skipped or fails.
+      if not modsSetActive(gModsPanel, false):
+        warn "mods tab: could not switch OUR panel off on the way out of the " &
+             "MODS tab, so the stock panel is NOT being restored on top of " &
+             "it -- that would draw both at once. The screen keeps showing " &
+             "the MODS panel until it can be switched off."
+        return
       modsRestoreStockPanels()
       gModsShown = false
       # THE PERSIST POINT, on the HIDE edge and nowhere else: reading back and
@@ -1316,6 +1440,36 @@ proc modsTabTickBody() =
   if not gModsShown:
     return
   modsTickSubtabs()
+
+var gModsSanityFrames = 0
+const ModsSanityEveryFrames = 30
+
+proc modsPanelSanity() =
+  ## THE STANDING OUTCOME CHECK: our panel may be active ONLY while the MODS
+  ## toggle is on. Everything above drives that on edges; this verifies the
+  ## STATE, on the same throttle as the label re-assert, because an edge that
+  ## was missed leaves two panels drawn over each other and nothing would
+  ## otherwise notice.
+  if not gModsBuilt or gModsPanel == nil or gModsToggle == nil:
+    return
+  inc gModsSanityFrames
+  if gModsSanityFrames < ModsSanityEveryFrames:
+    return
+  gModsSanityFrames = 0
+  if not duOk(gModsPanel, 0x20'i32) or not duOk(gModsToggle, ModsOffIsOn + 4'i32):
+    return
+  let want = cSwReadU8(gModsToggle, ModsOffIsOn) != 0'i32
+  if modsGoActive(gModsPanel) == want:
+    return
+  if not want:
+    if modsSetActive(gModsPanel, false):
+      modsRestoreStockPanels()
+      gModsShown = false
+      warn "mods tab: our panel was still active with the MODS tab NOT " &
+           "selected -- both panels would have been drawn at once. Switched " &
+           "ours off and restored the stock panel. An edge was missed."
+  else:
+    gModsShown = false                  # let the edge path show it properly
 
 # ---------------------------------------------------------------------------
 # THE VERSION BRAND, ported from `merge-host-v3` where it worked, and the
@@ -1678,6 +1832,326 @@ proc seasonsTickBody() =
          "banner is untouched."
 
 # ---------------------------------------------------------------------------
+# POSTFX AS A SUBTAB OF GRAPHICS (`settingsPostFxSubtab`, default OFF).
+#
+# The top row loses POSTFX and the Graphics panel gains a two-button strip:
+# GRAPHICS SETTINGS | POSTFX. Four tabs above, two subtabs inside.
+#
+# THIS ONE IS DIFFERENT IN KIND FROM EVERYTHING ELSE IN THIS FILE, AND IS
+# TREATED THAT WAY. Everything above only ever writes to clones we made. This
+# drives the GAME'S OWN panels and hides one of the GAME'S OWN tab buttons, so
+# it takes the seasons feature's discipline rather than the clone discipline:
+#
+#   * `PostFxToggleSpawner` is only ever SetActive(false) -- never destroyed,
+#     never re-parented, never written to. Nothing here persists, so a session
+#     started with the flag off has the stock POSTFX tab back.
+#   * It is hidden LAST, after both strips exist and both stock panels have
+#     been located. A build that fails half way therefore leaves the stock tab
+#     exactly where it was; the player never loses POSTFX because our walk
+#     broke.
+#   * If the feature turns itself off after faults, the spawner is put back.
+#   * Neither panel is cloned. This re-parents CONTROL, not content: the two
+#     stock panels are switched between, which is precisely what the game will
+#     not do for us, because it switches panels by `ESettingsGroup` and our
+#     subtab is not one.
+#
+# THE STRIP HAS TO EXIST TWICE, and that is a consequence, not a choice: it
+# lives inside the panel it switches, so a single strip would vanish with the
+# panel that carried it. So there is one in each, and whichever is on screen
+# drives both. They are kept in agreement on every switch.
+# ---------------------------------------------------------------------------
+
+const GfxMaxFaults = 4
+const GfxMaxBuildTries = 8
+
+var gGfxBuilt = false
+var gGfxTried = 0
+var gGfxFaults = 0
+## The two STOCK panels, and the stock tab button we hide. Every one of these
+## is an object the GAME made: they are read, and switched active, and nothing
+## else is ever done to them.
+var gGfxPanelGo: Il2CppPtr = nil
+var gGfxPostGo: Il2CppPtr = nil
+var gGfxSpawnerGo: Il2CppPtr = nil
+## Our two strips' toggles: index 0 = GRAPHICS SETTINGS, 1 = POSTFX, one pair
+## per strip. Clones we made, so these are ours to write.
+var gGfxTogA: seq[Il2CppPtr] = @[]
+var gGfxTogB: seq[Il2CppPtr] = @[]
+var gGfxLast: seq[bool] = @[]
+## Which subtab is showing: 0 = graphics, 1 = postfx.
+var gGfxSel = 0
+var gGfxSaid = false
+
+proc gfxNoteFault(what: string) =
+  inc gGfxFaults
+  warn "postfx subtab: " & what & " (fault " & $gGfxFaults & " of " &
+       $GfxMaxFaults & ")"
+  if gGfxFaults >= GfxMaxFaults:
+    gGfxOn = false
+    # PUT THE STOCK TAB BACK. A feature that disables itself must not leave the
+    # player without POSTFX at all -- that would be strictly worse than never
+    # having run.
+    if gGfxSpawnerGo != nil and modsSetActive(gGfxSpawnerGo, true):
+      warn "postfx subtab: fault ceiling reached; the feature is OFF for this " &
+           "session and the STOCK POSTFX TAB HAS BEEN PUT BACK in the top row."
+    else:
+      warn "postfx subtab: fault ceiling reached; the feature is OFF for this " &
+           "session. The stock POSTFX tab could NOT be restored -- open " &
+           "another tab and back, or restart, to get it."
+
+proc gfxBuildStrip(panelT, donorStripGo, donorButtonGo, donorButtonT: Il2CppPtr;
+                   into: var seq[Il2CppPtr]; containerName: string): bool =
+  ## One strip of two buttons inside one stock panel. The strip and the buttons
+  ## are CLONES; the panel they go into is the game's, and the only thing done
+  ## to it is `SetParentAndAlign` of an object of ours.
+  result = false
+  into = @[]
+  let stackT = modsFindNamed(panelT, containerName, 4)
+  if stackT == nil:
+    warn "postfx subtab: no " & containerName & " inside the stock panel " &
+         iObjName(panelT) & ", so there is nowhere to put the subtab strip " &
+         "that the stock layout group would lay out. Nothing was added to " &
+         "that panel."
+    return
+  let stackGo = iGameObjectOf(stackT)
+  if stackGo == nil:
+    return
+  let strip = modsClone(donorStripGo)
+  if strip == nil or not modsSetParent(strip, stackGo):
+    warn "postfx subtab: the subtab strip could not be cloned into " &
+         iObjName(panelT) & "; nothing was added to that panel."
+    return
+  let stripT = modsTransformOf(strip)
+  # The donor strip's own buttons came along with the clone: switch them off,
+  # exactly as the MODS strip does.
+  var inherited = 0
+  if iChildCount(stripT, inherited):
+    var h = 0
+    while h < inherited and h < 32:
+      let c = iChildAt(stripT, h)
+      if c != nil and duOk(c, 0x20'i32):
+        let go = iGameObjectOf(c)
+        if go != nil:
+          discard modsSetActive(go, false)
+      h = h + 1
+  let stripGo = iGameObjectOf(stripT)
+  if stripGo == nil:
+    return
+  var made = 0
+  var i = 0
+  while i < 2:
+    let caption = (if i == 0: "GRAPHICS SETTINGS" else: "POSTFX")
+    let btn = modsClone(donorButtonGo)
+    if btn == nil or not modsSetParent(btn, stripGo):
+      warn "postfx subtab: could not clone the " & caption & " button"
+      i = i + 1
+      continue
+    let btnT = modsTransformOf(btn)
+    if not modsRelabelLike(btnT, donorButtonT, caption):
+      warn "postfx subtab: the caption " & caption & " did not fully take; " &
+           "that button reads wrong or blank on screen"
+    discard modsReapExtraToggles(btnT, donorButtonT, caption)
+    let tog = modsToggleOf(btnT)
+    modsDescribeToggle("postfx strip button " & caption, tog)
+    if tog == nil:
+      warn "postfx subtab: the " & caption & " clone has no Toggle, so it " &
+           "could never be read"
+      discard modsSetActive(btn, false)
+      i = i + 1
+      continue
+    discard modsSetActive(btn, true)
+    into.add tog
+    made = made + 1
+    i = i + 1
+  discard modsSetActive(strip, true)
+  if made != 2:
+    warn "postfx subtab: only " & $made & " of 2 buttons came out usable in " &
+         iObjName(panelT) & "; REFUSING to hide the stock POSTFX tab, because " &
+         "a half-built strip with no way back is worse than no feature."
+    return
+  result = true
+
+proc gfxApply(sel: int) =
+  ## Switch the two STOCK panels and put both strips in agreement. Calls only
+  ## where something differs: this runs while the player is on the Graphics
+  ## tab, so it must be quiet in the steady state.
+  if gGfxPanelGo == nil or gGfxPostGo == nil:
+    return
+  let wantPost = (sel == 1)
+  if modsGoActive(gGfxPostGo) != wantPost:
+    discard modsSetActive(gGfxPostGo, wantPost)
+  if modsGoActive(gGfxPanelGo) == wantPost:
+    discard modsSetActive(gGfxPanelGo, not wantPost)
+  var i = 0
+  while i < 2:
+    let want = (i == sel)
+    if i < gGfxTogA.len and modsToggleIsOn(gGfxTogA[i]) != want:
+      discard modsSetToggleQuiet(gGfxTogA[i], want)
+    if i < gGfxTogB.len and modsToggleIsOn(gGfxTogB[i]) != want:
+      discard modsSetToggleQuiet(gGfxTogB[i], want)
+    if i < gGfxLast.len:
+      gGfxLast[i] = want
+    i = i + 1
+  gGfxSel = sel
+  if not gGfxSaid:
+    gGfxSaid = true
+    okLog "postfx subtab: switching between the STOCK Graphics Settings and " &
+          "PostFX Settings panels from a cloned two-button strip. Neither " &
+          "panel is cloned and neither is written to -- only its active state " &
+          "is driven, which is the one thing the game will not do for us, " &
+          "because it switches panels by ESettingsGroup."
+
+proc gfxBuild(): bool =
+  result = false
+  if gModsLastTabPtr == nil or not duOk(gModsLastTabPtr, 0x20'i32):
+    return
+  if gModsLastTabName != "game":
+    return                              # the container name comes from this tab
+  inc gGfxTried
+  let tabT = iToTransform(gModsLastTabPtr)
+  let screenT = (if tabT != nil: modsParentOf(tabT) else: nil)
+  if screenT == nil:
+    gfxNoteFault("could not reach the SettingsScreen from the tab")
+    return
+  let toggles = modsChildNamed(screenT, "Toggles")
+  let gfxPanel = modsChildNamed(screenT, "Graphics Settings")
+  let postPanel = modsChildNamed(screenT, "PostFX Settings")
+  let ctrlPanel = modsChildNamed(screenT, "Control Settings")
+  let donorStrip = (if ctrlPanel != nil: modsChildNamed(ctrlPanel, "Toggles")
+                    else: nil)
+  let donorButton = (if donorStrip != nil:
+                       modsChildNamed(donorStrip, "ControlToggle") else: nil)
+  if toggles == nil or gfxPanel == nil or postPanel == nil or
+     donorStrip == nil or donorButton == nil:
+    gfxNoteFault("the pieces this needs were not all found (" &
+                 (if toggles == nil: "Toggles " else: "") &
+                 (if gfxPanel == nil: "Graphics-Settings " else: "") &
+                 (if postPanel == nil: "PostFX-Settings " else: "") &
+                 (if donorStrip == nil: "the donor strip " else: "") &
+                 (if donorButton == nil: "ControlToggle" else: "") &
+                 "). NOTHING was hidden: the stock POSTFX tab is untouched.")
+    return
+  let spawner = modsChildNamed(toggles, "PostFxToggleSpawner")
+  if spawner == nil:
+    gfxNoteFault("no PostFxToggleSpawner in the tab bar, so there is no stock " &
+                 "tab to fold in. Nothing was changed.")
+    return
+  var containerWhy = ""
+  let stockContainerGo = swRowContainerGo(gModsLastTabPtr, containerWhy)
+  let stockContainerT = (if stockContainerGo != nil:
+                           modsTransformOf(stockContainerGo) else: nil)
+  let containerName = (if stockContainerT != nil: iObjName(stockContainerT)
+                       else: "")
+  if containerName.len == 0:
+    gfxNoteFault("no row-container name to look for (" & containerWhy &
+                 "); nothing was changed")
+    return
+  let donorStripGo = iGameObjectOf(donorStrip)
+  let donorButtonGo = iGameObjectOf(donorButton)
+  gGfxPanelGo = iGameObjectOf(gfxPanel)
+  gGfxPostGo = iGameObjectOf(postPanel)
+  if donorStripGo == nil or donorButtonGo == nil or gGfxPanelGo == nil or
+     gGfxPostGo == nil:
+    gfxNoteFault("a GameObject was not reachable; nothing was changed")
+    return
+  # BOTH STRIPS FIRST. The stock tab is hidden only once both exist.
+  if not gfxBuildStrip(gfxPanel, donorStripGo, donorButtonGo, donorButton,
+                       gGfxTogA, containerName):
+    gfxNoteFault("the strip inside Graphics Settings was not built; the stock " &
+                 "POSTFX tab is left exactly where it was")
+    return
+  if not gfxBuildStrip(postPanel, donorStripGo, donorButtonGo, donorButton,
+                       gGfxTogB, containerName):
+    gfxNoteFault("the strip inside PostFX Settings was not built; the stock " &
+                 "POSTFX tab is left exactly where it was")
+    return
+  gGfxLast = @[false, false]
+  # NOW, and only now, the stock tab comes out of the top row.
+  gGfxSpawnerGo = iGameObjectOf(spawner)
+  if gGfxSpawnerGo == nil or not modsSetActive(gGfxSpawnerGo, false):
+    gGfxSpawnerGo = nil
+    gfxNoteFault("the stock POSTFX tab button could not be switched off, so " &
+                 "the top row would show five tabs AND a duplicate subtab. " &
+                 "The strips are built but the fold-in is incomplete.")
+    return
+  # THE OUTCOME CHECK: four buttons in the top row, not five.
+  let liveTabs = modsActiveChildren(toggles)
+  if liveTabs == 4:
+    okLog "postfx subtab: the top row now shows 4 tab button(s) -- POSTFX has " &
+          "been folded into Graphics as a subtab. The stock button is HIDDEN, " &
+          "never destroyed, and comes back on its own if this feature turns " &
+          "itself off."
+  else:
+    warn "postfx subtab: the top row shows " & $liveTabs & " active tab " &
+         "button(s); 4 was expected after hiding POSTFX. Something else is " &
+         "adding or hiding buttons -- reporting it rather than assuming."
+  gGfxBuilt = true
+  gGfxSel = 0
+  gfxApply(0)
+  result = true
+
+proc gfxTickBody() =
+  if not gGfxOn or gGfxFaults >= GfxMaxFaults:
+    return
+  if not gGfxBuilt:
+    if gModsLastTabPtr != nil and gGfxTried < GfxMaxBuildTries:
+      discard gfxBuild()
+    return
+  if gGfxPanelGo == nil or gGfxPostGo == nil:
+    return
+  if not duOk(gGfxPanelGo, 0x20'i32) or not duOk(gGfxPostGo, 0x20'i32):
+    return
+  let gfxUp = modsGoActive(gGfxPanelGo)
+  let postUp = modsGoActive(gGfxPostGo)
+  if not gfxUp and not postUp:
+    # The player is on some other tab entirely. Do NOT touch anything -- the
+    # game owns the screen here. Just remember that re-entering starts on
+    # GRAPHICS SETTINGS, which is what the stock tab used to do.
+    if gGfxSel != 0:
+      gGfxSel = 0
+      var i = 0
+      while i < gGfxLast.len:
+        gGfxLast[i] = (i == 0)
+        i = i + 1
+    return
+  if gfxUp and postUp:
+    # Both stock panels drawn at once -- the same failure the MODS tab had, and
+    # it happens here when the game switches TO graphics while our subtab still
+    # says postfx. Resolve towards what the strip says.
+    gfxApply(gGfxSel)
+    return
+  # Which subtab did the player just press? Either strip may be the visible one,
+  # so both are read and a rising edge on either wins.
+  var rising = -1
+  var i = 0
+  while i < 2:
+    let on = (i < gGfxTogA.len and modsToggleIsOn(gGfxTogA[i])) or
+             (i < gGfxTogB.len and modsToggleIsOn(gGfxTogB[i]))
+    if on and i < gGfxLast.len and not gGfxLast[i]:
+      rising = i
+    if i < gGfxLast.len:
+      gGfxLast[i] = on
+    i = i + 1
+  if rising >= 0 and rising != gGfxSel:
+    gfxApply(rising)
+    return
+  # STEADY STATE: the panel that is up must be the one the selection names.
+  if postUp and gGfxSel != 1:
+    gfxApply(gGfxSel)
+  elif gfxUp and gGfxSel == 1:
+    gfxApply(1)
+
+proc gfxTick() =
+  ## Every frame while armed: the steady state is two `activeSelf` reads and a
+  ## handful of guarded byte reads, with no allocation and no call.
+  if not gGfxOn or gGfxFaults >= GfxMaxFaults:
+    return
+  gModsBranch = 4
+  if cModsGuarded(cast[Il2CppPtr](0)) == nil:
+    gfxNoteFault("the postfx-subtab tick FAULTED and was caught; the game " &
+                 "survived. The stock panels are left as they were")
+
+# ---------------------------------------------------------------------------
 # ONE GUARDED ENTRY, THREE BRANCHES. `aowl_p_p_seh` is NOT re-entrant, so all
 # three features are dispatched through a single body selected by a global:
 # only one branch runs per guarded call and none of them nests a second guard.
@@ -1690,10 +2164,15 @@ proc modsBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_mods_body", cdecl.} =
   result = cast[Il2CppPtr](1)
   if gModsBranch == 1:
     modsTabTickBody()
+    # THE STATE CHECK, after the edge work and inside the same single guard --
+    # never a second one. Throttled inside itself.
+    modsPanelSanity()
   elif gModsBranch == 2:
     verBrandTickBody()
   elif gModsBranch == 3:
     seasonsTickBody()
+  elif gModsBranch == 4:
+    gfxTickBody()
 
 proc modsTabTick() =
   ## The rider's entry, called every frame from the shared
@@ -1766,6 +2245,7 @@ proc modsRidersTick() =
   modsTabTick()
   verBrandTick()
   seasonsTick()
+  gfxTick()
 
 proc bindModsTab(verbose: bool): bool =
   ## A RIDER on `EFT.UI.PreloaderUI::Update`, never a second detour on it: two
@@ -1776,7 +2256,7 @@ proc bindModsTab(verbose: bool): bool =
   result = false
   if gModsSlot >= 0:
     return true
-  if not (gModsOn or gVerOn or gSeasonsOn):
+  if not (gModsOn or gVerOn or gSeasonsOn or gGfxOn):
     return false
   if gDebugUiSlot >= 0:
     gModsSlot = gDebugUiSlot
