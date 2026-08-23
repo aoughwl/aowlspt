@@ -76,9 +76,68 @@ BUILT-IN SELF-CHECK: `System.String` must show `_stringLength` @ +0x10 and
 `_firstChar` @ +0x14 (the exact layout the live version-brand raw write relied
 on). `verify-fields` asserts it, the same way `verify-be` asserts the BE RVAs.
 
+## Signatures (added)
+
+`Il2CppMethodDefinition` (36 bytes, v31) is, MEASURED on this build against both
+`UnityEngine.AssetBundle::LoadAsset` overloads:
+
+    nameIndex@0  declaringType@4  returnType@8  returnParameterToken@12
+    parameterStart@16  genericContainerIndex@20  token@24
+    flags@28(u16) iflags@30(u16) slot@32(u16) parameterCount@34(u16)
+
+`returnType` and each parameter's `typeIndex` are indices into
+`Il2CppMetadataRegistration.types` -- the SAME table field types already resolve
+through -- so full parameter and return TYPE NAMES are reachable, not just the
+count. Parameters are metadata property 10 (`Il2CppParameterDefinition` =
+nameIndex@0, token@4, typeIndex@8; 12 bytes). Proof: rid 6 reads
+`Object LoadAsset(string name)` and rid 7 `Object LoadAsset(string name, Type type)`,
+which is the documented Unity API.
+
+## Shared thunks: one RVA, many methods
+
+The IL2CPP backend FOLDS identical compiled bodies. Two entirely unrelated
+methods, in different images, can share one address:
+`Diz.Resources.EasyAssets::get_System` and `BundlesManager::get_DownloadingUrl`
+BOTH resolve to `0x692A50` (measured; 338 keys total land there). `0x628110` --
+the address CLAUDE.md records as "ForceMeshUpdate, a stripped stub" -- is shared
+by **6438** methods: it is not ForceMeshUpdate's, it is the build's universal
+empty-body `ret`.
+
+A shared RVA is a technically-correct answer that is useless as a PATCH target: a
+detour there fires for every one of those call sites. `shared` / `--shared`
+annotate it; see `il2cpp_nameindex.py shared` for the full distribution.
+
+## Thunk shapes
+
+Postfix-detouring a thunk is unsafe (there is no meaningful "after"), so the
+obvious shapes are classified from the bytes:
+
+  * `TAILJUMP`   -- a few setup bytes then `E9 rel32`, `CC` padding after.
+    e.g. `BundlesManager::LoadBundleAsync@0x191B9E0` = `45 33 C9 E9 C8 13 00 00 CC`
+  * `VDISPATCH`  -- load through `rcx`, then `jmp`/`call` through a vtable slot.
+    e.g. `AssetBundleRequest::get_asset@0xB196C0` =
+    `48 8B 11 48 8B 82 78 01 00 00 48 8B 92 80 01 00 00 48 FF E0`. NOTE it takes
+    21 bytes to see the `jmp rax`, so classification reads 32, not 16.
+  * `STUB`       -- an immediate `C3`, `C2 imm16`, or `xor eax,eax; ret`: no
+    body. MEASURED CORRECTION: `0x628110` is `C2 00 00` (`ret 0`), not a bare
+    `C3` as CLAUDE.md says.
+  * `JMPTABLE`   -- an immediate `FF 25` (RIP-relative indirect jump).
+  * `TRIVIAL`    -- `mov rax,[rcx+disp8]; ret`. A real body, but so small that
+    the linker folds every getter at that offset onto it; these are the top
+    shared-RVA offenders. `0x692A50` is `48 8B 41 28 C3` = `[rcx+0x28]`.
+
+Anything not matching prints nothing -- absence of an annotation is NOT proof a
+function is a real body.
+
 Usage:
   il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> find <substr>
   il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> type <idx>...
+        # per method: rid, RVA, arity, full signature, section, thunk shape.
+        # add --shared to also annotate RVAs shared with other methods (this
+        # costs one full metadata walk, ~1.2s)
+  il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> bytes <RVA> [N]
+        # containing PE section + N bytes (default 16) as hex, + thunk shape.
+        # Generated code lives in the `il2cpp` section, NOT `.text`.
   il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> verify-be
   il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> fields <TypeName>
         # every field (incl. inherited) with offset + static/inst + type;
@@ -232,6 +291,136 @@ class Resolver:
             va = self.rq(base + (rid-1)*8) if (base and 1 <= rid <= cnt) else None
             out.append((self.mname(mi), rid, va))
         return full, img, out
+
+    # ---- code bytes / sections / thunk shapes -----------------------------
+
+    def section_of_rva(self, rva):
+        """(name, file_offset, bytes_available) for an RVA, or (None, None, 0)."""
+        for name, vs, vz, raw, rz in self.SEC:
+            if vs <= rva < vs + vz:
+                off = rva - vs
+                if off >= rz:
+                    return name, None, 0        # in a section, but not on disk
+                return name, raw + off, rz - off
+        return None, None, 0
+
+    def code_bytes(self, rva, n=16):
+        _, fo, avail = self.section_of_rva(rva)
+        if fo is None:
+            return None
+        return self.b[fo:fo + min(n, avail)]
+
+    @staticmethod
+    def classify_thunk(bs):
+        """(KIND, explanation) for an obvious non-body shape, else None.
+
+        Conservative on purpose: NOT matching is not evidence of a real body.
+        """
+        if not bs or len(bs) < 4:
+            return None
+        if bs[0] == 0xC3:
+            return ("STUB", "immediate ret -- empty body, nothing to detour")
+        if bs[0] == 0xC2:
+            return ("STUB", "ret 0x%X -- empty body, nothing to detour"
+                    % struct.unpack_from("<H", bs, 1)[0])
+        if bs[:3] == b"\x33\xC0\xC3" or bs[:4] == b"\x48\x33\xC0\xC3":
+            return ("STUB", "xor eax,eax; ret -- returns 0, no body")
+        # mov rax,[rcx+disp8]; ret  -- the folded field getter. A REAL body, but
+        # every getter at the same offset compiles to the identical 5 bytes and
+        # the linker folds them, so these are the top shared-RVA offenders.
+        if bs[:3] == b"\x48\x8B\x41" and len(bs) > 4 and bs[4] == 0xC3:
+            return ("TRIVIAL", "mov rax,[rcx+0x%02X]; ret -- one-instruction "
+                    "field getter; bodies this small are FOLDED, expect the "
+                    "RVA to be shared" % bs[3])
+        if bs[:2] == b"\xFF\x25":
+            return ("JMPTABLE", "jmp [rip+disp32] -- indirect jump, not a body")
+        # tail jump: up to 8 bytes of register setup then E9 rel32
+        for i in range(0, min(9, len(bs) - 4)):
+            if bs[i] == 0xE9:
+                tail = bs[i + 5:i + 7]
+                pad = tail[:1] in (b"\xCC", b"") or tail[:1] == b"\x90"
+                if i == 0 or pad:
+                    return ("TAILJUMP",
+                            "jmp rel32 at +%d -- tail-call thunk; a postfix "
+                            "detour here has no return site" % i)
+                break
+        # virtual dispatch: load `this`/vtable then jmp/call through it
+        if bs[:3] in (b"\x48\x8B\x11", b"\x48\x8B\x01", b"\x48\x8B\x09"):
+            for i in range(3, min(len(bs) - 1, 20)):
+                if bs[i] == 0xFF and (bs[i + 1] & 0x38) in (0x20, 0x10):
+                    return ("VDISPATCH",
+                            "loads through rcx then jmp/call through a vtable "
+                            "slot -- dispatch thunk, not the implementation")
+        return None
+
+    def annotate_rva(self, rva, nbytes=32):
+        """' [il2cpp] TAILJUMP: ...' style suffix for a resolved RVA."""
+        sec, fo, _ = self.section_of_rva(rva)
+        bits = ["sec=%s" % (sec or "UNMAPPED")]
+        if fo is not None:
+            th = self.classify_thunk(self.code_bytes(rva, nbytes))
+            if th:
+                bits.append("%s: %s" % th)
+        return "  [" + "; ".join(bits) + "]"
+
+    # ---- signatures --------------------------------------------------------
+
+    def _ensure_params(self):
+        if not hasattr(self, "PAR_OFF"):
+            self.PAR_OFF = struct.unpack_from("<i", self.m, 8 + 10*8)[0]
+            self.PARS = 12
+            self._ensure_fields()      # needs TYPES_PTR for type names
+
+    def method_sig(self, mi):
+        """(return_type, [(param_name, param_type)], arity) for method index mi.
+
+        Types come from metadataRegistration.types, the same table field types
+        resolve through. Anything unresolvable prints as '?', never a guess.
+        """
+        self._ensure_params()
+        base = self.M_OFF + mi*self.MS
+        rt = struct.unpack_from("<i", self.m, base + 8)[0]
+        ps = struct.unpack_from("<i", self.m, base + 16)[0]
+        pc = struct.unpack_from("<H", self.m, base + 34)[0]
+        ret = self.field_typename(rt) if rt >= 0 else "?"
+        ps_list = []
+        for i in range(pc):
+            ni, _tok, ti = struct.unpack_from("<iIi", self.m,
+                                              self.PAR_OFF + (ps + i)*self.PARS)
+            ps_list.append((self.s(ni), self.field_typename(ti) if ti >= 0 else "?"))
+        return ret, ps_list, pc
+
+    def sig_string(self, mi, name):
+        ret, ps, pc = self.method_sig(mi)
+        return "%s %s(%s)" % (ret, name,
+                              ", ".join("%s %s" % (t, n) for n, t in ps)), pc
+
+    # ---- shared-RVA histogram ---------------------------------------------
+
+    def shared_rva_counts(self):
+        """{rva: number_of_distinct_methods_resolving_there}, all images.
+
+        Built from the same per-image methodPointers walk the name index uses,
+        so the two cannot disagree. ~1.2s over 208k methods.
+        """
+        if hasattr(self, "_SHARED"):
+            return self._SHARED
+        counts = {}
+        for t in range(self.NTYPES):
+            mp = self.MOD.get(self.image_of_type(t))
+            if not mp or not mp[0]:
+                continue
+            base, cnt = mp
+            for mi in self.type_methods(t):
+                rid = self.mtoken(mi) & 0xFFFFFF
+                if not (1 <= rid <= cnt):
+                    continue
+                va = self.rq(base + (rid - 1)*8)
+                if va:
+                    r = va - self.IB
+                    counts[r] = counts.get(r, 0) + 1
+        self._SHARED = counts
+        return counts
 
     def find(self, needle):
         needle = needle.lower()
@@ -403,12 +592,55 @@ def main():
         for t, full in R.find(sys.argv[4]):
             print(t, full, " image=", R.image_of_type(t))
     elif cmd == "type":
-        for t in map(int, sys.argv[4:]):
+        args = [a for a in sys.argv[4:] if not a.startswith("--")]
+        want_shared = "--shared" in sys.argv[4:]
+        shared = R.shared_rva_counts() if want_shared else {}
+        for t in map(int, args):
             full, img, ms = R.resolve_type(t)
             print("TYPE", t, full, "image=", img)
-            for nm, rid, va in ms:
-                print("   %-40s rid=%d RVA=%s" %
-                      (nm, rid, hex(va - R.IB) if va else None))
+            for (nm, rid, va), mi in zip(ms, R.type_methods(t)):
+                try:
+                    sig, pc = R.sig_string(mi, nm)
+                except Exception:
+                    sig, pc = "unknown", -1
+                rva = (va - R.IB) if va else None
+                print("   %-52s rid=%-6d arity=%-3s RVA=%s" %
+                      (sig, rid, pc if pc >= 0 else "?",
+                       hex(rva) if rva is not None else None))
+                if rva is None:
+                    continue
+                note = R.annotate_rva(rva)
+                n = shared.get(rva, 1)
+                if n > 1:
+                    note += ("  [SHARED: %d methods resolve here -- hooking "
+                             "this fires for all of them]" % n)
+                    # NOTE: this counts METHOD DEFINITIONS. il2cpp_nameindex.py
+                    # counts index KEYS, which is slightly lower because it has
+                    # already dropped the name-ambiguous ones. Neither is wrong;
+                    # they answer marginally different questions.
+                print("      " + note.strip())
+    elif cmd == "bytes":
+        rva = int(sys.argv[4], 0)
+        if rva > R.IB:
+            rva -= R.IB          # accept a VA too
+        n = int(sys.argv[5], 0) if len(sys.argv) > 5 else 16
+        cls_n = max(n, 32)     # classification needs the whole thunk
+        sec, fo, avail = R.section_of_rva(rva)
+        print("RVA      0x%X   (VA 0x%X)" % (rva, R.IB + rva))
+        print("section  %s%s" % (sec or "NONE -- rva is not inside any section",
+                                 "" if sec != "il2cpp" else "   (generated code)"))
+        if sec and sec != "il2cpp":
+            print("         NOTE: generated IL2CPP method bodies live in the "
+                  "`il2cpp` section, not %s." % sec)
+        if fo is None:
+            print("bytes    unavailable (section has no raw data at this offset)")
+            sys.exit(1)
+        bs = R.code_bytes(rva, n)
+        print("bytes    " + " ".join("%02X" % c for c in bs))
+        th = R.classify_thunk(R.code_bytes(rva, cls_n))
+        print("shape    %s -- %s" % th if th else
+              "shape    no known thunk shape matched (this is NOT proof of a "
+              "real body)")
     elif cmd == "verify-be":
         known = {"IsInstanceSuccessfully": 0x6699C0, "Update": 0x669390,
                  "Stop": 0x668E80, "Run": 0x667700}
