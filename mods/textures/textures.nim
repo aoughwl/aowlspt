@@ -165,7 +165,7 @@ proc texturesSchema(): seq[Setting] =
 
     stringSetting("probeTargets", "Load-method counting probe", "",
                 category = "Advanced",
-                description = "DIAGNOSTIC, default OFF. Empty or 'off' installs nothing. 'all', or a comma list of AssetBundle method rids (6 7 8 9 10 11 12 13 14 15 18 19), installs a count-only typed PREFIX on each and logs one ranked line every 10s: grep 'textures  loadprobe fires'. rid=6 is the control and must read 0. Requires swapMode=off (both would detour rid=6)."),
+                description = "DIAGNOSTIC, default OFF. Empty or 'off' installs nothing. Otherwise a comma list of GROUPS (ab eb ea am bm ex tc abx bsg all) or TAGS (ab6, eb42, am100582, tc56889, ...), installing a count-only typed PREFIX on each and logging one line every 10s: grep 'textures  loadprobe fires'. Start with 'bsg' -- BSG's own asset layer (Diz.Resources.EasyAssets/EasyBundle, EFT.AssetsManager, TextureCache) plus the ab6 control, which must read 0. A bare number still means an AssetBundle rid, and only that. Requires swapMode=off (both would detour ab6)."),
 
     boolSetting("packRootSet", "Custom pack root", false, category = "Advanced",
                 implemented = false,
