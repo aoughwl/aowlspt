@@ -45,8 +45,10 @@
     "subtab BUTTON(s) cloned into a clone of ",
     "version brand: REFUSING to write",
     "hide seasons: Common UI/MenuScreen/SeasonsButton switched off",
-    "DID NOT TAKE on any of the ",
-    "verified by reading m_text back",
+    "DID NOT FULLY TAKE -- it reads ",
+    "TextMeshProUGUI, matching the donor",
+    "was hidden again on the FIRST frame it did",
+    "Verified by re-reading the clone, not by trusting the write",
     "hide seasons: GIVING UP after "
       ]
     },
