@@ -84,6 +84,14 @@ import invoke
 ## drained on Unity's own thread even when the runtime hands back no usable
 ## `MethodInfo.methodPointer`. See `aowlspt_bridge.h`.
 {.emit: """#include "aowlspt_bridge.h" """.}
+## Runtime resolution of a compiled method address out of IL2CPP's OWN
+## per-assembly `Il2CppCodeGenModule.methodPointers` table, for the many methods
+## on build 1.1.0.1.46777 whose `MethodInfo.methodPointer` reads NULL even
+## though `findClass`/`findMethod` both succeed. Cross-checked offline against
+## `tools/il2cpp_resolve.py` on seven methods across four different assemblies,
+## including a BE RVA known independently from `aowlspt_beclient.h`. See
+## `aowlspt_codegen.h` for the chain and for the safety argument.
+{.emit: """#include "aowlspt_codegen.h" """.}
 ## ORIGINAL PROLOGUE BYTES, snapshotted once before any detour is installed.
 ## Included FIRST of the target-owning headers, because every one of them
 ## verifies through it. Two features that share a target used to be unable to
@@ -1301,6 +1309,17 @@ var gUiProbe = false
 ## populated. It can crash if the found pointer is a wrong-but-real function, so
 ## it is opt-in; the always-on diagnostic below logs the layout either way.
 var gDeepScan = false
+var gCodeGenResolve = false
+  ## `codeGenResolve` in `aowlspt-host.json`. When `MethodInfo.methodPointer`
+  ## reads null, resolve the compiled address from IL2CPP's own per-assembly
+  ## `methodPointers` table instead of refusing. Default OFF -- see the caveat
+  ## in `aowlspt_codegen.h`.
+var gCodeGenAudit = false
+  ## `codeGenAudit`. Read-only: whenever BOTH `methodPointer` and the
+  ## codeGenModule walk produce an address for the same method, log whether they
+  ## agree. Costs nothing, patches nothing, and is the only instrument that can
+  ## settle on the LIVE client whether this build's table holds the pointer the
+  ## game actually calls.
 ## How many live-MethodInfo layout dumps have been written. Capped so the first
 ## bind pass dumps every candidate (there are only a handful) and the five-second
 ## retry loop does not repeat them forever.
@@ -3115,6 +3134,152 @@ proc patchReturned(slot: int32; regs: Il2CppPtr): int32 {.
     return 0'i32
   result = 1'i32
 
+# ----------------------------------------------- codeGenModule code pointers
+
+proc cCodeGenReady(): int32 {.importc: "aowl_codegen_ready", nodecl.}
+proc cCodeGenLookup(imageName: Il2CppPtr; token: uint32): Il2CppPtr {.
+  importc: "aowl_codegen_lookup", nodecl.}
+proc cCodeGenReason(): int32 {.importc: "aowl_codegen_reason", nodecl.}
+proc cCodeGenReasonStr(): Il2CppPtr {.importc: "aowl_codegen_reason_str", nodecl.}
+proc cCodeGenModules(): int32 {.importc: "aowl_codegen_modules", nodecl.}
+proc cCodeGenValidNames(): int32 {.importc: "aowl_codegen_valid_names", nodecl.}
+proc cCodeGenNoteAgreement(live, resolved: Il2CppPtr): int32 {.
+  importc: "aowl_codegen_note_agreement", nodecl.}
+proc cCodeGenAgreeSame(): int32 {.importc: "aowl_codegen_agree_same", nodecl.}
+proc cCodeGenAgreeDiff(): int32 {.importc: "aowl_codegen_agree_diff", nodecl.}
+
+proc hexOf(v: uint64): string =
+  ## Lowercase hex of a machine word, no `0x`. A local helper because a live
+  ## MethodInfo dump wants pointer values and the codebase's other hex writers
+  ## are fixed-width session ids. Defined here rather than beside the deep-probe
+  ## because `resolveCodeGen`, above `installPatch`, logs RVAs with it.
+  const digits = "0123456789abcdef"
+  if v == 0'u64:
+    return "0"
+  var x = v
+  var s = ""
+  while x > 0'u64:
+    s = $digits[int(x and 0xF'u64)] & s
+    x = x shr 4
+  return s
+
+var gCodeGenRefusals = 0
+const CodeGenRefusalCap = 24
+  ## Self-limiting log, not self-disabling behaviour: the walk itself cannot
+  ## fault (every hop is a VirtualQuery, nothing is called), so there is no
+  ## fault count to disable on. What is capped is the NOISE, so a mod that
+  ## registers many patches on a build without this table does not fill the log
+  ## with one identical sentence per patch.
+
+proc codeGenReason(): string =
+  result = readCString(cCodeGenReasonStr())
+  if result.len == 0:
+    result = "reason " & $int(cCodeGenReason())
+
+proc codeGenRefuse(msg: string) =
+  ## One place for every decline, so none of them can be silent and none of them
+  ## can flood. Rule 6 of the host discipline in one proc.
+  if gCodeGenRefusals < CodeGenRefusalCap:
+    inc gCodeGenRefusals
+    warn msg
+    if gCodeGenRefusals == CodeGenRefusalCap:
+      warn "codeGen: further resolution refusals will not be logged (cap " &
+           $CodeGenRefusalCap & " reached)"
+
+proc resolveCodeGen(m: Il2CppMethod; spec: string; verbose: bool): Il2CppPtr =
+  ## The compiled address of `m` out of its OWN image's
+  ## `Il2CppCodeGenModule.methodPointers`, or nil with a logged reason.
+  ##
+  ## The RID is derived from the `MethodInfo` the caller was ALREADY handed, via
+  ## `il2cpp_method_get_token`. It is never re-derived from a name lookup, which
+  ## is what keeps overload resolution self-consistent: `AssetBundle::LoadAsset`
+  ## has two overloads at 0x5250100 and 0x5250340 and `findMethod(.., -1)` picks
+  ## one of them; whichever it picked is the one whose token this reads.
+  ##
+  ## Every hop through the metadata is guarded inside `aowlspt_codegen.h` by
+  ## `aowl_is_readable` (a VirtualQuery), so nothing here can fault and nothing
+  ## here needs -- or takes -- an `aowl_p_p_seh`, which matters because that
+  ## guard is not re-entrant and a caller may already be inside one.
+  result = cast[Il2CppPtr](0)
+  if m == nil:
+    return
+  if cCodeGenReady() == 0'i32:
+    codeGenRefuse("codeGen: cannot resolve " & spec &
+                  " -- the codeGenModules table did not validate: " &
+                  codeGenReason())
+    return
+  if not gRt.has(eClassGetImage) or not gRt.has(eMethodGetToken):
+    codeGenRefuse("codeGen: cannot resolve " & spec &
+                  " -- this runtime exports no il2cpp_class_get_image / " &
+                  "il2cpp_method_get_token")
+    return
+
+  # method -> declaring class -> image -> image NAME. All three are exported
+  # runtime calls, so no struct offset is assumed anywhere on this path.
+  let cls = gRt.methodClass(m)
+  if cls == nil:
+    codeGenRefuse("codeGen: cannot resolve " & spec &
+                  " -- il2cpp_method_get_class returned null")
+    return
+  let img = gRt.classGetImage(cls)
+  if img == nil:
+    codeGenRefuse("codeGen: cannot resolve " & spec &
+                  " -- il2cpp_class_get_image returned null for its " &
+                  "declaring type")
+    return
+  var imageName = gRt.imageGetName(img)
+  if imageName.len == 0:
+    codeGenRefuse("codeGen: cannot resolve " & spec & " -- its image has no name")
+    return
+
+  let token = gRt.methodToken(m)
+  let rid = token and 0xFFFFFF'u32
+  if rid == 0'u32:
+    codeGenRefuse("codeGen: cannot resolve " & spec &
+                  " -- its metadata token has a zero RID")
+    return
+
+  let fn = cCodeGenLookup(cast[Il2CppPtr](toCString(imageName)), token)
+  if fn == nil:
+    codeGenRefuse("codeGen: cannot resolve " & spec & " in " & imageName &
+                  " (token rid " & $int(rid) & "): " & codeGenReason())
+    return
+
+  if verbose:
+    okLog "codeGen: " & spec & " -> il2cpp+0x" &
+          hexOf(uint64(cIl2cppRvaOf(fn))) & " via " & imageName &
+          " methodPointers[" & $int(rid - 1'u32) & "]"
+  return fn
+
+proc auditCodeGen(m: Il2CppMethod; spec: string; live: Il2CppPtr) =
+  ## READ-ONLY. With a live `methodPointer` in hand, resolve the same method the
+  ## other way and say whether they agree. Nothing is patched either way.
+  ##
+  ## This exists because the tree contains two notes that contradict each other:
+  ## `bindMainDrain` records that a static RVA out of this table bound "a real
+  ## function that Unity never reached as Update" and crashed the client, while
+  ## the static-RVA block below it says the address is "now KNOWN correct" and
+  ## the crash "unexplained". Nobody has re-tested it. An agreement count from
+  ## the live client settles it at zero risk, which is the cheapest honest
+  ## answer available.
+  if not gCodeGenAudit or live == nil or m == nil:
+    return
+  let resolved = resolveCodeGen(m, spec, false)
+  if resolved == nil:
+    return
+  if cCodeGenNoteAgreement(live, resolved) != 0'i32:
+    okLog "codeGen audit: " & spec & " AGREES (methodPointer == " &
+          "methodPointers[rid-1] == il2cpp+0x" &
+          hexOf(uint64(cIl2cppRvaOf(live))) & "); running totals same=" &
+          $int(cCodeGenAgreeSame()) & " diff=" & $int(cCodeGenAgreeDiff())
+  else:
+    warn "codeGen audit: " & spec & " DISAGREES -- methodPointer=il2cpp+0x" &
+         hexOf(uint64(cIl2cppRvaOf(live))) & " but methodPointers[rid-1]=" &
+         "il2cpp+0x" & hexOf(uint64(cIl2cppRvaOf(resolved))) &
+         "; the table does NOT hold the live pointer on this build, so " &
+         "codeGenResolve must stay OFF. Running totals same=" &
+         $int(cCodeGenAgreeSame()) & " diff=" & $int(cCodeGenAgreeDiff())
+
 proc installPatch(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
                   kind: int32; cb: Il2CppPtr; user: Il2CppPtr;
                   typed: bool): int32 =
@@ -3192,11 +3357,34 @@ proc installPatch(ctx: Il2CppPtr; target: Il2CppPtr; targetLen: int32;
     gLastError = "no method " & member & " on " & typePart
     return ErrNotFound
 
-  let fn = methodPointer(gRt, m)
-  if fn == nil:
-    gLastError = "could not read a usable code pointer for " & spec &
-                 " (the method may not be compiled yet)"
-    return ErrUnsupported
+  # Resolution order, most-trusted first:
+  #   1. `MethodInfo.methodPointer` -- the pointer the runtime itself holds and
+  #      the game itself calls. Nothing beats it, so it is always tried first.
+  #   2. the declaring image's `Il2CppCodeGenModule.methodPointers[rid-1]` --
+  #      IL2CPP's own per-assembly code table, the same mechanism
+  #      `tools/il2cpp_resolve.py` uses offline. Flag-gated, default OFF.
+  #   3. refuse, naming which hop failed.
+  #
+  # There is deliberately no deep-scan step here: scanning a MethodInfo for
+  # "some field that looks like code" is a guess, and `installPatch` is what
+  # every mod's `patch`/`hookReturn` goes through. The drain binder keeps its
+  # scan because it has a diagnostic purpose; a mod's patch does not.
+  var fn = methodPointer(gRt, m)
+  if fn != nil:
+    auditCodeGen(m, spec, fn)
+  else:
+    if gCodeGenResolve:
+      fn = resolveCodeGen(m, spec, true)
+    if fn == nil:
+      gLastError = "could not read a usable code pointer for " & spec &
+                   " (methodPointer is null" &
+                   (if gCodeGenResolve:
+                      " and the codeGenModule fallback also declined: " &
+                      codeGenReason()
+                    else:
+                      "; set codeGenResolve in aowlspt-host.json to try " &
+                      "IL2CPP's own per-assembly methodPointers table") & ")"
+      return ErrUnsupported
 
   # The two shapes a postfix cannot carry, checked against the method rather
   # than against the patch kind alone: a value-type return wider than a
@@ -3454,19 +3642,8 @@ const gBridgeEnabled* = true
   ## nothing and the queue falls back to the host thread -- it cannot crash by
   ## default. `bridgeDisableDrain` in `aowlspt-host.json` is the real off-switch.
 
-proc hexOf(v: uint64): string =
-  ## Lowercase hex of a machine word, no `0x`. A local helper because a live
-  ## MethodInfo dump wants pointer values and the codebase's other hex writers
-  ## are fixed-width session ids.
-  const digits = "0123456789abcdef"
-  if v == 0'u64:
-    return "0"
-  var x = v
-  var s = ""
-  while x > 0'u64:
-    s = $digits[int(x and 0xF'u64)] & s
-    x = x shr 4
-  return s
+## `hexOf` is defined above `installPatch`, because the codeGenModule resolver
+## that `installPatch` calls logs RVAs with it.
 
 proc dumpMethodInfo(m: Il2CppMethod; spec: string) =
   ## One guarded dump of a live `MethodInfo`'s first nine words, so that a build
@@ -3518,10 +3695,24 @@ proc resolveDrainPointer(m: Il2CppMethod; spec: string;
   ## of the rest of the struct for an executable il2cpp pointer to hook instead.
   result = methodPointer(gRt, m)
   if result != nil:
+    auditCodeGen(m, spec, result)
     return
   if gMethodInfoDumps < MethodInfoDumpCap:
     inc gMethodInfoDumps
     dumpMethodInfo(m, spec)
+  # Ahead of the deep scan, because this is a RESOLUTION and the scan is a
+  # guess: IL2CPP's own per-assembly `methodPointers` table, selected by the
+  # declaring type's image and indexed by this MethodInfo's own token RID.
+  if gCodeGenResolve:
+    let viaTable = resolveCodeGen(m, spec, verbose)
+    if viaTable != nil:
+      warn "codeGen: binding the drain for " & spec & " at il2cpp+0x" &
+           hexOf(uint64(cIl2cppRvaOf(viaTable))) & " from its image's " &
+           "methodPointers table (codeGenResolve is set). NOTE: a static RVA " &
+           "out of this same table was bound on the live client once and the " &
+           "drain never fired; run with codeGenAudit first if that has not " &
+           "been re-tested on this build."
+      return viaTable
   if gDeepScan:
     var off = -1
     let scanned = scanMethodPointer(m, off)
@@ -5140,6 +5331,25 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
     info "bridgeUiProbe is set: the drain self-test will also instantiate and " &
          "parent Unity UI GameObjects on the Unity thread once, to prove the " &
          "native settings-injection path"
+  gCodeGenAudit = readBoolKey("codeGenAudit")
+  if gCodeGenAudit:
+    info "codeGenAudit is set: whenever a method has BOTH a live methodPointer " &
+         "and a codeGenModule table entry, the host will log whether the two " &
+         "agree. Read-only -- it patches nothing."
+  gCodeGenResolve = readBoolKey("codeGenResolve")
+  if gCodeGenResolve:
+    if cCodeGenReady() != 0'i32:
+      warn "codeGenResolve is set: when methodPointer reads null the host will " &
+           "resolve the compiled address from IL2CPP's own per-assembly " &
+           "methodPointers table (" & $int(cCodeGenModules()) & " modules, " &
+           $int(cCodeGenValidNames()) & " with readable names) and patch THAT. " &
+           "Cross-checked offline against tools/il2cpp_resolve.py, but a static " &
+           "RVA out of this table crashed the live client once and that has not " &
+           "been re-tested -- run codeGenAudit first."
+    else:
+      warn "codeGenResolve is set but the codeGenModules table did not " &
+           "validate on this build (" & codeGenReason() & "); the fallback is " &
+           "inert and every null methodPointer will still refuse."
   gDeepScan = readBoolKey("bridgeDeepScan")
   if gDeepScan:
     warn "bridgeDeepScan is set: when methodPointer is null the host will scan " &

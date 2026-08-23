@@ -141,9 +141,18 @@ type
     ## replacement image bytes for `ImageConversion.LoadImage` (see
     ## `mods/textures`). Not `Essential`: a mod that never constructs an array
     ## does not need it, and a build that stripped it is still hostable.
-    eArrayNew
+    eArrayNew,
+    ## Appended, again, rather than inserted -- same append-only reason. These
+    ## two are the runtime half of the codeGenModule code-pointer fallback (see
+    ## `abi/aowlspt_codegen.h`): with them the walk from a `MethodInfo*` to its
+    ## declaring image's NAME and to its metadata TOKEN needs no guessed struct
+    ## offset for `MethodInfo`, `Il2CppClass` or `Il2CppImage`. Both were
+    ## confirmed present in `GameAssembly.dll`'s export directory for build
+    ## 1.1.0.1.46777 (386 exports) before being added here. Not `Essential`:
+    ## a build without them simply loses the fallback.
+    eClassGetImage, eMethodGetToken
 
-const NumEntries* = 63
+const NumEntries* = 65
 
 const EntryNames*: array[NumEntries, string] = [
   "il2cpp_set_data_dir", "il2cpp_set_config_dir", "il2cpp_init",
@@ -178,7 +187,8 @@ const EntryNames*: array[NumEntries, string] = [
   "il2cpp_class_from_il2cpp_type", "il2cpp_field_get_flags",
   "il2cpp_class_get_static_field_data", "il2cpp_gc_wbarrier_set_field",
   "il2cpp_method_get_flags",
-  "il2cpp_array_new"
+  "il2cpp_array_new",
+  "il2cpp_class_get_image", "il2cpp_method_get_token"
 ]
 
 ## The entry points the host cannot work without, as opposed to the ones it
@@ -345,6 +355,35 @@ proc imageGetClassCount*(rt: Il2Cpp; i: Il2CppImage): int =
 proc imageGetClass*(rt: Il2Cpp; i: Il2CppImage; index: int): Il2CppClass =
   if not rt.has(eImageGetClass): return nullPtr()
   result = tpPZ(rt.fns[ord(eImageGetClass)], i, uint64(index))
+
+proc methodClass*(rt: Il2Cpp; m: Il2CppMethod): Il2CppClass =
+  ## The type a method was declared on. `il2cpp_method_get_class` is an
+  ## exported entry point, so this is an interface call rather than a read of
+  ## `MethodInfo.klass` at an assumed offset.
+  if not rt.has(eMethodGetClass): return nullPtr()
+  if m == nil: return nullPtr()
+  result = tpP(rt.fns[ord(eMethodGetClass)], m)
+
+proc classGetImage*(rt: Il2Cpp; c: Il2CppClass): Il2CppImage =
+  ## The assembly image a class was defined in. Exported by the runtime, so this
+  ## is an interface call and not a struct-offset read -- which matters, because
+  ## it is the hop the codeGenModule code-pointer fallback needs and a guessed
+  ## `Il2CppClass.image` offset would be exactly the kind of coin flip this
+  ## project refuses.
+  if not rt.has(eClassGetImage): return nullPtr()
+  result = tpP(rt.fns[ord(eClassGetImage)], c)
+
+proc methodToken*(rt: Il2Cpp; m: Il2CppMethod): uint32 =
+  ## A method's metadata token. `token and 0xFFFFFF` is its RID within its own
+  ## image, which is the index (minus one) into that image's
+  ## `Il2CppCodeGenModule.methodPointers`. Zero means unavailable.
+  ##
+  ## Called through a uint32-returning trampoline rather than the size_t one:
+  ## the high half of RAX is unspecified for a uint32-returning callee, so
+  ## reading it as a size_t can bring garbage back in the top 32 bits.
+  if not rt.has(eMethodGetToken): return 0'u32
+  if m == nil: return 0'u32
+  result = tu32P(rt.fns[ord(eMethodGetToken)], m)
 
 proc classFromName*(rt: Il2Cpp; image: Il2CppImage;
                     ns, name: string): Il2CppClass =
