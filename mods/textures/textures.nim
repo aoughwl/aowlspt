@@ -45,6 +45,7 @@ import aowlspt/server     # `setting`, `serve`
 import aowlspt/settings   # the F12 settings schema
 import manifest
 import swap
+import redirect
 import loadprobe
 
 const
@@ -75,6 +76,12 @@ type
     catGround: bool
     packRoot: string         ## where the replacement images live on disk
     probeTargets: string     ## multi-target counting probe; "" = OFF
+    ## THE CURRENT MECHANISM: bundle file redirect (see redirect.nim).
+    bundleRoot: string       ## dir of patched bundles named VERBATIM by key; "" = OFF
+    redirectMode: string     ## "off" | "probe" | "match" | "full"
+    ## THE RETIRED MECHANISM: name-keyed Texture2D substitution (swap.nim).
+    ## Off, and kept only so the measurements that killed it stay reproducible.
+    legacyNameSwap: bool
 
 proc defaultSettings(): Settings =
   Settings(enabled: true, swapMode: "off", hookAsync: false, armDelayMs: 15000,
@@ -82,7 +89,8 @@ proc defaultSettings(): Settings =
            minConfidence: 0.5, logMatches: true, albedoOnly: true,
            catMetal: true, catWood: true, catConcrete: true,
            catBrick: true, catFabric: true, catGround: false,
-           packRoot: "", probeTargets: "")
+           packRoot: "", probeTargets: "",
+           bundleRoot: "", redirectMode: "off", legacyNameSwap: false)
 
 var gCfg = defaultSettings()
 var gTicks = 0
@@ -112,6 +120,9 @@ proc loadConfig() =
   gCfg.catGround = sBool("catGround", gCfg.catGround)
   gCfg.packRoot = sText("packRoot", gCfg.packRoot)
   gCfg.probeTargets = sText("probeTargets", gCfg.probeTargets)
+  gCfg.bundleRoot = sText("bundleRoot", gCfg.bundleRoot)
+  gCfg.redirectMode = sText("redirectMode", gCfg.redirectMode)
+  gCfg.legacyNameSwap = sBool("legacyNameSwap", gCfg.legacyNameSwap)
 
 proc tierName(): string =
   if gCfg.quality == "4k": "4K" else: "2K"
@@ -136,9 +147,19 @@ proc texturesSchema(): seq[Setting] =
     boolSetting("enabled", "Enable texture replacement", true,
                 category = "General",
                 description = "Master switch. Off means stock textures, no hooks."),
-    enumSetting("swapMode", "Swap mode", "off",
+    enumSetting("redirectMode", "Bundle redirect mode", "off",
                 @["off", "probe", "match", "full"], category = "General",
-                description = "Escalation ladder. off: install nothing. probe: install the verified LoadAsset hook, count firings only (proves the hook is safe). match: also name-match against the manifest (no pixels). full: also upload the replacement texture. Escalate one rung at a time."),
+                description = "THE MECHANISM THAT WORKS ON THIS BUILD. Rewrites Diz.Resources.EasyBundle._path (+0x20) from a typed PREFIX on EasyBundle::Load @0x2772CC0, so a vanilla bundle key loads OUR patched file instead — the game's own pipeline then does the decode, so compression, mips and colour space are all correct and VRAM is unchanged. Ladder: off installs nothing; probe installs the verified prefix and counts bundle loads only; match also reads <Key> and looks it up (writes NOTHING, and samples the keys that missed — that sampler is how we learn what the game actually asks for); full also rewrites _path. Needs bundleRoot set; empty bundleRoot forces off. Escalate one rung at a time."),
+    stringSetting("bundleRoot", "Patched bundle directory", "",
+                category = "General",
+                description = "Directory of replacement bundles, produced by the pack pipeline. Empty (the default) means the redirect is OFF. Each file must be named EXACTLY like the bundle key — NO extension is appended, stripped or normalised: measured on 4.1.2 (fact #73), 214 of 292 in-scope keys carry no .bundle extension and appending one silently killed 214 of 278 with no error. Optionally add an index.txt (one key per line, verbatim; # comments and blank lines skipped) and the whole table is read once at arm time with zero filesystem I/O on the hook path; without it each distinct key costs one cached open() probe."),
+    boolSetting("legacyNameSwap", "Legacy name-keyed texture swap (RETIRED)",
+                false, category = "Advanced", implemented = false,
+                description = "RETIRED AND OFF. swap.nim's Texture2D-by-name substitution, kept only so the measurements that killed it stay reproducible. Three independent facts rule it out: nothing ever asks for a texture by name (the chain ends at LoadAllAssetsAsync -> Assets = op.allAssets, a bulk array); Texture2D.LoadImage returns false on a non-readable texture and RE-CREATES rather than mutating, so the in-place premise was false; and RGBA32 replacements are 4-8x the BC originals (512 x 2K is ~5.6 GB). It also detours the SAME RVA as the redirect, and a second detour overwrites the first's trampoline — so the two are mutually exclusive and the redirect wins."),
+    enumSetting("swapMode", "Legacy swap mode (RETIRED)", "off",
+                @["off", "probe", "match", "full"], category = "Advanced",
+                implemented = false,
+                description = "Only consulted when legacyNameSwap is on AND the redirect is off. See legacyNameSwap for why this is retired."),
     intSetting("armDelayMs", "Arm delay (ms)", 15000, lo = 0, hi = 120000,
                step = 1000, category = "General",
                description = "How long after load before hooks are installed. Deferred past the boot bundle-load storm, which is where the naive version crashed. The mod also waits for the Unity main-thread drain to be live."),
@@ -240,6 +261,30 @@ proc simSelfTest(): Status =
         not canUpload() and not swapArmed(),
         "the swap armed on the sim side, where there is no game to swap against")
 
+  # The redirect, offline. Two properties matter and neither needs a runtime:
+  # an empty bundleRoot must force the feature OFF whatever the mode says, and
+  # the key must reach the path VERBATIM (fact #73 — appending an extension
+  # silently killed 214 of 278 bundles).
+  configureRedirect("full", "", 0)
+  check("an empty bundleRoot forces the redirect off",
+        not redirectEnabled(),
+        "redirectMode=full with no bundleRoot armed anyway; there would be " &
+        "nowhere to redirect to")
+  configureRedirect("full", "D:/packs/bundles", 999999)
+  check("the redirect is configurable but not armed offline",
+        redirectEnabled() and not redirectArmed(),
+        "the redirect armed on the sim side, where there is no game")
+  check("a bundle key reaches the path VERBATIM, with no extension appended",
+        pathFor("assets/content/weapons/ak74/ak74_container") ==
+          "D:/packs/bundles/assets/content/weapons/ak74/ak74_container",
+        "pathFor normalised or extended the key: got " &
+        pathFor("assets/content/weapons/ak74/ak74_container"))
+  check("a key that already carries an extension keeps it unchanged",
+        pathFor("some.bundle") == "D:/packs/bundles/some.bundle",
+        "pathFor altered a key with an extension: got " & pathFor("some.bundle"))
+  # Leave the module the way it was found, so the sim side ends inert.
+  configureRedirect("off", "", 0)
+
   if gFailures == 0:
     success "selftest  all checks passed (" & $entryCount() & " replacements)"
     return Ok
@@ -282,7 +327,47 @@ proc onLoad(): Status =
          $(gCfg.armDelayMs div 1000) & "s after load and report every 10s " &
          "(grep: textures  loadprobe fires)"
 
-  if not gCfg.enabled or gCfg.quality == "off" or gCfg.swapMode == "off":
+  # ---------------------------------------------------------------------
+  # THE CURRENT MECHANISM: bundle file redirect.
+  # ---------------------------------------------------------------------
+  #
+  # Configured first, and it WINS. It and the retired name swap detour the
+  # same RVA (EasyBundle::Load @0x2772CC0), and two detours on one function
+  # means the second overwrites the first's trampoline and silently kills it.
+  # So this is an exclusive choice made out loud, never a race.
+  if gCfg.enabled:
+    configureRedirect(gCfg.redirectMode, gCfg.bundleRoot, gCfg.armDelayMs)
+  if redirectEnabled():
+    info "textures  bundle redirect: mode '" & gCfg.redirectMode &
+         "', bundleRoot '" & gCfg.bundleRoot & "' — will install a verified " &
+         "typed PREFIX on Diz.Resources.EasyBundle::Load ~" &
+         $(gCfg.armDelayMs div 1000) & "s after load and rewrite _path (+0x20) " &
+         "for keys we have a replacement for; every other key passes through " &
+         "untouched"
+  elif gCfg.enabled and gCfg.redirectMode != "off" and gCfg.bundleRoot.len == 0:
+    warn "textures  redirectMode='" & gCfg.redirectMode & "' but bundleRoot " &
+         "is EMPTY, so there is nowhere to redirect TO. The redirect is OFF. " &
+         "This is a refusal, not a zero-hit result."
+  else:
+    info "textures  bundle redirect is off (set bundleRoot and redirectMode " &
+         "to enable). The game uses stock bundles."
+
+  # ---------------------------------------------------------------------
+  # THE RETIRED MECHANISM, behind its own flag and never alongside the above.
+  # ---------------------------------------------------------------------
+  if not gCfg.legacyNameSwap:
+    return Ok
+  if redirectEnabled():
+    warn "textures  legacyNameSwap is on but the bundle redirect is ALSO on. " &
+         "Both detour EasyBundle::Load @0x2772CC0, and the second detour " &
+         "overwrites the first's trampoline — so the legacy name swap is NOT " &
+         "installed. Turn off redirectMode (or clear bundleRoot) to run it."
+    return Ok
+  warn "textures  legacyNameSwap is ON: installing the RETIRED name-keyed " &
+       "Texture2D substitution. It cannot work on this build (nothing asks " &
+       "for a texture by name; LoadImage re-creates rather than mutating; " &
+       "RGBA32 is 4-8x the VRAM). Use redirectMode instead."
+  if gCfg.quality == "off" or gCfg.swapMode == "off":
     info "textures  swapMode=off (or disabled): no swap hooks will be " &
          "installed, the game uses stock textures. Escalate with swapMode " &
          "probe -> match -> full in config.json once boot is confirmed stable."
@@ -311,6 +396,10 @@ proc onUpdate(elapsedMs: int64): Status =
   # swapMode=off, where `swapArmed()` is false forever and the swap's own
   # early-return below would otherwise never let a readout happen.
   discard maybeArmLoadProbe()
+  # The bundle redirect arms on its own schedule, independently of the retired
+  # swap: `swapArmed()` is false forever now, and the swap's early-return below
+  # would otherwise never let a redirect readout happen.
+  discard maybeArmRedirect()
 
   let now = nowMs()
   let due = now - gLastReadoutMs >= 10000'i64
@@ -320,6 +409,8 @@ proc onUpdate(elapsedMs: int64): Status =
     # ones did NOT fire" is half the result of the probe raid.
     if loadProbeArmed():
       info loadProbeReport()
+    if redirectArmed():
+      info "textures  " & redirectStats()
 
   # Deferred, verified arming of the swap: a no-op every tick until it is safe.
   if not swapArmed():
@@ -332,6 +423,8 @@ proc onUpdate(elapsedMs: int64): Status =
 proc onUnload(): Status =
   if loadProbeArmed():
     info loadProbeReport()
+  if redirectArmed():
+    info "textures  " & redirectStats()
   info ModName & " unloaded after " & $gTicks & " ticks; " & swapStats()
   Ok
 

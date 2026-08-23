@@ -38,9 +38,9 @@
         "components EXPR [BaseType]",
         "SHARED RVA: ",
         "SHAREDNESS IS UNKNOWN for this entry",
-    "mods tab: built -- a sixth tab button cloned into SettingsScreen/",
-    "mods tab armed as a RIDER on the existing EFT.UI.PreloaderUI::",
-    "settingsModsTab is set"
+        "mods tab: built -- a sixth tab button cloned into SettingsScreen/",
+        "mods tab armed as a RIDER on the existing EFT.UI.PreloaderUI::",
+        "settingsModsTab is set"
       ]
     },
     {
@@ -119,7 +119,10 @@
         "textures  hooked ",
         "textures  ARMED post-boot in mode",
         "textures  unmatched sample",
-        "prologue MISMATCH"
+        "prologue MISMATCH",
+        "textures  REDIRECT",
+        "textures  bundle redirect",
+        "Diz.Resources.EasyBundle::Load@0x2772CC0/i>x"
       ]
     }
   ]
