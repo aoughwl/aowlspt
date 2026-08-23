@@ -85,6 +85,32 @@ const
                   "!488B11488B8278010000488B92800100"
   TgtReqAssetRva* = 0xB196C0'u32
 
+  ## `UnityEngine.Object::get_name`, rid=2874 of type 23130, RVA 0x52AD4B0.
+  ##
+  ## THE NAME SOURCE. `match` mode exists to compare what the game loads
+  ## against the curated manifest, and the manifest is a NAME table -- so
+  ## without a name the whole rung, and with it the unmatched-name sampler
+  ## that is the only evidence we would ever get of a namespace mismatch, is
+  ## dead. It used to come from `GameObj.invoke("get_name")`, which resolves by
+  ## name, which returns non-nil handles into unmapped memory on this build.
+  ##
+  ## So it is CALLED AT ITS STATIC RVA instead -- one of the three things that
+  ## still works here. Instance convention: RCX = the object, RDX = the hidden
+  ## trailing `const MethodInfo*`, which may be NULL because `get_name` is not
+  ## a shared generic. Prologue `40 53 48 83 EC 20 80 3D ...` is
+  ## `push rbx ; sub rsp,0x20 ; cmp byte[rip+..],0 ; mov rbx,rcx`, IL2CPP's
+  ## ordinary class-init preamble; bytes 8..11 are a RIP-relative displacement,
+  ## which is exactly what pins this signature to this build.
+  GetNameRva* = 0x52AD4B0'u32
+  GetNameProlog: array[16, uint8] = [
+    0x40'u8, 0x53, 0x48, 0x83, 0xEC, 0x20, 0x80, 0x3D,
+    0x36,    0x72, 0xE2, 0x01, 0x00, 0x48, 0x8B, 0xD9]
+
+  ## The longest asset name this will read out of a managed string. A cap, not
+  ## an expectation: `length` is read from the object and a corrupt one would
+  ## otherwise be an unbounded loop inside a frame.
+  MaxNameChars = 256
+
   ## The first 16 bytes of `UnityEngine.AssetBundle::LoadAsset` on build
   ## 1.1.0.1.46777, shared by both the `(string)` and `(string, Type)` overloads
   ## (RVA 0x5250100 / 0x5250340, imagebase 0x180000000). All non-RIP-relative
@@ -122,6 +148,22 @@ static int aowl_tex_readable(const void* p, int n) {
     return ((unsigned long long)p + (unsigned long long)n <= end) ? 1 : 0;
   }
 }
+/* The direct call at a static RVA. IL2CPP instance convention: `this` in RCX,
+ * then the hidden trailing `const MethodInfo*` in RDX -- NULL is fine here
+ * because `get_name` is not a shared generic. Returns the `System.String*`.
+ *
+ * No fault guard around it, deliberately: `aowl_p_p_seh` is NOT re-entrant and
+ * this runs inside the host's typed-fire path, so a guard here could disarm an
+ * outer one. Safety comes from the checks the caller makes FIRST -- the
+ * prologue is byte-verified against the bytes this build compiled, and the
+ * object pointer is VirtualQuery'd -- plus the caller's fault-budget
+ * self-disable. */
+static void* aowl_tex_getname(void* fn, void* obj) {
+  typedef void* (*getname_t)(void*, void*);
+  if (!fn || !obj) return 0;
+  return ((getname_t)fn)(obj, 0);
+}
+
 /* GameAssembly.dll's ACTUAL base, asked for at runtime. 0x180000000 is the PE
  * PREFERRED base -- the space tools/il2cpp_resolve.py reports RVAs in -- and
  * the module is ASLR-relocated in the live process. Never hardcode it. */
@@ -141,6 +183,8 @@ proc texReadable(p: Il2CppPtr; n: int32): int32 {.importc: "aowl_tex_readable", 
 proc texReadCode(p, outp: Il2CppPtr; n: int32): int32 {.
   importc: "aowl_tex_readcode", nodecl.}
 proc texRva(rva: uint32): Il2CppPtr {.importc: "aowl_tex_rva", nodecl.}
+proc texGetName(fn, obj: Il2CppPtr): Il2CppPtr {.
+  importc: "aowl_tex_getname", nodecl.}
 
 proc rvaHex(v: uint32): string =
   ## An RVA as bare hex, the way every address in this project is written.
@@ -203,6 +247,16 @@ var gUploadFailReported = false
 
 const MaxUnmatchedLogged = 40
 var gUnmatchedLogged = 0
+
+## The name source, resolved and prologue-verified once at arm time. Nil means
+## `match`/`full` cannot run and SAY SO -- never that they run and match zero.
+var gGetNameFn: Il2CppPtr = cast[Il2CppPtr](0)
+## Fault budget. `get_name` is a real call into game code, so a path that has
+## gone wrong N times turns itself off rather than doing it every frame for the
+## rest of the session. Counted on unusable ANSWERS (an unreadable string, an
+## absurd length), which is the only failure this can observe without a guard.
+var gNameFaults = 0
+const MaxNameFaults = 8
 
 # Runtime + bindings, all resolved at arm time (post-boot), never at load.
 var gRt = Il2Cpp(handle: cast[Il2CppPtr](0), loaded: false, lastError: 0'i32,
@@ -276,14 +330,94 @@ proc readFileBinary(path: string; into: var string): bool =
   close(f)
   result = into.len > 0
 
-proc buildAndSwap(idx: int; obj: GameObj): bool =
+proc nameOfObject(obj: Il2CppPtr): string =
+  ## The managed `name` of a live `UnityEngine.Object`, by direct call at a
+  ## verified static RVA, then a raw read of the returned `System.String`.
+  ##
+  ## Layout, 64-bit: `Il2CppObject{ klass, monitor }` is 16 bytes, then
+  ## `length` (int32) at 0x10 and the UTF-16 characters at 0x14. That is a raw
+  ## static-offset read, which is one of the three things that still works on
+  ## this build.
+  ##
+  ## Every hop is VirtualQuery'd before it is touched and the character loop is
+  ## capped, so a corrupt length is a short name rather than a walk off the end
+  ## of the heap. Returns "" for every failure; the caller treats "" as "no
+  ## name available" and never as "the name is empty".
+  result = ""
+  if cast[uint](gGetNameFn) == 0'u or cast[uint](obj) == 0'u:
+    return
+  if gNameFaults >= MaxNameFaults:
+    return
+  if texReadable(obj, 16'i32) == 0'i32:
+    inc gNameFaults
+    return
+  let sp = texGetName(gGetNameFn, obj)
+  if cast[uint](sp) == 0'u:
+    return                      # a genuinely unnamed object is not a fault
+  if texReadable(sp, 20'i32) == 0'i32:
+    inc gNameFaults
+    return
+  var lenBuf: array[4, uint8] = [0'u8, 0, 0, 0]
+  if texReadCode(cast[Il2CppPtr](cast[uint](sp) + 0x10'u),
+                 cast[Il2CppPtr](addr lenBuf[0]), 4'i32) != 4'i32:
+    inc gNameFaults
+    return
+  var n = int(lenBuf[0]) or (int(lenBuf[1]) shl 8) or
+          (int(lenBuf[2]) shl 16) or (int(lenBuf[3]) shl 24)
+  if n <= 0:
+    return
+  if n > MaxNameChars:
+    n = MaxNameChars
+  # The whole character run has to be committed before ANY of it is read.
+  if texReadable(cast[Il2CppPtr](cast[uint](sp) + 0x14'u), int32(n * 2)) == 0'i32:
+    inc gNameFaults
+    return
+  var chars = newSeq[uint8](n * 2)
+  if texReadCode(cast[Il2CppPtr](cast[uint](sp) + 0x14'u),
+                 cast[Il2CppPtr](addr chars[0]), int32(n * 2)) != int32(n * 2):
+    inc gNameFaults
+    return
+  # Asset names are ASCII in practice; anything above 0x7F becomes '?' rather
+  # than being dropped, so a name that does not match still LOOKS like the name
+  # it is in the unmatched sample.
+  for k in 0 ..< n:
+    let w = int(chars[k * 2]) or (int(chars[k * 2 + 1]) shl 8)
+    if w >= 0x20 and w < 0x7F:
+      result = result & $char(w)
+    elif w == 0:
+      break
+    else:
+      result = result & "?"
+
+proc resolveNameSource() =
+  ## Verify `UnityEngine.Object::get_name` before it is ever called. A wrong
+  ## code pointer here is a call into arbitrary bytes, so this refuses loudly
+  ## rather than leaving a maybe.
+  gGetNameFn = cast[Il2CppPtr](0)
+  var fn: Il2CppPtr = cast[Il2CppPtr](0)
+  let why = verifyTarget(GetNameRva, "UnityEngine.Object::get_name",
+                         GetNameProlog, fn)
+  if why.len > 0:
+    warn "textures  NO name source: " & why & " — match/full cannot run, " &
+         "because the manifest is a NAME table. The mod will count firings " &
+         "only. This is a refusal, not a zero-match result."
+    return
+  gGetNameFn = fn
+  info "textures  name source verified: UnityEngine.Object::get_name at " &
+       "GameAssembly+0x" & rvaHex(GetNameRva) & " (direct call at a static " &
+       "RVA; by-name resolution is dead on this build)"
+
+proc buildAndSwap(idx: int; texPtr: Il2CppPtr): bool =
   ## Decodes the replacement image into the returned texture in place. Every
   ## pointer is checked committed-and-readable before use; any failure is a clean
   ## false and the game keeps its texture.
-  var address: uint64 = 0
-  if pointerOf(obj.handle, address) != Ok or address == 0'u64:
+  # The raw `Texture2D*` straight from the typed frame's return register.
+  # It used to come back through `pointerOf(obj.handle, ...)`, but a typed
+  # postfix has no GC handle to round-trip through -- and it does not need one:
+  # the postfix runs on the Unity thread inside the call that produced this
+  # pointer, so the collector cannot have moved it underneath us.
+  if cast[uint](texPtr) == 0'u:
     return false
-  let texPtr = cast[Il2CppPtr](address)
   if texReadable(texPtr, 8) == 0'i32:      # the object header must be readable
     return false
 
@@ -319,22 +453,76 @@ proc onTextureReturn(frame: PatchFrame): TypedResult =
   ## Fires after `LoadAsset` returns, on the Unity thread.
   ##
   ## A TYPED handler, because the patch is installed by RVA and an RVA has no
-  ## MethodInfo — which every JSON firing path needs to read the declared types
-  ## from. The typed frame carries the shape the spec declared (`io>o`), so
-  ## `resultPointer` reads the returned `Object*` out of RAX knowing that is
-  ## where the declared return kind puts it.
+  ## MethodInfo -- which every JSON firing path needs to read the declared
+  ## types from. The typed frame carries the shape the spec declared (`io>o`),
+  ## so `resultPointer` reads the returned `Object*` out of the register the
+  ## declared return kind says it is in.
   ##
-  ## It counts, and it never replaces. That is the whole of `probe` mode, and
-  ## on this build it is the whole of what this mod can do — see the clamp in
-  ## `maybeArm`: the `match` and `full` rungs are built on
-  ## `GameObj.invoke("get_name")`, which is by-name resolution, which is dead
-  ## here. Counting a non-null return is a real measurement; inventing a name
-  ## for it would not be.
+  ## The mode ladder is unchanged: `probe` counts, `match` adds the name
+  ## lookup, `full` adds the upload. What changed underneath is only where the
+  ## name comes from -- a direct call at `get_name`'s static RVA instead of
+  ## `GameObj.invoke("get_name")`, because by-name resolution is dead here.
   inc gFires
+  if gMode <= ModeProbe:
+    return frameContinue()
+
   var okPtr = false
-  let obj = resultPointer(frame, okPtr)
-  if okPtr and obj != 0'u64:
-    inc gTexReturns
+  let raw = resultPointer(frame, okPtr)
+  if not okPtr or raw == 0'u64:
+    return frameContinue()
+  let obj = cast[Il2CppPtr](raw)
+
+  let name = nameOfObject(obj)
+  if name.len == 0:
+    return frameContinue()
+  inc gTexReturns
+  let idx = lookup(name)
+  if idx < 0:
+    # The single most useful thing one live run can tell us: what BSG actually
+    # names the textures it loads. The curated manifest is a NAME table, so if
+    # the namespaces disagree there will be zero matches and no other evidence
+    # of why. Log a hard-capped SAMPLE (never a storm) of the names that came
+    # back and missed, so the pipeline can be re-aimed from one run instead of
+    # guessing. Capped at MaxUnmatchedLogged for the whole session.
+    if gUnmatchedLogged < MaxUnmatchedLogged:
+      inc gUnmatchedLogged
+      info "textures  unmatched sample " & $gUnmatchedLogged & "/" &
+           $MaxUnmatchedLogged & ": \"" & name & "\""
+      if gUnmatchedLogged == MaxUnmatchedLogged:
+        info "textures  unmatched sampling stopped at " &
+             $MaxUnmatchedLogged & " names (the cap); counts keep running"
+    return frameContinue()
+  if entryConf(idx) < gMinConf:
+    return frameContinue()
+  if gCatFilter.len > 0 and find(gCatFilter, "," & entryCat(idx) & ",") < 0:
+    return frameContinue()
+  inc gMatches
+  gLastMatchName = name
+  let cost = tierBytes(entryTier(idx))
+  if gResidentBytes + cost > gBudgetBytes:
+    inc gRefusedBudget
+    return frameContinue()
+  inc gWithinBudget
+
+  if gMode < ModeFull or not gCanUpload:
+    # Matched and within budget, but not uploading (match mode, or upload not
+    # available). The game keeps its stock texture; this is observable proof
+    # the match half works ahead of enabling pixels.
+    return frameContinue()
+
+  if buildAndSwap(idx, obj):
+    gResidentBytes = gResidentBytes + cost
+    inc gSwapped
+    if gSwapped <= 5'i64 or (gSwapped mod 25'i64) == 0'i64:
+      info "textures  swapped " & name & " (" & entryCat(idx) & ", " &
+           entryMap(idx) & "); resident " &
+           $(gResidentBytes div (1024'i64 * 1024'i64)) & " MB of " &
+           $(gBudgetBytes div (1024'i64 * 1024'i64)) & " MB"
+  elif not gUploadFailReported:
+    gUploadFailReported = true
+    warn "textures  the first upload of " & name & " did not take (LoadImage " &
+         "returned false or the file was unreadable); further failures are " &
+         "silent — the game keeps its stock texture"
   result = frameContinue()
 
 # --------------------------------------------------------------------------
@@ -495,21 +683,11 @@ proc maybeArm*(): bool =
   # a well-known type resolved, so gRt is loaded here.
   gArmTried = true
 
-  # THE CLAMP, stated in the log rather than discovered from zero matches.
-  #
-  # `match` and `full` both run through `GameObj.invoke("get_name")` on the
-  # returned asset, and `invoke` resolves by name. By-name resolution is dead
-  # on build 1.1.0.1.46777 — `findClass`/`findMethod` return non-nil handles
-  # into unmapped memory — so those rungs cannot work here whatever the config
-  # says. Running them anyway would produce a mod that hooks correctly,
-  # matches nothing, and looks like a bad manifest. Clamping and SAYING SO is
-  # the honest outcome; the rungs come back the moment name resolution does.
-  if gMode > ModeProbe:
-    warn "textures  mode " & $gMode & " (match/full) CLAMPED to probe: the " &
-         "name-lookup half needs by-name method resolution, which returns " &
-         "non-nil handles into unmapped memory on this build. The RVA hook " &
-         "itself is unaffected and still installs — it will count firings."
-    gMode = ModeProbe
+  # The name source, before anything that needs it. `match` and `full` both
+  # compare against a NAME table, so a mod that armed without one would match
+  # zero and look like a bad manifest. `resolveNameSource` refuses out loud.
+  if gMode >= ModeMatch:
+    resolveNameSource()
 
   if gMode >= ModeFull:
     probeUpload()
