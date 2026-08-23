@@ -79,6 +79,52 @@ A refusal is recoverable; a wrong-but-mapped address is the corruption the whole
 safety discipline exists to prevent. Duplicates that agree on the RVA collapse
 harmlessly and are kept.
 
+## SHARED RVAs: the inverse ambiguity, and the more dangerous one
+
+Dropping "one name -> two RVAs" (above) is only half the problem. The other half
+is **many names -> ONE RVA**, and the index used to say nothing about it.
+
+The IL2CPP backend folds identical compiled bodies, so unrelated methods in
+DIFFERENT images share an address. Measured on this build:
+`Diz.Resources.EasyAssets::get_System` and `BundlesManager::get_DownloadingUrl`
+BOTH resolve to 0x692A50 (`48 8B 41 28 C3` -- `mov rax,[rcx+0x28]; ret`), one
+of 338 method keys on that single address. 0x628110 -- recorded elsewhere as "ForceMeshUpdate, a stripped
+stub" -- is shared by 6438 methods: it is not ForceMeshUpdate's address at all,
+it is this build's universal `ret 0`.
+
+That address is technically CORRECT and catastrophic as a patch target: a detour
+there fires for every one of those call sites. This is exactly the
+confidently-wrong answer the ambiguity rule above exists to prevent, arriving
+from the other direction.
+
+So generation computes the RVA -> key-count distribution and writes it beside
+the index as `<out>.shared` (see `shared_sidecar`), and `lookup` prints
+
+    [SHARED: N methods resolve here -- hooking this fires for all of them]
+
+Sharedness stays in the SIDECAR, not in the `.idx`, and that is a deliberate
+choice re-taken after the type keys landed. The type keys could go in-format
+because they are new KEYS in an existing key/value table -- no struct change,
+no host change, so `abi/aowlspt_nameindex.h` was untouched. A per-entry shared
+FLAG is a different thing: it is a new field in the on-disk entry, which means
+format version 2 and a matching change to `abi/aowlspt_nameindex.h`, a file
+this change does not own. The `.idx` therefore stays version 1 and the host
+keeps parsing it unchanged.
+
+What the sidecar does NOT get to be is a second staleness story. It carries
+the SAME `imageKey`/`fileHash` stamp the index header carries, and `lookup`
+refuses a sidecar whose stamp disagrees -- printing "sharedness UNKNOWN"
+rather than an answer from a sidecar that belongs to another DLL. So there is
+still one stamp and one staleness answer, in two files.
+
+Teaching the host to REFUSE a shared RVA is still the right end state and is
+NOT done here.
+Recommended policy when it is: refuse a shared RVA for any PATCH target unless
+explicitly overridden, allow it for a read-only direct CALL. A call at a folded
+getter is still the right code for the receiver you pass it; a detour there is a
+write whose blast radius is every other method that folded onto it, and the host
+cannot tell them apart at runtime.
+
 ## Hash, and why a collision cannot survive generation
 
 Entries are `u64 primary hash` (FNV-1a-64), not verbatim names: 8.8 MB of names
@@ -114,7 +160,9 @@ this stamp narrows the window, it does not replace the check.
   il2cpp_nameindex.py gen    <GameAssembly.dll> <global-metadata.dec.dat> <out.idx>
   il2cpp_nameindex.py verify <GameAssembly.dll> <global-metadata.dec.dat>
   il2cpp_nameindex.py check  <GameAssembly.dll> <out.idx>
-  il2cpp_nameindex.py lookup <out.idx> <Ns.Type::Method> [arity]
+  il2cpp_nameindex.py lookup <out.idx> <Ns.Type::Method> [arity] [--refuse-shared]
+  il2cpp_nameindex.py shared <GameAssembly.dll> <global-metadata.dec.dat> [topN]
+        # the RVA -> key-count distribution and the worst offenders
   il2cpp_nameindex.py type   <out.idx> <Ns.Type>
   il2cpp_nameindex.py typename <out.idx> <Ns.Type>
 
@@ -395,6 +443,109 @@ def add_type_keys(R, exact, method_names):
         added += 1
     return dict(typekeys=added, typedropped=dropped, typeentries=scanned,
                 typedupes=dupe_collapsed, namekeys=namekeys)
+SHARED_MAGIC = "AOWLSHARED1"
+
+
+def is_method_key(k):
+    """True for a real method key -- NOT a `/*` alias, NOT a type-family key.
+
+    THIS PREDICATE IS THE WHOLE MERGE. Sharedness is a statement about CODE
+    addresses, and two other key families now live in this same index:
+
+      * `Ns.Type::@name/0` -> 1. That 1 is a presence TOKEN, not an address.
+        Counting it would report a single "RVA 0x1" shared by all ~26k type
+        names -- the largest and most confident wrong answer this tool could
+        produce, and it would sit at the top of `worst offenders`.
+      * `Ns.Type::@type/0` -> a static `Il2CppType` RVA in `.data`. Nobody
+        detours `.data`, and duplicate descriptor addresses are not folded
+        code; counting them would inflate the measured 28.3% with non-code.
+
+    Both families are excluded BY NAME, not by hoping their values fail to
+    alias a code RVA. `/*` aliases are excluded because they are the same
+    method as their `/N` key and would double-count it.
+    """
+    return not (k.endswith("/*") or TYPE_SUFFIX + "/" in k
+                or NAME_SUFFIX + "/" in k)
+
+
+def shared_map(keys):
+    """{rva: [key, ...]} for every RVA reached by MORE THAN ONE method key."""
+    by_rva = {}
+    for k, rva in keys.items():
+        if not is_method_key(k):
+            continue
+        by_rva.setdefault(rva, []).append(k)
+    return {r: sorted(v) for r, v in by_rva.items() if len(v) > 1}, len(by_rva)
+
+
+def shared_sidecar_path(idx_path):
+    return idx_path + ".shared"
+
+
+def write_shared_sidecar(path, shared, image_key, fhash, sample=8):
+    """Text, one RVA per line: `0xRVA <count> <up to `sample` key names>`.
+
+    Deliberately NOT inside the .idx: the .idx stays byte-identical to what the
+    current host parses (version 1). See the module docstring.
+    """
+    with open(path, "w", encoding="utf8") as f:
+        # THE SAME STAMP THE .idx CARRIES. A second file is a second
+        # staleness story unless it is pinned to the first; it is pinned
+        # here, and `lookup` treats a mismatch as "sharedness UNKNOWN"
+        # rather than answering out of a sidecar that no longer belongs
+        # to this DLL.
+        f.write("%s %d %016x %016x\n"
+                % (SHARED_MAGIC, len(shared), image_key, fhash))
+        for rva in sorted(shared, key=lambda r: (-len(shared[r]), r)):
+            ks = shared[rva]
+            f.write("0x%X %d %s\n" % (rva, len(ks), " ".join(ks[:sample])))
+
+
+def read_shared_sidecar(path, image_key=None, fhash=None):
+    """{rva: (count, [sample keys])}, or None when absent OR STALE."""
+    try:
+        f = open(path, encoding="utf8")
+    except OSError:
+        return None
+    with f:
+        first = f.readline().split()
+        if not first or first[0] != SHARED_MAGIC:
+            return None
+        if image_key is not None:
+            if len(first) < 4:
+                return None    # unstamped sidecar from an older gen
+            if (int(first[2], 16), int(first[3], 16)) != (image_key, fhash):
+                return None    # STALE: belongs to a different DLL
+        out = {}
+        for line in f:
+            parts = line.split()
+            if len(parts) < 2:
+                continue
+            out[int(parts[0], 16)] = (int(parts[1]), parts[2:])
+        return out
+
+
+def report_shared(shared, distinct, keys, top=10):
+    hist = {}
+    for v in shared.values():
+        hist[len(v)] = hist.get(len(v), 0) + 1
+    on_shared = sum(len(v) for v in shared.values())
+    exact = sum(1 for k in keys if is_method_key(k))
+    print("SHARED RVAs (one address, many methods -- the inverse of the "
+          "ambiguity that gets dropped):")
+    print("  distinct RVAs            %d" % distinct)
+    print("  RVAs reached by >1 key   %d (%.1f%%)"
+          % (len(shared), 100.0 * len(shared) / max(distinct, 1)))
+    print("  exact keys on a shared RVA %d of %d (%.1f%%)"
+          % (on_shared, exact, 100.0 * on_shared / max(exact, 1)))
+    print("  keys-per-shared-RVA histogram (count: how many RVAs):")
+    print("     " + "  ".join("%d:%d" % kv for kv in sorted(hist.items())[:10])
+          + ("  ... max %d" % max(hist)))
+    print("  worst offenders:")
+    for rva in sorted(shared, key=lambda r: -len(shared[r]))[:top]:
+        ks = shared[rva]
+        print("     0x%-9X %5d methods   e.g. %s" % (rva, len(ks),
+                                                     ", ".join(ks[:2])))
 
 
 def pack(keys, image_key, fhash):
@@ -588,6 +739,11 @@ def main():
         print("TYPE-NAME MEMBERSHIP KEYS (Ns.Type::@name/0 -> 1, what a klass "
               "name read from live memory is validated against): %d"
               % st["namekeys"])
+        shared, distinct = shared_map(keys)
+        side = shared_sidecar_path(out)
+        write_shared_sidecar(side, shared, ikey, fhash)
+        print("wrote %s: %d shared RVAs" % (side, len(shared)))
+        report_shared(shared, distinct, keys)
         b, n, _, _ = read_index(out)
         g = lambda k: idx_lookup(b, n, k)
         okm = cross_check(g, "from the emitted index")
@@ -628,15 +784,48 @@ def main():
         print("%s -> %s" % (key, ("static Il2CppType RVA 0x%X" % r) if r else
                             "NOT FOUND (absent, or ambiguous and dropped)"))
         sys.exit(0 if r else 1)
+    if cmd == "shared":
+        R = Resolver(sys.argv[2], sys.argv[3])
+        top = int(sys.argv[4]) if len(sys.argv) > 4 else 20
+        keys, _ = build_keys(R)
+        shared, distinct = shared_map(keys)
+        report_shared(shared, distinct, keys, top=top)
+        sys.exit(0)
 
     if cmd == "lookup":
-        b, n, _, _ = read_index(sys.argv[2])
-        spec = sys.argv[3]
-        key = spec + "/" + (sys.argv[4] if len(sys.argv) > 4 else "*")
+        argv = [a for a in sys.argv[2:] if not a.startswith("--")]
+        refuse = "--refuse-shared" in sys.argv[2:]
+        b, n, ikey, fh = read_index(argv[0])
+        spec = argv[1]
+        key = spec + "/" + (argv[2] if len(argv) > 2 else "*")
         r = idx_lookup(b, n, key)
         print("%s -> %s" % (key, ("0x%X" % r) if r is not None else
                             "NOT FOUND (absent, or ambiguous and therefore dropped)"))
-        sys.exit(0 if r is not None else 1)
+        if r is None:
+            sys.exit(1)
+        sh = read_shared_sidecar(shared_sidecar_path(argv[0]), ikey, fh)
+        if sh is None:
+            print("  [sharedness UNKNOWN -- %s is missing, unstamped, or "
+                  "belongs to a DIFFERENT DLL; re-run `gen` to get it. This "
+                  "is NOT a statement that the RVA is unshared.]"
+                  % shared_sidecar_path(argv[0]))
+            sys.exit(0)
+        hit = sh.get(r)
+        if hit:
+            cnt, sample = hit
+            print("  [SHARED: %d methods resolve here -- hooking this fires for "
+                  "all of them]" % cnt)
+            print("  others here: %s%s"
+                  % (", ".join(k for k in sample if k != key),
+                     " ..." if cnt > len(sample) else ""))
+            print("  A DIRECT CALL is still correct for the receiver you pass. "
+                  "A DETOUR is not: it is a write whose blast radius is all %d."
+                  % cnt)
+            if refuse:
+                sys.exit(2)
+        else:
+            print("  [not shared: this RVA is reached by this method only]")
+        sys.exit(0)
 
     sys.exit(__doc__)
 
