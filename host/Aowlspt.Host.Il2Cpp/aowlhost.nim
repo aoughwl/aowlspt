@@ -1331,6 +1331,19 @@ var gModeTextOn = false
 ## live trap currently self-rejecting `uxMenuModeText`. See `bindInspect`.
 var gInspSlot = -1
 
+## THE MODS TAB -- the FIFTH rider on `EFT.UI.PreloaderUI::Update`. Slot, flag
+## and the published live-tab pointer all live here rather than in
+## `modstab.nim`, because nimony forward-resolves procs across an `include`
+## boundary but NOT variables, and `patchFired`, the flag block and
+## `settingsui.nim` all sit above that include point.
+var gModsSlot = -1
+var gModsOn = false
+## The live `SettingsTab` the ShowScreen postfix last handed us, and its group
+## name. The mods tab is built by WALKING UP from this -- never from an offset
+## that can read null.
+var gModsLastTabPtr: Il2CppPtr = nil
+var gModsLastTabName = ""
+
 var gCodeGenProbeSlot = -1
   ## THE FOURTH RIDER on `EFT.UI.PreloaderUI::Update`, armed only by
   ## `codeGenAudit`. It exists to run the codeGen self-test ON THE UNITY MAIN
@@ -2997,7 +3010,7 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
   # be on at once over ONE detour and ONE trampoline. Its per-frame cost when
   # no command is queued is a single interlocked load (`aowl_insp_have`).
   if i == gDebugUiSlot or i == gModeTextSlot or i == gInspSlot or
-     i == gCodeGenProbeSlot:
+     i == gCodeGenProbeSlot or i == gModsSlot:
     if not gSharedRidersLoggedPf:
       gSharedRidersLoggedPf = true
       logSharedRiders("patchFired", i)
@@ -3009,6 +3022,10 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
       inspectFired(regs)
     if i == gCodeGenProbeSlot:
       codeGenProbeFired()
+    # THE MODS TAB, the fifth rider. Aliased onto whichever slot was claimed, so
+    # it costs one integer compare when it is off and never a second detour.
+    if i == gModsSlot:
+      modsTabTick()
     return 0'i32
   # The overlay's GameWorld cache: one register read, nothing walked, never a
   # suppression of RegisterPlayer.
@@ -3121,7 +3138,8 @@ proc patchReturned(slot: int32; regs: Il2CppPtr): int32 {.
   # POSTFIX slot -- so this is the only half that ever fires for it, and leaving
   # it out here would silently kill the inspector in precisely the arming order
   # (mode-text first, inspector second) that the multiplex exists to tolerate.
-  if i == gModeTextSlot or i == gDebugUiSlot or i == gInspSlot:
+  if i == gModeTextSlot or i == gDebugUiSlot or i == gInspSlot or
+     i == gModsSlot:
     if not gSharedRidersLoggedPr:
       gSharedRidersLoggedPr = true
       logSharedRiders("patchReturned", i)
@@ -3131,6 +3149,8 @@ proc patchReturned(slot: int32; regs: Il2CppPtr): int32 {.
       modeTextUpdateFired(regs)
     if i == gInspSlot:
       inspectFired(regs)
+    if i == gModsSlot:
+      modsTabTick()
     return 0'i32
   # Phase 1.5 native-settings control probe, by identity and for the same reason:
   # a host drain (meth == nil) whose whole point is to read AFTER the original
@@ -5303,6 +5323,13 @@ include "modetext.nim"
 ## thing available on the client side.
 include "inspect.nim"
 
+## THE MODS TAB -- a sixth tab in the game's own settings screen, with a row of
+## SUBTABS inside it, every widget of it a clone of one of the game's own. It is
+## included LAST because it stands on `inspect.nim`'s transform walkers,
+## `debugui.nim`'s guarded call primitives and `settingspages.nim`'s row
+## renderer. Default OFF (`settingsModsTab`).
+include "modstab.nim"
+
 proc bindCodeGenProbe(verbose: bool): bool =
   ## THE FOURTH RIDER on `EFT.UI.PreloaderUI::Update`, and the only reason it
   ## exists is to get `codeGenAuditSelfTest` onto Unity's main thread.
@@ -6486,6 +6513,28 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "not yet wired are suffixed '(not done yet)'. Nothing the GAME " &
          "created is ever written -- only clones the host made itself -- and " &
          "the whole thing shares the Phase-2 fault budget."
+  # THE MODS TAB (`settingsModsTab`). Default OFF. It is built from the live
+  # SettingsScreen, which this host only ever learns about through the
+  # ShowScreen postfix `settingsUiProbe` installs -- so, like Phase 2 and Phase
+  # 3, it turns that flag on with itself rather than declining for a reason
+  # nobody could see.
+  gModsOn = readBoolKey("settingsModsTab")
+  if gModsOn and not gSettingsUiProbe:
+    gSettingsUiProbe = true
+    info "settingsModsTab is set, so settingsUiProbe has been turned on with " &
+         "it -- the tab is built from the live SettingsScreen pointer that " &
+         "probe's ShowScreen postfix is what learns."
+  if gModsOn:
+    info "settingsModsTab is set: the host adds a SIXTH tab, MODS, to the " &
+         "game's own settings screen by cloning a stock tab button into " &
+         "SettingsScreen/Toggles and a stock panel beside the other five. " &
+         "Inside it, a row of SUBTABS cloned from the game's own tab strip " &
+         "switches between one page of settings per area, each page a set of " &
+         "cloned stock rows laid out by the stock layout group -- nothing is " &
+         "hand-positioned. It rides the existing PreloaderUI::Update detour " &
+         "(never a second one), needs one of debugUi/uxMenuModeText/" &
+         "liveInspector to have claimed that slot, and self-disables after " &
+         "four trapped faults. Open Settings -> Game once to build it."
   gMi2Probe = readBoolKey("managedInvokeProbe")
   if gMi2Probe:
     info "managedInvokeProbe is set: a POSTFIX detour on " &
@@ -6766,6 +6815,13 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       # three may have claimed the slot and this aliases onto it for free.
       if gCodeGenAudit:
         discard bindCodeGenProbe(true)
+
+      # THE MODS TAB (opt-in, `settingsModsTab`). Armed LAST of the five riders
+      # on `EFT.UI.PreloaderUI::Update`, so by here any of the other four may
+      # have claimed the slot and this aliases onto it for free. It never
+      # attaches a detour of its own.
+      if gModsOn:
+        discard bindModsTab(true)
 
   let modsDir = joinPath(gDir, "mods")
   # The runtime may not have come up, and that deliberately does not stop this:

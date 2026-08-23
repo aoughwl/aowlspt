@@ -37,7 +37,10 @@
         "anti-cheat:",
         "components EXPR [BaseType]",
         "SHARED RVA: ",
-        "SHAREDNESS IS UNKNOWN for this entry"
+        "SHAREDNESS IS UNKNOWN for this entry",
+    "mods tab: built -- a sixth tab button cloned into SettingsScreen/",
+    "mods tab armed as a RIDER on the existing EFT.UI.PreloaderUI::",
+    "settingsModsTab is set"
       ]
     },
     {

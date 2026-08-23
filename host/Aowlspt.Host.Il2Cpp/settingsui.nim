@@ -358,6 +358,12 @@ proc suiTabInitBody(a: Il2CppPtr): Il2CppPtr {.
         # the one that would own such a global.
         swOnTabBuilt(tabR, gnameR, true)
         swPagesOnTabBuilt(tabR, gnameR, true)
+        # PUBLISH THE LIVE TAB for the MODS tab, which is built by walking UP
+        # from it to the SettingsScreen. Published on the REVISIT path too, so
+        # a player who opens Settings on a tab we cannot clone from and then
+        # clicks Game still gets the tab built.
+        gModsLastTabPtr = tabR
+        gModsLastTabName = gnameR
     return cast[Il2CppPtr](1)
 
   let self = cast[Il2CppPtr](selfPtr)
@@ -415,6 +421,12 @@ proc suiTabInitBody(a: Il2CppPtr): Il2CppPtr {.
   # Same guard, same fault budget, same default-OFF discipline; it renders only
   # onto the Game tab and only when `settingsPages` is set.
   swPagesOnTabBuilt(tab, gname, false)
+  # The same publication on the first-build path. Unconditional: the MODS tab
+  # decides for itself whether this is a tab it can clone rows from, and a
+  # pointer published only when some other flag is on is exactly the kind of
+  # silent gate that made this feature ship doing nothing once already.
+  gModsLastTabPtr = tab
+  gModsLastTabName = gname
   return cast[Il2CppPtr](1)
 
 # The VEH/SEH guard thunk, the same mechanism botdiag/botcap use: `aowl_p_p_seh`
