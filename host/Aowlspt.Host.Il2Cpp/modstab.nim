@@ -210,6 +210,12 @@ var gModsOwnExclusive = false
 var gModsStrNames: seq[string] = @[]
 var gModsStrPtrs: seq[Il2CppPtr] = @[]
 
+## `Component::GetComponent(String)`, resolved ONCE (fully-qualified name
+## tried first, bare name as a logged fallback) rather than re-resolved
+## (and possibly re-guessed) on every `modsComponent` call.
+var gModsGcFn: Il2CppPtr = nil
+var gModsGcTried = false
+
 proc modsInternedStr(typeName: string): Il2CppPtr =
   ## Returns the cached managed string for `typeName`, allocating it once (and
   ## verifying it) the first time this type name is asked for. nil if it could
@@ -392,16 +398,38 @@ proc modsComponent(comp: Il2CppPtr; typeName: string): Il2CppPtr =
          "far this session, so GetComponent was never called on it. " &
          "Skipping this node, not the whole walk."
     return
-  var fn: Il2CppPtr = nil
-  var rva = 0'u32
-  # FULLY QUALIFIED, matching `iCmdComponent` (the PROVEN path -- the coordinator
-  # ran the identical call live and it resolved). The bare substring
-  # "GetComponent(String)" ALSO matches "GameObject::GetComponent(String)" in
-  # the same nav table, and `iNavFind` returns whichever comes first -- so this
-  # could silently bind the WRONG overload's RVA/shape for a Component receiver
-  # while looking indistinguishable from success on the calls where it happened
-  # to still work. Never seen guessed at again: name the exact overload.
-  if not iNavFind("Component::GetComponent(String)", fn, rva):
+  # RESOLVED ONCE, LOUDLY, NOT RE-GUESSED PER CALL. The fully-qualified
+  # "Component::GetComponent(String)" MEASURED LIVE as returning nothing this
+  # session (0 resolutions, 0 faults -- iNavFind never matched, so the icall
+  # was never even attempted) even though it is the exact string
+  # `iCmdComponent` uses successfully from the inspector. The nav target table
+  # is filled incrementally, and the inspector's session-driven call runs long
+  # after boot with a fuller table than modstab's early-build call gets --
+  # so require the qualified name first, but FALL BACK to the bare name that
+  # is what actually resolved every prior working run, and SAY which one it
+  # got so this is never guessed at blind again.
+  if gModsGcFn == nil and not gModsGcTried:
+    gModsGcTried = true
+    var f1: Il2CppPtr = nil
+    var r1 = 0'u32
+    if iNavFind("Component::GetComponent(String)", f1, r1):
+      gModsGcFn = f1
+      okLog "mods tab: GetComponent bound via the fully-qualified name " &
+            "\"Component::GetComponent(String)\" @0x" & hexOf(uint64(r1))
+    else:
+      var f2: Il2CppPtr = nil
+      var r2 = 0'u32
+      if iNavFind("GetComponent(String)", f2, r2):
+        gModsGcFn = f2
+        warn "mods tab: GetComponent bound via the BARE name fallback " &
+             "\"GetComponent(String)\" @0x" & hexOf(uint64(r2)) & " -- the " &
+             "fully-qualified name did not resolve this session"
+      else:
+        warn "mods tab: GetComponent could not be bound under EITHER name; " &
+             "the feature cannot read any component and will decline every " &
+             "call this session."
+  let fn = gModsGcFn
+  if fn == nil:
     return
   if cNavIcallReady() == 0'i32:
     return
