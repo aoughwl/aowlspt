@@ -32,7 +32,14 @@ const
   cModSetMaxMods = 16       ## bounds the fetch cycle, not the mods installed
   cModSetPollMs = 300       ## floored to 250 by `aowl_ov_sync_start` anyway
   cModSetMaxFaults = 4      ## faults across the whole feature, not per mod
-  cModSetStallMs = 5000'u64 ## no answer in this long on one step -> give up
+  cModSetStallMs = 8000'u64 ## no answer in this long on one step -> give up
+  ## Measured live (coordinator report): the worker took ~2.1s of
+  ## changeover latency before it fired the FIRST request for a newly
+  ## armed path, on top of its own ~375ms poll cadence -- the budget must
+  ## clear the changeover plus a few poll periods, not just the RTT of one
+  ## request. This is now a secondary safeguard: the primary fix is that
+  ## `takeModSet` no longer steals this step's answer (see `hostMain`),
+  ## which was the actual cause of every prior timeout.
 
 type
   ModSetPhase = enum
@@ -48,6 +55,8 @@ var gModSetPhase = msIdle
 var gModSetArmedAt = 0'u64
 var gModSetMods: seq[tuple[guid: string, name: string]] = @[]
 var gModSetIdx = 0
+var gModSetArmedAttempts = 0'i32  ## `overlaySyncAttempts()` read right after arming
+var gModSetInstrumentTicks = 0     ## logs raw slot state for the first few ticks of a step
 
 proc modSetParseF64(s: string; dflt: float64): float64 =
   ## A tiny, dependency-free float parse -- this file has no `strutils`
@@ -82,6 +91,16 @@ proc modSetParseF64(s: string; dflt: float64): float64 =
   result = whole + frac
   if neg:
     result = -result
+
+proc modSetOwnsSlot(): bool =
+  ## True while this feature has the shared GET slot armed for its own path
+  ## and has not yet handed it back -- `takeModSet` must not call
+  ## `overlaySyncTake` during this window, because the two share ONE
+  ## serial/taken cursor and whichever calls first on a given tick consumes
+  ## the body, leaving the other with nothing (see the call site in
+  ## `hostMain`).
+  gModSetOn and not gModSetOff and
+    (gModSetPhase == msIndex or gModSetPhase == msSchema)
 
 proc modSetFault(why: string) =
   gModSetFaults = gModSetFaults + 1
@@ -179,15 +198,39 @@ proc modSetTick(now: uint64) =
   of msIdle:
     gModSetPhase = msIndex
     gModSetArmedAt = now
+    gModSetArmedAttempts = overlaySyncAttempts()
+    gModSetInstrumentTicks = 0
     overlaySyncStart("/aowlspt/settings/index", int32(cModSetPollMs))
     okLog "mod settings render: borrowing the sync slot for " &
-          "/aowlspt/settings/index"
+          "/aowlspt/settings/index (worker attempt counter at arm: " &
+          $gModSetArmedAttempts & ")"
   of msIndex:
     let doc = overlaySyncTake()
+    let attempts = overlaySyncAttempts() - gModSetArmedAttempts
+    if gModSetInstrumentTicks < 20:
+      # Raw slot state for the first ~20 ticks of this step -- the ONLY way
+      # to tell "the worker has not gotten to this path yet" from "it has
+      # answered N times and something ate every one of them" without a
+      # debugger attached.
+      inc gModSetInstrumentTicks
+      okLog "mod settings render: index step, tick " & $gModSetInstrumentTicks &
+            ": worker attempts-since-arm=" & $attempts &
+            " pending=" & (if doc.len > 0: $doc.len else: "0") &
+            " ownsSlot=" & (if modSetOwnsSlot(): "true" else: "false")
     if doc.len == 0:
       if now - gModSetArmedAt > cModSetStallMs:
-        modSetFault("no answer for the settings index within " &
-                    $cModSetStallMs & "ms")
+        if attempts <= 0:
+          modSetFault("gave up on the settings index: the worker never " &
+                      "reported a body for this path within " &
+                      $cModSetStallMs & "ms (attempts-since-arm=0 -- this " &
+                      "is a changeover-latency problem, not a parse or " &
+                      "take() problem)")
+        else:
+          modSetFault("gave up on the settings index: the worker fired " &
+                      $attempts & " request(s) for this path but " &
+                      "overlaySyncTake() never returned a body here -- " &
+                      "something else is consuming the shared slot's " &
+                      "take cursor before this reads it")
         modSetFinish("gave up waiting for the index")
       return
     var items: seq[string] = @[]
@@ -212,14 +255,30 @@ proc modSetTick(now: uint64) =
     else:
       gModSetPhase = msSchema
       gModSetArmedAt = now
+      gModSetArmedAttempts = overlaySyncAttempts()
+      gModSetInstrumentTicks = 0
       overlaySyncStart("/aowlspt/settings/" & gModSetMods[0].guid,
                        int32(cModSetPollMs))
   of msSchema:
     let doc = overlaySyncTake()
+    let attempts = overlaySyncAttempts() - gModSetArmedAttempts
+    if gModSetInstrumentTicks < 20:
+      inc gModSetInstrumentTicks
+      okLog "mod settings render: schema step ('" & gModSetMods[gModSetIdx].guid &
+            "'), tick " & $gModSetInstrumentTicks &
+            ": worker attempts-since-arm=" & $attempts &
+            " pending=" & (if doc.len > 0: $doc.len else: "0")
     if doc.len == 0:
       if now - gModSetArmedAt > cModSetStallMs:
-        modSetFault("no answer for '" & gModSetMods[gModSetIdx].guid &
-                    "' schema within " & $cModSetStallMs & "ms")
+        if attempts <= 0:
+          modSetFault("gave up on '" & gModSetMods[gModSetIdx].guid &
+                      "': the worker never reported a body for this path " &
+                      "within " & $cModSetStallMs & "ms (attempts-since-" &
+                      "arm=0 -- changeover latency, not a take() problem)")
+        else:
+          modSetFault("gave up on '" & gModSetMods[gModSetIdx].guid &
+                      "': the worker fired " & $attempts & " request(s) " &
+                      "but overlaySyncTake() never returned a body here")
         # Give up on THIS mod, not the whole cycle -- one unreachable mod
         # should not cost the others their page.
         gModSetIdx = gModSetIdx + 1
@@ -227,6 +286,8 @@ proc modSetTick(now: uint64) =
           modSetFinish("cycle finished (with at least one stall)")
         else:
           gModSetArmedAt = now
+          gModSetArmedAttempts = overlaySyncAttempts()
+          gModSetInstrumentTicks = 0
           overlaySyncStart("/aowlspt/settings/" & gModSetMods[gModSetIdx].guid,
                            int32(cModSetPollMs))
       return
@@ -243,6 +304,8 @@ proc modSetTick(now: uint64) =
       modSetFinish("cycle finished, " & $gModSetMods.len & " mod page(s)")
     else:
       gModSetArmedAt = now
+      gModSetArmedAttempts = overlaySyncAttempts()
+      gModSetInstrumentTicks = 0
       overlaySyncStart("/aowlspt/settings/" & gModSetMods[gModSetIdx].guid,
                        int32(cModSetPollMs))
 

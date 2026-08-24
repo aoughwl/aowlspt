@@ -343,6 +343,7 @@ static int32_t aowl_ov_frame_ns_max(void);
 static void    aowl_ov_sync_start(const char* path, int32_t intervalMs);
 static int32_t aowl_ov_sync_pending(void);
 static int32_t aowl_ov_sync_take(char* out, int32_t cap);
+static int32_t aowl_ov_sync_attempts(void);
 
 /* The write leg. `aowl_ov_post_start` arms one path+body; the worker sends it
  * on its own thread (never the caller's) and `aowl_ov_post_take` returns the
@@ -862,6 +863,16 @@ typedef struct AowlOvState {
     int32_t syncLen;
     int32_t syncSerial;                 /* bumped on every successful fetch */
     int32_t syncTaken;                  /* the serial the host last read */
+    int32_t syncAttempts;               /* bumped every time the worker FIRES a
+                                          * request for the current syncPath,
+                                          * success or failure -- lets a caller
+                                          * tell "the worker has not gotten to
+                                          * my path yet" from "it has tried and
+                                          * something else is wrong". Never
+                                          * reset by `sync_start`: it is a
+                                          * monotonic counter, and the caller
+                                          * is expected to diff against the
+                                          * value it read right after arming. */
 
     /* --- the one-shot POST slot (host->backend write leg) ---
      * Single-slot, like the GET feed above: `postArm` names one path+body the
@@ -2519,6 +2530,13 @@ static DWORD WINAPI aowl_ov_worker(LPVOID unused) {
                 int32_t rc;
                 sinceSync = 0;
                 rc = aowl_ov_http(L"GET", wpath, NULL, buf, (int32_t)sizeof(buf));
+                /* Bumped for THIS fetch regardless of outcome -- it answers
+                 * "has the worker gotten to my path at all", not "did it
+                 * succeed". `sync_start` never resets it, so a caller diffs
+                 * against the value it read right after arming. */
+                EnterCriticalSection(&g_ov.cs);
+                g_ov.syncAttempts++;
+                LeaveCriticalSection(&g_ov.cs);
                 /* Published only when there is a whole plausible body. A
                  * failure, an empty answer or a deflated one leaves the
                  * previous serial alone, so the host does exactly what it was
@@ -2611,6 +2629,15 @@ static int32_t aowl_ov_sync_pending(void) {
     int32_t n = 0;
     EnterCriticalSection(&g_ov.cs);
     if (g_ov.syncSerial != g_ov.syncTaken) n = g_ov.syncLen;
+    LeaveCriticalSection(&g_ov.cs);
+    return n;
+}
+
+static int32_t aowl_ov_sync_attempts(void) {
+    if (!g_ov.started) return 0;
+    int32_t n;
+    EnterCriticalSection(&g_ov.cs);
+    n = g_ov.syncAttempts;
     LeaveCriticalSection(&g_ov.cs);
     return n;
 }

@@ -63,6 +63,7 @@ proc cOvSyncStart(path: cstring; intervalMs: int32) {.
 proc cOvSyncPending(): int32 {.importc: "aowl_ov_sync_pending", nodecl.}
 proc cOvSyncTake(buf: ptr char; cap: int32): int32 {.
   importc: "aowl_ov_sync_take", nodecl.}
+proc cOvSyncAttempts(): int32 {.importc: "aowl_ov_sync_attempts", nodecl.}
 proc cOvPostStart(path: cstring; body: cstring) {.
   importc: "aowl_ov_post_start", nodecl.}
 proc cOvPostPending(): int32 {.importc: "aowl_ov_post_pending", nodecl.}
@@ -228,6 +229,14 @@ proc overlayPostTake*(): tuple[got: bool, ok: bool, body: string] =
   while i < int(n):
     result.body.add buf[i]
     inc i
+
+proc overlaySyncAttempts*(): int32 =
+  ## How many times the worker has FIRED a fetch for whatever path is
+  ## currently armed, success or failure -- never reset by
+  ## `overlaySyncStart`, so a caller diffs against the value it read right
+  ## after arming to tell "the worker has not gotten to my path yet" from
+  ## "it tried and something else ate the answer".
+  cOvSyncAttempts()
 
 proc overlaySetPrePresent*(fn: pointer) =
   ## Register a callback the overlay invokes at the top of its Present hook,
