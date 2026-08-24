@@ -79,12 +79,21 @@ const PageHtml = """<!doctype html>
   .saved { color:#6fbf6f; font-size:11px; margin-left:8px; opacity:0; transition:opacity .2s; }
   .saved.show { opacity:1; }
   #status { color:#888; padding:10px 0; }
+  button.reset-row { background:#262626; color:#aaa; border:1px solid #383838; border-radius:4px; padding:4px 9px; font-size:11px; cursor:pointer; }
+  button.reset-row:hover { background:#333; color:#eee; }
+  #titlebar { display:flex; align-items:center; justify-content:space-between; margin:0 0 18px; }
+  #titlebar h1 { margin:0; }
+  #resetAll { background:#4a2626; color:#e0a0a0; border:1px solid #5a3030; border-radius:4px; padding:6px 12px; font-size:12px; cursor:pointer; }
+  #resetAll:hover { background:#5a2e2e; }
 </style>
 </head>
 <body>
 <nav id="nav"><div id="status">loading&hellip;</div></nav>
 <main>
-  <h1 id="title">aowlspt &mdash; fallback settings UI</h1>
+  <div id="titlebar">
+    <h1 id="title">aowlspt &mdash; fallback settings UI</h1>
+    <button id="resetAll" style="display:none">Reset everything to default</button>
+  </div>
   <div id="body">Pick a mod on the left. This page reads and writes the exact
   same <code>/aowlspt/settings/&lt;guid&gt;</code> endpoint the native F12
   screen uses &mdash; see <code>docs/UI-API.md</code> for the surface.</div>
@@ -153,6 +162,13 @@ async function loadPage(guid) {
   const body = document.getElementById('body');
   body.innerHTML = '';
   document.getElementById('title').textContent = guid;
+  const resetAll = document.getElementById('resetAll');
+  resetAll.style.display = '';
+  resetAll.onclick = async () => {
+    if (!confirm('Reset every setting on this page to its default? This discards everything you have set for ' + guid + '.')) return;
+    const reply = await apiPost('/aowlspt/settings/' + encodeURIComponent(guid) + '/reset', {});
+    if (Array.isArray(reply)) loadPage(guid);
+  };
   let lastCat = null;
   (Array.isArray(rows) ? rows : []).forEach(row => {
     if ((row.category || '') !== lastCat) {
@@ -184,6 +200,16 @@ async function loadPage(guid) {
     });
     ctl.appendChild(saved);
     r.appendChild(ctl);
+    const resetBtn = document.createElement('button');
+    resetBtn.className = 'reset-row';
+    resetBtn.textContent = 'Reset';
+    resetBtn.title = 'Reset this to default';
+    resetBtn.onclick = async () => {
+      const reply = await apiPost('/aowlspt/settings/' + encodeURIComponent(guid) + '/reset',
+        {key: row.key});
+      if (Array.isArray(reply)) loadPage(guid);
+    };
+    r.appendChild(resetBtn);
     body.appendChild(r);
   });
   if (!rows || !rows.length) {

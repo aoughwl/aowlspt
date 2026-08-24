@@ -504,9 +504,14 @@ proc onMoreBotsSettings(url, body, session: string): string =
     discard applySettingFromBody(body)
   result = declaredSchemaJson().text
 
+proc onMoreBotsSettingsReset(url, body, session: string): string =
+  discard resetFromBody(body)
+  result = declaredSchemaJson().text
+
 proc registerRoutes() =
   declareSettings(moreBotsSchema())
   discard serve("/aowlspt/settings/" & ModGuid, onMoreBotsSettings)
+  discard serve("/aowlspt/settings/" & ModGuid & "/reset", onMoreBotsSettingsReset)
   discard serve("/morebotsapi/getfactions", onGetFactions)
   discard serve("/morebotsapi/getrevenges", onGetRevenges)
   discard serve("/morebotsapi/updaterevenge", onUpdateRevenge)

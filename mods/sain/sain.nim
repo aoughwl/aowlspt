@@ -1190,9 +1190,14 @@ proc onSainSettings(url, body, session: string): string =
     discard applySettingFromBody(body)
   result = declaredSchemaJson().text
 
+proc onSainSettingsReset(url, body, session: string): string =
+  discard resetFromBody(body)
+  result = declaredSchemaJson().text
+
 proc onLoad(): Status =
   declareSettings(sainSchema())
   discard serve("/aowlspt/settings/aowl.sain", onSainSettings)
+  discard serve("/aowlspt/settings/aowl.sain/reset", onSainSettingsReset)
   gPreset = loadPreset()
   if not gPreset.enabled:
     warn "sain: disabled in config.json"

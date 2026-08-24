@@ -282,3 +282,66 @@ proc applySettingFromBody*(body: string): Status =
   if key.len == 0:
     return ErrBadArg
   result = applySetting(key, v.raw)
+  if result != Ok:
+    # The route handler's contract is "reply with the schema regardless" (see
+    # the docstring above), which means a failed persist and a successful one
+    # produce the same 200 with a JSON array either way -- the "renders but
+    # changes nothing" shape this whole change exists to stop being silent.
+    # The host log is the one channel left that can say so without changing
+    # that wire shape.
+    warn "settings: POST for \"" & key & "\" did not persist (status " &
+         $result & ") -- the reply still echoes the schema, unchanged"
+
+# ---------------------------------------------------------------------------
+# Reset to declared default
+# ---------------------------------------------------------------------------
+#
+# The schema is the one place a default lives (`Setting.defaultJson`, filled
+# in by every `xSetting` builder above). A reset writes that same literal back
+# through `applySetting` -- the identical write path a normal edit takes, key
+# creation included -- so a reset can never drift from an edit's idea of what
+# "default" means, and a reset on a key `config.json` has never held (this
+# module's whole bug) works for exactly the same reason the fix above does.
+
+proc findDeclared(key: string): int =
+  ## Index into `gDeclared` of `key`, or -1. Declared once per mod and short
+  ## (single digits to a few dozen rows), so a linear scan costs nothing next
+  ## to the file write that follows it.
+  result = -1
+  for i, s in gDeclared:
+    if s.key == key:
+      return i
+
+proc resetSetting*(key: string): Status =
+  ## Reset one declared key to the value its builder call declared as
+  ## `default`. `ErrNotFound` for a key this mod never declared -- resetting
+  ## an unknown key is not "no-op successfully", it is "there is nothing to
+  ## reset", and the caller should see that rather than a silent 200.
+  let i = findDeclared(key)
+  if i < 0:
+    return ErrNotFound
+  result = applySetting(key, gDeclared[i].defaultJson)
+
+proc resetAllSettings*(): Status =
+  ## Reset every declared key of this mod to its default. Stops at the first
+  ## failure and reports that key's status -- a partial reset with no
+  ## indication of where it stopped would be worse than refusing outright.
+  result = Ok
+  for s in gDeclared:
+    let st = applySetting(s.key, s.defaultJson)
+    if st != Ok:
+      warn "settings: reset of \"" & s.key & "\" did not persist (status " &
+           $st & ")"
+      return st
+
+proc resetFromBody*(body: string): Status =
+  ## The body a reset POST may carry: `{"key":"<configKey>"}` resets that one
+  ## key; an empty body (no `key` field, or an empty body entirely) resets
+  ## every key this mod declared. Mirrors `applySettingFromBody`'s shape.
+  let k = field(body, "key")
+  if body.len == 0 or not k.exists:
+    return resetAllSettings()
+  let key = k.asText("")
+  if key.len == 0:
+    return resetAllSettings()
+  result = resetSetting(key)

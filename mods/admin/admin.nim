@@ -131,6 +131,11 @@ proc onAdminSettings(url, body, session: string): string =
     applyConfigToggles()
   result = declaredSchemaJson().text
 
+proc onAdminSettingsReset(url, body, session: string): string =
+  if resetFromBody(body) == Ok:
+    applyConfigToggles()
+  result = declaredSchemaJson().text
+
 # ---------------------------------------------------------------------------
 # Capability -- what the mod could actually arm, so the menu is honest
 # ---------------------------------------------------------------------------
@@ -199,6 +204,7 @@ proc onLoad(): Status =
   applyConfigToggles()
   declareSettings(adminSchema())
   discard serve("/aowlspt/settings/" & ModGuid, onAdminSettings)
+  discard serve("/aowlspt/settings/" & ModGuid & "/reset", onAdminSettingsReset)
 
   if side() == sideClient:
     info ModName & " " & ModVersion &

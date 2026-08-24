@@ -315,9 +315,16 @@ proc onClassicMovementSettings(url, body, session: string): string =
     loadConfig()
   result = declaredSchemaJson().text
 
+proc onClassicMovementSettingsReset(url, body, session: string): string =
+  if resetFromBody(body) == Ok:
+    loadConfig()
+  result = declaredSchemaJson().text
+
 proc serverLoad(): Status =
   declareSettings(classicMovementSchema())
   discard serve("/aowlspt/settings/" & ModGuid, onClassicMovementSettings)
+  discard serve("/aowlspt/settings/" & ModGuid & "/reset",
+                onClassicMovementSettingsReset)
   if serve(ConfigRoute, onGetConfig) != Ok:
     error "could not register " & ConfigRoute & ": " & lastError()
     return ErrGeneric

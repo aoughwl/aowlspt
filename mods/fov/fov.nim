@@ -457,6 +457,11 @@ proc onFovSettings(url, body, session: string): string =
     loadConfig()
   result = declaredSchemaJson().text
 
+proc onFovSettingsReset(url, body, session: string): string =
+  if resetFromBody(body) == Ok:
+    loadConfig()
+  result = declaredSchemaJson().text
+
 # ---------------------------------------------------------------------------
 # The magnification -> sensitivity table
 # ---------------------------------------------------------------------------
@@ -2048,6 +2053,7 @@ proc onLoad(): Status =
   loadConfig()
   declareSettings(fovSchema())
   discard serve("/aowlspt/settings/" & ModGuid, onFovSettings)
+  discard serve("/aowlspt/settings/" & ModGuid & "/reset", onFovSettingsReset)
   success ModName & " " & ModVersion & " loaded on " & hostName()
   if side() == sideSim:
     return simSelfTest()
