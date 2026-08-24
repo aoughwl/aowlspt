@@ -104,6 +104,14 @@ const ModsMaxFaults = 4
 const ModsOffIsOn = 0x120'i32
 const ModsOffGroup = 0x110'i32
 
+## `UnityEngine.UI.LayoutElement` -- from the field table
+## (`il2cpp_resolve.py fields UnityEngine.UI.LayoutElement`), never guessed.
+## Unity's sentinel for "not set" on any of these is a negative value (-1);
+## anything >= 0 actively constrains a `LayoutGroup`'s sizing pass.
+const ModsOffLeMinHeight = 0x28'i32
+const ModsOffLePreferredHeight = 0x30'i32
+const ModsOffLeFlexibleHeight = 0x38'i32
+
 ## At most this many subtabs. A cap, not an expectation: it bounds how many
 ## Unity objects a bad page table could instantiate into a live screen.
 const ModsMaxSubtabs = 5
@@ -886,9 +894,21 @@ proc modsRestoreStockPanels() =
   ## Put back exactly what `modsHideStockPanels` took away. Without this,
   ## leaving MODS for a stock tab can leave the screen blank: the game's own tab
   ## switch never knew we had switched a panel off.
+  ##
+  ## NEVER MORE THAN ONE. If `gModsHidden` holds more than one entry, more than
+  ## one stock panel was ALREADY active at once before MODS ever touched the
+  ## screen (measured: the postfx subtab leaving Graphics Settings AND PostFX
+  ## Settings both active is exactly how this happens) -- restoring every entry
+  ## would just re-create that inconsistency, one tab switch later and harder to
+  ## explain. Keep the first (screenT child order) and leave the rest hidden;
+  ## the steady state this asserts is exactly one active stock panel.
+  if gModsHidden.len > 1:
+    warn "mods tab: " & $gModsHidden.len & " stock panel(s) were active " &
+         "together when MODS hid them; restoring only the first so the " &
+         "steady state is exactly one active panel, not a pile-up"
   var i = 0
   while i < gModsHidden.len and i < ModsMaxHidden:
-    discard modsSetActive(gModsHidden[i], true)
+    discard modsSetActive(gModsHidden[i], i == 0)
     i = i + 1
   gModsHidden = @[]
 
@@ -2123,6 +2143,54 @@ proc gfxBuildStrip(panelT, donorStripGo, donorButtonGo, donorButtonT: Il2CppPtr;
            "than shipping it in the wrong place."
       discard modsSetActive(strip, false)
       return
+  # SIZE TO CONTENT, NOT TO THE DONOR. `donorStripGo` is `Control Settings/
+  # Toggles`, a VerticalLayoutGroup sized (via its own `LayoutElement`, if it
+  # carries one) to hold that panel's WHOLE checkbox list -- a size the clone
+  # inherits VERBATIM, because a `LayoutElement`'s min/preferred/flexible
+  # fields are ordinary serialized floats that Instantiate does not
+  # recompute. Left alone, that reserves the donor's full height inside a
+  # two-button strip and reads as "the settings start half way down the
+  # panel". MEASURED, not guessed: read first, and only reset a field that is
+  # actually a positive constraint (Unity's "unset" sentinel is negative).
+  let stripLe = modsComponent(stripT, "LayoutElement")
+  if stripLe != nil and duOk(stripLe, ModsOffLeFlexibleHeight + 4'i32):
+    var reset = 0
+    let minH = cReadF32At(duPtrAdd(stripLe, ModsOffLeMinHeight))
+    let prefH = cReadF32At(duPtrAdd(stripLe, ModsOffLePreferredHeight))
+    let flexH = cReadF32At(duPtrAdd(stripLe, ModsOffLeFlexibleHeight))
+    if minH >= 0.0:
+      discard cDuWriteF32(stripLe, ModsOffLeMinHeight, -1.0)
+      reset = reset + 1
+    if prefH >= 0.0:
+      discard cDuWriteF32(stripLe, ModsOffLePreferredHeight, -1.0)
+      reset = reset + 1
+    if flexH > 0.0:
+      discard cDuWriteF32(stripLe, ModsOffLeFlexibleHeight, 0.0)
+      reset = reset + 1
+    if reset > 0:
+      okLog "postfx subtab: " & iObjName(panelT) & "'s strip inherited a " &
+            "LayoutElement sized for the donor's full checkbox list (min=" &
+            $minH & " preferred=" & $prefH & " flexible=" & $flexH &
+            "); reset " & $reset & " field(s) to Unity's unset sentinel so " &
+            "the panel's layout group sizes it to its own two buttons."
+  # THE GROUP QUESTION, MEASURED PER STRIP (the two buttons made just above),
+  # exactly the check `modsBuildSubtabs` uses -- same donor, same question.
+  # Native means the game's own ToggleGroup logic runs the strip; anything
+  # else means exclusivity stays OURS, which `gfxApply`/`gfxTickBody` already
+  # enforce every frame with `SetIsOnWithoutNotify`, so a "not native" result
+  # here is a fact to log, not a missing feature.
+  if into.len == 2 and duOk(into[0], ModsOffGroup + 8'i32) and
+     duOk(into[1], ModsOffGroup + 8'i32):
+    let g0 = cReadPtrAt(into[0], ModsOffGroup)
+    let g1 = cReadPtrAt(into[1], ModsOffGroup)
+    okLog "postfx subtab: " & iObjName(panelT) & "'s strip toggle group " &
+          "check -> GRAPHICS m_Group=" & iPtr(g0) & " POSTFX m_Group=" &
+          iPtr(g1) & "; exclusivity is " &
+          (if g0 != nil and g0 == g1: "NATIVE (both point at the same " &
+             "cloned ToggleGroup, so the game's own group logic runs the " &
+             "strip)"
+           else: "OURS (no shared cloned group; enforced every frame by " &
+             "gfxApply/gfxTickBody instead)")
   result = true
 
 proc gfxApply(sel: int) =
@@ -2154,6 +2222,25 @@ proc gfxApply(sel: int) =
           "panel is cloned and neither is written to -- only its active state " &
           "is driven, which is the one thing the game will not do for us, " &
           "because it switches panels by ESettingsGroup."
+
+proc gfxSeedSelection() =
+  ## Seed the STRIP's own visual state to GRAPHICS SETTINGS selected -- and
+  ## ONLY the strip. `SetIsOnWithoutNotify` on our own clones, never
+  ## `SetActive` on a stock panel: that split is the whole fix for DEFECT A
+  ## (see `gfxBuild`) without reintroducing it. Without this the strip shows
+  ## NEITHER button selected on first open even though the game itself is
+  ## already showing Graphics Settings by default, which is exactly "should
+  ## be enabled/active by default" read backwards.
+  var i = 0
+  while i < 2:
+    let want = (i == 0)
+    if i < gGfxTogA.len:
+      discard modsSetToggleQuiet(gGfxTogA[i], want)
+    if i < gGfxTogB.len:
+      discard modsSetToggleQuiet(gGfxTogB[i], want)
+    if i < gGfxLast.len:
+      gGfxLast[i] = want
+    i = i + 1
 
 proc gfxBuild(): bool =
   result = false
@@ -2262,6 +2349,11 @@ proc gfxBuild(): bool =
   # Game Settings, with our strip drawn over the wrong panel. Panel
   # visibility is driven only by `gfxTickBody`'s steady-state checks, and
   # only once the game itself has actually put one of the two panels up.
+  #
+  # THE STRIP'S OWN SELECTED STATE IS A DIFFERENT CONCERN, and forcing a
+  # panel active was never required to seed it: `gfxSeedSelection` writes
+  # only to toggles WE cloned, never to a stock panel's active state.
+  gfxSeedSelection()
   result = true
 
 proc gfxTickBody() =
