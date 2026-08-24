@@ -2080,20 +2080,40 @@ proc main(): int =
     #     loop actually gets to retry on its own 3s cadence; only the final
     #     click, once the screen is confirmed up, uses the longer pinned
     #     timeout.
-    var u = initUi(root, 5000, false)
+    # FOUND (this is the actual bug, not a tuning problem): `runBatch`'s
+    # timeout logic is `if t <= 0 or u.timeoutPinned: t = u.timeoutMs` --
+    # meaning an UNPINNED `Ui.timeoutMs` is only a FLOOR the call can raise,
+    # never a ceiling the caller enforces. `roots()`/`children()`/`actives()`
+    # (which `screens()` calls) each pass their OWN hardcoded suggestion
+    # (60000/40000/60000ms) as `runBatch`'s `timeoutMs` argument, and since
+    # my previous `initUi(root, 5000, false)` left `timeoutPinned = false`,
+    # every one of those suggestions WON over my 5s, each retried 3x
+    # internally -- so a single `screens()` call could legitimately block
+    # for minutes, exactly matching "one 'before' line, no 'after', ~280s
+    # gone". `pinned = true` is what actually forces `Ui.timeoutMs` to win.
+    var u = initUi(root, 5000, true)
     var waitTries = 0
     var screenUp = false
     var waitErr = ""
+    let waitStart = cNowMs()
     discard writeTextFile(verdictPath,
       "auto-enter: before screen-wait loop\n")
-    while waitTries < 50 and not screenUp:  # up to ~150s of ACTUAL waiting
+    # The bound is WALL-CLOCK, not "N attempts", so a call that runs long
+    # despite the pin still cannot keep this looping past 150s.
+    while cNowMs() - waitStart < 150000'i64 and not screenUp:
       var ss = default(ScreenSet)
+      var active = triUnknown
       if screens(u, "Menu UI", ss):
         for sc in ss.screens:
-          if sc.name == "CharacterSelectionScreen" and sc.active == triYes:
-            screenUp = true
+          if sc.name == "CharacterSelectionScreen":
+            active = sc.active
+            if sc.active == triYes: screenUp = true
       else:
         waitErr = u.lastErr
+      discard writeTextFile(verdictPath,
+        "auto-enter: wait iter " & $waitTries & " elapsed=" &
+        $(cNowMs() - waitStart) & "ms active=" & $active &
+        " err=" & waitErr & "\n")
       if not screenUp:
         cSleepMs 3000
         inc waitTries
