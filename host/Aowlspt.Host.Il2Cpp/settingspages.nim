@@ -391,6 +391,21 @@ proc swRowContainerGo(tabPtr: Il2CppPtr; why: var string): Il2CppPtr =
           (if fnTr != nil: "OK" else: "REJECTED") & " get_parent=" &
           (if fnPar != nil: "OK" else: "REJECTED") & ")"
     return
+  # THE FAKE-NULL GATE. `cIsReadable` proves the pointer is mapped memory of
+  # the right SIZE; it proves nothing about whether the object is a live
+  # Unity object. `Component::get_gameObject`, `GameObject::get_transform`
+  # and `Transform::get_parent` are IL2CPP internal-call wrappers that
+  # dereference `m_CachedPtr` at +0x10 -- and when the native half has been
+  # destroyed (Unity's "fake null": readable managed memory, compares equal
+  # to null, but the C++ object behind it is gone) that deref faults INSIDE
+  # Unity's own code, past every guard `cIsReadable` can offer. `iUnityAlive`
+  # (the identical check `inspect.nim`/`modstab.nim` already use for exactly
+  # this trap) is the only thing that catches it before the call is made.
+  if not iUnityAlive(control):
+    why = "control=0x" & hexOf(cast[uint64](control)) &
+          " is readable but its native half is gone (fake null); " &
+          "Component::get_gameObject would fault on it"
+    return
   swCrumbP("STAGE: swRowContainerGo -- Component::get_gameObject(control)",
            control)
   let rowGo = cMi2CallPP(fnGo, control)
@@ -399,11 +414,21 @@ proc swRowContainerGo(tabPtr: Il2CppPtr; why: var string): Il2CppPtr =
           hexOf(cast[uint64](control)) & ") gave 0x" &
           hexOf(cast[uint64](rowGo)) & ", which is not readable"
     return
+  if not iUnityAlive(rowGo):
+    why = "rowGo=0x" & hexOf(cast[uint64](rowGo)) &
+          " is readable but its native half is gone (fake null); " &
+          "GameObject::get_transform would fault on it"
+    return
   swCrumbP("STAGE: swRowContainerGo -- GameObject::get_transform(rowGo)", rowGo)
   let rowT = cMi2CallPP(fnTr, rowGo)
   if rowT == nil or cIsReadable(rowT, 0x20'i32) == 0'i32:
     why = "GameObject::get_transform(rowGo=0x" & hexOf(cast[uint64](rowGo)) &
           ") gave 0x" & hexOf(cast[uint64](rowT)) & ", which is not readable"
+    return
+  if not iUnityAlive(rowT):
+    why = "rowT=0x" & hexOf(cast[uint64](rowT)) &
+          " is readable but its native half is gone (fake null); " &
+          "Transform::get_parent would fault on it"
     return
   swCrumbP("STAGE: swRowContainerGo -- Transform::get_parent(rowT)", rowT)
   let contT = cDuCallPP(fnPar, rowT)
@@ -411,6 +436,11 @@ proc swRowContainerGo(tabPtr: Il2CppPtr; why: var string): Il2CppPtr =
     why = "Transform::get_parent(rowT=0x" & hexOf(cast[uint64](rowT)) &
           ") gave 0x" & hexOf(cast[uint64](contT)) &
           " -- the row appears to have no parent, which cannot be right"
+    return
+  if not iUnityAlive(contT):
+    why = "containerT=0x" & hexOf(cast[uint64](contT)) &
+          " is readable but its native half is gone (fake null); " &
+          "Component::get_gameObject would fault on it"
     return
   swCrumbP("STAGE: swRowContainerGo -- Component::get_gameObject(contT)", contT)
   let contGo = cMi2CallPP(fnGo, contT)
@@ -540,6 +570,11 @@ proc swCloneRow(donor, parentGo: Il2CppPtr; text: string): Il2CppPtr =
   let fnInst = mi2Fn(Mi2Instantiate)
   if fnInst == nil or donor == nil:
     return
+  if not iUnityAlive(donor):
+    warn "settings pages: donor=0x" & hexOf(cast[uint64](donor)) &
+         " is readable but its native half is gone (fake null); row '" &
+         text & "' is skipped rather than Instantiate()d off it"
+    return
   swCrumbP("Object::Instantiate(donor) for row '" & text & "' donor", donor)
   let clone = cMi2CallPS1(fnInst, donor)
   if clone == nil or cIsReadable(clone, cSuiOffCtrlValue() + 8'i32) == 0'i32:
@@ -554,6 +589,11 @@ proc swCloneRow(donor, parentGo: Il2CppPtr; text: string): Il2CppPtr =
          "(get_gameObject=" & (if fnGo != nil: "OK" else: "REJECTED") &
          " parentGo=0x" & hexOf(cast[uint64](parentGo)) &
          "); the clone is left unparented and is NOT drawn"
+  elif not iUnityAlive(clone):
+    warn "settings pages: the clone for row '" & text & "' (0x" &
+         hexOf(cast[uint64](clone)) & ") is readable but its native half " &
+         "is gone (fake null) right after Instantiate; left unparented " &
+         "and NOT drawn"
   else:
     swCrumbP("Component::get_gameObject(clone) for row '" & text & "' clone",
              clone)
@@ -561,6 +601,10 @@ proc swCloneRow(donor, parentGo: Il2CppPtr; text: string): Il2CppPtr =
     if cloneGo == nil:
       warn "settings pages: Component::get_gameObject on the clone for row '" &
            text & "' returned null; it cannot be parented or shown"
+    elif not iUnityAlive(cloneGo):
+      warn "settings pages: cloneGo=0x" & hexOf(cast[uint64](cloneGo)) &
+           " for row '" & text & "' is readable but its native half is " &
+           "gone (fake null); it cannot be parented or shown"
     else:
       let fnPar = mi2Fn(Mi2SetParentAlign)
       if fnPar != nil:
