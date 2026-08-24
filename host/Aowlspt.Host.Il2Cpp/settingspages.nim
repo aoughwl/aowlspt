@@ -146,6 +146,35 @@ const cSwNotDone = "  (not done yet)"
 ## 30) -- still a bound, not a target.
 const cSwMaxRows = 48
 
+## Sanity bounds for a row that came off the wire (`modsettingsrender.nim`
+## parses `/aowlspt/settings/<guid>` -- an HTTP response from whatever the mod
+## author's process sends, not something this host authored). A row that fails
+## these is SKIPPED, never rendered and never faulted on; rule 8 (never blind-
+## write) applies just as much to "never blind-render".
+const cSwMaxLabelLen = 200
+const cSwMaxKeyLen = 200
+
+proc swRowIsSane(row: SwRow; why: var string): bool =
+  ## True if `row` is safe to hand to `swCloneRow`/`swSeedToggle`. Every check
+  ## here is something a REMOTE schema could get wrong, honestly or not:
+  ## `key`/`label` length, and `kind` being one of the three this renderer
+  ## actually knows how to draw. A header row (kind=swkStub, key="") is
+  ## explicitly VALID -- empty key is the documented shape for it -- so this
+  ## does not reject on an empty key alone.
+  why = ""
+  if ord(row.kind) < ord(low(SwKind)) or ord(row.kind) > ord(high(SwKind)):
+    why = "kind " & $ord(row.kind) & " is out of range"
+    return false
+  if row.label.len > cSwMaxLabelLen:
+    why = "label is " & $row.label.len & " byte(s), over the " &
+          $cSwMaxLabelLen & "-byte cap"
+    return false
+  if row.key.len > cSwMaxKeyLen:
+    why = "key is " & $row.key.len & " byte(s), over the " & $cSwMaxKeyLen &
+          "-byte cap"
+    return false
+  result = true
+
 var gSwPages: seq[SwPage] = @[]
 ## `settingsPages` -- Phase 3. Default OFF.
 var gSwPagesOn = false
@@ -362,23 +391,28 @@ proc swRowContainerGo(tabPtr: Il2CppPtr; why: var string): Il2CppPtr =
           (if fnTr != nil: "OK" else: "REJECTED") & " get_parent=" &
           (if fnPar != nil: "OK" else: "REJECTED") & ")"
     return
+  swCrumbP("STAGE: swRowContainerGo -- Component::get_gameObject(control)",
+           control)
   let rowGo = cMi2CallPP(fnGo, control)
   if rowGo == nil or cIsReadable(rowGo, 0x20'i32) == 0'i32:
     why = "Component::get_gameObject(control=0x" &
           hexOf(cast[uint64](control)) & ") gave 0x" &
           hexOf(cast[uint64](rowGo)) & ", which is not readable"
     return
+  swCrumbP("STAGE: swRowContainerGo -- GameObject::get_transform(rowGo)", rowGo)
   let rowT = cMi2CallPP(fnTr, rowGo)
   if rowT == nil or cIsReadable(rowT, 0x20'i32) == 0'i32:
     why = "GameObject::get_transform(rowGo=0x" & hexOf(cast[uint64](rowGo)) &
           ") gave 0x" & hexOf(cast[uint64](rowT)) & ", which is not readable"
     return
+  swCrumbP("STAGE: swRowContainerGo -- Transform::get_parent(rowT)", rowT)
   let contT = cDuCallPP(fnPar, rowT)
   if contT == nil or cIsReadable(contT, 0x20'i32) == 0'i32:
     why = "Transform::get_parent(rowT=0x" & hexOf(cast[uint64](rowT)) &
           ") gave 0x" & hexOf(cast[uint64](contT)) &
           " -- the row appears to have no parent, which cannot be right"
     return
+  swCrumbP("STAGE: swRowContainerGo -- Component::get_gameObject(contT)", contT)
   let contGo = cMi2CallPP(fnGo, contT)
   if contGo == nil or cIsReadable(contGo, 0x20'i32) == 0'i32:
     why = "Component::get_gameObject(containerT=0x" &
@@ -708,6 +742,7 @@ proc swRenderPage(tabPtr, parentGo: Il2CppPtr; page: var SwPage): int =
   ## its heading and its note and stops -- which is the point of `stub`: the
   ## player sees the page exists and is told plainly that it does nothing yet.
   result = 0
+  swCrumb("STAGE: swRenderPage -- swAnyDonor for page '" & page.id & "'")
   var donorKind = ""
   let donorToggle = swAnyDonor(tabPtr, donorKind)
   if donorToggle == nil:
@@ -730,7 +765,19 @@ proc swRenderPage(tabPtr, parentGo: Il2CppPtr; page: var SwPage): int =
           "note rendered, no rows bound"
     return
   var i = 0
+  var skipped = 0
+  var lastSkipWhy = ""
   while i < page.rows.len and result < cSwMaxRows:
+    swCrumb("STAGE: swRenderPage -- validate row " & $i & " of " &
+            $page.rows.len & " page '" & page.id & "'")
+    var why = ""
+    if not swRowIsSane(page.rows[i], why):
+      skipped = skipped + 1
+      lastSkipWhy = why
+      warn "settings pages: page '" & page.id & "' row " & $i &
+           " SKIPPED (not rendered) -- " & why
+      i = i + 1
+      continue
     var text = page.rows[i].label
     if not page.rows[i].implemented:
       text = text & cSwNotDone
@@ -752,7 +799,11 @@ proc swRenderPage(tabPtr, parentGo: Il2CppPtr; page: var SwPage): int =
         swDumpRowGeometry(donorToggle, clone, parentGo)
     i = i + 1
   okLog "settings pages: page '" & page.id & "' rendered " & $result &
-        " row(s) of " & $page.rows.len
+        " row(s) of " & $page.rows.len &
+        (if skipped > 0:
+           " -- " & $skipped & " row(s) SKIPPED as unsafe (last reason: " &
+           lastSkipWhy & ")"
+         else: "")
 
 proc swReadBackPage(page: var SwPage) =
   ## Read every rendered row's live value and persist the ones the player
