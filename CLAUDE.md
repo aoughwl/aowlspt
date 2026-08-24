@@ -352,6 +352,43 @@ What goes where:
 A fact recorded as `measured` that was not measured poisons the store, and a
 poisoned store is worse than an empty one. Say `inferred` when you inferred it.
 
+## 9b. A VERIFICATION THAT CANNOT FAIL IS THE BUG
+
+Every single defect in the settings screen -- twenty-plus hours of them -- was
+the same shape. Not a hard bug: a check that could only ever say yes.
+
+* the row relabel sized its write by counting the TMPs the **donor** had text
+  on, then re-read only what it had just written. It reported "0 did not take"
+  for 16 rows that were all visibly wrong on screen.
+* a settle-loop counted any tick with `reaped == 0` as STABLE -- indistinguish-
+  able from "the thing has not spawned yet" -- so it hit its threshold and
+  disabled itself permanently before the late spawn.
+* an offline disassembly proof established, correctly, which field
+  `SetGameModeText` writes. It could not establish that the field reaches the
+  screen. It did not. The label the player sees was a different object in a
+  different scene root.
+* the backend selftest asserted with substring `contains`, so a payload that
+  was not valid JSON at all passed for months.
+
+So: **assert a property of the FINISHED STATE, never of your own write.**
+Prefer the negative -- "no TMP under this panel still reads the donor's
+caption", "exactly one stock panel is active", "the served payload parses
+strictly" -- because a negative can be falsified and a self-comparison cannot.
+If you cannot describe the input that would make your check fail, you have not
+written a check.
+
+Three outcomes, never two: PASS / FAIL / **INCONCLUSIVE**. "I could not look"
+is not a pass. `find`/`findtext` reporting STOPPED EARLY, an unreadable
+pointer, a screen that never opened -- all inconclusive. The inspector already
+models this correctly; code that consumes it must not flatten it.
+
+And structural is not behavioural. A sibling index, an `activeSelf`, a log line
+saying "ok" are evidence, not proof. The only thing that settles a UI question
+is reading back what the live tree renders. `tools/acceptance.py` exists so that
+costs one command instead of fifteen minutes -- run it before saying "fixed".
+
+---
+
 ## 10. THE TOOLS ARE HALF-BUILT. SAY SO THE MOMENT YOU NOTICE
 
 The live inspector, the fact store, `harness.py`, `entergame.py`, `deploy.py` —
