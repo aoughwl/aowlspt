@@ -268,6 +268,12 @@ var gFindQueue: seq[Il2CppPtr] = @[]
 var gFindHead = 0
 var gFindWant = ""
 var gFindVisited = 0
+var gFindInvalidSkips = 0
+  ## Dequeued nodes that failed `duOk`/`iUnityAlive` and were never actually
+  ## examined -- counted separately from `gFindVisited` so a search whose
+  ## ENTIRE frontier was garbage cannot be reported as "searched
+  ## EXHAUSTIVELY, genuinely NOT PRESENT". Visiting nothing valid is not the
+  ## same fact as searching everything and finding nothing.
 var gFindFound = 0
 var gFindActive = false
 var gFindBudgetLeft = 0
@@ -639,7 +645,12 @@ proc iRefreshAnchors() =
   iSetVarP("duroot", gDuRootGo)          # the GameObject it parents clones to
   iSetVarP("gameworld", gDuGameWorld)    # the live GameWorld, when in a raid
   iSetVarP("you", gDuYou)                # the local player, when in a raid
-  iSetVarP("settings", gMi2Self)         # the live SettingsScreen, once opened
+  # The live SettingsScreen `this`, once opened. `gSettingsLiveSelf` (set by the
+  # `ShowScreen` postfix that actually drives Phase 1/2/3, first-fire AND every
+  # revisit) is preferred over `gMi2Self` (set only by the separate invoke2
+  # ladder proof, which may never fire): the anchor must reflect whichever probe
+  # is ACTUALLY running, not assume a specific one is.
+  iSetVarP("settings", iInspSettingsSelf())
   for i in 0 ..< 8:
     if gSuiTabPtr[i] != 0'u64:
       iSetVar("tab" & $i, gSuiTabPtr[i])
@@ -1693,10 +1704,11 @@ proc iFindStep(): int =
     let cur = gFindQueue[gFindHead]
     inc gFindHead
     inc spent
-    inc gFindVisited
     dec gFindBudgetLeft
     if not duOk(cur, 0x20'i32) or not iUnityAlive(cur):
+      inc gFindInvalidSkips
       continue
+    inc gFindVisited
     iNoteKlass(cur)
     let nm = iObjName(cur)
     if nm.len > 0 and iContains(iLower(nm), gFindWant):
@@ -1722,15 +1734,31 @@ proc iFindReport(status: int) =
   ## progress report every frame would bury the answer.
   iOut("  visited " & $gFindVisited & " node(s) over " & $gFindFrames &
        " frame(s), " & $gFindFound & " match(es), frontier " &
-       $(gFindQueue.len - gFindHead) & " node(s)")
+       $(gFindQueue.len - gFindHead) & " node(s)" &
+       (if gFindInvalidSkips > 0:
+          ", " & $gFindInvalidSkips & " unreadable/invalid node(s) skipped"
+        else: ""))
   if status == FindDone:
     gFindActive = false
     gFindOwnerIdx = -1
     gFindOwnerBatch = -1
-    iOut("  -- the subtree was searched EXHAUSTIVELY. " &
-         (if gFindFound == 0:
-            "That name is genuinely NOT PRESENT under this root."
-          else: "Every match is listed above."))
+    if gFindVisited == 0:
+      # Nothing was ever actually examined -- either the root(s) were all
+      # invalid, or the frontier was empty. "EXHAUSTIVELY searched" and
+      # "genuinely NOT PRESENT" are both claims about work that was done, and
+      # none was. Say that plainly instead.
+      iOut("  -- NOTHING WAS EXAMINED (0 valid nodes visited" &
+           (if gFindInvalidSkips > 0:
+              ", " & $gFindInvalidSkips & " root/node(s) were unreadable or " &
+              "not a valid Transform"
+            else: "") &
+           "). This is NOT evidence the name is absent -- it means the " &
+           "search never actually looked. Check the root pointer.")
+    else:
+      iOut("  -- the subtree was searched EXHAUSTIVELY. " &
+           (if gFindFound == 0:
+              "That name is genuinely NOT PRESENT under this root."
+            else: "Every match is listed above."))
   elif status == FindEnoughHits:
     gFindActive = true
     iOut("  -- stopped at the match cap (" & $InspFindMaxHits & "). There may " &
@@ -2262,6 +2290,35 @@ proc iCmdFind(toks: seq[string]) =
     budgetTok = 4
     iOut("  root \"" & toks[3] & "\" resolved to " & iPtr(root) &
          " name=\"" & iObjName(root) & "\"")
+  elif toks.len == 3:
+    # AMBIGUOUS: exactly one bare token after NAME, with grammar
+    # `find NAME [ROOT] [BUDGET]`. This used to always be read as ROOT, which
+    # made `find SettingsScreen 200000` silently walk the "root" 0x30d40 (that
+    # decimal value read as a pointer), visit one bogus node, and report the
+    # name "genuinely NOT PRESENT" -- a confidently wrong answer. Disambiguate
+    # by READABILITY: only treat it as a root if it actually reads back as a
+    # live Transform/GameObject; otherwise it is a BUDGET, which is what a
+    # plain integer like 20000 or 200000 almost always means here.
+    var v = 0'u64
+    var err = ""
+    if not iEval(toks[2], v, err):
+      iErr(err)
+      return
+    let cand = cast[Il2CppPtr](v)
+    if duOk(cand, 0x20'i32):
+      if iRefuseIfGameObject(cand, "find"):
+        return
+      root = cand
+      rootExplicit = true
+      iOut("  NOTE: \"" & toks[2] & "\" reads as a live pointer, so it is " &
+           "being treated as ROOT, not BUDGET. If you meant a budget, pass " &
+           "an explicit root too: `find " & want & " $someRoot " & toks[2] & "`.")
+    else:
+      budgetTok = 2
+      iOut("  NOTE: \"" & toks[2] & "\" does not read back as a live " &
+           "pointer, so it is being treated as BUDGET, not ROOT. Searching " &
+           "every scene root (as if no root were given). If you meant a " &
+           "root, pass a pointer that is actually live.")
   elif toks.len > 2:
     var v = 0'u64
     var err = ""
@@ -2277,6 +2334,12 @@ proc iCmdFind(toks: seq[string]) =
 
   if rootExplicit:
     root = iToTransform(root)
+    if not duOk(root, 0x20'i32):
+      iErr("that root pointer is not readable as a Transform; refusing to " &
+           "walk it. (The unconverted pointer read back readable, but " &
+           "`Component::get_transform` on it did not -- something changed " &
+           "underneath, or it was never a Transform/GameObject.)")
+      return
   elif root == nil:
     discard
 
@@ -2320,6 +2383,7 @@ proc iCmdFind(toks: seq[string]) =
   gFindHead = 0
   gFindWant = iLower(want)
   gFindVisited = 0
+  gFindInvalidSkips = 0
   gFindFound = 0
   gFindActive = false
   gFindBudgetLeft = budget
@@ -3158,6 +3222,15 @@ proc iCmdClick(toks: seq[string]; useInvoke: bool) =
        "with `state`, or `until` on whatever the click was supposed to " &
        "create, to confirm the effect rather than the call.")
 
+proc iInspSettingsSelf(): Il2CppPtr =
+  ## The best-known live SettingsScreen `this`. `gSettingsLiveSelf` is set by
+  ## the `ShowScreen` postfix that actually drives Phase 1/2/3 (settingsui.nim);
+  ## `gMi2Self` is set only by the separate invoke2 ladder proof, which is a
+  ## different hook (`EnsureTabInitialized` postfix) and may never fire in a
+  ## given session. Preferring the former is what makes `state` match reality
+  ## rather than asserting a specific probe ran.
+  if gSettingsLiveSelf != nil: gSettingsLiveSelf else: gMi2Self
+
 proc iCmdOpen(toks: seq[string]) =
   ## `open [GROUP]` -- EFT.UI.SettingsScreen::ShowScreen(screen, group).
   if not iNavGate("open"):
@@ -3166,11 +3239,13 @@ proc iCmdOpen(toks: seq[string]) =
   var rva = 0'u32
   if not iNavFind("ShowScreen", fn, rva):
     return
-  var screen = gMi2Self
+  var screen = iInspSettingsSelf()
   if screen == nil:
-    iErr("no live SettingsScreen is known yet ($settings is null). The host " &
-         "learns it the first time the screen is opened by hand, so open " &
-         "Settings once manually and this will work from then on.")
+    iErr("no live SettingsScreen is known yet ($settings is null). It is " &
+         "learned by the ShowScreen postfix or the invoke2 ladder hook, " &
+         "whichever fires first, so open Settings once manually (with the " &
+         "relevant flag on -- see `state` for which hooks are armed) and " &
+         "this will work from then on.")
     return
   var group = 0'u64
   if toks.len > 1:
@@ -3233,7 +3308,7 @@ proc iCmdState(toks: seq[string]) =
   ## guarded field read -- no calls -- so `state` itself can never be the thing
   ## that breaks.
   iOut("  anchors: $preloader=" & iPtr(gInspPreloader) &
-       " $settings=" & iPtr(gMi2Self))
+       " $settings=" & iPtr(iInspSettingsSelf()))
   iOut("  inspector: menu anchor slot=" & $gInspSlot &
        ", in-raid anchor slot=" & $gInspSlot2 &
        ", dispatches=" & $gInspFires & " (of those in-raid=" &
@@ -3245,11 +3320,17 @@ proc iCmdState(toks: seq[string]) =
   if gInspPreloader == nil:
     iOut("  menu: PreloaderUI anchor is null -- either the menu has not built " &
          "yet, or the session is in a raid (where PreloaderUI does not tick).")
-  let ss = gMi2Self
+  let ss = iInspSettingsSelf()
   if ss == nil:
-    iOut("  settings: NOT KNOWN. The host learns the SettingsScreen pointer " &
-         "the first time that screen is opened; it has not been opened this " &
-         "session. This is why the anchor is null -- not a read failure.")
+    iOut("  settings: NOT KNOWN. Two independent hooks can learn this pointer " &
+         "-- the `ShowScreen` postfix (settingsUiProbe / settingsRelabelProbe / " &
+         "settingsBindProbe / settingsPages) and the invoke2 ladder proof " &
+         "(EnsureTabInitialized postfix) -- and neither has reported one yet " &
+         "this session. Most likely cause: the Settings screen has not been " &
+         "opened, OR it has been opened but the flag that arms one of those " &
+         "hooks is off. Check `python tools/hostcfg.py show` and the host log " &
+         "for 'settings probe: ShowScreen (postfix) first fired' before " &
+         "assuming this is a read failure.")
     return
   if not duOk(ss, cNavOffInitTabs() + 8'i32):
     iErr("the SettingsScreen pointer is not readable to +0x" &

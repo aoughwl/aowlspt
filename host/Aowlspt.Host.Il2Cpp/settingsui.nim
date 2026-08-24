@@ -58,6 +58,16 @@ proc cBridgeSettingsTabTargetName(i: int32): Il2CppPtr {.
 # The slot/flag/guard globals (gSettingsUiSlot / gSettingsUiProbe /
 # gSettingsUiDone) are declared in aowlhost.nim beside the other detour slots.
 
+## The live SettingsScreen `this`, as last seen by the hook that ACTUALLY
+## drives Phase 1/2/3 (the `ShowScreen` postfix in `suiTabInitBody`, below --
+## first-fire AND every revisit). Declared here, ahead of `invoke2.nim`'s
+## `gMi2Self`, because nimony forward-resolves procs across an `include`
+## boundary but NOT variables (see the note on the revisit path below), and
+## this is the earliest point a consumer further down the include chain
+## (`inspect.nim`) can see a pointer that is actually kept live. Read-only
+## outside this file; never written from anywhere but a verified `this`.
+var gSettingsLiveSelf: Il2CppPtr = nil
+
 ## Cap the controls read per tab so a corrupt `_size` cannot spin the walk.
 const cSuiMaxControls = 64
 ## Cap the label length decoded from a TMP string.
@@ -326,6 +336,7 @@ proc suiTabInitBody(a: Il2CppPtr): Il2CppPtr {.
            else: " -- Unity's main thread") & "; this=0x" & hexOf(selfPtr)
   if onHost or selfPtr == 0'u64:
     return cast[Il2CppPtr](1)
+  gSettingsLiveSelf = cast[Il2CppPtr](selfPtr)
 
   let gname = readCString(cSuiGroupName(group))
   let off = cSuiGroupTabOffset(group)
