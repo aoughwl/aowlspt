@@ -155,35 +155,105 @@ class ParseRoots(unittest.TestCase):
 
 
 class ParseReadLabelComponentCallPress(unittest.TestCase):
+    """Fixtures below are the literal shapes iOut/iErr emit at each command's
+    real call site in inspect.nim, not assumed prose -- see channel.py
+    docstrings for the line numbers."""
+
     def test_read_value(self):
-        r = channel.parse_read('$c0+0x18 i32 = 42', '$c0+0x18', 'i32')
+        r = channel.parse_read('  0x1234 as i32 = 42', '$c0+0x18', 'i32')
         self.assertEqual(r['value'], '42')
         self.assertTrue(r['parse_ok'])
 
     def test_read_error_not_mistaken_for_value(self):
-        r = channel.parse_read('!! read faulted: invalid pointer', '$bad', 'i32')
+        r = channel.parse_read('  ! read faulted: invalid pointer', '$bad', 'i32')
         self.assertIsNone(r['value'])
-        self.assertFalse(r['parse_ok'])
 
     def test_label(self):
         r = channel.parse_label('  text = "Continue"')
         self.assertEqual(r['text'], 'Continue')
 
     def test_component_found(self):
-        r = channel.parse_component('component resolved -> $comp bound')
+        raw = '  FOUND Button component = 0xABCDEF  klass=0x123   ($comp)'
+        r = channel.parse_component(raw)
         self.assertTrue(r['bound'])
+        self.assertTrue(r['found'])
 
     def test_component_not_found(self):
-        r = channel.parse_component('!! no component of type Foo on this GameObject')
+        raw = ('  ! GetComponent returned NULL -- this is an ANSWER, not a '
+               'crash. Either this object genuinely has no Foo ...')
+        r = channel.parse_component(raw)
         self.assertFalse(r['found'])
+        self.assertFalse(r['bound'])
 
     def test_call_error_is_typed_false_not_prose(self):
-        r = channel.parse_call('!! call refused: shared RVA, detour blocked')
+        r = channel.parse_call('  ! rva 0x1000: not committed or not executable')
         self.assertFalse(r['ok'])
 
-    def test_press_ok(self):
-        r = channel.parse_press('press: DefaultUIButton.OnClick invoked')
+    def test_call_ptr_return(self):
+        raw = '  -> ptr 0xDEADBEEF  readable, klass=0x123   (bound to $_)'
+        r = channel.parse_call(raw)
         self.assertTrue(r['ok'])
+        self.assertEqual(r['ret_type'], 'ptr')
+        self.assertEqual(r['returned'], '0xDEADBEEF')
+
+    def test_call_i64_return(self):
+        r = channel.parse_call('  -> i64 42 (0x000000000000002A)')
+        self.assertEqual(r['ret_type'], 'i64')
+        self.assertEqual(r['returned'], '0x000000000000002A')
+
+    def test_call_void_return(self):
+        r = channel.parse_call('  -> returned without faulting (void)')
+        self.assertTrue(r['ok'])
+        self.assertEqual(r['ret_type'], 'void')
+
+    def test_press_ok(self):
+        raw = ('  target klass = 0x1  OnClick(+0x120) = 0xABC\n'
+                '  returned without faulting.')
+        r = channel.parse_press(raw)
+        self.assertTrue(r['ok'])
+
+    def test_press_refused(self):
+        raw = '  ! that slot is NULL -- no handler is wired to this button.'
+        r = channel.parse_press(raw)
+        self.assertFalse(r['ok'])
+
+
+class ParseTreeAndParent(unittest.TestCase):
+    def test_tree_nodes(self):
+        raw = ('  tree from 0x1 name="Root" (max depth 4, max 500 nodes)\n'
+               '    "Root"  0x1  (2 child)\n'
+               '      + "Child A"  0x2\n'
+               '      + "Child B"  0x3  (1 child)\n'
+               '  3 node(s) printed  -- complete.')
+        r = channel.parse_tree(raw)
+        self.assertEqual(len(r['nodes']), 3)
+        self.assertEqual(r['nodes'][1]['name'], 'Child A')
+        self.assertEqual(r['nodes'][2]['child_count'], 1)
+        self.assertTrue(r['complete'])
+        self.assertFalse(r['truncated'])
+
+    def test_parent_levels(self):
+        raw = ('    [0] transform=0x1 klass=0x10 name="Row" go=0x2 activeSelf=true\n'
+               '    [1] (null parent -- this is the hierarchy root)')
+        r = channel.parse_parent(raw)
+        self.assertEqual(len(r['levels']), 1)
+        self.assertEqual(r['levels'][0]['name'], 'Row')
+        self.assertTrue(r['levels'][0]['active_self'])
+        self.assertTrue(r['reached_root'])
+
+
+class ParseChildrenReal(unittest.TestCase):
+    def test_children_real_shape(self):
+        raw = ('  childCount = 2\n'
+               '  via Transform::GetChild / get_childCount, Object::get_name (calls)\n'
+               '    [0] transform=0x1 ($c0)  go=0x2 ($g0)  name="Background"\n'
+               '    [1] transform=0x3 ($c1)  go=0x4 ($g1)  name="Label"\n'
+               '  transforms bound to $c0..$c1, GameObjects to $g0..$g1. NOTE: ...')
+        r = channel.parse_children(raw)
+        self.assertEqual(len(r['children']), 2)
+        self.assertEqual(r['children'][1]['name'], 'Label')
+        self.assertEqual(r['child_count'], 2)
+        self.assertTrue(r['parse_ok'])
 
 
 if __name__ == '__main__':

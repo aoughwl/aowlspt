@@ -211,7 +211,7 @@ def open_settings(live, timeout=90):
         ["component %s AnimatedToggle" % settings_button,
          "call %s v_pb $comp 1" % OPEN_SETTINGS_RVA],
         live_dir=live, timeout=40, write=True)
-    if "returned without faulting" not in raw and "!!" in raw:
+    if "returned without faulting" not in raw and ch._has_err_line(raw):
         return False, "the AnimatedToggle call did not go through: %s" % raw[-300:]
     return True, "pressed Settings via %s" % OPEN_SETTINGS_RVA
 

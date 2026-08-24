@@ -216,63 +216,223 @@ def parse_roots(raw):
     }
 
 
-def parse_children(raw):
-    """`children EXPR` prints one line per child; format observed in practice
-    is index/ptr/name-ish -- kept intentionally loose (name+ptr capture) since
-    this verb's exact prose was not independently re-verified against a live
-    client for this task (see report: needs live-client verification)."""
+def _has_err_line(raw):
+    """`iErr` (inspect.nim:635) emits `iOut("  ! " & s)` -- every failure line
+    is `!`, single, after the two-space indent iOut adds. Checked stripped-
+    per-line, never `.startswith("!!")` (that string never occurs)."""
+    return any(l.strip().startswith("!") for l in raw.splitlines())
+
+
+_PARENT_LINE_RE = re.compile(
+    r'\[(?P<level>\d+)\]\s+transform=(?P<ptr>0x[0-9a-fA-F]+)\s+'
+    r'klass=(?P<klass>0x[0-9a-fA-F]+)'
+    r'(?:\s+name="(?P<name>[^"]*)")?'
+    r'(?:\s+go=(?P<go>0x[0-9a-fA-F]+)\s+activeSelf=(?P<active>true|false))?'
+)
+
+
+def parse_parent(raw):
+    """`parent EXPR [DEPTH]` (iCmdParent, inspect.nim:1066) prints, per
+    level: `    [N] transform=0xPTR klass=0xKLASS name="X" go=0xPTR
+    activeSelf=true/false` -- a DIFFERENT shape from `children` (klass= and
+    activeSelf=, no $cN/$gN anchors are bound by this verb at all) so it
+    cannot share `parse_children`'s regex, which requires the `($cN)`
+    anchor group that `parent` never emits. Terminates either with
+    `(null parent -- this is the hierarchy root)` or `... stopped at depth N`."""
     items = []
     for line in raw.splitlines():
-        m = re.search(r'(0x[0-9a-fA-F]+)\s*(?:name="([^"]*)")?', line)
-        if m and ("child" in line.lower() or m.group(2)):
-            items.append({"ptr": m.group(1), "name": m.group(2)})
-    return {"children": items, "parse_ok": len(items) > 0, "raw": raw}
+        m = _PARENT_LINE_RE.search(line)
+        if m:
+            items.append({
+                "level": int(m.group("level")),
+                "ptr": m.group("ptr"),
+                "klass": m.group("klass"),
+                "name": m.group("name"),
+                "go": m.group("go"),
+                "active_self": (m.group("active") == "true") if m.group("active") else None,
+            })
+    reached_root = "hierarchy root" in raw
+    return {
+        "levels": items,
+        "reached_root": reached_root,
+        "parse_ok": bool(items) or reached_root,
+        "raw": raw,
+    }
+
+
+_CHILD_LINE_RE = re.compile(
+    r'\[(?P<idx>\d+)\]\s+transform=(?P<ptr>0x[0-9a-fA-F]+)\s+\(\$c\d+\)'
+    r'(?:\s+go=(?P<go>0x[0-9a-fA-F]+)\s+\(\$g\d+\))?'
+    r'\s+name="(?P<name>[^"]*)"'
+)
+
+
+def parse_children(raw):
+    """`children EXPR` (iCmdChildren, inspect.nim:1601) prints, per child:
+    `    [i] transform=0xPTR ($cN)  go=0xPTR ($gN)  name="X"` -- or
+    `    [i] <child not readable>`. Corrected against the real emit site;
+    the previous regex looked for `name="..."` immediately after the first
+    hex token, which is the transform pointer, so it never matched (the name
+    is several tokens later, past `go=`) and this verb effectively always
+    returned an empty list."""
+    items = []
+    for line in raw.splitlines():
+        m = _CHILD_LINE_RE.search(line)
+        if m:
+            items.append({
+                "index": int(m.group("idx")),
+                "ptr": m.group("ptr"),
+                "go": m.group("go"),
+                "name": m.group("name"),
+            })
+        elif "not readable" in line and re.search(r'\[\d+\]', line):
+            idx_m = re.search(r'\[(\d+)\]', line)
+            items.append({"index": int(idx_m.group(1)) if idx_m else None,
+                           "ptr": None, "go": None, "name": None,
+                           "unreadable": True})
+    count_m = re.search(r'childCount\s*=\s*(\d+)', raw)
+    return {
+        "children": items,
+        "child_count": int(count_m.group(1)) if count_m else None,
+        "parse_ok": bool(items) or "no children" in raw.lower(),
+        "raw": raw,
+    }
+
+
+_TREE_LINE_RE = re.compile(
+    r'^(?P<indent>\s*)(?P<plus>\+\s+)?"(?P<name>[^"]*)"\s+'
+    r'(?P<ptr>0x[0-9a-fA-F]+)(?:\s+\((?P<nchild>\d+)\s+child\))?'
+)
+
+
+def parse_tree(raw):
+    """`tree EXPR [DEPTH]` (iCmdTree, inspect.nim:2568) prints one line per
+    node: `    ["+ "]"Name"  0xPTR  (N child)`, a shape entirely unlike
+    `children` (no `transform=`/`name=` keys at all -- it is positional:
+    quoted name, then pointer, then an optional child count in parens).
+    Previously this verb was routed through `parse_children`, whose regex
+    requires a `name="..."` key that tree's format never emits, so `tree`
+    always came back with an empty item list regardless of what was on
+    screen. Depth is inferred from indentation width and the leading `+ `."""
+    items = []
+    for line in raw.splitlines():
+        m = _TREE_LINE_RE.match(line)
+        if m:
+            items.append({
+                "name": m.group("name"),
+                "ptr": m.group("ptr"),
+                "child_count": int(m.group("nchild")) if m.group("nchild") else None,
+                "is_root": m.group("plus") is None,
+            })
+    nodes_m = re.search(r'(\d+)\s+node\(s\)\s+printed', raw)
+    truncated = "STOPPED EARLY" in raw
+    return {
+        "nodes": items,
+        "node_count": int(nodes_m.group(1)) if nodes_m else len(items),
+        "truncated": truncated,
+        "complete": ("-- complete." in raw) and not truncated,
+        "parse_ok": bool(items),
+        "raw": raw,
+    }
 
 
 def parse_read(raw, expr, type_):
-    """`read EXPR TYPE` -- the value is the token right after '=' on the
-    matching line, or the whole trimmed line if no '=' is present."""
-    line = raw.strip().splitlines()[-1].strip() if raw.strip() else ""
-    if "=" in line:
-        value = line.split("=", 1)[1].strip()
-    else:
-        value = line or None
-    is_err = raw.strip().startswith("!!") or "error" in raw.lower()[:40]
+    """`read EXPR TYPE` (inspect.nim ~3982) prints
+    `  0xPTR as TYPE = VALUE` on success, or a `  ! ...` error line via
+    `iErr`. Value is the token after '=' on the matching `as TYPE =` line."""
+    is_err = _has_err_line(raw)
+    value = None
+    for line in raw.splitlines():
+        if " as " in line and "=" in line:
+            value = line.split("=", 1)[1].strip()
     return {
         "expr": expr, "type": type_, "value": None if is_err else value,
-        "parse_ok": bool(value) and not is_err, "raw": raw,
+        "parse_ok": (value is not None) or is_err, "raw": raw,
     }
 
 
 def parse_label(raw):
+    """`label EXPR` (iCmdLabel, inspect.nim:3031) prints
+    `  text = "..."` on success, or a `  ! ...` refusal (e.g. "that is a
+    TRANSFORM", "not a TMP_Text") via iErr."""
     text = None
     m = re.search(r'text\s*=\s*"([^"]*)"', raw)
     if m:
         text = m.group(1)
-    refused = "refus" in raw.lower() or "not a" in raw.lower()
-    return {"text": text, "refused": refused, "parse_ok": m is not None, "raw": raw}
+    refused = _has_err_line(raw)
+    return {"text": text, "refused": refused, "parse_ok": m is not None or refused, "raw": raw}
 
 
 def parse_component(raw):
-    bound = "$comp" in raw and ("bound" in raw.lower() or "->" in raw)
-    found = not (raw.strip().startswith("!!") or "no component" in raw.lower()
-                 or "not found" in raw.lower())
-    return {"bound": bound and found, "found": found, "var": "$comp" if found else None,
+    """`component EXPR TypeName` (iCmdComponent, inspect.nim:2654). Success:
+    `  FOUND TypeName component = 0xPTR  klass=0xKLASS   ($comp)`. Failure is
+    NOT always an `iErr` line -- a genuine "no such component" answer is
+    `iErr("GetComponent returned NULL -- this is an ANSWER, not a crash...")`
+    which DOES start with `!` (so _has_err_line catches it), but the old
+    parser also required the literal substring "bound" or "->" to declare
+    `bound`, which the real FOUND line never contains -- so it reported
+    found=True, bound=False on every real success. Now `bound` follows
+    `found` directly, both from the FOUND anchor string."""
+    found = bool(re.search(r'\bFOUND\b.*\(\$comp\)', raw))
+    is_err = _has_err_line(raw)
+    return {"bound": found and not is_err, "found": found and not is_err,
+            "var": "$comp" if found and not is_err else None,
             "parse_ok": True, "raw": raw}
 
 
+_CALL_VOID_RE = re.compile(r'->\s*returned without faulting \(void\)')
+_CALL_BOOL_RE = re.compile(r'->\s*bool\s+(true|false)')
+_CALL_I32_RE = re.compile(r'->\s*i32\s+(-?\d+)')
+_CALL_I64_RE = re.compile(r'->\s*i64\s+(-?\d+)\s*\((0x[0-9a-fA-F]+)\)')
+_CALL_F32_RE = re.compile(r'->\s*f32\s+(-?[\d.]+(?:e[+-]?\d+)?)', re.I)
+_CALL_STR_RE = re.compile(r'->\s*String\*\s+(0x[0-9a-fA-F]+)\s*=\s*"([^"]*)"')
+_CALL_PTR_RE = re.compile(
+    r'->\s*ptr\s+(0x[0-9a-fA-F]+)'
+    r'(\s+NULL|\s+NOT readable|\s+readable, klass=(0x[0-9a-fA-F]+)\s*\(bound to \$_\))?'
+)
+
+
 def parse_call(raw):
-    is_err = raw.strip().startswith("!!")
-    ret = None
-    m = re.search(r'(?:returned|->|result)\s*[:=]?\s*(0x[0-9a-fA-F]+|-?\d+)', raw, re.I)
-    if m:
-        ret = m.group(1)
-    return {"ok": not is_err, "returned": ret, "parse_ok": True, "raw": raw}
+    """`call TARGET SIG [ARGS]` (iCmdCall, inspect.nim:3619). Every return
+    kind (`v`,`b`,`i`,`l`/`u`,`f`,`s`,`p`) has its own `-> ...` shape, e.g.
+    `-> ptr 0xPTR  readable, klass=0xK   (bound to $_)` or
+    `-> i64 N (0xHEX)` or `-> String* 0xPTR = "text"`. The previous regex
+    (`(?:returned|->|result)\\s*[:=]?\\s*(hex|digit)`) required the numeric
+    token to sit IMMEDIATELY after `->`/`:`/`=`, but every real line has a
+    type-name word (`ptr`, `i64`, `bool`, ...) in between, so it matched
+    almost nothing that this verb actually prints. Replaced with one regex
+    per emitted shape, keyed off the actual retKind switch in iCmdCall."""
+    is_err = _has_err_line(raw)
+    ret_type, returned = None, None
+    if _CALL_VOID_RE.search(raw):
+        ret_type, returned = "void", None
+    elif (m := _CALL_BOOL_RE.search(raw)):
+        ret_type, returned = "bool", m.group(1)
+    elif (m := _CALL_I64_RE.search(raw)):
+        ret_type, returned = "i64", m.group(2)
+    elif (m := _CALL_I32_RE.search(raw)):
+        ret_type, returned = "i32", m.group(1)
+    elif (m := _CALL_F32_RE.search(raw)):
+        ret_type, returned = "f32", m.group(1)
+    elif (m := _CALL_STR_RE.search(raw)):
+        ret_type, returned = "string", m.group(2)
+    elif (m := _CALL_PTR_RE.search(raw)):
+        ret_type, returned = "ptr", m.group(1)
+    return {"ok": not is_err, "ret_type": ret_type, "returned": returned,
+            "parse_ok": (ret_type is not None) or is_err, "raw": raw}
 
 
 def parse_press(raw):
-    is_err = raw.strip().startswith("!!")
-    return {"ok": not is_err, "parse_ok": True, "raw": raw}
+    """`press EXPR [OFFSET]` (iCmdPress, inspect.nim:3171) has no dedicated
+    success token -- on success the last output line is
+    `  returned without faulting.` after printing the target's OnClick
+    slot; any refusal path (`null pointer`, `not readable`, `slot is NULL`,
+    `holds a GAMEOBJECT`, ...) is an `iErr` `  ! ...` line. `ok` now reflects
+    the real absence of an error line, not a `!!` sentinel that iErr never
+    emits."""
+    is_err = _has_err_line(raw)
+    fired = "returned without faulting" in raw
+    return {"ok": not is_err and fired, "fired": fired, "parse_ok": True, "raw": raw}
 
 
 FACTS_DB_DEFAULT = os.path.expandvars(r"%USERPROFILE%\.aowl\facts.db")
