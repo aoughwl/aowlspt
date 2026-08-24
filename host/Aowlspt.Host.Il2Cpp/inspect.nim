@@ -293,6 +293,25 @@ var gFindFrames = 0
   ## continues instead of re-walking the nodes it already rejected. Restarting
   ## a capped search from scratch can never reach past the cap, which made the
   ## cap message's own advice impossible to follow.
+var gTxtQueue: seq[Il2CppPtr] = @[]
+var gTxtHead = 0
+var gTxtWant = ""
+var gTxtVisited = 0
+var gTxtFound = 0
+var gTxtActive = false
+var gTxtBudgetLeft = 0
+var gTxtOwnerIdx = -1
+var gTxtOwnerBatch = -1
+var gTxtFrames = 0
+var gTxtTypeStr: Il2CppPtr = nil
+  ## `findtext` state, deliberately separate from `find`'s own -- same shape,
+  ## same resume contract (see gFindQueue et al. above), but a DIFFERENT
+  ## search so the two verbs never stomp each other's frontier. `gTxtTypeStr`
+  ## is the "TextMeshProUGUI" managed string, allocated ONCE per search
+  ## (il2cpp_string_new) and reused for every node's GetComponent call --
+  ## never re-allocated per node, which is what keeps this out of the
+  ## per-frame-managed-allocation trap.
+
 var gInspPolls = 0
   ## Times `inspectPoll` has been ENTERED. If this stops advancing while the
   ## rider keeps dispatching, the host tick thread is blocked or dead -- a
@@ -1409,6 +1428,27 @@ const
     ## seconds at 60fps, then it stops and says so.
   InspTreeMaxNodes = 3000
   InspTreeMaxDepth = 16
+  InspTextFindDefBudget = 4000
+    ## DEFAULT nodes per `findtext` invocation -- much lower than `find`'s,
+    ## because each node here costs a managed GetComponent CALL, not a raw
+    ## field read. The 12ms slice below is still the real backstop; this only
+    ## bounds the total across however many frames it takes.
+  InspTextFindMaxBudget = 60000
+    ## Ceiling on an explicit request. Kept well under `find`'s ceiling for the
+    ## same reason: a managed call per node is heavier than a pointer chase.
+
+proc iInspSeedTextType(): bool =
+  ## Allocate the "TextMeshProUGUI" managed string ONCE, at search start, and
+  ## reuse the same pointer for every node's GetComponent call for the rest
+  ## of the search -- including across resumed frames. Allocating a fresh
+  ## string per node would be exactly the per-frame managed allocation this
+  ## project's rules forbid, and at thousands of nodes it would also be slow
+  ## enough to fight the 12ms slice on every single node instead of once.
+  if gTxtTypeStr != nil and duOk(gTxtTypeStr, 0x18'i32):
+    return true
+  var typeName = "TextMeshProUGUI"
+  gTxtTypeStr = cNavNewString(toCString(typeName))
+  result = gTxtTypeStr != nil
 
 proc iNavFindQuiet(want: string; fn: var Il2CppPtr): bool =
   ## Same lookup, no logging. `find` calls this thousands of times inside one
@@ -1738,6 +1778,101 @@ proc iFindFirstByName(want: string; root: Il2CppPtr; budget: int): Il2CppPtr =
           queue.add c
         inc k
 
+proc iFindTextStep(): int =
+  ## One FRAME's slice of the breadth-first walk, mirroring `iFindStep` exactly
+  ## in shape and budgets -- see that proc's comment for the two-budget
+  ## rationale. The difference is what happens AT each node: instead of a raw
+  ## name compare, this asks the node's GameObject for a TextMeshProUGUI
+  ## component and reads ITS text, because `find`'s own name match cannot see
+  ## what a control DISPLAYS.
+  ##
+  ## fact #88: a caption can live on any of several TMPs under one control, so
+  ## this walks EVERY node (not just leaves, not just the first hit) rather
+  ## than stopping at the first TMP found under a subtree -- each TMP in
+  ## practice sits on its own GameObject, so a full node-by-node walk already
+  ## covers all of them without a second, heavier per-node component listing.
+  var fn: Il2CppPtr = nil
+  if not iNavFindQuiet("Component::GetComponent(String)", fn) or fn == nil:
+    return FindDone
+  let started = cNowMs()
+  var spent = 0
+  while gTxtHead < gTxtQueue.len:
+    if gTxtBudgetLeft <= 0:
+      return FindOutOfBudget
+    if gTxtFound >= InspFindMaxHits:
+      return FindEnoughHits
+    if (spent and 63) == 0 and cNowMs() - started > InspFindSliceMs:
+      return FindOutOfTime
+    let cur = gTxtQueue[gTxtHead]
+    inc gTxtHead
+    inc spent
+    inc gTxtVisited
+    dec gTxtBudgetLeft
+    if not duOk(cur, 0x20'i32) or not iUnityAlive(cur):
+      continue
+    iNoteKlass(cur)
+    # EVERY HOP GUARDED. `cur` is a Transform by contract (queue is seeded and
+    # fed only from Transforms below), so the Component overload is correct
+    # here without the GameObject/Component branch `component` needs.
+    iMark("Component::GetComponent(String) [findtext]", cur)
+    let comp = cast[Il2CppPtr](cInspUPP(fn, cur, gTxtTypeStr, nil))
+    if comp != nil and duOk(comp, 0xE8'i32) and iUnityAlive(comp):
+      # `comp` is a real Component pointer returned by GetComponent by
+      # contract -- unlike `label`'s EXPR, it is never a bare Transform, so
+      # no klass-confusion guard is needed here. `sp` (m_text at +0xE0) IS
+      # guarded exactly as `label` guards it: a known-klass value there means
+      # type confusion, not a String, and must not be dereferenced as one.
+      iNoteKlass(comp)
+      let sp = cReadPtrAt(comp, 0xE0'i32)
+      if sp != nil and not iIsKnownKlass(cast[uint64](sp)) and duOk(sp, 0x18'i32):
+        let txt = suiReadString(sp)
+        if txt.len > 0 and iContains(iLower(txt), gTxtWant):
+          inc gTxtFound
+          iSetVar("f" & $gTxtFound, cast[uint64](cur))
+          let nm = iObjName(cur)
+          let pn = iParentName(cur)
+          iOut("    HIT " & iPtr(cur) &
+               (if nm.len > 0: "  name=\"" & nm & "\"" else: "") &
+               (if pn.len > 0: "  parent=\"" & pn & "\"" else: "") &
+               "  text=\"" & txt & "\"   ($f" & $gTxtFound & ")")
+    var n = 0
+    if iChildCount(cur, n):
+      var k = 0
+      while k < n and k < InspMaxChildren:
+        let c = iChildAt(cur, k)
+        if c != nil:
+          gTxtQueue.add c
+        inc k
+  result = FindDone
+
+proc iFindTextReport(status: int) =
+  ## Same reporting contract as `iFindReport` -- STOPPED EARLY is never
+  ## conflated with NOT PRESENT.
+  iOut("  visited " & $gTxtVisited & " node(s) over " & $gTxtFrames &
+       " frame(s), " & $gTxtFound & " match(es), frontier " &
+       $(gTxtQueue.len - gTxtHead) & " node(s)")
+  if status == FindDone:
+    gTxtActive = false
+    gTxtOwnerIdx = -1
+    gTxtOwnerBatch = -1
+    iOut("  -- the subtree was searched EXHAUSTIVELY. " &
+         (if gTxtFound == 0:
+            "No TMP text containing that substring is PRESENT under this root."
+          else: "Every match is listed above."))
+  elif status == FindEnoughHits:
+    gTxtActive = true
+    iOut("  -- stopped at the match cap (" & $InspFindMaxHits & "). There may " &
+         "be more; `findtext more` continues from the frontier above.")
+  else:
+    gTxtActive = true
+    iOut("  -- STOPPED EARLY on the NODE BUDGET. This is NOT proof the text is " &
+         "absent. Continue with `findtext more` (it RESUMES from the frontier " &
+         "above), or re-run with a bigger budget, or search from a narrower " &
+         "root.")
+  if gTxtFound > 0:
+    iOut("  matches are bound to $f1..$f" & $gTxtFound &
+         " for the rest of this batch")
+
 const InspMaxScenes = 24
 const InspMaxRootsPerScene = 96
 
@@ -1928,6 +2063,128 @@ proc iCmdRoots(toks: seq[string]) =
        "go straight into children/tree/parent/find. The GameObject of each is " &
        "$rgo0..$rgo" & $(n - 1) & " (that is what `component` wants).")
   iOut("  e.g.  find PvE $r9        or   children $r9")
+
+proc iCmdFindText(toks: seq[string]) =
+  ## `findtext SUBSTR [ROOT] [BUDGET]` -- find controls by the TEXT THEY
+  ## DISPLAY, not by GameObject name. Mirrors `find`'s resume/budget/report
+  ## contract exactly (see iCmdFind); the only difference is the per-node
+  ## test.
+  if gTxtActive and gTxtOwnerIdx == gInspCurIdx and gTxtOwnerBatch == gInspBatch:
+    inc gTxtFrames
+    let st = iFindTextStep()
+    if st == FindOutOfTime and gTxtBudgetLeft > 0 and
+       gTxtFrames < InspFindMaxFrames:
+      gFindSuspend = true
+      return
+    iFindTextReport(st)
+    return
+
+  if toks.len < 2:
+    iErr("usage: findtext SUBSTR [ROOT] [BUDGET] | findtext more [BUDGET]")
+    return
+
+  if iLower(toks[1]) == "more":
+    if not gTxtActive:
+      iErr("there is no capped text search to continue. Run `findtext " &
+           "SUBSTR ...` first.")
+      return
+    var budget = InspTextFindDefBudget
+    if toks.len > 2:
+      var b = 0'u64
+      var e = ""
+      if iEval(toks[2], b, e) and int(b) > 0:
+        budget = int(b)
+    if budget > InspTextFindMaxBudget:
+      budget = InspTextFindMaxBudget
+    if not iInspSeedTextType():
+      iErr("il2cpp_string_new failed for \"TextMeshProUGUI\"; nothing was " &
+           "called.")
+      return
+    iOut("  resuming text search for \"" & gTxtWant & "\" from a frontier of " &
+         $(gTxtQueue.len - gTxtHead) & " node(s), budget " & $budget)
+    gTxtBudgetLeft = budget
+    gTxtOwnerIdx = gInspCurIdx
+    gTxtOwnerBatch = gInspBatch
+    gTxtFrames = 1
+    let st = iFindTextStep()
+    if st == FindOutOfTime and gTxtBudgetLeft > 0 and
+       gTxtFrames < InspFindMaxFrames:
+      gFindSuspend = true
+      return
+    iFindTextReport(st)
+    return
+
+  if cNavIcallReady() == 0'i32:
+    iErr("the icall \"UnityEngine.Component::GetComponent(System.String)\" is " &
+         "NOT registered in this runtime, so findtext cannot resolve any " &
+         "components. Nothing was searched.")
+    return
+  if not iInspSeedTextType():
+    iErr("il2cpp_string_new failed for \"TextMeshProUGUI\"; nothing was " &
+         "searched.")
+    return
+
+  let want = toks[1]
+  var root: Il2CppPtr = nil
+  var rootExplicit = false
+  if toks.len > 2:
+    var v = 0'u64
+    var err = ""
+    if not iEval(toks[2], v, err):
+      iErr(err)
+      return
+    root = cast[Il2CppPtr](v)
+    if iRefuseIfGameObject(root, "findtext"):
+      return
+    rootExplicit = true
+    root = iToTransform(root)
+
+  var budget = InspTextFindDefBudget
+  if toks.len > 3:
+    var b = 0'u64
+    var e = ""
+    if iEval(toks[3], b, e) and int(b) > 0:
+      budget = int(b)
+  if budget > InspTextFindMaxBudget:
+    budget = InspTextFindMaxBudget
+
+  gTxtQueue = @[]
+  var seededRoots = 0
+  if rootExplicit:
+    gTxtQueue.add root
+  else:
+    seededRoots = iSceneRoots(gTxtQueue, false)
+    if seededRoots == 0:
+      if gInspPreloader == nil:
+        iErr("scene-root enumeration is unavailable and $preloader is null, " &
+             "so there is nothing to search from. Pass a root explicitly.")
+        return
+      iOut("  NOTE: scene-root enumeration did not work, so this searches " &
+           "only the tree $preloader belongs to. A miss here is NOT proof " &
+           "the text is absent from the game.")
+      gTxtQueue.add iHierRoot(iToTransform(gInspPreloader))
+  gTxtHead = 0
+  gTxtWant = iLower(want)
+  gTxtVisited = 0
+  gTxtFound = 0
+  gTxtActive = false
+  gTxtBudgetLeft = budget
+  gTxtOwnerIdx = gInspCurIdx
+  gTxtOwnerBatch = gInspBatch
+  gTxtFrames = 1
+  iOut("  searching " &
+       (if rootExplicit: "from " & iPtr(root) & " name=\"" & iObjName(root) & "\""
+        else: "ALL " & $seededRoots & " scene root(s)") &
+       " for TMP text containing \"" & want & "\" (case-insensitive; budget " &
+       $budget & " nodes, " & $int(InspFindSliceMs) & "ms per frame, " &
+       "continuing across frames automatically)")
+  let st = iFindTextStep()
+  if st == FindOutOfTime and gTxtBudgetLeft > 0 and
+     gTxtFrames < InspFindMaxFrames:
+    gTxtActive = true
+    gFindSuspend = true
+    return
+  iFindTextReport(st)
 
 proc iCmdFind(toks: seq[string]) =
   ## `find NAME [ROOT] [BUDGET]`
@@ -3345,6 +3602,9 @@ proc iCmdHelp() =
   iOut("    find NAME [ROOT] [BUDGET]     name search; NO ROOT = ALL scenes")
   iOut("    find NAME in ROOTNAME         narrow by a root named, not pointed")
   iOut("    find more [BUDGET]            RESUME a search that hit its cap")
+  iOut("    findtext SUBSTR [ROOT] [BUDGET]  search by TEXT A CONTROL DISPLAYS")
+  iOut("                                  (TMP_Text only), not GameObject name")
+  iOut("    findtext more [BUDGET]        RESUME a text search that hit its cap")
   iOut("    component EXPR TypeName       GameObject/Transform -> component")
   iOut("    components EXPR [BaseType]    LIST every component, named  -> $k0..")
   iOut("                                  e.g.  component $g0 Button   -> $comp")
@@ -3501,6 +3761,8 @@ proc iExec(line: string) =
     iCmdChildren(toks)
   of "find":
     iCmdFind(toks)
+  of "findtext":
+    iCmdFindText(toks)
   of "tree":
     iCmdTree(toks)
   of "roots":

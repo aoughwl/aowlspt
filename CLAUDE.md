@@ -129,6 +129,8 @@ parent EXPR [N]          children EXPR      tree EXPR [DEPTH]
 roots                    every scene root -> $r0..$rN (transforms; GOs are $rgoN)
 find NAME [ROOT] [BUDGET]      NO ROOT = ALL scenes    find NAME in ROOTNAME
 find more [BUDGET]       dump EXPR [N]      fields EXPR [N]
+findtext SUBSTR [ROOT] [BUDGET]   search by the TEXT A CONTROL DISPLAYS
+                          (TMP_Text only), not GameObject name    findtext more [BUDGET]
 component EXPR TypeName  -> $comp           rect EXPR       label EXPR
 scan EXPR N TYPE VALUE   canvas EXPR        call TARGET SIG [ARGS]   image
 click EXPR / invoke EXPR         open [GROUP] / tab EXPR [0|1]
