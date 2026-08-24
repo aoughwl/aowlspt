@@ -104,6 +104,16 @@ const ModsMaxFaults = 4
 const ModsOffIsOn = 0x120'i32
 const ModsOffGroup = 0x110'i32
 
+## `UnityEngine.UI.Selectable.m_Interactable` / `.m_TargetGraphic`, and
+## `UnityEngine.UI.Graphic.m_RaycastTarget` -- from the field table
+## (`il2cpp_resolve.py fields UnityEngine.UI.Selectable` /
+## `...Graphic`), never guessed. A click that never reaches `m_IsOn` can be
+## the group question OR a Toggle that cannot receive the click at all; these
+## three fields are what answer the second question instead of assuming it.
+const ModsOffInteractable = 0xd8'i32
+const ModsOffTargetGraphic = 0xe0'i32
+const GfxOffRaycastTarget = 0x3a'i32
+
 ## `UnityEngine.UI.LayoutElement` -- from the field table
 ## (`il2cpp_resolve.py fields UnityEngine.UI.LayoutElement`), never guessed.
 ## Unity's sentinel for "not set" on any of these is a negative value (-1);
@@ -2205,22 +2215,77 @@ proc gfxBuildStrip(panelT, donorStripGo, donorButtonGo, donorButtonT: Il2CppPtr;
             "the panel's layout group sizes it to its own two buttons."
   # THE GROUP QUESTION, MEASURED PER STRIP (the two buttons made just above),
   # exactly the check `modsBuildSubtabs` uses -- same donor, same question.
-  # Native means the game's own ToggleGroup logic runs the strip; anything
-  # else means exclusivity stays OURS, which `gfxApply`/`gfxTickBody` already
-  # enforce every frame with `SetIsOnWithoutNotify`, so a "not native" result
-  # here is a fact to log, not a missing feature.
-  if into.len == 2 and duOk(into[0], ModsOffGroup + 8'i32) and
-     duOk(into[1], ModsOffGroup + 8'i32):
+  # MEASURED (fact #117): both buttons came out with m_Group=0 -- unlike the
+  # MODS strip, the buttons here are cloned SEPARATELY from the strip
+  # (`modsClone(donorButtonGo)`, not part of the strip's own Instantiate), so
+  # Unity has no cloned hierarchy to remap an external reference onto and the
+  # field is left null. The technique `modsBuildSubtabs` uses is passive (it
+  # only NULLS a clone that inherited the STOCK group); there is nothing to
+  # null here. So: if the strip clone itself carries a ToggleGroup component
+  # (the donor "Toggles" object is the group owner, and that identity comes
+  # along with the strip's own Instantiate), WRITE both buttons' m_Group onto
+  # it -- read-validate-write, on a clone we made, never on a stock object.
+  var groupWired = false
+  let stripGroup = modsComponent(stripT, "ToggleGroup")
+  if stripGroup != nil and into.len == 2 and
+     duOk(into[0], ModsOffGroup + 8'i32) and duOk(into[1], ModsOffGroup + 8'i32):
     let g0 = cReadPtrAt(into[0], ModsOffGroup)
     let g1 = cReadPtrAt(into[1], ModsOffGroup)
-    okLog "postfx subtab: " & iObjName(panelT) & "'s strip toggle group " &
-          "check -> GRAPHICS m_Group=" & iPtr(g0) & " POSTFX m_Group=" &
-          iPtr(g1) & "; exclusivity is " &
-          (if g0 != nil and g0 == g1: "NATIVE (both point at the same " &
-             "cloned ToggleGroup, so the game's own group logic runs the " &
-             "strip)"
-           else: "OURS (no shared cloned group; enforced every frame by " &
-             "gfxApply/gfxTickBody instead)")
+    if g0 == nil and g1 == nil:
+      discard cUxWritePtr(into[0], ModsOffGroup, stripGroup)
+      discard cUxWritePtr(into[1], ModsOffGroup, stripGroup)
+      groupWired = true
+      okLog "postfx subtab: " & iObjName(panelT) & "'s strip toggle group " &
+            "-> both buttons came out m_Group=NULL (no Instantiate remap: " &
+            "the buttons are cloned separately from the strip), so both " &
+            "were WIRED onto the strip's own cloned ToggleGroup " & iPtr(stripGroup) &
+            " -- native exclusivity now runs off that group."
+    elif g0 != nil and g0 == g1:
+      groupWired = true
+      okLog "postfx subtab: " & iObjName(panelT) & "'s strip toggle group " &
+            "check -> GRAPHICS m_Group=" & iPtr(g0) & " POSTFX m_Group=" &
+            iPtr(g1) & "; exclusivity is NATIVE already (both point at the " &
+            "same cloned ToggleGroup)"
+    else:
+      okLog "postfx subtab: " & iObjName(panelT) & "'s strip toggle group " &
+            "check -> GRAPHICS m_Group=" & iPtr(g0) & " POSTFX m_Group=" &
+            iPtr(g1) & "; NOT wired (neither both-null nor matching), " &
+            "left alone -- exclusivity stays OURS, enforced every frame by " &
+            "gfxApply/gfxTickBody"
+  else:
+    okLog "postfx subtab: " & iObjName(panelT) & "'s strip clone carries no " &
+          "reachable ToggleGroup component, so m_Group could not be wired; " &
+          "exclusivity stays OURS, enforced every frame by " &
+          "gfxApply/gfxTickBody"
+  # THE CLICK QUESTION, MEASURED NOT ASSUMED. A group wiring fix does nothing
+  # if the click never reaches the Toggle at all. Read (never blind-write)
+  # Selectable.m_Interactable and the target Graphic's m_RaycastTarget for
+  # each button and say what was found; only flip m_Interactable when it
+  # measures false, because THAT alone is unambiguously wrong for a control
+  # meant to be clickable -- raycastTarget/occlusion is reported, not patched,
+  # since fixing it blind could as easily be the wrong sibling.
+  var i2 = 0
+  while i2 < into.len:
+    let tog = into[i2]
+    if tog != nil and duOk(tog, ModsOffInteractable + 1'i32):
+      let interact = cSwReadU8(tog, ModsOffInteractable) != 0'i32
+      var rtStr = "n/a"
+      if duOk(tog, ModsOffTargetGraphic + 8'i32):
+        let tg = cReadPtrAt(tog, ModsOffTargetGraphic)
+        if tg != nil and duOk(tg, GfxOffRaycastTarget + 1'i32):
+          rtStr = (if cSwReadU8(tg, GfxOffRaycastTarget) != 0'i32: "true" else: "FALSE")
+        else:
+          rtStr = "no reachable targetGraphic"
+      if not interact:
+        discard cUxWritePtr(tog, ModsOffInteractable, cast[Il2CppPtr](1))
+        warn "postfx subtab: " & iObjName(panelT) & " strip button " & $i2 &
+             " measured m_Interactable=FALSE (raycastTarget=" & rtStr &
+             ") -- a click could never reach it. Flipped to true."
+      else:
+        okLog "postfx subtab: " & iObjName(panelT) & " strip button " & $i2 &
+              " measured m_Interactable=true, targetGraphic.raycastTarget=" &
+              rtStr & "."
+    i2 = i2 + 1
   result = true
 
 proc gfxApply(sel: int) =
@@ -2386,6 +2451,14 @@ proc gfxBuild(): bool =
   gfxSeedSelection()
   result = true
 
+## Throttled tick diagnostic (fact from the live run: gfxTickBody's neither-
+## panel-active early return is CORRECT behaviour, but it also made an
+## experiment look like "enforcement is dead" when the player was simply on
+## another tab. This says which branch the tick took, ONCE per settings
+## screen open -- not per frame -- so the next person can tell "correctly
+## idle" from "silently broken" without re-running the experiment.
+var gGfxTickDiagSaid = false
+
 proc gfxTickBody() =
   if not gGfxOn or gGfxFaults >= GfxMaxFaults:
     return
@@ -2393,12 +2466,23 @@ proc gfxTickBody() =
     if gModsLastTabPtr != nil and gGfxTried < GfxMaxBuildTries:
       discard gfxBuild()
     return
+  if gModsLastTabPtr == nil:
+    gGfxTickDiagSaid = false          # settings screen closed; re-arm for next open
   if gGfxPanelGo == nil or gGfxPostGo == nil:
     return
   if not duOk(gGfxPanelGo, 0x20'i32) or not duOk(gGfxPostGo, 0x20'i32):
     return
   let gfxUp = modsGoActive(gGfxPanelGo)
   let postUp = modsGoActive(gGfxPostGo)
+  if not gGfxTickDiagSaid:
+    gGfxTickDiagSaid = true
+    okLog "postfx subtab: tick diagnostic (once per open) -> " &
+          "gfxPanelActive=" & $gfxUp & " postPanelActive=" & $postUp &
+          "; branch = " &
+          (if not gfxUp and not postUp: "IDLE (player on another tab; " &
+             "nothing touched, this is correct)"
+           elif gfxUp and postUp: "BOTH-ACTIVE (forcing back to selection)"
+           else: "NORMAL (watching the strip for a rising edge)")
   if not gfxUp and not postUp:
     # The player is on some other tab entirely. Do NOT touch anything -- the
     # game owns the screen here. Just remember that re-entering starts on
