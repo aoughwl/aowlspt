@@ -2004,15 +2004,20 @@ proc main(): int =
   # identical from outside unless entry itself is logged. Written every run,
   # regardless of which branch runs next.
   let verdictPath = joinPath(root, "aowlspt\\aowlspt-autoenter.log")
-  discard writeTextFile(verdictPath,
-    "auto-enter: entered, clientExited=" & $clientExited &
+  # `writeTextFile` OVERWRITES, there is no append helper -- so every write
+  # below carries this entry line along with it, on purpose. Losing "how did
+  # we get here" every time a later line replaced it is what made the last
+  # live run's single surviving line ambiguous.
+  let entryLine = "auto-enter: entered, clientExited=" & $clientExited &
     " haveChoice=" & $haveChoice & " noProfile=" & $o.noProfile &
-    " noAutoEnter=" & $o.noAutoEnter & " profile=" & chosen.id & "\n")
+    " noAutoEnter=" & $o.noAutoEnter & " profile=" & chosen.id
+  discard writeTextFile(verdictPath, entryLine & "\n")
 
   if clientExited:
     warn "the client exited while starting; see " & hostLog
     discard writeTextFile(verdictPath,
-      "auto-enter verdict: SKIPPED -- client exited while starting\n")
+      entryLine & "\nauto-enter verdict: SKIPPED -- client exited while " &
+      "starting\n")
   elif haveChoice and not o.noProfile and not o.noAutoEnter:
     # The client's own character-select screen shows on every boot
     # regardless of `-token` -- that is measured, not assumed (see the
@@ -2091,16 +2096,34 @@ proc main(): int =
     # internally -- so a single `screens()` call could legitimately block
     # for minutes, exactly matching "one 'before' line, no 'after', ~280s
     # gone". `pinned = true` is what actually forces `Ui.timeoutMs` to win.
-    var u = initUi(root, 5000, true)
+    #
+    # SECOND BUG, found the same way: `initUi`'s `live` argument must be the
+    # INSTALL directory that actually holds `aowlspt-inspect.txt` and
+    # `aowlspt-host.log` (`D:\Aowlspt\aowlspt`) -- but this launcher's own
+    # `root` is one level ABOVE that (`D:\Aowlspt`, where
+    # `EscapeFromTarkov.exe` sits; see `hostLog = joinPath(root,
+    # "aowlspt\\aowlspt-host.log")` above). Passing `root` straight to
+    # `initUi` pointed every read/write at `D:\Aowlspt\aowlspt-inspect.txt`
+    # -- a file the host never looks at -- so no batch could ever be
+    # answered, independent of any timeout. `joinPath(root, "aowlspt")` is
+    # the fix.
+    #
+    # THIRD: 5s was measured as too aggressive for this channel -- a
+    # healthy `EFT.UI.PreloaderUI::Update`-drained batch routinely takes
+    # 10-30s, so 5s was timing out a live channel and reading it as "no
+    # screen". Raised to 20s per attempt (still pinned, still a real
+    # ceiling), and the wall-clock wait bound raised to 270s to match (the
+    # client legitimately takes 90s+ to reach the selector).
+    var u = initUi(joinPath(root, "aowlspt"), 20000, true)
     var waitTries = 0
     var screenUp = false
     var waitErr = ""
     let waitStart = cNowMs()
     discard writeTextFile(verdictPath,
-      "auto-enter: before screen-wait loop\n")
+      entryLine & "\nauto-enter: before screen-wait loop\n")
     # The bound is WALL-CLOCK, not "N attempts", so a call that runs long
-    # despite the pin still cannot keep this looping past 150s.
-    while cNowMs() - waitStart < 150000'i64 and not screenUp:
+    # despite the pin still cannot keep this looping past 270s.
+    while cNowMs() - waitStart < 270000'i64 and not screenUp:
       var ss = default(ScreenSet)
       var active = triUnknown
       if screens(u, "Menu UI", ss):
@@ -2111,21 +2134,21 @@ proc main(): int =
       else:
         waitErr = u.lastErr
       discard writeTextFile(verdictPath,
-        "auto-enter: wait iter " & $waitTries & " elapsed=" &
+        entryLine & "\nauto-enter: wait iter " & $waitTries & " elapsed=" &
         $(cNowMs() - waitStart) & "ms active=" & $active &
         " err=" & waitErr & "\n")
       if not screenUp:
         cSleepMs 3000
         inc waitTries
     discard writeTextFile(verdictPath,
-      "auto-enter: after screen-wait loop, screenUp=" & $screenUp &
-      " waitTries=" & $waitTries & " waitErr=" & waitErr & "\n")
+      entryLine & "\nauto-enter: after screen-wait loop, screenUp=" &
+      $screenUp & " waitTries=" & $waitTries & " waitErr=" & waitErr & "\n")
     if not screenUp:
       let msg = "auto-enter verdict: INCONCLUSIVE -- " &
         "CharacterSelectionScreen under Menu UI never became active " &
-        "within 150s. " & waitErr
+        "within 270s. " & waitErr
       warn msg
-      discard writeTextFile(verdictPath, msg & "\n")
+      discard writeTextFile(verdictPath, entryLine & "\n" & msg & "\n")
       note "left at whatever screen is actually up; check liveInspector is " &
            "on in aowlspt-host.json, or pass --no-auto-enter to silence this"
     else:
@@ -2150,13 +2173,13 @@ proc main(): int =
       if pressed:
         let msg = "auto-enter verdict: PASS (verified closed) -- " & lastMsg
         ok msg
-        discard writeTextFile(verdictPath, msg & "\n")
+        discard writeTextFile(verdictPath, entryLine & "\n" & msg & "\n")
       else:
         let msg = "auto-enter verdict: FAIL (screen still up, or a " &
           "candidate could not be pressed, after " & $tries & " attempt(s)) " &
           "-- " & lastMsg
         warn msg
-        discard writeTextFile(verdictPath, msg & "\n")
+        discard writeTextFile(verdictPath, entryLine & "\n" & msg & "\n")
         note "left at the manual selector; pass --no-auto-enter to silence " &
              "this warning next time"
 
