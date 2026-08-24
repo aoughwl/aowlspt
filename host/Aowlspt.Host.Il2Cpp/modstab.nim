@@ -1321,7 +1321,23 @@ proc modsReassertLabels() =
         discard swRelabelControl(cast[Il2CppPtr](0), gModsLabelTmp[i],
                                  gModsLabelText[i])
     i = i + 1
-  if clobbered == 0 and reaped == 0:
+  # THE STABILITY GATE MUST NOT TRUST "reaped == 0 this poll" ON ITS OWN: that
+  # is also what a poll BEFORE the late spawn looks like, since there is
+  # nothing to reap yet. Left alone, the counter can reach ModsStableEnough
+  # and switch this whole poll off before the *ToggleSpawner clone has ever
+  # spawned its stray child (fact #93/#87) -- which is exactly the bug where
+  # ControlsToggleSpawner(Clone) kept a second, unlabelled toggle forever.
+  # So "stable" additionally requires every reap target to ALREADY be caught
+  # up with its donor's child count, checked fresh every poll.
+  var strayRemaining = 0
+  var s = 0
+  while s < gModsReapClone.len and s < ModsMaxSubtabs + 1:
+    let wantS = modsChildCount(gModsReapDonor[s])
+    let haveS = modsChildCount(gModsReapClone[s])
+    if wantS > 0 and haveS > wantS:
+      strayRemaining = strayRemaining + 1
+    s = s + 1
+  if clobbered == 0 and reaped == 0 and strayRemaining == 0:
     inc gModsLabelStable
     if gModsLabelStable == ModsStableEnough:
       okLog "mods tab: all " & $gModsLabelTmp.len & " label(s) have stayed " &
@@ -1899,19 +1915,67 @@ proc gfxNoteFault(what: string) =
            "session. The stock POSTFX tab could NOT be restored -- open " &
            "another tab and back, or restart, to get it."
 
+proc gfxContentContainerT(panelT: Il2CppPtr; why: var string): Il2CppPtr =
+  ## The panel's own content container, found BY STRUCTURE rather than by a
+  ## name borrowed from a different panel. Every stock panel under
+  ## SettingsScreen uses its own name for this child ("Container",
+  ## "Other Settings", "Panel", "Toggles" -- measured across all five stock
+  ## panels), so no single literal name is safe to hardcode. What every one of
+  ## them DOES share is an "Overlay Layer" child (holding a SettingsTooltip)
+  ## that is never the content: skip that, skip anything named like a
+  ## tooltip, and if exactly one direct child remains, that is the container.
+  ##
+  ## (No `strutils` needed here -- the one non-"Overlay Layer" name that is
+  ## not content on any measured panel is the literal "SettingsTooltip".)
+  ## Verified against the measured tree of all five panels: Game Settings
+  ## (Container / Overlay Layer), Graphics Settings (Other Settings /
+  ## Overlay Layer), PostFX Settings (Panel / Overlay Layer), Sound Settings
+  ## (Panel / SettingsTooltip) all resolve to exactly one candidate. Control
+  ## Settings (Toggles / Content / Overlay Layer) does NOT -- two candidates
+  ## remain -- so this REFUSES rather than guessing there; that panel is not
+  ## one this feature needs a container from.
+  result = nil
+  why = ""
+  if panelT == nil or not duOk(panelT, 0x20'i32):
+    why = "the panel transform itself is not readable"
+    return
+  var n = 0
+  if not iChildCount(panelT, n):
+    why = "child count of " & iObjName(panelT) & " could not be read"
+    return
+  var candidate: Il2CppPtr = nil
+  var candidates = 0
+  var i = 0
+  while i < n and i < 16:
+    let c = iChildAt(panelT, i)
+    if c != nil and duOk(c, 0x20'i32):
+      let nm = iObjName(c)
+      if nm != "Overlay Layer" and nm != "SettingsTooltip":
+        candidates = candidates + 1
+        candidate = c
+    i = i + 1
+  if candidates != 1:
+    why = iObjName(panelT) & " has " & $candidates & " non-overlay child(ren) " &
+          "(expected exactly 1); refusing to guess which one is the content " &
+          "container"
+    return
+  result = candidate
+
 proc gfxBuildStrip(panelT, donorStripGo, donorButtonGo, donorButtonT: Il2CppPtr;
-                   into: var seq[Il2CppPtr]; containerName: string): bool =
+                   into: var seq[Il2CppPtr]; stripGoOut: var Il2CppPtr): bool =
   ## One strip of two buttons inside one stock panel. The strip and the buttons
   ## are CLONES; the panel they go into is the game's, and the only thing done
   ## to it is `SetParentAndAlign` of an object of ours.
   result = false
   into = @[]
-  let stackT = modsFindNamed(panelT, containerName, 4)
+  stripGoOut = nil
+  var why = ""
+  let stackT = gfxContentContainerT(panelT, why)
   if stackT == nil:
-    warn "postfx subtab: no " & containerName & " inside the stock panel " &
-         iObjName(panelT) & ", so there is nowhere to put the subtab strip " &
-         "that the stock layout group would lay out. Nothing was added to " &
-         "that panel."
+    warn "postfx subtab: no content container inside the stock panel " &
+         iObjName(panelT) & " (" & why & "), so there is nowhere to put the " &
+         "subtab strip that the stock layout group would lay out. Nothing " &
+         "was added to that panel."
     return
   let stackGo = iGameObjectOf(stackT)
   if stackGo == nil:
@@ -2036,16 +2100,6 @@ proc gfxBuild(): bool =
     gfxNoteFault("no PostFxToggleSpawner in the tab bar, so there is no stock " &
                  "tab to fold in. Nothing was changed.")
     return
-  var containerWhy = ""
-  let stockContainerGo = swRowContainerGo(gModsLastTabPtr, containerWhy)
-  let stockContainerT = (if stockContainerGo != nil:
-                           modsTransformOf(stockContainerGo) else: nil)
-  let containerName = (if stockContainerT != nil: iObjName(stockContainerT)
-                       else: "")
-  if containerName.len == 0:
-    gfxNoteFault("no row-container name to look for (" & containerWhy &
-                 "); nothing was changed")
-    return
   let donorStripGo = iGameObjectOf(donorStrip)
   let donorButtonGo = iGameObjectOf(donorButton)
   gGfxPanelGo = iGameObjectOf(gfxPanel)
@@ -2055,15 +2109,26 @@ proc gfxBuild(): bool =
     gfxNoteFault("a GameObject was not reachable; nothing was changed")
     return
   # BOTH STRIPS FIRST. The stock tab is hidden only once both exist.
+  var stripAGo: Il2CppPtr = nil
+  var stripBGo: Il2CppPtr = nil
   if not gfxBuildStrip(gfxPanel, donorStripGo, donorButtonGo, donorButton,
-                       gGfxTogA, containerName):
+                       gGfxTogA, stripAGo):
     gfxNoteFault("the strip inside Graphics Settings was not built; the stock " &
                  "POSTFX tab is left exactly where it was")
     return
   if not gfxBuildStrip(postPanel, donorStripGo, donorButtonGo, donorButton,
-                       gGfxTogB, containerName):
+                       gGfxTogB, stripBGo):
+    # Strip A already came out usable and is live in Graphics Settings. Left
+    # alone it would be a stray, non-functional row -- exactly the kind of
+    # half-built residue this feature promises not to leave. Hide it (never
+    # destroy; the clone discipline for this file is SetActive only) so the
+    # screen is back to stock, matching the fault-ceiling promise below.
+    if stripAGo != nil:
+      discard modsSetActive(stripAGo, false)
+    gGfxTogA = @[]
     gfxNoteFault("the strip inside PostFX Settings was not built; the stock " &
-                 "POSTFX tab is left exactly where it was")
+                 "POSTFX tab is left exactly where it was, and the Graphics " &
+                 "Settings strip that was already built has been hidden")
     return
   gGfxLast = @[false, false]
   # NOW, and only now, the stock tab comes out of the top row.
