@@ -135,12 +135,16 @@ Options
   --new NAME     create a profile called NAME and bind it before launch
   --side SIDE    Usec or Bear, for --new (default Usec)
   --pick         show the launcher's own profile picker before starting the
-                 game. OFF by default: the game has its own character-select
-                 screen, and asking twice is the same choice made twice. With
-                 this off (the default) the launcher picks a profile without
-                 asking -- the one you played last, else the most recent -- and
-                 binds it, so the session is authenticated and the in-game
-                 screen is the only thing that asks you anything.
+                 game. OFF by default: the launcher picks a profile without
+                 asking -- the one you played last, else the most recent --
+                 binds it, and (see --no-auto-enter) presses the matching
+                 in-game character-select slot for you, so the TUI is the
+                 only place you are ever asked.
+  --no-auto-enter
+                 do not auto-press the in-game character-select screen after
+                 a profile was bound. The client still shows it, exactly as
+                 before this feature; use this if the auto-press ever picks
+                 the wrong slot, or to debug the selector itself.
   --no-profile   start the client with no -token, so it logs in on its own.
                  The backend binds no session for a tokenless client, so this
                  is the first-run/character-creation path only -- it cannot
@@ -201,8 +205,14 @@ type
     noProfile: bool
     pick: bool
       ## `--pick`: restore the launcher's own TUI profile picker. Off by
-      ## default -- the launcher boots straight to the game, whose in-game
-      ## character-select is the single place a profile is chosen.
+      ## default -- the TUI is now the ONLY place a profile is chosen (see
+      ## `--no-auto-enter`); the in-game character-select is auto-pressed
+      ## rather than shown to a human.
+    noAutoEnter: bool
+      ## `--no-auto-enter`: the escape hatch. Restores the old behaviour --
+      ## the client boots with a bound token but still stops at its own
+      ## character-select screen for a human to click through, exactly as
+      ## before this feature existed.
     port: int
       ## Only meaningful when `portGiven`. The port actually used is resolved
       ## in `main`, once `root` is known and `backend.json` can be read.
@@ -257,6 +267,8 @@ proc parseArgs(): Options =
       result.noProfile = true
     elif a == "--pick":
       result.pick = true
+    elif a == "--no-auto-enter":
+      result.noAutoEnter = true
     elif a == "--wait":
       result.wait = true
     elif a == "--no-backend":
@@ -1988,6 +2000,37 @@ proc main(): int =
 
   if clientExited:
     warn "the client exited while starting; see " & hostLog
+  elif haveChoice and not o.noProfile and not o.noAutoEnter:
+    # The client's own character-select screen shows on every boot
+    # regardless of `-token` -- that is measured, not assumed (see the
+    # "Profile" heading above: `onProfilesV2` always renders a slot, and
+    # `RunCharacterSelectionFlow` is a client-side flow the wire cannot skip).
+    # So the TUI choice above still has to be re-asserted on screen, and doing
+    # that here -- unattended, the instant the screen exists -- is what makes
+    # the TUI the ONLY place a human is asked. This rides the exact mechanism
+    # `tools/entergame.py` already proved safe (find the live `Menu UI` copy
+    # of `CharacterSelectionScreen`, match the slot by its DISPLAYED title
+    # rather than its lying object name, fire the `DefaultUIButton` OnClick
+    # UnityEvent at +0x120) rather than a new, unverified host detour -- this
+    # backend only ever fills the "regular" slot (see `onProfilesV2`), whose
+    # displayed title is "PvE", so that is the fixed target.
+    #
+    # Best-effort and silent-safe: if `tools/entergame.py` (or the inspector
+    # it drives) is missing -- a packaged install with no source checkout --
+    # this warns once and the client is left exactly as it is today, sitting
+    # at the selector for a human to click. `--no-auto-enter` is the explicit
+    # way to get that same fallback on purpose.
+    let entergame = joinPath(root, "tools\\entergame.py")
+    if not fileExists(entergame):
+      note "no tools\\entergame.py next to this install -- the character-" &
+           "select screen will still show for a click. Run from a source " &
+           "checkout, or pass --no-auto-enter to silence this."
+    else:
+      var egExe = "python"
+      var egCwd = root
+      var egCmd = "python \"" & entergame & "\" --mode \"PvE\""
+      discard cSpawnQuiet(toCString(egExe), toCString(egCwd), toCString(egCmd))
+      ok "auto-entering past the character-select screen (tools\\entergame.py, background)"
 
   if o.clientWindow:
     # The second window, for anyone who wants it. It is another copy of this
