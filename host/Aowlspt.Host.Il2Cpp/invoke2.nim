@@ -93,6 +93,7 @@ const
   Mi2Instantiate     = 11'i32
   Mi2AddComponentTy  = 12'i32
   Mi2AddComponentGen = 13'i32
+  Mi2SetAsFirstSibling = 14'i32
 
 # ---------------------------------------------------------------------------
 # Ladder state

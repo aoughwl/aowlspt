@@ -235,6 +235,18 @@ proc modsTransformOf(go: Il2CppPtr): Il2CppPtr =
     return nil
   result = cMi2CallPP(fn, go)
 
+proc modsSetFirstSibling(t: Il2CppPtr): bool =
+  ## `Transform::SetAsFirstSibling` -- moves `t` to sibling index 0 among its
+  ## PARENT's children. Only ever called on a strip WE cloned; nothing about
+  ## the parent or its other children is touched, it is simply where in the
+  ## parent's child list our own object sits.
+  result = false
+  let fn = mi2Fn(Mi2SetAsFirstSibling)
+  if fn == nil or t == nil or not duOk(t, 0x20'i32):
+    return
+  discard cMi2CallPP(fn, t)              # void method; the "return" is unused
+  result = true
+
 proc modsParentOf(t: Il2CppPtr): Il2CppPtr =
   ## `Transform::get_parent`. Guarded like every other hop: an ICALL on a
   ## destroyed object faults inside Unity's C++ where no guard of ours reaches.
@@ -1897,6 +1909,7 @@ var gGfxLast: seq[bool] = @[]
 ## Which subtab is showing: 0 = graphics, 1 = postfx.
 var gGfxSel = 0
 var gGfxSaid = false
+var gGfxBothActiveSaid = false
 
 proc gfxNoteFault(what: string) =
   inc gGfxFaults
@@ -2033,6 +2046,24 @@ proc gfxBuildStrip(panelT, donorStripGo, donorButtonGo, donorButtonT: Il2CppPtr;
          iObjName(panelT) & "; REFUSING to hide the stock POSTFX tab, because " &
          "a half-built strip with no way back is worse than no feature."
     return
+  # DOCK AT THE TOP, NOT THE BOTTOM. The panel's own layout group lays out
+  # children in sibling order, and `modsSetParent` always appends -- so the
+  # strip landed AFTER the tall scrolling settings list and read as floating
+  # in the middle of the panel instead of docked by the tabs. Move it to
+  # sibling index 0, then read the order back and REFUSE (hide the strip,
+  # same as any other build failure here) rather than ship it in the wrong
+  # place if that did not stick.
+  discard modsSetFirstSibling(stripT)
+  var afterN = 0
+  if iChildCount(stackT, afterN) and afterN > 0:
+    let firstChild = iChildAt(stackT, 0)
+    if firstChild != stripT:
+      warn "postfx subtab: SetAsFirstSibling did not stick in " &
+           iObjName(panelT) & " -- the strip is still not sibling 0, so it " &
+           "would still lay out below the settings list. Hiding it rather " &
+           "than shipping it in the wrong place."
+      discard modsSetActive(strip, false)
+      return
   result = true
 
 proc gfxApply(sel: int) =
@@ -2139,20 +2170,35 @@ proc gfxBuild(): bool =
                  "the top row would show five tabs AND a duplicate subtab. " &
                  "The strips are built but the fold-in is incomplete.")
     return
-  # THE OUTCOME CHECK: four buttons in the top row, not five.
+  # THE OUTCOME CHECK: 5 stock tabs minus the one just hidden, PLUS the MODS
+  # clone if it exists. Hardcoding "4" was a false alarm waiting to happen:
+  # with settingsModsTab also on, the correct live count is 5 (5 stock + 1
+  # MODS - 1 hidden POSTFX), and a constant that assumes a stock-only world
+  # reported a CORRECT state as suspicious. Derived from the same flag the
+  # MODS feature itself sets when its clone actually exists, not re-guessed.
+  let expectTabs = 4 + (if gModsBuilt: 1 else: 0)
   let liveTabs = modsActiveChildren(toggles)
-  if liveTabs == 4:
-    okLog "postfx subtab: the top row now shows 4 tab button(s) -- POSTFX has " &
-          "been folded into Graphics as a subtab. The stock button is HIDDEN, " &
-          "never destroyed, and comes back on its own if this feature turns " &
+  if liveTabs == expectTabs:
+    okLog "postfx subtab: the top row now shows " & $liveTabs & " tab " &
+          "button(s) (expected " & $expectTabs & ", accounting for the MODS " &
+          "clone = " & $gModsBuilt & ") -- POSTFX has been folded into " &
+          "Graphics as a subtab. The stock button is HIDDEN, never " &
+          "destroyed, and comes back on its own if this feature turns " &
           "itself off."
   else:
     warn "postfx subtab: the top row shows " & $liveTabs & " active tab " &
-         "button(s); 4 was expected after hiding POSTFX. Something else is " &
+         "button(s); " & $expectTabs & " was expected after hiding POSTFX " &
+         "(4 stock + MODS clone=" & $gModsBuilt & "). Something else is " &
          "adding or hiding buttons -- reporting it rather than assuming."
   gGfxBuilt = true
   gGfxSel = 0
-  gfxApply(0)
+  # DO NOT force either panel active here. The build ran while the player is
+  # on the GAME tab (the guard above requires it), so `gGfxPanelGo` /
+  # `gGfxPostGo` are the game's to show or hide -- forcing Graphics Settings
+  # on right now was DEFECT A: it left Graphics Settings active ALONGSIDE
+  # Game Settings, with our strip drawn over the wrong panel. Panel
+  # visibility is driven only by `gfxTickBody`'s steady-state checks, and
+  # only once the game itself has actually put one of the two panels up.
   result = true
 
 proc gfxTickBody() =
@@ -2182,7 +2228,15 @@ proc gfxTickBody() =
   if gfxUp and postUp:
     # Both stock panels drawn at once -- the same failure the MODS tab had, and
     # it happens here when the game switches TO graphics while our subtab still
-    # says postfx. Resolve towards what the strip says.
+    # says postfx. Resolve towards what the strip says. THE OUTCOME, logged
+    # once so a real recurrence is visible without spamming every frame it
+    # persists.
+    if not gGfxBothActiveSaid:
+      gGfxBothActiveSaid = true
+      warn "postfx subtab: BOTH Graphics Settings and PostFX Settings were " &
+           "active at once (activeSelf true/true); forcing back to " &
+           "selection " & $gGfxSel & " so exactly one is up, as the game " &
+           "itself would enforce for its own stock tabs."
     gfxApply(gGfxSel)
     return
   # Which subtab did the player just press? Either strip may be the visible one,

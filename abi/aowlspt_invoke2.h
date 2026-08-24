@@ -152,6 +152,7 @@ typedef struct AowlMi2Target {
 #define AOWL_MI2_INSTANTIATE        11
 #define AOWL_MI2_ADDCOMPONENT_TYPE  12
 #define AOWL_MI2_ADDCOMPONENT_GEN   13
+#define AOWL_MI2_SET_AS_FIRST_SIBLING 14
 
 static const AowlMi2Target aowl_mi2_targets[] = {
     /* UnityEngine.Component::get_gameObject -- instance, 0 args -> GameObject.
@@ -245,6 +246,18 @@ static const AowlMi2Target aowl_mi2_targets[] = {
     { "UnityEngine.GameObject::AddComponent<T>", 0x2A9AE90u,
       { 0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x6C,0x24,0x10,0x48,0x89,0x74,
         0x24,0x18,0x57 }, 16 },
+
+    /* UnityEngine.Transform::SetAsFirstSibling() -- instance, 0 args -> void.
+     * Resolved offline (tools/il2cpp_resolve.py, type UnityEngine.Transform,
+     * rid=3239) against the same GameAssembly.dll/global-metadata pair used
+     * for every other entry in this table; not shared (no --shared
+     * annotation). Real body in the `il2cpp` section, not a thunk. Called via
+     * aowl_mi2_call_p_p (its void* return is discarded) to reorder a strip
+     * WE cloned to sibling index 0 within its parent -- nothing about the
+     * parent or its other children is touched. */
+    { "UnityEngine.Transform::SetAsFirstSibling", 0x52B9CF0u,
+      { 0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,0xBB,0xAE,0xE1,0x01,
+        0x48,0x8B,0xD9 }, 16 },
 };
 
 #define AOWL_MI2_TARGET_COUNT \
