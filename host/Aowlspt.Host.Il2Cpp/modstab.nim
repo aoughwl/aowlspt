@@ -123,8 +123,10 @@ const ModsOffLePreferredHeight = 0x30'i32
 const ModsOffLeFlexibleHeight = 0x38'i32
 
 ## At most this many subtabs. A cap, not an expectation: it bounds how many
-## Unity objects a bad page table could instantiate into a live screen.
-const ModsMaxSubtabs = 5
+## Unity objects a bad page table could instantiate into a live screen. Raised
+## from 5 to fit the built-in host pages (4) plus one subtab per fetched mod
+## page (`modsBuildPages` appends those from `gSwPages`) with room to spare.
+const ModsMaxSubtabs = 8
 
 ## How many times the lazy build may be attempted before it gives up quietly.
 const ModsMaxBuildTries = 8
@@ -850,6 +852,19 @@ proc modsBuildPages(): seq[SwPage] =
   devRows.add swRow("codeGenAudit", "CodeGen audit", readBoolKey("codeGenAudit"), false)
   result.add modsPage("dev", "Diagnostics", devRows,
                       "Developer instruments. All read once at boot.")
+
+  # ---- one subtab per MOD, fetched over the wire (`modsettingsrender.nim`)
+  # and already sitting in `gSwPages` (the same registry the Game-tab flat
+  # list reads) by the time the player opens Settings -- the fetch cycle runs
+  # off `hostMain`'s own tick loop from boot, well before any tab is built.
+  # `swPageRegister` keys pages by id and a mod's id is always "mod:<guid>"
+  # (`modSetParseSchema`), so filtering on `modGuid.len > 0` picks out exactly
+  # the fetched pages and none of the built-in ones above.
+  var m = 0
+  while m < gSwPages.len and result.len < ModsMaxSubtabs:
+    if gSwPages[m].modGuid.len > 0:
+      result.add gSwPages[m]
+    m = m + 1
 
 # ---------------------------------------------------------------------------
 # The build. Runs at most once, from the live SettingsScreen, and every step

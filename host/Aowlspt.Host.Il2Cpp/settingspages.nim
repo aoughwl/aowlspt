@@ -107,6 +107,11 @@ type
     lo*: float64
     hi*: float64
     implemented*: bool          ## false -> suffixed with the not-wired marker
+    category*: string           ## "" -> ungrouped. A mod schema's `category`
+    ## field, used only to insert a header row ahead of each group (see
+    ## `modSetGroupByCategory` in `modsettingsrender.nim`) -- the renderer
+    ## below treats a header exactly like any other `swkStub` row, so it needs
+    ## no code of its own here.
     ## Filled by the renderer: the clone this row is showing on, and the value
     ## it was last seeded with, so a change made by the player can be spotted.
     clone*: uint64
@@ -136,8 +141,10 @@ const cSwNotDone = "  (not done yet)"
 
 ## How many rows one page may render. A cap, not an expectation -- it bounds the
 ## clone count so a bad schema cannot instantiate hundreds of Unity objects into
-## a live screen.
-const cSwMaxRows = 24
+## a live screen. Raised from 24 to fit a mod schema's real rows PLUS one
+## header row per category (mods/tarkov alone is 22 rows across 8 categories =
+## 30) -- still a bound, not a target.
+const cSwMaxRows = 48
 
 var gSwPages: seq[SwPage] = @[]
 ## `settingsPages` -- Phase 3. Default OFF.

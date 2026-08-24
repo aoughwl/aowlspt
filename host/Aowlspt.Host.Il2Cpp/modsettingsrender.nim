@@ -140,6 +140,7 @@ proc modSetParseRow(obj: string; row: var SwRow): bool =
   var implStr = ""
   if pathGet(obj, "implemented", implStr) and implStr == "false":
     row.implemented = false
+  discard pathGet(obj, "category", row.category)
   case t
   of "bool":
     row.kind = swkToggle
@@ -152,12 +153,15 @@ proc modSetParseRow(obj: string; row: var SwRow): bool =
     if pathGet(obj, "min", loS): row.lo = modSetParseF64(loS, 0.0)
     if pathGet(obj, "max", hiS): row.hi = modSetParseF64(hiS, row.lo)
     # `swRenderPage` clones and labels a slider row but does not yet seed or
-    # read it back (only `swkToggle` is wired there) -- true today, and
-    # marking it not-implemented here would be a lie about what the BACKEND
-    # supports. The gap is in the renderer, not the schema, so it is left
-    # `implemented` and simply inert until that renderer gains slider
-    # seeding; this is the same honesty the free-text/keybind case below
-    # states outright, just for a different reason.
+    # read it back (only `swkToggle` is wired there) -- MEASURED, not assumed:
+    # neither `swSeedToggle`'s slider counterpart nor a slider branch in
+    # `swReadBackPage` exists. Closing that needs a byte-verified slider-value
+    # field offset this task has not obtained, so per rule 8 (never blind-
+    # write) it is left unseeded rather than guessed at -- and marked
+    # `implemented = false` here so the player sees the same honest
+    # "(not done yet)" suffix the free-text/keybind case gets below, instead
+    # of a slider that silently shows the DONOR's value and does nothing.
+    row.implemented = false
   else:
     # enum / string / keybind / anything else: no native widget exists to
     # clone (`SETTINGS-CONTROLS-RE.md` sec.4 lists what does). Drawn and
@@ -167,17 +171,63 @@ proc modSetParseRow(obj: string; row: var SwRow): bool =
     row.implemented = false
   result = true
 
+proc modSetGroupByCategory(rows: seq[SwRow]): seq[SwRow] =
+  ## Buckets rows by `category`, preserving each category's first-seen order,
+  ## and inserts one HEADER row (kind=swkStub, implemented=true so it gets no
+  ## "(not done yet)" suffix) ahead of each group -- reusing the existing
+  ## renderer and the existing `swkStub` kind rather than adding a second
+  ## rendering path. This is the whole "sections within a page" feature: no
+  ## code in `swRenderPage`/`swCloneRow`/`modsRelabelRow` needs to know a
+  ## header exists, because it is just another row to them.
+  ##
+  ## Rows with no category ("") are left ungrouped, in their original order,
+  ## AT THE FRONT -- so a schema that never sets `category` (every page
+  ## except a fetched mod's, today) renders exactly as it did before this
+  ## function existed.
+  result = @[]
+  var i = 0
+  while i < rows.len and result.len < cSwMaxRows:
+    if rows[i].category.len == 0:
+      result.add rows[i]
+    i = i + 1
+  var cats: seq[string] = @[]
+  i = 0
+  while i < rows.len:
+    let c = rows[i].category
+    if c.len > 0:
+      var seen = false
+      for existing in cats:
+        if existing == c:
+          seen = true
+          break
+      if not seen:
+        cats.add c
+    i = i + 1
+  var ci = 0
+  while ci < cats.len and result.len < cSwMaxRows:
+    result.add SwRow(kind: swkStub, implemented: true,
+                     label: "-- " & cats[ci] & " --", key: "",
+                     category: cats[ci])
+    var j = 0
+    while j < rows.len and result.len < cSwMaxRows:
+      if rows[j].category == cats[ci]:
+        result.add rows[j]
+      j = j + 1
+    ci = ci + 1
+
 proc modSetParseSchema(doc: string; guid, name: string; page: var SwPage): bool =
   var items: seq[string] = @[]
   if not pathItems(doc, "", items):
     return false
   page = SwPage(id: "mod:" & guid, title: name, modGuid: guid)
+  var rawRows: seq[SwRow] = @[]
   var i = 0
-  while i < items.len and page.rows.len < cSwMaxRows:
+  while i < items.len and rawRows.len < cSwMaxRows:
     var row = SwRow()
     if modSetParseRow(items[i], row):
-      page.rows.add row
+      rawRows.add row
     i = i + 1
+  page.rows = modSetGroupByCategory(rawRows)
   result = true
 
 proc modSetTick(now: uint64) =
