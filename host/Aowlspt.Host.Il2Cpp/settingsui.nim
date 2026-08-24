@@ -338,6 +338,13 @@ proc suiTabInitBody(a: Il2CppPtr): Il2CppPtr {.
     return cast[Il2CppPtr](1)
   gSettingsLiveSelf = cast[Il2CppPtr](selfPtr)
 
+  # THE NATIVE LIFECYCLE RIDER (`settingsNativeLifecycle`). Riding this same
+  # detour rather than installing a second one on ShowScreen -- see the flag's
+  # own comment in `aowlhost.nim`. A no-op unless `settingsModsTab` AND
+  # `settingsNativeLifecycle` are both on. Runs BEFORE any of Phase 1.8's own
+  # work below so a fault in that work can never suppress the hide.
+  modsNativeOnShowScreen(group)
+
   let gname = readCString(cSuiGroupName(group))
   let off = cSuiGroupTabOffset(group)
   let alreadyLogged = (group >= 0'i32 and int(group) < gSuiGroupsLogged.len and
