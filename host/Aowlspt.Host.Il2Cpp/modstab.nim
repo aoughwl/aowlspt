@@ -198,6 +198,47 @@ var gModsSel = -1
 ## their `m_Group`, which means exclusivity is ours to enforce.
 var gModsOwnExclusive = false
 
+## INTERNED TYPE-NAME STRINGS, same idiom as `inspect.nim`'s `gTxtTypeStr`
+## (`findtext`'s "allocated ONCE per search, reused for every node's
+## GetComponent call"). `modsComponent` used to call `il2cpp_string_new`
+## FRESH on every node -- and a live crumb proved that path can hand back a
+## pointer that reads as non-null-and-readable and STILL faults inside
+## `GetComponent`. Rather than chase why one specific allocation is bad, this
+## removes per-call allocation from the picture entirely: each distinct type
+## name is interned once, verified, and every later call reuses the SAME
+## proven-good string object.
+var gModsStrNames: seq[string] = @[]
+var gModsStrPtrs: seq[Il2CppPtr] = @[]
+
+proc modsInternedStr(typeName: string): Il2CppPtr =
+  ## Returns the cached managed string for `typeName`, allocating it once (and
+  ## verifying it) the first time this type name is asked for. nil if it could
+  ## never be made -- the caller declines rather than calling through.
+  var i = 0
+  while i < gModsStrNames.len:
+    if gModsStrNames[i] == typeName:
+      # Re-verify every time: a stale-but-cached pointer must not be handed
+      # to an icall on faith just because it worked once.
+      if duOk(gModsStrPtrs[i], 0x18'i32):
+        return gModsStrPtrs[i]
+      warn "mods tab: interned string for \"" & typeName & "\" no longer " &
+           "reads back live; re-allocating rather than using it."
+      gModsStrPtrs[i] = nil
+      break
+    i = i + 1
+  var name = typeName
+  let sp = cNavNewString(toCString(name))
+  if sp == nil or not duOk(sp, 0x18'i32):
+    warn "mods tab: il2cpp_string_new for \"" & typeName & "\" did not " &
+         "produce a live, readable managed string; nothing was called."
+    return nil
+  if i < gModsStrNames.len:
+    gModsStrPtrs[i] = sp
+  else:
+    gModsStrNames.add typeName
+    gModsStrPtrs.add sp
+  result = sp
+
 ## STAGE CRUMBS. Same idea as `settingsui.nim`'s `gSwCrumb`: one cheap string
 ## assignment before every IL2CPP call in the mods-tab body, so a caught fault
 ## (which unwinds the WHOLE guarded body silently -- fact #19) can still say
@@ -364,15 +405,14 @@ proc modsComponent(comp: Il2CppPtr; typeName: string): Il2CppPtr =
     return
   if cNavIcallReady() == 0'i32:
     return
-  var name = typeName
-  let sp = cNavNewString(toCString(name))
+  # INTERNED, not per-call: see `modsInternedStr`. This is the only place the
+  # string is produced, so there is nothing downstream that can be handed a
+  # bad one -- the decline below is not bypassable by a different call site.
+  let sp = modsInternedStr(typeName)
   modsCrumbP("modsComponent(" & typeName & ") node=" & iObjName(comp) &
              " str=", sp)
-  if sp == nil or not duOk(sp, 0x18'i32):
-    warn "mods tab: modsComponent(" & typeName & ") DECLINED -- " &
-         "il2cpp_string_new for the type name did not produce a live, " &
-         "readable managed string; nothing was called."
-    return
+  if sp == nil:
+    return                              # modsInternedStr already warned
   result = cast[Il2CppPtr](cInspUPP(fn, comp, sp, nil))
 
 ## The SettingsScreen transform, kept from the build so the per-frame path can
