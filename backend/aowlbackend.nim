@@ -811,6 +811,16 @@ proc parseHead(head: string; r: var Request; contentLength: var int): bool =
     return false
   r.verb = first.substr(0, sp1 - 1)
   r.url = first.substr(sp1 + 1, sp1 + sp2)
+  # The `/aowlspt/ui/` fallback settings page (docs/UI-API.md) runs its
+  # fetches from an ordinary browser, which the Fetch spec forbids from ever
+  # setting `Accept-Encoding` -- so it cannot ask for `identity` the way the
+  # overlay's own worker thread does (header). A `?ident=1` query param says
+  # the same thing through a channel the browser does not block. It changes
+  # nothing about what any route returns (fact #123's JSON shapes are
+  # untouched) -- only whether this one response goes out deflated, which is
+  # exactly what the header spelling already lets any caller ask for.
+  if find(r.url, "ident=1") >= 0:
+    r.identity = true
   # HTTP/1.1 keeps the connection open unless the client says otherwise; 1.0
   # closes unless it says otherwise. Getting that default backwards is how a
   # server ends up holding a socket the client has already forgotten about.
@@ -1361,6 +1371,15 @@ proc handleRequest(sock: uint64; buf: HostPtr; len: int32;
       # carried (the client sniffs the format from the magic bytes, not the
       # header or the path), so the honest Content-Type is `image/png`.
       sendResponse(sock, "200 OK", body, false, req.keepAlive, "image/png")
+    elif fpath.len >= 18 and fpath.substr(0, 17) == "/aowlspt/ui/page/":
+      # The fallback settings UI (docs/UI-API.md) is a page a human opens
+      # directly in an ordinary browser -- not the overlay's worker thread,
+      # which sets its own headers and can ask for `identity` -- so it cannot
+      # rely on a client that knows to request uncompressed and inflate
+      # nothing else does. Same reasoning as `/client/metadata` below: send it
+      # uncompressed, and with a real `text/html` Content-Type so the browser
+      # renders it instead of offering it as a JSON download.
+      sendResponse(sock, "200 OK", body, false, req.keepAlive, "text/html; charset=utf-8")
     else:
       # `/client/metadata` must go out uncompressed, whatever the request asked
       # for. It is read during `il2cpp_init` by a regex that scans the raw bytes
