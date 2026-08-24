@@ -63,6 +63,11 @@ proc cOvSyncStart(path: cstring; intervalMs: int32) {.
 proc cOvSyncPending(): int32 {.importc: "aowl_ov_sync_pending", nodecl.}
 proc cOvSyncTake(buf: ptr char; cap: int32): int32 {.
   importc: "aowl_ov_sync_take", nodecl.}
+proc cOvPostStart(path: cstring; body: cstring) {.
+  importc: "aowl_ov_post_start", nodecl.}
+proc cOvPostPending(): int32 {.importc: "aowl_ov_post_pending", nodecl.}
+proc cOvPostTake(buf: ptr char; cap: int32; ok: ptr int32): int32 {.
+  importc: "aowl_ov_post_take", nodecl.}
 proc cOvSetPrePresent(fn: pointer) {.importc: "aowl_ov_set_pre_present", nodecl.}
 proc cOvSetPreResize(fn: pointer) {.importc: "aowl_ov_set_pre_resize", nodecl.}
 
@@ -175,6 +180,53 @@ proc overlaySyncTake*(): string =
   var i = 0
   while i < int(got):
     result.add buf[i]
+    inc i
+
+proc overlayPostStart*(path: string; body: string) =
+  ## Arms one POST for the worker thread: `path` and `body` (a JSON literal
+  ## the caller has already built). Single-slot, same discipline as
+  ## `overlaySyncStart` -- arming a second one before the first is taken
+  ## replaces it, so a caller writing several rows must wait for
+  ## `overlayPostPending()` to clear (or take the result) between them.
+  ##
+  ## Call after `overlayStart`; the worker thread it needs exists regardless
+  ## of whether the panel itself could draw.
+  var p = path
+  var b = body
+  cOvPostStart(toCString(p), toCString(b))
+
+proc overlayPostPending*(): bool =
+  ## True while a write is armed or in flight. False once the response has
+  ## landed (whether or not `overlayPostTake` has read it yet) -- poll this
+  ## before arming the next write into the single slot.
+  cOvPostPending() != 0'i32
+
+proc overlayPostTake*(): tuple[got: bool, ok: bool, body: string] =
+  ## The last completed write's outcome, taken once. `got = false` means
+  ## nothing new landed since the last call -- check `overlayPostPending()`
+  ## first to tell "still working" from "nothing was ever armed". `ok` is the
+  ## transport/backend outcome; `body` is whatever the backend answered (often
+  ## the reloaded row).
+  result = (got: false, ok: false, body: "")
+  var okFlag: int32 = 0
+  # Sized for a settings POST's reply, which the backend answers with the one
+  # row it just wrote -- nowhere near the mod-schema feed's ceiling.
+  const cap = 4096
+  var buf = newSeq[char](cap)
+  let n = cOvPostTake(addr buf[0], int32(cap), addr okFlag)
+  if n < 0:
+    # The response outgrew `cap` between pending() and take(); not expected
+    # for a single-row edit reply, but do not claim a result that was not
+    # actually read -- leave it unread and let the next poll see it fail the
+    # same way rather than silently truncate.
+    return
+  if n == 0:
+    return
+  result.got = true
+  result.ok = okFlag != 0'i32
+  var i = 0
+  while i < int(n):
+    result.body.add buf[i]
     inc i
 
 proc overlaySetPrePresent*(fn: pointer) =
