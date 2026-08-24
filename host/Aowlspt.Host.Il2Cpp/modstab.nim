@@ -644,7 +644,7 @@ proc modsDescribeToggle(tag: string; tog: Il2CppPtr) =
         " m_Group=" & iPtr(grp)
 
 proc modsCollectTmp(t: Il2CppPtr; depth: int; nodes: var seq[Il2CppPtr];
-                    tmps: var seq[Il2CppPtr]) =
+                    tmps: var seq[Il2CppPtr]; isRoot: bool = false) =
   ## EVERY TextMeshProUGUI at or under `t`, to `depth` levels. Capped hard at
   ## `ModsMaxTmp` in total and 16 per level.
   ##
@@ -654,7 +654,24 @@ proc modsCollectTmp(t: Il2CppPtr; depth: int; nodes: var seq[Il2CppPtr];
   ## renders on, and the clone that came out blank had no submesh at all, which
   ## is the fingerprint of a TMP that was never given text. So the caller tries
   ## each in turn and keeps the one whose text actually reads back.
+  ##
+  ## `t` MUST be a Transform, never a GameObject: `Component::GetComponent`
+  ## reads a GameObject's layout as if it were a Component and returns null on
+  ## every call, no fault, no decline -- indistinguishable from a genuine
+  ## absence. `isRoot` makes the walk's OWN starting pointer's kind visible in
+  ## the log rather than trusted on faith; every recursive step below only
+  ## ever hands `t` the result of `iChildAt`, which returns a Transform by
+  ## contract, so this is checked once per walk, not once per node.
+  if isRoot:
+    okLog "mods tab: TMP walk root ptr=" & iPtr(t) & " name=" & iObjName(t) &
+          " isGameObject=" & $iIsGameObject(t) & " (must be false -- a " &
+          "GameObject here silently resolves zero TMPs every time)"
   if t == nil or depth < 0 or not duOk(t, 0x20'i32) or tmps.len >= ModsMaxTmp:
+    return
+  if iIsGameObject(t):
+    warn "mods tab: TMP walk DECLINED " & iObjName(t) & " -- it is a " &
+         "GameObject, not a Transform; GetComponent would silently return " &
+         "null on it forever. Fix the caller that fed it in."
     return
   let here = modsComponent(t, "TextMeshProUGUI")
   if here != nil:
@@ -686,7 +703,7 @@ proc modsFindTmp(t: Il2CppPtr; depth: int): Il2CppPtr =
   result = nil
   var nodes: seq[Il2CppPtr] = @[]
   var tmps: seq[Il2CppPtr] = @[]
-  modsCollectTmp(t, depth, nodes, tmps)
+  modsCollectTmp(t, depth, nodes, tmps, isRoot = true)
   if tmps.len > 0:
     result = tmps[0]
 
@@ -767,7 +784,7 @@ proc modsCaptionOf(donorT: Il2CppPtr; count: var int): string =
   count = 0
   var nodes: seq[Il2CppPtr] = @[]
   var tmps: seq[Il2CppPtr] = @[]
-  modsCollectTmp(donorT, 4, nodes, tmps)
+  modsCollectTmp(donorT, 4, nodes, tmps, isRoot = true)
   var i = 0
   while i < tmps.len:
     let ti = modsTmpText(tmps[i])
@@ -788,7 +805,7 @@ proc modsCountReading(t: Il2CppPtr; text: string): int =
   result = 0
   var nodes: seq[Il2CppPtr] = @[]
   var tmps: seq[Il2CppPtr] = @[]
-  modsCollectTmp(t, 4, nodes, tmps)
+  modsCollectTmp(t, 4, nodes, tmps, isRoot = true)
   var i = 0
   while i < tmps.len:
     if modsTmpText(tmps[i]) == text:
@@ -818,7 +835,7 @@ proc modsRelabelLike(cloneT, donorT: Il2CppPtr; text: string;
   var cTmps: seq[Il2CppPtr] = @[]
   let examined0 = gModsExamined
   let declines0 = gModsDeclines
-  modsCollectTmp(cloneT, 4, cNodes, cTmps)
+  modsCollectTmp(cloneT, 4, cNodes, cTmps, isRoot = true)
   if cTmps.len == 0:
     let ex = gModsExamined - examined0
     let dc = gModsDeclines - declines0
@@ -908,7 +925,7 @@ proc modsRelabelRow(cloneT, donorT: Il2CppPtr; text: string;
   let donorCaption = modsCaptionOf(donorT, want)
   var cNodes: seq[Il2CppPtr] = @[]
   var cTmps: seq[Il2CppPtr] = @[]
-  modsCollectTmp(cloneT, 4, cNodes, cTmps)
+  modsCollectTmp(cloneT, 4, cNodes, cTmps, isRoot = true)
   if cTmps.len == 0:
     warn "mods tab: REFUSING to claim the row label '" & text & "' -- there " &
          "is no TextMeshProUGUI anywhere under this clone (searched 4 " &
