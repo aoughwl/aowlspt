@@ -238,6 +238,12 @@ def parse_children(raw):
     return {"children": items, "parse_ok": len(items) > 0, "raw": raw}
 
 
+
+def _has_err_line(raw):
+    """iErr (inspect.nim) emits '  ! ' + msg -- single '!', never '!!'.
+    Checked per stripped line, matching channel.py's fix for the same bug."""
+    return any(l.strip().startswith("!") for l in raw.splitlines())
+
 def parse_read(raw, expr, type_):
     """`read EXPR TYPE` -- the value is the token right after '=' on the
     matching line, or the whole trimmed line if no '=' is present."""
@@ -246,7 +252,7 @@ def parse_read(raw, expr, type_):
         value = line.split("=", 1)[1].strip()
     else:
         value = line or None
-    is_err = raw.strip().startswith("!!") or "error" in raw.lower()[:40]
+    is_err = _has_err_line(raw)
     return {
         "expr": expr, "type": type_, "value": None if is_err else value,
         "parse_ok": bool(value) and not is_err, "raw": raw,
@@ -263,25 +269,39 @@ def parse_label(raw):
 
 
 def parse_component(raw):
-    bound = "$comp" in raw and ("bound" in raw.lower() or "->" in raw)
-    found = not (raw.strip().startswith("!!") or "no component" in raw.lower()
-                 or "not found" in raw.lower())
-    return {"bound": bound and found, "found": found, "var": "$comp" if found else None,
+    found = bool(re.search(r'FOUND.*\(\$comp\)', raw)) and not _has_err_line(raw)
+    return {"bound": found, "found": found, "var": "$comp" if found else None,
             "parse_ok": True, "raw": raw}
 
 
+_CALL_I64_RE = re.compile(r'->\s*i64\s+(-?\d+)\s*\((0x[0-9a-fA-F]+)\)')
+_CALL_I32_RE = re.compile(r'->\s*i32\s+(-?\d+)')
+_CALL_BOOL_RE = re.compile(r'->\s*bool\s+(true|false)')
+_CALL_STR_RE = re.compile(r'->\s*String\*\s+(0x[0-9a-fA-F]+)\s*=\s*"([^"]*)"')
+_CALL_PTR_RE = re.compile(r'->\s*ptr\s+(0x[0-9a-fA-F]+)')
+
+
 def parse_call(raw):
-    is_err = raw.strip().startswith("!!")
+    """Same fix as channel.py::parse_call -- the old regex required the
+    return value immediately after '->'/'='/':' , but every real line has a
+    type-name word (`ptr`, `i64`, ...) in between and never matched."""
+    is_err = _has_err_line(raw)
     ret = None
-    m = re.search(r'(?:returned|->|result)\s*[:=]?\s*(0x[0-9a-fA-F]+|-?\d+)', raw, re.I)
-    if m:
-        ret = m.group(1)
+    if "returned without faulting (void)" in raw:
+        ret = None
+    else:
+        for rx, grp in ((_CALL_I64_RE, 2), (_CALL_I32_RE, 1), (_CALL_BOOL_RE, 1),
+                        (_CALL_STR_RE, 2), (_CALL_PTR_RE, 1)):
+            m = rx.search(raw)
+            if m:
+                ret = m.group(grp)
+                break
     return {"ok": not is_err, "returned": ret, "parse_ok": True, "raw": raw}
 
 
 def parse_press(raw):
-    is_err = raw.strip().startswith("!!")
-    return {"ok": not is_err, "parse_ok": True, "raw": raw}
+    is_err = _has_err_line(raw)
+    return {"ok": not is_err and "returned without faulting" in raw, "parse_ok": True, "raw": raw}
 
 
 FACTS_DB_DEFAULT = os.path.expandvars(r"%USERPROFILE%\.aowl\facts.db")

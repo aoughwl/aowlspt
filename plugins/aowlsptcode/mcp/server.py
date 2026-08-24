@@ -19,6 +19,13 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import channel  # noqa: E402
+import compound  # noqa: E402
+
+_TOOLS_DIR = os.path.join(os.path.dirname(os.path.dirname(os.path.dirname(
+    os.path.dirname(os.path.abspath(__file__))))), 'tools')
+if _TOOLS_DIR not in sys.path:
+    sys.path.insert(0, _TOOLS_DIR)
+import shot  # noqa: E402
 
 PROTOCOL_VERSION = '2024-11-05'
 SERVER_INFO = {'name': 'aowlinspect', 'version': '0.1.0'}
@@ -92,13 +99,13 @@ def h_children(a):
 def h_tree(a):
     depth = a.get('depth')
     line = 'tree %s%s' % (a['ptr'], (' %s' % depth) if depth else '')
-    return _run([line], a, channel.parse_children)
+    return _run([line], a, channel.parse_tree)
 
 
 def h_parent(a):
     depth = a.get('depth')
     line = 'parent %s%s' % (a['ptr'], (' %s' % depth) if depth else '')
-    return _run([line], a, channel.parse_children)
+    return _run([line], a, channel.parse_parent)
 
 
 def h_read(a):
@@ -146,6 +153,58 @@ def h_recipe_run(a):
         result['status'] = status
         result['steps_run'] = steps
     return result
+
+
+def h_screenshot(a):
+    crop = None
+    if a.get('crop'):
+        parts = [int(x) for x in a['crop'].split(',')]
+        if len(parts) != 4:
+            return _err('bad_crop', 'crop must be "x,y,w,h"')
+        crop = tuple(parts)
+    result = shot.capture(process_name=a.get('process', 'EscapeFromTarkov.exe'),
+                           crop=crop, max_width=int(a.get('max_width', 1200)))
+    if not result.get('ok'):
+        return _err('capture_failed', result.get('reason', 'unknown'), **result)
+    return result
+
+
+def h_path(a):
+    try:
+        return compound.resolve_path(a['path'], live_dir=a.get('_live_dir'),
+                                      timeout=float(a.get('timeout_s', 25.0)),
+                                      budget=int(a.get('budget', 20000)))
+    except channel.InspectorError as e:
+        return _err(e.kind, str(e))
+
+
+def h_open_settings(a):
+    try:
+        return compound.open_settings(live_dir=a.get('_live_dir'),
+                                       timeout=float(a.get('timeout_s', 90.0)))
+    except channel.InspectorError as e:
+        return _err(e.kind, str(e))
+
+
+def h_batch(a):
+    try:
+        return compound.run_batch_commands(a['commands'], live_dir=a.get('_live_dir'),
+                                            timeout=float(a.get('timeout_s', 30.0)),
+                                            write=bool(a.get('write', False)))
+    except channel.InspectorError as e:
+        return _err(e.kind, str(e))
+
+
+def h_assert(a):
+    try:
+        return compound.run_assertion(a['name'], live_dir=a.get('_live_dir'),
+                                       root=a.get('root'),
+                                       mods_built=bool(a.get('mods_built', False)),
+                                       guid=a.get('guid'))
+    except compound.AssertionUnknown as e:
+        return _err('unknown_assertion', str(e))
+    except channel.InspectorError as e:
+        return _err(e.kind, str(e))
 
 
 TOOLS = [
@@ -230,6 +289,70 @@ TOOLS = [
      'inputSchema': {'type': 'object', 'required': ['ptr'], 'properties': {
          'ptr': {'type': 'string'}, 'timeout_s': {'type': 'number'}}},
      'handler': h_press},
+    {'name': 'inspect_screenshot', 'description':
+     'Screenshot the EscapeFromTarkov window BY HWND, even when it is not '
+     'focused/foreground (PrintWindow PW_RENDERFULLCONTENT; falls back to '
+     'BitBlt and says so; a near-black/uniform result from BOTH paths is '
+     'reported as a FAILURE, never handed back as if it were real). '
+     'THIS IS THE MOST EXPENSIVE ACTION AVAILABLE -- use it ONLY for '
+     'genuinely VISUAL questions (layout, overlap, "does this look right", '
+     '"where is this on screen"). Every other question -- does a control '
+     'exist, what text does it show, what state is it in -- goes through '
+     'inspect_find/inspect_findtext/inspect_label/inspect_state instead. '
+     'Returns a PNG PATH plus width/height/mean_luminance, never inline '
+     'image bytes.',
+     'inputSchema': {'type': 'object', 'properties': {
+         'process': {'type': 'string', 'description': 'default EscapeFromTarkov.exe'},
+         'crop': {'type': 'string', 'description': '"x,y,w,h" to grab a sub-region'},
+         'max_width': {'type': 'integer', 'description': 'downscale width cap, default 1200'}}},
+     'handler': h_screenshot},
+    {'name': 'inspect_path', 'description':
+     'Resolve a slash path like "Preloader UI/BottomPanel/Content/TaskBar/'
+     'Tabs/Settings/SettingsButton" from the scene roots in ONE call -- the '
+     'walk that used to be a `find` per hop, each its own round trip. Fails '
+     'FAST at the first missing segment and reports whether that miss is '
+     'EXHAUSTIVE (trustworthy) or STOPPED_EARLY/HIT_CAP (inconclusive, not '
+     'proof of absence).',
+     'inputSchema': {'type': 'object', 'required': ['path'], 'properties': {
+         'path': {'type': 'string'}, 'budget': {'type': 'integer'},
+         'timeout_s': {'type': 'number'}}},
+     'handler': h_path},
+    {'name': 'inspect_open_settings', 'description':
+     'The whole fact #109 recipe as one call: walk Preloader UI -> TaskBar '
+     '-> Tabs -> the Settings child (LAST child, bottom-right icon) -> '
+     'SettingsButton -> component AnimatedToggle -> call rva:0x55ba430 '
+     'v_pb $comp 1 -> confirm via `state` that $settings is now bound. '
+     'Returns status PASS/FAIL/INCONCLUSIVE with the measured evidence at '
+     'whichever step it stopped, never just a bool. Does NOT launch the '
+     'client or drive the mode selector -- the menu must already be up.',
+     'inputSchema': {'type': 'object', 'properties': {
+         'timeout_s': {'type': 'number'}}},
+     'handler': h_open_settings},
+    {'name': 'inspect_batch', 'description':
+     'Send several raw inspector verbs in ONE channel round trip (the file '
+     'channel already supports multi-line batches; this just exposes it). '
+     'Returns the combined raw text plus a best-effort per-command parse -- '
+     'read the `note` field: parsing multiple commands of the SAME verb '
+     '(e.g. two `find`s) back out of one combined blob is unreliable, so '
+     'prefer this for independent single-purpose verbs, and prefer the '
+     'single-verb tools when you need precise per-call attribution.',
+     'inputSchema': {'type': 'object', 'required': ['commands'], 'properties': {
+         'commands': {'type': 'array', 'items': {'type': 'string'}},
+         'write': {'type': 'boolean'}, 'timeout_s': {'type': 'number'}}},
+     'handler': h_batch},
+    {'name': 'inspect_assert', 'description':
+     'Run ONE named acceptance assertion from tools/acceptance.py against '
+     'an ALREADY-RUNNING client with Settings ALREADY OPEN (call '
+     'inspect_open_settings first) and return PASS/FAIL/INCONCLUSIVE plus '
+     'the measured numbers that made the call. Does NOT launch the client '
+     'or navigate menus -- per CLAUDE.md, a subagent must never start/stop '
+     'the game, and this tool may run inside one. Known names: tab_count, '
+     'no_donor_caption, no_placeholder_text, spawner_one_active_toggle, '
+     'postfx_group, one_panel_active_per_group, no_faults, settings_json.',
+     'inputSchema': {'type': 'object', 'required': ['name'], 'properties': {
+         'name': {'type': 'string'}, 'root': {'type': 'string'},
+         'mods_built': {'type': 'boolean'}, 'guid': {'type': 'string'}}},
+     'handler': h_assert},
     {'name': 'recipe_run', 'description':
      'Replay a stored aowlfacts recipe (read-only lookup into '
      '%USERPROFILE%\\.aowl\\facts.db, recipe.steps_json) through the '
