@@ -1186,13 +1186,14 @@ proc onSainSettings(url, body, session: string): string =
   ## GET serves the schema; a POST body persists one edit into config.json. SAIN
   ## reads its settings inline, so the write is saved and applied at the next
   ## load rather than made live here.
+  var st = Ok
   if body.len > 0:
-    discard applySettingFromBody(body)
-  result = declaredSchemaJson().text
+    st = applySettingFromBody(body)
+  result = declaredSchemaReply(st).text
 
 proc onSainSettingsReset(url, body, session: string): string =
-  discard resetFromBody(body)
-  result = declaredSchemaJson().text
+  let st = resetFromBody(body)
+  result = declaredSchemaReply(st).text
 
 proc onLoad(): Status =
   declareSettings(sainSchema())

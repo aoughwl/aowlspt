@@ -453,14 +453,16 @@ proc onFovSettings(url, body, session: string): string =
   ## UI. POST: the one edit the panel is writing back — applied to config.json,
   ## then re-read so the effect is live and the returned schema shows the saved
   ## value.
-  if body.len > 0 and applySettingFromBody(body) == Ok:
-    loadConfig()
-  result = declaredSchemaJson().text
+  var st = Ok
+  if body.len > 0:
+    st = applySettingFromBody(body)
+    if st == Ok: loadConfig()
+  result = declaredSchemaReply(st).text
 
 proc onFovSettingsReset(url, body, session: string): string =
-  if resetFromBody(body) == Ok:
-    loadConfig()
-  result = declaredSchemaJson().text
+  let st = resetFromBody(body)
+  if st == Ok: loadConfig()
+  result = declaredSchemaReply(st).text
 
 # ---------------------------------------------------------------------------
 # The magnification -> sensitivity table

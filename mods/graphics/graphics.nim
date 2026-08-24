@@ -211,16 +211,20 @@ proc onSettings(url, body, session: string): string =
   ## GET returns the schema with live values; POST applies one edit to
   ## config.json, re-reads, and re-pushes the grade so the change is visible at
   ## once.
-  if body.len > 0 and applySettingFromBody(body) == Ok:
-    loadConfig()
-    discard pushGrade()
-  result = declaredSchemaJson().text
+  var st = Ok
+  if body.len > 0:
+    st = applySettingFromBody(body)
+    if st == Ok:
+      loadConfig()
+      discard pushGrade()
+  result = declaredSchemaReply(st).text
 
 proc onSettingsReset(url, body, session: string): string =
-  if resetFromBody(body) == Ok:
+  let st = resetFromBody(body)
+  if st == Ok:
     loadConfig()
     discard pushGrade()
-  result = declaredSchemaJson().text
+  result = declaredSchemaReply(st).text
 
 # ---------------------------------------------------------------------------
 # Events — apply/reload without a settings round trip

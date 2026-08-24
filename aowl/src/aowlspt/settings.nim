@@ -251,6 +251,35 @@ proc declaredSchemaJson*(): Json =
   ## `/aowlspt/settings/<guid>` route returns.
   result = schemaJson(gDeclared)
 
+proc statusMessage(st: Status): string =
+  case st
+  of Ok: "ok"
+  of ErrBadArg: "the POST body was not {\"key\":...,\"value\":...}"
+  of ErrNotFound: "no such declared key on this mod"
+  of ErrConfigParse: "this mod's config.json does not parse; lastError() names why"
+  of ErrUnsupported: "this host does not support writing config"
+  else: "could not persist (status " & $st & ")"
+
+proc declaredSchemaReply*(applyStatus: Status): Json =
+  ## The reply a route sends after a POST (edit or reset) attempt. `Ok`
+  ## replies with the bare array `GET` always returned — the wire shape both
+  ## the F12 overlay and the fallback page already parse. Anything else wraps
+  ## the SAME rows in `{"err":...,"rows":[...]}` instead: a caller that only
+  ## ever checked `Array.isArray` on the reply could not tell a persisted
+  ## write from a discarded one, which is the exact 200-with-unchanged-echo
+  ## shape this whole change exists to stop being silent. `rows` still carries
+  ## the current schema so a caller that has not been updated to look at
+  ## `err` degrades to "did not refresh" rather than "threw".
+  if applyStatus == Ok:
+    return schemaJson(gDeclared)
+  var o = obj()
+  o.put("err", statusMessage(applyStatus))
+  var a = arr()
+  for s in gDeclared:
+    a.add toJson(s)
+  o.put("rows", done(a))
+  result = done(o)
+
 # ---------------------------------------------------------------------------
 # Writing an edit back
 # ---------------------------------------------------------------------------

@@ -119,6 +119,14 @@ async function apiPost(path, body) {
 
 let currentGuid = null;
 
+// A POST reply is the bare `[{Setting}...]` array on success, or
+// `{"err":"...","rows":[{Setting}...]}` when the persist failed -- see
+// docs/UI-API.md. This is the one place that tells them apart, so a
+// rejected write cannot silently look identical to an accepted one.
+function replyOk(reply) { return Array.isArray(reply); }
+function replyRows(reply) { return Array.isArray(reply) ? reply : (reply && reply.rows) || []; }
+function replyErr(reply) { return (reply && !Array.isArray(reply) && reply.err) || null; }
+
 function inputFor(row, onSave) {
   const wrap = document.createElement('span');
   let el;
@@ -167,10 +175,11 @@ async function loadPage(guid) {
   resetAll.onclick = async () => {
     if (!confirm('Reset every setting on this page to its default? This discards everything you have set for ' + guid + '.')) return;
     const reply = await apiPost('/aowlspt/settings/' + encodeURIComponent(guid) + '/reset', {});
-    if (Array.isArray(reply)) loadPage(guid);
+    if (replyOk(reply)) loadPage(guid);
+    else alert('Reset did not persist: ' + replyErr(reply));
   };
   let lastCat = null;
-  (Array.isArray(rows) ? rows : []).forEach(row => {
+  (replyRows(rows)).forEach(row => {
     if ((row.category || '') !== lastCat) {
       lastCat = row.category || '';
       if (lastCat) {
@@ -191,12 +200,16 @@ async function loadPage(guid) {
     const ctl = inputFor(row, async (val) => {
       const reply = await apiPost('/aowlspt/settings/' + encodeURIComponent(guid),
         {key: row.key, value: val});
-      saved.classList.add('show');
-      setTimeout(() => saved.classList.remove('show'), 900);
+      if (replyOk(reply)) {
+        saved.classList.add('show');
+        setTimeout(() => saved.classList.remove('show'), 900);
+      } else {
+        alert('Did not save "' + row.key + '": ' + replyErr(reply));
+      }
       // Re-render from the reply so a value the backend clamped or rejected
       // shows what actually landed, not what was typed -- the single-source-
       // of-truth rule applies to a rejected write as much as an accepted one.
-      if (Array.isArray(reply)) loadPage(guid);
+      loadPage(guid);
     });
     ctl.appendChild(saved);
     r.appendChild(ctl);
@@ -207,7 +220,8 @@ async function loadPage(guid) {
     resetBtn.onclick = async () => {
       const reply = await apiPost('/aowlspt/settings/' + encodeURIComponent(guid) + '/reset',
         {key: row.key});
-      if (Array.isArray(reply)) loadPage(guid);
+      if (replyOk(reply)) loadPage(guid);
+      else alert('Reset of "' + row.key + '" did not persist: ' + replyErr(reply));
     };
     r.appendChild(resetBtn);
     body.appendChild(r);
