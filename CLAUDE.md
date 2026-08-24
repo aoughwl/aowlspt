@@ -243,8 +243,11 @@ direct calls at static RVA, and `il2cpp_string_new` work. Convention: instance
 `RCX=this, RDX/R8/R9=args`, then a **hidden trailing `const MethodInfo*`**; NULL is fine
 except for shared generics. Imagebase `0x180000000`; generated code lives in the
 **`il2cpp` PE section, not `.text`**. Offsets come from `Il2CppMetadataRegistration.fieldOffsets`
-via `tools/il2cpp_resolve.py` (`find` / `type` / `bytes <RVA>`; there is **no**
-`fields` verb) — **never guess**. Full signatures are reachable offline
+via `tools/il2cpp_resolve.py` (`find` / `type` / `bytes <RVA>` / `fields <Type>`) or
+`tools/fldoff.py` (`fields <Type>` / `field <Type> <fieldName>`) — a thin CLI over the
+same `Resolver`, with a mandatory self-check (`System.String._stringLength@0x10`,
+`_firstChar@0x14`) that must pass, printing nothing else, before any offset is
+trusted — **never guess**. Full signatures are reachable offline
 (`returnType@8`, `parameterStart@16`, `parameterCount@34`), so a patch frame shape
 should be **derived, never inferred from a method name**. Metadata strings are
 encrypted (`tools/metablob.py`; decrypted cache at `.cache/global-metadata.dec.dat`).

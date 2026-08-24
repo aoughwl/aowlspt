@@ -64,7 +64,7 @@ tab's `CreateControls`.
 `fieldOffsets` was located in `Il2CppMetadataRegistration` by its
 `(NTYPES, ptr, NTYPES, ptr)` signature — `fieldOffsets = 0x186B61E70`,
 `NTYPES = 31282`. Dumper self-checks against `System.String _stringLength=0x10 /
-_firstChar=0x14` before printing anything (`scratchpad/fldoff.py`).
+_firstChar=0x14` before printing anything (`tools/fldoff.py`).
 
 ```
 EFT.UI.Settings.SettingsTab (type 15717)
@@ -374,9 +374,11 @@ Everything else in this document is byte-level or metadata fact.
 ## Tooling used
 
 * `tools/il2cpp_resolve.py` — type/method RVAs (BE self-check passes).
-* `scratchpad/fldoff.py` (new) — field-name → offset via
+* `tools/fldoff.py` — field-name → offset via
   `Il2CppMetadataRegistration.fieldOffsets` (`0x186B61E70`), self-checked
-  against `System.String`.
+  against `System.String`. (This was cited as `scratchpad/fldoff.py (new)`,
+  which was never committed and does not exist; the path above is the real,
+  committed tool.)
 * `scratchpad/disa2.py` — annotated capstone disassembly with RVA→name.
 * `scratchpad/xref2.py` — direct-`E8` xrefs over `.text` **and** `il2cpp`.
 * Ad-hoc scans: `mov r64,[reg+0x2C8]`+`0x2D0` pattern (vtable-slot invokers) and
