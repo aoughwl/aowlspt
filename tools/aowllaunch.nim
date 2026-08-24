@@ -46,6 +46,7 @@ import aowlsptinstall/[winfs, log, eft]
 import "../host/common/jsonpath"
 import aowlterm
 import aowlsession
+import aowlui
 
 {.emit: """#include <stdlib.h>""".}
 {.emit: """#include <string.h>""".}
@@ -2007,30 +2008,60 @@ proc main(): int =
     # `RunCharacterSelectionFlow` is a client-side flow the wire cannot skip).
     # So the TUI choice above still has to be re-asserted on screen, and doing
     # that here -- unattended, the instant the screen exists -- is what makes
-    # the TUI the ONLY place a human is asked. This rides the exact mechanism
-    # `tools/entergame.py` already proved safe (find the live `Menu UI` copy
-    # of `CharacterSelectionScreen`, match the slot by its DISPLAYED title
-    # rather than its lying object name, fire the `DefaultUIButton` OnClick
-    # UnityEvent at +0x120) rather than a new, unverified host detour -- this
-    # backend only ever fills the "regular" slot (see `onProfilesV2`), whose
-    # displayed title is "PvE", so that is the fixed target.
+    # the TUI the ONLY place a human is asked.
     #
-    # Best-effort and silent-safe: if `tools/entergame.py` (or the inspector
-    # it drives) is missing -- a packaged install with no source checkout --
-    # this warns once and the client is left exactly as it is today, sitting
-    # at the selector for a human to click. `--no-auto-enter` is the explicit
-    # way to get that same fallback on purpose.
-    let entergame = joinPath(root, "tools\\entergame.py")
-    if not fileExists(entergame):
-      note "no tools\\entergame.py next to this install -- the character-" &
-           "select screen will still show for a click. Run from a source " &
-           "checkout, or pass --no-auto-enter to silence this."
+    # This calls `aowlui` DIRECTLY, in-process -- NOT `tools/entergame.py`.
+    # A first version shelled out to that Python script and it never fired on
+    # a real install: there is no source checkout and no Python next to
+    # `EscapeFromTarkov.exe`, so it silently hit its own "missing" fallback
+    # every time. `aowlui`/`aowluicmd` are the Nim port of the same channel
+    # (write `aowlspt-inspect.txt`, read `aowlspt-inspect-out.txt`) and are
+    # already linked into this build via `aowl.nim` -- so this ships.
+    #
+    # Every measured rule `entergame.py` encoded is preserved because this
+    # calls the SAME primitives, not a reimplementation:
+    #  * `clickText(..., rootName = "Menu UI", exact = true)` matches by the
+    #    DISPLAYED title, never the object name (`CharacterSlotView_pvp`
+    #    displays "PvE" -- this backend's `onProfilesV2` only ever fills the
+    #    "regular" slot, whose title is "PvE", so that is the fixed target).
+    #  * Searching is scoped to the LIVE `Menu UI` root, so the inactive
+    #    `Login UI` copy of `CharacterSelectionScreen` (fact #94) is never
+    #    the one queried.
+    #  * `clickText`'s `buttonFor` walk prefers `DefaultUIButton` first and
+    #    actuates via its `OnClick` UnityEvent, never
+    #    `ButtonFeedback::OnPointerClick` (fact #5: plays the sound, presses
+    #    nothing).
+    #  * The retry loop below tolerates the placeholder "New Text" window
+    #    before localisation lands, by simply not having matched "PvE" yet.
+    #
+    # After pressing, the close is ASSERTED, not assumed (rule 9b): `expect`
+    # is `xkNoScreen` on `CharacterSelectionScreen` under the live `Menu UI`
+    # root, so PASS means that specific screen was observed to go inactive,
+    # not "something was pressed".
+    var u = initUi(root, 60000, true)
+    var pressed = false
+    var lastMsg = ""
+    var tries = 0
+    while tries < 30 and not pressed:
+      let expect = Expect(kind: xkNoScreen, name: "CharacterSelectionScreen",
+                          root: "Menu UI")
+      let r = clickText(u, "PvE", "Menu UI", true, "", expect, 4000, true)
+      lastMsg = r.msg
+      if r.ok:
+        pressed = true
+      elif lastMsg.contains("liveInspector"):
+        break
+      else:
+        cSleepMs 3000
+      inc tries
+    if pressed:
+      ok "auto-entered past character-select (PASS, verified closed): " &
+         lastMsg
     else:
-      var egExe = "python"
-      var egCwd = root
-      var egCmd = "python \"" & entergame & "\" --mode \"PvE\""
-      discard cSpawnQuiet(toCString(egExe), toCString(egCwd), toCString(egCmd))
-      ok "auto-entering past the character-select screen (tools\\entergame.py, background)"
+      warn "auto-enter did NOT verify the character-select screen closed " &
+           "(FAIL/INCONCLUSIVE): " & lastMsg
+      note "left at the manual selector; check liveInspector is on in " &
+           "aowlspt-host.json, or pass --no-auto-enter to silence this"
 
   if o.clientWindow:
     # The second window, for anyone who wants it. It is another copy of this
