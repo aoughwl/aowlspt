@@ -198,10 +198,24 @@ var gModsSel = -1
 ## their `m_Group`, which means exclusivity is ours to enforce.
 var gModsOwnExclusive = false
 
+## STAGE CRUMBS. Same idea as `settingsui.nim`'s `gSwCrumb`: one cheap string
+## assignment before every IL2CPP call in the mods-tab body, so a caught fault
+## (which unwinds the WHOLE guarded body silently -- fact #19) can still say
+## WHERE it died instead of just "FAULTED and was caught". Never per-frame
+## allocation-heavy: this runs on a tab click and once per steady-state tick,
+## not in a hot loop of its own.
+var gModsCrumb = "(nothing attempted yet)"
+
+proc modsCrumb(what: string) =
+  gModsCrumb = what
+
+proc modsCrumbP(what: string; p: Il2CppPtr) =
+  gModsCrumb = what & " ptr=0x" & hexOf(cast[uint64](p))
+
 proc modsNoteFault(what: string) =
   inc gModsFaults
   warn "mods tab: " & what & " (fault " & $gModsFaults & " of " &
-       $ModsMaxFaults & ")"
+       $ModsMaxFaults & "). LAST HOP ATTEMPTED: " & gModsCrumb
   if gModsFaults >= ModsMaxFaults:
     gModsOn = false
     warn "mods tab: fault ceiling reached; the feature is OFF for this " &
@@ -249,8 +263,13 @@ proc modsSetParent(child, parent: Il2CppPtr): bool =
   result = true
 
 proc modsSetActive(go: Il2CppPtr; on: bool): bool =
+  ## An ICALL (`GameObject::SetActive`). `duOk` alone is not enough here: a
+  ## DESTROYED-but-still-readable Unity wrapper (a "fake null") passes a plain
+  ## readability check and then faults INSIDE Unity's own code when the icall
+  ## dereferences `m_CachedPtr` -- `iUnityAlive` is the guard keyed off that.
+  modsCrumbP("modsSetActive", go)
   let fn = mi2Fn(Mi2GoSetActive)
-  if fn == nil or go == nil or not duOk(go, 0x20'i32):
+  if fn == nil or go == nil or not iUnityAlive(go):
     return false
   cMi2CallVPB(fn, go, (if on: 1'i32 else: 0'i32))
   result = true
@@ -267,8 +286,9 @@ proc modsSetFirstSibling(t: Il2CppPtr): bool =
   ## the parent or its other children is touched, it is simply where in the
   ## parent's child list our own object sits.
   result = false
+  modsCrumbP("modsSetFirstSibling", t)
   let fn = mi2Fn(Mi2SetAsFirstSibling)
-  if fn == nil or t == nil or not duOk(t, 0x20'i32):
+  if fn == nil or t == nil or not iUnityAlive(t):
     return
   discard cMi2CallPP(fn, t)              # void method; the "return" is unused
   result = true
@@ -297,7 +317,8 @@ proc modsComponent(comp: Il2CppPtr; typeName: string): Il2CppPtr =
   ## complaint, just nothing. That one mistake previously broke this feature and
   ## reported itself as two unrelated symptoms.
   result = nil
-  if comp == nil or not duOk(comp, 0x20'i32):
+  modsCrumbP("modsComponent(" & typeName & ")", comp)
+  if comp == nil or not iUnityAlive(comp):
     return
   var fn: Il2CppPtr = nil
   var rva = 0'u32
@@ -800,7 +821,8 @@ proc modsSetToggleQuiet(toggle: Il2CppPtr; on: bool): bool =
   ## clone inherits the donor's `onValueChanged`, so the notifying setter would
   ## run the GAME's handler for the tab the donor came from.
   result = false
-  if toggle == nil or not duOk(toggle, ModsOffIsOn + 4'i32):
+  modsCrumbP("modsSetToggleQuiet", toggle)
+  if toggle == nil or not iUnityAlive(toggle):
     return
   let fn = swFn(SwToggleNoNotify)
   if fn == nil:
@@ -1605,6 +1627,7 @@ proc modsTickSubtabs() =
     gModsSubs[gModsSel].lastOn = true
 
 proc modsTabTickBody() =
+  modsCrumb("STAGE: entered modsTabTickBody")
   if not gModsOn or gModsFaults >= ModsMaxFaults:
     return
   if not gModsBuilt:
@@ -1613,6 +1636,7 @@ proc modsTabTickBody() =
     # different thing from the code it guards is a silent feature-off switch,
     # and that is how this once shipped doing nothing at all.
     if gModsLastTabPtr != nil and gModsTried < ModsMaxBuildTries:
+      modsCrumb("STAGE: lazy modsTabBuild")
       discard modsTabBuild()
     return
   if gModsToggle == nil or gModsPanel == nil:
@@ -1656,9 +1680,11 @@ proc modsTabTickBody() =
         swReadBackPage(gModsPages[q])
         q = q + 1
     return                              # one edge's worth of work per frame
+  modsCrumb("STAGE: modsReassertLabels")
   modsReassertLabels()                  # throttled, and it stops when stable
   if not gModsShown:
     return
+  modsCrumb("STAGE: modsTickSubtabs")
   modsTickSubtabs()
 
 var gModsSanityFrames = 0
