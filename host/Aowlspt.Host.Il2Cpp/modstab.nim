@@ -313,12 +313,24 @@ proc modsComponent(comp: Il2CppPtr; typeName: string): Il2CppPtr =
   ## PASS A COMPONENT (a Transform will do), NOT a GameObject.
   ##
   ## `GetComponent` is declared on `UnityEngine.Component`, and a GameObject is
-  ## not one. Handing it a GameObject returns NULL every time -- no fault, no
-  ## complaint, just nothing. That one mistake previously broke this feature and
-  ## reported itself as two unrelated symptoms.
+  ## not one. MEASURED LIVE (not the "returns NULL, no fault" this comment used
+  ## to claim): `Component::GetComponent(String)` puts the wrong `this` in RCX
+  ## when handed a GameObject and FAULTS inside Unity's own code -- same class
+  ## of bug as ff6b769 and the inspector's `iRefuseIfGameObject`. So this
+  ## refuses loudly before ever reaching the icall, rather than calling through
+  ## and hoping.
   result = nil
-  modsCrumbP("modsComponent(" & typeName & ")", comp)
-  if comp == nil or not iUnityAlive(comp):
+  modsCrumbP("modsComponent(" & typeName & ") node=" & iObjName(comp) &
+             " parent=" & iObjName(modsParentOf(comp)), comp)
+  if comp == nil:
+    return
+  if iRefuseIfGameObject(comp, "modsComponent(" & typeName & ")"):
+    warn "mods tab: modsComponent(" & typeName & ") was handed a GameObject " &
+         "(" & iObjName(comp) & ", parent " & iObjName(modsParentOf(comp)) &
+         ") instead of a Transform/Component -- DECLINING rather than " &
+         "calling GetComponent through the wrong `this`."
+    return
+  if not iUnityAlive(comp):
     return
   var fn: Il2CppPtr = nil
   var rva = 0'u32
