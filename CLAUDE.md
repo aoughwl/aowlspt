@@ -1,5 +1,38 @@
 # aowlspt — how to work in this repo
 
+## 0. NEVER expose the personal address. Non-negotiable.
+
+There is a personal `@mumfordandmiller.com` address on this machine — it is the
+one Claude Code reports as the user's email, and it is NOT spelled out here on
+purpose, because this file is tracked and this repo is public. Writing it down
+to warn about it is itself the leak.
+
+That address must **never** reach anything public — no git commit author or
+committer, no README, no release note, no Discord post, no issue, no pushed file.
+It leaked once, into two public repos, and had to be scrubbed with a history
+rewrite and a force push.
+
+The identity to use, everywhere, is the one WSL already has:
+
+```
+git config --global user.name  savannt
+git config --global user.email savant.eclipse@gmail.com
+```
+
+`savant.eclipse@gmail.com` is the only verified email on the GitHub account, so
+it is also the only one that links a commit to the profile — a commit authored
+with any other address shows a generic avatar and no attribution.
+
+Before the FIRST commit in any repo, check `git config user.email`. A per-repo
+`user.email` silently overrides the global one, which is exactly how this
+happened. `savannt@users.noreply.github.com` is also fine.
+
+If it leaks again: rewrite the author AND committer fields (`git filter-branch
+--env-filter`, or `--amend` for a single commit), delete `refs/original/*`,
+expire the reflog, then force-push every branch and tag. Verify against the
+GitHub API, not the local clone.
+
+
 Post-1.0 Escape From Tarkov is **IL2CPP**. There is no BepInEx and no Mono patching.
 aowlspt is a host DLL running on the Unity main thread plus a nimony backend that
 emulates the game server.
@@ -101,10 +134,17 @@ pointer only once that screen has been opened).
 
 - **PowerShell only.** `gcc` silently fails in Git Bash (exit 1, no output).
 - Hand-invoking `nimony` outside `aowl` silently exits 0 producing **nothing**.
-- **Name the target**: `aowl build host` ≈ 48s vs `aowl build` ≈ 4m27s warm / 18m cold.
+- **Name the target**: `aowl build host` ≈ 2m vs `aowl build` ≈ 4m27s warm / 18m cold.
   Targets: host backend sim launch installer emutest verify probe mods examples deploy.
 - `aowl build` does **not** rebuild `aowl.exe` itself → use `aowl bootstrap`.
   `installer/build/` is gitignored, so a fresh worktree has **no** `aowl.exe` at all.
+- **`bootstrap` and named targets exist only on `feat-dev-tooling` and its
+  descendants** — measured: `grep -c bootstrap tools/aowl.nim` is 0 on `main`, and
+  `tools/aowl.nim` at `04f0311` does not even compile. `integ-tooling` is the
+  consolidated branch where they work; start there. If you copy `aowl.exe` from
+  another checkout for speed, it runs **that checkout's** `aowl.nim`, so a build
+  step defined on your branch goes **silently unexercised** — this has bitten
+  three agents. Say so if you do it.
 - **Concurrent builds in separate git worktrees are SAFE** (measured). Do NOT serialise
   agents. The corruption hazard is two builds in the **same checkout**.
 
@@ -123,7 +163,10 @@ direct calls at static RVA, and `il2cpp_string_new` work. Convention: instance
 `RCX=this, RDX/R8/R9=args`, then a **hidden trailing `const MethodInfo*`**; NULL is fine
 except for shared generics. Imagebase `0x180000000`; generated code lives in the
 **`il2cpp` PE section, not `.text`**. Offsets come from `Il2CppMetadataRegistration.fieldOffsets`
-via `tools/il2cpp_resolve.py fields <Type>` — **never guess**. Metadata strings are
+via `tools/il2cpp_resolve.py` (`find` / `type` / `bytes <RVA>`; there is **no**
+`fields` verb) — **never guess**. Full signatures are reachable offline
+(`returnType@8`, `parameterStart@16`, `parameterCount@34`), so a patch frame shape
+should be **derived, never inferred from a method name**. Metadata strings are
 encrypted (`tools/metablob.py`; decrypted cache at `.cache/global-metadata.dec.dat`).
 
 - **Walk from a verified live object; never trust an offset that can read null.**
@@ -131,8 +174,14 @@ encrypted (`tools/metablob.py`; decrypted cache at `.cache/global-metadata.dec.d
   by walking up from a live control.)
 - **Writing UI text requires CALLING real setters** — `LocalizedText::SetLabelText`
   @0x140FE70, `TMP_Text::set_text` @0x51BC1E0 — **and re-applying**, because
-  `LocalizedText` clobbers raw `m_text` stores. `ForceMeshUpdate` @0x628110 is a bare
-  `ret`: a stub that passes a signature check is the worst case.
+  `LocalizedText` clobbers raw `m_text` stores. Resolving `ForceMeshUpdate` lands on
+  `0x628110`, which is `C2 00 00` (`ret 0`) — and is **not that method's own code**:
+  it is this build's universal empty-body stub, shared by **6,438** methods. A stub
+  that passes a signature check is the worst case.
+- **28.3% of by-name lookups land on a SHARED RVA** (6,261 RVAs have more than one
+  owner). *Calling* a shared address is fine — it is correct code for the receiver
+  you pass. **Detouring one is a write with unbounded blast radius**, because it
+  fires for every method that shares it. Check sharedness before patching by name.
 - **Two detours on one function**: the second overwrites the first's trampoline. Ride an
   existing detour as a drain. Verify prologues against the **startup snapshot**
   (`abi/aowlspt_prologue.h`), never against live memory — verifying after another feature
