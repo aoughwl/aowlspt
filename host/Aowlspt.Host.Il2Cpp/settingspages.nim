@@ -68,6 +68,11 @@ const
   SwSliderSetMax    = 4'i32
   SwSliderRepaint   = 5'i32
 
+## Forward-declared: implemented in `modsettingsrender.nim`, `include`d after
+## this file. Queues a POST to the mod that owns `guid` on the overlay's own
+## worker thread -- never blocks this (the Unity main) thread.
+proc modSetQueueWrite(guid, key, val: string)
+
 proc swFn(i: int32): Il2CppPtr =
   ## A byte-verified setter, or nil. Logged on refusal so a target that did not
   ## verify on this build is never mistaken for a row that rendered and did
@@ -116,6 +121,13 @@ type
     ## Renderer state: which tab object this page was last rendered into, so
     ## re-opening the tab does not render it twice.
     renderedFor*: uint64
+    ## "" -> a local page (write-back edits `aowlspt-host.json` in place, the
+    ## original `host` page). Non-empty -> a MOD page fetched from
+    ## `/aowlspt/settings/<modGuid>`; write-back POSTs the edit to the mod that
+    ## owns it instead (see `modsettingsrender.nim`). Kept on the page rather
+    ## than threaded through every call so `swReadBackPage` needs no second
+    ## signature.
+    modGuid*: string
 
 ## The marker a not-yet-wired row carries. Deliberately verbose: a settings row
 ## that silently does nothing is worse than no row, and this is the project's
@@ -771,7 +783,14 @@ proc swReadBackPage(page: var SwPage) =
         okLog "settings pages: row '" & page.rows[i].key & "' changed " &
               swBoolText(page.rows[i].bval) & " -> " & swBoolText(live) &
               " in game"
-        if swSetHostFlag(page.rows[i].key, live):
+        if page.modGuid.len > 0:
+          # A mod page: the file that would change is the mod's, not ours, and
+          # it lives across a process boundary -- POST it, and take the value
+          # only optimistically (see `modsettingsrender.swModSetDrainPost` for
+          # the outcome, which is asserted, not assumed).
+          modSetQueueWrite(page.modGuid, page.rows[i].key, swBoolText(live))
+          page.rows[i].bval = live
+        elif swSetHostFlag(page.rows[i].key, live):
           page.rows[i].bval = live
     i = i + 1
 

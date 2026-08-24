@@ -6113,6 +6113,15 @@ var gInRaidLast = false
 var gReportSeq = -1
 var gReportNextMs = 0'u64
 
+## A per-mod settings page rendered into the real settings screen, fetched
+## over the sync feed above and written back over the overlay's POST slot.
+## Stands on `gSyncPath`/`gSyncBase`/`gSyncMs` (just declared) and on
+## `settingspages.nim` (included earlier) for `SwPage`/`SwRow`/
+## `swPageRegister`. Defines `modSetTick` and `modSetDrainPost`, called from
+## `hostMain`'s tick loop, and `modSetQueueWrite`, which fulfils
+## `settingspages.nim`'s forward declaration.
+include "modsettingsrender.nim"
+
 proc hex16(v: uint64): string =
   const digits = "0123456789abcdef"
   result = ""
@@ -6504,6 +6513,16 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # ShowScreen postfix, so it turns the read probe on with itself for the same
   # reason Phase 2 does.
   gSwPagesOn = readBoolKey("settingsPages")
+  # `modSettingsRender` needs `settingsPages`' renderer, so it turns that on
+  # with itself the same way `settingsPages` turns `settingsUiProbe` on --
+  # a flag that draws mod pages but never renders anything is a feature that
+  # looks off when it is armed.
+  gModSetOn = readBoolKey("modSettingsRender")
+  if gModSetOn and not gSwPagesOn:
+    gSwPagesOn = true
+    info "modSettingsRender is set, so settingsPages has been turned on " &
+         "with it -- mod pages render through the same cloned-control " &
+         "renderer the host page uses."
   if gSwPagesOn and not gSettingsUiProbe:
     gSettingsUiProbe = true
     info "settingsPages is set, so settingsUiProbe has been turned on with " &
@@ -7184,6 +7203,8 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
     inspectPoll(now)
     runPending()
     takeModSet()
+    modSetTick(now)
+    modSetDrainPost()
     # Live mod control, off the emitting stack -- the only place in this host a
     # mod is loaded or unloaded while the game is running.
     modcontrol.drain()

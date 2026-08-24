@@ -344,6 +344,13 @@ static void    aowl_ov_sync_start(const char* path, int32_t intervalMs);
 static int32_t aowl_ov_sync_pending(void);
 static int32_t aowl_ov_sync_take(char* out, int32_t cap);
 
+/* The write leg. `aowl_ov_post_start` arms one path+body; the worker sends it
+ * on its own thread (never the caller's) and `aowl_ov_post_take` returns the
+ * response once, non-blocking, same shape as the GET feed above. */
+static void    aowl_ov_post_start(const char* path, const char* body);
+static int32_t aowl_ov_post_pending(void);
+static int32_t aowl_ov_post_take(char* out, int32_t cap, int32_t* ok);
+
 /* ================================================================== *
  * Baked assets
  *
@@ -855,6 +862,22 @@ typedef struct AowlOvState {
     int32_t syncLen;
     int32_t syncSerial;                 /* bumped on every successful fetch */
     int32_t syncTaken;                  /* the serial the host last read */
+
+    /* --- the one-shot POST slot (host->backend write leg) ---
+     * Single-slot, like the GET feed above: `postArm` names one path+body the
+     * worker has not sent yet. A second `aowl_ov_post_start` before the first
+     * is taken REPLACES it -- the caller is expected to wait for
+     * `aowl_ov_post_pending()` to clear (or take the previous result) before
+     * arming another, same discipline as the GET slot's single path. */
+    char    postPath[192];
+    char    postBody[512];
+    volatile LONG postArm;              /* 1 = queued, not yet sent           */
+    volatile LONG postInFlight;         /* 1 = sent, waiting on the response  */
+    char    postResp[AOWL_OV_SYNC_MAX];
+    int32_t postRespLen;
+    int32_t postOk;                     /* outcome of the last completed POST */
+    int32_t postSerial;                 /* bumped when a response lands       */
+    int32_t postTaken;                  /* the serial the host last read      */
 
     /* --- frame scratch and UI state, render thread only --- */
     AowlOvVert vtx[AOWL_OV_MAX_VERTS];
@@ -2513,6 +2536,53 @@ static DWORD WINAPI aowl_ov_worker(LPVOID unused) {
             }
         }
 
+        /* The write leg. One armed request per pass, same worker, same
+         * `aowl_ov_http` machinery the GET feed and `aowl_ov_fetch` both use --
+         * no second WinHTTP path. Read the armed path+body out under the lock,
+         * send with the lock released (a two-second WinHTTP call must never
+         * hold `cs`), then publish the outcome under the lock again. Always
+         * published, success or failure: unlike the GET feed, a write's
+         * failure is not "keep showing the old value", it is something the
+         * caller must be told so it does not believe an edit stuck. */
+        {
+            wchar_t wpath[192];
+            char reqBody[512];
+            int32_t wantPost = 0;
+            EnterCriticalSection(&g_ov.cs);
+            if (g_ov.postArm) {
+                int32_t i = 0;
+                for (; g_ov.postPath[i] && i < 191; i++)
+                    wpath[i] = (wchar_t)(unsigned char)g_ov.postPath[i];
+                wpath[i] = 0;
+                aowl_ov_copy(reqBody, (int32_t)sizeof(reqBody), g_ov.postBody);
+                g_ov.postArm = 0;
+                g_ov.postInFlight = 1;
+                wantPost = 1;
+            }
+            LeaveCriticalSection(&g_ov.cs);
+
+            if (wantPost) {
+                int32_t rc = aowl_ov_http(L"POST", wpath, reqBody, buf,
+                                          (int32_t)sizeof(buf));
+                int32_t ok = (rc > 0 && (unsigned char)buf[0] != 0x78);
+                EnterCriticalSection(&g_ov.cs);
+                if (ok) {
+                    int32_t n = rc;
+                    if (n >= AOWL_OV_SYNC_MAX) n = AOWL_OV_SYNC_MAX - 1;
+                    memcpy(g_ov.postResp, buf, (size_t)n);
+                    g_ov.postResp[n] = 0;
+                    g_ov.postRespLen = n;
+                } else {
+                    g_ov.postResp[0] = 0;
+                    g_ov.postRespLen = 0;
+                }
+                g_ov.postOk = ok;
+                g_ov.postInFlight = 0;
+                g_ov.postSerial++;
+                LeaveCriticalSection(&g_ov.cs);
+            }
+        }
+
         Sleep(50);
         sinceFast += 50;
         sinceSlow += 50;
@@ -2563,6 +2633,57 @@ static int32_t aowl_ov_sync_take(char* out, int32_t cap) {
         out[g_ov.syncLen] = 0;
         n = g_ov.syncLen;
         g_ov.syncTaken = g_ov.syncSerial;
+    }
+    LeaveCriticalSection(&g_ov.cs);
+    return n;
+}
+
+/* Arms one POST for the worker thread. Called from the host's own thread
+ * (never the Unity main thread's), same requirement `aowl_ov_sync_start`
+ * carries. Overwrites whatever was armed and not yet sent -- the caller owns
+ * sequencing the single slot, same as it already does for the GET path. */
+static void aowl_ov_post_start(const char* path, const char* body) {
+    if (!g_ov.started || !path || !path[0]) return;
+    EnterCriticalSection(&g_ov.cs);
+    aowl_ov_copy(g_ov.postPath, (int32_t)sizeof(g_ov.postPath), path);
+    aowl_ov_copy(g_ov.postBody, (int32_t)sizeof(g_ov.postBody), body ? body : "");
+    g_ov.postArm = 1;
+    LeaveCriticalSection(&g_ov.cs);
+}
+
+/* 1 while a request is armed or has been sent and not yet answered; 0 once the
+ * response has landed (whether or not it has been taken yet -- `post_take`
+ * still has it). The caller polls this to know when it may arm the next one. */
+static int32_t aowl_ov_post_pending(void) {
+    if (!g_ov.started) return 0;
+    int32_t n;
+    EnterCriticalSection(&g_ov.cs);
+    n = (g_ov.postArm || g_ov.postInFlight) ? 1 : 0;
+    LeaveCriticalSection(&g_ov.cs);
+    return n;
+}
+
+/* Copies the last completed POST's response out and marks it read, once.
+ * Returns the body length (0 possible on a success with an empty body),
+ * writes 1/0 to `*ok`, and returns -1 (leaving the serial untaken) only when
+ * `cap` is too small for a body that is there -- mirrors `aowl_ov_sync_take`.
+ * Returns 0 with `*ok` unset when nothing new has landed; the caller must
+ * check `aowl_ov_post_pending` first to tell "still in flight" from "nothing
+ * was ever armed". */
+static int32_t aowl_ov_post_take(char* out, int32_t cap, int32_t* ok) {
+    if (!g_ov.started || !out || cap <= 0 || !ok) return 0;
+    int32_t n = 0;
+    EnterCriticalSection(&g_ov.cs);
+    if (g_ov.postSerial == g_ov.postTaken) {
+        n = 0;
+    } else if (g_ov.postRespLen >= cap) {
+        n = -1;
+    } else {
+        memcpy(out, g_ov.postResp, (size_t)g_ov.postRespLen);
+        out[g_ov.postRespLen] = 0;
+        n = g_ov.postRespLen;
+        *ok = g_ov.postOk;
+        g_ov.postTaken = g_ov.postSerial;
     }
     LeaveCriticalSection(&g_ov.cs);
     return n;
