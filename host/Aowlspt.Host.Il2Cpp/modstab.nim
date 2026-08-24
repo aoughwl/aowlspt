@@ -2240,10 +2240,14 @@ proc gfxBuild(): bool =
   if liveTabs == expectTabs:
     okLog "postfx subtab: the top row now shows " & $liveTabs & " tab " &
           "button(s) (expected " & $expectTabs & ", accounting for the MODS " &
-          "clone = " & $gModsBuilt & ") -- POSTFX has been folded into " &
-          "Graphics as a subtab. The stock button is HIDDEN, never " &
-          "destroyed, and comes back on its own if this feature turns " &
-          "itself off."
+          "clone = " & $gModsBuilt & ") -- POSTFX has " &
+          # Kept as ONE literal on purpose: `tools/deploy.json` verifies this
+          # exact phrase, and a marker that spans a `&` boundary is not
+          # contiguous in the binary, so the check fails on a feature that is
+          # actually present. Reword the sentence around it, never through it.
+          "been folded into Graphics as a subtab" &
+          ". The stock button is HIDDEN, never destroyed, and comes back on " &
+          "its own if this feature turns itself off."
   else:
     warn "postfx subtab: the top row shows " & $liveTabs & " active tab " &
          "button(s); " & $expectTabs & " was expected after hiding POSTFX " &
