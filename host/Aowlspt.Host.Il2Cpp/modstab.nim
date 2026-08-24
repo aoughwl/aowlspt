@@ -207,9 +207,6 @@ var gModsOwnExclusive = false
 ## removes per-call allocation from the picture entirely: each distinct type
 ## name is interned once, verified, and every later call reuses the SAME
 ## proven-good string object.
-var gModsStrNames: seq[string] = @[]
-var gModsStrPtrs: seq[Il2CppPtr] = @[]
-
 ## DECLINE vs ABSENCE, counted separately. A guard inside `modsComponent`
 ## returning nil BEFORE ever calling GetComponent ("I refused to look") must
 ## never render the same as GetComponent genuinely finding nothing ("it is
@@ -228,32 +225,22 @@ var gModsGcTries = 0
 const ModsGcMaxTries = 8
 
 proc modsInternedStr(typeName: string): Il2CppPtr =
-  ## Returns the cached managed string for `typeName`, allocating it once (and
-  ## verifying it) the first time this type name is asked for. nil if it could
-  ## never be made -- the caller declines rather than calling through.
-  var i = 0
-  while i < gModsStrNames.len:
-    if gModsStrNames[i] == typeName:
-      # Re-verify every time: a stale-but-cached pointer must not be handed
-      # to an icall on faith just because it worked once.
-      if duOk(gModsStrPtrs[i], 0x18'i32):
-        return gModsStrPtrs[i]
-      warn "mods tab: interned string for \"" & typeName & "\" no longer " &
-           "reads back live; re-allocating rather than using it."
-      gModsStrPtrs[i] = nil
-      break
-    i = i + 1
+  ## FRESH, NOT CACHED -- despite the name, kept only so every call site does
+  ## not need to change. MEASURED LIVE (the coordinator's timeline: self-test
+  ## at 0:00:50, walk at 0:02:22): a cached `il2cpp_string_new` result is NOT
+  ## GC-pinned, so a pointer proven live at bind time can be collected or
+  ## moved before a later call reuses it -- GetComponent then compares
+  ## against garbage and returns NULL, no fault, indistinguishable from a
+  ## real absence. Caching traded a rare fault (fixed below by the null
+  ## check) for a permanent silent null. Allocate immediately before every
+  ## use, exactly like the pre-interning code that demonstrably resolved
+  ## components, and decline by name if the allocation itself came back bad.
   var name = typeName
   let sp = cNavNewString(toCString(name))
   if sp == nil or not duOk(sp, 0x18'i32):
     warn "mods tab: il2cpp_string_new for \"" & typeName & "\" did not " &
          "produce a live, readable managed string; nothing was called."
     return nil
-  if i < gModsStrNames.len:
-    gModsStrPtrs[i] = sp
-  else:
-    gModsStrNames.add typeName
-    gModsStrPtrs.add sp
   result = sp
 
 ## STAGE CRUMBS. Same idea as `settingsui.nim`'s `gSwCrumb`: one cheap string
@@ -450,9 +437,10 @@ proc modsComponent(comp: Il2CppPtr; typeName: string): Il2CppPtr =
     return
   if cNavIcallReady() == 0'i32:
     return
-  # INTERNED, not per-call: see `modsInternedStr`. This is the only place the
-  # string is produced, so there is nothing downstream that can be handed a
-  # bad one -- the decline below is not bypassable by a different call site.
+  # FRESH, immediately before use, every call -- see `modsInternedStr`. `fn`
+  # (a code address) does not go stale between calls the way a GC'd managed
+  # string does, so it stays bound-once; the string does not, so it is never
+  # reused across calls, no matter how long the walk that calls this runs.
   let sp = modsInternedStr(typeName)
   modsCrumbP("modsComponent(" & typeName & ") node=" & iObjName(comp) &
              " str=", sp)
