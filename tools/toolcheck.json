@@ -163,6 +163,36 @@
       "batches": [["find Foo 0x1 500"]],
       "refuse": ["(?i)not readable"],
       "deny": ["(?i)genuinely NOT PRESENT", "(?i)searched EXHAUSTIVELY"]
+    },
+    {
+      "name": "findtext-single-numeric-arg-is-budget-not-root",
+      "why": "`findtext` had its own copy of the ROOT-vs-BUDGET parser from BEFORE this ambiguity was fixed in `find`: `findtext SETTINGS 300000` silently read 300000 decimal (0x493e0) as a ROOT, walked one bogus node, and claimed the text genuinely NOT PRESENT. Now shares `find`'s readability-based disambiguator (`iFindResolveRoot`).",
+      "needs": "menu",
+      "batches": [["findtext SETTINGS 300000"]],
+      "assert": ["(?i)treated as BUDGET"],
+      "deny": ["(?i)NOT PRESENT under this root", "(?i)searched EXHAUSTIVELY"]
+    },
+    {
+      "name": "findtext-invalid-root-refused-not-reported-absent",
+      "why": "`findtext` accepted an unreadable explicit root and then asserted a confident, exhaustive absence from it. It must refuse up front, the same as `find` and `tree` already do.",
+      "needs": "any",
+      "batches": [["findtext Foo 0x1 500"]],
+      "refuse": ["(?i)not readable"],
+      "deny": ["(?i)NOT PRESENT under this root", "(?i)searched EXHAUSTIVELY"]
+    },
+    {
+      "name": "findtext-echoes-once-not-per-frame",
+      "why": "A frame-spanning `findtext` re-entered iExec every frame and the echo-suppression check only ever covered `find`'s resume flag, so a 57-frame findtext search printed 57 identical `> findtext ...` header lines around a 4-line answer.",
+      "needs": "menu",
+      "batches": [["findtext e"]],
+      "deny": ["(> findtext e\\s*\\n[\\s\\S]*){2}"]
+    },
+    {
+      "name": "findtext-hit-reports-active-state-and-scope",
+      "why": "findtext hits gave no way to tell an active, pressable control from an inactive one -- pressing an inactive node returns success and does nothing (fact #72). A hit must state activeInHierarchy, and the summary must state which scope (active-only vs all) was actually searched.",
+      "needs": "menu",
+      "batches": [["findtext e"]],
+      "assert": ["(?i)scope: ACTIVE nodes only"]
     }
   ]
 }

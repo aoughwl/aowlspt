@@ -303,6 +303,14 @@ var gTxtQueue: seq[Il2CppPtr] = @[]
 var gTxtHead = 0
 var gTxtWant = ""
 var gTxtVisited = 0
+var gTxtInvalidSkips = 0
+var gTxtActiveOnly = true
+  ## default ACTIVE-ONLY, matching `aowl ui`'s default -- a hit on an
+  ## inactive node hands the caller a control it cannot press (fact #72:
+  ## pressing one returns ok=True and does nothing). `findtext SUBSTR ... all`
+  ## opts into including inactive nodes, same spelling family as `aowl ui`'s
+  ## `--all`.
+var gTxtInactiveSkipped = 0
 var gTxtFound = 0
 var gTxtActive = false
 var gTxtBudgetLeft = 0
@@ -1439,11 +1447,17 @@ const
     ## seconds at 60fps, then it stops and says so.
   InspTreeMaxNodes = 3000
   InspTreeMaxDepth = 16
-  InspTextFindDefBudget = 4000
-    ## DEFAULT nodes per `findtext` invocation -- much lower than `find`'s,
-    ## because each node here costs a managed GetComponent CALL, not a raw
-    ## field read. The 12ms slice below is still the real backstop; this only
-    ## bounds the total across however many frames it takes.
+  InspTextFindDefBudget = InspFindDefBudget
+    ## DEFAULT nodes per `findtext` invocation. Used to be 4000 (much lower
+    ## than `find`'s 20000) on the theory that each node here costs a managed
+    ## GetComponent CALL, not a raw field read -- but the REAL backstop is
+    ## the 12ms per-frame time slice below, not the node count, exactly as
+    ## `InspFindMaxFrames`'s comment already says for `find`. Measured: a
+    ## whole-scene `findtext` at the old default reported "visited 4000,
+    ## frontier 18376" -- STOPPED EARLY was the normal outcome, not the
+    ## exceptional one. Aligned with `find`'s default; `findtext more`
+    ## resumes cheaply regardless, so a search that is genuinely slow just
+    ## takes more frames, not a worse default.
   InspTextFindMaxBudget = 60000
     ## Ceiling on an explicit request. Kept well under `find`'s ceiling for the
     ## same reason: a managed call per node is heavier than a pointer chase.
@@ -1646,6 +1660,47 @@ proc iParentName(p: Il2CppPtr): string =
     return
   result = iObjName(par)
 
+var gFnGoOfComponent: Il2CppPtr = nil
+var gFnActiveInHierarchy: Il2CppPtr = nil
+var gActiveFnsResolved = false
+
+proc iEnsureActiveFns(): bool =
+  ## Resolve `Component::get_gameObject` and `GameObject::get_activeInHierarchy`
+  ## ONCE and cache them, the same way `iInspSeedTextType` caches the managed
+  ## string for `findtext` -- a per-node `iFindTarget` lookup on top of a
+  ## per-node managed call would double the cost of an already-heavier walk.
+  if gActiveFnsResolved:
+    return gFnGoOfComponent != nil and gFnActiveInHierarchy != nil
+  gActiveFnsResolved = true
+  var idx = 0
+  var hits = 0
+  if iFindTarget("Component::get_gameObject", idx, hits):
+    gFnGoOfComponent = iTargetFn(idx)
+  if iFindTarget("GameObject::get_activeInHierarchy", idx, hits):
+    gFnActiveInHierarchy = iTargetFn(idx)
+  result = gFnGoOfComponent != nil and gFnActiveInHierarchy != nil
+
+proc iActiveInHierarchy(cur: Il2CppPtr): (bool, bool) =
+  ## (ok, active). `activeInHierarchy` rather than `activeSelf`: a node that
+  ## is itself active but sits under an inactive ancestor is still
+  ## unpressable (fact #72 -- a press on an inactive GameObject returns
+  ## success and does NOTHING), so `activeSelf` alone would still mislead.
+  ## ok=false means the state could not be determined (function unresolved
+  ## on this build, or a hop was unreadable) -- callers must NOT assume
+  ## "active" in that case.
+  result = (false, false)
+  if not iEnsureActiveFns():
+    return
+  if not duOk(cur, 0x20'i32) or not iUnityAlive(cur):
+    return
+  iMark("Component::get_gameObject [active]", cur)
+  let go = cast[Il2CppPtr](cInspUP(gFnGoOfComponent, cur, nil))
+  if not duOk(go, 0x20'i32) or not iUnityAlive(go):
+    return
+  iMark("GameObject::get_activeInHierarchy", go)
+  let act = cInspUP(gFnActiveInHierarchy, go, nil)
+  result = (true, (act and 1'u64) != 0'u64)
+
 proc iToTransform(p: Il2CppPtr): Il2CppPtr =
   ## `get_transform` on something that is already a Transform returns itself,
   ## so this is safe for a component or a transform alike.
@@ -1728,52 +1783,65 @@ proc iFindStep(): int =
         inc k
   result = FindDone
 
-proc iFindReport(status: int) =
-  ## Only called when the search has actually STOPPED. Running out of time is
-  ## not stopping -- that path parks and resumes and says nothing, because a
-  ## progress report every frame would bury the answer.
-  iOut("  visited " & $gFindVisited & " node(s) over " & $gFindFrames &
-       " frame(s), " & $gFindFound & " match(es), frontier " &
-       $(gFindQueue.len - gFindHead) & " node(s)" &
-       (if gFindInvalidSkips > 0:
-          ", " & $gFindInvalidSkips & " unreadable/invalid node(s) skipped"
+proc iFindReportGeneric(status: int; visited, frames, found, invalidSkips,
+                         frontier: int; verb, subjectAbsent: string;
+                         active: var bool; ownerIdx, ownerBatch: var int) =
+  ## Shared reporting contract for `find` and `findtext`. Only called when the
+  ## search has actually STOPPED -- running out of time is not stopping, that
+  ## path parks and resumes and says nothing, because a progress report every
+  ## frame would bury the answer.
+  ##
+  ## `verb` is "find"/"findtext" (for the `<verb> more` hint); `subjectAbsent`
+  ## is the noun phrase for a genuine miss ("That name"/"No TMP text
+  ## containing that substring").
+  iOut("  visited " & $visited & " node(s) over " & $frames &
+       " frame(s), " & $found & " match(es), frontier " & $frontier &
+       " node(s)" &
+       (if invalidSkips > 0:
+          ", " & $invalidSkips & " unreadable/invalid node(s) skipped"
         else: ""))
   if status == FindDone:
-    gFindActive = false
-    gFindOwnerIdx = -1
-    gFindOwnerBatch = -1
-    if gFindVisited == 0:
+    active = false
+    ownerIdx = -1
+    ownerBatch = -1
+    if visited == 0:
       # Nothing was ever actually examined -- either the root(s) were all
       # invalid, or the frontier was empty. "EXHAUSTIVELY searched" and
       # "genuinely NOT PRESENT" are both claims about work that was done, and
       # none was. Say that plainly instead.
       iOut("  -- NOTHING WAS EXAMINED (0 valid nodes visited" &
-           (if gFindInvalidSkips > 0:
-              ", " & $gFindInvalidSkips & " root/node(s) were unreadable or " &
+           (if invalidSkips > 0:
+              ", " & $invalidSkips & " root/node(s) were unreadable or " &
               "not a valid Transform"
             else: "") &
-           "). This is NOT evidence the name is absent -- it means the " &
-           "search never actually looked. Check the root pointer.")
+           "). This is NOT evidence the search subject is absent -- it " &
+           "means the search never actually looked. Check the root pointer.")
     else:
       iOut("  -- the subtree was searched EXHAUSTIVELY. " &
-           (if gFindFound == 0:
-              "That name is genuinely NOT PRESENT under this root."
+           (if found == 0:
+              subjectAbsent & " is genuinely NOT PRESENT under this root."
             else: "Every match is listed above."))
   elif status == FindEnoughHits:
-    gFindActive = true
+    active = true
     iOut("  -- stopped at the match cap (" & $InspFindMaxHits & "). There may " &
-         "be more; `find more` continues from the frontier above.")
+         "be more; `" & verb & " more` continues from the frontier above.")
   else:
-    gFindActive = true
+    active = true
     # THE HONEST CAP MESSAGE, unchanged in substance: "not found within budget"
     # and "not present" are different facts and must never be conflated.
-    iOut("  -- STOPPED EARLY on the NODE BUDGET. This is NOT proof the name is " &
-         "absent. Continue with `find more` (it RESUMES from the frontier " &
-         "above and does not re-walk what it already rejected), or re-run " &
-         "with a bigger budget, or search from a narrower root.")
-  if gFindFound > 0:
-    iOut("  matches are bound to $f1..$f" & $gFindFound &
-         " for the rest of this batch")
+    iOut("  -- STOPPED EARLY on the NODE BUDGET. This is NOT proof the " &
+         "subject is absent. Continue with `" & verb & " more` (it RESUMES " &
+         "from the frontier above and does not re-walk what it already " &
+         "rejected), or re-run with a bigger budget, or search from a " &
+         "narrower root.")
+  if found > 0:
+    iOut("  matches are bound to $f1..$f" & $found & " for the rest of this batch")
+
+proc iFindReport(status: int) =
+  iFindReportGeneric(status, gFindVisited, gFindFrames, gFindFound,
+                      gFindInvalidSkips, gFindQueue.len - gFindHead,
+                      "find", "That name", gFindActive, gFindOwnerIdx,
+                      gFindOwnerBatch)
 
 proc iFindFirstByName(want: string; root: Il2CppPtr; budget: int): Il2CppPtr =
   ## Resolve a root BY NAME, so `find X in Y` does not require already knowing
@@ -1834,10 +1902,11 @@ proc iFindTextStep(): int =
     let cur = gTxtQueue[gTxtHead]
     inc gTxtHead
     inc spent
-    inc gTxtVisited
     dec gTxtBudgetLeft
     if not duOk(cur, 0x20'i32) or not iUnityAlive(cur):
+      inc gTxtInvalidSkips
       continue
+    inc gTxtVisited
     iNoteKlass(cur)
     # EVERY HOP GUARDED. `cur` is a Transform by contract (queue is seeded and
     # fed only from Transforms below), so the Component overload is correct
@@ -1855,14 +1924,22 @@ proc iFindTextStep(): int =
       if sp != nil and not iIsKnownKlass(cast[uint64](sp)) and duOk(sp, 0x18'i32):
         let txt = suiReadString(sp)
         if txt.len > 0 and iContains(iLower(txt), gTxtWant):
-          inc gTxtFound
-          iSetVar("f" & $gTxtFound, cast[uint64](cur))
-          let nm = iObjName(cur)
-          let pn = iParentName(cur)
-          iOut("    HIT " & iPtr(cur) &
-               (if nm.len > 0: "  name=\"" & nm & "\"" else: "") &
-               (if pn.len > 0: "  parent=\"" & pn & "\"" else: "") &
-               "  text=\"" & txt & "\"   ($f" & $gTxtFound & ")")
+          let (activeOk, active) = iActiveInHierarchy(cur)
+          if gTxtActiveOnly and activeOk and not active:
+            inc gTxtInactiveSkipped
+          else:
+            inc gTxtFound
+            iSetVar("f" & $gTxtFound, cast[uint64](cur))
+            let nm = iObjName(cur)
+            let pn = iParentName(cur)
+            let activeTag = (if not activeOk: "  activeInHierarchy=unknown"
+                              elif active: "  activeInHierarchy=true"
+                              else: "  activeInHierarchy=FALSE (unpressable)")
+            iOut("    HIT " & iPtr(cur) &
+                 (if nm.len > 0: "  name=\"" & nm & "\"" else: "") &
+                 (if pn.len > 0: "  parent=\"" & pn & "\"" else: "") &
+                 "  text=\"" & txt & "\"" & activeTag &
+                 "   ($f" & $gTxtFound & ")")
     var n = 0
     if iChildCount(cur, n):
       var k = 0
@@ -1875,31 +1952,26 @@ proc iFindTextStep(): int =
 
 proc iFindTextReport(status: int) =
   ## Same reporting contract as `iFindReport` -- STOPPED EARLY is never
-  ## conflated with NOT PRESENT.
-  iOut("  visited " & $gTxtVisited & " node(s) over " & $gTxtFrames &
-       " frame(s), " & $gTxtFound & " match(es), frontier " &
-       $(gTxtQueue.len - gTxtHead) & " node(s)")
-  if status == FindDone:
-    gTxtActive = false
-    gTxtOwnerIdx = -1
-    gTxtOwnerBatch = -1
-    iOut("  -- the subtree was searched EXHAUSTIVELY. " &
-         (if gTxtFound == 0:
-            "No TMP text containing that substring is PRESENT under this root."
-          else: "Every match is listed above."))
-  elif status == FindEnoughHits:
-    gTxtActive = true
-    iOut("  -- stopped at the match cap (" & $InspFindMaxHits & "). There may " &
-         "be more; `findtext more` continues from the frontier above.")
+  ## conflated with NOT PRESENT, and NOTHING EXAMINED is never conflated with
+  ## either. Additionally states which SCOPE (active-only vs all) was
+  ## searched -- "EXHAUSTIVELY" while silently skipping or silently including
+  ## unpressable nodes is the same wrong-answer class as the other findtext
+  ## defects (fact #72: a press on an inactive node returns ok=True and does
+  ## nothing).
+  iFindReportGeneric(status, gTxtVisited, gTxtFrames, gTxtFound,
+                      gTxtInvalidSkips, gTxtQueue.len - gTxtHead,
+                      "findtext", "No TMP text containing that substring",
+                      gTxtActive, gTxtOwnerIdx, gTxtOwnerBatch)
+  if gTxtActiveOnly:
+    iOut("  scope: ACTIVE nodes only (activeInHierarchy)" &
+         (if gTxtInactiveSkipped > 0:
+            "; " & $gTxtInactiveSkipped & " inactive hit(s) skipped -- " &
+            "re-run as `findtext ... all` to include them"
+          else: ""))
   else:
-    gTxtActive = true
-    iOut("  -- STOPPED EARLY on the NODE BUDGET. This is NOT proof the text is " &
-         "absent. Continue with `findtext more` (it RESUMES from the frontier " &
-         "above), or re-run with a bigger budget, or search from a narrower " &
-         "root.")
-  if gTxtFound > 0:
-    iOut("  matches are bound to $f1..$f" & $gTxtFound &
-         " for the rest of this batch")
+    iOut("  scope: ALL nodes, active and inactive -- `all` was passed, so " &
+         "some hits above may be unpressable; check activeInHierarchy on " &
+         "each before pressing")
 
 const InspMaxScenes = 24
 const InspMaxRootsPerScene = 96
@@ -2092,11 +2164,114 @@ proc iCmdRoots(toks: seq[string]) =
        "$rgo0..$rgo" & $(n - 1) & " (that is what `component` wants).")
   iOut("  e.g.  find PvE $r9        or   children $r9")
 
+proc iFindResolveRoot(toks: seq[string]; startTok: int; cmdName: string;
+                       root: var Il2CppPtr; rootExplicit: var bool;
+                       budgetTok: var int): bool =
+  ## Shared disambiguation for the `NAME [ROOT] [BUDGET]` grammar, shared by
+  ## `find` and `findtext`, given the token index right after NAME (normally
+  ## 2). A single bare token after NAME is AMBIGUOUS -- it used to always be
+  ## read as ROOT, which made `find NAME 200000` (or `findtext NAME 300000`)
+  ## silently walk the "root" that decimal reads as, visit one bogus node,
+  ## and claim the name/text "genuinely NOT PRESENT" -- a confidently wrong
+  ## answer. Disambiguate by READABILITY: only treat it as a root if it
+  ## actually reads back as a live Transform/GameObject; otherwise it is a
+  ## BUDGET, which is what a plain integer almost always means here.
+  ## Returns false (having already `iErr`'d) if an eval failed.
+  if toks.len == startTok + 1:
+    var v = 0'u64
+    var err = ""
+    if not iEval(toks[startTok], v, err):
+      iErr(err)
+      return false
+    let cand = cast[Il2CppPtr](v)
+    if duOk(cand, 0x20'i32):
+      if iRefuseIfGameObject(cand, cmdName):
+        return false
+      root = cand
+      rootExplicit = true
+      budgetTok = startTok + 1
+      iOut("  NOTE: \"" & toks[startTok] & "\" reads as a live pointer, so " &
+           "it is being treated as ROOT, not BUDGET. If you meant a " &
+           "budget, pass an explicit root too: `" & cmdName & " ... $someRoot " &
+           toks[startTok] & "`.")
+    else:
+      budgetTok = startTok
+      iOut("  NOTE: \"" & toks[startTok] & "\" does not read back as a live " &
+           "pointer, so it is being treated as BUDGET, not ROOT. Searching " &
+           "every scene root (as if no root were given). If you meant a " &
+           "root, pass a pointer that is actually live.")
+  elif toks.len > startTok:
+    var v = 0'u64
+    var err = ""
+    if not iEval(toks[startTok], v, err):
+      iErr(err)
+      return false
+    root = cast[Il2CppPtr](v)
+    if iRefuseIfGameObject(root, cmdName):
+      return false
+    rootExplicit = true
+    budgetTok = startTok + 1
+  result = true
+
+proc iFindValidateRoot(root: var Il2CppPtr; rootExplicit: bool): bool =
+  ## Shared: an explicit root MUST read back as a live Transform before any
+  ## walk starts -- refused up front, the same way `tree` refuses one,
+  ## instead of being walked and then reported as an exhaustive, confident
+  ## miss.
+  if rootExplicit:
+    root = iToTransform(root)
+    if not duOk(root, 0x20'i32):
+      iErr("that root pointer is not readable as a Transform; refusing to " &
+           "walk it. (The unconverted pointer read back readable, but " &
+           "`Component::get_transform` on it did not -- something changed " &
+           "underneath, or it was never a Transform/GameObject.)")
+      return false
+  result = true
+
+proc iFindParseBudget(toks: seq[string]; budgetTok, defBudget,
+                       maxBudget: int): int =
+  ## Shared: an explicit budget token, clamped to the command's ceiling. The
+  ## default and the ceiling are deliberately different constants per
+  ## `InspFindDefBudget`'s comment -- a caller asking for more than the
+  ## default must not be silently clamped back down to it.
+  result = defBudget
+  if toks.len > budgetTok:
+    var b = 0'u64
+    var e = ""
+    if iEval(toks[budgetTok], b, e) and int(b) > 0:
+      result = int(b)
+  if result > maxBudget:
+    result = maxBudget
+
+proc iFindParseBudgetNoted(toks: seq[string]; budgetTok, defBudget,
+                           maxBudget: int; cmdName: string): int =
+  ## Same as `iFindParseBudget`, but SAYS SO when the requested budget was
+  ## clamped -- a caller who asked for 150000 and got a silent 60000 has no
+  ## way to know the ceiling exists, let alone what it is.
+  var requested = -1
+  if toks.len > budgetTok:
+    var b = 0'u64
+    var e = ""
+    if iEval(toks[budgetTok], b, e) and int(b) > 0:
+      requested = int(b)
+  result = iFindParseBudget(toks, budgetTok, defBudget, maxBudget)
+  if requested > maxBudget:
+    iOut("  NOTE: requested budget " & $requested & " exceeds `" & cmdName &
+         "`'s ceiling of " & $maxBudget & " nodes; clamped to " & $maxBudget &
+         ". The real backstop is the " & $int(InspFindSliceMs) & "ms " &
+         "per-frame time slice, not the node count -- raising this ceiling " &
+         "is a deliberate code change, not a per-call override.")
+
 proc iCmdFindText(toks: seq[string]) =
-  ## `findtext SUBSTR [ROOT] [BUDGET]` -- find controls by the TEXT THEY
-  ## DISPLAY, not by GameObject name. Mirrors `find`'s resume/budget/report
-  ## contract exactly (see iCmdFind); the only difference is the per-node
-  ## test.
+  ## `findtext SUBSTR [ROOT] [BUDGET] [all]` -- find controls by the TEXT
+  ## THEY DISPLAY, not by GameObject name. Mirrors `find`'s resume/budget/
+  ## report contract exactly (see iCmdFind); the differences are the
+  ## per-node test, and that a hit is checked against `activeInHierarchy`
+  ## and, by DEFAULT, an inactive hit is skipped rather than reported --
+  ## matching the Nimony `aowl ui` driver's default and fact #72 (pressing a
+  ## control on an inactive GameObject returns success and does nothing).
+  ## Pass a trailing `all` to include inactive hits (same spelling family as
+  ## `aowl ui`'s `--all`).
   if gTxtActive and gTxtOwnerIdx == gInspCurIdx and gTxtOwnerBatch == gInspBatch:
     inc gTxtFrames
     let st = iFindTextStep()
@@ -2108,7 +2283,7 @@ proc iCmdFindText(toks: seq[string]) =
     return
 
   if toks.len < 2:
-    iErr("usage: findtext SUBSTR [ROOT] [BUDGET] | findtext more [BUDGET]")
+    iErr("usage: findtext SUBSTR [ROOT] [BUDGET] [all] | findtext more [BUDGET]")
     return
 
   if iLower(toks[1]) == "more":
@@ -2152,29 +2327,26 @@ proc iCmdFindText(toks: seq[string]) =
          "searched.")
     return
 
-  let want = toks[1]
+  # `all` is a trailing keyword, stripped before ROOT/BUDGET parsing so it
+  # cannot be misread as either -- `findtext SUBSTR ROOT BUDGET all` and
+  # `findtext SUBSTR all` both work. Same spelling family as `aowl ui`'s
+  # `--all`, which is what the Nimony UI driver uses for the identical
+  # opt-in.
+  var ftoks = toks
+  let includeInactive = ftoks.len > 2 and iLower(ftoks[^1]) == "all"
+  if includeInactive:
+    ftoks.setLen(ftoks.len - 1)
+
+  let want = ftoks[1]
   var root: Il2CppPtr = nil
   var rootExplicit = false
-  if toks.len > 2:
-    var v = 0'u64
-    var err = ""
-    if not iEval(toks[2], v, err):
-      iErr(err)
-      return
-    root = cast[Il2CppPtr](v)
-    if iRefuseIfGameObject(root, "findtext"):
-      return
-    rootExplicit = true
-    root = iToTransform(root)
-
-  var budget = InspTextFindDefBudget
-  if toks.len > 3:
-    var b = 0'u64
-    var e = ""
-    if iEval(toks[3], b, e) and int(b) > 0:
-      budget = int(b)
-  if budget > InspTextFindMaxBudget:
-    budget = InspTextFindMaxBudget
+  var budgetTok = 3
+  if not iFindResolveRoot(ftoks, 2, "findtext", root, rootExplicit, budgetTok):
+    return
+  if not iFindValidateRoot(root, rootExplicit):
+    return
+  let budget = iFindParseBudgetNoted(ftoks, budgetTok, InspTextFindDefBudget,
+                                      InspTextFindMaxBudget, "findtext")
 
   gTxtQueue = @[]
   var seededRoots = 0
@@ -2194,6 +2366,9 @@ proc iCmdFindText(toks: seq[string]) =
   gTxtHead = 0
   gTxtWant = iLower(want)
   gTxtVisited = 0
+  gTxtInvalidSkips = 0
+  gTxtActiveOnly = not includeInactive
+  gTxtInactiveSkipped = 0
   gTxtFound = 0
   gTxtActive = false
   gTxtBudgetLeft = budget
@@ -2205,7 +2380,9 @@ proc iCmdFindText(toks: seq[string]) =
         else: "ALL " & $seededRoots & " scene root(s)") &
        " for TMP text containing \"" & want & "\" (case-insensitive; budget " &
        $budget & " nodes, " & $int(InspFindSliceMs) & "ms per frame, " &
-       "continuing across frames automatically)")
+       "continuing across frames automatically; scope: " &
+       (if gTxtActiveOnly: "ACTIVE nodes only -- pass `all` to include inactive"
+        else: "ALL nodes, active and inactive") & ")")
   let st = iFindTextStep()
   if st == FindOutOfTime and gTxtBudgetLeft > 0 and
      gTxtFrames < InspFindMaxFrames:
@@ -2220,6 +2397,14 @@ proc iCmdFind(toks: seq[string]) =
   ## `find more [BUDGET]`               -- RESUME a search that hit a cap
   ##
   ## Matching is case-insensitive substring on the GameObject name.
+  ##
+  ## KNOWN GAP, DELIBERATELY LEFT: `find` has the same active/inactive blind
+  ## spot `findtext` had (a hit may sit on an inactive node and be
+  ## unpressable, fact #72) and does NOT report `activeInHierarchy` or
+  ## filter by it. Left unchanged here because `find` is used for MORE than
+  ## locating pressable controls (e.g. confirming a name exists anywhere,
+  ## active or not) and a default flip is a bigger behavior change than this
+  ## pass should make silently -- flagging it rather than changing it.
   # ---- AUTOMATIC CONTINUATION ----
   # This same command index already owns a search that ran out of FRAME time.
   # Resume it rather than restarting: re-running from the root would re-walk
@@ -2290,67 +2475,17 @@ proc iCmdFind(toks: seq[string]) =
     budgetTok = 4
     iOut("  root \"" & toks[3] & "\" resolved to " & iPtr(root) &
          " name=\"" & iObjName(root) & "\"")
-  elif toks.len == 3:
-    # AMBIGUOUS: exactly one bare token after NAME, with grammar
-    # `find NAME [ROOT] [BUDGET]`. This used to always be read as ROOT, which
-    # made `find SettingsScreen 200000` silently walk the "root" 0x30d40 (that
-    # decimal value read as a pointer), visit one bogus node, and report the
-    # name "genuinely NOT PRESENT" -- a confidently wrong answer. Disambiguate
-    # by READABILITY: only treat it as a root if it actually reads back as a
-    # live Transform/GameObject; otherwise it is a BUDGET, which is what a
-    # plain integer like 20000 or 200000 almost always means here.
-    var v = 0'u64
-    var err = ""
-    if not iEval(toks[2], v, err):
-      iErr(err)
-      return
-    let cand = cast[Il2CppPtr](v)
-    if duOk(cand, 0x20'i32):
-      if iRefuseIfGameObject(cand, "find"):
-        return
-      root = cand
-      rootExplicit = true
-      iOut("  NOTE: \"" & toks[2] & "\" reads as a live pointer, so it is " &
-           "being treated as ROOT, not BUDGET. If you meant a budget, pass " &
-           "an explicit root too: `find " & want & " $someRoot " & toks[2] & "`.")
-    else:
-      budgetTok = 2
-      iOut("  NOTE: \"" & toks[2] & "\" does not read back as a live " &
-           "pointer, so it is being treated as BUDGET, not ROOT. Searching " &
-           "every scene root (as if no root were given). If you meant a " &
-           "root, pass a pointer that is actually live.")
-  elif toks.len > 2:
-    var v = 0'u64
-    var err = ""
-    if not iEval(toks[2], v, err):
-      iErr(err)
-      return
-    root = cast[Il2CppPtr](v)
-    if iRefuseIfGameObject(root, "find"):
-      return
-    rootExplicit = true
   else:
-    root = nil    # no root named: search EVERY scene root (see below)
-
-  if rootExplicit:
-    root = iToTransform(root)
-    if not duOk(root, 0x20'i32):
-      iErr("that root pointer is not readable as a Transform; refusing to " &
-           "walk it. (The unconverted pointer read back readable, but " &
-           "`Component::get_transform` on it did not -- something changed " &
-           "underneath, or it was never a Transform/GameObject.)")
+    # `find NAME [ROOT] [BUDGET]` -- shared with `findtext`'s identical
+    # grammar (see `iFindResolveRoot`/`iFindValidateRoot`).
+    if not iFindResolveRoot(toks, 2, "find", root, rootExplicit, budgetTok):
       return
-  elif root == nil:
-    discard
 
-  var budget = InspFindDefBudget
-  if toks.len > budgetTok:
-    var b = 0'u64
-    var e = ""
-    if iEval(toks[budgetTok], b, e) and int(b) > 0:
-      budget = int(b)
-  if budget > InspFindMaxBudget:
-    budget = InspFindMaxBudget
+  if not iFindValidateRoot(root, rootExplicit):
+    return
+
+  let budget = iFindParseBudgetNoted(toks, budgetTok, InspFindDefBudget,
+                                      InspFindMaxBudget, "find")
 
   gFindQueue = @[]
   var seededRoots = 0
@@ -3683,8 +3818,10 @@ proc iCmdHelp() =
   iOut("    find NAME [ROOT] [BUDGET]     name search; NO ROOT = ALL scenes")
   iOut("    find NAME in ROOTNAME         narrow by a root named, not pointed")
   iOut("    find more [BUDGET]            RESUME a search that hit its cap")
-  iOut("    findtext SUBSTR [ROOT] [BUDGET]  search by TEXT A CONTROL DISPLAYS")
+  iOut("    findtext SUBSTR [ROOT] [BUDGET] [all]  TEXT A CONTROL DISPLAYS")
   iOut("                                  (TMP_Text only), not GameObject name")
+  iOut("                                  ACTIVE nodes only by default; `all`")
+  iOut("                                  includes inactive (unpressable) hits")
   iOut("    findtext more [BUDGET]        RESUME a text search that hit its cap")
   iOut("    component EXPR TypeName       GameObject/Transform -> component")
   iOut("    components EXPR [BaseType]    LIST every component, named  -> $k0..")
@@ -3720,12 +3857,18 @@ proc iExec(line: string) =
   let cmd = iLower(toks[0])
   if cmd.len > 0 and cmd[0] == '#':
     return
-  # ECHO ONCE PER COMMAND, NOT ONCE PER FRAME. A frame-spanning `find` re-enters
-  # this same command every frame until it finishes, and echoing each time
-  # produced 32 identical `> find PvE` lines wrapped around the results. The
-  # echo belongs to the command being CLAIMED, not to each slice of its work.
-  if not (gFindActive and gFindOwnerIdx == gInspCurIdx and
-          gFindOwnerBatch == gInspBatch):
+  # ECHO ONCE PER COMMAND, NOT ONCE PER FRAME. A frame-spanning `find` (or
+  # `findtext`) re-enters this same command every frame until it finishes,
+  # and echoing each time produced 32 identical `> find PvE` lines wrapped
+  # around the results -- and, before this fixed, 57 `> findtext SETTINGS`
+  # lines around a 4-line answer, because this check only ever covered
+  # `find`'s resume flag. The echo belongs to the command being CLAIMED, not
+  # to each slice of its work, for EITHER walker.
+  let isFindResume = gFindActive and gFindOwnerIdx == gInspCurIdx and
+                      gFindOwnerBatch == gInspBatch
+  let isFindTextResume = gTxtActive and gTxtOwnerIdx == gInspCurIdx and
+                          gTxtOwnerBatch == gInspBatch
+  if not (isFindResume or isFindTextResume):
     iOut("> " & line)
   case cmd
   of "help", "?":

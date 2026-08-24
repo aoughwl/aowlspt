@@ -129,8 +129,10 @@ parent EXPR [N]          children EXPR      tree EXPR [DEPTH]
 roots                    every scene root -> $r0..$rN (transforms; GOs are $rgoN)
 find NAME [ROOT] [BUDGET]      NO ROOT = ALL scenes    find NAME in ROOTNAME
 find more [BUDGET]       dump EXPR [N]      fields EXPR [N]
-findtext SUBSTR [ROOT] [BUDGET]   search by the TEXT A CONTROL DISPLAYS
-                          (TMP_Text only), not GameObject name    findtext more [BUDGET]
+findtext SUBSTR [ROOT] [BUDGET] [all]  search by the TEXT A CONTROL DISPLAYS
+                          (TMP_Text only), not GameObject name; ACTIVE nodes
+                          only by default, `all` includes inactive (unpressable)
+                          hits    findtext more [BUDGET]
 component EXPR TypeName  -> $comp           rect EXPR       label EXPR
 scan EXPR N TYPE VALUE   canvas EXPR        call TARGET SIG [ARGS]   image
 click EXPR / invoke EXPR         open [GROUP] / tab EXPR [0|1]
@@ -169,6 +171,23 @@ refused up front, exactly like `tree` already refuses, if it does not read back
 as a valid Transform — `find` never again reports a "genuinely NOT PRESENT" or
 "searched EXHAUSTIVELY" verdict when zero valid nodes were actually visited; it
 says plainly that nothing was examined.
+
+**`findtext` shares `find`'s root/budget parser and reporter** (`iFindResolveRoot`,
+`iFindValidateRoot`, `iFindParseBudget(Noted)`, `iFindReportGeneric`) — it was
+added on a different branch and had drifted to reproduce the same bugs `find`
+had just been fixed for; that is now structurally harder, since only the
+per-node predicate differs. It also fixes two defects `find` never had:
+`findtext` used to echo its own `> findtext ...` header **every resumed
+frame** (57 lines around a 4-line answer) because the echo-suppression check
+only ever tested `find`'s resume flag, not `findtext`'s; and every hit is now
+checked against `GameObject::get_activeInHierarchy` and tagged in the output,
+because a hit on an inactive node **is not pressable** — pressing one returns
+success and does nothing (fact #72). `findtext` therefore searches **ACTIVE
+nodes only by default**, matching the Nimony `aowl ui` driver; pass a
+trailing `all` to include inactive hits, and the summary line always states
+which scope was actually searched. `find` has the identical active/inactive
+blind spot and was deliberately **left unchanged** — flip its default only as
+a considered decision, not silently.
 
 Write the command file **without a BOM**. PowerShell 5.1's `Set-Content -Encoding
 utf8` emits one; it is stripped now, but `printf` from Bash is the safe habit.
