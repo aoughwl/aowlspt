@@ -14,7 +14,8 @@ does not expose, the fix is to add it to the route, not to the UI.
 |---|---|---|
 | GET | `/aowlspt/settings/index` | `{"mods":[{"guid","name","count"}...]}` — every mod that has declared settings |
 | GET | `/aowlspt/settings/<guid>` | `[{Setting}...]` — that mod's schema, current values folded in |
-| POST | `/aowlspt/settings/<guid>` | body `{"key":"<configKey>","value":<json literal>}`; persists the edit, replies with the refreshed `[{Setting}...]` |
+| POST | `/aowlspt/settings/<guid>` | body `{"key":"<configKey>","value":<json literal>}`; persists the edit — creating the key in `config.json` if it was never there — replies with the refreshed `[{Setting}...]` |
+| POST | `/aowlspt/settings/<guid>/reset` | body `{"key":"<configKey>"}` resets that one key, or an empty body `{}` resets every key this mod declares — in both cases to the value in that key's `default` field, the schema's one source of truth; replies with the refreshed `[{Setting}...]` |
 | GET | `/aowlspt/settings/spt/index` | `{"pages":[{id,label,count,done}...]}` — the read-only SPT config catalogue (`mods/settingshub`) |
 | GET | `/aowlspt/settings/spt/page/<id>` | `{"settings":[...],"nested":[...]}` — one SPT config page, all `implemented:false` today |
 | GET | `/aowlspt/ui/page/settings` | the fallback HTML page (`mods/uihub`), for a human with a browser |

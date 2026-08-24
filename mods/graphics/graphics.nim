@@ -216,6 +216,12 @@ proc onSettings(url, body, session: string): string =
     discard pushGrade()
   result = declaredSchemaJson().text
 
+proc onSettingsReset(url, body, session: string): string =
+  if resetFromBody(body) == Ok:
+    loadConfig()
+    discard pushGrade()
+  result = declaredSchemaJson().text
+
 # ---------------------------------------------------------------------------
 # Events — apply/reload without a settings round trip
 # ---------------------------------------------------------------------------
@@ -233,6 +239,7 @@ proc onLoad(): Status =
   loadConfig()
   declareSettings(schema())
   discard serve("/aowlspt/settings/" & ModGuid, onSettings)
+  discard serve("/aowlspt/settings/" & ModGuid & "/reset", onSettingsReset)
   discard on("aowl.graphics.apply", onApplyEvent)
   if pushGrade():
     success "graphics  grade pushed to the host post-process (tonemapper=" &

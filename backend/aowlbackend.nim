@@ -1484,11 +1484,83 @@ proc hostConfigGet(ctx: HostPtr; key: HostPtr; keyLen: int32;
   result = cOutCopy(outPtr, outLen, cast[HostPtr](toCString(value)),
                     int32(value.len))
 
+proc jsonEscapeKey(s: string): string =
+  result = ""
+  for c in s:
+    case c
+    of '"':  result.add "\\\""
+    of '\\': result.add "\\\\"
+    else:    result.add c
+
+proc mergeConfigKey(text, key, valueJson: string): string =
+  ## `text` with `key` set to `valueJson` (a JSON literal, verbatim). Replaces
+  ## an existing top-level member's span in place; a key `config.json` has
+  ## never held (a declared setting with no on-disk entry -- the write path
+  ## this exists to fix) is inserted before the closing brace instead of
+  ## being silently dropped.
+  var vs = 0
+  var ve = 0
+  if locatePath(text, key, vs, ve):
+    result = text.substr(0, vs - 1) & valueJson & text.substr(ve)
+    return
+  let trimmed = strip(text)
+  let member = "\"" & jsonEscapeKey(key) & "\":" & valueJson
+  if trimmed.len == 0 or trimmed == "{}":
+    result = "{" & member & "}"
+    return
+  # `trimmed` is a readable object (checked by the caller before this runs),
+  # so it starts with `{` and ends with `}`; splice the new member in just
+  # before the closing brace.
+  let inner = strip(trimmed.substr(1, trimmed.len - 2))
+  if inner.len == 0:
+    result = "{" & member & "}"
+  else:
+    result = "{" & inner & "," & member & "}"
+
 proc hostConfigSet(ctx: HostPtr; key: HostPtr; keyLen: int32;
                    val: HostPtr; valLen: int32): int32 {.
     exportc: "aowlspt_nim_config_set", cdecl.} =
-  gLastError = "the backend does not write mod config"
-  result = ErrUnsupported
+  ## Merges one key into this mod's `config.json`, creating the file and/or
+  ## the key if either is absent. Used to silently no-op for a key the file
+  ## had never held -- `applySettingFromBody` would return `Ok`, the caller's
+  ## POST would get 200 with the schema's *old* value echoed back, and
+  ## nothing on disk would change. Every early-return here sets `gLastError`
+  ## and answers a real status instead, so a failed persist cannot look like
+  ## a successful one.
+  let idx = int(cast[uint](ctx))
+  let k = readBytes(key, keyLen)
+  let v = readBytes(val, valLen)
+  if k.len == 0:
+    gLastError = "config set needs a key"
+    return ErrBadArg
+  var valueFault = ""
+  if jsonFault(v, valueFault):
+    gLastError = "value for \"" & k & "\" is not valid JSON: " & valueFault
+    return ErrBadArg
+  let dir = modDirOf(idx)
+  if dir.len == 0:
+    gLastError = "no such mod context"
+    return ErrBadArg
+  let cfgPath = joinPath(dir, "config.json")
+  var text = ""
+  var readErr = ""
+  let rst = configRead(idx, text, readErr)
+  if rst == ErrConfigParse:
+    gLastError = readErr
+    return ErrConfigParse
+  if rst == ErrNotFound:
+    text = "{}"
+  let merged = mergeConfigKey(text, k, v)
+  var mergedFault = ""
+  if jsonFault(merged, mergedFault):
+    gLastError = "internal: the merged " & cfgPath & " would not parse (" &
+                 mergedFault & ")"
+    return ErrGeneric
+  let wr = writeTextFile(cfgPath, merged)
+  if not wr.ok:
+    gLastError = "could not write " & cfgPath
+    return ErrGeneric
+  result = StatusOk
 
 proc hostDbGet(ctx: HostPtr; path: HostPtr; pathLen: int32;
                outPtr, outLen: HostPtr): int32 {.
@@ -2417,6 +2489,66 @@ proc main(): int =
         else:
           console.err "settings route: no 'edition' row found to check"
           inc gSelfFailures
+
+    # A POST to a DECLARED key must actually persist -- and a reset must put
+    # the declared default back -- even when `config.json` never held that key
+    # to begin with. `menuCornerLabel` is exactly that key on a stock install
+    # (fact: `mods/tarkov/config.json` ships with no `menuCornerLabel` entry;
+    # only the schema's `enumSetting` default supplies one), which is what
+    # made the write path's old behaviour -- `configSet` hard-coded to
+    # `ErrUnsupported`, silently discarded by every mod's route handler -- a
+    # 200 that echoed the unchanged value back and changed nothing on disk.
+    const cornerRoute = "/aowlspt/settings/aowl.tarkov"
+    const cornerResetRoute = cornerRoute & "/reset"
+    proc cornerLabelValue(): string =
+      let r = request(gPort, cornerRoute, "", "000000000000000000000001")
+      result = ""
+      if not r.ok:
+        return
+      var tree = parseJson(r.body)
+      if hasError(tree):
+        return
+      for row in items(root(tree)):
+        var isCorner = false
+        var v = ""
+        for k, val in pairs(row):
+          if k == "key" and val.getStr() == "menuCornerLabel":
+            isCorner = true
+          if k == "value" and val.kind == JString:
+            v = val.getStr()
+        if isCorner:
+          return v
+
+    let before = cornerLabelValue()
+    let setResp = request(gPort, cornerRoute,
+                          "{\"key\":\"menuCornerLabel\",\"value\":\"\\\"PVE ZONE\\\"\"}",
+                          "000000000000000000000001")
+    let after = cornerLabelValue()
+    if not setResp.ok:
+      console.err "settings write: POST failed: " & setResp.error
+      inc gSelfFailures
+    elif after != "PVE ZONE":
+      console.err "settings write: POST to a key not yet in config.json did " &
+                  "not persist (before=\"" & before & "\" after=\"" & after &
+                  "\", wanted \"PVE ZONE\")"
+      inc gSelfFailures
+    else:
+      console.ok "settings write: a declared key with no prior config.json " &
+                 "entry now persists"
+
+    let resetResp = request(gPort, cornerResetRoute,
+                            "{\"key\":\"menuCornerLabel\"}",
+                            "000000000000000000000001")
+    let afterReset = cornerLabelValue()
+    if not resetResp.ok:
+      console.err "settings reset: POST failed: " & resetResp.error
+      inc gSelfFailures
+    elif afterReset != "Profile Name":
+      console.err "settings reset: did not restore the declared default " &
+                  "(got \"" & afterReset & "\", wanted \"Profile Name\")"
+      inc gSelfFailures
+    else:
+      console.ok "settings reset: restores the schema's declared default"
 
     # And a malformed session id must be refused before any route sees it.
     let badSession = request(gPort, "/aowlspt/status", "", "not-a-mongo-id")

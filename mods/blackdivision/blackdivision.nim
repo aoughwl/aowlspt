@@ -616,11 +616,18 @@ proc onBlackDivisionSettings(url, body, session: string): string =
     readConfig()
   result = declaredSchemaJson().text
 
+proc onBlackDivisionSettingsReset(url, body, session: string): string =
+  if resetFromBody(body) == Ok:
+    readConfig()
+  result = declaredSchemaJson().text
+
 proc onLoadServer(): Status =
   seedRandom(nowMs())
   readConfig()
   declareSettings(blackDivisionSchema())
   discard serve("/aowlspt/settings/" & ModGuid, onBlackDivisionSettings)
+  discard serve("/aowlspt/settings/" & ModGuid & "/reset",
+                onBlackDivisionSettingsReset)
   discard onEvent("morebots.ready", onMorebotsReady)
   discard onEvent("tarkov.raid.ended", onRaidEnded)
   info "blackdivision " & ModVersion & " loaded, waiting for morebots (" &

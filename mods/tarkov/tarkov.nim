@@ -2855,6 +2855,11 @@ proc onTarkovSettings(url, body, session: string): string =
     applyMenuCornerLabel()
   result = declaredSchemaJson().text
 
+proc onTarkovSettingsReset(url, body, session: string): string =
+  discard resetFromBody(body)
+  applyMenuCornerLabel()
+  result = declaredSchemaJson().text
+
 proc onLoad(): Status =
   if side() != sideServer:
     info "the emulator is a server mod; nothing to do on this side"
@@ -2892,6 +2897,7 @@ proc onLoad(): Status =
   # it answers even on a host where the emulator refuses to serve anything else.
   declareSettings(tarkovSchema())
   discard serve("/aowlspt/settings/" & ModGuid, onTarkovSettings)
+  discard serve("/aowlspt/settings/" & ModGuid & "/reset", onTarkovSettingsReset)
 
   if not storeReady():
     error "this host has no persistent store; profiles cannot be kept " &

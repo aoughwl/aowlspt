@@ -182,6 +182,11 @@ proc onSettings(url, body, session: string): string =
     loadConfig()
   result = declaredSchemaJson().text
 
+proc onSettingsReset(url, body, session: string): string =
+  if resetFromBody(body) == Ok:
+    loadConfig()
+  result = declaredSchemaJson().text
+
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
@@ -254,6 +259,7 @@ proc onLoad(): Status =
   loadConfig()
   declareSettings(texturesSchema())
   discard serve("/aowlspt/settings/" & ModGuid, onSettings)
+  discard serve("/aowlspt/settings/" & ModGuid & "/reset", onSettingsReset)
   success ModName & " " & ModVersion & " loaded on " & hostName()
 
   # The manifest lives in the mod's own data dir; packRoot (where the images
