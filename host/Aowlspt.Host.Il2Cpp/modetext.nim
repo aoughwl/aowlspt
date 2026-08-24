@@ -105,27 +105,6 @@ proc modeTextSetWanted(s: string) =
   info "menu mode text: the backend wants the corner label to read \"" & s &
        "\"; it will be applied on the next PreloaderUI frame"
 
-proc modeTextRawString(p: Il2CppPtr): string =
-  ## A `System.String*` as text by its FIXED runtime layout -- length int32 at
-  ## +0x10, UTF-16 chars inline at +0x14 -- with every read guarded. The same
-  ## primitive the version brand uses, and self-validating: a slot that is not a
-  ## String yields "" rather than garbage. ASCII only, which is all the corner
-  ## label has ever held; a non-ASCII char makes it bail rather than guess.
-  result = ""
-  if p == nil or cIsReadable(p, 0x14'i32) == 0'i32:
-    return
-  let n = cReadI32At(cast[Il2CppPtr](cast[uint64](p) + 0x10'u64))
-  if n <= 0'i32 or n > 128'i32:
-    return
-  let chars = cast[Il2CppPtr](cast[uint64](p) + 0x14'u64)
-  if cIsReadable(chars, int32(n) * 2'i32) == 0'i32:
-    return
-  for i in 0 ..< int(n):
-    let c = cWordAt(chars, uint64(i))
-    if c == 0'u16 or c > 0x7E'u16:
-      return ""
-    result.add char(c)
-
 ## Carries the string for the guarded allocation, for the same reason
 ## `gBrandText` does: `aowl_p_p_seh` passes exactly one pointer.
 var gModeTextAlloc = ""
@@ -152,6 +131,134 @@ static void* aowl_mtx_tick_guarded(void* a) {
 proc cMtxTickGuarded(a: Il2CppPtr): Il2CppPtr {.
   importc: "aowl_mtx_tick_guarded", nodecl.}
 
+# ---------------------------------------------------------------------------
+# RETARGET (measured today, fact #116): `PreloaderUI::SetGameModeText` writes
+# `_sessionModeText`(+0x128) and that field genuinely updates -- but it never
+# reaches the screen. The label a player actually sees is TWO TMPs under
+# Common UI: `ChangeGameModeButton/Available/MainTextContainer/{MainText,
+# MainTextHover}`. `aowl ui findtext "ZONE" --root "Common UI" --all` found
+# exactly those two, walk COMPLETE; the same search under Preloader UI and
+# Menu UI returned zero hits, walk COMPLETE -- the label is not in
+# PreloaderUI's subtree at all, which is why the old call could succeed and
+# still show nothing. So this now WALKS to the real nodes from a verified
+# scene root (never a hardcoded pointer -- those are per-session) and writes
+# BOTH TMPs, because MainTextHover is the hover state and a stale hover copy
+# changes the label under the cursor (fact #88, the same bug that hit the
+# MODS row captions).
+# ---------------------------------------------------------------------------
+
+var gMtxTmpMain: Il2CppPtr = nil    ## resolved once, revalidated, never re-walked
+var gMtxLocMain: Il2CppPtr = nil    ## optional LocalizedText sibling; nil is fine
+var gMtxTmpHover: Il2CppPtr = nil
+var gMtxLocHover: Il2CppPtr = nil
+var gMtxResolved = false
+var gMtxResolvePasses = 0
+var gMtxResolveWhy = ""
+var gMtxResolveSaidWalk = false
+var gMtxResolveGaveUp = false
+const MtxResolveMaxPasses = 30
+  ## Same budget as `SeasonsMaxPasses`: the walk is bounded and cheap, so 30
+  ## tries (well under a second at 60fps) is plenty before the main menu is up,
+  ## and giving up loudly beats retrying forever in silence.
+
+proc modeTextFindGameModeRoot(): Il2CppPtr =
+  ## `ChangeGameModeButton`, searched from every scene root down to a bounded
+  ## depth -- the same pattern as `seasonsFindMenuScreen`. "Common UI" is the
+  ## verified live root (fact #116), but this does not hardcode that layer, so
+  ## an inserted UI wrapper does not silently break the walk.
+  result = nil
+  var roots: seq[Il2CppPtr] = @[]
+  let n = iSceneRoots(roots, false)
+  if roots.len == 0:
+    gMtxResolveWhy = "iSceneRoots enumerated NO roots (" & $n & ")"
+    return
+  var names = ""
+  var i = 0
+  while i < roots.len and i < 32:
+    let goT = iToTransform(roots[i])
+    if goT != nil and duOk(goT, 0x20'i32):
+      if names.len < 300:
+        names = names & "'" & iObjName(goT) & "' "
+      let m = modsFindNamed(goT, "ChangeGameModeButton", 8)
+      if m != nil:
+        gMtxResolveWhy = ""
+        return m
+    i = i + 1
+  gMtxResolveWhy = "no 'ChangeGameModeButton' within 8 levels of any of the " &
+                    $roots.len & " scene root(s): " & names
+
+proc modeTextResolveOne(btnT: Il2CppPtr; childName: string;
+                         tmpOut, locOut: var Il2CppPtr): bool =
+  ## Walks `btnT -> Available -> MainTextContainer -> childName`, then
+  ## resolves the TextMeshProUGUI (required) and LocalizedText (optional --
+  ## not every TMP carries one) components on the leaf. Never falls back to a
+  ## guess: a missing hop is reported and nothing is cached.
+  result = false
+  tmpOut = nil
+  locOut = nil
+  let avail = modsChildNamed(btnT, "Available")
+  if avail == nil:
+    gMtxResolveWhy = "ChangeGameModeButton has no child 'Available'"
+    return
+  let container = modsChildNamed(avail, "MainTextContainer")
+  if container == nil:
+    gMtxResolveWhy = "Available has no child 'MainTextContainer'"
+    return
+  let leaf = modsChildNamed(container, childName)
+  if leaf == nil:
+    gMtxResolveWhy = "MainTextContainer has no child '" & childName & "'"
+    return
+  let tmp = modsComponent(leaf, "TextMeshProUGUI")
+  if tmp == nil or not duOk(tmp, cSuiOffTmpMText() + 8'i32):
+    gMtxResolveWhy = childName & " has no readable TextMeshProUGUI component"
+    return
+  tmpOut = tmp
+  locOut = modsComponent(leaf, "LocalizedText")     # optional
+  result = true
+
+proc modeTextResolveBoth(): bool =
+  result = false
+  let btnT = modeTextFindGameModeRoot()
+  if btnT == nil:
+    return
+  var tmpM: Il2CppPtr = nil
+  var locM: Il2CppPtr = nil
+  var tmpH: Il2CppPtr = nil
+  var locH: Il2CppPtr = nil
+  if not modeTextResolveOne(btnT, "MainText", tmpM, locM):
+    return
+  if not modeTextResolveOne(btnT, "MainTextHover", tmpH, locH):
+    return
+  gMtxTmpMain = tmpM
+  gMtxLocMain = locM
+  gMtxTmpHover = tmpH
+  gMtxLocHover = locH
+  result = true
+
+proc modeTextApplyOne(tmp, loc, s: Il2CppPtr; label: string) =
+  ## Writes through the REAL setters and re-applies, same recipe as
+  ## `swRelabelControl`: `LocalizedText::SetLabelText` first (the level a
+  ## locale pass re-applies from, when the sibling exists), then
+  ## `TMP_Text::set_text` + the real dirty latch. `ForceMeshUpdate` @0x628110
+  ## is this build's universal empty-body stub and is not called.
+  ##
+  ## VERIFIES THE OUTCOME: reads `m_text` back AFTER both calls and logs what
+  ## is actually there, not what was asked for -- a verification that can only
+  ## observe its own write is worthless (fact #88, the MODS row-caption bug).
+  if loc != nil:
+    let fn = cSwFn2(SwLocSetLabelText)
+    if fn != nil:
+      cSwCallVPP(fn, loc, s)
+  discard swSetTmpTextByCall(tmp, s)
+  let after = suiReadString(cReadPtrAt(tmp, cSuiOffTmpMText()))
+  if after == gModeTextWant:
+    okLog "menu mode text: " & label & " now reads \"" & after &
+          "\" (VERIFIED by read-back)"
+  else:
+    warn "menu mode text: " & label & " reads \"" & after &
+         "\" after the write, not the requested \"" & gModeTextWant &
+         "\" -- something else is still writing this TMP"
+
 proc modeTextTickBody(a: Il2CppPtr): Il2CppPtr {.
     exportc: "aowl_mtx_tick_body", cdecl.} =
   ## The whole managed-touching body, under ONE guard. `a` is the live
@@ -160,50 +267,52 @@ proc modeTextTickBody(a: Il2CppPtr): Il2CppPtr {.
   ## Returns a non-nil sentinel on clean completion; the guard returns nil if
   ## this faulted, and the caller counts that toward the self-disable.
   result = cast[Il2CppPtr](1)
-  let self = a
+  let self = a           # the PreloaderUI `this`; unused by the new path below,
+  discard self           # kept only so the shared drain's dispatch shape is intact
 
-  # ---- the one-shot identification log ----
-  #
-  # This is what makes the target verifiable from a real run rather than from
-  # this file's claims: the object pointer the user is looking at, the parent
-  # chain to it, and the CURRENT text of the field, read before anything is
-  # written. On a stock client the last of these prints "PVE ZONE".
-  if not gModeTextLogged:
-    gModeTextLogged = true
-    let modeOff = cMtxOffModeText()
-    let lblOff = cMtxOffCornerLabel()
-    var cur = ""
-    if cIsReadable(self, modeOff + 8'i32) != 0'i32:
-      cur = modeTextRawString(cReadPtrAt(self, modeOff))
-    var lbl: Il2CppPtr = nil
-    if cIsReadable(self, lblOff + 8'i32) != 0'i32:
-      lbl = cReadPtrAt(self, lblOff)
-    okLog "menu mode text: FOUND the corner label. parent chain = " &
-          "EFT.UI.PreloaderUI(this=0x" & hexOf(cast[uint64](self)) & ")" &
-          " -> _alphaVersionLabel:LocalizedText(+0x" & hexOf(uint64(lblOff)) &
-          ")=0x" & hexOf(cast[uint64](lbl)) &
-          " ; the mode string is _sessionModeText(+0x" &
-          hexOf(uint64(modeOff)) & ") and currently reads \"" & cur & "\"" &
-          " (this is the \"PVE ZONE\" slot; identified offline from the " &
-          "decrypted metadata, and confirmed here by SetGameModeText's own " &
-          "mov [rcx+0x128],rdx)"
-    # Seed `gModeTextApplied` with the stock value so that a backend asking for
-    # exactly what is already on screen costs no allocation and no call.
-    if cur.len > 0:
-      gModeTextApplied = cur
+  # ---- resolve the REAL target once, by walking, never by a cached RVA guess ----
+  if not gMtxResolved:
+    if gMtxResolvePasses < MtxResolveMaxPasses:
+      inc gMtxResolvePasses
+      if modeTextResolveBoth():
+        gMtxResolved = true
+        gModeTextLogged = true
+        let curMain = suiReadString(cReadPtrAt(gMtxTmpMain, cSuiOffTmpMText()))
+        let curHover = suiReadString(cReadPtrAt(gMtxTmpHover, cSuiOffTmpMText()))
+        okLog "menu mode text: FOUND both corner-label TMPs by WALKING (never " &
+              "hardcoded) Common UI/.../ChangeGameModeButton/Available/" &
+              "MainTextContainer/{MainText,MainTextHover} from a verified scene " &
+              "root. MainText=0x" & hexOf(cast[uint64](gMtxTmpMain)) &
+              " currently reads \"" & curMain & "\"; MainTextHover=0x" &
+              hexOf(cast[uint64](gMtxTmpHover)) & " currently reads \"" &
+              curHover & "\". LocalizedText siblings: main=" &
+              (if gMtxLocMain != nil: "0x" & hexOf(cast[uint64](gMtxLocMain))
+               else: "none") &
+              ", hover=" &
+              (if gMtxLocHover != nil: "0x" & hexOf(cast[uint64](gMtxLocHover))
+               else: "none") &
+              ". The old EFT.UI.PreloaderUI::SetGameModeText path is REMOVED: " &
+              "measured that _sessionModeText genuinely updates but never " &
+              "reaches the screen, and these two TMPs are what actually renders."
+        if curMain.len > 0:
+          gModeTextApplied = curMain
+      elif not gMtxResolveSaidWalk and gMtxResolvePasses == 2:
+        gMtxResolveSaidWalk = true
+        okLog "menu mode text: not found yet -- " & gMtxResolveWhy &
+              ". Expected before the main menu is up; retried on a throttle."
+    elif not gMtxResolveGaveUp:
+      gMtxResolveGaveUp = true
+      warn "menu mode text: GIVING UP after " & $gMtxResolvePasses &
+           " passes -- " & gMtxResolveWhy & ". Stock corner label left alone; " &
+           "this feature is otherwise idle for the session."
+    if not gMtxResolved:
+      return
 
   if gModeTextWant.len == 0 or gModeTextWant == gModeTextApplied:
     return                                   # nothing changed: no alloc, no call
 
-  let fn = cMtxFn(MtxTSetText)
-  if fn == nil:
-    # Verified at bind time, so this is only reachable if the module moved under
-    # us. Refuse permanently rather than retry every frame.
-    warn "menu mode text: SetGameModeText no longer verifies; switching off"
-    gModeTextOff = true
-    return
-
-  # THE ONE ALLOCATION, and only because the text actually changed.
+  # THE ONE ALLOCATION, and only because the text actually changed. One String
+  # feeds both TMPs' writes below.
   gModeTextAlloc = gModeTextWant
   let ns = modeTextNewString(cast[Il2CppPtr](0))
   if ns == nil or cIsReadable(ns, 0x14'i32) == 0'i32:
@@ -213,17 +322,10 @@ proc modeTextTickBody(a: Il2CppPtr): Il2CppPtr {.
     gModeTextApplied = gModeTextWant
     return
 
-  # Call the game's own setter. RCX=this, RDX=the String, R8=MethodInfo*=NULL
-  # (correct here: SetGameModeText is not shared generic code). The setter
-  # stores 0x128 and refreshes the corner label itself -- which is the whole
-  # reason this is a call and not a field poke.
-  cMtxCallVPP(fn, self, ns)
+  modeTextApplyOne(gMtxTmpMain, gMtxLocMain, ns, "MainText")
+  modeTextApplyOne(gMtxTmpHover, gMtxLocHover, ns, "MainTextHover")
   gModeTextApplied = gModeTextWant
   inc gModeTextApplies
-  okLog "menu mode text: called EFT.UI.PreloaderUI::SetGameModeText @ 0x" &
-        hexOf(uint64(cMtxRva(MtxTSetText))) & " on this=0x" &
-        hexOf(cast[uint64](self)) & " with \"" & gModeTextApplied &
-        "\" (apply #" & $gModeTextApplies & ")"
 
 proc modeTextUpdateFired(regs: Il2CppPtr) =
   ## Dispatched by slot identity from `patchReturned` for the kind=13 POSTFIX
@@ -274,9 +376,9 @@ proc modeTextUpdateFired(regs: Il2CppPtr) =
                     " (HOST thread -- unexpected, NOT Unity's)"
                   else: " (Unity's main thread)")
 
-  if cIsReadable(self, cMtxOffModeText() + 8'i32) == 0'i32:
-    return
-
+  # No `self` field-gate here any more: the new target is resolved by walking
+  # scene roots, not by reading an offset on this PreloaderUI `this`. `self` is
+  # still passed through only to keep the guarded call's shape unchanged.
   if cMtxTickGuarded(self) == nil:
     inc gModeTextFaults
     warn "menu mode text: the guarded body faulted (" & $gModeTextFaults &
@@ -319,14 +421,12 @@ proc bindModeText(verbose: bool): bool =
            "(" & $int(cMtxOkCount()) & " target(s) verified, " &
            $int(cMtxBadCount()) & " rejected); nothing bound"
     return false
-  # The setter must verify too, before anything is hooked. Binding a per-frame
-  # detour whose only purpose is a call we then could not make is pure cost.
-  if cMtxFn(MtxTSetText) == nil:
-    if verbose:
-      info "menu mode text: " & readCString(cMtxName(MtxTSetText)) &
-           " @ 0x" & hexOf(uint64(cMtxRva(MtxTSetText))) &
-           " did not verify; nothing bound"
-    return false
+  # `SetGameModeText` is NO LONGER the write path (measured: it updates
+  # `_sessionModeText` but never reaches the screen -- fact #116), so its
+  # verification is not a bind gate any more. The real target is resolved at
+  # runtime by walking the scene tree in `modeTextTickBody`, which declines
+  # and logs on its own if the path is not there; binding the shared drain
+  # does not depend on it.
   # THE MULTIPLEX. The overlay armed first (aowlhost arms it first), so the
   # normal path when both are on is this one: no second detour, no second
   # trampoline, one shared firing.
