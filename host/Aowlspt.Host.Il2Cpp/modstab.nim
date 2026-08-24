@@ -626,7 +626,8 @@ proc modsCountReading(t: Il2CppPtr; text: string): int =
       result = result + 1
     i = i + 1
 
-proc modsRelabelLike(cloneT, donorT: Il2CppPtr; text: string): bool =
+proc modsRelabelLike(cloneT, donorT: Il2CppPtr; text: string;
+                     cloneCtrl: Il2CppPtr = nil): bool =
   ## Relabel a button WE cloned, and prove the CAPTION CHANGED -- not merely
   ## that a write landed.
   ##
@@ -667,7 +668,19 @@ proc modsRelabelLike(cloneT, donorT: Il2CppPtr; text: string): bool =
     # whose Label came out blank is exactly the case being fixed. A TMP showing
     # something ELSE is left alone: it is not part of this caption.
     if cur == caption or cur.len == 0 or caption.len == 0:
-      if swRelabelControl(cast[Il2CppPtr](0), cTmps[i], text):
+      # FACT #88, THE PART THIS RE-ASSERT USED TO MISS: `swRelabelControl`'s
+      # first argument is not decorative -- it is what lets it call
+      # `LocalizedText::SetLabelText` at the level the game itself writes at.
+      # Passed nil (as this loop always did before), only the raw
+      # `TMP_Text::set_text` route runs: the write lands, reads back true, and
+      # then the row's OWN inherited LocalizedText clobbers it back to the
+      # donor's caption the next time it refreshes -- which a subtab's
+      # `SetActive(true)` on re-select reliably triggers. That is why every
+      # row on every MODS subtab kept showing the donor's caption
+      # ('Interface language') even though this same function logged success.
+      # Passing the clone's real control here lets the LocalizedText source get
+      # fixed too, not just today's TMP text.
+      if swRelabelControl(cloneCtrl, cTmps[i], text):
         if modsTmpText(cTmps[i]) == text:
           wrote = wrote + 1
           if gModsLabelTmp.len < ModsMaxLabels:
@@ -1228,6 +1241,23 @@ proc modsTabBuild(): bool =
     return
   discard modsSetActive(stripClone, true)
 
+  # DOCK AT THE TOP, NOT THE CENTRE. `modsSetParent` always appends, so the
+  # cloned strip landed after whatever was already in the layout group and
+  # the vertical layout drew it in the middle of the panel instead of above
+  # the rows. Same fix as the postfx strip: sibling index 0, then read the
+  # order back and REFUSE (hide the strip) rather than ship it floating.
+  discard modsSetFirstSibling(stripT)
+  var stripAfterN = 0
+  if iChildCount(stackT, stripAfterN) and stripAfterN > 0:
+    let stripFirstChild = iChildAt(stackT, 0)
+    if stripFirstChild != stripT:
+      modsNoteFault("SetAsFirstSibling did not stick for the MODS subtab " &
+                    "strip -- it is still not sibling 0, so it would still " &
+                    "lay out below the page containers. Hiding it rather " &
+                    "than shipping it in the wrong place.")
+      discard modsSetActive(stripClone, false)
+      return
+
   # ---- one page container per subtab: a clone of the SAME layout container,
   # so it inherits its vertical spacing, emptied of the rows it came with and
   # appended AFTER the strip, so the strip stays on top ----
@@ -1289,7 +1319,7 @@ proc modsTabBuild(): bool =
               text = text & cSwNotDone
             let rowT = iToTransform(ctrl)
             if rowT != nil:
-              if modsRelabelLike(rowT, rowDonorT, text):
+              if modsRelabelLike(rowT, rowDonorT, text, ctrl):
                 rowsFixed = rowsFixed + 1
               else:
                 rowsBad = rowsBad + 1
