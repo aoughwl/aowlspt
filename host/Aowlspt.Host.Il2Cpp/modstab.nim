@@ -279,6 +279,10 @@ proc modsTransformOf(go: Il2CppPtr): Il2CppPtr =
   if fn == nil or go == nil:
     return nil
   result = cMi2CallPP(fn, go)
+  # CONTRACT-GUARANTEED Transform: seed the klass whitelist `modsComponent`
+  # checks against, exactly like `inspect.nim`'s own `get_transform` call does.
+  if result != nil:
+    iNoteTransform(result)
 
 proc modsSetFirstSibling(t: Il2CppPtr): bool =
   ## `Transform::SetAsFirstSibling` -- moves `t` to sibling index 0 among its
@@ -331,6 +335,21 @@ proc modsComponent(comp: Il2CppPtr; typeName: string): Il2CppPtr =
          "calling GetComponent through the wrong `this`."
     return
   if not iUnityAlive(comp):
+    return
+  # KLASS, NOT JUST ALIVENESS. MEASURED LIVE: a `Label` under `SizeLabel`
+  # passed `iRefuseIfGameObject` and `iUnityAlive` and STILL faulted inside
+  # `GetComponent(String)` -- alive and non-GameObject is not proof it is
+  # really a Transform's own klass at +0. `gTfKlass`/`iIsTransform` is the
+  # existing whitelist, seeded only from contract-guaranteed Transform
+  # sources (`GetChild`, `get_transform`) -- reuse it rather than build a
+  # second one. Only enforced once something has actually been seeded, so
+  # this never blocks the very first call of a session.
+  if gTfKlass.len > 0 and not iIsTransform(comp):
+    warn "mods tab: modsComponent(" & typeName & ") DECLINED node " &
+         iObjName(comp) & " (parent " & iObjName(modsParentOf(comp)) &
+         ") -- its klass at +0 does not match any Transform klass seen so " &
+         "far this session, so GetComponent was never called on it. " &
+         "Skipping this node, not the whole walk."
     return
   var fn: Il2CppPtr = nil
   var rva = 0'u32
