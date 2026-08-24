@@ -184,11 +184,52 @@ proc schemaJson*(settings: seq[Setting]): Json =
 # a route handler can serve it without the mod threading the seq through itself.
 
 var gDeclared: seq[Setting] = @[]
+var gAnnounceSubscribed = false
+
+const
+  SettingsIndexQuery* = "aowlspt.settings.indexQuery"
+    ## Broadcast by the `/aowlspt/settings/index` aggregator (see
+    ## `mods/settingshub`). Every mod that has ever called `declareSettings`
+    ## replies synchronously with `SettingsIndexAnnounce` — see `emit`/`on` in
+    ## `aowlspt.nim`: `deliverEvent` calls every subscriber before returning,
+    ## so by the time the query's `emit` call returns, the aggregator has
+    ## already heard from everybody. This is the same synchronous
+    ## broadcast-then-collect shape the host's own mod-control replies use
+    ## (`deliverEvent`'s comment: "the mod-control replies come from here").
+    ##
+    ## Chosen over a process-wide registry proc (design doc §6, option 1)
+    ## because that would need a new export on the mod ABI, and
+    ## `abi/**`/`host/**` are off limits to this change; chosen over N
+    ## loopback HTTP calls (option 2) because there is no in-process route
+    ## dispatch exposed to a mod, only the real network listener, and a real
+    ## HTTP round-trip per mod per index fetch — through TLS, on the request
+    ## thread that is itself serving the index route — is worse than one
+    ## broadcast. `on`/`emit` already exist and already cross mods without
+    ## either knowing the other exists, which is exactly this problem.
+  SettingsIndexAnnounce* = "aowlspt.settings.indexAnnounce"
+    ## Payload: `{"guid":"...","name":"...","count":N}`. Emitted by every mod
+    ## that has declared settings, once per `SettingsIndexQuery` it hears.
+
+proc onIndexQuery(payload: string): string =
+  if gDeclared.len > 0:
+    var o = obj()
+    o.put("guid", modGuid())
+    o.put("name", modName())
+    o.put("count", gDeclared.len)
+    discard emit(SettingsIndexAnnounce, done(o).text)
+  result = ""
 
 proc declareSettings*(settings: seq[Setting]) =
   ## Register this mod's schema. Replaces any previous declaration — call it
   ## once with the whole list, not once per row.
   gDeclared = settings
+  if not gAnnounceSubscribed and settings.len > 0:
+    # Subscribe once, lazily, the first time a mod actually has something to
+    # announce — a mod that never declares settings never joins the
+    # broadcast at all, which keeps a no-op `declareSettings(@[])` cheap and
+    # keeps the fan-out list free of mods with nothing to say.
+    discard on(SettingsIndexQuery, onIndexQuery)
+    gAnnounceSubscribed = true
 
 proc declaredSettings*(): seq[Setting] =
   ## What this mod declared, for a route handler that serves it.
