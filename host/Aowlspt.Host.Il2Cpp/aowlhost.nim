@@ -7202,8 +7202,20 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
     # file open every 250 ms while armed, and nothing at all when it is not.
     inspectPoll(now)
     runPending()
-    takeModSet()
+    # THE SHARED SLOT'S TAKE CURSOR IS ONE CURSOR, NOT TWO. `modSetTick`
+    # and `takeModSet` both read `overlaySyncTake` against the same
+    # serial/taken pair; the comment on `overlaySyncTake` already warns
+    # "0 is another caller got there first" -- and until this line, the
+    # other caller was always `takeModSet`, called first, every tick, so
+    # every settings-index/schema body the backend ever answered was
+    # consumed and discarded here before `modSetTick` could read it (it
+    # is not valid `DesiredMod` JSON, so `takeModSet` silently dropped it
+    # and returned). `modSetTick` gets first and exclusive access to the
+    # slot for as long as it owns the path it armed; mod control's own
+    # take only runs the rest of the time.
     modSetTick(now)
+    if not modSetOwnsSlot():
+      takeModSet()
     modSetDrainPost()
     # Live mod control, off the emitting stack -- the only place in this host a
     # mod is loaded or unloaded while the game is running.
