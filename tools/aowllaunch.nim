@@ -1999,8 +1999,20 @@ proc main(): int =
   # thing with more room. A cold IL2CPP launch is minutes.
   watchClient(launch, hostLog, 90000'i64, clientExited)
 
+  # UNCONDITIONAL, before any gate. A verdict that never appears could mean
+  # "the walk failed" or "this routine was never entered" -- and those look
+  # identical from outside unless entry itself is logged. Written every run,
+  # regardless of which branch runs next.
+  let verdictPath = joinPath(root, "aowlspt\\aowlspt-autoenter.log")
+  discard writeTextFile(verdictPath,
+    "auto-enter: entered, clientExited=" & $clientExited &
+    " haveChoice=" & $haveChoice & " noProfile=" & $o.noProfile &
+    " noAutoEnter=" & $o.noAutoEnter & " profile=" & chosen.id & "\n")
+
   if clientExited:
     warn "the client exited while starting; see " & hostLog
+    discard writeTextFile(verdictPath,
+      "auto-enter verdict: SKIPPED -- client exited while starting\n")
   elif haveChoice and not o.noProfile and not o.noAutoEnter:
     # The client's own character-select screen shows on every boot
     # regardless of `-token` -- that is measured, not assumed (see the
@@ -2045,8 +2057,8 @@ proc main(): int =
     # driven that way showed no verdict line ANYWHERE, indistinguishable
     # from never having run. So every verdict also lands in a small,
     # single-purpose file next to the host log that survives regardless of
-    # how this exe was invoked.
-    let verdictPath = joinPath(root, "aowlspt\\aowlspt-autoenter.log")
+    # how this exe was invoked. (`verdictPath` was already written once,
+    # unconditionally, right after `watchClient` returns -- see above.)
 
     # MEASURED (two bugs, not one):
     #  1. An earlier version started matching at t=+1.3s, right after
@@ -2072,6 +2084,8 @@ proc main(): int =
     var waitTries = 0
     var screenUp = false
     var waitErr = ""
+    discard writeTextFile(verdictPath,
+      "auto-enter: before screen-wait loop\n")
     while waitTries < 50 and not screenUp:  # up to ~150s of ACTUAL waiting
       var ss = default(ScreenSet)
       if screens(u, "Menu UI", ss):
@@ -2083,6 +2097,9 @@ proc main(): int =
       if not screenUp:
         cSleepMs 3000
         inc waitTries
+    discard writeTextFile(verdictPath,
+      "auto-enter: after screen-wait loop, screenUp=" & $screenUp &
+      " waitTries=" & $waitTries & " waitErr=" & waitErr & "\n")
     if not screenUp:
       let msg = "auto-enter verdict: INCONCLUSIVE -- " &
         "CharacterSelectionScreen under Menu UI never became active " &
