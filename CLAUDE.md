@@ -2,6 +2,11 @@
 
 ## 0. NEVER expose the personal address. Non-negotiable.
 
+There is a personal `@mumfordandmiller.com` address on this machine — it is the
+one Claude Code reports as the user's email, and it is NOT spelled out here on
+purpose, because this file is tracked and this repo is public. Writing it down
+to warn about it is itself the leak.
+
 That address must **never** reach anything public — no git commit author or
 committer, no README, no release note, no Discord post, no issue, no pushed file.
 It leaked once, into two public repos, and had to be scrubbed with a history
