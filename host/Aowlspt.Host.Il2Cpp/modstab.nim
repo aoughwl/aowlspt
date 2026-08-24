@@ -214,7 +214,8 @@ var gModsStrPtrs: seq[Il2CppPtr] = @[]
 ## tried first, bare name as a logged fallback) rather than re-resolved
 ## (and possibly re-guessed) on every `modsComponent` call.
 var gModsGcFn: Il2CppPtr = nil
-var gModsGcTried = false
+var gModsGcTries = 0
+const ModsGcMaxTries = 8
 
 proc modsInternedStr(typeName: string): Il2CppPtr =
   ## Returns the cached managed string for `typeName`, allocating it once (and
@@ -398,36 +399,57 @@ proc modsComponent(comp: Il2CppPtr; typeName: string): Il2CppPtr =
          "far this session, so GetComponent was never called on it. " &
          "Skipping this node, not the whole walk."
     return
-  # RESOLVED ONCE, LOUDLY, NOT RE-GUESSED PER CALL. The fully-qualified
-  # "Component::GetComponent(String)" MEASURED LIVE as returning nothing this
-  # session (0 resolutions, 0 faults -- iNavFind never matched, so the icall
-  # was never even attempted) even though it is the exact string
-  # `iCmdComponent` uses successfully from the inspector. The nav target table
-  # is filled incrementally, and the inspector's session-driven call runs long
-  # after boot with a fuller table than modstab's early-build call gets --
-  # so require the qualified name first, but FALL BACK to the bare name that
-  # is what actually resolved every prior working run, and SAY which one it
-  # got so this is never guessed at blind again.
-  if gModsGcFn == nil and not gModsGcTried:
-    gModsGcTried = true
-    var f1: Il2CppPtr = nil
-    var r1 = 0'u32
-    if iNavFind("Component::GetComponent(String)", f1, r1):
-      gModsGcFn = f1
-      okLog "mods tab: GetComponent bound via the fully-qualified name " &
-            "\"Component::GetComponent(String)\" @0x" & hexOf(uint64(r1))
-    else:
-      var f2: Il2CppPtr = nil
-      var r2 = 0'u32
-      if iNavFind("GetComponent(String)", f2, r2):
-        gModsGcFn = f2
-        warn "mods tab: GetComponent bound via the BARE name fallback " &
-             "\"GetComponent(String)\" @0x" & hexOf(uint64(r2)) & " -- the " &
-             "fully-qualified name did not resolve this session"
+  # RESOLVED ONCE, LOUDLY, SELF-TESTED, NOT RE-GUESSED PER CALL.
+  #
+  # MEASURED LIVE (the RVA the crumb's own bind-log printed): the
+  # fully-qualified "Component::GetComponent(String)" bound @0x52a48e0 --
+  # NOT @0x2a48e0, which is what the inspector's IDENTICAL string resolves to
+  # and what the icall must be, because 0x2a48e0's first instruction is
+  # `add rcx, 0x10` -- a THUNK that adjusts `this` by 16 bytes before the
+  # real body runs. Calling anything else with an unadjusted receiver
+  # inspects the wrong object and returns null, silently, forever. The nav
+  # target table fills in incrementally, and modstab's early-build lookup
+  # apparently lands on a different candidate than the inspector's
+  # later-session lookup does for the same substring -- so the fix is not
+  # "which string" but "which RESULT actually works", proven right here:
+  #
+  # THE BARE NAME is what every partially-working run used, so it stays.
+  # What is NEW is the self-test: call it once, on THIS call's own receiver,
+  # and refuse to arm the feature at all unless it comes back non-nil --
+  # a bind that resolves cleanly and then answers null on everything is
+  # exactly the failure this file has now chased for four rounds.
+  if gModsGcFn == nil:
+    # RETRIED, not latched on one failure: a probe node that genuinely lacks
+    # `typeName` (e.g. the first call happens to be for "AnimatedToggle" on a
+    # node with none) must not be confused with a broken bind, so this tries
+    # again on the NEXT call rather than refusing forever after one null --
+    # but a resolved RVA is only ever trusted once it has actually PRODUCED a
+    # component, never on the strength of iNavFind alone (that is exactly
+    # what hid the wrong-address bind for four rounds).
+    if gModsGcTries < ModsGcMaxTries:
+      inc gModsGcTries
+      var f1: Il2CppPtr = nil
+      var r1 = 0'u32
+      if not iNavFind("GetComponent(String)", f1, r1):
+        warn "mods tab: GetComponent could not be bound at all (try " &
+             $gModsGcTries & " of " & $ModsGcMaxTries & ")."
       else:
-        warn "mods tab: GetComponent could not be bound under EITHER name; " &
-             "the feature cannot read any component and will decline every " &
-             "call this session."
+        let str0 = modsInternedStr(typeName)
+        let probe = (if str0 != nil: cast[Il2CppPtr](cInspUPP(f1, comp, str0, nil))
+                     else: nil)
+        if probe != nil:
+          gModsGcFn = f1
+          okLog "mods tab: GetComponent bound @0x" & hexOf(uint64(r1)) &
+                " -- SELF-TESTED true, found " & typeName & " = " &
+                iPtr(probe) & " on " & iObjName(comp)
+          return probe
+        else:
+          warn "mods tab: GetComponent bound @0x" & hexOf(uint64(r1)) & " " &
+               "but the self-test for \"" & typeName & "\" on " &
+               iObjName(comp) & " came back null (try " & $gModsGcTries &
+               " of " & $ModsGcMaxTries & "); not yet trusted -- will not " &
+               "call it for real until one self-test finds something."
+    return
   let fn = gModsGcFn
   if fn == nil:
     return
