@@ -1338,6 +1338,7 @@ var gInspSlot = -1
 ## `settingsui.nim` all sit above that include point.
 var gModsSlot = -1
 var gModsOn = false
+var gModsNativeLifecycle = false
 ## The live `SettingsTab` the ShowScreen postfix last handed us, and its group
 ## name. The mods tab is built by WALKING UP from this -- never from an offset
 ## that can read null.
@@ -6543,6 +6544,41 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "(never a second one), needs one of debugUi/uxMenuModeText/" &
          "liveInspector to have claimed that slot, and self-disables after " &
          "four trapped faults. Open Settings -> Game once to build it."
+  # THE NATIVE LIFECYCLE RIDER (`settingsNativeLifecycle`). Default OFF, and
+  # meaningless without `settingsModsTab` -- it only changes HOW the MODS tab
+  # notices a stock tab was chosen, not whether the tab exists at all.
+  #
+  # It does NOT install a second detour on ShowScreen. It rides the SAME
+  # `settingsUiProbe` ShowScreen-postfix drain `gModsOn` already forces on
+  # (see above) -- exactly the "ride an existing detour as a drain" rule,
+  # because ShowScreen already carries one live hook and a second physical
+  # detour on the same function would overwrite its trampoline.
+  #
+  # IT IS ONLY HALF NATIVE. ShowScreen fires for every STOCK tab click, which
+  # is a trustworthy native signal that MODS was just LEFT -- so that edge
+  # (hide our panel + restore the stock one) is driven from the postfix the
+  # instant it fires, instead of waiting up to a frame for the toggle poll.
+  # There is NO equivalent native signal for ENTERING the MODS tab: our
+  # cloned toggle is a plain `UnityEngine.UI.Toggle` in the stock
+  # `ToggleGroup` and nothing calls `ShowScreen` (or anything else) when it
+  # turns on -- confirmed by reading `modsTabTickBody`'s own edge detection,
+  # which is the only place that ever learns the toggle went on. Making that
+  # side native would mean either subclassing a managed type (reflection is
+  # dead, `fact #35`) or calling `ShowScreen` ourselves with a synthetic
+  # group value the original body was never verified against -- a blind call
+  # this file will not make. So the SHOW edge stays exactly the existing
+  # standing-check poll in `modsTabTickBody`, flag or no flag.
+  gModsNativeLifecycle = readBoolKey("settingsNativeLifecycle")
+  if gModsNativeLifecycle and not gModsOn:
+    warn "settingsNativeLifecycle is set but settingsModsTab is not -- there " &
+         "is no MODS tab for it to drive, so this does nothing"
+  elif gModsNativeLifecycle:
+    info "settingsNativeLifecycle is set: leaving MODS for a stock tab is " &
+         "now driven from the ShowScreen postfix the moment it fires, " &
+         "instead of the next frame's toggle poll. Entering MODS is still " &
+         "poll-driven -- no game code calls anything when our cloned toggle " &
+         "turns on. The old standing-check path is untouched and stays as " &
+         "the backstop (and the only path at all when this flag is off)."
   gMi2Probe = readBoolKey("managedInvokeProbe")
   if gMi2Probe:
     info "managedInvokeProbe is set: a POSTFIX detour on " &

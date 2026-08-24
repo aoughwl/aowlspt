@@ -150,6 +150,12 @@ var gModsPanel: Il2CppPtr = nil
 ## an actual edge rather than every frame.
 var gModsShown = false
 var gModsSaidShown = false
+## Fault budget for the NATIVE lifecycle rider only (`settingsNativeLifecycle`).
+## Separate from `gModsFaults`, which guards the standing-check path that must
+## keep working even if this rider self-disables.
+var gModsNativeFaults = 0
+const ModsNativeMaxFaults = 4
+var gModsNativeSaidHide = false
 
 ## The tab pointer the last ShowScreen postfix handed us, and its group name.
 ## Published by `settingsui.nim`; declared in `aowlhost.nim` because nimony
@@ -739,6 +745,7 @@ proc modsBuildPages(): seq[SwPage] =
   devRows.add swRow("liveInspectorWrite", "Inspector may write", readBoolKey("liveInspectorWrite"), false)
   devRows.add swRow("settingsUiProbe", "Settings-screen probe", readBoolKey("settingsUiProbe"), false)
   devRows.add swRow("settingsPages", "Native mod settings pages", readBoolKey("settingsPages"), false)
+  devRows.add swRow("settingsNativeLifecycle", "MODS tab hide rides ShowScreen", readBoolKey("settingsNativeLifecycle"), false)
   devRows.add swRow("codeGenAudit", "CodeGen audit", readBoolKey("codeGenAudit"), false)
   result.add modsPage("dev", "Diagnostics", devRows,
                       "Developer instruments. All read once at boot.")
@@ -872,6 +879,58 @@ proc modsRestoreStockPanels() =
     discard modsSetActive(gModsHidden[i], true)
     i = i + 1
   gModsHidden = @[]
+
+proc modsNativeOnShowScreen(group: int32) =
+  ## Called from `settingsui.nim`'s ShowScreen-postfix body (the SAME detour
+  ## `settingsUiProbe`/`gModsOn` already rides -- this installs NOTHING of its
+  ## own), already inside that body's ONE `aowl_p_p_seh` guard. Must NOT open
+  ## a second one -- the guard is not re-entrant.
+  ##
+  ## `group` is whatever `ESettingsGroup` the game just switched TO. It is
+  ## never ours (our tab is not a registered group -- see the file header),
+  ## so any call here at all is native proof the player just picked a STOCK
+  ## tab. If our panel was showing, that means MODS was just left, and this
+  ## does the hide/restore right now instead of waiting for the next frame's
+  ## toggle poll in `modsTabTickBody`.
+  ##
+  ## Only ever HIDES. It never shows our panel -- there is no ShowScreen call
+  ## for entering MODS to hook (our clone toggle invokes nothing native), so
+  ## that edge stays exactly the existing standing-check poll.
+  if not gModsOn or not gModsNativeLifecycle:
+    return
+  if gModsNativeFaults >= ModsNativeMaxFaults:
+    return
+  if not gModsShown:
+    return                                # nothing to natively hide
+  if gModsToggle == nil or gModsPanel == nil:
+    return
+  if not duOk(gModsPanel, 0x20'i32):
+    inc gModsNativeFaults
+    warn "mods tab: native lifecycle rider could not read our panel on a " &
+         "ShowScreen(group=" & $int(group) & ") postfix -- skipping this " &
+         "hide, standing-check poll will still catch it. Fault " &
+         $gModsNativeFaults & "/" & $ModsNativeMaxFaults
+    return
+  if not modsSetActive(gModsPanel, false):
+    inc gModsNativeFaults
+    warn "mods tab: native lifecycle rider failed to switch our panel off " &
+         "on ShowScreen(group=" & $int(group) & ") -- leaving it for the " &
+         "standing-check poll. Fault " & $gModsNativeFaults & "/" &
+         $ModsNativeMaxFaults
+    return
+  modsRestoreStockPanels()
+  gModsShown = false
+  var q = 0
+  while q < gModsPages.len:
+    swReadBackPage(gModsPages[q])
+    q = q + 1
+  if not gModsNativeSaidHide:
+    gModsNativeSaidHide = true
+    okLog "mods tab: native lifecycle rider hid the MODS panel from the " &
+          "ShowScreen(group=" & $int(group) & ") postfix -- driven by the " &
+          "game's own tab switch, not the standing check"
+  if gModsNativeFaults > 0:
+    gModsNativeFaults = 0                 # a clean run forgives past faults
 
 proc modsBuildSubtabs(stripT, buttonDonorGo, donorT: Il2CppPtr;
                       stockToggle: Il2CppPtr): int =
