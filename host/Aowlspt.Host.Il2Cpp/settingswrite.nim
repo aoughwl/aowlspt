@@ -434,6 +434,8 @@ proc swRelabelTab(tabPtr: Il2CppPtr; tabName: string; revisit: bool): int =
   for i in 0 ..< int(n):
     if result >= cSwMaxRelabels:
       break
+    swCrumb("STAGE: swRelabelTab tab=" & tabName & " control[" & $i & "] of " &
+            $n)
     let slot = suiPtrAdd(arr, cSuiOffArrElems() + int32(i) * 8'i32)
     if cIsReadable(slot, 8'i32) == 0'i32:
       continue
@@ -562,6 +564,8 @@ proc swBindTab(tabPtr: Il2CppPtr; tabName: string) =
   var toggles = 0
   var sliders = 0
   for i in 0 ..< int(n):
+    swCrumb("STAGE: swBindTab tab=" & tabName & " control[" & $i & "] of " &
+            $n)
     let slot = suiPtrAdd(arr, cSuiOffArrElems() + int32(i) * 8'i32)
     if cIsReadable(slot, 8'i32) == 0'i32:
       continue
@@ -649,8 +653,10 @@ proc swOnTabBuilt(tabPtr: Il2CppPtr; tabName: string; revisit: bool) =
   if not (gSwRelabel or gSwBind):
     return
   if gSwRelabel:
+    swCrumb("STAGE: swRelabelTab tab=" & tabName)
     discard swRelabelTab(tabPtr, tabName, revisit)
   if gSwBind and not revisit:
+    swCrumb("STAGE: swBindTab tab=" & tabName)
     swBindTab(tabPtr, tabName)
 
 proc swBeginVisit() =

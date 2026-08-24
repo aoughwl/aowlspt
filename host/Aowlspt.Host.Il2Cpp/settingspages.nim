@@ -862,6 +862,7 @@ proc swPagesOnTabBuilt(tabPtr: Il2CppPtr; tabName: string; revisit: bool) =
   # having been switched on. Phase 3 previously depended on `settingsRelabel
   # Probe`/`settingsBindProbe` for its klass pointers without saying so, which
   # meant `settingsPages` alone could only ever decline.
+  swCrumb("STAGE: swPagesOnTabBuilt -- swLearnTabKlasses tab=" & tabName)
   swLearnTabKlasses(tabPtr)
   if gSwPagesFires <= 8:
     okLog "settings pages: after the census on this same tab visit -- " &
@@ -886,6 +887,8 @@ proc swPagesOnTabBuilt(tabPtr: Il2CppPtr; tabName: string; revisit: bool) =
     return
   var i = 0
   while i < gSwPages.len:
+    swCrumb("STAGE: swPagesOnTabBuilt -- page[" & $i & "/" & $gSwPages.len &
+            "] id='" & gSwPages[i].id & "' rows=" & $gSwPages[i].rows.len)
     # Read back BEFORE deciding whether to re-render, so a value the player
     # changed is captured even on the pass that decides to rebuild the page.
     if gSwPages[i].renderedFor == tabKey:

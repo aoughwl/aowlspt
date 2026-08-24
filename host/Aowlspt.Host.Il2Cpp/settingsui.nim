@@ -329,6 +329,7 @@ proc suiTabInitBody(a: Il2CppPtr): Il2CppPtr {.
   let group = cast[int32](uint32(cRegsInt(regs, 1'i32) and 0xFFFFFFFF'u64))
   inc gSuiTabFires
   swBeginVisit()
+  swCrumb("STAGE: entered suiTabInitBody")
   if gSuiTabFires == 1:
     okLog "settings probe: ShowScreen (postfix) first fired on thread " &
           $tid & " (host thread " & $int(gHostThreadId) & ")" &
@@ -343,6 +344,7 @@ proc suiTabInitBody(a: Il2CppPtr): Il2CppPtr {.
   # own comment in `aowlhost.nim`. A no-op unless `settingsModsTab` AND
   # `settingsNativeLifecycle` are both on. Runs BEFORE any of Phase 1.8's own
   # work below so a fault in that work can never suppress the hide.
+  swCrumb("STAGE: modsNativeOnShowScreen group=" & $int(group))
   modsNativeOnShowScreen(group)
 
   let gname = readCString(cSuiGroupName(group))
@@ -361,12 +363,20 @@ proc suiTabInitBody(a: Il2CppPtr): Il2CppPtr {.
     # session and could never be re-checked or re-applied. That is what made
     # "the model changed but the pixels did not" impossible to tell apart from
     # "the game overwrote us a frame later": nothing ever looked again.
+    swCrumb("STAGE: revisit -- suiPollRegisteredTabs")
     suiPollRegisteredTabs()
     let selfR = cast[Il2CppPtr](selfPtr)
     if cIsReadable(selfR, cSuiOffCurrentTab() + 8'i32) != 0'i32:
       let tabR = cReadPtrAt(selfR, cSuiOffCurrentTab())
       if tabR != nil:
         let gnameR = readCString(cSuiGroupName(group))
+        # PUBLISH BEFORE Phase 2/3 -- see the identical comment on the
+        # first-build path above. A fault in `swOnTabBuilt`/`swPagesOnTabBuilt`
+        # below must not be able to take the MODS tab's only tab pointer down
+        # with it.
+        gModsLastTabPtr = tabR
+        gModsLastTabName = gnameR
+        swCrumb("STAGE: revisit -- swVerifyRelabel tab=" & gnameR)
         swVerifyRelabel("revisit tab=" & gnameR)
         # `revisit = true` keeps the relabel re-asserting itself while silencing
         # the Phase-2b value census, which would otherwise print thirty lines
@@ -374,14 +384,10 @@ proc suiTabInitBody(a: Il2CppPtr): Il2CppPtr {.
         # through a global on purpose: nimony forward-resolves procs across an
         # `include` boundary but NOT variables, and this file is included before
         # the one that would own such a global.
+        swCrumb("STAGE: revisit -- swOnTabBuilt tab=" & gnameR)
         swOnTabBuilt(tabR, gnameR, true)
+        swCrumb("STAGE: revisit -- swPagesOnTabBuilt tab=" & gnameR)
         swPagesOnTabBuilt(tabR, gnameR, true)
-        # PUBLISH THE LIVE TAB for the MODS tab, which is built by walking UP
-        # from it to the SettingsScreen. Published on the REVISIT path too, so
-        # a player who opens Settings on a tab we cannot clone from and then
-        # clicks Game still gets the tab built.
-        gModsLastTabPtr = tabR
-        gModsLastTabName = gnameR
     return cast[Il2CppPtr](1)
 
   let self = cast[Il2CppPtr](selfPtr)
@@ -425,26 +431,41 @@ proc suiTabInitBody(a: Il2CppPtr): Il2CppPtr {.
   # OnFirstSelect -> CreateControls -> CreateControl<T>, the only writer of
   # +0x88. A postfix here therefore sees a fully built tab -- confirmed live
   # (78 controls across game/graphics/postfx/sound).
+  swCrumb("STAGE: suiWalkTab tab=" & gname)
   suiWalkTab(tab, gname)
+  # PUBLISH THE LIVE TAB FOR THE MODS TAB RIGHT HERE -- BEFORE Phase 2/3.
+  #
+  # THE REGRESSION THIS FIXES: `gModsLastTabPtr` used to be set at the very end
+  # of this body, after Phase 2 and Phase 3 ran. Both phases now walk far more
+  # controls/rows than before (the row cap went 24 -> 48, subtabs 5 -> 8, and a
+  # mod schema's rows are rendered onto this very tab by Phase 3), so a fault in
+  # either phase is far likelier -- and when one faults, `aowl_p_p_seh` unwinds
+  # this WHOLE body, so the publish at the bottom never runs. The MODS tab is
+  # built by `modstab.nim`'s OWN separately-guarded tick, gated on exactly this
+  # pointer (`gModsLastTabPtr != nil`, see `modsTabTickBody`) -- so a Phase 2/3
+  # fault on ANY tab silently meant the MODS tab could never build AT ALL, for
+  # the rest of the session, with no MODS-tab log line to say why. Publishing
+  # here, right after Phase 1 confirms the tab is live and walked, means a
+  # later fault in Phase 2/3 can no longer take this down with it.
+  gModsLastTabPtr = tab
+  gModsLastTabName = gname
   # The registry poll stays as a cheap backstop for any tab that somehow lags.
+  swCrumb("STAGE: suiPollRegisteredTabs tab=" & gname)
   suiPollRegisteredTabs()
   # PHASE 2 -- the WRITE side, in `settingswrite.nim`. It runs here, inside this
   # body, precisely so it inherits this body's `aowl_p_p_seh` guard rather than
   # arming a second one (that guard is not re-entrant). It does nothing unless
   # `settingsRelabelProbe` or `settingsBindProbe` is set, and it disables itself
   # after two faults.
+  swCrumb("STAGE: swVerifyRelabel (build) tab=" & gname)
   swVerifyRelabel("build tab=" & gname)
+  swCrumb("STAGE: swOnTabBuilt (build) tab=" & gname)
   swOnTabBuilt(tab, gname, false)
   # PHASE 3 -- the per-mod settings PAGES, rendered by cloning stock controls.
   # Same guard, same fault budget, same default-OFF discipline; it renders only
   # onto the Game tab and only when `settingsPages` is set.
+  swCrumb("STAGE: swPagesOnTabBuilt (build) tab=" & gname)
   swPagesOnTabBuilt(tab, gname, false)
-  # The same publication on the first-build path. Unconditional: the MODS tab
-  # decides for itself whether this is a tab it can clone rows from, and a
-  # pointer published only when some other flag is on is exactly the kind of
-  # silent gate that made this feature ship doing nothing once already.
-  gModsLastTabPtr = tab
-  gModsLastTabName = gname
   return cast[Il2CppPtr](1)
 
 # The VEH/SEH guard thunk, the same mechanism botdiag/botcap use: `aowl_p_p_seh`
