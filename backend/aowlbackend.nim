@@ -26,7 +26,7 @@
 ##   * The session id is a 24-character hex MongoId. Anything else is rejected
 ##     upstream of any route.
 
-import std/[strutils, syncio, cmdline]
+import std/[strutils, syncio, cmdline, json]
 import aowlsptinstall/winfs
 import aowlsptinstall/log as console
 import modhost
@@ -2357,6 +2357,42 @@ proc main(): int =
     else:
       console.err "an uncompressed body was rejected"
       inc gSelfFailures
+
+    # The mod settings wire format must be STRICT json, not just something the
+    # client's own tolerant parser happens to accept -- fact #122 was 22 rows
+    # of unquoted `"value":standard` that this same self test's `contains`-only
+    # `expect` helper would never catch. Parse it for real and check the enum
+    # row round-trips.
+    let settingsResp = request(gPort, "/aowlspt/settings/aowl.tarkov", "",
+                               "000000000000000000000001")
+    if not settingsResp.ok:
+      console.err "settings route: " & settingsResp.error
+      inc gSelfFailures
+    else:
+      var tree = parseJson(settingsResp.body)
+      if hasError(tree):
+        console.err "settings route did not parse as strict JSON: " & errorMsg(tree)
+        inc gSelfFailures
+      else:
+        var sawEdition = false
+        for row in items(root(tree)):
+          var isEdition = false
+          var valueOk = false
+          for k, v in pairs(row):
+            if k == "key" and v.getStr() == "edition":
+              isEdition = true
+            if k == "value" and v.kind == JString and v.getStr().len > 0:
+              valueOk = true
+          if isEdition:
+            sawEdition = true
+            if not valueOk:
+              console.err "settings route: 'edition' value did not round-trip as a string"
+              inc gSelfFailures
+        if sawEdition:
+          console.ok "settings route is strict JSON and 'edition' survives the round trip"
+        else:
+          console.err "settings route: no 'edition' row found to check"
+          inc gSelfFailures
 
     # And a malformed session id must be refused before any route sees it.
     let badSession = request(gPort, "/aowlspt/status", "", "not-a-mongo-id")

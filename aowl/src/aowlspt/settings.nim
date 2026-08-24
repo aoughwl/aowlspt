@@ -116,7 +116,7 @@ proc floatSetting*(key, label: string; default: float;
 proc enumSetting*(key, label: string; default: string; options: seq[string];
                   category = ""; description = ""; implemented = true): Setting =
   result = Setting(key: key, label: label, kind: stEnum,
-                   defaultJson: "\"" & default & "\"",
+                   defaultJson: "\"" & server.escapeText(default) & "\"",
                    lo: 0.0, hi: 0.0, step: 0.0, hasRange: false,
                    options: options, category: category,
                    description: description, implemented: implemented)
@@ -124,7 +124,7 @@ proc enumSetting*(key, label: string; default: string; options: seq[string];
 proc stringSetting*(key, label: string; default: string;
                     category = ""; description = ""; implemented = true): Setting =
   result = Setting(key: key, label: label, kind: stString,
-                   defaultJson: "\"" & default & "\"",
+                   defaultJson: "\"" & server.escapeText(default) & "\"",
                    lo: 0.0, hi: 0.0, step: 0.0, hasRange: false,
                    options: @[], category: category, description: description,
                    implemented: implemented)
@@ -132,7 +132,7 @@ proc stringSetting*(key, label: string; default: string;
 proc keybindSetting*(key, label: string; default: string;
                      category = ""; description = ""; implemented = true): Setting =
   result = Setting(key: key, label: label, kind: stKeybind,
-                   defaultJson: "\"" & default & "\"",
+                   defaultJson: "\"" & server.escapeText(default) & "\"",
                    lo: 0.0, hi: 0.0, step: 0.0, hasRange: false,
                    options: @[], category: category, description: description,
                    implemented: implemented)
@@ -151,8 +151,19 @@ proc toJson*(s: Setting): JsonObject =
   o.put("type", kindName(s.kind))
   o.put("default", Json(text: s.defaultJson))
   var cur = setting(s.key)
+  # `cur.raw` is the on-disk text for the key, but hosts disagree on whether a
+  # string-shaped value comes back with its JSON quotes still on (see
+  # `asText`'s docstring) -- so for the three text-shaped kinds the only safe
+  # thing is to strip via `asText` and re-quote/escape through `jstr`, the same
+  # helper the `key`/`label` string fields above already go through. For the
+  # numeric/bool kinds the on-disk text is already a bare JSON literal either
+  # way, so it is used verbatim.
   if cur.ok:
-    o.put("value", Json(text: cur.raw))
+    case s.kind
+    of stEnum, stString, stKeybind:
+      o.put("value", jstr(asText(cur, "")))
+    of stBool, stInt, stFloat:
+      o.put("value", Json(text: cur.raw))
   else:
     o.put("value", Json(text: s.defaultJson))
   if s.hasRange:
