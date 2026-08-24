@@ -390,6 +390,15 @@ static const AowlDuTarget aowl_du_targets[] = {
     { "UnityEngine.RectTransform::get_pivot", 0x52B55B0u,
       { 0x40,0x53,0x48,0x83,0xEC,0x20,0x33,0xC0,0x48,0x8B,0xD9,0x48,0x89,
         0x44,0x24,0x40 }, 16 },
+    /* get_anchorMax -- rid 3151, resolved with tools/il2cpp_resolve.py against
+     * type 23163 (UnityEngine.RectTransform, UnityEngine.CoreModule.dll), NOT
+     * annotated `[shared]` by that resolver's --shared pass. Same Vector2-in-RAX
+     * prologue as the four getters above it -> AowlDu_U_P / aowl_du_vec2_x/y.
+     * Added for `rect`'s anchorMax column; get_anchorMin already covered the
+     * other corner. */
+    { "UnityEngine.RectTransform::get_anchorMax", 0x52B5370u,
+      { 0x40,0x53,0x48,0x83,0xEC,0x20,0x33,0xC0,0x48,0x8B,0xD9,0x48,0x89,
+        0x44,0x24,0x40 }, 16 },
     /* get_rect returns a Rect (x, y, width, height) -- the ONE call that says
      * outright how big the label's box is after every anchor has been applied,
      * and, on the canvas root, how big the canvas is in canvas units. */

@@ -197,6 +197,29 @@ proc cInspFPI(fn, a0: Il2CppPtr; a1: int32; mi: Il2CppPtr): float32 {.
   importc: "aowl_insp_f_pi", nodecl.}
 proc cInspBitsF32(b: uint32): float32 {.importc: "aowl_insp_bits_to_f32", nodecl.}
 proc cInspBitsF64(b: uint64): float64 {.importc: "aowl_insp_bits_to_f64", nodecl.}
+
+# ---- struct-by-value RETURN decoding, borrowed from aowlspt_debugui.h ----
+#
+# MEASURED (abi/aowlspt_debugui.h, dumped prologues, not assumed): on this
+# build's Win64 IL2CPP ABI, a Vector2 (8 bytes) comes back PACKED IN RAX --
+# `aowl_insp_u_p` (already used above for plain pointer/int returns) captures
+# it unmodified, so decoding it is just unpacking the same uint64 two floats
+# were memcpy'd into on the way out. A Vector3 (12 bytes) or Rect (16 bytes)
+# is bigger than 8 bytes, so Win64 returns it through a HIDDEN BUFFER
+# (retbuf in RCX, this in RDX, MethodInfo* in R8) -- `aowl_du_call_sret_p`
+# is that shape, already proven live by the overlay's `get_rect` reads.
+# These are the SAME C statics debugui.nim's thunks use (one nimony TU), so
+# no second copy of the sret plumbing is written here.
+proc cDuCallUP2(fn, self: Il2CppPtr): uint64 {.
+  importc: "aowl_du_call_u_p", nodecl.}
+proc cDuVec2X2(packed: uint64): float64 {.importc: "aowl_du_vec2_x", nodecl.}
+proc cDuVec2Y2(packed: uint64): float64 {.importc: "aowl_du_vec2_y", nodecl.}
+proc cDuCallSretP2(fn, self: Il2CppPtr; nfloats: int32): int32 {.
+  importc: "aowl_du_call_sret_p", nodecl.}
+proc cDuSret0_2(): float64 {.importc: "aowl_du_sret_0", nodecl.}
+proc cDuSret1_2(): float64 {.importc: "aowl_du_sret_1", nodecl.}
+proc cDuSret2_2(): float64 {.importc: "aowl_du_sret_2", nodecl.}
+proc cDuSret3_2(): float64 {.importc: "aowl_du_sret_3", nodecl.}
 proc cInspF32Bits(v: float32): uint32 {.importc: "aowl_insp_f32_to_bits", nodecl.}
 proc cInspF64Bits(v: float64): uint64 {.importc: "aowl_insp_f64_to_bits", nodecl.}
 
@@ -2927,6 +2950,29 @@ proc iCmdComponents(toks: seq[string]) =
     iOut("  bound to $k0" & (if last > 0: "..$k" & $last else: "") &
          " -- feed straight into  label $k0 / click $k0 / call $k0 ...")
 
+proc iRectVec2Getter(p: Il2CppPtr; pattern, label: string) =
+  ## Shared body for `rect`'s five Vector2-by-value getters (packed 8 bytes
+  ## IN RAX -- see the note above `cDuCallUP2`). A top-level proc, not nested,
+  ## so it does not depend on nimony closure support this file has no other
+  ## precedent for.
+  var idx = 0
+  var hits = 0
+  if not iFindTarget(pattern, idx, hits):
+    iOut("  " & label & ": target \"" & pattern & "\" not resolvable " &
+         "(missing or ambiguous in the verified-target table -- see `targets`)")
+    return
+  let fn = iTargetFn(idx)
+  if fn == nil:
+    iOut("  " & label & ": prologue verify FAILED for @0x" &
+         iHexPad(iTargetRva(idx), 6) & " -- refusing to call")
+    return
+  iMark(pattern, p)
+  let packed = cDuCallUP2(fn, p)
+  let x = cDuVec2X2(packed)
+  let y = cDuVec2Y2(packed)
+  iOut("  " & label & " = (" & iFmtF(x) & ", " & iFmtF(y) & ")   via @0x" &
+       iHexPad(iTargetRva(idx), 6))
+
 proc iCmdRect(toks: seq[string]) =
   ## `rect EXPR` -- RectTransform geometry, from targets already byte-verified
   ## for the overlay. Useful for confirming that something actually happened:
@@ -2947,26 +2993,40 @@ proc iCmdRect(toks: seq[string]) =
   iOut("  klass = " & iPtrU(iKlassOf(p)) &
        "   (a Transform that is NOT a RectTransform has no rect -- the " &
        "outermost menu roots are plain Transforms)")
-  var idx = 0
-  var hits = 0
-  if iFindTarget("RectTransform::get_anchoredPosition", idx, hits):
+
+  # Vector2-by-value getters: packed 8 bytes IN RAX (measured, see the note
+  # above cDuCallUP2).
+  iRectVec2Getter(p, "RectTransform::get_anchoredPosition", "anchoredPosition")
+  iRectVec2Getter(p, "RectTransform::get_sizeDelta",         "sizeDelta       ")
+  iRectVec2Getter(p, "RectTransform::get_anchorMin",         "anchorMin       ")
+  iRectVec2Getter(p, "RectTransform::get_anchorMax",         "anchorMax       ")
+  iRectVec2Getter(p, "RectTransform::get_pivot",             "pivot           ")
+
+  # Rect-by-value: 16 bytes, bigger than 8 -> hidden-buffer (sret) return.
+  block rectBlock:
+    var idx = 0
+    var hits = 0
+    if not iFindTarget("RectTransform::get_rect", idx, hits):
+      iOut("  rect (x,y,w,h): target not resolvable")
+      break rectBlock
     let fn = iTargetFn(idx)
-    if fn != nil:
-      iOut("  via RectTransform::get_anchoredPosition @0x" &
-           iHexPad(iTargetRva(idx), 6) & " (call)")
-      iMark("RectTransform::get_anchoredPosition", p)
-      discard cInspUP(fn, p, nil)
-  if iFindTarget("RectTransform::get_sizeDelta", idx, hits):
-    let fn = iTargetFn(idx)
-    if fn != nil:
-      iOut("  via RectTransform::get_sizeDelta @0x" &
-           iHexPad(iTargetRva(idx), 6) & " (call)")
-      iMark("RectTransform::get_sizeDelta", p)
-      discard cInspUP(fn, p, nil)
-  iOut("  NOTE: these getters return a Vector2 BY VALUE, which the inspector's " &
-       "call shapes do not decode yet -- the calls above prove reachability " &
-       "without faulting, but the numbers are not printed. Read the backing " &
-       "fields directly with `fields` until a struct-return shape exists.")
+    if fn == nil:
+      iOut("  rect (x,y,w,h): prologue verify FAILED for @0x" &
+           iHexPad(iTargetRva(idx), 6) & " -- refusing to call")
+      break rectBlock
+    iMark("RectTransform::get_rect", p)
+    if cDuCallSretP2(fn, p, 4'i32) == 0'i32:
+      iOut("  rect (x,y,w,h): call returned a non-finite/absurd value " &
+           "(NaN or |v|>1e9) -- refusing to print a plausible-looking number")
+    else:
+      iOut("  rect (x,y,w,h) = (" & iFmtF(cDuSret0_2()) & ", " &
+           iFmtF(cDuSret1_2()) & ", " & iFmtF(cDuSret2_2()) & ", " &
+           iFmtF(cDuSret3_2()) & ")   via @0x" & iHexPad(iTargetRva(idx), 6))
+
+  iOut("  NOTE: Vector2 getters decode via RAX (8-byte pack); get_rect " &
+       "decodes via the hidden-buffer sret convention Win64 uses for a " &
+       "struct >8 bytes. Both measured from GameAssembly.dll prologues, " &
+       "not assumed -- see abi/aowlspt_debugui.h.")
 
 proc iCmdLabel(toks: seq[string]) =
   ## `label EXPR` -- the text of a TMP label, read as a field.

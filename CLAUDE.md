@@ -160,6 +160,23 @@ hierarchy of wrong children without faulting at all.
 whole search) and says which happened: `searched EXHAUSTIVELY` vs `STOPPED EARLY`
 — and STOPPED EARLY is **not** proof a name is absent.
 
+**`rect EXPR` now prints real numbers.** It used to call
+`RectTransform::get_anchoredPosition`/`get_sizeDelta` and admit it could not
+decode a Vector2 returned BY VALUE, pointing at `fields` as a workaround —
+which measurement then showed is impossible: `UnityEngine.RectTransform`
+declares exactly ONE il2cpp field (`reapplyDrivenProperties`, static);
+`m_AnchorMin`/`m_AnchoredPosition`/`m_SizeDelta`/`m_Pivot` are native-side, not
+il2cpp fields. The fix was a struct-return decoder, not a field offset: MEASURED
+from `GameAssembly.dll` prologues (not assumed) that on this build's Win64 ABI a
+Vector2 (8 bytes) comes back **packed in RAX**, while a Rect (16 bytes, `x,y,w,h`)
+is bigger than 8 bytes and comes back through a **hidden-buffer (sret)** —
+`(retbuf in RCX, this in RDX, MethodInfo* in R8)`. `rect` now prints
+`anchoredPosition`, `sizeDelta`, `anchorMin`, `anchorMax`, `pivot` (all via the
+RAX shape) and `rect (x,y,w,h)` (via sret), each resolved by name through the
+same byte-verified target table `call` uses, and each checked NOT `[shared]`
+before being trusted. A getter that fails prologue verify or a struct call that
+comes back NaN/absurd prints a refusal, never a plausible-looking number.
+
 `find NAME X` with exactly ONE trailing token is genuinely ambiguous against the
 `[ROOT] [BUDGET]` grammar — `X` disambiguates by **readability**: if it reads
 back as a live Transform/GameObject it is treated as ROOT, otherwise as BUDGET
