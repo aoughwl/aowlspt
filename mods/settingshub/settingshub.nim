@@ -26,8 +26,9 @@
 ## it is a no-op mod that happens to carry a large read-only catalogue.
 
 import aowlspt
-import aowlspt/server            # serve, servePrefix, pathAfter, obj, arr, put, done
+import aowlspt/server as sv      # serve, servePrefix, pathAfter, obj, arr, put, done
 import aowlspt/json as jr        # field/each/child/count/asText/raw — reading the catalogue
+import aowlspt/settings          # SettingsIndexQuery/Announce — the mod-schema broadcast
 import sptsurface                # sptSurfaceText() — the embedded SPT config surface
 
 const
@@ -38,6 +39,7 @@ const
 
   IndexRoute = "/aowlspt/settings/spt/index"
   PagePrefix = "/aowlspt/settings/spt/page/"
+  ModsIndexRoute = "/aowlspt/settings/index"
 
 ## The whole SPT surface, ~108 KB of JSON, reassembled once from the string
 ## chunks the generated `sptsurface` module carries. nimony has no compile-time
@@ -73,6 +75,34 @@ proc onPage(url, body, session: string): string =
       return jr.raw(p)
   result = "{\"settings\":[],\"nested\":[],\"err\":\"no such SPT page\"}"
 
+## The cross-mod aggregation: `/aowlspt/settings/index` -- the list of mods
+## that have declared a settings schema, per the mod-settings-api design
+## doc §2/§6. Each mod's `declareSettings()` (in `aowlspt/settings`) is
+## per-mod-process-private, so this mod cannot walk another mod's state
+## directly; it broadcasts `SettingsIndexQuery` and every mod that has ever
+## declared settings replies synchronously with `SettingsIndexAnnounce`
+## (`aowlspt.nim`'s `emit`/`deliverEvent` calls every subscriber before the
+## broadcasting `emit` call returns), so the collected list is complete by
+## the time this handler builds its response -- no load-order dependency,
+## because the broadcast happens per request, not at mod-load time.
+var gAnnounced: seq[string] = @[]
+
+proc onAnnounce(payload: string): string =
+  ## One mod's reply to the index query, collected for the in-flight
+  ## `/aowlspt/settings/index` request that triggered it.
+  gAnnounced.add payload
+  result = ""
+
+proc onModsIndex(url, body, session: string): string =
+  gAnnounced = @[]
+  discard emit(settings.SettingsIndexQuery, "")
+  var a = arr()
+  for m in gAnnounced:
+    a.add sv.raw(m)
+  var root = obj()
+  root.put("mods", a)
+  result = done(root).text
+
 proc onLoad(): Status =
   if side() != sideServer:
     info "the SPT settings surface is a server mod; nothing to do on this side"
@@ -82,6 +112,11 @@ proc onLoad(): Status =
     warn "could not register the SPT settings index route"
   if servePrefix(PagePrefix, onPage) != Ok:
     warn "could not register the SPT settings page route"
+  if serve(ModsIndexRoute, onModsIndex) != Ok:
+    warn "could not register " & ModsIndexRoute
+  if on(settings.SettingsIndexAnnounce, onAnnounce) != Ok:
+    warn "could not subscribe to " & settings.SettingsIndexAnnounce &
+         " -- " & ModsIndexRoute & " will always report an empty mod list"
   let pages = jr.field(sptSurface, "pages")
   success ModName & " " & ModVersion & " serving " & $jr.count(pages) &
           " SPT config pages (all not implemented yet)"

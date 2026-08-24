@@ -1449,6 +1449,16 @@ var gSptRange: string = ""
 var gSides: uint32 = 0'u32
 var gFlags: uint32 = 0'u32
 
+proc modGuid*(): string =
+  ## This mod's own GUID, as passed to `exportMod`. Set by `registerMod`
+  ## before `onLoad` runs (the host calls `describe` first), so it is safe
+  ## to call from `onLoad` onward. Empty before that.
+  gGuid
+
+proc modName*(): string =
+  ## This mod's own display name, as passed to `exportMod`.
+  gName
+
 proc modOnLoad(self: pointer): Status {.cdecl.} = gOnLoad()
 proc modOnUpdate(self: pointer; elapsedMs: int64): Status {.cdecl.} = gOnUpdate(elapsedMs)
 proc modOnUnload(self: pointer): Status {.cdecl.} = gOnUnload()
