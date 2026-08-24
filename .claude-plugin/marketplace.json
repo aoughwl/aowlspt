@@ -1,0 +1,25 @@
+{
+  "name": "aowlspt",
+  "owner": {
+    "name": "savannt"
+  },
+  "metadata": {
+    "description": "Plugins that ship with the aowlspt repo: typed tooling over the live Tarkov client.",
+    "version": "0.1.0"
+  },
+  "plugins": [
+    {
+      "name": "aowlsptcode",
+      "source": "./plugins/aowlsptcode",
+      "description": "Typed MCP tools over the aowlspt live inspector's file channel: one call per verb (state/roots/find/findtext/children/tree/parent/read/component/label/call/press), each returning structured JSON with an explicit search-completeness field and typed errors, instead of hand-driving a write/poll/parse loop.",
+      "category": "development",
+      "keywords": [
+        "aowlspt",
+        "tarkov",
+        "il2cpp",
+        "inspector",
+        "mcp"
+      ]
+    }
+  ]
+}
