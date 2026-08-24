@@ -2038,19 +2038,41 @@ proc main(): int =
     # is `xkNoScreen` on `CharacterSelectionScreen` under the live `Menu UI`
     # root, so PASS means that specific screen was observed to go inactive,
     # not "something was pressed".
-    var u = initUi(root, 60000, true)
-    # MEASURED: an earlier version started matching at t=+1.3s, right after
-    # `watchClient` returns -- long before the selector can possibly be up
-    # (60-90s on a cold IL2CPP boot, same number CLAUDE.md's false-crash
-    # trap uses). It burned its whole retry budget on a screen that did not
-    # exist yet, gave up, and logged NOTHING distinguishable from never
-    # having run -- so the first fix is: wait for the LIVE
-    # `CharacterSelectionScreen` under `Menu UI` to actually be ACTIVE
-    # before ever calling `clickText`, and say so as it happens.
+    # The verdict is written HERE, in one place, on every exit from this
+    # block -- not only at the end of the happy path. `ok`/`warn`/`note` go
+    # to this process's own stdout only, which `tools/harness.py run` (and
+    # anything else that launches this headless) swallows entirely: a run
+    # driven that way showed no verdict line ANYWHERE, indistinguishable
+    # from never having run. So every verdict also lands in a small,
+    # single-purpose file next to the host log that survives regardless of
+    # how this exe was invoked.
+    let verdictPath = joinPath(root, "aowlspt\\aowlspt-autoenter.log")
+
+    # MEASURED (two bugs, not one):
+    #  1. An earlier version started matching at t=+1.3s, right after
+    #     `watchClient` returns -- long before the selector can possibly be
+    #     up (60-90s on a cold IL2CPP boot). Fixed by waiting for the LIVE
+    #     `CharacterSelectionScreen` under `Menu UI` to actually be ACTIVE
+    #     first.
+    #  2. That fix then made things WORSE: the wait loop's `screens()` polls
+    #     were made with `initUi(root, 60000, true)` -- a PINNED 60s
+    #     timeout, and `runBatch` itself retries a dropped batch 3 times
+    #     internally. One early poll, issued before the client's main
+    #     thread is even pumping frames yet, could therefore burn up to
+    #     3 x 60s = 180s **inside a single iteration** of what was meant to
+    #     be a light, fast, repeated check -- consuming the whole intended
+    #     150s wait budget on ONE poll, which reads exactly like "dropped
+    #     a batch; retry 1/2, retry 2/2" and then silence. The wait-phase
+    #     poll below therefore uses a SHORT, unpinned timeout of its own
+    #     (5s) so a poll that gets no answer yet is cheap and the outer
+    #     loop actually gets to retry on its own 3s cadence; only the final
+    #     click, once the screen is confirmed up, uses the longer pinned
+    #     timeout.
+    var u = initUi(root, 5000, false)
     var waitTries = 0
     var screenUp = false
     var waitErr = ""
-    while waitTries < 50 and not screenUp:  # up to ~150s
+    while waitTries < 50 and not screenUp:  # up to ~150s of ACTUAL waiting
       var ss = default(ScreenSet)
       if screens(u, "Menu UI", ss):
         for sc in ss.screens:
@@ -2062,12 +2084,17 @@ proc main(): int =
         cSleepMs 3000
         inc waitTries
     if not screenUp:
-      warn "auto-enter verdict: INCONCLUSIVE -- CharacterSelectionScreen " &
-           "under Menu UI never became active within 150s. " & waitErr
+      let msg = "auto-enter verdict: INCONCLUSIVE -- " &
+        "CharacterSelectionScreen under Menu UI never became active " &
+        "within 150s. " & waitErr
+      warn msg
+      discard writeTextFile(verdictPath, msg & "\n")
       note "left at whatever screen is actually up; check liveInspector is " &
            "on in aowlspt-host.json, or pass --no-auto-enter to silence this"
     else:
       ok "character-select is up (waited " & $(waitTries * 3) & "s) -- matching now"
+      u.timeoutMs = 60000
+      u.timeoutPinned = true
       var pressed = false
       var lastMsg = ""
       var tries = 0
@@ -2084,10 +2111,15 @@ proc main(): int =
           cSleepMs 3000
         inc tries
       if pressed:
-        ok "auto-enter verdict: PASS (verified closed) -- " & lastMsg
+        let msg = "auto-enter verdict: PASS (verified closed) -- " & lastMsg
+        ok msg
+        discard writeTextFile(verdictPath, msg & "\n")
       else:
-        warn "auto-enter verdict: FAIL (screen still up, or a candidate " &
-             "could not be pressed) -- " & lastMsg
+        let msg = "auto-enter verdict: FAIL (screen still up, or a " &
+          "candidate could not be pressed, after " & $tries & " attempt(s)) " &
+          "-- " & lastMsg
+        warn msg
+        discard writeTextFile(verdictPath, msg & "\n")
         note "left at the manual selector; pass --no-auto-enter to silence " &
              "this warning next time"
 
