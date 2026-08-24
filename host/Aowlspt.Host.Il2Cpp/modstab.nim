@@ -723,6 +723,64 @@ proc modsRelabelLike(cloneT, donorT: Il2CppPtr; text: string;
          "(This is fact #88: a write that lands on the SIZING helper reads " &
          "back perfectly and changes nothing the player sees.)"
 
+proc modsRelabelRow(cloneT, donorT: Il2CppPtr; text: string;
+                    cloneCtrl: Il2CppPtr = nil): bool =
+  ## Relabel a ROW clone. Unlike `modsRelabelLike` (used for the tab/subtab
+  ## BUTTONS, where "N of N matching the donor" holds up), a row clone is a
+  ## clone-of-a-clone ("Settings Drop Down(Clone)(Clone)") and was measured
+  ## LIVE (`findtext "Interface language" ... all`) to carry THREE
+  ## TextMeshProUGUI where only one -- a child literally named "Text" -- is
+  ## the one that renders. `modsRelabelLike`'s "count matches the donor"
+  ## check is unfalsifiable here: it only re-reads what it just wrote, so it
+  ## can be satisfied by writing the WRONG TMP and never touching the one on
+  ## screen -- which is exactly what the host log's "1 of 3, matching the
+  ## donor" was doing while every row visibly still read the donor's caption.
+  ##
+  ## So: write EVERY TMP the clone carries, unconditionally (no cur==caption
+  ## filter -- that filter is what skipped the "Text" node when it still held
+  ## something the donor-count math treated as already-correct). Then the
+  ## check that decides success is the one thing that can actually FAIL: does
+  ## any TMP under this clone still read the donor's ORIGINAL caption after
+  ## the write? If so, that is the one rendering and the fix did not reach it.
+  result = false
+  var want = 0
+  let donorCaption = modsCaptionOf(donorT, want)
+  var cNodes: seq[Il2CppPtr] = @[]
+  var cTmps: seq[Il2CppPtr] = @[]
+  modsCollectTmp(cloneT, 4, cNodes, cTmps)
+  if cTmps.len == 0:
+    warn "mods tab: REFUSING to claim the row label '" & text & "' -- there " &
+         "is no TextMeshProUGUI anywhere under this clone (searched 4 " &
+         "levels). Nothing was written."
+    return
+  var wrote = 0
+  var i = 0
+  while i < cTmps.len:
+    if swRelabelControl(cloneCtrl, cTmps[i], text):
+      wrote = wrote + 1
+    i = i + 1
+  # THE CHECK THAT CAN FAIL: re-read every TMP under the clone afterwards and
+  # count how many STILL show the donor's ORIGINAL caption -- not how many
+  # show ours, and not a count borrowed from the donor.
+  var stale = 0
+  i = 0
+  while i < cTmps.len:
+    if donorCaption.len > 0 and modsTmpText(cTmps[i]) == donorCaption:
+      stale = stale + 1
+    i = i + 1
+  result = stale == 0
+  if result:
+    okLog "mods tab: row caption '" & text & "' written to all " &
+          $cTmps.len & " of the clone's TextMeshProUGUI (" & $wrote &
+          " write(s) succeeded); none still read the donor's '" &
+          donorCaption & "'."
+  else:
+    warn "mods tab: row caption '" & text & "' DID NOT FULLY TAKE -- " &
+         $stale & " of the clone's " & $cTmps.len & " TextMeshProUGUI " &
+         "STILL read the donor's original '" & donorCaption & "' after " &
+         $wrote & " write(s). That TMP is the one rendering, and it did " &
+         "not take the new caption."
+
 proc modsRelabel(t: Il2CppPtr; text: string): bool =
   ## Relabel with no donor to compare against: the clone is its own reference.
   ## Kept for callers that have no donor handy; everything on the build path
@@ -1349,7 +1407,7 @@ proc modsTabBuild(): bool =
               text = text & cSwNotDone
             let rowT = iToTransform(ctrl)
             if rowT != nil:
-              if modsRelabelLike(rowT, rowDonorT, text, ctrl):
+              if modsRelabelRow(rowT, rowDonorT, text, ctrl):
                 rowsFixed = rowsFixed + 1
               else:
                 rowsBad = rowsBad + 1
