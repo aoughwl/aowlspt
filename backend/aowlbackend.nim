@@ -1371,7 +1371,12 @@ proc handleRequest(sock: uint64; buf: HostPtr; len: int32;
       # carried (the client sniffs the format from the magic bytes, not the
       # header or the path), so the honest Content-Type is `image/png`.
       sendResponse(sock, "200 OK", body, false, req.keepAlive, "image/png")
-    elif fpath.len >= 18 and fpath.substr(0, 17) == "/aowlspt/ui/page/":
+    # `substr(a, b)` is INCLUSIVE of b, so a 17-character prefix is
+    # `substr(0, 16)`, not `substr(0, 17)`. Getting this wrong makes the branch
+    # unreachable and the page goes out as `application/json`, which a browser
+    # offers as a download instead of rendering. The two branches above are the
+    # correct pattern: "/files/" is 7 chars and uses substr(0, 6).
+    elif fpath.len >= 17 and fpath.substr(0, 16) == "/aowlspt/ui/page/":
       # The fallback settings UI (docs/UI-API.md) is a page a human opens
       # directly in an ordinary browser -- not the overlay's worker thread,
       # which sets its own headers and can ask for `identity` -- so it cannot
