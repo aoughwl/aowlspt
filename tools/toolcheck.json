@@ -140,6 +140,29 @@
       "needs": "raid",
       "batches": [["state"]],
       "deny": ["(?i)not in (a )?raid", "(?i)in-raid anchor slot=-1"]
+    },
+    {
+      "name": "state-settings-null-does-not-invent-a-cause",
+      "why": "`state` asserted the SettingsScreen anchor was null because the screen 'has not been opened this session' while the host log showed ShowScreen already firing and $settings still null -- a cause it never checked. The message must name what it actually knows (two independent hooks, either can be un-armed) rather than a single invented cause.",
+      "needs": "menu",
+      "batches": [["state"]],
+      "assert": ["(?i)ShowScreen postfix", "(?i)invoke2 ladder"]
+    },
+    {
+      "name": "find-single-numeric-arg-is-budget-not-root",
+      "why": "`find NAME 200000` silently read 200000 decimal (0x30d40) as a ROOT pointer, walked that one bogus node, and reported the name genuinely NOT PRESENT. A bare integer that does not read back as a live pointer must be treated as BUDGET and the tool must say which interpretation it picked.",
+      "needs": "menu",
+      "batches": [["find CharacterSlotView 200000"]],
+      "assert": ["(?i)treated as BUDGET"],
+      "deny": ["(?i)genuinely NOT PRESENT", "(?i)searched EXHAUSTIVELY"]
+    },
+    {
+      "name": "find-invalid-root-refused-not-reported-absent",
+      "why": "An explicit root that does not read back as a live Transform must be refused up front, the way `tree` already refuses -- never walked as if valid and then reported 'searched EXHAUSTIVELY, genuinely NOT PRESENT' off one bogus node.",
+      "needs": "any",
+      "batches": [["find Foo 0x1 500"]],
+      "refuse": ["(?i)not readable"],
+      "deny": ["(?i)genuinely NOT PRESENT", "(?i)searched EXHAUSTIVELY"]
     }
   ]
 }

@@ -156,6 +156,18 @@ hierarchy of wrong children without faulting at all.
 whole search) and says which happened: `searched EXHAUSTIVELY` vs `STOPPED EARLY`
 — and STOPPED EARLY is **not** proof a name is absent.
 
+`find NAME X` with exactly ONE trailing token is genuinely ambiguous against the
+`[ROOT] [BUDGET]` grammar — `X` disambiguates by **readability**: if it reads
+back as a live Transform/GameObject it is treated as ROOT, otherwise as BUDGET
+(and `find` says which it picked, and why). This replaced a bug where a plain
+integer like `find SettingsScreen 200000` was always read as ROOT — `200000`
+decimal IS `0x30d40`, a bogus pointer — searched that one bogus node, and
+reported the name **"genuinely NOT PRESENT"**. An explicit ROOT is *also* now
+refused up front, exactly like `tree` already refuses, if it does not read back
+as a valid Transform — `find` never again reports a "genuinely NOT PRESENT" or
+"searched EXHAUSTIVELY" verdict when zero valid nodes were actually visited; it
+says plainly that nothing was examined.
+
 Write the command file **without a BOM**. PowerShell 5.1's `Set-Content -Encoding
 utf8` emits one; it is stripped now, but `printf` from Bash is the safe habit.
 
@@ -168,7 +180,12 @@ questions that are genuinely visual and that no field read can answer — and sa
 
 Anchors rebind per batch: `$preloader $verlabel $modetext $tab1 $settings $gameworld
 $you $_`. `state` explains WHY an anchor is null (e.g. the host learns the SettingsScreen
-pointer only once that screen has been opened).
+pointer only once that screen has been opened) — but check that explanation against the
+host log before trusting it; `$settings` is populated by whichever of two independent
+hooks fires first (the `ShowScreen` postfix that drives Phase 1/2/3, or the separate
+invoke2 ladder proof on `EnsureTabInitialized`), and a null anchor while the host log
+shows "settings probe: ShowScreen (postfix) first fired" means a flag gating one of
+those hooks is off, not that Settings was never opened.
 
 ---
 
