@@ -2039,29 +2039,57 @@ proc main(): int =
     # root, so PASS means that specific screen was observed to go inactive,
     # not "something was pressed".
     var u = initUi(root, 60000, true)
-    var pressed = false
-    var lastMsg = ""
-    var tries = 0
-    while tries < 30 and not pressed:
-      let expect = Expect(kind: xkNoScreen, name: "CharacterSelectionScreen",
-                          root: "Menu UI")
-      let r = clickText(u, "PvE", "Menu UI", true, "", expect, 4000, true)
-      lastMsg = r.msg
-      if r.ok:
-        pressed = true
-      elif lastMsg.contains("liveInspector"):
-        break
+    # MEASURED: an earlier version started matching at t=+1.3s, right after
+    # `watchClient` returns -- long before the selector can possibly be up
+    # (60-90s on a cold IL2CPP boot, same number CLAUDE.md's false-crash
+    # trap uses). It burned its whole retry budget on a screen that did not
+    # exist yet, gave up, and logged NOTHING distinguishable from never
+    # having run -- so the first fix is: wait for the LIVE
+    # `CharacterSelectionScreen` under `Menu UI` to actually be ACTIVE
+    # before ever calling `clickText`, and say so as it happens.
+    var waitTries = 0
+    var screenUp = false
+    var waitErr = ""
+    while waitTries < 50 and not screenUp:  # up to ~150s
+      var ss = default(ScreenSet)
+      if screens(u, "Menu UI", ss):
+        for sc in ss.screens:
+          if sc.name == "CharacterSelectionScreen" and sc.active == triYes:
+            screenUp = true
       else:
+        waitErr = u.lastErr
+      if not screenUp:
         cSleepMs 3000
-      inc tries
-    if pressed:
-      ok "auto-entered past character-select (PASS, verified closed): " &
-         lastMsg
+        inc waitTries
+    if not screenUp:
+      warn "auto-enter verdict: INCONCLUSIVE -- CharacterSelectionScreen " &
+           "under Menu UI never became active within 150s. " & waitErr
+      note "left at whatever screen is actually up; check liveInspector is " &
+           "on in aowlspt-host.json, or pass --no-auto-enter to silence this"
     else:
-      warn "auto-enter did NOT verify the character-select screen closed " &
-           "(FAIL/INCONCLUSIVE): " & lastMsg
-      note "left at the manual selector; check liveInspector is on in " &
-           "aowlspt-host.json, or pass --no-auto-enter to silence this"
+      ok "character-select is up (waited " & $(waitTries * 3) & "s) -- matching now"
+      var pressed = false
+      var lastMsg = ""
+      var tries = 0
+      while tries < 10 and not pressed:
+        let expect = Expect(kind: xkNoScreen, name: "CharacterSelectionScreen",
+                            root: "Menu UI")
+        let r = clickText(u, "PvE", "Menu UI", true, "", expect, 4000, true)
+        lastMsg = r.msg
+        if r.ok:
+          pressed = true
+        elif lastMsg.contains("liveInspector"):
+          break
+        else:
+          cSleepMs 3000
+        inc tries
+      if pressed:
+        ok "auto-enter verdict: PASS (verified closed) -- " & lastMsg
+      else:
+        warn "auto-enter verdict: FAIL (screen still up, or a candidate " &
+             "could not be pressed) -- " & lastMsg
+        note "left at the manual selector; pass --no-auto-enter to silence " &
+             "this warning next time"
 
   if o.clientWindow:
     # The second window, for anyone who wants it. It is another copy of this
