@@ -32,6 +32,48 @@ If it leaks again: rewrite the author AND committer fields (`git filter-branch
 expire the reflog, then force-push every branch and tag. Verify against the
 GitHub API, not the local clone.
 
+### It happened again, in THIS repo — measured 2026-08-24
+
+Do not assume the earlier scrub covered this repo. An audit on 2026-08-24 found:
+
+* **274 commits** across ~90 local branches authored AND committed by the
+  address, and **50 of the 51 commits on `origin/main`** — i.e. it was pushed.
+* Cause: the **global** config held it until **2026-08-23 ~12:16**, when it was
+  switched. No per-repo, per-worktree or env override was ever involved — the
+  earlier note blaming a per-repo override is not what happened here. Last bad
+  commit 2026-08-23 18:12; nothing since.
+* It also sat in `CLAUDE.md` content on 4 branches, and **on disk plus in the
+  index of 4 of the 66 worktrees** — `git gc` could not prune the blob until
+  those worktrees were reset. A scrub that only walks refs will miss this.
+
+All of it was rewritten and force-pushed; a fresh clone of `origin` now reports
+zero occurrences, and `main`'s tree hash is byte-identical to before
+(`30ddabee…`), so only metadata changed.
+
+**Two things that are still true and matter:**
+
+1. **GitHub keeps force-pushed commits reachable by direct SHA** until its own
+   GC runs. `git fetch origin <old-sha>` still returned a commit bearing the
+   address after the push. The repo is private, so this needs repo access AND
+   the SHA — but "I force-pushed" is NOT "it is gone". The only complete fixes
+   are GitHub Support running `gc`, or deleting and recreating the repo.
+2. **The repo is PRIVATE** (`api.github.com/repos/savannt/aowlspt` 404s
+   unauthenticated while `git ls-remote` succeeds). That is what kept this from
+   being a public leak. Do not make it public until item 1 is settled.
+
+### The guard
+
+`tools/githooks/pre-commit`, wired up with
+`git config --local core.hooksPath tools/githooks` (which every worktree
+inherits, since worktrees share local config — and worktrees are where the 274
+came from). It refuses a commit whose author identity, committer identity, or
+staged content carries the address. Tested against all three cases.
+
+The hook never writes the address literally; it reassembles the pattern at
+runtime. **Do the same in anything you write.** A guard, a test fixture or a
+warning that spells the string out is itself the leak — that is exactly how
+this file came to contain it in the first place.
+
 
 Post-1.0 Escape From Tarkov is **IL2CPP**. There is no BepInEx and no Mono patching.
 aowlspt is a host DLL running on the Unity main thread plus a nimony backend that

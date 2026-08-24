@@ -1,0 +1,51 @@
+#!/bin/sh
+# Refuse any commit that would record the personal address -- as the author or
+# committer identity, or inside the staged content.
+#
+# The address is NEVER written literally in this file. A guard that spells out
+# the string it guards against is itself the leak it exists to prevent, and this
+# file is tracked. The pattern is reassembled at runtime instead.
+#
+# Installed via `git config core.hooksPath tools/githooks`, which applies to
+# every worktree because worktrees share the repo's local config -- and the 274
+# bad commits this hook exists to prevent were made in worktrees.
+
+U='twill''its'
+D='mumfordand''miller.com'
+PAT="$U@$D"
+
+fail=0
+
+ae=$(git var GIT_AUTHOR_IDENT 2>/dev/null)
+ce=$(git var GIT_COMMITTER_IDENT 2>/dev/null)
+
+case "$ae" in *"$PAT"*)
+  echo "pre-commit: REFUSED -- author identity is the personal address." >&2
+  fail=1 ;;
+esac
+case "$ce" in *"$PAT"*)
+  echo "pre-commit: REFUSED -- committer identity is the personal address." >&2
+  fail=1 ;;
+esac
+
+# Staged content. --cached diff of what is about to be committed.
+if git diff --cached -U0 | grep -q "$PAT"; then
+  echo "pre-commit: REFUSED -- the personal address appears in staged content:" >&2
+  git diff --cached --name-only | while read -r f; do
+    if git show ":$f" 2>/dev/null | grep -q "$PAT"; then echo "    $f" >&2; fi
+  done
+  fail=1
+fi
+
+if [ "$fail" != "0" ]; then
+  cat >&2 <<'MSG'
+
+  Fix before committing:
+    git config --global user.email savant.eclipse@gmail.com
+    git config --global user.name  savannt
+  and remove the address from the staged files. See CLAUDE.md section 0.
+  This hook is deliberate; do not bypass it with --no-verify.
+MSG
+  exit 1
+fi
+exit 0
