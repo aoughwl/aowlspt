@@ -210,6 +210,16 @@ var gModsOwnExclusive = false
 var gModsStrNames: seq[string] = @[]
 var gModsStrPtrs: seq[Il2CppPtr] = @[]
 
+## DECLINE vs ABSENCE, counted separately. A guard inside `modsComponent`
+## returning nil BEFORE ever calling GetComponent ("I refused to look") must
+## never render the same as GetComponent genuinely finding nothing ("it is
+## not there") -- that conflation is what made a false decline look like a
+## content problem for two rounds straight (CLAUDE.md rule 9b). Reset per
+## search by the caller (`modsCollectTmp`'s top-level entry points), read
+## back as a delta.
+var gModsExamined = 0   ## every node modsComponent was asked about
+var gModsDeclines = 0   ## of those, how many were refused before the icall
+
 ## `Component::GetComponent(String)`, resolved ONCE (fully-qualified name
 ## tried first, bare name as a logged fallback) rather than re-resolved
 ## (and possibly re-guessed) on every `modsComponent` call.
@@ -372,52 +382,33 @@ proc modsComponent(comp: Il2CppPtr; typeName: string): Il2CppPtr =
   ## refuses loudly before ever reaching the icall, rather than calling through
   ## and hoping.
   result = nil
+  inc gModsExamined
   modsCrumbP("modsComponent(" & typeName & ") node=" & iObjName(comp) &
              " parent=" & iObjName(modsParentOf(comp)), comp)
   if comp == nil:
+    inc gModsDeclines
     return
   if iRefuseIfGameObject(comp, "modsComponent(" & typeName & ")"):
+    inc gModsDeclines
     warn "mods tab: modsComponent(" & typeName & ") was handed a GameObject " &
          "(" & iObjName(comp) & ", parent " & iObjName(modsParentOf(comp)) &
          ") instead of a Transform/Component -- DECLINING rather than " &
          "calling GetComponent through the wrong `this`."
     return
   if not iUnityAlive(comp):
+    inc gModsDeclines
     return
-  # KLASS, NOT JUST ALIVENESS. MEASURED LIVE: a `Label` under `SizeLabel`
-  # passed `iRefuseIfGameObject` and `iUnityAlive` and STILL faulted inside
-  # `GetComponent(String)` -- alive and non-GameObject is not proof it is
-  # really a Transform's own klass at +0. `gTfKlass`/`iIsTransform` is the
-  # existing whitelist, seeded only from contract-guaranteed Transform
-  # sources (`GetChild`, `get_transform`) -- reuse it rather than build a
-  # second one. Only enforced once something has actually been seeded, so
-  # this never blocks the very first call of a session.
-  if gTfKlass.len > 0 and not iIsTransform(comp):
-    warn "mods tab: modsComponent(" & typeName & ") DECLINED node " &
-         iObjName(comp) & " (parent " & iObjName(modsParentOf(comp)) &
-         ") -- its klass at +0 does not match any Transform klass seen so " &
-         "far this session, so GetComponent was never called on it. " &
-         "Skipping this node, not the whole walk."
-    return
-  # RESOLVED ONCE, LOUDLY, SELF-TESTED, NOT RE-GUESSED PER CALL.
-  #
-  # MEASURED LIVE (the RVA the crumb's own bind-log printed): the
-  # fully-qualified "Component::GetComponent(String)" bound @0x52a48e0 --
-  # NOT @0x2a48e0, which is what the inspector's IDENTICAL string resolves to
-  # and what the icall must be, because 0x2a48e0's first instruction is
-  # `add rcx, 0x10` -- a THUNK that adjusts `this` by 16 bytes before the
-  # real body runs. Calling anything else with an unadjusted receiver
-  # inspects the wrong object and returns null, silently, forever. The nav
-  # target table fills in incrementally, and modstab's early-build lookup
-  # apparently lands on a different candidate than the inspector's
-  # later-session lookup does for the same substring -- so the fix is not
-  # "which string" but "which RESULT actually works", proven right here:
-  #
-  # THE BARE NAME is what every partially-working run used, so it stays.
-  # What is NEW is the self-test: call it once, on THIS call's own receiver,
-  # and refuse to arm the feature at all unless it comes back non-nil --
-  # a bind that resolves cleanly and then answers null on everything is
-  # exactly the failure this file has now chased for four rounds.
+  # REMOVED: a klass whitelist (`gTfKlass`/`iIsTransform`) used to gate here.
+  # DISPROVED LIVE: the coordinator ran the inspector's own `component` on
+  # the exact node it was added for and got FOUND -- the receiver was always
+  # valid, so the whitelist only ever contributed false declines (a decline
+  # that then rendered as "no TextMeshProUGUI anywhere", indistinguishable
+  # from a real absence -- see `gModsDeclines`/`gModsExamined` below).
+  # RESOLVED ONCE, LOUDLY, SELF-TESTED, NOT RE-GUESSED PER CALL. The bare
+  # name @0x52a48e0 is CONFIRMED live (self-test finds real components), so
+  # this only tries a few times if the bind or a probe node hasn't proven
+  # itself yet -- see `gModsDeclines` for how those unproven calls are
+  # counted separately from a genuine "GetComponent said no".
   if gModsGcFn == nil:
     # RETRIED, not latched on one failure: a probe node that genuinely lacks
     # `typeName` (e.g. the first call happens to be for "AnimatedToggle" on a
@@ -431,6 +422,7 @@ proc modsComponent(comp: Il2CppPtr; typeName: string): Il2CppPtr =
       var f1: Il2CppPtr = nil
       var r1 = 0'u32
       if not iNavFind("GetComponent(String)", f1, r1):
+        inc gModsDeclines
         warn "mods tab: GetComponent could not be bound at all (try " &
              $gModsGcTries & " of " & $ModsGcMaxTries & ")."
       else:
@@ -444,11 +436,14 @@ proc modsComponent(comp: Il2CppPtr; typeName: string): Il2CppPtr =
                 iPtr(probe) & " on " & iObjName(comp)
           return probe
         else:
+          inc gModsDeclines
           warn "mods tab: GetComponent bound @0x" & hexOf(uint64(r1)) & " " &
                "but the self-test for \"" & typeName & "\" on " &
                iObjName(comp) & " came back null (try " & $gModsGcTries &
                " of " & $ModsGcMaxTries & "); not yet trusted -- will not " &
                "call it for real until one self-test finds something."
+    else:
+      inc gModsDeclines           # tries exhausted; still not trusted
     return
   let fn = gModsGcFn
   if fn == nil:
@@ -821,11 +816,21 @@ proc modsRelabelLike(cloneT, donorT: Il2CppPtr; text: string;
   let caption = modsCaptionOf(donorT, want)
   var cNodes: seq[Il2CppPtr] = @[]
   var cTmps: seq[Il2CppPtr] = @[]
+  let examined0 = gModsExamined
+  let declines0 = gModsDeclines
   modsCollectTmp(cloneT, 4, cNodes, cTmps)
   if cTmps.len == 0:
-    warn "mods tab: REFUSING to claim the label '" & text & "' -- there is " &
-         "no TextMeshProUGUI anywhere under this clone (searched 4 levels). " &
-         "Nothing was written."
+    let ex = gModsExamined - examined0
+    let dc = gModsDeclines - declines0
+    warn "mods tab: REFUSING to claim the label '" & text & "' -- " &
+         (if dc > 0:
+            "modsComponent DECLINED " & $dc & " of " & $ex & " node(s) " &
+            "examined (searched 4 levels) without ever calling GetComponent " &
+            "-- this is a REFUSAL, not proof there is no TextMeshProUGUI"
+          else:
+            "GetComponent was called on all " & $ex & " node(s) examined " &
+            "(4 levels) and found none -- this IS an absence, not a decline") &
+         ". Nothing was written."
     return
   if want == 0:
     # No caption on the donor at all. Fall back to writing every candidate,
