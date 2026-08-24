@@ -353,13 +353,25 @@ proc modsComponent(comp: Il2CppPtr; typeName: string): Il2CppPtr =
     return
   var fn: Il2CppPtr = nil
   var rva = 0'u32
-  if not iNavFind("GetComponent(String)", fn, rva):
+  # FULLY QUALIFIED, matching `iCmdComponent` (the PROVEN path -- the coordinator
+  # ran the identical call live and it resolved). The bare substring
+  # "GetComponent(String)" ALSO matches "GameObject::GetComponent(String)" in
+  # the same nav table, and `iNavFind` returns whichever comes first -- so this
+  # could silently bind the WRONG overload's RVA/shape for a Component receiver
+  # while looking indistinguishable from success on the calls where it happened
+  # to still work. Never seen guessed at again: name the exact overload.
+  if not iNavFind("Component::GetComponent(String)", fn, rva):
     return
   if cNavIcallReady() == 0'i32:
     return
   var name = typeName
   let sp = cNavNewString(toCString(name))
-  if sp == nil:
+  modsCrumbP("modsComponent(" & typeName & ") node=" & iObjName(comp) &
+             " str=", sp)
+  if sp == nil or not duOk(sp, 0x18'i32):
+    warn "mods tab: modsComponent(" & typeName & ") DECLINED -- " &
+         "il2cpp_string_new for the type name did not produce a live, " &
+         "readable managed string; nothing was called."
     return
   result = cast[Il2CppPtr](cInspUPP(fn, comp, sp, nil))
 
