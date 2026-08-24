@@ -178,14 +178,16 @@ proc texturesSchema(): seq[Setting] =
   ]
 
 proc onSettings(url, body, session: string): string =
-  if body.len > 0 and applySettingFromBody(body) == Ok:
-    loadConfig()
-  result = declaredSchemaJson().text
+  var st = Ok
+  if body.len > 0:
+    st = applySettingFromBody(body)
+    if st == Ok: loadConfig()
+  result = declaredSchemaReply(st).text
 
 proc onSettingsReset(url, body, session: string): string =
-  if resetFromBody(body) == Ok:
-    loadConfig()
-  result = declaredSchemaJson().text
+  let st = resetFromBody(body)
+  if st == Ok: loadConfig()
+  result = declaredSchemaReply(st).text
 
 # ---------------------------------------------------------------------------
 # Reporting

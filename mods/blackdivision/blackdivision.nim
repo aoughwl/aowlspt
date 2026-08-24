@@ -612,14 +612,16 @@ proc blackDivisionSchema(): seq[Setting] =
 
 proc onBlackDivisionSettings(url, body, session: string): string =
   ## GET serves the schema; a POST body applies one edit, then re-reads config.
-  if body.len > 0 and applySettingFromBody(body) == Ok:
-    readConfig()
-  result = declaredSchemaJson().text
+  var st = Ok
+  if body.len > 0:
+    st = applySettingFromBody(body)
+    if st == Ok: readConfig()
+  result = declaredSchemaReply(st).text
 
 proc onBlackDivisionSettingsReset(url, body, session: string): string =
-  if resetFromBody(body) == Ok:
-    readConfig()
-  result = declaredSchemaJson().text
+  let st = resetFromBody(body)
+  if st == Ok: readConfig()
+  result = declaredSchemaReply(st).text
 
 proc onLoadServer(): Status =
   seedRandom(nowMs())

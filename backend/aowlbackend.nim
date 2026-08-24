@@ -1528,10 +1528,17 @@ proc hostConfigSet(ctx: HostPtr; key: HostPtr; keyLen: int32;
   if k.len == 0:
     gLastError = "config set needs a key"
     return ErrBadArg
-  var valueFault = ""
-  if jsonFault(v, valueFault):
-    gLastError = "value for \"" & k & "\" is not valid JSON: " & valueFault
+  if v.len == 0:
+    gLastError = "config set needs a value"
     return ErrBadArg
+  # NOTE: `jsonFault` validates a whole DOCUMENT -- it demands the top level
+  # begin with `{` -- so it cannot be used to check `v` here: `v` is almost
+  # always a scalar (`"PVE ZONE"`, `true`, `1.5`), and running it through
+  # jsonFault rejected every one of those with ErrBadArg before this ever
+  # reached a file write. That was the actual reason no POST persisted: not
+  # a missing key, not a read/write failure, but this check refusing every
+  # legal value. `v`'s syntax is verified for real below, as part of the
+  # whole merged document -- a malformed `v` still cannot slip past that.
   let dir = modDirOf(idx)
   if dir.len == 0:
     gLastError = "no such mod context"
@@ -2515,14 +2522,22 @@ proc main(): int =
           return v
 
     let before = cornerLabelValue()
+    # The escaping that matters: the wire body's "value" field IS the JSON
+    # literal to persist (per `applySettingFromBody`'s docstring, the same
+    # shape a keybind's `"KeypadMultiply"` uses) -- one level of quoting, not
+    # two. `\"PVE ZONE\"` here is Nim source escaping down to the single JSON
+    # string literal `"PVE ZONE"` on the wire; escaping it a second time would
+    # send a value whose *content* is the four extra quote characters, not
+    # the six-character label this checks for.
     let setResp = request(gPort, cornerRoute,
-                          "{\"key\":\"menuCornerLabel\",\"value\":\"\\\"PVE ZONE\\\"\"}",
+                          "{\"key\":\"menuCornerLabel\",\"value\":\"PVE ZONE\"}",
                           "000000000000000000000001")
     let after = cornerLabelValue()
+    let writeWorked = setResp.ok and after == "PVE ZONE"
     if not setResp.ok:
       console.err "settings write: POST failed: " & setResp.error
       inc gSelfFailures
-    elif after != "PVE ZONE":
+    elif not writeWorked:
       console.err "settings write: POST to a key not yet in config.json did " &
                   "not persist (before=\"" & before & "\" after=\"" & after &
                   "\", wanted \"PVE ZONE\")"
@@ -2531,19 +2546,35 @@ proc main(): int =
       console.ok "settings write: a declared key with no prior config.json " &
                  "entry now persists"
 
-    let resetResp = request(gPort, cornerResetRoute,
-                            "{\"key\":\"menuCornerLabel\"}",
-                            "000000000000000000000001")
-    let afterReset = cornerLabelValue()
-    if not resetResp.ok:
-      console.err "settings reset: POST failed: " & resetResp.error
-      inc gSelfFailures
-    elif afterReset != "Profile Name":
-      console.err "settings reset: did not restore the declared default " &
-                  "(got \"" & afterReset & "\", wanted \"Profile Name\")"
+    # The reset check's whole point is to prove a WRITE happened and reset
+    # undid it. If the write above did not actually change the value, the
+    # value was already sitting at "Profile Name" and a reset that does
+    # NOTHING would still make this assertion read true -- exactly the
+    # unfalsifiable shape rule 9b warns about, so that precondition is
+    # checked explicitly and a failed precondition is reported as
+    # INCONCLUSIVE, never as `ok`.
+    if not writeWorked:
+      console.err "settings reset: INCONCLUSIVE -- the write above did not " &
+                  "establish a value other than the default, so this check " &
+                  "cannot tell a working reset from a no-op one"
       inc gSelfFailures
     else:
-      console.ok "settings reset: restores the schema's declared default"
+      let resetResp = request(gPort, cornerResetRoute,
+                              "{\"key\":\"menuCornerLabel\"}",
+                              "000000000000000000000001")
+      let afterReset = cornerLabelValue()
+      if not resetResp.ok:
+        console.err "settings reset: POST failed: " & resetResp.error
+        inc gSelfFailures
+      elif afterReset != "Profile Name":
+        console.err "settings reset: did not restore the declared default " &
+                    "(got \"" & afterReset & "\", wanted \"Profile Name\", " &
+                    "was \"PVE ZONE\" before the reset)"
+        inc gSelfFailures
+      else:
+        console.ok "settings reset: restores the schema's declared default " &
+                   "(confirmed it was \"PVE ZONE\", not \"Profile Name\", " &
+                   "immediately before the reset)"
 
     # And a malformed session id must be refused before any route sees it.
     let badSession = request(gPort, "/aowlspt/status", "", "not-a-mongo-id")

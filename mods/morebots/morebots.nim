@@ -500,13 +500,14 @@ proc onMoreBotsSettings(url, body, session: string): string =
   ## value is read fresh at the next load — this mod reads its settings inline
   ## rather than through a single reloadable config, so the write is saved but
   ## not made live here.
+  var st = Ok
   if body.len > 0:
-    discard applySettingFromBody(body)
-  result = declaredSchemaJson().text
+    st = applySettingFromBody(body)
+  result = declaredSchemaReply(st).text
 
 proc onMoreBotsSettingsReset(url, body, session: string): string =
-  discard resetFromBody(body)
-  result = declaredSchemaJson().text
+  let st = resetFromBody(body)
+  result = declaredSchemaReply(st).text
 
 proc registerRoutes() =
   declareSettings(moreBotsSchema())

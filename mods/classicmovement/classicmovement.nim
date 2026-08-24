@@ -311,14 +311,16 @@ proc classicMovementSchema(): seq[Setting] =
 
 proc onClassicMovementSettings(url, body, session: string): string =
   ## GET serves the schema; a POST body applies one edit, then re-reads config.
-  if body.len > 0 and applySettingFromBody(body) == Ok:
-    loadConfig()
-  result = declaredSchemaJson().text
+  var st = Ok
+  if body.len > 0:
+    st = applySettingFromBody(body)
+    if st == Ok: loadConfig()
+  result = declaredSchemaReply(st).text
 
 proc onClassicMovementSettingsReset(url, body, session: string): string =
-  if resetFromBody(body) == Ok:
-    loadConfig()
-  result = declaredSchemaJson().text
+  let st = resetFromBody(body)
+  if st == Ok: loadConfig()
+  result = declaredSchemaReply(st).text
 
 proc serverLoad(): Status =
   declareSettings(classicMovementSchema())

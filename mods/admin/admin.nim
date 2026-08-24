@@ -127,14 +127,16 @@ proc adminSchema(): seq[Setting] =
                  lo = 10.0, hi = 2000.0, step = 10.0, category = "Visuals")]
 
 proc onAdminSettings(url, body, session: string): string =
-  if body.len > 0 and applySettingFromBody(body) == Ok:
-    applyConfigToggles()
-  result = declaredSchemaJson().text
+  var st = Ok
+  if body.len > 0:
+    st = applySettingFromBody(body)
+    if st == Ok: applyConfigToggles()
+  result = declaredSchemaReply(st).text
 
 proc onAdminSettingsReset(url, body, session: string): string =
-  if resetFromBody(body) == Ok:
-    applyConfigToggles()
-  result = declaredSchemaJson().text
+  let st = resetFromBody(body)
+  if st == Ok: applyConfigToggles()
+  result = declaredSchemaReply(st).text
 
 # ---------------------------------------------------------------------------
 # Capability -- what the mod could actually arm, so the menu is honest
