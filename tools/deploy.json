@@ -100,7 +100,8 @@
         "/client/game/profile/list",
         "/client/items",
         "/client/locations",
-        "BotLocationModifier"
+        "BotLocationModifier",
+        "menuCornerLabel"
       ]
     },
     {

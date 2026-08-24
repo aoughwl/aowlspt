@@ -37,6 +37,7 @@ import aowlspt
 import aowlspt/server
 import aowlspt/settings # the F12 settings schema this emulator declares
 import aowlspt/json
+import aowlspt/menutext # the main menu's bottom-right corner label
 import emu/ids
 import emu/profile
 import emu/sessions
@@ -129,6 +130,15 @@ var gFenceKarmaExtract = 0.01
 var gFenceKarmaDeath = 0.0
 var gRaidId = ""
 var gRaidClock = unknownClock()
+
+# ---------------------------------------------------------------------------
+# The menu corner label (see `menuCornerLabel` in `tarkovSchema` and
+# `applyMenuCornerLabel` below).
+# ---------------------------------------------------------------------------
+var gMenuNickname = ""
+  ## The last profile nickname seen at profile-select, held here so a setting
+  ## change (which arrives with no session/profile context of its own) can
+  ## re-apply "Profile Name" without re-deriving it.
   ## The in-game clock the last `/client/raid/configuration` established, kept
   ## for `emu/questcond`'s `daytime` windows. Kept rather than dropped: the
   ## parse already existed and everything but the raid id used to be thrown
@@ -533,6 +543,46 @@ proc onShopStatus(url, body, session: string): string =
   put(o, "tarcoins", 0)
   result = envelope(o)
 
+proc applyMenuCornerLabel() =
+  ## Drives the main menu's bottom-right corner label from the
+  ## `menuCornerLabel` setting, using whatever nickname was last seen at
+  ## profile-select (`gMenuNickname`). Safe to call with no profile selected
+  ## yet -- "Profile Name" then logs and falls back to leaving the stock label
+  ## alone, rather than sending an empty override that would look identical to
+  ## every other "nothing to say" case.
+  ##
+  ## The three options are represented on the wire (see `aowlspt/menutext`)
+  ## as:
+  ##   * "PVE ZONE"     -> the literal string "PVE ZONE", sent as an
+  ##     override. Simpler and unambiguous versus clearing the override and
+  ##     trusting the stock default to still read "PVE ZONE" -- this way the
+  ##     option means what it says regardless of what the host's stock text
+  ##     happens to be.
+  ##   * "Profile Name" -> `clearMenuModeText()`. The tarkov mod already
+  ##     broadcasts the nickname on `aowlspt.menu.nickname` as the manager's
+  ##     DEFAULT (see `onProfileSelect` below), so clearing any override here
+  ##     lets that default show through -- no need to re-send the nickname as
+  ##     an override too.
+  ##   * "No text"      -> a single space (`" "`), sent as an override. An
+  ##     empty string is already spoken-for: `setMenuModeText("")` means
+  ##     "clear my override" all the way down this chain (menutext.nim,
+  ##     mgr/control.nim's `onMenuModeText`, the host's `modeTextSetWanted`),
+  ##     so it cannot ALSO mean "blank the label" -- that would be one value
+  ##     doing two jobs. A single space is a distinct, non-empty, printable-
+  ##     ASCII string that survives every `menuTextSane`/`menuTextAcceptable`
+  ##     check unchanged and renders as visually blank on screen.
+  let choice = setting("menuCornerLabel").asText("Profile Name")
+  case choice
+  of "PVE ZONE":
+    discard setMenuModeText("PVE ZONE")
+  of "No text":
+    discard setMenuModeText(" ")
+  else: # "Profile Name", and any unrecognised value defaults here too
+    if gMenuNickname.len == 0:
+      info "menu corner label: setting is 'Profile Name' but no profile " &
+           "has been selected yet -- leaving the stock label alone"
+    discard clearMenuModeText()
+
 proc onProfileSelect(url, body, session: string): string =
   ## Binds this session to a profile. The id comes out of the request body, and
   ## a body naming a profile that does not exist is refused rather than bound --
@@ -570,6 +620,10 @@ proc onProfileSelect(url, body, session: string): string =
   # subscribed to is a no-op, so this costs nothing when the feature is off.
   if p.nickname.len > 0:
     discard broadcast("aowlspt.menu.nickname", objOf("nickname", p.nickname))
+    gMenuNickname = p.nickname
+  else:
+    info "menu corner label: profile " & id & " has no nickname to show"
+  applyMenuCornerLabel()
 
   # Insurance returns are checked at login as well as on a timer. A server that
   # was switched off when a return came due must still deliver it, and a timer
@@ -2777,7 +2831,17 @@ proc tarkovSchema(): seq[Setting] =
     floatSetting("skillMaxPerRaid", "Skill max per raid", 100.0, lo = 0.0,
                  hi = 1000.0, step = 1.0, category = "Skills"),
     intSetting("masteringMaxPerRaid", "Mastering max per raid", 100, lo = 0,
-               hi = 1000, category = "Skills")]
+               hi = 1000, category = "Skills"),
+
+    # What the main menu's bottom-right corner reads. Three options, wired
+    # through aowlspt/menutext (the literal key "menuCornerLabel" is also the
+    # deploy marker for this feature -- see tools/deploy.json). See
+    # `applyMenuCornerLabel` below for how each is represented on the wire.
+    enumSetting("menuCornerLabel", "Menu corner label", "Profile Name",
+                @["Profile Name", "PVE ZONE", "No text"], category = "Menu",
+                description = "What the main menu's bottom-right corner " &
+                              "shows: the logged-in character's name, the " &
+                              "stock \"PVE ZONE\", or nothing")]
 
 proc onTarkovSettings(url, body, session: string): string =
   ## GET serves the emulator's schema; a POST body persists one edit into
@@ -2785,6 +2849,10 @@ proc onTarkovSettings(url, body, session: string): string =
   ## takes effect next start rather than live.
   if body.len > 0:
     discard applySettingFromBody(body)
+    # Hot-apply: `menuCornerLabel` (and only that one -- everything else on
+    # this schema is load-time only) must take effect the moment it is saved,
+    # not merely on the next restart.
+    applyMenuCornerLabel()
   result = declaredSchemaJson().text
 
 proc onLoad(): Status =
