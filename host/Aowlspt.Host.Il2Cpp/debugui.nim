@@ -1916,6 +1916,31 @@ proc duNoteGameWorld(gw: Il2CppPtr) =
   if gw != nil and bdSanePtr(gw) and gw != gDuGameWorld:
     gDuGameWorld = gw
 
+proc aowlHostGameWorld(): pointer {.exportc: "aowl_host_gameworld", cdecl.} =
+  ## READ-ONLY export of the GameWorld pointer the existing kind=11 /
+  ## botdiag `RegisterPlayer` detour already caches. Exported so an out-of-host
+  ## consumer (mods/admin) can have the live world WITHOUT binding a second
+  ## detour on `EFT.GameWorld::RegisterPlayer` -- a second detour would
+  ## overwrite the first's trampoline and silently kill debugEsp/botdiag
+  ## (CLAUDE.md 5). This rides the existing detour as a drain; it installs
+  ## nothing and writes nothing.
+  ##
+  ## NULL means one of three things, and the caller must not flatten them:
+  ##   * not in a raid (no GameWorld exists)          -- expected
+  ##   * neither `botDiag` nor `debugEsp` is armed, so nothing populates the
+  ##     cache                                        -- INCONCLUSIVE, not "no raid"
+  ##   * the cached pointer stopped validating and was dropped (line ~1864)
+  ## `aowl_host_gameworld_armed` distinguishes the second case.
+  result = cast[pointer](gDuGameWorld)
+
+proc aowlHostGameWorldArmed(): int32 {.
+    exportc: "aowl_host_gameworld_armed", cdecl.} =
+  ## 1 when a detour that populates the GameWorld cache is actually installed.
+  ## Without this a consumer cannot tell "not in a raid" from "nobody is
+  ## watching", and reporting the second as the first is exactly the silent
+  ## decline CLAUDE.md 6 forbids.
+  if gDebugEspSlot >= 0 or gBotDiagSlot >= 0: 1'i32 else: 0'i32
+
 proc debugEspRegisterFired(regs: Il2CppPtr) =
   ## The kind=11 read-only detour on `EFT.GameWorld::RegisterPlayer`. It does
   ## ONE thing -- take RCX and remember it -- because that is all the overlay

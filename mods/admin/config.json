@@ -1,8 +1,8 @@
 {
-  "_comment": "Admin / cheat menu. These are the INITIAL toggle states, read at load and seeded into the F6 menu; after you change a toggle in the menu it lives in the mod's own state, not here. Defaults per the brief: ESP and God mode on, everything else off. Keys mirror the F12 settings schema in admin.nim.",
+  "_comment": "Admin / cheat menu. These are the INITIAL toggle states, read at load and seeded into the F6 menu; after you change a toggle in the menu it lives in the mod's own state, not here. EVERY cheat defaults OFF: this build goes to testers, so nothing cheats until the player opts in from the F6 menu or the settings screen. Keys mirror the F12 settings schema in admin.nim, and the three default sets (here, the schema, AOWL_ADM_DEFAULTS) must agree.",
 
-  "esp": true,
-  "godmode": true,
+  "esp": false,
+  "godmode": false,
   "infiniteStamina": false,
   "noRecoil": false,
   "noWeight": false,
