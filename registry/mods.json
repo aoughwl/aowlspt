@@ -4,7 +4,7 @@
     "id": "aowl.registry.official",
     "name": "aowlspt official registry",
     "description": "Every mod built in this repository, plus the lists that name them. One file with one git history, so a mod list is a document you can send someone.",
-    "revision": 7,
+    "revision": 8,
     "updated": "2026-08-25"
   },
   "mods": [
@@ -120,7 +120,7 @@
       "name": "SAIN",
       "author": "aowlspt port of SAIN by Solarint and ArchangelWTF",
       "version": "0.1.0",
-      "description": "Bot AI: layered decisions, per-bot personalities, cover use, searching that looks like searching, squads that behave like squads. A port of the design, not of the C# NOT SHIPPED ENABLED as of 2026-08-25: measured to kill the client ~8s after launch across six runs, judged by process-alive plus an advancing host log. The whenReady->mainThread().bound gate (fact #141) was applied and does NOT fix it; an earlier 'SAIN survived' verdict was a false positive from a weak predicate (fact #142).",
+      "description": "Bot AI: layered decisions, per-bot personalities, cover use, searching that looks like searching, squads that behave like squads. A port of the design, not of the C#. Boots clean as of 2026-08-25 but runs in OBSERVER MODE -- see fact #145; it declines every by-name route rather than dying on one.",
       "pipeline": ">=0.1.0",
       "sides": [
         "server",
@@ -231,7 +231,7 @@
       "id": "aowl.uihub",
       "name": "Fallback Settings UI",
       "author": "savannt",
-      "version": "1.0.0",
+      "version": "2.0.0",
       "description": "The browser settings page at /aowlspt/ui/page/settings. It reads and writes the exact same /aowlspt/settings/* routes any other UI would, including the per-row and page-level reset buttons, so it is the reference implementation as well as the shipping surface.",
       "pipeline": ">=0.1.0",
       "sides": [
@@ -366,11 +366,17 @@
       "name": "Default",
       "author": "savannt",
       "version": "1.0.0",
-      "description": "Core only, for now: the Singleplayer Mod plus the settings surface. SAIN was measured on 2026-08-25 to kill the client ~8s after launch even with the mainThread().bound gate that fixed mods/fov, so it has a second defect and must not ship enabled until a launch proves otherwise. mods/fov IS verified (client alive 99.8s, Unity thread live confirmed) but stays unlisted until its FOV write can arm -- EFT.GameWorld has no get_Instance on this build.",
+      "description": "The Singleplayer Mod and SAIN. SAIN was measured on 2026-08-25 to boot clean (client alive 1:55.828, Unity thread live confirmed, arming complete) after every by-name route was made to refuse. It is in OBSERVER MODE: its ~70 members are LazyCalls whose `ensure` calls il2cpp_object_get_class, which faults on this build, so the read path is blocked and both detours decline. It is safe to ship and it does not yet drive bots.",
       "inherits": [
         "aowl.list.core"
       ],
-      "entries": []
+      "entries": [
+        {
+          "id": "aowl.sain",
+          "enabled": true,
+          "note": "boots clean -- measured client alive 1:55.828 with Unity thread live; OBSERVER MODE, it drives nothing yet"
+        }
+      ]
     }
   ]
 }
