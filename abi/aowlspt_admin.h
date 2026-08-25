@@ -76,9 +76,13 @@ enum {
     AOWL_ADM_COUNT      = 12
 };
 
-/* ESP and godmode on, everything else off. Seeded once by the mod. */
-#define AOWL_ADM_DEFAULTS \
-    (((uint32_t)1 << AOWL_ADM_ESP) | ((uint32_t)1 << AOWL_ADM_GODMODE))
+/* EVERY cheat off. Seeded once by the mod.
+ *
+ * ESP and God mode used to default ON here. For a build handed to testers a
+ * cheat must default OFF -- the player opts in from the F6 menu or the settings
+ * screen. This is the same default the schema and config.json now carry; all
+ * three have to agree or the "default" depends on which one ran last. */
+#define AOWL_ADM_DEFAULTS  ((uint32_t)0)
 
 /* The menu label for one mode. Shared so the HUD and the mod's log agree. */
 static const char* aowl_admin_mode_name(int32_t bit) {
@@ -392,6 +396,66 @@ static int32_t       aowl_admin_god_patched = 0;
  * the boot crash this guard exists to prevent. */
 static const unsigned char AOWL_ADMIN_GOD_EXPECT[5] = { 0x48, 0x89, 0x5C, 0x24, 0x20 };
 
+/* ------------------------------------------------------------------
+ * The live GameWorld, borrowed from the host.
+ *
+ * MEASURED, not assumed: `EFT.GameWorld` is reached in the client through
+ * `Comfort.Common.Singleton<GameWorld>._instance` -- a static on a GENERIC
+ * INSTANTIATION, whose storage is allocated at runtime and therefore has no
+ * static address this mod could read. The old `worldSingleton()` looked up a
+ * non-generic field named "Instance" that does not exist on this build, so it
+ * returned NULL every frame and ESP was dark BY CONSTRUCTION.
+ *
+ * The host already caches the live world from its read-only detour on
+ * `EFT.GameWorld::RegisterPlayer` (RCX = the GameWorld). We RIDE that detour by
+ * reading its cache through an exported accessor. We deliberately do NOT bind
+ * our own detour: a second detour on one function overwrites the first's
+ * trampoline and silently kills the first feature (CLAUDE.md 5).
+ *
+ * Resolved lazily by GetProcAddress so an older host without the export is a
+ * clean "unavailable", not a load failure.
+ * ------------------------------------------------------------------ */
+
+typedef void*   (*AowlAdmGwFn)(void);
+typedef int32_t (*AowlAdmGwArmedFn)(void);
+static AowlAdmGwFn      aowl_adm_gw_fn    = 0;
+static AowlAdmGwArmedFn aowl_adm_gw_armed = 0;
+static int32_t          aowl_adm_gw_tried = 0;
+
+static void aowl_admin_gw_resolve(void) {
+    HMODULE h;
+    if (aowl_adm_gw_tried) return;
+    aowl_adm_gw_tried = 1;
+    h = GetModuleHandleA("aowlspt-host-il2cpp.dll");
+    if (!h) return;
+    aowl_adm_gw_fn = (AowlAdmGwFn)(void*)
+        GetProcAddress(h, "aowl_host_gameworld");
+    aowl_adm_gw_armed = (AowlAdmGwArmedFn)(void*)
+        GetProcAddress(h, "aowl_host_gameworld_armed");
+}
+
+/* The live GameWorld, or NULL. NULL is ambiguous on its own -- pair it with
+ * aowl_admin_gw_state() before reporting anything to a human. */
+static void* aowl_admin_gameworld(void) {
+    aowl_admin_gw_resolve();
+    if (!aowl_adm_gw_fn) return 0;
+    return aowl_adm_gw_fn();
+}
+
+/* Why there is no world, so a caller can say PASS / FAIL / INCONCLUSIVE rather
+ * than flattening all three into "not in a raid":
+ *   0 = no host export   (old host, or the mod is not running in the client)
+ *   1 = export present but NO detour armed -> nothing can ever populate the
+ *       cache: INCONCLUSIVE, and the fix is a host flag, not a raid
+ *   2 = armed, cache empty  -> genuinely not in a raid
+ *   3 = armed, world live   -> PASS */
+static int32_t aowl_admin_gw_state(void) {
+    aowl_admin_gw_resolve();
+    if (!aowl_adm_gw_fn) return 0;
+    if (aowl_adm_gw_armed && aowl_adm_gw_armed() == 0) return 1;
+    return aowl_adm_gw_fn() ? 3 : 2;
+}
+
 static int32_t aowl_admin_godmode(int32_t on, uint32_t rva) {
     HMODULE ga = GetModuleHandleA("GameAssembly.dll");
     if (!ga || rva == 0) return 0;
@@ -461,6 +525,208 @@ static void aowl_admin_mat_mul(const float* a, const float* b, float* out) {
             for (int k = 0; k < 4; k++) s += a[k*4 + r] * b[c*4 + k];
             out[c*4 + r] = s;
         }
+}
+
+
+/* ------------------------------------------------------------------ *
+ * WORLD -> SCREEN: the camera view-projection snapshot.
+ *
+ * ESP had real world positions and no way to turn one into a pixel. This is
+ * that last mile, and it is deliberately SPLIT ACROSS TWO THREADS:
+ *
+ *   * `aowl_admin_cam_sample()` CALLS Unity code and therefore may only run on
+ *     Unity's own thread. The mod drives it from `everyMain`, gated on the
+ *     host's `aowlspt.host::main_thread` answer reporting the drain has already
+ *     FIRED there (fact #136: arming il2cpp work before the drain is live kills
+ *     the client ~1.2s in). It writes 16 floats plus a generation counter.
+ *
+ *   * `aowl_admin_project()` above is pure arithmetic over those 16 floats and
+ *     runs on the mod's own thread, per entity, per frame. No Unity call, no
+ *     allocation, so the ESP data pass does not move threads.
+ *
+ * The three RVAs, MEASURED offline against D:/Games/Tarkov/GameAssembly.dll
+ * (build 1.1.0.1.46777) with `tools/il2cpp_resolve.py type 22882` +
+ * `bytes <rva> 32`, and each one DISASSEMBLED to establish its argument shape
+ * rather than inferred from its name:
+ *
+ *   UnityEngine.Camera::get_main @ 0x5260400 -- STATIC, 0 args -> Camera.
+ *     5260400: sub rsp,0x28 ; mov rax,[rip+0x1E727D5] ; test rax,rax ; jne ..
+ *     RCX carries only the hidden MethodInfo* and the body never reads it.
+ *     Byte-identical to the entry `abi/aowlspt_debugui.h` already ships, which
+ *     is an independent confirmation of the RVA rather than a copy of a guess.
+ *
+ *   UnityEngine.Camera::get_worldToCameraMatrix @ 0x525F2A0
+ *   UnityEngine.Camera::get_projectionMatrix    @ 0x525F380
+ *     Both return a Matrix4x4 -- 64 bytes, far larger than 8 -- so Win64 uses a
+ *     HIDDEN RETURN BUFFER (sret) and every argument shifts right by one:
+ *       48 89 5C 24 08   mov [rsp+8],rbx
+ *       57               push rdi
+ *       48 83 EC 20      sub rsp,0x20
+ *       48 8B 05 ..      mov rax,[rip+..]        <- the icall slot
+ *       0F 57 C0         xorps xmm0,xmm0
+ *       48 8B FA         mov rdi,rdx             <- RDX = this   (the Camera)
+ *       48 8B D9         mov rbx,rcx             <- RCX = retbuf (sret)
+ *       0F 11 01         movups [rcx],xmm0       <- zeroes the retbuf
+ *     so the call is (retbuf, this, MethodInfo*). This is the same shape
+ *     CLAUDE.md records for `RectTransform::get_rect`, and the OPPOSITE of the
+ *     Vector2 getters, which pack into RAX -- passing `this` in RCX here would
+ *     have written 64 bytes of matrix over the Camera object.
+ *
+ * The two matrix prologues differ ONLY in the RIP displacement (2F 3A E7 01 vs
+ * 5F 39 E7 01), so the 16-byte signatures below include it: they cannot match
+ * each other, and they cannot match this build's universal empty-body stub.
+ * ------------------------------------------------------------------ */
+
+#define AOWL_ADM_RVA_CAM_MAIN 0x5260400u
+#define AOWL_ADM_RVA_CAM_W2C  0x525F2A0u
+#define AOWL_ADM_RVA_CAM_PROJ 0x525F380u
+
+static const unsigned char AOWL_ADM_SIG_CAM_MAIN[16] = {
+    0x48,0x83,0xEC,0x28,0x48,0x8B,0x05,0xD5,0x27,0xE7,0x01,0x48,0x85,0xC0,0x75,0x18 };
+static const unsigned char AOWL_ADM_SIG_CAM_W2C[16] = {
+    0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,0x2F,0x3A,0xE7 };
+static const unsigned char AOWL_ADM_SIG_CAM_PROJ[16] = {
+    0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,0x5F,0x39,0xE7 };
+
+typedef void* (*AowlAdmCamMainFn)(void* methodInfo);
+typedef void  (*AowlAdmCamMatFn)(void* retbuf, void* self, void* methodInfo);
+
+static AowlAdmCamMainFn aowl_adm_cam_main_fn = 0;
+static AowlAdmCamMatFn  aowl_adm_cam_w2c_fn  = 0;
+static AowlAdmCamMatFn  aowl_adm_cam_proj_fn = 0;
+
+/* 0 = not attempted yet | 1 = GameAssembly.dll not loaded (transient) |
+ * 2 = a prologue did NOT byte-match, i.e. a Tarkov update moved these RVAs |
+ * 3 = all three bound. Never collapse 1 or 2 into "not in a raid". */
+static int32_t aowl_adm_cam_bind = 0;
+
+/* The published snapshot. `gen` is bumped only by a sample that produced a
+ * plausible matrix, so a consumer can tell "never sampled" from "sampled and
+ * refused". `stale` counts drains since the last good sample. */
+static float   aowl_adm_cam_vp[16];
+static int32_t aowl_adm_cam_gen   = 0;
+static int32_t aowl_adm_cam_stale = 0;
+static int32_t aowl_adm_cam_fail  = 0;   /* consecutive refusals: self-disable */
+#define AOWL_ADM_CAM_MAXFAIL 240         /* ~4s at 60fps before giving up      */
+
+/* Byte-verify one RVA and hand back a callable pointer, or NULL. The page is
+ * checked with the same VirtualQuery guard every other hop in this header uses,
+ * so a not-yet-mapped section is a refusal rather than a fault. */
+static void* aowl_admin_bind_rva(unsigned char* base, uint32_t rva,
+                                 const unsigned char* sig) {
+    unsigned char* p = base + rva;
+    if (!aowl_admin_readable(p, 16)) return 0;
+    if (memcmp(p, sig, 16) != 0) return 0;
+    return (void*)p;
+}
+
+static void aowl_admin_cam_resolve(void) {
+    HMODULE ga;
+    unsigned char* base;
+    if (aowl_adm_cam_bind != 0) return;
+    ga = GetModuleHandleA("GameAssembly.dll");
+    if (!ga) { aowl_adm_cam_bind = 1; return; }
+    base = (unsigned char*)ga;
+    aowl_adm_cam_main_fn = (AowlAdmCamMainFn)
+        aowl_admin_bind_rva(base, AOWL_ADM_RVA_CAM_MAIN, AOWL_ADM_SIG_CAM_MAIN);
+    aowl_adm_cam_w2c_fn = (AowlAdmCamMatFn)
+        aowl_admin_bind_rva(base, AOWL_ADM_RVA_CAM_W2C, AOWL_ADM_SIG_CAM_W2C);
+    aowl_adm_cam_proj_fn = (AowlAdmCamMatFn)
+        aowl_admin_bind_rva(base, AOWL_ADM_RVA_CAM_PROJ, AOWL_ADM_SIG_CAM_PROJ);
+    if (!aowl_adm_cam_main_fn || !aowl_adm_cam_w2c_fn || !aowl_adm_cam_proj_fn) {
+        aowl_adm_cam_bind = 2;                   /* prologue mismatch: refuse */
+        aowl_adm_cam_main_fn = 0;
+        aowl_adm_cam_w2c_fn  = 0;
+        aowl_adm_cam_proj_fn = 0;
+        return;
+    }
+    aowl_adm_cam_bind = 3;
+}
+
+/* State 1 must NOT latch -- GameAssembly.dll is simply not mapped yet when the
+ * mod loads, and latching it would report "unavailable" for the whole session
+ * over a condition that clears a second later. */
+static int32_t aowl_admin_cam_state(void) {
+    if (aowl_adm_cam_bind == 1) aowl_adm_cam_bind = 0;
+    aowl_admin_cam_resolve();
+    return aowl_adm_cam_bind;
+}
+
+/* A finite matrix that actually projects. This is a property of the FINISHED
+ * matrix, not a restatement of the call: an all-zero retbuf -- which is exactly
+ * what these getters leave behind if the icall slot is not filled in, since
+ * they zero the buffer before dispatching -- fails it, as does any NaN. */
+static int32_t aowl_admin_mat_sane(const float* m) {
+    int i;
+    float acc = 0.0f;
+    for (i = 0; i < 16; i++) {
+        float v = m[i];
+        if (v != v) return 0;                       /* NaN                    */
+        if (v > 1.0e12f || v < -1.0e12f) return 0;  /* infinity / absurd      */
+        acc += (v < 0.0f ? -v : v);
+    }
+    return acc > 1.0e-3f ? 1 : 0;                   /* not the zeroed retbuf  */
+}
+
+/* UNITY THREAD ONLY. Returns 1 when the snapshot was refreshed by this call.
+ *
+ * Returning 0 is never silent: the REASON is readable through
+ * aowl_admin_cam_state() / _gen() / _stale() / _disabled(), and the mod's
+ * status line and adminDiag() print it. Nothing here writes game memory. */
+static int32_t aowl_admin_cam_sample(void) {
+    void* cam;
+    float view[16];
+    float proj[16];
+    float vp[16];
+    int i;
+
+    if (aowl_adm_cam_fail >= AOWL_ADM_CAM_MAXFAIL) return 0;  /* self-disabled */
+    if (aowl_admin_cam_state() != 3) { aowl_adm_cam_fail++; return 0; }
+
+    cam = aowl_adm_cam_main_fn(0);       /* static: a NULL MethodInfo* is fine */
+    if (!cam || !aowl_admin_readable(cam, 16)) {
+        /* No main camera. Normal in the menu, and NOT a bind failure -- so it
+         * does not burn the fault budget, it only ages the snapshot. */
+        if (aowl_adm_cam_stale < 1000000) aowl_adm_cam_stale++;
+        return 0;
+    }
+    for (i = 0; i < 16; i++) { view[i] = 0.0f; proj[i] = 0.0f; }
+    aowl_adm_cam_w2c_fn(view, cam, 0);
+    aowl_adm_cam_proj_fn(proj, cam, 0);
+    if (!aowl_admin_mat_sane(view) || !aowl_admin_mat_sane(proj)) {
+        aowl_adm_cam_fail++;
+        if (aowl_adm_cam_stale < 1000000) aowl_adm_cam_stale++;
+        return 0;
+    }
+    aowl_admin_mat_mul(proj, view, vp);  /* VP = P * V, Unity column-major */
+    if (!aowl_admin_mat_sane(vp)) { aowl_adm_cam_fail++; return 0; }
+    for (i = 0; i < 16; i++) aowl_adm_cam_vp[i] = vp[i];
+    aowl_adm_cam_gen++;
+    aowl_adm_cam_stale = 0;
+    aowl_adm_cam_fail  = 0;
+    return 1;
+}
+
+static int32_t aowl_admin_cam_gen(void)   { return aowl_adm_cam_gen; }
+static int32_t aowl_admin_cam_stale(void) { return aowl_adm_cam_stale; }
+static int32_t aowl_admin_cam_disabled(void) {
+    return aowl_adm_cam_fail >= AOWL_ADM_CAM_MAXFAIL ? 1 : 0;
+}
+
+/* The projectable predicate that the ESP capability bit, the draw loop and
+ * adminDiag() all read, so the three cannot drift apart: bound, sampled at
+ * least once, sampled RECENTLY, and not self-disabled. */
+static int32_t aowl_admin_cam_ready(void) {
+    return (aowl_adm_cam_bind == 3 && aowl_adm_cam_gen > 0 &&
+            aowl_adm_cam_stale < 120 && aowl_adm_cam_fail < AOWL_ADM_CAM_MAXFAIL)
+           ? 1 : 0;
+}
+
+/* ANY thread. Project one world point through the published snapshot. */
+static int32_t aowl_admin_w2s(float x, float y, float z, int32_t w, int32_t h,
+                              float* sx, float* sy) {
+    if (!aowl_admin_cam_ready()) return 0;
+    return aowl_admin_project(aowl_adm_cam_vp, x, y, z, w, h, sx, sy);
 }
 
 #ifdef __cplusplus

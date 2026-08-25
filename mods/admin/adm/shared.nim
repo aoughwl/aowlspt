@@ -67,6 +67,18 @@ proc cProject(m: ptr cfloat; x, y, z: cfloat; w, h: int32;
               sx, sy: ptr cfloat): int32 {.importc: "aowl_admin_project", nodecl.}
 proc cMatMul(a, b, outp: ptr cfloat) {.importc: "aowl_admin_mat_mul", nodecl.}
 
+proc cGameWorld(): pointer {.importc: "aowl_admin_gameworld", nodecl.}
+proc cGwState(): int32 {.importc: "aowl_admin_gw_state", nodecl.}
+
+proc cCamSample(): int32 {.importc: "aowl_admin_cam_sample", nodecl.}
+proc cCamState(): int32 {.importc: "aowl_admin_cam_state", nodecl.}
+proc cCamReady(): int32 {.importc: "aowl_admin_cam_ready", nodecl.}
+proc cCamGen(): int32 {.importc: "aowl_admin_cam_gen", nodecl.}
+proc cCamStale(): int32 {.importc: "aowl_admin_cam_stale", nodecl.}
+proc cCamDisabled(): int32 {.importc: "aowl_admin_cam_disabled", nodecl.}
+proc cW2s(x, y, z: cfloat; w, h: int32; sx, sy: ptr cfloat): int32 {.
+  importc: "aowl_admin_w2s", nodecl.}
+
 proc cGodmode(on: int32; rva: uint32): int32 {.importc: "aowl_admin_godmode", nodecl.}
 proc cGodOn(): int32 {.importc: "aowl_admin_god_is_on", nodecl.}
 proc cGameAsm(): int32 {.importc: "aowl_admin_gameasm_present", nodecl.}
@@ -120,6 +132,108 @@ proc frameAdd*(s: AdminRegion; cx, top, bottom, health, maxHealth, distance: flo
 
 proc frameCommit*(s: AdminRegion) =
   if s != nil: cFrameCommit(s)
+
+proc modeName*(bit: int32): string =
+  ## The menu label for one mode.
+  ##
+  ## These duplicate `aowl_admin_mode_name` in `abi/aowlspt_admin.h` -- nimony
+  ## has no `$` for `cstring`, so the C function cannot be reused directly.
+  ## KEEP THE TWO IN SYNC; the header is the original and the HUD draws from it,
+  ## this copy only reaches the log and adminDiag().
+  case bit
+  of admEsp:       "ESP"
+  of admGodmode:   "God mode"
+  of admStamina:   "Infinite stamina"
+  of admNoRecoil:  "No recoil / sway"
+  of admNoWeight:  "No weight"
+  of admInstaHeal: "Instant heal"
+  of admAmmo:      "Unlimited ammo"
+  of admThermal:   "Thermal vision"
+  of admNightVis:  "Night vision"
+  of admFly:       "Fly / noclip"
+  of admTeleport:  "Teleport to marker"
+  of admTimeOfDay: "Set time of day"
+  else:            "?"
+
+proc hostGameWorld*(): pointer =
+  ## The live `EFT.GameWorld`, borrowed from the host's existing RegisterPlayer
+  ## detour cache. nil is AMBIGUOUS on its own -- always pair with gwState().
+  cGameWorld()
+
+proc gwState*(): int =
+  ## 0 no host export | 1 export but no detour armed (INCONCLUSIVE) |
+  ## 2 armed, no world (not in a raid) | 3 world live.
+  int(cGwState())
+
+proc gwStateText*(): string =
+  case gwState()
+  of 0: "no host export aowl_host_gameworld (host too old, or not in the client)"
+  of 1: "host export present but NO detour is armed -- set the host flag " &
+        "debugEsp or botDiag; this is INCONCLUSIVE, not \"no raid\""
+  of 2: "armed; no GameWorld cached yet (not in a raid)"
+  else: "GameWorld live"
+
+# --------------------------------------------------- world -> screen
+#
+# Two halves on two threads. `camSample` CALLS Unity (Camera::get_main plus the
+# two sret Matrix4x4 getters) and is legal ONLY on the game's own thread;
+# `worldToScreen` is pure arithmetic over the 16 floats that produced, and runs
+# on the mod's thread inside the per-frame ESP pass. See the block comment in
+# `abi/aowlspt_admin.h` for the measured RVAs and the sret shape.
+
+proc camSample*(): bool =
+  ## UNITY THREAD ONLY. Refresh the view-projection snapshot. True when this
+  ## call actually refreshed it.
+  cCamSample() != 0'i32
+
+proc camReady*(): bool =
+  ## Bound, sampled at least once, sampled recently, not self-disabled. The one
+  ## predicate the capability bit, the draw loop and adminDiag() all read.
+  cCamReady() != 0'i32
+
+proc camState*(): int =
+  ## 0 not attempted | 1 GameAssembly not mapped yet | 2 PROLOGUE MISMATCH (the
+  ## RVAs moved -- a Tarkov update) | 3 all three targets bound.
+  int(cCamState())
+
+proc camGen*(): int = int(cCamGen())
+proc camStale*(): int = int(cCamStale())
+proc camDisabled*(): bool = cCamDisabled() != 0'i32
+
+proc camStateText*(): string =
+  ## Why there is no projection, in words. Never collapses a bind failure or an
+  ## un-driven sampler into "not in a raid".
+  if camDisabled():
+    return "SELF-DISABLED after repeated refusals; last bind state " &
+           $camState()
+  case camState()
+  of 0, 1:
+    "GameAssembly.dll is not mapped yet -- nothing has been attempted"
+  of 2:
+    "PROLOGUE MISMATCH: Camera::get_main@0x5260400 / " &
+    "get_worldToCameraMatrix@0x525F2A0 / get_projectionMatrix@0x525F380 do " &
+    "not byte-match this build; refusing to call them. Re-measure with " &
+    "tools/il2cpp_resolve.py"
+  else:
+    if camGen() == 0:
+      "bound, but the Unity-thread sampler has never produced a matrix " &
+      "(no main camera yet, or the everyMain driver did not arm)"
+    elif camStale() >= 120:
+      "bound and sampled " & $camGen() & " times, but the last good sample " &
+      "was " & $camStale() & " drains ago (no main camera right now)"
+    else:
+      "live (gen " & $camGen() & ")"
+
+proc worldToScreen*(x, y, z: float; w, h: int; sx, sy: var float): bool =
+  ## ANY thread. World point -> pixel through the published snapshot. False when
+  ## the point is behind the camera or no snapshot is live.
+  var fx = 0.0'f32
+  var fy = 0.0'f32
+  let ok = cW2s(cfloat(x), cfloat(y), cfloat(z), int32(w), int32(h),
+                addr fx, addr fy)
+  sx = float(fx)
+  sy = float(fy)
+  result = ok != 0'i32
 
 proc godmodePatch*(on: bool; rva: uint32): bool =
   ## Apply (or revert) the God mode byte-patch on the damage function at `rva`.
