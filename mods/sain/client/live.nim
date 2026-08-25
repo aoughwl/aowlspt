@@ -116,12 +116,22 @@ proc openLive*(): bool =
   ## it has succeeded; retried while it has not, because "the game has not got
   ## that far yet" and "this is not the game" look the same from here and only
   ## one of them is final.
+  ##
+  ## The three sub-steps announce themselves, for the reason `mods/fov`'s
+  ## `openRuntime` does: a crash inside `openIl2Cpp` and a crash inside
+  ## `missingEssential` are different bugs and "somewhere in openLive" cannot
+  ## tell them apart.
   if gLive:
     return true
+  info "sain: openLive step 1/3 -- opening GameAssembly.dll from the mod"
   gRt = openIl2Cpp()
+  info "sain: openLive step 2/3 -- GameAssembly.dll bound, loaded=" &
+       $gRt.loaded
   if not gRt.loaded:
     return false
   let missing = missingEssential(gRt)
+  info "sain: openLive step 3/3 -- essential entry points checked, " &
+       $missing.len & " missing"
   if missing.len > 0:
     # Refusing here rather than at the first call: a runtime missing
     # `il2cpp_object_get_class` cannot do lazy binding at all, and finding that
@@ -133,8 +143,187 @@ proc openLive*(): bool =
   result = true
 
 # ---------------------------------------------------------------------------
+# THE LIVE GameWorld, BORROWED FROM THE HOST
+# ---------------------------------------------------------------------------
+#
+# THE GENERAL RULE THIS BUILD ESTABLISHES, and everything below is one instance
+# of it: **a by-name bind that "succeeds" proves nothing.** Resolving is
+# harmless; CALLING is what kills. Only a byte-verified static RVA, a measured
+# static field offset, or a host export is callable.
+#
+# `EFT.GameWorld::get_Instance` DOES NOT EXIST on this build. MEASURED:
+# `tools/il2cpp_resolve.py <GameAssembly.dll> <metadata.dec> type 6172
+# --shared` dumps all 409 members of `EFT.GameWorld` and there is not one
+# case-insensitive match for "instance". `mods/fov` measured the same thing
+# independently (fact #136).
+#
+# What used to happen here is the whole bug, in three steps:
+#   1. `bindAll` resolved `get_Instance` BY NAME and reported success.
+#   2. Fact #35 -- by-name resolution returns NON-NIL handles into UNMAPPED
+#      memory -- so that "success" was a garbage pointer that passed a nil
+#      check and was reported in the log as a working binding.
+#   3. `probe` step 5/7 CALLED through it: a jump into unmapped memory, and the
+#      client died instantly, with no dump and no event-log entry.
+#
+# `Comfort.Common.Singleton<GameWorld>._instance` is closed too: it is a static
+# on a GENERIC INSTANTIATION, whose storage is allocated at runtime and has no
+# static address at all (measured by the admin work; see `abi/aowlspt_admin.h`).
+#
+# So the world is BORROWED. The host caches it from its own read-only detour on
+# `EFT.GameWorld::RegisterPlayer` (RCX = the GameWorld) and exports it
+# read-only. We ride that detour rather than binding a second one, because a
+# second detour on one function overwrites the first's trampoline and silently
+# kills the first feature (CLAUDE.md 5). This installs nothing, patches
+# nothing and writes nothing.
+#
+# Resolved lazily through `GetProcAddress`, so an older host is a clean
+# "unavailable" rather than a load failure. Same route `mods/admin` takes in
+# `abi/aowlspt_admin.h`; written in nimony here rather than through that header
+# because that header is admin's and this needs two symbols, not a C shim.
+#
+# NULL IS THREE ANSWERS AND MUST NOT BE FLATTENED. `gwState` keeps them apart,
+# and CLAUDE.md 9b is why: "I could not look" is not "no raid".
+
+# `GetModuleHandleA`, not the W form `aowlspt/il2cpp` uses internally: the
+# module name is pure ASCII and the wide path would need `WideCString`, which
+# that module does not re-export. One less type crossing a module boundary for
+# no gain.
+# `GetModuleHandleA`, not the W form `aowlspt/il2cpp` uses internally: the
+# module name is pure ASCII and the wide path would need `WideCString`, which
+# that module does not re-export.
+proc gwGetModuleHandleA(name: cstring): Il2CppPtr {.
+  stdcall, dynlib: "kernel32", importc: "GetModuleHandleA", sideEffect.}
+proc gwGetProcAddress(module: Il2CppPtr; name: cstring): Il2CppPtr {.
+  stdcall, dynlib: "kernel32", importc: "GetProcAddress", sideEffect.}
+
+# TWO ONE-LINE THUNKS, and they are here rather than in `abi/aowlspt_shim.h`
+# on purpose. nimony refuses `cast[proc(...)](pointer)` outright, so a raw
+# address has to be called through C. The shim header has `aowl_p_v` already
+# but no zero-argument int32 form, and adding one to a shared ABI header drops
+# every build cache and forces a full 18-minute rebuild (CLAUDE.md 3) for two
+# lines used by one file. Local is cheaper and changes nothing anyone else
+# compiles.
+#
+# The int32 form is a REAL int32 thunk rather than reading the low half of
+# `aowl_p_v`'s pointer: an int32 return leaves the upper 32 bits of RAX
+# undefined, so a pointer-shaped read of it would be a plausible non-zero
+# answer for a function that returned 0. That is the kind of check that cannot
+# fail, and this is a three-way state where the difference decides whether a
+# human is told "no raid" or "nothing is watching".
+{.emit: """
+#include <stdint.h>
+static void*   sain_gw_p_v  (void* f) { return ((void*  (*)(void))f)(); }
+static int32_t sain_gw_i32_v(void* f) { return ((int32_t(*)(void))f)(); }
+""".}
+
+proc sainGwPV(f: Il2CppPtr): Il2CppPtr {.importc: "sain_gw_p_v", nodecl.}
+proc sainGwI32V(f: Il2CppPtr): int32 {.importc: "sain_gw_i32_v", nodecl.}
+
+var gGwFn: Il2CppPtr = cast[Il2CppPtr](0)
+var gGwArmedFn: Il2CppPtr = cast[Il2CppPtr](0)
+var gGwTried = false
+
+proc gwResolve() =
+  if gGwTried:
+    return
+  gGwTried = true
+  var hostName = "aowlspt-host-il2cpp.dll"
+  let h = gwGetModuleHandleA(toCString(hostName))
+  if h == nil:
+    return
+  var n1 = "aowl_host_gameworld"
+  var n2 = "aowl_host_gameworld_armed"
+  gGwFn = gwGetProcAddress(h, toCString(n1))
+  gGwArmedFn = gwGetProcAddress(h, toCString(n2))
+
+proc gwState*(): int =
+  ## 0 no host export (host too old, or this is not the client)
+  ## 1 export present but NO detour armed -- INCONCLUSIVE, not "no raid"
+  ## 2 armed, cache empty -- genuinely not in a raid
+  ## 3 world live
+  gwResolve()
+  if gGwFn == nil:
+    return 0
+  if gGwArmedFn != nil and sainGwI32V(gGwArmedFn) == 0'i32:
+    return 1
+  if sainGwPV(gGwFn) == nil:
+    return 2
+  result = 3
+
+proc gwStateText*(): string =
+  case gwState()
+  of 0: "no host export aowl_host_gameworld -- this host predates it, or " &
+        "this mod is not running in the client. There is no fallback: " &
+        "EFT.GameWorld::get_Instance does not exist on this build (measured, " &
+        "409 members, no match for 'instance') and none is invented"
+  of 1: "the host exports the world but NO detour is armed to populate it -- " &
+        "set the host flag debugEsp or botDiag. INCONCLUSIVE, not 'no raid'"
+  of 2: "armed; no GameWorld cached yet, which is what a menu looks like"
+  else: "GameWorld live, borrowed from the host's RegisterPlayer cache"
+
+# ---------------------------------------------------------------------------
 # Asking the runtime what a method is
 # ---------------------------------------------------------------------------
+#
+# AND WHY IT NO LONGER ASKS.
+#
+# The three procs below -- `signatureOf`, `staticMethodOf`, `payloadSizeOf` --
+# are the ONLY places this mod resolves anything by NAME through the IL2CPP C
+# API. Every one of them is `findClass` + `findMethod` (or `findClass` +
+# `classInstanceSize`) followed by a DEREFERENCE of the handle that comes back.
+#
+# On this build that is fatal. Fact #35, measured by a two-thread controlled
+# experiment: `il2cpp_class_from_name` and
+# `il2cpp_class_get_method_from_name` return NON-NIL pointers into UNMAPPED
+# memory -- on Unity's own main thread as much as anywhere else. So the `if
+# cls == nil` guards below are checks that CANNOT FAIL (CLAUDE.md 9b), the
+# resolution reads as a success, and the process dies at the first field read
+# through the handle.
+#
+# MEASURED, in this client, by the breadcrumb run this gate was written for:
+# the last line the mod ever logged was `bindProbe 1/2 --
+# UnityEngine.Physics::Raycast`, and `bindRaycast`'s first statement is
+# `signatureOf`. `armAimHook` and `armDamageHook` call it too and would have
+# reached the identical fault about a tenth of a second later.
+#
+# The other ~70 bindings survive because they never do this: `lazy` builds a
+# record and resolves against the class of a receiver at CALL time, and
+# `bindMethodAs` goes through the HOST's name index rather than the runtime's.
+#
+# So: refused, once, loudly, unless `allowIl2cppReflection` is set in
+# `config.json`. A feature that declines and says so beats one that kills the
+# client. What each caller loses is written at the call site, not here.
+var gAllowReflection = false
+var gReflectionNoted = false
+
+proc setAllowReflection*(v: bool) =
+  ## From `onLoad`, out of the preset. Default false.
+  gAllowReflection = v
+
+proc reflectionAllowed*(): bool = gAllowReflection
+
+const ReflectionRefusal* =
+  "IL2CPP by-name resolution is refused on this build: " &
+  "il2cpp_class_from_name and il2cpp_class_get_method_from_name return " &
+  "NON-NIL handles into unmapped memory (fact #35), so a nil check passes " &
+  "and the first dereference kills the client -- measured, this mod died " &
+  "inside exactly that call. Set allowIl2cppReflection in config.json to " &
+  "re-measure it on a future build."
+
+proc reflectionRefused*(where: string = ""): bool =
+  ## True when the caller must not resolve by name. Says so once per session:
+  ## three callers times a retry loop would otherwise be a log full of one
+  ## sentence. Callers that write their own refusal into a `why` string pass
+  ## no `where` and say the rest themselves.
+  if gAllowReflection:
+    return false
+  if not gReflectionNoted:
+    gReflectionNoted = true
+    warn "sain: " & ReflectionRefusal
+  if where.len > 0:
+    debug "sain: by-name resolution refused for " & where
+  result = true
+
 
 proc signatureOf*(owner, member: string; argc: int;
                   params: var seq[string]; ret: var string): bool =
@@ -153,6 +342,8 @@ proc signatureOf*(owner, member: string; argc: int;
   params = @[]
   ret = ""
   if not gLive:
+    return false
+  if reflectionRefused(owner & "::" & member):
     return false
   let cls = findClass(gRt, owner)
   if cls == nil:
@@ -672,6 +863,23 @@ proc ensure*(l: var LazyCall; obj: Il2CppPtr): bool =
   ## `il2cpp_object_get_class` and one pointer compare.
   if obj == nil or not gLive:
     return false
+  # AND THE SAME REFUSAL, at the root of the whole lazy table.
+  #
+  # This is the widest consequence of fact #35 and it is worth stating plainly:
+  # every one of the ~70 members in `bindAll` is a `LazyCall`, and EVERY
+  # `LazyCall` becomes callable only by coming through here -- one
+  # `il2cpp_object_get_class` on the receiver, then a class-based method
+  # lookup. `il2cpp_object_get_class` is on CLAUDE.md 5's list of reflection
+  # entry points that FAULT on this build, and the lookup after it is the same
+  # unmapped-handle path that killed the client at `get_Instance`.
+  #
+  # So the mod's whole read path is blocked by construction here, not merely
+  # its two entry points. Refusing at this one choke point is what makes that
+  # a degraded mod rather than a dead client: `ensure` answers "not callable",
+  # every sensor and every driving call declines, and each one already has a
+  # `why` string that says so.
+  if reflectionRefused():
+    return false
   let c = objectClass(gRt, obj)
   if c == nil:
     return false
@@ -1100,8 +1308,15 @@ proc bindAll*() =
   ## Fill the table. Called once, from the first tick on which the runtime is
   ## up -- never from `onLoad`, where the game's assemblies do not exist and
   ## every binding would correctly refuse.
+  ##
+  ## Phase-by-phase in the log, and only ever once (`gB.ready` guards the whole
+  ## proc). Two of these phases call the runtime's own name lookups and two of
+  ## them only fill a record; a crash that stops mid-table has to say which,
+  ## because `bindAll` is 70-odd bindings and "somewhere in bindAll" is not an
+  ## answer.
   if gB.ready:
     return
+  info "sain: bindAll phase 1/5 -- float readers"
   initFloatReaders()
 
   # The two static entry points. `EFT.GameWorld::get_Instance` is the shape
@@ -1111,24 +1326,48 @@ proc bindAll*() =
   # is a real gap rather than something to paper over. The reflective fallback
   # below covers the case where the method exists but its signature does not
   # classify.
-  gB.worldInstance = bindMethodAs(gRt, "EFT.GameWorld", "get_Instance",
-                                  [], fkPtr)
-  gB.worldWhy = gB.worldInstance.why
-  gB.worldMethod = gB.worldInstance.info
-  if not gB.worldInstance.ok:
-    let c = findClass(gRt, "EFT.GameWorld")
-    if c != nil:
-      gB.worldMethod = findMethod(gRt, c, "get_Instance", 0)
+  # PHASE 2 IS NOW A REFUSAL, and it is the fix for the crash this file's own
+  # header block describes. `EFT.GameWorld::get_Instance` does not exist on
+  # this build -- measured, 409 members, no match for "instance" -- so it is
+  # not resolved, not bound and not called. The world comes from `gwState` /
+  # the host export instead.
+  #
+  # The `findClass` + `findMethod` fallback that used to sit here was the
+  # worst part: it ran precisely WHEN the bind had failed, and handed back a
+  # non-nil pointer into unmapped memory for a method that does not exist.
+  info "sain: bindAll phase 2/5 -- EFT.GameWorld::get_Instance is NOT bound: " &
+       "it does not exist on this build (measured offline, 409 members of " &
+       "EFT.GameWorld, no match for \"instance\"). The live world is " &
+       "borrowed from the host export instead"
+  gB.worldInstance = emptyBinding()
+  gB.worldMethod = cast[Il2CppMethod](0)
+  gB.worldWhy = "EFT.GameWorld::get_Instance does not exist on this build; " &
+                "the world is borrowed from the host -- " & gwStateText()
 
-  gB.worldAlive = bindMethodAs(gRt, "EFT.GameWorld", "get_AllAlivePlayersList",
-                               [], fkPtr)
-  gB.aliveWhy = gB.worldAlive.why
-  gB.aliveMethod = gB.worldAlive.info
-  if not gB.worldAlive.ok:
-    let c = findClass(gRt, "EFT.GameWorld")
-    if c != nil:
-      gB.aliveMethod = findMethod(gRt, c, "get_AllAlivePlayersList", 0)
+  # PHASE 3 IS THE SAME LANDMINE, one step further along, and it had never
+  # executed because the process died at phase 2's call. MEASURED in the same
+  # 409-member dump: `EFT.GameWorld` has NO `get_AllAlivePlayersList` either.
+  # There is no getter at all.
+  #
+  # What there IS, from `il2cpp_resolve.py fields EFT.GameWorld`, is the plain
+  # instance field:
+  #
+  #     0x1c8   inst   AllAlivePlayersList   List<Player>   EFT.GameWorld
+  #
+  # That is a real, measured, static offset on a NON-generic type, which is
+  # exactly the toolkit CLAUDE.md 5 says still works. It is recorded here and
+  # read in `alivePlayers` below, off a world pointer the host validated --
+  # never off an offset that could read null.
+  info "sain: bindAll phase 3/5 -- EFT.GameWorld::get_AllAlivePlayersList is " &
+       "NOT bound: no such getter exists on this build. The list is read as " &
+       "the measured instance field AllAlivePlayersList @0x1c8 instead"
+  gB.worldAlive = emptyBinding()
+  gB.aliveMethod = cast[Il2CppMethod](0)
+  gB.aliveWhy = "no get_AllAlivePlayersList on this build; reading the " &
+                "measured field AllAlivePlayersList @0x1c8 off the borrowed " &
+                "world"
 
+  info "sain: bindAll phase 4/5 -- the lazy member table (~70 names)"
   gB.listCount = lazy("get_Count")
   gB.listItem = lazyAs("get_Item", [fkI32], fkPtr)
 
@@ -1210,6 +1449,8 @@ proc bindAll*() =
   # types back and refuses when the first is not a `Vector3` -- so a build
   # whose one-argument `GoToPoint` takes something else gets no movement and
   # says so, rather than a bot walking to an address reinterpreted as a float.
+  info "sain: bindAll phase 5/5 -- the gated driving calls, whose gates read " &
+       "declared parameter types back out of the runtime"
   gB.mvGoTo = withGate(lazy("GoToPoint", 1'i32), dsVectorFirst)
   gB.mvGoTo.argcAlts = @[2'i32, 3'i32, 4'i32, 5'i32, 6'i32]
   # `Sprint` was `lazyAs([fkBool])`, which *stated* the signature rather than
@@ -1224,6 +1465,7 @@ proc bindAll*() =
   gB.stLookTo.argcAlts = @[2'i32]
   gB.sdShoot = withGate(lazy("Shoot"), dsNoArgs)
 
+  info "sain: bindAll complete -- all five phases returned"
   gB.ready = true
 
 proc reportOne(name: string; l: LazyCall) =
@@ -1419,6 +1661,8 @@ proc payloadSizeOf*(tn: string): int =
   result = 0
   if tn.len == 0 or not gLive:
     return
+  if reflectionRefused(tn):
+    return
   let c = findClass(gRt, tn)
   if c == nil:
     return
@@ -1440,6 +1684,8 @@ proc staticMethodOf*(owner, member: string; argc: int): Il2CppMethod =
   ## `il2cpp_runtime_invoke` and the caller is told as much in the log.
   result = cast[Il2CppMethod](0)
   if not gLive:
+    return
+  if reflectionRefused(owner & "::" & member):
     return
   let cls = findClass(gRt, owner)
   if cls == nil:
@@ -1487,34 +1733,59 @@ proc shapedSizeAccepted*(sz: int): bool =
 # ---------------------------------------------------------------------------
 
 proc worldObject*(): Il2CppPtr =
-  ## `GameWorld.Instance`, or null between raids -- which is an ordinary answer
-  ## rather than a failure.
+  ## The live `EFT.GameWorld`, borrowed from the host. Null is an ORDINARY
+  ## answer between raids and an INCONCLUSIVE one when no detour is armed --
+  ## `gwStateText()` is what tells the two apart and every caller that reports
+  ## this to a human must use it.
+  ##
+  ## This makes NO call into game code. That is the entire point: the call it
+  ## used to make was into a method that does not exist, through a handle into
+  ## unmapped memory, and it killed the client.
   result = cast[Il2CppPtr](0)
-  if not gLive or not gB.ready:
-    return
-  if gB.worldInstance.ok:
-    var a = noArgs()
-    return callPtr(gB.worldInstance, cast[Il2CppPtr](0), a)
-  if gB.worldMethod == nil:
-    return
-  result = reflect(gB.worldMethod, cast[Il2CppPtr](0), cast[Il2CppPtr](0))
+  if gwState() == 3:
+    gwResolve()
+    if gGwFn != nil:
+      result = sainGwPV(gGwFn)
+
+const AliveListOffset* = 0x1c8'i32
+  ## `EFT.GameWorld.AllAlivePlayersList`, a `List<Player>` instance field.
+  ## MEASURED: `tools/il2cpp_resolve.py fields EFT.GameWorld`, which reads
+  ## `Il2CppMetadataRegistration.fieldOffsets` and self-checks against
+  ## `System.String._stringLength@0x10`. NOT guessed, and there is no getter to
+  ## use instead -- see `bindAll` phase 3.
 
 proc alivePlayers*(world: Il2CppPtr): Il2CppPtr =
+  ## The alive-players list, as a raw field read off a world the HOST validated
+  ## and handed us. One hop, one measured offset, no call into game code.
   result = cast[Il2CppPtr](0)
   if world == nil:
     return
-  if gB.worldAlive.ok:
-    var a = noArgs()
-    return callPtr(gB.worldAlive, world, a)
-  if gB.aliveMethod == nil:
-    return
-  result = reflect(gB.aliveMethod, world, cast[Il2CppPtr](0))
+  var f = FieldBinding(ok: true, why: "AllAlivePlayersList@0x1c8 (measured)",
+                       target: "EFT.GameWorld.AllAlivePlayersList",
+                       offset: AliveListOffset, kind: fkPtr, bindNs: 0'i64)
+  result = readPtr(f, world)
+
+proc listLenWhy*(): string =
+  ## Why there is no count. Read into the log rather than asserted, because a
+  ## count of 0 and "I cannot count" are different answers and reporting the
+  ## second as the first is the silent decline CLAUDE.md 6 forbids.
+  result = "List<Player> cannot be counted on this build. `get_Count` is a " &
+           "SHARED GENERIC, so it needs a real MethodInfo* -- a NULL one is " &
+           "only safe for non-generics -- and the only route to one here is " &
+           "by-name resolution, which returns a handle into unmapped memory " &
+           "(fact #35). The field route is closed too: `List`1._size` has " &
+           "offset 0 in the metadata table because a generic instantiation's " &
+           "field offsets are allocated at RUNTIME, so there is no static " &
+           "number to read and this mod will not guess one. Settling it needs " &
+           "a LIVE measurement -- `dump`/`scan` on a real list pointer inside " &
+           "a raid through the inspector -- not another offline pass"
 
 proc listLen*(list: Il2CppPtr): int =
+  ## Always 0, and `listLenWhy()` says why. It used to call `get_Count` through
+  ## a by-name binding; on this build that is the same unmapped-memory jump
+  ## that killed the client at `get_Instance`, and it had simply never been
+  ## reached.
   result = 0
-  if list == nil:
-    return
-  result = callIntOn(gB.listCount, list, 0)
 
 proc listAt*(list: Il2CppPtr; index: int): Il2CppPtr =
   ## `List<T>.get_Item(int)`.

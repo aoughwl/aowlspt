@@ -64,6 +64,28 @@ type
     ## every host that has not grown the drain. `driveStats()` says which path
     ## a session actually took, so a log distinguishes the two.
     driveFromHostThread*: bool
+    ## Whether this mod may use IL2CPP **by-name** resolution at all.
+    ##
+    ## Default **false**, and that default is a measured fact rather than
+    ## caution. On this build `il2cpp_class_from_name` /
+    ## `il2cpp_class_get_method_from_name` return NON-NIL handles into
+    ## UNMAPPED memory (fact #35, a two-thread controlled experiment; it is
+    ## dead on Unity's own thread too). A `nil` check therefore passes and the
+    ## first dereference of the returned `MethodInfo*` takes the process down.
+    ##
+    ## MEASURED here, `D:\Aowlspt\hostlogs\` breadcrumb run: the client died
+    ## inside `bindProbe 1/2`, whose first statement is `signatureOf` --
+    ## `findClass` + `findMethod` + `methodParamCount`. Nothing else in this
+    ## mod's arming path resolves by name (`lazy` builds a record and resolves
+    ## per receiver at CALL time; `bindMethodAs` goes through the host's own
+    ## name index), which is exactly why the other ~70 bindings survived and
+    ## this one did not.
+    ##
+    ## It is a switch and not a constant so the fact stays falsifiable: fact
+    ## #35 is scope-keyed to this GameAssembly.dll, and after a Tarkov update
+    ## someone can flip this to re-measure rather than re-derive. Turning it on
+    ## is turning on a known process-killer on THIS build.
+    allowIl2cppReflection*: bool
 
 const RoleCount = 8      ## must match the number of `BotRole` members
 
@@ -207,7 +229,9 @@ proc loadPreset*(): Preset =
       doc.field("server.neutraliseLocationModifiers").asBool(true),
     logDecisions: doc.field("logDecisions").asBool(false),
     driveFromHostThread:
-      doc.field("driveFromHostThread").asBool(true))
+      doc.field("driveFromHostThread").asBool(true),
+    allowIl2cppReflection:
+      doc.field("allowIl2cppReflection").asBool(false))
 
   # The difficulty scale is folded in here rather than at every spawn: a bot
   # spawning gets `resolvedFor(preset.byRole[role], personality, scale)` and

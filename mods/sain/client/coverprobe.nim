@@ -131,6 +131,44 @@ proc sampleCostNs*(): int64 =
   result = gSampleNs div int64(gSamples)
 
 proc bindRaycast() =
+  # THE REFUSAL COMES FIRST, and it is the reason this file exists in its
+  # current shape. `signatureOf` below is `findClass` + `findMethod` +
+  # dereference, and on this build that sequence is what killed the client --
+  # MEASURED: the last line the mod ever logged was this function's own
+  # breadcrumb. See `client/live.nim` and fact #35.
+  #
+  # The offline route is already measured and is written down here so the next
+  # agent does not re-derive it. From
+  # `tools/il2cpp_resolve.py <GameAssembly.dll> <metadata.dec> type 29163
+  # --shared` (`UnityEngine.Physics`, image UnityEngine.PhysicsModule.dll):
+  #
+  #   bool Raycast(Vector3 origin, Vector3 direction, float maxDistance)
+  #     rid=45  arity=3  RVA=0x5328830   NOT [shared]
+  #     prologue 48 89 5C 24 08 57 48 83 EC 70 80 3D 51 D9 DA 01
+  #
+  # and it disambiguates what this file's own header warns cannot be
+  # disambiguated through the C API: there are THREE arity-3 `Raycast`
+  # overloads (rid 45, 50, 52) and the runtime hands back whichever it meets
+  # first.
+  #
+  # It is NOT wired up, deliberately. Two things are missing and neither is a
+  # detail: a mod has no byte-verified call-by-RVA facility (nothing in
+  # `aowlspt/il2cpp`, `aowlspt/fast` or `aowlspt/game` takes an RVA), and the
+  # ARGUMENT CONVENTION for two by-value `Vector3`s into an il2cpp static is
+  # unverified -- this file's own header already says `aowlspt/fast` refuses
+  # that shape. Asserting it would be a guess that returns a plausible bool,
+  # which is the failure this mod is arranged against. So the sensor declines.
+  if reflectionRefused():
+    gRayWhy = "refused: " & ReflectionRefusal &
+              " The cover sensor is OFF, so there are no cover points and " &
+              "the cover decisions stay unreachable -- bots fight, search " &
+              "and flank without taking cover. The offline RVA for the " &
+              "right overload is measured and recorded in the source " &
+              "(0x5328830, not shared); wiring it up needs a byte-verified " &
+              "call-by-RVA path for mods and a verified argument convention " &
+              "for two by-value Vector3s, and this mod will not assert " &
+              "either one"
+    return
   var params: seq[string] = @[]
   var ret = ""
   if not signatureOf(RaycastOwner, RaycastMember, 3, params, ret):
@@ -165,6 +203,25 @@ proc bindRaycast() =
             "assert a convention for a static"
 
 proc bindNavMesh() =
+  # Same refusal, same reason, and this one has NEVER RUN on this client: the
+  # process died in `bindRaycast` above before reaching it. Its offline route
+  # is measured too, from `type 30426 --shared` (`UnityEngine.AI.NavMesh`,
+  # image UnityEngine.AIModule.dll):
+  #
+  #   bool SamplePosition(Vector3, NavMeshHit, float, int)
+  #     rid=48  arity=4  RVA=0x5238930   NOT [shared]
+  #
+  # It additionally needs `payloadSizeOf(NavMeshHit)`, which is `findClass` +
+  # `classInstanceSize` -- the same dead path -- so an RVA alone would not be
+  # enough here even once the call path exists.
+  if reflectionRefused():
+    gNavWhy = "refused: " & ReflectionRefusal &
+              " The navmesh filter is OFF. It is a filter on a sensor that " &
+              "is itself off, so nothing further is lost today. Offline RVA " &
+              "0x5238930 (not shared) is recorded in the source, but sizing " &
+              "the `out NavMeshHit` buffer needs the same dead by-name path, " &
+              "so this one needs more than an RVA"
+    return
   var params: seq[string] = @[]
   var ret = ""
   if not signatureOf(NavMeshOwner, NavMeshMember, 4, params, ret):
@@ -221,8 +278,14 @@ proc bindProbe*() =
     gRayWhy = "refused: no IL2CPP runtime is bound in this process"
     gNavWhy = gRayWhy
     return
+  # Named separately: these two resolve UnityEngine statics rather than EFT
+  # members, so a fault in one of them is a different bug from a fault in
+  # `bindAll`, and a single "bindProbe" line could not say which.
+  info "sain: bindProbe 1/2 -- UnityEngine.Physics::Raycast"
   bindRaycast()
+  info "sain: bindProbe 2/2 -- UnityEngine.AI.NavMesh::SamplePosition"
   bindNavMesh()
+  info "sain: bindProbe complete"
 
 proc probeState*(): string =
   ## One line each, for `report()`. Both halves always, because "the cover

@@ -7,6 +7,9 @@
   "_driveFromHostThread": "Whether the five driving calls (GoToPoint, Sprint, LookToPoint, Shoot, and the self-actions) may be made from the host's own thread on a host whose onMainThread drain has never fired. When the drain has fired they are queued and executed on Unity's thread regardless, which is what they need. Set false to withhold them instead: bots then decide and do not move, which is the safe direction and the visibly broken one. Either way /sain/status and the log say which path the session took.",
   "driveFromHostThread": true,
 
+  "_allowIl2cppReflection": "Whether this mod may resolve IL2CPP types and methods BY NAME (il2cpp_class_from_name / il2cpp_class_get_method_from_name). Default false, and that is a measured fact rather than caution: on this build those calls return NON-NIL handles into UNMAPPED memory, so the nil check passes and the first dereference kills the client. The mod was measured dying inside exactly that call while binding UnityEngine.Physics::Raycast. With it false the cover sensor, the navmesh filter, the aim postfix and the damage postfix all decline and say why in the log; suppression falls back to the health delta and bots fight without taking cover. Turn it on only to re-measure the fact on a future Tarkov build.",
+  "allowIl2cppReflection": false,
+
   "_selfTestRuntime": "A GameAssembly.dll for the `--side sim` self-test to bind against, so it reports real bindings offline. Empty -- which is what ships -- means the process, and under aowlspt-sim there is no runtime at all. It must be an ABSOLUTE path: a relative one resolves against whatever directory the host was started in, which in an install is the game's own directory, and it is refused with that reason. `aowl test` and `aowl run` set AOWLSPT_SELFTEST_RUNTIME to the stand-in runtime tests/mockil2cpp builds, which is why this key is empty here and nothing ships a fixture path into an install.",
   "selfTestRuntime": "",
 

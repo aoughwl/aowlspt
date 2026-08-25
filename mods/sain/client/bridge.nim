@@ -115,6 +115,28 @@ var gCapability = capNone
 var gAnnounced = false
 var gProbeNote = ""
 
+# ---------------------------------------------------------------------------
+# Breadcrumbs through the arming path
+#
+# MEASURED, from the archived crashing run `D:\Aowlspt\hostlogs\sain-crash.log`:
+# `invoke_main now runs on Unity's main thread` at 0:00:08.032, the client dead
+# by 0:00:08.141, and this mod logged NOTHING in between. It could not: the
+# first line `probe` produces comes from `announce`, which runs AFTER every hop
+# below, so "somewhere in the arming path" was the whole of what a crash could
+# say and one more guess costs another launch. `mods/fov`'s `openRuntime` grew
+# `step N/3` breadcrumbs for exactly this reason and they are what named its
+# failing sub-step.
+#
+# FIRST PASS ONLY. `probe` is re-called on a two-second poll between raids; a
+# trace that repeated forever would be a standing cost for an answer that only
+# ever matters once. `gCrumbsDone` is set when a pass reaches the end.
+var gCrumbsDone = false
+var gProbePasses = 0
+
+proc crumb(s: string) =
+  if not gCrumbsDone:
+    info "sain: arming " & s
+
 proc capability*(): Capability = gCapability
 
 proc probe*(): Capability =
@@ -128,34 +150,93 @@ proc probe*(): Capability =
   ## `GameWorld.Instance` come back, and does its alive-players list have a
   ## length? Those two together are the whole of what the bot walk depends on.
   ## Anything past them degrades to a default rather than to nothing.
+  # One pass is traced and one only. Between raids `probe` runs every two
+  # seconds and returns at step 5 with a null world, so a trace gated on
+  # "reached the end" would print six lines every two seconds for the whole
+  # menu -- a standing cost for an answer already given.
+  if gProbePasses > 0:
+    gCrumbsDone = true
+  inc gProbePasses
+  crumb("step 1/7: asking the host whether EFT.GameWorld resolves")
   if not available(GameWorld):
     gCapability = capNone
     gProbeNote = "EFT.GameWorld does not resolve"
+    crumb("step 1/7 answered no; the arming path stops here")
     return gCapability
+  crumb("step 2/7: openLive -- binding GameAssembly.dll's C API directly")
   if not openLive():
     gCapability = capReadOnly
     gProbeNote = "GameAssembly.dll is not bound in this process, so the fast " &
                  "path is unavailable"
+    crumb("step 2/7 refused; the arming path stops here")
     return gCapability
+  crumb("step 3/7: bindAll -- resolving this mod's whole method table")
   bindAll()
+  crumb("step 3/7 returned")
   # The cover sensor, resolved on the same first tick every other binding is.
   # It is two Unity statics rather than an EFT member, and it refuses the same
   # way: by name, with the signature the runtime reported. See
   # `client/coverprobe.nim` for why a matching arity is not enough.
+  crumb("step 4/7: bindProbe -- the two Unity statics the cover sampler needs")
   bindProbe()
+  crumb("step 4/7 returned")
+  # STEP 5 NO LONGER CALLS ANYTHING. It used to call
+  # `EFT.GameWorld::get_Instance`, which does not exist on this build, through
+  # a by-name handle into unmapped memory -- MEASURED as the last thing this
+  # mod ever did before the client died. The world is now borrowed from the
+  # host's read-only export instead. See `client/live.nim`.
+  crumb("step 5/7: borrowing the live GameWorld from the host export " &
+        "(no call into game code)")
   let world = worldObject()
+  crumb("step 5/7 returned " & (if world == nil: "null" else: "non-null") &
+        " -- " & gwStateText())
   if world == nil:
     gCapability = capReadOnly
-    gProbeNote = "GameWorld.Instance is null -- no raid is running, or " &
-                 gB.worldWhy
+    # THREE ANSWERS, NOT TWO. `gwStateText` distinguishes "not in a raid" from
+    # "nothing is armed to look", and flattening those is exactly the
+    # can-only-say-yes failure CLAUDE.md 9b is about.
+    gProbeNote = "no live GameWorld: " & gwStateText()
     return gCapability
+  # STEP 6 IS A FIELD READ, not a call. `get_AllAlivePlayersList` does not
+  # exist either (same 409-member dump); `AllAlivePlayersList` is an instance
+  # field at a measured 0x1c8, read off the world the host validated.
+  crumb("step 6/7: reading the measured field AllAlivePlayersList@0x1c8 off " &
+        "the borrowed world (no call into game code)")
   let list = alivePlayers(world)
+  crumb("step 6/7 returned " & (if list == nil: "null" else: "non-null"))
   if list == nil:
     gCapability = capReadOnly
-    gProbeNote = "the alive-players list could not be read: " & gB.aliveWhy
+    gProbeNote = "the alive-players list read back null at " &
+                 "AllAlivePlayersList@0x1c8 off a world the host had " &
+                 "validated -- that is a real answer and not a refusal, and " &
+                 "it means this offset is not what it was measured to be"
+    crumb("step 6/7 gave null; the arming path stops here")
     return gCapability
-  gCapability = capFull
-  gProbeNote = $listLen(list) & " players in the world"
+
+  # STEP 7 REFUSES, AND capFull IS NOT REACHED. This is the deliberate part.
+  #
+  # Everything past here -- the bot walk, every sensor, every driving call --
+  # goes through `LazyCall`/`ensure`, which needs `il2cpp_object_get_class` on
+  # a receiver. That is on CLAUDE.md 5's list of reflection entry points that
+  # FAULT on this build. So `capFull` would not be a capability, it would be a
+  # licence to walk straight back into the fault this whole pass removed.
+  #
+  # The mod therefore stays at `capReadOnly`: it boots, it says what it found
+  # and what it cannot do, and it drives nothing. That is a mod declining
+  # loudly, which CLAUDE.md 6 asks for, rather than a mod that kills the
+  # client -- and it is honestly worse than the old behaviour looked, because
+  # the old behaviour never worked at all.
+  crumb("step 7/7: NOT counting the list -- refused")
+  gCapability = capReadOnly
+  gProbeNote = "the world and the alive-players list were both reached " &
+               "without calling into game code, and that is as far as this " &
+               "build allows. " & listLenWhy() &
+               ". Everything past a count needs LazyCall/ensure, which needs " &
+               "il2cpp_object_get_class -- one of the reflection entry " &
+               "points that faults here -- so this mod stays in observer " &
+               "mode and drives nothing rather than walking back into that"
+  crumb("step 7/7 refused; the arming path is complete and this trace stops")
+  gCrumbsDone = true
   result = gCapability
 
 proc announce*() =
