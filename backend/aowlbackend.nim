@@ -2226,8 +2226,22 @@ proc main(): int =
       modhost.info "database loaded from " & dbPath & " (" & $text.len & " bytes)"
       line "  db    " & dbPath
   else:
-    modhost.info "no database at " & dbPath & "; db_get will find nothing"
-    console.line "  db    (none)"
+    # `warn`, not `info`, and said in full. Without the database the backend
+    # does not fail -- it comes up, loads every mod, creates profiles and
+    # answers 200 on every route, with `/client/items`, `/client/globals` and
+    # `/client/customization` all returning a structurally valid and EMPTY
+    # `data`. Measured: 33-byte bodies, `{"err":0,"errmsg":null,"data":{}}`.
+    # So every signal a tester can see says healthy, and the game has no items
+    # in it. That is the silent-decline failure this project keeps paying for,
+    # and one `info` line at the top of a log nobody reads is not an
+    # announcement.
+    modhost.warn "NO DATABASE at " & dbPath & " -- the backend will still " &
+                 "start and answer every request, but /client/items, " &
+                 "/client/globals and /client/customization will all be " &
+                 "EMPTY and the game will have no items in it. Run " &
+                 "aowl-importdb.exe against a Tarkov/SPT install to produce " &
+                 "db.json, then restart the backend."
+    console.line "  db    (NONE -- the game will have no items; run aowl-importdb)"
 
   storeInit(gRoot)
   console.line "  store " & storeRoot()

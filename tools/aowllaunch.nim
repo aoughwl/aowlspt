@@ -1739,6 +1739,28 @@ proc main(): int =
   # all, because the answer goes on its command line.
   var backendProc = 0'u64
   let backendExe = joinPath(root, "aowlspt\\aowlspt-backend.exe")
+
+  # `db.json` is the one required post-install step with an external
+  # dependency, and skipping it fails SILENTLY: measured on a root with no
+  # database, the backend starts, loads every mod, creates profiles and
+  # answers 200 on every route -- but `/client/items`, `/client/globals` and
+  # `/client/customization` all come back as a structurally valid, EMPTY
+  # `data` (33-byte bodies). Every signal a tester can see says healthy and
+  # the game has no items in it. The backend now warns, but it warns into its
+  # own log; this is the screen a person is actually looking at, so it has to
+  # be said here too. A warning, not a refusal -- an empty database is a
+  # legitimate state to boot into while importing, and the launcher does not
+  # get to decide otherwise.
+  block:
+    let dbPath = joinPath(root, "aowlspt\\db.json")
+    if not fileExists(dbPath):
+      heading "Database"
+      warn "there is no db.json at " & dbPath & ". The server will start and " &
+           "answer everything, but the game will have NO ITEMS in it: " &
+           "/client/items, /client/globals and /client/customization all " &
+           "return empty. Run aowl-importdb.exe against a Tarkov or SPT " &
+           "install to produce it, then start again."
+
   if o.noBackend:
     # Asked, not assumed, and not waited on. `--no-backend` means this launcher
     # is not responsible for the server -- so it says what is there and starts
