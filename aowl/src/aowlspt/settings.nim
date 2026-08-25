@@ -53,6 +53,13 @@ type
     stEnum
     stString
     stKeybind
+    stSelect
+      ## A choice out of a LARGE set -- thousands of item ids, say. Same value
+      ## shape as `stEnum` (a string), and a UI that knows nothing about it can
+      ## fall back to drawing it as an enum; the distinction is that a renderer
+      ## is told up front to draw a searchable typeahead rather than a `<select>`
+      ## with ten thousand `<option>`s in it, and that the choices may be fetched
+      ## on demand from `optionsUrl` instead of shipped inline.
 
   Setting* = object
     key*: string          ## the config.json key, verbatim
@@ -65,6 +72,9 @@ type
     hasRange*: bool       ## lo/hi/step are meaningful
     options*: seq[string] ## the choices, for stEnum
     category*: string     ## the sub-page/section this row groups under
+    subcategory*: string  ## an optional second level INSIDE `category`
+    optionLabels*: seq[string] ## display names parallel to `options`, or empty
+    optionsUrl*: string   ## for stSelect: a route serving choices on demand
     description*: string  ## one sentence of help
     implemented*: bool    ## false → drawn greyed with the reason in `description`
 
@@ -77,6 +87,7 @@ proc kindName*(k: SettingType): string =
   of stEnum:    result = "enum"
   of stString:  result = "string"
   of stKeybind: result = "keybind"
+  of stSelect:  result = "select"
 
 # ---------------------------------------------------------------------------
 # Builders — one per type, so a mod never hand-fills the object
@@ -87,54 +98,90 @@ proc kindName*(k: SettingType): string =
 # chosen so the shortest possible call still produces a usable control.
 
 proc boolSetting*(key, label: string; default: bool;
-                  category = ""; description = ""; implemented = true): Setting =
+                  category = ""; subcategory = ""; description = ""; implemented = true): Setting =
   result = Setting(key: key, label: label, kind: stBool,
                    defaultJson: (if default: "true" else: "false"),
                    lo: 0.0, hi: 0.0, step: 0.0, hasRange: false,
-                   options: @[], category: category, description: description,
+                   options: @[], category: category, subcategory: subcategory,
+                   optionLabels: @[], optionsUrl: "", description: description,
                    implemented: implemented)
 
 proc intSetting*(key, label: string; default: int;
                  lo = 0; hi = 0; step = 1;
-                 category = ""; description = ""; implemented = true): Setting =
+                 category = ""; subcategory = ""; description = ""; implemented = true): Setting =
   result = Setting(key: key, label: label, kind: stInt,
                    defaultJson: $default,
                    lo: float(lo), hi: float(hi), step: float(step),
                    hasRange: hi > lo,
-                   options: @[], category: category, description: description,
+                   options: @[], category: category, subcategory: subcategory,
+                   optionLabels: @[], optionsUrl: "", description: description,
                    implemented: implemented)
 
 proc floatSetting*(key, label: string; default: float;
                    lo = 0.0; hi = 0.0; step = 0.0;
-                   category = ""; description = ""; implemented = true): Setting =
+                   category = ""; subcategory = ""; description = ""; implemented = true): Setting =
   result = Setting(key: key, label: label, kind: stFloat,
                    defaultJson: $default,
                    lo: lo, hi: hi, step: step, hasRange: hi > lo,
-                   options: @[], category: category, description: description,
+                   options: @[], category: category, subcategory: subcategory,
+                   optionLabels: @[], optionsUrl: "", description: description,
                    implemented: implemented)
 
 proc enumSetting*(key, label: string; default: string; options: seq[string];
-                  category = ""; description = ""; implemented = true): Setting =
+                  category = ""; subcategory = ""; description = ""; implemented = true): Setting =
   result = Setting(key: key, label: label, kind: stEnum,
                    defaultJson: "\"" & server.escapeText(default) & "\"",
                    lo: 0.0, hi: 0.0, step: 0.0, hasRange: false,
-                   options: options, category: category,
+                   options: options, category: category, subcategory: subcategory,
+                   optionLabels: @[], optionsUrl: "",
                    description: description, implemented: implemented)
 
 proc stringSetting*(key, label: string; default: string;
-                    category = ""; description = ""; implemented = true): Setting =
+                    category = ""; subcategory = ""; description = ""; implemented = true): Setting =
   result = Setting(key: key, label: label, kind: stString,
                    defaultJson: "\"" & server.escapeText(default) & "\"",
                    lo: 0.0, hi: 0.0, step: 0.0, hasRange: false,
-                   options: @[], category: category, description: description,
+                   options: @[], category: category, subcategory: subcategory,
+                   optionLabels: @[], optionsUrl: "", description: description,
                    implemented: implemented)
 
 proc keybindSetting*(key, label: string; default: string;
-                     category = ""; description = ""; implemented = true): Setting =
+                     category = ""; subcategory = ""; description = ""; implemented = true): Setting =
   result = Setting(key: key, label: label, kind: stKeybind,
                    defaultJson: "\"" & server.escapeText(default) & "\"",
                    lo: 0.0, hi: 0.0, step: 0.0, hasRange: false,
-                   options: @[], category: category, description: description,
+                   options: @[], category: category, subcategory: subcategory,
+                   optionLabels: @[], optionsUrl: "", description: description,
+                   implemented: implemented)
+
+proc selectSetting*(key, label: string; default: string; options: seq[string];
+                    optionLabels: seq[string] = @[]; optionsUrl = "";
+                    category = ""; subcategory = ""; description = "";
+                    implemented = true): Setting =
+  ## A choice out of a set too large to draw as a `<select>` -- an item id out
+  ## of the whole handbook, a map, a trader. The VALUE is a plain string, the
+  ## same as `enumSetting`, so nothing about persistence or `configSet`
+  ## changes; only the control a renderer picks does.
+  ##
+  ## Two ways to supply the choices, and a row may use both:
+  ##
+  ## * `options` (with optional `optionLabels`, a parallel array of display
+  ##   names) ships the choices inline in the schema. Fine for hundreds.
+  ## * `optionsUrl` names a route the UI queries as the user types --
+  ##   `GET <optionsUrl>?q=<term>&limit=<n>` returning
+  ##   `{"options":[{"value":"...","label":"..."}...]}`. This is the one that
+  ##   scales to thousands of item ids, because the schema stays small and the
+  ##   mod that owns the ids does the searching.
+  ##
+  ## A renderer that has never heard of `select` and falls through to its
+  ## `enum` branch still draws a working control from `options`; that is why
+  ## the value shape was kept identical rather than introducing an object.
+  result = Setting(key: key, label: label, kind: stSelect,
+                   defaultJson: "\"" & server.escapeText(default) & "\"",
+                   lo: 0.0, hi: 0.0, step: 0.0, hasRange: false,
+                   options: options, category: category, subcategory: subcategory,
+                   optionLabels: optionLabels, optionsUrl: optionsUrl,
+                   description: description,
                    implemented: implemented)
 
 # ---------------------------------------------------------------------------
@@ -160,7 +207,7 @@ proc toJson*(s: Setting): JsonObject =
   # way, so it is used verbatim.
   if cur.ok:
     case s.kind
-    of stEnum, stString, stKeybind:
+    of stEnum, stString, stKeybind, stSelect:
       o.put("value", jstr(asText(cur, "")))
     of stBool, stInt, stFloat:
       o.put("value", Json(text: cur.raw))
@@ -175,6 +222,16 @@ proc toJson*(s: Setting): JsonObject =
     for opt in s.options:
       a.add opt
     o.put("options", a)
+  if s.optionLabels.len > 0 and s.optionLabels.len == s.options.len:
+    # Parallel to `options`, and emitted ONLY when it is exactly parallel --
+    # a labels array of a different length would silently mislabel a control,
+    # which is worse than a UI showing raw ids.
+    var la = arr()
+    for lb in s.optionLabels:
+      la.add lb
+    o.put("optionLabels", la)
+  if s.optionsUrl.len > 0: o.put("optionsUrl", s.optionsUrl)
+  if s.subcategory.len > 0: o.put("subcategory", s.subcategory)
   if s.category.len > 0:  o.put("category", s.category)
   if s.description.len > 0: o.put("description", s.description)
   o.put("implemented", s.implemented)
