@@ -48,7 +48,7 @@ import registry
 
 const
   ModGuid = "aowl.resourcepacks"
-  ModName = "aowl.resourcepacks"
+  ModName = "Resource Packs"
   ModAuthor = "savannt"
   ModVersion = "1.0.0"
 

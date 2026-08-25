@@ -42,7 +42,7 @@ import aowlspt/settings
 
 const
   ModGuid = "aowl.graphics"
-  ModName = "aowl.graphics"
+  ModName = "Graphics"
   ModAuthor = "savannt"
   ModVersion = "1.0.0"
 

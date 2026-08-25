@@ -49,7 +49,7 @@ import loadprobe
 
 const
   ModGuid = "aowl.textures"
-  ModName = "aowl.textures"
+  ModName = "Textures"
   ModVersion = "1.0.0"
 
 # ---------------------------------------------------------------------------
