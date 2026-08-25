@@ -48,6 +48,30 @@ The audit below is preserved as written. These items are now closed:
   `aowl bootstrap` to take effect, since `aowl build` does not rebuild
   `aowl.exe`.
 
+* **Profile creation — VERIFIED LIVE, no longer read-only.** The audit could
+  only read the launcher's control flow. The route `--new` actually calls was
+  driven directly against a standalone backend:
+  `POST /aowlspt/tarkov/launcher/profile/create {"nickname":"ReleaseTest1","side":"Bear"}`
+  → `{"ok":true,"token":"0000000000fc...","profile":{...,"side":"Bear","voice":"Bear_1","level":1}}`;
+  re-listing `/aowlspt/tarkov/launcher/profiles` showed it persisted alongside
+  the existing profile; and creating the same nickname again was refused with
+  the server's own `{"ok":false,"error":"that nickname is taken"}`. The test
+  profile was then deleted (`store/aowl.tarkov/profile.<id>` plus its `.hist`
+  entry) and the list re-read to confirm only the real profile remained.
+* **The settings surface — VERIFIED LIVE.** After deploying the staged payload
+  mods to `D:\Aowlsptowlspt`, `/aowlspt/ui/page/settings` answers 200
+  `text/html` (8801 bytes) and `/aowlspt/settings/index` answers 200 JSON.
+  `/aowlspt/mods` reports `"mods":16` (was 11), `"problems":[]`.
+* **The payload guard — VERIFIED.** With `payload.json` temporarily renamed
+  away, `aowl payload` now exits 1 with the explanatory message instead of
+  exit 0. (`aowl bootstrap` was run, so the rebuilt `aowl.exe` carries it.)
+
+**The cheap rung nobody was using:** the backend runs STANDALONE on plain
+HTTP with no game client, no TLS and no certificate --
+`aowlspt-backend.exe --root D:\Aowlsptowlspt --port 6969` -- and answers
+every route. Send `Accept-Encoding: identity` or it deflates (fact #123).
+Every verification in this section took seconds; none needed a client launch.
+
 Still open from the audit: **#4** (`deploy.json` covers 2 of 7 mod artifacts —
 dev-install path only, does not block the payload), **#5** (rebuilding a mod
 needs the private Nimony toolchain), **#6** (`db.json` must be imported
