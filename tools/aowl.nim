@@ -2596,9 +2596,22 @@ proc cmdPayload(e: Env): int =
     return 1
 
   ok $copied & " files staged in " & dest
+
+  # `payload.json` is gitignored, so it exists on the machine this was
+  # developed on and NOWHERE else -- a release cut from a fresh clone or a
+  # fresh worktree has only the template. This used to be a warning, and a
+  # warning is exactly wrong here: `aowl payload` said "ok, N files staged"
+  # and exited 0 while `aowlspt-install.exe` could not run at all, because it
+  # reads `targetTarkovVersion`, `targetBackend` and `kind` out of that file.
+  # A payload that cannot be installed is not a payload, which is the same
+  # argument the missing-host check above already makes.
   if not fileExists(joinPath(payload, "payload.json")):
-    warn "there is still no payload.json here -- copy payload.json.template " &
-         "and fill in the version this was built against"
+    err "there is no payload.json in " & payload & " -- it is gitignored, so " &
+        "a fresh clone or worktree never has one. Copy payload.json.template " &
+        "next to it and fill in the client version this was built against; " &
+        "aowlspt-install.exe reads targetTarkovVersion, targetBackend and " &
+        "kind out of it and cannot run without them"
+    return 1
   result = 0
 
 proc cmdRelease(e: Env; extra: seq[string]): int =

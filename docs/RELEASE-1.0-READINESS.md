@@ -21,6 +21,39 @@ character creation; `--new`/`--pick` are conveniences, not the only path.
 **Not run live** — this is read from the launcher's own control flow and log
 strings, not observed against a real empty `db.json`.
 
+## STATUS AFTER THE AUDIT — what has since been fixed
+
+The audit below is preserved as written. These items are now closed:
+
+* **#1, #2, #3 — FIXED in `958e7a2`.** All five unregistered mods
+  (`uihub`, `settingshub`, `admin`, `graphics`, `resourcepacks`) are in
+  `registry/mods.json`. `settingshub` and `uihub` went into
+  **`aowl.list.core`**, which every list inherits — so `vanillaplus` gets the
+  settings surface without needing its own entry, closing #3 as well.
+  `admin`, `graphics` and `resourcepacks` are registered but in no list on
+  purpose, and their descriptions say so. `aowl.icebreaker` was dropped (1.0
+  ships the map) along with the two stale `loadAfter` references to it.
+  **Verified**: `installeruildowl-regcheck.exe --repo <repo>` — 200
+  checks, 0 failures, exit 0. It was 1 failure and 7 warnings before, and that
+  one pre-existing failure (`textures` exported its guid as its display name)
+  is fixed too.
+  *The check that would have caught this already existed* — `aowl-regcheck`
+  tests the registry in both directions — but it only runs inside
+  `aowl verify`, which had not been run. The binary is prebuilt and instant;
+  run it directly.
+* **#7 — FIXED.** `aowl payload` now **fails** on a missing `payload.json`
+  instead of warning. The file is gitignored, so it exists only on the machine
+  this was developed on; a release cut from a fresh clone got "ok, N files
+  staged", exit 0, and an installer that could not run. Requires
+  `aowl bootstrap` to take effect, since `aowl build` does not rebuild
+  `aowl.exe`.
+
+Still open from the audit: **#4** (`deploy.json` covers 2 of 7 mod artifacts —
+dev-install path only, does not block the payload), **#5** (rebuilding a mod
+needs the private Nimony toolchain), **#6** (`db.json` must be imported
+post-install), and everything under "What could NOT be verified without a live
+install".
+
 ## BLOCKER
 
 | # | Finding | Evidence |
