@@ -4,7 +4,7 @@
     "id": "aowl.registry.official",
     "name": "aowlspt official registry",
     "description": "Every mod built in this repository, plus the lists that name them. One file with one git history, so a mod list is a document you can send someone.",
-    "revision": 3,
+    "revision": 4,
     "updated": "2026-08-25"
   },
   "mods": [
@@ -629,32 +629,25 @@
       "name": "Vanilla Plus",
       "author": "savannt",
       "version": "1.0.0",
-      "description": "Core, plus the four client mods that change how the game feels without changing what is in it.",
+      "description": "Core, plus the client mods MEASURED to load on this game build. It used to name fovfix, sptsway, classicmovement and perf; each of those was measured on 2026-08-25 to crash the client on its own, ~1-2s after the host reports HOST RUNNING, so they now live in aowl.list.feelmods-broken. This list is the installer default, which is why it may only contain things that have actually been launched.",
       "inherits": [
         "aowl.list.core"
       ],
       "entries": [
         {
-          "id": "aowl.fovfix",
-          "enabled": true
-        },
-        {
-          "id": "com.savannt.sptsway",
-          "enabled": true
-        },
-        {
-          "id": "aowl.classicmovement",
-          "enabled": true
-        },
-        {
-          "id": "aowl.perf",
-          "enabled": true,
-          "note": "loaded, but every knob it has is off until you turn one on; it reports frame pacing before it changes anything"
-        },
-        {
           "id": "aowl.textures",
           "enabled": true,
-          "note": "curated 2K PBR replacements, bounded by a VRAM budget; NO-OPs to stock textures until the upload capability lands"
+          "note": "measured live on 2026-08-25: loads and runs"
+        },
+        {
+          "id": "aowl.graphics",
+          "enabled": true,
+          "note": "measured live on 2026-08-25: loads and runs"
+        },
+        {
+          "id": "aowl.pathtotarkov",
+          "enabled": true,
+          "note": "measured live on 2026-08-25: loads and runs"
         }
       ]
     },
@@ -663,7 +656,7 @@
       "name": "Raid Night",
       "author": "savannt",
       "version": "1.0.0",
-      "description": "Vanilla Plus with the bots turned up: new brains, a new faction, and a map that is not in the base game.",
+      "description": "Vanilla Plus with the bots turned up: new brains, a new faction, and a map that is not in the base game. NOT verified on this game build: morebots, sain and blackdivision are all renamed .dll.off on the only working install and were measured to crash only as part of the all-seven set, never individually. Treat this list as unproven until each is launched on its own.",
       "inherits": [
         "aowl.list.vanillaplus"
       ],
@@ -715,6 +708,36 @@
           "id": "aowl.perf",
           "enabled": false,
           "note": "client-only; a headless server has no frames to pace"
+        }
+      ]
+    },
+    {
+      "id": "aowl.list.feelmods-broken",
+      "name": "Feel Mods (BROKEN on this build)",
+      "author": "savannt",
+      "version": "1.0.0",
+      "description": "The four client feel mods that aowl.list.vanillaplus used to enable. Every one of them was measured on 2026-08-25 to kill the client ~1-2s after HOST RUNNING -- individually, not only together, and the pre-existing binaries fail identically, so this is not a build regression. They are kept here, named and off, because deleting them would lose the measurement; on the install they are renamed to .dll.off, which no manifest records. Do not put these in a shipped list until a launch proves one of them survives.",
+      "inherits": [],
+      "entries": [
+        {
+          "id": "aowl.fovfix",
+          "enabled": false,
+          "note": "crashes the client on its own -- measured 2026-08-25"
+        },
+        {
+          "id": "com.savannt.sptsway",
+          "enabled": false,
+          "note": "crashes the client on its own -- measured 2026-08-25"
+        },
+        {
+          "id": "aowl.classicmovement",
+          "enabled": false,
+          "note": "crashes the client on its own -- measured 2026-08-25"
+        },
+        {
+          "id": "aowl.perf",
+          "enabled": false,
+          "note": "crashes the client on its own -- measured 2026-08-25"
         }
       ]
     }
