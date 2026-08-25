@@ -776,13 +776,33 @@ proc resolveRequirements*(recipeJson, areasJson: string; inv: Inventory;
 # The production record
 # ---------------------------------------------------------------------------
 
+var gCraftMultiplier = 1.0
+
+proc configureCraftTimes*(craftMultiplier: float) =
+  gCraftMultiplier = craftMultiplier
+
+proc scaleCraftTime*(seconds: int): int =
+  ## A craft duration with the multiplier applied.
+  ##
+  ## Stamped onto the production record at START, not applied at collection.
+  ## That is the same choice the surrounding code already makes and for the same
+  ## reason: a craft finishes on the terms it was started on, so changing this
+  ## setting does not retroactively shorten or lengthen something already
+  ## running -- which would be indistinguishable from the server losing track.
+  if seconds <= 0 or gCraftMultiplier == 1.0:
+    return seconds
+  result = int(float(seconds) * gCraftMultiplier + 0.5)
+  if result < 0:
+    result = 0
+
 proc newProduction(recipeJson: string; nowSeconds: int): Doc =
   result = newDoc()
   setText(result, "RecipeId", field(recipeJson, "_id").asText(""))
   setNumber(result, "Progress", 0)
   setBool(result, "inProgress", true)
   setNumber(result, "StartTimestamp", nowSeconds)
-  setNumber(result, "ProductionTime", field(recipeJson, "productionTime").asInt(0))
+  setNumber(result, "ProductionTime",
+            scaleCraftTime(field(recipeJson, "productionTime").asInt(0)))
   setRaw(result, "Products", "[]")
   setNumber(result, "SkipTime", 0)
   setBool(result, "sptIsComplete", false)
@@ -890,7 +910,8 @@ proc newScavCaseProduction(recipeJson: string; products: seq[string];
   setNumber(result, "Progress", 0)
   setBool(result, "inProgress", true)
   setNumber(result, "StartTimestamp", nowSeconds)
-  setNumber(result, "ProductionTime", field(recipeJson, "productionTime").asInt(0))
+  setNumber(result, "ProductionTime",
+            scaleCraftTime(field(recipeJson, "productionTime").asInt(0)))
   setRaw(result, "Products", "[]")
   setNumber(result, "SkipTime", 0)
   setBool(result, "sptIsComplete", false)
