@@ -104,10 +104,58 @@ var gHooked = false
 ## the argument is still the better place to read from here: `AddActivePLayer`
 ## is called on the controller and carries the bot, so the argument is the bot
 ## and the instance is the controller.
-const SpawnHookCandidates: array[3, string] = [
-  "EFT.BotsController::AddActivePLayer",
-  "EFT.BotSpawner::AddPlayer",
-  "EFT.BotsController::AddActivePlayer"]
+##
+## BY RVA, NOT BY NAME, and that is the whole of why this mod can install a
+## detour at all on this build.
+##
+## Asking the host to patch `"EFT.BotsController::AddActivePLayer"` makes the
+## host resolve that name through the IL2CPP C API, and fact #35 says by-name
+## resolution returns a NON-NIL handle into UNMAPPED memory. The host then
+## patched at that address. MEASURED: that call was the last line this mod ever
+## logged before the client died at 9.250s. It is the same root cause as
+## `get_Instance`, one layer out -- on this build every by-name route is fatal
+## the moment it is USED, and a patch is a use.
+##
+## The host's own drains already take the other route (`patch-by-RVA
+## EFT.TarkovApplication::Update ... il2cpp+0x977b10` in the boot log), and the
+## grammar is open to mods through the same `target` string:
+##
+##     Type::Method@0xRVA/<shape>[!<hex prologue>]
+##
+## `<shape>` is `i`/`s` (instance/static), one letter per DECLARED argument,
+## then `>` and the return letter. It is REQUIRED: there is no MethodInfo
+## behind an RVA, so the host cannot derive the frame and refuses to guess it.
+##
+## `!<hex>` is REQUIRED HERE TOO, by this mod rather than by the host. Without
+## it `aowl_pro_verify` returns 1 having compared nothing, and the boot log says
+## so -- "NO prologue signature was declared, so NOTHING was byte-compared".
+## That is a check that cannot fail (CLAUDE.md 9b), and on a detour it is a
+## write with unbounded blast radius. The bytes come from `il2cpp_resolve.py
+## bytes <RVA> 16` against GameAssembly.dll ON DISK, and the host compares them
+## against its STARTUP SNAPSHOT (`abi/aowlspt_prologue.h`) rather than live
+## memory -- so a second feature verifying a function a first feature already
+## detoured reads the original bytes, not a trampoline.
+##
+## MEASURED, `il2cpp_resolve.py type 6489 --shared`:
+##   void AddActivePLayer(Player player)   rid=41021  RVA=0x254ce30  NOT shared
+##   prologue 48 83 79 28 00 74 0C 48 8B 49 28 45 33 C0 E9 9D
+##
+## Shape `io>x`: instance, one reference argument (`Player`), void return.
+##
+## EXPECT THIS ONE TO BE REFUSED, and that is a real answer rather than a
+## failure. Those 16 bytes contain a short branch (`74 0C`) at byte 5 and a
+## near jump (`E9`) at byte 14 -- relative branches inside the region a detour
+## must relocate, which is exactly the "prologue holding a relative branch"
+## case the fallback note below was written for. The world scan still finds
+## every bot, half a second later and without a spawn type.
+##
+## The two alternates this ladder used to carry are GONE rather than left as
+## by-name entries. `EFT.BotSpawner::AddPlayer` and the `AddActivePlayer`
+## spelling were never measured, and an unmeasured name is not a fallback on
+## this build -- it is the fatal path wearing a fallback's clothes.
+const SpawnHookCandidates: array[1, string] = [
+  "EFT.BotsController::AddActivePLayer@0x254ce30/io>x" &
+  "!4883792800740C488B49284533C0E99D"]
 
 ## The methods that might tell us a player died.
 ##
@@ -116,10 +164,27 @@ const SpawnHookCandidates: array[3, string] = [
 ## arguments and not the instance, so the handler learned that *a* player had
 ## died. `thisPointer` is the whole difference, and it is why the death poll in
 ## `client/driver.nim` can now be turned off.
-const DeathHookCandidates: array[3, string] = [
-  "EFT.Player::OnDead",
-  "EFT.Player::Kill",
-  "EFT.Player::OnBeenKilledByAggressor"]
+##
+## BY RVA for the same measured reason as the spawn ladder above.
+##
+## MEASURED, `il2cpp_resolve.py type 7013 --shared`:
+##   void OnDead(EDamageType damageType)  rid=42620  RVA=0x732c30  NOT shared
+##   prologue 48 89 5C 24 10 48 89 4C 24 08 56 57 41 54 41 56
+##
+## Shape `ii>x`: instance, one integer argument (an enum is an `Int32` in a
+## register), void return.
+##
+## This prologue is a plain register-save sequence with no relative branch in
+## it, so unlike the spawn target it is a shape a detour can relocate.
+##
+## `Kill` and `OnBeenKilledByAggressor` are dropped for the same reason the
+## spawn alternates are: they resolve (they are real -- rid 42618 and others in
+## the same dump) but they were never byte-measured, and shipping an unverified
+## RVA would be the blind write rule 8 forbids. Adding either back is one
+## `il2cpp_resolve.py bytes` call away.
+const DeathHookCandidates: array[1, string] = [
+  "EFT.Player::OnDead@0x732c30/ii>x" &
+  "!48895C241048894C2408565741544156"]
 
 proc onBotAdded(target, payload: string): HookResult =
   ## Fired by a detour on the game's own bot activation, **with the bot**.
@@ -267,10 +332,23 @@ proc memberOf(target: string): string =
 ## three may be wrong, in which case all three refuse with the reason in the
 ## log and every bot shoots exactly as it does today -- see the gate in
 ## `client/driver.nim` for why that is the only failure this sensor has.
+##
+## MEASURED OFFLINE, so that "all three may be wrong" stops being a guess:
+## `tools/il2cpp_resolve.py <GameAssembly.dll> <metadata.dec> find
+## AimDataClass` returns NOTHING on this build. `EFT.AimDataClass` is not a
+## type here at all, so the first candidate can only ever be refused and this
+## says so rather than letting it fall through as if it had merely not matched.
 const AimHookCandidates: array[3, string] = [
   "EFT.AimDataClass::get_IsReady",
   "EFT.BotAimingData::get_IsReady",
   "EFT.BotOwner::get_AimingIsReady"]
+
+const AimCandidateNotes: array[3, string] = [
+  "EFT.AimDataClass does not exist on this build -- measured offline with " &
+    "tools/il2cpp_resolve.py find, which returns no such type. This is SAIN's " &
+    "own C# spelling and it did not survive post-1.0",
+  "",
+  ""]
 
 ## The methods that might carry a damage event.
 ##
@@ -460,11 +538,30 @@ proc armAimHook() =
                     "1.06 ms a frame at forty bots -- a frame tax for one " &
                     "bool, so the sensor stays off rather than being paid for"
     return
+  # AND BEFORE ANY OF THAT: this ladder's first act on every candidate is
+  # `signatureOf`, which is the by-name resolution that killed the client in
+  # `bindProbe` a tenth of a second earlier. Refused up front, with the real
+  # reason, because the loop below would otherwise fall through all three
+  # candidates and report "none of them exists on this build" -- which is not
+  # what happened and would send the next reader hunting for renamed types.
+  if reflectionRefused():
+    gAimHookState = "refused: " & ReflectionRefusal &
+                    " Every candidate below is checked with signatureOf " &
+                    "before it is patched, so none can be checked and none " &
+                    "is patched. Bots shoot when the decision ladder says " &
+                    "so, exactly as they did before this sensor existed"
+    return
   var tried = 0
   var j = 0
   while j < AimHookCandidates.len:
     let name = AimHookCandidates[j]
+    let note = AimCandidateNotes[j]
     inc j
+    if note.len > 0:
+      # Named, not skipped silently. An offline measurement that a type is
+      # absent is a real answer and belongs in the log beside the refusal.
+      info "sain: aim postfix -- skipping " & name & ": " & note
+      continue
     var params: seq[string] = @[]
     var ret = ""
     if not signatureOf(ownerOf(name), memberOf(name), -1, params, ret):
@@ -483,6 +580,7 @@ proc armAimHook() =
       gAimHookState = "refused: " & name & " is " & describeSig(params, ret) &
                       ", and this reads a bool"
       continue
+    info "sain: aim postfix -- attempting the typed detour on " & name
     if hookReturnTyped(name, onBotAimTyped) == Ok:
       setAimHooked(true)
       gAimHookState = "armed on the typed path on " & name &
@@ -508,6 +606,18 @@ proc armDamageHook() =
   ## disqualifying one, in the way that a per-bot-per-frame payload is. Which
   ## form armed is in the state line, because the two are forty-fold apart and
   ## "armed" alone would hide that.
+  ##
+  ## The same up-front refusal as `armAimHook`, for the same measured reason:
+  ## every candidate here is checked with `signatureOf` first, and `signatureOf`
+  ## is the by-name path that takes the client down on this build.
+  if reflectionRefused():
+    gDamageHookState = "refused: " & ReflectionRefusal &
+                       " Suppression keeps inferring hits from the health " &
+                       "delta between two decisions, which is up to four " &
+                       "ticks late and nets two hits against a regeneration " &
+                       "-- degraded, and it is what this mod did before the " &
+                       "hook existed"
+    return
   var tried = 0
   var j = 0
   while j < DamageHookCandidates.len:
@@ -528,6 +638,7 @@ proc armDamageHook() =
         gDamageAmountArg = q
         break
       inc q
+    info "sain: damage postfix -- attempting a detour on " & name
     if typedPatchesReady() and
        hookReturnTyped(name, onPlayerDamagedTyped) == Ok:
       setDamageHooked(true)
@@ -582,10 +693,69 @@ proc installHooks() =
     return
   gHooked = true
 
+  # BOTH DETOURS ARE REFUSED ON THIS BUILD, and the reason is measured rather
+  # than cautious. MEASURED: `installHooks -- attempting the bot-activation
+  # detour on EFT.BotsController::AddActivePLayer` was the last line this mod
+  # ever logged before the client died at 9.250s. Patching BY NAME makes the
+  # host resolve the name through the IL2CPP C API, which on this build hands
+  # back a non-nil pointer into unmapped memory (fact #35) -- and the host then
+  # patches THERE. A patch is a use, and on this build every by-name route is
+  # fatal the moment it is used.
+  #
+  # The RVAs are measured and are in the two `const` arrays above, prologue
+  # bytes and all, ready for the host's patch-by-RVA grammar. They are NOT
+  # installed, and there are two independent reasons -- either alone is enough:
+  #
+  # 1. THE HOST REFUSES THE JSON PATCH ABI FOR AN RVA SPEC, by design.
+  #    `aowlhost.nim` (~4040): "An RVA patch has NO MethodInfo, and every JSON
+  #    firing path needs one ... So the JSON ABI is refused here rather than
+  #    installed and quietly handing a handler an empty payload." Both hooks
+  #    below use `hookArgs`, which IS the JSON ABI. The typed ABI --
+  #    `hookTyped` / `hookReturnTyped` -- does accept an RVA spec, so this is a
+  #    handler rewrite, not a missing host facility.
+  #
+  # 2. THE HANDLERS COULD NOT DO THEIR JOB EVEN THEN. `onBotAdded` reads the
+  #    bot's identity with `who.get("ProfileId")` and `r.invoke("ToString")` --
+  #    boxed by-name member access, the same dead path. A typed RVA detour
+  #    would install, fire, and register every bot with an EMPTY id. That is a
+  #    live code patch bought for nothing, which is worse than no patch.
+  #
+  # WHAT UNBLOCKS IT, measured here so the next pass does not re-derive it:
+  # a bot's profile id is reachable with no reflection at all, in two hops of
+  # measured static field offsets --
+  #
+  #     EFT.Player.<Profile>k__BackingField   inst @0x9c0  -> EFT.Profile
+  #     EFT.Profile.Id                        inst @0x10   -> System.String
+  #     System.String._stringLength @0x10, _firstChar @0x14
+  #
+  # (the last pair being `il2cpp_resolve.py`'s own self-check, so it is the
+  # most-verified offset in the codebase). With those, `onBotAdded` becomes a
+  # typed prefix that reads `f.argPointer(0)` and walks three offsets, and both
+  # detours can go live by RVA. That is the next step, and it is a real one --
+  # not a workaround.
+  warn "sain: BOTH detours are refused on this build. The RVAs are measured " &
+       "and byte-verified in the source (AddActivePLayer 0x254ce30, OnDead " &
+       "0x732c30, neither shared), but patching by NAME is what killed the " &
+       "client here and the host refuses the JSON patch ABI behind an RVA " &
+       "spec -- so these need typed handlers, and the identity read inside " &
+       "onBotAdded needs the measured field walk noted in the source " &
+       "(Player.Profile@0x9c0 -> Profile.Id@0x10). Bot discovery falls back " &
+       "to the 2 Hz world scan, which cannot read a spawn type; death falls " &
+       "back to the per-bot health poll"
+  gAimHookState = "refused: not attempted -- installHooks declines every " &
+                  "detour on this build"
+  gDamageHookState = gAimHookState
+  if true:
+    return
+
   var i = 0
   var spawnOk = false
   while i < SpawnHookCandidates.len:
     let name = SpawnHookCandidates[i]
+    # Before, not after. `hookArgs` WRITES a detour into game code; if the
+    # process does not survive the write, the only line that can name which
+    # candidate did it is one printed first.
+    info "sain: installHooks -- attempting the bot-activation detour on " & name
     if hookArgs(name, onBotAdded) == Ok:
       info "sain: bot activation hooked on " & name
       spawnOk = true
@@ -616,6 +786,7 @@ proc installHooks() =
   var deathOk = false
   while j < DeathHookCandidates.len:
     let name = DeathHookCandidates[j]
+    info "sain: installHooks -- attempting the death detour on " & name
     if hookArgs(name, onPlayerDead) == Ok:
       info "sain: death hooked on " & name &
            "; the per-bot health poll is off"
@@ -632,8 +803,11 @@ proc installHooks() =
   # JSON payload -- see `README.md` section 5 -- and both are here now because
   # the typed frame made the objection a number rather than a principle. They
   # are armed in the order `README.md` names them.
+  info "sain: installHooks -- arming the aim postfix"
   armAimHook()
+  info "sain: installHooks -- arming the damage postfix"
   armDamageHook()
+  info "sain: installHooks -- both postfixes returned"
 
   reportHookCost("bot aim result", gAimHookState, aimHookCostNs(),
                  gAimHookSamples)
@@ -1236,6 +1410,16 @@ proc onLoad(): Status =
     success "sain: driver pipeline exercised without a game attached"
   of sideClient:
     setPreset(gPreset)
+    # Before anything can resolve a name. `live.nim` refuses by-name
+    # resolution unless this says otherwise, and it must be told at load
+    # rather than at arming time, because arming is where the fault was.
+    setAllowReflection(gPreset.allowIl2cppReflection)
+    if gPreset.allowIl2cppReflection:
+      warn "sain: allowIl2cppReflection is ON. On this build that is a " &
+           "known process-killer (fact #35): il2cpp_class_from_name returns " &
+           "a non-nil handle into unmapped memory and the first dereference " &
+           "takes the client down. This is a re-measurement switch, not a " &
+           "feature switch"
     info "sain: client half loaded; waiting for the game world"
   else:
     discard
@@ -1286,9 +1470,19 @@ proc onUpdate(elapsedMs: int64): Status =
     # anything that assumes an answer. This is the first tick on which
     # `bindMethod` can succeed -- `docs/PERF.md` is explicit that binding in
     # `onLoad` correctly refuses, because the game's assemblies are not up.
+    # THIS IS THE TICK THE CRASH LANDS ON, so it is traced from the outside as
+    # well as from the inside. MEASURED, `D:\Aowlspt\hostlogs\sain-crash.log`:
+    # the drain came up at 8.032s, the client was gone by 8.141s, and this mod
+    # produced no line at all in between -- because the first line it used to
+    # produce came from `announce`, below all three calls.
+    info "sain: the Unity-thread gate has opened and EFT.GameWorld resolves; " &
+         "arming now -- probe, then announce, then installHooks"
     discard probe()
+    info "sain: probe returned"
     announce()
+    info "sain: announce returned"
     installHooks()
+    info "sain: installHooks returned; arming complete"
 
   if capability() != capFull:
     # Re-probe occasionally rather than every frame: the answer only changes
