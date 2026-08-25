@@ -304,6 +304,12 @@ proc assortItem*(traderId, itemId: string): string =
       return raw(it)
   result = ""
 
+var gScaledArm = ""
+  ## Backing text for the rewritten arm below. A `JsonRef` is a view into a
+  ## string, so the string it views has to outlive the call that made it --
+  ## returning a view of a local is a read of freed memory, and the shape of
+  ## bug that reads as "prices are sometimes wrong".
+
 proc schemeArm(traderId, offerId: string; index: int): JsonRef =
   ## What an offer costs: one arm of its `barter_scheme`, as the array of
   ## `{_tpl, count}` the player has to hand over. An offer the scheme does not
@@ -317,7 +323,27 @@ proc schemeArm(traderId, offerId: string; index: int): JsonRef =
   var arm = at(arms, index)
   if not arm.found:
     arm = at(arms, 0)
-  result = arm
+  if not arm.found or traderPriceMultiplier() == 1.0:
+    return arm
+  # The trader price multiplier, applied to what the server CHARGES.
+  #
+  # Here rather than in the caller, and returning a rewritten arm rather than
+  # offering a second "scaled" accessor beside this one: `emu/traders` already
+  # scales the same `count` on the way out to the trade screen, and two
+  # accessors is one accessor somebody calls by mistake. A shop that shows half
+  # price and refuses the payment is the failure that costs, and it is the
+  # failure that a second entry point makes possible.
+  var outArr = arr()
+  for req in each(arm):
+    var r = obj()
+    for k in keys(req):
+      if k == "count":
+        put(r, "count", scaleTraderCount(field(req, k).asInt(0)))
+      else:
+        put(r, k, raw(field(req, k).raw()))
+    outArr.add r
+  gScaledArm = done(outArr).text
+  result = whole(gScaledArm)
 
 proc roubleValue*(tpl: string; count: int): int =
   ## What `count` of a currency is worth in roubles, for the purpose of a

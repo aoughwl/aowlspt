@@ -82,16 +82,54 @@ proc stampRequirementTypes*(barterRaw: string): string =
         for k in keys(req):
           if k == "type":
             continue
+          if k == "count":
+            # The one field the price multiplier touches. Everything else is
+            # copied as its own raw text, so numbers stay numbers.
+            put(r, "count", scaleTraderCount(field(req, k).asInt(0)))
+            continue
           put(r, k, raw(field(req, k).raw()))
         reqArr.add r
       armsArr.add reqArr
     put(o, offerId, armsArr)
   result = done(o).text
 
-const gUnlockAllOffers* = true
+var gUnlockAllOffers* = true
   ## Sell a trader's whole stock from loyalty level 1. This is a sandbox server;
-  ## the user wants everything unlocked. Flip to false to restore real loyalty
-  ## gating.
+  ## the user wants everything unlocked. Set `traderUnlockAllOffers` to false on
+  ## the settings page to restore real loyalty gating. It was a `const`, which
+  ## made it the one sandbox decision in this module nobody could change without
+  ## a rebuild.
+
+var gTraderPriceMultiplier = 1.0
+  ## What every trader cost is multiplied by.
+  ##
+  ## Applied in TWO places and it has to be, which is why it lives here rather
+  ## than at either of them: `stampRequirementTypes` builds the cost the CLIENT
+  ## draws, and `schemeArm` in `emu/trading` reads the cost the server CHARGES.
+  ## Scaling only the first produces a shop showing half price and refusing the
+  ## payment; scaling only the second produces a shop that quietly takes a
+  ## different number from the one on the label.
+
+proc configureTraders*(unlockAll: bool; priceMultiplier: float) =
+  gUnlockAllOffers = unlockAll
+  gTraderPriceMultiplier = priceMultiplier
+
+proc traderPriceMultiplier*(): float = gTraderPriceMultiplier
+
+proc scaleTraderCount*(count: int): int =
+  ## A requirement count with the price multiplier applied.
+  ##
+  ## Never below 1 for a cost that started above zero: rounding a price to zero
+  ## turns "cheap" into "free", and free is a different game from cheap. A
+  ## requirement that was already zero stays zero, because that is a gift the
+  ## database is describing and not a price at all.
+  if count <= 0:
+    return count
+  if gTraderPriceMultiplier == 1.0:
+    return count
+  result = int(float(count) * gTraderPriceMultiplier + 0.5)
+  if result < 1:
+    result = 1
 
 proc allLoyaltyOne(loyalRaw: string): string =
   ## Every offer at loyalty level 1. `loyal_level_items` maps an offer id to the

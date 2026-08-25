@@ -73,6 +73,8 @@ import emu/decorate
 import emu/selfchecks
 import emu/metadata
 import emu/post1
+import emu/tuning   # the globals overrides -- the settings that reach the CLIENT
+import emu/spawn    # spawning items into a stash from the settings page
 
 const
   ModGuid = "aowl.tarkov"
@@ -1222,7 +1224,15 @@ proc onTraderUserAssort(url, body, session: string): string =
 # request: each is spliced in as the text the database already holds.
 
 proc onItems(url, body, session: string): string = envelope(raw(items()))
-proc onGlobals(url, body, session: string): string = envelope(raw(globals()))
+proc onGlobals(url, body, session: string): string =
+  ## The globals document, with every singleplayer override applied.
+  ##
+  ## This is where a settings row stops being a number in a file and becomes a
+  ## number the CLIENT reads: `globals.config` is what the client's own
+  ## ballistics, stamina, malfunction, skill and flea-market code parses at
+  ## session start. `applyGlobalTunes` returns its argument unchanged, without
+  ## reparsing it, when nothing is overridden -- see `emu/tuning`.
+  result = envelope(raw(applyGlobalTunes(globals())))
 proc onHandbook(url, body, session: string): string = envelope(raw(handbook()))
 proc onCustomization(url, body, session: string): string =
   envelope(raw(customization()))
@@ -2833,6 +2843,39 @@ proc tarkovSchema(): seq[Setting] =
     intSetting("masteringMaxPerRaid", "Mastering max per raid", 100, lo = 0,
                hi = 1000, category = "Skills"),
 
+    # ---- server-side economy and time modifiers ------------------------
+    #
+    # These five cannot ride the globals table: none of them is a value the
+    # database keeps in `globals.config`. Each names the one function it
+    # reaches, and each of those functions is the ONLY place its number is
+    # produced, which is what keeps the row from becoming decorative.
+    boolSetting("traderUnlockAllOffers", "Unlock every trader offer", true,
+                category = "Traders",
+                description = "Sell every trader's whole stock from loyalty " &
+                              "level 1 (emu/traders.traderAssort)"),
+    floatSetting("traderPriceMultiplier", "Trader price multiplier", 1.0,
+                 lo = 0.0, hi = 10.0, step = 0.05, category = "Traders",
+                 description = "Scales every barter-scheme count, in BOTH " &
+                               "the assort the client is shown and the cost " &
+                               "the server charges -- scaling only one is a " &
+                               "shop that shows one price and takes another"),
+    floatSetting("hideoutConstructionMultiplier",
+                 "Hideout construction time multiplier", 1.0,
+                 lo = 0.0, hi = 5.0, step = 0.05, category = "Hideout",
+                 description = "Scales every area upgrade duration " &
+                               "(emu/hideout.upgradeSeconds). 0 makes " &
+                               "upgrades instant"),
+    floatSetting("hideoutProductionMultiplier",
+                 "Hideout craft time multiplier", 1.0,
+                 lo = 0.0, hi = 5.0, step = 0.05, category = "Hideout",
+                 description = "Scales a craft's duration when it STARTS; a " &
+                               "craft already running keeps the terms it " &
+                               "started on"),
+    floatSetting("questXpMultiplier", "Quest experience multiplier", 1.0,
+                 lo = 0.0, hi = 100.0, step = 0.1, category = "Quests",
+                 description = "Scales the experience a quest pays out " &
+                               "(emu/quests.rewardExperience)"),
+
     # What the main menu's bottom-right corner reads. Three options, wired
     # through aowlspt/menutext (the literal key "menuCornerLabel" is also the
     # deploy marker for this feature -- see tools/deploy.json). See
@@ -2841,19 +2884,105 @@ proc tarkovSchema(): seq[Setting] =
                 @["Profile Name", "PVE ZONE", "No text"], category = "Menu",
                 description = "What the main menu's bottom-right corner " &
                               "shows: the logged-in character's name, the " &
-                              "stock \"PVE ZONE\", or nothing")]
+                              "stock \"PVE ZONE\", or nothing"),
+
+    # ---- item spawning -------------------------------------------------
+    #
+    # Four ordinary rows rather than a control type the settings UI does not
+    # have yet. `spawnNow` is momentary: `onTarkovSettings` intercepts the POST
+    # that sets it, runs the spawn, and writes the key back to false, so the
+    # page never renders a checkbox stuck on and the row is armed again.
+    stringSetting("spawnQuery", "Item to spawn", "",
+                  category = "Spawn Items",
+                  description = "Part of an item's English name, or a 24-hex " &
+                                "template id. An ambiguous name is refused " &
+                                "with the candidates named, never guessed at"),
+    intSetting("spawnCount", "How many", 1, lo = 1, hi = 5000,
+               category = "Spawn Items"),
+    intSetting("spawnCondition", "Condition (%)", 100, lo = 1, hi = 100,
+               category = "Spawn Items",
+               description = "Durability, resource or medkit charge as a " &
+                             "percentage of the template's own maximum; only " &
+                             "the properties the template declares are written"),
+    boolSetting("spawnNow", "Spawn now", false, category = "Spawn Items",
+                description = "Turn on to spawn. It turns itself back off, " &
+                              "and the outcome appears in the row below"),
+    stringSetting("spawnResult", "Last spawn result", "",
+                  category = "Spawn Items",
+                  description = "What the last spawn did, or exactly why it " &
+                                "did nothing")]
+
+  # Several hundred server value modifiers, generated from the database and
+  # applied to the globals document the client fetches. `emu/tuning` builds
+  # this list and the patcher from the SAME table, which is what stops a row
+  # existing here without being wired to anything (CLAUDE.md 9b).
+  let tuneRows = tuneSchema()
+  for st in tuneRows:
+    result.add st
+
+proc spawnProfileId(session: string): string =
+  ## Which stash a spawn goes into.
+  ##
+  ## The settings page is reached from a browser, not from the game client, so
+  ## the session is usually empty and `profileFor` answers nothing. Falling back
+  ## to the only profile when there is exactly one -- and REFUSING, by name,
+  ## when there are several, because picking one of two stashes arbitrarily is
+  ## how a spawn lands somewhere nobody is looking.
+  result = profileFor(session)
+  if result.len > 0:
+    return
+  let all = allProfileIds()
+  if all.len == 1:
+    result = all[0]
+
+proc runSpawn(session: string): string =
+  ## Perform the spawn the four `spawn*` rows describe and return the outcome.
+  let pid = spawnProfileId(session)
+  if pid.len == 0:
+    let all = allProfileIds()
+    if all.len == 0:
+      return "there is no profile to spawn into yet"
+    return "there are " & $all.len & " profiles and this page is not bound " &
+           "to one; log in to the character you want first"
+  let outcome = spawnInto(pid, setting("spawnQuery").asText(""),
+                          setting("spawnCount").asInt(1),
+                          setting("spawnCondition").asInt(100))
+  result = outcome.message
+  if outcome.ok:
+    info "spawn: " & outcome.message
+  else:
+    warn "spawn refused: " & outcome.message
 
 proc onTarkovSettings(url, body, session: string): string =
   ## GET serves the emulator's schema; a POST body persists one edit into
   ## config.json. The emulator reads these at load, so the write is saved and
-  ## takes effect next start rather than live.
+  ## takes effect next start rather than live -- except for the three keys
+  ## handled below, which would be useless if they did not act immediately.
   var st = Ok
   if body.len > 0:
     st = applySettingFromBody(body)
-    # Hot-apply: `menuCornerLabel` (and only that one -- everything else on
-    # this schema is load-time only) must take effect the moment it is saved,
-    # not merely on the next restart.
+    let key = field(body, "key").asText("")
+    # Hot-apply: `menuCornerLabel` must take effect the moment it is saved.
     applyMenuCornerLabel()
+    # Hot-apply: the globals overrides. `/client/globals` is fetched once per
+    # session, so re-reading here means an edit lands on the next login rather
+    # than on the next server restart.
+    if key.len > 1 and key[0] == 'g' and key[1] == '_':
+      loadGlobalTunes()
+    # `spawnNow` is a button, not a value. Run it, record what happened, and
+    # put the key back to false so the control is armed again -- a checkbox
+    # that stays on after its action is one nobody can press twice.
+    if key == "spawnNow" and setting("spawnNow").asBool(false):
+      let outcome = runSpawn(session)
+      discard applySetting("spawnResult", jstr(outcome).text)
+      discard applySetting("spawnNow", "false")
+    elif key == "spawnQuery":
+      # Typing in the search box previews what it would match, so an ambiguous
+      # query is visible BEFORE the spawn refuses it.
+      let q = setting("spawnQuery").asText("")
+      if q.len > 0:
+        discard applySetting("spawnResult",
+                             jstr("matches: " & searchSummary(q, 8)).text)
   result = declaredSchemaReply(st).text
 
 proc onTarkovSettingsReset(url, body, session: string): string =
@@ -2889,10 +3018,43 @@ proc onLoad(): Status =
   # the whole history -- see the header of `emu/mail`.
   configureMail(setting("mailKeepHours").asInt(72),
                 setting("mailKeepCollected").asInt(1))
+  # The five server-side modifiers above, each handed to the module that owns
+  # the number. Read here, at load, like every other key on this page.
+  configureTraders(setting("traderUnlockAllOffers").asBool(true),
+                   setting("traderPriceMultiplier").asFloat(1.0))
+  configureHideoutTimes(
+    setting("hideoutConstructionMultiplier").asFloat(1.0))
+  configureCraftTimes(setting("hideoutProductionMultiplier").asFloat(1.0))
+  configureQuestXp(setting("questXpMultiplier").asFloat(1.0))
   configureMarket(setting("fleaSpreadPercent").asInt(20),
                   setting("fleaOfferHours").asInt(12),
                   setting("fleaMaxOffers").asInt(600),
                   setting("fleaSaleMinutes").asInt(30))
+
+  # Read the server value modifiers out of config.json BEFORE the schema is
+  # declared, so the page and `/client/globals` agree from the first request.
+  #
+  # A key absent from config.json is not an override -- the settings UI writes a
+  # key only when somebody edits it -- so an untouched install resolves zero of
+  # these and `applyGlobalTunes` never even parses the globals document.
+  loadGlobalTunes()
+  let tunes = globalTuneReport()
+  if tunes.len > 0:
+    info "singleplayer: " & $tunes.len & " of " & $globalTuneTotal() &
+         " server value modifiers are overridden and will be served in " &
+         "/client/globals"
+    for line in tunes:
+      info "  " & line
+  else:
+    info "singleplayer: " & $globalTuneTotal() &
+         " server value modifiers available, none overridden"
+  # A value that is not a JSON literal is refused rather than spliced into the
+  # globals document, and it is said out loud -- an override that silently did
+  # not apply is the failure this whole surface is built to avoid.
+  let rejected = globalTuneRejected()
+  for bad in rejected:
+    warn "singleplayer: refusing a modifier whose value is not a JSON " &
+         "literal: " & bad
 
   # The emulator's own settings page, registered before the store gate below so
   # it answers even on a host where the emulator refuses to serve anything else.

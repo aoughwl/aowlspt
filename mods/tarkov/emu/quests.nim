@@ -105,6 +105,11 @@ proc questTemplate*(p: Profile; qid: string; nowSeconds: int): string =
     return direct
   result = questTemplateFor(p, qid, nowSeconds)
 
+var gQuestXpMultiplier = 1.0
+
+proc configureQuestXp*(multiplier: float) =
+  gQuestXpMultiplier = multiplier
+
 proc rewardExperience*(qid, state: string): int =
   ## Experience from a quest's own reward table, when the database has one.
   ## Zero when it does not -- a quest with no known rewards still completes,
@@ -117,6 +122,8 @@ proc rewardExperience*(qid, state: string): int =
   for r in rewards:
     if r.kind == "Experience":
       result = result + int(r.value)
+  if gQuestXpMultiplier != 1.0 and result > 0:
+    result = int(float(result) * gQuestXpMultiplier + 0.5)
 
 # ---------------------------------------------------------------------------
 # Editing the profile around a quest

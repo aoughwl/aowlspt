@@ -114,6 +114,23 @@ proc newArea(areaType: int): Doc =
   setRaw(result, "slots", "[]")
   setNumber(result, "lastRecipe", 0)
 
+var gConstructionMultiplier = 1.0
+
+proc configureHideoutTimes*(constructionMultiplier: float) =
+  gConstructionMultiplier = constructionMultiplier
+
+proc scaleHideoutTime*(seconds: int): int =
+  ## A construction duration with the multiplier applied.
+  ##
+  ## Zero stays zero: `upgradeSeconds` already uses zero to mean "this database
+  ## does not describe that stage", and multiplying that sentinel would turn a
+  ## missing row into a wait.
+  if seconds <= 0 or gConstructionMultiplier == 1.0:
+    return seconds
+  result = int(float(seconds) * gConstructionMultiplier + 0.5)
+  if result < 0:
+    result = 0
+
 proc upgradeSeconds*(areaType, level: int): int =
   ## How long the next level takes, out of the database. Zero when it is not
   ## there -- an upgrade with no known duration completes immediately, which is
@@ -127,7 +144,7 @@ proc upgradeSeconds*(areaType, level: int): int =
       continue
     let stages = a.field("stages." & $level)
     if stages.found:
-      return stages.field("constructionTime").asInt(0)
+      return scaleHideoutTime(stages.field("constructionTime").asInt(0))
   result = 0
 
 proc stageRequirements*(areaType, level: int): string =

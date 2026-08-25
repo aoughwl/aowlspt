@@ -40,6 +40,8 @@ import health
 import production
 import gym
 import customise
+import tuning
+import spawn
 import decorate
 import dialogue
 import insurance
@@ -87,6 +89,12 @@ proc selfCheckFailures*(): seq[string] =
   # small fixture still loads; on a real one it is the check that catches a
   # default naming the wrong body part, which is the state those ids were in.
   discard customise.selfCheckCustomisation(result)
+  # The two modules behind the expanded singleplayer surface. `tuning` proves
+  # the generated override table parses and that a patched globals document
+  # READS BACK correct -- not that the write happened, which is the check that
+  # cannot fail. `spawn` proves every refusal path carries a reason.
+  discard tuning.selfCheckTuning(result)
+  discard spawn.selfCheckSpawn(result)
   # The fifth of that shape, and the one with two halves for the same reason
   # `selfCheckCustomisation` has two. The pure half is the whole of the hideout
   # decoration planner -- which offer resolves to which field of
