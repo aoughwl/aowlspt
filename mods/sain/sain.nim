@@ -80,9 +80,11 @@ import client/bridge
 import client/driver
 import client/live
 import client/coverprobe
+import client/mainthread
 import server/serverside
 
 var gWorld = whenReady("EFT.GameWorld")
+var gDeferNoted = false
 var gPreset: Preset
 var gProbedAt = 0'i64
 var gHooked = false
@@ -1243,6 +1245,42 @@ proc onUpdate(elapsedMs: int64): Status =
   if not gPreset.enabled or side() != sideClient:
     return Ok
 
+  let now = nowMs()
+
+  # THE UNITY-THREAD GATE, and it is the first thing here because everything
+  # below it touches the runtime.
+  #
+  # `whenReady("EFT.GameWorld")` does NOT mean a world exists. It means the
+  # TYPE resolves, and the type resolves as soon as the client's metadata is
+  # up -- which is at host boot, with no raid anywhere. MEASURED, on the fov
+  # crash run, from `aowlspt-host.log`: `HOST RUNNING` at 0:00:01.328,
+  # `FOV Fix: the game world is up` at 0:00:01.375, seven types resolved, then
+  # the process was gone -- run length 1.375s, and the boot table's
+  # `Unity thread live` row never filled in. On a run with none of those mods
+  # enabled the same row is confirmed at 14.469s. So the block below used to
+  # run about thirteen seconds before Unity's thread existed, from the host's
+  # own worker, and that window is the only thing the surviving mods do not
+  # enter. This is section 9b of CLAUDE.md exactly: a readiness check that
+  # could not fail.
+  #
+  # `mainThread().bound` is the check that can. The host sets it only once its
+  # per-frame drain has ACTUALLY FIRED -- installed is not fired -- so it is
+  # positive evidence of Unity's thread rather than of our own optimism. Until
+  # it is true this mod binds nothing, hooks nothing and reads nothing; it
+  # costs one `call` every two seconds (`refreshMainThread` rate-limits
+  # itself) and it says so once.
+  let mt = refreshMainThread(now)
+  if not mt.bound:
+    if not gDeferNoted and mt.asked:
+      gDeferNoted = true
+      info "sain: " & mainThreadNote() &
+           " -- deferring every binding, hook and read until it has. " &
+           "Nothing is bound and nothing is driven, and this line is the " &
+           "reason. `EFT.GameWorld` is deliberately NOT probed yet: the type " &
+           "resolves at host boot with no raid anywhere, so probing it here " &
+           "would spend `ready()`'s one-shot on the wrong tick."
+    return Ok
+
   if gWorld.ready():
     # The world exists. Bind everything and say what took, before doing
     # anything that assumes an answer. This is the first tick on which
@@ -1252,7 +1290,6 @@ proc onUpdate(elapsedMs: int64): Status =
     announce()
     installHooks()
 
-  let now = nowMs()
   if capability() != capFull:
     # Re-probe occasionally rather than every frame: the answer only changes
     # when the game loads a raid, and `resolve` walks every loaded assembly.
