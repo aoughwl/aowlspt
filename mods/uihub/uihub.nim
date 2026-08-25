@@ -1,4 +1,4 @@
-## aowlspt/uihub — the fallback settings UI.
+## aowlspt/uihub — the settings UI, and the client library it is built out of.
 ##
 ## The problem this solves. The NATIVE in-game F12 settings screen (built on the
 ## D3D11 overlay, `abi/aowlspt_overlay.h`) has taken 20+ hours and still is not
@@ -14,10 +14,33 @@
 ## the browser warning) and it works whether or not the game is even running,
 ## as long as the backend is up.
 ##
-## The full public surface — routes, JSON shapes, how a third party builds
-## their own page against the same endpoints — is documented in
-## `docs/UI-API.md`; that document is the contract, this mod is one client of
-## it, and it is written to be read alongside this file.
+## **Two routes, one implementation.** Everything this page knows how to do —
+## call the API, filter rows, group them, draw a control for a `type` — lives in
+## a library served at `GET /aowlspt/ui/lib/settings.js` as `window.AowlSettings`.
+## The page at `/aowlspt/ui/page/settings` is a thin shell that loads that same
+## URL with a `<script src>`; it has no private copy. That is the whole answer to
+## "expose this logic so people can make their own UIs": a third-party page adds
+## one script tag and gets `AowlSettings.mount(el)` for the finished screen, or
+## `getSchema`/`setValue`/`controlFor`/`matches`/`groupRows` to build its own —
+## against the identical code path the shipped page runs, so a third-party UI
+## cannot drift from it.
+##
+## **Scale.** The design target is HUNDREDS of settings per mod (`mods/tarkov`
+## is heading there) and thousands of choices in one control (item ids). So the
+## library carries: a search that matches key/label/description/category across
+## one mod or every mod at once; collapsible category → subcategory sections
+## with a sidebar and a deep-linkable hash; incremental rendering that puts a
+## bounded number of rows in the DOM and appends the rest as you scroll; a
+## searchable typeahead for `type:"select"` (and for any `enum` with more
+## options than a dropdown should hold), able to fetch its choices on demand
+## from the row's `optionsUrl`; and a slider-plus-number pair for any numeric
+## row whose schema declared a range.
+##
+## None of that changes a single route or a single JSON shape. The `Setting`
+## object gained three OPTIONAL fields (`subcategory`, `optionLabels`,
+## `optionsUrl`) and the `type` vocabulary gained `select`, all emitted only
+## when a mod asks for them — a renderer that has never heard of any of it draws
+## exactly what it drew before. The full public surface is `docs/UI-API.md`.
 ##
 ## Why a browser page and not more overlay C code: the overlay's own render
 ## path (`aowl_ov_read_panel` et al.) is hand-written per-shape C reading a
@@ -25,8 +48,7 @@
 ## would mean a second implementation of "how to draw a Setting.kind" beside
 ## the native F12 screen's, which is exactly the divergent logic the brief
 ## rules out. A browser already has a JSON parser, a DOM and an input widget
-## for every `SettingType`; this page is ~150 lines of vanilla JS because it
-## does not have to reimplement any of that.
+## for every `SettingType`.
 ##
 ## Wire note (see `docs/UI-API.md` and fact #123): the backend deflates every
 ## response by default and never sends a `Content-Encoding` header, which is
@@ -36,7 +58,10 @@
 ## a query-string spelling of the same "send it uncompressed" request the
 ## header already supports (see `backend/aowlbackend.nim`, `parseHead`) that a
 ## browser is allowed to send. The JSON shape returned is byte-for-byte the
-## same either way — only the wire transport differs.
+## same either way — only the wire transport differs. The library route is
+## served uncompressed and as `text/javascript` for the same reason, by the
+## `/aowlspt/ui/lib/` branch in `backend/aowlbackend.nim` — a browser refuses
+## to execute a script labelled `application/json`.
 
 import aowlspt
 import aowlspt/server as sv
@@ -45,71 +70,38 @@ const
   ModGuid = "aowl.uihub"
   ModName = "Fallback Settings UI"
   ModAuthor = "savannt"
-  ModVersion = "1.0.0"
+  ModVersion = "2.0.0"
 
   PageRoute = "/aowlspt/ui/page/settings"
+  LibRoute = "/aowlspt/ui/lib/settings.js"
 
-## The whole page: markup, styling and the JS client for the settings API, as
-## one self-contained document with no external request but the ones it makes
-## back to this same backend. Kept as a single string so the mod ships as one
-## DLL, the same reasoning `mods/settingshub` gives for embedding its catalogue
-## at build time.
-const PageHtml = """<!doctype html>
-<html lang="en">
-<head>
-<meta charset="utf-8">
-<title>aowlspt settings (fallback)</title>
-<style>
-  :root { color-scheme: dark; }
-  body { font-family: -apple-system, Segoe UI, sans-serif; background:#141414; color:#ddd; margin:0; display:flex; height:100vh; }
-  nav { width:220px; overflow-y:auto; background:#1c1c1c; border-right:1px solid #2c2c2c; padding:8px; box-sizing:border-box; }
-  nav div.mod { padding:8px 10px; border-radius:6px; cursor:pointer; margin-bottom:2px; }
-  nav div.mod:hover { background:#2a2a2a; }
-  nav div.mod.active { background:#3a5a8c; color:#fff; }
-  main { flex:1; overflow-y:auto; padding:20px 28px; }
-  h1 { font-size:16px; color:#9c9c9c; font-weight:600; margin:0 0 18px; }
-  .cat { font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:#7d99c9; margin:22px 0 8px; }
-  .row { display:flex; align-items:center; justify-content:space-between; padding:8px 0; border-bottom:1px solid #232323; gap:16px; }
-  .row .label { flex:1; }
-  .row .label small { display:block; color:#888; font-weight:400; margin-top:2px; }
-  .row.dim { opacity:.5; }
-  .row input[type=text], .row select { background:#222; color:#ddd; border:1px solid #333; border-radius:4px; padding:5px 8px; min-width:140px; }
-  .row input[type=number] { background:#222; color:#ddd; border:1px solid #333; border-radius:4px; padding:5px 8px; width:90px; }
-  .row input[type=checkbox] { width:18px; height:18px; }
-  .saved { color:#6fbf6f; font-size:11px; margin-left:8px; opacity:0; transition:opacity .2s; }
-  .saved.show { opacity:1; }
-  #status { color:#888; padding:10px 0; }
-  button.reset-row { background:#262626; color:#aaa; border:1px solid #383838; border-radius:4px; padding:4px 9px; font-size:11px; cursor:pointer; }
-  button.reset-row:hover { background:#333; color:#eee; }
-  #titlebar { display:flex; align-items:center; justify-content:space-between; margin:0 0 18px; }
-  #titlebar h1 { margin:0; }
-  #resetAll { background:#4a2626; color:#e0a0a0; border:1px solid #5a3030; border-radius:4px; padding:6px 12px; font-size:12px; cursor:pointer; }
-  #resetAll:hover { background:#5a2e2e; }
-</style>
-</head>
-<body>
-<nav id="nav"><div id="status">loading&hellip;</div></nav>
-<main>
-  <div id="titlebar">
-    <h1 id="title">aowlspt &mdash; fallback settings UI</h1>
-    <button id="resetAll" style="display:none">Reset everything to default</button>
-  </div>
-  <div id="body">Pick a mod on the left. This page reads and writes the exact
-  same <code>/aowlspt/settings/&lt;guid&gt;</code> endpoint the native F12
-  screen uses &mdash; see <code>docs/UI-API.md</code> for the surface.</div>
-</main>
-<script>
-// One source of truth: the same GET/POST JSON routes the native F12 overlay
-// panel calls. `?ident=1` only changes the wire transport (see the mod's
-// docstring); the JSON shape below is exactly docs/UI-API.md.
+## The client library — the ONLY place this repo implements "talk to the
+## settings API and draw it". Served verbatim at `LibRoute`, loaded by the page
+## below, and equally loadable by anybody else's page. Kept as a source string
+## so the mod ships as one DLL with no file beside it, the same reasoning
+## `mods/settingshub` gives for embedding its catalogue at build time.
+const LibJs = """/* aowlspt settings client -- window.AowlSettings.
+ * Served at /aowlspt/ui/lib/settings.js by mods/uihub. The shipped page at
+ * /aowlspt/ui/page/settings is nothing but a shell around mount(); a third
+ * party page can do the same, or use the lower-level pieces. Contract:
+ * docs/UI-API.md. No dependencies, no build step, no framework.
+ */
+(function (global) {
+'use strict';
+
+/* ---- transport ------------------------------------------------------ */
+/* `ident=1` asks the backend for an uncompressed response. It changes the
+ * bytes on the wire and nothing about the JSON. Browser JS is not permitted
+ * to send Accept-Encoding, which is why this exists at all. */
+function withIdent(path) {
+  return path + (path.indexOf('?') >= 0 ? '&' : '?') + 'ident=1';
+}
 async function apiGet(path) {
-  const sep = path.indexOf('?') >= 0 ? '&' : '?';
-  const r = await fetch(path + sep + 'ident=1', {cache: 'no-store'});
+  var r = await fetch(withIdent(path), {cache: 'no-store'});
   return r.json();
 }
 async function apiPost(path, body) {
-  const sep = path.indexOf('?') >= 0 ? '&' : '?';
-  const r = await fetch(path + sep + 'ident=1', {
+  var r = await fetch(withIdent(path), {
     method: 'POST', cache: 'no-store',
     headers: {'Content-Type': 'application/json'},
     body: JSON.stringify(body)
@@ -117,144 +109,662 @@ async function apiPost(path, body) {
   return r.json();
 }
 
-let currentGuid = null;
-
-// A POST reply is the bare `[{Setting}...]` array on success, or
-// `{"err":"...","rows":[{Setting}...]}` when the persist failed -- see
-// docs/UI-API.md. This is the one place that tells them apart, so a
-// rejected write cannot silently look identical to an accepted one.
-function replyOk(reply) { return Array.isArray(reply); }
+/* A POST reply is the bare [{Setting}...] array on success, or
+ * {"err":"...","rows":[...]} when the persist failed. This is the one place
+ * that tells them apart, so a rejected write cannot look like an accepted
+ * one. Never weaken these to a truthiness check. */
+function replyOk(reply)   { return Array.isArray(reply); }
 function replyRows(reply) { return Array.isArray(reply) ? reply : (reply && reply.rows) || []; }
-function replyErr(reply) { return (reply && !Array.isArray(reply) && reply.err) || null; }
+function replyErr(reply)  { return (reply && !Array.isArray(reply) && reply.err) || null; }
 
-function inputFor(row, onSave) {
-  const wrap = document.createElement('span');
-  let el;
-  if (row.type === 'bool') {
-    el = document.createElement('input');
-    el.type = 'checkbox';
-    el.checked = !!row.value;
-    el.onchange = () => onSave(el.checked);
-  } else if (row.type === 'enum') {
-    el = document.createElement('select');
-    (row.options || []).forEach(o => {
-      const opt = document.createElement('option');
-      opt.value = o; opt.textContent = o;
-      if (JSON.stringify(o) === JSON.stringify(row.value)) opt.selected = true;
-      el.appendChild(opt);
-    });
-    el.onchange = () => onSave(el.value);
-  } else if (row.type === 'int' || row.type === 'float') {
-    el = document.createElement('input');
-    el.type = 'number';
-    el.value = row.value;
-    if (row.min !== undefined) el.min = row.min;
-    if (row.max !== undefined) el.max = row.max;
-    if (row.step !== undefined) el.step = row.step;
-    el.onchange = () => onSave(row.type === 'int' ? parseInt(el.value, 10) : parseFloat(el.value));
-  } else {
-    // string / keybind
-    el = document.createElement('input');
-    el.type = 'text';
-    el.value = row.value;
-    el.onchange = () => onSave(el.value);
+var S = '/aowlspt/settings/';
+function listMods()  { return apiGet(S + 'index').then(function (i) { return (i && i.mods) || []; }); }
+function getSchema(guid) { return apiGet(S + encodeURIComponent(guid)).then(replyRows); }
+function setValue(guid, key, value) { return apiPost(S + encodeURIComponent(guid), {key: key, value: value}); }
+function resetKey(guid, key) { return apiPost(S + encodeURIComponent(guid) + '/reset', {key: key}); }
+function resetAll(guid) { return apiPost(S + encodeURIComponent(guid) + '/reset', {}); }
+
+/* ---- searching and grouping ----------------------------------------- */
+
+function haystack(row) {
+  if (row.__hay === undefined) {
+    row.__hay = [row.key, row.label, row.description, row.category,
+                 row.subcategory].filter(Boolean).join(' ').toLowerCase();
   }
-  wrap.appendChild(el);
+  return row.__hay;
+}
+/* Every whitespace-separated word must appear somewhere in the row's text.
+ * AND, not OR, because with hundreds of rows an OR search returns the whole
+ * list and reads as "search is broken". */
+function matches(row, query) {
+  var t = (query || '').trim().toLowerCase();
+  if (!t) return true;
+  var h = haystack(row);
+  return t.split(/\s+/).every(function (w) { return h.indexOf(w) >= 0; });
+}
+
+/* [{name, subs:[{name, rows:[row...]}]}] in DECLARATION order -- a mod author
+ * orders their schema deliberately and re-sorting it alphabetically throws
+ * that away. Rows with no category land in one leading unnamed group. */
+function groupRows(rows) {
+  var cats = [], byCat = {};
+  rows.forEach(function (row) {
+    var c = row.category || '', sc = row.subcategory || '';
+    var g = byCat[c];
+    if (!g) { g = byCat[c] = {name: c, subs: [], bySub: {}}; cats.push(g); }
+    var sg = g.bySub[sc];
+    if (!sg) { sg = g.bySub[sc] = {name: sc, rows: []}; g.subs.push(sg); }
+    sg.rows.push(row);
+  });
+  return cats;
+}
+
+/* ---- controls -------------------------------------------------------- */
+
+/* An inline <select> stops being usable somewhere around here; past it a row
+ * gets the typeahead even if it only declared itself an `enum`. */
+var INLINE_OPTION_MAX = 24;
+
+function el(tag, cls, text) {
+  var e = document.createElement(tag);
+  if (cls) e.className = cls;
+  if (text !== undefined && text !== null) e.textContent = text;
+  return e;
+}
+
+/* options + optionLabels (parallel, optional) -> [{value,label}]. */
+function inlineOptions(row) {
+  var opts = row.options || [], labels = row.optionLabels || [];
+  var useLabels = labels.length === opts.length;
+  return opts.map(function (o, i) {
+    return {value: o, label: useLabels ? labels[i] : String(o)};
+  });
+}
+function labelForValue(row, value) {
+  var v = value === undefined || value === null ? '' : String(value);
+  var inline = inlineOptions(row);
+  for (var i = 0; i < inline.length; i++) {
+    if (String(inline[i].value) === v) return inline[i].label;
+  }
+  return v;
+}
+
+/* A searchable select. Draws the CURRENT value as text, filters as you type,
+ * and shows at most TYPEAHEAD_MAX matches -- the point of this control is that
+ * the option set may be in the thousands, so it must never build a DOM node
+ * per option. Choices come from the row's inline `options` and, when the row
+ * declares an `optionsUrl`, from that route as the user types:
+ *   GET <optionsUrl>?q=<term>&limit=<n> -> {"options":[{value,label}...]}
+ * Committing requires PICKING a listed choice (click, Enter, or typing text
+ * that exactly matches one). Free text is refused and the box reverts, so a
+ * typo can never be persisted as an item id. */
+var TYPEAHEAD_MAX = 60;
+
+function typeahead(row, onSave) {
+  var wrap = el('span', 'ta');
+  var input = el('input', 'ta-input');
+  input.type = 'text';
+  input.placeholder = 'search' + (row.options && row.options.length
+                                  ? ' ' + row.options.length + ' choices' : '');
+  var committed = row.value === undefined || row.value === null ? '' : String(row.value);
+  input.value = labelForValue(row, committed);
+  var list = el('div', 'ta-list');
+  list.style.display = 'none';
+  var note = el('div', 'ta-note');
+  wrap.appendChild(input);
+  wrap.appendChild(list);
+  wrap.appendChild(note);
+
+  var shown = [], cursor = -1, seq = 0, timer = null;
+
+  function close() { list.style.display = 'none'; cursor = -1; }
+  function revert() { input.value = labelForValue(row, committed); }
+
+  function draw(items, truncated) {
+    list.innerHTML = '';
+    shown = items;
+    if (!items.length) {
+      list.appendChild(el('div', 'ta-empty', 'no match'));
+    } else {
+      items.forEach(function (o, i) {
+        var d = el('div', 'ta-opt', o.label);
+        if (o.label !== String(o.value)) d.appendChild(el('small', null, String(o.value)));
+        d.onmousedown = function (ev) { ev.preventDefault(); commit(o); };
+        d.onmouseenter = function () { setCursor(i); };
+        list.appendChild(d);
+      });
+      if (truncated) {
+        list.appendChild(el('div', 'ta-empty',
+          'showing first ' + items.length + ' -- keep typing to narrow'));
+      }
+    }
+    list.style.display = '';
+  }
+  function setCursor(i) {
+    cursor = i;
+    Array.prototype.forEach.call(list.querySelectorAll('.ta-opt'), function (d, j) {
+      d.classList.toggle('on', j === i);
+    });
+  }
+  function commit(o) {
+    committed = String(o.value);
+    input.value = o.label;
+    close();
+    onSave(o.value);
+  }
+
+  async function search(term) {
+    var mine = ++seq;
+    var t = term.trim().toLowerCase();
+    var out = [], truncated = false;
+    var inline = inlineOptions(row);
+    for (var i = 0; i < inline.length; i++) {
+      var o = inline[i];
+      if (!t || o.label.toLowerCase().indexOf(t) >= 0 ||
+          String(o.value).toLowerCase().indexOf(t) >= 0) {
+        if (out.length >= TYPEAHEAD_MAX) { truncated = true; break; }
+        out.push(o);
+      }
+    }
+    if (row.optionsUrl) {
+      note.textContent = 'searching' + String.fromCharCode(0x2026);
+      try {
+        var sep = row.optionsUrl.indexOf('?') >= 0 ? '&' : '?';
+        var res = await apiGet(row.optionsUrl + sep + 'q=' + encodeURIComponent(term) +
+                               '&limit=' + TYPEAHEAD_MAX);
+        if (mine !== seq) return;               /* a newer keystroke won */
+        note.textContent = '';
+        var remote = (res && res.options) || [];
+        var seen = {};
+        out.forEach(function (o) { seen[String(o.value)] = 1; });
+        remote.forEach(function (o) {
+          var v = String(o.value === undefined ? o : o.value);
+          if (seen[v]) return;
+          seen[v] = 1;
+          if (out.length >= TYPEAHEAD_MAX) { truncated = true; return; }
+          out.push({value: v, label: o.label === undefined ? v : String(o.label)});
+        });
+      } catch (e) {
+        if (mine !== seq) return;
+        /* Say so. A typeahead that silently shows only the inline options
+         * after its remote source failed is the "declines quietly" shape. */
+        note.textContent = 'option source unreachable: ' + e;
+      }
+    }
+    if (mine !== seq) return;
+    draw(out, truncated);
+  }
+
+  input.onfocus = function () { search(''); };
+  input.oninput = function () {
+    if (timer) clearTimeout(timer);
+    var v = input.value;
+    timer = setTimeout(function () { search(v); }, 140);
+  };
+  input.onkeydown = function (ev) {
+    if (ev.key === 'ArrowDown') { ev.preventDefault(); setCursor(Math.min(cursor + 1, shown.length - 1)); }
+    else if (ev.key === 'ArrowUp') { ev.preventDefault(); setCursor(Math.max(cursor - 1, 0)); }
+    else if (ev.key === 'Enter') {
+      ev.preventDefault();
+      if (cursor >= 0 && shown[cursor]) commit(shown[cursor]);
+      else {
+        var t = input.value.trim().toLowerCase();
+        var hit = shown.filter(function (o) {
+          return o.label.toLowerCase() === t || String(o.value).toLowerCase() === t;
+        })[0];
+        if (hit) commit(hit); else revert();
+      }
+    } else if (ev.key === 'Escape') { revert(); close(); input.blur(); }
+  };
+  input.onblur = function () {
+    setTimeout(function () { close(); revert(); }, 120);
+  };
   return wrap;
 }
 
-async function loadPage(guid) {
-  currentGuid = guid;
-  document.querySelectorAll('#nav .mod').forEach(d => d.classList.toggle('active', d.dataset.guid === guid));
-  const rows = await apiGet('/aowlspt/settings/' + encodeURIComponent(guid));
-  const body = document.getElementById('body');
-  body.innerHTML = '';
-  document.getElementById('title').textContent = guid;
-  const resetAll = document.getElementById('resetAll');
-  resetAll.style.display = '';
-  resetAll.onclick = async () => {
-    if (!confirm('Reset every setting on this page to its default? This discards everything you have set for ' + guid + '.')) return;
-    const reply = await apiPost('/aowlspt/settings/' + encodeURIComponent(guid) + '/reset', {});
-    if (replyOk(reply)) loadPage(guid);
-    else alert('Reset did not persist: ' + replyErr(reply));
+/* Numeric: a slider whenever the schema declared a range, plus a typed box,
+ * both bound to the same value. Without a range there is only the box --
+ * inventing min/max would be a lie about what the mod declared. */
+function numeric(row, onSave) {
+  var wrap = el('span', 'num');
+  var isInt = row.type === 'int';
+  var parse = function (s) { return isInt ? parseInt(s, 10) : parseFloat(s); };
+  var box = el('input', 'num-box');
+  box.type = 'number';
+  box.value = row.value;
+  var hasRange = row.min !== undefined && row.max !== undefined && row.max > row.min;
+  var slider = null;
+  if (hasRange) {
+    slider = el('input', 'num-slider');
+    slider.type = 'range';
+    slider.min = row.min; slider.max = row.max;
+    slider.step = row.step !== undefined && row.step > 0 ? row.step : (isInt ? 1 : 'any');
+    slider.value = row.value;
+    slider.oninput = function () { box.value = slider.value; };
+    slider.onchange = function () { onSave(parse(slider.value)); };
+    wrap.appendChild(slider);
+  }
+  if (row.min !== undefined) box.min = row.min;
+  if (row.max !== undefined) box.max = row.max;
+  if (row.step !== undefined && row.step > 0) box.step = row.step;
+  box.onchange = function () {
+    if (slider) slider.value = box.value;
+    onSave(parse(box.value));
   };
-  let lastCat = null;
-  (replyRows(rows)).forEach(row => {
-    if ((row.category || '') !== lastCat) {
-      lastCat = row.category || '';
-      if (lastCat) {
-        const h = document.createElement('div');
-        h.className = 'cat'; h.textContent = lastCat;
-        body.appendChild(h);
-      }
+  wrap.appendChild(box);
+  return wrap;
+}
+
+/* The one switch on `row.type`. Everything that draws a settings row in this
+ * project goes through here. */
+function controlFor(row, onSave) {
+  var wrap = el('span', 'ctl');
+  var e;
+  if (row.type === 'bool') {
+    e = el('input');
+    e.type = 'checkbox';
+    e.checked = !!row.value;
+    e.onchange = function () { onSave(e.checked); };
+  } else if (row.type === 'select' ||
+             (row.type === 'enum' && ((row.options || []).length > INLINE_OPTION_MAX ||
+                                      row.optionsUrl))) {
+    e = typeahead(row, onSave);
+  } else if (row.type === 'enum') {
+    e = el('select');
+    inlineOptions(row).forEach(function (o) {
+      var opt = document.createElement('option');
+      opt.value = o.value; opt.textContent = o.label;
+      if (String(o.value) === String(row.value)) opt.selected = true;
+      e.appendChild(opt);
+    });
+    e.onchange = function () { onSave(e.value); };
+  } else if (row.type === 'int' || row.type === 'float') {
+    e = numeric(row, onSave);
+  } else {
+    e = el('input');                        /* string / keybind */
+    e.type = 'text';
+    e.value = row.value;
+    e.onchange = function () { onSave(e.value); };
+  }
+  wrap.appendChild(e);
+  return wrap;
+}
+
+/* ---- the page -------------------------------------------------------- */
+
+/* Rows put into the DOM per batch. Hundreds of rows across a dozen mods is
+ * thousands of nodes if drawn eagerly; this draws a screenful and appends the
+ * rest as the sentinel scrolls into view, so time-to-interactive does not
+ * depend on how many settings exist. */
+var CHUNK = 50;
+
+function mount(root, opts) {
+  opts = opts || {};
+  var state = {
+    mods: [], guid: null, rows: [], schemas: {},
+    query: '', scope: 'mod', collapsed: {}, flat: [], drawn: 0, busy: false
+  };
+
+  root.innerHTML =
+    '<nav id="aw-nav"><div class="aw-search"><input id="aw-q" type="search" placeholder="Search all settings"></div>' +
+    '<label class="aw-scope"><input type="checkbox" id="aw-all"> search every mod</label>' +
+    '<div id="aw-mods"></div><div id="aw-cats"></div></nav>' +
+    '<main id="aw-main"><div id="aw-titlebar"><h1 id="aw-title">aowlspt settings</h1>' +
+    '<span id="aw-count"></span><button id="aw-resetall" style="display:none">Reset everything to default</button></div>' +
+    '<div id="aw-body"></div><div id="aw-sentinel"></div></main>';
+
+  var $ = function (id) { return root.querySelector('#' + id); };
+  var body = $('aw-body'), main = $('aw-main'), sentinel = $('aw-sentinel');
+
+  /* ---- deep links: #guid=<guid>&cat=<category>&q=<query> ---- */
+  function readHash() {
+    var h = (location.hash || '').replace(/^#/, ''), out = {};
+    h.split('&').forEach(function (p) {
+      var i = p.indexOf('=');
+      if (i > 0) out[p.substr(0, i)] = decodeURIComponent(p.substr(i + 1));
+    });
+    return out;
+  }
+  function writeHash(extra) {
+    var parts = [];
+    if (state.guid) parts.push('guid=' + encodeURIComponent(state.guid));
+    if (extra && extra.cat) parts.push('cat=' + encodeURIComponent(extra.cat));
+    if (state.query) parts.push('q=' + encodeURIComponent(state.query));
+    var h = '#' + parts.join('&');
+    if (location.hash !== h) history.replaceState(null, '', h);
+  }
+
+  function catId(guid, cat, sub) {
+    return 'sec-' + btoa(unescape(encodeURIComponent(guid + '::' + cat + '::' + (sub || ''))))
+                    .replace(/[^A-Za-z0-9]/g, '');
+  }
+
+  /* ---- flatten: sections + rows, honouring search and collapse ---- */
+  function rebuild() {
+    var flat = [], sources;
+    if (state.scope === 'all') {
+      sources = state.mods.map(function (m) { return {guid: m.guid, name: m.name, rows: state.schemas[m.guid] || []}; });
+    } else {
+      var m = state.mods.filter(function (x) { return x.guid === state.guid; })[0];
+      sources = [{guid: state.guid, name: (m && m.name) || state.guid, rows: state.rows}];
     }
-    const r = document.createElement('div');
-    r.className = 'row' + (row.implemented === false ? ' dim' : '');
-    const lab = document.createElement('div');
-    lab.className = 'label';
-    lab.innerHTML = '<div>' + row.label + '</div>' +
-      (row.description ? '<small>' + row.description + '</small>' : '');
+    var total = 0, shownCount = 0;
+    sources.forEach(function (src) {
+      var kept = src.rows.filter(function (r) { return matches(r, state.query); });
+      total += src.rows.length;
+      shownCount += kept.length;
+      if (!kept.length) return;
+      if (state.scope === 'all') flat.push({t: 'mod', guid: src.guid, name: src.name, n: kept.length});
+      groupRows(kept).forEach(function (g) {
+        var key = src.guid + '::' + g.name;
+        var isCollapsed = !!state.collapsed[key];
+        var n = 0;
+        g.subs.forEach(function (s) { n += s.rows.length; });
+        if (g.name) flat.push({t: 'cat', guid: src.guid, name: g.name, n: n, key: key,
+                               collapsed: isCollapsed, id: catId(src.guid, g.name)});
+        if (isCollapsed) return;
+        g.subs.forEach(function (s) {
+          if (s.name) flat.push({t: 'sub', guid: src.guid, name: s.name,
+                                 id: catId(src.guid, g.name, s.name)});
+          s.rows.forEach(function (r) { flat.push({t: 'row', guid: src.guid, row: r}); });
+        });
+      });
+    });
+    state.flat = flat;
+    state.drawn = 0;
+    body.innerHTML = '';
+    $('aw-count').textContent = state.query
+      ? shownCount + ' of ' + total + ' settings match'
+      : total + ' settings';
+    drawMore();
+    drawSidebar(sources);
+  }
+
+  function drawMore() {
+    var end = Math.min(state.flat.length, state.drawn + CHUNK);
+    for (var i = state.drawn; i < end; i++) body.appendChild(nodeFor(state.flat[i]));
+    state.drawn = end;
+    /* If the batch did not fill the viewport there is nothing to scroll and
+     * the sentinel would never fire again -- keep going until it does. */
+    if (state.drawn < state.flat.length && main.scrollHeight <= main.clientHeight + 40) drawMore();
+  }
+
+  function nodeFor(item) {
+    if (item.t === 'mod') {
+      var mh = el('div', 'aw-modhead', item.name);
+      mh.appendChild(el('small', null, ' ' + item.guid + ' -- ' + item.n));
+      return mh;
+    }
+    if (item.t === 'cat') {
+      var h = el('div', 'aw-cat' + (item.collapsed ? ' collapsed' : ''));
+      h.id = item.id;
+      h.appendChild(el('span', 'aw-caret', item.collapsed ? '+' : '-'));
+      h.appendChild(el('span', 'aw-catname', item.name));
+      h.appendChild(el('span', 'aw-catn', String(item.n)));
+      h.onclick = function () {
+        state.collapsed[item.key] = !state.collapsed[item.key];
+        rebuild();
+      };
+      return h;
+    }
+    if (item.t === 'sub') {
+      var s = el('div', 'aw-sub', item.name);
+      s.id = item.id;
+      return s;
+    }
+    return rowNode(item.guid, item.row);
+  }
+
+  function rowNode(guid, row) {
+    var r = el('div', 'aw-row' + (row.implemented === false ? ' dim' : ''));
+    var lab = el('div', 'aw-label');
+    lab.appendChild(el('div', null, row.label || row.key));
+    var meta = el('small', null, row.description || '');
+    if (row.description) lab.appendChild(meta);
+    lab.appendChild(el('small', 'aw-key', row.key));
     r.appendChild(lab);
-    const saved = document.createElement('span');
-    saved.className = 'saved'; saved.textContent = 'saved';
-    const ctl = inputFor(row, async (val) => {
-      const reply = await apiPost('/aowlspt/settings/' + encodeURIComponent(guid),
-        {key: row.key, value: val});
+    var saved = el('span', 'aw-saved', 'saved');
+    var ctl = controlFor(row, async function (val) {
+      var reply = await setValue(guid, row.key, val);
       if (replyOk(reply)) {
         saved.classList.add('show');
-        setTimeout(() => saved.classList.remove('show'), 900);
+        setTimeout(function () { saved.classList.remove('show'); }, 900);
+        refreshFrom(guid, reply);
       } else {
         alert('Did not save "' + row.key + '": ' + replyErr(reply));
+        refreshFrom(guid, replyRows(reply));
       }
-      // Re-render from the reply so a value the backend clamped or rejected
-      // shows what actually landed, not what was typed -- the single-source-
-      // of-truth rule applies to a rejected write as much as an accepted one.
-      loadPage(guid);
     });
     ctl.appendChild(saved);
     r.appendChild(ctl);
-    const resetBtn = document.createElement('button');
-    resetBtn.className = 'reset-row';
-    resetBtn.textContent = 'Reset';
-    resetBtn.title = 'Reset this to default';
-    resetBtn.onclick = async () => {
-      const reply = await apiPost('/aowlspt/settings/' + encodeURIComponent(guid) + '/reset',
-        {key: row.key});
-      if (replyOk(reply)) loadPage(guid);
+    var rb = el('button', 'aw-reset', 'Reset');
+    rb.title = 'Reset this to its declared default';
+    rb.onclick = async function () {
+      var reply = await resetKey(guid, row.key);
+      if (replyOk(reply)) refreshFrom(guid, reply);
       else alert('Reset of "' + row.key + '" did not persist: ' + replyErr(reply));
     };
-    r.appendChild(resetBtn);
-    body.appendChild(r);
-  });
-  if (!rows || !rows.length) {
-    body.innerHTML = '<p>No declared settings for this mod, or the schema came back empty.</p>';
+    r.appendChild(rb);
+    return r;
   }
-}
 
-async function init() {
-  const nav = document.getElementById('nav');
-  try {
-    const idx = await apiGet('/aowlspt/settings/index');
-    nav.innerHTML = '';
-    const mods = (idx && idx.mods) || [];
-    if (!mods.length) {
-      nav.innerHTML = '<div id="status">No mod has declared settings yet.</div>';
+  /* Re-render from the SERVER reply, so a value the backend clamped, coerced
+   * or refused shows what actually landed rather than what was typed. The
+   * whole list is rebuilt rather than the one row patched, because a mod is
+   * free to change other rows in response to an edit. */
+  function refreshFrom(guid, rows) {
+    state.schemas[guid] = rows;
+    if (guid === state.guid) state.rows = rows;
+    var top = main.scrollTop;
+    rebuild();
+    main.scrollTop = top;
+  }
+
+  function drawSidebar(sources) {
+    var mods = $('aw-mods');
+    mods.innerHTML = '';
+    state.mods.forEach(function (m) {
+      var d = el('div', 'aw-mod' + (m.guid === state.guid && state.scope === 'mod' ? ' active' : ''),
+                 m.name + ' (' + m.count + ')');
+      d.onclick = function () { state.scope = 'mod'; $('aw-all').checked = false; open(m.guid); };
+      mods.appendChild(d);
+    });
+    var cats = $('aw-cats');
+    cats.innerHTML = '';
+    var seen = {};
+    state.flat.forEach(function (item) {
+      if (item.t !== 'cat' && item.t !== 'sub') return;
+      if (seen[item.id]) return;
+      seen[item.id] = 1;
+      var d = el('div', item.t === 'cat' ? 'aw-navcat' : 'aw-navsub',
+                 item.name + (item.t === 'cat' ? ' (' + item.n + ')' : ''));
+      d.onclick = function () {
+        var target = root.querySelector('#' + item.id);
+        /* The section may not be drawn yet -- draw until it is, or say so
+         * rather than doing nothing when the anchor is past the cursor. */
+        var guard = 0;
+        while (!target && state.drawn < state.flat.length && guard++ < 200) {
+          drawMore();
+          target = root.querySelector('#' + item.id);
+        }
+        /* Hash FIRST: the deep link is the durable half, and it must land
+         * even where scrollIntoView does not exist (jsdom found this -- the
+         * throw skipped the link entirely). */
+        if (target) {
+          writeHash({cat: item.name});
+          if (target.scrollIntoView) target.scrollIntoView({block: 'start'});
+        }
+      };
+      cats.appendChild(d);
+    });
+  }
+
+  async function open(guid, keepQuery) {
+    state.guid = guid;
+    $('aw-title').textContent = (state.mods.filter(function (m) { return m.guid === guid; })[0] || {name: guid}).name;
+    $('aw-resetall').style.display = '';
+    if (!state.schemas[guid]) state.schemas[guid] = await getSchema(guid);
+    state.rows = state.schemas[guid];
+    if (!keepQuery) writeHash();
+    rebuild();
+  }
+
+  async function loadAll() {
+    for (var i = 0; i < state.mods.length; i++) {
+      var g = state.mods[i].guid;
+      if (!state.schemas[g]) state.schemas[g] = await getSchema(g);
+    }
+  }
+
+  $('aw-q').oninput = function () {
+    state.query = $('aw-q').value;
+    writeHash();
+    rebuild();
+  };
+  $('aw-all').onchange = async function () {
+    state.scope = $('aw-all').checked ? 'all' : 'mod';
+    if (state.scope === 'all') {
+      $('aw-count').textContent = 'loading every mod' + String.fromCharCode(0x2026);
+      await loadAll();
+      $('aw-title').textContent = 'Every mod';
+    } else if (state.guid) {
+      $('aw-title').textContent = (state.mods.filter(function (m) { return m.guid === state.guid; })[0] || {name: state.guid}).name;
+    }
+    rebuild();
+  };
+  $('aw-resetall').onclick = async function () {
+    var g = state.guid;
+    if (!g) return;
+    if (!confirm('Reset every setting on this page to its default? This discards everything you have set for ' + g + '.')) return;
+    var reply = await resetAll(g);
+    if (replyOk(reply)) refreshFrom(g, reply);
+    else alert('Reset did not persist: ' + replyErr(reply));
+  };
+
+  if (global.IntersectionObserver) {
+    new IntersectionObserver(function (es) {
+      if (es[0].isIntersecting && state.drawn < state.flat.length) drawMore();
+    }, {root: main, rootMargin: '400px'}).observe(sentinel);
+  } else {
+    main.onscroll = function () {
+      if (main.scrollTop + main.clientHeight > main.scrollHeight - 400) drawMore();
+    };
+  }
+
+  (async function () {
+    try {
+      state.mods = await listMods();
+    } catch (e) {
+      body.textContent = 'Could not reach the backend: ' + e;
       return;
     }
-    mods.forEach(m => {
-      const d = document.createElement('div');
-      d.className = 'mod';
-      d.dataset.guid = m.guid;
-      d.textContent = m.name + ' (' + m.count + ')';
-      d.onclick = () => loadPage(m.guid);
-      nav.appendChild(d);
-    });
-    loadPage(mods[0].guid);
-  } catch (e) {
-    nav.innerHTML = '<div id="status">Could not reach the backend: ' + e + '</div>';
-  }
+    if (!state.mods.length) {
+      $('aw-mods').innerHTML = '<div class="aw-note">No mod has declared settings yet.</div>';
+      body.textContent = 'Nothing to show: /aowlspt/settings/index returned no mods.';
+      return;
+    }
+    var h = readHash();
+    if (h.q) { state.query = h.q; $('aw-q').value = h.q; }
+    var want = h.guid && state.mods.some(function (m) { return m.guid === h.guid; }) ? h.guid : state.mods[0].guid;
+    await open(want, true);
+    if (h.cat) {
+      var target = root.querySelector('#' + catId(want, h.cat));
+      var guard = 0;
+      while (!target && state.drawn < state.flat.length && guard++ < 200) {
+        drawMore();
+        target = root.querySelector('#' + catId(want, h.cat));
+      }
+      if (target && target.scrollIntoView) target.scrollIntoView({block: 'start'});
+    }
+  })();
+
+  return state;
 }
-init();
+
+global.AowlSettings = {
+  apiGet: apiGet, apiPost: apiPost,
+  replyOk: replyOk, replyRows: replyRows, replyErr: replyErr,
+  listMods: listMods, getSchema: getSchema,
+  setValue: setValue, resetKey: resetKey, resetAll: resetAll,
+  matches: matches, groupRows: groupRows,
+  inlineOptions: inlineOptions, labelForValue: labelForValue,
+  controlFor: controlFor, mount: mount
+};
+})(window);
+"""
+
+## The page: a shell. Every behaviour it has comes from `LibJs` over HTTP, so
+## the shipped page and a third party's page run identical code.
+const PageHtml = """<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>aowlspt settings</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: -apple-system, Segoe UI, sans-serif; background:#141414; color:#ddd; margin:0; }
+  #app { display:flex; height:100vh; }
+  #aw-nav { width:260px; overflow-y:auto; background:#1c1c1c; border-right:1px solid #2c2c2c; padding:8px; box-sizing:border-box; }
+  .aw-search input { width:100%; box-sizing:border-box; background:#222; color:#ddd; border:1px solid #333; border-radius:6px; padding:7px 9px; font-size:13px; }
+  .aw-scope { display:block; font-size:11px; color:#888; margin:8px 2px 10px; cursor:pointer; }
+  #aw-mods { border-bottom:1px solid #282828; padding-bottom:8px; margin-bottom:8px; }
+  .aw-mod { padding:7px 10px; border-radius:6px; cursor:pointer; margin-bottom:2px; font-size:13px; }
+  .aw-mod:hover { background:#2a2a2a; }
+  .aw-mod.active { background:#3a5a8c; color:#fff; }
+  .aw-navcat { padding:5px 10px; font-size:12px; color:#9fb6d8; cursor:pointer; border-radius:5px; }
+  .aw-navsub { padding:3px 10px 3px 22px; font-size:11px; color:#7f8a99; cursor:pointer; border-radius:5px; }
+  .aw-navcat:hover, .aw-navsub:hover { background:#262626; color:#fff; }
+  .aw-note { color:#888; font-size:12px; padding:8px 10px; }
+  #aw-main { flex:1; overflow-y:auto; padding:18px 26px 60vh; }
+  #aw-titlebar { display:flex; align-items:center; gap:14px; margin:0 0 14px; position:sticky; top:0; background:#141414; padding:6px 0 10px; z-index:5; }
+  #aw-title { font-size:16px; color:#ddd; font-weight:600; margin:0; }
+  #aw-count { color:#777; font-size:12px; flex:1; }
+  #aw-resetall { background:#4a2626; color:#e0a0a0; border:1px solid #5a3030; border-radius:4px; padding:6px 12px; font-size:12px; cursor:pointer; }
+  #aw-resetall:hover { background:#5a2e2e; }
+  .aw-modhead { font-size:14px; color:#fff; font-weight:600; margin:26px 0 4px; border-bottom:1px solid #333; padding-bottom:5px; }
+  .aw-modhead small { color:#666; font-weight:400; font-size:11px; }
+  .aw-cat { display:flex; align-items:center; gap:8px; font-size:12px; text-transform:uppercase; letter-spacing:.06em; color:#7d99c9; margin:20px 0 6px; cursor:pointer; user-select:none; }
+  .aw-cat:hover { color:#a9c4ee; }
+  .aw-caret { font-size:10px; width:10px; }
+  .aw-catn { color:#5c5c5c; font-size:11px; letter-spacing:0; }
+  .aw-sub { font-size:11px; color:#8a8a8a; margin:12px 0 4px 2px; letter-spacing:.04em; }
+  .aw-row { display:flex; align-items:center; justify-content:space-between; padding:7px 0; border-bottom:1px solid #232323; gap:16px; }
+  .aw-label { flex:1; min-width:0; font-size:13px; }
+  .aw-label small { display:block; color:#888; font-weight:400; margin-top:2px; font-size:11px; }
+  .aw-label small.aw-key { color:#4d4d4d; font-family:ui-monospace, Consolas, monospace; }
+  .aw-row.dim { opacity:.5; }
+  .aw-row input[type=text], .aw-row select, .ta-input { background:#222; color:#ddd; border:1px solid #333; border-radius:4px; padding:5px 8px; min-width:170px; }
+  .num { display:inline-flex; align-items:center; gap:10px; }
+  .num-slider { width:150px; accent-color:#5a86c9; }
+  .num-box { background:#222; color:#ddd; border:1px solid #333; border-radius:4px; padding:5px 8px; width:86px; }
+  .aw-row input[type=checkbox] { width:18px; height:18px; }
+  .ctl { display:inline-flex; align-items:center; }
+  .ta { position:relative; display:inline-block; }
+  .ta-list { position:absolute; z-index:20; right:0; top:100%; margin-top:2px; width:340px; max-height:280px; overflow-y:auto; background:#1d1d1d; border:1px solid #3a3a3a; border-radius:6px; box-shadow:0 8px 22px #000a; }
+  .ta-opt { padding:6px 9px; font-size:12px; cursor:pointer; }
+  .ta-opt small { display:block; color:#6a6a6a; font-family:ui-monospace, Consolas, monospace; font-size:10px; }
+  .ta-opt.on, .ta-opt:hover { background:#33465f; }
+  .ta-empty { padding:6px 9px; font-size:11px; color:#777; }
+  .ta-note { font-size:10px; color:#a08a5a; }
+  .aw-saved { color:#6fbf6f; font-size:11px; margin-left:8px; opacity:0; transition:opacity .2s; }
+  .aw-saved.show { opacity:1; }
+  .aw-reset { background:#262626; color:#aaa; border:1px solid #383838; border-radius:4px; padding:4px 9px; font-size:11px; cursor:pointer; }
+  .aw-reset:hover { background:#333; color:#eee; }
+</style>
+</head>
+<body>
+<div id="app">Loading the settings client&hellip;</div>
+<script src="/aowlspt/ui/lib/settings.js?ident=1"></script>
+<script>
+// The page owns nothing but this call. If the library route did not load, say
+// so plainly rather than showing an empty frame that looks like "no settings".
+if (window.AowlSettings) {
+  AowlSettings.mount(document.getElementById('app'));
+} else {
+  document.getElementById('app').textContent =
+    'Could not load /aowlspt/ui/lib/settings.js -- the settings client did not load, so nothing on this page will work.';
+}
 </script>
 </body>
 </html>
@@ -263,14 +773,20 @@ init();
 proc onPage(url, body, session: string): string =
   result = PageHtml
 
+proc onLib(url, body, session: string): string =
+  result = LibJs
+
 proc onLoad(): Status =
   if side() != sideServer:
     info ModName & " is a server-side page; nothing to do on this side"
     return Ok
+  if serve(LibRoute, onLib) != Ok:
+    warn "could not register " & LibRoute &
+         " -- the settings page will load but do nothing"
   if serve(PageRoute, onPage) != Ok:
     warn "could not register " & PageRoute
-  success ModName & " " & ModVersion & " serving " & PageRoute &
-          " -- the same /aowlspt/settings/* routes the native F12 screen uses"
+  success ModName & " " & ModVersion & " serving " & PageRoute & " and " &
+          LibRoute & " -- the same /aowlspt/settings/* routes the native F12 screen uses"
   Ok
 
 exportMod(

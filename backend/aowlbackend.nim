@@ -1385,6 +1385,17 @@ proc handleRequest(sock: uint64; buf: HostPtr; len: int32;
       # uncompressed, and with a real `text/html` Content-Type so the browser
       # renders it instead of offering it as a JSON download.
       sendResponse(sock, "200 OK", body, false, req.keepAlive, "text/html; charset=utf-8")
+    elif fpath.len >= 16 and fpath.substr(0, 15) == "/aowlspt/ui/lib/":
+      # The settings UI client library (docs/UI-API.md). Same reasoning as the
+      # page above -- a browser fetches it with a plain `<script src>` and can
+      # neither ask for `identity` nor inflate -- plus the MIME type has to be
+      # a script type: a browser will refuse to execute a `<script src>` served
+      # as `application/json`. Serving the library over HTTP rather than
+      # inlining it in the page is what lets a THIRD-PARTY page reuse the exact
+      # same settings client the shipped page runs, instead of reimplementing
+      # it and drifting.
+      sendResponse(sock, "200 OK", body, false, req.keepAlive,
+                   "text/javascript; charset=utf-8")
     else:
       # `/client/metadata` must go out uncompressed, whatever the request asked
       # for. It is read during `il2cpp_init` by a regex that scans the raw bytes

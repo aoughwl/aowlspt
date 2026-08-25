@@ -6,10 +6,11 @@ Status: design only, not implemented. Target: `feat-mod-settings-api`.
 
 Two pieces of working infrastructure cover most of this problem already:
 
-1. **`aowl/src/aowlspt/settings.nim`** (232 lines) — a mod-facing schema
+1. **`aowl/src/aowlspt/settings.nim`** — a mod-facing schema
    library. `Setting`/`SettingType` (`stBool stInt stFloat stEnum stString
-   stKeybind`), builder procs (`boolSetting`, `intSetting`, `floatSetting`,
-   `enumSetting`, `stringSetting`, `keybindSetting`), `declareSettings()` /
+   stKeybind stSelect`), builder procs (`boolSetting`, `intSetting`,
+   `floatSetting`, `enumSetting`, `stringSetting`, `keybindSetting`,
+   `selectSetting`), `declareSettings()` /
    `declaredSettings()` / `declaredSchemaJson()`, and the write path
    `applySettingFromBody()` → `configSet()` → the mod's own `config.json`.
    Nine mods already call `declareSettings` + `serve("/aowlspt/settings/" &
@@ -69,7 +70,18 @@ heuristic, not measured, and worth revisiting once real mods use it.
 
 Reuse `Setting.toJson()`'s shape verbatim — it already carries everything a
 native row needs (`key label type default value min max step options
-category description implemented`). No new JSON shape for the schema itself.
+category subcategory description implemented`). No new JSON shape for the
+schema itself.
+
+**Since, for scale** (see `docs/UI-API.md` for the wire contract): every row
+may carry `subcategory` — one grouping level inside `category` — and
+`stSelect` exists for an enumeration too large to draw as a dropdown. A
+`selectSetting` may ship its choices inline (`options`, with optional
+parallel `optionLabels`) or name an `optionsUrl` the UI queries as the user
+types, which is what makes "pick one of several thousand item ids" a
+declarable setting rather than a bespoke screen. The value on the wire and in
+`config.json` is a plain string either way, exactly like `stEnum`, so nothing
+about persistence changed and an older renderer degrades to a dropdown.
 
 New routes, following the `settingshub` aggregation pattern and the existing
 per-mod `/aowlspt/settings/<guid>` convention (`matchRoute`'s exact-match /

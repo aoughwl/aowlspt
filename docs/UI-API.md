@@ -18,7 +18,9 @@ does not expose, the fix is to add it to the route, not to the UI.
 | POST | `/aowlspt/settings/<guid>/reset` | body `{"key":"<configKey>"}` resets that one key, or an empty body `{}` resets every key this mod declares — in both cases to the value in that key's `default` field, the schema's one source of truth. Same success/failure reply shape as the write route above |
 | GET | `/aowlspt/settings/spt/index` | `{"pages":[{id,label,count,done}...]}` — the read-only SPT config catalogue (`mods/settingshub`) |
 | GET | `/aowlspt/settings/spt/page/<id>` | `{"settings":[...],"nested":[...]}` — one SPT config page, all `implemented:false` today |
-| GET | `/aowlspt/ui/page/settings` | the fallback HTML page (`mods/uihub`), for a human with a browser |
+| GET | `/aowlspt/ui/page/settings` | the settings HTML page (`mods/uihub`), for a human with a browser |
+| GET | `/aowlspt/ui/lib/settings.js` | the settings CLIENT LIBRARY the page above is built out of, as `window.AowlSettings` — served `text/javascript`, uncompressed, so any page can `<script src>` it |
+| GET | `<a row's optionsUrl>?q=<term>&limit=<n>` | OPTIONAL, owned by the declaring mod: `{"options":[{"value","label"}...],"matched":N}` — how a `type:"select"` row with thousands of choices is searched without shipping them in the schema |
 
 `/aowlspt/settings/index` is an aggregation: every mod that ever called
 `declareSettings` answers a broadcast (`aowlspt/settings`'s
@@ -44,17 +46,50 @@ One row of `GET /aowlspt/settings/<guid>`:
 }
 ```
 
-`type` is one of `bool | int | float | enum | string | keybind`. `min`/`max`/
-`step` are present only when the setting declared a range; `options` (a string
-array) is present only for `type:"enum"`. `implemented:false` means the value
-is carried and shown but nothing acts on it yet — any UI should draw it
-visibly disabled/greyed rather than omit it, so a player is told the truth
-instead of seeing a shorter list.
+`type` is one of `bool | int | float | enum | string | keybind | select`.
+`min`/`max`/`step` are present only when the setting declared a range;
+`options` (a string array) is present for `type:"enum"` and may be present for
+`type:"select"`. `implemented:false` means the value is carried and shown but
+nothing acts on it yet — any UI should draw it visibly disabled/greyed rather
+than omit it, so a player is told the truth instead of seeing a shorter list.
 
-`category` groups rows into a sub-page/section within one mod's schema — it is
-the section label; there is no separate "declare a page" call because a mod's
-whole schema **is** its page, and `category` is as far down as the hierarchy
-goes.
+`category` groups rows into a section within one mod's schema, and the
+OPTIONAL `subcategory` is one further level inside it. Neither is a separate
+"declare a page" call: a mod's whole schema **is** its page. Both are emitted
+only when non-empty, and both should be rendered in DECLARATION order — a mod
+author orders their schema deliberately.
+
+### The optional fields, and what a renderer owes them
+
+Every field below is emitted **only when the mod asked for it**, so a renderer
+written against the older six-type shape keeps working unchanged.
+
+| field | on | meaning |
+|---|---|---|
+| `subcategory` | any row | a second grouping level inside `category` |
+| `optionLabels` | `enum`/`select` | display names, exactly parallel to `options`. Emitted only when the two arrays are the same length — a mismatched labels array would silently mislabel a control, so it is dropped instead |
+| `optionsUrl` | `select` | a route the UI queries as the user types, instead of (or as well as) `options` |
+
+`type:"select"` is `enum`'s value shape — a plain string — with a different
+instruction to the renderer: **do not build a `<select>`, build a searchable
+typeahead**, because the choice set may be in the thousands (item ids). A
+renderer that has never heard of `select` and falls through to its `enum`
+branch still produces a working control from `options`; that compatibility is
+why the value was kept a string rather than becoming an object.
+
+`optionsUrl` is the shape that actually scales. The mod that owns the ids
+serves it and does the searching:
+
+```
+GET <optionsUrl>?q=<term>&limit=<n>
+-> {"options":[{"value":"5449016a4bdc2d6f028b456f","label":"Roubles"}, ...],
+    "matched": 412}
+```
+
+`matched` is the count BEFORE `limit` was applied, so a UI can say "showing
+the first 60" honestly instead of implying the list is complete. An empty `q`
+means "the first n, unfiltered". `tests/uihubscale` is the reference
+implementation of both ends.
 
 ## Wire transport note
 
@@ -93,14 +128,51 @@ proc onLoad(): Status =
   Ok
 ```
 
-That is the entire contribution surface — five builders
+That is the entire contribution surface — seven builders
 (`boolSetting`/`intSetting`/`floatSetting`/`enumSetting`/`stringSetting`/
-`keybindSetting`), one call to register them, one route that echoes
+`keybindSetting`/`selectSetting`), each taking optional `category`,
+`subcategory`, `description` and `implemented`; one call to register them, one route that echoes
 `declaredSchemaJson()` back after applying an edit. Every renderer — native
 F12, the fallback browser page, or a third party's own — draws whatever
 control the row's `type` calls for; the mod author never writes a line of UI
 code. This is deliberately as small a surface as `declareSettings` already
 was — the fallback UI and the Nimony API are the same contract, not two.
+
+## Building your own UI on the shipped client
+
+`mods/uihub` keeps NO private copy of any of this. Its page is a shell around
+one call, and everything it can do is served at `/aowlspt/ui/lib/settings.js`
+as `window.AowlSettings`. A third-party page gets the identical code path:
+
+```html
+<div id="app"></div>
+<script src="/aowlspt/ui/lib/settings.js?ident=1"></script>
+<script>AowlSettings.mount(document.getElementById('app'));</script>
+```
+
+`mount(el)` is the whole screen: mod list, search across one mod or all mods,
+collapsible `category`/`subcategory` sections with a sidebar, a deep-linkable
+hash (`#guid=<guid>&cat=<category>&q=<query>`), incremental rendering so
+hundreds of rows do not all enter the DOM at once, per-row and page-level
+reset, sliders for ranged numbers, and searchable typeaheads for large
+enumerations.
+
+To build something else, use the pieces instead:
+
+| call | does |
+|---|---|
+| `listMods()` / `getSchema(guid)` | the two GETs, already parsed |
+| `setValue(guid, key, value)` / `resetKey(guid, key)` / `resetAll(guid)` | the POSTs |
+| `replyOk(r)` / `replyErr(r)` / `replyRows(r)` | tell a persisted write from a refused one — never weaken this to a truthiness check |
+| `matches(row, query)` | the search predicate (every word must appear in key/label/description/category/subcategory) |
+| `groupRows(rows)` | `[{name, subs:[{name, rows}]}]`, in declaration order |
+| `inlineOptions(row)` / `labelForValue(row, v)` | `options` + `optionLabels` as `{value,label}` pairs |
+| `controlFor(row, onSave)` | the one switch on `row.type`, as a DOM element |
+| `apiGet(path)` / `apiPost(path, body)` | the transport, `?ident=1` handled |
+
+Nothing in the library is specific to the shipped page, and nothing in the
+shipped page is specific to the library — which is the point: a third-party UI
+cannot drift from the one that ships, because it is running it.
 
 ## Worked example: a third-party page
 
