@@ -5,26 +5,25 @@
 ##
 ## Why it is not a "setting"
 ## -------------------------
-## Spawning is an ACTION, and the settings wire format only carries values --
-## `{"key":..., "value":...}` in, a schema array back. Rather than invent a new
-## control type that the settings UI would have to grow support for before any
-## of this worked, a spawn is expressed as four ordinary rows that already
-## render everywhere:
+## Spawning is an ACTION, and the settings wire format carries values --
+## `{"key":..., "value":...}` in, a schema array back. So a spawn is expressed
+## as five ordinary rows, and the action is a boolean that unsets itself:
 ##
-##   spawnQuery     string   part of a name, or a bare 24-hex template id
+##   spawnQuery     select   the template id, chosen by typeahead against
+##                           `/aowlspt/settings/<guid>/items` (`optionsUrl`)
 ##   spawnCount     int      how many
 ##   spawnCondition int      durability/resource as a percentage
 ##   spawnNow       bool     flipping this to true PERFORMS the spawn
+##   spawnResult    string   what happened, or exactly why nothing did
 ##
 ## `spawnNow` is a momentary control: the POST that sets it true is intercepted
-## here, the spawn runs, and the key is written straight back to `false` so the
-## row is armed again and the page never shows a checkbox stuck on. The result
-## -- what was spawned, or precisely why nothing was -- goes into `spawnResult`,
-## a read-only string row the page renders under the button.
+## in `tarkov.nim`, the spawn runs, and the key is written straight back to
+## `false` so the row is armed again and the page never shows a checkbox stuck
+## on.
 ##
-## This is the "new control type" the settings UI could offer instead: a
-## search-select box plus an action button. Until it does, the four rows above
-## work with the schema shape that already ships.
+## 4,673 item templates is far too many to inline in a schema, which is what
+## the UI's `optionsUrl` contract exists for -- `onSpawnItemOptions` in
+## `tarkov.nim` is this module's `searchItemsCounted` behind that route.
 ##
 ## Searching
 ## ---------
@@ -92,18 +91,23 @@ proc localeNameOf*(tpl: string): string =
     return unescapeName(asText(v))
   result = ""
 
-proc searchItems*(query: string; limit: int): seq[ItemHit] =
+proc searchItemsCounted*(query: string; limit: int;
+                         matched: var int): seq[ItemHit] =
   ## Items whose English name contains `query`, case-insensitively.
   ##
-  ## `limit` bounds the answer AND the work: the scan stops at the limit rather
-  ## than collecting every match and slicing, because "find me everything called
-  ## bolt" over 40,000 members is a large seq built to be thrown away.
+  ## `limit` bounds what comes BACK; `matched` reports how many there really
+  ## were. Those are two different numbers and collapsing them is how a
+  ## truncated list gets presented as a complete one -- "no such item" when the
+  ## item was the fifty-first match. The scan still visits the whole document
+  ## when it has to, because counting is the question being asked.
   result = @[]
+  matched = 0
   if query.len == 0:
     return
   if isTemplateId(query):
     let low = toLowerAscii(query)
     if itemExists(low):
+      matched = 1
       result.add ItemHit(tpl: low, name: localeNameOf(low))
     return
   let doc = dbRead("locales.global.en")
@@ -113,7 +117,7 @@ proc searchItems*(query: string; limit: int): seq[ItemHit] =
   let want = toLowerAscii(query)
   const Marker = " Name\":\""
   var at = hay.find(Marker, 0)
-  while at >= 0 and result.len < limit:
+  while at >= 0:
     # The key runs from the quote before the id back to `"`; the id is the 24
     # characters immediately before ` Name`.
     let idEnd = at
@@ -135,18 +139,28 @@ proc searchItems*(query: string; limit: int): seq[ItemHit] =
         # The locale carries names for things that are not items -- quests,
         # traders, areas. `itemExists` is what makes this an ITEM search.
         if itemExists(tpl):
-          result.add ItemHit(tpl: tpl, name: unescapeName(value))
+          matched = matched + 1
+          if result.len < limit:
+            result.add ItemHit(tpl: tpl, name: unescapeName(value))
     at = hay.find(Marker, at + Marker.len)
+
+proc searchItems*(query: string; limit: int): seq[ItemHit] =
+  ## `searchItemsCounted` for a caller that does not care how many were cut off.
+  var matched = 0
+  result = searchItemsCounted(query, limit, matched)
 
 proc searchSummary*(query: string; limit: int): string =
   ## The hits as one line, for the read-only result row.
-  let hits = searchItems(query, limit)
+  var matched = 0
+  let hits = searchItemsCounted(query, limit, matched)
   if hits.len == 0:
     return "no item matches \"" & query & "\""
   result = ""
   for h in hits:
     if result.len > 0: result.add "; "
     result.add h.name & " (" & h.tpl & ")"
+  if matched > hits.len:
+    result = $hits.len & " of " & $matched & " matches: " & result
 
 proc applyCondition(d: var Doc; tpl: string; percent: int) =
   ## Durability / resource, as a percentage of the template's own maximum.
@@ -210,11 +224,12 @@ proc spawnInto*(profileId, query: string; count, condition: int): SpawnOutcome =
                      " items; 5000 is the cap"
     return
 
-  let hits = searchItems(query, 8)
+  var matched = 0
+  let hits = searchItemsCounted(query, 8, matched)
   if hits.len == 0:
     result.message = "no item matches \"" & query & "\""
     return
-  if hits.len > 1 and not isTemplateId(query):
+  if matched > 1 and not isTemplateId(query):
     # Refused rather than "the first one", because the first one is an
     # arbitrary document order and spawning the wrong item is a stash to clean
     # up by hand. The candidates are named so the query can be narrowed.
@@ -222,7 +237,7 @@ proc spawnInto*(profileId, query: string; count, condition: int): SpawnOutcome =
     for h in hits:
       if names.len > 0: names.add "; "
       names.add h.name & " (" & h.tpl & ")"
-    result.message = "\"" & query & "\" matches " & $hits.len &
+    result.message = "\"" & query & "\" matches " & $matched &
                      " items -- narrow it or paste an id: " & names
     return
   let tpl = hits[0].tpl

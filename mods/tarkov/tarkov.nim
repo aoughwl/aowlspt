@@ -2285,6 +2285,22 @@ proc onBotGenerate(url, body, session: string): string =
   info "generated " & $generated & " bot(s) in " & $int(took) & "ms"
   result = envelope(raw(batch))
 
+proc digitsToInt(s: string; default: int): int =
+  ## A decimal query parameter, or the default. Non-raising and total: one
+  ## non-digit byte returns the default rather than a partial number, because
+  ## `?limit=50x` meaning 50 is a guess about what somebody meant.
+  if s.len == 0:
+    return default
+  var acc = 0
+  for i in 0 ..< s.len:
+    let c = s[i]
+    if c < '0' or c > '9':
+      return default
+    acc = acc * 10 + (int(c) - int('0'))
+    if acc > 1000000:
+      return default
+  result = acc
+
 proc queryValue(url, name: string): string =
   ## One `?name=value` out of a url. Written here rather than in `aowlspt/json`
   ## because it is two routes worth of need and no route on this server takes a
@@ -2892,11 +2908,18 @@ proc tarkovSchema(): seq[Setting] =
     # have yet. `spawnNow` is momentary: `onTarkovSettings` intercepts the POST
     # that sets it, runs the spawn, and writes the key back to false, so the
     # page never renders a checkbox stuck on and the row is armed again.
-    stringSetting("spawnQuery", "Item to spawn", "",
+    # A remote select, not a text box. The value stored is still a plain
+    # string -- the template id -- so nothing about persistence changes; what
+    # changes is that the UI does typeahead against `/items` below instead of
+    # the player typing an id from memory, and that free text the search does
+    # not match is REFUSED rather than persisted and then refused at spawn time.
+    # 4,673 item templates is far too many to inline in the schema, which is
+    # what `optionsUrl` exists for.
+    selectSetting("spawnQuery", "Item to spawn", "", @[],
+                  optionsUrl = "/aowlspt/settings/" & ModGuid & "/items",
                   category = "Spawn Items",
-                  description = "Part of an item's English name, or a 24-hex " &
-                                "template id. An ambiguous name is refused " &
-                                "with the candidates named, never guessed at"),
+                  description = "Search the item table by name or paste a " &
+                                "24-hex template id"),
     intSetting("spawnCount", "How many", 1, lo = 1, hi = 5000,
                category = "Spawn Items"),
     intSetting("spawnCondition", "Condition (%)", 100, lo = 1, hi = 100,
@@ -2919,6 +2942,35 @@ proc tarkovSchema(): seq[Setting] =
   let tuneRows = tuneSchema()
   for st in tuneRows:
     result.add st
+
+proc onSpawnItemOptions(url, body, session: string): string =
+  ## The `optionsUrl` behind the "Item to spawn" row:
+  ## `GET .../items?q=<term>&limit=<n>` -> `{"options":[{value,label}], "matched":N}`.
+  ##
+  ## `matched` is the number of items the term REALLY matches, which can be
+  ## larger than the number returned. Reporting it separately is what lets the
+  ## page say "showing the first 50 of 214" instead of implying the list is
+  ## complete -- a truncated list presented as a whole one is how somebody
+  ## concludes an item does not exist.
+  let want = queryValue(url, "q")
+  var limit = 50
+  let lim = queryValue(url, "limit")
+  if lim.len > 0:
+    let n = digitsToInt(lim, 50)
+    if n > 0 and n <= 200:
+      limit = n
+  var a = arr()
+  var matched = 0
+  let hits = searchItemsCounted(want, limit, matched)
+  for h in hits:
+    var o = obj()
+    o.put("value", h.tpl)
+    o.put("label", (if h.name.len > 0: h.name else: h.tpl))
+    a.add o
+  var root = obj()
+  root.put("options", a)
+  root.put("matched", matched)
+  result = done(root).text
 
 proc spawnProfileId(session: string): string =
   ## Which stash a spawn goes into.
@@ -3061,6 +3113,11 @@ proc onLoad(): Status =
   declareSettings(tarkovSchema())
   discard serve("/aowlspt/settings/" & ModGuid, onTarkovSettings)
   discard serve("/aowlspt/settings/" & ModGuid & "/reset", onTarkovSettingsReset)
+  # The typeahead source for the item-spawn row. Registered beside the schema
+  # route and before the store gate, so the search box works on a host where
+  # the emulator refuses to serve anything else -- a select whose options route
+  # 404s renders as an empty list, which reads as "there are no items".
+  discard serve("/aowlspt/settings/" & ModGuid & "/items", onSpawnItemOptions)
 
   if not storeReady():
     error "this host has no persistent store; profiles cannot be kept " &

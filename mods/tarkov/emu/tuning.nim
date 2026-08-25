@@ -130,21 +130,29 @@ proc tuneSchema*(): seq[Setting] =
   for r in allRows:
     let help = "Overrides globals." & r.path.substr(7) &
                " in the document the client fetches from /client/globals"
+    # The second level of grouping is the branch of the globals document the
+    # value lives on -- `Stamina`, `RagFair`, `Overheat`. Derived from the path
+    # rather than named separately, because a subcategory that can disagree
+    # with the path is a label that lies about where the value goes.
+    let sub = (if r.parts.len > 2: r.parts[1] else: "")
     case r.kind
     of 'b':
       result.add boolSetting(r.key, r.label, r.defRaw == "true",
-                             category = r.category, description = help)
+                             category = r.category, subcategory = sub,
+                             description = help)
     of 'i':
       result.add intSetting(r.key, r.label, int(toFloat(r.defRaw)),
                             lo = int(r.lo), hi = int(r.hi), step = 1,
-                            category = r.category, description = help)
+                            category = r.category, subcategory = sub,
+                            description = help)
     else:
       var step = 0.01
       if r.hasRange and (r.hi - r.lo) > 100.0:
         step = 1.0
       result.add floatSetting(r.key, r.label, toFloat(r.defRaw),
                               lo = r.lo, hi = r.hi, step = step,
-                              category = r.category, description = help)
+                              category = r.category, subcategory = sub,
+                              description = help)
 
 proc literalOk(kind: char; raw: string): bool =
   ## Whether `raw` is a JSON literal of the declared kind.
