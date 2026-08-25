@@ -301,6 +301,18 @@ var cfgUnAimSpeedZ = 4.5
 
 var cfgVerifyHooks = true
 
+var cfgDeferUntilUnityThread = true
+  ## Hold every hook until the host says its main-thread drain has fired.
+  ## Default ON: the unsafe direction is the one that crashed.
+
+const
+  DeferPollMs = 500'i64
+    ## How often to ask the host. The answer changes at most once per run.
+  DeferGiveUpMs = 180_000'i64
+    ## After this, refuse rather than arm. A surviving run confirmed the drain
+    ## at 14.469s, so three minutes is not a tight bound -- it is the point at
+    ## which "it is coming" stops being credible.
+
 proc cfgFloat(key: string; default: float): float =
   result = setting(key).asFloat(default)
 
@@ -381,6 +393,7 @@ proc loadConfig() =
   cfgUnAimSpeedZ = cfgFloat("unAimSpeedZ", 4.5)
 
   cfgVerifyHooks = cfgBool("verifyHooks", true)
+  cfgDeferUntilUnityThread = cfgBool("deferUntilUnityThread", true)
 
   # Upstream's FovRangePatch swaps the two when they are the wrong way round
   # rather than refusing; keeping that behaviour keeps a hand-edited config
@@ -554,12 +567,25 @@ var rt: Il2Cpp
 var rtOpen = false
 
 proc openRuntime(): bool =
+  ## Breadcrumbed, and not decoratively. A run measured on 2026-08-25 died
+  ## silently -- no crash dump, no client log directory, no further host line --
+  ## immediately after the last `reportType` in `onWorldReady`, which makes the
+  ## next statement (this proc) the last thing that ran. Nothing inside here is
+  ## IL2CPP work; it is `GetModuleHandleW` plus 65 `GetProcAddress` calls into
+  ## an already-loaded module. So the next crashing run has to say WHICH of the
+  ## three sub-steps it reached, because "somewhere in openRuntime" is not an
+  ## answer and one more guess costs another launch.
   if rtOpen:
     return true
+  info "FOV Fix: opening GameAssembly.dll from the mod (step 1/3)"
   rt = openIl2Cpp()
+  info "FOV Fix: GameAssembly.dll bound, loaded=" & $rt.loaded &
+       " (step 2/3)"
   if not rt.loaded:
     return false
   let missing = rt.missingEssential()
+  info "FOV Fix: essential entry points checked, " & $missing.len &
+       " missing (step 3/3)"
   if missing.len > 0:
     warn "the IL2CPP runtime is missing " & $missing.len &
          " essential entry points; the fast path stays off"
@@ -2106,13 +2132,79 @@ proc onLoad(): Status =
        "which capability each one is waiting on."
   Ok
 
+## Deferral state. See `onUpdate`.
+var gPending = false
+var gPendingMs = 0'i64
+var gPollMs = 0'i64
+var gDeferSaid = false
+
 proc onUpdate(elapsedMs: int64): Status =
   if side() != sideClient:
     return Ok
   gElapsedMs = gElapsedMs + elapsedMs
+
+  # `world.ready()` is a TYPE-existence probe, and the name has been lying.
+  # `EFT.GameWorld` is a type in `Assembly-CSharp.dll`, so it resolves the
+  # instant the IL2CPP runtime is up -- MEASURED at 1.375s into a run, with no
+  # world, no player, no camera and no scene. Everything `onWorldReady` does
+  # therefore used to run a quarter of a second after `host running`, on the
+  # host's own thread, while the client was still booting.
+  #
+  # So the probe is kept (it is the cheap "the runtime is up" signal it always
+  # really was) and a second, honest gate is put in front of the work: the
+  # host's own answer to whether its main-thread drain has FIRED. That is the
+  # only evidence available from inside a mod that Unity's thread is live, and
+  # in a surviving run it does not become true until 14.469s.
+  #
+  # This is the standing hypothesis for the crash, stated so it can be
+  # falsified: if a run with `deferUntilUnityThread` on still dies at ~1.4s in
+  # `openRuntime`, the thread was never the cause and the breadcrumbs there say
+  # which sub-step it was instead.
   if world.ready():
-    onWorldReady()
-    gElapsedMs = 0
+    if not cfgDeferUntilUnityThread:
+      info "FOV Fix: deferUntilUnityThread is off; arming immediately on the " &
+           "host's own thread, which is what the 2026-08-25 crash did"
+      onWorldReady()
+      gElapsedMs = 0
+    else:
+      gPending = true
+      gPendingMs = 0
+      gPollMs = 0
+
+  if gPending:
+    gPendingMs = gPendingMs + elapsedMs
+    gPollMs = gPollMs + elapsedMs
+    # Throttled: asking the host every frame is a host round trip per frame for
+    # no new information, and the answer changes at most once.
+    if gPollMs >= DeferPollMs:
+      gPollMs = 0
+      let mt = askMainThread()
+      if mt.ok and mt.bound:
+        gPending = false
+        success "FOV Fix: Unity's main thread is live after " &
+                $(gPendingMs div 1000) & "s (drain " & mt.methodName & ", " &
+                $mt.frames & " firings); arming now"
+        onWorldReady()
+        gElapsedMs = 0
+      elif gPendingMs >= DeferGiveUpMs:
+        # Self-disable rather than arm anyway. Arming here would be doing
+        # exactly the thing this gate exists to prevent, and doing it after
+        # announcing that the evidence for its safety never arrived.
+        gPending = false
+        gFovState = "refused: the host's main-thread drain never confirmed " &
+                    "within " & $(DeferGiveUpMs div 1000) & "s, so there is " &
+                    "no thread on which a camera write is legal"
+        gScaleState = gFovState
+        gSensState = gFovState
+        gAimSensState = gFovState
+        gDriverState = gFovState
+        warn "FOV Fix: " & gFovState & " -- this mod has switched itself OFF " &
+             "for the rest of the run. Nothing was patched."
+      elif not gDeferSaid and gPendingMs >= 3000:
+        gDeferSaid = true
+        info "FOV Fix: the runtime is up but the host's main-thread drain has " &
+             "not fired yet; holding every hook until it does (up to " &
+             $(DeferGiveUpMs div 1000) & "s)"
   # One report, a minute after the world came up: long enough that a method
   # called only on ADS or only on a weapon swap has had a chance to fire, so a
   # zero here means "never", not "not yet".
