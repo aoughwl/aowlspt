@@ -1374,6 +1374,15 @@ var gCodeGenProbeSlot = -1
   ## `codeGenAudit`. It exists to run the codeGen self-test ON THE UNITY MAIN
   ## THREAD, because that is the one variable in this investigation that was
   ## never controlled -- see `codeGenAuditSelfTest`.
+## THE SHARED PER-FRAME REGION -- the LAST rider on `EFT.UI.PreloaderUI::
+## Update` that will ever need to be added by hand. Every future per-frame
+## draw or tick registers WITH it (`abi/aowlspt_region.h`) instead of editing
+## this file for a slot of its own. Declared here for the same reason every
+## slot above it is: `patchFired` names it and sits above `region.nim`'s
+## include point. Flag `sharedRegion`, default OFF.
+var gRegionSlot = -1
+var gRegionOn = false
+
 var gInspSlot2 = -1
   ## The inspector's SECOND anchor: the main drain's slot, aliased so the
   ## instrument keeps ticking inside a raid where `PreloaderUI::Update` does
@@ -3042,7 +3051,7 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
   # be on at once over ONE detour and ONE trampoline. Its per-frame cost when
   # no command is queued is a single interlocked load (`aowl_insp_have`).
   if i == gDebugUiSlot or i == gModeTextSlot or i == gInspSlot or
-     i == gCodeGenProbeSlot or i == gModsSlot:
+     i == gCodeGenProbeSlot or i == gModsSlot or i == gRegionSlot:
     if not gSharedRidersLoggedPf:
       gSharedRidersLoggedPf = true
       logSharedRiders("patchFired", i)
@@ -3058,6 +3067,13 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     # it costs one integer compare when it is off and never a second detour.
     if i == gModsSlot:
       modsRidersTick()
+    # THE SHARED REGION, and the generic one: it dispatches every mod that
+    # registered a draw or tick callback. LAST in the chain on purpose --
+    # the hand-written riders above it predate it and keep their existing
+    # ordering, so arming the region cannot reorder anything that already
+    # works. It opens NO guard of its own here; see `region.nim`.
+    if i == gRegionSlot:
+      regionFired(regs)
     return 0'i32
   # The overlay's GameWorld cache: one register read, nothing walked, never a
   # suppression of RegisterPlayer.
@@ -3183,7 +3199,7 @@ proc patchReturned(slot: int32; regs: Il2CppPtr): int32 {.
   # it out here would silently kill the inspector in precisely the arming order
   # (mode-text first, inspector second) that the multiplex exists to tolerate.
   if i == gModeTextSlot or i == gDebugUiSlot or i == gInspSlot or
-     i == gModsSlot:
+     i == gModsSlot or i == gRegionSlot:
     if not gSharedRidersLoggedPr:
       gSharedRidersLoggedPr = true
       logSharedRiders("patchReturned", i)
@@ -3195,6 +3211,8 @@ proc patchReturned(slot: int32; regs: Il2CppPtr): int32 {.
       inspectFired(regs)
     if i == gModsSlot:
       modsRidersTick()
+    if i == gRegionSlot:
+      regionFired(regs)
     return 0'i32
   # Phase 1.5 native-settings control probe, by identity and for the same reason:
   # a host drain (meth == nil) whose whole point is to read AFTER the original
@@ -5387,6 +5405,11 @@ include "inspect.nim"
 ## renderer. Default OFF (`settingsModsTab`).
 include "modstab.nim"
 
+## THE SHARED PER-FRAME REGION. Included AFTER `modstab.nim` because
+## `bindRegion` names `gModsSlot` and `cDuPreloaderTarget`, and nimony
+## forward-resolves procs across an include boundary but NOT variables.
+include "region.nim"
+
 proc bindCodeGenProbe(verbose: bool): bool =
   ## THE FOURTH RIDER on `EFT.UI.PreloaderUI::Update`, and the only reason it
   ## exists is to get `codeGenAuditSelfTest` onto Unity's main thread.
@@ -6445,6 +6468,7 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "parent Unity UI GameObjects on the Unity thread once, to prove the " &
          "native settings-injection path"
   gCodeGenAudit = readBoolKey("codeGenAudit")
+  gRegionOn = readBoolKey("sharedRegion")
   if gCodeGenAudit:
     info "codeGenAudit is set: whenever a method has BOTH a live methodPointer " &
          "and a codeGenModule table entry, the host will log whether the two " &
@@ -7051,6 +7075,15 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       # attaches a detour of its own.
       if gModsOn or gVerOn or gSeasonsOn or gGfxOn:
         discard bindModsTab(true)
+
+      # THE SHARED PER-FRAME REGION (opt-in, `sharedRegion`). Armed LAST of
+      # every rider on `EFT.UI.PreloaderUI::Update`, so by here any of the
+      # others may have claimed the slot and this aliases onto it for free
+      # and attaches nothing. It is the generic one: from here on a
+      # per-frame draw or tick is a registration, not another entry in
+      # this list.
+      if gRegionOn:
+        discard bindRegion(true)
 
   let modsDir = joinPath(gDir, "mods")
   # The runtime may not have come up, and that deliberately does not stop this:
