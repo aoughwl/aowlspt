@@ -223,8 +223,10 @@ import aowlspt/fixture  # where a self-test's runtime path may come from
 
 const
   ModGuid = "aowl.fovfix"
-  ModName = "FOV Fix"
-  ModAuthor = "Fontaine (ported by savannt)"
+  ModName = "FOV"
+  # The display author. Upstream attribution lives in this file's header,
+  # `mods/fov/README.md` and LICENSE.txt -- not in the user-facing mod list.
+  ModAuthor = "aowlspt"
   ModVersion = "4.1.0"
 
 # ---------------------------------------------------------------------------

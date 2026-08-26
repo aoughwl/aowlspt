@@ -1508,7 +1508,6 @@ proc onUnload(): Status =
     info "sain: " & stats()
   Ok
 
-exportMod(guid = "aowl.sain", name = "SAIN", author = "aowlspt port of SAIN " &
-          "by Solarint and ArchangelWTF", version = "0.1.0",
+exportMod(guid = "aowl.sain", name = "Bot AI", author = "aowlspt", version = "0.1.0",
           sptRange = "*", sides = {sideClient, sideServer, sideSim},
           onLoad = onLoad, onUpdate = onUpdate, onUnload = onUnload)
