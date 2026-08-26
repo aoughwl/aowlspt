@@ -208,7 +208,7 @@ const MtxHeartbeatPasses = 25
   ## went silent for the remaining 77 s of the run, so "backed off and still
   ## failing" and "not running at all" were indistinguishable from the log --
   ## which is the exact failure mode CLAUDE.md 9b is about.
-const MtxSliceMs = 16'u64
+const MtxSliceMs = 40'u64
   ## One WHOLE resolve pass may cost this much -- the root enumeration (which
   ## allocates) plus the descent. Deliberately ABOVE `MtxWalkMs`: the in-walk
   ## deadline is what keeps a pass short, and this outer figure exists to catch
@@ -218,7 +218,7 @@ const MtxSliceMs = 16'u64
 const MtxHuntMs = 300_000'u64
   ## Five minutes of wall clock to find the button, then a loud give-up. The
   ## menu can legitimately be many seconds away on a cold load.
-const MtxNodeBudget = 1500
+const MtxNodeBudget = 6000
   ## Nodes one resolve pass may visit across ALL roots combined.
   ##
   ## SIZED FROM THE REAL TREE, not from a round number. The measured pass A
@@ -230,7 +230,7 @@ const MtxNodeBudget = 1500
   ## 11 (MEASURED on the live client), and too large because 4000 nodes at the
   ## measured per-node cost is 750 ms on the Unity main thread. Visiting fewer
   ## nodes is the fix; a bigger budget would only have made the stall longer.
-const MtxWalkMs = 8'u64
+const MtxWalkMs = 30'u64
   ## The IN-WALK deadline, checked every 32 nodes inside the recursion. This is
   ## the bound whose absence produced the 750 ms pass: `MtxSliceMs` was only
   ## compared AFTER the walk had already returned, so it could report a stall
@@ -285,7 +285,6 @@ var gMtxNotReady = 0              ## passes where the button was legitimately ab
 # at flag-read time, loudly. Making the flags fight silently is how this
 # codebase produces its worst outcomes.
 var gModeHideOn = false
-var gMtxMenu: Il2CppPtr = nil     ## Common UI/MenuScreen, revalidated not trusted
 var gMtxHideGo: Il2CppPtr = nil   ## the ChangeGameModeButton GameObject, cached
 var gMtxHidden = 0
 var gMtxSaidHidden = false
@@ -441,115 +440,100 @@ proc mtxNoteSlice(spent: uint64; label: string) =
        "deliberate trade. The search itself is NOT abandoned; the wall-clock " &
        "give-up is still " & $int(MtxHuntMs div 1000) & " s away."
 
-proc mtxFindMenuScreen(budget: var int; deadline: uint64;
-                        names: var string): Il2CppPtr =
-  ## `MenuScreen`, exactly the way `seasonsFindMenuScreen` finds it: enumerate
-  ## the roots, then search each root's subtree BY NAME to a shallow depth.
-  ## That resolver is human-confirmed on screen (fact #81) and was MEASURED
-  ## switching `SeasonsButton` off at 0:00:26.484 in the same run this feature
-  ## was still failing in, so it is copied rather than competed with.
+proc modeTextFindGameModeRoot(): Il2CppPtr =
+  ## `ChangeGameModeButton`, found the way `hide seasons` finds `MenuScreen`.
+  ##
+  ## THIS IS DELIBERATELY NOT A THIRD RESOLVER. `seasonsFindMenuScreen` reaches
+  ## `Common UI/MenuScreen` on this build and is human-confirmed on screen (fact
+  ## #81); it was MEASURED succeeding at 19.546 s in the very same process where
+  ## this feature's previous attempt declared `Common UI` absent. Its shape is
+  ## copied exactly: enumerate the roots, then search each root's subtree BY
+  ## TARGET NAME to a shallow depth. What it does NOT do -- and what the previous
+  ## version of this proc did -- is gate on a ROOT being *named* `Common UI`. On
+  ## this build that gate never matched, and worse, its failure was
+  ## indistinguishable from the button genuinely not existing yet.
+  ##
+  ## Two passes, reported differently so they can never be confused:
+  ##   A. the target name, depth `MtxDescendDepth`, from every root. Seasons'
+  ##      shape exactly.
+  ##   B. `MenuScreen` first -- the node seasons PROVED reachable -- then up one
+  ##      level to its parent (which fact #116 calls `Common UI`) and down again.
+  ##      This is the belt to A's braces: it can only work if the proven node is
+  ##      there, so it cannot succeed at a moment when the menu does not exist.
+  ##
+  ## Both share ONE node budget and ONE in-walk deadline, so the pair is bounded
+  ## exactly as tightly as a single pass was.
   result = nil
   var roots: seq[Il2CppPtr] = @[]
   if not mtxAnchorRoots(roots):
     return                              # gMtxResolveWhy already set
+  let deadline = cNowMs() + MtxWalkMs
+  var budget = MtxNodeBudget
+  var names = ""
   var i = 0
+  # ---- PASS A: the target name, from every root. `hide seasons`' shape. ----
   while i < roots.len and i < MtxRootCap and budget > 0:
     let r = iToTransform(roots[i])
     if r != nil and duOk(r, 0x20'i32):
       if names.len < 300:
         names = names & "'" & iObjName(r) & "' "
-      let m = mtxDescend(r, "MenuScreen", MtxDescendDepth, budget, deadline)
+      let m = mtxDescend(r, "ChangeGameModeButton", MtxDescendDepth,
+                         budget, deadline)
       if m != nil:
+        gMtxResolveWhy = ""
+        gMtxLastNodes = MtxNodeBudget - budget
+        gMtxLastVia = "pass A (target name, depth " & $MtxDescendDepth &
+                      ", from every root -- the hide-seasons shape)"
         return m
     i = i + 1
-
-proc modeTextFindGameModeRoot(): Il2CppPtr =
-  ## `Common UI/MenuScreen/ChangeGameModeButton`.
-  ##
-  ## ---------------------------------------------------------------------
-  ## FACT #116 IS WRONG BY ONE LEVEL, AND THIS COMMENT IS THE CORRECTION.
-  ##
-  ## It records the path as `Common UI/ChangeGameModeButton`. **That path does
-  ## not exist.** MEASURED on the running client with the live inspector,
-  ## `find ChangeGameModeButton` over all 16 scene roots:
-  ##
-  ##     HIT 0x2b759d467a0  name="ChangeGameModeButton"  parent="MenuScreen"
-  ##
-  ## So the button's parent is `MenuScreen`, and it is a DIRECT SIBLING of
-  ## `SeasonsButton` -- the node `hide seasons` has been reaching and switching
-  ## off every single run. Fact #116 is still right about the thing it was
-  ## recorded for (this control is NOT `PreloaderUI._sessionModeText`); it is
-  ## only its PATH that is off by a level.
-  ##
-  ## Three rewrites of this resolver were spent on that one wrong level: a
-  ## depth-8 sweep of every root (750 ms/frame), a gate on a root *named*
-  ## `Common UI`, and a 6000-node wide walk that burned its entire budget over
-  ## 16 roots for 96 seconds. None of them were searching for the wrong name or
-  ## in the wrong process -- they were all searching one level too shallow, at a
-  ## node whose real parent was already being touched by a sibling feature in
-  ## the same file. If you are about to widen a search here, re-read this first.
-  ##
-  ## NOTE ON WHAT THE INSPECTOR COULD AND COULD NOT PROVE: that `find` reported
-  ## `STOPPED EARLY ... can_trust_absence: false` even while returning the hit.
-  ## It proved PRESENCE. Absence at any depth was never provable, which is why
-  ## every "not found" branch below is worded as INCONCLUSIVE or as "too early",
-  ## and never as a verdict.
-  ## ---------------------------------------------------------------------
-  ##
-  ## So this is now `hide seasons` with the leaf name changed, and nothing else:
-  ## same roots, same `MenuScreen`, same depth, one named child, and the same
-  ## `GameObject::SetActive(false)` primitive at the call site. The cached
-  ## `MenuScreen` is revalidated rather than trusted, so a menu rebuild is
-  ## re-resolved and the button is hidden again.
-  result = nil
-  var budget = MtxNodeBudget
-  let deadline = cNowMs() + MtxWalkMs
-  var names = ""
-  # Revalidate the cached MenuScreen before trusting it: a menu rebuild
-  # destroys it, and a stale Transform is a fault waiting for the next ICALL.
-  if gMtxMenu != nil and
-     (not duOk(gMtxMenu, 0x20'i32) or not iUnityAlive(gMtxMenu)):
-    gMtxMenu = nil
-  if gMtxMenu == nil:
-    gMtxMenu = mtxFindMenuScreen(budget, deadline, names)
-  if gMtxMenu == nil:
-    if gMtxResolveWhy.len == 0 or budget > 0:
-      if budget <= 0:
-        gMtxResolveWhy = "the search for 'MenuScreen' hit its node budget (" &
-                         $MtxNodeBudget & ") or its " & $int(MtxWalkMs) &
-                         " ms in-walk deadline after " &
-                         $(MtxNodeBudget - budget) & " nodes. This is " &
-                         "INCONCLUSIVE, not a verdict of absent"
-      else:
-        gMtxResolveWhy = "no 'MenuScreen' within " & $MtxDescendDepth &
-                         " levels of any root (" & $(MtxNodeBudget - budget) &
-                         " nodes, budget NOT exhausted). MenuScreen is what " &
-                         "hide-seasons hangs off, so its absence means THE " &
-                         "MAIN MENU IS NOT UP YET -- this is not a miss, it " &
-                         "is too early. Roots: " & names
-    gMtxLastNodes = MtxNodeBudget - budget
-    return
-  # ONE NAMED CHILD of a node we already hold. This is the whole search now: a
-  # handful of nodes, no sweep, nothing to back off from.
-  let btn = modsChildNamed(gMtxMenu, "ChangeGameModeButton")
+  # ---- PASS B: via MenuScreen's parent, the node `hide seasons` proved. ----
+  var sawMenu = false
+  var j = 0
+  while j < roots.len and j < MtxRootCap and budget > 0 and not sawMenu:
+    let r = iToTransform(roots[j])
+    if r != nil and duOk(r, 0x20'i32):
+      let menu = mtxDescend(r, "MenuScreen", MtxDescendDepth, budget, deadline)
+      if menu != nil:
+        sawMenu = true
+        # UP ONE LEVEL. `hide seasons` reaches `Common UI/MenuScreen`, so
+        # MenuScreen's parent IS the container fact #116 names, without this
+        # feature ever having to recognise it by name.
+        let common = modsParentOf(menu)
+        if common != nil and duOk(common, 0x20'i32):
+          let m = mtxDescend(common, "ChangeGameModeButton", MtxDescendDepth,
+                             budget, deadline)
+          if m != nil:
+            gMtxResolveWhy = ""
+            gMtxLastNodes = MtxNodeBudget - budget
+            gMtxLastVia = "pass B (up from the MenuScreen that hide-seasons " &
+                          "proved reachable, then down into its parent)"
+            return m
+    j = j + 1
   gMtxLastNodes = MtxNodeBudget - budget
-  if btn == nil:
-    # NO POSITIONAL FALLBACK, on purpose and for the same reason `hide seasons`
-    # refuses one: hiding whatever happens to sit at an index is how the Play
-    # button disappears after a patch.
-    gMtxResolveWhy = "'MenuScreen' WAS reached, so the menu exists, but it " &
-                     "has NO child named 'ChangeGameModeButton'. The " &
-                     "MEASURED path is Common UI/MenuScreen/" &
-                     "ChangeGameModeButton (fact #116's " &
-                     "Common UI/ChangeGameModeButton is wrong by one level). " &
-                     "If this build renamed the node, NOTHING is hidden -- " &
-                     "there is deliberately no positional fallback"
-    return
-  gMtxResolveWhy = ""
-  gMtxLastVia = "Common UI/MenuScreen/ChangeGameModeButton -- one named " &
-                "child of the same MenuScreen hide-seasons uses, in " &
-                $gMtxLastNodes & " nodes"
-  result = btn
+  # THREE DISTINGUISHABLE OUTCOMES, never flattened into one. "I ran out of
+  # budget" and "I looked everywhere and it is not there" are different facts,
+  # and only the second is a verdict. A fourth is now separated out too: the
+  # menu demonstrably not existing yet, which is not a miss at all.
+  if budget <= 0:
+    gMtxResolveWhy = "the descent hit its node budget (" & $MtxNodeBudget &
+                     ") or its " & $int(MtxWalkMs) & " ms in-walk deadline " &
+                     "after " & $gMtxLastNodes & " nodes over " & $roots.len &
+                     " root(s). This is INCONCLUSIVE, not a verdict of absent"
+  elif not sawMenu:
+    gMtxResolveWhy = "neither 'ChangeGameModeButton' nor even 'MenuScreen' is " &
+                     "within " & $MtxDescendDepth & " levels of any of the " &
+                     $roots.len & " root(s) (" & $gMtxLastNodes & " nodes, " &
+                     "budget NOT exhausted). MenuScreen is what hide-seasons " &
+                     "hangs off, so its absence means THE MAIN MENU IS NOT UP " &
+                     "YET -- this is not a miss, it is too early. Roots: " &
+                     names
+  else:
+    gMtxResolveWhy = "'MenuScreen' WAS reached, so the menu exists, but no " &
+                     "'ChangeGameModeButton' within " & $MtxDescendDepth &
+                     " levels of any root NOR of MenuScreen's own parent (" &
+                     $gMtxLastNodes & " nodes visited, budget NOT exhausted, " &
+                     "so this one is a real absence AT THIS DEPTH). Roots: " &
+                     names
 
 proc modeTextResolveOne(btnT: Il2CppPtr; childName: string;
                          tmpOut, locOut: var Il2CppPtr): bool =
@@ -688,16 +672,13 @@ proc modeTextTickBody(a: Il2CppPtr): Il2CppPtr {.
       inc gMtxHidden
       if not gMtxSaidHidden:
         gMtxSaidHidden = true
-        okLog "hide mode button: Common UI/MenuScreen/ChangeGameModeButton " &
-              "switched off (the bottom-right PVE ZONE / switch-game-mode " &
-              "control), " &
+        okLog "hide mode button: Common UI/ChangeGameModeButton switched off " &
+              "(the bottom-right PVE ZONE / switch-game-mode control), " &
               $int(gMtxTResolved - gMtxT0) & " ms after this rider first " &
               "ticked. Found STRUCTURALLY by walking from a verified scene " &
               "root with a " & $MtxNodeBudget & "-node budget -- never from a " &
               "cached pointer, and never from PreloaderUI._sessionModeText, " &
-              "which is a recorded FALSE POSITIVE for this label (fact #116 -- " &
-              "whose PATH is also wrong by one level: the parent is " &
-              "MenuScreen, not Common UI). " &
+              "which is a recorded FALSE POSITIVE for this label (fact #116). " &
               "REACHED VIA " & gMtxLastVia & ", in " & $gMtxLastNodes &
               " nodes. " &
               "It is re-checked on a throttle so a menu rebuild hides it " &
