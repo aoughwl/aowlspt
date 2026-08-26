@@ -31,7 +31,8 @@ can be silently wrong is worse than no tool at all.
         -> just that field's offset, machine-readable ("0x120" or "MISSING").
 
 GAMEASM defaults to D:/Games/Tarkov/GameAssembly.dll; METADEC defaults to
-.cache/global-metadata.dec.dat (relative to CWD) -- both can be overridden by
+.cache/global-metadata.dec.dat, resolved against the REPO (and, in a
+worktree, the parent checkout) -- both can be overridden by
 passing them explicitly as the first two arguments, matching il2cpp_resolve.py's
 convention. GameAssembly.dll is ASLR-relocated at runtime; every address here
 is an RVA (VA - imagebase), never a hardcoded live address.
@@ -42,8 +43,24 @@ import sys
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 from il2cpp_resolve import Resolver  # noqa: E402
 
-DEFAULT_GAMEASM = "D:/Games/Tarkov/GameAssembly.dll"
-DEFAULT_METADEC = ".cache/global-metadata.dec.dat"
+DEFAULT_GAMEASM = os.environ.get("AOWLSPT_GAMEASM",
+                                 "D:/Games/Tarkov/GameAssembly.dll")
+# Resolved against the REPO, not the CWD. It used to be a bare relative
+# path, so every one of these tools failed in a git worktree -- the cache
+# lives in the main checkout -- and the failure looked like a missing file
+# rather than a wrong working directory.
+_REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+DEFAULT_METADEC = os.path.join(_REPO, ".cache", "global-metadata.dec.dat")
+if not os.path.exists(DEFAULT_METADEC):
+    # A worktree under <main>/.claude/worktrees/<name> has no cache of its
+    # own; fall back to the checkout it was created from.
+    _up = _REPO
+    for _ in range(4):
+        _up = os.path.dirname(_up)
+        _cand = os.path.join(_up, ".cache", "global-metadata.dec.dat")
+        if os.path.exists(_cand):
+            DEFAULT_METADEC = _cand
+            break
 
 
 def self_check(R):
