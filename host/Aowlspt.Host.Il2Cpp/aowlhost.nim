@@ -2925,6 +2925,60 @@ proc logSharedRiders(half: string; i: int) =
         (if i != gDebugUiSlot and i != gModeTextSlot and i != gInspSlot:
            " NOTHING (no rider slot matches this firing)" else: "")
 
+{.emit: """#include "aowlspt_profile.h" """.}
+# The header is `include`d again HERE, and not only in `modhost.nim`, because
+# these are two translation units: the `nodecl` importc procs modhost exports
+# are Nim-level names, and the C declarations behind them only exist in a file
+# that included the header. Each TU therefore gets its own copy of the header's
+# `static` functions and its own `g_prof` pointer -- which is correct and is the
+# same arrangement `aowlspt_admin.h` already uses. What the two share is the
+# named file mapping, not the variable.
+
+# ---------------------------------------------------------------------------
+# THE PROFILER'S RIDER SCOPES (abi/aowlspt_profile.h)
+# ---------------------------------------------------------------------------
+#
+# One slot per rider on the SHARED `EFT.UI.PreloaderUI::Update` detour, plus the
+# frame boundary. This installs NOTHING: there is no new detour, no new RVA, no
+# by-name lookup (fact #145 -- every by-NAME IL2CPP route on this build is fatal
+# the moment it is USED, and a QueryPerformanceCounter has no name to resolve).
+# It rides the chain `patchFired`/`patchReturned` already dispatch, which is the
+# whole reason a second detour is not needed and must not be added.
+#
+# DEFAULT OFF, and off costs one volatile load: `gProfOn` is refreshed once per
+# frame from the shared region, and `cProfBegin`/`cProfEnd` each re-check the
+# same flag, so enabling it mid-frame can never leave a begin without an end.
+#
+# NO ALLOCATION. The slot indices are five int32 globals registered ONCE, by a
+# constant string, on the first frame after the profiler is switched on. A
+# `-1` slot is legal and ignored, so a refused registration means "this rider is
+# not profiled" and never a fault.
+#
+# NO NESTED GUARD. This runs inside the ONE `aowl_p_p_seh` the rider chain
+# already holds; `abi/aowlspt_profile.h` deliberately arms no guard of its own,
+# because that guard is not re-entrant and a nested one would disarm the outer.
+var profSlotDebugUi  = -1'i32
+var profSlotModeText = -1'i32
+var profSlotInspect  = -1'i32
+var profSlotCodeGen  = -1'i32
+var profSlotModsTab  = -1'i32
+var gProfRegistered = false
+
+proc profFrameTick() =
+  ## Close the frame and, every `windowFrames`, roll every slot's window. Called
+  ## from the shared rider chain and nowhere else, so exactly once per frame.
+  if cProfEnabled() == 0:
+    return
+  if not gProfRegistered:
+    gProfRegistered = true
+    cProfCalibrate()
+    profSlotDebugUi  = cProfSlot(cstring"host:debugOverlay", 2'i32)
+    profSlotModeText = cProfSlot(cstring"host:menuModeText", 2'i32)
+    profSlotInspect  = cProfSlot(cstring"host:liveInspector", 2'i32)
+    profSlotCodeGen  = cProfSlot(cstring"host:codeGenProbe", 2'i32)
+    profSlotModsTab  = cProfSlot(cstring"host:modsTab", 2'i32)
+  cProfFrame()
+
 proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     exportc: "aowlspt_nim_patch_fired", cdecl.} =
   ## Called from the detour thunk, on the game thread, inside the patched
@@ -3023,18 +3077,36 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     if not gSharedRidersLoggedPf:
       gSharedRidersLoggedPf = true
       logSharedRiders("patchFired", i)
+    # THE FRAME BOUNDARY for the profiler. This block is the shared
+    # `EFT.UI.PreloaderUI::Update` rider chain -- exactly once per frame while
+    # the preloader ticks -- so it is where a frame is closed and, every
+    # `windowFrames`, every slot's window is rolled. `profFrameTick` is a
+    # no-op that costs one volatile load when the profiler is off, which is
+    # the shipped default. It NEVER installs a detour of its own: this rides
+    # the chain that already exists, per the two-detours-one-trampoline rule.
+    profFrameTick()
     if i == gDebugUiSlot:
+      cProfBegin(profSlotDebugUi)
       debugUiFired(regs)
+      cProfEnd(profSlotDebugUi)
     if i == gModeTextSlot:
+      cProfBegin(profSlotModeText)
       modeTextUpdateFired(regs)
+      cProfEnd(profSlotModeText)
     if i == gInspSlot:
+      cProfBegin(profSlotInspect)
       inspectFired(regs)
+      cProfEnd(profSlotInspect)
     if i == gCodeGenProbeSlot:
+      cProfBegin(profSlotCodeGen)
       codeGenProbeFired()
+      cProfEnd(profSlotCodeGen)
     # THE MODS TAB, the fifth rider. Aliased onto whichever slot was claimed, so
     # it costs one integer compare when it is off and never a second detour.
     if i == gModsSlot:
+      cProfBegin(profSlotModsTab)
       modsRidersTick()
+      cProfEnd(profSlotModsTab)
     return 0'i32
   # The overlay's GameWorld cache: one register read, nothing walked, never a
   # suppression of RegisterPlayer.
@@ -3152,14 +3224,26 @@ proc patchReturned(slot: int32; regs: Il2CppPtr): int32 {.
     if not gSharedRidersLoggedPr:
       gSharedRidersLoggedPr = true
       logSharedRiders("patchReturned", i)
+    # The frame boundary again -- see the prefix half. Only ONE of the two
+    # halves ever fires for a given slot (the engine routes on the postfix
+    # flag), so this cannot double-count a frame.
+    profFrameTick()
     if i == gDebugUiSlot:
+      cProfBegin(profSlotDebugUi)
       debugUiFired(regs)
+      cProfEnd(profSlotDebugUi)
     if i == gModeTextSlot:
+      cProfBegin(profSlotModeText)
       modeTextUpdateFired(regs)
+      cProfEnd(profSlotModeText)
     if i == gInspSlot:
+      cProfBegin(profSlotInspect)
       inspectFired(regs)
+      cProfEnd(profSlotInspect)
     if i == gModsSlot:
+      cProfBegin(profSlotModsTab)
       modsRidersTick()
+      cProfEnd(profSlotModsTab)
     return 0'i32
   # Phase 1.5 native-settings control probe, by identity and for the same reason:
   # a host drain (meth == nil) whose whole point is to read AFTER the original

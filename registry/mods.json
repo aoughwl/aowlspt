@@ -4,8 +4,8 @@
     "id": "aowl.registry.official",
     "name": "aowlspt official registry",
     "description": "Every mod built in this repository, plus the lists that name them. One file with one git history, so a mod list is a document you can send someone.",
-    "revision": 8,
-    "updated": "2026-08-25"
+    "revision": 9,
+    "updated": "2026-08-26"
   },
   "mods": [
     {
@@ -329,6 +329,42 @@
         "client",
         "graphics"
       ]
+    },
+    {
+      "id": "aowl.debug",
+      "name": "Debug",
+      "author": "savannt",
+      "version": "1.0.0",
+      "description": "The F3 debug overlay's configuration surface, and the per-mod profiler. The overlay itself is drawn Unity-natively by the host; this mod turns 'which lines, in what order, where, and on which key' into settings, so the panel is customisable without a rebuild or a restart. The profiler is the aowlspt-shaped ModProfiler: it times every mod's per-frame work and every host rider on the shared PreloaderUI Update chain, in absolute ms and as a share of measured frame wall time, over a rolling window. It installs NO detour and resolves NO IL2CPP name -- its whole native surface is a shared page and a QueryPerformanceCounter. Both halves default OFF.",
+      "pipeline": ">=0.1.0",
+      "sides": [
+        "client",
+        "sim"
+      ],
+      "source": {
+        "kind": "intree",
+        "path": "mods/debug",
+        "url": null
+      },
+      "artifact": {
+        "dir": "debug",
+        "library": "debug.dll"
+      },
+      "upstream": null,
+      "license": "see repository",
+      "download": null,
+      "requires": [],
+      "conflicts": [],
+      "provides": [
+        "aowl.capability.profiler"
+      ],
+      "loadAfter": [],
+      "tags": [
+        "client",
+        "debug",
+        "profiling",
+        "diagnostics"
+      ]
     }
   ],
   "lists": [
@@ -375,6 +411,11 @@
           "id": "aowl.sain",
           "enabled": true,
           "note": "boots clean -- measured client alive 1:55.828 with Unity thread live; OBSERVER MODE, it drives nothing yet"
+        },
+        {
+          "id": "aowl.debug",
+          "enabled": false,
+          "note": "registered and present but NOT enabled: it has never run against the live client. Flip this to true (or select it in the manager) to load it; both of its features are still individually default-OFF after that, so loading it changes nothing on screen until a setting is turned on."
         }
       ]
     }

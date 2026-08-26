@@ -1118,6 +1118,107 @@ proc duBotListLine(): string =
     s.add "  +" & $(gDuBots.len - shown) & " more"
   result = s
 
+# ---------------------------------------------------------------------------
+# PROFILER PANEL LINES (abi/aowlspt_profile.h) -- ADDITIVE
+# ---------------------------------------------------------------------------
+#
+# New `panelFields` names only. Nothing above this point changed: the profiler
+# is a set of extra `of` branches in `duPanelLine`, so a config that does not
+# name them behaves exactly as it did before, and the profiler being OFF makes
+# every one of them print a refusal rather than a zero.
+#
+# Every number here comes out of the shared region through a typed accessor;
+# this file never dereferences the struct. The whole cost of a profiler line is
+# a bounded loop over 64 int32 slots, and it only runs on a panel REFRESH
+# (`panelThrottle`, default every 10th frame), not every frame.
+#
+# `-1` from `aowl_prof_slot_permille` means "no complete window yet" and is
+# rendered "--", never "0.0%": "I could not look" is not a measurement.
+proc cProfSlotCount(): int32 {.importc: "aowl_prof_slot_count", nodecl.}
+proc cProfSlotKind(i: int32): int32 {.importc: "aowl_prof_slot_kind", nodecl.}
+proc cProfSlotNameC(i: int32): cstring {.importc: "aowl_prof_slot_name", nodecl.}
+proc cProfSlotNs(i: int32): int64 {.importc: "aowl_prof_slot_ns", nodecl.}
+proc cProfSlotMaxNs(i: int32): int64 {.importc: "aowl_prof_slot_max_ns", nodecl.}
+proc cProfSlotCalls(i: int32): int64 {.importc: "aowl_prof_slot_calls", nodecl.}
+proc cProfSlotPermille(i: int32): int32 {.
+  importc: "aowl_prof_slot_permille", nodecl.}
+proc cProfWinUs(which: int32): int32 {.importc: "aowl_prof_win_us", nodecl.}
+proc cProfOverheadNs(): int64 {.importc: "aowl_prof_overhead_ns", nodecl.}
+proc cProfFaults(): int32 {.importc: "aowl_prof_faults", nodecl.}
+proc cProfSelfDisabled(): int32 {.
+  importc: "aowl_prof_self_disabled", nodecl.}
+proc cProfFramesSeen(): int64 {.importc: "aowl_prof_frames", nodecl.}
+proc cProfOn(): int32 {.importc: "aowl_prof_is_enabled", nodecl.}
+
+proc duMsText(ns: int64): string =
+  ## Nanoseconds as milliseconds to 3 places, without floating point formatting
+  ## and without allocating a table. 1_234_567 ns -> "1.234".
+  let us = ns div 1000
+  result = $(us div 1000) & "." &
+           (if us mod 1000 < 10: "00" elif us mod 1000 < 100: "0" else: "") &
+           $(us mod 1000)
+
+proc duProfRank(n: int): int32 =
+  ## The index of the n-th costliest slot this window (0-based), or -1 when
+  ## there is no n-th slot.
+  ##
+  ## No sort and no allocation: a bounded selection scan over a table whose
+  ## size is a compile-time constant, run n+1 times. The order is TOTAL --
+  ## (ns descending, index ascending) -- which is what stops two slots with
+  ## identical cost from both being reported as rank 0 and one of them never
+  ## appearing at all.
+  result = -1'i32
+  let cap = cProfSlotCount()
+  var prevNs = int64(0)
+  var prevIdx = -1'i32
+  var rank = 0
+  while rank <= n:
+    var bestIdx = -1'i32
+    var bestNs = int64(-1)
+    var i = 0'i32
+    while i < cap:
+      if cProfSlotKind(i) != 0'i32:
+        let v = cProfSlotNs(i)
+        let eligible = prevIdx < 0 or v < prevNs or (v == prevNs and i > prevIdx)
+        # `v > bestNs` alone breaks ties toward the LOWER index, because the
+        # scan runs ascending -- which is the second half of the total order.
+        if eligible and v > bestNs:
+          bestNs = v
+          bestIdx = i
+      i = i + 1'i32
+    if bestIdx < 0: return -1'i32
+    if rank == n: return bestIdx
+    prevNs = bestNs
+    prevIdx = bestIdx
+    rank = rank + 1
+
+proc duProfState(): string =
+  if cProfOn() == 0:
+    if cProfSelfDisabled() != 0:
+      result = "profiler SELF-DISABLED after " & $cProfFaults() & " faults"
+    else:
+      result = "profiler OFF (turn it on in the Debug mod's settings)"
+  elif cProfWinUs(1) == 0:
+    result = "profiler ON, no complete window yet"
+  else:
+    result = ""
+
+proc duProfLine(n: int): string =
+  ## The n-th costliest profiled scope, or an explicit refusal.
+  let st = duProfState()
+  if st.len > 0: return (if n == 0: st else: "")
+  let i = duProfRank(n)
+  if i < 0: return ""
+  let permille = cProfSlotPermille(i)
+  let ns = cProfSlotNs(i)
+  let noise = cProfOverheadNs() * 3
+  result = "  " & $cProfSlotNameC(i) & "  " & duMsText(ns) & " ms  " &
+           (if permille < 0: "--"
+            else: $(permille div 10) & "." & $(permille mod 10) & "%") &
+           "  x" & $cProfSlotCalls(i) &
+           "  peak " & duMsText(cProfSlotMaxNs(i)) & " ms" &
+           (if noise > 0 and ns < noise: "  [at the noise floor]" else: "")
+
 proc duPanelLine(field: string): string =
   ## One panel line's text for one field name. An unrecognised name prints
   ## itself with a marker rather than being silently dropped, so a typo in the
@@ -1159,6 +1260,32 @@ proc duPanelLine(field: string): string =
                            else: "-")
   of "botlist":
     result = duBotListLine()
+  of "frametime":
+    if cProfOn() == 0:
+      result = "frametime  " & duProfState()
+    elif cProfWinUs(1) == 0:
+      result = "frametime  profiler ON, no complete window yet"
+    else:
+      result = "frametime ms  min " & duMsText(int64(cProfWinUs(0)) * 1000) &
+               "  p50 " & duMsText(int64(cProfWinUs(2)) * 1000) &
+               "  p95 " & duMsText(int64(cProfWinUs(3)) * 1000) &
+               "  p99 " & duMsText(int64(cProfWinUs(4)) * 1000) &
+               "  max " & duMsText(int64(cProfWinUs(5)) * 1000)
+  of "prof":
+    let st = duProfState()
+    result = "profiler  " &
+             (if st.len > 0: st
+              else: "window " & $cProfFramesSeen() & " frames seen, " &
+                    "scope overhead " & $cProfOverheadNs() & " ns, " &
+                    $cProfFaults() & " faults")
+  of "prof1": result = duProfLine(0)
+  of "prof2": result = duProfLine(1)
+  of "prof3": result = duProfLine(2)
+  of "prof4": result = duProfLine(3)
+  of "prof5": result = duProfLine(4)
+  of "prof6": result = duProfLine(5)
+  of "prof7": result = duProfLine(6)
+  of "prof8": result = duProfLine(7)
   of "note1": result = gDuCfg.note1
   of "note2": result = gDuCfg.note2
   of "note3": result = gDuCfg.note3

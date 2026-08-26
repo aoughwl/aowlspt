@@ -36,6 +36,32 @@ import aowlsptinstall/winfs
 import jsonpath
 
 {.emit: """#include "aowlspt_shim.h" """.}
+{.emit: """#include "aowlspt_profile.h" """.}
+
+# ---------------------------------------------------------------------------
+# THE PER-MOD PROFILER's one hook into the loader (abi/aowlspt_profile.h).
+#
+# `tickMods` below is the ONE place in the whole project where every mod's
+# per-frame work is dispatched, on every host -- the client host, the backend
+# and the simulator all call it. That makes it the only honest place to answer
+# "which mod is costing frame time", and it is why the profiler is here rather
+# than in a mod: a mod cannot time its siblings.
+#
+# It is OFF by default and it is off in the shipped build. With `enabled` clear,
+# `aowl_prof_begin` is one volatile load and a return, so the cost of carrying
+# this is a load and a predicted branch per mod per tick. Nothing here allocates:
+# the slot index is registered ONCE per mod (idempotent, by guid) and lives in
+# the LoadedMod record; the accumulators are int64s in a shared page.
+proc cProfSlot*(name: cstring; kind: int32): int32 {.
+  importc: "aowl_prof_slot", nodecl.}
+proc cProfBegin*(slot: int32) {.importc: "aowl_prof_begin", nodecl.}
+proc cProfEnd*(slot: int32) {.importc: "aowl_prof_end", nodecl.}
+proc cProfEnabled*(): int32 {.importc: "aowl_prof_is_enabled", nodecl.}
+proc cProfFrame*() {.importc: "aowl_prof_frame", nodecl.}
+proc cProfTickBoundary*() {.importc: "aowl_prof_tick_boundary", nodecl.}
+proc cProfCalibrate*() {.importc: "aowl_prof_calibrate", nodecl.}
+
+const ProfKindMod* = 1'i32
 
 ## ---------------------------------------------------------------------------
 ## Giving a mod's allocator back when the mod goes
@@ -409,6 +435,13 @@ type
       ## supposed to avoid wearing a disguise. `tests/tickfault`'s flaky
       ## fixture is what found it.
     tickFaulted*: bool
+    profSlot*: int32
+      ## This mod's slot in the profiler's shared region, or -1 for "not
+      ## registered yet". Registered lazily on the first tick AFTER the
+      ## profiler is switched on, so a run that never enables the profiler
+      ## never touches the region at all. -1 is a legal argument to
+      ## `cProfBegin`/`cProfEnd`, which ignore it, so a refused registration
+      ## degrades to "this mod is not profiled" and never to a fault.
       ## Set once the run above reaches `TickFaultLimit`. The mod stays
       ## **loaded** -- its routes, events, timers and detours all keep working;
       ## it simply stops being handed the tick it cannot survive.
@@ -805,7 +838,8 @@ proc loadMod*(path: string; side: int32; hostName, hostVersion: string;
                     api: cast[HostPtr](0), hostBlock: cast[HostPtr](0),
                     guid: "", name: "", author: "", version: "",
                     hasUpdate: false, live: false, tickFails: 0,
-                    tickWarned: false, tickFaulted: false, flags: 0'u32)
+                    tickWarned: false, tickFaulted: false, flags: 0'u32,
+                    profSlot: -1'i32)
 
   # Before the first `LoadLibrary` of the process and harmless on every one
   # after it: each mod's mimalloc reads this when it initialises, and without
@@ -1067,10 +1101,29 @@ proc tickMods*(elapsed: int64) =
   ## faulted mod answering HTTP as well -- and would leave `unloadOne`'s drain
   ## looking at a flag somebody else set. `tests/tickfault` asserts that a
   ## faulted mod is still enterable for exactly that reason.
+  let profOn = cProfEnabled() != 0
+  # The LOADER's window boundary, once per pass rather than once per mod. On the
+  # backend and the simulator it is the only boundary there is, which is what
+  # makes the profiler measurable without a game running; on the client host the
+  # frame rider boundary also fires and owns the frame-time histogram. It does
+  # NOT write that histogram -- see `aowl_prof_boundary`.
+  if profOn: cProfTickBoundary()
   for i in 0 ..< gMods.len:
     if not gMods[i].live or not gMods[i].hasUpdate or gMods[i].tickFaulted:
       continue
+    # THE PROFILER SCOPE. Registration is lazy and idempotent: it happens on
+    # the first tick after the profiler is enabled, never at load, so a run
+    # with the profiler off never maps the region. `profOn` is read ONCE per
+    # tickMods call rather than per mod, so enabling it mid-window cannot
+    # produce a window where some mods were timed and others were not.
+    if profOn and gMods[i].profSlot < 0:
+      # `toCString` wants a mutable string and the C side only reads it -- it
+      # copies the name into the slot's fixed char[32] and keeps no pointer.
+      var guidBuf = gMods[i].guid
+      gMods[i].profSlot = cProfSlot(toCString(guidBuf), ProfKindMod)
+    if profOn: cProfBegin(gMods[i].profSlot)
     let st = cModApiOnUpdate(gMods[i].api, elapsed)
+    if profOn: cProfEnd(gMods[i].profSlot)
     if st == StatusOk:
       # A run of failures ended by a success never gets to the threshold.
       gMods[i].tickFails = 0
