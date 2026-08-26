@@ -60,7 +60,7 @@
   "unAimSpeedZ": 4.5,
 
   "enableFovWrite": false,
-  "verifyHooks": false,
+  "verifyHooksByName": false,
   "deferUntilUnityThread": true,
   "hookFrameDriver": false,
 
