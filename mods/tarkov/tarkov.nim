@@ -2231,6 +2231,98 @@ proc onMatchEnd(url, body, session: string): string =
 
   if not saveProfile(updated):
     return failure(1, "could not save the profile after the raid")
+
+  # `transferItems`: everything the player handed to the BTR container or
+  # carried into a transit. It is in the request body and it is **not** in the
+  # profile the client posts back -- handing an item over is exactly how it
+  # leaves the character -- so the profile replacement above destroyed all of
+  # it. Pay the BTR, load the container, extract, and the kit was neither in
+  # the stash nor in the mail. Silent, permanent, and answered with a 200.
+  #
+  # Posted rather than spliced into the stash, for three reasons. A stash can
+  # be full, and the only honest thing a splice can do when it is full is drop
+  # items -- which is the bug being fixed, wearing a different hat. The
+  # mailbox has no capacity to run out of, so the full-stash case stops being
+  # a case at all: the items wait in the inbox until there is room. And the
+  # client already has `EFT.UI.DragAndDrop.MailTransferItemsGridItemView` -- a
+  # mailbox view built for transferred items -- which is the best evidence
+  # available that post is what the real backend does with them.
+  #
+  # After the save on purpose: a raid whose result was thrown away must not
+  # leave items in a mailbox for it.
+  var xferProblems: seq[string] = @[]
+  let carried = transferredItems(body, xferProblems)
+  for problem in xferProblems:
+    # `error`, not `warn`. Every line here means items this server could see
+    # and could not place, which is the loudest thing that happens in this
+    # handler.
+    error "match/end transferItems: " & problem
+  let carriedList = parseArray(carried)
+  if carriedList.ok and carriedList.len > 0:
+    # Which of them are already somewhere the player can reach. Both places are
+    # checked, because this is what makes a retried `match/local/end`
+    # idempotent: without it a client that re-posts the same body -- and it
+    # does, after a failed save -- gets a second copy of every transferred
+    # item.
+    var home: seq[string] = @[]
+    let stashItems = each(updated.field("Inventory.items"))
+    for it in stashItems:
+      home.add it.field("_id").asText("")
+    let inbox = loadMail(p.id)
+    for i in 0 ..< inbox.len:
+      let attached = each(whole(inbox.items[i]).field("items.data"))
+      for a in attached:
+        home.add a.field("_id").asText("")
+    var owed = newList()
+    for i in 0 ..< carriedList.len:
+      let id = field(carriedList.items[i], "_id").asText("")
+      var have = false
+      for h in home:
+        if h.len > 0 and h == id:
+          have = true
+      if not have:
+        owed.add carriedList.items[i]
+    if owed.len == 0:
+      info $carriedList.len & " transferred item(s) are already in the stash " &
+           "or the mailbox; nothing was posted"
+    elif deliver(p.id, "", "The items you handed over in the raid have been " &
+                 "delivered.", mkSystem, nowSeconds(), text(owed)):
+      # Plain words rather than a trader's. This is a system message, which the
+      # client renders without a sender, so there is no voice being put in
+      # anybody's mouth -- unlike the insurance returns, which refuse to send
+      # anything the database has no wording for.
+      success $owed.len & " item(s) handed over in the raid were posted to " &
+              "the mailbox"
+    else:
+      # The mailbox could not be written and the profile already has been, so
+      # the items exist nowhere. Nothing here can put them back -- the profile
+      # the client played with no longer contains them -- so the only useful
+      # act is to name every one of them in the log, loudly enough that a
+      # human can put them back by hand.
+      var names = ""
+      for i in 0 ..< owed.len:
+        if names.len > 0: names.add ", "
+        names.add field(owed.items[i], "_tpl").asText("?") & " (" &
+                  field(owed.items[i], "_id").asText("?") & ")"
+      error "could not post " & $owed.len & " transferred item(s) to " &
+            p.nickname & "'s mailbox, and the profile has already been " &
+            "saved without them, so they are LOST: " & names
+
+  if outcome == rrTransit:
+    # KNOWN LIMITATION, stated rather than hidden. `locationTransit` names a
+    # destination map (MEASURED: `EFT.LocationTransit` is `{hash, playersCount,
+    # ip, location, profiles, transitionRaidId, raidMode, side, dayTime}` --
+    # no items), and this server does not continue a raid onto it: it ends the
+    # raid here, exactly as it does for `Left`. Gear is kept and the transit
+    # hold has just been posted above, so nothing is lost by it; what is
+    # missing is the seamless second raid.
+    let dest = transitDestination(body)
+    warn "this raid ended in a transit to " &
+         (if dest.len > 0: dest else: "an unnamed location") &
+         ", and this server does not continue a raid across one: it has been " &
+         "ended here instead. Nothing was lost -- the gear is kept and the " &
+         "transit hold has been posted to the mailbox."
+
   # Only now. A raid whose result failed to save is still a raid in progress,
   # and dropping the map here would make the retry worse than the failure.
   leaveRaid(session)
@@ -2448,6 +2540,42 @@ proc onMailView(url, body, session: string): string =
     return envelope(emptyObject())
   let dialogId = field(body, "dialogId").asText("")
   result = envelope(raw(dialogView(p.id, dialogId)))
+
+proc onMailDialogInfo(url, body, session: string): string =
+  ## `/client/mail/dialog/info` -- the header of ONE dialog: the sender, its
+  ## newest message, its unread count and its parcel badge.
+  ##
+  ## This was served by `onEmptyObject`. `{}` is a correct answer for a dialog
+  ## that does not exist and a wrong one for a dialog that does, and the two
+  ## are indistinguishable to the client: it takes the empty header, draws a
+  ## row with no preview and no badge, and the player's insurance return has
+  ## no visible unread mark. Same shape of defect as the hard-coded `new: 0`
+  ## that `dialogList` used to carry.
+  ##
+  ## Built by selecting out of `dialogList` rather than by assembling a header
+  ## here, so the row this route draws and the row the inbox draws cannot
+  ## disagree -- a second place deciding what a dialog header looks like is
+  ## how the two drift apart.
+  inc gRequests
+  let p = currentProfile(session)
+  if not p.ok:
+    return envelope(emptyObject())
+  # Not gated on a non-empty id. A system message is delivered with an empty
+  # sender -- `mkSystem` renders without one, which is what an achievement, an
+  # insurance return and the BTR hand-over all want -- so `""` is a real dialog
+  # in this mailbox and refusing to look it up would be the same wrong answer
+  # in a smaller place.
+  let dialogId = field(body, "dialogId").asText("")
+  let rows = each(whole(dialogList(p.id)))
+  for row in rows:
+    if row.field("_id").asText("") == dialogId:
+      let header = raw(row)
+      return envelope(raw(header))
+  # No such dialog. `{}` is the honest answer *here* -- and it is now only ever
+  # sent when the dialog genuinely is not in the mailbox.
+  warn "mail/dialog/info asked for dialog '" & dialogId &
+       "', which is not in this profile's mailbox; an empty header was sent"
+  result = envelope(emptyObject())
 
 proc onMailAttachments(url, body, session: string): string =
   inc gRequests
@@ -2750,6 +2878,11 @@ proc registerRoutes() =
   discard servePrefix("/client/trading/api/getTrader/", onTrader)
   discard serve("/client/trading/customization/storage", onCustomizationStorage)
   discard servePrefix("/client/items/prices/", onItemPrices)
+  # And without the trailing slash. `servePrefix` requires one, so the bare
+  # `/client/items/prices` -- which is a literal in the client's own string
+  # table -- matched nothing and 404'd. The handler never reads the URL, so
+  # both spellings are the same answer.
+  discard serve("/client/items/prices", onItemPrices)
 
   # Post-1.0 tables and stubs, none of which pre-1.0 had
   discard serve("/client/dialogue", onDialogue)
@@ -2767,6 +2900,13 @@ proc registerRoutes() =
   # Raids
   discard serve("/client/raid/configuration", onRaidConfiguration)
   discard serve("/client/location/getLocalloot", onLocalLoot)
+  # Both spellings. MEASURED against the client's own string table (the
+  # decrypted `global-metadata`): `/client/airdrop/loot` occurs ONCE and
+  # `/client/location/getAirdropLoot` occurs ZERO times -- i.e. the route this
+  # server has always served is one this client never calls, and the one it
+  # does call 404'd. The old name is kept because a pre-1.0 client does use it
+  # and removing it would trade one silent gap for another.
+  discard serve("/client/airdrop/loot", onAirdropLoot)
   discard serve("/client/location/getAirdropLoot", onAirdropLoot)
   discard serve("/client/locations", onLocations)
   discard serve("/client/match/local/start", onMatchStart)
@@ -2800,7 +2940,7 @@ proc registerRoutes() =
   discard serve("/client/notifier/channel/create", onNotifierChannel)
   discard servePrefix("/client/notifier/getwebsocket", onNotifierPoll)
   discard serve("/client/mail/dialog/list", onMailList)
-  discard serve("/client/mail/dialog/info", onEmptyObject)
+  discard serve("/client/mail/dialog/info", onMailDialogInfo)
   discard serve("/client/mail/dialog/view", onMailView)
   discard serve("/client/mail/dialog/getAllAttachments", onMailAttachments)
   discard serve("/client/mail/dialog/read", onMailRead)
