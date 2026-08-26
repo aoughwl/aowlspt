@@ -625,6 +625,87 @@ proc noteLastProfile*(root, id: string) =
   discard ensureDir(joinPath(root, "aowlspt"))
   discard writeTextFile(lastProfilePath(root), id & "\n")
 
+# ---------------------------------------------------------------------------
+# `launchProfileId` -- telling the HOST which profile the launcher bound
+# ---------------------------------------------------------------------------
+#
+# The host DLL cannot see the launcher's choice. It is passed to the CLIENT as
+# `-token=<session>`, and a session token is not a profile id -- the host has no
+# route from one to the other, because that mapping lives in the backend.
+#
+# The `uxSkipModeScreen` feature needs the PROFILE id specifically: it compares
+# it against `CharacterSelectionProfileData.ProfileId` on each slot the game's
+# selection screen shows, and Submits the slot that matches. So the launcher
+# writes the id it bound into `aowlspt-host.json`, beside the DLL, where the
+# host already reads its other settings from.
+#
+# Written on EVERY launch, including as an explicit empty string when no profile
+# was bound. That is the important half: a STALE id left over from a previous
+# boot would have the host select a profile the current session is not bound to,
+# which is a worse failure than not skipping at all. Clearing is not optional.
+
+proc hostConfigPath*(root: string): string =
+  joinPath(root, "aowlspt\\aowlspt-host.json")
+
+proc noteLaunchProfileId*(root, id: string): bool =
+  ## Records `id` as `launchProfileId` in `aowlspt-host.json`. Pass "" to clear
+  ## it. Returns false if the file could not be written, so the caller can say
+  ## so -- unlike `noteLastProfile`, this one is NOT purely a hint: a launch that
+  ## silently failed to record its profile will show the mode screen the user
+  ## asked never to see, and that deserves a word rather than a shrug.
+  ##
+  ## A shallow key rewrite, deliberately matching the shallow key READ the host
+  ## does (`readStrKey` in `aowlhost.nim`). Neither side drags in a JSON parser
+  ## for a flat file of scalars, and a parser here would additionally reformat a
+  ## file a human edits by hand.
+  let path = hostConfigPath(root)
+  let value = (if isHexId(id): id else: "")
+  var text = ""
+  if not readTextFile(path, text):
+    # No config yet: create a minimal one rather than failing. The host treats
+    # every absent key as its default, so a file with only this key is valid.
+    discard ensureDir(joinPath(root, "aowlspt"))
+    return writeTextFile(path,
+      "{\n  \"launchProfileId\": \"" & value & "\"\n}\n").ok
+
+  let needle = "\"launchProfileId\""
+  let at = find(text, needle)
+  if at < 0:
+    # Insert after the opening brace, preserving everything else byte for byte.
+    let brace = find(text, "{")
+    if brace < 0:
+      return writeTextFile(path,
+        "{\n  \"launchProfileId\": \"" & value & "\"\n}\n").ok
+    var outp = text[0 .. brace]
+    outp.add "\n  \"launchProfileId\": \"" & value & "\","
+    outp.add text[brace + 1 .. text.high]
+    return writeTextFile(path, outp).ok
+
+  # Replace the existing quoted value in place. Capped scans throughout: a file
+  # with an unterminated quote must not become an unbounded walk.
+  var i = at + needle.len
+  var guard = 0
+  while i < text.len and (text[i] == ' ' or text[i] == ':' or
+                          text[i] == '\t') and guard < 64:
+    inc i
+    inc guard
+  if i >= text.len or text[i] != '"':
+    # The key is there but its value is not a quoted string. Leave the file
+    # alone rather than guessing at what to rewrite, and say the write failed.
+    return false
+  let vStart = i + 1
+  var j = vStart
+  guard = 0
+  while j < text.len and text[j] != '"' and guard < 512:
+    inc j
+    inc guard
+  if j >= text.len or text[j] != '"':
+    return false
+  var outp = text[0 ..< vStart]
+  outp.add value
+  outp.add text[j .. text.high]
+  return writeTextFile(path, outp).ok
+
 proc autoProfile*(list: ProfileList; lastId: string; chosen: var Profile;
                   reason: var string): bool =
   ## Which profile to play when nobody is being asked.

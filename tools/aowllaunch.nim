@@ -1969,6 +1969,29 @@ proc main(): int =
     # selected does not become the one the next boot prefers.
     noteLastProfile(root, chosen.id)
 
+    # TELL THE HOST WHICH PROFILE THIS IS. `-token` carries the SESSION to the
+    # client; it does not carry the profile id, and the host has no route from
+    # one to the other. The `uxSkipModeScreen` feature matches this id against
+    # each slot the game's own selection screen shows, so without it the host
+    # cannot answer that screen and the user sees the thing they asked never to
+    # see. Written after the bind succeeded, for the same reason as above.
+    if not noteLaunchProfileId(root, chosen.id):
+      warn "could not write launchProfileId into aowlspt-host.json. If " &
+           "uxSkipModeScreen is on, the host will not know which profile " &
+           "to select and the character/mode selection screen WILL appear. " &
+           "The launch itself is unaffected."
+
+  if not haveChoice:
+    # NO PROFILE WAS BOUND. Clear `launchProfileId` rather than leaving the
+    # previous boot's id in place: a stale id would have the host select a
+    # profile this session is not bound to, which is a worse failure than
+    # showing the selection screen. `uxSkipModeScreen` then declines loudly at
+    # host boot and says the launcher bound nothing, which is the truth.
+    if not noteLaunchProfileId(root, ""):
+      warn "could not clear launchProfileId in aowlspt-host.json. No " &
+           "profile was bound this launch, so a leftover id there could have " &
+           "the host select the wrong profile."
+
   heading "Launching"
   let cmdLine = clientCommandLine(backendUrl, token, o.extraArgs)
   # Whole, not fitted. It is long, and it is the one line somebody will be

@@ -193,6 +193,9 @@ static int aowl_rva_is_code(unsigned int rva) {
 ## thunk that drives it. The implementation is in `modetext.nim` (included
 ## below). See `aowlspt_modetext.h`.
 {.emit: """#include "aowlspt_modetext.h" """.}
+## SKIP THE MODE SCREEN. The three byte-verified selection-screen targets and
+## the profile-data field offsets. See `aowlspt_modeskip.h`.
+{.emit: """#include "aowlspt_modeskip.h" """.}
 ## The in-game, Unity-native debug overlay: the F3 info panel and the
 ## in-world AI markers. Target table, call thunks, guarded scalar stores,
 ## the toggle key and the frame-rate estimate. See `aowlspt_debugui.h`.
@@ -1319,6 +1322,19 @@ var gDebugEsp = false
 ## matches rather than picking one. Neither feature excludes the other any more.
 var gModeTextSlot = -1
 var gModeTextOn = false
+
+## SKIP THE MODE SCREEN (`modeskip.nim`). Declared here for the same reason
+## `gModeTextSlot` is: `attachDrain` and the two dispatch points all name
+## them and all sit above the include point, and while procs resolve across
+## the whole module regardless of order, module-level `var`s do not.
+##
+## These are two detours on two functions NOTHING ELSE IN THIS HOST TOUCHES
+## (both unshared RVAs), so unlike the PreloaderUI::Update multiplex above
+## there is no rider alias to take and no double-detour hazard.
+var gModeSkipCtorSlot = -1
+var gModeSkipShowSlot = -1
+var gModeSkipOn = false
+var gModeSkipWantId = ""
 
 ## THE LIVE INSPECTOR'S slot -- the THIRD rider on `EFT.UI.PreloaderUI::Update`,
 ## declared here for the same reason `gModeTextSlot` is: `attachDrain` and
@@ -2958,6 +2974,13 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     # per frame and never runs a batch twice.
     if i == gInspSlot2:
       inspectDrainFired()
+    # SKIP THE MODE SCREEN'S deferred Submit. It rides THIS drain, not
+    # `PreloaderUI::Update`, for two reasons: `TarkovApplication::Update` ticks
+    # for the whole session (the selection screen is up before the main menu
+    # exists, where PreloaderUI's tick cannot be assumed), and riding an
+    # existing drain means no second detour and no second trampoline. Idle cost
+    # is two integer compares.
+    modeSkipDrainTick()
     return 0'i32
   # The render-phase drain, likewise by identity: a second detour on a
   # render-phase method that drains the render queue where GL drawing lands.
@@ -3127,6 +3150,18 @@ proc patchReturned(slot: int32; regs: Il2CppPtr): int32 {.
   # falling through to the meth-driven code below.
   if i == gVersionSlot:
     versionBrandFired(regs)
+    return 0'i32
+  # SKIP THE MODE SCREEN: the two READ-ONLY postfix captures, by identity and
+  # before the generic postfix path -- both are host drains (meth == nil), so
+  # they must be handled here rather than falling through to the meth-driven
+  # code below. Both return 0: neither ever changes what the caller gets, and
+  # neither suppresses its original. The selection screen is allowed to build
+  # itself completely and is dismissed from a LATER frame by the drain tick.
+  if i == gModeSkipCtorSlot:
+    modeSkipCtorFired(regs)
+    return 0'i32
+  if i == gModeSkipShowSlot:
+    modeSkipShowSlotFired(regs)
     return 0'i32
   # The menu mode-text postfix, by identity and for the same reason: a host
   # drain (meth == nil) on `PreloaderUI::Update`. Returns 0 -- it never changes
@@ -4299,6 +4334,8 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
               elif kind == 13: "menu-mode-text"
               elif kind == 14: "live-inspector"
               elif kind == 15: "bot-nav"
+              elif kind == 17: "skip-mode-screen-ctor"
+              elif kind == 18: "skip-mode-screen-showslot"
               else: "main-thread")
   tablesLock()
   let claimed = cHookClaim()
@@ -4372,6 +4409,10 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
     gBotNavSlot = int(claimed)
   elif kind == 16:
     gCodeGenProbeSlot = int(claimed)
+  elif kind == 17:
+    gModeSkipCtorSlot = int(claimed)
+  elif kind == 18:
+    gModeSkipShowSlot = int(claimed)
   else:
     gDrainSlot = int(claimed)
   tablesUnlock()
@@ -4380,7 +4421,7 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
   elif kind == 2 or kind == 3 or kind == 4 or kind == 5 or kind == 6 or
        kind == 7 or kind == 8 or kind == 9 or kind == 10 or
        kind == 11 or kind == 12 or kind == 13 or kind == 14 or kind == 15 or
-       kind == 16:
+       kind == 16 or kind == 17 or kind == 18:
     discard
   else:
     gDrainMethod = spec
@@ -4390,7 +4431,8 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
         (if perFrame or kind == 2 or kind == 3 or kind == 4 or kind == 5 or
             kind == 6 or kind == 7 or kind == 8 or kind == 9 or
             kind == 10 or kind == 11 or kind == 12 or kind == 13 or
-            kind == 14 or kind == 15 or kind == 16: "" else:
+            kind == 14 or kind == 15 or kind == 16 or kind == 17 or
+            kind == 18: "" else:
            "; it runs more than once a frame, so its firing count is not a " &
            "frame count")
   return true
@@ -5318,6 +5360,12 @@ include "settingspages.nim"
 ## `bindModeText`.
 include "modetext.nim"
 
+## SKIP THE MODE SCREEN. Included after `modetext.nim` and before
+## `inspect.nim`; it shares this file's guarded primitives and logging the
+## same way, and it touches none of the PreloaderUI riders above -- its two
+## detours are on functions nothing else in this host names.
+include "modeskip.nim"
+
 ## THE LIVE INSPECTOR / REPL. `include`d LAST of all, because it stands on every
 ## file above it at once: `settingsui.nim`'s `suiReadString` and tab registry,
 ## `invoke2.nim`'s byte-verified managed-call targets, `debugui.nim`'s `duOk`,
@@ -5872,6 +5920,41 @@ proc readBoolKey(key: string): bool =
     result = true
   elif i < text.len and text[i] >= '1' and text[i] <= '9':
     result = true
+
+proc readStrKey(key: string): string =
+  ## A shallow read of one `aowlspt-host.json` STRING key: the contents of the
+  ## first double-quoted run after `"key":`. Deliberately the same shallow shape
+  ## as `readBoolKey` above, and for the same reason -- none of these settings is
+  ## worth dragging a JSON parser into the host for.
+  ##
+  ## Returns "" when the key is absent, when the file is unreadable, or when the
+  ## value is not a quoted string. It does NOT decode escapes: every key read
+  ## this way is an opaque identifier (a Mongo profile id is hex), and silently
+  ## half-decoding an escape would be worse than not accepting one.
+  result = ""
+  var text = ""
+  if not readTextFile(joinPath(gDir, "aowlspt-host.json"), text):
+    return
+  let needle = "\"" & key & "\""
+  let at = find(text, needle)
+  if at < 0:
+    return
+  var i = at + needle.len
+  while i < text.len and (text[i] == ' ' or text[i] == ':' or text[i] == '\t'):
+    inc i
+  if i >= text.len or text[i] != '"':
+    return
+  inc i
+  var acc = ""
+  # CAPPED, like every other loop that reads game-adjacent data: a file with an
+  # unterminated quote must not become an unbounded scan.
+  var guard = 0
+  while i < text.len and text[i] != '"' and guard < 512:
+    acc.add text[i]
+    inc i
+    inc guard
+  if i < text.len and text[i] == '"':
+    result = acc
 
 proc readDrainDisabled(): bool = readBoolKey("bridgeDisableDrain")
 
@@ -6598,6 +6681,27 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "poll-driven -- no game code calls anything when our cloned toggle " &
          "turns on. The old standing-check path is untouched and stays as " &
          "the backstop (and the only path at all when this flag is off)."
+  # SKIP THE MODE SCREEN. Two independent conditions, both explicit: the flag,
+  # and an actual profile id to select. `launchProfileId` is written by
+  # `tools/aowllaunch.nim` from the SAME id it passes as `-token`, which is the
+  # only thing that gives the client a PHPSESSID -- so if the launcher got far
+  # enough to start the client at all, it knew this id.
+  gModeSkipOn = readBoolKey("uxSkipModeScreen")
+  gModeSkipWantId = readStrKey("launchProfileId")
+  if gModeSkipOn and gModeSkipWantId.len == 0:
+    warn "uxSkipModeScreen is set but `launchProfileId` is absent or empty in " &
+         "aowlspt-host.json. There is no profile to select, so NOTHING will " &
+         "be bound and the character/mode selection screen WILL appear. This " &
+         "is a launcher error, not a host one: aowllaunch writes that key " &
+         "from the same id it passes as -token."
+  elif gModeSkipOn:
+    info "uxSkipModeScreen is set: read-only postfix detours on " &
+         "CharacterSelectionScreenController::.ctor and " &
+         "CharacterSelectionScreen::ShowSlot will capture the slot whose " &
+         "ProfileId is " & gModeSkipWantId & ", and the " &
+         "TarkovApplication::Update drain will call the game's own " &
+         "Submit for it a couple of ticks later. Neither detour suppresses " &
+         "its original, so the screen is dismissed rather than prevented."
   gMi2Probe = readBoolKey("managedInvokeProbe")
   if gMi2Probe:
     info "managedInvokeProbe is set: a POSTFIX detour on " &
@@ -6912,6 +7016,18 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
                "backend.json, so this host cannot ask the backend what the " &
                "label should read and the corner will keep the game's stock " &
                "text. Set backendPort to the backend's port to use this."
+
+      # SKIP THE MODE SCREEN (opt-in). Independent of every rider above: its two
+      # detours are on `CharacterSelectionScreenController::.ctor` and
+      # `CharacterSelectionScreen::ShowSlot`, both UNSHARED RVAs that nothing
+      # else in this host touches, so there is no ordering constraint and no
+      # trampoline to contend for. Its deferred `Submit` rides the
+      # `TarkovApplication::Update` drain, which is already bound by now.
+      if gModeSkipOn:
+        if not bindModeSkip(true):
+          info "skip mode screen did not arm (see the reason logged above: " &
+               "no launchProfileId, targets unverified on this build, or " &
+               "drain disabled). The selection screen will appear as normal."
 
       # THE LIVE INSPECTOR (opt-in). Bound LAST of the three riders on
       # `EFT.UI.PreloaderUI::Update`, which is exactly where it wants to be:
