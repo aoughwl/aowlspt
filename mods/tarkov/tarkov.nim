@@ -3235,7 +3235,7 @@ proc onUnload(): Status =
 
 exportMod(
   guid = ModGuid,
-  name = "Tarkov Emulator",
+  name = "Singleplayer",
   author = "aowlspt",
   version = ModVersion,
   sptRange = "*",

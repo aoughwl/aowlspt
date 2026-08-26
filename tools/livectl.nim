@@ -121,7 +121,7 @@ livectl -- enable and disable mods on a running server
   ## unloaded.
 
   ServerName = "Game Server"     ## as `exportMod` names it, and as the log does
-  TarkovName = "Tarkov Emulator"
+  TarkovName = "Singleplayer"
   ManagerName = "Mod Manager"    ## `mgr`'s own `ModName`
 
   # A registry of exactly the three mods staged beside it. Written here rather
@@ -156,7 +156,7 @@ livectl -- enable and disable mods on a running server
     },
     {
       "id": "aowl.tarkov",
-      "name": "Tarkov Emulator",
+      "name": "Singleplayer",
       "author": "aowlspt",
       "version": "0.1.0",
       "description": "The mod that must keep serving while another one is taken out.",
@@ -263,7 +263,7 @@ livectl -- enable and disable mods on a running server
     },
     {
       "id": "aowl.tarkov",
-      "name": "Tarkov Emulator",
+      "name": "Singleplayer",
       "author": "aowlspt",
       "version": "0.1.0",
       "description": "The mod that must keep serving while another one is taken out.",
@@ -835,7 +835,7 @@ proc main(): int =
   #
   # Three checks further down assert `unloadedCount("Mod Manager") == 0` -- the
   # manager was never taken out -- and a count of a string that this log never
-  # writes is zero whatever the host did. `Game Server` and `Tarkov Emulator`
+  # writes is zero whatever the host did. `Game Server` and `Singleplayer`
   # are each anchored by a check that counts *up* to a known number; the
   # manager's name had no such anchor, so its three protection checks rested on
   # a spelling nothing here confirmed. This confirms it.
