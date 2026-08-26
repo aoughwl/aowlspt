@@ -1,0 +1,42 @@
+token-gated il2cpp_* exports (32-byte memcmp before any work)
+
+il2cpp_class_for_each                          0x005b59c0 NONCE-token   per-API TLS nonce (see il2cpp_nonce)
+il2cpp_class_from_il2cpp_type                  0x005b1a70 NONCE-token   per-API TLS nonce (see il2cpp_nonce)
+il2cpp_class_from_name                         0x005b1b80 NONCE-token   per-API TLS nonce (see il2cpp_nonce)
+il2cpp_class_from_system_type                  0x005b1960 STATIC-token  token@0x65649f0[.rdata] 81ee5bc835a20f7ce956c3309d0a77e451be2b980572df4cb92693006dda47b4
+il2cpp_class_from_type                         0x005b2760 NONCE-token   per-API TLS nonce (see il2cpp_nonce)
+il2cpp_class_get_declaring_type                0x005b2650 STATIC-token  token@0x6564cc0[.rdata] 6bd845b21f8cf966d340ad1a87f461ce3ba81582ef5cc936a3107dea57c4319e
+il2cpp_class_get_field_from_name               0x005b2150 NONCE-token   per-API TLS nonce (see il2cpp_nonce)
+il2cpp_class_get_fields                        0x005b1cb0 NONCE-token   per-API TLS nonce (see il2cpp_nonce)
+il2cpp_class_get_method_from_name              0x005b23e0 NONCE-token   per-API TLS nonce (see il2cpp_nonce)
+il2cpp_class_get_methods                       0x005b2270 NONCE-token   per-API TLS nonce (see il2cpp_nonce)
+il2cpp_class_get_name                          0x005b2500 NONCE-token   per-API TLS nonce (see il2cpp_nonce)
+il2cpp_class_get_nested_types                  0x005b1e20 STATIC-token  token@0x6564d20[.rdata] 0f7ce956c3309d0a77e451be2b980572df4cb92693006dda47b4218efb68d542
+il2cpp_class_get_parent                        0x005b2610 STATIC-token  token@0x6564da0[.rdata] 59c633a00d7ae754c12e9b0875e24fbc29960370dd4ab72491fe6bd845b21f8c
+il2cpp_class_get_property_from_name            0x005b1f20 STATIC-token  token@0x6564b78[.rdata] 9d0a77e451be2b980572df4cb92693006dda47b4218efb68d542af1c89f663d0
+il2cpp_class_get_type                          0x005b2870 STATIC-token  token@0x6564af0[.rdata] 6bd845b21f8cf966d340ad1a87f461ce3ba81582ef5cc936a3107dea57c4319e
+il2cpp_class_num_fields                        0x005b26a0 STATIC-token  token@0x65648d0[.rdata] b5228ffc69d643b01d8af764d13eab1885f25fcc39a61380ed5ac734a10e7be8
+il2cpp_field_get_name                          0x005b30e0 NONCE-token   per-API TLS nonce (see il2cpp_nonce)
+il2cpp_field_get_offset                        0x005b3310 NONCE-token   per-API TLS nonce (see il2cpp_nonce)
+il2cpp_field_get_parent                        0x005b3200 NONCE-token   per-API TLS nonce (see il2cpp_nonce)
+il2cpp_field_get_type                          0x005b34f0 STATIC-token  token@0x6564990[.rdata] 218efb68d542af1c89f663d03daa1784f15ecb38a5127fec59c633a00d7ae754
+il2cpp_field_get_value                         0x005b3530 STATIC-token  token@0x6564e40[.rdata] d542af1c89f663d03daa1784f15ecb38a5127fec59c633a00d7ae754c12e9b08
+il2cpp_field_get_value_object                  0x005b3590 STATIC-token  token@0x6564b50[.rdata] af1c89f663d03daa1784f15ecb38a5127fec59c633a00d7ae754c12e9b0875e2
+il2cpp_field_static_get_value                  0x005b3790 STATIC-token  token@0x65649d0[.rdata] 63d03daa1784f15ecb38a5127fec59c633a00d7ae754c12e9b0875e24fbc2996
+il2cpp_method_get_class                        0x005b4350 NONCE-token   per-API TLS nonce (see il2cpp_nonce)
+il2cpp_method_get_declaring_type               0x005b44f0 NONCE-token   per-API TLS nonce (see il2cpp_nonce)
+il2cpp_method_get_flags                        0x005b4600 STATIC-token  token@0x65649b0[.rdata] b3208dfa67d441ae1b88f562cf3ca91683f05dca37a4117eeb58c5329f0c79e6
+il2cpp_method_get_from_reflection              0x005b3db0 NONCE-token   per-API TLS nonce (see il2cpp_nonce)
+il2cpp_method_get_name                         0x005b40b0 NONCE-token   per-API TLS nonce (see il2cpp_nonce)
+il2cpp_method_get_object                       0x005b3ec0 NONCE-token   per-API TLS nonce (see il2cpp_nonce)
+il2cpp_method_get_param                        0x005b42e0 STATIC-token  token@0x6564ad0[.rdata] 2f9c0976e350bd2a970471de4bb82592ff6cd946b3208dfa67d441ae1b88f562
+il2cpp_method_get_param_count                  0x005b42a0 STATIC-token  token@0x65648b0[.rdata] e350bd2a970471de4bb82592ff6cd946b3208dfa67d441ae1b88f562cf3ca916
+il2cpp_method_get_param_name                   0x005b46a0 NONCE-token   per-API TLS nonce (see il2cpp_nonce)
+il2cpp_method_get_return_type                  0x005b3d70 STATIC-token  token@0x6564ca0[.rdata] 37a4117eeb58c5329f0c79e653c02d9a0774e14ebb2895026fdc49b62390fd6a
+il2cpp_method_get_token                        0x005b4660 STATIC-token  token@0x6564c00[.rdata] a10e7be855c22f9c0976e350bd2a970471de4bb82592ff6cd946b3208dfa67d4
+il2cpp_method_has_attribute                    0x005b4460 STATIC-token  token@0x6564b98[.rdata] e14ebb2895026fdc49b62390fd6ad744b11e8bf865d23fac1986f360cd3aa714
+il2cpp_method_is_generic                       0x005b41c0 STATIC-token  token@0x6564890[.rdata] 49b62390fd6ad744b11e8bf865d23fac1986f360cd3aa71481ee5bc835a20f7c
+il2cpp_method_is_inflated                      0x005b4200 STATIC-token  token@0x6564930[.rdata] 1380ed5ac734a10e7be855c22f9c0976e350bd2a970471de4bb82592ff6cd946
+il2cpp_method_is_instance                      0x005b4250 STATIC-token  token@0x6564d40[.rdata] 69d643b01d8af764d13eab1885f25fcc39a61380ed5ac734a10e7be855c22f9c
+
+{'ungated': 203, 'NONCE-token': 18, 'STATIC-token': 20}

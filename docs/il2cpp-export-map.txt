@@ -1,0 +1,247 @@
+imagebase 0x180000000  sections: .text@0x1000+0x626200, il2cpp@0x628000+0x510fc00, .rdata@0x5738000+0x1428200, .data@0x6b61000+0x81ad74, .pdata@0x737c000+0x3b6400, .reloc@0x7733000+0x1bc200
+exports total 386  (il2cpp_* = 241)
+
+EXPORT                                               RVA        SECTION   KIND         FIRST BYTES / INSNS
+il2cpp_add_internal_call                             0x005b1860 .text     tailjump     e92bfcf5ffcccccc jmp 0x180511490
+il2cpp_alloc                                         0x005a6b30 .text     body         488b05c9bdb00648 mov rax, qword ptr [rip + 0x6b0bdc9]; jmp rax
+il2cpp_allocation_granularity                        0x0045cb70 .text     const-stub   b810000000c3cccc mov eax, 0x10; ret    [RVA shared by 3 exports]
+il2cpp_array_class_get                               0x005b1880 .text     body         4533c0e9989bfcff xor r8d, r8d; jmp 0x18057b420
+il2cpp_array_element_size                            0x00091760 .text     accessor     8b8104010000c3cc mov eax, dword ptr [rcx + 0x104]; ret    [RVA shared by 2 exports]
+il2cpp_array_get_byte_length                         0x005b1890 .text     body         48837910004c8b01 cmp qword ptr [rcx + 0x10], 0; mov r8, qword ptr [rcx]; jne 0x1805b18a7; mov rax, qword ptr [rcx + 0x18]
+il2cpp_array_length                                  0x0000f2c0 .text     accessor     8b4118c3cccccccc mov eax, dword ptr [rcx + 0x18]; ret    [RVA shared by 3 exports]
+il2cpp_array_new                                     0x005b18e0 .text     body         40534883ec20488b push rbx; sub rsp, 0x20; mov rbx, rdx; xor r8d, r8d
+il2cpp_array_new_full                                0x005b1920 .text     tailjump     e90b7c0200cccccc jmp 0x1805d9530
+il2cpp_array_new_specific                            0x005b1910 .text     tailjump     e9eb790200cccccc jmp 0x1805d9300
+il2cpp_array_object_header_size                      0x005b3b20 .text     const-stub   b820000000c3cccc mov eax, 0x20; ret 
+il2cpp_assembly_get_image                            0x00005520 .text     accessor     488b01c3cccccccc mov rax, qword ptr [rcx]; ret    [RVA shared by 12 exports]
+il2cpp_bounded_array_class_get                       0x005b1930 .text     tailjump     e9eb9afcffcccccc jmp 0x18057b420
+il2cpp_capture_memory_snapshot                       0x005b5620 .text     tailjump     e90b20f7ffcccccc jmp 0x180527630
+il2cpp_class_array_element_size                      0x005b2750 .text     tailjump     e98b2f0100cccccc jmp 0x1805c56e0
+il2cpp_class_enum_basetype                           0x005b1940 .text     body         48394940750333c0 cmp qword ptr [rcx + 0x40], rcx; jne 0x1805b1949; xor eax, eax; ret 
+il2cpp_class_for_each                                0x005b59c0 .text     body         4d85c00f84bd0100 test r8, r8; je 0x1805b5b86; push rdi; push r14
+il2cpp_class_from_il2cpp_type                        0x005b1a70 .text     body         48895c2410488974 mov qword ptr [rsp + 0x10], rbx; mov qword ptr [rsp + 0x18], rsi; push rdi; push r14
+il2cpp_class_from_name                               0x005b1b80 .text     body         48895c241048896c mov qword ptr [rsp + 0x10], rbx; mov qword ptr [rsp + 0x18], rbp; push rsi; push rdi
+il2cpp_class_from_system_type                        0x005b1960 .text     body         40534883ec20488b push rbx; sub rsp, 0x20; mov rax, rdx; mov rbx, rcx
+il2cpp_class_from_type                               0x005b2760 .text     body         48895c2410488974 mov qword ptr [rsp + 0x10], rbx; mov qword ptr [rsp + 0x18], rsi; push rdi; push r14
+il2cpp_class_get_assemblyname                        0x005b2960 .text     accessor     488b01488b4008c3 mov rax, qword ptr [rcx]; mov rax, qword ptr [rax + 8]; ret 
+il2cpp_class_get_bitmap                              0x005b29b0 .text     body         48895c2408574883 mov qword ptr [rsp + 8], rbx; push rdi; sub rsp, 0x30; mov rbx, rdx
+il2cpp_class_get_bitmap_size                         0x005b2990 .text     body         8b81f800000048c1 mov eax, dword ptr [rcx + 0xf8]; shr rax, 6; lea rax, [rax*8 + 8]; ret 
+il2cpp_class_get_data_size                           0x005b2980 .text     accessor     8b810c010000c3cc mov eax, dword ptr [rcx + 0x10c]; ret 
+il2cpp_class_get_declaring_type                      0x005b2650 .text     body         40534883ec20488b push rbx; sub rsp, 0x20; mov rax, rdx; mov rbx, rcx
+il2cpp_class_get_element_class                       0x00049680 .text     accessor     488b4140c3cccccc mov rax, qword ptr [rcx + 0x40]; ret    [RVA shared by 2 exports]
+il2cpp_class_get_events                              0x005b1ca0 .text     tailjump     e93b030100cccccc jmp 0x1805c1fe0
+il2cpp_class_get_field_from_name                     0x005b2150 .text     body         48895c241048896c mov qword ptr [rsp + 0x10], rbx; mov qword ptr [rsp + 0x18], rbp; mov qword ptr [rsp + 0x20], rsi; push rdi
+il2cpp_class_get_fields                              0x005b1cb0 .text     body         48895c241048896c mov qword ptr [rsp + 0x10], rbx; mov qword ptr [rsp + 0x18], rbp; mov qword ptr [rsp + 0x20], rsi; push rdi
+il2cpp_class_get_flags                               0x005b2710 .text     accessor     8b8118010000c3cc mov eax, dword ptr [rcx + 0x118]; ret    [RVA shared by 2 exports]
+il2cpp_class_get_image                               0x00005520 .text     accessor     488b01c3cccccccc mov rax, qword ptr [rcx]; ret    [RVA shared by 12 exports]
+il2cpp_class_get_interfaces                          0x005b1e80 .text     body         48895c2408574883 mov qword ptr [rsp + 8], rbx; push rdi; sub rsp, 0x20; mov rdi, rdx   [RVA shared by 2 exports]
+il2cpp_class_get_method_from_name                    0x005b23e0 .text     body         48895c241048896c mov qword ptr [rsp + 0x10], rbx; mov qword ptr [rsp + 0x18], rbp; push rsi; push rdi
+il2cpp_class_get_methods                             0x005b2270 .text     body         48895c241048896c mov qword ptr [rsp + 0x10], rbx; mov qword ptr [rsp + 0x18], rbp; mov qword ptr [rsp + 0x20], rsi; push rdi
+il2cpp_class_get_name                                0x005b2500 .text     body         48895c2410488974 mov qword ptr [rsp + 0x10], rbx; mov qword ptr [rsp + 0x18], rsi; push rdi; push r14
+il2cpp_class_get_namespace                           0x000087d0 .text     accessor     488b4118c3cccccc mov rax, qword ptr [rcx + 0x18]; ret    [RVA shared by 5 exports]
+il2cpp_class_get_nested_types                        0x005b1e20 .text     body         48895c2408574883 mov qword ptr [rsp + 8], rbx; push rdi; sub rsp, 0x20; mov rax, r8
+il2cpp_class_get_parent                              0x005b2610 .text     body         40534883ec20488b push rbx; sub rsp, 0x20; mov rax, rdx; mov rbx, rcx
+il2cpp_class_get_properties                          0x005b1f10 .text     tailjump     e97b040100cccccc jmp 0x1805c2390   [RVA shared by 2 exports]
+il2cpp_class_get_property_from_name                  0x005b1f20 .text     body         48895c240848896c mov qword ptr [rsp + 8], rbx; mov qword ptr [rsp + 0x10], rbp; mov qword ptr [rsp + 0x20], rsi; push rdi
+il2cpp_class_get_rank                                0x005b2970 .text     accessor     0fb68132010000c3 movzx eax, byte ptr [rcx + 0x132]; ret    [RVA shared by 2 exports]
+il2cpp_class_get_static_field_data                   0x00003570 .text     accessor     488b81b8000000c3 mov rax, qword ptr [rcx + 0xb8]; ret 
+il2cpp_class_get_type                                0x005b2870 .text     body         40534883ec20488b push rbx; sub rsp, 0x20; mov rax, rdx; mov rbx, rcx
+il2cpp_class_get_type_token                          0x005b28b0 .text     accessor     8b811c010000c3cc mov eax, dword ptr [rcx + 0x11c]; ret    [RVA shared by 2 exports]
+il2cpp_class_get_userdata_offset                     0x005b59b0 .text     const-stub   b8d0000000c3cccc mov eax, 0xd0; ret 
+il2cpp_class_has_attribute                           0x005b28c0 .text     body         48895c2408574883 mov qword ptr [rsp + 8], rbx; push rdi; sub rsp, 0x40; mov rbx, qword ptr [rcx]
+il2cpp_class_has_parent                              0x005b1a10 .text     body         48895c2408574883 mov qword ptr [rsp + 8], rbx; push rdi; sub rsp, 0x20; mov rbx, rdx
+il2cpp_class_has_references                          0x005b2910 .text     body         40534883ec20f681 push rbx; sub rsp, 0x20; test byte ptr [rcx + 0x136], 1; mov rbx, rcx
+il2cpp_class_instance_size                           0x005b2690 .text     accessor     8b81f8000000c3cc mov eax, dword ptr [rcx + 0xf8]; ret 
+il2cpp_class_is_abstract                             0x005b2720 .text     body         8b8118010000c1e8 mov eax, dword ptr [rcx + 0x118]; shr eax, 7; and al, 1; ret 
+il2cpp_class_is_assignable_from                      0x005b19f0 .text     tailjump     e98b0c0100cccccc jmp 0x1805c2680
+il2cpp_class_is_blittable                            0x005b26f0 .text     body         0fb68136010000c0 movzx eax, byte ptr [rcx + 0x136]; shr al, 3; and al, 1; ret 
+il2cpp_class_is_enum                                 0x005b2950 .text     body         0fb68135010000c0 movzx eax, byte ptr [rcx + 0x135]; shr al, 2; and al, 1; ret 
+il2cpp_class_is_generic                              0x005b19d0 .text     body         0fb68135010000c0 movzx eax, byte ptr [rcx + 0x135]; shr al, 4; and al, 1; ret 
+il2cpp_class_is_inflated                             0x005b19e0 .text     body         48837960000f95c0 cmp qword ptr [rcx + 0x60], 0; setne al; ret 
+il2cpp_class_is_inited                               0x005b19c0 .text     body         0fb68135010000d0 movzx eax, byte ptr [rcx + 0x135]; shr al, 1; and al, 1; ret 
+il2cpp_class_is_interface                            0x005b2730 .text     body         f681180100002075 test byte ptr [rcx + 0x118], 0x20; jne 0x1805b2748; cmp byte ptr [rcx + 0x2a], 0x13; je 0x1805b2748
+il2cpp_class_is_subclass_of                          0x005b1a00 .text     tailjump     e9bb130100cccccc jmp 0x1805c2dc0
+il2cpp_class_is_valuetype                            0x000dad20 .text     body         8b4128c1e81fc3cc mov eax, dword ptr [rcx + 0x28]; shr eax, 0x1f; ret    [RVA shared by 2 exports]
+il2cpp_class_num_fields                              0x005b26a0 .text     body         40534883ec20488b push rbx; sub rsp, 0x20; mov rax, rdx; mov rbx, rcx
+il2cpp_class_set_userdata                            0x005b59a0 .text     body         488991d0000000c3 mov qword ptr [rcx + 0xd0], rdx; ret 
+il2cpp_class_value_size                              0x005b2700 .text     tailjump     e96bfd0000cccccc jmp 0x1805c2470   [RVA shared by 2 exports]
+il2cpp_current_thread_get_frame_at                   0x005b50b0 .text     tailjump     e9ab9dffffcccccc jmp 0x1805aee60
+il2cpp_current_thread_get_stack_depth                0x005b51d0 .text     body         4883ec28e88796ff sub rsp, 0x28; call 0x1805ae860; mov rcx, qword ptr [rax + 8]; sub rcx, qword ptr [rax]
+il2cpp_current_thread_get_top_frame                  0x005b4fa0 .text     body         488bd133c9e9b69e mov rdx, rcx; xor ecx, ecx; jmp 0x1805aee60
+il2cpp_current_thread_walk_frame_stack               0x005b4e40 .text     body         48895c240848896c mov qword ptr [rsp + 8], rbx; mov qword ptr [rsp + 0x10], rbp; mov qword ptr [rsp + 0x18], rsi; push rdi
+il2cpp_custom_attrs_construct                        0x005b58d0 .text     body         40534883ec40488b push rbx; sub rsp, 0x40; mov rbx, rcx; test rcx, rcx
+il2cpp_custom_attrs_free                             0x00002fc0 .text     ret0-stub    c20000cccccccccc ret 0   [RVA shared by 23 exports]
+il2cpp_custom_attrs_from_class                       0x005b57d0 .text     body         8b911c010000488b mov edx, dword ptr [rcx + 0x11c]; mov rcx, qword ptr [rcx]; jmp 0x180525d70
+il2cpp_custom_attrs_from_field                       0x005b57f0 .text     body         8b511c488b491048 mov edx, dword ptr [rcx + 0x1c]; mov rcx, qword ptr [rcx + 0x10]; mov rcx, qword ptr [rcx]; jmp 0x180525d70
+il2cpp_custom_attrs_from_method                      0x005b57e0 .text     body         8b5148488b492048 mov edx, dword ptr [rcx + 0x48]; mov rcx, qword ptr [rcx + 0x20]; mov rcx, qword ptr [rcx]; jmp 0x180525d70
+il2cpp_custom_attrs_get_attr                         0x005b58c0 .text     tailjump     e99b710200cccccc jmp 0x1805dca60
+il2cpp_custom_attrs_has_attr                         0x005b5800 .text     body         48895c2410574883 mov qword ptr [rsp + 0x10], rbx; push rdi; sub rsp, 0x40; mov rdi, rdx
+il2cpp_debug_call_info                               0x00254210 .text     ret0-stub    33c0c3cccccccccc xor eax, eax; ret    [RVA shared by 21 exports]
+il2cpp_debug_get_method_info                         0x005b5740 .text     body         48895c2408574883 mov qword ptr [rsp + 8], rbx; push rdi; sub rsp, 0x20; mov rbx, rdx
+il2cpp_debugger_set_agent_options                    0x00002fc0 .text     ret0-stub    c20000cccccccccc ret 0   [RVA shared by 23 exports]
+il2cpp_domain_assembly_open                          0x005b2dc0 .text     body         488bcae9c8690200 mov rcx, rdx; jmp 0x1805d9790
+il2cpp_domain_get                                    0x005b2db0 .text     tailjump     e99b8bf6ffcccccc jmp 0x18051b950   [RVA shared by 3 exports]
+il2cpp_domain_get_assemblies                         0x005b2dd0 .text     body         488b05214ab00648 mov rax, qword ptr [rip + 0x6b04a21]; sub rax, qword ptr [rip + 0x6b04a12]; sar rax, 3; mov qword ptr [rdx], rax
+il2cpp_exception_from_name_msg                       0x005b2e00 .text     tailjump     e97bcdf5ffcccccc jmp 0x18050fb80
+il2cpp_field_get_flags                               0x005b31f0 .text     accessor     488b41080fb74008 mov rax, qword ptr [rcx + 8]; movzx eax, word ptr [rax + 8]; ret 
+il2cpp_field_get_name                                0x005b30e0 .text     body         48895c2410488974 mov qword ptr [rsp + 0x10], rbx; mov qword ptr [rsp + 0x18], rsi; push rdi; push r14
+il2cpp_field_get_offset                              0x005b3310 .text     body         48895c240848896c mov qword ptr [rsp + 8], rbx; mov qword ptr [rsp + 0x10], rbp; mov qword ptr [rsp + 0x18], rsi; push rdi
+il2cpp_field_get_parent                              0x005b3200 .text     body         48895c2410488974 mov qword ptr [rsp + 0x10], rbx; mov qword ptr [rsp + 0x18], rsi; push rdi; push r14
+il2cpp_field_get_type                                0x005b34f0 .text     body         40534883ec20488b push rbx; sub rsp, 0x20; mov rax, rdx; mov rbx, rcx
+il2cpp_field_get_value                               0x005b3530 .text     body         4d85c9744e48895c test r9, r9; je 0x1805b3583; mov qword ptr [rsp + 8], rbx; mov qword ptr [rsp + 0x10], rsi
+il2cpp_field_get_value_object                        0x005b3590 .text     body         48895c2408488974 mov qword ptr [rsp + 8], rbx; mov qword ptr [rsp + 0x10], rsi; push rdi; sub rsp, 0x20
+il2cpp_field_has_attribute                           0x005b36d0 .text     body         48895c2408574883 mov qword ptr [rsp + 8], rbx; push rdi; sub rsp, 0x40; mov rax, qword ptr [rcx + 0x10]
+il2cpp_field_is_literal                              0x005b37f0 .text     body         488b41088b4008c1 mov rax, qword ptr [rcx + 8]; mov eax, dword ptr [rax + 8]; shr eax, 6; and al, 1
+il2cpp_field_set_value                               0x005b3720 .text     tailjump     e93b42ffffcccccc jmp 0x1805a7960
+il2cpp_field_set_value_object                        0x005b3730 .text     body         4c634a184c03c983 movsxd r9, dword ptr [rdx + 0x18]; add r9, rcx; cmp dword ptr [rip + 0x6b02e02], 0; mov qword ptr [r9], r8
+il2cpp_field_static_get_value                        0x005b3790 .text     body         4d85c0744148895c test r8, r8; je 0x1805b37d6; mov qword ptr [rsp + 8], rbx; push rdi
+il2cpp_field_static_set_value                        0x005b37e0 .text     tailjump     e94b47ffffcccccc jmp 0x1805a7f30
+il2cpp_format_exception                              0x005b2e20 .text     body         48895c2408574883 mov qword ptr [rsp + 8], rbx; push rdi; sub rsp, 0x50; movsxd rbx, r8d
+il2cpp_format_stack_trace                            0x005b2ec0 .text     body         48895c2410555657 mov qword ptr [rsp + 0x10], rbx; push rbp; push rsi; push rdi
+il2cpp_free                                          0x005a5da0 .text     tailjump     48ff2569cbb006cc jmp qword ptr [rip + 0x6b0cb69]   [RVA shared by 3 exports]
+il2cpp_free_captured_memory_snapshot                 0x005b5630 .text     body         48895c2408488974 mov qword ptr [rsp + 8], rbx; mov qword ptr [rsp + 0x10], rsi; push rdi; sub rsp, 0x20
+il2cpp_gc_alloc_fixed                                0x005b3a00 .text     tailjump     e94bb3f4ffcccccc jmp 0x1804fed50
+il2cpp_gc_collect                                    0x005b3800 .text     body         4883ec28e8c787f4 sub rsp, 0x28; call 0x1804fbfd0; cmp dword ptr [rip + 0x6b02bf8], 0; je 0x1805b381b
+il2cpp_gc_collect_a_little                           0x005b3820 .text     tailjump     e9ab74f4ffcccccc jmp 0x1804facd0
+il2cpp_gc_disable                                    0x005041f0 .text     body         4883ec288b05921a sub rsp, 0x28; mov eax, dword ptr [rip + 0x6bb1a92]; test eax, eax; je 0x180504211
+il2cpp_gc_enable                                     0x005041a0 .text     body         4883ec288b05e21a sub rsp, 0x28; mov eax, dword ptr [rip + 0x6bb1ae2]; test eax, eax; je 0x1805041c1
+il2cpp_gc_foreach_heap                               0x005b3970 .text     body         4883ec3848894c24 sub rsp, 0x38; mov qword ptr [rsp + 0x20], rcx; lea rcx, [rsp + 0x20]; mov qword ptr [rsp + 0x28], rdx
+il2cpp_gc_free_fixed                                 0x005b3a10 .text     tailjump     e96bb4f4ffcccccc jmp 0x1804fee80
+il2cpp_gc_get_heap_size                              0x005b3960 .text     accessor     488b05b957b20648 mov rax, qword ptr [rip + 0x6b257b9]; sub rax, qword ptr [rip + 0x6b25852]; ret 
+il2cpp_gc_get_max_time_slice_ns                      0x005b3930 .text     accessor     488b05f9ecaf06c3 mov rax, qword ptr [rip + 0x6afecf9]; ret 
+il2cpp_gc_get_used_size                              0x005b3950 .text     accessor     488b05c957b20648 mov rax, qword ptr [rip + 0x6b257c9]; sub rax, qword ptr [rip + 0x6b257e2]; ret 
+il2cpp_gc_has_strict_wbarriers                       0x000550f0 .text     const-stub   32c0c3cccccccccc xor al, al; ret 
+il2cpp_gc_is_disabled                                0x005b3850 .text     body         833d4924b006000f cmp dword ptr [rip + 0x6b02449], 0; setne al; ret 
+il2cpp_gc_is_incremental                             0x005b3920 .text     body         833d192cb006000f cmp dword ptr [rip + 0x6b02c19], 0; setne al; ret 
+il2cpp_gc_set_external_allocation_tracker            0x00002fc0 .text     ret0-stub    c20000cccccccccc ret 0   [RVA shared by 23 exports]
+il2cpp_gc_set_external_wbarrier_tracker              0x00002fc0 .text     ret0-stub    c20000cccccccccc ret 0   [RVA shared by 23 exports]
+il2cpp_gc_set_max_time_slice_ns                      0x005b3940 .text     body         48890de9ecaf06c3 mov qword ptr [rip + 0x6afece9], rcx; ret 
+il2cpp_gc_set_mode                                   0x005b3860 .text     body         48895c2408564883 mov qword ptr [rsp + 8], rbx; push rsi; sub rsp, 0x20; mov ebx, ecx
+il2cpp_gc_start_incremental_collection               0x005b3830 .text     body         833d092db0060074 cmp dword ptr [rip + 0x6b02d09], 0; je 0x1805b3848; mov dword ptr [rip + 0x6b02755], 1; jmp 0x1804facd0
+il2cpp_gc_wbarrier_set_field                         0x005b3ab0 .text     body         833d892ab006004c cmp dword ptr [rip + 0x6b02a89], 0; mov r9, rdx; mov qword ptr [rdx], r8; je 0x1805b3b01
+il2cpp_gchandle_foreach_get_target                   0x005b3a80 .text     body         4883ec3848894c24 sub rsp, 0x38; mov qword ptr [rsp + 0x20], rcx; lea rcx, [rip - 0x8c470]; mov qword ptr [rsp + 0x28], rdx
+il2cpp_gchandle_free                                 0x005b3b10 .text     tailjump     e91b3ff9ffcccccc jmp 0x180547a30
+il2cpp_gchandle_get_target                           0x005b3a70 .text     tailjump     e96b3ef9ffcccccc jmp 0x1805478e0
+il2cpp_gchandle_new                                  0x005b3a20 .text     body         0fb6c24c8bc1488d movzx eax, dl; mov r8, rcx; lea rdx, [rax + rax*4]; lea rax, [rip + 0x6afee7f]
+il2cpp_gchandle_new_weakref                          0x005b3a40 .text     body         40534883ec60440f push rbx; sub rsp, 0x60; movzx r8d, dl; mov rdx, rcx
+il2cpp_get_corlib                                    0x005b1850 .text     accessor     488b05294db006c3 mov rax, qword ptr [rip + 0x6b04d29]; ret 
+il2cpp_get_exception_argument_null                   0x005b2e10 .text     tailjump     e9bbd0f5ffcccccc jmp 0x18050fed0
+il2cpp_image_get_assembly                            0x0000c400 .text     accessor     488b4110c3cccccc mov rax, qword ptr [rcx + 0x10]; ret    [RVA shared by 5 exports]
+il2cpp_image_get_class                               0x005b55c0 .text     body         40534883ec20488b push rbx; sub rsp, 0x20; mov rax, qword ptr [rcx + 0x28]; mov ebx, dword ptr [rax]
+il2cpp_image_get_class_count                         0x0000f2c0 .text     accessor     8b4118c3cccccccc mov eax, dword ptr [rcx + 0x18]; ret    [RVA shared by 3 exports]
+il2cpp_image_get_entry_point                         0x005b55a0 .text     body         488b49284885c974 mov rcx, qword ptr [rcx + 0x28]; test rcx, rcx; je 0x1805b55b7; cmp dword ptr [rcx + 0xc], -1
+il2cpp_image_get_filename                            0x00005520 .text     accessor     488b01c3cccccccc mov rax, qword ptr [rcx]; ret    [RVA shared by 12 exports]
+il2cpp_image_get_name                                0x00005520 .text     accessor     488b01c3cccccccc mov rax, qword ptr [rcx]; ret    [RVA shared by 12 exports]
+il2cpp_init                                          0x005b1440 .text     body         40534883ec20488b push rbx; sub rsp, 0x20; mov rbx, rcx; lea rdx, [rip + 0x5197db8]
+il2cpp_init_utf16                                    0x005b1470 .text     body         48895c2418574883 mov qword ptr [rsp + 0x18], rbx; push rdi; sub rsp, 0x50; mov rdi, rcx
+il2cpp_is_debugger_attached                          0x005b5720 .text     body         4883ec28ff15c62b sub rsp, 0x28; call qword ptr [rip + 0x5182bc6]; test eax, eax; setne al
+il2cpp_is_vm_thread                                  0x005b4e30 .text     body         48390df12ab0060f cmp qword ptr [rip + 0x6b02af1], rcx; setne al; ret 
+il2cpp_method_get_class                              0x005b4350 .text     body         48895c2410488974 mov qword ptr [rsp + 0x10], rbx; mov qword ptr [rsp + 0x18], rsi; push rdi; push r14
+il2cpp_method_get_declaring_type                     0x005b44f0 .text     body         48895c2410488974 mov qword ptr [rsp + 0x10], rbx; mov qword ptr [rsp + 0x18], rsi; push rdi; push r14
+il2cpp_method_get_flags                              0x005b4600 .text     body         48895c2408574883 mov qword ptr [rsp + 8], rbx; push rdi; sub rsp, 0x20; mov rax, r8
+il2cpp_method_get_from_reflection                    0x005b3db0 .text     body         48895c2410488974 mov qword ptr [rsp + 0x10], rbx; mov qword ptr [rsp + 0x18], rsi; push rdi; push r14
+il2cpp_method_get_name                               0x005b40b0 .text     body         48895c2410488974 mov qword ptr [rsp + 0x10], rbx; mov qword ptr [rsp + 0x18], rsi; push rdi; push r14
+il2cpp_method_get_object                             0x005b3ec0 .text     body         48895c240848896c mov qword ptr [rsp + 8], rbx; mov qword ptr [rsp + 0x10], rbp; mov qword ptr [rsp + 0x18], rsi; mov qword ptr [rsp + 0x20], rdi
+il2cpp_method_get_param                              0x005b42e0 .text     body         48895c2408574883 mov qword ptr [rsp + 8], rbx; push rdi; sub rsp, 0x20; mov ebx, edx
+il2cpp_method_get_param_count                        0x005b42a0 .text     body         40534883ec20488b push rbx; sub rsp, 0x20; mov rax, rdx; mov rbx, rcx
+il2cpp_method_get_param_name                         0x005b46a0 .text     body         48895c241048896c mov qword ptr [rsp + 0x10], rbx; mov qword ptr [rsp + 0x18], rbp; mov qword ptr [rsp + 0x20], rsi; push rdi
+il2cpp_method_get_return_type                        0x005b3d70 .text     body         40534883ec20488b push rbx; sub rsp, 0x20; mov rax, rdx; mov rbx, rcx
+il2cpp_method_get_token                              0x005b4660 .text     body         40534883ec20488b push rbx; sub rsp, 0x20; mov rax, rdx; mov rbx, rcx
+il2cpp_method_has_attribute                          0x005b4460 .text     body         4889742410574883 mov qword ptr [rsp + 0x10], rsi; push rdi; sub rsp, 0x40; mov rax, r8
+il2cpp_method_is_generic                             0x005b41c0 .text     body         40534883ec20488b push rbx; sub rsp, 0x20; mov rax, rdx; mov rbx, rcx
+il2cpp_method_is_inflated                            0x005b4200 .text     body         40534883ec20488b push rbx; sub rsp, 0x20; mov rax, rdx; mov rbx, rcx
+il2cpp_method_is_instance                            0x005b4250 .text     body         40534883ec20488b push rbx; sub rsp, 0x20; mov rax, rdx; mov rbx, rcx
+il2cpp_monitor_enter                                 0x005b4b20 .text     body         baffffffffe96636 mov edx, 0xffffffff; jmp 0x180528190
+il2cpp_monitor_exit                                  0x005b4b40 .text     tailjump     e92b39f7ffcccccc jmp 0x180528470
+il2cpp_monitor_pulse                                 0x005b4b50 .text     tailjump     e9fb39f7ffcccccc jmp 0x180528550
+il2cpp_monitor_pulse_all                             0x005b4b60 .text     body         48895c2408574883 mov qword ptr [rsp + 8], rbx; push rdi; sub rsp, 0x20; call 0x180528120
+il2cpp_monitor_try_enter                             0x005b4b30 .text     tailjump     e95b36f7ffcccccc jmp 0x180528190
+il2cpp_monitor_try_wait                              0x005b4bc0 .text     tailjump     e9eb39f7ffcccccc jmp 0x1805285b0
+il2cpp_monitor_wait                                  0x005b4bb0 .text     body         baffffffffe9f639 mov edx, 0xffffffff; jmp 0x1805285b0
+il2cpp_native_stack_trace                            0x005b2ff0 .text     body         48895c2408488974 mov qword ptr [rsp + 8], rbx; mov qword ptr [rsp + 0x10], rsi; mov qword ptr [rsp + 0x18], rdi; push r14
+il2cpp_nonce                                         0x005b3d60 .text     tailjump     e9abd2ffffcccccc jmp 0x1805b1010
+il2cpp_object_get_class                              0x00005520 .text     accessor     488b01c3cccccccc mov rax, qword ptr [rcx]; ret    [RVA shared by 12 exports]
+il2cpp_object_get_size                               0x005b4a80 .text     body         488b11483b15861b mov rdx, qword ptr [rcx]; cmp rdx, qword ptr [rip + 0x6b01b86]; jne 0x1805b4a97; mov eax, dword ptr [rcx + 0x10]
+il2cpp_object_get_virtual_method                     0x005b4ae0 .text     tailjump     e98b510200cccccc jmp 0x1805d9c70
+il2cpp_object_header_size                            0x0045cb70 .text     const-stub   b810000000c3cccc mov eax, 0x10; ret    [RVA shared by 3 exports]
+il2cpp_object_new                                    0x005b4af0 .text     body         4883ec28e8275302 sub rsp, 0x28; call 0x1805d9e20; jmp 0x1805b4afd
+il2cpp_object_unbox                                  0x004997f0 .text     accessor     488d4110c3cccccc lea rax, [rcx + 0x10]; ret    [RVA shared by 2 exports]
+il2cpp_offset_of_array_bounds_in_array_object_header 0x0045cb70 .text     const-stub   b810000000c3cccc mov eax, 0x10; ret    [RVA shared by 3 exports]
+il2cpp_offset_of_array_length_in_array_object_header 0x005b3b30 .text     const-stub   b818000000c3cccc mov eax, 0x18; ret 
+il2cpp_override_stack_backtrace                      0x005b52d0 .text     body         48890d1928b006c3 mov qword ptr [rip + 0x6b02819], rcx; ret 
+il2cpp_profiler_install                              0x005b47e0 .text     body         48895c240848896c mov qword ptr [rsp + 8], rbx; mov qword ptr [rsp + 0x10], rbp; mov qword ptr [rsp + 0x18], rsi; push rdi
+il2cpp_profiler_install_allocation                   0x005b49c0 .text     body         488b15c91eb00648 mov rdx, qword ptr [rip + 0x6b01ec9]; test rdx, rdx; je 0x1805b49dc; mov rax, qword ptr [rip + 0x6b01eb5]
+il2cpp_profiler_install_enter_leave                  0x005b4980 .text     body         4c8b05091fb0064d mov r8, qword ptr [rip + 0x6b01f09]; test r8, r8; je 0x1805b49b3; mov rax, qword ptr [rip + 0x6b01ef5]
+il2cpp_profiler_install_fileio                       0x005b4a20 .text     body         488b15691eb00648 mov rdx, qword ptr [rip + 0x6b01e69]; test rdx, rdx; je 0x1805b4a3c; mov rax, qword ptr [rip + 0x6b01e55]
+il2cpp_profiler_install_gc                           0x005b49e0 .text     body         4c8b05a91eb0064d mov r8, qword ptr [rip + 0x6b01ea9]; test r8, r8; je 0x1805b4a13; mov rax, qword ptr [rip + 0x6b01e95]
+il2cpp_profiler_install_thread                       0x005b4a40 .text     body         4c8b05491eb0064d mov r8, qword ptr [rip + 0x6b01e49]; test r8, r8; je 0x1805b4a73; mov rax, qword ptr [rip + 0x6b01e35]
+il2cpp_profiler_set_events                           0x005b4920 .text     body         488b15691fb00645 mov rdx, qword ptr [rip + 0x6b01f69]; xor r8d, r8d; test rdx, rdx; je 0x1805b4945
+il2cpp_property_get_flags                            0x0004f940 .text     accessor     8b4120c3cccccccc mov eax, dword ptr [rcx + 0x20]; ret 
+il2cpp_property_get_get_method                       0x0000c400 .text     accessor     488b4110c3cccccc mov rax, qword ptr [rcx + 0x10]; ret    [RVA shared by 5 exports]
+il2cpp_property_get_name                             0x00007650 .text     accessor     488b4108c3cccccc mov rax, qword ptr [rcx + 8]; ret    [RVA shared by 3 exports]
+il2cpp_property_get_parent                           0x00005520 .text     accessor     488b01c3cccccccc mov rax, qword ptr [rcx]; ret    [RVA shared by 12 exports]
+il2cpp_property_get_set_method                       0x000087d0 .text     accessor     488b4118c3cccccc mov rax, qword ptr [rcx + 0x18]; ret    [RVA shared by 5 exports]
+il2cpp_raise_exception                               0x005b2df0 .text     body         4883ec2833d2e8f5 sub rsp, 0x28; xor edx, edx; call 0x18050f0f0; int3 
+il2cpp_register_debugger_agent_transport             0x00002fc0 .text     ret0-stub    c20000cccccccccc ret 0   [RVA shared by 23 exports]
+il2cpp_register_log_callback                         0x005b5710 .text     body         48890d21d2af06c3 mov qword ptr [rip + 0x6afd221], rcx; ret 
+il2cpp_resolve_icall                                 0x005b1870 .text     tailjump     e9fbfdf5ffcccccc jmp 0x180511670
+il2cpp_runtime_class_init                            0x005b4bf0 .text     tailjump     e9eb92ffffcccccc jmp 0x1805adee0
+il2cpp_runtime_invoke                                0x005b4be0 .text     tailjump     e93b87ffffcccccc jmp 0x1805ad320
+il2cpp_runtime_invoke_convert_args                   0x005b4bd0 .text     tailjump     e91b8cffffcccccc jmp 0x1805ad7f0
+il2cpp_runtime_object_init                           0x005b4c00 .text     body         33d2e9c988ffffcc xor edx, edx; jmp 0x1805ad4d0
+il2cpp_runtime_object_init_exception                 0x005b4c10 .text     tailjump     e9bb88ffffcccccc jmp 0x1805ad4d0
+il2cpp_runtime_unhandled_exception_policy_set        0x00002fc0 .text     ret0-stub    c20000cccccccccc ret 0   [RVA shared by 23 exports]
+il2cpp_set_commandline_arguments                     0x005b1610 .text     body         488bc28bd1488bc8 mov rax, rdx; mov edx, ecx; mov rcx, rax; jmp 0x1805c0530
+il2cpp_set_commandline_arguments_utf16               0x005b1620 .text     body         48895c2410574883 mov qword ptr [rsp + 0x10], rbx; push rdi; sub rsp, 0x20; mov rdi, rdx
+il2cpp_set_config                                    0x005b1780 .text     body         4883ec580f57c00f sub rsp, 0x58; xorps xmm0, xmm0; movups xmmword ptr [rsp + 0x30], xmm0; xorps xmm1, xmm1
+il2cpp_set_config_dir                                0x005b1580 .text     body         49c7c0ffffffff66 mov r8, 0xffffffffffffffff; nop word ptr [rax + rax]; inc r8; cmp byte ptr [rcx + r8], 0
+il2cpp_set_config_utf16                              0x005b16a0 .text     body         48895c2418574883 mov qword ptr [rsp + 0x18], rbx; push rdi; sub rsp, 0x50; mov rdi, rcx
+il2cpp_set_data_dir                                  0x005b15b0 .text     body         49c7c0ffffffff66 mov r8, 0xffffffffffffffff; nop word ptr [rax + rax]; inc r8; cmp byte ptr [rcx + r8], 0
+il2cpp_set_default_thread_affinity                   0x00002fc0 .text     ret0-stub    c20000cccccccccc ret 0   [RVA shared by 23 exports]
+il2cpp_set_find_plugin_callback                      0x005b5700 .text     body         48890d5123b006c3 mov qword ptr [rip + 0x6b02351], rcx; ret 
+il2cpp_set_memory_callbacks                          0x005b1820 .text     body         0f10010f1105d610 movups xmm0, xmmword ptr [rcx]; movups xmmword ptr [rip + 0x6b010d6], xmm0; movups xmm1, xmmword ptr [rcx + 0x10]; movups xmmword ptr [rip + 0x6b010db], xmm1
+il2cpp_set_temp_dir                                  0x005b15e0 .text     body         49c7c0ffffffff66 mov r8, 0xffffffffffffffff; nop word ptr [rax + rax]; inc r8; cmp byte ptr [rcx + r8], 0
+il2cpp_shutdown                                      0x005b1570 .text     tailjump     e96bb1ffffcccccc jmp 0x1805ac6e0   [RVA shared by 2 exports]
+il2cpp_start_gc_world                                0x005b39d0 .text     body         4883ec28e8f721f5 sub rsp, 0x28; call 0x180505bd0; cmp dword ptr [rip + 0x6b022ac], 0; je 0x1805b39f4
+il2cpp_stats_dump_to_file                            0x005b2a00 .text     body         40534881ec800100 push rbx; sub rsp, 0x180; mov rbx, rcx; lea rcx, [rsp + 0x30]
+il2cpp_stats_get_value                               0x005b2d20 .text     body         83f907775e4863c1 cmp ecx, 7; ja 0x1805b2d83; movsxd rax, ecx; lea rdx, [rip - 0x5b2d2f]
+il2cpp_stop_gc_world                                 0x005b39a0 .text     body         4883ec28833de122 sub rsp, 0x28; cmp dword ptr [rip + 0x6b022e1], 0; je 0x1805b39ba; lea rcx, [rip + 0x6b2572c]
+il2cpp_string_chars                                  0x005b4c20 .text     accessor     488d4114c3cccccc lea rax, [rcx + 0x14]; ret    [RVA shared by 2 exports]
+il2cpp_string_intern                                 0x005b4cb0 .text     tailjump     e96bf0faffcccccc jmp 0x180563d20
+il2cpp_string_is_interned                            0x005b4cc0 .text     body         48895c240848896c mov qword ptr [rsp + 8], rbx; mov qword ptr [rsp + 0x10], rbp; mov qword ptr [rsp + 0x18], rsi; push rdi
+il2cpp_string_length                                 0x0003a040 .text     accessor     8b4110c3cccccccc mov eax, dword ptr [rcx + 0x10]; ret    [RVA shared by 2 exports]
+il2cpp_string_new                                    0x005b4c30 .text     body         48c7c2ffffffff48 mov rdx, 0xffffffffffffffff; inc rdx; cmp byte ptr [rcx + rdx], 0; jne 0x1805b4c37   [RVA shared by 2 exports]
+il2cpp_string_new_len                                0x005b4ca0 .text     tailjump     e96beffaffcccccc jmp 0x180563c10
+il2cpp_string_new_utf16                              0x005b4c50 .text     body         48895c2408488974 mov qword ptr [rsp + 8], rbx; mov qword ptr [rsp + 0x10], rsi; push rdi; sub rsp, 0x20
+il2cpp_string_new_wrapper                            0x005b4c30 .text     body         48c7c2ffffffff48 mov rdx, 0xffffffffffffffff; inc rdx; cmp byte ptr [rcx + rdx], 0; jne 0x1805b4c37   [RVA shared by 2 exports]
+il2cpp_thread_attach                                 0x005b4de0 .text     tailjump     e91b3cf7ffcccccc jmp 0x180528a00   [RVA shared by 2 exports]
+il2cpp_thread_current                                0x005b4db0 .text     body         40534883ec20488b push rbx; sub rsp, 0x20; mov rcx, qword ptr [rip + 0x6b01cc3]; mov ecx, dword ptr [rcx]   [RVA shared by 2 exports]
+il2cpp_thread_detach                                 0x005b4df0 .text     body         4883ec28e85741f7 sub rsp, 0x28; call 0x180528f50; add rsp, 0x28; jmp 0x1805aed60   [RVA shared by 2 exports]
+il2cpp_thread_get_all_attached_threads               0x005b4e10 .text     body         488b053127b00648 mov rax, qword ptr [rip + 0x6b02731]; mov rdx, qword ptr [rax + 8]; sub rdx, qword ptr [rax]; sar rdx, 3
+il2cpp_thread_get_frame_at                           0x005b50c0 .text     body         48895c241048896c mov qword ptr [rsp + 0x10], rbx; mov qword ptr [rsp + 0x18], rbp; mov qword ptr [rsp + 0x20], rsi; push rdi
+il2cpp_thread_get_stack_depth                        0x005b51f0 .text     body         48895c2410574883 mov qword ptr [rsp + 0x10], rbx; push rdi; sub rsp, 0x40; mov rdi, rcx
+il2cpp_thread_get_top_frame                          0x005b4fb0 .text     body         48895c2410488974 mov qword ptr [rsp + 0x10], rbx; mov qword ptr [rsp + 0x18], rsi; push rdi; sub rsp, 0x50
+il2cpp_thread_walk_frame_stack                       0x005b4ea0 .text     body         48895c241048896c mov qword ptr [rsp + 0x10], rbx; mov qword ptr [rsp + 0x18], rbp; mov qword ptr [rsp + 0x20], rsi; push rdi
+il2cpp_type_equals                                   0x005b5560 .text     body         4883ec28e86771fc sub rsp, 0x28; call 0x18057c6d0; test eax, eax; sete al
+il2cpp_type_get_assembly_qualified_name              0x005b53e0 .text     body         40534883ec5041b8 push rbx; sub rsp, 0x50; mov r8d, 3; mov rdx, rcx
+il2cpp_type_get_attrs                                0x005b5550 .text     accessor     0fb74108c3cccccc movzx eax, word ptr [rcx + 8]; ret    [RVA shared by 2 exports]
+il2cpp_type_get_class_or_element_class               0x005b5300 .text     body         80790a14750d488b cmp byte ptr [rcx + 0xa], 0x14; jne 0x1805b5313; mov rax, qword ptr [rcx]; mov dl, 1
+il2cpp_type_get_name                                 0x005b5330 .text     body         40534883ec504533 push rbx; sub rsp, 0x50; xor r8d, r8d; mov rdx, rcx
+il2cpp_type_get_name_chunked                         0x005b5980 .text     body         4883ec384c894424 sub rsp, 0x38; mov qword ptr [rsp + 0x20], r8; mov r9, rdx; xor r8d, r8d
+il2cpp_type_get_object                               0x005b52e0 .text     tailjump     e97b670200cccccc jmp 0x1805dba60
+il2cpp_type_get_reflection_name                      0x005b5490 .text     body         40534883ec5041b8 push rbx; sub rsp, 0x50; mov r8d, 1; mov rdx, rcx
+il2cpp_type_get_type                                 0x005b52f0 .text     accessor     0fbe410ac3cccccc movsx eax, byte ptr [rcx + 0xa]; ret    [RVA shared by 2 exports]
+il2cpp_type_is_byref                                 0x005b5540 .text     body         8b4108c1e81d2401 mov eax, dword ptr [rcx + 8]; shr eax, 0x1d; and al, 1; ret 
+il2cpp_type_is_pointer_type                          0x005b5590 .text     body         80790a0f0f94c0c3 cmp byte ptr [rcx + 0xa], 0xf; sete al; ret 
+il2cpp_type_is_static                                0x005b5580 .text     body         8b4108c1e8042401 mov eax, dword ptr [rcx + 8]; shr eax, 4; and al, 1; ret 
+il2cpp_unhandled_exception                           0x005b2fe0 .text     tailjump     e9eba5ffffcccccc jmp 0x1805ad5d0
+il2cpp_unity_install_unitytls_interface              0x005b57c0 .text     body         48890d6123b006c3 mov qword ptr [rip + 0x6b02361], rcx; ret 
+il2cpp_unity_liveness_allocate_struct                0x005b3b40 .text     body         48895c2408488974 mov qword ptr [rsp + 8], rbx; mov qword ptr [rsp + 0x10], rsi; mov qword ptr [rsp + 0x18], rdi; push r14
+il2cpp_unity_liveness_calculation_from_root          0x005b3bf0 .text     body         40534883ec20488b push rbx; sub rsp, 0x20; mov rax, qword ptr [rdx + 0x10]; mov rbx, rdx
+il2cpp_unity_liveness_calculation_from_statics       0x005b3c50 .text     tailjump     e9abe7f5ffcccccc jmp 0x180512400
+il2cpp_unity_liveness_finalize                       0x005b3c60 .text     body         4883ec284c8b014c sub rsp, 0x28; mov r8, qword ptr [rcx]; mov r10, rcx; mov rdx, qword ptr [r8 + 0x10]
+il2cpp_unity_liveness_free_struct                    0x005b3d20 .text     body         4885c97432534883 test rcx, rcx; je 0x1805b3d57; push rbx; sub rsp, 0x20
+il2cpp_unity_set_android_network_up_state_func       0x00002fc0 .text     ret0-stub    c20000cccccccccc ret 0   [RVA shared by 23 exports]
+il2cpp_value_box                                     0x005b4b10 .text     tailjump     e95b4f0200cccccc jmp 0x1805d9a70
+
+summary: {'tailjump': 43, 'body': 149, 'const-stub': 7, 'accessor': 33, 'ret0-stub': 9}
