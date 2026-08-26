@@ -1999,10 +1999,20 @@ proc verBrandResolve(): Il2CppPtr =
   ## is checked BY NAME, so a build that moved the label declines loudly instead
   ## of writing into whatever happens to sit at that index.
   result = nil
-  if gInspPreloader == nil or not duOk(gInspPreloader, 0x20'i32):
-    gVerWhy = "no live PreloaderUI anchor yet"
+  # TWO INDEPENDENT ANCHOR SOURCES, ours first. `gVerPreloader` is captured by
+  # this feature from its own rider's RCX and from the Awake postfix;
+  # `gInspPreloader` is the live inspector's and is only a bonus. Borrowing the
+  # inspector's global as the ONLY source is the measured cause of this feature
+  # never resolving in a real boot, and it must not come back.
+  var anchor = gVerPreloader
+  if anchor == nil or not duOk(anchor, 0x20'i32):
+    anchor = gInspPreloader
+  if anchor == nil or not duOk(anchor, 0x20'i32):
+    gVerWhy = "no live PreloaderUI anchor yet (neither this feature's own " &
+              "capture from PreloaderUI::Update/Awake RCX, nor the live " &
+              "inspector's)"
     return
-  let t = iToTransform(gInspPreloader)
+  let t = iToTransform(anchor)
   if t == nil:
     gVerWhy = "PreloaderUI has no reachable Transform"
     return
@@ -2010,18 +2020,45 @@ proc verBrandResolve(): Il2CppPtr =
   # gives the SCENE ROOT named "Preloader UI", whose single child is ANOTHER
   # node also named "Preloader UI", and BottomPanel hangs off that one. So the
   # panel is two levels below the component, not beside it and not above it.
-  var bottom = modsChildNamed(t, "BottomPanel")
+  # CLIMB TO THE HIERARCHY ROOT FIRST. The measured path is
+  # `Preloader UI/BottomPanel/Content/UpperPart/AlphaLabel` (fact #12), and the
+  # component we hold may sit anywhere on that hierarchy. `Transform::get_root`
+  # is an ICALL on the object we already verified live -- it does NOT go
+  # through `SceneManager`, and that matters: the live UI lives in
+  # `DontDestroyOnLoad`, which `sceneCount`/`GetSceneAt` exclude BY DESIGN, so
+  # a sibling rider in the same run truthfully reported "iSceneRoots
+  # enumerated NO roots (0)". Nothing in this walk may depend on that list.
+  var top = iHierRoot(t)
+  if top == nil or not duOk(top, 0x20'i32):
+    top = t
+  # BOUNDED DESCENT for BottomPanel: the root itself, its children, and its
+  # grandchildren -- because the root "Preloader UI" has a single child also
+  # named "Preloader UI" and the panel hangs off that one. 16 x 16 nodes is the
+  # hard ceiling, and the 4 ms slice in `verBrandTickBody` bounds it in time as
+  # well. Both bounds, never just one.
+  var bottom = modsChildNamed(top, "BottomPanel")
   if bottom == nil:
     var n = 0
-    if iChildCount(t, n):
+    if iChildCount(top, n):
       var i = 0
       while i < n and i < 16 and bottom == nil:
-        let c = iChildAt(t, i)
+        let c = iChildAt(top, i)
         if c != nil and duOk(c, 0x20'i32):
           bottom = modsChildNamed(c, "BottomPanel")
+          if bottom == nil:
+            var m = 0
+            if iChildCount(c, m):
+              var j = 0
+              while j < m and j < 16 and bottom == nil:
+                let g = iChildAt(c, j)
+                if g != nil and duOk(g, 0x20'i32):
+                  bottom = modsChildNamed(g, "BottomPanel")
+                j = j + 1
         i = i + 1
   if bottom == nil:
-    gVerWhy = "no 'BottomPanel' under the PreloaderUI or its children"
+    gVerWhy = "no 'BottomPanel' within 2 levels of the PreloaderUI hierarchy " &
+              "root (searched at most 16 children x 16 grandchildren; this is " &
+              "a BUDGET, so it is not proof the panel is absent)"
     return
   let content = modsChildNamed(bottom, "Content")
   if content == nil:
@@ -2889,8 +2926,21 @@ proc modsTabTick() =
 proc verBrandTick() =
   ## Throttled entry for the version brand. The throttle lives HERE and nowhere
   ## else -- see `verBrandTickBody`.
-  if not gVerOn or gVerApplies >= VerBrandMaxApplies or
-     gVerWalkFaults >= VerBrandMaxWalkFaults or gVerGaveUp:
+  if not gVerOn or gVerGaveUp:
+    return
+  if gVerWalkFaults >= VerBrandMaxWalkFaults:
+    # A CEILING REACHED SILENTLY IS THE WORST THING THIS FILE CAN DO. This used
+    # to just `return` forever with nothing in the log after the third fault.
+    gVerGaveUp = true
+    warn "version brand: REFUSING further attempts -- the label walk faulted " &
+         $gVerWalkFaults & " times (the ceiling). LAST REASON: " & gVerWhy &
+         ". The bottom-left label is left STOCK and will NOT say aowlspt."
+    return
+  if gVerApplies >= VerBrandMaxApplies:
+    gVerGaveUp = true
+    warn "version brand: STOPPING -- the label was written " & $gVerApplies &
+         " times (the apply ceiling) and kept being overwritten. Something " &
+         "else owns this label's text; it is left as the game made it."
     return
   if gVerT0 == 0:
     # THE FIRST FRAME THE RIDER CHAIN GAVE US. Recorded, and logged, because
@@ -2968,10 +3018,24 @@ proc seasonsTick() =
       warn "hide seasons: fault ceiling reached; the feature is OFF for this " &
            "session and the banner is left exactly as the game made it."
 
-proc modsRidersTick() =
+proc modsRidersTick(regs: Il2CppPtr) =
   ## Everything in this file that wants a frame, behind ONE call the rider
   ## chain in `aowlhost.nim` makes. Each entry re-arms the guard separately --
   ## never nested -- and each is a cheap flag test when its feature is off.
+  ##
+  ## `regs` IS THE FIX FOR A MEASURED FAILURE. This used to take no arguments,
+  ## so the version brand had no PreloaderUI of its own and borrowed
+  ## `gInspPreloader` -- a global written ONLY by the live inspector's rider.
+  ## In a real boot with the inspector's rider not writing it, the brand hunted
+  ## from 14.797 s, the menu came up, and it never resolved once. RCX here is
+  ## the live `PreloaderUI` `this` in both dispatch halves, so it is captured
+  ## before anything else runs.
+  if regs != nil:
+    let selfRaw = cRegsInt(regs, 0'i32)
+    if selfRaw != 0'u64:
+      let self = cast[Il2CppPtr](selfRaw)
+      if duOk(self, 0x20'i32):
+        gVerPreloader = self
   modsTabTick()
   verBrandTick()
   seasonsTick()
