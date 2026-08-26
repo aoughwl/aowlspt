@@ -722,6 +722,37 @@ proc readAnswer(prompt: string; into: var string): bool =
   result = readLine(stdin, into)
   into = strip(into)
 
+proc listProfilesWaiting(port: int; root: string): ProfileList =
+  ## `listProfiles`, but it does not accept a dropped connection as the answer.
+  ##
+  ## MEASURED: the launcher starts the backend and asks for this list almost
+  ## immediately. The backend accepts the TCP connection before its TLS
+  ## listener can serve it, so the first attempt reports "connected to
+  ## 127.0.0.1:443 and then lost the connection" and the list silently
+  ## degrades to the on-disk store for the WHOLE session. That is not a
+  ## cosmetic warning: the store path cannot create a character, so the picker
+  ## offers `0 = new character` and then refuses it, for a backend that was
+  ## healthy and merely a few hundred milliseconds late. (Confirmed after one
+  ## such failure that both :80 and :443 answered 200.)
+  ##
+  ## Only a TRANSPORT failure is retried. A 404, or any non-200, is a real
+  ## answer from a live server -- retrying a definite negative only makes a
+  ## fast failure slow.
+  const Retries = 6
+  const RetryMs = 400'i32
+  result = listProfiles(port, root)
+  var tries = 1
+  while result.source != psRoute and result.error.len == 0 and tries < Retries:
+    cSleepMs(RetryMs)
+    result = listProfiles(port, root)
+    inc tries
+  if result.source == psRoute and tries > 1:
+    let waited = (tries - 1) * int(RetryMs)
+    if result.note.len > 0: result.note.add "; "
+    result.note.add "the profile-list route needed " & $tries &
+                    " attempts (" & $waited & "ms) before the backend " &
+                    "answered -- it accepts the connection before it can serve"
+
 proc pickProfile(o: Options; port: int; root: string;
                  chosen: var Profile; reason: var string;
                  viaRoute: var bool): bool =
@@ -735,7 +766,7 @@ proc pickProfile(o: Options; port: int; root: string;
   chosen = Profile(id: "", token: "", nickname: "", side: "", level: 0,
                    edition: "", lastPlayed: 0)
 
-  var list = listProfiles(port, root)
+  var list = listProfilesWaiting(port, root)
   viaRoute = list.source == psRoute
   if list.error.len > 0:
     reason = list.error
@@ -773,7 +804,9 @@ proc pickProfile(o: Options; port: int; root: string;
   drawProfiles(list)
   if list.source == psStore:
     sayColoured ColDim,
-      "  this list came off disk, so `new` is not available here"
+      "  this list came off disk, so creating a character is not available " &
+      "here -- the backend's launcher routes are what create one, and this " &
+      "list was read from the store because it could not reach them"
 
   # Not a console: no picker. One profile is unambiguous and is taken with a
   # line saying so; more than one is not, and guessing which character somebody
@@ -793,7 +826,10 @@ proc pickProfile(o: Options; port: int; root: string;
     if list.items.len > 0:
       prompt = "play which? [1-" & $list.items.len & "]"
     if list.source == psRoute:
-      prompt.add "  (n = new, q = quit)"
+      # `0` is an alias for `n`. The list is numbered from 1, so a player who
+      # has just read it reaches for a number, not a letter -- asked for by
+      # name the first time somebody used this picker.
+      prompt.add "  (0 or n = new character, q = quit)"
     else:
       prompt.add "  (q = quit)"
     var answer = ""
@@ -803,7 +839,18 @@ proc pickProfile(o: Options; port: int; root: string;
     if answer == "q" or answer == "Q":
       reason = "you chose to quit"
       return false
-    if (answer == "n" or answer == "N") and list.source == psRoute:
+    if (answer == "n" or answer == "N" or answer == "0") and
+       list.source != psRoute:
+      # Falling through to "that is not one of the choices" is a LIE here: it
+      # IS one of the choices, it just cannot be served right now. The player
+      # asked to create a character and deserves the actual reason.
+      err "creating a character needs the backend's launcher routes, and " &
+          "this list was read from " & joinPath(root, "aowlspt") & "\\store" &
+          " because those routes could not be reached. Start the backend " &
+          "(or re-run without --no-backend) and try again."
+      continue
+    if (answer == "n" or answer == "N" or answer == "0") and
+       list.source == psRoute:
       var nick = ""
       if not readAnswer("nickname:", nick): return false
       if nick.len < 3:
@@ -1902,7 +1949,7 @@ proc main(): int =
          "first-run/character-creation path, not a way into an existing " &
          "character."
   elif autoSelect:
-    let list = listProfiles(port, root)
+    let list = listProfilesWaiting(port, root)
     viaRoute = list.source == psRoute
     if list.error.len > 0:
       # Not fatal: a backend with no profile route and no store on disk is an

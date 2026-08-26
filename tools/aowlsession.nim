@@ -465,6 +465,11 @@ proc listProfiles*(port: int; root: string): ProfileList =
   ## The route first, the store when there is no route, and a plain statement
   ## of which happened either way.
   result = ProfileList(source: psNone, items: @[], note: "", error: "")
+  # ONE attempt, deliberately. A dropped connection here is usually the backend
+  # accepting the socket before its TLS listener can serve, and retrying is the
+  # caller's job -- see `listProfilesWaiting` in the launcher, which owns the
+  # sleep primitive. Keeping this proc a single honest attempt means callers
+  # that must not block (a status dump, a probe) still get an immediate answer.
   let r = call(port, "GET", "/aowlspt/tarkov/launcher/profiles", "", ProbeSession)
   if r.ok and r.status == 200:
     var err = ""
@@ -483,7 +488,8 @@ proc listProfiles*(port: int; root: string): ProfileList =
       else: inc skipped
     result.source = psRoute
     if skipped > 0:
-      result.note = $skipped & " entr" & (if skipped == 1: "y" else: "ies") &
+      if result.note.len > 0: result.note.add "; "
+      result.note.add $skipped & " entr" & (if skipped == 1: "y" else: "ies") &
                     " in the profile list carried no usable 24-character id " &
                     "and were left out rather than guessed at"
     return
