@@ -284,6 +284,20 @@ var cfgPistolCameraYOffset = 0.04
 var cfgPistolCameraZOffset = 0.025
 
 var cfgEnableFovScaleFix = false
+var cfgEnableFovWrite = false
+  ## THE PER-FRAME FOV WRITE ITSELF. DEFAULT OFF.
+  ##
+  ## Not caution for its own sake. `CameraManager::get_Instance` and
+  ## `SetFov` are prologue-verified 16/16 against the installed
+  ## GameAssembly.dll, and that proves THE BYTES MATCH. It does not prove
+  ## that calling them from the host's `everyMain` drain, at boot, with a
+  ## NULL trailing MethodInfo*, is survivable -- and neither has ever
+  ## actually been EXECUTED in the client. The 9.703s death is still
+  ## unlocalised.
+  ##
+  ## So the mod loads, verifies, reports honestly, and writes nothing until
+  ## somebody turns this on deliberately. A FOV mod that boots and declines
+  ## is shippable; one that kills the client is not.
 var cfgFovScale = 1.0
 var cfgMaxBaseFov = 110
 var cfgMinBaseFov = 30
@@ -385,6 +399,7 @@ proc loadConfig() =
   cfgPistolCameraZOffset = cfgFloat("pistolCameraZOffset", 0.025)
 
   cfgEnableFovScaleFix = cfgBool("enableFovScaleFix", false)
+  cfgEnableFovWrite = cfgBool("enableFovWrite", false)
   cfgFovScale = cfgFloat("fovScale", 1.0)
   cfgMaxBaseFov = cfgInt("maxBaseFov", 110)
   cfgMinBaseFov = cfgInt("minBaseFov", 30)
@@ -596,13 +611,16 @@ proc openRuntime(): bool =
   ## answer and one more guess costs another launch.
   if rtOpen:
     return true
+  bc "R1 openRuntime: about to openIl2Cpp"
   info "FOV: opening GameAssembly.dll from the mod (step 1/3)"
   rt = openIl2Cpp()
   info "FOV: GameAssembly.dll bound, loaded=" & $rt.loaded &
        " (step 2/3)"
   if not rt.loaded:
     return false
+  bc "R2 openIl2Cpp returned; about to missingEssential"
   let missing = rt.missingEssential()
+  bc "R3 missingEssential returned"
   info "FOV: essential entry points checked, " & $missing.len &
        " missing (step 3/3)"
   if missing.len > 0:
@@ -633,6 +651,7 @@ proc openRuntime(): bool =
 {.emit: """
 #include <stdint.h>
 #include <string.h>
+#include <stdio.h>
 #include <windows.h>
 
 /* Calling a raw address needs C: nimony refuses `cast[proc(...)](pointer)`
@@ -680,7 +699,66 @@ static void* fov_read_ptr(void* p, int32_t off) {
 static uint8_t fov_byte_at(void* p, uint64_t i) {
     return ((const uint8_t*)p)[i];
 }
+
+/* Crash-proof breadcrumbs. See `bc` in the nimony below for why the host log
+ * could not be used. fopen/fputs/fflush/fclose per call: once fclose returns
+ * the bytes belong to the file rather than to this process, so they outlive
+ * an access violation. The file is truncated once, on the first call of a
+ * run, so it is always exactly one run -- the same contract the host log
+ * has. */
+static int32_t fov_bc_n = 0;
+static void fov_bc(const char* tag) {
+    FILE* f = fopen("aowlspt-fov-breadcrumb.log", fov_bc_n == 0 ? "w" : "a");
+    if (!f) return;
+    fov_bc_n++;
+    /* No "
+" escape anywhere in this emit block: nimony re-escapes the
+     * string on its way into the generated C and a backslash-n does not
+     * survive the trip. fputc(10) is the newline. */
+    fprintf(f, "%04d ", (int)fov_bc_n);
+    fputs(tag ? tag : "(null)", f);
+    fputc(10, f);
+    fflush(f);
+    fclose(f);
+}
+static int32_t fov_bc_count(void) { return fov_bc_n; }
 """.}
+
+proc fovBcC(tag: cstring) {.importc: "fov_bc", nodecl.}
+proc fovBcCount(): int32 {.importc: "fov_bc_count", nodecl.}
+
+var gBcOn = true
+
+proc bc(tag: string) =
+  ## A CRASH-PROOF breadcrumb. Not a log line.
+  ##
+  ## WHY THIS IS NOT `info`. Twice now the host log's tail has been MISSING
+  ## the lines immediately before death: the 2026-08-26 8.375s run showed no
+  ## `reportType` output between "the game world is up" and "step 1/3", and
+  ## the 9.703s run showed no "verifyHooks is off" line between the last
+  ## summary line and the end of the file, although both are unconditional
+  ## `info` calls sitting exactly there in the source. Whatever the cause,
+  ## the consequence is the same and it is severe: THE LAST LOGGED LINE IS
+  ## NOT THE LAST STATEMENT EXECUTED, so localising a crash by reading the
+  ## log tail is off by an unknown number of statements. Six source-reasoning
+  ## attempts have already been lost on this bug; spending another cycle on a
+  ## breadcrumb that can evaporate would be a seventh.
+  ##
+  ## `fov_bc` does fopen("a") / fputs / fflush / fclose per call. Once
+  ## `fclose` returns, the bytes are in the OS page cache and belong to the
+  ## FILE, not to this process -- so they survive an access violation, which
+  ## is exactly the failure mode being chased. It is slow (a syscall per
+  ## breadcrumb) and that is affordable because it is capped and fires only
+  ## on the arming path and the first driver tick, never per frame.
+  if not gBcOn:
+    return
+  if fovBcCount() > 400'i32:
+    # Capped iteration. A breadcrumb that fires forever is a per-frame file
+    # open, which is its own outage.
+    gBcOn = false
+    return
+  var t = tag
+  fovBcC(toCString(t))
 
 proc fovGwPV(f: Il2CppPtr): Il2CppPtr {.importc: "fov_gw_p_v", nodecl.}
 proc fovGwI32V(f: Il2CppPtr): int32 {.importc: "fov_gw_i32_v", nodecl.}
@@ -763,10 +841,28 @@ proc gwWorld(): Il2CppPtr =
 #
 # WHY EVERY BY-NAME LOOKUP IS GONE FROM THE CLIENT PATH.
 #
-# MEASURED, fact #35, by a two-thread controlled experiment: on this build
-# `il2cpp_class_from_name` and `il2cpp_class_get_method_from_name` return
-# NON-NIL pointers into UNMAPPED memory -- on Unity's own main thread as much
-# as anywhere else. `fast.nim`'s `findClass` walks every loaded image calling
+# MEASURED. `il2cpp_class_from_name` and `il2cpp_class_get_method_from_name`
+# hand back NON-NIL garbage on this build.
+#
+# THE MECHANISM, corrected 2026-08-26 by an offline disassembly (see
+# docs/IL2CPP_EXPORTS.md on feat-il2cpp-export-map). The earlier wording here
+# -- "returns a pointer into unmapped memory", fact #35 -- described the
+# symptom and got the cause wrong, and a wrong cause encoded in a refusal
+# string is a confidently wrong diagnostic. What is actually true: this is
+# STOCK IL2CPP with a TOKEN-GATED export ABI. 38 of the 241 exports take an
+# extra trailing 32-byte token argument that nothing in this repo passes, and
+# when the token does not match they return a UNIFORM RANDOM NON-ZERO uint64
+# drawn from a per-thread MT19937-64.
+#
+# That is why `if cls == nil` is a check that CANNOT FAIL: the failure value
+# is deliberately never zero. The call "succeeds", and the process dies at
+# the first dereference of a random 64-bit number.
+#
+# It does not change the design one bit -- a direct call at a static RVA
+# bypasses the export ABI entirely and needs no token -- but it does change
+# what we are entitled to say, so the strings say the true thing now.
+#
+# `fast.nim`'s `findClass` walks every loaded image calling
 # `il2cpp_class_from_name`; `bindMethod` hands the result to `findMethod`,
 # which DEREFERENCES it. So `if cls == nil` is a check that CANNOT FAIL, the
 # resolution reads as a success, and the process dies at the first read
@@ -1001,6 +1097,12 @@ proc signatureOf(owner, member: string; argc: int;
     # (`CalculateScaleValueByFov`, `get_GetCurrentSensitivity`,
     # `get_AimingSensitivity`) at their first line, with their own reasons.
     gByNameRefusals = gByNameRefusals + 1
+    # Suspect (b) on the coordinator's list, answered as EVIDENCE rather than
+    # as a counter. This crumb is written BEFORE the return, so its presence
+    # proves the client path reached the guard and turned back. The summary
+    # counter it replaces only ever proved that a number had been
+    # incremented somewhere, which is not the same claim.
+    bc("N* signatureOf DECLINED (nothing looked up): " & owner & "::" & member)
     return false
   if not rtOpen:
     return false
@@ -1010,7 +1112,7 @@ proc signatureOf(owner, member: string; argc: int;
   # 0xC0000005 in the first by-name probe -- because `il2cpp_init` out of
   # process returns no domain (the metadata is decrypted during the game's
   # own startup), and the by-name path walks structures that were never
-  # built. That is fact #35 reproduced in a throwaway process, and it is also
+  # built. That is the same failure reproduced in a throwaway process, and
   # the reason the sim self-test could not be run against a real runtime
   # without taking the sim down.
   if gNoDomain:
@@ -1087,7 +1189,8 @@ proc argsUsable(params: seq[string]; why: var string): bool =
     # reintroduce the fatal route by accident.
     why = "REFUSED in the client: classifying a parameter needs findClass, " &
           "which on this build returns a non-nil pointer into unmapped " &
-          "memory (fact #35)"
+          "memory: the export ABI is token-gated and returns random " &
+          "non-zero garbage when the token is absent"
     gByNameRefusals = gByNameRefusals + 1
     return false
   let header = boxHeaderBytes(rt)
@@ -1355,7 +1458,8 @@ proc bindFovStatics(): bool =
   # asking was survivable. It is GONE, not repaired: the world now comes from
   # the host export, as an object, and `bWorld` is retired.
   info "FOV: binding CameraManager::get_Instance at a verified static RVA " &
-       "(no name is looked up; see fact #35)"
+       "(no name is looked up, so the token-gated export ABI is not " &
+       "involved at all)"
   # Given a reason BEFORE the early return below can strand it. A zeroed
   # `Binding` reports an empty `why`, which reads in a log as "no reason
   # given" rather than "never asked" -- the exact defect the comment above
@@ -1368,6 +1472,7 @@ proc bindFovStatics(): bool =
                     fn: cast[Il2CppPtr](0), info: cast[Il2CppPtr](0),
                     argc: 0'i32, slots: 0'i32, mask: 0'u32, ret: fkVoid,
                     isStatic: false, bindNs: 0'i64)
+  bc "S1 about to prologue-verify get_Instance"
   bCamInstance = bindAtRva("CameraManager::get_Instance", RvaCamInstance,
                            ProCamInstance, noKinds(), fkPtr, true)
   if not bCamInstance.ok:
@@ -1392,6 +1497,7 @@ proc bindFovStatics(): bool =
   # so the arity is 3 and the register shape is (f32, f32, bool). The
   # prologue compare below is what makes that a CHECK rather than a memory:
   # if the installed DLL is not the one those bytes came from, this refuses.
+  bc "S2 get_Instance verified; about to prologue-verify SetFov"
   bSetFov = bindAtRva("CameraManager::SetFov(float,float,bool)", RvaSetFov3,
                       ProSetFov3, setFovKinds3(), fkVoid, false)
   if not bSetFov.ok:
@@ -1401,6 +1507,7 @@ proc bindFovStatics(): bool =
   gSetFovArgc = 3
   info "FOV: " & bSetFov.why
 
+  bc "S3 both RVAs verified; bindFovStatics returning true"
   gFovState = "arming: SetFov verified at 0x" & hexs(RvaSetFov3) &
               " with 3 argument(s); waiting for a live CameraManager"
   result = true
@@ -1471,6 +1578,8 @@ proc applyFov() =
   ## the game's own frame -- which is where a Unity write has to happen. Every
   ## pointer here is resolved fresh and dropped before the call returns: rule 4
   ## in docs/PERF.md, and the reason nothing in this file stores one.
+  if not cfgEnableFovWrite:
+    return
   if not bCamInstance.ok or not bSetFov.ok:
     return
   let now = perfCounter()
@@ -1480,6 +1589,8 @@ proc applyFov() =
   gLastFovTicks = now
   let measuring = gFovSamples < CostSamples
 
+  let firstPass = gFovWrites == 0'i64 and not gFovBoundSaid
+  if firstPass: bc "A1 applyFov: past the rate gate"
   var none = noKinds()
   var a = noArgs()
   # The world, from the host's cache rather than from a type probe. `gwWorld`
@@ -1488,16 +1599,25 @@ proc applyFov() =
   # read as "not in a raid", which is why `onWorldReady` and `reportWatch`
   # both print `gwStateText()`: the three-way answer stays visible even
   # though this fast path can only branch two ways.
+  if firstPass: bc "A2 about to ask the host export for the world"
   let w = gwWorld()
-  if w == nil: return
-  if not fovReadable(w, 16): return
+  if w == nil:
+    if firstPass: bc "A2x no world (host export state below 3) -- returning"
+    return
+  if not fovReadable(w, 16):
+    if firstPass: bc "A2y world pointer not readable -- returning"
+    return
+  if firstPass: bc "A3 world in hand and readable"
 
+  if firstPass: bc "A4 about to bindOnObject get_MainPlayer on the world"
   if not ensureCall(obMainPlayer, w, "get_MainPlayer", none, fkPtr):
     gFovState = "refused: " & obMainPlayer.why
     return
   a.reset()
+  if firstPass: bc "A5 get_MainPlayer bound; about to CALL it"
   let player = callPtr(obMainPlayer.b, w, a)
   if player == nil: return
+  if firstPass: bc "A6 player in hand"
 
   if not ensureCall(obPwa, player, "get_ProceduralWeaponAnimation", none,
                     fkPtr):
@@ -1506,22 +1626,36 @@ proc applyFov() =
   a.reset()
   let pwa = callPtr(obPwa.b, player, a)
   if pwa == nil: return
+  if firstPass: bc "A7 weapon animation in hand"
 
   a.reset()
+  # SUSPECT (a). The first execution EVER of a verified-but-never-run RVA.
+  if firstPass: bc "B1 about to CALL CameraManager::get_Instance @0x1263bd0"
   let cm = callPtr(bCamInstance, nullPtr(), a)
-  if cm == nil: return
-  if not fovReadable(cm, OffCamManagerCamera + 8): return
+  if firstPass: bc "B2 get_Instance returned without faulting"
+  if cm == nil:
+    if firstPass: bc "B2x get_Instance returned NULL -- returning"
+    return
+  # SUSPECT (c). A CameraManager that is non-null but not yet initialised.
+  if not fovReadable(cm, OffCamManagerCamera + 8):
+    if firstPass: bc "B2y CameraManager not readable to +0x78 -- returning"
+    return
   # `get_Camera` is not called: it resolves to 0x65ED10, which is literally
   # `mov rax,[rcx+0x70]; ret` and is a FOLDED body shared with every other
   # `+0x70` reference getter in the build. The field read is the same answer
   # with one fewer call and no shared-RVA exposure. Offset from
   # `tools/fldoff.py`: CameraManager.<Camera>k__BackingField @0x70.
   let cam = guardedField(cm, OffCamManagerCamera, "CameraManager.Camera")
-  if cam == nil: return
+  if cam == nil:
+    if firstPass: bc "B3x CameraManager.Camera is null -- returning"
+    return
+  if firstPass: bc "B3 camera in hand"
 
+  if firstPass: bc "B4 about to bindOnObject get_fieldOfView on the camera"
   if not ensureCall(obCamFov, cam, "get_fieldOfView", none, fkF32):
     gFovState = "refused: " & obCamFov.why
     return
+  if firstPass: bc "B5 get_fieldOfView bound"
 
   if not gFovBoundSaid:
     gFovBoundSaid = true
@@ -1575,7 +1709,10 @@ proc applyFov() =
   if gSetFovArgc == 3:
     addFloat(a, 0.0)     # lerp time: upstream sets the value outright
     addBool(a, true)
+  # SUSPECT (a), the other half.
+  if firstPass: bc "C1 about to CALL CameraManager::SetFov @0x1268d20"
   callVoid(bSetFov, cm, a)
+  if firstPass: bc "C2 SetFov returned without faulting"
   gFovWrites = gFovWrites + 1
   if measuring:
     gFovNs = gFovNs + nanosBetween(now, perfCounter())
@@ -1611,10 +1748,12 @@ proc armScaleFix() =
   if not signatureOf(TyPlayer, "CalculateScaleValueByFov", -1, params, ret):
     gScaleState = "REFUSED (INCONCLUSIVE, not absent): confirming the signature of " &
                   TyPlayer & "::CalculateScaleValueByFov" & " needs a by-name IL2CPP " &
-                  "lookup, and on this build il2cpp_class_from_name " &
-                  "returns a NON-NIL pointer into unmapped memory " &
-                  "(fact #35) -- so the lookup that would answer this " &
-                  "is the one that killed the client at 8.375s. This " &
+                  "lookup, and this build's IL2CPP exports are " &
+                  "TOKEN-GATED: 38 of 241 take a trailing 32-byte token we " &
+                  "do not pass, and on mismatch they return a uniform " &
+                  "random non-zero uint64 from a per-thread MT19937-64. So " &
+                  "the handle is garbage, the nil check passes, and the " &
+                  "first dereference kills the process. This " &
                   "effect is NOT ported to a verified static RVA yet; " &
                   "it needs one from tools/il2cpp_resolve.py plus a " &
                   "PatchKind the host can install by address."
@@ -1677,10 +1816,12 @@ proc armScopeSensitivity() =
   if not signatureOf(TySight, "get_GetCurrentSensitivity", -1, params, ret):
     gSensState = "REFUSED (INCONCLUSIVE, not absent): confirming the signature of " &
                   TySight & "::get_GetCurrentSensitivity" & " needs a by-name IL2CPP " &
-                  "lookup, and on this build il2cpp_class_from_name " &
-                  "returns a NON-NIL pointer into unmapped memory " &
-                  "(fact #35) -- so the lookup that would answer this " &
-                  "is the one that killed the client at 8.375s. This " &
+                  "lookup, and this build's IL2CPP exports are " &
+                  "TOKEN-GATED: 38 of 241 take a trailing 32-byte token we " &
+                  "do not pass, and on mismatch they return a uniform " &
+                  "random non-zero uint64 from a per-thread MT19937-64. So " &
+                  "the handle is garbage, the nil check passes, and the " &
+                  "first dereference kills the process. This " &
                   "effect is NOT ported to a verified static RVA yet; " &
                   "it needs one from tools/il2cpp_resolve.py plus a " &
                   "PatchKind the host can install by address."
@@ -1832,10 +1973,12 @@ proc armAimingSensitivity() =
   if not signatureOf(TyFirearm, "get_AimingSensitivity", -1, params, ret):
     gAimSensState = "REFUSED (INCONCLUSIVE, not absent): confirming the signature of " &
                   TyFirearm & "::get_AimingSensitivity" & " needs a by-name IL2CPP " &
-                  "lookup, and on this build il2cpp_class_from_name " &
-                  "returns a NON-NIL pointer into unmapped memory " &
-                  "(fact #35) -- so the lookup that would answer this " &
-                  "is the one that killed the client at 8.375s. This " &
+                  "lookup, and this build's IL2CPP exports are " &
+                  "TOKEN-GATED: 38 of 241 take a trailing 32-byte token we " &
+                  "do not pass, and on mismatch they return a uniform " &
+                  "random non-zero uint64 from a per-thread MT19937-64. So " &
+                  "the handle is garbage, the nil check passes, and the " &
+                  "first dereference kills the process. This " &
                   "effect is NOT ported to a verified static RVA yet; " &
                   "it needs one from tools/il2cpp_resolve.py plus a " &
                   "PatchKind the host can install by address."
@@ -2004,12 +2147,36 @@ proc onFovTick(payload: string): string =
   ## only evidence for it available from inside a mod. It is printed next to
   ## the host's own answer so the two can disagree in public.
   gDriverFirings = gDriverFirings + 1
+  if gDriverFirings == 1:
+    # The first tick ONLY. This is suspect (a) on the coordinator's list: the
+    # RVAs are prologue-verified but have never been EXECUTED, and a verified
+    # prologue proves the bytes match, not that calling them here is legal.
+    # If the run dies with T1 present and T2 absent, the fault is inside
+    # `applyFov` on its first pass and the sub-crumbs A*/B* say where.
+    bc "T1 first everyMain tick, about to call applyFov"
   gDriverThreadId = currentThreadId()
   applyFov()
+  if gDriverFirings == 1:
+    bc "T2 first everyMain tick returned from applyFov"
   result = ""
 
 proc armFovDriver() =
   ## Install whatever will call `applyFov` every frame.
+  bc "D1 armFovDriver entered"
+  if not cfgEnableFovWrite:
+    # Nothing is installed AT ALL -- not a driver that calls a chain that
+    # returns at its first guard, which would still be a per-frame call into
+    # code whose safety is the open question. No callback is registered, so
+    # `applyFov` is unreachable for the whole run.
+    gDriverState = "NOT INSTALLED: enableFovWrite is off (the default). No " &
+                   "driver was registered and applyFov is unreachable this " &
+                   "run. The two static RVAs are still verified and reported " &
+                   "above; what is not proven is that CALLING them from the " &
+                   "host's everyMain drain is survivable, and the client is " &
+                   "still dying at ~9.7s with this mod staged."
+    gFovState = "NOT INSTALLED: enableFovWrite is off (the default)"
+    bc "D2 armFovDriver declined (enableFovWrite off)"
+    return
   if not bCamInstance.ok or not bSetFov.ok or
      gFovState.substr(0, 5) != "arming":
     # The statics, *and* the SetFov arity check that follows them. A driver
@@ -2084,11 +2251,14 @@ proc onWorldReady() =
   ## was false on every run that ever printed it -- the gate behind it was a
   ## type-existence probe. The honest state goes out instead, three-valued,
   ## and it is INFO not SUCCESS because arming is not an achievement.
+  bc "W1 onWorldReady entered"
   info "FOV: arming on Unity's thread. World: " & gwStateText()
+  bc "W2 gwStateText survived (host export queried)"
 
   # Every type FOV Fix patched. Resolving them is not decorative: if BSG or a
   # backport renames one, this is the line that says so, and it says it before
   # anything downstream fails in a way that reads like a different bug.
+  bc "W3 about to resolve seven game types by name (the HOST route)"
   reportType(CameraManager)
   reportType(ProceduralWeaponAnimation)
   reportType(Player)
@@ -2096,11 +2266,13 @@ proc onWorldReady() =
   reportType(SightComponent)
   reportType(GameSettingsTab)
   reportType(ScopeZoomHandler)
+  bc "W4 seven game types resolved"
 
   # Binding happens here rather than in `onLoad`, and that is not a detail:
   # `findClass` walks every loaded assembly, and at load time the game's own
   # assemblies are not among them, so a binding made then would correctly
   # refuse and never be retried.
+  bc "W5 about to openRuntime"
   if not openRuntime():
     gFovState = "refused: the IL2CPP runtime could not be bound from the mod"
     gScaleState = gFovState
@@ -2108,15 +2280,22 @@ proc onWorldReady() =
     gAimSensState = gFovState
     warn "FOV: " & gFovState
   else:
+    bc "W6 openRuntime ok; about to bindFovStatics"
     discard bindFovStatics()
+    bc "W7 bindFovStatics returned"
     armScaleFix()
+    bc "W8 armScaleFix returned"
     armScopeSensitivity()
+    bc "W9 armScopeSensitivity returned"
     armAimingSensitivity()
+    bc "W10 armAimingSensitivity returned"
 
   # The driver goes in before the diagnostics, because it is the effect and
   # they are the measurement. It used to go in after, inside the `verifyHooks`
   # block, which meant one config flag switched off the mod.
+  bc "W11 about to armFovDriver"
   armFovDriver()
+  bc "W12 armFovDriver returned"
 
   info "FOV: static RVAs -- " & $gRvaVerified & " prologue-verified, " &
        $gRvaRejected & " REFUSED; by-name lookups declined in the client: " &
@@ -2127,11 +2306,14 @@ proc onWorldReady() =
   info "FOV: CalculateScaleValueByFov -- " & gScaleState
   info "FOV: scope sensitivity -- " & gSensState
   info "FOV: aiming sensitivity -- " & gAimSensState
+  # The 9.703s run's host log ENDS here -- but the next statement is an
+  # unconditional `info` that never appeared. E1 is the crumb that settles
+  # whether the log tail was lost or the process really stopped here.
+  bc "E1 summary dump complete"
 
   if not cfgVerifyHooks:
-    info "verifyHooks is off; not attaching the target-verification detours. " &
-         "The FOV write is unaffected -- it is driven on its own account now, " &
-         "and this flag decides only what is counted."
+    info "verifyHooks is off; not attaching the target-verification detours."
+    bc "E2 verifyHooks off -- onWorldReady returning, nothing patched"
     return
 
   # The exact methods the original patched, in the original's order. Sixteen
@@ -2388,7 +2570,8 @@ proc checkGuards(): int =
     # runs on `sideSim` alone -- but the guard is here rather than only
     # there.
     warn "  guards not checked: they use by-name IL2CPP resolution, which " &
-         "is fatal in the client (fact #35). Run the self-test on the sim " &
+         "is fatal in the client (token-gated exports). Run the self-test " &
+         "on the sim " &
          "side against selfTestRuntime instead."
     return
   if not rtOpen:
@@ -2502,7 +2685,7 @@ proc simSelfTest(): Status =
         # by-name probe takes the whole sim down with 0xC0000005. A domain
         # that `il2cpp_init` declined to build is not an empty universe, it
         # is an absent one, and walking it is the same class of fault as
-        # fact #35 in the client.
+        # fault as the token-gated exports in the client.
         gNoDomain = true
         warn "  " & runtimePath & " loaded but il2cpp_init returned no " &
              "domain. That is the expected answer for a real client out of " &
@@ -2740,10 +2923,12 @@ proc onUpdate(elapsedMs: int64): Status =
       let mt = askMainThread()
       if mt.ok and mt.bound:
         gPending = false
+        bc "U1 host drain confirmed; about to call onWorldReady"
         success "FOV: Unity's main thread is live after " &
                 $(gPendingMs div 1000) & "s (drain " & mt.methodName & ", " &
                 $mt.frames & " firings); arming now"
         onWorldReady()
+        bc "U2 onWorldReady RETURNED -- arming complete and survived"
         gElapsedMs = 0
       elif gPendingMs >= DeferGiveUpMs:
         # Self-disable rather than arm anyway. Arming here would be doing
