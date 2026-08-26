@@ -1363,6 +1363,17 @@ var gModsLastTabName = ""
 ## The POLLING version brand and the seasons-banner hider. Both live in
 ## `modstab.nim` and ride the same detour; both default OFF.
 var gVerOn = false
+## THE VERSION BRAND'S OWN PRELOADER ANCHOR, and it exists because the brand
+## used to borrow `gInspPreloader` -- which is written ONLY by `inspectFired`,
+## the LIVE INSPECTOR's rider. MEASURED in a real boot: the brand hunted from
+## 14.797 s, the client reached the main menu, and it never once resolved --
+## it logged "no live PreloaderUI anchor yet" throughout, because the
+## inspector's rider had never written that global. A feature must not depend
+## on another feature's flag to find its own target. RCX at
+## `EFT.UI.PreloaderUI::Update` IS the live PreloaderUI in BOTH dispatch
+## halves (the argument registers are saved on entry either way), so the brand
+## captures it itself now, from the very rider call it already receives.
+var gVerPreloader: Il2CppPtr = nil
 var gSeasonsOn = false
 ## POSTFX folded into Graphics as a subtab. Default OFF, and it is the one
 ## feature in `modstab.nim` that drives the GAME's own panels rather than
@@ -3066,7 +3077,7 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     # THE MODS TAB, the fifth rider. Aliased onto whichever slot was claimed, so
     # it costs one integer compare when it is off and never a second detour.
     if i == gModsSlot:
-      modsRidersTick()
+      modsRidersTick(regs)
     # THE SHARED REGION, and the generic one: it dispatches every mod that
     # registered a draw or tick callback. LAST in the chain on purpose --
     # the hand-written riders above it predate it and keep their existing
@@ -3210,7 +3221,7 @@ proc patchReturned(slot: int32; regs: Il2CppPtr): int32 {.
     if i == gInspSlot:
       inspectFired(regs)
     if i == gModsSlot:
-      modsRidersTick()
+      modsRidersTick(regs)
     if i == gRegionSlot:
       regionFired(regs)
     return 0'i32
@@ -5212,6 +5223,17 @@ proc versionBrandFired(regs: Il2CppPtr) =
     warn "version probe: `this` is null; nothing to read"
     return
   let self = cast[Il2CppPtr](selfRaw)
+  # THE SECOND, INDEPENDENT ANCHOR SOURCE for the polling brand in
+  # `modstab.nim`. This postfix fires at ~1.3 s, more than 13 s before the
+  # first `PreloaderUI::Update` rider tick, and its `this` is the same live
+  # PreloaderUI. It is captured here and ONLY here -- nothing in this probe
+  # writes through it, and the offset this probe goes on to read
+  # (`cUxVersionLabelOffset`) is the fact-#13 WRONG object; the polling brand
+  # ignores that offset entirely and walks by NAME to AlphaLabel instead.
+  # Two independent sources, because one of them being gated behind another
+  # feature's flag is exactly what made this never resolve.
+  if gVerPreloader == nil:
+    gVerPreloader = self
   let off = cUxVersionLabelOffset()
   if cIsReadable(self, off + 8'i32) == 0'i32:
     warn "version probe: this+0x" & hexOf(uint64(off)) & " is not readable"
