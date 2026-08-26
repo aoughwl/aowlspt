@@ -1,0 +1,107 @@
+{
+ "id": "Labs_TarkovDev",
+ "displayName": "Labs (TarkovDev)",
+ "author": "Tarkov.dev",
+ "authorLink": "https://tarkov.dev",
+ "internalNames": [
+  "laboratory"
+ ],
+ "coordinateRotation": 270,
+ "bounds": {
+  "Min": {
+   "x": -292,
+   "y": -441
+  },
+  "Max": {
+   "x": -96,
+   "y": -223
+  }
+ },
+ "defaultLevel": 0,
+ "layers": {
+  "Technical": {
+   "level": -1,
+   "image": "Labs_TarkovDev/Layers/Labs_Technical_Level.svg",
+   "imageBounds": {
+    "Min": {
+     "x": -292,
+     "y": -441
+    },
+    "Max": {
+     "x": -96,
+     "y": -223
+    }
+   },
+   "gameBounds": [
+    {
+     "Min": {
+      "x": -292,
+      "y": -441,
+      "z": -100
+     },
+     "Max": {
+      "x": -96,
+      "y": -223,
+      "z": -0.9
+     }
+    }
+   ]
+  },
+  "First Level": {
+   "level": 0,
+   "image": "Labs_TarkovDev/Layers/Labs_First_Level.svg",
+   "imageBounds": {
+    "Min": {
+     "x": -292,
+     "y": -441
+    },
+    "Max": {
+     "x": -96,
+     "y": -223
+    }
+   },
+   "gameBounds": [
+    {
+     "Min": {
+      "x": -292,
+      "y": -441,
+      "z": -0.9
+     },
+     "Max": {
+      "x": -96,
+      "y": -223,
+      "z": 3
+     }
+    }
+   ]
+  },
+  "Second Level": {
+   "level": 1,
+   "image": "Labs_TarkovDev/Layers/Labs_Second_Level.svg",
+   "imageBounds": {
+    "Min": {
+     "x": -292,
+     "y": -441
+    },
+    "Max": {
+     "x": -96,
+     "y": -223
+    }
+   },
+   "gameBounds": [
+    {
+     "Min": {
+      "x": -271,
+      "y": -422,
+      "z": 3
+     },
+     "Max": {
+      "x": -101,
+      "y": -270,
+      "z": 100
+     }
+    }
+   ]
+  }
+ }
+}

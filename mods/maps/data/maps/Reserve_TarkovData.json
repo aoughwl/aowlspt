@@ -1,0 +1,79 @@
+{
+ "id": "Reserve_TarkovData",
+ "displayName": "Reserve (TarkovData)",
+ "author": "Shebuka",
+ "authorLink": "https://github.com/TarkovTracker/tarkovdata/",
+ "internalNames": [
+  "RezervBase"
+ ],
+ "coordinateRotation": 180,
+ "bounds": {
+  "Min": {
+   "x": -303.5,
+   "y": -275
+  },
+  "Max": {
+   "x": 292,
+   "y": 271.5
+  }
+ },
+ "defaultLevel": 0,
+ "layers": {
+  "Bunkers": {
+   "level": -1,
+   "image": "Reserve_TarkovData/Layers/Reserve-Bunkers.svg",
+   "imageBounds": {
+    "Min": {
+     "x": -303.5,
+     "y": -275
+    },
+    "Max": {
+     "x": 292,
+     "y": 271.5
+    }
+   },
+   "gameBounds": [
+    {
+     "Min": {
+      "x": -303.5,
+      "y": -275,
+      "z": -100
+     },
+     "Max": {
+      "x": 292,
+      "y": 271.5,
+      "z": -8
+     }
+    }
+   ]
+  },
+  "Ground Level": {
+   "level": 0,
+   "image": "Reserve_TarkovData/Layers/Reserve-Ground_Level.svg",
+   "imageBounds": {
+    "Min": {
+     "x": -303.5,
+     "y": -275
+    },
+    "Max": {
+     "x": 292,
+     "y": 271.5
+    }
+   },
+   "gameBounds": [
+    {
+     "Min": {
+      "x": -303.5,
+      "y": -275,
+      "z": -8
+     },
+     "Max": {
+      "x": 292,
+      "y": 271.5,
+      "z": 100
+     }
+    }
+   ]
+  }
+ }
+}

@@ -1,0 +1,51 @@
+{
+ "id": "Labyrinth",
+ "displayName": "Labyrinth",
+ "author": "acidphantasm",
+ "authorLink": "https://github.com/acidphantasm/SPT-DynamicMaps/",
+ "internalNames": [
+  "Labyrinth"
+ ],
+ "coordinateRotation": 90,
+ "bounds": {
+  "Min": {
+   "x": -52.5,
+   "y": -36.5
+  },
+  "Max": {
+   "x": 50.7,
+   "y": 75.3
+  }
+ },
+ "defaultLevel": 0,
+ "layers": {
+  "Ground Level": {
+   "level": 0,
+   "image": "Labyrinth/Layers/Labyrinth.svg",
+   "imageBounds": {
+    "Min": {
+     "x": -52.5,
+     "y": -36.5
+    },
+    "Max": {
+     "x": 50.7,
+     "y": 75.3
+    }
+   },
+   "gameBounds": [
+    {
+     "Min": {
+      "x": -52.5,
+      "y": -36.5,
+      "z": -100
+     },
+     "Max": {
+      "x": 50.7,
+      "y": 75.3,
+      "z": 100
+     }
+    }
+   ]
+  }
+ }
+}

@@ -1385,6 +1385,20 @@ proc handleRequest(sock: uint64; buf: HostPtr; len: int32;
       # uncompressed, and with a real `text/html` Content-Type so the browser
       # renders it instead of offering it as a JSON download.
       sendResponse(sock, "200 OK", body, false, req.keepAlive, "text/html; charset=utf-8")
+    elif fpath.len >= 20 and fpath.substr(0, 19) == "/aowlspt/maps/asset/":
+      # Map terrain art (mods/maps). Fetched by an ordinary browser, which can
+      # neither ask for `identity` nor inflate, so it goes out uncompressed for
+      # the same reason as the two branches below. The MIME type has to be
+      # `image/svg+xml` specifically: a browser asked to render SVG labelled
+      # `application/json` offers it as a download, and one labelled `text/xml`
+      # will not render inside an <img>. This page inlines the markup through
+      # DOMParser, which is stricter still.
+      #
+      # Count check, because the two branches below record getting this wrong:
+      # `substr(a, b)` is INCLUSIVE of b, so the 20-character prefix
+      # "/aowlspt/maps/asset/" is `substr(0, 19)`.
+      sendResponse(sock, "200 OK", body, false, req.keepAlive,
+                   "image/svg+xml; charset=utf-8")
     elif fpath.len >= 16 and fpath.substr(0, 15) == "/aowlspt/ui/lib/":
       # The settings UI client library (docs/UI-API.md). Same reasoning as the
       # page above -- a browser fetches it with a plain `<script src>` and can

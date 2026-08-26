@@ -1,0 +1,136 @@
+{
+ "id": "Factory_TarkovDev",
+ "displayName": "Factory (TarkovDev)",
+ "author": "Tarkov.dev",
+ "authorLink": "https://tarkov.dev",
+ "internalNames": [
+  "factory4_day",
+  "factory4_night"
+ ],
+ "coordinateRotation": 90,
+ "bounds": {
+  "Min": {
+   "x": -65,
+   "y": -64.5
+  },
+  "Max": {
+   "x": 77.6,
+   "y": 67.2
+  }
+ },
+ "defaultLevel": 0,
+ "layers": {
+  "Tunnels": {
+   "level": -1,
+   "image": "Factory_TarkovDev/Layers/Factory-Basement.svg",
+   "imageBounds": {
+    "Min": {
+     "x": -65,
+     "y": -64.5
+    },
+    "Max": {
+     "x": 77.6,
+     "y": 67.2
+    }
+   },
+   "gameBounds": [
+    {
+     "Min": {
+      "x": -65,
+      "y": -64.5,
+      "z": -100
+     },
+     "Max": {
+      "x": 77.6,
+      "y": 67.2,
+      "z": -1
+     }
+    }
+   ]
+  },
+  "Ground Floor": {
+   "level": 0,
+   "image": "Factory_TarkovDev/Layers/Factory-Ground_Floor.svg",
+   "imageBounds": {
+    "Min": {
+     "x": -65,
+     "y": -64.5
+    },
+    "Max": {
+     "x": 77.6,
+     "y": 67.2
+    }
+   },
+   "gameBounds": [
+    {
+     "Min": {
+      "x": -65,
+      "y": -64.5,
+      "z": -1
+     },
+     "Max": {
+      "x": 77.6,
+      "y": 67.2,
+      "z": 3
+     }
+    }
+   ]
+  },
+  "2nd Floor": {
+   "level": 1,
+   "image": "Factory_TarkovDev/Layers/Factory-Second_Floor.svg",
+   "imageBounds": {
+    "Min": {
+     "x": -65,
+     "y": -64.5
+    },
+    "Max": {
+     "x": 77.6,
+     "y": 67.2
+    }
+   },
+   "gameBounds": [
+    {
+     "Min": {
+      "x": -65,
+      "y": -64.5,
+      "z": 3
+     },
+     "Max": {
+      "x": 77.6,
+      "y": 67.2,
+      "z": 6
+     }
+    }
+   ]
+  },
+  "3rd Floor": {
+   "level": 2,
+   "image": "Factory_TarkovDev/Layers/Factory-Third_Floor.svg",
+   "imageBounds": {
+    "Min": {
+     "x": -65,
+     "y": -64.5
+    },
+    "Max": {
+     "x": 77.6,
+     "y": 67.2
+    }
+   },
+   "gameBounds": [
+    {
+     "Min": {
+      "x": -65,
+      "y": -64.5,
+      "z": 6
+     },
+     "Max": {
+      "x": 77.6,
+      "y": 67.2,
+      "z": 100
+     }
+    }
+   ]
+  }
+ }
+}
