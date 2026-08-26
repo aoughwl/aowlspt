@@ -131,64 +131,89 @@ proc hexOf(bs: openArray[uint8]): string =
     result.add digits[int(bs[i] and 0x0F'u8)]
     inc i
 
-var gMoverSprint = rvaTarget(
-  AOWL_SYM_SAIN_MOVER_SPRINT_NAME & "(bool val, bool withDebugCallback)",
-  AOWL_SYM_SAIN_MOVER_SPRINT,
-  hexOf(AOWL_SYM_SAIN_MOVER_SPRINT_PROLOGUE),
-  owners = int32(AOWL_SYM_SAIN_MOVER_SPRINT_OWNERS))
+# THE TARGETS ARE DECLARED BARE AND ASSIGNED INSIDE A PROC, and that is not a
+# style choice -- it is the trap documented at `aowl/src/aowlspt/fast.nim:44`.
+#
+# In a nimony `--app:lib` build a global INITIALISED BY A CALL is silently left
+# ZEROED. `var gDot = rvaTarget(...)` at module scope does not fail; it produces
+# an all-zero object, so the target's RVA reads 0 and the first call refuses
+# with `@0x0`. It fails safe, which is the reason nobody notices: the mod loads,
+# the log says "refused", and the refusal names the wrong cause. This file was
+# written that way and would have refused every driving call for a reason that
+# had nothing to do with IL2CPP. Measured today by the call-proof mod's first
+# live run, which hit exactly this.
+#
+# So: bare declarations here, one assignment site in `installTargets` below,
+# called from `verifyAll`.
 
-var gMoverStop = rvaTarget(
-  AOWL_SYM_SAIN_MOVER_STOP_NAME & "()",
-  AOWL_SYM_SAIN_MOVER_STOP,
-  hexOf(AOWL_SYM_SAIN_MOVER_STOP_PROLOGUE),
-  owners = int32(AOWL_SYM_SAIN_MOVER_STOP_OWNERS))
+var gMoverSprint: RvaTarget
+var gMoverStop: RvaTarget
+var gSteeringLookTo: RvaTarget
+var gShoot: RvaTarget
+var gStopMove: RvaTarget
+var gNavSample: RvaTarget
+var gRaycast: RvaTarget
 
-var gSteeringLookTo = rvaTarget(
-  AOWL_SYM_SAIN_STEERING_LOOKTO_NAME & "(Vector3 point)",
-  AOWL_SYM_SAIN_STEERING_LOOKTO,
-  hexOf(AOWL_SYM_SAIN_STEERING_LOOKTO_PROLOGUE),
-  owners = int32(AOWL_SYM_SAIN_STEERING_LOOKTO_OWNERS))
+proc installTargets() =
+  gMoverSprint = rvaTarget(
+    AOWL_SYM_SAIN_MOVER_SPRINT_NAME & "(bool val, bool withDebugCallback)",
+    AOWL_SYM_SAIN_MOVER_SPRINT,
+    hexOf(AOWL_SYM_SAIN_MOVER_SPRINT_PROLOGUE),
+    owners = int32(AOWL_SYM_SAIN_MOVER_SPRINT_OWNERS))
 
-var gShoot = rvaTarget(
-  AOWL_SYM_SAIN_SHOOTDATA_SHOOT_NAME & "() -> bool",
-  AOWL_SYM_SAIN_SHOOTDATA_SHOOT,
-  hexOf(AOWL_SYM_SAIN_SHOOTDATA_SHOOT_PROLOGUE),
-  owners = int32(AOWL_SYM_SAIN_SHOOTDATA_SHOOT_OWNERS))
+  gMoverStop = rvaTarget(
+    AOWL_SYM_SAIN_MOVER_STOP_NAME & "()",
+    AOWL_SYM_SAIN_MOVER_STOP,
+    hexOf(AOWL_SYM_SAIN_MOVER_STOP_PROLOGUE),
+    owners = int32(AOWL_SYM_SAIN_MOVER_STOP_OWNERS))
 
-var gStopMove = rvaTarget(
-  AOWL_SYM_SAIN_BOTOWNER_STOPMOVE_NAME & "()",
-  AOWL_SYM_SAIN_BOTOWNER_STOPMOVE,
-  hexOf(AOWL_SYM_SAIN_BOTOWNER_STOPMOVE_PROLOGUE),
-  owners = int32(AOWL_SYM_SAIN_BOTOWNER_STOPMOVE_OWNERS))
+  gSteeringLookTo = rvaTarget(
+    AOWL_SYM_SAIN_STEERING_LOOKTO_NAME & "(Vector3 point)",
+    AOWL_SYM_SAIN_STEERING_LOOKTO,
+    hexOf(AOWL_SYM_SAIN_STEERING_LOOKTO_PROLOGUE),
+    owners = int32(AOWL_SYM_SAIN_STEERING_LOOKTO_OWNERS))
 
-var gNavSample = rvaTarget(
-  AOWL_SYM_SAIN_NAVMESH_SAMPLE_NAME &
-    "(Vector3 src, out NavMeshHit hit, float maxDistance, int areaMask) -> bool",
-  AOWL_SYM_SAIN_NAVMESH_SAMPLE,
-  hexOf(AOWL_SYM_SAIN_NAVMESH_SAMPLE_PROLOGUE),
-  owners = int32(AOWL_SYM_SAIN_NAVMESH_SAMPLE_OWNERS))
+  gShoot = rvaTarget(
+    AOWL_SYM_SAIN_SHOOTDATA_SHOOT_NAME & "() -> bool",
+    AOWL_SYM_SAIN_SHOOTDATA_SHOOT,
+    hexOf(AOWL_SYM_SAIN_SHOOTDATA_SHOOT_PROLOGUE),
+    owners = int32(AOWL_SYM_SAIN_SHOOTDATA_SHOOT_OWNERS))
 
-# `UnityEngine.Physics::Raycast(Vector3, Vector3, float)` is NOT in the
-# generated table and cannot be, which is a real gap in the tool rather than a
-# thing to route around silently. `abi/aowlspt_symbols.txt` names an overload as
-# `Type::Method/arity`, and this build has THREE arity-3 `Raycast` overloads:
-#   (Vector3,Vector3,float)      0x5328830   <- the one wanted
-#   (Vector3,Vector3,RaycastHit) 0x5328C30
-#   (Ray,float,int)              0x5328DD0
-# so `UnityEngine.Physics::Raycast/3` is REJECTED as ambiguous. That rejection
-# is correct -- picking one silently would be the bug -- but the manifest has no
-# way to disambiguate BY PARAMETER TYPE, so the only route left is the one
-# `callrva` documents for exactly this case: declare the RVA and paste the
-# prologue from
-#   python tools\il2cpp_resolve.py <gameasm> <metadec> bytes 0x5328830 16
-# which printed, on 2026-08-26, precisely the sixteen bytes below. The
-# rejected symbol is LEFT in the manifest, unreferenced, so the gap is
-# documented where the next person will look.
-var gRaycast = rvaTarget(
-  "UnityEngine.Physics::Raycast(Vector3 origin, Vector3 direction, float maxDistance) -> bool",
-  0x5328830'u32,
-  "48 89 5C 24 08 57 48 83 EC 70 80 3D 51 D9 DA 01",
-  owners = 1'i32)
+  gStopMove = rvaTarget(
+    AOWL_SYM_SAIN_BOTOWNER_STOPMOVE_NAME & "()",
+    AOWL_SYM_SAIN_BOTOWNER_STOPMOVE,
+    hexOf(AOWL_SYM_SAIN_BOTOWNER_STOPMOVE_PROLOGUE),
+    owners = int32(AOWL_SYM_SAIN_BOTOWNER_STOPMOVE_OWNERS))
+
+  gNavSample = rvaTarget(
+    AOWL_SYM_SAIN_NAVMESH_SAMPLE_NAME &
+      "(Vector3 src, out NavMeshHit hit, float maxDistance, int areaMask) -> bool",
+    AOWL_SYM_SAIN_NAVMESH_SAMPLE,
+    hexOf(AOWL_SYM_SAIN_NAVMESH_SAMPLE_PROLOGUE),
+    owners = int32(AOWL_SYM_SAIN_NAVMESH_SAMPLE_OWNERS))
+
+  # `UnityEngine.Physics::Raycast(Vector3, Vector3, float)` is NOT in the
+  # generated table and cannot be, which is a real gap in the tool rather than
+  # a thing to route around silently. `abi/aowlspt_symbols.txt` names an
+  # overload as `Type::Method/arity`, and this build has THREE arity-3
+  # `Raycast` overloads:
+  #   (Vector3,Vector3,float)      0x5328830   <- the one wanted
+  #   (Vector3,Vector3,RaycastHit) 0x5328C30
+  #   (Ray,float,int)              0x5328DD0
+  # so `UnityEngine.Physics::Raycast/3` is REJECTED as ambiguous. That
+  # rejection is correct -- picking one silently would be the bug -- but the
+  # manifest has no way to disambiguate BY PARAMETER TYPE, so the only route
+  # left is the one `callrva` documents for exactly this case: declare the RVA
+  # and paste the prologue from
+  #   python tools\il2cpp_resolve.py <gameasm> <metadec> bytes 0x5328830 16
+  # which printed, on 2026-08-26, precisely the sixteen bytes below. The
+  # rejected symbol is LEFT in the manifest, unreferenced, so the gap is
+  # documented where the next person will look.
+  gRaycast = rvaTarget(
+    "UnityEngine.Physics::Raycast(Vector3 origin, Vector3 direction, float maxDistance) -> bool",
+    0x5328830'u32,
+    "48 89 5C 24 08 57 48 83 EC 70 80 3D 51 D9 DA 01",
+    owners = 1'i32)
 
 # ---------------------------------------------------------------------------
 # Verification, once
@@ -219,12 +244,37 @@ proc noteOutcome(label: string; o: CallOutcome; ok: var bool) =
     warn "sain drive: " & label & " REFUSED -- " & o.why
     gS.why = gS.why & label & ": " & o.why & "; "
 
+# WHICH THREAD. Two different answers, and conflating them is how this mod died
+# before.
+#
+#   VERIFICATION (`verifyAll`) reads code pages and compares bytes. It calls
+#   nothing, patches nothing and touches no il2cpp export, so it is safe from
+#   any thread and is run from the ordinary arming path.
+#
+#   EVERY CALL below it must run on UNITY's thread, reached through the host's
+#   main-thread drain. `every()` is a deadline timer on a WORKER thread, so
+#   merely gating on a flag is not enough -- the work has to be HANDED to
+#   `onMainThread`, and `call("aowlspt.host::main_thread")` has to report
+#   `bound`, which means the drain has actually FIRED rather than merely been
+#   installed. `client/mainthread.nim` asks that question and `driver.nim` is
+#   the only caller of both `runSample` and `applyTo`; both go through
+#   `onMainThread`.
+#
+#   And never `whenReady("EFT.GameWorld")` as the gate (fact #141): it tests
+#   type RESOLVABILITY, not whether a world exists, so it is a check that
+#   cannot fail. The world is borrowed from the host's `aowl_host_gameworld` /
+#   `_armed` exports instead. Fact #143 is the companion warning: this mod once
+#   died at the instant such a gate OPENED, so surviving the gate is not the
+#   same as surviving the first call -- which is why every entry point here
+#   reports `coFaulted` separately and the file self-disables at a budget.
+
 proc verifyAll*() =
   ## Byte-verify every target against the startup prologue snapshot. Reads code
   ## pages only; patches nothing; safe at bind time. Idempotent.
   if gS.tried: return
   gS.tried = true
   gS.why = ""
+  installTargets()
   noteOutcome("BotMover::Sprint", verify(gMoverSprint), gS.sprintOk)
   noteOutcome("BotMover::Stop", verify(gMoverStop), gS.stopOk)
   noteOutcome("BotSteering::LookToPoint", verify(gSteeringLookTo), gS.lookOk)

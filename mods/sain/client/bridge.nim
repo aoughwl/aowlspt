@@ -174,11 +174,23 @@ proc probe*(): Capability =
   crumb("step 3/7: bindAll -- resolving this mod's whole method table")
   bindAll()
   crumb("step 3/7 returned")
-  # The cover sensor, resolved on the same first tick every other binding is.
-  # It is two Unity statics rather than an EFT member, and it refuses the same
-  # way: by name, with the signature the runtime reported. See
-  # `client/coverprobe.nim` for why a matching arity is not enough.
-  crumb("step 4/7: bindProbe -- the two Unity statics the cover sampler needs")
+  # The cover sensor. This step USED to resolve two Unity statics by name and
+  # was measured as the last line the mod ever logged before the client died
+  # (fact #144 -- and that fact should be read knowing the host log loses about
+  # six statements of tail on a hard death, so it names the last line LOGGED,
+  # not necessarily the last EXECUTED).
+  #
+  # It no longer resolves anything. `bindProbe` now only BYTE-VERIFIES two
+  # offline-resolved RVAs against the startup prologue snapshot: it reads code
+  # pages, patches nothing, calls nothing into game code, and touches no export.
+  # That is why it is still safe on this thread, whichever thread this is.
+  #
+  # The CALLS are a separate question and are answered elsewhere: `runSample`
+  # is reached only from `onMainThread(coverJob)` (driver.nim) and `applyTo`
+  # only from `onMainThread(driveJob)` or the explicitly-flagged host-thread
+  # fallback. Verification here, execution on Unity's thread there.
+  crumb("step 4/7: bindProbe -- byte-verifying the cover sensor RVAs (no " &
+        "name resolved, no game code called)")
   bindProbe()
   crumb("step 4/7 returned")
   # STEP 5 NO LONGER CALLS ANYTHING. It used to call
