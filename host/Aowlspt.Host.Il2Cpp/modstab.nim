@@ -1899,13 +1899,49 @@ proc modsPanelSanity() =
 ## reads on the menu.
 const VerBrandOurVersion = "1.0"
 const VerBrandMaxApplies = 8
+## THE STEADY-STATE cadence, once the label is ours: a cheap re-check for a
+## clobber, not a search.
 const VerBrandEveryFrames = 120
+## THE HUNTING cadence, while the label has not been reached yet. This is the
+## whole reason the brand used to appear late: the throttle was 120 frames for
+## BOTH phases, and the first attempt was not made until frame 120 either. At
+## menu-load framerates 120 frames is not 2 seconds, it is however long 120
+## slow frames take -- a frame counter is not a clock, and this one was being
+## read as one.
+const VerBrandHuntFrames = 2
+## The time slice. If one resolve pass costs more than this, the hunt drops
+## back to the steady cadence and SAYS SO -- the walk allocates a name string
+## per child, and a per-frame unbounded search on this exact rider chain is a
+## measured main-thread stall (menuModeText: >=1.08 s/frame for 32 s).
+const VerBrandSliceMs = 4'u64
+## How long the hunt may go on before it gives up, in WALL CLOCK, not in
+## attempts. An attempt budget and a fast poll are incompatible: 40 attempts at
+## one every 2 frames is ~1.3 s, which is long before the menu exists. "Not
+## reachable yet" is not a failure and must not spend the fault budget.
+const VerBrandHuntMs = 300_000'u64
 const VerBrandMaxWalkFaults = 40
 
 var gVerTmp: Il2CppPtr = nil
 var gVerApplies = 0
 var gVerFrames = 0
 var gVerSaid = false
+## TIMESTAMPS, so "it is late" becomes three numbers instead of an impression.
+## All are `cNowMs()` values; `gVerT0` is the first frame the rider chain
+## dispatched us, which is itself one of the candidate causes (nothing in this
+## file can run before `EFT.UI.PreloaderUI::Update` first fires).
+var gVerT0: uint64 = 0
+var gVerTResolved: uint64 = 0
+var gVerTApplied: uint64 = 0
+## Re-applies after the first: a non-zero count here is the CLOBBER signature
+## (`LocalizedText` rewriting `m_text` under us), and it is the difference
+## between "we were late" and "we were early and overwritten".
+var gVerReapplies = 0
+## Set when a resolve pass overran the slice; the hunt then runs at the steady
+## cadence instead. One-shot log.
+var gVerSlow = false
+## Passes where the walk legitimately could not reach the label. NOT faults.
+var gVerNotReady = 0
+var gVerGaveUp = false
 ## Faults during the WALK are counted separately from successful applies. They
 ## are not the same event and must not share a budget: an earlier version spent
 ## all eight APPLY attempts on walk faults between 20s and 29s -- before the
@@ -2018,16 +2054,31 @@ proc verBrandTickBody() =
   ## label. A throttle belongs on ONE side of a split, and it belongs on the
   ## side that decides whether to enter the guard.
   if gVerTmp == nil or not duOk(gVerTmp, 0xE8'i32):
+    let t0 = cNowMs()
     gVerTmp = verBrandResolve()
+    let spent = cNowMs() - t0
+    if spent > VerBrandSliceMs and not gVerSlow:
+      # THE TIME SLICE, reported rather than silently absorbed. The hunt gives
+      # up its fast cadence here; it does not give up the hunt.
+      gVerSlow = true
+      warn "version brand: one label walk cost " & $int(spent) & " ms, over " &
+           "the " & $int(VerBrandSliceMs) & " ms slice, so the fast hunt " &
+           "(every " & $VerBrandHuntFrames & " frames) has BACKED OFF to " &
+           "every " & $VerBrandEveryFrames & " frames. The brand will be " &
+           "later, and that is the deliberate trade: this rider runs on the " &
+           "Unity main thread."
     if gVerTmp == nil:
-      inc gVerWalkFaults
-      if gVerWalkFaults <= 2:
+      inc gVerNotReady
+      if gVerNotReady <= 2:
         okLog "version brand: the label is not reachable yet -- " & gVerWhy &
               ". Retrying; this is normal before the menu is up."
-      elif gVerWalkFaults == VerBrandMaxWalkFaults:
-        warn "version brand: GIVING UP after " & $gVerWalkFaults &
-             " attempts -- " & gVerWhy & ". The label is stock."
       return
+    gVerTResolved = cNowMs()
+    okLog "version brand: TIMING -- the AlphaLabel became reachable " &
+          $int(gVerTResolved - gVerT0) & " ms after the first " &
+          "PreloaderUI::Update tick, on hunt pass " & $(gVerNotReady + 1) &
+          ". Nothing this feature does can happen before that moment; it is " &
+          "the floor on how early the brand can correctly be."
   let cur = suiReadString(cReadPtrAt(gVerTmp, 0xE0'i32))
   if cur.len == 0:
     # THE ASSERTION. An empty label is the FINGERPRINT OF THE WRONG OBJECT --
@@ -2051,8 +2102,27 @@ proc verBrandTickBody() =
   let want = verBrandCompose(gVerStock)
   if swRelabelControl(cast[Il2CppPtr](0), gVerTmp, want):
     inc gVerApplies
-    if not gVerSaid:
+    if gVerSaid:
+      # A SECOND APPLY MEANS SOMETHING ELSE WROTE THE LABEL. Reaching this
+      # branch is the clobber (fact: `LocalizedText` re-applies over raw
+      # stores), and it is reported because "applied at T" plus "clobbered at
+      # T+n" is a different bug from "applied late".
+      inc gVerReapplies
+      if gVerReapplies <= 3:
+        warn "version brand: the label was CLOBBERED back to the game's own " &
+             "text and has been re-applied (" & $gVerReapplies & " of at " &
+             "most " & $(VerBrandMaxApplies - 1) & "), " &
+             $int(cNowMs() - gVerTApplied) & " ms after the first apply. If " &
+             "this repeats, the brand is not late -- it is being overwritten."
+    else:
       gVerSaid = true
+      gVerTApplied = cNowMs()
+      okLog "version brand: TIMING -- applied " &
+            $int(gVerTApplied - gVerT0) & " ms after the first " &
+            "PreloaderUI::Update tick, and " &
+            $int(gVerTApplied - gVerTResolved) & " ms after the label " &
+            "became reachable. The second number is this feature's own " &
+            "latency; the first is dominated by the client."
       okLog "version brand: the bottom label now reads \"" & want &
             "\" -- written through LocalizedText::SetLabelText / " &
             "TMP_Text::set_text on AlphaLabel (fact #12), NOT the $verlabel " &
@@ -2820,15 +2890,45 @@ proc verBrandTick() =
   ## Throttled entry for the version brand. The throttle lives HERE and nowhere
   ## else -- see `verBrandTickBody`.
   if not gVerOn or gVerApplies >= VerBrandMaxApplies or
-     gVerWalkFaults >= VerBrandMaxWalkFaults:
+     gVerWalkFaults >= VerBrandMaxWalkFaults or gVerGaveUp:
     return
+  if gVerT0 == 0:
+    # THE FIRST FRAME THE RIDER CHAIN GAVE US. Recorded, and logged, because
+    # every other timestamp is relative to it and because this moment is
+    # itself a candidate cause: nothing here can run before
+    # `EFT.UI.PreloaderUI::Update` first fires.
+    gVerT0 = cNowMs()
+    okLog "version brand: TIMING -- first tick; the rider chain on " &
+          "EFT.UI.PreloaderUI::Update has started dispatching. The label " &
+          "hunt begins on THIS frame, not 120 frames from now."
+  # ADAPTIVE, and every branch is bounded:
+  #   * not resolved yet -> every `VerBrandHuntFrames` frames, the closing of
+  #     the "stock version string visible for seconds" window;
+  #   * resolved         -> every `VerBrandEveryFrames` frames, a clobber
+  #     re-check that is one guarded pointer check and one string read;
+  #   * pass overran the slice -> the steady cadence, and it said so.
+  let hunting = (gVerTmp == nil) and not gVerSlow
+  let every = (if hunting: VerBrandHuntFrames else: VerBrandEveryFrames)
   inc gVerFrames
-  if gVerFrames < VerBrandEveryFrames:
+  if gVerFrames < every:
     return
   gVerFrames = 0
+  if gVerTmp == nil and gVerT0 != 0 and cNowMs() - gVerT0 > VerBrandHuntMs:
+    # THE GIVE-UP, in wall clock. It says how long it hunted and why it
+    # stopped, so "the label is stock" is never a silent outcome.
+    gVerGaveUp = true
+    warn "version brand: GIVING UP after " & $int(VerBrandHuntMs div 1000) &
+         " s and " & $gVerNotReady & " walk attempts -- " & gVerWhy &
+         ". The label is left stock. This is a REFUSAL, not a success."
+    return
   gModsBranch = 2
   if cModsGuarded(cast[Il2CppPtr](0)) == nil:
     inc gVerWalkFaults
+    # A REAL FAULT ENDS THE FAST HUNT. Otherwise a walk that faults every pass
+    # would spend the whole 40-fault budget in ~80 frames -- the same
+    # "gave up before its target existed" failure the budget split was made to
+    # prevent, just moved.
+    gVerSlow = true
     # NAME THE HOP. A caught fault with no location is precisely what costs
     # cycles here, and the breadcrumb is already being written for us.
     if gVerWalkFaults <= 3:
