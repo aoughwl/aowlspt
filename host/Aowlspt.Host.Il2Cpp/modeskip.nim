@@ -29,11 +29,41 @@
 # Neither detour ever suppresses its original. The screen is allowed to build
 # itself completely; it is then dismissed from a LATER frame.
 #
-# WHY THE SUBMIT IS DEFERRED
-# --------------------------
+# WHY THE SUBMIT IS DEFERRED -- AND WHY TWO FRAMES WAS NOT ENOUGH
+# ---------------------------------------------------------------
 # Calling `Submit` from inside `ShowSlot` would re-enter the selection screen's
 # own code from the middle of one of its own calls, while it is still building
-# the very slot it is being told to accept. So the capture only RECORDS a wish,
+# the very slot it is being told to accept.
+#
+# Deferring by TWO DRAIN TICKS was not enough either, and shipping that was a
+# real regression: the player got a blank Escape From Tarkov background with no
+# menu at all. MEASURED, from the client's own
+# `...output_000.log` and from the live inspector:
+#
+#   * host log: ShowSlot first fired at 0:00:25.703, Submit at 0:00:25.719 --
+#     SIXTEEN MILLISECONDS later.
+#   * client log, 372 ms after that: `NullReferenceException` in
+#     `EFT.UI.CharacterSelectionSeasonPanel.ShowPerks`, thrown under
+#     `RunInitialLobbyFlow -> RunCharacterSelectionFlow ->
+#      ShowCharacterSelectionScreen -> ShowScreenAsync -> DisplayScreen ->
+#      CharacterSelectionScreen.Show -> ShowSlot`. The client shows this screen
+#     a SECOND time from its own async startup flow, and we had already
+#     answered and torn down the first one.
+#   * that exception aborts the whole `RunInitialLobbyFlow` task (it surfaces as
+#     an `AggregateException` at `TasksExtensions:HandleFinishedTask`), so
+#     nothing ever activates the main menu.
+#   * live inspector, six minutes into that run: `MenuScreen` (parent
+#     `Common UI`) `activeInHierarchy = 0`; `CharacterSelectionScreen` under
+#     `Login UI` = 0; `CharacterSelectionScreen` under `UI` = 0. Everything
+#     built, nothing shown.
+#
+# The gate is therefore no longer a frame count. It is WALL-CLOCK QUIET on an
+# OBSERVABLE EVENT: `Submit` is sent only once `ShowSlot` has not fired for
+# `ModeSkipQuietMs`, and every ShowSlot -- including the late one -- restarts
+# that clock. If quiet never arrives inside `ModeSkipMaxWaitMs` the feature
+# DECLINES and presses nothing, leaving the stock screen usable.
+#
+# So the capture only RECORDS a wish,
 # and the call happens from the `EFT.TarkovApplication::Update` drain -- the
 # host's validated main-thread bridge (RVA 0x977B10), which ticks for the whole
 # session, menu and raid alike -- on a strictly LATER tick than the capture.
@@ -96,11 +126,42 @@ const
     ## After this many guarded bodies have faulted the feature switches itself
     ## off for the session. Three, not one: a single fault during a scene change
     ## is worth surviving, a pattern of them is not.
-  ModeSkipDeferTicks = 2
-    ## How many `TarkovApplication::Update` ticks must pass between the capture
-    ## and the `Submit`. Two, not one, so that the frame `ShowSlot` ran in has
-    ## definitively completed -- the drain rides a DIFFERENT function, and
-    ## whether it has already ticked this frame is not knowable from here.
+  ModeSkipQuietMs = 3000'u64
+    ## WALL-CLOCK milliseconds of `ShowSlot` SILENCE that must pass after the
+    ## last slot was shown before `Submit` is called.
+    ##
+    ## THIS NUMBER IS WHY THE FEATURE BROKE, AND WHAT FIXES IT. Measured from
+    ## `D:\Aowlspt\Logs\log_2026.08.26_13-33-04...\...output_000.log`: the
+    ## client's OWN startup flow calls `CharacterSelectionScreen.Show` a SECOND
+    ## time, from
+    ##   RunInitialLobbyFlow -> RunCharacterSelectionFlow
+    ##     -> ShowCharacterSelectionScreen -> ScreenController.ShowScreenAsync
+    ##     -> DisplayScreen -> Show -> ShowSlot
+    ## **372 ms** after the first slots appeared. The old rule waited TWO drain
+    ## ticks (~16 ms), so `Submit` landed in the middle of that async flow; the
+    ## late `Show` then ran against a controller we had already answered and
+    ## `EFT.UI.CharacterSelectionSeasonPanel.ShowPerks` threw
+    ## `NullReferenceException`, which aborted the whole `RunInitialLobbyFlow`
+    ## task. The selection screen went away and `MenuScreen` was never
+    ## activated -- MEASURED through the live inspector: `MenuScreen` (parent
+    ## `Common UI`) `activeInHierarchy = 0`, and both `CharacterSelectionScreen`
+    ## copies (parents `Login UI` and `UI`) `activeInHierarchy = 0`. A blank
+    ## background with nothing on it.
+    ##
+    ## So the gate is no longer a TICK COUNT. A tick count is a guess whose
+    ## meaning changes with the frame rate (this client runs the lobby at 120
+    ## and the raid at 240 fps, both configurable), and it rots. This is
+    ## wall-clock, and it is anchored to an OBSERVABLE EVENT -- the last
+    ## `ShowSlot` -- rather than to the moment we happened to notice a match.
+    ## 3000 ms is ~8x the measured 372 ms gap, and is roughly the hesitation a
+    ## human's click already gave the flow for free.
+  ModeSkipMaxWaitMs = 30000'u64
+    ## Hard upper bound on that wait. If `ShowSlot` never goes quiet for
+    ## `ModeSkipQuietMs` within this long, the feature DECLINES: it never
+    ## presses anything, so the stock selection screen is left exactly as the
+    ## client built it and the player can use it. A visible screen the player
+    ## can click is strictly better than a blank background, which is the
+    ## outcome this whole change exists to prevent.
   ModeSkipStarveTicks = 3600
     ## Roughly a minute of drain ticks. If the feature is armed and the screen
     ## has never been seen, it says so once rather than being a silent no-op.
@@ -116,8 +177,12 @@ var gModeSkipController: Il2CppPtr = nil
 var gModeSkipPendingPd: Il2CppPtr = nil
 var gModeSkipPendingMode: uint64 = 0
 var gModeSkipPending = false
-var gModeSkipArmedAtTick = 0
+var gModeSkipArmedAtMs: uint64 = 0     ## when the matching slot was seen
+var gModeSkipLastSlotMs: uint64 = 0    ## when ANY slot was last shown
 var gModeSkipTicks = 0
+var gModeSkipSubmittedAtMs: uint64 = 0
+var gModeSkipDeclined = false
+var gModeSkipLateShow = false
 var gModeSkipSubmittedFor: Il2CppPtr = nil   ## once per controller instance
 var gModeSkipSubmits = 0
 var gModeSkipSlotsSeen = 0
@@ -223,10 +288,14 @@ proc modeSkipSlotBody(a: Il2CppPtr): Il2CppPtr {.
   gModeSkipPendingPd = pd
   gModeSkipPendingMode = gModeSkipSlotMode
   gModeSkipPending = true
-  gModeSkipArmedAtTick = gModeSkipTicks
+  gModeSkipArmedAtMs = cNowMs()
   okLog "skip mode screen: slot for profile " & idStr & " (\"" & nickStr &
         "\", gameMode=" & $gModeSkipSlotMode & ") matches launchProfileId; " &
-        "queued Submit for a later TarkovApplication.Update tick"
+        "Submit is QUEUED, not sent -- it waits for " & $int(ModeSkipQuietMs) &
+        "ms with no further ShowSlot, because the client's own " &
+        "RunCharacterSelectionFlow shows this screen AGAIN ~372ms later and " &
+        "answering before that lands throws inside CharacterSelectionSeason" &
+        "Panel.ShowPerks and strands the player on a blank background"
 
 proc modeSkipCtorFired(regs: Il2CppPtr) =
   ## POSTFIX on `CharacterSelectionScreenController::.ctor`. Captures `this`.
@@ -247,6 +316,12 @@ proc modeSkipCtorFired(regs: Il2CppPtr) =
   gModeSkipPending = false
   gModeSkipPendingPd = nil
   gModeSkipSlotsSeen = 0
+  # A NEW controller means a NEW screen, so the previous screen's Submit must
+  # not be mistaken for this one's -- otherwise the very first slot of a second
+  # visit reads as a "late show AFTER Submit" and the feature would disable
+  # itself on a false positive.
+  gModeSkipSubmittedAtMs = 0'u64
+  gModeSkipLateShow = false
   if not gModeSkipCtorLogged:
     gModeSkipCtorLogged = true
     let tid = int(cThreadId())
@@ -263,6 +338,29 @@ proc modeSkipShowSlotFired(regs: Il2CppPtr) =
   ## The fourth argument, `controller`, is on the STACK and is therefore NOT
   ## reachable here -- which is why it is captured from the .ctor instead.
   if gModeSkipOff or not gModeSkipOn:
+    return
+  # STAMPED FIRST, AND UNCONDITIONALLY. This timestamp is the readiness signal
+  # the deferred Submit waits on, so it must be refreshed by EVERY slot the
+  # client shows -- including slots shown by the LATE second Show that
+  # RunCharacterSelectionFlow performs, and including slots shown after a match
+  # has already been queued. The old code returned early once a slot matched,
+  # which is precisely how the late Show became invisible to this feature.
+  gModeSkipLastSlotMs = cNowMs()
+  if gModeSkipSubmittedAtMs != 0'u64 and not gModeSkipLateShow:
+    # A slot AFTER our Submit. The screen is being re-shown by the client's own
+    # flow, which is the exact condition that used to abort RunInitialLobbyFlow.
+    # It is reported rather than swallowed: a silent decline is this host's
+    # recurring failure mode.
+    gModeSkipLateShow = true
+    warn "skip mode screen: CharacterSelectionScreen.ShowSlot fired AGAIN " &
+         $int(cNowMs() - gModeSkipSubmittedAtMs) & "ms AFTER Submit was " &
+         "called. That means the client re-showed the selection screen after " &
+         "it had been answered -- the condition that throws inside " &
+         "CharacterSelectionSeasonPanel.ShowPerks and leaves the player on a " &
+         "blank background. The quiet window (" & $int(ModeSkipQuietMs) &
+         "ms) was NOT long enough on this run. Switching this feature off for " &
+         "the session so it cannot do it twice."
+    gModeSkipOff = true
     return
   if gModeSkipPending:
     return                                   # a slot already matched
@@ -303,6 +401,7 @@ proc modeSkipSubmitBody(a: Il2CppPtr): Il2CppPtr {.
     return
   cMskCallSubmit(fn, gModeSkipController, gModeSkipPendingMode,
                  gModeSkipPendingPd)
+  gModeSkipSubmittedAtMs = cNowMs()
   inc gModeSkipSubmits
 
 proc modeSkipDrainTick() =
@@ -326,8 +425,30 @@ proc modeSkipDrainTick() =
            "bind line above)."
     return
 
-  if gModeSkipTicks - gModeSkipArmedAtTick < ModeSkipDeferTicks:
-    return                                   # not a later frame yet
+  # ---- THE READINESS GATE -------------------------------------------------
+  #
+  # Not "N frames have passed" (a guess that rots with the frame rate) but "the
+  # client has stopped showing slots for a while". The wait is anchored to an
+  # OBSERVABLE EVENT -- the last ShowSlot -- and it is a NEGATIVE, which is the
+  # only kind of check that can fail: if the client shows one more slot the
+  # clock restarts and we do not press.
+  let now = cNowMs()
+  if now - gModeSkipLastSlotMs < ModeSkipQuietMs:
+    # If the wait has run past its hard bound, DECLINE. Never press anyway.
+    if now - gModeSkipArmedAtMs > ModeSkipMaxWaitMs and not gModeSkipDeclined:
+      gModeSkipDeclined = true
+      gModeSkipPending = false
+      gModeSkipOff = true
+      warn "skip mode screen: DECLINING. A slot matched launchProfileId " &
+           $int(now - gModeSkipArmedAtMs) & "ms ago but " &
+           "CharacterSelectionScreen.ShowSlot has never been quiet for " &
+           $int(ModeSkipQuietMs) & "ms, so this host cannot tell that the " &
+           "client's own character-selection flow has finished. NOTHING WAS " &
+           "PRESSED: the stock selection screen is exactly as the client " &
+           "built it and the player can use it. That is deliberate -- a " &
+           "screen the player can click is better than the blank background " &
+           "an early Submit produces."
+    return
   if gModeSkipController == nil:
     warn "skip mode screen: a slot matched launchProfileId but the " &
          "controller was never captured, so there is nothing to Submit to. " &
@@ -352,9 +473,15 @@ proc modeSkipDrainTick() =
            "session. The selection screen is left for the player to use."
     return
   okLog "skip mode screen: Submit called for profile " & gModeSkipWantId &
-        " (gameMode=" & $gModeSkipPendingMode & "); the character/mode " &
-        "selection screen has been answered without a human. Submits this " &
-        "session: " & $gModeSkipSubmits
+        " (gameMode=" & $gModeSkipPendingMode & ") after " &
+        $int(cNowMs() - gModeSkipArmedAtMs) & "ms of waiting, the last " &
+        $int(ModeSkipQuietMs) & "ms of it with no further ShowSlot. The " &
+        "character/mode selection screen has been answered without a human. " &
+        "Submits this session: " & $gModeSkipSubmits & ". THIS IS NOT PROOF " &
+        "THE MENU APPEARED -- assert that separately: MenuScreen (parent " &
+        "\"Common UI\") must be activeInHierarchy, and BOTH " &
+        "CharacterSelectionScreen copies (parents \"Login UI\" and \"UI\") " &
+        "must not be."
 
 # ---------------------------------------------------------------------------
 # BINDING
@@ -431,7 +558,9 @@ proc bindModeSkip(verbose: bool): bool =
         $gModeSkipCtorSlot & ") and CharacterSelectionScreen::ShowSlot (slot " &
         $gModeSkipShowSlot & "); the slot whose ProfileId is " &
         gModeSkipWantId & " will be Submitted from the " &
-        "TarkovApplication::Update drain " & $ModeSkipDeferTicks &
-        " ticks later. The screen is built and briefly visible; it is " &
-        "dismissed, not prevented."
+        "TarkovApplication::Update drain once ShowSlot has been quiet for " &
+        $int(ModeSkipQuietMs) & "ms (hard bound " & $int(ModeSkipMaxWaitMs) &
+        "ms, after which it DECLINES and leaves the stock screen). The " &
+        "screen is built and visible for that whole wait; it is dismissed, " &
+        "not prevented."
   return true

@@ -101,9 +101,22 @@
  * The Nim caller (`modeskip.nim`) is flag-gated `uxSkipModeScreen`, default OFF,
  * runs its whole body under ONE `aowl_p_p_seh` (never nested), guards every
  * pointer hop, caps iteration, self-disables after a few faults, and calls
- * Submit from the TarkovApplication::Update drain on a LATER frame -- never
- * inline inside ShowSlot, which would re-enter the screen's own code from
- * inside its own call.
+ * Submit from the TarkovApplication::Update drain -- never inline inside
+ * ShowSlot, which would re-enter the screen's own code from inside its own
+ * call.
+ *
+ * HOW LONG IT DEFERS, AND WHY THAT IS NOT A FRAME COUNT.
+ * Deferring two drain ticks (~16ms) was measured to BREAK THE CLIENT: the
+ * player was left on a blank background with no menu. `TarkovApplication`
+ * shows this screen a SECOND time from its own async
+ * `RunInitialLobbyFlow -> RunCharacterSelectionFlow ->
+ *  ShowCharacterSelectionScreen -> ShowScreenAsync -> DisplayScreen -> Show`,
+ * 372ms after the first slots appear. Answering before that lands makes the
+ * late `Show` throw `NullReferenceException` inside
+ * `EFT.UI.CharacterSelectionSeasonPanel.ShowPerks`, which aborts the whole
+ * lobby-flow task, so `MenuScreen` is never activated. `modeskip.nim` now
+ * waits for WALL-CLOCK QUIET on `ShowSlot` instead, and declines outright
+ * rather than pressing if quiet never arrives.
  */
 #ifndef AOWLSPT_MODESKIP_H
 #define AOWLSPT_MODESKIP_H
