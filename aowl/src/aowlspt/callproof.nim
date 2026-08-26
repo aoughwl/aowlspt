@@ -85,29 +85,53 @@ import aowlspt/callrva
 # was typed from memory and nothing was inferred from a method NAME.
 # ---------------------------------------------------------------------------
 
-var gDot = rvaTarget(
-  "UnityEngine.Vector3::Dot(Vector3,Vector3) -> float",
-  0x5297BF0'u32,
-  # 66 90 | movss xmm0,[rcx+4] | mulss xmm0,[rdx+4] | movss xmm1,[rcx] | mulss xmm1,[rdx]
-  "66 90 F3 0F 10 41 04 F3 0F 59 42 04 F3 0F 10 09",
-  owners = 1)
+## DECLARED BARE AND ASSIGNED IN A PROC -- NOT `var g = rvaTarget(...)`.
+##
+## This is the defect the first live run found. In a nimony `--app:lib` build a
+## global initialised by a CALL is silently left zeroed, which `aowlspt/fast`
+## documents as its first non-negotiable rule and which this file broke anyway.
+## The live client reported
+##
+##     INCONCLUSIVE verifier -- ... @0x0: no prologue was declared
+##
+## and that message was TRUE and was not the cause: the whole object was zero,
+## including the name, which is why the line began with a blank. `looksZeroed`
+## in `aowlspt/callrva` now names this trap outright, and `describe` prints the
+## module base beside the resolved address so a zero on one side can never be
+## read as a zero on the other.
+var gDot: RvaTarget
+var gCross: RvaTarget
+var gWrongSig: RvaTarget
+var gTargetsReady = false
 
-var gCross = rvaTarget(
-  "UnityEngine.Vector3::Cross(Vector3,Vector3) -> Vector3",
-  0x5297A60'u32,
-  # movss xmm3,[rdx+4] | movss xmm0,[rdx+8] | mulss xmm0,[r8+4] | mulss xmm3,[r8+8]
-  "F3 0F 10 5A 04 F3 0F 10 42 08 F3 41 0F 59 40 04",
-  owners = 1)
+proc initTargets() =
+  ## Assign the targets. Called from the run, never at module scope.
+  if gTargetsReady: return
+  gTargetsReady = true
 
-## The same RVA with ONE byte of the declared prologue flipped. This exists so
-## that "the verify passed" is a claim that can be falsified: if this one ALSO
-## verifies, the verifier is not comparing anything and every other PASS in this
-## file is worthless.
-var gWrongSig = rvaTarget(
-  "UnityEngine.Vector3::Dot [DELIBERATELY WRONG PROLOGUE]",
-  0x5297BF0'u32,
-  "67 90 F3 0F 10 41 04 F3 0F 59 42 04 F3 0F 10 09",
-  owners = 1)
+  gDot = rvaTarget(
+    "UnityEngine.Vector3::Dot(Vector3,Vector3) -> float",
+    0x5297BF0'u32,
+    # 66 90 | movss xmm0,[rcx+4] | mulss xmm0,[rdx+4] | movss xmm1,[rcx]
+    "66 90 F3 0F 10 41 04 F3 0F 59 42 04 F3 0F 10 09",
+    owners = 1)
+
+  gCross = rvaTarget(
+    "UnityEngine.Vector3::Cross(Vector3,Vector3) -> Vector3",
+    0x5297A60'u32,
+    # movss xmm3,[rdx+4] | movss xmm0,[rdx+8] | mulss xmm0,[r8+4]
+    "F3 0F 10 5A 04 F3 0F 10 42 08 F3 41 0F 59 40 04",
+    owners = 1)
+
+  # The same RVA with ONE byte of the declared prologue flipped. This exists so
+  # that "the verify passed" is a claim that can be falsified: if this one ALSO
+  # verifies, the verifier is not comparing anything and every other PASS in
+  # this file is worthless.
+  gWrongSig = rvaTarget(
+    "UnityEngine.Vector3::Dot [DELIBERATELY WRONG PROLOGUE]",
+    0x5297BF0'u32,
+    "67 90 F3 0F 10 41 04 F3 0F 59 42 04 F3 0F 10 09",
+    owners = 1)
 
 type
   ProofOutcome* = enum
@@ -126,6 +150,9 @@ type
     fails*: int32
     inconclusive*: int32
     verdict*: string
+    wiring*: string
+      ## The resolved address, the module base and the declared prologue
+      ## length, printed every run so a zero can never be ambiguous again.
 
 proc note(r: var ProofReport; name: string; o: ProofOutcome; detail: string) =
   r.lines.add ProofLine(name: name, outcome: o, detail: detail)
@@ -322,11 +349,18 @@ proc runCallProof*(includeRival: bool = true): ProofReport =
   ## rather than repeating game calls -- nothing here is a per-frame path and
   ## nothing about it needs to be.
   result = ProofReport(lines: @[], passes: 0'i32, fails: 0'i32,
-                       inconclusive: 0'i32, verdict: "")
+                       inconclusive: 0'i32, verdict: "", wiring: "")
   if gRan or gDisabled:
     result.verdict = "call-proof: already run this session; not repeating"
     return
   gRan = true
+  initTargets()
+
+  # State the wiring BEFORE anything is attempted. The first live run reported
+  # "@0x0" and it took a whole client start to learn whether that meant a
+  # zeroed target, an unloaded module, or a bad address. This line answers all
+  # three, every run, pass or fail.
+  result.wiring = "call-proof: wiring " & describe(gDot)
 
   let faultsBefore = faultCount()
 
@@ -378,6 +412,8 @@ proc formatCallProof*(r: ProofReport): seq[string] =
   ## line carries its own outcome word so `hostlog.py grep call-proof` shows the
   ## whole result and not just the happy summary.
   result = @[]
+  if r.wiring.len > 0:
+    result.add r.wiring
   var i = 0
   while i < r.lines.len and i < 32:
     let l = r.lines[i]
