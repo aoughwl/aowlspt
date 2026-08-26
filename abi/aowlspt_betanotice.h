@@ -119,7 +119,8 @@ static const char AOWL_BETA_LINE2[] = "aoughwl.com  -  F12 for mod settings";
 
 /* ---- state -------------------------------------------------------- */
 typedef struct AowlBetaState {
-    int32_t handle;        /* region participant handle, or <0            */
+    int32_t handle;        /* DRAW participant handle, or <0              */
+    int32_t tickHandle;    /* TICK participant handle (resolution), or <0  */
     int32_t inMenu;        /* 1 while the host says we are NOT in a raid  */
     int32_t scrW, scrH;    /* last good back-buffer size, 0 = unknown     */
     int32_t resAge;        /* frames since the last successful re-read    */
@@ -131,7 +132,14 @@ typedef struct AowlBetaState {
     int64_t draws;
 } AowlBetaState;
 
-static AowlBetaState g_beta = { -1, 1, 0, 0, 0, 0, 0, 0, -1, -1, 0.5f, 0.11f, 0 };
+/* handle, tickHandle, inMenu, scrW, scrH, resAge, resFail, saidNoRes,
+ * saidDrawn, wIdx, hIdx, fracX, fracY, draws.
+ * BOTH handles start at -1. Adding `tickHandle` shifted every positional
+ * value in this initialiser by one, which would have silently set
+ * tickHandle = 1 (a valid-looking participant handle) and inMenu = 0 --
+ * a feature that unregisters someone else's participant and never draws. */
+static AowlBetaState g_beta = { -1, -1, 1, 0, 0, 0, 0, 0, 0, -1, -1,
+                                0.5f, 0.11f, 0 };
 
 /* The host installs this so refusals reach `aowlspt-host.log` through the same
  * sink the region uses. NULL is legal and means silence. */
@@ -201,13 +209,36 @@ static int32_t aowl_beta_resolution(void) {
  * one `aowl_p_p_seh`. It opens no guard, allocates nothing, dereferences no
  * game pointer, and loops over nothing.
  * ------------------------------------------------------------------- */
+static void aowl_beta_tick(void* user, int64_t frame) {
+    /* THE RESOLUTION RE-READ LIVES HERE, NOT IN THE DRAW.
+     *
+     * MEASURED on the live client: registered DRAW-only, this participant was
+     * reported by the region as `OVERRAN its frame budget: 142 us against
+     * 120 us` and again at 147 us, roughly 120 frames apart. The draw itself
+     * is four fixed submissions and some arithmetic -- it cannot cost that.
+     * The spike is exactly this function on its re-read frame: two prologue
+     * byte-compares plus two managed calls into `Screen::get_width/height`.
+     *
+     * Raising the draw budget would have silenced a TRUE signal -- the
+     * comment on `budgetUs` says "anything near this is a bug", and it was
+     * right. Splitting is the honest fix: DRAW stays pure submission and
+     * keeps its tight budget, and the periodic managed call moves to TICK
+     * with a budget sized for what it actually does. Amortised the re-read
+     * was always cheap (~140 us every 120 frames is ~1.2 us/frame); the
+     * problem was never the cost, it was charging it to the wrong meter. */
+    (void)user; (void)frame;
+    if (!g_beta.inMenu) return;
+    (void)aowl_beta_resolution();
+}
+
 static void aowl_beta_draw(void* user, int64_t frame) {
     float x, y, w, h, tx;
     int32_t cols;
     (void)user; (void)frame;
 
     if (!g_beta.inMenu) return;              /* raid: draw nothing at all   */
-    if (!aowl_beta_resolution()) {
+    /* Read only what TICK has already resolved -- no managed call here. */
+    if (!(g_beta.scrW > 0)) {
         if (!g_beta.saidNoRes) {
             g_beta.saidNoRes = 1;
             aowl_beta_sayf(
@@ -308,14 +339,38 @@ static int32_t aowl_beta_register(void) {
     d.fn       = aowl_beta_draw;
     d.user     = 0;
     g_beta.handle = aowl_region_register(&d);
+    if (g_beta.handle < 0) return g_beta.handle;
+
+    /* The periodic resolution re-read, on its own meter. See aowl_beta_tick:
+     * folded into DRAW it overran a correct 120 us budget at 142/147 us on
+     * the frame it re-read, once every ~120 frames. */
+    memset(&d, 0, sizeof(d));
+    d.size = (int32_t)sizeof(d);
+    strncpy(d.name, "beta-notice-res", AOWL_REGION_NAME_LEN - 1);
+    d.mask     = AOWL_REGION_TICK;
+    d.order    = 899;   /* before the draw, so the draw sees this frame's size */
+    d.budgetUs = 400;   /* two prologue verifies + two managed calls, periodic */
+    d.fn       = aowl_beta_tick;
+    d.user     = 0;
+    g_beta.tickHandle = aowl_region_register(&d);
+    /* The DRAW half is what the feature IS. If only the periodic re-read
+     * failed to register we still draw, using whatever resolution the first
+     * read got -- and the region names the missing participant itself. */
     return g_beta.handle;
 }
 
 static int32_t aowl_beta_unregister(void) {
     int32_t h = g_beta.handle;
-    if (h < 0) return 0;
+    int32_t t = g_beta.tickHandle;
+    int32_t rc;
+    if (h < 0 && t < 0) return 0;
     g_beta.handle = -1;
-    return aowl_region_unregister(h);
+    g_beta.tickHandle = -1;
+    /* BOTH, always. Releasing only the draw half would leave the resolution
+     * tick running against a feature that is switched off. */
+    rc = (h >= 0) ? aowl_region_unregister(h) : 0;
+    if (t >= 0) { int32_t rc2 = aowl_region_unregister(t); if (!rc) rc = rc2; }
+    return rc;
 }
 
 static int32_t aowl_beta_handle(void)  { return g_beta.handle; }
