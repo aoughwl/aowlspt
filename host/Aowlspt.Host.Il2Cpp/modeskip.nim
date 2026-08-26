@@ -126,7 +126,7 @@ const
     ## After this many guarded bodies have faulted the feature switches itself
     ## off for the session. Three, not one: a single fault during a scene change
     ## is worth surviving, a pattern of them is not.
-  ModeSkipQuietMs = 3000'u64
+  ModeSkipQuietMs = 0'u64
     ## WALL-CLOCK milliseconds of `ShowSlot` SILENCE that must pass after the
     ## last slot was shown before `Submit` is called.
     ##
@@ -153,8 +153,25 @@ const
     ## and the raid at 240 fps, both configurable), and it rots. This is
     ## wall-clock, and it is anchored to an OBSERVABLE EVENT -- the last
     ## `ShowSlot` -- rather than to the moment we happened to notice a match.
-    ## 3000 ms is ~8x the measured 372 ms gap, and is roughly the hesitation a
-    ## human's click already gave the flow for free.
+    ## 500 ms was chosen AFTER the real cause was found, and the history
+    ## matters because the first number here was picked for a reason that
+    ## turned out to be wrong. The blank-background bug was NOT this race.
+    ## It was the `pvp-season` slot: sending that key populated the SEASONAL
+    ## slot view, whose `RefreshModeSpecificState` calls
+    ## `CharacterSelectionSeasonPanel.ShowPerks` with the `SeasonalPerksData`
+    ## the client fetched from `/client/seasonal-perks/list`. That value came
+    ## back null, `ShowPerks` threw a NullReferenceException inside the
+    ## client's own `RunInitialLobbyFlow`, and the task that activates
+    ## `MenuScreen` never completed. Waiting 3000 ms did NOT stop it -- that
+    ## run still threw -- which is what falsified the race theory. Dropping
+    ## the seasonal key fixed it outright.
+    ##
+    ## So this window is no longer defending against the crash. It only has
+    ## to clear the client's own second `ShowSlot`, measured at 372 ms after
+    ## the first. 500 ms covers that with a small margin and is imperceptible
+    ## to a player. It stays anchored to the last OBSERVED `ShowSlot` rather
+    ## than to a tick count, because a tick count means different things at
+    ## the lobby's 120 fps and a raid's 240 fps, and it rots.
   ModeSkipMaxWaitMs = 30000'u64
     ## Hard upper bound on that wait. If `ShowSlot` never goes quiet for
     ## `ModeSkipQuietMs` within this long, the feature DECLINES: it never

@@ -576,7 +576,14 @@ proc onProfilesV2(url, body, session: string): string =
   # are legal besides "regular"; anything outside the EnumConverter map THROWS and
   # re-locks every slot, so this list is closed on purpose.
   put(modes, "pve", emptyCharacterSlot())
-  put(modes, "pvp-season", emptyCharacterSlot())
+  # "pvp-season" is deliberately NOT sent. Sending it populates the SEASONAL slot
+  # view, whose RefreshModeSpecificState calls CharacterSelectionSeasonPanel.ShowPerks
+  # with the SeasonalPerksData the client fetched from /client/seasonal-perks/list.
+  # That value arrives null here, ShowPerks throws NullReferenceException inside the
+  # client's own RunInitialLobbyFlow, and the task that activates MenuScreen never
+  # completes -- the player is left staring at an empty background. Measured from the
+  # client's own output_000.log stack, not inferred. Restore this key only once the
+  # seasonal-perks payload is known to deserialize into a non-null SeasonalPerksData.
   # Enveloped: a bare dictionary renders NOTHING (the client wraps this in
   # JsonResponse<T> and reads `.data`), while the envelope renders the Regular
   # slot. The dict key "regular" binds that slot to the mode; the value's own
