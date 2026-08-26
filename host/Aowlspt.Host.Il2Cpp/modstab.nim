@@ -2252,7 +2252,16 @@ proc seasonsFindMenuScreen(): Il2CppPtr =
                 $roots.len & " scene root(s): " & names
 
 proc seasonsTickBody() =
-  if not gSeasonsOn or gSeasonsFaults >= SeasonsMaxFaults:
+  ## RESOLVES `gSeasonsMenu`, then hides the banner IF `uxHideSeasons` is set.
+  ##
+  ## The gate is `gSeasonsOn or gBetaNoticeOn` rather than `gSeasonsOn` alone
+  ## because the beta notice needs exactly the same MenuScreen and exactly the
+  ## same `SeasonsButton`, and the ONLY thing in this host that resolves either
+  ## is this proc. Giving the notice its own walk would be a second scene
+  ## enumeration on the Unity main thread for an object we already hold -- the
+  ## measured mistake that cost 1.08 s/frame. So this resolves, and the hide
+  ## below is what is conditional.
+  if not (gSeasonsOn or gBetaNoticeOn) or gSeasonsFaults >= SeasonsMaxFaults:
     return
   inc gSeasonsPasses
   # Revalidate the cached MenuScreen before trusting it: a menu rebuild
@@ -2273,6 +2282,17 @@ proc seasonsTickBody() =
               "looking on a " & $SeasonsEveryFrames & "-frame throttle."
       elif gSeasonsPasses >= SeasonsMaxPasses:
         gSeasonsOn = false
+        # The beta notice hangs off this same resolve, so it dies here too --
+        # loudly, in its own words, rather than ticking forever against a
+        # MenuScreen that is never coming.
+        if gBetaNoticeOn:
+          gBetaNoticeOn = false
+          warn "beta notice: GIVING UP with hide seasons after " &
+               $gSeasonsPasses & " passes -- " & gSeasonsWhy & ". No " &
+               "MenuScreen was ever reached, so the banner was never even " &
+               "looked at. NOTHING was written and NOTHING was hidden; the " &
+               "banner is exactly as the game made it, and this feature is " &
+               "OFF for the session."
         warn "hide seasons: GIVING UP after " & $gSeasonsPasses &
              " passes -- " & gSeasonsWhy & ". The KORD BREACH / Season " &
              "banner is left exactly as the game made it, and this feature " &
@@ -2281,6 +2301,13 @@ proc seasonsTickBody() =
       return
     okLog "hide seasons: found MenuScreen; looking for its 'SeasonsButton' " &
           "child on every pass from here"
+  # FROM HERE DOWN IS THE HIDE, AND ONLY THE HIDE. With `uxBetaNotice` on,
+  # `uxHideSeasons` has already been forced off in `aowlhost.nim` (they target
+  # one object from opposite directions), so this returns with `gSeasonsMenu`
+  # resolved and `betaNoticeFrom` -- called from the same branch, under the
+  # same single guard -- does the rest.
+  if not gSeasonsOn:
+    return
   # THE FAST PATH, taken every frame once the button is known: validate the
   # cached GameObject without allocating, ask `activeSelf`, and hide it the
   # frame it comes back. `modsChildNamed` compares NAMES, and reading a managed
@@ -2401,6 +2428,250 @@ proc modeButtonHideFrom(menu: Il2CppPtr) =
     warn "hide mode button: GameObject::SetActive(false) REFUSED on " &
          "ChangeGameModeButton (the target verified, the call did not run). " &
          "The button is untouched."
+
+# ---------------------------------------------------------------------------
+# THE BETA NOTICE IN THE SEASONS BANNER SLOT (`uxBetaNotice`, default OFF).
+#
+# REPURPOSE, NOT REPLACE, and the trade is worth stating plainly.
+#
+# Replacing would mean drawing our own panel. Native Unity UI construction is
+# ruled out on this project -- days were lost to it on the settings screen --
+# and the surviving alternative, a cheap overlay, lives on a DIFFERENT SURFACE:
+# it is drawn over the client rather than laid out by it, it is owned by
+# another file, and it would not sit in the banner slot the user actually
+# pointed at. Repurposing costs us BSG's prefab and BSG's child structure --
+# which is the real cost, since we do not get to choose which TextMeshProUGUI
+# is the big one -- but it buys the game's own position, font, and layout for
+# free, on an object THIS FILE ALREADY HOLDS AND REVALIDATES EVERY RUN.
+#
+# So: no scene walk, no anchor hunt, no budget. `seasonsTickBody` above has
+# already resolved `MenuScreen`; this is one `modsChildNamed` on it.
+#
+# WHAT IT DOES NOT ASSUME. It does not hardcode a path inside the banner. The
+# season prefab's internals have never been measured on this build, and fact
+# #116 was WRONG BY ONE LEVEL about a node in this exact subtree, costing four
+# implementation rounds -- so a recorded path here would be a guess wearing a
+# measurement's clothes. Instead it enumerates the banner's own descendants,
+# bounded to `BetaNoticeMaxNodes` nodes and `BetaNoticeMaxDepth` levels, and
+# keeps every TextMeshProUGUI whose `m_text` is NON-EMPTY.
+#
+# THE NON-EMPTY TEST IS THE ASSERTION, and it is the same one the version
+# brand makes: an empty `m_text` is the FINGERPRINT OF THE WRONG OBJECT (fact
+# #13 -- exactly what the old `$verlabel` target reads, and exactly why that
+# feature looked armed for months and changed nothing). A node that renders
+# nothing today will render nothing tomorrow.
+#
+# THE FAILURE MODE IS DECIDED IN ADVANCE: if that enumeration finds ZERO
+# non-empty labels, or if no setter takes, this writes NOTHING, says so once
+# in full, switches the banner OFF, and disables itself. Half a notice -- our
+# headline over BSG's subtitle, or "AOWLSPT BETA" alone under a season
+# artwork -- is strictly worse than the banner simply being gone, which is the
+# behaviour the player already has today.
+#
+# TEXT IS WRITTEN BY CALLING THE SETTERS, never by storing `m_text`: a raw
+# store reads back true and is then clobbered by `LocalizedText`. This goes
+# through `swRelabelControl` -- SetLabelText @0x140FE70 then set_text
+# @0x51BC1E0 plus the repaint latch -- the SAME writer the version brand and
+# the settings rows use. There is deliberately no second text-writer in this
+# host.
+#
+# ALLOCATION: the strings are `const`, composed at compile time, and
+# `swRelabelControl` allocates one managed String per label per APPLY. Applies
+# are capped at `BetaNoticeMaxApplies`. The steady state is one pointer
+# validation and ONE `m_text` read on the first label -- no allocation, no
+# walk -- on the throttle `seasonsTick` already owns.
+#
+# THE SLOT ORDER IS A KNOWN UNCERTAINTY AND IS REPORTED AS ONE. Labels are
+# taken in breadth-first order and slot 0 gets the headline, slot 1 the
+# sub-line, the rest are blanked. Which of the banner's labels is visually the
+# title has NOT been measured. So the apply log prints the STOCK text each slot
+# carried before we wrote it: if the mapping is inverted, that one line says so
+# and the fix is to swap two constants.
+# ---------------------------------------------------------------------------
+
+const BetaNoticeMaxNodes = 64
+const BetaNoticeMaxDepth = 4
+const BetaNoticeMaxChildren = 32
+## Applies, not passes. A clobber costs one; eight is enough to win an argument
+## with `LocalizedText` and few enough that a label which fights back forever
+## cannot spin.
+const BetaNoticeMaxApplies = 8
+## What tells us the banner is ALREADY OURS, read back off the live label. Not
+## a flag of our own -- a flag would say "we wrote it", and what we need to
+## know is "it still says it".
+const BetaNoticeSentinel = "AOWLSPT"
+const BetaNoticeHead = "AOWLSPT BETA"
+const BetaNoticeSub = "aoughwl.com  -  F12 for mod settings"
+## Used when the banner turns out to have exactly ONE label: everything on one
+## line rather than dropping half the message.
+const BetaNoticeOneLine =
+  "AOWLSPT BETA  -  aoughwl.com  -  F12 for mod settings"
+## `swRelabelControl` REFUSES an empty string (`text.len == 0` returns false),
+## so a surplus label is blanked with a space rather than "".
+const BetaNoticeBlank = " "
+
+var gBetaBtnT: Il2CppPtr = nil          ## the SeasonsButton transform
+var gBetaTmps: seq[Il2CppPtr] = @[]     ## its non-empty TextMeshProUGUIs
+var gBetaApplies = 0
+var gBetaReapplies = 0
+var gBetaSaid = false
+var gBetaSaidMissing = false
+var gBetaOff = false                    ## declined; never try again this run
+
+proc betaCollectTexts(root: Il2CppPtr): seq[Il2CppPtr] =
+  ## Every TextMeshProUGUI at or under `root` whose `m_text` is NON-EMPTY, in
+  ## breadth-first order. Bounded twice over -- by node count and by depth --
+  ## and every hop validated, because a corrupt `childCount` inside a frame is
+  ## an infinite loop on the Unity main thread.
+  result = @[]
+  if root == nil:
+    return
+  var qT: seq[Il2CppPtr] = @[]
+  var qD: seq[int] = @[]
+  qT.add root
+  qD.add 0
+  var head = 0
+  while head < qT.len and head < BetaNoticeMaxNodes:
+    let t = qT[head]
+    let d = qD[head]
+    head = head + 1
+    if t == nil or not duOk(t, 0x20'i32) or not iUnityAlive(t):
+      continue
+    let tmp = modsComponent(t, "TextMeshProUGUI")
+    if tmp != nil and duOk(tmp, 0xE8'i32):
+      if suiReadString(cReadPtrAt(tmp, 0xE0'i32)).len > 0:
+        result.add tmp
+    if d < BetaNoticeMaxDepth:
+      var n = 0
+      if iChildCount(t, n):
+        var i = 0
+        while i < n and i < BetaNoticeMaxChildren and
+              qT.len < BetaNoticeMaxNodes:
+          let c = iChildAt(t, i)
+          if c != nil:
+            qT.add c
+            qD.add (d + 1)
+          i = i + 1
+
+proc betaNoticeDecline(go: Il2CppPtr; why: string) =
+  ## The loud refusal. NOTHING is written, the banner is switched OFF so the
+  ## player gets the `uxHideSeasons` outcome rather than a half-branded season
+  ## advert, and the feature is done for the session.
+  gBetaOff = true
+  gBetaNoticeOn = false
+  let hid = (go != nil and modsSetActive(go, false))
+  warn "beta notice: REFUSING to write -- " & why & ". Nothing was written " &
+       "to any label. The banner has " &
+       (if hid: "been SWITCHED OFF instead"
+        else: "NOT been switched off either (SetActive(false) did not run), " &
+              "so it still shows the game's own season caption") &
+       ", and uxBetaNotice is OFF for this session. This is deliberate: a " &
+       "partly-written banner -- our headline over BSG's subtitle -- is " &
+       "worse than no banner at all."
+
+proc betaNoticeFrom(menu: Il2CppPtr) =
+  ## Brand the seasons banner, given the MenuScreen hide-seasons just resolved.
+  ## Rides `gModsBranch == 3` -- the SAME single `aowl_p_p_seh` -- and adds no
+  ## guard of its own, because that guard is not re-entrant and a nested one
+  ## would DISARM it.
+  if not gBetaNoticeOn or gBetaOff or menu == nil:
+    return
+  if gBetaApplies >= BetaNoticeMaxApplies:
+    return
+  # Revalidate the cached banner: a menu rebuild destroys it, and a stale
+  # Transform is a fault waiting for the next ICALL.
+  if gBetaBtnT != nil and
+     (not duOk(gBetaBtnT, 0x20'i32) or not iUnityAlive(gBetaBtnT)):
+    gBetaBtnT = nil
+    gBetaTmps = @[]
+  if gBetaBtnT == nil:
+    let btn = modsChildNamed(menu, "SeasonsButton")
+    if btn == nil:
+      if not gBetaSaidMissing:
+        gBetaSaidMissing = true
+        warn "beta notice: MenuScreen was reached, so the menu exists, but " &
+             "it has NO child named 'SeasonsButton'. NOTHING was written. " &
+             "This is a REAL ABSENCE at this level -- MenuScreen was held, " &
+             "not searched for -- so the name has changed on this build, and " &
+             "there is deliberately no positional fallback: branding " &
+             "whatever happens to sit there is how the Play button ends up " &
+             "reading 'AOWLSPT BETA'."
+      return
+    gBetaBtnT = btn
+    gBetaTmps = @[]
+  let go = iGameObjectOf(gBetaBtnT)
+  if go == nil or not iUnityAlive(go):
+    return
+  # THE ENUMERATION, once per resolve -- not per frame. `m_text` is readable
+  # whether or not the object is active, so this runs BEFORE anything is made
+  # visible: we do not put the banner on screen until we know we can brand it.
+  if gBetaTmps.len == 0:
+    gBetaTmps = betaCollectTexts(gBetaBtnT)
+  if gBetaTmps.len == 0:
+    betaNoticeDecline(go, "the banner was found and walked (" &
+                      $BetaNoticeMaxNodes & " nodes, " & $BetaNoticeMaxDepth &
+                      " levels max) but NOT ONE TextMeshProUGUI under it has " &
+                      "non-empty m_text. An empty label is the fingerprint of " &
+                      "the wrong object (fact #13), so there is nothing here " &
+                      "this host is willing to write to")
+    return
+  # THE STEADY STATE: one read. If the first label still carries our sentinel,
+  # the notice is intact and this pass costs nothing more.
+  let cur0 = suiReadString(cReadPtrAt(gBetaTmps[0], 0xE0'i32))
+  if cur0.len == 0:
+    gBetaTmps = @[]                     # label died under us; re-enumerate
+    return
+  if gBetaApplies > 0 and cur0.startsWith(BetaNoticeSentinel):
+    return
+  var stock = ""
+  var wrote = 0
+  var i = 0
+  while i < gBetaTmps.len and i < BetaNoticeMaxNodes:
+    let want = (if gBetaTmps.len == 1: BetaNoticeOneLine
+                elif i == 0: BetaNoticeHead
+                elif i == 1: BetaNoticeSub
+                else: BetaNoticeBlank)
+    if i < 3:
+      stock = stock & "[" &
+              suiReadString(cReadPtrAt(gBetaTmps[i], 0xE0'i32)) & "] "
+    if swRelabelControl(cast[Il2CppPtr](0), gBetaTmps[i], want):
+      wrote = wrote + 1
+    i = i + 1
+  if wrote == 0:
+    betaNoticeDecline(go, "the banner has " & $gBetaTmps.len & " non-empty " &
+                      "label(s), but NOT ONE of them accepted a write -- " &
+                      "neither LocalizedText::SetLabelText nor " &
+                      "TMP_Text::set_text nor the raw m_text fallback took")
+    return
+  inc gBetaApplies
+  # ONLY NOW is it made visible. Ordering is the whole failure design: every
+  # path that could decline has already run.
+  if not modsGoActive(go):
+    discard modsSetActive(go, true)
+  if gBetaSaid:
+    # A SECOND APPLY MEANS SOMETHING ELSE WROTE THESE LABELS -- the clobber
+    # (`LocalizedText` re-applying over our text), or a menu rebuild. Either
+    # way it is a different event from "applied late" and is named as one.
+    inc gBetaReapplies
+    if gBetaReapplies <= 3:
+      warn "beta notice: the banner was CLOBBERED back to the game's own " &
+           "text and has been re-applied (" & $gBetaReapplies & " of at " &
+           "most " & $(BetaNoticeMaxApplies - 1) & "). If this repeats, the " &
+           "notice is not late -- it is being overwritten."
+  else:
+    gBetaSaid = true
+    okLog "beta notice: Common UI/MenuScreen/SeasonsButton now reads \"" &
+          (if gBetaTmps.len == 1: BetaNoticeOneLine
+           else: BetaNoticeHead & "\" / \"" & BetaNoticeSub) &
+          "\" -- " & $wrote & " of " & $gBetaTmps.len & " non-empty labels " &
+          "written through LocalizedText::SetLabelText / TMP_Text::set_text " &
+          "(never a raw m_text store, which LocalizedText clobbers)."
+    okLog "beta notice: the STOCK text each slot carried before we wrote it, " &
+          "in slot order, was " & stock & "-- if the headline and the " &
+          "sub-line look swapped on screen, THIS LINE IS WHY: the banner's " &
+          "internal layout was never measured, slots are taken " &
+          "breadth-first, and the fix is to swap BetaNoticeHead and " &
+          "BetaNoticeSub."
 
 # ---------------------------------------------------------------------------
 # POSTFX AS A SUBTAB OF GRAPHICS (`settingsPostFxSubtab`, default OFF).
@@ -2989,6 +3260,12 @@ proc modsBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_mods_body", cdecl.} =
     # no search of its own. If seasons found nothing, `gSeasonsMenu` is nil and
     # this returns immediately.
     modeButtonHideFrom(gSeasonsMenu)
+    # The beta notice rides the SAME branch and the SAME guard, for the same
+    # reason: `aowl_p_p_seh` is not re-entrant, so a guard of its own would
+    # disarm this one. It reuses the MenuScreen resolved above and costs one
+    # child lookup. If nothing was resolved, `gSeasonsMenu` is nil and this
+    # returns immediately.
+    betaNoticeFrom(gSeasonsMenu)
   elif gModsBranch == 4:
     gfxTickBody()
 
@@ -3069,8 +3346,9 @@ proc verBrandTick() =
            "retries (" & $gVerWalkFaults & " of " & $VerBrandMaxWalkFaults & ")"
 
 proc seasonsTick() =
-  ## Throttled entry for the seasons-banner hider, on the same terms.
-  if not gSeasonsOn or gSeasonsFaults >= SeasonsMaxFaults:
+  ## Throttled entry for the seasons-banner hider AND the beta notice, which
+  ## share the MenuScreen resolve and therefore share this throttle.
+  if not (gSeasonsOn or gBetaNoticeOn) or gSeasonsFaults >= SeasonsMaxFaults:
     return
   # THE THROTTLE IS ADAPTIVE, and it lives here because every throttle in this
   # file lives on the side that decides whether to enter the guard.
@@ -3152,7 +3430,7 @@ proc bindModsTab(verbose: bool): bool =
   result = false
   if gModsSlot >= 0:
     return true
-  if not (gModsOn or gVerOn or gSeasonsOn or gGfxOn):
+  if not (gModsOn or gVerOn or gSeasonsOn or gGfxOn or gBetaNoticeOn):
     return false
   if gDebugUiSlot >= 0:
     gModsSlot = gDebugUiSlot

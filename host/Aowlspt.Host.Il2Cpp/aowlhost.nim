@@ -1375,6 +1375,13 @@ var gVerOn = false
 ## captures it itself now, from the very rider call it already receives.
 var gVerPreloader: Il2CppPtr = nil
 var gSeasonsOn = false
+## THE BETA NOTICE IN THE SEASONS BANNER SLOT. A SEPARATE KEY from
+## `uxHideSeasons` on purpose: a player may well want the KORD BREACH banner
+## gone and no notice in its place, and overloading one key would take that
+## choice away. Default OFF, and a brand new name, because a default in source
+## is not a value -- a flag whose default was flipped in source was still
+## `true` in a deployed config.json for two launch cycles.
+var gBetaNoticeOn = false
 ## POSTFX folded into Graphics as a subtab. Default OFF, and it is the one
 ## feature in `modstab.nim` that drives the GAME's own panels rather than
 ## clones of them.
@@ -6890,6 +6897,36 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "state is driven, because the game switches panels by ESettingsGroup " &
          "and a subtab of ours is not one."
   gSeasonsOn = readBoolKey("uxHideSeasons")
+  gBetaNoticeOn = readBoolKey("uxBetaNotice")
+  # BOTH LOGGED AS ACTUALLY READ, not as defaulted, and then resolved here
+  # rather than left to fight on the Unity thread. They target the SAME
+  # GameObject -- `Common UI/MenuScreen/SeasonsButton` -- from opposite
+  # directions: one switches it off, the other keeps it on and rewrites its
+  # text. With both set the host would hide the object it is branding.
+  info "uxHideSeasons read as " & (if gSeasonsOn: "ON" else: "OFF") &
+       "; uxBetaNotice read as " & (if gBetaNoticeOn: "ON" else: "OFF") &
+       " (these are the values actually read from config, not the defaults)"
+  if gBetaNoticeOn and gSeasonsOn:
+    gSeasonsOn = false
+    warn "uxBetaNotice and uxHideSeasons are BOTH set. They target the same " &
+         "object (Common UI/MenuScreen/SeasonsButton), so uxBetaNotice WINS " &
+         "and uxHideSeasons is FORCED OFF for this session -- the banner " &
+         "stays on screen carrying the aowlspt beta notice instead of the " &
+         "KORD BREACH / Season caption. If the notice cannot find a text " &
+         "node inside the banner it declines and hides the banner itself, so " &
+         "the uxHideSeasons outcome is still what you get in that case."
+  if gBetaNoticeOn:
+    info "uxBetaNotice is set: the host REPURPOSES " &
+         "Common UI/MenuScreen/SeasonsButton -- the KORD BREACH / Season " &
+         "banner above Play -- to read the aowlspt beta notice " &
+         "(aoughwl.com, F12 for mod settings). It is reached as one named " &
+         "child of the SAME MenuScreen uxHideSeasons already resolves, so " &
+         "there is no scene walk and no budget. The text is written by " &
+         "CALLING LocalizedText::SetLabelText and TMP_Text::set_text -- a " &
+         "raw m_text store is clobbered -- and re-applied on a throttle, so " &
+         "a menu rebuild is re-branded. If NO non-empty TextMeshProUGUI is " &
+         "found inside the banner, it writes NOTHING, says so, and switches " &
+         "the banner off: half a notice is worse than none."
   if gSeasonsOn:
     info "uxHideSeasons is set: the host switches off " &
          "Common UI/MenuScreen/SeasonsButton -- the KORD BREACH / Season " &
@@ -7132,7 +7169,7 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       # on `EFT.UI.PreloaderUI::Update`, so by here any of the other four may
       # have claimed the slot and this aliases onto it for free. It never
       # attaches a detour of its own.
-      if gModsOn or gVerOn or gSeasonsOn or gGfxOn:
+      if gModsOn or gVerOn or gSeasonsOn or gGfxOn or gBetaNoticeOn:
         discard bindModsTab(true)
 
       # THE SHARED PER-FRAME REGION (opt-in, `sharedRegion`). Armed LAST of
