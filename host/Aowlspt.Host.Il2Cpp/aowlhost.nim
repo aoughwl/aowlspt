@@ -6759,7 +6759,38 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # The main menu's bottom-right game-mode label. Default OFF until proven live:
   # it is the first thing this host does that CALLS a managed method on the
   # Unity thread as a feature rather than as a probe.
+  # REMOVE THE BOTTOM-RIGHT MODE BUTTON (`uxHideModeButton`). Default OFF, and
+  # a BRAND NEW KEY on purpose: a default in source is not a value, and a flag
+  # whose default was flipped in source was still `true` in a deployed
+  # config.json for two launch cycles. A new name cannot inherit a stale value.
+  gModeHideOn = readBoolKey("uxHideModeButton")
   gModeTextOn = readBoolKey("uxMenuModeText")
+  # BOTH READ FIRST, THEN LOGGED AS ACTUALLY READ, THEN RESOLVED. The two are
+  # MUTUALLY EXCLUSIVE and that is enforced here rather than left to fight on
+  # the Unity thread: `uxMenuModeText` rewrites the text OF the control
+  # `uxHideModeButton` removes, so with both on the host would walk the tree
+  # twice and paint an object nobody can see.
+  info "uxHideModeButton read as " & (if gModeHideOn: "ON" else: "OFF") &
+       "; uxMenuModeText read as " & (if gModeTextOn: "ON" else: "OFF") &
+       " (these are the values actually read from config, not the defaults)"
+  if gModeHideOn and gModeTextOn:
+    gModeTextOn = false
+    warn "uxHideModeButton and uxMenuModeText are BOTH set. They target the " &
+         "same control (Common UI/ChangeGameModeButton -- fact #116), so " &
+         "uxHideModeButton WINS and uxMenuModeText is FORCED OFF for this " &
+         "session. Rewriting the caption of a hidden button is per-frame work " &
+         "on the Unity main thread for something nobody can see."
+  if gModeHideOn:
+    info "uxHideModeButton is set: the host switches off " &
+         "Common UI/ChangeGameModeButton -- the bottom-right PVE ZONE / " &
+         "switch-game-mode control -- because the character/mode selection " &
+         "screen is skipped on launch and this is the last route back into " &
+         "it. Same primitive as uxHideSeasons: ONE GameObject::SetActive" &
+         "(false), never a destroy, never set back to true. The button is " &
+         "found STRUCTURALLY by walking from a verified scene root, bounded " &
+         "to 4000 nodes and 4 ms per pass, on a 4-frame hunt cadence that " &
+         "drops to 120 frames once hidden or if a pass overruns, and it gives " &
+         "up LOUDLY after 300 s rather than searching forever."
   if gModeTextOn:
     info "uxMenuModeText is set: a postfix detour on EFT.UI.PreloaderUI.Update " &
          "will set the menu's bottom-right corner label by CALLING the game's " &
@@ -7025,11 +7056,17 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       # are live together. Ordering still matters, because whoever arms first is
       # the one that owns the trampoline and the other must be able to see the
       # claimed slot to alias onto it.
-      if gModeTextOn:
+      # `uxHideModeButton` rides the SAME slot for the same reason: it needs a
+      # per-frame tick on the Unity thread and the button it hides is the very
+      # object this rider already walks to. One detour, one trampoline.
+      if gModeTextOn or gModeHideOn:
         if not bindModeText(true):
           info "menu mode text did not arm (PreloaderUI.Update or " &
                "SetGameModeText unverified on this build, or drain disabled)"
-        elif readBackendPort() <= 0:
+        elif gModeTextOn and readBackendPort() <= 0:
+          # Gated on `gModeTextOn`, not on the arm: `uxHideModeButton` needs no
+          # backend at all, and warning it has "no source" would be a
+          # confidently wrong diagnostic.
           # ARMED WITH NO SOURCE, said at boot rather than a minute into the
           # menu. The label's text comes from the backend on the mod-sync poll,
           # and with no port this host cannot ask. `backendPort` falls back to

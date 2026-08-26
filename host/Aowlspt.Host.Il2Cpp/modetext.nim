@@ -156,16 +156,118 @@ var gMtxResolvePasses = 0
 var gMtxResolveWhy = ""
 var gMtxResolveSaidWalk = false
 var gMtxResolveGaveUp = false
-const MtxResolveMaxPasses = 30
-  ## Same budget as `SeasonsMaxPasses`: the walk is bounded and cheap, so 30
-  ## tries (well under a second at 60fps) is plenty before the main menu is up,
-  ## and giving up loudly beats retrying forever in silence.
+
+# ---------------------------------------------------------------------------
+# THE THROTTLE. This block is the fix for a MEASURED main-thread stall, and the
+# comment it replaced ("retried on a throttle") was simply false -- there was no
+# throttle at all. Until it resolved, `modeTextTickBody` ran
+# `modsFindNamed(root, "ChangeGameModeButton", 8)` over all 11 scene roots EVERY
+# FRAME, and `modsFindNamed` has no node budget and no time slice: 32 children
+# per level, 8 levels, allocating a managed name string per node visited.
+#
+# Measured on the live client: first fire 0:00:14.172, resolved 0:00:46.485 --
+# 32.3 seconds across <=30 passes, i.e. >=1.08 SECONDS PER FRAME on the Unity
+# main thread. It stalled the process so hard that a 302-byte HTTP response from
+# our own backend took 1.2 s, and the user reported the game as "SUPER DUPER
+# laggy" during load. `uxMenuModeText` has been OFF on the live install since.
+#
+# The shape below is the one a nearby agent arrived at for exactly this class of
+# bug in the version brand (`modstab.nim`, `VerBrand*`), and it is deliberately
+# copied rather than reinvented:
+#   * a HUNT cadence while unresolved and a STEADY cadence once resolved;
+#   * a wall-clock SLICE per pass, with a logged BACK-OFF to the steady cadence
+#     when a pass overruns -- the hunt gives up its speed, not the hunt;
+#   * a NODE BUDGET inside the walk itself, so one pass is bounded even if the
+#     slice is never checked;
+#   * a give-up in WALL CLOCK, not in attempts. An attempt budget and a fast
+#     poll are incompatible: 30 attempts at one every 2 frames is under a
+#     second, which is long before the main menu exists, so the old
+#     `MtxResolveMaxPasses = 30` would have given up before its target could
+#     possibly be there. "Not reachable yet" is not a failure.
+const MtxHuntFrames = 4
+  ## While unresolved. Not 1: even a budgeted walk allocates a name string per
+  ## node, and nothing that allocates belongs on every frame of the Unity thread.
+const MtxSteadyFrames = 120
+  ## Once resolved: a revalidate-and-recheck, not a search.
+const MtxSliceMs = 4'u64
+  ## One resolve pass may cost this much. Over it, the hunt BACKS OFF to the
+  ## steady cadence and says so.
+const MtxHuntMs = 300_000'u64
+  ## Five minutes of wall clock to find the button, then a loud give-up. The
+  ## menu can legitimately be many seconds away on a cold load.
+const MtxNodeBudget = 4000
+  ## Nodes one resolve pass may visit across ALL roots combined. This is the
+  ## bound the old code did not have; the slice above is the belt to its braces.
+
+var gMtxFrames = 0
+var gMtxSlow = false              ## a pass overran the slice; one-shot log
+var gMtxT0: uint64 = 0            ## first tick from the rider chain
+var gMtxTResolved: uint64 = 0
+var gMtxNotReady = 0              ## passes where the button was legitimately absent
+
+# ---------------------------------------------------------------------------
+# REMOVE THE BUTTON ENTIRELY (`uxHideModeButton`, default OFF).
+#
+# The bottom-right "PVE ZONE" control is `Common UI -> ChangeGameModeButton`
+# (fact #116 -- it is NOT `PreloaderUI._sessionModeText`, which something once
+# reported success against while the screen never changed). Since the host now
+# skips the character/mode selection screen on launch, this button is the last
+# route back into the mode UI, and the user does not want to see it.
+#
+# The mechanism is deliberately the SMALLEST one that works, and it is not new:
+# `uxHideSeasons` removes `Common UI/MenuScreen/SeasonsButton` with a single
+# `GameObject::SetActive(false)` and that is human-confirmed on screen (fact
+# #81). This is the same primitive on a different object. It only ever sets
+# active=FALSE, never true, so the game can rebuild the menu and we hide it
+# again, but nothing this host does can put a hidden control back.
+#
+# MUTUALLY EXCLUSIVE WITH `uxMenuModeText`, ENFORCED RATHER THAN LEFT TO LUCK.
+# That feature exists to rewrite the text OF THIS BUTTON to the character name.
+# If the button is gone there is nothing to rewrite, and doing it anyway means
+# two resolve walks and two writes per menu, on the Unity main thread, to paint
+# an object nobody can see. So `uxHideModeButton` WINS and forces the other off
+# at flag-read time, loudly. Making the flags fight silently is how this
+# codebase produces its worst outcomes.
+var gModeHideOn = false
+var gMtxHideGo: Il2CppPtr = nil   ## the ChangeGameModeButton GameObject, cached
+var gMtxHidden = 0
+var gMtxSaidHidden = false
+
+proc mtxFindNamed(t: Il2CppPtr; name: string; depth: int;
+                   budget: var int): Il2CppPtr =
+  ## `modsFindNamed`, but with a GLOBAL NODE BUDGET threaded through the
+  ## recursion. `modsFindNamed` caps 32 children per level and nothing else, so
+  ## its worst case is 32^8 -- a number that is only survivable because the real
+  ## tree is small, which is not a bound. This one cannot visit more nodes than
+  ## the caller allowed, whatever the tree looks like.
+  result = nil
+  if t == nil or depth < 0 or budget <= 0 or not duOk(t, 0x20'i32):
+    return
+  budget = budget - 1
+  if iObjName(t) == name:
+    return t
+  if depth == 0:
+    return
+  var n = 0
+  if not iChildCount(t, n):
+    return
+  var i = 0
+  while i < n and i < 32 and budget > 0:
+    let c = iChildAt(t, i)
+    if c != nil:
+      result = mtxFindNamed(c, name, depth - 1, budget)
+      if result != nil:
+        return
+    i = i + 1
 
 proc modeTextFindGameModeRoot(): Il2CppPtr =
   ## `ChangeGameModeButton`, searched from every scene root down to a bounded
   ## depth -- the same pattern as `seasonsFindMenuScreen`. "Common UI" is the
   ## verified live root (fact #116), but this does not hardcode that layer, so
   ## an inserted UI wrapper does not silently break the walk.
+  ##
+  ## BOUNDED TWICE: one shared node budget across every root, and the caller
+  ## times the whole pass against `MtxSliceMs`.
   result = nil
   var roots: seq[Il2CppPtr] = @[]
   let n = iSceneRoots(roots, false)
@@ -173,19 +275,28 @@ proc modeTextFindGameModeRoot(): Il2CppPtr =
     gMtxResolveWhy = "iSceneRoots enumerated NO roots (" & $n & ")"
     return
   var names = ""
+  var budget = MtxNodeBudget
   var i = 0
-  while i < roots.len and i < 32:
+  while i < roots.len and i < 32 and budget > 0:
     let goT = iToTransform(roots[i])
     if goT != nil and duOk(goT, 0x20'i32):
       if names.len < 300:
         names = names & "'" & iObjName(goT) & "' "
-      let m = modsFindNamed(goT, "ChangeGameModeButton", 8)
+      let m = mtxFindNamed(goT, "ChangeGameModeButton", 8, budget)
       if m != nil:
         gMtxResolveWhy = ""
         return m
     i = i + 1
-  gMtxResolveWhy = "no 'ChangeGameModeButton' within 8 levels of any of the " &
-                    $roots.len & " scene root(s): " & names
+  if budget <= 0:
+    gMtxResolveWhy = "the walk EXHAUSTED its " & $MtxNodeBudget &
+                     "-node budget after " & $i & " of " & $roots.len &
+                     " scene root(s) without finding 'ChangeGameModeButton'. " &
+                     "This is INCONCLUSIVE, not a verdict of absent"
+  else:
+    gMtxResolveWhy = "no 'ChangeGameModeButton' within 8 levels of any of the " &
+                      $roots.len & " scene root(s) (" & $(MtxNodeBudget - budget) &
+                      " nodes visited, budget NOT exhausted, so this one is a " &
+                      "real absence): " & names
 
 proc modeTextResolveOne(btnT: Il2CppPtr; childName: string;
                          tmpOut, locOut: var Il2CppPtr): bool =
@@ -270,12 +381,88 @@ proc modeTextTickBody(a: Il2CppPtr): Il2CppPtr {.
   let self = a           # the PreloaderUI `this`; unused by the new path below,
   discard self           # kept only so the shared drain's dispatch shape is intact
 
+  # ---- REMOVE THE BUTTON (uxHideModeButton). Wins over the relabel outright. ----
+  if gModeHideOn:
+    # THE FAST PATH, once the object is known: a guarded pointer check, a
+    # liveness check and one `activeSelf` ICALL. No allocation, no walk, so it
+    # may run on the steady cadence and still hide a rebuilt menu promptly.
+    if gMtxHideGo != nil:
+      if duOk(gMtxHideGo, 0x20'i32) and iUnityAlive(gMtxHideGo):
+        if modsGoActive(gMtxHideGo):
+          if modsSetActive(gMtxHideGo, false):
+            inc gMtxHidden
+            if gMtxHidden == 2:
+              okLog "hide mode button: ChangeGameModeButton came back after a " &
+                    "menu rebuild and was switched off again from the cached " &
+                    "object"
+          else:
+            warn "hide mode button: GameObject::SetActive(false) REFUSED on " &
+                 "ChangeGameModeButton (the target verified, the call did not " &
+                 "run). The button is UNTOUCHED -- this is a refusal, not a " &
+                 "success."
+        return
+      gMtxHideGo = nil                  # destroyed; fall through and re-resolve
+    let t0h = cNowMs()
+    let btnT = modeTextFindGameModeRoot()
+    let spentH = cNowMs() - t0h
+    if spentH > MtxSliceMs and not gMtxSlow:
+      gMtxSlow = true
+      warn "hide mode button: one bounded walk cost " & $int(spentH) &
+           " ms, over the " & $int(MtxSliceMs) & " ms slice, so the fast hunt " &
+           "(every " & $MtxHuntFrames & " frames) has BACKED OFF to every " &
+           $MtxSteadyFrames & " frames. This rider runs on the Unity main " &
+           "thread and a stall here is the whole reason this feature was " &
+           "rewritten; being late is the deliberate trade."
+    if btnT == nil:
+      inc gMtxNotReady
+      if gMtxNotReady <= 2:
+        okLog "hide mode button: not reachable yet -- " & gMtxResolveWhy &
+              ". Expected before the main menu is up; it keeps looking."
+      return
+    let go = iGameObjectOf(btnT)
+    if go == nil or not iUnityAlive(go):
+      gMtxResolveWhy = "ChangeGameModeButton was found but its GameObject is " &
+                       "null or its native half is not live yet"
+      return
+    gMtxHideGo = go
+    if gMtxTResolved == 0:
+      gMtxTResolved = cNowMs()
+    if not modsGoActive(go):
+      return                            # already hidden: a read, and no call
+    if modsSetActive(go, false):
+      inc gMtxHidden
+      if not gMtxSaidHidden:
+        gMtxSaidHidden = true
+        okLog "hide mode button: Common UI/ChangeGameModeButton switched off " &
+              "(the bottom-right PVE ZONE / switch-game-mode control), " &
+              $int(gMtxTResolved - gMtxT0) & " ms after this rider first " &
+              "ticked. Found STRUCTURALLY by walking from a verified scene " &
+              "root with a " & $MtxNodeBudget & "-node budget -- never from a " &
+              "cached pointer, and never from PreloaderUI._sessionModeText, " &
+              "which is a recorded FALSE POSITIVE for this label (fact #116). " &
+              "It is re-checked on a throttle so a menu rebuild hides it " &
+              "again; this host never sets it back to active."
+    else:
+      warn "hide mode button: GameObject::SetActive(false) REFUSED on " &
+           "ChangeGameModeButton. The button is UNTOUCHED."
+    return
+
   # ---- resolve the REAL target once, by walking, never by a cached RVA guess ----
   if not gMtxResolved:
-    if gMtxResolvePasses < MtxResolveMaxPasses:
+    block:
+      let t0 = cNowMs()
+      let got = modeTextResolveBoth()
+      let spent = cNowMs() - t0
+      if spent > MtxSliceMs and not gMtxSlow:
+        gMtxSlow = true
+        warn "menu mode text: one bounded walk cost " & $int(spent) &
+             " ms, over the " & $int(MtxSliceMs) & " ms slice, so the fast " &
+             "hunt has BACKED OFF from every " & $MtxHuntFrames &
+             " frames to every " & $MtxSteadyFrames & " frames."
       inc gMtxResolvePasses
-      if modeTextResolveBoth():
+      if got:
         gMtxResolved = true
+        gMtxTResolved = cNowMs()
         gModeTextLogged = true
         let curMain = suiReadString(cReadPtrAt(gMtxTmpMain, cSuiOffTmpMText()))
         let curHover = suiReadString(cReadPtrAt(gMtxTmpHover, cSuiOffTmpMText()))
@@ -296,15 +483,20 @@ proc modeTextTickBody(a: Il2CppPtr): Il2CppPtr {.
               "reaches the screen, and these two TMPs are what actually renders."
         if curMain.len > 0:
           gModeTextApplied = curMain
-      elif not gMtxResolveSaidWalk and gMtxResolvePasses == 2:
-        gMtxResolveSaidWalk = true
-        okLog "menu mode text: not found yet -- " & gMtxResolveWhy &
-              ". Expected before the main menu is up; retried on a throttle."
-    elif not gMtxResolveGaveUp:
-      gMtxResolveGaveUp = true
-      warn "menu mode text: GIVING UP after " & $gMtxResolvePasses &
-           " passes -- " & gMtxResolveWhy & ". Stock corner label left alone; " &
-           "this feature is otherwise idle for the session."
+      else:
+        inc gMtxNotReady
+        if not gMtxResolveSaidWalk and gMtxNotReady == 2:
+          gMtxResolveSaidWalk = true
+          okLog "menu mode text: not found yet -- " & gMtxResolveWhy &
+                ". Expected before the main menu is up; it keeps looking on a " &
+                "real throttle (every " & $MtxHuntFrames & " frames while " &
+                "hunting, bounded to " & $MtxNodeBudget & " nodes and " &
+                $int(MtxSliceMs) & " ms per pass)."
+    # THE GIVE-UP moved OUT of here and into `modeTextUpdateFired`, where it is
+    # measured in WALL CLOCK. The old `MtxResolveMaxPasses = 30` counted passes
+    # that used to happen once per frame, so it also bounded nothing that
+    # mattered: 30 frames is a fraction of a second, and the button appears
+    # tens of seconds in.
     if not gMtxResolved:
       return
 
@@ -346,7 +538,10 @@ proc modeTextUpdateFired(regs: Il2CppPtr) =
   # healthy and the SOURCE is missing -- almost always the backend poll not
   # reaching this host (no `backendPort` and no installer `backend.json`, or the
   # manager mod not running) -- so it names that rather than the hook.
-  if not gModeTextStarved and gModeTextWant.len == 0 and
+  # NOT when `uxHideModeButton` is the reason this rider is armed: that feature
+  # has no backend source and never wanted one, so "the backend never sent a
+  # menuModeText" would be a true sentence and a wrong diagnosis.
+  if not gModeHideOn and not gModeTextStarved and gModeTextWant.len == 0 and
      gModeTextFires >= ModeTextStarveFrames:
     gModeTextStarved = true
     warn "menu mode text: the PreloaderUI.Update hook has fired " &
@@ -358,9 +553,42 @@ proc modeTextUpdateFired(regs: Il2CppPtr) =
 
   # The cheap early-out that keeps this off the hot path: after the one-shot
   # identification log has run, a frame with no pending change does no work at
-  # all -- no read, no guard entry, no allocation.
-  if gModeTextLogged and
+  # all -- no read, no guard entry, no allocation. It does NOT apply when the
+  # hide feature is on, because that one has work to do on every throttled pass
+  # regardless of what the backend has said.
+  if not gModeHideOn and gModeTextLogged and
      (gModeTextWant.len == 0 or gModeTextWant == gModeTextApplied):
+    return
+
+  # ------------------------------------------------------------------
+  # THE THROTTLE. It lives HERE, on the side that decides whether to enter the
+  # guard, and nowhere else -- a throttle duplicated on both sides of a split
+  # once cancelled exactly and produced a feature that was armed, guarded,
+  # never faulting and never doing anything.
+  #
+  # Adaptive, and every branch bounded:
+  #   * hunting (target not yet found, no slice overrun) -> MtxHuntFrames;
+  #   * resolved, or backed off after an overrun          -> MtxSteadyFrames.
+  if gMtxT0 == 0:
+    gMtxT0 = cNowMs()
+  let hunting = (if gModeHideOn: gMtxHideGo == nil else: not gMtxResolved)
+  let every = (if hunting and not gMtxSlow: MtxHuntFrames else: MtxSteadyFrames)
+  inc gMtxFrames
+  if gMtxFrames < every:
+    return
+  gMtxFrames = 0
+
+  # THE GIVE-UP, in wall clock rather than in attempts, and LOUD. "The button is
+  # still there" must never be a silent outcome.
+  if hunting and cNowMs() - gMtxT0 > MtxHuntMs:
+    if not gMtxResolveGaveUp:
+      gMtxResolveGaveUp = true
+      warn (if gModeHideOn: "hide mode button" else: "menu mode text") &
+           ": GIVING UP after " & $int(MtxHuntMs div 1000) & " s and " &
+           $gMtxNotReady & " bounded walks -- " & gMtxResolveWhy &
+           ". Nothing was changed; the stock control is exactly as the game " &
+           "made it. This is a REFUSAL, not a success."
+      gModeTextOff = true
     return
 
   if gModeTextFires == 1:
@@ -381,9 +609,21 @@ proc modeTextUpdateFired(regs: Il2CppPtr) =
   # still passed through only to keep the guarded call's shape unchanged.
   if cMtxTickGuarded(self) == nil:
     inc gModeTextFaults
+    # A FAULT WHILE STILL HUNTING ALSO ENDS THE FAST CADENCE. Otherwise a walk
+    # that faults every pass burns the whole budget in a handful of frames --
+    # the "gave up before its target existed" failure, just relocated. The
+    # budget is also LARGER while hunting: faulting on a half-built menu is not
+    # the same event as faulting on a resolved target, and an earlier version of
+    # this pattern in the version brand spent every attempt on pre-menu walk
+    # faults and had nothing left for the moment the control appeared.
+    let cap = (if hunting: ModeTextMaxFaults * 8 else: ModeTextMaxFaults)
+    if hunting:
+      gMtxSlow = true
     warn "menu mode text: the guarded body faulted (" & $gModeTextFaults &
-         " of " & $ModeTextMaxFaults & ")"
-    if gModeTextFaults >= ModeTextMaxFaults:
+         " of " & $cap & (if hunting: ", while still HUNTING -- expected " &
+         "before the menu exists; the fast cadence has been dropped" else: "") &
+         ")"
+    if gModeTextFaults >= cap:
       gModeTextOff = true
       warn "menu mode text: too many faults; switching itself off for this " &
            "session and leaving the stock label alone"
