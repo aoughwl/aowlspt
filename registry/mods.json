@@ -329,6 +329,38 @@
         "client",
         "graphics"
       ]
+    },
+    {
+      "id": "aowl.callproof",
+      "name": "Call Proof",
+      "author": "aowlspt",
+      "version": "1.0.0",
+      "description": "A one-shot experiment that settles how this build passes by-value aggregates to a managed call. Default off; it makes four calls whose correct answers are known offline and reports PASS/FAIL/INCONCLUSIVE.",
+      "pipeline": ">=0.1.0",
+      "sides": [
+        "client",
+        "sim"
+      ],
+      "source": {
+        "kind": "intree",
+        "path": "examples/callproof",
+        "url": null
+      },
+      "artifact": {
+        "dir": "callproof",
+        "library": "callproof.dll"
+      },
+      "upstream": null,
+      "license": null,
+      "download": null,
+      "requires": [],
+      "conflicts": [],
+      "provides": [],
+      "loadAfter": [],
+      "tags": [
+        "client",
+        "diagnostic"
+      ]
     }
   ],
   "lists": [
