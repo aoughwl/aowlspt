@@ -102,6 +102,8 @@ import aowlspt/callrva
 var gDot: RvaTarget
 var gCross: RvaTarget
 var gWrongSig: RvaTarget
+var gV2Dot: RvaTarget
+var gOrtho: RvaTarget
 var gTargetsReady = false
 
 proc initTargets() =
@@ -131,6 +133,38 @@ proc initTargets() =
     "UnityEngine.Vector3::Dot [DELIBERATELY WRONG PROLOGUE]",
     0x5297BF0'u32,
     "67 90 F3 0F 10 41 04 F3 0F 59 42 04 F3 0F 10 09",
+    owners = 1)
+
+  # THE 8-BYTE AGGREGATE SUBJECT. Vector2 is exactly 8 bytes, which is the one
+  # size Win64 passes IN the register, and this method takes two of them.
+  #
+  #   48 83 EC 18        sub   rsp, 0x18
+  #   48 89 54 24 38     mov   [rsp+0x38], rdx    <- stores RDX AS A VALUE
+  #   48 89 0C 24        mov   [rsp+0x00], rcx    <- stores RCX AS A VALUE
+  #   F3 0F 10 44 24 3C  movss xmm0, [rsp+0x3c]   <- rhs.y = byte 4 of RDX
+  #   F3 0F 10 4C 24 38  movss xmm1, [rsp+0x38]   <- rhs.x = byte 0 of RDX
+  #
+  # It never dereferences either register. The mirror image of `Vector3::Dot`,
+  # which does nothing else. `type 23032 --shared` reports no sharing.
+  gV2Dot = rvaTarget(
+    "UnityEngine.Vector2::Dot(Vector2,Vector2) -> float",
+    0x529BB60'u32,
+    "48 83 EC 18 48 89 54 24 38 48 89 0C 24 F3 0F 10",
+    owners = 1)
+
+  # THE SPILL SUBJECT. Returns a 64-byte Matrix4x4, so the shape is
+  #   pos0 retbuf (RCX), pos1 left (XMM1), pos2 right (XMM2), pos3 bottom
+  #   (XMM3), pos4 top, pos5 zNear, pos6 zFar, pos7 MethodInfo*
+  # -- EIGHT slots, three of them float arguments on the STACK. The callee's
+  # own frame fixes the caller layout beyond doubt: `push rbx; sub rsp,0x70`
+  # puts the return address at rsp+0x78, and it then reads
+  #   movss xmm3,[rsp+0xa0]  movss xmm1,[rsp+0xa8]  movss xmm0,[rsp+0xb0]
+  # i.e. 32 bytes of shadow space above the return address, then 8-byte slots
+  # in argument order. `type 23028 --shared` reports no sharing.
+  gOrtho = rvaTarget(
+    "UnityEngine.Matrix4x4::Ortho(l,r,b,t,zNear,zFar) -> Matrix4x4",
+    0x5294C30'u32,
+    "40 53 48 83 EC 70 48 8B 05 3B F5 E3 01 0F 57 C0",
     owners = 1)
 
 type
@@ -321,19 +355,299 @@ proc checkRival(r: var ProofReport) =
 # ---------------------------------------------------------------------------
 
 proc checkRefusesUnproven(r: var ProofReport) =
-  ## An 8-byte by-value aggregate must be REFUSED, because that is the one size
-  ## Win64 passes in the register itself and no such argument has been measured
-  ## on this build. A refusal that never fires is not a refusal.
+  ## A 4-byte by-value aggregate must still be REFUSED. A refusal that never
+  ## fires is not a refusal, and this check exists so the refusal path stays
+  ## real now that the 8-byte case has been lifted out of it.
+  ##
+  ## It USED to assert on 8 bytes, and that was correct while 8 was unmeasured.
+  ## It is measured now -- `checkVec2Dot` below -- so keeping this pointed at 8
+  ## would have made the refusal path and the proof contradict each other, with
+  ## both reporting PASS. 4 bytes is genuinely unmeasured on this build.
   var a = callArgs()
-  var scratch: array[8, uint8] = [0'u8, 0'u8, 0'u8, 0'u8, 0'u8, 0'u8, 0'u8, 0'u8]
-  a.addAggregate(cast[Il2CppPtr](addr scratch[0]), 8'i32)
+  var scratch: array[4, uint8] = [0'u8, 0'u8, 0'u8, 0'u8]
+  a.addAggregate(cast[Il2CppPtr](addr scratch[0]), 4'i32)
   if a.bad:
     note(r, "refuses-unproven-size", pvPass,
-      "an 8-byte by-value aggregate was refused: " & a.badWhy)
+      "a 4-byte by-value aggregate was refused: " & a.badWhy)
   else:
     note(r, "refuses-unproven-size", pvFail,
-      "an 8-byte by-value aggregate was ACCEPTED. That size is the unproven " &
-      "case and accepting it silently picks one of two conventions")
+      "a 4-byte by-value aggregate was ACCEPTED. That size is still unmeasured " &
+      "on this build and accepting it silently picks one of two conventions")
+
+# ---------------------------------------------------------------------------
+# Check 5 -- the 8-BYTE aggregate, which used to be the refused case.
+# ---------------------------------------------------------------------------
+
+proc checkVec2Dot(r: var ProofReport) =
+  ## `Vector2::Dot((1,2),(3,4))` must be EXACTLY 11.0.
+  ##
+  ## 1*3 + 2*4 = 11, and every input and the output are exact in binary32, so
+  ## this is equality and not a tolerance. The point is not the arithmetic: it
+  ## is that the two arguments are 8-byte aggregates, and this build passes an
+  ## 8-byte aggregate PACKED IN the register while it passes a 12-byte one by
+  ## hidden pointer. Those are opposite conventions in one call table, which is
+  ## why neither could be assumed from the other.
+  ##
+  ## This is the EXACT MIRROR of `checkRival`. There, packing a Vector3 into
+  ## the register takes an access violation because the callee dereferences it.
+  ## Here, packing a Vector2 into the register is the RIGHT answer -- and the
+  ## negative control below is the other half of the mirror.
+  var a = callArgs()
+  a.addVec2(1.0, 2.0)
+  a.addVec2(3.0, 4.0)
+  let o = callFloat(gV2Dot, a)
+  if o.kind == coRefused:
+    note(r, "vec2/8-byte-in-register", pvInconclusive,
+      "refused before calling: " & o.why)
+    return
+  if o.kind == coFaulted:
+    note(r, "vec2/8-byte-in-register", pvFail,
+      "the call FAULTED: " & o.why & " -- an access violation here means the " &
+      "callee DID dereference its argument register, so an 8-byte aggregate " &
+      "does NOT travel in the register on this build and the refusal should " &
+      "be put back")
+    return
+  if o.f == 11.0:
+    note(r, "vec2/8-byte-in-register", pvPass,
+      "Dot((1,2),(3,4)) returned exactly 11.0 -- an 8-byte by-value aggregate " &
+      "IS passed PACKED IN the integer-class register for its slot, first " &
+      "field in the low half")
+  else:
+    note(r, "vec2/8-byte-in-register", pvFail,
+      "Dot((1,2),(3,4)) returned a number that is not 11.0, and did not fault. " &
+      "The 8-byte convention is wrong and the answer looked plausible")
+
+proc checkVec2Rival(r: var ProofReport) =
+  ## THE NEGATIVE CONTROL for the 8-byte case: make the SAME call the OTHER
+  ## way -- by hidden pointer, the convention that is right for 12 bytes -- and
+  ## require it does NOT return 11.0.
+  ##
+  ## The callee reads the register's own bits as two floats. Handed a pointer,
+  ## it reads the low and high halves of an address as floats, which is a
+  ## number and not a fault, so this control cannot be "passed" by a crash.
+  ## If it returned 11.0 as well, the two conventions would be
+  ## indistinguishable here and the check above would be worthless.
+  var a = callArgs()
+  # Staged through addOut, which does not consult the size classifier, so the
+  # rival shape can be built even though addAggregate would now route 8 bytes
+  # the other way. That is the point: a control has to be able to be wrong.
+  # The cells are zeroed, so what the callee sees is the ADDRESS of a cell
+  # reinterpreted as two floats -- never 11.0 for any address.
+  let cl = a.addOut(8'i32)
+  let cr = a.addOut(8'i32)
+  if cl < 0'i32 or cr < 0'i32:
+    note(r, "vec2-rival/negative-control", pvInconclusive,
+      "the rival shape could not be staged: " & a.badWhy)
+    return
+  let o = callFloat(gV2Dot, a)
+  if o.kind == coRefused:
+    note(r, "vec2-rival/negative-control", pvInconclusive,
+      "the rival call was refused rather than attempted (" & o.why &
+      "), so nothing was ruled out")
+    return
+  if o.kind == coFaulted:
+    note(r, "vec2-rival/negative-control", pvPass,
+      "the by-pointer rival faulted rather than returning 11.0, so the " &
+      "positive result above is not an artefact of a check that cannot fail")
+    return
+  if o.f == 11.0:
+    note(r, "vec2-rival/negative-control", pvFail,
+      "the by-POINTER rival ALSO returned 11.0. Both conventions cannot be " &
+      "right, so this experiment cannot distinguish them and the 8-byte " &
+      "question is NOT settled by it")
+    return
+  note(r, "vec2-rival/negative-control", pvPass,
+    "the by-pointer rival returned something other than 11.0 (it read the " &
+    "two halves of an address as floats), so the 8-byte result above is " &
+    "falsifiable and was not falsified")
+
+# ---------------------------------------------------------------------------
+# Check 6 -- STACK SPILL, on a call that needs eight slots.
+# ---------------------------------------------------------------------------
+
+proc orthoDiag(r: var ProofReport; name: string;
+               top, zNear, zFar: float; slots: int32;
+               m00, m11, m22: var float; okAll: var bool): bool =
+  ## One `Matrix4x4::Ortho` call, returning the three diagonal entries.
+  ##
+  ## `slots` is how many argument positions to declare. The correct number is
+  ## 8; passing 7 is the negative control, and it deliberately leaves the
+  ## MethodInfo* (NULL) sitting in zFar's stack slot.
+  ##
+  ## Diagonal entries only, and that is deliberate: m00/m11/m22/m33 sit at
+  ## byte 0/20/40/60 whichever way round the storage is, because a diagonal is
+  ## unchanged by transposition. Row-major-versus-column-major is a question
+  ## this check does not have to answer and therefore cannot get wrong.
+  ## (Measured anyway: boxed m00@0x10, m11@0x24, m22@0x38, m33@0x4c, so the
+  ## unboxed payload is column-major and 64 bytes.)
+  okAll = false
+  m00 = 0.0
+  m11 = 0.0
+  m22 = 0.0
+  var a = callArgs()
+  let ret = a.addSret(64'i32)
+  if ret < 0'i32:
+    note(r, name, pvInconclusive, "no 64-byte return buffer: " & a.badWhy)
+    return false
+  a.addFloat(-1.0)      # pos1 left    -> XMM1
+  a.addFloat(1.0)       # pos2 right   -> XMM2
+  a.addFloat(-4.0)      # pos3 bottom  -> XMM3
+  a.addFloat(top)       # pos4 top     -> [rsp+32]   THE FIRST SPILLED SLOT
+  a.addFloat(zNear)     # pos5         -> [rsp+40]
+  if slots >= 8'i32:
+    a.addFloat(zFar)    # pos6         -> [rsp+48]
+  if a.bad:
+    note(r, name, pvInconclusive, "the argument pack refused: " & a.badWhy)
+    return false
+  let o = callVoid(gOrtho, a)
+  if o.kind == coRefused:
+    note(r, name, pvInconclusive, "refused before calling: " & o.why)
+    return false
+  if o.kind == coFaulted:
+    note(r, name, pvFail, "the 8-slot call FAULTED: " & o.why)
+    return false
+  var k0 = false
+  var k1 = false
+  var k2 = false
+  m00 = outFloat(ret, 0'i32, k0)
+  m11 = outFloat(ret, 20'i32, k1)
+  m22 = outFloat(ret, 40'i32, k2)
+  okAll = k0 and k1 and k2
+  if not okAll:
+    note(r, name, pvInconclusive,
+      "the return buffer could not be read back -- which is not the same " &
+      "answer as zero and is not being reported as one")
+    return false
+  return true
+
+proc checkSpill(r: var ProofReport) =
+  ## `Ortho(-1, 1, -4, 4, -16, 16)` on EIGHT slots, three of them on the stack.
+  ##
+  ## An orthographic projection maps [left,right] onto a fixed range in x and
+  ## [bottom,top] onto the same range in y, so its x and y diagonal entries are
+  ## 2/(right-left) and 2/(top-bottom) in every convention there is -- GL, D3D
+  ## and Vulkan alike. With these inputs that is 2/2 = 1 and 2/8 = 0.25, both
+  ## exact in binary32.
+  ##
+  ## **m11 == 0.25 is the spill claim**, and it is the whole check: `bottom` is
+  ## the last register argument and `top` is the FIRST STACK ARGUMENT. If the
+  ## shadow space were 16 bytes instead of 32, or the slot stride 4 instead of
+  ## 8, or the arguments in the wrong order, `top` would not be 4.0 and m11
+  ## would not be 0.25. It is also a float in a spilled position, which is the
+  ## one thing `tools/gen_fast_table.py` derives rather than measures.
+  ##
+  ## m00 == 1.0 is the control on the register half of the same call.
+  ##
+  ## The z entry is reported by MAGNITUDE only: |m22| = 2/(zFar-zNear) =
+  ## 0.0625 for a GL-style depth range, and the SIGN and a D3D-style 1/(f-n)
+  ## are both live conventions that this experiment is not testing and will
+  ## not pretend to have tested. A |m22| of 0.03125 is reported INCONCLUSIVE
+  ## and named, not quietly failed.
+  var m00 = 0.0
+  var m11 = 0.0
+  var m22 = 0.0
+  var ok = false
+  if not orthoDiag(r, "spill/8-slot", 4.0, -16.0, 16.0, 8'i32, m00, m11, m22, ok):
+    return
+  if m00 != 1.0:
+    note(r, "spill/8-slot", pvFail,
+      "m00 is not 1.0, so the REGISTER half of an 8-slot call is already " &
+      "wrong and the stack half cannot be read into")
+    return
+  if m11 != 0.25:
+    note(r, "spill/8-slot", pvFail,
+      "m00 is 1.0 but m11 is not 0.25. The register arguments arrived and " &
+      "the FIRST STACKED argument did not: `top` is not reaching [rsp+32]. " &
+      "This is the shadow-space/stride/order failure, and it did not fault")
+    return
+  var mag = m22
+  if mag < 0.0: mag = -mag
+  if mag != 0.0625:
+    if mag == 0.03125:
+      note(r, "spill/8-slot", pvInconclusive,
+        "m00 and m11 are exactly right, so the first stacked argument DID " &
+        "arrive -- but |m22| is 0.03125, i.e. 1/(zFar-zNear) rather than " &
+        "2/(zFar-zNear). That is a depth-range convention this check does not " &
+        "test, not a spill failure; the last two stack slots are unproven here")
+      return
+    note(r, "spill/8-slot", pvFail,
+      "m00 and m11 are right but |m22| is neither 0.0625 nor 0.03125, so " &
+      "`zNear`/`zFar` -- stack slots 2 and 3 -- did not arrive")
+    return
+  note(r, "spill/8-slot", pvPass,
+    "Ortho(-1,1,-4,4,-16,16) on EIGHT slots returned m00=1.0, m11=0.25 and " &
+    "|m22|=0.0625 exactly -- three float arguments crossed the 32-byte shadow " &
+    "space into [rsp+32], [rsp+40], [rsp+48] in order, and a spilled float " &
+    "carried in the low half of an 8-byte slot is read correctly")
+
+proc checkSpillControl(r: var ProofReport) =
+  ## THE NEGATIVE CONTROL for spill: make the SAME call one slot SHORT.
+  ##
+  ## Declaring 7 positions instead of 8 leaves the trailing MethodInfo* -- NULL
+  ## -- in the stack slot `zFar` should have occupied, so the callee reads
+  ## zFar as 0.0. The range becomes 0-(-16) = 16, and |m22| becomes 0.125
+  ## rather than 0.0625, while m00 and m11 stay exactly right.
+  ##
+  ## That is a very specific prediction and it is the point. If the stack
+  ## layout in `aowlspt_fast.h` were wrong, a one-slot change would not move
+  ## exactly one entry by exactly a factor of two while leaving the others
+  ## alone. And it is safe: pure arithmetic, no dereference, no game state.
+  var m00 = 0.0
+  var m11 = 0.0
+  var m22 = 0.0
+  var ok = false
+  if not orthoDiag(r, "spill-short/negative-control", 4.0, -16.0, 0.0, 7'i32,
+                   m00, m11, m22, ok):
+    return
+  var mag = m22
+  if mag < 0.0: mag = -mag
+  if m11 != 0.25:
+    note(r, "spill-short/negative-control", pvInconclusive,
+      "the one-slot-short call did not even reproduce m11 = 0.25, so it is " &
+      "not isolating the last stack slot and rules nothing out")
+    return
+  if mag == 0.0625:
+    note(r, "spill-short/negative-control", pvFail,
+      "dropping the LAST stack argument changed nothing: |m22| is still " &
+      "0.0625. The 8-slot result above is therefore not evidence that the " &
+      "last stack slot is read at all -- a check that cannot fail")
+    return
+  if mag == 0.125:
+    note(r, "spill-short/negative-control", pvPass,
+      "one slot short, the callee read zFar as 0.0 and |m22| became exactly " &
+      "0.125 -- twice 0.0625, exactly as a range of 16 instead of 32 predicts " &
+      "-- while m11 stayed 0.25. Stack slot POSITION is what is being proved, " &
+      "not merely that some bytes arrived")
+    return
+  note(r, "spill-short/negative-control", pvPass,
+    "one slot short, |m22| moved off 0.0625, so the last stack slot is really " &
+    "read and the 8-slot result is falsifiable (the value was not the 0.125 " &
+    "predicted, which is worth noting but does not weaken the 8-slot PASS)")
+
+proc checkStackIntact(r: var ProofReport) =
+  ## After the spilled calls, the ORIGINAL five-slot proof must still hold.
+  ##
+  ## A mis-modelled stack does not always show up in the callee's answer; it
+  ## shows up in the CALLER afterwards. `Dot((1,2,3),(4,5,6))` was exactly 32.0
+  ## before any spilled call was made, and if it is not exactly 32.0 after
+  ## them, something the spilled calls did outlived them.
+  var a = callArgs()
+  a.addVec3(1.0, 2.0, 3.0)
+  a.addVec3(4.0, 5.0, 6.0)
+  let o = callFloat(gDot, a)
+  if o.kind != coOk:
+    note(r, "spill/stack-intact", pvFail,
+      "after the spilled calls, the plain 5-slot call no longer even runs: " & o.why)
+    return
+  if o.f == 32.0:
+    note(r, "spill/stack-intact", pvPass,
+      "the plain 5-slot Dot still returns exactly 32.0 after three spilled " &
+      "calls, so nothing those calls did to the stack outlived them")
+  else:
+    note(r, "spill/stack-intact", pvFail,
+      "the plain 5-slot Dot returned something other than 32.0 AFTER the " &
+      "spilled calls, having returned 32.0 before them. The spilled call " &
+      "shape damaged something that outlived it")
 
 # ---------------------------------------------------------------------------
 # The run
@@ -378,15 +692,24 @@ proc runCallProof*(includeRival: bool = true): ProofReport =
   checkRefusesUnproven(result)
   checkDot(result)
   checkCross(result)
+  checkVec2Dot(result)
+  checkSpill(result)
+  checkSpillControl(result)
+  checkStackIntact(result)
   if includeRival:
     checkRival(result)
+    checkVec2Rival(result)
   else:
     note(result, "rival/negative-control", pvInconclusive,
       "not run (the rival control is separately gated), so the positive " &
       "results above are unfalsified")
 
   # A fault beyond the one the rival control expects is a reason to stay off.
-  let extra = faultCount() - faultsBefore - (if includeRival: 1'i32 else: 0'i32)
+  # TWO controls are now allowed to fault, not one: `checkRival` is expected
+  # to, and `checkVec2Rival` is allowed to (it reads an address as two floats,
+  # which normally returns a number, but a fault there is a PASS for it too).
+  # An allowance that is too tight self-disables the module on a healthy run.
+  let extra = faultCount() - faultsBefore - (if includeRival: 2'i32 else: 0'i32)
   if extra > 0'i32:
     gDisabled = true
 
@@ -402,8 +725,11 @@ proc runCallProof*(includeRival: bool = true): ProofReport =
       $result.passes & " PASS, " & $result.fails & " FAIL, " &
       $result.inconclusive & " INCONCLUSIVE"
   else:
-    result.verdict = "call-proof: VERDICT by-value aggregates pass BY HIDDEN " &
-      "POINTER, and sret is (retbuf RCX, this/arg0 RDX, ...) -- " &
+    result.verdict = "call-proof: VERDICT aggregates WIDER than 8 bytes pass " &
+      "BY HIDDEN POINTER and aggregates of EXACTLY 8 bytes pass PACKED IN the " &
+      "register; sret is (retbuf RCX, this/arg0 RDX, ...); and arguments past " &
+      "position 3 SPILL to 8-byte stack slots above a 32-byte shadow area, " &
+      "proven to 8 slots -- " &
       $result.passes & " PASS, " & $result.fails & " FAIL, " &
       $result.inconclusive & " INCONCLUSIVE"
 
