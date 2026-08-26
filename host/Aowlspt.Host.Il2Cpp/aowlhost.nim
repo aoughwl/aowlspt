@@ -5439,6 +5439,14 @@ include "modstab.nim"
 ## forward-resolves procs across an include boundary but NOT variables.
 include "region.nim"
 
+## THE MAIN-MENU BETA NOTICE, DRAWN ON THE OVERLAY. Included AFTER
+## `region.nim` because it registers with the shared region, and after
+## `invoke2.nim` because it asks `UnityEngine.Screen::get_width` for the
+## back-buffer size through that file's byte-verified target table. It
+## installs NO detour. Default OFF (`uxBetaOverlay`).
+include "betanotice.nim"
+
+
 proc bindCodeGenProbe(verbose: bool): bool =
   ## THE FOURTH RIDER on `EFT.UI.PreloaderUI::Update`, and the only reason it
   ## exists is to get `codeGenAuditSelfTest` onto Unity's main thread.
@@ -6368,8 +6376,14 @@ proc takeModSet() =
   if modcontrol.parseInRaid(doc, raid) and raid != gInRaidLast:
     gInRaidLast = raid
     graphicsSetInRaid(raid)
+    betaNoticeSetMenu(raid)
     info "graphics: backend reports " & (if raid: "IN RAID â€” grading the world"
                                          else: "in menu â€” post-process off")
+
+  # The beta notice's FINISHED STATE, once it has one: how many frames it
+  # actually submitted on, not that we called a setter. Zero is the
+  # falsifiable failure and it stays silent until there is a number.
+  betaNoticeReport()
 
   # The menu's bottom-right game-mode label rides this same poll, for exactly
   # the reasons `inRaid` does: the client host has one way to reach the backend
@@ -6498,6 +6512,7 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "native settings-injection path"
   gCodeGenAudit = readBoolKey("codeGenAudit")
   gRegionOn = readBoolKey("sharedRegion")
+  betaNoticeReadFlags()
   if gCodeGenAudit:
     info "codeGenAudit is set: whenever a method has BOTH a live methodPointer " &
          "and a codeGenModule table entry, the host will log whether the two " &
@@ -7180,6 +7195,13 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       # this list.
       if gRegionOn:
         discard bindRegion(true)
+
+      # THE MAIN-MENU BETA NOTICE (opt-in, `uxBetaOverlay`). Not a rider
+      # and not a detour: a REGISTRATION with the region armed just above.
+      # Armed after it so the log reads in the order things happened.
+      if gBetaOverlayOn:
+        discard bindBetaNotice(true)
+
 
   let modsDir = joinPath(gDir, "mods")
   # The runtime may not have come up, and that deliberately does not stop this:
