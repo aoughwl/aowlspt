@@ -2328,6 +2328,81 @@ proc seasonsTickBody() =
          "banner is untouched."
 
 # ---------------------------------------------------------------------------
+# THE BOTTOM-RIGHT MODE BUTTON (`uxHideModeButton`), hidden from HERE.
+#
+# It lives at `Common UI/MenuScreen/ChangeGameModeButton` -- a DIRECT SIBLING
+# of SeasonsButton. MEASURED on the live client: `find ChangeGameModeButton`
+# over all 16 scene roots returns exactly one hit, `parent="MenuScreen"`.
+#
+# **fact #116 says `Common UI/ChangeGameModeButton` and that path DOES NOT
+# EXIST.** Being wrong by that one level cost four separate implementation
+# rounds in `modetext.nim`, each of which searched the wrong depth, correctly
+# reported "not found", and was believed. One of those rounds also drove the
+# shared scene-root enumerator ~340 times during a warm-up and took THIS
+# feature down with it -- hide seasons went silent and the host log dropped
+# from 4,248 lines to 262.
+#
+# So it is done here instead, and it does no searching at all: `gSeasonsMenu`
+# is already resolved and cached above, and this is one more `modsChildNamed`
+# on an object we are already holding. No scene enumeration, no anchor
+# dependency, no budget, nothing to back off from. If hide seasons can reach
+# MenuScreen -- and it demonstrably can, every run -- so can this.
+#
+# There is deliberately NO positional fallback, for the same reason the
+# seasons block gives: hiding whatever happens to sit there is how the Play
+# button disappears after a patch.
+var gModeBtnGo: Il2CppPtr = nil
+var gModeBtnSaid = false
+var gModeBtnSaidMissing = false
+var gModeBtnHidden = 0
+
+proc modeButtonHideFrom(menu: Il2CppPtr) =
+  ## Hide the mode button, given the MenuScreen hide-seasons just resolved.
+  if not gModeHideOn or menu == nil:
+    return
+  # Fast path: we already own the GameObject and it is still alive.
+  if gModeBtnGo != nil:
+    if duOk(gModeBtnGo, 0x20'i32) and iUnityAlive(gModeBtnGo):
+      if modsGoActive(gModeBtnGo):
+        if modsSetActive(gModeBtnGo, false):
+          inc gModeBtnHidden
+          okLog "hide mode button: the button came back after a menu " &
+                "rebuild and was switched off again (" & $gModeBtnHidden &
+                " time(s)) from the cached object."
+      return
+    gModeBtnGo = nil                    # destroyed; fall through and re-resolve
+  let btn = modsChildNamed(menu, "ChangeGameModeButton")
+  if btn == nil:
+    if not gModeBtnSaidMissing:
+      gModeBtnSaidMissing = true
+      okLog "hide mode button: MenuScreen was reached, so the menu exists, " &
+            "but it has NO child named 'ChangeGameModeButton'. NOTHING was " &
+            "hidden. This is a REAL ABSENCE at this level -- MenuScreen was " &
+            "held, not searched for -- so the name has changed, and there " &
+            "is deliberately no positional fallback."
+    return
+  let go = iGameObjectOf(btn)
+  if go == nil or not iUnityAlive(go):
+    return
+  gModeBtnGo = go
+  if not modsGoActive(go):
+    return                              # already hidden: a read, and no call
+  if modsSetActive(go, false):
+    inc gModeBtnHidden
+    if not gModeBtnSaid:
+      gModeBtnSaid = true
+      okLog "hide mode button: Common UI/MenuScreen/ChangeGameModeButton " &
+            "switched off (the bottom-right PVE ZONE / switch-game-mode " &
+            "control). Reached as one named child of the SAME MenuScreen " &
+            "hide-seasons resolves -- no scene walk, no budget. It is " &
+            "re-checked on the same throttle, so a menu rebuild hides it " &
+            "again; it is never re-enabled by this host."
+  else:
+    warn "hide mode button: GameObject::SetActive(false) REFUSED on " &
+         "ChangeGameModeButton (the target verified, the call did not run). " &
+         "The button is untouched."
+
+# ---------------------------------------------------------------------------
 # POSTFX AS A SUBTAB OF GRAPHICS (`settingsPostFxSubtab`, default OFF).
 #
 # The top row loses POSTFX and the Graphics panel gains a two-button strip:
@@ -2908,6 +2983,12 @@ proc modsBody(a: Il2CppPtr): Il2CppPtr {.exportc: "aowl_mods_body", cdecl.} =
     verBrandTickBody()
   elif gModsBranch == 3:
     seasonsTickBody()
+    # The mode button rides the SAME branch and the SAME guard -- never a
+    # second one, because `aowl_p_p_seh` is not re-entrant. It reuses the
+    # MenuScreen hide-seasons just resolved, so it costs one child lookup and
+    # no search of its own. If seasons found nothing, `gSeasonsMenu` is nil and
+    # this returns immediately.
+    modeButtonHideFrom(gSeasonsMenu)
   elif gModsBranch == 4:
     gfxTickBody()
 
@@ -3036,6 +3117,27 @@ proc modsRidersTick(regs: Il2CppPtr) =
       let self = cast[Il2CppPtr](selfRaw)
       if duOk(self, 0x20'i32):
         gVerPreloader = self
+        # AND SEED THE SHARED ENUMERATOR'S ANCHOR, if nothing has yet.
+        #
+        # `iSceneRoots` reaches `DontDestroyOnLoad` -- the only scene the live
+        # UI is actually in -- by asking a live object which scene it belongs
+        # to. That object is `gInspPreloader`, which has exactly ONE writer in
+        # the whole host: `inspectFired`, the live inspector's rider. So every
+        # consumer of `iSceneRoots` silently depended on the inspector being
+        # armed AND having ticked FIRST.
+        #
+        # Measured, on a run where it had not: `iSceneRoots` returned 0, and
+        # `hide seasons` -- which works every other run -- gave up after 30
+        # passes saying "iSceneRoots enumerated NO roots at all". The mode
+        # button, the version brand and fact #108's `$settings` anchor are the
+        # same disease; four features, one unwritten global.
+        #
+        # We already hold a verified-live `PreloaderUI` right here, from RCX,
+        # roughly 13 seconds before the inspector's first dispatch. Seeding it
+        # costs one nil check and makes the shared walk work for everyone
+        # regardless of which rider happens to tick first.
+        if gInspPreloader == nil:
+          gInspPreloader = self
   modsTabTick()
   verBrandTick()
   seasonsTick()
