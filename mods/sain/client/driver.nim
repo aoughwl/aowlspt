@@ -59,6 +59,7 @@ import ".." / preset / preset
 import bridge
 import live
 import coverprobe
+import drivecalls
 import mainthread
 
 const
@@ -1327,6 +1328,20 @@ proc driveStats*(): string =
     result = result & ", " & $ns & " ns a drain"
   else:
     result = result & ", nothing measured: no drain has run"
+  # WHAT WAS WANTED AND NOT DELIVERED, always, on every path. A total of game
+  # calls that goes up looks like success even when the one call that moves a
+  # bot is the one being dropped, so the two refusals are printed next to it
+  # rather than inferred from its absence.
+  result = result & " -- NOT DELIVERED: " & $moveTargetsDropped() &
+           " destinations (GoToPoint needs 8-9 register slots; the shape " &
+           "dispatcher tops out at 5 and refuses rather than spilling to the " &
+           "stack -- route is aowlspt/botnav), " & $selfActionsRefused() &
+           " medical self-actions (Nullable<int> is an 8-byte by-value " &
+           "aggregate whose register-vs-pointer convention is unmeasured on " &
+           "this build, and each takes a managed Action)"
+  result = result & " -- RVA targets: " & driveWhy()
+  if driveDisabled():
+    result = result & " [SELF-DISABLED after " & $driveFaults() & " faults]"
 
 proc stats*(): string =
   result = $gBots.len & " bots, " & $gDecisionsMade & " decisions, " &

@@ -1015,3 +1015,116 @@ client/     the only files that know Tarkov exists
   driver    who thinks, when: the budget, discovery, the raid-level passes
 server/     brain forcing, per-map difficulty, the preset route
 ```
+
+---
+
+## The live raid test for each capability (2026-08-26)
+
+Nothing below has run in a client. Every one of these is written so that a
+WRONG calling convention trips it, because a wrong convention does not fault —
+it returns a plausible number. "The call came back" is not a result.
+
+Flags, default OFF, staged in `config.json` **next to the DLL** (a default in
+source is not a value; the log prints each one as actually read).
+
+**PASS / FAIL / INCONCLUSIVE, never two outcomes.** A refusal, a bot that never
+spawned, an unreadable pointer, a `find` that STOPPED EARLY — all INCONCLUSIVE.
+
+### 0. Verification only, no calls. Run this first, alone.
+
+Boot to the main menu with the mod loaded and nothing else changed.
+
+* Expect in `aowlspt-host.log`: seven `sain drive: ... VERIFIED` lines, one per
+  target, each naming its RVA and `1 owner`.
+* **Falsifier:** any `REFUSED` line. A prologue mismatch here means the game
+  build moved and every RVA below is stale — stop, do not run 1–4.
+* This step calls nothing, so a crash here would be a bug in verification
+  itself.
+
+### 1. `Physics::Raycast` — the convention proof
+
+Stand a bot in the open, then against a wall. Read `probeState()`.
+
+* PASS is not "it returned true". PASS is that `chestBlocked` **changes**
+  between the two positions and changes in the right direction.
+* **Falsifier:** a constant answer. If the two Vector3s are not arriving as
+  pointers, or `maxDistance` is not in XMM2, the ray is cast from garbage and
+  answers the same thing everywhere. A sensor that always says "blocked" and a
+  sensor that always says "clear" are both this failure.
+* Second falsifier, cheaper: cast a ray of length 0.01 straight down from a
+  bot's own position. It must report blocked. Straight up in the open must
+  report clear.
+
+### 2. `NavMesh::SamplePosition` — the out-buffer proof
+
+Sample a point on known floor, then a point 200 m in the air.
+
+* PASS: floor answers `true` with `hitDist` small and the returned position
+  within ~1 m of the input; air answers `false`.
+* **Falsifier:** `hitDist` is huge, negative, or NaN, or the returned position
+  is nowhere near the query. That says the 36-byte layout is wrong, and it
+  would happen silently — the bool alone cannot catch it, which is exactly why
+  the position is read back and checked rather than discarded as the old boxed
+  path did.
+
+### 3. `BotSteering::LookToPoint` — the one that is visible
+
+One bot, one fixed world point, `hasLookTarget` only.
+
+* PASS: the bot's head/weapon tracks that point as you move around it.
+* **Falsifier:** the bot snaps to a fixed absurd direction, or its aim does not
+  respond to the point changing. That is the Vector3 arriving as three
+  registers instead of one pointer.
+
+### 4. `BotMover::Sprint` and `ShootData::Shoot`
+
+* Sprint PASS: `MovementContext.IsSprintEnabled` reads back **true** after
+  `setSprint(mover, true)` and false after `false` — read it, do not infer it.
+  **Falsifier:** it does not change, or it changes for `false` as well.
+* Shoot PASS: the bot's own returned bool agrees with an audible shot.
+  **Falsifier:** the call returns true and nothing fires — that is the shared-
+  RVA / wrong-receiver shape, and it is why `ShootData::Shoot` was required to
+  be a 1-owner symbol.
+
+## BLOCKED: the destination
+
+`BotMover::GoToPoint(Vector3, bool, float, bool, bool, bool, bool)` @0x1A2EE00
+needs 8 register slots including `this`; `EFT.BotOwner::GoToPoint(...)`
+@0x81CB40 needs 9. `AOWL_FAST_MAX_SLOTS` is **5** — Win64 spills everything past
+the fourth argument to the **stack**, and the shape dispatcher does not express
+a stack argument. `callrva` refuses rather than spilling, which is the right
+behaviour and not something to work around inside this mod.
+
+Both symbols are therefore **deliberately absent** from
+`abi/aowlspt_symbols.txt`, with the reason written there, so nobody adds a
+symbol that compiles into a call that can never be staged.
+
+So today a bot steers, sprints and stops, and does not walk anywhere. That is
+counted, not silent: `driveStats()` prints `NOT DELIVERED: N destinations`.
+
+**The route out already exists and is not this mod's to build alone.**
+`abi/aowlspt_botnav.h` carries a hand-written, byte-verified 8-argument thunk
+for `EFT.BotOwner::GoToPoint` @0x81CB40, reachable from a mod as
+`aowlspt/botnav.goTo` / `sendBotTo`. It is keyed by the **host census's bot
+ID**; this mod walks to a `Player*` of its own. Mapping one to the other is the
+next piece of work. The alternative — teaching the shape dispatcher to spill to
+the stack — is a change to shared infrastructure (`abi/aowlspt_fast.h`) and
+belongs to whoever owns it, not here.
+
+## BLOCKED: the three medical self-actions
+
+Measured offline: they do not exist at arity zero, which is how this mod used to
+bind them.
+
+    void BotFirstAid::TryApplyToCurrentPart(Nullable<int>, Action)            @0x1A20740
+    void BotStimulators::TryApply(bool, Nullable<int>, Action<bool>)          @0x1A245E0
+    void BotSurgicalKit::ApplyToCurrentPart(Action)                           @0x1A252F0
+
+Two independent blocks. `Nullable<int>` is an **8-byte** by-value aggregate, and
+8 bytes is precisely the size Win64 passes **in** the register rather than by
+pointer — a case not measured on this build, which `callrva.addAggregate`
+refuses by name. And each takes a managed `Action`; passing null bets that the
+callee null-checks before invoking, and nothing has measured that it does.
+
+Counted as `NOT DELIVERED: N medical self-actions`. `saReload` is unaffected and
+still runs.

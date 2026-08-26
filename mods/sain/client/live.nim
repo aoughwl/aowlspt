@@ -303,12 +303,35 @@ proc setAllowReflection*(v: bool) =
 proc reflectionAllowed*(): bool = gAllowReflection
 
 const ReflectionRefusal* =
-  "IL2CPP by-name resolution is refused on this build: " &
-  "il2cpp_class_from_name and il2cpp_class_get_method_from_name return " &
-  "NON-NIL handles into unmapped memory (fact #35), so a nil check passes " &
-  "and the first dereference kills the client -- measured, this mod died " &
-  "inside exactly that call. Set allowIl2cppReflection in config.json to " &
-  "re-measure it on a future build."
+  # THIS SENTENCE WAS WRONG ABOUT THE MECHANISM AND USERS READ IT.
+  #
+  # It used to say "reflection is dead / the exports return handles into
+  # unmapped memory". Unmapped memory was the SYMPTOM. Measured offline
+  # (docs/IL2CPP_EXPORTS.md): this is stock IL2CPP behind a TOKEN-GATED export
+  # ABI. 38 of the 241 exports take an undocumented trailing pointer to 32
+  # bytes and memcmp it; on a mismatch -- which is every call we make, since we
+  # never pass a token -- they return a UNIFORM RANDOM NON-ZERO uint64 drawn
+  # from a per-thread MT19937-64. Nothing faults at the call. And
+  # `il2cpp_object_get_class` is literally `mov rax,[rcx]; ret`: it validates
+  # nothing, so a bad pointer yields a plausible number in silence.
+  #
+  # Why the distinction is worth the words: "it is broken" invites someone to
+  # look for a working variant. "It answers a random number that passes every
+  # check you can write" says why no runtime check can save it, and why the
+  # only fix is to stop asking -- which is what abi/aowlspt_symbols.txt and
+  # client/drivecalls.nim now do. A direct call at a static RVA does not touch
+  # the export ABI at all.
+  "IL2CPP by-name resolution is refused on this build. " &
+  "il2cpp_class_from_name and il2cpp_class_get_method_from_name are " &
+  "TOKEN-GATED: they take a trailing 32-byte token the stock signature does " &
+  "not have, and on a mismatch they do not fail -- they return a uniform " &
+  "random non-zero uint64 (measured offline, docs/IL2CPP_EXPORTS.md). So a " &
+  "nil check passes, every signature check runs happily on a random number, " &
+  "and the first real dereference kills the client with a log identical to a " &
+  "healthy run. There is no run-time check that can catch this, which is why " &
+  "the fix is to resolve OFFLINE (abi/aowlspt_symbols.txt -> " &
+  "client/drivecalls.nim) rather than to check harder. Set " &
+  "allowIl2cppReflection in config.json only to re-measure on a future build."
 
 proc reflectionRefused*(where: string = ""): bool =
   ## True when the caller must not resolve by name. Says so once per session:
@@ -1772,8 +1795,10 @@ proc listLenWhy*(): string =
   result = "List<Player> cannot be counted on this build. `get_Count` is a " &
            "SHARED GENERIC, so it needs a real MethodInfo* -- a NULL one is " &
            "only safe for non-generics -- and the only route to one here is " &
-           "by-name resolution, which returns a handle into unmapped memory " &
-           "(fact #35). The field route is closed too: `List`1._size` has " &
+           "by-name resolution, which on this build returns a uniform " &
+           "random non-zero uint64 from a token-gated export rather than " &
+           "failing (docs/IL2CPP_EXPORTS.md). The field route is closed too: " &
+           "`List`1._size` has " &
            "offset 0 in the metadata table because a generic instantiation's " &
            "field offsets are allocated at RUNTIME, so there is no static " &
            "number to read and this mod will not guess one. Settling it needs " &
