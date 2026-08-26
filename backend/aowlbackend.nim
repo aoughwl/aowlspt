@@ -1969,6 +1969,14 @@ aowlspt-backend -- the game backend
                 drops the request without logging anything -- so those fetches
                 are served over http instead, where no validation happens. The
                 mod's `Static` backend url must name the same port.
+  --control-port N
+                the plain-HTTP port to fall back to when the asset port above
+                cannot be opened (default 6970). There is exactly ONE plain
+                listener and it carries every route this server has, `/aowlspt/*`
+                included -- so whichever port it ends up on is also the CONTROL
+                port that the launcher uses for mod management, settings and
+                profile create/select. Its real value is written to
+                <root>/aowlspt-control.json; nothing has to guess it.
   --cert PATH   TLS certificate PEM (default <root>/aowlspt-tls-cert.pem)
   --key PATH    TLS private key PEM (default <root>/aowlspt-tls-key.pem)
   --gen-cert    generate the self-signed cert+key and exit, without serving
@@ -2079,6 +2087,28 @@ proc main(): int =
   # it, and the mod's `AssetUrl` has to be moved to match.
   var assetPort = 80
   var assetPortSet = false
+  # The plain-HTTP CONTROL port.
+  #
+  # There is exactly one plain listener (`aowl_net_listen_plain`, socket
+  # `g_listenSock2`), and it is not an asset-only server: everything downstream
+  # of `accept` branches on the per-connection `ssl` handle rather than on the
+  # listener, so a connection arriving there reaches the same router as one over
+  # TLS. `/aowlspt/*` therefore already answers on it. What was missing was a
+  # port the launcher could rely on and a way to find it -- the asset port is 80,
+  # which is very often held on Windows, and when it is held the whole plain
+  # surface disappeared with it.
+  #
+  # So: 80 is tried first (assets keep the portless url the tarkov mod's
+  # `Static` needs), and if it is unavailable the plain listener is opened here
+  # instead. Assets are lost in that case and the log says so, but mod
+  # management, settings and profile creation are not.
+  #
+  # 6970 rather than a port chosen at run time: a fixed number is greppable, is
+  # stable across restarts, and sits next to the 6969 everything in this repo
+  # already knows. It is not *trusted* as a fixed number anywhere -- the value
+  # that was actually bound is published in `aowlspt-control.json` and the
+  # launcher reads that, so an override or a fallback needs no other change.
+  var controlFallback = 6970
   var i = 1
   let n = paramCount()
   while i <= n:
@@ -2110,6 +2140,17 @@ proc main(): int =
         if any:
           assetPort = v
           assetPortSet = true
+    elif a == "--control-port":
+      inc i
+      if i <= n:
+        var v = 0
+        var any = false
+        for ch in paramStr(i):
+          if ch >= '0' and ch <= '9':
+            v = v * 10 + (ord(ch) - ord('0'))
+            any = true
+        if any:
+          controlFallback = v
     elif a == "--tls":
       tlsMode = true
     elif a == "--cert":
@@ -2437,8 +2478,17 @@ proc main(): int =
   # 80 is very often held on a Windows box (IIS, the WinNAT/Hyper-V reservation,
   # Skype's old habit), so the failure is a normal thing to meet rather than an
   # exotic one, and it says what to do about it.
-  if tlsMode and assetPort > 0:
+  #
+  # `controlPort` is whatever the plain listener actually ended up on -- 0 when
+  # there is none. It is derived from the socket's own result, never assumed:
+  # the whole point of publishing it is that no reader has to guess.
+  var controlPort = 0
+  if not tlsMode:
+    # A plain run's main listener already is the plain listener. Nothing to open.
+    controlPort = gPort
+  elif assetPort > 0:
     if cNetListenPlain(int32(assetPort)) != 0'i32:
+      controlPort = assetPort
       modhost.okLog "asset listener on http://127.0.0.1:" & $assetPort
       console.line "  asset " & $assetPort & " (plain HTTP)"
     else:
@@ -2455,9 +2505,44 @@ proc main(): int =
       modhost.warn "asset port " & $assetPort & " unavailable" &
                    (if who.len > 0: " (held by " & who & ")" else: "") &
                    "; uncached asset fetches will fail"
-  elif tlsMode and assetPortSet:
+      # Assets are lost, but the control surface need not be. The same socket is
+      # still free to open on another port.
+      if controlFallback > 0 and cNetListenPlain(int32(controlFallback)) != 0'i32:
+        controlPort = controlFallback
+        modhost.okLog "control listener on http://127.0.0.1:" & $controlFallback
+        console.line "  control " & $controlFallback & " (plain HTTP, no assets)"
+  elif assetPortSet:
     console.line "  asset disabled (--asset-port 0)"
     modhost.warn "asset listener disabled; uncached asset fetches will fail"
+    if controlFallback > 0 and cNetListenPlain(int32(controlFallback)) != 0'i32:
+      controlPort = controlFallback
+      modhost.okLog "control listener on http://127.0.0.1:" & $controlFallback
+      console.line "  control " & $controlFallback & " (plain HTTP, no assets)"
+
+  # Publish it, or make sure nothing stale claims one.
+  #
+  # Written last, from `controlPort`, so the file exists only when a plain
+  # socket is genuinely listening -- and REMOVED when there is none, because a
+  # leftover file from a previous run is exactly the "confidently wrong answer"
+  # a reader cannot tell from a right one. Readers are still expected to probe
+  # the port rather than trust the file: this process can die without unlinking.
+  let ctlPath = joinPath(gRoot, "aowlspt-control.json")
+  if controlPort > 0:
+    let ctlBody = "{\"port\":" & $controlPort &
+                  ",\"url\":\"http://127.0.0.1:" & $controlPort & "\"" &
+                  ",\"pid\":" & $processId() &
+                  ",\"assets\":" & (if controlPort == assetPort: "true" else: "false") &
+                  ",\"tls\":" & (if tlsMode: "true" else: "false") & "}\n"
+    if writeTextFile(ctlPath, ctlBody).ok:
+      modhost.okLog "control port published in " & ctlPath
+    else:
+      modhost.warn "could not write " & ctlPath &
+                   "; the launcher will have to be told the port by hand"
+  else:
+    discard removeFileAt(ctlPath)
+    modhost.warn "no plain-HTTP control listener: mod management, settings " &
+                 "and profile creation are unreachable from the launcher, " &
+                 "which speaks plain HTTP only"
 
   console.line ""
   console.line "  serving. Ctrl-C to stop."

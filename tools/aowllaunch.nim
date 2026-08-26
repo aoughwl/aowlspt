@@ -146,10 +146,6 @@ Options
                  a profile was bound. The client still shows it, exactly as
                  before this feature; use this if the auto-press ever picks
                  the wrong slot, or to debug the selector itself.
-  --no-profile   start the client with no -token, so it logs in on its own.
-                 The backend binds no session for a tokenless client, so this
-                 is the first-run/character-creation path only -- it cannot
-                 reach an existing character.
   --wait         stay open until the game exits
   --no-backend   do not start the backend server
   --no-logs      do not show the live log view; exit once the game is up
@@ -203,7 +199,6 @@ type
     profileId: string
     newProfile: string
     side: string
-    noProfile: bool
     pick: bool
       ## `--pick`: restore the launcher's own TUI profile picker. Off by
       ## default -- the TUI is now the ONLY place a profile is chosen (see
@@ -232,7 +227,7 @@ proc parseArgs(): Options =
                    logsOnly: false,
                    clientWindow: false, plain: false, ascii: false,
                    profileId: "", newProfile: "", side: "Usec",
-                   noProfile: false, pick: false, port: 0,
+                   pick: false, port: 0,
                    portGiven: false, allowPortMismatch: false,
                    backendWait: 300, tailPath: "", tailTitle: "log",
                    help: false)
@@ -264,8 +259,6 @@ proc parseArgs(): Options =
     elif a == "--tail-title":
       inc i
       if i <= n: result.tailTitle = paramStr(i)
-    elif a == "--no-profile":
-      result.noProfile = true
     elif a == "--pick":
       result.pick = true
     elif a == "--no-auto-enter":
@@ -1693,12 +1686,16 @@ proc main(): int =
       # on to start a client with nothing to talk to.
       warn "  no backend at " & be & "; the client would start alone"
     let dExplicit = o.profileId.len > 0 or o.newProfile.len > 0
-    let dAuto = not o.noProfile and not o.pick and not dExplicit
-    if o.noProfile:
-      line "  would ask     nothing about profiles, and bind none (--no-profile)"
-    elif dAuto:
+    let dAuto = not o.pick and not dExplicit
+    # The profile routes go to the CONTROL port, never to `port`. In a dry run
+    # nothing has been started, so this ordinarily reports no control port --
+    # which is the truth about this moment, not a failure.
+    var dWhyCtl = ""
+    let dCtl = controlPort(root, dWhyCtl)
+    line "  control port  " & (if dCtl > 0: $dCtl else: "none") & " -- " & dWhyCtl
+    if dAuto:
       line "  would ask     nothing"
-      let l = listProfiles(port, root)
+      let l = listProfiles(dCtl, root)
       if l.error.len > 0:
         line "  would play    nothing -- " & l.error & " -- so no -token"
       else:
@@ -1715,11 +1712,8 @@ proc main(): int =
       line "  would play    " & o.profileId & " (--profile)"
     elif o.newProfile.len > 0:
       line "  would create  " & o.newProfile & " (--new) and play it"
-    elif https:
-      line "  would ask     which profile, read from the store on disk -- the " &
-           "launcher cannot use the backend's profile routes over TLS"
     else:
-      let l = listProfiles(port, root)
+      let l = listProfiles(dCtl, root)
       if l.error.len > 0:
         line "  would ask     which profile, but: " & l.error
       else:
@@ -1881,28 +1875,34 @@ proc main(): int =
   # profiles is the one case that still boots with no token: there is nothing to
   # bind, and the game's own character-creation flow is the intended first run.
   let explicitProfile = o.profileId.len > 0 or o.newProfile.len > 0
-  let autoSelect = not o.noProfile and not o.pick and not explicitProfile
+  let autoSelect = not o.pick and not explicitProfile
   heading "Profile"
-  if https and not o.noProfile:
-    # The launcher's own HTTP client is plain-only, so over TLS it cannot ask
-    # the backend for the profile list or create/select one; it reads the
-    # store on disk instead. Said once, here, so the store-source note that
-    # follows is not a surprise.
-    note "over TLS the launcher reads profiles from the store on disk: it " &
-         "speaks plain HTTP and cannot reach the backend's profile routes. " &
-         "Creating a profile from here needs a plain-HTTP (http://) backend."
+  # The launcher's own routes go to the CONTROL port, which is the backend's
+  # plain-HTTP listener -- never to `port`, which in a real launch is TLS on 443
+  # and which this plain-only HTTP client cannot speak to at all. That is not a
+  # timeout and not a race: connecting to the TLS port succeeds and then loses
+  # the connection, every time, because the server is waiting for a ClientHello
+  # this client will never send. The port is not guessed; the backend publishes
+  # the one it actually bound and `controlPort` probes it before believing it.
+  var whyCtl = ""
+  let ctlPort = controlPort(root, whyCtl)
+  if ctlPort > 0:
+    line "  " & whyCtl
+  else:
+    # Said ONCE, here, before anything is offered -- so that what follows never
+    # advertises a thing it will then refuse. The profile list still works off
+    # the store on disk; creating one does not.
+    warn whyCtl
+    note "so profiles are read from the store on disk and none can be " &
+         "created from here. Every launcher route (list, create, select) " &
+         "needs that plain-HTTP port."
   var chosen = Profile(id: "", token: "", nickname: "", side: "", level: 0,
                        edition: "", lastPlayed: 0)
   var haveChoice = false
   var viaRoute = false
   var why = ""
-  if o.noProfile:
-    note "--no-profile: the client is started with no -token and will log " &
-         "in on its own. The backend binds no session for it, so this is the " &
-         "first-run/character-creation path, not a way into an existing " &
-         "character."
-  elif autoSelect:
-    let list = listProfiles(port, root)
+  if autoSelect:
+    let list = listProfiles(ctlPort, root)
     viaRoute = list.source == psRoute
     if list.error.len > 0:
       # Not fatal: a backend with no profile route and no store on disk is an
@@ -1921,14 +1921,14 @@ proc main(): int =
         note reason & ", so the client starts with no -token and the game's " &
              "own character-creation flow runs"
   else:
-    if pickProfile(o, port, root, chosen, why, viaRoute):
+    if pickProfile(o, ctlPort, root, chosen, why, viaRoute):
       haveChoice = true
     else:
       err "no profile to play: " & why
       note "the client needs a -token to log in, and a made-up one is a " &
            "session the server has never heard of -- the game would reach the " &
            "menu and stay there. Pass --profile <id>, or --new <name> to " &
-           "create one, or --no-profile to start the client without one."
+           "create one."
       if backendProc != 0'u64:
         cSpawnKill(backendProc)
         line "  backend stopped"
@@ -1944,7 +1944,7 @@ proc main(): int =
     if viaRoute:
       var bound = Profile(id: "", token: "", nickname: "", side: "",
                           level: 0, edition: "", lastPlayed: 0)
-      let se = selectProfile(port, chosen.id, bound)
+      let se = selectProfile(ctlPort, chosen.id, bound)
       if se.len > 0:
         err "could not select the profile on the server: " & se
         note "the client would arrive on a session the server has not bound " &
@@ -2054,7 +2054,7 @@ proc main(): int =
   # we get here" every time a later line replaced it is what made the last
   # live run's single surviving line ambiguous.
   let entryLine = "auto-enter: entered, clientExited=" & $clientExited &
-    " haveChoice=" & $haveChoice & " noProfile=" & $o.noProfile &
+    " haveChoice=" & $haveChoice &
     " noAutoEnter=" & $o.noAutoEnter & " profile=" & chosen.id
   discard writeTextFile(verdictPath, entryLine & "\n")
 
@@ -2063,7 +2063,7 @@ proc main(): int =
     discard writeTextFile(verdictPath,
       entryLine & "\nauto-enter verdict: SKIPPED -- client exited while " &
       "starting\n")
-  elif haveChoice and not o.noProfile and not o.noAutoEnter:
+  elif haveChoice and not o.noAutoEnter:
     # The client's own character-select screen shows on every boot
     # regardless of `-token` -- that is measured, not assumed (see the
     # "Profile" heading above: `onProfilesV2` always renders a slot, and

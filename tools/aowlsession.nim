@@ -461,11 +461,75 @@ proc profilesFromStore*(root: string; into: var seq[Profile]): string =
     into.add p
   result = ""
 
+proc controlPortPath*(root: string): string =
+  ## Where the backend publishes the plain-HTTP control port. `root` is the
+  ## install root, and the backend's own `--root` is `<root>\aowlspt`, which is
+  ## also where it writes its log.
+  joinPath(root, "aowlspt\\aowlspt-control.json")
+
+proc controlPort*(root: string; why: var string): int =
+  ## The plain-HTTP port carrying `/aowlspt/*`, or 0.
+  ##
+  ## This exists because the launcher's HTTP client is plain-only and the client
+  ## needs HTTPS: over TLS every launcher route was unreachable, permanently,
+  ## and the profile list silently degraded to the on-disk store -- which cannot
+  ## create a profile. The backend now publishes the port of its plain listener;
+  ## this reads it.
+  ##
+  ## The file is READ but not TRUSTED. A backend that was killed leaves it
+  ## behind, and a stale port that happens to be answering is exactly the
+  ## confidently-wrong answer this whole file is written to avoid -- so the port
+  ## is probed with `answers`, which asks the tarkov mod's own selfcheck route,
+  ## and a port that does not answer is reported as no control port at all.
+  ##
+  ## `why` is always set to a sentence naming what was tried, success or not,
+  ## so a caller never has to invent one.
+  why = ""
+  let p = controlPortPath(root)
+  var text = ""
+  if not readShared(p, text):
+    why = "there is no " & p & ", so the backend published no plain-HTTP " &
+          "control port (it writes one as soon as its plain listener is up)"
+    return 0
+  var v = ""
+  if not pathGet(text, "port", v):
+    why = p & " carries no \"port\", so it is not a control file this " &
+          "launcher understands"
+    return 0
+  var n = 0
+  var any = false
+  for ch in v:
+    if ch >= '0' and ch <= '9':
+      n = n * 10 + (ord(ch) - ord('0'))
+      any = true
+  if not any or n <= 0 or n > 65535:
+    why = p & " names port \"" & v & "\", which is not a port"
+    return 0
+  let a = answers(n)
+  if a == 1:
+    why = "the backend's plain-HTTP control port is 127.0.0.1:" & $n &
+          " (from " & p & ")"
+    return n
+  if a < 0:
+    why = "127.0.0.1:" & $n & " is named in " & p & " but no socket could be " &
+          "opened at all to ask it anything"
+  else:
+    why = "127.0.0.1:" & $n & " is named in " & p & " but nothing answered " &
+          "there, so that file is stale or the listener is gone"
+  result = 0
+
 proc listProfiles*(port: int; root: string): ProfileList =
   ## The route first, the store when there is no route, and a plain statement
   ## of which happened either way.
   result = ProfileList(source: psNone, items: @[], note: "", error: "")
-  let r = call(port, "GET", "/aowlspt/tarkov/launcher/profiles", "", ProbeSession)
+  # `port <= 0` means the caller already established there is no control port,
+  # and said why. Dialling it anyway would produce "nothing is listening on
+  # 127.0.0.1:0", which names a port that was never a port and buries the real
+  # reason under a socket error.
+  var r = Reply(ok: false, status: 0, body: "",
+                error: "there is no plain-HTTP control port to ask")
+  if port > 0:
+    r = call(port, "GET", "/aowlspt/tarkov/launcher/profiles", "", ProbeSession)
   if r.ok and r.status == 200:
     var err = ""
     if not okEnvelope(r.body, err):
@@ -543,6 +607,10 @@ proc createProfile*(port: int; nickname, side: string; into: var Profile): strin
   ## failed", and the emulator already writes it.
   into = Profile(id: "", token: "", nickname: "", side: "", level: 0,
                  edition: "", lastPlayed: 0)
+  if port <= 0:
+    return "there is no plain-HTTP control port, so a profile cannot be " &
+           "created from here. See the control-port line above for what was " &
+           "tried."
   let body = "{\"nickname\":" & jsonQuoted(nickname) & ",\"side\":" &
              jsonQuoted(side) & "}"
   let r = call(port, "POST", "/aowlspt/tarkov/launcher/profile/create", body,
@@ -573,6 +641,9 @@ proc selectProfile*(port: int; id: string; into: var Profile): string =
   ## the launcher happened to hold. Returns "" on success, a sentence otherwise.
   into = Profile(id: "", token: "", nickname: "", side: "", level: 0,
                  edition: "", lastPlayed: 0)
+  if port <= 0:
+    return "there is no plain-HTTP control port, so the session cannot be " &
+           "bound to this profile from here"
   let body = "{\"id\":" & jsonQuoted(id) & "}"
   let r = call(port, "POST", "/aowlspt/tarkov/launcher/profile/select", body,
                ProbeSession)
