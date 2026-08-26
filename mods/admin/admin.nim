@@ -72,6 +72,7 @@ import aowlspt/json
 
 import "adm" / shared
 import "adm" / data
+import "adm" / presets
 
 const
   ModGuid = "aowl.admin"
@@ -84,6 +85,12 @@ const
 # ---------------------------------------------------------------------------
 
 var cfgEspMaxDistance = 400.0
+## Loot markers get their OWN range, defaulting far shorter than the player
+## range: 400 m of loose loot is several thousand markers, which is not an
+## overlay, it is a white screen. The 256-entity frame budget would silently
+## TRUNCATE that, and a silent truncation is the failure mode this project keeps
+## paying for -- so the range is what limits it, visibly, instead.
+var cfgLootMaxDistance = 60.0
 
 proc cfgBool(key: string; default: bool): bool =
   setting(key).asBool(default)
@@ -109,14 +116,37 @@ proc applyConfigToggles() =
   setToggle(gRegion, admAmmo,      cfgBool("unlimitedAmmo", false))
   setToggle(gRegion, admThermal,   cfgBool("thermalVision", false))
   setToggle(gRegion, admNightVis,  cfgBool("nightVision", false))
-  setToggle(gRegion, admFly,       cfgBool("fly", false))
+  setToggle(gRegion, admSpeed,     cfgBool("moveSpeed", false))
   setToggle(gRegion, admTeleport,  cfgBool("teleport", false))
-  setToggle(gRegion, admTimeOfDay, cfgBool("timeOfDay", false))
+  setToggle(gRegion, admTimeOfDay, cfgBool("timeFlow", false))
+  # The ESP LAYERS. Presentation only: with the master `esp` toggle off they
+  # publish nothing, which is why they may default ON without any of them being
+  # a cheat that ships enabled.
+  setToggle(gRegion, admLootEsp,   cfgBool("lootEsp", false))
+  setToggle(gRegion, admEspNames,  cfgBool("espNames", true))
+  setToggle(gRegion, admEspDist,   cfgBool("espDistance", true))
+  setToggle(gRegion, admEspBox,    cfgBool("espBoxes", true))
   cfgEspMaxDistance = setting("espMaxDistance").asFloat(400.0)
+  cfgLootMaxDistance = setting("lootEspMaxDistance").asFloat(60.0)
+  setSpeedMultiplier(setting("moveSpeedMultiplier").asFloat(1.0))
+  setTimeFactor(setting("timeFlowFactor").asFloat(1.0))
 
 # ---------------------------------------------------------------------------
 # The F12 settings schema (client-only route; the F6 menu is the live control)
 # ---------------------------------------------------------------------------
+
+proc selectedPresetSlot(): int =
+  ## The chosen preset as an INDEX. Resolved by matching the stored label
+  ## against the declared labels; a value that matches nothing returns -1, which
+  ## `presetAt` turns into an explicitly empty preset. It does NOT fall back to
+  ## slot 0 -- silently applying a kit the user did not pick is the failure this
+  ## project keeps paying for.
+  result = -1
+  let want = setting("presetSlot").asText("")
+  if want.len == 0: return 0
+  let labels = presetLabels()
+  for i in 0 ..< labels.len:
+    if labels[i] == want: return i
 
 proc adminSchema(): seq[Setting] =
   result = @[
@@ -141,14 +171,64 @@ proc adminSchema(): seq[Setting] =
                 implemented = false, description = "Read; write not bound yet"),
     boolSetting("nightVision", "Night vision", false, category = "Visuals",
                 implemented = false, description = "Read; write not bound yet"),
-    boolSetting("fly", "Fly / noclip", false, category = "Movement",
-                implemented = false, description = "Read; write not bound yet"),
+    boolSetting("moveSpeed", "Move speed multiplier", false, category = "Movement",
+                description = "Scales MovementContext MaxSpeed and " &
+                              "SprintingSpeed by the factor below. The base is " &
+                              "captured only while this is OFF, so the effect " &
+                              "cannot compound, and turning it off writes the " &
+                              "game's own numbers back."),
+    floatSetting("moveSpeedMultiplier", "Move speed x", 1.0,
+                 lo = 0.5, hi = 4.0, step = 0.1, category = "Movement"),
     boolSetting("teleport", "Teleport to marker", false, category = "Movement",
-                implemented = false, description = "Read; write not bound yet"),
-    boolSetting("timeOfDay", "Set time of day", false, category = "World",
-                implemented = false, description = "Read; write not bound yet"),
+                implemented = false,
+                description = "NOT BOUND. A teleport is a WRITE to the " &
+                              "character controller's transform -- a Unity " &
+                              "call, which is not legal on the thread this " &
+                              "mod's pass runs on. Declared unimplemented " &
+                              "rather than stubbed."),
+    boolSetting("timeFlow", "Time flow / freeze", false, category = "World",
+                description = "Scales GameDateTime.TimeFactor; 0 freezes the " &
+                              "clock and sets the game's own _locked flag so " &
+                              "nothing thaws it. This is NOT 'set the time to " &
+                              "14:00' -- that needs a DateTime tick write that " &
+                              "could not be verified offline, so it is not " &
+                              "offered."),
+    floatSetting("timeFlowFactor", "Time flow x (0 = frozen)", 1.0,
+                 lo = 0.0, hi = 24.0, step = 0.5, category = "World"),
+    boolSetting("lootEsp", "Loot ESP (dropped items)", false, category = "Visuals",
+                description = "A separate layer over GameWorld.LootList. Every " &
+                              "entry must EARN its marker (a real System.String " &
+                              "name AND a plausible position); adminDiag() " &
+                              "prints how many of how many validated, so a " &
+                              "wrong offset reads as a ratio rather than as a " &
+                              "screen of confident markers. Positions come from " &
+                              "LootItem._startPosition -- where the item was " &
+                              "PLACED, exact for static loot, stale for the " &
+                              "second an item is still rolling."),
+    floatSetting("lootEspMaxDistance", "Loot ESP max distance (m)", 60.0,
+                 lo = 5.0, hi = 500.0, step = 5.0, category = "Visuals"),
+    boolSetting("espNames", "ESP: nicknames", true, category = "Visuals",
+                description = "Presentation layer; draws nothing at all while " &
+                              "the ESP master toggle is off."),
+    boolSetting("espDistance", "ESP: distance", true, category = "Visuals"),
+    boolSetting("espBoxes", "ESP: boxes", true, category = "Visuals"),
     floatSetting("espMaxDistance", "ESP max distance (m)", 400.0,
-                 lo = 10.0, hi = 2000.0, step = 10.0, category = "Visuals")]
+                 lo = 10.0, hi = 2000.0, step = 10.0, category = "Visuals"),
+    # ---- Inventory presets -------------------------------------------------
+    # The selection PERSISTS (it is an ordinary setting, written back to
+    # config.json); applying it does not work yet and says so in its own
+    # description rather than in a comment nobody reads. See adm/presets.nim.
+    selectSetting("presetSlot", "Inventory preset", presetLabels()[0],
+                  presetLabels(), category = "Inventory",
+                  description = "Four kits ship built in: a starter kit, a " &
+                                "high-tier kit, a scav-run kit and a medical/" &
+                                "quest kit. Every line is a NAME QUERY, not a " &
+                                "template id, so a database update changes " &
+                                "what a line resolves to instead of silently " &
+                                "resolving to nothing."),
+    boolSetting("presetApply", "Apply the selected preset", false,
+                category = "Inventory", implemented = false,
+                description = presetApplyStatus())]
 
 proc onAdminSettings(url, body, session: string): string =
   var st = Ok
@@ -281,6 +361,8 @@ proc adminDiag*(): string {.exportc: "aowl_admin_diag", cdecl.} =
                $hudHeight(gRegion) & " back buffer)\n"
   result.add samplerDiag()
   result.add dataDiag()
+  result.add "\n"
+  result.add presetsDiag(selectedPresetSlot())
   result.add "\n  toggles      : "
   if gRegion == nil:
     result.add "unavailable"
@@ -298,6 +380,16 @@ proc publishCapability() =
   if dataResolved():  cap = cap or (1'u32 shl admEsp)
   if godCapable():    cap = cap or (1'u32 shl admGodmode)
   if staminaCapable(): cap = cap or (1'u32 shl admStamina)
+  if speedCapable():   cap = cap or (1'u32 shl admSpeed)
+  if timeCapable():    cap = cap or (1'u32 shl admTimeOfDay)
+  # The ESP LAYER bits are capable exactly when ESP itself is: they are
+  # presentation, not separate bindings, so gating them on anything else would
+  # leave rows the menu refuses to toggle for no reason the player can see.
+  if dataResolved():
+    cap = cap or (1'u32 shl admLootEsp)
+    cap = cap or (1'u32 shl admEspNames)
+    cap = cap or (1'u32 shl admEspDist)
+    cap = cap or (1'u32 shl admEspBox)
   # Every other mode is not bound on this build; left 0 => drawn "unavailable".
   setCapability(gRegion, cap)
 
@@ -308,6 +400,7 @@ proc publishCapability() =
 var gTick = 0'i64
 var gReported = false
 var gRaidReported = false
+var gWasInRaid = false
 
 
 proc onUpdate(elapsedMs: int64): Status =
@@ -323,7 +416,7 @@ proc onUpdate(elapsedMs: int64): Status =
   if w <= 0: w = 1920
   if h <= 0: h = 1080
 
-  collectAndPublish(gRegion, cfgEspMaxDistance, w, h)
+  collectAndPublish(gRegion, cfgEspMaxDistance, cfgLootMaxDistance, w, h)
 
   # God mode patches live combat code, so it is DEFERRED: applied only in an
   # actual raid (a live GameWorld), never at boot or the menu -- patching a
@@ -333,9 +426,17 @@ proc onUpdate(elapsedMs: int64): Status =
   # so even a wrong RVA on a future build refuses rather than corrupts.)
   if dataInRaid():
     setGodmode(toggleOn(gRegion, admGodmode))
-    if toggleOn(gRegion, admStamina): applyStamina()
+    # Stamina, move speed and time flow are ONE fault-guarded body; each write
+    # inside is separately toggle-gated, so all-off costs three nil checks.
+    applyWrites(gRegion)
+    gWasInRaid = true
   else:
     setGodmode(false)
+    if gWasInRaid:
+      # The raid ended. Put the game's own speed and clock back, rather than
+      # letting a boosted base leak into the next raid.
+      gWasInRaid = false
+      revertWrites()
 
   publishCapability()
   setStatus(gRegion, dataStatus() & "  " & godStatus())
@@ -383,6 +484,7 @@ proc onUnload(): Status =
   ## damage code. The shared region is a file mapping shared with the overlay; it
   ## is left mapped (the overlay may still be drawing).
   setGodmode(false)
+  revertWrites()
   result = Ok
 
 exportMod(

@@ -24,10 +24,14 @@ const
   admAmmo*       = 6'i32
   admThermal*    = 7'i32
   admNightVis*   = 8'i32
-  admFly*        = 9'i32
+  admSpeed*      = 9'i32   ## was admFly, which bound to nothing; see the header
   admTeleport*   = 10'i32
   admTimeOfDay*  = 11'i32
-  admCount*      = 12'i32
+  admLootEsp*    = 12'i32   ## loose loot / dropped items -- its own ESP layer
+  admEspNames*   = 13'i32   ## nicknames on the player boxes
+  admEspDist*    = 14'i32   ## metres under the player boxes
+  admEspBox*     = 15'i32   ## the box itself (off => labels only)
+  admCount*      = 16'i32
 
 # Side codes.
 const
@@ -36,12 +40,14 @@ const
   sideEnemy*   = 2'i32
   sideScav*    = 3'i32
   sideBoss*    = 4'i32
+  sideLoot*    = 5'i32
 
 # Entity flags.
 const
   flagIsAI*     = 0x1'u32
   flagDead*     = 0x2'u32
   flagOnScreen* = 0x4'u32
+  flagLoot*     = 0x8'u32
 
 # --------------------------------------------------------------- C surface
 
@@ -88,6 +94,16 @@ proc cRp(o: pointer; off: int32): pointer {.importc: "aowl_admin_rp", nodecl.}
 proc cRi(o: pointer; off: int32): int32 {.importc: "aowl_admin_ri", nodecl.}
 proc cRf(o: pointer; off: int32): cfloat {.importc: "aowl_admin_rf", nodecl.}
 proc cWf(o: pointer; off: int32; v: cfloat) {.importc: "aowl_admin_wf", nodecl.}
+proc cWi(o: pointer; off: int32; v: int32) {.importc: "aowl_admin_wi", nodecl.}
+proc cWb(o: pointer; off: int32; v: int32) {.importc: "aowl_admin_wb", nodecl.}
+proc cRd(o: pointer; off: int32): float64 {.importc: "aowl_admin_rd", nodecl.}
+proc cWd(o: pointer; off: int32; v: float64) {.importc: "aowl_admin_wd", nodecl.}
+proc cStrLen(o: pointer; off: int32): int32 {.
+  importc: "aowl_admin_str_len", nodecl.}
+proc cStrAt(o: pointer; off, i: int32): int32 {.
+  importc: "aowl_admin_str_at", nodecl.}
+proc cReadable(p: pointer; size: int32): int32 {.
+  importc: "aowl_admin_readable", nodecl.}
 
 # --------------------------------------------------------------- public
 
@@ -150,9 +166,13 @@ proc modeName*(bit: int32): string =
   of admAmmo:      "Unlimited ammo"
   of admThermal:   "Thermal vision"
   of admNightVis:  "Night vision"
-  of admFly:       "Fly / noclip"
+  of admSpeed:     "Move speed x"
   of admTeleport:  "Teleport to marker"
-  of admTimeOfDay: "Set time of day"
+  of admTimeOfDay: "Time flow / freeze"
+  of admLootEsp:   "Loot ESP"
+  of admEspNames:  "ESP: names"
+  of admEspDist:   "ESP: distance"
+  of admEspBox:    "ESP: boxes"
   else:            "?"
 
 proc hostGameWorld*(): pointer =
@@ -280,3 +300,42 @@ proc rdF32*(o: pointer; off: int): float =
   result = float(cRf(o, int32(off)))
 proc wrF32*(o: pointer; off: int; v: float) =
   if o != nil: cWf(o, int32(off), cfloat(v))
+proc wrI32*(o: pointer; off: int; v: int32) =
+  if o != nil: cWi(o, int32(off), v)
+proc wrBool*(o: pointer; off: int; v: bool) =
+  if o != nil: cWb(o, int32(off), if v: 1'i32 else: 0'i32)
+proc rdF64*(o: pointer; off: int): float64 =
+  if o == nil: return 0.0
+  result = cRd(o, int32(off))
+proc wrF64*(o: pointer; off: int; v: float64) =
+  if o != nil: cWd(o, int32(off), v)
+
+proc readable*(p: pointer; size: int): bool =
+  ## VirtualQuery. Exposed so a caller can validate a POINTER it holds, not only
+  ## a field it is about to read -- `rdPtr` checks the address it reads FROM,
+  ## which says nothing about whether the value it read back is mapped.
+  p != nil and cReadable(p, int32(size)) != 0'i32
+
+proc rdStr*(o: pointer; off: int; maxLen: int = 24): string =
+  ## A `System.String` field as ASCII, or "" if the pointer is not a string.
+  ##
+  ## Empty is a REFUSAL as well as a genuinely empty name; that ambiguity is why
+  ## no caller here treats "" as evidence of anything -- the loot pass counts the
+  ## entries whose name read back and reports that count, so a systematic
+  ## refusal shows up as a number rather than as a screen of blank markers.
+  ##
+  ## Every hop is VirtualQuery-checked in C, and a declared length outside
+  ## 1..1024 is REFUSED outright: that is what a non-string pointer looks like,
+  ## and it is the check that keeps a heterogeneous list from producing 24 bytes
+  ## of plausible garbage.
+  result = ""
+  if o == nil: return
+  var n = int(cStrLen(o, int32(off)))
+  if n <= 0: return
+  if n > maxLen: n = maxLen
+  var i = 0
+  while i < n:
+    let c = int(cStrAt(o, int32(off), int32(i)))
+    if c == 0: break
+    result.add char(c)
+    inc i

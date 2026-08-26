@@ -49,6 +49,7 @@
 #include <windows.h>
 #include <stdint.h>
 #include <string.h>
+#include <setjmp.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -70,10 +71,22 @@ enum {
     AOWL_ADM_AMMO       = 6,
     AOWL_ADM_THERMAL    = 7,
     AOWL_ADM_NIGHTVIS   = 8,
-    AOWL_ADM_FLY        = 9,
+    /* was AOWL_ADM_FLY ("Fly / noclip"), which was never bound to anything.
+     * Re-used for MOVE SPEED, which IS bound: two measured MovementContext
+     * floats with a captured base and a clamped multiplier. A bit that reads
+     * "Fly" and does nothing is worse than no bit. */
+    AOWL_ADM_SPEED      = 9,
     AOWL_ADM_TELEPORT   = 10,
     AOWL_ADM_TIMEOFDAY  = 11,
-    AOWL_ADM_COUNT      = 12
+    /* --- added: independently flag-gated ESP LAYERS and extra modes. Each is
+     * a separate bit so a layer can be off while the master ESP bit is on;
+     * every layer is enforced PRODUCER-side (the mod publishes nothing for a
+     * layer that is off), so the HUD needed no change to honour them. --- */
+    AOWL_ADM_LOOTESP    = 12,  /* loose loot / dropped items, own layer       */
+    AOWL_ADM_ESPNAMES   = 13,  /* nicknames on the player boxes               */
+    AOWL_ADM_ESPDIST    = 14,  /* metres under the player boxes               */
+    AOWL_ADM_ESPBOX     = 15,  /* the box itself (off => labels only)         */
+    AOWL_ADM_COUNT      = 16
 };
 
 /* EVERY cheat off. Seeded once by the mod.
@@ -82,7 +95,12 @@ enum {
  * cheat must default OFF -- the player opts in from the F6 menu or the settings
  * screen. This is the same default the schema and config.json now carry; all
  * three have to agree or the "default" depends on which one ran last. */
-#define AOWL_ADM_DEFAULTS  ((uint32_t)0)
+/* The CHEAT bits are all 0. The three ESP PRESENTATION bits (names, distance,
+ * boxes) default ON -- they are not cheats on their own: with the master
+ * AOWL_ADM_ESP bit off they publish and draw nothing at all, and with it on a
+ * user who opted into ESP wants boxes rather than an empty screen and three
+ * more menu presses. AOWL_ADM_LOOTESP is a separate opt-in and stays 0. */
+#define AOWL_ADM_DEFAULTS  ((uint32_t)((1u << AOWL_ADM_ESPNAMES) |                                        (1u << AOWL_ADM_ESPDIST)  |                                        (1u << AOWL_ADM_ESPBOX)))
 
 /* The menu label for one mode. Shared so the HUD and the mod's log agree. */
 static const char* aowl_admin_mode_name(int32_t bit) {
@@ -96,9 +114,13 @@ static const char* aowl_admin_mode_name(int32_t bit) {
         case AOWL_ADM_AMMO:      return "Unlimited ammo";
         case AOWL_ADM_THERMAL:   return "Thermal vision";
         case AOWL_ADM_NIGHTVIS:  return "Night vision";
-        case AOWL_ADM_FLY:       return "Fly / noclip";
+        case AOWL_ADM_SPEED:     return "Move speed x";
         case AOWL_ADM_TELEPORT:  return "Teleport to marker";
-        case AOWL_ADM_TIMEOFDAY: return "Set time of day";
+        case AOWL_ADM_TIMEOFDAY: return "Time flow / freeze";
+        case AOWL_ADM_LOOTESP:   return "Loot ESP";
+        case AOWL_ADM_ESPNAMES:  return "ESP: names";
+        case AOWL_ADM_ESPDIST:   return "ESP: distance";
+        case AOWL_ADM_ESPBOX:    return "ESP: boxes";
         default:                 return "?";
     }
 }
@@ -109,13 +131,15 @@ enum {
     AOWL_ADM_SIDE_FRIEND  = 1,   /* same side as the local player            */
     AOWL_ADM_SIDE_ENEMY   = 2,   /* a human enemy                            */
     AOWL_ADM_SIDE_SCAV    = 3,   /* an AI scav / raider                      */
-    AOWL_ADM_SIDE_BOSS    = 4    /* a boss or guard                          */
+    AOWL_ADM_SIDE_BOSS    = 4,   /* a boss or guard                          */
+    AOWL_ADM_SIDE_LOOT    = 5    /* a dropped item / loose loot marker        */
 };
 
 /* Per-entity flags. */
 #define AOWL_ADM_F_ISAI     0x1u
 #define AOWL_ADM_F_DEAD     0x2u
 #define AOWL_ADM_F_ONSCREEN 0x4u   /* projected in front of the camera        */
+#define AOWL_ADM_F_LOOT     0x8u   /* a loot marker, not a player             */
 
 #define AOWL_ADM_MAX_ENTITIES 256
 #define AOWL_ADM_NAME_LEN     24
@@ -368,6 +392,150 @@ static float aowl_admin_rf(const void* o, int32_t off) {
 static void aowl_admin_wf(void* o, int32_t off, float v) {
     char* a = (char*)o + off;
     if (aowl_admin_readable(a, 4)) memcpy(a, &v, 4);
+}
+static void aowl_admin_wi(void* o, int32_t off, int32_t v) {
+    char* a = (char*)o + off;
+    if (aowl_admin_readable(a, 4)) memcpy(a, &v, 4);
+}
+static void aowl_admin_wb(void* o, int32_t off, int32_t v) {
+    unsigned char b = v ? 1u : 0u;
+    char* a = (char*)o + off;
+    if (aowl_admin_readable(a, 1)) memcpy(a, &b, 1);
+}
+static double aowl_admin_rd(const void* o, int32_t off) {
+    double v = 0.0;
+    const char* a = (const char*)o + off;
+    if (!aowl_admin_readable(a, 8)) return 0.0;
+    memcpy(&v, a, 8);
+    return v;
+}
+static void aowl_admin_wd(void* o, int32_t off, double v) {
+    char* a = (char*)o + off;
+    if (aowl_admin_readable(a, 8)) memcpy(a, &v, 8);
+}
+
+/* ------------------------------------------------------------------ *
+ * A System.String field -> ASCII, every hop VirtualQuery-checked.
+ *
+ * The il2cpp string layout is an ABI constant, not a guessed offset, and
+ * `tools/fldoff.py`'s own mandatory self-check asserts it before it will print
+ * anything: `System.String._stringLength@0x10`, `_firstChar@0x14` (UTF-16).
+ *
+ * Returns the number of bytes written (0 on any refusal). It REFUSES rather
+ * than truncating garbage: a length outside 1..1024 means the pointer is not a
+ * string -- a wrong offset, or a heterogeneous list -- and the caller is told
+ * nothing was read instead of being handed a plausible-looking name.
+ * Non-ASCII code units become '?', so a Cyrillic nickname is still a marker
+ * rather than a crash in the 8x16 bitmap font.
+ * ------------------------------------------------------------------ */
+#define AOWL_ADM_STR_LEN_OFF   0x10
+#define AOWL_ADM_STR_CHAR_OFF  0x14
+
+static int32_t aowl_admin_rstr(const void* o, int32_t off, char* out, int32_t cap) {
+    const void* sp;
+    int32_t n, i, w;
+    if (!out || cap <= 0) return 0;
+    out[0] = 0;
+    sp = aowl_admin_rp(o, off);
+    if (!sp) return 0;
+    if (!aowl_admin_readable(sp, AOWL_ADM_STR_CHAR_OFF)) return 0;
+    n = aowl_admin_ri(sp, AOWL_ADM_STR_LEN_OFF);
+    if (n < 1 || n > 1024) return 0;          /* not a string: refuse          */
+    if (!aowl_admin_readable((const char*)sp + AOWL_ADM_STR_CHAR_OFF, n * 2))
+        return 0;
+    w = 0;
+    for (i = 0; i < n && w < cap - 1; i++) {
+        unsigned short c = 0;
+        memcpy(&c, (const char*)sp + AOWL_ADM_STR_CHAR_OFF + i * 2, 2);
+        if (c == 0) break;
+        out[w++] = (c >= 0x20 && c < 0x7f) ? (char)c : '?';
+    }
+    out[w] = 0;
+    return w;
+}
+
+/* The same read, decomposed, for a caller with no C string buffer to lend.
+ * `..._len` returns the ASCII length that WOULD be produced (0 = refused);
+ * `..._at` returns code point i, or 0 past the end. The producer calls the
+ * first once and the second `len` times, so the bound is the caller's, not a
+ * fixed buffer's. */
+static int32_t aowl_admin_str_len(const void* o, int32_t off) {
+    const void* sp = aowl_admin_rp(o, off);
+    int32_t n;
+    if (!sp) return 0;
+    if (!aowl_admin_readable(sp, AOWL_ADM_STR_CHAR_OFF)) return 0;
+    n = aowl_admin_ri(sp, AOWL_ADM_STR_LEN_OFF);
+    if (n < 1 || n > 1024) return 0;
+    if (!aowl_admin_readable((const char*)sp + AOWL_ADM_STR_CHAR_OFF, n * 2))
+        return 0;
+    return n;
+}
+static int32_t aowl_admin_str_at(const void* o, int32_t off, int32_t i) {
+    const void* sp = aowl_admin_rp(o, off);
+    unsigned short c = 0;
+    if (!sp || i < 0) return 0;
+    if (!aowl_admin_readable((const char*)sp + AOWL_ADM_STR_CHAR_OFF + i * 2, 2))
+        return 0;
+    memcpy(&c, (const char*)sp + AOWL_ADM_STR_CHAR_OFF + i * 2, 2);
+    if (c < 0x20 || c >= 0x7f) return (int32_t)'?';
+    return (int32_t)c;
+}
+
+/* ------------------------------------------------------------------ *
+ * THE FAULT GUARD.
+ *
+ * Host rule 3 -- "whole body under ONE aowl_p_p_seh; it is NOT re-entrant" --
+ * was not satisfied anywhere in this file before: prologue byte-verify and
+ * VirtualQuery were the only guards, which stop a WRONG address but not a race
+ * (an object freed between the VirtualQuery and the read, a page decommitted by
+ * the GC mid-walk).
+ *
+ * This is deliberately NOT `aowl_p_p_seh` from `abi/aowlspt_shim.h`:
+ *
+ *   * that symbol is not visible in this translation unit -- the mod includes
+ *     only this header -- and declaring it would break the mod DLL's link;
+ *   * `aowlspt_overlay.h` includes THIS header inside the host, where
+ *     `aowl_p_p_seh` DOES exist, so re-using the name would be a redefinition.
+ *
+ * It has its own thread-local `jmp_buf` and its own flag, so it cannot disarm
+ * the host's guard the way a genuine nested `aowl_p_p_seh` would: the two never
+ * share state. It is still used at TOP-LEVEL ENTRY POINTS ONLY -- one per body,
+ * never nested inside another -- because that is the rule the rule is for.
+ * ------------------------------------------------------------------ */
+
+static __declspec(thread) jmp_buf aowl_adm_seh_jmp;
+static __declspec(thread) int     aowl_adm_seh_active = 0;
+
+static LONG CALLBACK aowl_adm_seh_veh(PEXCEPTION_POINTERS ep) {
+    if (aowl_adm_seh_active &&
+        ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+        aowl_adm_seh_active = 0;
+        longjmp(aowl_adm_seh_jmp, 1);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+/* Call `f(a)` with access violations trapped. Returns f's result, or NULL if it
+ * faulted -- so a caller distinguishes "it ran" from "it died" and can count
+ * the fault towards its self-disable budget. Refuses to RE-ENTER: if this
+ * thread is already inside one of these guards the inner call runs UNGUARDED
+ * rather than clobbering the outer jmp_buf, which is the exact failure mode
+ * host rule 3 exists to prevent. */
+static void* aowl_adm_seh(void* f, void* a) {
+    static volatile LONG installed = 0;
+    void* r = 0;
+    if (!f) return 0;
+    if (InterlockedCompareExchange(&installed, 1, 0) == 0)
+        AddVectoredExceptionHandler(1, aowl_adm_seh_veh);
+    if (aowl_adm_seh_active)          /* already guarded: do NOT nest */
+        return ((void*(*)(void*))f)(a);
+    aowl_adm_seh_active = 1;
+    if (setjmp(aowl_adm_seh_jmp) == 0)
+        r = ((void*(*)(void*))f)(a);
+    else
+        r = 0;
+    aowl_adm_seh_active = 0;
+    return r;
 }
 
 /* ------------------------------------------------------------------ *

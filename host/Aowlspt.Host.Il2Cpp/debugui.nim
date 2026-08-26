@@ -1927,8 +1927,8 @@ proc aowlHostGameWorld(): pointer {.exportc: "aowl_host_gameworld", cdecl.} =
   ##
   ## NULL means one of three things, and the caller must not flatten them:
   ##   * not in a raid (no GameWorld exists)          -- expected
-  ##   * neither `botDiag` nor `debugEsp` is armed, so nothing populates the
-  ##     cache                                        -- INCONCLUSIVE, not "no raid"
+  ##   * neither `botDiag`, `debugEsp` nor `gameWorldCache` is armed, so nothing
+  ##     populates the cache                          -- INCONCLUSIVE, not "no raid"
   ##   * the cached pointer stopped validating and was dropped (line ~1864)
   ## `aowl_host_gameworld_armed` distinguishes the second case.
   result = cast[pointer](gDuGameWorld)
@@ -2027,6 +2027,20 @@ proc bindDebugEspWorld(verbose: bool): bool =
   ## two detours on one function would have the second overwrite the first's
   ## trampoline. When botdiag owns it, `botDiagRegisterFired` feeds the cache
   ## instead and this is not needed at all.
+  ##
+  ## THREE flags can now ask for it, not two. `gameWorldCache` arms EXACTLY this
+  ## one read-only detour and nothing else -- no panel, no in-world markers, no
+  ## per-frame PreloaderUI hook. It exists because `aowl_host_gameworld` is the
+  ## only route mods/admin has to a live `EFT.GameWorld`
+  ## (`Singleton<GameWorld>._instance` is a static on a GENERIC INSTANTIATION
+  ## and therefore has no static address), and before this the only way to
+  ## populate that cache was to switch on the whole debug overlay or bot
+  ## diagnostics. The admin ESP could not render without also turning on an
+  ## unrelated feature -- which is why it had never been seen to render.
+  ##
+  ## This adds NO second detour: same target, same claim path, same
+  ## `attachDrain` the other two flags already use, and it returns early if
+  ## either of them got there first.
   if gDebugEspSlot >= 0 or gBotDiagSlot >= 0:
     return true
   if not gReady or gDisableDrain:

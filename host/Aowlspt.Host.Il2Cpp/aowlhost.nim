@@ -1297,6 +1297,9 @@ var gMi2Probe = false
 ## invoke2's verified managed-call thunks.
 var gDebugUiSlot = -1
 var gDebugEspSlot = -1
+## `gameWorldCache`: arm the kind=11 GameWorld pointer cache BY ITSELF, without
+## the debug overlay or bot diagnostics. See `bindDebugEspWorld` in debugui.nim.
+var gGameWorldCache = false
 var gDebugUi = false
 var gDebugEsp = false
 
@@ -6615,6 +6618,20 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # line rather than a surprise the first time the key is pressed.
   gDebugUi = readBoolKey("debugUi")
   gDebugEsp = readBoolKey("debugEsp")
+  # `gameWorldCache` arms ONE read-only detour -- the kind=11 GameWorld pointer
+  # cache on `EFT.GameWorld::RegisterPlayer` -- and nothing else. It is what
+  # `aowl_host_gameworld` serves to mods/admin, and without it the admin ESP has
+  # no world to walk and correctly reports INCONCLUSIVE forever. Default OFF
+  # like every other feature flag; `debugEsp` and `botDiag` still imply it, and
+  # whichever arms first owns the single trampoline.
+  gGameWorldCache = readBoolKey("gameWorldCache")
+  if gGameWorldCache and not (gDebugEsp or gBotDiag):
+    info "gameWorldCache is set: ONE read-only detour on EFT.GameWorld." &
+         "RegisterPlayer will cache the live GameWorld pointer and export it " &
+         "as aowl_host_gameworld. It walks nothing, writes nothing and draws " &
+         "nothing -- it exists so an out-of-host consumer (mods/admin ESP) can " &
+         "reach the world WITHOUT binding a second detour on the same " &
+         "function, which would overwrite the first trampoline."
   if gDebugUi or gDebugEsp:
     duLoadLayout()
     info "debugUi/debugEsp is set: a per-frame detour on EFT.UI.PreloaderUI." &
@@ -6889,6 +6906,16 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
                "unverified on this build, or drain disabled)"
         elif gDebugEsp:
           discard bindDebugEspWorld(true)
+      # The GameWorld cache ON ITS OWN. Independent of the overlay: a different
+      # target (GameWorld::RegisterPlayer, not PreloaderUI::Update), so it does
+      # not need, and must not wait for, bindDebugUi. Idempotent -- if debugEsp
+      # or botDiag already claimed that target this installs nothing.
+      if gGameWorldCache:
+        if not bindDebugEspWorld(true):
+          warn "gameWorldCache is set but EFT.GameWorld::RegisterPlayer did " &
+               "not verify (or the drain is disabled), so aowl_host_gameworld " &
+               "stays NULL -- a consumer of it must report INCONCLUSIVE, not " &
+               "an absence of raid"
 
       # THE MENU'S BOTTOM-RIGHT GAME-MODE LABEL (opt-in). Bound LAST, and it
       # still is: it wants `EFT.UI.PreloaderUI::Update`, the same function the

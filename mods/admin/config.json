@@ -10,10 +10,27 @@
   "unlimitedAmmo": false,
   "thermalVision": false,
   "nightVision": false,
-  "fly": false,
+  "moveSpeed": false,
   "teleport": false,
-  "timeOfDay": false,
+  "timeFlow": false,
+  "lootEsp": false,
+
+  "_layers": "espNames / espDistance / espBoxes are PRESENTATION layers, not cheats: with `esp` false the mod publishes nothing for them and the HUD draws nothing at all. They default ON so that opting into ESP gives boxes rather than an empty screen and three more menu presses. AOWL_ADM_DEFAULTS in abi/aowlspt_admin.h carries the same three bits and must agree with this file.",
+  "espNames": true,
+  "espDistance": true,
+  "espBoxes": true,
 
   "_espMaxDistance": "Do not box players farther than this many metres from you. 400 is a sane raid default; raise it for open maps.",
-  "espMaxDistance": 400.0
+  "espMaxDistance": 400.0,
+
+  "_lootEspMaxDistance": "Loot markers have their OWN, much shorter range. A published frame holds 256 entities; 400 m of loose loot is thousands of them, so a long range would be SILENTLY truncated. The range is the visible limit instead. 60 m is roughly 'this room and the next one'.",
+  "lootEspMaxDistance": 60.0,
+
+  "_moveSpeedMultiplier": "Scales MovementContext MaxSpeed and SprintingSpeed. The base is captured only while the moveSpeed toggle is OFF, so the effect cannot compound; turning the toggle off writes the game's own numbers back. Clamped to 0.5..4.0 inside the mod regardless of what is written here.",
+  "moveSpeedMultiplier": 1.0,
+
+  "_timeFlowFactor": "Scales GameDateTime.TimeFactor. 1.0 is the game's own rate; 0.0 freezes the clock (and sets the game's own _locked flag). Clamped to 0.0..24.0 inside the mod.",
+  "timeFlowFactor": 1.0,
+
+  "_gameWorldCache": "The ESP cannot see a raid unless the HOST flag `gameWorldCache` (or debugEsp, or botDiag) is on -- that flag arms the one read-only detour that caches the live EFT.GameWorld and exports it as aowl_host_gameworld. It is a HOST flag, not a mod setting: python tools/hostcfg.py set gameWorldCache on. With it off, adminDiag() reports the gameworld line INCONCLUSIVE and says so in those words; it never reports it as 'not in a raid'."
 }
