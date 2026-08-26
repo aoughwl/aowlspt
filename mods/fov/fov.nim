@@ -319,7 +319,14 @@ var cfgVerifyHooks = false
   ## The target-verification detours. DEFAULT OFF as of the crash fix: every
   ## one of them is `patch(<name>, ...)`, i.e. a by-name host detour, and
   ## they exist purely to COUNT firings. Diagnostics are not worth a risk the
-  ## effect itself has been rewritten to avoid.
+  ## effect itself has been rewritten to avoid. Read from the NEW key
+  ## `verifyHooksByName` -- see `loadConfig` for why the old name could not
+  ## be reused.
+
+var gStaleVerifyHooks = false
+  ## Whether a deployed config.json still carries the retired `verifyHooks`
+  ## key. Reported, not obeyed. An orphaned key that silently does nothing is
+  ## how the next person loses an afternoon.
 
 var cfgDeferUntilUnityThread = true
   ## Hold every hook until the host says its main-thread drain has fired.
@@ -417,7 +424,26 @@ proc loadConfig() =
   cfgUnAimSpeedY = cfgFloat("unAimSpeedY", 4.5)
   cfgUnAimSpeedZ = cfgFloat("unAimSpeedZ", 4.5)
 
-  cfgVerifyHooks = cfgBool("verifyHooks", false)
+  # RENAMED, and the rename IS the fix.
+  #
+  # MEASURED 2026-08-26: the client died at 8.328s with the breadcrumb trail
+  # ending at E1 and no E2 -- because E2 sits on the `if not cfgVerifyHooks`
+  # branch and that branch was NOT TAKEN. The deployed
+  # D:\Aowlsptowlspt\modsov\config.json still carries
+  # `"verifyHooks": true` from before this key's default was flipped, only
+  # fov.dll was staged, and a default is not a value -- `cfgBool` reads the
+  # file. So the gate was real and could not take effect, and execution fell
+  # through into the `watch(...)` calls, every one of which is `patch(<name>,
+  # ...)`: a BY-NAME host detour, the last by-name route in the mod.
+  #
+  # Flipping a default cannot fix that, because the stale file wins. Reading
+  # a NEW key can: `verifyHooksByName` does not exist in any deployed
+  # config.json, so it can only ever take the default below until somebody
+  # writes it deliberately. `verifyHooks` is deliberately no longer read at
+  # all -- see `gStaleVerifyHooks`, which reports the orphaned key rather
+  # than silently ignoring it.
+  cfgVerifyHooks = cfgBool("verifyHooksByName", false)
+  gStaleVerifyHooks = cfgBool("verifyHooks", false)
   cfgDeferUntilUnityThread = cfgBool("deferUntilUnityThread", true)
   # Default OFF. See `armFovDriver` for why: it is the only remaining
   # by-name route on the client path, and its target's sharedness is
@@ -707,8 +733,32 @@ static uint8_t fov_byte_at(void* p, uint64_t i) {
  * run, so it is always exactly one run -- the same contract the host log
  * has. */
 static int32_t fov_bc_n = 0;
+static char fov_bc_path[1024] = {0};
+
+/* THE ABSOLUTE PATH, resolved once and reportable.
+ *
+ * The first version passed the bare relative name to fopen, which resolved
+ * against the process CWD. MEASURED: the file landed in D:\Aowlspt, one
+ * directory ABOVE where this mod said to look, and the coordinator spent a
+ * minute concluding "no crumbs were written" -- the exact wrong answer a
+ * debugging aid must never give. So the path is resolved to an absolute one
+ * up front and `fov_bc_where` hands it back, so the mod can PRINT where its
+ * own crumbs go instead of asserting it. */
+static const char* fov_bc_where(void) {
+    if (!fov_bc_path[0]) {
+        DWORD n = GetFullPathNameA("aowlspt-fov-breadcrumb.log",
+                                   (DWORD)sizeof(fov_bc_path),
+                                   fov_bc_path, NULL);
+        if (n == 0 || n >= sizeof(fov_bc_path)) {
+            /* Could not resolve it -- say so rather than invent a path. */
+            strcpy(fov_bc_path, "(GetFullPathName failed)");
+        }
+    }
+    return fov_bc_path;
+}
+
 static void fov_bc(const char* tag) {
-    FILE* f = fopen("aowlspt-fov-breadcrumb.log", fov_bc_n == 0 ? "w" : "a");
+    FILE* f = fopen(fov_bc_where(), fov_bc_n == 0 ? "w" : "a");
     if (!f) return;
     fov_bc_n++;
     /* No "
@@ -722,10 +772,35 @@ static void fov_bc(const char* tag) {
     fclose(f);
 }
 static int32_t fov_bc_count(void) { return fov_bc_n; }
+
+/* nimony has no `$cstring`, so the path comes back a character at a time
+ * rather than as a pointer nimony would have to own. */
+static int32_t fov_bc_where_len(void) { return (int32_t)strlen(fov_bc_where()); }
+static int32_t fov_bc_where_at(int32_t i) {
+    const char* p = fov_bc_where();
+    int32_t n = (int32_t)strlen(p);
+    return (i >= 0 && i < n) ? (int32_t)(unsigned char)p[i] : 0;
+}
 """.}
 
 proc fovBcC(tag: cstring) {.importc: "fov_bc", nodecl.}
 proc fovBcCount(): int32 {.importc: "fov_bc_count", nodecl.}
+proc fovBcWhereLen(): int32 {.importc: "fov_bc_where_len", nodecl.}
+proc fovBcWhereAt(i: int32): int32 {.importc: "fov_bc_where_at", nodecl.}
+
+proc bcWhere(): string =
+  ## The ABSOLUTE path the crumbs are actually going to. Printed rather than
+  ## claimed -- see the C comment on `fov_bc_where` for the run that made
+  ## that distinction expensive. Copied a character at a time because nimony
+  ## has no `$cstring`; capped, like every other loop in this file.
+  result = ""
+  let n = fovBcWhereLen()
+  if n <= 0 or n > 1024'i32:
+    return "(unknown)"
+  var i = 0'i32
+  while i < n:
+    result.add char(fovBcWhereAt(i))
+    i = i + 1'i32
 
 var gBcOn = true
 
@@ -2071,6 +2146,22 @@ proc watch(target, why: string) =
   ## thing I attached to the thing the game calls? A target that patches and
   ## then never fires answers "no", and says so in the log.
   countOnly(target, why)
+  # A SECOND, CODE-LEVEL gate, because the first one was a config value and a
+  # config value can be overridden by a file we did not ship. This one
+  # cannot: there is no key that turns it off.
+  #
+  # `hook` -> `patch` asks the host to detour a method BY NAME. That is the
+  # route the token-gated export ABI makes fatal, and these calls exist
+  # PURELY TO COUNT FIRINGS. A diagnostic must not be able to kill the
+  # process it is diagnosing.
+  if side() == sideClient:
+    bc("V* watch DECLINED (never patched): " & target)
+    warn "not watching " & target & " -- by-name host detours are refused " &
+         "in the client outright. This is a counter, and a counter must not " &
+         "be able to kill the client."
+    shrink(gWatchNames, gWatchNames.len - 1)
+    shrink(gWatchCounts, gWatchCounts.len - 1)
+    return
   if hook(target, onWatched) == Ok:
     info "watching " & target & " (" & why & ")"
   else:
@@ -2238,6 +2329,14 @@ proc armFovDriver() =
                    hookWhy & ") and everyMain was refused by the host too"
 
 proc reportType(t: var GameType) =
+  # Suspect 4 from the coordinator: a by-name resolve that merely RECORDS a
+  # garbage handle would not fault at the resolve, it would fault at the
+  # first DEREFERENCE. So crumb each of the seven individually. If a run dies
+  # between two Y-crumbs, the resolve IS the faulting statement; if it clears
+  # all seven, nothing downstream dereferences what they produced -- and
+  # nothing does, because a `GameType` here is only ever asked `available()`
+  # and none of the seven values is read anywhere else in this file.
+  bc("Y* about to resolve " & t.name)
   if t.available():
     info "  resolved " & t.name
   else:
@@ -2252,6 +2351,10 @@ proc onWorldReady() =
   ## type-existence probe. The honest state goes out instead, three-valued,
   ## and it is INFO not SUCCESS because arming is not an achievement.
   bc "W1 onWorldReady entered"
+  info "FOV: crash-proof breadcrumbs are being written to " & bcWhere() &
+       " (absolute, resolved by GetFullPathName -- read THAT file, not the " &
+       "host log, if the client dies: the host log has been measured to " &
+       "lose about six statements of tail on a hard crash)"
   info "FOV: arming on Unity's thread. World: " & gwStateText()
   bc "W2 gwStateText survived (host export queried)"
 
@@ -2310,17 +2413,36 @@ proc onWorldReady() =
   # unconditional `info` that never appeared. E1 is the crumb that settles
   # whether the log tail was lost or the process really stopped here.
   bc "E1 summary dump complete"
+  # THE VALUE IN FORCE, not the default in the source. The 8.328s death was
+  # localised to exactly this: a flag whose source default said false while
+  # the deployed config.json said true. Crumb what `cfgBool` actually
+  # returned, so the two can never be conflated again.
+  bc("E1a flags in force: verifyHooksByName=" & $cfgVerifyHooks &
+     " enableFovWrite=" & $cfgEnableFovWrite &
+     " hookFrameDriver=" & $cfgHookFrameDriver &
+     " deferUntilUnityThread=" & $cfgDeferUntilUnityThread &
+     " (retired key verifyHooks on disk=" & $gStaleVerifyHooks & ")")
+  if gStaleVerifyHooks:
+    warn "the deployed config.json still has \"verifyHooks\" in it. That " &
+         "key is RETIRED and is no longer read -- it is replaced by " &
+         "\"verifyHooksByName\", which defaults OFF. Left as-is it does " &
+         "nothing; delete it to keep the file honest."
 
   if not cfgVerifyHooks:
-    info "verifyHooks is off; not attaching the target-verification detours."
-    bc "E2 verifyHooks off -- onWorldReady returning, nothing patched"
+    info "verifyHooksByName is off; not attaching the target-verification " &
+         "detours."
+    bc "E2 verifyHooksByName off -- onWorldReady returning, nothing patched"
     return
+  bc "E3 verifyHooksByName is ON -- entering the by-name watch block"
 
   # The exact methods the original patched, in the original's order. Sixteen
   # patch slots exist; this uses six, two of which now do work rather than
   # only counting.
+  bc "G1 about to watch PWA::UpdateWeaponVariables"
   watch("EFT.Animations.ProceduralWeaponAnimation::UpdateWeaponVariables",
         "PwaWeaponParamsPatch -- where upstream learns the current weapon")
+  bc "G2 PWA::UpdateWeaponVariables watch returned"
+  bc "G3 about to watch PWA::LerpCamera"
   watch("EFT.Animations.ProceduralWeaponAnimation::LerpCamera",
         "LerpCameraPatch -- not ported: the camera-offset field names cannot " &
         "be confirmed against a running build. The cost objection this line " &
@@ -2329,6 +2451,7 @@ proc onWorldReady() =
   # Counted, not hooked again: `armFovDriver` already detoured this when it
   # took the first of its two paths, and on the `everyMain` path there is no
   # detour on it to count.
+  bc "G4 LerpCamera watch returned; on to the driver target"
   if gDriverIsEveryMain:
     info "not watching " & FrameDriver &
          " -- it could not be detoured, which is why the write is on everyMain"
@@ -2343,12 +2466,14 @@ proc onWorldReady() =
   # An effect that already hooked its target is its own watcher: `hookArgs`
   # and `hook` both go through `patch`, and two patches on one compiled
   # function would be a detour of a detour.
+  bc "G5 driver target handled; on to CalculateScaleValueByFov"
   if armed(gScaleState):
     info "watching EFT.Player::CalculateScaleValueByFov through the " &
          "replacing hook (CalculateScaleValueByFovPatch)"
   else:
     watch("EFT.Player::CalculateScaleValueByFov",
           "CalculateScaleValueByFovPatch -- viewmodel/ribcage scale")
+  bc "G6 on to get_AimingSensitivity"
   if armed(gAimSensState):
     info "watching EFT.Player.FirearmController::get_AimingSensitivity " &
          "through the scaling postfix (AimingSensitivityPatch)"
@@ -2362,6 +2487,7 @@ proc onWorldReady() =
   else:
     watch("EFT.InventoryLogic.SightComponent::get_GetCurrentSensitivity",
           "ScopeSensitivityPatch -- per-scope sensitivity")
+  bc "G7 watch block complete -- onWorldReady falling off the end"
 
 proc reportEffect(name, state: string; hits: int) =
   if armed(state):
@@ -2821,6 +2947,23 @@ var gElapsedMs = 0'i64
 
 proc onLoad(): Status =
   loadConfig()
+  # THE VALUES IN FORCE, at load, on every side. Not the defaults in this
+  # source file -- `cfgBool` reads the DEPLOYED config.json, and the 8.328s
+  # death was exactly that gap: `verifyHooks` defaulted false here and was
+  # true on disk, so the gate that was supposed to stop the by-name detours
+  # never closed. A default is not a value. Print the value.
+  info "FOV flags IN FORCE (read from the deployed config.json, not the " &
+       "source defaults): enableFovWrite=" & $cfgEnableFovWrite &
+       " verifyHooksByName=" & $cfgVerifyHooks &
+       " hookFrameDriver=" & $cfgHookFrameDriver &
+       " deferUntilUnityThread=" & $cfgDeferUntilUnityThread &
+       " enableFovScaleFix=" & $cfgEnableFovScaleFix
+  if gStaleVerifyHooks:
+    warn "the deployed config.json still carries \"verifyHooks\". That key " &
+         "is RETIRED and is NOT read any more: it was renamed to " &
+         "\"verifyHooksByName\" precisely because a stale true on disk " &
+         "silently overrode the new default and killed the client at 8.328s. " &
+         "It now does nothing. Delete it to keep the file honest."
   declareSettings(fovSchema())
   discard serve("/aowlspt/settings/" & ModGuid, onFovSettings)
   discard serve("/aowlspt/settings/" & ModGuid & "/reset", onFovSettingsReset)
