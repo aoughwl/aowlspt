@@ -135,3 +135,59 @@ after load the F6 menu owns them.
 - `adm/shared.nim` — the nimony face of `aowlspt_admin.h`.
 - `adm/data.nim` — the field-offset ESP data pass + God mode / stamina writes.
 - `config.json` — initial toggle states.
+- `adm/presets.nim` — the four built-in inventory kits and the request payload.
+- `adm/mailbox.nim` — the cross-process spawner mailbox (`Local\aowlspt_spawn_v1`).
+- `adm/dispatch.nim` — the backend half: drain the mailbox, `invoke("aowl.items", 1, ...)`.
+
+## The item spawner
+
+Four F6 rows — `Spawn: prev preset`, `Spawn: next preset`, `Spawn: apply
+preset`, `Spawn: search query` — are **momentary actions**, not modes: the menu
+sets the bit, the mod acts on the next tick and clears it. The query, the count
+and the condition are ordinary settings (`spawnQuery`, `spawnCount`,
+`spawnCondition`) because the HUD has no text entry and adding one would mean a
+keyboard hook in a live game.
+
+Nothing about the item set is on the client. The client posts an intent into a
+named section; the backend — where the database already is — searches and
+spawns and posts back at most ten pre-formatted lines. Per frame with nothing
+outstanding the client does four bit reads and one `LONG` compare, and
+allocates nothing.
+
+### The capability this mod CONSUMES: `aowl.items` / 1
+
+`mods/admin` is a consumer only. **The provider belongs in `mods/tarkov`**,
+which already owns `searchItemsCounted` and `spawnInto` in `emu/spawn.nim`.
+Registration there is:
+
+```nim
+discard provide("aowl.items", 1, onItemsCapability)
+```
+
+plus `"provides": ["aowl.items"]` on its `registry/mods.json` entry — the second
+does not make the call work, but it is what lets a refusal say
+`provider-not-loaded` ("installed, switched off") instead of `no-provider`
+("not installed"), which are different sentences to a player.
+
+Request (an object; unlisted members ignored):
+
+```
+{"op":"search","query":"salewa","limit":10}
+{"op":"spawn","query":"salewa","count":3,"condition":100}
+{"op":"spawn","preset":"Starter kit","lines":[{"q":"AKM","n":1,"c":85}, ...]}
+```
+
+Response to `search`: `{"matched":57,"hits":[{"tpl":"...","name":"..."}]}` —
+`matched` is how many there REALLY were, `hits.len` is what fitted in `limit`.
+Both are required; collapsing them is how a truncated list is presented as a
+complete one.
+
+Response to `spawn`: `{"spawned":3,"message":"...","lines":[...]}` — `spawned`
+is the TOTAL number of items actually written into the stash.
+
+**A provider must refuse with `capFail(reason)` rather than answering `capOk`
+with `spawned: 0`.** The consumer cannot tell an honest zero from a silent
+failure, so it treats `capOk` + `spawned == 0` as a refusal and says the
+spawner "answered ok but put NOTHING in the stash". That is deliberate — a
+chunked POST answered 200 with nothing changed is a shape this project has
+already paid for.

@@ -49,6 +49,7 @@
 #include <windows.h>
 #include <stdint.h>
 #include <string.h>
+#include <setjmp.h>
 
 #ifdef __cplusplus
 extern "C" {
@@ -70,11 +71,61 @@ enum {
     AOWL_ADM_AMMO       = 6,
     AOWL_ADM_THERMAL    = 7,
     AOWL_ADM_NIGHTVIS   = 8,
-    AOWL_ADM_FLY        = 9,
+    /* was AOWL_ADM_FLY ("Fly / noclip"), which was never bound to anything.
+     * Re-used for MOVE SPEED, which IS bound: two measured MovementContext
+     * floats with a captured base and a clamped multiplier. A bit that reads
+     * "Fly" and does nothing is worse than no bit. */
+    AOWL_ADM_SPEED      = 9,
     AOWL_ADM_TELEPORT   = 10,
     AOWL_ADM_TIMEOFDAY  = 11,
-    AOWL_ADM_COUNT      = 12
+    /* --- added: independently flag-gated ESP LAYERS and extra modes. Each is
+     * a separate bit so a layer can be off while the master ESP bit is on;
+     * every layer is enforced PRODUCER-side (the mod publishes nothing for a
+     * layer that is off), so the HUD needed no change to honour them. --- */
+    AOWL_ADM_LOOTESP    = 12,  /* loose loot / dropped items, own layer       */
+    AOWL_ADM_ESPNAMES   = 13,  /* nicknames on the player boxes               */
+    AOWL_ADM_ESPDIST    = 14,  /* metres under the player boxes               */
+    AOWL_ADM_ESPBOX     = 15,  /* the box itself (off => labels only)         */
+    /* --- THE ITEM SPAWNER. These four are MOMENTARY ACTIONS, not modes. ---
+     *
+     * They live in `toggles` because that is the only thing the F6 menu can
+     * write, and the menu needed NO change to gain four more rows: it draws
+     * `AOWL_ADM_COUNT` of them and activates whichever is selected. The mod
+     * clears the bit again on the very next tick after acting, so the row
+     * flashes ON and returns to OFF -- which is the honest rendering of an
+     * action, since a stuck-ON action row would read as a mode that is running
+     * and none of these keeps running.
+     *
+     * `capability` is published for them exactly like a mode: the mod sets the
+     * bit only once it can actually reach a spawner (see AowlSpawnShared
+     * below), so pressing one when the emulator is not there is refused by the
+     * menu itself rather than appearing to work.
+     *
+     * The struct is UNCHANGED by this addition -- `toggles` and `capability`
+     * are 32-bit masks with room to spare and `ents[]` is fixed -- so a binary
+     * built against the older header maps the SAME region at the same size and
+     * simply draws sixteen rows instead of twenty. That was the whole reason
+     * for reusing the toggle mask rather than growing the struct: growing it
+     * would change the mapping size, and the second mapper of a named section
+     * with a different size fails, which would have silently killed the ESP and
+     * the menu in whichever process rebuilt last. */
+    AOWL_ADM_SPAWNPREV  = 16,  /* select the previous inventory preset        */
+    AOWL_ADM_SPAWNNEXT  = 17,  /* select the next inventory preset            */
+    AOWL_ADM_SPAWNKIT   = 18,  /* apply the selected preset into the stash    */
+    AOWL_ADM_SPAWNITEM  = 19,  /* spawn the current search query              */
+    AOWL_ADM_COUNT      = 20
 };
+
+/* The four action bits as a mask, so a consumer can ask "is this row an action
+ * rather than a mode" in one test instead of four comparisons. */
+#define AOWL_ADM_ACTION_MASK ((uint32_t)((1u << AOWL_ADM_SPAWNPREV) | \
+                                         (1u << AOWL_ADM_SPAWNNEXT) | \
+                                         (1u << AOWL_ADM_SPAWNKIT)  | \
+                                         (1u << AOWL_ADM_SPAWNITEM)))
+static int32_t aowl_admin_is_action(int32_t bit) {
+    if (bit < 0 || bit >= 32) return 0;
+    return ((AOWL_ADM_ACTION_MASK >> bit) & 1u) ? 1 : 0;
+}
 
 /* EVERY cheat off. Seeded once by the mod.
  *
@@ -82,7 +133,12 @@ enum {
  * cheat must default OFF -- the player opts in from the F6 menu or the settings
  * screen. This is the same default the schema and config.json now carry; all
  * three have to agree or the "default" depends on which one ran last. */
-#define AOWL_ADM_DEFAULTS  ((uint32_t)0)
+/* The CHEAT bits are all 0. The three ESP PRESENTATION bits (names, distance,
+ * boxes) default ON -- they are not cheats on their own: with the master
+ * AOWL_ADM_ESP bit off they publish and draw nothing at all, and with it on a
+ * user who opted into ESP wants boxes rather than an empty screen and three
+ * more menu presses. AOWL_ADM_LOOTESP is a separate opt-in and stays 0. */
+#define AOWL_ADM_DEFAULTS  ((uint32_t)((1u << AOWL_ADM_ESPNAMES) |                                        (1u << AOWL_ADM_ESPDIST)  |                                        (1u << AOWL_ADM_ESPBOX)))
 
 /* The menu label for one mode. Shared so the HUD and the mod's log agree. */
 static const char* aowl_admin_mode_name(int32_t bit) {
@@ -96,9 +152,17 @@ static const char* aowl_admin_mode_name(int32_t bit) {
         case AOWL_ADM_AMMO:      return "Unlimited ammo";
         case AOWL_ADM_THERMAL:   return "Thermal vision";
         case AOWL_ADM_NIGHTVIS:  return "Night vision";
-        case AOWL_ADM_FLY:       return "Fly / noclip";
+        case AOWL_ADM_SPEED:     return "Move speed x";
         case AOWL_ADM_TELEPORT:  return "Teleport to marker";
-        case AOWL_ADM_TIMEOFDAY: return "Set time of day";
+        case AOWL_ADM_TIMEOFDAY: return "Time flow / freeze";
+        case AOWL_ADM_LOOTESP:   return "Loot ESP";
+        case AOWL_ADM_ESPNAMES:  return "ESP: names";
+        case AOWL_ADM_ESPDIST:   return "ESP: distance";
+        case AOWL_ADM_ESPBOX:    return "ESP: boxes";
+        case AOWL_ADM_SPAWNPREV: return "Spawn: prev preset";
+        case AOWL_ADM_SPAWNNEXT: return "Spawn: next preset";
+        case AOWL_ADM_SPAWNKIT:  return "Spawn: apply preset";
+        case AOWL_ADM_SPAWNITEM: return "Spawn: search query";
         default:                 return "?";
     }
 }
@@ -109,13 +173,15 @@ enum {
     AOWL_ADM_SIDE_FRIEND  = 1,   /* same side as the local player            */
     AOWL_ADM_SIDE_ENEMY   = 2,   /* a human enemy                            */
     AOWL_ADM_SIDE_SCAV    = 3,   /* an AI scav / raider                      */
-    AOWL_ADM_SIDE_BOSS    = 4    /* a boss or guard                          */
+    AOWL_ADM_SIDE_BOSS    = 4,   /* a boss or guard                          */
+    AOWL_ADM_SIDE_LOOT    = 5    /* a dropped item / loose loot marker        */
 };
 
 /* Per-entity flags. */
 #define AOWL_ADM_F_ISAI     0x1u
 #define AOWL_ADM_F_DEAD     0x2u
 #define AOWL_ADM_F_ONSCREEN 0x4u   /* projected in front of the camera        */
+#define AOWL_ADM_F_LOOT     0x8u   /* a loot marker, not a player             */
 
 #define AOWL_ADM_MAX_ENTITIES 256
 #define AOWL_ADM_NAME_LEN     24
@@ -188,6 +254,277 @@ static AowlAdminShared* aowl_admin_map(void) {
         s->version = AOWL_ADM_VERSION;
     }
     return s;
+}
+
+/* ================================================================== *
+ * THE ITEM-SPAWNER MAILBOX -- a SECOND, SEPARATE named region.
+ * ================================================================== *
+ *
+ * Why a second region rather than four more fields on AowlAdminShared: the
+ * admin region is mapped by two binaries that are not rebuilt together in
+ * every situation (the host DLL carries the HUD, the mod DLL carries the
+ * producer). `CreateFileMappingA` on an existing name keeps the ORIGINAL
+ * section's size, and a `MapViewOfFile` for more bytes than the section holds
+ * FAILS -- so growing the struct would make whichever process started second
+ * get a NULL region and lose the ESP and the F6 menu entirely, with no error
+ * anyone would connect to a struct change. A separate region cannot do that:
+ * the worst case is that the spawner is unavailable and says so.
+ *
+ * WHO TALKS TO IT. Three processes may map it, and the split is the point:
+ *
+ *   * the game client (mods/admin, side=client) is the REQUESTER. It has no
+ *     HTTP client and no route to another mod -- `provide()` is refused on the
+ *     client outright -- so it cannot spawn anything itself and must not try.
+ *   * the backend (mods/admin, side=sim) is the DISPATCHER. It runs in the
+ *     same process as the emulator mod, so `invoke("aowl.items.spawn", ...)`
+ *     from there reaches a real provider. It polls this mailbox and answers.
+ *   * the overlay (the HUD) is a READER, for drawing the last answer.
+ *
+ * That is the whole reason this file gained a mailbox instead of the mod
+ * gaining an HTTP client: the SEARCH and the SPAWN both stay server-side,
+ * where the 41 MB database already is. Nothing here ever parses an item list
+ * on the Unity thread; the client's entire per-frame cost is one LONG compare.
+ *
+ * PROTOCOL. One requester, one dispatcher, no locks:
+ *   requester: if reqSeq != ackSeq the mailbox is BUSY -- refuse, do not queue.
+ *              otherwise write kind/count/presetIdx/query, THEN bump reqSeq.
+ *   dispatcher: while ackSeq != reqSeq, copy the request out, do the work,
+ *              write outcome/matched/shown/message/lines, THEN store ackSeq.
+ * The two `THEN`s are the ordering that makes this safe: the sequence number
+ * is always the last write on each side, so a reader that sees the new number
+ * sees the payload that goes with it.
+ * ------------------------------------------------------------------ */
+
+#define AOWL_SPW_REGION_NAME "Local\\aowlspt_spawn_v1"
+#define AOWL_SPW_MAGIC       0x414F574C53505701ull   /* "AOWLSPW" + 1        */
+#define AOWL_SPW_VERSION     1
+#define AOWL_SPW_QUERY_LEN   96
+#define AOWL_SPW_MSG_LEN     256
+#define AOWL_SPW_LINES       10
+#define AOWL_SPW_LINE_LEN    72
+
+enum {
+    AOWL_SPW_KIND_NONE   = 0,
+    AOWL_SPW_KIND_SEARCH = 1,   /* look up `query`, spawn nothing            */
+    AOWL_SPW_KIND_ITEM   = 2,   /* spawn `count` of what `query` names       */
+    AOWL_SPW_KIND_PRESET = 3    /* apply preset `presetIdx`                  */
+};
+
+/* Outcomes. 0 is "never answered", which is DIFFERENT from a refusal and is
+ * rendered as INCONCLUSIVE -- a mailbox nobody is listening to must not read
+ * as "no such item". The refusal codes mirror `CapOutcome` in the SDK's
+ * capability module one for one, so the taxonomy the SDK worked out is not
+ * flattened on its way to the screen. */
+enum {
+    AOWL_SPW_OUT_NONE              = 0,
+    AOWL_SPW_OUT_OK                = 1,
+    AOWL_SPW_OUT_PROVIDER_ERROR    = 2,
+    AOWL_SPW_OUT_VERSION_MISMATCH  = 3,
+    AOWL_SPW_OUT_PROVIDER_NOTLOADED= 4,   /* installed, switched OFF         */
+    AOWL_SPW_OUT_PROVIDER_SILENT   = 5,
+    AOWL_SPW_OUT_NO_PROVIDER       = 6,   /* not installed at all            */
+    AOWL_SPW_OUT_ROSTER_UNKNOWN    = 7,
+    AOWL_SPW_OUT_BAD_REPLY         = 8,
+    AOWL_SPW_OUT_UNAVAILABLE       = 9,
+    AOWL_SPW_OUT_LOCAL_REFUSED     = 10   /* the requester declined to ask   */
+};
+
+static const char* aowl_spw_outcome_name(int32_t o) {
+    switch (o) {
+        case AOWL_SPW_OUT_OK:                 return "ok";
+        case AOWL_SPW_OUT_PROVIDER_ERROR:     return "provider-error";
+        case AOWL_SPW_OUT_VERSION_MISMATCH:   return "version-mismatch";
+        case AOWL_SPW_OUT_PROVIDER_NOTLOADED: return "provider-not-loaded";
+        case AOWL_SPW_OUT_PROVIDER_SILENT:    return "provider-silent";
+        case AOWL_SPW_OUT_NO_PROVIDER:        return "no-provider";
+        case AOWL_SPW_OUT_ROSTER_UNKNOWN:     return "roster-unknown";
+        case AOWL_SPW_OUT_BAD_REPLY:          return "bad-reply";
+        case AOWL_SPW_OUT_UNAVAILABLE:        return "unavailable";
+        case AOWL_SPW_OUT_LOCAL_REFUSED:      return "local-refused";
+        default:                              return "never-answered";
+    }
+}
+
+typedef struct AowlSpawnShared {
+    uint64_t      magic;
+    uint32_t      version;
+    uint32_t      pad0;
+
+    volatile LONG reqSeq;      /* requester bumps this LAST                  */
+    volatile LONG ackSeq;      /* dispatcher stores this LAST                */
+    volatile LONG kind;        /* AOWL_SPW_KIND_*                            */
+    volatile LONG count;       /* how many to spawn (KIND_ITEM)              */
+    volatile LONG presetIdx;   /* which kit (KIND_PRESET)                    */
+    volatile LONG condition;   /* percent, 100 = pristine                    */
+    char          query[AOWL_SPW_QUERY_LEN];
+
+    volatile LONG outcome;     /* AOWL_SPW_OUT_*                             */
+    volatile LONG matched;     /* how many the search really matched         */
+    volatile LONG shown;       /* how many of lines[] carry text             */
+    volatile LONG spawned;     /* items actually put in the stash            */
+    char          message[AOWL_SPW_MSG_LEN];
+    char          lines[AOWL_SPW_LINES][AOWL_SPW_LINE_LEN];
+
+    /* Liveness, so "nothing happened" can be told apart from "nobody is
+     * listening". The dispatcher bumps `polls` every time it looks, whether or
+     * not there was a request. Zero polls with a pending request is the
+     * INCONCLUSIVE case and the reason this counter exists. */
+    volatile LONG polls;
+    volatile LONG served;
+} AowlSpawnShared;
+
+static AowlSpawnShared* aowl_spawn_map(void) {
+    HANDLE h = CreateFileMappingA(INVALID_HANDLE_VALUE, NULL, PAGE_READWRITE, 0,
+                                  (DWORD)sizeof(AowlSpawnShared),
+                                  AOWL_SPW_REGION_NAME);
+    if (!h) return NULL;
+    int existed = (GetLastError() == ERROR_ALREADY_EXISTS);
+    AowlSpawnShared* s = (AowlSpawnShared*)MapViewOfFile(
+        h, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(AowlSpawnShared));
+    if (!s) return NULL;
+    if (!existed) { s->magic = AOWL_SPW_MAGIC; s->version = AOWL_SPW_VERSION; }
+    return s;
+}
+
+static void aowl_spw_copy(char* dst, int32_t cap, const char* src) {
+    int32_t i = 0;
+    if (!dst || cap <= 0) return;
+    if (src) for (; i < cap - 1 && src[i]; i++) dst[i] = src[i];
+    dst[i] = 0;
+}
+
+static int32_t aowl_spw_valid(AowlSpawnShared* s) {
+    return (s && s->magic == AOWL_SPW_MAGIC && s->version == AOWL_SPW_VERSION)
+           ? 1 : 0;
+}
+/* BUSY: a request is outstanding. The requester must refuse rather than
+ * overwrite -- overwriting would answer request N with request N+1's result. */
+static int32_t aowl_spw_busy(AowlSpawnShared* s) {
+    if (!aowl_spw_valid(s)) return 0;
+    return (s->reqSeq != s->ackSeq) ? 1 : 0;
+}
+
+/* ---- requester side ---- */
+static int32_t aowl_spw_post(AowlSpawnShared* s, int32_t kind,
+                             const char* query, int32_t count,
+                             int32_t presetIdx, int32_t condition) {
+    if (!aowl_spw_valid(s)) return 0;
+    if (aowl_spw_busy(s)) return 0;
+    aowl_spw_copy(s->query, AOWL_SPW_QUERY_LEN, query);
+    InterlockedExchange(&s->kind, kind);
+    InterlockedExchange(&s->count, count);
+    InterlockedExchange(&s->presetIdx, presetIdx);
+    InterlockedExchange(&s->condition, condition);
+    InterlockedExchange(&s->outcome, AOWL_SPW_OUT_NONE);
+    InterlockedExchange(&s->matched, 0);
+    InterlockedExchange(&s->shown, 0);
+    InterlockedExchange(&s->spawned, 0);
+    s->message[0] = 0;
+    MemoryBarrier();
+    InterlockedIncrement(&s->reqSeq);   /* LAST */
+    return 1;
+}
+
+/* ---- dispatcher side ---- */
+/* Poll. The query is NOT copied out here -- the Nim side reads it back
+ * character by character with the two accessors below, the same way it reads
+ * every other string in this project, because nimony has no `$` for a
+ * `cstring` and passing a `char*` out buffer across that boundary is a wider
+ * contract than this needs. */
+static int32_t aowl_spw_take(AowlSpawnShared* s, int32_t* kind, int32_t* count,
+                             int32_t* presetIdx, int32_t* condition) {
+    if (!aowl_spw_valid(s)) return 0;
+    InterlockedIncrement(&s->polls);
+    if (s->reqSeq == s->ackSeq) return 0;
+    MemoryBarrier();
+    if (kind) *kind = (int32_t)s->kind;
+    if (count) *count = (int32_t)s->count;
+    if (presetIdx) *presetIdx = (int32_t)s->presetIdx;
+    if (condition) *condition = (int32_t)s->condition;
+    return 1;
+}
+static int32_t aowl_spw_query_len(AowlSpawnShared* s) {
+    int32_t n = 0;
+    if (!aowl_spw_valid(s)) return 0;
+    while (n < AOWL_SPW_QUERY_LEN - 1 && s->query[n]) n++;
+    return n;
+}
+static int32_t aowl_spw_query_ch(AowlSpawnShared* s, int32_t i) {
+    if (!aowl_spw_valid(s) || i < 0 || i >= AOWL_SPW_QUERY_LEN) return 0;
+    return (int32_t)(unsigned char)s->query[i];
+}
+static void aowl_spw_line(AowlSpawnShared* s, int32_t i, const char* text) {
+    if (!aowl_spw_valid(s) || i < 0 || i >= AOWL_SPW_LINES) return;
+    aowl_spw_copy(s->lines[i], AOWL_SPW_LINE_LEN, text);
+}
+static void aowl_spw_answer(AowlSpawnShared* s, int32_t outcome,
+                            const char* message, int32_t matched,
+                            int32_t shown, int32_t spawned) {
+    if (!aowl_spw_valid(s)) return;
+    aowl_spw_copy(s->message, AOWL_SPW_MSG_LEN, message);
+    InterlockedExchange(&s->matched, matched);
+    InterlockedExchange(&s->shown, shown);
+    InterlockedExchange(&s->spawned, spawned);
+    InterlockedExchange(&s->outcome, outcome);
+    InterlockedIncrement(&s->served);
+    MemoryBarrier();
+    InterlockedExchange(&s->ackSeq, s->reqSeq);   /* LAST */
+}
+
+/* ---- reader side (the HUD, and the requester when it wants the answer) ---- */
+static int32_t aowl_spw_outcome(AowlSpawnShared* s) {
+    return aowl_spw_valid(s) ? (int32_t)s->outcome : AOWL_SPW_OUT_NONE;
+}
+static int32_t aowl_spw_polls(AowlSpawnShared* s) {
+    return aowl_spw_valid(s) ? (int32_t)s->polls : 0;
+}
+static int32_t aowl_spw_served(AowlSpawnShared* s) {
+    return aowl_spw_valid(s) ? (int32_t)s->served : 0;
+}
+static int32_t aowl_spw_matched(AowlSpawnShared* s) {
+    return aowl_spw_valid(s) ? (int32_t)s->matched : 0;
+}
+static int32_t aowl_spw_spawned(AowlSpawnShared* s) {
+    return aowl_spw_valid(s) ? (int32_t)s->spawned : 0;
+}
+static int32_t aowl_spw_shown(AowlSpawnShared* s) {
+    if (!aowl_spw_valid(s)) return 0;
+    { int32_t n = (int32_t)s->shown;
+      if (n < 0) n = 0;
+      if (n > AOWL_SPW_LINES) n = AOWL_SPW_LINES;
+      return n; }
+}
+static const char* aowl_spw_message(AowlSpawnShared* s) {
+    return aowl_spw_valid(s) ? s->message : "";
+}
+static const char* aowl_spw_line_at(AowlSpawnShared* s, int32_t i) {
+    if (!aowl_spw_valid(s) || i < 0 || i >= AOWL_SPW_LINES) return "";
+    return s->lines[i];
+}
+/* Character-at-a-time readers. nimony has no `$` for a `cstring`, so the Nim
+ * side reads these back one byte at a time exactly as it already does for
+ * il2cpp strings -- see `readString` in mods/admin/adm/shared.nim. Bounded by
+ * construction: the buffers are fixed and NUL-terminated by aowl_spw_copy. */
+static int32_t aowl_spw_msg_len(AowlSpawnShared* s) {
+    int32_t n = 0;
+    if (!aowl_spw_valid(s)) return 0;
+    while (n < AOWL_SPW_MSG_LEN - 1 && s->message[n]) n++;
+    return n;
+}
+static int32_t aowl_spw_msg_ch(AowlSpawnShared* s, int32_t i) {
+    if (!aowl_spw_valid(s) || i < 0 || i >= AOWL_SPW_MSG_LEN) return 0;
+    return (int32_t)(unsigned char)s->message[i];
+}
+static int32_t aowl_spw_line_len(AowlSpawnShared* s, int32_t li) {
+    int32_t n = 0;
+    if (!aowl_spw_valid(s) || li < 0 || li >= AOWL_SPW_LINES) return 0;
+    while (n < AOWL_SPW_LINE_LEN - 1 && s->lines[li][n]) n++;
+    return n;
+}
+static int32_t aowl_spw_line_ch(AowlSpawnShared* s, int32_t li, int32_t i) {
+    if (!aowl_spw_valid(s) || li < 0 || li >= AOWL_SPW_LINES) return 0;
+    if (i < 0 || i >= AOWL_SPW_LINE_LEN) return 0;
+    return (int32_t)(unsigned char)s->lines[li][i];
 }
 
 /* ------------------------------------------------------------------ *
@@ -368,6 +705,150 @@ static float aowl_admin_rf(const void* o, int32_t off) {
 static void aowl_admin_wf(void* o, int32_t off, float v) {
     char* a = (char*)o + off;
     if (aowl_admin_readable(a, 4)) memcpy(a, &v, 4);
+}
+static void aowl_admin_wi(void* o, int32_t off, int32_t v) {
+    char* a = (char*)o + off;
+    if (aowl_admin_readable(a, 4)) memcpy(a, &v, 4);
+}
+static void aowl_admin_wb(void* o, int32_t off, int32_t v) {
+    unsigned char b = v ? 1u : 0u;
+    char* a = (char*)o + off;
+    if (aowl_admin_readable(a, 1)) memcpy(a, &b, 1);
+}
+static double aowl_admin_rd(const void* o, int32_t off) {
+    double v = 0.0;
+    const char* a = (const char*)o + off;
+    if (!aowl_admin_readable(a, 8)) return 0.0;
+    memcpy(&v, a, 8);
+    return v;
+}
+static void aowl_admin_wd(void* o, int32_t off, double v) {
+    char* a = (char*)o + off;
+    if (aowl_admin_readable(a, 8)) memcpy(a, &v, 8);
+}
+
+/* ------------------------------------------------------------------ *
+ * A System.String field -> ASCII, every hop VirtualQuery-checked.
+ *
+ * The il2cpp string layout is an ABI constant, not a guessed offset, and
+ * `tools/fldoff.py`'s own mandatory self-check asserts it before it will print
+ * anything: `System.String._stringLength@0x10`, `_firstChar@0x14` (UTF-16).
+ *
+ * Returns the number of bytes written (0 on any refusal). It REFUSES rather
+ * than truncating garbage: a length outside 1..1024 means the pointer is not a
+ * string -- a wrong offset, or a heterogeneous list -- and the caller is told
+ * nothing was read instead of being handed a plausible-looking name.
+ * Non-ASCII code units become '?', so a Cyrillic nickname is still a marker
+ * rather than a crash in the 8x16 bitmap font.
+ * ------------------------------------------------------------------ */
+#define AOWL_ADM_STR_LEN_OFF   0x10
+#define AOWL_ADM_STR_CHAR_OFF  0x14
+
+static int32_t aowl_admin_rstr(const void* o, int32_t off, char* out, int32_t cap) {
+    const void* sp;
+    int32_t n, i, w;
+    if (!out || cap <= 0) return 0;
+    out[0] = 0;
+    sp = aowl_admin_rp(o, off);
+    if (!sp) return 0;
+    if (!aowl_admin_readable(sp, AOWL_ADM_STR_CHAR_OFF)) return 0;
+    n = aowl_admin_ri(sp, AOWL_ADM_STR_LEN_OFF);
+    if (n < 1 || n > 1024) return 0;          /* not a string: refuse          */
+    if (!aowl_admin_readable((const char*)sp + AOWL_ADM_STR_CHAR_OFF, n * 2))
+        return 0;
+    w = 0;
+    for (i = 0; i < n && w < cap - 1; i++) {
+        unsigned short c = 0;
+        memcpy(&c, (const char*)sp + AOWL_ADM_STR_CHAR_OFF + i * 2, 2);
+        if (c == 0) break;
+        out[w++] = (c >= 0x20 && c < 0x7f) ? (char)c : '?';
+    }
+    out[w] = 0;
+    return w;
+}
+
+/* The same read, decomposed, for a caller with no C string buffer to lend.
+ * `..._len` returns the ASCII length that WOULD be produced (0 = refused);
+ * `..._at` returns code point i, or 0 past the end. The producer calls the
+ * first once and the second `len` times, so the bound is the caller's, not a
+ * fixed buffer's. */
+static int32_t aowl_admin_str_len(const void* o, int32_t off) {
+    const void* sp = aowl_admin_rp(o, off);
+    int32_t n;
+    if (!sp) return 0;
+    if (!aowl_admin_readable(sp, AOWL_ADM_STR_CHAR_OFF)) return 0;
+    n = aowl_admin_ri(sp, AOWL_ADM_STR_LEN_OFF);
+    if (n < 1 || n > 1024) return 0;
+    if (!aowl_admin_readable((const char*)sp + AOWL_ADM_STR_CHAR_OFF, n * 2))
+        return 0;
+    return n;
+}
+static int32_t aowl_admin_str_at(const void* o, int32_t off, int32_t i) {
+    const void* sp = aowl_admin_rp(o, off);
+    unsigned short c = 0;
+    if (!sp || i < 0) return 0;
+    if (!aowl_admin_readable((const char*)sp + AOWL_ADM_STR_CHAR_OFF + i * 2, 2))
+        return 0;
+    memcpy(&c, (const char*)sp + AOWL_ADM_STR_CHAR_OFF + i * 2, 2);
+    if (c < 0x20 || c >= 0x7f) return (int32_t)'?';
+    return (int32_t)c;
+}
+
+/* ------------------------------------------------------------------ *
+ * THE FAULT GUARD.
+ *
+ * Host rule 3 -- "whole body under ONE aowl_p_p_seh; it is NOT re-entrant" --
+ * was not satisfied anywhere in this file before: prologue byte-verify and
+ * VirtualQuery were the only guards, which stop a WRONG address but not a race
+ * (an object freed between the VirtualQuery and the read, a page decommitted by
+ * the GC mid-walk).
+ *
+ * This is deliberately NOT `aowl_p_p_seh` from `abi/aowlspt_shim.h`:
+ *
+ *   * that symbol is not visible in this translation unit -- the mod includes
+ *     only this header -- and declaring it would break the mod DLL's link;
+ *   * `aowlspt_overlay.h` includes THIS header inside the host, where
+ *     `aowl_p_p_seh` DOES exist, so re-using the name would be a redefinition.
+ *
+ * It has its own thread-local `jmp_buf` and its own flag, so it cannot disarm
+ * the host's guard the way a genuine nested `aowl_p_p_seh` would: the two never
+ * share state. It is still used at TOP-LEVEL ENTRY POINTS ONLY -- one per body,
+ * never nested inside another -- because that is the rule the rule is for.
+ * ------------------------------------------------------------------ */
+
+static __declspec(thread) jmp_buf aowl_adm_seh_jmp;
+static __declspec(thread) int     aowl_adm_seh_active = 0;
+
+static LONG CALLBACK aowl_adm_seh_veh(PEXCEPTION_POINTERS ep) {
+    if (aowl_adm_seh_active &&
+        ep->ExceptionRecord->ExceptionCode == EXCEPTION_ACCESS_VIOLATION) {
+        aowl_adm_seh_active = 0;
+        longjmp(aowl_adm_seh_jmp, 1);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
+/* Call `f(a)` with access violations trapped. Returns f's result, or NULL if it
+ * faulted -- so a caller distinguishes "it ran" from "it died" and can count
+ * the fault towards its self-disable budget. Refuses to RE-ENTER: if this
+ * thread is already inside one of these guards the inner call runs UNGUARDED
+ * rather than clobbering the outer jmp_buf, which is the exact failure mode
+ * host rule 3 exists to prevent. */
+static void* aowl_adm_seh(void* f, void* a) {
+    static volatile LONG installed = 0;
+    void* r = 0;
+    if (!f) return 0;
+    if (InterlockedCompareExchange(&installed, 1, 0) == 0)
+        AddVectoredExceptionHandler(1, aowl_adm_seh_veh);
+    if (aowl_adm_seh_active)          /* already guarded: do NOT nest */
+        return ((void*(*)(void*))f)(a);
+    aowl_adm_seh_active = 1;
+    if (setjmp(aowl_adm_seh_jmp) == 0)
+        r = ((void*(*)(void*))f)(a);
+    else
+        r = 0;
+    aowl_adm_seh_active = 0;
+    return r;
 }
 
 /* ------------------------------------------------------------------ *

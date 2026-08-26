@@ -72,6 +72,9 @@ import aowlspt/json
 
 import "adm" / shared
 import "adm" / data
+import "adm" / mailbox
+import "adm" / presets
+import "adm" / dispatch
 
 const
   ModGuid = "aowl.admin"
@@ -84,6 +87,12 @@ const
 # ---------------------------------------------------------------------------
 
 var cfgEspMaxDistance = 400.0
+## Loot markers get their OWN range, defaulting far shorter than the player
+## range: 400 m of loose loot is several thousand markers, which is not an
+## overlay, it is a white screen. The 256-entity frame budget would silently
+## TRUNCATE that, and a silent truncation is the failure mode this project keeps
+## paying for -- so the range is what limits it, visibly, instead.
+var cfgLootMaxDistance = 60.0
 
 proc cfgBool(key: string; default: bool): bool =
   setting(key).asBool(default)
@@ -109,14 +118,47 @@ proc applyConfigToggles() =
   setToggle(gRegion, admAmmo,      cfgBool("unlimitedAmmo", false))
   setToggle(gRegion, admThermal,   cfgBool("thermalVision", false))
   setToggle(gRegion, admNightVis,  cfgBool("nightVision", false))
-  setToggle(gRegion, admFly,       cfgBool("fly", false))
+  setToggle(gRegion, admSpeed,     cfgBool("moveSpeed", false))
   setToggle(gRegion, admTeleport,  cfgBool("teleport", false))
-  setToggle(gRegion, admTimeOfDay, cfgBool("timeOfDay", false))
+  setToggle(gRegion, admTimeOfDay, cfgBool("timeFlow", false))
+  # The ESP LAYERS. Presentation only: with the master `esp` toggle off they
+  # publish nothing, which is why they may default ON without any of them being
+  # a cheat that ships enabled.
+  setToggle(gRegion, admLootEsp,   cfgBool("lootEsp", false))
+  setToggle(gRegion, admEspNames,  cfgBool("espNames", true))
+  setToggle(gRegion, admEspDist,   cfgBool("espDistance", true))
+  setToggle(gRegion, admEspBox,    cfgBool("espBoxes", true))
+  # The four SPAWNER ACTION rows are cleared, unconditionally and with no
+  # config key behind them. They are momentary actions, not modes: a bit left
+  # set in a region a previous process created would fire a spawn on the first
+  # tick of this one, which is a cheat running because of a stale byte rather
+  # than because anyone asked. "A default is not a value" -- so this one is not
+  # a default, it is an assignment.
+  setToggle(gRegion, admSpawnPrev, false)
+  setToggle(gRegion, admSpawnNext, false)
+  setToggle(gRegion, admSpawnKit,  false)
+  setToggle(gRegion, admSpawnItem, false)
   cfgEspMaxDistance = setting("espMaxDistance").asFloat(400.0)
+  cfgLootMaxDistance = setting("lootEspMaxDistance").asFloat(60.0)
+  setSpeedMultiplier(setting("moveSpeedMultiplier").asFloat(1.0))
+  setTimeFactor(setting("timeFlowFactor").asFloat(1.0))
 
 # ---------------------------------------------------------------------------
 # The F12 settings schema (client-only route; the F6 menu is the live control)
 # ---------------------------------------------------------------------------
+
+proc selectedPresetSlot(): int =
+  ## The chosen preset as an INDEX. Resolved by matching the stored label
+  ## against the declared labels; a value that matches nothing returns -1, which
+  ## `presetAt` turns into an explicitly empty preset. It does NOT fall back to
+  ## slot 0 -- silently applying a kit the user did not pick is the failure this
+  ## project keeps paying for.
+  result = -1
+  let want = setting("presetSlot").asText("")
+  if want.len == 0: return 0
+  let labels = presetLabels()
+  for i in 0 ..< labels.len:
+    if labels[i] == want: return i
 
 proc adminSchema(): seq[Setting] =
   result = @[
@@ -141,14 +183,86 @@ proc adminSchema(): seq[Setting] =
                 implemented = false, description = "Read; write not bound yet"),
     boolSetting("nightVision", "Night vision", false, category = "Visuals",
                 implemented = false, description = "Read; write not bound yet"),
-    boolSetting("fly", "Fly / noclip", false, category = "Movement",
-                implemented = false, description = "Read; write not bound yet"),
+    boolSetting("moveSpeed", "Move speed multiplier", false, category = "Movement",
+                description = "Scales MovementContext MaxSpeed and " &
+                              "SprintingSpeed by the factor below. The base is " &
+                              "captured only while this is OFF, so the effect " &
+                              "cannot compound, and turning it off writes the " &
+                              "game's own numbers back."),
+    floatSetting("moveSpeedMultiplier", "Move speed x", 1.0,
+                 lo = 0.5, hi = 4.0, step = 0.1, category = "Movement"),
     boolSetting("teleport", "Teleport to marker", false, category = "Movement",
-                implemented = false, description = "Read; write not bound yet"),
-    boolSetting("timeOfDay", "Set time of day", false, category = "World",
-                implemented = false, description = "Read; write not bound yet"),
+                implemented = false,
+                description = "NOT BOUND. A teleport is a WRITE to the " &
+                              "character controller's transform -- a Unity " &
+                              "call, which is not legal on the thread this " &
+                              "mod's pass runs on. Declared unimplemented " &
+                              "rather than stubbed."),
+    boolSetting("timeFlow", "Time flow / freeze", false, category = "World",
+                description = "Scales GameDateTime.TimeFactor; 0 freezes the " &
+                              "clock and sets the game's own _locked flag so " &
+                              "nothing thaws it. This is NOT 'set the time to " &
+                              "14:00' -- that needs a DateTime tick write that " &
+                              "could not be verified offline, so it is not " &
+                              "offered."),
+    floatSetting("timeFlowFactor", "Time flow x (0 = frozen)", 1.0,
+                 lo = 0.0, hi = 24.0, step = 0.5, category = "World"),
+    boolSetting("lootEsp", "Loot ESP (dropped items)", false, category = "Visuals",
+                description = "A separate layer over GameWorld.LootList. Every " &
+                              "entry must EARN its marker (a real System.String " &
+                              "name AND a plausible position); adminDiag() " &
+                              "prints how many of how many validated, so a " &
+                              "wrong offset reads as a ratio rather than as a " &
+                              "screen of confident markers. Positions come from " &
+                              "LootItem._startPosition -- where the item was " &
+                              "PLACED, exact for static loot, stale for the " &
+                              "second an item is still rolling."),
+    floatSetting("lootEspMaxDistance", "Loot ESP max distance (m)", 60.0,
+                 lo = 5.0, hi = 500.0, step = 5.0, category = "Visuals"),
+    boolSetting("espNames", "ESP: nicknames", true, category = "Visuals",
+                description = "Presentation layer; draws nothing at all while " &
+                              "the ESP master toggle is off."),
+    boolSetting("espDistance", "ESP: distance", true, category = "Visuals"),
+    boolSetting("espBoxes", "ESP: boxes", true, category = "Visuals"),
     floatSetting("espMaxDistance", "ESP max distance (m)", 400.0,
-                 lo = 10.0, hi = 2000.0, step = 10.0, category = "Visuals")]
+                 lo = 10.0, hi = 2000.0, step = 10.0, category = "Visuals"),
+    # ---- Inventory presets -------------------------------------------------
+    # The selection PERSISTS (it is an ordinary setting, written back to
+    # config.json). APPLYING it is the F6 row "Spawn: apply preset", and it now
+    # really applies -- see adm/dispatch.nim for the capability it goes through
+    # and what each refusal means.
+    selectSetting("presetSlot", "Inventory preset", presetLabels()[0],
+                  presetLabels(), category = "Inventory",
+                  description = "Four kits ship built in: a starter kit, a " &
+                                "high-tier kit, a scav-run kit and a medical/" &
+                                "quest kit. Every line is a NAME QUERY, not a " &
+                                "template id, so a database update changes " &
+                                "what a line resolves to instead of silently " &
+                                "resolving to nothing. Apply it from the F6 " &
+                                "menu row \"Spawn: apply preset\"."),
+    # ---- The item spawner --------------------------------------------------
+    # The QUERY lives here rather than in the HUD because the overlay has no
+    # text entry and inventing one would be a keyboard hook in a live game. The
+    # F6 rows are the trigger; this is the parameter. Nothing here searches on
+    # the client: the query is posted to the backend, which already holds the
+    # database, and at most ten formatted result lines come back.
+    stringSetting("spawnQuery", "Item to spawn", "", category = "Inventory",
+                  description = "Part of an English item name (\"salewa\", " &
+                                "\"m995\") or a 24-character template id. The " &
+                                "SEARCH runs on the server, over the same " &
+                                "index the emulator's own item lookup uses -- " &
+                                "the client never scans the item set and never " &
+                                "holds it. Press \"Spawn: search query\" in " &
+                                "the F6 menu to spawn it."),
+    intSetting("spawnCount", "How many", 1, lo = 1, hi = 5000,
+               category = "Inventory",
+               description = "1..5000. The emulator refuses above 5000 and " &
+                             "this refuses locally too, so the cap is not a " &
+                             "surprise that arrives as a server error."),
+    intSetting("spawnCondition", "Condition (%)", 100, lo = 1, hi = 100,
+               category = "Inventory",
+               description = "100 is pristine. Applies to durability, medkit " &
+                             "charges and resources where the item has them.")]
 
 proc onAdminSettings(url, body, session: string): string =
   var st = Ok
@@ -161,6 +275,174 @@ proc onAdminSettingsReset(url, body, session: string): string =
   let st = resetFromBody(body)
   if st == Ok: applyConfigToggles()
   result = declaredSchemaReply(st).text
+
+# ---------------------------------------------------------------------------
+# THE ITEM SPAWNER
+# ---------------------------------------------------------------------------
+#
+# Four F6 rows, one mailbox, one capability. The rows are MOMENTARY: the menu
+# sets a bit, this clears it on the next tick, so a row cannot sit ON pretending
+# to be a running mode.
+#
+# PER-FRAME COST, which is the constraint that shaped all of this: with no
+# request outstanding and no key pressed, `serviceSpawner` does four
+# `InterlockedCompareExchange`-free bit reads and one LONG compare. It allocates
+# nothing. The search that could stall a frame -- 4,673 templates against a
+# 2.7 MB locale -- happens in the BACKEND process, on the backend's thread, and
+# the client only ever sees at most ten pre-formatted 72-byte lines. That is the
+# whole reason the mailbox exists instead of a client-side item index.
+#
+# Reading an answer DOES allocate (one nimony string per line), so it is done
+# exactly once, on the tick `served` advances, and never per frame.
+
+var gMail: SpawnRegion
+var gSeenServed = 0
+## Ticks for which the spawner's message OWNS the HUD status line. Without this
+## the routine `setStatus(dataStatus() & godStatus())` at the end of every tick
+## would overwrite the spawner's answer within one frame -- the player would
+## press a row, an answer would arrive, and the screen would show the ESP status
+## as if nothing had happened. A message nobody can read is the same as no
+## message.
+var gStatusHold = 0
+var gLastAnswer = ""
+var gSpawnRequests = 0
+var gSpawnOk = 0
+var gSpawnRefused = 0
+var gDispatched = 0
+
+proc spawnStatus(text: string) =
+  ## Write the HUD status AND claim it for a while. ~600 ticks is a handful of
+  ## seconds at frame rate; short enough that a stale answer does not sit there
+  ## forever, long enough to read.
+  setStatus(gRegion, text)
+  gStatusHold = 600
+
+proc spawnerAvailable(): bool =
+  ## The mailbox exists AND the region is stamped. NULL is a no-spawner
+  ## session, not an error, and is reported in those words.
+  mailboxValid(gMail)
+
+proc setPresetSlot(delta: int) =
+  ## Move the selection and PERSIST it, so the F6 menu and the settings screen
+  ## are showing the same preset rather than two independent ideas of one.
+  let labels = presetLabels()
+  if labels.len == 0: return
+  var i = selectedPresetSlot()
+  if i < 0: i = 0
+  i = i + delta
+  while i < 0: i = i + labels.len
+  while i >= labels.len: i = i - labels.len
+  discard applySetting("presetSlot", quoted(labels[i]))
+  spawnStatus("preset: " & presetSummary(i))
+
+proc noteAnswer() =
+  ## Called only when the dispatcher's `served` counter has advanced. Reads the
+  ## answer ONCE and puts it where both the HUD and the log can see it.
+  let outcome = readOutcome(gMail)
+  let msg = readMessage(gMail)
+  var line = ""
+  if outcome == spwOutOk:
+    gSpawnOk = gSpawnOk + 1
+    line = "spawner OK: " & msg
+    let shown = readShown(gMail)
+    var i = 0
+    while i < shown:
+      let t = readLine(gMail, i)
+      if t.len > 0: line.add "\n    " & t
+      inc i
+  else:
+    gSpawnRefused = gSpawnRefused + 1
+    line = "spawner " & outcomeText(outcome) & ": " & msg
+  gLastAnswer = line
+  # The HUD's status field is 192 bytes; the first line is the verdict, which is
+  # the part that has to fit. The full text goes to the log.
+  spawnStatus(line)
+  info "admin: " & line
+
+proc postFromMenu(bit: int32) =
+  ## Turn one pressed row into one mailbox request. Every refusal path writes a
+  ## status the player can read -- a row that does nothing and says nothing is
+  ## the outcome this whole module exists to avoid.
+  if not spawnerAvailable():
+    spawnStatus("spawner unavailable: the shared mailbox did not map, " &
+                       "so no request can be sent this session")
+    return
+  if mailboxBusy(gMail):
+    spawnStatus("spawner busy: the previous request has not been " &
+                       "answered yet -- not queuing a second one")
+    return
+  let query = setting("spawnQuery").asText("")
+  var okPost = false
+  if bit == admSpawnItem:
+    if query.len == 0:
+      spawnStatus("spawner: set \"Item to spawn\" in the settings " &
+                         "screen first -- there is no text entry in this HUD")
+      return
+    okPost = postItem(gMail, query, setting("spawnCount").asInt(1),
+                      setting("spawnCondition").asInt(100))
+  elif bit == admSpawnKit:
+    let slot = selectedPresetSlot()
+    if slot < 0:
+      spawnStatus("spawner: no preset is selected (the stored label " &
+                         "matches none of the built-in kits)")
+      return
+    okPost = postPreset(gMail, slot)
+  if okPost:
+    gSpawnRequests = gSpawnRequests + 1
+    spawnStatus("spawner: request sent, waiting for the backend...")
+  else:
+    spawnStatus("spawner: the mailbox refused the request (busy or " &
+                       "unmapped); nothing was sent and nothing was spawned")
+
+proc serviceSpawner() =
+  ## The client half, once per tick. Cheap by construction -- see the note at
+  ## the top of this section.
+  if gRegion == nil: return
+  # The four action rows. Read, clear, then act: clearing FIRST means a handler
+  # that throws cannot leave a bit set to re-fire every frame forever.
+  var pressed = -1'i32
+  if toggleOn(gRegion, admSpawnPrev):
+    setToggle(gRegion, admSpawnPrev, false); pressed = admSpawnPrev
+  if toggleOn(gRegion, admSpawnNext):
+    setToggle(gRegion, admSpawnNext, false); pressed = admSpawnNext
+  if toggleOn(gRegion, admSpawnKit):
+    setToggle(gRegion, admSpawnKit, false); pressed = admSpawnKit
+  if toggleOn(gRegion, admSpawnItem):
+    setToggle(gRegion, admSpawnItem, false); pressed = admSpawnItem
+
+  if pressed == admSpawnPrev: setPresetSlot(-1)
+  elif pressed == admSpawnNext: setPresetSlot(1)
+  elif pressed >= 0: postFromMenu(pressed)
+
+  # Did an answer land? One LONG read.
+  if spawnerAvailable():
+    let served = mailboxServed(gMail)
+    if served != gSeenServed:
+      gSeenServed = served
+      noteAnswer()
+
+proc spawnerDiag*(): string =
+  ## PASS / FAIL / INCONCLUSIVE, and the INCONCLUSIVE case is the one that
+  ## needed writing down: a mailbox that maps but that nobody polls looks
+  ## exactly like a spawner that refuses. `polls` is what tells them apart, and
+  ## it is a counter rather than a boolean so "it stopped" is visible too.
+  if not spawnerAvailable():
+    return "  spawner     : FAIL  the shared mailbox did not map; the four " &
+           "F6 spawner rows are unavailable this session\n"
+  let polls = mailboxPolls(gMail)
+  if polls == 0:
+    return "  spawner     : INCONCLUSIVE  the mailbox is mapped but the " &
+           "backend has polled it ZERO times -- mods/admin is not loaded " &
+           "server-side, or its onUpdate is not running there. A request " &
+           "would wait forever; this is NOT evidence that spawning refuses\n"
+  if gSpawnRequests == 0:
+    return "  spawner     : INCONCLUSIVE  mailbox mapped, backend polled it " &
+           $polls & " time(s), but nothing has been requested yet\n"
+  if gSpawnOk > 0:
+    return "  spawner     : PASS  " & $gSpawnOk & " of " & $gSpawnRequests &
+           " request(s) put items in the stash; last: " & gLastAnswer & "\n"
+  result = "  spawner     : FAIL  " & $gSpawnRequests & " request(s), " &
+           $gSpawnRefused & " refused, none spawned; last: " & gLastAnswer & "\n"
 
 # ---------------------------------------------------------------------------
 # The Unity-thread sampler: the ONLY thing in this mod that calls game code
@@ -281,6 +563,21 @@ proc adminDiag*(): string {.exportc: "aowl_admin_diag", cdecl.} =
                $hudHeight(gRegion) & " back buffer)\n"
   result.add samplerDiag()
   result.add dataDiag()
+  result.add spawnerDiag()
+  # What the capability layer says about the provider RIGHT NOW. Server side
+  # only: on the client `invoke` cannot see a server-side mod set at all, so
+  # asking there would print `no-provider` about a provider that is loaded and
+  # working one process away -- a confidently wrong answer, which is worse than
+  # none. The client says where to look instead.
+  if side() != sideClient:
+    result.add providerDiag()
+    result.add "  dispatched  : " & $gDispatched & " mailbox request(s) served\n"
+  else:
+    result.add "  provider    : not askable from the client -- capability " &
+               "resolution is server-side. Read the spawner line above, and " &
+               "the backend's own admin diag, for the provider verdict\n"
+  result.add "\n"
+  result.add presetsDiag(selectedPresetSlot())
   result.add "\n  toggles      : "
   if gRegion == nil:
     result.add "unavailable"
@@ -298,6 +595,28 @@ proc publishCapability() =
   if dataResolved():  cap = cap or (1'u32 shl admEsp)
   if godCapable():    cap = cap or (1'u32 shl admGodmode)
   if staminaCapable(): cap = cap or (1'u32 shl admStamina)
+  if speedCapable():   cap = cap or (1'u32 shl admSpeed)
+  if timeCapable():    cap = cap or (1'u32 shl admTimeOfDay)
+  # The ESP LAYER bits are capable exactly when ESP itself is: they are
+  # presentation, not separate bindings, so gating them on anything else would
+  # leave rows the menu refuses to toggle for no reason the player can see.
+  if dataResolved():
+    cap = cap or (1'u32 shl admLootEsp)
+    cap = cap or (1'u32 shl admEspNames)
+    cap = cap or (1'u32 shl admEspDist)
+    cap = cap or (1'u32 shl admEspBox)
+  # The four SPAWNER ACTION rows. Capable exactly when the shared mailbox
+  # mapped -- which is what the F6 menu tests before it will let a row be
+  # pressed at all, so an unmapped mailbox is a row that visibly refuses rather
+  # than a row that appears to work. Whether the BACKEND is listening is a
+  # different question and cannot be answered from here without sending a
+  # request; that is what `spawnerDiag()` reports, and it reports it as
+  # INCONCLUSIVE rather than folding it into this bit.
+  if spawnerAvailable():
+    cap = cap or (1'u32 shl admSpawnPrev)
+    cap = cap or (1'u32 shl admSpawnNext)
+    cap = cap or (1'u32 shl admSpawnKit)
+    cap = cap or (1'u32 shl admSpawnItem)
   # Every other mode is not bound on this build; left 0 => drawn "unavailable".
   setCapability(gRegion, cap)
 
@@ -308,9 +627,24 @@ proc publishCapability() =
 var gTick = 0'i64
 var gReported = false
 var gRaidReported = false
+var gWasInRaid = false
 
 
 proc onUpdate(elapsedMs: int64): Status =
+  # THE BACKEND HALF, FIRST AND UNCONDITIONALLY. It must not sit behind the
+  # `gRegion == nil` guard below: the admin HUD region is a client concern and
+  # the dispatcher is not, and gating the dispatcher on the HUD would make the
+  # spawner silently dead in exactly the process that does the spawning.
+  #
+  # `serviceOne` costs one interlocked increment and one LONG compare when there
+  # is nothing to do, and it is the ONLY place in this mod that calls
+  # `invoke()`. The client never does -- see the note at the top of
+  # adm/mailbox.nim for why a client-side invoke would answer `no-provider`
+  # forever while the provider sat loaded in this process.
+  if side() != sideClient and gMail != nil:
+    if serviceOne(gMail):
+      gDispatched = gDispatched + 1
+
   if gRegion == nil:
     return Ok
   gTick = gTick + 1
@@ -323,7 +657,7 @@ proc onUpdate(elapsedMs: int64): Status =
   if w <= 0: w = 1920
   if h <= 0: h = 1080
 
-  collectAndPublish(gRegion, cfgEspMaxDistance, w, h)
+  collectAndPublish(gRegion, cfgEspMaxDistance, cfgLootMaxDistance, w, h)
 
   # God mode patches live combat code, so it is DEFERRED: applied only in an
   # actual raid (a live GameWorld), never at boot or the menu -- patching a
@@ -333,12 +667,26 @@ proc onUpdate(elapsedMs: int64): Status =
   # so even a wrong RVA on a future build refuses rather than corrupts.)
   if dataInRaid():
     setGodmode(toggleOn(gRegion, admGodmode))
-    if toggleOn(gRegion, admStamina): applyStamina()
+    # Stamina, move speed and time flow are ONE fault-guarded body; each write
+    # inside is separately toggle-gated, so all-off costs three nil checks.
+    applyWrites(gRegion)
+    gWasInRaid = true
   else:
     setGodmode(false)
+    if gWasInRaid:
+      # The raid ended. Put the game's own speed and clock back, rather than
+      # letting a boosted base leak into the next raid.
+      gWasInRaid = false
+      revertWrites()
 
   publishCapability()
-  setStatus(gRegion, dataStatus() & "  " & godStatus())
+  serviceSpawner()
+  # The spawner's answer wins while its hold lasts; otherwise the routine
+  # binding status. See `gStatusHold`.
+  if gStatusHold > 0:
+    gStatusHold = gStatusHold - 1
+  else:
+    setStatus(gRegion, dataStatus() & "  " & godStatus())
 
   # Report once the mod has had time to settle, and AGAIN the first time a raid
   # is actually entered -- the boot report is necessarily INCONCLUSIVE about
@@ -357,6 +705,9 @@ proc onUpdate(elapsedMs: int64): Status =
 # ---------------------------------------------------------------------------
 
 proc onLoad(): Status =
+  # The spawner mailbox is mapped on BOTH sides and independently of the HUD
+  # region: the backend has no HUD and must still be able to serve requests.
+  gMail = mailboxMap()
   gRegion = adminMap()
   if gRegion == nil:
     warn ModName & ": could not map the shared HUD region; the menu and ESP " &
@@ -383,6 +734,7 @@ proc onUnload(): Status =
   ## damage code. The shared region is a file mapping shared with the overlay; it
   ## is left mapped (the overlay may still be drawing).
   setGodmode(false)
+  revertWrites()
   result = Ok
 
 exportMod(
