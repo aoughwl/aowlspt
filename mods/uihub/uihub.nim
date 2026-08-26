@@ -65,6 +65,7 @@
 
 import aowlspt
 import aowlspt/server as sv
+import aowlspt/settings
 
 const
   ModGuid = "aowl.uihub"
@@ -785,10 +786,36 @@ proc onPage(url, body, session: string): string =
 proc onLib(url, body, session: string): string =
   result = LibJs
 
+proc onSettings(url, body, session: string): string =
+  ## `GET` serves the schema; a `POST` carrying `{"key":...,"value":...}`
+  ## persists one row into this mod's `config.json`. Same contract every other
+  ## mod's settings route has -- see `aowlspt/settings`.
+  var st = Ok
+  if body.len > 0:
+    st = applySettingFromBody(body)
+  result = declaredSchemaReply(st).text
+
 proc onLoad(): Status =
   if side() != sideServer:
     info ModName & " is a server-side page; nothing to do on this side"
     return Ok
+  # The native F12 overlay reads `launchHint` from this route at start-up and
+  # obeys THE VALUE IT READS -- see `aowl_ov_hint_alpha` in
+  # `abi/aowlspt_overlay.h`. It exists here, rather than as a bare host flag,
+  # so that the "turn this off in Settings" the toast prints is true: the
+  # toggle is a real row on a real settings page the player can reach.
+  declareSettings(@[
+    boolSetting("launchHint", "Show the \"Press F12\" hint at launch", true,
+                category = "Overlay/Launch",
+                description = "A small notice in the top-right corner, once " &
+                              "per launch, that fades after a few seconds"),
+    boolSetting("launchHintFallbackPage", "Advertise the browser settings page",
+                false, category = "Overlay/Launch", implemented = false,
+                description = "Not wired yet: the toast names the in-game " &
+                              "screen only")])
+  if serve("/aowlspt/settings/" & ModGuid, onSettings) != Ok:
+    warn "could not register the uihub settings route -- the launch hint's " &
+         "off-switch will not appear in the settings surface"
   if serve(LibRoute, onLib) != Ok:
     warn "could not register " & LibRoute &
          " -- the settings page will load but do nothing"

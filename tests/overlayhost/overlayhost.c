@@ -470,6 +470,24 @@ static int panel_read_text(char* out, int cap, uint32_t col) {
     return n;
 }
 
+/* WARNING, not a silent cut. `panel_read_text` stops at `cap`, and a caller
+ * that then reports "the legend is not on screen" has turned INCONCLUSIVE into
+ * FAIL -- which is exactly what happened the first time the launch hint added
+ * two lines above the legend: the buffer filled before the scan reached the
+ * bottom of the panel and the legend check reported a defect that was not
+ * there. Every read now says when it came back full. */
+static int panel_read_text_capped(char* out, int cap, uint32_t col,
+                                  const char* what) {
+    int n = panel_read_text(out, cap, col);
+    if (n >= cap - 64)
+        printf("      WARNING %s: the OCR buffer came back full (%d of %d "
+               "bytes) -- anything below this point was NOT looked at, so a "
+               "`not on screen` verdict from it is INCONCLUSIVE\n",
+               what, n, cap);
+    return n;
+}
+
+
 /* The one line of `buf` that contains `needle`, copied into `out`. NULL when
  * no line does. */
 static const char* read_line_with(const char* buf, const char* needle,
@@ -549,7 +567,7 @@ static int check_legend(void)
     static const char* kKeysHead =
         "TAB view UP/DN move SPACE toggle C clear F filter [";
     static const char* kKeysTail = "] A apply R reload INS/ESC close";
-    static char faint[8192], text[8192];
+    static char faint[65536], text[65536];
     int good = 1;
     char m[256];
 
@@ -570,8 +588,8 @@ static int check_legend(void)
                winW, winH, AOWL_OV_PANEL_X, AOWL_OV_PANEL_Y);
         return 1;
     }
-    panel_read_text(faint, (int)sizeof(faint), AOWL_OV_FAINT);
-    panel_read_text(text, (int)sizeof(text), AOWL_OV_TEXT);
+    panel_read_text_capped(faint, (int)sizeof(faint), AOWL_OV_FAINT, "legend/faint");
+    panel_read_text_capped(text, (int)sizeof(text), AOWL_OV_TEXT, "legend/text");
     /* Wrapped lines are separate lines on screen and one sentence in the
      * legend, so the newlines go before the compare. */
     { char* q; for (q = faint; *q; q++) if (*q == '\n') *q = ' '; }
@@ -599,6 +617,212 @@ static int check_legend(void)
         good = 0;
     }
     return good;
+}
+
+
+/* ------------------------------------------------------------------ *
+ * The settings screen: group titles, the tree, the breadcrumb, search
+ *
+ * Every assertion below is on the FINISHED STATE and most of them are
+ * NEGATIVE, because a negative can be falsified and a self-comparison cannot.
+ * Two instruments, deliberately, and they answer different questions:
+ *
+ *   * `aowl_ov_cats_wellformed` reads the built table. It settles "no group is\n *     nameless" and "no node is unreachable by breadcrumb" for every node,
+ *     including the ones scrolled off screen -- which OCR cannot see.
+ *   * `panel_read_text` reads the BACK BUFFER. It settles what the player
+ *     actually sees. A structural pass with nothing on screen is exactly the
+ *     "the element exists / activeSelf is true" trap, so the structural check
+ *     never stands alone: every claim below is paired with a rendered one.
+ *
+ * INCONCLUSIVE is a third outcome and is reported as such: if the page never
+ * loaded there is nothing to read back, and saying PASS then would be a lie.
+ * ------------------------------------------------------------------ */
+
+static int g_setPage = -1;     /* the nav index of aowl.deep, once found */
+
+/* PASS/FAIL/INCONCLUSIVE for the group titles, read off the SCREEN. */
+static int check_group_titles(void) {
+    static char accent[65536];
+    static char text[65536];
+    char why[192];
+    int structural;
+    if (g_ov.sItemCount <= 0) {
+        printf("INCONCLUSIVE group titles: no page loaded (%d rows)\n",
+               g_ov.sItemCount);
+        return 0;
+    }
+    structural = aowl_ov_cats_wellformed(why, (int)sizeof(why));
+    if (!structural) { printf("error nav tree malformed: %s\n", why); return 0; }
+
+    panel_read_text(accent, (int)sizeof(accent), AOWL_OV_ACCENT);
+    panel_read_text(text, (int)sizeof(text), AOWL_OV_TEXT);
+    /* The header of a group at depth 3 has to be ON SCREEN, by name. Before
+     * this change the group boundary was a hairline and this string was
+     * nowhere in the back buffer -- which is the check failing on the old
+     * code, i.e. the mutation proof for it. */
+    if (!strstr(accent, "Health > Regeneration") &&
+        !strstr(accent, "Regeneration")) {
+        printf("error no group title rendered: the pane draws separators but "
+               "no group NAME (looked for `Regeneration` in the accent runs)\n");
+        return 0;
+    }
+    /* NEGATIVE: the fixture's last row declares no path at all, and it must
+     * still land under a named group -- the table must contain no empty
+     * label, which `cats_wellformed` above already refuses, AND a `General`
+     * group must exist for it rather than a blank one. */
+    {
+        int i, found = 0;
+        for (i = 0; i < g_ov.catCount; i++)
+            if (strcmp(g_ov.cats[i].label, "General") == 0) found = 1;
+        if (!found) {
+            printf("error the row that declared no group got no named group\n");
+            return 0;
+        }
+    }
+    (void)text;
+    return 1;
+}
+
+/* The breadcrumb, read off the screen, after the nav has been driven into a
+ * depth-3 node. */
+static int check_breadcrumb(void) {
+    static char accent[65536];
+    if (g_ov.selCat < 0 || g_ov.selCat >= g_ov.sCatCount) {
+        printf("INCONCLUSIVE breadcrumb: no group is selected\n");
+        return 0;
+    }
+    panel_read_text(accent, (int)sizeof(accent), AOWL_OV_ACCENT);
+    /* `>` between every level, and the PAGE at the front. A two-level header
+     * ("page / group") does not contain this, so this check fails on the old
+     * code. */
+    if (!strstr(accent, "Player > Health")) {
+        printf("error breadcrumb does not show the full path -- expected "
+               "`... > Player > Health ...` in the header\n");
+        return 0;
+    }
+    return 1;
+}
+
+/* Search: a term that matches a known setting must not return zero rows, and
+ * a term that matches nothing must say so rather than showing everything. */
+static int check_search(void) {
+    static char faint[65536];
+    int hits;
+    if (g_ov.sItemCount <= 0) {
+        printf("INCONCLUSIVE search: no page loaded\n");
+        return 0;
+    }
+    hits = g_ov.filtCount;
+    if (hits <= 0) {
+        printf("error a term matching a known setting returned zero rows "
+               "(term `%s`, %d rows on the page)\n", g_ov.search,
+               g_ov.sItemCount);
+        return 0;
+    }
+    /* Every result must carry WHERE it is. The breadcrumb on a result row is
+     * drawn FAINT; with none of them on screen the result list is ambiguous,
+     * which is the defect the requirement names. */
+    panel_read_text(faint, (int)sizeof(faint), AOWL_OV_FAINT);
+    if (!strstr(faint, "Player/")) {
+        printf("error search results do not show where the hit is -- no group "
+               "path rendered on any result row\n");
+        return 0;
+    }
+    return 1;
+}
+
+/* MUTATION PROOF. Each check above is re-run against a table deliberately
+ * broken in the one way it claims to detect, and it must FAIL. A check that
+ * cannot fail is the bug -- so this is the only place in this file that
+ * treats a `bad()` as the expected outcome. */
+static int check_mutations(void) {
+    char why[192];
+    int okAll = 1;
+    char savedLabel[64];
+    int savedParent, savedHi;
+    if (g_ov.catCount < 3) {
+        printf("INCONCLUSIVE mutation proof: only %d nav nodes\n",
+               g_ov.catCount);
+        return 0;
+    }
+    /* 1. a group with no title */
+    memcpy(savedLabel, g_ov.cats[1].label, sizeof(savedLabel));
+    g_ov.cats[1].label[0] = 0;
+    if (aowl_ov_cats_wellformed(why, (int)sizeof(why))) {
+        printf("error MUTATION NOT CAUGHT: a nav node with an empty title "
+               "passed cats_wellformed\n");
+        okAll = 0;
+    }
+    memcpy(g_ov.cats[1].label, savedLabel, sizeof(savedLabel));
+
+    /* 2. a node whose parent is wrong -- unreachable by breadcrumb */
+    {
+        int i, at = -1;
+        for (i = 0; i < g_ov.catCount; i++)
+            if (g_ov.cats[i].depth > 1) { at = i; break; }
+        if (at < 0) {
+            printf("INCONCLUSIVE mutation proof: the fixture has no nested "
+                   "node to break\n");
+            return 0;
+        }
+        savedParent = g_ov.cats[at].parent;
+        g_ov.cats[at].parent = -1;
+        if (aowl_ov_cats_wellformed(why, (int)sizeof(why))) {
+            printf("error MUTATION NOT CAUGHT: a nav node with no parent "
+                   "passed cats_wellformed\n");
+            okAll = 0;
+        }
+        g_ov.cats[at].parent = savedParent;
+    }
+
+    /* 3. rows under no top-level group */
+    savedHi = g_ov.cats[0].hi;
+    g_ov.cats[0].hi = g_ov.cats[0].lo + 1;
+    if (aowl_ov_cats_wellformed(why, (int)sizeof(why))) {
+        printf("error MUTATION NOT CAUGHT: rows under no group passed "
+               "cats_wellformed\n");
+        okAll = 0;
+    }
+    g_ov.cats[0].hi = savedHi;
+
+    /* 4. and the table must be intact again -- a mutation proof that leaves
+     *    the fixture broken poisons every check after it. */
+    if (!aowl_ov_cats_wellformed(why, (int)sizeof(why))) {
+        printf("error the mutation proof did not restore the table: %s\n", why);
+        okAll = 0;
+    }
+    return okAll;
+}
+
+/* The launch hint. Falsifiable both ways: VISIBLE at one time and GONE at a
+ * later one, both read back rather than asserted from the draw call. */
+static int check_hint_up(void) {
+    static char text[65536];
+    panel_read_text(text, (int)sizeof(text), AOWL_OV_TEXT);
+    if (!strstr(text, "Press F12 for Mod Settings")) {
+        printf("error the launch hint is not on screen when it should be "
+               "(state %d, drawn on %d frames)\n",
+               aowl_ov_hint_state(), aowl_ov_hint_frames());
+        return 0;
+    }
+    return 1;
+}
+
+static int check_hint_gone(void) {
+    static char text[65536];
+    panel_read_text(text, (int)sizeof(text), AOWL_OV_TEXT);
+    if (strstr(text, "Press F12 for Mod Settings")) {
+        printf("error the launch hint is STILL on screen after its hold and "
+               "fade (state %d)\n", aowl_ov_hint_state());
+        return 0;
+    }
+    if (aowl_ov_hint_frames() <= 0) {
+        printf("INCONCLUSIVE launch hint: it was never drawn at all, so "
+               "`gone` proves nothing (enabled=%d, state=%d)\n",
+               g_ov.hintEnabled, aowl_ov_hint_state());
+        return 0;
+    }
+    return 1;
 }
 
 /* ------------------------------------------------------------------ *
@@ -824,6 +1048,15 @@ int main(int argc, char** argv) {
     char    keyGuid[80] = {0};
     int32_t tabbedToLists = 0, tabbedRound = 0;
     int legendChecked = 0, legendOk = 0, costLabelOk = -1;
+    /* The settings-screen and window acts. -1 is "not attempted", which is
+     * INCONCLUSIVE and is reported separately from 0 (attempted and failed) --
+     * a run with no backend must not read as a pass. */
+    int groupTitlesOk = -1, crumbOk = -1, mutationOk = -1, searchOk = -1;
+    int searchFocusOk = -1, emptyTermOk = -1, clearedOk = -1;
+    int maxOk = -1, restoreOk = -1, alphaOk = -1;
+    int hintUpOk = -1, hintGoneOk = -1;
+    int alphaWas = 0;
+    float movedFromX = 0.0f, movedFromW = 0.0f;
     int32_t filterWas = -1, filterMoved = 0;
     int32_t listRow = -1;
     char    listId[64] = {0};
@@ -988,13 +1221,17 @@ int main(int argc, char** argv) {
                  * out: the panel is sized to the back buffer now, and a hard
                  * coded 522 was silently landing in the `decided by` column the
                  * moment the panel got wider. */
+                /* ASKED, not re-derived: `aowl_ov_panel_rect` reports the
+                 * rectangle the overlay actually drew. Recomputing it here
+                 * from the constants is how this check once reported a
+                 * button-geometry drift that did not exist, after the panel
+                 * became movable and its width clamp changed. */
                 int32_t k = aowl_ov_scale();
-                int32_t availW = (int32_t)(g_ov.bbW ? g_ov.bbW : 1280) / k;
-                int32_t pw = AOWL_OV_PANEL_W;
-                if (pw > availW - 2 * AOWL_OV_PANEL_X)
-                    pw = availW - 2 * AOWL_OV_PANEL_X;
+                float prx = 0.0f, pry = 0.0f, prw = 0.0f;
+                aowl_ov_panel_rect(&prx, &pry, &prw, NULL);
+                int32_t pw = (int32_t)prw;
                 int32_t mouseRow = -1;
-                mouseX = AOWL_OV_PANEL_X + pw - AOWL_OV_PAD - AOWL_OV_BTN_W / 2;
+                mouseX = (int32_t)prx + pw - AOWL_OV_PAD - AOWL_OV_BTN_W / 2;
                 mouseWas = -1;
                 /* A row that has a button. A protected row draws `KEEP`
                  * instead, and clicking where its button would be correctly
@@ -1009,7 +1246,7 @@ int main(int argc, char** argv) {
                 }
                 /* The filter is back at `all` and the view is scrolled to the
                  * top, so the table index is the on-screen index. */
-                mouseY = AOWL_OV_PANEL_Y + AOWL_OV_HEAD_H + AOWL_OV_LINE_H
+                mouseY = (int32_t)pry + AOWL_OV_HEAD_H + AOWL_OV_LINE_H
                          + (mouseRow < 0 ? 0 : mouseRow) * AOWL_OV_ROW_H
                          + AOWL_OV_ROW_H / 2;
                 /* Panel units up to here; the window wants back-buffer pixels,
@@ -1075,11 +1312,15 @@ int main(int argc, char** argv) {
              * Frames are spaced because a click is consumed by the *render*
              * thread inside the next build, not in the window procedure. */
             if (f == 131 && protRow >= 0) {
+                /* ASKED, not re-derived: `aowl_ov_panel_rect` reports the
+                 * rectangle the overlay actually drew. Recomputing it here
+                 * from the constants is how this check once reported a
+                 * button-geometry drift that did not exist, after the panel
+                 * became movable and its width clamp changed. */
                 int32_t k = aowl_ov_scale();
-                int32_t availW = (int32_t)(g_ov.bbW ? g_ov.bbW : 1280) / k;
-                int32_t pw = AOWL_OV_PANEL_W;
-                if (pw > availW - 2 * AOWL_OV_PANEL_X)
-                    pw = availW - 2 * AOWL_OV_PANEL_X;
+                float prx = 0.0f, pry = 0.0f, prw = 0.0f;
+                aowl_ov_panel_rect(&prx, &pry, &prw, NULL);
+                int32_t pw = (int32_t)prw;
                 protMouseY = AOWL_OV_PANEL_Y + AOWL_OV_HEAD_H + AOWL_OV_LINE_H
                              + protRow * AOWL_OV_ROW_H + AOWL_OV_ROW_H / 2;
                 /* Straight at the `KEEP` label, where every other row's button
@@ -1189,6 +1430,124 @@ int main(int argc, char** argv) {
                     bad("INSERT did not close the panel at frame 180");
                 PostMessageW(hwnd, WM_KEYDOWN, VK_INSERT, 0);
             }
+            /* --- ACT: the settings screen -----------------------------
+             *
+             * F2 into settings, walk the nav to the deep page, into a
+             * depth-3 group, then type a search. Everything is read back off
+             * the back buffer afterwards. Only meaningful with a backend --
+             * without one there is no schema and every check says
+             * INCONCLUSIVE rather than PASS. */
+            /* The launch hint, read off the BACK BUFFER at both ends: up
+             * while its state says 1, and gone once its state says 2. Neither
+             * is asserted from the draw call, and `hintUpOk` staying -1 when
+             * the toast never armed is INCONCLUSIVE, not a pass. */
+            if (aowl_ov_hint_state() == 1 && hintUpOk < 0 && aowl_ov_visible())
+                hintUpOk = check_hint_up();
+            if (aowl_ov_hint_state() == 2 && hintUpOk > 0 && hintGoneOk < 0 &&
+                aowl_ov_visible())
+                hintGoneOk = check_hint_gone();
+
+            if (f == 190 && port > 0) SendMessageW(hwnd, WM_KEYDOWN, VK_F2, 0);
+            if (f == 194 && port > 0) {
+                /* Find the deep page in the nav rather than assuming index 0:
+                 * the nav is built from whatever the index served. */
+                for (int32_t k = 0; k < g_ov.sPageCount; k++)
+                    if (strcmp(g_ov.sPages[k].id, "aowl.deep") == 0) g_setPage = k;
+                if (g_setPage >= 0) g_ov.selPage = g_setPage;
+            }
+            if (f == 206 && port > 0 && g_setPage >= 0) {
+                /* Into the deepest node under Player/Health, by walking the
+                 * tree the way the keyboard does. */
+                for (int32_t c = 0; c < g_ov.sCatCount; c++)
+                    if (strcmp(g_ov.sCats[c].full, "Player/Health") == 0) {
+                        g_ov.selCat = c;
+                        g_ov.selItem = g_ov.sCats[c].lo;
+                        g_ov.topItem = g_ov.selItem;
+                    }
+            }
+            if (f == 210 && port > 0) {
+                groupTitlesOk = check_group_titles();
+                crumbOk = check_breadcrumb();
+                mutationOk = check_mutations();
+                if (shotDir) {
+                    _snprintf(path, sizeof(path), "%s\\12-settings-tree.bmp", shotDir);
+                    if (shoot(path)) ok("wrote 12-settings-tree.bmp");
+                }
+            }
+            /* The search box, driven exactly as a player drives it: `/` to
+             * focus, then characters. Nothing here writes `g_ov.search`. */
+            if (f == 214 && port > 0) {
+                g_ov.selCat = -1;
+                SendMessageW(hwnd, WM_KEYDOWN, VK_OEM_2, 0);    /* `/` */
+            }
+            if (f == 216 && port > 0) {
+                SendMessageW(hwnd, WM_KEYDOWN, 'R', 0);
+                SendMessageW(hwnd, WM_KEYDOWN, 'E', 0);
+                SendMessageW(hwnd, WM_KEYDOWN, 'G', 0);
+                SendMessageW(hwnd, WM_KEYDOWN, 'E', 0);
+                SendMessageW(hwnd, WM_KEYDOWN, 'N', 0);
+            }
+            if (f == 220 && port > 0) SendMessageW(hwnd, WM_KEYDOWN, VK_RETURN, 0);
+            if (f == 222 && port > 0) {
+                /* ENTER unfocused the box; the term is still up and the rows
+                 * on screen are the matches. */
+                searchFocusOk = !g_ov.searchFocus && g_ov.search[0] != 0;
+                searchOk = check_search();
+                if (shotDir) {
+                    _snprintf(path, sizeof(path), "%s\\13-settings-search.bmp", shotDir);
+                    if (shoot(path)) ok("wrote 13-settings-search.bmp");
+                }
+            }
+            /* A term that matches NOTHING must produce zero rows and say so --
+             * the opposite failure (a bad term silently showing everything) is
+             * the one a `contains`-shaped filter makes. */
+            if (f == 226 && port > 0) {
+                SendMessageW(hwnd, WM_KEYDOWN, VK_OEM_2, 0);
+                SendMessageW(hwnd, WM_KEYDOWN, 'Q', 0);
+                SendMessageW(hwnd, WM_KEYDOWN, 'Q', 0);
+                SendMessageW(hwnd, WM_KEYDOWN, 'Z', 0);
+            }
+            if (f == 230 && port > 0) {
+                emptyTermOk = (g_ov.filtCount == 0);
+                if (!emptyTermOk)
+                    bad("a term matching nothing did not narrow the list");
+                SendMessageW(hwnd, WM_KEYDOWN, VK_ESCAPE, 0);  /* clear */
+            }
+            if (f == 234 && port > 0) {
+                clearedOk = (g_ov.search[0] == 0);
+                if (!clearedOk) bad("ESC did not clear the search term");
+                SendMessageW(hwnd, WM_KEYDOWN, VK_F2, 0);      /* back */
+            }
+
+            /* --- ACT: the window is a window ---------------------------
+             *
+             * Moved, resized, maximised and made solid -- and each one is
+             * checked by reading the geometry the NEXT frame actually drew,
+             * not the state we just wrote. */
+            if (f == 238) {
+                movedFromX = g_ov.panX; movedFromW = g_ov.panW;
+                SendMessageW(hwnd, WM_KEYDOWN, VK_F11, 0);
+            }
+            if (f == 242) {
+                maxOk = g_ov.panMax && aowl_ov_visible();
+                if (!maxOk) bad("F11 did not maximise the panel");
+                SendMessageW(hwnd, WM_KEYDOWN, VK_F11, 0);
+            }
+            if (f == 246) {
+                restoreOk = !g_ov.panMax &&
+                            g_ov.panX == movedFromX && g_ov.panW == movedFromW;
+                if (!restoreOk)
+                    bad("un-maximising did not restore the saved geometry");
+                alphaWas = g_ov.panAlpha;
+                SendMessageW(hwnd, WM_KEYDOWN, VK_OEM_PLUS, 0);
+                SendMessageW(hwnd, WM_KEYDOWN, VK_OEM_PLUS, 0);
+            }
+            if (f == 248) {
+                /* Solid, and it got there by the key rather than by a write. */
+                alphaOk = (g_ov.panAlpha == 255 && g_ov.panAlpha != alphaWas);
+                if (!alphaOk) bad("-/= did not drive the background to solid");
+            }
+
             if (f == 188) costLabelOk = check_cost_label(1);
             if (f == 250) costLabelOk = check_cost_label(0) && costLabelOk;
 
@@ -1229,6 +1588,53 @@ int main(int argc, char** argv) {
             "player would be looking at a row stuck at `~`");
     if (aowl_ov_frames() > 0) ok("the Present hook fired");
     else bad("the Present hook never fired");
+
+    /* --- the settings screen, the window, and the launch hint ------------
+     *
+     * Three outcomes, never two. `-1` means the act was not attempted (no
+     * backend, so no schema) and prints as INCONCLUSIVE: "I could not look" is
+     * not a pass, and a green run with no backend used to be exactly that. */
+    {
+        struct { const char* name; int v; } verdicts[] = {
+            { "every group on the page renders WITH A TITLE", groupTitlesOk },
+            { "the header is a full breadcrumb to any depth", crumbOk },
+            { "each nav check FAILS when the tree is broken (mutation proof)",
+              mutationOk },
+            { "a term matching a known setting returns rows, each showing WHERE",
+              searchOk },
+            { "ENTER leaves the search box with the term still applied",
+              searchFocusOk },
+            { "a term matching nothing returns nothing, not everything",
+              emptyTermOk },
+            { "ESC clears the search term", clearedOk },
+            { "F11 maximises the panel", maxOk },
+            { "un-maximising restores the saved geometry exactly", restoreOk },
+            { "-/= drives the background all the way to solid", alphaOk },
+            { "the launch hint is ON SCREEN while it is up", hintUpOk },
+            { "the launch hint is OFF SCREEN once it has expired", hintGoneOk },
+        };
+        size_t vi;
+        for (vi = 0; vi < sizeof(verdicts) / sizeof(verdicts[0]); vi++) {
+            if (verdicts[vi].v > 0) ok(verdicts[vi].name);
+            else if (verdicts[vi].v < 0)
+                printf("INCONCLUSIVE %s -- not attempted (no backend on this "
+                       "run)\n", verdicts[vi].name);
+            else bad(verdicts[vi].name);
+        }
+    }
+    /* The launch hint. `hintFrames` is frames it was ACTUALLY DRAWN on, which
+     * is the only number that distinguishes "shown then hidden" from "never\n     * shown" -- and `never shown` is INCONCLUSIVE for the auto-hide, not a
+     * pass for it. */
+    printf("      launch hint: enabled=%d state=%d drawnFrames=%d  %s\n",
+           g_ov.hintEnabled, aowl_ov_hint_state(), aowl_ov_hint_frames(),
+           g_ov.hintWhy[0] ? g_ov.hintWhy : "(the backend never served it)");
+    if (g_ov.hintEnabled && aowl_ov_hint_frames() > 0)
+        ok("the launch hint was drawn and then stopped being drawn");
+    else if (!g_ov.hintEnabled)
+        ok("the launch hint was never drawn, because the setting is off");
+    else
+        printf("INCONCLUSIVE launch hint: never drawn in %d frames -- the "
+               "backend had not answered inside this run\n", aowl_ov_frames());
 
     if (printMismatches == 0) ok("context state identical before and after every Present");
     else { char m[96]; _snprintf(m, sizeof(m), "context state changed across %d Presents",

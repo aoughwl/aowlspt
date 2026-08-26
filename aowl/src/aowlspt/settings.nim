@@ -188,6 +188,40 @@ proc selectSetting*(key, label: string; default: string; options: seq[string];
 # Serialisation
 # ---------------------------------------------------------------------------
 
+proc settingPath*(s: Setting): seq[string] =
+  ## The GROUP PATH this row lives at, to ARBITRARY DEPTH.
+  ##
+  ## `category` and `subcategory` stayed exactly as they were -- every mod that
+  ## has already declared settings keeps working, unedited, and keeps getting
+  ## the same one- or two-level grouping it had. Depth beyond two is expressed
+  ## by putting separators IN `category` (or `subcategory`):
+  ##
+  ##     category = "Player/Health/Regeneration"
+  ##
+  ## which yields the path `["Player", "Health", "Regeneration"]` and renders
+  ## as `Singleplayer > Player > Health > Regeneration`. That was chosen over
+  ## adding a `path: seq[string]` argument to all seven builders because it
+  ## changes NO existing call site and no existing wire field: `category` and
+  ## `subcategory` are still emitted verbatim next to `path`, so a renderer
+  ## that has never heard of `path` (the served web UI, an older overlay)
+  ## degrades to the two-level grouping it already drew rather than to
+  ## nothing.
+  ##
+  ## Empty segments are dropped, so `"A//B"`, `"/A/B"` and `"A/B/"` all mean
+  ## `["A", "B"]` -- a stray separator must not produce an unnamed group, which
+  ## is precisely the "a group renders with no title" defect this exists to
+  ## make unrepresentable.
+  result = @[]
+  for part in [s.category, s.subcategory]:
+    var cur = ""
+    for ch in part:
+      if ch == '/':
+        if cur.len > 0: result.add cur
+        cur = ""
+      else:
+        cur.add ch
+    if cur.len > 0: result.add cur
+
 proc toJson*(s: Setting): JsonObject =
   ## One row, as the UI receives it. `value` is the *current* value read out of
   ## `config.json` (falling back to `defaultJson` when the file has no such
@@ -233,6 +267,17 @@ proc toJson*(s: Setting): JsonObject =
   if s.optionsUrl.len > 0: o.put("optionsUrl", s.optionsUrl)
   if s.subcategory.len > 0: o.put("subcategory", s.subcategory)
   if s.category.len > 0:  o.put("category", s.category)
+  # The same grouping as an explicit, ordered path -- see `settingPath`. Always
+  # emitted when the row is grouped at all, so a renderer never has to re-derive
+  # it by re-splitting two fields and never has to guess which of them is the
+  # outer one.
+  block:
+    let segs = settingPath(s)
+    if segs.len > 0:
+      var pa = arr()
+      for seg in segs:
+        pa.add seg
+      o.put("path", pa)
   if s.description.len > 0: o.put("description", s.description)
   o.put("implemented", s.implemented)
   result = o

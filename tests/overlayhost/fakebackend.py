@@ -355,6 +355,56 @@ def select(list_id):
             "loaded": sum(1 for x in ROWS if x["enabled"]), "problems": []}
 
 
+
+# ---------------------------------------------------------------------------
+# The SETTINGS surface, deliberately DEEP.
+#
+# The overlay's settings screen had two levels and now has a tree, so the
+# fixture has to have more than two or the nesting is untested by construction.
+# `aowl.deep` declares rows at depths 1, 2, 3 and 4 -- including the exact
+# "Player / Health" the report named, now as "Player > Health > Regeneration".
+#
+# `path` is emitted the way `aowl/src/aowlspt/settings.nim` emits it, so the
+# overlay is parsing the real wire shape and not a convenience.
+# ---------------------------------------------------------------------------
+
+def _row(key, label, path, kind="bool", value=True, desc=""):
+    r = {"key": key, "label": label, "type": kind, "value": value,
+         "default": value, "implemented": True, "path": path,
+         "category": "/".join(path[:1]), "subcategory": "/".join(path[1:])}
+    if desc:
+        r["description"] = desc
+    return r
+
+DEEP_ROWS = (
+    [_row("hp%d" % i, "Regen tick %d" % i,
+          ["Player", "Health", "Regeneration"]) for i in range(4)] +
+    [_row("hd%d" % i, "Damage rule %d" % i,
+          ["Player", "Health", "Damage", "Bleeding"]) for i in range(3)] +
+    [_row("pi%d" % i, "Inertia %d" % i, ["Player", "Movement"]) for i in range(5)] +
+    [_row("bt%d" % i, "Bot cap %d" % i, ["Bots"]) for i in range(6)] +
+    [_row("zz", "Ungrouped switch", [])]
+)
+# The last row declares NO path at all: the overlay must still put it under a
+# NAMED group. A fixture where every row is well-formed cannot catch the
+# nameless-group defect.
+for _k in ("path", "category", "subcategory"):
+    DEEP_ROWS[-1].pop(_k, None)
+
+UIHUB_ROWS = [
+    {"key": "launchHint", "label": "Show the launch hint", "type": "bool",
+     "value": True, "default": True, "implemented": True,
+     "path": ["Overlay", "Launch"], "category": "Overlay",
+     "subcategory": "Launch"}
+]
+
+def settings_index():
+    return {"mods": [{"guid": "aowl.deep", "name": "Deep tree fixture",
+                      "count": len(DEEP_ROWS)},
+                     {"guid": "aowl.uihub", "name": "Fallback Settings UI",
+                      "count": len(UIHUB_ROWS)}]}
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -373,6 +423,15 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        if self.path == "/aowlspt/settings/index":
+            self._send(settings_index())
+            return
+        if self.path.startswith("/aowlspt/settings/aowl.deep"):
+            self._send(DEEP_ROWS)
+            return
+        if self.path.startswith("/aowlspt/settings/aowl.uihub"):
+            self._send(UIHUB_ROWS)
+            return
         if self.path in ("/aowlspt/mods/panel", "/aowlspt/mods"):
             self._send(panel())
         elif self.path == "/aowlspt/mods/list":
