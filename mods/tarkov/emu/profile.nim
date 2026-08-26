@@ -26,6 +26,7 @@ import aowlspt/json
 import ids
 import numbers
 import starter
+import starterkit
 
 const
   KeyPrefix* = "profile."
@@ -185,6 +186,20 @@ proc newProfileText*(id, nickname, sideName, edition: string;
   let sorting = newId()
   let scav = newId()
 
+  # The edition's starting kit, out of `templates.profiles` (see `starterkit`).
+  # When it is not there the profile is still built -- with five containers and
+  # a money stack, as it always was -- but the log says so, because a player who
+  # spawns unarmed and unarmoured deserves an explanation on the server that
+  # made them.
+  let kit = starterKit(edition, sideName, startingRoubles)
+  var gameVersion = normalEdition(edition)
+  if gameVersion.len == 0:
+    gameVersion = "standard"
+  if not kit.ok:
+    warn "starting gear: " & kit.reason
+    warn "starting gear: this profile gets containers and cash only. Import " &
+         "templates/profiles.json with `aowl importdb` to fix it."
+
   var info = obj()
   put(info, "Nickname", nickname)
   put(info, "LowerNickname", toLowerAscii(nickname))
@@ -193,7 +208,7 @@ proc newProfileText*(id, nickname, sideName, edition: string;
   put(info, "Level", 1)
   put(info, "Experience", 0)
   put(info, "RegistrationDate", nowSeconds)
-  put(info, "GameVersion", edition)
+  put(info, "GameVersion", gameVersion)
   put(info, "AccountType", 0)
   put(info, "MemberCategory", 0)
   put(info, "SelectedMemberCategory", 0)
@@ -299,6 +314,10 @@ proc newProfileText*(id, nickname, sideName, edition: string;
   put(inventory, "fastPanel", obj())
   put(inventory, "favoriteItems", arr())
 
+  # The kit wins when it is there. `inventoryText` is what goes on the profile;
+  # the seven-item build above is the fallback and nothing else reads it.
+  let inventoryText = if kit.ok: kit.inventory else: done(inventory).text
+
   var skills = obj()
   # The 54 Common skills and the one Mastering entry a fresh standard-edition
   # profile carries (capture seq 096), all at Progress 0. An empty list here is
@@ -352,10 +371,10 @@ proc newProfileText*(id, nickname, sideName, edition: string;
   put(p, "Info", info)
   put(p, "Customization", customization)
   put(p, "Health", health)
-  put(p, "Inventory", inventory)
+  put(p, "Inventory", raw(inventoryText))
   put(p, "Skills", skills)
   put(p, "Stats", stats)
-  put(p, "Encyclopedia", obj())
+  put(p, "Encyclopedia", raw(if kit.ok: kit.encyclopedia else: "{}"))
   put(p, "TaskConditionCounters", obj())
   put(p, "InsuredItems", arr())
   put(p, "Hideout", hideout)
@@ -363,7 +382,7 @@ proc newProfileText*(id, nickname, sideName, edition: string;
   # StashSize bonus (which is what gives the stash its grid) and the starting
   # weapon-modification unlock. Without the StashSize bonus the stash renders at
   # its base template size.
-  put(p, "Bonuses", raw(StarterBonuses))
+  put(p, "Bonuses", raw(if kit.ok: kit.bonuses else: StarterBonuses))
   put(p, "Notes", objOf("Notes", arr()))
   # Starting quests are left empty on purpose: capture 096 shows two intro
   # quests pre-started, but those ids are game-version specific and pre-starting
@@ -377,7 +396,7 @@ proc newProfileText*(id, nickname, sideName, edition: string;
   put(ragfair, "offers", arr())
   put(ragfair, "sellSum", 0)
   put(p, "RagfairInfo", ragfair)
-  put(p, "TradersInfo", obj())
+  put(p, "TradersInfo", raw(seedTradersInfo(kit.trader)))
   put(p, "UnlockedInfo", objOf("unlockedProductionRecipe", arr()))
   put(p, "WishList", arr())
   put(p, "moneyTransferLimitData", obj())
