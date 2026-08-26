@@ -367,6 +367,20 @@ static int count_overlay_pixels(void) {
  * alignment dies on its first cell -- eight columns of two different glyphs do
  * not spell a third -- so the misaligned starts cost time and produce nothing.
  */
+/* WHERE a decoded run is, in back-buffer pixels. `panel_read_text` throws this
+ * away, which is fine for "is this string on screen" and useless for "is this\n * row indented further than that one" -- and indentation is the whole of the
+ * hierarchy question. So the scan optionally records one of these per run.
+ *
+ * Recorded, not derived: the x here is the pixel column the glyphs were
+ * actually decoded at. Computing it from AOWL_OV_PAD and a depth would be a
+ * second derivation of the thing under test, which is how this harness already
+ * once reported a button-geometry drift that did not exist. */
+typedef struct OcrRun { int x, y; int at; } OcrRun;
+
+static OcrRun* g_ocrRuns = NULL;
+static int     g_ocrRunCap = 0;
+static int     g_ocrRunN = 0;
+
 static int panel_read_text(char* out, int cap, uint32_t col) {
     ID3D11Texture2D* bb = NULL;
     D3D11_TEXTURE2D_DESC td, sd;
@@ -418,6 +432,7 @@ static int panel_read_text(char* out, int cap, uint32_t col) {
                 for (ux = 0; (int)ux + AOWL_OV_CW <= (int)W; ux++) {
                     char line[512];
                     int len = 0, blanks = 0, cells = 0;
+                    int firstGlyphX = -1;
                     UINT cx = ux;
                     while ((int)cx + AOWL_OV_CW <= (int)W) {
                         uint8_t rows[AOWL_OV_CH];
@@ -439,6 +454,7 @@ static int panel_read_text(char* out, int cap, uint32_t col) {
                                     break;
                                 }
                             if (hit < 0) break;
+                            if (firstGlyphX < 0) firstGlyphX = (int)cx;
                             if (blanks && len && len < (int)sizeof(line) - 1)
                                 line[len++] = ' ';
                             blanks = 0;
@@ -450,6 +466,34 @@ static int panel_read_text(char* out, int cap, uint32_t col) {
                     }
                     line[len] = 0;
                     if (len >= OCR_MIN_RUN && n + len + 2 < cap) {
+                        if (g_ocrRuns && g_ocrRunN < g_ocrRunCap) {
+                            /* The first GLYPH, not the scan start.
+                             *
+                             * The scan walks one pixel at a time and a run is
+                             * happily begun up to OCR_BLANK_RUN-1 blank cells
+                             * before the text -- blanks only end a run once
+                             * four of them are seen, and a leading blank adds
+                             * no character. So `ux` is the leftmost position
+                             * the decoder HAPPENED to start from, which is up
+                             * to three cells (24 px) left of the ink, and the
+                             * amount of that error depends on what is drawn
+                             * next to the text.
+                             *
+                             * That is a measuring instrument that is quietly
+                             * wrong by a variable amount, and it produced its
+                             * first false reading immediately: a row label
+                             * drawn 4 px right of a group header measured
+                             * 20 px LEFT of it, because the header had a solid
+                             * accent bar beside it that broke the early scans
+                             * and the row had nothing. Every indentation claim
+                             * in this file rests on this number, so it is the
+                             * ink`s position or it is nothing. */
+                            g_ocrRuns[g_ocrRunN].x = firstGlyphX >= 0
+                                                       ? firstGlyphX : (int)ux;
+                            g_ocrRuns[g_ocrRunN].y = (int)uy;
+                            g_ocrRuns[g_ocrRunN].at = n;
+                            g_ocrRunN++;
+                        }
                         memcpy(out + n, line, (size_t)len);
                         n += len;
                         out[n++] = '\n';
@@ -487,6 +531,39 @@ static int panel_read_text_capped(char* out, int cap, uint32_t col,
     return n;
 }
 
+
+/* The pixel column the run CONTAINING `needle` was decoded at, in the text
+ * drawn in `col`. -1 when nothing on screen contains it -- which the caller
+ * must treat as INCONCLUSIVE, not as "it is at x=0".
+ *
+ * `nth` picks among several matches, top to bottom, because a tree draws the
+ * same word at more than one depth. */
+static int panel_text_x(uint32_t col, const char* needle, int nth, int* outY) {
+    static OcrRun runs[512];
+    static char buf[65536];
+    int i, seen = 0, n;
+    g_ocrRuns = runs; g_ocrRunCap = 512; g_ocrRunN = 0;
+    n = panel_read_text(buf, (int)sizeof(buf), col);
+    g_ocrRuns = NULL;
+    if (n >= (int)sizeof(buf) - 64)
+        printf("      WARNING panel_text_x(%s): the OCR buffer came back full "
+               "-- a miss below this point is INCONCLUSIVE\n", needle);
+    for (i = 0; i < g_ocrRunN; i++) {
+        const char* line = buf + runs[i].at;
+        const char* end = strchr(line, (int)0x0A);
+        size_t len = end ? (size_t)(end - line) : strlen(line);
+        char one[512];
+        if (len > sizeof(one) - 1) len = sizeof(one) - 1;
+        memcpy(one, line, len); one[len] = 0;
+        if (strstr(one, needle)) {
+            if (seen++ < nth) continue;
+            if (outY) *outY = runs[i].y;
+            return runs[i].x;
+        }
+    }
+    if (outY) *outY = -1;
+    return -1;
+}
 
 /* The one line of `buf` that contains `needle`, copied into `out`. NULL when
  * no line does. */
@@ -686,20 +763,339 @@ static int check_group_titles(void) {
 /* The breadcrumb, read off the screen, after the nav has been driven into a
  * depth-3 node. */
 static int check_breadcrumb(void) {
-    static char accent[65536];
+    static char dim[65536];
+    static char text[65536];
+    int tailX, ancX;
     if (g_ov.selCat < 0 || g_ov.selCat >= g_ov.sCatCount) {
         printf("INCONCLUSIVE breadcrumb: no group is selected\n");
         return 0;
     }
-    panel_read_text(accent, (int)sizeof(accent), AOWL_OV_ACCENT);
-    /* `>` between every level, and the PAGE at the front. A two-level header
-     * ("page / group") does not contain this, so this check fails on the old
-     * code. */
-    if (!strstr(accent, "Player > Health")) {
-        printf("error breadcrumb does not show the full path -- expected "
-               "`... > Player > Health ...` in the header\n");
+    /* The ANCESTORS are dim and the CURRENT segment is bright, and both facts
+     * are read off the back buffer rather than off the draw calls.
+     *
+     * This is a stronger claim than "the path is on screen": a crumb rendered
+     * in one flat colour passes a substring test and still leaves the player
+     * hunting for which end says where they are. The split IS the change, so
+     * the check is on the split. */
+    panel_read_text_capped(dim, (int)sizeof(dim), AOWL_OV_DIM, "crumb/dim");
+    panel_read_text_capped(text, (int)sizeof(text), AOWL_OV_TEXT, "crumb/text");
+    if (!strstr(dim, "Deep tree fixture > Player")) {
+        printf("error the breadcrumb ancestors are not on screen dimmed -- "
+               "expected `Deep tree fixture > Player` in the DIM runs\n");
         return 0;
     }
+    if (!strstr(text, "> Health")) {
+        printf("error the breadcrumb`s CURRENT segment is not drawn in the "
+               "bright colour -- expected `> Health` in the TEXT runs\n");
+        return 0;
+    }
+    /* ...and the bright tail comes AFTER the dim ancestors, which is what
+     * makes it a trail rather than two unrelated labels. */
+    ancX = panel_text_x(AOWL_OV_DIM, "Deep tree fixture > Player", 0, NULL);
+    tailX = panel_text_x(AOWL_OV_TEXT, "> Health", 0, NULL);
+    if (ancX < 0 || tailX < 0) {
+        printf("INCONCLUSIVE breadcrumb order: one half did not decode "
+               "(ancestors x=%d, tail x=%d)\n", ancX, tailX);
+        return 0;
+    }
+    if (tailX <= ancX) {
+        printf("error the breadcrumb tail renders at x=%d, at or before its "
+               "own ancestors at x=%d -- it is not a trail\n", tailX, ancX);
+        return 0;
+    }
+    return 1;
+}
+
+/* IS THE DEPTH VISIBLE? Measured as pixels of indentation ON SCREEN, because
+ * that is the only form of the question the player can answer.
+ *
+ * `Regeneration` sits one level below `Health`, which sits one below `Player`.
+ * Each must render strictly further right than the last -- AND each is read
+ * from a different text colour, which is the depth-in-colour claim making
+ * itself falsifiable: if every level were drawn in one colour, two of these
+ * three reads would come back -1 and the check would say INCONCLUSIVE rather
+ * than quietly pass. */
+static int check_depth_visible(void) {
+    int xPlayer, xHealth, xRegen;
+    if (g_ov.selCat >= 0) {
+        printf("INCONCLUSIVE nav depth: a node is selected, so the active-path "
+               "colouring is in play and the colours no longer encode depth "
+               "alone -- run this with nothing selected\n");
+        return 0;
+    }
+    xPlayer = panel_text_x(AOWL_OV_TEXT, "Player", 0, NULL);
+    xHealth = panel_text_x(AOWL_OV_DIM, "Health", 0, NULL);
+    xRegen  = panel_text_x(AOWL_OV_FAINT, "Regeneration", 0, NULL);
+    if (xPlayer < 0 || xHealth < 0 || xRegen < 0) {
+        printf("INCONCLUSIVE nav depth: one level did not decode "
+               "(Player x=%d, Health x=%d, Regeneration x=%d)\n",
+               xPlayer, xHealth, xRegen);
+        return 0;
+    }
+    if (!(xHealth > xPlayer && xRegen > xHealth)) {
+        printf("error the nav does not indent by depth on screen: "
+               "Player x=%d, Health x=%d, Regeneration x=%d\n",
+               xPlayer, xHealth, xRegen);
+        return 0;
+    }
+    printf("      nav indent, measured on the back buffer: depth1 x=%d "
+           "depth2 x=%d depth3 x=%d, each in its own colour\n",
+           xPlayer, xHealth, xRegen);
+    return 1;
+}
+
+/* Like `panel_text_x`, but only inside the NAV COLUMN.
+ *
+ * Needed because the same words appear in three places: the nav, the group
+ * band, and the detail strip`s breadcrumb. "Did collapsing hide `Health`"
+ * asked of the WHOLE screen is answered by the detail strip, which is not the
+ * nav and never collapses -- so the unscoped question is unanswerable and the
+ * answer it gives is wrong. */
+static int nav_text_x_y(uint32_t col, const char* needle, int* outY) {
+    float prx = 0.0f;
+    int nth, x;
+    aowl_ov_panel_rect(&prx, NULL, NULL, NULL);
+    for (nth = 0; nth < 16; nth++) {
+        x = panel_text_x(col, needle, nth, outY);
+        if (x < 0) return -1;
+        /* The nav column is AOWL_OV_PAD + 256 wide and the right pane starts
+         * at +278, so 272 is inside the nav and short of the pane. 300 was
+         * NOT: it reached past 318 and let the right pane`s group bands answer
+         * questions asked about the nav. */
+        if (x < (int)prx + 272) return x;
+    }
+    return -1;
+}
+
+static int nav_text_x(uint32_t col, const char* needle) {
+    return nav_text_x_y(col, needle, NULL);
+}
+
+/* WHERE AM I? The negative the report asked for, and it is the strong form:
+ * NO nav node other than the selected one may render as selected.
+ *
+ * "Selected" is a solid 3px accent bar spanning the full row height at the
+ * nav`s left edge. Ancestors get a SHORT bar in a different colour and the
+ * rest get none, so counting full-height accent bars in that column counts
+ * selected rows -- and the answer must be exactly one.
+ *
+ * Counted off the back buffer, not off `selCat`: `selCat` is the thing under
+ * test. Clicking a leaf used to leave the ROOT looking selected, and any check
+ * phrased against `selCat` would have passed while the screen was wrong. */
+static int count_selected_bars(int navX, uint32_t col, int yMin, int* firstY) {
+    ID3D11Texture2D* bb = NULL;
+    D3D11_TEXTURE2D_DESC td, sd;
+    ID3D11Texture2D* stage = NULL;
+    D3D11_MAPPED_SUBRESOURCE map;
+    int found = 0, run = 0, y;
+    uint8_t want[3];
+    if (firstY) *firstY = -1;
+    /* The SAME byte order `panel_read_text` uses, copied rather than re-derived
+     * from AOWL_RGBA -- deriving it independently is how this first came back
+     * "0 nav rows are selected" about a bar that was plainly on screen. */
+    want[0] = (uint8_t)(col & 0xFF);
+    want[1] = (uint8_t)((col >> 8) & 0xFF);
+    want[2] = (uint8_t)((col >> 16) & 0xFF);
+    if (FAILED(IDXGISwapChain_GetBuffer(swap, 0, &AOWL_IID_ID3D11Texture2D,
+                                        (void**)&bb)))
+        return -1;
+    ID3D11Texture2D_GetDesc(bb, &td);
+    sd = td;
+    sd.Usage = D3D11_USAGE_STAGING;
+    sd.BindFlags = 0;
+    sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    sd.MiscFlags = 0;
+    if (FAILED(ID3D11Device_CreateTexture2D(dev, &sd, NULL, &stage))) {
+        ID3D11Texture2D_Release(bb);
+        return -1;
+    }
+    ID3D11DeviceContext_CopyResource(ctx, (ID3D11Resource*)stage,
+                                     (ID3D11Resource*)bb);
+    if (SUCCEEDED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource*)stage, 0,
+                                          D3D11_MAP_READ, 0, &map))) {
+        const uint8_t* base = (const uint8_t*)map.pData;
+        for (y = yMin; y < (int)td.Height; y++) {
+            const uint8_t* q = base + (size_t)y * map.RowPitch
+                                    + (size_t)navX * 4;
+            int on = q[0] + 1 >= want[0] && q[0] <= want[0] + 1 &&
+                     q[1] + 1 >= want[1] && q[1] <= want[1] + 1 &&
+                     q[2] + 1 >= want[2] && q[2] <= want[2] + 1;
+            if (on) { run++; continue; }
+            /* A FULL-height bar is the selection; the ancestors` ticks are
+             * AOWL_OV_ROW_H-10 tall and a different colour, so neither the
+             * length nor the colour of one can be mistaken for the other. */
+            if (run >= AOWL_OV_ROW_H - 2) {
+                if (found == 0 && firstY) *firstY = y - run;
+                found++;
+            }
+            run = 0;
+        }
+        if (run >= AOWL_OV_ROW_H - 2) {
+            if (found == 0 && firstY) *firstY = (int)td.Height - run;
+            found++;
+        }
+        ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource*)stage, 0);
+    }
+    ID3D11Texture2D_Release(stage);
+    ID3D11Texture2D_Release(bb);
+    return found;
+}
+
+static int check_one_selected(const char* wantLabel) {
+    float prx = 0.0f, pry = 0.0f;
+    int n, selY = -1, lblY = -1, lblX;
+    aowl_ov_panel_rect(&prx, &pry, NULL, NULL);
+    /* The row HIGHLIGHT, sampled in the middle of the nav column rather than
+     * the 3px accent bar at its edge -- the same claim, and it does not rest
+     * on a three-pixel rectangle surviving everything drawn over it. 150 units
+     * in is inside every nav row, and the scan starts BELOW the header --
+     * without which the `SETTINGS` tab, which wears the same colour because it
+     * is also "the selected one", counts as a selected nav row. It did. */
+    n = count_selected_bars((int)prx + 150, AOWL_OV_SELBG,
+                            (int)pry + AOWL_OV_HEAD_H, &selY);
+    if (n < 0) {
+        printf("INCONCLUSIVE selection: could not read the back buffer\n");
+        return 0;
+    }
+    if (n != 1) {
+        printf("error %d nav rows render as selected, not 1 -- the tree does "
+               "not show where you are\n", n);
+        return 0;
+    }
+    /* ...and it is the row that was CLICKED, not its root. Matched by the
+     * label`s own y against the bar`s y. */
+    /* IN THE NAV, not anywhere. The breadcrumb in the right pane says
+     * `... > Health` in the same colour and sits at the top of the body, so an
+     * unscoped read answers this question with the header and reports that
+     * something else is highlighted. */
+    lblX = nav_text_x_y(AOWL_OV_TEXT, wantLabel, &lblY);
+    if (lblX < 0) {
+        printf("INCONCLUSIVE selection: `%s` is not on screen to compare "
+               "against\n", wantLabel);
+        return 0;
+    }
+    if (lblY < selY || lblY > selY + AOWL_OV_ROW_H) {
+        printf("error the selected row is at y=%d but `%s` renders at y=%d -- "
+               "something else is highlighted\n", selY, wantLabel, lblY);
+        return 0;
+    }
+    printf("      selection, measured on the back buffer: exactly 1 selected "
+           "row, at y=%d, carrying `%s`\n", selY, wantLabel);
+    return 1;
+}
+
+/* COLLAPSE ACTUALLY HIDES. The negative: after closing a branch, none of its
+ * children may still be on screen. Asserted on the glyphs, because a tree that
+ * flips a flag and keeps drawing the children is exactly the bug. */
+static int check_collapse_hides(void) {
+    int before = nav_text_x(AOWL_OV_FAINT, "Regeneration");
+    if (before < 0) {
+        printf("INCONCLUSIVE collapse: `Regeneration` was not on screen "
+               "BEFORE the branch was closed, so hiding it proves nothing\n");
+        return -1;
+    }
+    return 1;
+}
+
+/* IS THE SEARCH BOX BIG? Measured, not asserted. The field`s own label is a
+ * sentence that only fits when the box spans the pane, and the box`s HEIGHT is
+ * the gap between that label and the scope line under it. */
+static int check_search_prominent(void) {
+    static char faint[65536];
+    int inputY = -1, scopeY = -1;
+    panel_read_text_capped(faint, (int)sizeof(faint), AOWL_OV_FAINT,
+                           "searchbox");
+    if (!strstr(faint, "search these settings by name, key or group")) {
+        printf("error the search field`s own label is not on screen in full -- "
+               "the box is too narrow to hold it\n");
+        return 0;
+    }
+    /* The scope line names the three fields it searches. The parenthetical
+     * about what it does NOT search is dropped on a narrow pane -- deliberately,
+     * see the overlay`s own comment -- so the check is on the part that is
+     * always said, not on the part that is a nicety. */
+    if (!strstr(faint, "name, key, group only")) {
+        printf("error the search SCOPE line does not say what it searched\n");
+        return 0;
+    }
+    (void)panel_text_x(AOWL_OV_FAINT, "search these settings by name", 0,
+                       &inputY);
+    (void)panel_text_x(AOWL_OV_FAINT, "name, key, group only", 0, &scopeY);
+    if (inputY < 0 || scopeY < 0) {
+        printf("INCONCLUSIVE search box height: input y=%d scope y=%d\n",
+               inputY, scopeY);
+        return 0;
+    }
+    if (scopeY - inputY < AOWL_OV_LINE_H) {
+        printf("error the search box is one line tall: its label and its "
+               "scope line are %d pixels apart\n", scopeY - inputY);
+        return 0;
+    }
+    printf("      search box, measured on the back buffer: label at y=%d, "
+           "scope at y=%d, %d pixels apart\n", inputY, scopeY, scopeY - inputY);
+    return 1;
+}
+
+/* Group headers are BANDS with a name and a count, and the rows they contain
+ * sit below AND indented past them -- which is what makes a band read as a
+ * container rather than as another row. */
+static int check_group_bands(void) {
+    int bandY = -1, rowY = -1;
+    int bandX = panel_text_x(AOWL_OV_ACCENT, "Regeneration", 0, &bandY);
+    int rowX = panel_text_x(AOWL_OV_TEXT, "Regen tick 0", 0, &rowY);
+    if (bandX < 0 || rowX < 0) {
+        printf("INCONCLUSIVE group bands: header x=%d, first row x=%d\n",
+               bandX, rowX);
+        return 0;
+    }
+    if (rowY <= bandY) {
+        printf("error a group`s rows do not sit below its header band "
+               "(band y=%d, row y=%d)\n", bandY, rowY);
+        return 0;
+    }
+    {   /* Dump every TEXT run in a band of rows, with its measured x. */
+        static OcrRun runs[512]; static char buf[65536]; int i2;
+        g_ocrRuns = runs; g_ocrRunCap = 512; g_ocrRunN = 0;
+        panel_read_text(buf, (int)sizeof(buf), AOWL_OV_TEXT);
+        g_ocrRuns = NULL;
+        for (i2 = 0; i2 < g_ocrRunN; i2++)
+            if (runs[i2].y > 290 && runs[i2].y < 312) {
+                char one[200]; const char* L = buf + runs[i2].at;
+                const char* e2 = strchr(L, 10);
+                size_t ln = e2 ? (size_t)(e2 - L) : strlen(L);
+                if (ln > 190) ln = 190;
+                memcpy(one, L, ln); one[ln] = 0;
+                printf("      DEBUG TEXT run at (%d,%d): [%s]\n",
+                       runs[i2].x, runs[i2].y, one);
+            }
+    }
+    {   int q, yy;
+        for (q = 0; q < 4; q++) {
+            int xx = panel_text_x(AOWL_OV_TEXT, "Regen tick 0", q, &yy);
+            if (xx < 0) break;
+            printf("      DEBUG match %d of `Regen tick 0` at (%d,%d)\n", q, xx, yy);
+        }
+        for (q = 0; q < 4; q++) {
+            int xx = panel_text_x(AOWL_OV_ACCENT, "Regeneration", q, &yy);
+            if (xx < 0) break;
+            printf("      DEBUG match %d of accent `Regeneration` at (%d,%d)\n", q, xx, yy);
+        }
+    }
+    {   /* Say where the pane starts, so a surprising x is diagnosable rather
+         * than just wrong. */
+        float prx = 0.0f, prw = 0.0f;
+        aowl_ov_panel_rect(&prx, NULL, &prw, NULL);
+        printf("      (panel x=%d w=%d, scale=%d)\n", (int)prx, (int)prw,
+               aowl_ov_scale());
+    }
+    if (rowX <= bandX) {
+        printf("error a group`s rows are not indented past its header "
+               "(band x=%d, row x=%d) -- the band does not read as a "
+               "container\n", bandX, rowX);
+        return 0;
+    }
+    printf("      group band, measured on the back buffer: header at (%d,%d), "
+           "its first row at (%d,%d)\n", bandX, bandY, rowX, rowY);
     return 1;
 }
 
@@ -719,14 +1115,48 @@ static int check_search(void) {
                g_ov.sItemCount);
         return 0;
     }
-    /* Every result must carry WHERE it is. The breadcrumb on a result row is
-     * drawn FAINT; with none of them on screen the result list is ambiguous,
-     * which is the defect the requirement names. */
-    panel_read_text(faint, (int)sizeof(faint), AOWL_OV_FAINT);
-    if (!strstr(faint, "Player/")) {
-        printf("error search results do not show where the hit is -- no group "
-               "path rendered on any result row\n");
+    /* Every result must carry WHERE it is, and it must still end in the
+     * segment that DISTINGUISHES the hit.
+     *
+     * Clipped on the right the path read `Player/Health/Regenera..` --
+     * present, plausible, and missing the only part that answers "which of the\n     * nine rows called Enabled is this one". So the check is on the TAIL, not
+     * on the presence of a path. It fails on the right-clipped code this
+     * replaced, which is its mutation proof. */
+    panel_read_text_capped(faint, (int)sizeof(faint), AOWL_OV_FAINT,
+                           "search results");
+    if (!strstr(faint, "Regeneration")) {
+        printf("error a search result`s group path does not carry its own "
+               "deepest segment\n");
         return 0;
+    }
+    /* THE NEGATIVE, and it is the one that matters: no rendered path may end
+     * in the right-clip marker. `Player > Health > Regenera..` satisfies the
+     * check above and IS the failure -- present, plausible, and cut at the end
+     * that identifies the hit. Truncation is allowed, but only from the LEFT,
+     * where what it costs is the prefix every sibling shares. */
+    if (strstr(faint, "Regenera..") || strstr(faint, "Player > Health >")) {
+        printf("error a search result`s path is clipped on the RIGHT (or is "
+               "untruncated and overflowing) -- the identifying end is what "
+               "was lost\n");
+        return 0;
+    }
+    /* ...and the box echoes the term AS TYPED. `aowl_ov_vk_char` hands back
+     * virtual keys, so a letter arrives as its capital; a search field that
+     * shouts REGEN back at somebody who typed regen reads as broken. */
+    {
+        static char text[65536];
+        panel_read_text_capped(text, (int)sizeof(text), AOWL_OV_TEXT,
+                               "search term");
+        if (strstr(text, "REGEN")) {
+            printf("error the search box upper-cased what was typed\n");
+            return 0;
+        }
+        if (!strstr(text, "regener")) {
+            printf("INCONCLUSIVE search echo: neither `regener` nor `REGENER` "
+                   "is on screen, so nothing was read back (the decoder "
+                   "ignores runs shorter than %d glyphs)\n", OCR_MIN_RUN);
+            return 0;
+        }
     }
     return 1;
 }
@@ -1054,6 +1484,12 @@ int main(int argc, char** argv) {
     int groupTitlesOk = -1, crumbOk = -1, mutationOk = -1, searchOk = -1;
     int searchFocusOk = -1, emptyTermOk = -1, clearedOk = -1;
     int maxOk = -1, restoreOk = -1, alphaOk = -1;
+    /* The look-and-feel pass. Every one of these is a measurement taken off
+     * the back buffer, not a claim about a coordinate we computed. */
+    int depthOk = -1, bandsOk = -1, bigBoxOk = -1, indentMutOk = -1;
+    int selectedOk = -1, collapseOk = -1, collapsePre = -1;
+    int unfocusedKeyOk = -1, focusedKeyOk = -1;
+    int keyAlphaWas = 0, keyFocusWas = 0;
     int hintUpOk = -1, hintGoneOk = -1;
     int alphaWas = 0;
     float movedFromX = 0.0f, movedFromW = 0.0f;
@@ -1456,11 +1892,11 @@ int main(int argc, char** argv) {
                 if (g_setPage >= 0) g_ov.selPage = g_setPage;
             }
             if (f == 206 && port > 0 && g_setPage >= 0) {
-                /* Into the deepest node under Player/Health, by walking the
-                 * tree the way the keyboard does. */
+                /* Into a node three deep, the way a click gets there. */
                 for (int32_t c = 0; c < g_ov.sCatCount; c++)
                     if (strcmp(g_ov.sCats[c].full, "Player/Health") == 0) {
                         g_ov.selCat = c;
+                        g_ov.navOpen[c] = 1;
                         g_ov.selItem = g_ov.sCats[c].lo;
                         g_ov.topItem = g_ov.selItem;
                     }
@@ -1469,6 +1905,9 @@ int main(int argc, char** argv) {
                 groupTitlesOk = check_group_titles();
                 crumbOk = check_breadcrumb();
                 mutationOk = check_mutations();
+                bandsOk = check_group_bands();
+                bigBoxOk = check_search_prominent();
+                selectedOk = check_one_selected("Health");
                 if (shotDir) {
                     _snprintf(path, sizeof(path), "%s\\12-settings-tree.bmp", shotDir);
                     if (shoot(path)) ok("wrote 12-settings-tree.bmp");
@@ -1481,11 +1920,18 @@ int main(int argc, char** argv) {
                 SendMessageW(hwnd, WM_KEYDOWN, VK_OEM_2, 0);    /* `/` */
             }
             if (f == 216 && port > 0) {
+                /* `regener`, not `regen`, and the extra two letters are for
+                 * the INSTRUMENT: the glyph decoder ignores any run shorter
+                 * than OCR_MIN_RUN (6) so that it does not read noise as text,
+                 * which makes a 5-character term invisible to it. Both terms
+                 * match the same four rows. */
                 SendMessageW(hwnd, WM_KEYDOWN, 'R', 0);
                 SendMessageW(hwnd, WM_KEYDOWN, 'E', 0);
                 SendMessageW(hwnd, WM_KEYDOWN, 'G', 0);
                 SendMessageW(hwnd, WM_KEYDOWN, 'E', 0);
                 SendMessageW(hwnd, WM_KEYDOWN, 'N', 0);
+                SendMessageW(hwnd, WM_KEYDOWN, 'E', 0);
+                SendMessageW(hwnd, WM_KEYDOWN, 'R', 0);
             }
             if (f == 220 && port > 0) SendMessageW(hwnd, WM_KEYDOWN, VK_RETURN, 0);
             if (f == 222 && port > 0) {
@@ -1494,7 +1940,7 @@ int main(int argc, char** argv) {
                 searchFocusOk = !g_ov.searchFocus && g_ov.search[0] != 0;
                 searchOk = check_search();
                 if (shotDir) {
-                    _snprintf(path, sizeof(path), "%s\\13-settings-search.bmp", shotDir);
+                    _snprintf(path, sizeof(path), "%s\13-settings-search.bmp", shotDir);
                     if (shoot(path)) ok("wrote 13-settings-search.bmp");
                 }
             }
@@ -1546,6 +1992,87 @@ int main(int argc, char** argv) {
                 /* Solid, and it got there by the key rather than by a write. */
                 alphaOk = (g_ov.panAlpha == 255 && g_ov.panAlpha != alphaWas);
                 if (!alphaOk) bad("-/= did not drive the background to solid");
+            }
+
+            /* --- ACT: the tree collapses, and the keyboard is not swallowed --
+             *
+             * On frames of its own, after the search and window acts have
+             * finished, because both leave state behind -- a term in the box
+             * and a focused field -- and a check that runs on top of another
+             * act`s leftovers is measuring the wrong screen. */
+            if (f == 252) SendMessageW(hwnd, WM_KEYDOWN, VK_F2, 0);
+            if (f == 254 && port > 0) {
+                /* Nothing selected, two levels open: the one state in which the
+                 * nav`s colours encode depth AND ONLY depth. */
+                g_ov.search[0] = 0; g_ov.searchFocus = 0;
+                g_ov.selCat = -1;
+                for (int32_t c = 0; c < g_ov.sCatCount; c++)
+                    g_ov.navOpen[c] = (strcmp(g_ov.sCats[c].full, "Player") == 0 ||
+                                       strcmp(g_ov.sCats[c].full,
+                                              "Player/Health") == 0);
+            }
+            if (f == 258 && port > 0) {
+                depthOk = check_depth_visible();
+                collapsePre = check_collapse_hides();
+                indentMutOk = (panel_text_x(AOWL_OV_ERR, "Regeneration", 0,
+                                            NULL) < 0) &&
+                              (panel_text_x(AOWL_OV_TEXT,
+                                            "no such string anywhere", 0,
+                                            NULL) < 0);
+                if (!indentMutOk)
+                    bad("panel_text_x returned a position for text that is "
+                        "not on screen -- every indent measurement is "
+                        "worthless");
+            }
+            /* Close `Player`; its whole subtree must leave the NAV. */
+            if (f == 260 && port > 0)
+                for (int32_t c = 0; c < g_ov.sCatCount; c++)
+                    if (strcmp(g_ov.sCats[c].full, "Player") == 0)
+                        g_ov.navOpen[c] = 0;
+            if (f == 264 && port > 0 && collapsePre > 0) {
+                int gx = nav_text_x(AOWL_OV_FAINT, "Regeneration");
+                int hx = nav_text_x(AOWL_OV_DIM, "Health");
+                collapseOk = (gx < 0 && hx < 0);
+                if (!collapseOk) {
+                    char m2[160];
+                    _snprintf(m2, sizeof(m2),
+                              "closing a branch left its children in the nav "
+                              "(Regeneration x=%d, Health x=%d)", gx, hx);
+                    bad(m2);
+                }
+            }
+            /* THE INPUT MODEL, both halves. Unfocused, `-` must reach the
+             * panel and must NOT land in the term; focused, `-` must land in
+             * the term and F10 must STILL work -- that is the whole reason the
+             * opacity control is a function key. */
+            if (f == 266 && port > 0) {
+                keyAlphaWas = g_ov.panAlpha;
+                keyFocusWas = g_ov.searchFocus;
+                SendMessageW(hwnd, WM_KEYDOWN, VK_OEM_MINUS, 0);
+            }
+            if (f == 268 && port > 0) {
+                unfocusedKeyOk = !keyFocusWas &&
+                                 g_ov.panAlpha != keyAlphaWas &&
+                                 g_ov.search[0] == 0;
+                if (!unfocusedKeyOk)
+                    bad("with the search box unfocused, `-` did not reach the "
+                        "panel, or leaked into the search term");
+                keyAlphaWas = g_ov.panAlpha;
+                SendMessageW(hwnd, WM_KEYDOWN, VK_OEM_2, 0);   /* `/` focuses */
+            }
+            if (f == 270 && port > 0) {
+                SendMessageW(hwnd, WM_KEYDOWN, VK_F10, 0);
+                SendMessageW(hwnd, WM_KEYDOWN, VK_OEM_MINUS, 0);
+            }
+            if (f == 272 && port > 0) {
+                focusedKeyOk = g_ov.searchFocus &&
+                               g_ov.panAlpha != keyAlphaWas &&
+                               strchr(g_ov.search, 0x2D) != NULL;
+                if (!focusedKeyOk)
+                    bad("with the search box focused, F10 stopped working or "
+                        "`-` did not reach the term");
+                SendMessageW(hwnd, WM_KEYDOWN, VK_ESCAPE, 0);
+                SendMessageW(hwnd, WM_KEYDOWN, VK_F2, 0);
             }
 
             if (f == 188) costLabelOk = check_cost_label(1);
@@ -1610,6 +2137,19 @@ int main(int argc, char** argv) {
             { "F11 maximises the panel", maxOk },
             { "un-maximising restores the saved geometry exactly", restoreOk },
             { "-/= drives the background all the way to solid", alphaOk },
+            { "nav depth is VISIBLE: each level indents further and is drawn "
+              "in its own colour", depthOk },
+            { "a group is a BAND its rows sit below and inside", bandsOk },
+            { "the search box is full-width and two lines tall", bigBoxOk },
+            { "panel_text_x misses when the text is not there (mutation proof)",
+              indentMutOk },
+            { "EXACTLY ONE nav row renders selected, and it is the one clicked",
+              selectedOk },
+            { "closing a branch takes its children OFF SCREEN", collapseOk },
+            { "unfocused, `-` reaches the panel and not the search term",
+              unfocusedKeyOk },
+            { "focused, F10 still works and `-` goes into the term",
+              focusedKeyOk },
             { "the launch hint is ON SCREEN while it is up", hintUpOk },
             { "the launch hint is OFF SCREEN once it has expired", hintGoneOk },
         };
