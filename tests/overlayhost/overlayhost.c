@@ -1224,6 +1224,450 @@ static int check_mutations(void) {
     return okAll;
 }
 
+/* ASK THE FIXTURE, over the wire, on this thread.
+ *
+ * The whole point of these checks is that the observer is not the thing being
+ * observed: "how many writes arrived" has to be answered by the process that
+ * received them. Blocking here is fine -- this is a scripted test frame, not a
+ * game frame -- and it uses the overlay's own transport so there is no second
+ * HTTP client to keep in step. Returns NULL when it could not ask, which the
+ * callers turn into INCONCLUSIVE rather than into a pass. */
+static char g_ask[65536];
+static const char* ask_fixture(const wchar_t* path) {
+    g_ask[0] = 0;
+    if (aowl_ov_http(L"GET", path, NULL, g_ask, (int)sizeof(g_ask)) <= 0)
+        return NULL;
+    return g_ask;
+}
+
+/* How many settings writes the fixture has received for the deep page. Counted
+ * from its `/posts` record by looking for the route, so it counts REQUESTS THAT
+ * ARRIVED rather than anything this process intended to send. */
+static int posts_seen(void) {
+    const char* b = ask_fixture(L"/posts");
+    const char* p;
+    int n = 0;
+    if (!b) return -1;
+    for (p = b; (p = strstr(p, "/aowlspt/settings/aowl.deep")) != NULL; p++)
+        n++;
+    return n;
+}
+
+/* ==================================================================
+ * THE FOUR NEW NEGATIVES
+ *
+ * Each is phrased so that an input exists which makes it fail, and each is
+ * mutation-proved below in `check_new_mutations`. Three outcomes throughout:
+ * PASS, FAIL, and INCONCLUSIVE for "I could not look" -- which is never a pass.
+ * ================================================================== */
+
+/* 1. NO NAV ROW RENDERS AT THE SAME X-OFFSET AS ITS OWN PARENT.
+ *
+ * The reported defect exactly: "Singleplayer" (the page) and the group inside
+ * it had the same indentation, so nothing said one contained the other. Read
+ * off the BACK BUFFER, and the page row is found in the page's own colour --
+ * asking `g_ov` where it drew the label would be asking the code under test.
+ *
+ * The strong form is the parent comparison, not "depth1 is indented": a tree
+ * whose every level shared one indent would pass "is indented" trivially. */
+static int check_nav_depth1_indent(void) {
+    int xPage, xD1;
+    if (g_ov.sCatCount < 1) {
+        printf("INCONCLUSIVE nav depth-1 indent: the page has no groups\n");
+        return 0;
+    }
+    /* WHICH TWO WORDS, and why these two -- three instrument facts went into
+     * it, each measured, none of them a property of the panel:
+     *
+     *  1. The glyph decoder IGNORES ANY RUN SHORTER THAN 6 (OCR_MIN_RUN), so it
+     *     does not read noise as text. `nav_text_x(TEXT, "Bots")` -- the
+     *     obvious needle for a depth-1 group -- returns -1 for a label plainly
+     *     on screen, and that reads as "the nav did not draw it".
+     *  2. A SPACE BREAKS A RUN, so the x of a needle is the x of ITS WORD, not
+     *     of the label it sits in. "fixture" (the last word of the page label)
+     *     measured 122 against a depth-1 group at 74, which reads as the page
+     *     being indented further than its own child -- the exact opposite of
+     *     the truth.
+     *  3. On the SELECTED page row the first word does not decode at all, while
+     *     the second on the same row does: probing "Deeper"/"Deeptree" both
+     *     returned -1 while "Fixture" on that row returned 122 and "Fallback"
+     *     -- the first word of the UNSELECTED page row -- returned 66. The
+     *     selected page row carries a "- " disclosure marker where the
+     *     unselected one carries "  ", so the leading glyph appears to be
+     *     merging into the first word and corrupting it. NOT CHARACTERISED
+     *     FURTHER, and this check does not depend on it.
+     *
+     *  4. AND `panel_text_x` REPORTS THE START OF THE RUN THE NEEDLE IS IN,
+     *     NOT THE NEEDLE'S OWN x. This is the fourth instrument lie found in
+     *     this file and it is the same one a previous round believed fixed.
+     *
+     *     Measured, and it is not subtle: "Player" and "Numbers" are BOTH
+     *     depth-1 groups on the same page and must be drawn at the same x. They
+     *     report 74 and 90. The difference is exactly 2 characters, and the
+     *     cause is the disclosure marker -- "Player" has children so its label
+     *     is drawn as "- Player" and the decoded run begins at the dash, while
+     *     "Numbers" has none so its run is drawn as two SPACES (blank pixels,
+     *     which start no run) followed by "Numbers". Same indent, two answers,
+     *     16 px apart.
+     *
+     *     Working back through it the real ladder is a clean 24 px per level --
+     *     page 50, depth-1 74, depth-2 98, depth-3 122, and 24 is exactly the
+     *     `3 * AOWL_OV_CW` the nav intends. But no comparison here may mix a
+     *     marker-bearing run with a marker-less one, or it is off by 16.
+     *
+     *     So BOTH needles below are chosen to be MARKER-LESS runs: "Fallback"
+     *     is an unselected page row (drawn "  Fallback...") and "Numbers" is a
+     *     depth-1 group with no children (drawn "  Numbers"). Both report
+     *     `lx + 2 * CW`, the constant cancels, and the difference is the true
+     *     indent. Reported to the caller as an instrument defect, not worked
+     *     around silently. */
+    xPage = nav_text_x(AOWL_OV_TEXT, "Fallback");
+    xD1   = nav_text_x(AOWL_OV_TEXT, "Numbers");
+    if (xPage < 0 || xD1 < 0) {
+        static char dbg[65536];
+        int n = panel_read_text(dbg, (int)sizeof(dbg), AOWL_OV_TEXT);
+        printf("INCONCLUSIVE nav depth-1 indent: page x=%d, depth-1 x=%d "
+               "(one of them did not decode)\n", xPage, xD1);
+        /* Print what the decoder DID see. An INCONCLUSIVE with no evidence is
+         * indistinguishable from a broken decoder, and this file has been
+         * burned by exactly that: a needle under the 6-glyph minimum reads as
+         * "the panel did not draw it". */
+        printf("      decoder saw (%d bytes, TEXT): %.400s\n", n, dbg);
+        {
+            static const char* try_[] = { "Deeper", "Fixture", "Deeptree",
+                                          "Fallback", "Player", "Numbers" };
+            size_t ti;
+            for (ti = 0; ti < sizeof(try_) / sizeof(try_[0]); ti++)
+                printf("      probe '%s': nav x=%d, whole-panel x=%d\n",
+                       try_[ti], nav_text_x(AOWL_OV_TEXT, try_[ti]),
+                       panel_text_x(AOWL_OV_TEXT, try_[ti], 0, NULL));
+        }
+        return 0;
+    }
+    if (xD1 <= xPage) {
+        printf("error a depth-1 group renders at or left of its own page: "
+               "page x=%d, depth-1 group 'Player' x=%d -- the first level of "
+               "nesting has no tree treatment\n", xPage, xD1);
+        return 0;
+    }
+    printf("      nav depth-1, measured on the back buffer: page x=%d, its "
+           "depth-1 group x=%d (+%d)\n", xPage, xD1, xD1 - xPage);
+    /* The WHOLE LADDER, printed every run. A single "+N" says the first level
+     * is indented and says nothing about whether it is indented as much as
+     * every other level -- which is the difference between a tree and a tree
+     * with one apologetic step in it. These are read, not asserted, so a
+     * regression shows up as a number changing in the log. */
+    printf("      nav ladder (RUN starts -- a row with a disclosure marker "
+           "reads 16 low; see above): page=%d d1=%d d1+mark=%d d2+mark=%d "
+           "d3=%d\n",
+           xPage, xD1, nav_text_x(AOWL_OV_TEXT, "Player"),
+           nav_text_x(AOWL_OV_DIM, "Health"),
+           nav_text_x(AOWL_OV_FAINT, "Regeneration"));
+    return 1;
+}
+
+/* 2. NO RENDERED ROW HAS `implemented:false`, AND NO GROUP IS LEFT EMPTY.
+ *
+ * Two halves, both negatives. The first is checked against the SCREEN -- the
+ * fixture's hidden rows are labelled "Cultist circle N", a string that appears
+ * nowhere else -- because the question is what the player sees. The second is
+ * checked against the built nav, since an empty group is a structural thing
+ * that has no pixels by definition; a group that exists with zero rows would
+ * still print a band and a count of 0. */
+static int check_unimpl_hidden(void) {
+    static char text[65536];
+    int i, okAll = 1;
+    if (g_ov.showUnimpl) {
+        printf("INCONCLUSIVE unimplemented filter: F8 is ON, so the rows are "
+               "meant to be on screen\n");
+        return 0;
+    }
+    if (g_ov.sItemCount <= 0) {
+        printf("INCONCLUSIVE unimplemented filter: no rows loaded\n");
+        return 0;
+    }
+    panel_read_text(text, (int)sizeof(text), AOWL_OV_TEXT);
+    if (strstr(text, "Cultist")) {
+        printf("error a row the schema marks implemented:false is on screen "
+               "(found 'Cultist' in the panel text)\n");
+        okAll = 0;
+    }
+    panel_read_text(text, (int)sizeof(text), AOWL_OV_DIM);
+    if (strstr(text, "Cultist")) {
+        printf("error a row marked implemented:false is on screen, dimmed -- "
+               "dimming it is what this change replaces, not what it does\n");
+        okAll = 0;
+    }
+    /* No row that survived the filter may be unimplemented. This is the
+     * property, stated over the data the draw walks. */
+    for (i = 0; i < g_ov.sItemCount; i++)
+        if (!g_ov.sItems[i].implemented) {
+            printf("error row %d (%s) is implemented:false and was kept\n",
+                   i, g_ov.sItems[i].key);
+            okAll = 0;
+            break;
+        }
+    /* No group may exist with no rows in it. */
+    for (i = 0; i < g_ov.sCatCount; i++)
+        if (g_ov.sCats[i].hi <= g_ov.sCats[i].lo) {
+            printf("error nav group '%s' survived with no rows in it\n",
+                   g_ov.sCats[i].full);
+            okAll = 0;
+            break;
+        }
+    /* And the count the band prints must be the count of rows it heads --
+     * `itemsImpl` counts only implemented rows, and with the filter on that is
+     * every row there is. A mismatch means a count on screen that no row
+     * supports, which is the "right-aligned counts include hidden rows" case. */
+    if (g_ov.sItemsImpl != g_ov.sItemCount) {
+        printf("error the implemented count (%d) and the row count (%d) "
+               "disagree with the filter on\n",
+               g_ov.sItemsImpl, g_ov.sItemCount);
+        okAll = 0;
+    }
+    if (okAll)
+        printf("      %d rows kept, %d hidden as not-implemented, %d groups, "
+               "none empty\n", g_ov.sItemCount, g_ov.sHiddenCount,
+               g_ov.sCatCount);
+    return okAll;
+}
+
+/* A page every row of which is unimplemented must not be in the nav -- and must
+ * NOT HAVE BEEN FETCHED to establish that. The second half is the one that
+ * matters for cost: hiding 28 SPT pages by loading 28 SPT pages is not hiding
+ * them, it is hiding them expensively. Answered by the fixture's own fetch
+ * counter, over the wire, not by anything this process believes. */
+static int check_dead_page_hidden(const char* fetchesJson) {
+    int i, found = 0;
+    for (i = 0; i < g_ov.sPageCount; i++)
+        if (strcmp(g_ov.sPages[i].id, "aowl.dead") == 0) found = 1;
+    if (found) {
+        printf("error a page whose index says done:0 is still in the nav\n");
+        return 0;
+    }
+    if (!fetchesJson) {
+        printf("INCONCLUSIVE dead page: could not read the fixture's fetch "
+               "counter, so 'never fetched' is unproven\n");
+        return 0;
+    }
+    if (strstr(fetchesJson, "aowl.dead")) {
+        printf("error the hidden page WAS fetched -- the nav is hiding it "
+               "after paying for it: %s\n", fetchesJson);
+        return 0;
+    }
+    printf("      the all-unimplemented page is absent from the nav and was "
+           "never fetched (fixture says %s)\n", fetchesJson);
+    return 1;
+}
+
+/* 3. EXACTLY ONE NUMERIC ROW MAY DRAW A SLIDER.
+ *
+ * The fixture declares six numbers: one with a well-formed range and five with
+ * range shapes that must fall back (none, max only, min only, inverted, and a
+ * span too wide for a 104px track to address). `hasRange` is the parser's
+ * decision and is a pure function of the body, so it is the right thing to
+ * assert -- and the check is a COUNT over all six rather than a look at the
+ * good one, so a panel that sliders everything fails. */
+static int check_slider_ranges(void) {
+    int i, sliders = 0, numbers = 0, okAll = 1;
+    for (i = 0; i < g_ov.sItemCount; i++) {
+        AowlOvSItem* s = &g_ov.sItems[i];
+        if (strcmp(s->path, "Numbers") != 0) continue;
+        numbers++;
+        if (s->hasRange) {
+            sliders++;
+            if (strcmp(s->key, "sliderok") != 0) {
+                printf("error '%s' got a slider from a range that cannot "
+                       "support one (lo=%g hi=%g step=%g)\n",
+                       s->key, (double)s->lo, (double)s->hi, (double)s->step);
+                okAll = 0;
+            }
+        }
+        /* A step of zero would divide by zero in the drag; it must never
+         * survive the parser whatever the body said. */
+        if (s->step <= 0.0f) {
+            printf("error '%s' kept a non-positive step (%g)\n",
+                   s->key, (double)s->step);
+            okAll = 0;
+        }
+    }
+    if (numbers < 6) {
+        printf("INCONCLUSIVE slider ranges: only %d numeric rows loaded\n",
+               numbers);
+        return 0;
+    }
+    if (sliders != 1) {
+        printf("error %d of %d numeric rows drew a slider; exactly 1 has a "
+               "range that can support one\n", sliders, numbers);
+        okAll = 0;
+    }
+    if (okAll)
+        printf("      %d numeric rows, 1 slider, %d steppers -- a missing or "
+               "unusable range falls back rather than inventing bounds\n",
+               numbers, numbers - 1);
+    return okAll;
+}
+
+/* 4. A DRAG OF N FRAMES EMITS FEWER THAN N WRITES.
+ *
+ * Counted at the BACKEND, from its own record of what arrived, not from
+ * `writeCount` -- which is the panel counting its own writes and is the
+ * self-comparison CLAUDE.md 9b forbids. `writeCount` is printed alongside so
+ * that a disagreement between the two is visible rather than silent. */
+static int check_drag_coalesced(int frames, int postsBefore, int postsAfter,
+                                int writesBefore, int writesAfter) {
+    int sent = postsAfter - postsBefore;
+    int claimed = writesAfter - writesBefore;
+    if (postsBefore < 0 || postsAfter < 0) {
+        printf("INCONCLUSIVE drag coalescing: the backend's POST record could "
+               "not be read\n");
+        return 0;
+    }
+    if (sent < 1) {
+        printf("error a %d-frame drag sent NO write at all -- coalescing that "
+               "coalesces to zero is a dropped edit, not a saving\n", frames);
+        return 0;
+    }
+    if (sent >= frames) {
+        printf("error a %d-frame drag sent %d writes; each one POSTs AND "
+               "re-GETs the whole page\n", frames, sent);
+        return 0;
+    }
+    if (sent != claimed)
+        printf("      NOTE: the panel counted %d writes and the backend "
+               "received %d\n", claimed, sent);
+    printf("      a %d-frame slider drag produced %d write%s at the backend\n",
+           frames, sent, sent == 1 ? "" : "s");
+    return 1;
+}
+
+/* A TYPED VALUE IS READ BACK OVER THE WIRE UNCHANGED.
+ *
+ * The fixture stores what it is POSTed and serves it from the next GET, so this
+ * reads the value the ROUND TRIP produced. Checked on the SCREEN, because a
+ * value that reached the file and does not reach the row is the defect this
+ * project has shipped before (`SetGameModeText` wrote the right field on the
+ * wrong object). Fact #135 is why status codes are not consulted anywhere here.
+ */
+static int check_typed_readback(const char* wantText) {
+    static char text[65536];
+    int i, at = -1;
+    for (i = 0; i < g_ov.sItemCount; i++)
+        if (strcmp(g_ov.sItems[i].key, "sliderok") == 0) at = i;
+    if (at < 0) {
+        printf("INCONCLUSIVE typed value: the row is not loaded\n");
+        return 0;
+    }
+    if (strcmp(g_ov.sItems[at].value, wantText) != 0) {
+        printf("error a typed value did not survive the round trip: the row "
+               "reads '%s', the wire was told '%s'\n",
+               g_ov.sItems[at].value, wantText);
+        return 0;
+    }
+    panel_read_text(text, (int)sizeof(text), AOWL_OV_TEXT);
+    if (!strstr(text, wantText)) {
+        printf("error the typed value '%s' is in the table but is not on "
+               "screen\n", wantText);
+        return 0;
+    }
+    printf("      a typed value round-tripped: POSTed, re-GET, and rendered "
+           "as '%s'\n", wantText);
+    return 1;
+}
+
+/* THE MUTATION PROOF for the four above. Each check is handed the state it
+ * claims to detect and must FAIL. A check that cannot fail is the bug. */
+static int check_new_mutations(void) {
+    int okAll = 1;
+    int savedImpl, savedRange, savedCount;
+    char savedVal[64];
+
+    /* 1. an unimplemented row smuggled back into the kept set */
+    if (g_ov.sItemCount < 1) {
+        printf("INCONCLUSIVE new mutation proof: no rows\n");
+        return 0;
+    }
+    savedImpl = g_ov.sItems[0].implemented;
+    savedCount = g_ov.sItemsImpl;
+    g_ov.sItems[0].implemented = 0;
+    g_ov.sItemsImpl = g_ov.sItemCount;   /* keep the count half quiet */
+    if (check_unimpl_hidden()) {
+        printf("error MUTATION NOT CAUGHT: an implemented:false row in the "
+               "kept set passed the hidden-rows check\n");
+        okAll = 0;
+    }
+    g_ov.sItems[0].implemented = savedImpl;
+    g_ov.sItemsImpl = savedCount;
+
+    /* 2. a second slider, from a range that cannot support one */
+    {
+        int i, at = -1;
+        for (i = 0; i < g_ov.sItemCount; i++)
+            if (strcmp(g_ov.sItems[i].key, "norange") == 0) at = i;
+        if (at < 0) {
+            printf("INCONCLUSIVE new mutation proof: the no-range row is not "
+                   "loaded\n");
+            return 0;
+        }
+        savedRange = g_ov.sItems[at].hasRange;
+        g_ov.sItems[at].hasRange = 1;
+        g_ov.sItems[at].lo = 0.0f; g_ov.sItems[at].hi = 100.0f;
+        if (check_slider_ranges()) {
+            printf("error MUTATION NOT CAUGHT: a row with no declared range "
+                   "drew a slider and passed the range check\n");
+            okAll = 0;
+        }
+        g_ov.sItems[at].hasRange = savedRange;
+    }
+
+    /* 3. a drag that wrote every frame */
+    if (check_drag_coalesced(60, 0, 60, 0, 60)) {
+        printf("error MUTATION NOT CAUGHT: 60 writes from a 60-frame drag "
+               "passed the coalescing check\n");
+        okAll = 0;
+    }
+    /* ...and one that wrote nothing at all, which is the opposite failure and
+     * the one a naive "fewer is better" check would call a pass. */
+    if (check_drag_coalesced(60, 7, 7, 0, 0)) {
+        printf("error MUTATION NOT CAUGHT: a drag that sent ZERO writes "
+               "passed the coalescing check\n");
+        okAll = 0;
+    }
+
+    /* 4. a typed value the round trip did not preserve */
+    {
+        int i, at = -1;
+        for (i = 0; i < g_ov.sItemCount; i++)
+            if (strcmp(g_ov.sItems[i].key, "sliderok") == 0) at = i;
+        if (at >= 0) {
+            memcpy(savedVal, g_ov.sItems[at].value, sizeof(savedVal));
+            strcpy(g_ov.sItems[at].value, "999");
+            if (check_typed_readback("543210")) {
+                printf("error MUTATION NOT CAUGHT: a row reading 999 passed a "
+                       "read-back check for 543210\n");
+                okAll = 0;
+            }
+            memcpy(g_ov.sItems[at].value, savedVal, sizeof(savedVal));
+        }
+    }
+
+    /* 5. the dead-page check must fail when the page IS in the nav. Mutated by
+     *    naming a page that is there, which is the same question asked of a
+     *    row that exists -- no table is left modified. */
+    if (g_ov.sPageCount > 0) {
+        char saved[80];
+        memcpy(saved, g_ov.sPages[0].id, sizeof(saved));
+        strcpy(g_ov.sPages[0].id, "aowl.dead");
+        if (check_dead_page_hidden("{}")) {
+            printf("error MUTATION NOT CAUGHT: a page in the nav passed the "
+                   "hidden-page check\n");
+            okAll = 0;
+        }
+        memcpy(g_ov.sPages[0].id, saved, sizeof(saved));
+    }
+    return okAll;
+}
+
 /* The launch hint. Falsifiable both ways: VISIBLE at one time and GONE at a
  * later one, both read back rather than asserted from the draw call. */
 static int check_hint_up(void) {
@@ -1490,6 +1934,16 @@ int main(int argc, char** argv) {
     int selectedOk = -1, collapseOk = -1, collapsePre = -1;
     int unfocusedKeyOk = -1, focusedKeyOk = -1;
     int keyAlphaWas = 0, keyFocusWas = 0;
+    /* --- the slider / filter / tree act. -1 is "never ran", which is reported
+     * as INCONCLUSIVE at the bottom and never as a pass. */
+    int navIndentOk = -1, unimplOk = -1, rangesOk = -1, deadPageOk = -1;
+    int dragCoalOk = -1, typedOk = -1, typeBoxOpenOk = -1, numOnlyOk = -1;
+    int f8FromFieldOk = -1, f8ShowsOk = -1, newMutOk = -1;
+    int postsBefore = -1, writesBefore = 0, dragRow = -1;
+    int f8FromFieldWas = 0, f8FocusWas = 0;
+    /* Long enough that "fewer than N" is a real claim: at one write a frame
+     * this would be 90 POSTs, each of which re-GETs the whole page. */
+    const int kDragFrames = 90;
     int hintUpOk = -1, hintGoneOk = -1;
     int alphaWas = 0;
     float movedFromX = 0.0f, movedFromW = 0.0f;
@@ -2075,6 +2529,162 @@ int main(int argc, char** argv) {
                 SendMessageW(hwnd, WM_KEYDOWN, VK_F2, 0);
             }
 
+            /* ======================================================
+             * ACT: THE SLIDERS, THE FILTER AND THE TREE'S FIRST LEVEL
+             *
+             * Back into settings mode on a clean screen. Everything below is
+             * driven the way a player drives it -- real messages to the window
+             * -- and read back off the buffer or off the fixture, never off the
+             * state the gesture just wrote.
+             * ====================================================== */
+            if (f == 276 && port > 0) {
+                SendMessageW(hwnd, WM_KEYDOWN, VK_F2, 0);
+                g_ov.search[0] = 0; g_ov.searchFocus = 0; g_ov.selCat = -1;
+            }
+            if (f == 280 && port > 0) {
+                /* Say what screen the checks below are about to be run on. A
+                 * nav check run against the MOD MANAGER decodes nothing and
+                 * reports INCONCLUSIVE, which reads like a decoder problem and
+                 * is not one -- this line is the difference. */
+                printf("      act: settings=%d page=%d/%d '%s' rows=%d "
+                       "cats=%d visible=%d\n",
+                       g_ov.settings, g_ov.selPage, g_ov.sPageCount,
+                       g_ov.sItemsPage, g_ov.sItemCount, g_ov.sCatCount,
+                       (int)g_ov.visible);
+                navIndentOk  = check_nav_depth1_indent();
+                unimplOk     = check_unimpl_hidden();
+                rangesOk     = check_slider_ranges();
+                deadPageOk   = check_dead_page_hidden(ask_fixture(L"/fetches"));
+            }
+            /* --- the drag. The mouse goes down on the slider track, MOVES
+             *     across it for many frames, and comes up. One gesture. */
+            if (f == 284 && port > 0) {
+                for (int32_t i2 = 0; i2 < g_ov.sItemCount; i2++)
+                    if (strcmp(g_ov.sItems[i2].key, "sliderok") == 0) {
+                        for (int32_t c = 0; c < g_ov.sCatCount; c++)
+                            if (strcmp(g_ov.sCats[c].full, "Numbers") == 0)
+                                g_ov.selCat = c;
+                        g_ov.selItem = i2;
+                        g_ov.topItem = i2;
+                        dragRow = i2;
+                    }
+                postsBefore  = posts_seen();
+                writesBefore = g_ov.writeCount;
+            }
+            /* THE GESTURE IS A HELD ARROW KEY, not a synthetic mouse drag.
+             *
+             * A first attempt walked `g_ov.mx` across the panel with
+             * `mouseHeld` set. It did not work and it was not a near miss: with
+             * no `my` on the slider row the cursor was over whatever happened
+             * to be under it, the `clickDown` that opened the gesture landed on
+             * an unrelated control, and the checks after it were then reading a
+             * screen the script had wandered off. Poking the cursor at
+             * coordinates the harness computes ITSELF is exactly the
+             * "re-derived the panel rect instead of asking" trap this file has
+             * been caught in before.
+             *
+             * A held arrow is a real gesture, made through the window the way a
+             * player makes it, and it runs the SAME path: `aowl_ov_s_adjust` ->
+             * `aowl_ov_s_commit` -> the write slot. It is also the worse of the
+             * two cases -- auto-repeat fires ~30 times a second indefinitely,
+             * where a drag at least ends when the button comes up. What is NOT
+             * covered here is the drag's own arming site; that shares one line
+             * with this one and is stated as unverified rather than implied. */
+            if (f >= 286 && f < 286 + kDragFrames && port > 0 && dragRow >= 0) {
+                g_ov.selItem = dragRow;
+                SendMessageW(hwnd, WM_KEYDOWN, VK_RIGHT, 0);
+            }
+            /* Well past AOWL_OV_WRITE_QUIET_MS at 16ms a frame, so the slot has
+             * had every chance to flush -- "fewer writes" must not be measured
+             * inside the window that is holding them. */
+            if (f == 286 + kDragFrames + 40 && port > 0 && dragRow >= 0) {
+                dragCoalOk = check_drag_coalesced(kDragFrames,
+                                                  postsBefore, posts_seen(),
+                                                  writesBefore, g_ov.writeCount);
+            }
+            /* --- click-to-type: SPACE opens the box, digits go in, ENTER
+             *     stores. Then the page is re-fetched and the value is read
+             *     back off the screen. */
+            if (f == 286 + kDragFrames + 46 && port > 0 && dragRow >= 0) {
+                g_ov.selItem = dragRow;
+                SendMessageW(hwnd, WM_KEYDOWN, VK_SPACE, 0);
+            }
+            if (f == 286 + kDragFrames + 48 && port > 0 && dragRow >= 0) {
+                typeBoxOpenOk = (g_ov.editItem == dragRow) && !g_ov.searchFocus;
+                if (!typeBoxOpenOk)
+                    bad("SPACE on a numeric row did not open the value box, "
+                        "or left the search field focused as well");
+                /* Clear the seeded value, then type 42. Eight backspaces, not
+                 * twenty-four: the key ring is AOWL_OV_KEYS deep and a frame
+                 * that overfills it drops the tail -- which would have been the
+                 * two digits, and the check would have blamed the field. */
+                for (int k2 = 0; k2 < 8; k2++)
+                    SendMessageW(hwnd, WM_KEYDOWN, VK_BACK, 0);
+                /* SIX digits, not two. "42" is under the decoder`s 6-glyph
+                 * minimum, so "is it on screen" came back false about a value
+                 * that was plainly rendered -- the instrument`s limit, not the
+                 * panel`s. Six digits is also inside the row`s 0..999999. */
+                SendMessageW(hwnd, WM_KEYDOWN, '5', 0);
+                SendMessageW(hwnd, WM_KEYDOWN, '4', 0);
+                SendMessageW(hwnd, WM_KEYDOWN, '3', 0);
+                SendMessageW(hwnd, WM_KEYDOWN, '2', 0);
+                SendMessageW(hwnd, WM_KEYDOWN, '1', 0);
+                SendMessageW(hwnd, WM_KEYDOWN, '0', 0);
+            }
+            if (f == 286 + kDragFrames + 50 && port > 0 && dragRow >= 0) {
+                /* A letter must NOT enter a numeric field. */
+                SendMessageW(hwnd, WM_KEYDOWN, 'X', 0);
+            }
+            if (f == 286 + kDragFrames + 52 && port > 0 && dragRow >= 0) {
+                numOnlyOk = (strcmp(g_ov.editBuf, "543210") == 0);
+                if (!numOnlyOk) {
+                    char m3[128];
+                    _snprintf(m3, sizeof(m3),
+                              "the number box accepted a letter: buffer is "
+                              "'%s', expected '543210'", g_ov.editBuf);
+                    bad(m3);
+                }
+                SendMessageW(hwnd, WM_KEYDOWN, VK_RETURN, 0);
+            }
+            /* Long enough for the flush, the POST and the page re-GET. */
+            if (f == 286 + kDragFrames + 100 && port > 0 && dragRow >= 0)
+                typedOk = check_typed_readback("543210");
+            /* --- F8, and the fact that it works from a FOCUSED FIELD. */
+            if (f == 286 + kDragFrames + 106 && port > 0) {
+                SendMessageW(hwnd, WM_KEYDOWN, VK_OEM_2, 0);   /* focus search */
+            }
+            if (f == 286 + kDragFrames + 108 && port > 0) {
+                f8FromFieldWas = g_ov.showUnimpl;
+                f8FocusWas = g_ov.searchFocus;
+                SendMessageW(hwnd, WM_KEYDOWN, VK_F8, 0);
+            }
+            if (f == 286 + kDragFrames + 112 && port > 0) {
+                f8FromFieldOk = f8FocusWas &&
+                                (g_ov.showUnimpl != f8FromFieldWas);
+                if (!f8FromFieldOk)
+                    bad("F8 did not reach the panel with the search field "
+                        "focused -- a shortcut a text field can eat");
+                g_ov.search[0] = 0; g_ov.searchFocus = 0;
+            }
+            /* With F8 on, the rows that were hidden must be BACK -- the
+             * negative in its mirror form. A filter that hides everything
+             * forever passes "nothing unimplemented is shown" perfectly. */
+            if (f == 286 + kDragFrames + 130 && port > 0) {
+                static char t8[65536];
+                panel_read_text(t8, (int)sizeof(t8), AOWL_OV_TEXT);
+                if (!strstr(t8, "Cultist")) {
+                    static char t8b[65536];
+                    panel_read_text(t8b, (int)sizeof(t8b), AOWL_OV_DIM);
+                    f8ShowsOk = strstr(t8b, "Cultist") != NULL;
+                } else f8ShowsOk = 1;
+                if (!f8ShowsOk)
+                    bad("F8 is on but the not-implemented rows are still not "
+                        "on screen -- the toggle only hides");
+                SendMessageW(hwnd, WM_KEYDOWN, VK_F8, 0);   /* back to default */
+            }
+            if (f == 286 + kDragFrames + 150 && port > 0)
+                newMutOk = check_new_mutations();
+
             if (f == 188) costLabelOk = check_cost_label(1);
             if (f == 250) costLabelOk = check_cost_label(0) && costLabelOk;
 
@@ -2152,6 +2762,25 @@ int main(int argc, char** argv) {
               focusedKeyOk },
             { "the launch hint is ON SCREEN while it is up", hintUpOk },
             { "the launch hint is OFF SCREEN once it has expired", hintGoneOk },
+            /* --- the slider / filter / tree act --- */
+            { "NO nav row renders at the same x-offset as its own parent -- "
+              "the FIRST level of nesting is indented too", navIndentOk },
+            { "NO rendered row is implemented:false, and no group is left "
+              "empty by hiding them", unimplOk },
+            { "a page whose every row is unimplemented is absent from the nav "
+              "AND was never fetched", deadPageOk },
+            { "only a WELL-FORMED range draws a slider; a missing, inverted or "
+              "unusable one falls back", rangesOk },
+            { "a slider drag of 90 frames emits FEWER than 90 writes, and more "
+              "than zero", dragCoalOk },
+            { "SPACE opens the value box and takes focus from the search field",
+              typeBoxOpenOk },
+            { "the value box refuses a letter", numOnlyOk },
+            { "a typed value is read back OVER THE WIRE unchanged", typedOk },
+            { "F8 reaches the panel with a text field focused", f8FromFieldOk },
+            { "F8 puts the hidden rows BACK on screen", f8ShowsOk },
+            { "each new check FAILS when handed what it claims to detect "
+              "(mutation proof)", newMutOk },
         };
         size_t vi;
         for (vi = 0; vi < sizeof(verdicts) / sizeof(verdicts[0]); vi++) {
