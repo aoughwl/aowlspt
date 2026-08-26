@@ -184,7 +184,7 @@ var gMtxResolveGaveUp = false
 #     second, which is long before the main menu exists, so the old
 #     `MtxResolveMaxPasses = 30` would have given up before its target could
 #     possibly be there. "Not reachable yet" is not a failure.
-const MtxHuntFrames = 8
+const MtxHuntFrames = 60
   ## While unresolved. Not 1: even a budgeted walk allocates a name string per
   ## node, and nothing that allocates belongs on every frame of the Unity thread.
 const MtxSteadyFrames = 120
@@ -247,6 +247,37 @@ const MtxDescendDepth = 3
 const MtxRootCap = 32
   ## Roots examined. The live client reported 11 and then 13.
 
+const MtxEnumEveryMs = 1000'u64
+  ## A HARD WALL-CLOCK FLOOR between scene-root enumerations, independent of
+  ## every frame-based cadence above it.
+  ##
+  ## `iSceneRoots` is SHARED with `hide seasons`, it calls
+  ## `Scene::GetRootGameObjects` -- which ALLOCATES a managed array -- and it
+  ## writes shared klass tables on every root it touches. The previous build
+  ## hunted every 8 frames, so it drove that shared enumerator roughly 340
+  ## times in the 45 s warm-up where nothing had previously driven it more than
+  ## once per 120 frames. In that same run `hide seasons`, which had switched
+  ## its banner off at ~0:00:26 in every earlier run, produced ZERO log lines,
+  ## and the whole host log fell from 4,248 lines to 262.
+  ##
+  ## That correlation is NOT a proven cause and is not claimed as one -- but a
+  ## feature of mine has no business driving a shared, allocating,
+  ## globally-stateful enumerator at 7 Hz on the Unity main thread to find a
+  ## button, whatever the outcome of the investigation. This floor is set below
+  ## `hide seasons`' own ~2 s cadence, so this feature can never again be the
+  ## heavier user of a resolver it borrowed.
+var gMtxRootsFailed = false
+  ## The root step itself declined (throttled, no anchor, nothing enumerated).
+  ## The caller must NOT overwrite that reason with a search verdict, because
+  ## no search happened -- that overwrite is how "throttled" would have been
+  ## reported as "no MenuScreen within 3 levels of any root".
+var gMtxLastEnum: uint64 = 0
+var gMtxEnumSkipped = 0
+var gMtxSceneRoots = 0
+  ## What `iSceneRoots` ITSELF returned on the last pass -- NOT counting the
+  ## anchor-seed we append. The distinction is the whole bug below.
+var gMtxRootsWalked = 0
+var gMtxSaidRoots = false
 var gMtxLastNodes = 0
   ## Nodes the last pass actually visited. Logged, because "it was slow" is an
   ## impression and "613 nodes in 40 ms" is a measurement the next session can
@@ -342,7 +373,21 @@ proc mtxAnchorRoots(into: var seq[Il2CppPtr]): bool =
   ## Our own anchor's hierarchy root is appended regardless, so pass B has
   ## something to search even in that degraded case.
   result = false
+  gMtxRootsFailed = true
+  # THE FLOOR, checked before anything is enumerated. `gMtxLastEnum == 0` lets
+  # the very first pass through, so arming is never delayed by it.
+  let nowMs = cNowMs()
+  if gMtxLastEnum != 0'u64 and nowMs - gMtxLastEnum < MtxEnumEveryMs:
+    inc gMtxEnumSkipped
+    gMtxResolveWhy = "throttled: the shared scene-root enumeration is limited " &
+                     "to once per " & $int(MtxEnumEveryMs) & " ms (" &
+                     $gMtxEnumSkipped & " passes skipped so far) because " &
+                     "iSceneRoots is shared with hide-seasons and allocates. " &
+                     "Nothing was searched, so this is INCONCLUSIVE"
+    return
+  gMtxLastEnum = nowMs
   let n = iSceneRoots(into, false)
+  gMtxSceneRoots = into.len
   let anchor = mtxAnchor()
   if anchor != nil:
     let at = iToTransform(anchor)
@@ -356,17 +401,37 @@ proc mtxAnchorRoots(into: var seq[Il2CppPtr]): bool =
           dup = true
       if not dup:
         into.add top
+  gMtxRootsWalked = into.len
+  # SAY WHAT WAS ACTUALLY ENUMERATED, ONCE. The previous build could not
+  # distinguish "16 roots" from "zero roots plus our own seed", and reported
+  # both as "any root". MEASURED consequence: a 66-node search -- one root's
+  # subtree -- reported as a clean "no MenuScreen within 3 levels of any root",
+  # a verdict produced by a search that barely ran. A cheap confident miss is
+  # worse than an expensive inconclusive one.
+  if not gMtxSaidRoots:
+    gMtxSaidRoots = true
+    var rn = ""
+    var q = 0
+    while q < into.len and q < MtxRootCap and rn.len < 400:
+      let rt = iToTransform(into[q])
+      if rt != nil and duOk(rt, 0x20'i32):
+        var cc = 0
+        discard iChildCount(rt, cc)
+        rn = rn & "'" & iObjName(rt) & "'(" & $cc & ") "
+      q = q + 1
+    okLog "hide mode button: SCOPE -- iSceneRoots returned " & $n &
+          " and yielded " & $gMtxSceneRoots & " root(s); this feature added " &
+          $(gMtxRootsWalked - gMtxSceneRoots) & " anchor seed(s), so " &
+          $gMtxRootsWalked & " will be searched. Roots and their childCount: " &
+          rn & ". If the scene-root count is 0 or 1 here while the client is " &
+          "at the menu, the search SCOPE is the bug, not the depth or the " &
+          "budget."
   if into.len == 0:
-    gMtxResolveWhy = "NO scene roots are reachable (iSceneRoots returned " &
-                     $n & ") and this feature has no live PreloaderUI anchor " &
-                     "of its own yet either. If this persists once the menu " &
-                     "is up it is NOT a timing problem: iSceneRoots reaches " &
-                     "the DontDestroyOnLoad scene -- where the live UI is -- " &
-                     "only through gInspPreloader, which ONLY the live " &
-                     "inspector's rider ever writes, so turning liveInspector " &
-                     "on is the workaround and generalising " &
-                     "iAnchorSceneHandle is the fix"
+    gMtxResolveWhy = "NO roots at all: iSceneRoots returned " & $n &
+                     " and this feature has no live PreloaderUI anchor of " &
+                     "its own either. INCONCLUSIVE"
     return
+  gMtxRootsFailed = false
   result = true
 
 proc mtxDescend(t: Il2CppPtr; name: string; depth: int;
@@ -513,6 +578,10 @@ proc modeTextFindGameModeRoot(): Il2CppPtr =
   if gMtxMenu == nil:
     gMtxMenu = mtxFindMenuScreen(budget, deadline, names)
   if gMtxMenu == nil:
+    if gMtxRootsFailed:
+      # The roots step already said WHY, and no search ran. Leave it alone.
+      gMtxLastNodes = MtxNodeBudget - budget
+      return
     if gMtxResolveWhy.len == 0 or budget > 0:
       if budget <= 0:
         gMtxResolveWhy = "the search for 'MenuScreen' hit its node budget (" &
@@ -520,13 +589,33 @@ proc modeTextFindGameModeRoot(): Il2CppPtr =
                          " ms in-walk deadline after " &
                          $(MtxNodeBudget - budget) & " nodes. This is " &
                          "INCONCLUSIVE, not a verdict of absent"
+      elif gMtxSceneRoots <= 1:
+        # THE SCOPE FAILURE, NEVER AGAIN DRESSED UP AS A RESULT. With no scene
+        # roots the only thing searched is our own anchor's hierarchy --
+        # `Preloader UI`, ~66 nodes -- and `MenuScreen` is NOT on it. Saying
+        # "not within 3 levels of any root" there is true of what was searched
+        # and false about the tree.
+        gMtxResolveWhy = "SCOPE FAILURE, not a miss: iSceneRoots yielded " &
+                         $gMtxSceneRoots & " scene root(s), so the only " &
+                         "thing searched was this feature's own anchor " &
+                         "hierarchy (" & $gMtxRootsWalked & " root(s), " &
+                         $(MtxNodeBudget - budget) & " nodes). MenuScreen " &
+                         "does not hang off Preloader UI, so it could not " &
+                         "have been found no matter how deep we went. This " &
+                         "is INCONCLUSIVE. iSceneRoots reaches the " &
+                         "DontDestroyOnLoad scene -- where the live UI is -- " &
+                         "only via iAnchorSceneHandle/gInspPreloader, which " &
+                         "ONLY the live inspector's rider writes"
       else:
         gMtxResolveWhy = "no 'MenuScreen' within " & $MtxDescendDepth &
-                         " levels of any root (" & $(MtxNodeBudget - budget) &
-                         " nodes, budget NOT exhausted). MenuScreen is what " &
-                         "hide-seasons hangs off, so its absence means THE " &
-                         "MAIN MENU IS NOT UP YET -- this is not a miss, it " &
-                         "is too early. Roots: " & names
+                         " levels of any of the " & $gMtxRootsWalked &
+                         " root(s) searched (" & $gMtxSceneRoots &
+                         " of them real scene roots, " &
+                         $(MtxNodeBudget - budget) & " nodes, budget NOT " &
+                         "exhausted). MenuScreen is what hide-seasons hangs " &
+                         "off, so its absence means THE MAIN MENU IS NOT UP " &
+                         "YET -- this is not a miss, it is too early. " &
+                         "Roots: " & names
     gMtxLastNodes = MtxNodeBudget - budget
     return
   # ONE NAMED CHILD of a node we already hold. This is the whole search now: a
