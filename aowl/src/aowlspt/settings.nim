@@ -320,8 +320,9 @@ const
     ## broadcast. `on`/`emit` already exist and already cross mods without
     ## either knowing the other exists, which is exactly this problem.
   SettingsIndexAnnounce* = "aowlspt.settings.indexAnnounce"
-    ## Payload: `{"guid":"...","name":"...","count":N}`. Emitted by every mod
-    ## that has declared settings, once per `SettingsIndexQuery` it hears.
+    ## Payload: `{"guid":"...","name":"...","count":N,"done":M}`. Emitted by
+    ## every mod that has declared settings, once per `SettingsIndexQuery` it
+    ## hears. `done` is how many of the `count` rows are `implemented`.
 
 proc onIndexQuery(payload: string): string =
   if gDeclared.len > 0:
@@ -329,6 +330,21 @@ proc onIndexQuery(payload: string): string =
     o.put("guid", modGuid())
     o.put("name", modName())
     o.put("count", gDeclared.len)
+    # How many of them are actually BACKED. The index has always carried
+    # `count`; without a companion `done` a consumer cannot tell a mod with six
+    # working settings from one with six placeholders, and the overlay's
+    # "hide what is not implemented" filter would have had to fetch every page
+    # to find out that a page has nothing to show. `mods/settingshub` already
+    # sends `done` for each SPT page (0, for all of them), so this makes both
+    # halves of the settings index answer the same question in the same field.
+    #
+    # An explicit 0 therefore MEANS "none of these do anything yet" and is
+    # distinct from the field being absent, which means "this index did not
+    # say". A consumer must not treat the two alike.
+    var impl = 0
+    for s in gDeclared:
+      if s.implemented: inc impl
+    o.put("done", impl)
     discard emit(SettingsIndexAnnounce, done(o).text)
   result = ""
 
