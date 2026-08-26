@@ -4410,6 +4410,12 @@ static void aowl_ov_keys(int32_t page, const int32_t* vis, int32_t visN) {
          *     focus, because they are not printable and so can never be
          *     something the player meant to type. That is why the opacity
          *     control is F9/F10 and not only `-`/`=`.
+         *
+         *     ...which is necessary and was not SUFFICIENT: F10 is also
+         *     Windows' menu key and arrives as WM_SYSKEYDOWN, a message the
+         *     panel's own switch did not take. "Not swallowed by a text field"
+         *     and "delivered to the panel at all" are two different claims and
+         *     only the first was true. See WM_SYSKEYDOWN in the wndproc.
          *   * `-`/`=` remain as aliases, and work whenever the field does NOT
          *     have focus -- which is the state the panel is in unless the
          *     player put it in the other one on purpose.
@@ -7248,15 +7254,15 @@ static void aowl_ov_build(void) {
             if (g_ov.editItem >= 0 && !g_ov.capturing)
                 aowl_ov_fmt(legKeys, (int32_t)sizeof(legKeys),
                             "TYPING A VALUE   ENTER store   ESC cancel   "
-                            "F9/F10 fade   F11 max   F2 manager");
+                            "F9 fade   F10 solid   F11 max   F2 manager");
             else if (g_ov.capturing)
                 aowl_ov_fmt(legKeys, (int32_t)sizeof(legKeys),
                             "PRESS A KEY TO BIND   ESC cancel   "
-                            "F9/F10 fade   F11 max   F2 manager");
+                            "F9 fade   F10 solid   F11 max   F2 manager");
             else if (g_ov.searchFocus)
                 aowl_ov_fmt(legKeys, (int32_t)sizeof(legKeys),
                             "TYPING IN SEARCH   ENTER results   ESC cancel   "
-                            "F9/F10 fade   F11 max   F2 manager");
+                            "F9 fade   F10 solid   F11 max   F2 manager");
             else
                 /* Line one is what you DO to a setting; line two is what you
                  * do to the WINDOW. Split that way, and each kept under the
@@ -7310,12 +7316,12 @@ static void aowl_ov_build(void) {
                 aowl_ov_fmt(legNote, (int32_t)sizeof(legNote),
                             "click a number to type it   %d not-yet-"
                             "implemented setting%s hidden (F8)   F2 manager   "
-                            "F11 max   F9/F10 fade", g_ov.sHiddenCount,
+                            "F11 max   F9 fade/F10 solid", g_ov.sHiddenCount,
                             g_ov.sHiddenCount == 1 ? "" : "s");
             else
                 aowl_ov_copy(legNote, (int32_t)sizeof(legNote),
                              "click a number to type it   F8 show unimplemented"
-                             "   F2 manager   F11 max   F9/F10 fade   "
+                             "   F2 manager   F11 max   F9 fade/F10 solid   "
                              "drag title = move   drag corner = resize");
         }
         else
@@ -7786,7 +7792,50 @@ static LRESULT CALLBACK aowl_ov_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
         case WM_KEYUP:
         case WM_SYSKEYUP:
         case WM_CHAR:
+        /* WM_SYSCHAR is swallowed for the same reason WM_SYSKEYDOWN is taken
+         * below: without it, every system-key press Windows did not get to
+         * turn into a menu produces the default BEEP. A panel that beeps at
+         * you for pressing its own opacity key reads as a panel refusing the
+         * key -- which is the exact wrong signal here. */
+        case WM_SYSCHAR:
             return 0;
+        case WM_SYSKEYDOWN:
+            /* ---- F10 ARRIVES HERE, NOT AT WM_KEYDOWN. This was the bug. ----
+             *
+             * F10 is Windows' menu-activation key, so the system delivers it
+             * as WM_SYSKEYDOWN even with no Alt held -- and so does any key
+             * pressed WITH Alt down. This switch only had WM_KEYDOWN, so F10
+             * fell through to `default: break;` and on to the game's wndproc:
+             * it never reached `aowl_ov_push_key`, never reached
+             * `aowl_ov_keys`, and `panAlpha` was never touched. F9 is an
+             * ordinary WM_KEYDOWN and worked, which is exactly the reported
+             * asymmetry -- "F10 still does not make the fade darker ... it
+             * works only in one direction".
+             *
+             * The handler was symmetric the whole time (`+27` against `-27`
+             * with the same clamp); nothing about the VALUE was ever wrong.
+             * Three candidate bugs -- wrong sign, saturating clamp, key never
+             * fires -- and it was the third. Worth stating plainly, because
+             * the two arithmetic ones are what the code invites you to
+             * suspect, and the message routing is invisible from the handler.
+             *
+             * ALT+F4 IS THE ONE EXCEPTION and must keep closing the game.
+             * Bit 29 of lParam is the context code: set means Alt was down. So
+             * Alt+F4 goes to the game and everything else -- bare F10, and any
+             * other Alt combination, which must not walk the player around
+             * behind an open panel -- is taken exactly like a normal key. */
+            if ((int32_t)wp == VK_F4 && (lp & (1 << 29)))
+                break;                       /* -> the game's wndproc */
+            aowl_ov_push_key((LONG)wp);
+            return 0;
+        case WM_SYSCOMMAND:
+            /* And the other half of the same key. Even with WM_SYSKEYDOWN
+             * swallowed, DefWindowProc can still be asked to open the window
+             * menu via SC_KEYMENU -- which grabs focus and stops the game
+             * presenting until it is dismissed. A panel key must never be able
+             * to freeze the client. */
+            if ((wp & 0xFFF0) == SC_KEYMENU) return 0;
+            break;
         case WM_KEYDOWN:
             /* Every key is eaten while the panel is open -- WASD must not walk
              * the player into a wall behind a menu -- and the ones the panel

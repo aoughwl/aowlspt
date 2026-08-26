@@ -1224,6 +1224,141 @@ static int check_mutations(void) {
     return okAll;
 }
 
+/* SEND A KEY THE WAY WINDOWS SENDS IT.
+ *
+ * THE FIFTH INSTRUMENT LIE IN THIS FILE, and the most expensive so far: it let
+ * a dead key pass its own test for a whole round.
+ *
+ * F10 is Windows' menu-activation key. The system delivers it as
+ * WM_SYSKEYDOWN, never as WM_KEYDOWN, and the same is true of any key pressed
+ * with Alt held. This harness was synthesising `SendMessageW(hwnd,
+ * WM_KEYDOWN, VK_F10, 0)` -- a message the real world never produces for that
+ * key -- so it walked straight into the panel's WM_KEYDOWN branch, moved
+ * `panAlpha`, and the check said F10 worked. On the live client F10 arrived as
+ * WM_SYSKEYDOWN, hit `default:`, and went to the game. The user reported it as
+ * "works only in one direction F9".
+ *
+ * A test that sends a message the OS would not send is not testing the key; it
+ * is testing the branch it already decided to aim at. Every keypress in this
+ * file now goes through here, so the routing is decided in ONE place by the
+ * same rule Windows uses.
+ *
+ * `extended` is the context-code bit (lParam 29): Alt-down. Bare F10 is a
+ * system key WITHOUT it, which is exactly the case the panel has to take. */
+static void send_key(HWND h, int vk) {
+    if (vk == VK_F10)                       /* bare F10: syskey, Alt NOT down */
+        SendMessageW(h, WM_SYSKEYDOWN, (WPARAM)vk, 0);
+    else
+        SendMessageW(h, WM_KEYDOWN, (WPARAM)vk, 0);
+}
+
+/* ADVANCE `n` FRAMES WITH THE SCENE HELD STILL.
+ *
+ * The main loop clears to `0.10 + 0.05*sin(f*0.03)` -- the scene behind the
+ * panel MOVES EVERY FRAME, on purpose, so the overlay is composited over
+ * something that changes. That is right for the rest of the run and fatal to a
+ * pixel round trip: the panel background is blended over the scene, so the same
+ * alpha two hundred frames apart renders to a different colour and "did it come
+ * back to where it started" is unanswerable.
+ *
+ * So this pump clears to a CONSTANT. Holding the test's own input still is the
+ * only way the measurement isolates the one variable it is about, and it is a
+ * control on the fixture, not on the panel: nothing here touches the overlay.
+ *
+ * Returns 1 always, so it can be passed as the `pump` callback.
+ */
+static int pump_frames(int n) {
+    int i;
+    for (i = 0; i < n; i++) {
+        MSG m;
+        FLOAT fixed[4] = { 0.10f, 0.12f, 0.18f, 1.0f };
+        while (PeekMessageW(&m, NULL, 0, 0, PM_REMOVE)) {
+            TranslateMessage(&m);
+            DispatchMessageW(&m);
+        }
+        ID3D11DeviceContext_ClearRenderTargetView(ctx, rtv, fixed);
+        ID3D11DeviceContext_Draw(ctx, 3, 0);
+        IDXGISwapChain_Present(swap, 0, 0);
+    }
+    return 1;
+}
+
+/* THE PANEL'S RENDERED BACKGROUND, as a number, read off the back buffer.
+ *
+ * The mean of R+G+B over the panel's interior. Not `panAlpha` -- that is the
+ * stored value, and this surface has taught us repeatedly that a stored value
+ * and a rendered result are different claims (the row relabel that re-read its
+ * own write; the disassembly proof about a field that never reached the
+ * screen). The panel background is blended over the scene, so a change in
+ * alpha changes every interior pixel and the mean moves monotonically with it.
+ *
+ * Averaging over the whole interior rather than sampling one pixel: text and
+ * chrome sit at fixed positions and are a minority of the area, and -- what
+ * actually matters for the round trip -- the SAME alpha always produces the
+ * SAME image and therefore exactly the same mean. Equality is preserved
+ * whatever the text is doing.
+ *
+ * Returns -1 if the buffer could not be read, which callers turn into
+ * INCONCLUSIVE and never into a pass. */
+static int panel_bg_mean(void) {
+    ID3D11Texture2D* bb = NULL;
+    D3D11_TEXTURE2D_DESC td, sd;
+    ID3D11Texture2D* stage = NULL;
+    D3D11_MAPPED_SUBRESOURCE map;
+    float px = 0.0f, py = 0.0f, pw = 0.0f, ph = 0.0f;
+    double sum = 0.0;
+    int n = 0, x, y, x0, y0, x1, y1, k;
+    if (FAILED(IDXGISwapChain_GetBuffer(swap, 0, &AOWL_IID_ID3D11Texture2D,
+                                        (void**)&bb)))
+        return -1;
+    ID3D11Texture2D_GetDesc(bb, &td);
+    sd = td;
+    sd.Usage = D3D11_USAGE_STAGING;
+    sd.BindFlags = 0;
+    sd.CPUAccessFlags = D3D11_CPU_ACCESS_READ;
+    sd.MiscFlags = 0;
+    if (FAILED(ID3D11Device_CreateTexture2D(dev, &sd, NULL, &stage))) {
+        ID3D11Texture2D_Release(bb);
+        return -1;
+    }
+    ID3D11DeviceContext_CopyResource(ctx, (ID3D11Resource*)stage,
+                                     (ID3D11Resource*)bb);
+    if (FAILED(ID3D11DeviceContext_Map(ctx, (ID3D11Resource*)stage, 0,
+                                       D3D11_MAP_READ, 0, &map))) {
+        ID3D11Texture2D_Release(stage);
+        ID3D11Texture2D_Release(bb);
+        return -1;
+    }
+    /* ASK the panel where it is; never re-derive it. `aowl_ov_panel_rect`
+     * exists precisely because this file used to compute the rect itself and
+     * drifted 40px when the resize grip was added. Panel units times `scale`
+     * gives back-buffer pixels. */
+    aowl_ov_panel_rect(&px, &py, &pw, &ph);
+    k = g_ov.scale > 0 ? g_ov.scale : 1;
+    x0 = (int)(px * k) + 6;  y0 = (int)(py * k) + 6;
+    x1 = (int)((px + pw) * k) - 6;  y1 = (int)((py + ph) * k) - 6;
+    if (x0 < 0) x0 = 0;
+    if (y0 < 0) y0 = 0;
+    if (x1 > (int)td.Width)  x1 = (int)td.Width;
+    if (y1 > (int)td.Height) y1 = (int)td.Height;
+    for (y = y0; y < y1; y++) {
+        const uint8_t* row = (const uint8_t*)map.pData + (size_t)y * map.RowPitch;
+        for (x = x0; x < x1; x++) {
+            const uint8_t* q = row + (size_t)x * 4;
+            sum += (double)q[0] + (double)q[1] + (double)q[2];
+            n++;
+        }
+    }
+    ID3D11DeviceContext_Unmap(ctx, (ID3D11Resource*)stage, 0);
+    ID3D11Texture2D_Release(stage);
+    ID3D11Texture2D_Release(bb);
+    if (n < 100) return -1;
+    /* Scaled by 1000 so a change of well under one 8-bit level is still a
+     * different integer -- 27/255 of the blend spread over the interior is a
+     * fraction of a level per pixel and would round to nothing otherwise. */
+    return (int)(sum / (double)n * 1000.0);
+}
+
 /* ASK THE FIXTURE, over the wire, on this thread.
  *
  * The whole point of these checks is that the observer is not the thing being
@@ -1573,6 +1708,152 @@ static int check_typed_readback(const char* wantText) {
     printf("      a typed value round-tripped: POSTed, re-GET, and rendered "
            "as '%s'\n", wantText);
     return 1;
+}
+
+/* 5. F9 AND F10 ARE A SYMMETRIC PAIR, PROVED ON THE PIXELS.
+ *
+ * Three separate claims, because "F10 does not work" has three different
+ * causes and this instrument can tell them apart:
+ *
+ *   a. THE KEY FIRES AT ALL. `panAlpha` moves when F10 is pressed. If this
+ *      fails the key never reached the handler -- which is what was actually
+ *      wrong: F10 arrives as WM_SYSKEYDOWN and the panel only took WM_KEYDOWN.
+ *   b. THE VALUE MOVES THE OTHER WAY. F9 and F10 must move `panAlpha` in
+ *      OPPOSITE directions. Catches a wrong sign and a shared step variable.
+ *   c. THE RENDER FOLLOWS, AND ROUND-TRIPS. N presses of F9 then N of F10 must
+ *      return the RENDERED background to where it started. This is the one the
+ *      coordinator asked for and it is the strongest: it fails if either
+ *      direction is dead, if the steps are unequal, if one saturates against a
+ *      bound the other does not, or if the value moves and the draw ignores it.
+ *
+ * Plus: BOTH BOUNDS MUST BE REACHABLE and must differ. "Works in one
+ * direction" can also mean "already sitting on the bound it steps toward", and
+ * a round trip taken entirely at a clamp passes trivially -- start-at-a-bound
+ * is exactly the input that would make (c) pass while the pair is broken, so
+ * it is run from mid-range and the bounds are checked separately.
+ *
+ * Every reading is `panel_bg_mean` off the back buffer, never `panAlpha`. */
+static int check_opacity_pair(HWND h, int (*pump)(int)) {
+    int i, midAlpha, aAfterF9, aAfterF10;
+    int bg0, bg1, bg2, darkest, lightest, darkA, lightA;
+    const int kN = 4;
+
+    /* --- both bounds, first, so the round trip below is known to start away
+     *     from either of them. 20 presses is more than (255-40)/27. */
+    for (i = 0; i < 20; i++) { send_key(h, VK_F9);  pump(1); }
+    darkA = g_ov.panAlpha;  darkest  = panel_bg_mean();
+    for (i = 0; i < 20; i++) { send_key(h, VK_F10); pump(1); }
+    lightA = g_ov.panAlpha; lightest = panel_bg_mean();
+    if (darkest < 0 || lightest < 0) {
+        printf("INCONCLUSIVE opacity: the back buffer could not be read\n");
+        return 0;
+    }
+    if (darkA == lightA) {
+        printf("error F9 and F10 saturate at the SAME alpha (%d) -- the pair "
+               "has one direction\n", darkA);
+        return 0;
+    }
+    if (darkest == lightest) {
+        printf("error the two opacity bounds (alpha %d and %d) RENDER "
+               "identically (%d) -- the value moves and the draw does not\n",
+               darkA, lightA, darkest);
+        return 0;
+    }
+
+    /* --- mid-range: 3 presses of F9 off the solid bound we are now sitting on. */
+    for (i = 0; i < 3; i++) { send_key(h, VK_F9); pump(1); }
+    midAlpha = g_ov.panAlpha;
+    if (midAlpha == darkA || midAlpha == lightA) {
+        printf("INCONCLUSIVE opacity round trip: could not leave a bound "
+               "(alpha %d, bounds %d/%d)\n", midAlpha, darkA, lightA);
+        return 0;
+    }
+    bg0 = panel_bg_mean();
+
+    for (i = 0; i < kN; i++) { send_key(h, VK_F9); pump(1); }
+    aAfterF9 = g_ov.panAlpha;
+    bg1 = panel_bg_mean();
+    for (i = 0; i < kN; i++) { send_key(h, VK_F10); pump(1); }
+    aAfterF10 = g_ov.panAlpha;
+    bg2 = panel_bg_mean();
+    if (bg0 < 0 || bg1 < 0 || bg2 < 0) {
+        printf("INCONCLUSIVE opacity round trip: a frame did not read back\n");
+        return 0;
+    }
+    /* (a) and (b): the two keys must move the stored value in opposite ways. */
+    if (aAfterF9 >= midAlpha) {
+        printf("error %d presses of F9 did not lower the alpha (%d -> %d)\n",
+               kN, midAlpha, aAfterF9);
+        return 0;
+    }
+    if (aAfterF10 <= aAfterF9) {
+        printf("error %d presses of F10 did not raise the alpha (%d -> %d) -- "
+               "F10 is dead or moves the same way as F9\n",
+               kN, aAfterF9, aAfterF10);
+        return 0;
+    }
+    /* (c) the round trip, on the stored value AND on the pixels. */
+    if (aAfterF10 != midAlpha) {
+        printf("error F9 x%d then F10 x%d did not return the alpha: %d -> %d "
+               "-> %d; the two steps are not equal and opposite\n",
+               kN, kN, midAlpha, aAfterF9, aAfterF10);
+        return 0;
+    }
+    if (bg1 == bg0) {
+        printf("error %d presses of F9 changed the alpha (%d -> %d) and the "
+               "RENDERED background did not move (%d)\n",
+               kN, midAlpha, aAfterF9, bg0);
+        return 0;
+    }
+    /* "within rounding": the mean is scaled by 1000, so a whole 8-bit level is
+     * 1000. A round trip to the identical alpha must reproduce the identical
+     * image; anything above a hair of blend noise is a real difference. */
+    if (bg2 < bg0 - 20 || bg2 > bg0 + 20) {
+        printf("error the RENDERED background did not round-trip: %d -> %d -> "
+               "%d (alpha %d -> %d -> %d)\n",
+               bg0, bg1, bg2, midAlpha, aAfterF9, aAfterF10);
+        return 0;
+    }
+    printf("      opacity pair: alpha %d -F9x%d-> %d -F10x%d-> %d; rendered "
+           "background %d -> %d -> %d; bounds alpha %d..%d render %d..%d\n",
+           midAlpha, kN, aAfterF9, kN, aAfterF10, bg0, bg1, bg2,
+           darkA, lightA, darkest, lightest);
+    return 1;
+}
+
+/* A pump that does not pump. Keys are queued by the wndproc and consumed by
+ * the RENDER thread during the draw, so with no frames in between a keypress
+ * never takes effect -- which is behaviourally identical, from the check's
+ * point of view, to a key that never reached the panel at all. That is exactly
+ * the bug that shipped (F10 arriving as WM_SYSKEYDOWN and being dropped), so
+ * it is the right thing to prove the check catches. */
+static int pump_none(int n) { (void)n; return 1; }
+
+/* THE MUTATION PROOF for the opacity pair. Handed a world in which the keys do
+ * not take effect, `check_opacity_pair` MUST fail. If it passes here it is a
+ * check that cannot fail, and a check that cannot fail is the bug -- which is
+ * precisely how the old `SendMessageW(WM_KEYDOWN, VK_F10)` test reported a
+ * dead key as working for a whole round. */
+static int check_opacity_mutation(HWND h, int (*realPump)(int)) {
+    int okAll = 1;
+    int saved = g_ov.panAlpha;
+    if (check_opacity_pair(h, pump_none)) {
+        printf("error MUTATION NOT CAUGHT: the opacity pair passed in a world "
+               "where no keypress ever takes effect\n");
+        okAll = 0;
+    }
+    /* RESTORE. The mutation left a pile of unconsumed keys in the ring, and a
+     * fixture left broken poisons every check after it -- the same rule
+     * `check_mutations` follows. Drain them, then put the alpha back. */
+    realPump(64);
+    while (g_ov.panAlpha > saved) { send_key(h, VK_F9);  realPump(1); }
+    while (g_ov.panAlpha < saved) { send_key(h, VK_F10); realPump(1); }
+    if (g_ov.panAlpha != saved) {
+        printf("error the opacity mutation proof did not restore the alpha "
+               "(%d, wanted %d)\n", g_ov.panAlpha, saved);
+        okAll = 0;
+    }
+    return okAll;
 }
 
 /* THE MUTATION PROOF for the four above. Each check is handed the state it
@@ -1939,6 +2220,7 @@ int main(int argc, char** argv) {
     int navIndentOk = -1, unimplOk = -1, rangesOk = -1, deadPageOk = -1;
     int dragCoalOk = -1, typedOk = -1, typeBoxOpenOk = -1, numOnlyOk = -1;
     int f8FromFieldOk = -1, f8ShowsOk = -1, newMutOk = -1;
+    int opacityOk = -1, opacityMutOk = -1;
     int postsBefore = -1, writesBefore = 0, dragRow = -1;
     int f8FromFieldWas = 0, f8FocusWas = 0;
     /* Long enough that "fewer than N" is a real claim: at one write a frame
@@ -2515,7 +2797,7 @@ int main(int argc, char** argv) {
                 SendMessageW(hwnd, WM_KEYDOWN, VK_OEM_2, 0);   /* `/` focuses */
             }
             if (f == 270 && port > 0) {
-                SendMessageW(hwnd, WM_KEYDOWN, VK_F10, 0);
+                send_key(hwnd, VK_F10);   /* the REAL message: WM_SYSKEYDOWN */
                 SendMessageW(hwnd, WM_KEYDOWN, VK_OEM_MINUS, 0);
             }
             if (f == 272 && port > 0) {
@@ -2684,6 +2966,16 @@ int main(int argc, char** argv) {
             }
             if (f == 286 + kDragFrames + 150 && port > 0)
                 newMutOk = check_new_mutations();
+            /* THE OPACITY PAIR. On frames of its own and last, because it
+             * drives the alpha to both bounds and leaves it mid-range -- a
+             * check that runs on top of that is measuring a screen somebody
+             * else's act moved. It pumps its own frames, so the loop counter
+             * advances past `f` here; everything after it is `frames - N`. */
+            if (f == 286 + kDragFrames + 160) {
+                opacityOk = check_opacity_pair(hwnd, pump_frames);
+                if (opacityOk)
+                    opacityMutOk = check_opacity_mutation(hwnd, pump_frames);
+            }
 
             if (f == 188) costLabelOk = check_cost_label(1);
             if (f == 250) costLabelOk = check_cost_label(0) && costLabelOk;
@@ -2781,6 +3073,11 @@ int main(int argc, char** argv) {
             { "F8 puts the hidden rows BACK on screen", f8ShowsOk },
             { "each new check FAILS when handed what it claims to detect "
               "(mutation proof)", newMutOk },
+            { "F9 and F10 are a SYMMETRIC pair: N presses each way returns the "
+              "RENDERED background to where it started, and both bounds are "
+              "reachable", opacityOk },
+            { "the opacity check FAILS when one direction is dead "
+              "(mutation proof)", opacityMutOk },
         };
         size_t vi;
         for (vi = 0; vi < sizeof(verdicts) / sizeof(verdicts[0]); vi++) {
