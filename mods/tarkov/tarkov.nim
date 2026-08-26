@@ -506,6 +506,47 @@ proc characterSlot(p: Profile): JsonObject =
   put(o, "unlockedTraders", raw("[]"))
   result = o
 
+proc emptyCharacterSlot(): JsonObject =
+  ## One `EFT.CharacterSelectionProfileData` for a mode with NO character yet.
+  ##
+  ## This exists because OMITTING a mode key is NOT the same as sending an empty
+  ## slot, which is what the old comment in `onProfilesV2` assumed. A key the
+  ## dictionary never receives is a slot the client was never told about, so it
+  ## draws nothing -- no character, and no "create a character" prompt either.
+  ## The slot prefab really does carry the affordance (`View/Empty` with its own
+  ## Idle/Hover, measured live in the tree), but it only renders for a slot whose
+  ## status is `empty`.
+  ##
+  ## `status` goes over the wire as a STRING through EGameMode's sibling
+  ## `EnumConverter`: Available->"available", Locked->"locked", Empty->"empty",
+  ## InRaid->"in_raid". `get_HasProfile` is `status==2 && uid != ""`, so an empty
+  ## slot is the exact inverse: status "empty" and a blank uid.
+  ##
+  ## Every field the populated slot sends is sent here too, at its zero value. A
+  ## throw ANYWHERE in one value aborts the WHOLE dictionary deserialize and
+  ## re-locks every slot -- including the one that does have a character -- so a
+  ## missing field here would cost us the working slot, not just this one.
+  var o = obj()
+  put(o, "uid", "")
+  put(o, "status", "empty")
+  put(o, "side", 0)
+  put(o, "nickname", "")
+  put(o, "lowerNickname", "")
+  put(o, "nicknamePref", "")
+  put(o, "level", 0)
+  put(o, "prestigeLevel", 0)
+  put(o, "memberCategory", 0)
+  put(o, "accountType", 0)
+  put(o, "aid", 0)
+  put(o, "gameVersion", "standard")
+  put(o, "PlayerVisualRepresentation", jnull())
+  put(o, "SeasonalInfo", jnull())
+  put(o, "unlockedProductionRecipe", raw("[]"))
+  put(o, "unlockedRules", raw("[]"))
+  put(o, "unlockedTraderDialogues", raw("[]"))
+  put(o, "unlockedTraders", raw("[]"))
+  result = o
+
 proc onProfilesV2(url, body, session: string): string =
   ## `/v2/client/game/profiles/` -- the character-select bootstrap. Post-1.0
   ## deserialises `data` into `Dictionary<EGameMode, CharacterSelectionProfileData>`
@@ -527,6 +568,15 @@ proc onProfilesV2(url, body, session: string): string =
       # slot; this server's one profile fills it.
       put(modes, "regular", characterSlot(p))
       break
+  # The two modes this server has no character for are sent EXPLICITLY as empty
+  # slots, not omitted. Omitting them was the old behaviour and its comment
+  # claimed it produced "a create a character prompt"; it does not -- measured on
+  # the live client, the response carried only the "regular" key and the player
+  # saw no empty slot and no + button anywhere on the screen. Only these two keys
+  # are legal besides "regular"; anything outside the EnumConverter map THROWS and
+  # re-locks every slot, so this list is closed on purpose.
+  put(modes, "pve", emptyCharacterSlot())
+  put(modes, "pvp-season", emptyCharacterSlot())
   # Enveloped: a bare dictionary renders NOTHING (the client wraps this in
   # JsonResponse<T> and reads `.data`), while the envelope renders the Regular
   # slot. The dict key "regular" binds that slot to the mode; the value's own
