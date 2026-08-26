@@ -1318,6 +1318,23 @@ proc cmdTest(e: Env): int =
     discard run(e, "installer tests",
                 quoted(joinPath(e.repo, "installer\\build\\test-installer.exe")))
 
+  heading "Shared per-frame region"
+  # The MUTATION PROOF for `abi/aowlspt_region.h`. It does not check that the
+  # dispatcher runs -- it deliberately registers a participant that faults, one
+  # that overruns its budget, and one that calls the dispatcher from inside a
+  # live guard, then asserts on the FINISHED STATE: that nobody ORDERED AFTER
+  # the faulting participant lost a frame, that the faulting one is disabled by
+  # name, that the overrunning one is reported and throttled, and that nesting
+  # is refused. It then runs the identical harness with nothing misbehaving, so
+  # every one of those checks is shown to be capable of failing.
+  let regionExe = joinPath(testsDir, "region_test.exe")
+  if run(e, "compile region_test.c",
+         "gcc -I" & quoted(joinPath(e.repo, "abi")) & " -O1 -o " &
+         quoted(regionExe) & " " &
+         quoted(joinPath(testsDir, "region_test.c"))):
+    discard run(e, "one mod faulting in the shared region never costs another " &
+                   "mod a frame", quoted(regionExe))
+
   heading "Detour engine"
   let detourExe = joinPath(testsDir, "detour_test.exe")
   if run(e, "compile detour_test.c",

@@ -114,6 +114,7 @@
 
 #include "aowlspt_detour.h"
 #include "aowlspt_admin.h"   /* the admin/cheat HUD's shared-memory surface */
+#include "aowlspt_region.h"  /* the SHARED per-frame region: every mod's draw */
 
 /* The admin/cheat HUD's shared region, mapped in `aowl_ov_start`. NULL until
  * then, and NULL forever if the OS refuses the mapping -- in which case every
@@ -5905,6 +5906,67 @@ static int32_t aowl_ov_admin_active(void) {
  * 256-entity frame is a needless 10 KB memmove on the stack. */
 static AowlAdminShared g_ovAdminSnap;
 
+/* ------------------------------------------------------------------ *
+ * THE SHARED REGION'S DRAW
+ *
+ * The generic replacement for what `aowl_ov_admin_append` does privately for
+ * one mod. Every participant that registered a DRAW callback with
+ * `abi/aowlspt_region.h` submitted screen-space commands on the Unity thread;
+ * this drains the published buffer here, on the render thread, and rasterises
+ * it with the same primitives the panel uses.
+ *
+ * The overlay is its own module, so it is a plain CLIENT of the region: it
+ * resolves `aowl_region_commands_x` by GetProcAddress on the host DLL, and a
+ * host that predates the region simply returns 0 commands. Nothing here can
+ * fault the game -- an absent host is an empty frame, exactly as an absent
+ * admin mod is an empty HUD.
+ *
+ * True back-buffer pixels: the submitter already projected to pixels, so the
+ * panel's integer scale is forced to 1 across this and restored after, the
+ * same discipline the admin ESP append follows.
+ * ------------------------------------------------------------------ */
+static void aowl_ov_region_append(void) {
+    const AowlRegionCmd* cmds = 0;
+    int32_t n = aowl_region_commands(&cmds);
+    int32_t i, savedScale;
+    if (n <= 0 || !cmds) return;
+    if (n > AOWL_REGION_MAX_CMDS) n = AOWL_REGION_MAX_CMDS;  /* capped */
+    savedScale = g_ov.scale;
+    g_ov.scale = 1;
+    for (i = 0; i < n; i++) {
+        const AowlRegionCmd* c = &cmds[i];
+        switch (c->kind) {
+            case AOWL_REGION_CMD_FILL:
+                aowl_ov_rect(c->x, c->y, c->w, c->h, c->col);
+                break;
+            case AOWL_REGION_CMD_BOX:
+                aowl_ov_frame_rect(c->x, c->y, c->w, c->h,
+                                   c->t > 0.0f ? c->t : 1.0f, c->col);
+                break;
+            case AOWL_REGION_CMD_TEXT:
+                aowl_ov_text(c->x, c->y, c->text, c->col);
+                break;
+            case AOWL_REGION_CMD_LINE: {
+                /* An axis-aligned quad between the two points. The overlay has
+                 * no line primitive and inventing a rotated one here would be
+                 * a second rasteriser to maintain; a thin rect is what the
+                 * admin HUD's own "lines" already are. */
+                float x0 = c->x, y0 = c->y, x1 = c->w, y1 = c->h;
+                float t  = c->t > 0.0f ? c->t : 1.0f;
+                float lx = x0 < x1 ? x0 : x1, ly = y0 < y1 ? y0 : y1;
+                float w  = (x1 > x0 ? x1 - x0 : x0 - x1);
+                float h  = (y1 > y0 ? y1 - y0 : y0 - y1);
+                if (w < t) w = t;
+                if (h < t) h = t;
+                if (w <= t || h <= t) aowl_ov_rect(lx, ly, w, h, c->col);
+                break;
+            }
+            default: break;
+        }
+    }
+    g_ov.scale = savedScale;
+}
+
 /* Append the HUD's geometry into the overlay's vertex scratch, to be flushed by
  * the one `aowl_ov_draw` the Present body already issues. ESP is drawn in true
  * back-buffer pixels (scale forced to 1, since the mod already projected to
@@ -6011,12 +6073,21 @@ static HRESULT STDMETHODCALLTYPE aowl_ov_present(IDXGISwapChain* sc, UINT sync,
         if (g_ov.visible && !g_ov.wasVisible) g_ov.openDrawn = 0;
         g_ov.wasVisible = g_ov.visible;
         int32_t adminOn = aowl_ov_admin_active();
+        /* The shared region draws whenever it has published anything, exactly
+         * as the admin HUD draws whenever it is live -- otherwise a mod's
+         * markers would appear only while the manager panel happened to be
+         * open, which reads to a player as "the mod is broken". */
+        int32_t regionOn = 0;
+        {
+            const AowlRegionCmd* rcPeek = 0;
+            regionOn = aowl_region_commands(&rcPeek) > 0 ? 1 : 0;
+        }
         /* Tell the mod the resolution it must project to, every frame the swap
          * chain is bound, so its screen coordinates match this back buffer even
          * across a resize. */
         if (g_ov_admin && aowl_ov_bind(sc))
             aowl_admin_set_screen(g_ov_admin, (int32_t)g_ov.bbW, (int32_t)g_ov.bbH);
-        if (aowl_ov_bind(sc) && (g_ov.visible || adminOn)) {
+        if (aowl_ov_bind(sc) && (g_ov.visible || adminOn || regionOn)) {
             /* What one frame of this costs, measured rather than asserted. The
              * overlay is drawn inside the present loop of a game people play
              * competitively, so "it is cheap" is a claim that has to have a
@@ -6033,7 +6104,7 @@ static HRESULT STDMETHODCALLTYPE aowl_ov_present(IDXGISwapChain* sc, UINT sync,
              * cache is defeated (drawSig = 0) so the per-frame ESP is not held
              * back by the panel's "nothing changed" fast path. */
             if (g_ov.visible) {
-                if (adminOn) g_ov.drawSig = 0;
+                if (adminOn || regionOn) g_ov.drawSig = 0;
                 aowl_ov_build();
             } else {
                 g_ov.vtxCount = 0;
@@ -6041,6 +6112,8 @@ static HRESULT STDMETHODCALLTYPE aowl_ov_present(IDXGISwapChain* sc, UINT sync,
                 g_ov.needUpload = 1;
             }
             if (adminOn) aowl_ov_admin_append();
+            /* And every participant of the SHARED region, generically. */
+            if (regionOn) aowl_ov_region_append();
             QueryPerformanceCounter(&tb);
             aowl_ov_draw(sc);
             QueryPerformanceCounter(&t1);
