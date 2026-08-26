@@ -2077,6 +2077,22 @@ proc onMatchEnd(url, body, session: string): string =
     setRaw(updated, "Inventory", p.field("Inventory").raw())
     warn "match/end: the raid body carried no stash, so the stored inventory " &
          "was kept intact rather than replaced (gear is not lost this raid)"
+  else:
+    # The hotkey bar. Only on the path where the handed-back inventory actually
+    # replaced the stored one -- the branch above keeps the stored inventory
+    # whole, bar included, so there is nothing to put back there.
+    var rebound = 0
+    let panel = keptQuickBinds(p.text, updated.text, rebound)
+    if rebound > 0:
+      var inventoryDoc = parseObject(updated.field("Inventory").raw())
+      if inventoryDoc.ok:
+        setRaw(inventoryDoc, "fastPanel", panel)
+        updated.setTopLevel("Inventory", text(inventoryDoc))
+        info "match/end: put " & $rebound & " quickbind(s) back on the hotkey " &
+             "bar for items that came home"
+      else:
+        warn "match/end: the raid body has no inventory object, so the " &
+             "hotkey bar was left as the client sent it"
   # Skills are applied as a delta against the pre-raid profile and run through
   # the game's curve, rather than believed as sent. The client's numbers are the
   # client's.

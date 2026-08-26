@@ -40,6 +40,75 @@ proc keepsGear*(r: RaidResult): bool =
   of rrKilled, rrMissingInAction: false
   else: true
 
+proc keptQuickBinds*(beforeJson, afterJson: string; restored: var int): string =
+  ## The hotkey bar, put back after a raid.
+  ##
+  ## `Inventory.fastPanel` maps a slot index to an item id, and the profile the
+  ## client hands back at the end of a raid has had it emptied -- on a death it
+  ## comes back bare, and even on a survived raid the client drops bindings it
+  ## no longer wants to argue about. The stash items themselves are still there,
+  ## so the player walks out of the raid with a full stash and an empty hotkey
+  ## bar and rebinds the same six items again.
+  ##
+  ## This is the server half of what UIFixes patches into `InRaidHelper.
+  ## DeleteInventory` client-side, and it needs no client at all: a binding is
+  ## restored only when
+  ##
+  ##   * the pre-raid profile had it, AND
+  ##   * the slot is not already bound in the profile handed back -- what the
+  ##     raid decided wins, always -- AND
+  ##   * the item is STILL PRESENT in the handed-back inventory, by id.
+  ##
+  ## That last clause is the whole safety of it: an item lost in the raid is
+  ## never re-bound, so the bar can never point at something the player no
+  ## longer owns. Restoring blind would draw a rifle that is on the floor of
+  ## Customs.
+  ##
+  ## Returns the merged `fastPanel` object as text, and sets `restored` to how
+  ## many bindings were actually put back. Returns `""` when there is nothing
+  ## to do, so the caller can leave the profile untouched rather than rewrite
+  ## it with an identical value.
+  restored = 0
+  let beforeText = field(beforeJson, "Inventory.fastPanel").raw()
+  if beforeText.len == 0:
+    return ""
+  var panel = parseObject(field(afterJson, "Inventory.fastPanel").raw())
+  if not panel.ok:
+    panel = newDoc()
+  # Every id the handed-back inventory still holds. Built once: a panel with six
+  # entries against an inventory with thousands of items would otherwise walk
+  # the item list six times.
+  var present: seq[string] = @[]
+  for it in each(field(afterJson, "Inventory.items")):
+    let id = it.field("_id").asText("")
+    if id.len > 0:
+      present.add id
+  var merged = text(panel)
+  for slot in keys(whole(beforeText)):
+    let id = field(beforeText, slot).asText("")
+    if id.len == 0:
+      continue
+    if field(merged, slot).asText("").len > 0:
+      continue          # the raid bound this slot itself; leave it alone
+    var stillOwned = false
+    for have in present:
+      if have == id:
+        stillOwned = true
+    if not stillOwned:
+      continue          # lost in the raid -- binding it would point at nothing
+    var boundElsewhere = false
+    for other in keys(whole(merged)):
+      if field(merged, other).asText("") == id:
+        boundElsewhere = true
+    if boundElsewhere:
+      continue          # already on the bar under a different slot
+    setText(panel, slot, id)
+    merged = text(panel)
+    restored = restored + 1
+  if restored == 0:
+    return ""
+  result = merged
+
 # ---------------------------------------------------------------------------
 # The map list
 # ---------------------------------------------------------------------------
@@ -1077,5 +1146,41 @@ proc selfCheckRaid*(into: var seq[string]): bool =
     into.add "raid: a mod's season did not survive"
   if field(modded, "weather.timestamp").asInt(0) != 99:
     into.add "raid: a mod's stale timestamp was served instead of now"
+
+  
+
+  # The hotkey bar after a raid. Asserted as properties of the MERGED PANEL --
+  # what the profile ends up holding -- and three of the four are negatives,
+  # because "it put something back" is the one claim that cannot fail.
+  const ChkBefore = """{"Inventory":{"fastPanel":{"1":"keep","2":"lost","3":"old3","4":"dupe"},"items":[{"_id":"keep"},{"_id":"lost"},{"_id":"old3"},{"_id":"dupe"}]}}"""
+  const ChkAfter = """{"Inventory":{"fastPanel":{"3":"raidbound","5":"dupe"},"items":[{"_id":"keep"},{"_id":"old3"},{"_id":"dupe"},{"_id":"raidbound"}]}}"""
+  var rebound = 0
+  let merged = keptQuickBinds(ChkBefore, ChkAfter, rebound)
+  if merged.len == 0:
+    into.add "raid: the hotkey bar restored nothing at all from a profile " &
+             "that had a surviving binding to put back"
+  else:
+    if field(merged, "1").asText("") != "keep":
+      into.add "raid: a quickbind whose item came home was not put back"
+    if field(merged, "2").found:
+      into.add "raid: a quickbind was restored for an item LOST in the raid, " &
+               "so the hotkey bar points at something the player no longer owns"
+    if field(merged, "3").asText("") != "raidbound":
+      into.add "raid: the pre-raid quickbind overwrote the slot the raid " &
+               "itself bound; what the raid decided must win"
+    if field(merged, "4").found:
+      into.add "raid: an item already on the bar under another slot was bound " &
+               "a second time, so one item draws in two places"
+    if field(merged, "5").asText("") != "dupe":
+      into.add "raid: restoring the bar dropped a binding the raid handed back"
+    if rebound != 1:
+      into.add "raid: the hotkey bar reported " & $rebound &
+               " restored binding(s) where exactly one was eligible"
+
+  # And the negative that proves it does nothing when there is nothing to do: a
+  # profile whose bar the raid handed back whole must not be rewritten.
+  var idle = 0
+  if keptQuickBinds(ChkAfter, ChkAfter, idle).len != 0 or idle != 0:
+    into.add "raid: the hotkey bar rewrote a profile that needed no change"
 
   result = into.len == before
