@@ -140,6 +140,16 @@ static void aowl_crva_w_f32(void* p, int32_t off, double v) {
 }
 static const char* aowl_crva_reason_s(int32_t r) { return aowl_crva_reason(r); }
 
+/* The two numbers that make "@0x0" unambiguous forever. `base` is
+ * GameAssembly.dll's load address (0 = the module is not loaded, which is a
+ * COMPLETELY different fault from a zeroed RVA); `fn` is what verify actually
+ * resolved to, which is base+rva or NULL. Reported side by side so a zero on
+ * one side can never be mistaken for a zero on the other. */
+static uint64_t aowl_crva_base_u(void)  { return (uint64_t)(uintptr_t)aowl_crva_base(); }
+static uint64_t aowl_crva_t_fn(void* p) { return (uint64_t)(uintptr_t)((AowlCrvaTarget*)p)->fn; }
+static uint32_t aowl_crva_t_rva(void* p){ return ((AowlCrvaTarget*)p)->rva; }
+static int32_t  aowl_crva_t_siglen(void* p){ return ((AowlCrvaTarget*)p)->siglen; }
+
 /* The invoke wrapper: nimony cannot take the address of a local int64 and hand
  * it to C as `int64_t*` without a cast it refuses, so the out-parameters come
  * back through plain `void*` the same way every other out-parameter here does. */
@@ -160,6 +170,10 @@ proc cInvokeW(t: Il2CppPtr; mi: Il2CppPtr; nslots: int32; mask: uint32;
               og: Il2CppPtr; ofv: Il2CppPtr): int32 {.
   importc: "aowl_crva_invoke_w", nodecl.}
 proc cReason(r: int32): cstring {.importc: "aowl_crva_reason_s", nodecl.}
+proc cBaseU(): uint64 {.importc: "aowl_crva_base_u", nodecl.}
+proc cTargetFn(t: Il2CppPtr): uint64 {.importc: "aowl_crva_t_fn", nodecl.}
+proc cTargetRva(t: Il2CppPtr): uint32 {.importc: "aowl_crva_t_rva", nodecl.}
+proc cTargetSiglen(t: Il2CppPtr): int32 {.importc: "aowl_crva_t_siglen", nodecl.}
 
 const
   MaxCallSlots* = 5
@@ -283,21 +297,63 @@ proc prepare(t: var RvaTarget) =
         hi = -1'i32
     inc i
 
+proc hex64(v: uint64): string =
+  const digits = "0123456789abcdef"
+  result = ""
+  var started = false
+  var shift = 60
+  while shift >= 0:
+    let nib = int((v shr uint64(shift)) and 0xF'u64)
+    if nib != 0 or started or shift == 0:
+      started = true
+      result.add digits[nib]
+    shift = shift - 4
+
+proc describe*(t: var RvaTarget): string =
+  ## Everything needed to tell a zeroed target from an unloaded module from a
+  ## bad address, in one line. A bare "@0x0" was ambiguous between all three
+  ## and cost a whole live run to disambiguate; it never will again.
+  prepare(t)
+  let p = cast[Il2CppPtr](addr t.storage[0])
+  let base = cBaseU()
+  let rva = cTargetRva(p)
+  let fn = cTargetFn(p)
+  result = "name=" & (if t.name.len == 0: "<EMPTY>" else: t.name) &
+    " rva=0x" & hexRva(rva) &
+    " siglen=" & $cTargetSiglen(p) &
+    " base=0x" & (if base == 0'u64: "0 <GameAssembly.dll NOT LOADED>" else: hex64(base)) &
+    " resolved=0x" & (if fn == 0'u64: "0 <not resolved>" else: hex64(fn))
+
+proc looksZeroed*(t: RvaTarget): bool =
+  ## The signature of the nimony `--app:lib` module-scope trap: a global
+  ## initialised by a CALL is silently left zeroed, so name, rva and the
+  ## declared prologue are ALL empty at once. That triple can only happen one
+  ## way, and it is worth naming rather than letting it present as "no prologue
+  ## was declared" -- which is true, and is not the cause.
+  t.rva == 0'u32 and t.declaredSig.len == 0 and t.name.len == 0
+
 proc verify*(t: var RvaTarget): CallOutcome =
   ## Byte-verify the target without calling it. Idempotent and cached. Safe to
   ## run at mod init: it only reads the code page and never patches.
+  if looksZeroed(t):
+    return CallOutcome(kind: coRefused, code: 7'i32, g: 0'i64, f: 0.0,
+      why: "this RvaTarget is entirely ZEROED (no name, rva 0, no prologue). " &
+           "That is the nimony --app:lib trap `aowlspt/fast` documents: a " &
+           "global initialised by a CALL at module scope is silently left " &
+           "zeroed. Declare the global BARE and assign it from onLoad, never " &
+           "`var t = rvaTarget(...)` at module scope.")
   prepare(t)
   let code = cTargetVerify(cast[Il2CppPtr](addr t.storage[0]))
   if code == 0'i32:
-    result = CallOutcome(kind: coOk, why: t.name & " @0x" & hexRva(t.rva) &
-      ": prologue verified against the snapshot" &
+    result = CallOutcome(kind: coOk, why: t.name & ": prologue verified " &
+      "against the snapshot [" & describe(t) & "]" &
       (if t.owners == 1'i32: ", 1 owner"
        elif t.owners > 1'i32: ", " & $t.owners & " owners share this RVA (fine to CALL, never to detour)"
        else: ""),
       code: 0'i32, g: 0'i64, f: 0.0)
   else:
     result = CallOutcome(kind: coRefused,
-      why: t.name & " @0x" & hexRva(t.rva) & ": " & reasonOf(code),
+      why: t.name & ": " & reasonOf(code) & " [" & describe(t) & "]",
       code: code, g: 0'i64, f: 0.0)
 
 proc faultCount*(): int32 =
@@ -498,6 +554,10 @@ proc run(t: var RvaTarget; a: var CallArgs; retclass: int32): CallOutcome =
     return CallOutcome(kind: coRefused,
       why: t.name & ": arguments were not staged -- " & a.badWhy,
       code: 8'i32, g: 0'i64, f: 0.0)
+  if looksZeroed(t):
+    return CallOutcome(kind: coRefused, code: 7'i32, g: 0'i64, f: 0.0,
+      why: "refusing to call an entirely ZEROED RvaTarget -- see `verify` for " &
+           "the module-scope initialiser trap this is")
   prepare(t)
   var g = 0'i64
   var f = 0.0
@@ -508,12 +568,12 @@ proc run(t: var RvaTarget; a: var CallArgs; retclass: int32): CallOutcome =
     result = CallOutcome(kind: coOk, why: "", code: 0'i32, g: g, f: f)
   elif code == 10'i32:
     result = CallOutcome(kind: coFaulted,
-      why: t.name & " @0x" & hexRva(t.rva) & ": " & reasonOf(code) &
-           " (fault " & $faultCount() & ")",
+      why: t.name & ": " & reasonOf(code) & " (fault " & $faultCount() &
+           ") [" & describe(t) & "]",
       code: code, g: 0'i64, f: 0.0)
   else:
     result = CallOutcome(kind: coRefused,
-      why: t.name & " @0x" & hexRva(t.rva) & ": " & reasonOf(code),
+      why: t.name & ": " & reasonOf(code) & " [" & describe(t) & "]",
       code: code, g: 0'i64, f: 0.0)
 
 proc callVoid*(t: var RvaTarget; a: var CallArgs): CallOutcome =
