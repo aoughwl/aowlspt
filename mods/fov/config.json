@@ -59,7 +59,9 @@
   "unAimSpeedY": 4.5,
   "unAimSpeedZ": 4.5,
 
-  "verifyHooks": true,
+  "verifyHooks": false,
+  "deferUntilUnityThread": true,
+  "hookFrameDriver": false,
 
   "//selfTestRuntime": "A GameAssembly.dll for the `--side sim` self-test to bind against, so it reports real bindings offline. Empty -- which is what ships -- means the process, and under aowlspt-sim there is no runtime at all. It must be an ABSOLUTE path: a relative one resolves against whatever directory the host was started in, which in an install is the game's own directory, and it is refused with that reason. `aowl test` and `aowl run` set AOWLSPT_SELFTEST_RUNTIME to the stand-in runtime tests/mockil2cpp builds, which is why this key is empty here and nothing ships a fixture path into an install.",
   "//selfTestDataDir": "The *_Data directory il2cpp_init is given when selfTestRuntime was loaded out of process -- a real client's EscapeFromTarkov_Data. Empty means the runtime is started without one, which is right for the stand-in and wrong for a real GameAssembly.dll. Absolute paths only, same rule and same reason as selfTestRuntime; AOWLSPT_SELFTEST_DATADIR sets it for a whole run. The mod has read this key since the self-test learned to start a runtime, so it is declared here where it can be found.",
