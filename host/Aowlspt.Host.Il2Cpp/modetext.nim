@@ -189,15 +189,50 @@ const MtxHuntFrames = 4
   ## node, and nothing that allocates belongs on every frame of the Unity thread.
 const MtxSteadyFrames = 120
   ## Once resolved: a revalidate-and-recheck, not a search.
-const MtxSliceMs = 4'u64
-  ## One resolve pass may cost this much. Over it, the hunt BACKS OFF to the
-  ## steady cadence and says so.
+const MtxSliceMs = 12'u64
+  ## One WHOLE resolve pass may cost this much -- the root enumeration (which
+  ## allocates) plus the descent. Deliberately ABOVE `MtxWalkMs`: the in-walk
+  ## deadline is what keeps a pass short, and this outer figure exists to catch
+  ## a pass that overran for some reason the inner bound could not see. Setting
+  ## it below the inner bound would make the back-off fire on every healthy
+  ## pass, which is a check that cannot fail in the other direction.
 const MtxHuntMs = 300_000'u64
   ## Five minutes of wall clock to find the button, then a loud give-up. The
   ## menu can legitimately be many seconds away on a cold load.
-const MtxNodeBudget = 4000
-  ## Nodes one resolve pass may visit across ALL roots combined. This is the
-  ## bound the old code did not have; the slice above is the belt to its braces.
+const MtxNodeBudget = 1200
+  ## Nodes one resolve pass may visit across ALL roots combined.
+  ##
+  ## SIZED FROM THE REAL TREE, not from a round number. The measured pass A
+  ## shape is: ~13 roots, each costing one `iObjName`, then a depth-3 descent
+  ## under exactly ONE of them at a fan-out of 24 -- a worst case of
+  ## 13 + 24 + 24*24 = 613 nodes, so 1200 is roughly 2x headroom and pass B has
+  ## the remainder. The old 4000 was BOTH too small and too large: too small
+  ## because a depth-8 fan-out-32 sweep exhausted it before reaching root 11 of
+  ## 11 (MEASURED on the live client), and too large because 4000 nodes at the
+  ## measured per-node cost is 750 ms on the Unity main thread. Visiting fewer
+  ## nodes is the fix; a bigger budget would only have made the stall longer.
+const MtxWalkMs = 6'u64
+  ## The IN-WALK deadline, checked every 32 nodes inside the recursion. This is
+  ## the bound whose absence produced the 750 ms pass: `MtxSliceMs` was only
+  ## compared AFTER the walk had already returned, so it could report a stall
+  ## but never prevent one. A budget that is only checked at the end is a
+  ## report, not a bound.
+const MtxFanout = 24
+  ## Children examined per level. 24, not 32: `Common UI`'s interesting
+  ## children are few, and every extra slot is a full `iObjName` -- a by-name
+  ## target resolve plus a managed string allocation, per node.
+const MtxDescendDepth = 3
+  ## Fact #116 records the path as `Common UI` -> `ChangeGameModeButton`, so
+  ## depth 3 is already two levels of slack for an inserted wrapper. Depth 8 is
+  ## what made the old sweep unaffordable, and it never once helped.
+const MtxRootCap = 32
+  ## Roots examined. The live client reported 11 and then 13.
+
+var gMtxLastNodes = 0
+  ## Nodes the last pass actually visited. Logged, because "it was slow" is an
+  ## impression and "613 nodes in 40 ms" is a measurement the next session can
+  ## act on without re-deriving anything.
+var gMtxLastVia = ""
 
 var gMtxFrames = 0
 var gMtxSlow = false              ## a pass overran the slice; one-shot log
@@ -233,17 +268,107 @@ var gMtxHideGo: Il2CppPtr = nil   ## the ChangeGameModeButton GameObject, cached
 var gMtxHidden = 0
 var gMtxSaidHidden = false
 
-proc mtxFindNamed(t: Il2CppPtr; name: string; depth: int;
-                   budget: var int): Il2CppPtr =
-  ## `modsFindNamed`, but with a GLOBAL NODE BUDGET threaded through the
-  ## recursion. `modsFindNamed` caps 32 children per level and nothing else, so
-  ## its worst case is 32^8 -- a number that is only survivable because the real
-  ## tree is small, which is not a bound. This one cannot visit more nodes than
-  ## the caller allowed, whatever the tree looks like.
+proc mtxAnchor(): Il2CppPtr =
+  ## A LIVE `PreloaderUI`, from THIS FEATURE'S OWN capture first.
+  ##
+  ## The version brand's measured root cause is the trap being avoided here: it
+  ## read `gInspPreloader`, which is written in exactly ONE place --
+  ## `inspectFired`, the LIVE INSPECTOR's rider -- so with `liveInspector` off
+  ## it had no anchor at any point in a run and never could have had one. A
+  ## feature must not depend on another feature's flag to reach its own target.
+  ##
+  ## So, in order: `gModeTextSelf`, which `modeTextUpdateFired` sets from RCX on
+  ## every one of OUR rider ticks and which therefore exists whenever this code
+  ## can run at all; then `gVerPreloader`, captured by the `PreloaderUI::Awake`
+  ## postfix at ~1.3 s (a bonus, and gated behind another flag, so never the
+  ## only source).
+  ##
+  ## `gInspPreloader` is deliberately NOT consulted, and not merely as a matter
+  ## of taste: it is declared in `inspect.nim`, which is `include`d AFTER this
+  ## file, so a module-level var from it is not even in scope here. That the
+  ## language stops it is convenient; the reason not to want it is the measured
+  ## one above.
+  result = nil
+  if gModeTextSelf != nil and duOk(gModeTextSelf, 0x20'i32):
+    return gModeTextSelf
+  if gVerPreloader != nil and duOk(gVerPreloader, 0x20'i32):
+    return gVerPreloader
+
+proc mtxAnchorRoots(into: var seq[Il2CppPtr]): bool =
+  ## Every root Transform we can reach, plus OUR OWN anchor's hierarchy root as
+  ## an independent seed.
+  ##
+  ## `iSceneRoots` is used for the cross-root list because `ChangeGameModeButton`
+  ## lives under `Common UI`, a DIFFERENT root from the `Preloader UI` our anchor
+  ## sits on -- and `Transform::get_root` cannot cross roots, so a pure
+  ## climb-and-descend (which is what fixed the version brand, whose target IS on
+  ## the PreloaderUI hierarchy) cannot reach this one. That difference is why the
+  ## two features do not share a resolver.
+  ##
+  ## KNOWN CROSS-FEATURE DEPENDENCY, NAMED RATHER THAN INHERITED SILENTLY:
+  ## `iSceneRoots` reaches the `DontDestroyOnLoad` scene -- the only scene the
+  ## live UI is actually in, since `sceneCount`/`GetSceneAt` exclude it BY
+  ## DESIGN -- via `iAnchorSceneHandle`, which reads `gInspPreloader`. That
+  ## global is written in exactly ONE place, `inspectFired`, the LIVE
+  ## INSPECTOR's rider. So with `liveInspector` off, the root list can come back
+  ## EMPTY and this feature cannot resolve. That is precisely the disease the
+  ## version brand was just cured of, and it is reported here as a specific,
+  ## actionable sentence instead of an empty list -- the proper fix is to
+  ## generalise `iAnchorSceneHandle` to take an anchor argument, which is in
+  ## `inspect.nim` and not this feature's file to change.
+  ##
+  ## Our own anchor's hierarchy root is appended regardless, so pass B has
+  ## something to search even in that degraded case.
+  result = false
+  let n = iSceneRoots(into, false)
+  let anchor = mtxAnchor()
+  if anchor != nil:
+    let at = iToTransform(anchor)
+    if at != nil and duOk(at, 0x20'i32):
+      var top = iHierRoot(at)
+      if top == nil or not duOk(top, 0x20'i32):
+        top = at
+      var dup = false
+      for k in 0 ..< into.len:
+        if into[k] == top:
+          dup = true
+      if not dup:
+        into.add top
+  if into.len == 0:
+    gMtxResolveWhy = "NO scene roots are reachable (iSceneRoots returned " &
+                     $n & ") and this feature has no live PreloaderUI anchor " &
+                     "of its own yet either. If this persists once the menu " &
+                     "is up it is NOT a timing problem: iSceneRoots reaches " &
+                     "the DontDestroyOnLoad scene -- where the live UI is -- " &
+                     "only through gInspPreloader, which ONLY the live " &
+                     "inspector's rider ever writes, so turning liveInspector " &
+                     "on is the workaround and generalising " &
+                     "iAnchorSceneHandle is the fix"
+    return
+  result = true
+
+proc mtxDescend(t: Il2CppPtr; name: string; depth: int;
+                 budget: var int; deadline: uint64): Il2CppPtr =
+  ## A bounded, TIME-SLICED descent by name.
+  ##
+  ## THREE bounds, because the previous version had only one and it was not
+  ## enough: a 750 ms walk was MEASURED on the live client (187x the 4 ms
+  ## slice) because the slice was only checked AFTER the whole pass returned.
+  ##   * `budget` -- total nodes across the whole pass, threaded through the
+  ##     recursion;
+  ##   * `deadline` -- checked INSIDE the walk, so a pass can abandon itself
+  ##     mid-descent instead of stalling the Unity main thread to completion;
+  ##   * `depth` and a per-level fan-out cap.
+  ## `iObjName` is the expensive step (it resolves a target BY NAME and then
+  ## allocates a managed string, per node), so the cheapest bound is simply not
+  ## visiting the node -- which is what the targeted descent below is for.
   result = nil
   if t == nil or depth < 0 or budget <= 0 or not duOk(t, 0x20'i32):
     return
   budget = budget - 1
+  if (budget and 31) == 0 and cNowMs() > deadline:
+    budget = 0                        # poison the budget: unwinds every level
+    return
   if iObjName(t) == name:
     return t
   if depth == 0:
@@ -252,51 +377,91 @@ proc mtxFindNamed(t: Il2CppPtr; name: string; depth: int;
   if not iChildCount(t, n):
     return
   var i = 0
-  while i < n and i < 32 and budget > 0:
+  while i < n and i < MtxFanout and budget > 0:
     let c = iChildAt(t, i)
     if c != nil:
-      result = mtxFindNamed(c, name, depth - 1, budget)
+      result = mtxDescend(c, name, depth - 1, budget, deadline)
       if result != nil:
         return
     i = i + 1
 
 proc modeTextFindGameModeRoot(): Il2CppPtr =
-  ## `ChangeGameModeButton`, searched from every scene root down to a bounded
-  ## depth -- the same pattern as `seasonsFindMenuScreen`. "Common UI" is the
-  ## verified live root (fact #116), but this does not hardcode that layer, so
-  ## an inserted UI wrapper does not silently break the walk.
+  ## `ChangeGameModeButton`, reached from a live object we already hold.
   ##
-  ## BOUNDED TWICE: one shared node budget across every root, and the caller
-  ## times the whole pass against `MtxSliceMs`.
+  ## TARGETED, not a sweep. The measured path is `Common UI` ->
+  ## `ChangeGameModeButton` (fact #116), so pass A reads the name of each ROOT
+  ## once -- a dozen `iObjName` calls -- and only descends under the root that
+  ## is actually named `Common UI`. The previous version descended 8 levels with
+  ## a fan-out of 32 under EVERY root and burned its whole 4000-node budget
+  ## without reaching root 11 of 11; the node it wanted was never in the part of
+  ## the tree it could afford to look at.
+  ##
+  ## Pass B is the honest fallback for a build that renamed or re-parented the
+  ## root, and it is reported DIFFERENTLY so the two can never be confused.
   result = nil
   var roots: seq[Il2CppPtr] = @[]
-  let n = iSceneRoots(roots, false)
-  if roots.len == 0:
-    gMtxResolveWhy = "iSceneRoots enumerated NO roots (" & $n & ")"
-    return
-  var names = ""
+  if not mtxAnchorRoots(roots):
+    return                              # gMtxResolveWhy already set
+  let deadline = cNowMs() + MtxWalkMs
   var budget = MtxNodeBudget
+  var names = ""
+  var sawCommon = false
   var i = 0
-  while i < roots.len and i < 32 and budget > 0:
-    let goT = iToTransform(roots[i])
-    if goT != nil and duOk(goT, 0x20'i32):
+  # ---- PASS A: the root named "Common UI", descended shallowly. ----
+  while i < roots.len and i < MtxRootCap and budget > 0:
+    let r = roots[i]
+    if r != nil and duOk(r, 0x20'i32):
+      let rn = iObjName(r)
       if names.len < 300:
-        names = names & "'" & iObjName(goT) & "' "
-      let m = mtxFindNamed(goT, "ChangeGameModeButton", 8, budget)
+        names = names & "'" & rn & "' "
+      if rn == "Common UI":
+        sawCommon = true
+        let m = mtxDescend(r, "ChangeGameModeButton", MtxDescendDepth,
+                           budget, deadline)
+        if m != nil:
+          gMtxResolveWhy = ""
+          gMtxLastNodes = MtxNodeBudget - budget
+          gMtxLastVia = "Common UI (pass A, targeted)"
+          return m
+    i = i + 1
+  # ---- PASS B: every other root, same shallow depth, same shared budget. ----
+  var j = 0
+  while j < roots.len and j < MtxRootCap and budget > 0:
+    let r = roots[j]
+    if r != nil and duOk(r, 0x20'i32):
+      let m = mtxDescend(r, "ChangeGameModeButton", MtxDescendDepth,
+                         budget, deadline)
       if m != nil:
         gMtxResolveWhy = ""
+        gMtxLastNodes = MtxNodeBudget - budget
+        gMtxLastVia = "a root OTHER than 'Common UI' (pass B, fallback) -- " &
+                      "fact #116 said Common UI, so this build has moved it"
         return m
-    i = i + 1
+    j = j + 1
+  gMtxLastNodes = MtxNodeBudget - budget
+  # THREE DISTINGUISHABLE OUTCOMES, never flattened into one. "I ran out of
+  # budget" and "I looked everywhere and it is not there" are different facts
+  # and only the second is a verdict.
   if budget <= 0:
-    gMtxResolveWhy = "the walk EXHAUSTED its " & $MtxNodeBudget &
-                     "-node budget after " & $i & " of " & $roots.len &
-                     " scene root(s) without finding 'ChangeGameModeButton'. " &
-                     "This is INCONCLUSIVE, not a verdict of absent"
+    gMtxResolveWhy = "the descent hit its node budget (" & $MtxNodeBudget &
+                     ") or its " & $int(MtxWalkMs) & " ms in-walk deadline " &
+                     "after " & $gMtxLastNodes & " nodes over " & $roots.len &
+                     " root(s); a root named 'Common UI' was " &
+                     (if sawCommon: "PRESENT" else: "NOT present") &
+                     ". This is INCONCLUSIVE, not a verdict of absent"
+  elif not sawCommon:
+    gMtxResolveWhy = "no root is named 'Common UI' (fact #116 says the button " &
+                     "hangs off it) and no 'ChangeGameModeButton' within " &
+                     $MtxDescendDepth & " levels of any of the " & $roots.len &
+                     " root(s) either, in " & $gMtxLastNodes & " nodes. Roots " &
+                     "seen: " & names
   else:
-    gMtxResolveWhy = "no 'ChangeGameModeButton' within 8 levels of any of the " &
-                      $roots.len & " scene root(s) (" & $(MtxNodeBudget - budget) &
-                      " nodes visited, budget NOT exhausted, so this one is a " &
-                      "real absence): " & names
+    gMtxResolveWhy = "'Common UI' WAS reached but has no " &
+                     "'ChangeGameModeButton' within " & $MtxDescendDepth &
+                     " levels, and neither does any other root (" &
+                     $gMtxLastNodes & " nodes visited, budget NOT exhausted, " &
+                     "so this one is a real absence AT THIS DEPTH). Roots: " &
+                     names
 
 proc modeTextResolveOne(btnT: Il2CppPtr; childName: string;
                          tmpOut, locOut: var Il2CppPtr): bool =
@@ -417,7 +582,9 @@ proc modeTextTickBody(a: Il2CppPtr): Il2CppPtr {.
       inc gMtxNotReady
       if gMtxNotReady <= 2:
         okLog "hide mode button: not reachable yet -- " & gMtxResolveWhy &
-              ". Expected before the main menu is up; it keeps looking."
+              ". [pass " & $gMtxNotReady & ", " & $gMtxLastNodes &
+              " nodes, " & $int(spentH) & " ms] Expected before the main " &
+              "menu is up; it keeps looking."
       return
     let go = iGameObjectOf(btnT)
     if go == nil or not iUnityAlive(go):
@@ -440,6 +607,8 @@ proc modeTextTickBody(a: Il2CppPtr): Il2CppPtr {.
               "root with a " & $MtxNodeBudget & "-node budget -- never from a " &
               "cached pointer, and never from PreloaderUI._sessionModeText, " &
               "which is a recorded FALSE POSITIVE for this label (fact #116). " &
+              "REACHED VIA " & gMtxLastVia & ", in " & $gMtxLastNodes &
+              " nodes. " &
               "It is re-checked on a throttle so a menu rebuild hides it " &
               "again; this host never sets it back to active."
     else:
