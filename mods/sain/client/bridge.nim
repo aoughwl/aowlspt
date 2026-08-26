@@ -234,7 +234,13 @@ proc probe*(): Capability =
                ". Everything past a count needs LazyCall/ensure, which needs " &
                "il2cpp_object_get_class -- one of the reflection entry " &
                "points that faults here -- so this mod stays in observer " &
-               "mode and drives nothing rather than walking back into that"
+               "mode and drives nothing rather than walking back into that. " &
+               nativeFieldsState() &
+               ". The native walk opens the READ half only (Profile.Id, " &
+               "AIData, HealthController, Physical, MovementContext, " &
+               "BotsGroup -- every offset measured); IsAI has no field on " &
+               "this build and every DRIVING call is a call, so capFull " &
+               "still needs byte-verified RVAs that have not been measured yet"
   crumb("step 7/7 refused; the arming path is complete and this trace stops")
   gCrumbsDone = true
   result = gCapability
@@ -261,6 +267,10 @@ proc announce*() =
   # from the thread it is on. Either one absent means no cover points, and a
   # log that ran them together could not say which.
   info "sain: " & probeState()
+  # Said on every session, on or off, because "the native field walk is OFF" and
+  # "it is on and every hop was unreadable" produce the SAME absence of bot data
+  # and a log that printed only in the on case could not tell them apart.
+  info "sain: " & nativeFieldsState()
   # Asked here rather than read here: `announce` runs on the first tick the
   # world resolves, which is before the driver's own two-second poll has ever
   # fired, and a report that said "not asked yet" would be reporting this
@@ -368,9 +378,25 @@ proc profileIdOf*(player: Il2CppPtr): string =
   ## The bot's key. A managed string, copied out once at attach and never read
   ## again -- reading it per tick would put a UTF-16 to UTF-8 conversion on the
   ## hot path for a value that cannot change.
+  ##
+  ## TWO ROUTES, and the first one is the one that works on this build.
+  ##
+  ## `nativeProfileId` walks `Player.Profile@0x9c0 -> Profile.Id@0x10 ->
+  ## System.String`, three offsets measured offline by `tools/fldoff.py`, each
+  ## hop checked with `VirtualQuery`. It calls nothing and resolves nothing, so
+  ## it is not on the by-name path that kills the client (fact #35).
+  ##
+  ## The old route -- `callObj(gB.pProfileId, ...)` -- is kept underneath it
+  ## rather than deleted, because it is what a build with working reflection
+  ## should use and it is the thing the native walk is checked against. On THIS
+  ## build it goes through `ensure`, which refuses, and returns "".
   result = ""
   if player == nil:
     return
+  if nativeFieldsOn():
+    result = nativeProfileId(player)
+    if result.len > 0:
+      return
   result = readManagedString(callObj(gB.pProfileId, player))
 
 proc isAI*(player: Il2CppPtr): bool =

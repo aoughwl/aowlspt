@@ -210,8 +210,16 @@ proc gwGetProcAddress(module: Il2CppPtr; name: cstring): Il2CppPtr {.
 # answer for a function that returned 0. That is the kind of check that cannot
 # fail, and this is a three-way state where the difference decides whether a
 # human is told "no raid" or "nothing is watching".
+#
+# The shim header is included HERE as well as in `aowlspt/il2cpp`, and that is
+# not a duplicate: nimony emits one C file per module, so `aowl_is_readable`
+# and `aowl_word_at` -- which the native field walk further down needs, and
+# which `il2cpp.nim` keeps private -- are not declared in this translation unit
+# otherwise. Every function in that header is `static`, so a second inclusion
+# in a second TU costs a second copy and nothing else.
 {.emit: """
 #include <stdint.h>
+#include "aowlspt_shim.h"
 static void*   sain_gw_p_v  (void* f) { return ((void*  (*)(void))f)(); }
 static int32_t sain_gw_i32_v(void* f) { return ((int32_t(*)(void))f)(); }
 """.}
@@ -1149,6 +1157,216 @@ proc readManagedString*(p: Il2CppPtr): string =
   if p == nil:
     return ""
   result = readString(gRt, p)
+
+# ---------------------------------------------------------------------------
+# The native field walk: reading a bot with NO reflection at all
+# ---------------------------------------------------------------------------
+#
+# Everything above this line that reads a bot goes through `LazyCall`/`ensure`,
+# and `ensure`'s first act is `il2cpp_object_get_class` -- one of the entry
+# points CLAUDE.md 5 lists as faulting on this build. That is the single choke
+# point that keeps this mod in observer mode.
+#
+# This section is the way past it for the READ half. It calls nothing and
+# resolves nothing: it loads a pointer out of an object at an offset that was
+# measured OFFLINE, out of
+# `Il2CppMetadataRegistration.fieldOffsets`, by `tools/fldoff.py` -- which
+# self-checks against `System.String._stringLength@0x10` / `_firstChar@0x14`
+# and prints nothing if that check fails.
+#
+# MEASURED, `python tools/fldoff.py fields EFT.Player` on this build's
+# `global-metadata` (all `inst`, all declared by `EFT.Player`):
+#
+#     <MovementContext>k__BackingField  0x60   MovementContext
+#     <Profile>k__BackingField          0x9c0  Profile
+#     Physical                          0x9d8  PhysicalBase
+#     <AIData>k__BackingField           0xa00  IAIData
+#     _healthController                 0xa20  IHealthController
+#
+# and `python tools/fldoff.py fields EFT.Profile`:
+#
+#     Id                                0x10   string
+#
+# NOT guessed. An offset that is not in that dump does not appear here.
+#
+# **Every hop is checked with `aowl_is_readable`, which is a `VirtualQuery`.**
+# Rule 2 says every dereference, not just the first, and a chain of three
+# offsets is three checks. A pointer that reads back non-null but unreadable is
+# a fault, not a value, and it is counted.
+#
+# **Flag-gated, default OFF** (`nativeFieldReads` in `config.json`), and
+# **self-disabling** after `NativeFaultBudget` faults. A path that faults every
+# frame forever is worse than one that turns itself off and says so.
+
+proc aowlIsReadable(p: Il2CppPtr; size: int32): int32 {.
+  importc: "aowl_is_readable", nodecl.}
+proc aowlWordAt(p: Il2CppPtr; i: uint64): uint16 {.
+  importc: "aowl_word_at", nodecl.}
+
+const
+  NativeFaultBudget* = 8
+    ## How many unreadable hops this path tolerates before it turns itself off
+    ## for the session. Rule 6.
+  PlayerProfileOffset* = 0x9c0'i32
+  PlayerAIDataOffset* = 0xa00'i32
+  PlayerHealthControllerOffset* = 0xa20'i32
+  PlayerPhysicalOffset* = 0x9d8'i32
+  PlayerMovementContextOffset* = 0x60'i32
+  PlayerBotsGroupOffset* = 0xb68'i32
+    ## `EFT.Player.<BotsGroup>k__BackingField`, used as an IDENTITY only --
+    ## compared, never dereferenced -- exactly as `boBotsGroup` above is.
+  ProfileIdOffset* = 0x10'i32
+  StringLengthOffset* = 0x10'i32
+  StringFirstCharOffset* = 0x14'i32
+  MaxManagedStringChars* = 128
+    ## A profile id is 24 hex characters. 128 is generous and it is a CAP:
+    ## rule 4, and a corrupt length field is exactly how a read walks off a
+    ## page.
+
+var gNativeFields = false
+var gNativeFaults = 0
+var gNativeFirstFault = ""
+var gNativeReads = 0
+
+proc setNativeFieldReads*(v: bool) =
+  ## From `onLoad`, out of the preset. Default false.
+  gNativeFields = v
+
+proc nativeFieldsOn*(): bool =
+  gNativeFields and gLive and gNativeFaults < NativeFaultBudget
+
+proc nativeFieldsState*(): string =
+  ## Three answers, not two (CLAUDE.md 9b): OFF by configuration, ON and
+  ## working, or DISABLED because it faulted. A caller that flattened these
+  ## would report "no bots" for all three.
+  if not gNativeFields:
+    return "the native field walk is OFF (set nativeFieldReads in " &
+           "config.json to turn it on). Every read still goes through " &
+           "LazyCall/ensure, which needs il2cpp_object_get_class and " &
+           "therefore refuses"
+  if not gLive:
+    return "the native field walk is on, but GameAssembly.dll's C API is not " &
+           "bound in this process"
+  if gNativeFaults >= NativeFaultBudget:
+    return "the native field walk SELF-DISABLED after " & $gNativeFaults &
+           " unreadable hops; the first was: " & gNativeFirstFault
+  result = "the native field walk is on: " & $gNativeReads &
+           " reads, " & $gNativeFaults & " unreadable hops so far"
+
+proc noteNativeFault(why: string) =
+  if gNativeFaults == 0:
+    gNativeFirstFault = why
+  gNativeFaults = gNativeFaults + 1
+  if gNativeFaults == NativeFaultBudget:
+    warn "sain: the native field walk has self-disabled after " &
+         $NativeFaultBudget & " unreadable hops. The first was: " & why
+
+proc hopPtr*(obj: Il2CppPtr; off: int32; what: string): Il2CppPtr =
+  ## One measured-offset reference load, both ends checked.
+  ##
+  ## Null is an ORDINARY answer (the field is genuinely null) and is not a
+  ## fault. A non-null pointer that `VirtualQuery` will not vouch for IS a
+  ## fault, and it is the case that would otherwise crash the client.
+  result = cast[Il2CppPtr](0)
+  if obj == nil or not nativeFieldsOn():
+    return
+  if aowlIsReadable(obj, off + 8'i32) == 0'i32:
+    noteNativeFault(what & ": the receiver is not readable for " &
+                    $(off + 8) & " bytes")
+    return
+  var f = FieldBinding(ok: true, why: what, target: what, offset: off,
+                       kind: fkPtr, bindNs: 0'i64)
+  let p = readPtr(f, obj)
+  if p == nil:
+    return
+  # 16 bytes: an IL2CPP object header is klass + monitor, and every consumer
+  # here reads at least that far before it reads anything of its own.
+  if aowlIsReadable(p, 16'i32) == 0'i32:
+    noteNativeFault(what & ": read a non-null pointer (" & what &
+                    ") that VirtualQuery will not vouch for")
+    return
+  gNativeReads = gNativeReads + 1
+  result = p
+
+proc nativeString*(p: Il2CppPtr; what: string): string =
+  ## A `System.String` read by offset, with no runtime call.
+  ##
+  ## `_stringLength@0x10` and `_firstChar@0x14` are `tools/fldoff.py`'s own
+  ## mandatory self-check, so they are the most-verified offsets in this repo.
+  ## UTF-16 is narrowed to bytes for the ASCII range only: a profile id is hex,
+  ## and a character this cannot represent becomes '?' rather than a silently
+  ## truncated key.
+  result = ""
+  if p == nil or not nativeFieldsOn():
+    return
+  if aowlIsReadable(p, StringFirstCharOffset + 2'i32) == 0'i32:
+    noteNativeFault(what & ": the string object is not readable")
+    return
+  var lf = FieldBinding(ok: true, why: what, target: what,
+                        offset: StringLengthOffset, kind: fkI32, bindNs: 0'i64)
+  let n = readInt32(lf, p)
+  if n <= 0'i32:
+    return
+  if int(n) > MaxManagedStringChars:
+    noteNativeFault(what & ": _stringLength read back " & $int(n) &
+                    ", past the " & $MaxManagedStringChars & "-character cap")
+    return
+  if aowlIsReadable(p, StringFirstCharOffset + n * 2'i32) == 0'i32:
+    noteNativeFault(what & ": the string's characters are not readable for " &
+                    $int(n) & " of them")
+    return
+  # `aowl_word_at` indexes in 16-bit units, so the first character is at
+  # 0x14 / 2 = 10.
+  let base = uint64(StringFirstCharOffset div 2'i32)
+  var i = 0
+  while i < int(n) and i < MaxManagedStringChars:
+    let w = aowlWordAt(p, base + uint64(i))
+    if w >= 0x20'u16 and w < 0x7f'u16:
+      result.add char(w)
+    else:
+      result.add '?'
+    inc i
+  gNativeReads = gNativeReads + 1
+
+proc nativeProfileId*(player: Il2CppPtr): string =
+  ## `Player.<Profile>k__BackingField@0x9c0 -> Profile.Id@0x10 -> String`.
+  ## Three checked hops, no reflection, no call into game code.
+  result = ""
+  let prof = hopPtr(player, PlayerProfileOffset, "EFT.Player.Profile@0x9c0")
+  if prof == nil:
+    return
+  let s = hopPtr(prof, ProfileIdOffset, "EFT.Profile.Id@0x10")
+  if s == nil:
+    return
+  result = nativeString(s, "EFT.Profile.Id")
+
+proc nativeAIData*(player: Il2CppPtr): Il2CppPtr =
+  hopPtr(player, PlayerAIDataOffset, "EFT.Player.AIData@0xa00")
+
+proc nativeHealthController*(player: Il2CppPtr): Il2CppPtr =
+  hopPtr(player, PlayerHealthControllerOffset,
+         "EFT.Player._healthController@0xa20")
+
+proc nativePhysical*(player: Il2CppPtr): Il2CppPtr =
+  hopPtr(player, PlayerPhysicalOffset, "EFT.Player.Physical@0x9d8")
+
+proc nativeMovementContext*(player: Il2CppPtr): Il2CppPtr =
+  hopPtr(player, PlayerMovementContextOffset,
+         "EFT.Player.MovementContext@0x60")
+
+proc nativeBotsGroup*(player: Il2CppPtr): Il2CppPtr =
+  hopPtr(player, PlayerBotsGroupOffset, "EFT.Player.BotsGroup@0xb68")
+
+# WHAT IS DELIBERATELY NOT HERE: `IsAI`.
+#
+# `python tools/fldoff.py fields EFT.Player` lists NO field on this build that
+# says whether a player is a bot -- the whole dump's only AI-shaped members are
+# `<AIData>k__BackingField@0xa00` and `<BotsGroup>k__BackingField@0xb68`, both
+# references. "AIData is non-null therefore this is a bot" is an INFERENCE, not
+# a measurement, and it is the one this mod must not make: a wrong answer here
+# does not degrade a sensor, it drives the human player's character. So `isAI`
+# stays on the refusing `LazyCall` path and says so, and the live measurement
+# that would settle it is named in the report rather than guessed at here.
 
 # ---------------------------------------------------------------------------
 # The binding set

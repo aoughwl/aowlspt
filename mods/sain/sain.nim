@@ -268,6 +268,24 @@ proc onBotAdded(target, payload: string): HookResult =
   release(who)
   carryOn()
 
+proc onPlayerDeadTyped(f: PatchFrame): TypedResult =
+  ## The death hook, on the typed frame, behind a byte-verified RVA.
+  ##
+  ## This is the same handler as `onPlayerDead` below with the JSON build taken
+  ## out, and taking it out is what makes it installable at all: an `@0x` spec
+  ## has no `MethodInfo`, every JSON firing path needs one, and the host refuses
+  ## the JSON ABI behind an RVA rather than handing a handler an empty payload.
+  ## `selfPointer` needs no `MethodInfo` -- it is the register the method was
+  ## entered with.
+  ##
+  ## It does as little as it can, for the same reason as before: it runs on the
+  ## game's thread and the bot table it would have to walk is owned by the
+  ## host's. `driver.drainDeaths` does the matching one tick later.
+  let who = f.selfPointer()
+  if who != 0'u64:
+    noteDeath(who)
+  frameContinue()
+
 proc onPlayerDead(target, payload: string): HookResult =
   ## Fired on the player that died, **by the player that died**.
   ##
@@ -393,6 +411,11 @@ const HookCostSamples = 512
 var gAimHookNs = 0'i64
 var gAimHookSamples = 0
 var gAimHookState = "not attempted"
+var gSpawnHookState = "not attempted"
+  ## What became of the bot-activation detour, as a sentence rather than a
+  ## bool. On this build it is "not installed because the target's prologue
+  ## branches", which is a different answer from "it failed" and from "it was
+  ## never tried", and `/sain/status` must be able to say which.
 var gDamageHookNs = 0'i64
 var gDamageHookSamples = 0
 var gDamageHookState = "not attempted"
@@ -693,111 +716,130 @@ proc installHooks() =
     return
   gHooked = true
 
-  # BOTH DETOURS ARE REFUSED ON THIS BUILD, and the reason is measured rather
-  # than cautious. MEASURED: `installHooks -- attempting the bot-activation
-  # detour on EFT.BotsController::AddActivePLayer` was the last line this mod
-  # ever logged before the client died at 9.250s. Patching BY NAME makes the
-  # host resolve the name through the IL2CPP C API, which on this build hands
-  # back a non-nil pointer into unmapped memory (fact #35) -- and the host then
-  # patches THERE. A patch is a use, and on this build every by-name route is
-  # fatal the moment it is used.
+  # THE SPAWN DETOUR IS REFUSED AND THE DEATH DETOUR IS INSTALLED, and the
+  # difference between them is a property of the two functions' first sixteen
+  # bytes rather than a policy.
   #
-  # The RVAs are measured and are in the two `const` arrays above, prologue
-  # bytes and all, ready for the host's patch-by-RVA grammar. They are NOT
-  # installed, and there are two independent reasons -- either alone is enough:
+  # Both are patched BY RVA. Patching BY NAME is what killed the client here
+  # (fact #35: by-name resolution hands back a non-nil handle into unmapped
+  # memory, and a patch is a use), and both handlers below are now TYPED, which
+  # is what the host's `@0x` grammar requires -- an RVA has no `MethodInfo` and
+  # every JSON firing path needs one.
   #
-  # 1. THE HOST REFUSES THE JSON PATCH ABI FOR AN RVA SPEC, by design.
-  #    `aowlhost.nim` (~4040): "An RVA patch has NO MethodInfo, and every JSON
-  #    firing path needs one ... So the JSON ABI is refused here rather than
-  #    installed and quietly handing a handler an empty payload." Both hooks
-  #    below use `hookArgs`, which IS the JSON ABI. The typed ABI --
-  #    `hookTyped` / `hookReturnTyped` -- does accept an RVA spec, so this is a
-  #    handler rewrite, not a missing host facility.
+  # -- THE SPAWN HOOK CANNOT BE DETOURED ON THIS BUILD. --
   #
-  # 2. THE HANDLERS COULD NOT DO THEIR JOB EVEN THEN. `onBotAdded` reads the
-  #    bot's identity with `who.get("ProfileId")` and `r.invoke("ToString")` --
-  #    boxed by-name member access, the same dead path. A typed RVA detour
-  #    would install, fire, and register every bot with an EMPTY id. That is a
-  #    live code patch bought for nothing, which is worse than no patch.
+  # MEASURED, `il2cpp_resolve.py <GameAssembly.dll> <metadata> bytes 0x254ce30
+  # 20`, read out of GameAssembly.dll ON DISK:
   #
-  # WHAT UNBLOCKS IT, measured here so the next pass does not re-derive it:
-  # a bot's profile id is reachable with no reflection at all, in two hops of
-  # measured static field offsets --
+  #     48 83 79 28 00  74 0C  48 8B 49 28  45 33 C0  E9 9D 6C 01 00  C3
+  #     cmp qword [rcx+0x28],0 ; jz +12 ; mov rcx,[rcx+0x28] ; xor r8d,r8d
+  #                            ; jmp rel32 ; ret
   #
-  #     EFT.Player.<Profile>k__BackingField   inst @0x9c0  -> EFT.Profile
-  #     EFT.Profile.Id                        inst @0x10   -> System.String
-  #     System.String._stringLength @0x10, _firstChar @0x14
+  # A detour needs FOURTEEN bytes (`jmp [rip+0]` plus the destination) and has
+  # to relocate every instruction it steals. `abi/aowlspt_detour.h` relocates a
+  # RIP-relative displacement and REFUSES a relative BRANCH -- "they could be
+  # rewritten too, but they are rare this early in a function, and a refusal a
+  # mod author can read beats a rewrite nobody has checked". The `jz` is at
+  # byte FIVE. The decoder therefore stops at five bytes with
+  # `AOWL_INSN_RELATIVE`, nine short of the jump, and no amount of decoder work
+  # changes that: it is a property of the target.
   #
-  # (the last pair being `il2cpp_resolve.py`'s own self-check, so it is the
-  # most-verified offset in the codebase). With those, `onBotAdded` becomes a
-  # typed prefix that reads `f.argPointer(0)` and walks three offsets, and both
-  # detours can go live by RVA. That is the next step, and it is a real one --
-  # not a workaround.
-  warn "sain: BOTH detours are refused on this build. The RVAs are measured " &
-       "and byte-verified in the source (AddActivePLayer 0x254ce30, OnDead " &
-       "0x732c30, neither shared), but patching by NAME is what killed the " &
-       "client here and the host refuses the JSON patch ABI behind an RVA " &
-       "spec -- so these need typed handlers, and the identity read inside " &
-       "onBotAdded needs the measured field walk noted in the source " &
-       "(Player.Profile@0x9c0 -> Profile.Id@0x10). Bot discovery falls back " &
-       "to the 2 Hz world scan, which cannot read a spawn type; death falls " &
-       "back to the per-bot health poll"
-  gAimHookState = "refused: not attempted -- installHooks declines every " &
-                  "detour on this build"
-  gDamageHookState = gAimHookState
-  if true:
-    return
-
-  var i = 0
-  var spawnOk = false
-  while i < SpawnHookCandidates.len:
-    let name = SpawnHookCandidates[i]
-    # Before, not after. `hookArgs` WRITES a detour into game code; if the
-    # process does not survive the write, the only line that can name which
-    # candidate did it is one printed first.
-    info "sain: installHooks -- attempting the bot-activation detour on " & name
-    if hookArgs(name, onBotAdded) == Ok:
-      info "sain: bot activation hooked on " & name
-      spawnOk = true
-      break
-    inc i
-  if not spawnOk:
-    # Not fatal, and worth naming: some methods cannot be detoured (a prologue
-    # holding a relative branch, or one shorter than the jump), and a method
-    # that does not exist under any of these names cannot be either. Without
-    # the hook the mod still finds every bot -- the world scan is what makes
-    # that true -- but it finds them up to half a second late and without their
-    # spawn type, which means scav settings for a PMC.
-    warn "sain: no bot-activation hook took (last error: " & lastError() &
-         "); falling back to the world scan, which cannot read a spawn type"
+  # So this is not attempted. Not "attempted and it failed", not "attempted
+  # with a fallback" -- there is nothing here to install, and installing the
+  # spec anyway to watch the host refuse it would be a patch that pretends.
+  # `SpawnHookCandidates` is kept because the RVA and its bytes are worth
+  # having measured, and because the answer changes the day a Tarkov update
+  # recompiles that function with a different prologue.
+  #
+  # The world scan remains the bot discovery path: half a second late, and
+  # without a spawn type, exactly as before.
+  warn "sain: the bot-activation detour is NOT INSTALLED, and this is a " &
+       "property of the target rather than a refusal that might lift. " &
+       "EFT.BotsController::AddActivePLayer@0x254ce30 opens `cmp qword " &
+       "[rcx+0x28],0 ; jz +12` -- a RELATIVE BRANCH at byte 5, inside the 14 " &
+       "bytes a detour must steal and relocate, which aowlspt_detour.h " &
+       "refuses by design. Bot discovery stays on the 2 Hz world scan, which " &
+       "finds every bot up to half a second late and cannot read a spawn " &
+       "type, so an unknown bot is tuned as a scav"
+  gSpawnHookState = "not installed: AddActivePLayer@0x254ce30 has a relative " &
+                    "branch (74 0C) at byte 5 of its prologue and cannot be " &
+                    "relocated"
 
   if not livePointersReady():
-    # Revision 2 or a host with no managed heap. The death hook would fire and
-    # `thisPointer` would answer zero every time, which is a hook that costs a
-    # payload per death and identifies nobody -- strictly worse than the poll.
-    # So it is not installed, and the poll stays.
+    # Revision 2 or a host with no managed heap. Kept from the JSON era because
+    # it is still the honest gate on the OTHER consumer of an address: the
+    # world scan's `attachPointer`.
     warn "sain: this host cannot turn a hook's instance into an address " &
          "(it is older than ABI revision 3, or has no managed heap); death " &
          "stays on the per-bot poll, which costs two bound calls per bot " &
          "per decision"
     return
 
+  if not gPreset.nativeDeathDetour:
+    # RULE 5, and it is the only thing standing between "measured installable"
+    # and "installed". Arming this WRITES fourteen bytes into live game code; a
+    # live path ships disabled and a human turns it on.
+    warn "sain: the death detour is measured INSTALLABLE but is OFF by " &
+         "configuration (set nativeDeathDetour in config.json). " &
+         "EFT.Player::OnDead@0x732c30 opens with seven register saves that " &
+         "land exactly on an instruction boundary at fourteen bytes, with no " &
+         "relative branch and no RIP-relative displacement, so the detour " &
+         "copier relocates them -- but arming it is a write into live code " &
+         "and this mod does not do that unasked. Death stays on the per-bot " &
+         "health poll"
+    return
+
+  if not typedPatchesReady():
+    # THE ONE REFUSAL THAT IS THE HOST'S AND NOT THE TARGET'S, said apart from
+    # the other two so a reader can tell "this build cannot" from "this host
+    # cannot".
+    warn "sain: the death detour is not installed: this host has no typed " &
+         "patch frame (it is ABI revision " & $hostApiSize() & " bytes of " &
+         "HostApi, and the frame wants revision 4). The JSON form that would " &
+         "work on an older host CANNOT be used here, because the target is " &
+         "declared by RVA and the host refuses the JSON patch ABI behind an " &
+         "RVA -- an @0x spec has no MethodInfo and every JSON firing path " &
+         "needs one. Death stays on the per-bot health poll"
+    return
+
+  # -- THE DEATH HOOK. Installed, by RVA, on the typed frame. --
+  #
+  # MEASURED, same command, `bytes 0x732c30 20`:
+  #
+  #     48 89 5C 24 10  48 89 4C 24 08  56  57  41 54  41 56 41 57  48 81
+  #     mov [rsp+0x10],rbx ; mov [rsp+8],rcx ; push rsi ; push rdi ; push r12
+  #                        ; push r14 ; push r15 ; sub rsp,imm32
+  #
+  # Cumulative lengths 5, 10, 11, 12, 14 -- the stolen region ends EXACTLY on
+  # an instruction boundary at fourteen bytes, and every instruction in it is a
+  # register save with no relative branch and no RIP-relative displacement.
+  # That is a shape the copier relocates, which is the whole difference from
+  # the spawn target above.
+  #
+  # The `!` prologue is not optional here. Without it `aowl_pro_verify` returns
+  # 1 having compared NOTHING and says so in the boot log, which is a check
+  # that cannot fail (CLAUDE.md 9b) guarding a write into live code.
   var j = 0
   var deathOk = false
   while j < DeathHookCandidates.len:
     let name = DeathHookCandidates[j]
-    info "sain: installHooks -- attempting the death detour on " & name
-    if hookArgs(name, onPlayerDead) == Ok:
+    # Before, not after. This WRITES a detour into game code; if the process
+    # does not survive the write, the only line that can name which candidate
+    # did it is one printed first.
+    info "sain: installHooks -- attempting the TYPED by-RVA death detour on " &
+         name
+    if hookTyped(name, onPlayerDeadTyped) == Ok:
       info "sain: death hooked on " & name &
-           "; the per-bot health poll is off"
+           " (typed frame, verified RVA); the per-bot health poll is off"
       setDeathHooked(true)
       deathOk = true
       break
+    warn "sain: the death detour on " & name & " was refused: " & lastError()
     inc j
   if not deathOk:
-    warn "sain: no death hook took (last error: " & lastError() &
-         "); keeping the per-bot health poll, which cannot be wrong about a " &
-         "death but costs two bound calls per bot per decision"
+    warn "sain: no death hook took; keeping the per-bot health poll, which " &
+         "cannot be wrong about a death but costs two bound calls per bot " &
+         "per decision"
 
   # The two postfixes. Both were declined outright while a postfix meant a
   # JSON payload -- see `README.md` section 5 -- and both are here now because
@@ -1414,6 +1456,7 @@ proc onLoad(): Status =
     # resolution unless this says otherwise, and it must be told at load
     # rather than at arming time, because arming is where the fault was.
     setAllowReflection(gPreset.allowIl2cppReflection)
+    setNativeFieldReads(gPreset.nativeFieldReads)
     if gPreset.allowIl2cppReflection:
       warn "sain: allowIl2cppReflection is ON. On this build that is a " &
            "known process-killer (fact #35): il2cpp_class_from_name returns " &

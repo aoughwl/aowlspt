@@ -87,6 +87,39 @@ type
     ## is turning on a known process-killer on THIS build.
     allowIl2cppReflection*: bool
 
+    ## Whether this mod may read a bot through MEASURED STATIC FIELD OFFSETS
+    ## instead of through `LazyCall`/`ensure`.
+    ##
+    ## Default false, and the default is caution rather than a measurement:
+    ## the offsets themselves ARE measured (`tools/fldoff.py fields EFT.Player`
+    ## / `EFT.Profile`, which self-checks against `System.String._stringLength
+    ## @0x10`), and every hop is `VirtualQuery`-checked and self-disables after
+    ## eight unreadable ones -- but nothing has yet read one out of a live bot
+    ## in a raid, and an offset that is right in the metadata and wrong in the
+    ## process is exactly the failure this project keeps hitting. Turn it on to
+    ## make the client answer that; `/sain/status` reports what it found.
+    ##
+    ## It replaces NO call. Only the reads whose offsets are in that dump go
+    ## this way; `IsAI`, every driving call and everything shaped like one is
+    ## unaffected and still refuses.
+    nativeFieldReads*: bool
+
+    ## Whether this mod may install the TYPED BY-RVA DEATH DETOUR on
+    ## `EFT.Player::OnDead@0x732c30`.
+    ##
+    ## Default false, because arming it WRITES FOURTEEN BYTES INTO LIVE GAME
+    ## CODE and rule 5 says a new live path ships disabled. What is measured
+    ## rather than assumed is that it is installable at all: the target's first
+    ## fourteen bytes are seven register saves, no relative branch and no
+    ## RIP-relative displacement, so `abi/aowlspt_detour.h`'s copier relocates
+    ## them -- unlike the bot-activation target, whose prologue branches at byte
+    ## five and which is refused permanently and not by a switch.
+    ##
+    ## Off, the per-bot health poll stays: two bound calls per bot per decision
+    ## for a fact that changes once in a bot's life, which on THIS build means
+    ## it refuses too.
+    nativeDeathDetour*: bool
+
 const RoleCount = 8      ## must match the number of `BotRole` members
 
 func roleFromText*(s: string): int =
@@ -231,7 +264,11 @@ proc loadPreset*(): Preset =
     driveFromHostThread:
       doc.field("driveFromHostThread").asBool(true),
     allowIl2cppReflection:
-      doc.field("allowIl2cppReflection").asBool(false))
+      doc.field("allowIl2cppReflection").asBool(false),
+    nativeFieldReads:
+      doc.field("nativeFieldReads").asBool(false),
+    nativeDeathDetour:
+      doc.field("nativeDeathDetour").asBool(false))
 
   # The difficulty scale is folded in here rather than at every spawn: a bot
   # spawning gets `resolvedFor(preset.byRole[role], personality, scale)` and
