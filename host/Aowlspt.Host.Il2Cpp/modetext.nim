@@ -618,8 +618,29 @@ proc modeTextTickBody(a: Il2CppPtr): Il2CppPtr {.
   let self = a           # the PreloaderUI `this`; unused by the new path below,
   discard self           # kept only so the shared drain's dispatch shape is intact
 
-  # ---- REMOVE THE BUTTON (uxHideModeButton). Wins over the relabel outright. ----
-  if gModeHideOn:
+  # ---- REMOVE THE BUTTON (uxHideModeButton) -- RETIRED, SUPERSEDED. ----
+  #
+  # This path is dead and is kept only as the record of why. The button is now
+  # hidden in `modstab.nim`'s `modeButtonHideFrom`, from the seasons branch,
+  # because `Common UI/MenuScreen/ChangeGameModeButton` is a DIRECT SIBLING of
+  # `SeasonsButton` -- so hide-seasons has already resolved and cached that
+  # exact MenuScreen, and hiding the button costs ONE `modsChildNamed` on an
+  # object we hold. No scene walk, no budget, no back-off.
+  #
+  # The version below searched for it instead, and could not find it because
+  # fact #116 records the path as `Common UI/ChangeGameModeButton`, which is
+  # WRONG BY ONE LEVEL and does not exist. FOUR implementation rounds were
+  # spent here, each searching the wrong depth, each correctly reporting "not
+  # found", each believed. The live inspector settled it in one query:
+  # `find ChangeGameModeButton` over all 16 scene roots returns exactly one
+  # hit, `parent="MenuScreen"`.
+  #
+  # Leaving it enabled is not harmless. Measured on a live run WITH the working
+  # modstab path also active: this searched 6000 nodes over 16 roots every
+  # ~4 seconds ON THE UNITY MAIN THREAD, logged 27 "not reachable yet" lines,
+  # and was still at it on pass 500 after 86 seconds -- for a button that had
+  # already been hidden at 0:00:22.406.
+  if false:
     # THE FAST PATH, once the object is known: a guarded pointer check, a
     # liveness check and one `activeSelf` ICALL. No allocation, no walk, so it
     # may run on the steady cadence and still hide a rebuilt menu promptly.
