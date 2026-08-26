@@ -2489,6 +2489,12 @@ proc modeButtonHideFrom(menu: Il2CppPtr) =
 # and the fix is to swap two constants.
 # ---------------------------------------------------------------------------
 
+## FALSE until a MEASURED tree of `SeasonsButton` says which child is the
+## headline, which is a sub-line, and which are the battlepass progress
+## widgets to switch off. While it is false the feature publishes its census
+## and declines. See the slot gate in `betaNoticeFrom` for what measuring it
+## costs and why guessing is not allowed.
+const BetaNoticeSlotsVerified = false
 const BetaNoticeMaxNodes = 64
 const BetaNoticeMaxDepth = 4
 const BetaNoticeMaxChildren = 32
@@ -2622,6 +2628,52 @@ proc betaNoticeFrom(menu: Il2CppPtr) =
     gBetaTmps = @[]                     # label died under us; re-enumerate
     return
   if gBetaApplies > 0 and cur0.startsWith(BetaNoticeSentinel):
+    return
+  # ---- THE SLOT GATE. MEASURED 2026-08-26, ON SCREEN, AND IT LOOKED BAD. ----
+  #
+  # The bring-up behaviour was "write every non-empty label", which succeeded
+  # completely -- `6 of 6 non-empty labels written` -- and rendered wrong. That
+  # is the §9b shape exactly: a true report of our own write, next to a screen
+  # the user described as "it sucks".
+  #
+  # WHAT THE CENSUS BELOW ACTUALLY TOLD US, live:
+  #   slot 0 [Battlepass]  slot 1 [SeasonWidget/Progress]  slot 2 [12 / 40]
+  # These are BATTLEPASS PROGRESS-WIDGET labels. They sit to the RIGHT of the
+  # logo, which is where our text appeared.
+  #
+  # AND THE HEADLINE IS NOT A LABEL AT ALL. "KORD BREACH / SEASON 1" survived
+  # untouched through a write to all six TMPs, so it is an IMAGE. No text
+  # writer can remove it. The non-empty-`m_text` heuristic did not fail here --
+  # it correctly reported that the headline is not text.
+  #
+  # So this feature CANNOT reach its target by writing labels, and the honest
+  # state is that we do not yet know which nodes to drive. Until a measured
+  # slot mapping exists, it REFUSES: it publishes the census -- the one thing
+  # here with evidential value -- switches the banner off, and disables itself.
+  # That leaves the player with the `uxHideSeasons` outcome, which is known
+  # good, rather than our caption beside a battlepass progress bar.
+  #
+  # Flipping `BetaNoticeSlotsVerified` without a measured tree of SeasonsButton
+  # re-ships the screenshot the user rejected.
+  if not BetaNoticeSlotsVerified:
+    var census = ""
+    var k = 0
+    while k < gBetaTmps.len and k < BetaNoticeMaxNodes:
+      census = census & "[" &
+               suiReadString(cReadPtrAt(gBetaTmps[k], 0xE0'i32)) & "] "
+      k = k + 1
+    okLog "beta notice: CENSUS of the " & $gBetaTmps.len & " non-empty " &
+          "label(s) under SeasonsButton, in breadth-first slot order: " &
+          census & "-- published because this is the measurement the " &
+          "feature needs and cannot get any other way."
+    betaNoticeDecline(go, "there is NO VERIFIED SLOT MAPPING for this " &
+                      "banner yet. Writing every label was the bring-up " &
+                      "step, and it landed on battlepass progress labels " &
+                      "beside the logo. The 'KORD BREACH / SEASON 1' " &
+                      "headline is an IMAGE -- it survived a write to every " &
+                      "TMP here -- so no text writer can replace it. " &
+                      "Refusing rather than re-shipping a banner that reads " &
+                      "correctly in the log and badly on screen")
     return
   var stock = ""
   var wrote = 0
