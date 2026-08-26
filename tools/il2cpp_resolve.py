@@ -714,6 +714,22 @@ def main():
                       (short, fname, hex(off) if off is not None else "?",
                        "STATIC" if st else "inst", ty, short))
 
+    else:
+        # This used to fall off the end of the if-chain and exit 0 having
+        # printed nothing, which reads as "searched, found nothing". Two
+        # separate agents lost round trips to it. Say what happened.
+        sys.exit(
+            "unknown subcommand %r.\n"
+            "Known: find, type, bytes, verify-be, fields, verify-fields, "
+            "settings-table.\n"
+            "NOTE: `find` matches TYPE names only. To search by METHOD name "
+            "use\n"
+            "  python tools/il2cpp_symtab.py find-method <dll> <metadec> "
+            "<substr>\n"
+            "which also prints the owner count, the PE section, and a warning "
+            "if the\nname lands on a shared RVA or on this build's universal "
+            "stub." % cmd)
+
 
 if __name__ == "__main__":
     main()
