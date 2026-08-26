@@ -95,6 +95,34 @@ proc fixtureSchema(): seq[Setting] =
                            category = "Loot", subcategory = "Core",
                            description = "a select whose choices ship in the schema")
   var noInline: seq[string] = @[]
+  # --- ARBITRARY DEPTH ----------------------------------------------------
+  #
+  # Depth beyond two is expressed by putting separators IN `category` (see
+  # `settingPath` in `aowl/src/aowlspt/settings.nim`), so no builder signature
+  # changed and no mod that already declares settings had to be touched. These
+  # twelve rows sit at depths 3 and 4 -- including the exact
+  # "Player > Health > Regeneration" shape the report asked for -- and one row
+  # deliberately carries a stray separator, because "A//B" must mean ["A","B"]
+  # and must NOT produce a group with no name.
+  for j in 0 ..< 5:
+    result.add boolSetting("deepRegen" & $j, "Regen tick " & $j, j == 0,
+                           category = "Deep/Player/Health/Regeneration",
+                           description = "depth 4")
+  for j in 0 ..< 4:
+    result.add boolSetting("deepBleed" & $j, "Bleeding rule " & $j, false,
+                           category = "Deep/Player/Health",
+                           subcategory = "Damage/Bleeding",
+                           description = "depth 5, split across both fields")
+  for j in 0 ..< 2:
+    result.add floatSetting("deepMove" & $j, "Inertia " & $j, 1.0,
+                            lo = 0.0, hi = 2.0, step = 0.05,
+                            category = "Deep/Player/Movement",
+                            description = "depth 3")
+  result.add boolSetting("deepStray", "Stray separators", true,
+                         category = "Deep//Player///Movement/",
+                         description = "empty segments must collapse, not " &
+                                       "become a nameless group")
+
   result.add selectSetting("itemRemote", "Item (searched on the server)",
                            "", noInline,
                            optionsUrl = "/aowlspt/settings/aowl.uihubscale/items",
