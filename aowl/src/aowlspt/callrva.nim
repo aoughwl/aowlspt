@@ -87,7 +87,6 @@ proc cCellF32(i, off: int32; ok: Il2CppPtr): float {.importc: "aowl_crva_cell_f3
 proc cCellI32(i, off: int32; ok: Il2CppPtr): int32 {.importc: "aowl_crva_cell_i32_w", nodecl.}
 proc cWriteF32(p: Il2CppPtr; off: int32; v: float) {.importc: "aowl_crva_w_f32", nodecl.}
 proc cFaultCount(): int32 {.importc: "aowl_crva_fault_count", nodecl.}
-proc cAggByPointer(size: int32): int32 {.importc: "aowl_crva_agg_by_pointer", nodecl.}
 
 # Small accessors the nimony side needs but that C expresses more honestly than
 # a mirrored struct layout would. Mirroring `AowlCrvaTarget` field-by-field in
@@ -150,6 +149,24 @@ static uint64_t aowl_crva_t_fn(void* p) { return (uint64_t)(uintptr_t)((AowlCrva
 static uint32_t aowl_crva_t_rva(void* p){ return ((AowlCrvaTarget*)p)->rva; }
 static int32_t  aowl_crva_t_siglen(void* p){ return ((AowlCrvaTarget*)p)->siglen; }
 
+/* `verified` and `why`, so `describe` can tell "not looked at yet" from
+ * "looked at and refused". Without these it printed `resolved=0x0 <not
+ * resolved>` for a target that verifies and calls perfectly a microsecond
+ * later, because the wiring line is printed BEFORE the first verify -- a
+ * diagnostic added to make a zeroed target unambiguous, being confidently
+ * wrong about a healthy one. */
+static int32_t  aowl_crva_t_verified(void* p){ return ((AowlCrvaTarget*)p)->verified; }
+static int32_t  aowl_crva_t_why(void* p){ return ((AowlCrvaTarget*)p)->why; }
+
+/* An 8-byte by-value aggregate, loaded as the packed value its register
+ * carries. Out-parameter through `void*` like every other one here. */
+static int32_t aowl_crva_agg8_w(const void* src, void* out) {
+    int64_t v = 0;
+    if (!aowl_crva_agg8(src, &v)) return 0;
+    if (out) *(int64_t*)out = v;
+    return 1;
+}
+
 /* The invoke wrapper: nimony cannot take the address of a local int64 and hand
  * it to C as `int64_t*` without a cast it refuses, so the out-parameters come
  * back through plain `void*` the same way every other out-parameter here does. */
@@ -174,13 +191,28 @@ proc cBaseU(): uint64 {.importc: "aowl_crva_base_u", nodecl.}
 proc cTargetFn(t: Il2CppPtr): uint64 {.importc: "aowl_crva_t_fn", nodecl.}
 proc cTargetRva(t: Il2CppPtr): uint32 {.importc: "aowl_crva_t_rva", nodecl.}
 proc cTargetSiglen(t: Il2CppPtr): int32 {.importc: "aowl_crva_t_siglen", nodecl.}
+proc cTargetVerified(t: Il2CppPtr): int32 {.importc: "aowl_crva_t_verified", nodecl.}
+proc cTargetWhy(t: Il2CppPtr): int32 {.importc: "aowl_crva_t_why", nodecl.}
+proc cAggClass(size: int32): int32 {.importc: "aowl_crva_agg_class", nodecl.}
+proc cAgg8(src: Il2CppPtr; outv: Il2CppPtr): int32 {.importc: "aowl_crva_agg8_w", nodecl.}
 
 const
-  MaxCallSlots* = 5
-    ## `this`/retbuf plus four arguments -- what Win64 passes in registers
-    ## before it starts using the stack, and exactly what `aowlspt_fast.h`
-    ## dispatches. A shape past this is refused, not spilled.
-  MaxArenaCells* = 8
+  MaxCallSlots* = 12
+    ## Total argument POSITIONS one call can have, counting an sret buffer,
+    ## `this`, every declared argument and the trailing `MethodInfo*`.
+    ##
+    ## It was 5 -- what Win64 passes in registers before it starts using the
+    ## stack -- and a wider shape was REFUSED rather than spilled, which
+    ## blocked every 8- and 9-slot method outright. `aowlspt_fast.h` now emits
+    ## the stack cases, so the cap is the table's width and not the register
+    ## file's. It must equal `AOWL_FAST_MAX_SLOTS`; `aowl_crva_invoke` checks
+    ## against the C constant, so a disagreement is a refusal and never a
+    ## truncated call.
+  RegisterSlots* = 4
+    ## Positions 0..3 get a register (RCX/RDX/R8/R9, or XMM0..3 for a float).
+    ## From position 4 up an argument is an 8-byte stack slot whatever its
+    ## type, which is why `mask` only ever describes the first four.
+  MaxArenaCells* = 16
   ArenaCellBytes* = 64
 
 # ---------------------------------------------------------------------------
@@ -222,9 +254,14 @@ type
     ## inferred: slot 0 is whatever the caller says slot 0 is -- `this` for an
     ## instance method, the hidden return buffer for an sret call, or the first
     ## argument for a plain static one.
-    slots*: array[5, uint64]
+    slots*: array[12, uint64]
     n*: int32
-    mask*: uint32       ## bit i set => slot i is a float, i.e. XMM_i
+    mask*: uint32
+      ## bit i set => slot i is a float, i.e. XMM_i. Only bits 0..3 mean
+      ## anything: a float in position 4 or beyond is an 8-byte stack slot
+      ## carrying the float bits in its low half, so there is no register
+      ## class left to choose. `AOWL_FAST_CODE` narrows the mask to four bits
+      ## for that reason, and `addFloat` stops setting bits past `RegisterSlots`.
     cells*: int32       ## arena cells consumed so far
     bad*: bool          ## a staging step refused; the call must not run
     badWhy*: string
@@ -318,11 +355,23 @@ proc describe*(t: var RvaTarget): string =
   let base = cBaseU()
   let rva = cTargetRva(p)
   let fn = cTargetFn(p)
+  # `resolved` has THREE readings and used to have one. A target that has not
+  # been verified yet has fn == 0 and is perfectly healthy -- which is the
+  # normal state of the wiring line, because it is printed BEFORE the first
+  # verify on purpose. Printing "<not resolved>" there was a diagnostic added
+  # to make a zeroed target unambiguous, being confidently wrong about a
+  # target whose very next call succeeded. Three outcomes, never two.
+  let resolved =
+    if fn != 0'u64: "0x" & hex64(fn)
+    elif cTargetVerified(p) == 0'i32:
+      "<NOT YET VERIFIED -- verify() has not run on this target; this is not a failure>"
+    else:
+      "<REFUSED: " & reasonOf(cTargetWhy(p)) & ">"
   result = "name=" & (if t.name.len == 0: "<EMPTY>" else: t.name) &
     " rva=0x" & hexRva(rva) &
     " siglen=" & $cTargetSiglen(p) &
     " base=0x" & (if base == 0'u64: "0 <GameAssembly.dll NOT LOADED>" else: hex64(base)) &
-    " resolved=0x" & (if fn == 0'u64: "0 <not resolved>" else: hex64(fn))
+    " resolved=" & resolved
 
 proc looksZeroed*(t: RvaTarget): bool =
   ## The signature of the nimony `--app:lib` module-scope trap: a global
@@ -367,7 +416,8 @@ proc faultCount*(): int32 =
 
 proc callArgs*(): CallArgs =
   result = CallArgs(n: 0'i32, mask: 0'u32, cells: 0'i32, bad: false, badWhy: "",
-                    slots: [0'u64, 0'u64, 0'u64, 0'u64, 0'u64])
+                    slots: [0'u64, 0'u64, 0'u64, 0'u64, 0'u64, 0'u64,
+                            0'u64, 0'u64, 0'u64, 0'u64, 0'u64, 0'u64])
 
 proc refuse(a: var CallArgs; why: string) =
   if not a.bad:
@@ -377,14 +427,14 @@ proc refuse(a: var CallArgs; why: string) =
 proc addPtr*(a: var CallArgs; p: Il2CppPtr) =
   ## A reference: an object, a string, an array, `this`. The pointer itself.
   if a.n >= int32(MaxCallSlots):
-    refuse(a, "more than " & $MaxCallSlots & " register slots"); return
+    refuse(a, "more than " & $MaxCallSlots & " argument slots"); return
   cSlotSetP(cast[Il2CppPtr](addr a.slots[0]), a.n, p)
   inc a.n
 
 proc addInt*(a: var CallArgs; v: int64) =
   ## Every integer, bool and enum: one general-purpose register.
   if a.n >= int32(MaxCallSlots):
-    refuse(a, "more than " & $MaxCallSlots & " register slots"); return
+    refuse(a, "more than " & $MaxCallSlots & " argument slots"); return
   cSlotSetG(cast[Il2CppPtr](addr a.slots[0]), a.n, v)
   inc a.n
 
@@ -397,9 +447,14 @@ proc addFloat*(a: var CallArgs; v: float) =
   ## slots 0 and 1 are consumed by pointers. Position picks the register; the
   ## other slots being integer-class does not shift it.
   if a.n >= int32(MaxCallSlots):
-    refuse(a, "more than " & $MaxCallSlots & " register slots"); return
+    refuse(a, "more than " & $MaxCallSlots & " argument slots"); return
   cSlotSetF(cast[Il2CppPtr](addr a.slots[0]), a.n, v)
-  a.mask = a.mask or (1'u32 shl uint32(a.n))
+  # Only the first four positions have a register class to choose. Past that
+  # the float travels as an 8-byte stack slot with its bits in the low half --
+  # `cSlotSetF` writes all eight bytes so the high half is defined -- and
+  # setting a mask bit there would describe a register that is not used.
+  if a.n < int32(RegisterSlots):
+    a.mask = a.mask or (1'u32 shl uint32(a.n))
   inc a.n
 
 proc addAggregate*(a: var CallArgs; src: Il2CppPtr; size: int32) =
@@ -411,19 +466,34 @@ proc addAggregate*(a: var CallArgs; src: Il2CppPtr; size: int32) =
   ## `Camera::WorldToScreenPoint@0x525F940` dereferences R8. This copies `size`
   ## bytes into an arena cell the call keeps alive and passes that cell.
   ##
-  ## REFUSES a size of exactly 1, 2, 4 or 8. That is the one case Win64 passes
-  ## in the register itself, no such argument has been measured on this build,
-  ## and the difference between the two conventions is a call with the
-  ## arguments in the wrong registers. Refusing names the unproven case;
-  ## choosing would produce a plausible wrong number.
+  ## An aggregate of EXACTLY 8 bytes goes the other way: packed INTO the
+  ## integer-class register, first field in the low half. That is measured, on
+  ## this build, from `Vector2::Dot@0x529BB60`, whose whole body spills RCX and
+  ## RDX to the stack and reads its four floats out of the spilled bytes --
+  ## it never dereferences either register. So this stages no arena cell for a
+  ## size of 8; it loads the eight bytes and passes them as the value.
+  ##
+  ## Sizes 1, 2 and 4 are STILL REFUSED. The ABI rule that covers 8 covers
+  ## them, and that extrapolation is exactly what left 8 filed as unknowable
+  ## for months while the answer sat in a callee we could already read.
+  ## Nothing needs them yet; whatever needs one first should measure it.
+  let klass = cAggClass(size)
+  if klass == 2'i32:                     # AOWL_CRVA_AGG_INREG
+    var packed = 0'i64
+    if cAgg8(src, cast[Il2CppPtr](addr packed)) == 0'i32:
+      refuse(a, "an 8-byte by-value aggregate whose source failed VirtualQuery")
+      return
+    addInt(a, packed)
+    return
+  if klass != 1'i32:                     # AOWL_CRVA_AGG_POINTER
+    refuse(a, "a " & $size & "-byte by-value aggregate: on Win64 a size of " &
+              "exactly 1, 2 or 4 passes IN the register rather than by " &
+              "pointer, and THAT size has not been measured on this build. " &
+              "(8 bytes has been, and is accepted.) Refusing rather than " &
+              "choosing one of two conventions.")
+    return
   if a.cells >= int32(MaxArenaCells):
     refuse(a, "more than " & $MaxArenaCells & " staged aggregates in one call"); return
-  if cAggByPointer(size) == 0'i32:
-    refuse(a, "a " & $size & "-byte by-value aggregate: on Win64 a size of " &
-              "exactly 1/2/4/8 passes IN the register rather than by pointer, " &
-              "and that case has NOT been measured on this build. Refusing " &
-              "rather than choosing one of two conventions.")
-    return
   let cell = cArgAgg(a.cells, src, size)
   if cell == nil:
     refuse(a, "staging a " & $size & "-byte aggregate: the source failed " &
@@ -447,6 +517,21 @@ proc addVec3*(a: var CallArgs; x, y, z: float) =
   cWriteF32(cell, 8'i32, z)
   inc a.cells
   addPtr(a, cell)
+
+proc addVec2*(a: var CallArgs; x, y: float) =
+  ## A by-value `UnityEngine.Vector2`. Eight bytes, so it travels PACKED IN the
+  ## register rather than by pointer, and no arena cell is consumed.
+  ##
+  ## Layout x@0 y@4 is not assumed -- it is read straight off
+  ## `Vector2::Dot@0x529BB60`, which multiplies the low half of RCX by the low
+  ## half of RDX and byte 4 of each by byte 4 of the other.
+  var bits = 0'i64
+  var buf: array[8, uint8] = [0'u8, 0'u8, 0'u8, 0'u8, 0'u8, 0'u8, 0'u8, 0'u8]
+  cWriteF32(cast[Il2CppPtr](addr buf[0]), 0'i32, x)
+  cWriteF32(cast[Il2CppPtr](addr buf[0]), 4'i32, y)
+  if cAgg8(cast[Il2CppPtr](addr buf[0]), cast[Il2CppPtr](addr bits)) == 0'i32:
+    refuse(a, "a Vector2 could not be packed"); return
+  addInt(a, bits)
 
 proc addOut*(a: var CallArgs; size: int32): int32 =
   ## An `out`/`ref` parameter: a zeroed arena cell the callee writes through.

@@ -90,15 +90,31 @@
  *   Vector3s in one call are therefore two pointer slots and need no new
  *   machinery at all -- only two buffers, which is what the arena below is.
  *
- * WHAT IS STILL ASSERTED, and therefore REFUSED
- * ---------------------------------------------
- * An aggregate of size EXACTLY 1, 2, 4 or 8 is the one case Win64 passes in
- * the register itself rather than by pointer. No such argument has been
- * measured on this build, so `aowl_crva_arg_agg` REFUSES a size in that set
- * rather than picking one of the two possible conventions. A refusal that
- * names the unproven case is the whole point; a call that "returned without
- * faulting" is not evidence, because a wrong convention returns plausible
- * garbage, and that is the class of bug that has cost this project the most.
+ * MEASURED SINCE: 8 BYTES GOES IN THE REGISTER
+ * --------------------------------------------
+ * The 1/2/4/8-byte case -- the one Win64 passes IN the register rather than by
+ * pointer -- used to be refused wholesale as unproven. The 8-byte half of it
+ * is now measured, from `UnityEngine.Vector2::Dot(Vector2,Vector2)`@0x529BB60,
+ * whose entire body spills RCX and RDX to the stack and reads the two floats
+ * out of the SPILLED BYTES without ever dereferencing either register. The
+ * bytes are quoted in full at `aowl_crva_agg_class` below, and the live check
+ * is `Dot((1,2),(3,4)) == 11.0` exactly.
+ *
+ * 1, 2 and 4 bytes stay REFUSED. The same ABI rule covers them, and that is
+ * precisely the extrapolation that had 8 bytes filed as unknowable while the
+ * answer sat in a callee we could already read. Nothing needs them yet;
+ * whatever needs one first should measure it, not inherit this sentence.
+ *
+ * MEASURED SINCE: THE STACK, NOT JUST THE REGISTERS
+ * -------------------------------------------------
+ * A call was capped at five slots and a wider shape was refused rather than
+ * spilled, which blocked every 8- and 9-slot method. `aowlspt_fast.h` now
+ * emits stack cases up to twelve slots. Shadow-space size, stack-slot stride
+ * and argument order were read off `UnityEngine.Matrix4x4::Ortho`@0x5294C30,
+ * which takes three of its six floats on the stack; see the header of
+ * `tools/gen_fast_table.py` for the three `movss` instructions that fix all
+ * three numbers. Nothing here writes assembly: every case is a C call through
+ * a full prototype, so the compiler owns alignment and cleanup.
  *
  * SAFETY
  * ======
@@ -145,13 +161,16 @@
 #define AOWL_CRVA_SIG_BYTES  16
 #define AOWL_CRVA_SNAP_ROWS  128
 
-/* Arena: fixed, thread-local, 16-byte aligned. Eight slots is comfortably more
- * than the widest call this dispatcher can make (five register slots, of which
- * at most four can be a buffer, plus a return buffer), and a request outside
- * the range returns NULL rather than wrapping onto another argument's storage.
- * 64 bytes per slot holds every aggregate we have measured -- Vector3 is 12,
- * the unboxed NavMeshHit payload is 36, a Matrix4x4 would be 64. */
-#define AOWL_CRVA_ARENA_SLOTS 8
+/* Arena: fixed, thread-local, 16-byte aligned. Sixteen cells is more than the
+ * widest call this dispatcher can make (twelve slots, of which at most eleven
+ * could be a buffer, plus a return buffer), and a request outside the range
+ * returns NULL rather than wrapping onto another argument's storage. It was
+ * eight when a call was capped at five slots; it moved with the cap, because
+ * an arena narrower than the slot count is a silent overlap of two arguments.
+ * 64 bytes per cell holds every aggregate we have measured -- Vector3 is 12,
+ * the unboxed NavMeshHit payload is 36, and Matrix4x4 is exactly 64 (measured:
+ * boxed m00@0x10 .. m33@0x4c, so a 64-byte unboxed payload). */
+#define AOWL_CRVA_ARENA_SLOTS 16
 #define AOWL_CRVA_ARENA_BYTES 64
 
 /* ------------------------------------------------------------------ *
@@ -411,19 +430,71 @@ static void* aowl_crva_cell_zero(int32_t i, int32_t nbytes) {
     return p;
 }
 
-/* Whether an aggregate of this size has a PROVEN convention on this build.
+/* How an aggregate of this size travels, on THIS build. Three answers, and
+ * the third is a refusal rather than a default.
  *
- * >8 bytes: measured by hidden pointer, three times over (see the header
- * comment). 3, 5, 6, 7 bytes: not a Win64 register size either, same rule,
- * but no such argument has been measured here -- they are permitted because
- * the ABI rule that covers 12 also covers them, and the header says so.
- * EXACTLY 1/2/4/8: Win64 passes the aggregate IN the register. That case has
- * NOT been measured on this build, and the difference between the two
- * conventions is a call with the arguments in the wrong registers, so it is
- * REFUSED rather than chosen. */
+ *   AGG_POINTER (>8 bytes)  -- measured by hidden pointer, three times over
+ *       (see the header comment). 3, 5, 6, 7 are also not register sizes and
+ *       take the same route; no such argument has been measured here, and the
+ *       header says so rather than implying it was.
+ *
+ *   AGG_INREG (exactly 8)   -- MEASURED, and it is the one that was refused
+ *       until now. `UnityEngine.Vector2::Dot(Vector2,Vector2) -> float`
+ *       @0x529BB60 is two 8-byte by-value aggregates and one owner, and its
+ *       whole body is:
+ *
+ *           48 83 EC 18        sub   rsp, 0x18
+ *           48 89 54 24 38     mov   [rsp+0x38], rdx    <- stores RDX AS A VALUE
+ *           48 89 0C 24        mov   [rsp+0x00], rcx    <- stores RCX AS A VALUE
+ *           F3 0F 10 44 24 3C  movss xmm0, [rsp+0x3c]   <- rhs.y, byte 4 OF THAT VALUE
+ *           F3 0F 10 4C 24 38  movss xmm1, [rsp+0x38]   <- rhs.x
+ *           F3 0F 59 44 24 04  mulss xmm0, [rsp+0x04]   <- lhs.y
+ *           F3 0F 59 0C 24     mulss xmm1, [rsp+0x00]   <- lhs.x
+ *           F3 0F 58 C1        addss xmm0, xmm1
+ *           48 83 C4 18 C3     add   rsp, 0x18 ; ret
+ *
+ *       It never DEREFERENCES RCX or RDX. It spills them and reads the float
+ *       fields out of the spilled bytes. So an 8-byte aggregate arrives packed
+ *       IN the integer-class register for its position, x in the low half.
+ *       That is the exact opposite of the >8 case and it is why guessing was
+ *       never acceptable. The live check is `checkVec2Dot` in
+ *       `aowl/src/aowlspt/callproof.nim`: Dot((1,2),(3,4)) must be exactly 11.
+ *
+ *   AGG_REFUSE (1, 2, 4)    -- still not measured on this build. The ABI rule
+ *       that covers 8 covers these too, but "the rule that covered 8 also
+ *       covers 4" is the kind of extrapolation that produced the wrong answer
+ *       for 8 in the first place, and nothing in this project needs them yet.
+ *       They stay refused, by name, until something measures one. */
+#define AOWL_CRVA_AGG_REFUSE  0
+#define AOWL_CRVA_AGG_POINTER 1
+#define AOWL_CRVA_AGG_INREG   2
+
+static int32_t aowl_crva_agg_class(int32_t size) {
+    if (size <= 0) return AOWL_CRVA_AGG_REFUSE;
+    if (size == 8) return AOWL_CRVA_AGG_INREG;
+    if (size == 1 || size == 2 || size == 4) return AOWL_CRVA_AGG_REFUSE;
+    return AOWL_CRVA_AGG_POINTER;
+}
+
+/* Kept as its own predicate because "does this go by pointer" and "is this
+ * allowed at all" are now two different questions and folding them was how the
+ * 8-byte case came to be described as unproven in one place and refused in
+ * another. */
 static int32_t aowl_crva_agg_by_pointer(int32_t size) {
-    if (size <= 0) return 0;
-    if (size == 1 || size == 2 || size == 4 || size == 8) return 0;
+    return aowl_crva_agg_class(size) == AOWL_CRVA_AGG_POINTER ? 1 : 0;
+}
+
+/* Load an 8-byte by-value aggregate as the packed value the register carries.
+ * No arena cell: the bytes ARE the argument, so there is nothing to keep alive
+ * across the call. Returns 0 and leaves `*out` untouched if the source is not
+ * readable -- `aowl_is_readable` on the source is the whole of rule 2 here,
+ * and it is not skipped just because eight bytes feels small. */
+static int32_t aowl_crva_agg8(const void* src, int64_t* out) {
+    int64_t v = 0;
+    if (!out) return 0;
+    if (!aowl_is_readable((void*)src, 8)) return 0;
+    memcpy(&v, src, 8);
+    *out = v;
     return 1;
 }
 
@@ -432,7 +503,11 @@ static int32_t aowl_crva_agg_by_pointer(int32_t size) {
  * build has not proved, or when the source is unreadable. */
 static void* aowl_crva_arg_agg(int32_t i, const void* src, int32_t size) {
     void* p;
-    if (!aowl_crva_agg_by_pointer(size)) return 0;   /* unproven: refuse */
+    /* Only the by-POINTER class stages a cell. An 8-byte aggregate has a
+     * proven convention but it is not this one, so it is still NULL here and
+     * the nimony side routes it to `aowl_crva_agg8` instead -- refusing here
+     * would now be wrong, and quietly staging a cell for it would be worse. */
+    if (aowl_crva_agg_class(size) != AOWL_CRVA_AGG_POINTER) return 0;
     if (size > AOWL_CRVA_ARENA_BYTES) return 0;
     if (!aowl_is_readable((void*)src, size)) return 0;
     p = aowl_crva_cell_zero(i, size);
