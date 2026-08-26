@@ -40,6 +40,7 @@ import aowlspt/json
 import aowlspt/menutext # the main menu's bottom-right corner label
 import emu/ids
 import emu/profile
+import emu/starterkit
 import emu/sessions
 import emu/templates
 import emu/traders
@@ -910,6 +911,11 @@ proc onLauncherCreate(url, body, session: string): string =
     sideName = gDefaultSide
   if edition.len == 0:
     edition = gEdition
+  let canonEdition = normalEdition(edition)
+  if canonEdition.len == 0:
+    return launcherRefusal("this server does not have a starting profile for " &
+                           "edition '" & edition & "'")
+  edition = canonEdition
   var p = createProfile(nickname, sideName, edition, nowSeconds(),
                         gStartingRoubles)
   if not p.ok:
@@ -2922,10 +2928,17 @@ proc tarkovSchema(): seq[Setting] =
     # database keeps in `globals.config`. Each names the one function it
     # reaches, and each of those functions is the ONLY place its number is
     # produced, which is what keeps the row from becoming decorative.
-    boolSetting("traderUnlockAllOffers", "Unlock every trader offer", true,
+    # OFF by default since the beta. It shipped `true`, which meant every
+    # trader's whole stock was buyable at level 1 -- Prapor's 422
+    # `loyal_level_items` entries were rewritten to 1 on the way out -- so the
+    # honest answer to "are items gated by loyalty and quests" was "no". The
+    # sandbox behaviour is still one switch away; it is just no longer the
+    # thing a stranger gets without asking.
+    boolSetting("traderUnlockAllOffers", "Unlock every trader offer", false,
                 category = "Traders",
                 description = "Sell every trader's whole stock from loyalty " &
-                              "level 1 (emu/traders.traderAssort)"),
+                              "level 1, ignoring loyalty and quest gating " &
+                              "(emu/traders.traderAssort). Off by default."),
     floatSetting("traderPriceMultiplier", "Trader price multiplier", 1.0,
                  lo = 0.0, hi = 10.0, step = 0.05, category = "Traders",
                  description = "Scales every barter-scheme count, in BOTH " &
@@ -3107,7 +3120,16 @@ proc onLoad(): Status =
   # Decode the placeholder image once, before any route can be asked for it.
   gFilesPng = decodeHex(PlaceholderPngHex)
 
-  gEdition = setting("edition").asText("standard")
+  # The edition is normalised here and NOWHERE else. The settings page spells
+  # it with hyphens, the launcher and `Info.GameVersion` with underscores; an
+  # edition this server cannot build a starting kit for is refused at create
+  # rather than quietly downgraded to standard.
+  let wantEdition = setting("edition").asText("standard")
+  gEdition = normalEdition(wantEdition)
+  if gEdition.len == 0:
+    warn "edition '" & wantEdition & "' is not one this server knows; new " &
+         "profiles will be standard"
+    gEdition = "standard"
   gDefaultSide = setting("defaultSide").asText("Usec")
   gNowSeconds = setting("epochBase").asInt(1700000000)
   gStartingRoubles = setting("startingRoubles").asInt(500000)
@@ -3129,7 +3151,7 @@ proc onLoad(): Status =
                 setting("mailKeepCollected").asInt(1))
   # The five server-side modifiers above, each handed to the module that owns
   # the number. Read here, at load, like every other key on this page.
-  configureTraders(setting("traderUnlockAllOffers").asBool(true),
+  configureTraders(setting("traderUnlockAllOffers").asBool(false),
                    setting("traderPriceMultiplier").asFloat(1.0))
   configureHideoutTimes(
     setting("hideoutConstructionMultiplier").asFloat(1.0))

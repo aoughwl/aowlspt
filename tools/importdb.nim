@@ -66,8 +66,8 @@ importdb -- build the emulator's db.json from an SPT installation
                    Default: <repo>\build\db\db.json
   --only LIST      comma-separated sections, instead of the default set:
                      items handbook quests repeatable customization
-                     achievements prestige globals settings locales traders
-                     hideout locations bots
+                     achievements prestige profiles globals settings locales
+                     traders hideout locations bots
   --skip LIST      sections to leave out of the default set
   --maps LIST      which locations to import (default: all)
   --loose LIST     maps whose looseLoot to include: none (default), all, or a
@@ -482,9 +482,9 @@ var gRepeatableConfig = ""
 # ---------------------------------------------------------------------------
 
 const AllSections = ["items", "handbook", "quests", "repeatable",
-                     "customization", "achievements", "prestige", "globals",
-                     "settings", "locales", "traders", "hideout", "locations",
-                     "bots"]
+                     "customization", "achievements", "prestige", "profiles",
+                     "globals", "settings", "locales", "traders", "hideout",
+                     "locations", "bots"]
 
 proc byName(a, b: string): int =
   ## nimony's `sort` wants an explicit comparator. Ordering the walk's output
@@ -620,7 +620,8 @@ proc reportRefs(what: string; total, missing: int; sample: string;
 const ReadPath = [
   "templates.items", "templates.handbook.Items", "templates.handbook.Categories",
   "templates.quests", "templates.customization", "templates.achievements",
-  "templates.prestige", "templates.repeatableQuests.templates",
+  "templates.prestige", "templates.profiles",
+  "templates.repeatableQuests.templates",
   "templates.repeatableQuests.data", "configs.quest.repeatableQuests",
   "globals.ItemPresets", "globals.config.Health", "globals.config.RagFair",
   "globals.config.RepairSettings", "globals.config.Mastering",
@@ -633,7 +634,7 @@ const ReadPath = [
 const ReadSection = [
   "items", "handbook", "handbook",
   "quests", "customization", "achievements",
-  "prestige", "repeatable",
+  "prestige", "profiles", "repeatable",
   "repeatable", "repeatable",
   "globals", "globals", "globals",
   "globals", "globals",
@@ -647,7 +648,7 @@ const ReadBy = [
   "emu/templates, emu/bots, emu/grid", "emu/market, emu/production, emu/templates",
   "emu/market",
   "emu/quests", "emu/customise", "emu/achievements",
-  "tarkov.onPrestigeList", "emu/repeatable",
+  "tarkov.onPrestigeList", "emu/profile", "emu/repeatable",
   "emu/repeatable", "emu/repeatable",
   "emu/loot", "emu/health", "emu/market",
   "emu/repair", "emu/skills",
@@ -1172,7 +1173,8 @@ proc main(): int =
                       contains(want, "repeatable") or
                       contains(want, "customization") or
                       contains(want, "achievements") or
-                      contains(want, "prestige")
+                      contains(want, "prestige") or
+                      contains(want, "profiles")
   if wantTemplates:
     addKey(o, first, "templates")
     o.add "{"
@@ -1233,6 +1235,38 @@ proc main(): int =
       if text.len > 0:
         addMember(o, tf, "achievements", text)
         line "  achievements    " & $arrayItems(text).len
+    if contains(want, "profiles"):
+      # `templates/profiles.json` -- the STARTING PROFILE per edition, per side.
+      #
+      # This is the table that decides what a new player spawns owning. Each
+      # edition (`Standard`, `Edge Of Darkness`, ...) carries a `usec` and a
+      # `bear` branch, and each of those a `character` (the profile document
+      # BSG's own server hands back, with 205 inventory items for Standard usec
+      # and 337 for Edge Of Darkness) plus a `trader` block holding
+      # `initialLoyaltyLevel`, `initialStanding`, `jaegerUnlocked` and
+      # `lockedByDefaultOverride`.
+      #
+      # Spliced verbatim, keyed by SPT's own display names, because `emu/profile`
+      # resolves an edition by matching `character.Info.GameVersion` rather than
+      # by the display name -- reshaping the keys here would put a second
+      # spelling of the edition list in a second place.
+      #
+      # Without this section a fresh profile has no gear at all: `emu/profile`
+      # falls back to five containers and a money stack, and says so loudly.
+      let text = loadJson(joinPath(db, "templates\\profiles.json"), pretty)
+      if text.len > 0:
+        addMember(o, tf, "profiles", text)
+        let editions = objectKeys(text)
+        var withGear = 0
+        for e in editions:
+          let ch = memberRaw(memberRaw(memberRaw(text, e), "usec"), "character")
+          if arrayItems(memberRaw(memberRaw(ch, "Inventory"), "items")).len > 0:
+            inc withGear
+        line "  profiles        " & $editions.len & " edition(s), " &
+             $withGear & " with starting gear, " & mib(text.len)
+      else:
+        warn "no templates\\profiles.json -- every new profile will start " &
+             "with no gear"
     if contains(want, "prestige"):
       # SPT's file is `{elements:[...]}`; `onPrestigeList` wraps whatever it
       # finds in `{elements: ...}` itself, so what goes in the database is the

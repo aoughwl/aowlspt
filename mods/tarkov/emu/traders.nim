@@ -93,12 +93,17 @@ proc stampRequirementTypes*(barterRaw: string): string =
     put(o, offerId, armsArr)
   result = done(o).text
 
-var gUnlockAllOffers* = true
-  ## Sell a trader's whole stock from loyalty level 1. This is a sandbox server;
-  ## the user wants everything unlocked. Set `traderUnlockAllOffers` to false on
-  ## the settings page to restore real loyalty gating. It was a `const`, which
-  ## made it the one sandbox decision in this module nobody could change without
-  ## a rebuild.
+var gUnlockAllOffers* = false
+  ## Sell a trader's whole stock from loyalty level 1.
+  ##
+  ## **Off.** It was `true`, and the effect was not subtle: `allLoyaltyOne`
+  ## rewrote every value in `loyal_level_items` to 1, so Prapor's 422 gated
+  ## entries and Jaeger's were all buyable at level 1 with nothing done. A
+  ## player asking "is anything unlocked by quests here" got "no" without ever
+  ## being told a switch had been flipped for them.
+  ##
+  ## Set `traderUnlockAllOffers` on the settings page to get the sandbox back.
+  ## The default is the honest one; the shortcut is opt-in.
 
 var gTraderPriceMultiplier = 1.0
   ## What every trader cost is multiplied by.
@@ -169,23 +174,11 @@ proc traderAssort*(id: string; resupplyAt: int): string =
 proc traderExists*(id: string): bool =
   result = traderBase(id).len > 0
 
-proc newTradersInfo*(): string =
-  ## What a fresh profile knows about each trader: nothing bought, nothing
-  ## unlocked, standing at zero. Built from whatever traders the database has,
-  ## so a profile created on a server with no traders does not carry entries for
-  ## traders that do not exist.
-  var o = obj()
-  let ids = traderIds()
-  for id in ids:
-    var t = obj()
-    put(t, "loyaltyLevel", 1)
-    put(t, "salesSum", 0)
-    put(t, "standing", 0.0)
-    put(t, "nextResupply", 0)
-    put(t, "unlocked", true)
-    put(t, "disabled", false)
-    put(o, id, t)
-  result = done(o).text
+# `newTradersInfo` used to live here and had zero callers, while
+# `emu/profile` wrote `TradersInfo: {}` on every new profile. It is now
+# `seedTradersInfo` in `emu/starterkit`, which is where the edition's
+# `initialLoyaltyLevel` / `initialStanding` / `jaegerUnlocked` /
+# `lockedByDefaultOverride` block is read -- and it is CALLED.
 
 # ---------------------------------------------------------------------------
 # The player's standing with a trader
