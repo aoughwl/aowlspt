@@ -2287,6 +2287,13 @@ proc hostEmit(name, payload: string) =
 # string compares against a false flag.
 
 const
+  SbIndexQuery* = "aowlspt.settings.indexQuery"
+    ## The QUERY a mod subscribes to (`aowl/src/aowlspt/settings.nim` line 258,
+    ## `discard on(SettingsIndexQuery, onIndexQuery)`). `sbCollect` used to
+    ## broadcast `SbIndexAnnounce` -- the REPLY name -- which nothing is
+    ## subscribed to, so every round collected zero mods and the bridge had
+    ## nothing to push. Page/apply were already correct; only this one was
+    ## swapped.
   SbIndexAnnounce* = "aowlspt.settings.indexAnnounce"
   SbPageQuery* = "aowlspt.settings.pageQuery"
   SbPageAnnounce* = "aowlspt.settings.pageAnnounce"

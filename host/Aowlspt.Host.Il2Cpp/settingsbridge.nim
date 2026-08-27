@@ -81,6 +81,21 @@ proc sbFault(why: string) =
          $cSbMaxFaults & " faults; client-side mods will not appear in the " &
          "F12 settings nav until the game is restarted"
 
+var gSbSaid = ""
+var gSbSaidAt = 0'u64
+
+proc sbSay(now: uint64; what: string) =
+  ## THE ANTI-SILENCE RULE (CLAUDE.md 6). Every terminating branch of `sbTick`
+  ## ends here, so "the bridge did nothing" is never a state you have to infer
+  ## from an absent line. Says it the first time and on every CHANGE, and
+  ## re-states an unchanged condition once a minute so a log opened late still
+  ## carries the reason. Not per tick: that would bury the log.
+  if what == gSbSaid and gSbSaidAt > 0'u64 and now - gSbSaidAt < 60000'u64:
+    return
+  gSbSaid = what
+  gSbSaidAt = now
+  okLog "client settings bridge: " & what
+
 proc sbParseInt(s: string): int =
   ## Digits only, no sign: every field this reads is a non-negative count that
   ## the SDK wrote. A non-numeric field yields 0 rather than a guess.
@@ -111,7 +126,7 @@ proc sbCollect() =
   gSbMods = @[]
   gSbIndex = @[]
   gSbCollecting = true
-  hostEmit(SbIndexAnnounce, "")
+  hostEmit(SbIndexQuery, "")
   var announced = gSbIndex
   gSbIndex = @[]
   for a in announced:
@@ -188,9 +203,19 @@ proc sbApplyPending(reply: string) =
 proc sbTick(now: uint64) =
   ## One bounded step per host tick. Never loops on the network and never
   ## blocks: it either arms a POST or reads one that already landed.
-  if not gSbOn or gSbOff:
+  if gSbOff:
+    return
+  if not gSbOn:
+    sbSay(now, "OFF -- gSbOn is false; no client-side mod page will be published")
     return
   if gSyncMs <= 0:
+    # NO POST CHANNEL. `gSyncMs` is only set when `aowlspt-host.json` has a
+    # `backendPort` AND a non-zero `modSyncMs`; without it the overlay worker
+    # has no backend to POST to. This was one of the four candidate causes and
+    # it used to return in total silence.
+    sbSay(now, "no backend channel (gSyncMs is 0 -- backendPort missing or " &
+               "modSyncMs is 0 in aowlspt-host.json), so no client-side " &
+               "settings page can be pushed")
     return
   case gSbPhase
   of SbPhase.sbIdle:
@@ -202,16 +227,20 @@ proc sbTick(now: uint64) =
       # Not a fault. A host with no client-side mod that declares settings is
       # the normal case on a bare install, and saying "0 mods" every five
       # seconds would bury the log.
-      if gSbCycles == 1:
-        okLog "client settings bridge: no client-side mod has declared " &
-              "settings in this process; nothing to publish"
+      # Not a fault -- a bare install has no client-side mod with settings.
+      # But it MUST keep saying so: the old code said it only on cycle 1, which
+      # is the tick right after host start, BEFORE the mods have loaded, so the
+      # one honest line was also the least informative one and nothing was ever
+      # printed again.
+      sbSay(now, "0 client-side mods answered " & SbIndexQuery &
+                 " (cycle " & $gSbCycles & "); nothing to publish")
       return
     gSbPhase = SbPhase.sbPushing
     gSbLastPushed = 0
   of SbPhase.sbPushing:
     if gSbIdx >= gSbMods.len:
-      okLog "client settings bridge: published " & $gSbLastPushed & " of " &
-            $gSbMods.len & " client-side settings page(s) to the backend"
+      sbSay(now, "published " & $gSbLastPushed & " of " & $gSbMods.len &
+                 " client-side settings page(s) to the backend")
       gSbPhase = SbPhase.sbIdle
       return
     if overlayPostPending():
