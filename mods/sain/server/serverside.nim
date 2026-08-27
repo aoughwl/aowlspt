@@ -33,6 +33,7 @@ import aowlspt/server
 import aowlspt/json
 import ".." / core / types
 import ".." / preset / preset
+import "." / drive
 
 var gPreset: Preset
 
@@ -308,6 +309,11 @@ proc onStatus(url, body, session: string): string =
   # up here once it has announced itself, so the number answers "did SAIN reach
   # every map on this install" instead of "did SAIN run".
   put(o, "mapsNeutralised", neutralisedCount())
+  # What the drive path is doing, and its PASS/FAIL/INCONCLUSIVE verdict on the
+  # live census. Served rather than only logged so the two-band comparison in
+  # README.md can be run with curl instead of by reading a log.
+  put(o, "drive", driveState())
+  put(o, "driveCheck", driveCheck())
   var maps = arr()
   var i = 0
   while i < neutralisedCount():
@@ -348,6 +354,19 @@ proc startServer*(p: Preset) =
     # the maps that exist at this instant, and which maps those are is decided
     # by a directory walk. See the block comment above.
     watchForNewLocations()
+  # The one path in this mod that reaches a bot. It resolves no name and binds
+  # no RVA: it rides `aowlspt/botnav`, whose host side is the already
+  # byte-verified kind=15 detour on `EFT.BotOwner::UpdateManual`. See
+  # `server/drive.nim` for why that is the whole of the reach, and for the
+  # arming gate (the first census, not `whenReady`).
+  startDrive(p.difficulty, p.logDecisions)
   discard serve("/sain/status", onStatus)
   discard serve("/sain/preset", onPreset)
   success "sain: server half ready"
+
+proc stopServer*() =
+  ## Hand every bot back to its own brain. A mod that unloads mid-raid must not
+  ## leave a squad running at a MoveSpeed nobody set for the rest of the
+  ## session -- that is the exact shape of a change that outlives the thing
+  ## that made it.
+  stopDrive()
