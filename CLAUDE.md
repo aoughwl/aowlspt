@@ -254,9 +254,35 @@ line. Marker list is data in `tools/deploy.json`; **never edit it to make a chec
 
 ## 5. IL2CPP facts
 
-Reflection is **dead** (`il2cpp_object_get_class`, `il2cpp_class_get_name`,
-`il2cpp_value_box`, field iteration all fault). Only raw static-offset field read/write,
-direct calls at static RVA, and `il2cpp_string_new` work. Convention: instance
+Reflection is **NOT dead** -- it is **token-gated**, and the old wording in this file
+was wrong about the mechanism for months. Measured 2026-08-26 by offline disassembly
+(`docs/IL2CPP_EXPORTS.md`): this is **stock IL2CPP with a gated export ABI**. 38 of the
+241 `il2cpp_*` exports take an **extra trailing argument we never passed** -- a pointer
+to 32 bytes -- and `memcmp` it before doing any work. On mismatch they do not return
+NULL and do not abort: they tail-call a trap that lazily seeds a per-thread
+**MT19937-64** and returns a **uniform random non-zero uint64**. THAT is why a nil check
+passes and the first dereference kills the client. It was never poisoned metadata; it
+was a random number. 20 gates are STATIC (expected bytes are a constant in `.rdata`, all
+extracted) and 18 are NONCE-derived via the exported, non-stock `il2cpp_nonce(apiId)`.
+
+Two corrections that follow, because both were stated here as fact and are false:
+`il2cpp_object_get_class` does **not** fault -- it is literally `mov rax,[rcx]; ret`, one
+of 33 three-instruction accessors that validate nothing, so a bad pointer yields a
+*plausible number* silently, which is worse. `il2cpp_value_box` is likewise intact and
+ungated. **Nothing a mod needs is stubbed**: 386 exports, all in `.text`, no forwarders,
+none at the universal stub; the 9 `ret0` exports are ordinary release no-ops
+(debugger/profiler/android/thread-affinity).
+
+**None of this changes what you should DO today.** Keep using raw static-offset field
+read/write, direct calls at byte-verified static RVA, and `il2cpp_string_new` -- a direct
+RVA call bypasses the export ABI entirely and is unaffected by any gate. What changes is
+the *reason*: never write "reflection is dead" into a comment, a doc or a refusal
+message again. Say the export is token-gated and its failure mode is a plausible random
+value. Runtime managed **type injection is PLAUSIBLE, not blocked** -- every
+injector-relevant export (`object_new`, `gc_alloc_fixed`, `gchandle_*`,
+`runtime_class_init`, `runtime_invoke`, `add_internal_call`, `type_get_object`) is
+ungated -- but nothing about constructing a valid `Il2CppClass` has been checked, so
+"plausible" means the export surface does not block it, not that it works. Convention: instance
 `RCX=this, RDX/R8/R9=args`, then a **hidden trailing `const MethodInfo*`**; NULL is fine
 except for shared generics. Imagebase `0x180000000`; generated code lives in the
 **`il2cpp` PE section, not `.text`**. Offsets come from `Il2CppMetadataRegistration.fieldOffsets`

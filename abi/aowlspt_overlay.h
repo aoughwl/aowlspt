@@ -114,6 +114,7 @@
 
 #include "aowlspt_detour.h"
 #include "aowlspt_admin.h"   /* the admin/cheat HUD's shared-memory surface */
+#include "aowlspt_region.h"  /* the SHARED per-frame region: every mod's draw */
 
 /* The admin/cheat HUD's shared region, mapped in `aowl_ov_start`. NULL until
  * then, and NULL forever if the OS refuses the mapping -- in which case every
@@ -689,8 +690,18 @@ typedef enum AowlOvFilter {
  * a NOT-IMPL badge and cannot be changed, because nothing behind it would act on
  * the change yet. That honesty is a hard requirement, not a nicety. */
 
+/* The worker's one HTTP body buffer. Sized off the largest body any route this
+ * panel fetches actually produces, with room to grow: 283,798 bytes measured
+ * today for `aowl.tarkov`'s 802-row schema, so 1 MiB is a little over 3x. It is
+ * `static` inside the worker rather than on its stack -- a megabyte on a thread
+ * stack is not affordable, a megabyte in `.bss` is. A body that STILL does not
+ * fit now says so (`lastTrunc`) instead of being reported as a bad schema. */
+#define AOWL_OV_HTTP_BUF     1048576
+
 #define AOWL_OV_MAX_SPAGES   48    /* mod pages + 28 SPT pages + margin */
-#define AOWL_OV_MAX_SITEMS   420   /* controls on the one loaded page   */
+#define AOWL_OV_MAX_SITEMS   1200  /* controls on the one loaded page   */
+#define AOWL_OV_MAX_SCATS    96    /* distinct categories on that page  */
+#define AOWL_OV_MAX_NAV      (AOWL_OV_MAX_SPAGES + AOWL_OV_MAX_SCATS)
 #define AOWL_OV_SOPT_MAX     10    /* enum choices kept per control     */
 
 typedef enum AowlOvSKind {
@@ -729,9 +740,20 @@ typedef struct AowlOvSItem {
     char    opts[AOWL_OV_SOPT_MAX][28];
     int32_t optCount;
     char    category[64];
+    char    subcat[64];
     char    desc[192];
     int32_t implemented;
 } AowlOvSItem;
+
+/* One second-level tab on the loaded page. `items` is SORTED by category (see
+ * `aowl_ov_sort_items`), so a category is a contiguous half-open range and a
+ * sub-tab is a filter that costs two integers rather than an index table --
+ * which is why `selItem`/`editItem`/`dragItem` stay item indices and every edit
+ * path below is untouched by this. */
+typedef struct AowlOvSCat {
+    char    label[64];
+    int32_t lo, hi;      /* [lo,hi) into items */
+} AowlOvSCat;
 
 typedef struct AowlOvState {
     /* --- lifecycle --- */
@@ -806,11 +828,31 @@ typedef struct AowlOvState {
     AowlOvSPage      sptPages[AOWL_OV_MAX_SPAGES]; /* the SPT half, as the hub gave it */
     int32_t          sptPageCount;
     int32_t          sptGot;        /* the SPT index has answered at least once */
+    /* The settings INDEX -- `GET /aowlspt/settings/index`, one entry per mod
+     * that has actually called `declareSettings`. This, and not the mod
+     * roster, is what the nav is built from: the roster lists everything the
+     * registry knows about, including the manager, the settings hub itself and
+     * the fallback UI, none of which a player can configure and all of which
+     * used to occupy a page that then failed to load. The filter is structural
+     * -- "did this mod publish a schema" -- not a list of names to hide. */
+    AowlOvSPage      idxMods[AOWL_OV_MAX_SPAGES];
+    int32_t          idxModCount;
+    int32_t          idxGot;        /* the index has answered at least once */
+    char             idxWhy[192];   /* why it has not, when it has not */
     AowlOvSItem      items[AOWL_OV_MAX_SITEMS];    /* the one loaded page's controls */
     int32_t          itemCount;
     char             itemsPage[80]; /* which page id `items` holds ("" = none)   */
+    volatile LONG    lastTrunc;     /* nonzero: the last body did not fit, in bytes */
     int32_t          itemsErr;      /* the last page fetch failed */
+    /* WHY the last page fetch failed, in the words the player needs. Empty when
+     * `itemsErr` is 0. A body that was too big for the worker buffer used to be
+     * indistinguishable here from a 404 and from a mod that is not loaded, and
+     * all three read as "the mod may not be loaded" -- which sent one session
+     * looking at the registry for a fault that was a 32 KB buffer. */
+    char             itemsWhy[192];
     int32_t          itemsImpl;     /* implemented count on the loaded page */
+    AowlOvSCat       cats[AOWL_OV_MAX_SCATS];
+    int32_t          catCount;
 
     /* The wrapper scalars every reply carries, kept because the panel is
      * required to show what the backend said rather than a paraphrase. */
@@ -921,6 +963,10 @@ typedef struct AowlOvState {
     AowlOvSPage  sPages[AOWL_OV_MAX_SPAGES];
     int32_t      sPageCount;
     AowlOvSItem  sItems[AOWL_OV_MAX_SITEMS];
+    AowlOvSCat   sCats[AOWL_OV_MAX_SCATS];
+    int32_t      sCatCount;
+    char         sItemsWhy[192];
+    char         sIdxWhy[192];
     int32_t      sItemCount;
     char         sItemsPage[80];
     int32_t      sItemsErr, sItemsImpl;
@@ -932,6 +978,17 @@ typedef struct AowlOvState {
     /* --- settings mode, render side --- */
     int32_t settings;          /* 0 = mod manager, 1 = the settings screen */
     int32_t selPage, topPage;  /* the nav cursor and its scroll             */
+    /* The second-level nav. `selCat` is an index into `sCats` and -1 means
+     * "the whole page", which is what a page with fewer than two categories
+     * always shows. It is reset whenever the loaded page changes, because a
+     * category index means nothing across pages. */
+    int32_t selCat;
+    /* The bounds the LAST frame actually drew. The keyboard handler runs on the
+     * same thread as the draw and must move the cursor inside the same range
+     * the player can see -- two independent computations of "which rows are on
+     * screen" is exactly how a cursor ends up selecting a row that is not
+     * there. Written by the draw, read by the key handler. */
+    int32_t viewLo, viewHi;
     int32_t selItem, topItem;  /* the control cursor and its scroll         */
     char    curPage[80];       /* the page id the render thread wants loaded */
     int32_t curPageIsMod;
@@ -1298,10 +1355,19 @@ static int32_t aowl_ov_http(const wchar_t* verb, const wchar_t* path,
     if (!g_wh.recv(r, NULL)) goto done;
 
     total = 0;
+    InterlockedExchange(&g_ov.lastTrunc, 0);
     for (;;) {
         DWORD avail = 0;
         if (!g_wh.avail(r, &avail) || avail == 0) break;
-        if (total >= cap - 1) break;
+        /* Out of room. Recorded, not swallowed: the caller gets a body that is
+         * a PREFIX of valid JSON, which every reader below correctly rejects as
+         * "not a schema" -- and for two builds that rejection was the only
+         * symptom a 283,798-byte page had. `lastTrunc` is what lets the panel
+         * say the size instead of guessing at the cause. */
+        if (total >= cap - 1) {
+            InterlockedExchange(&g_ov.lastTrunc, (LONG)cap);
+            break;
+        }
         DWORD want = avail;
         if (want > (DWORD)(cap - 1 - total)) want = (DWORD)(cap - 1 - total);
         DWORD got = 0;
@@ -2081,10 +2147,62 @@ static int32_t aowl_ov_read_one_item(const char* it, const char* end,
             aowl_ov_jtext(o, end, si->opts[si->optCount++], 28);
     }
     aowl_ov_jput(it, end, "category", si->category, (int32_t)sizeof(si->category));
+    /* Optional and emitted only when a mod sets it (`aowl/src/aowlspt/settings.nim`
+     * `toJson`), so its absence is normal and must not read as an empty group. */
+    aowl_ov_jput(it, end, "subcategory", si->subcat, (int32_t)sizeof(si->subcat));
     aowl_ov_jput(it, end, "description", si->desc, (int32_t)sizeof(si->desc));
     v = aowl_ov_jmem(it, end, "implemented");
     if (v) si->implemented = aowl_ov_jbool(v, end, 1);
     return 1;
+}
+
+/* Order `items` by (category, subcategory), preserving declaration order inside
+ * a subcategory. An insertion sort: bounded, in place, no allocation, and at
+ * AOWL_OV_MAX_SITEMS rows the worst case is a few million byte compares on a
+ * worker thread once per page load -- not on the render thread and not per
+ * frame. The sort is what makes a category a CONTIGUOUS range, which is the
+ * whole reason the sub-tab filter below can be two integers. Called under `cs`. */
+static int32_t aowl_ov_scmp(const AowlOvSItem* a, const AowlOvSItem* b) {
+    int32_t c = strcmp(a->category, b->category);
+    if (c) return c;
+    return strcmp(a->subcat, b->subcat);
+}
+
+static void aowl_ov_sort_items(void) {
+    int32_t i, j;
+    static AowlOvSItem tmp;   /* 1 KB; the worker's own, never re-entered */
+    for (i = 1; i < g_ov.itemCount; i++) {
+        tmp = g_ov.items[i];
+        for (j = i - 1; j >= 0 && aowl_ov_scmp(&g_ov.items[j], &tmp) > 0; j--)
+            g_ov.items[j + 1] = g_ov.items[j];
+        g_ov.items[j + 1] = tmp;
+    }
+}
+
+/* The second-level tabs: one per distinct `category`, in the sorted order, each
+ * holding the half-open range of rows that carry it. A page whose rows all
+ * share one category (or carry none) produces one entry, and the nav below
+ * draws no sub-tabs for it -- hierarchy appears only where there is some.
+ * Called under `cs`. */
+static void aowl_ov_build_cats(void) {
+    int32_t i;
+    g_ov.catCount = 0;
+    for (i = 0; i < g_ov.itemCount; i++) {
+        AowlOvSCat* C = (g_ov.catCount > 0) ? &g_ov.cats[g_ov.catCount - 1] : NULL;
+        if (C && strcmp(C->label, g_ov.items[i].category) == 0) { C->hi = i + 1; continue; }
+        if (g_ov.catCount >= AOWL_OV_MAX_SCATS) {
+            /* Out of tabs: the rest of the page joins the last one rather than
+             * disappearing. A row that exists and is unreachable is the failure
+             * this branch exists to not have. */
+            if (C) C->hi = g_ov.itemCount;
+            return;
+        }
+        C = &g_ov.cats[g_ov.catCount++];
+        memset(C, 0, sizeof(*C));
+        aowl_ov_copy(C->label, (int32_t)sizeof(C->label),
+                     g_ov.items[i].category[0] ? g_ov.items[i].category : "General");
+        C->lo = i; C->hi = i + 1;
+    }
 }
 
 /* Fill `items` from a page body -- a bare array (a mod's schema) or an object
@@ -2133,6 +2251,8 @@ static void aowl_ov_read_items(const char* body, int32_t len) {
             g_ov.itemCount++;
         }
     }
+    aowl_ov_sort_items();
+    aowl_ov_build_cats();
 }
 
 /* The SPT page index: `{"pages":[{"id","label","count","done"}...]}`. Called
@@ -2158,19 +2278,48 @@ static void aowl_ov_read_spt_index(const char* body, int32_t len) {
     g_ov.sptGot = 1;
 }
 
-/* Merge the nav: one page per loaded mod (its guid is its fetch key), then the
- * SPT pages the hub described. Called under `cs` whenever either half moves. */
+/* The settings index: `{"mods":[{"guid","name","count"}...]}`. Called under
+ * `cs`. Every entry here is a mod that answered the index broadcast, which is
+ * to say a mod that declared at least one setting -- see `onIndexQuery` in
+ * `aowl/src/aowlspt/settings.nim`, which only subscribes when `declareSettings`
+ * was called with a non-empty list. */
+static void aowl_ov_read_settings_index(const char* body, int32_t len) {
+    const char* end = body + len;
+    const char* m = aowl_ov_jmem(body, end, "mods");
+    m = m ? aowl_ov_jarr(m, end) : NULL;
+    g_ov.idxModCount = 0;
+    for (; m && g_ov.idxModCount < AOWL_OV_MAX_SPAGES; m = aowl_ov_jnext(m, end)) {
+        AowlOvSPage* P = &g_ov.idxMods[g_ov.idxModCount];
+        const char* v;
+        memset(P, 0, sizeof(*P));
+        aowl_ov_jput(m, end, "guid", P->id, (int32_t)sizeof(P->id));
+        if (!P->id[0]) continue;
+        aowl_ov_jput(m, end, "name", P->label, (int32_t)sizeof(P->label));
+        if (!P->label[0]) aowl_ov_copy(P->label, (int32_t)sizeof(P->label), P->id);
+        P->isMod = 1;
+        v = aowl_ov_jmem(m, end, "count"); P->count = v ? aowl_ov_jint(v, end, -1) : -1;
+        P->done = -1;
+        g_ov.idxModCount++;
+    }
+    g_ov.idxGot = 1;
+    g_ov.idxWhy[0] = 0;
+}
+
+/* Merge the nav: one page per mod THAT PUBLISHES SETTINGS, then the SPT pages
+ * the hub described. Called under `cs` whenever either half moves.
+ *
+ * It used to walk `g_ov.mods` -- the client mod roster -- which is a different
+ * question with a different answer: the roster carries `aowl.manager`,
+ * `aowl.settingshub`, `aowl.uihub` and every not-selected mod, so the settings
+ * nav listed five pages a player cannot configure and four of them opened on an
+ * error. There is deliberately NO fallback to the roster when the index is
+ * missing: an empty nav that names the missing route is a true statement, and
+ * the roster is a false one. */
 static void aowl_ov_rebuild_pages(void) {
     int32_t i;
     g_ov.pageCount = 0;
-    for (i = 0; i < g_ov.modCount && g_ov.pageCount < AOWL_OV_MAX_SPAGES; i++) {
-        AowlOvSPage* P = &g_ov.pages[g_ov.pageCount++];
-        memset(P, 0, sizeof(*P));
-        aowl_ov_copy(P->id, (int32_t)sizeof(P->id), g_ov.mods[i].guid);
-        aowl_ov_copy(P->label, (int32_t)sizeof(P->label),
-                     g_ov.mods[i].name[0] ? g_ov.mods[i].name : g_ov.mods[i].guid);
-        P->isMod = 1; P->count = -1; P->done = -1;
-    }
+    for (i = 0; i < g_ov.idxModCount && g_ov.pageCount < AOWL_OV_MAX_SPAGES; i++)
+        g_ov.pages[g_ov.pageCount++] = g_ov.idxMods[i];
     for (i = 0; i < g_ov.sptPageCount && g_ov.pageCount < AOWL_OV_MAX_SPAGES; i++)
         g_ov.pages[g_ov.pageCount++] = g_ov.sptPages[i];
 }
@@ -2217,7 +2366,7 @@ static void aowl_ov_settings_load(const char* pageId, int32_t isMod,
                                   char* buf, int32_t cap) {
     wchar_t path[224];
     wchar_t warg[96];
-    int32_t i = 0, rc;
+    int32_t i = 0, rc, trunc;
     for (; pageId[i] && i < 95; i++) warg[i] = (wchar_t)(unsigned char)pageId[i];
     warg[i] = 0;
     if (isMod) _snwprintf(path, 224, L"/aowlspt/settings/%ls", warg);
@@ -2225,15 +2374,40 @@ static void aowl_ov_settings_load(const char* pageId, int32_t isMod,
     path[223] = 0;
 
     rc = aowl_ov_fetch(L"GET", path, NULL, buf, cap);
+    trunc = (int32_t)InterlockedCompareExchange(&g_ov.lastTrunc, 0, 0);
     EnterCriticalSection(&g_ov.cs);
     aowl_ov_copy(g_ov.itemsPage, (int32_t)sizeof(g_ov.itemsPage), pageId);
+    g_ov.itemsWhy[0] = 0;
     if (rc > 0 && (unsigned char)buf[0] != 0x78 && aowl_ov_jwhole(buf, rc)) {
         aowl_ov_read_items(buf, rc);
         g_ov.itemsErr = 0;
+        if (g_ov.itemCount >= AOWL_OV_MAX_SITEMS)
+            aowl_ov_fmt(g_ov.itemsWhy, (int32_t)sizeof(g_ov.itemsWhy),
+                        "this page has more rows than the panel can hold; "
+                        "showing the first %d", AOWL_OV_MAX_SITEMS);
     } else {
         g_ov.itemCount = 0;
         g_ov.itemsImpl = 0;
+        g_ov.catCount = 0;
         g_ov.itemsErr = 1;
+        /* Three different faults used to arrive here indistinguishable. Named
+         * separately now, because "it did not fit" and "nobody answered" send a
+         * person to opposite ends of the system. */
+        if (trunc > 0)
+            aowl_ov_fmt(g_ov.itemsWhy, (int32_t)sizeof(g_ov.itemsWhy),
+                        "the reply was larger than the panel's %d-byte buffer "
+                        "and arrived cut in half", trunc);
+        else if (rc > 0 && (unsigned char)buf[0] == 0x78)
+            aowl_ov_copy(g_ov.itemsWhy, (int32_t)sizeof(g_ov.itemsWhy),
+                         "the backend sent a deflated body; it must honour "
+                         "Accept-Encoding: identity");
+        else if (rc > 0)
+            aowl_ov_copy(g_ov.itemsWhy, (int32_t)sizeof(g_ov.itemsWhy),
+                         "the backend answered, but not with a schema -- the "
+                         "route may be missing on this mod");
+        else
+            aowl_ov_copy(g_ov.itemsWhy, (int32_t)sizeof(g_ov.itemsWhy),
+                         "the backend did not answer at all");
     }
     LeaveCriticalSection(&g_ov.cs);
     g_ov.dataSerial++;
@@ -2261,8 +2435,16 @@ static DWORD WINAPI aowl_ov_worker(LPVOID unused) {
      * 32 KB that is allocated once is one fewer thing that can fail late.
      * `/aowlspt/mods/lists` on the shipped registry is about 2 KB; the ceiling
      * is what a very large registry could produce, and a body that does not fit
-     * is truncated, fails to parse into rows, and leaves the tables alone. */
-    static char buf[32768];
+     * is truncated, fails to parse into rows, and leaves the tables alone.
+     *
+     * It was 32,768 bytes and that was the whole of defect (1): MEASURED with
+     * curl against the live backend, `GET /aowlspt/settings/aowl.tarkov` with
+     * `Accept-Encoding: identity` answers 200 with **283,798 bytes** (802
+     * rows), and `GET /aowlspt/settings/aowl.sain` answers 1,156 (5 rows). The
+     * small page loaded and the large one did not, and the panel said "the mod
+     * may not be loaded" about a mod that was loaded and answering. The cap is
+     * the only thing that was ever wrong. See `AOWL_OV_HTTP_BUF`. */
+    static char buf[AOWL_OV_HTTP_BUF];
     (void)unused;
     /* Starts at the interval so the first poll happens immediately: an overlay
      * that shows a stale read-only list for a second after the game starts
@@ -2485,6 +2667,32 @@ static DWORD WINAPI aowl_ov_worker(LPVOID unused) {
                 LeaveCriticalSection(&g_ov.cs);
                 g_ov.dataSerial++;
             }
+
+            /* The settings nav's real source. Re-fetched every slow pass
+             * rather than held, because a mod loaded after start-up publishes
+             * settings after start-up, and a nav that was correct once is not
+             * the same thing as a nav that is correct. Cheap: the shipped
+             * index is a few hundred bytes.
+             *
+             * A failure leaves the previous nav ALONE and records why, so a
+             * momentary backend hiccup does not blank a screen the player is
+             * looking at -- but it never substitutes the mod roster. */
+            rc = aowl_ov_fetch(L"GET", L"/aowlspt/settings/index", NULL, buf,
+                               (int32_t)sizeof(buf));
+            EnterCriticalSection(&g_ov.cs);
+            if (rc > 0 && (unsigned char)buf[0] != 0x78 &&
+                aowl_ov_jwhole(buf, rc) && aowl_ov_jmem(buf, buf + rc, "mods")) {
+                aowl_ov_read_settings_index(buf, rc);
+            } else if (!g_ov.idxGot) {
+                aowl_ov_copy(g_ov.idxWhy, (int32_t)sizeof(g_ov.idxWhy),
+                             rc > 0
+                               ? "GET /aowlspt/settings/index did not answer with "
+                                 "a mods list -- the settings hub (aowl.settingshub) "
+                                 "is not loaded, so nothing can enumerate which mods "
+                                 "have settings"
+                               : "GET /aowlspt/settings/index did not answer");
+            }
+            LeaveCriticalSection(&g_ov.cs);
 
             /* The settings screen's page index. The SPT surface is a fixed
              * catalogue the hub serves once; a 404 (no hub loaded) just leaves
@@ -3367,6 +3575,10 @@ static void aowl_ov_snapshot(void) {
     memcpy(g_ov.sItems, g_ov.items, sizeof(AowlOvSItem) * (size_t)g_ov.itemCount);
     memcpy(g_ov.sItemsPage, g_ov.itemsPage, sizeof(g_ov.sItemsPage));
     g_ov.sItemsErr = g_ov.itemsErr;
+    memcpy(g_ov.sCats, g_ov.cats, sizeof(AowlOvSCat) * (size_t)g_ov.catCount);
+    g_ov.sCatCount = g_ov.catCount;
+    memcpy(g_ov.sItemsWhy, g_ov.itemsWhy, sizeof(g_ov.sItemsWhy));
+    memcpy(g_ov.sIdxWhy, g_ov.idxWhy, sizeof(g_ov.sIdxWhy));
     g_ov.sItemsImpl = g_ov.itemsImpl;
     LeaveCriticalSection(&g_ov.cs);
 }
@@ -4379,7 +4591,12 @@ static int32_t aowl_ov_settings_rows(float bodyH) {
  * either the render thread's own cursor or a snapshot row it then POSTs. */
 static void aowl_ov_settings_key(LONG vk, int32_t page) {
     int32_t n = g_ov.sItemCount;
-    AowlOvSItem* si = (g_ov.selItem >= 0 && g_ov.selItem < n)
+    /* The sub-tab the draw is showing. Falls back to the whole page before the
+     * first frame has run, when the bounds are still zero. */
+    int32_t lo = g_ov.viewLo, hi = g_ov.viewHi;
+    AowlOvSItem* si;
+    if (hi <= lo || hi > n) { lo = 0; hi = n; }
+    si = (g_ov.selItem >= 0 && g_ov.selItem < n)
                         ? &g_ov.sItems[g_ov.selItem] : NULL;
     int32_t canEdit = si && si->implemented && g_ov.curPageIsMod &&
                       si->kind != AOWL_S_NESTED;
@@ -4425,14 +4642,28 @@ static void aowl_ov_settings_key(LONG vk, int32_t page) {
     }
 
     /* --- navigation ------------------------------------------------------ */
-    if (vk == VK_UP   || vk == 'W') { if (g_ov.selItem > 0) g_ov.selItem--; return; }
-    if (vk == VK_DOWN || vk == 'S') { if (g_ov.selItem < n - 1) g_ov.selItem++; return; }
-    if (vk == VK_PRIOR) { g_ov.selItem -= page; if (g_ov.selItem < 0) g_ov.selItem = 0; return; }
+    if (vk == VK_UP   || vk == 'W') { if (g_ov.selItem > lo) g_ov.selItem--; return; }
+    if (vk == VK_DOWN || vk == 'S') { if (g_ov.selItem < hi - 1) g_ov.selItem++; return; }
+    if (vk == VK_PRIOR) { g_ov.selItem -= page; if (g_ov.selItem < lo) g_ov.selItem = lo; return; }
     if (vk == VK_NEXT)  { g_ov.selItem += page;
-                          if (g_ov.selItem > n - 1) g_ov.selItem = n - 1;
-                          if (g_ov.selItem < 0) g_ov.selItem = 0; return; }
-    if (vk == VK_HOME) { g_ov.selItem = 0; return; }
-    if (vk == VK_END)  { g_ov.selItem = n > 0 ? n - 1 : 0; return; }
+                          if (g_ov.selItem > hi - 1) g_ov.selItem = hi - 1;
+                          if (g_ov.selItem < lo) g_ov.selItem = lo; return; }
+    if (vk == VK_HOME) { g_ov.selItem = lo; return; }
+    if (vk == VK_END)  { g_ov.selItem = hi > lo ? hi - 1 : lo; return; }
+    /* `,` and `.` walk the sub-tabs of the page already selected, including
+     * back out to "the whole page" at -1, so a 802-row page is reachable from
+     * the keyboard without the mouse. A page with fewer than two categories
+     * draws no sub-tabs and these do nothing. */
+    if (vk == VK_OEM_COMMA || vk == VK_OEM_PERIOD) {
+        if (g_ov.sCatCount > 1) {
+            g_ov.selCat += (vk == VK_OEM_PERIOD) ? 1 : -1;
+            if (g_ov.selCat < -1) g_ov.selCat = g_ov.sCatCount - 1;
+            if (g_ov.selCat >= g_ov.sCatCount) g_ov.selCat = -1;
+            g_ov.selItem = (g_ov.selCat >= 0) ? g_ov.sCats[g_ov.selCat].lo : 0;
+            g_ov.topItem = g_ov.selItem;
+        }
+        return;
+    }
     if (vk == VK_TAB) {
         if (g_ov.sPageCount > 0)
             g_ov.selPage = (g_ov.selPage + 1) % g_ov.sPageCount;
@@ -4487,6 +4718,13 @@ static void aowl_ov_view_settings(float x, float y, float w, float bodyH) {
     AowlOvSPage* P;
     int32_t loaded;
     float ny, cy;
+    /* The flattened two-level nav for this frame. Automatic, not state: it is
+     * derived from `sPages`/`sCats`/`selPage` every frame and nothing outside
+     * this function ever reads it. ~576 bytes of stack. */
+    int32_t navPage[AOWL_OV_MAX_NAV];
+    int32_t navCat[AOWL_OV_MAX_NAV];
+    int32_t navCount = 0, navSel = 0;
+    int32_t lo = 0, hi = 0;
     if (navRows < 1) navRows = 1;
 
     /* --- keep the page cursor sane and request its controls once ---------- */
@@ -4497,6 +4735,7 @@ static void aowl_ov_view_settings(float x, float y, float w, float bodyH) {
         if (strcmp(g_ov.curPage, P->id) != 0) {
             aowl_ov_copy(g_ov.curPage, (int32_t)sizeof(g_ov.curPage), P->id);
             g_ov.curPageIsMod = P->isMod;
+            g_ov.selCat = -1;
             g_ov.selItem = 0; g_ov.topItem = 0;
             g_ov.editItem = -1; g_ov.capturing = 0; g_ov.dragItem = -1;
             aowl_ov_queue_spage(P->id, P->isMod);
@@ -4504,47 +4743,100 @@ static void aowl_ov_view_settings(float x, float y, float w, float bodyH) {
     }
 
     /* --- the left nav ----------------------------------------------------- */
-    if (g_ov.topPage > g_ov.selPage) g_ov.topPage = g_ov.selPage;
-    if (g_ov.selPage - g_ov.topPage >= navRows)
-        g_ov.topPage = g_ov.selPage - navRows + 1;
-    if (g_ov.topPage > pc - navRows) g_ov.topPage = pc - navRows;
+    {
+        /* Where the cursor is IN THE FLATTENED LIST -- the page row when no
+         * sub-tab is chosen, otherwise that sub-tab's row. */
+        int32_t k;
+        navSel = -1;
+        for (k = 0; k < navCount; k++)
+            if (navPage[k] == g_ov.selPage && navCat[k] == g_ov.selCat) { navSel = k; break; }
+        /* No exact row: the sub-tabs are not drawn yet because the page is
+         * still loading. Fall back to the PAGE's own row rather than to zero --
+         * zero would scroll the nav back to the top for as long as a fetch
+         * takes, which reads as the nav resetting itself. */
+        if (navSel < 0)
+            for (k = 0; k < navCount; k++)
+                if (navPage[k] == g_ov.selPage) { navSel = k; break; }
+        if (navSel < 0) navSel = 0;
+    }
+    if (g_ov.topPage > navSel) g_ov.topPage = navSel;
+    if (navSel - g_ov.topPage >= navRows)
+        g_ov.topPage = navSel - navRows + 1;
+    if (g_ov.topPage > navCount - navRows) g_ov.topPage = navCount - navRows;
     if (g_ov.topPage < 0) g_ov.topPage = 0;
 
+    /* The nav is flattened here, once per frame, into "a page row" or "a
+     * sub-tab row of the selected page". Two levels drawn by one loop: the
+     * alternative was a second loop with its own scroll, its own hit testing
+     * and its own off-by-one, for a list that is at most ~140 rows. */
+    {
+        int32_t k;
+        navCount = 0;
+        for (k = 0; k < pc && navCount < AOWL_OV_MAX_NAV; k++) {
+            navPage[navCount] = k; navCat[navCount] = -1; navCount++;
+            if (k == g_ov.selPage && g_ov.sCatCount > 1 &&
+                strcmp(g_ov.sItemsPage, g_ov.sPages[k].id) == 0 &&
+                !g_ov.sItemsErr) {
+                int32_t c;
+                for (c = 0; c < g_ov.sCatCount && navCount < AOWL_OV_MAX_NAV; c++) {
+                    navPage[navCount] = k; navCat[navCount] = c; navCount++;
+                }
+            }
+        }
+    }
     aowl_ov_text(x + (float)AOWL_OV_PAD, y, "pages", AOWL_OV_FAINT);
     aowl_ov_rect(x + (float)AOWL_OV_PAD + leftW + 5.0f, y, 1.0f, bodyH, AOWL_OV_EDGE);
     ny = y + (float)AOWL_OV_LINE_H;
     if (pc == 0) {
         aowl_ov_wrap(x + (float)AOWL_OV_PAD, ny,
-                     g_ov.backendPort > 0
-                       ? "no pages yet -- waiting for the backend to describe "
-                         "the mod and SPT settings surface"
-                       : "no pages -- the settings screen needs a backend to "
-                         "read the schema from",
-                     AOWL_OV_DIM, 24, 4);
+                     g_ov.backendPort <= 0
+                       ? "no pages -- the settings screen needs a backend to "
+                         "read the schema from"
+                       : (g_ov.sIdxWhy[0]
+                            ? g_ov.sIdxWhy
+                            : "no pages yet -- waiting for the settings index"),
+                     AOWL_OV_DIM, 24, 6);
     }
-    for (i = 0; i < navRows && g_ov.topPage + i < pc; i++) {
+    for (i = 0; i < navRows && g_ov.topPage + i < navCount; i++) {
         int32_t at = g_ov.topPage + i;
-        AowlOvSPage* Q = &g_ov.sPages[at];
+        int32_t pi = navPage[at], ci = navCat[at];
+        AowlOvSPage* Q = &g_ov.sPages[pi];
         int32_t hot = aowl_ov_hit(x + 1.0f, ny, leftW + (float)AOWL_OV_PAD,
                                   (float)AOWL_OV_ROW_H);
         uint32_t col;
-        if (at == g_ov.selPage)
+        if (at == navSel)
             aowl_ov_rect(x + 1.0f, ny, leftW + (float)AOWL_OV_PAD,
                          (float)AOWL_OV_ROW_H, AOWL_OV_SELBG);
         else if (hot)
             aowl_ov_rect(x + 1.0f, ny, leftW + (float)AOWL_OV_PAD,
                          (float)AOWL_OV_ROW_H, AOWL_OV_ROWALT);
-        /* Mods read in the panel's text colour; the SPT surface -- none of it
-         * backed yet -- is dimmed, which is the same "not running" language the
-         * manager uses. */
-        col = Q->isMod ? AOWL_OV_TEXT : AOWL_OV_DIM;
-        aowl_ov_textn(x + (float)AOWL_OV_PAD, ny + 3.0f,
-                      Q->label, col, (int32_t)((leftW - 24.0f) / AOWL_OV_CW));
-        if (!Q->isMod)
-            aowl_ov_text(x + (float)AOWL_OV_PAD + leftW - 18.0f, ny + 3.0f,
-                         "NI", AOWL_OV_WARN);
+        if (ci < 0) {
+            /* Mods read in the panel's text colour; the SPT surface -- none of
+             * it backed yet -- is dimmed, which is the same "not running"
+             * language the manager uses. */
+            col = Q->isMod ? AOWL_OV_TEXT : AOWL_OV_DIM;
+            aowl_ov_textn(x + (float)AOWL_OV_PAD, ny + 3.0f,
+                          Q->label, col, (int32_t)((leftW - 24.0f) / AOWL_OV_CW));
+            if (!Q->isMod)
+                aowl_ov_text(x + (float)AOWL_OV_PAD + leftW - 18.0f, ny + 3.0f,
+                             "NI", AOWL_OV_WARN);
+        } else {
+            /* A sub-tab: indented, dimmer, and carrying its own row count, so
+             * "Player / Inertia 101" is one glance rather than a scroll. */
+            AowlOvSCat* C = &g_ov.sCats[ci];
+            char sub[96];
+            aowl_ov_fmt(sub, (int32_t)sizeof(sub), "  %s", C->label);
+            aowl_ov_textn(x + (float)AOWL_OV_PAD, ny + 3.0f, sub,
+                          at == navSel ? AOWL_OV_TEXT : AOWL_OV_DIM,
+                          (int32_t)((leftW - 40.0f) / AOWL_OV_CW));
+            aowl_ov_fmt(sub, (int32_t)sizeof(sub), "%d", C->hi - C->lo);
+            aowl_ov_text(x + (float)AOWL_OV_PAD + leftW - 30.0f, ny + 3.0f,
+                         sub, AOWL_OV_FAINT);
+        }
         if (hot && g_ov.clickDown) {
-            g_ov.selPage = at;
+            g_ov.selPage = pi;
+            g_ov.selCat = ci;
+            if (ci >= 0) { g_ov.selItem = g_ov.sCats[ci].lo; g_ov.topItem = g_ov.selItem; }
             InterlockedExchange(&g_ov.clickDown, 0);
         }
         ny += (float)AOWL_OV_ROW_H;
@@ -4565,9 +4857,16 @@ static void aowl_ov_view_settings(float x, float y, float w, float bodyH) {
             aowl_ov_fmt(hdr, (int32_t)sizeof(hdr), "%s   loading...", P->label);
             aowl_ov_textn(rx, cy, hdr, AOWL_OV_DIM, rcols);
         } else if (P->isMod) {
-            aowl_ov_fmt(hdr, (int32_t)sizeof(hdr),
-                        "%s   --   %d settings, %d implemented", P->label,
-                        g_ov.sItemCount, g_ov.sItemsImpl);
+            if (g_ov.selCat >= 0 && g_ov.selCat < g_ov.sCatCount) {
+                AowlOvSCat* C = &g_ov.sCats[g_ov.selCat];
+                aowl_ov_fmt(hdr, (int32_t)sizeof(hdr),
+                            "%s / %s   --   %d of %d settings", P->label,
+                            C->label, C->hi - C->lo, g_ov.sItemCount);
+            } else {
+                aowl_ov_fmt(hdr, (int32_t)sizeof(hdr),
+                            "%s   --   %d settings, %d implemented", P->label,
+                            g_ov.sItemCount, g_ov.sItemsImpl);
+            }
             aowl_ov_textn(rx, cy, hdr, AOWL_OV_ACCENT, rcols);
         } else {
             aowl_ov_fmt(hdr, (int32_t)sizeof(hdr),
@@ -4579,10 +4878,14 @@ static void aowl_ov_view_settings(float x, float y, float w, float bodyH) {
     cy += (float)AOWL_OV_LINE_H + 2.0f;
 
     if (P && g_ov.sItemsErr && strcmp(g_ov.sItemsPage, P->id) == 0) {
+        /* The reason the WORKER recorded, not a guess made here. The old text
+         * asserted "the mod may not be loaded" for every failure, including the
+         * one that was actually a full buffer -- a confidently wrong diagnostic,
+         * which is worse than none. */
         aowl_ov_wrap(rx, cy,
-                     "could not read this page's settings. The backend answered, "
-                     "but not with a schema -- the mod may not be loaded, or its "
-                     "settings route may be missing.", AOWL_OV_ERR, rcols, 4);
+                     g_ov.sItemsWhy[0] ? g_ov.sItemsWhy
+                                       : "could not read this page's settings.",
+                     AOWL_OV_ERR, rcols, 5);
         return;
     }
     if (!loaded) return;
@@ -4592,18 +4895,37 @@ static void aowl_ov_view_settings(float x, float y, float w, float bodyH) {
         int32_t n = g_ov.sItemCount;
         float itemsBottom = y + bodyH - (float)AOWL_OV_SDETAIL_H;
 
-        if (g_ov.selItem >= n) g_ov.selItem = n > 0 ? n - 1 : 0;
-        if (g_ov.selItem < 0) g_ov.selItem = 0;
+        /* `items` is sorted by category, so the chosen sub-tab is a contiguous
+         * half-open range and the filter is a pair of bounds. `selItem` stays
+         * an ITEM index throughout, which is why the edit, drag and commit
+         * paths below and in `aowl_ov_settings_key` need to know nothing about
+         * sub-tabs at all. */
+        lo = 0; hi = n;
+        if (g_ov.selCat >= 0 && g_ov.selCat < g_ov.sCatCount) {
+            lo = g_ov.sCats[g_ov.selCat].lo;
+            hi = g_ov.sCats[g_ov.selCat].hi;
+            if (lo < 0) lo = 0;
+            if (hi > n) hi = n;
+            if (hi < lo) hi = lo;
+        }
+        g_ov.viewLo = lo; g_ov.viewHi = hi;
+
+        if (g_ov.selItem >= hi) g_ov.selItem = hi > lo ? hi - 1 : lo;
+        if (g_ov.selItem < lo) g_ov.selItem = lo;
         if (g_ov.topItem > g_ov.selItem) g_ov.topItem = g_ov.selItem;
         if (g_ov.selItem - g_ov.topItem >= iRows)
             g_ov.topItem = g_ov.selItem - iRows + 1;
-        if (g_ov.topItem > n - iRows) g_ov.topItem = n - iRows;
-        if (g_ov.topItem < 0) g_ov.topItem = 0;
+        if (g_ov.topItem > hi - iRows) g_ov.topItem = hi - iRows;
+        if (g_ov.topItem < lo) g_ov.topItem = lo;
 
         if (n == 0)
             aowl_ov_text(rx, cy, "this page declares no settings", AOWL_OV_DIM);
+        else if (g_ov.sItemsWhy[0])
+            aowl_ov_text(rx, y + bodyH - (float)AOWL_OV_SDETAIL_H
+                             - (float)AOWL_OV_LINE_H,
+                         g_ov.sItemsWhy, AOWL_OV_WARN);
 
-        for (i = 0; i < iRows && g_ov.topItem + i < n; i++) {
+        for (i = 0; i < iRows && g_ov.topItem + i < hi; i++) {
             int32_t at = g_ov.topItem + i;
             AowlOvSItem* si = &g_ov.sItems[at];
             float ry = cy + (float)(i * AOWL_OV_ROW_H);
@@ -4616,7 +4938,10 @@ static void aowl_ov_view_settings(float x, float y, float w, float bodyH) {
 
             /* A hairline where the category changes -- grouping without
              * spending a row, so one item is exactly one selectable row. */
-            if (at > 0 && strcmp(si->category, g_ov.sItems[at - 1].category) != 0)
+            if (at > lo &&
+                strcmp(g_ov.selCat >= 0 ? si->subcat : si->category,
+                       g_ov.selCat >= 0 ? g_ov.sItems[at - 1].subcat
+                                        : g_ov.sItems[at - 1].category) != 0)
                 aowl_ov_rect(rx - 2.0f, ry, rw, 1.0f, AOWL_OV_FAINT);
 
             if (isSel)
@@ -5581,6 +5906,67 @@ static int32_t aowl_ov_admin_active(void) {
  * 256-entity frame is a needless 10 KB memmove on the stack. */
 static AowlAdminShared g_ovAdminSnap;
 
+/* ------------------------------------------------------------------ *
+ * THE SHARED REGION'S DRAW
+ *
+ * The generic replacement for what `aowl_ov_admin_append` does privately for
+ * one mod. Every participant that registered a DRAW callback with
+ * `abi/aowlspt_region.h` submitted screen-space commands on the Unity thread;
+ * this drains the published buffer here, on the render thread, and rasterises
+ * it with the same primitives the panel uses.
+ *
+ * The overlay is its own module, so it is a plain CLIENT of the region: it
+ * resolves `aowl_region_commands_x` by GetProcAddress on the host DLL, and a
+ * host that predates the region simply returns 0 commands. Nothing here can
+ * fault the game -- an absent host is an empty frame, exactly as an absent
+ * admin mod is an empty HUD.
+ *
+ * True back-buffer pixels: the submitter already projected to pixels, so the
+ * panel's integer scale is forced to 1 across this and restored after, the
+ * same discipline the admin ESP append follows.
+ * ------------------------------------------------------------------ */
+static void aowl_ov_region_append(void) {
+    const AowlRegionCmd* cmds = 0;
+    int32_t n = aowl_region_commands(&cmds);
+    int32_t i, savedScale;
+    if (n <= 0 || !cmds) return;
+    if (n > AOWL_REGION_MAX_CMDS) n = AOWL_REGION_MAX_CMDS;  /* capped */
+    savedScale = g_ov.scale;
+    g_ov.scale = 1;
+    for (i = 0; i < n; i++) {
+        const AowlRegionCmd* c = &cmds[i];
+        switch (c->kind) {
+            case AOWL_REGION_CMD_FILL:
+                aowl_ov_rect(c->x, c->y, c->w, c->h, c->col);
+                break;
+            case AOWL_REGION_CMD_BOX:
+                aowl_ov_frame_rect(c->x, c->y, c->w, c->h,
+                                   c->t > 0.0f ? c->t : 1.0f, c->col);
+                break;
+            case AOWL_REGION_CMD_TEXT:
+                aowl_ov_text(c->x, c->y, c->text, c->col);
+                break;
+            case AOWL_REGION_CMD_LINE: {
+                /* An axis-aligned quad between the two points. The overlay has
+                 * no line primitive and inventing a rotated one here would be
+                 * a second rasteriser to maintain; a thin rect is what the
+                 * admin HUD's own "lines" already are. */
+                float x0 = c->x, y0 = c->y, x1 = c->w, y1 = c->h;
+                float t  = c->t > 0.0f ? c->t : 1.0f;
+                float lx = x0 < x1 ? x0 : x1, ly = y0 < y1 ? y0 : y1;
+                float w  = (x1 > x0 ? x1 - x0 : x0 - x1);
+                float h  = (y1 > y0 ? y1 - y0 : y0 - y1);
+                if (w < t) w = t;
+                if (h < t) h = t;
+                if (w <= t || h <= t) aowl_ov_rect(lx, ly, w, h, c->col);
+                break;
+            }
+            default: break;
+        }
+    }
+    g_ov.scale = savedScale;
+}
+
 /* Append the HUD's geometry into the overlay's vertex scratch, to be flushed by
  * the one `aowl_ov_draw` the Present body already issues. ESP is drawn in true
  * back-buffer pixels (scale forced to 1, since the mod already projected to
@@ -5687,12 +6073,21 @@ static HRESULT STDMETHODCALLTYPE aowl_ov_present(IDXGISwapChain* sc, UINT sync,
         if (g_ov.visible && !g_ov.wasVisible) g_ov.openDrawn = 0;
         g_ov.wasVisible = g_ov.visible;
         int32_t adminOn = aowl_ov_admin_active();
+        /* The shared region draws whenever it has published anything, exactly
+         * as the admin HUD draws whenever it is live -- otherwise a mod's
+         * markers would appear only while the manager panel happened to be
+         * open, which reads to a player as "the mod is broken". */
+        int32_t regionOn = 0;
+        {
+            const AowlRegionCmd* rcPeek = 0;
+            regionOn = aowl_region_commands(&rcPeek) > 0 ? 1 : 0;
+        }
         /* Tell the mod the resolution it must project to, every frame the swap
          * chain is bound, so its screen coordinates match this back buffer even
          * across a resize. */
         if (g_ov_admin && aowl_ov_bind(sc))
             aowl_admin_set_screen(g_ov_admin, (int32_t)g_ov.bbW, (int32_t)g_ov.bbH);
-        if (aowl_ov_bind(sc) && (g_ov.visible || adminOn)) {
+        if (aowl_ov_bind(sc) && (g_ov.visible || adminOn || regionOn)) {
             /* What one frame of this costs, measured rather than asserted. The
              * overlay is drawn inside the present loop of a game people play
              * competitively, so "it is cheap" is a claim that has to have a
@@ -5709,7 +6104,7 @@ static HRESULT STDMETHODCALLTYPE aowl_ov_present(IDXGISwapChain* sc, UINT sync,
              * cache is defeated (drawSig = 0) so the per-frame ESP is not held
              * back by the panel's "nothing changed" fast path. */
             if (g_ov.visible) {
-                if (adminOn) g_ov.drawSig = 0;
+                if (adminOn || regionOn) g_ov.drawSig = 0;
                 aowl_ov_build();
             } else {
                 g_ov.vtxCount = 0;
@@ -5717,6 +6112,8 @@ static HRESULT STDMETHODCALLTYPE aowl_ov_present(IDXGISwapChain* sc, UINT sync,
                 g_ov.needUpload = 1;
             }
             if (adminOn) aowl_ov_admin_append();
+            /* And every participant of the SHARED region, generically. */
+            if (regionOn) aowl_ov_region_append();
             QueryPerformanceCounter(&tb);
             aowl_ov_draw(sc);
             QueryPerformanceCounter(&t1);
@@ -5918,6 +6315,8 @@ static int32_t aowl_ov_start(int32_t toggleVk, int32_t backendPort) {
     g_ov.selItem = 0; g_ov.topItem = 0;
     g_ov.editItem = -1;
     g_ov.dragItem = -1;
+    g_ov.selCat = -1;      /* -1 is "the whole page", the only sane start */
+    g_ov.viewLo = 0; g_ov.viewHi = 0;
     g_ov.capturing = 0;
     g_ov.curPage[0] = 0;
     g_ov.itemsPage[0] = 0;
@@ -5926,6 +6325,11 @@ static int32_t aowl_ov_start(int32_t toggleVk, int32_t backendPort) {
     g_ov.pageCount = 0;
     g_ov.sptPageCount = 0;
     g_ov.sptGot = 0;
+    g_ov.idxModCount = 0;
+    g_ov.idxGot = 0;
+    g_ov.idxWhy[0] = 0;
+    g_ov.catCount = 0;
+    g_ov.itemsWhy[0] = 0;
     g_ov.itemCount = 0;
     g_ov.mouseHeld = 0;
     /* -1, not 0: zero is a sequence number the client host really sends on its

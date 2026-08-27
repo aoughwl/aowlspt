@@ -44,7 +44,7 @@
     },
     {
       "id": "aowl.tarkov",
-      "name": "Tarkov Emulator",
+      "name": "Singleplayer",
       "author": "aowlspt",
       "version": "0.1.0",
       "description": "The game server: profiles, static tables, traders, flea market, quests, hideout, raids. Written entirely on the public mod API, which is the only honest test that the API is enough to build a game server with.",
@@ -117,8 +117,8 @@
     },
     {
       "id": "aowl.sain",
-      "name": "SAIN",
-      "author": "aowlspt port of SAIN by Solarint and ArchangelWTF",
+      "name": "Bot AI",
+      "author": "aowlspt",
       "version": "0.1.0",
       "description": "Bot AI: layered decisions, per-bot personalities, cover use, searching that looks like searching, squads that behave like squads. A port of the design, not of the C#. Boots clean as of 2026-08-25 but runs in OBSERVER MODE -- see fact #145; it declines every by-name route rather than dying on one.",
       "pipeline": ">=0.1.0",
@@ -137,7 +137,7 @@
         "library": "sain.dll"
       },
       "upstream": {
-        "name": "SAIN",
+        "name": "Bot AI",
         "author": "Solarint, maintained by ArchangelWTF",
         "url": "https://github.com/Solarint/SAIN"
       },
@@ -158,8 +158,8 @@
     },
     {
       "id": "aowl.fovfix",
-      "name": "FOV Fix",
-      "author": "Fontaine (ported by savannt)",
+      "name": "FOV",
+      "author": "aowlspt",
       "version": "4.1.0",
       "description": "Field of view that stays where you put it, including while aiming and while scoped.",
       "pipeline": ">=0.1.0",
@@ -405,7 +405,7 @@
       "name": "Default",
       "author": "savannt",
       "version": "1.0.0",
-      "description": "The Singleplayer Mod and SAIN. SAIN was measured on 2026-08-25 to boot clean (client alive 1:55.828, Unity thread live confirmed, arming complete) after every by-name route was made to refuse. It is in OBSERVER MODE: its ~70 members are LazyCalls whose `ensure` calls il2cpp_object_get_class, which faults on this build, so the read path is blocked and both detours decline. It is safe to ship and it does not yet drive bots.",
+      "description": "The Singleplayer mod and Bot AI. Bot AI was measured on 2026-08-25 to boot clean (client alive 1:55.828, Unity thread live confirmed, arming complete) after every by-name route was made to refuse. It is in OBSERVER MODE: its ~70 members are LazyCalls whose `ensure` calls il2cpp_object_get_class, which faults on this build, so the read path is blocked and both detours decline. It is safe to ship and it does not yet drive bots.",
       "inherits": [
         "aowl.list.core"
       ],

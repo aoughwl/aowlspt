@@ -203,12 +203,99 @@ proc sourceOf(modPath: string): string =
 
 proc placeLibrary(dir, stem, outPath: string): bool
 
+var gSymTabRan = false
+
+proc symTab(e: Env): bool =
+  ## Regenerate `abi/aowlspt_symtab.h` + `.nim` from `abi/aowlspt_symbols.txt`,
+  ## then CHECK that nothing in `abi/`, `host/` or `mods/` references a symbol
+  ## the generator rejected.
+  ##
+  ## This runs BEFORE anything that `#include`s the header, and it is the point
+  ## where a by-name IL2CPP resolve stops being a silent client death and
+  ## becomes a build error. A runtime name lookup goes through a TOKEN-GATED
+  ## il2cpp export: called with the stock signature it does not fail, it
+  ## returns a plausible random value, and nothing distinguishes that from
+  ## success until something dereferences it -- at which point the client is
+  ## gone, with a log byte-identical to a healthy run. There is no runtime
+  ## check that catches it, so the resolve is done here instead.
+  ##
+  ## Three outcomes, each said out loud:
+  ##   * inputs present -> regenerate AND check; either failing FAILS THE BUILD.
+  ##   * inputs absent, header present -> NOT CHECKED, and it says so. A stale
+  ##     header cannot be detected without the DLL to compare against, so this
+  ##     is an INCONCLUSIVE, never a pass.
+  ##   * inputs absent, no header -> anything that includes it will fail to
+  ##     compile, which is the correct and loud outcome.
+  ##
+  ## The staleness story lives in the header itself: it records the image key
+  ## and SHA-256 of the GameAssembly.dll every RVA came from, and `check`
+  ## refuses on a mismatch. A Tarkov update therefore fails the build rather
+  ## than shipping wrong-but-mapped addresses.
+  if gSymTabRan:
+    return true
+  let gen = joinPath(e.repo, "tools\\il2cpp_symtab.py")
+  let manifest = joinPath(e.repo, "abi\\aowlspt_symbols.txt")
+  if not fileExists(gen) or not fileExists(manifest):
+    return true
+  let outH = joinPath(e.repo, "abi\\aowlspt_symtab.h")
+  let outNim = joinPath(e.repo, "abi\\aowlspt_symtab.nim")
+  var gameasm = getEnv("AOWLSPT_GAMEASM", "")
+  if gameasm.len == 0:
+    gameasm = "D:\\Games\\Tarkov\\GameAssembly.dll"
+  let meta = joinPath(e.repo, ".cache\\global-metadata.dec.dat")
+
+  if fileExists(gameasm) and fileExists(meta):
+    gSymTabRan = true
+    # ORDER MATTERS, and the first version of this got it wrong. `gen` then
+    # `check` puts the staleness gate and the prologue gate AFTER the step that
+    # rewrites the header from this same DLL -- so neither could ever fail,
+    # whatever GameAssembly.dll was on disk. A gate that cannot fail is not a
+    # gate. `verify-header` runs FIRST, against the header as committed, which
+    # is where a Tarkov update, a hand-edited header or a stale commit is
+    # genuinely detectable.
+    if not run(e, "the committed symbol table still matches GameAssembly.dll",
+               "python " & quoted(gen) & " verify-header " & quoted(gameasm) &
+               " " & quoted(meta) & " " & quoted(manifest) & " " & quoted(outH),
+               e.repo):
+      note "the RVAs in abi\\aowlspt_symtab.h do not describe the " &
+           "GameAssembly.dll on this machine. Regenerating would paper over " &
+           "that; every consumer of a moved RVA needs looking at first. To " &
+           "regenerate deliberately: python tools\\il2cpp_symtab.py gen ..."
+      return false
+    if not run(e, "the compile-time symbol table",
+               "python " & quoted(gen) & " gen " & quoted(gameasm) & " " &
+               quoted(meta) & " " & quoted(manifest) & " " & quoted(outH) &
+               " " & quoted(outNim), e.repo):
+      return false
+    return run(e, "no source references a rejected or shared IL2CPP symbol",
+               "python " & quoted(gen) & " check " & quoted(gameasm) & " " &
+               quoted(meta) & " " & quoted(manifest) & " " & quoted(outH),
+               e.repo)
+
+  gSymTabRan = true
+  if fileExists(outH):
+    note "abi\\aowlspt_symtab.h is present but " &
+         (if fileExists(gameasm): "there is no .cache\\global-metadata.dec.dat"
+          else: "there is no GameAssembly.dll at " & gameasm) &
+         ", so it was NOT CHECKED for staleness here. That is inconclusive, " &
+         "not a pass: run `python tools\\il2cpp_symtab.py check` on a machine " &
+         "with the game installed before trusting a build for the live client."
+    return true
+  note "no abi\\aowlspt_symtab.h and no inputs to generate one. Anything " &
+       "that includes it will fail to compile, which is the intended and " &
+       "loud outcome -- set AOWLSPT_GAMEASM and decrypt the metadata with " &
+       "tools/metablob.py."
+  return true
+
 proc buildMod(e: Env; modPathIn: string): bool =
   let modPath = absolutePathOf(modPathIn)
   let source = sourceOf(modPath)
   if source.len == 0:
     err "no single .nim source in " & modPath
     inc failures
+    return false
+
+  if not symTab(e):
     return false
 
   let dir = parentOf(source)
@@ -410,6 +497,8 @@ proc buildIl2CppHost(e: Env): bool =
   if not fileExists(source):
     err "no aowlhost.nim under " & dir
     inc failures
+    return false
+  if not symTab(e):
     return false
   let binDir = joinPath(dir, "bin")
   discard ensureDir(binDir)
@@ -1228,6 +1317,23 @@ proc cmdTest(e: Env): int =
   if buildInstallerTests(e):
     discard run(e, "installer tests",
                 quoted(joinPath(e.repo, "installer\\build\\test-installer.exe")))
+
+  heading "Shared per-frame region"
+  # The MUTATION PROOF for `abi/aowlspt_region.h`. It does not check that the
+  # dispatcher runs -- it deliberately registers a participant that faults, one
+  # that overruns its budget, and one that calls the dispatcher from inside a
+  # live guard, then asserts on the FINISHED STATE: that nobody ORDERED AFTER
+  # the faulting participant lost a frame, that the faulting one is disabled by
+  # name, that the overrunning one is reported and throttled, and that nesting
+  # is refused. It then runs the identical harness with nothing misbehaving, so
+  # every one of those checks is shown to be capable of failing.
+  let regionExe = joinPath(testsDir, "region_test.exe")
+  if run(e, "compile region_test.c",
+         "gcc -I" & quoted(joinPath(e.repo, "abi")) & " -O1 -o " &
+         quoted(regionExe) & " " &
+         quoted(joinPath(testsDir, "region_test.c"))):
+    discard run(e, "one mod faulting in the shared region never costs another " &
+                   "mod a frame", quoted(regionExe))
 
   heading "Detour engine"
   let detourExe = joinPath(testsDir, "detour_test.exe")

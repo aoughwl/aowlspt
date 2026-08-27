@@ -588,6 +588,89 @@ int main(void) {
                g_ov.listCount, lists);
     }
 
+
+    /* ---- the settings nav is driven by WHO PUBLISHES SETTINGS ------------
+     *
+     * The finished-state assertions here are NEGATIVE on purpose. "the index
+     * produced two pages" is satisfied by almost any bug; "no infrastructure
+     * guid is anywhere in the nav" is not, and it is the property that was
+     * actually broken -- the nav used to be built from the client mod roster,
+     * which carries the manager, the settings hub and the fallback UI. */
+    {
+        static const char idx[] =
+            "{\"mods\":[{\"guid\":\"aowl.tarkov\",\"name\":\"Singleplayer\",\"count\":802},"
+            "{\"guid\":\"aowl.sain\",\"name\":\"Bot AI\",\"count\":5}]}";
+        /* A roster that DOES carry the infrastructure, so the negative below
+         * can fail: if `rebuild_pages` ever reads `mods` again, these appear. */
+        static const char roster[] =
+            "{\"mods\":[{\"guid\":\"aowl.manager\",\"name\":\"Mod Manager\"},"
+            "{\"guid\":\"aowl.settingshub\",\"name\":\"SPT Settings Surface\"},"
+            "{\"guid\":\"aowl.uihub\",\"name\":\"Fallback Settings UI\"},"
+            "{\"guid\":\"aowl.morebots\",\"name\":\"MoreBots\"},"
+            "{\"guid\":\"aowl.tarkov\",\"name\":\"Singleplayer\"}]}";
+        int32_t i, bad_ = 0;
+        aowl_ov_read_panel(roster, (int32_t)strlen(roster));
+        aowl_ov_read_settings_index(idx, (int32_t)strlen(idx));
+        aowl_ov_rebuild_pages();
+        eq_int("index: the roster really did carry infrastructure",
+               g_ov.modCount >= 4, 1);
+        for (i = 0; i < g_ov.pageCount; i++)
+            if (!strcmp(g_ov.pages[i].id, "aowl.manager") ||
+                !strcmp(g_ov.pages[i].id, "aowl.settingshub") ||
+                !strcmp(g_ov.pages[i].id, "aowl.uihub") ||
+                !strcmp(g_ov.pages[i].id, "aowl.morebots")) bad_++;
+        eq_int("index: NO infrastructure mod appears in the settings nav", bad_, 0);
+        for (i = 0, bad_ = 0; i < g_ov.pageCount; i++)
+            if (strstr(g_ov.pages[i].label, "Tarkov Emulator") ||
+                strstr(g_ov.pages[i].label, "SAIN") ||
+                strstr(g_ov.pages[i].label, "MoreBots")) bad_++;
+        eq_int("index: no retired display name is rendered in the nav", bad_, 0);
+        eq_int("index: exactly the two publishers are pages", g_ov.pageCount, 2);
+        eq_str("index: the page key is the guid, not the name",
+               g_ov.pages[0].id, "aowl.tarkov");
+
+        /* An index that does not answer must not resurrect the roster. */
+        g_ov.idxModCount = 0;
+        aowl_ov_rebuild_pages();
+        eq_int("index: a missing index yields an EMPTY nav, not the roster",
+               g_ov.pageCount, 0);
+    }
+
+    /* ---- sub-tabs: categories are contiguous after the sort -------------- */
+    {
+        static const char page[] =
+            "[{\"key\":\"a\",\"type\":\"bool\",\"value\":true,\"category\":\"Loot\"},"
+            "{\"key\":\"b\",\"type\":\"bool\",\"value\":true,\"category\":\"Bots\",\"subcategory\":\"Spawn\"},"
+            "{\"key\":\"c\",\"type\":\"bool\",\"value\":true,\"category\":\"Loot\"},"
+            "{\"key\":\"d\",\"type\":\"bool\",\"value\":true,\"category\":\"Bots\",\"subcategory\":\"Aim\"},"
+            "{\"key\":\"e\",\"type\":\"bool\",\"value\":true,\"category\":\"Bots\",\"subcategory\":\"Aim\"}]";
+        int32_t c, i, bad_ = 0;
+        aowl_ov_read_items(page, (int32_t)strlen(page));
+        eq_int("subtabs: every row survived", g_ov.itemCount, 5);
+        eq_int("subtabs: one tab per distinct category", g_ov.catCount, 2);
+        /* The property the FILTER depends on, stated so it can fail: every row
+         * inside a tab's range carries that tab's category, and no row outside
+         * it does. A sort that is not stable, or a range built off the unsorted
+         * order, breaks this and nothing else would notice. */
+        for (c = 0; c < g_ov.catCount; c++)
+            for (i = 0; i < g_ov.itemCount; i++) {
+                int32_t inside = (i >= g_ov.cats[c].lo && i < g_ov.cats[c].hi);
+                int32_t same = !strcmp(g_ov.items[i].category, g_ov.cats[c].label);
+                if (inside != same) bad_++;
+            }
+        eq_int("subtabs: each category is exactly its contiguous range", bad_, 0);
+        eq_str("subtabs: the tabs are in sorted order", g_ov.cats[0].label, "Bots");
+        eq_int("subtabs: the ranges cover the page",
+               g_ov.cats[g_ov.catCount - 1].hi, g_ov.itemCount);
+        eq_str("subtabs: subcategory is read when present",
+               g_ov.items[0].subcat, "Aim");
+        /* Declaration order is kept inside a subcategory: d before e. */
+        eq_str("subtabs: declaration order survives inside a subcategory",
+               g_ov.items[0].key, "d");
+        eq_str("subtabs: an absent subcategory stays empty",
+               g_ov.items[3].subcat, "");
+    }
+
     printf("\n%s\n", failures == 0 ? "all overlay json checks passed"
                                    : "some overlay json checks failed");
     return failures == 0 ? 0 : 1;

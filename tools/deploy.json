@@ -1,129 +1,135 @@
 {
-  "//": "Data for `python tools/deploy.py`. Each artifact names where it is built,",
-  "//1": "where it goes in a live install, and the literal strings that MUST be",
-  "//2": "present in the built file. A marker is a feature's fingerprint: if the",
-  "//3": "string is gone, the feature is gone, and the deploy is refused.",
-  "//4": "Markers must be literals the compiler cannot fold away -- log message",
-  "//5": "text is ideal, because it is emitted verbatim and it names the feature.",
-  "//6": "Add a marker the same day you add a feature; that is the whole point.",
-  "install": "D:\\Aowlspt\\aowlspt",
-  "artifacts": [
-    {
-      "name": "host",
-      "src": "host/Aowlspt.Host.Il2Cpp/bin/aowlspt-host-il2cpp.dll",
-      "dst": "aowlspt-host-il2cpp.dll",
-      "minBytes": 500000,
-      "markers": [
-        "aowlspt-host-il2cpp",
-        "nameIndex: loaded aowlspt-names.idx",
-        "STALE INDEX -- aowlspt-names.idx",
-        "host running",
-        "IL2CPP runtime bound, all essential entry points present",
-        "overlay ready (F12 opens settings)",
-        "botcap (offline bot-cap lift)",
-        "botdiag",
-        "botai",
-        "debugui: PreloaderUI::Update detour is live",
-        "debugEsp",
-        "menu mode text:",
-        "settings pages: persisted",
-        "settingsRelabelProbe",
-        "settingsBindProbe",
-        "osCloseFix",
-        "imageCdnRedirect",
-        "uxVersionBrand",
-        "unlimitedBots",
-        "invoke2",
-        "anti-cheat:",
-        "components EXPR [BaseType]",
-        "SHARED RVA: ",
-        "SHAREDNESS IS UNKNOWN for this entry",
-        "mods tab: built -- a sixth tab button cloned into SettingsScreen/",
-        "hide seasons armed as RIDERS on the ",
-        "settingsModsTab is set",
-        "mods tab: pages go into ",
-        "subtab BUTTON(s) cloned into a clone of ",
-        "version brand: REFUSING to write",
-        "hide seasons: Common UI/MenuScreen/SeasonsButton switched off",
-        "DID NOT FULLY TAKE -- it reads ",
-        "TextMeshProUGUI, matching the donor",
-        "was hidden again on the FIRST frame it did",
-        "extra toggle(s) inside a ",
-        "inherited sibling(s) on the spine ",
-        "row caption(s) across ",
-        "strip and ONE page. More means several pages are visible at once",
-        "our panel was still active with the MODS tab NOT ",
-        "settingsPostFxSubtab is set",
-        "been folded into Graphics as a subtab",
-        "STOCK POSTFX TAB HAS BEEN PUT BACK in the top row",
-        "Verified by re-reading the clone, not by trusting the write",
-        "hide seasons: GIVING UP after "
-      ]
-    },
-    {
-      "//": "The offline name->RVA index the host resolves by-name patch targets",
-      "//1": "through. It was built beside the host DLL and deployed by NOBODY,",
-      "//2": "which left the live install with whatever stale copy was last put",
-      "//3": "there by hand -- and, since format version 2, with no share counts",
-      "//4": "at all. The host refuses a version-1 index outright, so the marker",
-      "//5": "below is the magic AND the little-endian version word: an index",
-      "//6": "that cannot answer 'is this RVA shared?' never reaches an install.",
-      "name": "nameidx",
-      "src": "host/Aowlspt.Host.Il2Cpp/bin/aowlspt-names.idx",
-      "dst": "aowlspt-names.idx",
-      "minBytes": 1000000,
-      "markers": [
-        "AOWLNIDX\u0002\u0000\u0000\u0000"
-      ]
-    },
-    {
-      "//": "The human-readable half: which METHOD NAMES share a folded RVA.",
-      "//1": "The index carries the COUNT and drives every refusal; this file",
-      "//2": "only names the neighbours, and carries the same imageKey/fileHash",
-      "//3": "stamp so it can never be read as belonging to another DLL.",
-      "name": "nameidxshared",
-      "src": "host/Aowlspt.Host.Il2Cpp/bin/aowlspt-names.idx.shared",
-      "dst": "aowlspt-names.idx.shared",
-      "minBytes": 1000,
-      "markers": [
-        "AOWLSHARED1"
-      ]
-    },
-    {
-      "name": "tarkov",
-      "src": "mods/tarkov/bin/tarkov.dll",
-      "dst": "mods/tarkov/tarkov.dll",
-      "minBytes": 100000,
-      "markers": [
-        "aowl.tarkov",
-        "/client/game/start",
-        "/client/game/profile/list",
-        "/client/items",
-        "/client/locations",
-        "BotLocationModifier",
-        "menuCornerLabel"
-      ]
-    },
-    {
-      "name": "backend",
-      "src": "backend/bin/aowlspt-backend.exe",
-      "dst": "aowlspt-backend.exe",
-      "minBytes": 100000,
-      "markers": [
-        "aowlspt-backend",
-        "listening on"
-      ]
-    },
-    {
-      "name": "launch",
-      "src": "installer/build/aowlspt-launch.exe",
-      "dst": "aowlspt-launch.exe",
-      "minBytes": 100000,
-      "markers": [
-        "aowlspt-launch",
-        "host running",
-        "backendUrl"
-      ]
-    }
-  ]
+ "//": "Data for `python tools/deploy.py`. Each artifact names where it is built,",
+ "//1": "where it goes in a live install, and the literal strings that MUST be",
+ "//2": "present in the built file. A marker is a feature's fingerprint: if the",
+ "//3": "string is gone, the feature is gone, and the deploy is refused.",
+ "//4": "Markers must be literals the compiler cannot fold away -- log message",
+ "//5": "text is ideal, because it is emitted verbatim and it names the feature.",
+ "//6": "Add a marker the same day you add a feature; that is the whole point.",
+ "install": "D:\\Aowlspt\\aowlspt",
+ "artifacts": [
+  {
+   "name": "host",
+   "src": "host/Aowlspt.Host.Il2Cpp/bin/aowlspt-host-il2cpp.dll",
+   "dst": "aowlspt-host-il2cpp.dll",
+   "minBytes": 500000,
+   "markers": [
+    "aowlspt-host-il2cpp",
+    "nameIndex: loaded aowlspt-names.idx",
+    "STALE INDEX -- aowlspt-names.idx",
+    "host running",
+    "IL2CPP runtime bound, all essential entry points present",
+    "overlay ready (F12 opens settings)",
+    "botcap (offline bot-cap lift)",
+    "botdiag",
+    "botai",
+    "debugui: PreloaderUI::Update detour is live",
+    "debugEsp",
+    "menu mode text:",
+    "settings pages: persisted",
+    "settingsRelabelProbe",
+    "settingsBindProbe",
+    "osCloseFix",
+    "imageCdnRedirect",
+    "uxVersionBrand",
+    "unlimitedBots",
+    "invoke2",
+    "anti-cheat:",
+    "components EXPR [BaseType]",
+    "SHARED RVA: ",
+    "SHAREDNESS IS UNKNOWN for this entry",
+    "mods tab: built -- a sixth tab button cloned into SettingsScreen/",
+    "hide seasons armed as RIDERS on the ",
+    "settingsModsTab is set",
+    "mods tab: pages go into ",
+    "subtab BUTTON(s) cloned into a clone of ",
+    "version brand: REFUSING to write",
+    "hide seasons: Common UI/MenuScreen/SeasonsButton switched off",
+    "DID NOT FULLY TAKE -- it reads ",
+    "TextMeshProUGUI, matching the donor",
+    "was hidden again on the FIRST frame it did",
+    "extra toggle(s) inside a ",
+    "inherited sibling(s) on the spine ",
+    "row caption(s) across ",
+    "strip and ONE page. More means several pages are visible at once",
+    "our panel was still active with the MODS tab NOT ",
+    "settingsPostFxSubtab is set",
+    "been folded into Graphics as a subtab",
+    "STOCK POSTFX TAB HAS BEEN PUT BACK in the top row",
+    "Verified by re-reading the clone, not by trusting the write",
+    "hide seasons: GIVING UP after ",
+    "skip mode screen ARMED",
+    "uxSkipModeScreen",
+    "CharacterSelectionScreenController::Submit",
+    "region: armed as a RIDER on the existing EFT.UI.PreloaderUI::",
+    "aowl_region_register_x"
+   ]
+  },
+  {
+   "//": "The offline name->RVA index the host resolves by-name patch targets",
+   "//1": "through. It was built beside the host DLL and deployed by NOBODY,",
+   "//2": "which left the live install with whatever stale copy was last put",
+   "//3": "there by hand -- and, since format version 2, with no share counts",
+   "//4": "at all. The host refuses a version-1 index outright, so the marker",
+   "//5": "below is the magic AND the little-endian version word: an index",
+   "//6": "that cannot answer 'is this RVA shared?' never reaches an install.",
+   "name": "nameidx",
+   "src": "host/Aowlspt.Host.Il2Cpp/bin/aowlspt-names.idx",
+   "dst": "aowlspt-names.idx",
+   "minBytes": 1000000,
+   "markers": [
+    "AOWLNIDX\u0002\u0000\u0000\u0000"
+   ]
+  },
+  {
+   "//": "The human-readable half: which METHOD NAMES share a folded RVA.",
+   "//1": "The index carries the COUNT and drives every refusal; this file",
+   "//2": "only names the neighbours, and carries the same imageKey/fileHash",
+   "//3": "stamp so it can never be read as belonging to another DLL.",
+   "name": "nameidxshared",
+   "src": "host/Aowlspt.Host.Il2Cpp/bin/aowlspt-names.idx.shared",
+   "dst": "aowlspt-names.idx.shared",
+   "minBytes": 1000,
+   "markers": [
+    "AOWLSHARED1"
+   ]
+  },
+  {
+   "name": "tarkov",
+   "src": "mods/tarkov/bin/tarkov.dll",
+   "dst": "mods/tarkov/tarkov.dll",
+   "minBytes": 100000,
+   "markers": [
+    "aowl.tarkov",
+    "/client/game/start",
+    "/client/game/profile/list",
+    "/client/items",
+    "/client/locations",
+    "BotLocationModifier",
+    "menuCornerLabel"
+   ]
+  },
+  {
+   "name": "backend",
+   "src": "backend/bin/aowlspt-backend.exe",
+   "dst": "aowlspt-backend.exe",
+   "minBytes": 100000,
+   "markers": [
+    "aowlspt-backend",
+    "listening on"
+   ]
+  },
+  {
+   "name": "launch",
+   "src": "installer/build/aowlspt-launch.exe",
+   "dst": "aowlspt-launch.exe",
+   "minBytes": 100000,
+   "markers": [
+    "aowlspt-launch",
+    "host running",
+    "backendUrl",
+    "could not write launchProfileId"
+   ]
+  }
+ ]
 }

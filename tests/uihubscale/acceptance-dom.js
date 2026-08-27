@@ -109,6 +109,34 @@ function check(n, c, d) { console.log((c ? 'PASS ' : 'FAIL ') + n + (d !== undef
   check('clicking a sidebar section writes a deep link into the hash',
         /guid=aowl\.uihubscale/.test(win.location.hash) && /cat=/.test(win.location.hash), win.location.hash);
 
+  /* 5b. SUB-TABS: the second level is nested, not promoted.
+   *
+   * Stated as NEGATIVES. "there are 24 sub-entries" passes for a nav that
+   * flattened every (category, subcategory) pair into 32 top-level rows, which
+   * is precisely the shape this exists to forbid: a subcategory must never
+   * become a top-level group, and a group name must never be a dotted path
+   * standing in for a hierarchy the nav did not build. */
+  {
+    const SUBS = ['Core', 'Tuning', 'Experimental'];
+    /* The nav renders a category as `Name (n)`; the count is not part of
+     * the name and a check that forgot to strip it could never fail. */
+    const catNames = $$('.aw-navcat').map(e => e.textContent.trim().replace(/\s*\(\d+\)$/, ''));
+    const subNames = $$('.aw-navsub').map(e => e.textContent.trim());
+    check('no subcategory has been promoted to a top-level group',
+          catNames.every(n => SUBS.indexOf(n) < 0), catNames);
+    check('no top-level group name is a dotted path standing in for nesting',
+          catNames.every(n => n.indexOf('.') < 0 && !/^SPT/i.test(n)), catNames);
+    check('every category really does carry its three sub-tabs',
+          subNames.length === 24 && SUBS.every(s => subNames.filter(n => n === s).length === 8),
+          [subNames.length, subNames.slice(0, 4)]);
+    /* And the second level is USABLE, not decoration: clicking one deep-links
+     * to that (category, subcategory), not to the category alone. */
+    $$('.aw-navsub')[1].dispatchEvent(new win.Event('click'));
+    await sleep(80);
+    check('clicking a sub-tab deep-links to the subcategory, not just the category',
+          /sub=/.test(win.location.hash), win.location.hash);
+  }
+
   /* 6. remote typeahead -- reach the row by searching for it */
   q.value = 'searched on the server'; q.dispatchEvent(new win.Event('input'));
   await sleep(120);
