@@ -223,6 +223,72 @@ def cmd_routes(a):
     print(f"-- {len(routes)} distinct routes actually exercised")
 
 
+def cmd_dtos(a):
+    """route -> the DTO THE CLIENT ITSELF NAMES, and whether dtogap agrees.
+
+    ## This is the best route->DTO instrument we have, and it was buried
+
+    When Newtonsoft throws, the client logs `JSON parsing into <Type>` next to
+    the URL. That is the client STATING its deserialization target -- strictly
+    better evidence than dtogap's `--whichdto`, which ranks types by wire-key
+    overlap and therefore cannot say anything at all about a payload with one
+    or two generic keys ({"elements": [...]}, {"status": "ok"}): hundreds of
+    the assembly's 18,629 types declare those names, so a 1.000 score is
+    meaningless. The 28 routes that had no mapping were overwhelmingly of that
+    shape, which is exactly why key ranking had left them unmapped.
+
+    `sweep` already parsed this field and printed it in a 34-character column,
+    truncated, mixed into an error table -- so answering "what type does the
+    client deserialize route X into" meant reading the sweep, guessing which
+    row, and running `show N` for each. It is one table.
+
+    Three outcomes per row, never two: `agree`, `DISAGREE` (dtogap maps a
+    different type -- one of the two is wrong and it is worth knowing which),
+    and `UNMAPPED` (the client named a type dtogap does not carry). Absence
+    from this table is NOT evidence a route is fine: the client only names a
+    type when it THREW, so a route that never failed never appears.
+    """
+    _, agg, _, _ = collect(a.sessions)
+    seen = {}
+    for e in agg.values():
+        r, d = e.get("route"), e.get("dto")
+        if not r or not d:
+            continue
+        r = r.split("?")[0].rstrip(":")
+        cur = seen.setdefault(r, {})
+        cur[d] = cur.get(d, 0) + e["count"]
+    try:
+        sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+        import dtogap as G
+        table = G.ROUTES
+    except Exception:
+        table = None
+    print(f"{'route':<44} {'type the CLIENT named':<44} hits  vs dtogap")
+    for r in sorted(seen):
+        for d, n in sorted(seen[r].items(), key=lambda kv: -kv[1]):
+            bare = d[:-2] if d.endswith("[]") else d
+            # The client prints a NESTED type CLR-style,
+            # `EFT.GlobalConfiguration+MainQuestSettings`, while il2cpp
+            # metadata (and therefore dtogap) names it `MainQuestSettings`.
+            # Comparing the raw strings reported DISAGREE for a route where
+            # the two agree exactly -- a false alarm in a column whose whole
+            # value is that DISAGREE means something.
+            bare = bare.rsplit("+", 1)[-1]
+            if table is None:
+                verdict = "?"
+            elif r not in table:
+                verdict = "UNMAPPED in dtogap"
+            elif table[r][0] is None:
+                verdict = "dtogap says n/a"
+            elif table[r][0] == bare or table[r][0].endswith("." + bare):
+                verdict = "agree"
+            else:
+                verdict = "DISAGREE: dtogap has " + table[r][0]
+            print(f"{r[:44]:<44} {d[:44]:<44} {n:>4}  {verdict}")
+    print(f"-- {len(seen)} route(s) the client NAMED a type for. A route absent "
+          f"here never threw, which is not the same as never being wrong.")
+
+
 def main():
     p = argparse.ArgumentParser()
     p.add_argument("--sessions", type=int, default=None,
@@ -233,6 +299,7 @@ def main():
     s = sub.add_parser("show"); s.add_argument("n", type=int)
     s.add_argument("--chars", type=int, default=1800); s.set_defaults(fn=cmd_show)
     s = sub.add_parser("routes"); s.set_defaults(fn=cmd_routes)
+    s = sub.add_parser("dtos"); s.set_defaults(fn=cmd_dtos)
     a = p.parse_args()
     a.fn(a)
 

@@ -172,6 +172,191 @@ ROUTES = {
     "/client/menu/locale/en":              (None, "n/a", "keyed localisation dict, not a DTO"),
     "/client/customization":               (None, "n/a",
                                             "728 customization templates keyed by id, like /client/items"),
+    # ------------------------------------------------------------------
+    # MAPPED FROM THE CLIENT OWN ERROR LOG -- the authoritative instrument.
+    #
+    # `--whichdto` cannot map any of these: their payloads carry 1-3 top-level
+    # keys, and a one-generic-key payload ({"elements": [...]}, {"status":..})
+    # has HUNDREDS of declarers among 18,629 types. Ranking by key overlap on
+    # such a payload produces a 1.000 score that means nothing. That is the
+    # confidence floor adopted here, and it is why these 28 stayed unmapped.
+    #
+    # The floor: a route is MAPPED only if EITHER
+    #   (a) a client log line says `JSON parsing into <Type>` FOR THAT ROUTE
+    #       -- the client naming its own deserialization target, or
+    #   (b) the DTO is the UNIQUE declarer, across every type in the assembly,
+    #       of the payload full key set, and at least one of those keys is
+    #       route-specific rather than a generic word.
+    # Anything else is n/a or INCONCLUSIVE. It is never forced.
+    #
+    # (a) is new and it is strictly better than key-set ranking, because it is
+    # the client stating the type rather than us inferring it. It is mined by
+    # tools/clientlog.py; `clientlog.py dtos` prints the route -> type table.
+    # ------------------------------------------------------------------
+
+    # THE ONE THIS WEEK TWO LIVE CRASHES LIVED ON.
+    # `clientlog.py show 16`: 45 hits across 13 sessions, verbatim --
+    #   JSON parsing into ChatShared.ChatRoomInformation[]
+    #   Error converting value False to type 'ChatShared.ChatMessageSystemData'.
+    #   Path 'data[0].message.systemData'
+    # so the element type is measured, not inferred. It is independently
+    # confirmed structurally: of 18,629 types exactly TWO declare
+    # `attachmentsNew` -- ChatRoomInformation and UpdatableChatDialogue -- and
+    # only ChatRoomInformation carries wire-lowercase names and no runtime-only
+    # members (UpdatableChatDialogue holds UpdatableBindableList fields, so it
+    # is the live model, not the wire DTO). Its `message` is
+    # DialogueChatMessage, whose `systemData` is ChatMessageSystemData: exactly
+    # the member and exactly the path the client threw on.
+    #
+    # NOTE THE FALSIFIER IS ABSENT, and that is stated rather than hidden: all
+    # three raid1 captures for this route (136, 263, 458) have `data: []`, and
+    # our own sample is `[]` too, because the capture account had no mail. So
+    # there is NO key-set evidence either way here and `--whichdto` on this
+    # route is INCONCLUSIVE by construction -- an empty capture body must not
+    # be read as "BSG never sent this". The mapping rests on (a), not on keys.
+    "/client/mail/dialog/list":            ("ChatShared.ChatRoomInformation", "named",
+                                            "MEASURED from the client log (clientlog.py show 16): "
+                                            "'JSON parsing into ChatShared.ChatRoomInformation[]'. "
+                                            "Response is an ARRAY; keys taken from element [0]. "
+                                            "Both live crash-class bugs this week were on this route."),
+
+    # clientlog.py show 21: 'JSON parsing into EFT.Dialogs.TraderDialogsDTO'.
+    # The route mapping is measured. The MEMBER audit is not: this type
+    # declares ZERO fields and zero properties, so it is populated by a custom
+    # converter and there is nothing to diff. Mapped anyway, because "which
+    # type" and "which members" are different questions and only the second is
+    # unanswerable here.
+    "/client/dialogue":                    ("EFT.Dialogs.TraderDialogsDTO", "named",
+                                            "client log; 0 declared members (converter-driven), so any "
+                                            "member diff below is INCONCLUSIVE, not a pass"),
+
+    # clientlog.py show 25: 'JSON parsing into
+    # EFT.GlobalConfiguration+MainQuestSettings'. Independently, MainQuestSettings
+    # is the UNIQUE declarer of `chapters` in the whole assembly. Two instruments,
+    # same answer.
+    #
+    # AND A TRAP AVOIDED. Its one member is `Chapters : IEnumerable<string>`,
+    # while we serve `chapters: [{"ChapterId": "..."}]` -- objects into a string
+    # sequence, which reads as a certain FATAL. It is not one: raid1 capture
+    # seq 073 is VERBATIM BSG TRAFFIC for this route and sends the IDENTICAL
+    # array-of-objects. A defect BSG own server also commits is our audit
+    # being wrong, not BSG. Member-level verdict: INCONCLUSIVE (the client must
+    # read Chapters through a converter); route-level verdict: MAPPED.
+    "/client/quest/getMainQuestsList":     ("MainQuestSettings", "named",
+                                            "client log + unique declarer of `chapters`; the "
+                                            "IEnumerable<string> vs array-of-objects mismatch is "
+                                            "contradicted by BSG capture 073 -- NOT a defect"),
+
+    # clientlog.py show 28: 'JSON parsing into EFT.Quests.RepeatableQuestsRange[]'.
+    # The logged failure -- `Error converting value {null} to type System.Int32,
+    # Path data[0].unavailableTime` -- is HISTORICAL: we now serve `[]`, and so
+    # does BSG (captures 271 and 462 are both `[]`).
+    "/client/repeatalbeQuests/activityPeriods":
+                                           ("EFT.Quests.RepeatableQuestsRange", "named",
+                                            "client log; response is an ARRAY; keys from element [0]"),
+
+    # clientlog.py show 37: 'JSON parsing into EFT.AvailableCustomizationsResponse'
+    # -- and the client says that type "requires a JSON array", so the response
+    # is array-shaped. Same envelope type as /client/account/customization.
+    #
+    # THE ELEMENT TYPE IS NOT ESTABLISHED, and this is a check that would
+    # otherwise not be able to fail: AvailableCustomizationsResponse declares
+    # ZERO members, so diffing against it reports "nothing missing" for any
+    # payload whatsoever. No type in the assembly declares {id, source, type}
+    # together, so the element DTO was not found. Route MAPPED, elements
+    # INCONCLUSIVE -- said out loud rather than banked as a pass.
+    "/client/customization/storage":       ("EFT.AvailableCustomizationsResponse", "named",
+                                            "client log; ARRAY-shaped. 0 declared members, so the "
+                                            "member diff is INCONCLUSIVE, not a pass; no type declares "
+                                            "the element key set {id,source,type}"),
+
+    # ---- rule (b): UNIQUE declarer of the payload full key set ----
+    # `launchTutorGame` is declared by exactly ONE type of 18,629.
+    # Falsified against BSG: captures 148/257/454 all send {"launchTutorGame": <bool>}.
+    "/client/tutor-game/check":            ("EFT.StartTutorialInfo", "named",
+                                            "1.00, 1/1 keys, UNIQUE declarer of `launchTutorGame`; "
+                                            "matches BSG captures 148/257/454"),
+    # elements -> EndingElement[]; BSG capture 132 element keys match 5/5
+    # (id, systemName, conditions, rewards, consequences).
+    "/client/ending/list":                 ("EFT.FinalsResponse", "named",
+                                            "1.00; element EFT.EndingElement matches BSG capture 132 5/5"),
+    # elements -> AchievementTemplate[]; BSG capture 133 element keys 12/15
+    # (the 3 BSG sends that the client does not declare are tolerated extras).
+    "/client/achievement/list":            ("EFT.Achievements.AchievementsListDTO", "named",
+                                            "1.00; element EFT.Achievements.AchievementTemplate "
+                                            "matches BSG capture 133 12/15"),
+    # elements -> Dictionary<MongoID,float>, i.e. an OBJECT, which is what we
+    # serve. The sibling AchievementsListDTO declares elements as an ARRAY, so
+    # these two are not interchangeable and the shape distinction is real.
+    "/client/achievement/statistic":       ("EFT.Achievements.AchievementsGlobalProgressDTO", "named",
+                                            "1.00; `elements` is Dictionary<MongoID,float> -- an OBJECT, "
+                                            "as we serve it"),
+    # season -> SeasonData; BSG captures 080/237/438 match 4/4.
+    # THIS ONE IS A REAL GAP, and it is ours, not a mapping artefact: our
+    # backend serves `data: {}` for this route where BSG serves
+    # {"season": {...}}. Reported, not fixed here.
+    "/client/season/active":               ("EFT.ActiveSeasonResponse", "named",
+                                            "1.00; EFT.SeasonData matches BSG captures 080/237/438 4/4. "
+                                            "WE SERVE `data: {}` -- an emulation gap, not a shape bug"),
+    # battlePasses -> IReadOnlyList<BattlePassData>; BSG capture 081 element
+    # keys match 6/6. `weak` and not `named` ON PURPOSE: `battlePasses` is also
+    # declared by EFT.GlobalConfiguration, so this is not a unique declarer and
+    # rule (b) is not satisfied outright.
+    "/client/battle-pass/active":          ("BattlePassConfig", "weak",
+                                            "0.83 on 1 key; NOT a unique declarer (GlobalConfiguration "
+                                            "declares `battlePasses` too). Element BattlePassData does "
+                                            "match BSG capture 081 6/6, but treat diffs as INCONCLUSIVE"),
+
+    # ---- genuinely no single top-level DTO. This is a RESULT, not a gap. ----
+    "/client/languages":                   (None, "n/a",
+                                            "17 language names keyed by 2-letter code (BSG capture 033 "
+                                            "is identical in shape); not a DTO"),
+    "/client/insurance/items/list/cost":   (None, "n/a",
+                                            "costs keyed by traderId, then by item template id; "
+                                            "no top-level DTO"),
+    "/v2/client/game/profiles/":           (None, "n/a",
+                                            "profile descriptors keyed by GAME MODE (`regular`, `pve`); "
+                                            "the DTO is the VALUE (EFT.ProfileDescriptor), not the "
+                                            "top-level object -- diff with "
+                                            "--dto EFT.ProfileDescriptor --path data.regular"),
+
+    # ---- client-SENT, or a response with no key set at all. Nothing to diff.
+    # An empty/bool/null `data` is not a DTO and saying "mapped" about it would
+    # be a check that cannot fail.
+    "/client/game/profile/items/moving":   (None, "n/a", "client SENDS this; the response is an "
+                                            "operation result envelope, no named response class"),
+    "/client/putLoadMetrics":              (None, "n/a", "telemetry sink; `data` is null"),
+    "/client/putHWMetrics":                (None, "n/a", "telemetry sink; `data` is null"),
+    "/client/putMetrics":                  (None, "n/a", "telemetry sink; `data` is null"),
+    "/client/survey":                      (None, "n/a", "`data` is null when no survey is active"),
+    "/client/raid/configuration":          (None, "n/a", "client SENDS the raid config; `data` is null"),
+    "/client/match/group/exit_from_menu":  (None, "n/a", "`data` is null"),
+    "/client/match/available":             (None, "n/a", "`data` is a bare bool"),
+    "/client/match/group/invite/cancel-all": (None, "n/a", "`data` is a bare bool"),
+
+    # ---- INCONCLUSIVE. Not mapped, and deliberately NOT forced. ----
+    "/client/variable/group":              (None, "n/a",
+                                            "INCONCLUSIVE, not n/a-by-nature: the payload is an array of "
+                                            "{id, variables}, and NO type in 18,629 declares both keys. "
+                                            "The DTO exists (BSG capture 075 sends the same shape); we "
+                                            "did not find it."),
+    "/client/prestige/list":               (None, "n/a",
+                                            "INCONCLUSIVE: `elements` resolves to the OPEN generic "
+                                            "EFT.BackendArrayDto`1, whose element is a type parameter. "
+                                            "A closed instantiation is not nameable here, so the "
+                                            "elements would go silently unaudited under it."),
+    "/client/game/start":                  (None, "n/a",
+                                            "INCONCLUSIVE: `{utc_time}` ties JsonType.KeepAliveResponse "
+                                            "and JsonType.RegenerateTokenResponse, both 1 member. One "
+                                            "generic key cannot break the tie."),
+    "/client/game/version/validate":       (None, "n/a",
+                                            "INCONCLUSIVE: `{isvalid}` has 7 declarers; EFT.CheckVersionData "
+                                            "is plausible (it is /client/checkVersion DTO) but one key "
+                                            "is not evidence."),
+    "/client/game/logout":                 (None, "n/a",
+                                            "INCONCLUSIVE: `{status}` is one of the most-declared names "
+                                            "in the assembly; unmappable by key set."),
+
     "/client/quest/getMainQuestNotesList": (None, "n/a",
                                             "QuestNoteTemplate ranks 0.75 and CONTRADICTS a verbatim BSG "
                                             "capture; see the note above. Unmapped, not passed."),
@@ -590,7 +775,22 @@ def report(r, route, dto, conf, note, sample, jpath, at=None, prov=None):
         print("%s\n  INCONCLUSIVE: DTO %r -- %s" % (route, dto, e))
         return
     flds, skipped = dto_fields(r, t, at)
-    sample = sample or find_capture(route)
+    if not sample:
+        # NOT `find_capture`. That returns the FIRST captured body, and an
+        # empty first body is the trap this module's own find_captures
+        # docstring documents: seq 083 for /client/game/profile/list was
+        # recorded before a profile existed, so `data` is `[]`, and the diff
+        # then reports every declared member as absent. Take the first capture
+        # that actually carries something at `jpath`; fall back to the first
+        # body so the "EMPTY -- zero keys to diff" INCONCLUSIVE is still
+        # printed when EVERY capture is empty (which is the true state of
+        # /client/mail/dialog/list: 136, 263 and 458 are all `data: []`).
+        for _p in find_captures(route):
+            if emitted_keys(_p, jpath):
+                sample = _p
+                break
+        else:
+            sample = find_capture(route)
     if not sample:
         print("%s  DTO=%s [%s]" % (route, dto, conf))
         print("  INCONCLUSIVE: no served payload for this route (not in raid1 "

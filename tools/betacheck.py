@@ -73,6 +73,11 @@ constant is the failure mode this file exists to avoid.
                server must go red
     senderid   demand 23-character sender ids instead of the 24 a MongoID has,
                so a correct server must go red
+    dtomap     hide one route from dtogap.ROUTES, so the coverage check must
+               go red.  An UNMAPPED route is INCONCLUSIVE and was silently
+               reported as nothing at all -- which is how mail/dialog/list,
+               the most-called route in the client's own log and the home of
+               both live crashes this week, went 43 hits a session unaudited
     nestedtype plant an ARRAY at a NESTED member the client declares as a
                class, after the response arrives.  The recursive type walk
                must go red -- if it does not, it is only looking at the top
@@ -640,17 +645,26 @@ def check_tolerated(w, mut):
     import dtogap as _g
     missing, superset, notes = [], [], []
     for route, key, trader in TOLERATED:
-        cap = _g.find_capture(route)
-        if not cap:
+        # `find_capture` returns the FIRST captured body, and dtogap's own
+        # docstring records why that is a trap: seq 083 for
+        # /client/game/profile/list was captured before a profile existed, so
+        # `data` is EMPTY, and an empty falsifier is indistinguishable from an
+        # absent one. dtodeep/dtotype were moved to `find_captures`; this
+        # consumer was left behind and would report INCONCLUSIVE (or, worse,
+        # compare against nothing) for any route whose first body is empty.
+        # Take the first capture that actually carries an object at `data`.
+        cap, bsg_data = None, None
+        for p in (_g.find_captures(route) or []):
+            with open(p, encoding="utf-8") as fh:
+                d = json.load(fh).get("data")
+            if isinstance(d, dict) and d:
+                cap, bsg_data = p, d
+                break
+        if cap is None:
             record("tolerated", INCONC,
-                   "no BSG capture for %s under %s" % (route, _g.CAPTURE_ROOT))
-            return
-        with open(cap, encoding="utf-8") as fh:
-            bsg = json.load(fh)
-        bsg_data = bsg.get("data")
-        if not isinstance(bsg_data, dict):
-            record("tolerated", INCONC,
-                   "BSG capture %s has no object at `data`" % os.path.basename(cap))
+                   "no BSG capture for %s with a non-empty object at `data` "
+                   "under %s (an EMPTY captured body is not evidence)"
+                   % (route, _g.CAPTURE_ROOT))
             return
         want_present = (mut == "tolerated")
         if (key in bsg_data) != want_present:
@@ -1553,6 +1567,61 @@ def _dig(obj, path):
             return False, None
         cur = cur[part]
     return True, cur
+
+
+def check_dto_map(w, mut):
+    """Every route we SAMPLE must have a dtogap entry -- mapped, or n/a WITH A
+    REASON. Neither is optional and neither is silence.
+
+    ## Why this is a check and not bookkeeping
+
+    An unmapped route produces no row anywhere: dtogap prints INCONCLUSIVE,
+    dtotype prints "no DTO mapped -- TYPES NOT CHECKED", and both scroll past.
+    Nothing ever goes red. /client/mail/dialog/list was in exactly that state
+    -- 43 hits per session in the client's own backend_000.log, the single
+    most-called route it has -- while BOTH of the week's live crash-class bugs
+    lived on it (`systemData: false` into ChatMessageSystemData, and a sender
+    id that was not 24 chars and threw in EFT.MongoID's constructor, killing
+    the ENTIRE inbox response). Neither was findable by the audit. That is a
+    coverage hole behaving like a pass, which is CLAUDE.md 9b exactly.
+
+    So the assertion is on the FINISHED STATE of the map and is a NEGATIVE:
+    no route this repo samples is absent from it, and no entry declines to
+    say why it has no DTO. It needs no backend and no payload -- it is a
+    property of the two tables -- so it can never be skipped for lack of a
+    running server, which is the other way a check quietly stops running.
+
+    Falsifiable by construction: `--mutate dtomap` removes one route from the
+    map, and this must go red.
+    """
+    import dtogap as _g
+    import oursample as _o
+    routes = [c[0] for c in _o.CALLS]
+    table = dict(_g.ROUTES)
+    if mut == "dtomap" and routes:
+        victim = "/client/mail/dialog/list" if "/client/mail/dialog/list" in table \
+            else routes[0]
+        table.pop(victim, None)
+    unmapped = [r for r in routes if r not in table]
+    silent = sorted(k for k, v in table.items()
+                    if not v[0] and not (len(v) > 2 and v[2] and v[2].strip()))
+    if unmapped:
+        record("dto-map", FAIL,
+               "%d of %d sampled route(s) have NO dtogap entry, so they are "
+               "not INCONCLUSIVE -- they are invisible: %s"
+               % (len(unmapped), len(routes), ", ".join(sorted(unmapped))))
+        return
+    if silent:
+        record("dto-map", FAIL,
+               "%d entry/entries map to no DTO and give no reason; 'n/a' "
+               "without a stated reason is indistinguishable from an "
+               "oversight: %s" % (len(silent), ", ".join(silent)))
+        return
+    withdto = sum(1 for r in routes if table[r][0])
+    record("dto-map", OK,
+           "all %d sampled routes are accounted for: %d carry a DTO, %d are "
+           "explicitly reason-bearing n/a" % (len(routes), withdto,
+                                              len(routes) - withdto))
 
 
 def check_route_shapes(w, mut):
@@ -2573,6 +2642,14 @@ def main():
         check_route_shapes(w, mut)
     except Exception as exc:                       # noqa: BLE001
         record("route-shapes", INCONC, "%s: %r" % (type(exc).__name__, exc))
+
+    # ------------------------------------------------------------------ 18b
+    # Offline on purpose: a property of dtogap.ROUTES vs oursample.CALLS, so
+    # it still runs (and can still go red) when no backend is reachable.
+    try:
+        check_dto_map(w, mut)
+    except Exception as exc:                       # noqa: BLE001
+        record("dto-map", INCONC, "%s: %r" % (type(exc).__name__, exc))
 
     # ------------------------------------------------------------------ 19
     try:

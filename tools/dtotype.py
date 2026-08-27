@@ -157,7 +157,7 @@ def sweep(r, at, dto, obj):
     return rows
 
 
-def bsg_kind(route, jpath, key):
+def bsg_kind(route, jpath, key, dto=None):
     """What JSON kind BSG's OWN capture put at this key, or None.
 
     This is the falsifier for the tool itself. `/client/weather` reported
@@ -166,26 +166,68 @@ def bsg_kind(route, jpath, key):
     BSG itself serves to this client is not our type error; it falsifies the
     DTO/[JsonProperty] mapping instead. Such a row is downgraded to UNKNOWN and
     says so, rather than being printed as a defect we do not have.
+
+    ## AN EMPTY FIRST BODY SILENTLY DISABLED THIS FALSIFIER
+
+    This used to call `G.find_capture`, which returns the FIRST captured body
+    for the route. For `/client/game/profile/list` that is seq 083, captured
+    before a profile existed, so `data` is an EMPTY LIST -- `o` came out None
+    and the function returned None, which the caller reads as "BSG never sent
+    this key", which is indistinguishable from "BSG sent a different kind".
+    dtogap.find_captures was fixed for exactly this and documents it in its own
+    docstring; this consumer was left on the old accessor and so reproduced the
+    bug it warns about. It now walks EVERY captured body in manifest order and
+    uses the first one that actually carries the key.
+
+    Returning None still means "no evidence", and no evidence is not an
+    excusal: the caller keeps the FATAL. What changed is that an empty body no
+    longer counts as evidence of absence.
     """
     try:
-        p = G.find_capture(route)
+        paths = list(G.find_captures(route) or [])
     except Exception:
         return None
-    if not p or not os.path.exists(p):
-        return None
-    try:
-        with open(p, encoding="utf-8", errors="replace") as f:
-            doc = json.load(f)
-    except (ValueError, OSError):
-        return None
-    o = at_path(doc, jpath or "data")
-    if isinstance(o, list):
-        o = o[0] if o else None
-    if not isinstance(o, dict):
-        return None
-    low = {k.lower(): k for k in o}
-    k = low.get(key.lower())
-    return None if k is None else jkind(o[k])
+    # ## THE EVIDENCE BELONGS TO THE DTO, NOT TO THE ROUTE
+    #
+    # /client/game/bot/generate deserializes into EFT.ProfileDescriptor, and
+    # raid1 captured no bot/generate body at all -- so route-keyed lookup found
+    # nothing and printed 7 FATAL rows (.Inventory.equipment/stash/
+    # questRaidItems/questStashItems/sortingTable "string into ItemDescriptor",
+    # and .Stats.Eft.DamageHistory.BodyParts "array into Dictionary").
+    # /client/game/profile/list uses THE SAME DTO and IS captured, five times:
+    # every one of 096/208/273/398/472 sends `equipment` as a bare string, and
+    # three of the five send `BodyParts` as an array. Our payload is byte-shaped
+    # like BSG's. All 7 were the audit being wrong, for the fifth time.
+    #
+    # A shape BSG serves for a DTO is evidence about THAT DTO wherever it
+    # appears. Same-route captures are still tried FIRST, so a route with its
+    # own evidence is never overruled by a sibling's.
+    if dto:
+        for other, ent in sorted(G.ROUTES.items()):
+            if other == route or ent[0] != dto:
+                continue
+            try:
+                paths.extend(G.find_captures(other) or [])
+            except Exception:
+                pass
+    for p in paths:
+        if not p or not os.path.exists(p):
+            continue
+        try:
+            with open(p, encoding="utf-8", errors="replace") as f:
+                doc = json.load(f)
+        except (ValueError, OSError):
+            continue
+        o = at_path(doc, jpath or "data")
+        if isinstance(o, list):
+            o = o[0] if o else None
+        if not isinstance(o, dict):
+            continue          # empty/absent body: NO evidence, not evidence of absence
+        low = {k.lower(): k for k in o}
+        k = low.get(key.lower())
+        if k is not None:
+            return jkind(o[k])
+    return None
 
 
 def run_one(r, at, label, obj, dto, route=None, jpath=None):
@@ -197,7 +239,7 @@ def run_one(r, at, label, obj, dto, route=None, jpath=None):
     for x in rows:
         if x[0] != MISMATCH:
             continue
-        same = bsg_kind(route, jpath, x[2]) if route else None
+        same = bsg_kind(route, jpath, x[2], dto) if route else None
         if same == x[4]:
             suppressed.append(x)
         else:
@@ -226,8 +268,30 @@ def run_one(r, at, label, obj, dto, route=None, jpath=None):
 _CAPCACHE = {}
 
 
-def capture_doc(route, jpath):
-    """BSG's own captured body for `route`, positioned at `jpath`."""
+def capture_doc(route, jpath, dto=None):
+    """BSG's own captured body for `route`, positioned at `jpath`.
+
+    ## THE EVIDENCE BELONGS TO THE DTO, NOT ONLY TO THE ROUTE
+
+    /client/game/bot/generate deserializes into EFT.ProfileDescriptor and raid1
+    captured NO bot/generate body at all, so this returned None and the deep
+    walk printed 7 FATAL rows with `0 BSG-excused`:
+    `.Inventory.equipment|stash|questRaidItems|questStashItems|sortingTable`
+    as "string into class ItemDescriptor", plus
+    `.Stats.Eft.DamageHistory.BodyParts` as "array into Dictionary".
+    /client/game/profile/list uses THE SAME DTO and is captured five times --
+    096, 208, 273, 398, 472 -- and every one of them sends `equipment` as a
+    bare string; three of the five send `BodyParts` as an array. Our payload is
+    shaped exactly like BSG's, so all 7 were the audit being wrong, which is
+    now the FIFTH time (container positions, /client/weather,
+    getMainQuestNotesList, 152 nested rows, and these).
+
+    A shape BSG serves for a DTO is evidence about that DTO wherever it
+    appears. The route's OWN captures are still tried first and win outright;
+    a sibling route sharing the DTO is only consulted when the route itself has
+    no usable body. No capture anywhere still returns None, and None still
+    means "no evidence" -- the FATAL is kept.
+    """
     if route in _CAPCACHE:
         return _CAPCACHE[route]
     # The FIRST capture for a route can be empty -- seq 083 for
@@ -235,8 +299,13 @@ def capture_doc(route, jpath):
     # empty falsifier is indistinguishable from an absent one, which is how
     # five correct `Inventory.*` members got reported FATAL. Take the first
     # capture that actually has something at `jpath`.
+    paths = list(G.find_captures(route) or [])
+    if dto:
+        for other, ent in sorted(G.ROUTES.items()):
+            if other != route and ent[0] == dto:
+                paths.extend(G.find_captures(other) or [])
     doc = None
-    for p in (G.find_captures(route) or []):
+    for p in paths:
         try:
             with open(p, encoding="utf-8", errors="replace") as f:
                 d = at_path(json.load(f), jpath or "data")
@@ -260,7 +329,7 @@ def deep_one(r, at, label, obj, dto, route=None, jpath="data",
               % (label, dto))
         return [], 0, 0, False, 0
     w = D.Walk(r, at, max_depth=depth, max_elems=elems)
-    bsg = capture_doc(route, jpath) if route else None
+    bsg = capture_doc(route, jpath, dto) if route else None
     if isinstance(bsg, list):
         bsg = bsg[0] if bsg else None
     w.walk_object(obj, t, "", 0, bsg)
