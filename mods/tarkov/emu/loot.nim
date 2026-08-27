@@ -883,6 +883,35 @@ proc descendants(list: List; rootId: string; picked: var seq[int]) =
     frontier = added
     inc guard
 
+proc rootIdForKey(list: List; key: string): string =
+  ## A drawn `itemDistribution` key, resolved to the `_id` of the item it names.
+  ##
+  ## The key is the candidate's **`composedKey`**, not its `_id`. Measured on
+  ## sandbox's `looseLoot.json`: 1232 of 1232 spawn points carry a
+  ## distribution, every drawn key matches some item's `composedKey`, and
+  ## **none of them matches any `_id`** in the same point. Treating the key as
+  ## an `_id` therefore selected an item that does not exist, `descendants`
+  ## picked nothing, and every probabilistic loose spawn point on every map
+  ## returned the empty string -- only `spawnpointsForced`, which carries no
+  ## distribution at all, survived to the client.
+  ##
+  ## An `_id` is still accepted, because the static tables and older dumps key
+  ## their distributions that way. A key that matches neither resolves to the
+  ## empty string and the point spawns nothing -- never a fallback to the first
+  ## candidate, because a wrong item on the floor is worse than a bare one.
+  result = ""
+  for i in 0 ..< list.len:
+    let it = whole(list.items[i])
+    var ck = it.field("composedKey").asText("")
+    if ck.len == 0:
+      ck = it.field("composedKey.key").asText("")
+    if ck.len > 0 and ck == key:
+      return it.field("_id").asText("")
+  for i in 0 ..< list.len:
+    let id = whole(list.items[i]).field("_id").asText("")
+    if id == key:
+      return id
+
 proc looseSpawn(d: LootDb; p: PresetIndex; a: AmmoTable; r: var Rng;
                 point: JsonRef; budget: var int): string =
   ## One loose spawn point, resolved to a loot entry.
@@ -904,7 +933,10 @@ proc looseSpawn(d: LootDb; p: PresetIndex; a: AmmoTable; r: var Rng;
     let k = pick(dist, r)
     if k.len == 0:
       return ""
-    rootId = k
+    let id = rootIdForKey(list, k)
+    if id.len == 0:
+      return ""
+    rootId = id
 
   var picked: seq[int] = @[]
   descendants(list, rootId, picked)

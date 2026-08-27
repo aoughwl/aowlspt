@@ -38,6 +38,8 @@ constant is the failure mode this file exists to avoid.
                It is in the post-1.0 location table the real server sent us
                but has no database entry and no parent map to inherit one, so
                a correct server cannot answer it and must go red
+    lootloose  demand MORE loose entries than a map has spawn points, which
+               no correct server can serve
 """
 
 import argparse
@@ -226,6 +228,7 @@ def main():
     std_profile = None
 
     # ---------------------------------------------------------------- 1 + 2
+    spt_root = a.spt   # `a` is shadowed further down; keep the path here.
     std_char, std_trader = spt_template(a.spt, "Standard", "usec")
     eod_char, _ = spt_template(a.spt, "Edge Of Darkness", "usec")
     want_std = len(std_char["Inventory"]["items"])
@@ -737,6 +740,75 @@ def main():
                    "%d container(s) at (0,0,0) as BSG sends them, %d loose "
                    "entr(ies) all with a non-zero Position"
                    % (len(conts), len(loose)))
+
+    # ----------------------------------------------------------------- 8c
+    # THE PROBABILISTIC LOOSE-LOOT NEGATIVE.
+    #
+    # "No map whose database carries N probabilistic `spawnpoints` serves a
+    # loose-entry count that is only its `spawnpointsForced` list."
+    #
+    # Stated that way because the failure it names is invisible to every check
+    # above: `looseLoot` was imported, the loose path ran, and the payload came
+    # back with a non-empty `Loot` -- so `lootmap`, `lootparity` and `lootpos`
+    # all went green while 1232 of sandbox's 1232 probabilistic spawn points
+    # emitted NOTHING and only the 15 forced ones survived.  The count is the
+    # only thing that distinguishes the two, which is why this asserts on it.
+    #
+    # Three outcomes, not two.  A server whose database has no `looseLoot` for
+    # a map serves zero loose entries, which is CORRECT for that database and
+    # proves nothing about this bug -- so it is INCONCLUSIVE, never a pass.
+    #
+    # The falsifying input: `--mutate lootloose` demands more loose entries
+    # than the map has spawn points at all, which no correct server can serve.
+    if not std_session:
+        record("lootloose", INCONC, "no session to start a raid with")
+    else:
+        locdir = os.path.join(spt_root, "SPT_Runtime", "SPT_Data", "database",
+                              "locations")
+        if not os.path.isdir(locdir):
+            locdir = os.path.join(spt_root, "SPT_Data", "database", "locations")
+        by_dir = dict((i.lower(), i) for i in CLIENT_LOCATION_IDS)
+        checked, silent, unimported = [], [], []
+        for d in (sorted(os.listdir(locdir)) if os.path.isdir(locdir) else []):
+            loc = by_dir.get(d.lower())
+            src = os.path.join(locdir, d, "looseLoot.json")
+            if loc is None or not os.path.isfile(src):
+                continue
+            loot, _ = _start(loc)
+            if loot is None:
+                continue
+            loose = [e for e in loot if not e.get("IsContainer")]
+            if not loose:
+                unimported.append(loc)
+                continue
+            # Only now is the (large) source file worth parsing.
+            with open(src, encoding="utf-8") as fh:
+                tbl = json.load(fh)
+            forced = len(tbl.get("spawnpointsForced") or [])
+            points = tbl.get("spawnpoints") or []
+            floor = forced + len(points) if mut == "lootloose" else forced
+            checked.append((loc, len(loose), forced, len(points)))
+            if len(loose) <= floor:
+                silent.append("%s: %d loose served, needed more than %d "
+                              "(%d forced + %d probabilistic spawn point(s) "
+                              "in the database)"
+                              % (loc, len(loose), floor, forced, len(points)))
+        if not checked:
+            record("lootloose", INCONC,
+                   "no map served any loose loot, so nothing was proved: "
+                   "`looseLoot` is not imported into this db.json for %s "
+                   "(tools/importdb.nim --loose)"
+                   % (", ".join(unimported) or "any map"))
+        elif silent:
+            record("lootloose", FAIL,
+                   "%d map(s) served ONLY their forced loose spawns: %s"
+                   % (len(silent), "; ".join(silent)))
+        else:
+            record("lootloose", OK,
+                   "%s"
+                   % "; ".join("%s served %d loose entr(ies) from %d forced + "
+                               "%d probabilistic spawn point(s)"
+                               % (l, n, f, p) for l, n, f, p in checked))
 
     print()
     bad = [r for r in results if r[1] != OK]
