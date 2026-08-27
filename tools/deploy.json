@@ -109,7 +109,9 @@
     "beta notice: registered with the shared region as participant '",
     "uxBetaOverlay",
     "read straight from the two log files, so this works with the backend down",
-    "/ search   O source   L level   M/N mod   G follow   "
+    "/ search   O source   L level   M/N mod   G follow   ",
+    "<press a key   Del=clear   Esc=cancel>",
+    "aowlspt_admin_shared_v5"
    ]
   },
   {
@@ -316,7 +318,10 @@
     "No recoil / sway",
     "Teleport to marker",
     "PASS  PhysicalBase+0x8C -> Stamina+0x10 written",
-    "Neuters EFT.Player::ApplyDamageInfo while in a "
+    "Neuters EFT.Player::ApplyDamageInfo while in a ",
+    "not read as KeyCode.None",
+    "Input::GetKeyDown bound and byte-verified",
+    "KeypadPlus"
    ]
   },
   {

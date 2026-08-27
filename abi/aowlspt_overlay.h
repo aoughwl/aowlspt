@@ -9481,6 +9481,31 @@ static LRESULT CALLBACK aowl_ov_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
         }
         if (g_ov_admin && aowl_admin_menu_open(g_ov_admin)) {
             int32_t sel = (int32_t)g_ov_admin->menuSel;
+            /* ---- REBIND CAPTURE -------------------------------------------
+             * While a capture is in flight the MOD is reading the key, on
+             * Unity's thread, through Input::GetKeyDown. This wndproc must
+             * therefore not ALSO interpret the press -- so everything is
+             * swallowed here. Unity's input does not come from this message
+             * pump, so swallowing the message does not hide the key from the
+             * capture; it only stops the same press from additionally moving
+             * the menu selection or the player.
+             *
+             * Capture is deliberately resolved on the mod side and not here:
+             * a wndproc sees Win32 virtual-keys, and turning those into
+             * KeyCodes would mean a 328-entry mapping of hand-typed
+             * constants. This way there is exactly one key namespace. */
+            if (aowl_admin_hotkey_capturing(g_ov_admin)) return 0;
+            /* K on a toggle row starts a rebind; Delete clears one. Both are
+             * free: the menu's other keys are already spoken for and neither
+             * of these is among them. */
+            if ((int32_t)wp == 'K' && aowl_admin_row_is_toggle(sel)) {
+                aowl_admin_hotkey_capture_begin(g_ov_admin, sel);
+                return 0;
+            }
+            if ((int32_t)wp == VK_DELETE && aowl_admin_row_is_toggle(sel)) {
+                aowl_admin_hotkey_set(g_ov_admin, sel, AOWL_KC_UNBOUND);
+                return 0;
+            }
             switch ((int32_t)wp) {
                 case VK_UP:    aowl_admin_menu_move(g_ov_admin, -1); return 0;
                 case VK_DOWN:  aowl_admin_menu_move(g_ov_admin, +1); return 0;
@@ -9929,7 +9954,7 @@ static void aowl_ov_admin_append(void) {
         float rowH = (float)AOWL_OV_CH + 5.0f;
         float mw = 250.0f;
         float mx = 18.0f, my = 70.0f;
-        mw = 320.0f;   /* wider than the toggle-only menu: the spawner rows carry values */
+        mw = 430.0f;   /* wider again: each toggle row now carries its hotkey too */
         float mh = rowH * (float)(AOWL_ADM_ROW_TOTAL + 3) + 8.0f;
         int32_t sel = (int32_t)g_ov_admin->menuSel;
         aowl_ov_rect(mx, my, mw, mh, AOWL_OV_BG);
@@ -9968,6 +9993,27 @@ static void aowl_ov_admin_append(void) {
             }
             aowl_ov_text(mx + 10.0f, ry + 2.0f, aowl_admin_row_name(i), AOWL_OV_TEXT);
             aowl_ov_text(mx + 148.0f, ry + 2.0f, st, col);
+            /* The HOTKEY column. Only toggle rows have one. It shows the key
+             * that is actually in the region, so what is drawn is the state
+             * the poll will read -- not an echo of whatever was last typed. */
+            if (aowl_admin_row_is_toggle(i)) {
+                if (aowl_admin_hotkey_capturing(g_ov_admin) &&
+                    (int32_t)g_ov_admin->hotkeyCapture == i) {
+                    aowl_ov_text(mx + 210.0f, ry + 2.0f,
+                                 "<press a key   Del=clear   Esc=cancel>",
+                                 AOWL_OV_ACCENT);
+                } else if (!aowl_admin_capable(g_ov_admin, i)) {
+                    /* Deliberately NOT blank: blank reads as "no key yet",
+                     * which invites the player to try to set one on an action
+                     * whose write is not bound. */
+                    aowl_ov_text(mx + 210.0f, ry + 2.0f, "[not bound]", AOWL_OV_DIM);
+                } else {
+                    const char* kn = aowl_admin_hotkey_name(g_ov_admin, i);
+                    aowl_ov_text(mx + 210.0f, ry + 2.0f,
+                                 (kn && kn[0]) ? kn : "[K to bind]",
+                                 (kn && kn[0]) ? AOWL_OV_TEXT : AOWL_OV_DIM);
+                }
+            }
         }
         /* The last spawn result, verbatim. It is populated on refusal as well
          * as on success -- there is deliberately no "it worked" styling here,
@@ -9975,10 +10021,17 @@ static void aowl_ov_admin_append(void) {
          * sent back. */
         {
             const char* res = aowl_admin_spawn_result(g_ov_admin);
+            const char* hkn = aowl_admin_hotkey_note_text(g_ov_admin);
+            float ry = my + rowH * (float)(AOWL_ADM_ROW_TOTAL + 1) + 8.0f;
             if (res && res[0]) {
-                float ry = my + rowH * (float)(AOWL_ADM_ROW_TOTAL + 1) + 8.0f;
                 aowl_ov_text(mx + 10.0f, ry, res, AOWL_OV_DIM);
+                ry += (float)AOWL_OV_CH + 2.0f;
             }
+            /* Why the last rebind was REFUSED, verbatim. A refusal nobody can
+             * see is the same as a silent no-op, which is the failure this
+             * whole feature exists not to be. */
+            if (hkn && hkn[0])
+                aowl_ov_text(mx + 10.0f, ry, hkn, AOWL_OV_ACCENT);
         }
     }
 

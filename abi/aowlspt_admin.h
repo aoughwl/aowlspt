@@ -149,14 +149,22 @@ enum {
 #define AOWL_ADM_F_DEAD     0x2u
 #define AOWL_ADM_F_ONSCREEN 0x4u   /* projected in front of the camera        */
 
+#include "aowlspt_keycode.h"
+
 #define AOWL_ADM_MAX_ENTITIES 256
 #define AOWL_ADM_NAME_LEN     24
 #define AOWL_ADM_STATUS_LEN   192
 #define AOWL_ADM_QUERY_LEN    48
 #define AOWL_ADM_RESULT_LEN   192
-#define AOWL_ADM_REGION_NAME  "Local\\aowlspt_admin_shared_v4"
-#define AOWL_ADM_MAGIC        0x414F574C41444D34ull  /* "AOWLADM4"            */
-#define AOWL_ADM_VERSION      4
+#define AOWL_ADM_REGION_NAME  "Local\\aowlspt_admin_shared_v5"
+#define AOWL_ADM_MAGIC        0x414F574C41444D35ull  /* "AOWLADM5"            */
+#define AOWL_ADM_VERSION      5
+/* v5 grew a hotkey block. The NAME and MAGIC change with the layout ON
+ * PURPOSE: a named section is created at the size of whoever maps it FIRST,
+ * so a v4 host sharing a name with a v5 mod would give the larger side a
+ * mapping that is too small and its writes would run off the end. A changed
+ * name makes a mixed deploy show up as "region not mapped" on one side --
+ * loud, and named by adminDiag() -- instead of as a fault. */
 
 typedef struct AowlAdminEntity {
     /* Screen box in back-buffer pixels, top-left origin, valid only when
@@ -217,6 +225,32 @@ typedef struct AowlAdminShared {
     volatile LONG spawnAck;
     volatile LONG spawnBusy;
     char          spawnResult[AOWL_ADM_RESULT_LEN];
+
+    /* ---- Action hotkeys -------------------------------------------------
+     * One slot per toggle. The value is a `UnityEngine.KeyCode` ORDINAL, not
+     * a Win32 virtual-key: the key is read with the game's own
+     * `Input::GetKeyDown(KeyCode)`, so KeyCode is the only namespace involved
+     * and there is no VK<->KeyCode mapping to get wrong.
+     *
+     * AOWL_KC_UNBOUND (-1) means "no key". It is deliberately NOT 0, because
+     * KeyCode.None IS 0 -- a real member -- and a sentinel that collides with
+     * a real key turns an unparsed name into a bound one.
+     *
+     * `hotkeyCapture` is the rebind rendezvous: the overlay WndProc sets it to
+     * the row being rebound, and the MOD (on Unity's thread, the only place
+     * Input:: may legally be called) scans the KeyCode table for the first key
+     * pressed, writes the slot and sets it back to -1. Capturing on the mod
+     * side rather than in the WndProc is what keeps the feature inside the
+     * KeyCode namespace end to end.
+     *
+     * `hotkeyNote` is why the last rebind was REFUSED, in words, drawn under
+     * the menu. A refusal that is not shown is the same as a silent no-op.  */
+    volatile LONG hotkeyKc[AOWL_ADM_COUNT];
+    volatile LONG hotkeyCapture;       /* -1 idle, else the row being rebound  */
+    volatile LONG hotkeyEpoch;         /* bumped on any slot change, so the    */
+                                       /* mod knows to persist to config.json  */
+    volatile LONG hotkeyFires;         /* total activations, for adminDiag()   */
+    char          hotkeyNote[AOWL_ADM_STATUS_LEN];
 } AowlAdminShared;
 
 /* ------------------------------------------------------------------ *
@@ -241,6 +275,14 @@ static AowlAdminShared* aowl_admin_map(void) {
          * seed toggles here (the mod does, in one place). */
         s->magic = AOWL_ADM_MAGIC;
         s->version = AOWL_ADM_VERSION;
+        /* MUST be done here rather than left to the OS zero-fill: an all-zero
+         * hotkey block reads as "every action bound to KeyCode.None", which is
+         * a real key with ordinal 0. Unbound is -1. */
+        {
+            int i;
+            for (i = 0; i < AOWL_ADM_COUNT; i++) s->hotkeyKc[i] = AOWL_KC_UNBOUND;
+            s->hotkeyCapture = -1;
+        }
     }
     return s;
 }
@@ -953,6 +995,344 @@ static int32_t aowl_admin_w2s(float x, float y, float z, int32_t w, int32_t h,
                               float* sx, float* sy) {
     if (!aowl_admin_cam_ready()) return 0;
     return aowl_admin_project(aowl_adm_cam_vp, x, y, z, w, h, sx, sy);
+}
+
+
+/* ================================================================== *
+ * Action hotkeys
+ * ==================================================================
+ *
+ * A key that toggles an admin action, user-assignable, read through the
+ * GAME'S OWN INPUT rather than through Windows.
+ *
+ * WHY Input::GetKeyDown AND NOT THE WNDPROC. Two delivery paths already exist
+ * in this codebase and both work:
+ *   * `GetAsyncKeyState` (the F3 overlay). Global, not a window message, so
+ *     the WM_KEYDOWN-vs-WM_SYSKEYDOWN routing that once hid F10 from the D3D
+ *     overlay's wndproc cannot affect it -- but for the same reason it fires
+ *     while the game is in the BACKGROUND and while the player is typing into
+ *     another application. For a key that turns God mode on, that is wrong.
+ *   * the overlay wndproc (F6; the F12 panel additionally reads typed
+ *     characters from WM_CHAR). Correct about focus, but it speaks Win32
+ *     virtual-keys, so a user-assignable bind would need a VK<->KeyCode
+ *     mapping -- 328 entries of exactly the hand-typed constants that are
+ *     forbidden here.
+ * `UnityEngine.Input::GetKeyDown(KeyCode)` is neither: it is the same input
+ * the game itself reads, it is already false when the window is not focused,
+ * it is edge-triggered by construction, and its argument is a KeyCode -- the
+ * one namespace config.json, the settings page and the F6 menu all use.
+ * Nothing here is tested with a synthetic message, because nothing here reads
+ * a message.
+ *
+ * THREAD. `Input::` is Unity's, so `aowl_admin_hotkey_poll()` is UNITY THREAD
+ * ONLY and is driven from the same `everyMain` tick that drives the camera
+ * sampler. Off that thread it is never called.
+ *
+ * MEASURED, build 1.1.0.1.46777:
+ *   UnityEngine.Input::GetKeyDown(KeyCode) -> bool  rid=45, STATIC, arity 1
+ *   RVA 0x531EB80, section `il2cpp`,
+ *   bytes 40 53 48 83 EC 20 48 8B 05 9B 71 DB 01 8B D9 48
+ *   -- `il2cpp_resolve.py bytes 0x531eb80 16` against the installed
+ *   D:/Games/Tarkov/GameAssembly.dll. It is NOT the universal empty-body stub
+ *   at 0x628110 (`C2 00 00`). It SHARES its RVA with `GetKeyDownInt(KeyCode)`,
+ *   the same body under its internal name; sharing is a hazard for a DETOUR,
+ *   which has unbounded blast radius, and this only ever CALLS it, with the
+ *   argument it is correct for. A KeyCode is an enum over Int32, so the
+ *   argument is one integer register; the trailing hidden `const MethodInfo*`
+ *   is NULL, which is legal because the method is not generic.
+ */
+
+#define AOWL_ADM_RVA_GETKEYDOWN 0x531EB80u
+static const unsigned char AOWL_ADM_SIG_GETKEYDOWN[16] = {
+    0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,0x9B,0x71,0xDB,0x01,0x8B,0xD9,0x48 };
+
+typedef int32_t (*AowlAdmGetKeyDownFn)(int32_t keyCode, void* methodInfo);
+static AowlAdmGetKeyDownFn aowl_adm_getkeydown_fn = 0;
+
+/* 0 not attempted | 1 GameAssembly.dll not mapped yet (TRANSIENT, must not
+ * latch) | 2 PROLOGUE MISMATCH -- refused, nothing called | 3 bound. */
+static int32_t aowl_adm_hk_bind = 0;
+static int32_t aowl_adm_hk_fail = 0;
+#define AOWL_ADM_HK_MAXFAIL 240
+
+static int32_t aowl_admin_hotkey_state(void) {
+    HMODULE ga;
+    if (aowl_adm_hk_bind == 1) aowl_adm_hk_bind = 0;
+    if (aowl_adm_hk_bind != 0) return aowl_adm_hk_bind;
+    ga = GetModuleHandleA("GameAssembly.dll");
+    if (!ga) { aowl_adm_hk_bind = 1; return 1; }
+    aowl_adm_getkeydown_fn = (AowlAdmGetKeyDownFn)aowl_admin_bind_rva(
+        (unsigned char*)ga, AOWL_ADM_RVA_GETKEYDOWN, AOWL_ADM_SIG_GETKEYDOWN);
+    aowl_adm_hk_bind = aowl_adm_getkeydown_fn ? 3 : 2;
+    return aowl_adm_hk_bind;
+}
+
+static int32_t aowl_admin_hotkey_disabled(void) {
+    return aowl_adm_hk_fail >= AOWL_ADM_HK_MAXFAIL ? 1 : 0;
+}
+
+static void aowl_admin_hotkey_note(AowlAdminShared* s, const char* text) {
+    size_t n;
+    if (!s || !text) return;
+    n = strlen(text);
+    if (n >= AOWL_ADM_STATUS_LEN) n = AOWL_ADM_STATUS_LEN - 1;
+    memcpy(s->hotkeyNote, text, n);
+    s->hotkeyNote[n] = 0;
+}
+
+static void aowl_adm_note_cat(char* msg, const char* add) {
+    size_t used = strlen(msg);
+    if (used >= (size_t)(AOWL_ADM_STATUS_LEN - 1)) return;
+    strncat(msg, add, (size_t)(AOWL_ADM_STATUS_LEN - 1) - used);
+}
+
+static int32_t aowl_admin_hotkey_get(AowlAdminShared* s, int32_t row) {
+    if (!s || row < 0 || row >= AOWL_ADM_COUNT) return AOWL_KC_UNBOUND;
+    return (int32_t)s->hotkeyKc[row];
+}
+
+/* The ONE place a slot is written, so every caller gets the same rules.
+ * Returns 1 on success, 0 on a REFUSAL -- and a refusal always leaves a reason
+ * in `hotkeyNote`, naming the key, never folding it onto anything. */
+static int32_t aowl_admin_hotkey_set(AowlAdminShared* s, int32_t row, int32_t kc) {
+    int i;
+    char msg[AOWL_ADM_STATUS_LEN];
+    const char* kn;
+    if (!s || row < 0 || row >= AOWL_ADM_COUNT) return 0;
+    if (kc == AOWL_KC_UNBOUND) {                     /* clearing is always ok */
+        s->hotkeyKc[row] = AOWL_KC_UNBOUND;
+        InterlockedIncrement(&s->hotkeyEpoch);
+        return 1;
+    }
+    kn = aowl_keycode_name(kc);
+    if (!kn) {
+        aowl_admin_hotkey_note(s, "REFUSED: that ordinal is not a "
+                                  "UnityEngine.KeyCode member");
+        return 0;
+    }
+    /* An action whose WRITE is not bound on this build must not get a key. A
+     * hotkey that does nothing is worse than no hotkey: it teaches the player
+     * that the KEY is broken rather than that the FEATURE is absent. */
+    if (!aowl_admin_capable(s, row)) {
+        msg[0] = 0;
+        aowl_adm_note_cat(msg, "REFUSED: ");
+        aowl_adm_note_cat(msg, aowl_admin_mode_name(row));
+        aowl_adm_note_cat(msg, " is not bound on this build, so a key on it "
+                               "would do nothing");
+        aowl_admin_hotkey_note(s, msg);
+        return 0;
+    }
+    /* One key, one action. A duplicate would fire two toggles from one press. */
+    for (i = 0; i < AOWL_ADM_COUNT; i++) {
+        if (i != row && (int32_t)s->hotkeyKc[i] == kc) {
+            msg[0] = 0;
+            aowl_adm_note_cat(msg, "REFUSED: ");
+            aowl_adm_note_cat(msg, kn);
+            aowl_adm_note_cat(msg, " is already bound to ");
+            aowl_adm_note_cat(msg, aowl_admin_mode_name(i));
+            aowl_admin_hotkey_note(s, msg);
+            return 0;
+        }
+    }
+    s->hotkeyKc[row] = kc;
+    InterlockedIncrement(&s->hotkeyEpoch);
+    return 1;
+}
+
+/* Set from a NAME, which is what config.json and the settings page carry.
+ * An unknown name is REFUSED WITH THE NAME PRINTED. It is never resolved to
+ * KeyCode.None, which is a real key with ordinal 0. The empty string (and
+ * "-") is the one spelling that means "unbound", and it means only that. */
+static int32_t aowl_admin_hotkey_set_name(AowlAdminShared* s, int32_t row,
+                                          const char* name) {
+    int32_t kc;
+    char msg[AOWL_ADM_STATUS_LEN];
+    if (!s || row < 0 || row >= AOWL_ADM_COUNT) return 0;
+    if (!name || !name[0] || strcmp(name, "-") == 0)
+        return aowl_admin_hotkey_set(s, row, AOWL_KC_UNBOUND);
+    kc = aowl_keycode_of(name);
+    if (kc == AOWL_KC_UNKNOWN) {
+        msg[0] = 0;
+        aowl_adm_note_cat(msg, "REFUSED: \"");
+        aowl_adm_note_cat(msg, name);
+        aowl_adm_note_cat(msg, "\" is not a UnityEngine.KeyCode member -- left "
+                               "UNBOUND, not read as KeyCode.None");
+        aowl_admin_hotkey_note(s, msg);
+        s->hotkeyKc[row] = AOWL_KC_UNBOUND;
+        InterlockedIncrement(&s->hotkeyEpoch);
+        return 0;
+    }
+    return aowl_admin_hotkey_set(s, row, kc);
+}
+
+/* The name of the key on a row, or "" for unbound. Never a bare number. */
+static const char* aowl_admin_hotkey_name(AowlAdminShared* s, int32_t row) {
+    const char* n;
+    if (!s || row < 0 || row >= AOWL_ADM_COUNT) return "";
+    n = aowl_keycode_name((int32_t)s->hotkeyKc[row]);
+    return n ? n : "";
+}
+
+static const char* aowl_admin_hotkey_note_text(AowlAdminShared* s) {
+    return s ? s->hotkeyNote : "";
+}
+
+/* Rebind capture: the overlay asks, the mod answers on Unity's thread. */
+static void aowl_admin_hotkey_capture_begin(AowlAdminShared* s, int32_t row) {
+    if (!s || row < 0 || row >= AOWL_ADM_COUNT) return;
+    aowl_admin_hotkey_note(s, "");
+    InterlockedExchange(&s->hotkeyCapture, row);
+}
+static void aowl_admin_hotkey_capture_cancel(AowlAdminShared* s) {
+    if (s) InterlockedExchange(&s->hotkeyCapture, -1);
+}
+static int32_t aowl_admin_hotkey_capturing(AowlAdminShared* s) {
+    return (s && s->hotkeyCapture >= 0) ? 1 : 0;
+}
+
+/* Keys a bind may not take, because taking them would make the menu itself
+ * unusable or the bind unreachable: F6 opens this menu, Escape cancels a
+ * capture, and None is a KeyCode member that no key produces.
+ *
+ * Every one is looked up BY NAME in the generated table -- there is not a
+ * single key ordinal typed anywhere in this file. `aowl_keycode_of` returns
+ * -1 for a name it does not have, and -1 matches no live KeyCode, so a table
+ * that somehow lost a member degrades to "not reserved" rather than to a
+ * wrong reservation. */
+static int32_t aowl_admin_hotkey_reserved(int32_t kc) {
+    if (kc == AOWL_KC_UNBOUND) return 1;
+    return (kc == aowl_keycode_of("F6") ||
+            kc == aowl_keycode_of("Escape") ||
+            kc == aowl_keycode_of("None")) ? 1 : 0;
+}
+
+/* ------------------------------------------------------------------
+ * UNITY THREAD ONLY. One call per frame. Returns row+1 for the action it
+ * toggled this frame, or 0.
+ *
+ * DEFAULT OFF, twice over: `enabled` is the mod's flag (config.json,
+ * default false), and with every slot at AOWL_KC_UNBOUND -- which is the
+ * shipped state -- the loop below makes ZERO calls into the game.
+ *
+ * Capped: at most AOWL_ADM_COUNT (12) calls per frame when polling, and at
+ * most AOWL_KC_COUNT (328) on the one frame a capture resolves. Both are
+ * compile-time bounds over fixed-size tables; neither reads a count out of
+ * game memory. Nothing here allocates.
+ * ------------------------------------------------------------------ */
+static int32_t aowl_admin_hotkey_poll(AowlAdminShared* s, int32_t enabled) {
+    int i;
+    int32_t cap;
+    if (!s || !enabled) return 0;
+    if (aowl_adm_hk_fail >= AOWL_ADM_HK_MAXFAIL) return 0;   /* self-disabled */
+
+    cap = (int32_t)s->hotkeyCapture;
+
+    /* Nothing to do at all in the shipped state: no capture in flight and no
+     * key assigned. This is the branch that makes "flag on, nothing bound"
+     * cost nothing and call nothing. */
+    if (cap < 0) {
+        int any = 0;
+        for (i = 0; i < AOWL_ADM_COUNT; i++)
+            if ((int32_t)s->hotkeyKc[i] != AOWL_KC_UNBOUND) { any = 1; break; }
+        if (!any) return 0;
+    }
+
+    if (aowl_admin_hotkey_state() != 3) { aowl_adm_hk_fail++; return 0; }
+    aowl_adm_hk_fail = 0;
+
+    if (cap >= 0 && cap < AOWL_ADM_COUNT) {
+        /* Capture frame. Escape is tested FIRST, so a cancel can never be
+         * mistaken for a bind to Escape. */
+        if (aowl_adm_getkeydown_fn(aowl_keycode_of("Escape"), 0)) {
+            aowl_admin_hotkey_capture_cancel(s);
+            aowl_admin_hotkey_note(s, "rebind cancelled");
+            return 0;
+        }
+        if (aowl_adm_getkeydown_fn(aowl_keycode_of("Delete"), 0)) {  /* unbind */
+            aowl_admin_hotkey_set(s, cap, AOWL_KC_UNBOUND);
+            aowl_admin_hotkey_capture_cancel(s);
+            aowl_admin_hotkey_note(s, "unbound");
+            return 0;
+        }
+        for (i = 0; i < AOWL_KC_COUNT; i++) {
+            int32_t kc = AOWL_KEYCODES[i].ordinal;
+            if (aowl_admin_hotkey_reserved(kc)) continue;
+            if (aowl_adm_getkeydown_fn(kc, 0)) {
+                char msg[AOWL_ADM_STATUS_LEN];
+                if (aowl_admin_hotkey_set(s, cap, kc)) {
+                    msg[0] = 0;
+                    aowl_adm_note_cat(msg, "bound ");
+                    aowl_adm_note_cat(msg, AOWL_KEYCODES[i].name);
+                    aowl_adm_note_cat(msg, " -> ");
+                    aowl_adm_note_cat(msg, aowl_admin_mode_name(cap));
+                    aowl_admin_hotkey_note(s, msg);
+                }
+                /* On a refusal the slot is untouched and `hotkeyNote` already
+                 * says why; either way the capture ENDS, so the player is
+                 * never left in a capture whose outcome they cannot see. */
+                aowl_admin_hotkey_capture_cancel(s);
+                return 0;
+            }
+        }
+        return 0;                                  /* still waiting for a key */
+    }
+
+    /* Ordinary poll. At most one action per frame -- two toggles from one
+     * frame would be two state changes the player cannot attribute. */
+    for (i = 0; i < AOWL_ADM_COUNT; i++) {
+        int32_t kc = (int32_t)s->hotkeyKc[i];
+        if (kc == AOWL_KC_UNBOUND) continue;
+        if (!aowl_admin_capable(s, i)) continue;    /* not bound: never fires */
+        if (aowl_adm_getkeydown_fn(kc, 0)) {
+            aowl_admin_toggle_flip(s, i);
+            InterlockedIncrement(&s->hotkeyFires);
+            return i + 1;
+        }
+    }
+    return 0;
+}
+
+static const char* aowl_admin_hotkey_state_text_c(void);
+
+/* Byte-at accessors. nimony has no `$` for `cstring`, so the mod cannot read
+ * a `const char*` return at all -- the same reason `spawnQueryAt` exists. A
+ * one-byte-at-a-time read is also bounded by construction: it cannot walk off
+ * the end of an unterminated buffer, because the caller supplies the cap. */
+static int32_t aowl_admin_hotkey_name_at(AowlAdminShared* s, int32_t row, int32_t i) {
+    const char* n = aowl_admin_hotkey_name(s, row);
+    if (!n || i < 0 || i >= AOWL_ADM_STATUS_LEN) return 0;
+    { int32_t k = 0; while (k < i) { if (!n[k]) return 0; k++; } }
+    return (int32_t)(unsigned char)n[i];
+}
+static int32_t aowl_admin_hotkey_note_at(AowlAdminShared* s, int32_t i) {
+    if (!s || i < 0 || i >= AOWL_ADM_STATUS_LEN) return 0;
+    return (int32_t)(unsigned char)s->hotkeyNote[i];
+}
+static int32_t aowl_admin_hotkey_state_at(int32_t i) {
+    const char* n = aowl_admin_hotkey_state_text_c();
+    if (!n || i < 0 || i >= 512) return 0;
+    { int32_t k = 0; while (k < i) { if (!n[k]) return 0; k++; } }
+    return (int32_t)(unsigned char)n[i];
+}
+
+static int32_t aowl_admin_hotkey_fires(AowlAdminShared* s) {
+    return s ? (int32_t)s->hotkeyFires : 0;
+}
+static int32_t aowl_admin_hotkey_epoch(AowlAdminShared* s) {
+    return s ? (int32_t)s->hotkeyEpoch : 0;
+}
+
+/* Why a hotkey did not fire, in words. Never collapses "not bound on this
+ * build" into "no key assigned" or into "the poll is off". */
+static const char* aowl_admin_hotkey_state_text_c(void) {
+    switch (aowl_adm_hk_bind) {
+        case 0: return "not attempted";
+        case 1: return "GameAssembly.dll is not mapped yet (transient)";
+        case 2: return "PROLOGUE MISMATCH at Input::GetKeyDown 0x531EB80 -- "
+                       "REFUSED, nothing was called. Either a Tarkov update "
+                       "moved this RVA or something else detoured it";
+        default: return "Input::GetKeyDown bound and byte-verified";
+    }
 }
 
 #ifdef __cplusplus
