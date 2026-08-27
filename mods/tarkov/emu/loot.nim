@@ -1152,7 +1152,48 @@ proc lootFor*(locationId, raidId: string): string =
   ##
   ## With no loot tables present every read inside returns nothing and this
   ## returns `[]` -- a valid, empty floor. A raid on the test fixture starts.
-  result = generateLoot(liveDb(), lootConfig(), locationId, raidId)
+  ##
+  ## An empty floor is VALID and it is also the shape of every way this can go
+  ## wrong -- a map id that resolves to nothing, a rebuild from a base that
+  ## predates the id fix, `lootEnabled` off, `maxLootItems` at zero. All four
+  ## used to be the same silent `[]`, served in a few milliseconds with nothing
+  ## anywhere saying which. Ten of thirteen maps were empty for a day on
+  ## exactly that silence. So: an empty answer NAMES ITS REASON, once per
+  ## raid, and the reason is read off the finished state rather than assumed.
+  let d = liveDb()
+  let cfg = lootConfig()
+  result = generateLoot(d, cfg, locationId, raidId)
+  if result.len > 2:
+    return
+  if not cfg.enabled:
+    warn "loot: " & locationId & " served NO loot because `lootEnabled` is " &
+         "false in this mod's config.json"
+    return
+  if cfg.maxItems <= 0:
+    warn "loot: " & locationId & " served NO loot because `maxLootItems` is " &
+         $cfg.maxItems & " in this mod's config.json"
+    return
+  let base = sub(d, "locations." & locationId & ".base")
+  if base.len == 0:
+    warn "loot: " & locationId & " served NO loot -- the database has no " &
+         "`locations." & locationId & "` at all, so the raid's map id was " &
+         "not resolved to a database location. This is what an id-mapping " &
+         "regression looks like, not an empty map."
+    return
+  let statics = sub(d, "locations." & locationId & ".staticContainers")
+  let loose = sub(d, "locations." & locationId & ".looseLoot")
+  let side = readSidecar(locationId)
+  if statics.len == 0 and loose.len == 0 and side.len == 0:
+    warn "loot: " & locationId & " served NO loot -- the location IS in the " &
+         "database but carries no staticContainers and no looseLoot, and " &
+         "there is no sidecar at " & looseSidecarDir() & "/" & locationId &
+         ".json. Import loot for this map, or expect a bare floor."
+    return
+  warn "loot: " & locationId & " served NO loot even though its tables are " &
+       "present (staticContainers " & $statics.len & " bytes, looseLoot " &
+       $loose.len & " bytes, sidecar " & $side.len & " bytes). Every spawn " &
+       "was refused -- check staticLootMultiplier/looseLootMultiplier and " &
+       "the map's own chance modifiers."
 
 # ---------------------------------------------------------------------------
 # Self-check
