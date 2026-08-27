@@ -1363,10 +1363,18 @@ proc onLocale(url, body, session: string): string =
   # without it the client shows raw key paths -- map names as `Icebreaker`,
   # settings hovers as `Settings/Graphics/PostFxOff`, and so on. The SPT table
   # remains the fallback and the source for the mail this server composes.
-  let post1Locale = post1Table("locale_" & (if lang.len > 0: lang else: "en"))
+  # `safeLanguage`, not the raw URL segment: `lang` is whatever the client put
+  # after `/client/locale/`, and it is spliced into BOTH a dotted database path
+  # and a FILE path. A segment carrying a dot or a slash reads a different
+  # subtree, or a different file, than the one asked for -- and both callees
+  # fall back to English, so the wrong answer would have looked like a working
+  # one. `emu/dialogue.localeText` already sanitised for exactly this reason;
+  # these two routes, the ones the client actually calls, did not.
+  let lang1 = safeLanguage(lang)
+  let post1Locale = post1Table("locale_" & lang1)
   if post1Locale.len > 0:
     return envelope(raw(post1Locale))
-  result = envelope(raw(locale(if lang.len > 0: lang else: "en")))
+  result = envelope(raw(locale(lang1)))
 
 proc onMenuLocale(url, body, session: string): string =
   ## Post-1.0 deserialises this `data` into `EFT.BackendMenuLocale`, whose sole
@@ -1375,10 +1383,11 @@ proc onMenuLocale(url, body, session: string): string =
   ## (surfacing far away as a preloader-UI crash), so the map is wrapped under
   ## `menu`. Pre-1.0 put the map straight on `data`; this is the post-1.0 shape.
   let lang = pathAfter(url, "/client/menu/locale/")
-  let post1Menu = post1Table("menulocale_" & (if lang.len > 0: lang else: "en"))
+  let lang1 = safeLanguage(lang)
+  let post1Menu = post1Table("menulocale_" & lang1)
   if post1Menu.len > 0:
     return envelope(objOf("menu", raw(post1Menu)))
-  result = envelope(objOf("menu", raw(menuLocale(if lang.len > 0: lang else: "en"))))
+  result = envelope(objOf("menu", raw(menuLocale(lang1))))
 
 proc onSettings(url, body, session: string): string =
   let v = dbRead("settings")
@@ -2296,9 +2305,17 @@ proc onMatchEnd(url, body, session: string): string =
   # kills it did not count, and every quest that is now ready to hand in.
   # Rewards are *not* paid here -- the `QuestComplete` the player sends pays
   # them, and paying here as well would pay them twice.
-  discard advanceQuestsAfterRaid(updated, p.text, raidMapFor(session, body),
+  # Both spellings of the map go in: `raidMapFor` is CANONICAL (a database
+  # key, which is what everything that reads `locations` needs) while a
+  # quest's `Location` target is usually the client's `base.Id`. Passing only
+  # one of the two is what refused map-qualified progress -- first on the
+  # thirteen maps whose key differs from the id, then, after canonicalising,
+  # on the seven whose target is an id. See `emu/raid.locationAliases`.
+  let questMap = raidMapFor(session, body)
+  discard advanceQuestsAfterRaid(updated, p.text, questMap,
                                  results.field("result").asText("Left"),
-                                 nowSeconds(), gRaidClock)
+                                 nowSeconds(), gRaidClock,
+                                 locationAliases(questMap))
 
   # And whatever the raid just earned. After the quest pass rather than before
   # it: an achievement condition can name a quest status, and the status the

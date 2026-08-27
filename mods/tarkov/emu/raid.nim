@@ -448,6 +448,47 @@ proc canonicalLocation*(id: string): string =
         return byName
   result = id
 
+proc addUnique(into: var seq[string]; s: string) =
+  if s.len == 0:
+    return
+  for x in into:
+    if x == s:
+      return
+  into.add s
+
+proc locationAliases*(id: string): seq[string] =
+  ## EVERY spelling of one map, as the CLIENT named it and as the DATABASE
+  ## names it -- the database key, `base._Id`, `base.Id` and `base.Name`.
+  ##
+  ## `canonicalLocation` answers "which row of `locations` is this?" and that
+  ## is the right question for reading loot, a bot cap or a base. It is the
+  ## WRONG question for matching a quest's `Location` target, because those
+  ## targets are not database keys: MEASURED over `templates.quests` in the
+  ## live db.json, 233 of the 301 `Location` targets are the `base.Id`
+  ## spelling (`Woods` 39, `Shoreline` 46, `RezervBase` 28, `TarkovStreets`
+  ## 32, `Interchange` 23, `Lighthouse` 26, `Sandbox` 14, `Sandbox_high` 15)
+  ## and only 68 are database keys (`bigmap` 33, `factory4_day` 16,
+  ## `factory4_night` 15, `laboratory` 11). `configs.quest.repeatableQuests`
+  ## keys its `locations` pools the same way.
+  ##
+  ## So canonicalising OUR side and comparing with an exact string test moved
+  ## the mismatch rather than removing it: it fixed `bigmap`/`laboratory` and
+  ## broke the seven map families whose target is an `Id`. Both sides have to
+  ## be spelled the same way, and the only spelling both sides always have is
+  ## "any of them" -- hence a set, not a single canonical string.
+  result = @[]
+  if id.len == 0:
+    return
+  addUnique(result, id)
+  let key = canonicalLocation(id)
+  addUnique(result, key)
+  let base = dbRead("locations." & key & ".base")
+  if base.ok and base.raw.len > 0:
+    let b = whole(base.raw)
+    addUnique(result, b.field("_Id").asText(""))
+    addUnique(result, b.field("Id").asText(""))
+    addUnique(result, b.field("Name").asText(""))
+
 proc locationBase*(id: string): string =
   ## A map's static description. Looked up by both `_Id` and name, because
   ## `/client/locations` hands the client a list keyed by `_Id` and
