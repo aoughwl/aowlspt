@@ -581,6 +581,19 @@ proc buildOverlayTests(e: Env): bool =
   elif not run(e, "overlay logs checks", quoted(joinPath(dir, "logstest.exe")), dir):
     okAll = false
 
+  # The F3 widgets' RENDER path: the region command shape crossing into the
+  # rasteriser. The widgets used to be cloned TextMeshPro labels in the game's
+  # canvas, which had NO offline check at all -- that is how the same feature
+  # failed six times, the last three of them with a walk that succeeded and
+  # rendered nothing. This is the check that approach could never have.
+  if not run(e, "the F3 widgets' render path",
+    "gcc -O2 -Wno-unused-function -I" & inc & " " &
+    quoted(joinPath(dir, "f3test.c")) & " -o " &
+    quoted(joinPath(dir, "f3test.exe")), dir):
+    okAll = false
+  elif not run(e, "F3 render checks", quoted(joinPath(dir, "f3test.exe")), dir):
+    okAll = false
+
   if not run(e, "overlay header needs no extra link library",
     "gcc -O1 -Wno-unused-function -I" & inc & " " &
     quoted(joinPath(dir, "linkprobe.c")) & " -o " &

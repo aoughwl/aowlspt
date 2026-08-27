@@ -389,6 +389,13 @@ enum {
     AOWL_REGION_CMD_TEXT = 4
 };
 
+/* `t` ON A TEXT COMMAND IS AN INTEGER FONT SCALE (1..8); 0 means 1. It has no
+ * other meaning for TEXT, every submitter that predates this leaves it 0, and
+ * the renderer treats <1 as 1 -- so this is additive and no module had to be
+ * rebuilt. x/y stay TRUE BACK-BUFFER PIXELS at every scale; the renderer
+ * divides the position out before applying the scale, so a submitter never has
+ * a second coordinate system to get wrong. An 8x16 cell is unreadable at 4K,
+ * which is the whole reason this exists. */
 typedef struct AowlRegionCmd {
     int32_t  kind;
     int32_t  owner;                        /* participant index, for blame   */
@@ -729,6 +736,17 @@ static int32_t aowl_region_fill(float x, float y, float w, float h,
 }
 static int32_t aowl_region_text(float x, float y, const char* s, uint32_t col) {
     return aowl_region_push(AOWL_REGION_CMD_TEXT, x, y, 0, 0, 0, col, s);
+}
+/* The same command with an explicit integer font scale. See the note on
+ * `AowlRegionCmd`: this writes the scale into `t`, which is unused for TEXT.
+ * A scale below 1 is stored as 0 so the wire value stays exactly what an old
+ * submitter would have produced. */
+static int32_t aowl_region_text_scaled(float x, float y, const char* s,
+                                       uint32_t col, int32_t scale) {
+    if (scale < 1) scale = 0;
+    if (scale > 8) scale = 8;
+    return aowl_region_push(AOWL_REGION_CMD_TEXT, x, y, 0, 0,
+                            (float)scale, col, s);
 }
 
 /* World space, via the projector the host installed. Returns 0 -- and records

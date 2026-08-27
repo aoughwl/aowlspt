@@ -188,20 +188,57 @@ proc cWgRgDisabled(): int32 {.importc: "aowl_wg_rg_disabled", nodecl.}
 proc cWgRgThrottled(): int32 {.importc: "aowl_wg_rg_throttled", nodecl.}
 proc cWgRgArmed(): int32 {.importc: "aowl_wg_rg_armed", nodecl.}
 
+## THE SUBMITTER SURFACE -- how the widgets are DRAWN.
+##
+## Screen-space draw commands into the shared region, rasterised by the D3D11
+## overlay inside `Present`, exactly as the F12 settings panel and the F6 admin
+## HUD already are. No TextMeshPro clone, no Unity canvas, no parenting and no
+## sort order -- so there is no longer a state that can be "built successfully"
+## and invisible, which is what six rounds of the clone approach ended at.
+##
+## Coordinates are TRUE BACK-BUFFER PIXELS, origin TOP-LEFT. `wgeom.nim` works
+## in Unity's Y-UP canvas units and is deliberately unchanged; the one flip
+## lives in `duPx`.
+proc cWgDrFill(x, y, w, h: float32; col: uint32): int32 {.
+  importc: "aowl_wg_dr_fill", nodecl.}
+proc cWgDrBox(x, y, w, h, t: float32; col: uint32): int32 {.
+  importc: "aowl_wg_dr_box", nodecl.}
+proc cWgDrText(x, y: float32; s: cstring; col: uint32; scale: int32): int32 {.
+  importc: "aowl_wg_dr_text", nodecl.}
+proc cWgScrW(): int32 {.importc: "aowl_wg_scr_w", nodecl.}
+proc cWgScrH(): int32 {.importc: "aowl_wg_scr_h", nodecl.}
+proc cWgScrKnown(): int32 {.importc: "aowl_wg_scr_known", nodecl.}
+type AowlRegionCb = proc (user: pointer; frame: int64) {.cdecl.}
+proc cWgRgRegister(name: cstring; fn: AowlRegionCb;
+                   mask, order, budgetUs: int32): int32 {.
+  importc: "aowl_wg_rg_register", nodecl.}
+proc cWgRgRefusalTextC(r: int32): cstring {.
+  importc: "aowl_wg_rg_refusal_text", nodecl.}
+proc cWgRgMaskDraw(): int32 {.importc: "aowl_wg_rg_mask_draw", nodecl.}
+
+## The overlay's font cell, from `AOWL_OV_CW`/`AOWL_OV_CH` in
+## `abi/aowlspt_overlay.h`. Fixed 8x16 at scale 1; there is no proportional
+## metric to approximate and therefore no `cDuGlyphAspect` guess any more --
+## a widget's extent is now EXACT rather than estimated, which is what makes
+## the hit box match what is on screen.
+const
+  cDuCellW = 8.0
+  cDuCellH = 16.0
+  ## `AOWL_REGION_TEXT_LEN` is 64, so a command carries at most 63 characters.
+  ## Lines are TRUNCATED to this and marked, never silently cut: a read-out
+  ## that loses its right-hand column without saying so is the failure mode
+  ## this whole file exists to avoid.
+  cDuCmdText = 63
+
 proc cWgCrumb(stage: int32) {.importc: "aowl_wg_crumb", nodecl.}
 proc cWgCrumbW(idx: int32) {.importc: "aowl_wg_crumb_w", nodecl.}
 proc cWgCrumbGet(): int32 {.importc: "aowl_wg_crumb_get", nodecl.}
 proc cWgCrumbGetW(): int32 {.importc: "aowl_wg_crumb_get_w", nodecl.}
 proc cWgCrumbTextC(s: int32): cstring {.importc: "aowl_wg_crumb_text", nodecl.}
-proc cWgCrumbDepth(packed: int32): int32 {.
-  importc: "aowl_wg_crumb_depth", nodecl.}
-proc cWgCrumbRoleC(packed: int32): cstring {.
-  importc: "aowl_wg_crumb_role", nodecl.}
 
 const
   WgCrumbEnter     = 1'i32
   WgCrumbToggle    = 2'i32
-  WgCrumbBuild     = 3'i32
   WgCrumbScanWorld = 4'i32
   WgCrumbMouse     = 5'i32
   WgCrumbEditKeys  = 6'i32
@@ -212,41 +249,8 @@ const
   WgCrumbWSetText  = 11'i32
   WgCrumbWShow     = 12'i32
   WgCrumbBanner    = 13'i32
-  WgCrumbHideRest  = 14'i32
   WgCrumbMarkers   = 15'i32
   WgCrumbDone      = 16'i32
-  # Inside duBuild. The live run narrowed the fault to "cloning the label pool",
-  # which is still a dozen distinct managed operations; these split it the rest
-  # of the way rather than inviting another guess.
-  WgCrumbBAnchor      = 17'i32
-  WgCrumbBRoot        = 18'i32
-  WgCrumbBProbeClone  = 19'i32
-  WgCrumbBProbeDraw   = 20'i32
-  WgCrumbBSrcCanvas   = 21'i32
-  WgCrumbBProbeCanvas = 22'i32
-  WgCrumbBDropCanvas  = 23'i32
-  WgCrumbBAssertLog   = 24'i32
-  WgCrumbBProbeReuse  = 25'i32
-  WgCrumbBPanelClone  = 26'i32
-  WgCrumbBPanelDraw   = 27'i32
-  WgCrumbBMarkClone   = 28'i32
-  WgCrumbBMarkDraw    = 29'i32
-  WgCrumbBScale       = 30'i32
-  WgCrumbBDiagDump    = 31'i32
-  WgCrumbBReadback    = 32'i32
-  # Inside duCanvasRootGo -- every one of these is a managed call on a
-  # UnityEngine.Object whose native half may already be gone.
-  WgCrumbRAnchorAlive = 33'i32
-  WgCrumbRRect        = 34'i32
-  WgCrumbRRectAlive   = 35'i32
-  WgCrumbRParent      = 36'i32
-  WgCrumbRParSane     = 37'i32
-  WgCrumbRParGo       = 38'i32
-  WgCrumbRCanvas      = 39'i32
-  WgCrumbRClimb       = 40'i32
-  WgCrumbRDone        = 41'i32
-  WgCrumbRClimbParent = 42'i32
-  WgCrumbRRectSrc     = 43'i32
 
 # ---- target indices into `aowl_du_targets` in abi/aowlspt_debugui.h ----
 #
@@ -301,25 +305,8 @@ const
 # bots must all cost a bounded amount of work inside a per-frame detour.
 # ---------------------------------------------------------------------------
 const
-  cDuMaxPanelLines = 12    ## panel labels; the config picks which fields fill them
-  cDuMaxMarkers    = 48    ## hard ceiling on ESP labels, whatever the config says
+  cDuMaxMarkers    = 48    ## hard ceiling on ESP markers, whatever the config says
   cDuMaxPlayers    = 64    ## registered players read per pass
-  cDuMaxTextLen    = 1024  ## characters written into ONE label.
-    ## Was 160, which was right when a label held ONE line and wrong the moment
-    ## a widget became many. The profiler table alone is ~40 characters a row
-    ## over up to twelve rows, so 160 silently cut it off mid-row -- and a
-    ## truncated read-out that still looks like a read-out is the worst kind.
-    ## Still a hard cap, and `duSetText` still truncates rather than refusing.
-
-## The `last` value a freshly cloned label starts at. It must be a string no
-## real caption can equal, because `duSetText` short-circuits on unchanged text
-## and a clone starts out carrying the DONOR'S text ("1.1.0.1.4677 | PvE").
-## With `last` initialised to "" the first `duHide` compared "" to "" , decided
-## nothing had changed, and left the donor's string on screen at the donor's
-## position -- which is the stray label parked in the middle of the screen.
-## The leading control byte is deliberate: no caption this overlay composes
-## ever begins with one, so the sentinel cannot collide with real text.
-const cDuUnset = "\x01<clone has never been written to>"
 
 # ---------------------------------------------------------------------------
 # The layout configuration
@@ -613,66 +600,15 @@ proc duLoadLayout() =
   gDuCfg.loaded = true
   gDuCfg.source = "aowlspt-debugui.json"
 
-# ---------------------------------------------------------------------------
-# The label pool
-#
-# One entry per cloned TextMeshProUGUI. `last` is what was last written into it,
-# so an unchanged line costs no managed String allocation at all -- which is the
-# difference between a debug panel and a debug panel that shows up in the frame
-# time.
-# ---------------------------------------------------------------------------
-type DuLabel = object
-  tmp: Il2CppPtr        ## the cloned TextMeshProUGUI component
-  rect: Il2CppPtr       ## its RectTransform (m_rectTransform, or get_transform)
-  last: string          ## the text currently in it
-  shown: bool           ## whether it is currently non-empty
-  ## The anchor + offset this label was last PLACED at. `duPlace` costs four
-  ## managed calls; a panel line that has not moved since the last refresh needs
-  ## none of them, and a panel line almost never moves.
-  pAnchor: string
-  pX: float64
-  pY: float64
-  placed: bool
-  ## The clone's GameObject, so a label can be switched off entirely rather
-  ## than merely blanked, and whether it is currently on.
-  go: Il2CppPtr
-  active: bool
-
-var gDuPanel: seq[DuLabel] = @[]
-var gDuMarks: seq[DuLabel] = @[]
-
-## The clone anchor and the canvas root, resolved once and then reused. Both are
-## re-validated by every user, because a scene change can leave either dangling
-## and this file must notice rather than dereference.
-var gDuAnchorTmp: Il2CppPtr = nil
-var gDuRootGo: Il2CppPtr = nil
-
-## The live GameWorld, cached by the kind=11 RegisterPlayer detour (or by
-## botdiag when that is the one armed). Cleared when it stops being readable.
 var gDuGameWorld: Il2CppPtr = nil
-
-## The canvas scale factor, resolved once when the pool is built. See the note
-## where it is assigned: it is the pixels-to-canvas-units divisor the ESP
-## projection needs and the panel does not.
-var gDuCanvasScale = 1.0
 
 ## Whether the overlay is currently visible, and whether the markers are.
 var gDuVisible = false
 var gDuEspVisible = false
 ## Per-frame bookkeeping.
 var gDuFires = 0
-var gDuBuilt = false
-var gDuBuildFailed = false
 var gDuLoggedOnce = false
 var gDuFaults = 0
-## The single trial clone whose canvas decides whether the rest of the pool is
-## built at all, and how many refreshes we have waited for Unity to resolve its
-## canvas. Held across frames so a retry never clones again.
-var gDuProbe: DuLabel
-var gDuProbeWaits = 0
-## Whether the copied-Canvas repair has been attempted on the probe. Once only:
-## if disabling it did not help, doing it again will not either.
-var gDuCanvasDropTried = false
 
 proc duPtrAdd(p: Il2CppPtr; off: int32): Il2CppPtr =
   cast[Il2CppPtr](cast[uint64](p) + uint64(off))
@@ -682,145 +618,6 @@ proc duOk(p: Il2CppPtr; size: int32): bool =
   ## non-null, in a plausible user-space range, and page-readable for `size`
   ## bytes by VirtualQuery -- never a faulting deref to find out.
   result = p != nil and bdSanePtr(p) and cIsReadable(p, size) != 0'i32
-
-proc cDuOffCachedPtr(): int32 {.importc: "aowl_nav_off_cachedptr", nodecl.}
-  ## From `abi/aowlspt_navui.h` (AOWL_NAV_UOBJ_CACHEDPTR = 0x10), never guessed.
-
-proc duUnityAlive(p: Il2CppPtr): bool =
-  ## IS THE NATIVE HALF OF THIS UnityEngine.Object STILL THERE?
-  ##
-  ## THIS IS THE GATE WHOSE ABSENCE WAS THE BUG. `duOk` proves a pointer is
-  ## READABLE. It cannot prove the object is ALIVE, and those are different
-  ## facts: when Unity destroys an object, the managed wrapper survives -- fully
-  ## readable, `duOk` passes -- but `m_CachedPtr` at +0x10 is zeroed. That is
-  ## Unity's famous "fake null": an object that compares equal to null in C# and
-  ## kills the process if you call anything on it.
-  ##
-  ## `Component::get_transform`, `Component::get_gameObject` and
-  ## `Transform::get_parent` -- the three calls `duCanvasRootGo` is built out of
-  ## -- are all IL2CPP internal-call wrappers that dereference `m_CachedPtr`
-  ## with no null check of their own.
-  ##
-  ## MEASURED: the overlay faulted on `duCanvasRootGo` on every refresh, at the
-  ## MAIN MENU, two minutes after boot. The menu rebuild destroys the tree the
-  ## boot-time version label lived in; `PreloaderUI._alphaVersionLabel` still
-  ## points at the destroyed wrapper, `duFindAnchor`'s `duOk` chain passes it
-  ## happily, and the first `get_transform` on it dies inside Unity's C++.
-  ##
-  ## `inspect.nim` learned this first (`iUnityAlive`) but is included AFTER this
-  ## file in the one translation unit, so this is the same gate stated here
-  ## rather than a second opinion. The offset comes from `aowlspt_navui.h`
-  ## (`AOWL_NAV_UOBJ_CACHEDPTR`, 0x10), never from a guess.
-  ##
-  ## This is a plain guarded field read and cannot itself fault.
-  if not duOk(p, cDuOffCachedPtr() + 8'i32):
-    return false
-  result = cReadPtrAt(p, cDuOffCachedPtr()) != nil
-
-# ---------------------------------------------------------------------------
-# Reaching the anchor
-#
-# PreloaderUI._alphaVersionLabel (+0x20) -> LocalizedText._labels (+0x78)
-#   -> List<TextMeshProUGUI> -> _items (+0x10) -> elems (+0x20) -> [0]
-#
-# Every hop guarded. A failure at any hop is "not yet" -- PreloaderUI's Update
-# can fire before its label list is populated -- so it returns nil and the caller
-# simply tries again next frame rather than latching a failure.
-# ---------------------------------------------------------------------------
-proc duFindAnchor(preloader: Il2CppPtr): Il2CppPtr =
-  result = nil
-  if not duOk(preloader, cDuOffPreVersionLabel() + 8'i32):
-    return
-  let loc = cReadPtrAt(preloader, cDuOffPreVersionLabel())
-  if not duOk(loc, cDuOffLocLabels() + 8'i32):
-    return
-  let lst = cReadPtrAt(loc, cDuOffLocLabels())
-  if not duOk(lst, cDuOffListSize() + 4'i32):
-    return
-  let arr = cReadPtrAt(lst, cDuOffListItems())
-  let size = cReadI32At(duPtrAdd(lst, cDuOffListSize()))
-  if not duOk(arr, cDuOffArrElems() + 8'i32) or size <= 0'i32:
-    return
-  let tmp0 = cReadPtrAt(arr, cDuOffArrElems())
-  # The anchor must be readable all the way past the fields this file writes,
-  # because a TMP-shaped pointer that is short is not a TextMeshProUGUI.
-  if not duOk(tmp0, cDuOffTmpRect() + 8'i32):
-    return
-  # AND ALIVE. `_alphaVersionLabel` keeps pointing at the boot-time label after
-  # the menu rebuild destroys it: readable, `duOk` passes, `m_CachedPtr` zero.
-  # Returning nil here means "not yet" and the caller re-resolves next refresh,
-  # which is the whole fix -- the old code handed the dead wrapper onward.
-  if not duUnityAlive(tmp0):
-    return
-  result = tmp0
-
-## What `duRectOf` last did, for the log. A pointer that faulted is worth far
-## more with its provenance attached than without.
-var gDuRectSource = "not resolved"
-var gDuRectMismatchLogged = false
-var gDuRectEvidenceLogged = false
-
-proc duRectOf(tmp: Il2CppPtr): Il2CppPtr =
-  ## The RectTransform of a TMP component -- FROM `Component::get_transform`,
-  ## which is live truth, NOT from TMP's `m_rectTransform` cache at +0x388.
-  ##
-  ## THE CACHE IS WHY THE WALK STILL FAULTED. The previous version preferred the
-  ## cached field and returned it after nothing but a `duOk` readability check --
-  ## before even reaching the liveness gate below it. `duCanvasRootGo` then gated
-  ## that pointer (readable: yes; `m_CachedPtr` non-zero: yes) and called
-  ## `Transform::get_parent` on it, which died. Measured: the fault moved from
-  ## `get_transform` to `get_parent` exactly when the anchor gate started
-  ## working, which means the receiver of `get_parent` -- this value -- is the
-  ## remaining bad pointer.
-  ##
-  ## Both gates can pass on a pointer that is still wrong, and that is the whole
-  ## lesson here. `duOk` proves READABLE. `duUnityAlive` proves `m_CachedPtr` is
-  ## NON-ZERO -- it does not prove that pointer still points at a live native
-  ## object, and it does not prove the managed object is a Transform at all. A
-  ## stale field left over from a rebuilt tree satisfies both.
-  ##
-  ## So: ask the live component what its transform IS. One managed call, made
-  ## only while building the pool (not per frame), on a receiver that has just
-  ## been liveness-gated. The cached field is kept only as a CROSS-CHECK and is
-  ## logged once when the two disagree -- which is the evidence that says whether
-  ## the field is stale or the offset is wrong for this build.
-  result = nil
-  gDuRectSource = "not resolved"
-  if tmp == nil:
-    return
-  let fn = cDuFn(DuGetTransform)
-  if fn == nil:
-    gDuRectSource = "Component::get_transform did not verify on this build"
-    return
-  # `Component::get_transform` is an internal-call wrapper that dereferences
-  # `m_CachedPtr`, so liveness is checked BEFORE the call, never after.
-  if not duUnityAlive(tmp):
-    gDuRectSource = "the TMP component is destroyed (m_CachedPtr 0)"
-    return
-  let t = cDuCallPP(fn, tmp)
-  if not (duOk(t, 0x20'i32) and duUnityAlive(t)):
-    gDuRectSource = "get_transform returned null, unreadable or destroyed"
-    return
-  gDuRectSource = "Component::get_transform (live)"
-
-  # The cross-check. Read-only, and it decides nothing -- it only reports.
-  if not gDuRectMismatchLogged and duOk(tmp, cDuOffTmpRect() + 8'i32):
-    let cached = cReadPtrAt(tmp, cDuOffTmpRect())
-    if cached != t:
-      gDuRectMismatchLogged = true
-      warn "debugui: TMP's m_rectTransform cache (+0x" &
-           hexOf(uint64(cDuOffTmpRect())) & ") = 0x" &
-           hexOf(cast[uint64](cached)) & " but Component::get_transform says 0x" &
-           hexOf(cast[uint64](t)) & ". The cached value is " &
-           (if cached == nil: "null"
-            elif not duOk(cached, 0x20'i32): "UNREADABLE"
-            elif not duUnityAlive(cached): "readable but DESTROYED (m_CachedPtr 0)"
-            else: "readable and alive-looking, m_CachedPtr=0x" &
-                  hexOf(cast[uint64](duReadPtrField(cached, cDuOffCachedPtr()))) &
-                  ", klass=0x" & hexOf(cast[uint64](duReadPtrField(cached, 0'i32)))) &
-           ". The overlay uses get_transform and ignores the cache; this line " &
-           "is evidence about the field, not a failure."
-  result = t
 
 # ---------------------------------------------------------------------------
 # Read-back helpers
@@ -883,241 +680,7 @@ proc duNameOf(obj: Il2CppPtr): string =
     return
   result = bdReadString(s)
 
-# ---------------------------------------------------------------------------
-# Making a clone actually DRAW
-#
-# A clone of the version label inherits the version label's ENTIRE styling, and
-# that styling is for a faint bottom-corner stamp, not for a panel. Six separate
-# inherited properties can each independently render a live, parented, correctly
-# positioned label as zero pixels; the header note lists them with the field
-# offsets. This applies the opposite of each, by raw field write into a component
-# THIS FILE CLONED -- never into anything the game built.
-#
-# All of it is idempotent and none of it needs a managed call, so it costs one
-# burst of stores per label per session.
-# ---------------------------------------------------------------------------
-const
-  cDuAlignLeft   = 1'i32      ## HorizontalAlignmentOptions.Left
-  cDuAlignTop    = 256'i32    ## VerticalAlignmentOptions.Top
-  cDuAlignTopLft = 257'i32    ## TextAlignmentOptions.TopLeft
-  cDuOverflowOn  = 0'i32      ## TextOverflowModes.Overflow
-  cDuIntMax      = 2147483647'i32
-
-proc duMakeDrawable(lab: DuLabel; w, h: float64) =
-  if lab.tmp == nil:
-    return
-  # Word wrap OFF and overflow Overflow: after this the rect's WIDTH cannot
-  # hide a single glyph, which removes the whole class of "the box collapsed".
-  discard cDuWriteU8(lab.tmp, cDuOffTmpWordWrap(), 0'i32)
-  discard cDuWriteI32(lab.tmp, cDuOffTmpOverflow(), cDuOverflowOn)
-  # Auto-sizing OFF, or the font size written by `duStyle` is advisory and the
-  # real size is whatever fits a box we just collapsed to a point.
-  discard cDuWriteU8(lab.tmp, cDuOffTmpAutosize(), 0'i32)
-  # Top-left alignment, to match the top-left pivot `duPlace` sets: otherwise
-  # the glyphs sit a whole rect-height below where the anchor claims they are.
-  discard cDuWriteI32(lab.tmp, cDuOffTmpHAlign(), cDuAlignLeft)
-  discard cDuWriteI32(lab.tmp, cDuOffTmpVAlign(), cDuAlignTop)
-  discard cDuWriteI32(lab.tmp, cDuOffTmpTextAlign(), cDuAlignTopLft)
-  # Nothing clipped from either end: a source label with a reveal effect leaves
-  # these clamped, and a clamp of zero is an invisible label with perfect text.
-  discard cDuWriteI32(lab.tmp, cDuOffTmpFirstVis(), 0'i32)
-  discard cDuWriteI32(lab.tmp, cDuOffTmpMaxVisChars(), cDuIntMax)
-  discard cDuWriteI32(lab.tmp, cDuOffTmpMaxVisWords(), cDuIntMax)
-  discard cDuWriteI32(lab.tmp, cDuOffTmpMaxVisLines(), cDuIntMax)
-  discard cDuWriteI32(lab.tmp, cDuOffTmpPage(), 1'i32)
-  # No margins -- the version label's margins are sized for its own corner.
-  discard cDuWriteColor(lab.tmp, cDuOffTmpMargin(), 0.0, 0.0, 0.0, 0.0)
-  # The Graphic tint the CanvasRenderer multiplies by. The alpha version label
-  # is drawn faint; a clone that inherits alpha 0.15 is not literally invisible
-  # but is indistinguishable from it against the game's background.
-  discard cDuWriteColor(lab.tmp, cDuOffTmpGColor(), 1.0, 1.0, 1.0, 1.0)
-  # A real box. `duPlace` collapses anchorMin == anchorMax to a POINT, after
-  # which the rect IS the sizeDelta -- and the sizeDelta inherited from a
-  # stretch-anchored source is routinely zero or negative.
-  let fnSize = cDuFn(DuSetSizeDelta)
-  if fnSize != nil and lab.rect != nil:
-    cDuSetVec2(fnSize, lab.rect, w, h)
-  # Identity scale and a zero local Z. `SetParentAndAlign` does NOT reset the
-  # local transform (it is `SetParent(parent, false)` plus a layer walk), so the
-  # clone arrives carrying whatever the source had.
-  let fnScale = cDuFn(DuSetLocalScale)
-  if fnScale != nil and lab.rect != nil:
-    cDuSetVec3(fnScale, lab.rect, 1.0, 1.0, 1.0)
-  let fnPos = cDuFn(DuSetLocalPos)
-  if fnPos != nil and lab.rect != nil:
-    cDuSetVec3(fnPos, lab.rect, 0.0, 0.0, 0.0)
-  # And finally: awake. `Instantiate` copies `activeSelf`, so a clone of a
-  # disabled source is a disabled clone that will never render anything.
-  let go = duGameObjectOf(lab.tmp)
-  let fnAct = mi2Fn(Mi2GoSetActive)
-  if go != nil and fnAct != nil:
-    cMi2CallVPB(fnAct, go, 1'i32)
-  # Never a raycast target: a debug read-out must not eat the player's clicks.
-  duNoRaycast(lab.tmp)
-  # And never its own canvas: `Instantiate` copies the source label's nested
-  # Canvas onto every single clone, which is what put 33 canvases in the scene.
-  # The probe proves the repair works; this applies it to the rest.
-  if gDuAnchorTmp != nil:
-    discard duDropNestedCanvas(lab.tmp, duReadPtrField(gDuAnchorTmp,
-                                                       cDuOffTmpGCanvas()))
-  discard cDuWriteU8(lab.tmp, cDuOffTmpDirty(), 1'i32)
-
-# ---------------------------------------------------------------------------
-# Making one label
-#
-# `Object::Instantiate(Object)` on the anchor COMPONENT (see the header note on
-# why the component and not its GameObject), then `SetParentAndAlign` into the
-# canvas root, then anchors/pivot so the caller can position it in screen terms.
-# Returns a `DuLabel` with `tmp == nil` if any step did not happen.
-# ---------------------------------------------------------------------------
-proc duCloneLabel(anchor, rootGo: Il2CppPtr): DuLabel =
-  result = DuLabel(tmp: nil, rect: nil, last: cDuUnset, shown: false,
-                   pAnchor: "", pX: 0.0, pY: 0.0, placed: false,
-                   go: nil, active: true)
-  let fnInst = mi2Fn(Mi2Instantiate)
-  if fnInst == nil or anchor == nil:
-    return
-  let clone = cMi2CallPS1(fnInst, anchor)
-  if not duOk(clone, cDuOffTmpRect() + 8'i32):
-    return
-  # Parent it before anything else: SetParentAndAlign resets the local transform,
-  # so any position written before it would be thrown away.
-  let fnGo = mi2Fn(Mi2GetGameObject)
-  var cloneGo: Il2CppPtr = nil
-  if fnGo != nil:
-    cloneGo = cMi2CallPP(fnGo, clone)
-  if cloneGo != nil and rootGo != nil:
-    let fnPar = mi2Fn(Mi2SetParentAlign)
-    if fnPar != nil:
-      cMi2CallVS2(fnPar, cloneGo, rootGo)
-  let rect = duRectOf(clone)
-  if rect == nil:
-    # A label with no RectTransform cannot be positioned, and an unpositioned
-    # clone sitting on top of the version label is worse than no label at all.
-    return
-  result = DuLabel(tmp: clone, rect: rect, last: cDuUnset, shown: false,
-                   pAnchor: "", pX: 0.0, pY: 0.0, placed: false,
-                   go: cloneGo, active: true)
-
-# The widget model and ALL of its pure geometry live in `wgeom.nim`, which has
-# no game dependency of any kind -- no managed call, no IL2CPP pointer, no
-# Windows call. That is not tidiness: it is what lets `tests/wgeom_test.nim`
-# exercise the built-in placement path, the snap and the on-screen clamp against
-# a 0x0 and a 3840x2160 back buffer WITHOUT the client. The live faults this
-# overlay produced could not be reproduced any other way.
 include wgeom
-
-proc duPlace(lab: var DuLabel; anchorName: string; x, y: float64) =
-  ## Anchor + pivot + offset, in that order. FOUR managed calls -- so a label
-  ## that has not moved since the last refresh makes none of them. The panel
-  ## used to re-anchor all nine of its lines on every refresh forever, for a
-  ## layout that changes only when the config is re-read; markers genuinely do
-  ## move and pay the cost only when they actually did.
-  if lab.rect == nil:
-    return
-  if lab.placed and lab.pAnchor == anchorName and lab.pX == x and lab.pY == y:
-    return
-  var ax = 0.0
-  var ay = 1.0
-  var px = 0.0
-  var py = 1.0
-  duAnchorVec(anchorName, ax, ay, px, py)
-  let fnMin = cDuFn(DuSetAnchorMin)
-  let fnMax = cDuFn(DuSetAnchorMax)
-  let fnPiv = cDuFn(DuSetPivot)
-  let fnPos = cDuFn(DuSetAnchoredPos)
-  if fnMin != nil: cDuSetVec2(fnMin, lab.rect, ax, ay)
-  if fnMax != nil: cDuSetVec2(fnMax, lab.rect, ax, ay)
-  if fnPiv != nil: cDuSetVec2(fnPiv, lab.rect, px, py)
-  if fnPos != nil: cDuSetVec2(fnPos, lab.rect, x, y)
-  lab.pAnchor = anchorName
-  lab.pX = x
-  lab.pY = y
-  lab.placed = true
-
-proc duStyle(lab: DuLabel; size, r, g, b: float64) =
-  ## Font size and colour by RAW FIELD WRITE -- `m_fontSize` (+0x1EC, float) and
-  ## `m_fontColor` (+0x150, four floats). Both are plain managed fields, so no
-  ## call is needed; the dirty flag set by `duSetText` is what makes TMP notice.
-  if lab.tmp == nil:
-    return
-  if size > 0.0:
-    discard cDuWriteF32(lab.tmp, cDuOffTmpFontSize(), size)
-  discard cDuWriteColor(lab.tmp, cDuOffTmpFontColor(), r, g, b, 1.0)
-
-## Carries the text into `duNewStringImpl` -- the guarded alloc thunk passes one
-## pointer, and a string is easier held in a global than marshalled through it.
-## Exactly the shape `gBrandText` uses for the version brand.
-var gDuStrText: string = ""
-
-proc duNewStringImpl(a: Il2CppPtr): Il2CppPtr {.
-    exportc: "aowl_du_newstring", cdecl.} =
-  ## Allocates the managed `System.String` for `gDuStrText`. `a` is unused. This
-  ## is NOT separately SEH-guarded: the whole overlay body already runs under one
-  ## `aowl_p_p_seh`, and that guard is not re-entrant -- a nested one would
-  ## disarm the outer on return and leave the rest of the body unprotected.
-  result = newString(gRt, gDuStrText)
-
-proc duSetText(lab: var DuLabel; text: string): bool =
-  ## Put `text` into a cloned label, by the primitive proven live by the version
-  ## brand: allocate a managed String and RAW-WRITE its pointer into `m_text`
-  ## (+0xE0), then set `m_havePropertiesChanged` (+0x378) so TMP re-lays it out
-  ## on its next tick.
-  ##
-  ## Unchanged text is a no-op, which is what keeps a 12-line panel from
-  ## allocating 12 Strings every refresh forever.
-  result = false
-  if lab.tmp == nil:
-    return
-  if lab.last == text:
-    return true
-  var t = text
-  if t.len > cDuMaxTextLen:
-    # Truncate rather than refuse: a runaway nickname must not be able to stop
-    # the rest of the panel from updating.
-    var cut = ""
-    for i in 0 ..< cDuMaxTextLen:
-      cut.add t[i]
-    t = cut
-  gDuStrText = t
-  let s = duNewStringImpl(cast[Il2CppPtr](0))
-  if s == nil or cIsReadable(s, 0x14'i32) == 0'i32:
-    return
-  if cUxWritePtr(lab.tmp, cDuOffTmpText(), s) == 0'i32:
-    return
-  discard cDuWriteU8(lab.tmp, cDuOffTmpDirty(), 1'i32)
-  lab.last = t
-  lab.shown = t.len > 0
-  result = true
-
-proc duSetActive(lab: var DuLabel; on: bool) =
-  ## Switch the whole clone on or off. Called only on a CHANGE, so an idle
-  ## marker costs nothing per frame.
-  if lab.go == nil or lab.active == on:
-    return
-  let fnAct = mi2Fn(Mi2GoSetActive)
-  if fnAct == nil:
-    return
-  cMi2CallVPB(fnAct, lab.go, (if on: 1'i32 else: 0'i32))
-  lab.active = on
-
-proc duHide(lab: var DuLabel) =
-  ## Take a label off the screen properly.
-  ##
-  ## The old version only blanked the text, and only when `shown` was already
-  ## true -- so a clone that had never been written kept the DONOR'S caption and
-  ## the donor's position, visible, forever. That is the "1.1.0.1.4677 | PvE"
-  ## floating in the dead centre of the screen: marker 0, never assigned a bot,
-  ## never actually hidden.
-  ##
-  ## Now it clears the text (the `cDuUnset` sentinel guarantees the first call
-  ## really writes) AND deactivates the GameObject, which also takes the label
-  ## out of the canvas batch and out of the raycaster.
-  discard duSetText(lab, "")
-  duSetActive(lab, false)
-
-proc duShow(lab: var DuLabel) =
-  duSetActive(lab, true)
 
 # ---------------------------------------------------------------------------
 # Reading the world
@@ -1640,37 +1203,61 @@ proc duSaveWidgets() =
 #
 #   CLIENT PIXELS   what `GetCursorPos` + `ScreenToClient` give. Origin TOP-left,
 #                   Y grows DOWN.
-#   CANVAS UNITS    what `anchoredPosition` is in. Origin BOTTOM-left, Y grows
-#                   UP. Pixels / the CanvasScaler's scaleFactor.
+#   CANVAS UNITS    what `wgeom.nim` works in. Origin BOTTOM-left, Y grows UP,
+#                   because that is Unity's convention and wgeom is the one
+#                   part of this feature that never failed -- it was left
+#                   untouched by the move to the D3D overlay, and its 208-check
+#                   offline test still passes unmodified.
 #   ANCHORED        the offset the widget stores: canvas units relative to its
-#                   anchor point, with its pivot deciding which corner of the
-#                   text sits there.
+#                   anchor point, with its pivot deciding which corner sits
+#                   there. This is what is PERSISTED, never a pixel pair, which
+#                   is what makes a saved layout survive a resolution change.
 #
-# `gDuCanvasScale` is the measured scaleFactor of the canvas the clones actually
-# landed in (read at build time, not assumed), so these conversions are the same
-# correction the ESP markers already apply.
+# One canvas unit IS one back-buffer pixel now. There is no CanvasScaler in the
+# path any more, so the only conversion left is the Y flip, in `duPx`.
 # ---------------------------------------------------------------------------
 
 proc duCanvasSize(cw, ch: var float64): bool =
-  ## Canvas extent in canvas units. False when the client rect is not readable,
-  ## in which case no drag maths is attempted at all.
-  let pw = float64(cWgClientW())
-  let ph = float64(cWgClientH())
-  if pw < 16.0 or ph < 16.0 or gDuCanvasScale <= 0.01:
+  ## THE SCREEN, FROM THE REGION'S OWN PUBLISHED MEASUREMENT.
+  ##
+  ## `aowl_region_screen_*` is measured once a frame from the game window's
+  ## client rect by `region.nim` and is the SAME size the overlay's back buffer
+  ## has, which is what makes a snap land where the pixel does. It is never a
+  ## constant and never assumed: `known` is a genuine third answer, and a
+  ## not-yet-measured screen is refused here rather than flattened into 0x0 --
+  ## snapping against a zero canvas drags every widget to the origin.
+  ##
+  ## A canvas unit IS a back-buffer pixel now: the TextMeshPro CanvasScaler that
+  ## used to divide this down is not in the path any more.
+  if cWgScrKnown() == 0'i32:
     return false
-  cw = pw / gDuCanvasScale
-  ch = ph / gDuCanvasScale
+  let pw = float64(cWgScrW())
+  let ph = float64(cWgScrH())
+  if pw < 16.0 or ph < 16.0:
+    return false
+  cw = pw
+  ch = ph
   true
 
 proc duCursorCanvas(cx, cy: var float64): bool =
   ## The cursor in canvas units, Y-up. False unless the sample is inside our own
   ## client area this refresh.
-  if cWgMouseOk() == 0'i32 or gDuCanvasScale <= 0.01:
+  if cWgMouseOk() == 0'i32:
     return false
-  let ph = float64(cWgClientH())
-  cx = float64(cWgMouseX()) / gDuCanvasScale
-  cy = (ph - float64(cWgMouseY())) / gDuCanvasScale
+  var cw = 0.0
+  var ch = 0.0
+  if not duCanvasSize(cw, ch):
+    return false
+  cx = float64(cWgMouseX())
+  cy = ch - float64(cWgMouseY())
   true
+
+proc duPx(cy, ch: float64): float32 =
+  ## THE ONE FLIP. `wgeom.nim` is Unity's Y-up canvas; the overlay is Y-down
+  ## pixels. Keeping the conversion to a single named proc is why wgeom did not
+  ## have to change at all -- it is the one part of this feature that never
+  ## failed and its 208-check offline test still passes untouched.
+  float32(ch - cy)
 
 # ---------------------------------------------------------------------------
 # The drag
@@ -1848,24 +1435,23 @@ proc duMemLine(): string =
           $cWgSysFree() & " MB free"
   s
 
-# ---------------------------------------------------------------------------
-# Rendering a widget
-#
-# One label, one string, newline-separated. `duSetText` short-circuits when the
-# text has not changed, so a widget whose values are steady costs one string
-# comparison and no managed call at all.
-#
-# THE EXTENT IS AN ESTIMATE, and is labelled one. TMP's real rendered bounds are
-# behind `GetPreferredValues`/`textBounds`, which are struct-returning managed
-# calls this file has not byte-verified -- and `ForceMeshUpdate` on this build
-# is the universal empty-body stub (`ret 0`, shared by 6,438 methods), so the
-# mesh is not guaranteed refreshed at the moment we would read it anyway. What
-# the estimate is used for is HIT-TESTING A DRAG, where being a few units res
-# costs a slightly generous grab box and nothing else. It is never used to place
-# text, only to catch a cursor.
-# ---------------------------------------------------------------------------
-const cDuGlyphAspect = 0.55   ## mean advance / point size for this font, approx
 
+# ---------------------------------------------------------------------------
+# COMPOSING A WIDGET'S TEXT
+#
+# One widget is one newline-separated string, and the caller turns each line
+# into ONE region TEXT command. `lineCount` and `widest` come back so the caller
+# can size the widget's box, and that box is now EXACT rather than estimated:
+# the overlay's font is a fixed 8x16 cell, so `widest * 8 * scale` is the real
+# rendered width. The old path had to guess (TMP's real bounds are behind
+# struct-returning calls this file never byte-verified, and `ForceMeshUpdate` on
+# this build is the universal empty-body stub), and a guessed grab box that does
+# not match what is on screen is a drag that misses.
+#
+# Embedded newlines are counted, not just the field count: `region` and
+# `botlist` are ONE field and MANY lines, and a height taken from the field
+# count gave the profiler widget a grab box one line tall.
+# ---------------------------------------------------------------------------
 proc duWidgetText(w: DuWidget; lineCount: var int; widest: var int): string =
   var res = ""
   lineCount = 0
@@ -1917,93 +1503,234 @@ proc duWidgetText(w: DuWidget; lineCount: var int; widest: var int): string =
     widest = res.len
   res
 
-proc duUpdateWidgets() =
-  ## Refresh, place and size every widget. One label per widget, taken from the
-  ## same pool the old single-column panel used.
+## THE COLOURS. Packed 0xAABBGGRR, matching `AOWL_RGBA` and the overlay's
+## vertex colour. Plain constants because the region command carries a colour
+## per command and nothing here reads a theme.
+proc duRgba(r, g, b, a: int): uint32 =
+  uint32(r and 255) or (uint32(g and 255) shl 8) or
+  (uint32(b and 255) shl 16) or (uint32(a and 255) shl 24)
+
+proc duCfgColour(): uint32 =
+  duRgba(int(gDuCfg.panelR * 255.0), int(gDuCfg.panelG * 255.0),
+         int(gDuCfg.panelB * 255.0), 255)
+
+proc duTextScale(ch: float64): int32 =
+  ## The integer font scale, chosen by the SAME rule the overlay's own panel and
+  ## the F6 menu use, so all three read at the same size on one screen. An 8x16
+  ## cell is unreadable at 2160p, which is the only reason this exists.
+  if ch >= 2500.0: 3'i32
+  elif ch >= 1300.0: 2'i32
+  else: 1'i32
+
+## ONE FIXED LINE BUFFER, refilled per command. Not a `toCString`: that
+## allocates, and this runs several dozen times per frame inside a per-frame
+## callback. File-scope and fixed-size, so there is no allocation on the draw
+## path at all and the length is bounded by a compile-time constant.
+var gDuLineBuf: array[cDuCmdText + 1, char]
+
+proc duEmitLine(x, y: float32; s: string; col: uint32; scale: int32) =
+  ## One TEXT command. A line longer than the command's inline buffer is
+  ## truncated AND MARKED with a trailing '>', because a read-out that quietly
+  ## loses its right-hand column looks exactly like one telling the truth.
+  if s.len == 0:
+    return
+  var n = s.len
+  var cut = false
+  if n > cDuCmdText:
+    n = cDuCmdText - 1
+    cut = true
+  for i in 0 ..< n:
+    gDuLineBuf[i] = s[i]
+  if cut:
+    gDuLineBuf[n] = '>'
+    gDuLineBuf[n + 1] = chr(0)
+  else:
+    gDuLineBuf[n] = chr(0)
+  discard cWgDrText(x, y, cast[cstring](addr gDuLineBuf[0]), col, scale)
+
+proc duDrawWidgets() =
+  ## Lay out and SUBMIT every enabled widget. Called from inside the region's
+  ## DRAW callback and nowhere else: `aowl_region_push` refuses outside one, so
+  ## a stray call cannot add geometry to somebody else's frame.
+  ##
+  ## NO GUARD IS OPENED HERE. The region dispatcher already wraps each
+  ## participant callback in the ONE `aowl_p_p_seh`, and that guard is not
+  ## re-entrant -- a guard here would DISARM it rather than add anything.
   var cw = 0.0
   var ch = 0.0
-  let haveCanvas = duCanvasSize(cw, ch)
-  var used = 0
+  if not duCanvasSize(cw, ch):
+    return                      # screen not measured yet: draw nothing rather
+                                # than guess a size
+  let scale = duTextScale(ch)
+  let cellW = cDuCellW * float64(scale)
+  let cellH = cDuCellH * float64(scale)
+  let base = duCfgColour()
+  var drawn = 0
   for i in 0 ..< gDuWidgets.len:
-    if used >= gDuPanel.len or used >= cDuMaxWidgets:
+    if drawn >= cDuMaxWidgets:
       break
     if not gDuWidgets[i].on:
       continue
     # A widget already charged with `cDuWidgetFaultLimit` faults is skipped
-    # entirely -- not retried, not recharged. This is what keeps one bad widget
-    # from taking the other seven dark.
+    # entirely. This is what keeps one bad widget from taking the rest dark.
     if i < gDuWidgetFaults.len and gDuWidgetFaults[i] >= cDuWidgetFaultLimit:
       continue
-    # THE BREADCRUMB: one store per stage into a file-scope volatile, so it
-    # survives the guard's longjmp and the handler can name the stage AND the
-    # widget. See the note in `abi/aowlspt_widget.h`.
     cWgCrumbW(int32(i))
     cWgCrumb(WgCrumbWText)
     var lines = 0
     var widest = 0
     let text = duWidgetText(gDuWidgets[i], lines, widest)
-    # Extent, in canvas units, from the font size the config asked for.
+    if widest > cDuCmdText: widest = cDuCmdText
+    # THE EXTENT IS NOW EXACT, not estimated. The overlay's font is a fixed
+    # 8x16 cell, so the box the user grabs is the box that is on screen -- the
+    # old estimate against TMP's unknown metrics is gone with it.
     gDuWidgets[i].lines = lines
-    gDuWidgets[i].w = float64(widest) * gDuCfg.panelFont * cDuGlyphAspect + 12.0
-    gDuWidgets[i].h = float64(lines) * gDuCfg.panelLine + 6.0
-    # A widget dragged off the canvas by a resolution change is pulled back on
-    # BEFORE it is placed, so it can never become unreachable by the mouse.
-    if haveCanvas:
-      duClampOnScreen(i, cw, ch)
+    gDuWidgets[i].w = float64(widest) * cellW + 8.0
+    gDuWidgets[i].h = float64(lines) * cellH + 6.0
+    duClampOnScreen(i, cw, ch)
     cWgCrumb(WgCrumbWPlace)
-    duPlace(gDuPanel[used], gDuWidgets[i].anchor,
-            gDuWidgets[i].x, gDuWidgets[i].y)
+    var l = 0.0
+    var t = 0.0
+    var r = 0.0
+    var b = 0.0
+    duWidgetRect(gDuWidgets[i], cw, ch, l, t, r, b)
+    let px = float32(l)
+    let py = duPx(t, ch)
     cWgCrumb(WgCrumbWStyle)
-    # The widget being dragged is tinted, so "which one am I holding" is
-    # answered on screen rather than by feel.
+    # A BACKING PLATE, so pale text on a pale loading screen is still readable.
+    # Drawn first; the region rasterises commands in SUBMISSION ORDER, which is
+    # the only ordering guarantee this path needs -- and it is a guarantee,
+    # unlike a Unity canvas sort order.
+    discard cWgDrFill(px, py, float32(gDuWidgets[i].w),
+                      float32(gDuWidgets[i].h), duRgba(8, 10, 14, 170))
+    var col = base
     if gDuEdit and gDuWidgets[i].dragging:
-      duStyle(gDuPanel[used], gDuCfg.panelFont, 0.45, 1.0, 0.45)
+      col = duRgba(115, 255, 115, 255)
+      discard cWgDrBox(px, py, float32(gDuWidgets[i].w),
+                       float32(gDuWidgets[i].h), 2.0'f32,
+                       duRgba(115, 255, 115, 255))
     elif gDuEdit:
-      duStyle(gDuPanel[used], gDuCfg.panelFont, 0.6, 0.85, 1.0)
-    else:
-      duStyle(gDuPanel[used], gDuCfg.panelFont,
-              gDuCfg.panelR, gDuCfg.panelG, gDuCfg.panelB)
+      col = duRgba(153, 217, 255, 255)
+      discard cWgDrBox(px, py, float32(gDuWidgets[i].w),
+                       float32(gDuWidgets[i].h), 1.0'f32,
+                       duRgba(153, 217, 255, 200))
     cWgCrumb(WgCrumbWSetText)
-    discard duSetText(gDuPanel[used], text)
+    # ONE COMMAND PER LINE. The command carries its text inline (no lifetime
+    # question) and is capped at `AOWL_REGION_TEXT_LEN`, so a multi-line widget
+    # is many commands -- bounded by `cDuMaxWidgetLines`, which is why one
+    # widget cannot exhaust the frame's command budget.
+    var row = 0
+    var start = 0
+    var k = 0
+    while k <= text.len and row < cDuMaxWidgetLines:
+      if k == text.len or text[k] == '\n':
+        duEmitLine(px + 4.0'f32, py + 3.0'f32 + float32(float64(row) * cellH),
+                   text[start ..< k], col, scale)
+        inc row
+        start = k + 1
+      inc k
     cWgCrumb(WgCrumbWShow)
-    duShow(gDuPanel[used])
-    inc used
-  # Out of the per-widget region. The widget crumb is CLEARED rather than left
-  # pointing at the last widget that rendered successfully, which would blame an
-  # innocent one for a fault raised after the loop.
+    inc drawn
   cWgCrumbW(-1'i32)
-  # THE EDIT-MODE BANNER, in the spare label the pool was sized for. It exists
-  # because edit mode is otherwise invisible, and an invisible mode that changes
-  # what a left click does is the worst kind: it says what is on, what the keys
-  # are, and -- explicitly -- that the click is NOT taken from the game.
+  # THE EDIT-MODE BANNER. Edit mode changes what a left click does, and an
+  # invisible mode that does that is the worst kind -- so it says what is on,
+  # what the keys are, and that the click is NOT taken from the game.
   cWgCrumb(WgCrumbBanner)
-  if gDuEdit and used < gDuPanel.len:
-    var b = "EDIT MODE  --  drag a widget with the left mouse button"
-    b.add "\n  Ctrl+F3 leave   1-9 toggle a widget   0 reset all placements"
-    b.add "\n  drops snap to screen edges, corners and to other widgets,"
-    b.add "\n  and are saved to aowlspt-debugui-layout.json on every drop."
-    b.add "\n  The overlay does NOT swallow the click; the game still sees it."
-    b.add "\n  widgets: "
+  if gDuEdit:
+    var bl: seq[string] = @[
+      "EDIT MODE -- drag a widget with the left mouse button",
+      "Ctrl+F3 leave   1-9 toggle a widget   0 reset all",
+      "drops snap to edges, corners and to other widgets,",
+      "and are saved to aowlspt-debugui-layout.json on drop.",
+      "The overlay does NOT swallow the click."]
+    var names = "widgets: "
     var n = 0
     for i in 0 ..< gDuWidgets.len:
       if n >= 9:
         break
-      if n > 0:
-        b.add "  "
-      b.add $(n + 1) & "=" & gDuWidgets[i].id &
-            (if gDuWidgets[i].on: "" else: "(off)")
+      if n > 0: names.add " "
+      names.add $(n + 1) & "=" & gDuWidgets[i].id &
+                (if gDuWidgets[i].on: "" else: "-off")
       inc n
-    b.add "\n  layout from " & gDuLayoutSource
-    duPlace(gDuPanel[used], "bottom", 0.0, 16.0)
-    duStyle(gDuPanel[used], gDuCfg.panelFont, 1.0, 0.85, 0.35)
-    discard duSetText(gDuPanel[used], b)
-    duShow(gDuPanel[used])
+    bl.add names
+    bl.add "layout from " & gDuLayoutSource
+    let bx = float32(cw * 0.5 - 27.0 * cellW)
+    let by = float32(ch - 8.0 - float64(bl.len) * cellH)
+    discard cWgDrFill(bx - 4.0'f32, by - 3.0'f32, float32(56.0 * cellW),
+                      float32(float64(bl.len) * cellH + 6.0),
+                      duRgba(8, 10, 14, 190))
+    for i in 0 ..< bl.len:
+      duEmitLine(bx, by + float32(float64(i) * cellH), bl[i],
+                 duRgba(255, 217, 89, 255), scale)
+  # NOTHING TO HIDE. The command buffer is rebuilt from empty every frame, so a
+  # widget switched off simply stops being submitted. There is no label pool to
+  # blank and therefore no way to leave stale text on screen -- a whole class of
+  # bug that only existed because the clone path had persistent objects.
+
+# ---------------------------------------------------------------------------
+# THE IN-WORLD MARKERS
+#
+# Same projection as before -- `Camera.main.WorldToScreenPoint` -- but the
+# result now goes straight out as a region TEXT command instead of into a cloned
+# label. Unity's screen point has its ORIGIN AT THE BOTTOM-LEFT and a `z` that
+# is the distance in front of the camera, so `z <= 0` is BEHIND the camera and
+# the marker must be dropped; drawing those is the classic ESP ghost bug.
+# ---------------------------------------------------------------------------
+proc duDrawMarkers(): bool =
+  ## False means projection is UNAVAILABLE on this build -- a third answer, not
+  ## "nothing to draw" -- so the caller can say so once.
+  let fnCam = cDuFn(DuCameraMain)
+  let fnW2S = cDuFn(DuWorldToScreen)
+  if fnCam == nil or fnW2S == nil:
+    return false
+  var cw = 0.0
+  var ch = 0.0
+  if not duCanvasSize(cw, ch):
+    return true                 # no measured screen yet; not a build problem
+  let cam = cDuCallPV(fnCam)
+  if not duOk(cam, 0x20'i32):
+    return true                 # menu or loading screen: not an error
+  var eyeOk = false
+  var ex = 0.0
+  var ey = 0.0
+  var ez = 0.0
+  duPlayerPos(gDuYou, eyeOk, ex, ey, ez)
+  let want = duSplit(gDuCfg.espFields, ',')
+  let scale = duTextScale(ch)
+  var used = 0
+  for i in 0 ..< gDuBots.len:
+    if used >= cDuMaxMarkers:
+      break
+    let b = gDuBots[i]
+    if not b.posOk:
+      continue
+    var dist = 0.0
+    if eyeOk:
+      dist = duDistance(ex, ey, ez, b.x, b.y, b.z)
+      if gDuCfg.espMaxDist > 0.0 and dist > gDuCfg.espMaxDist:
+        continue
+    if cDuWorldToScreen(fnW2S, cam, b.x, b.y, b.z) == 0'i32:
+      continue
+    if cDuScreenZ() <= 0.0:
+      continue                  # behind the camera
+    var text = ""
+    for w in want:
+      if text.len > 0: text.add " "
+      case w
+      of "role": text.add duRoleName(b.role)
+      of "nick": text.add (if b.nick.len > 0: b.nick else: "?")
+      of "dist": text.add duFmt0(dist) & "m"
+      of "pos":  text.add "(" & duFmt0(b.x) & "," & duFmt0(b.z) & ")"
+      else: discard
+    if not b.alive:
+      text.add " [dead]"
+    # Unity's screen point is bottom-origin; the overlay is top-origin. The same
+    # single flip as the widgets, through the same proc.
+    duEmitLine(float32(cDuScreenX()),
+               duPx(cDuScreenY() + gDuCfg.espY, ch),
+               text, duRgba(255, 190, 80, 255), scale)
     inc used
-  # Every label past the last enabled widget is hidden, or a widget turned off
-  # leaves its last text on screen forever.
-  cWgCrumb(WgCrumbHideRest)
-  for i in used ..< gDuPanel.len:
-    duHide(gDuPanel[i])
+  true
 
 # ---------------------------------------------------------------------------
 # Edit-mode keys
@@ -2032,115 +1759,6 @@ proc duEditKeys() =
     okLog "debugui: every widget reset to its built-in placement and enabled"
     duSaveWidgets()
 
-proc duUpdatePanel() =
-  ## Refresh every panel line. Positions are re-applied each refresh because the
-  ## line COUNT can change between refreshes (a field that produced no text is
-  ## still a slot), and re-anchoring is three cheap calls on a label that is
-  ## already parented.
-  let fields = duSplit(gDuCfg.panelFields, ',')
-  var used = 0
-  for i in 0 ..< gDuPanel.len:
-    if used >= fields.len or used >= cDuMaxPanelLines:
-      duHide(gDuPanel[i])
-      continue
-    let text = duPanelLine(fields[used])
-    duPlace(gDuPanel[i], gDuCfg.panelAnchor,
-            gDuCfg.panelX, gDuCfg.panelY - float64(used) * gDuCfg.panelLine)
-    discard duSetText(gDuPanel[i], text)
-    duShow(gDuPanel[i])
-    inc used
-
-# ---------------------------------------------------------------------------
-# The in-world markers
-#
-# Screen-space, via `Camera.main.WorldToScreenPoint(botPosition)`. Unity's screen
-# point has its ORIGIN AT THE BOTTOM-LEFT and a `z` that is the distance in front
-# of the camera, so `z <= 0` is BEHIND the camera and the marker must be hidden
-# (its x/y are finite there, and drawing them would put ghost markers on screen
-# for everything behind you -- the classic ESP bug).
-#
-# The label is anchored bottom-left of the canvas so that `anchoredPosition` is
-# in the same coordinate system the projection produces, which is what makes this
-# a straight copy with no resolution maths.
-# ---------------------------------------------------------------------------
-proc duUpdateMarkers(): bool =
-  ## Returns false when projection is unavailable on this build, so the caller
-  ## can say so once and fall back to the panel's `botlist` line.
-  let fnCam = cDuFn(DuCameraMain)
-  let fnW2S = cDuFn(DuWorldToScreen)
-  if fnCam == nil or fnW2S == nil:
-    for i in 0 ..< gDuMarks.len:
-      duHide(gDuMarks[i])
-    return false
-  let cam = cDuCallPV(fnCam)
-  if not duOk(cam, 0x20'i32):
-    # No main camera: the menu, or a loading screen. Not an error.
-    for i in 0 ..< gDuMarks.len:
-      duHide(gDuMarks[i])
-    return true
-
-  var eyeOk = false
-  var ex = 0.0
-  var ey = 0.0
-  var ez = 0.0
-  duPlayerPos(gDuYou, eyeOk, ex, ey, ez)
-
-  let want = duSplit(gDuCfg.espFields, ',')
-  var used = 0
-  for i in 0 ..< gDuBots.len:
-    if used >= gDuMarks.len:
-      break
-    let b = gDuBots[i]
-    if not b.posOk:
-      continue
-    var dist = 0.0
-    if eyeOk:
-      dist = duDistance(ex, ey, ez, b.x, b.y, b.z)
-      if gDuCfg.espMaxDist > 0.0 and dist > gDuCfg.espMaxDist:
-        continue
-    if cDuWorldToScreen(fnW2S, cam, b.x, b.y, b.z) == 0'i32:
-      continue
-    if cDuScreenZ() <= 0.0:
-      continue                      # behind the camera
-    var text = ""
-    for w in want:
-      if text.len > 0: text.add " "
-      case w
-      of "role": text.add duRoleName(b.role)
-      of "nick": text.add (if b.nick.len > 0: b.nick else: "?")
-      of "dist": text.add duFmt0(dist) & "m"
-      of "pos":  text.add "(" & duFmt0(b.x) & "," & duFmt0(b.z) & ")"
-      else: discard
-    if not b.alive:
-      text.add " [dead]"
-    # Pixels -> canvas units. `gDuCanvasScale` is 1.0 when the scaler is 1 or
-    # when the canvas could not be read, so this is a no-op in the case the
-    # original code assumed and a correction in the case it did not.
-    let inv = 1.0 / gDuCanvasScale
-    duPlace(gDuMarks[used], "bottomleft",
-            cDuScreenX() * inv, cDuScreenY() * inv + gDuCfg.espY)
-    discard duSetText(gDuMarks[used], text)
-    duShow(gDuMarks[used])
-    inc used
-  for i in used ..< gDuMarks.len:
-    duHide(gDuMarks[i])
-  result = true
-
-# ---------------------------------------------------------------------------
-# THE ONE-SHOT DIAGNOSTIC DUMP
-#
-# The rule in this codebase is that the client tells you; you do not reason from
-# source. The first build of this overlay logged "built 9 panel line(s) and 24
-# marker label(s)" and put nothing on screen, and there was no way to tell which
-# of five completely different causes it was -- a collapsed rect, a wiped
-# position, an inactive object, a hidden canvas, or a label drawn behind the game
-# -- because the code only ever wrote and never read.
-#
-# So: once, on the first successful build, dump the SOURCE label and CLONE[0]
-# side by side. The two columns next to each other are the answer: everything the
-# clone inherited shows as an identical pair, and everything the overlay changed
-# shows as a difference. Read-only, capped, and it never runs again.
-# ---------------------------------------------------------------------------
 proc duDescribeVec2(target: int32; self: Il2CppPtr): string =
   var ok = false
   var x = 0.0
@@ -2203,656 +1821,6 @@ proc duReadF32Field(p: Il2CppPtr; off: int32): float64 =
 
 ## Where the clones were actually parented, and by which route. Logged once, so
 ## the next run can be read rather than reasoned about.
-var gDuParentRoute = "?"
-var gDuParentRect: Il2CppPtr = nil
-
-proc duRectIsSane(t: Il2CppPtr): bool =
-  ## True only if `t` really is a RectTransform with a usable rect. This is the
-  ## guard the first version did not have, and its absence is the whole bug:
-  ## `Transform::get_root` on the version label lands on a plain Transform
-  ## ('Preloader UI', the OUTERMOST root), and reading RectTransform fields off a
-  ## plain Transform yields garbage -- the live dump showed w=-7268628.0 h=0.0.
-  ## A clone parented there inherits no screen-space Canvas, so Unity gives each
-  ## one its OWN world-space canvas: 33 clones became 33 extra render passes,
-  ## which is the lag, the stutter and (with the churn on top) the crash.
-  ##
-  ## `RectTransform::get_rect` is an sret call; a plain Transform does not have
-  ## the method at all, but the call is made through the RectTransform vtable-free
-  ## static RVA, so what protects us is the SANITY of the answer, not the type.
-  result = false
-  if not duOk(t, 0x20'i32):
-    return
-  var ok = false
-  duGetSret(DuGetRect, t, 4'i32, ok)
-  if not ok:
-    return
-  let w = cDuSret2()
-  let h = cDuSret3()
-  # A real UI rect: positive, finite, and not absurd. 32..16384 covers every
-  # sane canvas from a small panel to an 8K screen and excludes both the zero
-  # rect of a plain Transform and the -7,268,628 garbage the dump showed.
-  result = w > 32.0 and w < 16384.0 and h > 32.0 and h < 16384.0
-
-## Why the walk refused, in words, for the log. Set at every early return so a
-## refusal is never silent and never generic -- "duCanvasRootGo returned nil" is
-## the kind of message that costs a whole cycle.
-var gDuRootRefusal = "not attempted"
-
-proc duCanvasRootGo(anchor: Il2CppPtr): Il2CppPtr =
-  ## The GameObject the clones must be parented under.
-  ##
-  ## EVERY HOP HERE IS A MANAGED CALL ON A UnityEngine.Object, and every one of
-  ## those calls is an IL2CPP internal-call wrapper that dereferences
-  ## `m_CachedPtr` without checking it. So every hop is gated TWICE -- `duOk`
-  ## for readability and `duUnityAlive` for the native half -- and carries its
-  ## own breadcrumb, because the second live run proved that "it faulted
-  ## somewhere in this proc" is not a narrow enough answer to act on.
-  ##
-  ## THE FAULT THIS FIXES. At the main menu, two minutes after boot, the anchor
-  ## reached through `PreloaderUI._alphaVersionLabel` is a DESTROYED wrapper: the
-  ## menu rebuild replaced the tree it lived in. It is perfectly readable, so the
-  ## old `duOk`-only chain handed it over, and `Component::get_transform` on it
-  ## faulted inside Unity's C++ on every single refresh until the overlay
-  ## switched itself off.
-  ##
-  ## ROUTE 1, right by CONSTRUCTION rather than by lookup: the source label's
-  ## OWN PARENT. A sibling of the version label is on the version label's canvas
-  ## because it is in the version label's subtree -- there is no canvas to
-  ## resolve and nothing to be wrong about. The live dump names it: `UpperPart`,
-  ## parent[0], rect 1920x1080.
-  ##
-  ## The two earlier attempts both went looking for a canvas instead and both
-  ## landed the clones on a DIFFERENT canvas from the source:
-  ##   * `Transform::get_root` -> the outermost 'Preloader UI', a plain
-  ##     Transform with no canvas above it -> a world-space canvas each.
-  ##   * "highest sane RectTransform ancestor" -> 'Preloader UI' at parent[3],
-  ##     which carries the OUTER canvas, not the nested one the source draws on.
-  ## `Graphic.m_Canvas` was meant to fix that and did not take on the live run,
-  ## so it is a CROSS-CHECK only: routes 2 and 3 exist so a build where
-  ## `get_parent` is unavailable still gets something, and each says which it
-  ## used.
-  result = nil
-  gDuParentRoute = "none"
-  gDuParentRect = nil
-
-  let fnGo = mi2Fn(Mi2GetGameObject)
-  if fnGo == nil:
-    gDuRootRefusal = "Component::get_gameObject did not verify on this build"
-    return
-
-  # ---- HOP 0: is the anchor itself still alive? -------------------------
-  # This is the one that was missing. Everything below calls into Unity with
-  # `anchor` or something derived from it as `this`.
-  cWgCrumb(WgCrumbRAnchorAlive)
-  if not duUnityAlive(anchor):
-    gDuRootRefusal = "the anchor (PreloaderUI._alphaVersionLabel) is a " &
-      "DESTROYED UnityEngine.Object -- readable, but m_CachedPtr is 0. This " &
-      "is what a menu rebuild leaves behind; re-resolving next refresh."
-    return
-
-  # ---- route 1: the source label's own parent -- a sibling by construction ----
-  cWgCrumb(WgCrumbRRect)
-  let rect = duRectOf(anchor)
-  cWgCrumb(WgCrumbRRectAlive)
-  # `rect != nil` was the ONLY check here, and a non-nil pointer is not a live
-  # object. Both gates, before it is ever used as a `this`.
-  let rectOk = duOk(rect, 0x20'i32) and duUnityAlive(rect)
-  let fnPar = cDuFn(DuGetParent)
-  if not rectOk:
-    gDuRootRefusal = "the anchor's RectTransform is null, unreadable or " &
-      "destroyed (m_CachedPtr 0)"
-  elif fnPar == nil:
-    gDuRootRefusal = "Transform::get_parent did not verify on this build"
-  else:
-    # THE EVIDENCE, written BEFORE the call that has been dying, so it survives
-    # even if this still faults. Everything here is a guarded field read; none
-    # of it calls into Unity.
-    if not gDuRectEvidenceLogged:
-      gDuRectEvidenceLogged = true
-      okLog "debugui: about to call Transform::get_parent on rect=0x" &
-            hexOf(cast[uint64](rect)) & " from " & gDuRectSource &
-            "; klass=0x" & hexOf(cast[uint64](duReadPtrField(rect, 0'i32))) &
-            " m_CachedPtr=0x" &
-            hexOf(cast[uint64](duReadPtrField(rect, cDuOffCachedPtr()))) &
-            " (anchor=0x" & hexOf(cast[uint64](anchor)) & " klass=0x" &
-            hexOf(cast[uint64](duReadPtrField(anchor, 0'i32))) & ")"
-    cWgCrumbW(2'i32)                   # role 2: in the call itself, depth 0
-    cWgCrumb(WgCrumbRParent)
-    let par = cDuCallPP(fnPar, rect)
-    # The parent comes back from Unity and gets the same two gates: a destroyed
-    # parent is exactly as fatal as a destroyed anchor.
-    if duOk(par, 0x20'i32) and duUnityAlive(par):
-      cWgCrumb(WgCrumbRParSane)
-      if duRectIsSane(par):
-        cWgCrumb(WgCrumbRParGo)
-        let go = cMi2CallPP(fnGo, par)
-        if duOk(go, 0x20'i32) and duUnityAlive(go):
-          gDuParentRoute = "the source label's own parent (sibling of the version label)"
-          gDuParentRect = par
-          gDuRootRefusal = ""
-          cWgCrumb(WgCrumbRDone)
-          return go
-        gDuRootRefusal = "route 1: the parent's GameObject is unreadable or destroyed"
-      else:
-        gDuRootRefusal = "route 1: the parent is not a sane RectTransform"
-    else:
-      gDuRootRefusal = "route 1: Transform::get_parent returned null, " &
-        "unreadable or destroyed"
-
-  # ---- route 2: the Graphic's own Canvas ----
-  cWgCrumb(WgCrumbRCanvas)
-  let canvas = duReadPtrField(anchor, cDuOffTmpGCanvas())
-  if duOk(canvas, 0x20'i32) and duUnityAlive(canvas):
-    let cgo = cMi2CallPP(fnGo, canvas)
-    if duOk(cgo, 0x20'i32) and duUnityAlive(cgo):
-      let fnT = mi2Fn(Mi2GoGetTransform)
-      if fnT != nil:
-        let ct = cMi2CallPP(fnT, cgo)
-        if duOk(ct, 0x20'i32) and duUnityAlive(ct) and duRectIsSane(ct):
-          gDuParentRoute = "Graphic.m_Canvas (route 1 was unavailable)"
-          gDuParentRect = ct
-          gDuRootRefusal = ""
-          cWgCrumb(WgCrumbRDone)
-          return cgo
-
-  # ---- route 3: the highest SANE RectTransform ancestor ----
-  cWgCrumb(WgCrumbRClimb)
-  if not rectOk or fnPar == nil:
-    return
-  var cur = rect
-  var best: Il2CppPtr = nil
-  var depth = 0
-  while depth < 8:
-    # The crumb's second slot carries `depth * 4 + role` here, so a fault in
-    # this loop says WHICH iteration and whether it was gating the receiver,
-    # gating the result, or inside the call. Route 1 above has no loop, which
-    # is how the log already distinguished the two.
-    cWgCrumb(WgCrumbRClimbParent)
-    cWgCrumbW(int32(depth * 4 + 0))
-    # `cur` is gated on EVERY iteration, not only the ones that came back from
-    # get_parent: the first `cur` is the anchor's own rect.
-    if not (duOk(cur, 0x20'i32) and duUnityAlive(cur)):
-      break
-    cWgCrumbW(int32(depth * 4 + 2))
-    let par = cDuCallPP(fnPar, cur)
-    cWgCrumbW(int32(depth * 4 + 1))
-    if not (duOk(par, 0x20'i32) and duUnityAlive(par)):
-      break                            # cur was the outermost root; stop
-    if duRectIsSane(par):
-      best = par                       # keep climbing; the highest sane one wins
-    cur = par
-    inc depth
-  if best == nil:
-    if gDuRootRefusal.len == 0 or gDuRootRefusal == "not attempted":
-      gDuRootRefusal = "no route produced a parent: no sane RectTransform " &
-        "ancestor within 8 hops"
-    return
-  let go = cMi2CallPP(fnGo, best)
-  if duOk(go, 0x20'i32) and duUnityAlive(go):
-    gDuParentRoute = "highest sane RectTransform ancestor (LAST RESORT -- " &
-                     "expect the clones to be on the wrong canvas)"
-    gDuParentRect = best
-    gDuRootRefusal = ""
-    cWgCrumb(WgCrumbRDone)
-    result = go
-
-proc duNoRaycast(tmp: Il2CppPtr) =
-  ## Take a clone out of the raycaster.
-  ##
-  ## A TextMeshProUGUI is a Graphic and a Graphic is a raycast target by
-  ## default, so every clone is an invisible clickable surface. The panel is a
-  ## 1200-unit-wide strip; with it open, a click in the menu lands on OUR label
-  ## instead of the button beneath it. That is the reported crash -- "clicking
-  ## with the panel open killed the game". A read-out must never eat input.
-  if tmp == nil:
-    return
-  let fn = cDuFn(DuSetRaycast)
-  if fn != nil:
-    cDuCallVPB(fn, tmp, 0'i32)
-  else:
-    # The setter did not verify; store the field directly. `get_raycastTarget`
-    # is `movzx eax, byte [rcx+0x3A]; ret`, so the offset is not a guess -- but
-    # the raw store skips SetRaycastDirty, so the graphic stays registered until
-    # something else re-registers it. Better than remaining clickable.
-    discard cDuWriteU8(tmp, 0x3A'i32, 0'i32)
-
-proc duDropNestedCanvas(tmp, srcCanvas: Il2CppPtr): bool =
-  ## Turn OFF a `Canvas` that `Object::Instantiate` copied onto our clone.
-  ##
-  ## This is the actual root cause of every canvas symptom chased so far. The
-  ## version label's own GameObject carries a NESTED Canvas, so each clone gets
-  ## a copy of it and reports its own canvas pointer no matter where it is
-  ## parented -- which is exactly what the live log showed after the clone was
-  ## made a sibling of the source. It was never a parenting problem.
-  ##
-  ## `Graphic.m_Canvas` (+0x60) already points at whichever Canvas the clone
-  ## renders on, so there is no component lookup to do: if that pointer is not
-  ## the source's canvas, it IS the copied one. Disabling it makes the clone
-  ## fall through to the nearest enabled ancestor canvas.
-  ##
-  ## SAFETY: this only ever disables a Canvas that (1) differs from the source's
-  ## and (2) lives on the CLONE'S OWN GameObject. Both are checked before
-  ## anything is written, so a Canvas the game owns can never be switched off by
-  ## this -- the rule in this codebase is that we write only into objects the
-  ## host itself created.
-  result = false
-  let cv = duReadPtrField(tmp, cDuOffTmpGCanvas())
-  if cv == nil or cv == srcCanvas or not duOk(cv, 0x20'i32):
-    return                              # nothing copied, or already correct
-  let fnGo = mi2Fn(Mi2GetGameObject)
-  if fnGo == nil:
-    return
-  let cvGo = cMi2CallPP(fnGo, cv)
-  let myGo = cMi2CallPP(fnGo, tmp)
-  if cvGo == nil or myGo == nil or cvGo != myGo:
-    # The offending canvas is NOT on our own object -- it is an ancestor's, and
-    # ancestors belong to the game. Refuse, and say so.
-    warn "debugui: clone canvas 0x" & hexOf(cast[uint64](cv)) &
-         " is not on the clone's own GameObject (canvasGo=0x" &
-         hexOf(cast[uint64](cvGo)) & " cloneGo=0x" &
-         hexOf(cast[uint64](myGo)) & "); it belongs to the game and will NOT " &
-         "be touched"
-    return
-  let fnEn = cDuFn(DuSetEnabled)
-  if fnEn == nil:
-    warn "debugui: UnityEngine.Behaviour::set_enabled did not verify on this " &
-         "build, so the Canvas copied onto the clone cannot be switched off"
-    return
-  cDuCallVPB(fnEn, cv, 0'i32)
-  okLog "debugui: disabled the nested Canvas 0x" & hexOf(cast[uint64](cv)) &
-        " that Instantiate copied onto our own clone (cloneGo=0x" &
-        hexOf(cast[uint64](myGo)) & "); the clone should now fall through to " &
-        "the source's canvas 0x" & hexOf(cast[uint64](srcCanvas))
-  result = true
-
-# ---------------------------------------------------------------------------
-# THE ONE-SHOT DIAGNOSTIC DUMP, continued
-# ---------------------------------------------------------------------------
-proc duDumpOne(tag: string; tmp: Il2CppPtr) =
-  ## Everything about one TMP label that can decide whether it draws.
-  if not duOk(tmp, cDuOffTmpRect() + 8'i32):
-    info "debugui/diag " & tag & ": component not readable"
-    return
-  let rect = duRectOf(tmp)
-  let go = duGameObjectOf(tmp)
-  let canvas = duReadPtrField(tmp, cDuOffTmpGCanvas())
-  let txt = duReadPtrField(tmp, cDuOffTmpText())
-  info "debugui/diag " & tag & ": tmp=0x" & hexOf(cast[uint64](tmp)) &
-       " go=0x" & hexOf(cast[uint64](go)) &
-       " name='" & (if go != nil: duNameOf(go) else: "") & "'" &
-       " cachedPtr=0x" & hexOf(cast[uint64](duReadPtrField(tmp, 0x10'i32))) &
-       " activeSelf=" & duDescribeInt(DuGoActiveSelf, go) &
-       " activeInHierarchy=" & duDescribeInt(DuGoActiveInHier, go) &
-       " layer=" & duDescribeInt(DuGoLayer, go)
-  info "debugui/diag " & tag & ": rect=0x" & hexOf(cast[uint64](rect)) &
-       " anchoredPos=" & duDescribeVec2(DuGetAnchoredPos, rect) &
-       " sizeDelta=" & duDescribeVec2(DuGetSizeDelta, rect) &
-       " anchorMin=" & duDescribeVec2(DuGetAnchorMin, rect) &
-       " pivot=" & duDescribeVec2(DuGetPivot, rect) &
-       " localPos=" & duDescribeVec3(DuGetLocalPos, rect) &
-       " localScale=" & duDescribeVec3(DuGetLocalScale, rect) &
-       " rect=[" & duDescribeRect(rect) & "]"
-  let fontSize = duReadF32Field(tmp, cDuOffTmpFontSize())
-  let alpha = duReadF32Field(tmp, cDuOffTmpFontColor() + 12'i32)
-  let galpha = duReadF32Field(tmp, cDuOffTmpGColor() + 12'i32)
-  info "debugui/diag " & tag & ": fontSize=" & duFmt1(fontSize) &
-       " fontColor.a=" & duFmt2(alpha) & " graphicColor.a=" & duFmt2(galpha) &
-       " textPtr=0x" & hexOf(cast[uint64](txt)) &
-       " textLen=" & $int(cDuStringLen(txt)) &
-       " wordWrap=" & $int(duReadBoolField(tmp, cDuOffTmpWordWrap())) &
-       " overflow=" & $int(duReadI32Field(tmp, cDuOffTmpOverflow())) &
-       " autoSize=" & $int(duReadBoolField(tmp, cDuOffTmpAutosize())) &
-       " maxVisChars=" & $int(duReadI32Field(tmp, cDuOffTmpMaxVisChars())) &
-       " firstVis=" & $int(duReadI32Field(tmp, cDuOffTmpFirstVis())) &
-       " textAlign=" & $int(duReadI32Field(tmp, cDuOffTmpTextAlign()))
-  if canvas != nil:
-    info "debugui/diag " & tag & ": canvas=0x" & hexOf(cast[uint64](canvas)) &
-         " sortingOrder=" & duDescribeInt(DuCanvasOrder, canvas) &
-         " renderMode=" & duDescribeInt(DuCanvasMode, canvas) &
-         " scaleFactor=" & duDescribeScale(canvas)
-  else:
-    info "debugui/diag " & tag & ": Graphic.m_Canvas is NULL -- the label is " &
-         "not attached to a canvas, so it cannot draw at all"
-  # The parent chain, capped. This is what says WHERE the clone ended up, and
-  # whether anything above it is inactive or scaled to nothing.
-  var cur = rect
-  var depth = 0
-  while cur != nil and depth < 8:
-    let fnPar = cDuFn(DuGetParent)
-    if fnPar == nil:
-      break
-    let par = cDuCallPP(fnPar, cur)
-    if not duOk(par, 0x20'i32):
-      break
-    let pgo = duGameObjectOf(par)
-    info "debugui/diag " & tag & ": parent[" & $depth & "] t=0x" &
-         hexOf(cast[uint64](par)) & " name='" &
-         (if pgo != nil: duNameOf(pgo) else: "") & "'" &
-         " activeSelf=" & duDescribeInt(DuGoActiveSelf, pgo) &
-         " localScale=" & duDescribeVec3(DuGetLocalScale, par) &
-         " rect=[" & duDescribeRect(par) & "]"
-    cur = par
-    inc depth
-
-var gDuDiagDone = false
-
-proc duDiagDump(anchor: Il2CppPtr) =
-  if gDuDiagDone:
-    return
-  gDuDiagDone = true
-  var okTargets = 0
-  for i in 0 ..< int(cDuTargetCount()):
-    if cDuFn(int32(i)) != nil: inc okTargets
-  info "debugui/diag: " & $okTargets & " of " & $int(cDuTargetCount()) &
-       " managed targets verified; screen=" & duDescribeScreen()
-  duDumpOne("SOURCE(version label)", anchor)
-  if gDuPanel.len > 0:
-    duDumpOne("CLONE[0](panel line 0)", gDuPanel[0].tmp)
-  if gDuMarks.len > 0:
-    duDumpOne("CLONE[m0](marker 0)", gDuMarks[0].tmp)
-
-# ---------------------------------------------------------------------------
-# Building and tearing down the label pool
-# ---------------------------------------------------------------------------
-## duBUILD FAULTS, counted separately from widget faults.
-##
-## They are not attributable to any widget -- the pool does not exist yet when
-## they happen -- so the per-widget retirement cannot save the panel from them.
-## That is exactly what the live run hit: eight identical faults in `duBuild`,
-## and a black screen.
-##
-## The response is to DEGRADE, not to die. After `cDuBuildFaultsBeforeMinimal`
-## faults inside `duBuild` the pool is rebuilt at its MINIMUM size -- one panel
-## label, no markers. If the fault is in the ninth clone, or anywhere in the
-## marker loop, a one-label panel still draws and the user gets a read-out
-## instead of nothing.
-##
-## It also PARTITIONS the cause, which is the more valuable half: if the minimum
-## builds, the fault is in the pool size or a later clone; if the minimum faults
-## too, it is in the very first `Instantiate` and nothing about the widget work
-## is implicated at all.
-const cDuBuildFaultsBeforeMinimal = 3
-var gDuBuildFaults = 0
-var gDuMinimalLogged = false
-
-var gDuRebuilds = 0
-var gDuRootRefusalLogged = ""
-
-proc duInvalidateIfStale() =
-  ## RE-RESOLVE RATHER THAN CACHE ACROSS A MENU REBUILD.
-  ##
-  ## `gDuAnchorTmp`, `gDuProbe`, `gDuPanel` and `gDuMarks` are all pointers into
-  ## the tree that was live when the pool was built. A menu rebuild destroys
-  ## that tree: the wrappers stay readable, so nothing here looks wrong, and
-  ## every managed call the refresh makes goes into freed native memory.
-  ##
-  ## The version brand and the hide-seasons code both hit this and both had to
-  ## stop caching. The overlay cannot stop caching -- it owns 33 clones -- so it
-  ## does the next thing: it notices, throws the pool away, and builds again.
-  ##
-  ## The clones themselves are NOT destroyed by us. They were children of the
-  ## destroyed tree and Unity has already taken them with it; calling Destroy on
-  ## a dead wrapper is the very fault this is avoiding. Dropping the references
-  ## is the whole teardown.
-  if not gDuBuilt:
-    return
-  if duUnityAlive(gDuAnchorTmp):
-    return
-  inc gDuRebuilds
-  gDuBuilt = false
-  gDuBuildFailed = false
-  gDuPanel = @[]
-  gDuMarks = @[]
-  gDuProbe = DuLabel(tmp: nil, rect: nil, last: cDuUnset, shown: false,
-                     placed: false, pAnchor: "", pX: 0.0, pY: 0.0)
-  gDuProbeWaits = 0
-  gDuCanvasDropTried = false
-  gDuAnchorTmp = nil
-  gDuRootGo = nil
-  # The fault budget is reset too. Those faults were caused by a tree that no
-  # longer exists; carrying them forward would retire the overlay for a
-  # condition that has already been repaired.
-  gDuBuildFaults = 0
-  gDuMinimalLogged = false
-  if gDuRebuilds <= 8 or (gDuRebuilds mod 50) == 0:
-    okLog "debugui: the anchor's native half is gone (menu rebuild #" &
-          $gDuRebuilds & "); dropped the label pool and re-resolving from " &
-          "PreloaderUI on the next refresh. Nothing was destroyed by us."
-
-
-proc duBuild(preloader: Il2CppPtr): bool =
-  ## Clone every label the configuration asks for, once. Returns false while the
-  ## anchor is not yet reachable (the caller retries next frame) and latches
-  ## `gDuBuildFailed` only when a clone genuinely could not be made -- retrying a
-  ## real failure every frame forever would be its own performance bug.
-  if gDuBuilt:
-    return true
-  if gDuBuildFailed:
-    return false
-  cWgCrumb(WgCrumbBAnchor)
-  cWgCrumbW(-1'i32)
-  let anchor = duFindAnchor(preloader)
-  if anchor == nil:
-    return false                       # not yet; try again next frame
-  cWgCrumb(WgCrumbBRoot)
-  let rootGo = duCanvasRootGo(anchor)
-  if rootGo == nil:
-    # SAY WHY, and say it once per distinct reason. `duCanvasRootGo` is called
-    # every throttled refresh until it succeeds, so an unconditional log would
-    # be a per-second spam; a log only on CHANGE means the reason appears the
-    # first time and again whenever it becomes a different reason.
-    if gDuRootRefusal != gDuRootRefusalLogged:
-      gDuRootRefusalLogged = gDuRootRefusal
-      warn "debugui: the canvas-root walk declined -- " & gDuRootRefusal &
-           ". No clone was made and nothing in the game was touched; the " &
-           "overlay retries on the next refresh."
-    return false
-  gDuAnchorTmp = anchor
-  gDuRootGo = rootGo
-
-  # ---------------------------------------------------------------------
-  # THE PROBE CLONE, and the canvas assertion.
-  #
-  # Build exactly ONE label first and check which canvas it landed on. If it is
-  # not the source's canvas, do NOT go on to build thirty-two more: that is the
-  # regression that cost the user two crashes, and one stray inactive clone is a
-  # far cheaper way to find out than thirty-three live ones.
-  #
-  # A clone's `Graphic.m_Canvas` is resolved by Unity, not by us, and is null
-  # until the graphic has been through a canvas update -- so an unresolved
-  # canvas means TRY AGAIN NEXT FRAME, not FAIL. The probe is kept in a global
-  # across those frames precisely so that retrying does not clone every frame.
-  # ---------------------------------------------------------------------
-  if gDuProbe.tmp == nil:
-    cWgCrumb(WgCrumbBProbeClone)
-    gDuProbe = duCloneLabel(anchor, rootGo)
-    if gDuProbe.tmp == nil:
-      gDuBuildFailed = true
-      warn "debugui: Object::Instantiate produced no usable label clone; the " &
-           "overlay cannot draw on this build (nothing was changed in the game)"
-      return false
-    cWgCrumb(WgCrumbBProbeDraw)
-    duMakeDrawable(gDuProbe, 400.0, 20.0)
-  cWgCrumb(WgCrumbBSrcCanvas)
-  let srcCv0 = duReadPtrField(anchor, cDuOffTmpGCanvas())
-  cWgCrumb(WgCrumbBProbeCanvas)
-  let probeCv = duReadPtrField(gDuProbe.tmp, cDuOffTmpGCanvas())
-  if probeCv == nil:
-    inc gDuProbeWaits
-    if gDuProbeWaits > 240:
-      gDuBuildFailed = true
-      duHide(gDuProbe)
-      warn "debugui: the probe clone's Graphic.m_Canvas never resolved after " &
-           $gDuProbeWaits & " refreshes (parent route = " & gDuParentRoute &
-           "). Refusing to build the rest of the overlay rather than put " &
-           "labels on an unknown canvas. Nothing in the game was changed."
-      return false
-    return false                       # not yet resolved; try again next frame
-  if probeCv != srcCv0:
-    # A MISMATCH IS NOT YET A VERDICT.
-    #
-    # Two things can produce it, and they want opposite responses:
-    #   * `Instantiate` copied the source's own nested Canvas onto our clone.
-    #     That is the real cause, and it is FIXABLE -- switch the copy off and
-    #     the clone falls through to the source's canvas.
-    #   * the clone is only part-initialised this frame, and Unity has not yet
-    #     re-resolved its canvas. That resolves itself and must not be punished.
-    #
-    # So: try the fix, then give it several frames to settle, and only refuse if
-    # it is still wrong afterwards. Refusing on the first frame is what made the
-    # last build report a permanent failure for a condition it could have
-    # repaired.
-    if not gDuCanvasDropTried:
-      gDuCanvasDropTried = true
-      cWgCrumb(WgCrumbBDropCanvas)
-      discard duDropNestedCanvas(gDuProbe.tmp, srcCv0)
-      return false                     # re-check next frame
-    inc gDuProbeWaits
-    if gDuProbeWaits <= 120:
-      return false                     # still settling; look again next frame
-    gDuBuildFailed = true
-    duHide(gDuProbe)
-    warn "debugui: REFUSING TO BUILD. After disabling the copied Canvas and " &
-         "waiting " & $gDuProbeWaits & " refreshes, the probe clone is still " &
-         "on canvas 0x" & hexOf(cast[uint64](probeCv)) & " (renderMode=" &
-         duDescribeInt(DuCanvasMode, probeCv) & ") while the source is on 0x" &
-         hexOf(cast[uint64](srcCv0)) & " (renderMode=" &
-         duDescribeInt(DuCanvasMode, srcCv0) & "); parent route = " &
-         gDuParentRoute & ", parentRect=[" & duDescribeRect(gDuParentRect) &
-         "]. Exactly one clone was made and it has been switched off. " &
-         "Nothing else in the game was changed."
-    return false
-  cWgCrumb(WgCrumbBAssertLog)
-  okLog "debugui: canvas assertion PASSED -- probe clone and source label are " &
-        "both on canvas 0x" & hexOf(cast[uint64](srcCv0)) & " (renderMode=" &
-        duDescribeInt(DuCanvasMode, srcCv0) & ", scaleFactor=" &
-        duDescribeScale(srcCv0) & ") via " & gDuParentRoute &
-        ". One canvas, one render pass; the rest of the pool is safe to build."
-
-  # ONE LABEL PER WIDGET (plus one for the edit-mode banner), not one per line.
-  # The pool is sized here, once, and cannot grow later -- so adding a widget to
-  # the config takes effect on the next game start, exactly as adding a panel
-  # field always did. `cDuMaxWidgets` is the ceiling whatever the config says.
-  var nPanel = gDuWidgets.len + 1
-  if nPanel > cDuMaxPanelLines: nPanel = cDuMaxPanelLines
-  if not gDuCfg.panelOn: nPanel = 0
-  var nMark = gDuCfg.espMax
-  if not gDuCfg.espOn: nMark = 0
-  if nMark > cDuMaxMarkers: nMark = cDuMaxMarkers
-
-  # DEGRADE RATHER THAN DIE -- see `gDuBuildFaults` above. Stop asking for
-  # thirty-three clones once several attempts have faulted, and ask for one.
-  if gDuBuildFaults >= cDuBuildFaultsBeforeMinimal:
-    nPanel = 1
-    nMark = 0
-    if not gDuMinimalLogged:
-      gDuMinimalLogged = true
-      warn "debugui: duBuild has faulted " & $gDuBuildFaults & " times; " &
-           "retrying at MINIMUM size (1 panel label, 0 markers) rather than " &
-           "going dark. If this builds, the fault is in the pool size or in a " &
-           "later clone; if it faults too, it is the first Instantiate."
-
-  var panel: seq[DuLabel] = @[]
-  # The probe becomes panel line 0 when the panel wants one, so the assertion
-  # costs nothing; otherwise it is switched off and left alone.
-  var reused = false
-  if nPanel > 0:
-    var p0 = gDuProbe
-    cWgCrumb(WgCrumbBProbeReuse)
-    duStyle(p0, gDuCfg.panelFont, gDuCfg.panelR, gDuCfg.panelG, gDuCfg.panelB)
-    duMakeDrawable(p0, 1200.0, gDuCfg.panelLine * 1.6)
-    panel.add p0
-    reused = true
-  else:
-    duHide(gDuProbe)
-  for i in (if reused: 1 else: 0) ..< nPanel:
-    # The crumb's widget slot carries the CLONE INDEX here, so a fault names
-    # which of the nine died rather than only that one of them did.
-    cWgCrumbW(int32(i))
-    cWgCrumb(WgCrumbBPanelClone)
-    var lab = duCloneLabel(anchor, rootGo)
-    if lab.tmp == nil:
-      break
-    cWgCrumb(WgCrumbBPanelDraw)
-    duStyle(lab, gDuCfg.panelFont, gDuCfg.panelR, gDuCfg.panelG, gDuCfg.panelB)
-    duMakeDrawable(lab, 1200.0, gDuCfg.panelLine * 1.6)
-    # Born hidden. A fresh clone still carries the DONOR'S caption and the
-    # DONOR'S position, and the update pass only ever touches the labels it
-    # actually uses -- so anything not hidden here is a stray label sitting in
-    # the middle of the screen reading "1.1.0.1.4677 | PvE".
-    duHide(lab)
-    panel.add lab
-  var marks: seq[DuLabel] = @[]
-  for i in 0 ..< nMark:
-    cWgCrumbW(int32(i))
-    cWgCrumb(WgCrumbBMarkClone)
-    var lab = duCloneLabel(anchor, rootGo)
-    if lab.tmp == nil:
-      break
-    cWgCrumb(WgCrumbBMarkDraw)
-    duStyle(lab, gDuCfg.espFont, gDuCfg.espR, gDuCfg.espG, gDuCfg.espB)
-    duMakeDrawable(lab, 400.0, gDuCfg.espFont * 1.6)
-    # Markers especially: with ESP off, or in the menu where there are no bots,
-    # `duUpdateMarkers` never assigns them, so an unhidden marker is visible
-    # forever showing the donor's text. Every one of the 24 was doing that.
-    duHide(lab)
-    marks.add lab
-  if panel.len == 0 and marks.len == 0:
-    gDuBuildFailed = true
-    warn "debugui: Object::Instantiate produced no usable label clone; the " &
-         "overlay cannot draw on this build (nothing was changed in the game)"
-    return false
-  gDuPanel = panel
-  gDuMarks = marks
-  gDuBuilt = true
-  # The canvas the clones actually landed in, and its scale factor. Unity's
-  # WorldToScreenPoint answers in PIXELS; `anchoredPosition` is in CANVAS UNITS.
-  # They are the same number only when the CanvasScaler is at 1, and EFT's menu
-  # canvas is not -- so an uncorrected marker for a bot at the middle of the
-  # screen lands off the edge of it.
-  cWgCrumb(WgCrumbBScale)
-  cWgCrumbW(-1'i32)
-  gDuCanvasScale = 1.0
-  if panel.len > 0:
-    let cv = duReadPtrField(panel[0].tmp, cDuOffTmpGCanvas())
-    let fn = cDuFn(DuCanvasScale)
-    if fn != nil and duOk(cv, 0x20'i32):
-      let s = cDuCallFP(fn, cv)
-      if s > 0.01 and s < 100.0:
-        gDuCanvasScale = s
-  cWgCrumb(WgCrumbBDiagDump)
-  duDiagDump(anchor)
-  # PLACEMENT READ-BACK. The clone starts life at the source's anchoredPosition,
-  # which on a centre-pivot parent is the middle of the screen -- that is what
-  # the user saw. So place panel line 0 for real and then ASK where it ended up,
-  # rather than assuming the write took. Intended vs actual, side by side.
-  cWgCrumb(WgCrumbBReadback)
-  if gDuPanel.len > 0:
-    let wantX = gDuCfg.panelX
-    let wantY = gDuCfg.panelY
-    duPlace(gDuPanel[0], gDuCfg.panelAnchor, wantX, wantY)
-    okLog "debugui: placement check, panel line 0 -- anchor='" &
-          gDuCfg.panelAnchor & "' intended anchoredPos=(" & duFmt1(wantX) &
-          "," & duFmt1(wantY) & ") actual=" &
-          duDescribeVec2(DuGetAnchoredPos, gDuPanel[0].rect) &
-          " anchorMin=" & duDescribeVec2(DuGetAnchorMin, gDuPanel[0].rect) &
-          " pivot=" & duDescribeVec2(DuGetPivot, gDuPanel[0].rect) &
-          " parentRect=[" & duDescribeRect(gDuParentRect) & "]"
-  okLog "debugui: parent route = " & gDuParentRoute &
-        "; parentRect=[" & duDescribeRect(gDuParentRect) & "]" &
-        "; canvas 0x" & hexOf(cast[uint64](srcCv0)) &
-        " shared by the source and every clone (asserted before building)"
-  okLog "debugui: built " & $panel.len & " widget label(s) and " & $marks.len &
-        " marker label(s), all born hidden and none a raycast target; layout " &
-        "from " & gDuCfg.source
-  return true
-
-proc duHideAll() =
-  for i in 0 ..< gDuPanel.len:
-    duHide(gDuPanel[i])
-  for i in 0 ..< gDuMarks.len:
-    duHide(gDuMarks[i])
-
 # ---------------------------------------------------------------------------
 # The per-frame body
 #
@@ -2874,10 +1842,11 @@ proc debugUiBodyImpl(a: Il2CppPtr): Il2CppPtr {.
   if tid == int(gHostThreadId):
     # Not Unity's thread: refuse outright rather than touch a managed object.
     return cast[Il2CppPtr](1)
-  let selfRaw = cRegsInt(regs, 0'i32)         # RCX = the PreloaderUI `this`
-  if selfRaw == 0'u64:
+  # RCX = the PreloaderUI `this`. It is still checked, because a detour firing
+  # with a null receiver means the slot is not what we think it is -- but it is
+  # no longer USED: nothing on this path walks the UI tree any more.
+  if cRegsInt(regs, 0'i32) == 0'u64:
     return cast[Il2CppPtr](1)
-  let preloader = cast[Il2CppPtr](selfRaw)
   if not gDuLoggedOnce:
     gDuLoggedOnce = true
     okLog "debugui: PreloaderUI::Update detour is live on thread " & $tid &
@@ -2939,56 +1908,80 @@ proc debugUiBodyImpl(a: Il2CppPtr): Il2CppPtr {.
         gDuDragIdx = -1
         if gDuCfg.espVk <= 0:
           gDuEspVisible = false
-        duHideAll()
         okLog "debugui: panel OFF"
     if gDuCfg.espVk > 0 and cDuKeyEdge(int32(gDuCfg.espVk)) != 0'i32:
       gDuEspVisible = not gDuEspVisible
-      if not gDuEspVisible:
-        for i in 0 ..< gDuMarks.len:
-          duHide(gDuMarks[i])
 
+  # NOTHING IS DRAWN FROM THIS DETOUR ANY MORE. Turning the panel on or off only
+  # moves a flag; the drawing is `duRegionDraw` below, dispatched by the shared
+  # region and rasterised by the D3D11 overlay in `Present`. There is no label
+  # to hide on the way out, because there is no persistent object at all.
+  cWgCrumb(WgCrumbDone)
+  return cast[Il2CppPtr](1)
+
+# ---------------------------------------------------------------------------
+# THE DRAW -- a region participant, not a Unity canvas
+#
+# WHY THIS IS NOT A DETOUR AND NOT A CLONE. Six rounds of cloning a
+# TextMeshProUGUI into the game's own canvas ended with a walk that succeeded,
+# faulted nowhere, and rendered nothing: the clone landed under a canvas whose
+# parenting and sort order belong to somebody else's UI. Worse, there is no
+# check reachable from inside the host that can distinguish "drawn" from "not
+# drawn" there -- which by CLAUDE.md 9b makes the approach unverifiable, not
+# merely broken.
+#
+# The overlay's own pipeline has neither problem. `abi/aowlspt_region.h` is the
+# sanctioned channel: a participant submits screen-space commands on the Unity
+# thread, the D3D11 overlay drains the published buffer on the render thread
+# inside `Present` and rasterises it with the same primitives the F12 panel and
+# the F6 admin HUD use. Whether a command was drawn is decided by our own code
+# in one place, not by another team's canvas.
+#
+# THE GUARD. The region dispatcher wraps EVERY participant callback in the one
+# `aowl_p_p_seh`, times it against the budget declared here, counts its faults
+# and disables it on its own if it misbehaves. So this body opens NO guard --
+# `aowl_p_p_seh` is not re-entrant and one here would disarm the dispatcher's.
+# It is also why the profiler widget can report this participant's cost: it is
+# the same accounting, read back through `aowl_region_status_x`.
+# ---------------------------------------------------------------------------
+proc duRegionDraw(user: pointer; frame: int64) {.exportc: "aowl_du_region_draw",
+                                                 cdecl.} =
+  discard user
+  discard frame
+  cWgCrumb(WgCrumbEnter)
+  cWgCrumbW(-1'i32)
+  inc gDuFires
+  cDuFpsSample()
   if not gDuVisible and not gDuEspVisible:
-    return cast[Il2CppPtr](1)
-
-  # Throttle. The panel is a debug read-out, not an instrument: refreshing it
-  # every tenth frame is indistinguishable to a human and costs a tenth as much.
-  # The markers ride the same throttle -- a marker that lags a frame or two is
-  # still exactly where the bot is standing, and a frozen bot does not move at
-  # all, which is the case being investigated.
-  if (gDuFires mod gDuCfg.panelThrottle) != 0:
-    return cast[Il2CppPtr](1)
-
-  # Before anything else in the build path: has the tree we cached been
-  # replaced? A menu rebuild leaves every cached pointer readable and dead.
-  duInvalidateIfStale()
-  cWgCrumb(WgCrumbBuild)
-  if not duBuild(preloader):
-    return cast[Il2CppPtr](1)
-
-  # The cached GameWorld goes stale at the end of a raid; drop it rather than
-  # keep reading a dead object.
-  if gDuGameWorld != nil and
-     not duOk(gDuGameWorld, cBdOffRegPlayers() + 8'i32):
-    gDuGameWorld = nil
-
-  cWgCrumb(WgCrumbScanWorld)
-  duScanWorld()
-
+    return
+  # Throttle. The panel is a debug read-out, not an instrument: recomposing it
+  # every Nth frame is indistinguishable to a human and costs a fraction as
+  # much. The SUBMISSION is not throttled -- the command buffer is rebuilt from
+  # empty every frame, so skipping a submission would flicker the panel off.
+  # What is throttled is the expensive half: the world census.
+  if (gDuFires mod gDuCfg.panelThrottle) == 0:
+    # The cached GameWorld goes stale at the end of a raid; drop it rather than
+    # keep reading a dead object.
+    if gDuGameWorld != nil and
+       not duOk(gDuGameWorld, cBdOffRegPlayers() + 8'i32):
+      gDuGameWorld = nil
+    cWgCrumb(WgCrumbScanWorld)
+    duScanWorld()
   if gDuVisible:
-    # The pointer is sampled ONCE per refresh, before anything reads it, so a
-    # drag cannot see the cursor in two places within one frame and the button
-    # edges are computed exactly once. It is a `GetCursorPos` and a
-    # `GetAsyncKeyState`: no message, no hook, nothing swallowed from the game.
+    # The pointer is sampled ONCE per frame, before anything reads it, so a drag
+    # cannot see the cursor in two places and the button edges are computed
+    # exactly once. It is a `GetCursorPos` and a `GetAsyncKeyState`: no window
+    # message, no hook, nothing swallowed from the game.
     cWgCrumb(WgCrumbMouse)
     discard cWgMouseSample()
     cWgCrumb(WgCrumbEditKeys)
     duEditKeys()
     cWgCrumb(WgCrumbDrag)
     duDragTick()
-    duUpdateWidgets()
+    duDrawWidgets()
   cWgCrumb(WgCrumbMarkers)
   if gDuEspVisible:
-    if not duUpdateMarkers():
+    if not duDrawMarkers():
       if not gDuEspUnavailableLogged:
         gDuEspUnavailableLogged = true
         warn "debugui: Camera::get_main / Camera::WorldToScreenPoint did not " &
@@ -2996,7 +1989,30 @@ proc debugUiBodyImpl(a: Il2CppPtr): Il2CppPtr {.
              "panel's `botlist` field still shows every AI bot's world " &
              "coordinates and distance -- add it to panelFields."
   cWgCrumb(WgCrumbDone)
-  return cast[Il2CppPtr](1)
+
+var gDuRegionHandle = -1
+
+proc duRegisterDraw(): bool =
+  ## Register the F3 widgets as a DRAW participant. Says WHY it failed, using
+  ## the region's own refusal text -- never the raw number, which means nothing
+  ## to a reader of the log.
+  if gDuRegionHandle >= 0:
+    return true
+  let h = cWgRgRegister(cstring("debugui"), duRegionDraw,
+                        cWgRgMaskDraw(), 50'i32, 900'i32)
+  if h < 0:
+    warn "debugui: the F3 widgets could NOT be registered with the shared " &
+         "region -- " & $cWgRgRefusalTextC(h) & ". Nothing will be drawn, and " &
+         "that is reported here rather than as an empty screen."
+    return false
+  gDuRegionHandle = h
+  okLog "debugui: F3 widgets registered with the shared region as DRAW " &
+        "participant " & $h & " (budget 900 us). They are rasterised by the " &
+        "D3D11 overlay in Present -- the same path as the F12 panel and the " &
+        "F6 admin HUD -- so no TextMeshPro clone, no Unity canvas, no " &
+        "parenting and no sort order are involved. If the region is not " &
+        "armed, aowl_wg_rg_armed() reports 0 and the profiler widget says so."
+  true
 
 # The VEH/SEH guard thunk. ONE of them, wrapping the whole body: `aowl_p_p_seh`
 # has a single thread-local `jmp_buf` and disarms itself on return, so nesting a
@@ -3027,27 +2043,11 @@ proc debugUiFired(regs: Il2CppPtr) =
     let stage = cWgCrumbGet()
     let wi = int(cWgCrumbGetW())
     var where = $cWgCrumbTextC(stage)
-    # THE SLOT MEANS TWO DIFFERENT THINGS, so it is never rendered ambiguously.
-    # In the draw loop it is a WIDGET index; inside duBuild's two pool loops it
-    # is a CLONE index, and printing a widget id for one of those would name an
-    # innocent widget for a fault raised before any widget existed.
-    let isCloneIdx = (stage == WgCrumbBPanelClone or
-                      stage == WgCrumbBPanelDraw or
-                      stage == WgCrumbBMarkClone or
-                      stage == WgCrumbBMarkDraw)
-    # A THIRD meaning for the same slot, in the canvas-root walk: packed
-    # `depth * 4 + role`. Three meanings is one too many for a bare integer, so
-    # each is decoded explicitly and none is ever printed raw.
-    let isWalkSlot = (stage == WgCrumbRClimbParent or stage == WgCrumbRParent)
-    if isWalkSlot and wi >= 0:
-      where.add " -- climb depth " & $int(cWgCrumbDepth(int32(wi))) & ", " &
-                $cWgCrumbRoleC(int32(wi))
-      if gDuRectSource.len > 0:
-        where.add "; the rect came from " & gDuRectSource
-    elif isCloneIdx and wi >= 0:
-      where.add " -- clone index " & $wi
-    elif not isCloneIdx and not isWalkSlot and wi >= 0 and
-         wi < gDuWidgets.len:
+    # THE SLOT NOW MEANS EXACTLY ONE THING: a widget index. It used to carry
+    # three meanings -- widget index, clone-pool index, and a packed climb
+    # depth for the canvas-root walk -- and the clone pool and the walk are
+    # both gone with the Unity-UI path, so the ambiguity is gone with them.
+    if wi >= 0 and wi < gDuWidgets.len:
       where.add " -- widget '" & gDuWidgets[wi].id & "' (index " & $wi &
                 ", fields '" & gDuWidgets[wi].fields & "')"
     if gDuFaults == 1 or (gDuFaults mod 240) == 0:
@@ -3063,9 +2063,6 @@ proc debugUiFired(regs: Il2CppPtr) =
     # retry. It is deliberately NOT counted as "isolated": it is not, and
     # claiming otherwise would disable the whole-overlay backstop for precisely
     # the case that needs it.
-    if stage >= WgCrumbBAnchor and stage <= WgCrumbBReadback:
-      inc gDuBuildFaults
-
     var isolated = false
     if wi >= 0 and wi < gDuWidgets.len and wi < gDuWidgetFaults.len and
        (stage == WgCrumbWText or stage == WgCrumbWPlace or
@@ -3233,11 +2230,10 @@ proc bindDebugUi(verbose: bool): bool =
     return true
   if not gReady or gDisableDrain:
     return false
-  # The widget set is read at BIND, not at first F3, because `duBuild` sizes the
-  # label pool from it and the pool is built once. Reading it here means the
-  # count on screen matches the count in the config from the very first press.
-  # Both files are re-read on every toggle-ON as well, so editing them still
-  # needs no restart -- only ADDING a widget does.
+  # The widget set is read at BIND so the count on screen matches the count in
+  # the config from the very first press. Both files are re-read on every
+  # toggle-ON as well, so editing them needs no restart at all -- there is no
+  # longer a pool sized once at build time to be out of step with them.
   duLoadWidgets()
   okLog "debugui: " & $gDuWidgets.len & " widget(s) configured -- " &
         gDuLayoutSource
@@ -3256,6 +2252,12 @@ proc bindDebugUi(verbose: bool): bool =
       info "debugui: EFT.UI.PreloaderUI::Update @ 0x" &
            hexOf(uint64(cDuPreloaderRva())) & " did not verify on this build"
     return false
+  # REGISTER THE DRAW before claiming or riding the detour. The detour only
+  # supplies the per-frame TICK the region dispatches from; the drawing itself
+  # is `duRegionDraw`, submitted to the shared region and rasterised by the
+  # D3D11 overlay in Present. If this refuses, it says why -- an F3 that
+  # silently draws nothing is the exact failure this rewrite exists to end.
+  discard duRegisterDraw()
   # THE SHARED `PreloaderUI::Update` HOOK, from the other side. The menu
   # mode-text feature (kind 13) drains the same function; two detours on one
   # function would have the second overwrite the first's trampoline. aowlhost
