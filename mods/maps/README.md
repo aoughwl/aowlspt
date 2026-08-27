@@ -104,13 +104,28 @@ A screen-relative arrow without a heading would point somewhere for every
 threat and be right only when the player happens to face north — a confidently
 wrong picture, which is worse than none.
 
-**BLOCKED — in-game overlay drawing.** The radar and the indicators are pure
-2D and would suit the overlay, but the only existing generic draw region is
-`abi/aowlspt_admin.h`'s ESP surface, which another feature owns, and adding a
-second Present hook is the double-detour hazard. *Unblock:* agreement to
-publish into that existing region (it already carries per-frame primitives),
-after which `RadarView`/`IndicatorView`'s maths ports directly — they are
-already pure functions of the snapshot.
+**DONE — in-game overlay drawing.** This was listed BLOCKED on the grounds that
+the only generic draw region was `abi/aowlspt_admin.h`'s ESP surface, owned by
+another feature, and that a second Present hook is the double-detour hazard.
+The hazard was real; the conclusion was not. `abi/aowlspt_region.h` is the
+shared per-frame region — one dispatch point, any number of participants, each
+entered through exactly one non-nested guard — and `sp/hud.nim` registers a
+DRAW callback on it. No second hook, nothing borrowed from another mod's
+private header.
+
+Caveats that are part of the feature, not excuses:
+
+* The region is armed by the **host flag `sharedRegion`, default OFF**. A mod's
+  registration always succeeds; a registered participant on an unarmed region
+  never fires. The mod logs those as two different states.
+* Marks are FILL and BOX only. `AOWL_REGION_CMD_LINE` exists but the overlay
+  rasterises a line as the axis-aligned quad spanning its endpoints, so a
+  diagonal comes out as a filled rectangle.
+* The radar is **north-up**, because no heading has been measured (below).
+* The layout takes the screen size from `screenW`/`screenH` in config, because
+  the region tracks `screenW`/`screenH` internally but nothing calls
+  `aowl_region_set_screen` and no getter is exported — so asking it would
+  return a value that is provably always 0.
 
 **NOT PORTED** from upstream: loot, corpse, extract, quest, airdrop, BTR,
 transit and locked-door markers; minefields; item pricing. Every one needs game
