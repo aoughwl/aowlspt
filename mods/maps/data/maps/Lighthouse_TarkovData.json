@@ -1,0 +1,51 @@
+{
+ "id": "Lighthouse_TarkovData",
+ "displayName": "Lighthouse (TarkovData)",
+ "author": "Shebuka",
+ "authorLink": "https://github.com/TarkovTracker/tarkovdata/",
+ "internalNames": [
+  "Lighthouse"
+ ],
+ "coordinateRotation": 180,
+ "bounds": {
+  "Min": {
+   "x": -545,
+   "y": -998
+  },
+  "Max": {
+   "x": 512,
+   "y": 721
+  }
+ },
+ "defaultLevel": 0,
+ "layers": {
+  "Ground Floor": {
+   "level": 0,
+   "image": "Lighthouse_TarkovData/Layers/Lighthouse.svg",
+   "imageBounds": {
+    "Min": {
+     "x": -545,
+     "y": -998
+    },
+    "Max": {
+     "x": 512,
+     "y": 721
+    }
+   },
+   "gameBounds": [
+    {
+     "Min": {
+      "x": -545,
+      "y": -998,
+      "z": -100
+     },
+     "Max": {
+      "x": 512,
+      "y": 721,
+      "z": 100
+     }
+    }
+   ]
+  }
+ }
+}

@@ -4,7 +4,7 @@
     "id": "aowl.registry.official",
     "name": "aowlspt official registry",
     "description": "Every mod built in this repository, plus the lists that name them. One file with one git history, so a mod list is a document you can send someone.",
-    "revision": 11,
+    "revision": 12,
     "updated": "2026-08-27"
   },
   "mods": [
@@ -399,6 +399,45 @@
         "client",
         "diagnostic"
       ]
+    },
+    {
+      "id": "aowl.maps",
+      "name": "Spatial",
+      "author": "aowlspt",
+      "version": "0.1.0",
+      "description": "Map, radar and direction indicators over one guarded position feed. The client half reads positions at measured static field offsets off the GameWorld the host's already-armed RegisterPlayer detour caches -- it resolves no IL2CPP name, installs no detour and calls no game method, because every by-name route is fatal on this build (fact #145). The server half serves 11 maps of real terrain SVG plus their calibration, and the three views are drawn in a browser at /aowlspt/ui/page/spatial. SHIPS DISABLED: the live feed is off until config.json `enabled` is set, and with it off nothing here touches game memory. The map browser works either way.",
+      "pipeline": ">=0.1.0",
+      "sides": [
+        "server",
+        "client"
+      ],
+      "source": {
+        "kind": "intree",
+        "path": "mods/maps",
+        "url": null
+      },
+      "artifact": {
+        "dir": "maps",
+        "library": "maps.dll"
+      },
+      "upstream": {
+        "note": "Behaviour specified from three pre-1.0 BepInEx/Mono mods; no code is carried over and none could be. The map terrain art and calibration under data/maps/ ARE reused -- they are data. Provenance and refs: mods/maps/data/maps/README.md"
+      },
+      "license": "see mods/maps/data/maps/README.md for asset provenance",
+      "download": null,
+      "requires": [],
+      "conflicts": [],
+      "provides": [
+        "aowl.capability.spatialfeed"
+      ],
+      "loadAfter": [],
+      "tags": [
+        "client",
+        "server",
+        "ui",
+        "map",
+        "radar"
+      ]
     }
   ],
   "lists": [
@@ -477,6 +516,11 @@
           "id": "aowl.graphics",
           "enabled": true,
           "note": "20 settings, all read and acted on -- but see the client-side settings surfacing fix, without which they are invisible in F12"
+        },
+        {
+          "id": "aowl.maps",
+          "enabled": true,
+          "note": "selected so the map browser and its routes are served; the LIVE FEED is still off by its own config.json `enabled` flag, so selecting it cannot make anything touch game memory"
         }
       ]
     }

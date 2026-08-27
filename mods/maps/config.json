@@ -1,0 +1,15 @@
+{
+  "enabled": false,
+  "hz": 10,
+  "radiusM": 120,
+  "hudRadar": true,
+  "hudIndicators": false,
+  "radarSize": 220,
+  "radarX": 24,
+  "radarY": 24,
+  "showBots": true,
+  "showPlayers": true,
+  "screenW": 1920,
+  "screenH": 1080,
+  "hudBudgetUs": 400
+}

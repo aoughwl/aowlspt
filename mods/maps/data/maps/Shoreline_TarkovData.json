@@ -1,0 +1,147 @@
+{
+ "id": "Shoreline_TarkovData",
+ "displayName": "Shoreline (TarkovData)",
+ "author": "Shebuka",
+ "authorLink": "https://github.com/TarkovTracker/tarkovdata/",
+ "internalNames": [
+  "Shoreline"
+ ],
+ "coordinateRotation": 180,
+ "bounds": {
+  "Min": {
+   "x": -1060,
+   "y": -415
+  },
+  "Max": {
+   "x": 508,
+   "y": 622
+  }
+ },
+ "defaultLevel": 0,
+ "layers": {
+  "Underground": {
+   "level": -1,
+   "image": "Shoreline_TarkovData/Layers/Shoreline-Underground_Level.svg",
+   "imageBounds": {
+    "Min": {
+     "x": -1060,
+     "y": -415
+    },
+    "Max": {
+     "x": 508,
+     "y": 622
+    }
+   },
+   "gameBounds": [
+    {
+     "Min": {
+      "x": -237,
+      "y": -104,
+      "z": -100
+     },
+     "Max": {
+      "x": -137,
+      "y": -68,
+      "z": -5
+     }
+    },
+    {
+     "Min": {
+      "x": -268,
+      "y": -163,
+      "z": -100
+     },
+     "Max": {
+      "x": -234,
+      "y": -134,
+      "z": -5
+     }
+    }
+   ]
+  },
+  "Ground Floor": {
+   "level": 0,
+   "image": "Shoreline_TarkovData/Layers/Shoreline-Ground_Level.svg",
+   "imageBounds": {
+    "Min": {
+     "x": -1060,
+     "y": -415
+    },
+    "Max": {
+     "x": 508,
+     "y": 622
+    }
+   },
+   "gameBounds": [
+    {
+     "Min": {
+      "x": -1060,
+      "y": -415,
+      "z": -100
+     },
+     "Max": {
+      "x": 508,
+      "y": 622,
+      "z": 100
+     }
+    }
+   ]
+  },
+  "2nd Floor": {
+   "level": 1,
+   "image": "Shoreline_TarkovData/Layers/Shoreline-Second_Floor.svg",
+   "imageBounds": {
+    "Min": {
+     "x": -1060,
+     "y": -415
+    },
+    "Max": {
+     "x": 508,
+     "y": 622
+    }
+   },
+   "gameBounds": [
+    {
+     "Min": {
+      "x": -375,
+      "y": -178,
+      "z": -1
+     },
+     "Max": {
+      "x": -128,
+      "y": -55,
+      "z": 2
+     }
+    }
+   ]
+  },
+  "3rd Floor": {
+   "level": 2,
+   "image": "Shoreline_TarkovData/Layers/Shoreline-Third_Floor.svg",
+   "imageBounds": {
+    "Min": {
+     "x": -1060,
+     "y": -415
+    },
+    "Max": {
+     "x": 508,
+     "y": 622
+    }
+   },
+   "gameBounds": [
+    {
+     "Min": {
+      "x": -375,
+      "y": -178,
+      "z": 2
+     },
+     "Max": {
+      "x": -128,
+      "y": -55,
+      "z": 100
+     }
+    }
+   ]
+  }
+ }
+}

@@ -1,0 +1,107 @@
+{
+ "id": "Interchange_TarkovDev",
+ "displayName": "Interchange (TarkovDev)",
+ "author": "Tarkov.dev",
+ "authorLink": "https://tarkov.dev",
+ "internalNames": [
+  "Interchange"
+ ],
+ "coordinateRotation": 180,
+ "bounds": {
+  "Min": {
+   "x": -364,
+   "y": -443
+  },
+  "Max": {
+   "x": 534,
+   "y": 452
+  }
+ },
+ "defaultLevel": 0,
+ "layers": {
+  "Ground Floor": {
+   "level": 0,
+   "image": "Interchange_TarkovDev/Layers/Interchange-Ground_Level.svg",
+   "imageBounds": {
+    "Min": {
+     "x": -364,
+     "y": -443
+    },
+    "Max": {
+     "x": 534,
+     "y": 452
+    }
+   },
+   "gameBounds": [
+    {
+     "Min": {
+      "x": -364,
+      "y": -443,
+      "z": -100
+     },
+     "Max": {
+      "x": 534,
+      "y": 452,
+      "z": 100
+     }
+    }
+   ]
+  },
+  "2nd Floor": {
+   "level": 1,
+   "image": "Interchange_TarkovDev/Layers/Interchange-First_Floor.svg",
+   "imageBounds": {
+    "Min": {
+     "x": -364,
+     "y": -443
+    },
+    "Max": {
+     "x": 534,
+     "y": 452
+    }
+   },
+   "gameBounds": [
+    {
+     "Min": {
+      "x": -222,
+      "y": -327,
+      "z": 25
+     },
+     "Max": {
+      "x": 120,
+      "y": 218,
+      "z": 34
+     }
+    }
+   ]
+  },
+  "3rd Floor": {
+   "level": 2,
+   "image": "Interchange_TarkovDev/Layers/Interchange-Second_Floor.svg",
+   "imageBounds": {
+    "Min": {
+     "x": -364,
+     "y": -443
+    },
+    "Max": {
+     "x": 534,
+     "y": 452
+    }
+   },
+   "gameBounds": [
+    {
+     "Min": {
+      "x": -222,
+      "y": -443,
+      "z": 34
+     },
+     "Max": {
+      "x": 120,
+      "y": 218,
+      "z": 100
+     }
+    }
+   ]
+  }
+ }
+}
