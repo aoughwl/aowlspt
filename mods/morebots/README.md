@@ -1,8 +1,16 @@
-# aowl.morebots
+# aowl.morebots -- the population half of Bot AI
 
-Two jobs in one mod, because upstream had them in one mod: it is **the bot-type
-and faction API** other mods register against, and it is **the mod that raises
-how many bots a map runs**. Ported from **MoreBotsAPI** by TacticalToaster.
+**To the player this is not a mod.** It is hidden from the mod list
+(`"internal": true`), it claims no settings page of its own, and its rows render
+inside the Bot AI page tree as `Bot AI > Population`. The guid `aowl.morebots`,
+this directory, `morebots.dll` and the `/morebotsapi/*` routes are INTERNAL
+identifiers: the registry, the selection store and deploy verification all key
+off them, so they are deliberately unchanged.
+
+Two jobs in one binary, because upstream had them in one mod: it is **the
+bot-type and faction API** other mods register against, and it is **the half
+that raises how many bots a map runs**. Ported from the MoreBotsAPI mod by
+TacticalToaster (upstream credit, not a name shown to a player).
 Upstream is CC BY-NC-SA 4.0; the licence travels with the port and its text is
 in `LICENSE` beside this file.
 

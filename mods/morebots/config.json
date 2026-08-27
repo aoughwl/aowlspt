@@ -1,5 +1,5 @@
 {
-  "_comment": "aowl.morebots. Two jobs: it is the bot-type and faction API other mods register against (mods/blackdivision is the first customer), and it is the mod that raises how many bots a map runs. Every key is documented on the line above it. README.md says which of the original MoreBotsAPI's features survived post-1.0 and which cannot exist at all.",
+  "_comment": "aowl.morebots -- the population half of Bot AI. To the player this is not a separate mod: it is hidden from the mod list and its settings render under Bot AI > Population. Two jobs: it is the bot-type and faction API other mods register against (mods/blackdivision is the first customer), and it is the half that raises how many bots a map runs. Every key is documented on the line above it. README.md says which upstream features survived post-1.0 and which cannot exist at all.",
 
   "//enableDebugLogs": "One line per registration, per overlay and per relation. Off by default: it is 30+ lines at every load on a normal install and says nothing a working one needs to hear.",
   "enableDebugLogs": false,

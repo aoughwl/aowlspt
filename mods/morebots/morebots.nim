@@ -1,4 +1,10 @@
-## MoreBots — the bot-type and faction API other mods build on.
+## The bot population and bot-type/faction API half of Bot AI.
+##
+## User-visible everywhere as **Bot AI** (its rows render under
+## `Bot AI > Population`). The guid `aowl.morebots`, this path, the dll name
+## and the /morebotsapi/* routes are INTERNAL identifiers and are deliberately
+## unchanged -- the registry, the selection store and deploy verification all
+## key off them.
 ##
 ## A from-scratch rewrite for aowlspt of **MoreBotsAPI** by TacticalToaster
 ## (https://discord.gg/nxa3W7w4rJ), whose original C# client plugin, prepatcher
@@ -484,24 +490,61 @@ proc onHello(payload: string): string =
 
 proc moreBotsSchema(): seq[Setting] =
   result = @[
-    boolSetting("enableDebugLogs", "Debug logs", false, category = "Debug",
-                description = "One line per registration, overlay and relation"),
+    boolSetting("population.enabled", "Raise bot counts", false,
+                category = "Bot AI/Population", subcategory = "Spawns",
+                description = "Raise how many AI a map runs. Writes BotMax, BotMaxPvE, MaxBotPerZone and every scav wave's slot counts into the served database, computed from a stock baseline so it never compounds. Off means the stock numbers. Applied when the server starts, so restart the backend after changing it.",
+                implemented = true),
+    enumSetting("population.preset", "Population preset", "vanilla",
+                @["vanilla", "more", "lots", "horde", "custom"],
+                category = "Bot AI/Population", subcategory = "Spawns",
+                description = "vanilla puts every number back to stock (that is how you undo this, since the database keeps the last run's numbers). more is 1.35x cap and waves, 1.5x per zone; lots is 1.75x/2x; horde is 2.5x/3x and is past the point where anything is balanced. custom means the three multipliers in config.json, which ship unset and therefore change nothing on their own.",
+                implemented = true),
+    intSetting("population.capFloor", "Cap floor", 4, lo = 1, hi = 60,
+               category = "Bot AI/Population", subcategory = "Limits",
+               description = "No map's alive-AI cap is written below this, whatever the preset works out to.",
+               implemented = true),
+    intSetting("population.capCeiling", "Cap ceiling", 60, lo = 4, hi = 200,
+               category = "Bot AI/Population", subcategory = "Limits",
+               description = "No map's alive-AI cap is written above this. A map has a fixed number of spawn points; asking for more bots than it has places to put them gives stuttering rather than more bots. A clamp is logged, not silent.",
+               implemented = true),
+    intSetting("population.perZoneCeiling", "Per-zone ceiling", 12, lo = 1, hi = 40,
+               category = "Bot AI/Population", subcategory = "Limits",
+               description = "The largest MaxBotPerZone any map may be given. The spawner will not put a fifth bot in a zone that allows four, so this is what decides whether a raised cap is ever used. Lighthouse ships at 8, the highest any stock map uses.",
+               implemented = true),
+    intSetting("population.waveSlotCeiling", "Wave slot ceiling", 12, lo = 1, hi = 40,
+               category = "Bot AI/Population", subcategory = "Limits",
+               description = "The largest slots_max any single scav wave may reach. A wave asking for more bots at once than the zone can place is a wave that arrives partly.",
+               implemented = true),
     intSetting("increaseBotCapAmount", "Increase bot cap amount", 0,
-               lo = 0, hi = 50, category = "Population", implemented = false,
-               description = "Deprecated: writes bots.config.maxBotCap, which nothing on this stack reads; use population instead"),
-    boolSetting("clientCensus", "Client census", false, category = "Census",
-                description = "The client half, off by default: it opens the IL2CPP runtime in the client process. Server-side bot counts do not need it"),
-    boolSetting("deferUntilUnityThread", "Defer until Unity thread", true,
-                category = "Census",
-                description = "Hold all client arming until the host confirms its main-thread drain has fired. Turning this off reproduces the crash that quarantined this mod"),
-    boolSetting("deathLedger", "Death ledger", false, category = "Census",
-                description = "Installs a BY-NAME host detour on EFT.BaseStatisticsManager::OnDeath -- a write into game code against a pre-1.0 name. Not needed for bot counts"),
-    intSetting("censusIntervalMs", "Census interval (ms)", 5000,
-               lo = 500, hi = 60000, step = 500, category = "Census",
-               description = "How often the client half counts the bots that arrived; read-only, floored at 500"),
+               lo = 0, hi = 50,
+               category = "Bot AI/Population", subcategory = "Limits",
+               description = "Deprecated and does nothing: it writes bots.config.maxBotCap, a database path nothing on this stack reads. Use the preset above instead.",
+               implemented = false),
+    boolSetting("clientCensus", "Count the bots that arrived", false,
+                category = "Bot AI/Advanced", subcategory = "Population diagnostics",
+                description = "The in-client half, off by default: it opens the IL2CPP runtime in the game process to count live bots. Raising bot counts is the server half and needs none of this.",
+                implemented = true),
+    boolSetting("deferUntilUnityThread", "Defer until the Unity thread is live", true,
+                category = "Bot AI/Advanced", subcategory = "Population diagnostics",
+                description = "Hold all in-client arming until the host confirms its main-thread drain has fired. Turning this off reproduces a crash. Leave it on.",
+                implemented = true),
+    boolSetting("deathLedger", "Death ledger", false,
+                category = "Bot AI/Advanced", subcategory = "Population diagnostics",
+                description = "Installs a BY-NAME detour on EFT.BaseStatisticsManager::OnDeath -- a write into game code against a pre-1.0 name. Not needed for bot counts.",
+                implemented = true),
+    intSetting("censusIntervalMs", "Count interval (ms)", 5000,
+               lo = 500, hi = 60000, step = 500,
+               category = "Bot AI/Advanced", subcategory = "Population diagnostics",
+               description = "How often the count runs; read-only, floored at 500.",
+               implemented = true),
     intSetting("expectedBotCap", "Expected bot cap", 0, lo = 0, hi = 200,
-               category = "Census",
-               description = "The alive-bot cap the census compares against; 0 reports the count without judging it")]
+               category = "Bot AI/Advanced", subcategory = "Population diagnostics",
+               description = "The alive-bot cap the count compares against; 0 reports the number without judging it.",
+               implemented = true),
+    boolSetting("enableDebugLogs", "Verbose population log", false,
+                category = "Bot AI/Advanced", subcategory = "Population diagnostics",
+                description = "One line per bot-type registration, overlay and relation.",
+                implemented = true)]
 
 proc onMoreBotsSettings(url, body, session: string): string =
   ## GET serves the schema; a POST body persists one edit into config.json. The
@@ -518,7 +561,10 @@ proc onMoreBotsSettingsReset(url, body, session: string): string =
   result = declaredSchemaReply(st).text
 
 proc registerRoutes() =
-  declareSettings(moreBotsSchema())
+  # inIndex = false: these rows are shown INSIDE the Bot AI page tree
+  # (mods/sain proxies them under Bot AI > Population), so this mod must not
+  # also claim a second top-level entry in the F12 nav.
+  declareSettings(moreBotsSchema(), inIndex = false)
   discard serve("/aowlspt/settings/" & ModGuid, onMoreBotsSettings)
   discard serve("/aowlspt/settings/" & ModGuid & "/reset", onMoreBotsSettingsReset)
   discard serve("/morebotsapi/getfactions", onGetFactions)
@@ -884,7 +930,7 @@ proc onLoadServer(): Status =
 # own startup, and a refusal is printed as the real answer it is.
 
 proc simSelfTest(): Status =
-  info "MoreBots self-test (--side sim)"
+  info "Bot AI population self-test (--side sim)"
   var bad = 0
 
   # --- the server half, driven through its own event surface.
@@ -1554,11 +1600,11 @@ proc simSelfTest(): Status =
        "forty bots, which is why it is not on it"
 
   if bad == 0:
-    success "MoreBots self-test: the registration surface works with no " &
+    success "Bot AI population self-test: the registration surface works with no " &
             "backend attached"
     result = Ok
   else:
-    error "MoreBots self-test: " & $bad & " problem(s)"
+    error "Bot AI population self-test: " & $bad & " problem(s)"
     result = ErrGeneric
 
 proc onLoad(): Status =
@@ -1643,7 +1689,7 @@ proc onUnload(): Status =
 
 exportMod(
   guid = ModGuid,
-  name = "MoreBots",
+  name = "Bot AI: population",
   author = "TacticalToaster (ported to aowlspt)",
   version = ModVersion,
   sptRange = "*",

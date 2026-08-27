@@ -7,9 +7,9 @@ wire, not names on a screen.
 
 It replaces Tarkov's stock bot AI: layered decisions, per-bot personalities,
 real cover use, searching that looks like searching, and squads that behave
-like squads. The More Bots spawn expansion is part of Bot AI too, rather than a
-separate brand -- though it is quarantined on this build, and the settings page
-says so.
+like squads. The spawn-population expansion is part of Bot AI too, rather than
+a separate mod: its rows render under `Bot AI > Population` and its binary
+(`mods/morebots`, guid `aowl.morebots`) is hidden from the player mod list.
 
 The design is a from-scratch rewrite of the one SAIN (Solarint, maintained by
 ArchangelWTF) established -- ~64,000 lines of C# built on BepInEx, Harmony and

@@ -298,6 +298,11 @@ proc schemaJson*(settings: seq[Setting]): Json =
 
 var gDeclared: seq[Setting] = @[]
 var gAnnounceSubscribed = false
+var gInIndex = true
+  ## Whether this mod gets its OWN entry in the F12 nav. False means the
+  ## schema is still served, still page-queryable and still writable -- it
+  ## is simply not a top-level mod in the list, because another mod presents
+  ## these rows inside its own page tree.
 
 const
   SettingsIndexQuery* = "aowlspt.settings.indexQuery"
@@ -353,7 +358,7 @@ const
     ## (fact #135: a chunked POST is answered 200 with the schema unchanged).
 
 proc onIndexQuery(payload: string): string =
-  if gDeclared.len > 0:
+  if gDeclared.len > 0 and gInIndex:
     var o = obj()
     o.put("guid", modGuid())
     o.put("name", modName())
@@ -577,10 +582,11 @@ proc onApplyQuery(payload: string): string =
   discard emit(SettingsApplyAnnounce, done(o).text)
   result = ""
 
-proc declareSettings*(settings: seq[Setting]) =
+proc declareSettings*(settings: seq[Setting]; inIndex = true) =
   ## Register this mod's schema. Replaces any previous declaration — call it
   ## once with the whole list, not once per row.
   gDeclared = settings
+  gInIndex = inIndex
   if not gAnnounceSubscribed and settings.len > 0:
     # Subscribe once, lazily, the first time a mod actually has something to
     # announce — a mod that never declares settings never joins the
