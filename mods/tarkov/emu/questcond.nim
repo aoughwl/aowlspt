@@ -474,6 +474,23 @@ proc listHas(node: JsonRef; wanted: string): bool =
       return true
   result = false
 
+proc listHasAny(node: JsonRef; wanted: seq[string]): bool =
+  ## Whether an array of strings contains ANY of several spellings of the same
+  ## thing. Used for `Location`, whose target may be a database key
+  ## (`bigmap`), a `base.Id` (`Woods`), a `base._Id` or a `base.Name` -- see
+  ## `emu/raid.locationAliases` for the measured distribution. An exact
+  ## compare against one canonical spelling refused 233 of the 301 `Location`
+  ## targets in the live database.
+  if not node.found:
+    return false
+  let elems = each(node)
+  for e in elems:
+    let got = e.asText("")
+    for w in wanted:
+      if got == w:
+        return true
+  result = false
+
 proc sideMatches(target, side: string): bool =
   case target
   of "", "Any": true
@@ -622,8 +639,16 @@ proc daytimeVerdict*(c: RaidClock; fromHour, toHour: float): DaytimeVerdict =
   result = dtUndecided
 
 proc killCredit*(cond, victimsJson, location, exitStatus: string;
-                 refused: var seq[string]; clock: RaidClock): int =
+                 refused: var seq[string]; clock: RaidClock;
+                 locationAliases: seq[string] = @[]): int =
   ## How many of a raid's victims this `CounterCreator` should count.
+  ##
+  ## `locationAliases` is every spelling of the raid's map (see
+  ## `emu/raid.locationAliases`). `location` alone is not enough: a quest's
+  ## `Location` target is usually the client's `base.Id` and this server's
+  ## `location` is the database key, and on 13 of 19 maps those differ. When
+  ## the list is empty `location` is used on its own, which is what every
+  ## selfcheck below passes and what a caller with no index can do.
   ##
   ## `refused` comes back naming every qualifier that stopped the count. It is
   ## empty on a clean credit and on a counter that is not about kills at all;
@@ -740,7 +765,12 @@ proc killCredit*(cond, victimsJson, location, exitStatus: string;
         noteRefusal(refused, "the target's health effects")
     of "Location":
       let target = sj.field("target")
-      if target.count > 0 and not listHas(target, location):
+      var spellings: seq[string] = @[]
+      for a in locationAliases:
+        spellings.add a
+      if spellings.len == 0:
+        spellings.add location
+      if target.count > 0 and not listHasAny(target, spellings):
         # The raid was somewhere else. Not unverifiable -- verified, and no.
         refused = @[]
         return 0
@@ -950,6 +980,38 @@ proc selfCheck*(): string =
     out1.add "FAIL kill credit on the wrong map\n"
   else:
     out1.add "ok    the same kills on another map are not\n"
+
+  # The MEASURED spelling problem, both ways round. In the live db.json, 233
+  # of the 301 `Location` targets under `templates.quests` are the client's
+  # `base.Id` (`Woods` 39, `Shoreline` 46, `RezervBase` 28, `TarkovStreets`
+  # 32, `Interchange` 23, `Lighthouse` 26, `Sandbox`/`Sandbox_high` 29) and
+  # only 68 are database keys. `raidMapFor` canonicalises to the database key,
+  # so an exact compare against `location` alone refuses all 233.
+  #
+  # The falsifying input is the SECOND case, not the first: passing only the
+  # canonical spelling MUST still refuse, or this check could not fail.
+  const CounterWoods = """{"conditionType":"CounterCreator","id":"cw","value":5,
+    "counter":{"conditions":[{"conditionType":"Kills","target":"Savage"},
+                             {"conditionType":"Location","target":["Woods"]}]}}"""
+  if killCredit(CounterWoods, Victims, "bigmap", "Survived", why1,
+                unknownClock(), @["bigmap", "Woods", "Woods"]) != 2:
+    inc fails
+    out1.add "FAIL an Id-spelled Location target with the aliases present\n"
+  else:
+    out1.add "ok    a Location target spelled `Woods` credits a raid the " &
+             "server canonicalised to `bigmap`\n"
+  if killCredit(CounterWoods, Victims, "bigmap", "Survived", why1) != 0:
+    inc fails
+    out1.add "FAIL an Id-spelled target matched with no aliases at all\n"
+  else:
+    out1.add "ok    and with no alias list it still refuses, so the check " &
+             "above can fail\n"
+  if killCredit(CounterWoods, Victims, "shoreline", "Survived", why1,
+                unknownClock(), @["shoreline", "Shoreline"]) != 0:
+    inc fails
+    out1.add "FAIL another map's aliases credited a Woods condition\n"
+  else:
+    out1.add "ok    a different map's aliases do not credit it\n"
 
   # The shape a real `templates.quests` writes on almost every kill condition:
   # both keys present, both neutral. This used to refuse every one of them.
