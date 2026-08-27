@@ -207,6 +207,96 @@ proc modeName*(bit: int32): string =
   of admTimeOfDay: "Set time of day"
   else:            "?"
 
+# ------------------------------------------------------------- hotkeys
+#
+# The C in `abi/aowlspt_admin.h` owns every rule (unknown name -> REFUSAL with
+# the name printed, never KeyCode.None; no key on an action whose write is not
+# bound; no duplicate binds) so that the F6 menu and this settings path cannot
+# drift apart -- there is ONE implementation and two callers.
+
+proc cHkSetName(s: AdminRegion; row: int32; name: cstring): int32 {.
+  importc: "aowl_admin_hotkey_set_name", nodecl.}
+proc cHkGet(s: AdminRegion; row: int32): int32 {.
+  importc: "aowl_admin_hotkey_get", nodecl.}
+proc cHkNameAt(s: AdminRegion; row, i: int32): int32 {.
+  importc: "aowl_admin_hotkey_name_at", nodecl.}
+proc cHkNoteAt(s: AdminRegion; i: int32): int32 {.
+  importc: "aowl_admin_hotkey_note_at", nodecl.}
+proc cHkStateAt(i: int32): int32 {.
+  importc: "aowl_admin_hotkey_state_at", nodecl.}
+proc cHkPoll(s: AdminRegion; enabled: int32): int32 {.
+  importc: "aowl_admin_hotkey_poll", nodecl.}
+proc cHkEpoch(s: AdminRegion): int32 {.
+  importc: "aowl_admin_hotkey_epoch", nodecl.}
+proc cHkFires(s: AdminRegion): int32 {.
+  importc: "aowl_admin_hotkey_fires", nodecl.}
+proc cHkDisabled(): int32 {.
+  importc: "aowl_admin_hotkey_disabled", nodecl.}
+proc cHkCapturing(s: AdminRegion): int32 {.
+  importc: "aowl_admin_hotkey_capturing", nodecl.}
+
+proc hotkeySetName*(s: AdminRegion; row: int32; name: string): bool =
+  ## True when the key was accepted. False is a REFUSAL, and `hotkeyNote()`
+  ## then says why, naming the key. Never silently binds anything.
+  if s == nil: return false
+  var n = name
+  cHkSetName(s, row, toCString(n)) != 0'i32
+
+proc hotkeyName*(s: AdminRegion; row: int32): string =
+  ## The KeyCode NAME on this row, or "" for unbound. Never a bare ordinal.
+  ##
+  ## Read one byte at a time because nimony has no `$` for `cstring` -- the
+  ## same reason `modeName` above duplicates the header's table. Capped, so a
+  ## buffer that somehow lost its terminator yields a short string rather than
+  ## a walk off the end.
+  result = ""
+  if s == nil: return
+  var i = 0'i32
+  while i < 40'i32:
+    let c = cHkNameAt(s, row, i)
+    if c <= 0'i32 or c > 255'i32: break
+    result.add char(c)
+    i = i + 1'i32
+
+proc hotkeyOrdinal*(s: AdminRegion; row: int32): int =
+  if s == nil: -1 else: int(cHkGet(s, row))
+
+proc hotkeyNote*(s: AdminRegion): string =
+  ## Why the last bind was REFUSED, in words, or "". Capped at the region's
+  ## own buffer size.
+  result = ""
+  if s == nil: return
+  var i = 0'i32
+  while i < 191'i32:            # AOWL_ADM_STATUS_LEN - 1
+    let c = cHkNoteAt(s, i)
+    if c <= 0'i32 or c > 255'i32: break
+    result.add char(c)
+    i = i + 1'i32
+
+proc hotkeyPoll*(s: AdminRegion; enabled: bool): int =
+  ## UNITY THREAD ONLY. 0, or row+1 for the action toggled this frame.
+  if s == nil: return 0
+  int(cHkPoll(s, (if enabled: 1'i32 else: 0'i32)))
+
+proc hotkeyEpoch*(s: AdminRegion): int =
+  if s == nil: 0 else: int(cHkEpoch(s))
+proc hotkeyFires*(s: AdminRegion): int =
+  if s == nil: 0 else: int(cHkFires(s))
+proc hotkeyCapturing*(s: AdminRegion): bool =
+  s != nil and cHkCapturing(s) != 0'i32
+proc hotkeyDisabled*(): bool = cHkDisabled() != 0'i32
+proc hotkeyStateText*(): string =
+  ## Whether Input::GetKeyDown bound, and if not, why -- never collapsed into
+  ## "no key pressed".
+  result = ""
+  var i = 0'i32
+  while i < 255'i32:
+    let c = cHkStateAt(i)
+    if c <= 0'i32 or c > 255'i32: break
+    result.add char(c)
+    i = i + 1'i32
+  if result.len == 0: result = "not attempted"
+
 proc hostGameWorld*(): pointer =
   ## The live `EFT.GameWorld`, borrowed from the host's existing RegisterPlayer
   ## detour cache. nil is AMBIGUOUS on its own -- always pair with gwState().
