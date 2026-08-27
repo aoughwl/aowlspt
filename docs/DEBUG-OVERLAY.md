@@ -167,3 +167,90 @@ applies on the next toggle-on.
 
 See `abi/aowlspt_debugui.h` for the RVAs, the disassembled evidence for each
 calling convention, and the offline-resolved field offsets.
+
+---
+
+## Widgets (drag, snap, toggle, persist)
+
+The single stacked column is now **N independent widgets**. Each is one Unity
+label holding several lines, with its own anchor, its own offset, and its own
+on/off — and each can be dragged with the mouse.
+
+| widget | default corner | shows |
+|---|---|---|
+| `fps` | top-left | fps, host ticks, frame-time min/p50/p95/p99/max |
+| `scene` | top-left | map id, raid state and the GameWorld pointer |
+| `pos` | top-left | your world position and yaw/pitch |
+| `mem` | top-right | process working set, private bytes, system load |
+| `bots` | bottom-left | registered / AI / alive, then per-bot coordinates |
+| `prof` | top-right | **per-participant budget vs actual** (see below) |
+| `build` | bottom-left | host name/version, client build, detour fire count |
+| `notes` | bottom-right | the three free-text note slots |
+
+### The keys
+
+* **F3** — show / hide.
+* **Ctrl+F3** — enter / leave **edit mode**. Default OFF within a visible panel.
+* In edit mode: **left-drag** a widget; **1**–**9** toggle a widget; **0**
+  resets every widget to its built-in corner.
+
+Edit mode is its own state because a left click that grabbed a widget would
+otherwise change what the mouse does in a raid. The overlay **does not hook or
+swallow input** — it polls `GetAsyncKeyState`/`GetCursorPos`, so the game still
+receives every click. The on-screen banner says so.
+
+**Why the F10 bug cannot recur here.** F10 never reached the D3D overlay because
+Windows delivers it as `WM_SYSKEYDOWN`, not `WM_KEYDOWN`. This overlay reads no
+window message at all: the async key state is updated by the raw-input thread
+*before* any message exists, so there is no classification to get wrong. That
+argument is *measured* rather than asserted — the first time the toggle edge
+fires, the host log records which route saw it and the vk code.
+
+### Snapping
+
+A drop snaps to the screen edges, to the corners, and to other widgets (flush
+left/top edges, or abutting with a small gap). A snap **rebinds the anchor**
+rather than nudging the offset, which is what makes the saved layout survive a
+resolution change: a widget dropped bottom-right is stored as *"bottom-right,
+minus 12"*, not as *"x = 2436"*. A widget is also always pulled back on-screen,
+so a bad drag can never make one unreachable.
+
+Screen bounds come from the game window's own `GetClientRect` divided by the
+canvas's **measured** `scaleFactor`. Never from a constant, and a read that
+comes back below 16px is refused rather than used.
+
+### Persistence
+
+Two files, beside the host DLL:
+
+| file | written by | holds |
+|---|---|---|
+| `aowlspt-debugui.json` | **you** | which widgets exist, their titles and fields |
+| `aowlspt-debugui-layout.json` | **the overlay** | only `on` / `anchor` / `x` / `y` |
+
+The overlay never writes to your file, so a drag cannot destroy anything you
+typed; deleting the layout file resets every placement. The layout file is
+written on every drop and every widget toggle — never per frame — and a failed
+write is logged as a warning rather than silently losing the arrangement.
+
+Keys are flat and dotted (`w.fps.x`), not nested, because the host's shallow
+key scanner would happily find an `"x"` belonging to a different object.
+
+### The profiler widget
+
+`prof` shows, for every participant of the shared region
+(`abi/aowlspt_region.h`):
+
+```
+  name   last / budget ms   peak   calls  [skip N] [over N] [FAULTS N] [flag]
+```
+
+**No new detour and no new timer.** The region dispatcher already times each
+participant against the budget it declared at registration, and already counts
+overruns, faults and skipped frames — this reads that accounting through
+`aowl_region_status_x` and formats it.
+
+It refuses to invent numbers: a participant that has never been called shows
+`--`, not `0.000`. An unarmed region says *"region NOT ARMED — no per-mod timing
+is being collected"*, and an armed region with nothing registered says *"that is
+not 'nothing is slow' — it is 'nothing is measured'"*.
