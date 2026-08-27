@@ -527,6 +527,15 @@ proc onFovSettings(url, body, session: string): string =
     if st == Ok: loadConfig()
   result = declaredSchemaReply(st).text
 
+proc onSettingsHotApply(key: string) =
+  ## fov is client-side, so its `/aowlspt/settings/<guid>` route is registered
+  ## into nothing and the handlers above never run in the client. Without this
+  ## an F12 edit persists to config.json and the live FOV keeps the value it
+  ## was loaded with until the next launch -- a slider that moves and changes
+  ## nothing. Same call the route handler makes: ONE apply path, not two.
+  discard key
+  loadConfig()
+
 proc onFovSettingsReset(url, body, session: string): string =
   let st = resetFromBody(body)
   if st == Ok: loadConfig()
@@ -2965,6 +2974,7 @@ proc onLoad(): Status =
          "silently overrode the new default and killed the client at 8.328s. " &
          "It now does nothing. Delete it to keep the file honest."
   declareSettings(fovSchema())
+  onSettingsApplied(onSettingsHotApply)
   discard serve("/aowlspt/settings/" & ModGuid, onFovSettings)
   discard serve("/aowlspt/settings/" & ModGuid & "/reset", onFovSettingsReset)
   success ModName & " " & ModVersion & " loaded on " & hostName()

@@ -162,6 +162,16 @@ proc onAdminSettingsReset(url, body, session: string): string =
   if st == Ok: applyConfigToggles()
   result = declaredSchemaReply(st).text
 
+proc onSettingsHotApply(key: string) =
+  ## admin is client-side, so its `/aowlspt/settings/<guid>` route is
+  ## registered into nothing and the two handlers above never run in the
+  ## client. Without this the F12 edit persists to config.json and the shared
+  ## HUD region keeps the OLD toggle until the next launch -- a cheat switch
+  ## that flips and changes nothing. Same call the route handler makes, so
+  ## there is ONE apply path and not two.
+  discard key
+  applyConfigToggles()
+
 # ---------------------------------------------------------------------------
 # The Unity-thread sampler: the ONLY thing in this mod that calls game code
 # ---------------------------------------------------------------------------
@@ -362,10 +372,12 @@ proc onLoad(): Status =
     warn ModName & ": could not map the shared HUD region; the menu and ESP " &
          "are unavailable this session (the game is otherwise untouched)"
     declareSettings(adminSchema())
+    onSettingsApplied(onSettingsHotApply)
     return Ok
 
   applyConfigToggles()
   declareSettings(adminSchema())
+  onSettingsApplied(onSettingsHotApply)
   discard serve("/aowlspt/settings/" & ModGuid, onAdminSettings)
   discard serve("/aowlspt/settings/" & ModGuid & "/reset", onAdminSettingsReset)
 
