@@ -118,6 +118,8 @@ entry in the middle.
 | `provides` | capability ids. Two enabled mods that provide the same id conflict, even though neither has heard of the other. That is how "two AI overhauls" is detected without every AI mod listing every other one. |
 | `loadAfter` | soft ordering. Unlike `requires`, the named mod does not have to be present. |
 | `tags` | free-form, for a UI to group by. Not used in resolution. |
+| `internal` | optional, default `false`. **Presentation only.** Infrastructure a player has no business seeing: the settings index, the fallback browser page, an ABI experiment. The manager's player-facing panel omits the row; every diagnostic route still carries it, and resolution, load order and selection are untouched -- an internal mod is still resolved, still loaded, still required by whatever requires it. |
+| `shipped` | optional, default `true`. **Distribution only.** Whether the built artifact can ever reach an install (`aowl payload` stages `mods/*`, so anything under `examples/` cannot). It is NOT a visibility flag: `aowl.textures` is `shipped: false` and is an ordinary player mod that simply has no artifact yet, while `aowl.settingshub` ships in every install and must never appear in the list. The two questions are independent; set both when both apply. |
 
 #### Why `download` is null for everything here
 

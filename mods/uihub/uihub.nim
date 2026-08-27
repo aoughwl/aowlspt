@@ -69,7 +69,11 @@ import aowlspt/settings
 
 const
   ModGuid = "aowl.uihub"
-  ModName = "Fallback Settings UI"
+  ModName = "Interface"
+    ## Was "Fallback Settings UI". The MOD is infrastructure and is now marked
+    ## `internal` in the registry, so it no longer appears on the mod list --
+    ## but it declares one genuine player row (the F12 launch hint), so it
+    ## still has a settings page, and that page needs a name a player can read.
   ModAuthor = "savannt"
   ModVersion = "2.0.0"
 
