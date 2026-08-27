@@ -63,6 +63,23 @@
 #include <string.h>
 #include <stdio.h>
 
+/* For AOWL_NAV_UOBJ_CACHEDPTR -- the offset of `UnityEngine.Object.m_CachedPtr`,
+ * which is how the overlay tells a LIVE object from Unity's "fake null".
+ *
+ * Included HERE, from the header `debugui.nim` pulls in first, purely for
+ * ORDER: `botnav.nim` includes the same file, but its emit lands later in the
+ * single generated translation unit than `debugui.nim`'s first use of the
+ * accessor -- which surfaced as `implicit declaration of
+ * aowl_nav_off_cachedptr` followed by `static declaration follows non-static
+ * declaration`. Including it earlier makes botnav's include a no-op through the
+ * ordinary include guard.
+ *
+ * Unlike `aowlspt_region.h`, this is safe to include from anywhere: navui.h has
+ * NO host/client mode define, so there is no configuration for an early include
+ * to lock in. That difference is the whole reason the region view needed its
+ * own file and this does not. */
+#include "aowlspt_navui.h"
+
 /* ================================================================== *
  * 1. THE POINTER
  * ================================================================== */
@@ -364,7 +381,21 @@ enum {
     AOWL_WG_CRUMB_B_MARKDRAW   = 29,
     AOWL_WG_CRUMB_B_SCALE      = 30,/* reading the canvas scaleFactor      */
     AOWL_WG_CRUMB_B_DIAGDUMP   = 31,/* duDiagDump                          */
-    AOWL_WG_CRUMB_B_READBACK   = 32 /* the placement read-back             */
+    AOWL_WG_CRUMB_B_READBACK   = 32,/* the placement read-back             */
+
+    /* INSIDE duCanvasRootGo -- the canvas-root walk, which the second live run
+     * named. Every one of these is a MANAGED CALL on a UnityEngine.Object whose
+     * native half may be gone (Unity's "fake null"), so each hop gets its own
+     * crumb and its own liveness gate. */
+    AOWL_WG_CRUMB_R_ANCHORALIVE = 33,
+    AOWL_WG_CRUMB_R_RECT        = 34, /* duRectOf -> Component::get_transform */
+    AOWL_WG_CRUMB_R_RECTALIVE   = 35,
+    AOWL_WG_CRUMB_R_PARENT      = 36, /* Transform::get_parent                */
+    AOWL_WG_CRUMB_R_PARSANE     = 37, /* duRectIsSane -> get_rect (sret)      */
+    AOWL_WG_CRUMB_R_PARGO       = 38, /* Component::get_gameObject            */
+    AOWL_WG_CRUMB_R_CANVAS      = 39, /* route 2                              */
+    AOWL_WG_CRUMB_R_CLIMB       = 40, /* route 3                              */
+    AOWL_WG_CRUMB_R_DONE        = 41
 };
 
 static volatile int32_t aowl_wg_crumb_stage  = 0;
@@ -409,6 +440,15 @@ static const char* aowl_wg_crumb_text(int32_t s) {
     case AOWL_WG_CRUMB_B_SCALE:       return "duBuild: reading the canvas scaleFactor";
     case AOWL_WG_CRUMB_B_DIAGDUMP:    return "duBuild: duDiagDump";
     case AOWL_WG_CRUMB_B_READBACK:    return "duBuild: the placement read-back";
+    case AOWL_WG_CRUMB_R_ANCHORALIVE: return "duCanvasRootGo: liveness gate on the anchor";
+    case AOWL_WG_CRUMB_R_RECT:        return "duCanvasRootGo: duRectOf -> Component::get_transform on the anchor";
+    case AOWL_WG_CRUMB_R_RECTALIVE:   return "duCanvasRootGo: liveness gate on the anchor's RectTransform";
+    case AOWL_WG_CRUMB_R_PARENT:      return "duCanvasRootGo: Transform::get_parent";
+    case AOWL_WG_CRUMB_R_PARSANE:     return "duCanvasRootGo: duRectIsSane -> RectTransform::get_rect on the parent";
+    case AOWL_WG_CRUMB_R_PARGO:       return "duCanvasRootGo: Component::get_gameObject on the parent";
+    case AOWL_WG_CRUMB_R_CANVAS:      return "duCanvasRootGo: route 2, the Graphic's own Canvas";
+    case AOWL_WG_CRUMB_R_CLIMB:       return "duCanvasRootGo: route 3, climbing to the highest sane ancestor";
+    case AOWL_WG_CRUMB_R_DONE:        return "duCanvasRootGo: finished";
     default:                      return "nothing recorded";
     }
 }
