@@ -1035,12 +1035,20 @@ proc buildDeploySet(e: Env): int =
       inc mods
       discard buildMod(e, joinPath(e.repo, p.substr(0, cut - 1)))
     elif find(p, "\\bin\\") < 0 and not startsWith(p, "installer\\build\\") and
-         fileExists(joinPath(e.repo, p)):
+         (fileExists(joinPath(e.repo, p)) or isDirectory(joinPath(e.repo, p))):
       # Checked-in data that is SHIPPED but not BUILT -- `registry\mods.json`
       # is the first of these. It is deliberately not silent: the condition
       # requires the file to exist in the repo right now, so a typo'd or
       # deleted path still falls through to the loud error below rather than
       # being waved past as "probably data".
+      #
+      # A shipped data artifact may also be a DIRECTORY (`mods\tarkov\data`,
+      # `mods\maps\data`, ...). The original condition tested `fileExists`
+      # only, so every directory entry fell through to the loud error and
+      # failed the whole `build deploy` target -- the file-only case was the
+      # only one exercised when this was written. `isDirectory` is the same
+      # existence test for the other kind: a typo'd path is neither a file nor
+      # a directory and still reaches the error below.
       note "deploy set: " & s & " is checked-in data, nothing to build"
     else:
       err "tools\\deploy.json ships '" & s & "' and this build target does " &
