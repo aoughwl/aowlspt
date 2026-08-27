@@ -21,7 +21,6 @@ CASES = [
     # --- must BLOCK -------------------------------------------------------- #
     (BLOCK, "Bash", {"command": "cat /d/Aowlspt/aowlspt/db.json"}, "cat the 41 MB db"),
     (BLOCK, "Bash", {"command": "head -1 mods/tarkov/data/post1/locale_en.json"}, "head -1 of a one-line file"),
-    (BLOCK, "Bash", {"command": "tail -c 2000 D:\\Aowlspt\\aowlspt\\nettrace.log"}, "tail on nettrace"),
     (BLOCK, "Bash", {"command": "grep -n 'PROBE RES' /d/Aowlspt/aowlspt/aowlspt-backend.log"}, "uncapped grep of backend log"),
     (BLOCK, "Bash", {"command": "rg Nickname mods/tarkov/data/capture/raid1/responses/large/045.json"}, "uncapped rg of an 18 MB capture"),
     (BLOCK, "Bash", {"command": "grep Chances mods/tarkov/data/post1/locations.json"}, "uncapped grep of locations.json"),
@@ -58,6 +57,31 @@ CASES = [
     (ALLOW, "PowerShell", {"command": "Get-Item D:\\Aowlspt\\aowlspt\\db.json | Select-Object Length"}, "Get-Item sizing"),
     (ALLOW, "Bash", {"command": "echo 'do not cat db.json'"}, "merely mentioning it"),
     (ALLOW, "Edit", {"file_path": "D:/Aowlspt/aowlspt/db.json"}, "a non-read tool"),
+
+    # --- bounded reads: the direction this guard used to get WRONG ---------- #
+    #
+    # `tail -40 aowlspt-backend.log` -- forty lines -- was BLOCKED, and an
+    # agent got past it by assembling the path from a shell variable. A guard
+    # cheaper to evade than to obey teaches evasion, so the rule is now the
+    # READ INTENT: an unbounded reader is blocked, a reader that states its own
+    # bound is not. Both directions are asserted here on purpose; a fix seen to
+    # succeed only one way is not verified.
+    (ALLOW, "Bash", {"command": "tail -40 /d/Aowlspt/aowlspt/aowlspt-backend.log"}, "tail -40 of the backend log"),
+    (ALLOW, "Bash", {"command": "tail -n 40 D:/Aowlspt/aowlspt/aowlspt-backend.log"}, "tail -n 40 of the backend log"),
+    (ALLOW, "Bash", {"command": "head -n 20 D:/Aowlspt/aowlspt/nettrace.log"}, "head -n 20 of nettrace"),
+    (ALLOW, "Bash", {"command": "tail --lines=30 /d/Aowlspt/aowlspt/aowlspt-backend.log"}, "tail --lines=30"),
+    (ALLOW, "Bash", {"command": "tail -c 2000 D:/Aowlspt/aowlspt/nettrace.log"}, "a 2 KB byte bound"),
+    (ALLOW, "Bash", {"command": "head -c 4096 D:/Aowlspt/aowlspt/db.json"}, "a byte bound is honest even on a one-line file"),
+    (ALLOW, "PowerShell", {"command": "Get-Content D:/Aowlspt/aowlspt/nettrace.log -Tail 50"}, "bounded Get-Content of nettrace"),
+    (ALLOW, "Bash", {"command": "mv D:/Aowlspt/aowlspt/db.json /tmp/x"}, "moving the db"),
+
+    # ...and the bounds that are not bounds. These MUST still block.
+    (BLOCK, "Bash", {"command": "tail -n 5 D:/Aowlspt/aowlspt/db.json"}, "a line bound on a ONE-LINE file is a lie"),
+    (BLOCK, "Bash", {"command": "head -n 1 mods/tarkov/data/post1/locale_en.json"}, "one line of a one-line file"),
+    (BLOCK, "Bash", {"command": "head -c D:/Aowlspt/aowlspt/db.json"}, "-c with no number is not a cap"),
+    (BLOCK, "Bash", {"command": "head -c 900000 D:/Aowlspt/aowlspt/db.json"}, "900 KB is not a cap"),
+    (BLOCK, "Bash", {"command": "tail -n 5000 /d/Aowlspt/aowlspt/aowlspt-backend.log"}, "5000 PROBE lines is not a bound"),
+    (BLOCK, "Bash", {"command": "less D:/Aowlspt/aowlspt/nettrace.log"}, "an unbounded pager"),
 ]
 
 

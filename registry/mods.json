@@ -4,8 +4,8 @@
     "id": "aowl.registry.official",
     "name": "aowlspt official registry",
     "description": "Every mod built in this repository, plus the lists that name them. One file with one git history, so a mod list is a document you can send someone.",
-    "revision": 8,
-    "updated": "2026-08-25"
+    "revision": 11,
+    "updated": "2026-08-27"
   },
   "mods": [
     {
@@ -68,7 +68,8 @@
       "requires": [],
       "conflicts": [],
       "provides": [
-        "aowl.capability.gameserver"
+        "aowl.capability.gameserver",
+        "aowl.items"
       ],
       "loadAfter": [],
       "tags": [
@@ -271,10 +272,12 @@
       "name": "Admin Menu",
       "author": "savannt",
       "version": "1.0.0",
+      "shipped": true,
       "description": "The cheat/admin panel: its controls are served as a settings schema like any other mod's, so it renders in whatever settings UI is installed. Registered but OFF in every shipped list -- it is opt-in on purpose. It is in no shipped list on purpose: it is meant to be switched on by hand.",
       "pipeline": ">=0.1.0",
       "sides": [
         "client",
+        "server",
         "sim"
       ],
       "source": {
@@ -304,6 +307,7 @@
       "name": "Graphics",
       "author": "savannt",
       "version": "1.0.0",
+      "shipped": true,
       "description": "Client graphics knobs served as a settings schema. Independent of the shelved native in-game settings work (see docs/SHELVED-NATIVE-SETTINGS.md); registered but not enabled in a shipped list until it has been exercised on a tester install. It is in no shipped list on purpose: it is meant to be switched on by hand.",
       "pipeline": ">=0.1.0",
       "sides": [
@@ -331,11 +335,45 @@
       ]
     },
     {
+      "id": "aowl.textures",
+      "name": "Textures",
+      "author": "savannt",
+      "version": "1.0.0",
+      "shipped": false,
+      "description": "Texture replacement: swaps client textures from a pack under its own data/ directory. In no shipped list on purpose -- it does nothing until a pack is installed, so it is meant to be switched on by hand.",
+      "pipeline": ">=0.1.0",
+      "sides": [
+        "client",
+        "sim"
+      ],
+      "source": {
+        "kind": "intree",
+        "path": "mods/textures",
+        "url": null
+      },
+      "artifact": {
+        "dir": "textures",
+        "library": "textures.dll"
+      },
+      "upstream": null,
+      "license": "see repository",
+      "download": null,
+      "requires": [],
+      "conflicts": [],
+      "provides": [],
+      "loadAfter": [],
+      "tags": [
+        "client",
+        "textures"
+      ]
+    },
+    {
       "id": "aowl.callproof",
       "name": "Call Proof",
       "author": "aowlspt",
       "version": "1.0.0",
-      "description": "A one-shot experiment that settles how this build passes by-value aggregates to a managed call. Default off; it makes four calls whose correct answers are known offline and reports PASS/FAIL/INCONCLUSIVE.",
+      "shipped": false,
+      "description": "A one-shot experiment that settles how this build passes by-value aggregates to a managed call. Default off; it makes four calls whose correct answers are known offline and reports PASS/FAIL/INCONCLUSIVE. NOT SHIPPABLE, deliberately: its source lives at examples/callproof, outside the mods/* tree that `aowl payload` stages, so no install can ever receive it. It is marked \"shipped\": false to say that in a field tools read, instead of leaving the manager to offer a mod that can never arrive.",
       "pipeline": ">=0.1.0",
       "sides": [
         "client",
@@ -406,7 +444,39 @@
         {
           "id": "aowl.sain",
           "enabled": true,
-          "note": "boots clean -- measured client alive 1:55.828 with Unity thread live; OBSERVER MODE, it drives nothing yet"
+          "note": "drives bot MoveSpeed from the difficulty band via botnav (easy 0.49 .. deathwish 1.0); the band difference is UNVERIFIED in a live raid"
+        }
+      ]
+    },
+    {
+      "id": "aowl.list.beta",
+      "name": "aowlspt beta",
+      "author": "aowlspt",
+      "version": "1.0.0",
+      "description": "What the public beta ships. Inherits vanillaplus (manager, tarkov, settingshub, uihub, sain) and adds the player-facing mods. Anything absent here is absent from the beta -- a mod in the registry but in no list can never be selected.",
+      "inherits": [
+        "aowl.list.vanillaplus"
+      ],
+      "entries": [
+        {
+          "id": "aowl.morebots",
+          "enabled": true,
+          "note": "bot population/types; folded into the Bot AI mod branding"
+        },
+        {
+          "id": "aowl.fovfix",
+          "enabled": true,
+          "note": "FOV + aiming/scope sensitivity; zoom-toggle and camera-offset keys are declared unimplemented"
+        },
+        {
+          "id": "aowl.admin",
+          "enabled": true,
+          "note": "F6 admin overlay + item spawner; ESP/godmode/stamina are the bound writes"
+        },
+        {
+          "id": "aowl.graphics",
+          "enabled": true,
+          "note": "20 settings, all read and acted on -- but see the client-side settings surfacing fix, without which they are invisible in F12"
         }
       ]
     }

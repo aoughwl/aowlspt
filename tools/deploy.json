@@ -86,6 +86,10 @@
    "name": "nameidx",
    "src": "host/Aowlspt.Host.Il2Cpp/bin/aowlspt-names.idx",
    "dst": "aowlspt-names.idx",
+   "requiresInput": {
+    "path": ".cache/global-metadata.dec.dat",
+    "why": "gitignored and NOT shared between worktrees -- copy it from the main checkout, then re-run `aowl build host`"
+   },
    "minBytes": 1000000,
    "markers": [
     "AOWLNIDX\u0002\u0000\u0000\u0000"
@@ -99,6 +103,10 @@
    "name": "nameidxshared",
    "src": "host/Aowlspt.Host.Il2Cpp/bin/aowlspt-names.idx.shared",
    "dst": "aowlspt-names.idx.shared",
+   "requiresInput": {
+    "path": ".cache/global-metadata.dec.dat",
+    "why": "gitignored and NOT shared between worktrees -- copy it from the main checkout, then re-run `aowl build host`"
+   },
    "minBytes": 1000,
    "markers": [
     "AOWLSHARED1"
@@ -117,6 +125,188 @@
     "/client/locations",
     "BotLocationModifier",
     "menuCornerLabel"
+   ]
+  },
+  {
+   "//": "Every OTHER mod we ship. Until 2026-08-27 `tarkov` was the only mod",
+   "//1": "with any marker at all, so sain.dll and nine others could ship with a",
+   "//2": "feature silently missing and this tool would still say ok. Markers here",
+   "//3": "are route paths, event ids, settings-schema captions and per-feature log",
+   "//4": "text -- each names ONE feature, so deleting that feature deletes the",
+   "//5": "string. A mod-id string (`aowl.sain`) is identity, not a feature check;",
+   "//6": "it is kept for parity with `tarkov` but the lines below it do the work.",
+   "//7": "NOTE: `aowl build deploy` builds only host+tarkov+backend+launch, so",
+   "//8": "these must be built with `aowl build mods` (and `build-mod` for",
+   "//9": "examples/callproof) before `deploy.py check` can see them.",
+   "name": "manager",
+   "src": "mods/manager/bin/manager.dll",
+   "dst": "mods/manager/manager.dll",
+   "minBytes": 400000,
+   "markers": [
+    "/aowlspt/mods/list",
+    "/aowlspt/mods/apply",
+    "/aowlspt/mods/toggle",
+    "/aowlspt/mods/conflicts",
+    "/aowlspt/mods/panel",
+    "/aowlspt/mods/clientreport",
+    "/aowlspt/mods/describe/",
+    "/aowlspt/mods/reload",
+    "manager: live mod control is available (",
+    "manager: active lists: ",
+    "manager: registry refresh refused -- "
+   ]
+  },
+  {
+   "name": "sain",
+   "src": "mods/sain/bin/sain.dll",
+   "dst": "mods/sain/sain.dll",
+   "minBytes": 500000,
+   "markers": [
+    "aowl.sain",
+    "/aowlspt/settings/aowl.sain/reset",
+    "sain: bindAll phase 4/5 -- the lazy member table (~70 names)",
+    "sain: bindProbe 1/2 -- UnityEngine.Physics::Raycast",
+    "sain: bindProbe 2/2 -- UnityEngine.AI.NavMesh::SamplePosition",
+    "sain: bot activation hooked on ",
+    "sain: bot aim result hooked on ",
+    "sain: by-name resolution refused for ",
+    "sain: a cover sample costs ",
+    "sain: a decision costs ",
+    "sain: an actuation costs ",
+    "sain: could not write the brain tables"
+   ]
+  },
+  {
+   "name": "morebots",
+   "src": "mods/morebots/bin/morebots.dll",
+   "dst": "mods/morebots/morebots.dll",
+   "minBytes": 400000,
+   "markers": [
+    "morebots.type.register",
+    "morebots.type.overlay",
+    "morebots.faction.define",
+    "morebots.faction.relate",
+    "morebots.client.census",
+    "morebots.flush",
+    "morebots.ready",
+    "morebots: a faction definition arrived without a name",
+    "morebots:   spawn types alive:"
+   ]
+  },
+  {
+   "name": "fov",
+   "src": "mods/fov/bin/fov.dll",
+   "dst": "mods/fov/fov.dll",
+   "minBytes": 400000,
+   "markers": [
+    "aowl.fovfix",
+    "FOV: binding CameraManager::get_Instance at a verified static RVA ",
+    "FOV: CalculateScaleValueByFov -- ",
+    "FOV: base field of view captured at ",
+    "FOV: the per-frame chain bound -- ",
+    "FOV: per-frame FOV write -- ",
+    "FOV: scope sensitivity -- ",
+    "FOV: aiming sensitivity -- ",
+    "FOV scale while aiming iron sights / reflex",
+    "FOV scale while aiming a magnified sight"
+   ]
+  },
+  {
+   "name": "settingshub",
+   "src": "mods/settingshub/bin/settingshub.dll",
+   "dst": "mods/settingshub/settingshub.dll",
+   "minBytes": 300000,
+   "markers": [
+    "/aowlspt/settings/index",
+    "/aowlspt/settings/spt/index",
+    "/aowlspt/settings/spt/page/",
+    "spt.bot.AssaultBrainType",
+    "spt.bot.BotNameLengthLimit",
+    "spt.airdrop.Loot",
+    "spt.backup.MaxBackups"
+   ]
+  },
+  {
+   "name": "uihub",
+   "src": "mods/uihub/bin/uihub.dll",
+   "dst": "mods/uihub/uihub.dll",
+   "minBytes": 300000,
+   "markers": [
+    "/aowlspt/ui/page/settings",
+    "Fallback Settings UI",
+    "Search all settings",
+    "Advertise the browser settings page",
+    "launchHintFallbackPage",
+    "width=device-width, initial-scale=1"
+   ]
+  },
+  {
+   "//": "The F6 ITEM SPAWNER is deliberately NOT marked here yet. On 2026-08-27",
+   "//1": "it existed only as uncommitted work in one checkout: a build from",
+   "//2": "committed source has no `admin: F6 spawn -- ` string, so marking it now",
+   "//3": "would fail every honest build. Add those markers in the same commit that",
+   "//4": "lands the spawner -- that is the rule, not an exception to it.",
+   "name": "admin",
+   "src": "mods/admin/bin/admin.dll",
+   "dst": "mods/admin/admin.dll",
+   "minBytes": 300000,
+   "markers": [
+    "aowl.admin",
+    "the F6 menu and ESP are unavailable this session",
+    "samples nothing -- turn ESP on in the F6 menu",
+    "player position validated this frame",
+    "ESP max distance (m)",
+    "Infinite stamina",
+    "No recoil / sway",
+    "Teleport to marker",
+    "PASS  PhysicalBase+0x8C -> Stamina+0x10 written",
+    "Neuters EFT.Player::ApplyDamageInfo while in a "
+   ]
+  },
+  {
+   "name": "graphics",
+   "src": "mods/graphics/bin/graphics.dll",
+   "dst": "mods/graphics/graphics.dll",
+   "minBytes": 300000,
+   "markers": [
+    "aowl.graphics.apply",
+    "aowlspt.host::gfx_apply",
+    "graphics  grade pushed to the host post-process (tonemapper=",
+    "Enable post-process",
+    "Raid only (menu stays stock)",
+    "Red-tint diagnostic",
+    "Shadow lift (additive)",
+    "Blend of the tonemap look over the linear image."
+   ]
+  },
+  {
+   "name": "textures",
+   "src": "mods/textures/bin/textures.dll",
+   "dst": "mods/textures/textures.dll",
+   "minBytes": 300000,
+   "markers": [
+    "aowl.textures",
+    "textures  ARMED post-boot in mode ",
+    "textures  REDIRECT: ",
+    "textures  VRAM budget ",
+    "textures  bundleRoot index: ",
+    "textures  bundle redirect RETIRED after ",
+    "textures  hookAsync is on: AssetBundleRequest::get_asset is a ",
+    "prologue MISMATCH at GameAssembly+0x"
+   ]
+  },
+  {
+   "name": "callproof",
+   "src": "examples/callproof/bin/callproof.dll",
+   "dst": "mods/callproof/callproof.dll",
+   "minBytes": 300000,
+   "markers": [
+    "aowl.callproof",
+    "aowlspt.host::main_thread",
+    "call-proof: armed, deferring until the host's main-thread drain fires ",
+    "call-proof: the rival negative control is disabled, so a passing ",
+    "call-proof: still holding at ",
+    "NEVER RUN. Nothing was called and nothing is proved. Not a pass."
    ]
   },
   {

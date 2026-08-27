@@ -22,7 +22,32 @@ feature and adding its fingerprint are one edit in one place.
     python tools/deploy.py rollback host         # restore host's newest backup
 
 `--install PATH` overrides the destination from `deploy.json`.
-Exit codes: 0 ok, 1 a marker was missing or a copy failed, 2 bad usage.
+
+Three outcomes, never two (CLAUDE.md 9b). An artifact whose own INPUT is
+absent was not verified -- it did not fail. `.cache/global-metadata.dec.dat`
+is gitignored, so in a fresh worktree `aowl build host` cannot emit the name
+index at all; calling that FAIL says "the feature was dropped" about a thing
+nobody looked at, and the measured consequence is that subagents stop
+trusting this tool and hand-scan binaries instead. So:
+
+    ok            built, and every marker is present
+    FAIL          built, and a marker is MISSING -- the feature was dropped
+    INCONCLUSIVE  not built, and a declared required input is absent
+
+An artifact declares its input with `"requiresInput"` in `deploy.json`:
+
+    "requiresInput": {"path": ".cache/global-metadata.dec.dat",
+                      "why":  "gitignored; copy it from the main checkout"}
+
+That downgrade applies ONLY when the artifact is absent AND the input is
+absent. If the input is present and the artifact still is not, that is a
+real build failure and stays FAIL; if the artifact exists, its markers are
+checked exactly as before and a missing one still FAILs loudly. There is no
+path by which declaring an input can weaken a marker.
+
+Exit codes: 0 ok, 1 a marker was missing or a copy failed, 2 bad usage,
+3 nothing failed but at least one artifact was INCONCLUSIVE. A release
+script can therefore refuse on 1 and tolerate 3 with a visible notice.
 """
 
 import argparse
@@ -68,19 +93,52 @@ def select(cfg, only):
     return [a for a in arts if a["name"] in want]
 
 
+OK = "ok"
+FAIL = "fail"
+INCONCLUSIVE = "inconclusive"
+
+
+def missing_input(art):
+    """The artifact's declared input, if it is declared AND absent.
+
+    Returns (path, why) or None. Only consulted when the artifact itself is
+    missing -- see the module docstring.
+    """
+    req = art.get("requiresInput")
+    if not req:
+        return None
+    rel = req.get("path", "")
+    if not rel:
+        return None
+    full = os.path.join(REPO, rel.replace("/", os.sep))
+    if os.path.exists(full):
+        return None
+    return rel, req.get("why", "")
+
+
 def verify(art, src, C):
-    """Return (ok, list-of-problem-strings). Reads the file once."""
+    """Return (verdict, list-of-problem-strings). Reads the file once."""
     red, green, yellow, dim, reset = C
     problems = []
     if not os.path.isfile(src):
-        return False, ["not built: %s" % src]
+        gone = missing_input(art)
+        if gone:
+            rel, why = gone
+            msg = ["not built: %s" % src,
+                   "its declared input is ABSENT: %s" % rel]
+            if why:
+                msg.append("    %s" % why)
+            msg.append("nothing was verified -- this is NOT evidence the "
+                       "markers are missing.")
+            return INCONCLUSIVE, msg
+        return FAIL, ["not built: %s" % src]
     size = os.path.getsize(src)
     floor = art.get("minBytes", 1)
     if size < floor:
         problems.append("only %d bytes (expected at least %d) -- a failed or "
                         "half-written build" % (size, floor))
         # No point scanning a truncated file for markers.
-        return False, problems
+        return FAIL, problems
 
     with open(src, "rb") as f:
         blob = f.read()
@@ -96,31 +154,45 @@ def verify(art, src, C):
                         % (len(missing), len(art.get("markers", []))))
         for m in missing:
             problems.append("    %s" % m)
-    return (len(problems) == 0), problems
+    return (OK if not problems else FAIL), problems
 
 
 def cmd_check(args, cfg, C):
     red, green, yellow, dim, reset = C
     arts = select(cfg, args.only)
     bad = 0
+    unknown = 0
     for art in arts:
         src = os.path.join(REPO, art["src"].replace("/", os.sep))
-        ok, problems = verify(art, src, C)
+        verdict, problems = verify(art, src, C)
         n = len(art.get("markers", []))
-        if ok:
+        if verdict == OK:
             print("%sok%s   %-8s %s  (%d marker%s, %s bytes)"
                   % (green, reset, art["name"], art["src"], n,
                      "" if n == 1 else "s", os.path.getsize(src)))
+            continue
+        if verdict == INCONCLUSIVE:
+            unknown += 1
+            print("%sINCONCLUSIVE%s %-8s %s"
+                  % (yellow, reset, art["name"], art["src"]))
         else:
             bad += 1
             print("%sFAIL%s %-8s %s" % (red, reset, art["name"], art["src"]))
-            for p in problems:
-                print("       %s" % p)
+        for p in problems:
+            print("       %s" % p)
     if bad:
-        print("\n%s%d artifact(s) failed verification.%s" % (red, bad, reset))
+        print("\n%s%d artifact(s) FAILED verification.%s" % (red, bad, reset))
         print("A missing marker means the feature's own text is not in the "
               "binary. Do NOT deploy this; rebuild from the right base.")
-    return 1 if bad else 0
+    if unknown:
+        print("\n%s%d artifact(s) INCONCLUSIVE -- not built, and the input "
+              "they are built FROM is absent.%s" % (yellow, unknown, reset))
+        print("This is not a pass and not a failure: nothing was verified. "
+              "Supply the input and re-run, or deploy only the artifacts you "
+              "did build (--only).")
+    if bad:
+        return 1
+    return 3 if unknown else 0
 
 
 def backup_name(dst):
@@ -136,6 +208,13 @@ def cmd_deploy(args, cfg, C):
     # against an old tarkov.dll -- is its own class of confusing bug, so if any
     # selected artifact is bad, nothing moves.
     rc = cmd_check(args, cfg, C)
+    if rc == 3:
+        # Not a failure -- but an artifact that was never built cannot be
+        # copied either, so the deploy still stops. The distinction matters
+        # for what you do next: supply the input, do not go rebuild.
+        print("\n%srefusing to deploy: INCONCLUSIVE, not failed.%s"
+              % (yellow, reset))
+        return 3
     if rc != 0:
         print("\n%srefusing to deploy.%s" % (red, reset))
         return 1

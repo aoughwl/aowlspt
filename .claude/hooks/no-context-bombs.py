@@ -23,8 +23,15 @@ cap. That is why this is a hook and the rest of the discipline is a skill.
 
 Deliberately NOT blocked
 ------------------------
-* Writing, copying, deleting or deploying these files. Only readers match.
+* Writing, copying, moving, deleting or deploying these files. Only READERS match.
 * `ls`, `stat`, `wc`, `du`, `Get-Item` on them -- those are the right way to size a file.
+* A read that STATES ITS OWN BOUND: `tail -n 40`, `head -n 20`, `-Tail 50` on a
+  line-oriented file, or `head -c N` for a small N on any file. This guard used
+  to block `tail -40 aowlspt-backend.log` -- forty lines -- and an agent got
+  past it by assembling the path out of a shell variable, which is exactly the
+  silent workaround the discipline warns about. A guard cheaper to evade than
+  to obey teaches evasion. A LINE bound does NOT count on a single-line file:
+  one line of db.json is 41 MB.
 * `aowlspt-host.log` (14 KB, 91 lines): `tail`/`grep` on it is fine; only a
   whole-file read is redirected to `tools/hostlog.py`.
 * Any command that invokes one of the safe accessors, even if a huge path
@@ -46,29 +53,32 @@ import sys
 #    lowercased) form of any path-looking token in the command.
 # --------------------------------------------------------------------------- #
 
+# Each entry carries `lines`: True when the file is LINE-ORIENTED, so a bounded
+# `tail -n N` / `head -n N` returns N lines and not the whole thing. False for
+# the single-line JSON blobs, where a one-line window IS the entire file.
 HUGE = [
-    # (regex on normalised path, human name, the accessor to use instead)
+    # (regex on normalised path, human name, the accessor to use instead, lines?)
     (r"(^|/)db\.json$", "db.json (41.3 MB, ONE line)",
      "python tools/bigjson.py keys D:/Aowlspt/aowlspt/db.json\n"
      "    python tools/bigjson.py find D:/Aowlspt/aowlspt/db.json --key <name>\n"
-     "    python tools/bigjson.py get  D:/Aowlspt/aowlspt/db.json --path <a.b.c>"),
+     "    python tools/bigjson.py get  D:/Aowlspt/aowlspt/db.json --path <a.b.c>", False),
     (r"(^|/)nettrace\.log$", "nettrace.log (3.1 MB, 42,107 lines)",
      "python tools/wirelog.py nettrace            # socket/route census\n"
-     "    python tools/wirelog.py nettrace --grep <term>   # capped grep"),
+     "    python tools/wirelog.py nettrace --grep <term>   # capped grep", True),
     (r"(^|/)aowlspt-backend\.log$", "aowlspt-backend.log (PROBE lines up to 6 KB each)",
      "python tools/wirelog.py summary             # boot + route census + faults\n"
      "    python tools/wirelog.py routes\n"
      "    python tools/wirelog.py route <route> [--full N]\n"
-     "    python tools/wirelog.py grep <regex>        # line-capped"),
+     "    python tools/wirelog.py grep <regex>        # line-capped", True),
     (r"/data/capture/", "a raid capture payload (50 MB over 705 files; 045.json is 18.3 MB on one line)",
      "python tools/bigjson.py keys <file>         # shape, not values\n"
      "    python tools/bigjson.py get  <file> --path <a.b.c>\n"
-     "    python tools/bsgwire.py scan <capture>      # classify bodies"),
+     "    python tools/bsgwire.py scan <capture>      # classify bodies", False),
     (r"/data/post1/(locale_[a-z]{2}|locations)\.json$",
      "a post1 data blob (locale_en.json 2.77 MB / locations.json 1.91 MB, ONE line each)",
      "python tools/bigjson.py keys <file>\n"
      "    python tools/bigjson.py search <file> --value <string>\n"
-     "    python tools/bigjson.py get <file> --path <a.b.c>"),
+     "    python tools/bigjson.py get <file> --path <a.b.c>", False),
 ]
 
 # Whole-file reads only; tail/grep on this one are fine (it is 14 KB).
@@ -159,10 +169,10 @@ def huge_hits(text, ignore_spans=()):
         if any(a <= tok.start() < b for a, b in ignore_spans):
             continue
         p = normalise(tok.group())
-        for rx, name, advice in HUGE:
+        for rx, name, advice, lines in HUGE:
             if re.search(rx, p) and name not in seen:
                 seen.add(name)
-                hits.append((name, advice))
+                hits.append((name, advice, lines))
     return hits
 
 
@@ -191,6 +201,43 @@ def refusal(what, why, instead):
 # --------------------------------------------------------------------------- #
 
 
+# A byte cap small enough that the result cannot itself be the bomb. 64 KB is
+# ~18k tokens: large, deliberate, and finite -- unlike `cat`.
+BYTE_CAP = 64 * 1024
+# Above this many lines a "bounded" read stops being bounded in any useful
+# sense: backend.log PROBE lines run to 6 KB each, so 200 of them is already
+# over a megabyte.
+LINE_CAP = 200
+
+LINE_BOUND = re.compile(
+    r"\b(?:head|tail)\b[^|;&]*?\s-(?:n\s*|-lines[= ])?(\d+)\b"
+    r"|-(?:Tail|TotalCount|First|Last)\s+(\d+)\b",
+    re.I,
+)
+BYTE_BOUND = re.compile(
+    r"\b(?:head|tail)\b[^|;&]*?\s-(?:c\s*|-bytes[= ])(\d+)\b", re.I)
+
+
+def bounded_read(text, line_oriented):
+    """True when every reader in `text` states its own bound.
+
+    Two kinds of bound. A BYTE bound (`head -c N`) is honest about any file,
+    single-line or not. A LINE bound (`tail -n 40`) only bounds a file that has
+    lines -- on db.json, one line is 41 MB -- so it counts only when the target
+    is line-oriented. `head -c` with NO number is not a bound at all.
+    """
+    for m in BYTE_BOUND.finditer(text):
+        if int(m.group(1)) <= BYTE_CAP:
+            return True
+    if not line_oriented:
+        return False
+    for m in LINE_BOUND.finditer(text):
+        n = int(m.group(1) or m.group(2))
+        if 0 < n <= LINE_CAP:
+            return True
+    return False
+
+
 def check_bash(command):
     if not command.strip():
         return 0
@@ -216,7 +263,15 @@ def check_bash(command):
 
     hits = huge_hits(text, _grep_pattern_spans(text) if greps else ())
     if hits:
-        name, advice = hits[0]
+        name, advice, lines = hits[0]
+        # A read that is ALREADY BOUNDED is not a context bomb, and blocking it
+        # was this guard's own worst failure mode: `tail -40 aowlspt-backend.log`
+        # -- forty lines -- was refused, and an agent got past it by building the
+        # path out of a shell variable, which is precisely the silent workaround
+        # the discipline warns about. A guard that is cheaper to evade than to
+        # obey teaches evasion.
+        if reads_whole and bounded_read(text, lines):
+            return 0
         if greps and not reads_whole and CAPPED.search(text):
             return 0  # a capped grep cannot return the whole line
         why = (
@@ -257,7 +312,7 @@ def check_read(tool_input):
             "wait for the completion notification; it carries the agent's report.",
         ))
 
-    for rx, name, advice in HUGE:
+    for rx, name, advice, lines in HUGE:
         if re.search(rx, p):
             if tool_input.get("limit") and tool_input.get("offset") is not None:
                 # An explicit window is a deliberate act -- but on a ONE-LINE file

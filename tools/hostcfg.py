@@ -67,6 +67,11 @@ INT_KEYS = {
 }
 
 BOOL_CALL = re.compile(r'readBoolKey\(\s*"([A-Za-z0-9_]+)"')
+# String-valued flags go through `readStrKey`, a shape `scrape_keys` did not
+# know about at all, so every string key was invisible to this tool -- measured
+# missing: `launchProfileId` (aowlhost.nim) and `uxBetaOverlayPos`
+# (betanotice.nim). A key this tool cannot see is a key `set` refuses to write.
+STR_CALL = re.compile(r'readStrKey\(\s*"([A-Za-z0-9_]+)"')
 # `readStaticBridgeEnabled` does not go through `readBoolKey`; it builds its own
 # needle as the nim literal `"\"bridgeStaticRva\""`. Match that shape so a flag
 # read the hand-rolled way is still known here.
@@ -85,14 +90,24 @@ def host_sources(hostdir):
 
 
 def scrape_keys(hostdir):
-    """Every key name the host actually looks for. Bools + the three ints.
+    """Every key name the host actually looks for. Bools, strings, the ints.
 
-    Only files that name `aowlspt-host.json` are scraped. Without that filter
-    the same needle shapes match unrelated readers -- `modcontrol.nim` parses
-    the backend's mod-control JSON with the same helpers, and its `guid`,
-    `path`, `lib`, `schema` keys would be offered here as host flags. Accepting
-    a key the host will ignore is precisely the failure this tool prevents, so
-    a false positive is as bad as a missing one.
+    EVERY host .nim is scraped. This used to skip any file that did not itself
+    contain the literal `aowlspt-host.json`, on the stated grounds that the
+    needles would otherwise match `modcontrol.nim`, which parses the backend's
+    mod-control JSON. That justification was measured against the current
+    needles and does not hold: `modcontrol.nim` matches BOOL_CALL and
+    NEEDLE_LIT zero times, because those needles name `readBoolKey` /
+    `readStrKey` explicitly and those procs are the host-config readers and
+    nothing else. So the filter bought no false-positive protection while
+    silently costing correctness -- a host module that reads a flag but never
+    names the config file (the normal case for a module that is `include`d into
+    aowlhost.nim) would drop off this list entirely, and a flag this tool
+    cannot see is a flag `set` refuses to write.
+
+    Guarding by needle rather than by filename is also the stricter rule: it
+    keys on the reader proc actually being called, not on an unrelated string
+    happening to appear somewhere in the same file.
     """
     keys = {}
     files = host_sources(hostdir)
@@ -102,15 +117,23 @@ def scrape_keys(hostdir):
     for path in files:
         with open(path, "r", encoding="utf-8", errors="replace") as f:
             text = f.read()
-        if "aowlspt-host.json" not in text:
-            continue
-        scanned += 1
+        hit = False
         for m in BOOL_CALL.finditer(text):
             keys.setdefault(m.group(1), ("bool", os.path.basename(path)))
+            hit = True
         for m in NEEDLE_LIT.finditer(text):
             keys.setdefault(m.group(1), ("bool", os.path.basename(path)))
+            hit = True
+        for m in STR_CALL.finditer(text):
+            keys.setdefault(m.group(1), ("str", os.path.basename(path)))
+            hit = True
+        if hit:
+            scanned += 1
     if not scanned:
-        sys.exit("no host source under %s reads aowlspt-host.json" % hostdir)
+        sys.exit("no host source under %s reads a host-config key -- the "
+                 "readBoolKey/readStrKey needles matched nothing, which means "
+                 "the readers were renamed, not that there are no flags"
+                 % hostdir)
     # The three integers are read by dedicated procs with their own literals;
     # they are named explicitly, and asserted to still be present in the source.
     for k, _d in INT_KEYS.items():
@@ -180,7 +203,7 @@ def cmd_keys(args, keys, C):
     print("keys the host actually parses (scraped from %s):" % args.host)
     for k in sorted(keys):
         kind, where = keys[k]
-        d = INT_KEYS.get(k, "off")
+        d = INT_KEYS.get(k, '""' if kind == "str" else "off")
         print("  %-24s %-5s default %-8s %s%s%s"
               % (k, kind, d, DIM if C else "", where, RESET if C else ""))
     print("\n%d key(s). Anything not on this list is IGNORED by the host, "
@@ -247,6 +270,17 @@ def cmd_get(args, keys, C):
 
 
 def normalise(key, kind, val):
+    if kind == "str":
+        # Written back as a JSON string. Refuse anything needing escapes rather
+        # than emitting JSON we did not verify we can re-parse.
+        s = val.strip()
+        if s.startswith('"') and s.endswith('"') and len(s) >= 2:
+            s = s[1:-1]
+        if '"' in s or "\\" in s or "\n" in s or "\r" in s:
+            sys.exit("%s is a string key; %r contains a quote, backslash or "
+                     "newline and would need escaping -- edit the file by hand"
+                     % (key, val))
+        return '"%s"' % s
     v = val.strip().lower()
     if kind == "int":
         if not re.fullmatch(r"\d+", v):

@@ -103,6 +103,7 @@ type
     srcPath: string
     artDir: string
     artLib: string
+    shipped: bool
     sides: seq[string]
     requires: seq[string]
     conflicts: seq[string]
@@ -144,6 +145,20 @@ proc soft(what: string; condition: bool; detail = "") =
   else:
     inc gWarnings
     warn what
+    if detail.len > 0:
+      line "      " & detail
+
+proc softEither(whenTrue, whenFalse: string; condition: bool; detail = "") =
+  ## `soft`, but the warning line states the FINDING rather than the property
+  ## that was tested. `soft` printed `warn <id> is named by at least one list`
+  ## when the finding was the exact opposite -- so the one line an agent reads
+  ## said the reverse of the truth.
+  inc gChecks
+  if condition:
+    ok whenTrue
+  else:
+    inc gWarnings
+    warn whenFalse
     if detail.len > 0:
       line "      " & detail
 
@@ -213,6 +228,7 @@ proc readRegistry(text: string; mods: var seq[RegMod];
     for m in each(modsArr):
       var e = RegMod(id: "", name: "", author: "", version: "",
                      srcKind: "", srcPath: "", artDir: "", artLib: "",
+                     shipped: true,
                      sides: @[], requires: @[], conflicts: @[], loadAfter: @[])
       e.id = m.child("id").asText("")
       e.name = m.child("name").asText("")
@@ -222,6 +238,13 @@ proc readRegistry(text: string; mods: var seq[RegMod];
       e.srcPath = m.field("source.path").asText("")
       e.artDir = m.field("artifact.dir").asText("")
       e.artLib = m.field("artifact.library").asText("")
+      # `shipped` is the OPT-OUT this file used to only pretend to have. Absent
+      # means true, so every existing entry keeps its meaning; `false` says, in
+      # a field a tool can read, what several descriptions used to say only in
+      # prose -- "it is meant to be switched on by hand". Before this, that
+      # sentence was ignored and the warning fired anyway, which is a documented
+      # escape hatch that does nothing.
+      e.shipped = m.child("shipped").asBool(true)
       e.sides = idsOfArray(m.child("sides"))
       e.requires = idsOfObjectArray(m.child("requires"), "id")
       e.conflicts = idsOfObjectArray(m.child("conflicts"), "id")
@@ -607,11 +630,34 @@ proc checkRepo(repo: string): bool =
     inc i
 
   # 2. Every intree entry names a directory.
+  #
+  # There are two different failures hiding behind "no such directory", and
+  # collapsing them cost real time: an entry pointing at a directory that was
+  # renamed or deleted is broken, while an entry pointing OUTSIDE `mods/` --
+  # `aowl.callproof` at `examples/callproof` -- is a mod that builds fine and
+  # can never SHIP, because `aowl payload` stages the `mods/*` tree and nothing
+  # else. The manager offered it anyway. Say which one it is, in those words.
   heading "Entries against directories"
   for m in mods:
     if m.srcKind != "intree":
       note m.id & ": source.kind is \"" & m.srcKind & "\"; no directory " &
            "expected here"
+      continue
+    if not normSep(m.srcPath).startsWith("mods\\"):
+      # NOT SHIPPABLE. A `shipped: false` entry is saying so on purpose and is
+      # allowed; anything else is claiming to ship out of a tree the payload
+      # never stages.
+      check(m.id & " is marked non-shippable, as an out-of-tree entry must be",
+            not m.shipped,
+            "source.path is \"" & m.srcPath & "\", which is outside mods/, " &
+            "so `aowl payload` never stages it and this mod CANNOT SHIP -- " &
+            "the manager would offer a mod no install can ever have. Keep it " &
+            "as an in-tree experiment by adding \"shipped\": false to its " &
+            "entry, or move the source under mods/")
+      if not m.shipped:
+        note m.id & ": in-tree experiment at \"" & m.srcPath & "\" -- NOT " &
+             "SHIPPABLE by design (outside mods/, so `aowl payload` does not " &
+             "stage it), and marked \"shipped\": false to say so"
       continue
     var hit = false
     for s in srcs:
@@ -684,11 +730,22 @@ proc checkRepo(repo: string): bool =
     for l in lists:
       for e in l.entries:
         if e == m.id: named = true
-    soft(m.id & " is named by at least one list", named,
-         "it is in the registry and in no list, so selecting any list never " &
-         "selects it and the panel offers it only to somebody who already " &
-         "knows it exists. Add it to a list, or say in its `description` that " &
-         "it is meant to be switched on by hand")
+    if not m.shipped:
+      # The escape hatch, honoured. It used to be documented in prose ("it is
+      # meant to be switched on by hand", verbatim, in three descriptions) and
+      # ignored by this check, which is worse than having no hatch at all.
+      inc gChecks
+      note m.id & " is in no list, deliberately: its entry says " &
+           "\"shipped\": false, so it is switched on by hand"
+      continue
+    softEither(m.id & " is named by at least one list",
+               m.id & " is named by NO list",
+               named,
+               "it is in the registry and in no list, so selecting any list " &
+               "never selects it and the panel offers it only to somebody " &
+               "who already knows it exists. Add it to a list, or add " &
+               "\"shipped\": false to its entry -- a field this tool " &
+               "honours, unlike a sentence in `description`")
 
   result = gFailures == 0
 
