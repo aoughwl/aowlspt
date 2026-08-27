@@ -15,6 +15,10 @@
    "minBytes": 500000,
    "markers": [
     "aowlspt-host-il2cpp",
+    "float _Clarity;float _Vibrance;",
+    "float _Chroma;float _BloomThreshold;float2 _Res;",
+    "post GPU cost NOT MEASURED (no timestamp query yet)",
+    "depth: DSV %ux%u fmt=%u bind=0x%X srv=%s fullres=%s",
     "nameIndex: loaded aowlspt-names.idx",
     "STALE INDEX -- aowlspt-names.idx",
     "host running",
@@ -277,7 +281,12 @@
     "Raid only (menu stays stock)",
     "Red-tint diagnostic",
     "Shadow lift (additive)",
-    "Blend of the tonemap look over the linear image."
+    "Blend of the tonemap look over the linear image.",
+    "cold-clinical",
+    "night-owl",
+    "Clarity (local contrast)",
+    "Shadow detail (toe lift)",
+    "Output dither (LSB)"
    ]
   },
   {

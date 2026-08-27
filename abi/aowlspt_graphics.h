@@ -100,6 +100,15 @@ typedef struct AowlGfxParams {
     float bloom;           /* 0/1 enable the bloom pre-pass */
     float diag;            /* 1 = red-tint blit test */
     float raidOnly;        /* 1 = grade only in-raid, pass-through in the menu */
+    /* --- look extensions (all LDR screen-space; see Post.hlsl) --- */
+    float clarity;         /* local-contrast unsharp, 0..1  (4 extra taps) */
+    float vibrance;        /* saturation weighted by 1-sat, 0..1 (0 ALU cost) */
+    float shadowDetail;    /* toe re-lift after contrast, 0..1 */
+    float grain;           /* animated film grain, shadow-weighted, 0..1 */
+    float grainSize;       /* grain cell size in pixels, >=1 */
+    float dither;          /* triangular-PDF dither in LSBs, 0..2 */
+    float chroma;          /* radial chromatic aberration, 0..1 (2 extra taps) */
+    float bloomThreshold;  /* bright-pass knee, 0..1 */
 } AowlGfxParams;
 
 static AowlGfxParams aowl_gfx_defaults(void) {
@@ -125,6 +134,16 @@ static AowlGfxParams aowl_gfx_defaults(void) {
     p.bloom = 1.0f;
     p.diag = 0.0f;
     p.raidOnly = 1.0f;           /* menu stays stock by default */
+    p.clarity = 0.25f;
+    p.vibrance = 0.30f;
+    p.shadowDetail = 0.25f;
+    p.grain = 0.15f;
+    p.grainSize = 1.5f;
+    p.dither = 1.0f;             /* on by default: it costs ~nothing and it is
+                                  * the only thing that kills 8-bit banding in
+                                  * dark interiors, which is most of Tarkov */
+    p.chroma = 0.0f;             /* off: tasteful means opt-in */
+    p.bloomThreshold = 0.70f;
     return p;
 }
 
@@ -188,6 +207,30 @@ typedef struct AowlGfxState {
     int32_t deviceReady;
     char    status[256];
 
+    /* --- GPU cost measurement (timestamp queries) -------------------
+     * The brief asks for a NUMBER, and a CPU-side stopwatch around a D3D11
+     * submit measures driver bookkeeping, not the pass. So: a disjoint +
+     * two timestamps, collected non-blocking on a LATER frame. While a
+     * query set is in flight we do not re-issue, so this samples
+     * periodically rather than every frame -- which is the point (issuing
+     * timestamps every frame is itself a cost). `gpuMs` is the last
+     * successful measurement; 0 means "never measured", NOT "free". */
+    ID3D11Query* qDisjoint;
+    ID3D11Query* qT0;
+    ID3D11Query* qT1;
+    int          qInFlight;
+    float        gpuMs;
+    int32_t      gpuSamples;
+
+    /* --- depth-buffer probe (see the SSAO note in the README) --------
+     * Free: aowl_gfx_save already asks OMGetRenderTargets for the DSV bound
+     * at Present. If a scene depth texture is still bound there AND it was
+     * created BIND_SHADER_RESOURCE, depth effects are reachable with no new
+     * hook at all. Recorded once, verbatim, so the answer is a measurement
+     * and not an opinion. */
+    int          depthProbed;
+    char         depthNote[160];
+
     /* runtime shader compiler */
     HMODULE d3dcompiler;
     AowlGfxD3DCompileFn compile;
@@ -228,7 +271,10 @@ static const char* AOWL_GFX_HLSL =
 "float _Temperature;float _Tint;float _Tonemapper;float _TonemapStrength;"
 "float _Lift;float _Gamma;float _Gain;float _Shadows;"
 "float _Highlights;float _Sharpness;float _Vignette;float _BloomStrength;"
-"float2 _TexelSize;float _VignetteRadius;float _Diag;float _GateAmount;}\n"
+"float2 _TexelSize;float _VignetteRadius;float _Diag;"
+"float _GateAmount;float _Time;float _Clarity;float _Vibrance;"
+"float _ShadowDetail;float _Grain;float _GrainSize;float _Dither;"
+"float _Chroma;float _BloomThreshold;float2 _Res;}\n"
 "Texture2D _Source:register(t0);Texture2D _Bloom:register(t1);SamplerState _Samp:register(s0);\n"
 "struct VSOut{float4 pos:SV_POSITION;float2 uv:TEXCOORD0;};\n"
 "VSOut VSMain(uint id:SV_VertexID){VSOut o;o.uv=float2((id<<1)&2,id&2);"
@@ -236,6 +282,8 @@ static const char* AOWL_GFX_HLSL =
 "float3 S2L(float3 c){return c<=0.04045?c/12.92:pow((c+0.055)/1.055,2.4);}\n"
 "float3 L2S(float3 c){c=saturate(c);return c<=0.0031308?c*12.92:1.055*pow(c,1.0/2.4)-0.055;}\n"
 "float Luma(float3 c){return dot(c,float3(0.2126,0.7152,0.0722));}\n"
+"float Hash21(float2 p){p=frac(p*float2(443.8975,441.4236));p+=dot(p,p.yx+19.19);"
+"return frac((p.x+p.y)*p.x);}\n"
 "static const float3x3 AgXin=float3x3(0.842479062253094,0.0784335999999992,0.0792237451477643,"
 "0.0423282422610123,0.878468636469772,0.0791661274605434,"
 "0.0423756549057051,0.0784336,0.879142973793104);\n"
@@ -249,24 +297,79 @@ static const char* AOWL_GFX_HLSL =
 "float3 ACES(float3 x){return saturate((x*(2.51*x+0.03))/(x*(2.43*x+0.59)+0.14));}\n"
 "float3 WB(float3 c,float t,float ti){float3 g=float3(1.0+t*0.20+ti*0.05,1.0-ti*0.10,1.0-t*0.20+ti*0.05);return c*g;}\n"
 "float3 LGG(float3 c,float l,float gp,float gn){c=c*gn+l;c=max(c,0.0);c=pow(c,max(1.0/max(gp,1e-3),1e-3));return c;}\n"
+/* ---- CAS: unchanged AMD-style contrast-adaptive sharpen. Adaptive by
+ * construction, so it does not ring on already-crisp edges the way a fixed
+ * unsharp mask does -- that is why it is the sharpener here and why the
+ * clarity pass below deliberately works at a much wider radius instead of
+ * stacking a second sharpen on the same frequencies. */
 "float3 CAS(float2 uv,float3 mid,float amt){if(amt<=0.0001)return mid;float2 t=_TexelSize;"
 "float3 a=_Source.Sample(_Samp,uv+float2(0,-t.y)).rgb;float3 b=_Source.Sample(_Samp,uv+float2(-t.x,0)).rgb;"
 "float3 d=_Source.Sample(_Samp,uv+float2(t.x,0)).rgb;float3 e=_Source.Sample(_Samp,uv+float2(0,t.y)).rgb;"
 "float3 mn=min(mid,min(min(a,b),min(d,e)));float3 mx=max(mid,max(max(a,b),max(d,e)));"
 "float3 amp=sqrt(saturate(min(mn,1.0-mx)/max(mx,1e-4)));float w=-amp*(amt*0.2+0.05);"
 "return saturate((mid+(a+b+d+e)*w)/(1.0+4.0*w));}\n"
+/* ---- Clarity: midtone local contrast (unsharp against a wide 4-tap low
+ * pass). This is the knob that makes a flat, hazy Tarkov frame read as
+ * three-dimensional. Masked to peak at mid grey and fall to zero at both
+ * ends, so it cannot crush blacks or blow highlights. 4 extra taps. */
+"float3 Clarity(float2 uv,float3 c,float amt){if(amt<=0.0001)return c;"
+"float2 t=_TexelSize*7.0;"
+"float3 lo=_Source.Sample(_Samp,uv+float2( t.x, t.y)).rgb;"
+"lo+=_Source.Sample(_Samp,uv+float2(-t.x, t.y)).rgb;"
+"lo+=_Source.Sample(_Samp,uv+float2( t.x,-t.y)).rgb;"
+"lo+=_Source.Sample(_Samp,uv+float2(-t.x,-t.y)).rgb;lo*=0.25;"
+"float l=Luma(c);float dl=l-Luma(lo);float mask=1.0-abs(l*2.0-1.0);"
+"return saturate(c+dl*amt*1.6*mask);}\n"
+/* ---- Vibrance: saturation weighted by (1 - existing saturation). Grey,
+ * washed-out things gain; already-saturated things (foliage, flares, a hit
+ * marker) do not, so the frame gains colour separation without the neon
+ * foliage a flat saturation multiplier gives. */
+"float3 Vibrance(float3 c,float amt){if(abs(amt)<=0.0001)return c;"
+"float mx=max(c.r,max(c.g,c.b));float mn=min(c.r,min(c.g,c.b));"
+"float sat=saturate(mx-mn);float l=Luma(c);"
+"return lerp(l.xxx,c,1.0+amt*(1.0-sat));}\n"
+/* ---- Chromatic aberration: radial, red/blue only, exactly zero at the
+ * screen centre so it never smears what you are aiming at. Off by default;
+ * tasteful means opt-in. 2 extra taps. */
+"float3 Chroma(float2 uv,float3 c,float amt){if(amt<=0.0001)return c;"
+"float2 d=(uv-0.5)*amt*0.0035;"
+"c.r=_Source.Sample(_Samp,uv+d).r;c.b=_Source.Sample(_Samp,uv-d).b;return c;}\n"
 "float4 PSMain(VSOut i):SV_Target{float3 src=_Source.Sample(_Samp,i.uv).rgb;"
 "if(_Enabled<0.5)return float4(src,1.0);if(_Diag>0.5)return float4(lerp(src,float3(1,0,0),0.5),1.0);"
-"float3 c=CAS(i.uv,src,_Sharpness);c=S2L(c);c*=exp2(_Exposure);"
+"float3 c=CAS(i.uv,src,_Sharpness);"
+"c=Clarity(i.uv,c,_Clarity);"
+"c=Chroma(i.uv,c,_Chroma);"
+"c=S2L(c);c*=exp2(_Exposure);"
 "float hl=Luma(c);c*=lerp(1.0,1.0/max(_Highlights,0.01),saturate(hl-0.5)*(1.0-1.0/max(_Highlights,1.0)));"
 "c+=_Shadows;c=WB(c,_Temperature,_Tint);float3 bl=_Bloom.Sample(_Samp,i.uv).rgb;c+=bl*_BloomStrength;"
 "float3 m=c;if(_Tonemapper>1.5)m=ACES(c);else if(_Tonemapper>0.5)m=AgX(c);c=lerp(c,m,saturate(_TonemapStrength));c=saturate(c);"
-"c=LGG(c,_Lift,_Gamma,_Gain);c=(c-0.18)*_Contrast+0.18;c=max(c,0.0);"
+"c=LGG(c,_Lift,_Gamma,_Gain);"
+/* Contrast around 18% grey, then re-lift ONLY the toe. A straight contrast
+ * multiply is exactly what crushes the shadow detail you need to see a
+ * player standing in a doorway; _ShadowDetail buys that back without
+ * lifting the whole image into milk the way a global `lift` does. */
+"float3 pre=c;c=(c-0.18)*_Contrast+0.18;c=max(c,0.0);"
+"float3 toe=1.0-smoothstep(0.0,0.14,pre);c+=toe*_ShadowDetail*0.045;"
 "float l=Luma(c);c=lerp(l.xxx,c,_Saturation);"
+"c=Vibrance(c,_Vibrance);"
 "float2 dd=i.uv-0.5;float vig=1.0-_Vignette*smoothstep(_VignetteRadius*0.5,_VignetteRadius,length(dd)*1.4142);c*=saturate(vig);"
-"return float4(lerp(src,L2S(c),_GateAmount),1.0);}\n"
+"float3 outc=L2S(c);"
+/* Grain: animated, weighted toward the shadows -- which is both where real
+ * film grain lives and where 8-bit banding lives, so one effect does two
+ * jobs at once. */
+"if(_Grain>0.0001){float2 gp=floor(i.uv*_Res/max(_GrainSize,1.0))+floor(_Time*24.0)*17.0;"
+"float n=Hash21(gp)-0.5;float w=1.0-smoothstep(0.0,0.55,Luma(outc));"
+"outc=saturate(outc+n*_Grain*0.09*(0.25+w));}\n"
+/* Dither: triangular-PDF noise at ~1 LSB before the 8-bit write. The
+ * cheapest real win in the stack -- every gradient built in linear above is
+ * quantised on the way out, and dark Tarkov interiors are almost entirely
+ * gradient. */
+"if(_Dither>0.0001){float2 dp=i.uv*_Res;"
+"float n1=Hash21(dp+_Time);float n2=Hash21(dp+_Time+41.7);"
+"outc=saturate(outc+(n1-n2)*(_Dither/255.0));}\n"
+"return float4(lerp(src,outc,_GateAmount),1.0);}\n"
 "float4 PSBright(VSOut i):SV_Target{float3 c=S2L(_Source.Sample(_Samp,i.uv).rgb);float l=Luma(c);"
-"return float4(c*smoothstep(0.7,1.05,l),1.0);}\n"
+"return float4(c*smoothstep(_BloomThreshold,_BloomThreshold+0.35,l),1.0);}\n"
 "float4 PSBlur(VSOut i):SV_Target{float2 dir=_TexelSize;float3 s=_Source.Sample(_Samp,i.uv).rgb*0.227027;"
 "float2 o1=dir*1.3846153846;float2 o2=dir*3.2307692308;"
 "s+=_Source.Sample(_Samp,i.uv+o1).rgb*0.3162162162;s+=_Source.Sample(_Samp,i.uv-o1).rgb*0.3162162162;"
@@ -284,12 +387,35 @@ static void aowl_gfx_fail(const char* why) {
 }
 
 static int32_t aowl_gfx_running(void) { return g_gfx.started && !g_gfx.broken; }
+/* Measured GPU milliseconds for the whole post chain, x1000 so it crosses the
+ * int32 host boundary without a float. -1 = never measured (which is NOT the
+ * same as "free"). */
+static int32_t aowl_gfx_gpu_us(void) {
+    return g_gfx.gpuSamples ? (int32_t)(g_gfx.gpuMs * 1000.0f) : -1;
+}
 static int32_t aowl_gfx_frames(void)  { return g_gfx.frames; }
+static int32_t aowl_gfx_depth_note(char* buf, int32_t cap);
+
+/* The status line the host logs. It carries the two things that must never be
+ * guessed at: the MEASURED GPU cost of the whole post chain, and the depth
+ * probe verdict. Both say plainly when they have no answer -- "not measured"
+ * and "not probed yet" are distinct from a number and from a no. */
 static int32_t aowl_gfx_status(char* buf, int32_t cap) {
     if (!buf || cap <= 0) return 0;
-    int32_t n = (int32_t)strlen(g_gfx.status);
+    char depth[160];
+    aowl_gfx_depth_note(depth, (int32_t)sizeof(depth));
+    int32_t us = aowl_gfx_gpu_us();
+    char line[640];
+    if (us >= 0)
+        _snprintf(line, sizeof(line) - 1, "%s | post %d.%03d ms GPU (measured, %d samples) | %s",
+                  g_gfx.status, us / 1000, us % 1000, (int)g_gfx.gpuSamples, depth);
+    else
+        _snprintf(line, sizeof(line) - 1, "%s | post GPU cost NOT MEASURED (no timestamp query yet) | %s",
+                  g_gfx.status, depth);
+    line[sizeof(line) - 1] = 0;
+    int32_t n = (int32_t)strlen(line);
     if (n >= cap) n = cap - 1;
-    memcpy(buf, g_gfx.status, (size_t)n);
+    memcpy(buf, line, (size_t)n);
     buf[n] = 0;
     return n;
 }
@@ -357,6 +483,14 @@ static void aowl_gfx_set_params_json(const char* json) {
     aowl_gfx_jnum(json, "bloom",           &p.bloom);
     aowl_gfx_jnum(json, "diag",            &p.diag);
     aowl_gfx_jnum(json, "raidOnly",        &p.raidOnly);
+    aowl_gfx_jnum(json, "clarity",         &p.clarity);
+    aowl_gfx_jnum(json, "vibrance",        &p.vibrance);
+    aowl_gfx_jnum(json, "shadowDetail",    &p.shadowDetail);
+    aowl_gfx_jnum(json, "grain",           &p.grain);
+    aowl_gfx_jnum(json, "grainSize",       &p.grainSize);
+    aowl_gfx_jnum(json, "dither",          &p.dither);
+    aowl_gfx_jnum(json, "chroma",          &p.chroma);
+    aowl_gfx_jnum(json, "bloomThreshold",  &p.bloomThreshold);
     aowl_gfx_set_params(&p);
 }
 
@@ -411,12 +545,24 @@ static int aowl_gfx_make_pipeline(void) {
     }
 
     D3D11_BUFFER_DESC bd; memset(&bd, 0, sizeof(bd));
-    bd.ByteWidth = sizeof(float) * 24;   /* 6 float4 registers */
+    bd.ByteWidth = sizeof(float) * 36;   /* 9 float4 registers */
     bd.Usage = D3D11_USAGE_DYNAMIC;
     bd.BindFlags = D3D11_BIND_CONSTANT_BUFFER;
     bd.CPUAccessFlags = D3D11_CPU_ACCESS_WRITE;
     if (FAILED(ID3D11Device_CreateBuffer(g_gfx.dev, &bd, NULL, &g_gfx.cb))) {
         aowl_gfx_fail("CreateBuffer(cb) failed"); return 0;
+    }
+
+    /* GPU timestamp queries. Deliberately NOT fatal: a driver that refuses
+     * them costs us the measurement, not the feature. gpuMs then stays 0 and
+     * the status line says "not measured" rather than inventing a number. */
+    {
+        D3D11_QUERY_DESC qd; memset(&qd, 0, sizeof(qd));
+        qd.Query = D3D11_QUERY_TIMESTAMP_DISJOINT;
+        ID3D11Device_CreateQuery(g_gfx.dev, &qd, &g_gfx.qDisjoint);
+        qd.Query = D3D11_QUERY_TIMESTAMP;
+        ID3D11Device_CreateQuery(g_gfx.dev, &qd, &g_gfx.qT0);
+        ID3D11Device_CreateQuery(g_gfx.dev, &qd, &g_gfx.qT1);
     }
 
     D3D11_BLEND_DESC bl; memset(&bl, 0, sizeof(bl));
@@ -550,6 +696,64 @@ static void aowl_gfx_save(ID3D11DeviceContext* c, AowlGfxSaved* s) {
     ID3D11DeviceContext_IAGetVertexBuffers(c, 0, 1, &s->vb, &s->vbStride, &s->vbOffset);
 }
 
+/* Settle the depth question with a measurement instead of a claim.
+ *
+ * `aowl_gfx_save` asks OMGetRenderTargets for whatever depth-stencil view is
+ * bound at Present. If a real, full-resolution scene depth texture is still
+ * bound there and it carries D3D11_BIND_SHADER_RESOURCE, then SSAO / fog /
+ * DoF are reachable from this exact hook with NO new hook and no interception
+ * of the device context. If the DSV is NULL, or the texture is not
+ * SRV-bindable, then it is not reachable this way and the ReShade-style route
+ * (intercepting ID3D11Device::CreateTexture2D to add BIND_SHADER_RESOURCE and
+ * promote the format to typeless, plus tracking clears) is the only option --
+ * a much larger, per-draw-call write into the game's renderer.
+ *
+ * Recorded ONCE, verbatim, into the status line. Three outcomes, not two:
+ * "no DSV bound", "DSV bound but not SRV-bindable", "DSV bound, SRV-bindable".
+ * Nothing here binds, reads or modifies the depth buffer -- it only reports a
+ * descriptor. */
+static void aowl_gfx_probe_depth(ID3D11DepthStencilView* dsv, UINT bbW, UINT bbH) {
+    if (g_gfx.depthProbed) return;
+    g_gfx.depthProbed = 1;
+    if (!dsv) {
+        strcpy(g_gfx.depthNote, "depth: NO DSV bound at Present -> not reachable from this hook");
+        return;
+    }
+    ID3D11Resource* res = NULL;
+    ID3D11DepthStencilView_GetResource(dsv, &res);
+    if (!res) {
+        strcpy(g_gfx.depthNote, "depth: DSV bound but GetResource failed -> INCONCLUSIVE");
+        return;
+    }
+    ID3D11Texture2D* tex = NULL;
+    static const GUID IID_T2D =
+        { 0x6f15aaf2, 0xd208, 0x4e89, { 0x9a, 0xb4, 0x48, 0x95, 0x35, 0xd3, 0x4f, 0x9c } };
+    if (FAILED(ID3D11Resource_QueryInterface(res, &IID_T2D, (void**)&tex)) || !tex) {
+        ID3D11Resource_Release(res);
+        strcpy(g_gfx.depthNote, "depth: DSV resource is not a Texture2D -> INCONCLUSIVE");
+        return;
+    }
+    D3D11_TEXTURE2D_DESC td; ID3D11Texture2D_GetDesc(tex, &td);
+    _snprintf(g_gfx.depthNote, sizeof(g_gfx.depthNote) - 1,
+              "depth: DSV %ux%u fmt=%u bind=0x%X srv=%s fullres=%s",
+              (unsigned)td.Width, (unsigned)td.Height, (unsigned)td.Format,
+              (unsigned)td.BindFlags,
+              (td.BindFlags & D3D11_BIND_SHADER_RESOURCE) ? "YES" : "no",
+              (td.Width == bbW && td.Height == bbH) ? "yes" : "no");
+    g_gfx.depthNote[sizeof(g_gfx.depthNote) - 1] = 0;
+    ID3D11Texture2D_Release(tex);
+    ID3D11Resource_Release(res);
+}
+
+static int32_t aowl_gfx_depth_note(char* buf, int32_t cap) {
+    if (!buf || cap <= 0) return 0;
+    const char* s = g_gfx.depthProbed ? g_gfx.depthNote : "depth: not probed yet (no frame graded)";
+    int32_t l = (int32_t)strlen(s);
+    if (l >= cap) l = cap - 1;
+    memcpy(buf, s, (size_t)l); buf[l] = 0;
+    return l;
+}
+
 static void aowl_gfx_restore(ID3D11DeviceContext* c, AowlGfxSaved* s) {
     ID3D11DeviceContext_RSSetViewports(c, s->vpN, s->vp);
     ID3D11DeviceContext_OMSetRenderTargets(c, D3D11_SIMULTANEOUS_RENDER_TARGET_COUNT, s->rtvs, s->dsv);
@@ -582,7 +786,7 @@ static void aowl_gfx_restore(ID3D11DeviceContext* c, AowlGfxSaved* s) {
 }
 
 static void aowl_gfx_upload_cb(const AowlGfxParams* p, float texW, float texH,
-                               float gate) {
+                               float gate, float timeSec) {
     D3D11_MAPPED_SUBRESOURCE m;
     if (FAILED(ID3D11DeviceContext_Map(g_gfx.ctx, (ID3D11Resource*)g_gfx.cb, 0,
                                        D3D11_MAP_WRITE_DISCARD, 0, &m))) return;
@@ -592,7 +796,10 @@ static void aowl_gfx_upload_cb(const AowlGfxParams* p, float texW, float texH,
     f[8]=p->lift; f[9]=p->gamma; f[10]=p->gain; f[11]=p->shadows;
     f[12]=p->highlights; f[13]=p->sharpness; f[14]=p->vignette; f[15]=p->bloomStrength;
     f[16]=1.0f/texW; f[17]=1.0f/texH; f[18]=p->vignetteRadius; f[19]=p->diag;
-    f[20]=gate; f[21]=0.0f; f[22]=0.0f; f[23]=0.0f;
+    f[20]=gate;          f[21]=timeSec;        f[22]=p->clarity;    f[23]=p->vibrance;
+    f[24]=p->shadowDetail;f[25]=p->grain;       f[26]=p->grainSize;  f[27]=p->dither;
+    f[28]=p->chroma;      f[29]=p->bloomThreshold; f[30]=texW;       f[31]=texH;
+    f[32]=0.0f; f[33]=0.0f; f[34]=0.0f; f[35]=0.0f;
     ID3D11DeviceContext_Unmap(g_gfx.ctx, (ID3D11Resource*)g_gfx.cb, 0);
 }
 
@@ -695,8 +902,46 @@ static void aowl_gfx_render(IDXGISwapChain* sc) {
     }
     ID3D11DeviceContext* c = g_gfx.ctx;
 
+    /* Wall clock in seconds, for the animated grain/dither. Monotonic and
+     * wrapped so the float never loses precision in a long session. */
+    float tsec;
+    {
+        LARGE_INTEGER f, t;
+        QueryPerformanceFrequency(&f); QueryPerformanceCounter(&t);
+        tsec = (float)((double)(t.QuadPart % (f.QuadPart * 3600)) / (double)f.QuadPart);
+    }
+
     AowlGfxSaved saved;
     aowl_gfx_save(c, &saved);
+    aowl_gfx_probe_depth(saved.dsv, g_gfx.bbW, g_gfx.bbH);
+
+    /* Collect a previously-issued timing window, non-blocking; only issue a
+     * new one when none is in flight. Issuing timestamps every frame is itself
+     * a measurable cost, so this samples rather than instruments. */
+    int timing = 0;
+    if (g_gfx.qDisjoint && g_gfx.qT0 && g_gfx.qT1) {
+        if (g_gfx.qInFlight) {
+            D3D11_QUERY_DATA_TIMESTAMP_DISJOINT dj; UINT64 a = 0, b = 0;
+            if (ID3D11DeviceContext_GetData(c, (ID3D11Asynchronous*)g_gfx.qDisjoint,
+                    &dj, sizeof(dj), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK &&
+                ID3D11DeviceContext_GetData(c, (ID3D11Asynchronous*)g_gfx.qT0,
+                    &a, sizeof(a), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK &&
+                ID3D11DeviceContext_GetData(c, (ID3D11Asynchronous*)g_gfx.qT1,
+                    &b, sizeof(b), D3D11_ASYNC_GETDATA_DONOTFLUSH) == S_OK) {
+                g_gfx.qInFlight = 0;
+                if (!dj.Disjoint && dj.Frequency && b > a) {
+                    float ms = (float)((double)(b - a) * 1000.0 / (double)dj.Frequency);
+                    /* exponential average -- one frame is not a number */
+                    g_gfx.gpuMs = g_gfx.gpuSamples ? (g_gfx.gpuMs * 0.9f + ms * 0.1f) : ms;
+                    g_gfx.gpuSamples++;
+                }
+            }
+        } else {
+            ID3D11DeviceContext_Begin(c, (ID3D11Asynchronous*)g_gfx.qDisjoint);
+            ID3D11DeviceContext_End(c, (ID3D11Asynchronous*)g_gfx.qT0);
+            timing = 1;
+        }
+    }
 
     /* snapshot the finished frame into the sampleable copy */
     ID3D11DeviceContext_CopyResource(c, (ID3D11Resource*)g_gfx.sceneCopy, (ID3D11Resource*)bb);
@@ -707,21 +952,27 @@ static void aowl_gfx_render(IDXGISwapChain* sc) {
         UINT hw = g_gfx.bbW / 2 > 0 ? g_gfx.bbW / 2 : 1;
         UINT hh = g_gfx.bbH / 2 > 0 ? g_gfx.bbH / 2 : 1;
         /* bright pass: sceneCopy -> bloomA (texel size = full res source) */
-        aowl_gfx_upload_cb(&p, (float)g_gfx.bbW, (float)g_gfx.bbH, gate);
+        aowl_gfx_upload_cb(&p, (float)g_gfx.bbW, (float)g_gfx.bbH, gate, tsec);
         aowl_gfx_fullscreen(c, g_gfx.psBright, g_gfx.bloomARtv, g_gfx.sceneSrv, NULL, hw, hh);
         /* blur H: bloomA -> bloomB (texel = half res, x only) */
         AowlGfxParams hp = p; /* reuse cb, but blur reads _TexelSize as direction */
-        aowl_gfx_upload_cb(&hp, (float)hw, 1.0e30f, gate);   /* 1/x = 1/hw, 1/y ~ 0 => horizontal */
+        aowl_gfx_upload_cb(&hp, (float)hw, 1.0e30f, gate, tsec);  /* 1/x = 1/hw, 1/y ~ 0 => horizontal */
         aowl_gfx_fullscreen(c, g_gfx.psBlur, g_gfx.bloomBRtv, g_gfx.bloomASrv, NULL, hw, hh);
         /* blur V: bloomB -> bloomA (y only) */
-        aowl_gfx_upload_cb(&hp, 1.0e30f, (float)hh, gate);
+        aowl_gfx_upload_cb(&hp, 1.0e30f, (float)hh, gate, tsec);
         aowl_gfx_fullscreen(c, g_gfx.psBlur, g_gfx.bloomARtv, g_gfx.bloomBSrv, NULL, hw, hh);
     }
 
     /* main pass: sceneCopy (+ bloomA) -> back buffer */
-    aowl_gfx_upload_cb(&p, (float)g_gfx.bbW, (float)g_gfx.bbH, gate);
+    aowl_gfx_upload_cb(&p, (float)g_gfx.bbW, (float)g_gfx.bbH, gate, tsec);
     aowl_gfx_fullscreen(c, g_gfx.psMain, g_gfx.bbRtv, g_gfx.sceneSrv,
                         doBloom ? g_gfx.bloomASrv : g_gfx.blackSrv, g_gfx.bbW, g_gfx.bbH);
+
+    if (timing) {
+        ID3D11DeviceContext_End(c, (ID3D11Asynchronous*)g_gfx.qT1);
+        ID3D11DeviceContext_End(c, (ID3D11Asynchronous*)g_gfx.qDisjoint);
+        g_gfx.qInFlight = 1;
+    }
 
     aowl_gfx_restore(c, &saved);
     g_gfx.frames++;
@@ -881,6 +1132,11 @@ static void aowl_gfx_stop(void) {
     if (g_gfx.blackSrv) { ID3D11ShaderResourceView_Release(g_gfx.blackSrv); g_gfx.blackSrv = NULL; }
     if (g_gfx.samp)     { ID3D11SamplerState_Release(g_gfx.samp); g_gfx.samp = NULL; }
     if (g_gfx.cb)       { ID3D11Buffer_Release(g_gfx.cb); g_gfx.cb = NULL; }
+    if (g_gfx.qDisjoint){ ID3D11Query_Release(g_gfx.qDisjoint); g_gfx.qDisjoint = NULL; }
+    if (g_gfx.qT0)      { ID3D11Query_Release(g_gfx.qT0); g_gfx.qT0 = NULL; }
+    if (g_gfx.qT1)      { ID3D11Query_Release(g_gfx.qT1); g_gfx.qT1 = NULL; }
+    g_gfx.qInFlight = 0; g_gfx.gpuSamples = 0; g_gfx.gpuMs = 0.0f;
+    g_gfx.depthProbed = 0; g_gfx.depthNote[0] = 0;
     if (g_gfx.blendOff) { ID3D11BlendState_Release(g_gfx.blendOff); g_gfx.blendOff = NULL; }
     if (g_gfx.depthOff) { ID3D11DepthStencilState_Release(g_gfx.depthOff); g_gfx.depthOff = NULL; }
     if (g_gfx.rast)     { ID3D11RasterizerState_Release(g_gfx.rast); g_gfx.rast = NULL; }
