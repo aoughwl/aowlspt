@@ -301,4 +301,79 @@ extern int32_t     aowl_wg_rg_disabled(void);
 extern int32_t     aowl_wg_rg_throttled(void);
 extern int32_t     aowl_wg_rg_armed(void);
 
+/* ================================================================== *
+ * 4. THE BREADCRUMB
+ *
+ * WHY THIS EXISTS. The overlay's per-frame body runs under ONE `aowl_p_p_seh`.
+ * That guard is doing its job -- a fault costs a skipped refresh and the client
+ * is unaffected -- but the report it produced said only "fault #1 caught by the
+ * VEH guard". That is a fault report with NO LOCATION, and it cost a live
+ * session: the panel drew nothing, self-disabled after eight faults, and the
+ * log could not say which of forty steps had died.
+ *
+ * A guard cannot tell you where it caught something, because the stack is gone
+ * by the time it regains control. So the body leaves a trail instead: one plain
+ * `int32_t` store per stage, into a file-scope variable that SURVIVES the
+ * longjmp because it is neither on the stack nor in a register. After the guard
+ * returns null, the handler reads the last crumb and names the stage.
+ *
+ * The cost is one aligned 4-byte store per stage on a throttled refresh. That
+ * is not a per-frame cost worth optimising and it must not be made conditional:
+ * a breadcrumb you have to turn on is a breadcrumb that is off when you need it.
+ *
+ * `aowl_wg_crumb_widget` is the second half: it names WHICH widget the body was
+ * rendering, so a single misbehaving widget can be identified and skipped
+ * rather than taking the whole overlay dark with it.
+ * ================================================================== */
+
+enum {
+    AOWL_WG_CRUMB_NONE      = 0,
+    AOWL_WG_CRUMB_ENTER     = 1,
+    AOWL_WG_CRUMB_TOGGLE    = 2,
+    AOWL_WG_CRUMB_BUILD     = 3,
+    AOWL_WG_CRUMB_SCANWORLD = 4,
+    AOWL_WG_CRUMB_MOUSE     = 5,
+    AOWL_WG_CRUMB_EDITKEYS  = 6,
+    AOWL_WG_CRUMB_DRAG      = 7,
+    AOWL_WG_CRUMB_WTEXT     = 8,   /* composing a widget's text        */
+    AOWL_WG_CRUMB_WPLACE    = 9,   /* duPlace on a widget              */
+    AOWL_WG_CRUMB_WSTYLE    = 10,
+    AOWL_WG_CRUMB_WSETTEXT  = 11,
+    AOWL_WG_CRUMB_WSHOW     = 12,
+    AOWL_WG_CRUMB_BANNER    = 13,
+    AOWL_WG_CRUMB_HIDEREST  = 14,
+    AOWL_WG_CRUMB_MARKERS   = 15,
+    AOWL_WG_CRUMB_DONE      = 16
+};
+
+static volatile int32_t aowl_wg_crumb_stage  = 0;
+static volatile int32_t aowl_wg_crumb_widget = -1;
+
+static void aowl_wg_crumb(int32_t stage) { aowl_wg_crumb_stage = stage; }
+static void aowl_wg_crumb_w(int32_t idx) { aowl_wg_crumb_widget = idx; }
+static int32_t aowl_wg_crumb_get(void)   { return aowl_wg_crumb_stage; }
+static int32_t aowl_wg_crumb_get_w(void) { return aowl_wg_crumb_widget; }
+
+static const char* aowl_wg_crumb_text(int32_t s) {
+    switch (s) {
+    case AOWL_WG_CRUMB_ENTER:     return "entering the body";
+    case AOWL_WG_CRUMB_TOGGLE:    return "reading the toggle key";
+    case AOWL_WG_CRUMB_BUILD:     return "duBuild (cloning the label pool)";
+    case AOWL_WG_CRUMB_SCANWORLD: return "duScanWorld (walking RegisteredPlayers)";
+    case AOWL_WG_CRUMB_MOUSE:     return "sampling the pointer";
+    case AOWL_WG_CRUMB_EDITKEYS:  return "edit-mode keys";
+    case AOWL_WG_CRUMB_DRAG:      return "the drag step";
+    case AOWL_WG_CRUMB_WTEXT:     return "composing a widget's text";
+    case AOWL_WG_CRUMB_WPLACE:    return "placing a widget (duPlace)";
+    case AOWL_WG_CRUMB_WSTYLE:    return "styling a widget (duStyle)";
+    case AOWL_WG_CRUMB_WSETTEXT:  return "writing a widget's text (duSetText)";
+    case AOWL_WG_CRUMB_WSHOW:     return "showing a widget (duShow)";
+    case AOWL_WG_CRUMB_BANNER:    return "the edit-mode banner";
+    case AOWL_WG_CRUMB_HIDEREST:  return "hiding unused labels";
+    case AOWL_WG_CRUMB_MARKERS:   return "the ESP markers";
+    case AOWL_WG_CRUMB_DONE:      return "finished (fault came from elsewhere)";
+    default:                      return "nothing recorded";
+    }
+}
+
 #endif /* AOWLSPT_WIDGET_H */

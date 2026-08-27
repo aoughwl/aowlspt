@@ -491,6 +491,27 @@ static const AowlDuTarget aowl_du_targets[] = {
 static int32_t aowl_du_verified = 0;
 static int32_t aowl_du_rejected = 0;
 
+/* PER-TARGET RESOLUTION STATE: 0 untried, 1 verified, 2 rejected.
+ *
+ * MEASURED DEFECT this fixes: `aowl_du_verified` was incremented on every
+ * SUCCESSFUL CALL to `aowl_du_fn`, but reported as though it were a count of
+ * distinct targets -- "%d of %d managed targets verified". Since the overlay
+ * calls `aowl_du_fn` repeatedly at runtime (every `duPlace` resolves four
+ * setters, every refresh), the left-hand number grew without bound while the
+ * right-hand one stayed at the table size. A live run printed
+ *
+ *     36 of 28 managed targets verified by RVA + prologue
+ *
+ * which is arithmetically impossible and therefore worthless as evidence in
+ * EITHER direction -- it can no longer be read as "all targets verified" nor as
+ * "something is wrong". The TOTAL was right; the left-hand number was the bug.
+ *
+ * The state array makes the counters mean what the message says: each target is
+ * counted exactly once, on its first resolution. It also removes a repeated
+ * VirtualQuery and prologue compare per call, which is a small bonus and not
+ * the point. */
+static unsigned char aowl_du_state[AOWL_DU_TARGET_COUNT];
+
 static void* aowl_du_fn(int32_t i) {
     HMODULE ga;
     const AowlDuTarget* t;
@@ -510,10 +531,11 @@ static void* aowl_du_fn(int32_t i) {
      * `aowlspt_prologue.h`. Symmetrical with the mode-text verifier: whichever
      * of the two features binds second must still be able to verify. */
     if (t->siglen > 0 && !aowl_pro_verify(t->rva, t->sig, t->siglen)) {
-        aowl_du_rejected++;
+        /* Counted ONCE, on first rejection. See `aowl_du_state`. */
+        if (aowl_du_state[i] == 0) { aowl_du_state[i] = 2; aowl_du_rejected++; }
         return NULL;
     }
-    aowl_du_verified++;
+    if (aowl_du_state[i] == 0) { aowl_du_state[i] = 1; aowl_du_verified++; }
     return (void*)p;
 }
 static const char* aowl_du_name(int32_t i) {
@@ -525,8 +547,18 @@ static uint32_t aowl_du_rva(int32_t i) {
     return aowl_du_targets[i].rva;
 }
 static int32_t aowl_du_target_count(void) { return AOWL_DU_TARGET_COUNT; }
+/* Distinct targets, never call counts. Both are now bounded by
+ * AOWL_DU_TARGET_COUNT by construction: a target transitions out of state 0
+ * exactly once, and only one of the two counters is incremented when it does.
+ * `ok + bad <= total` is therefore an invariant a reader may rely on. */
 static int32_t aowl_du_ok_count(void)     { return aowl_du_verified; }
 static int32_t aowl_du_bad_count(void)    { return aowl_du_rejected; }
+/* How many targets have been resolved AT ALL. `ok + bad < resolved_total` is
+ * impossible; a caller that wants to say "all verified" should compare
+ * `aowl_du_ok_count()` against `aowl_du_target_count()` and nothing else. */
+static int32_t aowl_du_tried_count(void)  {
+    return aowl_du_verified + aowl_du_rejected;
+}
 
 /* ------------------------------------------------------------------ *
  * The detour target: EFT.UI.PreloaderUI::Update

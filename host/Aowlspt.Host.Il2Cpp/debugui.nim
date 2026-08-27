@@ -188,6 +188,30 @@ proc cWgRgDisabled(): int32 {.importc: "aowl_wg_rg_disabled", nodecl.}
 proc cWgRgThrottled(): int32 {.importc: "aowl_wg_rg_throttled", nodecl.}
 proc cWgRgArmed(): int32 {.importc: "aowl_wg_rg_armed", nodecl.}
 
+proc cWgCrumb(stage: int32) {.importc: "aowl_wg_crumb", nodecl.}
+proc cWgCrumbW(idx: int32) {.importc: "aowl_wg_crumb_w", nodecl.}
+proc cWgCrumbGet(): int32 {.importc: "aowl_wg_crumb_get", nodecl.}
+proc cWgCrumbGetW(): int32 {.importc: "aowl_wg_crumb_get_w", nodecl.}
+proc cWgCrumbTextC(s: int32): cstring {.importc: "aowl_wg_crumb_text", nodecl.}
+
+const
+  WgCrumbEnter     = 1'i32
+  WgCrumbToggle    = 2'i32
+  WgCrumbBuild     = 3'i32
+  WgCrumbScanWorld = 4'i32
+  WgCrumbMouse     = 5'i32
+  WgCrumbEditKeys  = 6'i32
+  WgCrumbDrag      = 7'i32
+  WgCrumbWText     = 8'i32
+  WgCrumbWPlace    = 9'i32
+  WgCrumbWStyle    = 10'i32
+  WgCrumbWSetText  = 11'i32
+  WgCrumbWShow     = 12'i32
+  WgCrumbBanner    = 13'i32
+  WgCrumbHideRest  = 14'i32
+  WgCrumbMarkers   = 15'i32
+  WgCrumbDone      = 16'i32
+
 # ---- target indices, mirroring the AOWL_DU_* defines ----
 const
   DuCameraMain     = 0'i32
@@ -229,7 +253,12 @@ const
   cDuMaxPanelLines = 12    ## panel labels; the config picks which fields fill them
   cDuMaxMarkers    = 48    ## hard ceiling on ESP labels, whatever the config says
   cDuMaxPlayers    = 64    ## registered players read per pass
-  cDuMaxTextLen    = 160   ## characters written into one label
+  cDuMaxTextLen    = 1024  ## characters written into ONE label.
+    ## Was 160, which was right when a label held ONE line and wrong the moment
+    ## a widget became many. The profiler table alone is ~40 characters a row
+    ## over up to twelve rows, so 160 silently cut it off mid-row -- and a
+    ## truncated read-out that still looks like a read-out is the worst kind.
+    ## Still a hard cap, and `duSetText` still truncates rather than refusing.
 
 ## The `last` value a freshly cloned label starts at. It must be a string no
 ## real caption can equal, because `duSetText` short-circuits on unchanged text
@@ -831,28 +860,13 @@ proc duCloneLabel(anchor, rootGo: Il2CppPtr): DuLabel =
                    pAnchor: "", pX: 0.0, pY: 0.0, placed: false,
                    go: cloneGo, active: true)
 
-proc duAnchorVec(name: string; ax, ay, px, py: var float64) =
-  ## A corner name -> the anchorMin/anchorMax point on the parent (ax, ay) and
-  ## the pivot on the label itself (px, py). Setting anchorMin == anchorMax
-  ## collapses the label's rect to a POINT on the canvas, so `anchoredPosition`
-  ## is then a plain offset from that point; the pivot decides which corner of
-  ## the text sits there, which is what stops a top-right panel from hanging off
-  ## the right edge of the screen.
-  case name
-  of "topright":
-    ax = 1.0; ay = 1.0; px = 1.0; py = 1.0
-  of "bottomleft":
-    ax = 0.0; ay = 0.0; px = 0.0; py = 0.0
-  of "bottomright":
-    ax = 1.0; ay = 0.0; px = 1.0; py = 0.0
-  of "top":
-    ax = 0.5; ay = 1.0; px = 0.5; py = 1.0
-  of "bottom":
-    ax = 0.5; ay = 0.0; px = 0.5; py = 0.0
-  of "center":
-    ax = 0.5; ay = 0.5; px = 0.5; py = 0.5
-  else:                       # "topleft" and anything unrecognised
-    ax = 0.0; ay = 1.0; px = 0.0; py = 1.0
+# The widget model and ALL of its pure geometry live in `wgeom.nim`, which has
+# no game dependency of any kind -- no managed call, no IL2CPP pointer, no
+# Windows call. That is not tidiness: it is what lets `tests/wgeom_test.nim`
+# exercise the built-in placement path, the snap and the on-screen clamp against
+# a 0x0 and a 3840x2160 back buffer WITHOUT the client. The live faults this
+# overlay produced could not be reproduced any other way.
+include wgeom
 
 proc duPlace(lab: var DuLabel; anchorName: string; x, y: float64) =
   ## Anchor + pivot + offset, in that order. FOUR managed calls -- so a label
@@ -1366,74 +1380,6 @@ proc duPanelLine(field: string): string =
 # this section; see the note on `debugUiBodyImpl`.
 # ===========================================================================
 
-const
-  cDuMaxWidgets   = 12    ## hard ceiling; the label pool is built at this size
-  cDuMaxWidgetLines = 14  ## lines rendered into ONE widget label
-  cDuSnapPx       = 14.0  ## canvas units within which a snap engages
-  cDuSnapMargin   = 12.0  ## resting distance from a screen edge after a snap
-  cDuSnapGap      = 4.0   ## resting gap when a widget snaps to another widget
-
-type DuWidget = object
-  id: string            ## stable key: the config and the layout file use it
-  title: string         ## header line; "" draws no header
-  fields: string        ## comma-separated `duPanelLine` field names
-  on: bool              ## individually toggleable
-  anchor: string        ## topleft | topright | bottomleft | bottomright |
-                        ## top | bottom | center
-  x: float64            ## offset from that anchor, canvas units
-  y: float64            ## Unity Y grows UP, so a top anchor wants negative Y
-  w: float64            ## last rendered extent, canvas units -- for hit-test
-  h: float64
-  lines: int            ## last rendered line count
-  dragging: bool
-  grabDx: float64       ## cursor offset from the widget's pivot point at grab
-  grabDy: float64
-
-var gDuWidgets: seq[DuWidget] = @[]
-var gDuEdit = false           ## edit mode: widgets are draggable. DEFAULT OFF.
-var gDuEditLogged = false
-var gDuLayoutDirty = false
-var gDuLayoutSource = "built-in defaults"
-var gDuKeyRouteLogged = false
-
-## The built-in widget set. `id:title:fields` -- and the fields are exactly the
-## `duPanelLine` names the single-column panel already understood, so every
-## field that worked before still works, just grouped.
-const cDuDefaultWidgets = [
-  ("fps",     "FPS",      "fps,frametime"),
-  ("scene",   "SCENE",    "map,raid"),
-  ("pos",     "POSITION", "pos,rot"),
-  ("mem",     "MEMORY",   "mem"),
-  ("bots",    "BOTS",     "bots,botlist"),
-  ("prof",    "PROFILER", "region"),
-  ("build",   "BUILD",    "build,frame"),
-  ("notes",   "NOTES",    "note1,note2,note3")]
-
-proc duDefaultWidgetSpec(id: string; title, fields: var string): bool =
-  for i in 0 ..< cDuDefaultWidgets.len:
-    if cDuDefaultWidgets[i][0] == id:
-      title = cDuDefaultWidgets[i][1]
-      fields = cDuDefaultWidgets[i][2]
-      return true
-  title = id
-  fields = id
-  false
-
-## Where each widget starts life the very first time, before anything has been
-## dragged. Spread across the corners rather than stacked, so the first F3 shows
-## eight distinguishable widgets instead of one illegible pile.
-proc duDefaultPlace(id: string; anchor: var string; x, y: var float64) =
-  case id
-  of "fps":    anchor = "topleft";     x =  16.0; y =  -16.0
-  of "scene":  anchor = "topleft";     x =  16.0; y = -104.0
-  of "pos":    anchor = "topleft";     x =  16.0; y = -176.0
-  of "mem":    anchor = "topright";    x = -16.0; y =  -16.0
-  of "bots":   anchor = "bottomleft";  x =  16.0; y =  120.0
-  of "prof":   anchor = "topright";    x = -16.0; y =  -88.0
-  of "build":  anchor = "bottomleft";  x =  16.0; y =   16.0
-  of "notes":  anchor = "bottomright"; x = -16.0; y =   16.0
-  else:        anchor = "topleft";     x =  16.0; y =  -16.0
-
 # ---------------------------------------------------------------------------
 # Loading the widget layout
 #
@@ -1500,6 +1446,11 @@ proc duLoadWidgets() =
       w.y      = duCfgNum(lay,  "w." & id & ".y", w.y)
     built.add w
   gDuWidgets = built
+  # The fault vector is per-widget and must be the same length, or a fault
+  # charged after a config change would retire the wrong widget.
+  gDuWidgetFaults = @[]
+  for i in 0 ..< built.len:
+    gDuWidgetFaults.add 0
   gDuLayoutSource =
     (if haveLay: "aowlspt-debugui-layout.json (saved layout)"
      else: "built-in placement (no layout file yet)")
@@ -1581,153 +1532,6 @@ proc duCursorCanvas(cx, cy: var float64): bool =
   cx = float64(cWgMouseX()) / gDuCanvasScale
   cy = (ph - float64(cWgMouseY())) / gDuCanvasScale
   true
-
-proc duWidgetPivotPoint(w: DuWidget; cw, ch: float64;
-                        pxOut, pyOut: var float64) =
-  ## Where the widget's PIVOT sits, in canvas units. This is the point
-  ## `anchoredPosition` is measured from, so it is the one place the anchor and
-  ## the offset combine.
-  var ax = 0.0
-  var ay = 1.0
-  var px = 0.0
-  var py = 1.0
-  duAnchorVec(w.anchor, ax, ay, px, py)
-  pxOut = ax * cw + w.x
-  pyOut = ay * ch + w.y
-
-proc duWidgetRect(w: DuWidget; cw, ch: float64;
-                  l, t, r, b: var float64) =
-  ## The widget's box in canvas units: left, TOP, right, BOTTOM (Y-up, so
-  ## t > b). Uses the extent measured at the last render.
-  var ax = 0.0
-  var ay = 1.0
-  var px = 0.0
-  var py = 1.0
-  duAnchorVec(w.anchor, ax, ay, px, py)
-  var pvx = 0.0
-  var pvy = 0.0
-  duWidgetPivotPoint(w, cw, ch, pvx, pvy)
-  l = pvx - px * w.w
-  r = l + w.w
-  t = pvy + (1.0 - py) * w.h
-  b = t - w.h
-
-proc duWidgetSetTopLeft(w: var DuWidget; cw, ch, l, t: float64) =
-  ## The inverse of `duWidgetRect`: given an absolute top-left in canvas units,
-  ## write back the anchored offset for the widget's CURRENT anchor.
-  var ax = 0.0
-  var ay = 1.0
-  var px = 0.0
-  var py = 1.0
-  duAnchorVec(w.anchor, ax, ay, px, py)
-  w.x = (l + px * w.w) - ax * cw
-  w.y = (t - (1.0 - py) * w.h) - ay * ch
-
-proc duAbs(v: float64): float64 = (if v < 0.0: -v else: v)
-
-proc duNearestAnchor(l, t, cw, ch, wdt, hgt: float64;
-                     lockLeft, lockRight, lockTop, lockBottom: bool): string =
-  ## Which of the seven anchors this box should now be bound to. A snapped edge
-  ## DECIDES its axis; an unsnapped axis falls back to which third of the canvas
-  ## the box's centre is in.
-  ##
-  ## Rebinding rather than keeping the old anchor is the entire reason the saved
-  ## layout survives a resolution change: a widget dropped against the right
-  ## edge is stored as "right edge, minus 12", not as "x = 2436".
-  let cxm = l + wdt * 0.5
-  let cym = t - hgt * 0.5
-  var hz = 1                       # 0 left, 1 centre, 2 right
-  var vt = 1                       # 0 bottom, 1 centre, 2 top
-  if lockLeft: hz = 0
-  elif lockRight: hz = 2
-  elif cxm < cw / 3.0: hz = 0
-  elif cxm > cw * 2.0 / 3.0: hz = 2
-  if lockBottom: vt = 0
-  elif lockTop: vt = 2
-  elif cym < ch / 3.0: vt = 0
-  elif cym > ch * 2.0 / 3.0: vt = 2
-  if hz == 0 and vt == 2: return "topleft"
-  if hz == 2 and vt == 2: return "topright"
-  if hz == 0 and vt == 0: return "bottomleft"
-  if hz == 2 and vt == 0: return "bottomright"
-  if hz == 1 and vt == 2: return "top"
-  if hz == 1 and vt == 0: return "bottom"
-  if hz == 0: return "topleft"     # left edge, vertically central
-  if hz == 2: return "topright"
-  "center"
-
-proc duSnapWidget(idx: int; cw, ch: float64) =
-  ## Snap widget `idx` to the screen edges/corners and to its neighbours, then
-  ## rebind its anchor. Called ONCE, on the drop -- never while dragging, so the
-  ## widget follows the cursor exactly and only jumps when the user lets go.
-  ## A snap that fought the cursor every frame is unusable.
-  if idx < 0 or idx >= gDuWidgets.len:
-    return
-  var l = 0.0
-  var t = 0.0
-  var r = 0.0
-  var b = 0.0
-  duWidgetRect(gDuWidgets[idx], cw, ch, l, t, r, b)
-  let wdt = gDuWidgets[idx].w
-  let hgt = gDuWidgets[idx].h
-  if wdt <= 0.0 or hgt <= 0.0:
-    return                          # never rendered: nothing to snap
-
-  var lockL = false
-  var lockR = false
-  var lockT = false
-  var lockB = false
-
-  # 1. SCREEN EDGES. Nearest edge wins per axis; both can win, which is what a
-  #    corner snap IS.
-  if duAbs(l - cDuSnapMargin) <= cDuSnapPx:
-    l = cDuSnapMargin; lockL = true
-  elif duAbs((cw - cDuSnapMargin) - (l + wdt)) <= cDuSnapPx:
-    l = cw - cDuSnapMargin - wdt; lockR = true
-  if duAbs((ch - cDuSnapMargin) - t) <= cDuSnapPx:
-    t = ch - cDuSnapMargin; lockT = true
-  elif duAbs((t - hgt) - cDuSnapMargin) <= cDuSnapPx:
-    t = cDuSnapMargin + hgt; lockB = true
-
-  # 2. OTHER WIDGETS -- edge alignment and abutting, but only on an axis the
-  #    screen did not already claim, so a corner snap is never dragged back off
-  #    the corner by a neighbour. Bounded by the widget count, which is capped.
-  for j in 0 ..< gDuWidgets.len:
-    if j == idx or not gDuWidgets[j].on:
-      continue
-    if gDuWidgets[j].w <= 0.0 or gDuWidgets[j].h <= 0.0:
-      continue
-    var ol = 0.0
-    var ot = 0.0
-    var orr = 0.0
-    var ob = 0.0
-    duWidgetRect(gDuWidgets[j], cw, ch, ol, ot, orr, ob)
-    if not lockL and not lockR:
-      if duAbs(l - ol) <= cDuSnapPx:                 # left edges flush
-        l = ol; lockL = true
-      elif duAbs(l - (orr + cDuSnapGap)) <= cDuSnapPx:   # sits to its right
-        l = orr + cDuSnapGap
-      elif duAbs((l + wdt + cDuSnapGap) - ol) <= cDuSnapPx:  # sits to its left
-        l = ol - cDuSnapGap - wdt
-    if not lockT and not lockB:
-      if duAbs(t - ot) <= cDuSnapPx:                 # top edges flush
-        t = ot; lockT = true
-      elif duAbs(t - (ob - cDuSnapGap)) <= cDuSnapPx:    # stacks below it
-        t = ob - cDuSnapGap
-      elif duAbs((t - hgt - cDuSnapGap) - ot) <= cDuSnapPx: # stacks above it
-        t = ot + cDuSnapGap + hgt
-
-  # 3. Never off-screen, whatever the drag did. A widget dropped past the edge
-  #    and then unreachable is a layout the user cannot undo without deleting
-  #    the file.
-  if l < 0.0: l = 0.0
-  if l + wdt > cw: l = cw - wdt
-  if t > ch: t = ch
-  if t - hgt < 0.0: t = hgt
-
-  gDuWidgets[idx].anchor =
-    duNearestAnchor(l, t, cw, ch, wdt, hgt, lockL, lockR, lockT, lockB)
-  duWidgetSetTopLeft(gDuWidgets[idx], cw, ch, l, t)
 
 # ---------------------------------------------------------------------------
 # The drag
@@ -1986,6 +1790,16 @@ proc duUpdateWidgets() =
       break
     if not gDuWidgets[i].on:
       continue
+    # A widget already charged with `cDuWidgetFaultLimit` faults is skipped
+    # entirely -- not retried, not recharged. This is what keeps one bad widget
+    # from taking the other seven dark.
+    if i < gDuWidgetFaults.len and gDuWidgetFaults[i] >= cDuWidgetFaultLimit:
+      continue
+    # THE BREADCRUMB: one store per stage into a file-scope volatile, so it
+    # survives the guard's longjmp and the handler can name the stage AND the
+    # widget. See the note in `abi/aowlspt_widget.h`.
+    cWgCrumbW(int32(i))
+    cWgCrumb(WgCrumbWText)
     var lines = 0
     var widest = 0
     let text = duWidgetText(gDuWidgets[i], lines, widest)
@@ -1995,21 +1809,12 @@ proc duUpdateWidgets() =
     gDuWidgets[i].h = float64(lines) * gDuCfg.panelLine + 6.0
     # A widget dragged off the canvas by a resolution change is pulled back on
     # BEFORE it is placed, so it can never become unreachable by the mouse.
-    if haveCanvas and not gDuWidgets[i].dragging:
-      var l = 0.0
-      var t = 0.0
-      var r = 0.0
-      var b = 0.0
-      duWidgetRect(gDuWidgets[i], cw, ch, l, t, r, b)
-      var fixed = false
-      if l > cw - 24.0: l = cw - 24.0; fixed = true
-      if r < 24.0: l = 24.0 - gDuWidgets[i].w; fixed = true
-      if t < 24.0: t = 24.0; fixed = true
-      if b > ch - 24.0: t = ch - 24.0 + gDuWidgets[i].h; fixed = true
-      if fixed:
-        duWidgetSetTopLeft(gDuWidgets[i], cw, ch, l, t)
+    if haveCanvas:
+      duClampOnScreen(i, cw, ch)
+    cWgCrumb(WgCrumbWPlace)
     duPlace(gDuPanel[used], gDuWidgets[i].anchor,
             gDuWidgets[i].x, gDuWidgets[i].y)
+    cWgCrumb(WgCrumbWStyle)
     # The widget being dragged is tinted, so "which one am I holding" is
     # answered on screen rather than by feel.
     if gDuEdit and gDuWidgets[i].dragging:
@@ -2019,13 +1824,20 @@ proc duUpdateWidgets() =
     else:
       duStyle(gDuPanel[used], gDuCfg.panelFont,
               gDuCfg.panelR, gDuCfg.panelG, gDuCfg.panelB)
+    cWgCrumb(WgCrumbWSetText)
     discard duSetText(gDuPanel[used], text)
+    cWgCrumb(WgCrumbWShow)
     duShow(gDuPanel[used])
     inc used
+  # Out of the per-widget region. The widget crumb is CLEARED rather than left
+  # pointing at the last widget that rendered successfully, which would blame an
+  # innocent one for a fault raised after the loop.
+  cWgCrumbW(-1'i32)
   # THE EDIT-MODE BANNER, in the spare label the pool was sized for. It exists
   # because edit mode is otherwise invisible, and an invisible mode that changes
   # what a left click does is the worst kind: it says what is on, what the keys
   # are, and -- explicitly -- that the click is NOT taken from the game.
+  cWgCrumb(WgCrumbBanner)
   if gDuEdit and used < gDuPanel.len:
     var b = "EDIT MODE  --  drag a widget with the left mouse button"
     b.add "\n  Ctrl+F3 leave   1-9 toggle a widget   0 reset all placements"
@@ -2050,6 +1862,7 @@ proc duUpdateWidgets() =
     inc used
   # Every label past the last enabled widget is hidden, or a widget turned off
   # leaves its last text on screen forever.
+  cWgCrumb(WgCrumbHideRest)
   for i in used ..< gDuPanel.len:
     duHide(gDuPanel[i])
 
@@ -2719,6 +2532,10 @@ var gDuEspUnavailableLogged = false
 proc debugUiBodyImpl(a: Il2CppPtr): Il2CppPtr {.
     exportc: "aowl_du_body", cdecl.} =
   let regs = a
+  # THE TRAIL STARTS HERE, and is cleared on every body, so a stale crumb from a
+  # previous refresh can never be reported as this refresh's fault site.
+  cWgCrumb(WgCrumbEnter)
+  cWgCrumbW(-1'i32)
   let tid = int(cThreadId())
   inc gDuFires
   cDuFpsSample()
@@ -2741,6 +2558,7 @@ proc debugUiBodyImpl(a: Il2CppPtr): Il2CppPtr {.
   # The toggle, edge-detected in C and ignored unless the game has the
   # foreground -- otherwise an F3 typed into an editor on the other monitor
   # would toggle the overlay.
+  cWgCrumb(WgCrumbToggle)
   if cDuForeground() != 0'i32:
     if gDuCfg.toggleVk > 0 and
        cDuKeyEdge(int32(gDuCfg.toggleVk)) != 0'i32:
@@ -2808,6 +2626,7 @@ proc debugUiBodyImpl(a: Il2CppPtr): Il2CppPtr {.
   if (gDuFires mod gDuCfg.panelThrottle) != 0:
     return cast[Il2CppPtr](1)
 
+  cWgCrumb(WgCrumbBuild)
   if not duBuild(preloader):
     return cast[Il2CppPtr](1)
 
@@ -2817,6 +2636,7 @@ proc debugUiBodyImpl(a: Il2CppPtr): Il2CppPtr {.
      not duOk(gDuGameWorld, cBdOffRegPlayers() + 8'i32):
     gDuGameWorld = nil
 
+  cWgCrumb(WgCrumbScanWorld)
   duScanWorld()
 
   if gDuVisible:
@@ -2824,10 +2644,14 @@ proc debugUiBodyImpl(a: Il2CppPtr): Il2CppPtr {.
     # drag cannot see the cursor in two places within one frame and the button
     # edges are computed exactly once. It is a `GetCursorPos` and a
     # `GetAsyncKeyState`: no message, no hook, nothing swallowed from the game.
+    cWgCrumb(WgCrumbMouse)
     discard cWgMouseSample()
+    cWgCrumb(WgCrumbEditKeys)
     duEditKeys()
+    cWgCrumb(WgCrumbDrag)
     duDragTick()
     duUpdateWidgets()
+  cWgCrumb(WgCrumbMarkers)
   if gDuEspVisible:
     if not duUpdateMarkers():
       if not gDuEspUnavailableLogged:
@@ -2836,6 +2660,7 @@ proc debugUiBodyImpl(a: Il2CppPtr): Il2CppPtr {.
              "verify on this build, so in-world markers are unavailable. The " &
              "panel's `botlist` field still shows every AI bot's world " &
              "coordinates and distance -- add it to panelFields."
+  cWgCrumb(WgCrumbDone)
   return cast[Il2CppPtr](1)
 
 # The VEH/SEH guard thunk. ONE of them, wrapping the whole body: `aowl_p_p_seh`
@@ -2858,16 +2683,52 @@ proc debugUiFired(regs: Il2CppPtr) =
   ## on `EFT.UI.PreloaderUI::Update`. Never suppresses the original.
   if cDuBodyGuarded(regs) == nil:
     inc gDuFaults
+    # WHERE. The guard itself cannot say -- the stack is gone by the time it
+    # regains control -- so the body leaves a trail of file-scope stores the
+    # longjmp cannot disturb, and this reads the last one. The old message said
+    # only "fault #1 caught by the VEH guard", which is a fault report with NO
+    # LOCATION; it cost a live session in which the panel showed nothing and the
+    # log could not narrow forty steps down to one.
+    let stage = cWgCrumbGet()
+    let wi = int(cWgCrumbGetW())
+    var where = $cWgCrumbTextC(stage)
+    if wi >= 0 and wi < gDuWidgets.len:
+      where.add " -- widget '" & gDuWidgets[wi].id & "' (index " & $wi &
+                ", fields '" & gDuWidgets[wi].fields & "')"
     if gDuFaults == 1 or (gDuFaults mod 240) == 0:
-      warn "debugui: fault #" & $gDuFaults & " caught by the VEH guard; the " &
-           "overlay skipped a refresh and the game is unaffected"
-    if gDuFaults == 8:
-      # Eight faults is not a transient: something in the chain is wrong on this
-      # build, and continuing to fault every refresh is worse than going dark.
+      warn "debugui: fault #" & $gDuFaults & " caught by the VEH guard while " &
+           where & "; the overlay skipped a refresh and the game is unaffected"
+
+    # ATTRIBUTE IT. A fault raised inside a known widget's render is charged to
+    # THAT widget; after `cDuWidgetFaultLimit` charges the widget switches itself
+    # off and every other widget keeps drawing. This is the difference between
+    # "the overlay is off, good luck" and "the prof widget is off, and here is
+    # the stage it died in".
+    var isolated = false
+    if wi >= 0 and wi < gDuWidgets.len and wi < gDuWidgetFaults.len and
+       (stage == WgCrumbWText or stage == WgCrumbWPlace or
+        stage == WgCrumbWStyle or stage == WgCrumbWSetText or
+        stage == WgCrumbWShow):
+      gDuWidgetFaults[wi] = gDuWidgetFaults[wi] + 1
+      isolated = true
+      if gDuWidgetFaults[wi] == cDuWidgetFaultLimit:
+        gDuWidgets[wi].on = false
+        warn "debugui: widget '" & gDuWidgets[wi].id & "' faulted " &
+             $cDuWidgetFaultLimit & " times while " & where &
+             " and has been switched OFF on its own. Every OTHER widget keeps " &
+             "drawing. Re-enable it with 0 in edit mode, or by deleting " &
+             "aowlspt-debugui-layout.json, once the cause is fixed."
+
+    # THE BACKSTOP, for a fault that belongs to no single widget. A
+    # widget-attributable fault no longer reaches it: three charges retire one
+    # widget instead of eight taking the whole panel down.
+    if gDuFaults >= 8 and not isolated:
       gDuVisible = false
       gDuEspVisible = false
-      warn "debugui: eight faults -- the overlay has switched itself OFF for " &
-           "this session (toggle it back on to retry after fixing the layout)"
+      if gDuFaults == 8:
+        warn "debugui: eight faults NOT attributable to any one widget (the " &
+             "last was while " & where & ") -- the overlay has switched " &
+             "itself OFF for this session"
 
 proc duNoteGameWorld(gw: Il2CppPtr) =
   ## Cache the live GameWorld. Called from the kind=11 RegisterPlayer detour and
