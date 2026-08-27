@@ -52,6 +52,7 @@ import emu/quests
 import emu/hideout
 import emu/trading
 import emu/bots
+import emu/orbit
 import emu/mail
 import emu/insurance
 import emu/dialogue
@@ -1911,6 +1912,24 @@ proc onNotifierPoll(url, body, session: string): string =
   result = envelope(raw(ping()))
 
 # ---------------------------------------------------------------------------
+# ORBIT
+# ---------------------------------------------------------------------------
+
+proc onOrbitPlan(url, body, session: string): string =
+  ## The plan for the raid that is running, and the verdict on it.
+  ##
+  ## Served rather than only broadcast so the check can be read with curl
+  ## instead of by grepping a log, and so that a `mods/sain` that never got the
+  ## broadcast can be told apart from a plan that was never built -- two
+  ## failures with identical symptoms on the client side.
+  inc gRequests
+  var o = obj()
+  put(o, "plan", Json(text: lastPlanJson()))
+  put(o, "check", orbitCheck())
+  put(o, "state", orbitState())
+  result = done(o).text
+
+# ---------------------------------------------------------------------------
 # Raids
 # ---------------------------------------------------------------------------
 
@@ -1932,11 +1951,23 @@ proc onRaidConfiguration(url, body, session: string): string =
   info "raid configured: " & field(cfg, "location").asText("?") & " as " &
        field(cfg, "side").asText("?")
   discard broadcast("tarkov.raid.configured", raw(cfg))
+  # The ORBIT plan for this map, built here because this is the FIRST moment
+  # the map is known and it is known before any bot exists. `emitPlan` is a
+  # no-op when the map has not changed, so the second caller below costs
+  # nothing on the common path. See `emu/orbit.nim` for what a plan is and,
+  # more importantly, for the three things it deliberately does not contain.
+  emitPlan(field(cfg, "location").asText(""))
   result = envelopeNull()
 
 proc onLocalLoot(url, body, session: string): string =
   inc gRequests
   let loc = field(body, "locationId").asText("factory4_day")
+  # The fallback namer. A client that reaches `getLocalloot` without having
+  # sent `raid/configuration` -- the scav path does exactly this -- would
+  # otherwise enter a raid with no plan and the dispatcher would sit
+  # INCONCLUSIVE for the whole raid with no way to tell that apart from a
+  # broken bus.
+  emitPlan(loc)
   result = envelope(raw(localLoot(loc, nowSeconds(), gRaidId)))
 
 proc onMatchStart(url, body, session: string): string =
@@ -2838,6 +2869,12 @@ proc registerRoutes() =
   discard serve("/aowlspt/tarkov/launcher/profiles", onLauncherProfiles)
   discard serve("/aowlspt/tarkov/launcher/profile/create", onLauncherCreate)
   discard serve("/aowlspt/tarkov/launcher/profile/select", onLauncherSelect)
+
+  # The ORBIT plan and its verdict. Under `/aowlspt/tarkov/` rather than
+  # `/aowlspt/orbit/`, measured: a route registered at `/aowlspt/orbit/plan`
+  # 404s on a running backend while `/aowlspt/tarkov/launcher/ping` beside it
+  # answers, so that namespace does not reach a mod on this host.
+  discard serve("/aowlspt/tarkov/orbit/plan", onOrbitPlan)
 
   discard serve("/client/profile/status", onProfileStatus)
   # `GetProfileSettings` answers a bare `true`; the client only checks that the

@@ -26,5 +26,36 @@
   "fleaSaleMinutes": 30,
 
   "skillMaxPerRaid": 100.0,
-  "masteringMaxPerRaid": 100
+  "masteringMaxPerRaid": 100,
+
+  "orbitEnabled": true,
+  "orbitCellSize": 50.0,
+  "orbitLootAnchors": 12,
+  "orbitPvpAnchors": 6,
+  "orbitLeashM": 45.0,
+  "orbitSplinterM": 90.0,
+  "orbitReachM": 8.0,
+  "orbitHoldMs": 30000,
+  "orbitExtractFraction": 0.75,
+
+  "orbitPersonalityRat": 0.15,
+  "orbitPersonalityCoward": 0.10,
+  "orbitPersonalityNormal": 0.45,
+  "orbitPersonalityChad": 0.20,
+  "orbitPersonalityGigaChad": 0.05,
+  "orbitPersonalityTimmy": 0.05,
+
+  "orbitCoverageRat": 0.90,
+  "orbitCoverageCoward": 0.90,
+  "orbitCoverageNormal": 0.70,
+  "orbitCoverageChad": 0.55,
+  "orbitCoverageGigaChad": 0.38,
+  "orbitCoverageTimmy": 0.80,
+
+  "orbitValueRat": 5000,
+  "orbitValueCoward": 5000,
+  "orbitValueNormal": 10000,
+  "orbitValueChad": 15000,
+  "orbitValueGigaChad": 20000,
+  "orbitValueTimmy": 0
 }
