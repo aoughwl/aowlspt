@@ -219,7 +219,8 @@ import bots/spawnscale
 import bots/census
 import bots/instance
 import bots/deaths
-import aowlspt/game    # `whenReady` -- the client half waits for a world
+import bots/gate       # the two gates that replaced `whenReady` -- read it first
+import aowlspt/game    # `whenReady` -- now only "the IL2CPP runtime is up"
 import aowlspt/fast    # `perfCounter` -- the clock the census reports on
 import aowlspt/fixture # where a self-test's runtime path may come from
 
@@ -488,6 +489,13 @@ proc moreBotsSchema(): seq[Setting] =
     intSetting("increaseBotCapAmount", "Increase bot cap amount", 0,
                lo = 0, hi = 50, category = "Population", implemented = false,
                description = "Deprecated: writes bots.config.maxBotCap, which nothing on this stack reads; use population instead"),
+    boolSetting("clientCensus", "Client census", false, category = "Census",
+                description = "The client half, off by default: it opens the IL2CPP runtime in the client process. Server-side bot counts do not need it"),
+    boolSetting("deferUntilUnityThread", "Defer until Unity thread", true,
+                category = "Census",
+                description = "Hold all client arming until the host confirms its main-thread drain has fired. Turning this off reproduces the crash that quarantined this mod"),
+    boolSetting("deathLedger", "Death ledger", false, category = "Census",
+                description = "Installs a BY-NAME host detour on EFT.BaseStatisticsManager::OnDeath -- a write into game code against a pre-1.0 name. Not needed for bot counts"),
     intSetting("censusIntervalMs", "Census interval (ms)", 5000,
                lo = 500, hi = 60000, step = 500, category = "Census",
                description = "How often the client half counts the bots that arrived; read-only, floored at 500"),
@@ -642,6 +650,47 @@ var gCensusReported = false
 var gCensusScans = 0
 var gCensusNs = 0'i64
 var gWorld = whenReady("EFT.GameWorld")
+  ## KEPT, RENAMED IN MEANING. This is the cheap "the IL2CPP runtime is up"
+  ## probe it always really was -- it goes true ~47 ms after HOST RUNNING with
+  ## no raid anywhere. It is no longer a gate on anything. `bots/gate.nim` has
+  ## the mechanism and the measurement.
+
+# --- the client half's flags, all default OFF (CLAUDE.md 5) ----------------
+var cfgClientCensus = false
+  ## The whole client half. OFF by default: this mod was quarantined as
+  ## `morebots.dll.off` for killing the client, and a fix that has never been
+  ## run in a raid does not get to ship enabled.
+var cfgDeferUntilUnityThread = true
+  ## Hold ALL arming until the host says its main-thread drain has fired. The
+  ## unsafe direction is the one that crashed, so this defaults ON and turning
+  ## it off is how you reproduce the crash deliberately.
+var cfgDeathLedger = false
+  ## `armDeaths` installs a **by-name host detour** -- a write into game code
+  ## against `EFT.BaseStatisticsManager::OnDeath`, a pre-1.0 C# name. Facts
+  ## #143-145: by-name is fatal the moment it is USED, and `mods/fov` refuses
+  ## by-name detours in the client outright. OFF, and separately named, so
+  ## that turning the census on does not silently turn a code patch on.
+
+const
+  GatePollMs = 500'i64
+    ## Asking the host every frame is a round trip per frame for an answer that
+    ## changes at most once.
+  GateGiveUpMs = 180_000'i64
+    ## Then refuse, permanently, rather than arm anyway. A surviving FOV run
+    ## confirmed the drain at 14.469 s; three minutes is not a tight bound, it
+    ## is the point at which "it is coming" stops being credible.
+  MaxCensusFaults = 5
+    ## Consecutive failed scans after which the client half switches itself off
+    ## for the rest of the run.
+
+var gGatePassed = false
+var gGateMs = 0'i64
+var gGatePollMs = 0'i64
+var gGateSaid = false
+var gClientOff = false
+var gClientState = "not started"
+var gCensusFaults = 0
+var gWorldSaid = false
 
 proc censusJson(c: Census): string =
   var roles = arr()
@@ -679,10 +728,24 @@ proc censusTick() =
     # The death ledger goes up with the census and on the same runtime, because
     # the two answer halves of one question: the census is the population and
     # the ledger is the turnover, and a raid can be steady in one while the
-    # other is churning. Armed once; the refusal, if it refuses, is printed
-    # with the census's own binding report below.
-    discard armDeaths(censusRuntime(), censusLive())
-    info "morebots: death ledger -- " & deathState()
+    # other is churning.
+    #
+    # It is now gated on its OWN flag, default off. `armDeaths` ends in
+    # `hookArgs`, which asks the host to detour a method BY NAME, and that is a
+    # write into game code -- the route facts #143-145 make fatal and the one
+    # `mods/fov` refuses outright on the client. This mod's census is read-only
+    # and the ledger is not; they should not share a switch.
+    if cfgDeathLedger:
+      warn "morebots: deathLedger is ON -- this installs a BY-NAME host " &
+           "detour on " & DeathTarget & ", a write into game code against a " &
+           "pre-1.0 name. It is not part of the census and is not needed for " &
+           "bot counts."
+      discard armDeaths(censusRuntime(), censusLive())
+      info "morebots: death ledger -- " & deathState()
+    else:
+      info "morebots: death ledger OFF (deathLedger=false). It would patch " &
+           "game code by name; the census below is read-only and does not " &
+           "need it. Turnover between two scans is the cost."
     gCensusBound = true
   let now = nowMs()
   if gLastCensusMs != 0'i64 and now - gLastCensusMs < int64(gCensusIntervalMs):
@@ -691,7 +754,18 @@ proc censusTick() =
 
   let c = runCensus()
   if not c.ok:
+    # Self-disable after N faults, rather than fault every interval forever.
+    # Counted CONSECUTIVELY and reset on the next good scan below, so a single
+    # bad frame during a map load does not spend the budget.
+    gCensusFaults = gCensusFaults + 1
+    if gCensusFaults >= MaxCensusFaults:
+      gClientOff = true
+      gClientState = "refused: " & $MaxCensusFaults & " consecutive scans " &
+                     "failed, so the client half switched itself OFF for the " &
+                     "rest of the run"
+      warn "morebots: " & gClientState
     return
+  gCensusFaults = 0
   gCensusScans = gCensusScans + 1
   gCensusNs = gCensusNs + c.scanNs
   if not gCensusReported:
@@ -714,6 +788,18 @@ proc onLoadClient(): Status =
   ## override, a Unity component -- is still out of reach post-1.0 and is still
   ## said plainly. What is *not* out of reach is observing the result, and that
   ## is what runs here.
+  cfgClientCensus = setting("clientCensus").asBool(false)
+  cfgDeferUntilUnityThread = setting("deferUntilUnityThread").asBool(true)
+  cfgDeathLedger = setting("deathLedger").asBool(false)
+  if not cfgClientCensus:
+    gClientOff = true
+    gClientState = "off: clientCensus=false. Nothing in this process is " &
+                   "opened, bound, walked or patched. The server half -- " &
+                   "which is what raises bot counts -- is unaffected."
+    info "morebots: " & gClientState
+    return Ok
+  info "morebots: client census ON, deferUntilUnityThread=" &
+       $cfgDeferUntilUnityThread & ", deathLedger=" & $cfgDeathLedger
   gCensusIntervalMs = setting("censusIntervalMs").asInt(5000)
   if gCensusIntervalMs < 500:
     gCensusIntervalMs = 500
@@ -1484,12 +1570,69 @@ proc onLoad(): Status =
 proc onUpdate(elapsedMs: int64): Status =
   ## The client half only. The server half is entirely event- and route-driven
   ## and has nothing per-tick to do.
+  ##
+  ## THE ORDER HERE IS THE FIX. It used to be `if gWorld.ready(): censusTick()`,
+  ## and `bots/gate.nim` has the full mechanism; the short version is that
+  ## `whenReady` is a type-resolvability probe that goes true ~47 ms after HOST
+  ## RUNNING, so the mod opened the runtime, walked every loading assembly and
+  ## installed a by-name detour off the Unity thread, in a menu, with no world.
+  ##
+  ## Three gates now, in cost order, and each one can say no:
+  ##   1. the flag                     -- default OFF
+  ##   2. the host's main-thread drain -- `bound` means it has FIRED
+  ##   3. a GameWorld the host actually cached -- three-way, INCONCLUSIVE is
+  ##      not a pass
   if side() != sideClient:
     return Ok
-  if gWorld.ready():
-    success "morebots: the game world is up; the census starts"
-  if gWorld.fired:
-    censusTick()
+  if gClientOff or not cfgClientCensus:
+    return Ok
+
+  if not gGatePassed:
+    if not cfgDeferUntilUnityThread:
+      warn "morebots: deferUntilUnityThread is OFF -- arming on the host's " &
+           "own thread, which is what killed the client ~30 ms after HOST " &
+           "RUNNING and quarantined this mod. This path exists to reproduce " &
+           "that deliberately."
+      gGatePassed = true
+    else:
+      gGateMs = gGateMs + elapsedMs
+      gGatePollMs = gGatePollMs + elapsedMs
+      if gGatePollMs >= GatePollMs:
+        gGatePollMs = 0
+        let mt = askMainThread()
+        if mt.ok and mt.bound:
+          gGatePassed = true
+          success "morebots: Unity's main thread is live after " &
+                  $(gGateMs div 1000) & "s (drain " & mt.methodName & ", " &
+                  $mt.frames & " firings); the world gate opens now"
+        elif gGateMs >= GateGiveUpMs:
+          gClientOff = true
+          gClientState = "refused: the host's main-thread drain never " &
+                         "confirmed within " & $(GateGiveUpMs div 1000) &
+                         "s, so there is no thread on which IL2CPP work is " &
+                         "legal. Nothing was opened, bound or patched."
+          warn "morebots: " & gClientState & " The client half is OFF for " &
+               "the rest of this run."
+        elif not gGateSaid and gGateMs >= 3000:
+          gGateSaid = true
+          info "morebots: the IL2CPP runtime is up (" &
+               (if gWorld.ready(): "whenReady true" else: "whenReady false") &
+               ", which proves only that a type resolves) but the host's " &
+               "main-thread drain has not fired; holding everything until " &
+               "it does, up to " & $(GateGiveUpMs div 1000) & "s"
+      return Ok
+
+  # Gate 3. Re-asked every tick on purpose: a raid ends, the cache empties, and
+  # the census must stop rather than keep scanning a world that is gone.
+  let ws = worldState()
+  if not gWorldSaid and ws != GwLive:
+    gWorldSaid = true
+    info "morebots: no census yet -- " & worldStateText()
+  if ws != GwLive:
+    return Ok
+  if gWorldSaid or not gCensusBound:
+    gWorldSaid = false
+  censusTick()
   Ok
 
 proc onUnload(): Status =

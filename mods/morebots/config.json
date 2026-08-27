@@ -43,6 +43,15 @@
   "//increaseBotCapAmount": "DEPRECATED and 0. Upstream's flat per-map cap bump. It writes bots.config.maxBotCap, which is not a path anything on this stack reads -- a stock SPT 4.x database has no `bots.config` at all and the emulator never looks there. It was doing nothing, silently. Kept so an install that set it does not change behaviour without saying so; it now logs a line pointing at `population` above, which writes somewhere the client can see.",
   "increaseBotCapAmount": 0,
 
+  "//clientCensus": "The CLIENT half, and it is OFF. It opens GameAssembly.dll inside the client process to count the bots that arrived. This mod was quarantined as morebots.dll.off for killing the client ~30ms after HOST RUNNING; the gates that caused that are replaced (see bots/gate.nim) but the fix has never been run in a live raid. Raising bot counts is the SERVER half (`population`) and needs none of this.",
+  "clientCensus": false,
+
+  "//deferUntilUnityThread": "Hold every client-side open/bind/patch until the host reports its main-thread drain has FIRED. ON. Turning it off arms on the host's own thread, which is the crash.",
+  "deferUntilUnityThread": true,
+
+  "//deathLedger": "OFF. Installs a by-name host detour on EFT.BaseStatisticsManager::OnDeath -- a WRITE into game code against a pre-1.0 C# name. The census is read-only; this is not, and it is not needed for bot counts.",
+  "deathLedger": false,
+
   "//censusIntervalMs": "How often the client half counts the bots that actually arrived. Read-only; it changes nothing in the game. Floored at 500.",
   "censusIntervalMs": 5000,
 
