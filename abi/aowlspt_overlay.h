@@ -655,6 +655,11 @@ typedef enum AowlOvView {
     AOWL_VIEW_LISTS,
     AOWL_VIEW_ISSUES,
     AOWL_VIEW_APPLY,
+    /* The two logs, interleaved and filtered -- see THE LOGS SCREEN below.
+     * Appended rather than inserted: `sel`/`top` are indexed by view and the
+     * numeric jump keys are positional, so a new view in the middle would
+     * silently move somebody's muscle memory. */
+    AOWL_VIEW_LOGS,
     AOWL_VIEW_COUNT
 } AowlOvView;
 
@@ -669,6 +674,99 @@ typedef enum AowlOvFilter {
     AOWL_FILTER_OVERRIDDEN,
     AOWL_FILTER_COUNT
 } AowlOvFilter;
+
+/* ================================================================== *
+ * THE LOGS SCREEN
+ *
+ * A fifth manager view that shows the two logs this install writes -- the
+ * backend's (`aowlspt-backend.log`, the SERVER) and the host's
+ * (`aowlspt-host.log`, the CLIENT) -- interleaved in the order they were
+ * read, filterable by source, by level, by which mod or subsystem wrote the
+ * line, and by a typed search term.
+ *
+ * WHY IT READS FILES AND NOT HTTP. "The backend died" is precisely the moment
+ * somebody opens the logs, and a log screen that needs the backend to be up in
+ * order to show you why the backend went down is not a log screen. Both files
+ * sit next to this DLL in the install directory, and the game process can open
+ * them directly -- so this whole feature works with the port dead, exactly as
+ * the synthetic `aowl.panel` settings page does.
+ *
+ * WHAT BOUNDS THE COST. Never a whole file: `aowlspt-backend.log` carries PROBE
+ * lines several kilobytes long and grows without limit during a session. The
+ * worker thread (never the render thread) opens each file at most once every
+ * AOWL_OV_LOG_POLL_MS, and only while the screen is actually being drawn; on
+ * the first read it seeks to at most AOWL_OV_LOG_TAIL bytes from the end, and
+ * every read after that takes at most AOWL_OV_LOG_CHUNK new bytes. Lines land
+ * in a fixed ring of AOWL_OV_LOG_MAX entries -- the oldest are dropped, and the
+ * count of what was dropped is printed rather than hidden. The render thread
+ * re-derives the filtered index only when something it depends on has changed
+ * (`logFiltStamp`), so a still frame walks nothing at all.
+ *
+ * THE FACET RULE, stated so it can be argued with. A line's facet is the first
+ * whitespace-delimited word of its message WHEN THAT WORD ENDS IN A COLON --
+ * `sain:`, `debugui:`, `botdiag:`, `manager:`, `morebots:`, `config:` -- with
+ * the colon stripped and the rest lowercased. Anything else is `system`. The
+ * word must be 2..AOWL_OV_LOG_FACETLEN-1 characters, must contain a letter, and
+ * must be made only of letters, digits, `.`, `_` and `-`; a token that fails
+ * any of those is not a facet and the line is `system`.
+ *
+ * MEASURED against 326 host lines and 2,496 backend lines from a live run:
+ * the rule finds sain, FOV, config, debugui, botdiag, region, deep-probe,
+ * manager, morebots, singleplayer and leaves REQ, route, subscribed, loaded,
+ * profile and prose lines under `system`, which is what one wants.
+ *
+ * WHAT IT FAILS ON, and this is not hypothetical:
+ *   * A mod that prefixes with a SPACE and no colon is invisible to it. The
+ *     brief named `graphics` as such a prefix; every `graphics` line in the
+ *     sampled run lands under `system`, and there is no way for this rule to
+ *     know that `graphics` is a mod and `subscribed` is a verb.
+ *   * The same subsystem writing both `botdiag:` and `botdiag ` produces ONE
+ *     facet and a set of `system` lines, not two facets.
+ *   * A line whose message happens to begin with a colon-terminated word that
+ *     is not a mod -- `capability:`, `ids:`, `g_Airdrop_PlaneAirdropFlareWait:`
+ *     -- becomes a facet of its own. Three such appeared in the 2,496-line
+ *     sample. They are harmless (one extra entry in the facet cycle) and they
+ *     are the honest cost of not hardcoding a mod list.
+ *   * Continuation lines (a stack trace, a wrapped message) have no `[t]`
+ *     prefix at all. They keep the level `?` and the facet `system` rather than
+ *     inheriting the line above, because inheriting would be a guess.
+ * ================================================================== */
+
+#define AOWL_OV_LOG_MAX      1200   /* lines held, across BOTH sources */
+#define AOWL_OV_LOG_TEXT      196   /* per line, including the terminator */
+#define AOWL_OV_LOG_FACETS     64
+#define AOWL_OV_LOG_FACETLEN   20
+#define AOWL_OV_LOG_TAIL   262144   /* how far back the FIRST read looks */
+#define AOWL_OV_LOG_CHUNK   65536   /* new bytes taken per source per poll */
+#define AOWL_OV_LOG_POLL_MS   400
+/* Consecutive open/read failures before a source switches itself off and says
+ * so. The same self-disable every other overlay feature has: a log file that
+ * cannot be opened must cost one line of explanation, not a syscall a frame. */
+#define AOWL_OV_LOG_MAXFAIL    10
+
+enum { AOWL_LOG_SERVER = 0, AOWL_LOG_CLIENT = 1, AOWL_LOG_SRCS = 2 };
+
+/* `?` is a real state and not a synonym for info: a line whose level could not
+ * be read must not be coloured as though it had been. */
+enum { AOWL_LOGLVL_UNKNOWN = 0, AOWL_LOGLVL_OK, AOWL_LOGLVL_INFO,
+       AOWL_LOGLVL_WARN, AOWL_LOGLVL_ERR, AOWL_LOGLVL_COUNT };
+
+/* The source filter. `ALL` first, so the default shows everything. */
+enum { AOWL_LOGSRC_ALL = 0, AOWL_LOGSRC_SERVER, AOWL_LOGSRC_CLIENT,
+       AOWL_LOGSRC_COUNT };
+
+/* The facet filter is not an enum: -2 is every facet, -1 is `system` (lines
+ * with no mod prefix), and >= 0 is an index into `logFacets`. */
+#define AOWL_LOG_FACET_ALL    (-2)
+#define AOWL_LOG_FACET_SYSTEM (-1)
+
+typedef struct AowlOvLogLine {
+    char    text[AOWL_OV_LOG_TEXT];  /* the WHOLE line, prefix included */
+    int32_t src;                     /* AOWL_LOG_SERVER | AOWL_LOG_CLIENT */
+    int32_t lvl;                     /* AOWL_LOGLVL_*                     */
+    int32_t facet;                   /* index, or AOWL_LOG_FACET_SYSTEM   */
+    int32_t msgAt;                   /* offset of the message in `text`   */
+} AowlOvLogLine;
 
 /* ================================================================== *
  * Settings mode
@@ -1186,6 +1284,53 @@ typedef struct AowlOvState {
     int32_t sel[AOWL_VIEW_COUNT];   /* the cursor, per view */
     int32_t top[AOWL_VIEW_COUNT];   /* the first visible row, per view */
 
+
+    /* --- THE LOGS SCREEN's state -----------------------------------------
+     *
+     * `logs` is a RING and `logSeq` is the number of lines ever appended, so a
+     * line's slot is `seq % AOWL_OV_LOG_MAX` and a stored sequence can always
+     * be tested for having been evicted. The filtered index holds SEQUENCES,
+     * not slots, for exactly that reason: an index of slots cannot tell "row 7"
+     * from "row 7, overwritten since".
+     *
+     * The worker writes everything above `logWant`; the render thread writes
+     * only the filter/cursor half and `logWant`. */
+    AowlOvLogLine logs[AOWL_OV_LOG_MAX];
+    int32_t  logSeq;            /* lines ever appended                      */
+    int32_t  logCount;          /* lines held (<= AOWL_OV_LOG_MAX)          */
+    int32_t  logDropped;        /* lines the ring evicted, ever             */
+    int32_t  logSerial;         /* bumped on every append; the cache key    */
+    char     logFacets[AOWL_OV_LOG_FACETS][AOWL_OV_LOG_FACETLEN];
+    int32_t  logFacetN;
+    int32_t  logFacetOver;      /* facets that did not fit the table        */
+    /* Per source. `logPath` is derived once from this DLL's own directory --
+     * the same directory the host writes both logs into. `logWhy` is why a
+     * source is showing nothing, IN WORDS, because an empty pane that does not
+     * say whether the file is missing, unreadable or merely quiet is the
+     * silent-decline failure this project keeps paying for. */
+    char     logPath[AOWL_LOG_SRCS][300];
+    long long logOff[AOWL_LOG_SRCS];    /* bytes already consumed            */
+    int32_t  logOpened[AOWL_LOG_SRCS]; /* the file has been read at least once */
+    int32_t  logFail[AOWL_LOG_SRCS];   /* consecutive failures              */
+    int32_t  logOff2[AOWL_LOG_SRCS];   /* self-disabled after MAXFAIL       */
+    char     logWhy[AOWL_LOG_SRCS][120];
+    int32_t  logLines[AOWL_LOG_SRCS];  /* lines taken from this source      */
+    /* A line split across two reads. Carried rather than emitted in halves. */
+    char     logCarry[AOWL_LOG_SRCS][AOWL_OV_LOG_TEXT];
+    int32_t  logCarryN[AOWL_LOG_SRCS];
+    volatile LONG logWant;      /* the render thread is drawing the screen  */
+    int32_t  logPathsDone;
+
+    /* The filter, and the cursor's half of it. All render thread. */
+    int32_t  logSrcFilt;        /* AOWL_LOGSRC_*                            */
+    int32_t  logLvlFilt;        /* 0 = all, else AOWL_LOGLVL_* and worse    */
+    int32_t  logFacetFilt;      /* AOWL_LOG_FACET_ALL | _SYSTEM | index     */
+    char     logSearch[48];
+    int32_t  logSearchFocus;    /* ONLY after `/` or a click. Never on open. */
+    int32_t  logFollow;         /* pin to the newest line                   */
+    int32_t  logFilt[AOWL_OV_LOG_MAX];   /* sequences that pass             */
+    int32_t  logFiltN;
+    uint32_t logFiltStamp;      /* what `logFilt` was computed for; 0 = none */
     /* --- cost --- */
     LARGE_INTEGER qpcFreq;
     int32_t       drawn;        /* frames actually drawn; render thread only */
@@ -3363,6 +3508,293 @@ static void aowl_ov_settings_set(const AowlOvCmd* cmd, char* buf, int32_t cap) {
     aowl_ov_settings_load(cmd->guid, 1, buf, cap);
 }
 
+/* ================================================================== *
+ * The logs screen -- reading the files
+ *
+ * Everything in this section runs on the WORKER thread except where the
+ * comment says otherwise. Nothing here ever runs from `aowl_ov_build`.
+ * ================================================================== */
+
+/* Both logs live next to this DLL: `aowlhost.nim` opens `aowlspt-host.log` at
+ * `modhost.ownDirectory()`, and `aowlspt-launch.exe` puts the backend and its
+ * log in the same install root. So the path is derived from THIS MODULE rather
+ * than from a configured directory, a CWD (which the game changes) or an
+ * argument the host would have to remember to pass -- one fewer thing that can
+ * be wired up wrong and fail silently.
+ *
+ * If it cannot be derived, both sources say so and neither is retried. */
+static void aowl_ov_log_paths(void) {
+    char self[300];
+    HMODULE mod = NULL;
+    DWORD n;
+    int32_t i;
+    if (g_ov.logPathsDone) return;
+    g_ov.logPathsDone = 1;
+    if (!GetModuleHandleExA(GET_MODULE_HANDLE_EX_FLAG_FROM_ADDRESS |
+                            GET_MODULE_HANDLE_EX_FLAG_UNCHANGED_REFCOUNT,
+                            (LPCSTR)(void*)&aowl_ov_log_paths, &mod) || !mod) {
+        for (i = 0; i < AOWL_LOG_SRCS; i++) {
+            g_ov.logOff2[i] = 1;
+            aowl_ov_copy(g_ov.logWhy[i], (int32_t)sizeof(g_ov.logWhy[i]),
+                         "cannot find this module, so the install directory is unknown");
+        }
+        return;
+    }
+    n = GetModuleFileNameA(mod, self, (DWORD)sizeof(self));
+    if (n == 0 || n >= sizeof(self)) {
+        for (i = 0; i < AOWL_LOG_SRCS; i++) {
+            g_ov.logOff2[i] = 1;
+            aowl_ov_copy(g_ov.logWhy[i], (int32_t)sizeof(g_ov.logWhy[i]),
+                         "GetModuleFileName did not give a usable path");
+        }
+        return;
+    }
+    while (n > 0 && self[n - 1] != '\\' && self[n - 1] != '/') n--;
+    self[n] = 0;
+    _snprintf(g_ov.logPath[AOWL_LOG_SERVER],
+              sizeof(g_ov.logPath[0]) - 1, "%saowlspt-backend.log", self);
+    _snprintf(g_ov.logPath[AOWL_LOG_CLIENT],
+              sizeof(g_ov.logPath[0]) - 1, "%saowlspt-host.log", self);
+    g_ov.logPath[AOWL_LOG_SERVER][sizeof(g_ov.logPath[0]) - 1] = 0;
+    g_ov.logPath[AOWL_LOG_CLIENT][sizeof(g_ov.logPath[0]) - 1] = 0;
+}
+
+/* The level word, as written. Anything else is UNKNOWN -- never info. */
+static int32_t aowl_ov_log_lvl(const char* w, int32_t n) {
+    if (n == 2 && strncmp(w, "ok", 2) == 0) return AOWL_LOGLVL_OK;
+    if (n == 4 && strncmp(w, "info", 4) == 0) return AOWL_LOGLVL_INFO;
+    if (n == 4 && strncmp(w, "warn", 4) == 0) return AOWL_LOGLVL_WARN;
+    if (n == 5 && strncmp(w, "error", 5) == 0) return AOWL_LOGLVL_ERR;
+    if (n == 4 && strncmp(w, "fail", 4) == 0) return AOWL_LOGLVL_ERR;
+    return AOWL_LOGLVL_UNKNOWN;
+}
+
+static const char* aowl_ov_log_lvl_name(int32_t l) {
+    if (l == AOWL_LOGLVL_OK) return "ok";
+    if (l == AOWL_LOGLVL_INFO) return "info";
+    if (l == AOWL_LOGLVL_WARN) return "warn";
+    if (l == AOWL_LOGLVL_ERR) return "error";
+    return "?";
+}
+
+static uint32_t aowl_ov_log_lvl_col(int32_t l) {
+    if (l == AOWL_LOGLVL_OK) return AOWL_OV_GOOD;
+    if (l == AOWL_LOGLVL_WARN) return AOWL_OV_WARN;
+    if (l == AOWL_LOGLVL_ERR) return AOWL_OV_ERR;
+    if (l == AOWL_LOGLVL_INFO) return AOWL_OV_TEXT;
+    return AOWL_OV_DIM;   /* `?` is dim, not white: it is not an info line */
+}
+
+/* Interns a facet name and returns its index, or AOWL_LOG_FACET_SYSTEM. Called
+ * with `cs` held. The table never shrinks and never reorders, which is what
+ * lets `logFacetFilt` be a plain index that survives an append. */
+static int32_t aowl_ov_log_intern(const char* name, int32_t n) {
+    int32_t i, k;
+    char low[AOWL_OV_LOG_FACETLEN];
+    if (n <= 0 || n >= AOWL_OV_LOG_FACETLEN) return AOWL_LOG_FACET_SYSTEM;
+    for (k = 0; k < n; k++) {
+        char c = name[k];
+        if (c >= 'A' && c <= 'Z') c = (char)(c + 32);
+        low[k] = c;
+    }
+    low[n] = 0;
+    for (i = 0; i < g_ov.logFacetN; i++)
+        if (strcmp(g_ov.logFacets[i], low) == 0) return i;
+    if (g_ov.logFacetN >= AOWL_OV_LOG_FACETS) {
+        /* Counted, not dropped in silence -- the strip prints it. */
+        g_ov.logFacetOver++;
+        return AOWL_LOG_FACET_SYSTEM;
+    }
+    aowl_ov_copy(g_ov.logFacets[g_ov.logFacetN], AOWL_OV_LOG_FACETLEN, low);
+    return g_ov.logFacetN++;
+}
+
+/* THE FACET RULE. Stated in full where the screen is described; this is it in
+ * code, and it is deliberately the whole of it -- there is no table of mod
+ * names to fall back on, because a hardcoded table is wrong the day a mod is
+ * added, and wrong silently. */
+static int32_t aowl_ov_log_facet(const char* msg, int32_t n) {
+    int32_t i = 0, hasAlpha = 0;
+    while (i < n && msg[i] != ' ' && msg[i] != '\t') {
+        char c = msg[i];
+        if (c == ':') break;
+        if ((c >= 'a' && c <= 'z') || (c >= 'A' && c <= 'Z')) hasAlpha = 1;
+        else if (!((c >= '0' && c <= '9') || c == '.' || c == '_' || c == '-'))
+            return AOWL_LOG_FACET_SYSTEM;
+        i++;
+        if (i >= AOWL_OV_LOG_FACETLEN) return AOWL_LOG_FACET_SYSTEM;
+    }
+    /* The colon is REQUIRED and must be the token's last character: `sain:` is
+     * a facet, `sain` is not, and neither is `http://x`. */
+    if (i < 2 || i >= n || msg[i] != ':') return AOWL_LOG_FACET_SYSTEM;
+    if (i + 1 < n && msg[i + 1] != ' ' && msg[i + 1] != '\t')
+        return AOWL_LOG_FACET_SYSTEM;
+    if (!hasAlpha) return AOWL_LOG_FACET_SYSTEM;
+    return aowl_ov_log_intern(msg, i);
+}
+
+/* One line into the ring. Called with `cs` held. `n` excludes the terminator;
+ * a longer line is kept up to the buffer and marked `..`, never dropped -- a
+ * 6 KB PROBE line still has a readable first 190 characters, and its facet and
+ * level are both inside them. */
+static void aowl_ov_log_append(int32_t src, const char* line, int32_t n) {
+    AowlOvLogLine* L;
+    int32_t i, cut = 0, msgAt = 0;
+    while (n > 0 && (line[n - 1] == 13 || line[n - 1] == 10)) n--;
+    if (n <= 0) return;
+    L = &g_ov.logs[g_ov.logSeq % AOWL_OV_LOG_MAX];
+    if (n > AOWL_OV_LOG_TEXT - 3) { n = AOWL_OV_LOG_TEXT - 3; cut = 1; }
+    memcpy(L->text, line, (size_t)n);
+    if (cut) { L->text[n] = '.'; L->text[n + 1] = '.'; n += 2; }
+    L->text[n] = 0;
+    L->src = src;
+    L->lvl = AOWL_LOGLVL_UNKNOWN;
+    L->facet = AOWL_LOG_FACET_SYSTEM;
+    L->msgAt = 0;
+    /* `[0:00:01.187] ok     admin diag (...)`. No prefix is a real case (a
+     * wrapped message, a stack trace) and it keeps `?` and `system`, because
+     * inheriting the line above would be a guess dressed as a fact. */
+    if (L->text[0] == '[') {
+        for (i = 1; i < n && L->text[i] != ']'; i++) { }
+        if (i < n) {
+            int32_t j = i + 1, w;
+            while (j < n && (L->text[j] == ' ' || L->text[j] == '\t')) j++;
+            w = j;
+            while (w < n && L->text[w] != ' ' && L->text[w] != '\t') w++;
+            L->lvl = aowl_ov_log_lvl(L->text + j, w - j);
+            if (L->lvl != AOWL_LOGLVL_UNKNOWN) {
+                while (w < n && (L->text[w] == ' ' || L->text[w] == '\t')) w++;
+                msgAt = w;
+            } else {
+                msgAt = j;   /* an unrecognised level word IS the message */
+            }
+        }
+    }
+    L->msgAt = msgAt;
+    if (msgAt < n)
+        L->facet = aowl_ov_log_facet(L->text + msgAt, n - msgAt);
+    g_ov.logSeq++;
+    if (g_ov.logCount < AOWL_OV_LOG_MAX) g_ov.logCount++;
+    else g_ov.logDropped++;
+    g_ov.logLines[src]++;
+    g_ov.logSerial++;
+}
+
+/* One source, one poll. Opens, reads at most AOWL_OV_LOG_CHUNK new bytes, and
+ * appends whole lines. The file IO happens with `cs` NOT held; only the append
+ * loop takes it.
+ *
+ * The share mode is the point: the backend has its log open for append and the
+ * host has the other one, so anything less than FILE_SHARE_READ | WRITE |
+ * DELETE fails on a live install -- which is the only install there is. */
+static void aowl_ov_log_pull(int32_t src, char* scratch, int32_t cap) {
+    HANDLE h;
+    LARGE_INTEGER sz, pos;
+    DWORD got = 0;
+    int32_t want, i, start;
+
+    if (g_ov.logOff2[src] || !g_ov.logPath[src][0]) return;
+    h = CreateFileA(g_ov.logPath[src], GENERIC_READ,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    NULL, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, NULL);
+    if (h == INVALID_HANDLE_VALUE) {
+        DWORD e = GetLastError();
+        g_ov.logFail[src]++;
+        aowl_ov_fmt(g_ov.logWhy[src], (int32_t)sizeof(g_ov.logWhy[0]),
+                    "cannot open %s (error %lu)", g_ov.logPath[src],
+                    (unsigned long)e);
+        if (g_ov.logFail[src] >= AOWL_OV_LOG_MAXFAIL) {
+            g_ov.logOff2[src] = 1;
+            aowl_ov_fmt(g_ov.logWhy[src], (int32_t)sizeof(g_ov.logWhy[0]),
+                        "gave up after %d failures to open %s (error %lu)",
+                        AOWL_OV_LOG_MAXFAIL, g_ov.logPath[src],
+                        (unsigned long)e);
+        }
+        return;
+    }
+    if (!GetFileSizeEx(h, &sz)) {
+        CloseHandle(h);
+        g_ov.logFail[src]++;
+        aowl_ov_copy(g_ov.logWhy[src], (int32_t)sizeof(g_ov.logWhy[0]),
+                     "the file opened but its size could not be read");
+        return;
+    }
+    g_ov.logFail[src] = 0;
+    /* Truncated or rotated: start again from the tail rather than reading from
+     * an offset past the end, which would look like "the log went quiet". */
+    if (sz.QuadPart < g_ov.logOff[src]) {
+        g_ov.logOff[src] = 0;
+        g_ov.logOpened[src] = 0;
+        g_ov.logCarryN[src] = 0;
+    }
+    if (!g_ov.logOpened[src]) {
+        g_ov.logOpened[src] = 1;
+        g_ov.logOff[src] = sz.QuadPart > (long long)AOWL_OV_LOG_TAIL
+                         ? sz.QuadPart - (long long)AOWL_OV_LOG_TAIL : 0;
+        /* A tail that starts mid-line drops that half-line rather than showing
+         * it: half a line at the very top reads as a corrupted log. */
+        g_ov.logCarryN[src] = g_ov.logOff[src] > 0 ? -1 : 0;
+    }
+    if (sz.QuadPart <= g_ov.logOff[src]) {
+        CloseHandle(h);
+        if (g_ov.logLines[src] == 0)
+            aowl_ov_fmt(g_ov.logWhy[src], (int32_t)sizeof(g_ov.logWhy[0]),
+                        "%s is %lld bytes and nothing new has been written",
+                        g_ov.logPath[src], (long long)sz.QuadPart);
+        return;
+    }
+    want = (int32_t)(sz.QuadPart - g_ov.logOff[src]);
+    if (want > cap) want = cap;
+    if (want > AOWL_OV_LOG_CHUNK) want = AOWL_OV_LOG_CHUNK;
+    pos.QuadPart = g_ov.logOff[src];
+    if (!SetFilePointerEx(h, pos, NULL, FILE_BEGIN) ||
+        !ReadFile(h, scratch, (DWORD)want, &got, NULL)) {
+        CloseHandle(h);
+        g_ov.logFail[src]++;
+        aowl_ov_copy(g_ov.logWhy[src], (int32_t)sizeof(g_ov.logWhy[0]),
+                     "the file opened but the read failed");
+        return;
+    }
+    CloseHandle(h);
+    if (got == 0) return;
+    g_ov.logOff[src] += (long long)got;
+    g_ov.logWhy[src][0] = 0;
+
+    EnterCriticalSection(&g_ov.cs);
+    start = 0;
+    for (i = 0; i < (int32_t)got; i++) {
+        if (scratch[i] != 10) continue;
+        if (g_ov.logCarryN[src] < 0) {
+            g_ov.logCarryN[src] = 0;      /* the first-read half-line, dropped */
+        } else if (g_ov.logCarryN[src] > 0) {
+            int32_t room = AOWL_OV_LOG_TEXT - 1 - g_ov.logCarryN[src];
+            int32_t take = i - start;
+            if (take > room) take = room;
+            if (take > 0)
+                memcpy(g_ov.logCarry[src] + g_ov.logCarryN[src],
+                       scratch + start, (size_t)take);
+            aowl_ov_log_append(src, g_ov.logCarry[src],
+                               g_ov.logCarryN[src] + take);
+            g_ov.logCarryN[src] = 0;
+        } else {
+            aowl_ov_log_append(src, scratch + start, i - start);
+        }
+        start = i + 1;
+    }
+    /* Whatever is left has no newline yet -- carry it, bounded. A single line
+     * longer than the carry buffer is cut here and marked by the append, the
+     * same treatment a 6 KB PROBE line gets. */
+    if (g_ov.logCarryN[src] >= 0) {
+        int32_t rest = (int32_t)got - start;
+        if (rest > AOWL_OV_LOG_TEXT - 1) rest = AOWL_OV_LOG_TEXT - 1;
+        if (rest > 0) {
+            memcpy(g_ov.logCarry[src], scratch + start, (size_t)rest);
+            g_ov.logCarryN[src] = rest;
+        }
+    }
+    LeaveCriticalSection(&g_ov.cs);
+}
+
 static DWORD WINAPI aowl_ov_worker(LPVOID unused) {
     /* Static rather than automatic: 32 KB on a thread stack is affordable and
      * 32 KB that is allocated once is one fewer thing that can fail late.
@@ -3395,6 +3827,9 @@ static DWORD WINAPI aowl_ov_worker(LPVOID unused) {
      * a moment after the worker exists, and a first fetch fired before
      * `aowl_ov_sync_start` has run would only have to be thrown away. */
     int32_t sinceSync = 0;
+    /* Starts at the interval so the first frame of the logs screen is not a
+     * blank pane for four hundred milliseconds. */
+    int32_t sinceLog = AOWL_OV_LOG_POLL_MS;
 
     while (g_ov.workerRun) {
         AowlOvCmd cmd;
@@ -3804,10 +4239,29 @@ static DWORD WINAPI aowl_ov_worker(LPVOID unused) {
             }
         }
 
+        /* --- THE LOG TAIL ------------------------------------------------
+         *
+         * Only while the screen is being drawn (`logWant`), and at most once
+         * every AOWL_OV_LOG_POLL_MS. Two opens, two reads of at most
+         * AOWL_OV_LOG_CHUNK bytes each, on this thread; the render thread does
+         * none of it. With the screen shut this block is one integer compare
+         * per pass and touches no file at all -- which is the whole reason
+         * `logWant` exists rather than polling unconditionally.
+         *
+         * `buf` is reused: every step above fills it before reading it, so
+         * nothing here can be seen by them. */
+        if (g_ov.logWant && sinceLog >= AOWL_OV_LOG_POLL_MS) {
+            sinceLog = 0;
+            aowl_ov_log_paths();
+            aowl_ov_log_pull(AOWL_LOG_SERVER, buf, (int32_t)sizeof(buf));
+            aowl_ov_log_pull(AOWL_LOG_CLIENT, buf, (int32_t)sizeof(buf));
+        }
+
         Sleep(50);
         sinceFast += 50;
         sinceSlow += 50;
         sinceSync += 50;
+        sinceLog += 50;
     }
     return 0;
 }
@@ -4876,6 +5330,10 @@ static int32_t aowl_ov_row_count(int32_t view, const int32_t* vis, int32_t visN)
     if (view == AOWL_VIEW_MODS) return visN;
     if (view == AOWL_VIEW_LISTS) return g_ov.sListCount;
     if (view == AOWL_VIEW_ISSUES) return g_ov.sIssueCount;
+    /* The FILTERED count, not the held count: the cursor moves through what is
+     * on screen, and a count that included hidden lines would let END land on
+     * a row that is not drawn. */
+    if (view == AOWL_VIEW_LOGS) return g_ov.logFiltN;
     return g_ov.sResultCount;
 }
 
@@ -4895,6 +5353,11 @@ static void aowl_ov_s_flush_now(void);
 static void aowl_ov_rebuild_pages(void);
 static int32_t aowl_ov_searching(void);
 static char aowl_ov_vk_char(LONG vk);
+/* The LOGS view's own key handler and its focus flag, both defined with the
+ * screen below. Declared here for the same reason the settings pair is: the
+ * key pump is above the screens it drives. */
+static int32_t aowl_ov_logs_key(LONG vk, int32_t page, int32_t count);
+static int32_t aowl_ov_log_searching(void);
 
 /* Drains the ring and turns it into actions. Runs on the render thread, once
  * per frame, so a key pressed between two frames is never lost and a key held
@@ -4990,7 +5453,15 @@ static void aowl_ov_keys(int32_t page, const int32_t* vis, int32_t visN) {
             InterlockedExchange(&g_ov.prefsDirty, 1);
             continue;
         }
-        if (!(g_ov.settings && g_ov.searchFocus)) {
+        /* The alias keys are live UNLESS a text field on the current screen
+         * has the keyboard -- the settings search box, or the logs one. The
+         * fix for `-`/`=` being eaten was never "no text fields"; it was
+         * "shortcuts a text field cannot eat" (the F-keys above) plus this
+         * one narrow exception, and a second screen with a search box has to
+         * be named here or it reintroduces exactly that bug. */
+        if (!((g_ov.settings && g_ov.searchFocus) ||
+              (!g_ov.settings && g_ov.view == AOWL_VIEW_LOGS &&
+               aowl_ov_log_searching()))) {
             if (vk == VK_OEM_MINUS || vk == VK_SUBTRACT) {
                 g_ov.panAlpha -= 27;
                 if (g_ov.panAlpha < 40) g_ov.panAlpha = 40;
@@ -5007,6 +5478,12 @@ static void aowl_ov_keys(int32_t page, const int32_t* vis, int32_t visN) {
 
         if (g_ov.settings) { aowl_ov_settings_key(vk, page); continue; }
 
+        /* The logs screen gets first refusal, so its search box can own TAB
+         * and the arrows while it has focus. It returns 0 for anything it does
+         * not claim, and everything below then behaves exactly as it did. */
+        if (view == AOWL_VIEW_LOGS && aowl_ov_logs_key(vk, page, count))
+            continue;
+
         if (vk == VK_TAB || vk == VK_RIGHT) {
             g_ov.view = (view + 1) % AOWL_VIEW_COUNT;
             continue;
@@ -5015,7 +5492,7 @@ static void aowl_ov_keys(int32_t page, const int32_t* vis, int32_t visN) {
             g_ov.view = (view + AOWL_VIEW_COUNT - 1) % AOWL_VIEW_COUNT;
             continue;
         }
-        if (vk >= '1' && vk <= '4') { g_ov.view = (int32_t)(vk - '1'); continue; }
+        if (vk >= '1' && vk <= '5') { g_ov.view = (int32_t)(vk - '1'); continue; }
         if (vk == VK_UP   || vk == 'W') { aowl_ov_move(view, -1, count); continue; }
         if (vk == VK_DOWN || vk == 'S') { aowl_ov_move(view, +1, count); continue; }
         if (vk == VK_PRIOR) { aowl_ov_move(view, -page, count); continue; }
@@ -5086,8 +5563,12 @@ static void aowl_ov_health(char* out, int32_t cap, uint32_t* col) {
     *col = AOWL_OV_WARN;
 }
 
-static void aowl_ov_tabs(float x, float y, float w, int32_t counts[4]) {
-    static const char* names[AOWL_VIEW_COUNT] = { "MODS", "LISTS", "ISSUES", "APPLY" };
+/* `counts` is sized by the enum rather than by a literal 4 -- it was `[4]`,
+ * which a fifth view would have overrun silently. */
+static void aowl_ov_tabs(float x, float y, float w,
+                         int32_t counts[AOWL_VIEW_COUNT]) {
+    static const char* names[AOWL_VIEW_COUNT] = { "MODS", "LISTS", "ISSUES",
+                                                  "APPLY", "LOGS" };
     float tx = x + AOWL_OV_PAD;
     int32_t i;
     aowl_ov_rect(x + 1.0f, y, w - 2.0f, (float)AOWL_OV_TABS_H, AOWL_OV_PANEBG);
@@ -7712,6 +8193,406 @@ static void aowl_ov_view_settings(float x, float y, float w, float bodyH) {
 }
 
 /* Refreshed on a timer rather than per frame -- see above. */
+/* ================================================================== *
+ * The logs screen -- filtering and drawing
+ *
+ * Render thread only. It reads the ring under `cs`, and it holds `cs` for
+ * exactly two bounded stretches: the refilter (which runs only when something
+ * it depends on has moved) and the copy of the <= `rows` lines about to be
+ * drawn. It never draws with the lock held and it never does file IO.
+ * ================================================================== */
+
+static const char* aowl_ov_log_src_name(int32_t f) {
+    if (f == AOWL_LOGSRC_SERVER) return "server";
+    if (f == AOWL_LOGSRC_CLIENT) return "client";
+    return "all";
+}
+
+/* The level filter. `warn+` is the one people actually reach for, so it is the
+ * first step off `all`; the exact-level states follow it. */
+enum { AOWL_LOGF_ALL = 0, AOWL_LOGF_WARNPLUS, AOWL_LOGF_ERROR, AOWL_LOGF_WARN,
+       AOWL_LOGF_INFO, AOWL_LOGF_OK, AOWL_LOGF_UNKNOWN, AOWL_LOGF_COUNT };
+
+static const char* aowl_ov_log_lvlf_name(int32_t f) {
+    if (f == AOWL_LOGF_WARNPLUS) return "warn+";
+    if (f == AOWL_LOGF_ERROR) return "error";
+    if (f == AOWL_LOGF_WARN) return "warn";
+    if (f == AOWL_LOGF_INFO) return "info";
+    if (f == AOWL_LOGF_OK) return "ok";
+    if (f == AOWL_LOGF_UNKNOWN) return "unparsed";
+    return "all";
+}
+
+static const char* aowl_ov_log_facet_name(int32_t f) {
+    if (f == AOWL_LOG_FACET_ALL) return "all";
+    if (f == AOWL_LOG_FACET_SYSTEM) return "system";
+    if (f >= 0 && f < g_ov.logFacetN) return g_ov.logFacets[f];
+    return "all";
+}
+
+/* Case-insensitive substring, over the WHOLE line -- elapsed, level and
+ * message. Searching only the message would make `warn` un-findable by typing
+ * it, which is the sort of surprise the scope line below exists to prevent. */
+static int32_t aowl_ov_log_hit(const AowlOvLogLine* L, const char* term) {
+    if (!term[0]) return 1;
+    return aowl_ov_ci_find(L->text, term);
+}
+
+/* THE ONE PREDICATE. Every filter goes through here and nothing else decides
+ * what is on screen, so "no combination of filters can display a line whose
+ * source, level or facet does not match" is a property of four `if`s rather
+ * than of a drawing loop nobody can audit. */
+static int32_t aowl_ov_log_pass(const AowlOvLogLine* L) {
+    if (g_ov.logSrcFilt == AOWL_LOGSRC_SERVER && L->src != AOWL_LOG_SERVER)
+        return 0;
+    if (g_ov.logSrcFilt == AOWL_LOGSRC_CLIENT && L->src != AOWL_LOG_CLIENT)
+        return 0;
+    switch (g_ov.logLvlFilt) {
+        case AOWL_LOGF_ALL: break;
+        case AOWL_LOGF_WARNPLUS:
+            if (L->lvl != AOWL_LOGLVL_WARN && L->lvl != AOWL_LOGLVL_ERR)
+                return 0;
+            break;
+        case AOWL_LOGF_ERROR:   if (L->lvl != AOWL_LOGLVL_ERR) return 0; break;
+        case AOWL_LOGF_WARN:    if (L->lvl != AOWL_LOGLVL_WARN) return 0; break;
+        case AOWL_LOGF_INFO:    if (L->lvl != AOWL_LOGLVL_INFO) return 0; break;
+        case AOWL_LOGF_OK:      if (L->lvl != AOWL_LOGLVL_OK) return 0; break;
+        case AOWL_LOGF_UNKNOWN:
+            if (L->lvl != AOWL_LOGLVL_UNKNOWN) return 0;
+            break;
+        default: break;
+    }
+    if (g_ov.logFacetFilt != AOWL_LOG_FACET_ALL &&
+        L->facet != g_ov.logFacetFilt) return 0;
+    return aowl_ov_log_hit(L, g_ov.logSearch);
+}
+
+/* What `logFilt` was computed for. Any change in any of these re-derives it;
+ * nothing else does, so a still frame with the screen open walks zero lines. */
+static uint32_t aowl_ov_log_stamp(void) {
+    uint32_t h = 2166136261u;
+    int32_t k;
+    aowl_ov_sig_add(&h, g_ov.logSerial);
+    aowl_ov_sig_add(&h, g_ov.logSrcFilt);
+    aowl_ov_sig_add(&h, g_ov.logLvlFilt);
+    aowl_ov_sig_add(&h, g_ov.logFacetFilt);
+    for (k = 0; g_ov.logSearch[k]; k++) aowl_ov_sig_add(&h, g_ov.logSearch[k]);
+    return h ? h : 1u;
+}
+
+static void aowl_ov_log_refilter(void) {
+    uint32_t want = aowl_ov_log_stamp();
+    int32_t first, seq, n = 0;
+    if (want == g_ov.logFiltStamp) return;
+    EnterCriticalSection(&g_ov.cs);
+    first = g_ov.logSeq - g_ov.logCount;
+    if (first < 0) first = 0;
+    for (seq = first; seq < g_ov.logSeq && n < AOWL_OV_LOG_MAX; seq++)
+        if (aowl_ov_log_pass(&g_ov.logs[seq % AOWL_OV_LOG_MAX]))
+            g_ov.logFilt[n++] = seq;
+    LeaveCriticalSection(&g_ov.cs);
+    g_ov.logFiltN = n;
+    g_ov.logFiltStamp = want;
+    if (g_ov.sel[AOWL_VIEW_LOGS] >= n) g_ov.sel[AOWL_VIEW_LOGS] = n > 0 ? n - 1 : 0;
+    /* Following means the newest line, not the newest line that used to pass:
+     * changing a filter with follow on lands on the last MATCH. */
+    if (g_ov.logFollow) g_ov.sel[AOWL_VIEW_LOGS] = n > 0 ? n - 1 : 0;
+}
+
+static int32_t aowl_ov_log_searching(void) { return g_ov.logSearchFocus; }
+
+/* The facet cycle: all -> system -> each facet in the order it was first seen
+ * -> back to all. `dir` is +1 or -1. */
+static void aowl_ov_log_cycle_facet(int32_t dir) {
+    int32_t f = g_ov.logFacetFilt;
+    int32_t lo = AOWL_LOG_FACET_ALL, hi = g_ov.logFacetN - 1;
+    f += dir;
+    if (f > hi) f = lo;
+    if (f < lo) f = hi < lo ? lo : hi;
+    g_ov.logFacetFilt = f;
+}
+
+/* Keys, when the LOGS view has them. Called from `aowl_ov_keys`, after the
+ * window keys (F9/F10/F11) and before the manager`s own list keys, so nothing
+ * here can shadow a key that works everywhere.
+ *
+ * THE SEARCH FIELD DOES NOT STEAL FOCUS. It is drawn on every frame of this
+ * screen and it owns the keyboard only after `/` or a click on it, which is
+ * the rule the settings screen already follows and the one that was broken and
+ * fixed earlier today. `-` and `=` therefore keep working here in exactly the
+ * state the screen opens in.
+ *
+ * Returns 1 when it consumed the key. */
+static int32_t aowl_ov_logs_key(LONG vk, int32_t page, int32_t count) {
+    int32_t L;
+    char ch;
+    if (g_ov.logSearchFocus) {
+        if (vk == VK_ESCAPE) { g_ov.logSearch[0] = 0; g_ov.logSearchFocus = 0; return 1; }
+        if (vk == VK_RETURN || vk == VK_DOWN || vk == VK_TAB) {
+            g_ov.logSearchFocus = 0; return 1;
+        }
+        if (vk == VK_BACK) {
+            L = (int32_t)strlen(g_ov.logSearch);
+            if (L > 0) g_ov.logSearch[L - 1] = 0;
+            return 1;
+        }
+        ch = aowl_ov_vk_char(vk);
+        if (ch) {
+            if (ch >= 0x41 && ch <= 0x5A) ch = (char)(ch + 32);
+            L = (int32_t)strlen(g_ov.logSearch);
+            if (L < (int32_t)sizeof(g_ov.logSearch) - 1) {
+                g_ov.logSearch[L] = ch; g_ov.logSearch[L + 1] = 0;
+            }
+        }
+        return 1;   /* a focused field consumes EVERY printable key */
+    }
+    if (vk == VK_OEM_2) { g_ov.logSearchFocus = 1; return 1; }
+    /* The four filters. Letters that the manager views do not already use --
+     * `F`, `C`, `A`, `R`, `W` and `S` are taken, and `1`-`5` jump views. */
+    if (vk == 'O') {
+        g_ov.logSrcFilt = (g_ov.logSrcFilt + 1) % AOWL_LOGSRC_COUNT;
+        return 1;
+    }
+    if (vk == 'L') {
+        g_ov.logLvlFilt = (g_ov.logLvlFilt + 1) % AOWL_LOGF_COUNT;
+        return 1;
+    }
+    if (vk == 'M') { aowl_ov_log_cycle_facet(+1); return 1; }
+    if (vk == 'N') { aowl_ov_log_cycle_facet(-1); return 1; }
+    if (vk == 'G') { g_ov.logFollow = !g_ov.logFollow; return 1; }
+    /* Moving off the bottom by hand is how you stop following; END resumes. */
+    if (vk == VK_UP || vk == VK_PRIOR || vk == VK_HOME || vk == 'W')
+        g_ov.logFollow = 0;
+    if (vk == VK_END) g_ov.logFollow = 1;
+    (void)page; (void)count;
+    return 0;
+}
+
+/* The body. `rows` is how many log lines fit under the two-line filter strip
+ * and above the three-line detail pane. */
+static void aowl_ov_view_logs(float x, float y, float w, float bodyH,
+                              int32_t rows) {
+    int32_t cols = (int32_t)(w / AOWL_OV_CW);
+    int32_t sel, i, held, dropped, seqLo;
+    float ry, sy = y;
+    char line[288];
+    /* The visible page, copied out from under the lock in one go. 40 lines of
+     * 208 bytes is 8 KB of stack, which is why `rows` is clamped: a panel
+     * maximised on a 4K screen is about 34 rows at scale 3. */
+    AowlOvLogLine page[64];
+    int32_t pageN = 0, top;
+
+    aowl_ov_log_refilter();
+    sel = g_ov.sel[AOWL_VIEW_LOGS];
+
+    /* --- the filter strip, one line, every chip clickable ---------------- */
+    {
+        float cx = x + AOWL_OV_PAD;
+        struct { const char* k; const char* lab; const char* val; int32_t on; } chip[4];
+        int32_t c;
+        chip[0].k = "O"; chip[0].lab = "source";
+        chip[0].val = aowl_ov_log_src_name(g_ov.logSrcFilt);
+        chip[0].on = g_ov.logSrcFilt != AOWL_LOGSRC_ALL;
+        chip[1].k = "L"; chip[1].lab = "level";
+        chip[1].val = aowl_ov_log_lvlf_name(g_ov.logLvlFilt);
+        chip[1].on = g_ov.logLvlFilt != AOWL_LOGF_ALL;
+        chip[2].k = "M"; chip[2].lab = "mod";
+        chip[2].val = aowl_ov_log_facet_name(g_ov.logFacetFilt);
+        chip[2].on = g_ov.logFacetFilt != AOWL_LOG_FACET_ALL;
+        chip[3].k = "G"; chip[3].lab = "follow";
+        chip[3].val = g_ov.logFollow ? "on" : "off";
+        chip[3].on = g_ov.logFollow;
+        for (c = 0; c < 4; c++) {
+            float cw;
+            int32_t hot;
+            aowl_ov_fmt(line, (int32_t)sizeof(line), " %s %s: %s ",
+                        chip[c].k, chip[c].lab, chip[c].val);
+            cw = (float)(strlen(line) * AOWL_OV_CW);
+            if (cx + cw > x + w) break;   /* never draw past the pane */
+            hot = aowl_ov_hit(cx, sy, cw, (float)AOWL_OV_ROW_H);
+            aowl_ov_rect(cx, sy, cw, (float)AOWL_OV_ROW_H,
+                         chip[c].on ? AOWL_OV_SELBG
+                                    : (hot ? AOWL_OV_HOT : AOWL_OV_PANEBG));
+            aowl_ov_text(cx, sy + 3.0f, line,
+                         chip[c].on ? AOWL_OV_ACCENT : AOWL_OV_DIM);
+            if (hot && g_ov.clickDown) {
+                if (c == 0) g_ov.logSrcFilt = (g_ov.logSrcFilt + 1) % AOWL_LOGSRC_COUNT;
+                else if (c == 1) g_ov.logLvlFilt = (g_ov.logLvlFilt + 1) % AOWL_LOGF_COUNT;
+                else if (c == 2) aowl_ov_log_cycle_facet(+1);
+                else g_ov.logFollow = !g_ov.logFollow;
+                InterlockedExchange(&g_ov.clickDown, 0);
+                aowl_ov_log_refilter();
+                sel = g_ov.sel[AOWL_VIEW_LOGS];
+            }
+            cx += cw + 6.0f;
+        }
+        sy += (float)AOWL_OV_ROW_H + 2.0f;
+    }
+
+    /* --- the search box, same shape and same focus rule as the settings
+     * screen`s: always visible, focused only by `/` or a click. -------- */
+    {
+        float bh = (float)AOWL_OV_SEARCH_BOX;
+        float bx = x + AOWL_OV_PAD, bw = w - 2.0f * AOWL_OV_PAD;
+        int32_t hot = aowl_ov_hit(bx, sy, bw, bh);
+        int32_t on = g_ov.logSearchFocus;
+        aowl_ov_rect(bx, sy, bw, bh,
+                     on ? AOWL_OV_SELBG : (hot ? AOWL_OV_HOT : AOWL_OV_PANEBG));
+        aowl_ov_frame_rect(bx, sy, bw, bh, on ? 2.0f : 1.0f,
+                           on ? AOWL_OV_ACCENT : AOWL_OV_EDGE);
+        aowl_ov_text(bx + 6.0f, sy + 3.0f, "[/]",
+                     on ? AOWL_OV_ACCENT : AOWL_OV_DIM);
+        if (g_ov.logSearch[0])
+            aowl_ov_fmt(line, (int32_t)sizeof(line), "%s%s", g_ov.logSearch,
+                        on ? "_" : "");
+        else
+            aowl_ov_fmt(line, (int32_t)sizeof(line), "%s",
+                        on ? "_" : "search both logs -- time, level and message");
+        aowl_ov_textn(bx + 6.0f + 4.0f * AOWL_OV_CW, sy + 3.0f, line,
+                      g_ov.logSearch[0] ? AOWL_OV_TEXT : AOWL_OV_FAINT,
+                      (int32_t)((bw - 12.0f - 4.0f * AOWL_OV_CW) / AOWL_OV_CW));
+        if (g_ov.logSearch[0]) {
+            float cxx = bx + bw - 4.0f * AOWL_OV_CW;
+            int32_t hotC = aowl_ov_hit(cxx - 2.0f, sy, 3.0f * AOWL_OV_CW, bh);
+            aowl_ov_text(cxx, sy + 3.0f, "[x]", hotC ? AOWL_OV_TEXT : AOWL_OV_DIM);
+            if (hotC && g_ov.clickDown) {
+                g_ov.logSearch[0] = 0; g_ov.logSearchFocus = 0;
+                InterlockedExchange(&g_ov.clickDown, 0);
+                hot = 0;
+            }
+        }
+        if (hot && g_ov.clickDown) {
+            g_ov.logSearchFocus = 1;
+            InterlockedExchange(&g_ov.clickDown, 0);
+        }
+        sy += bh + 3.0f;
+    }
+
+    /* --- what was searched, and what is being held --------------------- */
+    EnterCriticalSection(&g_ov.cs);
+    held = g_ov.logCount;
+    dropped = g_ov.logDropped;
+    seqLo = g_ov.logSeq - g_ov.logCount;
+    LeaveCriticalSection(&g_ov.cs);
+    aowl_ov_fmt(line, (int32_t)sizeof(line),
+                "%d of %d lines held (%d server, %d client)%s%s",
+                g_ov.logFiltN, held,
+                g_ov.logLines[AOWL_LOG_SERVER], g_ov.logLines[AOWL_LOG_CLIENT],
+                dropped > 0 ? "  older lines dropped: " : "",
+                dropped > 0 ? "yes" : "");
+    if (dropped > 0)
+        aowl_ov_fmt(line, (int32_t)sizeof(line),
+                    "%d of %d lines held  (%d server, %d client)  %d older "
+                    "lines scrolled out of the ring",
+                    g_ov.logFiltN, held, g_ov.logLines[AOWL_LOG_SERVER],
+                    g_ov.logLines[AOWL_LOG_CLIENT], dropped);
+    aowl_ov_textn(x + AOWL_OV_PAD, sy, line, AOWL_OV_FAINT, cols);
+    sy += (float)AOWL_OV_LINE_H;
+
+    /* A source that is switched off, or that has never produced a line, says
+     * so IN WORDS. An empty pane that does not distinguish "the file is not
+     * there" from "the log is quiet" is the silent decline this project keeps
+     * paying for. */
+    for (i = 0; i < AOWL_LOG_SRCS; i++) {
+        if (!g_ov.logWhy[i][0]) continue;
+        aowl_ov_fmt(line, (int32_t)sizeof(line), "%s log: %s",
+                    i == AOWL_LOG_SERVER ? "server" : "client", g_ov.logWhy[i]);
+        aowl_ov_textn(x + AOWL_OV_PAD, sy, line,
+                      g_ov.logOff2[i] ? AOWL_OV_ERR : AOWL_OV_WARN, cols);
+        sy += (float)AOWL_OV_LINE_H;
+    }
+
+    /* --- rows ---------------------------------------------------------- */
+    rows = (int32_t)((y + bodyH - 3.0f * AOWL_OV_LINE_H - sy) / AOWL_OV_ROW_H);
+    if (rows < 1) rows = 1;
+    if (rows > (int32_t)(sizeof(page) / sizeof(page[0])))
+        rows = (int32_t)(sizeof(page) / sizeof(page[0]));
+
+    if (g_ov.logFiltN == 0) {
+        aowl_ov_wrap(x + AOWL_OV_PAD, sy,
+                     held == 0
+                       ? "Nothing has been read from either log yet. The two "
+                         "files are read directly from the install directory, "
+                         "so this screen works with the backend down."
+                       : "No line matches. O cycles the source, L the level, "
+                         "M the mod, and / searches -- ESC in the box clears "
+                         "the term.",
+                     AOWL_OV_DIM, cols - 3, 4);
+        return;
+    }
+
+    top = g_ov.top[AOWL_VIEW_LOGS];
+    if (top > sel) top = sel;
+    if (sel - top >= rows) top = sel - rows + 1;
+    if (top > g_ov.logFiltN - rows) top = g_ov.logFiltN - rows;
+    if (top < 0) top = 0;
+    g_ov.top[AOWL_VIEW_LOGS] = top;
+
+    EnterCriticalSection(&g_ov.cs);
+    for (i = 0; i < rows && top + i < g_ov.logFiltN; i++) {
+        int32_t seq = g_ov.logFilt[top + i];
+        /* Evicted since the filter was built. Cannot happen while `logSerial`
+         * drives the stamp -- every append bumps it -- but a row drawn from a
+         * slot that has been overwritten is exactly the kind of plausible-
+         * looking wrong answer this file keeps a rule about, so it is checked
+         * rather than assumed. */
+        if (seq < seqLo || seq >= g_ov.logSeq) {
+            page[pageN].text[0] = 0;
+            page[pageN].src = -1;
+            page[pageN].lvl = AOWL_LOGLVL_UNKNOWN;
+            page[pageN].facet = AOWL_LOG_FACET_SYSTEM;
+            page[pageN].msgAt = 0;
+        } else {
+            page[pageN] = g_ov.logs[seq % AOWL_OV_LOG_MAX];
+        }
+        pageN++;
+    }
+    LeaveCriticalSection(&g_ov.cs);
+
+    ry = sy;
+    for (i = 0; i < pageN; i++) {
+        AowlOvLogLine* Ln = &page[i];
+        uint32_t col = aowl_ov_log_lvl_col(Ln->lvl);
+        if (top + i == sel)
+            aowl_ov_rect(x + 1.0f, ry, w + AOWL_OV_PAD * 2 - 2.0f,
+                         (float)AOWL_OV_ROW_H, AOWL_OV_SELBG);
+        if (Ln->src < 0) {
+            aowl_ov_textn(x + AOWL_OV_PAD, ry + 3.0f,
+                          "(this line scrolled out of the ring while you were "
+                          "looking at it)", AOWL_OV_DIM, cols);
+            ry += (float)AOWL_OV_ROW_H;
+            continue;
+        }
+        aowl_ov_text(x + AOWL_OV_PAD, ry + 3.0f,
+                     Ln->src == AOWL_LOG_SERVER ? "srv" : "cli",
+                     Ln->src == AOWL_LOG_SERVER ? AOWL_OV_ACCENT : AOWL_OV_DIM);
+        aowl_ov_textn(x + AOWL_OV_PAD + 4.0f * AOWL_OV_CW, ry + 3.0f,
+                      Ln->text, col, cols - 5);
+        ry += (float)AOWL_OV_ROW_H;
+    }
+
+    /* The selected line in full, wrapped: a log line is longer than the pane
+     * and a screen that can only show its first sixty characters is a screen
+     * that cannot answer the question it was opened for. */
+    if (sel >= 0 && sel < g_ov.logFiltN && sel - top >= 0 && sel - top < pageN) {
+        AowlOvLogLine* Ln = &page[sel - top];
+        float dy = y + bodyH - 3.0f * (float)AOWL_OV_LINE_H;
+        aowl_ov_rect(x + 1.0f, dy - 4.0f, w + AOWL_OV_PAD * 2 - 2.0f, 1.0f,
+                     AOWL_OV_EDGE);
+        if (Ln->src >= 0) {
+            aowl_ov_fmt(line, (int32_t)sizeof(line), "%s  %s  %s",
+                        Ln->src == AOWL_LOG_SERVER ? "server" : "client",
+                        aowl_ov_log_lvl_name(Ln->lvl),
+                        Ln->facet == AOWL_LOG_FACET_SYSTEM
+                          ? "system" : aowl_ov_log_facet_name(Ln->facet));
+            aowl_ov_textn(x + AOWL_OV_PAD, dy, line,
+                          aowl_ov_log_lvl_col(Ln->lvl), cols);
+            aowl_ov_wrap(x + AOWL_OV_PAD, dy + (float)AOWL_OV_LINE_H,
+                         Ln->text, AOWL_OV_TEXT, cols - 3, 2);
+        }
+    }
+}
+
 static void aowl_ov_refresh_display(void) {
     DWORD now = GetTickCount();
     if (g_ov.dispTick != 0 && now - g_ov.dispTick < 500) return;
@@ -7815,6 +8696,21 @@ static uint32_t aowl_ov_signature(void) {
             aowl_ov_sig_add(&h, g_ov.pageOpen[k]);
     }
     aowl_ov_sig_add(&h, g_ov.filtCount);
+    /* The logs screen. `logSerial` covers the ring; the rest is the filter
+     * state, which changes what is drawn without moving any cursor -- exactly
+     * the case that leaves a stale frame on screen when it is left out. */
+    aowl_ov_sig_add(&h, g_ov.logSerial);
+    aowl_ov_sig_add(&h, g_ov.logSrcFilt);
+    aowl_ov_sig_add(&h, g_ov.logLvlFilt);
+    aowl_ov_sig_add(&h, g_ov.logFacetFilt);
+    aowl_ov_sig_add(&h, g_ov.logFollow);
+    aowl_ov_sig_add(&h, g_ov.logSearchFocus);
+    aowl_ov_sig_add(&h, g_ov.logFiltN);
+    aowl_ov_sig_add(&h, g_ov.logFacetN);
+    {
+        int32_t k;
+        for (k = 0; g_ov.logSearch[k]; k++) aowl_ov_sig_add(&h, g_ov.logSearch[k]);
+    }
     /* The window. A drag moves the panel without touching any cursor, so
      * without these a dragged panel would stop redrawing at its old position. */
     aowl_ov_sig_add(&h, (int32_t)(g_ov.panX * 4.0f));
@@ -7868,6 +8764,15 @@ static void aowl_ov_build(void) {
 
     aowl_ov_snapshot();
     aowl_ov_refresh_display();
+
+    /* WHETHER THE WORKER SHOULD BE TAILING THE LOGS AT ALL. Set before the
+     * geometry cache's early return, not inside the view function: the view
+     * function does not run on a cached frame, and a flag that only gets set
+     * when the panel happens to be rebuilding is a flag that switches itself
+     * off the moment the screen goes still -- which is precisely when somebody
+     * is reading it. */
+    InterlockedExchange(&g_ov.logWant,
+                        (!g_ov.settings && g_ov.view == AOWL_VIEW_LOGS) ? 1 : 0);
 
     /* Nothing moved and nothing is waiting: last frame's vertices are still on
      * the GPU and still correct. Checking input first, because `aowl_ov_keys`
@@ -7965,6 +8870,11 @@ static void aowl_ov_build(void) {
     counts[AOWL_VIEW_LISTS] = g_ov.sListCount;
     counts[AOWL_VIEW_ISSUES] = g_ov.sIssueCount;
     counts[AOWL_VIEW_APPLY] = g_ov.sResultCount;
+    /* Cheap: `aowl_ov_log_refilter` returns immediately unless its stamp moved,
+     * so this is one hash of a handful of integers on a still frame. It has to
+     * run before `aowl_ov_keys`, because PgUp/PgDn and END need the count. */
+    if (g_ov.view == AOWL_VIEW_LOGS && !g_ov.settings) aowl_ov_log_refilter();
+    counts[AOWL_VIEW_LOGS] = g_ov.logFiltN;
 
     /* Rows that fit. The mods view gives up the detail pane's height; the
      * others use the whole body. */
@@ -8085,9 +8995,16 @@ static void aowl_ov_build(void) {
             aowl_ov_fmt(legKeys, (int32_t)sizeof(legKeys),
                         "TAB view  UP/DN move  ENTER activate this list  "
                         "A apply  R reload  INS/ESC close");
+        else if (g_ov.view == AOWL_VIEW_LOGS)
+            /* Named in the order they are reached for, and every key here
+             * works from the state the screen OPENS in -- the search box has
+             * no focus until `/` or a click, so `-`/`=` are live too. */
+            aowl_ov_fmt(legKeys, (int32_t)sizeof(legKeys),
+                        "/ search   O source   L level   M/N mod   G follow   "
+                        "UP/DN line   END newest   TAB view   INS/ESC close");
         else
             aowl_ov_fmt(legKeys, (int32_t)sizeof(legKeys),
-                        "TAB view  UP/DN move  1-4 jump  A apply  R reload  "
+                        "TAB view  UP/DN move  1-5 jump  A apply  R reload  "
                         "INS/ESC close");
         /* The second line is the marker legend, *unless* something went wrong
          * -- in which case it is what went wrong, on every view. An error you
@@ -8129,6 +9046,14 @@ static void aowl_ov_build(void) {
                              "   F2 manager   F11 max   F9 fade/F10 solid   "
                              "drag title = move   drag corner = resize");
         }
+        else if (g_ov.view == AOWL_VIEW_LOGS && !g_ov.sLastError[0])
+            /* The facet rule, ON SCREEN. A filter whose grouping rule is only
+             * in a comment is a filter whose empty results look like a bug. */
+            aowl_ov_copy(legNote, (int32_t)sizeof(legNote),
+                         "read straight from the two log files, so this works "
+                         "with the backend down   `mod` groups by a first word "
+                         "ending in `:` (sain:, config:); everything else is "
+                         "`system`");
         else
             aowl_ov_copy(legNote, (int32_t)sizeof(legNote),
                      g_ov.sLastError[0] ? g_ov.sLastError :
@@ -8356,8 +9281,10 @@ static void aowl_ov_build(void) {
         aowl_ov_view_lists(x, bodyY, innerW, bodyH, rows);
     else if (g_ov.view == AOWL_VIEW_ISSUES)
         aowl_ov_view_issues(x, bodyY, innerW, bodyH, rows);
-    else
+    else if (g_ov.view == AOWL_VIEW_APPLY)
         aowl_ov_view_apply(x, bodyY, innerW, bodyH, rows);
+    else
+        aowl_ov_view_logs(x, bodyY, innerW, bodyH, rows);
 
 settings_body_done:
 
@@ -8756,9 +9683,12 @@ static LRESULT CALLBACK aowl_ov_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
              * this key", not "what does it do" -- and getting it wrong is not
              * a cursor landing on the wrong row, it is the panel vanishing. */
             if (wp == VK_ESCAPE) {
-                int32_t owned = g_ov.settings &&
-                                (g_ov.searchFocus || g_ov.search[0] ||
-                                 g_ov.editItem >= 0 || g_ov.capturing);
+                int32_t owned = (g_ov.settings &&
+                                 (g_ov.searchFocus || g_ov.search[0] ||
+                                  g_ov.editItem >= 0 || g_ov.capturing)) ||
+                                (!g_ov.settings &&
+                                 g_ov.view == AOWL_VIEW_LOGS &&
+                                 (g_ov.logSearchFocus || g_ov.logSearch[0]));
                 if (!owned) { InterlockedExchange(&g_ov.visible, 0); return 0; }
             }
             aowl_ov_push_key((LONG)wp);
@@ -9245,6 +10175,13 @@ static HRESULT STDMETHODCALLTYPE aowl_ov_present(IDXGISwapChain* sc, UINT sync,
          * was next opened -- a write that looks applied on screen and is not on
          * disk, which is the worst outcome this whole slot could produce. */
         if (!g_ov.visible && g_ov.wasVisible) aowl_ov_s_flush_now();
+        /* CLOSING THE PANEL ALSO STOPS THE LOG TAIL. `logWant` is set in
+         * `aowl_ov_build`, and `aowl_ov_build` is not called at all while the
+         * panel is shut -- so a panel closed while the LOGS view was up would
+         * have left the flag at 1 and the worker opening two files every
+         * 400 ms for the rest of the session, invisibly. A flag whose only
+         * writer stops running is a flag that gets stuck on. */
+        if (!g_ov.visible) InterlockedExchange(&g_ov.logWant, 0);
         g_ov.wasVisible = g_ov.visible;
         int32_t adminOn = aowl_ov_admin_active();
         /* The shared region draws whenever it has published anything, exactly
@@ -9504,6 +10441,28 @@ static int32_t aowl_ov_start(int32_t toggleVk, int32_t backendPort) {
     g_ov.selCat = -1;      /* -1 is "the whole page", the only sane start */
     g_ov.search[0] = 0; g_ov.searchFocus = 0;
     g_ov.filtCount = 0; g_ov.filtStamp = 0;
+    /* The logs screen opens showing EVERYTHING, following the newest line, and
+     * with its search box unfocused -- see the input-model note in
+     * `aowl_ov_keys`. `logFiltStamp` of 0 means "nothing has been computed",
+     * which forces the first refilter. */
+    g_ov.logSrcFilt = AOWL_LOGSRC_ALL;
+    g_ov.logLvlFilt = AOWL_LOGF_ALL;
+    g_ov.logFacetFilt = AOWL_LOG_FACET_ALL;
+    g_ov.logSearch[0] = 0; g_ov.logSearchFocus = 0;
+    g_ov.logFollow = 1;
+    g_ov.logFiltN = 0; g_ov.logFiltStamp = 0;
+    g_ov.logSeq = 0; g_ov.logCount = 0; g_ov.logDropped = 0; g_ov.logSerial = 0;
+    g_ov.logFacetN = 0; g_ov.logFacetOver = 0;
+    g_ov.logPathsDone = 0;
+    {
+        int32_t li;
+        for (li = 0; li < AOWL_LOG_SRCS; li++) {
+            g_ov.logOff[li] = 0; g_ov.logOpened[li] = 0; g_ov.logFail[li] = 0;
+            g_ov.logOff2[li] = 0; g_ov.logLines[li] = 0; g_ov.logCarryN[li] = 0;
+            g_ov.logWhy[li][0] = 0; g_ov.logPath[li][0] = 0;
+        }
+    }
+    InterlockedExchange(&g_ov.logWant, 0);
     g_ov.dragWin = 0; g_ov.dragGrip = 0;
     /* Every page starts OPEN. A tree that boots collapsed shows the player a
      * list of names and no settings, which is indistinguishable from a page
