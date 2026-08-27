@@ -1113,6 +1113,32 @@ typedef struct AowlOvState {
      * SELECTION moves, which is when following it is what a person expects
      * again. `navSelSeen` is how the clearing is detected. */
     int32_t navFree, navSelSeen;
+    /* WHICH OF THE TWO LISTS THE KEYBOARD IS DRIVING: 0 = the control list,
+     * 1 = the nav column. TAB toggles it.
+     *
+     * Before this the arrow keys ALWAYS drove the control list and the nav
+     * could only be walked with , . [ ] -- four keys nobody guesses, for the
+     * half of the screen a person looks at first. TAB in settings mode used to
+     * be a DUPLICATE of ] (next page), so nothing unique is taken: [ and ]
+     * still walk the pages, and TAB in the MOD MANAGER still switches view,
+     * which is a different handler entirely and is not touched.
+     *
+     * It gates the arrows BOTH ways, and that is the property the test asserts:
+     * the unfocused side must be INERT, or TAB has changed nothing a person
+     * can feel. */
+    int32_t navFocus;
+    /* THE CONTROL LIST IS FREE-SCROLLED RIGHT NOW -- the same shape as
+     * `navFree`, and it exists for the same reason.
+     *
+     * The wheel over the control list used to move the SELECTION by three rows
+     * and let the follow-clamp below decide whether the view moved at all. With
+     * the cursor anywhere but the last visible row, the first notches moved
+     * nothing a person could see: the nav free-scrolled, the settings list did
+     * not, and that asymmetry is the whole of "my scroll only works for the
+     * pages scroll". The wheel now scrolls the VIEW on both sides, which is
+     * what every list on this platform does. Cleared the moment the selection
+     * moves, so the keyboard still drags the view along behind it. */
+    int32_t itemFree, itemSelSeen;
     /* The second-level nav. `selCat` is an index into `sCats` and -1 means
      * "the whole page", which is what a page with fewer than two categories
      * always shows. It is reset whenever the loaded page changes, because a
@@ -6954,6 +6980,56 @@ static void aowl_ov_settings_key(LONG vk, int32_t page) {
         }
     }
 
+    /* --- THE NAV HAS THE KEYBOARD ---------------------------------------
+     *
+     * Everything below this point drives the CONTROL list, so the whole block
+     * has to be claimed here and returned from rather than fallen through:
+     * a nav that moves the page cursor AND the control cursor on one DOWN has
+     * not got focus, it has got both. UP/DOWN step the tree in the same
+     * flattened order `,`/`.` use, PgUp/PgDn and `[`/`]` walk the pages,
+     * LEFT/RIGHT close and open a branch, HOME goes back out to the page.
+     *
+     * Anything it does not name -- F-keys, the search box, ESC -- was taken by
+     * `aowl_ov_keys` before this function ran, so no shortcut is swallowed by
+     * having focus over here. */
+    if (g_ov.navFocus) {
+        if (vk == VK_DOWN || vk == 'S' || vk == VK_NEXT) {
+            if (g_ov.sCatCount > 1 && g_ov.selCat < g_ov.sCatCount - 1) {
+                g_ov.selCat++;
+                g_ov.navOpen[g_ov.selCat] = 1;
+                g_ov.selItem = g_ov.sCats[g_ov.selCat].lo;
+                g_ov.topItem = g_ov.selItem;
+            } else if (g_ov.selPage < g_ov.sPageCount - 1) {
+                g_ov.selPage++;
+                g_ov.pageOpen[g_ov.selPage] = 1;
+            }
+            return;
+        }
+        if (vk == VK_UP || vk == 'W' || vk == VK_PRIOR) {
+            if (g_ov.selCat >= 0) {
+                g_ov.selCat--;
+                if (g_ov.selCat >= 0) {
+                    g_ov.selItem = g_ov.sCats[g_ov.selCat].lo;
+                    g_ov.topItem = g_ov.selItem;
+                }
+            } else if (g_ov.selPage > 0) {
+                g_ov.selPage--;
+                g_ov.pageOpen[g_ov.selPage] = 1;
+            }
+            return;
+        }
+        if (vk == VK_RIGHT && g_ov.selCat >= 0 && g_ov.selCat < g_ov.sCatCount) {
+            g_ov.navOpen[g_ov.selCat] = 1; return;
+        }
+        if (vk == VK_LEFT && g_ov.selCat >= 0 && g_ov.selCat < g_ov.sCatCount) {
+            g_ov.navOpen[g_ov.selCat] = 0; return;
+        }
+        if (vk == VK_HOME) { g_ov.selCat = -1; g_ov.selItem = 0;
+                             g_ov.topItem = 0; return; }
+        /* RETURN steps INTO the page: the natural "I have found it, now let me
+         * change something" move, and the only way off the nav other than TAB. */
+        if (vk == VK_RETURN || vk == VK_SPACE) { g_ov.navFocus = 0; return; }
+    }
     /* --- navigation ------------------------------------------------------ */
     if (vk == VK_UP   || vk == 'W') { if (g_ov.selItem > lo) g_ov.selItem--; return; }
     if (vk == VK_DOWN || vk == 'S') { if (g_ov.selItem < hi - 1) g_ov.selItem++; return; }
@@ -6995,13 +7071,20 @@ static void aowl_ov_settings_key(LONG vk, int32_t page) {
         g_ov.navOpen[g_ov.selCat] = (vk == VK_ADD);
         return;
     }
-    if (vk == VK_TAB) {
-        if (g_ov.sPageCount > 0) {
-            g_ov.selPage = (g_ov.selPage + 1) % g_ov.sPageCount;
-            g_ov.pageOpen[g_ov.selPage] = 1;
-        }
-        return;
-    }
+    /* --- TAB: WHICH LIST THE KEYBOARD IS DRIVING ------------------------
+     *
+     * TAB used to be a second `]` -- next page -- which is a key spent on
+     * something `]` already did. It now moves focus between the nav column and
+     * the control list, so a person on the keyboard can drive either half of
+     * the screen with the arrows, which is the half of the input model that
+     * was missing. `[`/`]` still walk the pages from either side, so nothing
+     * that worked before has been taken away.
+     *
+     * TAB IN THE MOD MANAGER IS NOT TOUCHED: that is `aowl_ov_keys`, which
+     * only reaches its own `VK_TAB` case when `g_ov.settings` is 0, and it
+     * still cycles the view. Two screens, two meanings, one key -- which is
+     * what TAB means on every other application on this platform too. */
+    if (vk == VK_TAB) { g_ov.navFocus = !g_ov.navFocus; return; }
     if (vk == VK_OEM_4) { if (g_ov.selPage > 0) g_ov.selPage--; return; }          /* [ */
     if (vk == VK_OEM_6) { if (g_ov.selPage < g_ov.sPageCount - 1) g_ov.selPage++; return; } /* ] */
 
@@ -7242,10 +7325,23 @@ static void aowl_ov_view_settings(float x, float y, float w, float bodyH) {
     }
     /* --- THE WHEEL, ROUTED ------------------------------------------------
      *
-     * Over the nav column it scrolls the nav; anywhere else it moves the
-     * control cursor, which is what it always did. Three rows a notch, the
-     * Windows convention, and the same number both sides so the two lists feel
-     * like one surface. */
+     * Over the nav column it scrolls the nav; over the control list it scrolls
+     * the CONTROL LIST. Three rows a notch, the Windows convention, and the
+     * same number both sides so the two lists feel like one surface.
+     *
+     * The boundary is the divider, which is drawn at
+     * `x + PAD + leftW + 5` a few lines below: one pixel further right so that
+     * the divider column itself belongs to the nav rather than to neither.
+     * `leftW` is read from `navW` at the top of this function, so a person who
+     * has widened the nav on the panel`s own page moves this line with it --
+     * a hard-coded boundary would be right only at the default width.
+     *
+     * IT SCROLLS THE VIEW, NOT THE SELECTION. It used to move `selItem` and
+     * leave the follow-clamp to decide whether anything moved on screen, so
+     * with the cursor mid-viewport the first notches did nothing visible while
+     * the nav -- which has always free-scrolled -- responded instantly. That
+     * asymmetry is what was reported, not the routing: the routing is asserted
+     * both ways in tests/overlayhost/uxtest.c and passes unchanged. */
     {
         int32_t notches = g_ov.navWheel;
         g_ov.navWheel = 0;
@@ -7255,10 +7351,8 @@ static void aowl_ov_view_settings(float x, float y, float w, float bodyH) {
                 g_ov.topPage -= 3 * notches;
                 g_ov.navFree = 1;
             } else {
-                g_ov.selItem -= 3 * notches;
-                if (g_ov.selItem < 0) g_ov.selItem = 0;
-                if (g_ov.selItem >= g_ov.sItemCount)
-                    g_ov.selItem = g_ov.sItemCount > 0 ? g_ov.sItemCount - 1 : 0;
+                g_ov.topItem -= 3 * notches;
+                g_ov.itemFree = 1;   /* clamped against the real list by the draw */
             }
         }
     }
@@ -7275,7 +7369,26 @@ static void aowl_ov_view_settings(float x, float y, float w, float bodyH) {
     if (g_ov.topPage > navCount - navRows) g_ov.topPage = navCount - navRows;
     if (g_ov.topPage < 0) g_ov.topPage = 0;
 
-    aowl_ov_text(x + (float)AOWL_OV_PAD, y, "pages", AOWL_OV_FAINT);
+    /* THE COLUMN HEADER CARRIES THE HIERARCHY NOW, not a per-row border.
+     *
+     * Every top-level row here is a mod (or an SPT config surface, which is
+     * already dimmed and already carries its own NI tag), and everything
+     * indented under one is a group inside it. That was previously said with a
+     * hairline above each root row -- a rule the eye reads as a SEPARATOR
+     * between unrelated things, which is the opposite of what it meant, and
+     * which the reporter disliked on sight.
+     *
+     * It is DROPPED rather than replaced with a quieter mark. The indentation
+     * already answers the question: a root sits at x + PAD behind a
+     * two-column marker, and a group at depth d sits three columns per level
+     * further in behind a guide rule and an elbow drawn under its parent -- so
+     * the only rows flush with the left edge ARE the roots. A second signal
+     * for something already unambiguous is noise. The header names what they
+     * are.
+     *
+     * AOWL_OV_FAINT is a theme token, not a colour: themes are data files and
+     * this line has to move when one is loaded. */
+    aowl_ov_text(x + (float)AOWL_OV_PAD, y, "mods", AOWL_OV_FAINT);
     aowl_ov_rect(x + (float)AOWL_OV_PAD + leftW + 5.0f, y, 1.0f, bodyH, AOWL_OV_EDGE);
     ny = y + (float)AOWL_OV_LINE_H;
     if (pc == 0) {
@@ -7295,9 +7408,16 @@ static void aowl_ov_view_settings(float x, float y, float w, float bodyH) {
         int32_t hot = aowl_ov_hit(x + 1.0f, ny, leftW + (float)AOWL_OV_PAD,
                                   (float)AOWL_OV_ROW_H);
         uint32_t col;
+        /* WHICH SELECTION IS LIVE. Both lists keep a cursor at all times, so
+         * two rows are always highlighted and only one of them answers to the
+         * arrow keys. The focused side gets the full selection fill and the
+         * other the fainter row shade -- the same two theme tokens the hover
+         * state already uses, so a theme cannot end up with a focus cue it did
+         * not choose a colour for. */
         if (at == navSel)
             aowl_ov_rect(x + 1.0f, ny, leftW + (float)AOWL_OV_PAD,
-                         (float)AOWL_OV_ROW_H, AOWL_OV_SELBG);
+                         (float)AOWL_OV_ROW_H,
+                         g_ov.navFocus ? AOWL_OV_SELBG : AOWL_OV_ROWALT);
         else if (hot)
             aowl_ov_rect(x + 1.0f, ny, leftW + (float)AOWL_OV_PAD,
                          (float)AOWL_OV_ROW_H, AOWL_OV_ROWALT);
@@ -7306,12 +7426,10 @@ static void aowl_ov_view_settings(float x, float y, float w, float bodyH) {
              * it backed yet -- is dimmed, which is the same "not running"
              * language the manager uses. */
             col = Q->isMod ? AOWL_OV_TEXT : AOWL_OV_DIM;
-            /* A page is the ROOT of the tree below it, so it is separated from
-             * the previous page`s branch by a hairline rather than by nothing.
-             * Without it a collapsed tree and a list of pages look identical. */
-            if (at > g_ov.topPage)
-                aowl_ov_rect(x + 1.0f, ny, leftW + (float)AOWL_OV_PAD, 1.0f,
-                             AOWL_OV_EDGE);
+            /* NO HAIRLINE HERE. It used to draw one above every root row to
+             * say "this is the top of a branch"; the header comment above says
+             * why the indentation says that better and why the rule said it
+             * wrong. Deliberately nothing replaces it. */
             {
                 /* A DISCLOSURE MARKER, and it is its own click target:
                  * pressing it opens or closes the page WITHOUT selecting it,
@@ -7758,6 +7876,15 @@ static void aowl_ov_view_settings(float x, float y, float w, float bodyH) {
         }
         g_ov.viewLo = lo; g_ov.viewHi = hi;
 
+        /* A FREE SCROLL ENDS WHEN THE SELECTION MOVES, which is when following
+         * it is what a person expects again -- `navSelSeen``s rule, applied to
+         * the control list. Detected by change rather than set at every site
+         * that can move `selItem`: there are a dozen of those and a new one
+         * that forgot to clear the flag would leave the list stuck. */
+        if (g_ov.selItem != g_ov.itemSelSeen) {
+            g_ov.itemFree = 0; g_ov.itemSelSeen = g_ov.selItem;
+        }
+
         aowl_ov_search_refresh();
 
         if (aowl_ov_searching()) {
@@ -7777,17 +7904,28 @@ static void aowl_ov_view_settings(float x, float y, float w, float bodyH) {
             at = aowl_ov_filt_pos(g_ov.selItem);
             if (at < 0) at = 0;
             g_ov.selItem = g_ov.filt[at];
-            if (g_ov.topItem > at) g_ov.topItem = at;
-            if (at - g_ov.topItem >= iRows) g_ov.topItem = at - iRows + 1;
+            /* FOLLOWING THE CURSOR, UNLESS THE PLAYER HAS JUST SCROLLED -- the
+             * same rule the nav uses a few hundred lines up, and for the same
+             * reason: without it the wheel moved `topItem` and this clamp put
+             * it straight back, so the list could not be scrolled away from
+             * its own selection at all. The RANGE clamps below still run
+             * either way, because a free scroll can leave the view past the
+             * end of the list and blank rows read as a broken screen. */
+            if (!g_ov.itemFree) {
+                if (g_ov.topItem > at) g_ov.topItem = at;
+                if (at - g_ov.topItem >= iRows) g_ov.topItem = at - iRows + 1;
+            }
             if (g_ov.topItem > g_ov.filtCount - iRows)
                 g_ov.topItem = g_ov.filtCount - iRows;
             if (g_ov.topItem < 0) g_ov.topItem = 0;
         } else {
             if (g_ov.selItem >= hi) g_ov.selItem = hi > lo ? hi - 1 : lo;
             if (g_ov.selItem < lo) g_ov.selItem = lo;
-            if (g_ov.topItem > g_ov.selItem) g_ov.topItem = g_ov.selItem;
-            if (g_ov.selItem - g_ov.topItem >= iRows)
-                g_ov.topItem = g_ov.selItem - iRows + 1;
+            if (!g_ov.itemFree) {
+                if (g_ov.topItem > g_ov.selItem) g_ov.topItem = g_ov.selItem;
+                if (g_ov.selItem - g_ov.topItem >= iRows)
+                    g_ov.topItem = g_ov.selItem - iRows + 1;
+            }
             if (g_ov.topItem > hi - iRows) g_ov.topItem = hi - iRows;
             if (g_ov.topItem < lo) g_ov.topItem = lo;
         }
@@ -7902,8 +8040,10 @@ static void aowl_ov_view_settings(float x, float y, float w, float bodyH) {
             rowX = rx + (aowl_ov_searching() ? 0.0f : 10.0f);
             rowHot = aowl_ov_hit(rx - 2.0f, ry, rw, (float)AOWL_OV_ROW_H);
 
+            /* The other half of the focus cue -- see the nav`s selection fill. */
             if (isSel)
-                aowl_ov_rect(rx - 2.0f, ry, rw, (float)AOWL_OV_ROW_H, AOWL_OV_SELBG);
+                aowl_ov_rect(rx - 2.0f, ry, rw, (float)AOWL_OV_ROW_H,
+                             g_ov.navFocus ? AOWL_OV_ROWALT : AOWL_OV_SELBG);
             else if (rowHot && canEdit)
                 aowl_ov_rect(rx - 2.0f, ry, rw, (float)AOWL_OV_ROW_H, AOWL_OV_ROWALT);
 
@@ -8672,6 +8812,12 @@ static uint32_t aowl_ov_signature(void) {
      * out to "the whole page" without moving `selItem` at all, and that frame
      * could land on a cache hit and leave the previous sub-tab on screen. */
     aowl_ov_sig_add(&h, g_ov.selCat);
+    /* Which side has the keyboard, and whether either list is free-scrolled.
+     * Both change what is DRAWN -- the focus fill on the selected rows, and
+     * `topItem` -- without necessarily moving a cursor, so a frame that
+     * changed only one of them would otherwise land on a cache hit. */
+    aowl_ov_sig_add(&h, g_ov.navFocus);
+    aowl_ov_sig_add(&h, g_ov.itemFree);
     /* The search box: the term, whether it has the keyboard, and what it
      * matched. */
     {
@@ -8901,8 +9047,8 @@ static void aowl_ov_build(void) {
              * bottom were simply unreachable by mouse. The nav's own geometry
              * is not known here, so the notches are handed to
              * `aowl_ov_view_settings`, which owns that geometry, and it decides
-             * from the cursor's x. Anything it does not claim comes back and
-             * moves the control list exactly as before. */
+             * from the cursor's x, then scrolls whichever list it decided on.
+             * Neither branch moves a CURSOR any more: both scroll a view. */
             g_ov.navWheel = (int32_t)notches;
         } else {
             if (notches)
@@ -8983,9 +9129,20 @@ static void aowl_ov_build(void) {
                  * do to the WINDOW. Split that way, and each kept under the
                  * pane width, both fit on one line each at the default size
                  * instead of spilling a third line that begins mid-phrase. */
+                /* TAB no longer says "page" -- it moves focus -- and the
+                 * legend has to say which side has it, or the arrows silently
+                 * mean two different things depending on invisible state. That
+                 * is the same failure the `-`/`=` bug was: a key whose effect
+                 * depends on a focus the legend does not name. `[`/`]` are
+                 * named here now precisely because TAB stopped doing what they
+                 * do. Both lines stay inside the pane width at the default
+                 * size, which is what `aowl_ov_wrap` is measured against. */
                 aowl_ov_fmt(legKeys, (int32_t)sizeof(legKeys),
-                            "/ search   UP/DN row   L/R change   SPACE type   "
-                            "+/- open   TAB page   ESC close");
+                            g_ov.navFocus
+                              ? "NAV   UP/DN move   L/R fold   ENTER settings   "
+                                "TAB settings   [ ] page   ESC close"
+                              : "/ search   UP/DN row   L/R change   SPACE type   "
+                                "TAB nav   [ ] page   ESC close");
         else if (g_ov.view == AOWL_VIEW_MODS)
             aowl_ov_fmt(legKeys, (int32_t)sizeof(legKeys),
                         "TAB view  UP/DN move  SPACE toggle  C clear  "
