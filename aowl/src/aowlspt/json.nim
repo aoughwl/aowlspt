@@ -263,9 +263,9 @@ proc child*(j: JsonRef; key: string): JsonRef =
   if i > j.last or s[i] != '{':
     return
   inc i
-  while i <= j.last:
+  while i < s.len:
     skipWs(s, i)
-    if i > j.last or s[i] == '}':
+    if i >= s.len or s[i] == '}':
       return
     if s[i] != '"':
       return
@@ -274,7 +274,7 @@ proc child*(j: JsonRef; key: string): JsonRef =
       return
     let name = unquote(s.substr(nameStart + 1, i - 2))
     skipWs(s, i)
-    if i > j.last or s[i] != ':':
+    if i >= s.len or s[i] != ':':
       return
     inc i
     skipWs(s, i)
@@ -288,7 +288,7 @@ proc child*(j: JsonRef; key: string): JsonRef =
         dec stop
       return JsonRef(text: s, first: valueStart, last: stop, found: true)
     skipWs(s, i)
-    if i <= j.last and s[i] == ',':
+    if i < s.len and s[i] == ',':
       inc i
 
 proc count*(j: JsonRef): int =
