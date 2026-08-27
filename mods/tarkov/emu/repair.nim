@@ -201,6 +201,19 @@ proc armourClassOf(tpl: string): float =
     return 0.0
   result = v
 
+var gRepairPriceMultiplier = 1.0
+  ## What a TRADER repair bill is multiplied by.
+  ##
+  ## Trader repairs only. A kit repair is paid for in the kit's own `Resource`,
+  ## not in roubles, so there is no bill for this to scale -- pretending
+  ## otherwise would be a row that changes nothing for half the repairs in the
+  ## game.
+
+proc configureRepairPrices*(priceMultiplier: float) =
+  gRepairPriceMultiplier = priceMultiplier
+  if gRepairPriceMultiplier < 0.0:
+    gRepairPriceMultiplier = 0.0
+
 proc repairSetting(name: string; fallback: float): float =
   ## One number off `globals.config.RepairSettings`. Read under both the
   ## reference's spelling and the lower-camel one the live globals file uses,
@@ -453,9 +466,15 @@ proc doTraderRepair(p: var Profile; inv: var Inventory; action: JsonRef;
       # as unknown, and a free repair removes the whole system.
       ch.problems.add "repair: no repair price is known for " & tpl
       return false
-    one.cost = ceilInt(perPoint * one.points * coefficient / 100.0)
-    if one.cost <= 0:
+    one.cost = ceilInt(perPoint * one.points * coefficient / 100.0 *
+                       gRepairPriceMultiplier)
+    # A multiplier of exactly 0 is the "repairs are free" setting and is
+    # allowed to reach 0. Every other multiplier keeps the floor of 1, so a
+    # bill is never rounded away by accident.
+    if one.cost <= 0 and gRepairPriceMultiplier != 0.0:
       one.cost = 1
+    if one.cost < 0:
+      one.cost = 0
     total = total + one.cost
     plans.add one
     tpls.add tpl

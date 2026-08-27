@@ -24,6 +24,14 @@
   "fleaOfferHours": 12,
   "fleaMaxOffers": 600,
   "fleaSaleMinutes": 30,
+  "fleaPriceMultiplier": 1.0,
+  "fleaSellFeePercent": 0,
+  "fleaSellRequiresFoundInRaid": false,
+
+  "traderUnlockAllOffers": false,
+  "traderPriceMultiplier": 1.0,
+  "traderIgnoreStockLimits": false,
+  "repairPriceMultiplier": 1.0,
 
   "skillMaxPerRaid": 100.0,
   "masteringMaxPerRaid": 100,

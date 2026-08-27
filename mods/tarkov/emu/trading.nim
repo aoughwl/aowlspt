@@ -395,8 +395,11 @@ proc buyFromTrader*(p: var Profile; inv: var Inventory; action: JsonRef;
   # And no more than the trader has. Zero means the assort does not say, which
   # on this server means unlimited -- an invented limit would refuse purchases
   # a live database allows.
+  #
+  # `traderIgnoreStockLimits` removes this bound and only this one: it is the
+  # per-item purchase limit the settings page names.
   let stock = field(offer, "upd.StackObjectsCount").asInt(0)
-  if stock > 0 and count > stock:
+  if not traderIgnoreStockLimits() and stock > 0 and count > stock:
     ch.problems.add "that trader has only " & $stock & " of those"
     return false
 

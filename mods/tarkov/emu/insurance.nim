@@ -118,7 +118,14 @@ proc premiumFor*(handbookPrice, percent: int): int =
   ## What the trader charges. Never zero for an item with a price: a free
   ## premium makes insurance strictly better than not insuring, which is a
   ## decision the player should be making.
+  ##
+  ## A percent of exactly 0 IS free, and is the one way to get there: it is the
+  ## "insurance costs nothing" setting, asked for by name. The floor below
+  ## applies to every other percent, so a cheap item is never rounded to free
+  ## by accident -- which is the case this floor was written for.
   if handbookPrice <= 0:
+    return 0
+  if percent <= 0:
     return 0
   result = (handbookPrice * percent) div 100
   if result < 1:
