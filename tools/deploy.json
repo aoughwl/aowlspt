@@ -6,6 +6,17 @@
  "//4": "Markers must be literals the compiler cannot fold away -- log message",
  "//5": "text is ideal, because it is emitted verbatim and it names the feature.",
  "//6": "Add a marker the same day you add a feature; that is the whole point.",
+ "//7": "An artifact may also declare the DATA it needs, with `data`. The file",
+ "//8": "list is DERIVED by walking `src` -- never enumerated here, because a",
+ "//9": "hardcoded list rots the day someone adds a data file. `exclude` uses",
+ "//10": "the same set `aowl payload`/`stageTarkovData` already established:",
+ "//11": "`capture/**` is a recording of the real backend kept to check this",
+ "//12": "server AGAINST, not anything it serves (690 files, mostly regenerated",
+ "//13": "rather than stored, so a payload built on one machine would carry it",
+ "//14": "and one built on another would not) -- skipped by NAME, not by size,",
+ "//15": "because large is not the reason. `*.md` is documentation. `minFiles`",
+ "//16": "is a floor that makes the derivation falsifiable: a glob that silently",
+ "//17": "matches almost nothing FAILS instead of passing with an empty set.",
  "install": "D:\\Aowlspt\\aowlspt",
  "artifacts": [
   {
@@ -125,6 +136,15 @@
     "/client/locations",
     "BotLocationModifier",
     "menuCornerLabel"
+   ],
+   "data": [
+    {
+     "src": "mods/tarkov/data",
+     "dst": "mods/tarkov/data",
+     "exclude": ["capture/**", "*.md"],
+     "minFiles": 14,
+     "why": "the emulator answers seven menu routes out of post1/ and refuses to start a raid without post1/serversettings.json. On 2026-08-27 post1/globalsgaps.json was not shipped: tarkov.dll's self-check logged 'this build fails its own arithmetic; refusing to serve', registered ONLY its selfcheck route, and the launcher said 'unable to check client version'"
+    }
    ]
   },
   {
@@ -192,6 +212,15 @@
     "morebots.ready",
     "morebots: a faction definition arrived without a name",
     "morebots:   spawn types alive:"
+   ],
+   "data": [
+    {
+     "src": "mods/morebots/data",
+     "dst": "mods/morebots/data",
+     "exclude": ["capture/**", "*.md"],
+     "minFiles": 1,
+     "why": "the vanilla faction/spawn-type definitions this mod registers from; a morebots with no data registers nothing"
+    }
    ]
   },
   {
@@ -294,6 +323,15 @@
     "textures  bundle redirect RETIRED after ",
     "textures  hookAsync is on: AssetBundleRequest::get_asset is a ",
     "prologue MISMATCH at GameAssembly+0x"
+   ],
+   "data": [
+    {
+     "src": "mods/textures/data",
+     "dst": "mods/textures/data",
+     "exclude": ["capture/**", "*.md"],
+     "minFiles": 1,
+     "why": "the redirect manifest; without it every bundle redirect is a no-op and the log still says ARMED"
+    }
    ]
   },
   {
@@ -324,6 +362,15 @@
     "Loot / extract / corpse / quest markers",
     "GameWorld live, borrowed from the host's already-armed RegisterPlayer cache",
     "the shared region refused the in-game HUD: "
+   ],
+   "data": [
+    {
+     "src": "mods/maps/data",
+     "dst": "mods/maps/data",
+     "exclude": ["capture/**", "*.md"],
+     "minFiles": 40,
+     "why": "every map JSON and every terrain SVG layer. On 2026-08-27 none of the 59 files were shipped and the backend logged 'data/bigmap.json is not on disk -- that map will report no data' for 8 maps"
+    }
    ]
   },
   {
@@ -371,6 +418,15 @@
     "aowlspt/botnav sendBotTo -- advisory, host flag botNav, default off",
     "no waypoint data for ",
     "patrol points served; "
+   ],
+   "data": [
+    {
+     "src": "mods/waypoints/data",
+     "dst": "mods/waypoints/data",
+     "exclude": ["capture/**", "*.md"],
+     "minFiles": 8,
+     "why": "one patrol-point document per map, checked against schema aowlspt.waypoints/1. Without them every map answers 'no waypoint data for <map>' and the mod is a no-op that loads cleanly"
+    }
    ]
   },
   {
@@ -385,6 +441,41 @@
     "call-proof: the rival negative control is disabled, so a passing ",
     "call-proof: still holding at ",
     "NEVER RUN. Nothing was called and nothing is proved. Not a pass."
+   ]
+  },
+  {
+   "//": "The mod registry. Not under any mod, and therefore shipped by NOBODY",
+   "//1": "until 2026-08-27: the deployed copy was a day old and had no",
+   "//2": "`aowl.list.beta` in it, so the manager logged 'no list called",
+   "//3": "aowl.list.beta in the registry', fell back to manager + tarkov, and",
+   "//4": "SIX mods reported 'installed and not selected'. An hour was spent",
+   "//5": "believing FOV and the F3 overlay were broken. It is a first-class",
+   "//6": "artifact here, marker-checked like any binary -- the markers are the",
+   "//7": "schema id, the three list ids and the mod ids a list references, so a",
+   "//8": "registry that lost a list or a mod cannot ship.",
+   "name": "registry",
+   "src": "registry/mods.json",
+   "dst": "registry/mods.json",
+   "minBytes": 5000,
+   "//9": "verifyInstalled: its markers are scanned in the REPO copy, which",
+   "//10": "says nothing about the install -- that is exactly how a registry a",
+   "//11": "day old sat live while check printed ok. So the installed bytes are",
+   "//12": "compared against the repo's too.",
+   "verifyInstalled": true,
+   "invalidates": [
+    "mods/aowlspt-selection.json"
+   ],
+   "markers": [
+    "aowlspt.registry/1",
+    "aowl.list.core",
+    "aowl.list.vanillaplus",
+    "aowl.list.beta",
+    "aowl.manager",
+    "aowl.tarkov",
+    "aowl.maps",
+    "aowl.fovfix",
+    "aowl.debug",
+    "aowl.waypoints"
    ]
   },
   {
