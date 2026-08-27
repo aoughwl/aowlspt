@@ -111,6 +111,7 @@
 #include <stdio.h>
 #include <stdlib.h>       /* strtod, for a float control's value */
 #include <stdarg.h>
+#include <stddef.h>       /* offsetof, for the theme key table */
 
 #include "aowlspt_detour.h"
 #include "aowlspt_admin.h"   /* the admin/cheat HUD's shared-memory surface */
@@ -1001,6 +1002,19 @@ typedef struct AowlOvState {
     /* --- settings mode, render side --- */
     int32_t settings;          /* 0 = mod manager, 1 = the settings screen */
     int32_t selPage, topPage;  /* the nav cursor and its scroll             */
+    /* Wheel notches handed to the settings view for it to route -- the nav
+     * column's geometry lives there, so the decision does too. Consumed and
+     * zeroed by `aowl_ov_view_settings` every frame it runs. */
+    int32_t navWheel;
+    /* THE NAV IS FREE-SCROLLED RIGHT NOW.
+     *
+     * Without this the auto-follow clamp ("keep the cursor on screen") snapped
+     * `topPage` back the same frame the wheel moved it, so the nav could not be
+     * scrolled away from the selection at all -- the wheel appeared to do
+     * nothing. Set by a wheel/PgUp scroll of the nav, cleared the moment the
+     * SELECTION moves, which is when following it is what a person expects
+     * again. `navSelSeen` is how the clearing is detected. */
+    int32_t navFree, navSelSeen;
     /* The second-level nav. `selCat` is an index into `sCats` and -1 means
      * "the whole page", which is what a page with fewer than two categories
      * always shows. It is reset whenever the loaded page changes, because a
@@ -1111,6 +1125,32 @@ typedef struct AowlOvState {
     volatile LONG prefsDirty;  /* geometry changed; the WORKER writes it out */
     char    prefsPath[300];
 
+    /* --- THE PANEL'S OWN PREFERENCES ------------------------------------
+     *
+     * Everything here is a thing a person can plausibly want different about
+     * the settings panel itself, and every one of them is reachable from the
+     * synthetic "Settings Panel" page (`aowl_ov_panel_schema`) rather than
+     * only from a key nobody was told about. They persist in the same file the
+     * geometry does, as `key=value` lines AFTER the legacy first line -- so an
+     * old file still loads and a new file still loads on an old build.
+     *
+     * `showFooter` hides the legend strip; `savePos` stops the panel writing
+     * its geometry back, for somebody who wants it to open in the same place
+     * every time; `navW` is the nav column width in panel units; `animate`
+     * turns the hint's fade into a cut. `themeName` is the SELECTED theme by
+     * NAME, not by index -- an index would silently point at a different theme
+     * the moment a user drops another file into the themes folder. */
+    int32_t showFooter;        /* draw the legend/footer strip               */
+    int32_t savePos;           /* persist geometry as it is dragged          */
+    int32_t navW;              /* nav column width, panel units              */
+    int32_t animate;           /* fades rather than cuts                     */
+    /* 0 = follow the back buffer (what it always did), 1..3 = pinned. The
+     * automatic rule is right for most screens and wrong for exactly the
+     * person who says so, which is what this is for. */
+    int32_t scalePref;
+    char    themeName[32];
+    volatile LONG themeDirty;  /* the render thread asked for a theme re-pick */
+
     /* --- the launch hint ("Press F12 for Mod Settings") ---
      *
      * A toast, drawn by this same Present hook, so it needs no detour of its
@@ -1157,6 +1197,11 @@ typedef struct AowlOvState {
     volatile LONG lastNs, avgNs, maxNs;
     volatile LONG avgBuildNs;   /* the geometry half, on its own */
 } AowlOvState;
+
+/* The synthetic page id for the panel's own settings -- see
+ * `aowl_ov_panel_schema`. Declared here because `aowl_ov_rebuild_pages` puts
+ * the page in the nav long before the schema that fills it is defined. */
+#define AOWL_OV_PANEL_PAGE "aowl.panel"
 
 static AowlOvState g_ov;
 
@@ -1246,6 +1291,277 @@ static void aowl_ov_copy(char* dst, int32_t cap, const char* src) {
     if (!src) { dst[0] = 0; return; }
     for (; i < cap - 1 && src[i]; i++) dst[i] = src[i];
     dst[i] = 0;
+}
+
+/* ------------------------------------------------------------------ *
+ * THEMES -- and they are DATA, not code.
+ *
+ * Every colour the panel draws with used to be a `#define` compiled in. They
+ * are now sixteen fields of one struct, and the sixteen macros below read that
+ * struct -- so every existing draw site is unchanged and none of them had to
+ * learn about theming.
+ *
+ * A theme is a text file: `name=...` and one `key=RRGGBBAA` line per colour.
+ * The BUILT-INS ARE THE SAME TEXT, parsed by the same parser at startup, which
+ * is the whole point: there is no privileged code path a built-in takes and a
+ * user's file does not, so "write your own" cannot silently be a lesser thing.
+ * A user theme is a `*.theme` file under %LOCALAPPDATA%\aowlspt\themes and is
+ * picked up by NAME -- copy one out, edit it, share the file.
+ *
+ * There is no fixed theme COUNT. AOWL_OV_MAX_THEMES is a buffer bound on a
+ * fixed-size table (this file allocates nothing), not a design limit, and when
+ * it is reached the panel SAYS so rather than dropping files silently.
+ *
+ * Any key a file omits keeps the value it had from the built-in the theme
+ * inherits, so a two-line theme that changes only the accent is legal and does
+ * not have to restate fifteen colours it does not care about. */
+#define AOWL_OV_MAX_THEMES 64
+
+typedef struct AowlOvTheme {
+    char     name[32];
+    uint32_t bg, edge, titlebg, text, dim, faint, on, off, hot, selbg,
+             rowalt, panebg, warn, err, good, accent;
+} AowlOvTheme;
+
+static AowlOvTheme g_ovTheme;                          /* the live palette   */
+static AowlOvTheme g_ovThemes[AOWL_OV_MAX_THEMES];
+static int32_t     g_ovThemeCount = 0;
+static int32_t     g_ovThemeOver  = 0;   /* files that did not fit the table */
+
+#define AOWL_OV_BG        (g_ovTheme.bg)
+#define AOWL_OV_EDGE      (g_ovTheme.edge)
+#define AOWL_OV_TITLEBG   (g_ovTheme.titlebg)
+#define AOWL_OV_TEXT      (g_ovTheme.text)
+#define AOWL_OV_DIM       (g_ovTheme.dim)
+#define AOWL_OV_FAINT     (g_ovTheme.faint)
+#define AOWL_OV_ON        (g_ovTheme.on)
+#define AOWL_OV_OFF       (g_ovTheme.off)
+#define AOWL_OV_HOT       (g_ovTheme.hot)
+#define AOWL_OV_SELBG     (g_ovTheme.selbg)
+#define AOWL_OV_ROWALT    (g_ovTheme.rowalt)
+#define AOWL_OV_PANEBG    (g_ovTheme.panebg)
+#define AOWL_OV_WARN      (g_ovTheme.warn)
+#define AOWL_OV_ERR       (g_ovTheme.err)
+#define AOWL_OV_GOOD      (g_ovTheme.good)
+#define AOWL_OV_ACCENT    (g_ovTheme.accent)
+
+/* The shipped themes, in the file format, byte for byte what a user writes.
+ * "Dark" is the palette this panel has always had, unchanged, so an install
+ * that never touches the control sees exactly what it saw before. */
+static const char* const AOWL_OV_BUILTIN_THEMES[] = {
+"name=Dark\n"
+"bg=0E1014E8\nedge=78A0C8FF\ntitlebg=1C222CFF\ntext=E2E6ECFF\ndim=828C98FF\n"
+"faint=5C6470FF\non=46965AFF\noff=783C3CFF\nhot=506E96FF\nselbg=263A54FF\n"
+"rowalt=161A20C8\npanebg=12151BFF\nwarn=E2AA50FF\nerr=E46E64FF\n"
+"good=78C88CFF\naccent=96BEEBFF\n",
+/* Light: the same roles, inverted ground. Text on background is #22262C on
+ * #EEF1F5 -- a luminance contrast well past 7:1 -- and every dim/faint tone
+ * was darkened rather than merely flipped, so "faint" stays readable instead
+ * of becoming the pale-grey-on-white that light themes usually ship. */
+"name=Light\n"
+"bg=EEF1F5F0\nedge=5C7894FF\ntitlebg=DCE2EAFF\ntext=22262CFF\ndim=4A5462FF\n"
+"faint=6A7484FF\non=2E7844FF\noff=A03C3CFF\nhot=B4C8E0FF\nselbg=C2D4EAFF\n"
+"rowalt=E2E7EEC8\npanebg=E4E8EFFF\nwarn=8A5E00FF\nerr=A82820FF\n"
+"good=1E6E38FF\naccent=1C4E86FF\n",
+/* High contrast: for a player who cannot read the dim tones at all. Nothing
+ * is dimmed below #B0B0B0 and the accent is pure. */
+"name=High Contrast\n"
+"bg=000000FF\nedge=FFFFFFFF\ntitlebg=101010FF\ntext=FFFFFFFF\ndim=D0D0D0FF\n"
+"faint=B0B0B0FF\non=00C050FF\noff=E03030FF\nhot=004080FF\nselbg=0050A0FF\n"
+"rowalt=1C1C1CFF\npanebg=0A0A0AFF\nwarn=FFC000FF\nerr=FF5040FF\n"
+"good=40E080FF\naccent=60D0FFFF\n",
+/* Amber: the terminal look, one hue, for somebody who wants the panel to stop
+ * competing with the game's own blues. */
+"name=Amber\n"
+"bg=140F08F0\nedge=C8912CFF\ntitlebg=241A0CFF\ntext=F0D8A8FF\ndim=A88A50FF\n"
+"faint=7A6238FF\non=8AA030FF\noff=A0502CFF\nhot=6E5220FF\nselbg=4A3410FF\n"
+"rowalt=1E1710C8\npanebg=181208FF\nwarn=E8B040FF\nerr=E07048FF\n"
+"good=A8C048FF\naccent=FFCC66FF\n"
+};
+
+static int32_t aowl_ov_hexnib(char c) {
+    if (c >= '0' && c <= '9') return c - '0';
+    if (c >= 'a' && c <= 'f') return c - 'a' + 10;
+    if (c >= 'A' && c <= 'F') return c - 'A' + 10;
+    return -1;
+}
+
+/* `RRGGBBAA` or `RRGGBB` (alpha defaults to opaque), with or without a leading
+ * `#`. Returns 0 and leaves `*out` alone on anything else -- a typo'd colour
+ * must not become a black rectangle the user cannot explain. */
+static int32_t aowl_ov_parse_hex(const char* s, uint32_t* out) {
+    uint32_t v[4] = { 0, 0, 0, 255 };
+    int32_t i, n = 0;
+    if (*s == '#') s++;
+    while (s[n] && s[n] > ' ') n++;
+    if (n != 6 && n != 8) return 0;
+    for (i = 0; i < n; i += 2) {
+        int32_t a = aowl_ov_hexnib(s[i]), b = aowl_ov_hexnib(s[i + 1]);
+        if (a < 0 || b < 0) return 0;
+        v[i / 2] = (uint32_t)(a * 16 + b);
+    }
+    *out = AOWL_RGBA(v[0], v[1], v[2], v[3]);
+    return 1;
+}
+
+/* One `key=value` line into `T`. Unknown keys are IGNORED rather than fatal:
+ * a theme written for a later build that grows a colour must still load here,
+ * and a theme written here must still load there. */
+static void aowl_ov_theme_kv(AowlOvTheme* T, const char* k, const char* v) {
+    struct { const char* k; size_t off; } map[] = {
+        { "bg", offsetof(AowlOvTheme, bg) },
+        { "edge", offsetof(AowlOvTheme, edge) },
+        { "titlebg", offsetof(AowlOvTheme, titlebg) },
+        { "text", offsetof(AowlOvTheme, text) },
+        { "dim", offsetof(AowlOvTheme, dim) },
+        { "faint", offsetof(AowlOvTheme, faint) },
+        { "on", offsetof(AowlOvTheme, on) },
+        { "off", offsetof(AowlOvTheme, off) },
+        { "hot", offsetof(AowlOvTheme, hot) },
+        { "selbg", offsetof(AowlOvTheme, selbg) },
+        { "rowalt", offsetof(AowlOvTheme, rowalt) },
+        { "panebg", offsetof(AowlOvTheme, panebg) },
+        { "warn", offsetof(AowlOvTheme, warn) },
+        { "err", offsetof(AowlOvTheme, err) },
+        { "good", offsetof(AowlOvTheme, good) },
+        { "accent", offsetof(AowlOvTheme, accent) }
+    };
+    int32_t i;
+    if (!strcmp(k, "name")) {
+        int32_t n = 0;
+        while (v[n] && v[n] >= ' ' && n < (int32_t)sizeof(T->name) - 1) {
+            T->name[n] = v[n]; n++;
+        }
+        while (n > 0 && T->name[n - 1] == ' ') n--;
+        T->name[n] = 0;
+        return;
+    }
+    for (i = 0; i < (int32_t)(sizeof(map) / sizeof(map[0])); i++)
+        if (!strcmp(k, map[i].k)) {
+            uint32_t c;
+            if (aowl_ov_parse_hex(v, &c))
+                *(uint32_t*)((char*)T + map[i].off) = c;
+            return;
+        }
+}
+
+/* A whole theme body into `T`, which arrives pre-seeded with whatever it
+ * inherits. `#` and `;` start a comment; blank lines are fine. */
+static void aowl_ov_theme_parse(AowlOvTheme* T, const char* body) {
+    char line[160];
+    int32_t n = 0;
+    const char* p = body;
+    for (;; p++) {
+        if (*p && *p != '\n' && *p != '\r') {
+            if (n < (int32_t)sizeof(line) - 1) line[n++] = *p;
+            continue;
+        }
+        line[n] = 0;
+        if (n > 0 && line[0] != '#' && line[0] != ';') {
+            char* eq = strchr(line, '=');
+            if (eq) {
+                char key[32];
+                int32_t k = 0, i = 0;
+                while (line[i] == ' ' || line[i] == '\t') i++;
+                while (&line[i] < eq && k < (int32_t)sizeof(key) - 1 &&
+                       line[i] > ' ') key[k++] = line[i++];
+                key[k] = 0;
+                { char* val = eq + 1;
+                  while (*val == ' ' || *val == '\t') val++;
+                  aowl_ov_theme_kv(T, key, val); }
+            }
+        }
+        n = 0;
+        if (!*p) break;
+    }
+}
+
+static int32_t aowl_ov_theme_find(const char* name) {
+    int32_t i;
+    for (i = 0; i < g_ovThemeCount; i++)
+        if (!_stricmp(g_ovThemes[i].name, name)) return i;
+    return -1;
+}
+
+/* Make `name` the live palette. A name that is not there does NOT fall back
+ * silently to something arbitrary -- it falls back to theme 0, which is the
+ * palette this panel has always had, and says so in the status line. */
+static void aowl_ov_theme_apply(const char* name) {
+    int32_t i = aowl_ov_theme_find(name);
+    if (i < 0 && g_ovThemeCount > 0) i = 0;
+    if (i < 0) return;
+    g_ovTheme = g_ovThemes[i];
+    aowl_ov_copy(g_ov.themeName, (int32_t)sizeof(g_ov.themeName),
+                 g_ovThemes[i].name);
+}
+
+/* Built-ins first, then every `*.theme` file in the themes folder. A user file
+ * whose `name` matches a built-in REPLACES it -- that is how somebody adjusts
+ * the shipped Dark rather than having to invent a new name for it. */
+static void aowl_ov_themes_load(void) {
+    int32_t i;
+    char dir[300], pat[320], path[340];
+    WIN32_FIND_DATAA fd;
+    HANDLE h;
+    DWORD n;
+    g_ovThemeCount = 0; g_ovThemeOver = 0;
+    for (i = 0; i < (int32_t)(sizeof(AOWL_OV_BUILTIN_THEMES) /
+                              sizeof(AOWL_OV_BUILTIN_THEMES[0])); i++) {
+        AowlOvTheme* T = &g_ovThemes[g_ovThemeCount];
+        memset(T, 0, sizeof(*T));
+        /* A built-in inherits from the FIRST built-in, so a shipped theme that
+         * omits a key is as legal as a user one that does. */
+        if (g_ovThemeCount > 0) *T = g_ovThemes[0];
+        T->name[0] = 0;
+        aowl_ov_theme_parse(T, AOWL_OV_BUILTIN_THEMES[i]);
+        if (T->name[0]) g_ovThemeCount++;
+    }
+    /* The live palette exists from here on, whatever happens with the files. */
+    if (g_ovThemeCount > 0) g_ovTheme = g_ovThemes[0];
+
+    n = GetEnvironmentVariableA("LOCALAPPDATA", dir, (DWORD)sizeof(dir));
+    if (n == 0 || n >= sizeof(dir) - 24) return;
+    _snprintf(path, sizeof(path) - 1, "%s\\aowlspt\\themes", dir);
+    path[sizeof(path) - 1] = 0;
+    CreateDirectoryA(path, NULL);
+    _snprintf(pat, sizeof(pat) - 1, "%s\\*.theme", path);
+    pat[sizeof(pat) - 1] = 0;
+    h = FindFirstFileA(pat, &fd);
+    if (h == INVALID_HANDLE_VALUE) return;
+    do {
+        FILE* f;
+        char body[4096];
+        size_t got;
+        AowlOvTheme T;
+        int32_t at;
+        if (fd.dwFileAttributes & FILE_ATTRIBUTE_DIRECTORY) continue;
+        if (g_ovThemeCount >= AOWL_OV_MAX_THEMES) { g_ovThemeOver++; continue; }
+        _snprintf(path, sizeof(path) - 1, "%s\\aowlspt\\themes\\%s", dir,
+                  fd.cFileName);
+        path[sizeof(path) - 1] = 0;
+        f = fopen(path, "rb");
+        if (!f) continue;
+        got = fread(body, 1, sizeof(body) - 1, f);
+        fclose(f);
+        body[got] = 0;
+        T = g_ovThemes[0];        /* inherit the shipped Dark, then override */
+        T.name[0] = 0;
+        aowl_ov_theme_parse(&T, body);
+        if (!T.name[0]) {
+            /* No `name=` line: the FILENAME is the name, minus `.theme`. A
+             * theme with no name at all would be unselectable, which is a
+             * theme that silently does not exist. */
+            int32_t k = 0;
+            while (fd.cFileName[k] && k < (int32_t)sizeof(T.name) - 1 &&
+                   fd.cFileName[k] != '.') { T.name[k] = fd.cFileName[k]; k++; }
+            T.name[k] = 0;
+        }
+        if (!T.name[0]) continue;
+        at = aowl_ov_theme_find(T.name);
+        if (at >= 0) g_ovThemes[at] = T;
+        else g_ovThemes[g_ovThemeCount++] = T;
+    } while (FindNextFileA(h, &fd));
+    FindClose(h);
 }
 
 /* Finds by guid, or appends. Returns NULL when the table is full — a full
@@ -2735,6 +3051,20 @@ static int32_t aowl_ov_page_all_hidden(const AowlOvSPage* P) {
 static void aowl_ov_rebuild_pages(void) {
     int32_t i;
     g_ov.pageCount = 0;
+    /* THE PANEL'S OWN PAGE, FIRST AND ALWAYS.
+     *
+     * Unconditional: it is the one page with no backend behind it, so it is
+     * also the one page that is still there when the backend is down -- which
+     * is exactly when somebody wants to turn the startup toast off or make the
+     * panel readable. It is never subject to `aowl_ov_page_all_hidden`; every
+     * row on it is implemented. */
+    {
+        AowlOvSPage* P = &g_ov.pages[g_ov.pageCount++];
+        memset(P, 0, sizeof(*P));
+        aowl_ov_copy(P->id, (int32_t)sizeof(P->id), AOWL_OV_PANEL_PAGE);
+        aowl_ov_copy(P->label, (int32_t)sizeof(P->label), "Settings Panel");
+        P->isMod = 1; P->count = 9; P->done = 9;
+    }
     for (i = 0; i < g_ov.idxModCount && g_ov.pageCount < AOWL_OV_MAX_SPAGES; i++)
         if (!aowl_ov_page_all_hidden(&g_ov.idxMods[i]))
             g_ov.pages[g_ov.pageCount++] = g_ov.idxMods[i];
@@ -2781,6 +3111,164 @@ static int32_t aowl_ov_fetch(const wchar_t* verb, const wchar_t* path,
  * mod serves its own schema at `/aowlspt/settings/<guid>`, the SPT pages come
  * from the hub. Runs on the worker; publishes under `cs` and bumps the serial
  * so the render thread snapshots it. */
+/* ------------------------------------------------------------------ *
+ * THE PANEL'S OWN SETTINGS PAGE
+ *
+ * The overlay is the one mod on this screen with no backend behind it, and for
+ * a long time that meant it was the one thing on the screen you could not
+ * configure from the screen: opacity was a key, the footer was not settable at
+ * all, and the theme did not exist. Every one of those is now a row.
+ *
+ * It is a SYNTHETIC PAGE -- the same JSON shape a real mod serves, generated in
+ * memory and handed to the same `aowl_ov_read_items` -- rather than a bespoke
+ * view. That is the whole design: the tree, the groups, the sliders, the enum
+ * cycling, the search, the keyboard bounds and the write coalescing are the
+ * ones that already work, and a second implementation of any of them would be
+ * a second thing to get wrong. It also means the page cannot drift from the
+ * rest of the screen: if a control type renders badly here it renders badly
+ * everywhere, and gets fixed once.
+ *
+ * There is no HTTP anywhere in this path, so this page works with the backend
+ * down -- which is also when somebody is most likely to be poking at the panel.
+ * ------------------------------------------------------------------ */
+
+/* A string into a JSON literal, dropping anything that would need escaping.
+ * Theme names come from files a user wrote, so a stray quote must not be able
+ * to produce a body that does not parse -- and a name with a quote in it is not
+ * worth a general escaper here. */
+static void aowl_ov_jsafe(const char* s, char* out, int32_t cap) {
+    int32_t n = 0;
+    for (; *s && n < cap - 1; s++)
+        if (*s >= ' ' && *s != '"' && *s != '\\') out[n++] = *s;
+    out[n] = 0;
+}
+
+static void aowl_ov_panel_schema(char* out, int32_t cap) {
+    int32_t n, i;
+    char opts[1024];
+    char one[64];
+    /* The theme list is DATA-DRIVEN -- it is whatever `aowl_ov_themes_load`
+     * found, built-ins plus every file in the themes folder. Nothing here
+     * knows how many themes there are, which is the requirement: a user who
+     * drops a fifth file in gets a fifth option with no code change. */
+    opts[0] = 0; n = 0;
+    for (i = 0; i < g_ovThemeCount; i++) {
+        aowl_ov_jsafe(g_ovThemes[i].name, one, (int32_t)sizeof(one));
+        if (!one[0]) continue;
+        n += _snprintf(opts + n, sizeof(opts) - 1 - (size_t)n, "%s\"%s\"",
+                       n ? "," : "", one);
+        if (n < 0 || n > (int32_t)sizeof(opts) - 80) break;
+    }
+    opts[sizeof(opts) - 1] = 0;
+    aowl_ov_jsafe(g_ov.themeName, one, (int32_t)sizeof(one));
+    _snprintf(out, (size_t)cap - 1,
+      "{\"settings\":["
+      "{\"key\":\"theme\",\"label\":\"Theme\",\"type\":\"enum\","
+        "\"value\":\"%s\",\"options\":[%s],\"category\":\"Appearance\","
+        "\"description\":\"the panel's colour scheme. Built-ins plus every "
+        "*.theme file in %%LOCALAPPDATA%%\\\\aowlspt\\\\themes -- copy one out, "
+        "edit it, share the file.\",\"implemented\":true},"
+      "{\"key\":\"opacity\",\"label\":\"Background opacity\",\"type\":\"int\","
+        "\"value\":%d,\"min\":40,\"max\":255,\"step\":5,"
+        "\"category\":\"Appearance\",\"description\":\"how solid the panel's "
+        "background is. 255 hides the game behind it entirely.\","
+        "\"implemented\":true},"
+      "{\"key\":\"scalePref\",\"label\":\"UI scale\",\"type\":\"enum\","
+        "\"value\":\"%s\",\"options\":[\"Auto\",\"1x\",\"2x\",\"3x\"],"
+        "\"category\":\"Appearance\",\"description\":\"Auto picks from the "
+        "back-buffer height, which is right for most screens and wrong for "
+        "exactly the person who says so.\",\"implemented\":true},"
+      "{\"key\":\"navW\",\"label\":\"Nav column width\",\"type\":\"int\","
+        "\"value\":%d,\"min\":140,\"max\":640,\"step\":8,"
+        "\"category\":\"Layout\",\"description\":\"how much of the panel the "
+        "page tree gets. A deep tree spends its left edge on indent.\","
+        "\"implemented\":true},"
+      "{\"key\":\"showFooter\",\"label\":\"Show the footer\",\"type\":\"bool\","
+        "\"value\":%s,\"category\":\"Layout\",\"description\":\"the key legend "
+        "along the bottom. Off gives its height back to the list.\","
+        "\"implemented\":true},"
+      "{\"key\":\"savePos\",\"label\":\"Remember size and position\","
+        "\"type\":\"bool\",\"value\":%s,\"category\":\"Layout\","
+        "\"description\":\"off means the panel opens in the same place every "
+        "time; it can still be dragged for this session.\","
+        "\"implemented\":true},"
+      "{\"key\":\"hint\",\"label\":\"Startup message\",\"type\":\"bool\","
+        "\"value\":%s,\"category\":\"Behaviour\",\"description\":\"the 'Press "
+        "F12 for Mod Settings' toast shown once after the backend answers.\","
+        "\"implemented\":true},"
+      "{\"key\":\"animate\",\"label\":\"Animate\",\"type\":\"bool\","
+        "\"value\":%s,\"category\":\"Behaviour\",\"description\":\"off makes "
+        "the startup message cut rather than fade. It is on screen for the "
+        "same length of time either way.\",\"implemented\":true},"
+      "{\"key\":\"showUnimpl\",\"label\":\"Show unimplemented settings\","
+        "\"type\":\"bool\",\"value\":%s,\"category\":\"Behaviour\","
+        "\"description\":\"rows a mod declared but does not act on yet. Off "
+        "by default: a control that does nothing is worse than no control.\","
+        "\"implemented\":true}"
+      "]}",
+      one, opts, g_ov.panAlpha,
+      g_ov.scalePref == 0 ? "Auto" : g_ov.scalePref == 1 ? "1x"
+                          : g_ov.scalePref == 2 ? "2x" : "3x",
+      g_ov.navW,
+      g_ov.showFooter ? "true" : "false",
+      g_ov.savePos ? "true" : "false",
+      g_ov.hintEnabled ? "true" : "false",
+      g_ov.animate ? "true" : "false",
+      g_ov.showUnimpl ? "true" : "false");
+    out[cap - 1] = 0;
+}
+
+/* One edit from the panel page, applied to the live prefs. Returns 1 when the
+ * key was one of ours -- an unknown key is REFUSED rather than ignored, so a
+ * renamed row shows up as a row that stops working instead of a row that
+ * silently writes nothing. */
+static int32_t aowl_ov_panel_set(const char* key, const char* val) {
+    /* `val` is the RAW schema value: quoted for enums, bare for numbers and
+     * bools -- the same text `aowl_ov_settings_set` would have POSTed. */
+    char v[64];
+    int32_t n = 0;
+    const char* p = val;
+    if (*p == '"') p++;
+    while (*p && *p != '"' && n < (int32_t)sizeof(v) - 1) v[n++] = *p++;
+    v[n] = 0;
+    if (!strcmp(key, "theme")) {
+        if (aowl_ov_theme_find(v) < 0) return 0;
+        aowl_ov_theme_apply(v);
+    } else if (!strcmp(key, "opacity")) {
+        int32_t a = atoi(v);
+        if (a < 40 || a > 255) return 0;
+        g_ov.panAlpha = a;
+    } else if (!strcmp(key, "scalePref")) {
+        g_ov.scalePref = !strcmp(v, "Auto") ? 0 : (v[0] >= '1' && v[0] <= '3')
+                                                    ? v[0] - '0' : 0;
+    } else if (!strcmp(key, "navW")) {
+        int32_t a = atoi(v);
+        if (a < 140 || a > 640) return 0;
+        g_ov.navW = a;
+    } else if (!strcmp(key, "showFooter")) g_ov.showFooter = (v[0] == 't' || v[0] == '1');
+    else if (!strcmp(key, "savePos"))      g_ov.savePos    = (v[0] == 't' || v[0] == '1');
+    else if (!strcmp(key, "hint"))         g_ov.hintEnabled= (v[0] == 't' || v[0] == '1');
+    else if (!strcmp(key, "animate"))      g_ov.animate    = (v[0] == 't' || v[0] == '1');
+    else if (!strcmp(key, "showUnimpl")) {
+        g_ov.showUnimpl = (v[0] == 't' || v[0] == '1');
+        /* This one changes which PAGES exist, not just which rows do -- and
+         * `pages` is read by the render thread, so the rebuild takes the lock
+         * the HTTP path's rebuild already runs under. The theme write above
+         * does not: `g_ovTheme` is sixteen independent uint32s and the worst a
+         * torn copy can produce is one frame in two palettes, where taking a
+         * lock in Present would be a frame spike the player feels. */
+        EnterCriticalSection(&g_ov.cs);
+        aowl_ov_rebuild_pages();
+        LeaveCriticalSection(&g_ov.cs);
+        g_ov.dataSerial++;
+    } else return 0;
+    /* Every one of these persists, and it persists NOW rather than at exit --
+     * a crash must not be able to eat a preference the player just set. This
+     * runs on the worker, which is the only thread allowed to write the file. */
+    aowl_ov_prefs_save();
+    return 1;
+}
+
 static void aowl_ov_settings_load(const char* pageId, int32_t isMod,
                                   char* buf, int32_t cap) {
     wchar_t path[224];
@@ -2791,6 +3279,23 @@ static void aowl_ov_settings_load(const char* pageId, int32_t isMod,
     if (isMod) _snwprintf(path, 224, L"/aowlspt/settings/%ls", warg);
     else       _snwprintf(path, 224, L"/aowlspt/settings/spt/page/%ls", warg);
     path[223] = 0;
+
+    /* The panel's own page is generated, not fetched -- see
+     * `aowl_ov_panel_schema`. Everything below this point is identical for it
+     * and for a real mod, including the well-formedness check on the finished
+     * nav, which is the point: the synthetic page is held to the same standard
+     * as a served one. */
+    if (!strcmp(pageId, AOWL_OV_PANEL_PAGE)) {
+        aowl_ov_panel_schema(buf, cap);
+        EnterCriticalSection(&g_ov.cs);
+        aowl_ov_copy(g_ov.itemsPage, (int32_t)sizeof(g_ov.itemsPage), pageId);
+        g_ov.itemsWhy[0] = 0;
+        aowl_ov_read_items(buf, (int32_t)strlen(buf));
+        g_ov.itemsErr = 0;
+        LeaveCriticalSection(&g_ov.cs);
+        g_ov.dataSerial++;
+        return;
+    }
 
     rc = aowl_ov_fetch(L"GET", path, NULL, buf, cap);
     trunc = (int32_t)InterlockedCompareExchange(&g_ov.lastTrunc, 0, 0);
@@ -2841,6 +3346,15 @@ static void aowl_ov_settings_set(const AowlOvCmd* cmd, char* buf, int32_t cap) {
     int32_t i = 0;
     for (; cmd->guid[i] && i < 95; i++) warg[i] = (wchar_t)(unsigned char)cmd->guid[i];
     warg[i] = 0;
+    if (!strcmp(cmd->guid, AOWL_OV_PANEL_PAGE)) {
+        /* Applied locally and re-generated, which is the same shape the HTTP
+         * path has: write, then RE-READ, so the row shows what was actually
+         * kept rather than what was hoped for. A refused value therefore snaps
+         * back on screen instead of being displayed as if it took. */
+        (void)aowl_ov_panel_set(cmd->skey, cmd->sval);
+        aowl_ov_settings_load(cmd->guid, 1, buf, cap);
+        return;
+    }
     _snwprintf(path, 224, L"/aowlspt/settings/%ls", warg);
     path[223] = 0;
     aowl_ov_fmt(jbody, (int32_t)sizeof(jbody), "{\"key\":\"%s\",\"value\":%s}",
@@ -3893,22 +4407,6 @@ static void aowl_ov_restore(ID3D11DeviceContext* c, AowlOvSaved* s) {
  * session's number carries about a third of the weight and falling. */
 #define AOWL_OV_COST_SETTLE  32
 
-static const uint32_t AOWL_OV_BG     = AOWL_RGBA(14, 16, 20, 232);
-#define AOWL_OV_EDGE      AOWL_RGBA(120, 160, 200, 255)
-#define AOWL_OV_TITLEBG   AOWL_RGBA(28, 34, 44, 255)
-#define AOWL_OV_TEXT      AOWL_RGBA(226, 230, 236, 255)
-#define AOWL_OV_DIM       AOWL_RGBA(130, 140, 152, 255)
-#define AOWL_OV_FAINT     AOWL_RGBA(92, 100, 112, 255)
-#define AOWL_OV_ON        AOWL_RGBA(70, 150, 90, 255)
-#define AOWL_OV_OFF       AOWL_RGBA(120, 60, 60, 255)
-#define AOWL_OV_HOT       AOWL_RGBA(80, 110, 150, 255)
-#define AOWL_OV_SELBG     AOWL_RGBA(38, 58, 84, 255)
-#define AOWL_OV_ROWALT    AOWL_RGBA(22, 26, 32, 200)
-#define AOWL_OV_PANEBG    AOWL_RGBA(18, 21, 27, 255)
-#define AOWL_OV_WARN      AOWL_RGBA(226, 170, 80, 255)
-#define AOWL_OV_ERR       AOWL_RGBA(228, 110, 100, 255)
-#define AOWL_OV_GOOD      AOWL_RGBA(120, 200, 140, 255)
-#define AOWL_OV_ACCENT    AOWL_RGBA(150, 190, 235, 255)
 
 #define OV_DOT '.'
 #define OV_SP  ' '
@@ -3962,6 +4460,31 @@ static void aowl_ov_prefs_default(void) {
     g_ov.panMax = 0;
     g_ov.panAlpha = 232;          /* what this panel always was */
     g_ov.hintEnabled = 1;
+    /* Every one of these is the behaviour the panel had before it was
+     * settable, so a first run and an install that never opens this page look
+     * identical to what shipped. */
+    g_ov.showFooter = 1;
+    g_ov.savePos = 1;
+    g_ov.navW = 256;
+    g_ov.animate = 1;
+    aowl_ov_copy(g_ov.themeName, (int32_t)sizeof(g_ov.themeName), "Dark");
+}
+
+/* The `key=value` tail of the prefs file -- everything after the legacy first
+ * line. Shared by the loader and, in reverse, by the writer. Range-checked one
+ * key at a time rather than all-or-nothing: unlike the geometry, a bad
+ * `navW` cannot strand the window, so one unusable key must not throw away the
+ * fifteen good ones next to it. */
+static void aowl_ov_prefs_kv(const char* k, const char* v) {
+    int32_t n = atoi(v);
+    if (!strcmp(k, "showFooter")) { if (n == 0 || n == 1) g_ov.showFooter = n; }
+    else if (!strcmp(k, "savePos")) { if (n == 0 || n == 1) g_ov.savePos = n; }
+    else if (!strcmp(k, "animate")) { if (n == 0 || n == 1) g_ov.animate = n; }
+    else if (!strcmp(k, "showUnimpl")) { if (n == 0 || n == 1) g_ov.showUnimpl = n; }
+    else if (!strcmp(k, "navW")) { if (n >= 140 && n <= 640) g_ov.navW = n; }
+    else if (!strcmp(k, "scalePref")) { if (n >= 0 && n <= 3) g_ov.scalePref = n; }
+    else if (!strcmp(k, "theme"))
+        aowl_ov_copy(g_ov.themeName, (int32_t)sizeof(g_ov.themeName), v);
 }
 
 static void aowl_ov_prefs_load(void) {
@@ -3998,6 +4521,23 @@ static void aowl_ov_prefs_load(void) {
     } else {
         aowl_ov_note("window prefs: unreadable, defaults used");
     }
+    /* The `key=value` tail. Read with `fgets` from wherever the first line
+     * left the stream, so an OLD seven-integer file simply has no tail and an
+     * old BUILD reading a new file stops after the first line: the format is
+     * forward and backward compatible without a version number to get wrong. */
+    {
+        char line[160];
+        while (fgets(line, (int32_t)sizeof(line), f)) {
+            char* eq = strchr(line, '=');
+            char* nl;
+            if (!eq) continue;
+            *eq = 0;
+            nl = eq + 1;
+            while (*nl && *nl != '\n' && *nl != '\r') nl++;
+            *nl = 0;
+            aowl_ov_prefs_kv(line, eq + 1);
+        }
+    }
     fclose(f);
     /* The value AS ACTUALLY READ, not the default the source declares -- a
      * default is not a value, and a flag whose deployed value differs from its
@@ -4016,6 +4556,13 @@ static void aowl_ov_prefs_save(void) {
     fprintf(f, "%d %d %d %d %d %d %d\n",
             (int)g_ov.panX, (int)g_ov.panY, (int)g_ov.panW, (int)g_ov.panH,
             g_ov.panMax, g_ov.panAlpha, g_ov.hintEnabled);
+    /* The tail. One line per key, written unconditionally rather than only for
+     * non-defaults: a file that lists every key is a file a person can EDIT,
+     * and this file is now the same kind of artifact a theme file is. */
+    fprintf(f, "showFooter=%d\nsavePos=%d\nanimate=%d\nshowUnimpl=%d\n"
+               "navW=%d\nscalePref=%d\ntheme=%s\n",
+            g_ov.showFooter, g_ov.savePos, g_ov.animate, g_ov.showUnimpl,
+            g_ov.navW, g_ov.scalePref, g_ov.themeName);
     fclose(f);
 }
 
@@ -5170,14 +5717,94 @@ static void aowl_ov_view_apply(float x, float y, float w, float bodyH,
 /* Write a number back into a row, formatted the way the type wants it: an int
  * with no point, a float minimally. Touches the render thread's own snapshot
  * copy, which the next fetch overwrites with what the file kept. */
+/* HOW MANY DECIMALS THIS CONTROL'S NUMBERS ARE WORTH, derived from the control
+ * rather than guessed.
+ *
+ * `%.6g` on a float that arrived as a JSON double printed
+ * `0.30000001192092896` for a 0..1 step-0.01 slider, which the value cell then
+ * clipped to `0.3000..` -- a number that is both wrong-looking and truncated.
+ * The step is the answer: a step of 0.01 can only ever land on two decimals, so
+ * printing more digits is printing noise. An integer control gets none; a
+ * control with no step at all falls back to its RANGE, on the same reasoning
+ * (a 0..1 span needs resolution a 0..1200 span does not).
+ *
+ * Capped at 4. Past that the digits are below anything a 84-pixel track can
+ * address, so they are decoration on a control that cannot produce them. */
+static int32_t aowl_ov_num_decimals(const AowlOvSItem* si) {
+    float step = si->step;
+    int32_t d = 0;
+    if (si->kind == AOWL_S_INT) return 0;
+    if (!(step > 0.0f) || !aowl_ov_finite(step)) {
+        float span = si->hasRange ? (si->hi - si->lo) : 0.0f;
+        if (!(span > 0.0f)) return 3;          /* unbounded float: 3 is plenty */
+        return span >= 100.0f ? 1 : span >= 10.0f ? 2 : 3;
+    }
+    /* The smallest d for which the step is representable in d decimals. A
+     * step of 0.25 needs two, 0.1 needs one, 5 needs none. */
+    while (d < 4) {
+        float scaled = step;
+        int32_t i;
+        for (i = 0; i < d; i++) scaled *= 10.0f;
+        {
+            float r = scaled - (float)(int32_t)(scaled + 0.5f);
+            if (r < 0.0f) r = -r;
+            if (r < 0.001f) break;
+        }
+        d++;
+    }
+    /* A step finer than the range can address is a step that will never be
+     * hit, so the decimals it implies are not worth the width either. */
+    if (si->hasRange && si->hi - si->lo >= 1000.0f && d > 2) d = 2;
+    return d;
+}
+
+/* `v` printed at this control's own precision, and then SHORTENED UNTIL IT
+ * FITS `cols` -- decimals first, then a compact exponent. It never returns a
+ * string longer than `cols`, so the caller never has to clip one, which is the
+ * whole point: a value cell that ends in `..` has told the player a different
+ * number than the one the control holds.
+ *
+ * `cols <= 0` means "no width limit", which is what the raw/write path wants:
+ * the value SENT must be the value chosen, never the value that fitted. */
+static void aowl_ov_num_str(const AowlOvSItem* si, float v, int32_t cols,
+                            char* out, int32_t cap) {
+    int32_t d = aowl_ov_num_decimals(si);
+    if (si->kind == AOWL_S_INT) {
+        aowl_ov_fmt(out, cap, "%d", (int32_t)(v < 0 ? v - 0.5f : v + 0.5f));
+    } else {
+        aowl_ov_fmt(out, cap, "%.*f", d, (double)v);
+    }
+    if (cols <= 0) return;
+    while ((int32_t)strlen(out) > cols && d > 0) {
+        d--;
+        aowl_ov_fmt(out, cap, "%.*f", d, (double)v);
+    }
+    if ((int32_t)strlen(out) > cols) {
+        /* Still too wide at zero decimals: the INTEGER part is the problem, so
+         * the number gets shorter rather than the string getting cut. `%.*g`
+         * with the widest significand that fits, then plain `%g`; either way
+         * what is drawn is a number, not a number with its tail removed. */
+        int32_t sig = cols - 4 > 1 ? cols - 4 : 1;
+        aowl_ov_fmt(out, cap, "%.*g", sig, (double)v);
+        while ((int32_t)strlen(out) > cols && sig > 1) {
+            sig--;
+            aowl_ov_fmt(out, cap, "%.*g", sig, (double)v);
+        }
+        /* The floor: a number so wide that even one significant digit and an
+         * exponent do not fit means the CELL is too small, and saying so with
+         * `#` is honest where a truncated digit string is not. */
+        if ((int32_t)strlen(out) > cols) {
+            int32_t i;
+            for (i = 0; i < cols && i < cap - 1; i++) out[i] = '#';
+            out[i] = 0;
+        }
+    }
+}
+
 static void aowl_ov_s_fmt_num(AowlOvSItem* si, float v) {
     char t[48];
-    if (si->kind == AOWL_S_INT) {
-        aowl_ov_fmt(t, (int32_t)sizeof(t), "%d",
-                    (int32_t)(v < 0 ? v - 0.5f : v + 0.5f));
-    } else {
-        aowl_ov_fmt(t, (int32_t)sizeof(t), "%.6g", (double)v);
-    }
+    /* No width limit here: this is the value that will be WRITTEN. */
+    aowl_ov_num_str(si, v, 0, t, (int32_t)sizeof(t));
     aowl_ov_copy(si->raw, (int32_t)sizeof(si->raw), t);
     aowl_ov_copy(si->value, (int32_t)sizeof(si->value), t);
 }
@@ -5283,6 +5910,28 @@ static void aowl_ov_s_num_box(AowlOvSItem* si, int32_t at, float bx, float by,
             InterlockedExchange(&g_ov.clickDown, 0);
             return;
         }
+    }
+    /* THE NUMBER IS SHORTENED, NOT CLIPPED.
+     *
+     * `aowl_ov_textn` ends an over-long string with `..`, which on a numeric
+     * cell reads as a DIFFERENT NUMBER -- `0.3000..` is not 0.3 and 12345.. is
+     * not 12345. So a numeric row re-renders its value at the width it has
+     * (`aowl_ov_num_str` drops decimals, then significant digits, and only
+     * fills with `#` when even one digit will not fit), and what reaches
+     * `aowl_ov_textn` is already short enough that its ellipsis path cannot
+     * fire. Non-numeric rows are unchanged: clipping a string is honest,
+     * clipping a number is not. */
+    if (si->kind == AOWL_S_INT || si->kind == AOWL_S_FLOAT) {
+        char shown[48];
+        if (!si->value[0]) {
+            aowl_ov_textn(bx, by + 3.0f, "-", AOWL_OV_DIM, cols);
+            return;
+        }
+        aowl_ov_num_str(si, (float)strtod(si->raw, NULL), cols, shown,
+                        (int32_t)sizeof(shown));
+        aowl_ov_textn(bx, by + 3.0f, shown,
+                      canEdit ? AOWL_OV_TEXT : AOWL_OV_DIM, cols);
+        return;
     }
     aowl_ov_textn(bx, by + 3.0f, si->value[0] ? si->value : "-",
                   canEdit ? AOWL_OV_TEXT : AOWL_OV_DIM, cols);
@@ -5827,6 +6476,12 @@ static void aowl_ov_settings_key(LONG vk, int32_t page) {
     /* --- navigation ------------------------------------------------------ */
     if (vk == VK_UP   || vk == 'W') { if (g_ov.selItem > lo) g_ov.selItem--; return; }
     if (vk == VK_DOWN || vk == 'S') { if (g_ov.selItem < hi - 1) g_ov.selItem++; return; }
+    if ((vk == VK_PRIOR || vk == VK_NEXT) && (GetKeyState(VK_SHIFT) & 0x8000)) {
+        g_ov.topPage += (vk == VK_NEXT ? +1 : -1) * (page > 1 ? page - 1 : 1);
+        if (g_ov.topPage < 0) g_ov.topPage = 0;
+        g_ov.navFree = 1;    /* clamped against the real list by the draw */
+        return;
+    }
     if (vk == VK_PRIOR) { g_ov.selItem -= page; if (g_ov.selItem < lo) g_ov.selItem = lo; return; }
     if (vk == VK_NEXT)  { g_ov.selItem += page;
                           if (g_ov.selItem > hi - 1) g_ov.selItem = hi - 1;
@@ -5869,6 +6524,43 @@ static void aowl_ov_settings_key(LONG vk, int32_t page) {
     if (vk == VK_OEM_4) { if (g_ov.selPage > 0) g_ov.selPage--; return; }          /* [ */
     if (vk == VK_OEM_6) { if (g_ov.selPage < g_ov.sPageCount - 1) g_ov.selPage++; return; } /* ] */
 
+    /* --- THE NAV, FROM THE KEYBOARD --------------------------------------
+     *
+     * `[` and `]` walk the PAGES and `+`/`-` open and close a branch, but
+     * before this there was no key that moved DOWN INTO one: the group cursor
+     * could only be placed with the mouse, so on a page with a deep tree the
+     * keyboard could reach the page and nothing inside it.
+     *
+     * `,` and `.` step the group cursor through `sCats` -- which is the whole
+     * tree in path order -- so every node is reachable in a bounded number of
+     * presses at any depth. Ancestors open on the way because
+     * `aowl_ov_nav_open` treats "the selection is inside me" as open, the same
+     * rule the mouse path uses; there is no second notion of expansion to
+     * disagree with the first. `,` from the first group goes to -1, the page
+     * itself, which is where the cursor started.
+     *
+     * SHIFT+PgUp/PgDn scrolls the nav VIEW without moving the cursor, which is
+     * the "look at the rest of the list" gesture the wheel gives the mouse. */
+    if (vk == VK_OEM_COMMA) {
+        if (g_ov.selCat >= 0) {
+            g_ov.selCat--;
+            if (g_ov.selCat >= 0) {
+                g_ov.selItem = g_ov.sCats[g_ov.selCat].lo;
+                g_ov.topItem = g_ov.selItem;
+            }
+        }
+        return;
+    }
+    if (vk == VK_OEM_PERIOD) {
+        if (g_ov.selCat < g_ov.sCatCount - 1) {
+            g_ov.selCat++;
+            g_ov.navOpen[g_ov.selCat] = 1;
+            g_ov.selItem = g_ov.sCats[g_ov.selCat].lo;
+            g_ov.topItem = g_ov.selItem;
+        }
+        return;
+    }
+
     if (!canEdit) return;
     /* --- change the selected control ------------------------------------ */
     if (vk == VK_LEFT) {
@@ -5909,7 +6601,11 @@ static void aowl_ov_view_settings(float x, float y, float w, float bodyH) {
      * on depth, and a nav that indents four levels into a 208-wide column has
      * ~14 characters left for the name -- which is how "Regeneration" became
      * "Regenera.." and every deep node started looking like every other. */
-    const float leftW = 256.0f;
+    /* 256 by default, and settable from the panel's own page -- a person with
+     * deeply nested mod settings wants more, a person on a small window wants
+     * less, and neither of them should have to rebuild the host to get it. */
+    const float leftW = (float)(g_ov.navW >= 140 && g_ov.navW <= 640
+                                ? g_ov.navW : 256);
     float rx = x + (float)AOWL_OV_PAD + leftW + 12.0f;
     float rrEdge = x + w + (float)AOWL_OV_PAD;       /* right inner edge */
     float rw = rrEdge - rx;
@@ -6063,9 +6759,38 @@ static void aowl_ov_view_settings(float x, float y, float w, float bodyH) {
                 if (navPage[k] == g_ov.selPage) { navSel = k; break; }
         if (navSel < 0) navSel = 0;
     }
-    if (g_ov.topPage > navSel) g_ov.topPage = navSel;
-    if (navSel - g_ov.topPage >= navRows)
-        g_ov.topPage = navSel - navRows + 1;
+    /* --- THE WHEEL, ROUTED ------------------------------------------------
+     *
+     * Over the nav column it scrolls the nav; anywhere else it moves the
+     * control cursor, which is what it always did. Three rows a notch, the
+     * Windows convention, and the same number both sides so the two lists feel
+     * like one surface. */
+    {
+        int32_t notches = g_ov.navWheel;
+        g_ov.navWheel = 0;
+        if (notches) {
+            float navRight = x + (float)AOWL_OV_PAD + leftW + 6.0f;
+            if (mxp < navRight) {
+                g_ov.topPage -= 3 * notches;
+                g_ov.navFree = 1;
+            } else {
+                g_ov.selItem -= 3 * notches;
+                if (g_ov.selItem < 0) g_ov.selItem = 0;
+                if (g_ov.selItem >= g_ov.sItemCount)
+                    g_ov.selItem = g_ov.sItemCount > 0 ? g_ov.sItemCount - 1 : 0;
+            }
+        }
+    }
+    /* Following the cursor is what the nav does UNLESS the player has just
+     * scrolled it themselves. Both clamps below still run either way -- a free
+     * scroll may leave the list past its own end, and a list scrolled past its
+     * end shows blank rows and reads as broken. */
+    if (navSel != g_ov.navSelSeen) { g_ov.navFree = 0; g_ov.navSelSeen = navSel; }
+    if (!g_ov.navFree) {
+        if (g_ov.topPage > navSel) g_ov.topPage = navSel;
+        if (navSel - g_ov.topPage >= navRows)
+            g_ov.topPage = navSel - navRows + 1;
+    }
     if (g_ov.topPage > navCount - navRows) g_ov.topPage = navCount - navRows;
     if (g_ov.topPage < 0) g_ov.topPage = 0;
 
@@ -6282,6 +7007,53 @@ static void aowl_ov_view_settings(float x, float y, float w, float bodyH) {
             InterlockedExchange(&g_ov.clickDown, 0);
         }
         ny += (float)AOWL_OV_ROW_H;
+    }
+
+    /* --- THERE IS MORE OF THIS LIST --------------------------------------
+     *
+     * A list that scrolls and does not SAY it scrolls is a list whose extra
+     * entries do not exist as far as the player is concerned -- which is
+     * exactly the report this fixes. Two marks, both falsifiable by looking:
+     *
+     *  * a THUMB in the nav's own right-hand gutter, whose length is the
+     *    fraction on screen and whose position is where in the list you are.
+     *    Drawn only when there IS more, so its presence is itself the signal.
+     *  * a COUNT at each end -- "12 more" above, "40 more" below -- because a
+     *    thumb says "there is more" and a number says how much.
+     *
+     * Both come from `navCount`/`topPage`/`navRows`, the same three numbers the
+     * row loop above just drew from, so the indicator cannot disagree with the
+     * list it describes. */
+    if (navCount > navRows) {
+        float trackX = x + (float)AOWL_OV_PAD + leftW + 1.0f;
+        float trackY = y + (float)AOWL_OV_LINE_H;
+        float trackH = (float)navRows * (float)AOWL_OV_ROW_H;
+        float th = trackH * (float)navRows / (float)navCount;
+        float tt = trackH * (float)g_ov.topPage / (float)navCount;
+        char more[32];
+        if (th < 12.0f) th = 12.0f;
+        if (tt > trackH - th) tt = trackH - th;
+        if (tt < 0.0f) tt = 0.0f;
+        aowl_ov_rect(trackX, trackY, 3.0f, trackH, AOWL_OV_PANEBG);
+        aowl_ov_rect(trackX, trackY + tt, 3.0f, th, AOWL_OV_ACCENT);
+        if (g_ov.topPage > 0) {
+            aowl_ov_fmt(more, (int32_t)sizeof(more), "^ %d more", g_ov.topPage);
+            /* Right-aligned in the nav's own column, beside the "pages"
+             * caption rather than on top of it. */
+            aowl_ov_text(x + (float)AOWL_OV_PAD + leftW
+                           - (float)strlen(more) * AOWL_OV_CW, y,
+                         more, AOWL_OV_FAINT);
+        }
+        {
+            int32_t below = navCount - g_ov.topPage - navRows;
+            if (below > 0) {
+                aowl_ov_fmt(more, (int32_t)sizeof(more), "v %d more", below);
+                aowl_ov_text(x + (float)AOWL_OV_PAD + leftW
+                               - (float)strlen(more) * AOWL_OV_CW,
+                             trackY + trackH - (float)AOWL_OV_LINE_H + 2.0f,
+                             more, AOWL_OV_FAINT);
+            }
+        }
     }
 
     /* --- the right pane header ------------------------------------------- */
@@ -7050,6 +7822,17 @@ static uint32_t aowl_ov_signature(void) {
     aowl_ov_sig_add(&h, (int32_t)(g_ov.panW * 4.0f));
     aowl_ov_sig_add(&h, (int32_t)(g_ov.panH * 4.0f));
     aowl_ov_sig_add(&h, g_ov.panMax);
+    /* The panel's own preferences are part of what is on screen, so a change to
+     * any of them has to invalidate the "nothing moved, do not redraw" cache.
+     * Leaving them out is how a theme switch produces a frame that is still the
+     * old theme -- and then stays that way until something unrelated moves. */
+    aowl_ov_sig_add(&h, g_ov.showFooter);
+    aowl_ov_sig_add(&h, g_ov.navW);
+    aowl_ov_sig_add(&h, g_ov.panAlpha);
+    aowl_ov_sig_add(&h, g_ov.scalePref);
+    aowl_ov_sig_add(&h, (int32_t)g_ovTheme.bg);
+    aowl_ov_sig_add(&h, (int32_t)g_ovTheme.accent);
+    aowl_ov_sig_add(&h, g_ov.topPage);
     aowl_ov_sig_add(&h, g_ov.panAlpha);
     aowl_ov_sig_add(&h, g_ov.dragWin);
     aowl_ov_sig_add(&h, g_ov.dragGrip);
@@ -7072,7 +7855,16 @@ static void aowl_ov_build(void) {
     char legKeys[288], legNote[256];
     int32_t legCols = 0, legKeyN = 1, legNoteN = 1;
     float titleRight = 0.0f;   /* where the window controls start */
-    uint32_t healthCol = AOWL_OV_DIM;
+    uint32_t healthCol;
+    /* THE PALETTE MUST EXIST BEFORE THE FIRST RECTANGLE.
+     *
+     * `aowl_ov_start` loads the themes, but this file is also included by test
+     * hosts and probes that draw without going through it -- and a zeroed
+     * `g_ovTheme` is not a wrong colour, it is transparent black on
+     * transparent black, i.e. a panel that renders as nothing at all. One
+     * integer compare a frame buys the guarantee that cannot happen. */
+    if (g_ovThemeCount == 0) aowl_ov_themes_load();
+    healthCol = AOWL_OV_DIM;
 
     aowl_ov_snapshot();
     aowl_ov_refresh_display();
@@ -7104,7 +7896,8 @@ static void aowl_ov_build(void) {
      * and nothing else, so a resize gives the same answer every time and
      * `aowl_ov_bind` invalidating the geometry cache on a size change is all
      * the bookkeeping it needs. */
-    g_ov.scale = (g_ov.bbH >= 2500) ? 3 : (g_ov.bbH >= 1300) ? 2 : 1;
+    g_ov.scale = g_ov.scalePref > 0 ? g_ov.scalePref
+               : (g_ov.bbH >= 2500) ? 3 : (g_ov.bbH >= 1300) ? 2 : 1;
     availW = (g_ov.bbW ? (float)g_ov.bbW : 1280.0f) / (float)g_ov.scale;
     availH = (g_ov.bbH ? (float)g_ov.bbH : 720.0f) / (float)g_ov.scale;
     mxp = (float)g_ov.mx / (float)g_ov.scale;
@@ -7191,12 +7984,16 @@ static void aowl_ov_build(void) {
     {
         LONG notches = InterlockedExchange(&g_ov.wheel, 0);
         if (g_ov.settings) {
-            if (notches) {
-                g_ov.selItem -= 3 * (int32_t)notches;
-                if (g_ov.selItem < 0) g_ov.selItem = 0;
-                if (g_ov.selItem >= g_ov.sItemCount)
-                    g_ov.selItem = g_ov.sItemCount > 0 ? g_ov.sItemCount - 1 : 0;
-            }
+            /* THE WHEEL BELONGS TO WHICHEVER LIST IS UNDER THE CURSOR.
+             *
+             * It used to always move the CONTROL list, so the nav could not be
+             * scrolled at all -- with more pages than rows, the ones past the
+             * bottom were simply unreachable by mouse. The nav's own geometry
+             * is not known here, so the notches are handed to
+             * `aowl_ov_view_settings`, which owns that geometry, and it decides
+             * from the cursor's x. Anything it does not claim comes back and
+             * moves the control list exactly as before. */
+            g_ov.navWheel = (int32_t)notches;
         } else {
             if (notches)
                 aowl_ov_move(g_ov.view, -3 * (int32_t)notches,
@@ -7353,6 +8150,13 @@ static void aowl_ov_build(void) {
         if (legNoteN > maxN - legKeyN) legNoteN = maxN - legKeyN;
         legendH = (float)(AOWL_OV_LEGEND_H - 2 * AOWL_OV_LINE_H
                           + (legKeyN + legNoteN) * AOWL_OV_LINE_H);
+        /* THE FOOTER IS OPTIONAL, and turning it off gives its height to the
+         * body rather than leaving a blank strip -- a hidden footer that still
+         * costs three rows is not hidden, it is invisible and expensive. The
+         * default is ON: the argument above (a keyboard interface whose keys
+         * are not on screen is unusable) is still the right default, and this
+         * is for the player who has learnt them. */
+        if (!g_ov.showFooter) legendH = 0.0f;
         bodyH = h - (float)AOWL_OV_HEAD_H - legendH;
         rows = (int32_t)((bodyH - (float)AOWL_OV_LINE_H) / AOWL_OV_ROW_H);
         if (g_ov.view == AOWL_VIEW_MODS)
@@ -7371,7 +8175,27 @@ static void aowl_ov_build(void) {
                  (AOWL_OV_BG & 0x00FFFFFFu) |
                  ((uint32_t)(g_ov.panAlpha & 0xFF) << 24));
     aowl_ov_rect(x, y, w, (float)AOWL_OV_TITLE_H, AOWL_OV_TITLEBG);
-    aowl_ov_frame_rect(x, y, w, h, 1.0f, AOWL_OV_EDGE);
+    /* NO BORDER WHEN THERE IS NOTHING TO BE BORDERED FROM.
+     *
+     * The frame exists to separate a floating window from the game behind it.
+     * Maximised, the panel IS the back buffer -- `panMax` pins it to 0,0 and
+     * the full `availW`x`availH` a few hundred lines up -- so the frame is a
+     * rule around the edge of the screen, which is decoration with no job. It
+     * is a property of the STATE, not a setting: nobody should have to turn
+     * off a line that only ever appears in a mode where it means nothing.
+     *
+     * The other floating-case affordances were checked at the same time:
+     *   * the RESIZE GRIP was already suppressed under `panMax` (see the
+     *     move/resize block below) -- left as it was;
+     *   * the TITLE-BAR DRAG was already inert under `panMax` -- but the title
+     *     bar itself stays drawn, because it carries the tab strip, the
+     *     MANAGER/SETTINGS toggle and the maximise button, which have jobs at
+     *     any size;
+     *   * there is no drop shadow, no corner rounding and no outer margin in
+     *     this renderer to drop -- the panel is axis-aligned rects and the only
+     *     inset is `AOWL_OV_PAD`, which is text padding, not window chrome. */
+    if (!g_ov.panMax)
+        aowl_ov_frame_rect(x, y, w, h, 1.0f, AOWL_OV_EDGE);
     aowl_ov_text(x + AOWL_OV_PAD, y + 5.0f, "aowlspt", AOWL_OV_ACCENT);
     /* The two faces, as a clickable toggle right in the title bar, so the way
      * across is always visible and never a key nobody was told about. F2 does
@@ -7542,7 +8366,7 @@ settings_body_done:
      * Printed, always, on every view. A keyboard interface whose keys are not
      * on screen is a keyboard interface nobody can use, and this one is being
      * driven by somebody whose mouse is busy pointing a rifle. */
-    {
+    if (g_ov.showFooter) {
         /* Built and measured above; here it is only placed. Both lines are
          * wrapped rather than clipped -- see the note by the measurement. */
         float ly = y + h - legendH + 4.0f;
@@ -7581,7 +8405,11 @@ settings_body_done:
         if (g_ov.dragGrip) {
             if (!g_ov.mouseHeld) {
                 g_ov.dragGrip = 0;
-                InterlockedExchange(&g_ov.prefsDirty, 1);
+                /* `savePos` off means the panel opens where it always opens.
+                 * The drag still WORKS this session -- it just is not written
+                 * back, which is the difference between "cannot move it" and
+                 * "does not remember". */
+                if (g_ov.savePos) InterlockedExchange(&g_ov.prefsDirty, 1);
             } else {
                 g_ov.panW = mxp - g_ov.panX + g_ov.dragDX;
                 g_ov.panH = myp - g_ov.panY + g_ov.dragDY;
@@ -7591,7 +8419,7 @@ settings_body_done:
         } else if (g_ov.dragWin) {
             if (!g_ov.mouseHeld) {
                 g_ov.dragWin = 0;
-                InterlockedExchange(&g_ov.prefsDirty, 1);
+                if (g_ov.savePos) InterlockedExchange(&g_ov.prefsDirty, 1);
             } else {
                 g_ov.panX = mxp - g_ov.dragDX;
                 g_ov.panY = myp - g_ov.dragDY;
@@ -8166,7 +8994,8 @@ static void aowl_ov_admin_append(void) {
 
     /* ---- The F6 menu, at panel scale ---- */
     if (aowl_admin_menu_open(g_ov_admin)) {
-        g_ov.scale = (g_ov.bbH >= 2500) ? 3 : (g_ov.bbH >= 1300) ? 2 : 1;
+        g_ov.scale = g_ov.scalePref > 0 ? g_ov.scalePref
+               : (g_ov.bbH >= 2500) ? 3 : (g_ov.bbH >= 1300) ? 2 : 1;
         float rowH = (float)AOWL_OV_CH + 5.0f;
         float mw = 250.0f;
         float mx = 18.0f, my = 70.0f;
@@ -8294,7 +9123,12 @@ static int32_t aowl_ov_hint_alpha(void) {
     }
     age = now - g_ov.hintAt;
     if (age < AOWL_OV_HINT_HOLD) return 255;
-    if (age < AOWL_OV_HINT_HOLD + AOWL_OV_HINT_FADE) {
+    /* With animation off the toast CUTS rather than fades. It is the same
+     * total time on screen either way -- turning animation off must not also
+     * silently change how long the message is readable for. */
+    if (!g_ov.animate) {
+        if (age < AOWL_OV_HINT_HOLD + AOWL_OV_HINT_FADE) return 255;
+    } else if (age < AOWL_OV_HINT_HOLD + AOWL_OV_HINT_FADE) {
         DWORD f = age - AOWL_OV_HINT_HOLD;
         return (int32_t)(255u - (f * 255u) / AOWL_OV_HINT_FADE);
     }
@@ -8449,7 +9283,8 @@ static HRESULT STDMETHODCALLTYPE aowl_ov_present(IDXGISwapChain* sc, UINT sync,
                 aowl_ov_build();
             } else {
                 g_ov.vtxCount = 0;
-                g_ov.scale = (g_ov.bbH >= 2500) ? 3 : (g_ov.bbH >= 1300) ? 2 : 1;
+                g_ov.scale = g_ov.scalePref > 0 ? g_ov.scalePref
+               : (g_ov.bbH >= 2500) ? 3 : (g_ov.bbH >= 1300) ? 2 : 1;
                 g_ov.needUpload = 1;
             }
             if (adminOn) aowl_ov_admin_append();
@@ -8687,7 +9522,12 @@ static int32_t aowl_ov_start(int32_t toggleVk, int32_t backendPort) {
      * wanted -- read from disk BEFORE the first present, so the panel never
      * flashes at a default position on its way to the remembered one. The
      * value it read is in `status`. */
+    /* Themes BEFORE prefs: the prefs name a theme by NAME, and applying a name
+     * against an empty table would silently land on the compiled default while
+     * reporting the name the player chose. */
+    aowl_ov_themes_load();
     aowl_ov_prefs_load();
+    aowl_ov_theme_apply(g_ov.themeName);
     g_ov.viewLo = 0; g_ov.viewHi = 0;
     g_ov.capturing = 0;
     g_ov.curPage[0] = 0;

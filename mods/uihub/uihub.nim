@@ -69,7 +69,7 @@ import aowlspt/settings
 
 const
   ModGuid = "aowl.uihub"
-  ModName = "Fallback Settings UI"
+  ModName = "Browser Settings Page"
   ModAuthor = "savannt"
   ModVersion = "2.0.0"
 

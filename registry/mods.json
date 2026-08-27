@@ -230,10 +230,10 @@
     },
     {
       "id": "aowl.uihub",
-      "name": "Fallback Settings UI",
+      "name": "Browser Settings Page",
       "author": "savannt",
       "version": "2.0.0",
-      "description": "The browser settings page at /aowlspt/ui/page/settings. It reads and writes the exact same /aowlspt/settings/* routes any other UI would, including the per-row and page-level reset buttons, so it is the reference implementation as well as the shipping surface.",
+      "description": "The settings screen served in your web browser, at /aowlspt/ui/page/settings -- the alternative to the in-game F12 panel, and the one that still works when the game is fullscreen or on another machine. It reads and writes the exact same /aowlspt/settings/* routes any other UI would, including the per-row and page-level reset buttons, so it is the reference implementation as well as the shipping surface.",
       "pipeline": ">=0.1.0",
       "sides": [
         "server"
