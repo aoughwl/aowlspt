@@ -222,7 +222,162 @@ proc settingPath*(s: Setting): seq[string] =
         cur.add ch
     if cur.len > 0: result.add cur
 
-proc toJson*(s: Setting): JsonObject =
+# ---------------------------------------------------------------------------
+# Display names for machine-shaped group segments
+# ---------------------------------------------------------------------------
+
+proc isUpperCh(c: char): bool = c >= 'A' and c <= 'Z'
+proc isLowerCh(c: char): bool = c >= 'a' and c <= 'z'
+proc isDigitCh(c: char): bool = c >= '0' and c <= '9'
+
+proc prettySegment*(name: string): string =
+  ## A group segment as a HUMAN reads it. `ArmorMaterials` -> `Armor Materials`.
+  ##
+  ## Display only. The `key` of every row, and the verbatim `category` /
+  ## `subcategory` fields, are untouched -- they are the wire identity and a
+  ## renamed one would silently orphan a saved value.
+  ##
+  ## The rule, in the order the cases are tested, because naive
+  ## split-before-every-capital produces `B T R Settings`:
+  ##
+  ##   1. a segment that ALREADY contains a space is returned verbatim. Somebody
+  ##      wrote that name for a human; re-splitting it is how `Flea Market`
+  ##      becomes `Flea  Market`.
+  ##   2. `_` and `-` are word separators and become a single space.
+  ##   3. break before an upper that follows a lower or a digit
+  ##      (`ArmorMaterials` -> `Armor Materials`).
+  ##   4. break before a digit that follows a letter (`Level2` -> `Level 2`).
+  ##   5. break before the LAST upper of an upper run when a lower follows it --
+  ##      that upper starts the next word, the ones before it are an acronym
+  ##      (`BTRSettings` -> `BTR Settings`, `PMCChatResponse` -> `PMC Chat
+  ##      Response`). An upper run with no lower after it stays whole (`BTR`).
+  ##
+  ## Never emits a leading, trailing or doubled space: an empty-looking group
+  ## title is the defect this is supposed to remove, not add.
+  if name.len == 0:
+    return ""
+  for ch in name:
+    if ch == ' ':
+      return name
+  result = ""
+  for i in 0 ..< name.len:
+    let c = name[i]
+    if c == '_' or c == '-':
+      if result.len > 0 and result[result.len - 1] != ' ':
+        result.add ' '
+      continue
+    if i > 0:
+      let p = name[i - 1]
+      var brk = false
+      if isUpperCh(c) and (isLowerCh(p) or isDigitCh(p)):
+        brk = true
+      elif isDigitCh(c) and (isLowerCh(p) or isUpperCh(p)):
+        brk = true
+      elif isUpperCh(c) and isUpperCh(p) and i + 1 < name.len and
+           isLowerCh(name[i + 1]):
+        brk = true
+      if brk and result.len > 0 and result[result.len - 1] != ' ':
+        result.add ' '
+    result.add c
+
+proc prettyPath*(segs: seq[string]): seq[string] =
+  result = @[]
+  for s in segs:
+    let p = prettySegment(s)
+    if p.len > 0: result.add p
+
+# ---------------------------------------------------------------------------
+# Collapsing a level that is not a level
+# ---------------------------------------------------------------------------
+
+proc pathKey(segs: seq[string]; upto: int): string =
+  ## The first `upto` segments, joined by a byte no segment can contain (a
+  ## separator that IS representable inside a segment would merge two distinct
+  ## nodes into one and silently move settings between groups).
+  result = ""
+  for i in 0 ..< upto:
+    result.add "\x1f"
+    result.add segs[i]
+
+proc slotOf(keys: var seq[string]; own: var seq[int]; kidCount: var seq[int];
+            k: string): int =
+  ## Index of node `k`, appending it (with zeroed counters) if new. Linear, so
+  ## the three parallel seqs stay the whole data structure -- a schema is
+  ## hundreds of rows, not millions, and a hash table here would be one more
+  ## thing to get wrong.
+  for i in 0 ..< keys.len:
+    if keys[i] == k: return i
+  keys.add k
+  own.add 0
+  kidCount.add 0
+  result = keys.len - 1
+
+proc collapsedPaths*(settings: seq[Setting]): seq[seq[string]] =
+  ## The group path of every row, with the levels that are not levels removed.
+  ##
+  ## A node that holds NO settings of its own and has EXACTLY ONE child is not a
+  ## level: opening it shows one folder, and that folder has the same contents
+  ## and the same count. `Ballistics / Armour / ArmorMaterials` reported 48
+  ## settings at `Armour` and 48 at `ArmorMaterials` for exactly that reason.
+  ##
+  ## So such a node ABSORBS its single child: the two become one level, keeping
+  ## the OUTER name (the heading a human wrote) and dropping the inner one (the
+  ## raw branch name the path happened to have). The absorbing node is then not
+  ## re-examined -- one merge per chain, walking outwards in.
+  ##
+  ##   Ballistics / Armour / ArmorMaterials  ->  Ballistics / ArmorMaterials
+  ##   Insurance / Insurance                 ->  Insurance
+  ##   Weapons / Aiming / Aiming             ->  Weapons / Aiming
+  ##
+  ## Not iterated to a fixed point, deliberately. Re-running it would eat
+  ## `Ballistics / ArmorMaterials` down to `Ballistics` -- the top-level heading
+  ## swallowing the only thing under it, which is a worse tree than the one this
+  ## started with, and is not what was asked for.
+  ##
+  ## This is computed over the WHOLE schema, never one row at a time -- whether
+  ## `Armour` has a sibling is not knowable from a single setting.
+  var raw: seq[seq[string]] = @[]
+  for s in settings:
+    raw.add settingPath(s)
+
+  # own[k]: settings whose whole path is exactly k. kidCount[k]: distinct children.
+  var keys: seq[string] = @[]
+  var own: seq[int] = @[]
+  var kidKeys: seq[string] = @[]      ## parentKey + "\x1e" + childKey, deduped
+  var kidCount: seq[int] = @[]
+
+  for p in raw:
+    for i in 0 ..< p.len:
+      let d = i + 1
+      let me = slotOf(keys, own, kidCount, pathKey(p, d))
+      if d == p.len:
+        own[me] = own[me] + 1
+      if d > 1:
+        let parent = slotOf(keys, own, kidCount, pathKey(p, d - 1))
+        let edge = pathKey(p, d - 1) & "\x1e" & pathKey(p, d)
+        var seenEdge = false
+        for e in kidKeys:
+          if e == edge:
+            seenEdge = true
+            break
+        if not seenEdge:
+          kidKeys.add edge
+          kidCount[parent] = kidCount[parent] + 1
+
+  result = @[]
+  for p in raw:
+    var outp: seq[string] = @[]
+    var i = 0
+    while i < p.len:
+      outp.add p[i]
+      let me = slotOf(keys, own, kidCount, pathKey(p, i + 1))
+      if own[me] == 0 and kidCount[me] == 1:
+        i = i + 2       # this level absorbed its only child; skip the child
+      else:
+        i = i + 1
+    result.add prettyPath(outp)
+
+proc toJsonAt*(s: Setting; path: seq[string]): JsonObject =
   ## One row, as the UI receives it. `value` is the *current* value read out of
   ## `config.json` (falling back to `defaultJson` when the file has no such
   ## key), so the panel can be drawn without a second round trip.
@@ -272,21 +427,28 @@ proc toJson*(s: Setting): JsonObject =
   # it by re-splitting two fields and never has to guess which of them is the
   # outer one.
   block:
-    let segs = settingPath(s)
-    if segs.len > 0:
+    if path.len > 0:
       var pa = arr()
-      for seg in segs:
+      for seg in path:
         pa.add seg
       o.put("path", pa)
   if s.description.len > 0: o.put("description", s.description)
   o.put("implemented", s.implemented)
   result = o
 
+proc toJson*(s: Setting): JsonObject =
+  ## One row on its own. The tree-shaping pass in `collapsedPaths` needs the
+  ## whole schema, so a row serialised ALONE keeps its literal path -- honest
+  ## about what it can know, rather than half-collapsing against a set of one.
+  result = toJsonAt(s, prettyPath(settingPath(s)))
+
 proc schemaJson*(settings: seq[Setting]): Json =
-  ## A whole schema as a JSON array, current values folded in.
+  ## A whole schema as a JSON array, current values folded in, and the group
+  ## tree shaped ONCE over the whole set (see `collapsedPaths`).
+  let paths = collapsedPaths(settings)
   var a = arr()
-  for s in settings:
-    a.add toJson(s)
+  for i in 0 ..< settings.len:
+    a.add toJsonAt(settings[i], paths[i])
   result = done(a)
 
 # ---------------------------------------------------------------------------

@@ -13,7 +13,10 @@ what the feature asks for ("still show them but mark them clearly not
 implemented yet"). Flip entries in IMPLEMENTED below as aowlspt grows a backing
 feature for one.
 """
-import json, os, re
+import json, os, re, sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+from nametree import pretty_segment, collapse_paths
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SURFACE = os.path.join(HERE, "..", "reference", "spt-4.1-surface.json")
@@ -135,6 +138,33 @@ def main():
                     n_nested += 1
 
         walk(cn, "spt." + cfile, cn, 0, {cn})
+
+        # Shape the group tree ONCE per page, exactly as `settings.nim` shapes a
+        # mod's declared schema: drop the levels that are not levels, then give
+        # every surviving segment (and every row label) its human spelling. The
+        # `key` is untouched -- it is the wire identity. `category` is display
+        # only, so it is rewritten in place, and `path` is emitted beside it so a
+        # renderer never has to re-split a string to find the levels.
+        # The outermost segment is the config CLASS, which is what the page
+        # itself is named -- `SPT / Bot > BotConfig > Durability` made the class
+        # a level inside a page that already was that class. Dropped here rather
+        # than in `walk`, because `walk` builds the key namespace off the same
+        # string and the key must not move.
+        segs = []
+        for s in page["settings"]:
+            p = [x.strip() for x in s["category"].split("/") if x.strip()]
+            if p and p[0] == cn:
+                p = p[1:]
+            segs.append(p)
+        for s, p in zip(page["settings"], collapse_paths(segs)):
+            pretty = [pretty_segment(x) for x in p]
+            s["path"] = pretty
+            s["category"] = " / ".join(pretty)
+            s["label"] = pretty_segment(s["label"])
+        for n in page["nested"]:
+            n["label"] = pretty_segment(n["label"])
+        base = cn[:-6] if cn.endswith("Config") else cn
+        page["label"] = "SPT / " + pretty_segment(base)
         pages.append(page)
 
     doc = {
