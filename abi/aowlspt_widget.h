@@ -343,7 +343,28 @@ enum {
     AOWL_WG_CRUMB_BANNER    = 13,
     AOWL_WG_CRUMB_HIDEREST  = 14,
     AOWL_WG_CRUMB_MARKERS   = 15,
-    AOWL_WG_CRUMB_DONE      = 16
+    AOWL_WG_CRUMB_DONE      = 16,
+
+    /* INSIDE duBuild. The live run narrowed the fault to "cloning the label
+     * pool", which is still a dozen distinct managed operations -- so the
+     * build path gets its own stages rather than another round of guessing.
+     * `aowl_wg_crumb_w` doubles as the CLONE INDEX in the two pool loops. */
+    AOWL_WG_CRUMB_B_ANCHOR   = 17,  /* duFindAnchor                        */
+    AOWL_WG_CRUMB_B_ROOT     = 18,  /* duCanvasRootGo                      */
+    AOWL_WG_CRUMB_B_PROBECLONE = 19,/* Instantiate for the probe           */
+    AOWL_WG_CRUMB_B_PROBEDRAW  = 20,/* duMakeDrawable on the probe         */
+    AOWL_WG_CRUMB_B_SRCCANVAS  = 21,/* reading the SOURCE's m_Canvas       */
+    AOWL_WG_CRUMB_B_PROBECANVAS= 22,/* reading the PROBE's m_Canvas        */
+    AOWL_WG_CRUMB_B_DROPCANVAS = 23,/* duDropNestedCanvas                  */
+    AOWL_WG_CRUMB_B_ASSERTLOG  = 24,/* the assertion's own describe calls  */
+    AOWL_WG_CRUMB_B_PROBEREUSE = 25,/* style+drawable on the reused probe  */
+    AOWL_WG_CRUMB_B_PANELCLONE = 26,/* pool clone loop; crumb_w = index    */
+    AOWL_WG_CRUMB_B_PANELDRAW  = 27,/* style+drawable on a pool clone      */
+    AOWL_WG_CRUMB_B_MARKCLONE  = 28,/* marker clone loop; crumb_w = index  */
+    AOWL_WG_CRUMB_B_MARKDRAW   = 29,
+    AOWL_WG_CRUMB_B_SCALE      = 30,/* reading the canvas scaleFactor      */
+    AOWL_WG_CRUMB_B_DIAGDUMP   = 31,/* duDiagDump                          */
+    AOWL_WG_CRUMB_B_READBACK   = 32 /* the placement read-back             */
 };
 
 static volatile int32_t aowl_wg_crumb_stage  = 0;
@@ -372,6 +393,22 @@ static const char* aowl_wg_crumb_text(int32_t s) {
     case AOWL_WG_CRUMB_HIDEREST:  return "hiding unused labels";
     case AOWL_WG_CRUMB_MARKERS:   return "the ESP markers";
     case AOWL_WG_CRUMB_DONE:      return "finished (fault came from elsewhere)";
+    case AOWL_WG_CRUMB_B_ANCHOR:      return "duBuild: duFindAnchor (locating the donor version label)";
+    case AOWL_WG_CRUMB_B_ROOT:        return "duBuild: duCanvasRootGo (walking to the canvas root)";
+    case AOWL_WG_CRUMB_B_PROBECLONE:  return "duBuild: Object::Instantiate for the PROBE clone";
+    case AOWL_WG_CRUMB_B_PROBEDRAW:   return "duBuild: duMakeDrawable on the probe clone";
+    case AOWL_WG_CRUMB_B_SRCCANVAS:   return "duBuild: reading the SOURCE label's Graphic.m_Canvas";
+    case AOWL_WG_CRUMB_B_PROBECANVAS: return "duBuild: reading the PROBE clone's Graphic.m_Canvas";
+    case AOWL_WG_CRUMB_B_DROPCANVAS:  return "duBuild: duDropNestedCanvas on the probe";
+    case AOWL_WG_CRUMB_B_ASSERTLOG:   return "duBuild: composing the canvas-assertion log line";
+    case AOWL_WG_CRUMB_B_PROBEREUSE:  return "duBuild: restyling the reused probe as panel label 0";
+    case AOWL_WG_CRUMB_B_PANELCLONE:  return "duBuild: Object::Instantiate for a POOL label (index in the widget field)";
+    case AOWL_WG_CRUMB_B_PANELDRAW:   return "duBuild: duStyle/duMakeDrawable on a pool label";
+    case AOWL_WG_CRUMB_B_MARKCLONE:   return "duBuild: Object::Instantiate for a MARKER label (index in the widget field)";
+    case AOWL_WG_CRUMB_B_MARKDRAW:    return "duBuild: duStyle/duMakeDrawable on a marker label";
+    case AOWL_WG_CRUMB_B_SCALE:       return "duBuild: reading the canvas scaleFactor";
+    case AOWL_WG_CRUMB_B_DIAGDUMP:    return "duBuild: duDiagDump";
+    case AOWL_WG_CRUMB_B_READBACK:    return "duBuild: the placement read-back";
     default:                      return "nothing recorded";
     }
 }
