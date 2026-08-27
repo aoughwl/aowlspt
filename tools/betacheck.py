@@ -853,6 +853,112 @@ def check_mail_types(w, mut):
                "never a scalar" % len(rows))
 
 
+# The four container shapes below are not guesses. Each one is quoted from a
+# Newtonsoft exception the CLIENT ITSELF wrote into
+# D:\Aowlspt\Logs\<ts>\...errors_000.log, alongside the systemData boolean
+# that check_mail_types already guards:
+#
+#   20x  "Cannot deserialize the current JSON array ... into type
+#         'EFT.Dialogs.TraderDialogsDTO' because the type requires a JSON
+#         object"                                        -> /client/dialogue
+#    4x  ... 'EFT.GlobalConfiguration+MainQuestSettings' requires a JSON object
+#                                          -> /client/globals .config.MainQuest
+#    2x  "Cannot deserialize the current JSON object ... into type
+#         'EFT.AvailableCustomizationsResponse' because the type requires a
+#         JSON array"                     -> /client/account/customization
+#    2x  ... 'EFT.SeasonalPerks.SeasonalPerksData' requires a JSON object
+#                                          -> /client/seasonal-perks/list
+#
+# All four are fixed. Nothing re-checked them, so nothing would notice them
+# coming back -- and object-vs-array does not degrade, it throws inside
+# ExecuteRequest and takes the raid load with it.
+#
+# The assertion is a NEGATIVE about the finished payload ("this container is
+# not the wrong JSON kind"), and `absent` is deliberately NOT a pass for the
+# routes whose DTO is the response itself: a 404 or an empty envelope would
+# otherwise skim as success, which is the failure mode this file exists for.
+SHAPES = [
+    # (check-suffix, route, body, dotted path under the envelope, want, mutant)
+    ("dialogue",   "/client/dialogue",                {}, "",
+     dict, "EFT.Dialogs.TraderDialogsDTO"),
+    ("seasonal",   "/client/seasonal-perks/list",     {}, "",
+     dict, "EFT.SeasonalPerks.SeasonalPerksData"),
+    ("customization", "/client/account/customization", None, "",
+     list, "EFT.AvailableCustomizationsResponse"),
+    ("mainquest",  "/client/globals",                 {}, "config.MainQuest",
+     dict, "EFT.GlobalConfiguration+MainQuestSettings"),
+]
+
+
+def _dig(obj, path):
+    """(found, value). `found` is False for 'no such key', which is a DIFFERENT
+    outcome from a key holding null -- the caller must keep them apart."""
+    cur = obj
+    for part in [p for p in path.split(".") if p]:
+        if not isinstance(cur, dict) or part not in cur:
+            return False, None
+        cur = cur[part]
+    return True, cur
+
+
+def check_route_shapes(w, mut):
+    """Every container the client crashed on, re-asserted against live output."""
+    tag = "%04d" % random.randrange(10000)
+    st, doc, text = make_profile(w, "Shape" + tag, "standard")
+    sess = session_of(doc) if doc else ""
+    if not sess:
+        record("route-shapes", INCONC, "no profile, so no route was sampled")
+        return
+    w.call("/client/game/profile/select", {"uid": sess}, sess)
+
+    bad, seen, skipped = [], [], []
+    for suffix, route, body, path, want, dto in SHAPES:
+        st, doc, text = w.call(route, body, sess)
+        if doc is None:
+            bad.append("%s: did not parse as JSON (HTTP %d, %d bytes)"
+                       % (route, st, len(text)))
+            continue
+        err = doc.get("err") if isinstance(doc, dict) else None
+        if err not in (None, 0, "0"):
+            bad.append("%s: envelope err=%r" % (route, err))
+            continue
+        found, val = _dig(envelope(doc), path)
+        if not found:
+            # MainQuest is a MEMBER of a larger DTO: absent leaves the field
+            # null, which cannot throw. Absence of a whole response body can.
+            if path:
+                skipped.append("%s .%s absent (null member, not a throw)"
+                               % (route, path))
+                continue
+            bad.append("%s: nothing at %r" % (route, path or "<envelope>"))
+            continue
+        got = type(val).__name__
+        if mut == "shapes":
+            # The falsifying input: assert the WRONG kind on purpose. If this
+            # does not turn the check red, the check is not looking.
+            want = list if want is dict else dict
+        ok = isinstance(val, want) and not isinstance(val, bool)
+        if ok:
+            seen.append("%s%s=%s" % (route, ("." + path) if path else "", got))
+        else:
+            bad.append("%s%s is %s, client declares %s which requires a JSON %s"
+                       % (route, ("." + path) if path else "", got, dto,
+                          "object" if want is dict else "array"))
+    if bad:
+        record("route-shapes", FAIL, "; ".join(bad[:4]))
+    elif mut == "shapes":
+        record("route-shapes", OK, "every container is the WRONG kind "
+                                   "(mutated expectation)")
+    elif not seen:
+        record("route-shapes", INCONC,
+               "no container was actually examined: " + "; ".join(skipped))
+    else:
+        record("route-shapes", OK,
+               "%d container(s) hold the kind the client's DTO requires (%s)%s"
+               % (len(seen), ", ".join(seen),
+                  ("; not examined: " + "; ".join(skipped)) if skipped else ""))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=7788)
@@ -1667,6 +1773,12 @@ def main():
         check_mail_types(w, mut)
     except Exception as exc:                       # noqa: BLE001
         record("mail-types", INCONC, "%s: %r" % (type(exc).__name__, exc))
+
+    # ------------------------------------------------------------------ 16
+    try:
+        check_route_shapes(w, mut)
+    except Exception as exc:                       # noqa: BLE001
+        record("route-shapes", INCONC, "%s: %r" % (type(exc).__name__, exc))
 
     # ------------------------------------------------------------------ 14
     try:

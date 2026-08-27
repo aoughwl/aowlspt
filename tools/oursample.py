@@ -148,6 +148,96 @@ CALLS = [
     ("/client/mail/dialog/view",             None, {"dialogId": "", "type": 2,
                                                     "limit": 100, "time": 0}, "data"),
     ("/client/mail/dialog/getAllAttachments", None, {"dialogId": ""}, "data"),
+
+    # ---------------------------------------------------------------------
+    # THE REST OF THE REAL SURFACE.
+    #
+    # The 16 entries above were a curated table. The AUTHORITY for what the
+    # client actually calls is the client's own backend_000.log: aggregating
+    # every log under D:\Aowlspt\Logs yields 70 distinct routes (trader-assort
+    # and items/prices collapsed to one <id> form each). Everything below is
+    # the other 54, so that "we never looked at it" stops being a category.
+    #
+    # An unlisted route is INCONCLUSIVE, never a pass -- that conflation is
+    # exactly what let /client/mail/dialog/list ship `systemData: false`.
+    # ---------------------------------------------------------------------
+    ("/client/profile/status",              None, {}, "data"),
+    ("/client/game/profile/items/moving",   None, {"data": []}, "data"),
+    ("/client/seasonal-perks/list",         None, {}, "data"),
+    ("/client/match/group/current",         None, {}, "data"),
+    ("/client/customization",               None, {}, "data"),
+    ("/client/variable/group",              None, {}, "data"),
+    ("/client/tape/list",                   None, {}, "data"),
+    ("/client/subtitle-track/list",         None, {}, "data"),
+    ("/client/season/active",               None, {}, "data"),
+    ("/client/quest/list",                  None, {}, "data"),
+    ("/client/quest/getMainQuestsList",     None, {}, "data"),
+    ("/client/quest/getMainQuestNotesList", None, {}, "data"),
+    ("/client/prestige/list",               None, {}, "data"),
+    ("/client/hideout/settings",            None, {}, "data"),
+    ("/client/hideout/qte/list",            None, {}, "data"),
+    ("/client/hideout/production/recipes",  None, {}, "data"),
+    ("/client/hideout/customization/offer/list", None, {}, "data"),
+    ("/client/hideout/areas",               None, {}, "data"),
+    ("/client/handbook/templates",          None, {}, "data"),
+    ("/client/game/bot/generate",           None,
+     {"conditions": [{"Role": "assault", "Limit": 1, "Difficulty": "normal"}]},
+     "data"),
+    ("/client/friends",                     None, {}, "data"),
+    ("/client/ending/list",                 None, {}, "data"),
+    ("/client/dialogue",                    None, {}, "data"),
+    ("/client/customization/storage",        None, {}, "data"),
+    ("/client/builds/list",                 None, {}, "data"),
+    ("/client/battle-pass/active",          None, {}, "data"),
+    ("/client/achievement/statistic",       None, {}, "data"),
+    ("/client/achievement/list",            None, {}, "data"),
+    ("/client/tutor-game/check",            None, {}, "data"),
+    ("/client/survey",                      None, {}, "data"),
+    ("/client/server/list",                 None, {}, "data"),
+    ("/client/repeatalbeQuests/activityPeriods", None, {}, "data"),
+    ("/client/ragfair/find",                None,
+     {"page": 0, "limit": 15, "sortType": 5, "sortDirection": 0,
+      "currency": 0, "priceFrom": 0, "priceTo": 0, "quantityFrom": 0,
+      "quantityTo": 0, "conditionFrom": 0, "conditionTo": 100,
+      "oneHourExpiration": False, "removeBartering": True,
+      "offerOwnerType": 0, "onlyFunctional": True, "updateOfferCount": True,
+      "handbookId": "", "linkedSearchId": "", "neededSearchId": "",
+      "buildItems": {}, "buildCount": 0, "tm": 1, "reload": 0}, "data"),
+    ("/client/notifier/channel/create",     None, {}, "data"),
+    ("/v2/client/game/profiles/",           None, {}, "data"),
+    ("/client/putLoadMetrics",              None, {"data": {}}, "data"),
+    ("/client/putHWMetrics",                None, {"data": {}}, "data"),
+    ("/client/putMetrics",                  None, {"data": {}}, "data"),
+    ("/client/menu/locale/en",              None, {}, "data"),
+    ("/client/locale/en",                   None, {}, "data"),
+    ("/client/languages",                   None, {}, "data"),
+    ("/client/game/version/validate",       None,
+     {"version": {"major": "1.1.0.1.46777", "game": "live", "backend": "6"}},
+     "data"),
+    ("/client/game/start",                  None, {}, "data"),
+    ("/client/game/mode",                   None, {"sessionMode": "regular"}, "data"),
+    ("/client/game/config",                 None, {}, "data"),
+    ("/client/items/prices",
+     "/client/items/prices/" + PRAPOR, {}, "data"),
+    ("/client/checkVersion",                None, {}, "data"),
+    ("/client/raid/configuration",          None,
+     {"keyId": "", "side": "Pmc", "location": "factory4_day",
+      "timeVariant": "CURR", "raidMode": "Local", "metabolismDisabled": False,
+      "playersSpawnPlace": "SamePlace", "timeAndWeatherSettings": {},
+      "botSettings": {}, "wavesSettings": {}}, "data"),
+    ("/client/match/local/start",           None,
+     {"location": "factory4_day", "timeVariant": "CURR",
+      "mode": "PVE", "playerSide": "Pmc"}, "data"),
+    ("/client/insurance/items/list/cost",   None,
+     {"traders": [PRAPOR], "items": []}, "data"),
+    ("/client/getMetricsConfig",            None, {}, "data"),
+    ("/client/match/join",                  None, {"servername": "", "version": ""}, "data"),
+    ("/client/match/available",             None, {}, "data"),
+    ("/client/match/group/exit_from_menu",  None, {}, "data"),
+    ("/client/match/group/invite/cancel-all", None, {}, "data"),
+    # LAST on purpose: logout invalidates the session token, so any route
+    # sampled after it would be measured without a session.
+    ("/client/game/logout",                 None, {}, "data"),
 ]
 
 
