@@ -779,6 +779,80 @@ def check_settings_write(w, mut):
            % ("; ".join(tried) if tried else "no server-side pages at all"))
 
 
+# ---------------------------------------------------------------------------
+# 15. mail: the TYPE of every member, not its presence
+#
+# The defect this exists for: `/client/mail/dialog/list` served
+# `"systemData": false`.  The client declares
+# `DialogueChatMessageSerializer.systemData` as `ChatMessageSystemData`, a
+# CLASS (measured with tools/fldoff.py), so Newtonsoft threw
+# "Could not cast or convert from System.Boolean" inside ExecuteRequest and the
+# RAID LOAD died -- not the inbox.  Every check we had asked "is the member
+# there?", and it was.
+#
+# So this asserts a NEGATIVE about the FINISHED payload: no message in the
+# served inbox carries a `systemData` that is anything other than an object or
+# null (absent is fine -- a reference member left null is what BSG's own
+# ordinary messages produce, and we do NOT invent a populated one).
+# `--mutate systemdata` demands a BOOLEAN instead, so a correct payload must
+# FAIL -- that is the falsifying input.
+def check_mail_types(w, mut):
+    tag = "%04d" % random.randrange(10000)
+    st, doc, text = make_profile(w, "Mail" + tag, "standard")
+    if doc is None or not session_of(doc):
+        record("mail-types", INCONC, "no profile to post mail to")
+        return
+    sess = session_of(doc)
+    w.call("/client/game/profile/select", {"uid": sess}, sess)
+    # A raid that hands an item over is the cheapest way to make the server
+    # post real mail; an empty inbox would make this check unfalsifiable.
+    body = {"serverId": "betacheck.factory4_day.0",
+            "results": {"profile": {"_id": sess}, "result": "Survived",
+                        "killerId": "", "killerAid": "", "exitName": "Gate 0",
+                        "inSession": True, "favorite": False, "playTime": 60},
+            "lostInsuredItems": [],
+            "transferItems": {sess: [{"_id": "aaaaaaaaaaaaaaaaaaaaaa01",
+                                      "_tpl": "5449016a4bdc2d6f028b456f",
+                                      "upd": {"StackObjectsCount": 5000}}]}}
+    w.call("/client/match/local/end", body, sess)
+    st, doc, text = w.call("/client/mail/dialog/list", {}, sess)
+    if doc is None:
+        record("mail-types", INCONC,
+               "mail/dialog/list did not parse as JSON (%d bytes)" % len(text))
+        return
+    rows = envelope(doc)
+    if not isinstance(rows, list) or not rows:
+        record("mail-types", INCONC,
+               "the served inbox is empty, so no message TYPE was examined")
+        return
+    bad = []
+    for d in rows:
+        m = d.get("message")
+        if not isinstance(m, dict):
+            bad.append("dialog %r has no message object" % d.get("_id"))
+            continue
+        if "systemData" not in m:
+            sd, kind = None, "absent"
+        else:
+            sd = m["systemData"]
+            kind = ("null" if sd is None else
+                    "object" if isinstance(sd, dict) else type(sd).__name__)
+        want_bool = (mut == "systemdata")
+        ok = isinstance(sd, bool) if want_bool else kind in ("absent", "null", "object")
+        if not ok:
+            bad.append("dialog %r message.systemData is %s (%r)"
+                       % (d.get("_id"), kind, sd))
+    if bad:
+        record("mail-types", FAIL, "; ".join(bad[:3]))
+    elif mut == "systemdata":
+        record("mail-types", OK,
+               "every message.systemData is a boolean (mutated expectation)")
+    else:
+        record("mail-types", OK,
+               "%d dialog(s): every message.systemData is object/null/absent, "
+               "never a scalar" % len(rows))
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=7788)
@@ -1587,6 +1661,12 @@ def main():
         check_trader_unlock(w, mut)
     except Exception as exc:                       # noqa: BLE001
         record("trader-loyalty", INCONC, "%s: %r" % (type(exc).__name__, exc))
+
+    # ------------------------------------------------------------------ 15
+    try:
+        check_mail_types(w, mut)
+    except Exception as exc:                       # noqa: BLE001
+        record("mail-types", INCONC, "%s: %r" % (type(exc).__name__, exc))
 
     # ------------------------------------------------------------------ 14
     try:

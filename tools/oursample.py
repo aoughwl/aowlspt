@@ -138,6 +138,16 @@ CALLS = [
     ("/client/account/customization",       None, {}, "data"),
     ("/client/items",                       None, {}, "data"),
     ("/client/match/local/end",             None, "__RAIDEND__", "data"),
+    # MAIL. Added because a live crash came out of a route this table did not
+    # know existed: /client/mail/dialog/list served `systemData: false` where
+    # the client declares a class, Newtonsoft threw inside ExecuteRequest and
+    # the RAID LOAD died. 13 routes were measured and the client calls ~60 --
+    # the most-called route in the client's own backend_000.log (43 hits) was
+    # mail/dialog/list, and it was not one of the 13.
+    ("/client/mail/dialog/list",             None, {}, "data"),
+    ("/client/mail/dialog/view",             None, {"dialogId": "", "type": 2,
+                                                    "limit": 100, "time": 0}, "data"),
+    ("/client/mail/dialog/getAllAttachments", None, {"dialogId": ""}, "data"),
 ]
 
 
