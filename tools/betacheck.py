@@ -34,6 +34,9 @@ constant is the failure mode this file exists to avoid.
     lootpos    demand a NON-zero Position on static containers -- which BSG's
                own captured match/local/start does NOT send -- so a correct
                server must go red
+    skillids   accept the 17 pre-1.0 skill ids the client rejects, as the
+               old 54-entry starter list served -- a correct server, which
+               no longer serves them, must go red
     lootmap    add `Icebreaker` to the set of ids REQUIRED to serve loot.
                It is in the post-1.0 location table the real server sent us
                but has no database entry and no parent map to inherit one, so
@@ -111,6 +114,22 @@ LOOT_BEARING = set(CLIENT_LOCATION_IDS)
 UNMAPPABLE_IDS = ["Icebreaker", "Terminal_ui", "develop", "hideout",
                   "Private Area", "Suburbs", "Terminal", "Town"]
 FENCE = "579dc571d53a0658a154fbec"
+
+# Skill ids `SkillManager..ctor` REJECTS on this post-1.0 build.  MEASURED, not
+# derived: the client logs `Can't find skill to upgrade: <id>` into
+# `D:\Aowlspt\Logs\<ts>\... backend_000.log`, once per profile construction
+# (22 identical repeats in log_2026.08.27_12-*).  Every one of these is STILL a
+# member of `EFT.ESkillId` (67 members, `tools/fldoff.py enum EFT.ESkillId`),
+# so an enum-membership assertion here would be a check that cannot fail --
+# `SkillManager.Skills` is a strict subset of the enum and the log is the only
+# measured source for it.  Re-derive by re-reading the client log, never by
+# reasoning from the enum.
+CLIENT_REJECTED_SKILL_IDS = set([
+    "AdvancedModding", "Auctions", "Barter", "Cleanoperations", "FieldMedicine",
+    "FirstAid", "Freetrading", "Lockpicking", "Memory", "NightOps",
+    "ProneMovement", "RecoilControl", "Shadowconnections", "SilentOps",
+    "Sniping", "Taskperformance", "WeaponModding",
+])
 
 results = []
 
@@ -529,6 +548,50 @@ def main():
                    "%d quests, %d AvailableForStart, every one carries a "
                    "status key, %d probed Locked quests all refused"
                    % (len(quests), len(avail), len(locked[:40])))
+
+    # ----------------------------------------------------------------- 4b
+    # Dead skill ids on every fresh profile.
+    #
+    # The negative: no skill id on the profile the server just created may be
+    # one the client is on record as REJECTING.  Asserting the opposite (that
+    # our ids are ESkillId members) cannot fail -- all 17 rejected ids are in
+    # the enum.  Read back from the profile list, never from the create reply.
+    if std_profile is None:
+        record("skill-ids", INCONC, "no fresh profile to read skills from")
+    else:
+        common = std_profile.get("Skills", {}).get("Common")
+        if not isinstance(common, list) or not common:
+            record("skill-ids", INCONC,
+                   "the fresh profile carries no Skills.Common array")
+        else:
+            rejected = set(CLIENT_REJECTED_SKILL_IDS)
+            if mut == "skillids":
+                rejected = set()      # accept anything, as the old list did
+            served_ids = [x.get("Id") for x in common if isinstance(x, dict)]
+            bad = sorted(set(served_ids) & rejected)
+            missing_id = [x for x in common
+                          if not isinstance(x, dict) or not x.get("Id")]
+            if mut == "skillids":
+                # prove the check can go red: demand an id the client rejects.
+                if "Sniping" not in served_ids:
+                    record("skill-ids", FAIL,
+                           "mutant: `Sniping` (a pre-1.0 id the client logs "
+                           "`Can't find skill to upgrade` for) is NOT served, "
+                           "which is what a CORRECT server does")
+                else:
+                    record("skill-ids", OK, "mutant: dead ids still served")
+            elif missing_id:
+                record("skill-ids", FAIL,
+                       "%d Skills.Common entr(ies) have no Id" % len(missing_id))
+            elif bad:
+                record("skill-ids", FAIL,
+                       "%d skill id(s) served that SkillManager..ctor rejects: "
+                       "%s" % (len(bad), ", ".join(bad)))
+            else:
+                record("skill-ids", OK,
+                       "%d skill ids on the fresh profile, none of the %d the "
+                       "client is measured to reject"
+                       % (len(served_ids), len(rejected)))
 
     # ----------------------------------------------------------------- 5
     # BLOCKER 2 -- hideout area type 21 absent from every new profile.
