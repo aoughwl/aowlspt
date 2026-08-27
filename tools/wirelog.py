@@ -125,6 +125,43 @@ def parse_probes(path):
 # --------------------------------------------------------------------------- #
 
 
+def unmangle(pat):
+    """Recover a route pattern that MSYS turned into a Windows path.
+
+    Git Bash rewrites an argument that LOOKS like a POSIX absolute path
+    before the process is even spawned, so
+        wirelog.py route /aowlspt/status
+    arrives as 'C:/Program Files/Git/aowlspt/status'. MSYS_NO_PATHCONV=1 does
+    NOT help -- the rewrite happens in the argument marshaller, not the
+    shell. A route verb that cannot take a route path is a real gap, so this
+    detects the rewrite and undoes it, LOUDLY (never silently: a silent
+    rewrite of the user's search term is its own confidently-wrong answer).
+
+    Returns (pattern, note-or-None).
+    """
+    if not pat:
+        return pat, None
+    m = re.match(r"^[A-Za-z]:[\\/](.*)$", pat)
+    if not m:
+        return pat, None
+    tail = m.group(1).replace("\\", "/")
+    # Drop the installation prefix MSYS prepended. Everything from the first
+    # segment that is not part of a known msys/git root is the real route.
+    parts = tail.split("/")
+    for i, seg in enumerate(parts):
+        if seg.lower() in ("msys64", "git", "usr", "mingw64", "ucrt64",
+                           "program files", "program files (x86)"):
+            continue
+        tail = "/".join(parts[i:])
+        break
+    fixed = "/" + tail
+    return fixed, ("MSYS path-mangling detected: the shell rewrote your "
+                   "argument to %r before this tool saw it. Searching for %r "
+                   "instead. (MSYS_NO_PATHCONV=1 does not prevent this; to "
+                   "pass it verbatim, drop the leading slash: %r)"
+                   % (pat, fixed, tail))
+
+
 def cmd_routes(args):
     path = logpath(args, "backend")
     stats = {}
@@ -296,13 +333,23 @@ def main(argv=None):
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog=__doc__,
     )
-    ap.add_argument("--root", default=DEFAULT_ROOT)
-    ap.add_argument("--file", help="read this log file instead of --root/<name>")
-    ap.add_argument("--width", type=int, default=200, help="hard cap per printed line")
-    ap.add_argument("--max-lines", type=int, default=60, help="hard cap on rows printed")
-    ap.add_argument("--preview", type=int, default=200, help="default body preview chars")
-    ap.add_argument("--full", type=int, default=0, help="raise the BODY cap to N chars")
-    sub = ap.add_subparsers(dest="cmd", required=True)
+    # These are declared on a PARENT parser and attached to every subcommand
+    # as well as the top level, because argparse otherwise accepts them ONLY
+    # before the subcommand -- so the documented
+    #     wirelog.py route profile/list --full 4000
+    # died with "unrecognized arguments: --full 4000". Nothing about that
+    # error says "move the flag left".
+    gl = argparse.ArgumentParser(add_help=False)
+    gl.add_argument("--root", default=DEFAULT_ROOT)
+    gl.add_argument("--file", help="read this log file instead of --root/<name>")
+    gl.add_argument("--width", type=int, default=200, help="hard cap per printed line")
+    gl.add_argument("--max-lines", type=int, default=60, help="hard cap on rows printed")
+    gl.add_argument("--preview", type=int, default=200, help="default body preview chars")
+    gl.add_argument("--full", type=int, default=0, help="raise the BODY cap to N chars")
+    for _a in gl._actions:
+        ap._add_action(_a)
+    sub = ap.add_subparsers(dest="cmd", required=True, parser_class=(
+        lambda **kw: argparse.ArgumentParser(parents=[gl], **kw)))
 
     sub.add_parser("summary", help="boot lines + route census + faults").set_defaults(fn=cmd_summary)
     sub.add_parser("routes", help="one row per route: count, bytes, errors").set_defaults(fn=cmd_routes)
@@ -327,6 +374,10 @@ def main(argv=None):
     p.set_defaults(fn=cmd_nettrace)
 
     args = ap.parse_args(argv)
+    if getattr(args, "pattern", None):
+        args.pattern, note = unmangle(args.pattern)
+        if note:
+            print(note)
     return args.fn(args)
 
 

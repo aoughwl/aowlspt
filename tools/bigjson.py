@@ -60,14 +60,34 @@ def load(path):
             die("%s is not parseable JSON: %s" % (path, exc))
 
 
+def segments(args):
+    """The path to walk: --path split on dots, then every --at verbatim."""
+    parts = [x for x in (getattr(args, "path", None) or "").split(".") if x]
+    parts += list(getattr(args, "at", None) or [])
+    return parts
+
+
 def walk(node, path):
-    for part in path.split("."):
-        if part == "":
-            continue
+    parts = path if isinstance(path, list) else [
+        x for x in path.split(".") if x]
+    for part in parts:
         try:
             node = node[int(part)] if part.lstrip("-").isdigit() else node[part]
         except Exception:
-            die("path stops at %r (type there was %s)" % (part, type(node).__name__))
+            hint = ""
+            if isinstance(node, dict):
+                near = [k for k in node
+                        if isinstance(k, str) and k.startswith(part)][:5]
+                if near:
+                    # The overwhelmingly common cause: --path split a key on a
+                    # dot the key legitimately contains.
+                    hint = ("\n%d key(s) here START with %r. --path CANNOT "
+                            "address them: it splits on '.'. Pass the key "
+                            "whole with --at:%s"
+                            % (len(near), part,
+                               "".join("\n  --at %r" % k for k in near)))
+            die("path stops at %r (type there was %s)%s"
+                % (part, type(node).__name__, hint))
     return node
 
 
@@ -104,7 +124,7 @@ def cmd_keys(args):
     # added to work around; the cap is a default, not a limit.
     if args.max_rows <= 0:
         args.max_rows = 1 << 30
-    node = walk(load(args.file), args.path or "")
+    node = walk(load(args.file), segments(args))
     if isinstance(node, dict):
         items = list(node.items())
         print("dict with %d key(s) at %r" % (len(items), args.path or "(root)"))
@@ -137,7 +157,7 @@ def cmd_topkeys(args):
     scalar or an EMPTY container is an error, not an empty success, because
     "no keys" and "not an object" must not look alike.
     """
-    node = walk(load(args.file), args.path or "")
+    node = walk(load(args.file), segments(args))
     if isinstance(node, list):
         if not node:
             die("empty list at %r -- no element to take keys from" % (args.path or "(root)"))
@@ -160,7 +180,10 @@ def cmd_topkeys(args):
 
 
 def cmd_get(args):
-    node = walk(load(args.file), args.path or "")
+    if not segments(args):
+        die("get needs --path or --at; with neither it would dump the whole "
+            "document, which is the exact thing this tool exists to prevent.")
+    node = walk(load(args.file), segments(args))
     width = args.full or args.width
     if isinstance(node, (dict, list)):
         print(clip(json.dumps(node, ensure_ascii=False), width))
@@ -190,7 +213,7 @@ def _paths(node, prefix, key, want_value, hits, limit, depth):
 
 
 def cmd_find(args):
-    doc = walk(load(args.file), args.path or "")
+    doc = walk(load(args.file), segments(args))
     hits = []
     _paths(doc, args.path or "", args.key, None, hits, args.max_rows, 0)
     if not hits:
@@ -203,7 +226,7 @@ def cmd_find(args):
 
 
 def cmd_search(args):
-    doc = walk(load(args.file), args.path or "")
+    doc = walk(load(args.file), segments(args))
     hits = []
     _paths(doc, args.path or "", None, args.value, hits, args.max_rows, 0)
     if not hits:
@@ -242,6 +265,16 @@ def main(argv=None):
     def add(name, fn, help_):
         p = sub.add_parser(name, help=help_)
         p.add_argument("file")
+        # --path is DOT-separated, so it cannot address a key that contains a
+        # dot -- which is EVERY key in Windows.json
+        # ("assets/content/audio/voice/scav/scav6.bundle": the slashes are
+        # harmless, the ".bundle" is not). --at takes ONE literal segment per
+        # occurrence and never splits, so any key is reachable:
+        #   get FILE --at "assets/content/audio/voice/scav/scav6.bundle"
+        # Repeat it to descend. --path is applied first, then every --at.
+        p.add_argument("--at", action="append", default=None, metavar="KEY",
+                       help="one LITERAL path segment, never split; repeat to "
+                            "descend. Use this for a key containing a dot.")
         p.set_defaults(fn=fn)
         return p
 
@@ -252,7 +285,7 @@ def main(argv=None):
     p.add_argument("--path")
     p.add_argument("--json", action="store_true", help="emit a JSON array instead")
     p = add("get", cmd_get, "one value at a dotted path")
-    p.add_argument("--path", required=True)
+    p.add_argument("--path")
     p = add("find", cmd_find, "which paths carry a given key name")
     p.add_argument("--key", required=True)
     p.add_argument("--path", help="search only under this subtree")

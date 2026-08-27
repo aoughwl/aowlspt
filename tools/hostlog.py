@@ -12,6 +12,7 @@ are always the same four, so they are subcommands here:
     python tools/hostlog.py boot               # the boot milestone checklist
     python tools/hostlog.py grep <regex>
     python tools/hostlog.py tail               # follow, with faults highlighted
+    python tools/hostlog.py shape              # level histogram + top first tokens
 
 `--root PATH` picks the install (default D:\\Aowlspt\\aowlspt); `--backend`
 reads aowlspt-backend.log instead.
@@ -310,18 +311,70 @@ def cmd_tail(args, C):
         time.sleep(0.4)
 
 
+def cmd_shape(args, C):
+    """"What shape are these lines?" -- a level histogram plus the top-N
+    leading tokens, in one call.
+
+    This existed as a throwaway awk/python one-liner in at least three
+    sessions, each written slightly differently, so the answers were not
+    comparable between them. It answers: how big is this log, how much of it
+    is errors, and what subsystems are actually talking. `--backend` points
+    it at aowlspt-backend.log, so the backend equivalent is the same verb.
+    """
+    p, lines = read(args)
+    rows = list(parse(lines))
+    print("%s  %d line(s), %d bytes" % (p, len(lines), os.path.getsize(p)))
+
+    levels = {}
+    toks = {}
+    unparsed = 0
+    for _stamp, level, msg, _raw in rows:
+        if not level:
+            unparsed += 1
+        levels[level or "(no level -- banner/continuation)"] = \
+            levels.get(level or "(no level -- banner/continuation)", 0) + 1
+        # First token of the MESSAGE, which is how this codebase prefixes
+        # subsystems ("settings:", "betanotice:", "modstab:").
+        t = msg.strip().split(" ", 1)[0].rstrip(":,") if msg.strip() else ""
+        if t:
+            toks[t] = toks.get(t, 0) + 1
+
+    print("\nlevels")
+    for lv, n in sorted(levels.items(), key=lambda kv: -kv[1]):
+        print("  %-40s %6d  %5.1f%%"
+              % (lv, n, 100.0 * n / max(len(rows), 1)))
+
+    n_top = args.top
+    ordered = sorted(toks.items(), key=lambda kv: -kv[1])
+    print("\ntop %d first token(s), of %d distinct" % (n_top, len(ordered)))
+    for t, n in ordered[:n_top]:
+        print("  %-40s %6d" % (t[:40], n))
+    if len(ordered) > n_top:
+        rest = sum(n for _, n in ordered[n_top:])
+        print("  %-40s %6d   (%d more distinct token(s) -- this is a "
+              "TRUNCATED list, not the whole set; raise --top)"
+              % ("... everything else", rest, len(ordered) - n_top))
+    if unparsed:
+        print("\n%d line(s) did not match the timestamped log format and "
+              "carry no level; they are counted above under "
+              "'(no level ...)', not dropped." % unparsed)
+    return 0
+
+
 def main():
     p = argparse.ArgumentParser(
         description="read the aowlspt host log",
         formatter_class=argparse.RawDescriptionHelpFormatter, epilog=__doc__)
     p.add_argument("command",
                    choices=["summary", "boot", "faults", "feature", "config",
-                            "grep", "tail"])
+                            "grep", "tail", "shape"])
     p.add_argument("pattern", nargs="?", default="")
     p.add_argument("--root", default=DEFAULT_ROOT)
     p.add_argument("--backend", action="store_true",
                    help="read aowlspt-backend.log instead")
     p.add_argument("--case", action="store_true", help="grep case-sensitively")
+    p.add_argument("--top", type=int, default=25,
+                   help="how many leading tokens `shape` lists (default 25)")
     p.add_argument("--no-color", action="store_true")
     args = p.parse_args()
     C = (not args.no_color) and sys.stdout.isatty()
@@ -332,7 +385,7 @@ def main():
         return {
             "summary": cmd_summary, "boot": lambda a, c: (0 if cmd_boot(a, c) else 1),
             "faults": cmd_faults, "feature": cmd_feature, "config": cmd_config,
-            "grep": cmd_grep, "tail": cmd_tail,
+            "grep": cmd_grep, "tail": cmd_tail, "shape": cmd_shape,
         }[args.command](args, C)
     except KeyboardInterrupt:
         return 0

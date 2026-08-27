@@ -63,11 +63,18 @@ constant is the failure mode this file exists to avoid.
 """
 
 import argparse
+import atexit
 import http.client
 import json
 import os
 import random
+import shutil
+import socket
+import subprocess
 import sys
+import time
+import urllib.error
+import urllib.request
 import zlib
 
 OK, FAIL, INCONC = "PASS", "FAIL", "INCONCLUSIVE"
@@ -150,6 +157,188 @@ results = []
 def record(name, verdict, detail):
     results.append((name, verdict, detail))
     print("%-14s %-12s %s" % (verdict, name, detail))
+
+
+REPO = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
+LIVE_DB = r"D:\Aowlspt\aowlspt\db.json"
+STAMP = ".betacheck-owned"          # proof this root is ours, not a collision
+
+
+def free_port():
+    """Ask the OS for a port nobody is on. --port's 7788 default is the same
+    number in every agent's terminal, so two concurrent runs answered each
+    other's requests."""
+    s = socket.socket()
+    s.bind(("127.0.0.1", 0))
+    p = s.getsockname()[1]
+    s.close()
+    return p
+
+
+def make_root(explicit):
+    """A scratch root that is provably OURS.
+
+    Two agents collided on a shared scratchpad path and one overwrote the
+    other's staged DLL, so a selfcheck passed against a binary nobody
+    intended (fact #153). The default is per-PID, and an EXISTING directory
+    is only reused if it carries our stamp file -- otherwise this refuses
+    rather than clobbering someone's run.
+    """
+    root = explicit or os.path.join(
+        os.environ.get("TEMP", "/tmp"), "betacheck-%d" % os.getpid())
+    if os.path.isdir(root) and os.listdir(root):
+        if not os.path.exists(os.path.join(root, STAMP)):
+            sys.exit("--root %s already exists, is not empty, and was not "
+                     "created by betacheck (no %s). REFUSING to stage into "
+                     "it: overwriting another run's staged DLL is how a "
+                     "selfcheck passed against the wrong binary (fact "
+                     "#153). Pass a different --root, or delete that one."
+                     % (root, STAMP))
+        shutil.rmtree(root)
+    os.makedirs(root, exist_ok=True)
+    with open(os.path.join(root, STAMP), "w") as f:
+        f.write("pid=%d\n" % os.getpid())
+    return root
+
+
+def spawn_backend(a):
+    """Stage a scratch root, start a private backend, wait for the PORT.
+
+    Returns (proc, port, root). Raises SystemExit with a stated reason if
+    anything is missing -- never "0 checks, all passed".
+    """
+    backend = a.backend or os.path.join(REPO, "backend", "bin",
+                                        "aowlspt-backend.exe")
+    if not os.path.isfile(backend):
+        sys.exit("--spawn: no backend at %s. Build it (`aowl build backend`) "
+                 "or pass --backend PATH. Nothing was checked." % backend)
+    db = a.db or LIVE_DB
+    if not os.path.isfile(db):
+        sys.exit("--spawn: no db.json at %s. Pass --db PATH. Nothing was "
+                 "checked." % db)
+    root = make_root(a.root)
+    os.makedirs(os.path.join(root, "mods", "tarkov"), exist_ok=True)
+    tark = a.tarkov or os.path.join(REPO, "mods", "tarkov", "bin",
+                                    "tarkov.dll")
+    where = "this worktree's build"
+    if not os.path.isfile(tark):
+        # Fall back to the DEPLOYED mod so --spawn is usable from a fresh
+        # worktree -- but say loudly which binary is under test, because
+        # "a selfcheck passed against the wrong binary" is the exact failure
+        # this verb exists to stop (fact #153).
+        live = os.path.join(r"D:\Aowlspt\aowlspt", "mods", "tarkov",
+                            "tarkov.dll")
+        if os.path.isfile(live):
+            tark, where = live, "the DEPLOYED install (NOT this worktree)"
+    if os.path.isfile(tark):
+        print("tarkov.dll under test: %s  <- %s" % (tark, where))
+        shutil.copy2(tark, os.path.join(root, "mods", "tarkov", "tarkov.dll"))
+        # The mod REFUSES TO SERVE without its data/ tables ("this build
+        # fails its own arithmetic; refusing to serve"). Staging only the
+        # DLL produced a backend that booted, listened, and answered "no
+        # route" to everything -- 24 INCONCLUSIVEs that could be skimmed as
+        # "it ran". Stage the tables from beside whichever DLL was chosen.
+        data_src = os.path.join(os.path.dirname(tark), "data")
+        if not os.path.isdir(data_src):
+            data_src = os.path.join(REPO, "mods", "tarkov", "data")
+        if os.path.isdir(data_src):
+            shutil.copytree(data_src,
+                            os.path.join(root, "mods", "tarkov", "data"),
+                            dirs_exist_ok=True)
+        else:
+            print("note: no mods/tarkov/data tree found beside %s -- the mod "
+                  "will refuse to serve and every check will be "
+                  "INCONCLUSIVE." % tark)
+        with open(os.path.join(root, "mods", "tarkov", "config.json"),
+                  "w", newline="\n") as fh:
+            fh.write("{}\n")
+        reg = os.path.join(root, "registry")
+        os.makedirs(reg, exist_ok=True)
+        with open(os.path.join(reg, "mods.json"), "w", newline="\n") as f:
+            json.dump({"schema": "aowlspt.registry/1",
+                       "registry": {"id": "betacheck",
+                                    "name": "betacheck spawn", "revision": 1},
+                       "mods": [{"id": "aowl.tarkov",
+                                 "name": "Tarkov server emulator",
+                                 "author": "aowlspt", "version": "1.0.0",
+                                 "sides": ["server"], "provides": []}]},
+                      f, indent=2)
+        with open(os.path.join(root, "mods", "aowlspt-selection.json"),
+                  "w", newline="\n") as f:
+            json.dump({"schema": "aowlspt.selection/1",
+                       "writtenBy": "betacheck", "side": "server",
+                       "registry": os.path.join(reg, "mods.json"),
+                       "load": ["aowl.tarkov"]}, f)
+    else:
+        print("note: no tarkov.dll found (neither %s nor the deployed "
+              "install) -- the spawned backend runs WITHOUT the tarkov mod. "
+              "Checks that need it will report INCONCLUSIVE, not pass."
+              % tark)
+    shutil.copy2(db, os.path.join(root, "db.json"))
+
+    port = a.port_explicit if a.port_explicit else free_port()
+    # Copy the backend INTO the root and run it with cwd=root, exactly as
+    # xferproof.py does -- that is the staging recipe measured to actually
+    # load the tarkov mod. --no-store-lock keeps a concurrent run (or the
+    # live install) from being locked out.
+    local_backend = os.path.join(root, os.path.basename(backend))
+    shutil.copy2(backend, local_backend)
+    proc = subprocess.Popen([local_backend, "--root", root,
+                             "--port", str(port), "--no-store-lock"],
+                            cwd=root,
+                            stdout=subprocess.PIPE, stderr=subprocess.STDOUT)
+
+    def teardown():
+        if proc.poll() is None:
+            proc.terminate()
+            try:
+                proc.wait(timeout=10)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+        if not a.keep:
+            shutil.rmtree(root, ignore_errors=True)
+    atexit.register(teardown)
+
+    # Wait for the SOCKET, not for a guessed number of seconds. ANY HTTP
+    # answer -- including a 404 -- means it is serving; treating 404 as "not
+    # up" once turned a 0.3s boot into a 120s timeout.
+    for _ in range(120):
+        if proc.poll() is not None:
+            out = (proc.stdout.read() or b"").decode("utf-8", "replace")
+            sys.exit("--spawn: the backend exited with %d before serving. "
+                     "Nothing was checked.\n%s"
+                     % (proc.returncode, out[-2000:]))
+        try:
+            urllib.request.urlopen(
+                "http://127.0.0.1:%d/aowlspt/status" % port, timeout=2).read()
+            break
+        except urllib.error.HTTPError:
+            break
+        except Exception:
+            time.sleep(0.5)
+    else:
+        sys.exit("--spawn: no answer on port %d within 60s. Nothing was "
+                 "checked -- this is INCONCLUSIVE, not a pass." % port)
+    print("spawned backend pid=%d port=%d root=%s db=%s"
+          % (proc.pid, port, root, db))
+
+    # A backend that is LISTENING is not a backend that is SERVING. Ask the
+    # mod's own selfcheck route; if it declined, say so once, loudly, instead
+    # of emitting two dozen INCONCLUSIVEs that read like a run.
+    try:
+        with urllib.request.urlopen(
+                "http://127.0.0.1:%d/aowlspt/tarkov/selfcheck" % port,
+                data=b"{}", timeout=10) as r:
+            sc = r.read().decode("utf-8", "replace")
+        if '"ok":true' not in sc.replace(" ", ""):
+            print("WARNING: the tarkov mod's own selfcheck did NOT pass, so "
+                  "it is refusing to serve its routes. Everything below will "
+                  "be INCONCLUSIVE and NONE of it is evidence about the "
+                  "server. selfcheck said: %s" % sc[:400])
+    except Exception as exc:                       # noqa: BLE001
+        print("WARNING: could not read /aowlspt/tarkov/selfcheck (%r). "
+              "Whether the mod is serving was NOT established." % (exc,))
+    return proc, port, root
 
 
 class Wire:
@@ -782,12 +971,47 @@ def check_settings_write(w, mut):
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=7788)
+    ap.add_argument("--spawn", action="store_true",
+                    help="stand up a private backend on a FREE port against a "
+                         "scratch root, run the checks, and tear it down. "
+                         "Several agents each spent ~20 minutes building this "
+                         "root by hand, and two of them collided on the same "
+                         "scratchpad path -- one overwrote the other's staged "
+                         "DLL, so a selfcheck passed against the wrong binary "
+                         "(fact #153). The root here is unique per PID and "
+                         "REFUSES a directory it did not create.")
+    ap.add_argument("--db", default="",
+                    help="db.json to stage into the spawned root "
+                         "(default: the live D:/Aowlspt/aowlspt/db.json)")
+    ap.add_argument("--root", default="",
+                    help="scratch root for --spawn (default: a unique "
+                         "per-PID directory under TEMP)")
+    ap.add_argument("--backend", default="",
+                    help="aowlspt-backend.exe for --spawn "
+                         "(default: <repo>/backend/bin/aowlspt-backend.exe)")
+    ap.add_argument("--tarkov", default="",
+                    help="tarkov.dll to stage for --spawn (default: this "
+                         "worktree's build, else the deployed one -- the "
+                         "tool always PRINTS which it used)")
+    ap.add_argument("--keep", action="store_true",
+                    help="do not delete the spawned root, so it can be "
+                         "inspected after a failure")
     ap.add_argument("--spt", default="D:\\SPT")
     ap.add_argument("--mutate", default="")
     ap.add_argument("--loose-dir", default="",
                     help="where the backend reads per-map looseLoot "
                          "sidecars from (default <repo>/build/db/looseloot)")
-    a = ap.parse_args()
+    a = ap.parse_args(namespace=argparse.Namespace())
+    # Remember whether --port was typed, so --spawn can pick a FREE port
+    # instead of the shared 7788 default two concurrent runs both grabbed.
+    a.port_explicit = a.port if any(
+        x == "--port" or x.startswith("--port=") for x in sys.argv[1:]) else 0
+    if a.spawn:
+        _proc, a.port, _root = spawn_backend(a)
+    elif a.db or a.root or a.backend or a.keep or a.tarkov:
+        sys.exit("--db/--root/--backend/--keep only mean anything with "
+                 "--spawn. Without it betacheck talks to whatever is already "
+                 "listening on --port.")
     w = Wire(a.port)
     mut = a.mutate
 
@@ -1230,7 +1454,12 @@ def main():
         body = envelope(doc) if doc else None
         if not isinstance(body, dict):
             return None, text
-        return body.get("locationLoot", {}).get("Loot"), text
+        ll = body.get("locationLoot")
+        if not isinstance(ll, dict):
+            return None, text
+        _start.last_loc = ll          # kept so a FAIL can REPORT, not diagnose
+        return ll.get("Loot"), text
+    _start.last_loc = None
 
     # 8a -- parity with BSG on the ONE request body we actually captured.
     if not std_session:
@@ -1242,11 +1471,29 @@ def main():
                    "match/local/start gave no locationLoot.Loot: %s"
                    % text[:140])
         elif not loot:
+            # Report the MEASUREMENT, never a diagnosis. This text used to
+            # assert "the raid id is not being mapped to a db location",
+            # which was FALSE in a `maxLootItems: 0` run -- the id mapped
+            # fine and the generator produced nothing. A confidently wrong
+            # cause costs more than no cause at all, so state what came back
+            # on the wire (including the fields that DISCRIMINATE between
+            # those two causes) and stop there.
+            ll = _start.last_loc or {}
+            ident = ", ".join(
+                "%s=%r" % (k, ll.get(k))
+                for k in ("_Id", "Id", "Name", "Locale")
+                if k in ll)
             record("lootparity", FAIL,
-                   "location %r served an EMPTY locationLoot.Loot; BSG's "
-                   "captured answer to this exact body (158.json) has 135 "
-                   "entries. The raid id is not being mapped to a db location."
-                   % LOOT_MAP)
+                   "location %r served locationLoot.Loot == [] (0 entries); "
+                   "BSG's captured answer to this exact request body "
+                   "(158.json) has 135. locationLoot keys present: %s. "
+                   "Identity fields echoed back: %s. NOT DIAGNOSED: an empty "
+                   "Loot is consistent with the id not resolving to a db "
+                   "location AND with a location that resolved but generated "
+                   "nothing (e.g. maxLootItems: 0) -- this check does not "
+                   "distinguish them; compare the identity fields above "
+                   "against the db entry to tell which."
+                   % (LOOT_MAP, sorted(ll.keys())[:12], ident or "(none)"))
         else:
             record("lootparity", OK,
                    "%r served %d loot entries (BSG's capture has 135)"
