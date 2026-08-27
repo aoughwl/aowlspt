@@ -1,533 +1,518 @@
 {
-  "//": "Data for `python tools/deploy.py`. Each artifact names where it is built,",
-  "//1": "where it goes in a live install, and the literal strings that MUST be",
-  "//2": "present in the built file. A marker is a feature's fingerprint: if the",
-  "//3": "string is gone, the feature is gone, and the deploy is refused.",
-  "//4": "Markers must be literals the compiler cannot fold away -- log message",
-  "//5": "text is ideal, because it is emitted verbatim and it names the feature.",
-  "//6": "Add a marker the same day you add a feature; that is the whole point.",
-  "//7": "An artifact may also declare the DATA it needs, with `data`. The file",
-  "//8": "list is DERIVED by walking `src` -- never enumerated here, because a",
-  "//9": "hardcoded list rots the day someone adds a data file. `exclude` uses",
-  "//10": "the same set `aowl payload`/`stageTarkovData` already established:",
-  "//11": "`capture/**` is a recording of the real backend kept to check this",
-  "//12": "server AGAINST, not anything it serves (690 files, mostly regenerated",
-  "//13": "rather than stored, so a payload built on one machine would carry it",
-  "//14": "and one built on another would not) -- skipped by NAME, not by size,",
-  "//15": "because large is not the reason. `*.md` is documentation. `minFiles`",
-  "//16": "is a floor that makes the derivation falsifiable: a glob that silently",
-  "//17": "matches almost nothing FAILS instead of passing with an empty set.",
-  "install": "D:\\Aowlspt\\aowlspt",
-  "artifacts": [
+ "//": "Data for `python tools/deploy.py`. Each artifact names where it is built,",
+ "//1": "where it goes in a live install, and the literal strings that MUST be",
+ "//2": "present in the built file. A marker is a feature's fingerprint: if the",
+ "//3": "string is gone, the feature is gone, and the deploy is refused.",
+ "//4": "Markers must be literals the compiler cannot fold away -- log message",
+ "//5": "text is ideal, because it is emitted verbatim and it names the feature.",
+ "//6": "Add a marker the same day you add a feature; that is the whole point.",
+ "//7": "An artifact may also declare the DATA it needs, with `data`. The file",
+ "//8": "list is DERIVED by walking `src` -- never enumerated here, because a",
+ "//9": "hardcoded list rots the day someone adds a data file. `exclude` uses",
+ "//10": "the same set `aowl payload`/`stageTarkovData` already established:",
+ "//11": "`capture/**` is a recording of the real backend kept to check this",
+ "//12": "server AGAINST, not anything it serves (690 files, mostly regenerated",
+ "//13": "rather than stored, so a payload built on one machine would carry it",
+ "//14": "and one built on another would not) -- skipped by NAME, not by size,",
+ "//15": "because large is not the reason. `*.md` is documentation. `minFiles`",
+ "//16": "is a floor that makes the derivation falsifiable: a glob that silently",
+ "//17": "matches almost nothing FAILS instead of passing with an empty set.",
+ "install": "D:\\Aowlspt\\aowlspt",
+ "artifacts": [
+  {
+   "name": "host",
+   "src": "host/Aowlspt.Host.Il2Cpp/bin/aowlspt-host-il2cpp.dll",
+   "dst": "aowlspt-host-il2cpp.dll",
+   "minBytes": 500000,
+   "markers": [
+    "aowlspt-host-il2cpp",
+    "float _Clarity;float _Vibrance;",
+    "float _Chroma;float _BloomThreshold;float2 _Res;",
+    "post GPU cost NOT MEASURED (no timestamp query yet)",
+    "depth: DSV %ux%u fmt=%u bind=0x%X srv=%s fullres=%s",
+    "nameIndex: loaded aowlspt-names.idx",
+    "STALE INDEX -- aowlspt-names.idx",
+    "host running",
+    "IL2CPP runtime bound, all essential entry points present",
+    "overlay ready (F12 opens settings)",
+    "botcap (offline bot-cap lift)",
+    "botdiag",
+    "botai",
+    "debugui: PreloaderUI::Update detour is live",
+    "debugEsp",
+    "menu mode text:",
+    "settings pages: persisted",
+    "settingsRelabelProbe",
+    "settingsBindProbe",
+    "osCloseFix",
+    "imageCdnRedirect",
+    "uxVersionBrand",
+    "unlimitedBots",
+    "invoke2",
+    "anti-cheat:",
+    "components EXPR [BaseType]",
+    "SHARED RVA: ",
+    "SHAREDNESS IS UNKNOWN for this entry",
+    "mods tab: built -- a sixth tab button cloned into SettingsScreen/",
+    "hide seasons armed as RIDERS on the ",
+    "settingsModsTab is set",
+    "mods tab: pages go into ",
+    "subtab BUTTON(s) cloned into a clone of ",
+    "version brand: REFUSING to write",
+    "hide seasons: Common UI/MenuScreen/SeasonsButton switched off",
+    "DID NOT FULLY TAKE -- it reads ",
+    "TextMeshProUGUI, matching the donor",
+    "was hidden again on the FIRST frame it did",
+    "extra toggle(s) inside a ",
+    "inherited sibling(s) on the spine ",
+    "row caption(s) across ",
+    "strip and ONE page. More means several pages are visible at once",
+    "our panel was still active with the MODS tab NOT ",
+    "settingsPostFxSubtab is set",
+    "been folded into Graphics as a subtab",
+    "STOCK POSTFX TAB HAS BEEN PUT BACK in the top row",
+    "Verified by re-reading the clone, not by trusting the write",
+    "hide seasons: GIVING UP after ",
+    "uxHideModeButton",
+    "hide mode button: Common UI/MenuScreen/ChangeGameModeButton ",
+    "uxHideModeButton WINS",
+    "the hide-seasons shape",
+    "THE MAIN MENU IS NOT UP ",
+    "in-walk deadline ",
+    "skip mode screen ARMED",
+    "uxSkipModeScreen",
+    "CharacterSelectionScreenController::Submit",
+    "region: armed as a RIDER on the existing EFT.UI.PreloaderUI::",
+    "aowl_region_register_x",
+    "AOWLSPT BETA",
+    "aoughwl.com  -  F12 for mod settings",
+    "beta notice: registered with the shared region as participant '",
+    "uxBetaOverlay",
+    "<press a key   Del=clear   Esc=cancel>",
+    "aowlspt_admin_shared_v5"
+   ]
+  },
+  {
+   "//": "The offline name->RVA index the host resolves by-name patch targets",
+   "//1": "through. It was built beside the host DLL and deployed by NOBODY,",
+   "//2": "which left the live install with whatever stale copy was last put",
+   "//3": "there by hand -- and, since format version 2, with no share counts",
+   "//4": "at all. The host refuses a version-1 index outright, so the marker",
+   "//5": "below is the magic AND the little-endian version word: an index",
+   "//6": "that cannot answer 'is this RVA shared?' never reaches an install.",
+   "name": "nameidx",
+   "src": "host/Aowlspt.Host.Il2Cpp/bin/aowlspt-names.idx",
+   "dst": "aowlspt-names.idx",
+   "requiresInput": {
+    "path": ".cache/global-metadata.dec.dat",
+    "why": "gitignored and NOT shared between worktrees -- copy it from the main checkout, then re-run `aowl build host`"
+   },
+   "minBytes": 1000000,
+   "markers": [
+    "AOWLNIDX\u0002\u0000\u0000\u0000"
+   ]
+  },
+  {
+   "//": "The human-readable half: which METHOD NAMES share a folded RVA.",
+   "//1": "The index carries the COUNT and drives every refusal; this file",
+   "//2": "only names the neighbours, and carries the same imageKey/fileHash",
+   "//3": "stamp so it can never be read as belonging to another DLL.",
+   "name": "nameidxshared",
+   "src": "host/Aowlspt.Host.Il2Cpp/bin/aowlspt-names.idx.shared",
+   "dst": "aowlspt-names.idx.shared",
+   "requiresInput": {
+    "path": ".cache/global-metadata.dec.dat",
+    "why": "gitignored and NOT shared between worktrees -- copy it from the main checkout, then re-run `aowl build host`"
+   },
+   "minBytes": 1000,
+   "markers": [
+    "AOWLSHARED1"
+   ]
+  },
+  {
+   "name": "tarkov",
+   "src": "mods/tarkov/bin/tarkov.dll",
+   "dst": "mods/tarkov/tarkov.dll",
+   "minBytes": 100000,
+   "markers": [
+    "aowl.tarkov",
+    "/client/game/start",
+    "/client/game/profile/list",
+    "/client/items",
+    "/client/locations",
+    "BotLocationModifier",
+    "menuCornerLabel"
+   ],
+   "data": [
     {
-      "name": "host",
-      "src": "host/Aowlspt.Host.Il2Cpp/bin/aowlspt-host-il2cpp.dll",
-      "dst": "aowlspt-host-il2cpp.dll",
-      "minBytes": 500000,
-      "markers": [
-        "aowlspt-host-il2cpp",
-        "float _Clarity;float _Vibrance;",
-        "float _Chroma;float _BloomThreshold;float2 _Res;",
-        "post GPU cost NOT MEASURED (no timestamp query yet)",
-        "depth: DSV %ux%u fmt=%u bind=0x%X srv=%s fullres=%s",
-        "nameIndex: loaded aowlspt-names.idx",
-        "STALE INDEX -- aowlspt-names.idx",
-        "host running",
-        "IL2CPP runtime bound, all essential entry points present",
-        "overlay ready (F12 opens settings)",
-        "botcap (offline bot-cap lift)",
-        "botdiag",
-        "botai",
-        "debugui: PreloaderUI::Update detour is live",
-        "debugEsp",
-        "menu mode text:",
-        "settings pages: persisted",
-        "settingsRelabelProbe",
-        "settingsBindProbe",
-        "osCloseFix",
-        "imageCdnRedirect",
-        "uxVersionBrand",
-        "unlimitedBots",
-        "invoke2",
-        "anti-cheat:",
-        "components EXPR [BaseType]",
-        "SHARED RVA: ",
-        "SHAREDNESS IS UNKNOWN for this entry",
-        "mods tab: built -- a sixth tab button cloned into SettingsScreen/",
-        "hide seasons armed as RIDERS on the ",
-        "settingsModsTab is set",
-        "mods tab: pages go into ",
-        "subtab BUTTON(s) cloned into a clone of ",
-        "version brand: REFUSING to write",
-        "hide seasons: Common UI/MenuScreen/SeasonsButton switched off",
-        "DID NOT FULLY TAKE -- it reads ",
-        "TextMeshProUGUI, matching the donor",
-        "was hidden again on the FIRST frame it did",
-        "extra toggle(s) inside a ",
-        "inherited sibling(s) on the spine ",
-        "row caption(s) across ",
-        "strip and ONE page. More means several pages are visible at once",
-        "our panel was still active with the MODS tab NOT ",
-        "settingsPostFxSubtab is set",
-        "been folded into Graphics as a subtab",
-        "STOCK POSTFX TAB HAS BEEN PUT BACK in the top row",
-        "Verified by re-reading the clone, not by trusting the write",
-        "hide seasons: GIVING UP after ",
-        "uxHideModeButton",
-        "hide mode button: Common UI/MenuScreen/ChangeGameModeButton ",
-        "uxHideModeButton WINS",
-        "the hide-seasons shape",
-        "THE MAIN MENU IS NOT UP ",
-        "in-walk deadline ",
-        "skip mode screen ARMED",
-        "uxSkipModeScreen",
-        "CharacterSelectionScreenController::Submit",
-        "region: armed as a RIDER on the existing EFT.UI.PreloaderUI::",
-        "aowl_region_register_x",
-        "AOWLSPT BETA",
-        "aoughwl.com  -  F12 for mod settings",
-        "beta notice: registered with the shared region as participant '",
-        "uxBetaOverlay",
-        "<press a key   Del=clear   Esc=cancel>",
-        "aowlspt_admin_shared_v5"
-      ]
-    },
-    {
-      "//": "The offline name->RVA index the host resolves by-name patch targets",
-      "//1": "through. It was built beside the host DLL and deployed by NOBODY,",
-      "//2": "which left the live install with whatever stale copy was last put",
-      "//3": "there by hand -- and, since format version 2, with no share counts",
-      "//4": "at all. The host refuses a version-1 index outright, so the marker",
-      "//5": "below is the magic AND the little-endian version word: an index",
-      "//6": "that cannot answer 'is this RVA shared?' never reaches an install.",
-      "name": "nameidx",
-      "src": "host/Aowlspt.Host.Il2Cpp/bin/aowlspt-names.idx",
-      "dst": "aowlspt-names.idx",
-      "requiresInput": {
-        "path": ".cache/global-metadata.dec.dat",
-        "why": "gitignored and NOT shared between worktrees -- copy it from the main checkout, then re-run `aowl build host`"
-      },
-      "minBytes": 1000000,
-      "markers": [
-        "AOWLNIDX\u0002\u0000\u0000\u0000"
-      ]
-    },
-    {
-      "//": "The human-readable half: which METHOD NAMES share a folded RVA.",
-      "//1": "The index carries the COUNT and drives every refusal; this file",
-      "//2": "only names the neighbours, and carries the same imageKey/fileHash",
-      "//3": "stamp so it can never be read as belonging to another DLL.",
-      "name": "nameidxshared",
-      "src": "host/Aowlspt.Host.Il2Cpp/bin/aowlspt-names.idx.shared",
-      "dst": "aowlspt-names.idx.shared",
-      "requiresInput": {
-        "path": ".cache/global-metadata.dec.dat",
-        "why": "gitignored and NOT shared between worktrees -- copy it from the main checkout, then re-run `aowl build host`"
-      },
-      "minBytes": 1000,
-      "markers": [
-        "AOWLSHARED1"
-      ]
-    },
-    {
-      "name": "tarkov",
-      "src": "mods/tarkov/bin/tarkov.dll",
-      "dst": "mods/tarkov/tarkov.dll",
-      "minBytes": 100000,
-      "markers": [
-        "aowl.tarkov",
-        "/client/game/start",
-        "/client/game/profile/list",
-        "/client/items",
-        "/client/locations",
-        "BotLocationModifier",
-        "menuCornerLabel"
-      ],
-      "data": [
-        {
-          "src": "mods/tarkov/data",
-          "dst": "mods/tarkov/data",
-          "exclude": [
-            "capture/**",
-            "*.md"
-          ],
-          "minFiles": 14,
-          "why": "the emulator answers seven menu routes out of post1/ and refuses to start a raid without post1/serversettings.json. On 2026-08-27 post1/globalsgaps.json was not shipped: tarkov.dll's self-check logged 'this build fails its own arithmetic; refusing to serve', registered ONLY its selfcheck route, and the launcher said 'unable to check client version'"
-        }
-      ]
-    },
-    {
-      "//": "Every OTHER mod we ship. Until 2026-08-27 `tarkov` was the only mod",
-      "//1": "with any marker at all, so sain.dll and nine others could ship with a",
-      "//2": "feature silently missing and this tool would still say ok. Markers here",
-      "//3": "are route paths, event ids, settings-schema captions and per-feature log",
-      "//4": "text -- each names ONE feature, so deleting that feature deletes the",
-      "//5": "string. A mod-id string (`aowl.sain`) is identity, not a feature check;",
-      "//6": "it is kept for parity with `tarkov` but the lines below it do the work.",
-      "//7": "`aowl build deploy` derives its build list from the `src` fields in",
-      "//8": "THIS file, so every artifact checked here is also built here. An",
-      "//9": "`src` the driver cannot map is a loud error -- teach buildDeploySet,",
-      "//10": "never delete the entry to quiet it.",
-      "name": "manager",
-      "src": "mods/manager/bin/manager.dll",
-      "dst": "mods/manager/manager.dll",
-      "minBytes": 400000,
-      "markers": [
-        "/aowlspt/mods/list",
-        "/aowlspt/mods/apply",
-        "/aowlspt/mods/toggle",
-        "/aowlspt/mods/conflicts",
-        "/aowlspt/mods/panel",
-        "/aowlspt/mods/clientreport",
-        "/aowlspt/mods/describe/",
-        "/aowlspt/mods/reload",
-        "manager: live mod control is available (",
-        "manager: active lists: ",
-        "manager: registry refresh refused -- "
-      ]
-    },
-    {
-      "name": "sain",
-      "src": "mods/sain/bin/sain.dll",
-      "dst": "mods/sain/sain.dll",
-      "minBytes": 500000,
-      "markers": [
-        "aowl.sain",
-        "/aowlspt/settings/aowl.sain/reset",
-        "sain: bindAll phase 4/5 -- the lazy member table (~70 names)",
-        "sain: bindProbe 1/2 -- UnityEngine.Physics::Raycast",
-        "sain: bindProbe 2/2 -- UnityEngine.AI.NavMesh::SamplePosition",
-        "sain: bot activation hooked on ",
-        "sain: bot aim result hooked on ",
-        "sain: by-name resolution refused for ",
-        "sain: a cover sample costs ",
-        "sain: a decision costs ",
-        "sain: an actuation costs ",
-        "sain: could not write the brain tables"
-      ]
-    },
-    {
-      "name": "morebots",
-      "src": "mods/morebots/bin/morebots.dll",
-      "dst": "mods/morebots/morebots.dll",
-      "minBytes": 400000,
-      "markers": [
-        "morebots.type.register",
-        "morebots.type.overlay",
-        "morebots.faction.define",
-        "morebots.faction.relate",
-        "morebots.client.census",
-        "morebots.flush",
-        "morebots.ready",
-        "morebots: a faction definition arrived without a name",
-        "morebots:   spawn types alive:"
-      ],
-      "data": [
-        {
-          "src": "mods/morebots/data",
-          "dst": "mods/morebots/data",
-          "exclude": [
-            "capture/**",
-            "*.md"
-          ],
-          "minFiles": 1,
-          "why": "the vanilla faction/spawn-type definitions this mod registers from; a morebots with no data registers nothing"
-        }
-      ]
-    },
-    {
-      "name": "fov",
-      "src": "mods/fov/bin/fov.dll",
-      "dst": "mods/fov/fov.dll",
-      "minBytes": 400000,
-      "markers": [
-        "aowl.fovfix",
-        "FOV: binding CameraManager::get_Instance at a verified static RVA ",
-        "FOV: CalculateScaleValueByFov -- ",
-        "FOV: base field of view captured at ",
-        "FOV: the per-frame chain bound -- ",
-        "FOV: per-frame FOV write -- ",
-        "FOV: scope sensitivity -- ",
-        "FOV: aiming sensitivity -- ",
-        "FOV scale while aiming iron sights / reflex",
-        "FOV scale while aiming a magnified sight"
-      ]
-    },
-    {
-      "name": "settingshub",
-      "src": "mods/settingshub/bin/settingshub.dll",
-      "dst": "mods/settingshub/settingshub.dll",
-      "minBytes": 300000,
-      "markers": [
-        "/aowlspt/settings/index",
-        "/aowlspt/settings/spt/index",
-        "/aowlspt/settings/spt/page/",
-        "spt.bot.AssaultBrainType",
-        "spt.bot.BotNameLengthLimit",
-        "spt.airdrop.Loot",
-        "spt.backup.MaxBackups"
-      ]
-    },
-    {
-      "name": "uihub",
-      "src": "mods/uihub/bin/uihub.dll",
-      "dst": "mods/uihub/uihub.dll",
-      "minBytes": 300000,
-      "markers": [
-        "/aowlspt/ui/page/settings",
-        "Browser Settings Page",
-        "Search all settings",
-        "Advertise the browser settings page",
-        "launchHintFallbackPage",
-        "width=device-width, initial-scale=1"
-      ]
-    },
-    {
-      "//": "The F6 ITEM SPAWNER is deliberately NOT marked here yet. On 2026-08-27",
-      "//1": "it existed only as uncommitted work in one checkout: a build from",
-      "//2": "committed source has no `admin: F6 spawn -- ` string, so marking it now",
-      "//3": "would fail every honest build. Add those markers in the same commit that",
-      "//4": "lands the spawner -- that is the rule, not an exception to it.",
-      "name": "admin",
-      "src": "mods/admin/bin/admin.dll",
-      "dst": "mods/admin/admin.dll",
-      "minBytes": 300000,
-      "markers": [
-        "aowl.admin",
-        "the F6 menu and ESP are unavailable this session",
-        "samples nothing -- turn ESP on in the F6 menu",
-        "player position validated this frame",
-        "ESP max distance (m)",
-        "Infinite stamina",
-        "No recoil / sway",
-        "Teleport to marker",
-        "PASS  PhysicalBase+0x8C -> Stamina+0x10 written",
-        "Neuters EFT.Player::ApplyDamageInfo while in a ",
-        "not read as KeyCode.None",
-        "Input::GetKeyDown bound and byte-verified",
-        "KeypadPlus"
-      ]
-    },
-    {
-      "name": "graphics",
-      "src": "mods/graphics/bin/graphics.dll",
-      "dst": "mods/graphics/graphics.dll",
-      "minBytes": 300000,
-      "markers": [
-        "aowl.graphics.apply",
-        "aowlspt.host::gfx_apply",
-        "graphics  grade pushed to the host post-process (tonemapper=",
-        "Enable post-process",
-        "Raid only (menu stays stock)",
-        "Red-tint diagnostic",
-        "Shadow lift (additive)",
-        "Blend of the tonemap look over the linear image.",
-        "cold-clinical",
-        "night-owl",
-        "Clarity (local contrast)",
-        "Shadow detail (toe lift)",
-        "Output dither (LSB)"
-      ]
-    },
-    {
-      "name": "textures",
-      "src": "mods/textures/bin/textures.dll",
-      "dst": "mods/textures/textures.dll",
-      "minBytes": 300000,
-      "markers": [
-        "aowl.textures",
-        "textures  ARMED post-boot in mode ",
-        "textures  REDIRECT: ",
-        "textures  VRAM budget ",
-        "textures  bundleRoot index: ",
-        "textures  bundle redirect RETIRED after ",
-        "textures  hookAsync is on: AssetBundleRequest::get_asset is a ",
-        "prologue MISMATCH at GameAssembly+0x"
-      ],
-      "data": [
-        {
-          "src": "mods/textures/data",
-          "dst": "mods/textures/data",
-          "exclude": [
-            "capture/**",
-            "*.md"
-          ],
-          "minFiles": 1,
-          "why": "the redirect manifest; without it every bundle redirect is a no-op and the log still says ARMED"
-        }
-      ]
-    },
-    {
-      "//": "Selectable by the beta (aowl.maps is enabled:true in aowl.list.beta)",
-      "//1": "and present in registry/mods.json since 2026-08-27 -- but absent",
-      "//2": "from THIS file until now, so `aowl build deploy` never built it and",
-      "//3": "`deploy.py check` never looked at it. A tester could select a mod",
-      "//4": "whose DLL was not shipped. `aowl.maps` below is IDENTITY, not a",
-      "//5": "feature check; the route paths, settings captions and per-feature",
-      "//6": "log text under it are what actually bite.",
-      "name": "maps",
-      "src": "mods/maps/bin/maps.dll",
-      "dst": "mods/maps/maps.dll",
-      "minBytes": 400000,
-      "markers": [
-        "aowl.maps",
-        "/aowlspt/maps/index",
-        "/aowlspt/maps/map/",
-        "/aowlspt/maps/asset/",
-        "/aowlspt/maps/feed",
-        "/aowlspt/maps/status",
-        "/aowlspt/ui/page/spatial",
-        "/aowlspt/ui/lib/spatial.js",
-        "Live position feed",
-        "Draw the radar over the game, via the shared region",
-        "A bearing mark per contact on a ring around screen centre",
-        "Rotate radar to facing",
-        "Loot / extract / corpse / quest markers",
-        "GameWorld live, borrowed from the host's already-armed RegisterPlayer cache",
-        "the shared region refused the in-game HUD: "
-      ],
-      "data": [
-        {
-          "src": "mods/maps/data",
-          "dst": "mods/maps/data",
-          "exclude": [
-            "capture/**",
-            "*.md"
-          ],
-          "minFiles": 40,
-          "why": "every map JSON and every terrain SVG layer. On 2026-08-27 none of the 59 files were shipped and the backend logged 'data/bigmap.json is not on disk -- that map will report no data' for 8 maps"
-        }
-      ]
-    },
-    {
-      "//": "`aowl.debug` is IDENTITY, kept for parity with `tarkov`; the route,",
-      "//1": "the four settings-schema captions and the profiler's own report text",
-      "//2": "are the feature checks. `THE FALSIFIER` is the self-test caption --",
-      "//3": "deleting the burn-N-ms control deletes it, which is the point.",
-      "name": "debug",
-      "src": "mods/debug/bin/debug.dll",
-      "dst": "mods/debug/debug.dll",
-      "minBytes": 400000,
-      "markers": [
-        "aowl.debug",
-        "/aowlspt/debug/profile",
-        "fps,frametime,build,map,raid,bots,pos,rot",
-        "Refresh every N frames",
-        "Toggle key (virtual-key code)",
-        "114 is VK_F3, which is the Minecraft key and ",
-        "Rolling window (frames)",
-        "Self-test: burn N ms per tick, in THIS mod",
-        "THE FALSIFIER, not a feature.",
-        "the shared profile region could not be ",
-        "profilerWindowFrames"
-      ]
-    },
-    {
-      "//": "`aowl.waypoints` is IDENTITY. The three /waypoints routes are the",
-      "//1": "serving half; the four `Patrol.*` / `Mind.*` db keys are the patrol",
-      "//2": "tuning half -- drop tunePatrol and those four vanish. The schema id",
-      "//3": "`aowlspt.waypoints/1` is what the data/ documents are checked against.",
-      "name": "waypoints",
-      "src": "mods/waypoints/bin/waypoints.dll",
-      "dst": "mods/waypoints/waypoints.dll",
-      "minBytes": 300000,
-      "markers": [
-        "aowl.waypoints",
-        "/waypoints/status",
-        "/waypoints/maps",
-        "/waypoints/points/",
-        "aowlspt.waypoints/1",
-        "Patrol.LOOK_TIME_BASE",
-        "Patrol.RESERVE_TIME_STAY",
-        "SPRINT_BETWEEN_CACHED_POINTS",
-        "Mind.CAN_STAND_BY",
-        "aowlspt/botnav sendBotTo -- advisory, host flag botNav, default off",
-        "no waypoint data for ",
-        "patrol points served; "
-      ],
-      "data": [
-        {
-          "src": "mods/waypoints/data",
-          "dst": "mods/waypoints/data",
-          "exclude": [
-            "capture/**",
-            "*.md"
-          ],
-          "minFiles": 8,
-          "why": "one patrol-point document per map, checked against schema aowlspt.waypoints/1. Without them every map answers 'no waypoint data for <map>' and the mod is a no-op that loads cleanly"
-        }
-      ]
-    },
-    {
-      "name": "callproof",
-      "src": "examples/callproof/bin/callproof.dll",
-      "dst": "mods/callproof/callproof.dll",
-      "minBytes": 300000,
-      "markers": [
-        "aowl.callproof",
-        "aowlspt.host::main_thread",
-        "call-proof: armed, deferring until the host's main-thread drain fires ",
-        "call-proof: the rival negative control is disabled, so a passing ",
-        "call-proof: still holding at ",
-        "NEVER RUN. Nothing was called and nothing is proved. Not a pass."
-      ]
-    },
-    {
-      "//": "The mod registry. Not under any mod, and therefore shipped by NOBODY",
-      "//1": "until 2026-08-27: the deployed copy was a day old and had no",
-      "//2": "`aowl.list.beta` in it, so the manager logged 'no list called",
-      "//3": "aowl.list.beta in the registry', fell back to manager + tarkov, and",
-      "//4": "SIX mods reported 'installed and not selected'. An hour was spent",
-      "//5": "believing FOV and the F3 overlay were broken. It is a first-class",
-      "//6": "artifact here, marker-checked like any binary -- the markers are the",
-      "//7": "schema id, the three list ids and the mod ids a list references, so a",
-      "//8": "registry that lost a list or a mod cannot ship.",
-      "name": "registry",
-      "src": "registry/mods.json",
-      "dst": "registry/mods.json",
-      "minBytes": 5000,
-      "//9": "verifyInstalled: its markers are scanned in the REPO copy, which",
-      "//10": "says nothing about the install -- that is exactly how a registry a",
-      "//11": "day old sat live while check printed ok. So the installed bytes are",
-      "//12": "compared against the repo's too.",
-      "verifyInstalled": true,
-      "invalidates": [
-        "mods/aowlspt-selection.json"
-      ],
-      "markers": [
-        "aowlspt.registry/1",
-        "aowl.list.core",
-        "aowl.list.vanillaplus",
-        "aowl.list.beta",
-        "aowl.manager",
-        "aowl.tarkov",
-        "aowl.maps",
-        "aowl.fovfix",
-        "aowl.debug",
-        "aowl.waypoints"
-      ]
-    },
-    {
-      "name": "backend",
-      "src": "backend/bin/aowlspt-backend.exe",
-      "dst": "aowlspt-backend.exe",
-      "minBytes": 100000,
-      "markers": [
-        "aowlspt-backend",
-        "listening on"
-      ]
-    },
-    {
-      "name": "launch",
-      "src": "installer/build/aowlspt-launch.exe",
-      "dst": "aowlspt-launch.exe",
-      "minBytes": 100000,
-      "markers": [
-        "aowlspt-launch",
-        "host running",
-        "backendUrl",
-        "could not write launchProfileId"
-      ]
+     "src": "mods/tarkov/data",
+     "dst": "mods/tarkov/data",
+     "exclude": ["capture/**", "*.md"],
+     "minFiles": 14,
+     "why": "the emulator answers seven menu routes out of post1/ and refuses to start a raid without post1/serversettings.json. On 2026-08-27 post1/globalsgaps.json was not shipped: tarkov.dll's self-check logged 'this build fails its own arithmetic; refusing to serve', registered ONLY its selfcheck route, and the launcher said 'unable to check client version'"
     }
-  ]
+   ]
+  },
+  {
+   "//": "Every OTHER mod we ship. Until 2026-08-27 `tarkov` was the only mod",
+   "//1": "with any marker at all, so sain.dll and nine others could ship with a",
+   "//2": "feature silently missing and this tool would still say ok. Markers here",
+   "//3": "are route paths, event ids, settings-schema captions and per-feature log",
+   "//4": "text -- each names ONE feature, so deleting that feature deletes the",
+   "//5": "string. A mod-id string (`aowl.sain`) is identity, not a feature check;",
+   "//6": "it is kept for parity with `tarkov` but the lines below it do the work.",
+   "//7": "`aowl build deploy` derives its build list from the `src` fields in",
+   "//8": "THIS file, so every artifact checked here is also built here. An",
+   "//9": "`src` the driver cannot map is a loud error -- teach buildDeploySet,",
+   "//10": "never delete the entry to quiet it.",
+   "name": "manager",
+   "src": "mods/manager/bin/manager.dll",
+   "dst": "mods/manager/manager.dll",
+   "minBytes": 400000,
+   "markers": [
+    "/aowlspt/mods/list",
+    "/aowlspt/mods/apply",
+    "/aowlspt/mods/toggle",
+    "/aowlspt/mods/conflicts",
+    "/aowlspt/mods/panel",
+    "/aowlspt/mods/clientreport",
+    "/aowlspt/mods/describe/",
+    "/aowlspt/mods/reload",
+    "manager: live mod control is available (",
+    "manager: active lists: ",
+    "manager: registry refresh refused -- "
+   ]
+  },
+  {
+   "name": "sain",
+   "src": "mods/sain/bin/sain.dll",
+   "dst": "mods/sain/sain.dll",
+   "minBytes": 500000,
+   "markers": [
+    "aowl.sain",
+    "/aowlspt/settings/aowl.sain/reset",
+    "sain: bindAll phase 4/5 -- the lazy member table (~70 names)",
+    "sain: bindProbe 1/2 -- UnityEngine.Physics::Raycast",
+    "sain: bindProbe 2/2 -- UnityEngine.AI.NavMesh::SamplePosition",
+    "sain: bot activation hooked on ",
+    "sain: bot aim result hooked on ",
+    "sain: by-name resolution refused for ",
+    "sain: a cover sample costs ",
+    "sain: a decision costs ",
+    "sain: an actuation costs ",
+    "sain: could not write the brain tables"
+   ]
+  },
+  {
+   "name": "morebots",
+   "src": "mods/morebots/bin/morebots.dll",
+   "dst": "mods/morebots/morebots.dll",
+   "minBytes": 400000,
+   "markers": [
+    "morebots.type.register",
+    "morebots.type.overlay",
+    "morebots.faction.define",
+    "morebots.faction.relate",
+    "morebots.client.census",
+    "morebots.flush",
+    "morebots.ready",
+    "morebots: a faction definition arrived without a name",
+    "morebots:   spawn types alive:"
+   ],
+   "data": [
+    {
+     "src": "mods/morebots/data",
+     "dst": "mods/morebots/data",
+     "exclude": ["capture/**", "*.md"],
+     "minFiles": 1,
+     "why": "the vanilla faction/spawn-type definitions this mod registers from; a morebots with no data registers nothing"
+    }
+   ]
+  },
+  {
+   "name": "fov",
+   "src": "mods/fov/bin/fov.dll",
+   "dst": "mods/fov/fov.dll",
+   "minBytes": 400000,
+   "markers": [
+    "aowl.fovfix",
+    "FOV: binding CameraManager::get_Instance at a verified static RVA ",
+    "FOV: CalculateScaleValueByFov -- ",
+    "FOV: base field of view captured at ",
+    "FOV: the per-frame chain bound -- ",
+    "FOV: per-frame FOV write -- ",
+    "FOV: scope sensitivity -- ",
+    "FOV: aiming sensitivity -- ",
+    "FOV scale while aiming iron sights / reflex",
+    "FOV scale while aiming a magnified sight"
+   ]
+  },
+  {
+   "name": "settingshub",
+   "src": "mods/settingshub/bin/settingshub.dll",
+   "dst": "mods/settingshub/settingshub.dll",
+   "minBytes": 300000,
+   "markers": [
+    "/aowlspt/settings/index",
+    "/aowlspt/settings/spt/index",
+    "/aowlspt/settings/spt/page/",
+    "spt.bot.AssaultBrainType",
+    "spt.bot.BotNameLengthLimit",
+    "spt.airdrop.Loot",
+    "spt.backup.MaxBackups"
+   ]
+  },
+  {
+   "name": "uihub",
+   "src": "mods/uihub/bin/uihub.dll",
+   "dst": "mods/uihub/uihub.dll",
+   "minBytes": 300000,
+   "markers": [
+    "/aowlspt/ui/page/settings",
+    "Browser Settings Page",
+    "Search all settings",
+    "Advertise the browser settings page",
+    "launchHintFallbackPage",
+    "width=device-width, initial-scale=1"
+   ]
+  },
+  {
+   "//": "The F6 ITEM SPAWNER is deliberately NOT marked here yet. On 2026-08-27",
+   "//1": "it existed only as uncommitted work in one checkout: a build from",
+   "//2": "committed source has no `admin: F6 spawn -- ` string, so marking it now",
+   "//3": "would fail every honest build. Add those markers in the same commit that",
+   "//4": "lands the spawner -- that is the rule, not an exception to it.",
+   "name": "admin",
+   "src": "mods/admin/bin/admin.dll",
+   "dst": "mods/admin/admin.dll",
+   "minBytes": 300000,
+   "markers": [
+    "aowl.admin",
+    "the F6 menu and ESP are unavailable this session",
+    "samples nothing -- turn ESP on in the F6 menu",
+    "player position validated this frame",
+    "ESP max distance (m)",
+    "Infinite stamina",
+    "No recoil / sway",
+    "Teleport to marker",
+    "PASS  PhysicalBase+0x8C -> Stamina+0x10 written",
+    "Neuters EFT.Player::ApplyDamageInfo while in a ",
+    "not read as KeyCode.None",
+    "Input::GetKeyDown bound and byte-verified",
+    "KeypadPlus"
+   ]
+  },
+  {
+   "name": "graphics",
+   "src": "mods/graphics/bin/graphics.dll",
+   "dst": "mods/graphics/graphics.dll",
+   "minBytes": 300000,
+   "markers": [
+    "aowl.graphics.apply",
+    "aowlspt.host::gfx_apply",
+    "graphics  grade pushed to the host post-process (tonemapper=",
+    "Enable post-process",
+    "Raid only (menu stays stock)",
+    "Red-tint diagnostic",
+    "Shadow lift (additive)",
+    "Blend of the tonemap look over the linear image.",
+    "cold-clinical",
+    "night-owl",
+    "Clarity (local contrast)",
+    "Shadow detail (toe lift)",
+    "Output dither (LSB)"
+   ]
+  },
+  {
+   "name": "textures",
+   "src": "mods/textures/bin/textures.dll",
+   "dst": "mods/textures/textures.dll",
+   "minBytes": 300000,
+   "markers": [
+    "aowl.textures",
+    "textures  ARMED post-boot in mode ",
+    "textures  REDIRECT: ",
+    "textures  VRAM budget ",
+    "textures  bundleRoot index: ",
+    "textures  bundle redirect RETIRED after ",
+    "textures  hookAsync is on: AssetBundleRequest::get_asset is a ",
+    "prologue MISMATCH at GameAssembly+0x"
+   ],
+   "data": [
+    {
+     "src": "mods/textures/data",
+     "dst": "mods/textures/data",
+     "exclude": ["capture/**", "*.md"],
+     "minFiles": 1,
+     "why": "the redirect manifest; without it every bundle redirect is a no-op and the log still says ARMED"
+    }
+   ]
+  },
+  {
+   "//": "Selectable by the beta (aowl.maps is enabled:true in aowl.list.beta)",
+   "//1": "and present in registry/mods.json since 2026-08-27 -- but absent",
+   "//2": "from THIS file until now, so `aowl build deploy` never built it and",
+   "//3": "`deploy.py check` never looked at it. A tester could select a mod",
+   "//4": "whose DLL was not shipped. `aowl.maps` below is IDENTITY, not a",
+   "//5": "feature check; the route paths, settings captions and per-feature",
+   "//6": "log text under it are what actually bite.",
+   "name": "maps",
+   "src": "mods/maps/bin/maps.dll",
+   "dst": "mods/maps/maps.dll",
+   "minBytes": 400000,
+   "markers": [
+    "aowl.maps",
+    "/aowlspt/maps/index",
+    "/aowlspt/maps/map/",
+    "/aowlspt/maps/asset/",
+    "/aowlspt/maps/feed",
+    "/aowlspt/maps/status",
+    "/aowlspt/ui/page/spatial",
+    "/aowlspt/ui/lib/spatial.js",
+    "Live position feed",
+    "Draw the radar over the game, via the shared region",
+    "A bearing mark per contact on a ring around screen centre",
+    "Rotate radar to facing",
+    "Loot / extract / corpse / quest markers",
+    "GameWorld live, borrowed from the host's already-armed RegisterPlayer cache",
+    "the shared region refused the in-game HUD: "
+   ],
+   "data": [
+    {
+     "src": "mods/maps/data",
+     "dst": "mods/maps/data",
+     "exclude": ["capture/**", "*.md"],
+     "minFiles": 40,
+     "why": "every map JSON and every terrain SVG layer. On 2026-08-27 none of the 59 files were shipped and the backend logged 'data/bigmap.json is not on disk -- that map will report no data' for 8 maps"
+    }
+   ]
+  },
+  {
+   "//": "`aowl.debug` is IDENTITY, kept for parity with `tarkov`; the route,",
+   "//1": "the four settings-schema captions and the profiler's own report text",
+   "//2": "are the feature checks. `THE FALSIFIER` is the self-test caption --",
+   "//3": "deleting the burn-N-ms control deletes it, which is the point.",
+   "name": "debug",
+   "src": "mods/debug/bin/debug.dll",
+   "dst": "mods/debug/debug.dll",
+   "minBytes": 400000,
+   "markers": [
+    "aowl.debug",
+    "/aowlspt/debug/profile",
+    "fps,frametime,build,map,raid,bots,pos,rot",
+    "Refresh every N frames",
+    "Toggle key (virtual-key code)",
+    "114 is VK_F3, which is the Minecraft key and ",
+    "Rolling window (frames)",
+    "Self-test: burn N ms per tick, in THIS mod",
+    "THE FALSIFIER, not a feature.",
+    "the shared profile region could not be ",
+    "profilerWindowFrames"
+   ]
+  },
+  {
+   "//": "`aowl.waypoints` is IDENTITY. The three /waypoints routes are the",
+   "//1": "serving half; the four `Patrol.*` / `Mind.*` db keys are the patrol",
+   "//2": "tuning half -- drop tunePatrol and those four vanish. The schema id",
+   "//3": "`aowlspt.waypoints/1` is what the data/ documents are checked against.",
+   "name": "waypoints",
+   "src": "mods/waypoints/bin/waypoints.dll",
+   "dst": "mods/waypoints/waypoints.dll",
+   "minBytes": 300000,
+   "markers": [
+    "aowl.waypoints",
+    "/waypoints/status",
+    "/waypoints/maps",
+    "/waypoints/points/",
+    "aowlspt.waypoints/1",
+    "Patrol.LOOK_TIME_BASE",
+    "Patrol.RESERVE_TIME_STAY",
+    "SPRINT_BETWEEN_CACHED_POINTS",
+    "Mind.CAN_STAND_BY",
+    "aowlspt/botnav sendBotTo -- advisory, host flag botNav, default off",
+    "no waypoint data for ",
+    "patrol points served; "
+   ],
+   "data": [
+    {
+     "src": "mods/waypoints/data",
+     "dst": "mods/waypoints/data",
+     "exclude": ["capture/**", "*.md"],
+     "minFiles": 8,
+     "why": "one patrol-point document per map, checked against schema aowlspt.waypoints/1. Without them every map answers 'no waypoint data for <map>' and the mod is a no-op that loads cleanly"
+    }
+   ]
+  },
+  {
+   "name": "callproof",
+   "src": "examples/callproof/bin/callproof.dll",
+   "dst": "mods/callproof/callproof.dll",
+   "minBytes": 300000,
+   "markers": [
+    "aowl.callproof",
+    "aowlspt.host::main_thread",
+    "call-proof: armed, deferring until the host's main-thread drain fires ",
+    "call-proof: the rival negative control is disabled, so a passing ",
+    "call-proof: still holding at ",
+    "NEVER RUN. Nothing was called and nothing is proved. Not a pass."
+   ]
+  },
+  {
+   "//": "The mod registry. Not under any mod, and therefore shipped by NOBODY",
+   "//1": "until 2026-08-27: the deployed copy was a day old and had no",
+   "//2": "`aowl.list.beta` in it, so the manager logged 'no list called",
+   "//3": "aowl.list.beta in the registry', fell back to manager + tarkov, and",
+   "//4": "SIX mods reported 'installed and not selected'. An hour was spent",
+   "//5": "believing FOV and the F3 overlay were broken. It is a first-class",
+   "//6": "artifact here, marker-checked like any binary -- the markers are the",
+   "//7": "schema id, the three list ids and the mod ids a list references, so a",
+   "//8": "registry that lost a list or a mod cannot ship.",
+   "name": "registry",
+   "src": "registry/mods.json",
+   "dst": "registry/mods.json",
+   "minBytes": 5000,
+   "//9": "verifyInstalled: its markers are scanned in the REPO copy, which",
+   "//10": "says nothing about the install -- that is exactly how a registry a",
+   "//11": "day old sat live while check printed ok. So the installed bytes are",
+   "//12": "compared against the repo's too.",
+   "verifyInstalled": true,
+   "invalidates": [
+    "mods/aowlspt-selection.json"
+   ],
+   "markers": [
+    "aowlspt.registry/1",
+    "aowl.list.core",
+    "aowl.list.vanillaplus",
+    "aowl.list.beta",
+    "aowl.manager",
+    "aowl.tarkov",
+    "aowl.maps",
+    "aowl.fovfix",
+    "aowl.debug",
+    "aowl.waypoints"
+   ]
+  },
+  {
+   "name": "backend",
+   "src": "backend/bin/aowlspt-backend.exe",
+   "dst": "aowlspt-backend.exe",
+   "minBytes": 100000,
+   "markers": [
+    "aowlspt-backend",
+    "listening on"
+   ]
+  },
+  {
+   "name": "launch",
+   "src": "installer/build/aowlspt-launch.exe",
+   "dst": "aowlspt-launch.exe",
+   "minBytes": 100000,
+   "markers": [
+    "aowlspt-launch",
+    "host running",
+    "backendUrl",
+    "could not write launchProfileId"
+   ]
+  }
+ ]
 }
