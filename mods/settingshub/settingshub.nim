@@ -40,6 +40,16 @@ const
   IndexRoute = "/aowlspt/settings/spt/index"
   PagePrefix = "/aowlspt/settings/spt/page/"
   ModsIndexRoute = "/aowlspt/settings/index"
+  ClientSyncRoute = "/aowlspt/settings/client/sync"
+  ClientPagePrefix = "/aowlspt/settings/"
+    ## A FALLBACK prefix, deliberately. `matchRoute` in the backend gives an
+    ## exact route priority over any prefix and the longest prefix priority
+    ## among prefixes, so every server-side mod's own exact
+    ## `/aowlspt/settings/<guid>` (and `/reset`), plus this hub's exact
+    ## `/aowlspt/settings/index` and the longer `/aowlspt/settings/spt/page/`,
+    ## all still win. Only a guid NOBODY registered lands here -- which is
+    ## exactly a client-side mod. The F12 overlay therefore needs no change at
+    ## all: it keeps fetching and POSTing the same URLs it always has.
 
 ## The whole SPT surface, ~108 KB of JSON, reassembled once from the string
 ## chunks the generated `sptsurface` module carries. nimony has no compile-time
@@ -93,12 +103,155 @@ proc onAnnounce(payload: string): string =
   gAnnounced.add payload
   result = ""
 
+## The CLIENT half of the index.
+##
+## A mod whose `sides` is `{sideClient}` -- `mods/graphics` and the client
+## halves of `mods/admin` and `mods/fov` -- is not loaded in THIS process at
+## all, so the `SettingsIndexQuery` broadcast above cannot reach it and it has
+## never appeared in the F12 nav. It is not a rendering fault: the mod is in a
+## different process with no HTTP listener (the client host refuses
+## `route_register`).
+##
+## So the client host pushes instead. `host/Aowlspt.Host.Il2Cpp/settingsbridge.nim`
+## runs the same broadcast INSIDE the game process over the event bus and POSTs
+## the result here, one mod per request:
+##
+##   POST /aowlspt/settings/client/sync   {"guid","name","count","done","rows":[...]}
+##     -> {"ok":true,"pending":[{"guid","key","value"}...]}
+##
+## and this hub then answers `GET /aowlspt/settings/<that guid>` out of what
+## was pushed, off a fallback prefix that an exact route always beats.
+##
+## The reply carries any edits made in F12 on a client page since the last
+## sync; the host emits each one at the owning mod, which persists it AND
+## hot-applies it in the process that owns the runtime. The next sync pushes
+## the re-read rows back, so the panel shows what the mod actually kept.
+##
+## This is deliberately NOT "give graphics a server side". A server side would
+## make the page appear while the edit landed in the wrong process -- a control
+## that moves and changes nothing, which is worse than an absent page.
+type
+  ClientPage = object
+    guid, name: string
+    count, done: int
+    rows: string        ## the schema array, verbatim as the mod emitted it
+    stamp: int          ## sync number this page last arrived on
+
+var gClientPages: seq[ClientPage] = @[]
+var gClientPending: seq[string] = @[]   ## queued edits, oldest first
+var gClientSyncs = 0
+
+proc clientIndexOf(guid: string): int =
+  result = -1
+  for i, p in gClientPages:
+    if p.guid == guid: return i
+
+proc onClientSync(url, body, session: string): string =
+  ## One client-side mod's page, pushed up from the game process; the reply
+  ## drains the edit queue back down. Both directions in one request, because
+  ## the host's POST slot is single-shot and shared.
+  let g = jr.field(body, "guid")
+  var root = obj()
+  if not g.exists or jr.asText(g, "").len == 0:
+    root.put("ok", false)
+    root.put("err", "a client settings sync must name a guid")
+    return done(root).text
+  inc gClientSyncs
+  var pg = ClientPage(guid: jr.asText(g, ""),
+                      name: jr.asText(jr.field(body, "name"), ""),
+                      count: jr.asInt(jr.field(body, "count"), 0),
+                      done: jr.asInt(jr.field(body, "done"), 0),
+                      rows: jr.raw(jr.field(body, "rows")),
+                      stamp: gClientSyncs)
+  if pg.name.len == 0: pg.name = pg.guid
+  if pg.rows.len == 0: pg.rows = "[]"
+  let i = clientIndexOf(pg.guid)
+  if i >= 0: gClientPages[i] = pg
+  else: gClientPages.add pg
+  root.put("ok", true)
+  var pend = arr()
+  for e in gClientPending:
+    pend.add sv.raw(e)
+  gClientPending = @[]
+  root.put("pending", pend)
+  result = done(root).text
+
+proc onClientPage(url, body, session: string): string =
+  ## `GET /aowlspt/settings/client/page/<guid>` -- the rows the host last
+  ## pushed. On a POST the edit is QUEUED for the host rather than applied
+  ## here: this process does not own the mod, and pretending otherwise is
+  ## exactly the half-working control this mechanism exists to prevent. The
+  ## reply is the rows as they stand NOW (unchanged, necessarily), so a caller
+  ## that verifies by re-reading sees the old value until the host has actually
+  ## applied it -- which is the truth, and is what fact #135 says to check.
+  var want = pathAfter(url, ClientPagePrefix)
+  # Strip a query string and a trailing `/reset` -- this prefix sees the raw
+  # url, unlike an exact route.
+  var cut = -1
+  for ci in 0 ..< want.len:
+    if want[ci] == '?':
+      cut = ci
+      break
+  if cut >= 0: want = want.substr(0, cut - 1)
+  var isReset = false
+  if want.len > 6 and want.substr(want.len - 6, want.len - 1) == "/reset":
+    isReset = true
+    want = want.substr(0, want.len - 7)
+  let i = clientIndexOf(want)
+  if i < 0:
+    return "{\"err\":\"no client mod has pushed a page for this guid\",\"rows\":[]}"
+  if isReset:
+    # A reset is an edit like any other from here: the host owns the mod and
+    # the mod owns its defaults, so the request is queued with no key and the
+    # owning process resolves it. Queueing it here as if it were applied is
+    # the one thing that must not happen.
+    var r = obj()
+    r.put("guid", want)
+    r.put("reset", true)
+    if jr.field(body, "key").exists:
+      r.put("key", jr.asText(jr.field(body, "key"), ""))
+    if gClientPending.len < 64:
+      gClientPending.add done(r).text
+    return gClientPages[i].rows
+  if body.len > 0:
+    let k = jr.field(body, "key")
+    if not k.exists or jr.asText(k, "").len == 0:
+      var e = obj()
+      e.put("err", "a client settings write must be {\"key\":..,\"value\":..}")
+      e.put("rows", sv.raw(gClientPages[i].rows))
+      return done(e).text
+    var q = obj()
+    q.put("guid", want)
+    q.put("key", jr.asText(k, ""))
+    q.put("value", sv.raw(jr.raw(jr.field(body, "value"))))
+    if gClientPending.len < 64:
+      gClientPending.add done(q).text
+      info "settingshub: queued a client settings edit for " & want &
+           " (key=" & jr.asText(k, "") & "); the game process applies it on " &
+           "its next sync"
+    else:
+      warn "settingshub: the client settings edit queue is full (64); " &
+           "dropping the edit for " & want & " rather than growing without bound"
+  result = gClientPages[i].rows
+
 proc onModsIndex(url, body, session: string): string =
   gAnnounced = @[]
   discard emit(settings.SettingsIndexQuery, "")
   var a = arr()
   for m in gAnnounced:
     a.add sv.raw(m)
+  # The client-side mods, from what the game process last pushed. Marked
+  # `client:true` so a reader can tell which transport a page comes over --
+  # and so `tools/settingsdump.py` can assert the NEGATIVE that matters: no
+  # mod declaring settings is missing from this list.
+  for p in gClientPages:
+    var o = obj()
+    o.put("guid", p.guid)
+    o.put("name", p.name)
+    o.put("count", p.count)
+    o.put("done", p.done)
+    o.put("client", true)
+    a.add done(o)
   var root = obj()
   root.put("mods", a)
   result = done(root).text
@@ -114,6 +267,11 @@ proc onLoad(): Status =
     warn "could not register the SPT settings page route"
   if serve(ModsIndexRoute, onModsIndex) != Ok:
     warn "could not register " & ModsIndexRoute
+  if serve(ClientSyncRoute, onClientSync) != Ok:
+    warn "could not register " & ClientSyncRoute &
+         " -- client-side mods will stay invisible in the F12 settings nav"
+  if servePrefix(ClientPagePrefix, onClientPage) != Ok:
+    warn "could not register " & ClientPagePrefix
   if on(settings.SettingsIndexAnnounce, onAnnounce) != Ok:
     warn "could not subscribe to " & settings.SettingsIndexAnnounce &
          " -- " & ModsIndexRoute & " will always report an empty mod list"

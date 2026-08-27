@@ -283,9 +283,40 @@ backend on `127.0.0.1:443`:
   schema, current values folded in. Reachable for every **server-side** mod
   (`classicmovement`, `morebots`, `blackdivision`, `sain`, `tarkov`), because
   server routes register on the backend the overlay talks to. `fov` is
-  **client-only** (`{sideClient, sideSim}`): its route is not on the backend, so
-  its page shows the honest "could not read this page" state. Making it reachable
-  needs an in-process host→overlay schema push, which is a separate mechanism.
+  **client-only** (`{sideClient, sideSim}`), as is `mods/graphics` (`{sideClient}`,
+  twenty wired settings) and the client half of `mods/admin`: their routes are
+  never registered anywhere at all -- the client host **refuses
+  `route_register`**, because the game process serves no HTTP -- so the
+  `SettingsIndexQuery` broadcast that fills the index (server-side, in
+  `mods/settingshub`) could never hear them and their pages were absent from the
+  F12 nav entirely.
+
+  **This is now fixed by the in-process schema push.**
+  `host/Aowlspt.Host.Il2Cpp/settingsbridge.nim` runs the same broadcast inside
+  the GAME process over the event bus -- the one cross-mod channel the client
+  host does implement -- collecting `SettingsIndexAnnounce` and, per mod,
+  `SettingsPageAnnounce` (both added to `aowl/src/aowlspt/settings.nim`). It
+  POSTs each mod's page to `POST /aowlspt/settings/client/sync`, and settingshub
+  then lists it in `/aowlspt/settings/index` (tagged `"client":true`) and answers
+  `GET /aowlspt/settings/<guid>` for it off a **fallback prefix** -- exact routes
+  and longer prefixes still win, so no server mod's own route is displaced and
+  **the overlay needed no change at all**.
+
+  An edit is the same path backwards: the panel POSTs to the URL it always did,
+  settingshub QUEUES it (it does not own the mod and must not pretend to), and
+  the sync reply hands it to the game process, which emits `SettingsApplyQuery`
+  at the owning mod. The mod persists it through the same
+  `applySettingFromBody` its route uses and then runs its `onSettingsApplied`
+  hook, so the change hot-applies where the runtime is. The deliberate
+  non-solution is giving a client mod a server side: the page would appear and
+  the edit would land in the wrong process -- a control that moves and changes
+  nothing, which is worse than an absent page.
+
+  `tools/settingsdump.py` is the check: it fetches the index and every page and
+  asserts the negative -- *no mod declaring settings is absent from the nav, and
+  no listed page is unreadable* -- tolerating and REPORTING the fact-#122
+  unquoted-`value` invalidity, and verifying a `--set` by re-reading the value
+  rather than by the status code (fact #135).
 - the **SPT pages** from the new server-side **settings-hub mod**
   (`mods/settingshub`): `GET /aowlspt/settings/spt/index` for the page list and
   `GET /aowlspt/settings/spt/page/<id>` for one page. The hub carries the whole

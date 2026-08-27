@@ -370,6 +370,9 @@ proc modSetQueueWrite(guid, key, val: string) =
   if not gModSetOn or gModSetOff:
     return
   let body = "{\"key\":\"" & key & "\",\"value\":" & val & "}"
+  # Claim the shared POST slot for a few seconds so the client-settings bridge
+  # (`settingsbridge.nim`) does not arm over this write before it has been sent.
+  gSbYieldUntil = cNowMs() + 3000'u64
   overlayPostStart("/aowlspt/settings/" & guid, body)
   okLog "mod settings render: POST /aowlspt/settings/" & guid &
         " key=" & key & " value=" & val

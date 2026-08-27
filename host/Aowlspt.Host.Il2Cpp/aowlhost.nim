@@ -2275,6 +2275,43 @@ proc deliverEvent(n, body: string; fromIndex: int): int =
 proc hostEmit(name, payload: string) =
   discard deliverEvent(name, payload, -1)
 
+# ---------------------------------------------------------------------------
+# The client-settings bridge's ear on the event bus
+# ---------------------------------------------------------------------------
+#
+# `settingsbridge.nim` (included further down, where the overlay's POST slot is
+# in scope) broadcasts the settings queries into the mods loaded HERE and needs
+# the replies. A mod replies by emitting, which lands in `hostEventEmit` below,
+# so this is the only place that can see them. Collection is off unless a
+# broadcast is actually in progress, so the ordinary event path costs three
+# string compares against a false flag.
+
+const
+  SbIndexAnnounce* = "aowlspt.settings.indexAnnounce"
+  SbPageQuery* = "aowlspt.settings.pageQuery"
+  SbPageAnnounce* = "aowlspt.settings.pageAnnounce"
+  SbApplyQuery* = "aowlspt.settings.applyQuery"
+  SbApplyAnnounce* = "aowlspt.settings.applyAnnounce"
+
+var gSbCollecting = false
+var gSbIndex: seq[string] = @[]
+var gSbPage = ""
+var gSbApply = ""
+var gSbYieldUntil = 0'u64
+  ## Set by `modSetQueueWrite` when a NATIVE settings page write takes the
+  ## single POST slot, so the bridge does not arm over an in-flight edit.
+
+proc sbCapture(n, body: string) =
+  if not gSbCollecting:
+    return
+  if n == SbIndexAnnounce:
+    if gSbIndex.len < 64:
+      gSbIndex.add body
+  elif n == SbPageAnnounce:
+    gSbPage = body
+  elif n == SbApplyAnnounce:
+    gSbApply = body
+
 proc hostEventEmit(ctx: Il2CppPtr; name: Il2CppPtr; nameLen: int32;
                    payload: Il2CppPtr; payloadLen: int32): int32 {.
     exportc: "aowlspt_nim_event_emit", cdecl.} =
@@ -2285,6 +2322,7 @@ proc hostEventEmit(ctx: Il2CppPtr; name: Il2CppPtr; nameLen: int32;
   let n = readBytes(name, nameLen)
   let body = readBytes(payload, payloadLen)
   let from1 = int(cast[uint](ctx))
+  sbCapture(n, body)
   # A mod-control request is recorded and performed from the host's own loop.
   # Never from here: this stack is usually the game thread inside a patch, and
   # for an unload it can run through the very mod being unloaded.
@@ -6265,6 +6303,12 @@ var gReportNextMs = 0'u64
 ## `settingspages.nim`'s forward declaration.
 include "modsettingsrender.nim"
 
+## Client-side mods' settings pages, published to the backend over the event
+## bus so the F12 nav can list them at all. Stands on `modsettingsrender.nim`
+## for the shared POST slot discipline (`gSbYieldUntil`) and on `gSyncMs`.
+## Defines `sbTick`, called from `hostMain`'s tick loop.
+include "settingsbridge.nim"
+
 proc hex16(v: uint64): string =
   const digits = "0123456789abcdef"
   result = ""
@@ -7504,6 +7548,12 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
     modSetTick(now)
     if not modSetOwnsSlot():
       takeModSet()
+    # The client-settings bridge reads the POST slot BEFORE `modSetDrainPost`
+    # for the same reason `modSetTick` reads the GET slot before `takeModSet`:
+    # one cursor, two readers, and whoever reads first wins. `sbTick` only
+    # consumes a reply it armed itself (`gSbArmedAt`), so a native-page write
+    # still reaches `modSetDrainPost` untouched.
+    sbTick(now)
     modSetDrainPost()
     # Live mod control, off the emitting stack -- the only place in this host a
     # mod is loaded or unloaded while the game is running.
