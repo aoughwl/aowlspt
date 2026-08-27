@@ -1343,42 +1343,71 @@ proc sainSchema(): seq[Setting] =
   ## The flat top-level scalar keys SAIN reads from config.json. The `global`,
   ## `roles` and `server` blocks are nested documents resolved into a Preset
   ## rather than scalar controls, so their members are not declared here.
-  # FOUR OF THESE FIVE ARE `implemented = false`, DELIBERATELY.
+  # TWO OF THESE FIVE ARE `implemented = false`. The other three are read AND
+  # ACTED ON, which is the only bar for flipping one.
   #
-  # This mod is in OBSERVER MODE: it loads, reports what it can and cannot
-  # reach, and does not currently drive bot behaviour. A setting that renders
-  # and changes nothing is the worst thing we ship -- a readiness audit put it
-  # exactly this way: a tester will change `difficulty`, see vanilla bots, and
-  # blame the game. So the four that cannot bite are marked unimplemented and
-  # the settings surface hides them by default (F8 shows them).
+  # What changed: this mod no longer needs a driving call of its own. The host
+  # already has one -- a kind=15 detour on `EFT.BotOwner::UpdateManual`
+  # @0x81B7C0, byte-verified offline, exposed to mods as `aowlspt/botnav`. So
+  # `server/drive.nim` sends `BotMover.MoveSpeed` for every bot, scaled by
+  # `difficulty`, over a channel that resolves no name at run time. Zero new
+  # RVAs; see that file's header for the three it rides and why move speed is
+  # the cheapest observable in the game.
   #
-  # `enabled` STAYS implemented, because it is honest: it is read, and turning
-  # it off really does stop the mod loading its decision core. It is the one
-  # control here that does what its label says.
+  # The bar, restated, because getting this wrong is the worst thing we ship: a
+  # setting is implemented when a tester who changes it can SEE the game differ.
+  # Not when it is parsed, not when it reaches a struct.
   #
-  # WHEN THE DRIVING CALLS LAND, FLIP THESE BACK. They are not aspirational
-  # placeholders -- the schema, the persistence and the decision core behind
-  # them are written; only the call path into the game was missing, and that
-  # is now proven (by-value aggregates by hidden pointer, 8-byte packed in
-  # register, spill past position 3 -- all measured on the live client).
+  #   enabled            READ  preset.nim:201 -> `Preset.enabled`, and acted on
+  #                      at serverside.nim `startServer` (returns before
+  #                      patching brains, neutralising modifiers or arming the
+  #                      drive) and at sain.nim `onLoad`/`onUpdate`. An audit
+  #                      reported this one as a control that lies because the
+  #                      string "enabled" appears once in sain.nim; the read is
+  #                      in preset.nim, so the audit was scoped to the wrong
+  #                      file. It stays TRUE, on the evidence above.
+  #   difficulty         READ  preset.nim:203 -> a 0..1 scale, and now ACTED ON:
+  #                      drive.nim converts it to MoveSpeed and sends it to
+  #                      every bot on every census. Partial, honestly: SAIN's
+  #                      real band moves a dozen brain coefficients that are not
+  #                      reachable without reflection. Speed is the part that
+  #                      is, and it is visible.
+  #   logDecisions       READ  preset.nim:230, and now ACTED ON: it gates the
+  #                      per-census drive line, which names the commanded speed,
+  #                      the bots tracked and how many were seen to move.
+  #
+  # Still false, with the reason each:
+  #
+  #   forcePersonality   Read (preset.nim:222) and it does change what
+  #                      `core/decide.nim` decides -- but nothing that core
+  #                      decides reaches a bot. The only channel out of this mod
+  #                      is MoveSpeed, and personality does not map onto it
+  #                      without inventing a meaning it does not have. Reading a
+  #                      value is not implementing a setting.
+  #   driveFromHostThread  Read (preset.nim:231), and it governs `client/live.nim`
+  #                      -- the by-NAME path. That path is not merely unused, it
+  #                      is fatal when used (facts #143/#144/#145: the gated
+  #                      il2cpp exports return a plausible RANDOM value, and the
+  #                      client dies on the first dereference). This switch
+  #                      cannot become true while the thing it switches is a way
+  #                      to kill the client.
+
   result = @[
     boolSetting("enabled", "Enable SAIN", true, category = "AI",
                 description = "Master switch; when off the mod loads and does nothing"),
     enumSetting("difficulty", "Difficulty", "default",
                 @["easy", "lessdifficult", "default", "harderpmcs",
                   "veryhard", "deathwish"], category = "AI",
-                description = "Scales bot aggression across every role",
-                implemented = false),
+                description = "Scales how fast every bot moves, from 0.49 at easy to 1.0 at deathwish. Needs `botNav` on in aowlspt-host.json"),
     stringSetting("forcePersonality", "Force personality", "", category = "AI",
-                  description = "Force every bot to one personality; empty means auto-assign by role",
+                  description = "Force every bot to one personality. Read and it changes the decision core, but nothing the core decides reaches a bot yet",
                   implemented = false),
     boolSetting("driveFromHostThread", "Drive from host thread", true,
                 category = "Advanced",
-                description = "Allow the driving calls from the host thread on a host whose main-thread drain never fired; false withholds them so bots decide but do not move",
+                description = "Governs the by-NAME client path, which is fatal on this build and is not used; driving goes over aowlspt/botnav instead",
                 implemented = false),
     boolSetting("logDecisions", "Log decisions", false, category = "Advanced",
-                description = "Verbose per-bot decision logging",
-                implemented = false)]
+                description = "Log every drive command: the speed sent, the bots tracked, and how many were seen to move")]
 
 proc onSainSettings(url, body, session: string): string =
   ## GET serves the schema; a POST body persists one edit into config.json. SAIN
@@ -1523,6 +1552,8 @@ proc onUpdate(elapsedMs: int64): Status =
   Ok
 
 proc onUnload(): Status =
+  if side() == sideServer:
+    stopServer()
   if side() == sideClient:
     # Order matters: the stats line names how many handles were released, and
     # `releaseAll` is what makes that number true.
