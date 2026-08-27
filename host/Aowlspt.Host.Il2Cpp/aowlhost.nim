@@ -6513,6 +6513,27 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   gCodeGenAudit = readBoolKey("codeGenAudit")
   gRegionOn = readBoolKey("sharedRegion")
   betaNoticeReadFlags()
+  # The breadcrumb file: a second, independent witness for the log's tail.
+  #
+  # The value is logged AS READ, not as declared: a flag defaulted to false in
+  # source has already been found true in the deployed `aowlspt-host.json`,
+  # with the dangerous branch running and the source saying otherwise.
+  let crumbsWanted = readBoolKey("hostCrumbs")
+  if crumbsWanted:
+    let crumbPath = joinPath(gDir, "aowlspt-host.crumbs")
+    let crumbErr = modhost.crumbArm(crumbPath, 20000)
+    if crumbErr.len == 0:
+      info "hostCrumbs read as TRUE from aowlspt-host.json: every log line is " &
+           "also written, numbered, to " & crumbPath & " (capped at 20000). " &
+           "That file is written with its own handle and flushed per record, " &
+           "so if a hard death loses the log's tail the crumb numbers say how " &
+           "far execution actually got."
+    else:
+      warn "hostCrumbs read as TRUE but the breadcrumb file is NOT armed: " &
+           crumbErr
+  else:
+    info "hostCrumbs read as FALSE from aowlspt-host.json: no breadcrumb file. " &
+         "Turn it on to get a second witness for the log tail after a crash."
   if gCodeGenAudit:
     info "codeGenAudit is set: whenever a method has BOTH a live methodPointer " &
          "and a codeGenModule table entry, the host will log whether the two " &

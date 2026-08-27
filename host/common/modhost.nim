@@ -428,10 +428,121 @@ proc startClock*() =
 proc elapsedMs*(): int64 =
   result = int64(cSysNowMs() - gStartMs)
 
+const NL = "\n"
+
+var gLogFile: File = default(File)
+var gLogFileOpen = false
+var gLogDropped = 0
+  ## Lines the sink could not write because it could not open the file. Counted
+  ## rather than discarded: a sink that loses a line and says nothing is the
+  ## instrument this module exists to stop being.
+
+proc closeLog*() =
+  ## Flush and release the log handle. Idempotent; safe if none was opened.
+  if gLogFileOpen:
+    gLogFileOpen = false
+    close(gLogFile)
+
 proc openLog*(path, banner: string) =
   ## A fresh log each run: the interesting failure is always this one.
+  closeLog()
   gLogPath = path
+  gLogDropped = 0
   discard writeTextFile(gLogPath, banner)
+
+proc fmtElapsed*(ms: int): string =
+  ## Milliseconds since start as `h:mm:ss.mmm`, so a log a person reads shows a
+  ## clock rather than a raw millisecond count. `aowlterm` already splits the
+  ## stamp on `"] "`, so it displays this verbatim with no change.
+  let h = ms div 3600000
+  let m = (ms div 60000) mod 60
+  let s = (ms div 1000) mod 60
+  let mm = ms mod 1000
+  func p2(n: int): string = (if n < 10: "0" else: "") & $n
+  func p3(n: int): string =
+    (if n < 100: (if n < 10: "00" else: "0") else: "") & $n
+  result = $h & ":" & p2(m) & ":" & p2(s) & "." & p3(mm)
+
+# ------------------------------------------------------------- breadcrumbs
+#
+# A crash-proof second witness for the log, and a first-class one, because a
+# mod has already had to hand-roll this and got the path wrong -- it wrote one
+# directory above where it said it did, and the run was briefly read as "no
+# crumbs were written" when the crumbs were fine.
+#
+# What makes it a witness rather than a duplicate: it is a DIFFERENT handle,
+# opened at a different moment, truncated once, capped, and written with its
+# own sequence number. If the log's tail and the crumb file's tail disagree,
+# the number of the last crumb says how far execution actually got -- which is
+# exactly the question "it dies at X" has been answered with, using the log
+# alone, for the whole life of this project.
+#
+# OFF by default. Armed by the host from a flag, and the host logs the value it
+# actually read, because a default is not a value.
+
+var gCrumbPath = ""
+var gCrumbCap = 0
+var gCrumbSeq = 0
+var gCrumbFile: File = default(File)
+var gCrumbOpen = false
+var gCrumbDead = false
+
+proc crumbsArmed*(): bool = gCrumbPath.len > 0 and not gCrumbDead
+
+proc crumbArm*(path: string; cap: int): string =
+  ## Arm the breadcrumb file. Returns "" on success, or the reason it refused.
+  ##
+  ## The path must be ABSOLUTE. That is the whole reason this returns a string
+  ## instead of nothing: the hand-rolled version took a relative path, resolved
+  ## it against a working directory nobody had established, and wrote a real
+  ## file somewhere nobody looked. A relative path here is refused loudly, not
+  ## resolved helpfully.
+  gCrumbPath = ""
+  gCrumbDead = false
+  gCrumbSeq = 0
+  if path.len < 3:
+    return "the breadcrumb path is too short to be absolute: '" & path & "'"
+  let absDrive = path[1] == ':' and (path[2] == '\\' or path[2] == '/')
+  let absUnc = path[0] == '\\' and path[1] == '\\'
+  let absRoot = path[0] == '/'
+  if not (absDrive or absUnc or absRoot):
+    return "the breadcrumb path must be absolute, and '" & path & "' is not"
+  if cap <= 0:
+    return "the breadcrumb cap must be positive, not " & $cap
+  gCrumbPath = path
+  gCrumbCap = cap
+  result = ""
+
+proc crumb*(tag: string) =
+  ## One numbered record, on disk before this returns.
+  ##
+  ## Costs one bool test when disarmed, which is why `logLine` may call it
+  ## unconditionally. When armed it costs a `flushFile` -- 2.4 us/record
+  ## measured by `tests/logtail.c`, the same price the log sink pays.
+  ##
+  ## Capped: at the cap it writes one last line saying so and disarms itself,
+  ## so a per-frame crumb cannot fill a disk overnight. Truncate-on-first-write
+  ## rather than at arm time, so arming costs nothing and a run that never
+  ## crumbs leaves the previous run's file alone to be read.
+  if gCrumbPath.len == 0 or gCrumbDead:
+    return
+  if not gCrumbOpen:
+    if not open(gCrumbFile, gCrumbPath, fmWrite):
+      # Nowhere to complain to that is more reliable than this file was.
+      gCrumbDead = true
+      return
+    gCrumbOpen = true
+  inc gCrumbSeq
+  if gCrumbSeq > gCrumbCap:
+    write(gCrumbFile, "crumbs capped at " & $gCrumbCap & "; no more" & NL)
+    flushFile(gCrumbFile)
+    gCrumbDead = true
+    return
+  write(gCrumbFile, $gCrumbSeq & " [" & fmtElapsed(int(elapsedMs())) & "] " &
+        tag & NL)
+  flushFile(gCrumbFile)
+
+proc crumbCount*(): int = gCrumbSeq
 
 type
   LogSinkFn* = nil proc (level, msg: string)
@@ -455,33 +566,64 @@ proc setLogSink*(fn: LogSinkFn) =
   ## before, and a host that installs one still gets the file if it opened one.
   gLogSink = fn
 
-proc fmtElapsed*(ms: int): string =
-  ## Milliseconds since start as `h:mm:ss.mmm`, so a log a person reads shows a
-  ## clock rather than a raw millisecond count. `aowlterm` already splits the
-  ## stamp on `"] "`, so it displays this verbatim with no change.
-  let h = ms div 3600000
-  let m = (ms div 60000) mod 60
-  let s = (ms div 1000) mod 60
-  let mm = ms mod 1000
-  func p2(n: int): string = (if n < 10: "0" else: "") & $n
-  func p3(n: int): string =
-    (if n < 100: (if n < 10: "00" else: "0") else: "") & $n
-  result = $h & ":" & p2(m) & ":" & p2(s) & "." & p3(mm)
+proc sinkWrite(text: string) =
+  ## One line to the log file, left OUTSIDE this process before returning.
+  ##
+  ## The handle is opened once and held. It used to be opened, written and
+  ## closed per line, on the reasoning that a host which takes the process down
+  ## with it needs a log that survives that -- which is true, and which
+  ## close-per-line does achieve. It is not the cheapest way to achieve it.
+  ##
+  ## MEASURED, `tests/logtail.c` on this machine, 2000 records each:
+  ##   open/write/close per line        113.8 us/record  survives a hard death
+  ##   held handle + flush                2.4 us/record  survives a hard death
+  ##   held handle, no flush              0.3 us/record  LOSES EVERYTHING
+  ##   held handle + FlushFileBuffers  4985.4 us/record  survives a hard death
+  ##
+  ## So: hold the handle and `flushFile` every line. `flushFile` is one
+  ## `WriteFile` of the pending bytes on nimony's native IO, or `fflush` on the
+  ## libc path; either way the bytes are out of this process and in the OS file
+  ## cache, which outlives it. Only losing the machine loses them -- which is
+  ## what the 5 ms `FlushFileBuffers` column buys, at a price nothing on the
+  ## Unity main thread may pay.
+  ##
+  ## The 47x is not cosmetic: this sink runs on the Unity thread, and a boot
+  ## that logs 800 lines spent 91 ms of frame time inside `CreateFileW` alone.
+  ##
+  ## One behaviour change that is not a bug and will look like one: the handle
+  ## is held for the life of the process, opened `FILE_SHARE_READ` and
+  ## `FILE_SHARE_WRITE` but NOT `FILE_SHARE_DELETE`. Reading the log while the
+  ## client runs is unaffected -- `tools/hostlog.py` opens read-only. DELETING
+  ## it mid-run now fails, where before there was a window between two lines in
+  ## which it succeeded and the host silently began a second file. Losing half
+  ## a run into an unlinked inode was never the better answer.
+  if not gLogFileOpen:
+    if open(gLogFile, gLogPath, fmAppend):
+      gLogFileOpen = true
+    else:
+      # Nothing to write with, and nowhere to say so. Count it; the next line
+      # that does get through reports the run.
+      inc gLogDropped
+      return
+  if gLogDropped > 0:
+    let missed = gLogDropped
+    gLogDropped = 0
+    write(gLogFile, "[" & fmtElapsed(int(elapsedMs())) &
+          "] warn   the log sink could not open " & gLogPath & " for " &
+          $missed & " line(s); those lines are MISSING from this file" & NL)
+  write(gLogFile, text)
+  flushFile(gLogFile)
 
 proc logLine*(level, msg: string) =
-  ## Opened, written and closed per line, never buffered. A host that takes the
-  ## process down with it is a host whose log has to survive that.
+  ## Never buffered across a return: by the time this returns, the line has
+  ## left the process. See `sinkWrite`, and `crumb` for the second witness.
   if gLogSink != nil:
     gLogSink(level, msg)
+  crumb(level & " " & msg)
   if gLogPath.len == 0:
     return
-  let text = "[" & fmtElapsed(int(elapsedMs())) & "] " & level & "  " & msg & "\n"
-  var f: File
-  if open(f, gLogPath, fmAppend):
-    try:
-      write(f, text)
-    finally:
-      close(f)
+  let text = "[" & fmtElapsed(int(elapsedMs())) & "] " & level & "  " & msg & NL
+  sinkWrite(text)
 
 proc info*(msg: string) = logLine("info ", msg)
 proc warn*(msg: string) = logLine("warn ", msg)
