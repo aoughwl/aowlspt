@@ -49,6 +49,7 @@ import aowlspt/server
 import aowlspt/json
 import store
 import rand
+import raid
 
 type
   Spoken* = object
@@ -255,7 +256,13 @@ proc locationName*(language, location: string): string =
   ## result says `RezervBase` where the database key is `rezervbase`.
   if location.len == 0:
     return ""
-  var name = whole(dbRead("locations." & location & ".base.Name").raw).asText("")
+  # The lower-cased retry handled `RezervBase` -> `rezervbase` and nothing
+  # else: the client's `Woods` is keyed `bigmap`, `Streets of Tarkov` is
+  # `tarkovstreets`, and lower-casing reaches neither. `canonicalLocation`
+  # (emu/raid) is the ONE resolver and covers all of them; the lower-cased
+  # try is kept only as a last resort for an id the index has not indexed.
+  var name = whole(dbRead("locations." & canonicalLocation(location) &
+                          ".base.Name").raw).asText("")
   if name.len == 0:
     name = whole(dbRead("locations." & toLowerAscii(location) &
                         ".base.Name").raw).asText("")

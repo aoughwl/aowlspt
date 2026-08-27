@@ -2094,9 +2094,16 @@ proc raidMapFor(session, body: string): string =
   ## must not be scored against a guess: `advanceQuestsAfterRaid` treats "" as
   ## "no location qualifier matched", which loses the map-specific progress of
   ## that one raid. Guessing loses it *and* credits the wrong map.
-  result = raidLocation(body)
+  # CANONICALISED before it leaves here. Quest `Location` conditions carry
+  # database keys as their target (`bigmap`, `interchange`); the session
+  # remembered what the CLIENT said (`Woods`, `Interchange`), and `listHas`
+  # is an exact string compare, so on 13 of 19 maps every map-qualified
+  # counter compared two spellings of the same map and refused. Same defect
+  # as the empty-loot one, in a place whose only symptom is quest progress
+  # that does not arrive.
+  result = canonicalLocation(raidLocation(body))
   if result.len == 0:
-    result = raidLocationFor(session)
+    result = canonicalLocation(raidLocationFor(session))
     if result.len == 0:
       warn "the raid that just ended has no map: the result body does not " &
            "carry one and the session did not record one, so map-qualified " &
@@ -2548,10 +2555,15 @@ proc onBotLimit(url, body, session: string): string =
   if loc.len == 0:
     loc = field(body, "locationId").asText("")
   if loc.len > 0:
-    let pve = dbRead("locations." & loc & ".base.BotMaxPvE")
+    # Through the ONE resolver: the client sends `base.Id` ("Interchange")
+    # and the table is keyed by the database key ("interchange"), so a raw
+    # read missed on 13 of 19 maps and silently returned the DEFAULT bot cap
+    # instead of the map's own -- a wrong number, not an error.
+    let key = canonicalLocation(loc)
+    let pve = dbRead("locations." & key & ".base.BotMaxPvE")
     if pve.ok and pve.asInt(0) > 0:
       return envelope(raw($pve.asInt(0)))
-    let cap = dbRead("locations." & loc & ".base.BotMax")
+    let cap = dbRead("locations." & key & ".base.BotMax")
     if cap.ok and cap.asInt(0) > 0:
       return envelope(raw($cap.asInt(0)))
   result = envelope(raw($gDefaultBotLimit))
