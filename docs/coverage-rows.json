@@ -25,7 +25,11 @@
     "/aowlspt/tarkov/launcher/ping",
     "/aowlspt/tarkov/launcher/profiles",
     "/aowlspt/tarkov/launcher/profile/create",
-    "/aowlspt/tarkov/launcher/profile/select"
+    "/aowlspt/tarkov/launcher/profile/select",
+    "/aowlspt/tarkov/orbit/plan",
+    "/aowlspt/settings/",
+    "/files/",
+    "/regular/files/"
   ],
   "post1OnlyRoutes": [
     "/client/battle-pass/active",
@@ -46,7 +50,8 @@
     "/client/tutor-game/check",
     "/client/variable/group",
     "/v2/client/game/profiles",
-    "/v2/client/shop/status"
+    "/v2/client/shop/status",
+    "/client/ending/list"
   ],
   "excludedCallbackClasses": {
     "LauncherV2Callbacks": "the SPT launcher's own plumbing",
@@ -80,7 +85,7 @@
     {"callback": "Data", "op": "GetHideoutAreas", "routes": ["/client/hideout/areas"], "actions": []},
     {"callback": "Data", "op": "GetHideoutProduction", "routes": ["/client/hideout/production/recipes"], "actions": []},
     {"callback": "Data", "op": "GetHideoutSettings", "routes": ["/client/hideout/settings"], "actions": []},
-    {"callback": "Data", "op": "GetItemPrices", "routes": ["/client/items/prices/"], "actions": []},
+    {"callback": "Data", "op": "GetItemPrices", "routes": ["/client/items/prices/", "/client/items/prices"], "actions": []},
     {"callback": "Data", "op": "GetLocalesGlobal", "routes": ["/client/locale/"], "actions": []},
     {"callback": "Data", "op": "GetLocalesLanguages", "routes": ["/client/languages"], "actions": []},
     {"callback": "Data", "op": "GetLocalesMenu", "routes": ["/client/menu/locale/"], "actions": []},
@@ -89,7 +94,7 @@
     {"callback": "Data", "op": "GetTemplateHandbook", "routes": ["/client/handbook/templates"], "actions": []},
     {"callback": "Data", "op": "GetTemplateItems", "routes": ["/client/items"], "actions": []},
     {"callback": "Data", "op": "GetTemplateSuits", "routes": ["/client/customization"], "actions": []},
-    {"callback": "Data", "op": "GetDialogue", "routes": [], "actions": [], "note": "SPT's chat-command templates, `templates/dialogue.json`, which the importer does not bring"},
+    {"callback": "Data", "op": "GetDialogue", "routes": ["/client/dialogue"], "actions": [], "note": "SPT's chat-command templates, `templates/dialogue.json`, which the importer does not bring"},
     {"callback": "Data", "op": "GetTemplateCharacter", "routes": [], "actions": [], "note": "the starting-profile templates; this server synthesises its own"},
     {"callback": "Dialogue", "op": "GetAllAttachments", "routes": ["/client/mail/dialog/getAllAttachments"], "actions": []},
     {"callback": "Dialogue", "op": "GetChatServerList", "routes": ["/client/chatServer/list"], "actions": []},
@@ -186,7 +191,7 @@
     {"callback": "Inventory", "op": "SortInventory", "routes": [], "actions": [], "note": "no arm; nothing stores a sort order"},
     {"callback": "ItemEvent", "op": "HandleEvents", "routes": ["/client/game/profile/items/moving"], "actions": []},
     {"callback": "Location", "op": "GetLocationData", "routes": ["/client/locations", "/client/location/getLocalloot"], "actions": []},
-    {"callback": "Location", "op": "GetAirdropLoot", "routes": ["/client/location/getAirdropLoot"], "actions": []},
+    {"callback": "Location", "op": "GetAirdropLoot", "routes": ["/client/location/getAirdropLoot", "/client/airdrop/loot"], "actions": []},
     {"callback": "Match", "op": "StartLocalRaidAsync", "routes": ["/client/match/local/start"], "actions": []},
     {"callback": "Match", "op": "EndLocalRaidAsync", "routes": ["/client/match/local/end"], "actions": []},
     {"callback": "Match", "op": "GetRaidConfiguration", "routes": ["/client/raid/configuration"], "actions": []},
@@ -204,7 +209,7 @@
     {"callback": "Match", "op": "CancelGroupInvite", "routes": [], "actions": [], "note": "group and matchmaking on a single-player server"},
     {"callback": "Match", "op": "DeclineGroupInvite", "routes": [], "actions": [], "note": "group and matchmaking on a single-player server"},
     {"callback": "Match", "op": "DeleteGroup", "routes": [], "actions": [], "note": "group and matchmaking on a single-player server"},
-    {"callback": "Match", "op": "JoinMatch", "routes": [], "actions": [], "note": "group and matchmaking on a single-player server"},
+    {"callback": "Match", "op": "JoinMatch", "routes": ["/client/match/join"], "actions": [], "note": "group and matchmaking on a single-player server"},
     {"callback": "Match", "op": "LeaveGroup", "routes": [], "actions": [], "note": "group and matchmaking on a single-player server"},
     {"callback": "Match", "op": "NotRaidReady", "routes": [], "actions": [], "note": "group and matchmaking on a single-player server"},
     {"callback": "Match", "op": "RaidReady", "routes": [], "actions": [], "note": "group and matchmaking on a single-player server"},
