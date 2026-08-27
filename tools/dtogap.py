@@ -108,6 +108,73 @@ ROUTES = {
     "/client/match/local/end":             (None, "n/a",
                                             "client SENDS this (LocalRaidEnded(settings,results,lostInsured,"
                                             "transferItems)); no named response class"),
+
+    # ---------------------------------------------------------------------
+    # THE REST OF THE SURFACE.
+    #
+    # The 13 entries above were the whole map. The client's own backend_000.log
+    # -- the authority, not this table -- shows it calls 70 distinct routes.
+    # Everything below was ranked by --whichdto against a payload OUR backend
+    # served (tools/oursample.py now samples all 70), then kept only where the
+    # WIRE-key overlap was decisive. The score is quoted in the note, because
+    # a mapping is a lead to confirm and not a measurement:
+    #
+    #   named   score >= 0.90 -- effectively every key accounted for
+    #   weak    score 0.60-0.89 -- plausible; treat any diff as INCONCLUSIVE
+    #
+    # `weak` is not decoration. /client/quest/getMainQuestNotesList ranks
+    # EFT.Quests.QuestNoteTemplate at 0.75, whose Links member is
+    # IEnumerable<QuestNoteLink> (measured, tools/fldoff.py), and our payload
+    # sends `links` as an OBJECT -- which reads as a fatal object-into-array.
+    # It is not one. That payload is capture seq 074, VERBATIM BSG TRAFFIC, and
+    # across every session in D:\Aowlspt\Logs the client has never once thrown
+    # on this route (only 404s, from before it was served). So the DTO mapping
+    # is wrong, exactly as /client/locations and /client/weather were. Marked
+    # n/a rather than left to generate a confident false FATAL.
+    # ---------------------------------------------------------------------
+    "/client/profile/status":              ("EFT.ProfileStatusData", "named", "1.00"),
+    "/client/seasonal-perks/list":         ("EFT.SeasonalPerks.SeasonalPerksData", "named", "1.00"),
+    "/client/match/group/current":         ("EFT.MatchmakerGroupStatus`1", "named", "1.00"),
+    "/client/tape/list":                   ("EFT.InventoryLogic.SubtitleDTO", "named", "1.00"),
+    "/client/subtitle-track/list":         ("EFT.InventoryLogic.SubtitleDTO", "named", "1.00"),
+    "/client/hideout/settings":            ("EFT.Hideout.HideoutSettings", "named", "1.00"),
+    "/client/hideout/qte/list":            ("UI.Hideout.QteHandleData", "named", "1.00"),
+    "/client/hideout/production/recipes":  ("EFT.Hideout.ProductionSchemesCollection", "named", "1.00"),
+    "/client/hideout/customization/offer/list":
+                                           ("EFT.Hideout.HideoutCustomizationOffersCollection", "named", "1.00"),
+    "/client/hideout/areas":               ("EFT.AreaTemplateSerializer", "named", "0.91"),
+    "/client/handbook/templates":          ("EFT.HandBook.Handbook", "named", "1.00"),
+    "/client/game/bot/generate":           ("EFT.ProfileDescriptor", "named",
+                                            "1.00; response is an ARRAY of bot profiles"),
+    "/client/friends":                     ("ChatShared.ChatContacts", "named", "1.00"),
+    "/client/builds/list":                 ("EFT.BuildsResponse", "named", "1.00"),
+    "/client/server/list":                 ("EFT.ProfileStatus", "named", "1.00"),
+    "/client/ragfair/find":                ("EFT.UI.Ragfair.OffersList", "named", "1.00"),
+    "/client/game/mode":                   ("GameModeResponse", "named", "1.00"),
+    "/client/items/prices":                ("EFT.SupplyData", "named",
+                                            "1.00; real route is items/prices/<traderId>"),
+    "/client/checkVersion":                ("EFT.CheckVersionData", "named", "1.00"),
+    "/client/match/local/start":           ("JsonType.LocalSettings", "named", "1.00"),
+    "/client/getMetricsConfig":            ("EFT.Utilities.ClientMetricsConfig", "named", "1.00"),
+    "/client/match/join":                  ("EFT.ProfileStatusData", "named", "1.00"),
+    "/client/mail/dialog/view":            ("ChatShared.ChatMessagesList", "named", "1.00"),
+    "/client/mail/dialog/getAllAttachments":
+                                           ("ChatShared.ChatMessagesList", "named", "1.00"),
+    "/client/notifier/channel/create":     ("JsonType.NotifierParams", "weak", "0.80"),
+    "/client/game/config":                 ("JsonType.LoginDataResponse", "weak", "0.67"),
+    "/client/quest/list":                  ("EFT.Quests.QuestTemplate", "weak",
+                                            "0.83; ties exactly with RepeatableQuestTemplate, which shares "
+                                            "the same 25 keys -- the tie is not broken by key overlap"),
+
+    # No single top-level DTO. Saying so is the result; forcing one is not.
+    "/client/locale/en":                   (None, "n/a",
+                                            "38,296 localisation strings keyed by id, not a DTO"),
+    "/client/menu/locale/en":              (None, "n/a", "keyed localisation dict, not a DTO"),
+    "/client/customization":               (None, "n/a",
+                                            "728 customization templates keyed by id, like /client/items"),
+    "/client/quest/getMainQuestNotesList": (None, "n/a",
+                                            "QuestNoteTemplate ranks 0.75 and CONTRADICTS a verbatim BSG "
+                                            "capture; see the note above. Unmapped, not passed."),
 }
 
 # Generic type names Newtonsoft populates IN PLACE through a get-only
