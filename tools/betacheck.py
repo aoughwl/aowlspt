@@ -1009,7 +1009,9 @@ def check_settings_write_client(w, mut):
         return
     mods = (idx or {}).get("mods") if isinstance(idx, dict) else None
     if not isinstance(mods, list) or not mods:
+        record("settings-write-client", INCONC,
                "the settings index named no mods")
+        return
 
     tried = []
     for m in mods:
@@ -1017,15 +1019,19 @@ def check_settings_write_client(w, mut):
             continue
         guid = m.get("guid") or ""
         if not guid:
+            continue
         rows, why = _settings_rows(w.port, guid)
         if rows is None:
             tried.append("%s: %s" % (guid, why))
+            continue
         if not rows:
             # The `waiting` reply: published in the nav, page not pushed yet.
             tried.append("%s: no rows yet (%s)" % (guid, why or "no reason given"))
+            continue
         key, cur = _writable_row(rows)
         if not key:
             tried.append("%s: no implemented bool row" % guid)
+            continue
 
         want = not cur
         wire = "true" if want else "false"
@@ -1039,6 +1045,7 @@ def check_settings_write_client(w, mut):
             waited += poll_s
             after, why2 = _settings_rows(w.port, guid)
             if after is None:
+                continue
             for r in after:
                 if isinstance(r, dict) and r.get("key") == key:
                     got = r.get("value")
@@ -1067,7 +1074,9 @@ def check_settings_write_client(w, mut):
                    "process never applied it (check the host log's `client "
                    "settings bridge:` lines for the refusal)"
                    % (guid, key, wire, st2, json.dumps(got), window_s))
+        return
 
+    record("settings-write-client", INCONC,
            "no client-side page offered an implemented bool row to write (%s)"
            % ("; ".join(tried) if tried else "no client-side pages at all -- "
               "the game process has not published, so this was NOT checked"))
@@ -1081,6 +1090,7 @@ def check_settings_write_client(w, mut):
 # "Could not cast or convert from System.Boolean" inside ExecuteRequest and the
 # RAID LOAD died -- not the inbox.  Every check we had asked "is the member
 # there?", and it was.
+#
 # So this asserts a NEGATIVE about the FINISHED payload: no message in the
 # served inbox carries a `systemData` that is anything other than an object or
 # null (absent is fine -- a reference member left null is what BSG's own
@@ -1092,6 +1102,7 @@ def check_mail_types(w, mut):
     st, doc, text = make_profile(w, "Mail" + tag, "standard")
     if doc is None or not session_of(doc):
         record("mail-types", INCONC, "no profile to post mail to")
+        return
     sess = session_of(doc)
     w.call("/client/game/profile/select", {"uid": sess}, sess)
     # A raid that hands an item over is the cheapest way to make the server
@@ -1109,16 +1120,21 @@ def check_mail_types(w, mut):
     if doc is None:
         record("mail-types", INCONC,
                "mail/dialog/list did not parse as JSON (%d bytes)" % len(text))
+        return
     rows = envelope(doc)
     if not isinstance(rows, list) or not rows:
+        record("mail-types", INCONC,
                "the served inbox is empty, so no message TYPE was examined")
+        return
     bad = []
     for d in rows:
         m = d.get("message")
         if not isinstance(m, dict):
             bad.append("dialog %r has no message object" % d.get("_id"))
+            continue
         if "systemData" not in m:
             sd, kind = None, "absent"
+        else:
             sd = m["systemData"]
             kind = ("null" if sd is None else
                     "object" if isinstance(sd, dict) else type(sd).__name__)
@@ -1132,11 +1148,15 @@ def check_mail_types(w, mut):
     elif mut == "systemdata":
         record("mail-types", OK,
                "every message.systemData is a boolean (mutated expectation)")
+    else:
+        record("mail-types", OK,
                "%d dialog(s): every message.systemData is object/null/absent, "
                "never a scalar" % len(rows))
 
 
+# ---------------------------------------------------------------------------
 # 16. profile/list: Dictionary members must be OBJECTS, never empty arrays
+#
 # Same class as check 15 above.  Six members of `EFT.ProfileDescriptor` (and of
 # its `Hideout`) are declared `Dictionary<...>` -- measured with
 # tools/fldoff.py -- and this server emitted `[]` for every one of them,
@@ -1144,6 +1164,7 @@ def check_mail_types(w, mut):
 # degrade on a Dictionary that arrives as a JSON array: it throws, inside the
 # client's own ExecuteRequest, which is how `systemData: false` killed a raid
 # load rather than an inbox.
+#
 # This asserts a NEGATIVE about the FINISHED served payload: no member in
 # DICT_MEMBERS is a list.  Absent is INCONCLUSIVE for that member rather than a
 # pass -- "I could not look" is not a pass -- and a non-dict scalar is a FAIL.
@@ -1160,11 +1181,17 @@ DICT_MEMBERS = [
 
 
 def check_dict_shapes(w, mut):
+    tag = "%04d" % random.randrange(10000)
     st, doc, text = make_profile(w, "Dict" + tag, "standard")
+    if doc is None or not session_of(doc):
         record("dict-shapes", INCONC, "no profile to read")
+        return
+    sess = session_of(doc)
+    w.call("/client/game/profile/select", {"uid": sess}, sess)
     p, why = read_back(w, sess)
     if p is None:
         record("dict-shapes", INCONC, why)
+        return
     want_list = (mut == "dictshapes")
     bad, missing, seen = [], [], 0
     for parent, name in DICT_MEMBERS:
@@ -1172,27 +1199,35 @@ def check_dict_shapes(w, mut):
         label = name if parent is None else parent + "." + name
         if not isinstance(holder, dict) or name not in holder:
             missing.append(label)
+            continue
         seen += 1
         v = holder[name]
         ok = isinstance(v, list) if want_list else isinstance(v, dict)
+        if not ok:
             bad.append("%s is %s (%s)" % (label, type(v).__name__,
                                           json.dumps(v)[:40]))
+    if bad:
         record("dict-shapes", FAIL, "; ".join(bad))
     elif seen == 0:
         record("dict-shapes", INCONC,
                "none of the %d Dictionary members were on the wire: %s"
                % (len(DICT_MEMBERS), ", ".join(missing)))
     elif missing:
+        record("dict-shapes", INCONC,
                "%d/%d checked; absent and therefore not examined: %s"
                % (seen, len(DICT_MEMBERS), ", ".join(missing)))
     elif want_list:
         record("dict-shapes", OK,
                "all %d Dictionary members are arrays (mutated expectation)" % seen)
+    else:
+        record("dict-shapes", OK,
                "all %d declared-Dictionary members are JSON objects, "
                "never arrays" % seen)
 
 
+# ---------------------------------------------------------------------------
 # 17. /client/weather: `weather` is ONE object, and that is BSG's own shape
+#
 # This is the check that stops a future "fix" from breaking a working route.
 # An audit read `/client/weather` against `JsonType.WeatherResponse`, whose
 # `Weathers` is `WeatherNode[]`, and reported that we send an object where an
@@ -1201,22 +1236,31 @@ def check_dict_shapes(w, mut):
 # WeatherNode, Acceleration, Date, Time -- a 5/5 key match against the served
 # body, versus 2/5 for WeatherResponse), and BSG's OWN captured response
 # raid1/responses/131.json sends `"weather": { ... }`, an object.
+#
 # So the assertion is: `data.weather` is a JSON object, exactly as the capture
 # has it.  `--mutate weatherarray` demands an array -- the shape the wrong DTO
 # implied -- so a correct server must go red.
 def check_weather_shape(w, mut):
     st, doc, text = w.call("/client/weather", {})
+    if doc is None:
         record("weather-shape", INCONC,
                "/client/weather did not parse as JSON (%d bytes)" % len(text))
+        return
     d = envelope(doc)
     if not isinstance(d, dict) or "weather" not in d:
+        record("weather-shape", INCONC,
                "the served body carries no `weather` member to examine")
+        return
     v = d["weather"]
     want_list = (mut == "weatherarray")
+    ok = isinstance(v, list) if want_list else isinstance(v, dict)
+    if not ok:
         record("weather-shape", FAIL,
                "data.weather is %s, not %s" % (type(v).__name__,
                                                "an array" if want_list else "an object"))
+    elif want_list:
         record("weather-shape", OK, "data.weather is an array (mutated expectation)")
+    else:
         record("weather-shape", OK,
                "data.weather is one object with %d members, as BSG capture 131 "
                "sends it" % len(v))
