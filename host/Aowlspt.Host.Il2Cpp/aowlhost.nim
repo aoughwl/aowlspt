@@ -1549,8 +1549,35 @@ proc hostConfigGet(ctx: Il2CppPtr; key: Il2CppPtr; keyLen: int32;
 proc hostConfigSet(ctx: Il2CppPtr; key: Il2CppPtr; keyLen: int32;
                    val: Il2CppPtr; valLen: int32): int32 {.
     exportc: "aowlspt_nim_config_set", cdecl.} =
-  gLastError = "the client host does not write config"
-  result = ErrUnsupported
+  ## Persist one edit into the calling mod's own `config.json`.
+  ##
+  ## This answered `ErrUnsupported` unconditionally, which the settings bridge
+  ## surfaced as "THIS HOST DOES NOT SUPPORT WRITING CONFIG" -- so no
+  ## client-side mod setting could ever be changed from the F12 panel, no
+  ## matter how correctly the panel and the schema behaved. Nothing about the
+  ## client made writing impossible; the entry point was simply never
+  ## implemented, and an honest-sounding refusal made it look deliberate.
+  ##
+  ## The work is `modhost.configWrite`, shared with the other hosts on purpose:
+  ## the backend already had a merge, and its merge INSERTS a flat member for a
+  ## dotted path it cannot find, which on a nested client config
+  ## (`mods/sain/config.json`) writes a key the mod will never read while
+  ## answering `Ok`. `configWrite` refuses that case by status instead.
+  let idx = int(cast[uint](ctx))
+  if idx < 0 or idx >= modhost.modCount():
+    gLastError = "no such mod context"
+    return ErrBadArg
+  let k = readBytes(key, keyLen)
+  let v = readBytes(val, valLen)
+  var err = ""
+  result = modhost.configWrite(idx, k, v, err)
+  if result != StatusOk:
+    gLastError = err
+    # Said out loud, once per failed edit. A refused write that travels back
+    # only as a status code is invisible to whoever is reading the host log
+    # while a player reports "the setting does not stick".
+    warn "config set " & k & " on " & modhost.modGuidOf(idx) &
+         " did not persist: " & err
 
 proc hostDbGet(ctx: Il2CppPtr; path: Il2CppPtr; pathLen: int32;
                outPtr, outLen: Il2CppPtr): int32 {.

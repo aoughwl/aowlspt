@@ -206,6 +206,21 @@ proc onSettings(url, body, session: string): string =
     loadConfig()
   result = declaredSchemaJson().text
 
+proc onSettingsHotApply(key: string) =
+  ## The F12 panel and the route are two transports for ONE question, so
+  ## they end in one apply path -- the same `loadConfig()` the route
+  ## handler above calls.
+  ##
+  ## Without this hook the client settings bridge had no subscriber to
+  ## answer `aowlspt.settings.applyQuery` for `aowl.textures` with; every
+  ## edit made in F12 was reported "the edit is NOT applied". Most of what
+  ## this mod reads is consumed at load (the manifest, the redirect arm),
+  ## so an edit still needs a restart to take full effect -- but the
+  ## in-memory config is refreshed here, and, far more importantly, the
+  ## edit is ACKNOWLEDGED. A mod with nothing to re-apply that stays
+  ## silent is indistinguishable from a broken one.
+  discard key
+  loadConfig()
 # ---------------------------------------------------------------------------
 # Reporting
 # ---------------------------------------------------------------------------
@@ -301,6 +316,7 @@ proc simSelfTest(): Status =
 proc onLoad(): Status =
   loadConfig()
   declareSettings(texturesSchema())
+  onSettingsApplied(onSettingsHotApply)
   discard serve("/aowlspt/settings/" & ModGuid, onSettings)
   success ModName & " " & ModVersion & " loaded on " & hostName()
 

@@ -205,8 +205,35 @@ proc sbApplyPending(reply: string) =
       # NO GUESS. The old text said "the mod may have been unloaded", which was
       # a hypothesis printed as a cause -- and it was wrong for every one of
       # the observed cases, where the mod was loaded and in the nav.
+      # "Cause unknown from here" was honest and it was also a dead end,
+      # so ASK instead of shrugging.
+      #
+      # There are exactly two ways `gSbApply` can be empty: the mod never
+      # subscribed to the apply query (its SDK never reached
+      # `declareSettings`, so no handler exists), or it did answer and the
+      # announce was lost on the way back. Those want opposite fixes and
+      # the log could not tell them apart.
+      #
+      # The page query separates them, because it is subscribed by the
+      # SAME `declareSettings` call, in the same statement block, as the
+      # apply query. A mod that answers PAGE but not APPLY is subscribed
+      # and the loss is on our side; one that answers neither never
+      # subscribed. The probe is read-only -- a page query persists
+      # nothing -- bounded to one emit, and runs only on this failure path.
+      gSbPage = ""
+      gSbCollecting = true
+      hostEmit(SbPageQuery, guid)
+      gSbCollecting = false
+      var why = ""
+      if gSbPage.len == 0:
+        why = "It does not answer " & SbPageQuery & " either, so this mod " &
+              "never subscribed: its SDK did not reach declareSettings."
+      else:
+        why = "It DOES answer " & SbPageQuery & " right now, so it is " &
+              "subscribed and the apply announce was lost between the mod " &
+              "and this bridge -- look at the capture gate, not at the mod."
       sbFault("no subscriber answered " & SbApplyQuery & " for '" & guid &
-              "' -- the edit is NOT applied; cause unknown from here")
+              "' -- the edit is NOT applied. " & why)
     else:
       var okTxt = ""
       discard pathGet(gSbApply, "ok", okTxt)

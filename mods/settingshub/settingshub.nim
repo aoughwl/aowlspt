@@ -40,6 +40,12 @@ const
   IndexRoute = "/aowlspt/settings/spt/index"
   PagePrefix = "/aowlspt/settings/spt/page/"
   ModsIndexRoute = "/aowlspt/settings/index"
+  ClientPublishPeriodMs = 5000
+    ## How long a client-side page may legitimately be missing for. This
+    ## MIRRORS `cSbPeriodMs` in the host bridge (host/Aowlspt.Host.Il2Cpp/
+    ## settingsbridge.nim) -- the two processes cannot share a constant, so
+    ## if that cycle changes, change this, or the panel will call a normal
+    ## wait a failure.
   ClientSyncRoute = "/aowlspt/settings/client/sync"
   ClientPagePrefix = "/aowlspt/settings/"
     ## A FALLBACK prefix, deliberately. `matchRoute` in the backend gives an
@@ -199,7 +205,25 @@ proc onClientPage(url, body, session: string): string =
     want = want.substr(0, want.len - 7)
   let i = clientIndexOf(want)
   if i < 0:
-    return "{\"err\":\"no client mod has pushed a page for this guid\",\"rows\":[]}"
+    # WAITING, not broken -- and the panel must be able to tell them apart.
+    #
+    # A client-side page exists only once the game process has pushed it,
+    # and that bridge runs on a ~5s cycle, so a page opened seconds after
+    # the client came up is legitimately absent for a few seconds. The old
+    # reply called that an `err`, which the panel rendered as an
+    # indefinite spinner: the one state that looks identical to a mod that
+    # will never answer. `waiting` says which it is, and `waitMs` says how
+    # long is reasonable, so the panel can show a bounded wait and then a
+    # real failure.
+    var w = obj()
+    w.put("waiting", true)
+    w.put("guid", want)
+    w.put("waitMs", ClientPublishPeriodMs)
+    w.put("err", "waiting for " & want &
+                 " to publish (client-side, up to " &
+                 $(ClientPublishPeriodMs div 1000) & "s)")
+    w.put("rows", done(arr()))
+    return done(w).text
   if isReset:
     # A reset is an edit like any other from here: the host owns the mod and
     # the mod owns its defaults, so the request is queued with no key and the
