@@ -71,21 +71,124 @@ type
     bloomStrength: float
     vignette: float
     vignetteRadius: float
+    clarity: float
+    vibrance: float
+    shadowDetail: float
+    grain: float
+    grainSize: float
+    dither: float
+    chroma: float
+    bloomThreshold: float
     diag: bool
 
 proc defaultGrade(): Grade =
-  Grade(enabled: true, raidOnly: true, tonemapper: 1, tonemapStrength: 0.85, exposure: 0.0,
-        contrast: 1.05, saturation: 1.05, temperature: 0.0, tint: 0.0,
+  ## The "filmic" preset, spelled out. Anything not overridden below inherits it.
+  Grade(enabled: true, raidOnly: true, tonemapper: 1, tonemapStrength: 0.90, exposure: 0.0,
+        contrast: 1.10, saturation: 1.02, temperature: 0.04, tint: 0.0,
         lift: 0.0, gamma: 1.0, gain: 1.0, shadows: 0.0, highlights: 1.1,
-        sharpness: 0.35, bloom: true, bloomStrength: 0.35, vignette: 0.18,
-        vignetteRadius: 1.0, diag: false)
+        sharpness: 0.35, bloom: true, bloomStrength: 0.30, vignette: 0.20,
+        vignetteRadius: 1.0,
+        clarity: 0.30, vibrance: 0.35, shadowDetail: 0.35,
+        grain: 0.18, grainSize: 1.5, dither: 1.0, chroma: 0.0,
+        bloomThreshold: 0.70,
+        diag: false)
+
+# ---------------------------------------------------------------------------
+# PRESETS - the point of the mod
+#
+# Twenty sliders is a toolkit, not a product. A preset is one word a player
+# types (or picks in the settings panel) that produces a finished look, and one
+# line they can paste into Discord for someone else to reproduce it exactly.
+#
+# Semantics, deliberately unambiguous: while `preset` is anything other than
+# "custom", the preset OWNS every look key and the individual sliders are
+# ignored. Pick "custom" to drive the sliders yourself. The alternative --
+# letting sliders partially override a preset -- means switching preset does
+# not visibly change anything once you have touched one slider, which is the
+# single most common way a preset system feels broken.
+# ---------------------------------------------------------------------------
+
+proc presetNames(): seq[string] =
+  @["custom", "neutral", "filmic", "cold-clinical", "warm-cinematic", "night-owl"]
+
+proc applyPreset(g: var Grade, name: string) =
+  ## Overwrite the look keys from a named preset. `enabled`, `raidOnly` and
+  ## `diag` are NOT touched: they are policy, not a look, and a preset that
+  ## silently re-enables the effect or re-arms the red-tint diagnostic would be
+  ## a nasty surprise.
+  if name == "neutral":
+    # Cleanup only. What BSG shipped, minus the banding and the mush. The
+    # honest baseline: if you cannot tell this apart from vanilla in a
+    # screenshot, it is doing its job.
+    g.tonemapper = 1;  g.tonemapStrength = 0.60
+    g.exposure = 0.0;  g.contrast = 1.02;  g.saturation = 1.0
+    g.temperature = 0.0; g.tint = 0.0
+    g.lift = 0.0; g.gamma = 1.0; g.gain = 1.0
+    g.shadows = 0.0; g.highlights = 1.05
+    g.sharpness = 0.30; g.clarity = 0.15; g.vibrance = 0.15
+    g.shadowDetail = 0.20
+    g.bloom = false; g.bloomStrength = 0.0; g.bloomThreshold = 0.70
+    g.vignette = 0.08; g.vignetteRadius = 1.0
+    g.grain = 0.0; g.grainSize = 1.5; g.dither = 1.0; g.chroma = 0.0
+  elif name == "cold-clinical":
+    # The competitive look: see people. Cool and slightly bright, shadows
+    # pulled open hard, bloom OFF (bloom is glare, glare is a player you did
+    # not see), no vignette (a vignette darkens exactly the screen edge where
+    # peripheral movement lives), no grain.
+    g.tonemapper = 1;  g.tonemapStrength = 0.70
+    g.exposure = 0.15; g.contrast = 1.06;  g.saturation = 0.95
+    g.temperature = -0.18; g.tint = -0.03
+    g.lift = 0.0; g.gamma = 1.04; g.gain = 1.0
+    g.shadows = 0.0; g.highlights = 1.20
+    g.sharpness = 0.50; g.clarity = 0.40; g.vibrance = 0.20
+    g.shadowDetail = 0.55
+    g.bloom = false; g.bloomStrength = 0.0; g.bloomThreshold = 0.80
+    g.vignette = 0.0; g.vignetteRadius = 1.0
+    g.grain = 0.0; g.grainSize = 1.5; g.dither = 1.0; g.chroma = 0.0
+  elif name == "warm-cinematic":
+    # The screenshot look. Warm, contrasty, bloomy, grainy, a touch of lens.
+    # Costs you a little visibility and buys you a frame worth posting.
+    g.tonemapper = 1;  g.tonemapStrength = 1.0
+    g.exposure = 0.0;  g.contrast = 1.12;  g.saturation = 1.05
+    g.temperature = 0.22; g.tint = 0.04
+    g.lift = 0.012; g.gamma = 1.0; g.gain = 1.02
+    g.shadows = 0.0; g.highlights = 1.10
+    g.sharpness = 0.30; g.clarity = 0.28; g.vibrance = 0.35
+    g.shadowDetail = 0.30
+    g.bloom = true; g.bloomStrength = 0.55; g.bloomThreshold = 0.62
+    g.vignette = 0.30; g.vignetteRadius = 1.05
+    g.grain = 0.28; g.grainSize = 1.8; g.dither = 1.0; g.chroma = 0.25
+  elif name == "night-owl":
+    # Dark interiors: Factory basements, Labs, Reserve bunkers, night raids.
+    # Exposure and gamma up, toe re-lifted hard, highlight roll-off raised so a
+    # flashlight does not blow out the wall in front of you, dither raised
+    # because a lifted near-black gradient is where 8-bit banding is worst.
+    g.tonemapper = 1;  g.tonemapStrength = 0.75
+    g.exposure = 0.55; g.contrast = 0.98;  g.saturation = 0.95
+    g.temperature = -0.05; g.tint = 0.0
+    g.lift = 0.0; g.gamma = 1.12; g.gain = 1.0
+    g.shadows = 0.02; g.highlights = 1.30
+    g.sharpness = 0.40; g.clarity = 0.35; g.vibrance = 0.25
+    g.shadowDetail = 0.70
+    g.bloom = true; g.bloomStrength = 0.15; g.bloomThreshold = 0.85
+    g.vignette = 0.05; g.vignetteRadius = 1.0
+    g.grain = 0.10; g.grainSize = 1.5; g.dither = 1.5; g.chroma = 0.0
+  else:
+    discard   # "filmic" is defaultGrade(); "custom" reads the sliders
 
 var gGrade = defaultGrade()
+var gPreset = "filmic"
 
 proc loadConfig() =
   gGrade = defaultGrade()
   gGrade.enabled        = setting("enabled").asBool(gGrade.enabled)
   gGrade.raidOnly       = setting("raidOnly").asBool(gGrade.raidOnly)
+  gGrade.diag           = setting("diag").asBool(gGrade.diag)
+
+  gPreset = setting("preset").asText(gPreset)
+  if gPreset != "custom":
+    applyPreset(gGrade, gPreset)
+    return
   gGrade.tonemapper     = setting("tonemapper").asInt(gGrade.tonemapper)
   gGrade.tonemapStrength = setting("tonemapStrength").asFloat(gGrade.tonemapStrength)
   gGrade.exposure       = setting("exposure").asFloat(gGrade.exposure)
@@ -103,7 +206,14 @@ proc loadConfig() =
   gGrade.bloomStrength  = setting("bloomStrength").asFloat(gGrade.bloomStrength)
   gGrade.vignette       = setting("vignette").asFloat(gGrade.vignette)
   gGrade.vignetteRadius = setting("vignetteRadius").asFloat(gGrade.vignetteRadius)
-  gGrade.diag           = setting("diag").asBool(gGrade.diag)
+  gGrade.clarity        = setting("clarity").asFloat(gGrade.clarity)
+  gGrade.vibrance       = setting("vibrance").asFloat(gGrade.vibrance)
+  gGrade.shadowDetail   = setting("shadowDetail").asFloat(gGrade.shadowDetail)
+  gGrade.grain          = setting("grain").asFloat(gGrade.grain)
+  gGrade.grainSize      = setting("grainSize").asFloat(gGrade.grainSize)
+  gGrade.dither         = setting("dither").asFloat(gGrade.dither)
+  gGrade.chroma         = setting("chroma").asFloat(gGrade.chroma)
+  gGrade.bloomThreshold = setting("bloomThreshold").asFloat(gGrade.bloomThreshold)
 
 # ---------------------------------------------------------------------------
 # Pushing the grade to the host renderer
@@ -137,6 +247,14 @@ proc paramsJson(g: Grade): string =
     ",\"bloomStrength\":" & f(g.bloomStrength) &
     ",\"vignette\":" & f(g.vignette) &
     ",\"vignetteRadius\":" & f(g.vignetteRadius) &
+    ",\"clarity\":" & f(g.clarity) &
+    ",\"vibrance\":" & f(g.vibrance) &
+    ",\"shadowDetail\":" & f(g.shadowDetail) &
+    ",\"grain\":" & f(g.grain) &
+    ",\"grainSize\":" & f(g.grainSize) &
+    ",\"dither\":" & f(g.dither) &
+    ",\"chroma\":" & f(g.chroma) &
+    ",\"bloomThreshold\":" & f(g.bloomThreshold) &
     ",\"diag\":" & (if g.diag: "1" else: "0") & "}"
 
 proc pushGrade(): bool =
@@ -154,6 +272,15 @@ proc pushGrade(): bool =
 
 proc schema(): seq[Setting] =
   @[
+    enumSetting("preset", "Preset", "filmic", presetNames(),
+                category = "Preset",
+                description = "A finished look in one word. While this is " &
+                    "anything but `custom` it OWNS every look slider below " &
+                    "and they are ignored -- pick `custom` to drive them " &
+                    "yourself. neutral = cleanup only; filmic = the default " &
+                    "look; cold-clinical = visibility first (no bloom, no " &
+                    "vignette, shadows pulled open); warm-cinematic = the " &
+                    "screenshot look; night-owl = dark interiors and night raids."),
     boolSetting("enabled", "Enable post-process", true,
                 category = "Post-process",
                 description = "Master switch. Off = the game renders untouched."),
@@ -204,6 +331,44 @@ proc schema(): seq[Setting] =
                  lo = 0.0, hi = 1.0, step = 0.01, category = "Vignette"),
     floatSetting("vignetteRadius", "Vignette radius", 1.0,
                  lo = 0.5, hi = 1.5, step = 0.01, category = "Vignette"),
+    floatSetting("clarity", "Clarity (local contrast)", 0.30,
+                 lo = 0.0, hi = 1.0, step = 0.01, category = "Detail",
+                 description = "Wide-radius local contrast. This is what makes " &
+                     "a flat, hazy frame read as three-dimensional. Costs 4 " &
+                     "texture taps; masked to mid-tones so it cannot crush " &
+                     "blacks or blow highlights."),
+    floatSetting("vibrance", "Vibrance", 0.35,
+                 lo = 0.0, hi = 1.0, step = 0.01, category = "Grade",
+                 description = "Saturation weighted by how unsaturated a pixel " &
+                     "already is. Gains colour separation without turning " &
+                     "foliage neon, which a flat saturation multiplier does. " &
+                     "Free (no extra taps)."),
+    floatSetting("shadowDetail", "Shadow detail (toe lift)", 0.35,
+                 lo = 0.0, hi = 1.0, step = 0.01, category = "Grade",
+                 description = "Re-lifts ONLY the toe after contrast, so " &
+                     "raising contrast does not cost you the ability to see a " &
+                     "player standing in a doorway. Free."),
+    floatSetting("grain", "Film grain", 0.18,
+                 lo = 0.0, hi = 1.0, step = 0.01, category = "Film",
+                 description = "Animated, weighted toward the shadows -- where " &
+                     "real grain lives and where banding lives. Free."),
+    floatSetting("grainSize", "Grain size (px)", 1.5,
+                 lo = 1.0, hi = 4.0, step = 0.1, category = "Film"),
+    floatSetting("dither", "Output dither (LSB)", 1.0,
+                 lo = 0.0, hi = 2.0, step = 0.1, category = "Film",
+                 description = "Triangular-PDF noise at ~1 least-significant " &
+                     "bit before the 8-bit write. The cheapest real win here: " &
+                     "it is the only thing that kills banding in dark " &
+                     "interiors. Leave it on."),
+    floatSetting("chroma", "Chromatic aberration", 0.0,
+                 lo = 0.0, hi = 1.0, step = 0.01, category = "Lens",
+                 description = "Radial, red/blue only, exactly zero at the " &
+                     "screen centre so it never smears what you are aiming " &
+                     "at. Off by default. Costs 2 texture taps."),
+    floatSetting("bloomThreshold", "Bloom threshold", 0.70,
+                 lo = 0.0, hi = 1.0, step = 0.01, category = "Bloom",
+                 description = "Luma knee for the bright pass. Raise it so " &
+                     "only real light sources bloom."),
     boolSetting("diag", "Red-tint diagnostic", false, category = "Debug",
                 description = "Tints the frame red to confirm the blit lands.")]
 
