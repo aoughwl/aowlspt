@@ -230,6 +230,17 @@ const
   WgCrumbBScale       = 30'i32
   WgCrumbBDiagDump    = 31'i32
   WgCrumbBReadback    = 32'i32
+  # Inside duCanvasRootGo -- every one of these is a managed call on a
+  # UnityEngine.Object whose native half may already be gone.
+  WgCrumbRAnchorAlive = 33'i32
+  WgCrumbRRect        = 34'i32
+  WgCrumbRRectAlive   = 35'i32
+  WgCrumbRParent      = 36'i32
+  WgCrumbRParSane     = 37'i32
+  WgCrumbRParGo       = 38'i32
+  WgCrumbRCanvas      = 39'i32
+  WgCrumbRClimb       = 40'i32
+  WgCrumbRDone        = 41'i32
 
 # ---- target indices, mirroring the AOWL_DU_* defines ----
 const
@@ -651,6 +662,40 @@ proc duOk(p: Il2CppPtr; size: int32): bool =
   ## bytes by VirtualQuery -- never a faulting deref to find out.
   result = p != nil and bdSanePtr(p) and cIsReadable(p, size) != 0'i32
 
+proc cDuOffCachedPtr(): int32 {.importc: "aowl_nav_off_cachedptr", nodecl.}
+  ## From `abi/aowlspt_navui.h` (AOWL_NAV_UOBJ_CACHEDPTR = 0x10), never guessed.
+
+proc duUnityAlive(p: Il2CppPtr): bool =
+  ## IS THE NATIVE HALF OF THIS UnityEngine.Object STILL THERE?
+  ##
+  ## THIS IS THE GATE WHOSE ABSENCE WAS THE BUG. `duOk` proves a pointer is
+  ## READABLE. It cannot prove the object is ALIVE, and those are different
+  ## facts: when Unity destroys an object, the managed wrapper survives -- fully
+  ## readable, `duOk` passes -- but `m_CachedPtr` at +0x10 is zeroed. That is
+  ## Unity's famous "fake null": an object that compares equal to null in C# and
+  ## kills the process if you call anything on it.
+  ##
+  ## `Component::get_transform`, `Component::get_gameObject` and
+  ## `Transform::get_parent` -- the three calls `duCanvasRootGo` is built out of
+  ## -- are all IL2CPP internal-call wrappers that dereference `m_CachedPtr`
+  ## with no null check of their own.
+  ##
+  ## MEASURED: the overlay faulted on `duCanvasRootGo` on every refresh, at the
+  ## MAIN MENU, two minutes after boot. The menu rebuild destroys the tree the
+  ## boot-time version label lived in; `PreloaderUI._alphaVersionLabel` still
+  ## points at the destroyed wrapper, `duFindAnchor`'s `duOk` chain passes it
+  ## happily, and the first `get_transform` on it dies inside Unity's C++.
+  ##
+  ## `inspect.nim` learned this first (`iUnityAlive`) but is included AFTER this
+  ## file in the one translation unit, so this is the same gate stated here
+  ## rather than a second opinion. The offset comes from `aowlspt_navui.h`
+  ## (`AOWL_NAV_UOBJ_CACHEDPTR`, 0x10), never from a guess.
+  ##
+  ## This is a plain guarded field read and cannot itself fault.
+  if not duOk(p, cDuOffCachedPtr() + 8'i32):
+    return false
+  result = cReadPtrAt(p, cDuOffCachedPtr()) != nil
+
 # ---------------------------------------------------------------------------
 # Reaching the anchor
 #
@@ -680,6 +725,12 @@ proc duFindAnchor(preloader: Il2CppPtr): Il2CppPtr =
   # because a TMP-shaped pointer that is short is not a TextMeshProUGUI.
   if not duOk(tmp0, cDuOffTmpRect() + 8'i32):
     return
+  # AND ALIVE. `_alphaVersionLabel` keeps pointing at the boot-time label after
+  # the menu rebuild destroys it: readable, `duOk` passes, `m_CachedPtr` zero.
+  # Returning nil here means "not yet" and the caller re-resolves next refresh,
+  # which is the whole fix -- the old code handed the dead wrapper onward.
+  if not duUnityAlive(tmp0):
+    return
   result = tmp0
 
 proc duRectOf(tmp: Il2CppPtr): Il2CppPtr =
@@ -697,6 +748,11 @@ proc duRectOf(tmp: Il2CppPtr): Il2CppPtr =
       return cached
   let fn = cDuFn(DuGetTransform)
   if fn == nil:
+    return
+  # `Component::get_transform` is an internal-call wrapper that dereferences
+  # `m_CachedPtr`. A destroyed TMP is readable and kills the process here, so
+  # liveness is checked before the call, not after.
+  if not duUnityAlive(tmp):
     return
   let t = cDuCallPP(fn, tmp)
   if duOk(t, 0x20'i32):
@@ -2113,83 +2169,146 @@ proc duRectIsSane(t: Il2CppPtr): bool =
   # rect of a plain Transform and the -7,268,628 garbage the dump showed.
   result = w > 32.0 and w < 16384.0 and h > 32.0 and h < 16384.0
 
+## Why the walk refused, in words, for the log. Set at every early return so a
+## refusal is never silent and never generic -- "duCanvasRootGo returned nil" is
+## the kind of message that costs a whole cycle.
+var gDuRootRefusal = "not attempted"
+
 proc duCanvasRootGo(anchor: Il2CppPtr): Il2CppPtr =
   ## The GameObject the clones must be parented under.
   ##
-  ## ROUTE 1, and the one that is right by CONSTRUCTION rather than by lookup:
-  ## the source label's OWN PARENT. A sibling of the version label is on the
-  ## version label's canvas because it is in the version label's subtree -- there
-  ## is no canvas to resolve, nothing to get null, and nothing to be wrong about.
-  ## The live dump names it: `UpperPart`, parent[0], rect 1920x1080.
+  ## EVERY HOP HERE IS A MANAGED CALL ON A UnityEngine.Object, and every one of
+  ## those calls is an IL2CPP internal-call wrapper that dereferences
+  ## `m_CachedPtr` without checking it. So every hop is gated TWICE -- `duOk`
+  ## for readability and `duUnityAlive` for the native half -- and carries its
+  ## own breadcrumb, because the second live run proved that "it faulted
+  ## somewhere in this proc" is not a narrow enough answer to act on.
   ##
-  ## The two previous attempts both went looking for a canvas instead, and both
+  ## THE FAULT THIS FIXES. At the main menu, two minutes after boot, the anchor
+  ## reached through `PreloaderUI._alphaVersionLabel` is a DESTROYED wrapper: the
+  ## menu rebuild replaced the tree it lived in. It is perfectly readable, so the
+  ## old `duOk`-only chain handed it over, and `Component::get_transform` on it
+  ## faulted inside Unity's C++ on every single refresh until the overlay
+  ## switched itself off.
+  ##
+  ## ROUTE 1, right by CONSTRUCTION rather than by lookup: the source label's
+  ## OWN PARENT. A sibling of the version label is on the version label's canvas
+  ## because it is in the version label's subtree -- there is no canvas to
+  ## resolve and nothing to be wrong about. The live dump names it: `UpperPart`,
+  ## parent[0], rect 1920x1080.
+  ##
+  ## The two earlier attempts both went looking for a canvas instead and both
   ## landed the clones on a DIFFERENT canvas from the source:
   ##   * `Transform::get_root` -> the outermost 'Preloader UI', a plain
-  ##     Transform, no canvas above it at all -> a world-space canvas each.
+  ##     Transform with no canvas above it -> a world-space canvas each.
   ##   * "highest sane RectTransform ancestor" -> 'Preloader UI' at parent[3],
   ##     which carries the OUTER canvas, not the nested one the source draws on.
-  ##     renderMode went 2 -> 0, which is why it started rendering, but every
-  ##     text change then dirtied the whole menu canvas instead of the small
-  ##     nested one. That is the remaining stutter.
   ## `Graphic.m_Canvas` was meant to fix that and did not take on the live run,
-  ## so it is demoted to a CROSS-CHECK: we no longer depend on it, we only
-  ## compare against it and say so.
-  ##
-  ## Routes 2 and 3 exist so that a build where `get_parent` is unavailable
-  ## still gets something, and each says which one it used.
+  ## so it is a CROSS-CHECK only: routes 2 and 3 exist so a build where
+  ## `get_parent` is unavailable still gets something, and each says which it
+  ## used.
   result = nil
-  let fnGo = mi2Fn(Mi2GetGameObject)
-  if fnGo == nil:
-    return
   gDuParentRoute = "none"
   gDuParentRect = nil
 
+  let fnGo = mi2Fn(Mi2GetGameObject)
+  if fnGo == nil:
+    gDuRootRefusal = "Component::get_gameObject did not verify on this build"
+    return
+
+  # ---- HOP 0: is the anchor itself still alive? -------------------------
+  # This is the one that was missing. Everything below calls into Unity with
+  # `anchor` or something derived from it as `this`.
+  cWgCrumb(WgCrumbRAnchorAlive)
+  if not duUnityAlive(anchor):
+    gDuRootRefusal = "the anchor (PreloaderUI._alphaVersionLabel) is a " &
+      "DESTROYED UnityEngine.Object -- readable, but m_CachedPtr is 0. This " &
+      "is what a menu rebuild leaves behind; re-resolving next refresh."
+    return
+
   # ---- route 1: the source label's own parent -- a sibling by construction ----
+  cWgCrumb(WgCrumbRRect)
   let rect = duRectOf(anchor)
+  cWgCrumb(WgCrumbRRectAlive)
+  # `rect != nil` was the ONLY check here, and a non-nil pointer is not a live
+  # object. Both gates, before it is ever used as a `this`.
+  let rectOk = duOk(rect, 0x20'i32) and duUnityAlive(rect)
   let fnPar = cDuFn(DuGetParent)
-  if rect != nil and fnPar != nil:
+  if not rectOk:
+    gDuRootRefusal = "the anchor's RectTransform is null, unreadable or " &
+      "destroyed (m_CachedPtr 0)"
+  elif fnPar == nil:
+    gDuRootRefusal = "Transform::get_parent did not verify on this build"
+  else:
+    cWgCrumb(WgCrumbRParent)
     let par = cDuCallPP(fnPar, rect)
-    if duRectIsSane(par):
-      let go = cMi2CallPP(fnGo, par)
-      if duOk(go, 0x20'i32):
-        gDuParentRoute = "the source label's own parent (sibling of the version label)"
-        gDuParentRect = par
-        return go
+    # The parent comes back from Unity and gets the same two gates: a destroyed
+    # parent is exactly as fatal as a destroyed anchor.
+    if duOk(par, 0x20'i32) and duUnityAlive(par):
+      cWgCrumb(WgCrumbRParSane)
+      if duRectIsSane(par):
+        cWgCrumb(WgCrumbRParGo)
+        let go = cMi2CallPP(fnGo, par)
+        if duOk(go, 0x20'i32) and duUnityAlive(go):
+          gDuParentRoute = "the source label's own parent (sibling of the version label)"
+          gDuParentRect = par
+          gDuRootRefusal = ""
+          cWgCrumb(WgCrumbRDone)
+          return go
+        gDuRootRefusal = "route 1: the parent's GameObject is unreadable or destroyed"
+      else:
+        gDuRootRefusal = "route 1: the parent is not a sane RectTransform"
+    else:
+      gDuRootRefusal = "route 1: Transform::get_parent returned null, " &
+        "unreadable or destroyed"
 
   # ---- route 2: the Graphic's own Canvas ----
+  cWgCrumb(WgCrumbRCanvas)
   let canvas = duReadPtrField(anchor, cDuOffTmpGCanvas())
-  if duOk(canvas, 0x20'i32):
+  if duOk(canvas, 0x20'i32) and duUnityAlive(canvas):
     let cgo = cMi2CallPP(fnGo, canvas)
-    if duOk(cgo, 0x20'i32):
+    if duOk(cgo, 0x20'i32) and duUnityAlive(cgo):
       let fnT = mi2Fn(Mi2GoGetTransform)
       if fnT != nil:
         let ct = cMi2CallPP(fnT, cgo)
-        if duRectIsSane(ct):
+        if duOk(ct, 0x20'i32) and duUnityAlive(ct) and duRectIsSane(ct):
           gDuParentRoute = "Graphic.m_Canvas (route 1 was unavailable)"
           gDuParentRect = ct
+          gDuRootRefusal = ""
+          cWgCrumb(WgCrumbRDone)
           return cgo
 
   # ---- route 3: the highest SANE RectTransform ancestor ----
-  if rect == nil or fnPar == nil:
+  cWgCrumb(WgCrumbRClimb)
+  if not rectOk or fnPar == nil:
     return
   var cur = rect
   var best: Il2CppPtr = nil
   var depth = 0
   while depth < 8:
+    # `cur` is gated on EVERY iteration, not only the ones that came back from
+    # get_parent: the first `cur` is the anchor's own rect.
+    if not (duOk(cur, 0x20'i32) and duUnityAlive(cur)):
+      break
     let par = cDuCallPP(fnPar, cur)
-    if not duOk(par, 0x20'i32):
+    if not (duOk(par, 0x20'i32) and duUnityAlive(par)):
       break                            # cur was the outermost root; stop
     if duRectIsSane(par):
       best = par                       # keep climbing; the highest sane one wins
     cur = par
     inc depth
   if best == nil:
+    if gDuRootRefusal.len == 0 or gDuRootRefusal == "not attempted":
+      gDuRootRefusal = "no route produced a parent: no sane RectTransform " &
+        "ancestor within 8 hops"
     return
   let go = cMi2CallPP(fnGo, best)
-  if duOk(go, 0x20'i32):
+  if duOk(go, 0x20'i32) and duUnityAlive(go):
     gDuParentRoute = "highest sane RectTransform ancestor (LAST RESORT -- " &
                      "expect the clones to be on the wrong canvas)"
     gDuParentRect = best
+    gDuRootRefusal = ""
+    cWgCrumb(WgCrumbRDone)
     result = go
 
 proc duNoRaycast(tmp: Il2CppPtr) =
@@ -2371,6 +2490,51 @@ const cDuBuildFaultsBeforeMinimal = 3
 var gDuBuildFaults = 0
 var gDuMinimalLogged = false
 
+var gDuRebuilds = 0
+var gDuRootRefusalLogged = ""
+
+proc duInvalidateIfStale() =
+  ## RE-RESOLVE RATHER THAN CACHE ACROSS A MENU REBUILD.
+  ##
+  ## `gDuAnchorTmp`, `gDuProbe`, `gDuPanel` and `gDuMarks` are all pointers into
+  ## the tree that was live when the pool was built. A menu rebuild destroys
+  ## that tree: the wrappers stay readable, so nothing here looks wrong, and
+  ## every managed call the refresh makes goes into freed native memory.
+  ##
+  ## The version brand and the hide-seasons code both hit this and both had to
+  ## stop caching. The overlay cannot stop caching -- it owns 33 clones -- so it
+  ## does the next thing: it notices, throws the pool away, and builds again.
+  ##
+  ## The clones themselves are NOT destroyed by us. They were children of the
+  ## destroyed tree and Unity has already taken them with it; calling Destroy on
+  ## a dead wrapper is the very fault this is avoiding. Dropping the references
+  ## is the whole teardown.
+  if not gDuBuilt:
+    return
+  if duUnityAlive(gDuAnchorTmp):
+    return
+  inc gDuRebuilds
+  gDuBuilt = false
+  gDuBuildFailed = false
+  gDuPanel = @[]
+  gDuMarks = @[]
+  gDuProbe = DuLabel(tmp: nil, rect: nil, last: cDuUnset, shown: false,
+                     placed: false, pAnchor: "", pX: 0.0, pY: 0.0)
+  gDuProbeWaits = 0
+  gDuCanvasDropTried = false
+  gDuAnchorTmp = nil
+  gDuRootGo = nil
+  # The fault budget is reset too. Those faults were caused by a tree that no
+  # longer exists; carrying them forward would retire the overlay for a
+  # condition that has already been repaired.
+  gDuBuildFaults = 0
+  gDuMinimalLogged = false
+  if gDuRebuilds <= 8 or (gDuRebuilds mod 50) == 0:
+    okLog "debugui: the anchor's native half is gone (menu rebuild #" &
+          $gDuRebuilds & "); dropped the label pool and re-resolving from " &
+          "PreloaderUI on the next refresh. Nothing was destroyed by us."
+
+
 proc duBuild(preloader: Il2CppPtr): bool =
   ## Clone every label the configuration asks for, once. Returns false while the
   ## anchor is not yet reachable (the caller retries next frame) and latches
@@ -2388,6 +2552,15 @@ proc duBuild(preloader: Il2CppPtr): bool =
   cWgCrumb(WgCrumbBRoot)
   let rootGo = duCanvasRootGo(anchor)
   if rootGo == nil:
+    # SAY WHY, and say it once per distinct reason. `duCanvasRootGo` is called
+    # every throttled refresh until it succeeds, so an unconditional log would
+    # be a per-second spam; a log only on CHANGE means the reason appears the
+    # first time and again whenever it becomes a different reason.
+    if gDuRootRefusal != gDuRootRefusalLogged:
+      gDuRootRefusalLogged = gDuRootRefusal
+      warn "debugui: the canvas-root walk declined -- " & gDuRootRefusal &
+           ". No clone was made and nothing in the game was touched; the " &
+           "overlay retries on the next refresh."
     return false
   gDuAnchorTmp = anchor
   gDuRootGo = rootGo
@@ -2700,6 +2873,9 @@ proc debugUiBodyImpl(a: Il2CppPtr): Il2CppPtr {.
   if (gDuFires mod gDuCfg.panelThrottle) != 0:
     return cast[Il2CppPtr](1)
 
+  # Before anything else in the build path: has the tree we cached been
+  # replaced? A menu rebuild leaves every cached pointer readable and dead.
+  duInvalidateIfStale()
   cWgCrumb(WgCrumbBuild)
   if not duBuild(preloader):
     return cast[Il2CppPtr](1)
