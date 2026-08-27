@@ -25,6 +25,10 @@ constant is the failure mode this file exists to avoid.
     traders    accept an all-1s loyalty distribution as gated
     tradersinfo  accept an empty TradersInfo
     edition    compare EoD against the standard template
+    quests     describe the startable quests as Locked, then accept them
+    queststatus  strip the `status` key, as the stored SPT templates do
+    hideout    remove area 21 from the profile, as the old constant did
+    fence      report Fence's generated assort as empty
 """
 
 import argparse
@@ -38,6 +42,7 @@ import zlib
 OK, FAIL, INCONC = "PASS", "FAIL", "INCONCLUSIVE"
 JAEGER = "5c0647fdd443bc2504c2d371"
 PRAPOR = "54cb50c76803fa8b248b4571"
+FENCE = "579dc571d53a0658a154fbec"
 
 results = []
 
@@ -156,6 +161,8 @@ def main():
     mut = a.mutate
 
     tag = "%04d" % random.randrange(10000)
+    std_session = ""
+    std_profile = None
 
     # ---------------------------------------------------------------- 1 + 2
     std_char, std_trader = spt_template(a.spt, "Standard", "usec")
@@ -174,7 +181,9 @@ def main():
             record("inventory", INCONC,
                    "create gave no profile id: %s" % json.dumps(doc)[:160])
             session = ""
+        std_session = session
         p, why = read_back(w, session) if session else (None, "no session")
+        std_profile = p
         if p is None:
             record("inventory", INCONC, why)
             record("edition", INCONC, why)
@@ -310,6 +319,177 @@ def main():
                 record("loyalty-gate", OK,
                        "%d entries, distribution %s" %
                        (len(vals), json.dumps(hist, sort_keys=True)))
+
+    # ----------------------------------------------------------------- 4
+    # BLOCKER 1 -- a fresh profile with no startable quest.
+    #
+    # Two independent negatives, because the cheap one cannot fail for the
+    # right reason on its own:
+    #
+    #   (a) no quest is served WITHOUT a `status` key.  A missing key and
+    #       `status: 0` are different documents to a deserialiser, and the
+    #       stored SPT templates omit the key on 50 of 558.
+    #   (b) NO QUEST THE SERVER WOULD ACCEPT IS SERVED AS LOCKED.  This is the
+    #       one that matters and the one that can fail: it asks the server to
+    #       accept quests it has just described as unstartable, and every
+    #       acceptance is a contradiction in what it served.
+    #
+    # (b) mutates the profile it runs against, so it gets its OWN profile.
+    st, doc, text = make_profile(w, "Quest" + tag, "standard")
+    qsession = session_of(doc) if doc else ""
+    if qsession:
+        st, doc, text = w.call("/client/quest/list", {}, qsession)
+    else:
+        doc, text = None, ""
+    quests = envelope(doc) if doc else None
+    if not isinstance(quests, list) or not quests:
+        record("quest-entry", INCONC,
+               "/client/quest/list did not answer a non-empty array "
+               "(%d bytes)" % len(text))
+    else:
+        nokey = [q.get("_id") for q in quests if "status" not in q]
+        avail = [q for q in quests if q.get("status") == 1]
+        locked = [q.get("_id") for q in quests if q.get("status") == 0]
+        if mut == "queststatus":
+            # Half of the PRE-FIX payload: the 50 stored templates that carry
+            # no `status` key at all.  Proves negative (a) can fail.
+            nokey = [q.get("_id") for q in avail][:50]
+        if mut == "quests":
+            # Reproduce the PRE-FIX payload: SPT's stored templates, where
+            # `status` is a static field -- 0 on most and absent on the rest,
+            # neither having anything to do with the player.  Both negatives
+            # must then fire: (a) on the stripped keys, and (b) because the
+            # 14 the server really will accept are described as Locked.
+            avail_ids = [q.get("_id") for q in avail]
+            locked = avail_ids + locked
+        accepted = []
+        for qid in locked[:40]:
+            _, d2, _ = w.call("/client/game/profile/items/moving",
+                              {"data": [{"Action": "QuestAccept", "qid": qid}],
+                               "tm": 0, "reload": 0}, qsession)
+            d2 = envelope(d2) if d2 else None
+            if not isinstance(d2, dict):
+                continue
+            warns = d2.get("warnings")
+            if not warns and d2.get("profileChanges"):
+                accepted.append(qid)
+        if nokey:
+            record("quest-entry", FAIL,
+                   "%d quest(s) served with NO status key, e.g. %s"
+                   % (len(nokey), nokey[0]))
+        elif accepted:
+            record("quest-entry", FAIL,
+                   "%d quest(s) served as Locked that the server ACCEPTED, "
+                   "e.g. %s" % (len(accepted), accepted[0]))
+        elif not avail:
+            record("quest-entry", FAIL,
+                   "%d quests served and not one is AvailableForStart"
+                   % len(quests))
+        else:
+            record("quest-entry", OK,
+                   "%d quests, %d AvailableForStart, every one carries a "
+                   "status key, %d probed Locked quests all refused"
+                   % (len(quests), len(avail), len(locked[:40])))
+
+    # ----------------------------------------------------------------- 5
+    # BLOCKER 2 -- hideout area type 21 absent from every new profile.
+    #
+    # The negative is general, not a test for 21: no area the server SERVES as
+    # enabled may be missing from the profile it just created.  A check that
+    # looked for `21` specifically could not detect area 28 being added.
+    st, doc, text = w.call("/client/hideout/areas", {}, std_session)
+    served = envelope(doc) if doc else None
+    if not isinstance(served, list) or not served:
+        record("hideout-areas", INCONC,
+               "/client/hideout/areas did not answer a non-empty array")
+    elif std_profile is None:
+        record("hideout-areas", INCONC, "no fresh profile to compare against")
+    else:
+        want = set(a["type"] for a in served
+                   if a.get("enabled") and "type" in a)
+        got = set(a["type"] for a in
+                  std_profile.get("Hideout", {}).get("Areas", [])
+                  if "type" in a)
+        if mut == "hideout":
+            got.discard(21)   # what the old 27-entry constant produced
+        absent = sorted(want - got)
+        if absent:
+            record("hideout-areas", FAIL,
+                   "%d enabled area type(s) served but absent from the fresh "
+                   "profile: %s" % (len(absent), absent))
+        else:
+            record("hideout-areas", OK,
+                   "%d enabled area types served, all present among the %d on "
+                   "the fresh profile" % (len(want), len(got)))
+
+    # ----------------------------------------------------------------- 6
+    # BLOCKER 3 -- traders serving a permanently empty shop.
+    #
+    # The negative: no trader the client can already reach may serve a
+    # zero-item assort unless this file names a REASON.  The allowlist is the
+    # point of the check, not a hole in it -- adding to it is a deliberate,
+    # reviewable statement that an empty shelf is correct for that trader.
+    EMPTY_OK = {
+        "638f541a29ffd1183d187f57":
+            "Ref trades for GP coins, an Arena currency this server has no "
+            "source of; a rouble-priced Ref would be a fabrication",
+    }
+    st, doc, text = w.call("/client/trading/api/traderSettings", {},
+                           std_session)
+    bases = envelope(doc) if doc else None
+    if not isinstance(bases, list) or not bases:
+        record("trader-assort", INCONC, "traderSettings answered no traders")
+    else:
+        probe = [b for b in bases if b.get("unlockedByDefault")]
+        probe += [b for b in bases if b.get("_id") == FENCE
+                  and not b.get("unlockedByDefault")]
+        silent = []
+        checked = 0
+        fence_items = -1
+        fence_unpriced = 0
+        for b in probe:
+            tid = b.get("_id")
+            _, d3, _ = w.call("/client/trading/api/getTraderAssort/" + tid,
+                              {}, std_session)
+            a = envelope(d3) if d3 else None
+            if not isinstance(a, dict):
+                continue
+            checked += 1
+            its = a.get("items") or []
+            if tid == FENCE:
+                fence_items = len(its)
+                scheme = a.get("barter_scheme") or {}
+                lvl = a.get("loyal_level_items") or {}
+                if mut == "fence":
+                    fence_items = 0
+                # No Fence offer may lack a price or a loyalty entry -- a
+                # generated item the client cannot buy is worse than none.
+                fence_unpriced = sum(
+                    1 for i in its
+                    if not scheme.get(i.get("_id"))
+                    or i.get("_id") not in lvl)
+            if not its and tid not in EMPTY_OK:
+                silent.append(b.get("nickname") or tid)
+        if fence_items < 0:
+            record("trader-assort", INCONC,
+                   "Fence's assort never answered")
+        elif fence_items == 0:
+            record("trader-assort", FAIL,
+                   "Fence serves a zero-item assort -- SPT does not ship his "
+                   "stock, it must be generated")
+        elif fence_unpriced:
+            record("trader-assort", FAIL,
+                   "%d of Fence's %d offers have no barter_scheme or no "
+                   "loyal_level_items entry" % (fence_unpriced, fence_items))
+        elif silent:
+            record("trader-assort", FAIL,
+                   "%d reachable trader(s) serve an empty assort with no "
+                   "stated reason: %s" % (len(silent), ", ".join(silent[:4])))
+        else:
+            record("trader-assort", OK,
+                   "%d reachable trader(s) checked, Fence generates %d fully "
+                   "priced offers, %d empty-by-design and named"
+                   % (checked, fence_items, len(EMPTY_OK)))
 
     print()
     bad = [r for r in results if r[1] != OK]

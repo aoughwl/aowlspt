@@ -1304,7 +1304,25 @@ proc onLanguages(url, body, session: string): string =
 proc onQuestList(url, body, session: string): string =
   ## An array, not the id-keyed object the database stores. See
   ## `emu/templates.questList`.
-  envelope(raw(questList()))
+  ##
+  ## The availability pass runs HERE, not only at profile creation: a profile
+  ## made before this existed, or made against a database that has since
+  ## changed, would otherwise keep an empty entry set forever. It is idempotent
+  ## and only ever moves a quest out of absent/`Locked`, so running it on every
+  ## menu load cannot undo progress.
+  var p = currentProfile(session)
+  if not p.ok:
+    # No profile to speak for. The raw template array is still a valid answer
+    # and is what shipped before; it is NOT presented as a per-profile one.
+    return envelope(raw(questList()))
+  let opened = refreshAvailability(p, nowSeconds())
+  if opened > 0:
+    if not saveProfile(p):
+      warn "quest/list: could not save the profile after opening " &
+        $opened & " quest(s)"
+    else:
+      info "quest/list: " & $opened & " quest(s) now AvailableForStart"
+  result = envelope(raw(questListFor(p)))
 proc onAchievementList(url, body, session: string): string =
   envelope(objOf("elements", raw(achievements())))
 
@@ -1753,7 +1771,7 @@ proc onQuestComplete(url, body, session: string): string =
   # shape that route uses. It sends the quests that are now relevant rather than
   # all of them; sending all of them is a superset and the client filters by
   # status, which is an approximation and is written down as one.
-  put(o, "quests", raw(questList()))
+  put(o, "quests", raw(questListFor(p)))
   # Empty, and honestly so. `questsStatus` was empty in the capture too, and
   # this server has nothing to put in it that it has not already written into
   # the profile's own `Quests` array.

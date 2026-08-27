@@ -40,6 +40,7 @@ import mail
 import questcond
 import traders
 import repeatable
+import templates
 
 type
   QuestAction* = enum
@@ -179,6 +180,58 @@ proc freshIds*(itemsJson: string): string =
           setText(d, "parentId", now1[k])
     out1.add d
   result = text(out1)
+
+proc refreshAvailability*(p: var Profile; nowSeconds: int): int =
+  ## The ENTRY POINT of the quest chain.
+  ##
+  ## `unlockFollowUps` only ever re-evaluates the quests that NAMED the one
+  ## just completed, so on a profile that has completed nothing it does
+  ## nothing at all -- and a fresh profile therefore has no quest it is
+  ## allowed to start, forever. That is not a display bug: the whole tree is
+  ## unreachable, because reaching any of it requires completing something
+  ## first.
+  ##
+  ## This is the same `groupMet(cgStart)` test `unlockFollowUps` applies,
+  ## applied instead to EVERY quest the database has whose profile entry is
+  ## absent or `Locked`. Quests already Started/Success/Fail are left alone --
+  ## re-deciding a quest the player is on would reset it.
+  ##
+  ## The cost is one full condition pass over ~558 templates. It is paid on
+  ## profile creation and on `/client/quest/list`, which is a menu load, not a
+  ## frame. It is NOT paid per condition-evaluation: the table is taken apart
+  ## once with `members`, for the reason `unlockFollowUps` documents.
+  result = 0
+  let all = dbRead("templates.quests")
+  if not all.ok or all.raw.len == 0:
+    return
+  let table = parseObject(all.raw)
+  if not table.ok:
+    return
+  var list = parseArray(p.field("Quests").raw())
+  if not list.ok:
+    list = newList()
+  var changed = false
+  for m in table.fields:
+    let status = questStatus(p.text, m.name)
+    # Empty and `Locked` are both "not decided in the player's favour yet".
+    # Anything else is a state the player reached and must keep.
+    if status.len > 0 and status != "Locked":
+      continue
+    var reason = ""
+    if not groupMet(p.text, m.name, m.value, cgStart, reason):
+      # Still gated. Recorded as Locked rather than left absent, so the
+      # served list can state a status for every quest instead of omitting
+      # the key on some -- a missing key and `status:0` are not the same
+      # document to the client.
+      if status.len == 0:
+        setState(list, m.name, "Locked", nowSeconds)
+        changed = true
+      continue
+    setState(list, m.name, "AvailableForStart", nowSeconds)
+    changed = true
+    inc result
+  if changed:
+    setTopLevel(p, "Quests", text(list))
 
 proc unlockFollowUps(p: var Profile; qid: string; nowSeconds: int): int =
   ## Marks every quest that was waiting on this one as available.
@@ -750,3 +803,46 @@ proc applyQuest*(questsJson: string; action: QuestAction; body: JsonRef;
     problem = "not a quest action"
     return questsJson
   result = text(list)
+
+# ---------------------------------------------------------------------------
+# The served quest list
+# ---------------------------------------------------------------------------
+
+proc questListFor*(p: Profile): string =
+  ## `/client/quest/list` for ONE profile: the cached template array with each
+  ## element's `status` restated from what this profile says.
+  ##
+  ## `emu/templates.questList` passes the database through untouched, and the
+  ## database is SPT's, where `status` is a STATIC field on the template. On a
+  ## fresh profile that means 508 quests arrive as `status: 0` (Locked) and 50
+  ## arrive with **no `status` key at all** -- and a missing key and `0` are
+  ## not the same document to a deserialiser. Neither number has anything to
+  ## do with the player.
+  ##
+  ## So the invariant asserted here is a negative one: after this proc, there
+  ## is no quest in the served array whose status disagrees with the status
+  ## `QuestAccept` would enforce, and no quest with the key missing.
+  ##
+  ## Whether the client's journal reads THIS field or reads the profile's own
+  ## `Quests` array is NOT established -- both are now consistent, which is the
+  ## only claim made.
+  let base = questList()
+  let list = parseArray(base)
+  if not list.ok:
+    return base
+  var out1 = newList()
+  for i in 0 ..< list.len:
+    var d = parseObject(list.items[i])
+    if not d.ok:
+      continue
+    let qid = get(d, "_id").asText("")
+    var code = 0
+    if qid.len > 0:
+      let s = questStatus(p.text, qid)
+      if s.len > 0:
+        let c = statusCode(s)
+        if c >= 0:
+          code = c
+    setNumber(d, "status", code)
+    out1.add d
+  result = text(out1)

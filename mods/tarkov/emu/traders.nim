@@ -17,6 +17,7 @@ import aowlspt/server
 import aowlspt/json
 import numbers
 import profile
+import fence
 
 proc traderIds*(): seq[string] =
   ## Every trader in the database, in document order.
@@ -150,7 +151,37 @@ proc allLoyaltyOne(loyalRaw: string): string =
     put(o, offerId, 1)
   result = done(o).text
 
+const FenceRefreshSeconds* = 1800
+  ## How long one generated Fence stock lasts. The same number is served as
+  ## `nextResupply` and used to bucket the generator seed, so the countdown the
+  ## client draws and the moment the stock actually changes are the same event.
+
 proc traderAssort*(id: string; resupplyAt: int): string =
+  # Fence is GENERATED, not stored.
+  #
+  # Four of the twelve traders serve a zero-item assort. Measured, and they are
+  # not one problem:
+  #
+  #   Fence  `579dc571...`  -- SPT's assort.json is 68 bytes because SPT
+  #       generates the stock at runtime. A stored-empty assort here is a
+  #       missing generator, and `emu/fence` is it. FIXED.
+  #   Ref    `638f541a...`  -- `unlockedByDefault: true`, and empty. Ref trades
+  #       for GP coins, an Arena currency this server has no source of; an
+  #       invented rouble-priced Ref would be a shop selling Arena rewards for
+  #       money, which is a worse lie than an empty shelf. Deliberately left
+  #       empty. STATED, not fixed.
+  #   BTR    `656f0f98...`  -- `unlockedByDefault: false`, and not a shop at
+  #       all: it is the armoured-transport service, whose interactions are the
+  #       taxi and delivery routes, not an assort. Empty is CORRECT.
+  #       (Its nickname is not empty either -- it is the Cyrillic "BTR".)
+  #   Storyteller `6864e812f9fe664cb8b8e152` -- `unlockedByDefault: false`, no
+  #       assort in SPT's own data, and gated behind content this server does
+  #       not run. Empty is CORRECT.
+  #
+  # So exactly one of the four was a bug, and three item lists that would have
+  # been invented are not invented.
+  if id == FenceId:
+    return fenceAssort(resupplyAt, FenceRefreshSeconds)
   let v = dbRead("traders." & id & ".assort")
   if not v.ok or v.raw.len == 0:
     return emptyAssort()
