@@ -47,6 +47,7 @@ import "../host/common/jsonpath"
 import aowlterm
 import aowlsession
 import aowlui
+import aowldiag
 
 {.emit: """#include <stdlib.h>""".}
 {.emit: """#include <string.h>""".}
@@ -890,10 +891,26 @@ proc clientRows(h: HostState; alive: bool; elapsed: int64; pid: int;
       dec pad
 
 proc watchClient(launch: LaunchPtr; hostLog: string; limitMs: int64;
-                 exited: var bool) =
+                 exited: var bool; lad: var Ladder; stalledMs: var int64) =
   ## Until the host says it is running, or the client dies, or the time is up.
   ## Whichever happens, the last thing painted is what actually happened.
+  ##
+  ## `exited` is the ONLY confirmed-failure signal: the process handle went
+  ## signalled before `host running`. It is not a timeout and does not care how
+  ## long the client takes -- a cold IL2CPP boot legitimately runs past ninety
+  ## seconds and an idle client at profile-select waits for a human forever, so
+  ## elapsed time is not evidence of anything and is never treated as such.
+  ##
+  ## `stalledMs` is the weaker, secondary signal, for the caller to report as a
+  ## SUSPICION and never as a cause: how long the host's boot ladder has stood
+  ## on the same rung. It is measured against the wall clock at each poll --
+  ## the rung it is on is a fact, "it has not moved since" is not a diagnosis.
   exited = false
+  lad = Ladder(rung: 0, name: rungName(0), initReturnedZero: false,
+               errors: 0, lastError: "", modsLoaded: 0)
+  stalledMs = 0'i64
+  var lastRung = -1
+  var lastAdvance = cNowMs()
   var tail = newTail(hostLog)
   let began = cNowMs()
   var panel = newPanel()
@@ -912,6 +929,11 @@ proc watchClient(launch: LaunchPtr; hostLog: string; limitMs: int64;
     let waited = cNowMs() - began
     discard tail.pump()
     let st = scanHost(tail)
+    lad = scanLadder(tail)
+    if lad.rung != lastRung:
+      lastRung = lad.rung
+      lastAdvance = cNowMs()
+    stalledMs = cNowMs() - lastAdvance
     let alive = cLaunchAlive(launch) != 0'i32
     if not alive: exited = true
     if painting:
@@ -1998,6 +2020,17 @@ proc main(): int =
   # asked to paste when the client comes up talking to the wrong server.
   line "  " & cmdLine
 
+  # SNAPSHOT BEFORE THE CLIENT IS EVEN STARTED. Logs\<ts>\ accumulates a
+  # directory per run forever, so "the newest one" is not this run's -- it is
+  # the newest one, which on a client that died before Unity opened a log is
+  # some other session entirely. Diffing against a set taken here is the only
+  # way to say "this directory belongs to this launch" and mean it.
+  let before = snapshotBefore(root)
+  # And the preflight, while the client is still not running: mod DATA files
+  # the repo has and the install does not. deploy.py ships DLLs, not data,
+  # which is precisely how a mod comes to refuse to serve at runtime.
+  runModDataPreflight(root)
+
   let launch = cLaunchNew()
   if launch == nil:
     err "out of memory"
@@ -2042,7 +2075,10 @@ proc main(): int =
   # Bounded, and the bound is not a deadline for the game -- it is how long
   # this view waits before handing over to the log view, which shows the same
   # thing with more room. A cold IL2CPP launch is minutes.
-  watchClient(launch, hostLog, 90000'i64, clientExited)
+  var lad = Ladder(rung: 0, name: rungName(0), initReturnedZero: false,
+                   errors: 0, lastError: "", modsLoaded: 0)
+  var stalledMs = 0'i64
+  watchClient(launch, hostLog, 90000'i64, clientExited, lad, stalledMs)
 
   # UNCONDITIONAL, before any gate. A verdict that never appears could mean
   # "the walk failed" or "this routine was never entered" -- and those look
@@ -2059,11 +2095,35 @@ proc main(): int =
   discard writeTextFile(verdictPath, entryLine & "\n")
 
   if clientExited:
-    warn "the client exited while starting; see " & hostLog
+    # CONFIRMED. The process handle went signalled before `host running`;
+    # there is nothing ambiguous about it and no timeout was involved. Say
+    # WHY, out of the logs, here and now -- the previous single line ("see
+    # the host log") is what cost a real session many minutes of hand-
+    # reading three logs in two directories.
+    reportLaunchFailure(root, before, lad, cfConfirmed,
+      "the client exited while starting, after " & $lad.rung & "/" &
+      $LadderTop & " host boot rungs (" & lad.name & ")")
     discard writeTextFile(verdictPath,
       entryLine & "\nauto-enter verdict: SKIPPED -- client exited while " &
       "starting\n")
-  elif haveChoice and not o.noAutoEnter:
+  else:
+    # ALIVE. The only other thing worth saying is a SUSPICION, and it is said
+    # as one. A client sitting at profile-select waiting for a human presents
+    # exactly like a hung one from out here, so this never claims a cause --
+    # it reports the rung the host stopped on and how long it has stood
+    # there, and offers the same ranked candidates for the reader to judge.
+    #
+    # The threshold is 45s of NO LADDER MOVEMENT, not 45s of elapsed time.
+    # Elapsed time is not evidence: a cold IL2CPP boot legitimately runs past
+    # ninety seconds while the ladder advances the whole way, and an idle
+    # client can sit at the selector for an hour with nothing wrong with it.
+    if lad.rung < 7 and stalledMs >= 45000'i64:
+      reportLaunchFailure(root, before, lad, cfSuspected,
+        "the client is alive but the host's boot ladder has not advanced " &
+        "past rung " & $lad.rung & "/" & $LadderTop & " (" & lad.name &
+        ") for " & $(stalledMs div 1000'i64) & "s")
+
+  if haveChoice and not o.noAutoEnter and not clientExited:
     # The client's own character-select screen shows on every boot
     # regardless of `-token` -- that is measured, not assumed (see the
     # "Profile" heading above: `onProfilesV2` always renders a slot, and
