@@ -44,6 +44,10 @@ constant is the failure mode this file exists to avoid.
     lootloose  raise every map's floor by its whole probabilistic spawn
                point count, so a correct server -- which rolls each point
                against its own probability -- must go red
+    orbitmap   add `Icebreaker` to the set of ids REQUIRED to yield an ORBIT
+               plan.  It has no database location and therefore no
+               SpawnPointParams, so a correct server cannot anchor it and
+               must go red
     tolerated  require BSG's own captured payloads to carry `SeasonsSettings`
                and `exchange_rate`.  They do not -- that is the whole basis of
                the CORRECT-AS-IS verdict on those two members -- so a correct
@@ -846,6 +850,79 @@ def main():
             record("lootunmapped", OK,
                    "all %d id(s) the database has nothing for served an empty "
                    "Loot rather than another map's" % len(UNMAPPABLE_IDS))
+
+    # 8a4 -- THE SAME NEGATIVE, FOR ORBIT.
+    #
+    # "No location id the client can send yields an ORBIT plan with ok=false
+    # for want of positional data that `locations.json` actually has."
+    #
+    # Same defect, same shape, different consumer.  `emu/orbit.buildPlan` read
+    # `locations.<clientId>.base.SpawnPointParams` with the id the CLIENT
+    # sent, while the table is keyed by the database key, so on a live raid it
+    # reported "0 usable containers and 0 player spawn points ... a map with
+    # no positional data here" for Interchange -- against a database with
+    # 3,762 SpawnPointParams across 24 locations, 100% of them at a non-zero
+    # Position.
+    #
+    # Not merely "the plan is non-empty": ORBIT's own check once returned PASS
+    # with 6 anchors and a 587 m spread while an entire loot layer was
+    # missing, because it did not count anchors BY KIND.  So this asserts the
+    # spawn-point layer was READ -- `spawnRows > 0` and `spawnPointsSeen > 0`
+    # -- which is the thing the resolver defect destroys, and reports the
+    # per-map counts so a regression names the maps rather than a total.
+    #
+    # `plan` is fetched AFTER the getLocalloot for that id, because that is
+    # the route that calls `emitPlan`, and `/aowlspt/tarkov/orbit/plan` serves
+    # the LAST plan built.
+    def _plan(loc):
+        st, doc, text = w.call("/client/location/getLocalloot",
+                               {"locationId": loc}, std_session)
+        st, doc, text = w.call("/aowlspt/tarkov/orbit/plan", {}, std_session)
+        d = envelope(doc)
+        if not isinstance(d, dict) or "ok" not in d:
+            return None, text
+        return d, text
+
+    if not std_session:
+        record("orbitmap", INCONC, "no session to configure a raid with")
+    else:
+        want = list(CLIENT_LOCATION_IDS)
+        if mut == "orbitmap":
+            want.append("Icebreaker")
+        bad, unread, seen = [], [], []
+        for loc in want:
+            pl, text = _plan(loc)
+            if pl is None:
+                unread.append(loc)
+                continue
+            rows = int(pl.get("spawnRows") or 0)
+            used = int(pl.get("spawnPointsSeen") or 0)
+            anchors = pl.get("anchors") or []
+            kinds = {}
+            for an in anchors:
+                kinds[an.get("kind")] = kinds.get(an.get("kind"), 0) + 1
+            seen.append("%s:%d/%d rows, %d anchors %s"
+                        % (loc, used, rows, len(anchors),
+                           ",".join("%s=%d" % kv for kv in sorted(kinds.items()))
+                           or "-"))
+            if not pl.get("ok") or rows == 0 or used == 0 or not anchors:
+                bad.append("%s(ok=%s rows=%d used=%d anchors=%d)"
+                           % (loc, pl.get("ok"), rows, used, len(anchors)))
+        for line in seen:
+            print("               orbit %s" % line)
+        if unread:
+            record("orbitmap", INCONC,
+                   "%d id(s) returned no readable plan, so nothing was proved "
+                   "about them: %s" % (len(unread), ", ".join(unread)))
+        elif bad:
+            record("orbitmap", FAIL,
+                   "%d of %d client-sendable location id(s) built NO usable "
+                   "ORBIT anchor from SpawnPointParams the database has: %s"
+                   % (len(bad), len(want), ", ".join(bad)))
+        else:
+            record("orbitmap", OK,
+                   "all %d client-sendable location id(s) read a non-zero "
+                   "SpawnPointParams layer and anchored it" % len(want))
 
     # 8b -- the Position shape, on a map our generator does answer for.
     loot, text = (None, "") if not std_session else _start(LOOT_SHAPE_MAP)
