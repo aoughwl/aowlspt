@@ -77,6 +77,7 @@ import emu/selfchecks
 import emu/metadata
 import emu/post1
 import emu/globalsgaps # the config members REAL BSG sends and db.json lacks
+import emu/itemsgaps # the `_props` members REAL BSG sends and db.json lacks
 import emu/tuning   # the globals overrides -- the settings that reach the CLIENT
 import emu/spawn    # spawning items into a stash from the settings page
 
@@ -1289,7 +1290,11 @@ proc onTraderUserAssort(url, body, session: string): string =
 # The largest bodies the server sends, and the ones that must not be rebuilt per
 # request: each is spliced in as the text the database already holds.
 
-proc onItems(url, body, session: string): string = envelope(raw(items()))
+proc onItems(url, body, session: string): string =
+  ## The item-template document, with the `_props` members REAL BSG sends
+  ## and this pre-1.0 database lacks spliced in. `applyItemsGaps` caches
+  ## against its input text, so the 12.7 MB reparse happens once.
+  envelope(raw(applyItemsGaps(items())))
 proc onGlobals(url, body, session: string): string =
   ## The globals document, with every singleplayer override applied.
   ##

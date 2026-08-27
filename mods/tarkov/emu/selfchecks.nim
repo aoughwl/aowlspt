@@ -42,6 +42,7 @@ import gym
 import customise
 import tuning
 import globalsgaps
+import itemsgaps
 import spawn
 import decorate
 import dialogue
@@ -101,6 +102,11 @@ proc selfCheckFailures*(): seq[string] =
   # a negative over the merged text, plus the two ways a merge silently lies
   # (dropping what the database had, or overwriting it).
   discard globalsgaps.selfCheckGlobalsGaps(result)
+
+  # `itemsgaps` proves the per-item `_props` members REAL BSG sends and our
+  # pre-1.0 database lacks are spliced in at the right depth, without
+  # overwriting the database and without inventing an item id.
+  discard itemsgaps.selfCheckItemsGaps(result)
   discard spawn.selfCheckSpawn(result)
   # The fifth of that shape, and the one with two halves for the same reason
   # `selfCheckCustomisation` has two. The pure half is the whole of the hideout

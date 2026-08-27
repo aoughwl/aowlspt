@@ -394,6 +394,271 @@ def dtogap_rows(route, sample, jpath, dto=None):
     return rows, p.stdout or ""
 
 
+# ------------------------------------------- the three routes with NO number
+#
+# Three routes used to print INCONCLUSIVE forever, and "no number" was being
+# read as "no gap". Each is now either a REAL number or a PERMANENT, stated
+# reason -- never "we did not look". The reason is asserted from evidence on
+# disk, so a wrong reason can still fail.
+
+# The BSG capture. Overridable because `responses/large/*.json` (the DECODED
+# large bodies, including seq 045 `/client/items`) are NOT tracked by git --
+# a fresh worktree has the 690 small files and none of the 15 large ones, so
+# the BSG half of the items measurement would silently go INCONCLUSIVE there.
+CAP = os.environ.get("AOWL_CAPTURE",
+                     os.path.join(REPO, "mods", "tarkov", "data",
+                                  "capture", "raid1"))
+CAP_ITEMS = os.path.join(CAP, "responses", "large", "045.json")   # BSG /client/items
+CAP_RAIDEND = os.path.join(CAP, "responses", "204.json")          # BSG /client/match/local/end
+
+
+def _load(path):
+    with open(path, "r", encoding="utf-8", errors="replace") as f:
+        return json.load(f)
+
+
+def _resolver():
+    import dtogap as G
+    from il2cpp_resolve import Resolver
+    import il2cpp_attrs
+    r = Resolver(G.GAMEASM, G.METADEC)
+    G.selfcheck(r)
+    at = il2cpp_attrs.selfcheck(r)
+    G.member_selfcheck(r, at)
+    return G, r, at
+
+
+def measure_items(sample):
+    """/client/items has no top-level DTO -- it is a dict of templates keyed by
+    id. That makes a WHOLE-PAYLOAD diff undefined, NOT absent. Two real numbers
+    are produced instead.
+
+    A. THE BSG SUPERSET CHECK (authoritative, cross-server). For every id we
+       serve that BSG also served (capture seq 045, `resp_xenc: aes`,
+       `PHPSESSID`), how many `_props` keys did BSG send that we do not? This
+       is a NEGATIVE about the finished payload and cannot pass by
+       construction: it fails the moment one key goes missing.
+
+    B. THE CLIENT-DECLARATION SWEEP. Our items collapse to a small number of
+       distinct `_props` key-set SIGNATURES. For each, the best-matching
+       `EFT.InventoryLogic.*Template` is picked by wire-key overlap (the
+       `--whichdto` method) and its declared members diffed against the UNION
+       of the item's outer keys and its `_props` keys -- the union, because the
+       client binds `_id`/`_name`/`_parent`/`_type` from the outer object and
+       everything else from `_props`. Diffing the outer object alone (which is
+       what dtogap's own `--path data.<id>` hint produces) reports ~107
+       fictional holes per item.
+
+    B's rows are CANDIDATES in the same currency as every other route; A's rows
+    are stronger, because BSG itself sent them.
+    """
+    G, r, at = _resolver()
+    ours = _load(sample).get("data") or {}
+    notes = []
+
+    bsg_missing = None
+    if not os.path.exists(CAP_ITEMS):
+        notes.append("BSG superset check: INCONCLUSIVE -- no capture at %s"
+                     % CAP_ITEMS)
+    else:
+        bsg = _load(CAP_ITEMS).get("data") or {}
+        common = sorted(set(bsg) & set(ours))
+        miss = {}
+        for i in common:
+            bp = (bsg[i] or {}).get("_props") or {}
+            op = (ours[i] or {}).get("_props") or {}
+            for k in bp:
+                if k not in op:
+                    miss[k] = miss.get(k, 0) + 1
+        bsg_missing = miss
+        notes.append("BSG superset check: %d of our %d ids were also served by "
+                     "BSG. %d distinct `_props` key(s) BSG sent are absent from "
+                     "ours (%d key-instances)."
+                     % (len(common), len(ours), len(miss), sum(miss.values())))
+        for k, c in sorted(miss.items(), key=lambda kv: -kv[1])[:12]:
+            notes.append("    BSG-SENDS-WE-OMIT  %-46s %d items" % (k, c))
+        notes.append("    %d id(s) BSG served are absent from our database "
+                     "entirely; conjuring a whole template is a different and "
+                     "much larger question, and is NOT counted here."
+                     % len(set(bsg) - set(ours)))
+
+    cands = []
+    for t in range(r.NTYPES):
+        ns, nm = r.tname(t)
+        if ns != "EFT.InventoryLogic" or not nm.endswith("Template"):
+            continue
+        if nm.startswith("I"):            # the interfaces, not the classes
+            continue
+        try:
+            ms = G.dto_fields(r, t, at)[0]
+        except Exception:
+            continue
+        if len(ms) < 5:
+            continue
+        cands.append((nm, ms, set((w or n).lower()
+                                  for n, w, _t, _k, _d, _s, _o in ms)))
+    if not cands:
+        return None, ["INCONCLUSIVE: not one EFT.InventoryLogic.*Template type "
+                      "was enumerated, so NOTHING was diffed."]
+
+    sigs = {}
+    for k, v in ours.items():
+        key = tuple(sorted(((v or {}).get("_props") or {}).keys()))
+        if key not in sigs:
+            sigs[key] = [0, k]
+        sigs[key][0] += 1
+    rows = {}
+    for _sig, pair in sigs.items():
+        cnt, rep = pair
+        item = ours[rep]
+        emitted = set(x.lower() for x in ((item.get("_props") or {})))
+        emitted |= set(x.lower() for x in item.keys())
+        best = max(cands, key=lambda c: (len(emitted & c[2]) / float(len(emitted) or 1),
+                                         -len(c[2])))
+        for n, w, ty, kind, _dcl, _st, _o in best[1]:
+            wire = w or n
+            if wire.lower() in emitted:
+                continue
+            key = (wire, ty, kind)
+            rows[key] = rows.get(key, 0) + cnt
+    return {"signatures": len(sigs), "classes": len(cands), "rows": rows,
+            "bsg_missing": bsg_missing, "items": len(ours)}, notes
+
+
+def measure_customization(sample):
+    """PERMANENT -- and it is a reason, not a shrug.
+
+    `EFT.AvailableCustomizationsResponse`, the class dtogap maps this route to,
+    declares ZERO serializable members on this build (it is a collection type;
+    `dto_fields` returns an empty member set AND an empty skipped set, so it is
+    not that members were filtered out). A key-set diff against a type with no
+    keys is undefined, so the gap number is 0 BY CONSTRUCTION. That is CHECKED
+    here, not assumed: the moment the client declares a member, this stops
+    claiming permanence and prints the count instead.
+
+    Separately, the empty array is CORRECT rather than a placeholder. This
+    route is the suits an ACCOUNT OWNS, which for a fresh profile is none. The
+    CATALOGUE is a different route, `/client/customization`, which this server
+    answers whole from `templates.customization`.
+    """
+    G, r, at = _resolver()
+    t = r.find_one("EFT.AvailableCustomizationsResponse")
+    if t is None:
+        return None, ["INCONCLUSIVE: EFT.AvailableCustomizationsResponse is not "
+                      "in this build's metadata, so the permanence claim was "
+                      "NOT checked."]
+    members, skipped = G.dto_fields(r, t, at)
+    body = _load(sample).get("data")
+    return {"members": len(members), "skipped": len(skipped),
+            "is_array": isinstance(body, list), "len": len(body or [])}, None
+
+
+def measure_raidend(sample):
+    """PERMANENT -- and it is a reason, not a shrug.
+
+    This route is client-SENT (`LocalRaidEnded`); the client declares no
+    response class, so there is nothing to diff. The open question was whether
+    an empty `data` is the right answer. It is, and BSG says so: the captured
+    BSG response (seq 204, POST /client/match/local/end, `resp_xenc: aes`) is
+    `{"err":0,"data":null,"errmsg":null}`. The assertion made here is therefore
+    a NEGATIVE against real BSG traffic -- our `data` must not differ in shape
+    from BSG's -- and it fails if we ever start sending an object BSG did not.
+    """
+    if not os.path.exists(CAP_RAIDEND):
+        return None, ["INCONCLUSIVE: no BSG capture at %s, so nothing was "
+                      "compared." % CAP_RAIDEND]
+    ours = _load(sample)
+    bsg = _load(CAP_RAIDEND)
+    return {"ours_data": ours.get("data"), "bsg_data": bsg.get("data"),
+            "same": (ours.get("data") is None) == (bsg.get("data") is None),
+            "ours_err": ours.get("err"), "bsg_err": bsg.get("err")}, None
+
+
+SPECIAL = {
+    "/client/items": measure_items,
+    "/client/account/customization": measure_customization,
+    "/client/match/local/end": measure_raidend,
+}
+
+
+def special_row(route, sample):
+    """(decl, ref, val, verdict, detail_lines) for a route with no top-level
+    DTO. Returns None for `decl`/`ref`/`val` only when the measurement itself
+    could not be made -- which prints INCONCLUSIVE with the reason, never a
+    silent zero."""
+    fn = SPECIAL[route]
+    try:
+        got, notes = fn(sample)
+    except Exception as exc:                      # noqa: BLE001
+        return (None, None, None, "INCONCLUSIVE (measurement raised)",
+                ["%s: %r" % (type(exc).__name__, exc)])
+    lines = list(notes or [])
+    if got is None:
+        return (None, None, None, "INCONCLUSIVE", lines)
+
+    if route == "/client/items":
+        rows = got["rows"]
+        ref = sum(1 for _n, _t, k in rows if k == "REF")
+        val = sum(1 for _n, _t, k in rows if k == "VALUE")
+        bm = got["bsg_missing"]
+        head = ("%d template class(es) ranked over %d distinct `_props` "
+                "signatures across %d items"
+                % (got["classes"], got["signatures"], got["items"]))
+        lines.insert(0, head)
+        for (n, ty, k), c in sorted(rows.items(),
+                                    key=lambda kv: (kv[0][2] != "REF", -kv[1])):
+            lines.append("    DECLARED-ABSENT  %-6s %-30s %-26s %d items"
+                         % (k, n, ty, c))
+        if bm is None:
+            verdict = "%d/%d cand (BSG check INCONCLUSIVE)" % (ref, val)
+        elif bm:
+            verdict = "GAP: BSG sends %d key(s) we omit" % len(bm)
+        else:
+            verdict = "no BSG gap; %d/%d declared-absent" % (ref, val)
+            lines.append("    Our `_props` is a strict SUPERSET of BSG's on "
+                         "every shared id, so every DECLARED-ABSENT row above "
+                         "is necessarily absent from BSG's payload too: they "
+                         "are CLIENT-TOLERATED absences, not our holes. That "
+                         "follows from the count on the line above being 0; if "
+                         "it is ever non-zero, this sentence does not apply.")
+        return (None, ref, val, verdict, lines)
+
+    if route == "/client/account/customization":
+        n = got["members"]
+        if n == 0:
+            verdict = ("no gap, PERMANENTLY: the DTO declares 0 members")
+            lines.append("EFT.AvailableCustomizationsResponse declares 0 "
+                         "serializable members and 0 skipped ones, so there is "
+                         "no key set to diff. `data` is an array (%s) of %d "
+                         "entr(ies): the suits this ACCOUNT OWNS, which for a "
+                         "fresh profile is none. The CATALOGUE is the separate "
+                         "route /client/customization, served whole from "
+                         "templates.customization."
+                         % (got["is_array"], got["len"]))
+            return (0, 0, 0, verdict, lines)
+        lines.append("the DTO now declares %d member(s); the permanence claim "
+                     "no longer holds and this route needs a real diff." % n)
+        return (n, None, None, "RECHECK", lines)
+
+    if route == "/client/match/local/end":
+        if got["same"]:
+            verdict = "no gap, PERMANENTLY: BSG sends data:null too"
+            lines.append("BSG capture seq 204 answered err=%r data=%r; we "
+                         "answer err=%r data=%r. The client declares no "
+                         "response class for a route it SENDS, so there is "
+                         "nothing to diff -- and an empty `data` is not a "
+                         "placeholder, it is what the real server sends."
+                         % (got["bsg_err"], got["bsg_data"],
+                            got["ours_err"], got["ours_data"]))
+            return (0, 0, 0, verdict, lines)
+        lines.append("our `data` is %r but BSG's is %r -- the shapes now "
+                     "differ, so this is a real divergence."
+                     % (got["ours_data"], got["bsg_data"]))
+        return (None, None, None, "DIVERGES FROM BSG", lines)
+
+    return (None, None, None, "INCONCLUSIVE", lines)
+
+
 def table(manifest, verbose=False):
     import dtogap as G
     print("")
@@ -406,15 +671,36 @@ def table(manifest, verbose=False):
     print("-" * 78)
     totals = {"REF": 0, "VALUE": 0}
     detail_blocks = []
+    special_blocks = []
     inconclusive = []
     for e in manifest["entries"]:
         route = e["route"]
         ent = G.ROUTES.get(route)
         dto = ent[0] if ent else None
-        if e["verdict"] != SERVED:
+        if e["verdict"] != SERVED and route not in SPECIAL:
             inconclusive.append((route, e["verdict"], e["detail"]))
             print("%-40s %6s %6s %6s  INCONCLUSIVE (%s)"
                   % (route, "-", "-", "-", e["verdict"]))
+            continue
+        if route in SPECIAL:
+            # No top-level DTO -- but "no DTO" is not "no measurement". Each of
+            # these three now yields a real number or a PERMANENT stated
+            # reason; see SPECIAL above.
+            sample = os.path.join(manifest["root"],
+                                  e["sample"].replace("/", os.sep))
+            decl, ref, val, verdict, lines = special_row(route, sample)
+            if ref is not None:
+                totals["REF"] += ref
+            if val is not None:
+                totals["VALUE"] += val
+            print("%-40s %6s %6s %6s  %s"
+                  % (route,
+                     "-" if decl is None else decl,
+                     "-" if ref is None else ref,
+                     "-" if val is None else val, verdict))
+            special_blocks.append((route, verdict, lines))
+            if verdict.startswith("INCONCLUSIVE"):
+                inconclusive.append((route, "NO-DTO", verdict))
             continue
         if not dto:
             inconclusive.append((route, "NO-DTO",
@@ -452,6 +738,11 @@ def table(manifest, verbose=False):
         print("%s   DTO=%s" % (route, dto))
         for _n, k, line in sorted(rows, key=lambda r: (r[1] != "REF", r[0])):
             print("  " + line.strip())
+    for route, verdict, lines in special_blocks:
+        print("")
+        print("%s   %s" % (route, verdict))
+        for ln in lines:
+            print("  " + ln)
     if inconclusive:
         print("")
         print("INCONCLUSIVE -- no gap number exists for these, and 'no number'")
