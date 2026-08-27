@@ -72,7 +72,9 @@
 ## write happens every frame, so it is on that path and nowhere near the boxed
 ## one (docs/PERF.md).
 ##
-## Three effects are implemented, each one armed only when every binding it
+## Four effects are implemented (the fourth, `get_AimingSensitivity`, is
+## described under "WHAT IS STILL NOT EXPRESSIBLE" below only because that is
+## where its refusal used to live), each one armed only when every binding it
 ## needs actually resolved, and each one reporting whether it applied:
 ##
 ##   1. **The per-frame FOV write.** Upstream's `FovController`: the camera's
@@ -143,8 +145,22 @@
 ##   this port cannot confirm the names of the camera-offset fields on
 ##   `ProceduralWeaponAnimation` against a running post-1.0 build, and writing a
 ##   camera offset to a field guessed by name is the one kind of approximation
-##   the rest of this file refuses. That is a much shorter distance to travel
-##   than it was, and it is a different problem.
+##   the rest of this file refuses.
+##
+##   **That last sentence has now expired too, and the replacement is narrower.**
+##   `tools/fldoff.py fields EFT.Animations.ProceduralWeaponAnimation` prints the
+##   whole field list off `GameAssembly.dll` + the decrypted metadata, so the
+##   names are no longer unconfirmable: `_cameraByFOVOffset` (Vector3 @0x1e0),
+##   `RotationCameraOffset` (Vector3 @0x18c), `_vCameraTarget` (Vector3 @0x180),
+##   `Offset` (Vector3 @0x98), `CameraSmoothTime` (float @0x124), `vel`
+##   (Vector3 @0x128) all exist and all have offsets. What blocks the port is
+##   one step further in: upstream's `LerpCameraPatch` is **not vendored beside
+##   this file** (`mods/fov/` holds LICENSE.txt, README.md, config.json and this
+##   source, and nothing of Fontaine's own code), so which of those six it
+##   writes, in what order, and against which speed, is a guess about
+##   *behaviour* rather than about a *name*. That is a strictly worse thing to
+##   guess, so it stays refused -- but the fix is now "vendor or read the
+##   upstream patch", not "dump a build".
 ##
 ## * **`Player::Look`** -- upstream's `FreeLookPatch` clamps the free-look angles
 ##   on `__instance`. The cost objection is gone with the rest; what stops it is
@@ -170,35 +186,67 @@
 ##   trips. Which of the two armed is in the effect's own state line, and the
 ##   effect times itself in place and prints that too. See "Effect 4".
 ##
-## * **The toggle-zoom key.** `zoomToggleKey`, `holdToZoom` and the three
-##   `*ToggleZoomMulti` settings need to know whether a key is down.
+## * **The toggle-zoom key -- NOW WIRED.** `zoomToggleKey`, `holdToZoom` and
+##   the three `*ToggleZoomMulti` settings need to know whether a key is down.
+##   For months they could not, and the reason recorded here was half expired
+##   and half a tool bug. Both halves are worth keeping straight.
 ##
-##   Half of what this used to say has expired and is worth correcting rather
-##   than quietly dropping. It read "`UnityEngine.Input::GetKey` takes a
-##   `KeyCode`, **which is an enum**, and mapping the configured names onto its
-##   numeric values by hand is precisely the kind of guess this port does not
-##   make" -- and the emphasis was doing real work, because an enum argument
-##   used to be refused outright by the host as something it "cannot build from
-##   a JSON scalar". That is gone: **an enum is a number in both directions**
-##   now (docs/IL2CPP.md), so `GetKey` is callable the moment this mod has a
-##   number to pass it.
+##   The expired half: an enum argument used to be refused outright by the
+##   host as something it "cannot build from a JSON scalar". That is gone --
+##   an enum is a number in both directions now (docs/IL2CPP.md).
 ##
-##   What is left is the other half, unchanged and still disqualifying: this
-##   mod has a *string* out of `config.json` -- `"M"`, `"KeypadMultiply"` --
-##   and turning one into a `KeyCode` ordinal means writing Unity's enumeration
-##   out by hand from memory. That is a guess about a value, not a missing
-##   capability, and it is the same class of refusal as the camera-offset field
-##   names above. The settings are read, reported and carried; nothing acts on
-##   them.
+##   The wrong half: this file then said the name->ordinal map "cannot be
+##   derived here", and cited a MEASUREMENT as proof -- `KeyCode.None` reading
+##   back as **-25161728** and `KeyCode.Space` as **-2113895872** out of
+##   metadata property 8. The measurement was real; the conclusion drawn from
+##   it was wrong. Property 8 (`fieldAndParameterDefaultValueData`) is **not
+##   encrypted**. It stores I4/U4 as ECMA-335 **compressed integers,
+##   big-endian and zigzagged**, not as raw int32 -- so reading four raw bytes
+##   at `None` (a single `0x00`) swallowed the next three constants and
+##   produced exactly that number. The reader was the bug, not the blob. This
+##   is the shape of defect CLAUDE.md 9b names: a check that could only ever
+##   agree with itself, dressed as a measurement.
+##
+##   `tools/fldoff.py enum <Type>` / `enumval <Type> <Member>` and
+##   `tools/il2cpp_resolve.py enum` decode it correctly now, and
+##   `verify-consts` puts the decoder against 19 independently-known values
+##   (KeyCode None/Space/A/Alpha0 plus one per primitive width) before
+##   anything is trusted. All 328 `UnityEngine.KeyCode` members come out; the
+##   table in this file is that command's verbatim output, not a recollection.
+##
+##   So: `Input::GetKey(KeyCode)` @0x531EAE0 and `GetKeyDown(KeyCode)`
+##   @0x531EB80, both STATIC, both prologue-verified 16/16 at bind, both real
+##   bodies in the `il2cpp` section rather than the universal empty-body stub.
+##   Each shares its RVA with its `*Int` internal alias, which is a hazard for
+##   a detour and not for a call. `pollZoomKey` runs on the game thread ahead
+##   of the FOV rate gate -- an edge is one frame wide and that gate skips
+##   frames -- under a 500 Hz gate of its own, and its answer multiplies into
+##   the same `SetFov` write Effect 1 already makes. See "Effect 5".
+##
+##   What is still NOT claimed: above 500 fps a toggle press can be missed
+##   (`holdToZoom`, the default, reads a level and is unaffected), and
+##   `cancelZoomOnUnAds` clears the latch against the PREVIOUS write's aiming
+##   state, one frame late.
 ##
 ## * **The base-FOV slider range** (`minBaseFov`/`maxBaseFov`) -- upstream's
 ##   `FovRangePatch` rewrites the slider bounds on a `GameSettingsTab` instance.
-##   The instance is delivered now and this one fires when a menu opens, so the
-##   cost objection does not apply -- it is genuinely expressible. What stops it
-##   is the last thing this port will not do: it would have to name the slider
-##   field on `GameSettingsTab`, and that name cannot be confirmed from here.
-##   The refusal is now about a name rather than a capability, which is a much
-##   shorter distance to travel.
+##   This file used to say the blocker was naming the slider field on
+##   `GameSettingsTab` -- "a much shorter distance to travel".
+##
+##   **It was measured, and the distance is infinite.** `fldoff.py fields
+##   EFT.UI.Settings.GameSettingsTab` lists all 34 fields on this build and
+##   there is no FOV bound among them: the type holds `_floatSliderTemplate`,
+##   `_toggleTemplate`, `_dropDownTemplate`, `_settingsRoot`, `_gameSettings`
+##   and the nickname/wishlist controls, and nothing else. The bounds live one
+##   type away, on `EFT.Settings.Game.GameSettingsGroup`, as
+##   `MIN_FIELD_OF_VIEW` and `MAX_FIELD_OF_VIEW` -- and both carry
+##   `attrs = 0x8056`, i.e. **`FIELD_ATTRIBUTE_LITERAL`**. A C# `const` has no
+##   storage at runtime; the compiler has already substituted its value into
+##   every use site. There is no field to write, no getter to detour and no
+##   instance that holds it. This is not "not expressible yet"; it is not
+##   expressible by a field write at all, on this build, and the only route
+##   left would be patching each inlined comparison individually. The settings
+##   stay `implemented = false` and now say why in terms that can be falsified.
 ##
 ## ---------------------------------------------------------------------------
 ## HOW YOU KNOW IT WORKED
@@ -254,6 +302,11 @@ var cfgCameraDecreaseOffsetKey = "KeypadDivide"
 
 var cfgZoomToggleKey = "M"
 var cfgHoldToZoom = true
+var gZoomKeyDirty = true
+  ## Raised by `loadConfig`, so the KeyCode ordinal is re-resolved from
+  ## `cfgZoomToggleKey` on the next frame. `loadConfig` is declared long
+  ## before `keyCodeOrdinal` exists, and this avoids a forward declaration
+  ## whose only purpose would be ordering.
 var cfgCancelZoomOnUnAds = false
 var cfgZoomOnHoldBreath = false
 var cfgOpticToggleZoomMulti = 0.9
@@ -375,6 +428,7 @@ proc loadConfig() =
   cfgCameraDecreaseOffsetKey = cfgText("cameraDecreaseOffsetKey", "KeypadDivide")
 
   cfgZoomToggleKey = cfgText("zoomToggleKey", "M")
+  gZoomKeyDirty = true
   cfgHoldToZoom = cfgBool("holdToZoom", true)
   cfgCancelZoomOnUnAds = cfgBool("cancelZoomOnUnAds", false)
   cfgZoomOnHoldBreath = cfgBool("zoomOnHoldBreath", false)
@@ -484,10 +538,14 @@ proc fovSchema(): seq[Setting] =
                  step = 0.01, category = "FOV"),
     intSetting("maxBaseFov", "Max base FOV", 110, lo = 30, hi = 140,
                category = "FOV", implemented = false,
-               description = "Read; the FOV-range slider patch is not expressible yet"),
+               description = "Read only. MEASURED: the bound is the C# const " &
+                 "GameSettingsGroup.MAX_FIELD_OF_VIEW (field attrs 0x8056 = " &
+                 "LITERAL|STATIC|HASDEFAULT). A const has no storage and is " &
+                 "inlined at every use site, so there is nothing to write."),
     intSetting("minBaseFov", "Min base FOV", 30, lo = 10, hi = 120,
                category = "FOV", implemented = false,
-               description = "Read; the FOV-range slider patch is not expressible yet"),
+               description = "Read only. MEASURED: MIN_FIELD_OF_VIEW is a C# " &
+                 "const (attrs 0x8056), same as the max -- inlined, no storage."),
 
     boolSetting("changeMouseSensitivity", "Scale mouse sensitivity", true,
                 category = "Sensitivity",
@@ -500,18 +558,38 @@ proc fovSchema(): seq[Setting] =
                  hi = 2.0, step = 0.001, category = "Sensitivity"),
 
     keybindSetting("zoomToggleKey", "Toggle-zoom key", "M",
-                   category = "Toggle zoom", implemented = false,
-                   description = "Read; needs KeyCode-enum name mapping, not yet expressible"),
+                   category = "Toggle zoom",
+                   description = "Applies the toggle-zoom FOV multipliers " &
+                     "while this key asks for zoom. The name is resolved to a " &
+                     "UnityEngine.KeyCode ordinal from a 328-member table " &
+                     "generated by `tools/fldoff.py enum UnityEngine.KeyCode`, " &
+                     "then passed to Input::GetKey / GetKeyDown at their " &
+                     "prologue-verified static RVAs. A name that is not a " &
+                     "KeyCode member is REFUSED with the name printed -- it is " &
+                     "never quietly read as KeyCode.None, which is a real key " &
+                     "whose ordinal is 0."),
     boolSetting("holdToZoom", "Hold to zoom", true, category = "Toggle zoom",
-                implemented = false, description = "Read; toggle-zoom is not wired yet"),
+                description = "On: zoom lasts while the key is held " &
+                  "(Input::GetKey, a level). Off: each press toggles it " &
+                  "(Input::GetKeyDown, an edge, latched in this mod). Both " &
+                  "are polled ahead of the FOV rate gate, because an edge is " &
+                  "one frame wide and that gate skips frames."),
 
     floatSetting("rifleCameraZOffset", "Rifle camera Z offset", 0.025,
                  lo = -0.2, hi = 0.2, step = 0.005, category = "Camera",
                  implemented = false,
-                 description = "Read; the camera-offset write is not expressible yet"),
+                 description = "Read only. ProceduralWeaponAnimation's field " &
+                   "list IS now resolvable offline (tools/fldoff.py), so the " &
+                   "old 'cannot confirm the name' reason has expired. What " &
+                   "blocks it now is semantics: upstream's LerpCameraPatch is " &
+                   "not vendored beside this file, so WHICH of _cameraByFOVOffset " &
+                   "/ RotationCameraOffset / _vCameraTarget it writes, and how, " &
+                   "would be a guess about behaviour rather than about a name."),
     floatSetting("rifleAimSpeedZ", "Rifle aim speed Z", 3.0, lo = 0.0, hi = 10.0,
                  step = 0.1, category = "Camera", implemented = false,
-                 description = "Read; the aim-speed write is not expressible yet"),
+                 description = "Read only. Same LerpCameraPatch semantics gap " &
+                   "as rifleCameraZOffset; the per-axis speed fields are not " &
+                   "identifiable without the upstream source."),
 
     boolSetting("verifyHooks", "Verify hooks at load", true, category = "Advanced",
                 description = "Assert each detour bound before trusting it")]
@@ -988,6 +1066,35 @@ const
     ## `applyFovOnCamera` flag makes the write reach the camera.
   ProSetFov3 = "48 89 5C 24 10 56 48 83 EC 40 80 3D AD 3A E5 05"
 
+  RvaGetKey = 0x531eae0
+    ## UnityEngine.Input::GetKey(KeyCode) -> bool. rid=41, arity 1, STATIC,
+    ## from `il2cpp_resolve.py type 30607 --shared`. It shares its RVA with
+    ## `GetKeyInt(KeyCode)` -- the same body under its internal name. A
+    ## shared RVA is a hazard for a DETOUR, which has unbounded blast
+    ## radius; this CALLS it, with the argument it is correct for, so
+    ## sharedness is not a risk here.
+  ProGetKey = "40 53 48 83 EC 20 48 8B 05 2B 72 DB 01 8B D9 48"
+
+  RvaGetKeyDown = 0x531eb80
+    ## UnityEngine.Input::GetKeyDown(KeyCode) -> bool. rid=45, arity 1,
+    ## STATIC, same source, same alias pair (`GetKeyDownInt`). Both bodies
+    ## sit in the `il2cpp` section and neither is the universal empty-body
+    ## stub at 0x628110 -- checked with `bytes`, which printed a real stack
+    ## frame, not `C2 00 00`.
+  ProGetKeyDown = "40 53 48 83 EC 20 48 8B 05 9B 71 DB 01 8B D9 48"
+
+  KeyIntervalNs = 2_000_000'i64
+    ## The key poll runs BEFORE the FOV rate gate, because `GetKeyDown` is
+    ## true for exactly one frame and a gate that skips that frame eats the
+    ## press. It therefore needs a gate of its own: the hook this rides on
+    ## fires once per PLAYER per frame (every bot included), so an ungated
+    ## poll would be forty calls a frame rather than one.
+    ##
+    ## 500 Hz, stated as a falsifiable limit rather than as a safe number:
+    ## up to 500 fps this is at most one poll per frame and misses no edge;
+    ## above 500 fps a toggle press can be missed. `holdToZoom` (the
+    ## default) reads a level, not an edge, and is unaffected either way.
+
   # Field offsets. These replace three by-name property getters outright:
   # `get_Camera` on BOTH managers resolves to 0x65ED10, whose bytes are
   # `48 8B 41 70 C3` -- `mov rax,[rcx+0x70]; ret`. The getter IS the field
@@ -1151,6 +1258,165 @@ proc guardedField(obj: Il2CppPtr; off: int; what: string): Il2CppPtr =
   if not fovReadable(p, 16):
     return
   result = p
+
+# ---------------------------------------------------------------------------
+# UnityEngine.KeyCode: name -> ordinal
+# ---------------------------------------------------------------------------
+#
+# GENERATED, not remembered. The table below is the verbatim output of
+#
+#     python tools/fldoff.py enum UnityEngine.KeyCode
+#
+# against the installed GameAssembly.dll -- all 328 members, in metadata
+# order. Nothing here was typed from memory, which is the entire reason these
+# two settings were inert until now.
+#
+# The history matters, because the old refusal was honest and the correction
+# is what changed. KeyCode's constants are LITERAL (attrs 0x8056) and live in
+# metadata property 8, `fieldAndParameterDefaultValueData`. That blob is NOT
+# encrypted -- it stores I4/U4 as ECMA-335 compressed integers, BIG-ENDIAN and
+# zigzagged, not as raw int32. Reading four raw bytes at `KeyCode.None` (a
+# single 0x00 byte) swallowed the next three constants and produced
+# -25161728, which is exactly the number this file used to quote as proof the
+# blob "does not decode". It decodes; the READER was wrong.
+# `il2cpp_resolve.py verify-consts` now checks the decoder against 19
+# independently-known values (KeyCode None/Space/A/Alpha0 plus one per
+# primitive width) and prints CONSTANT DECODER SELF-CHECK PASSED.
+
+const
+  KeyCodeTable =
+    "None=0,Backspace=8,Delete=127,Tab=9,Clear=12,Return=13,Pause=19,Es" &
+    "cape=27,Space=32,Keypad0=256,Keypad1=257,Keypad2=258,Keypad3=259,K" &
+    "eypad4=260,Keypad5=261,Keypad6=262,Keypad7=263,Keypad8=264,Keypad9" &
+    "=265,KeypadPeriod=266,KeypadDivide=267,KeypadMultiply=268,KeypadMi" &
+    "nus=269,KeypadPlus=270,KeypadEnter=271,KeypadEquals=272,UpArrow=27" &
+    "3,DownArrow=274,RightArrow=275,LeftArrow=276,Insert=277,Home=278,E" &
+    "nd=279,PageUp=280,PageDown=281,F1=282,F2=283,F3=284,F4=285,F5=286," &
+    "F6=287,F7=288,F8=289,F9=290,F10=291,F11=292,F12=293,F13=294,F14=29" &
+    "5,F15=296,Alpha0=48,Alpha1=49,Alpha2=50,Alpha3=51,Alpha4=52,Alpha5" &
+    "=53,Alpha6=54,Alpha7=55,Alpha8=56,Alpha9=57,Exclaim=33,DoubleQuote" &
+    "=34,Hash=35,Dollar=36,Percent=37,Ampersand=38,Quote=39,LeftParen=4" &
+    "0,RightParen=41,Asterisk=42,Plus=43,Comma=44,Minus=45,Period=46,Sl" &
+    "ash=47,Colon=58,Semicolon=59,Less=60,Equals=61,Greater=62,Question" &
+    "=63,At=64,LeftBracket=91,Backslash=92,RightBracket=93,Caret=94,Und" &
+    "erscore=95,BackQuote=96,A=97,B=98,C=99,D=100,E=101,F=102,G=103,H=1" &
+    "04,I=105,J=106,K=107,L=108,M=109,N=110,O=111,P=112,Q=113,R=114,S=1" &
+    "15,T=116,U=117,V=118,W=119,X=120,Y=121,Z=122,LeftCurlyBracket=123," &
+    "Pipe=124,RightCurlyBracket=125,Tilde=126,Numlock=300,CapsLock=301," &
+    "ScrollLock=302,RightShift=303,LeftShift=304,RightControl=305,LeftC" &
+    "ontrol=306,RightAlt=307,LeftAlt=308,LeftMeta=310,LeftCommand=310,L" &
+    "eftApple=310,LeftWindows=311,RightMeta=309,RightCommand=309,RightA" &
+    "pple=309,RightWindows=312,AltGr=313,Help=315,Print=316,SysReq=317," &
+    "Break=318,Menu=319,Mouse0=323,Mouse1=324,Mouse2=325,Mouse3=326,Mou" &
+    "se4=327,Mouse5=328,Mouse6=329,JoystickButton0=330,JoystickButton1=" &
+    "331,JoystickButton2=332,JoystickButton3=333,JoystickButton4=334,Jo" &
+    "ystickButton5=335,JoystickButton6=336,JoystickButton7=337,Joystick" &
+    "Button8=338,JoystickButton9=339,JoystickButton10=340,JoystickButto" &
+    "n11=341,JoystickButton12=342,JoystickButton13=343,JoystickButton14" &
+    "=344,JoystickButton15=345,JoystickButton16=346,JoystickButton17=34" &
+    "7,JoystickButton18=348,JoystickButton19=349,Joystick1Button0=350,J" &
+    "oystick1Button1=351,Joystick1Button2=352,Joystick1Button3=353,Joys" &
+    "tick1Button4=354,Joystick1Button5=355,Joystick1Button6=356,Joystic" &
+    "k1Button7=357,Joystick1Button8=358,Joystick1Button9=359,Joystick1B" &
+    "utton10=360,Joystick1Button11=361,Joystick1Button12=362,Joystick1B" &
+    "utton13=363,Joystick1Button14=364,Joystick1Button15=365,Joystick1B" &
+    "utton16=366,Joystick1Button17=367,Joystick1Button18=368,Joystick1B" &
+    "utton19=369,Joystick2Button0=370,Joystick2Button1=371,Joystick2But" &
+    "ton2=372,Joystick2Button3=373,Joystick2Button4=374,Joystick2Button" &
+    "5=375,Joystick2Button6=376,Joystick2Button7=377,Joystick2Button8=3" &
+    "78,Joystick2Button9=379,Joystick2Button10=380,Joystick2Button11=38" &
+    "1,Joystick2Button12=382,Joystick2Button13=383,Joystick2Button14=38" &
+    "4,Joystick2Button15=385,Joystick2Button16=386,Joystick2Button17=38" &
+    "7,Joystick2Button18=388,Joystick2Button19=389,Joystick3Button0=390" &
+    ",Joystick3Button1=391,Joystick3Button2=392,Joystick3Button3=393,Jo" &
+    "ystick3Button4=394,Joystick3Button5=395,Joystick3Button6=396,Joyst" &
+    "ick3Button7=397,Joystick3Button8=398,Joystick3Button9=399,Joystick" &
+    "3Button10=400,Joystick3Button11=401,Joystick3Button12=402,Joystick" &
+    "3Button13=403,Joystick3Button14=404,Joystick3Button15=405,Joystick" &
+    "3Button16=406,Joystick3Button17=407,Joystick3Button18=408,Joystick" &
+    "3Button19=409,Joystick4Button0=410,Joystick4Button1=411,Joystick4B" &
+    "utton2=412,Joystick4Button3=413,Joystick4Button4=414,Joystick4Butt" &
+    "on5=415,Joystick4Button6=416,Joystick4Button7=417,Joystick4Button8" &
+    "=418,Joystick4Button9=419,Joystick4Button10=420,Joystick4Button11=" &
+    "421,Joystick4Button12=422,Joystick4Button13=423,Joystick4Button14=" &
+    "424,Joystick4Button15=425,Joystick4Button16=426,Joystick4Button17=" &
+    "427,Joystick4Button18=428,Joystick4Button19=429,Joystick5Button0=4" &
+    "30,Joystick5Button1=431,Joystick5Button2=432,Joystick5Button3=433," &
+    "Joystick5Button4=434,Joystick5Button5=435,Joystick5Button6=436,Joy" &
+    "stick5Button7=437,Joystick5Button8=438,Joystick5Button9=439,Joysti" &
+    "ck5Button10=440,Joystick5Button11=441,Joystick5Button12=442,Joysti" &
+    "ck5Button13=443,Joystick5Button14=444,Joystick5Button15=445,Joysti" &
+    "ck5Button16=446,Joystick5Button17=447,Joystick5Button18=448,Joysti" &
+    "ck5Button19=449,Joystick6Button0=450,Joystick6Button1=451,Joystick" &
+    "6Button2=452,Joystick6Button3=453,Joystick6Button4=454,Joystick6Bu" &
+    "tton5=455,Joystick6Button6=456,Joystick6Button7=457,Joystick6Butto" &
+    "n8=458,Joystick6Button9=459,Joystick6Button10=460,Joystick6Button1" &
+    "1=461,Joystick6Button12=462,Joystick6Button13=463,Joystick6Button1" &
+    "4=464,Joystick6Button15=465,Joystick6Button16=466,Joystick6Button1" &
+    "7=467,Joystick6Button18=468,Joystick6Button19=469,Joystick7Button0" &
+    "=470,Joystick7Button1=471,Joystick7Button2=472,Joystick7Button3=47" &
+    "3,Joystick7Button4=474,Joystick7Button5=475,Joystick7Button6=476,J" &
+    "oystick7Button7=477,Joystick7Button8=478,Joystick7Button9=479,Joys" &
+    "tick7Button10=480,Joystick7Button11=481,Joystick7Button12=482,Joys" &
+    "tick7Button13=483,Joystick7Button14=484,Joystick7Button15=485,Joys" &
+    "tick7Button16=486,Joystick7Button17=487,Joystick7Button18=488,Joys" &
+    "tick7Button19=489,Joystick8Button0=490,Joystick8Button1=491,Joysti" &
+    "ck8Button2=492,Joystick8Button3=493,Joystick8Button4=494,Joystick8" &
+    "Button5=495,Joystick8Button6=496,Joystick8Button7=497,Joystick8But" &
+    "ton8=498,Joystick8Button9=499,Joystick8Button10=500,Joystick8Butto" &
+    "n11=501,Joystick8Button12=502,Joystick8Button13=503,Joystick8Butto" &
+    "n14=504,Joystick8Button15=505,Joystick8Button16=506,Joystick8Butto" &
+    "n17=507,Joystick8Button18=508,Joystick8Button19=509"
+
+proc kcFold(x: char): int =
+  ## ASCII lower-case, without `chr` and without a stdlib import.
+  result = int(x)
+  if result >= 65 and result <= 90:
+    result = result + 32
+
+proc kcEq(a, b: string): bool =
+  if a.len != b.len:
+    return false
+  var i = 0
+  while i < a.len:
+    if kcFold(a[i]) != kcFold(b[i]):
+      return false
+    inc i
+  result = true
+
+proc keyCodeOrdinal(name: string): int =
+  ## The `UnityEngine.KeyCode` ordinal for a configured key name, or -1.
+  ##
+  ## -1 is a REFUSAL, not a key: `KeyCode.None` is genuinely 0, so "unknown"
+  ## and "None" must never collapse onto the same answer. Case-insensitive,
+  ## because config.json is written by a human.
+  result = -1
+  if name.len == 0:
+    return
+  let t = KeyCodeTable
+  var i = 0
+  while i < t.len:
+    var j = i
+    while j < t.len and t[j] != '=':
+      inc j
+    if j >= t.len:
+      return
+    var k = j + 1
+    while k < t.len and t[k] != ',':
+      inc k
+    var nm = ""
+    var q = i
+    while q < j:
+      nm.add t[q]
+      inc q
+    if kcEq(nm, name):
+      var v = 0
+      var r = j + 1
+      while r < k:
+        v = v * 10 + (int(t[r]) - int('0'))
+        inc r
+      return v
+    i = k + 1
 
 proc signatureOf(owner, member: string; argc: int;
                  params: var seq[string]; ret: var string): bool =
@@ -1451,6 +1717,8 @@ proc noKinds(): seq[FastKind] =
 # becomes true. See fast.nim's rule 1.
 var bCamInstance: Binding      ## CameraManager::get_Instance, static RVA
 var bSetFov: Binding           ## CameraManager::SetFov(f,f,b), static RVA
+var bGetKey: Binding           ## Input::GetKey(KeyCode), static RVA
+var bGetKeyDown: Binding       ## Input::GetKeyDown(KeyCode), static RVA
   ## `bWorld` is GONE. There is no `EFT.GameWorld::get_Instance` on this
   ## build (409 members, zero matches), the by-name attempt to find one was
   ## the statement that killed the client, and the world now arrives from
@@ -1471,6 +1739,14 @@ var gFovNs = 0'i64
 var gFovSamples = 0
 var gFovBoundSaid = false
 
+var gZoomKeyCode = -1          ## resolved from cfgZoomToggleKey; -1 = refused
+var gZoomKeyState = "not attempted"
+var gZoomLatch = false         ## the toggle latch, when holdToZoom is off
+var gZoomOn = false            ## what the last poll decided
+var gZoomFrames = 0'i64        ## FOV writes taken with the zoom key asserted
+var gLastAiming = false
+var gLastKeyTicks = 0'i64
+
 const
   FovIntervalNs = 4_000_000'i64
     ## The FOV write is idempotent and the hook it rides on fires once per
@@ -1490,6 +1766,13 @@ const
     ## How many writes are timed before the measurement stops. Two `perfCounter`
     ## calls are about forty nanoseconds, the same order as the work, so
     ## measuring forever would be paying for a number nobody reads twice.
+
+proc keyKinds(): seq[FastKind] =
+  ## `bool GetKey(KeyCode key)`. A KeyCode is an enum over Int32, so its
+  ## register class is `fkI32` -- one general-purpose register. Stated from
+  ## the offline signature (`il2cpp_resolve.py type 30607`), not inferred by
+  ## `classifyType`, which is the by-name route this file does not take.
+  result = @[fkI32]
 
 proc setFovKinds3(): seq[FastKind] =
   ## The register classes of `SetFov(float x, float time, bool
@@ -1582,6 +1865,22 @@ proc bindFovStatics(): bool =
   gSetFovArgc = 3
   info "FOV: " & bSetFov.why
 
+  # The toggle-zoom key. NON-FATAL by construction: a refusal here leaves
+  # the FOV write exactly as it was and is reported on its own line,
+  # because a missing key must not take down the effect that works.
+  bc "S3a about to prologue-verify Input::GetKey / GetKeyDown"
+  bGetKey = bindAtRva("Input::GetKey(KeyCode)", RvaGetKey, ProGetKey,
+                      keyKinds(), fkBool, true)
+  bGetKeyDown = bindAtRva("Input::GetKeyDown(KeyCode)", RvaGetKeyDown,
+                          ProGetKeyDown, keyKinds(), fkBool, true)
+  if bGetKey.ok and bGetKeyDown.ok:
+    info "FOV: " & bGetKey.why
+    info "FOV: " & bGetKeyDown.why
+  else:
+    warn "FOV: toggle zoom refused -- " &
+         (if bGetKey.ok: bGetKeyDown.why else: bGetKey.why)
+  gZoomKeyDirty = true
+
   bc "S3 both RVAs verified; bindFovStatics returning true"
   gFovState = "arming: SetFov verified at 0x" & hexs(RvaSetFov3) &
               " with 3 argument(s); waiting for a live CameraManager"
@@ -1646,6 +1945,63 @@ proc opticFieldOfView(): float =
 # Effect 1: the per-frame FOV write
 # ---------------------------------------------------------------------------
 
+proc pollZoomKey() =
+  ## Effect 5: the toggle-zoom key.
+  ##
+  ## Runs on the game thread, inside the game's own frame, which is the only
+  ## place `UnityEngine.Input` may be read at all. No allocation: `Args` is a
+  ## stack value and the KeyCode goes in as a plain integer.
+  ##
+  ## The three-way outcome is kept. `gZoomKeyState` says armed, refused with
+  ## a reason, or not attempted, and `gZoomOn` is false in every case but
+  ## the first -- so "the key is not down" and "there is no key" never
+  ## collapse onto the same answer in the log.
+  if gZoomKeyDirty:
+    gZoomKeyDirty = false
+    gZoomLatch = false
+    gZoomOn = false
+    gZoomKeyCode = keyCodeOrdinal(cfgZoomToggleKey)
+    if gZoomKeyCode < 0:
+      gZoomKeyState = "refused: \"" & cfgZoomToggleKey & "\" is not a " &
+                      "member of UnityEngine.KeyCode. The 328-member map " &
+                      "in this file is the output of `tools/fldoff.py enum " &
+                      "UnityEngine.KeyCode`; a name that is not in it is " &
+                      "not a key on this build, and is NOT read as None."
+      warn "FOV: " & gZoomKeyState
+    elif bGetKey.ok and bGetKeyDown.ok:
+      gZoomKeyState = "armed: " & cfgZoomToggleKey & " = KeyCode " &
+                      $gZoomKeyCode & ", " &
+                      (if cfgHoldToZoom: "hold to zoom" else: "toggle") &
+                      (if cfgCancelZoomOnUnAds: ", cancelled on un-ADS"
+                       else: "")
+      info "FOV: toggle zoom " & gZoomKeyState
+    else:
+      gZoomKeyState = "refused: " &
+                      (if bGetKey.ok: bGetKeyDown.why else: bGetKey.why)
+  if gZoomKeyCode < 0 or not bGetKey.ok or not bGetKeyDown.ok:
+    gZoomOn = false
+    return
+  let now = perfCounter()
+  if gLastKeyTicks != 0'i64 and
+     nanosBetween(gLastKeyTicks, now) < KeyIntervalNs:
+    return
+  gLastKeyTicks = now
+  var a = noArgs()
+  addInt(a, int64(gZoomKeyCode))
+  if cfgHoldToZoom:
+    gZoomOn = callBool(bGetKey, nullPtr(), a)
+    return
+  if callBool(bGetKeyDown, nullPtr(), a):
+    gZoomLatch = not gZoomLatch
+  # `cancelZoomOnUnAds` reads the PREVIOUS write's aiming state, because
+  # this poll deliberately runs ahead of the frame that computes the next
+  # one. One frame of lag, on a latch that only ever clears; said here
+  # rather than hidden. It defaults off, so the default path does not
+  # depend on it at all.
+  if cfgCancelZoomOnUnAds and not gLastAiming:
+    gZoomLatch = false
+  gZoomOn = gZoomLatch
+
 proc applyFov() =
   ## Upstream's `FovController.Update`, on the fast path.
   ##
@@ -1657,6 +2013,9 @@ proc applyFov() =
     return
   if not bCamInstance.ok or not bSetFov.ok:
     return
+  # BEFORE the rate gate: GetKeyDown is a one-frame edge and the gate below
+  # skips frames by design. pollZoomKey has its own, tighter gate.
+  pollZoomKey()
   let now = perfCounter()
   if gLastFovTicks != 0'i64 and
      nanosBetween(gLastFovTicks, now) < FovIntervalNs:
@@ -1774,9 +2133,20 @@ proc applyFov() =
           a.reset()
           optic = callBool(obIsOptic.b, scope, a)
 
+  gLastAiming = aiming
+
   var mult = 1.0
   if aiming:
     mult = (if optic: cfgOpticFovMulti else: cfgNonOpticFovMulti)
+  if gZoomOn:
+    # Upstream applies the toggle-zoom multiplier ON TOP of the aim
+    # multiplier, and picks the unaimed one when the player is not aiming.
+    if aiming:
+      mult = mult * (if optic: cfgOpticToggleZoomMulti
+                     else: cfgNonOpticToggleZoomMulti)
+    else:
+      mult = mult * cfgUnaimedToggleZoomMulti
+    gZoomFrames = gZoomFrames + 1
 
   let target = gBaseFov * mult
   a.reset()
@@ -2558,12 +2928,17 @@ proc reportWatch() =
        "the host does today rather than what it did when the port was " &
        "written: LerpCamera and Look are neither a gap nor a cost any more " &
        "(the payload carries `this`, thisPointer turns it into an address in " &
-       "8 ns, and bindRaw reaches a Vector3) -- what is left is that this " &
-       "port cannot confirm the camera-offset field names on " &
-       "ProceduralWeaponAnimation against a running build, which is a name " &
-       "problem rather than a capability one; the FOV slider range is the " &
-       "same kind of name problem on GameSettingsTab; the toggle-zoom key " &
-       "needs a KeyCode ordinal this port will not guess -- and note that " &
+       "8 ns, and bindRaw reaches a Vector3) -- and the NAME objection has " &
+       "expired as well, because fldoff.py prints " &
+       "ProceduralWeaponAnimation's whole field list offline; what is left " &
+       "for LerpCamera is that upstream's patch is not vendored, so its " &
+       "BEHAVIOUR would be the guess. The FOV slider range is NOT the same " &
+       "kind of problem and is no longer a 'not yet': measured, the bounds " &
+       "are C# consts (GameSettingsGroup.MIN/MAX_FIELD_OF_VIEW, attrs " &
+       "0x8056 = LITERAL), inlined with no storage, so there is nothing to " &
+       "write. The toggle-zoom key " &
+       "needs a KeyCode ordinal this port will not guess -- measured: the " &
+       "ordinals live in a metadata blob that does not decode here -- and " &
        "that is now the whole of the objection, because an enum argument is " &
        "a plain number to the host and no longer refused. " &
        "get_AimingSensitivity is no longer on this list: it is a postfix now, " &
@@ -2841,6 +3216,8 @@ proc simSelfTest(): Status =
   reportBinding("CameraManager::get_Instance (verified static RVA)",
                 bCamInstance)
   reportBinding("CameraManager::SetFov (verified static RVA)", bSetFov)
+  reportBinding("Input::GetKey (verified static RVA)", bGetKey)
+  reportBinding("Input::GetKeyDown (verified static RVA)", bGetKeyDown)
   probeMember(TyCamera, "get_Camera", 0)
   probeMember(TyUnityCamera, "get_fieldOfView", 0)
   # -1 when the arity check above did not settle on one, so the probe reports
@@ -2894,9 +3271,13 @@ proc simSelfTest(): Status =
        "old blockers are gone: the payload carries `this`, thisPointer turns " &
        "it into an address in ~8 ns, and bindRaw binds a method by its native " &
        "slot shape, which is what a 12-byte Vector3 by hidden pointer needs. " &
-       "What is left is that this port cannot confirm the camera-offset " &
-       "field names on ProceduralWeaponAnimation against a running build, " &
-       "and will not write a camera offset through a guessed name."
+       "The NAME objection has expired too: fldoff.py prints the whole " &
+       "ProceduralWeaponAnimation field list offline -- _cameraByFOVOffset " &
+       "@0x1e0, RotationCameraOffset @0x18c, _vCameraTarget @0x180, Offset " &
+       "@0x98, CameraSmoothTime @0x124, vel @0x128. What is left is that " &
+       "upstream's LerpCameraPatch is not vendored beside this file, so which " &
+       "of those it writes and how is a guess about BEHAVIOUR, which is worse " &
+       "than a guess about a name. Refused."
   info "    Player::Look -- unchanged, and about the payload rather than the " &
        "instance: the angles arrive as a UnityEngine.Vector2, which is passed " &
        "by hidden pointer and reported as {\"valueType\":\"...\"} -- named " &
@@ -2907,13 +3288,23 @@ proc simSelfTest(): Status =
        "multiply, hand the product back. Typed (~44 ns) on a revision-4 " &
        "host, JSON (~1.6 us) on revision 3, and the effect's state line says " &
        "which armed."
-  info "    the toggle-zoom key -- UnityEngine.Input::GetKey takes a KeyCode " &
-       "enum and this port will not map the configured names onto ordinals " &
-       "it cannot confirm."
-  info "    the base-FOV slider range -- now blocked only by a *name*. The " &
-       "instance is delivered and this fires when a menu opens, so the cost " &
-       "objection does not apply; what cannot be confirmed from here is which " &
-       "field on GameSettingsTab holds the slider bounds."
+  info "    the toggle-zoom key -- **ported**. The old refusal here quoted a " &
+       "real measurement (KeyCode.None decoding as -25161728) and drew the " &
+       "wrong conclusion from it: metadata property 8 is NOT encrypted, it " &
+       "stores I4/U4 as ECMA-335 compressed integers, big-endian and " &
+       "zigzagged, so a four-raw-byte read at None swallowed three " &
+       "constants. `tools/fldoff.py enum UnityEngine.KeyCode` decodes all " &
+       "328 members and `il2cpp_resolve.py verify-consts` checks the decoder " &
+       "against 19 known values. Input::GetKey @0x531EAE0 / GetKeyDown " &
+       "@0x531EB80, both static, both prologue-verified at bind."
+  info "    toggle zoom state: " & gZoomKeyState & " -- writes taken with " &
+       "zoom asserted: " & $gZoomFrames
+  info "    the base-FOV slider range -- MEASURED and now a hard NO, not a " &
+       "'not yet'. GameSettingsTab has 34 fields on this build and no FOV " &
+       "bound among them; the bounds are GameSettingsGroup.MIN_FIELD_OF_VIEW " &
+       "/ MAX_FIELD_OF_VIEW, both attrs 0x8056 = FIELD_ATTRIBUTE_LITERAL. A " &
+       "C# const has no storage and is inlined at every use site: there is " &
+       "no field to write and no getter to detour."
 
   # --- the cost of the per-frame path, on this machine's own clock.
   const Iterations = 20000
@@ -2978,6 +3369,9 @@ proc onLoad(): Status =
        $cfgNonOpticFovMulti & ", base FOV range " & $cfgMinBaseFov & ".." &
        $cfgMaxBaseFov
   info "config: toggle zoom on " & cfgZoomToggleKey &
+       " (KeyCode " &
+       (if keyCodeOrdinal(cfgZoomToggleKey) < 0: "UNKNOWN -- refused"
+        else: $keyCodeOrdinal(cfgZoomToggleKey)) & ")" &
        (if cfgHoldToZoom: " (hold)" else: " (toggle)") &
        ", optic x" & $cfgOpticToggleZoomMulti &
        ", non-optic x" & $cfgNonOpticToggleZoomMulti
