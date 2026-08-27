@@ -29,6 +29,8 @@ constant is the failure mode this file exists to avoid.
     queststatus  strip the `status` key, as the stored SPT templates do
     hideout    remove area 21 from the profile, as the old constant did
     fence      report Fence's generated assort as empty
+    descriptor add a ProfileDescriptor member we correctly never serve on this
+               route, which MUST turn the descriptor check red
 """
 
 import argparse
@@ -41,6 +43,25 @@ import zlib
 
 OK, FAIL, INCONC = "PASS", "FAIL", "INCONCLUSIVE"
 JAEGER = "5c0647fdd443bc2504c2d371"
+
+# Members of the client's `EFT.ProfileDescriptor` that `/client/game/profile/list`
+# must carry, with the wire name the [JsonProperty] attribute gives them.
+#
+# THIS LIST IS A CONSTANT HERE AND THAT IS A LIMITATION, stated rather than
+# hidden: a check that compares our output to our own constant cannot notice
+# the constant going stale.  The AUTHORITY is `tools/oursample.py`, which
+# derives the whole member set from the decrypted global-metadata and diffs it
+# against our own served payload; these three are the rows it reported as
+# EXPECTED-BUT-MISSING on 2026-08-27.  betacheck's narrower job is to prove
+# they are on the wire, on a re-read, and are not null.
+#
+# `Bonuses` is a real member of the profile document and IS served; the mutant
+# below asks instead for `BTRLocalSettings`, which is a member of
+# EFT.GlobalConfiguration and has no business on this route -- so the mutated
+# run demands something genuinely absent and MUST go red.  That is the input
+# which makes this check fail.
+DESCRIPTOR_MEMBERS = ["CheckedChambers", "CheckedMagazines", "karmaValue"]
+MUTANT_MEMBER = "BTRLocalSettings"
 PRAPOR = "54cb50c76803fa8b248b4571"
 FENCE = "579dc571d53a0658a154fbec"
 
@@ -490,6 +511,36 @@ def main():
                    "%d reachable trader(s) checked, Fence generates %d fully "
                    "priced offers, %d empty-by-design and named"
                    % (checked, fence_items, len(EMPTY_OK)))
+    # ----------------------------------------------------------------- 7
+    # ProfileDescriptor members, asserted as a NEGATIVE on the finished
+    # document that was READ BACK -- never on the create response.
+    st, doc, text = make_profile(w, "Desc" + tag, "standard")
+    session = session_of(doc) if doc else ""
+    p, why = read_back(w, session) if session else (None, "no session")
+    if p is None:
+        record("descriptor", INCONC, why or "no profile to read")
+    else:
+        want = list(DESCRIPTOR_MEMBERS)
+        if mut == "descriptor":
+            want.append(MUTANT_MEMBER)
+        absent = [m for m in want if m not in p]
+        null = [m for m in want if m in p and p[m] is None]
+        if absent:
+            record("descriptor", FAIL,
+                   "ProfileDescriptor member(s) absent from the served "
+                   "profile: %s" % ", ".join(absent))
+        elif null:
+            # null and absent are the same thing to Newtonsoft for a reference
+            # type, so a null must not read as present.
+            record("descriptor", FAIL,
+                   "ProfileDescriptor member(s) served as null: %s"
+                   % ", ".join(null))
+        else:
+            record("descriptor", OK,
+                   "%s all present and non-null (%s)"
+                   % (", ".join(want),
+                      ", ".join("%s=%s" % (m, json.dumps(p[m])[:20])
+                                for m in want)))
 
     print()
     bad = [r for r in results if r[1] != OK]

@@ -422,6 +422,26 @@ proc newProfileText*(id, nickname, sideName, edition: string;
   put(p, "BattlePassProgress", arr())
   put(p, "BattlePassUniversalDocumentBalance", 0)
   put(p, "battlePassDocumentLimitData", obj())
+  # Three more members of the client's `EFT.ProfileDescriptor` that this
+  # profile never carried. MEASURED by `tools/oursample.py` against OUR OWN
+  # served `/client/game/profile/list` -- not against a BSG capture, which is
+  # what every earlier gap number was accidentally measuring.
+  #
+  # `CheckedChambers` (List<MongoID>) and `CheckedMagazines`
+  # (Dictionary<MongoID,int>) are REFERENCE types: absent from the JSON,
+  # Newtonsoft leaves them NULL, and the empty collection is both the correct
+  # fresh-profile state -- a new character has inspected no chamber and no
+  # magazine -- and the value that cannot NRE. `karmaValue` is a float and
+  # would silently default to 0, which is also the right starting value; it is
+  # written explicitly so the key exists rather than relying on that.
+  #
+  # Whether the client DEREFERENCES any of the three is NOT established here.
+  # That needs disassembly of the consumer, which nobody has done. These are
+  # filled because the correct value is knowable and costs nothing, not
+  # because a crash was proved.
+  put(p, "CheckedChambers", arr())
+  put(p, "CheckedMagazines", obj())
+  put(p, "karmaValue", 0.0)
   result = done(p).text
 
 proc replaceValue(text, path, newValue: string): string =
@@ -480,6 +500,46 @@ proc ensurePockets*(p: var Profile): bool =
   p.text = replaceValue(p.text, "Inventory.items", text(list))
   result = true
 
+const DescriptorDefaults = [
+  # (member, JSON literal). Members of the client's `EFT.ProfileDescriptor`
+  # that a profile written before they were known does not carry. MEASURED
+  # against OUR OWN `/client/game/profile/list` by `tools/oursample.py`.
+  ("CheckedChambers", "[]"),
+  ("CheckedMagazines", "{}"),
+  ("karmaValue", "0.0"),
+]
+
+proc ensureDescriptorMembers*(p: var Profile): seq[string] =
+  ## Adds any missing `ProfileDescriptor` member listed in
+  ## `DescriptorDefaults`, and returns the names it had to add.
+  ##
+  ## Same reasoning as `ensurePockets` directly above: new profiles get these
+  ## from `newProfileText`, and every profile already on disk does not -- so a
+  ## fix that only reaches new characters fixes nobody. In memory only, for the
+  ## same reason.
+  ##
+  ## Returning the NAMES rather than a bool on purpose: "it added something" is
+  ## not a result a caller can check against anything, while the list is
+  ## exactly what a wire check can assert has become empty.
+  result = @[]
+  if not p.ok or p.text.len == 0:
+    return
+  var wanted: seq[(string, string)] = @[]
+  for pair in DescriptorDefaults:
+    if not p.field(pair[0]).found:
+      wanted.add pair
+  if wanted.len == 0:
+    return
+  var d = parseObject(p.text)
+  if not d.ok:
+    # Unparseable here is NOT "nothing was missing" -- say nothing rather than
+    # report a repair that did not happen.
+    return
+  for pair in wanted:
+    setRaw(d, pair[0], pair[1])
+    result.add pair[0]
+  p.text = text(d)
+
 # ---------------------------------------------------------------------------
 # Persistence
 # ---------------------------------------------------------------------------
@@ -522,6 +582,14 @@ proc readProfile*(id: string; why: var ProfileRead): Profile =
     why = prLoaded
     if ensurePockets(result):
       info "profile " & id & " had no Pockets item; added one (see PocketsTpl)"
+    let added = ensureDescriptorMembers(result)
+    if added.len > 0:
+      var names = ""
+      for n in added:
+        if names.len > 0: names.add ", "
+        names.add n
+      info "profile " & id & " was missing ProfileDescriptor members: " &
+           names & " (added, empty)"
     return
   if not stored.ok and not stored.missing:
     why = prUnreadable
