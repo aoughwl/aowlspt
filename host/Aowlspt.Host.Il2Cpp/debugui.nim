@@ -143,6 +143,51 @@ proc cDuSetVec3(fn, self: Il2CppPtr; x, y, z: float64) {.
 proc cDuStringLen(s: Il2CppPtr): int32 {.
   importc: "aowl_du_string_len", nodecl.}
 
+# ---------------------------------------------------------------------------
+# THE WIDGET LAYER'S NATIVE SURFACE (abi/aowlspt_widget.h)
+#
+# The pointer, process memory, and a READ-ONLY view of the shared region's
+# participant table. Nothing here detours, resolves a name, or touches managed
+# memory; see the header's own preamble for why the pointer is polled with
+# `GetAsyncKeyState`/`GetCursorPos` rather than hooked, and why that makes the
+# WM_KEYDOWN-vs-WM_SYSKEYDOWN classification that broke F10 in the D3D overlay
+# structurally inapplicable to F3 here.
+# ---------------------------------------------------------------------------
+{.emit: """#include "aowlspt_widget.h" """.}
+
+proc cWgMouseSample(): int32 {.importc: "aowl_wg_mouse_sample", nodecl.}
+proc cWgMouseOk(): int32 {.importc: "aowl_wg_mouse_ok", nodecl.}
+proc cWgMouseX(): int32 {.importc: "aowl_wg_mouse_x", nodecl.}
+proc cWgMouseY(): int32 {.importc: "aowl_wg_mouse_y", nodecl.}
+proc cWgClientW(): int32 {.importc: "aowl_wg_client_w", nodecl.}
+proc cWgClientH(): int32 {.importc: "aowl_wg_client_h", nodecl.}
+proc cWgLmbHeld(): int32 {.importc: "aowl_wg_lmb_held", nodecl.}
+proc cWgLmbPressed(): int32 {.importc: "aowl_wg_lmb_pressed", nodecl.}
+proc cWgLmbReleased(): int32 {.importc: "aowl_wg_lmb_released", nodecl.}
+proc cWgCtrlDown(): int32 {.importc: "aowl_wg_ctrl_down", nodecl.}
+
+proc cWgMemSample() {.importc: "aowl_wg_mem_sample", nodecl.}
+proc cWgWs(): int64 {.importc: "aowl_wg_ws", nodecl.}
+proc cWgPriv(): int64 {.importc: "aowl_wg_priv", nodecl.}
+proc cWgSysLoad(): int64 {.importc: "aowl_wg_sysload", nodecl.}
+proc cWgSysFree(): int64 {.importc: "aowl_wg_sysfree", nodecl.}
+
+proc cWgRgMax(): int32 {.importc: "aowl_wg_rg_max", nodecl.}
+proc cWgRgSelect(h: int32): int32 {.importc: "aowl_wg_rg_select", nodecl.}
+proc cWgRgNameC(): cstring {.importc: "aowl_wg_rg_name_of", nodecl.}
+proc cWgRgReasonC(): cstring {.importc: "aowl_wg_rg_reason_of", nodecl.}
+proc cWgRgBudget(): int64 {.importc: "aowl_wg_rg_budget", nodecl.}
+proc cWgRgLast(): int64 {.importc: "aowl_wg_rg_last", nodecl.}
+proc cWgRgMaxUs(): int64 {.importc: "aowl_wg_rg_max_us", nodecl.}
+proc cWgRgCalls(): int64 {.importc: "aowl_wg_rg_calls", nodecl.}
+proc cWgRgSkipped(): int64 {.importc: "aowl_wg_rg_skipped", nodecl.}
+proc cWgRgFaults(): int32 {.importc: "aowl_wg_rg_faults", nodecl.}
+proc cWgRgOverruns(): int32 {.importc: "aowl_wg_rg_overruns", nodecl.}
+proc cWgRgEnabled(): int32 {.importc: "aowl_wg_rg_enabled", nodecl.}
+proc cWgRgDisabled(): int32 {.importc: "aowl_wg_rg_disabled", nodecl.}
+proc cWgRgThrottled(): int32 {.importc: "aowl_wg_rg_throttled", nodecl.}
+proc cWgRgArmed(): int32 {.importc: "aowl_wg_rg_armed", nodecl.}
+
 # ---- target indices, mirroring the AOWL_DU_* defines ----
 const
   DuCameraMain     = 0'i32
@@ -1292,6 +1337,749 @@ proc duPanelLine(field: string): string =
   else:
     result = "?" & field
 
+# ===========================================================================
+# THE WIDGETS
+#
+# The panel used to be ONE column: `panelFields` named N fields and the overlay
+# stacked N labels under a single anchor. A widget is that idea taken apart --
+# an INDEPENDENTLY placed, independently toggleable group of those same fields,
+# rendered into ONE label with embedded newlines, and MOVABLE WITH THE MOUSE.
+#
+# One label per widget, not one per line, and that is what makes dragging cheap
+# and correct: a widget is a single rect to hit-test and a single
+# `anchoredPosition` to write, so a drag costs the same four managed calls a
+# static placement already cost, and a widget can never tear (its lines cannot
+# end up half-moved). `duMakeDrawable` already sets word-wrap OFF and overflow
+# to Overflow, so a multi-line string is not clipped by the rect it is given.
+#
+# THE LAYOUT IS RESOLUTION-INDEPENDENT ON PURPOSE. What is persisted is an
+# ANCHOR (a corner or edge of the canvas) plus an offset from it -- never a raw
+# pixel pair. Dragging a widget to the bottom-right and restarting at a
+# different resolution puts it back in the bottom-right, which a stored pixel
+# pair would not. That is also why snapping REBINDS the anchor rather than
+# nudging the offset: the snap is the thing that makes the stored value mean
+# something.
+#
+# NOTHING HERE ALLOCATES ON THE MANAGED HEAP, and the drag runs on the same
+# throttled refresh as the rest of the panel body -- inside the one
+# `aowl_p_p_seh` the body already holds. No second guard is armed anywhere in
+# this section; see the note on `debugUiBodyImpl`.
+# ===========================================================================
+
+const
+  cDuMaxWidgets   = 12    ## hard ceiling; the label pool is built at this size
+  cDuMaxWidgetLines = 14  ## lines rendered into ONE widget label
+  cDuSnapPx       = 14.0  ## canvas units within which a snap engages
+  cDuSnapMargin   = 12.0  ## resting distance from a screen edge after a snap
+  cDuSnapGap      = 4.0   ## resting gap when a widget snaps to another widget
+
+type DuWidget = object
+  id: string            ## stable key: the config and the layout file use it
+  title: string         ## header line; "" draws no header
+  fields: string        ## comma-separated `duPanelLine` field names
+  on: bool              ## individually toggleable
+  anchor: string        ## topleft | topright | bottomleft | bottomright |
+                        ## top | bottom | center
+  x: float64            ## offset from that anchor, canvas units
+  y: float64            ## Unity Y grows UP, so a top anchor wants negative Y
+  w: float64            ## last rendered extent, canvas units -- for hit-test
+  h: float64
+  lines: int            ## last rendered line count
+  dragging: bool
+  grabDx: float64       ## cursor offset from the widget's pivot point at grab
+  grabDy: float64
+
+var gDuWidgets: seq[DuWidget] = @[]
+var gDuEdit = false           ## edit mode: widgets are draggable. DEFAULT OFF.
+var gDuEditLogged = false
+var gDuLayoutDirty = false
+var gDuLayoutSource = "built-in defaults"
+var gDuKeyRouteLogged = false
+
+## The built-in widget set. `id:title:fields` -- and the fields are exactly the
+## `duPanelLine` names the single-column panel already understood, so every
+## field that worked before still works, just grouped.
+const cDuDefaultWidgets = [
+  ("fps",     "FPS",      "fps,frametime"),
+  ("scene",   "SCENE",    "map,raid"),
+  ("pos",     "POSITION", "pos,rot"),
+  ("mem",     "MEMORY",   "mem"),
+  ("bots",    "BOTS",     "bots,botlist"),
+  ("prof",    "PROFILER", "region"),
+  ("build",   "BUILD",    "build,frame"),
+  ("notes",   "NOTES",    "note1,note2,note3")]
+
+proc duDefaultWidgetSpec(id: string; title, fields: var string): bool =
+  for i in 0 ..< cDuDefaultWidgets.len:
+    if cDuDefaultWidgets[i][0] == id:
+      title = cDuDefaultWidgets[i][1]
+      fields = cDuDefaultWidgets[i][2]
+      return true
+  title = id
+  fields = id
+  false
+
+## Where each widget starts life the very first time, before anything has been
+## dragged. Spread across the corners rather than stacked, so the first F3 shows
+## eight distinguishable widgets instead of one illegible pile.
+proc duDefaultPlace(id: string; anchor: var string; x, y: var float64) =
+  case id
+  of "fps":    anchor = "topleft";     x =  16.0; y =  -16.0
+  of "scene":  anchor = "topleft";     x =  16.0; y = -104.0
+  of "pos":    anchor = "topleft";     x =  16.0; y = -176.0
+  of "mem":    anchor = "topright";    x = -16.0; y =  -16.0
+  of "bots":   anchor = "bottomleft";  x =  16.0; y =  120.0
+  of "prof":   anchor = "topright";    x = -16.0; y =  -88.0
+  of "build":  anchor = "bottomleft";  x =  16.0; y =   16.0
+  of "notes":  anchor = "bottomright"; x = -16.0; y =   16.0
+  else:        anchor = "topleft";     x =  16.0; y =  -16.0
+
+# ---------------------------------------------------------------------------
+# Loading the widget layout
+#
+# TWO files, and the split is deliberate:
+#
+#   `aowlspt-debugui.json`        the USER's file. Hand-edited. Declares which
+#                                 widgets exist, their titles and their fields.
+#                                 The overlay NEVER writes to it.
+#   `aowlspt-debugui-layout.json` the OVERLAY's file. Machine-written on every
+#                                 drop. Holds only on/anchor/x/y per widget.
+#
+# A single file would mean the overlay rewriting the user's comments, ordering
+# and field choices every time a widget was nudged. This way a drag can never
+# destroy anything a human typed, and deleting the layout file is a clean
+# "put everything back where it started".
+#
+# Both are read with the same shallow flat-key scan the rest of the file uses,
+# so the keys are dotted rather than nested (`w.fps.x`, not `{"fps":{"x":..}}`).
+# A shallow scanner pointed at a nested schema would happily find an `"x"`
+# belonging to a different object, which is a trap, not a convenience.
+# ---------------------------------------------------------------------------
+proc duLayoutPath(): string = joinPath(gDir, "aowlspt-debugui-layout.json")
+
+proc duLoadWidgets() =
+  ## Build `gDuWidgets` from the user file, then apply the saved layout over it.
+  ## Called at boot and on every toggle-ON, so both files are live-editable.
+  var text = ""
+  discard readTextFile(joinPath(gDir, "aowlspt-debugui.json"), text)
+  var lay = ""
+  let haveLay = readTextFile(duLayoutPath(), lay)
+
+  var order = duCfgStr(text, "widgets",
+                       "fps,scene,pos,mem,bots,prof,build,notes")
+  var ids = duSplit(order, ',')
+  var built: seq[DuWidget] = @[]
+  for i in 0 ..< ids.len:
+    if built.len >= cDuMaxWidgets:
+      break
+    let id = duTrim(ids[i])
+    if id.len == 0:
+      continue
+    var title = ""
+    var fields = ""
+    discard duDefaultWidgetSpec(id, title, fields)
+    var w = DuWidget(id: id, title: "", fields: "", on: true,
+                     anchor: "topleft", x: 16.0, y: -16.0,
+                     w: 0.0, h: 0.0, lines: 0,
+                     dragging: false, grabDx: 0.0, grabDy: 0.0)
+    duDefaultPlace(id, w.anchor, w.x, w.y)
+    # The user file may override title/fields/placement/enabled...
+    w.title  = duCfgStr(text, "w." & id & ".title",  title)
+    w.fields = duCfgStr(text, "w." & id & ".fields", fields)
+    w.on     = duCfgBool(text, "w." & id & ".on", true)
+    w.anchor = duCfgStr(text, "w." & id & ".anchor", w.anchor)
+    w.x      = duCfgNum(text, "w." & id & ".x", w.x)
+    w.y      = duCfgNum(text, "w." & id & ".y", w.y)
+    # ...and the SAVED LAYOUT wins over both, because it is the most recent
+    # thing the user actually did. Only the four keys a drag can produce are
+    # taken from it: a layout file can never redefine what a widget shows.
+    if haveLay:
+      w.on     = duCfgBool(lay, "w." & id & ".on", w.on)
+      w.anchor = duCfgStr(lay,  "w." & id & ".anchor", w.anchor)
+      w.x      = duCfgNum(lay,  "w." & id & ".x", w.x)
+      w.y      = duCfgNum(lay,  "w." & id & ".y", w.y)
+    built.add w
+  gDuWidgets = built
+  gDuLayoutSource =
+    (if haveLay: "aowlspt-debugui-layout.json (saved layout)"
+     else: "built-in placement (no layout file yet)")
+
+proc duSaveWidgets() =
+  ## Write the layout file. Called ONLY on a drop or a per-widget toggle --
+  ## never per frame, never from the render path's hot half. It is a handful of
+  ## short lines and one file write, at human speed.
+  ##
+  ## Writes a WHOLE file, not an edit: there is no partial state a reader can
+  ## observe, and a truncated write leaves a file the flat scanner simply finds
+  ## no keys in, which falls back to the defaults rather than to nonsense.
+  var s = "{\n"
+  s.add "  \"_comment\": \"WRITTEN BY THE OVERLAY on every widget drop. " &
+        "Safe to delete -- that resets every widget to its built-in corner. " &
+        "Which widgets exist, and what they show, lives in " &
+        "aowlspt-debugui.json instead; this file only ever holds on/anchor/x/y.\",\n"
+  var n = 0
+  for i in 0 ..< gDuWidgets.len:
+    if n >= cDuMaxWidgets:
+      break
+    let w = gDuWidgets[i]
+    if n > 0:
+      s.add ",\n"
+    s.add "  \"w." & w.id & ".on\": " & (if w.on: "true" else: "false") &
+          ",\n  \"w." & w.id & ".anchor\": \"" & w.anchor &
+          "\",\n  \"w." & w.id & ".x\": " & duFmt1(w.x) &
+          ",\n  \"w." & w.id & ".y\": " & duFmt1(w.y)
+    inc n
+  s.add "\n}\n"
+  let rc = writeTextFile(duLayoutPath(), s)
+  if rc.ok:
+    gDuLayoutDirty = false
+    okLog "debugui: widget layout saved (" & $n & " widget(s)) -> " &
+          duLayoutPath()
+  else:
+    # A failure to persist must ANNOUNCE itself. Silently losing a layout the
+    # user just arranged is exactly the "declined quietly" failure this project
+    # treats as the worst outcome available.
+    warn "debugui: could NOT write the widget layout to " & duLayoutPath() &
+         " -- the arrangement is live but will not survive a restart"
+
+# ---------------------------------------------------------------------------
+# Geometry
+#
+# Three coordinate systems meet here and getting them confused is the whole
+# difficulty, so they are named every time:
+#
+#   CLIENT PIXELS   what `GetCursorPos` + `ScreenToClient` give. Origin TOP-left,
+#                   Y grows DOWN.
+#   CANVAS UNITS    what `anchoredPosition` is in. Origin BOTTOM-left, Y grows
+#                   UP. Pixels / the CanvasScaler's scaleFactor.
+#   ANCHORED        the offset the widget stores: canvas units relative to its
+#                   anchor point, with its pivot deciding which corner of the
+#                   text sits there.
+#
+# `gDuCanvasScale` is the measured scaleFactor of the canvas the clones actually
+# landed in (read at build time, not assumed), so these conversions are the same
+# correction the ESP markers already apply.
+# ---------------------------------------------------------------------------
+
+proc duCanvasSize(cw, ch: var float64): bool =
+  ## Canvas extent in canvas units. False when the client rect is not readable,
+  ## in which case no drag maths is attempted at all.
+  let pw = float64(cWgClientW())
+  let ph = float64(cWgClientH())
+  if pw < 16.0 or ph < 16.0 or gDuCanvasScale <= 0.01:
+    return false
+  cw = pw / gDuCanvasScale
+  ch = ph / gDuCanvasScale
+  true
+
+proc duCursorCanvas(cx, cy: var float64): bool =
+  ## The cursor in canvas units, Y-up. False unless the sample is inside our own
+  ## client area this refresh.
+  if cWgMouseOk() == 0'i32 or gDuCanvasScale <= 0.01:
+    return false
+  let ph = float64(cWgClientH())
+  cx = float64(cWgMouseX()) / gDuCanvasScale
+  cy = (ph - float64(cWgMouseY())) / gDuCanvasScale
+  true
+
+proc duWidgetPivotPoint(w: DuWidget; cw, ch: float64;
+                        pxOut, pyOut: var float64) =
+  ## Where the widget's PIVOT sits, in canvas units. This is the point
+  ## `anchoredPosition` is measured from, so it is the one place the anchor and
+  ## the offset combine.
+  var ax = 0.0
+  var ay = 1.0
+  var px = 0.0
+  var py = 1.0
+  duAnchorVec(w.anchor, ax, ay, px, py)
+  pxOut = ax * cw + w.x
+  pyOut = ay * ch + w.y
+
+proc duWidgetRect(w: DuWidget; cw, ch: float64;
+                  l, t, r, b: var float64) =
+  ## The widget's box in canvas units: left, TOP, right, BOTTOM (Y-up, so
+  ## t > b). Uses the extent measured at the last render.
+  var ax = 0.0
+  var ay = 1.0
+  var px = 0.0
+  var py = 1.0
+  duAnchorVec(w.anchor, ax, ay, px, py)
+  var pvx = 0.0
+  var pvy = 0.0
+  duWidgetPivotPoint(w, cw, ch, pvx, pvy)
+  l = pvx - px * w.w
+  r = l + w.w
+  t = pvy + (1.0 - py) * w.h
+  b = t - w.h
+
+proc duWidgetSetTopLeft(w: var DuWidget; cw, ch, l, t: float64) =
+  ## The inverse of `duWidgetRect`: given an absolute top-left in canvas units,
+  ## write back the anchored offset for the widget's CURRENT anchor.
+  var ax = 0.0
+  var ay = 1.0
+  var px = 0.0
+  var py = 1.0
+  duAnchorVec(w.anchor, ax, ay, px, py)
+  w.x = (l + px * w.w) - ax * cw
+  w.y = (t - (1.0 - py) * w.h) - ay * ch
+
+proc duAbs(v: float64): float64 = (if v < 0.0: -v else: v)
+
+proc duNearestAnchor(l, t, cw, ch, wdt, hgt: float64;
+                     lockLeft, lockRight, lockTop, lockBottom: bool): string =
+  ## Which of the seven anchors this box should now be bound to. A snapped edge
+  ## DECIDES its axis; an unsnapped axis falls back to which third of the canvas
+  ## the box's centre is in.
+  ##
+  ## Rebinding rather than keeping the old anchor is the entire reason the saved
+  ## layout survives a resolution change: a widget dropped against the right
+  ## edge is stored as "right edge, minus 12", not as "x = 2436".
+  let cxm = l + wdt * 0.5
+  let cym = t - hgt * 0.5
+  var hz = 1                       # 0 left, 1 centre, 2 right
+  var vt = 1                       # 0 bottom, 1 centre, 2 top
+  if lockLeft: hz = 0
+  elif lockRight: hz = 2
+  elif cxm < cw / 3.0: hz = 0
+  elif cxm > cw * 2.0 / 3.0: hz = 2
+  if lockBottom: vt = 0
+  elif lockTop: vt = 2
+  elif cym < ch / 3.0: vt = 0
+  elif cym > ch * 2.0 / 3.0: vt = 2
+  if hz == 0 and vt == 2: return "topleft"
+  if hz == 2 and vt == 2: return "topright"
+  if hz == 0 and vt == 0: return "bottomleft"
+  if hz == 2 and vt == 0: return "bottomright"
+  if hz == 1 and vt == 2: return "top"
+  if hz == 1 and vt == 0: return "bottom"
+  if hz == 0: return "topleft"     # left edge, vertically central
+  if hz == 2: return "topright"
+  "center"
+
+proc duSnapWidget(idx: int; cw, ch: float64) =
+  ## Snap widget `idx` to the screen edges/corners and to its neighbours, then
+  ## rebind its anchor. Called ONCE, on the drop -- never while dragging, so the
+  ## widget follows the cursor exactly and only jumps when the user lets go.
+  ## A snap that fought the cursor every frame is unusable.
+  if idx < 0 or idx >= gDuWidgets.len:
+    return
+  var l = 0.0
+  var t = 0.0
+  var r = 0.0
+  var b = 0.0
+  duWidgetRect(gDuWidgets[idx], cw, ch, l, t, r, b)
+  let wdt = gDuWidgets[idx].w
+  let hgt = gDuWidgets[idx].h
+  if wdt <= 0.0 or hgt <= 0.0:
+    return                          # never rendered: nothing to snap
+
+  var lockL = false
+  var lockR = false
+  var lockT = false
+  var lockB = false
+
+  # 1. SCREEN EDGES. Nearest edge wins per axis; both can win, which is what a
+  #    corner snap IS.
+  if duAbs(l - cDuSnapMargin) <= cDuSnapPx:
+    l = cDuSnapMargin; lockL = true
+  elif duAbs((cw - cDuSnapMargin) - (l + wdt)) <= cDuSnapPx:
+    l = cw - cDuSnapMargin - wdt; lockR = true
+  if duAbs((ch - cDuSnapMargin) - t) <= cDuSnapPx:
+    t = ch - cDuSnapMargin; lockT = true
+  elif duAbs((t - hgt) - cDuSnapMargin) <= cDuSnapPx:
+    t = cDuSnapMargin + hgt; lockB = true
+
+  # 2. OTHER WIDGETS -- edge alignment and abutting, but only on an axis the
+  #    screen did not already claim, so a corner snap is never dragged back off
+  #    the corner by a neighbour. Bounded by the widget count, which is capped.
+  for j in 0 ..< gDuWidgets.len:
+    if j == idx or not gDuWidgets[j].on:
+      continue
+    if gDuWidgets[j].w <= 0.0 or gDuWidgets[j].h <= 0.0:
+      continue
+    var ol = 0.0
+    var ot = 0.0
+    var orr = 0.0
+    var ob = 0.0
+    duWidgetRect(gDuWidgets[j], cw, ch, ol, ot, orr, ob)
+    if not lockL and not lockR:
+      if duAbs(l - ol) <= cDuSnapPx:                 # left edges flush
+        l = ol; lockL = true
+      elif duAbs(l - (orr + cDuSnapGap)) <= cDuSnapPx:   # sits to its right
+        l = orr + cDuSnapGap
+      elif duAbs((l + wdt + cDuSnapGap) - ol) <= cDuSnapPx:  # sits to its left
+        l = ol - cDuSnapGap - wdt
+    if not lockT and not lockB:
+      if duAbs(t - ot) <= cDuSnapPx:                 # top edges flush
+        t = ot; lockT = true
+      elif duAbs(t - (ob - cDuSnapGap)) <= cDuSnapPx:    # stacks below it
+        t = ob - cDuSnapGap
+      elif duAbs((t - hgt - cDuSnapGap) - ot) <= cDuSnapPx: # stacks above it
+        t = ot + cDuSnapGap + hgt
+
+  # 3. Never off-screen, whatever the drag did. A widget dropped past the edge
+  #    and then unreachable is a layout the user cannot undo without deleting
+  #    the file.
+  if l < 0.0: l = 0.0
+  if l + wdt > cw: l = cw - wdt
+  if t > ch: t = ch
+  if t - hgt < 0.0: t = hgt
+
+  gDuWidgets[idx].anchor =
+    duNearestAnchor(l, t, cw, ch, wdt, hgt, lockL, lockR, lockT, lockB)
+  duWidgetSetTopLeft(gDuWidgets[idx], cw, ch, l, t)
+
+# ---------------------------------------------------------------------------
+# The drag
+#
+# EDIT MODE IS ITS OWN STATE, and default OFF within an already-visible panel.
+# Without it, a left click anywhere the overlay happens to sit would grab a
+# widget instead of shooting -- so the overlay would be changing what the mouse
+# does in a raid, which is exactly the kind of write into game behaviour this
+# file is otherwise careful never to make. In edit mode the overlay still
+# SWALLOWS NOTHING: it does not hook input and cannot consume the click; it just
+# also moves a widget. That is stated plainly on the edit-mode banner.
+#
+# Ctrl+F3 toggles it. Same key as the panel, plus a modifier read from the same
+# async table, so there is no second key to document or collide with.
+# ---------------------------------------------------------------------------
+var gDuDragIdx = -1
+
+proc duDragTick() =
+  ## One drag step. Runs only in edit mode, only while our window has the
+  ## foreground, and only on the panel's throttled refresh.
+  if not gDuEdit:
+    if gDuDragIdx >= 0:
+      gDuDragIdx = -1
+    return
+  var cw = 0.0
+  var ch = 0.0
+  if not duCanvasSize(cw, ch):
+    return
+  var cx = 0.0
+  var cy = 0.0
+  let haveCursor = duCursorCanvas(cx, cy)
+
+  # RELEASE first, so a release in the same refresh as a press cannot leave a
+  # widget stuck to the cursor.
+  if cWgLmbReleased() != 0'i32:
+    if gDuDragIdx >= 0 and gDuDragIdx < gDuWidgets.len:
+      gDuWidgets[gDuDragIdx].dragging = false
+      duSnapWidget(gDuDragIdx, cw, ch)
+      duSaveWidgets()
+    gDuDragIdx = -1
+    return
+
+  # GRAB. Topmost-last wins: later widgets are drawn later, so iterating
+  # backwards picks the one visually on top when two overlap.
+  if cWgLmbPressed() != 0'i32 and gDuDragIdx < 0 and haveCursor:
+    var i = gDuWidgets.len - 1
+    while i >= 0:
+      if gDuWidgets[i].on and gDuWidgets[i].w > 0.0 and gDuWidgets[i].h > 0.0:
+        var l = 0.0
+        var t = 0.0
+        var r = 0.0
+        var b = 0.0
+        duWidgetRect(gDuWidgets[i], cw, ch, l, t, r, b)
+        if cx >= l and cx <= r and cy <= t and cy >= b:
+          var pvx = 0.0
+          var pvy = 0.0
+          duWidgetPivotPoint(gDuWidgets[i], cw, ch, pvx, pvy)
+          gDuWidgets[i].grabDx = cx - pvx
+          gDuWidgets[i].grabDy = cy - pvy
+          gDuWidgets[i].dragging = true
+          gDuDragIdx = i
+          break
+      dec i
+    return
+
+  # MOVE. `haveCursor` false (cursor left the client area mid-drag) HOLDS the
+  # widget where it is rather than teleporting it to a clamped edge.
+  if gDuDragIdx >= 0 and gDuDragIdx < gDuWidgets.len and
+     cWgLmbHeld() != 0'i32 and haveCursor:
+    var ax = 0.0
+    var ay = 1.0
+    var px = 0.0
+    var py = 1.0
+    duAnchorVec(gDuWidgets[gDuDragIdx].anchor, ax, ay, px, py)
+    gDuWidgets[gDuDragIdx].x = (cx - gDuWidgets[gDuDragIdx].grabDx) - ax * cw
+    gDuWidgets[gDuDragIdx].y = (cy - gDuWidgets[gDuDragIdx].grabDy) - ay * ch
+  elif gDuDragIdx >= 0 and cWgLmbHeld() == 0'i32:
+    # The button went up in a refresh we skipped. Treat it as a drop rather
+    # than leaving a widget welded to the cursor forever.
+    if gDuDragIdx < gDuWidgets.len:
+      gDuWidgets[gDuDragIdx].dragging = false
+      duSnapWidget(gDuDragIdx, cw, ch)
+      duSaveWidgets()
+    gDuDragIdx = -1
+
+# ---------------------------------------------------------------------------
+# The PROFILER widget: budget vs actual, per region participant
+#
+# SOURCED FROM THE ACCOUNTING THAT ALREADY EXISTS. `abi/aowlspt_region.h`'s
+# dispatcher already times every participant it calls and compares that against
+# the budget the participant declared at registration; it already counts
+# overruns, faults, and the frames it skipped a participant for. That is exactly
+# the ModProfiler read-out, and it is already being computed on every frame the
+# region is armed.
+#
+# So this adds NO detour, NO timer, NO instrumentation of any kind: it calls
+# `aowl_region_status_x` -- the export `region.nim` already publishes for mods --
+# and formats what comes back. A second detour on the same function overwrites
+# the first's trampoline, and a second timer would be measuring the same work
+# twice; riding the existing accounting avoids both.
+#
+# WHAT IT WILL NOT DO IS INVENT A NUMBER. A participant that has never been
+# called shows `--`, not `0.00`. A region that is not armed says so instead of
+# rendering an empty table that reads as "nothing is costing anything".
+# ---------------------------------------------------------------------------
+proc duUsText(us: int64): string =
+  ## Microseconds as milliseconds, three decimals. `-1` is "not measured" and
+  ## renders as `--`; it must never render as 0.000, which reads as "free".
+  if us < 0:
+    return "--"
+  formatFloat(float64(us) / 1000.0, ffDecimal, 3)
+
+proc duRegionLines(maxRows: int): string =
+  ## The participant table. One row per LIVE participant, capped by `maxRows`
+  ## and, independently, by the region's own compile-time slot ceiling -- so a
+  ## corrupt count cannot make this loop.
+  if cWgRgArmed() == 0'i32:
+    return "region NOT ARMED -- no per-mod timing is being collected.\n" &
+           "  (host flag `sharedRegion`; participants may still be registered)"
+  var res = ""
+  var rows = 0
+  var slots = int(cWgRgMax())
+  if slots > 64: slots = 64            # a cap on the cap
+  var h = 0
+  while h < slots:
+    if rows >= maxRows:
+      res.add "\n  ... more participants than rows; raise this widget's cap"
+      break
+    if cWgRgSelect(int32(h)) != 0'i32:
+      let nm = $cWgRgNameC()
+      let bud = cWgRgBudget()
+      let last = cWgRgLast()
+      let mx = cWgRgMaxUs()
+      let calls = cWgRgCalls()
+      var flag = ""
+      if cWgRgDisabled() != 0'i32: flag = "  [DISABLED]"
+      elif cWgRgThrottled() != 0'i32: flag = "  [THROTTLED]"
+      elif cWgRgEnabled() == 0'i32: flag = "  [off]"
+      elif last >= 0 and bud > 0 and last > bud: flag = "  [OVER]"
+      if rows > 0:
+        res.add "\n"
+      # Never called yet is a DIFFERENT state from called and fast. Saying
+      # `--` for both would make a participant that has never run look cheap.
+      let lastTxt = (if calls <= 0: "--" else: duUsText(last))
+      let maxTxt  = (if calls <= 0: "--" else: duUsText(mx))
+      res.add "  " & nm & "  " & lastTxt & " / " & duUsText(bud) &
+              " ms  peak " & maxTxt & "  x" & $calls
+      if cWgRgSkipped() > 0:
+        res.add "  skip " & $cWgRgSkipped()
+      if cWgRgOverruns() > 0:
+        res.add "  over " & $cWgRgOverruns()
+      if cWgRgFaults() > 0:
+        res.add "  FAULTS " & $cWgRgFaults()
+      res.add flag
+      inc rows
+    inc h
+  if rows == 0:
+    return "region ARMED, but NO participant is registered.\n" &
+           "  (that is not 'nothing is slow' -- it is 'nothing is measured')"
+  "  name  last / budget ms  peak  calls\n" & res
+
+proc duMemLine(): string =
+  ## Process working set and private bytes, and the machine's load. `-1` from
+  ## the sampler means the API did not resolve, which prints as `unavailable`
+  ## rather than as a zero.
+  cWgMemSample()
+  let ws = cWgWs()
+  let pv = cWgPriv()
+  if ws < 0 and pv < 0:
+    return "mem  unavailable (K32GetProcessMemoryInfo did not resolve)"
+  var s = "mem  ws " & (if ws < 0: "--" else: $ws & " MB") &
+          "   private " & (if pv < 0: "--" else: $pv & " MB")
+  if cWgSysLoad() >= 0:
+    s.add "\n     system " & $cWgSysLoad() & "% used, " &
+          $cWgSysFree() & " MB free"
+  s
+
+# ---------------------------------------------------------------------------
+# Rendering a widget
+#
+# One label, one string, newline-separated. `duSetText` short-circuits when the
+# text has not changed, so a widget whose values are steady costs one string
+# comparison and no managed call at all.
+#
+# THE EXTENT IS AN ESTIMATE, and is labelled one. TMP's real rendered bounds are
+# behind `GetPreferredValues`/`textBounds`, which are struct-returning managed
+# calls this file has not byte-verified -- and `ForceMeshUpdate` on this build
+# is the universal empty-body stub (`ret 0`, shared by 6,438 methods), so the
+# mesh is not guaranteed refreshed at the moment we would read it anyway. What
+# the estimate is used for is HIT-TESTING A DRAG, where being a few units res
+# costs a slightly generous grab box and nothing else. It is never used to place
+# text, only to catch a cursor.
+# ---------------------------------------------------------------------------
+const cDuGlyphAspect = 0.55   ## mean advance / point size for this font, approx
+
+proc duWidgetText(w: DuWidget; lineCount: var int; widest: var int): string =
+  var res = ""
+  lineCount = 0
+  widest = 0
+  var cur = 0
+  if w.title.len > 0:
+    res.add w.title
+    lineCount = 1
+    widest = w.title.len
+  let fields = duSplit(w.fields, ',')
+  var used = 0
+  for i in 0 ..< fields.len:
+    if lineCount >= cDuMaxWidgetLines:
+      break
+    let f = duTrim(fields[i])
+    if f.len == 0:
+      continue
+    var text = ""
+    # The two fields only a widget can produce. Everything else is the SAME
+    # `duPanelLine` the single-column panel used, so no field regressed.
+    if f == "region":
+      text = duRegionLines(cDuMaxWidgetLines - lineCount - 1)
+    elif f == "mem":
+      text = duMemLine()
+    else:
+      text = duPanelLine(f)
+    if text.len == 0:
+      continue
+    if lineCount > 0:
+      res.add "\n"
+    res.add text
+    inc used
+    # Count the embedded newlines too: `region` and `botlist` are one FIELD but
+    # many LINES, and a height computed from the field count would give the
+    # profiler widget a grab box one line tall.
+    cur = 0
+    for k in 0 ..< text.len:
+      if text[k] == '\n':
+        inc lineCount
+        if cur > widest: widest = cur
+        cur = 0
+      else:
+        inc cur
+    if cur > widest: widest = cur
+    inc lineCount
+  if used == 0 and w.title.len == 0:
+    res = "?" & w.id
+    lineCount = 1
+    widest = res.len
+  res
+
+proc duUpdateWidgets() =
+  ## Refresh, place and size every widget. One label per widget, taken from the
+  ## same pool the old single-column panel used.
+  var cw = 0.0
+  var ch = 0.0
+  let haveCanvas = duCanvasSize(cw, ch)
+  var used = 0
+  for i in 0 ..< gDuWidgets.len:
+    if used >= gDuPanel.len or used >= cDuMaxWidgets:
+      break
+    if not gDuWidgets[i].on:
+      continue
+    var lines = 0
+    var widest = 0
+    let text = duWidgetText(gDuWidgets[i], lines, widest)
+    # Extent, in canvas units, from the font size the config asked for.
+    gDuWidgets[i].lines = lines
+    gDuWidgets[i].w = float64(widest) * gDuCfg.panelFont * cDuGlyphAspect + 12.0
+    gDuWidgets[i].h = float64(lines) * gDuCfg.panelLine + 6.0
+    # A widget dragged off the canvas by a resolution change is pulled back on
+    # BEFORE it is placed, so it can never become unreachable by the mouse.
+    if haveCanvas and not gDuWidgets[i].dragging:
+      var l = 0.0
+      var t = 0.0
+      var r = 0.0
+      var b = 0.0
+      duWidgetRect(gDuWidgets[i], cw, ch, l, t, r, b)
+      var fixed = false
+      if l > cw - 24.0: l = cw - 24.0; fixed = true
+      if r < 24.0: l = 24.0 - gDuWidgets[i].w; fixed = true
+      if t < 24.0: t = 24.0; fixed = true
+      if b > ch - 24.0: t = ch - 24.0 + gDuWidgets[i].h; fixed = true
+      if fixed:
+        duWidgetSetTopLeft(gDuWidgets[i], cw, ch, l, t)
+    duPlace(gDuPanel[used], gDuWidgets[i].anchor,
+            gDuWidgets[i].x, gDuWidgets[i].y)
+    # The widget being dragged is tinted, so "which one am I holding" is
+    # answered on screen rather than by feel.
+    if gDuEdit and gDuWidgets[i].dragging:
+      duStyle(gDuPanel[used], gDuCfg.panelFont, 0.45, 1.0, 0.45)
+    elif gDuEdit:
+      duStyle(gDuPanel[used], gDuCfg.panelFont, 0.6, 0.85, 1.0)
+    else:
+      duStyle(gDuPanel[used], gDuCfg.panelFont,
+              gDuCfg.panelR, gDuCfg.panelG, gDuCfg.panelB)
+    discard duSetText(gDuPanel[used], text)
+    duShow(gDuPanel[used])
+    inc used
+  # THE EDIT-MODE BANNER, in the spare label the pool was sized for. It exists
+  # because edit mode is otherwise invisible, and an invisible mode that changes
+  # what a left click does is the worst kind: it says what is on, what the keys
+  # are, and -- explicitly -- that the click is NOT taken from the game.
+  if gDuEdit and used < gDuPanel.len:
+    var b = "EDIT MODE  --  drag a widget with the left mouse button"
+    b.add "\n  Ctrl+F3 leave   1-9 toggle a widget   0 reset all placements"
+    b.add "\n  drops snap to screen edges, corners and to other widgets,"
+    b.add "\n  and are saved to aowlspt-debugui-layout.json on every drop."
+    b.add "\n  The overlay does NOT swallow the click; the game still sees it."
+    b.add "\n  widgets: "
+    var n = 0
+    for i in 0 ..< gDuWidgets.len:
+      if n >= 9:
+        break
+      if n > 0:
+        b.add "  "
+      b.add $(n + 1) & "=" & gDuWidgets[i].id &
+            (if gDuWidgets[i].on: "" else: "(off)")
+      inc n
+    b.add "\n  layout from " & gDuLayoutSource
+    duPlace(gDuPanel[used], "bottom", 0.0, 16.0)
+    duStyle(gDuPanel[used], gDuCfg.panelFont, 1.0, 0.85, 0.35)
+    discard duSetText(gDuPanel[used], b)
+    duShow(gDuPanel[used])
+    inc used
+  # Every label past the last enabled widget is hidden, or a widget turned off
+  # leaves its last text on screen forever.
+  for i in used ..< gDuPanel.len:
+    duHide(gDuPanel[i])
+
+# ---------------------------------------------------------------------------
+# Edit-mode keys
+#
+# Number keys 1..9 toggle a widget, 0 puts every widget back where it started.
+# Read from the SAME async edge detector the toggle key uses and only while edit
+# mode is on and the game has the foreground, so a number typed anywhere else --
+# including into the game -- can never move a widget.
+# ---------------------------------------------------------------------------
+proc duEditKeys() =
+  if not gDuEdit:
+    return
+  var i = 0
+  while i < 9 and i < gDuWidgets.len:
+    if cDuKeyEdge(int32(0x31 + i)) != 0'i32:
+      gDuWidgets[i].on = not gDuWidgets[i].on
+      okLog "debugui: widget '" & gDuWidgets[i].id & "' " &
+            (if gDuWidgets[i].on: "ON" else: "OFF")
+      duSaveWidgets()
+    inc i
+  if cDuKeyEdge(0x30'i32) != 0'i32:
+    for j in 0 ..< gDuWidgets.len:
+      gDuWidgets[j].on = true
+      duDefaultPlace(gDuWidgets[j].id, gDuWidgets[j].anchor,
+                     gDuWidgets[j].x, gDuWidgets[j].y)
+    okLog "debugui: every widget reset to its built-in placement and enabled"
+    duSaveWidgets()
+
 proc duUpdatePanel() =
   ## Refresh every panel line. Positions are re-applied each refresh because the
   ## line COUNT can change between refreshes (a field that produced no text is
@@ -1821,8 +2609,11 @@ proc duBuild(preloader: Il2CppPtr): bool =
         duDescribeScale(srcCv0) & ") via " & gDuParentRoute &
         ". One canvas, one render pass; the rest of the pool is safe to build."
 
-  let fields = duSplit(gDuCfg.panelFields, ',')
-  var nPanel = fields.len
+  # ONE LABEL PER WIDGET (plus one for the edit-mode banner), not one per line.
+  # The pool is sized here, once, and cannot grow later -- so adding a widget to
+  # the config takes effect on the next game start, exactly as adding a panel
+  # field always did. `cDuMaxWidgets` is the ceiling whatever the config says.
+  var nPanel = gDuWidgets.len + 1
   if nPanel > cDuMaxPanelLines: nPanel = cDuMaxPanelLines
   if not gDuCfg.panelOn: nPanel = 0
   var nMark = gDuCfg.espMax
@@ -1906,7 +2697,7 @@ proc duBuild(preloader: Il2CppPtr): bool =
         "; parentRect=[" & duDescribeRect(gDuParentRect) & "]" &
         "; canvas 0x" & hexOf(cast[uint64](srcCv0)) &
         " shared by the source and every clone (asserted before building)"
-  okLog "debugui: built " & $panel.len & " panel line(s) and " & $marks.len &
+  okLog "debugui: built " & $panel.len & " widget label(s) and " & $marks.len &
         " marker label(s), all born hidden and none a raycast target; layout " &
         "from " & gDuCfg.source
   return true
@@ -1953,15 +2744,49 @@ proc debugUiBodyImpl(a: Il2CppPtr): Il2CppPtr {.
   if cDuForeground() != 0'i32:
     if gDuCfg.toggleVk > 0 and
        cDuKeyEdge(int32(gDuCfg.toggleVk)) != 0'i32:
+      # WHICH ROUTE ACTUALLY SAW THE KEY -- measured, once, rather than assumed.
+      # The F10 bug in the D3D overlay was a key that never arrived because
+      # Windows delivered it as WM_SYSKEYDOWN to a wndproc that only handled
+      # WM_KEYDOWN. This overlay reads no window message at all: `GetAsyncKeyState`
+      # reads the asynchronous key state the raw-input thread updates BEFORE any
+      # message exists, so there is no classification to get wrong. If this line
+      # is absent from the log after a press, the key genuinely never arrived and
+      # the log says so; it is not something to reason about.
+      if not gDuKeyRouteLogged:
+        gDuKeyRouteLogged = true
+        okLog "debugui: toggle key vk=0x" & hexOf(uint64(gDuCfg.toggleVk)) &
+              " edge OBSERVED via GetAsyncKeyState (async key state -- not a " &
+              "window message, so the WM_KEYDOWN/WM_SYSKEYDOWN routing that " &
+              "hid F10 from the D3D overlay's wndproc cannot apply here)"
+      # CTRL+F3 IS EDIT MODE, plain F3 is show/hide. Same key, one modifier read
+      # from the same async table: no second key to collide with anything.
+      if cWgCtrlDown() != 0'i32:
+        if not gDuVisible:
+          gDuVisible = true
+          duLoadLayout()
+          duLoadWidgets()
+        gDuEdit = not gDuEdit
+        if not gDuEdit:
+          gDuDragIdx = -1
+          for i in 0 ..< gDuWidgets.len:
+            gDuWidgets[i].dragging = false
+        okLog "debugui: edit mode " & (if gDuEdit: "ON -- drag widgets with " &
+              "the left mouse button; drops snap and are saved"
+              else: "OFF")
+        return cast[Il2CppPtr](1)
       gDuVisible = not gDuVisible
       if gDuVisible:
         # Re-read the layout file on every toggle-ON, so the user can edit it
         # and re-toggle without restarting the game.
         duLoadLayout()
+        duLoadWidgets()
         if gDuCfg.espVk <= 0:
           gDuEspVisible = gDuCfg.espOn
-        okLog "debugui: panel ON (layout re-read from " & gDuCfg.source & ")"
+        okLog "debugui: panel ON (" & $gDuWidgets.len & " widget(s); layout " &
+              "re-read from " & gDuCfg.source & " + " & gDuLayoutSource & ")"
       else:
+        gDuEdit = false
+        gDuDragIdx = -1
         if gDuCfg.espVk <= 0:
           gDuEspVisible = false
         duHideAll()
@@ -1995,7 +2820,14 @@ proc debugUiBodyImpl(a: Il2CppPtr): Il2CppPtr {.
   duScanWorld()
 
   if gDuVisible:
-    duUpdatePanel()
+    # The pointer is sampled ONCE per refresh, before anything reads it, so a
+    # drag cannot see the cursor in two places within one frame and the button
+    # edges are computed exactly once. It is a `GetCursorPos` and a
+    # `GetAsyncKeyState`: no message, no hook, nothing swallowed from the game.
+    discard cWgMouseSample()
+    duEditKeys()
+    duDragTick()
+    duUpdateWidgets()
   if gDuEspVisible:
     if not duUpdateMarkers():
       if not gDuEspUnavailableLogged:
@@ -2087,6 +2919,14 @@ proc bindDebugUi(verbose: bool): bool =
     return true
   if not gReady or gDisableDrain:
     return false
+  # The widget set is read at BIND, not at first F3, because `duBuild` sizes the
+  # label pool from it and the pool is built once. Reading it here means the
+  # count on screen matches the count in the config from the very first press.
+  # Both files are re-read on every toggle-ON as well, so editing them still
+  # needs no restart -- only ADDING a widget does.
+  duLoadWidgets()
+  okLog "debugui: " & $gDuWidgets.len & " widget(s) configured -- " &
+        gDuLayoutSource
   var ok = 0
   var bad = 0
   for i in 0 ..< int(cDuTargetCount()):

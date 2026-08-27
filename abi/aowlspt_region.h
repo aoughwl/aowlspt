@@ -648,8 +648,35 @@ static void aowl_region_set_projector(AowlRegionProjFn f) {
         "world-space draw is available" : "cleared -- world-space draw will "
         "refuse");
 }
+/* THE BACK-BUFFER SIZE.
+ *
+ * MEASURED DEFECT, fixed here: `screenW`/`screenH` existed and this setter
+ * existed, but NOTHING IN THE HOST EVER CALLED IT and no getter was exported.
+ * A participant asking how big the screen is therefore read a field that was
+ * provably always 0 -- and 0 is not a refusal, it is a plausible number that
+ * collapses any edge/corner layout into the top-left. A maps participant hit
+ * exactly this and had to route around it with a config key.
+ *
+ * Two halves to the fix. This one adds a getter and, crucially, a KNOWN flag:
+ * a reader can now tell "nobody has told the region the size yet" apart from
+ * "the size is zero", which a bare getter cannot express. The other half is the
+ * caller -- the F3 overlay publishes its `GetClientRect` measurement here on
+ * every refresh, so the value is a live measurement of the real window and
+ * never a constant anybody typed.
+ *
+ * A zero or negative size is REFUSED rather than stored, so one bad frame
+ * during a device reset cannot poison a value everything else lays out
+ * against. */
 static void aowl_region_set_screen(int32_t w, int32_t h) {
+    if (w <= 0 || h <= 0) return;
     g_region.screenW = w; g_region.screenH = h;
+}
+static int32_t aowl_region_screen_w(void) { return g_region.screenW; }
+static int32_t aowl_region_screen_h(void) { return g_region.screenH; }
+/* 1 once a real size has been published. Check this BEFORE using either
+ * dimension: the getters return 0 until then, and 0 is a trap, not an answer. */
+static int32_t aowl_region_screen_known(void) {
+    return (g_region.screenW > 0 && g_region.screenH > 0) ? 1 : 0;
 }
 static void aowl_region_set_armed(int32_t on) {
     if (!g_region.ready) aowl_region_init(g_region.sink);
@@ -1014,6 +1041,38 @@ static int32_t aowl_region_is_armed(void) {
     const AowlRegionCmd* ignore = 0;
     aowl_region_commands(&ignore);
     return aowl_rg_armed_fn ? aowl_rg_armed_fn() : 0;
+}
+
+/* The back-buffer size, from the client side. `aowl_region_screen_known()` is
+ * the one to test first: it is 0 both when the host is too old to export these
+ * and when nothing has published a size yet, and in BOTH of those cases the
+ * dimensions are 0 -- which a layout must treat as "I do not know", never as a
+ * screen that is zero pixels wide. */
+static AowlRegionAbiFn aowl_rg_scrw_fn = 0;
+static AowlRegionAbiFn aowl_rg_scrh_fn = 0;
+static AowlRegionAbiFn aowl_rg_scrk_fn = 0;
+static int32_t         aowl_rg_scr_tried = 0;
+static void aowl_region_resolve_screen(void) {
+    HMODULE h;
+    if (aowl_rg_scr_tried) return;
+    aowl_rg_scr_tried = 1;
+    h = GetModuleHandleA("aowlspt-host-il2cpp.dll");
+    if (!h) return;
+    aowl_rg_scrw_fn = (AowlRegionAbiFn)(void*)GetProcAddress(h, "aowl_region_screen_w_x");
+    aowl_rg_scrh_fn = (AowlRegionAbiFn)(void*)GetProcAddress(h, "aowl_region_screen_h_x");
+    aowl_rg_scrk_fn = (AowlRegionAbiFn)(void*)GetProcAddress(h, "aowl_region_screen_known_x");
+}
+static int32_t aowl_region_screen_known(void) {
+    aowl_region_resolve_screen();
+    return aowl_rg_scrk_fn ? aowl_rg_scrk_fn() : 0;
+}
+static int32_t aowl_region_screen_w(void) {
+    aowl_region_resolve_screen();
+    return aowl_rg_scrw_fn ? aowl_rg_scrw_fn() : 0;
+}
+static int32_t aowl_region_screen_h(void) {
+    aowl_region_resolve_screen();
+    return aowl_rg_scrh_fn ? aowl_rg_scrh_fn() : 0;
 }
 
 #endif /* AOWL_REGION_HOST */

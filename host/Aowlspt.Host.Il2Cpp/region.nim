@@ -42,6 +42,14 @@
 #define AOWL_REGION_HOST
 #include "aowlspt_region.h"
 
+/* The F3 profiler widget's read-only view of the participant table. It MUST be
+ * included here and nowhere else: this is the one translation unit in the host
+ * that defines AOWL_REGION_HOST, and `aowlspt_regview.h` `#error`s if it is not
+ * already set. See that file for why including `aowlspt_region.h` from the
+ * overlay side instead would silently delete this whole facility from the
+ * build. */
+#include "aowlspt_regview.h"
+
 /* The log sink. Nimony implements `aowlspt_nim_region_log`; this adapts the
  * plain `const char*` the header emits into it. */
 /* nimony renders a `cstring` parameter as `unsigned char*` (its NC8), so the
@@ -82,6 +90,15 @@ AOWL_RG_EXPORT int32_t aowl_region_project_x(float a, float b, float c, float* x
 AOWL_RG_EXPORT int32_t aowl_region_commands_x(const AowlRegionCmd** o) { return aowl_region_commands(o); }
 AOWL_RG_EXPORT int32_t aowl_region_is_armed_x(void) { return aowl_region_is_armed(); }
 AOWL_RG_EXPORT int32_t aowl_region_count_x(void) { return aowl_region_count(); }
+
+/* THE BACK-BUFFER SIZE -- newly exported. The state and the setter existed but
+ * nothing called the setter and nothing could read it, so every participant's
+ * read was a provably-always-0. `_known_x` is the one to test first: it is the
+ * only way to tell "not published yet" from "zero pixels wide", and a layout
+ * that cannot tell those apart collapses silently into the top-left corner. */
+AOWL_RG_EXPORT int32_t aowl_region_screen_w_x(void) { return aowl_region_screen_w(); }
+AOWL_RG_EXPORT int32_t aowl_region_screen_h_x(void) { return aowl_region_screen_h(); }
+AOWL_RG_EXPORT int32_t aowl_region_screen_known_x(void) { return aowl_region_screen_known(); }
 """.}
 
 proc cRegionBoot() {.importc: "aowl_region_boot", nodecl.}
@@ -92,10 +109,16 @@ proc cRegionFrames(): int64 {.importc: "aowl_region_frames", nodecl.}
 proc cRegionFrameUs(): int64 {.importc: "aowl_region_frame_us", nodecl.}
 proc cRegionDropped(): int64 {.importc: "aowl_region_dropped", nodecl.}
 proc cRegionLastRefusal(): int32 {.importc: "aowl_region_last_refusal", nodecl.}
+proc cRegionSetScreen(w, h: int32) {.importc: "aowl_region_set_screen", nodecl.}
+proc cRegionScreenKnown(): int32 {.
+  importc: "aowl_region_screen_known", nodecl.}
+proc cWgWindowW(): int32 {.importc: "aowl_wg_window_w", nodecl.}
+proc cWgWindowH(): int32 {.importc: "aowl_wg_window_h", nodecl.}
 
 var gRegionFaults = 0
 var gRegionBooted = false
 var gRegionAnnounced = false
+var gRegionScreenLogged = false
 
 proc regionLog(line: cstring) {.exportc: "aowlspt_nim_region_log", cdecl.} =
   ## Every line the region emits -- a registration, a fault naming the
@@ -124,6 +147,29 @@ proc regionFired(regs: Il2CppPtr) =
   ## NO GUARD IS OPENED HERE. See the header of this file: the dispatcher
   ## guards each participant individually and a guard here would nest.
   discard regs
+  # PUBLISH THE BACK-BUFFER SIZE, once a frame, before dispatching anyone.
+  #
+  # This is the missing caller. `aowl_region_set_screen` and the `screenW`/
+  # `screenH` state existed, but nothing in the host ever called the setter and
+  # nothing exported a getter -- so every participant that asked how big the
+  # screen was read a provably-always-0, which is not a refusal but a plausible
+  # number that collapses an edge-anchored layout into the top-left corner.
+  #
+  # The value is MEASURED from the game window's own client rect via
+  # `GetActiveWindow` (the Unity thread owns the window, so this does not need
+  # focus and stays correct while alt-tabbed). A non-positive measurement is
+  # refused on both sides rather than stored, so a device reset cannot poison
+  # it, and `aowl_region_screen_known` stays 0 until a real size has arrived.
+  let sw = cWgWindowW()
+  let sh = cWgWindowH()
+  if sw > 0 and sh > 0:
+    cRegionSetScreen(sw, sh)
+    if not gRegionScreenLogged:
+      gRegionScreenLogged = true
+      okLog "region: back-buffer size published to participants -- " &
+            $sw & "x" & $sh & " (measured from the game window's client rect; " &
+            "aowl_region_screen_known() now reports " &
+            $int(cRegionScreenKnown()) & ")"
   let r = cRegionFrame()
   if r < 0:
     inc gRegionFaults
