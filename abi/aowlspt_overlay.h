@@ -972,6 +972,17 @@ typedef struct AowlOvState {
      * all three read as "the mod may not be loaded" -- which sent one session
      * looking at the registry for a fault that was a 32 KB buffer. */
     char             itemsWhy[192];
+    /* THE WRITE DID NOT TAKE.
+     *
+     * Set by `aowl_ov_settings_set` when the value it POSTed is NOT the value
+     * the immediately following re-read brought back -- the one check that
+     * could have caught the silent revert that shipped: a 200 with the schema
+     * unchanged is byte-for-byte a successful write by status code, and every
+     * layer between here and the mod was reporting success. Asserted on the
+     * FINISHED STATE (what the row reads now), never on our own request, and
+     * phrased as the negative so it can actually fail. Empty = the last write
+     * verified. */
+    char             writeWhy[200];
     int32_t          itemsImpl;     /* implemented count on the loaded page */
     AowlOvSCat       cats[AOWL_OV_MAX_SCATS];
     int32_t          catCount;
@@ -1088,6 +1099,7 @@ typedef struct AowlOvState {
     AowlOvSCat   sCats[AOWL_OV_MAX_SCATS];
     int32_t      sCatCount;
     char         sItemsWhy[192];
+    char         sWriteWhy[200];
     char         sIdxWhy[192];
     int32_t      sItemCount;
     char         sItemsPage[80];
@@ -3040,8 +3052,28 @@ static void aowl_ov_read_items(const char* body, int32_t len) {
     if (*p == '[') {
         arr = aowl_ov_jarr(p, end);
     } else {
+        /* THE REFUSAL SHAPE. `declaredSchemaReply` in
+         * `aowl/src/aowlspt/settings.nim` answers `{"err":..,"rows":[..]}`
+         * when a write did NOT persist, and answers the bare array when it
+         * did. This reader knew only `[` and `{"settings":..}`, so a refusal
+         * parsed as a page with zero rows -- a blank pane, which reads as "this
+         * mod has no settings" and is the opposite of what happened. `rows` is
+         * read like any other array and `err` is surfaced verbatim, in the
+         * server's own words. */
+        const char* e = aowl_ov_jmem(p, end, "err");
         arr = aowl_ov_jmem(p, end, "settings");
+        if (!arr) arr = aowl_ov_jmem(p, end, "rows");
         arr = arr ? aowl_ov_jarr(arr, end) : NULL;
+        if (e) {
+            char ebuf[160];
+            ebuf[0] = 0;
+            aowl_ov_jtext(e, end, ebuf, (int32_t)sizeof(ebuf));
+            if (ebuf[0]) {
+                aowl_ov_fmt(g_ov.writeWhy, (int32_t)sizeof(g_ov.writeWhy),
+                            "the server REFUSED this write: %s", ebuf);
+                aowl_ov_note(g_ov.writeWhy);
+            }
+        }
     }
     for (; arr && g_ov.itemCount < AOWL_OV_MAX_SITEMS; arr = aowl_ov_jnext(arr, end)) {
         AowlOvSItem* si = &g_ov.items[g_ov.itemCount];
@@ -3433,6 +3465,10 @@ static void aowl_ov_settings_load(const char* pageId, int32_t isMod,
     if (!strcmp(pageId, AOWL_OV_PANEL_PAGE)) {
         aowl_ov_panel_schema(buf, cap);
         EnterCriticalSection(&g_ov.cs);
+        /* A "did not take" banner belongs to the page it was measured on. It
+         * is cleared on a page CHANGE only -- never on the re-read a write
+         * itself performs, which is the read the banner is computed from. */
+        if (strcmp(g_ov.itemsPage, pageId) != 0) g_ov.writeWhy[0] = 0;
         aowl_ov_copy(g_ov.itemsPage, (int32_t)sizeof(g_ov.itemsPage), pageId);
         g_ov.itemsWhy[0] = 0;
         aowl_ov_read_items(buf, (int32_t)strlen(buf));
@@ -3445,6 +3481,7 @@ static void aowl_ov_settings_load(const char* pageId, int32_t isMod,
     rc = aowl_ov_fetch(L"GET", path, NULL, buf, cap);
     trunc = (int32_t)InterlockedCompareExchange(&g_ov.lastTrunc, 0, 0);
     EnterCriticalSection(&g_ov.cs);
+    if (strcmp(g_ov.itemsPage, pageId) != 0) g_ov.writeWhy[0] = 0;
     aowl_ov_copy(g_ov.itemsPage, (int32_t)sizeof(g_ov.itemsPage), pageId);
     g_ov.itemsWhy[0] = 0;
     if (rc > 0 && (unsigned char)buf[0] != 0x78 && aowl_ov_jwhole(buf, rc)) {
@@ -3484,6 +3521,89 @@ static void aowl_ov_settings_load(const char* pageId, int32_t isMod,
 
 /* POST one edit to the mod that owns the page, then reload the page so the row
  * shows the value the file actually kept rather than the one we hoped for. */
+/* DID THE WRITE ACTUALLY TAKE?
+ *
+ * Called on the worker straight after `aowl_ov_settings_set` has POSTed a key
+ * and RE-READ the page, so `g_ov.items` already holds the finished state. It
+ * compares what the row reads NOW against what was sent -- never the status
+ * code, which is 200 on the silent-revert path and on the working one alike
+ * (fact #135), and never the request we made, which is a self-comparison and
+ * cannot fail.
+ *
+ * Three outcomes, not two: verified (clears the banner), NOT APPLIED (names
+ * both values), and INCONCLUSIVE when the re-read did not produce the row at
+ * all -- "I could not look" is not a pass.
+ *
+ * The comparison is on `raw`, the JSON literal, which is exactly the text that
+ * was POSTed, so `1.0` vs `1` cannot be read as a revert. Leading/trailing
+ * space is ignored; nothing else is normalised, because normalising is how a
+ * check stops being able to fail. */
+/* HOW LONG TO WAIT BEFORE CALLING A WRITE LOST.
+ *
+ * MEASURED, not guessed: a client-side page's rows only change at the backend
+ * when the host's settings bridge republishes them, and that is one collect +
+ * push cycle -- `cSbPeriodMs = 5000` in
+ * `host/Aowlspt.Host.Il2Cpp/settingsbridge.nim`, plus the push itself. So the
+ * patience has to exceed 5 s or this check would go red on the WORKING path.
+ * 10 x 800 ms = 8 s, and only a write that never lands ever waits that long. */
+#define AOWL_OV_VERIFY_TRIES 10
+#define AOWL_OV_VERIFY_WAIT  800
+
+static void aowl_ov_settings_verify(const char* guid, const char* key,
+                                    const char* sent, int32_t isMod,
+                                    char* buf, int32_t cap) {
+    int32_t i, try_;
+    int32_t found = 0;
+    const char* a;
+    const char* b;
+    const char* last = "";
+    if (!key || !key[0]) { g_ov.writeWhy[0] = 0; return; }
+    for (try_ = 0; try_ < AOWL_OV_VERIFY_TRIES; try_++) {
+        found = 0;
+        for (i = 0; i < g_ov.itemCount; i++) {
+            if (strcmp(g_ov.items[i].key, key) != 0) continue;
+            found = 1;
+            a = g_ov.items[i].raw;
+            b = sent ? sent : "";
+            while (*a == ' ') a++;
+            while (*b == ' ') b++;
+            last = a;
+            if (strcmp(a, b) == 0) { g_ov.writeWhy[0] = 0; return; }
+            break;
+        }
+        /* NOT YET IS NOT THE SAME AS NEVER.
+         *
+         * A CLIENT-SIDE mod's page is served by the backend but OWNED by the
+         * game process: `settingshub` QUEUES the edit and the host applies it
+         * on its next `/aowlspt/settings/client/sync` (a few hundred ms to a
+         * few seconds later). The re-read that happens immediately after the
+         * POST is therefore stale BY DESIGN on that transport, and declaring a
+         * revert here would be a check that fails on the working path -- which
+         * is the same disease as a check that cannot fail. So the page is
+         * re-read a bounded number of times before any verdict is given, and
+         * only a value that never lands is reported. */
+        if (try_ + 1 < AOWL_OV_VERIFY_TRIES) {
+            Sleep(AOWL_OV_VERIFY_WAIT);
+            aowl_ov_settings_load(guid, isMod, buf, cap);
+        }
+    }
+    if (found) {
+        aowl_ov_fmt(g_ov.writeWhy, (int32_t)sizeof(g_ov.writeWhy),
+                    "NOT APPLIED: %s was set to %s and still reads back %s "
+                    "after %d s. The server answered 200; the value did not "
+                    "change. This edit is NOT saved.",
+                    key, (sent && sent[0]) ? sent : "(nothing)",
+                    last[0] ? last : "(nothing)",
+                    (AOWL_OV_VERIFY_TRIES * AOWL_OV_VERIFY_WAIT) / 1000);
+    } else {
+        aowl_ov_fmt(g_ov.writeWhy, (int32_t)sizeof(g_ov.writeWhy),
+                    "INCONCLUSIVE: %s was written but the re-read of %s does "
+                    "not contain that row, so whether it took is unknown.",
+                    key, guid ? guid : "the page");
+    }
+    aowl_ov_note(g_ov.writeWhy);
+}
+
 static void aowl_ov_settings_set(const AowlOvCmd* cmd, char* buf, int32_t cap) {
     wchar_t path[224];
     wchar_t warg[96];
@@ -3498,6 +3618,9 @@ static void aowl_ov_settings_set(const AowlOvCmd* cmd, char* buf, int32_t cap) {
          * back on screen instead of being displayed as if it took. */
         (void)aowl_ov_panel_set(cmd->skey, cmd->sval);
         aowl_ov_settings_load(cmd->guid, 1, buf, cap);
+        /* The panel's own page is generated in-process, so one look settles
+         * it: `isMod` is irrelevant and no retry can change the answer. */
+        aowl_ov_settings_verify(cmd->guid, cmd->skey, cmd->sval, 1, buf, cap);
         return;
     }
     _snwprintf(path, 224, L"/aowlspt/settings/%ls", warg);
@@ -3506,6 +3629,7 @@ static void aowl_ov_settings_set(const AowlOvCmd* cmd, char* buf, int32_t cap) {
                 cmd->skey, cmd->sval);
     (void)aowl_ov_fetch(L"POST", path, jbody, buf, cap);
     aowl_ov_settings_load(cmd->guid, 1, buf, cap);
+    aowl_ov_settings_verify(cmd->guid, cmd->skey, cmd->sval, 1, buf, cap);
 }
 
 /* ================================================================== *
@@ -5161,6 +5285,7 @@ static void aowl_ov_snapshot(void) {
     memcpy(g_ov.sCats, g_ov.cats, sizeof(AowlOvSCat) * (size_t)g_ov.catCount);
     g_ov.sCatCount = g_ov.catCount;
     memcpy(g_ov.sItemsWhy, g_ov.itemsWhy, sizeof(g_ov.sItemsWhy));
+    memcpy(g_ov.sWriteWhy, g_ov.writeWhy, sizeof(g_ov.sWriteWhy));
     memcpy(g_ov.sIdxWhy, g_ov.idxWhy, sizeof(g_ov.sIdxWhy));
     g_ov.sItemsImpl = g_ov.itemsImpl;
     g_ov.sHiddenCount = g_ov.hiddenCount;
@@ -7732,6 +7857,19 @@ static void aowl_ov_view_settings(float x, float y, float w, float bodyH) {
         return;
     }
     if (!loaded) return;
+
+    /* THE LAST WRITE DID NOT TAKE, SAID OUT LOUD.
+     *
+     * Drawn, deliberately, WITHOUT returning: the rows stay visible underneath
+     * so the player can see the control that snapped back and the sentence that
+     * explains it at the same time. A setting that reverts silently is the exact
+     * failure that reached a user; this is the line that makes it impossible to
+     * miss. Cleared by the next write that verifies, and by loading any page. */
+    if (g_ov.sWriteWhy[0]) {
+        int32_t wlines = aowl_ov_wrap(rx, cy, g_ov.sWriteWhy,
+                                      AOWL_OV_ERR, rcols, 3);
+        cy += (float)(wlines * AOWL_OV_LINE_H) + 2.0f;
+    }
 
     /* --- the controls ---------------------------------------------------- */
     {
@@ -10554,6 +10692,8 @@ static int32_t aowl_ov_start(int32_t toggleVk, int32_t backendPort) {
     g_ov.idxWhy[0] = 0;
     g_ov.catCount = 0;
     g_ov.itemsWhy[0] = 0;
+    g_ov.writeWhy[0] = 0;
+    g_ov.sWriteWhy[0] = 0;
     g_ov.itemCount = 0;
     g_ov.mouseHeld = 0;
     /* -1, not 0: zero is a sequence number the client host really sends on its
