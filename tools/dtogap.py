@@ -229,7 +229,7 @@ def _wire(at, tok, declared):
         return None, "ATTR-UNPARSEABLE: %s" % e
 
 
-def dto_fields(r, t, at=None):
+def dto_fields(r, t, at=None, with_tidx=False):
     """(members, skipped) -- the members Newtonsoft would actually bind.
 
     ## Why this is not a field list
@@ -256,6 +256,13 @@ def dto_fields(r, t, at=None):
     because Newtonsoft would never have populated it.
 
     members: [(name, wire, typename, kind, declaring, attrstatus, origin)]
+    With with_tidx=True each member tuple carries an EIGHTH element: the
+    member's Il2CppType index. dtotype's recursive walk needs the TYPE, not
+    its printable name -- a name like `Dictionary<String,MainQuestSettings>`
+    has to be re-resolved by string, and a short name that is not unique
+    cannot be resolved at all, so nesting under it would go silently
+    unaudited. The index is exact. Existing callers unpack seven and are
+    untouched.
     skipped: [(name, declaring, reason)]     inherited first, in both.
     """
     r._ensure_fields()
@@ -299,7 +306,8 @@ def dto_fields(r, t, at=None):
                                     "get-only %s: Newtonsoft cannot bind it" % ty))
                     continue
                 origin = "prop/get-only-collection"
-            out.append((pname, wire, ty, kind, full, st, origin))
+            out.append((pname, wire, ty, kind, full, st, origin)
+                       + ((rt,) if with_tidx else ()))
 
         bb = r.TD_OFF + ct * r.TDS
         fs = struct.unpack_from("<i", r.m, bb + 32)[0]
@@ -320,7 +328,8 @@ def dto_fields(r, t, at=None):
                 skipped.append((fname, full, "non-public field, no [JsonProperty]"))
                 continue
             ty, kind = _kind_of(r, ti)
-            out.append((fname, wire, ty, kind, full, st, "field"))
+            out.append((fname, wire, ty, kind, full, st, "field")
+                       + ((ti,) if with_tidx else ()))
     return out, skipped
 
 
@@ -525,6 +534,12 @@ def find_capture(route):
                 return p
         return None
 
+    for p in _capture_paths(rows, base, want, body):
+        return p
+    return None
+
+
+def _capture_paths(rows, base, want, body):
     for exact in (True, False):
         for e in rows:
             u = e.get("url", "").split("?")[0].rstrip("/")
@@ -533,8 +548,35 @@ def find_capture(route):
                 continue
             p = body(e)
             if p:
+                yield p
+
+
+def find_captures(route):
+    """EVERY captured BSG body for `route`, in manifest order.
+
+    `find_capture` returns the FIRST, and for /client/game/profile/list that
+    is seq 083 -- captured before a profile existed, so `data` is an EMPTY
+    LIST. Anything using it as the falsifier for our payload therefore had
+    NOTHING to compare against and silently reported five FATAL rows
+    (`Inventory.equipment` and friends) that seq 208 shows BSG sending as
+    strings, exactly as we do. An empty body must not be mistaken for "BSG
+    never sent this".
+    """
+    base = CAPTURE_ROOT
+    man = os.path.join(base, "manifest.json")
+    if not os.path.exists(man):
+        return []
+    with open(man, encoding="utf-8") as fh:
+        rows = json.load(fh)
+
+    def body(e):
+        for sub in ("", "large"):
+            p = os.path.join(base, "responses", sub, e["seq"] + ".json")
+            if os.path.exists(p):
                 return p
-    return None
+        return None
+
+    return list(_capture_paths(rows, base, route.rstrip("/"), body))
 
 
 def report(r, route, dto, conf, note, sample, jpath, at=None, prov=None):

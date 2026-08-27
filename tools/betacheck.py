@@ -66,6 +66,24 @@ constant is the failure mode this file exists to avoid.
                and `exchange_rate`.  They do not -- that is the whole basis of
                the CORRECT-AS-IS verdict on those two members -- so a correct
                server plus a correct capture must go red
+    setwriteclient  the `setwrite` falsifier for the client-settings route:
+               demand the written value read back UNCHANGED
+    systemdata  demand that every mail message.systemData is a BOOLEAN -- the
+               exact shape that threw inside ExecuteRequest -- so a correct
+               server must go red
+    senderid   demand 23-character sender ids instead of the 24 a MongoID has,
+               so a correct server must go red
+    nestedtype plant an ARRAY at a NESTED member the client declares as a
+               class, after the response arrives.  The recursive type walk
+               must go red -- if it does not, it is only looking at the top
+               level, which is the blind spot that hid MainQuestSettings
+    shapes     assert the WRONG JSON kind on a served member on purpose; if
+               that does not turn the check red, the check is not looking
+
+Every name above is checked at start-up against the names this file actually
+branches on (`mut == "..."`), and a typo'd `--mutate` is REFUSED rather than
+silently running the unmutated check and printing PASS -- which is what it did
+until 2026-08-27, making `--mutate` a proof that could not fail.
 """
 
 import argparse
@@ -74,6 +92,7 @@ import http.client
 import json
 import os
 import random
+import re
 import shutil
 import socket
 import subprocess
@@ -472,6 +491,149 @@ TOLERATED = [
     ("/client/weather", "SeasonsSettings", None),
     ("/client/trading/api/getTraderAssort", "exchange_rate", PRAPOR),
 ]
+
+
+# ---------------------------------------------------------------------------
+# 19. every NESTED member's JSON type, not just the top level
+#
+# The type audit walked only the top level of a payload, so
+# `globals.config.MainQuest` -- and TraderDialogsDTO, and
+# AvailableCustomizationsResponse, and SeasonalPerksData -- were structurally
+# invisible to it.  All four were found by reading the client's crash log.
+# `tools/dtodeep.py` descends; this drives it against the LIVE server.
+#
+# It is asserted as a negative, on the finished payload: no member at ANY
+# depth may carry a JSON kind Newtonsoft would throw on.  A shape BSG's own
+# capture also sends is NOT counted -- that falsifies the DTO mapping, not our
+# payload, and "fixing" it would be editing correct data.
+#
+# `--mutate nestedtype` plants an ARRAY at a nested member the client declares
+# as a class, AFTER the response is received.  The walker must go red; if it
+# does not, it is not descending and this check is worthless.
+NESTED_ROUTES = [
+    ("/client/globals", "data.config"),
+    ("/client/weather", "data"),
+    ("/client/settings", "data"),
+    ("/client/hideout/areas", "data"),
+    ("/client/hideout/settings", "data"),
+    ("/client/seasonal-perks/list", "data"),
+    ("/client/profile/status", "data"),
+    ("/client/game/mode", "data"),
+    ("/client/friends", "data"),
+    ("/client/getMetricsConfig", "data"),
+]
+
+
+def _nested_resolver():
+    """(resolver, attrs, dtogap, dtodeep) or (None, reason)."""
+    import dtogap as _g
+    if not os.path.isfile(_g.METADEC):
+        return None, ("no decrypted metadata at %s -- set AOWL_METADEC or run "
+                      "tools/metablob.py. Nothing was type-checked."
+                      % _g.METADEC)
+    if not os.path.isfile(_g.GAMEASM):
+        return None, "no GameAssembly.dll at %s" % _g.GAMEASM
+    from il2cpp_resolve import Resolver
+    import il2cpp_attrs
+    import dtodeep as _d
+    r = Resolver(_g.GAMEASM, _g.METADEC)
+    _g.selfcheck(r)                      # exits the process if it fails
+    at = il2cpp_attrs.selfcheck(r)
+    _g.member_selfcheck(r, at)
+    return (r, at, _g, _d), ""
+
+
+def _plant_bad_nested(obj):
+    """Replace the first NESTED object-valued member with an array.
+
+    Returns the path it broke, or "". Deliberately not the top level: the
+    whole point is to prove the walk goes below it.
+    """
+    for k, v in obj.items():
+        if isinstance(v, dict) and v:
+            for k2, v2 in v.items():
+                if isinstance(v2, dict):
+                    v[k2] = [{"planted": True}]
+                    return "%s.%s" % (k, k2)
+    return ""
+
+
+def check_nested_types(w, mut):
+    got, err = _nested_resolver()
+    if got is None:
+        record("nested-types", INCONC, err)
+        return
+    r, at, _g, _d = got
+    fatal, walked, checked, found, seen_routes = [], 0, 0, 0, []
+    planted = ""
+    for route, jpath in NESTED_ROUTES:
+        ent = _g.ROUTES.get(route)
+        dto = ent[0] if ent else None
+        if not dto:
+            continue
+        st, doc, text = w.call(route, {})
+        if doc is None:
+            continue
+        node = doc
+        for part in jpath.split("."):
+            node = node.get(part) if isinstance(node, dict) else None
+        if isinstance(node, list):
+            node = node[0] if node else None
+        if not isinstance(node, dict):
+            continue
+        if mut == "nestedtype" and not planted:
+            planted = _plant_bad_nested(node)
+            if planted:
+                planted = "%s -> %s" % (route, planted)
+        t = r.find_one(dto)
+        if t is None:
+            continue
+        bsg = None
+        for p in (_g.find_captures(route) or []):
+            try:
+                with open(p, encoding="utf-8", errors="replace") as fh:
+                    d = json.load(fh)
+            except (ValueError, OSError):
+                continue
+            for part in jpath.split("."):
+                d = d.get(part) if isinstance(d, dict) else None
+            if isinstance(d, list):
+                d = d[0] if d else None
+            if isinstance(d, dict) and d:
+                bsg = d
+                break
+        walker = _d.Walk(r, at)
+        walker.walk_object(node, t, "", 0, bsg)
+        walked += 1
+        checked += walker.checked
+        found += walker.found
+        seen_routes.append(route)
+        for v, path, decl, jk, why in walker.rows:
+            if v == _d.FATAL:
+                fatal.append("%s%s: %s (declared %s, emitted %s)"
+                             % (route, path, why, decl, jk))
+    if not walked:
+        record("nested-types", INCONC,
+               "no mapped route answered -- nothing was type-checked")
+        return
+    if mut == "nestedtype" and not planted:
+        record("nested-types", INCONC,
+               "--mutate nestedtype found no nested object to break, so it "
+               "proved nothing")
+        return
+    if fatal:
+        record("nested-types", FAIL,
+               "%d nested member(s) carry a JSON type the client cannot "
+               "deserialize: %s" % (len(fatal), "; ".join(fatal[:6])))
+    elif mut == "nestedtype":
+        record("nested-types", FAIL,
+               "the planted array at %s was NOT detected -- the walk is not "
+               "descending, so its PASS means nothing" % planted)
+    else:
+        record("nested-types", OK,
+               "%d members type-checked at every depth across %d routes "
+               "(%d UNKNOWN, not counted as passes); 0 FATAL"
+               % (checked, walked, found - checked))
 
 
 def check_tolerated(w, mut):
@@ -1451,6 +1613,48 @@ def check_route_shapes(w, mut):
                   ("; not examined: " + "; ".join(skipped)) if skipped else ""))
 
 
+# ------------------------------------------------------- the mutation table
+#
+# `--mutate typo` used to fall through every `mut == "..."` branch, run the
+# UNMUTATED check and print PASS.  A falsifier that cannot fail is worth less
+# than no falsifier, so the name is now validated against a table -- and the
+# table itself is validated against the source, so it cannot silently drift
+# out of date the way it already had (four mutations existed with no doc line).
+def mutations():
+    """{name: one-line doc} for every --mutate this file implements.
+
+    Both halves are DERIVED, never written twice: the names come from the
+    `mut == "..."` branches in this file's own source, the docs from this
+    module's docstring.  A name in one and not the other is a defect in
+    betacheck itself and is reported as such -- it does not silently reduce
+    to a shorter list.
+    """
+    doc, started = {}, False
+    for line in (__doc__ or "").splitlines():
+        if "runs a deliberately wrong variant" in line:
+            started = True
+            continue
+        if not started:
+            continue
+        m = re.match(r"^    ([a-z]{3,14}) +(\S.*)$", line)
+        if m:
+            doc[m.group(1)] = m.group(2).strip()
+    try:
+        with open(os.path.abspath(__file__), encoding="utf-8") as f:
+            src = set(re.findall(r'mut == "([a-z]+)"', f.read()))
+    except OSError:
+        src = set(doc)
+    undoc, unimpl = sorted(src - set(doc)), sorted(set(doc) - src)
+    if undoc or unimpl:
+        sys.exit("betacheck's mutation table disagrees with its own source."
+                 "\n  implemented but undocumented: %s"
+                 "\n  documented but not implemented: %s\n"
+                 "Fix the docstring or the branch; do not ship a --mutate list "
+                 "that is wrong about what it can falsify."
+                 % (", ".join(undoc) or "none", ", ".join(unimpl) or "none"))
+    return doc
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--port", type=int, default=7788)
@@ -1480,11 +1684,29 @@ def main():
                     help="do not delete the spawned root, so it can be "
                          "inspected after a failure")
     ap.add_argument("--spt", default="D:\\SPT")
-    ap.add_argument("--mutate", default="")
+    ap.add_argument("--mutate", default="",
+                    help="run a deliberately wrong variant to prove a check "
+                         "can FAIL. An unknown name is REFUSED, never ignored. "
+                         "--list-mutations prints them all.")
+    ap.add_argument("--list-mutations", action="store_true",
+                    help="print every valid --mutate name and what it "
+                         "falsifies, then exit")
     ap.add_argument("--loose-dir", default="",
                     help="where the backend reads per-map looseLoot "
                          "sidecars from (default <repo>/build/db/looseloot)")
     a = ap.parse_args(namespace=argparse.Namespace())
+    known = mutations()
+    if a.list_mutations:
+        print("valid --mutate names (%d):" % len(known))
+        for k in sorted(known):
+            print("  %-14s %s" % (k, known[k]))
+        return 0
+    if a.mutate and a.mutate not in known:
+        sys.exit("unknown --mutate %r. betacheck used to accept this, run the "
+                 "UNMUTATED check and print PASS -- a falsifier that cannot "
+                 "fail.\nValid names: %s"
+                 "\n(--list-mutations describes each.)"
+                 % (a.mutate, ", ".join(sorted(known))))
     # Remember whether --port was typed, so --spawn can pick a FREE port
     # instead of the shared 7788 default two concurrent runs both grabbed.
     a.port_explicit = a.port if any(
@@ -2340,9 +2562,23 @@ def main():
         check_weather_shape(w, mut)
     except Exception as exc:                       # noqa: BLE001
         record("weather-shape", INCONC, "%s: %r" % (type(exc).__name__, exc))
+
+    # ------------------------------------------------------------------ 18
+    # `check_route_shapes` used to sit INSIDE the handler above -- legal
+    # Python (two statements in one except body, then a second except
+    # clause), so nothing complained, and it therefore ran ONLY when
+    # check_weather_shape raised. A check that never executes reports
+    # nothing and reads exactly like a passing one.
+    try:
         check_route_shapes(w, mut)
     except Exception as exc:                       # noqa: BLE001
         record("route-shapes", INCONC, "%s: %r" % (type(exc).__name__, exc))
+
+    # ------------------------------------------------------------------ 19
+    try:
+        check_nested_types(w, mut)
+    except Exception as exc:                       # noqa: BLE001
+        record("nested-types", INCONC, "%s: %r" % (type(exc).__name__, exc))
 
     # ------------------------------------------------------------------ 14
     try:

@@ -40,6 +40,7 @@ import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 import dtogap as G                                   # noqa: E402
+import dtodeep as D                                  # noqa: E402
 
 MISMATCH, OK, UNKNOWN = "MISMATCH", "OK", "UNKNOWN"
 
@@ -214,12 +215,170 @@ def run_one(r, at, label, obj, dto, route=None, jpath=None):
     return len(bad)
 
 
+
+# ---------------------------------------------------------------- the deep walk
+#
+# The top-level sweep above could not see `globals.config.MainQuest`, and that
+# is where MainQuestSettings -- one of four crash-class bugs found by reading
+# the client's error log instead of by this tool -- actually lived. dtodeep
+# descends; this is the reporting shell around it.
+
+_CAPCACHE = {}
+
+
+def capture_doc(route, jpath):
+    """BSG's own captured body for `route`, positioned at `jpath`."""
+    if route in _CAPCACHE:
+        return _CAPCACHE[route]
+    # The FIRST capture for a route can be empty -- seq 083 for
+    # /client/game/profile/list was recorded before a profile existed -- and an
+    # empty falsifier is indistinguishable from an absent one, which is how
+    # five correct `Inventory.*` members got reported FATAL. Take the first
+    # capture that actually has something at `jpath`.
+    doc = None
+    for p in (G.find_captures(route) or []):
+        try:
+            with open(p, encoding="utf-8", errors="replace") as f:
+                d = at_path(json.load(f), jpath or "data")
+        except (ValueError, OSError):
+            continue
+        if isinstance(d, list):
+            d = d[0] if d else None
+        if isinstance(d, dict) and d:
+            doc = d
+            break
+    _CAPCACHE[route] = doc
+    return doc
+
+
+def deep_one(r, at, label, obj, dto, route=None, jpath="data",
+             depth=8, elems=6, verbose=False):
+    """(fatal-rows, checked, found, truncated)."""
+    t = r.find_one(dto)
+    if t is None:
+        print("UNKNOWN     %s  DTO %s did not resolve -- NOT type-checked"
+              % (label, dto))
+        return [], 0, 0, False, 0
+    w = D.Walk(r, at, max_depth=depth, max_elems=elems)
+    bsg = capture_doc(route, jpath) if route else None
+    if isinstance(bsg, list):
+        bsg = bsg[0] if bsg else None
+    w.walk_object(obj, t, "", 0, bsg)
+    fatal = [x for x in w.rows if x[0] == D.FATAL]
+    hetero = [x for x in w.rows if x[0] == D.HETERO]
+    unk = [x for x in w.rows if x[0] == D.UNKNOWN]
+    coer = [x for x in w.rows if x[0] == D.COERCIBLE]
+    for v, path, decl, jk, why in fatal:
+        print("  FATAL     %-52s declared=%-28s emitted=%s  %s"
+              % (path or "<root>", decl, jk, why))
+    for v, path, decl, jk, why in hetero:
+        print("  HETERO    %-52s %s" % (path or "<root>", why))
+    if verbose:
+        for v, path, decl, jk, why in coer + unk:
+            print("  %-9s %-52s declared=%-28s emitted=%s  %s"
+                  % (v, path or "<root>", decl, jk, why))
+    print("%-11s %-46s DTO=%s  %d members type-checked / %d found, "
+          "%d FATAL, %d COERCIBLE, %d UNKNOWN, %d BSG-excused%s"
+          % ("FAIL" if fatal else ("INCONCL." if w.truncated else "PASS"),
+             label, dto.split(".")[-1], w.checked, w.found, len(fatal),
+             len(coer), len(unk), w.downgraded,
+             ", TRUNCATED" if w.truncated else ""))
+    return fatal + hetero, w.checked, w.found, w.truncated, w.downgraded
+
+
+def selftest(r, at, manifest):
+    """Can the recursive walk actually go RED, and does it go red BELOW the
+    top level? A sweep that reports 0 FATAL is worth nothing until this
+    passes, because 0 is also what a walk that never descends prints.
+
+    Three plants at NESTED paths in a real served payload, one per fatal
+    class. Each must be caught, and the row's path must be more than one
+    component deep -- otherwise the walk found it at the top level and proved
+    nothing about nesting.
+    """
+    with open(manifest, encoding="utf-8") as f:
+        man = json.load(f)
+    root = os.path.dirname(os.path.abspath(manifest))
+    ent = next((e for e in man.get("entries", [])
+                if e["route"] == "/client/globals"), None)
+    if ent is None:
+        print("INCONCLUSIVE: the manifest has no /client/globals entry")
+        return 2
+    with open(os.path.join(root, ent["sample"]), encoding="utf-8") as f:
+        base = at_path(json.load(f), ent.get("path") or "data")
+    dto = G.ROUTES["/client/globals"][0]
+    t = r.find_one(dto)
+
+    def find_nested(pred, node, path, depth=0):
+        if depth > 3 or not isinstance(node, dict):
+            return None
+        for k, v in node.items():
+            if depth > 0 and pred(v):
+                return path + [k]
+            got = find_nested(pred, v, path + [k], depth + 1)
+            if got:
+                return got
+        return None
+
+    plants = [
+        ("array into a declared class",
+         lambda v: isinstance(v, dict) and bool(v), lambda v: [{"x": 1}]),
+        ("string into a declared number",
+         lambda v: isinstance(v, (int, float)) and not isinstance(v, bool),
+         lambda v: "not a number at all"),
+        ("object into a declared array",
+         lambda v: isinstance(v, list) and bool(v), lambda v: {"x": 1}),
+    ]
+    bad = 0
+    for label, pred, make in plants:
+        doc = json.loads(json.dumps(base))
+        where = find_nested(pred, doc, [])
+        if where is None or len(where) < 2:
+            print("INCONCLUSIVE  %-34s no nested site to plant it at" % label)
+            bad += 1
+            continue
+        node = doc
+        for k in where[:-1]:
+            node = node[k]
+        node[where[-1]] = make(node[where[-1]])
+        w = D.Walk(r, at)
+        w.walk_object(doc, t, "", 0, None)      # no BSG falsifier: the plant
+        hits = [x for x in w.rows                # is ours, not BSG's
+                if x[0] in (D.FATAL, D.COERCIBLE)
+                and x[1] == "." + ".".join(where)]
+        deep = [x for x in hits if x[1].count(".") > 1]
+        if deep:
+            print("PASS          %-34s caught at %s" % (label, deep[0][1]))
+        else:
+            print("FAIL          %-34s planted at .%s and NOT reported -- the "
+                  "walk is not descending" % (label, ".".join(where)))
+            bad += 1
+    print("---- selftest: %s" % ("FAIL" if bad else
+                                 "PASS, the walk can go red below the top level"))
+    return 1 if bad else 0
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--sample")
     ap.add_argument("--dto")
     ap.add_argument("--path", default="data")
     ap.add_argument("--manifest")
+    ap.add_argument("--selftest", action="store_true",
+                    help="plant a known-bad value at a NESTED path in a real "
+                         "sample and prove the walk reports it. 0 FATAL means "
+                         "nothing until this passes.")
+    ap.add_argument("--shallow", action="store_true",
+                    help="the pre-2026-08-27 behaviour: check ONLY the "
+                         "top-level members. Every nested member goes "
+                         "unaudited, which is where the last four "
+                         "crash-class bugs were.")
+    ap.add_argument("--depth", type=int, default=8)
+    ap.add_argument("--elems", type=int, default=6,
+                    help="array/dictionary elements examined per node, on top "
+                         "of every element whose SHAPE differs from the first")
+    ap.add_argument("-v", "--verbose", action="store_true",
+                    help="also print COERCIBLE and UNKNOWN rows")
     a = ap.parse_args()
     from il2cpp_resolve import Resolver
     import il2cpp_attrs
@@ -227,7 +386,12 @@ def main():
     G.selfcheck(r)
     at = il2cpp_attrs.selfcheck(r)
     G.member_selfcheck(r, at)
-    bad = 0
+    bad = checked = found = routes_deep = excused = 0
+    unmapped, truncated = [], []
+    if a.selftest:
+        if not a.manifest:
+            raise SystemExit("INCONCLUSIVE: --selftest needs --manifest")
+        return selftest(r, at, a.manifest)
     if a.sample:
         if not a.dto:
             raise SystemExit("INCONCLUSIVE: --sample needs --dto")
@@ -239,7 +403,13 @@ def main():
         if obj is None:
             raise SystemExit("INCONCLUSIVE: nothing at --path %r in %s"
                              % (a.path, a.sample))
-        bad = run_one(r, at, a.sample, obj, a.dto)
+        if a.shallow:
+            bad = run_one(r, at, a.sample, obj, a.dto)
+        else:
+            rows, ck, fd, _tr, _dg = deep_one(r, at, a.sample, obj, a.dto,
+                                         None, a.path, a.depth, a.elems,
+                                         a.verbose)
+            bad, checked, found = len(rows), ck, fd
     elif a.manifest:
         with open(a.manifest, encoding="utf-8") as f:
             man = json.load(f)
@@ -250,6 +420,7 @@ def main():
             dto = ent[0] if ent else None
             if not dto:
                 print("%-11s %s  no DTO mapped -- TYPES NOT CHECKED" % (UNKNOWN, route))
+                unmapped.append(route)
                 continue
             p = os.path.join(root, e["sample"])
             if not os.path.exists(p):
@@ -267,10 +438,42 @@ def main():
             if not isinstance(obj, dict):
                 print("%-11s %s  nothing to check at %r" % (UNKNOWN, route, e.get("path")))
                 continue
-            bad += run_one(r, at, route, obj, dto, route, e.get("path") or "data")
+            if a.shallow:
+                bad += run_one(r, at, route, obj, dto, route,
+                               e.get("path") or "data")
+            else:
+                rows, ck, fd, tr, dg = deep_one(r, at, route, obj, dto, route,
+                                            e.get("path") or "data",
+                                            a.depth, a.elems, a.verbose)
+                bad += len(rows)
+                checked += ck
+                found += fd
+                routes_deep += 1
+                excused += dg
+                if tr:
+                    truncated.append(route)
     else:
         raise SystemExit("give --sample/--dto or --manifest")
-    print("---- %d MISMATCH total" % bad)
+    if a.shallow:
+        print("---- %d MISMATCH total (TOP LEVEL ONLY -- every nested member "
+              "went unaudited)" % bad)
+        return 1 if bad else 0
+    print("---- %d FATAL/HETERO total across %d routes walked recursively"
+          % (bad, routes_deep))
+    print("---- coverage: %d nested members TYPE-CHECKED out of %d the "
+          "payloads carry; %d are UNKNOWN, which is NOT a pass"
+          % (checked, found, found - checked))
+    print("---- %d row(s) would have been FATAL but BSG's OWN CAPTURE sends "
+          "the same JSON kind at that exact path -- those falsify the DTO "
+          "mapping, not our payload. 0 FATAL with a large number here is "
+          "NOT the same claim as 0 FATAL with none." % excused)
+    if unmapped:
+        print("---- %d routes have no DTO mapped and were NOT checked at all: "
+              "%s" % (len(unmapped), ", ".join(unmapped)))
+    if truncated:
+        print("---- INCONCLUSIVE on %d route(s) -- the node budget ran out "
+              "before the walk finished: %s"
+              % (len(truncated), ", ".join(truncated)))
     return 1 if bad else 0
 
 
