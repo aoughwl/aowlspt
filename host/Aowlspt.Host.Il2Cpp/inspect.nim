@@ -672,8 +672,13 @@ proc iRefreshAnchors() =
   if duOk(gInspPreloader, 0x130'i32):
     iSetVarP("verlabel", cReadPtrAt(gInspPreloader, 0x20'i32))
     iSetVarP("modetext", cReadPtrAt(gInspPreloader, 0x128'i32))
-  iSetVarP("duanchor", gDuAnchorTmp)     # the TMP the overlay clones from
-  iSetVarP("duroot", gDuRootGo)          # the GameObject it parents clones to
+  # `$duanchor` and `$duroot` are GONE, not left reading nil. They named the
+  # TextMeshProUGUI the F3 overlay cloned from and the GameObject it parented
+  # clones to, and the F3 overlay no longer clones or parents anything: it
+  # submits screen-space draw commands to the shared region and the D3D11
+  # overlay rasterises them in Present. An anchor that always reads null is
+  # indistinguishable from one whose object has not spawned yet, which is
+  # exactly the kind of answer the inspector must never give.
   iSetVarP("gameworld", gDuGameWorld)    # the live GameWorld, when in a raid
   iSetVarP("you", gDuYou)                # the local player, when in a raid
   # The live SettingsScreen `this`, once opened. `gSettingsLiveSelf` (set by the

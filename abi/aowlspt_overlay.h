@@ -10173,9 +10173,32 @@ static void aowl_ov_region_append(void) {
                 aowl_ov_frame_rect(c->x, c->y, c->w, c->h,
                                    c->t > 0.0f ? c->t : 1.0f, c->col);
                 break;
-            case AOWL_REGION_CMD_TEXT:
-                aowl_ov_text(c->x, c->y, c->text, c->col);
+            case AOWL_REGION_CMD_TEXT: {
+                /* TEXT REUSES `t` AS AN INTEGER FONT SCALE. `t` has no meaning
+                 * for a text command and every existing submitter leaves it 0,
+                 * so 0 (and anything < 1) is exactly the old 1x behaviour --
+                 * this is additive, not an ABI change, and no mod had to be
+                 * rebuilt for it.
+                 *
+                 * WHY IT WAS NEEDED. An 8x16 cell on a 3840x2160 back buffer is
+                 * unreadable, and the F3 widgets are a read-out a human is
+                 * meant to READ. The panel and the F6 menu already pick an
+                 * integer scale for exactly this reason; a region submitter had
+                 * no way to say so and was pinned at 1x.
+                 *
+                 * The submitter still works in TRUE BACK-BUFFER PIXELS: the
+                 * scale is applied inside `aowl_ov_vert`, which multiplies the
+                 * position as well as the glyph, so the position is divided out
+                 * here. A submitter that had to pre-divide would be a second
+                 * coordinate system to get wrong. */
+                int32_t k = (int32_t)c->t;
+                if (k < 1) k = 1;
+                if (k > 8) k = 8;          /* capped; never trusted raw */
+                g_ov.scale = k;
+                aowl_ov_text(c->x / (float)k, c->y / (float)k, c->text, c->col);
+                g_ov.scale = 1;
                 break;
+            }
             case AOWL_REGION_CMD_LINE: {
                 /* An axis-aligned quad between the two points. The overlay has
                  * no line primitive and inventing a rotated one here would be

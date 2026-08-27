@@ -318,6 +318,31 @@ extern int32_t     aowl_wg_rg_disabled(void);
 extern int32_t     aowl_wg_rg_throttled(void);
 extern int32_t     aowl_wg_rg_armed(void);
 
+/* THE SUBMITTER SIDE. Defined in `aowlspt_regview.h`, for the same reason and
+ * with the same discipline as the read-only view above: scalars and a
+ * `const char*` cross the line, never a struct.
+ *
+ * The F3 widgets DRAW THROUGH THESE, into the shared region, and are
+ * rasterised by the D3D11 overlay in `Present` -- the same path the F12 panel
+ * and the F6 admin HUD use. They no longer clone a TextMeshProUGUI, no longer
+ * walk Unity's canvas tree, and no longer have anything that can be
+ * "successfully built" and invisible. */
+extern int32_t     aowl_wg_dr_fill(float x, float y, float w, float h,
+                                   uint32_t col);
+extern int32_t     aowl_wg_dr_box(float x, float y, float w, float h, float t,
+                                  uint32_t col);
+extern int32_t     aowl_wg_dr_text(float x, float y, const char* s,
+                                   uint32_t col, int32_t scale);
+extern int32_t     aowl_wg_scr_w(void);
+extern int32_t     aowl_wg_scr_h(void);
+extern int32_t     aowl_wg_scr_known(void);
+extern int32_t     aowl_wg_rg_register(const char* name,
+                                       void (*fn)(void*, int64_t),
+                                       int32_t mask, int32_t order,
+                                       int32_t budgetUs);
+extern const char* aowl_wg_rg_refusal_text(int32_t r);
+extern int32_t     aowl_wg_rg_mask_draw(void);
+
 /* ================================================================== *
  * 4. THE BREADCRUMB
  *
@@ -347,76 +372,36 @@ enum {
     AOWL_WG_CRUMB_NONE      = 0,
     AOWL_WG_CRUMB_ENTER     = 1,
     AOWL_WG_CRUMB_TOGGLE    = 2,
-    AOWL_WG_CRUMB_BUILD     = 3,
+    AOWL_WG_CRUMB_BUILD     = 3,   /* retired with the clone path      */
     AOWL_WG_CRUMB_SCANWORLD = 4,
     AOWL_WG_CRUMB_MOUSE     = 5,
     AOWL_WG_CRUMB_EDITKEYS  = 6,
     AOWL_WG_CRUMB_DRAG      = 7,
     AOWL_WG_CRUMB_WTEXT     = 8,   /* composing a widget's text        */
-    AOWL_WG_CRUMB_WPLACE    = 9,   /* duPlace on a widget              */
+    AOWL_WG_CRUMB_WPLACE    = 9,   /* laying out a widget's rect       */
     AOWL_WG_CRUMB_WSTYLE    = 10,
     AOWL_WG_CRUMB_WSETTEXT  = 11,
     AOWL_WG_CRUMB_WSHOW     = 12,
     AOWL_WG_CRUMB_BANNER    = 13,
-    AOWL_WG_CRUMB_HIDEREST  = 14,
+    AOWL_WG_CRUMB_HIDEREST  = 14,  /* retired: nothing persists now    */
     AOWL_WG_CRUMB_MARKERS   = 15,
-    AOWL_WG_CRUMB_DONE      = 16,
-
-    /* INSIDE duBuild. The live run narrowed the fault to "cloning the label
-     * pool", which is still a dozen distinct managed operations -- so the
-     * build path gets its own stages rather than another round of guessing.
-     * `aowl_wg_crumb_w` doubles as the CLONE INDEX in the two pool loops. */
-    AOWL_WG_CRUMB_B_ANCHOR   = 17,  /* duFindAnchor                        */
-    AOWL_WG_CRUMB_B_ROOT     = 18,  /* duCanvasRootGo                      */
-    AOWL_WG_CRUMB_B_PROBECLONE = 19,/* Instantiate for the probe           */
-    AOWL_WG_CRUMB_B_PROBEDRAW  = 20,/* duMakeDrawable on the probe         */
-    AOWL_WG_CRUMB_B_SRCCANVAS  = 21,/* reading the SOURCE's m_Canvas       */
-    AOWL_WG_CRUMB_B_PROBECANVAS= 22,/* reading the PROBE's m_Canvas        */
-    AOWL_WG_CRUMB_B_DROPCANVAS = 23,/* duDropNestedCanvas                  */
-    AOWL_WG_CRUMB_B_ASSERTLOG  = 24,/* the assertion's own describe calls  */
-    AOWL_WG_CRUMB_B_PROBEREUSE = 25,/* style+drawable on the reused probe  */
-    AOWL_WG_CRUMB_B_PANELCLONE = 26,/* pool clone loop; crumb_w = index    */
-    AOWL_WG_CRUMB_B_PANELDRAW  = 27,/* style+drawable on a pool clone      */
-    AOWL_WG_CRUMB_B_MARKCLONE  = 28,/* marker clone loop; crumb_w = index  */
-    AOWL_WG_CRUMB_B_MARKDRAW   = 29,
-    AOWL_WG_CRUMB_B_SCALE      = 30,/* reading the canvas scaleFactor      */
-    AOWL_WG_CRUMB_B_DIAGDUMP   = 31,/* duDiagDump                          */
-    AOWL_WG_CRUMB_B_READBACK   = 32,/* the placement read-back             */
-
-    /* INSIDE duCanvasRootGo -- the canvas-root walk, which the second live run
-     * named. Every one of these is a MANAGED CALL on a UnityEngine.Object whose
-     * native half may be gone (Unity's "fake null"), so each hop gets its own
-     * crumb and its own liveness gate. */
-    AOWL_WG_CRUMB_R_ANCHORALIVE = 33,
-    AOWL_WG_CRUMB_R_RECT        = 34, /* duRectOf -> Component::get_transform */
-    AOWL_WG_CRUMB_R_RECTALIVE   = 35,
-    AOWL_WG_CRUMB_R_PARENT      = 36, /* Transform::get_parent                */
-    AOWL_WG_CRUMB_R_PARSANE     = 37, /* duRectIsSane -> get_rect (sret)      */
-    AOWL_WG_CRUMB_R_PARGO       = 38, /* Component::get_gameObject            */
-    AOWL_WG_CRUMB_R_CANVAS      = 39, /* route 2                              */
-    AOWL_WG_CRUMB_R_CLIMB       = 40, /* route 3                              */
-    AOWL_WG_CRUMB_R_DONE        = 41,
-    /* Route 3's climb, separately from route 1's single hop, because the two
-     * were indistinguishable in the log and only one of them has a loop. The
-     * crumb's second slot carries `depth * 4 + role`, role 0 = the RECEIVER
-     * being gated, 1 = the RESULT being gated, 2 = the call itself. */
-    AOWL_WG_CRUMB_R_CLIMBPARENT = 42,
-    AOWL_WG_CRUMB_R_RECTSRC     = 43  /* choosing the anchor's RectTransform */
+    AOWL_WG_CRUMB_DONE      = 16
 };
 
-/* Decode the packed loop slot for the log. Kept next to the encoding so the two
- * cannot drift; a depth that is reported wrong is worse than none. */
-static int32_t aowl_wg_crumb_depth(int32_t packed) {
-    return packed < 0 ? -1 : packed / 4;
-}
-static const char* aowl_wg_crumb_role(int32_t packed) {
-    if (packed < 0) return "";
-    switch (packed % 4) {
-    case 0:  return "gating the RECEIVER";
-    case 1:  return "gating the RESULT";
-    default: return "in the CALL itself";
-    }
-}
+/* THE STAGES NUMBERED 17..43 ARE DELETED, not renumbered and not left
+ * dormant. They named steps inside the old Unity-UI path -- cloning a
+ * TextMeshProUGUI, walking up to a canvas root, dropping a nested Canvas --
+ * and that path is gone: the F3 widgets now submit screen-space draw commands
+ * to the shared region and the D3D11 overlay rasterises them in `Present`,
+ * exactly as the F12 panel and the F6 admin HUD are. A crumb for a stage that
+ * can no longer be reached is a stage a future fault report can NAME, and a
+ * confidently wrong location is worse than none.
+ *
+ * `aowl_wg_crumb_widget` therefore now carries EXACTLY ONE meaning -- a widget
+ * index -- where it used to carry three (widget index, clone-pool index, and a
+ * packed `depth * 4 + role`). The two decoders for the other meanings went
+ * with them, for the same reason. */
+
 
 static volatile int32_t aowl_wg_crumb_stage  = 0;
 static volatile int32_t aowl_wg_crumb_widget = -1;
@@ -430,47 +415,18 @@ static const char* aowl_wg_crumb_text(int32_t s) {
     switch (s) {
     case AOWL_WG_CRUMB_ENTER:     return "entering the body";
     case AOWL_WG_CRUMB_TOGGLE:    return "reading the toggle key";
-    case AOWL_WG_CRUMB_BUILD:     return "duBuild (cloning the label pool)";
     case AOWL_WG_CRUMB_SCANWORLD: return "duScanWorld (walking RegisteredPlayers)";
     case AOWL_WG_CRUMB_MOUSE:     return "sampling the pointer";
     case AOWL_WG_CRUMB_EDITKEYS:  return "edit-mode keys";
     case AOWL_WG_CRUMB_DRAG:      return "the drag step";
     case AOWL_WG_CRUMB_WTEXT:     return "composing a widget's text";
-    case AOWL_WG_CRUMB_WPLACE:    return "placing a widget (duPlace)";
-    case AOWL_WG_CRUMB_WSTYLE:    return "styling a widget (duStyle)";
-    case AOWL_WG_CRUMB_WSETTEXT:  return "writing a widget's text (duSetText)";
-    case AOWL_WG_CRUMB_WSHOW:     return "showing a widget (duShow)";
+    case AOWL_WG_CRUMB_WPLACE:    return "laying out a widget's rect";
+    case AOWL_WG_CRUMB_WSTYLE:    return "the widget backing plate and frame";
+    case AOWL_WG_CRUMB_WSETTEXT:  return "submitting a widget's TEXT commands";
+    case AOWL_WG_CRUMB_WSHOW:     return "finishing a widget";
     case AOWL_WG_CRUMB_BANNER:    return "the edit-mode banner";
-    case AOWL_WG_CRUMB_HIDEREST:  return "hiding unused labels";
     case AOWL_WG_CRUMB_MARKERS:   return "the ESP markers";
     case AOWL_WG_CRUMB_DONE:      return "finished (fault came from elsewhere)";
-    case AOWL_WG_CRUMB_B_ANCHOR:      return "duBuild: duFindAnchor (locating the donor version label)";
-    case AOWL_WG_CRUMB_B_ROOT:        return "duBuild: duCanvasRootGo (walking to the canvas root)";
-    case AOWL_WG_CRUMB_B_PROBECLONE:  return "duBuild: Object::Instantiate for the PROBE clone";
-    case AOWL_WG_CRUMB_B_PROBEDRAW:   return "duBuild: duMakeDrawable on the probe clone";
-    case AOWL_WG_CRUMB_B_SRCCANVAS:   return "duBuild: reading the SOURCE label's Graphic.m_Canvas";
-    case AOWL_WG_CRUMB_B_PROBECANVAS: return "duBuild: reading the PROBE clone's Graphic.m_Canvas";
-    case AOWL_WG_CRUMB_B_DROPCANVAS:  return "duBuild: duDropNestedCanvas on the probe";
-    case AOWL_WG_CRUMB_B_ASSERTLOG:   return "duBuild: composing the canvas-assertion log line";
-    case AOWL_WG_CRUMB_B_PROBEREUSE:  return "duBuild: restyling the reused probe as panel label 0";
-    case AOWL_WG_CRUMB_B_PANELCLONE:  return "duBuild: Object::Instantiate for a POOL label (index in the widget field)";
-    case AOWL_WG_CRUMB_B_PANELDRAW:   return "duBuild: duStyle/duMakeDrawable on a pool label";
-    case AOWL_WG_CRUMB_B_MARKCLONE:   return "duBuild: Object::Instantiate for a MARKER label (index in the widget field)";
-    case AOWL_WG_CRUMB_B_MARKDRAW:    return "duBuild: duStyle/duMakeDrawable on a marker label";
-    case AOWL_WG_CRUMB_B_SCALE:       return "duBuild: reading the canvas scaleFactor";
-    case AOWL_WG_CRUMB_B_DIAGDUMP:    return "duBuild: duDiagDump";
-    case AOWL_WG_CRUMB_B_READBACK:    return "duBuild: the placement read-back";
-    case AOWL_WG_CRUMB_R_ANCHORALIVE: return "duCanvasRootGo: liveness gate on the anchor";
-    case AOWL_WG_CRUMB_R_RECT:        return "duCanvasRootGo: duRectOf -> Component::get_transform on the anchor";
-    case AOWL_WG_CRUMB_R_RECTALIVE:   return "duCanvasRootGo: liveness gate on the anchor's RectTransform";
-    case AOWL_WG_CRUMB_R_PARENT:      return "duCanvasRootGo: Transform::get_parent";
-    case AOWL_WG_CRUMB_R_PARSANE:     return "duCanvasRootGo: duRectIsSane -> RectTransform::get_rect on the parent";
-    case AOWL_WG_CRUMB_R_PARGO:       return "duCanvasRootGo: Component::get_gameObject on the parent";
-    case AOWL_WG_CRUMB_R_CANVAS:      return "duCanvasRootGo: route 2, the Graphic's own Canvas";
-    case AOWL_WG_CRUMB_R_CLIMB:       return "duCanvasRootGo: route 3, climbing to the highest sane ancestor";
-    case AOWL_WG_CRUMB_R_DONE:        return "duCanvasRootGo: finished";
-    case AOWL_WG_CRUMB_R_CLIMBPARENT: return "duCanvasRootGo: route 3 climb, Transform::get_parent";
-    case AOWL_WG_CRUMB_R_RECTSRC:     return "duCanvasRootGo: resolving the anchor's RectTransform";
     default:                      return "nothing recorded";
     }
 }
