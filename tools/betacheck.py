@@ -48,7 +48,9 @@ import http.client
 import json
 import os
 import random
+import subprocess
 import sys
+import time
 import zlib
 
 OK, FAIL, INCONC = "PASS", "FAIL", "INCONCLUSIVE"
@@ -109,6 +111,55 @@ UNMAPPABLE_IDS = ["Icebreaker", "Terminal_ui", "develop", "hideout",
 FENCE = "579dc571d53a0658a154fbec"
 
 results = []
+
+
+def _pid_on_port(port):
+    """The pid listening on `port`, or None. `netstat -ano` rather than a
+    dependency: this file has none and is not going to grow one for a number
+    Windows already prints."""
+    if os.name != "nt":
+        return None
+    try:
+        out = subprocess.check_output(["netstat", "-ano", "-p", "TCP"],
+                                      stderr=subprocess.DEVNULL).decode("latin1")
+    except Exception:
+        return None
+    for line in out.splitlines():
+        f = line.split()
+        if len(f) >= 5 and f[3] == "LISTENING" and f[1].endswith(":%d" % port):
+            try:
+                return int(f[4])
+            except ValueError:
+                return None
+    return None
+
+
+def _working_set_mb(pid):
+    """WorkingSet64, in MB, or None if the process cannot be opened."""
+    import ctypes
+    from ctypes import wintypes
+
+    class _PMC(ctypes.Structure):
+        _fields_ = [("cb", wintypes.DWORD), ("PageFaultCount", wintypes.DWORD),
+                    ("PeakWorkingSetSize", ctypes.c_size_t),
+                    ("WorkingSetSize", ctypes.c_size_t),
+                    ("QuotaPeakPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaPeakNonPagedPoolUsage", ctypes.c_size_t),
+                    ("QuotaNonPagedPoolUsage", ctypes.c_size_t),
+                    ("PagefileUsage", ctypes.c_size_t),
+                    ("PeakPagefileUsage", ctypes.c_size_t)]
+
+    h = ctypes.windll.kernel32.OpenProcess(0x1000, False, pid)
+    if not h:
+        return None
+    m = _PMC()
+    m.cb = ctypes.sizeof(m)
+    ok = ctypes.windll.psapi.GetProcessMemoryInfo(h, ctypes.byref(m), m.cb)
+    ctypes.windll.kernel32.CloseHandle(h)
+    if not ok:
+        return None
+    return m.WorkingSetSize / (1024.0 * 1024.0)
 
 
 def record(name, verdict, detail):
@@ -884,6 +935,63 @@ def main():
                    "sigma of forced + Sigma(probability x "
                    "GlobalLootChanceModifier)"
                    % len(rows))
+
+    # --------------------------------------------------------------- raidmem
+    #
+    # "N consecutive raids on ONE map leave the server's working set within X MB
+    # of where it stood after the FIRST raid on that map."
+    #
+    # A negative assertion, and stated against the post-first-raid reading on
+    # purpose: raid one is allowed to be expensive, because it is what warms
+    # every cache this server deliberately keeps. What must not happen is a
+    # per-raid slope, which is what a player doing ten raids in a session pays.
+    #
+    # X is 24 MB and comes from measurement, not from taste. `tools/lootmem.py`
+    # against a real db.json on `bigmap` measures one raid's *transient* peak at
+    # roughly 9 MB, and the server serves large answers from a pool of 16
+    # workers, each of which keeps its own allocator's high-water mark. So a
+    # server with the retention bounded to ONE worker's peak sits near 9-11 MB
+    # of drift and 24 MB is comfortably above it; a server that lets every
+    # worker reach its own peak passes 24 MB by raid four and converges near
+    # +176 MB. The two are not close, which is what makes the number safe.
+    #
+    # RAIDS is 8 rather than 16 because it has to fail on the CURRENT defect
+    # while staying inside a check-suite's patience: the slope is ~9 MB/raid, so
+    # eight raids is ~70 MB of drift against a 24 MB budget.
+    #
+    # The falsifying input: `--mutate raidmem` sets the budget to 0 MB, which no
+    # real process can meet.
+    RAIDS = 8
+    budget = 0.0 if mut == "raidmem" else 24.0
+    pid = _pid_on_port(a.port)
+    if not std_session:
+        record("raidmem", INCONC, "no session to start a raid with")
+    elif pid is None:
+        record("raidmem", INCONC,
+               "nothing is listening on port %d that this can measure; the "
+               "backend has to be a local process for its working set to be "
+               "readable" % a.port)
+    else:
+        loc = "bigmap"
+        samples = []
+        for i in range(RAIDS):
+            loot, _ = _start(loc)
+            if loot is None:
+                break
+            time.sleep(0.3)
+            samples.append(_working_set_mb(pid))
+        if len(samples) < RAIDS or any(m is None for m in samples):
+            record("raidmem", INCONC,
+                   "only %d of %d raid(s) on %s could be started and measured"
+                   % (len([m for m in samples if m is not None]), RAIDS, loc))
+        else:
+            drift = max(samples[1:]) - samples[0]
+            slope = (samples[-1] - samples[0]) / (RAIDS - 1)
+            detail = ("%d raids on %s: %.1f MB after the first, %.1f MB peak "
+                      "after that -- drift %.1f MB (%.2f MB/raid), budget "
+                      "%.1f MB" % (RAIDS, loc, samples[0], max(samples[1:]),
+                                   drift, slope, budget))
+            record("raidmem", FAIL if drift > budget else OK, detail)
 
     print()
     bad = [r for r in results if r[1] != OK]
