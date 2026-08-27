@@ -2736,7 +2736,7 @@ proc duNoteGameWorld(gw: Il2CppPtr) =
   if gw != nil and bdSanePtr(gw) and gw != gDuGameWorld:
     gDuGameWorld = gw
 
-proc aowlHostGameWorld(): pointer {.exportc: "aowl_host_gameworld", cdecl.} =
+proc aowlHostGameWorld(): pointer {.exportc: "aowl_host_gameworld_impl", cdecl.} =
   ## READ-ONLY export of the GameWorld pointer the existing kind=11 /
   ## botdiag `RegisterPlayer` detour already caches. Exported so an out-of-host
   ## consumer (mods/admin) can have the live world WITHOUT binding a second
@@ -2754,12 +2754,33 @@ proc aowlHostGameWorld(): pointer {.exportc: "aowl_host_gameworld", cdecl.} =
   result = cast[pointer](gDuGameWorld)
 
 proc aowlHostGameWorldArmed(): int32 {.
-    exportc: "aowl_host_gameworld_armed", cdecl.} =
+    exportc: "aowl_host_gameworld_armed_impl", cdecl.} =
   ## 1 when a detour that populates the GameWorld cache is actually installed.
   ## Without this a consumer cannot tell "not in a raid" from "nobody is
   ## watching", and reporting the second as the first is exactly the silent
   ## decline CLAUDE.md 6 forbids.
   if gDebugEspSlot >= 0 or gBotDiagSlot >= 0: 1'i32 else: 0'i32
+
+# THE DLL EXPORTS. Nim's `exportc` produces a C symbol, NOT a PE export -- and a
+# consumer resolves this by `GetProcAddress`, so without these two wrappers the
+# mod sees "no export" and correctly refuses. MEASURED before this change: the
+# built host DLL's export table held exactly 16 names, every one of them a
+# `aowl_region_*_x` wrapper from `region.nim`, and no `aowl_host_*` at all --
+# which is precisely why mods/admin, mods/sain and mods/morebots all reported
+# state 0. Same `__declspec(dllexport)` pattern as `region.nim`; `extern`
+# declarations keep it independent of emit order. Nothing here binds, walks,
+# calls into the game or writes: both wrappers are a single load of a cached
+# pointer that some OTHER, already-installed read-only detour populated.
+{.emit: """
+extern void* aowl_host_gameworld_impl(void);
+extern int32_t aowl_host_gameworld_armed_impl(void);
+__declspec(dllexport) void* aowl_host_gameworld(void) {
+    return aowl_host_gameworld_impl();
+}
+__declspec(dllexport) int32_t aowl_host_gameworld_armed(void) {
+    return aowl_host_gameworld_armed_impl();
+}
+""".}
 
 proc debugEspRegisterFired(regs: Il2CppPtr) =
   ## The kind=11 read-only detour on `EFT.GameWorld::RegisterPlayer`. It does
