@@ -395,8 +395,28 @@ enum {
     AOWL_WG_CRUMB_R_PARGO       = 38, /* Component::get_gameObject            */
     AOWL_WG_CRUMB_R_CANVAS      = 39, /* route 2                              */
     AOWL_WG_CRUMB_R_CLIMB       = 40, /* route 3                              */
-    AOWL_WG_CRUMB_R_DONE        = 41
+    AOWL_WG_CRUMB_R_DONE        = 41,
+    /* Route 3's climb, separately from route 1's single hop, because the two
+     * were indistinguishable in the log and only one of them has a loop. The
+     * crumb's second slot carries `depth * 4 + role`, role 0 = the RECEIVER
+     * being gated, 1 = the RESULT being gated, 2 = the call itself. */
+    AOWL_WG_CRUMB_R_CLIMBPARENT = 42,
+    AOWL_WG_CRUMB_R_RECTSRC     = 43  /* choosing the anchor's RectTransform */
 };
+
+/* Decode the packed loop slot for the log. Kept next to the encoding so the two
+ * cannot drift; a depth that is reported wrong is worse than none. */
+static int32_t aowl_wg_crumb_depth(int32_t packed) {
+    return packed < 0 ? -1 : packed / 4;
+}
+static const char* aowl_wg_crumb_role(int32_t packed) {
+    if (packed < 0) return "";
+    switch (packed % 4) {
+    case 0:  return "gating the RECEIVER";
+    case 1:  return "gating the RESULT";
+    default: return "in the CALL itself";
+    }
+}
 
 static volatile int32_t aowl_wg_crumb_stage  = 0;
 static volatile int32_t aowl_wg_crumb_widget = -1;
@@ -449,6 +469,8 @@ static const char* aowl_wg_crumb_text(int32_t s) {
     case AOWL_WG_CRUMB_R_CANVAS:      return "duCanvasRootGo: route 2, the Graphic's own Canvas";
     case AOWL_WG_CRUMB_R_CLIMB:       return "duCanvasRootGo: route 3, climbing to the highest sane ancestor";
     case AOWL_WG_CRUMB_R_DONE:        return "duCanvasRootGo: finished";
+    case AOWL_WG_CRUMB_R_CLIMBPARENT: return "duCanvasRootGo: route 3 climb, Transform::get_parent";
+    case AOWL_WG_CRUMB_R_RECTSRC:     return "duCanvasRootGo: resolving the anchor's RectTransform";
     default:                      return "nothing recorded";
     }
 }
