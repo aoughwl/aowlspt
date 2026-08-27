@@ -3870,6 +3870,950 @@ proc iCmdImage() =
     iOut("  a `call rva:` target must land inside that range; generated managed " &
          "code is NOT in .text on this build")
 
+# ===========================================================================
+# THE VISIBILITY VERBS -- `visible`, `screenrect`, `canvasorder`,
+# `whydidntitdraw`
+#
+# THE GAP THEY CLOSE
+# ------------------
+# Everything above this point answers "does it EXIST": a pointer, a name, a
+# child count, a field. Nothing answered "is it ON SCREEN", and that gap cost
+# six rounds on one feature. The F3 debug overlay clones TMP labels into the
+# game's canvas; three of those rounds were genuine pointer bugs (a destroyed
+# wrapper, a cached `m_rectTransform` that passed both readability AND liveness
+# gates, an off-by-one in a positional index table). Each fix was real. Then the
+# walk SUCCEEDED -- clones made, nested Canvas disabled, zero faults -- and
+# still nothing appeared, and there was no question we could ask that would
+# distinguish a working walk from a broken one. That is the whole reason these
+# verbs exist.
+#
+# THE DISCIPLINE (CLAUDE.md 9b)
+# -----------------------------
+# THREE OUTCOMES, NEVER TWO. Every factor below is a tri-state: YES, NO, or
+# "I could not look", and the third is never quietly folded into the second.
+# A verdict of NOT VISIBLE names the factor that killed it AND the call that
+# measured it; a verdict of INCONCLUSIVE names the factor we could not read and
+# why. "Nothing appeared" plus "no faults" is exactly the evidence we already
+# had, and it is worth nothing.
+#
+# The arithmetic -- the alpha fold, the on-screen classification, the
+# degenerate-rect test -- is NOT written here. It lives in `abi/aowlspt_visible.h`
+# and is asserted offline by `tests/overlayhost/vistest.c`, because pure logic
+# that can only be exercised inside a running Tarkov client is logic that never
+# gets tested.
+#
+# THE SAFETY RULES THESE PATHS OBEY
+# ---------------------------------
+#   * EVERY managed target is resolved BY NAME through `iFindTarget`, which
+#     returns a function only after a 16-byte prologue byte-verify against the
+#     startup snapshot. No positional index into a C table appears anywhere in
+#     this block -- that is the 2026-08-24 defect (`DuGetParent` resolving to
+#     `Transform::set_localPosition`) and a name lookup is structurally immune
+#     to it.
+#   * `iVisSelfOk` -- readability AND `m_CachedPtr` liveness -- runs before
+#     EVERY use of a pointer as `this`, not once at entry. That distinction is
+#     the whole of fact #184: a pointer that passed both gates at the top of a
+#     walk had been destroyed by the time it was used four hops later.
+#   * ONE `aowl_p_p_seh`, the one `iExec` already wraps each command in.
+#     Nothing here adds a guard; a nested guard disarms the outer one.
+#   * Every ancestor walk is capped (`VisMaxClimb`), every scan is capped.
+#   * `iMark` names the hop before every dereference and before every call, so
+#     a caught fault reports WHICH factor was being measured.
+# ===========================================================================
+
+# The generic (retbuf, this, &Vector3, MethodInfo*) thunk, added to
+# aowlspt_debugui.h beside the one Camera::WorldToScreenPoint already used.
+proc cDuCallSretPV3(fn, self: Il2CppPtr; ax, ay, az: float64;
+                    nfloats: int32): int32 {.
+  importc: "aowl_du_call_sret_p_v3", nodecl.}
+
+# The pure arithmetic, from abi/aowlspt_visible.h.
+proc cVisAlphaReset() {.importc: "aowl_vis_alpha_reset", nodecl.}
+proc cVisAlphaPush(a: float64; ign: int32): int32 {.
+  importc: "aowl_vis_alpha_push", nodecl.}
+proc cVisAlphaOk(): int32 {.importc: "aowl_vis_alpha_ok", nodecl.}
+proc cVisAlphaValue(): float64 {.importc: "aowl_vis_alpha_value", nodecl.}
+proc cVisAlphaCount(): int32 {.importc: "aowl_vis_alpha_count", nodecl.}
+proc cVisOnScreen(x0, y0, x1, y1: float64; sw, sh, known: int32): int32 {.
+  importc: "aowl_vis_onscreen", nodecl.}
+proc cVisDegenerate(w, h: float64): int32 {.
+  importc: "aowl_vis_degenerate", nodecl.}
+proc cVisScaleCollapsed(sx, sy: float64): int32 {.
+  importc: "aowl_vis_scale_collapsed", nodecl.}
+proc cVisAlphaInvisible(a: float64): int32 {.
+  importc: "aowl_vis_alpha_invisible", nodecl.}
+
+# THE BACK-BUFFER SIZE. `region.nim` is `include`d AFTER this file into the same
+# translation unit, so its `#include "aowlspt_region.h"` has not been seen yet
+# when this code is emitted. These are forward declarations of the three
+# `static` functions that header defines -- a static forward declaration
+# followed by a later static definition is ordinary C, and it is the reason the
+# screen size here is the REAL published one rather than a hardcoded 1920x1080.
+# `_known` is checked FIRST and separately every time: it is the only way to
+# tell "not published yet" from "zero pixels wide", and a check that cannot tell
+# those apart reports a node in the top-left corner as a finding.
+{.emit: """
+static int32_t aowl_region_screen_w(void);
+static int32_t aowl_region_screen_h(void);
+static int32_t aowl_region_screen_known(void);
+""".}
+proc cVisScrW(): int32 {.importc: "aowl_region_screen_w", nodecl.}
+proc cVisScrH(): int32 {.importc: "aowl_region_screen_h", nodecl.}
+proc cVisScrKnown(): int32 {.importc: "aowl_region_screen_known", nodecl.}
+
+const
+  VisMaxClimb = 24   ## ancestors walked for Canvas / CanvasGroup
+  VisMaxRoots = 24   ## scene roots enumerated by `canvasorder`
+  VisMaxKids  = 64   ## direct children of a root inspected by `canvasorder`
+
+proc iVisSelfOk(p: Il2CppPtr): bool =
+  ## THE GATE THAT MUST RUN BEFORE EVERY USE AS `this`, not once per walk.
+  ## `duOk` proves the memory is mapped and the right size. `iUnityAlive`
+  ## proves the NATIVE half is still there. A managed wrapper whose native half
+  ## is gone -- Unity's "fake null" -- passes the first and fails the second,
+  ## and calling an internal-call getter on one faults inside Unity's C++ where
+  ## no guard of ours reaches.
+  result = duOk(p, 0x20'i32) and iUnityAlive(p)
+
+proc iVisFn(pattern: string; why: var string): Il2CppPtr =
+  ## Resolve a managed target BY NAME, and say precisely which of the two ways
+  ## it failed. "not resolvable" and "prologue verify FAILED" want completely
+  ## different fixes, and reporting a wrong reason is worse than reporting none
+  ## (fact #129).
+  result = nil
+  why = ""
+  var idx = 0
+  var hits = 0
+  if not iFindTarget(pattern, idx, hits):
+    why = "\"" & pattern & "\" is not a unique row of the verified-target " &
+          "table on this build (see `targets`)"
+    return
+  let fn = iTargetFn(idx)
+  if fn == nil:
+    why = "\"" & pattern & "\" @0x" & iHexPad(iTargetRva(idx), 6) &
+          " FAILED its 16-byte prologue verify -- refusing to call it"
+    return
+  result = fn
+
+proc iVisBool(pattern: string; self: Il2CppPtr; val: var bool;
+              why: var string): bool =
+  ## Returns COULD-WE-LOOK. `val` is only meaningful when it returns true.
+  val = false
+  let fn = iVisFn(pattern, why)
+  if fn == nil:
+    return false
+  if not iVisSelfOk(self):
+    why = "the receiver for " & pattern & " is unreadable, or its native " &
+          "half (m_CachedPtr) is null -- refusing to call"
+    return false
+  iMark(pattern & " [visible]", self)
+  val = (cInspUP(fn, self, nil) and 1'u64) != 0'u64
+  result = true
+
+proc iVisI32(pattern: string; self: Il2CppPtr; val: var int;
+             why: var string): bool =
+  val = 0
+  let fn = iVisFn(pattern, why)
+  if fn == nil:
+    return false
+  if not iVisSelfOk(self):
+    why = "the receiver for " & pattern & " is unreadable, or its native " &
+          "half (m_CachedPtr) is null -- refusing to call"
+    return false
+  iMark(pattern & " [visible]", self)
+  val = int(int32(uint32(cInspUP(fn, self, nil) and 0xFFFFFFFF'u64)))
+  result = true
+
+proc iVisPtr(pattern: string; self: Il2CppPtr; val: var Il2CppPtr;
+             why: var string): bool =
+  val = nil
+  let fn = iVisFn(pattern, why)
+  if fn == nil:
+    return false
+  if not iVisSelfOk(self):
+    why = "the receiver for " & pattern & " is unreadable, or its native " &
+          "half (m_CachedPtr) is null -- refusing to call"
+    return false
+  iMark(pattern & " [visible]", self)
+  let p = cast[Il2CppPtr](cInspUP(fn, self, nil))
+  if p != nil and not duOk(p, 0x20'i32):
+    why = pattern & " returned 0x" & iHexPad(cast[uint64](p), 16) &
+          ", which is not readable memory -- treating it as UNKNOWN rather " &
+          "than as an object"
+    return false
+  val = p
+  result = true
+
+proc iVisF32(pattern: string; self: Il2CppPtr; val: var float64;
+             why: var string): bool =
+  val = 0.0
+  let fn = iVisFn(pattern, why)
+  if fn == nil:
+    return false
+  if not iVisSelfOk(self):
+    why = "the receiver for " & pattern & " is unreadable, or its native " &
+          "half (m_CachedPtr) is null -- refusing to call"
+    return false
+  iMark(pattern & " [visible]", self)
+  val = float64(cInspFP(fn, self, nil))
+  result = true
+
+proc iVisSret(pattern: string; self: Il2CppPtr; nfloats: int32;
+              why: var string): bool =
+  ## A struct >8 bytes returned through the hidden buffer. Results land in the
+  ## `cDuSret0_2..3_2` statics. Returns false -- and leaves them alone -- when
+  ## the call produced a NaN or an absurd magnitude, because a garbage
+  ## geometry number that still looks like a number is this whole file's
+  ## reason for existing.
+  let fn = iVisFn(pattern, why)
+  if fn == nil:
+    return false
+  if not iVisSelfOk(self):
+    why = "the receiver for " & pattern & " is unreadable, or its native " &
+          "half (m_CachedPtr) is null -- refusing to call"
+    return false
+  iMark(pattern & " [visible]", self)
+  if cDuCallSretP2(fn, self, nfloats) == 0'i32:
+    why = pattern & " returned a non-finite or absurd value (NaN, or " &
+          "|v| > 1e9) -- refusing to report a plausible-looking number"
+    return false
+  result = true
+
+proc iVisComponent(target: Il2CppPtr; typeName: string; comp: var Il2CppPtr;
+                   why: var string): bool =
+  ## Returns COULD-WE-ASK. A `true` with `comp == nil` means the component is
+  ## GENUINELY ABSENT -- an answer. A `false` means we could not look, and the
+  ## caller must not treat that as absence.
+  ##
+  ## The overload is chosen from the receiver's KLASS, never assumed: both
+  ## GameObject and Component carry `m_CachedPtr` at +0x10, so handing a
+  ## GameObject to `Component::GetComponent` passes every gate and then faults
+  ## inside Unity on a native type confusion (fact #68). `$comp` is deliberately
+  ## NOT touched here -- a diagnostic verb must not leave a pressable anchor
+  ## bound to something the operator did not ask for.
+  comp = nil
+  why = ""
+  if not iVisSelfOk(target):
+    why = "the receiver is unreadable, or its native half is null"
+    return false
+  let isGo = iIsGameObject(target)
+  let overload = (if isGo: "GameObject::GetComponent(String)"
+                  else: "Component::GetComponent(String)")
+  var fn: Il2CppPtr = nil
+  if not iNavFindQuiet(overload, fn) or fn == nil:
+    why = overload & " did not resolve or did not verify on this build"
+    return false
+  if cNavIcallReady() == 0'i32:
+    why = "the UnityEngine.Component::GetComponent(System.String) icall is " &
+          "NOT registered in this runtime, so the wrapper would take its " &
+          "failure branch and RAISE inside the detour"
+    return false
+  var tn = typeName
+  let sp = cNavNewString(toCString(tn))
+  if sp == nil:
+    why = "il2cpp_string_new returned null for \"" & typeName & "\""
+    return false
+  iMark(overload & " [visible " & typeName & "]", target)
+  let c = cast[Il2CppPtr](cInspUPP(fn, target, sp, nil))
+  if c != nil and not duOk(c, 0x20'i32):
+    why = "GetComponent(\"" & typeName & "\") returned 0x" &
+          iHexPad(cast[uint64](c), 16) & ", which is not readable memory"
+    return false
+  comp = c
+  result = true
+
+proc iVisFindGraphic(node: Il2CppPtr; comp: var Il2CppPtr; which: var string;
+                     why: var string): bool =
+  ## Unity's string overload matches by SHORT TYPE NAME, so there is no single
+  ## name that finds every Graphic. Several are tried, most specific first, and
+  ## the one that hit is reported -- so "no Graphic" is a statement about six
+  ## attempted names rather than about one guess.
+  comp = nil
+  which = ""
+  why = ""
+  let names = @["TextMeshProUGUI", "Image", "RawImage", "Text",
+                "MaskableGraphic", "Graphic"]
+  var asked = 0
+  var i = 0
+  while i < names.len:
+    var c: Il2CppPtr = nil
+    var w = ""
+    if iVisComponent(node, names[i], c, w):
+      inc asked
+      if c != nil:
+        comp = c
+        which = names[i]
+        why = ""
+        return true
+    else:
+      why = w
+    inc i
+  if asked == 0:
+    # We never managed to ASK. That is INCONCLUSIVE, not "no Graphic".
+    return false
+  why = ""
+  result = true
+
+proc iVisParentOf(t: Il2CppPtr): Il2CppPtr =
+  result = nil
+  var why = ""
+  let fn = iVisFn("Transform::get_parent", why)
+  if fn == nil:
+    return nil
+  if not iVisSelfOk(t):
+    return nil
+  iMark("Transform::get_parent [visible]", t)
+  let p = cast[Il2CppPtr](cInspUP(fn, t, nil))
+  if p != nil and duOk(p, 0x20'i32):
+    result = p
+
+proc iVisNearestCanvas(node: Il2CppPtr; canvas: var Il2CppPtr;
+                       depth: var int; why: var string): bool =
+  ## The nearest enabled-or-not Canvas at or above `node`. Returns COULD-WE-LOOK.
+  canvas = nil
+  depth = -1
+  why = ""
+  var cur = iToTransform(node)
+  var d = 0
+  var asked = 0
+  while cur != nil and d < VisMaxClimb:
+    var c: Il2CppPtr = nil
+    var w = ""
+    if iVisComponent(cur, "Canvas", c, w):
+      inc asked
+      if c != nil:
+        canvas = c
+        depth = d
+        return true
+    else:
+      why = w
+    cur = iVisParentOf(cur)
+    inc d
+  if asked == 0:
+    if why == "":
+      why = "no ancestor could be asked for a Canvas"
+    return false
+  result = true
+
+proc iVisRenderModeName(m: int): string =
+  case m
+  of 0: result = "ScreenSpaceOverlay"
+  of 1: result = "ScreenSpaceCamera"
+  of 2: result = "WorldSpace"
+  else: result = "NOT a render mode -- this is probably not a Canvas"
+
+# ---------------------------------------------------------------------------
+# screenrect
+# ---------------------------------------------------------------------------
+
+proc iVisScreenRect(node: Il2CppPtr; x0, y0, x1, y1: var float64;
+                    modeOut: var int; note: var string): bool =
+  ## Local rect corners -> WORLD via `Transform::TransformPoint` -> PIXELS.
+  ##
+  ## For a ScreenSpaceOverlay canvas a world unit IS a back-buffer pixel, so
+  ## the world point is already the answer -- that is a property of overlay
+  ## canvases, not an approximation. For ScreenSpaceCamera / WorldSpace the
+  ## world point must go through `Camera::WorldToScreenPoint`, and if there is
+  ## no `Camera.main` the honest answer is that we could not look.
+  ##
+  ## Unity screen space has its ORIGIN AT THE BOTTOM-LEFT, y up. Everything
+  ## printed by these verbs is in that space and says so.
+  x0 = 0.0; y0 = 0.0; x1 = 0.0; y1 = 0.0
+  modeOut = -1
+  note = ""
+  let t = iToTransform(node)
+  if not iVisSelfOk(t):
+    note = "the node's Transform is unreadable or its native half is null"
+    return false
+  var why = ""
+  if not iVisSret("RectTransform::get_rect", t, 4'i32, why):
+    note = "get_rect: " & why & ". (A plain Transform is not a " &
+           "RectTransform and genuinely has no rect -- the outermost menu " &
+           "roots are plain Transforms.)"
+    return false
+  let rx = cDuSret0_2()
+  let ry = cDuSret1_2()
+  let rw = cDuSret2_2()
+  let rh = cDuSret3_2()
+
+  let fnTp = iVisFn("Transform::TransformPoint(Vector3)", why)
+  if fnTp == nil:
+    note = "TransformPoint: " & why
+    return false
+  if not iVisSelfOk(t):
+    note = "the node's native half went away between get_rect and " &
+           "TransformPoint -- re-checked before each use, which is why this " &
+           "is a refusal and not a fault"
+    return false
+  iMark("Transform::TransformPoint [lower-left]", t)
+  if cDuCallSretPV3(fnTp, t, rx, ry, 0.0, 3'i32) == 0'i32:
+    note = "TransformPoint on the lower-left corner returned a non-finite " &
+           "or absurd value"
+    return false
+  let wlx = cDuSret0_2()
+  let wly = cDuSret1_2()
+  let wlz = cDuSret2_2()
+  if not iVisSelfOk(t):
+    note = "the node's native half went away mid-walk"
+    return false
+  iMark("Transform::TransformPoint [upper-right]", t)
+  if cDuCallSretPV3(fnTp, t, rx + rw, ry + rh, 0.0, 3'i32) == 0'i32:
+    note = "TransformPoint on the upper-right corner returned a non-finite " &
+           "or absurd value"
+    return false
+  let wux = cDuSret0_2()
+  let wuy = cDuSret1_2()
+  let wuz = cDuSret2_2()
+
+  # Which space are those world points in? That is the CANVAS's question.
+  var canvas: Il2CppPtr = nil
+  var depth = 0
+  var w2 = ""
+  if not iVisNearestCanvas(node, canvas, depth, w2):
+    note = "could not determine the Canvas above this node (" & w2 &
+           "), so a world point cannot be turned into pixels"
+    return false
+  if canvas == nil:
+    note = "there is NO Canvas at or above this node within " &
+           $VisMaxClimb & " ancestors. A UI graphic with no canvas draws " &
+           "nothing at all, and there is no pixel rect to compute."
+    return false
+  var mode = 0
+  if not iVisI32("Canvas::get_renderMode", canvas, mode, w2):
+    note = "Canvas::get_renderMode: " & w2
+    return false
+  modeOut = mode
+
+  if mode == 0:
+    # Overlay: world units ARE back-buffer pixels.
+    x0 = wlx; y0 = wly; x1 = wux; y1 = wuy
+    note = "ScreenSpaceOverlay -- world units are back-buffer pixels, so " &
+           "these ARE the pixels (no camera projection involved)."
+    return true
+
+  # Camera or world space: project.
+  let fnCam = iVisFn("Camera::get_main", w2)
+  if fnCam == nil:
+    note = "render mode is " & iVisRenderModeName(mode) & ", which needs a " &
+           "camera projection, and Camera::get_main: " & w2
+    return false
+  iMark("Camera::get_main [visible]", nil)
+  let cam = cast[Il2CppPtr](cInspUV(fnCam, nil))
+  if cam == nil or not iVisSelfOk(cam):
+    note = "render mode is " & iVisRenderModeName(mode) & ", which needs a " &
+           "camera projection, but Camera.main is null or not live right " &
+           "now. This is UNKNOWN, not off-screen."
+    return false
+  let fnW2S = iVisFn("Camera::WorldToScreenPoint(Vector3)", w2)
+  if fnW2S == nil:
+    note = "Camera::WorldToScreenPoint: " & w2
+    return false
+  iMark("Camera::WorldToScreenPoint [lower-left]", cam)
+  if cDuCallSretPV3(fnW2S, cam, wlx, wly, wlz, 3'i32) == 0'i32:
+    note = "WorldToScreenPoint on the lower-left corner returned a " &
+           "non-finite value -- the projection matrix was probably not ready"
+    return false
+  x0 = cDuSret0_2(); y0 = cDuSret1_2()
+  let z0 = cDuSret2_2()
+  if not iVisSelfOk(cam):
+    note = "the camera's native half went away mid-projection"
+    return false
+  iMark("Camera::WorldToScreenPoint [upper-right]", cam)
+  if cDuCallSretPV3(fnW2S, cam, wux, wuy, wuz, 3'i32) == 0'i32:
+    note = "WorldToScreenPoint on the upper-right corner returned a " &
+           "non-finite value"
+    return false
+  x1 = cDuSret0_2(); y1 = cDuSret1_2()
+  let z1 = cDuSret2_2()
+  if z0 <= 0.0 and z1 <= 0.0:
+    note = iVisRenderModeName(mode) & " -- BOTH corners have z <= 0, i.e. " &
+           "they are BEHIND the camera. x/y are still finite and are " &
+           "MEANINGLESS; nothing draws."
+    return true
+  note = iVisRenderModeName(mode) & " -- projected through Camera.main " &
+         "(z = " & iFmtF(z0) & " .. " & iFmtF(z1) & "; z <= 0 is behind the " &
+         "camera)."
+  result = true
+
+proc iCmdScreenRect(toks: seq[string]) =
+  ## `screenrect EXPR` -- where this node actually lands on the back buffer.
+  if toks.len < 2:
+    iErr("usage: screenrect EXPR")
+    return
+  var v = 0'u64
+  var err = ""
+  if not iEval(toks[1], v, err):
+    iErr(err)
+    return
+  let p = cast[Il2CppPtr](v)
+  if not iVisSelfOk(p):
+    iErr("not readable, or its native half is null; refusing to call.")
+    return
+  var x0 = 0.0
+  var y0 = 0.0
+  var x1 = 0.0
+  var y1 = 0.0
+  var mode = -1
+  var note = ""
+  if not iVisScreenRect(p, x0, y0, x1, y1, mode, note):
+    iOut("  screenrect: INCONCLUSIVE -- " & note)
+    return
+  iOut("  " & note)
+  iOut("  pixel corners (origin BOTTOM-LEFT, y up):")
+  iOut("    lower-left  = (" & iFmtF(x0) & ", " & iFmtF(y0) & ")")
+  iOut("    upper-right = (" & iFmtF(x1) & ", " & iFmtF(y1) & ")")
+  var w = x1 - x0
+  var h = y1 - y0
+  if w < 0.0: w = -w
+  if h < 0.0: h = -h
+  iOut("    size        = " & iFmtF(w) & " x " & iFmtF(h) & " px")
+  let known = cVisScrKnown()
+  let sw = cVisScrW()
+  let sh = cVisScrH()
+  if known == 0'i32:
+    iOut("  back buffer: SIZE NOT PUBLISHED YET (aowl_region_screen_known " &
+         "= 0). On-screen-ness is INCONCLUSIVE -- it is NOT off-screen. " &
+         "A hardcoded or zero size here is how a layout silently collapses " &
+         "into the top-left corner.")
+  else:
+    iOut("  back buffer: " & $int(sw) & " x " & $int(sh) & " px (published)")
+  let cls = int(cVisOnScreen(x0, y0, x1, y1, sw, sh, known))
+  case cls
+  of 2: iOut("  on screen:   YES, wholly inside the back buffer")
+  of 1: iOut("  on screen:   PARTIALLY -- it crosses an edge")
+  of 0: iOut("  on screen:   NO -- this rect does not touch the back buffer " &
+             "at all. That alone is a complete explanation for seeing nothing.")
+  else: iOut("  on screen:   INCONCLUSIVE -- the back-buffer size is not " &
+             "known, or a corner was NaN/absurd. Not a 'no'.")
+  let deg = int(cVisDegenerate(w, h))
+  if deg == 1:
+    iOut("  size:        DEGENERATE -- under half a pixel in one axis, so " &
+         "it draws nothing whatever else is true of it.")
+  elif deg < 0:
+    iOut("  size:        INCONCLUSIVE (non-finite)")
+
+# ---------------------------------------------------------------------------
+# canvasorder
+# ---------------------------------------------------------------------------
+
+proc iVisReportCanvas(tag: string; canvas: Il2CppPtr) =
+  var w = ""
+  var order = 0
+  var mode = 0
+  var en = false
+  var scale = 0.0
+  var line = "  " & tag & " canvas=" & iPtr(canvas)
+  if iVisI32("Canvas::get_sortingOrder", canvas, order, w):
+    line = line & " sortingOrder=" & $order
+  else:
+    line = line & " sortingOrder=UNKNOWN"
+  if iVisI32("Canvas::get_renderMode", canvas, mode, w):
+    line = line & " mode=" & iVisRenderModeName(mode)
+  else:
+    line = line & " mode=UNKNOWN"
+  if iVisBool("Behaviour::get_enabled", canvas, en, w):
+    line = line & " enabled=" & (if en: "yes" else: "NO")
+  else:
+    line = line & " enabled=UNKNOWN"
+  if iVisF32("Canvas::get_scaleFactor", canvas, scale, w):
+    line = line & " scaleFactor=" & iFmtF(scale)
+  iOut(line)
+
+proc iCmdCanvasOrder(toks: seq[string]) =
+  ## `canvasorder [EXPR]` -- which Canvas draws in front of which.
+  ##
+  ## TWO SCOPES, and it always states which one it used, because a census that
+  ## quietly searched a subset is the shape of fact #129.
+  ##   * with EXPR: every Canvas on that node's ANCESTOR CHAIN, nearest first.
+  ##     Cheap, exact, and the one that answers "what am I actually drawing on".
+  ##   * without: the scene ROOTS and their DIRECT CHILDREN only. That is a
+  ##     deliberate SCOPE, not a complete census -- a Canvas deeper than one
+  ##     level is not listed, and the summary says so. A full-tree scan would
+  ##     cost a managed string allocation and a GetComponent call per node over
+  ##     thousands of nodes, inside one frame.
+  if toks.len >= 2:
+    var v = 0'u64
+    var err = ""
+    if not iEval(toks[1], v, err):
+      iErr(err)
+      return
+    let p = cast[Il2CppPtr](v)
+    if not iVisSelfOk(p):
+      iErr("not readable, or its native half is null; refusing to call.")
+      return
+    iOut("  scope: the ANCESTOR CHAIN of " & iPtr(p) & ", nearest first, " &
+         "capped at " & $VisMaxClimb & " levels.")
+    var cur = iToTransform(p)
+    var d = 0
+    var found = 0
+    var asked = 0
+    while cur != nil and d < VisMaxClimb:
+      var c: Il2CppPtr = nil
+      var w = ""
+      if iVisComponent(cur, "Canvas", c, w):
+        inc asked
+        if c != nil:
+          inc found
+          iVisReportCanvas("depth=" & $d & " (" & iObjName(cur) & ")", c)
+      cur = iVisParentOf(cur)
+      inc d
+    if asked == 0:
+      iOut("  INCONCLUSIVE: not one ancestor could be asked for a Canvas.")
+    elif found == 0:
+      iOut("  answered by asking " & $asked & " ancestor(s): there is NO " &
+           "Canvas above this node. A UI graphic with no Canvas draws nothing.")
+    else:
+      iOut("  " & $found & " Canvas(es) on the chain, from " & $asked &
+           " ancestor(s) asked. The NEAREST enabled one is the one this " &
+           "node draws on; a higher sortingOrder draws IN FRONT.")
+    return
+
+  var roots: seq[Il2CppPtr] = @[]
+  let nroots = iSceneRoots(roots, true)
+  if nroots == 0 or roots.len == 0:
+    iOut("  canvasorder: INCONCLUSIVE -- NOT ONE scene root was enumerated " &
+         "(see `roots`), so nothing was examined. That is 'I could not " &
+         "look', not 'there are no canvases'.")
+    return
+  var nodes = 0
+  var found = 0
+  var asked = 0
+  var truncated = false
+  for i in 0 ..< roots.len:
+    if i >= VisMaxRoots:
+      truncated = true
+      break
+    # `iSceneRoots` hands back GAMEOBJECTS. The child walkers take
+    # TRANSFORMS, and feeding one a GameObject reads a plausible childCount
+    # and invents a hierarchy of wrong children WITHOUT faulting -- so the
+    # conversion is explicit and klass-driven, never assumed.
+    let rgo = roots[i]
+    if iVisSelfOk(rgo):
+      let r = (if iIsGameObject(rgo): iTransformOfGameObject(rgo)
+               else: iToTransform(rgo))
+      if r != nil and iVisSelfOk(r):
+        var c: Il2CppPtr = nil
+        var w = ""
+        inc nodes
+        if iVisComponent(r, "Canvas", c, w):
+          inc asked
+          if c != nil:
+            inc found
+            iVisReportCanvas("root '" & iObjName(r) & "'", c)
+        var n = 0
+        if iChildCount(r, n):
+          var k = 0
+          while k < n and k < VisMaxKids:
+            let ch = iChildAt(r, k)
+            inc k
+            if ch != nil and iVisSelfOk(ch):
+              inc nodes
+              var c2: Il2CppPtr = nil
+              var w2 = ""
+              if iVisComponent(ch, "Canvas", c2, w2):
+                inc asked
+                if c2 != nil:
+                  inc found
+                  iVisReportCanvas("  '" & iObjName(r) & "'/'" &
+                                   iObjName(ch) & "'", c2)
+          if n > VisMaxKids:
+            truncated = true
+  iOut("  scope: scene ROOTS and their DIRECT CHILDREN only -- " & $nodes &
+       " node(s) examined, " & $asked & " asked successfully, " & $found &
+       " Canvas(es) found." &
+       (if truncated: " TRUNCATED by a cap: a Canvas beyond it is NOT listed."
+        else: ""))
+  iOut("  This is a SCOPE, not a census. A Canvas nested deeper than one " &
+       "level below a scene root will not appear here, and its absence from " &
+       "this list is NOT evidence it does not exist. Use `canvasorder EXPR` " &
+       "for the exact chain above a node.")
+  if found > 0:
+    iOut("  Higher sortingOrder draws IN FRONT. If your Canvas is listed " &
+         "with a LOWER order than the game's, that is why your thing is " &
+         "behind it -- and it is the one visibility factor `visible` cannot " &
+         "settle on its own.")
+
+# ---------------------------------------------------------------------------
+# visible
+# ---------------------------------------------------------------------------
+
+proc iCmdVisible(toks: seq[string]) =
+  ## `visible EXPR` -- the composite answer, with a VERDICT and the factor that
+  ## produced it.
+  ##
+  ## The factors are evaluated in the order the renderer would kill them, and
+  ## the FIRST definite killer wins the verdict. A factor that could not be
+  ## read does not become a killer and does not become a pass -- it downgrades
+  ## the verdict to INCONCLUSIVE and is named.
+  if toks.len < 2:
+    iErr("usage: visible EXPR")
+    return
+  var v = 0'u64
+  var err = ""
+  if not iEval(toks[1], v, err):
+    iErr(err)
+    return
+  let p = cast[Il2CppPtr](v)
+  if not iVisSelfOk(p):
+    iErr("not readable, or its native half is null; refusing to call. " &
+         "That is itself an answer: a destroyed Unity wrapper draws nothing.")
+    return
+
+  var killer = ""      ## the first DEFINITE reason it is not visible
+  var unknowns: seq[string] = @[]
+  var w = ""
+
+  iOut("  node = " & iPtr(p) & "  '" & iObjName(p) & "'")
+
+  # 1. activeInHierarchy.
+  let (actOk, active) = iActiveInHierarchy(p)
+  if not actOk:
+    unknowns.add ("activeInHierarchy could not be read (Component::" &
+                 "get_gameObject / GameObject::get_activeInHierarchy did not " &
+                 "resolve, or a hop was unreadable)")
+    iOut("  activeInHierarchy : UNKNOWN")
+  else:
+    iOut("  activeInHierarchy : " & (if active: "yes" else: "NO"))
+    if not active and killer == "":
+      killer = "the GameObject is INACTIVE in the hierarchy. Nothing under " &
+               "an inactive object renders, and it is not pressable either " &
+               "(fact #72 -- a press returns success and does nothing)."
+
+  # 2. The Graphic, its enabled flag and its colour alpha.
+  var graphic: Il2CppPtr = nil
+  var gname = ""
+  if not iVisFindGraphic(p, graphic, gname, w):
+    unknowns.add ("whether this node has a Graphic could not be determined (" &
+                 w & ")")
+    iOut("  graphic           : UNKNOWN")
+  elif graphic == nil:
+    iOut("  graphic           : none (asked for TextMeshProUGUI, Image, " &
+         "RawImage, Text, MaskableGraphic, Graphic). This node draws " &
+         "nothing ITSELF -- it may still be a container whose CHILDREN draw.")
+  else:
+    iOut("  graphic           : " & gname & " @" & iPtr(graphic))
+    var gEn = false
+    if iVisBool("Behaviour::get_enabled", graphic, gEn, w):
+      iOut("  graphic.enabled   : " & (if gEn: "yes" else: "NO"))
+      if not gEn and killer == "":
+        killer = "the " & gname & " component is DISABLED. The object is " &
+                 "there, the rect is there, and the renderer skips it."
+    else:
+      unknowns.add ("Graphic.enabled: " & w)
+      iOut("  graphic.enabled   : UNKNOWN")
+    if iVisSret("UI.Graphic::get_color", graphic, 4'i32, w):
+      let ca = cDuSret3_2()
+      iOut("  graphic.color     : rgba(" & iFmtF(cDuSret0_2()) & ", " &
+           iFmtF(cDuSret1_2()) & ", " & iFmtF(cDuSret2_2()) & ", " &
+           iFmtF(ca) & ")")
+      let inv = int(cVisAlphaInvisible(ca))
+      if inv == 1 and killer == "":
+        killer = "the Graphic's own colour alpha is " & iFmtF(ca) &
+                 " -- below 1/255, so nothing survives an 8-bit blend."
+      elif inv < 0:
+        unknowns.add ("the Graphic's colour alpha was not a finite number")
+    else:
+      unknowns.add ("Graphic.color: " & w)
+      iOut("  graphic.color     : UNKNOWN")
+
+  # 3. The CanvasGroup alpha chain, folded with `ignoreParentGroups` honoured.
+  cVisAlphaReset()
+  var cur = iToTransform(p)
+  var d = 0
+  var groupsAsked = 0
+  var chainBroken = false
+  while cur != nil and d < VisMaxClimb:
+    var cg: Il2CppPtr = nil
+    var w2 = ""
+    if not iVisComponent(cur, "CanvasGroup", cg, w2):
+      chainBroken = true
+      unknowns.add ("a CanvasGroup lookup " & $d & " level(s) up failed (" &
+                   w2 & "), so the alpha chain is incomplete")
+      break
+    inc groupsAsked
+    if cg != nil:
+      var a = 0.0
+      var ign = false
+      if not iVisF32("CanvasGroup::get_alpha", cg, a, w2):
+        chainBroken = true
+        unknowns.add ("CanvasGroup.alpha " & $d & " level(s) up: " & w2)
+        break
+      if not iVisBool("CanvasGroup::get_ignoreParentGroups", cg, ign, w2):
+        # Not knowing this is NOT a small gap: it decides whether ancestors
+        # count at all, so folding on regardless would produce a confident
+        # wrong number.
+        chainBroken = true
+        unknowns.add ("CanvasGroup.ignoreParentGroups " & $d &
+                     " level(s) up: " & w2 & " -- without it the fold would " &
+                     "be a guess, so it stopped here")
+        break
+      iOut("  canvasGroup       : depth=" & $d & " alpha=" & iFmtF(a) &
+           (if ign: " ignoreParentGroups=YES (chain ends here)" else: ""))
+      if cVisAlphaPush(a, (if ign: 1'i32 else: 0'i32)) != 0'i32:
+        break
+    cur = iVisParentOf(cur)
+    inc d
+  if groupsAsked == 0 and chainBroken:
+    iOut("  canvasGroup alpha : UNKNOWN")
+  elif cVisAlphaOk() == 0'i32:
+    unknowns.add ("a CanvasGroup returned an alpha that is not a usable " &
+                 "number, so the folded alpha is UNKNOWN")
+    iOut("  canvasGroup alpha : UNKNOWN (a group returned an unusable value)")
+  else:
+    let fa = cVisAlphaValue()
+    iOut("  canvasGroup alpha : " & iFmtF(fa) & "  (from " &
+         $int(cVisAlphaCount()) & " group(s)" &
+         (if chainBroken: ", chain INCOMPLETE" else: "") & ")")
+    if not chainBroken and int(cVisAlphaInvisible(fa)) == 1 and killer == "":
+      killer = "a CanvasGroup above this node folds the alpha to " &
+               iFmtF(fa) & ". The object is built, positioned and enabled, " &
+               "and it is fully transparent."
+
+  # 4. The Canvas it draws on.
+  var canvas: Il2CppPtr = nil
+  var cdepth = 0
+  if not iVisNearestCanvas(p, canvas, cdepth, w):
+    unknowns.add ("the Canvas above this node could not be determined (" & w & ")")
+    iOut("  canvas            : UNKNOWN")
+  elif canvas == nil:
+    iOut("  canvas            : NONE within " & $VisMaxClimb & " ancestors")
+    if killer == "":
+      killer = "there is NO Canvas at or above this node. A UI graphic " &
+               "with no Canvas is never submitted to the renderer at all."
+  else:
+    iVisReportCanvas("canvas            : depth=" & $cdepth, canvas)
+    var cEn = false
+    if iVisBool("Behaviour::get_enabled", canvas, cEn, w):
+      if not cEn and killer == "":
+        killer = "the Canvas this node draws on is DISABLED. This is the " &
+                 "single most common reason a correctly built, correctly " &
+                 "parented clone never appears -- Object::Instantiate copies " &
+                 "a nested Canvas onto the clone, and disabling it is also " &
+                 "how the overlay makes a clone fall through to its parent."
+    else:
+      unknowns.add ("Canvas.enabled: " & w)
+
+  # 5. Scale.
+  if iVisSret("Transform::get_lossyScale", iToTransform(p), 3'i32, w):
+    let sx = cDuSret0_2()
+    let sy = cDuSret1_2()
+    iOut("  lossyScale        : (" & iFmtF(sx) & ", " & iFmtF(sy) & ", " &
+         iFmtF(cDuSret2_2()) & ")")
+    let sc = int(cVisScaleCollapsed(sx, sy))
+    if sc == 1 and killer == "":
+      killer = "the world (lossy) scale is collapsed to zero in x or y, so " &
+               "the node occupies no pixels however big its rect is."
+    elif sc < 0:
+      unknowns.add ("the lossy scale was not a finite number")
+  else:
+    unknowns.add ("Transform.lossyScale: " & w)
+    iOut("  lossyScale        : UNKNOWN")
+
+  # 6. The pixel rect.
+  var x0 = 0.0
+  var y0 = 0.0
+  var x1 = 0.0
+  var y1 = 0.0
+  var mode = -1
+  var note = ""
+  if not iVisScreenRect(p, x0, y0, x1, y1, mode, note):
+    unknowns.add ("the screen rect could not be computed (" & note & ")")
+    iOut("  screen rect       : UNKNOWN -- " & note)
+  else:
+    var rw = x1 - x0
+    var rh = y1 - y0
+    if rw < 0.0: rw = -rw
+    if rh < 0.0: rh = -rh
+    let known = cVisScrKnown()
+    iOut("  screen rect       : (" & iFmtF(x0) & ", " & iFmtF(y0) & ") .. (" &
+         iFmtF(x1) & ", " & iFmtF(y1) & ")  = " & iFmtF(rw) & " x " &
+         iFmtF(rh) & " px   [" & note & "]")
+    let deg = int(cVisDegenerate(rw, rh))
+    if deg == 1 and killer == "":
+      killer = "the rect is DEGENERATE on screen -- " & iFmtF(rw) & " x " &
+               iFmtF(rh) & " px, under half a pixel in one axis. A " &
+               "zero-size RectTransform was one of the invisible layers in " &
+               "the version-label saga."
+    elif deg < 0:
+      unknowns.add ("the screen rect size was not a finite number")
+    if known == 0'i32:
+      unknowns.add ("the back-buffer size has not been published " &
+                   "(aowl_region_screen_known = 0), so on-screen-ness is " &
+                   "UNKNOWN -- explicitly NOT 'off screen'")
+      iOut("  on screen         : UNKNOWN (back-buffer size not published)")
+    else:
+      let cls = int(cVisOnScreen(x0, y0, x1, y1, cVisScrW(), cVisScrH(), known))
+      case cls
+      of 2: iOut("  on screen         : YES (" & $int(cVisScrW()) & "x" &
+                 $int(cVisScrH()) & " back buffer)")
+      of 1: iOut("  on screen         : PARTIALLY -- crosses an edge")
+      of 0:
+        iOut("  on screen         : NO -- outside the " & $int(cVisScrW()) &
+             "x" & $int(cVisScrH()) & " back buffer")
+        if killer == "":
+          killer = "the node's pixel rect lies entirely OFF the back " &
+                   "buffer. Everything about it is correct except where it is."
+      else:
+        unknowns.add ("on-screen-ness was INCONCLUSIVE (a corner was not a " &
+                     "finite number)")
+
+  # ---- the verdict -------------------------------------------------------
+  iOut("")
+  if killer != "":
+    iOut("  VERDICT: NOT VISIBLE.")
+    iOut("  CAUSE:   " & killer)
+    if unknowns.len > 0:
+      iOut("  (Also " & $unknowns.len & " factor(s) could not be read; the " &
+           "cause above was MEASURED, so it stands regardless.)")
+  elif unknowns.len > 0:
+    iOut("  VERDICT: INCONCLUSIVE -- every factor that could be read passed, " &
+         "and " & $unknowns.len & " could NOT be read. This is not a 'yes'.")
+    var i = 0
+    while i < unknowns.len and i < 8:
+      iOut("    - " & unknowns[i])
+      inc i
+    if unknowns.len > 8:
+      iOut("    - ... and " & $(unknowns.len - 8) & " more")
+  else:
+    iOut("  VERDICT: VISIBLE as far as this node's own state goes -- active, " &
+         "graphic enabled, opaque, on an enabled Canvas, non-degenerate, and " &
+         "on the back buffer.")
+    iOut("  NOT PROVEN: whether something DRAWS OVER IT. Occlusion is a " &
+         "question about other Canvases' sortingOrder and about siblings " &
+         "later in the draw order, and no field read on this node can " &
+         "settle it. Run `canvasorder` and compare.")
+
+# ---------------------------------------------------------------------------
+# whydidntitdraw
+# ---------------------------------------------------------------------------
+
+proc iCmdWhyDidntItDraw(toks: seq[string]) =
+  ## `whydidntitdraw EXPR` -- the guided chain: `visible`, then `screenrect`,
+  ## then the Canvas chain, then ONE sentence naming the first failing
+  ## condition. It runs the same code paths, so it cannot disagree with them.
+  if toks.len < 2:
+    iErr("usage: whydidntitdraw EXPR")
+    return
+  iOut("  == 1/3  visible ==")
+  iCmdVisible(toks)
+  iOut("")
+  iOut("  == 2/3  screenrect ==")
+  iCmdScreenRect(toks)
+  iOut("")
+  iOut("  == 3/3  canvasorder (ancestor chain) ==")
+  iCmdCanvasOrder(toks)
+  iOut("")
+  iOut("  Read the VERDICT line in section 1. If it says NOT VISIBLE, the " &
+       "CAUSE line beneath it is the first failing condition and the only " &
+       "one worth fixing right now -- the later factors were still " &
+       "evaluated, but a renderer stops at the first. If it says " &
+       "INCONCLUSIVE, the listed factors are the ones to make readable " &
+       "before drawing any conclusion; INCONCLUSIVE is not a 'no'. If it " &
+       "says VISIBLE, this node's own state is not the problem: compare the " &
+       "sortingOrder in section 3 against the game's own canvases, because " &
+       "drawing BEHIND something is the one cause no field read on this " &
+       "node can rule out.")
+
 proc iCmdHelp() =
   iOut("  aowlspt live inspector -- commands (addresses are EXPR, see below)")
   iOut("    anchors                       list named anchors + variables")
@@ -3881,6 +4825,18 @@ proc iCmdHelp() =
   iOut("    scan EXPR N TYPE VALUE        find the offset of a value")
   iOut("    parent EXPR [DEPTH]           walk the Transform parent chain")
   iOut("    canvas EXPR                   the Graphic's cached Canvas + its mode")
+  iOut("    visible EXPR                  IS IT ON SCREEN -- composite verdict")
+  iOut("       active/graphic-enabled/colour alpha/CanvasGroup chain/Canvas")
+  iOut("       enabled+order+mode/lossyScale/pixel rect, then a VERDICT of")
+  iOut("       NOT VISIBLE + the CAUSE, VISIBLE, or INCONCLUSIVE. Never two.")
+  iOut("    screenrect EXPR               the rect in REAL back-buffer pixels")
+  iOut("       (origin bottom-left). Says UNKNOWN, not 'off screen', when the")
+  iOut("       back-buffer size has not been published.")
+  iOut("    canvasorder [EXPR]            live Canvases: sortingOrder, mode,")
+  iOut("       enabled. With EXPR, the exact ancestor chain; without, scene")
+  iOut("       roots + their direct children only (a SCOPE, not a census).")
+  iOut("    whydidntitdraw EXPR           guided: visible + screenrect +")
+  iOut("       canvasorder, then the first failing condition in a sentence.")
   iOut("    call TARGET SIG [ARG..]       direct RVA call (needs `allow write`)")
   iOut("    targets [SUBSTR]              list byte-verified call targets")
   iOut("  -- state + navigation (navigation needs `allow write`) --")
@@ -4105,6 +5061,14 @@ proc iExec(line: string) =
     # instead of pretending the command does not exist.
     iErr(cmd & " was not intercepted by the batch runner; this is an internal " &
          "inconsistency, not a bad command. Nothing was waited on.")
+  of "visible", "vis":
+    iCmdVisible(toks)
+  of "screenrect":
+    iCmdScreenRect(toks)
+  of "canvasorder":
+    iCmdCanvasOrder(toks)
+  of "whydidntitdraw", "why":
+    iCmdWhyDidntItDraw(toks)
   of "canvas":
     if toks.len < 2:
       iErr("usage: canvas EXPR   (EXPR is a Graphic, e.g. a TextMeshProUGUI)")

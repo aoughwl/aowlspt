@@ -483,6 +483,92 @@ static const AowlDuTarget aowl_du_targets[] = {
     { "UnityEngine.Behaviour::set_enabled", 0xC4C760u,
       { 0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,
         0x4F,0x7D,0x48 }, 16 },
+
+    /* ---- THE VISIBILITY BLOCK (indices 28..35) -------------------------
+     *
+     * APPENDED, never inserted. Every index above is positional and lives in
+     * debugui.nim / settingspages.nim; inserting a row in the MIDDLE of this
+     * table is exactly the defect that made `DuGetParent` resolve to
+     * `Transform::set_localPosition` and cost four rounds. Appending leaves
+     * every existing index untouched, and `duTargetsBindOk` still fails loudly
+     * if the appended NAMES do not match what the Nim side believes.
+     *
+     * These eight answer "is it actually on screen", which the table above
+     * could not: it could place a label and never say whether the label drew.
+     * SHAREDNESS was checked for each (il2cpp_resolve.py type --shared); the
+     * three folded ones are annotated. We only ever CALL these -- a shared RVA
+     * is correct code for the receiver passed; it must never be HOOKED. */
+
+    /* UnityEngine.Transform::TransformPoint(Vector3) -- INSTANCE, sret,
+     * argument BY ADDRESS: (retbuf, this, &position, MethodInfo*). Identical
+     * ABI shape to Camera::WorldToScreenPoint above, which is why
+     * `aowl_du_call_sret_p_v3` serves both. Local rect corner -> WORLD point;
+     * for a ScreenSpaceOverlay canvas a world unit IS a screen pixel, which is
+     * what makes `screenrect` real pixels rather than an estimate.
+     * Type 23165, rid 3232, RVA 0x52B9A10, section `il2cpp`, not shared. */
+    { "UnityEngine.Transform::TransformPoint(Vector3)", 0x52B9A10u,
+      { 0x48,0x89,0x5C,0x24,0x08,0x48,0x89,0x74,0x24,0x10,0x57,0x48,0x83,
+        0xEC,0x20,0x33 }, 16 },
+
+    /* UnityEngine.Transform::get_lossyScale -- INSTANCE, Vector3 sret.
+     * A zero component here is a complete explanation for an invisible node
+     * and is invisible to every other verb we have.
+     * Type 23165, rid 3245, RVA 0x52B9F60, not shared. */
+    { "UnityEngine.Transform::get_lossyScale", 0x52B9F60u,
+      { 0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x33,0xC0,0x48,
+        0x8B,0xFA,0x48 }, 16 },
+
+    /* UnityEngine.CanvasGroup::get_alpha -- INSTANCE -> float (XMM0).
+     * Type 30437, rid 2, RVA 0x5580A20, not shared. */
+    { "UnityEngine.CanvasGroup::get_alpha", 0x5580A20u,
+      { 0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,0x7B,0x73,0xB5,0x01,
+        0x48,0x8B,0xD9 }, 16 },
+
+    /* UnityEngine.CanvasGroup::get_ignoreParentGroups -- INSTANCE -> bool.
+     * Without this the alpha chain is WRONG, not merely incomplete: a group
+     * with ignoreParentGroups set terminates the multiplication, so folding
+     * ancestors past it would report an alpha the renderer never uses.
+     * Type 30437, rid 8, RVA 0x5580C30, not shared. */
+    { "UnityEngine.CanvasGroup::get_ignoreParentGroups", 0x5580C30u,
+      { 0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,0x9B,0x71,0xB5,0x01,
+        0x48,0x8B,0xD9 }, 16 },
+
+    /* UnityEngine.UI.Graphic::get_color -- INSTANCE, Color (16 bytes) sret.
+     * The body is the whole method: `movups xmm0,[rdx+0x28]; mov rax,rcx;
+     * movups [rcx],xmm0; ret` -- i.e. m_Color at +0x28, retbuf in RCX, this in
+     * RDX. SHARED with 13 other methods (14 total) purely because that body is
+     * generic; calling it with a Graphic receiver is correct. NEVER HOOK IT.
+     * Type 26949, rid 228, RVA 0xC41C50. */
+    { "UnityEngine.UI.Graphic::get_color", 0xC41C50u,
+      { 0x0F,0x10,0x42,0x28,0x48,0x8B,0xC1,0x0F,0x11,0x01,0xC3,0xCC,0xCC,
+        0xCC,0xCC,0xCC }, 16 },
+
+    /* UnityEngine.UI.Graphic::get_canvas -- INSTANCE -> Canvas.
+     * The PROPERTY, not the `m_Canvas` field the `canvas` verb reads raw: the
+     * field is a cache that is null until the graphic has been registered, so
+     * a raw read of it reports "no canvas" for a graphic that draws fine.
+     * Type 26949, rid 247, RVA 0x53AE230, not shared. */
+    { "UnityEngine.UI.Graphic::get_canvas", 0x53AE230u,
+      { 0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x80,0x3D,0xA4,
+        0x8B,0xD2,0x01 }, 16 },
+
+    /* UnityEngine.Behaviour::get_enabled -- INSTANCE -> bool. The read half of
+     * set_enabled above; a disabled Canvas is the single most common reason a
+     * correctly built, correctly parented clone never draws.
+     * SHARED with 32 other methods (33 total) -- call only, never hook.
+     * Type 23083, rid 2654, RVA 0xC4C710. */
+    { "UnityEngine.Behaviour::get_enabled", 0xC4C710u,
+      { 0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,0x9B,0x7D,0x48,0x06,
+        0x48,0x8B,0xD9 }, 16 },
+
+    /* UnityEngine.Behaviour::get_isActiveAndEnabled -- INSTANCE -> bool.
+     * `enabled` AND `gameObject.activeInHierarchy` in one call, which is the
+     * question actually being asked of a Canvas or a Graphic.
+     * SHARED with 3 other methods (4 total) -- call only, never hook.
+     * Type 23083, rid 2656, RVA 0x207A0E0. */
+    { "UnityEngine.Behaviour::get_isActiveAndEnabled", 0x207A0E0u,
+      { 0x40,0x53,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,0xDB,0xA3,0x05,0x05,
+        0x48,0x8B,0xD9 }, 16 },
 };
 
 #define AOWL_DU_TARGET_COUNT \
@@ -742,6 +828,35 @@ static int32_t aowl_du_call_sret_p(void* fn, void* self, int32_t nfloats) {
     if (nfloats < 1 || nfloats > 4) return 0;
     for (i = 0; i < 4; i++) ret[i] = 0.0f;
     ((AowlDu_SRET_P)fn)((void*)ret, self, NULL);
+    for (i = 0; i < nfloats; i++) {
+        float v = ret[i];
+        if (v != v) return 0;
+        if (v > 1.0e9f || v < -1.0e9f) return 0;
+    }
+    for (i = 0; i < nfloats; i++) aowl_du_sret_out[i] = (double)ret[i];
+    return 1;
+}
+/* INSTANCE, ONE Vector3 argument BY ADDRESS, struct >8 bytes returned through
+ * a hidden buffer: (retbuf, this, &arg, MethodInfo*).
+ *
+ * The same ABI shape `aowl_du_world_to_screen` hardcodes for
+ * Camera::WorldToScreenPoint, generalised so Transform::TransformPoint can use
+ * it without a second copy of the plumbing. Result lands in the SAME
+ * `aowl_du_sret_out` statics as `aowl_du_call_sret_p`, read back with
+ * `aowl_du_sret_0..3`. Returns 0 -- leaving the statics untouched -- on a NaN
+ * or an absurd magnitude, because a garbage screen position that still looks
+ * like a number is the failure this whole file exists to stop. */
+static int32_t aowl_du_call_sret_p_v3(void* fn, void* self,
+                                      double ax, double ay, double az,
+                                      int32_t nfloats) {
+    float arg[3];
+    float ret[4];
+    int i;
+    if (!fn || !self) return 0;
+    if (nfloats < 1 || nfloats > 4) return 0;
+    arg[0] = (float)ax; arg[1] = (float)ay; arg[2] = (float)az;
+    for (i = 0; i < 4; i++) ret[i] = 0.0f;
+    ((AowlDu_W2S)fn)((void*)ret, self, (void*)arg, NULL);
     for (i = 0; i < nfloats; i++) {
         float v = ret[i];
         if (v != v) return 0;
