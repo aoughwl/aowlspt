@@ -82,6 +82,7 @@ import client/live
 import client/coverprobe
 import client/mainthread
 import server/serverside
+import server/dispatch
 
 var gWorld = whenReady("EFT.GameWorld")
 var gDeferNoted = false
@@ -1213,7 +1214,20 @@ proc runSelfTest(s: Settings): int =
   else:
     error "sain: decision core, " & $r.failed & " of " &
           $(r.passed + r.failed) & " checks FAILED"
-  result = r.failed + runCostReport(s)
+  # The ORBIT dispatcher's arithmetic, exercised at the same moment: the
+  # square root it uses for every distance, and the personality draw. The draw
+  # is checked for BOTH stability (one bot id must not change personality
+  # between censuses) and spread (200 ids must not all draw the same one) --
+  # the second is the negative, and it is the one a hash that ignored its input
+  # would fail while looking perfectly deterministic.
+  var dispatchFails: seq[string] = @[]
+  if not selfCheckDispatch(dispatchFails):
+    for line in dispatchFails:
+      error "sain: " & line
+  else:
+    success "sain: ORBIT dispatcher arithmetic, " &
+            "distance and personality draw both check out"
+  result = r.failed + dispatchFails.len + runCostReport(s)
 
 proc runDriveQueueSelfTest(): int =
   ## The order ring between the two threads, exercised on one.
@@ -1378,12 +1392,20 @@ proc sainSchema(): seq[Setting] =
   #
   # Still false, with the reason each:
   #
-  #   forcePersonality   Read (preset.nim:222) and it does change what
-  #                      `core/decide.nim` decides -- but nothing that core
-  #                      decides reaches a bot. The only channel out of this mod
-  #                      is MoveSpeed, and personality does not map onto it
-  #                      without inventing a meaning it does not have. Reading a
-  #                      value is not implementing a setting.
+  #   forcePersonality   Read (preset.nim:222), and it now HAS a channel --
+  #                      `server/dispatch.nim` uses it to choose the coverage
+  #                      roll (how much of the map a bot bothers with) and the
+  #                      sprint rule (whether it runs to an objective), and
+  #                      those go out as `goTo` orders over `aowlspt/botnav`.
+  #                      STILL FALSE, deliberately, because the bar is "a
+  #                      tester who changes it can SEE the game differ" and
+  #                      nobody has looked yet. The exact test that flips it:
+  #                      `botNav` on in aowlspt-host.json, two offline Customs
+  #                      raids with `forcePersonality` "rat" then "gigachad",
+  #                      and `/sain/status`'s `dispatchCheck` reporting PASS in
+  #                      both with a materially different `declined by a
+  #                      coverage roll` count. Until somebody runs that, this
+  #                      is a channel that exists, not a setting that works.
   #   driveFromHostThread  Read (preset.nim:231), and it governs `client/live.nim`
   #                      -- the by-NAME path. That path is not merely unused, it
   #                      is fatal when used (facts #143/#144/#145: the gated
@@ -1400,7 +1422,7 @@ proc sainSchema(): seq[Setting] =
                   "veryhard", "deathwish"], category = "AI",
                 description = "Scales how fast every bot moves, from 0.49 at easy to 1.0 at deathwish. Needs `botNav` on in aowlspt-host.json"),
     stringSetting("forcePersonality", "Force personality", "", category = "AI",
-                  description = "Force every bot to one personality. Read and it changes the decision core, but nothing the core decides reaches a bot yet",
+                  description = "Force every bot to one personality. It now reaches bots -- it picks the ORBIT coverage roll and the sprint rule -- but nobody has yet watched two raids and confirmed the difference is visible",
                   implemented = false),
     boolSetting("driveFromHostThread", "Drive from host thread", true,
                 category = "Advanced",

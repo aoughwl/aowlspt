@@ -1051,3 +1051,68 @@ Still `implemented = false`, and why: **`forcePersonality`** is read and changes
 is not implementing a setting. **`driveFromHostThread`** governs
 `client/live.nim`, the by-NAME path, which is fatal when used on this build
 (facts #143/#144/#145) and is not used.
+
+
+---
+
+## ORBIT dispatch -- the low-level half
+
+`server/dispatch.nim` turns the plan `mods/tarkov` broadcasts on
+`tarkov.orbit.plan` into a per-bot `goTo` over `aowlspt/botnav`. See
+`mods/tarkov/README.md` for ORBIT's licence (MIT, reimplemented not copied) and
+the full concept map.
+
+**This is the second verb this mod has ever had.** Before it, the whole channel
+out of SAIN was `difficulty` -> `BotMover.MoveSpeed` for every bot at once.
+Everything `core/decide.nim` computes -- cover scoring, dwell hysteresis, path
+failure counting, banding, personality -- had nowhere to go. A per-bot
+DESTINATION now does.
+
+Zero new RVAs, same three `botnav` already rides. Nothing here resolves a name.
+
+**One command set.** `dispatch.nim` never calls `sendBotCommands`; `drive.nim`
+does, once, with the MoveSpeed row plus up to 12 `goTo` rows. `botnav` is
+last-writer-wins, so a second send would silently drop the difficulty band.
+
+### What it does
+
+* personality drawn per bot id from the plan's distribution (stable for the
+  raid), or forced by `forcePersonality`
+* coverage roll per (bot, anchor) -- a bot that declines an anchor keeps
+  declining it, so it does not oscillate across the map
+* leader takes the primary anchor, followers take splinters within
+  `splinterM`, and a follower past `leashM` is sent to the leader instead
+* `navStatus == 2` (no path) blacklists that anchor FOR THAT BOT and picks
+  another; it is never retried, because the navmesh will not change its mind
+* arrival at an anchor releases it and takes the next, so a bot tours the map
+
+### Check
+
+`dispatchCheck()` on `/sain/status`. The negative asserted: *of every bot
+addressed and measured twice, at least one got materially closer to the point
+it was sent to.* A wrong coordinate makes `gMeasured` climb while `gProgressed`
+stays 0, and it returns FAIL. Reading back the order we sent could not.
+
+### The live test -- NOT YET RUN
+
+Everything above is INCONCLUSIVE for behaviour. What has been proved offline is
+only that the plan is built and DELIVERED: with `aowl.sain` and `aowl.tarkov`
+both loaded on a scratch backend, a Customs raid configuration produced
+
+```
+dispatch : dispatch: 18 anchors on 'bigmap', 0 orders, 0 bots, personality drawn from the plan
+check    : INCONCLUSIVE: a plan with 18 anchors is loaded for 'bigmap' but no
+           order has been issued. Either no census has arrived (no raid, or
+           `botNav` off in aowlspt-host.json) or every anchor was declined -- 0 were
+```
+
+To settle it:
+
+1. `botNav` ON in `aowlspt-host.json` (default off).
+2. Enter an offline Customs raid with bots.
+3. `GET /sain/status` -- `dispatchCheck` must read PASS, not INCONCLUSIVE.
+   INCONCLUSIVE means the census never arrived; that is a botNav or raid
+   problem, not a dispatcher one, and the line says which.
+4. For `forcePersonality`: run steps 1-3 twice, `rat` then `gigachad`, and
+   compare the `declined by a coverage roll` counts. Same number both runs
+   means the setting is not reaching the roll.

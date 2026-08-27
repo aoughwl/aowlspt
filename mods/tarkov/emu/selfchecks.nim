@@ -47,6 +47,7 @@ import dialogue
 import insurance
 import raid
 import bots
+import orbit
 
 proc failedLines(report, label: string; into: var seq[string]) =
   ## `loot.selfCheck` and `questcond.selfCheck` report one line per check,
@@ -148,5 +149,12 @@ proc selfCheckFailures*(): seq[string] =
   # tables, in the real shape, is the only kind that could have caught them, and
   # it is the reason this one is here rather than on the wire.
   discard bots.selfCheckBots(result)
+  # The tenth. `emu/orbit` is the ORBIT high-level half, and every part of it
+  # that can be wrong without a raid running is arithmetic: the cell binning
+  # function and the weighted centroid. The specific defect it guards is
+  # `int(x / cell)` truncating toward zero, which folds the negative half of
+  # every map onto the positive half and puts a whole map's anchors in one
+  # quadrant -- a bug that produces a plausible plan, not an error.
+  discard orbit.selfCheckOrbit(result)
   failedLines(loot.selfCheck(), "loot", result)
   failedLines(questcond.selfCheck(), "questcond", result)

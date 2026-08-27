@@ -603,3 +603,75 @@ that reads it.
 Related documents: `docs/EMULATOR.md` (what it does),
 `docs/EMULATOR-COVERAGE.md` (what it does not — authoritative),
 `docs/IMPORTDB.md` (where the database comes from), `docs/BACKLOG.md`.
+
+
+---
+
+## ORBIT
+
+[ORBIT](https://github.com/Chazut/ORBIT) is an SPT bot-AI mod: bots pursue
+objectives -- loot zones, PvP hotspots, quest markers -- instead of patrolling.
+Its logic is reimplemented here, split across two mods. This file is the
+HIGH-LEVEL half.
+
+### Licence
+
+**ORBIT is MIT** (`LICENSE` at its repository root; the README credits Phobos's
+advection-field architecture, also MIT, with explicit permission). MIT is
+compatible with this repository and copying with attribution would have been
+allowed.
+
+**Nothing was copied.** ORBIT is C# built on BepInEx, BigBrain and Waypoints;
+none of those exist on post-1.0 IL2CPP Tarkov and none of that code would
+compile or run here. The LOGIC was reimplemented in nimony from the README and
+the repository's own description of its subsystems. Attribution is in this file
+and in `emu/orbit.nim`'s header.
+
+### The split
+
+ORBIT's README says it "operates entirely client-side ... there is no server
+component". We cannot have that half: there is no BepInEx, and every by-NAME
+IL2CPP route is fatal the moment it is USED (facts #143/#144/#145). So each
+concept is routed to whichever side of aowlspt can actually express it.
+
+| ORBIT concept | lands in | expressible here? |
+|---|---|---|
+| cell grid over the map | `mods/tarkov/emu/orbit.nim` | YES -- rebuilt from `db.json` instead of from a scene scan |
+| PvP hotspots | `mods/tarkov/emu/orbit.nim` | YES -- `SpawnPointParams` with `Categories` containing `Player` |
+| roam anchors | `mods/tarkov/emu/orbit.nim` | YES -- `Categories` containing `Bot`. Not an ORBIT concept; it replaces the loot layer below |
+| loot zones / density | `mods/tarkov/emu/orbit.nim` | **NO.** Every `staticContainers[*].template.Position` in this `db.json` is `(0,0,0)`. Measured; see the header. The reader is written and produces nothing |
+| personality distribution | `mods/tarkov/emu/orbit.nim` (policy) -> `mods/sain/server/dispatch.nim` (draw) | YES |
+| coverage roll (skip a POI) | policy here, rolled per bot in `dispatch.nim` | YES |
+| loot value gates (rub/slot) | policy here | PARTIAL -- carried, but with no loot layer and no inventory verb they gate nothing today |
+| primary anchor + splinter targets | `dispatch.nim` | YES |
+| squad leash / cohesion | `dispatch.nim` | YES -- over census positions, not a real squad id |
+| extract policy (when) | `emu/orbit.nim` | YES |
+| extract destination (where) | -- | **NO.** `base.exits[*]` carries `Name`, `EntryPoints`, `ExfiltrationTime` and no position |
+| quest-marker objectives | -- | **NO.** Quest conditions name zones, not coordinates |
+| looting, gear swap, search animations | -- | **NO.** `aowlspt/botnav` has `GoToPoint`, `SetTargetMoveSpeed`, `stop`. There is no inventory verb |
+| door breach | -- | **NO.** No door interaction verb |
+| bot waves / population | already `emu/raid.nim` | pre-existing; ORBIT does not touch waves |
+
+### Routes and checks
+
+* `GET /aowlspt/tarkov/orbit/plan` -- the plan for the running raid, plus
+  `orbitCheck()`'s PASS/FAIL/INCONCLUSIVE verdict. (Registered under
+  `/aowlspt/tarkov/`: a route at `/aowlspt/orbit/plan` 404s on a running
+  backend while `/aowlspt/tarkov/launcher/ping` beside it answers, so that
+  namespace does not reach a mod on this host.)
+* `selfCheckOrbit` runs at load and REFUSES the load on failure, like every
+  other check in `emu/selfchecks.nim`.
+
+Measured offline, backend on a scratch root against the live 41 MB `db.json`:
+
+```
+bigmap        PASS  18 anchors, spread 899m x 354m
+woods         PASS  18 anchors, spread 1075m x 1211m
+laboratory    PASS  14 anchors, spread 164m x 227m
+tarkovstreets PASS  18 anchors, spread 452m x 486m
+```
+
+Every one of those verdicts also carries `NO LOOT LAYER`, and that is the point
+of the check: the FIRST version of it passed with six anchors and no loot layer
+at all, because it did not count loot anchors separately. A plausible plan with
+a whole subsystem missing is exactly the failure CLAUDE.md 9b is about.

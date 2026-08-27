@@ -50,6 +50,7 @@
 
 import aowlspt
 import aowlspt/botnav
+import "." / dispatch
 
 const
   MaxTracked* = 32
@@ -158,13 +159,27 @@ proc note(id: int; x, y, z: float) =
   gTrack[idx].z = z
   gTrack[idx].lastCensus = gCensuses
 
-proc send(speed: float): bool =
-  ## One command, addressed to every bot. `BotNavAll` is used rather than a row
-  ## per bot on purpose: the census is PARTIAL and ROTATES, so a per-bot set
-  ## would only ever steer the five bots that happened to fit in the last
-  ## payload and would leave the rest vanilla -- which is precisely the "a
-  ## setting that changes nothing" failure this work exists to remove.
-  let st = sendBotCommands(@[moveSpeed(BotNavAll, speed)])
+proc send(speed: float; orders: seq[BotCommand]): bool =
+  ## ONE command set, carrying both halves of what this mod has to say.
+  ##
+  ## The MoveSpeed row is addressed to `BotNavAll` rather than per bot on
+  ## purpose: the census is PARTIAL and ROTATES, so a per-bot speed would only
+  ## ever steer the five bots that happened to fit in the last payload and
+  ## would leave the rest vanilla -- precisely the "a setting that changes
+  ## nothing" failure this work exists to remove.
+  ##
+  ## `orders` is `server/dispatch`'s per-bot ORBIT destinations, and they are
+  ## appended HERE rather than sent from there because `botnav` is LAST WRITER
+  ## WINS over one command set: a second `sendBotCommands` would replace this
+  ## MoveSpeed row and the difficulty band would stop reaching anything with no
+  ## error anywhere. One set, assembled once, is the only shape that cannot do
+  ## that silently.
+  var set: seq[BotCommand] = @[moveSpeed(BotNavAll, speed)]
+  var i = 0
+  while i < orders.len and set.len < BotNavMaxCommands:
+    set.add orders[i]
+    inc i
+  let st = sendBotCommands(set)
   if st == Ok:
     gFaults = 0
     gSinceSend = 0
@@ -242,11 +257,23 @@ proc onCensus(payload: string): string =
     inc i
 
   let want = speedForScale(gScale)
-  if gSpeed < 0.0 or want != gSpeed or gSinceSend >= RefreshEvery:
+  # The ORBIT orders for this census. Computed before the send decision because
+  # whether there ARE orders is part of that decision: a destination is only
+  # useful while the bot is still where the order assumed, so once the
+  # dispatcher is armed the set goes out every census rather than on the
+  # value-changed / every-tenth schedule that a single global speed can live
+  # with.
+  var orders: seq[BotCommand] = @[]
+  if dispatchArmed():
+    orders = dispatchFor(bots)
+  if gSpeed < 0.0 or want != gSpeed or gSinceSend >= RefreshEvery or
+     orders.len > 0:
     var why = " [refresh]"
     if gSpeed < 0.0 or want != gSpeed:
       why = " [value changed]"
-    if send(want):
+    if orders.len > 0:
+      why = " [" & $orders.len & " ORBIT order(s)]"
+    if send(want, orders):
       gSpeed = want
       if gLog:
         info "sain: drive -> every bot at MoveSpeed " & $round3(want) &
@@ -259,6 +286,8 @@ proc onCensus(payload: string): string =
   if not gReported and gPairs >= 3:
     gReported = true
     info "sain: drive check " & driveCheck()
+    if dispatchArmed():
+      info "sain: dispatch check " & dispatchCheck()
 
 proc startDrive*(difficultyScale: float; logDecisions: bool) =
   ## Wire the drive. Called from the server half's `startServer`, which already
@@ -280,6 +309,7 @@ proc startDrive*(difficultyScale: float; logDecisions: bool) =
 proc stopDrive*() =
   ## Hand every bot back to its own brain. A mod that is switched off must not
   ## leave a raid full of bots running at a speed nobody set.
+  stopDispatch()
   if gArmed and not gOff:
     discard clearBotNav()
 

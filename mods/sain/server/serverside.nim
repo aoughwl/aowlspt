@@ -34,6 +34,7 @@ import aowlspt/json
 import ".." / core / types
 import ".." / preset / preset
 import "." / drive
+import "." / dispatch
 
 var gPreset: Preset
 
@@ -314,6 +315,11 @@ proc onStatus(url, body, session: string): string =
   # README.md can be run with curl instead of by reading a log.
   put(o, "drive", driveState())
   put(o, "driveCheck", driveCheck())
+  # The ORBIT half. Two separate verdicts on purpose: `driveCheck` is about the
+  # MoveSpeed channel and `dispatchCheck` about the GoToPoint one, and folding
+  # them into one line would let a live speed channel mask a dead order channel.
+  put(o, "dispatch", dispatchState())
+  put(o, "dispatchCheck", dispatchCheck())
   var maps = arr()
   var i = 0
   while i < neutralisedCount():
@@ -359,6 +365,11 @@ proc startServer*(p: Preset) =
   # byte-verified kind=15 detour on `EFT.BotOwner::UpdateManual`. See
   # `server/drive.nim` for why that is the whole of the reach, and for the
   # arming gate (the first census, not `whenReady`).
+  # ORBIT: subscribe to the high-level plan BEFORE the drive arms, so a plan
+  # broadcast by mods/tarkov during a load that races this one is not missed.
+  if not startDispatch(p.forcePersonality, p.logDecisions):
+    warn "sain: could not subscribe to `tarkov.orbit.plan`; no bot will be " &
+         "sent to an objective this session, and /sain/status says so"
   startDrive(p.difficulty, p.logDecisions)
   discard serve("/sain/status", onStatus)
   discard serve("/sain/preset", onPreset)
