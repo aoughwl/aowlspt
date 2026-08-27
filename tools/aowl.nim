@@ -288,6 +288,35 @@ proc symTab(e: Env): bool =
        "tools/metablob.py."
   return true
 
+var gIdxBindRan = false
+
+proc idxBind(e: Env): bool =
+  ## Build gate for POSITIONAL INDEX BINDINGS into the C managed-target tables
+  ## in abi/. `il2cpp_symtab.py` proves each row's RVA is the method the row
+  ## NAMES, and whether that RVA is shared. It cannot prove that index 19 in a
+  ## .nim file means row 19 in the .h file -- and on 2026-08-24 it did not: a
+  ## row inserted mid-table made `DuGetParent` resolve to
+  ## `Transform::set_localPosition`, a byte-verified, non-shared, entirely
+  ## valid function OF THE WRONG SHAPE, which faulted inside Unity on a
+  ## receiver that had passed every liveness gate.
+  ##
+  ## This runs as a GATE, not a survey: an abi/ target array that is not
+  ## registered in tools/idxbind.py fails the build, so a new table cannot be
+  ## added unguarded, and INCONCLUSIVE (exit 2) is a failure too -- a checker
+  ## that could not look has not passed.
+  if gIdxBindRan:
+    return true
+  let tool = joinPath(e.repo, "tools\\idxbind.py")
+  if not fileExists(tool):
+    note "tools\\idxbind.py is not present on this branch, so no positional " &
+         "index binding was checked. That is inconclusive, not a pass."
+    gIdxBindRan = true
+    return true
+  gIdxBindRan = true
+  return run(e, "every positional index into a C target table binds the row " &
+             "its caller names",
+             "python " & quoted(tool), e.repo)
+
 proc buildMod(e: Env; modPathIn: string): bool =
   let modPath = absolutePathOf(modPathIn)
   let source = sourceOf(modPath)
@@ -297,6 +326,8 @@ proc buildMod(e: Env; modPathIn: string): bool =
     return false
 
   if not symTab(e):
+    return false
+  if not idxBind(e):
     return false
 
   let dir = parentOf(source)
@@ -500,6 +531,8 @@ proc buildIl2CppHost(e: Env): bool =
     inc failures
     return false
   if not symTab(e):
+    return false
+  if not idxBind(e):
     return false
   let binDir = joinPath(dir, "bin")
   discard ensureDir(binDir)

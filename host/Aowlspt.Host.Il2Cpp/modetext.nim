@@ -57,9 +57,9 @@ proc cMtxCallVPP(fn, self, a0: Il2CppPtr) {.
   importc: "aowl_mtx_call_v_pp", nodecl.}
 
 const
-  MtxTUpdate  = 0'i32
-  MtxTSetText = 1'i32
-  MtxTRefresh = 2'i32
+  MtxTUpdate  = 0'i32                  ## EFT.UI.PreloaderUI::Update
+  MtxTSetText = 1'i32                  ## EFT.UI.PreloaderUI::SetGameModeText
+  MtxTRefresh = 2'i32                  ## EFT.UI.PreloaderUI::RefreshCornerLabel
   ModeTextMaxFaults = 3
     ## After this many guarded bodies have faulted, the feature switches itself
     ## off for the session. Three, not one: a single fault during a scene change

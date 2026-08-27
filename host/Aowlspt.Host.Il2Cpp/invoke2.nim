@@ -79,21 +79,21 @@ proc cMi2AddCompRectMi(): Il2CppPtr {.
 
 # ---- target indices, mirroring the AOWL_MI2_* defines ----
 const
-  Mi2GetGameObject   = 0'i32
-  Mi2GetInstanceId   = 1'i32
-  Mi2GetName         = 2'i32
-  Mi2SetName         = 3'i32
-  Mi2FrameCount      = 4'i32
-  Mi2ScreenWidth     = 5'i32
-  Mi2ScreenHeight    = 6'i32
-  Mi2GoCtorString    = 7'i32
-  Mi2GoSetActive     = 8'i32
-  Mi2GoGetTransform  = 9'i32
-  Mi2SetParentAlign  = 10'i32
-  Mi2Instantiate     = 11'i32
-  Mi2AddComponentTy  = 12'i32
-  Mi2AddComponentGen = 13'i32
-  Mi2SetAsFirstSibling = 14'i32
+  Mi2GetGameObject   = 0'i32           ## UnityEngine.Component::get_gameObject
+  Mi2GetInstanceId   = 1'i32           ## UnityEngine.Object::GetInstanceID
+  Mi2GetName         = 2'i32           ## UnityEngine.Object::get_name
+  Mi2SetName         = 3'i32           ## UnityEngine.Object::set_name
+  Mi2FrameCount      = 4'i32           ## UnityEngine.Time::get_frameCount
+  Mi2ScreenWidth     = 5'i32           ## UnityEngine.Screen::get_width
+  Mi2ScreenHeight    = 6'i32           ## UnityEngine.Screen::get_height
+  Mi2GoCtorString    = 7'i32           ## UnityEngine.GameObject::.ctor(String)
+  Mi2GoSetActive     = 8'i32           ## UnityEngine.GameObject::SetActive
+  Mi2GoGetTransform  = 9'i32           ## UnityEngine.GameObject::get_transform
+  Mi2SetParentAlign  = 10'i32          ## TMPro.TMP_DefaultControls::SetParentAndAlign
+  Mi2Instantiate     = 11'i32          ## UnityEngine.Object::Instantiate(Object)
+  Mi2AddComponentTy  = 12'i32          ## UnityEngine.GameObject::AddComponent(Type)
+  Mi2AddComponentGen = 13'i32          ## UnityEngine.GameObject::AddComponent<T>
+  Mi2SetAsFirstSibling = 14'i32        ## UnityEngine.Transform::SetAsFirstSibling
 
 # ---------------------------------------------------------------------------
 # Ladder state

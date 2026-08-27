@@ -212,9 +212,9 @@ proc cSwCallVPB2(fn, self: Il2CppPtr; b: int32) {.
   importc: "aowl_sw_call_v_pb", nodecl.}
 
 const
-  SwLocSetLabelText = 6'i32
-  SwTmpSetText      = 7'i32
-  SwTmpSetDirty     = 8'i32
+  SwLocSetLabelText = 6'i32            ## EFT.UI.LocalizedText::SetLabelText
+  SwTmpSetText      = 7'i32            ## TMPro.TMP_Text::set_text
+  SwTmpSetDirty     = 8'i32            ## TMPro.TMP_Text::set_havePropertiesChanged
 
 ## Announce, once, which of the three repaint routes verified on this build --
 ## so a relabel that does not appear can be read against what was available

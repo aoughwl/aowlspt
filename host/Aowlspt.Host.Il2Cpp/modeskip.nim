@@ -119,9 +119,9 @@ proc cMskCallSubmit(fn, controller: Il2CppPtr; gameMode: uint64;
                     pd: Il2CppPtr) {.importc: "aowl_msk_call_submit", nodecl.}
 
 const
-  MskTShowSlot = 0'i32
-  MskTCtor     = 1'i32
-  MskTSubmit   = 2'i32
+  MskTShowSlot = 0'i32                 ## EFT.UI.CharacterSelectionScreen::ShowSlot
+  MskTCtor     = 1'i32                 ## CharacterSelectionScreenController::.ctor
+  MskTSubmit   = 2'i32                 ## CharacterSelectionScreenController::Submit
   ModeSkipMaxFaults = 3
     ## After this many guarded bodies have faulted the feature switches itself
     ## off for the session. Three, not one: a single fault during a scene change
