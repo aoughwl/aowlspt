@@ -1756,6 +1756,36 @@ var gZoomFrames = 0'i64        ## FOV writes taken with the zoom key asserted
 var gLastAiming = false
 var gLastKeyTicks = 0'i64
 
+# --- the CameraManager acquisition, reported three ways, never two.
+#
+# The receiver is obtained from the STATIC, byte-verified
+# `CameraManager::get_Instance` @0x1263bd0 and depends on NOTHING else -- in
+# particular not on the host export `aowl_host_gameworld`, which is the thing
+# that was actually missing (`gwState()` 0) and which silently vetoed this
+# whole path before the camera was ever asked for. The world is still used,
+# when present, for the AIMING multiplier only; without it the aim-dependent
+# multipliers degrade to 1.0 and the toggle-zoom multiplier still applies.
+#
+# Three outcomes, never two (CLAUDE.md 9b):
+#   ccUnknown  nothing has been tried yet
+#   ccAbsent   get_Instance returned NULL. Benign in a menu -- and if the
+#              world export cannot tell us whether we are in a raid, this is
+#              INCONCLUSIVE and says so rather than reading as patience.
+#   ccBroken   we have evidence we are in a game (a live GameWorld, or the
+#              player is HOLDING the zoom key) and STILL have no usable
+#              camera. That is a bug, and it is logged loudly, once, and then
+#              at a decaying rate -- not swallowed.
+#   ccLive     camera in hand.
+type CamAcq = enum ccUnknown, ccAbsent, ccBroken, ccLive
+var gCamAcq = ccUnknown
+var gCamNullFrames = 0'i64     ## consecutive frames with no usable camera
+var gCamBrokenFrames = 0'i64   ## ... of which had evidence of being in-game
+var gCamBrokenSaid = 0'i64     ## how many times we have shouted about it
+var gCamWhy = "not attempted"  ## the LAST concrete reason there was no camera
+var gCamLiveSaid = false
+var gLastMult = -1.0
+var gAimSourceState = "not attempted"
+
 const
   FovIntervalNs = 4_000_000'i64
     ## The FOV write is idempotent and the hook it rides on fires once per
@@ -1892,7 +1922,8 @@ proc bindFovStatics(): bool =
 
   bc "S3 both RVAs verified; bindFovStatics returning true"
   gFovState = "arming: SetFov verified at 0x" & hexs(RvaSetFov3) &
-              " with 3 argument(s); waiting for a live CameraManager"
+              " with 3 argument(s); the CameraManager is acquired per frame " &
+              "from the verified static get_Instance"
   result = true
 
 
@@ -2011,6 +2042,52 @@ proc pollZoomKey() =
     gZoomLatch = false
   gZoomOn = gZoomLatch
 
+proc inGameEvidence(): bool =
+  ## Positive evidence that we are IN A GAME, from two INDEPENDENT sources, so
+  ## that a missing `aowl_host_gameworld` export cannot by itself make a real
+  ## failure look like a menu:
+  ##   * the host has a live GameWorld cached (gwState 3), or
+  ##   * the player is physically asserting the zoom key right now.
+  ## Neither can fire in a main menu with the key untouched, and the second
+  ## needs no host export at all.
+  result = gwState() == 3 or gZoomOn
+
+proc noCamera(why: string) =
+  ## The per-frame "still no camera" reporter. Distinguishes NO RAID YET from
+  ## IN A RAID AND STILL BROKEN, and shouts about the second.
+  gCamWhy = why
+  gCamNullFrames = gCamNullFrames + 1'i64
+  if not inGameEvidence():
+    gCamAcq = ccAbsent
+    gCamBrokenFrames = 0'i64
+    gFovState = "no CameraManager yet -- " & why & ". No evidence of being " &
+                "in a game (" & gwStateText() & "), so this is INCONCLUSIVE, " &
+                "not a pass."
+    return
+  gCamAcq = ccBroken
+  gCamBrokenFrames = gCamBrokenFrames + 1'i64
+  gFovState = "BROKEN: in a game (" & (if gwState() == 3: "GameWorld live"
+              else: "zoom key held") & ") for " & $gCamBrokenFrames &
+              " frames and STILL no usable camera -- " & why
+  # Loud, then decaying: frame 1, 250, 2500, 25000 ... never silent, never a
+  # per-frame log flood. Capped by the counter itself, not by a loop.
+  if gCamBrokenFrames == 1'i64 or gCamBrokenFrames == 250'i64 or
+     gCamBrokenFrames == 2_500'i64 or gCamBrokenFrames == 25_000'i64:
+    gCamBrokenSaid = gCamBrokenSaid + 1'i64
+    warn "FOV: " & gFovState & " -- this is a BUG in the mod's camera " &
+         "acquisition, not patience. CameraManager::get_Instance is " &
+         "byte-verified at 0x" & hexs(RvaCamInstance) & "."
+
+proc camIsLive() =
+  gCamAcq = ccLive
+  gCamNullFrames = 0'i64
+  gCamBrokenFrames = 0'i64
+  gCamWhy = ""
+  if not gCamLiveSaid:
+    gCamLiveSaid = true
+    success "FOV: a live CameraManager and Camera are in hand, from the " &
+            "static verified get_Instance -- no host export involved."
+
 proc applyFov() =
   ## Upstream's `FovController.Update`, on the fast path.
   ##
@@ -2042,46 +2119,25 @@ proc applyFov() =
   # read as "not in a raid", which is why `onWorldReady` and `reportWatch`
   # both print `gwStateText()`: the three-way answer stays visible even
   # though this fast path can only branch two ways.
-  if firstPass: bc "A2 about to ask the host export for the world"
-  let w = gwWorld()
-  if w == nil:
-    if firstPass: bc "A2x no world (host export state below 3) -- returning"
-    return
-  if not fovReadable(w, 16):
-    if firstPass: bc "A2y world pointer not readable -- returning"
-    return
-  if firstPass: bc "A3 world in hand and readable"
-
-  if firstPass: bc "A4 about to bindOnObject get_MainPlayer on the world"
-  if not ensureCall(obMainPlayer, w, "get_MainPlayer", none, fkPtr):
-    gFovState = "refused: " & obMainPlayer.why
-    return
-  a.reset()
-  if firstPass: bc "A5 get_MainPlayer bound; about to CALL it"
-  let player = callPtr(obMainPlayer.b, w, a)
-  if player == nil: return
-  if firstPass: bc "A6 player in hand"
-
-  if not ensureCall(obPwa, player, "get_ProceduralWeaponAnimation", none,
-                    fkPtr):
-    gFovState = "refused: " & obPwa.why
-    return
-  a.reset()
-  let pwa = callPtr(obPwa.b, player, a)
-  if pwa == nil: return
-  if firstPass: bc "A7 weapon animation in hand"
-
-  a.reset()
-  # SUSPECT (a). The first execution EVER of a verified-but-never-run RVA.
+  # ---- 1. THE CAMERA FIRST. It needs no world and no player.
+  #
+  # This used to come LAST, behind `gwWorld()`. On the live run that motivated
+  # this change the host exported no `aowl_host_gameworld` at all (gwState 0),
+  # so the very first branch returned and `CameraManager::get_Instance` -- a
+  # verified static RVA that would have answered immediately -- was never once
+  # called. The arm-time string "waiting for a live CameraManager" was then the
+  # only thing the player saw, and it was false: nothing was waiting on the
+  # camera, everything was waiting on an export that does not exist.
   if firstPass: bc "B1 about to CALL CameraManager::get_Instance @0x1263bd0"
   let cm = callPtr(bCamInstance, nullPtr(), a)
   if firstPass: bc "B2 get_Instance returned without faulting"
   if cm == nil:
     if firstPass: bc "B2x get_Instance returned NULL -- returning"
+    noCamera("CameraManager::get_Instance returned NULL")
     return
-  # SUSPECT (c). A CameraManager that is non-null but not yet initialised.
   if not fovReadable(cm, OffCamManagerCamera + 8):
     if firstPass: bc "B2y CameraManager not readable to +0x78 -- returning"
+    noCamera("CameraManager is non-null but not readable to +0x78")
     return
   # `get_Camera` is not called: it resolves to 0x65ED10, which is literally
   # `mov rax,[rcx+0x70]; ret` and is a FOLDED body shared with every other
@@ -2091,8 +2147,55 @@ proc applyFov() =
   let cam = guardedField(cm, OffCamManagerCamera, "CameraManager.Camera")
   if cam == nil:
     if firstPass: bc "B3x CameraManager.Camera is null -- returning"
+    noCamera("CameraManager is live but its Camera backing field @0x70 is null")
     return
   if firstPass: bc "B3 camera in hand"
+  camIsLive()
+
+  # ---- 2. THE PLAYER, OPTIONALLY. Only the AIM multipliers need it.
+  #
+  # A missing world degrades the effect (every frame is treated as unaimed) but
+  # no longer vetoes it, so hold-to-zoom works in a raid even on a host with no
+  # `aowl_host_gameworld` export. Which of the two happened is recorded in
+  # `gAimSourceState` and printed in the roll-call, so a reduced effect can
+  # never be mistaken for a working one.
+  var pwa = cast[Il2CppPtr](0)
+  if firstPass: bc "A2 about to ask the host export for the world"
+  let w = gwWorld()
+  if w == nil:
+    gAimSourceState = "NO aiming input -- " & gwStateText() &
+                      " Aim multipliers are inert; toggle zoom still applies."
+    if firstPass: bc "A2x no world (host export state below 3) -- aim inert"
+  elif not fovReadable(w, 16):
+    gAimSourceState = "NO aiming input -- the world pointer was not readable"
+    if firstPass: bc "A2y world pointer not readable -- aim inert"
+  else:
+    if firstPass: bc "A3 world in hand and readable"
+    if firstPass: bc "A4 about to bindOnObject get_MainPlayer on the world"
+    if ensureCall(obMainPlayer, w, "get_MainPlayer", none, fkPtr):
+      a.reset()
+      if firstPass: bc "A5 get_MainPlayer bound; about to CALL it"
+      let player = callPtr(obMainPlayer.b, w, a)
+      if player != nil:
+        if firstPass: bc "A6 player in hand"
+        if ensureCall(obPwa, player, "get_ProceduralWeaponAnimation", none,
+                      fkPtr):
+          a.reset()
+          pwa = callPtr(obPwa.b, player, a)
+          if pwa != nil:
+            if firstPass: bc "A7 weapon animation in hand"
+            gAimSourceState = "live (world -> MainPlayer -> " &
+                              "ProceduralWeaponAnimation)"
+          else:
+            gAimSourceState = "NO aiming input -- ProceduralWeaponAnimation " &
+                              "was null"
+        else:
+          gAimSourceState = "NO aiming input -- " & obPwa.why
+      else:
+        gAimSourceState = "NO aiming input -- MainPlayer was null"
+    else:
+      gAimSourceState = "NO aiming input -- " & obMainPlayer.why
+  a.reset()
 
   if firstPass: bc "B4 about to bindOnObject get_fieldOfView on the camera"
   if not ensureCall(obCamFov, cam, "get_fieldOfView", none, fkF32):
@@ -2119,11 +2222,13 @@ proc applyFov() =
     gBaseFov = seen
     info "FOV: base field of view captured at " & $gBaseFov
 
-  if not ensureCall(obIsAiming, pwa, "get_IsAiming", none, fkBool):
-    gFovState = "refused: " & obIsAiming.why
-    return
-  a.reset()
-  let aiming = callBool(obIsAiming.b, pwa, a)
+  var aiming = false
+  if pwa != nil:
+    if not ensureCall(obIsAiming, pwa, "get_IsAiming", none, fkBool):
+      gFovState = "refused: " & obIsAiming.why
+      return
+    a.reset()
+    aiming = callBool(obIsAiming.b, pwa, a)
 
   var optic = false
   if aiming:
@@ -2156,6 +2261,14 @@ proc applyFov() =
     else:
       mult = mult * cfgUnaimedToggleZoomMulti
     gZoomFrames = gZoomFrames + 1
+
+  # An unchanged multiplier of exactly 1.0 is the camera's own value; writing
+  # it every frame would be a call that cannot be observed. Skipped -- but only
+  # when the PREVIOUS multiplier was also 1.0, so the frame that RETURNS to 1.0
+  # is still written and the effect actually clears.
+  if mult == 1.0 and gLastMult == 1.0:
+    return
+  gLastMult = mult
 
   let target = gBaseFov * mult
   a.reset()
@@ -2895,6 +3008,21 @@ proc reportWatch() =
   info "    world: " & gwStateText()
   info "    static RVAs: " & $gRvaVerified & " verified, " & $gRvaRejected &
        " REFUSED; by-name lookups declined: " & $gByNameRefusals
+  # The camera, on its own line, because it is the receiver every write needs
+  # and because a zero write count is only interpretable next to it.
+  case gCamAcq
+  of ccLive:
+    success "    camera: LIVE (static CameraManager::get_Instance; no host " &
+            "export involved)"
+  of ccBroken:
+    warn "    camera: BROKEN -- in a game and still no usable camera after " &
+         $gCamBrokenFrames & " frames: " & gCamWhy
+  of ccAbsent:
+    info "    camera: none, and no evidence of being in a game -- " &
+         "INCONCLUSIVE, not a pass (" & gCamWhy & ")"
+  of ccUnknown:
+    info "    camera: never asked for (the per-frame path never ran)"
+  info "    aiming input: " & gAimSourceState
   reportEffect("per-frame FOV write", gFovState, gFovWrites)
   info "    driven by " & gDriverState
   if gDriverIsEveryMain:
@@ -3332,8 +3460,9 @@ proc simSelfTest(): Status =
             " calls, " & $gFovWrites & " of which wrote"
   else:
     info "  per-frame cost " & $per & " ns over " & $Iterations &
-         " calls, none of which reached a write (no world). That is the " &
-         "guard: what the effect costs when there is nothing to do."
+         " calls, none of which reached a write -- camera: " & gCamWhy &
+         ". That is the guard: what the effect costs when there is nothing " &
+         "to do, and it is INCONCLUSIVE about whether the effect works."
   info "  for comparison, docs/PERF.md measures one boxed host call at " &
        "950-1235 ns and one bound call at 6-10 ns; the eight-call chain this " &
        "replaces was about 8 us of marshalling per frame"
