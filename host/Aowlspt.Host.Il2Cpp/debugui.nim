@@ -193,6 +193,10 @@ proc cWgCrumbW(idx: int32) {.importc: "aowl_wg_crumb_w", nodecl.}
 proc cWgCrumbGet(): int32 {.importc: "aowl_wg_crumb_get", nodecl.}
 proc cWgCrumbGetW(): int32 {.importc: "aowl_wg_crumb_get_w", nodecl.}
 proc cWgCrumbTextC(s: int32): cstring {.importc: "aowl_wg_crumb_text", nodecl.}
+proc cWgCrumbDepth(packed: int32): int32 {.
+  importc: "aowl_wg_crumb_depth", nodecl.}
+proc cWgCrumbRoleC(packed: int32): cstring {.
+  importc: "aowl_wg_crumb_role", nodecl.}
 
 const
   WgCrumbEnter     = 1'i32
@@ -241,6 +245,8 @@ const
   WgCrumbRCanvas      = 39'i32
   WgCrumbRClimb       = 40'i32
   WgCrumbRDone        = 41'i32
+  WgCrumbRClimbParent = 42'i32
+  WgCrumbRRectSrc     = 43'i32
 
 # ---- target indices, mirroring the AOWL_DU_* defines ----
 const
@@ -733,30 +739,73 @@ proc duFindAnchor(preloader: Il2CppPtr): Il2CppPtr =
     return
   result = tmp0
 
+## What `duRectOf` last did, for the log. A pointer that faulted is worth far
+## more with its provenance attached than without.
+var gDuRectSource = "not resolved"
+var gDuRectMismatchLogged = false
+var gDuRectEvidenceLogged = false
+
 proc duRectOf(tmp: Il2CppPtr): Il2CppPtr =
-  ## The RectTransform of a TMP component. `m_rectTransform` (+0x388) is TMP's
-  ## own cache and is free; it is null until TMP first touches it, in which case
-  ## `Component::get_transform` produces it (a UI object's Transform IS its
-  ## RectTransform). Cache first, call second -- one fewer managed call per
-  ## label per session.
+  ## The RectTransform of a TMP component -- FROM `Component::get_transform`,
+  ## which is live truth, NOT from TMP's `m_rectTransform` cache at +0x388.
+  ##
+  ## THE CACHE IS WHY THE WALK STILL FAULTED. The previous version preferred the
+  ## cached field and returned it after nothing but a `duOk` readability check --
+  ## before even reaching the liveness gate below it. `duCanvasRootGo` then gated
+  ## that pointer (readable: yes; `m_CachedPtr` non-zero: yes) and called
+  ## `Transform::get_parent` on it, which died. Measured: the fault moved from
+  ## `get_transform` to `get_parent` exactly when the anchor gate started
+  ## working, which means the receiver of `get_parent` -- this value -- is the
+  ## remaining bad pointer.
+  ##
+  ## Both gates can pass on a pointer that is still wrong, and that is the whole
+  ## lesson here. `duOk` proves READABLE. `duUnityAlive` proves `m_CachedPtr` is
+  ## NON-ZERO -- it does not prove that pointer still points at a live native
+  ## object, and it does not prove the managed object is a Transform at all. A
+  ## stale field left over from a rebuilt tree satisfies both.
+  ##
+  ## So: ask the live component what its transform IS. One managed call, made
+  ## only while building the pool (not per frame), on a receiver that has just
+  ## been liveness-gated. The cached field is kept only as a CROSS-CHECK and is
+  ## logged once when the two disagree -- which is the evidence that says whether
+  ## the field is stale or the offset is wrong for this build.
   result = nil
+  gDuRectSource = "not resolved"
   if tmp == nil:
     return
-  if duOk(tmp, cDuOffTmpRect() + 8'i32):
-    let cached = cReadPtrAt(tmp, cDuOffTmpRect())
-    if duOk(cached, 0x20'i32):
-      return cached
   let fn = cDuFn(DuGetTransform)
   if fn == nil:
+    gDuRectSource = "Component::get_transform did not verify on this build"
     return
   # `Component::get_transform` is an internal-call wrapper that dereferences
-  # `m_CachedPtr`. A destroyed TMP is readable and kills the process here, so
-  # liveness is checked before the call, not after.
+  # `m_CachedPtr`, so liveness is checked BEFORE the call, never after.
   if not duUnityAlive(tmp):
+    gDuRectSource = "the TMP component is destroyed (m_CachedPtr 0)"
     return
   let t = cDuCallPP(fn, tmp)
-  if duOk(t, 0x20'i32):
-    result = t
+  if not (duOk(t, 0x20'i32) and duUnityAlive(t)):
+    gDuRectSource = "get_transform returned null, unreadable or destroyed"
+    return
+  gDuRectSource = "Component::get_transform (live)"
+
+  # The cross-check. Read-only, and it decides nothing -- it only reports.
+  if not gDuRectMismatchLogged and duOk(tmp, cDuOffTmpRect() + 8'i32):
+    let cached = cReadPtrAt(tmp, cDuOffTmpRect())
+    if cached != t:
+      gDuRectMismatchLogged = true
+      warn "debugui: TMP's m_rectTransform cache (+0x" &
+           hexOf(uint64(cDuOffTmpRect())) & ") = 0x" &
+           hexOf(cast[uint64](cached)) & " but Component::get_transform says 0x" &
+           hexOf(cast[uint64](t)) & ". The cached value is " &
+           (if cached == nil: "null"
+            elif not duOk(cached, 0x20'i32): "UNREADABLE"
+            elif not duUnityAlive(cached): "readable but DESTROYED (m_CachedPtr 0)"
+            else: "readable and alive-looking, m_CachedPtr=0x" &
+                  hexOf(cast[uint64](duReadPtrField(cached, cDuOffCachedPtr()))) &
+                  ", klass=0x" & hexOf(cast[uint64](duReadPtrField(cached, 0'i32)))) &
+           ". The overlay uses get_transform and ignores the cache; this line " &
+           "is evidence about the field, not a failure."
+  result = t
 
 # ---------------------------------------------------------------------------
 # Read-back helpers
@@ -2240,6 +2289,19 @@ proc duCanvasRootGo(anchor: Il2CppPtr): Il2CppPtr =
   elif fnPar == nil:
     gDuRootRefusal = "Transform::get_parent did not verify on this build"
   else:
+    # THE EVIDENCE, written BEFORE the call that has been dying, so it survives
+    # even if this still faults. Everything here is a guarded field read; none
+    # of it calls into Unity.
+    if not gDuRectEvidenceLogged:
+      gDuRectEvidenceLogged = true
+      okLog "debugui: about to call Transform::get_parent on rect=0x" &
+            hexOf(cast[uint64](rect)) & " from " & gDuRectSource &
+            "; klass=0x" & hexOf(cast[uint64](duReadPtrField(rect, 0'i32))) &
+            " m_CachedPtr=0x" &
+            hexOf(cast[uint64](duReadPtrField(rect, cDuOffCachedPtr()))) &
+            " (anchor=0x" & hexOf(cast[uint64](anchor)) & " klass=0x" &
+            hexOf(cast[uint64](duReadPtrField(anchor, 0'i32))) & ")"
+    cWgCrumbW(2'i32)                   # role 2: in the call itself, depth 0
     cWgCrumb(WgCrumbRParent)
     let par = cDuCallPP(fnPar, rect)
     # The parent comes back from Unity and gets the same two gates: a destroyed
@@ -2286,11 +2348,19 @@ proc duCanvasRootGo(anchor: Il2CppPtr): Il2CppPtr =
   var best: Il2CppPtr = nil
   var depth = 0
   while depth < 8:
+    # The crumb's second slot carries `depth * 4 + role` here, so a fault in
+    # this loop says WHICH iteration and whether it was gating the receiver,
+    # gating the result, or inside the call. Route 1 above has no loop, which
+    # is how the log already distinguished the two.
+    cWgCrumb(WgCrumbRClimbParent)
+    cWgCrumbW(int32(depth * 4 + 0))
     # `cur` is gated on EVERY iteration, not only the ones that came back from
     # get_parent: the first `cur` is the anchor's own rect.
     if not (duOk(cur, 0x20'i32) and duUnityAlive(cur)):
       break
+    cWgCrumbW(int32(depth * 4 + 2))
     let par = cDuCallPP(fnPar, cur)
+    cWgCrumbW(int32(depth * 4 + 1))
     if not (duOk(par, 0x20'i32) and duUnityAlive(par)):
       break                            # cur was the outermost root; stop
     if duRectIsSane(par):
@@ -2950,9 +3020,19 @@ proc debugUiFired(regs: Il2CppPtr) =
                       stage == WgCrumbBPanelDraw or
                       stage == WgCrumbBMarkClone or
                       stage == WgCrumbBMarkDraw)
-    if isCloneIdx and wi >= 0:
+    # A THIRD meaning for the same slot, in the canvas-root walk: packed
+    # `depth * 4 + role`. Three meanings is one too many for a bare integer, so
+    # each is decoded explicitly and none is ever printed raw.
+    let isWalkSlot = (stage == WgCrumbRClimbParent or stage == WgCrumbRParent)
+    if isWalkSlot and wi >= 0:
+      where.add " -- climb depth " & $int(cWgCrumbDepth(int32(wi))) & ", " &
+                $cWgCrumbRoleC(int32(wi))
+      if gDuRectSource.len > 0:
+        where.add "; the rect came from " & gDuRectSource
+    elif isCloneIdx and wi >= 0:
       where.add " -- clone index " & $wi
-    elif not isCloneIdx and wi >= 0 and wi < gDuWidgets.len:
+    elif not isCloneIdx and not isWalkSlot and wi >= 0 and
+         wi < gDuWidgets.len:
       where.add " -- widget '" & gDuWidgets[wi].id & "' (index " & $wi &
                 ", fields '" & gDuWidgets[wi].fields & "')"
     if gDuFaults == 1 or (gDuFaults mod 240) == 0:
