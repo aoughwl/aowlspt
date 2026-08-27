@@ -56,6 +56,12 @@ constant is the failure mode this file exists to avoid.
                point past each family's own ceiling -- a correct server must
                go red on all three
     loyalty    accept a trader still sitting at loyalty level 1 as maxed
+    weatherarray  demand that /client/weather sends `weather` as an ARRAY --
+               the shape a WRONG DTO mapping implied and which BSG's own
+               capture contradicts -- so a correct server must go red
+    dictshapes demand that the six declared-Dictionary members of the served
+               profile arrive as JSON ARRAYS -- which is exactly the defect
+               that shipped -- so a correct server must go red
     tolerated  require BSG's own captured payloads to carry `SeasonsSettings`
                and `exchange_rate`.  They do not -- that is the whole basis of
                the CORRECT-AS-IS verdict on those two members -- so a correct
@@ -851,6 +857,118 @@ def check_mail_types(w, mut):
         record("mail-types", OK,
                "%d dialog(s): every message.systemData is object/null/absent, "
                "never a scalar" % len(rows))
+
+
+# ---------------------------------------------------------------------------
+# 16. profile/list: Dictionary members must be OBJECTS, never empty arrays
+#
+# Same class as check 15 above.  Six members of `EFT.ProfileDescriptor` (and of
+# its `Hideout`) are declared `Dictionary<...>` -- measured with
+# tools/fldoff.py -- and this server emitted `[]` for every one of them,
+# because an "empty collection" default reached for a seq.  Newtonsoft does not
+# degrade on a Dictionary that arrives as a JSON array: it throws, inside the
+# client's own ExecuteRequest, which is how `systemData: false` killed a raid
+# load rather than an inbox.
+#
+# This asserts a NEGATIVE about the FINISHED served payload: no member in
+# DICT_MEMBERS is a list.  Absent is INCONCLUSIVE for that member rather than a
+# pass -- "I could not look" is not a pass -- and a non-dict scalar is a FAIL.
+# `--mutate dictshapes` demands a LIST instead, so a correct server must go red;
+# that is the falsifying input.
+DICT_MEMBERS = [
+    ("Hideout", "MannequinPoses"),   # Dictionary<string, MongoID>
+    (None, "WishList"),              # Dictionary<MongoID, byte>
+    (None, "Achievements"),          # Dictionary<MongoID, int>
+    (None, "Prestige"),              # Dictionary<MongoID, int>
+    (None, "CompletableItems"),      # Dictionary<MongoID, bool>
+    (None, "SeasonalRewards"),       # Dictionary<MongoID, SeasonalRewardData>
+]
+
+
+def check_dict_shapes(w, mut):
+    tag = "%04d" % random.randrange(10000)
+    st, doc, text = make_profile(w, "Dict" + tag, "standard")
+    if doc is None or not session_of(doc):
+        record("dict-shapes", INCONC, "no profile to read")
+        return
+    sess = session_of(doc)
+    w.call("/client/game/profile/select", {"uid": sess}, sess)
+    p, why = read_back(w, sess)
+    if p is None:
+        record("dict-shapes", INCONC, why)
+        return
+    want_list = (mut == "dictshapes")
+    bad, missing, seen = [], [], 0
+    for parent, name in DICT_MEMBERS:
+        holder = p if parent is None else p.get(parent)
+        label = name if parent is None else parent + "." + name
+        if not isinstance(holder, dict) or name not in holder:
+            missing.append(label)
+            continue
+        seen += 1
+        v = holder[name]
+        ok = isinstance(v, list) if want_list else isinstance(v, dict)
+        if not ok:
+            bad.append("%s is %s (%s)" % (label, type(v).__name__,
+                                          json.dumps(v)[:40]))
+    if bad:
+        record("dict-shapes", FAIL, "; ".join(bad))
+    elif seen == 0:
+        record("dict-shapes", INCONC,
+               "none of the %d Dictionary members were on the wire: %s"
+               % (len(DICT_MEMBERS), ", ".join(missing)))
+    elif missing:
+        record("dict-shapes", INCONC,
+               "%d/%d checked; absent and therefore not examined: %s"
+               % (seen, len(DICT_MEMBERS), ", ".join(missing)))
+    elif want_list:
+        record("dict-shapes", OK,
+               "all %d Dictionary members are arrays (mutated expectation)" % seen)
+    else:
+        record("dict-shapes", OK,
+               "all %d declared-Dictionary members are JSON objects, "
+               "never arrays" % seen)
+
+
+# ---------------------------------------------------------------------------
+# 17. /client/weather: `weather` is ONE object, and that is BSG's own shape
+#
+# This is the check that stops a future "fix" from breaking a working route.
+# An audit read `/client/weather` against `JsonType.WeatherResponse`, whose
+# `Weathers` is `WeatherNode[]`, and reported that we send an object where an
+# array is declared.  The mapping was wrong, not the payload: the route's DTO
+# is `JsonType.LocationWeatherTime` (Season, SeasonsSettings, Weather:
+# WeatherNode, Acceleration, Date, Time -- a 5/5 key match against the served
+# body, versus 2/5 for WeatherResponse), and BSG's OWN captured response
+# raid1/responses/131.json sends `"weather": { ... }`, an object.
+#
+# So the assertion is: `data.weather` is a JSON object, exactly as the capture
+# has it.  `--mutate weatherarray` demands an array -- the shape the wrong DTO
+# implied -- so a correct server must go red.
+def check_weather_shape(w, mut):
+    st, doc, text = w.call("/client/weather", {})
+    if doc is None:
+        record("weather-shape", INCONC,
+               "/client/weather did not parse as JSON (%d bytes)" % len(text))
+        return
+    d = envelope(doc)
+    if not isinstance(d, dict) or "weather" not in d:
+        record("weather-shape", INCONC,
+               "the served body carries no `weather` member to examine")
+        return
+    v = d["weather"]
+    want_list = (mut == "weatherarray")
+    ok = isinstance(v, list) if want_list else isinstance(v, dict)
+    if not ok:
+        record("weather-shape", FAIL,
+               "data.weather is %s, not %s" % (type(v).__name__,
+                                               "an array" if want_list else "an object"))
+    elif want_list:
+        record("weather-shape", OK, "data.weather is an array (mutated expectation)")
+    else:
+        record("weather-shape", OK,
+               "data.weather is one object with %d members, as BSG capture 131 "
+               "sends it" % len(v))
 
 
 def main():
@@ -1667,6 +1785,18 @@ def main():
         check_mail_types(w, mut)
     except Exception as exc:                       # noqa: BLE001
         record("mail-types", INCONC, "%s: %r" % (type(exc).__name__, exc))
+
+    # ------------------------------------------------------------------ 16
+    try:
+        check_dict_shapes(w, mut)
+    except Exception as exc:                       # noqa: BLE001
+        record("dict-shapes", INCONC, "%s: %r" % (type(exc).__name__, exc))
+
+    # ------------------------------------------------------------------ 17
+    try:
+        check_weather_shape(w, mut)
+    except Exception as exc:                       # noqa: BLE001
+        record("weather-shape", INCONC, "%s: %r" % (type(exc).__name__, exc))
 
     # ------------------------------------------------------------------ 14
     try:

@@ -90,7 +90,14 @@ ROUTES = {
     "/client/settings":                    ("JsonType.ClientSettingsResponse", "named", ""),
     "/client/game/keepalive":              ("JsonType.KeepAliveResponse", "named", ""),
     "/client/game/profile/select":         ("JsonType.SelectProfileResponse", "named", ""),
-    "/client/weather":                     ("JsonType.WeatherResponse", "named", ""),
+    # NOT WeatherResponse. That type declares `Weathers` (WeatherNode[]) and
+    # made this route look like it emitted an object where an array was
+    # declared -- a false positive. The route's real DTO is
+    # `LocationWeatherTime`, whose `Weather` is a SINGLE `WeatherNode`:
+    # measured, its five members (weather, date, time, acceleration, season)
+    # match BSG's own capture 131 body 5/5, and 131 sends `weather` as an
+    # OBJECT, exactly as we do.
+    "/client/weather":                     ("JsonType.LocationWeatherTime", "named", ""),
     "/client/trading/api/traderSettings":  ("TraderSettings", "weak", ""),
     "/client/quest/chains":                ("EFT.Quests.QuestChainsResponse", "named", ""),
     "/client/account/customization":       ("EFT.AvailableCustomizationsResponse", "named", ""),

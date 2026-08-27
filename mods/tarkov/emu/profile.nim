@@ -355,7 +355,7 @@ proc newProfileText*(id, nickname, sideName, edition: string;
   # because `setRaw` on a profile does nothing to a path that does not exist,
   # so an absent block is a write that vanishes.
   put(hideout, "Customization", obj())
-  put(hideout, "MannequinPoses", arr())
+  put(hideout, "MannequinPoses", obj())
   put(hideout, "Production", obj())
   # Post-1.0 deserialises Hideout.Seed as a STRING (a 32-hex hideout RNG seed);
   # SPT's pre-1.0 profile had it as an object, which makes the client throw
@@ -398,16 +398,16 @@ proc newProfileText*(id, nickname, sideName, edition: string;
   put(p, "RagfairInfo", ragfair)
   put(p, "TradersInfo", raw(seedTradersInfo(kit.trader)))
   put(p, "UnlockedInfo", objOf("unlockedProductionRecipe", arr()))
-  put(p, "WishList", arr())
+  put(p, "WishList", obj())
   put(p, "moneyTransferLimitData", obj())
-  put(p, "Achievements", arr())
-  put(p, "Prestige", arr())
+  put(p, "Achievements", obj())
+  put(p, "Prestige", obj())
   # Post-1.0 top-level members the client's Profile DTO reads (capture seq 096).
   # Empty is the fresh-profile state; the point is that the key is present, so a
   # read of `profile.Variables[...]` or the seasonal/battle-pass screens find a
   # collection to index rather than null.
   put(p, "Variables", obj())
-  put(p, "CompletableItems", arr())
+  put(p, "CompletableItems", obj())
   put(p, "UnlockedLocations", arr())
   # Ending carries {current, achieved}.
   var ending = obj()
@@ -418,7 +418,7 @@ proc newProfileText*(id, nickname, sideName, edition: string;
   put(p, "ReadQuestData", arr())
   put(p, "SeasonalPerks", arr())
   put(p, "SeasonalPerkEffectParameters", obj())
-  put(p, "SeasonalRewards", arr())
+  put(p, "SeasonalRewards", obj())
   put(p, "BattlePassProgress", arr())
   put(p, "BattlePassUniversalDocumentBalance", 0)
   put(p, "battlePassDocumentLimitData", obj())
@@ -540,6 +540,56 @@ proc ensureDescriptorMembers*(p: var Profile): seq[string] =
     result.add pair[0]
   p.text = text(d)
 
+const DictionaryMembers* = [
+  # Members the client's DTO declares as a Dictionary and this emulator used to
+  # emit as an empty ARRAY. Newtonsoft does not degrade on a shape mismatch: it
+  # throws, and the throw propagates out of the client's own request handling --
+  # the same class of defect that killed a raid load when
+  # `/client/mail/dialog/list` sent `systemData: false` where a class was
+  # declared. Declared types, for the record:
+  #   Hideout.MannequinPoses  Dictionary<string, MongoID>
+  #   WishList                Dictionary<MongoID, byte>
+  #   Achievements            Dictionary<MongoID, int>
+  #   Prestige                Dictionary<MongoID, int>
+  #   CompletableItems        Dictionary<MongoID, bool>
+  #   SeasonalRewards         Dictionary<MongoID, SeasonalRewardData>
+  # SPT's own profile template sends `{}` for Achievements and Prestige, which
+  # is a second implementation agreeing, not a guess.
+  "Hideout.MannequinPoses",
+  "WishList",
+  "Achievements",
+  "Prestige",
+  "CompletableItems",
+  "SeasonalRewards",
+]
+
+proc ensureDictionaryShapes*(p: var Profile): seq[string] =
+  ## Rewrites any member of `DictionaryMembers` that is an EMPTY ARRAY into an
+  ## empty object, and returns the paths it had to rewrite.
+  ##
+  ## New profiles get `{}` from `newProfileText`; every profile already on disk
+  ## carries `[]`, so a fix that only reaches new characters fixes nobody --
+  ## same reasoning as `ensurePockets`. In memory only.
+  ##
+  ## Deliberately narrow: ONLY the literal empty array is rewritten. A
+  ## non-empty array here is a different bug with a different repair, and
+  ## quietly turning it into `{}` would destroy data while reporting success.
+  result = @[]
+  if not p.ok or p.text.len == 0:
+    return
+  for path in DictionaryMembers:
+    let r = p.field(path)
+    if not r.found:
+      continue
+    var raw = r.raw()
+    var compact = ""
+    for ch in raw:
+      if ch > chr(32): compact.add ch
+    if compact != "[]":
+      continue
+    p.text = replaceValue(p.text, path, "{}")
+    result.add path
+
 # ---------------------------------------------------------------------------
 # Persistence
 # ---------------------------------------------------------------------------
@@ -582,6 +632,14 @@ proc readProfile*(id: string; why: var ProfileRead): Profile =
     why = prLoaded
     if ensurePockets(result):
       info "profile " & id & " had no Pockets item; added one (see PocketsTpl)"
+    let reshaped = ensureDictionaryShapes(result)
+    if reshaped.len > 0:
+      var paths = ""
+      for n in reshaped:
+        if paths.len > 0: paths.add ", "
+        paths.add n
+      info "profile " & id & " had Dictionary members stored as empty " &
+           "arrays: " & paths & " (rewritten to {})"
     let added = ensureDescriptorMembers(result)
     if added.len > 0:
       var names = ""
