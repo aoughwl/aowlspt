@@ -267,7 +267,7 @@
    "minBytes": 300000,
    "markers": [
     "/aowlspt/ui/page/settings",
-    "Fallback Settings UI",
+    "Browser Settings Page",
     "Search all settings",
     "Advertise the browser settings page",
     "launchHintFallbackPage",

@@ -465,7 +465,7 @@ def settings_index():
     # one the overlay may hide without loading it.
     return {"mods": [{"guid": "aowl.deep", "name": "Deep tree fixture",
                       "count": len(DEEP_ROWS), "done": _impl_count(DEEP_ROWS)},
-                     {"guid": "aowl.uihub", "name": "Fallback Settings UI",
+                     {"guid": "aowl.uihub", "name": "Browser Settings Page",
                       "count": len(UIHUB_ROWS), "done": _impl_count(UIHUB_ROWS)},
                      {"guid": "aowl.dead", "name": "Nothing Implemented",
                       "count": len(DEAD_ROWS), "done": 0}]}

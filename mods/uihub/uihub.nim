@@ -69,11 +69,17 @@ import aowlspt/settings
 
 const
   ModGuid = "aowl.uihub"
-  ModName = "Interface"
-    ## Was "Fallback Settings UI". The MOD is infrastructure and is now marked
-    ## `internal` in the registry, so it no longer appears on the mod list --
-    ## but it declares one genuine player row (the F12 launch hint), so it
-    ## still has a settings page, and that page needs a name a player can read.
+  ModName = "Browser Settings Page"
+    ## Was "Fallback Settings UI". Two branches renamed this at once:
+    ## feat-internal-mods chose "Interface", feat-overlay-settings-ui chose
+    ## "Browser Settings Page". The latter wins because it is the name carried
+    ## by the deploy.json marker and two test fixtures, and because it says
+    ## what the page IS rather than naming a generic.
+    ##
+    ## The MOD is infrastructure and is marked `internal` in the registry, so
+    ## it no longer appears on the mod list -- but it declares one genuine
+    ## player row (the F12 launch hint), so it still has a settings page, and
+    ## that page needs a name a player can read.
   ModAuthor = "savannt"
   ModVersion = "2.0.0"
 

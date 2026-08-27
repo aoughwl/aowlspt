@@ -605,7 +605,7 @@ int main(void) {
         static const char roster[] =
             "{\"mods\":[{\"guid\":\"aowl.manager\",\"name\":\"Mod Manager\"},"
             "{\"guid\":\"aowl.settingshub\",\"name\":\"SPT Settings Surface\"},"
-            "{\"guid\":\"aowl.uihub\",\"name\":\"Fallback Settings UI\"},"
+            "{\"guid\":\"aowl.uihub\",\"name\":\"Browser Settings Page\"},"
             "{\"guid\":\"aowl.morebots\",\"name\":\"MoreBots\"},"
             "{\"guid\":\"aowl.tarkov\",\"name\":\"Singleplayer\"}]}";
         int32_t i, bad_ = 0;
@@ -625,15 +625,26 @@ int main(void) {
                 strstr(g_ov.pages[i].label, "SAIN") ||
                 strstr(g_ov.pages[i].label, "MoreBots")) bad_++;
         eq_int("index: no retired display name is rendered in the nav", bad_, 0);
-        eq_int("index: exactly the two publishers are pages", g_ov.pageCount, 2);
+        /* The panel's OWN page is always page 0 and is not a publisher, so the
+         * publisher count is what is left after it. Counted rather than
+         * subtracted blind: the point of this check is that nothing ELSE
+         * sneaks in, and `pageCount - 1` would pass if two did. */
+        eq_int("index: the panel's own page is first",
+               strcmp(g_ov.pages[0].id, AOWL_OV_PANEL_PAGE) == 0, 1);
+        eq_int("index: exactly the two publishers are pages, beside it",
+               g_ov.pageCount, 3);
         eq_str("index: the page key is the guid, not the name",
-               g_ov.pages[0].id, "aowl.tarkov");
+               g_ov.pages[1].id, "aowl.tarkov");
 
-        /* An index that does not answer must not resurrect the roster. */
+        /* An index that does not answer must not resurrect the roster. The
+         * panel's own page survives -- it has no backend to be missing -- and
+         * that is the ONLY page that may. */
         g_ov.idxModCount = 0;
         aowl_ov_rebuild_pages();
-        eq_int("index: a missing index yields an EMPTY nav, not the roster",
-               g_ov.pageCount, 0);
+        eq_int("index: a missing index yields the panel page and nothing else",
+               g_ov.pageCount, 1);
+        eq_int("index: and that page is the panel's own",
+               strcmp(g_ov.pages[0].id, AOWL_OV_PANEL_PAGE) == 0, 1);
     }
 
     /* ---- sub-tabs: categories are contiguous after the sort -------------- */
@@ -669,6 +680,170 @@ int main(void) {
                g_ov.items[0].key, "d");
         eq_str("subtabs: an absent subcategory stays empty",
                g_ov.items[3].subcat, "");
+    }
+
+    /* ---- numbers: a value cell NEVER renders as a truncated number ------
+     *
+     * The negative, not the positive. Asserting "0.30 formats as 0.30" would
+     * pass for a formatter that clipped everything else; asserting that NO
+     * value, at ANY width this panel can produce, comes back longer than its
+     * cell or carrying an ellipsis is falsifiable by exactly the defect being
+     * fixed -- `%.6g` on a JSON float printed `0.30000001192092896` and the
+     * cell drew `0.3000..`.
+     *
+     * The widths swept start at 3, which is narrower than any real cell (the
+     * value box is >= 8 columns at the 84px track), so the sweep covers cases
+     * the panel cannot even reach. */
+    {
+        static const struct { const char* body; float v; } cases[] = {
+          /* the reported one: 0..1 by 0.01, a float that arrived as a double */
+          { "{\"key\":\"k\",\"type\":\"float\",\"value\":0.30000001192092896,"
+            "\"min\":0,\"max\":1,\"step\":0.01}", 0.30000001192092896f },
+          /* a big integer range: no decimals are worth anything here */
+          { "{\"key\":\"k\",\"type\":\"int\",\"value\":1200,\"min\":0,"
+            "\"max\":1200,\"step\":1}", 1200.0f },
+          /* a fine float step: three decimals, and no more */
+          { "{\"key\":\"k\",\"type\":\"float\",\"value\":0.123456789,"
+            "\"min\":0,\"max\":1,\"step\":0.001}", 0.123456789f },
+          /* no step and no range at all: the fallback path */
+          { "{\"key\":\"k\",\"type\":\"float\",\"value\":123456.789}",
+            123456.789f },
+          /* a number far too wide for any cell, negative for good measure */
+          { "{\"key\":\"k\",\"type\":\"float\",\"value\":-98765432109.5,"
+            "\"min\":-100000000000,\"max\":100000000000,\"step\":0.5}",
+            -98765432109.5f }
+        };
+        int32_t c, cols, bad = 0, ell = 0;
+        for (c = 0; c < (int32_t)(sizeof(cases) / sizeof(cases[0])); c++) {
+            AowlOvSItem si;
+            const char* b = cases[c].body;
+            if (!aowl_ov_read_one_item(b, b + strlen(b), &si)) { bad++; continue; }
+            for (cols = 3; cols <= 24; cols++) {
+                char out[64];
+                aowl_ov_num_str(&si, cases[c].v, cols, out, (int32_t)sizeof(out));
+                if ((int32_t)strlen(out) > cols) bad++;
+                if (strstr(out, "..")) ell++;
+            }
+        }
+        eq_int("numbers: no formatted value is wider than the cell it is for",
+               bad, 0);
+        eq_int("numbers: no formatted value ends up carrying an ellipsis",
+               ell, 0);
+    }
+    {
+        /* And the precision is DERIVED, not guessed: the two shapes named in
+         * the report, checked at a width that fits them both comfortably. */
+        AowlOvSItem si;
+        char out[64];
+        const char* a = "{\"key\":\"k\",\"type\":\"float\",\"value\":0.3,"
+                        "\"min\":0,\"max\":1,\"step\":0.01}";
+        const char* b = "{\"key\":\"k\",\"type\":\"int\",\"value\":600,"
+                        "\"min\":0,\"max\":1200,\"step\":1}";
+        aowl_ov_read_one_item(a, a + strlen(a), &si);
+        eq_int("numbers: a 0..1 step-0.01 slider wants two decimals",
+               aowl_ov_num_decimals(&si), 2);
+        aowl_ov_num_str(&si, 0.30000001192092896f, 12, out, (int32_t)sizeof(out));
+        eq_str("numbers: and prints them", out, "0.30");
+        aowl_ov_read_one_item(b, b + strlen(b), &si);
+        eq_int("numbers: a 0..1200 integer wants none",
+               aowl_ov_num_decimals(&si), 0);
+        aowl_ov_num_str(&si, 600.0f, 12, out, (int32_t)sizeof(out));
+        eq_str("numbers: and prints none", out, "600");
+    }
+
+    /* ---- themes: data, unbounded in number, and readable ---------------- */
+    {
+        int32_t i, j, dup = 0, unnamed = 0;
+        aowl_ov_themes_load();
+        eq_int("themes: the shipped themes all parsed",
+               g_ovThemeCount >= 4, 1);
+        for (i = 0; i < g_ovThemeCount; i++) {
+            if (!g_ovThemes[i].name[0]) unnamed++;
+            for (j = i + 1; j < g_ovThemeCount; j++)
+                if (!_stricmp(g_ovThemes[i].name, g_ovThemes[j].name)) dup++;
+        }
+        eq_int("themes: none is nameless (a nameless theme is unselectable)",
+               unnamed, 0);
+        eq_int("themes: no two themes share a name", dup, 0);
+        /* CONTRAST, on the pair that has to satisfy it: text against the panel
+         * background. Rec.601 luma difference, which is the cheap check this
+         * file can make offline -- it is a floor, not a substitute for looking
+         * at it. Applied to EVERY loaded theme, so a user file that is
+         * unreadable is caught by the same rule the shipped ones pass. */
+        for (i = 0; i < g_ovThemeCount; i++) {
+            uint32_t t = g_ovThemes[i].text, b = g_ovThemes[i].bg;
+            int32_t lt = (int32_t)((( t        & 0xFF) * 299 +
+                                    ((t >> 8)  & 0xFF) * 587 +
+                                    ((t >> 16) & 0xFF) * 114) / 1000);
+            int32_t lb = (int32_t)((( b        & 0xFF) * 299 +
+                                    ((b >> 8)  & 0xFF) * 587 +
+                                    ((b >> 16) & 0xFF) * 114) / 1000);
+            int32_t d = lt - lb; if (d < 0) d = -d;
+            if (d < 125) {
+                printf("error themes: %s has text/background luma gap %d\n",
+                       g_ovThemes[i].name, d);
+                failures++;
+            }
+        }
+        /* A theme is DATA: this body has never been compiled in, and loading
+         * it must produce a theme like any other. */
+        {
+            AowlOvTheme T = g_ovThemes[0];
+            T.name[0] = 0;
+            aowl_ov_theme_parse(&T,
+                "# a comment\nname = My Theme\naccent=#FF00FF\nnonsense=zzz\n");
+            eq_str("themes: a hand-written body names itself", T.name, "My Theme");
+            eq_int("themes: and sets the colour it named",
+                   (int32_t)(T.accent == AOWL_RGBA(255, 0, 255, 255)), 1);
+            eq_int("themes: and keeps what it did not mention",
+                   (int32_t)(T.bg == g_ovThemes[0].bg), 1);
+            eq_int("themes: an unparseable colour changes nothing",
+                   (int32_t)(T.edge == g_ovThemes[0].edge), 1);
+        }
+    }
+
+    /* ---- the panel's own page is a real page ---------------------------- */
+    {
+        char body[4096];
+        int32_t i, unimpl = 0;
+        aowl_ov_themes_load();
+        aowl_ov_prefs_default();
+        aowl_ov_panel_schema(body, (int32_t)sizeof(body));
+        eq_int("panel page: the generated schema is well-formed JSON",
+               aowl_ov_jwhole(body, (int32_t)strlen(body)), 1);
+        g_ov.showUnimpl = 0;
+        aowl_ov_read_items(body, (int32_t)strlen(body));
+        eq_int("panel page: every row survives the unimplemented filter",
+               g_ov.itemCount, 9);
+        for (i = 0; i < g_ov.itemCount; i++)
+            if (!g_ov.items[i].implemented) unimpl++;
+        eq_int("panel page: no row on it is a control that does nothing",
+               unimpl, 0);
+        /* The theme row offers every theme that is loaded -- not a fixed
+         * number. Adding a theme adds an option, with no code change. */
+        for (i = 0; i < g_ov.itemCount; i++)
+            if (!strcmp(g_ov.items[i].key, "theme"))
+                eq_int("panel page: the theme row offers every loaded theme",
+                       g_ov.items[i].optCount, g_ovThemeCount);
+        /* A write round-trips: set it, re-generate, read it back. Asserting the
+         * FINISHED state -- what the regenerated schema says -- not that the
+         * setter was called. */
+        eq_int("panel page: a known key is accepted",
+               aowl_ov_panel_set("showFooter", "false"), 1);
+        eq_int("panel page: an unknown key is REFUSED, not ignored",
+               aowl_ov_panel_set("nosuchkey", "true"), 0);
+        eq_int("panel page: an out-of-range value is REFUSED",
+               aowl_ov_panel_set("navW", "20000"), 0);
+        aowl_ov_panel_schema(body, (int32_t)sizeof(body));
+        aowl_ov_read_items(body, (int32_t)strlen(body));
+        for (i = 0; i < g_ov.itemCount; i++) {
+            if (!strcmp(g_ov.items[i].key, "showFooter"))
+                eq_str("panel page: the write is what the page then reads back",
+                       g_ov.items[i].value, "false");
+            if (!strcmp(g_ov.items[i].key, "navW"))
+                eq_str("panel page: and the refused one did not take",
+                       g_ov.items[i].value, "256");
+        }
     }
 
     printf("\n%s\n", failures == 0 ? "all overlay json checks passed"
