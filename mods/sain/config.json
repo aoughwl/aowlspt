@@ -4,6 +4,9 @@
   "forcePersonality": "",
   "logDecisions": false,
 
+  "_moreBots": "The More Bots spawn expansion, presented as part of Bot AI rather than as a separate mod. INERT on this build: the mod that would do the work (aowl.morebots) is QUARANTINED because it crashes the client (fact #128, confirmed live), so this key is read for the settings page and nothing acts on it.",
+  "moreBots": false,
+
   "_driveFromHostThread": "Whether the five driving calls (GoToPoint, Sprint, LookToPoint, Shoot, and the self-actions) may be made from the host's own thread on a host whose onMainThread drain has never fired. When the drain has fired they are queued and executed on Unity's thread regardless, which is what they need. Set false to withhold them instead: bots then decide and do not move, which is the safe direction and the visibly broken one. Either way /sain/status and the log say which path the session took.",
   "driveFromHostThread": true,
 
@@ -29,21 +32,29 @@
   "roles": {
     "pmc": {
       "engageDistance": 90.0,
-      "timeBeforeSearch": 25.0
+      "timeBeforeSearch": 25.0,
+      "willSearchForEnemy": true,
+      "runAwayHealthThreshold": 0.28,
+      "canShiftCoverPosition": true
     },
     "scav": {
       "engageDistance": 50.0,
       "timeBeforeSearch": 60.0,
-      "willSearchForEnemy": false
+      "willSearchForEnemy": false,
+      "runAwayHealthThreshold": 0.28,
+      "canShiftCoverPosition": true
     },
     "boss": {
       "engageDistance": 110.0,
       "timeBeforeSearch": 5.0,
-      "runAwayHealthThreshold": 0.1
+      "willSearchForEnemy": true,
+      "runAwayHealthThreshold": 0.1,
+      "canShiftCoverPosition": true
     },
     "zombie": {
       "engageDistance": 200.0,
       "timeBeforeSearch": 1.0,
+      "willSearchForEnemy": true,
       "runAwayHealthThreshold": 0.0,
       "canShiftCoverPosition": false
     }

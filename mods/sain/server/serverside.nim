@@ -81,7 +81,7 @@ proc patchBrains() =
     missing = probes.len
 
   if applied > 0:
-    info "sain: forced " & $applied & " brain table(s) to a brain SAIN drives"
+    info "sain: forced " & $applied & " brain table(s) to a brain Bot AI drives"
   if missing > 0:
     info "sain: " & $missing & " of those table(s) were not in this database " &
          "and were created. That is the normal case on the emulator and on " &
