@@ -31,6 +31,13 @@ constant is the failure mode this file exists to avoid.
     fence      report Fence's generated assort as empty
     descriptor add a ProfileDescriptor member we correctly never serve on this
                route, which MUST turn the descriptor check red
+    lootpos    demand a NON-zero Position on static containers -- which BSG's
+               own captured match/local/start does NOT send -- so a correct
+               server must go red
+    lootmap    add `Icebreaker` to the set of ids REQUIRED to serve loot.
+               It is in the post-1.0 location table the real server sent us
+               but has no database entry and no parent map to inherit one, so
+               a correct server cannot answer it and must go red
 """
 
 import argparse
@@ -63,6 +70,39 @@ JAEGER = "5c0647fdd443bc2504c2d371"
 DESCRIPTOR_MEMBERS = ["CheckedChambers", "CheckedMagazines", "karmaValue"]
 MUTANT_MEMBER = "BTRLocalSettings"
 PRAPOR = "54cb50c76803fa8b248b4571"
+# The map the ONE captured match/local/start body covers, so our served payload
+# is compared against BSG's on the same location and nothing else.
+LOOT_MAP = "Sandbox_start"
+# A map the generator DOES answer for, so the Position-shape assertion is not
+# silently skipped by the unrelated Sandbox_start mapping defect above.
+LOOT_SHAPE_MAP = "sandbox"
+
+# Every location id the CLIENT can put in `/client/match/local/start`, which is
+# `base.Id` -- NOT the database key.  Measured from the captured request body
+# (raid1/requests/158.json names the map "Sandbox_start", an `Id`) and from the
+# `Id` member of all 24 maps in `mods/tarkov/data/post1/locations.json`, which
+# is the table the real server sent this build.
+#
+# `LOOT_BEARING` are the ones whose database entry carries static loot tables,
+# so an empty `Loot` for one of them is a DEFECT.  The rest -- develop,
+# hideout, Private Area, Suburdbs, Terminal, Town -- have a `base` and nothing
+# else in the database, and `Icebreaker` has no database entry at all, so an
+# empty list for those is the CORRECT answer and asserting otherwise would be
+# a check that fails on correct behaviour.
+CLIENT_LOCATION_IDS = [
+    "bigmap", "factory4_day", "factory4_night", "laboratory", "Interchange",
+    "Labyrinth", "Lighthouse", "RezervBase", "Sandbox", "Sandbox_high",
+    "Shoreline", "TarkovStreets", "Woods",
+    # Variants: their own Id and _Id, sharing a parent map's `Name`.
+    "Sandbox_start", "laboratory_dark", "Lighthouse2",
+]
+LOOT_BEARING = set(CLIENT_LOCATION_IDS)
+
+# Ids the client can send that the database has NOTHING for, directly or by
+# `Name`.  An empty `Loot` for these is correct, and `--mutate lootmap` demands
+# loot for one of them precisely so that a correct server goes red.
+UNMAPPABLE_IDS = ["Icebreaker", "Terminal_ui", "develop", "hideout",
+                  "Private Area", "Suburbs", "Terminal", "Town"]
 FENCE = "579dc571d53a0658a154fbec"
 
 results = []
@@ -541,6 +581,162 @@ def main():
                    % (", ".join(want),
                       ", ".join("%s=%s" % (m, json.dumps(p[m])[:20])
                                 for m in want)))
+
+    # ----------------------------------------------------------------- 8
+    # locationLoot Position shape, asserted as a NEGATIVE against BSG's OWN
+    # captured `/client/match/local/start` body (raid1/responses/158.json).
+    #
+    # MEASURED there, not assumed: all 41 `IsContainer` entries carry Position
+    # (0,0,0) and all 94 non-container entries carry a NON-zero Position.  So
+    # a zero on a container is CORRECT -- the client resolves a container by
+    # its `Id` against the loaded scene, and 96-100% of every map's container
+    # Ids exist verbatim in the client's own levelN files.  A zero on a LOOSE
+    # entry is the real defect, and serving zero loose entries at all is the
+    # hole this check names.
+    #
+    # The falsifying input: `--mutate lootpos` demands a NON-zero Position on
+    # containers, which BSG itself does not send, so the mutated run must go
+    # red on a correct server.
+    def _start(loc):
+        st, doc, text = w.call("/client/match/local/start",
+                               {"serverId": None, "location": loc,
+                                "timeVariant": "CURR", "mode": "TUTORIAL",
+                                "playerSide": "Pmc", "transitionType": 0,
+                                "transition": None},
+                               session=std_session)
+        body = envelope(doc) if doc else None
+        if not isinstance(body, dict):
+            return None, text
+        return body.get("locationLoot", {}).get("Loot"), text
+
+    # 8a -- parity with BSG on the ONE request body we actually captured.
+    if not std_session:
+        record("lootparity", INCONC, "no session to start a raid with")
+    else:
+        loot, text = _start(LOOT_MAP)
+        if loot is None:
+            record("lootparity", INCONC,
+                   "match/local/start gave no locationLoot.Loot: %s"
+                   % text[:140])
+        elif not loot:
+            record("lootparity", FAIL,
+                   "location %r served an EMPTY locationLoot.Loot; BSG's "
+                   "captured answer to this exact body (158.json) has 135 "
+                   "entries. The raid id is not being mapped to a db location."
+                   % LOOT_MAP)
+        else:
+            record("lootparity", OK,
+                   "%r served %d loot entries (BSG's capture has 135)"
+                   % (LOOT_MAP, len(loot)))
+
+    # 8a2 -- THE GENERAL NEGATIVE, over every id the client can send.
+    #
+    # "No location id the client can send serves an empty `Loot` when its
+    # database location has entries."  Stated as a negative on purpose: the
+    # positive form ("Sandbox_start serves loot") is one string and was
+    # special-cased away twice.
+    #
+    # This is the check that would have caught the real size of the hole.
+    # MEASURED on this backend with the fix reverted: TEN of the thirteen
+    # loot-bearing maps served ZERO -- Interchange, Labyrinth, Lighthouse,
+    # RezervBase, Sandbox, Sandbox_high, Shoreline, TarkovStreets, Woods and
+    # Sandbox_start -- because the id resolver matched only the database key
+    # and `base._Id`, never the `base.Id` the client actually sends.  Only
+    # bigmap, factory4_day, factory4_night and laboratory happened to spell
+    # the key and the `Id` identically, which is why "loot works" was
+    # believed: Customs, Factory and Labs are the maps people test on.
+    if not std_session:
+        record("lootmap", INCONC, "no session to start a raid with")
+    else:
+        want = list(CLIENT_LOCATION_IDS)
+        if mut == "lootmap":
+            want.append("Icebreaker")
+        empty, unread = [], []
+        for loc in want:
+            loot, text = _start(loc)
+            if loot is None:
+                unread.append(loc)
+            elif not loot:
+                empty.append(loc)
+        if unread:
+            record("lootmap", INCONC,
+                   "%d id(s) gave no locationLoot.Loot at all, so nothing was "
+                   "proved about them: %s" % (len(unread), ", ".join(unread)))
+        elif empty:
+            record("lootmap", FAIL,
+                   "%d of %d client-sendable location id(s) served an EMPTY "
+                   "locationLoot.Loot: %s"
+                   % (len(empty), len(want), ", ".join(empty)))
+        else:
+            record("lootmap", OK,
+                   "all %d client-sendable location id(s) served a non-empty "
+                   "Loot" % len(want))
+
+    # 8a3 -- the other half of the same negative, so the fix above cannot be a
+    # resolver that maps EVERYTHING to some map.  An id the database genuinely
+    # has nothing for must still answer empty rather than silently inherit
+    # another map's loot, which would put crates in mid-air.
+    if not std_session:
+        record("lootunmapped", INCONC, "no session to start a raid with")
+    else:
+        wrong = []
+        for loc in UNMAPPABLE_IDS:
+            loot, _ = _start(loc)
+            if loot:
+                wrong.append("%s(%d)" % (loc, len(loot)))
+        if wrong:
+            record("lootunmapped", FAIL,
+                   "id(s) with no database location of their own were served "
+                   "loot anyway -- the resolver is guessing: %s"
+                   % ", ".join(wrong))
+        else:
+            record("lootunmapped", OK,
+                   "all %d id(s) the database has nothing for served an empty "
+                   "Loot rather than another map's" % len(UNMAPPABLE_IDS))
+
+    # 8b -- the Position shape, on a map our generator does answer for.
+    loot, text = (None, "") if not std_session else _start(LOOT_SHAPE_MAP)
+    if not std_session:
+        record("lootpos", INCONC, "no session to start a raid with")
+    elif not loot:
+        record("lootpos", INCONC,
+               "%r served no loot to check the Position shape on: %s"
+               % (LOOT_SHAPE_MAP, text[:120]))
+    else:
+        def _nz(e):
+            p = e.get("Position") or {}
+            return any(abs(p.get(k, 0) or 0) > 1e-6 for k in "xyz")
+        conts = [e for e in loot if e.get("IsContainer")]
+        loose = [e for e in loot if not e.get("IsContainer")]
+        want_container_nonzero = (mut == "lootpos")
+        bad_cont = [e["Id"] for e in conts
+                    if _nz(e) != want_container_nonzero][:4]
+        bad_loose = [e.get("Id") for e in loose if not _nz(e)][:4]
+        if not conts:
+            record("lootpos", INCONC,
+                   "%d loot entries but none is a container" % len(loot))
+        elif bad_cont:
+            record("lootpos", FAIL,
+                   "container Position must be %s (BSG's own 158.json sends "
+                   "zeros); wrong on e.g. %s"
+                   % ("non-zero" if want_container_nonzero else "(0,0,0)",
+                      ", ".join(map(str, bad_cont))))
+        elif bad_loose:
+            record("lootpos", FAIL,
+                   "%d loose entr(ies) served at Position (0,0,0); BSG sends a "
+                   "real coordinate for every one: e.g. %s"
+                   % (len(bad_loose), ", ".join(map(str, bad_loose))))
+        elif not loose:
+            record("lootpos", FAIL,
+                   "%s served %d containers and ZERO loose loot entries; BSG's "
+                   "capture for Sandbox_start sends 94 of 135. db.json has no "
+                   "`looseLoot` key, so emu/loot.nim's loose path is dead."
+                   % (LOOT_SHAPE_MAP, len(conts)))
+        else:
+            record("lootpos", OK,
+                   "%d container(s) at (0,0,0) as BSG sends them, %d loose "
+                   "entr(ies) all with a non-zero Position"
+                   % (len(conts), len(loose)))
 
     print()
     bad = [r for r in results if r[1] != OK]

@@ -244,6 +244,11 @@ type
     ok*: bool
     names*: seq[string]   ## the database key -- the directory the map came from
     ids*: seq[string]     ## `base._Id`, or "" for a map whose base has none
+    gameIds*: seq[string] ## `base.Id` -- the name the CLIENT sends, which is
+                          ## not the database key: 13 of the 19 maps differ
+                          ## from it only in case ("Woods"/"woods",
+                          ## "TarkovStreets"/"tarkovstreets"), and a
+                          ## case-sensitive lookup missed every one of them.
 
 proc buildLocationIndex*(d: LootDb): LocationIndex =
   ## Every member of `locations` that has a `base`, in document order.
@@ -252,24 +257,52 @@ proc buildLocationIndex*(d: LootDb): LocationIndex =
   ## only maps: `locations.paths` is the transit graph, an array, and a route
   ## that listed it as a twentieth map would put an unloadable entry on the
   ## player's map screen.
-  result = LocationIndex(ok: false, names: @[], ids: @[])
+  result = LocationIndex(ok: false, names: @[], ids: @[], gameIds: @[])
   let names = keys(whole(sub(d, "locations")))
   for name in names:
     let id = whole(sub(d, "locations." & name & ".base._Id")).asText("")
+    let gid = whole(sub(d, "locations." & name & ".base.Id")).asText("")
     if id.len > 0:
       result.names.add name
       result.ids.add id
+      result.gameIds.add gid
     elif sub(d, "locations." & name & ".base").len > 0:
       # A map whose base carries no `_Id`. It is listed under its database key
       # rather than dropped: a key the client may not recognise costs that one
       # map, and dropping it costs that one map *and* leaves nothing to see.
       result.names.add name
       result.ids.add ""
+      result.gameIds.add gid
   result.ok = true
 
+proc lowerAscii(s: string): string =
+  result = newString(s.len)
+  var i = 0
+  while i < s.len:
+    let c = s[i]
+    result[i] = (if c >= 'A' and c <= 'Z': chr(ord(c) + 32) else: c)
+    inc i
+
 proc resolveLocation*(idx: LocationIndex; id: string): string =
-  ## The database key for a map named either way round. Empty when the table
-  ## has no such map -- never a guess.
+  ## The database key for a map named ANY of the three ways the client and the
+  ## database name it. Empty when the table has no such map -- never a guess.
+  ##
+  ## There are three names per map and they are not interchangeable. The
+  ## database key is the SPT directory ("woods"); `base._Id` is the GUID
+  ## `/client/locations` is keyed on ("5704e3c2..."); `base.Id` is what the
+  ## client actually PUTS IN THE REQUEST -- measured from the captured
+  ## `/client/match/local/start` body (raid1/requests/158.json), which names
+  ## the map "Sandbox_start", an `Id`.
+  ##
+  ## This used to try only the first two, case-sensitively. MEASURED against
+  ## db.json: 13 of the 19 maps carry a `base.Id` that differs from their
+  ## database key -- Woods, Shoreline, Interchange, RezervBase, TarkovStreets,
+  ## Lighthouse, Labyrinth, Sandbox, Sandbox_high, Terminal, Town, Suburbs,
+  ## "Private Area" -- so a client asking for the map by the only name it has
+  ## resolved NOTHING and the raid started with an empty loot list. Only
+  ## bigmap, factory4_day, factory4_night, laboratory, develop and hideout
+  ## happened to spell the two the same, which is exactly why this was never
+  ## noticed: Customs and Factory work.
   if id.len == 0:
     return ""
   for name in idx.names:
@@ -278,6 +311,18 @@ proc resolveLocation*(idx: LocationIndex; id: string): string =
   var i = 0
   while i < idx.ids.len:
     if idx.ids[i] == id:
+      return idx.names[i]
+    inc i
+  i = 0
+  while i < idx.gameIds.len:
+    if idx.gameIds[i] == id:
+      return idx.names[i]
+    inc i
+  # Case-insensitive last, so an exact hit is never beaten by a fuzzy one.
+  let want = lowerAscii(id)
+  i = 0
+  while i < idx.names.len:
+    if lowerAscii(idx.names[i]) == want or lowerAscii(idx.gameIds[i]) == want:
       return idx.names[i]
     inc i
   result = ""
@@ -351,6 +396,10 @@ proc liveLocationsBody*(): string =
   ## What `/client/locations` answers with.
   result = locationsBody(liveDb(), liveLocationIndex())
 
+proc post1LocationBase*(id: string): string
+  ## Forward-declared: `canonicalLocation` needs the post-1.0 table to resolve
+  ## a map VARIANT to its parent, and the definition sits below it.
+
 proc canonicalLocation*(id: string): string =
   ## The database key for a map the client named. `id` unchanged when the table
   ## does not have it, because every reader below answers "nothing here" for an
@@ -362,9 +411,41 @@ proc canonicalLocation*(id: string): string =
   let direct = dbRead("locations." & id & ".base")
   if direct.ok and direct.raw.len > 0:
     return id
-  let name = resolveLocation(liveLocationIndex(), id)
+  let idx = liveLocationIndex()
+  let name = resolveLocation(idx, id)
   if name.len > 0:
     return name
+  # Still nothing. The post-1.0 table lists 24 maps where the database has 19,
+  # and the five extra ones are VARIANTS of a map the database does have: each
+  # carries its own `Id` and `_Id` but shares the parent map's `Name`.
+  #
+  #   Sandbox_start   Name=Sandbox     scene maps/sandbox_start_preset.bundle
+  #   Sandbox_high    Name=Sandbox     scene maps/sandbox_high_preset.bundle
+  #   laboratory_dark Name=Laboratory  scene maps/laboratory_dark_preset.bundle
+  #   Lighthouse2     Name=Lighthouse  scene maps/lighthouse_preset.bundle
+  #   Terminal_ui     Name=Terminal    scene maps/terminal_preset.bundle
+  #
+  # So `Name` is the general variant->parent edge, and it is DATA, in a table
+  # the real server sent us -- not a hardcoded string list that would have to
+  # grow by hand every wipe. `Icebreaker` has a `Name` of its own and no
+  # database map, so it resolves to nothing, which is the honest answer.
+  #
+  # That this is the right parent for LOOT purposes is measured, not assumed:
+  # of the 41 static containers BSG serves for `Sandbox_start`
+  # (raid1/responses/158.json), 38 appear VERBATIM in SPT's `sandbox`
+  # staticContainers table. The 3 that do not are `container_ProfileEditor_*`,
+  # which exist only in the tutorial scene.
+  #
+  # It is NOT the right parent for loose loot: zero of BSG's 94 loose entries
+  # for `Sandbox_start` match a `sandbox` spawn point by Id, by position, or
+  # even by base name. See `looseLootFor` below.
+  let variant = post1LocationBase(id)
+  if variant.len > 0:
+    let parent = field(variant, "Name").asText("")
+    if parent.len > 0 and parent != id:
+      let byName = resolveLocation(idx, parent)
+      if byName.len > 0:
+        return byName
   result = id
 
 proc locationBase*(id: string): string =
