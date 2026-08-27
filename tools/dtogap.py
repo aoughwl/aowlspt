@@ -418,18 +418,47 @@ PROV_REFUSAL = (
     + "server, which is the failure this tool exists to avoid." + _NL)
 
 
+# The BSG capture root.  Overridable, and for the same reason oursample.py
+# overrides it: `responses/large/*.json` are not tracked by git, so a fresh
+# worktree has the small bodies and none of the large ones, and the BSG half of
+# any comparison would go silently INCONCLUSIVE there.
+CAPTURE_ROOT = os.environ.get(
+    "AOWL_CAPTURE",
+    os.path.join(REPO, "mods", "tarkov", "data", "capture", "raid1"))
+
+
 def find_capture(route):
-    base = os.path.join(REPO, "mods", "tarkov", "data", "capture", "raid1")
+    """The first captured BSG response for `route`, or None.
+
+    A route whose real URL carries a trailing id (getTraderAssort/<traderId>)
+    never matched here, because the manifest url is compared for EQUALITY.
+    That is not "BSG never served it" -- it is "we looked it up wrong", and the
+    two are indistinguishable in the output, so a PREFIX match is tried after
+    the exact one.  Exact wins: a prefix hit must not shadow a real row.
+    """
+    base = CAPTURE_ROOT
     man = os.path.join(base, "manifest.json")
     if not os.path.exists(man):
         return None
     want = route.rstrip("/")
-    for e in json.load(open(man)):
-        if e.get("url", "").split("?")[0].rstrip("/") != want:
-            continue
+    with open(man, encoding="utf-8") as fh:
+        rows = json.load(fh)
+
+    def body(e):
         for sub in ("", "large"):
             p = os.path.join(base, "responses", sub, e["seq"] + ".json")
             if os.path.exists(p):
+                return p
+        return None
+
+    for exact in (True, False):
+        for e in rows:
+            u = e.get("url", "").split("?")[0].rstrip("/")
+            hit = (u == want) if exact else u.startswith(want + "/")
+            if not hit:
+                continue
+            p = body(e)
+            if p:
                 return p
     return None
 

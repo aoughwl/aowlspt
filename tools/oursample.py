@@ -64,6 +64,21 @@ It is NOT a proven bug. Metadata gives a member's TYPE, not its use. REF members
 is a crash or a hang; VALUE members silently take the CLR default. Whether the
 client actually dereferences a given member needs disassembly of the CONSUMER,
 which nobody has done. The ranking below is "REF first", never "fatal first".
+
+## CANDIDATE HOLE vs CLIENT-TOLERATED, and why the number must converge
+
+A candidate row that has been shown to be absent from BSG'S OWN payload too is
+not a hole in our emulation and must stop being counted as one -- otherwise the
+total never converges and a real regression hides inside a permanent floor.
+Such rows are not dropped: they are moved to a `toler` column and printed in
+full under a CLIENT-TOLERATED heading, with the capture that proves it.
+
+The split is DERIVED every run, by asking dtogap the same question a second
+time against BSG's captured response for the route (`--provenance bsg`) and
+subtracting its DECLARED-BUT-ABSENT-FROM-BSG set. Nothing is written down, so
+nothing can go stale: if a game update makes BSG start sending a member, it
+moves back into the candidate column by itself. "No BSG capture for this route"
+is a third outcome, UNCLASSIFIED -- neither a hole nor tolerance.
 """
 
 import argparse
@@ -394,6 +409,66 @@ def dtogap_rows(route, sample, jpath, dto=None):
     return rows, p.stdout or ""
 
 
+# ---------------------------------------- CLIENT-TOLERATED vs CANDIDATE HOLE
+#
+# A "declared but absent" row was reported as a candidate hole on EVERY run,
+# forever, even after it had been proved that BSG'S OWN SERVER omits the same
+# member.  That is the shape of a number that never converges: the count stays
+# high, nobody can tell a new regression from the permanent floor, and a real
+# hole hides in the noise.
+#
+# The classification is DERIVED, never written down.  For each route we ask
+# dtogap the SAME question a second time against BSG's captured response for
+# that route, with --provenance bsg, and read its DECLARED-BUT-ABSENT-FROM-BSG
+# block.  A member that is absent from BOTH payloads is CLIENT-TOLERATED: the
+# real server does not send it and the client boots and plays anyway.  A member
+# absent only from OURS stays a CANDIDATE HOLE.
+#
+# Three properties this has, and a hardcoded exemption list would not:
+#   * it cannot go stale -- re-run it after a game update and a member BSG has
+#     started sending moves back into the candidate column by itself;
+#   * it can FAIL -- if BSG's capture turns out to carry the key, the row is
+#     NOT reclassified, and nothing here can quietly pass it;
+#   * "no BSG capture for this route" is its own third outcome (UNCLASSIFIED),
+#     printed as such.  It is NOT tolerance, and it is NOT a hole.
+
+
+def bsg_absent(route):
+    """(set-of-member-names, evidence) that BSG's own capture also omits.
+
+    Returns (None, why) when the comparison could not be made -- which is
+    reported as UNCLASSIFIED, never folded into either column.
+    """
+    import dtogap as G
+    cap = G.find_capture(route)
+    if not cap:
+        return None, "no BSG capture for this route in %s" % G.CAPTURE_ROOT
+    cmd = [sys.executable, os.path.join(HERE, "dtogap.py"), route,
+           "--sample", cap, "--provenance", "bsg"]
+    p = subprocess.run(cmd, capture_output=True, text=True,
+                       encoding="utf-8", errors="replace")
+    if p.returncode != 0:
+        return None, "dtogap exited %d on BSG's %s" % (p.returncode,
+                                                       os.path.basename(cap))
+    names, grab, saw = set(), False, False
+    for line in (p.stdout or "").splitlines():
+        t = line.strip()
+        if t.startswith("DECLARED-BUT-ABSENT-FROM-BSG"):
+            grab, saw = True, True
+            continue
+        if grab:
+            if t.startswith("ABSENT"):
+                names.add(t.split()[1])
+                continue
+            grab = False
+    if not saw:
+        return None, ("dtogap printed no DECLARED-BUT-ABSENT-FROM-BSG block "
+                      "for BSG's %s (it went INCONCLUSIVE)"
+                      % os.path.basename(cap))
+    return names, "BSG's own %s omits %d of them" % (os.path.basename(cap),
+                                                     len(names))
+
+
 # ------------------------------------------- the three routes with NO number
 #
 # Three routes used to print INCONCLUSIVE forever, and "no number" was being
@@ -582,19 +657,19 @@ SPECIAL = {
 
 
 def special_row(route, sample):
-    """(decl, ref, val, verdict, detail_lines) for a route with no top-level
-    DTO. Returns None for `decl`/`ref`/`val` only when the measurement itself
+    """(decl, ref, val, tol, verdict, detail_lines) for a route with no
+    top-level DTO. Returns None for `decl`/`ref`/`val` only when the measurement itself
     could not be made -- which prints INCONCLUSIVE with the reason, never a
     silent zero."""
     fn = SPECIAL[route]
     try:
         got, notes = fn(sample)
     except Exception as exc:                      # noqa: BLE001
-        return (None, None, None, "INCONCLUSIVE (measurement raised)",
+        return (None, None, None, None, "INCONCLUSIVE (measurement raised)",
                 ["%s: %r" % (type(exc).__name__, exc)])
     lines = list(notes or [])
     if got is None:
-        return (None, None, None, "INCONCLUSIVE", lines)
+        return (None, None, None, None, "INCONCLUSIVE", lines)
 
     if route == "/client/items":
         rows = got["rows"]
@@ -611,17 +686,21 @@ def special_row(route, sample):
                          % (k, n, ty, c))
         if bm is None:
             verdict = "%d/%d cand (BSG check INCONCLUSIVE)" % (ref, val)
+            return (None, ref, val, None, verdict, lines)
         elif bm:
             verdict = "GAP: BSG sends %d key(s) we omit" % len(bm)
+            return (None, ref, val, None, verdict, lines)
         else:
-            verdict = "no BSG gap; %d/%d declared-absent" % (ref, val)
+            verdict = "no gap; %d client-tolerated" % (ref + val)
             lines.append("    Our `_props` is a strict SUPERSET of BSG's on "
                          "every shared id, so every DECLARED-ABSENT row above "
                          "is necessarily absent from BSG's payload too: they "
                          "are CLIENT-TOLERATED absences, not our holes. That "
                          "follows from the count on the line above being 0; if "
-                         "it is ever non-zero, this sentence does not apply.")
-        return (None, ref, val, verdict, lines)
+                         "it is ever non-zero, this sentence does not apply. "
+                         "They are therefore counted in the `toler` column, "
+                         "not as candidate holes.")
+            return (None, 0, 0, ref + val, verdict, lines)
 
     if route == "/client/account/customization":
         n = got["members"]
@@ -635,10 +714,10 @@ def special_row(route, sample):
                          "route /client/customization, served whole from "
                          "templates.customization."
                          % (got["is_array"], got["len"]))
-            return (0, 0, 0, verdict, lines)
+            return (0, 0, 0, 0, verdict, lines)
         lines.append("the DTO now declares %d member(s); the permanence claim "
                      "no longer holds and this route needs a real diff." % n)
-        return (n, None, None, "RECHECK", lines)
+        return (n, None, None, None, "RECHECK", lines)
 
     if route == "/client/match/local/end":
         if got["same"]:
@@ -650,13 +729,13 @@ def special_row(route, sample):
                          "placeholder, it is what the real server sends."
                          % (got["bsg_err"], got["bsg_data"],
                             got["ours_err"], got["ours_data"]))
-            return (0, 0, 0, verdict, lines)
+            return (0, 0, 0, 0, verdict, lines)
         lines.append("our `data` is %r but BSG's is %r -- the shapes now "
                      "differ, so this is a real divergence."
                      % (got["ours_data"], got["bsg_data"]))
-        return (None, None, None, "DIVERGES FROM BSG", lines)
+        return (None, None, None, None, "DIVERGES FROM BSG", lines)
 
-    return (None, None, None, "INCONCLUSIVE", lines)
+    return (None, None, None, None, "INCONCLUSIVE", lines)
 
 
 def table(manifest, verbose=False):
@@ -666,11 +745,13 @@ def table(manifest, verbose=False):
     print("OUR EMULATION GAPS -- measured against OUR OWN served payloads")
     print("provenance: OURS. %s" % manifest["why"])
     print("=" * 78)
-    print("%-40s %6s %6s %6s  %s"
-          % ("route", "decl", "REF", "VALUE", "verdict"))
+    print("%-40s %5s %5s %5s %5s  %s"
+          % ("route", "decl", "REF", "VALUE", "toler", "verdict"))
     print("-" * 78)
-    totals = {"REF": 0, "VALUE": 0}
+    totals = {"REF": 0, "VALUE": 0, "TOL": 0}
     detail_blocks = []
+    tolerated_blocks = []
+    unclassified = []
     special_blocks = []
     inconclusive = []
     for e in manifest["entries"]:
@@ -679,8 +760,8 @@ def table(manifest, verbose=False):
         dto = ent[0] if ent else None
         if e["verdict"] != SERVED and route not in SPECIAL:
             inconclusive.append((route, e["verdict"], e["detail"]))
-            print("%-40s %6s %6s %6s  INCONCLUSIVE (%s)"
-                  % (route, "-", "-", "-", e["verdict"]))
+            print("%-40s %5s %5s %5s %5s  INCONCLUSIVE (%s)"
+                  % (route, "-", "-", "-", "-", e["verdict"]))
             continue
         if route in SPECIAL:
             # No top-level DTO -- but "no DTO" is not "no measurement". Each of
@@ -688,16 +769,19 @@ def table(manifest, verbose=False):
             # reason; see SPECIAL above.
             sample = os.path.join(manifest["root"],
                                   e["sample"].replace("/", os.sep))
-            decl, ref, val, verdict, lines = special_row(route, sample)
+            decl, ref, val, tol, verdict, lines = special_row(route, sample)
             if ref is not None:
                 totals["REF"] += ref
             if val is not None:
                 totals["VALUE"] += val
-            print("%-40s %6s %6s %6s  %s"
+            if tol is not None:
+                totals["TOL"] += tol
+            print("%-40s %5s %5s %5s %5s  %s"
                   % (route,
                      "-" if decl is None else decl,
                      "-" if ref is None else ref,
-                     "-" if val is None else val, verdict))
+                     "-" if val is None else val,
+                     "-" if tol is None else tol, verdict))
             special_blocks.append((route, verdict, lines))
             if verdict.startswith("INCONCLUSIVE"):
                 inconclusive.append((route, "NO-DTO", verdict))
@@ -705,28 +789,51 @@ def table(manifest, verbose=False):
         if not dto:
             inconclusive.append((route, "NO-DTO",
                                  (ent[2] if ent else "route not in dtogap ROUTES")))
-            print("%-40s %6s %6s %6s  INCONCLUSIVE (no DTO mapped)"
-                  % (route, "-", "-", "-"))
+            print("%-40s %5s %5s %5s %5s  INCONCLUSIVE (no DTO mapped)"
+                  % (route, "-", "-", "-", "-"))
             continue
         sample = os.path.join(manifest["root"], e["sample"].replace("/", os.sep))
         rows, raw = dtogap_rows(route, sample, e["path"])
         if rows is None:
             inconclusive.append((route, "DTOGAP-FAILED", raw.strip()[-200:]))
-            print("%-40s %6s %6s %6s  INCONCLUSIVE (dtogap refused)"
-                  % (route, "-", "-", "-"))
+            print("%-40s %5s %5s %5s %5s  INCONCLUSIVE (dtogap refused)"
+                  % (route, "-", "-", "-", "-"))
             continue
-        ref = sum(1 for _n, k, _l in rows if k == "REF")
-        val = sum(1 for _n, k, _l in rows if k == "VALUE")
+        tol_names, tol_why = bsg_absent(route)
+        if tol_names is None:
+            cand, tol = rows, []
+            # Only worth reporting when there is something to classify: a route
+            # with zero missing rows has no verdict riding on the BSG side.
+            if rows:
+                unclassified.append((route, tol_why))
+        else:
+            cand = [x for x in rows if x[0] not in tol_names]
+            tol = [x for x in rows if x[0] in tol_names]
+        ref = sum(1 for _n, k, _l in cand if k == "REF")
+        val = sum(1 for _n, k, _l in cand if k == "VALUE")
         totals["REF"] += ref
         totals["VALUE"] += val
+        totals["TOL"] += len(tol)
         decl = raw.count("    ok  ") + len(rows)
-        print("%-40s %6d %6d %6d  %s"
-              % (route, decl, ref, val, "gaps" if rows else "no gap"))
-        if rows:
-            detail_blocks.append((route, dto, rows))
+        if tol_names is None:
+            verdict = ("no gap" if not rows
+                       else "%d UNCLASSIFIED (%s)" % (len(rows), tol_why))
+        elif cand:
+            verdict = "gaps"
+        elif tol:
+            verdict = "no gap; %d client-tolerated" % len(tol)
+        else:
+            verdict = "no gap"
+        print("%-40s %5d %5d %5d %5s  %s"
+              % (route, decl, ref, val,
+                 "-" if tol_names is None else len(tol), verdict))
+        if cand:
+            detail_blocks.append((route, dto, cand))
+        if tol:
+            tolerated_blocks.append((route, dto, tol, tol_why))
     print("-" * 78)
-    print("%-40s %6s %6d %6d  CANDIDATE HOLES"
-          % ("TOTAL", "", totals["REF"], totals["VALUE"]))
+    print("%-40s %5s %5d %5d %5d  CANDIDATE HOLES (+tolerated)"
+          % ("TOTAL", "", totals["REF"], totals["VALUE"], totals["TOL"]))
     print("")
     print("A row is: the client declares a serializable member and OUR payload")
     print("carries no key for it. That is a CANDIDATE, not a proven bug --")
@@ -738,6 +845,24 @@ def table(manifest, verbose=False):
         print("%s   DTO=%s" % (route, dto))
         for _n, k, line in sorted(rows, key=lambda r: (r[1] != "REF", r[0])):
             print("  " + line.strip())
+    for route, dto, rows, why in tolerated_blocks:
+        print("")
+        print("%s   %d CLIENT-TOLERATED (not counted above)   DTO=%s"
+              % (route, len(rows), dto))
+        print("  Absent from OUR payload AND from BSG's: %s. The real server"
+              % why)
+        print("  does not send these either, so their absence is what the")
+        print("  client is built to survive -- it is not an emulation hole.")
+        print("  This is re-derived from the capture every run: if BSG's own")
+        print("  payload ever carries one, it moves back above by itself.")
+        for _n, k, line in sorted(rows, key=lambda x: (x[1] != "REF", x[0])):
+            print("  " + line.strip().replace("MISSING", "TOLERATED", 1))
+    if unclassified:
+        print("")
+        print("UNCLASSIFIED -- absent from ours, and we could not ask BSG.")
+        print("This is neither a hole nor tolerance; it is 'we did not look'.")
+        for route, why in unclassified:
+            print("  %-40s %s" % (route, why))
     for route, verdict, lines in special_blocks:
         print("")
         print("%s   %s" % (route, verdict))

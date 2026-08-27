@@ -40,6 +40,10 @@ constant is the failure mode this file exists to avoid.
                a correct server cannot answer it and must go red
     lootloose  demand MORE loose entries than a map has spawn points, which
                no correct server can serve
+    tolerated  require BSG's own captured payloads to carry `SeasonsSettings`
+               and `exchange_rate`.  They do not -- that is the whole basis of
+               the CORRECT-AS-IS verdict on those two members -- so a correct
+               server plus a correct capture must go red
 """
 
 import argparse
@@ -52,6 +56,7 @@ import zlib
 
 OK, FAIL, INCONC = "PASS", "FAIL", "INCONCLUSIVE"
 JAEGER = "5c0647fdd443bc2504c2d371"
+PRAPOR = "54cb50c76803fa8b248b4571"
 
 # Members of the client's `EFT.ProfileDescriptor` that `/client/game/profile/list`
 # must carry, with the wire name the [JsonProperty] attribute gives them.
@@ -212,6 +217,76 @@ def read_back(w, session):
             return None, ("the profile list has PMCs but none with _id %s "
                           "-- refusing to read someone else's" % session)
     return None, "no PMC in the profile list"
+
+
+
+# ---------------------------------------------------------------------------
+# 12. the two members we deliberately do NOT send, and the keys we do
+#
+# `JsonType.WeatherResponse.SeasonsSettings` (REF) and
+# `EFT.TraderAssortment.ExchangeRate -> exchange_rate` (VALUE) are declared by
+# the client and absent from our payload.  They are also absent from BSG'S OWN
+# captured payloads -- every /client/weather body and every getTraderAssort
+# body in raid1 -- so serving them would be inventing wire shape, not closing a
+# hole.
+#
+# The check therefore asserts a property of the FINISHED STATE, in both
+# directions, and neither half is a comparison against our own output:
+#   (a) BSG's capture really does omit both.  Re-read from the capture every
+#       run, so the verdict expires if the capture is ever replaced by one that
+#       carries them.  `--mutate tolerated` inverts this requirement, and a
+#       correct capture must then FAIL.
+#   (b) our served payload is a SUPERSET of BSG's key set on both routes -- the
+#       regression this pair could otherwise hide, which is us dropping a key
+#       BSG does send while everyone stares at the two it does not.
+# "Could not read the capture" and "the route did not answer" are INCONCLUSIVE.
+
+TOLERATED = [
+    ("/client/weather", "SeasonsSettings", None),
+    ("/client/trading/api/getTraderAssort", "exchange_rate", PRAPOR),
+]
+
+
+def check_tolerated(w, mut):
+    import dtogap as _g
+    missing, superset, notes = [], [], []
+    for route, key, trader in TOLERATED:
+        cap = _g.find_capture(route)
+        if not cap:
+            record("tolerated", INCONC,
+                   "no BSG capture for %s under %s" % (route, _g.CAPTURE_ROOT))
+            return
+        with open(cap, encoding="utf-8") as fh:
+            bsg = json.load(fh)
+        bsg_data = bsg.get("data")
+        if not isinstance(bsg_data, dict):
+            record("tolerated", INCONC,
+                   "BSG capture %s has no object at `data`" % os.path.basename(cap))
+            return
+        want_present = (mut == "tolerated")
+        if (key in bsg_data) != want_present:
+            missing.append("BSG's %s %s carry %r"
+                           % (os.path.basename(cap),
+                              "does not" if want_present else "DOES", key))
+        url = route if trader is None else route + "/" + trader
+        st, doc, text = w.call(url, {})
+        if doc is None or not isinstance(doc.get("data"), dict):
+            record("tolerated", INCONC,
+                   "%s did not answer a JSON object at `data` (status %s): %r"
+                   % (url, st, text[:100]))
+            return
+        lost = sorted(set(bsg_data) - set(doc["data"]))
+        if lost:
+            superset.append("%s omits %d key(s) BSG sends: %s"
+                            % (url, len(lost), ", ".join(lost)))
+        notes.append("%s: %d BSG key(s), all served; %r correctly absent from both"
+                     % (route, len(bsg_data), key))
+    if missing:
+        record("tolerated", FAIL, "; ".join(missing))
+    elif superset:
+        record("tolerated", FAIL, "; ".join(superset))
+    else:
+        record("tolerated", OK, "; ".join(notes))
 
 
 def main():
@@ -809,6 +884,13 @@ def main():
                    % "; ".join("%s served %d loose entr(ies) from %d forced + "
                                "%d probabilistic spawn point(s)"
                                % (l, n, f, p) for l, n, f, p in checked))
+
+    # ------------------------------------------------------------------ 12
+    sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+    try:
+        check_tolerated(w, mut)
+    except Exception as exc:                       # noqa: BLE001
+        record("tolerated", INCONC, "%s: %r" % (type(exc).__name__, exc))
 
     print()
     bad = [r for r in results if r[1] != OK]
