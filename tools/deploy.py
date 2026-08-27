@@ -495,10 +495,41 @@ def cmd_check(args, cfg, C, check_data=True):
     red, green, yellow, dim, reset = C
     install = args.install or cfg["install"]
     arts = select(cfg, args.only)
+    override = getattr(args, "artifact", None)
+    if override:
+        # Verify a build that has NOT been deployed. Every agent has
+        # hand-rolled this with PowerShell ReadAllBytes + .Contains, which
+        # has returned FALSE NEGATIVES five separate times (facts #151,
+        # #152) -- reporting 4 of 4 markers absent from a build `strings -a`
+        # and this tool both confirm as correct. Use this instead.
+        override = os.path.abspath(override)
+        if not os.path.isfile(override):
+            sys.exit("--artifact: no such file: %s" % override)
+        if len(arts) != 1:
+            base = os.path.basename(override).lower()
+            cand = [a for a in arts
+                    if os.path.basename(a["src"]).lower() == base]
+            if len(cand) != 1:
+                sys.exit(
+                    "--artifact needs to know WHICH marker set to apply.\n"
+                    "%s by basename, so pass --only NAME.\n"
+                    "Known: %s"
+                    % ("%d artifacts match %r" % (len(cand), base) if cand
+                       else "No artifact matches %r" % base,
+                       ", ".join(a["name"] for a in arts)))
+            arts = cand
+        # An undeployed file has no install beside it; the data check would
+        # compare against whatever is live and report a mismatch that says
+        # nothing about this file.
+        check_data = False
+        print("%s--artifact%s verifying %s against marker set %r "
+              "(install-side data check NOT performed)"
+              % (dim, reset, override, arts[0]["name"]))
     bad = 0
     unknown = 0
     for art in arts:
-        src = os.path.join(REPO, art["src"].replace("/", os.sep))
+        src = (override if override
+               else os.path.join(REPO, art["src"].replace("/", os.sep)))
         verdict, problems = verify(art, src, C)
         if verdict == OK and check_data:
             dverdict, dproblems = verify_data(art, install, C)
@@ -514,7 +545,8 @@ def cmd_check(args, cfg, C, check_data=True):
             if ne:
                 extra = ", %d export%s%s" % (ne, "" if ne == 1 else "s", extra)
             print("%sok%s   %-8s %s  (%d marker%s%s, %s bytes)"
-                  % (green, reset, art["name"], art["src"], n,
+                  % (green, reset, art["name"],
+                     override if override else art["src"], n,
                      "" if n == 1 else "s", extra, os.path.getsize(src)))
             continue
         if verdict == INCONCLUSIVE:
@@ -749,6 +781,12 @@ def main():
     p.add_argument("--only", default=None,
                    help="comma-separated artifact names (host,tarkov,backend,launch)")
     p.add_argument("--install", default=None, help="override the install directory")
+    p.add_argument("--artifact", default=None, metavar="PATH",
+                   help="check THIS file instead of the artifact's usual "
+                        "src (for an undeployed build in a worktree, a "
+                        "staging dir, or a downloaded binary). `check` only. "
+                        "Skips the install-side data check, which does not "
+                        "apply to a file that has not been deployed.")
     p.add_argument("--dry-run", action="store_true")
     p.add_argument("--no-color", action="store_true")
     args = p.parse_args()
@@ -757,6 +795,9 @@ def main():
 
     C = _color(not args.no_color and sys.stdout.isatty())
     cfg = load_config()
+    if args.artifact and args.command != "check":
+        sys.exit("--artifact is only meaningful with `check`: it verifies a "
+                 "file in place and never copies anything.")
     if args.command == "check":
         return cmd_check(args, cfg, C)
     if args.command == "deploy":

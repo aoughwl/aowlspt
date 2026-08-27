@@ -13,7 +13,10 @@ what the feature asks for ("still show them but mark them clearly not
 implemented yet"). Flip entries in IMPLEMENTED below as aowlspt grows a backing
 feature for one.
 """
-import json, os, re
+import json, os, re, sys
+
+sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import repowrite  # noqa: E402
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 SURFACE = os.path.join(HERE, "..", "reference", "spt-4.1-surface.json")
@@ -148,8 +151,16 @@ def main():
         "nestedCount": n_nested,
         "pages": pages,
     }
-    with open(OUT, "w", encoding="utf-8") as f:
-        json.dump(doc, f, indent=2)
+    # Text-mode "w" translates every newline to os.linesep, so this file's
+    # endings depended on which OS ran the tool -- and a run that flipped a
+    # CRLF tree to LF once turned a 100-line patch into a 21,000-line diff.
+    # repowrite preserves what the file already has. (.gitattributes says
+    # `* -text` deliberately; do not "fix" this there.)
+    # No trailing newline: the tracked file does not have one, and adding it
+    # would put a spurious hunk in every regenerate.
+    nl = repowrite.write_text(OUT, json.dumps(doc, indent=2))
+    print("line endings preserved: %s"
+          % ("CRLF" if nl == "\r\n" else "LF"))
     print("wrote", OUT)
     print("config files (pages):", len(pages))
     print("scalar settings:", n_settings)

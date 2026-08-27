@@ -758,17 +758,46 @@ class Resolver:
         return rows
 
     def find_one(self, name):
-        """Exact full-name match, else unique substring match; else exit."""
+        """Resolve a type name EXACTLY -- full name, or unique short name.
+
+        It used to fall back to "the only substring match", which is how
+        `fields EFT.CharacterController` silently answered for
+        `EFT.CharacterControllerFootprint` (fact #179). A near-miss type
+        yields offsets that are structurally plausible, pass a nil check,
+        and kill the client on first use. There is no safe way to guess
+        which type the caller meant, so this never guesses: it refuses and
+        prints the substring matches as CANDIDATES.
+        """
         hits = list(self.find(name))
-        exact = [(t, f) for t, f in hits if f == name or f.split(".")[-1] == name]
-        if len(exact) == 1:
-            return exact[0][0]
-        if len(hits) == 1:
-            return hits[0][0]
+        full_exact = [t for t, f in hits if f == name]
+        if len(full_exact) == 1:
+            return full_exact[0]
+        if len(full_exact) > 1:
+            sys.exit("AMBIGUOUS: %d types have the exact full name %r "
+                     "(indices %s) -- refusing to pick one."
+                     % (len(full_exact), name,
+                        ", ".join(str(t) for t in full_exact)))
+        short_exact = [(t, f) for t, f in hits if f.split(".")[-1] == name]
+        if len(short_exact) == 1:
+            return short_exact[0][0]
+        if len(short_exact) > 1:
+            sys.exit("AMBIGUOUS short name %r -- %d types match exactly; "
+                     "pass the full name:%s"
+                     % (name, len(short_exact),
+                        "".join("\n  " + f for _, f in short_exact[:20])))
         if not hits:
-            sys.exit("no type matches %r" % name)
-        sys.exit("ambiguous %r matches: %s" %
-                 (name, ", ".join(f for _, f in hits[:12])))
+            sys.exit("NO SUCH TYPE: %r. No type name even CONTAINS that "
+                     "string (searched all %d types exhaustively)."
+                     % (name, self.NTYPES))
+        sys.exit("NO SUCH TYPE: %r -- no type has that exact name.\n"
+                 "Refusing to substitute a near-miss: an offset read from the "
+                 "wrong type passes a nil check and kills the client.\n"
+                 "%d name(s) CONTAIN it; if you meant one, name it exactly:"
+                 "%s%s"
+                 % (name, len(hits),
+                    "".join("\n  " + f for _, f in hits[:20]),
+                    ("\n  ... and %d more" % (len(hits) - 20))
+                    if len(hits) > 20 else ""))
 
 
 # Ground truth for the constant decoder, known independently of this build:
@@ -850,8 +879,32 @@ def main():
     R = Resolver(sys.argv[1], sys.argv[2])
     cmd = sys.argv[3]
     if cmd == "find":
-        for t, full in R.find(sys.argv[4]):
+        needle = sys.argv[4]
+        n = 0
+        for t, full in R.find(needle):
             print(t, full, " image=", R.image_of_type(t))
+            n += 1
+        # An empty stdout with exit 0 is indistinguishable from "not found",
+        # and two agents read it as "the tool broke". Always say which.
+        if n == 0:
+            if "::" in needle:
+                ty, _, meth = needle.partition("::")
+                print("NO TYPE NAME CONTAINS %r (searched all %d types "
+                      "EXHAUSTIVELY)." % (needle, R.NTYPES))
+                print("`find` matches TYPE names ONLY -- %r looks like a "
+                      "Type::Method spec." % needle)
+                print("Try instead:")
+                print("  ... methods %s          # search by METHOD name"
+                      % (meth or "<name>"))
+                print("  ... type %s             # every method on that type"
+                      % (ty or "<Type>"))
+                sys.exit(1)
+            print("NO TYPE NAME CONTAINS %r (searched all %d types "
+                  "EXHAUSTIVELY). This is a genuine zero-hit answer, not an "
+                  "error." % (needle, R.NTYPES))
+            sys.exit(1)
+        print("-- %d type name(s) contain %r (searched all %d EXHAUSTIVELY)"
+              % (n, needle, R.NTYPES))
     elif cmd == "methods":
         # `find` searches TYPE names only; this searches METHOD names, which is
         # what you want when you know a call site's name (LocalRaidEnded) but
@@ -903,7 +956,18 @@ def main():
         args = [a for a in sys.argv[4:] if not a.startswith("--")]
         want_shared = "--shared" in sys.argv[4:]
         shared = R.shared_rva_counts() if want_shared else {}
-        for t in map(int, args):
+        # `type` used to take a numeric index ONLY -- an index that only
+        # `find` produces -- while fldoff.py's `fields` took a name. The two
+        # CLIs disagreeing is a papercut that pushed agents into hand-rolling.
+        # A NAME goes through find_one, so it gets the same exact-match
+        # refusal (never a near-miss) as `fields`.
+        idxs = []
+        for a in args:
+            try:
+                idxs.append(int(a, 0))
+            except ValueError:
+                idxs.append(R.find_one(a))
+        for t in idxs:
             full, img, ms = R.resolve_type(t)
             print("TYPE", t, full, "image=", img)
             for (nm, rid, va), mi in zip(ms, R.type_methods(t)):
