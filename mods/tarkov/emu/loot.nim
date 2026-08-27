@@ -73,6 +73,7 @@
 ##   distribution is flatter.
 
 import std/strutils
+import std/syncio
 import aowlspt
 import aowlspt/server
 import aowlspt/json
@@ -988,12 +989,67 @@ proc looseSpawn(d: LootDb; p: PresetIndex; a: AmmoTable; r: var Rng;
   budget = budget - sink.items.len
   result = lootEntry(raw(tmpl), newRoot, itemsArray(sink))
 
+proc parentDirOf(p: string): string =
+  var i = p.len - 1
+  while i >= 0 and p[i] != '/' and p[i] != '\\': dec i
+  if i <= 0: return ""
+  result = p.substr(0, i - 1)
+
+proc looseSidecarDir*(): string =
+  ## Where a map's `looseLoot` table lives when it is NOT in `db.json`.
+  ##
+  ## The whole of SPT's loose loot is 548 MiB minified -- lighthouse alone is
+  ## 126 MiB -- so importing it turns a 39 MiB database into a 587 MiB one that
+  ## the backend parses at every boot and holds resident for the life of the
+  ## process, to read one map of it per raid. It ships as one file per map
+  ## instead, read at raid start and dropped when the raid's loot is built.
+  ##
+  ## The default is `<install root>/looseloot`, derived the same way
+  ## `capability` derives the registry: `modDir()` is `<root>/mods/<mod>`, so
+  ## two steps up is the directory the backend loaded `db.json` from. A
+  ## `looseLootDir` setting overrides it, because `--db` can point the backend
+  ## at a database somewhere else entirely.
+  result = setting("looseLootDir").asText("")
+  if result.len > 0:
+    return
+  let md = modDir()
+  if md.len == 0:
+    return ""
+  let mods = parentDirOf(md)
+  if mods.len == 0:
+    return ""
+  let root = parentDirOf(mods)
+  if root.len == 0:
+    return ""
+  result = root & "/looseloot"
+
+proc readSidecar(locationId: string): string =
+  ## One map's sidecar, or the empty string. Absent is not an error: a database
+  ## imported with `--loose none` and no sidecars is a supported install, and
+  ## it is the one that has shipped until now.
+  result = ""
+  let dir = looseSidecarDir()
+  if dir.len == 0:
+    return ""
+  let path = dir & "/" & locationId & ".json"
+  try:
+    result = readFile(path)
+  except:
+    result = ""
+  if result.len >= 3 and ord(result[0]) == 0xEF and ord(result[1]) == 0xBB and
+     ord(result[2]) == 0xBF:
+    result = result.substr(3, result.len - 1)
+
 proc looseLoot(d: LootDb; p: PresetIndex; a: AmmoTable; r: var Rng;
                cfg: LootConfig;
                locationId: string; chanceMul: float;
                budget: var int): seq[string] =
   result = @[]
-  let root = sub(d, "locations." & locationId & ".looseLoot")
+  # In the database first -- that is what the fixture and `--loose all` use, and
+  # a sidecar must never shadow a table the operator deliberately imported.
+  var root = sub(d, "locations." & locationId & ".looseLoot")
+  if root.len == 0:
+    root = readSidecar(locationId)
   if root.len == 0:
     return
   let rootRef = whole(root)

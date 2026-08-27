@@ -70,8 +70,14 @@ importdb -- build the emulator's db.json from an SPT installation
                      traders hideout locations bots
   --skip LIST      sections to leave out of the default set
   --maps LIST      which locations to import (default: all)
-  --loose LIST     maps whose looseLoot to include: none (default), all, or a
-                   comma-separated list of map names. 42 MB for one map.
+  --loose LIST     maps whose looseLoot to EMBED in db.json: none (default),
+                   all, or a comma-separated list of map names. 42 MB for one
+                   map, 548 MiB for all thirteen -- see --loose sidecar.
+  --loose sidecar  write each map's looseLoot to <outdir>\looseloot\<map>.json
+                   instead of embedding it. The backend reads one of these at
+                   raid start and drops it again, so the resident cost is one
+                   map for the length of one loot build rather than all
+                   thirteen for the life of the process.
   --locales LIST   languages to import (default: en). "all" for every one,
                    +46 MiB. Include en whatever else you ask for: three
                    modules fall back to locales.global.en by name.
@@ -1155,11 +1161,18 @@ proc main(): int =
     excl(want, s)
 
   var looseAll = false
+  var looseSidecar = false
   var looseMaps: seq[string] = @[]
   if looseSpec == "all":
     looseAll = true
+  elif looseSpec == "sidecar":
+    looseSidecar = true
   elif looseSpec != "none" and looseSpec.len > 0:
     looseMaps = splitList(looseSpec)
+  let looseDir = joinPath(outDir, "looseloot")
+  if looseSidecar and not ensureDir(looseDir).ok:
+    err "could not create " & looseDir
+    return 1
 
   # ------------------------------------------------------------------ build
   heading "Converting"
@@ -1480,6 +1493,8 @@ proc main(): int =
     var lof = true
     var count = 0
     var looseBytes = 0
+    var sidecarBytes = 0
+    var sidecarCount = 0
     for name in dirs:
       if maps.len > 0:
         var wanted = false
@@ -1507,12 +1522,26 @@ proc main(): int =
       var takeLoose = looseAll
       for m in looseMaps:
         if m == name: takeLoose = true
+      let looseSrc = joinPath(db, "locations\\" & name & "\\looseLoot.json")
       if takeLoose:
-        let text = loadJson(
-          joinPath(db, "locations\\" & name & "\\looseLoot.json"), pretty)
+        let text = loadJson(looseSrc, pretty)
         if text.len > 0:
           addMember(o, mfirst, "looseLoot", text)
           looseBytes = looseBytes + text.len
+      elif looseSidecar and exists(looseSrc):
+        # Copied, not loaded and re-emitted: SPT already ships these
+        # minified (42 MB of bigmap is 42 MB either way), so a
+        # load/minify/write pass would hold 126 MiB of lighthouse in
+        # memory to produce the bytes it started with. Named by the
+        # DATABASE KEY, which is what `emu/raid.resolveLocation` hands
+        # `lootFor`.
+        let dst = joinPath(looseDir, name & ".json")
+        if copyFileAt(looseSrc, dst).ok:
+          sidecarBytes = sidecarBytes + int(fileSizeOf(dst))
+          inc sidecarCount
+        else:
+          err "could not copy " & looseSrc & " -> " & dst
+          gFailures = gFailures + 1
       o.add "}"
       gLocationIds.add name
       inc count
@@ -1520,6 +1549,9 @@ proc main(): int =
     line "  locations       " & $count & " maps" &
          (if looseBytes > 0: ", " & mib(looseBytes) & " of loose loot"
           else: ", no loose loot")
+    if looseSidecar:
+      line "  loose sidecars  " & $sidecarCount & " maps, " &
+           mib(sidecarBytes) & " -> " & looseDir
 
   # --- bots ---------------------------------------------------------------
   if contains(want, "bots"):

@@ -41,8 +41,9 @@ constant is the failure mode this file exists to avoid.
                It is in the post-1.0 location table the real server sent us
                but has no database entry and no parent map to inherit one, so
                a correct server cannot answer it and must go red
-    lootloose  demand MORE loose entries than a map has spawn points, which
-               no correct server can serve
+    lootloose  raise every map's floor by its whole probabilistic spawn
+               point count, so a correct server -- which rolls each point
+               against its own probability -- must go red
     tolerated  require BSG's own captured payloads to carry `SeasonsSettings`
                and `exchange_rate`.  They do not -- that is the whole basis of
                the CORRECT-AS-IS verdict on those two members -- so a correct
@@ -313,6 +314,9 @@ def main():
     ap.add_argument("--port", type=int, default=7788)
     ap.add_argument("--spt", default="D:\\SPT")
     ap.add_argument("--mutate", default="")
+    ap.add_argument("--loose-dir", default="",
+                    help="where the backend reads per-map looseLoot "
+                         "sidecars from (default <repo>/build/db/looseloot)")
     a = ap.parse_args()
     w = Wire(a.port)
     mut = a.mutate
@@ -322,8 +326,16 @@ def main():
     std_profile = None
 
     # ---------------------------------------------------------------- 1 + 2
-    spt_root = a.spt   # `a` is shadowed further down; keep the path here.
-    std_char, std_trader = spt_template(a.spt, "Standard", "usec")
+    # `a` is the argparse namespace for the whole of main(). Two loops below
+    # used to rebind it -- one comprehension variable, one assort body -- so
+    # every later `a.spt` / `a.port` died with AttributeError, and the
+    # workaround was this local. They are `ar` and `assort` now; `spt_root`
+    # stays because it reads better than `a.spt` at seven call sites.
+    spt_root = a.spt
+    loose_dir = a.loose_dir or os.path.join(
+        os.path.dirname(os.path.dirname(os.path.abspath(__file__))),
+        "build", "db", "looseloot")
+    std_char, std_trader = spt_template(spt_root, "Standard", "usec")
     eod_char, _ = spt_template(a.spt, "Edge Of Darkness", "usec")
     want_std = len(std_char["Inventory"]["items"])
     want_eod = len(eod_char["Inventory"]["items"])
@@ -607,11 +619,11 @@ def main():
     elif std_profile is None:
         record("hideout-areas", INCONC, "no fresh profile to compare against")
     else:
-        want = set(a["type"] for a in served
-                   if a.get("enabled") and "type" in a)
-        got = set(a["type"] for a in
+        want = set(ar["type"] for ar in served
+                   if ar.get("enabled") and "type" in ar)
+        got = set(ar["type"] for ar in
                   std_profile.get("Hideout", {}).get("Areas", [])
-                  if "type" in a)
+                  if "type" in ar)
         if mut == "hideout":
             got.discard(21)   # what the old 27-entry constant produced
         absent = sorted(want - got)
@@ -653,15 +665,15 @@ def main():
             tid = b.get("_id")
             _, d3, _ = w.call("/client/trading/api/getTraderAssort/" + tid,
                               {}, std_session)
-            a = envelope(d3) if d3 else None
-            if not isinstance(a, dict):
+            assort = envelope(d3) if d3 else None
+            if not isinstance(assort, dict):
                 continue
             checked += 1
-            its = a.get("items") or []
+            its = assort.get("items") or []
             if tid == FENCE:
                 fence_items = len(its)
-                scheme = a.get("barter_scheme") or {}
-                lvl = a.get("loyal_level_items") or {}
+                scheme = assort.get("barter_scheme") or {}
+                lvl = assort.get("loyal_level_items") or {}
                 if mut == "fence":
                     fence_items = 0
                 # No Fence offer may lack a price or a loyalty entry -- a
@@ -906,7 +918,7 @@ def main():
         if not os.path.isdir(locdir):
             locdir = os.path.join(spt_root, "SPT_Data", "database", "locations")
         by_dir = dict((i.lower(), i) for i in CLIENT_LOCATION_IDS)
-        checked, silent, unimported = [], [], []
+        rows, silent, absent, unread = [], [], [], []
         for d in (sorted(os.listdir(locdir)) if os.path.isdir(locdir) else []):
             loc = by_dir.get(d.lower())
             src = os.path.join(locdir, d, "looseLoot.json")
@@ -914,39 +926,102 @@ def main():
                 continue
             loot, _ = _start(loc)
             if loot is None:
+                unread.append(loc)
                 continue
-            loose = [e for e in loot if not e.get("IsContainer")]
-            if not loose:
-                unimported.append(loc)
+            loose = len([e for e in loot if not e.get("IsContainer")])
+            # THE SERVER's copy of the table, not SPT's.  A map the operator
+            # did not import serves zero loose entries CORRECTLY, and calling
+            # that a pass is the failure this file exists to avoid -- so it is
+            # INCONCLUSIVE and named.  Presence is tested as the per-map
+            # sidecar `--loose-dir` ships; a table EMBEDDED in db.json with
+            # `--loose all` is not detected here, which is stated rather than
+            # hidden: such a map that served zero would be reported
+            # INCONCLUSIVE when it is really a FAIL.
+            have = os.path.isfile(os.path.join(loose_dir, d + ".json"))
+            if loose == 0 and not have:
+                absent.append(loc)
                 continue
             # Only now is the (large) source file worth parsing.
             with open(src, encoding="utf-8") as fh:
                 tbl = json.load(fh)
             forced = len(tbl.get("spawnpointsForced") or [])
             points = tbl.get("spawnpoints") or []
-            floor = forced + len(points) if mut == "lootloose" else forced
-            checked.append((loc, len(loose), forced, len(points)))
-            if len(loose) <= floor:
+            npts = len(points)
+            psum = sum(float(sp.get("probability") or 0.0) for sp in points)
+            mul = 1.0
+            bp = os.path.join(locdir, d, "base.json")
+            if os.path.isfile(bp):
+                with open(bp, encoding="utf-8") as fh:
+                    mul = float(json.load(fh).get(
+                        "GlobalLootChanceModifier", 1.0) or 1.0)
+            # Each point is rolled INDEPENDENTLY against its own probability,
+            # so the served count is forced + a sum of len(points) Bernoullis.
+            # Its standard deviation is sqrt(Sigma p(1-p)) after the modifier,
+            # and that -- not a flat percentage -- is what "far from the
+            # prediction" has to mean: 20% is 6 sigma on TarkovStreets and
+            # under 1 sigma on Labyrinth, so a flat band both misses real bugs
+            # on big maps and cries wolf on small ones.
+            qs = [min(1.0, max(0.0, float(sp.get("probability") or 0.0) * mul))
+                  for sp in points]
+            expect = forced + sum(qs)
+            sigma = sum(q * (1.0 - q) for q in qs) ** 0.5
+            del tbl, points, qs
+            rows.append((loc, loose, forced, expect, sigma, psum))
+            floor = forced + npts if mut == "lootloose" else forced
+            if loose <= floor:
                 silent.append("%s: %d loose served, needed more than %d "
-                              "(%d forced + %d probabilistic spawn point(s) "
-                              "in the database)"
-                              % (loc, len(loose), floor, forced, len(points)))
-        if not checked:
+                              "(%d forced, %.1f probabilistic expected of "
+                              "%d point(s))"
+                              % (loc, loose, floor, forced,
+                                 expect - forced, npts))
+        print()
+        print("  %-16s %8s %8s %9s %7s %7s" %
+              ("map", "served", "forced", "expect", "sigma", "z"))
+        for loc, n, f, expect, sigma, psum in rows:
+            print("  %-16s %8d %8d %9.1f %7.1f %7s"
+                  % (loc, n, f, expect, sigma,
+                     "-" if sigma <= 0 else "%+.1f" % ((n - expect) / sigma)))
+        for loc in absent:
+            print("  %-16s %8s   (no table on the server)" % (loc, "-"))
+        # 4 sigma.  One-sided tail probability under 1 in 30,000 per map, so
+        # 13 maps false-alarm about once in 2,300 runs -- and a systematic
+        # defect (a whole class of point never firing) is tens of sigma, not
+        # four.  MEASURED: with the composedKey bug reverted every map sat at
+        # its forced count, which is -13 to -40 sigma.
+        skewed = ["%s: %d served, expected %.0f +- %.1f (%+.1f sigma)"
+                  % (loc, n, expect, sigma, (n - expect) / sigma)
+                  for loc, n, f, expect, sigma, psum in rows
+                  if sigma > 0 and abs(n - expect) > 4.0 * sigma]
+        if unread:
             record("lootloose", INCONC,
-                   "no map served any loose loot, so nothing was proved: "
-                   "`looseLoot` is not imported into this db.json for %s "
-                   "(tools/importdb.nim --loose)"
-                   % (", ".join(unimported) or "any map"))
+                   "%d id(s) gave no locationLoot.Loot at all: %s"
+                   % (len(unread), ", ".join(unread)))
+        elif not rows:
+            record("lootloose", INCONC,
+                   "no imported map served any loose loot; no looseLoot table "
+                   "is on the server for %s (aowl importdb --loose sidecar)"
+                   % (", ".join(absent) or "any map"))
         elif silent:
             record("lootloose", FAIL,
                    "%d map(s) served ONLY their forced loose spawns: %s"
                    % (len(silent), "; ".join(silent)))
+        elif skewed:
+            record("lootloose", FAIL,
+                   "%d map(s) served a loose count more than 4 sigma from "
+                   "forced + Sigma(probability x GlobalLootChanceModifier): %s"
+                   % (len(skewed), "; ".join(skewed)))
+        elif absent:
+            record("lootloose", INCONC,
+                   "%d of %d map(s) verified (%s); no table on the server for "
+                   "%s, so nothing was proved about them"
+                   % (len(rows), len(rows) + len(absent),
+                      ", ".join(r[0] for r in rows), ", ".join(absent)))
         else:
             record("lootloose", OK,
-                   "%s"
-                   % "; ".join("%s served %d loose entr(ies) from %d forced + "
-                               "%d probabilistic spawn point(s)"
-                               % (l, n, f, p) for l, n, f, p in checked))
+                   "all %d imported map(s) served a loose count within 4 "
+                   "sigma of forced + Sigma(probability x "
+                   "GlobalLootChanceModifier)"
+                   % len(rows))
 
     # ------------------------------------------------------------------ 12
     sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
