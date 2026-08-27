@@ -30,9 +30,30 @@ index at all; calling that FAIL says "the feature was dropped" about a thing
 nobody looked at, and the measured consequence is that subagents stop
 trusting this tool and hand-scan binaries instead. So:
 
-    ok            built, and every marker is present
-    FAIL          built, and a marker is MISSING -- the feature was dropped
-    INCONCLUSIVE  not built, and a declared required input is absent
+    ok            built, every marker is present, every declared PE export
+                  is in the export table
+    FAIL          built, and a marker or a required export is MISSING -- the
+                  feature was dropped, or is unreachable by name
+    INCONCLUSIVE  not built (nothing was verified), or the export table could
+                  not be read
+
+EXPORTS ARE NOT MARKERS
+-----------------------
+A marker asserts a string is somewhere in the binary, and the compiler puts
+that string there whether or not anything can reach the function at runtime.
+Measured 2026-08-27: the shipped host DLL had 16 PE exports, all
+`aowl_region_*_x`, and ZERO `aowl_host_*` -- while `aowl_host_gameworld`'s
+code and name were both in the file. Nim's `{.exportc.}` emits a C symbol,
+not a PE export. `GetProcAddress` returned NULL and mods/admin, mods/sain and
+mods/morebots refused, correctly and silently, for an unknown length of time.
+Markers could not have caught it. So an artifact may declare:
+
+    "exports": ["aowl_host_gameworld", "aowl_region_fill_x", ...]
+
+and every name is looked up in the real export directory. The list is the
+names MODS RESOLVE BY NAME (grep the mod sources for GetProcAddress), never a
+transcript of what the DLL happens to export today -- transcribing would
+enshrine exactly the absence this check exists to find.
 
 An artifact declares its input with `"requiresInput"` in `deploy.json`:
 
@@ -322,6 +343,75 @@ def data_count(art):
     return n
 
 
+def pe_exports(path):
+    """Names in a PE image's export directory. Returns (names, note).
+
+    A marker asserts a STRING IS IN THE FILE, which the compiler puts there
+    whether or not the function is reachable by name. Measured 2026-08-27:
+    the shipped host DLL contained `aowl_host_gameworld`'s code AND its name
+    as text, and had ZERO `aowl_host_*` PE exports -- Nim's `{.exportc.}`
+    emits a C symbol, not an export. `GetProcAddress` returned NULL and three
+    mods logged an honest refusal for an unknown length of time. So this
+    reads the export table itself; nothing else can tell the two apart.
+
+    `note` is non-None when the table could not be READ (not a PE, no export
+    directory, truncated) -- the caller must treat that as INCONCLUSIVE, not
+    as "no exports".
+    """
+    import struct
+    with open(path, "rb") as f:
+        b = f.read()
+    if len(b) < 0x40 or b[:2] != b"MZ":
+        return None, "not a PE image (no MZ)"
+    e_lfanew = struct.unpack_from("<I", b, 0x3C)[0]
+    if e_lfanew + 24 > len(b) or b[e_lfanew:e_lfanew + 4] != b"PE\0\0":
+        return None, "not a PE image (no PE signature)"
+    coff = e_lfanew + 4
+    nsec, opt_size = struct.unpack_from("<H", b, coff + 2)[0],         struct.unpack_from("<H", b, coff + 16)[0]
+    opt = coff + 20
+    magic = struct.unpack_from("<H", b, opt)[0]
+    if magic == 0x20B:      # PE32+
+        dirs = opt + 112
+    elif magic == 0x10B:    # PE32
+        dirs = opt + 96
+    else:
+        return None, "unknown optional-header magic 0x%X" % magic
+    exp_rva, exp_size = struct.unpack_from("<II", b, dirs)
+    sects = []
+    sh = opt + opt_size
+    for i in range(nsec):
+        o = sh + i * 40
+        vsize, vaddr, rsize, raddr = struct.unpack_from("<IIII", b, o + 8)
+        sects.append((vaddr, max(vsize, rsize), raddr))
+
+    def off(rva):
+        for vaddr, vsize, raddr in sects:
+            if vaddr <= rva < vaddr + vsize:
+                return raddr + (rva - vaddr)
+        return None
+
+    if not exp_rva or not exp_size:
+        return [], None   # a valid PE that simply exports nothing
+    d = off(exp_rva)
+    if d is None or d + 40 > len(b):
+        return None, "export directory RVA 0x%X is not in any section" % exp_rva
+    nnames = struct.unpack_from("<I", b, d + 24)[0]
+    names_rva = struct.unpack_from("<I", b, d + 32)[0]
+    na = off(names_rva)
+    if na is None:
+        return None, "export name table RVA 0x%X is not mapped" % names_rva
+    out = []
+    for i in range(nnames):
+        if na + i * 4 + 4 > len(b):
+            return None, "export name table is truncated"
+        so = off(struct.unpack_from("<I", b, na + i * 4)[0])
+        if so is None:
+            return None, "an export name string is not mapped"
+        end = b.find(b"\0", so)
+        out.append(b[so:end].decode("ascii", "replace"))
+    return sorted(out), None
+
+
 def verify(art, src, C):
     """Return (verdict, list-of-problem-strings). Reads the file once."""
     red, green, yellow, dim, reset = C
@@ -337,7 +427,16 @@ def verify(art, src, C):
             msg.append("nothing was verified -- this is NOT evidence the "
                        "markers are missing.")
             return INCONCLUSIVE, msg
-        return FAIL, ["not built: %s" % src]
+        # "I did not build it" is not a marker failure. Reporting it as FAIL
+        # put 16 red lines in front of every agent working in a fresh
+        # worktree and trained them to scroll past FAIL -- which is how a
+        # real dropped feature gets waved through. Nothing was verified, so
+        # the honest verdict is INCONCLUSIVE (CLAUDE.md 9b). A missing
+        # MARKER in a file that IS built stays FAIL, loudly.
+        return INCONCLUSIVE, ["not built: %s" % src,
+                              "nothing was verified -- this is NOT evidence "
+                              "the markers or exports are missing. Build it, "
+                              "or narrow with --only."]
     size = os.path.getsize(src)
     floor = art.get("minBytes", 1)
     if size < floor:
@@ -360,6 +459,27 @@ def verify(art, src, C):
                         % (len(missing), len(art.get("markers", []))))
         for m in missing:
             problems.append("    %s" % m)
+
+    want = art.get("exports", [])
+    if want:
+        names, note = pe_exports(src)
+        if names is None:
+            problems.append("could not read the export table: %s" % note)
+            return INCONCLUSIVE, problems
+        have = set(names)
+        gone = [e for e in want if e not in have]
+        if gone:
+            problems.append("%d of %d required PE export(s) ABSENT from the "
+                            "built file (the file has %d export(s)):"
+                            % (len(gone), len(want), len(names)))
+            for e in gone:
+                problems.append("    %s" % e)
+            problems.append("A mod resolves this name with GetProcAddress. "
+                            "The code can be compiled in and the name can be "
+                            "present as text while the export is not there: "
+                            "Nim's {.exportc.} emits a C symbol, NOT a PE "
+                            "export. Wrap it in a __declspec(dllexport) C "
+                            "shim, as region.nim does.")
     return (OK if not problems else FAIL), problems
 
 
@@ -390,6 +510,9 @@ def cmd_check(args, cfg, C, check_data=True):
             if check_data and art.get("data"):
                 extra = ", %d data file%s" % (data_count(art),
                                               "" if data_count(art) == 1 else "s")
+            ne = len(art.get("exports", []))
+            if ne:
+                extra = ", %d export%s%s" % (ne, "" if ne == 1 else "s", extra)
             print("%sok%s   %-8s %s  (%d marker%s%s, %s bytes)"
                   % (green, reset, art["name"], art["src"], n,
                      "" if n == 1 else "s", extra, os.path.getsize(src)))
@@ -409,10 +532,13 @@ def cmd_check(args, cfg, C, check_data=True):
               "binary. Do NOT deploy this; rebuild from the right base.")
         print("A MISSING or DIFFERS data line means the install does not hold "
               "the bytes the artifact needs; `deploy` is what fixes that.")
+        print("An ABSENT export means a mod's GetProcAddress will return NULL "
+              "and the feature will decline at runtime even though its code "
+              "and its name are both in the binary.")
     if unknown:
-        print("\n%s%d artifact(s) INCONCLUSIVE -- either not built with its "
-              "declared input absent, or its declared data could not be "
-              "derived.%s" % (yellow, unknown, reset))
+        print("\n%s%d artifact(s) INCONCLUSIVE -- "
+              "not built, or its declared data could not be derived, or its "
+              "export table could not be read.%s" % (yellow, unknown, reset))
         print("This is not a pass and not a failure: nothing was verified. "
               "Read the reason printed above the summary, supply what is "
               "missing and re-run, or narrow to the artifacts you did build "

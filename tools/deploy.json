@@ -22,6 +22,26 @@
   {
    "name": "host",
    "src": "host/Aowlspt.Host.Il2Cpp/bin/aowlspt-host-il2cpp.dll",
+   "//exports": "Names a MOD resolves with GetProcAddress on this DLL; derived by grepping mods/**/*.nim and abi/*.h for GetProcAddress, NOT transcribed from the current export table -- transcribing would enshrine an export that is missing right now.",
+   "//exports1": "A marker cannot see this: exportc puts the name in the file as text without putting it in the export directory (fact #175).",
+   "exports": [
+    "aowl_host_gameworld",
+    "aowl_host_gameworld_armed",
+    "aowl_region_abi_x",
+    "aowl_region_box_x",
+    "aowl_region_commands_x",
+    "aowl_region_fill_x",
+    "aowl_region_is_armed_x",
+    "aowl_region_line_x",
+    "aowl_region_project_x",
+    "aowl_region_register_x",
+    "aowl_region_screen_h_x",
+    "aowl_region_screen_known_x",
+    "aowl_region_screen_w_x",
+    "aowl_region_status_x",
+    "aowl_region_text_x",
+    "aowl_region_unregister_x"
+   ],
    "dst": "aowlspt-host-il2cpp.dll",
    "minBytes": 500000,
    "markers": [
