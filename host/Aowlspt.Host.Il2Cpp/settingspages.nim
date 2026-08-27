@@ -911,6 +911,23 @@ proc swPagesOnTabBuilt(tabPtr: Il2CppPtr; tabName: string; revisit: bool) =
   ## postfix), and across a full pass of every tab there was not one page line,
   ## not one clone line and not one fault line. A path that declines must say
   ## why, or it cannot be debugged from a log at all.
+  # THE INDEX-BINDING GATE, before anything here calls `cDuFn(DuGetParent)`.
+  #
+  # This module indexes `aowl_du_targets` POSITIONALLY with constants declared
+  # in debugui.nim, and until now nothing checked that binding on this path --
+  # only `bindDebugUi` did, and this feature runs whether or not debugui is
+  # flagged on. A row inserted into the middle of that C table would therefore
+  # reach the live client through HERE as a byte-verified function of the wrong
+  # shape, called with the wrong frame: precisely the 2026-08-24 defect
+  # (`DuGetParent` -> `Transform::set_localPosition`), just through a door the
+  # fix did not cover. `duTargetsBindOk` is memoised, so this costs one compare
+  # after debugui has already asked.
+  if not duTargetsBindOk():
+    warn "settings pages: the managed-target index binding self-check FAILED " &
+         "(see the debugui line above naming the offending index). This " &
+         "module calls aowl_du_targets by POSITION, so every call would be " &
+         "to the wrong method. NOT rendering."
+    return
   if gSwPagesOn:
     inc gSwPagesFires
     if gSwPagesFires <= 8:

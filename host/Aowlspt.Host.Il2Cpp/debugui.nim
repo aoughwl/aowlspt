@@ -2171,7 +2171,7 @@ proc duIndicesOk(): bool =
   ## four rounds -- shifts at least one of these and is caught HERE, at bind,
   ## instead of as a null-pointer fault inside Unity a hundred frames later.
   ## Falsifiable by construction: insert or delete any row and it fails.
-  const expect: array[28, string] = [
+  const expect: array[36, string] = [
     "UnityEngine.Camera::get_main",
     "UnityEngine.Camera::WorldToScreenPoint(Vector3)",
     "UnityEngine.RectTransform::set_anchoredPosition",
@@ -2199,7 +2199,21 @@ proc duIndicesOk(): bool =
     "UnityEngine.Canvas::get_renderMode",
     "UnityEngine.Canvas::get_scaleFactor",
     "UnityEngine.UI.Graphic::set_raycastTarget",
-    "UnityEngine.Behaviour::set_enabled"]
+    "UnityEngine.Behaviour::set_enabled",
+    # The visibility block, APPENDED (28..35). Nothing addresses these
+    # positionally -- the inspector resolves them BY NAME through
+    # `iFindTarget` -- but they are listed here anyway, because the check that
+    # matters is "the table is exactly what this host was written against",
+    # and a check that skips the tail is a check that can only say yes about
+    # the head.
+    "UnityEngine.Transform::TransformPoint(Vector3)",
+    "UnityEngine.Transform::get_lossyScale",
+    "UnityEngine.CanvasGroup::get_alpha",
+    "UnityEngine.CanvasGroup::get_ignoreParentGroups",
+    "UnityEngine.UI.Graphic::get_color",
+    "UnityEngine.UI.Graphic::get_canvas",
+    "UnityEngine.Behaviour::get_enabled",
+    "UnityEngine.Behaviour::get_isActiveAndEnabled"]
   result = true
   let n = int(cDuTargetCount())
   if n != expect.len:
@@ -2221,6 +2235,27 @@ proc duIndicesOk(): bool =
           $DuGetParent & " '" & $cDuName(DuGetParent) & "', get_rect=" &
           $DuGetRect & " '" & $cDuName(DuGetRect) & "'"
 
+var gDuIdxChecked = 0   ## 0 = not yet run, 1 = passed, 2 = failed
+
+proc duTargetsBindOk(): bool =
+  ## THE GENERALISED BINDING ASSERTION.
+  ##
+  ## `duIndicesOk` was written for `debugui` and ran only on `bindDebugUi`.
+  ## That left `settingspages.nim` -- which indexes the SAME C table with the
+  ## SAME positional constants (`DuGetParent`, `DuGoActiveSelf`, ...) -- armed
+  ## with no check at all whenever debugui was flagged off. A row inserted into
+  ## `aowl_du_targets` would then reach the live client through settingspages
+  ## exactly as it reached it through debugui: a valid, byte-verified function
+  ## of the WRONG SHAPE, called with the wrong frame.
+  ##
+  ## So the check is now a MODULE-LEVEL GATE that every consumer of the table
+  ## must pass through, memoised so the second caller costs nothing and the
+  ## refusal message is printed once rather than per feature.
+  if gDuIdxChecked != 0:
+    return gDuIdxChecked == 1
+  gDuIdxChecked = (if duIndicesOk(): 1 else: 2)
+  result = gDuIdxChecked == 1
+
 proc bindDebugUi(verbose: bool): bool =
   ## Installs the kind=10 PREFIX detour on `EFT.UI.PreloaderUI::Update` from the
   ## verified static target in `aowlspt_debugui.h`. Opt-in (`debugUi`/`debugEsp`);
@@ -2237,7 +2272,7 @@ proc bindDebugUi(verbose: bool): bool =
   duLoadWidgets()
   okLog "debugui: " & $gDuWidgets.len & " widget(s) configured -- " &
         gDuLayoutSource
-  if not duIndicesOk():
+  if not duTargetsBindOk():
     return false
   var ok = 0
   var bad = 0

@@ -200,6 +200,14 @@ static int aowl_rva_is_code(unsigned int rva) {
 ## in-world AI markers. Target table, call thunks, guarded scalar stores,
 ## the toggle key and the frame-rate estimate. See `aowlspt_debugui.h`.
 {.emit: """#include "aowlspt_debugui.h" """.}
+## THE PURE ARITHMETIC BEHIND "is it actually on screen" -- the CanvasGroup
+## alpha fold, the on-screen classification, the degenerate-rect and collapsed-
+## scale tests the inspector's `visible`/`screenrect` verbs consume. Free
+## functions over doubles with no pointer to anything, so
+## `tests/overlayhost/vistest.c` compiles the header standalone and asserts
+## against it OFFLINE -- the client-side verbs then contain no arithmetic of
+## their own to get wrong.
+{.emit: """#include "aowlspt_visible.h" """.}
 ## THE EAGER PROLOGUE SNAPSHOT. Defined here because it needs every target
 ## table above it, and CALLED from `hostReady` before any feature binds -- that
 ## ordering is the whole guarantee. Once this has run, no later verify can be
