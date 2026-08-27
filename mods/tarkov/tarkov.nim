@@ -59,6 +59,7 @@ import emu/dialogue
 import emu/market
 import emu/production
 import emu/skills
+import emu/progression
 import emu/scav
 import emu/redeem
 import emu/notify
@@ -373,8 +374,21 @@ proc onProfileList(url, body, session: string): string =
     if id in seenIds:
       continue
     seenIds.add id
-    let p = loadProfile(id)
+    var p = loadProfile(id)
     if p.ok:
+      # The progression floors, applied to the STORED profile before it is
+      # served. Here rather than at creation because the settings are editable
+      # after a character exists, and a floor that only ran once would be a row
+      # that silently does nothing for everyone who already has a profile.
+      # `applyProgression` returns false once the floor is met, so the steady
+      # state is a plain read with no write.
+      var notes: seq[string] = @[]
+      if applyProgression(p, notes):
+        if not saveProfile(p):
+          warn "progression: the profile was raised but could NOT be stored, " &
+               "so it will be raised again on the next fetch"
+        for n in notes:
+          info n
       a.add raw(p.text)
       # The scav goes straight after its PMC. The client reads the pair in that
       # order and shows the second as the scav character.
@@ -3198,11 +3212,84 @@ proc tarkovSchema(): seq[Setting] =
     # honest answer to "are items gated by loyalty and quests" was "no". The
     # sandbox behaviour is still one switch away; it is just no longer the
     # thing a stranger gets without asking.
+    # ---- progression ----------------------------------------------------
+    #
+    # Every row here is a FLOOR applied to the stored profile on each fetch,
+    # never a ceiling and never a reset: a value already above the setting is
+    # left alone, so leaving one of these on does not undo play, and turning one
+    # back to 0 takes nothing away. Zero is off, throughout.
+    #
+    # Two of the three write a field the setting is NOT named after, because
+    # that is the field the client reads. See the header of `emu/progression`.
+    intSetting("progressionPlayerLevel", "Player level", 0, lo = 0, hi = 79,
+               category = "Progression/Player",
+               description = "Raise the character to at least this level. " &
+                             "The client derives the level it draws from " &
+                             "Info.Experience against " &
+                             "globals.config.exp.level.exp_table and does not " &
+                             "trust Info.Level, so this writes the matching " &
+                             "EXPERIENCE (emu/progression.xpForLevel) and " &
+                             "sets Info.Level alongside it. 0 is off; 79 is " &
+                             "the length of the exp table on this database"),
+
+    intSetting("progressionSkillLevel", "Skill level", 0, lo = 0, hi = 51,
+               category = "Progression/Skills",
+               description = "Raise every skill the profile already carries " &
+                             "to at least this level, by writing " &
+                             "Skills.Common[].Progress = level x 100. 51 is " &
+                             "elite. Only ids ALREADY on the profile are " &
+                             "touched, so this cannot reintroduce one of the " &
+                             "17 pre-1.0 ids the client answers \"Can't find " &
+                             "skill to upgrade\" for. 0 is off"),
+    stringSetting("progressionSkillIds", "Only these skills", "",
+                  category = "Progression/Skills",
+                  description = "Comma-separated skill ids " &
+                                "(Endurance, Strength, Perception ...) to " &
+                                "restrict the row above to. Matched on the " &
+                                "WHOLE id, case-insensitively -- a substring " &
+                                "match would make one entry select several. " &
+                                "Empty means every skill on the profile"),
+
+    intSetting("progressionMasteryLevel", "Weapon mastery level", 0,
+               lo = 0, hi = 3, category = "Progression/Mastery",
+               description = "Raise every weapon family to at least this " &
+                             "mastery level (1, 2 or 3) by writing " &
+                             "Skills.Mastering[].Progress up to that family's " &
+                             "own Level2/Level3 threshold out of " &
+                             "globals.config.Mastering -- the thresholds " &
+                             "differ per family (M4 is 1600/2000, SKS " &
+                             "200/300), so they are read, not assumed. 0 is off"),
+    stringSetting("progressionMasteryFamilies", "Only these weapon families", "",
+                  category = "Progression/Mastery",
+                  description = "Comma-separated family names (M4, AKM, " &
+                                "AKSU, SKS ...) to restrict the row above to. " &
+                                "Mastery is per weapon FAMILY, not per " &
+                                "weapon: the 79 families on this database " &
+                                "cover several templates each, which is why " &
+                                "this is a filter and not 79 rows. Empty " &
+                                "means every family"),
+
     boolSetting("traderUnlockAllOffers", "Unlock every trader offer", false,
                 category = "Traders/Offers",
                 description = "Sell every trader's whole stock from loyalty " &
                               "level 1, ignoring loyalty and quest gating " &
                               "(emu/traders.traderAssort). Off by default."),
+    # A DIFFERENT axis from the row above, and the one that answers the error
+    # a player actually sees. `traderUnlockAllOffers` moves every OFFER down to
+    # loyalty 1; this moves the PLAYER up to the top level each trader defines.
+    # Both are needed to describe "unlock the traders", and neither implies the
+    # other -- loyalty level also sets the healing and repair price coefficients
+    # (emu/health, emu/repair) and gates hideout recipes (emu/production), none
+    # of which the assort rewrite touches.
+    boolSetting("traderMaxLoyalty", "Max trader loyalty level", false,
+                category = "Traders/Offers",
+                description = "Put every trader at the highest loyalty level " &
+                              "their own loyaltyLevels array defines, " &
+                              "ignoring player level, sales sum and standing " &
+                              "(emu/traders.loyaltyLevelFor). Applied in the " &
+                              "derivation rather than written to the profile, " &
+                              "because refreshLoyalty re-derives the stored " &
+                              "number after every trade. Off by default"),
     floatSetting("traderPriceMultiplier", "Trader price multiplier", 1.0,
                  lo = 0.0, hi = 10.0, step = 0.05, category = "Traders/Offers",
                  description = "Scales every barter-scheme count, in BOTH " &
@@ -3371,6 +3458,26 @@ proc onTarkovSettings(url, body, session: string): string =
     # than on the next server restart.
     if key.len > 1 and key[0] == 'g' and key[1] == '_':
       loadGlobalTunes()
+    # Hot-apply: the progression floors and the two trader unlock switches.
+    # These are read at load like everything else, but "takes effect next
+    # start" is the wrong contract for them -- a floor is applied on the next
+    # profile FETCH, and the client fetches the profile list without being
+    # restarted, so a saved value that did not reconfigure here would look like
+    # a row that does nothing. Re-read all of both groups rather than the one
+    # key: the configure procs take the whole set and a partial call would
+    # reset the others to their defaults.
+    if key.startsWith("progression"):
+      configureProgression(setting("progressionPlayerLevel").asInt(0),
+                           setting("progressionSkillLevel").asInt(0),
+                           setting("progressionSkillIds").asText(""),
+                           setting("progressionMasteryLevel").asInt(0),
+                           setting("progressionMasteryFamilies").asText(""))
+    elif key == "traderMaxLoyalty" or key == "traderUnlockAllOffers" or
+         key == "traderIgnoreStockLimits" or key == "traderPriceMultiplier":
+      configureTraders(setting("traderUnlockAllOffers").asBool(false),
+                       setting("traderPriceMultiplier").asFloat(1.0),
+                       setting("traderIgnoreStockLimits").asBool(false),
+                       setting("traderMaxLoyalty").asBool(false))
     # `spawnNow` is a button, not a value. Run it, record what happened, and
     # put the key back to false so the control is armed again -- a checkbox
     # that stays on after its action is one nobody can press twice.
@@ -3495,7 +3602,15 @@ proc onLoad(): Status =
   # the number. Read here, at load, like every other key on this page.
   configureTraders(setting("traderUnlockAllOffers").asBool(false),
                    setting("traderPriceMultiplier").asFloat(1.0),
-                   setting("traderIgnoreStockLimits").asBool(false))
+                   setting("traderIgnoreStockLimits").asBool(false),
+                   setting("traderMaxLoyalty").asBool(false))
+  # The progression floors. Read at load like every other key on this page; the
+  # profile itself is only rewritten when a fetch finds it below the floor.
+  configureProgression(setting("progressionPlayerLevel").asInt(0),
+                       setting("progressionSkillLevel").asInt(0),
+                       setting("progressionSkillIds").asText(""),
+                       setting("progressionMasteryLevel").asInt(0),
+                       setting("progressionMasteryFamilies").asText(""))
   configureRepairPrices(setting("repairPriceMultiplier").asFloat(1.0))
   configureHideoutTimes(
     setting("hideoutConstructionMultiplier").asFloat(1.0))

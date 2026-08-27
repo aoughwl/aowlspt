@@ -36,6 +36,7 @@ import loot
 import market
 import questcond
 import skills
+import progression
 import health
 import production
 import gym
@@ -83,6 +84,10 @@ proc selfCheckFailures*(): seq[string] =
   # minigame is worth is pure arithmetic over one database entry, and the only
   # way to reach it through a route is on a database that carries `hideout.qte`.
   discard gym.selfCheckGym(result)
+  # The progression floors: the family filter and the level<->experience maths.
+  # Pure over the exp table, and the round trip is asserted rather than the
+  # write, so an off-by-one in the cumulative sum fails here and not on screen.
+  progression.selfCheckProgression(result)
   # And the fourth, with one difference worth naming here because it is the one
   # exception to this module's "no database" rule. `selfCheckCustomisation` is
   # pure over a literal table for the whole of the validator, and then -- only
