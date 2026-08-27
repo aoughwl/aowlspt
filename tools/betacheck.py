@@ -41,6 +41,9 @@ constant is the failure mode this file exists to avoid.
                It is in the post-1.0 location table the real server sent us
                but has no database entry and no parent map to inherit one, so
                a correct server cannot answer it and must go red
+    setwrite   demand that a written setting reads back UNCHANGED -- which is
+               exactly the silent-revert shape of fact #135, so a server that
+               actually persists the edit must go red
     lootloose  raise every map's floor by its whole probabilistic spawn
                point count, so a correct server -- which rolls each point
                against its own probability -- must go red
@@ -616,6 +619,164 @@ def check_trader_unlock(w, mut):
                "all %d offers served at loyalty 1 with traderUnlockAllOffers "
                "on, against %d gated above 1 with it off"
                % (len(gate_open), gated_off))
+
+
+
+# ---------------------------------------------------------------------------
+# 14. A SETTING, WRITTEN AND READ BACK
+#
+# The whole reason this check exists: `POST /aowlspt/settings/<guid>` answers
+# 200 with the schema whether or not the value was kept (fact #135 -- a chunked
+# POST is treated as bodyless and answered 200 unchanged; and a persist that
+# fails answers the schema too).  So the STATUS CODE PROVES NOTHING, and neither
+# does the POST's own reply body: the only thing that settles it is a SEPARATE
+# re-read afterwards, compared against what was asked for.
+#
+# Fact #122: the schema emits `value` UNQUOTED, so the document can fail to be
+# JSON at all.  It is parsed STRICTLY here and an unparseable body is reported
+# as such rather than coped with -- coping is how that defect stays invisible.
+#
+# Three outcomes.  No writable server-side row anywhere is INCONCLUSIVE, not a
+# pass: "I could not look" is not "it works".
+# ---------------------------------------------------------------------------
+
+
+def _settings_get(port, path):
+    """A GET on a settings route.  Returns (status, raw-text)."""
+    c = http.client.HTTPConnection("127.0.0.1", port, timeout=30)
+    c.request("GET", path, b"", {"Accept-Encoding": "identity"})
+    r = c.getresponse()
+    raw = r.read()
+    c.close()
+    if raw[:2] in (b"\x78\x01", b"\x78\x9c", b"\x78\xda"):
+        raw = zlib.decompress(raw)
+    return r.status, raw.decode("utf-8", "replace")
+
+
+def _settings_rows(port, guid):
+    """The rows a page serves, strictly parsed.
+
+    Returns (rows, why).  `rows` is None when the body is not a schema, and
+    `why` then says which of the two failures it was -- a body that is not
+    JSON at all, or JSON that is not the shape.  The bare array and the
+    `{"err":..,"rows":[..]}` refusal shape are both understood, because the
+    refusal is what a correct server sends when the write did NOT persist and
+    it must not read here as "the page has no rows".
+    """
+    st, text = _settings_get(port, "/aowlspt/settings/" + guid)
+    if st != 200:
+        return None, "the page answered HTTP %d" % st
+    try:
+        doc = json.loads(text)
+    except Exception as exc:                       # noqa: BLE001
+        return None, ("the schema is not valid JSON (%s) -- fact #122: `value` "
+                      "is emitted unquoted" % exc)
+    if isinstance(doc, list):
+        return doc, ""
+    if isinstance(doc, dict) and isinstance(doc.get("rows"), list):
+        return doc["rows"], doc.get("err") or ""
+    return None, "the page answered JSON that is not a schema"
+
+
+def _writable_row(rows):
+    """A row this check can flip, and its current value.
+
+    Bools only, and only implemented ones: a bool has exactly one other legal
+    value, so the write can never be refused for being out of range and a
+    revert can never be confused with a clamp.
+    """
+    for r in rows:
+        if not isinstance(r, dict):
+            continue
+        if r.get("type") != "bool" or not r.get("implemented"):
+            continue
+        cur = r.get("value")
+        if not isinstance(cur, bool):
+            continue
+        return r.get("key"), cur
+    return None, None
+
+
+def check_settings_write(w, mut):
+    st, text = _settings_get(w.port, "/aowlspt/settings/index")
+    try:
+        idx = json.loads(text)
+    except Exception as exc:                       # noqa: BLE001
+        record("settings-write", INCONC,
+               "the settings index is not valid JSON (%s)" % exc)
+        return
+    mods = (idx or {}).get("mods") if isinstance(idx, dict) else None
+    if not isinstance(mods, list) or not mods:
+        record("settings-write", INCONC,
+               "the settings index named no mods, so there was nothing to write")
+        return
+
+    # SERVER-SIDE pages only.  A `client:true` page is owned by the game
+    # process and its edits are QUEUED, not applied, so re-reading it
+    # immediately shows the old value -- correctly.  Checking that transport
+    # from here would be a check that always fails; the host log's
+    # `client settings bridge:` lines settle that half.
+    tried = []
+    for m in mods:
+        if not isinstance(m, dict) or m.get("client"):
+            continue
+        guid = m.get("guid") or ""
+        if not guid:
+            continue
+        rows, why = _settings_rows(w.port, guid)
+        if rows is None:
+            tried.append("%s: %s" % (guid, why))
+            continue
+        key, cur = _writable_row(rows)
+        if not key:
+            tried.append("%s: no implemented bool row" % guid)
+            continue
+
+        want = not cur
+        wire = "true" if want else "false"
+        st2, _, ptext = w.call("/aowlspt/settings/" + guid,
+                               {"key": key, "value": want})
+
+        after, why2 = _settings_rows(w.port, guid)
+        if after is None:
+            record("settings-write", INCONC,
+                   "%s.%s was written but the re-read failed: %s"
+                   % (guid, key, why2))
+            return
+        got = None
+        for r in after:
+            if isinstance(r, dict) and r.get("key") == key:
+                got = r.get("value")
+        # Put it back before reporting, so a failing run is not also a
+        # destructive one.
+        w.call("/aowlspt/settings/" + guid, {"key": key, "value": cur})
+
+        if got is None:
+            record("settings-write", INCONC,
+                   "%s.%s vanished from the schema after the write" % (guid, key))
+            return
+
+        # THE FALSIFYING INPUT.  `--mutate setwrite` demands the value came
+        # back UNCHANGED -- the silent-revert shape -- so a server that really
+        # persists must go red here.
+        applied = (got == want)
+        if mut == "setwrite":
+            applied = (got == cur)
+        if applied:
+            record("settings-write", OK,
+                   "%s.%s written %s over HTTP %d and READ BACK %s by a "
+                   "separate GET" % (guid, key, wire, st2, json.dumps(got)))
+        else:
+            record("settings-write", FAIL,
+                   "%s.%s was set to %s, the server answered HTTP %d, and a "
+                   "SEPARATE re-read still says %s -- a 200 with the schema "
+                   "unchanged is fact #135's silent no-op, not a write"
+                   % (guid, key, wire, st2, json.dumps(got)))
+        return
+
+    record("settings-write", INCONC,
+           "no server-side page offered an implemented bool row to write (%s)"
+           % ("; ".join(tried) if tried else "no server-side pages at all"))
 
 
 def main():
@@ -1426,6 +1587,12 @@ def main():
         check_trader_unlock(w, mut)
     except Exception as exc:                       # noqa: BLE001
         record("trader-loyalty", INCONC, "%s: %r" % (type(exc).__name__, exc))
+
+    # ------------------------------------------------------------------ 14
+    try:
+        check_settings_write(w, mut)
+    except Exception as exc:                       # noqa: BLE001
+        record("settings-write", INCONC, "%s: %r" % (type(exc).__name__, exc))
 
     print()
     bad = [r for r in results if r[1] != OK]

@@ -184,10 +184,29 @@ proc sbApplyPending(reply: string) =
     if guid.len == 0:
       continue
     gSbApply = ""
+    # THE CAPTURE GATE MUST BE OPEN FOR THIS EMIT.
+    #
+    # `sbCapture` drops every announce while `gSbCollecting` is false, and
+    # `sbCollect` -- the only place that used to raise it -- has long since
+    # returned by the time an edit is applied: applying happens in
+    # `SbPhase.sbPushing`, from the POST reply. So `SettingsApplyAnnounce` was
+    # emitted correctly by the mod, delivered correctly by the bus, and thrown
+    # away here; `gSbApply` stayed empty and every edit on every client-side
+    # mod was reported as "nobody answered". The mod HAD answered, and had
+    # already persisted the value -- what was lost was only the ack, but the
+    # panel re-reads through the same queue and shows the old value, so the
+    # control snapped back. Measured 2026-08-27 against a live client:
+    # `POST /aowlspt/settings/aowl.debug` at 0:03:45.688, the warn at
+    # 0:03:46.297.
+    gSbCollecting = true
     hostEmit(SbApplyQuery, it)
+    gSbCollecting = false
     if gSbApply.len == 0:
-      sbFault("nobody answered a settings edit for '" & guid &
-              "' -- the mod may have been unloaded since it pushed its page")
+      # NO GUESS. The old text said "the mod may have been unloaded", which was
+      # a hypothesis printed as a cause -- and it was wrong for every one of
+      # the observed cases, where the mod was loaded and in the nav.
+      sbFault("no subscriber answered " & SbApplyQuery & " for '" & guid &
+              "' -- the edit is NOT applied; cause unknown from here")
     else:
       var okTxt = ""
       discard pathGet(gSbApply, "ok", okTxt)
