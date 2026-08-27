@@ -73,3 +73,13 @@ different, correct maps, not three copies of a preview.
   cost drops ~4× and the resident set can grow; (b) green-channel-flip GL→DX
   normals where a source ships only `NormalGL`; (c) a specular→roughness
   conversion for BSG's specular-workflow textures (ambientcg is metal/rough).
+
+---
+
+## The other route: in-place asset patching
+
+`resspatch.py` + `makedds.py` replace texture bytes directly inside the shipped
+`.assets`/`.resS` pair, instead of swapping at runtime. **See
+[RESSPATCH.md](RESSPATCH.md) before running any of it** — the shipped files are
+hardlinked to the real Tarkov install, and writing one in place corrupts the
+other.
