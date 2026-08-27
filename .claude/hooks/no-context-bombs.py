@@ -238,6 +238,11 @@ def bounded_read(text, line_oriented):
     return False
 
 
+# Pipeline / list separators. A huge path in one segment says nothing about a
+# reader in another.
+SEGSPLIT = re.compile("[|;]|&&|\\n")
+
+
 def check_bash(command):
     if not command.strip():
         return 0
@@ -256,12 +261,30 @@ def check_bash(command):
     if SAFE_ACCESSOR.search(text):
         return 0
 
-    reads_whole = bool(WHOLE_READER.search(text))
-    greps = bool(GREPPER.search(text))
+    # SEGMENT-SCOPED. This used to scan the WHOLE command for a huge path and
+    # the WHOLE command for a reader, so `ls data/capture/ ; grep -rn x tools/`
+    # was refused as "a grep on a raid capture payload" -- the grep never went
+    # near the capture, `ls` did. Keying on a path substring anywhere in the
+    # command line blocks plain `ls`, `find` and two-line `python -c`, which
+    # teaches evasion (see the bounded-read note below). A huge path now only
+    # counts against the reader in ITS OWN pipeline segment.
+    segs = [seg for seg in SEGSPLIT.split(text) if seg.strip()] or [text]
+    reads_whole = greps = False
+    hits = []
+    for seg in segs:
+        rw = bool(WHOLE_READER.search(seg))
+        gr = bool(GREPPER.search(seg))
+        if not (rw or gr):
+            continue
+        h = huge_hits(seg, _grep_pattern_spans(seg) if gr else ())
+        if h and not hits:
+            reads_whole, greps, hits, text = rw, gr, h, seg
+        elif not hits:
+            reads_whole = reads_whole or rw
+            greps = greps or gr
     if not (reads_whole or greps):
         return 0  # writing/copying/sizing these files is fine
 
-    hits = huge_hits(text, _grep_pattern_spans(text) if greps else ())
     if hits:
         name, advice, lines = hits[0]
         # A read that is ALREADY BOUNDED is not a context bomb, and blocking it

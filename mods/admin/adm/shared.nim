@@ -82,6 +82,17 @@ proc cW2s(x, y, z: cfloat; w, h: int32; sx, sy: ptr cfloat): int32 {.
 proc cGodmode(on: int32; rva: uint32): int32 {.importc: "aowl_admin_godmode", nodecl.}
 proc cGodOn(): int32 {.importc: "aowl_admin_god_is_on", nodecl.}
 proc cGameAsm(): int32 {.importc: "aowl_admin_gameasm_present", nodecl.}
+proc cSpawnPending(s: AdminRegion): int32 {.
+  importc: "aowl_admin_spawn_pending", nodecl.}
+proc cSpawnDone(s: AdminRegion; req: int32; text: cstring) {.
+  importc: "aowl_admin_spawn_done", nodecl.}
+proc cSpawnCount(s: AdminRegion): int32 {.
+  importc: "aowl_admin_spawn_count", nodecl.}
+proc cSpawnCondition(s: AdminRegion): int32 {.
+  importc: "aowl_admin_spawn_condition", nodecl.}
+proc cQueryLen(s: AdminRegion): int32 {.importc: "aowl_admin_query_len", nodecl.}
+proc cQueryAt(s: AdminRegion; i: int32): int32 {.
+  importc: "aowl_admin_query_at", nodecl.}
 proc cGetW(s: AdminRegion): int32 {.importc: "aowl_admin_get_w", nodecl.}
 proc cGetH(s: AdminRegion): int32 {.importc: "aowl_admin_get_h", nodecl.}
 proc cRp(o: pointer; off: int32): pointer {.importc: "aowl_admin_rp", nodecl.}
@@ -132,6 +143,47 @@ proc frameAdd*(s: AdminRegion; cx, top, bottom, health, maxHealth, distance: flo
 
 proc frameCommit*(s: AdminRegion) =
   if s != nil: cFrameCommit(s)
+
+# --------------------------------------------------------------- spawner
+#
+# The mod's half of the F6 item spawner. The overlay's WndProc fills the query
+# and bumps the request; this side drains it. `spawnPending` returns 0 when
+# there is nothing to do, so the common case costs one shared-memory read.
+
+proc spawnPending*(s: AdminRegion): int32 =
+  ## The sequence number of an UNSERVICED request, or 0 for none.
+  if s == nil: 0'i32 else: cSpawnPending(s)
+
+proc spawnQuery*(s: AdminRegion): string =
+  ## The typed query as a nimony string. Bounded by the shared buffer's own
+  ## capacity, and it stops at the first NUL, so a length field that overstates
+  ## the content yields a short string rather than a walk off the end.
+  result = ""
+  if s == nil: return
+  var n = cQueryLen(s)
+  if n < 0'i32: n = 0'i32
+  if n > 47'i32: n = 47'i32      # AOWL_ADM_QUERY_LEN - 1
+  var i = 0'i32
+  while i < n:
+    let c = cQueryAt(s, i)
+    if c <= 0'i32 or c > 255'i32: break
+    result.add char(c)
+    i = i + 1'i32
+
+proc spawnCount*(s: AdminRegion): int =
+  if s == nil: 1 else: int(cSpawnCount(s))
+
+proc spawnCondition*(s: AdminRegion): int =
+  if s == nil: 100 else: int(cSpawnCondition(s))
+
+proc spawnDone*(s: AdminRegion; req: int32; text: string) =
+  ## Finish a request. The text is what the player is shown, and it is written
+  ## before the ack, so the HUD cannot read the PREVIOUS result as this one's.
+  ## It is populated on refusal exactly as on success -- a spawn that did
+  ## nothing must never render as one that worked.
+  if s == nil: return
+  var t = text
+  cSpawnDone(s, req, toCString(t))
 
 proc modeName*(bit: int32): string =
   ## The menu label for one mode.

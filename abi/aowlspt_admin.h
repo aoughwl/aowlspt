@@ -103,6 +103,38 @@ static const char* aowl_admin_mode_name(int32_t bit) {
     }
 }
 
+/* ------------------------------------------------------------------ *
+ * THE MENU ROWS.
+ *
+ * The first AOWL_ADM_COUNT rows are the toggles above, one row each. The four
+ * after them are the item spawner, which is NOT a toggle: it is a query the
+ * player types, two numbers, and a submit. Keeping them in the same row space
+ * means the F6 menu has one selection index and one set of arrow keys, rather
+ * than a mode within a mode.
+ * ------------------------------------------------------------------ */
+
+enum {
+    AOWL_ADM_ROW_QUERY = AOWL_ADM_COUNT + 0,   /* typed: WM_CHAR / backspace  */
+    AOWL_ADM_ROW_COUNT = AOWL_ADM_COUNT + 1,   /* left/right: 1..5000          */
+    AOWL_ADM_ROW_COND  = AOWL_ADM_COUNT + 2,   /* left/right: 1..100 percent   */
+    AOWL_ADM_ROW_SPAWN = AOWL_ADM_COUNT + 3,   /* Enter: submit                */
+    AOWL_ADM_ROW_TOTAL = AOWL_ADM_COUNT + 4
+};
+
+static int32_t aowl_admin_row_is_toggle(int32_t row) {
+    return (row >= 0 && row < AOWL_ADM_COUNT) ? 1 : 0;
+}
+
+static const char* aowl_admin_row_name(int32_t row) {
+    switch (row) {
+        case AOWL_ADM_ROW_QUERY: return "Item";
+        case AOWL_ADM_ROW_COUNT: return "How many";
+        case AOWL_ADM_ROW_COND:  return "Condition %";
+        case AOWL_ADM_ROW_SPAWN: return "SPAWN  (Enter)";
+        default:                 return aowl_admin_mode_name(row);
+    }
+}
+
 /* Side colouring, published per entity; the HUD maps these to colours. */
 enum {
     AOWL_ADM_SIDE_UNKNOWN = 0,
@@ -120,9 +152,11 @@ enum {
 #define AOWL_ADM_MAX_ENTITIES 256
 #define AOWL_ADM_NAME_LEN     24
 #define AOWL_ADM_STATUS_LEN   192
-#define AOWL_ADM_REGION_NAME  "Local\\aowlspt_admin_shared_v3"
-#define AOWL_ADM_MAGIC        0x414F574C41444D33ull  /* "AOWLADM3"            */
-#define AOWL_ADM_VERSION      3
+#define AOWL_ADM_QUERY_LEN    48
+#define AOWL_ADM_RESULT_LEN   192
+#define AOWL_ADM_REGION_NAME  "Local\\aowlspt_admin_shared_v4"
+#define AOWL_ADM_MAGIC        0x414F574C41444D34ull  /* "AOWLADM4"            */
+#define AOWL_ADM_VERSION      4
 
 typedef struct AowlAdminEntity {
     /* Screen box in back-buffer pixels, top-left origin, valid only when
@@ -162,6 +196,27 @@ typedef struct AowlAdminShared {
 
     char          status[AOWL_ADM_STATUS_LEN];  /* what bound, or why not      */
     volatile LONG heartbeat;           /* bumped per publish; stale detection   */
+
+    /* ---- The item spawner ----------------------------------------------
+     * A request/ack pair, not a flag. The overlay (WndProc thread) fills the
+     * query and bumps `spawnReq`; the mod (host thread) notices req != ack,
+     * calls `aowl.items`, writes `spawnResult` and only THEN sets ack = req.
+     * `spawnBusy` is what the overlay reads to refuse a second submit and to
+     * refuse edits to the query while the first is still in flight -- which is
+     * also what makes the unsynchronised `spawnQuery` buffer safe: exactly one
+     * side may touch it at a time, and which side that is is `spawnBusy`.
+     *
+     * There is no "spawn succeeded" bit on purpose. `spawnResult` is the whole
+     * answer and it is populated on success AND on refusal, so the HUD cannot
+     * render a spawn that did nothing as a spawn that worked.                */
+    char          spawnQuery[AOWL_ADM_QUERY_LEN];
+    volatile LONG spawnQueryLen;
+    volatile LONG spawnCount;          /* 1..5000, 0 means "never set"         */
+    volatile LONG spawnCondition;      /* 1..100,  0 means "never set"         */
+    volatile LONG spawnReq;
+    volatile LONG spawnAck;
+    volatile LONG spawnBusy;
+    char          spawnResult[AOWL_ADM_RESULT_LEN];
 } AowlAdminShared;
 
 /* ------------------------------------------------------------------ *
@@ -230,17 +285,188 @@ static void aowl_admin_menu_toggle(AowlAdminShared* s) {
 static void aowl_admin_menu_move(AowlAdminShared* s, int32_t delta) {
     if (!s) return;
     LONG n = s->menuSel + delta;
-    while (n < 0) n += AOWL_ADM_COUNT;
-    while (n >= AOWL_ADM_COUNT) n -= AOWL_ADM_COUNT;
+    while (n < 0) n += AOWL_ADM_ROW_TOTAL;
+    while (n >= AOWL_ADM_ROW_TOTAL) n -= AOWL_ADM_ROW_TOTAL;
     InterlockedExchange(&s->menuSel, n);
 }
-/* Flip the selected mode -- but only if the mod says it is capable, so a menu
- * gesture never turns on a mode that would silently do nothing. */
+/* ------------------------------------------------------------------ *
+ * The item spawner -- shared, because the overlay drives it and the mod
+ * services it.
+ *
+ * Every accessor clamps rather than trusting the region: this struct lives in
+ * a named section any process on the box can open, so a length longer than the
+ * buffer is a thing that CAN happen and must read as a short string, never as
+ * a walk off the end.
+ * ------------------------------------------------------------------ */
+
+static int32_t aowl_admin_spawn_busy(AowlAdminShared* s) {
+    return (s && s->spawnBusy) ? 1 : 0;
+}
+static int32_t aowl_admin_spawn_count(AowlAdminShared* s) {
+    LONG v;
+    if (!s) return 1;
+    v = s->spawnCount;
+    if (v < 1) return 1;
+    if (v > 5000) return 5000;
+    return (int32_t)v;
+}
+static int32_t aowl_admin_spawn_condition(AowlAdminShared* s) {
+    LONG v;
+    if (!s) return 100;
+    v = s->spawnCondition;
+    if (v < 1) return 100;          /* 0 = never set -> the sane default      */
+    if (v > 100) return 100;
+    return (int32_t)v;
+}
+/* The typed query, always NUL-terminated inside `out`, always clamped to the
+ * buffer. Returns the length written. */
+static int32_t aowl_admin_spawn_query(AowlAdminShared* s, char* out, int32_t cap) {
+    int32_t n = 0, i = 0;
+    if (!out || cap <= 0) return 0;
+    out[0] = 0;
+    if (!s) return 0;
+    n = (int32_t)s->spawnQueryLen;
+    if (n < 0) n = 0;
+    if (n > AOWL_ADM_QUERY_LEN - 1) n = AOWL_ADM_QUERY_LEN - 1;
+    if (n > cap - 1) n = cap - 1;
+    for (i = 0; i < n; i++) {
+        char c = s->spawnQuery[i];
+        if (c == 0) break;          /* short-circuit a length that overstates */
+        out[i] = c;
+    }
+    out[i] = 0;
+    return i;
+}
+
+/* ---- consumer side (the overlay's WndProc) ---- */
+
+static void aowl_admin_query_putc(AowlAdminShared* s, int32_t ch) {
+    LONG n;
+    if (!s || aowl_admin_spawn_busy(s)) return;
+    /* Printable ASCII only. The item search is ASCII, and a control character
+     * in a shared buffer is a bug looking for somewhere to happen. */
+    if (ch < 0x20 || ch > 0x7E) return;
+    n = s->spawnQueryLen;
+    if (n < 0) n = 0;
+    if (n >= AOWL_ADM_QUERY_LEN - 1) return;   /* full: refuse, do not wrap   */
+    s->spawnQuery[n] = (char)ch;
+    s->spawnQuery[n + 1] = 0;
+    InterlockedExchange(&s->spawnQueryLen, n + 1);
+}
+static void aowl_admin_query_backspace(AowlAdminShared* s) {
+    LONG n;
+    if (!s || aowl_admin_spawn_busy(s)) return;
+    n = s->spawnQueryLen;
+    if (n <= 0) { InterlockedExchange(&s->spawnQueryLen, 0); return; }
+    if (n > AOWL_ADM_QUERY_LEN - 1) n = AOWL_ADM_QUERY_LEN - 1;
+    s->spawnQuery[n - 1] = 0;
+    InterlockedExchange(&s->spawnQueryLen, n - 1);
+}
+/* Left/right on the two number rows. The step grows with the value, so a
+ * thousand rounds is reachable without holding an arrow key for a minute. */
+static void aowl_admin_spawn_adjust(AowlAdminShared* s, int32_t row, int32_t dir) {
+    LONG v, step;
+    if (!s || aowl_admin_spawn_busy(s) || dir == 0) return;
+    if (row == AOWL_ADM_ROW_COUNT) {
+        v = (LONG)aowl_admin_spawn_count(s);
+        step = (v >= 1000) ? 500 : ((v >= 100) ? 100 : ((v >= 10) ? 10 : 1));
+        v += (dir > 0 ? step : -step);
+        if (v < 1) v = 1;
+        if (v > 5000) v = 5000;
+        InterlockedExchange(&s->spawnCount, v);
+    } else if (row == AOWL_ADM_ROW_COND) {
+        v = (LONG)aowl_admin_spawn_condition(s);
+        v += (dir > 0 ? 5 : -5);
+        if (v < 1) v = 1;
+        if (v > 100) v = 100;
+        InterlockedExchange(&s->spawnCondition, v);
+    }
+}
+/* Submit. Refuses -- OUT LOUD, into `spawnResult` -- rather than bumping the
+ * request when there is nothing to spawn or one is already in flight. A submit
+ * that appears to do nothing is exactly the outcome this surface is built to
+ * avoid. */
+static void aowl_admin_spawn_submit(AowlAdminShared* s) {
+    int32_t i = 0;
+    const char* why = 0;
+    const char* working = "working...";
+    if (!s) return;
+    if (aowl_admin_spawn_busy(s)) {
+        why = "a spawn is already in flight; wait for it";
+    } else if (s->spawnQueryLen <= 0 || s->spawnQuery[0] == 0) {
+        why = "type part of an item name, or a template id, first";
+    }
+    if (why) {
+        for (; i < AOWL_ADM_RESULT_LEN - 1 && why[i]; i++) s->spawnResult[i] = why[i];
+        s->spawnResult[i] = 0;
+        return;
+    }
+    if (s->spawnCount < 1)     InterlockedExchange(&s->spawnCount, 1);
+    if (s->spawnCondition < 1) InterlockedExchange(&s->spawnCondition, 100);
+    for (i = 0; i < AOWL_ADM_RESULT_LEN - 1 && working[i]; i++)
+        s->spawnResult[i] = working[i];
+    s->spawnResult[i] = 0;
+    InterlockedExchange(&s->spawnBusy, 1);
+    InterlockedIncrement(&s->spawnReq);
+}
+static const char* aowl_admin_spawn_result(AowlAdminShared* s) {
+    if (!s) return "";
+    s->spawnResult[AOWL_ADM_RESULT_LEN - 1] = 0;   /* never trust the writer  */
+    return s->spawnResult;
+}
+
+/* Character-at accessors. nimony has no `$` for `cstring`, so the mod side
+ * cannot take the `const char*` `aowl_admin_spawn_query` returns into a string;
+ * it reads the length and then the bytes, in a bounded loop. Both clamp. */
+static int32_t aowl_admin_query_len(AowlAdminShared* s) {
+    LONG n;
+    if (!s) return 0;
+    n = s->spawnQueryLen;
+    if (n < 0) return 0;
+    if (n > AOWL_ADM_QUERY_LEN - 1) return AOWL_ADM_QUERY_LEN - 1;
+    return (int32_t)n;
+}
+static int32_t aowl_admin_query_at(AowlAdminShared* s, int32_t i) {
+    if (!s || i < 0 || i >= AOWL_ADM_QUERY_LEN - 1) return 0;
+    return (int32_t)(unsigned char)s->spawnQuery[i];
+}
+
+/* ---- producer side (the mod) ---- */
+
+/* Is there a request to service? Returns its sequence number, or 0 for none. */
+static int32_t aowl_admin_spawn_pending(AowlAdminShared* s) {
+    if (!s) return 0;
+    if (s->spawnReq == s->spawnAck) return 0;
+    return (int32_t)s->spawnReq;
+}
+/* Finish one. `text` is what the player is shown, and it is written BEFORE the
+ * ack, so a HUD that sees the request complete can never read the previous
+ * request's result. */
+static void aowl_admin_spawn_done(AowlAdminShared* s, int32_t req, const char* text) {
+    int32_t i = 0;
+    if (!s) return;
+    if (text) {
+        for (; i < AOWL_ADM_RESULT_LEN - 1 && text[i]; i++) s->spawnResult[i] = text[i];
+    }
+    s->spawnResult[i] = 0;
+    InterlockedExchange(&s->spawnAck, (LONG)req);
+    InterlockedExchange(&s->spawnBusy, 0);
+}
+
+/* Activate the selected row. A toggle row flips -- but only if the mod says it
+ * is capable, so a menu gesture never turns on a mode that would silently do
+ * nothing. The spawn row submits; the two number rows are driven by left/right
+ * rather than by Enter, and the query row is typed into. */
 static void aowl_admin_menu_activate(AowlAdminShared* s) {
     if (!s) return;
     int32_t sel = (int32_t)s->menuSel;
-    if (aowl_admin_capable(s, sel))
-        aowl_admin_toggle_flip(s, sel);
+    if (aowl_admin_row_is_toggle(sel)) {
+        if (aowl_admin_capable(s, sel))
+            aowl_admin_toggle_flip(s, sel);
+        return;
+    }
+    if (sel == AOWL_ADM_ROW_SPAWN)
+        aowl_admin_spawn_submit(s);
 }
 
 /* ------------------------------------------------------------------ *

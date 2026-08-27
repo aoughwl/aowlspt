@@ -41,6 +41,7 @@ import production
 import gym
 import customise
 import tuning
+import globalsgaps
 import spawn
 import decorate
 import dialogue
@@ -94,6 +95,11 @@ proc selfCheckFailures*(): seq[string] =
   # READS BACK correct -- not that the write happened, which is the check that
   # cannot fail. `spawn` proves every refusal path carries a reason.
   discard tuning.selfCheckTuning(result)
+  # `globalsgaps` proves the twelve config members REAL BSG sends and our
+  # pre-1.0 database does not are actually PRESENT in the finished document --
+  # a negative over the merged text, plus the two ways a merge silently lies
+  # (dropping what the database had, or overwriting it).
+  discard globalsgaps.selfCheckGlobalsGaps(result)
   discard spawn.selfCheckSpawn(result)
   # The fifth of that shape, and the one with two halves for the same reason
   # `selfCheckCustomisation` has two. The pure half is the whole of the hideout

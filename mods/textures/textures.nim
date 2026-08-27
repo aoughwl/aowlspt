@@ -50,7 +50,10 @@ import loadprobe
 
 const
   ModGuid = "aowl.textures"
-  ModName = "aowl.textures"
+  # The DISPLAY name, not the guid. It read "aowl.textures" -- so the mod
+  # manager listed a mod called `aowl.textures` next to `FOV` and `Admin Menu`,
+  # and `aowl-regcheck` failed on the registry disagreeing with it.
+  ModName = "Textures"
   ModVersion = "1.0.0"
 
 # ---------------------------------------------------------------------------

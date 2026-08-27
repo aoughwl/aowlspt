@@ -28,7 +28,26 @@ can be silently wrong is worse than no tool at all.
            static/instance kind.
 
   fldoff.py [GAMEASM] [METADEC] field <Namespace.Type> <fieldName>
-        -> just that field's offset, machine-readable ("0x120" or "MISSING").
+        -> just that field's offset, machine-readable ("0x120", "MISSING",
+           or "NO-STORAGE" for a C# const, which has no address to read).
+
+  fldoff.py [GAMEASM] [METADEC] enum <Namespace.Type>
+        -> every member of an enum with its ORDINAL, decoded from the
+           fieldDefaultValues table + the default-value blob.
+
+  fldoff.py [GAMEASM] [METADEC] enumval <Namespace.Type> <MemberName>
+        -> that one ordinal, machine-readable (or MISSING / NO-VALUE /
+           NOT-AN-ENUM, never a plausible-looking number).
+
+`fields` prints the raw FieldAttributes word and its decoded names, and prints
+`--` rather than `0x0` in the Offset column for a field with NO STORAGE. A C#
+`const` is LITERAL|STATIC|HASDEFAULT (0x8056): the compiler inlines it at every
+use site, so its fieldOffsets slot is meaningless. Without the attributes that
+is indistinguishable from a `static readonly` at offset 0, which has real,
+writable storage.
+
+`enum`/`enumval` run a SECOND mandatory self-check (see `enum_self_check`)
+reproducing 19 independently-known constants before printing anything.
 
 GAMEASM defaults to D:/Games/Tarkov/GameAssembly.dll; METADEC defaults to
 .cache/global-metadata.dec.dat, resolved against the REPO (and, in a
@@ -41,7 +60,7 @@ import os
 import sys
 
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
-from il2cpp_resolve import Resolver  # noqa: E402
+from il2cpp_resolve import Resolver, const_check, print_field_rows  # noqa: E402
 
 DEFAULT_GAMEASM = os.environ.get("AOWLSPT_GAMEASM",
                                  "D:/Games/Tarkov/GameAssembly.dll")
@@ -85,11 +104,27 @@ def self_check(R):
         sys.exit(1)
 
 
+def enum_self_check(R):
+    """Same discipline as `self_check`, for the constant decoder: reproduce 19
+    constants known independently of this build (KeyCode.None/Space/A/Alpha0
+    plus one per primitive width) before printing any enum value. Prints only
+    the failure and exits non-zero if any disagrees."""
+    ok, rows = const_check(R)
+    if ok:
+        return
+    print("SELF-CHECK FAILED: the constant decoder does not reproduce known "
+          "values -- refusing to print any enum value from this build.")
+    for lbl, got, want, good in rows:
+        if not good:
+            print("   %-34s got=%r exp=%r" % (lbl, got, want))
+    sys.exit(1)
+
+
 def resolve_args():
     args = sys.argv[1:]
     # GAMEASM/METADEC are positional and optional: if the next two tokens
     # don't look like a known verb, treat them as paths.
-    verbs = ("fields", "field")
+    verbs = ("fields", "field", "enum", "enumval")
     gameasm, metadec = DEFAULT_GAMEASM, DEFAULT_METADEC
     if len(args) >= 1 and args[0] not in verbs:
         gameasm = args[0]
@@ -119,12 +154,7 @@ def main():
         ns, nm = R.tname(t)
         full = (ns + "." + nm) if ns else nm
         print("FIELDS %d %s  image=%s" % (t, full, R.image_of_type(t)))
-        print("  %-8s %-6s %-34s %-38s %s" %
-              ("Offset", "Kind", "Field", "FieldType", "DeclaredBy"))
-        for decl, name, off, st, ty in R.all_fields(t):
-            print("  %-8s %-6s %-34s %-38s %s" %
-                  (hex(off) if off is not None else "?",
-                   "STATIC" if st else "inst", name, ty, decl))
+        print_field_rows(R.all_fields_ex(t))
     elif cmd == "field":
         if len(args) < 3:
             sys.exit(__doc__)
@@ -135,7 +165,42 @@ def main():
             print("MISSING")
             sys.exit(1)
         name, off, st = rows[0]
+        # A literal has no storage; printing 0x0 here would be a lie that a
+        # caller would happily read or write through.
+        lit = [r for r in R.all_fields_ex(t) if r["name"] == args[2]][0]
+        if not lit["has_storage"]:
+            print("NO-STORAGE")
+            sys.exit(2)
         print(hex(off) if off is not None else "MISSING")
+    elif cmd == "enum":
+        enum_self_check(R)
+        t = R.find_one(args[1])
+        ns, nm = R.tname(t)
+        full = (ns + "." + nm) if ns else nm
+        if not R.is_enum(t):
+            sys.exit("%s is not an enum (base class is not System.Enum)" % full)
+        print("ENUM %d %s  image=%s" % (t, full, R.image_of_type(t)))
+        for name, v in R.enum_members(t):
+            print("  %-30s = %s" %
+                  (name, v if v is not None
+                   else "<no default-value entry in metadata>"))
+    elif cmd == "enumval":
+        # machine-readable single member: the value, or a refusal.
+        if len(args) < 3:
+            sys.exit(__doc__)
+        enum_self_check(R)
+        t = R.find_one(args[1])
+        if not R.is_enum(t):
+            print("NOT-AN-ENUM")
+            sys.exit(1)
+        hit = [v for n, v in R.enum_members(t) if n == args[2]]
+        if not hit:
+            print("MISSING")
+            sys.exit(1)
+        if hit[0] is None:
+            print("NO-VALUE")
+            sys.exit(1)
+        print(hit[0])
     else:
         sys.exit(__doc__)
 

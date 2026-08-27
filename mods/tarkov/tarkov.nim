@@ -38,6 +38,7 @@ import aowlspt/server
 import aowlspt/settings # the F12 settings schema this emulator declares
 import aowlspt/json
 import aowlspt/menutext # the main menu's bottom-right corner label
+import aowlspt/capability # the cross-mod call surface; this mod PROVIDES aowl.items
 import emu/ids
 import emu/profile
 import emu/starterkit
@@ -74,6 +75,7 @@ import emu/decorate
 import emu/selfchecks
 import emu/metadata
 import emu/post1
+import emu/globalsgaps # the config members REAL BSG sends and db.json lacks
 import emu/tuning   # the globals overrides -- the settings that reach the CLIENT
 import emu/spawn    # spawning items into a stash from the settings page
 
@@ -1295,7 +1297,7 @@ proc onGlobals(url, body, session: string): string =
   ## ballistics, stamina, malfunction, skill and flea-market code parses at
   ## session start. `applyGlobalTunes` returns its argument unchanged, without
   ## reparsing it, when nothing is overridden -- see `emu/tuning`.
-  result = envelope(raw(applyGlobalTunes(globals())))
+  result = envelope(raw(applyGlobalTunes(applyGlobalsGaps(globals()))))
 proc onHandbook(url, body, session: string): string = envelope(raw(handbook()))
 proc onCustomization(url, body, session: string): string =
   envelope(raw(customization()))
@@ -3247,6 +3249,68 @@ proc onTarkovSettings(url, body, session: string): string =
                              jstr("matches: " & searchSummary(q, 8)).text)
   result = declaredSchemaReply(st).text
 
+# ---------------------------------------------------------------------------
+# THE `aowl.items` PROVIDER
+# ---------------------------------------------------------------------------
+#
+# The same `spawnInto` the "Spawn Items" settings rows drive, published as a
+# capability so a surface that is NOT the settings page -- the admin mod's F6
+# overlay -- can spawn without reaching into this mod's routes or its config.
+#
+# THE ONE RULE THIS HANDLER EXISTS TO OBEY: every path that did not put items
+# in a stash returns `capFail` with the reason. `spawnInto` already declines in
+# five distinguishable ways and populates `message` on every one of them, so
+# there is nothing here to invent -- the failure mode this guards against is
+# the opposite one, a `capOk` carrying `"spawned": 0`, which reads to a caller
+# as success and is the single worst outcome this project produces.
+#
+# Request : {"query": str, "count": int?, "condition": int?, "profileId": str?,
+#            "session": str?}
+# Reply   : {"spawned": int, "query": str, "message": str}
+
+proc onItemsCapability(request: string): CapReply =
+  if not strictObject(request):
+    return capFail("the aowl.items request is not a JSON object")
+  let query = field(request, "query").asText("")
+  if query.len == 0:
+    return capFail("aowl.items needs a \"query\": part of an item name, or a " &
+                   "24-hex template id")
+  var count = field(request, "count").asInt(1)
+  if count < 1: count = 1
+  var condition = field(request, "condition").asInt(100)
+  if condition < 1: condition = 1
+  if condition > 100: condition = 100
+
+  # Which stash. An explicit profileId wins; otherwise the session, otherwise
+  # `spawnProfileId`'s single-profile fallback. Ambiguity is REFUSED by name
+  # rather than resolved arbitrarily -- see `spawnProfileId`.
+  var pid = field(request, "profileId").asText("")
+  if pid.len == 0:
+    pid = spawnProfileId(field(request, "session").asText(""))
+  if pid.len == 0:
+    let all = allProfileIds()
+    if all.len == 0:
+      return capFail("there is no profile to spawn into yet; log in first")
+    return capFail("there are " & $all.len & " profiles and the request named " &
+                   "none; pass \"profileId\", or log in to the character you want")
+
+  let outcome = spawnInto(pid, query, count, condition)
+  if not outcome.ok:
+    warn "aowl.items refused: " & outcome.message
+    return capFail(outcome.message)
+  # Belt and braces: `spawnInto` clamps `count` to at least 1 before placing,
+  # so `ok` cannot mean zero items -- but a future change to that clamp must
+  # not turn into a silent success here.
+  if count < 1:
+    return capFail("the spawn reported success but placed no items; refusing " &
+                   "to report that as a success")
+  info "aowl.items: " & outcome.message
+  var o = obj()
+  put(o, "spawned", count)
+  put(o, "query", query)
+  put(o, "message", outcome.message)
+  result = capOk(done(o).text)
+
 proc onTarkovSettingsReset(url, body, session: string): string =
   let st = resetFromBody(body)
   applyMenuCornerLabel()
@@ -3337,6 +3401,19 @@ proc onLoad(): Status =
   # the emulator refuses to serve anything else -- a select whose options route
   # 404s renders as an empty list, which reads as "there are no items".
   discard serve("/aowlspt/settings/" & ModGuid & "/items", onSpawnItemOptions)
+
+  # Publish the spawner as `aowl.items/1`. The registry entry for this mod
+  # lists the name too; that is what lets a consumer distinguish "not
+  # installed" from "installed but not in the selection", and it is NOT what
+  # makes the call work -- this line is.
+  let capSt = provide("aowl.items", 1, onItemsCapability)
+  if capSt == Ok:
+    info "singleplayer: providing aowl.items/1 -- the item spawner is now " &
+         "callable by any loaded mod (the admin mod's F6 overlay uses it)"
+  else:
+    warn "singleplayer: provide(aowl.items/1) was REFUSED, so the F6 overlay " &
+         "spawner will report the capability as unavailable. The " &
+         "settings-page spawner is unaffected."
 
   if not storeReady():
     error "this host has no persistent store; profiles cannot be kept " &

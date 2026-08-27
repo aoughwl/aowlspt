@@ -72,7 +72,9 @@
 ## write happens every frame, so it is on that path and nowhere near the boxed
 ## one (docs/PERF.md).
 ##
-## Three effects are implemented, each one armed only when every binding it
+## Four effects are implemented (the fourth, `get_AimingSensitivity`, is
+## described under "WHAT IS STILL NOT EXPRESSIBLE" below only because that is
+## where its refusal used to live), each one armed only when every binding it
 ## needs actually resolved, and each one reporting whether it applied:
 ##
 ##   1. **The per-frame FOV write.** Upstream's `FovController`: the camera's
@@ -143,8 +145,22 @@
 ##   this port cannot confirm the names of the camera-offset fields on
 ##   `ProceduralWeaponAnimation` against a running post-1.0 build, and writing a
 ##   camera offset to a field guessed by name is the one kind of approximation
-##   the rest of this file refuses. That is a much shorter distance to travel
-##   than it was, and it is a different problem.
+##   the rest of this file refuses.
+##
+##   **That last sentence has now expired too, and the replacement is narrower.**
+##   `tools/fldoff.py fields EFT.Animations.ProceduralWeaponAnimation` prints the
+##   whole field list off `GameAssembly.dll` + the decrypted metadata, so the
+##   names are no longer unconfirmable: `_cameraByFOVOffset` (Vector3 @0x1e0),
+##   `RotationCameraOffset` (Vector3 @0x18c), `_vCameraTarget` (Vector3 @0x180),
+##   `Offset` (Vector3 @0x98), `CameraSmoothTime` (float @0x124), `vel`
+##   (Vector3 @0x128) all exist and all have offsets. What blocks the port is
+##   one step further in: upstream's `LerpCameraPatch` is **not vendored beside
+##   this file** (`mods/fov/` holds LICENSE.txt, README.md, config.json and this
+##   source, and nothing of Fontaine's own code), so which of those six it
+##   writes, in what order, and against which speed, is a guess about
+##   *behaviour* rather than about a *name*. That is a strictly worse thing to
+##   guess, so it stays refused -- but the fix is now "vendor or read the
+##   upstream patch", not "dump a build".
 ##
 ## * **`Player::Look`** -- upstream's `FreeLookPatch` clamps the free-look angles
 ##   on `__instance`. The cost objection is gone with the rest; what stops it is
@@ -187,18 +203,43 @@
 ##   mod has a *string* out of `config.json` -- `"M"`, `"KeypadMultiply"` --
 ##   and turning one into a `KeyCode` ordinal means writing Unity's enumeration
 ##   out by hand from memory. That is a guess about a value, not a missing
-##   capability, and it is the same class of refusal as the camera-offset field
-##   names above. The settings are read, reported and carried; nothing acts on
+##   capability. The settings are read, reported and carried; nothing acts on
 ##   them.
+##
+##   **This was checked offline rather than assumed, and the check failed.**
+##   `UnityEngine.KeyCode` has 329 field entries in the metadata and every
+##   constant carries `attrs = 0x8056` (`LITERAL|STATIC|HASDEFAULT|PUBLIC`), so
+##   the ordinals are supposed to be in `fieldAndParameterDefaultValueData`
+##   (metadata header property 8), indexed by each field's
+##   `Il2CppFieldDefaultValue.dataIndex` (property 7). Read that way against
+##   `.cache/global-metadata.dec.dat`, `KeyCode.None` comes back as
+##   **-25161728** and `KeyCode.Space` as **-2113895872**; the true values are
+##   0 and 32. The blob does not decode -- string decryption is not enough for
+##   it -- so the ordinals are genuinely not derivable from what this repo has
+##   offline today, and no ordinal is written here on the strength of memory.
+##   The tool gap is named rather than routed around: neither `tools/fldoff.py`
+##   nor `tools/il2cpp_resolve.py` has an `enum <Type>` verb, and adding one
+##   requires decrypting that blob first.
 ##
 ## * **The base-FOV slider range** (`minBaseFov`/`maxBaseFov`) -- upstream's
 ##   `FovRangePatch` rewrites the slider bounds on a `GameSettingsTab` instance.
-##   The instance is delivered now and this one fires when a menu opens, so the
-##   cost objection does not apply -- it is genuinely expressible. What stops it
-##   is the last thing this port will not do: it would have to name the slider
-##   field on `GameSettingsTab`, and that name cannot be confirmed from here.
-##   The refusal is now about a name rather than a capability, which is a much
-##   shorter distance to travel.
+##   This file used to say the blocker was naming the slider field on
+##   `GameSettingsTab` -- "a much shorter distance to travel".
+##
+##   **It was measured, and the distance is infinite.** `fldoff.py fields
+##   EFT.UI.Settings.GameSettingsTab` lists all 34 fields on this build and
+##   there is no FOV bound among them: the type holds `_floatSliderTemplate`,
+##   `_toggleTemplate`, `_dropDownTemplate`, `_settingsRoot`, `_gameSettings`
+##   and the nickname/wishlist controls, and nothing else. The bounds live one
+##   type away, on `EFT.Settings.Game.GameSettingsGroup`, as
+##   `MIN_FIELD_OF_VIEW` and `MAX_FIELD_OF_VIEW` -- and both carry
+##   `attrs = 0x8056`, i.e. **`FIELD_ATTRIBUTE_LITERAL`**. A C# `const` has no
+##   storage at runtime; the compiler has already substituted its value into
+##   every use site. There is no field to write, no getter to detour and no
+##   instance that holds it. This is not "not expressible yet"; it is not
+##   expressible by a field write at all, on this build, and the only route
+##   left would be patching each inlined comparison individually. The settings
+##   stay `implemented = false` and now say why in terms that can be falsified.
 ##
 ## ---------------------------------------------------------------------------
 ## HOW YOU KNOW IT WORKED
@@ -484,10 +525,14 @@ proc fovSchema(): seq[Setting] =
                  step = 0.01, category = "FOV"),
     intSetting("maxBaseFov", "Max base FOV", 110, lo = 30, hi = 140,
                category = "FOV", implemented = false,
-               description = "Read; the FOV-range slider patch is not expressible yet"),
+               description = "Read only. MEASURED: the bound is the C# const " &
+                 "GameSettingsGroup.MAX_FIELD_OF_VIEW (field attrs 0x8056 = " &
+                 "LITERAL|STATIC|HASDEFAULT). A const has no storage and is " &
+                 "inlined at every use site, so there is nothing to write."),
     intSetting("minBaseFov", "Min base FOV", 30, lo = 10, hi = 120,
                category = "FOV", implemented = false,
-               description = "Read; the FOV-range slider patch is not expressible yet"),
+               description = "Read only. MEASURED: MIN_FIELD_OF_VIEW is a C# " &
+                 "const (attrs 0x8056), same as the max -- inlined, no storage."),
 
     boolSetting("changeMouseSensitivity", "Scale mouse sensitivity", true,
                 category = "Sensitivity",
@@ -501,17 +546,33 @@ proc fovSchema(): seq[Setting] =
 
     keybindSetting("zoomToggleKey", "Toggle-zoom key", "M",
                    category = "Toggle zoom", implemented = false,
-                   description = "Read; needs KeyCode-enum name mapping, not yet expressible"),
+                   description = "Read only. Input::GetKey takes a KeyCode " &
+                     "ordinal. MEASURED: KeyCode's constants are LITERAL " &
+                     "(attrs 0x8056) and their values live in metadata prop 8 " &
+                     "(fieldAndParameterDefaultValueData), which does NOT " &
+                     "decode on this build -- KeyCode.None reads -25161728, " &
+                     "not 0. So the name->ordinal map cannot be derived here " &
+                     "and will not be typed out from memory."),
     boolSetting("holdToZoom", "Hold to zoom", true, category = "Toggle zoom",
-                implemented = false, description = "Read; toggle-zoom is not wired yet"),
+                implemented = false,
+                description = "Read only. Blocked behind zoomToggleKey: with " &
+                  "no KeyCode ordinal there is no key state to hold."),
 
     floatSetting("rifleCameraZOffset", "Rifle camera Z offset", 0.025,
                  lo = -0.2, hi = 0.2, step = 0.005, category = "Camera",
                  implemented = false,
-                 description = "Read; the camera-offset write is not expressible yet"),
+                 description = "Read only. ProceduralWeaponAnimation's field " &
+                   "list IS now resolvable offline (tools/fldoff.py), so the " &
+                   "old 'cannot confirm the name' reason has expired. What " &
+                   "blocks it now is semantics: upstream's LerpCameraPatch is " &
+                   "not vendored beside this file, so WHICH of _cameraByFOVOffset " &
+                   "/ RotationCameraOffset / _vCameraTarget it writes, and how, " &
+                   "would be a guess about behaviour rather than about a name."),
     floatSetting("rifleAimSpeedZ", "Rifle aim speed Z", 3.0, lo = 0.0, hi = 10.0,
                  step = 0.1, category = "Camera", implemented = false,
-                 description = "Read; the aim-speed write is not expressible yet"),
+                 description = "Read only. Same LerpCameraPatch semantics gap " &
+                   "as rifleCameraZOffset; the per-axis speed fields are not " &
+                   "identifiable without the upstream source."),
 
     boolSetting("verifyHooks", "Verify hooks at load", true, category = "Advanced",
                 description = "Assert each detour bound before trusting it")]
@@ -2558,12 +2619,17 @@ proc reportWatch() =
        "the host does today rather than what it did when the port was " &
        "written: LerpCamera and Look are neither a gap nor a cost any more " &
        "(the payload carries `this`, thisPointer turns it into an address in " &
-       "8 ns, and bindRaw reaches a Vector3) -- what is left is that this " &
-       "port cannot confirm the camera-offset field names on " &
-       "ProceduralWeaponAnimation against a running build, which is a name " &
-       "problem rather than a capability one; the FOV slider range is the " &
-       "same kind of name problem on GameSettingsTab; the toggle-zoom key " &
-       "needs a KeyCode ordinal this port will not guess -- and note that " &
+       "8 ns, and bindRaw reaches a Vector3) -- and the NAME objection has " &
+       "expired as well, because fldoff.py prints " &
+       "ProceduralWeaponAnimation's whole field list offline; what is left " &
+       "for LerpCamera is that upstream's patch is not vendored, so its " &
+       "BEHAVIOUR would be the guess. The FOV slider range is NOT the same " &
+       "kind of problem and is no longer a 'not yet': measured, the bounds " &
+       "are C# consts (GameSettingsGroup.MIN/MAX_FIELD_OF_VIEW, attrs " &
+       "0x8056 = LITERAL), inlined with no storage, so there is nothing to " &
+       "write. The toggle-zoom key " &
+       "needs a KeyCode ordinal this port will not guess -- measured: the " &
+       "ordinals live in a metadata blob that does not decode here -- and " &
        "that is now the whole of the objection, because an enum argument is " &
        "a plain number to the host and no longer refused. " &
        "get_AimingSensitivity is no longer on this list: it is a postfix now, " &
@@ -2894,9 +2960,13 @@ proc simSelfTest(): Status =
        "old blockers are gone: the payload carries `this`, thisPointer turns " &
        "it into an address in ~8 ns, and bindRaw binds a method by its native " &
        "slot shape, which is what a 12-byte Vector3 by hidden pointer needs. " &
-       "What is left is that this port cannot confirm the camera-offset " &
-       "field names on ProceduralWeaponAnimation against a running build, " &
-       "and will not write a camera offset through a guessed name."
+       "The NAME objection has expired too: fldoff.py prints the whole " &
+       "ProceduralWeaponAnimation field list offline -- _cameraByFOVOffset " &
+       "@0x1e0, RotationCameraOffset @0x18c, _vCameraTarget @0x180, Offset " &
+       "@0x98, CameraSmoothTime @0x124, vel @0x128. What is left is that " &
+       "upstream's LerpCameraPatch is not vendored beside this file, so which " &
+       "of those it writes and how is a guess about BEHAVIOUR, which is worse " &
+       "than a guess about a name. Refused."
   info "    Player::Look -- unchanged, and about the payload rather than the " &
        "instance: the angles arrive as a UnityEngine.Vector2, which is passed " &
        "by hidden pointer and reported as {\"valueType\":\"...\"} -- named " &
@@ -2907,13 +2977,18 @@ proc simSelfTest(): Status =
        "multiply, hand the product back. Typed (~44 ns) on a revision-4 " &
        "host, JSON (~1.6 us) on revision 3, and the effect's state line says " &
        "which armed."
-  info "    the toggle-zoom key -- UnityEngine.Input::GetKey takes a KeyCode " &
-       "enum and this port will not map the configured names onto ordinals " &
-       "it cannot confirm."
-  info "    the base-FOV slider range -- now blocked only by a *name*. The " &
-       "instance is delivered and this fires when a menu opens, so the cost " &
-       "objection does not apply; what cannot be confirmed from here is which " &
-       "field on GameSettingsTab holds the slider bounds."
+  info "    the toggle-zoom key -- MEASURED, not assumed: KeyCode's 329 " &
+       "constants are all LITERAL (attrs 0x8056) and their ordinals live in " &
+       "metadata property 8, which does not decode on this build -- " &
+       "KeyCode.None reads -25161728 where the true value is 0. So no " &
+       "name->ordinal map is derivable offline, and none is typed out from " &
+       "memory. Tool gap: no `enum <Type>` verb in fldoff/il2cpp_resolve."
+  info "    the base-FOV slider range -- MEASURED and now a hard NO, not a " &
+       "'not yet'. GameSettingsTab has 34 fields on this build and no FOV " &
+       "bound among them; the bounds are GameSettingsGroup.MIN_FIELD_OF_VIEW " &
+       "/ MAX_FIELD_OF_VIEW, both attrs 0x8056 = FIELD_ATTRIBUTE_LITERAL. A " &
+       "C# const has no storage and is inlined at every use site: there is " &
+       "no field to write and no getter to detour."
 
   # --- the cost of the per-frame path, on this machine's own clock.
   const Iterations = 20000

@@ -1974,8 +1974,14 @@ proc verTrim(s: string): string =
     i = i + 1
 
 proc verBrandCompose(stock: string): string =
-  ## "aowlspt <ver>, aoughwl.com  -  tarkov <tarkov ver> | <mode>", built from
-  ## whatever the game actually wrote.
+  ## "aowlspt beta <ver>, aoughwl.com | <tarkov ver>", built from whatever the
+  ## game actually wrote.
+  ##
+  ## The stock label reads e.g. "1.1.0.1.46777 | PvE" (fact #12), so the part
+  ## before the pipe is Tarkov's build and the part after is the mode. We keep
+  ## the build and DROP the mode: the mode selector is skipped on launch and
+  ## its button is hidden, so "| PvE" is a claim about a screen the player
+  ## never sees.
   var tarkov = ""
   var mode = ""
   var seen = false
@@ -1988,11 +1994,9 @@ proc verBrandCompose(stock: string): string =
     else:
       tarkov.add stock[i]
     i = i + 1
-  result = "aowlspt " & VerBrandOurVersion & ", aoughwl.com  -  tarkov " &
+  result = "aowlspt beta " & VerBrandOurVersion & ", aoughwl.com | " &
            verTrim(tarkov)
-  let m = verTrim(mode)
-  if m.len > 0:
-    result = result & " | " & m
+  discard verTrim(mode)   # deliberately dropped; see the doc comment above
 
 proc verBrandResolve(): Il2CppPtr =
   ## Walk the fixed path to the label from the live PreloaderUI anchor. Each hop

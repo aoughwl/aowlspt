@@ -34,7 +34,8 @@ aowl -- build, test and install aowlspt
   build              hosts, installer and every example (~25 compiles, slow)
   build TARGET       just one: host backend sim launch installer emutest
                      verify probe mods examples deploy
-                     `deploy` = the four artifacts a live install takes
+                     `deploy` = every artifact tools\deploy.json ships,
+                     read from that file so the two can never drift
   bootstrap          rebuild aowl.exe ITSELF -- `build` never does, and a
                      worktree with no aowl.exe or a stale one runs old code
                      while reporting ok
@@ -956,6 +957,93 @@ proc modDirs(e: Env): seq[string] =
       continue
     result.add joinPath(root, d)
 
+# ------------------------------------------------------- the deploy set
+
+proc deploySrcPaths(e: Env): seq[string] =
+  ## Every `src` path named by `tools/deploy.json`, in file order.
+  ##
+  ## DERIVED, never duplicated. `python tools\deploy.py check` verifies exactly
+  ## this list; the build that precedes it must therefore cover exactly this
+  ## list. Until 2026-08-27 it did not: the `deploy` target built four things
+  ## while the checker verified sixteen, so ten mods reached a beta only if
+  ## somebody separately remembered `aowl build mods`. A second hand-written
+  ## list here would just be the same bug with a shorter fuse -- so there is
+  ## no list here, only a reader.
+  result = @[]
+  var text = ""
+  if not readTextFile(joinPath(e.repo, "tools\\deploy.json"), text):
+    err "cannot read tools\\deploy.json, so the deploy target cannot know " &
+        "what to build. Refusing to build a guess."
+    inc failures
+    return
+  var i = 0
+  while i < text.len:
+    var j = i
+    while j < text.len and text[j] != '\n':
+      inc j
+    var line = text.substr(i, j - 1)
+    i = j + 1
+    line = strip(line)
+    if not startsWith(line, "\"src\""):
+      continue
+    let c = find(line, ':')
+    if c < 0:
+      continue
+    var v = strip(line.substr(c + 1, line.len - 1))
+    if endsWith(v, ","):
+      v = strip(v.substr(0, v.len - 2))
+    if v.len < 2 or v[0] != '"' or v[v.len - 1] != '"':
+      err "tools\\deploy.json: could not read a src value from: " & line
+      inc failures
+      continue
+    result.add v.substr(1, v.len - 2)
+
+proc buildDeploySet(e: Env): int =
+  ## Build every artifact `deploy.py check` will look at.
+  ##
+  ## An entry this cannot map to a build step is a LOUD failure, not a skip.
+  ## That is the whole safety property: adding an artifact to deploy.json can
+  ## no longer quietly leave it unbuilt, and the fix is to teach this proc how
+  ## to build it -- never to delete the entry from deploy.json.
+  let srcs = deploySrcPaths(e)
+  if srcs.len == 0:
+    err "tools\\deploy.json named no artifacts. That is not a deploy build."
+    inc failures
+    return 1
+  var builtHost = false
+  var builtBackend = false
+  var builtLaunch = false
+  var mods = 0
+  for s in srcs:
+    let p = normSep(s)
+    if startsWith(p, "host\\Aowlspt.Host.Il2Cpp\\bin\\"):
+      # The host DLL and both name-index files all come out of one build.
+      if not builtHost:
+        builtHost = true
+        discard buildIl2CppHost(e)
+    elif startsWith(p, "backend\\bin\\"):
+      if not builtBackend:
+        builtBackend = true
+        discard buildBackend(e)
+    elif p == "installer\\build\\aowlspt-launch.exe":
+      if not builtLaunch:
+        builtLaunch = true
+        discard buildTool(e, "tools\\aowllaunch.nim", "aowlspt-launch.exe",
+                          "aowlspt-launch")
+    elif endsWith(p, ".dll") and find(p, "\\bin\\") > 0:
+      let cut = find(p, "\\bin\\")
+      inc mods
+      discard buildMod(e, joinPath(e.repo, p.substr(0, cut - 1)))
+    else:
+      err "tools\\deploy.json ships '" & s & "' and this build target does " &
+          "not know how to build it."
+      note "teach buildDeploySet in tools\\aowl.nim how -- do NOT delete the " &
+           "entry from deploy.json to make this quiet."
+      inc failures
+  note "deploy set: " & $srcs.len & " artifact(s) named by deploy.json, " &
+       $mods & " of them mods"
+  result = if failures > 0: 1 else: 0
+
 # --------------------------------------------------------------- commands
 
 proc abiStamp(e: Env): string =
@@ -1146,14 +1234,9 @@ proc cmdBuildOne(e: Env; target: string): int =
       discard buildMod(e, m)
     result = if failures > 0: 1 else: 0
   of "deploy":
-    # The four artifacts that actually go into a live install, and nothing
-    # else. This is the build that precedes `python tools\deploy.py deploy`.
-    discard buildIl2CppHost(e)
-    discard buildMod(e, joinPath(e.repo, "mods\\tarkov"))
-    discard buildBackend(e)
-    discard buildTool(e, "tools\\aowllaunch.nim", "aowlspt-launch.exe",
-                      "aowlspt-launch")
-    result = if failures > 0: 1 else: 0
+    # Everything a live install takes -- read off tools\deploy.json, which is
+    # the same file `python tools\deploy.py check` verifies against.
+    result = buildDeploySet(e)
   else:
     err "unknown build target: " & target
     note "targets: host backend sim launch installer emutest verify probe " &

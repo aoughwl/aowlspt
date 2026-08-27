@@ -140,10 +140,17 @@ Usage:
         # Generated code lives in the `il2cpp` section, NOT `.text`.
   il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> verify-be
   il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> fields <TypeName>
-        # every field (incl. inherited) with offset + static/inst + type;
+        # every field (incl. inherited) with offset, FieldAttributes (raw +
+        # decoded), and the constant value for a literal. A field with NO
+        # STORAGE (a C# `const`) prints `--` for its offset, not `0x0`.
         # <TypeName> is an exact full name or a unique substring
+  il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> enum <TypeName>
+        # every member of an enum with its decoded ordinal
   il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> verify-fields
         # System.String _stringLength@0x10 / _firstChar@0x14 self-check
+  il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> verify-consts
+        # the constant decoder against 19 independently-known values
+        # (KeyCode.None/Space/A/Alpha0 + one per primitive width)
   il2cpp_resolve.py <GameAssembly.dll> <global-metadata.dec.dat> settings-table
         # the SettingsScreen/SettingControl offset table Phase 1 will probe
 """
@@ -520,6 +527,187 @@ class Resolver:
         attrs = struct.unpack_from("<I", self.b, self.v2f(tva) + 8)[0] & 0xFFFF
         return bool(attrs & 0x10)
 
+    def field_attrs(self, tidx):
+        """Raw FieldAttributes (u16) for the field whose Il2CppType index is
+        tidx. Same word `field_is_static` masks 0x10 out of."""
+        tva = self.rq(self.TYPES_PTR + tidx*8)
+        return struct.unpack_from("<I", self.b, self.v2f(tva) + 8)[0] & 0xFFFF
+
+    FATTR = [(0x0010, "STATIC"), (0x0020, "INITONLY"), (0x0040, "LITERAL"),
+             (0x0080, "NOTSERIALIZED"), (0x0100, "HASFIELDRVA"),
+             (0x0200, "SPECIALNAME"), (0x0400, "RTSPECIALNAME"),
+             (0x1000, "HASFIELDMARSHAL"), (0x2000, "PINVOKEIMPL"),
+             (0x8000, "HASDEFAULT")]
+    FACCESS = ["PrivateScope", "private", "FamANDAssem", "internal",
+               "protected", "FamORAssem", "public", "?"]
+
+    @classmethod
+    def attr_names(cls, attrs):
+        out = [cls.FACCESS[attrs & 7]]
+        out += [n for bit, n in cls.FATTR if attrs & bit]
+        return out
+
+    # ---- default values (const / literal fields) -------------------------
+    #
+    # Metadata property 7 = `fieldDefaultValues`, an array of
+    # Il2CppFieldDefaultValue = { int32 fieldIndex; int32 typeIndex;
+    # int32 dataIndex; } (12 bytes). `dataIndex` is a BYTE OFFSET into
+    # property 8 (`fieldAndParameterDefaultValueData`) -- it is NOT the field
+    # index, and the blob is NOT a flat array of int32.
+    #
+    # MEASURED encoding on this build (see the self-check in `enum_self_check`,
+    # which reproduces 19 independently-known constants across every primitive
+    # class): the blob is RAW little-endian for every width EXCEPT I4/U4, which
+    # are stored as il2cpp's ECMA-335-style COMPRESSED integers, big-endian,
+    # with zigzag applied for the signed form. That is why a naive
+    # `int32 at blob[dataIndex]` reads KeyCode.None as -25161728: it is reading
+    # one zigzag-compressed byte (0x00 = 0) plus the next three neighbouring
+    # constants' bytes as if they were the upper 24 bits of an int32.
+    def _read_compressed_u32(self, p):
+        """il2cpp ReadCompressedUInt32. Returns (value, nbytes); (None, 0) if
+        the lead byte is not a legal encoding."""
+        m, b = self.m, self.m[p]
+        if b == 0xFF:
+            return 0xFFFFFFFF, 1
+        if b == 0xFE:
+            return 0xFFFFFFFE, 1
+        if b == 0xF0:
+            return int.from_bytes(m[p+1:p+5], "little"), 5
+        if b < 0x80:
+            return b, 1
+        if (b & 0xC0) == 0x80:
+            return ((b & 0x3F) << 8) | m[p+1], 2
+        if (b & 0xE0) == 0xC0:
+            return (((b & 0x1F) << 24) | (m[p+1] << 16) |
+                    (m[p+2] << 8) | m[p+3]), 4
+        return None, 0
+
+    def _read_compressed_i32(self, p):
+        u, n = self._read_compressed_u32(p)
+        if u is None:
+            return None
+        if u == 0xFFFFFFFF:
+            return -2**31
+        return -((u >> 1) + 1) if (u & 1) else (u >> 1)
+
+    def _ensure_defaults(self):
+        if hasattr(self, "DEFV"):
+            return
+        self._ensure_fields()
+        fo, fs = struct.unpack_from("<ii", self.m, 8 + 7*8)
+        self.DEFB = struct.unpack_from("<ii", self.m, 8 + 8*8)[0]
+        self.DEFV = {}
+        for i in range(fs // 12):
+            fi, ti, di = struct.unpack_from("<iii", self.m, fo + i*12)
+            self.DEFV[fi] = (ti, di)
+
+    def type_enum_of(self, tidx):
+        tva = self.rq(self.TYPES_PTR + tidx*8)
+        return (struct.unpack_from("<I", self.b, self.v2f(tva) + 8)[0] >> 16) & 0xFF
+
+    def field_default(self, field_index):
+        """Decoded constant for metadata field `field_index`, or None if the
+        field has no default-value entry. Returns (value, typeenum); value is
+        the string '<undecoded:0xNN>' for a shape we have not MEASURED, never a
+        plausible-looking number."""
+        self._ensure_defaults()
+        e = self.DEFV.get(field_index)
+        if e is None:
+            return None
+        ti, di = e
+        te = self.type_enum_of(ti)
+        p = self.DEFB + di
+        m = self.m
+        if te == 0x02:
+            return (bool(m[p]), te)
+        if te == 0x03:
+            return (struct.unpack_from("<H", m, p)[0], te)
+        if te == 0x04:
+            return (struct.unpack_from("<b", m, p)[0], te)
+        if te == 0x05:
+            return (m[p], te)
+        if te == 0x06:
+            return (struct.unpack_from("<h", m, p)[0], te)
+        if te == 0x07:
+            return (struct.unpack_from("<H", m, p)[0], te)
+        if te == 0x08:
+            return (self._read_compressed_i32(p), te)
+        if te == 0x09:
+            return (self._read_compressed_u32(p)[0], te)
+        if te == 0x0A:
+            return (struct.unpack_from("<q", m, p)[0], te)
+        if te == 0x0B:
+            return (struct.unpack_from("<Q", m, p)[0], te)
+        if te == 0x0C:
+            return (struct.unpack_from("<f", m, p)[0], te)
+        if te == 0x0D:
+            return (struct.unpack_from("<d", m, p)[0], te)
+        return ("<undecoded:%#x>" % te, te)
+
+    def is_enum(self, t):
+        """True iff t's base class is System.Enum."""
+        p = self.parent_type(t)
+        return p is not None and self.tname(p) == ("System", "Enum")
+
+    def enum_members(self, t):
+        """[(name, value_or_None)] for the LITERAL fields of enum type t, in
+        metadata declaration order. `value__` (the instance storage slot) is
+        excluded. A member with no default-value entry yields None -- that is
+        an honest 'metadata does not say', not a zero."""
+        out = []
+        for r in self.declared_fields_ex(t):
+            if not (r["attrs"] & 0x40):     # FIELD_ATTRIBUTE_LITERAL
+                continue
+            dv = self.field_default(r["fidx"])
+            out.append((r["name"], None if dv is None else dv[0]))
+        return out
+
+    def declared_fields_ex(self, t):
+        """Rich per-field rows for fields DECLARED on t. Superset of
+        `declared_fields`, which keeps its 4-tuple shape for existing callers.
+
+        keys: fidx name off attrs static literal has_storage typename default
+        `has_storage` is False for a LITERAL (C# `const`): the compiler inlines
+        it at every use site and the fieldOffsets entry is meaningless -- it
+        reads 0x0, which is indistinguishable from a real static at offset 0
+        unless the attributes are shown."""
+        self._ensure_fields()
+        bb = self.TD_OFF + t*self.TDS
+        fs = struct.unpack_from("<i", self.m, bb+32)[0]
+        fc = struct.unpack_from("<H", self.m, bb+68)[0]
+        entry = self.rq(self.FOFF_PTR + t*8)
+        base = self.v2f(entry) if entry else None
+        out = []
+        for i in range(fc):
+            ni, ti = struct.unpack_from("<ii", self.m, self.FLD_OFF + (fs+i)*12)
+            off = struct.unpack_from("<i", self.b, base + i*4)[0] if base else None
+            attrs = self.field_attrs(ti)
+            lit = bool(attrs & 0x40)
+            dv = self.field_default(fs + i)
+            out.append({"fidx": fs + i, "name": self.s(ni), "off": off,
+                        "attrs": attrs, "static": bool(attrs & 0x10),
+                        "literal": lit, "has_storage": not lit,
+                        "typename": self.field_typename(ti),
+                        "default": None if dv is None else dv[0]})
+        return out
+
+    def all_fields_ex(self, t):
+        """declared_fields_ex over the full parent chain, base classes first;
+        each row gains 'declared_by'."""
+        chain, cur, seen = [], t, set()
+        while cur is not None and cur not in seen:
+            seen.add(cur)
+            chain.append(cur)
+            cur = self.parent_type(cur)
+        rows = []
+        for ct in reversed(chain):
+            ns, nm = self.tname(ct)
+            full = (ns + "." + nm) if ns else nm
+            for r in self.declared_fields_ex(ct):
+                r["declared_by"] = full
+                rows.append(r)
+        return rows
+
     def declared_fields(self, t):
         """[(name, offset, is_static, typename)] for fields DECLARED on type t."""
         self._ensure_fields()
@@ -583,6 +771,79 @@ class Resolver:
                  (name, ", ".join(f for _, f in hits[:12])))
 
 
+# Ground truth for the constant decoder, known independently of this build:
+# these are C# language / Unity API constants. Every one of them must come back
+# exactly, or the decoder is wrong and no constant it prints may be trusted.
+# The four KeyCode entries are the oracle the enum verb was written against;
+# the rest pin down one primitive width each, so a decoder that is right only
+# for int32 cannot pass.
+ENUM_ORACLE = [
+    ("UnityEngine.KeyCode", "None", 0),
+    ("UnityEngine.KeyCode", "Space", 32),
+    ("UnityEngine.KeyCode", "A", 97),
+    ("UnityEngine.KeyCode", "Alpha0", 48),
+    ("System.Int32", "MaxValue", 2147483647),
+    ("System.Int32", "MinValue", -2147483648),
+    ("System.UInt32", "MaxValue", 4294967295),
+    ("System.Int16", "MaxValue", 32767),
+    ("System.Int16", "MinValue", -32768),
+    ("System.UInt16", "MaxValue", 65535),
+    ("System.Byte", "MaxValue", 255),
+    ("System.Char", "MaxValue", 65535),
+    ("System.Char", "MinValue", 0),
+    ("System.Int64", "MaxValue", 9223372036854775807),
+    ("System.Int64", "MinValue", -9223372036854775808),
+    ("System.UInt64", "MaxValue", 18446744073709551615),
+    ("System.Single", "MaxValue", 3.4028234663852886e38),
+    ("System.Single", "Epsilon", 1.401298464324817e-45),
+    ("System.Double", "MaxValue", 1.7976931348623157e308),
+]
+
+
+def print_field_rows(rows):
+    """Shared field table. The Offset column prints `--` for a field with NO
+    STORAGE (a C# `const` = LITERAL|STATIC|HASDEFAULT). It used to print 0x0
+    there, which is a real offset for a real static and so made a const
+    indistinguishable from a `static readonly` -- a distinction that decides
+    whether a field can be written at all."""
+    print("  %-8s %-34s %-30s %-40s %-22s %s" %
+          ("Offset", "Field", "FieldType", "Attrs", "Const", "DeclaredBy"))
+    for r in rows:
+        if not r["has_storage"]:
+            off = "--"
+        elif r["off"] is None:
+            off = "?"
+        else:
+            off = hex(r["off"])
+        dv = r["default"]
+        print("  %-8s %-34s %-30s %-40s %-22s %s" %
+              (off, r["name"], r["typename"],
+               "%#06x %s" % (r["attrs"], "|".join(Resolver.attr_names(r["attrs"]))),
+               "" if dv is None else repr(dv), r["declared_by"]))
+
+
+def const_check(R):
+    """Returns (ok, rows). A member the metadata does not contain at all is a
+    FAILURE here, not a pass -- these 19 are all reachable on this build, and
+    'I could not look' is not a pass. (Note that IL2CPP managed stripping DOES
+    remove unreferenced consts in general: System.SByte.MaxValue and
+    System.Math.PI are genuinely absent from this build's metadata, which is
+    why they are not in the oracle.)"""
+    rows, ok = [], True
+    for tn, fn, want in ENUM_ORACLE:
+        try:
+            t = R.find_one(tn)
+            hit = [r for r in R.declared_fields_ex(t) if r["name"] == fn]
+            got = hit[0]["default"] if hit else "<field absent from metadata>"
+        except SystemExit as e:
+            got = "<unresolved: %s>" % e
+        good = (got == want) and (type(got) is type(want) or
+                                  isinstance(got, (int, float)))
+        ok = ok and good
+        rows.append((tn + "." + fn, got, want, good))
+    return ok, rows
+
+
 def main():
     if len(sys.argv) < 4:
         sys.exit(__doc__)
@@ -591,6 +852,53 @@ def main():
     if cmd == "find":
         for t, full in R.find(sys.argv[4]):
             print(t, full, " image=", R.image_of_type(t))
+    elif cmd == "methods":
+        # `find` searches TYPE names only; this searches METHOD names, which is
+        # what you want when you know a call site's name (LocalRaidEnded) but
+        # not its declaring type, and it prints the full signature + RVA +
+        # sharedness so the answer is directly actionable.
+        needle = sys.argv[4].lower()
+        want_shared = "--shared" in sys.argv[5:]
+        shared = R.shared_rva_counts() if want_shared else {}
+        lim = 200
+        for a in sys.argv[5:]:
+            if a.startswith("--limit="):
+                lim = int(a.split("=", 1)[1])
+        hits = 0
+        for t in range(R.NTYPES):
+            ms = R.type_methods(t)
+            names = [R.mname(mi) for mi in ms]
+            if not any(needle in n.lower() for n in names):
+                continue
+            full, img, resolved = R.resolve_type(t)
+            for (nm, rid, va), mi in zip(resolved, ms):
+                if needle not in nm.lower():
+                    continue
+                if hits >= lim:
+                    print("... limit %d reached; re-run with --limit=N. This is "
+                          "NOT 'no more matches'." % lim)
+                    return
+                hits += 1
+                try:
+                    sig, pc = R.sig_string(mi, nm)
+                except Exception:
+                    sig, pc = nm + "(?)", -1
+                rva = (va - R.IB) if va else None
+                print("%s::%s  arity=%s RVA=%s  image=%s"
+                      % (full, sig, pc if pc >= 0 else "?",
+                         hex(rva) if rva is not None else "None", img))
+                if rva is None:
+                    continue
+                note = R.annotate_rva(rva)
+                n = shared.get(rva, 1)
+                if n > 1:
+                    note += ("  [SHARED: %d methods resolve here -- hooking "
+                             "this fires for all of them]" % n)
+                if note.strip():
+                    print("      " + note.strip())
+        if hits == 0:
+            print("no method name contains %r (searched all %d types "
+                  "EXHAUSTIVELY)" % (sys.argv[4], R.NTYPES))
     elif cmd == "type":
         args = [a for a in sys.argv[4:] if not a.startswith("--")]
         want_shared = "--shared" in sys.argv[4:]
@@ -667,12 +975,7 @@ def main():
         print("  MetadataRegistration @ %s  fieldOffsets @ %s" %
               (hex(R.MREG) if hasattr(R, "MREG") else "?",
                hex(R.FOFF_PTR) if hasattr(R, "FOFF_PTR") else "?"))
-        print("  %-8s %-6s %-34s %-38s %s" %
-              ("Offset", "Kind", "Field", "FieldType", "DeclaredBy"))
-        for decl, name, off, st, ty in R.all_fields(t):
-            print("  %-8s %-6s %-34s %-38s %s" %
-                  (hex(off) if off is not None else "?",
-                   "STATIC" if st else "inst", name, ty, decl))
+        print_field_rows(R.all_fields_ex(t))
     elif cmd == "verify-fields":
         t = R.find_one("System.String")
         want = {"_stringLength": 0x10, "_firstChar": 0x14}
@@ -685,6 +988,33 @@ def main():
                   (k, hex(g) if g is not None else None, hex(v),
                    "OK" if g == v else "MISMATCH"))
         print("STRING LAYOUT SELF-CHECK PASSED" if ok else "RESOLVER WRONG")
+        if not ok:
+            sys.exit(1)
+    elif cmd == "enum":
+        ok, rows = const_check(R)
+        if not ok:
+            print("CONSTANT SELF-CHECK FAILED -- refusing to print any enum "
+                  "value from this build.")
+            for lbl, got, want, good in rows:
+                if not good:
+                    print("   %-32s got=%r exp=%r" % (lbl, got, want))
+            sys.exit(1)
+        t = R.find_one(sys.argv[4])
+        ns, nm = R.tname(t)
+        full = (ns + "." + nm) if ns else nm
+        if not R.is_enum(t):
+            sys.exit("%s is not an enum (base class is not System.Enum)" % full)
+        print("ENUM", t, full, " image=", R.image_of_type(t))
+        for name, v in R.enum_members(t):
+            print("  %-30s = %s" %
+                  (name, v if v is not None
+                   else "<no default-value entry in metadata>"))
+    elif cmd == "verify-consts":
+        ok, rows = const_check(R)
+        for lbl, got, want, good in rows:
+            print("   %-34s got=%-24r exp=%-24r %s" %
+                  (lbl, got, want, "OK" if good else "MISMATCH"))
+        print("CONSTANT DECODER SELF-CHECK PASSED" if ok else "RESOLVER WRONG")
         if not ok:
             sys.exit(1)
     elif cmd == "settings-table":
@@ -720,8 +1050,8 @@ def main():
         # separate agents lost round trips to it. Say what happened.
         sys.exit(
             "unknown subcommand %r.\n"
-            "Known: find, type, bytes, verify-be, fields, verify-fields, "
-            "settings-table.\n"
+            "Known: find, type, bytes, verify-be, fields, enum, "
+            "verify-fields, verify-consts, settings-table.\n"
             "NOTE: `find` matches TYPE names only. To search by METHOD name "
             "use\n"
             "  python tools/il2cpp_symtab.py find-method <dll> <metadec> "

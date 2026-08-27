@@ -7717,16 +7717,77 @@ static LRESULT CALLBACK aowl_ov_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
             return 0;
         }
         if (g_ov_admin && aowl_admin_menu_open(g_ov_admin)) {
+            int32_t sel = (int32_t)g_ov_admin->menuSel;
             switch ((int32_t)wp) {
                 case VK_UP:    aowl_admin_menu_move(g_ov_admin, -1); return 0;
                 case VK_DOWN:  aowl_admin_menu_move(g_ov_admin, +1); return 0;
+                /* Left/right MEANS something different per row: on a toggle it
+                 * is still "flip", on the two spawner number rows it steps the
+                 * value, and on the query row it is ignored rather than
+                 * silently flipping whatever bit 12 would have been. */
+                case VK_LEFT:
+                case VK_RIGHT:
+                    if (aowl_admin_row_is_toggle(sel)) {
+                        aowl_admin_menu_activate(g_ov_admin);
+                    } else {
+                        aowl_admin_spawn_adjust(g_ov_admin, sel,
+                            ((int32_t)wp == VK_RIGHT) ? +1 : -1);
+                    }
+                    return 0;
                 case VK_RETURN:
                 case VK_SPACE:
-                case VK_LEFT:
-                case VK_RIGHT: aowl_admin_menu_activate(g_ov_admin); return 0;
+                    /* SPACE on the query row is a SPACE, not an activate --
+                     * item names have spaces in them ("m855a1", "grizzly
+                     * medical") and swallowing it would make half the
+                     * database untypeable. */
+                    if (sel == AOWL_ADM_ROW_QUERY && (int32_t)wp == VK_SPACE)
+                        aowl_admin_query_putc(g_ov_admin, ' ');
+                    else
+                        aowl_admin_menu_activate(g_ov_admin);
+                    return 0;
+                case VK_BACK:
+                    if (sel == AOWL_ADM_ROW_QUERY)
+                        aowl_admin_query_backspace(g_ov_admin);
+                    return 0;
                 case VK_ESCAPE: aowl_admin_menu_toggle(g_ov_admin); return 0;
             }
+            /* Everything else on the query row is swallowed here and picked up
+             * as WM_CHAR below. Swallowing the KEYDOWN as well is what stops
+             * the letters from also reaching the game as movement keys while
+             * the player is typing an item name. */
+            if (sel == AOWL_ADM_ROW_QUERY) {
+                int32_t vk = (int32_t)wp;
+                if ((vk >= '0' && vk <= '9') || (vk >= 'A' && vk <= 'Z') ||
+                    (vk >= VK_NUMPAD0 && vk <= VK_DIVIDE) ||
+                    (vk >= VK_OEM_1 && vk <= VK_OEM_3) ||
+                    (vk >= VK_OEM_4 && vk <= VK_OEM_8))
+                    return 0;
+            }
         }
+    }
+
+    /* WM_CHAR is where TEXT comes from. WM_KEYDOWN carries a virtual-key code,
+     * not a character: it does not know the keyboard layout, does not know
+     * whether shift was down, and does not produce the right byte for anything
+     * but unshifted US letters. Typing an item name therefore has to be read
+     * here, in its own message, exactly as F10 has to be read in WM_SYSKEYDOWN
+     * rather than WM_KEYDOWN -- the message a key arrives as is a fact about
+     * Windows, not something to infer from the key's name.
+     *
+     * F6 itself is an ordinary key and DOES arrive as WM_KEYDOWN; the block
+     * above handles WM_SYSKEYDOWN too, so it is correct either way. */
+    if (msg == WM_CHAR && g_ov_admin && aowl_admin_menu_open(g_ov_admin) &&
+        (int32_t)g_ov_admin->menuSel == AOWL_ADM_ROW_QUERY) {
+        int32_t ch = (int32_t)wp;
+        if (ch == '\b') { aowl_admin_query_backspace(g_ov_admin); return 0; }
+        if (ch >= 0x20 && ch <= 0x7E) {
+            aowl_admin_query_putc(g_ov_admin, ch);
+            return 0;
+        }
+        /* A character outside printable ASCII is swallowed rather than passed
+         * on: the menu has focus, and letting it through would move the player
+         * while they are typing. */
+        return 0;
     }
 
     if (g_ov.visible) {
@@ -8101,20 +8162,56 @@ static void aowl_ov_admin_append(void) {
         float rowH = (float)AOWL_OV_CH + 5.0f;
         float mw = 250.0f;
         float mx = 18.0f, my = 70.0f;
-        float mh = rowH * (float)(AOWL_ADM_COUNT + 2) + 8.0f;
+        mw = 320.0f;   /* wider than the toggle-only menu: the spawner rows carry values */
+        float mh = rowH * (float)(AOWL_ADM_ROW_TOTAL + 3) + 8.0f;
+        int32_t sel = (int32_t)g_ov_admin->menuSel;
         aowl_ov_rect(mx, my, mw, mh, AOWL_OV_BG);
         aowl_ov_frame_rect(mx, my, mw, mh, 1.0f, AOWL_OV_EDGE);
         aowl_ov_text(mx + 8.0f, my + 6.0f, "ADMIN  (F6)", AOWL_OV_ACCENT);
-        for (int32_t i = 0; i < AOWL_ADM_COUNT; i++) {
+        for (int32_t i = 0; i < AOWL_ADM_ROW_TOTAL; i++) {
             float ry = my + rowH * (float)(i + 1) + 6.0f;
-            if (i == (int32_t)g_ov_admin->menuSel)
+            if (i == sel)
                 aowl_ov_rect(mx + 2.0f, ry - 1.0f, mw - 4.0f, rowH, AOWL_OV_SELBG);
-            uint32_t col; const char* st;
-            if (!aowl_admin_capable(g_ov_admin, i)) { col = AOWL_OV_DIM; st = "n/a"; }
-            else if (aowl_admin_toggle_get(g_ov_admin, i)) { col = AOWL_OV_ON; st = "ON"; }
-            else { col = AOWL_OV_OFF; st = "off"; }
-            aowl_ov_text(mx + 10.0f, ry + 2.0f, aowl_admin_mode_name(i), AOWL_OV_TEXT);
-            aowl_ov_text(mx + mw - 44.0f, ry + 2.0f, st, col);
+            uint32_t col = AOWL_OV_OFF;
+            const char* st = "";
+            char valbuf[AOWL_ADM_QUERY_LEN + 8];
+            if (aowl_admin_row_is_toggle(i)) {
+                if (!aowl_admin_capable(g_ov_admin, i)) { col = AOWL_OV_DIM; st = "n/a"; }
+                else if (aowl_admin_toggle_get(g_ov_admin, i)) { col = AOWL_OV_ON; st = "ON"; }
+                else { col = AOWL_OV_OFF; st = "off"; }
+            } else if (i == AOWL_ADM_ROW_QUERY) {
+                int32_t n = aowl_admin_spawn_query(g_ov_admin, valbuf,
+                                                  (int32_t)sizeof(valbuf) - 2);
+                /* A caret ONLY while this row has focus, so an empty query on
+                 * an unfocused row reads as empty rather than as a stray bar. */
+                if (i == sel) { valbuf[n] = '_'; valbuf[n + 1] = 0; }
+                else if (n == 0) { valbuf[0] = '-'; valbuf[1] = 0; }
+                col = AOWL_OV_TEXT; st = valbuf;
+            } else if (i == AOWL_ADM_ROW_COUNT) {
+                aowl_ov_fmt(valbuf, (int32_t)sizeof(valbuf), "%d",
+                            aowl_admin_spawn_count(g_ov_admin));
+                col = AOWL_OV_TEXT; st = valbuf;
+            } else if (i == AOWL_ADM_ROW_COND) {
+                aowl_ov_fmt(valbuf, (int32_t)sizeof(valbuf), "%d%%",
+                            aowl_admin_spawn_condition(g_ov_admin));
+                col = AOWL_OV_TEXT; st = valbuf;
+            } else { /* AOWL_ADM_ROW_SPAWN */
+                if (aowl_admin_spawn_busy(g_ov_admin)) { col = AOWL_OV_DIM; st = "busy"; }
+                else { col = AOWL_OV_ACCENT; st = ">>"; }
+            }
+            aowl_ov_text(mx + 10.0f, ry + 2.0f, aowl_admin_row_name(i), AOWL_OV_TEXT);
+            aowl_ov_text(mx + 148.0f, ry + 2.0f, st, col);
+        }
+        /* The last spawn result, verbatim. It is populated on refusal as well
+         * as on success -- there is deliberately no "it worked" styling here,
+         * because the only thing this HUD knows is the sentence the provider
+         * sent back. */
+        {
+            const char* res = aowl_admin_spawn_result(g_ov_admin);
+            if (res && res[0]) {
+                float ry = my + rowH * (float)(AOWL_ADM_ROW_TOTAL + 1) + 8.0f;
+                aowl_ov_text(mx + 10.0f, ry, res, AOWL_OV_DIM);
+            }
         }
     }
 

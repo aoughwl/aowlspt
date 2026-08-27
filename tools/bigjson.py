@@ -16,7 +16,9 @@ One match is one line is the entire file. There is no safe raw read of any of
 them, so use this instead:
 
     python tools/bigjson.py size   <file>
-    python tools/bigjson.py keys   <file> [--path data.0]     # shape, never values
+    python tools/bigjson.py keys    <file> [--path data.0]    # shape, never values
+    python tools/bigjson.py topkeys <file> [--path data] [--json]
+                                              # ONLY the key names, for scripts
     python tools/bigjson.py get    <file> --path data.0._id   # one field
     python tools/bigjson.py find   <file> --key Chances       # where does a key live
     python tools/bigjson.py search <file> --value 5449016a...   # which paths hold a string
@@ -97,6 +99,11 @@ def cmd_size(args):
 
 
 def cmd_keys(args):
+    # `--max-rows 0` means EVERY row. Without it the only honest reading of a
+    # truncated listing was "there may be more", which is what `topkeys` was
+    # added to work around; the cap is a default, not a limit.
+    if args.max_rows <= 0:
+        args.max_rows = 1 << 30
     node = walk(load(args.file), args.path or "")
     if isinstance(node, dict):
         items = list(node.items())
@@ -104,15 +111,51 @@ def cmd_keys(args):
         for k, v in items[: args.max_rows]:
             print("  %-44s %s" % (clip(k, 44), describe(v, args.width)))
         if len(items) > args.max_rows:
-            print("  ... %d more key(s); use --path to descend" % (len(items) - args.max_rows))
+            print("  ... %d more key(s) NOT SHOWN; use --path to descend, "
+                  "--max-rows N to raise the cap, or --max-rows 0 for all"
+                  % (len(items) - args.max_rows))
     elif isinstance(node, list):
         print("list with %d element(s) at %r" % (len(node), args.path or "(root)"))
         for i, v in enumerate(node[: args.max_rows]):
             print("  [%d] %s" % (i, describe(v, args.width)))
         if len(node) > args.max_rows:
-            print("  ... %d more element(s)" % (len(node) - args.max_rows))
+            print("  ... %d more element(s) NOT SHOWN; --max-rows 0 for all"
+                  % (len(node) - args.max_rows))
     else:
         print("%s at %r" % (describe(node, args.full or args.width), args.path or "(root)"))
+    return 0
+
+
+def cmd_topkeys(args):
+    """Machine-readable top-level key list under --path. NOTHING else.
+
+    `keys` is for humans: it prose-wraps, annotates types and TRUNCATES at
+    --max-rows, so a script that parses it silently loses keys past row 80.
+    This prints every key, one per line (or a JSON array with --json), with no
+    header and no clipping, so `dtogap`-style diffs can consume it directly.
+    An array at --path yields the keys of element 0 and says so on stderr; a
+    scalar or an EMPTY container is an error, not an empty success, because
+    "no keys" and "not an object" must not look alike.
+    """
+    node = walk(load(args.file), args.path or "")
+    if isinstance(node, list):
+        if not node:
+            die("empty list at %r -- no element to take keys from" % (args.path or "(root)"))
+        sys.stderr.write("note: list at %r; keys taken from element [0] of %d\n"
+                         % (args.path or "(root)", len(node)))
+        node = node[0]
+    if not isinstance(node, dict):
+        die("%r is %s, not an object -- it has no top-level keys"
+            % (args.path or "(root)", type(node).__name__))
+    if not node:
+        die("object at %r is EMPTY (0 keys). That is not the same as 'no gaps'."
+            % (args.path or "(root)"))
+    keys = list(node.keys())
+    if args.json:
+        print(json.dumps(keys))
+    else:
+        for k in keys:
+            print(k)
     return 0
 
 
@@ -173,6 +216,17 @@ def cmd_search(args):
 
 
 def main(argv=None):
+    # Windows hands us a cp1252 stdout, so `get` on any non-ASCII value died with
+    # UnicodeEncodeError: 'charmap'. That is not a crash you read as "bad tool" --
+    # it is a crash you read as "the field is broken". It is what produced the
+    # measured-but-false claim that trader BTR has an EMPTY nickname; the nickname
+    # is "БТР" and was always there. `keys` survived only because it
+    # escapes. backslashreplace keeps output printable without inventing a value.
+    for _s in (sys.stdout, sys.stderr):
+        try:
+            _s.reconfigure(encoding="utf-8", errors="backslashreplace")
+        except (AttributeError, ValueError):
+            pass
     ap = argparse.ArgumentParser(
         prog="bigjson.py",
         description="Inspect huge single-line JSON without printing it.",
@@ -181,7 +235,8 @@ def main(argv=None):
     )
     ap.add_argument("--width", type=int, default=300, help="clip every value to N chars")
     ap.add_argument("--full", type=int, default=0, help="raise the clip to N chars, deliberately")
-    ap.add_argument("--max-rows", type=int, default=MAX_ROWS)
+    ap.add_argument("--max-rows", type=int, default=MAX_ROWS,
+                    help="rows to print (0 = no cap)")
     sub = ap.add_subparsers(dest="cmd", required=True)
 
     def add(name, fn, help_):
@@ -192,6 +247,10 @@ def main(argv=None):
 
     add("size", cmd_size, "bytes, line count, longest line")
     add("keys", cmd_keys, "shape at a path -- keys and types, not values").add_argument("--path")
+    p = add("topkeys", cmd_topkeys,
+            "MACHINE-READABLE top-level keys under --path, one per line, never truncated")
+    p.add_argument("--path")
+    p.add_argument("--json", action="store_true", help="emit a JSON array instead")
     p = add("get", cmd_get, "one value at a dotted path")
     p.add_argument("--path", required=True)
     p = add("find", cmd_find, "which paths carry a given key name")

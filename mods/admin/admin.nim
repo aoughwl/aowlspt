@@ -68,6 +68,7 @@ import std/strutils
 import aowlspt
 import aowlspt/server
 import aowlspt/settings
+import aowlspt/capability # the F6 spawner calls aowl.items, provided by mods/tarkov
 import aowlspt/json
 
 import "adm" / shared
@@ -120,6 +121,21 @@ proc applyConfigToggles() =
 
 proc adminSchema(): seq[Setting] =
   result = @[
+    # THE POINTER ROW. The admin surface is the F6 overlay, not this page: the
+    # overlay owns the toggles the moment the game is up, it has the item
+    # spawner, and it works in a raid where this page cannot be reached. What
+    # remains here is the boot state (config.json) plus this signpost, so a
+    # player who finds the settings page first is not left believing the nine
+    # unbound rows below are the whole admin menu.
+    stringSetting("adminSurface", "The admin menu is F6", "press F6 in game",
+                  category = "Admin", implemented = false,
+                  description = "The live admin surface is the in-game F6 " &
+                                "overlay -- toggles, and an item spawner " &
+                                "(type a name, set the count and condition, " &
+                                "Enter). The rows on this page set the state " &
+                                "the F6 menu STARTS in; after that F6 owns " &
+                                "them. This row is a signpost and sets " &
+                                "nothing."),
     boolSetting("esp", "ESP", false, category = "Visuals",
                 description = "Boxes and side-colour on every player (F6 menu). " &
                               "Needs the host's GameWorld cache: turn on the " &
@@ -130,23 +146,23 @@ proc adminSchema(): seq[Setting] =
                               "raid. GLOBAL: bots stop taking damage too."),
     boolSetting("infiniteStamina", "Infinite stamina", false, category = "Movement"),
     boolSetting("noRecoil", "No recoil / sway", false, category = "Combat",
-                implemented = false, description = "Read; write not bound yet"),
+                implemented = false, description = "NOT BOUND. The offset that would drive this has not been measured on build 1.1.0.1.46777, so the row reads and never writes -- and the F6 menu draws it \"n/a\" for the same reason. Neither surface can turn it on."),
     boolSetting("noWeight", "No weight", false, category = "Movement",
-                implemented = false, description = "Read; write not bound yet"),
+                implemented = false, description = "NOT BOUND. The offset that would drive this has not been measured on build 1.1.0.1.46777, so the row reads and never writes -- and the F6 menu draws it \"n/a\" for the same reason. Neither surface can turn it on."),
     boolSetting("instantHeal", "Instant heal", false, category = "Combat",
-                implemented = false, description = "Read; write not bound yet"),
+                implemented = false, description = "NOT BOUND. The offset that would drive this has not been measured on build 1.1.0.1.46777, so the row reads and never writes -- and the F6 menu draws it \"n/a\" for the same reason. Neither surface can turn it on."),
     boolSetting("unlimitedAmmo", "Unlimited ammo", false, category = "Combat",
-                implemented = false, description = "Read; write not bound yet"),
+                implemented = false, description = "NOT BOUND. The offset that would drive this has not been measured on build 1.1.0.1.46777, so the row reads and never writes -- and the F6 menu draws it \"n/a\" for the same reason. Neither surface can turn it on."),
     boolSetting("thermalVision", "Thermal vision", false, category = "Visuals",
-                implemented = false, description = "Read; write not bound yet"),
+                implemented = false, description = "NOT BOUND. The offset that would drive this has not been measured on build 1.1.0.1.46777, so the row reads and never writes -- and the F6 menu draws it \"n/a\" for the same reason. Neither surface can turn it on."),
     boolSetting("nightVision", "Night vision", false, category = "Visuals",
-                implemented = false, description = "Read; write not bound yet"),
+                implemented = false, description = "NOT BOUND. The offset that would drive this has not been measured on build 1.1.0.1.46777, so the row reads and never writes -- and the F6 menu draws it \"n/a\" for the same reason. Neither surface can turn it on."),
     boolSetting("fly", "Fly / noclip", false, category = "Movement",
-                implemented = false, description = "Read; write not bound yet"),
+                implemented = false, description = "NOT BOUND. The offset that would drive this has not been measured on build 1.1.0.1.46777, so the row reads and never writes -- and the F6 menu draws it \"n/a\" for the same reason. Neither surface can turn it on."),
     boolSetting("teleport", "Teleport to marker", false, category = "Movement",
-                implemented = false, description = "Read; write not bound yet"),
+                implemented = false, description = "NOT BOUND. The offset that would drive this has not been measured on build 1.1.0.1.46777, so the row reads and never writes -- and the F6 menu draws it \"n/a\" for the same reason. Neither surface can turn it on."),
     boolSetting("timeOfDay", "Set time of day", false, category = "World",
-                implemented = false, description = "Read; write not bound yet"),
+                implemented = false, description = "NOT BOUND. The offset that would drive this has not been measured on build 1.1.0.1.46777, so the row reads and never writes -- and the F6 menu draws it \"n/a\" for the same reason. Neither surface can turn it on."),
     floatSetting("espMaxDistance", "ESP max distance (m)", 400.0,
                  lo = 10.0, hi = 2000.0, step = 10.0, category = "Visuals")]
 
@@ -310,8 +326,98 @@ var gReported = false
 var gRaidReported = false
 
 
+# ---------------------------------------------------------------------------
+# The F6 item spawner -- the mod's half
+# ---------------------------------------------------------------------------
+#
+# WHY THIS RUNS ON THE SERVER SIDE AND NOT WITH THE REST OF THE MOD.
+#
+# `capability.invoke` REFUSES on `sideClient`, by design and out loud: the
+# client host has no mod set to resolve a provider against. The provider of
+# `aowl.items` is mods/tarkov, which is a server mod. So the F6 menu -- which
+# is drawn in the game process by the overlay -- cannot itself make the call.
+#
+# What CAN: this same mod, loaded on the server side, mapping the SAME named
+# region. `Local\aowlspt_admin_shared_v4` is a session-local file mapping, and
+# the backend runs in the same session on the same box, so both processes open
+# one region by name. The overlay writes the request; this drains it.
+#
+# That is also why `onUpdate` splits by side rather than doing both: the ESP
+# and cheat writes need the game's address space and are meaningless here, and
+# the invoke is impossible over there.
+
+var gSpawnServed = 0
+var gSpawnFaults = 0
+var gSpawnOff = false
+
+proc spawnRequestJson(query: string; count, condition: int): string =
+  ## Hand-built rather than composed, because this mod does not import the JSON
+  ## builder. The query is the only free text and it is escaped here; a query
+  ## carrying a quote or a backslash must not be able to change the shape of
+  ## the request.
+  var q = ""
+  for i in 0 ..< query.len:
+    let c = query[i]
+    if c == '"' or c == '\\':
+      q.add '\\'
+      q.add c
+    elif c >= ' ' and c <= '~':
+      q.add c
+    # anything else is dropped: the overlay only accepts printable ASCII, so a
+    # control byte here means the region was written by something else.
+  result = "{\"query\":\"" & q & "\",\"count\":" & $count &
+           ",\"condition\":" & $condition & "}"
+
+proc serviceSpawn() =
+  ## Drain at most ONE request per tick. Bounded by construction: `spawnPending`
+  ## returns a single sequence number, and every exit path calls `spawnDone`,
+  ## so a request can never be left in flight with the HUD showing "working...".
+  if gRegion == nil or gSpawnOff: return
+  let req = spawnPending(gRegion)
+  if req == 0'i32: return
+
+  let query = spawnQuery(gRegion)
+  if query.len == 0:
+    # Cannot happen through the overlay (submit refuses an empty query) but the
+    # region is shared, so it is answered rather than assumed away.
+    spawnDone(gRegion, req, "the request carried no item name")
+    return
+  let count = spawnCount(gRegion)
+  let condition = spawnCondition(gRegion)
+
+  let r = invoke("aowl.items", 1, spawnRequestJson(query, count, condition))
+  if r.isOk:
+    gSpawnServed = gSpawnServed + 1
+    # The provider's own sentence, verbatim. This mod deliberately does not
+    # compose a success message of its own: it does not know how many items
+    # were placed, and inventing "spawned N" here is precisely the silent-
+    # success failure the provider was written to make impossible.
+    var msg = field(r.body, "message").asText("")
+    if msg.len == 0:
+      msg = "aowl.items answered OK but said nothing about what it did; " &
+            "treat this as UNVERIFIED and check the stash"
+    info "admin: F6 spawn -- " & msg
+    spawnDone(gRegion, req, msg)
+    return
+
+  gSpawnFaults = gSpawnFaults + 1
+  warn "admin: F6 spawn refused -- " & r.message
+  spawnDone(gRegion, req, r.message)
+  if gSpawnFaults >= 20:
+    gSpawnOff = true
+    warn "admin: twenty consecutive F6 spawn refusals -- the spawner drain " &
+         "has DISABLED itself for this session rather than refuse every tick " &
+         "forever. Nothing else in this mod is affected."
+
 proc onUpdate(elapsedMs: int64): Status =
   if gRegion == nil:
+    return Ok
+  if side() != sideClient:
+    # The server-side copy of this mod exists for ONE reason: to service the
+    # F6 spawner, which needs `invoke` and therefore needs a side that has a
+    # mod set. It reads no game memory and patches nothing -- there is no game
+    # in this process.
+    serviceSpawn()
     return Ok
   gTick = gTick + 1
   discard dataOpen()
@@ -375,7 +481,10 @@ proc onLoad(): Status =
          "Cheats read measured static field offsets (build 1.1.0.1.46777)."
     info adminDiag()
   else:
-    info ModName & " loaded on a non-client side; the HUD does nothing here"
+    info ModName & " loaded on the server side: no HUD and no cheats here, " &
+         "only the F6 item spawner's drain, which calls aowl.items (provided " &
+         "by the Singleplayer mod). If that mod is not loaded, a spawn " &
+         "reports exactly that in the F6 menu instead of doing nothing."
   result = Ok
 
 proc onUnload(): Status =
@@ -391,7 +500,7 @@ exportMod(
   author = ModAuthor,
   version = ModVersion,
   sptRange = "*",
-  sides = {sideClient, sideSim},
+  sides = {sideClient, sideServer, sideSim},
   onLoad = onLoad,
   onUpdate = onUpdate,
   onUnload = onUnload)
