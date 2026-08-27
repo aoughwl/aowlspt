@@ -90,3 +90,7 @@ mods/textures/data/pack/
 # was measured against. Committing it would ship one machine's pointers as
 # if they were facts about everyone's install.
 tools/uimap.txt
+
+# Runtime relay log written by the aowlcode message bus. It got TRACKED by a
+# feature branch and blocked a merge; it is machine-local state, never source.
+.aowl-relay.jsonl
