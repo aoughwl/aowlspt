@@ -235,6 +235,18 @@ proc onApplyEvent(payload: string): string =
   let ok = pushGrade()
   result = "{\"ok\":" & (if ok: "true" else: "false") & "}"
 
+proc onSettingsHotApply(key: string) =
+  ## The hot-apply half of the in-process settings bus (`aowlspt/settings`).
+  ## graphics is `sides = {sideClient}`, so its `/aowlspt/settings/<guid>`
+  ## route is registered into nothing -- the client host refuses
+  ## `route_register`. Without this hook an edit made in F12 would persist to
+  ## config.json and not reach the live grade until the next load, which is a
+  ## slider that moves and changes nothing. Same two calls the route handler
+  ## makes, deliberately: one apply path, not two.
+  discard key
+  loadConfig()
+  discard pushGrade()
+
 # ---------------------------------------------------------------------------
 # Lifecycle
 # ---------------------------------------------------------------------------
@@ -242,6 +254,7 @@ proc onApplyEvent(payload: string): string =
 proc onLoad(): Status =
   loadConfig()
   declareSettings(schema())
+  onSettingsApplied(onSettingsHotApply)
   discard serve("/aowlspt/settings/" & ModGuid, onSettings)
   discard serve("/aowlspt/settings/" & ModGuid & "/reset", onSettingsReset)
   discard on("aowl.graphics.apply", onApplyEvent)

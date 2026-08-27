@@ -697,6 +697,14 @@ typedef enum AowlOvFilter {
  * stack is not affordable, a megabyte in `.bss` is. A body that STILL does not
  * fit now says so (`lastTrunc`) instead of being reported as a bad schema. */
 #define AOWL_OV_HTTP_BUF     1048576
+/* The write leg's body buffer. It was 512, which is ample for the one-row edit
+ * the panel sends and far too small for the other direction: the client host
+ * publishes a client-only mod's WHOLE schema up to the backend over this slot
+ * (`host/Aowlspt.Host.Il2Cpp/settingsbridge.nim`), because a mod loaded in the
+ * game process has no HTTP route of its own. `aowl_ov_copy` truncates rather
+ * than refusing, and half a schema parses as a short schema, so the caller is
+ * required to check the length against this before arming -- which it does. */
+#define AOWL_OV_POST_BODY    65536
 
 #define AOWL_OV_MAX_SPAGES   48    /* mod pages + 28 SPT pages + margin */
 #define AOWL_OV_MAX_SITEMS   1200  /* controls on the one loaded page   */
@@ -938,7 +946,7 @@ typedef struct AowlOvState {
      * `aowl_ov_post_pending()` to clear (or take the previous result) before
      * arming another, same discipline as the GET slot's single path. */
     char    postPath[192];
-    char    postBody[512];
+    char    postBody[AOWL_OV_POST_BODY];
     volatile LONG postArm;              /* 1 = queued, not yet sent           */
     volatile LONG postInFlight;         /* 1 = sent, waiting on the response  */
     char    postResp[AOWL_OV_SYNC_MAX];
@@ -3245,7 +3253,7 @@ static DWORD WINAPI aowl_ov_worker(LPVOID unused) {
          * caller must be told so it does not believe an edit stuck. */
         {
             wchar_t wpath[192];
-            char reqBody[512];
+            static char reqBody[AOWL_OV_POST_BODY];
             int32_t wantPost = 0;
             EnterCriticalSection(&g_ov.cs);
             if (g_ov.postArm) {

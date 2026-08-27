@@ -323,6 +323,34 @@ const
     ## Payload: `{"guid":"...","name":"...","count":N,"done":M}`. Emitted by
     ## every mod that has declared settings, once per `SettingsIndexQuery` it
     ## hears. `done` is how many of the `count` rows are `implemented`.
+  SettingsPageQuery* = "aowlspt.settings.pageQuery"
+    ## Payload: a bare guid. The mod whose `modGuid()` matches replies with
+    ## `SettingsPageAnnounce`; every other subscriber ignores it.
+    ##
+    ## This is the event twin of `GET /aowlspt/settings/<guid>`, and it exists
+    ## because **the client host refuses `route_register`**: a client-only mod
+    ## (`mods/graphics` is `sides = {sideClient}`) registers its settings route
+    ## into nothing, so its page was unreachable BY CONSTRUCTION -- and the
+    ## `/aowlspt/settings/index` aggregator in `mods/settingshub` is server-side,
+    ## so its `SettingsIndexQuery` broadcast never reached a client-only mod
+    ## either. The event bus IS implemented on the client
+    ## (`aowlspt_nim_event_emit` in the client host), so it is the only
+    ## in-process channel a client mod's schema can travel on.
+  SettingsPageAnnounce* = "aowlspt.settings.pageAnnounce"
+    ## Payload: `{"guid":"...","rows":[ ...schema... ]}` -- the same rows the
+    ## GET route returns, so one reader parses both transports.
+  SettingsApplyQuery* = "aowlspt.settings.applyQuery"
+    ## Payload: `{"guid":"...","key":"...","value":<literal>}`. The owning mod
+    ## persists it through the SAME `applySettingFromBody` its route uses and
+    ## then runs its apply hook (`onSettingsApplied`), so the edit HOT-APPLIES
+    ## in the process that owns the runtime. That is the point: a page that
+    ## renders but whose edits never reach the live instance is worse than an
+    ## absent page, so the schema and the write travel the same way.
+  SettingsApplyAnnounce* = "aowlspt.settings.applyAnnounce"
+    ## Payload: `{"guid":"...","ok":true|false,"err":"...","rows":[...]}`.
+    ## `rows` is the schema RE-READ after the write, never an echo of what was
+    ## asked for, so a caller verifies by value and not by "the call returned"
+    ## (fact #135: a chunked POST is answered 200 with the schema unchanged).
 
 proc onIndexQuery(payload: string): string =
   if gDeclared.len > 0:
@@ -347,18 +375,6 @@ proc onIndexQuery(payload: string): string =
     o.put("done", impl)
     discard emit(SettingsIndexAnnounce, done(o).text)
   result = ""
-
-proc declareSettings*(settings: seq[Setting]) =
-  ## Register this mod's schema. Replaces any previous declaration — call it
-  ## once with the whole list, not once per row.
-  gDeclared = settings
-  if not gAnnounceSubscribed and settings.len > 0:
-    # Subscribe once, lazily, the first time a mod actually has something to
-    # announce — a mod that never declares settings never joins the
-    # broadcast at all, which keeps a no-op `declareSettings(@[])` cheap and
-    # keeps the fan-out list free of mods with nothing to say.
-    discard on(SettingsIndexQuery, onIndexQuery)
-    gAnnounceSubscribed = true
 
 proc declaredSettings*(): seq[Setting] =
   ## What this mod declared, for a route handler that serves it.
@@ -492,3 +508,91 @@ proc resetFromBody*(body: string): Status =
   if key.len == 0:
     return resetAllSettings()
   result = resetSetting(key)
+
+# ---------------------------------------------------------------------------
+# The in-process bus: how a CLIENT-side mod's page reaches the settings screen
+# ---------------------------------------------------------------------------
+#
+# Everything above assumes an HTTP route. The client host does not have one --
+# it refuses `route_register` outright, because the game process serves no
+# HTTP -- so for a mod whose `sides` is `{sideClient}` the whole route half of
+# this module is dead code, and `/aowlspt/settings/index` (served server-side
+# by `mods/settingshub`) has never had any way to hear about it. That is why
+# `mods/graphics`' twenty fully-wired settings were INVISIBLE in F12: not a
+# rendering bug, an unreachable transport.
+#
+# The fix is not to give a client mod a server side -- that would make the page
+# APPEAR while its edits landed in a different process from the runtime they
+# configure, which is a half-working control. It is to carry the same schema
+# and the same write over the one channel the client host does implement:
+# events. `declareSettings` subscribes every mod to both queries below, and the
+# client host (`host/Aowlspt.Host.Il2Cpp/settingsbridge.nim`) drives them and
+# forwards the result to the backend so the F12 nav can list the mod.
+
+type
+  SettingsApplyHook* = nil proc (key: string)
+    ## Run after a `SettingsApplyQuery` edit has persisted, so the mod can
+    ## re-read its config and push the change into whatever it drives.
+    ## Nilable -- nimony proc types are non-nil by default, hence `nil proc`.
+
+var gApplyHook: SettingsApplyHook = nil
+var gBusSubscribed = false
+
+proc onSettingsApplied*(cb: SettingsApplyHook) =
+  ## Register the hot-apply hook. A mod without one still gets its page and
+  ## still persists edits -- it just will not SHOW them until it next re-reads
+  ## its config, and a control that moves and changes nothing is the exact
+  ## failure this whole mechanism exists to avoid. Register one.
+  gApplyHook = cb
+
+proc onPageQuery(payload: string): string =
+  if payload == modGuid() and gDeclared.len > 0:
+    var o = obj()
+    o.put("guid", modGuid())
+    o.put("rows", schemaJson(gDeclared))
+    discard emit(SettingsPageAnnounce, done(o).text)
+  result = ""
+
+proc onApplyQuery(payload: string): string =
+  let g = field(payload, "guid")
+  if not g.exists or g.asText("") != modGuid():
+    return ""
+  # A reset arrives on the same query, flagged, because it is the same
+  # question -- "make this key be X" -- and splitting it into a second event
+  # would give the client transport a second code path to rot in.
+  var st = Ok
+  if field(payload, "reset").asBool(false):
+    st = resetFromBody(payload)
+  else:
+    st = applySettingFromBody(payload)
+  if st == Ok and gApplyHook != nil:
+    let k = field(payload, "key")
+    gApplyHook(k.asText(""))
+  var o = obj()
+  o.put("guid", modGuid())
+  o.put("ok", st == Ok)
+  if st != Ok:
+    o.put("err", statusMessage(st))
+  o.put("rows", schemaJson(gDeclared))
+  discard emit(SettingsApplyAnnounce, done(o).text)
+  result = ""
+
+proc declareSettings*(settings: seq[Setting]) =
+  ## Register this mod's schema. Replaces any previous declaration — call it
+  ## once with the whole list, not once per row.
+  gDeclared = settings
+  if not gAnnounceSubscribed and settings.len > 0:
+    # Subscribe once, lazily, the first time a mod actually has something to
+    # announce — a mod that never declares settings never joins the
+    # broadcast at all, which keeps a no-op `declareSettings(@[])` cheap and
+    # keeps the fan-out list free of mods with nothing to say.
+    discard on(SettingsIndexQuery, onIndexQuery)
+    gAnnounceSubscribed = true
+  if not gBusSubscribed and settings.len > 0:
+    # The page/apply twins of the route pair. Subscribed for EVERY mod, not
+    # only client-side ones: a server mod answering both transports costs one
+    # ignored event per query and keeps ONE code path for both sides, so the
+    # client transport cannot quietly rot while only the server one is used.
+    discard on(SettingsPageQuery, onPageQuery)
+    discard on(SettingsApplyQuery, onApplyQuery)
+    gBusSubscribed = true
