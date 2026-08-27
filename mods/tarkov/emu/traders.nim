@@ -126,11 +126,31 @@ var gIgnoreStockLimits = false
   ## `traderPriceMultiplier`. Off by default, because unlimited stock is a
   ## different game and nobody should get it without asking.
 
+var gMaxLoyalty* = false
+  ## Whether every trader sits at their HIGHEST loyalty level regardless of the
+  ## player's level, sales sum and standing.
+  ##
+  ## This is a different axis from `traderUnlockAllOffers`, and the two were
+  ## being confused. `traderUnlockAllOffers` rewrites the ASSORT -- it moves
+  ## every offer down to loyalty 1, so nothing is gated. `traderMaxLoyalty`
+  ## moves the PLAYER up -- `TradersInfo.<id>.loyaltyLevel` becomes the last
+  ## level the trader's `loyaltyLevels` array defines, which is also what
+  ## `emu/health` and `emu/repair` read for their price coefficients and what
+  ## `emu/production` reads to gate a hideout recipe. Neither one implies the
+  ## other, and either alone answers "that offer needs loyalty level 2 and you
+  ## are 1".
+  ##
+  ## It has to live in `loyaltyLevelFor` rather than being written once onto
+  ## the profile: `refreshLoyalty` re-derives the stored number from that
+  ## function after every purchase, quest reward and scav run, so a value only
+  ## written to the profile is recomputed away by the next trade.
+
 proc configureTraders*(unlockAll: bool; priceMultiplier: float;
-                       ignoreStockLimits: bool) =
+                       ignoreStockLimits: bool; maxLoyalty = false) =
   gUnlockAllOffers = unlockAll
   gTraderPriceMultiplier = priceMultiplier
   gIgnoreStockLimits = ignoreStockLimits
+  gMaxLoyalty = maxLoyalty
 
 proc traderPriceMultiplier*(): float = gTraderPriceMultiplier
 
@@ -280,6 +300,11 @@ proc loyaltyLevelFor*(traderId: string; level, salesSum: int;
   if base.len == 0:
     return
   let levels = each(field(base, "loyaltyLevels"))
+  if gMaxLoyalty:
+    # The top of the array this trader actually declares, not a fixed 4: the
+    # levels are per trader and a number past the end is a level the client has
+    # no row for.
+    return (if levels.len > 1: levels.len else: 1)
   var index = 0
   for l in levels:
     inc index
@@ -343,6 +368,14 @@ proc loyaltyOf*(p: Profile; traderId: string): int =
 proc offerLoyalty*(traderId, offerId: string): int =
   ## The loyalty level an offer is gated behind. Zero means the assort does not
   ## say, which is not a gate.
+  # `traderAssort` serves `allLoyaltyOne` when the switch is on, so the client
+  # is shown every offer at loyalty 1. This function is the SERVER side of the
+  # same gate and read the raw database, which meant the two disagreed: the shop
+  # drew an ungated offer and `buyFromTrader` refused it with "that offer needs
+  # loyalty level 2 and you are 1". Measured live today. The served assort is
+  # the truth, so the gate follows it.
+  if gUnlockAllOffers:
+    return 0
   let v = dbRead("traders." & traderId & ".assort.loyal_level_items." & offerId)
   if not v.ok:
     return 0

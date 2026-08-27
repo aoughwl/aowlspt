@@ -28,7 +28,14 @@
   "fleaSellFeePercent": 0,
   "fleaSellRequiresFoundInRaid": false,
 
+  "progressionPlayerLevel": 0,
+  "progressionSkillLevel": 0,
+  "progressionSkillIds": "",
+  "progressionMasteryLevel": 0,
+  "progressionMasteryFamilies": "",
+
   "traderUnlockAllOffers": false,
+  "traderMaxLoyalty": false,
   "traderPriceMultiplier": 1.0,
   "traderIgnoreStockLimits": false,
   "repairPriceMultiplier": 1.0,

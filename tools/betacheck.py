@@ -48,6 +48,11 @@ constant is the failure mode this file exists to avoid.
                plan.  It has no database location and therefore no
                SpawnPointParams, so a correct server cannot anchor it and
                must go red
+    progression  demand the experience of the level ABOVE the one that was
+               set, one skill level above the one asked for, and one mastery
+               point past each family's own ceiling -- a correct server must
+               go red on all three
+    loyalty    accept a trader still sitting at loyalty level 1 as maxed
     tolerated  require BSG's own captured payloads to carry `SeasonsSettings`
                and `exchange_rate`.  They do not -- that is the whole basis of
                the CORRECT-AS-IS verdict on those two members -- so a correct
@@ -311,6 +316,306 @@ def check_tolerated(w, mut):
         record("tolerated", FAIL, "; ".join(superset))
     else:
         record("tolerated", OK, "; ".join(notes))
+
+
+
+# ---------------------------------------------------------------------------
+# 13. the progression floors, and what "unlock the traders" really means
+#
+# Every assertion below is on an INDEPENDENT RE-READ of
+# `/client/game/profile/list` after a settings POST -- never on the reply to
+# the write.  And every expected number comes from a SECOND route rather than
+# from a constant in this file:
+#
+#   the experience for a level    `/client/globals` -> config.exp.level.exp_table
+#   a family's mastery threshold  `/client/globals` -> config.Mastering
+#   a trader's top loyalty level  `/client/trading/api/traderSettings`
+#                                 -> len(loyaltyLevels)
+#
+# That is the point.  Comparing the served profile against a table this file
+# also owns is the self-comparison CLAUDE.md 9b is about; comparing it against
+# the table the SERVER separately publishes can actually fail.
+# ---------------------------------------------------------------------------
+
+PROG_LEVEL = 25
+PROG_SKILL = 10
+
+
+def _set(w, key, value):
+    """One settings edit through the mod's own settings route."""
+    st, doc, text = w.call("/aowlspt/settings/aowl.tarkov",
+                           {"key": key, "value": value})
+    if doc is None:
+        return False, "settings POST for %s did not parse: %r" % (key, text[:120])
+    return True, ""
+
+
+def _globals(w):
+    st, doc, text = w.call("/client/globals", {})
+    if doc is None:
+        return None, "/client/globals did not parse (%d bytes)" % len(text)
+    cfg = envelope(doc)
+    if not isinstance(cfg, dict) or "config" not in cfg:
+        return None, "/client/globals has no `config`"
+    return cfg["config"], ""
+
+
+def check_progression(w, mut):
+    cfg, why = _globals(w)
+    if cfg is None:
+        record("progression", INCONC, why)
+        record("skill-levels", INCONC, why)
+        record("mastery", INCONC, why)
+        return
+
+    table = cfg.get("exp", {}).get("level", {}).get("exp_table")
+    if not isinstance(table, list) or not table:
+        record("progression", INCONC,
+               "the server's globals carry no config.exp.level.exp_table")
+        record("skill-levels", INCONC, "no exp table")
+        record("mastery", INCONC, "no exp table")
+        return
+    want_level = PROG_LEVEL + (1 if mut == "progression" else 0)
+    want_xp = sum(int(e.get("exp", 0)) for e in table[:want_level])
+
+    tag = "%04d" % random.randrange(10000)
+    st, doc, text = make_profile(w, "Prog" + tag, "standard")
+    session = session_of(doc) if doc else ""
+    if not session:
+        record("progression", INCONC, "create gave no profile id: %r" % text[:120])
+        record("skill-levels", INCONC, "no profile")
+        record("mastery", INCONC, "no profile")
+        return
+
+    before, why = read_back(w, session)
+    if before is None:
+        record("progression", INCONC, why)
+        record("skill-levels", INCONC, why)
+        record("mastery", INCONC, why)
+        return
+    was_xp = int(before.get("Info", {}).get("Experience", 0))
+
+    for key, value in (("progressionPlayerLevel", PROG_LEVEL),
+                       ("progressionSkillLevel", PROG_SKILL),
+                       ("progressionMasteryLevel", 3)):
+        ok, why = _set(w, key, value)
+        if not ok:
+            record("progression", INCONC, why)
+            record("skill-levels", INCONC, why)
+            record("mastery", INCONC, why)
+            return
+
+    after, why = read_back(w, session)
+    if after is None:
+        record("progression", INCONC, why)
+        record("skill-levels", INCONC, why)
+        record("mastery", INCONC, why)
+        return
+
+    got_xp = int(after.get("Info", {}).get("Experience", 0))
+    got_lv = int(after.get("Info", {}).get("Level", 0))
+    if was_xp != 0:
+        record("progression", INCONC,
+               "the fresh profile already had %d experience, so a floor "
+               "cannot be told from what was already there" % was_xp)
+    elif got_xp != want_xp:
+        record("progression", FAIL,
+               "served Info.Experience=%d; the server's own exp_table puts "
+               "level %d at %d" % (got_xp, want_level, want_xp))
+    elif got_lv != PROG_LEVEL:
+        record("progression", FAIL,
+               "Info.Experience is right but Info.Level=%d, not %d -- the "
+               "server and the screen will disagree" % (got_lv, PROG_LEVEL))
+    else:
+        record("progression", OK,
+               "Info.Experience=%d, Info.Level=%d, matching the server's own "
+               "exp_table for level %d (was %d before the setting)"
+               % (got_xp, got_lv, PROG_LEVEL, was_xp))
+
+    common = after.get("Skills", {}).get("Common")
+    if not isinstance(common, list) or not common:
+        record("skill-levels", FAIL,
+               "the served profile has no Skills.Common array")
+    else:
+        # The falsifying input: one level higher than was actually asked for.
+        want_prog = (PROG_SKILL + (1 if mut == "progression" else 0)) * 100.0
+        low = sorted(str(e.get("Id")) for e in common
+                     if float(e.get("Progress", 0) or 0) < want_prog)
+        bad = sorted(str(e.get("Id")) for e in common
+                     if str(e.get("Id")) in CLIENT_REJECTED_SKILL_IDS)
+        if low:
+            record("skill-levels", FAIL,
+                   "%d of %d skills are still below Progress %d: %s"
+                   % (len(low), len(common), int(want_prog),
+                      ", ".join(low[:6])))
+        elif bad:
+            record("skill-levels", FAIL,
+                   "the raise reintroduced %d skill id(s) the client rejects: "
+                   "%s" % (len(bad), ", ".join(bad)))
+        else:
+            record("skill-levels", OK,
+                   "all %d skills served at Progress >= %d (level %d), none "
+                   "of the %d ids the client is measured to reject"
+                   % (len(common), int(want_prog), PROG_SKILL,
+                      len(CLIENT_REJECTED_SKILL_IDS)))
+
+    families = cfg.get("Mastering")
+    if not isinstance(families, list) or not families:
+        record("mastery", INCONC,
+               "the server's globals carry no config.Mastering table")
+    else:
+        served = dict((str(e.get("Id")), int(e.get("Progress", 0) or 0))
+                      for e in (after.get("Skills", {}).get("Mastering") or []))
+        short = []
+        for f in families:
+            name = str(f.get("Name", ""))
+            # The falsifying input: one point past the family's own ceiling.
+            want = int(f.get("Level3", 0) or 0) + (1 if mut == "progression" else 0)
+            if name not in served:
+                short.append("%s absent" % name)
+            elif served[name] < want:
+                short.append("%s %d<%d" % (name, served[name], want))
+        if short:
+            record("mastery", FAIL,
+                   "%d of %d weapon families are not at mastery level 3: %s"
+                   % (len(short), len(families), ", ".join(short[:6])))
+        else:
+            record("mastery", OK,
+                   "all %d weapon families served at or above their OWN "
+                   "Level3 threshold out of the server's config.Mastering"
+                   % len(families))
+
+    for key in ("progressionPlayerLevel", "progressionSkillLevel",
+                "progressionMasteryLevel"):
+        _set(w, key, 0)
+
+
+def check_trader_unlock(w, mut):
+    """The two DIFFERENT axes of "unlock the traders", proved to be different.
+
+    `traderUnlockAllOffers` moves every OFFER down to loyalty 1 -- a property
+    of the served ASSORT.  `traderMaxLoyalty` moves the PLAYER up -- a property
+    of the served PROFILE.  Each is turned on alone and the OTHER one's payload
+    is required to be UNCHANGED, which is what makes this a check rather than a
+    restatement: one switch secretly doing both would fail it.
+    """
+    st, doc, text = w.call("/client/trading/api/traderSettings", {})
+    bases = envelope(doc) if doc else None
+    if not isinstance(bases, list) or not bases:
+        record("trader-loyalty", INCONC,
+               "traderSettings did not answer a non-empty array: %r" % text[:120])
+        record("trader-offers", INCONC, "no trader bases")
+        return
+    tops = dict((str(b.get("_id")), len(b.get("loyaltyLevels") or []))
+                for b in bases)
+
+    tag = "%04d" % random.randrange(10000)
+    st, doc, text = make_profile(w, "Loy" + tag, "standard")
+    session = session_of(doc) if doc else ""
+    if not session:
+        record("trader-loyalty", INCONC, "create gave no profile id")
+        record("trader-offers", INCONC, "no profile")
+        return
+    before, why = read_back(w, session)
+    if before is None:
+        record("trader-loyalty", INCONC, why)
+        record("trader-offers", INCONC, why)
+        return
+    was = dict((t, int(v.get("loyaltyLevel", 0) or 0))
+               for t, v in (before.get("TradersInfo") or {}).items())
+    if not was:
+        record("trader-loyalty", INCONC, "the fresh profile has no TradersInfo")
+        record("trader-offers", INCONC, "no TradersInfo")
+        return
+
+    probe = sorted(t for t in was if tops.get(t, 0) > 1)
+    if not probe:
+        record("trader-loyalty", INCONC,
+               "no trader on this server declares more than one loyalty level")
+        record("trader-offers", INCONC, "no gated trader")
+        return
+    tid = probe[0]
+    st, doc, text = w.call("/client/trading/api/getTraderAssort/" + tid, {})
+    assort = envelope(doc) if doc else None
+    gate_before = dict((assort or {}).get("loyal_level_items") or {})
+
+    ok, why = _set(w, "traderMaxLoyalty", True)
+    if not ok:
+        record("trader-loyalty", INCONC, why)
+        record("trader-offers", INCONC, why)
+        return
+    after, why = read_back(w, session)
+    if after is None:
+        record("trader-loyalty", INCONC, why)
+        _set(w, "traderMaxLoyalty", False)
+        record("trader-offers", INCONC, why)
+        return
+    now = dict((t, int(v.get("loyaltyLevel", 0) or 0))
+               for t, v in (after.get("TradersInfo") or {}).items())
+    st, doc, text = w.call("/client/trading/api/getTraderAssort/" + tid, {})
+    assort = envelope(doc) if doc else None
+    gate_after = dict((assort or {}).get("loyal_level_items") or {})
+    _set(w, "traderMaxLoyalty", False)
+
+    short = []
+    for t, top in tops.items():
+        if t not in now or top <= 0:
+            continue
+        # The falsifying input: demand a level ABOVE the top the trader
+        # itself declares, which a correct server cannot reach.
+        want = top + 1 if mut == "loyalty" else top
+        if now[t] < want:
+            short.append("%s %d<%d" % (t[:6], now[t], want))
+    moved = sum(1 for t in now if now[t] > was.get(t, 0))
+    if short:
+        record("trader-loyalty", FAIL,
+               "%d trader(s) below the top loyalty level their own "
+               "loyaltyLevels array declares: %s"
+               % (len(short), ", ".join(short[:6])))
+    elif moved == 0:
+        record("trader-loyalty", FAIL,
+               "no trader's loyaltyLevel moved -- the setting was accepted "
+               "and had no effect on the served profile")
+    elif gate_after != gate_before:
+        record("trader-loyalty", FAIL,
+               "traderMaxLoyalty also rewrote the ASSORT's loyal_level_items "
+               "(%d -> %d entries) -- that is traderUnlockAllOffers' job and "
+               "the two must stay separable"
+               % (len(gate_before), len(gate_after)))
+    else:
+        record("trader-loyalty", OK,
+               "%d trader(s) raised to the top level their own loyaltyLevels "
+               "declares; the assort's %d loyal_level_items entries untouched "
+               "-- the PLAYER axis, not the OFFER axis"
+               % (moved, len(gate_before)))
+
+    _set(w, "traderUnlockAllOffers", True)
+    st, doc, text = w.call("/client/trading/api/getTraderAssort/" + tid, {})
+    assort = envelope(doc) if doc else None
+    gate_open = dict((assort or {}).get("loyal_level_items") or {})
+    _set(w, "traderUnlockAllOffers", False)
+    if not gate_open:
+        record("trader-offers", INCONC,
+               "the assort for %s carries no loyal_level_items" % tid[:6])
+        return
+    if mut == "loyalty":
+        still = sorted(k for k, v in gate_before.items() if int(v or 0) > 1)
+    else:
+        still = sorted(k for k, v in gate_open.items() if int(v or 0) > 1)
+    gated_off = sum(1 for v in gate_before.values() if int(v or 0) > 1)
+    if still:
+        record("trader-offers", FAIL,
+               "%d of %d offers still gated above loyalty 1 with "
+               "traderUnlockAllOffers on" % (len(still), len(gate_open)))
+    elif gated_off == 0:
+        record("trader-offers", INCONC,
+               "nothing was gated above loyalty 1 with the switch OFF, so "
+               "turning it on proves nothing")
+    else:
+        record("trader-offers", OK,
+               "all %d offers served at loyalty 1 with traderUnlockAllOffers "
+               "on, against %d gated above 1 with it off"
+               % (len(gate_open), gated_off))
 
 
 def main():
@@ -1106,6 +1411,16 @@ def main():
         check_tolerated(w, mut)
     except Exception as exc:                       # noqa: BLE001
         record("tolerated", INCONC, "%s: %r" % (type(exc).__name__, exc))
+
+    # ------------------------------------------------------------------ 13
+    try:
+        check_progression(w, mut)
+    except Exception as exc:                       # noqa: BLE001
+        record("progression", INCONC, "%s: %r" % (type(exc).__name__, exc))
+    try:
+        check_trader_unlock(w, mut)
+    except Exception as exc:                       # noqa: BLE001
+        record("trader-loyalty", INCONC, "%s: %r" % (type(exc).__name__, exc))
 
     print()
     bad = [r for r in results if r[1] != OK]
