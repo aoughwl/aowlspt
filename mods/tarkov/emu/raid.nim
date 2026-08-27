@@ -22,23 +22,148 @@ import post1
 
 type
   RaidResult* = enum
-    rrSurvived, rrKilled, rrLeft, rrRunner, rrMissingInAction
+    rrSurvived, rrKilled, rrLeft, rrRunner, rrMissingInAction, rrTransit
 
 proc parseResult*(s: string): RaidResult =
+  ## The client's `ExitStatus`. `Transit` had no member here and fell through
+  ## the `else` to `rrLeft` -- which keeps the gear, so nothing was ever lost by
+  ## it, but it also meant nothing downstream could tell a transit from a normal
+  ## extract and say so. It is its own member now precisely so the limitation
+  ## below can be announced instead of being invisible.
   case s
   of "Survived": rrSurvived
   of "Killed": rrKilled
   of "Left": rrLeft
   of "Runner": rrRunner
   of "MissingInAction": rrMissingInAction
+  of "Transit": rrTransit
   else: rrLeft
 
 proc keepsGear*(r: RaidResult): bool =
   ## Whether the player walks out with what they walked in with. Death and going
-  ## missing lose the gear; leaving early and running out keep it.
+  ## missing lose the gear; leaving early, running out and transiting keep it.
   case r
   of rrKilled, rrMissingInAction: false
   else: true
+
+# ---------------------------------------------------------------------------
+# What the raid handed over rather than carried out
+# ---------------------------------------------------------------------------
+#
+# `/client/match/local/end` carries `transferItems` alongside the played
+# profile, and until now nothing in this server read it. That is the BTR
+# container and the transit hold: items the player deliberately handed to
+# something that is *not* their character, so they are **not** in the profile
+# the client posts back. `onMatchEnd` replaces the stored profile with that
+# posted one, so every item in `transferItems` was destroyed -- silently,
+# permanently, and with a 200 on the wire.
+#
+# What is measured about the shape, and what is not:
+#
+# * MEASURED, from the client's own metadata: the body's top level is the
+#   anonymous type `<>f__AnonymousType80`5` with exactly the members
+#   `serverId, results, lostInsuredItems, transferItems, locationTransit`.
+#   An anonymous type carries its member *names* in metadata and its member
+#   *types* only as generic parameters, so the names are certain and the
+#   element type is not recoverable from there.
+# * MEASURED, from `EFT.TransferItemsController`: the containers behind this
+#   member are keyed by profile id --
+#   `GetOrAddTransferContainer(string profileId)`,
+#   `TryGetTransferContainer(string profileId, Stash)`,
+#   `HasNonEmptyTransferContainer(string profileId)`. So the natural
+#   serialisation is a map from profile id to that profile's items, which is
+#   also what SPT accepts.
+# * MEASURED: `EFT.UI.DragAndDrop.MailTransferItemsGridItemView` exists. The
+#   client has a *mailbox* view built specifically for transferred items, which
+#   is the strongest available evidence that the real backend returns them by
+#   post rather than by splicing them into the stash.
+# * INFERRED: that the map's values are plain item arrays. There is no request
+#   body on disk to check it against -- the recorded capture stores responses
+#   only (`manifest.json` seq 204 claims `reqlen: 14800` for this route and the
+#   on-disk body is the 81-byte *response*).
+#
+# Because the last point is inferred, this reader is deliberately tolerant of
+# three shapes and **says so in `problems` when it meets a fourth**, rather
+# than returning an empty array and letting the caller destroy the items on the
+# strength of a shape guess. Nothing here is allowed to fail quietly: an
+# unreadable `transferItems` must be louder than a readable one.
+
+proc collectItems(a: JsonRef; into: var List; seen: var seq[string];
+                  dropped: var int) =
+  ## Every well-formed item in one array, de-duplicated by `_id`.
+  ##
+  ## An element with no `_id` or no `_tpl` is not an item this server can put
+  ## anywhere -- it cannot be parented, drawn or redeemed -- so it is counted
+  ## and reported instead of being written into a mailbox as a shape the client
+  ## will choke on.
+  let elems = each(a)
+  for e in elems:
+    if not isObject(e):
+      inc dropped
+      continue
+    let id = e.field("_id").asText("")
+    let tpl = e.field("_tpl").asText("")
+    if id.len == 0 or tpl.len == 0:
+      inc dropped
+      continue
+    var already = false
+    for s in seen:
+      if s == id:
+        already = true
+    if already:
+      continue
+    seen.add id
+    into.add raw(e)
+
+proc transferredItems*(body: string; problems: var seq[string]): string =
+  ## The items `transferItems` names, as one flat JSON array. `[]` when there
+  ## are none -- which is the common case, since most raids do not use the BTR.
+  ##
+  ## Every key is taken, not just the player's own. The keys are profile ids
+  ## and the only profile in an offline raid is the player's, so filtering by
+  ## id would buy nothing and would throw the items away on the day that
+  ## assumption is wrong. Taking them all can at worst mail the player an item
+  ## that was already theirs.
+  result = "[]"
+  let t = field(body, "transferItems")
+  if not t.exists or isNull(t):
+    return
+  var out1 = newList()
+  var seen: seq[string] = @[]
+  var dropped = 0
+  if isArray(t):
+    collectItems(t, out1, seen, dropped)
+  elif isObject(t):
+    let ms = members(t)
+    for m in ms:
+      let v = whole(m.value)
+      if isArray(v):
+        collectItems(v, out1, seen, dropped)
+      elif isObject(v) and isArray(v.field("items")):
+        collectItems(v.field("items"), out1, seen, dropped)
+      elif isObject(v) and isArray(v.field("data")):
+        collectItems(v.field("data"), out1, seen, dropped)
+      else:
+        problems.add "transferItems entry '" & m.name & "' is not an item " &
+                     "array and holds no `items` or `data` array either, so " &
+                     "whatever it carried could not be brought home"
+  else:
+    problems.add "transferItems is neither an object nor an array, so " &
+                 "nothing could be read out of it"
+    return
+  if dropped > 0:
+    problems.add $dropped & " entr(ies) in transferItems had no _id or no " &
+                 "_tpl and could not be brought home"
+  result = text(out1)
+
+proc transitDestination*(body: string): string =
+  ## Where a transit exit was heading, from `locationTransit.location`.
+  ##
+  ## MEASURED from `EFT.LocationTransit`: `{hash, playersCount, ip, location,
+  ## profiles, transitionRaidId, raidMode, side, dayTime}`. It carries **no
+  ## items** -- the items a transit moves travel in `transferItems` above --
+  ## so reading it is about being able to name the limitation, not about loss.
+  result = field(body, "locationTransit.location").asText("")
 
 # ---------------------------------------------------------------------------
 # The map list

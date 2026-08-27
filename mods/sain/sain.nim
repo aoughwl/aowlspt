@@ -1343,20 +1343,42 @@ proc sainSchema(): seq[Setting] =
   ## The flat top-level scalar keys SAIN reads from config.json. The `global`,
   ## `roles` and `server` blocks are nested documents resolved into a Preset
   ## rather than scalar controls, so their members are not declared here.
+  # FOUR OF THESE FIVE ARE `implemented = false`, DELIBERATELY.
+  #
+  # This mod is in OBSERVER MODE: it loads, reports what it can and cannot
+  # reach, and does not currently drive bot behaviour. A setting that renders
+  # and changes nothing is the worst thing we ship -- a readiness audit put it
+  # exactly this way: a tester will change `difficulty`, see vanilla bots, and
+  # blame the game. So the four that cannot bite are marked unimplemented and
+  # the settings surface hides them by default (F8 shows them).
+  #
+  # `enabled` STAYS implemented, because it is honest: it is read, and turning
+  # it off really does stop the mod loading its decision core. It is the one
+  # control here that does what its label says.
+  #
+  # WHEN THE DRIVING CALLS LAND, FLIP THESE BACK. They are not aspirational
+  # placeholders -- the schema, the persistence and the decision core behind
+  # them are written; only the call path into the game was missing, and that
+  # is now proven (by-value aggregates by hidden pointer, 8-byte packed in
+  # register, spill past position 3 -- all measured on the live client).
   result = @[
     boolSetting("enabled", "Enable SAIN", true, category = "AI",
                 description = "Master switch; when off the mod loads and does nothing"),
     enumSetting("difficulty", "Difficulty", "default",
                 @["easy", "lessdifficult", "default", "harderpmcs",
                   "veryhard", "deathwish"], category = "AI",
-                description = "Scales bot aggression across every role"),
+                description = "Scales bot aggression across every role",
+                implemented = false),
     stringSetting("forcePersonality", "Force personality", "", category = "AI",
-                  description = "Force every bot to one personality; empty means auto-assign by role"),
+                  description = "Force every bot to one personality; empty means auto-assign by role",
+                  implemented = false),
     boolSetting("driveFromHostThread", "Drive from host thread", true,
                 category = "Advanced",
-                description = "Allow the driving calls from the host thread on a host whose main-thread drain never fired; false withholds them so bots decide but do not move"),
+                description = "Allow the driving calls from the host thread on a host whose main-thread drain never fired; false withholds them so bots decide but do not move",
+                implemented = false),
     boolSetting("logDecisions", "Log decisions", false, category = "Advanced",
-                description = "Verbose per-bot decision logging")]
+                description = "Verbose per-bot decision logging",
+                implemented = false)]
 
 proc onSainSettings(url, body, session: string): string =
   ## GET serves the schema; a POST body persists one edit into config.json. SAIN
@@ -1508,7 +1530,6 @@ proc onUnload(): Status =
     info "sain: " & stats()
   Ok
 
-exportMod(guid = "aowl.sain", name = "SAIN", author = "aowlspt port of SAIN " &
-          "by Solarint and ArchangelWTF", version = "0.1.0",
+exportMod(guid = "aowl.sain", name = "Bot AI", author = "aowlspt", version = "0.1.0",
           sptRange = "*", sides = {sideClient, sideServer, sideSim},
           onLoad = onLoad, onUpdate = onUpdate, onUnload = onUnload)

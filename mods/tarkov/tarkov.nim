@@ -40,6 +40,7 @@ import aowlspt/json
 import aowlspt/menutext # the main menu's bottom-right corner label
 import emu/ids
 import emu/profile
+import emu/starterkit
 import emu/sessions
 import emu/templates
 import emu/traders
@@ -506,6 +507,47 @@ proc characterSlot(p: Profile): JsonObject =
   put(o, "unlockedTraders", raw("[]"))
   result = o
 
+proc emptyCharacterSlot(): JsonObject =
+  ## One `EFT.CharacterSelectionProfileData` for a mode with NO character yet.
+  ##
+  ## This exists because OMITTING a mode key is NOT the same as sending an empty
+  ## slot, which is what the old comment in `onProfilesV2` assumed. A key the
+  ## dictionary never receives is a slot the client was never told about, so it
+  ## draws nothing -- no character, and no "create a character" prompt either.
+  ## The slot prefab really does carry the affordance (`View/Empty` with its own
+  ## Idle/Hover, measured live in the tree), but it only renders for a slot whose
+  ## status is `empty`.
+  ##
+  ## `status` goes over the wire as a STRING through EGameMode's sibling
+  ## `EnumConverter`: Available->"available", Locked->"locked", Empty->"empty",
+  ## InRaid->"in_raid". `get_HasProfile` is `status==2 && uid != ""`, so an empty
+  ## slot is the exact inverse: status "empty" and a blank uid.
+  ##
+  ## Every field the populated slot sends is sent here too, at its zero value. A
+  ## throw ANYWHERE in one value aborts the WHOLE dictionary deserialize and
+  ## re-locks every slot -- including the one that does have a character -- so a
+  ## missing field here would cost us the working slot, not just this one.
+  var o = obj()
+  put(o, "uid", "")
+  put(o, "status", "empty")
+  put(o, "side", 0)
+  put(o, "nickname", "")
+  put(o, "lowerNickname", "")
+  put(o, "nicknamePref", "")
+  put(o, "level", 0)
+  put(o, "prestigeLevel", 0)
+  put(o, "memberCategory", 0)
+  put(o, "accountType", 0)
+  put(o, "aid", 0)
+  put(o, "gameVersion", "standard")
+  put(o, "PlayerVisualRepresentation", jnull())
+  put(o, "SeasonalInfo", jnull())
+  put(o, "unlockedProductionRecipe", raw("[]"))
+  put(o, "unlockedRules", raw("[]"))
+  put(o, "unlockedTraderDialogues", raw("[]"))
+  put(o, "unlockedTraders", raw("[]"))
+  result = o
+
 proc onProfilesV2(url, body, session: string): string =
   ## `/v2/client/game/profiles/` -- the character-select bootstrap. Post-1.0
   ## deserialises `data` into `Dictionary<EGameMode, CharacterSelectionProfileData>`
@@ -527,6 +569,22 @@ proc onProfilesV2(url, body, session: string): string =
       # slot; this server's one profile fills it.
       put(modes, "regular", characterSlot(p))
       break
+  # The two modes this server has no character for are sent EXPLICITLY as empty
+  # slots, not omitted. Omitting them was the old behaviour and its comment
+  # claimed it produced "a create a character prompt"; it does not -- measured on
+  # the live client, the response carried only the "regular" key and the player
+  # saw no empty slot and no + button anywhere on the screen. Only these two keys
+  # are legal besides "regular"; anything outside the EnumConverter map THROWS and
+  # re-locks every slot, so this list is closed on purpose.
+  put(modes, "pve", emptyCharacterSlot())
+  # "pvp-season" is deliberately NOT sent. Sending it populates the SEASONAL slot
+  # view, whose RefreshModeSpecificState calls CharacterSelectionSeasonPanel.ShowPerks
+  # with the SeasonalPerksData the client fetched from /client/seasonal-perks/list.
+  # That value arrives null here, ShowPerks throws NullReferenceException inside the
+  # client's own RunInitialLobbyFlow, and the task that activates MenuScreen never
+  # completes -- the player is left staring at an empty background. Measured from the
+  # client's own output_000.log stack, not inferred. Restore this key only once the
+  # seasonal-perks payload is known to deserialize into a non-null SeasonalPerksData.
   # Enveloped: a bare dictionary renders NOTHING (the client wraps this in
   # JsonResponse<T> and reads `.data`), while the envelope renders the Regular
   # slot. The dict key "regular" binds that slot to the mode; the value's own
@@ -853,6 +911,11 @@ proc onLauncherCreate(url, body, session: string): string =
     sideName = gDefaultSide
   if edition.len == 0:
     edition = gEdition
+  let canonEdition = normalEdition(edition)
+  if canonEdition.len == 0:
+    return launcherRefusal("this server does not have a starting profile for " &
+                           "edition '" & edition & "'")
+  edition = canonEdition
   var p = createProfile(nickname, sideName, edition, nowSeconds(),
                         gStartingRoubles)
   if not p.ok:
@@ -2168,6 +2231,98 @@ proc onMatchEnd(url, body, session: string): string =
 
   if not saveProfile(updated):
     return failure(1, "could not save the profile after the raid")
+
+  # `transferItems`: everything the player handed to the BTR container or
+  # carried into a transit. It is in the request body and it is **not** in the
+  # profile the client posts back -- handing an item over is exactly how it
+  # leaves the character -- so the profile replacement above destroyed all of
+  # it. Pay the BTR, load the container, extract, and the kit was neither in
+  # the stash nor in the mail. Silent, permanent, and answered with a 200.
+  #
+  # Posted rather than spliced into the stash, for three reasons. A stash can
+  # be full, and the only honest thing a splice can do when it is full is drop
+  # items -- which is the bug being fixed, wearing a different hat. The
+  # mailbox has no capacity to run out of, so the full-stash case stops being
+  # a case at all: the items wait in the inbox until there is room. And the
+  # client already has `EFT.UI.DragAndDrop.MailTransferItemsGridItemView` -- a
+  # mailbox view built for transferred items -- which is the best evidence
+  # available that post is what the real backend does with them.
+  #
+  # After the save on purpose: a raid whose result was thrown away must not
+  # leave items in a mailbox for it.
+  var xferProblems: seq[string] = @[]
+  let carried = transferredItems(body, xferProblems)
+  for problem in xferProblems:
+    # `error`, not `warn`. Every line here means items this server could see
+    # and could not place, which is the loudest thing that happens in this
+    # handler.
+    error "match/end transferItems: " & problem
+  let carriedList = parseArray(carried)
+  if carriedList.ok and carriedList.len > 0:
+    # Which of them are already somewhere the player can reach. Both places are
+    # checked, because this is what makes a retried `match/local/end`
+    # idempotent: without it a client that re-posts the same body -- and it
+    # does, after a failed save -- gets a second copy of every transferred
+    # item.
+    var home: seq[string] = @[]
+    let stashItems = each(updated.field("Inventory.items"))
+    for it in stashItems:
+      home.add it.field("_id").asText("")
+    let inbox = loadMail(p.id)
+    for i in 0 ..< inbox.len:
+      let attached = each(whole(inbox.items[i]).field("items.data"))
+      for a in attached:
+        home.add a.field("_id").asText("")
+    var owed = newList()
+    for i in 0 ..< carriedList.len:
+      let id = field(carriedList.items[i], "_id").asText("")
+      var have = false
+      for h in home:
+        if h.len > 0 and h == id:
+          have = true
+      if not have:
+        owed.add carriedList.items[i]
+    if owed.len == 0:
+      info $carriedList.len & " transferred item(s) are already in the stash " &
+           "or the mailbox; nothing was posted"
+    elif deliver(p.id, "", "The items you handed over in the raid have been " &
+                 "delivered.", mkSystem, nowSeconds(), text(owed)):
+      # Plain words rather than a trader's. This is a system message, which the
+      # client renders without a sender, so there is no voice being put in
+      # anybody's mouth -- unlike the insurance returns, which refuse to send
+      # anything the database has no wording for.
+      success $owed.len & " item(s) handed over in the raid were posted to " &
+              "the mailbox"
+    else:
+      # The mailbox could not be written and the profile already has been, so
+      # the items exist nowhere. Nothing here can put them back -- the profile
+      # the client played with no longer contains them -- so the only useful
+      # act is to name every one of them in the log, loudly enough that a
+      # human can put them back by hand.
+      var names = ""
+      for i in 0 ..< owed.len:
+        if names.len > 0: names.add ", "
+        names.add field(owed.items[i], "_tpl").asText("?") & " (" &
+                  field(owed.items[i], "_id").asText("?") & ")"
+      error "could not post " & $owed.len & " transferred item(s) to " &
+            p.nickname & "'s mailbox, and the profile has already been " &
+            "saved without them, so they are LOST: " & names
+
+  if outcome == rrTransit:
+    # KNOWN LIMITATION, stated rather than hidden. `locationTransit` names a
+    # destination map (MEASURED: `EFT.LocationTransit` is `{hash, playersCount,
+    # ip, location, profiles, transitionRaidId, raidMode, side, dayTime}` --
+    # no items), and this server does not continue a raid onto it: it ends the
+    # raid here, exactly as it does for `Left`. Gear is kept and the transit
+    # hold has just been posted above, so nothing is lost by it; what is
+    # missing is the seamless second raid.
+    let dest = transitDestination(body)
+    warn "this raid ended in a transit to " &
+         (if dest.len > 0: dest else: "an unnamed location") &
+         ", and this server does not continue a raid across one: it has been " &
+         "ended here instead. Nothing was lost -- the gear is kept and the " &
+         "transit hold has been posted to the mailbox."
+
   # Only now. A raid whose result failed to save is still a raid in progress,
   # and dropping the map here would make the retry worse than the failure.
   leaveRaid(session)
@@ -2385,6 +2540,42 @@ proc onMailView(url, body, session: string): string =
     return envelope(emptyObject())
   let dialogId = field(body, "dialogId").asText("")
   result = envelope(raw(dialogView(p.id, dialogId)))
+
+proc onMailDialogInfo(url, body, session: string): string =
+  ## `/client/mail/dialog/info` -- the header of ONE dialog: the sender, its
+  ## newest message, its unread count and its parcel badge.
+  ##
+  ## This was served by `onEmptyObject`. `{}` is a correct answer for a dialog
+  ## that does not exist and a wrong one for a dialog that does, and the two
+  ## are indistinguishable to the client: it takes the empty header, draws a
+  ## row with no preview and no badge, and the player's insurance return has
+  ## no visible unread mark. Same shape of defect as the hard-coded `new: 0`
+  ## that `dialogList` used to carry.
+  ##
+  ## Built by selecting out of `dialogList` rather than by assembling a header
+  ## here, so the row this route draws and the row the inbox draws cannot
+  ## disagree -- a second place deciding what a dialog header looks like is
+  ## how the two drift apart.
+  inc gRequests
+  let p = currentProfile(session)
+  if not p.ok:
+    return envelope(emptyObject())
+  # Not gated on a non-empty id. A system message is delivered with an empty
+  # sender -- `mkSystem` renders without one, which is what an achievement, an
+  # insurance return and the BTR hand-over all want -- so `""` is a real dialog
+  # in this mailbox and refusing to look it up would be the same wrong answer
+  # in a smaller place.
+  let dialogId = field(body, "dialogId").asText("")
+  let rows = each(whole(dialogList(p.id)))
+  for row in rows:
+    if row.field("_id").asText("") == dialogId:
+      let header = raw(row)
+      return envelope(raw(header))
+  # No such dialog. `{}` is the honest answer *here* -- and it is now only ever
+  # sent when the dialog genuinely is not in the mailbox.
+  warn "mail/dialog/info asked for dialog '" & dialogId &
+       "', which is not in this profile's mailbox; an empty header was sent"
+  result = envelope(emptyObject())
 
 proc onMailAttachments(url, body, session: string): string =
   inc gRequests
@@ -2687,6 +2878,11 @@ proc registerRoutes() =
   discard servePrefix("/client/trading/api/getTrader/", onTrader)
   discard serve("/client/trading/customization/storage", onCustomizationStorage)
   discard servePrefix("/client/items/prices/", onItemPrices)
+  # And without the trailing slash. `servePrefix` requires one, so the bare
+  # `/client/items/prices` -- which is a literal in the client's own string
+  # table -- matched nothing and 404'd. The handler never reads the URL, so
+  # both spellings are the same answer.
+  discard serve("/client/items/prices", onItemPrices)
 
   # Post-1.0 tables and stubs, none of which pre-1.0 had
   discard serve("/client/dialogue", onDialogue)
@@ -2704,6 +2900,13 @@ proc registerRoutes() =
   # Raids
   discard serve("/client/raid/configuration", onRaidConfiguration)
   discard serve("/client/location/getLocalloot", onLocalLoot)
+  # Both spellings. MEASURED against the client's own string table (the
+  # decrypted `global-metadata`): `/client/airdrop/loot` occurs ONCE and
+  # `/client/location/getAirdropLoot` occurs ZERO times -- i.e. the route this
+  # server has always served is one this client never calls, and the one it
+  # does call 404'd. The old name is kept because a pre-1.0 client does use it
+  # and removing it would trade one silent gap for another.
+  discard serve("/client/airdrop/loot", onAirdropLoot)
   discard serve("/client/location/getAirdropLoot", onAirdropLoot)
   discard serve("/client/locations", onLocations)
   discard serve("/client/match/local/start", onMatchStart)
@@ -2737,7 +2940,7 @@ proc registerRoutes() =
   discard serve("/client/notifier/channel/create", onNotifierChannel)
   discard servePrefix("/client/notifier/getwebsocket", onNotifierPoll)
   discard serve("/client/mail/dialog/list", onMailList)
-  discard serve("/client/mail/dialog/info", onEmptyObject)
+  discard serve("/client/mail/dialog/info", onMailDialogInfo)
   discard serve("/client/mail/dialog/view", onMailView)
   discard serve("/client/mail/dialog/getAllAttachments", onMailAttachments)
   discard serve("/client/mail/dialog/read", onMailRead)
@@ -2865,10 +3068,17 @@ proc tarkovSchema(): seq[Setting] =
     # database keeps in `globals.config`. Each names the one function it
     # reaches, and each of those functions is the ONLY place its number is
     # produced, which is what keeps the row from becoming decorative.
-    boolSetting("traderUnlockAllOffers", "Unlock every trader offer", true,
+    # OFF by default since the beta. It shipped `true`, which meant every
+    # trader's whole stock was buyable at level 1 -- Prapor's 422
+    # `loyal_level_items` entries were rewritten to 1 on the way out -- so the
+    # honest answer to "are items gated by loyalty and quests" was "no". The
+    # sandbox behaviour is still one switch away; it is just no longer the
+    # thing a stranger gets without asking.
+    boolSetting("traderUnlockAllOffers", "Unlock every trader offer", false,
                 category = "Traders",
                 description = "Sell every trader's whole stock from loyalty " &
-                              "level 1 (emu/traders.traderAssort)"),
+                              "level 1, ignoring loyalty and quest gating " &
+                              "(emu/traders.traderAssort). Off by default."),
     floatSetting("traderPriceMultiplier", "Trader price multiplier", 1.0,
                  lo = 0.0, hi = 10.0, step = 0.05, category = "Traders",
                  description = "Scales every barter-scheme count, in BOTH " &
@@ -3050,7 +3260,16 @@ proc onLoad(): Status =
   # Decode the placeholder image once, before any route can be asked for it.
   gFilesPng = decodeHex(PlaceholderPngHex)
 
-  gEdition = setting("edition").asText("standard")
+  # The edition is normalised here and NOWHERE else. The settings page spells
+  # it with hyphens, the launcher and `Info.GameVersion` with underscores; an
+  # edition this server cannot build a starting kit for is refused at create
+  # rather than quietly downgraded to standard.
+  let wantEdition = setting("edition").asText("standard")
+  gEdition = normalEdition(wantEdition)
+  if gEdition.len == 0:
+    warn "edition '" & wantEdition & "' is not one this server knows; new " &
+         "profiles will be standard"
+    gEdition = "standard"
   gDefaultSide = setting("defaultSide").asText("Usec")
   gNowSeconds = setting("epochBase").asInt(1700000000)
   gStartingRoubles = setting("startingRoubles").asInt(500000)
@@ -3072,7 +3291,7 @@ proc onLoad(): Status =
                 setting("mailKeepCollected").asInt(1))
   # The five server-side modifiers above, each handed to the module that owns
   # the number. Read here, at load, like every other key on this page.
-  configureTraders(setting("traderUnlockAllOffers").asBool(true),
+  configureTraders(setting("traderUnlockAllOffers").asBool(false),
                    setting("traderPriceMultiplier").asFloat(1.0))
   configureHideoutTimes(
     setting("hideoutConstructionMultiplier").asFloat(1.0))
@@ -3185,7 +3404,7 @@ proc onUnload(): Status =
 
 exportMod(
   guid = ModGuid,
-  name = "Tarkov Emulator",
+  name = "Singleplayer",
   author = "aowlspt",
   version = ModVersion,
   sptRange = "*",

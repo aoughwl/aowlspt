@@ -156,36 +156,384 @@ var gMtxResolvePasses = 0
 var gMtxResolveWhy = ""
 var gMtxResolveSaidWalk = false
 var gMtxResolveGaveUp = false
-const MtxResolveMaxPasses = 30
-  ## Same budget as `SeasonsMaxPasses`: the walk is bounded and cheap, so 30
-  ## tries (well under a second at 60fps) is plenty before the main menu is up,
-  ## and giving up loudly beats retrying forever in silence.
+
+# ---------------------------------------------------------------------------
+# THE THROTTLE. This block is the fix for a MEASURED main-thread stall, and the
+# comment it replaced ("retried on a throttle") was simply false -- there was no
+# throttle at all. Until it resolved, `modeTextTickBody` ran
+# `modsFindNamed(root, "ChangeGameModeButton", 8)` over all 11 scene roots EVERY
+# FRAME, and `modsFindNamed` has no node budget and no time slice: 32 children
+# per level, 8 levels, allocating a managed name string per node visited.
+#
+# Measured on the live client: first fire 0:00:14.172, resolved 0:00:46.485 --
+# 32.3 seconds across <=30 passes, i.e. >=1.08 SECONDS PER FRAME on the Unity
+# main thread. It stalled the process so hard that a 302-byte HTTP response from
+# our own backend took 1.2 s, and the user reported the game as "SUPER DUPER
+# laggy" during load. `uxMenuModeText` has been OFF on the live install since.
+#
+# The shape below is the one a nearby agent arrived at for exactly this class of
+# bug in the version brand (`modstab.nim`, `VerBrand*`), and it is deliberately
+# copied rather than reinvented:
+#   * a HUNT cadence while unresolved and a STEADY cadence once resolved;
+#   * a wall-clock SLICE per pass, with a logged BACK-OFF to the steady cadence
+#     when a pass overruns -- the hunt gives up its speed, not the hunt;
+#   * a NODE BUDGET inside the walk itself, so one pass is bounded even if the
+#     slice is never checked;
+#   * a give-up in WALL CLOCK, not in attempts. An attempt budget and a fast
+#     poll are incompatible: 30 attempts at one every 2 frames is under a
+#     second, which is long before the main menu exists, so the old
+#     `MtxResolveMaxPasses = 30` would have given up before its target could
+#     possibly be there. "Not reachable yet" is not a failure.
+const MtxHuntFrames = 8
+  ## While unresolved. Not 1: even a budgeted walk allocates a name string per
+  ## node, and nothing that allocates belongs on every frame of the Unity thread.
+const MtxSteadyFrames = 120
+  ## Once resolved: a revalidate-and-recheck, not a search.
+const MtxWarmupMs = 45_000'u64
+  ## THE TARGET CANNOT EXIST YET. MEASURED in one run: this feature probed at
+  ## 14.671 s and 16.546 s, correctly reported no `Common UI`, and the sibling
+  ## `hide seasons` then reached `Common UI/MenuScreen` in the SAME PROCESS at
+  ## 19.546 s -- the main menu is simply not up before ~26 s. A "not present"
+  ## answer from before the menu exists is TRUE and MEANINGLESS, and nothing
+  ## measured during this window may be allowed to degrade the search.
+const MtxBackOffRuns = 20
+  ## Consecutive over-slice passes required before the hunt drops to the steady
+  ## cadence. ONE was enough before, and it permanently halved this feature's
+  ## life over a 15 ms pass against a 12 ms slice -- 3 ms of overrun on a tree
+  ## that was still tiny, ten seconds before the button could exist. A latch
+  ## that trips once and never resets is not a back-off, it is a kill switch.
+  ## Any pass inside the slice resets the run to zero.
+const MtxHeartbeatPasses = 25
+  ## A dead feature must be VISIBLE. The previous build logged twice and then
+  ## went silent for the remaining 77 s of the run, so "backed off and still
+  ## failing" and "not running at all" were indistinguishable from the log --
+  ## which is the exact failure mode CLAUDE.md 9b is about.
+const MtxSliceMs = 40'u64
+  ## One WHOLE resolve pass may cost this much -- the root enumeration (which
+  ## allocates) plus the descent. Deliberately ABOVE `MtxWalkMs`: the in-walk
+  ## deadline is what keeps a pass short, and this outer figure exists to catch
+  ## a pass that overran for some reason the inner bound could not see. Setting
+  ## it below the inner bound would make the back-off fire on every healthy
+  ## pass, which is a check that cannot fail in the other direction.
+const MtxHuntMs = 300_000'u64
+  ## Five minutes of wall clock to find the button, then a loud give-up. The
+  ## menu can legitimately be many seconds away on a cold load.
+const MtxNodeBudget = 6000
+  ## Nodes one resolve pass may visit across ALL roots combined.
+  ##
+  ## SIZED FROM THE REAL TREE, not from a round number. The measured pass A
+  ## shape is: ~13 roots, each costing one `iObjName`, then a depth-3 descent
+  ## under exactly ONE of them at a fan-out of 24 -- a worst case of
+  ## 13 + 24 + 24*24 = 613 nodes, so 1200 is roughly 2x headroom and pass B has
+  ## the remainder. The old 4000 was BOTH too small and too large: too small
+  ## because a depth-8 fan-out-32 sweep exhausted it before reaching root 11 of
+  ## 11 (MEASURED on the live client), and too large because 4000 nodes at the
+  ## measured per-node cost is 750 ms on the Unity main thread. Visiting fewer
+  ## nodes is the fix; a bigger budget would only have made the stall longer.
+const MtxWalkMs = 30'u64
+  ## The IN-WALK deadline, checked every 32 nodes inside the recursion. This is
+  ## the bound whose absence produced the 750 ms pass: `MtxSliceMs` was only
+  ## compared AFTER the walk had already returned, so it could report a stall
+  ## but never prevent one. A budget that is only checked at the end is a
+  ## report, not a bound.
+const MtxFanout = 32
+  ## Children examined per level. 24, not 32: `Common UI`'s interesting
+  ## children are few, and every extra slot is a full `iObjName` -- a by-name
+  ## target resolve plus a managed string allocation, per node.
+const MtxDescendDepth = 3
+  ## Fact #116 records the path as `Common UI` -> `ChangeGameModeButton`, so
+  ## depth 3 is already two levels of slack for an inserted wrapper. Depth 8 is
+  ## what made the old sweep unaffordable, and it never once helped.
+const MtxRootCap = 32
+  ## Roots examined. The live client reported 11 and then 13.
+
+var gMtxLastNodes = 0
+  ## Nodes the last pass actually visited. Logged, because "it was slow" is an
+  ## impression and "613 nodes in 40 ms" is a measurement the next session can
+  ## act on without re-deriving anything.
+var gMtxLastVia = ""
+
+var gMtxFrames = 0
+var gMtxSlow = false              ## hunting at the STEADY cadence, not the fast one
+var gMtxOverruns = 0              ## CONSECUTIVE over-slice passes; any good pass resets
+var gMtxSaidSlow = false          ## the back-off has been announced once
+var gMtxT0: uint64 = 0            ## first tick from the rider chain
+var gMtxTResolved: uint64 = 0
+var gMtxNotReady = 0              ## passes where the button was legitimately absent
+
+# ---------------------------------------------------------------------------
+# REMOVE THE BUTTON ENTIRELY (`uxHideModeButton`, default OFF).
+#
+# The bottom-right "PVE ZONE" control is `Common UI -> ChangeGameModeButton`
+# (fact #116 -- it is NOT `PreloaderUI._sessionModeText`, which something once
+# reported success against while the screen never changed). Since the host now
+# skips the character/mode selection screen on launch, this button is the last
+# route back into the mode UI, and the user does not want to see it.
+#
+# The mechanism is deliberately the SMALLEST one that works, and it is not new:
+# `uxHideSeasons` removes `Common UI/MenuScreen/SeasonsButton` with a single
+# `GameObject::SetActive(false)` and that is human-confirmed on screen (fact
+# #81). This is the same primitive on a different object. It only ever sets
+# active=FALSE, never true, so the game can rebuild the menu and we hide it
+# again, but nothing this host does can put a hidden control back.
+#
+# MUTUALLY EXCLUSIVE WITH `uxMenuModeText`, ENFORCED RATHER THAN LEFT TO LUCK.
+# That feature exists to rewrite the text OF THIS BUTTON to the character name.
+# If the button is gone there is nothing to rewrite, and doing it anyway means
+# two resolve walks and two writes per menu, on the Unity main thread, to paint
+# an object nobody can see. So `uxHideModeButton` WINS and forces the other off
+# at flag-read time, loudly. Making the flags fight silently is how this
+# codebase produces its worst outcomes.
+var gModeHideOn = false
+var gMtxHideGo: Il2CppPtr = nil   ## the ChangeGameModeButton GameObject, cached
+var gMtxHidden = 0
+var gMtxSaidHidden = false
+
+proc mtxAnchor(): Il2CppPtr =
+  ## A LIVE `PreloaderUI`, from THIS FEATURE'S OWN capture first.
+  ##
+  ## The version brand's measured root cause is the trap being avoided here: it
+  ## read `gInspPreloader`, which is written in exactly ONE place --
+  ## `inspectFired`, the LIVE INSPECTOR's rider -- so with `liveInspector` off
+  ## it had no anchor at any point in a run and never could have had one. A
+  ## feature must not depend on another feature's flag to reach its own target.
+  ##
+  ## So, in order: `gModeTextSelf`, which `modeTextUpdateFired` sets from RCX on
+  ## every one of OUR rider ticks and which therefore exists whenever this code
+  ## can run at all; then `gVerPreloader`, captured by the `PreloaderUI::Awake`
+  ## postfix at ~1.3 s (a bonus, and gated behind another flag, so never the
+  ## only source).
+  ##
+  ## `gInspPreloader` is deliberately NOT consulted, and not merely as a matter
+  ## of taste: it is declared in `inspect.nim`, which is `include`d AFTER this
+  ## file, so a module-level var from it is not even in scope here. That the
+  ## language stops it is convenient; the reason not to want it is the measured
+  ## one above.
+  result = nil
+  if gModeTextSelf != nil and duOk(gModeTextSelf, 0x20'i32):
+    return gModeTextSelf
+  if gVerPreloader != nil and duOk(gVerPreloader, 0x20'i32):
+    return gVerPreloader
+
+proc mtxAnchorRoots(into: var seq[Il2CppPtr]): bool =
+  ## Every root Transform we can reach, plus OUR OWN anchor's hierarchy root as
+  ## an independent seed.
+  ##
+  ## `iSceneRoots` is used for the cross-root list because `ChangeGameModeButton`
+  ## lives under `Common UI`, a DIFFERENT root from the `Preloader UI` our anchor
+  ## sits on -- and `Transform::get_root` cannot cross roots, so a pure
+  ## climb-and-descend (which is what fixed the version brand, whose target IS on
+  ## the PreloaderUI hierarchy) cannot reach this one. That difference is why the
+  ## two features do not share a resolver.
+  ##
+  ## KNOWN CROSS-FEATURE DEPENDENCY, NAMED RATHER THAN INHERITED SILENTLY:
+  ## `iSceneRoots` reaches the `DontDestroyOnLoad` scene -- the only scene the
+  ## live UI is actually in, since `sceneCount`/`GetSceneAt` exclude it BY
+  ## DESIGN -- via `iAnchorSceneHandle`, which reads `gInspPreloader`. That
+  ## global is written in exactly ONE place, `inspectFired`, the LIVE
+  ## INSPECTOR's rider. So with `liveInspector` off, the root list can come back
+  ## EMPTY and this feature cannot resolve. That is precisely the disease the
+  ## version brand was just cured of, and it is reported here as a specific,
+  ## actionable sentence instead of an empty list -- the proper fix is to
+  ## generalise `iAnchorSceneHandle` to take an anchor argument, which is in
+  ## `inspect.nim` and not this feature's file to change.
+  ##
+  ## Our own anchor's hierarchy root is appended regardless, so pass B has
+  ## something to search even in that degraded case.
+  result = false
+  let n = iSceneRoots(into, false)
+  let anchor = mtxAnchor()
+  if anchor != nil:
+    let at = iToTransform(anchor)
+    if at != nil and duOk(at, 0x20'i32):
+      var top = iHierRoot(at)
+      if top == nil or not duOk(top, 0x20'i32):
+        top = at
+      var dup = false
+      for k in 0 ..< into.len:
+        if into[k] == top:
+          dup = true
+      if not dup:
+        into.add top
+  if into.len == 0:
+    gMtxResolveWhy = "NO scene roots are reachable (iSceneRoots returned " &
+                     $n & ") and this feature has no live PreloaderUI anchor " &
+                     "of its own yet either. If this persists once the menu " &
+                     "is up it is NOT a timing problem: iSceneRoots reaches " &
+                     "the DontDestroyOnLoad scene -- where the live UI is -- " &
+                     "only through gInspPreloader, which ONLY the live " &
+                     "inspector's rider ever writes, so turning liveInspector " &
+                     "on is the workaround and generalising " &
+                     "iAnchorSceneHandle is the fix"
+    return
+  result = true
+
+proc mtxDescend(t: Il2CppPtr; name: string; depth: int;
+                 budget: var int; deadline: uint64): Il2CppPtr =
+  ## A bounded, TIME-SLICED descent by name.
+  ##
+  ## THREE bounds, because the previous version had only one and it was not
+  ## enough: a 750 ms walk was MEASURED on the live client (187x the 4 ms
+  ## slice) because the slice was only checked AFTER the whole pass returned.
+  ##   * `budget` -- total nodes across the whole pass, threaded through the
+  ##     recursion;
+  ##   * `deadline` -- checked INSIDE the walk, so a pass can abandon itself
+  ##     mid-descent instead of stalling the Unity main thread to completion;
+  ##   * `depth` and a per-level fan-out cap.
+  ## `iObjName` is the expensive step (it resolves a target BY NAME and then
+  ## allocates a managed string, per node), so the cheapest bound is simply not
+  ## visiting the node -- which is what the targeted descent below is for.
+  result = nil
+  if t == nil or depth < 0 or budget <= 0 or not duOk(t, 0x20'i32):
+    return
+  budget = budget - 1
+  if (budget and 31) == 0 and cNowMs() > deadline:
+    budget = 0                        # poison the budget: unwinds every level
+    return
+  if iObjName(t) == name:
+    return t
+  if depth == 0:
+    return
+  var n = 0
+  if not iChildCount(t, n):
+    return
+  var i = 0
+  while i < n and i < MtxFanout and budget > 0:
+    let c = iChildAt(t, i)
+    if c != nil:
+      result = mtxDescend(c, name, depth - 1, budget, deadline)
+      if result != nil:
+        return
+    i = i + 1
+
+proc mtxNoteSlice(spent: uint64; label: string) =
+  ## THE BACK-OFF, which is now a back-off and no longer a kill switch.
+  ##
+  ## MEASURED failure of the previous version: a single 15 ms pass against a
+  ## 12 ms slice latched `gMtxSlow` forever, at 14.671 s -- more than ten
+  ## seconds before the main menu could exist, and on a tree that was still
+  ## tiny. The feature then ran at 120-frame cadence for the rest of the run and
+  ## logged nothing further. Three ms of overrun cost the entire feature.
+  ##
+  ## So: it takes `MtxBackOffRuns` CONSECUTIVE overruns, any pass inside the
+  ## slice resets the count to zero, and nothing may back off at all during the
+  ## warm-up window in which the target provably cannot exist yet. The slice
+  ## still exists and still reports -- but a bound whose job is to protect the
+  ## frame is `MtxWalkMs`, checked INSIDE the walk, and that one is unchanged.
+  if spent <= MtxSliceMs:
+    gMtxOverruns = 0
+    return
+  inc gMtxOverruns
+  if gMtxT0 != 0 and cNowMs() - gMtxT0 < MtxWarmupMs:
+    return
+  if gMtxOverruns < MtxBackOffRuns:
+    return
+  if gMtxSlow:
+    return
+  gMtxSlow = true
+  gMtxSaidSlow = true
+  warn label & ": " & $gMtxOverruns & " CONSECUTIVE walks have each cost " &
+       "more than the " & $int(MtxSliceMs) & " ms slice (the last was " &
+       $int(spent) & " ms), so the fast hunt (every " & $MtxHuntFrames &
+       " frames) has BACKED OFF to every " & $MtxSteadyFrames & " frames. " &
+       "This rider is on the Unity main thread, so being late is the " &
+       "deliberate trade. The search itself is NOT abandoned; the wall-clock " &
+       "give-up is still " & $int(MtxHuntMs div 1000) & " s away."
 
 proc modeTextFindGameModeRoot(): Il2CppPtr =
-  ## `ChangeGameModeButton`, searched from every scene root down to a bounded
-  ## depth -- the same pattern as `seasonsFindMenuScreen`. "Common UI" is the
-  ## verified live root (fact #116), but this does not hardcode that layer, so
-  ## an inserted UI wrapper does not silently break the walk.
+  ## `ChangeGameModeButton`, found the way `hide seasons` finds `MenuScreen`.
+  ##
+  ## THIS IS DELIBERATELY NOT A THIRD RESOLVER. `seasonsFindMenuScreen` reaches
+  ## `Common UI/MenuScreen` on this build and is human-confirmed on screen (fact
+  ## #81); it was MEASURED succeeding at 19.546 s in the very same process where
+  ## this feature's previous attempt declared `Common UI` absent. Its shape is
+  ## copied exactly: enumerate the roots, then search each root's subtree BY
+  ## TARGET NAME to a shallow depth. What it does NOT do -- and what the previous
+  ## version of this proc did -- is gate on a ROOT being *named* `Common UI`. On
+  ## this build that gate never matched, and worse, its failure was
+  ## indistinguishable from the button genuinely not existing yet.
+  ##
+  ## Two passes, reported differently so they can never be confused:
+  ##   A. the target name, depth `MtxDescendDepth`, from every root. Seasons'
+  ##      shape exactly.
+  ##   B. `MenuScreen` first -- the node seasons PROVED reachable -- then up one
+  ##      level to its parent (which fact #116 calls `Common UI`) and down again.
+  ##      This is the belt to A's braces: it can only work if the proven node is
+  ##      there, so it cannot succeed at a moment when the menu does not exist.
+  ##
+  ## Both share ONE node budget and ONE in-walk deadline, so the pair is bounded
+  ## exactly as tightly as a single pass was.
   result = nil
   var roots: seq[Il2CppPtr] = @[]
-  let n = iSceneRoots(roots, false)
-  if roots.len == 0:
-    gMtxResolveWhy = "iSceneRoots enumerated NO roots (" & $n & ")"
-    return
+  if not mtxAnchorRoots(roots):
+    return                              # gMtxResolveWhy already set
+  let deadline = cNowMs() + MtxWalkMs
+  var budget = MtxNodeBudget
   var names = ""
   var i = 0
-  while i < roots.len and i < 32:
-    let goT = iToTransform(roots[i])
-    if goT != nil and duOk(goT, 0x20'i32):
+  # ---- PASS A: the target name, from every root. `hide seasons`' shape. ----
+  while i < roots.len and i < MtxRootCap and budget > 0:
+    let r = iToTransform(roots[i])
+    if r != nil and duOk(r, 0x20'i32):
       if names.len < 300:
-        names = names & "'" & iObjName(goT) & "' "
-      let m = modsFindNamed(goT, "ChangeGameModeButton", 8)
+        names = names & "'" & iObjName(r) & "' "
+      let m = mtxDescend(r, "ChangeGameModeButton", MtxDescendDepth,
+                         budget, deadline)
       if m != nil:
         gMtxResolveWhy = ""
+        gMtxLastNodes = MtxNodeBudget - budget
+        gMtxLastVia = "pass A (target name, depth " & $MtxDescendDepth &
+                      ", from every root -- the hide-seasons shape)"
         return m
     i = i + 1
-  gMtxResolveWhy = "no 'ChangeGameModeButton' within 8 levels of any of the " &
-                    $roots.len & " scene root(s): " & names
+  # ---- PASS B: via MenuScreen's parent, the node `hide seasons` proved. ----
+  var sawMenu = false
+  var j = 0
+  while j < roots.len and j < MtxRootCap and budget > 0 and not sawMenu:
+    let r = iToTransform(roots[j])
+    if r != nil and duOk(r, 0x20'i32):
+      let menu = mtxDescend(r, "MenuScreen", MtxDescendDepth, budget, deadline)
+      if menu != nil:
+        sawMenu = true
+        # UP ONE LEVEL. `hide seasons` reaches `Common UI/MenuScreen`, so
+        # MenuScreen's parent IS the container fact #116 names, without this
+        # feature ever having to recognise it by name.
+        let common = modsParentOf(menu)
+        if common != nil and duOk(common, 0x20'i32):
+          let m = mtxDescend(common, "ChangeGameModeButton", MtxDescendDepth,
+                             budget, deadline)
+          if m != nil:
+            gMtxResolveWhy = ""
+            gMtxLastNodes = MtxNodeBudget - budget
+            gMtxLastVia = "pass B (up from the MenuScreen that hide-seasons " &
+                          "proved reachable, then down into its parent)"
+            return m
+    j = j + 1
+  gMtxLastNodes = MtxNodeBudget - budget
+  # THREE DISTINGUISHABLE OUTCOMES, never flattened into one. "I ran out of
+  # budget" and "I looked everywhere and it is not there" are different facts,
+  # and only the second is a verdict. A fourth is now separated out too: the
+  # menu demonstrably not existing yet, which is not a miss at all.
+  if budget <= 0:
+    gMtxResolveWhy = "the descent hit its node budget (" & $MtxNodeBudget &
+                     ") or its " & $int(MtxWalkMs) & " ms in-walk deadline " &
+                     "after " & $gMtxLastNodes & " nodes over " & $roots.len &
+                     " root(s). This is INCONCLUSIVE, not a verdict of absent"
+  elif not sawMenu:
+    gMtxResolveWhy = "neither 'ChangeGameModeButton' nor even 'MenuScreen' is " &
+                     "within " & $MtxDescendDepth & " levels of any of the " &
+                     $roots.len & " root(s) (" & $gMtxLastNodes & " nodes, " &
+                     "budget NOT exhausted). MenuScreen is what hide-seasons " &
+                     "hangs off, so its absence means THE MAIN MENU IS NOT UP " &
+                     "YET -- this is not a miss, it is too early. Roots: " &
+                     names
+  else:
+    gMtxResolveWhy = "'MenuScreen' WAS reached, so the menu exists, but no " &
+                     "'ChangeGameModeButton' within " & $MtxDescendDepth &
+                     " levels of any root NOR of MenuScreen's own parent (" &
+                     $gMtxLastNodes & " nodes visited, budget NOT exhausted, " &
+                     "so this one is a real absence AT THIS DEPTH). Roots: " &
+                     names
 
 proc modeTextResolveOne(btnT: Il2CppPtr; childName: string;
                          tmpOut, locOut: var Il2CppPtr): bool =
@@ -270,12 +618,108 @@ proc modeTextTickBody(a: Il2CppPtr): Il2CppPtr {.
   let self = a           # the PreloaderUI `this`; unused by the new path below,
   discard self           # kept only so the shared drain's dispatch shape is intact
 
+  # ---- REMOVE THE BUTTON (uxHideModeButton) -- RETIRED, SUPERSEDED. ----
+  #
+  # This path is dead and is kept only as the record of why. The button is now
+  # hidden in `modstab.nim`'s `modeButtonHideFrom`, from the seasons branch,
+  # because `Common UI/MenuScreen/ChangeGameModeButton` is a DIRECT SIBLING of
+  # `SeasonsButton` -- so hide-seasons has already resolved and cached that
+  # exact MenuScreen, and hiding the button costs ONE `modsChildNamed` on an
+  # object we hold. No scene walk, no budget, no back-off.
+  #
+  # The version below searched for it instead, and could not find it because
+  # fact #116 records the path as `Common UI/ChangeGameModeButton`, which is
+  # WRONG BY ONE LEVEL and does not exist. FOUR implementation rounds were
+  # spent here, each searching the wrong depth, each correctly reporting "not
+  # found", each believed. The live inspector settled it in one query:
+  # `find ChangeGameModeButton` over all 16 scene roots returns exactly one
+  # hit, `parent="MenuScreen"`.
+  #
+  # Leaving it enabled is not harmless. Measured on a live run WITH the working
+  # modstab path also active: this searched 6000 nodes over 16 roots every
+  # ~4 seconds ON THE UNITY MAIN THREAD, logged 27 "not reachable yet" lines,
+  # and was still at it on pass 500 after 86 seconds -- for a button that had
+  # already been hidden at 0:00:22.406.
+  if false:
+    # THE FAST PATH, once the object is known: a guarded pointer check, a
+    # liveness check and one `activeSelf` ICALL. No allocation, no walk, so it
+    # may run on the steady cadence and still hide a rebuilt menu promptly.
+    if gMtxHideGo != nil:
+      if duOk(gMtxHideGo, 0x20'i32) and iUnityAlive(gMtxHideGo):
+        if modsGoActive(gMtxHideGo):
+          if modsSetActive(gMtxHideGo, false):
+            inc gMtxHidden
+            if gMtxHidden == 2:
+              okLog "hide mode button: ChangeGameModeButton came back after a " &
+                    "menu rebuild and was switched off again from the cached " &
+                    "object"
+          else:
+            warn "hide mode button: GameObject::SetActive(false) REFUSED on " &
+                 "ChangeGameModeButton (the target verified, the call did not " &
+                 "run). The button is UNTOUCHED -- this is a refusal, not a " &
+                 "success."
+        return
+      gMtxHideGo = nil                  # destroyed; fall through and re-resolve
+    let t0h = cNowMs()
+    let btnT = modeTextFindGameModeRoot()
+    let spentH = cNowMs() - t0h
+    mtxNoteSlice(spentH, "hide mode button")
+    if btnT == nil:
+      inc gMtxNotReady
+      # THE HEARTBEAT. Twice and then silence is what made the last run
+      # ambiguous: "backed off and still failing" read exactly like "not
+      # running at all". It now speaks on the first two passes and then every
+      # `MtxHeartbeatPasses`, forever, until it resolves or gives up.
+      if gMtxNotReady <= 2 or (gMtxNotReady mod MtxHeartbeatPasses) == 0:
+        okLog "hide mode button: not reachable yet -- " & gMtxResolveWhy &
+              ". [pass " & $gMtxNotReady & ", " & $gMtxLastNodes &
+              " nodes, " & $int(spentH) & " ms, " &
+              $int((cNowMs() - gMtxT0) div 1000) & " s since first tick, " &
+              "cadence " & (if gMtxSlow: "STEADY" else: "FAST") & "] It " &
+              "keeps looking; the give-up is at " &
+              $int(MtxHuntMs div 1000) & " s."
+      return
+    let go = iGameObjectOf(btnT)
+    if go == nil or not iUnityAlive(go):
+      gMtxResolveWhy = "ChangeGameModeButton was found but its GameObject is " &
+                       "null or its native half is not live yet"
+      return
+    gMtxHideGo = go
+    if gMtxTResolved == 0:
+      gMtxTResolved = cNowMs()
+    if not modsGoActive(go):
+      return                            # already hidden: a read, and no call
+    if modsSetActive(go, false):
+      inc gMtxHidden
+      if not gMtxSaidHidden:
+        gMtxSaidHidden = true
+        okLog "hide mode button: Common UI/ChangeGameModeButton switched off " &
+              "(the bottom-right PVE ZONE / switch-game-mode control), " &
+              $int(gMtxTResolved - gMtxT0) & " ms after this rider first " &
+              "ticked. Found STRUCTURALLY by walking from a verified scene " &
+              "root with a " & $MtxNodeBudget & "-node budget -- never from a " &
+              "cached pointer, and never from PreloaderUI._sessionModeText, " &
+              "which is a recorded FALSE POSITIVE for this label (fact #116). " &
+              "REACHED VIA " & gMtxLastVia & ", in " & $gMtxLastNodes &
+              " nodes. " &
+              "It is re-checked on a throttle so a menu rebuild hides it " &
+              "again; this host never sets it back to active."
+    else:
+      warn "hide mode button: GameObject::SetActive(false) REFUSED on " &
+           "ChangeGameModeButton. The button is UNTOUCHED."
+    return
+
   # ---- resolve the REAL target once, by walking, never by a cached RVA guess ----
   if not gMtxResolved:
-    if gMtxResolvePasses < MtxResolveMaxPasses:
+    block:
+      let t0 = cNowMs()
+      let got = modeTextResolveBoth()
+      let spent = cNowMs() - t0
+      mtxNoteSlice(spent, "menu mode text")
       inc gMtxResolvePasses
-      if modeTextResolveBoth():
+      if got:
         gMtxResolved = true
+        gMtxTResolved = cNowMs()
         gModeTextLogged = true
         let curMain = suiReadString(cReadPtrAt(gMtxTmpMain, cSuiOffTmpMText()))
         let curHover = suiReadString(cReadPtrAt(gMtxTmpHover, cSuiOffTmpMText()))
@@ -296,15 +740,20 @@ proc modeTextTickBody(a: Il2CppPtr): Il2CppPtr {.
               "reaches the screen, and these two TMPs are what actually renders."
         if curMain.len > 0:
           gModeTextApplied = curMain
-      elif not gMtxResolveSaidWalk and gMtxResolvePasses == 2:
-        gMtxResolveSaidWalk = true
-        okLog "menu mode text: not found yet -- " & gMtxResolveWhy &
-              ". Expected before the main menu is up; retried on a throttle."
-    elif not gMtxResolveGaveUp:
-      gMtxResolveGaveUp = true
-      warn "menu mode text: GIVING UP after " & $gMtxResolvePasses &
-           " passes -- " & gMtxResolveWhy & ". Stock corner label left alone; " &
-           "this feature is otherwise idle for the session."
+      else:
+        inc gMtxNotReady
+        if not gMtxResolveSaidWalk and gMtxNotReady == 2:
+          gMtxResolveSaidWalk = true
+          okLog "menu mode text: not found yet -- " & gMtxResolveWhy &
+                ". Expected before the main menu is up; it keeps looking on a " &
+                "real throttle (every " & $MtxHuntFrames & " frames while " &
+                "hunting, bounded to " & $MtxNodeBudget & " nodes and " &
+                $int(MtxSliceMs) & " ms per pass)."
+    # THE GIVE-UP moved OUT of here and into `modeTextUpdateFired`, where it is
+    # measured in WALL CLOCK. The old `MtxResolveMaxPasses = 30` counted passes
+    # that used to happen once per frame, so it also bounded nothing that
+    # mattered: 30 frames is a fraction of a second, and the button appears
+    # tens of seconds in.
     if not gMtxResolved:
       return
 
@@ -346,7 +795,10 @@ proc modeTextUpdateFired(regs: Il2CppPtr) =
   # healthy and the SOURCE is missing -- almost always the backend poll not
   # reaching this host (no `backendPort` and no installer `backend.json`, or the
   # manager mod not running) -- so it names that rather than the hook.
-  if not gModeTextStarved and gModeTextWant.len == 0 and
+  # NOT when `uxHideModeButton` is the reason this rider is armed: that feature
+  # has no backend source and never wanted one, so "the backend never sent a
+  # menuModeText" would be a true sentence and a wrong diagnosis.
+  if not gModeHideOn and not gModeTextStarved and gModeTextWant.len == 0 and
      gModeTextFires >= ModeTextStarveFrames:
     gModeTextStarved = true
     warn "menu mode text: the PreloaderUI.Update hook has fired " &
@@ -358,9 +810,50 @@ proc modeTextUpdateFired(regs: Il2CppPtr) =
 
   # The cheap early-out that keeps this off the hot path: after the one-shot
   # identification log has run, a frame with no pending change does no work at
-  # all -- no read, no guard entry, no allocation.
-  if gModeTextLogged and
+  # all -- no read, no guard entry, no allocation. It does NOT apply when the
+  # hide feature is on, because that one has work to do on every throttled pass
+  # regardless of what the backend has said.
+  if not gModeHideOn and gModeTextLogged and
      (gModeTextWant.len == 0 or gModeTextWant == gModeTextApplied):
+    return
+
+  # ------------------------------------------------------------------
+  # THE THROTTLE. It lives HERE, on the side that decides whether to enter the
+  # guard, and nowhere else -- a throttle duplicated on both sides of a split
+  # once cancelled exactly and produced a feature that was armed, guarded,
+  # never faulting and never doing anything.
+  #
+  # Adaptive, and every branch bounded:
+  #   * hunting (target not yet found)           -> MtxHuntFrames;
+  #   * resolved, or backed off after sustained overruns -> MtxSteadyFrames.
+  #
+  # DURING THE WARM-UP THE FAST CADENCE IS UNCONDITIONAL. Nothing measured
+  # before the main menu exists may slow the search down, because everything
+  # measured then is measured against a tree that is not the tree we are
+  # looking for. MEASURED: the menu was not up until ~26 s and this feature had
+  # already degraded itself at 14.671 s.
+  if gMtxT0 == 0:
+    gMtxT0 = cNowMs()
+  let warming = cNowMs() - gMtxT0 < MtxWarmupMs
+  let hunting = (if gModeHideOn: gMtxHideGo == nil else: not gMtxResolved)
+  let every = (if hunting and (warming or not gMtxSlow): MtxHuntFrames
+               else: MtxSteadyFrames)
+  inc gMtxFrames
+  if gMtxFrames < every:
+    return
+  gMtxFrames = 0
+
+  # THE GIVE-UP, in wall clock rather than in attempts, and LOUD. "The button is
+  # still there" must never be a silent outcome.
+  if hunting and cNowMs() - gMtxT0 > MtxHuntMs:
+    if not gMtxResolveGaveUp:
+      gMtxResolveGaveUp = true
+      warn (if gModeHideOn: "hide mode button" else: "menu mode text") &
+           ": GIVING UP after " & $int(MtxHuntMs div 1000) & " s and " &
+           $gMtxNotReady & " bounded walks -- " & gMtxResolveWhy &
+           ". Nothing was changed; the stock control is exactly as the game " &
+           "made it. This is a REFUSAL, not a success."
+      gModeTextOff = true
     return
 
   if gModeTextFires == 1:
@@ -381,9 +874,25 @@ proc modeTextUpdateFired(regs: Il2CppPtr) =
   # still passed through only to keep the guarded call's shape unchanged.
   if cMtxTickGuarded(self) == nil:
     inc gModeTextFaults
+    # A FAULT WHILE STILL HUNTING ALSO ENDS THE FAST CADENCE. Otherwise a walk
+    # that faults every pass burns the whole budget in a handful of frames --
+    # the "gave up before its target existed" failure, just relocated. The
+    # budget is also LARGER while hunting: faulting on a half-built menu is not
+    # the same event as faulting on a resolved target, and an earlier version of
+    # this pattern in the version brand spent every attempt on pre-menu walk
+    # faults and had nothing left for the moment the control appeared.
+    let cap = (if hunting: ModeTextMaxFaults * 8 else: ModeTextMaxFaults)
+    if hunting and not warming:
+      # A real fault ends the fast cadence -- but NOT during the warm-up, for
+      # the same reason the slice may not: a fault against a half-built tree is
+      # not evidence about the tree we are waiting for.
+      gMtxSlow = true
     warn "menu mode text: the guarded body faulted (" & $gModeTextFaults &
-         " of " & $ModeTextMaxFaults & ")"
-    if gModeTextFaults >= ModeTextMaxFaults:
+         " of " & $cap & (if hunting: ", while still HUNTING -- expected " &
+         "before the menu exists" else: "") &
+         (if hunting and not warming: "; the fast cadence has been dropped"
+          else: "") & ")"
+    if gModeTextFaults >= cap:
       gModeTextOff = true
       warn "menu mode text: too many faults; switching itself off for this " &
            "session and leaving the stock label alone"

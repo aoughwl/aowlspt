@@ -188,6 +188,40 @@ proc selectSetting*(key, label: string; default: string; options: seq[string];
 # Serialisation
 # ---------------------------------------------------------------------------
 
+proc settingPath*(s: Setting): seq[string] =
+  ## The GROUP PATH this row lives at, to ARBITRARY DEPTH.
+  ##
+  ## `category` and `subcategory` stayed exactly as they were -- every mod that
+  ## has already declared settings keeps working, unedited, and keeps getting
+  ## the same one- or two-level grouping it had. Depth beyond two is expressed
+  ## by putting separators IN `category` (or `subcategory`):
+  ##
+  ##     category = "Player/Health/Regeneration"
+  ##
+  ## which yields the path `["Player", "Health", "Regeneration"]` and renders
+  ## as `Singleplayer > Player > Health > Regeneration`. That was chosen over
+  ## adding a `path: seq[string]` argument to all seven builders because it
+  ## changes NO existing call site and no existing wire field: `category` and
+  ## `subcategory` are still emitted verbatim next to `path`, so a renderer
+  ## that has never heard of `path` (the served web UI, an older overlay)
+  ## degrades to the two-level grouping it already drew rather than to
+  ## nothing.
+  ##
+  ## Empty segments are dropped, so `"A//B"`, `"/A/B"` and `"A/B/"` all mean
+  ## `["A", "B"]` -- a stray separator must not produce an unnamed group, which
+  ## is precisely the "a group renders with no title" defect this exists to
+  ## make unrepresentable.
+  result = @[]
+  for part in [s.category, s.subcategory]:
+    var cur = ""
+    for ch in part:
+      if ch == '/':
+        if cur.len > 0: result.add cur
+        cur = ""
+      else:
+        cur.add ch
+    if cur.len > 0: result.add cur
+
 proc toJson*(s: Setting): JsonObject =
   ## One row, as the UI receives it. `value` is the *current* value read out of
   ## `config.json` (falling back to `defaultJson` when the file has no such
@@ -233,6 +267,17 @@ proc toJson*(s: Setting): JsonObject =
   if s.optionsUrl.len > 0: o.put("optionsUrl", s.optionsUrl)
   if s.subcategory.len > 0: o.put("subcategory", s.subcategory)
   if s.category.len > 0:  o.put("category", s.category)
+  # The same grouping as an explicit, ordered path -- see `settingPath`. Always
+  # emitted when the row is grouped at all, so a renderer never has to re-derive
+  # it by re-splitting two fields and never has to guess which of them is the
+  # outer one.
+  block:
+    let segs = settingPath(s)
+    if segs.len > 0:
+      var pa = arr()
+      for seg in segs:
+        pa.add seg
+      o.put("path", pa)
   if s.description.len > 0: o.put("description", s.description)
   o.put("implemented", s.implemented)
   result = o
@@ -275,8 +320,9 @@ const
     ## broadcast. `on`/`emit` already exist and already cross mods without
     ## either knowing the other exists, which is exactly this problem.
   SettingsIndexAnnounce* = "aowlspt.settings.indexAnnounce"
-    ## Payload: `{"guid":"...","name":"...","count":N}`. Emitted by every mod
-    ## that has declared settings, once per `SettingsIndexQuery` it hears.
+    ## Payload: `{"guid":"...","name":"...","count":N,"done":M}`. Emitted by
+    ## every mod that has declared settings, once per `SettingsIndexQuery` it
+    ## hears. `done` is how many of the `count` rows are `implemented`.
 
 proc onIndexQuery(payload: string): string =
   if gDeclared.len > 0:
@@ -284,6 +330,21 @@ proc onIndexQuery(payload: string): string =
     o.put("guid", modGuid())
     o.put("name", modName())
     o.put("count", gDeclared.len)
+    # How many of them are actually BACKED. The index has always carried
+    # `count`; without a companion `done` a consumer cannot tell a mod with six
+    # working settings from one with six placeholders, and the overlay's
+    # "hide what is not implemented" filter would have had to fetch every page
+    # to find out that a page has nothing to show. `mods/settingshub` already
+    # sends `done` for each SPT page (0, for all of them), so this makes both
+    # halves of the settings index answer the same question in the same field.
+    #
+    # An explicit 0 therefore MEANS "none of these do anything yet" and is
+    # distinct from the field being absent, which means "this index did not
+    # say". A consumer must not treat the two alike.
+    var impl = 0
+    for s in gDeclared:
+      if s.implemented: inc impl
+    o.put("done", impl)
     discard emit(SettingsIndexAnnounce, done(o).text)
   result = ""
 

@@ -461,14 +461,27 @@ proc classifyType*(rt: Il2Cpp; t: string): FastKind =
 
 const MaxArgs* = 4
 
-const MaxSlots* = 5
-  ## Native register slots a call can use: `this` plus four arguments, which is
-  ## what Win64 passes before it starts using the stack. A shaped call counts
-  ## its own slots against this, including a hidden struct-return pointer.
-  ## Four declared arguments plus `this` is five slots, which is exactly the
-  ## four general-purpose and four SSE registers Win64 passes arguments in
-  ## before it starts using the stack. Past that the shape count doubles per
-  ## slot and the call stops being free anyway.
+const MaxSlots* = 12
+  ## Argument POSITIONS a shaped call can use: a hidden struct-return pointer,
+  ## `this`, every declared argument and the trailing `MethodInfo*`.
+  ##
+  ## It was 5 -- the point at which Win64 stops using registers -- and that
+  ## made a wider call impossible rather than merely slower. `aowlspt_fast.h`
+  ## now emits the stack cases too, so this is the width of that TABLE and not
+  ## the width of the register file. It MUST equal `AOWL_FAST_MAX_SLOTS`: the
+  ## C side is what actually dispatches, and a disagreement between the two is
+  ## a call with the arguments in the wrong places. `bindRaw` refuses a wider
+  ## shape against this constant; `aowl_crva_invoke` refuses one against the C
+  ## constant, so neither side can silently truncate a shape.
+  ##
+  ## Only positions 0..3 have a register CLASS to choose, so `floatMask` still
+  ## only describes four bits: a float in position 4 or beyond is an 8-byte
+  ## stack slot carrying its bits in the low half, and `AOWL_FAST_CODE`
+  ## narrows the mask accordingly.
+  ##
+  ## `MaxArgs` above is deliberately NOT raised with it. That is the by-NAME
+  ## path, whose limit is signature CLASSIFICATION rather than slot count, and
+  ## fact #145 says a by-name route is fatal the moment it is used.
 
 type
   Args* = object

@@ -665,5 +665,27 @@ proc applyAction*(inv: var Inventory; action: JsonRef; ch: var Change;
           examined.add templateOf(inv, id)
     result = true
   else:
-    ch.problems.add "unhandled action: " & kind
+    # The batch is not aborted -- that part was right, and answering "bad
+    # request" to one unknown action throws away the moves in the same batch
+    # that were fine. What was wrong is that `true` was the *whole* answer:
+    # the caller reads it as "applied", so an entire unimplemented system
+    # returns `err:0` and looks like it works.
+    #
+    # So the answer stays `true` and the problem is made impossible to miss.
+    # `ch.problems` reaches two places -- a `warn` line per problem in
+    # `onItemsMoving`, and the response's `warnings` array, which the client
+    # shows the player. The message says what this server did with the action
+    # rather than only naming it, because "unhandled action: Foo" reads as a
+    # note and "nothing was done" reads as the failure it is.
+    #
+    # An action with no `Action` member at all is called out separately: that
+    # is a body this server could not even classify, and reporting it as an
+    # action named "" sends whoever reads the log looking for a feature.
+    if kind.len == 0:
+      ch.problems.add "an action in this batch carried no `Action` name, so " &
+                      "it could not be identified and nothing was done for it"
+    else:
+      ch.problems.add "this server does not implement the action '" & kind &
+                      "', so nothing was done for it; the rest of the batch " &
+                      "was applied"
     result = true

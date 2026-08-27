@@ -355,6 +355,139 @@ def select(list_id):
             "loaded": sum(1 for x in ROWS if x["enabled"]), "problems": []}
 
 
+
+# ---------------------------------------------------------------------------
+# The SETTINGS surface, deliberately DEEP.
+#
+# The overlay's settings screen had two levels and now has a tree, so the
+# fixture has to have more than two or the nesting is untested by construction.
+# `aowl.deep` declares rows at depths 1, 2, 3 and 4 -- including the exact
+# "Player / Health" the report named, now as "Player > Health > Regeneration".
+#
+# `path` is emitted the way `aowl/src/aowlspt/settings.nim` emits it, so the
+# overlay is parsing the real wire shape and not a convenience.
+# ---------------------------------------------------------------------------
+
+def _row(key, label, path, kind="bool", value=True, desc=""):
+    r = {"key": key, "label": label, "type": kind, "value": value,
+         "default": value, "implemented": True, "path": path,
+         "category": "/".join(path[:1]), "subcategory": "/".join(path[1:])}
+    if desc:
+        r["description"] = desc
+    return r
+
+def _num(key, label, path, value, lo=None, hi=None, step=None, kind="float"):
+    """A numeric row. `lo`/`hi` omitted means the schema declares NO range, and
+    the overlay must draw a stepper plus a type box rather than inventing one."""
+    r = {"key": key, "label": label, "type": kind, "value": value,
+         "default": value, "implemented": True, "path": path,
+         "category": "/".join(path[:1]), "subcategory": "/".join(path[1:])}
+    if lo is not None:
+        r["min"] = lo
+    if hi is not None:
+        r["max"] = hi
+    if step is not None:
+        r["step"] = step
+    return r
+
+
+DEEP_ROWS = (
+    [_row("hp%d" % i, "Regen tick %d" % i,
+          ["Player", "Health", "Regeneration"]) for i in range(4)] +
+    [_row("hd%d" % i, "Damage rule %d" % i,
+          ["Player", "Health", "Damage", "Bleeding"]) for i in range(3)] +
+    [_row("pi%d" % i, "Inertia %d" % i, ["Player", "Movement"]) for i in range(5)] +
+    [_row("bt%d" % i, "Bot cap %d" % i, ["Bots"]) for i in range(6)] +
+    # --- the numeric controls, one per range shape the overlay must tell apart.
+    #
+    # `sliderok` is the only one of these that may draw a slider. The other four
+    # are the range shapes that have to FALL BACK, and a fixture with only a
+    # well-formed range cannot catch a panel that sliders everything.
+    # An INT with a wide-but-addressable range, and both of those are for the
+    # INSTRUMENT rather than for the panel. The back-buffer glyph decoder
+    # ignores any run shorter than 6 characters, so a value the test types has
+    # to BE at least 6 digits to be readable back off the screen at all -- a
+    # 0..100 slider can only ever hold a 1-to-3 digit value, and "is 42 on
+    # screen" is unanswerable, not false. 999999/step 10 is 99,999 steps, just
+    # inside AOWL_OV_SLIDER_MAX_STEPS, so it still legitimately draws a slider.
+    [_num("sliderok",  "Slider with a range",   ["Numbers"], 25,
+          lo=0, hi=999999, step=10, kind="int"),
+     _num("norange",   "No range at all",       ["Numbers"], 7.0),
+     _num("onlymax",   "Only a max declared",   ["Numbers"], 3.0, hi=10.0),
+     _num("onlymin",   "Only a min declared",   ["Numbers"], 3.0, lo=1.0),
+     _num("inverted",  "Max below min",         ["Numbers"], 3.0,
+          lo=10.0, hi=2.0),
+     _num("astronomic", "Range too wide to drag", ["Numbers"], 5.0,
+          lo=0.0, hi=1.0e9, step=1.0, kind="int")] +
+    # --- rows that are DECLARED BUT NOT IMPLEMENTED. Hidden by default.
+    #
+    # A whole group of them ("Cultists"), so the check that no group is left
+    # empty has something to be wrong about, plus one mixed into a group that
+    # also has implemented rows, so hiding cannot simply drop whole groups.
+    [dict(_row("cc%d" % i, "Cultist circle %d" % i, ["Cultists"]),
+          implemented=False) for i in range(3)] +
+    [dict(_row("btx", "Bot cap NOT DONE", ["Bots"]), implemented=False)] +
+    [_row("zz", "Ungrouped switch", [])]
+)
+# The last row declares NO path at all: the overlay must still put it under a
+# NAMED group. A fixture where every row is well-formed cannot catch the
+# nameless-group defect.
+for _k in ("path", "category", "subcategory"):
+    DEEP_ROWS[-1].pop(_k, None)
+
+UIHUB_ROWS = [
+    {"key": "launchHint", "label": "Show the launch hint", "type": "bool",
+     "value": True, "default": True, "implemented": True,
+     "path": ["Overlay", "Launch"], "category": "Overlay",
+     "subcategory": "Launch"}
+]
+
+# A page every one of whose rows is unimplemented. `done: 0` in the index says
+# so WITHOUT the page being fetched, which is how 28 SPT pages are hidden for
+# the cost of one index read. The overlay must not list it with the filter on --
+# and must not have fetched it to find out.
+DEAD_ROWS = [dict(_row("d%d" % i, "Placeholder %d" % i, ["Nothing"]),
+                  implemented=False) for i in range(4)]
+
+# How many times each page was actually fetched, so a check can assert the
+# NEGATIVE "the hidden page was never requested" rather than only that it is
+# absent from the nav.
+FETCHES = {}
+
+
+def _impl_count(rows):
+    return sum(1 for r in rows if r.get("implemented"))
+
+
+def settings_index():
+    # `done` is now sent for MOD pages too -- see `onIndexQuery` in
+    # `aowl/src/aowlspt/settings.nim`. A page with count > 0 and done == 0 is
+    # one the overlay may hide without loading it.
+    return {"mods": [{"guid": "aowl.deep", "name": "Deep tree fixture",
+                      "count": len(DEEP_ROWS), "done": _impl_count(DEEP_ROWS)},
+                     {"guid": "aowl.uihub", "name": "Fallback Settings UI",
+                      "count": len(UIHUB_ROWS), "done": _impl_count(UIHUB_ROWS)},
+                     {"guid": "aowl.dead", "name": "Nothing Implemented",
+                      "count": len(DEAD_ROWS), "done": 0}]}
+
+
+def apply_setting(guid, key, value):
+    """Store a write the way a real mod does -- into the row the next GET
+    serves. Without this the panel could be checked only against its own
+    optimistic copy, which is a check that cannot fail (CLAUDE.md 9b): the row
+    would read back the value the panel wrote into itself whether or not one
+    byte ever reached the backend."""
+    rows = {"aowl.deep": DEEP_ROWS, "aowl.uihub": UIHUB_ROWS,
+            "aowl.dead": DEAD_ROWS}.get(guid)
+    if rows is None:
+        return False
+    for r in rows:
+        if r["key"] == key:
+            r["value"] = value
+            return True
+    return False
+
+
 class Handler(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -373,6 +506,18 @@ class Handler(BaseHTTPRequestHandler):
         self.wfile.write(body)
 
     def do_GET(self):
+        if self.path == "/aowlspt/settings/index":
+            self._send(settings_index())
+            return
+        for guid, rows in (("aowl.deep", DEEP_ROWS), ("aowl.uihub", UIHUB_ROWS),
+                           ("aowl.dead", DEAD_ROWS)):
+            if self.path.startswith("/aowlspt/settings/" + guid):
+                FETCHES[guid] = FETCHES.get(guid, 0) + 1
+                self._send(rows)
+                return
+        if self.path == "/fetches":
+            self._send(FETCHES)
+            return
         if self.path in ("/aowlspt/mods/panel", "/aowlspt/mods"):
             self._send(panel())
         elif self.path == "/aowlspt/mods/list":
@@ -404,6 +549,30 @@ class Handler(BaseHTTPRequestHandler):
         POSTS.append({"path": self.path,
                       "body": body,
                       "accept-encoding": self.headers.get("Accept-Encoding", "")})
+        # A SETTINGS WRITE. Applied to the served rows, so the next GET returns
+        # what was actually stored and the panel can be checked by INDEPENDENT
+        # RE-READ rather than against its own optimistic copy.
+        #
+        # Deliberately strict about the body: fact #135 is that a chunked POST
+        # to a settings write is treated as BODYLESS and answered 200 with the
+        # schema UNCHANGED -- success by status code, no effect. So a request
+        # that arrives with no parseable body is answered 400 HERE, loudly,
+        # rather than 200. A fixture that shrugs at an empty body reproduces the
+        # exact bug the real backend has and calls it a pass.
+        sp = "/aowlspt/settings/"
+        if self.path.startswith(sp) and "/spt/" not in self.path:
+            guid = self.path[len(sp):]
+            try:
+                o = json.loads(body)
+                key, value = o["key"], o["value"]
+            except Exception as e:
+                self.send_error(400, "unparseable settings write: %s" % e)
+                return
+            if apply_setting(guid, key, value):
+                self._send({"ok": True, "key": key, "value": value})
+            else:
+                self.send_error(404, "no such key %r on %r" % (key, guid))
+            return
         prefix = "/aowlspt/mods/toggle/"
         if self.path.startswith(prefix):
             guid = self.path[len(prefix):]

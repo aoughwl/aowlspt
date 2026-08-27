@@ -53,8 +53,44 @@ mods = idx['mods']
 check('index parses and names the fixture', any(m['guid']=='aowl.uihubscale' for m in mods), [m['guid'] for m in mods])
 st, ct, raw = req('/aowlspt/settings/aowl.uihubscale?ident=1')
 rows = json.loads(raw)
-check('schema parses strictly, 266 rows', isinstance(rows, list) and len(rows)==266, len(rows))
+check('schema parses strictly, 278 rows', isinstance(rows, list) and len(rows)==278, len(rows))
 byk = {r['key']: r for r in rows}
+
+# 2b. ARBITRARY-DEPTH GROUPING, on the finished payload.
+#
+# The assertions below are about the SERVED document, not about the builder
+# that produced it: every one of them can be falsified by a payload that
+# parses. `path` is the ordered group path; `category`/`subcategory` are still
+# there verbatim, so a renderer that never heard of `path` is unaffected.
+deep = byk['deepRegen0']
+check('a row carries an ordered `path` to arbitrary depth',
+      deep.get('path') == ['Deep','Player','Health','Regeneration'], deep.get('path'))
+check('`category` and `subcategory` are still emitted verbatim beside it',
+      deep.get('category') == 'Deep/Player/Health/Regeneration', deep.get('category'))
+bleed = byk['deepBleed0']
+check('a path spanning BOTH fields concatenates in declaration order',
+      bleed.get('path') == ['Deep','Player','Health','Damage','Bleeding'], bleed.get('path'))
+stray = byk['deepStray']
+check('stray separators collapse -- NO empty segment ever reaches the UI',
+      stray.get('path') == ['Deep','Player','Movement'], stray.get('path'))
+# The negative, over the WHOLE document: not one row anywhere may carry a
+# nameless group. This is the property "no group renders without a title"
+# reduced to the payload, and it fails the moment any segment is blank.
+nameless = [r['key'] for r in rows
+            if any((not seg) or not seg.strip() for seg in r.get('path', []))]
+check('NO row anywhere carries an empty path segment', nameless == [], nameless)
+# ...and every path is a proper tree: each row's parent prefix is reachable.
+paths = {tuple(r['path']) for r in rows if r.get('path')}
+orphans = sorted({'/'.join(p) for p in paths
+                  for i in range(1, len(p))
+                  if tuple(p[:i]) not in paths
+                  and not any(q[:i] == p[:i] for q in paths)})
+check('every group path prefix is itself a group somebody can walk through',
+      orphans == [], orphans)
+# A row with no grouping at all must still be representable -- and must NOT
+# invent an empty path.
+check('an ungrouped row omits `path` rather than sending an empty one',
+      all(r.get('path') != [] for r in rows))
 
 # 3. the NEW schema fields, on the finished payload
 sel = byk['itemInline']

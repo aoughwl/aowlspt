@@ -114,6 +114,7 @@
 
 #include "aowlspt_detour.h"
 #include "aowlspt_admin.h"   /* the admin/cheat HUD's shared-memory surface */
+#include "aowlspt_region.h"  /* the SHARED per-frame region: every mod's draw */
 
 /* The admin/cheat HUD's shared region, mapped in `aowl_ov_start`. NULL until
  * then, and NULL forever if the OS refuses the mapping -- in which case every
@@ -689,8 +690,18 @@ typedef enum AowlOvFilter {
  * a NOT-IMPL badge and cannot be changed, because nothing behind it would act on
  * the change yet. That honesty is a hard requirement, not a nicety. */
 
+/* The worker's one HTTP body buffer. Sized off the largest body any route this
+ * panel fetches actually produces, with room to grow: 283,798 bytes measured
+ * today for `aowl.tarkov`'s 802-row schema, so 1 MiB is a little over 3x. It is
+ * `static` inside the worker rather than on its stack -- a megabyte on a thread
+ * stack is not affordable, a megabyte in `.bss` is. A body that STILL does not
+ * fit now says so (`lastTrunc`) instead of being reported as a bad schema. */
+#define AOWL_OV_HTTP_BUF     1048576
+
 #define AOWL_OV_MAX_SPAGES   48    /* mod pages + 28 SPT pages + margin */
-#define AOWL_OV_MAX_SITEMS   420   /* controls on the one loaded page   */
+#define AOWL_OV_MAX_SITEMS   1200  /* controls on the one loaded page   */
+#define AOWL_OV_MAX_SCATS    96    /* distinct categories on that page  */
+#define AOWL_OV_MAX_NAV      (AOWL_OV_MAX_SPAGES + AOWL_OV_MAX_SCATS)
 #define AOWL_OV_SOPT_MAX     10    /* enum choices kept per control     */
 
 typedef enum AowlOvSKind {
@@ -729,9 +740,35 @@ typedef struct AowlOvSItem {
     char    opts[AOWL_OV_SOPT_MAX][28];
     int32_t optCount;
     char    category[64];
+    char    subcat[64];
+    /* The GROUP PATH, '/'-joined, to arbitrary depth -- "Player/Health/Regen".
+     * Taken from the row's `path` array when the backend sends one
+     * (`aowl/src/aowlspt/settings.nim` `settingPath`), and otherwise derived
+     * here from `category` and `subcat` by the identical rule, so a backend
+     * that predates `path` groups exactly as it always did. Empty segments are
+     * dropped on both routes: a stray separator must never produce a group with
+     * no name, which is the defect this whole path business exists to make
+     * unrepresentable. `depth` is the number of segments; 0 means ungrouped and
+     * the row lands under "General". */
+    char    path[160];
+    int32_t depth;
     char    desc[192];
     int32_t implemented;
 } AowlOvSItem;
+
+/* One second-level tab on the loaded page. `items` is SORTED by category (see
+ * `aowl_ov_sort_items`), so a category is a contiguous half-open range and a
+ * sub-tab is a filter that costs two integers rather than an index table --
+ * which is why `selItem`/`editItem`/`dragItem` stay item indices and every edit
+ * path below is untouched by this. */
+typedef struct AowlOvSCat {
+    char    label[64];   /* the LAST segment -- what the nav row prints */
+    char    full[160];   /* the whole path -- what the breadcrumb prints */
+    int32_t depth;       /* 1-based; 1 is a top-level group               */
+    int32_t parent;      /* index of the node one segment shorter, or -1  */
+    int32_t lo, hi;      /* [lo,hi) into items -- the WHOLE subtree       */
+    int32_t direct;      /* rows sitting exactly at `full`, not deeper    */
+} AowlOvSCat;
 
 typedef struct AowlOvState {
     /* --- lifecycle --- */
@@ -806,11 +843,31 @@ typedef struct AowlOvState {
     AowlOvSPage      sptPages[AOWL_OV_MAX_SPAGES]; /* the SPT half, as the hub gave it */
     int32_t          sptPageCount;
     int32_t          sptGot;        /* the SPT index has answered at least once */
+    /* The settings INDEX -- `GET /aowlspt/settings/index`, one entry per mod
+     * that has actually called `declareSettings`. This, and not the mod
+     * roster, is what the nav is built from: the roster lists everything the
+     * registry knows about, including the manager, the settings hub itself and
+     * the fallback UI, none of which a player can configure and all of which
+     * used to occupy a page that then failed to load. The filter is structural
+     * -- "did this mod publish a schema" -- not a list of names to hide. */
+    AowlOvSPage      idxMods[AOWL_OV_MAX_SPAGES];
+    int32_t          idxModCount;
+    int32_t          idxGot;        /* the index has answered at least once */
+    char             idxWhy[192];   /* why it has not, when it has not */
     AowlOvSItem      items[AOWL_OV_MAX_SITEMS];    /* the one loaded page's controls */
     int32_t          itemCount;
     char             itemsPage[80]; /* which page id `items` holds ("" = none)   */
+    volatile LONG    lastTrunc;     /* nonzero: the last body did not fit, in bytes */
     int32_t          itemsErr;      /* the last page fetch failed */
+    /* WHY the last page fetch failed, in the words the player needs. Empty when
+     * `itemsErr` is 0. A body that was too big for the worker buffer used to be
+     * indistinguishable here from a 404 and from a mod that is not loaded, and
+     * all three read as "the mod may not be loaded" -- which sent one session
+     * looking at the registry for a fault that was a 32 KB buffer. */
+    char             itemsWhy[192];
     int32_t          itemsImpl;     /* implemented count on the loaded page */
+    AowlOvSCat       cats[AOWL_OV_MAX_SCATS];
+    int32_t          catCount;
 
     /* The wrapper scalars every reply carries, kept because the panel is
      * required to show what the backend said rather than a paraphrase. */
@@ -921,6 +978,10 @@ typedef struct AowlOvState {
     AowlOvSPage  sPages[AOWL_OV_MAX_SPAGES];
     int32_t      sPageCount;
     AowlOvSItem  sItems[AOWL_OV_MAX_SITEMS];
+    AowlOvSCat   sCats[AOWL_OV_MAX_SCATS];
+    int32_t      sCatCount;
+    char         sItemsWhy[192];
+    char         sIdxWhy[192];
     int32_t      sItemCount;
     char         sItemsPage[80];
     int32_t      sItemsErr, sItemsImpl;
@@ -932,6 +993,17 @@ typedef struct AowlOvState {
     /* --- settings mode, render side --- */
     int32_t settings;          /* 0 = mod manager, 1 = the settings screen */
     int32_t selPage, topPage;  /* the nav cursor and its scroll             */
+    /* The second-level nav. `selCat` is an index into `sCats` and -1 means
+     * "the whole page", which is what a page with fewer than two categories
+     * always shows. It is reset whenever the loaded page changes, because a
+     * category index means nothing across pages. */
+    int32_t selCat;
+    /* The bounds the LAST frame actually drew. The keyboard handler runs on the
+     * same thread as the draw and must move the cursor inside the same range
+     * the player can see -- two independent computations of "which rows are on
+     * screen" is exactly how a cursor ends up selecting a row that is not
+     * there. Written by the draw, read by the key handler. */
+    int32_t viewLo, viewHi;
     int32_t selItem, topItem;  /* the control cursor and its scroll         */
     char    curPage[80];       /* the page id the render thread wants loaded */
     int32_t curPageIsMod;
@@ -940,6 +1012,113 @@ typedef struct AowlOvState {
     int32_t capturing;         /* a keybind row is waiting for the next key  */
     int32_t dragItem;          /* the slider being dragged, or -1            */
     float   dragVal;           /* its live value while the button is held    */
+
+    /* --- THE COALESCED WRITE SLOT ---------------------------------------
+     *
+     * ONE pending write, flushed after a quiet period. Not an optimisation:
+     * `aowl_ov_settings_set` POSTs the key AND THEN RE-GETS THE WHOLE PAGE, so
+     * one write to `aowl.tarkov` is a 283,798-byte download and a full re-sort
+     * and re-build of the nav tree. A slider dragged at 60 Hz, or `-` held down
+     * at the keyboard`s ~30 Hz repeat, was one of those per frame. The command
+     * queue is AOWL_OV_MAX_CMDS deep and DROPS silently past it, so the same
+     * gesture also lost writes at the far end.
+     *
+     * The slot holds page+key+value. A second edit to the SAME key replaces it
+     * -- that is the coalescing. A second edit to a DIFFERENT key FLUSHES the
+     * held one first, so two settings can never be collapsed into one and no
+     * edit is ever silently dropped for being superseded by an unrelated one.
+     *
+     * The body stays `{"key":...,"value":...}` for exactly one key, ~40 bytes,
+     * whatever was coalesced into it -- so this scheme can never produce the
+     * large or chunked body that fact #135 says is answered 200 with the schema
+     * UNCHANGED. Coalescing here shrinks the number of writes, never grows one.
+     *
+     * `writeCount` is monotonic and exists for the harness: "a drag of N frames
+     * emits fewer than N writes" is counted here AND independently at the
+     * backend, and the two have to agree. */
+    char    pendPage[80];
+    char    pendKey[80];
+    char    pendVal[64];
+    DWORD   pendAt;            /* tick of the last edit into the slot        */
+    int32_t pendArm;           /* 1 = something is held, not yet sent        */
+    int32_t writeCount;        /* writes actually handed to the queue        */
+
+    /* Rows the last page load DROPPED for being `implemented:false`, and the
+     * flag that decides whether they are dropped at all. Default OFF: a beta
+     * tester must not see a control that does nothing, a developer needs to.
+     * Filtering happens at PARSE time (`aowl_ov_read_items`), not in the draw,
+     * so the group ranges, the nav counts and the keyboard bounds are all
+     * computed over the rows that are actually on screen and cannot disagree
+     * with them. */
+    int32_t showUnimpl;
+    int32_t hiddenCount;       /* worker side */
+    int32_t sHiddenCount;      /* snapshot    */
+
+    /* --- the search box (permanent, top of the right pane) ---
+     *
+     * `search` is the live term. The FILTER IS CACHED: `filt` holds the item
+     * indices that match and is recomputed only when `filtStamp` -- a hash of
+     * the term, the loaded page and the row count -- moves. Re-filtering 802
+     * rows every frame is exactly the per-frame cost this panel's geometry
+     * cache exists to avoid, and it would defeat that cache as well, since a
+     * frame that rebuilds nothing must not do 802 string compares to find out.
+     * `filtCount` is what the header prints, so the count on screen and the
+     * rows on screen come from the same pass and cannot disagree. */
+    char     search[48];
+    int32_t  searchFocus;      /* the box owns the keyboard                  */
+
+    /* --- WHICH NAV NODES ARE OPEN ---
+     *
+     * One flag per node of the LOADED page, plus one per page. Indices, not
+     * paths, because they are only meaningful while a page is loaded and are
+     * cleared the moment `sItemsPage` changes -- a stale index would expand
+     * whatever now happens to sit there, which is worse than collapsing.
+     *
+     * A node also counts as open when it is an ANCESTOR OF THE SELECTION, so
+     * the branch you are in is never hidden from you and a fresh page opens
+     * showing where you are rather than showing nothing. That rule is applied
+     * in `aowl_ov_nav_open`, never by writing these flags, so the two can
+     * never disagree about the same node. */
+    int32_t  navOpen[AOWL_OV_MAX_SCATS];
+    int32_t  pageOpen[AOWL_OV_MAX_SPAGES];
+    char     navOpenFor[80];   /* the page `navOpen` belongs to */
+    int32_t  filt[AOWL_OV_MAX_SITEMS];
+    int32_t  filtCount;
+    uint32_t filtStamp;        /* what `filt` was computed for; 0 = nothing  */
+
+    /* --- the window: moved, resized, maximised, and made more or less solid ---
+     *
+     * All four in PANEL UNITS (post-`scale`), which is what every rectangle in
+     * this file is in. Zero width means "never placed" and the defaults are
+     * taken on the first frame. `panAlpha` is the background alpha 0..255; 255
+     * is the solid background the player asked for and 232 is what this panel
+     * always had. Persisted -- see `aowl_ov_prefs_save`. */
+    float   panX, panY, panW, panH;
+    int32_t panMax;            /* maximised: the whole client area           */
+    int32_t panAlpha;
+    float   preX, preY, preW, preH;  /* the geometry to restore un-maximising */
+    int32_t dragWin;           /* the title bar is held                      */
+    int32_t dragGrip;          /* the resize grip is held                    */
+    float   dragDX, dragDY;    /* cursor-to-corner at grab, in panel units   */
+    volatile LONG prefsDirty;  /* geometry changed; the WORKER writes it out */
+    char    prefsPath[300];
+
+    /* --- the launch hint ("Press F12 for Mod Settings") ---
+     *
+     * A toast, drawn by this same Present hook, so it needs no detour of its
+     * own, no managed object and no allocation at all: the two strings are
+     * literals and the only per-frame work is one compare and, while it is up,
+     * a dozen quads.
+     *
+     * `hintState`: 0 not armed, 1 counting down, 2 done (never shown again this
+     * launch). `hintAt` is the tick the countdown started. */
+    int32_t hintState;
+    int32_t hintEnabled;       /* the setting, AS ACTUALLY READ               */
+    int32_t hintFetched;       /* the backend has been asked, once            */
+    char    hintWhy[192];      /* the value as read, in words, for the log    */
+    DWORD   hintAt;
+    int32_t hintShownFrames;   /* frames the toast was actually drawn on      */
+    DWORD   hintGoneAt;        /* the tick it stopped being drawn             */
 
     /* --- the geometry cache ---
      *
@@ -1298,10 +1477,19 @@ static int32_t aowl_ov_http(const wchar_t* verb, const wchar_t* path,
     if (!g_wh.recv(r, NULL)) goto done;
 
     total = 0;
+    InterlockedExchange(&g_ov.lastTrunc, 0);
     for (;;) {
         DWORD avail = 0;
         if (!g_wh.avail(r, &avail) || avail == 0) break;
-        if (total >= cap - 1) break;
+        /* Out of room. Recorded, not swallowed: the caller gets a body that is
+         * a PREFIX of valid JSON, which every reader below correctly rejects as
+         * "not a schema" -- and for two builds that rejection was the only
+         * symptom a 283,798-byte page had. `lastTrunc` is what lets the panel
+         * say the size instead of guessing at the cause. */
+        if (total >= cap - 1) {
+            InterlockedExchange(&g_ov.lastTrunc, (LONG)cap);
+            break;
+        }
         DWORD want = avail;
         if (want > (DWORD)(cap - 1 - total)) want = (DWORD)(cap - 1 - total);
         DWORD got = 0;
@@ -1608,6 +1796,8 @@ static void aowl_ov_jput(const char* o, const char* e, const char* key,
  *   about a process it cannot see.
  *
  * Caller holds `g_ov.cs`. */
+static void aowl_ov_prefs_save(void);   /* defined with the panel geometry */
+
 static void aowl_ov_read_row_live(const char* it, const char* end,
                                   AowlOvMod* m) {
     const char* cl = aowl_ov_jmem(it, end, "clientLive");
@@ -1999,6 +2189,18 @@ static const char* aowl_ov_jraw(const char* v, const char* end,
     return ve;
 }
 
+/* Finite: not NaN, not +/-inf. Written without <math.h> so this header keeps
+ * its "no library beyond what the host already links" property. `f != f` is
+ * only true for NaN; the magnitude test catches both infinities. */
+static int32_t aowl_ov_finite(float f) {
+    if (f != f) return 0;
+    return (f < 3.0e38f && f > -3.0e38f);
+}
+
+/* The most discrete steps a 104-pixel track is allowed to span. Past this the
+ * slider cannot address its own values and the stepper is the honest control. */
+#define AOWL_OV_SLIDER_MAX_STEPS 100000
+
 static float aowl_ov_jfloat(const char* v, const char* end, float dflt) {
     char tmp[48];
     int32_t i = 0;
@@ -2038,6 +2240,57 @@ static void aowl_ov_sval_display(AowlOvSItem* si) {
 }
 
 /* One control object into one slot. Returns 1 on a usable row. */
+/* ------------------------------------------------------------------ *
+ * Group paths, to arbitrary depth
+ * ------------------------------------------------------------------ */
+
+/* Append `seg` to `out` as a path segment, skipping empties and collapsing
+ * separators. Returns the new segment count. */
+static int32_t aowl_ov_path_add(char* out, int32_t cap, int32_t depth,
+                                const char* seg) {
+    int32_t n = (int32_t)strlen(out), i = 0;
+    while (seg[i]) {
+        int32_t j = i, any = 0;
+        while (seg[j] && seg[j] != '/') j++;
+        if (j > i) {
+            if (n > 0 && n < cap - 2) out[n++] = '/';
+            for (; i < j && n < cap - 1; i++) { out[n++] = seg[i]; any = 1; }
+            if (any) depth++;
+        }
+        i = j;
+        while (seg[i] == '/') i++;
+    }
+    out[n] = 0;
+    return depth;
+}
+
+/* The `d`-segment prefix of `path`, into `out`. `d` past the end yields the
+ * whole path. */
+static void aowl_ov_path_prefix(const char* path, int32_t d, char* out,
+                                int32_t cap) {
+    int32_t n = 0, seen = 0, i;
+    for (i = 0; path[i] && n < cap - 1; i++) {
+        if (path[i] == '/') { if (++seen >= d) break; }
+        out[n++] = path[i];
+    }
+    out[n] = 0;
+}
+
+/* The last segment of `path`. */
+static const char* aowl_ov_path_leaf(const char* path) {
+    const char* q = strrchr(path, '/');
+    return q ? q + 1 : path;
+}
+
+/* True when `pre` is `path` or an ancestor of it -- a SEGMENT-wise prefix, so
+ * "Play" is not an ancestor of "Player/Health". */
+static int32_t aowl_ov_path_under(const char* path, const char* pre) {
+    size_t n;
+    if (!pre[0]) return 1;
+    n = strlen(pre);
+    return strncmp(path, pre, n) == 0 && (path[n] == 0 || path[n] == '/');
+}
+
 static int32_t aowl_ov_read_one_item(const char* it, const char* end,
                                      AowlOvSItem* si) {
     const char* v;
@@ -2063,15 +2316,50 @@ static int32_t aowl_ov_read_one_item(const char* it, const char* end,
     if (v) aowl_ov_jraw(v, end, si->raw, (int32_t)sizeof(si->raw));
     aowl_ov_sval_display(si);
 
-    v = aowl_ov_jmem(it, end, "min");
-    if (v) { si->lo = aowl_ov_jfloat(v, end, 0.0f); si->hasRange = 1; }
-    v = aowl_ov_jmem(it, end, "max");
-    if (v) { si->hi = aowl_ov_jfloat(v, end, 0.0f); si->hasRange = 1; }
-    v = aowl_ov_jmem(it, end, "step");
-    if (v) si->step = aowl_ov_jfloat(v, end, 0.0f);
-    if (si->hasRange && si->hi <= si->lo) si->hasRange = 0;
-    if (si->step <= 0.0f)
-        si->step = (si->kind == AOWL_S_FLOAT) ? 0.01f : 1.0f;
+    /* THE RANGE, and what a missing one MEANS.
+     *
+     * A slider is a promise that every value the control can reach is a legal
+     * value and that the two ends are the limits. When the schema does not say
+     * what the limits are, the panel does NOT invent them: there is no honest
+     * default for "how big can this number be", and 0..100 under a number whose
+     * real domain is 1..3 or 0..2,000,000 is a lie the player cannot see. So a
+     * row with no declared range gets the STEPPER and the type box instead --
+     * both of which are exact and neither of which claims a bound.
+     *
+     * "Declared" means BOTH ends. `min` alone used to leave `hi` at 0 and get
+     * caught by the `hi <= lo` test below only by luck; `max` alone silently
+     * invented `min: 0`, which is the invented-bound case this rule exists to
+     * refuse. Three further shapes are refused for the same reason -- the
+     * control they would produce cannot address its own values:
+     *
+     *   * a non-finite end (NaN/inf out of a malformed body): `t` comes out NaN
+     *     and the handle is drawn at an undefined x.
+     *   * `hi <= lo`: a zero or inverted span; `t` divides by zero.
+     *   * more than AOWL_OV_SLIDER_MAX_STEPS discrete steps in the span. The
+     *     track is 104 px, so a span of 1e9 moves ~10,000,000 per pixel: the
+     *     player can reach 104 of the values and no others, and the 3 they
+     *     wanted is not among them.
+     *
+     * In every refused case `hasRange` is 0, which is already the "no range"
+     * path everywhere downstream -- there is one representation of "unbounded",
+     * not two. */
+    {
+        int32_t hasLo = 0, hasHi = 0;
+        v = aowl_ov_jmem(it, end, "min");
+        if (v) { si->lo = aowl_ov_jfloat(v, end, 0.0f); hasLo = 1; }
+        v = aowl_ov_jmem(it, end, "max");
+        if (v) { si->hi = aowl_ov_jfloat(v, end, 0.0f); hasHi = 1; }
+        v = aowl_ov_jmem(it, end, "step");
+        if (v) si->step = aowl_ov_jfloat(v, end, 0.0f);
+        if (si->step <= 0.0f || !aowl_ov_finite(si->step))
+            si->step = (si->kind == AOWL_S_FLOAT) ? 0.01f : 1.0f;
+        si->hasRange = hasLo && hasHi;
+        if (si->hasRange &&
+            (!aowl_ov_finite(si->lo) || !aowl_ov_finite(si->hi) ||
+             si->hi <= si->lo ||
+             (si->hi - si->lo) / si->step > (float)AOWL_OV_SLIDER_MAX_STEPS))
+            si->hasRange = 0;
+    }
 
     v = aowl_ov_jmem(it, end, "options");
     if (v) {
@@ -2081,9 +2369,191 @@ static int32_t aowl_ov_read_one_item(const char* it, const char* end,
             aowl_ov_jtext(o, end, si->opts[si->optCount++], 28);
     }
     aowl_ov_jput(it, end, "category", si->category, (int32_t)sizeof(si->category));
+    /* Optional and emitted only when a mod sets it (`aowl/src/aowlspt/settings.nim`
+     * `toJson`), so its absence is normal and must not read as an empty group. */
+    aowl_ov_jput(it, end, "subcategory", si->subcat, (int32_t)sizeof(si->subcat));
     aowl_ov_jput(it, end, "description", si->desc, (int32_t)sizeof(si->desc));
     v = aowl_ov_jmem(it, end, "implemented");
     if (v) si->implemented = aowl_ov_jbool(v, end, 1);
+
+    /* The group path. `path` when the backend sends one -- it is the
+     * authoritative, already-ordered form -- and otherwise the identical rule
+     * applied to `category` then `subcat`, so nothing regresses against a
+     * backend that predates the field. Either way empty segments are dropped
+     * by `aowl_ov_path_add`, so no group can end up nameless. */
+    si->path[0] = 0; si->depth = 0;
+    v = aowl_ov_jmem(it, end, "path");
+    if (v) {
+        const char* o;
+        char one[80];
+        for (o = aowl_ov_jarr(v, end); o && si->depth < 12;
+             o = aowl_ov_jnext(o, end)) {
+            aowl_ov_jtext(o, end, one, (int32_t)sizeof(one));
+            si->depth = aowl_ov_path_add(si->path, (int32_t)sizeof(si->path),
+                                         si->depth, one);
+        }
+    }
+    if (!si->path[0]) {
+        si->depth = aowl_ov_path_add(si->path, (int32_t)sizeof(si->path),
+                                     si->depth, si->category);
+        si->depth = aowl_ov_path_add(si->path, (int32_t)sizeof(si->path),
+                                     si->depth, si->subcat);
+    }
+    if (!si->path[0]) {
+        /* Ungrouped rows get a real group with a real name rather than an
+         * empty one. "no group renders without a title" has to be true of the
+         * rows that declared nothing too, or it is not a property of the
+         * screen, only of the well-behaved half of it. */
+        aowl_ov_copy(si->path, (int32_t)sizeof(si->path), "General");
+        si->depth = 1;
+    }
+    return 1;
+}
+
+/* Order `items` by (category, subcategory), preserving declaration order inside
+ * a subcategory. An insertion sort: bounded, in place, no allocation, and at
+ * AOWL_OV_MAX_SITEMS rows the worst case is a few million byte compares on a
+ * worker thread once per page load -- not on the render thread and not per
+ * frame. The sort is what makes a category a CONTIGUOUS range, which is the
+ * whole reason the sub-tab filter below can be two integers. Called under `cs`. */
+static int32_t aowl_ov_scmp(const AowlOvSItem* a, const AowlOvSItem* b) {
+    /* By the WHOLE path, which generalises the old (category, subcategory)
+     * compare to any depth and keeps the property the rest of this file is
+     * built on: `/` is 0x2F, below every letter and digit, so every PREFIX of
+     * the sorted order is itself a contiguous half-open range. That is what
+     * lets a tree node -- at any depth -- still be two integers, and it is why
+     * `selItem` stays a flat item index and not one edit path below had to
+     * change. */
+    return strcmp(a->path, b->path);
+}
+
+static void aowl_ov_sort_items(void) {
+    int32_t i, j;
+    static AowlOvSItem tmp;   /* 1 KB; the worker's own, never re-entered */
+    for (i = 1; i < g_ov.itemCount; i++) {
+        tmp = g_ov.items[i];
+        for (j = i - 1; j >= 0 && aowl_ov_scmp(&g_ov.items[j], &tmp) > 0; j--)
+            g_ov.items[j + 1] = g_ov.items[j];
+        g_ov.items[j + 1] = tmp;
+    }
+}
+
+/* The nav TREE for the loaded page: one node per distinct path PREFIX, at any
+ * depth, in the sorted order, each holding the half-open range of rows beneath
+ * it. Replaces the old one-node-per-category table; a two-level schema
+ * produces exactly the nodes it used to, so nothing about the existing pages
+ * changes shape.
+ *
+ * `lo`/`hi` are the WHOLE subtree, so selecting "Player" shows every row under
+ * "Player/Health/Regen" as well -- which is what makes a parent node useful
+ * rather than empty. `direct` counts only the rows sitting exactly at that
+ * path, which is what tells a group that has rows from one that is purely
+ * structural.
+ *
+ * Every node`s parent is recorded and is guaranteed to EXIST: a node is only
+ * ever emitted after each of its shorter prefixes has been. That is what the
+ * invariant "no nav node is unreachable by breadcrumb" reduces to, and it is
+ * asserted rather than assumed -- see `aowl_ov_cats_wellformed`.
+ *
+ * Called under `cs`. */
+#define AOWL_OV_MAX_DEPTH 12
+
+static void aowl_ov_build_cats(void) {
+    int32_t i, d, k;
+    int32_t openAt[AOWL_OV_MAX_DEPTH + 2];
+    char    pre[160];
+    for (d = 0; d < AOWL_OV_MAX_DEPTH + 2; d++) openAt[d] = -1;
+    g_ov.catCount = 0;
+    for (i = 0; i < g_ov.itemCount; i++) {
+        AowlOvSItem* si = &g_ov.items[i];
+        int32_t dep = si->depth;
+        if (dep > AOWL_OV_MAX_DEPTH) dep = AOWL_OV_MAX_DEPTH;
+        if (dep < 1) dep = 1;
+        for (d = 1; d <= dep; d++) {
+            AowlOvSCat* C;
+            aowl_ov_path_prefix(si->path, d, pre, (int32_t)sizeof(pre));
+            if (openAt[d] >= 0 && strcmp(g_ov.cats[openAt[d]].full, pre) == 0) {
+                g_ov.cats[openAt[d]].hi = i + 1;
+                continue;
+            }
+            if (g_ov.catCount >= AOWL_OV_MAX_SCATS) {
+                /* Out of nodes: the rest of the page joins whatever is still
+                 * open rather than disappearing. A row that exists and is
+                 * unreachable is the failure this branch exists to not have. */
+                for (k = 1; k <= AOWL_OV_MAX_DEPTH; k++)
+                    if (openAt[k] >= 0) g_ov.cats[openAt[k]].hi = g_ov.itemCount;
+                return;
+            }
+            C = &g_ov.cats[g_ov.catCount];
+            memset(C, 0, sizeof(*C));
+            aowl_ov_copy(C->full, (int32_t)sizeof(C->full), pre);
+            aowl_ov_copy(C->label, (int32_t)sizeof(C->label),
+                         aowl_ov_path_leaf(pre));
+            C->depth = d;
+            C->parent = (d > 1) ? openAt[d - 1] : -1;
+            C->lo = i; C->hi = i + 1; C->direct = 0;
+            openAt[d] = g_ov.catCount++;
+            /* Everything deeper that was open belongs to a different branch
+             * now. Not clearing these is how a node inherits a parent from the
+             * previous branch and the breadcrumb starts lying. */
+            for (k = d + 1; k <= AOWL_OV_MAX_DEPTH + 1; k++) openAt[k] = -1;
+        }
+        if (openAt[dep] >= 0) g_ov.cats[openAt[dep]].direct++;
+    }
+}
+
+/* PASS / FAIL for the properties the nav must have, computed from the FINISHED
+ * table rather than from the loop that built it. Returns 0 when something is
+ * wrong and writes which; the caller records it and the panel prints it.
+ * Deliberately negative: it looks for a node that CANNOT be reached, not for
+ * one that can.
+ *
+ *   * no node has an empty label -- "no group renders without a title";
+ *   * every node deeper than 1 has a parent index that exists and whose `full`
+ *     is exactly this node`s path minus its last segment, so walking `parent`
+ *     from any node terminates at a top-level node. That walk IS the
+ *     breadcrumb, which is what makes this "no nav node is unreachable by
+ *     breadcrumb" and not a restatement of the builder;
+ *   * the depth-1 nodes partition the rows -- no row is under no group, and
+ *     none is under two.
+ *
+ * It can fail: give it two rows whose paths are "A/B" and "B" and set
+ * AOWL_OV_MAX_SCATS to 1 and the first branch fires; corrupt any `parent` and
+ * the third does; drop the "General" fallback in `read_one_item` and the first
+ * and last both do. `tests/overlayhost` mutates exactly these. */
+static int32_t aowl_ov_cats_wellformed(char* why, int32_t cap) {
+    int32_t i, covered = 0;
+    char pre[160];
+    if (why && cap > 0) why[0] = 0;
+    for (i = 0; i < g_ov.catCount; i++) {
+        AowlOvSCat* C = &g_ov.cats[i];
+        if (!C->label[0]) {
+            if (why) aowl_ov_fmt(why, cap, "nav node %d has no title", i);
+            return 0;
+        }
+        if (C->hi <= C->lo || C->lo < 0 || C->hi > g_ov.itemCount) {
+            if (why) aowl_ov_fmt(why, cap, "nav node %s spans [%d,%d)",
+                                 C->full, C->lo, C->hi);
+            return 0;
+        }
+        if (C->depth == 1) { covered += C->hi - C->lo; continue; }
+        if (C->parent < 0 || C->parent >= g_ov.catCount) {
+            if (why) aowl_ov_fmt(why, cap, "nav node %s has no parent", C->full);
+            return 0;
+        }
+        aowl_ov_path_prefix(C->full, C->depth - 1, pre, (int32_t)sizeof(pre));
+        if (strcmp(g_ov.cats[C->parent].full, pre) != 0) {
+            if (why) aowl_ov_fmt(why, cap, "nav node %s claims parent %s",
+                                 C->full, g_ov.cats[C->parent].full);
+            return 0;
+        }
+    }
+    if (covered != g_ov.itemCount) {
+        if (why) aowl_ov_fmt(why, cap,
+                             "%d of %d rows are under no top-level group",
+                             g_ov.itemCount - covered, g_ov.itemCount);
+        return 0;
+    }
     return 1;
 }
 
@@ -2095,6 +2565,7 @@ static void aowl_ov_read_items(const char* body, int32_t len) {
     const char* arr;
     g_ov.itemCount = 0;
     g_ov.itemsImpl = 0;
+    g_ov.hiddenCount = 0;
     if (p >= end) return;
 
     if (*p == '[') {
@@ -2106,6 +2577,24 @@ static void aowl_ov_read_items(const char* body, int32_t len) {
     for (; arr && g_ov.itemCount < AOWL_OV_MAX_SITEMS; arr = aowl_ov_jnext(arr, end)) {
         AowlOvSItem* si = &g_ov.items[g_ov.itemCount];
         if (aowl_ov_read_one_item(arr, end, si)) {
+            /* THE UNIMPLEMENTED FILTER, and it is applied HERE -- at parse
+             * time, before sorting and before the nav tree is built -- rather
+             * than in the draw.
+             *
+             * Filtering in the draw would have had to leave the row in `items`,
+             * which means `sCats[c].lo/hi` still spans it, the group band still
+             * counts it, `viewLo/viewHi` still let the cursor land on it and
+             * PgDn still pages over it. Every one of those is a place the
+             * count on screen and the rows on screen could disagree. Dropping
+             * the row before `sort_items`/`build_cats` run means a group that
+             * held nothing but hidden rows is never CREATED, so "do not render
+             * a group left empty" needs no code at all -- it is unrepresentable.
+             *
+             * The filter is on the DATA (`implemented`), never on a name. */
+            if (!si->implemented && !g_ov.showUnimpl) {
+                g_ov.hiddenCount++;
+                continue;
+            }
             if (si->implemented) g_ov.itemsImpl++;
             g_ov.itemCount++;
         }
@@ -2130,7 +2619,24 @@ static void aowl_ov_read_items(const char* body, int32_t len) {
                 aowl_ov_copy(si->desc, (int32_t)sizeof(si->desc),
                              "a nested list/dictionary; edited as raw JSON, "
                              "not implemented in aowlspt yet");
+            /* Nested rows are unconditionally not-implemented, so they obey the
+             * same filter as everything else rather than a rule of their own. */
+            if (!g_ov.showUnimpl) { g_ov.hiddenCount++; continue; }
             g_ov.itemCount++;
+        }
+    }
+    aowl_ov_sort_items();
+    aowl_ov_build_cats();
+    /* Check the FINISHED nav, every load, and say so on the panel when it is
+     * wrong. A tree that quietly loses a branch is the exact failure mode this
+     * screen has had before: a row that exists, is not on any page, and nobody
+     * finds out. `itemsWhy` is the line the right pane already prints. */
+    {
+        char why[192];
+        if (!aowl_ov_cats_wellformed(why, (int32_t)sizeof(why))) {
+            aowl_ov_fmt(g_ov.itemsWhy, (int32_t)sizeof(g_ov.itemsWhy),
+                        "nav tree is malformed: %s", why);
+            aowl_ov_note(g_ov.itemsWhy);
         }
     }
 }
@@ -2158,21 +2664,75 @@ static void aowl_ov_read_spt_index(const char* body, int32_t len) {
     g_ov.sptGot = 1;
 }
 
-/* Merge the nav: one page per loaded mod (its guid is its fetch key), then the
- * SPT pages the hub described. Called under `cs` whenever either half moves. */
+/* The settings index: `{"mods":[{"guid","name","count"}...]}`. Called under
+ * `cs`. Every entry here is a mod that answered the index broadcast, which is
+ * to say a mod that declared at least one setting -- see `onIndexQuery` in
+ * `aowl/src/aowlspt/settings.nim`, which only subscribes when `declareSettings`
+ * was called with a non-empty list. */
+static void aowl_ov_read_settings_index(const char* body, int32_t len) {
+    const char* end = body + len;
+    const char* m = aowl_ov_jmem(body, end, "mods");
+    m = m ? aowl_ov_jarr(m, end) : NULL;
+    g_ov.idxModCount = 0;
+    for (; m && g_ov.idxModCount < AOWL_OV_MAX_SPAGES; m = aowl_ov_jnext(m, end)) {
+        AowlOvSPage* P = &g_ov.idxMods[g_ov.idxModCount];
+        const char* v;
+        memset(P, 0, sizeof(*P));
+        aowl_ov_jput(m, end, "guid", P->id, (int32_t)sizeof(P->id));
+        if (!P->id[0]) continue;
+        aowl_ov_jput(m, end, "name", P->label, (int32_t)sizeof(P->label));
+        if (!P->label[0]) aowl_ov_copy(P->label, (int32_t)sizeof(P->label), P->id);
+        P->isMod = 1;
+        v = aowl_ov_jmem(m, end, "count"); P->count = v ? aowl_ov_jint(v, end, -1) : -1;
+        /* `done` used to be hardcoded to -1 here, because no mod sent one. One
+         * does now (`onIndexQuery` in `aowl/src/aowlspt/settings.nim`), and the
+         * absent case still lands on -1 through the same expression the SPT
+         * index uses -- so "the index did not say" stays distinguishable from
+         * "it said none", which is the distinction the page filter turns on. */
+        v = aowl_ov_jmem(m, end, "done");  P->done  = v ? aowl_ov_jint(v, end, -1) : -1;
+        g_ov.idxModCount++;
+    }
+    g_ov.idxGot = 1;
+    g_ov.idxWhy[0] = 0;
+}
+
+/* Merge the nav: one page per mod THAT PUBLISHES SETTINGS, then the SPT pages
+ * the hub described. Called under `cs` whenever either half moves.
+ *
+ * It used to walk `g_ov.mods` -- the client mod roster -- which is a different
+ * question with a different answer: the roster carries `aowl.manager`,
+ * `aowl.settingshub`, `aowl.uihub` and every not-selected mod, so the settings
+ * nav listed five pages a player cannot configure and four of them opened on an
+ * error. There is deliberately NO fallback to the roster when the index is
+ * missing: an empty nav that names the missing route is a true statement, and
+ * the roster is a false one. */
+/* A page NONE of whose rows would survive the unimplemented filter. Answered
+ * from the INDEX -- `count` rows of which `done` are implemented -- so it costs
+ * no fetch: hiding 28 SPT pages must not mean downloading 28 SPT pages to find
+ * out they are empty.
+ *
+ * `done == -1` means THE INDEX DID NOT SAY, and is emphatically not the same as
+ * `done == 0`. Only an explicit zero hides a page; an index that is silent
+ * leaves the page visible, because the failure mode of guessing here is a page
+ * the player cannot reach and cannot be told about. `mods/settingshub`'s
+ * `onIndex` sends `done: 0` for every SPT page (measured: all 323 settings and
+ * 197 nested rows in `sptsurface.nim` carry `implemented:false`), and
+ * `aowl/src/aowlspt/settings.nim`'s `onIndexQuery` now sends a real `done` for
+ * each mod, so both halves answer this honestly rather than by page kind. */
+static int32_t aowl_ov_page_all_hidden(const AowlOvSPage* P) {
+    if (g_ov.showUnimpl) return 0;
+    return P->count > 0 && P->done == 0;
+}
+
 static void aowl_ov_rebuild_pages(void) {
     int32_t i;
     g_ov.pageCount = 0;
-    for (i = 0; i < g_ov.modCount && g_ov.pageCount < AOWL_OV_MAX_SPAGES; i++) {
-        AowlOvSPage* P = &g_ov.pages[g_ov.pageCount++];
-        memset(P, 0, sizeof(*P));
-        aowl_ov_copy(P->id, (int32_t)sizeof(P->id), g_ov.mods[i].guid);
-        aowl_ov_copy(P->label, (int32_t)sizeof(P->label),
-                     g_ov.mods[i].name[0] ? g_ov.mods[i].name : g_ov.mods[i].guid);
-        P->isMod = 1; P->count = -1; P->done = -1;
-    }
+    for (i = 0; i < g_ov.idxModCount && g_ov.pageCount < AOWL_OV_MAX_SPAGES; i++)
+        if (!aowl_ov_page_all_hidden(&g_ov.idxMods[i]))
+            g_ov.pages[g_ov.pageCount++] = g_ov.idxMods[i];
     for (i = 0; i < g_ov.sptPageCount && g_ov.pageCount < AOWL_OV_MAX_SPAGES; i++)
-        g_ov.pages[g_ov.pageCount++] = g_ov.sptPages[i];
+        if (!aowl_ov_page_all_hidden(&g_ov.sptPages[i]))
+            g_ov.pages[g_ov.pageCount++] = g_ov.sptPages[i];
 }
 
 static int32_t aowl_ov_fetch(const wchar_t* verb, const wchar_t* path,
@@ -2217,7 +2777,7 @@ static void aowl_ov_settings_load(const char* pageId, int32_t isMod,
                                   char* buf, int32_t cap) {
     wchar_t path[224];
     wchar_t warg[96];
-    int32_t i = 0, rc;
+    int32_t i = 0, rc, trunc;
     for (; pageId[i] && i < 95; i++) warg[i] = (wchar_t)(unsigned char)pageId[i];
     warg[i] = 0;
     if (isMod) _snwprintf(path, 224, L"/aowlspt/settings/%ls", warg);
@@ -2225,15 +2785,40 @@ static void aowl_ov_settings_load(const char* pageId, int32_t isMod,
     path[223] = 0;
 
     rc = aowl_ov_fetch(L"GET", path, NULL, buf, cap);
+    trunc = (int32_t)InterlockedCompareExchange(&g_ov.lastTrunc, 0, 0);
     EnterCriticalSection(&g_ov.cs);
     aowl_ov_copy(g_ov.itemsPage, (int32_t)sizeof(g_ov.itemsPage), pageId);
+    g_ov.itemsWhy[0] = 0;
     if (rc > 0 && (unsigned char)buf[0] != 0x78 && aowl_ov_jwhole(buf, rc)) {
         aowl_ov_read_items(buf, rc);
         g_ov.itemsErr = 0;
+        if (g_ov.itemCount >= AOWL_OV_MAX_SITEMS)
+            aowl_ov_fmt(g_ov.itemsWhy, (int32_t)sizeof(g_ov.itemsWhy),
+                        "this page has more rows than the panel can hold; "
+                        "showing the first %d", AOWL_OV_MAX_SITEMS);
     } else {
         g_ov.itemCount = 0;
         g_ov.itemsImpl = 0;
+        g_ov.catCount = 0;
         g_ov.itemsErr = 1;
+        /* Three different faults used to arrive here indistinguishable. Named
+         * separately now, because "it did not fit" and "nobody answered" send a
+         * person to opposite ends of the system. */
+        if (trunc > 0)
+            aowl_ov_fmt(g_ov.itemsWhy, (int32_t)sizeof(g_ov.itemsWhy),
+                        "the reply was larger than the panel's %d-byte buffer "
+                        "and arrived cut in half", trunc);
+        else if (rc > 0 && (unsigned char)buf[0] == 0x78)
+            aowl_ov_copy(g_ov.itemsWhy, (int32_t)sizeof(g_ov.itemsWhy),
+                         "the backend sent a deflated body; it must honour "
+                         "Accept-Encoding: identity");
+        else if (rc > 0)
+            aowl_ov_copy(g_ov.itemsWhy, (int32_t)sizeof(g_ov.itemsWhy),
+                         "the backend answered, but not with a schema -- the "
+                         "route may be missing on this mod");
+        else
+            aowl_ov_copy(g_ov.itemsWhy, (int32_t)sizeof(g_ov.itemsWhy),
+                         "the backend did not answer at all");
     }
     LeaveCriticalSection(&g_ov.cs);
     g_ov.dataSerial++;
@@ -2261,8 +2846,16 @@ static DWORD WINAPI aowl_ov_worker(LPVOID unused) {
      * 32 KB that is allocated once is one fewer thing that can fail late.
      * `/aowlspt/mods/lists` on the shipped registry is about 2 KB; the ceiling
      * is what a very large registry could produce, and a body that does not fit
-     * is truncated, fails to parse into rows, and leaves the tables alone. */
-    static char buf[32768];
+     * is truncated, fails to parse into rows, and leaves the tables alone.
+     *
+     * It was 32,768 bytes and that was the whole of defect (1): MEASURED with
+     * curl against the live backend, `GET /aowlspt/settings/aowl.tarkov` with
+     * `Accept-Encoding: identity` answers 200 with **283,798 bytes** (802
+     * rows), and `GET /aowlspt/settings/aowl.sain` answers 1,156 (5 rows). The
+     * small page loaded and the large one did not, and the panel said "the mod
+     * may not be loaded" about a mod that was loaded and answering. The cap is
+     * the only thing that was ever wrong. See `AOWL_OV_HTTP_BUF`. */
+    static char buf[AOWL_OV_HTTP_BUF];
     (void)unused;
     /* Starts at the interval so the first poll happens immediately: an overlay
      * that shows a stale read-only list for a second after the game starts
@@ -2485,6 +3078,94 @@ static DWORD WINAPI aowl_ov_worker(LPVOID unused) {
                 LeaveCriticalSection(&g_ov.cs);
                 g_ov.dataSerial++;
             }
+
+            /* The settings nav's real source. Re-fetched every slow pass
+             * rather than held, because a mod loaded after start-up publishes
+             * settings after start-up, and a nav that was correct once is not
+             * the same thing as a nav that is correct. Cheap: the shipped
+             * index is a few hundred bytes.
+             *
+             * A failure leaves the previous nav ALONE and records why, so a
+             * momentary backend hiccup does not blank a screen the player is
+             * looking at -- but it never substitutes the mod roster. */
+            rc = aowl_ov_fetch(L"GET", L"/aowlspt/settings/index", NULL, buf,
+                               (int32_t)sizeof(buf));
+            EnterCriticalSection(&g_ov.cs);
+            if (rc > 0 && (unsigned char)buf[0] != 0x78 &&
+                aowl_ov_jwhole(buf, rc) && aowl_ov_jmem(buf, buf + rc, "mods")) {
+                aowl_ov_read_settings_index(buf, rc);
+            } else if (!g_ov.idxGot) {
+                aowl_ov_copy(g_ov.idxWhy, (int32_t)sizeof(g_ov.idxWhy),
+                             rc > 0
+                               ? "GET /aowlspt/settings/index did not answer with "
+                                 "a mods list -- the settings hub (aowl.settingshub) "
+                                 "is not loaded, so nothing can enumerate which mods "
+                                 "have settings"
+                               : "GET /aowlspt/settings/index did not answer");
+            }
+            LeaveCriticalSection(&g_ov.cs);
+
+            /* --- the launch hint`s own setting, as actually READ ---------
+             *
+             * `aowl.uihub` declares `launchHint`. It is fetched once, here on
+             * the worker, and the value that comes back over the wire is what
+             * the toast obeys -- NOT the default this file declares. A default
+             * is not a value: a flag that reads false in source and true in the
+             * deployed config is the shape that has cost this project launch
+             * cycles, so the number is logged as read and the panel`s status
+             * line carries it.
+             *
+             * Until the fetch answers, the prefs file`s remembered value is
+             * used, which is what makes the hint honour a player`s choice on
+             * the very next launch instead of one launch later. A backend that
+             * never answers therefore leaves the hint at whatever the player
+             * last chose, not at the source default. */
+            if (!g_ov.hintFetched) {
+                rc = aowl_ov_fetch(L"GET", L"/aowlspt/settings/aowl.uihub",
+                                   NULL, buf, (int32_t)sizeof(buf));
+                if (rc > 0 && (unsigned char)buf[0] != 0x78 &&
+                    aowl_ov_jwhole(buf, rc)) {
+                    const char* end = buf + rc;
+                    const char* it;
+                    for (it = aowl_ov_jarr(buf, end); it;
+                         it = aowl_ov_jnext(it, end)) {
+                        char k[48];
+                        aowl_ov_jput(it, end, "key", k, (int32_t)sizeof(k));
+                        if (strcmp(k, "launchHint") == 0) {
+                            const char* v = aowl_ov_jmem(it, end, "value");
+                            int32_t was = g_ov.hintEnabled;
+                            if (v) g_ov.hintEnabled = aowl_ov_jbool(v, end, 1);
+                            g_ov.hintFetched = 1;
+                            aowl_ov_fmt(g_ov.hintWhy, (int32_t)sizeof(g_ov.hintWhy),
+                                        "launchHint READ from aowl.uihub = %d "
+                                        "(prefs file had %d)",
+                                        g_ov.hintEnabled, was);
+                            aowl_ov_note(g_ov.hintWhy);
+                            InterlockedExchange(&g_ov.prefsDirty, 1);
+                            break;
+                        }
+                    }
+                }
+                if (!g_ov.hintFetched && g_ov.everOk) {
+                    /* The backend is up and did not serve the key. Said out
+                     * loud: a hint that advertises an off-switch which is not
+                     * in the settings surface is worse than no hint, so this
+                     * is the line that catches uihub having been built without
+                     * its schema. */
+                    g_ov.hintFetched = 1;
+                    aowl_ov_copy(g_ov.hintWhy, (int32_t)sizeof(g_ov.hintWhy),
+                                 "launchHint NOT served by aowl.uihub -- the "
+                                 "hint`s off-switch is not in the settings "
+                                 "surface; using the remembered value");
+                    aowl_ov_note(g_ov.hintWhy);
+                }
+            }
+
+            /* Geometry the render thread changed. Written HERE, on the worker,
+             * because a synchronous file write inside Present is a frame the
+             * player feels. */
+            if (InterlockedCompareExchange(&g_ov.prefsDirty, 0, 1) == 1)
+                aowl_ov_prefs_save();
 
             /* The settings screen's page index. The SPT surface is a fixed
              * catalogue the hub serves once; a 404 (no hub loaded) just leaves
@@ -3221,6 +3902,9 @@ static const uint32_t AOWL_OV_BG     = AOWL_RGBA(14, 16, 20, 232);
 #define AOWL_OV_GOOD      AOWL_RGBA(120, 200, 140, 255)
 #define AOWL_OV_ACCENT    AOWL_RGBA(150, 190, 235, 255)
 
+#define OV_DOT '.'
+#define OV_SP  ' '
+
 static int32_t aowl_ov_hit(float x, float y, float w, float h) {
     /* The cursor is in back-buffer pixels and the rectangle is in panel units,
      * so the cursor comes down rather than the rectangle going up -- one divide
@@ -3229,6 +3913,104 @@ static int32_t aowl_ov_hit(float x, float y, float w, float h) {
     float mx = (float)g_ov.mx / k, my = (float)g_ov.my / k;
     return mx >= x && mx < x + w && my >= y && my < y + h;
 }
+
+/* ------------------------------------------------------------------ *
+ * The panel own preferences -- where it sits, how big it is, how solid,
+ * and whether the launch hint is wanted.
+ *
+ * A four-line text file under %LOCALAPPDATA%\aowlspt, written by the WORKER
+ * thread and never by the render thread: the render thread is the game's
+ * Present, and a synchronous file write in Present is a frame spike the
+ * player feels. The render thread only ever sets `prefsDirty`.
+ *
+ * Deliberately NOT the host's `aowlspt-host.json`. That file is the host's
+ * feature flags, edited by hand and by `tools/hostcfg.py`, and a window
+ * position that rewrites itself every time somebody drags the panel would
+ * fight both. This is view state, and it lives with the view.
+ * ------------------------------------------------------------------ */
+
+static void aowl_ov_prefs_path(void) {
+    char base[240];
+    DWORD n;
+    if (g_ov.prefsPath[0]) return;
+    n = GetEnvironmentVariableA("LOCALAPPDATA", base, (DWORD)sizeof(base));
+    if (n == 0 || n >= sizeof(base)) { g_ov.prefsPath[0] = 0; return; }
+    _snprintf(g_ov.prefsPath, sizeof(g_ov.prefsPath) - 1, "%s\aowlspt", base);
+    g_ov.prefsPath[sizeof(g_ov.prefsPath) - 1] = 0;
+    CreateDirectoryA(g_ov.prefsPath, NULL);   /* fine if it is already there */
+    _snprintf(g_ov.prefsPath, sizeof(g_ov.prefsPath) - 1,
+              "%s\\aowlspt\\overlay-window.txt", base);
+    g_ov.prefsPath[sizeof(g_ov.prefsPath) - 1] = 0;
+}
+
+/* Defaults, applied when there is no file or the file is unusable. Separate
+ * from the load so that a corrupt file produces the SAME panel a first run
+ * does rather than a panel with three fields set and one garbage. */
+static void aowl_ov_prefs_default(void) {
+    g_ov.panX = (float)AOWL_OV_PANEL_X;
+    g_ov.panY = (float)AOWL_OV_PANEL_Y;
+    g_ov.panW = (float)AOWL_OV_PANEL_W;
+    g_ov.panH = (float)AOWL_OV_PANEL_H;
+    g_ov.panMax = 0;
+    g_ov.panAlpha = 232;          /* what this panel always was */
+    g_ov.hintEnabled = 1;
+}
+
+static void aowl_ov_prefs_load(void) {
+    FILE* f;
+    int x = 0, y = 0, w = 0, hh = 0, mx = 0, al = 0, hi = 1;
+    aowl_ov_prefs_default();
+    aowl_ov_prefs_path();
+    if (!g_ov.prefsPath[0]) {
+        aowl_ov_note("window prefs: no LOCALAPPDATA; using defaults, not persisting");
+        return;
+    }
+    f = fopen(g_ov.prefsPath, "rb");
+    if (!f) {
+        /* Not an error: this is what a first launch looks like. Said out loud
+         * anyway, because "the panel forgot where it was" and "the panel has
+         * never been told where it was" are otherwise the same screen. */
+        aowl_ov_note("window prefs: none on disk yet (first run)");
+        return;
+    }
+    if (fscanf(f, "%d %d %d %d %d %d %d", &x, &y, &w, &hh, &mx, &al, &hi) == 7) {
+        /* Every field is range-checked, and a single bad one throws the WHOLE
+         * record away. A file that half-parses is how a panel ends up 3 pixels
+         * wide off the bottom of the screen with no way to grab it. */
+        if (x >= -4000 && x <= 8000 && y >= -4000 && y <= 8000 &&
+            w >= 480 && w <= 8000 && hh >= 220 && hh <= 8000 &&
+            (mx == 0 || mx == 1) && al >= 40 && al <= 255 &&
+            (hi == 0 || hi == 1)) {
+            g_ov.panX = (float)x; g_ov.panY = (float)y;
+            g_ov.panW = (float)w; g_ov.panH = (float)hh;
+            g_ov.panMax = mx; g_ov.panAlpha = al; g_ov.hintEnabled = hi;
+        } else {
+            aowl_ov_note("window prefs: out of range, defaults used");
+        }
+    } else {
+        aowl_ov_note("window prefs: unreadable, defaults used");
+    }
+    fclose(f);
+    /* The value AS ACTUALLY READ, not the default the source declares -- a
+     * default is not a value, and a flag whose deployed value differs from its
+     * source default has cost this project launches. */
+    aowl_ov_fmt(g_ov.status, (int32_t)sizeof(g_ov.status),
+                "window prefs read: %dx%d at %d,%d max=%d alpha=%d launchHint=%d",
+                (int32_t)g_ov.panW, (int32_t)g_ov.panH, (int32_t)g_ov.panX,
+                (int32_t)g_ov.panY, g_ov.panMax, g_ov.panAlpha, g_ov.hintEnabled);
+}
+
+static void aowl_ov_prefs_save(void) {
+    FILE* f;
+    if (!g_ov.prefsPath[0]) return;
+    f = fopen(g_ov.prefsPath, "wb");
+    if (!f) return;
+    fprintf(f, "%d %d %d %d %d %d %d\n",
+            (int)g_ov.panX, (int)g_ov.panY, (int)g_ov.panW, (int)g_ov.panH,
+            g_ov.panMax, g_ov.panAlpha, g_ov.hintEnabled);
+    fclose(f);
+}
+
 
 /* ------------------------------------------------------------------ *
  * Text helpers
@@ -3367,7 +4149,12 @@ static void aowl_ov_snapshot(void) {
     memcpy(g_ov.sItems, g_ov.items, sizeof(AowlOvSItem) * (size_t)g_ov.itemCount);
     memcpy(g_ov.sItemsPage, g_ov.itemsPage, sizeof(g_ov.sItemsPage));
     g_ov.sItemsErr = g_ov.itemsErr;
+    memcpy(g_ov.sCats, g_ov.cats, sizeof(AowlOvSCat) * (size_t)g_ov.catCount);
+    g_ov.sCatCount = g_ov.catCount;
+    memcpy(g_ov.sItemsWhy, g_ov.itemsWhy, sizeof(g_ov.sItemsWhy));
+    memcpy(g_ov.sIdxWhy, g_ov.idxWhy, sizeof(g_ov.sIdxWhy));
     g_ov.sItemsImpl = g_ov.itemsImpl;
+    g_ov.sHiddenCount = g_ov.hiddenCount;
     LeaveCriticalSection(&g_ov.cs);
 }
 
@@ -3547,6 +4334,12 @@ static void aowl_ov_move(int32_t view, int32_t delta, int32_t count) {
 
 /* Defined below, next to the settings screen it drives. */
 static void aowl_ov_settings_key(LONG vk, int32_t page);
+/* Both defined with the settings screen below; F2 and F8 are handled up here,
+ * before the mode branch, so that they work from either face of the panel. */
+static void aowl_ov_s_flush_now(void);
+static void aowl_ov_rebuild_pages(void);
+static int32_t aowl_ov_searching(void);
+static char aowl_ov_vk_char(LONG vk);
 
 /* Drains the ring and turns it into actions. Runs on the render thread, once
  * per frame, so a key pressed between two frames is never lost and a key held
@@ -3562,10 +4355,101 @@ static void aowl_ov_keys(int32_t page, const int32_t* vis, int32_t visN) {
          * direction, and any in-progress edit is dropped rather than carried
          * across. It is checked before the mode branch so it works from both. */
         if (vk == VK_F2) {
+            /* A held write is SENT, not dropped. Switching face is not undo:
+             * the row on screen already shows the new value and the file must
+             * agree with it. Only the in-progress TEXT edit -- which the player
+             * has not confirmed with ENTER -- is abandoned. */
+            aowl_ov_s_flush_now();
             g_ov.settings = !g_ov.settings;
             g_ov.editItem = -1; g_ov.capturing = 0; g_ov.dragItem = -1;
             continue;
         }
+
+        /* F8 -- SHOW THE SETTINGS THAT ARE NOT IMPLEMENTED YET. Default OFF.
+         *
+         * A developer needs to see them; a beta tester must not be handed a
+         * screen of controls that do nothing, which is what "simply dont show
+         * the not included or finished stuff" asked for. It is a function key
+         * for the same reason every other panel shortcut is: no text field can
+         * eat it, so it works with the search box focused and with a value box
+         * open.
+         *
+         * The flag is read by the PARSER, so flipping it has to re-parse. The
+         * page is dropped by clearing `curPage`, which the draw sees as "the
+         * cursor is on a page that is not loaded" and re-requests through the
+         * ordinary path -- there is no second load route to keep in step. */
+        if (vk == VK_F8) {
+            aowl_ov_s_flush_now();
+            EnterCriticalSection(&g_ov.cs);
+            g_ov.showUnimpl = !g_ov.showUnimpl;
+            aowl_ov_rebuild_pages();
+            g_ov.itemsPage[0] = 0;
+            g_ov.dataSerial++;
+            LeaveCriticalSection(&g_ov.cs);
+            g_ov.curPage[0] = 0;
+            g_ov.editItem = -1; g_ov.capturing = 0; g_ov.dragItem = -1;
+            g_ov.selCat = -1; g_ov.selItem = 0; g_ov.topItem = 0;
+            g_ov.filtStamp = 0;
+            continue;
+        }
+
+        /* --- THE INPUT MODEL, stated once and obeyed everywhere -----------
+         *
+         * The rule the panel now follows, and the one the footer prints:
+         *
+         *   * THE SEARCH FIELD ONLY HAS FOCUS AFTER `/` OR A CLICK ON IT.
+         *     It is permanently VISIBLE; that is not the same as permanently
+         *     focused, and conflating the two is what broke this. While it has
+         *     focus it takes every printable key, which is what a text field
+         *     must do -- so `-` and `=` reached it and never reached the panel,
+         *     and the shortcuts the legend advertised were unreachable. That
+         *     was the bug.
+         *   * ESC gives the keyboard back to the list (and clears the term).
+         *     ENTER, TAB and DOWN give it back and KEEP the term.
+         *   * FUNCTION KEYS ARE NEVER SWALLOWED. F9/F10/F11 work whatever has
+         *     focus, because they are not printable and so can never be
+         *     something the player meant to type. That is why the opacity
+         *     control is F9/F10 and not only `-`/`=`.
+         *
+         *     ...which is necessary and was not SUFFICIENT: F10 is also
+         *     Windows' menu key and arrives as WM_SYSKEYDOWN, a message the
+         *     panel's own switch did not take. "Not swallowed by a text field"
+         *     and "delivered to the panel at all" are two different claims and
+         *     only the first was true. See WM_SYSKEYDOWN in the wndproc.
+         *   * `-`/`=` remain as aliases, and work whenever the field does NOT
+         *     have focus -- which is the state the panel is in unless the
+         *     player put it in the other one on purpose.
+         *
+         * A shortcut that a text field can eat is not a shortcut, and the fix
+         * is not "be cleverer about focus", it is "have keys that cannot be
+         * typed". */
+        if (vk == VK_F11) {
+            g_ov.panMax = !g_ov.panMax;
+            InterlockedExchange(&g_ov.prefsDirty, 1);
+            continue;
+        }
+        if (vk == VK_F9 || vk == VK_F10) {
+            g_ov.panAlpha += (vk == VK_F10) ? 27 : -27;
+            if (g_ov.panAlpha < 40) g_ov.panAlpha = 40;
+            if (g_ov.panAlpha > 255) g_ov.panAlpha = 255;
+            InterlockedExchange(&g_ov.prefsDirty, 1);
+            continue;
+        }
+        if (!(g_ov.settings && g_ov.searchFocus)) {
+            if (vk == VK_OEM_MINUS || vk == VK_SUBTRACT) {
+                g_ov.panAlpha -= 27;
+                if (g_ov.panAlpha < 40) g_ov.panAlpha = 40;
+                InterlockedExchange(&g_ov.prefsDirty, 1);
+                continue;
+            }
+            if (vk == VK_OEM_PLUS || vk == VK_ADD) {
+                g_ov.panAlpha += 27;
+                if (g_ov.panAlpha > 255) g_ov.panAlpha = 255;
+                InterlockedExchange(&g_ov.prefsDirty, 1);
+                continue;
+            }
+        }
+
         if (g_ov.settings) { aowl_ov_settings_key(vk, page); continue; }
 
         if (vk == VK_TAB || vk == VK_RIGHT) {
@@ -4290,10 +5174,110 @@ static void aowl_ov_s_fmt_num(AowlOvSItem* si, float v) {
     aowl_ov_copy(si->value, (int32_t)sizeof(si->value), t);
 }
 
+/* How long the write slot sits on an edit before sending it. 180 ms is under
+ * the ~200 ms a deliberate second gesture takes and well over both the 16 ms
+ * frame of a drag and the ~33 ms of a held key`s auto-repeat, so a whole
+ * gesture -- however long -- coalesces into ONE write, and two separate
+ * gestures never do. */
+#define AOWL_OV_WRITE_QUIET_MS 180
+
+/* Send whatever the slot holds, now. Idempotent; safe to call with nothing
+ * armed. */
+static void aowl_ov_s_flush_now(void) {
+    if (!g_ov.pendArm) return;
+    g_ov.pendArm = 0;
+    g_ov.writeCount++;
+    aowl_ov_queue_sset(g_ov.pendPage, g_ov.pendKey, g_ov.pendVal);
+}
+
+/* Put an edit in the slot. See the slot`s own comment in `AowlOvState`.
+ *
+ * The page id is the loaded page, which for a mod is its guid -- exactly the
+ * route the edit POSTs to. SPT rows never reach here (they are inert). */
 static void aowl_ov_s_commit(AowlOvSItem* si) {
-    /* The page id is the loaded page, which for a mod is its guid -- exactly the
-     * route the edit POSTs to. SPT rows never reach here (they are inert). */
-    aowl_ov_queue_sset(g_ov.sItemsPage, si->key, si->raw);
+    if (g_ov.pendArm &&
+        (strcmp(g_ov.pendKey, si->key) != 0 ||
+         strcmp(g_ov.pendPage, g_ov.sItemsPage) != 0))
+        aowl_ov_s_flush_now();          /* a different key: do not coalesce */
+    aowl_ov_copy(g_ov.pendPage, (int32_t)sizeof(g_ov.pendPage), g_ov.sItemsPage);
+    aowl_ov_copy(g_ov.pendKey,  (int32_t)sizeof(g_ov.pendKey),  si->key);
+    aowl_ov_copy(g_ov.pendVal,  (int32_t)sizeof(g_ov.pendVal),  si->raw);
+    g_ov.pendAt  = GetTickCount();
+    g_ov.pendArm = 1;
+}
+
+/* Called once per settings frame. Constant cost: one compare when nothing is
+ * held, and it never allocates. */
+static void aowl_ov_s_flush_tick(void) {
+    if (!g_ov.pendArm) return;
+    if (GetTickCount() - g_ov.pendAt < (DWORD)AOWL_OV_WRITE_QUIET_MS) return;
+    aowl_ov_s_flush_now();
+}
+
+/* CLICK-TO-TYPE.
+ *
+ * The numeric value cell, drawn as a real -- if minimal -- text field, so that
+ * a number can be ENTERED rather than only approached. A slider is a good
+ * control for "a bit more" and a bad one for "exactly 1.25": at 104 pixels it
+ * can address 104 positions, and on a 0..1000 range the value the player wants
+ * may simply not be reachable by dragging. The stepper has the same problem in
+ * the other direction -- 400 presses.
+ *
+ * Both variants call this for the same cell, so there is ONE way to type a
+ * number on this screen and it looks the same wherever the row came from.
+ *
+ * Editing state is the existing `editItem`/`editBuf` pair -- the same one the
+ * string and keybind editors use -- rather than a second one, because two
+ * "which row is being edited" variables is two answers to a question with one
+ * true answer, and the focus rules below only work if there is one.
+ *
+ * Drawn, not asserted: while the box has the row, the cell shows `editBuf` with
+ * a caret and an ACCENT frame, and NOT `si->value` -- so what is on screen is
+ * what ENTER will parse. */
+static void aowl_ov_s_num_box(AowlOvSItem* si, int32_t at, float bx, float by,
+                              float bw, int32_t canEdit) {
+    int32_t editing = (g_ov.editItem == at);
+    int32_t cols;
+    if (bw < AOWL_OV_CW) return;
+    cols = (int32_t)(bw / AOWL_OV_CW);
+    if (editing) {
+        char shown[80];
+        aowl_ov_rect(bx - 3.0f, by + 3.0f, bw, (float)(AOWL_OV_ROW_H - 6),
+                     AOWL_OV_ROWALT);
+        aowl_ov_frame_rect(bx - 3.0f, by + 3.0f, bw,
+                           (float)(AOWL_OV_ROW_H - 6), 1.0f, AOWL_OV_ACCENT);
+        aowl_ov_fmt(shown, (int32_t)sizeof(shown), "%s_", g_ov.editBuf);
+        aowl_ov_textn(bx, by + 4.0f, shown, AOWL_OV_TEXT, cols - 1);
+        return;
+    }
+    if (canEdit) {
+        /* A hairline under the cell: the affordance. Without it nothing on the
+         * row says the number is typeable and the feature is undiscoverable,
+         * which is the same as absent. */
+        int32_t hot = aowl_ov_hit(bx - 3.0f, by + 3.0f, bw,
+                                  (float)(AOWL_OV_ROW_H - 6));
+        if (hot)
+            aowl_ov_rect(bx - 3.0f, by + 3.0f, bw,
+                         (float)(AOWL_OV_ROW_H - 6), AOWL_OV_ROWALT);
+        aowl_ov_rect(bx - 3.0f, by + (float)AOWL_OV_ROW_H - 4.0f, bw, 1.0f,
+                     hot ? AOWL_OV_ACCENT : AOWL_OV_EDGE);
+        if (hot && g_ov.clickDown) {
+            g_ov.selItem = at;
+            /* Opening the value box TAKES THE KEYBOARD FROM THE SEARCH FIELD.
+             * Two focused text fields is the defect this screen already had
+             * once, in the other direction. */
+            g_ov.searchFocus = 0;
+            g_ov.editItem = at;
+            g_ov.capturing = 0;
+            g_ov.dragItem = -1;
+            aowl_ov_copy(g_ov.editBuf, (int32_t)sizeof(g_ov.editBuf),
+                         si->value);
+            InterlockedExchange(&g_ov.clickDown, 0);
+            return;
+        }
+    }
+    aowl_ov_textn(bx, by + 3.0f, si->value[0] ? si->value : "-",
+                  canEdit ? AOWL_OV_TEXT : AOWL_OV_DIM, cols);
 }
 
 static void aowl_ov_s_toggle_bool(AowlOvSItem* si) {
@@ -4359,6 +5343,28 @@ static char aowl_ov_vk_char(LONG vk) {
     if (vk == VK_OEM_MINUS)  return '-';
     if (vk == VK_OEM_PERIOD) return '.';
     if (vk == VK_OEM_2)      return '/';
+    /* The NUMERIC KEYPAD. Added for the value box: somebody typing a number
+     * reaches for the pad, and without these `4` off the pad produced nothing
+     * at all -- a text field that silently ignores half the keys that make the
+     * character it wants reads as broken, which is exactly the report that
+     * started the focus work. Harmless to the string editor, which accepts
+     * digits from the top row already. */
+    if (vk >= VK_NUMPAD0 && vk <= VK_NUMPAD9)
+        return (char)('0' + (vk - VK_NUMPAD0));
+    if (vk == VK_DECIMAL)    return '.';
+    return 0;
+}
+
+/* A character the NUMBER box accepts. Deliberately narrower than
+ * `aowl_ov_vk_char`: letters must not land in a numeric field, so `E` is
+ * rejected and scientific notation is not typeable. `-` is accepted anywhere in
+ * the buffer rather than only first -- rejecting it by position here would mean
+ * the field refusing a keystroke mid-edit, and `strtod` settles it on ENTER. */
+static char aowl_ov_vk_numchar(LONG vk) {
+    char c = aowl_ov_vk_char(vk);
+    if (c >= '0' && c <= '9') return c;
+    if (c == '.' || c == '-') return c;
+    if (vk == VK_SUBTRACT) return '-';
     return 0;
 }
 
@@ -4367,10 +5373,208 @@ static char aowl_ov_vk_char(LONG vk) {
  * by exactly what is on screen. */
 #define AOWL_OV_SDETAIL_H 62
 
+/* One extra line at the top of the right pane, for the permanent search box.
+ * Reserved unconditionally -- the box is always there, not summoned by a key,
+ * so the room for it is not conditional either and the row arithmetic does not
+ * change under the player mid-interaction. */
+/* The search box is a PRIMARY control, not a filter tucked in a corner.
+ *
+ * With 802 settings on one page it is how anybody actually finds a row, and it
+ * was drawn as a 16-pixel strip across half the pane -- the visual weight of a
+ * footnote. It is now the full width of the pane and two lines tall: an input
+ * line the size of a real text field, and a scope line underneath saying what
+ * was searched and how much of it matched.
+ *
+ * 44 rather than 20 costs the list one row. That is the right trade: a row you
+ * cannot see is one scroll away, and a search box you did not notice is 802
+ * rows of scrolling. */
+#define AOWL_OV_SEARCH_H 44
+#define AOWL_OV_SEARCH_BOX 22   /* the input line inside it */
+
+/* A group header in the row list: a filled band, not a hairline. `LINE_H` for
+ * the text and 6 above it, so one group visibly ends before the next begins. */
+#define AOWL_OV_GHDR_H   (AOWL_OV_LINE_H + 6)
+
 static int32_t aowl_ov_settings_rows(float bodyH) {
     int32_t r = (int32_t)((bodyH - 2.0f * (float)AOWL_OV_LINE_H
+                           - (float)AOWL_OV_SEARCH_H
                            - (float)AOWL_OV_SDETAIL_H) / (float)AOWL_OV_ROW_H);
     return r < 1 ? 1 : r;
+}
+
+/* How many CONTROL rows a screenful holds once the group bands between them
+ * are paid for. PgUp/PgDn moves by this, so the page key lands roughly where
+ * the eye expects instead of overshooting by one band per group -- which on a
+ * page of three-row groups is most of a screen.
+ *
+ * An estimate, deliberately, and it is allowed to be: the scroll clamp in the
+ * draw is what actually decides what is on screen, and it corrects any
+ * overshoot on the next frame. Estimating here and correcting there is one
+ * source of truth with a hint, not two computations that can disagree. */
+static int32_t aowl_ov_settings_page(float bodyH, int32_t rows) {
+    int32_t bands, r;
+    if (rows < 1) rows = 1;
+    if (g_ov.sCatCount <= 0 || g_ov.sItemCount <= 0) return rows;
+    /* Average rows per group, floored at one. */
+    bands = g_ov.sItemCount / (g_ov.sCatCount > 0 ? g_ov.sCatCount : 1);
+    if (bands < 1) bands = 1;
+    r = (int32_t)((float)rows * (float)bands * (float)AOWL_OV_ROW_H
+                  / ((float)bands * (float)AOWL_OV_ROW_H
+                     + (float)AOWL_OV_GHDR_H));
+    (void)bodyH;
+    return r < 1 ? 1 : r;
+}
+
+/* ------------------------------------------------------------------ *
+ * Search
+ *
+ * WHAT IT SEARCHES, exactly: the row LABEL, the row KEY, and the row`s GROUP
+ * PATH. Case-insensitive substring on each; a hit anywhere counts.
+ *
+ * WHAT IT DOES NOT SEARCH, and every one of these is a deliberate decision
+ * rather than an omission:
+ *
+ *   * the DESCRIPTION. Descriptions are sentences, and matching them turns a
+ *     three-letter term into forty hits with no visible reason for any of them
+ *     -- the result list would be full of rows whose match is not on screen.
+ *     (The served web UI at `mods/uihub` does match descriptions, because a web
+ *     page can show the matching sentence under the row. This panel cannot
+ *     afford the height, so it does not claim to.)
+ *   * the VALUE. Searching "true" would return every bool on the page.
+ *   * OTHER PAGES. The box searches the LOADED page only -- one mod, or one SPT
+ *     config file. Searching every page means fetching every page, and the
+ *     panel says which page it searched on the box itself so this is never a
+ *     silent limit.
+ *
+ * WHERE the hit is is printed on every result row, as the group breadcrumb,
+ * because a flat list of 802 labels with no path is ambiguous exactly when it
+ * matters -- "Enabled" occurs in nine groups.
+ *
+ * COST. The filter is a cached array of item indices, recomputed only when the
+ * term, the loaded page or the row count changes. A per-frame re-filter over
+ * 802 rows is the trap this panel`s geometry cache exists to avoid, and it
+ * would defeat that cache as well: a frame that draws the same thing must not
+ * do 2,400 string compares to discover that.
+ * ------------------------------------------------------------------ */
+
+static void aowl_ov_sig_add(uint32_t* h, int32_t v);   /* defined with the cache */
+
+static int32_t aowl_ov_ci_find(const char* hay, const char* needle) {
+    size_t i, j;
+    if (!needle[0]) return 1;
+    if (!hay || !hay[0]) return 0;
+    for (i = 0; hay[i]; i++) {
+        for (j = 0; needle[j]; j++) {
+            char a = hay[i + j], b = needle[j];
+            if (a >= 'A' && a <= 'Z') a = (char)(a + 32);
+            if (b >= 'A' && b <= 'Z') b = (char)(b + 32);
+            if (a != b) break;
+        }
+        if (!needle[j]) return 1;
+    }
+    return 0;
+}
+
+static int32_t aowl_ov_smatch(const AowlOvSItem* si, const char* term) {
+    return aowl_ov_ci_find(si->label, term) ||
+           aowl_ov_ci_find(si->key, term) ||
+           aowl_ov_ci_find(si->path, term);
+}
+
+/* Recompute `filt` if and only if what it was computed for has moved. Render
+ * thread; reads the SNAPSHOT (`sItems`), never the worker`s table. */
+static void aowl_ov_search_refresh(void) {
+    uint32_t stamp = 2166136261u;
+    int32_t i;
+    for (i = 0; g_ov.search[i]; i++) aowl_ov_sig_add(&stamp, g_ov.search[i]);
+    for (i = 0; g_ov.sItemsPage[i]; i++) aowl_ov_sig_add(&stamp, g_ov.sItemsPage[i]);
+    aowl_ov_sig_add(&stamp, g_ov.sItemCount);
+    if (!stamp) stamp = 1u;
+    if (stamp == g_ov.filtStamp) return;
+    g_ov.filtStamp = stamp;
+    g_ov.filtCount = 0;
+    if (!g_ov.search[0]) return;
+    for (i = 0; i < g_ov.sItemCount && g_ov.filtCount < AOWL_OV_MAX_SITEMS; i++)
+        if (aowl_ov_smatch(&g_ov.sItems[i], g_ov.search))
+            g_ov.filt[g_ov.filtCount++] = i;
+}
+
+static int32_t aowl_ov_searching(void) {
+    return g_ov.search[0] != 0;
+}
+
+/* The position of `item` in `filt`, or the nearest one at or after it. -1 when
+ * `filt` is empty. Ascending, so a linear walk is fine at 1,200 and bounded. */
+static int32_t aowl_ov_filt_pos(int32_t item) {
+    int32_t i;
+    if (g_ov.filtCount <= 0) return -1;
+    for (i = 0; i < g_ov.filtCount; i++)
+        if (g_ov.filt[i] >= item) return i;
+    return g_ov.filtCount - 1;
+}
+
+/* Is this nav node expanded? OPEN when its flag is set, or when it is an
+ * ancestor-or-self of the selected node -- the branch the player is standing
+ * in is never collapsed out from under them. Render thread. */
+static int32_t aowl_ov_nav_open(int32_t ci, const char* selFull) {
+    if (ci < 0 || ci >= g_ov.sCatCount) return 0;
+    if (g_ov.navOpen[ci]) return 1;
+    if (selFull && selFull[0] &&
+        aowl_ov_path_under(selFull, g_ov.sCats[ci].full) &&
+        strcmp(selFull, g_ov.sCats[ci].full) != 0) return 1;
+    return 0;
+}
+
+/* Drop the expansion state when the loaded page changes. Called from the draw,
+ * which is the only place that knows the page settled. */
+static void aowl_ov_nav_reset_if_page_changed(void) {
+    if (strcmp(g_ov.navOpenFor, g_ov.sItemsPage) == 0) return;
+    aowl_ov_copy(g_ov.navOpenFor, (int32_t)sizeof(g_ov.navOpenFor),
+                 g_ov.sItemsPage);
+    memset(g_ov.navOpen, 0, sizeof(g_ov.navOpen));
+}
+
+/* ------------------------------------------------------------------ *
+ * Group headers
+ *
+ * Every group on a page prints its NAME. It used to print only a hairline --
+ * the player could see that the rows had been divided and could not see into
+ * what, which is the "we have a separator but no name" the report named.
+ *
+ * The name is the part of the row`s path BELOW whatever the nav has selected,
+ * joined with " > ": inside "Player" the group under "Player/Health/Regen"
+ * heads itself "Health > Regen", and with nothing selected it heads itself with
+ * the whole path. When there is nothing below the selection -- the rows sitting
+ * directly at the selected node -- the header is the selected node`s own leaf,
+ * so the branch that could produce an empty string does not exist.
+ * ------------------------------------------------------------------ */
+static void aowl_ov_group_title(const AowlOvSItem* si, const char* base,
+                                char* out, int32_t cap) {
+    const char* rest = si->path;
+    int32_t n = 0;
+    if (base && base[0] && aowl_ov_path_under(si->path, base)) {
+        rest = si->path + strlen(base);
+        if (*rest == '/') rest++;
+    }
+    if (!rest[0]) {
+        /* Directly at the selected node: name it after that node rather than
+         * printing nothing. */
+        aowl_ov_copy(out, cap, base && base[0] ? aowl_ov_path_leaf(base)
+                                               : "General");
+        return;
+    }
+    for (; *rest && n < cap - 4; rest++) {
+        if (*rest == '/') { out[n++] = ' '; out[n++] = '>'; out[n++] = ' '; }
+        else out[n++] = *rest;
+    }
+    out[n] = 0;
+    if (!out[0]) aowl_ov_copy(out, cap, "General");
+}
+
+/* The group two adjacent rows belong to, for deciding where a header goes. A
+ * header is drawn whenever this changes -- and always before the first row. */
+static int32_t aowl_ov_same_group(const AowlOvSItem* a, const AowlOvSItem* b) {
+    return strcmp(a->path, b->path) == 0;
 }
 
 /* The settings screen's keyboard. Text and keybind capture take a key before
@@ -4379,7 +5583,143 @@ static int32_t aowl_ov_settings_rows(float bodyH) {
  * either the render thread's own cursor or a snapshot row it then POSTs. */
 static void aowl_ov_settings_key(LONG vk, int32_t page) {
     int32_t n = g_ov.sItemCount;
-    AowlOvSItem* si = (g_ov.selItem >= 0 && g_ov.selItem < n)
+    /* The sub-tab the draw is showing. Falls back to the whole page before the
+     * first frame has run, when the bounds are still zero. */
+    int32_t lo = g_ov.viewLo, hi = g_ov.viewHi;
+    AowlOvSItem* si;
+    if (hi <= lo || hi > n) { lo = 0; hi = n; }
+
+    /* ================================================================
+     * THE FOCUS MODEL, stated once, here, because it is now the rule for
+     * TWO text fields rather than one.
+     *
+     * There are exactly THREE things that can own the keyboard, and never more
+     * than one at a time:
+     *
+     *   1. THE SEARCH BOX          -- `searchFocus`
+     *   2. A ROW EDITOR            -- `editItem >= 0`; a string, a keybind
+     *                                 capture, or the new number box
+     *   3. THE LIST                -- neither of the above; the default
+     *
+     * The transitions, all of them:
+     *
+     *   list  -> search    `/`, or a click in the box. Closes any row editor.
+     *   list  -> editor    SPACE/ENTER on an editable row, or a click on its
+     *                      value cell. Clears `searchFocus`.
+     *   search-> list      ESC (clears the term), or ENTER/TAB/DOWN (keeps it).
+     *   search-> editor    NOT DIRECTLY. Leave the box first; there is no
+     *                      gesture that opens an editor while the box is
+     *                      focused, so the two can never both be up.
+     *   editor-> list      ESC (abandons), or ENTER (commits). A click in the
+     *                      search box also abandons it -- see the draw.
+     *
+     * ESC NEVER CLOSES THE PANEL from either field; it returns the keyboard to
+     * the list, and only an ESC that the LIST receives closes the panel. That
+     * is confirmed working and is deliberately unchanged here.
+     *
+     * WHY THE INVARIANT IS ENFORCED RATHER THAN MAINTAINED: `searchFocus` is
+     * tested first below, so if both were ever set the field drawing a caret
+     * would not be the field receiving keys -- silent, and indistinguishable
+     * from a dead keyboard. Rather than trust every transition above to have
+     * cleared the other, the impossible state is CORRECTED here, once, at the
+     * only place both are read. If it is ever entered, the row editor wins:
+     * it is the more recent and the more destructive to lose.
+     *
+     * AND WHY EVERY SHORTCUT IS A FUNCTION KEY: F2, F8, F9, F10, F11, F12 are
+     * handled in `aowl_ov_keys` BEFORE this function is reached, so no field on
+     * this screen can eat one. A shortcut a text field can swallow is not a
+     * shortcut -- that is the whole lesson of `-`/`=`, and adding a second text
+     * field is exactly when it would have been re-learned the hard way.
+     * ================================================================ */
+    if (g_ov.searchFocus && g_ov.editItem >= 0) g_ov.searchFocus = 0;
+
+    /* --- the search box owns the keyboard while it has focus -------------
+     *
+     * Checked FIRST, before the edit-in-progress branch and before navigation,
+     * because a text field that lets some of its characters through to a
+     * shortcut is a text field the player cannot type in. ESC gives the
+     * keyboard back and clears the term -- one key to undo the whole gesture;
+     * ENTER and DOWN keep the term and move into the results, which is what
+     * makes it keyboard-drivable end to end. */
+    if (g_ov.searchFocus) {
+        int32_t L;
+        char ch;
+        if (vk == VK_ESCAPE) {
+            g_ov.search[0] = 0; g_ov.searchFocus = 0; return;
+        }
+        if (vk == VK_RETURN || vk == VK_DOWN || vk == VK_TAB) {
+            g_ov.searchFocus = 0;
+            return;
+        }
+        if (vk == VK_BACK) {
+            L = (int32_t)strlen(g_ov.search);
+            if (L > 0) g_ov.search[L - 1] = 0;
+            return;
+        }
+        ch = aowl_ov_vk_char(vk);
+        if (ch) {
+            /* LOWER CASE. `aowl_ov_vk_char` returns the virtual key, which for
+             * a letter is its capital -- so typing `regen` put `REGEN` in the
+             * box. The match is case-insensitive either way, so this changes
+             * nothing about what is found and everything about whether the
+             * field looks like it is working: a text box that shouts back what
+             * you typed reads as broken. The string editor keeps the old
+             * behaviour, because there the case is the VALUE. */
+            if (ch >= 0x41 && ch <= 0x5A) ch = (char)(ch + 32);
+            L = (int32_t)strlen(g_ov.search);
+            if (L < (int32_t)sizeof(g_ov.search) - 1) {
+                g_ov.search[L] = ch; g_ov.search[L + 1] = 0;
+            }
+        }
+        return;
+    }
+    /* `/` puts the keyboard in the box. The box itself is ALWAYS on screen --
+     * this is a focus key, not a summon key. */
+    if (vk == VK_OEM_2 && g_ov.editItem < 0) { g_ov.searchFocus = 1; return; }
+
+    /* --- moving inside a result list ------------------------------------
+     *
+     * With a term up, the rows on screen are `filt`, not a contiguous range, so
+     * up and down step through `filt` and ENTER leaves the results at the row
+     * it landed on: the term is cleared and the nav is pointed at that row`s
+     * own group, which is the "jump to it" half of the gesture. `selItem` stays
+     * an ITEM index throughout, exactly as it does for sub-tabs, so every edit
+     * path below is untouched by search as well. */
+    if (aowl_ov_searching() && g_ov.editItem < 0) {
+        int32_t at = aowl_ov_filt_pos(g_ov.selItem);
+        if (g_ov.filtCount > 0 &&
+            (vk == VK_UP || vk == VK_DOWN || vk == VK_PRIOR ||
+             vk == VK_NEXT || vk == VK_HOME || vk == VK_END ||
+             vk == VK_RETURN)) {
+            if (at < 0) at = 0;
+            if (vk == VK_UP)    at--;
+            if (vk == VK_DOWN)  at++;
+            if (vk == VK_PRIOR) at -= page;
+            if (vk == VK_NEXT)  at += page;
+            if (vk == VK_HOME)  at = 0;
+            if (vk == VK_END)   at = g_ov.filtCount - 1;
+            if (at < 0) at = 0;
+            if (at >= g_ov.filtCount) at = g_ov.filtCount - 1;
+            g_ov.selItem = g_ov.filt[at];
+            if (vk == VK_RETURN) {
+                /* Land on the row IN ITS GROUP: the deepest nav node that
+                 * contains it, so the breadcrumb after the jump says where the
+                 * player now is rather than leaving them at "the whole page". */
+                int32_t c, best = -1;
+                for (c = 0; c < g_ov.sCatCount; c++)
+                    if (g_ov.selItem >= g_ov.sCats[c].lo &&
+                        g_ov.selItem < g_ov.sCats[c].hi &&
+                        (best < 0 || g_ov.sCats[c].depth > g_ov.sCats[best].depth))
+                        best = c;
+                g_ov.selCat = best;
+                g_ov.search[0] = 0;
+                g_ov.topItem = g_ov.selItem;
+            }
+            return;
+        }
+        if (vk == VK_ESCAPE) { g_ov.search[0] = 0; return; }
+    }
+    si = (g_ov.selItem >= 0 && g_ov.selItem < n)
                         ? &g_ov.sItems[g_ov.selItem] : NULL;
     int32_t canEdit = si && si->implemented && g_ov.curPageIsMod &&
                       si->kind != AOWL_S_NESTED;
@@ -4422,20 +5762,100 @@ static void aowl_ov_settings_key(LONG vk, int32_t page) {
             }
             return;
         }
+        /* THE NUMBER BOX. Same shape as the string editor above -- ENTER
+         * commits, ESC abandons, BACKSPACE deletes -- and the only differences
+         * are that it takes digits rather than letters and that what it commits
+         * is CLAMPED and RE-FORMATTED.
+         *
+         * The clamp is the point. A typed value is the one place the player can
+         * name a number outside the declared range, and the row must not end up
+         * showing a value the file will not hold. So the committed text is
+         * produced by `aowl_ov_s_fmt_num` from the CLAMPED float rather than
+         * from the buffer, which also means `3.` and `007` come back as `3` and
+         * `7` -- the row shows what was stored, never what was typed at it.
+         *
+         * An unparseable buffer (empty, or just `-`) is a CANCEL, not a write
+         * of zero. Storing 0 because somebody cleared the field and pressed
+         * ENTER is a silent destructive edit. */
+        if (e->kind == AOWL_S_INT || e->kind == AOWL_S_FLOAT) {
+            char ch;
+            int32_t L;
+            if (vk == VK_RETURN) {
+                const char* b = g_ov.editBuf;
+                char* fin = NULL;
+                double d = strtod(b, &fin);
+                g_ov.editItem = -1;
+                if (!fin || fin == b || !aowl_ov_finite((float)d)) return;
+                if (e->hasRange) {
+                    if (d < (double)e->lo) d = (double)e->lo;
+                    if (d > (double)e->hi) d = (double)e->hi;
+                }
+                aowl_ov_s_fmt_num(e, (float)d);
+                aowl_ov_s_commit(e);
+                return;
+            }
+            if (vk == VK_ESCAPE) { g_ov.editItem = -1; return; }
+            if (vk == VK_BACK) {
+                L = (int32_t)strlen(g_ov.editBuf);
+                if (L > 0) g_ov.editBuf[L - 1] = 0;
+                return;
+            }
+            ch = aowl_ov_vk_numchar(vk);
+            if (ch) {
+                L = (int32_t)strlen(g_ov.editBuf);
+                if (L < (int32_t)sizeof(g_ov.editBuf) - 1) {
+                    g_ov.editBuf[L] = ch; g_ov.editBuf[L + 1] = 0;
+                }
+            }
+            /* Everything else is SWALLOWED. A number field that lets the arrow
+             * keys through would move the row cursor out from under its own
+             * edit -- and the edit would then commit onto a different setting.
+             * The only keys that escape a focused field on this screen are the
+             * function keys, which `aowl_ov_keys` takes before this runs. */
+            return;
+        }
     }
 
     /* --- navigation ------------------------------------------------------ */
-    if (vk == VK_UP   || vk == 'W') { if (g_ov.selItem > 0) g_ov.selItem--; return; }
-    if (vk == VK_DOWN || vk == 'S') { if (g_ov.selItem < n - 1) g_ov.selItem++; return; }
-    if (vk == VK_PRIOR) { g_ov.selItem -= page; if (g_ov.selItem < 0) g_ov.selItem = 0; return; }
+    if (vk == VK_UP   || vk == 'W') { if (g_ov.selItem > lo) g_ov.selItem--; return; }
+    if (vk == VK_DOWN || vk == 'S') { if (g_ov.selItem < hi - 1) g_ov.selItem++; return; }
+    if (vk == VK_PRIOR) { g_ov.selItem -= page; if (g_ov.selItem < lo) g_ov.selItem = lo; return; }
     if (vk == VK_NEXT)  { g_ov.selItem += page;
-                          if (g_ov.selItem > n - 1) g_ov.selItem = n - 1;
-                          if (g_ov.selItem < 0) g_ov.selItem = 0; return; }
-    if (vk == VK_HOME) { g_ov.selItem = 0; return; }
-    if (vk == VK_END)  { g_ov.selItem = n > 0 ? n - 1 : 0; return; }
+                          if (g_ov.selItem > hi - 1) g_ov.selItem = hi - 1;
+                          if (g_ov.selItem < lo) g_ov.selItem = lo; return; }
+    if (vk == VK_HOME) { g_ov.selItem = lo; return; }
+    if (vk == VK_END)  { g_ov.selItem = hi > lo ? hi - 1 : lo; return; }
+    /* `,` and `.` walk the nav TREE of the page already selected, in the same
+     * flattened order the nav draws -- so at arbitrary depth, and including
+     * back out to "the whole page" at -1. A 802-row page is reachable from the
+     * keyboard without the mouse. A page with one group draws no tree and these
+     * do nothing. */
+    if (vk == VK_OEM_COMMA || vk == VK_OEM_PERIOD) {
+        if (g_ov.sCatCount > 1) {
+            g_ov.selCat += (vk == VK_OEM_PERIOD) ? 1 : -1;
+            if (g_ov.selCat < -1) g_ov.selCat = g_ov.sCatCount - 1;
+            if (g_ov.selCat >= g_ov.sCatCount) g_ov.selCat = -1;
+            g_ov.selItem = (g_ov.selCat >= 0) ? g_ov.sCats[g_ov.selCat].lo : 0;
+            g_ov.topItem = g_ov.selItem;
+        }
+        return;
+    }
+    /* `+`/`-` on the NUMBER PAD open and close the selected branch, and so do
+     * the arrow keys when the cursor is on a node: RIGHT opens, LEFT closes and
+     * then steps out to the parent. That is what every tree on this platform
+     * does, and it is the keyboard half of the disclosure markers -- a tree you
+     * can only expand with the mouse is not usable by somebody driving this
+     * from the keyboard, which is most of the point of the panel. */
+    if ((vk == VK_ADD || vk == VK_SUBTRACT) && g_ov.selCat >= 0 &&
+        g_ov.selCat < g_ov.sCatCount) {
+        g_ov.navOpen[g_ov.selCat] = (vk == VK_ADD);
+        return;
+    }
     if (vk == VK_TAB) {
-        if (g_ov.sPageCount > 0)
+        if (g_ov.sPageCount > 0) {
             g_ov.selPage = (g_ov.selPage + 1) % g_ov.sPageCount;
+            g_ov.pageOpen[g_ov.selPage] = 1;
+        }
         return;
     }
     if (vk == VK_OEM_4) { if (g_ov.selPage > 0) g_ov.selPage--; return; }          /* [ */
@@ -4465,13 +5885,23 @@ static void aowl_ov_settings_key(LONG vk, int32_t page) {
         } else if (si->kind == AOWL_S_STRING) {
             g_ov.editItem = g_ov.selItem; g_ov.capturing = 0;
             aowl_ov_copy(g_ov.editBuf, (int32_t)sizeof(g_ov.editBuf), si->value);
+        } else if (si->kind == AOWL_S_INT || si->kind == AOWL_S_FLOAT) {
+            /* The keyboard half of click-to-type, so the value box is reachable
+             * without the mouse like everything else on this screen. */
+            g_ov.editItem = g_ov.selItem; g_ov.capturing = 0;
+            g_ov.dragItem = -1;
+            aowl_ov_copy(g_ov.editBuf, (int32_t)sizeof(g_ov.editBuf), si->value);
         }
         return;
     }
 }
 
 static void aowl_ov_view_settings(float x, float y, float w, float bodyH) {
-    const float leftW = 208.0f;
+    /* Wider than the flat two-level list needed. A tree spends its left edge
+     * on depth, and a nav that indents four levels into a 208-wide column has
+     * ~14 characters left for the name -- which is how "Regeneration" became
+     * "Regenera.." and every deep node started looking like every other. */
+    const float leftW = 256.0f;
     float rx = x + (float)AOWL_OV_PAD + leftW + 12.0f;
     float rrEdge = x + w + (float)AOWL_OV_PAD;       /* right inner edge */
     float rw = rrEdge - rx;
@@ -4487,7 +5917,40 @@ static void aowl_ov_view_settings(float x, float y, float w, float bodyH) {
     AowlOvSPage* P;
     int32_t loaded;
     float ny, cy;
+    /* The flattened two-level nav for this frame. Automatic, not state: it is
+     * derived from `sPages`/`sCats`/`selPage` every frame and nothing outside
+     * this function ever reads it. ~576 bytes of stack. */
+    int32_t navPage[AOWL_OV_MAX_NAV];
+    int32_t navCat[AOWL_OV_MAX_NAV];
+    int32_t navCount = 0, navSel = 0;
+    int32_t lo = 0, hi = 0;
+    /* The selected node`s full path, at function scope: the flattening uses it
+     * to decide what to expand and the row drawing uses it to decide whether a
+     * node`s marker reads `-` (open) or `+` (closed). Two computations of "is
+     * this node on the path to the selection" would be two chances to disagree,
+     * and a tree whose markers disagree with its own expansion is worse than
+     * one with no markers. */
+    char navSelFull[160];
     if (navRows < 1) navRows = 1;
+    /* THE WRITE SLOT, once per frame, before anything else can arm it again.
+     * One integer compare when nothing is held. */
+    aowl_ov_s_flush_tick();
+    /* A DRAG ENDS WHEN THE BUTTON IS UP, wherever the row is.
+     *
+     * This used to live inside the row-draw branch, which meant it only ran
+     * while the dragged row was still on screen AND still editable. Release the
+     * button after the list has scrolled -- or over the nav, or outside the
+     * window -- and `dragItem` stayed set: the next click anywhere near a
+     * slider resumed a drag the player thought they had finished. Ending it
+     * here, from the state the wndproc publishes, has no such precondition. */
+    if (!g_ov.mouseHeld) g_ov.dragItem = -1;
+    /* The expansion state belongs to the page that is loaded; a stale index
+     * would expand whatever now sits at it. */
+    aowl_ov_nav_reset_if_page_changed();
+    navSelFull[0] = 0;
+    if (g_ov.selCat >= 0 && g_ov.selCat < g_ov.sCatCount)
+        aowl_ov_copy(navSelFull, (int32_t)sizeof(navSelFull),
+                     g_ov.sCats[g_ov.selCat].full);
 
     /* --- keep the page cursor sane and request its controls once ---------- */
     if (g_ov.selPage >= pc) g_ov.selPage = pc > 0 ? pc - 1 : 0;
@@ -4495,8 +5958,18 @@ static void aowl_ov_view_settings(float x, float y, float w, float bodyH) {
     if (pc > 0) {
         P = &g_ov.sPages[g_ov.selPage];
         if (strcmp(g_ov.curPage, P->id) != 0) {
+            /* Leaving a page must not abandon an edit made on it a moment ago.
+             * Flushed BEFORE `sItemsPage` moves, so the write still carries the
+             * page it was made on. */
+            aowl_ov_s_flush_now();
             aowl_ov_copy(g_ov.curPage, (int32_t)sizeof(g_ov.curPage), P->id);
             g_ov.curPageIsMod = P->isMod;
+            /* A page you have just moved to is OPEN. The alternative -- landing
+             * on a page whose tree is shut -- reads as a page with nothing in
+             * it, which is the worst possible first impression of a screen
+             * whose whole job is to show you 802 settings. */
+            g_ov.pageOpen[g_ov.selPage] = 1;
+            g_ov.selCat = -1;
             g_ov.selItem = 0; g_ov.topItem = 0;
             g_ov.editItem = -1; g_ov.capturing = 0; g_ov.dragItem = -1;
             aowl_ov_queue_spage(P->id, P->isMod);
@@ -4504,10 +5977,88 @@ static void aowl_ov_view_settings(float x, float y, float w, float bodyH) {
     }
 
     /* --- the left nav ----------------------------------------------------- */
-    if (g_ov.topPage > g_ov.selPage) g_ov.topPage = g_ov.selPage;
-    if (g_ov.selPage - g_ov.topPage >= navRows)
-        g_ov.topPage = g_ov.selPage - navRows + 1;
-    if (g_ov.topPage > pc - navRows) g_ov.topPage = pc - navRows;
+    /* The nav is flattened here, once per frame, into "a page row" or "a group
+     * row of the selected page". One loop, any depth: the alternative was a
+     * second loop with its own scroll, its own hit testing and its own
+     * off-by-one, for a list that is at most AOWL_OV_MAX_NAV rows.
+     *
+     * A group row is shown when it is TOP LEVEL, or when its parent is on the
+     * path from the root to the selection -- the ordinary expand-along-the-
+     * selection tree. That is what keeps the nav to a screenful on a page with
+     * a deep tree while leaving every node reachable: to get to any node you
+     * walk down through its ancestors, each of which is visible by the time you
+     * are at its parent. The nodes are already in path order (`build_cats`
+     * emits them as it walks the sorted rows), so the flattening is one pass
+     * and children sit directly under their parent with no sorting here. */
+    {
+        int32_t k;
+        navCount = 0;
+        for (k = 0; k < pc && navCount < AOWL_OV_MAX_NAV; k++) {
+            navPage[navCount] = k; navCat[navCount] = -1; navCount++;
+            if (k == g_ov.selPage && g_ov.pageOpen[k] && g_ov.sCatCount > 1 &&
+                strcmp(g_ov.sItemsPage, g_ov.sPages[k].id) == 0 &&
+                !g_ov.sItemsErr) {
+                int32_t c;
+                /* A node is on screen when EVERY ancestor of it is open, not
+                 * merely its parent. `vis[c]` carries that down the list, which
+                 * works in one pass because `build_cats` emits nodes in path
+                 * order, so a parent is always decided before its children.
+                 *
+                 * Testing only the parent looks right and is not: closing
+                 * `Player` while `Player/Health` was open left
+                 * `Player/Health/Regeneration` on screen -- a grandchild of a
+                 * collapsed branch, floating under nothing. Measured, not
+                 * reasoned: the nav read back `Regeneration` at x=114 with
+                 * `Health` gone from the same column. */
+                int32_t vis[AOWL_OV_MAX_SCATS];
+                for (c = 0; c < g_ov.sCatCount && navCount < AOWL_OV_MAX_NAV; c++) {
+                    AowlOvSCat* C = &g_ov.sCats[c];
+                    int32_t show;
+                    if (C->depth == 1) show = 1;
+                    else if (C->parent >= 0 && C->parent < g_ov.sCatCount)
+                        show = vis[C->parent] &&
+                               aowl_ov_nav_open(C->parent, navSelFull);
+                    else show = 0;
+                    vis[c] = show;
+                    if (!show) continue;
+                    navPage[navCount] = k; navCat[navCount] = c; navCount++;
+                }
+            }
+        }
+    }
+    /* WHERE THE CURSOR IS IN THE FLATTENED LIST -- computed HERE, after the
+     * flattening, because that is when the list exists.
+     *
+     * It used to run BEFORE it, against `navCount == 0`: both loops ran zero
+     * times, `navSel` fell through to its `0` default every single frame, and
+     * row 0 -- the PAGE -- was drawn selected no matter what was actually
+     * chosen. That is the whole of "it only shows Singleplayer as selected
+     * even if you click a sub-page": the tree knew the answer and the answer
+     * was being overwritten by a fallback before anything could read it.
+     *
+     * Found by counting highlighted rows on the back buffer, not by reading
+     * this code -- the ordering is invisible until you ask the screen. */
+    {
+        int32_t k;
+        navSel = -1;
+        for (k = 0; k < navCount; k++)
+            if (navPage[k] == g_ov.selPage && navCat[k] == g_ov.selCat) {
+                navSel = k; break;
+            }
+        /* No exact row: the group is not drawn yet because the page is still
+         * loading, or it sits inside a branch the player has collapsed. Fall
+         * back to the PAGE's own row rather than to zero -- zero would scroll
+         * the nav to the top for as long as a fetch takes, which reads as the
+         * nav resetting itself. */
+        if (navSel < 0)
+            for (k = 0; k < navCount; k++)
+                if (navPage[k] == g_ov.selPage) { navSel = k; break; }
+        if (navSel < 0) navSel = 0;
+    }
+    if (g_ov.topPage > navSel) g_ov.topPage = navSel;
+    if (navSel - g_ov.topPage >= navRows)
+        g_ov.topPage = navSel - navRows + 1;
+    if (g_ov.topPage > navCount - navRows) g_ov.topPage = navCount - navRows;
     if (g_ov.topPage < 0) g_ov.topPage = 0;
 
     aowl_ov_text(x + (float)AOWL_OV_PAD, y, "pages", AOWL_OV_FAINT);
@@ -4515,36 +6066,211 @@ static void aowl_ov_view_settings(float x, float y, float w, float bodyH) {
     ny = y + (float)AOWL_OV_LINE_H;
     if (pc == 0) {
         aowl_ov_wrap(x + (float)AOWL_OV_PAD, ny,
-                     g_ov.backendPort > 0
-                       ? "no pages yet -- waiting for the backend to describe "
-                         "the mod and SPT settings surface"
-                       : "no pages -- the settings screen needs a backend to "
-                         "read the schema from",
-                     AOWL_OV_DIM, 24, 4);
+                     g_ov.backendPort <= 0
+                       ? "no pages -- the settings screen needs a backend to "
+                         "read the schema from"
+                       : (g_ov.sIdxWhy[0]
+                            ? g_ov.sIdxWhy
+                            : "no pages yet -- waiting for the settings index"),
+                     AOWL_OV_DIM, 24, 6);
     }
-    for (i = 0; i < navRows && g_ov.topPage + i < pc; i++) {
+    for (i = 0; i < navRows && g_ov.topPage + i < navCount; i++) {
         int32_t at = g_ov.topPage + i;
-        AowlOvSPage* Q = &g_ov.sPages[at];
+        int32_t pi = navPage[at], ci = navCat[at];
+        AowlOvSPage* Q = &g_ov.sPages[pi];
         int32_t hot = aowl_ov_hit(x + 1.0f, ny, leftW + (float)AOWL_OV_PAD,
                                   (float)AOWL_OV_ROW_H);
         uint32_t col;
-        if (at == g_ov.selPage)
+        if (at == navSel)
             aowl_ov_rect(x + 1.0f, ny, leftW + (float)AOWL_OV_PAD,
                          (float)AOWL_OV_ROW_H, AOWL_OV_SELBG);
         else if (hot)
             aowl_ov_rect(x + 1.0f, ny, leftW + (float)AOWL_OV_PAD,
                          (float)AOWL_OV_ROW_H, AOWL_OV_ROWALT);
-        /* Mods read in the panel's text colour; the SPT surface -- none of it
-         * backed yet -- is dimmed, which is the same "not running" language the
-         * manager uses. */
-        col = Q->isMod ? AOWL_OV_TEXT : AOWL_OV_DIM;
-        aowl_ov_textn(x + (float)AOWL_OV_PAD, ny + 3.0f,
-                      Q->label, col, (int32_t)((leftW - 24.0f) / AOWL_OV_CW));
-        if (!Q->isMod)
-            aowl_ov_text(x + (float)AOWL_OV_PAD + leftW - 18.0f, ny + 3.0f,
-                         "NI", AOWL_OV_WARN);
+        if (ci < 0) {
+            /* Mods read in the panel's text colour; the SPT surface -- none of
+             * it backed yet -- is dimmed, which is the same "not running"
+             * language the manager uses. */
+            col = Q->isMod ? AOWL_OV_TEXT : AOWL_OV_DIM;
+            /* A page is the ROOT of the tree below it, so it is separated from
+             * the previous page`s branch by a hairline rather than by nothing.
+             * Without it a collapsed tree and a list of pages look identical. */
+            if (at > g_ov.topPage)
+                aowl_ov_rect(x + 1.0f, ny, leftW + (float)AOWL_OV_PAD, 1.0f,
+                             AOWL_OV_EDGE);
+            {
+                /* A DISCLOSURE MARKER, and it is its own click target:
+                 * pressing it opens or closes the page WITHOUT selecting it,
+                 * which is what makes the tree browsable. Before this the top
+                 * node could not be collapsed at all, so 802 settings across
+                 * four levels sat permanently in front of every other page. */
+                char lbl[96];
+                int32_t kids = Q->isMod && pi == g_ov.selPage &&
+                               g_ov.sCatCount > 1 &&
+                               strcmp(g_ov.sItemsPage, Q->id) == 0;
+                float mw = 2.0f * AOWL_OV_CW;
+                int32_t hotM = kids && aowl_ov_hit(x + 1.0f, ny,
+                                                   mw + (float)AOWL_OV_PAD,
+                                                   (float)AOWL_OV_ROW_H);
+                aowl_ov_fmt(lbl, (int32_t)sizeof(lbl), "%s%s",
+                            !kids ? "  " : (g_ov.pageOpen[pi] ? "- " : "+ "),
+                            Q->label);
+                aowl_ov_textn(x + (float)AOWL_OV_PAD, ny + 3.0f, lbl, col,
+                              (int32_t)((leftW - 34.0f) / AOWL_OV_CW));
+                if (hotM && g_ov.clickDown) {
+                    g_ov.pageOpen[pi] = !g_ov.pageOpen[pi];
+                    InterlockedExchange(&g_ov.clickDown, 0);
+                }
+            }
+            if (!Q->isMod)
+                aowl_ov_text(x + (float)AOWL_OV_PAD + leftW - 18.0f, ny + 3.0f,
+                             "NI", AOWL_OV_WARN);
+        } else {
+            /* A GROUP, and the whole job of this branch is that its DEPTH is
+             * readable without counting leading spaces.
+             *
+             * Four things carry it, and they were all missing when every level
+             * was drawn in one colour at two spaces of indent:
+             *
+             *  1. TREE GUIDES. A hairline column under each ancestor level and
+             *     an elbow into the label. Rules, not glyphs: `|` and `+--` in
+             *     an 8x16 bitmap font are as heavy as the text and read as
+             *     content. A 1px rule reads as structure. Bounded by
+             *     AOWL_OV_MAX_DEPTH, so at most twelve rects on a row.
+             *  2. DEPTH IN THE COLOUR. Top level in the panel`s text colour,
+             *     the level below dim, everything deeper faint -- so a glance
+             *     down the column sorts the levels without reading any of them.
+             *  3. AN EXPAND MARKER THAT MEANS SOMETHING. It used to be `+` on
+             *     every node with children, expanded or not, which is a marker
+             *     that says nothing. `-` now means "open, its children are the
+             *     rows below", `+` means "closed, there is more in here", and a
+             *     leaf has neither.
+             *  4. AN ACCENT BAR on the selected row, at the left edge, so
+             *     "where am I" is answered by a shape rather than by a shade of
+             *     blue behind a row of text.
+             *
+             * Indent is three characters a level, not two, and is capped so the
+             * name always keeps at least 14 columns -- past that the indent has
+             * stopped conveying depth and started eating the only thing that
+             * identifies the node. */
+            AowlOvSCat* C = &g_ov.sCats[ci];
+            char sub[128];
+            int32_t d = C->depth < 1 ? 1 : C->depth;
+            int32_t hasKids = (C->hi - C->lo) > C->direct;
+            int32_t open = hasKids && aowl_ov_path_under(navSelFull, C->full);
+            /* THE PAGE IS LEVEL 0 OF THIS TREE, and that is the fix.
+             *
+             * `ind` was `(d - 1) * step`, so a depth-1 group was drawn at
+             * indent ZERO -- the same x as the PAGE row above it, which is
+             * drawn at `x + AOWL_OV_PAD` with an identical two-character
+             * marker prefix. The two were pixel-aligned. The guide loop
+             * (`g = 1; g < d`) ran zero times at d == 1 and the elbow was
+             * behind `if (d > 1)`, so the first level of nesting got no rule,
+             * no elbow and no offset: "Singleplayer" and the group inside it
+             * were indistinguishable, exactly as reported. Depths 2, 3 and 4
+             * all worked, which is why this looked like a tree with one level
+             * missing rather than a tree with a wrong origin.
+             *
+             * Indenting by `d * step` instead makes the page the root and every
+             * group its descendant, so depth 1 gets the same three marks every
+             * other level gets -- a rule under its parent, an elbow into its
+             * label, and an offset from it. Nothing else moves. */
+            float step = 3.0f * AOWL_OV_CW;
+            float ind = (float)d * step;
+            float lx, room;
+            uint32_t lblCol;
+            if (ind > leftW - 14.0f * AOWL_OV_CW - 30.0f)
+                ind = leftW - 14.0f * AOWL_OV_CW - 30.0f;
+            if (ind < 0.0f) ind = 0.0f;
+            lx = x + (float)AOWL_OV_PAD + ind;
+            /* The guides: one vertical rule per ancestor level -- the page
+             * itself is one of them now, at g == 0 -- then an elbow into this
+             * row`s own label. */
+            {
+                int32_t g;
+                for (g = 0; g < d; g++) {
+                    float gx = x + (float)AOWL_OV_PAD + (float)g * step + 3.0f;
+                    if (gx >= lx) break;
+                    aowl_ov_rect(gx, ny, 1.0f, (float)AOWL_OV_ROW_H,
+                                 AOWL_OV_FAINT);
+                }
+                {
+                    float ex = x + (float)AOWL_OV_PAD + (float)(d - 1) * step
+                               + 3.0f;
+                    if (ex < lx - 2.0f)
+                        aowl_ov_rect(ex, ny + (float)AOWL_OV_ROW_H / 2.0f,
+                                     lx - ex - 2.0f, 1.0f, AOWL_OV_FAINT);
+                }
+            }
+            /* WHERE YOU ARE, in three marks, because one was not enough:
+             * clicking a sub-page used to leave the PAGE row looking selected
+             * and the sub-page looking like every other node, so the tree knew
+             * the answer and did not show it.
+             *
+             *  * the SELECTED node keeps the full-width highlight drawn above
+             *    and gets a solid accent bar;
+             *  * every ANCESTOR of it gets a half-height accent tick, so the
+             *    branch you are inside reads as the active path;
+             *  * everything else gets neither.
+             *
+             * All three come from the same `navSelFull` the flattening, the
+             * markers and the breadcrumb use, so they cannot disagree about
+             * which node is current. */
+            {
+                int32_t isSel = (at == navSel);
+                int32_t onPath = !isSel && navSelFull[0] &&
+                                 aowl_ov_path_under(navSelFull, C->full);
+                if (isSel)
+                    aowl_ov_rect(x + 1.0f, ny, 3.0f, (float)AOWL_OV_ROW_H,
+                                 AOWL_OV_ACCENT);
+                else if (onPath)
+                    aowl_ov_rect(x + 1.0f, ny + 5.0f, 3.0f,
+                                 (float)(AOWL_OV_ROW_H - 10), AOWL_OV_HOT);
+                lblCol = (isSel || onPath) ? AOWL_OV_TEXT
+                       : (d == 1) ? AOWL_OV_TEXT
+                       : (d == 2) ? AOWL_OV_DIM : AOWL_OV_FAINT;
+            }
+            room = leftW - 34.0f - ind;
+            if (room < 8.0f * AOWL_OV_CW) room = 8.0f * AOWL_OV_CW;
+            aowl_ov_fmt(sub, (int32_t)sizeof(sub), "%s%s",
+                        !hasKids ? "  " : (open ? "- " : "+ "), C->label);
+            aowl_ov_textn(lx, ny + 3.0f, sub, lblCol,
+                          (int32_t)(room / AOWL_OV_CW));
+            /* The marker is its own click target -- two characters wide, at
+             * this node`s own indent -- so a branch can be opened without
+             * being selected and selected without being opened. */
+            if (hasKids && aowl_ov_hit(lx, ny, 2.0f * AOWL_OV_CW,
+                                       (float)AOWL_OV_ROW_H) &&
+                g_ov.clickDown) {
+                g_ov.navOpen[ci] = !aowl_ov_nav_open(ci, navSelFull);
+                /* Closing the branch the selection is inside would hide the
+                 * selection, so the selection comes UP to the node being
+                 * closed rather than disappearing off the tree. */
+                if (!g_ov.navOpen[ci] && navSelFull[0] &&
+                    aowl_ov_path_under(navSelFull, C->full) &&
+                    strcmp(navSelFull, C->full) != 0) {
+                    g_ov.selCat = ci;
+                    g_ov.selItem = C->lo;
+                    g_ov.topItem = C->lo;
+                }
+                InterlockedExchange(&g_ov.clickDown, 0);
+            }
+            aowl_ov_fmt(sub, (int32_t)sizeof(sub), "%d", C->hi - C->lo);
+            aowl_ov_text(x + (float)AOWL_OV_PAD + leftW - 30.0f, ny + 3.0f,
+                         sub, AOWL_OV_FAINT);
+        }
         if (hot && g_ov.clickDown) {
-            g_ov.selPage = at;
+            g_ov.selPage = pi;
+            g_ov.selCat = ci;
+            /* Selecting reveals: picking a page opens it, picking a node opens
+             * it. A click that selects something and shows nothing new reads
+             * as a click that did nothing at all. */
+            g_ov.pageOpen[pi] = 1;
+            if (ci >= 0) {
+                g_ov.navOpen[ci] = 1;
+                g_ov.selItem = g_ov.sCats[ci].lo;
+                g_ov.topItem = g_ov.selItem;
+            }
             InterlockedExchange(&g_ov.clickDown, 0);
         }
         ny += (float)AOWL_OV_ROW_H;
@@ -4565,10 +6291,73 @@ static void aowl_ov_view_settings(float x, float y, float w, float bodyH) {
             aowl_ov_fmt(hdr, (int32_t)sizeof(hdr), "%s   loading...", P->label);
             aowl_ov_textn(rx, cy, hdr, AOWL_OV_DIM, rcols);
         } else if (P->isMod) {
-            aowl_ov_fmt(hdr, (int32_t)sizeof(hdr),
-                        "%s   --   %d settings, %d implemented", P->label,
-                        g_ov.sItemCount, g_ov.sItemsImpl);
-            aowl_ov_textn(rx, cy, hdr, AOWL_OV_ACCENT, rcols);
+            if (g_ov.selCat >= 0 && g_ov.selCat < g_ov.sCatCount) {
+                /* THE BREADCRUMB. Built by walking `parent` up from the
+                 * selected node, so it is the tree`s own structure printed out
+                 * rather than a second derivation of it -- if the walk did not
+                 * terminate at a top-level node the breadcrumb would be short,
+                 * which is exactly what `aowl_ov_cats_wellformed` refuses to
+                 * let happen. Page first, then every ancestor, then the node:
+                 * "Singleplayer > Player > Health > Regeneration". */
+                AowlOvSCat* C = &g_ov.sCats[g_ov.selCat];
+                int32_t chain[AOWL_OV_MAX_DEPTH + 1];
+                int32_t nc = 0, c = g_ov.selCat, k;
+                char crumb[192], tail[96], cnt[48];
+                int32_t room, cw;
+                float bx;
+                while (c >= 0 && c < g_ov.sCatCount && nc <= AOWL_OV_MAX_DEPTH) {
+                    chain[nc++] = c;
+                    c = g_ov.sCats[c].parent;
+                }
+                /* THE BREADCRUMB, IN TWO PIECES, and the split is the point.
+                 *
+                 * As one string clipped on the right, a deep path lost its own
+                 * tail -- "Singleplayer > Player > Health > Regen.." threw away
+                 * the only segment that says where you are and kept the four
+                 * that say where you came from. So the LAST segment is drawn
+                 * separately, in the panel`s brightest colour, and is never
+                 * truncated; the ancestors are dim, and when they do not fit
+                 * they are cut FROM THE LEFT and marked `..`, which is the end
+                 * that carries least.
+                 *
+                 * The count moves to the right edge instead of trailing the
+                 * path, so it stops competing with the name for the same
+                 * pixels and lands in the same place on every page. */
+                aowl_ov_copy(crumb, (int32_t)sizeof(crumb), P->label);
+                for (k = nc - 1; k >= 1; k--) {
+                    int32_t L = (int32_t)strlen(crumb);
+                    _snprintf(crumb + L, sizeof(crumb) - 1 - (size_t)L, " > %s",
+                              g_ov.sCats[chain[k]].label);
+                    crumb[sizeof(crumb) - 1] = 0;
+                }
+                aowl_ov_fmt(tail, (int32_t)sizeof(tail), " > %s", C->label);
+                aowl_ov_fmt(cnt, (int32_t)sizeof(cnt), "%d of %d settings",
+                            C->hi - C->lo, g_ov.sItemCount);
+                cw = (int32_t)strlen(cnt);
+                /* What the ancestors may have: the pane, less the tail, less
+                 * the count and a gap. */
+                room = rcols - (int32_t)strlen(tail) - cw - 4;
+                if (room < 6) room = 6;
+                if ((int32_t)strlen(crumb) > room) {
+                    /* Cut from the LEFT, on a separator where there is one, so
+                     * the crumb never starts mid-word. */
+                    char* from = crumb + (int32_t)strlen(crumb) - (room - 3);
+                    char* sep = strstr(from, "> ");
+                    if (sep) from = sep + 2;
+                    memmove(crumb + 3, from, strlen(from) + 1);
+                    crumb[0] = OV_DOT; crumb[1] = OV_DOT; crumb[2] = OV_SP;
+                }
+                bx = aowl_ov_text(rx, cy, crumb, AOWL_OV_DIM);
+                bx = aowl_ov_text(bx, cy, tail, AOWL_OV_TEXT);
+                aowl_ov_text(rrEdge - (float)cw * AOWL_OV_CW, cy, cnt,
+                             AOWL_OV_FAINT);
+                hdr[0] = 0;
+            } else {
+                aowl_ov_fmt(hdr, (int32_t)sizeof(hdr),
+                            "%s   --   %d settings, %d implemented", P->label,
+                            g_ov.sItemCount, g_ov.sItemsImpl);
+            }
+            if (hdr[0]) aowl_ov_textn(rx, cy, hdr, AOWL_OV_ACCENT, rcols);
         } else {
             aowl_ov_fmt(hdr, (int32_t)sizeof(hdr),
                         "%s   --   %d values, none implemented yet", P->label,
@@ -4578,11 +6367,107 @@ static void aowl_ov_view_settings(float x, float y, float w, float bodyH) {
     }
     cy += (float)AOWL_OV_LINE_H + 2.0f;
 
+    /* --- THE SEARCH BOX -- the primary way into 802 rows ------------------
+     *
+     * Permanent, full width, two lines. It is drawn on every settings frame,
+     * loaded or not, before any early return below -- a search box that
+     * appears only once a page has loaded is a search box the player has to
+     * learn is there. `/` focuses it, clicking it focuses it, ESC clears and
+     * unfocuses, ENTER/DOWN moves into the results.
+     *
+     * The second line says WHAT IT SEARCHED, always: how many rows are on the
+     * page and which fields were looked at. The panel must not leave the
+     * player guessing whether a term that found nothing found nothing because
+     * it is not there or because that field is not searched. */
+    {
+        float bh = (float)AOWL_OV_SEARCH_BOX;
+        int32_t hot = aowl_ov_hit(rx - 2.0f, cy, rw, bh);
+        int32_t on = g_ov.searchFocus;
+        char line[224];
+        aowl_ov_rect(rx - 2.0f, cy, rw, bh,
+                     on ? AOWL_OV_SELBG : (hot ? AOWL_OV_HOT : AOWL_OV_PANEBG));
+        /* A two-pixel frame when focused, one when not: the field says where
+         * the keyboard is going without needing a blinking caret to be read. */
+        aowl_ov_frame_rect(rx - 2.0f, cy, rw, bh, on ? 2.0f : 1.0f,
+                           on ? AOWL_OV_ACCENT : AOWL_OV_EDGE);
+        /* The magnifier stands in for an icon this font does not have. It is
+         * always in the same place, so the eye finds the field by shape. */
+        aowl_ov_text(rx + 6.0f, cy + 3.0f, "[/]",
+                     on ? AOWL_OV_ACCENT : AOWL_OV_DIM);
+        if (g_ov.search[0])
+            aowl_ov_fmt(line, (int32_t)sizeof(line), "%s%s", g_ov.search,
+                        on ? "_" : "");
+        else
+            aowl_ov_fmt(line, (int32_t)sizeof(line), "%s",
+                        on ? "_"
+                           : "search these settings by name, key or group");
+        aowl_ov_textn(rx + 6.0f + 4.0f * AOWL_OV_CW, cy + 3.0f, line,
+                      g_ov.search[0] ? AOWL_OV_TEXT : AOWL_OV_FAINT,
+                      (int32_t)((rw - 12.0f - 4.0f * AOWL_OV_CW) / AOWL_OV_CW));
+        /* A clear affordance, so a term can be dropped with the mouse too. */
+        if (g_ov.search[0]) {
+            float cxx = rrEdge - 3.0f * AOWL_OV_CW;
+            int32_t hotC = aowl_ov_hit(cxx - 2.0f, cy, 3.0f * AOWL_OV_CW, bh);
+            aowl_ov_text(cxx, cy + 3.0f, "[x]",
+                         hotC ? AOWL_OV_TEXT : AOWL_OV_DIM);
+            if (hotC && g_ov.clickDown) {
+                g_ov.search[0] = 0; g_ov.searchFocus = 0;
+                InterlockedExchange(&g_ov.clickDown, 0);
+            }
+        }
+        if (hot && g_ov.clickDown) {
+            g_ov.searchFocus = 1;
+            /* Taking the keyboard for the search box ABANDONS an open value or
+             * string box. The alternative is two focused fields, and the one
+             * that draws a caret is then not the one receiving the keys --
+             * which is the same class of defect as the search box eating `-`
+             * and `=`, just harder to see. Abandon rather than commit: the
+             * player clicked somewhere else, they did not press ENTER. */
+            g_ov.editItem = -1;
+            g_ov.capturing = 0;
+            InterlockedExchange(&g_ov.clickDown, 0);
+        }
+        /* The scope line, and it is MEASURED against the pane rather than
+         * written and hoped for: a sentence that runs off the right edge is
+         * the same as no sentence, and this one is the panel`s only statement
+         * of what search does and does not reach. The long form is used when
+         * it fits and a short form when it does not, and both name the same
+         * three fields -- what gets dropped is prose, never a field. */
+        {
+            const char* longF = aowl_ov_searching()
+                ? "%d of %d rows  --  name, key, group only"
+                : "%d rows  --  searches name, key, group only";
+            if (aowl_ov_searching())
+                aowl_ov_fmt(line, (int32_t)sizeof(line), longF,
+                            g_ov.filtCount, g_ov.sItemCount);
+            else
+                aowl_ov_fmt(line, (int32_t)sizeof(line), longF,
+                            g_ov.sItemCount);
+            if ((int32_t)strlen(line) + 44 <= rcols) {
+                int32_t L = (int32_t)strlen(line);
+                _snprintf(line + L, sizeof(line) - 1 - (size_t)L,
+                          "  (not descriptions, values or other pages)");
+                line[sizeof(line) - 1] = 0;
+            }
+        }
+        aowl_ov_textn(rx + 2.0f, cy + bh + 3.0f, line,
+                      (aowl_ov_searching() && g_ov.filtCount == 0)
+                          ? AOWL_OV_WARN
+                          : (aowl_ov_searching() ? AOWL_OV_ACCENT
+                                                 : AOWL_OV_FAINT),
+                      rcols);
+    }
+    cy += (float)AOWL_OV_SEARCH_H;
+
     if (P && g_ov.sItemsErr && strcmp(g_ov.sItemsPage, P->id) == 0) {
+        /* The reason the WORKER recorded, not a guess made here. The old text
+         * asserted "the mod may not be loaded" for every failure, including the
+         * one that was actually a full buffer -- a confidently wrong diagnostic,
+         * which is worse than none. */
         aowl_ov_wrap(rx, cy,
-                     "could not read this page's settings. The backend answered, "
-                     "but not with a schema -- the mod may not be loaded, or its "
-                     "settings route may be missing.", AOWL_OV_ERR, rcols, 4);
+                     g_ov.sItemsWhy[0] ? g_ov.sItemsWhy
+                                       : "could not read this page's settings.",
+                     AOWL_OV_ERR, rcols, 5);
         return;
     }
     if (!loaded) return;
@@ -4592,40 +6477,180 @@ static void aowl_ov_view_settings(float x, float y, float w, float bodyH) {
         int32_t n = g_ov.sItemCount;
         float itemsBottom = y + bodyH - (float)AOWL_OV_SDETAIL_H;
 
-        if (g_ov.selItem >= n) g_ov.selItem = n > 0 ? n - 1 : 0;
-        if (g_ov.selItem < 0) g_ov.selItem = 0;
-        if (g_ov.topItem > g_ov.selItem) g_ov.topItem = g_ov.selItem;
-        if (g_ov.selItem - g_ov.topItem >= iRows)
-            g_ov.topItem = g_ov.selItem - iRows + 1;
-        if (g_ov.topItem > n - iRows) g_ov.topItem = n - iRows;
-        if (g_ov.topItem < 0) g_ov.topItem = 0;
+        /* `items` is sorted by the whole path, so the selected nav node -- at
+         * ANY depth -- is a contiguous half-open range and the filter is still
+         * a pair of bounds. `selItem` stays an ITEM index throughout, which is
+         * why the edit, drag and commit paths below and in
+         * `aowl_ov_settings_key` need to know nothing about the tree, and
+         * nothing about search either. */
+        int32_t base[160];
+        const char* baseFull = "";
+        (void)base;
+        lo = 0; hi = n;
+        if (g_ov.selCat >= 0 && g_ov.selCat < g_ov.sCatCount) {
+            lo = g_ov.sCats[g_ov.selCat].lo;
+            hi = g_ov.sCats[g_ov.selCat].hi;
+            baseFull = g_ov.sCats[g_ov.selCat].full;
+            if (lo < 0) lo = 0;
+            if (hi > n) hi = n;
+            if (hi < lo) hi = lo;
+        }
+        g_ov.viewLo = lo; g_ov.viewHi = hi;
 
-        if (n == 0)
+        aowl_ov_search_refresh();
+
+        if (aowl_ov_searching()) {
+            /* Search overrides the nav`s range: the rows on screen are the
+             * matches, wherever on the page they live. `selItem` is snapped to
+             * a MATCH so that the arrow keys, the detail strip and every edit
+             * path keep pointing at a row that is actually drawn. */
+            int32_t at;
+            if (g_ov.filtCount <= 0) {
+                aowl_ov_wrap(rx, cy,
+                             "nothing on this page matches. the box searches "
+                             "setting names, keys and group names -- not "
+                             "descriptions, not values, and not other pages.",
+                             AOWL_OV_WARN, rcols, 3);
+                goto controls_done;
+            }
+            at = aowl_ov_filt_pos(g_ov.selItem);
+            if (at < 0) at = 0;
+            g_ov.selItem = g_ov.filt[at];
+            if (g_ov.topItem > at) g_ov.topItem = at;
+            if (at - g_ov.topItem >= iRows) g_ov.topItem = at - iRows + 1;
+            if (g_ov.topItem > g_ov.filtCount - iRows)
+                g_ov.topItem = g_ov.filtCount - iRows;
+            if (g_ov.topItem < 0) g_ov.topItem = 0;
+        } else {
+            if (g_ov.selItem >= hi) g_ov.selItem = hi > lo ? hi - 1 : lo;
+            if (g_ov.selItem < lo) g_ov.selItem = lo;
+            if (g_ov.topItem > g_ov.selItem) g_ov.topItem = g_ov.selItem;
+            if (g_ov.selItem - g_ov.topItem >= iRows)
+                g_ov.topItem = g_ov.selItem - iRows + 1;
+            if (g_ov.topItem > hi - iRows) g_ov.topItem = hi - iRows;
+            if (g_ov.topItem < lo) g_ov.topItem = lo;
+        }
+
+        if (n == 0 && g_ov.sHiddenCount > 0) {
+            /* A page emptied BY THE FILTER is not a page with nothing in it,
+             * and saying "this page declares no settings" about one would be
+             * the panel lying about its own doing. It names the number and the
+             * key that brings them back -- the only honest form of a hidden
+             * thing is one that says it is hidden. */
+            char msg[192];
+            aowl_ov_fmt(msg, (int32_t)sizeof(msg),
+                        "every setting on this page is not implemented yet "
+                        "(%d hidden). F8 shows them, read-only.",
+                        g_ov.sHiddenCount);
+            aowl_ov_wrap(rx, cy, msg, AOWL_OV_DIM, rcols, 3);
+        } else if (n == 0)
             aowl_ov_text(rx, cy, "this page declares no settings", AOWL_OV_DIM);
+        else if (g_ov.sItemsWhy[0])
+            aowl_ov_text(rx, y + bodyH - (float)AOWL_OV_SDETAIL_H
+                             - (float)AOWL_OV_LINE_H,
+                         g_ov.sItemsWhy, AOWL_OV_WARN);
 
-        for (i = 0; i < iRows && g_ov.topItem + i < n; i++) {
-            int32_t at = g_ov.topItem + i;
-            AowlOvSItem* si = &g_ov.sItems[at];
-            float ry = cy + (float)(i * AOWL_OV_ROW_H);
-            int32_t isSel = (at == g_ov.selItem);
-            int32_t canEdit = si->implemented && P->isMod &&
-                              si->kind != AOWL_S_NESTED;
-            uint32_t lblCol = si->implemented ? AOWL_OV_TEXT : AOWL_OV_DIM;
-            float cx = ctlX, cyy = ry + 3.0f;
-            int32_t rowHot = aowl_ov_hit(rx - 2.0f, ry, rw, (float)AOWL_OV_ROW_H);
+        /* The row walk. `ry` advances by hand rather than by `i * ROW_H`
+         * because a GROUP HEADER is a line of its own: the loop is over rows,
+         * the height of a row is not constant any more, and the stop condition
+         * is "the next row would not fit" rather than a count. `iRows` is still
+         * what PgUp/PgDn moves by and is still a count of CONTROL rows, so the
+         * page key can overshoot the bottom of a header-heavy screen by a row
+         * or two -- which the scroll clamp then corrects on the next frame.
+         *
+         * In search mode `i` indexes `filt` instead of the range; everything
+         * below still works in item indices. */
+        {
+        float ry = cy;
+        int32_t total = aowl_ov_searching() ? g_ov.filtCount : (hi - lo);
+        (void)total;
+        for (i = 0; ; i++) {
+            int32_t at;
+            AowlOvSItem* si;
+            int32_t isSel, canEdit, rowHot, newGroup;
+            uint32_t lblCol;
+            float cx, cyy, rowX;
+            if (aowl_ov_searching()) {
+                if (g_ov.topItem + i >= g_ov.filtCount) break;
+                at = g_ov.filt[g_ov.topItem + i];
+            } else {
+                at = g_ov.topItem + i;
+                if (at >= hi) break;
+            }
+            si = &g_ov.sItems[at];
 
-            /* A hairline where the category changes -- grouping without
-             * spending a row, so one item is exactly one selectable row. */
-            if (at > 0 && strcmp(si->category, g_ov.sItems[at - 1].category) != 0)
-                aowl_ov_rect(rx - 2.0f, ry, rw, 1.0f, AOWL_OV_FAINT);
+            /* --- THE GROUP HEADER ---------------------------------------
+             *
+             * Drawn before the first row on screen and wherever the group
+             * changes, and it always carries a NAME -- `aowl_ov_group_title`
+             * has no branch that yields an empty string. This is the whole of
+             * defect 1: there used to be a hairline here and nothing else, so
+             * a page told the player that its rows were divided and never into
+             * what.
+             *
+             * Suppressed entirely in search mode: results come from all over
+             * the page, so a per-row header would be one header per row. Each
+             * result carries its group on the row instead -- see below. */
+            newGroup = !aowl_ov_searching() &&
+                       (i == 0 || !aowl_ov_same_group(si, &g_ov.sItems[at - 1]));
+            if (newGroup) {
+                /* A BAND, not a hairline.
+                 *
+                 * A rule between two groups says only that a boundary exists,
+                 * and at four levels of nesting a screenful of rules says
+                 * nothing at all -- which is what "the sub-sub-pages are messy"
+                 * was about. A filled band with the name in it reads as a
+                 * container: the rows below it are visibly inside something.
+                 *
+                 * The band carries its own count on the right, in the same
+                 * column the nav uses, so the two agree by construction; and
+                 * the rows beneath are indented past it, so the header is the
+                 * outer thing and the rows are the inner ones. Six pixels of
+                 * lead above it separates one group from the previous group`s
+                 * last row -- the crowding the report named. */
+                char gt[160], gc[24];
+                int32_t gn = 0, q;
+                if (ry + (float)AOWL_OV_GHDR_H + 12.0f + (float)AOWL_OV_ROW_H
+                        > itemsBottom) break;
+                aowl_ov_group_title(si, baseFull, gt, (int32_t)sizeof(gt));
+                for (q = at; q < hi && aowl_ov_same_group(si, &g_ov.sItems[q]);
+                     q++) gn++;
+                /* Real air between regions. Six pixels was a gap; twelve is a
+                 * SEPARATION, and the difference is whether two groups read as
+                 * one list with a caption in it or as two things. The first
+                 * band on screen does not get it -- leading above the first
+                 * item is just a misaligned pane. */
+                ry += (i == 0) ? 2.0f : 12.0f;
+                aowl_ov_rect(rx - 2.0f, ry - 2.0f, rw,
+                             (float)AOWL_OV_LINE_H + 2.0f, AOWL_OV_PANEBG);
+                aowl_ov_rect(rx - 2.0f, ry - 2.0f, 2.0f,
+                             (float)AOWL_OV_LINE_H + 2.0f, AOWL_OV_ACCENT);
+                aowl_ov_fmt(gc, (int32_t)sizeof(gc), "%d", gn);
+                aowl_ov_textn(rx + 6.0f, ry, gt, AOWL_OV_ACCENT,
+                              rcols - (int32_t)strlen(gc) - 3);
+                aowl_ov_text(rrEdge - (float)strlen(gc) * AOWL_OV_CW, ry,
+                             gc, AOWL_OV_FAINT);
+                ry += (float)AOWL_OV_LINE_H;
+            }
+            if (ry + (float)AOWL_OV_ROW_H > itemsBottom) break;
+
+            isSel = (at == g_ov.selItem);
+            canEdit = si->implemented && P->isMod && si->kind != AOWL_S_NESTED;
+            lblCol = si->implemented ? AOWL_OV_TEXT : AOWL_OV_DIM;
+            cx = ctlX; cyy = ry + 3.0f;
+            rowX = rx + (aowl_ov_searching() ? 0.0f : 10.0f);
+            rowHot = aowl_ov_hit(rx - 2.0f, ry, rw, (float)AOWL_OV_ROW_H);
 
             if (isSel)
                 aowl_ov_rect(rx - 2.0f, ry, rw, (float)AOWL_OV_ROW_H, AOWL_OV_SELBG);
             else if (rowHot && canEdit)
                 aowl_ov_rect(rx - 2.0f, ry, rw, (float)AOWL_OV_ROW_H, AOWL_OV_ROWALT);
 
-            aowl_ov_textn(rx, cyy, si->label, lblCol,
-                          (int32_t)((ctlX - rx - 8.0f) / AOWL_OV_CW));
+            /* Indented past the group band above, so the hierarchy is a shape
+             * and not something the player has to infer from the header text.
+             * `rowX`, not `rx`, everywhere the label column is used below. */
+            aowl_ov_textn(rowX, cyy, si->label, lblCol,
+                          (int32_t)((ctlX - rowX - 8.0f) / AOWL_OV_CW));
 
             /* Clicking any editable row selects it, so the keyboard follows the
              * mouse. The controls below may also consume the click. */
@@ -4655,7 +6680,18 @@ static void aowl_ov_view_settings(float x, float y, float w, float bodyH) {
             case AOWL_S_INT:
             case AOWL_S_FLOAT: {
                 if (si->hasRange) {
-                    float sw = 104.0f, sh = 4.0f;
+                    /* THE TRACK GIVES UP 20 PIXELS TO THE VALUE.
+                     *
+                     * At 104 the value cell was `ctlW - 104 - 8` = 44 px, which
+                     * is FIVE characters. Measured: a row holding 543210
+                     * rendered `54321`. That was survivable while every ranged
+                     * row was 0..100, and stops being so the moment the value
+                     * box lets a number be typed -- a field that silently drops
+                     * the digit you just entered is worse than no field. 84
+                     * leaves eight columns, enough for a six-digit integer or
+                     * a signed four-digit one, and costs the track a fifth of
+                     * its length. */
+                    float sw = 84.0f, sh = 4.0f;
                     float sy = ry + (float)AOWL_OV_ROW_H / 2.0f - sh / 2.0f;
                     float cur = (g_ov.dragItem == at) ? g_ov.dragVal
                                                       : (float)strtod(si->raw, NULL);
@@ -4667,10 +6703,10 @@ static void aowl_ov_view_settings(float x, float y, float w, float bodyH) {
                     aowl_ov_rect(cx + sw * t - 3.0f, ry + 4.0f, 6.0f,
                                  (float)(AOWL_OV_ROW_H - 8),
                                  canEdit ? AOWL_OV_TEXT : AOWL_OV_FAINT);
-                    aowl_ov_textn(cx + sw + 8.0f, cyy, si->value,
-                                  canEdit ? AOWL_OV_TEXT : AOWL_OV_DIM,
-                                  (int32_t)((rrEdge - (cx + sw + 8.0f)) / AOWL_OV_CW));
-                    if (canEdit) {
+                    /* THE VALUE IS A TYPE BOX. See `aowl_ov_s_num_box`. */
+                    aowl_ov_s_num_box(si, at, cx + sw + 8.0f, ry,
+                                      rrEdge - (cx + sw + 8.0f), canEdit);
+                    if (canEdit && g_ov.editItem != at) {
                         int32_t hot = aowl_ov_hit(cx - 4.0f, ry, sw + 8.0f,
                                                   (float)AOWL_OV_ROW_H);
                         if (g_ov.mouseHeld && (hot || g_ov.dragItem == at)) {
@@ -4688,11 +6724,23 @@ static void aowl_ov_view_settings(float x, float y, float w, float bodyH) {
                             g_ov.selItem = at;
                             g_ov.dragVal = nv;
                             aowl_ov_s_fmt_num(si, nv);
-                            InterlockedExchange(&g_ov.clickDown, 0);
-                        } else if (g_ov.dragItem == at && !g_ov.mouseHeld) {
-                            aowl_ov_s_fmt_num(si, g_ov.dragVal);
+                            /* ARM the write slot, every frame of the drag, and
+                             * let the quiet period decide when it goes out.
+                             *
+                             * The old code deliberately did NOT commit here and
+                             * committed once on release instead -- which is the
+                             * same number of writes and is why this looked
+                             * already-coalesced. It was not equivalent: the
+                             * release branch only ran while the row was still
+                             * drawn and still editable, so a release after a
+                             * scroll dropped the write ENTIRELY and the file
+                             * kept the old value while the row showed the new
+                             * one. Arming here has no such precondition, and
+                             * `aowl_ov_s_commit` collapses every frame of the
+                             * drag into the one slot, so a 200-frame drag is
+                             * still one POST. */
                             aowl_ov_s_commit(si);
-                            g_ov.dragItem = -1;
+                            InterlockedExchange(&g_ov.clickDown, 0);
                         }
                     }
                 } else {
@@ -4713,9 +6761,8 @@ static void aowl_ov_view_settings(float x, float y, float w, float bodyH) {
                                        canEdit ? AOWL_OV_EDGE : AOWL_OV_FAINT);
                     aowl_ov_text(plusX + 6.0f, ry + 4.0f, "+",
                                  canEdit ? AOWL_OV_TEXT : AOWL_OV_FAINT);
-                    aowl_ov_textn(minusX + bw + 8.0f, cyy, si->value[0] ? si->value : "-",
-                                  canEdit ? AOWL_OV_TEXT : AOWL_OV_DIM,
-                                  (int32_t)((plusX - (minusX + bw + 8.0f)) / AOWL_OV_CW));
+                    aowl_ov_s_num_box(si, at, minusX + bw + 8.0f, ry,
+                                      plusX - (minusX + bw + 8.0f), canEdit);
                     if (hm && g_ov.clickDown) {
                         g_ov.selItem = at; InterlockedExchange(&g_ov.clickDown, 0);
                         aowl_ov_s_adjust(si, -1);
@@ -4793,8 +6840,48 @@ static void aowl_ov_view_settings(float x, float y, float w, float bodyH) {
             if (!si->implemented)
                 aowl_ov_text(rrEdge - 3.0f * AOWL_OV_CW, ry + 3.0f, "NI",
                              AOWL_OV_WARN);
-            (void)itemsBottom;
+
+            /* WHERE the hit is. A result list with no path is ambiguous
+             * exactly when it matters -- "Enabled" occurs in nine groups on a
+             * real page -- so every result carries its own breadcrumb, dimmed,
+             * under the label. It costs the row nothing: it is drawn in the
+             * label`s own band, right-aligned into the gap before the control.
+             */
+            if (aowl_ov_searching()) {
+                /* Cut from the LEFT, and in the same `>` vocabulary the header
+                 * uses. Clipped on the right it read
+                 * `Player/Health/Regenera..` -- it threw away the segment that
+                 * distinguishes this hit from the other eight called `Enabled`
+                 * and kept the one they all share, which is the wrong half of
+                 * a path to keep and exactly the bug the header breadcrumb was
+                 * already fixed for. */
+                int32_t room = (int32_t)((ctlX - rowX - 8.0f) / AOWL_OV_CW);
+                int32_t used = (int32_t)strlen(si->label);
+                int32_t have = room - used - 2;
+                if (have > 8) {
+                    char w[176];
+                    int32_t wn = 0, q;
+                    for (q = 0; si->path[q] && wn < (int32_t)sizeof(w) - 4; q++) {
+                        if (si->path[q] == (char)0x2F) {
+                            w[wn++] = OV_SP; w[wn++] = (char)0x3E; w[wn++] = OV_SP;
+                        } else w[wn++] = si->path[q];
+                    }
+                    w[wn] = 0;
+                    if (wn > have) {
+                        char* from = w + wn - (have - 3);
+                        char* sep = strstr(from, "> ");
+                        if (sep) from = sep + 2;
+                        memmove(w + 3, from, strlen(from) + 1);
+                        w[0] = OV_DOT; w[1] = OV_DOT; w[2] = OV_SP;
+                    }
+                    aowl_ov_textn(rowX + (float)(used + 2) * AOWL_OV_CW, cyy,
+                                  w, AOWL_OV_FAINT, have);
+                }
+            }
+            ry += (float)AOWL_OV_ROW_H;
         }
+        }
+    controls_done: ;
     }
 
     /* --- the detail strip: the selected control, explained --------------- */
@@ -4806,9 +6893,28 @@ static void aowl_ov_view_settings(float x, float y, float w, float bodyH) {
         if (g_ov.selItem < g_ov.sItemCount) {
             AowlOvSItem* si = &g_ov.sItems[g_ov.selItem];
             char line[256];
-            aowl_ov_fmt(line, (int32_t)sizeof(line), "%s%s%s", si->key,
-                        si->category[0] ? "   " : "", si->category);
-            aowl_ov_textn(rx, dy, line, AOWL_OV_ACCENT, rcols);
+            /* The key, then WHERE THE ROW LIVES, as the same `>` breadcrumb
+             * the header uses -- not the raw `category` field, which on a deep
+             * page is half the path with slashes in it and reads as a
+             * different notation for the same thing. One vocabulary for
+             * hierarchy across the whole screen. */
+            {
+                char where[160];
+                int32_t wn = 0, q;
+                for (q = 0; si->path[q] && wn < (int32_t)sizeof(where) - 4; q++) {
+                    if (si->path[q] == (char)0x2F) {
+                        where[wn++] = OV_SP; where[wn++] = (char)0x3E;
+                        where[wn++] = OV_SP;
+                    } else where[wn++] = si->path[q];
+                }
+                where[wn] = 0;
+                aowl_ov_fmt(line, (int32_t)sizeof(line), "%s", si->key);
+                aowl_ov_text(rx, dy, line, AOWL_OV_ACCENT);
+                if (where[0])
+                    aowl_ov_textn(rx + (float)(strlen(si->key) + 3) * AOWL_OV_CW,
+                                  dy, where, AOWL_OV_DIM,
+                                  rcols - (int32_t)strlen(si->key) - 3);
+            }
             dy += (float)AOWL_OV_LINE_H;
             if (!si->implemented) {
                 aowl_ov_fmt(line, (int32_t)sizeof(line), "NOT IMPLEMENTED YET -- %s",
@@ -4900,6 +7006,45 @@ static uint32_t aowl_ov_signature(void) {
         int32_t k;
         for (k = 0; g_ov.editBuf[k]; k++) aowl_ov_sig_add(&h, g_ov.editBuf[k]);
     }
+    /* The second-level nav cursor. It was missing: picking a sub-tab with the
+     * mouse changed `selItem` too and so happened to rebuild, but `,`/`.` back
+     * out to "the whole page" without moving `selItem` at all, and that frame
+     * could land on a cache hit and leave the previous sub-tab on screen. */
+    aowl_ov_sig_add(&h, g_ov.selCat);
+    /* The search box: the term, whether it has the keyboard, and what it
+     * matched. */
+    {
+        int32_t k;
+        for (k = 0; g_ov.search[k]; k++) aowl_ov_sig_add(&h, g_ov.search[k]);
+    }
+    aowl_ov_sig_add(&h, g_ov.searchFocus);
+    /* F8 changes the legend and the empty-page sentence directly, not only
+     * through `dataSerial` -- a cache keyed on the data alone would keep
+     * drawing "F8 show" after F8 had already shown them. */
+    aowl_ov_sig_add(&h, g_ov.showUnimpl);
+    aowl_ov_sig_add(&h, g_ov.sHiddenCount);
+    /* The nav`s expansion. Collapsing a branch moves no cursor, so without
+     * these the frame that closed it could land on a cache hit and leave the
+     * branch on screen -- a tree that ignores the first click on its own
+     * disclosure marker. */
+    {
+        int32_t k;
+        for (k = 0; k < g_ov.sCatCount && k < AOWL_OV_MAX_SCATS; k++)
+            aowl_ov_sig_add(&h, g_ov.navOpen[k]);
+        for (k = 0; k < g_ov.sPageCount && k < AOWL_OV_MAX_SPAGES; k++)
+            aowl_ov_sig_add(&h, g_ov.pageOpen[k]);
+    }
+    aowl_ov_sig_add(&h, g_ov.filtCount);
+    /* The window. A drag moves the panel without touching any cursor, so
+     * without these a dragged panel would stop redrawing at its old position. */
+    aowl_ov_sig_add(&h, (int32_t)(g_ov.panX * 4.0f));
+    aowl_ov_sig_add(&h, (int32_t)(g_ov.panY * 4.0f));
+    aowl_ov_sig_add(&h, (int32_t)(g_ov.panW * 4.0f));
+    aowl_ov_sig_add(&h, (int32_t)(g_ov.panH * 4.0f));
+    aowl_ov_sig_add(&h, g_ov.panMax);
+    aowl_ov_sig_add(&h, g_ov.panAlpha);
+    aowl_ov_sig_add(&h, g_ov.dragWin);
+    aowl_ov_sig_add(&h, g_ov.dragGrip);
     /* Never zero: zero is what `aowl_ov_bind` writes to force the next frame to
      * rebuild after a device change. */
     return h ? h : 1u;
@@ -4908,16 +7053,17 @@ static uint32_t aowl_ov_signature(void) {
 /* Builds the frame's geometry and consumes at most one click. Returns nothing;
  * everything it decides is either geometry or a queued command. */
 static void aowl_ov_build(void) {
-    float x = (float)AOWL_OV_PANEL_X, y = (float)AOWL_OV_PANEL_Y;
-    float w, h, bodyY, bodyH, innerW, legendH;
+    float x, y, w, h, bodyY, bodyH, innerW, legendH;
+    float availW, availH, mxp, myp;
     int32_t vis[AOWL_OV_MAX_MODS];
     int32_t visN, rows, counts[AOWL_VIEW_COUNT];
     char buf[256];
     /* The legend, built before the body so that its height is known, drawn
      * after it. `legNote` is the marker legend or, when something went wrong,
      * what went wrong -- they share the line and so they share the buffer. */
-    char legKeys[224], legNote[256];
+    char legKeys[288], legNote[256];
     int32_t legCols = 0, legKeyN = 1, legNoteN = 1;
+    float titleRight = 0.0f;   /* where the window controls start */
     uint32_t healthCol = AOWL_OV_DIM;
 
     aowl_ov_snapshot();
@@ -4951,19 +7097,61 @@ static void aowl_ov_build(void) {
      * `aowl_ov_bind` invalidating the geometry cache on a size change is all
      * the bookkeeping it needs. */
     g_ov.scale = (g_ov.bbH >= 2500) ? 3 : (g_ov.bbH >= 1300) ? 2 : 1;
-    {
-        float availW = (g_ov.bbW ? (float)g_ov.bbW : 1280.0f) / (float)g_ov.scale;
-        float availH = (g_ov.bbH ? (float)g_ov.bbH : 720.0f) / (float)g_ov.scale;
-        /* The panel is sized to the room it has rather than to a constant. A
-         * fixed 940x620 is fine at 1080p and taller than the window on the
-         * 800x520 the test host resizes to mid-run, and a panel whose legend is
-         * off the bottom of the screen is a panel with no legend. */
-        w = (float)AOWL_OV_PANEL_W;
-        if (w > availW - 2.0f * x) w = availW - 2.0f * x;
+    availW = (g_ov.bbW ? (float)g_ov.bbW : 1280.0f) / (float)g_ov.scale;
+    availH = (g_ov.bbH ? (float)g_ov.bbH : 720.0f) / (float)g_ov.scale;
+    mxp = (float)g_ov.mx / (float)g_ov.scale;
+    myp = (float)g_ov.my / (float)g_ov.scale;
+
+    /* --- WHERE THE PANEL IS, AND HOW BIG ---------------------------------
+     *
+     * It used to be a constant clamped to the back buffer, which is why it
+     * could not be moved, resized or maximised. Now it is four numbers of
+     * state, loaded from disk at start and written back when a drag ends, and
+     * this block is only their clamp. The clamp is the important half: a saved
+     * position that no longer fits (the player changed resolution, or unplugged
+     * the second monitor) must produce a panel that is ON SCREEN, not a
+     * faithful restoration of somewhere unreachable.
+     *
+     * Maximised is not a different code path -- it is the same four numbers
+     * pinned to the client area, so every rectangle below is unchanged and the
+     * un-maximise restores what was saved rather than recomputing a default. */
+    if (g_ov.panW < 1.0f) aowl_ov_prefs_default();
+    if (g_ov.panMax) {
+        x = 0.0f; y = 0.0f; w = availW; h = availH;
+    } else {
+        w = g_ov.panW; h = g_ov.panH; x = g_ov.panX; y = g_ov.panY;
+        if (w > availW) w = availW;
         if (w < 480.0f) w = 480.0f;
-        h = (float)AOWL_OV_PANEL_H;
-        if (h > availH - y - 30.0f) h = availH - y - 30.0f;
+        if (h > availH) h = availH;
         if (h < 220.0f) h = 220.0f;
+        /* Never entirely off: at least the title bar and a hand`s width of it
+         * stay inside, so there is always something to grab. */
+        if (x > availW - 80.0f) x = availW - 80.0f;
+        if (x < -(w - 80.0f)) x = -(w - 80.0f);
+        if (y > availH - (float)AOWL_OV_TITLE_H) y = availH - (float)AOWL_OV_TITLE_H;
+        if (y < 0.0f) y = 0.0f;
+        /* ...and the BOTTOM stays on screen too. This is the clamp the old
+         * fixed-position code did with `h > availH - y - 30`, kept because
+         * without it a 620-tall panel at y=60 in a 600-tall client area puts
+         * its legend below the back buffer -- and a panel whose legend is off
+         * the bottom of the screen is a panel with no legend, which is the
+         * argument for printing one at all. Measured, not assumed: dropping
+         * this is what made `tests/overlayhost`s legend readback fail.
+         *
+         * The right edge gets the same treatment, but only when the panel has
+         * not been dragged off to the LEFT -- there, hanging off is the
+         * player`s own doing and shrinking the panel under them would be a
+         * window that resizes itself when moved. */
+        if (y + h > availH) h = availH - y;
+        if (h < 220.0f) h = 220.0f;
+        if (x >= 0.0f && x + w > availW) w = availW - x;
+        if (w < 480.0f) w = 480.0f;
+        /* The POSITION clamp sticks -- a panel dragged off the edge should
+         * stay where it was pushed back to. The SIZE clamp does not: it is a
+         * function of the back buffer, and writing it back would let one
+         * launch in a small window permanently shrink a size the player chose
+         * in a big one. */
+        g_ov.panX = x; g_ov.panY = y;
     }
 
     innerW = w - 2.0f * AOWL_OV_PAD;
@@ -4989,7 +7177,9 @@ static void aowl_ov_build(void) {
      * wheel scrolls the current view by three rows a notch, which is what every
      * other list on Windows does. In settings mode the page size is the control
      * list's, and the wheel moves the selected control. */
-    aowl_ov_keys(g_ov.settings ? aowl_ov_settings_rows(bodyH) : rows, vis, visN);
+    aowl_ov_keys(g_ov.settings
+                     ? aowl_ov_settings_page(bodyH, aowl_ov_settings_rows(bodyH))
+                     : rows, vis, visN);
     {
         LONG notches = InterlockedExchange(&g_ov.wheel, 0);
         if (g_ov.settings) {
@@ -5046,9 +7236,41 @@ static void aowl_ov_build(void) {
         int32_t maxN;
         legCols = (int32_t)(innerW / AOWL_OV_CW);
         if (g_ov.settings)
-            aowl_ov_fmt(legKeys, (int32_t)sizeof(legKeys),
-                        "TAB page  [ ] page  UP/DN row  LEFT/RIGHT change  "
-                        "SPACE edit  F2 mod manager  INS/ESC close");
+            /* Ordered by how often it is wanted, and phrased so that every
+             * item is SHORT -- `aowl_ov_wrap` breaks on spaces, and a legend
+             * built from four-word phrases wraps in the middle of one, which
+             * is how "F2 mod manager" came to render as "F2 mod" above
+             * "manager". Two words each, so a break is always between items. */
+            /* Two short lines that describe the input model above, in the
+             * order somebody reaches for them -- and every key named here is
+             * one that actually works from the state the panel is in when they
+             * read it. The old line advertised `-/= opacity` while the search
+             * field was quietly eating both. */
+            /* THE FOOTER DESCRIBES THE FOCUS THE PANEL IS ACTUALLY IN, and now
+             * there are three of them rather than two. A legend that names keys
+             * the current focus cannot deliver is the defect that lost `-`/`=`;
+             * with a second text field on screen it would be twice as easy to
+             * reintroduce, so each state prints only what works from it. */
+            if (g_ov.editItem >= 0 && !g_ov.capturing)
+                aowl_ov_fmt(legKeys, (int32_t)sizeof(legKeys),
+                            "TYPING A VALUE   ENTER store   ESC cancel   "
+                            "F9 fade   F10 solid   F11 max   F2 manager");
+            else if (g_ov.capturing)
+                aowl_ov_fmt(legKeys, (int32_t)sizeof(legKeys),
+                            "PRESS A KEY TO BIND   ESC cancel   "
+                            "F9 fade   F10 solid   F11 max   F2 manager");
+            else if (g_ov.searchFocus)
+                aowl_ov_fmt(legKeys, (int32_t)sizeof(legKeys),
+                            "TYPING IN SEARCH   ENTER results   ESC cancel   "
+                            "F9 fade   F10 solid   F11 max   F2 manager");
+            else
+                /* Line one is what you DO to a setting; line two is what you
+                 * do to the WINDOW. Split that way, and each kept under the
+                 * pane width, both fit on one line each at the default size
+                 * instead of spilling a third line that begins mid-phrase. */
+                aowl_ov_fmt(legKeys, (int32_t)sizeof(legKeys),
+                            "/ search   UP/DN row   L/R change   SPACE type   "
+                            "+/- open   TAB page   ESC close");
         else if (g_ov.view == AOWL_VIEW_MODS)
             aowl_ov_fmt(legKeys, (int32_t)sizeof(legKeys),
                         "TAB view  UP/DN move  SPACE toggle  C clear  "
@@ -5071,11 +7293,37 @@ static void aowl_ov_build(void) {
          * Which is also why no action here changes the view. Yanking the panel
          * to another pane because a keypress was refused loses the row the
          * player had selected, to tell them something a line of text can. */
-        if (g_ov.settings)
-            aowl_ov_copy(legNote, (int32_t)sizeof(legNote),
-                         "NI = not implemented yet (read-only)   "
-                         "dim = SPT surface, not backed by aowlspt   "
-                         "edits save to config.json");
+        if (g_ov.settings) {
+            if (g_ov.editItem >= 0)
+                aowl_ov_copy(legNote, (int32_t)sizeof(legNote),
+                             "the value box has the keyboard; ESC gives it "
+                             "back to the list and keeps the old value");
+            else if (g_ov.searchFocus)
+                aowl_ov_copy(legNote, (int32_t)sizeof(legNote),
+                             "the search field has the keyboard; ESC gives it "
+                             "back to the list");
+            else if (g_ov.showUnimpl)
+                /* State the flag AS READ, on screen, whenever it is on. A
+                 * screen full of controls that do nothing, with nothing saying
+                 * why, is exactly the confusion the filter exists to remove --
+                 * and F8 is a key somebody can hit by accident. */
+                aowl_ov_fmt(legNote, (int32_t)sizeof(legNote),
+                            "F8 SHOWING %d UNIMPLEMENTED SETTING%s -- NI rows "
+                            "are read-only and change nothing.   F2 manager   "
+                            "F11 max", g_ov.sHiddenCount,
+                            g_ov.sHiddenCount == 1 ? "" : "s");
+            else if (g_ov.sHiddenCount > 0)
+                aowl_ov_fmt(legNote, (int32_t)sizeof(legNote),
+                            "click a number to type it   %d not-yet-"
+                            "implemented setting%s hidden (F8)   F2 manager   "
+                            "F11 max   F9 fade/F10 solid", g_ov.sHiddenCount,
+                            g_ov.sHiddenCount == 1 ? "" : "s");
+            else
+                aowl_ov_copy(legNote, (int32_t)sizeof(legNote),
+                             "click a number to type it   F8 show unimplemented"
+                             "   F2 manager   F11 max   F9 fade/F10 solid   "
+                             "drag title = move   drag corner = resize");
+        }
         else
             aowl_ov_copy(legNote, (int32_t)sizeof(legNote),
                      g_ov.sLastError[0] ? g_ov.sLastError :
@@ -5106,7 +7354,14 @@ static void aowl_ov_build(void) {
     }
 
     /* --- chrome --- */
-    aowl_ov_rect(x, y, w, h, AOWL_OV_BG);
+    /* The background, at the opacity the player chose. 255 is the solid
+     * background asked for; the old constant`s 232 is the default and is what
+     * an install that has never touched the control still gets. Only the alpha
+     * moves -- a panel that changed colour as well would stop being the same
+     * panel. */
+    aowl_ov_rect(x, y, w, h,
+                 (AOWL_OV_BG & 0x00FFFFFFu) |
+                 ((uint32_t)(g_ov.panAlpha & 0xFF) << 24));
     aowl_ov_rect(x, y, w, (float)AOWL_OV_TITLE_H, AOWL_OV_TITLEBG);
     aowl_ov_frame_rect(x, y, w, h, 1.0f, AOWL_OV_EDGE);
     aowl_ov_text(x + AOWL_OV_PAD, y + 5.0f, "aowlspt", AOWL_OV_ACCENT);
@@ -5132,12 +7387,35 @@ static void aowl_ov_build(void) {
             tx += tw + 4.0f;
         }
     }
+    /* The window controls, at the right end of the title bar: maximise and the
+     * opacity readout. Both are also keys (F11, `-`/`=`) and both are printed
+     * on the legend, because a control that is only a click is a control a
+     * player driving this from the keyboard cannot reach. */
+    {
+        float bw = 3.0f * AOWL_OV_CW;
+        float bx = x + w - AOWL_OV_PAD - bw;
+        int32_t hotM = aowl_ov_hit(bx, y + 2.0f, bw, (float)(AOWL_OV_TITLE_H - 4));
+        char op[16];
+        aowl_ov_rect(bx, y + 2.0f, bw, (float)(AOWL_OV_TITLE_H - 4),
+                     hotM ? AOWL_OV_HOT : AOWL_OV_PANEBG);
+        aowl_ov_text(bx, y + 5.0f, g_ov.panMax ? "[-]" : "[+]",
+                     g_ov.panMax ? AOWL_OV_ACCENT : AOWL_OV_DIM);
+        if (hotM && g_ov.clickDown) {
+            g_ov.panMax = !g_ov.panMax;
+            InterlockedExchange(&g_ov.prefsDirty, 1);
+            InterlockedExchange(&g_ov.clickDown, 0);
+        }
+        aowl_ov_fmt(op, (int32_t)sizeof(op), "%d%%",
+                    (g_ov.panAlpha * 100) / 255);
+        aowl_ov_text(bx - 6.0f * AOWL_OV_CW, y + 5.0f, op, AOWL_OV_FAINT);
+        titleRight = bx - 6.0f * AOWL_OV_CW;
+    }
     {
         float tw;
         char cost[48];
         aowl_ov_health(buf, (int32_t)sizeof(buf), &healthCol);
         tw = (float)(strlen(buf) * AOWL_OV_CW);
-        aowl_ov_text(x + w - AOWL_OV_PAD - tw, y + 5.0f, buf, healthCol);
+        aowl_ov_text(titleRight - 8.0f - tw, y + 5.0f, buf, healthCol);
         /* The frame cost, on the title bar, where it is visible from every view
          * -- an overlay in a game's present loop should be made to say what it
          * costs rather than be asked. Microseconds, one decimal, and the worst
@@ -5164,7 +7442,7 @@ static void aowl_ov_build(void) {
                         g_ov.dispMaxNs / 1000, (g_ov.dispMaxNs / 100) % 10);
         else
             aowl_ov_fmt(cost, sizeof(cost), "-- us");
-        aowl_ov_text(x + w - AOWL_OV_PAD - tw - 16.0f
+        aowl_ov_text(titleRight - 8.0f - tw - 16.0f
                      - (float)(strlen(cost) * AOWL_OV_CW), y + 5.0f,
                      cost, AOWL_OV_FAINT);
     }
@@ -5179,15 +7457,31 @@ static void aowl_ov_build(void) {
             if (g_ov.sPages[k].isMod) mods++; else spt++;
         aowl_ov_rect(x + 1.0f, sy, w - 2.0f,
                      (float)(AOWL_OV_TABS_H + AOWL_OV_STAT_H), AOWL_OV_PANEBG);
-        aowl_ov_fmt(line, (int32_t)sizeof(line),
-                    "in-game settings  |  %d mod pages  |  %d SPT config pages "
-                    "(all not implemented yet)", mods, spt);
-        aowl_ov_textn(x + AOWL_OV_PAD, sy + 3.0f, line, AOWL_OV_DIM,
-                      (int32_t)(innerW / AOWL_OV_CW));
-        aowl_ov_textn(x + AOWL_OV_PAD, sy + 3.0f + (float)AOWL_OV_TABS_H,
-                      "every mod config value and the whole SPT server config "
-                      "surface -- pick a page on the left, change a control on "
-                      "the right", AOWL_OV_FAINT, (int32_t)(innerW / AOWL_OV_CW));
+        /* ONE line, not two, and the second one is gone rather than shortened.
+         *
+         * It read "every mod config value and the whole SPT server config
+         * surface -- pick a page on the left, change a control on the right",
+         * which did not fit and rendered as `...pick a page on the left,..` --
+         * a sentence cut off mid-clause, above the content, on every frame.
+         * It was also instructions for a screen whose own layout says the same
+         * thing: there is a list on the left and controls on the right.
+         *
+         * What is left is the part that is a FACT rather than a hint -- how the
+         * nav is made up, so the dimmed SPT half is never a surprise -- and it
+         * is measured against the pane before the parenthetical is added, the
+         * same rule the search scope line follows. */
+        {
+            int32_t cols = (int32_t)(innerW / AOWL_OV_CW);
+            aowl_ov_fmt(line, (int32_t)sizeof(line),
+                        "%d mod pages  |  %d SPT config pages", mods, spt);
+            if ((int32_t)strlen(line) + 26 <= cols) {
+                int32_t L = (int32_t)strlen(line);
+                _snprintf(line + L, sizeof(line) - 1 - (size_t)L,
+                          "  (SPT: not backed yet)");
+                line[sizeof(line) - 1] = 0;
+            }
+            aowl_ov_textn(x + AOWL_OV_PAD, sy + 3.0f, line, AOWL_OV_DIM, cols);
+        }
         aowl_ov_view_settings(x, bodyY, innerW, bodyH);
         goto settings_body_done;
     }
@@ -5250,6 +7544,61 @@ settings_body_done:
         aowl_ov_wrap(x + AOWL_OV_PAD, ly + (float)(legKeyN * AOWL_OV_LINE_H),
                      legNote, g_ov.sLastError[0] ? AOWL_OV_ERR : AOWL_OV_FAINT,
                      legCols, legNoteN);
+    }
+
+    /* --- MOVING AND RESIZING THE WINDOW ---------------------------------
+     *
+     * Handled here, at the END of the build, after every control above has had
+     * its chance at the click -- so grabbing the title bar cannot also press
+     * the MANAGER/SETTINGS toggle or the maximise button that live on it. The
+     * cost is that a drag lands on the NEXT frame, which at 60 Hz is 16 ms and
+     * is not visible; the alternative was a hit-test ordering that had to be
+     * kept in sync with the chrome by hand.
+     *
+     * Driven by `mouseHeld` rather than by the click edge, because a drag is a
+     * held button by definition and `clickDown` is consumed by whatever it
+     * lands on. Releasing the button ends the drag and marks the geometry for
+     * the WORKER to write out -- never this thread; see `aowl_ov_prefs_save`.
+     *
+     * Maximised, neither gesture does anything: a maximised window has nowhere
+     * to be moved to, and silently un-maximising under a drag is a surprise. */
+    {
+        float gw = 14.0f;
+        int32_t onGrip = aowl_ov_hit(x + w - gw, y + h - gw, gw, gw);
+        int32_t onTitle = aowl_ov_hit(x, y, w, (float)AOWL_OV_TITLE_H);
+        if (!g_ov.panMax)
+            aowl_ov_rect(x + w - gw + 3.0f, y + h - gw + 3.0f, gw - 5.0f,
+                         gw - 5.0f,
+                         (onGrip || g_ov.dragGrip) ? AOWL_OV_ACCENT : AOWL_OV_EDGE);
+        if (g_ov.dragGrip) {
+            if (!g_ov.mouseHeld) {
+                g_ov.dragGrip = 0;
+                InterlockedExchange(&g_ov.prefsDirty, 1);
+            } else {
+                g_ov.panW = mxp - g_ov.panX + g_ov.dragDX;
+                g_ov.panH = myp - g_ov.panY + g_ov.dragDY;
+                if (g_ov.panW < 480.0f) g_ov.panW = 480.0f;
+                if (g_ov.panH < 220.0f) g_ov.panH = 220.0f;
+            }
+        } else if (g_ov.dragWin) {
+            if (!g_ov.mouseHeld) {
+                g_ov.dragWin = 0;
+                InterlockedExchange(&g_ov.prefsDirty, 1);
+            } else {
+                g_ov.panX = mxp - g_ov.dragDX;
+                g_ov.panY = myp - g_ov.dragDY;
+            }
+        } else if (g_ov.mouseHeld && !g_ov.panMax) {
+            if (onGrip) {
+                g_ov.dragGrip = 1;
+                g_ov.dragDX = x + w - mxp;
+                g_ov.dragDY = y + h - myp;
+            } else if (onTitle) {
+                g_ov.dragWin = 1;
+                g_ov.dragDX = mxp - x;
+                g_ov.dragDY = myp - y;
+            }
+        }
     }
 
     /* A click that reached nothing is dropped here rather than saved for the
@@ -5443,7 +7792,50 @@ static LRESULT CALLBACK aowl_ov_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
         case WM_KEYUP:
         case WM_SYSKEYUP:
         case WM_CHAR:
+        /* WM_SYSCHAR is swallowed for the same reason WM_SYSKEYDOWN is taken
+         * below: without it, every system-key press Windows did not get to
+         * turn into a menu produces the default BEEP. A panel that beeps at
+         * you for pressing its own opacity key reads as a panel refusing the
+         * key -- which is the exact wrong signal here. */
+        case WM_SYSCHAR:
             return 0;
+        case WM_SYSKEYDOWN:
+            /* ---- F10 ARRIVES HERE, NOT AT WM_KEYDOWN. This was the bug. ----
+             *
+             * F10 is Windows' menu-activation key, so the system delivers it
+             * as WM_SYSKEYDOWN even with no Alt held -- and so does any key
+             * pressed WITH Alt down. This switch only had WM_KEYDOWN, so F10
+             * fell through to `default: break;` and on to the game's wndproc:
+             * it never reached `aowl_ov_push_key`, never reached
+             * `aowl_ov_keys`, and `panAlpha` was never touched. F9 is an
+             * ordinary WM_KEYDOWN and worked, which is exactly the reported
+             * asymmetry -- "F10 still does not make the fade darker ... it
+             * works only in one direction".
+             *
+             * The handler was symmetric the whole time (`+27` against `-27`
+             * with the same clamp); nothing about the VALUE was ever wrong.
+             * Three candidate bugs -- wrong sign, saturating clamp, key never
+             * fires -- and it was the third. Worth stating plainly, because
+             * the two arithmetic ones are what the code invites you to
+             * suspect, and the message routing is invisible from the handler.
+             *
+             * ALT+F4 IS THE ONE EXCEPTION and must keep closing the game.
+             * Bit 29 of lParam is the context code: set means Alt was down. So
+             * Alt+F4 goes to the game and everything else -- bare F10, and any
+             * other Alt combination, which must not walk the player around
+             * behind an open panel -- is taken exactly like a normal key. */
+            if ((int32_t)wp == VK_F4 && (lp & (1 << 29)))
+                break;                       /* -> the game's wndproc */
+            aowl_ov_push_key((LONG)wp);
+            return 0;
+        case WM_SYSCOMMAND:
+            /* And the other half of the same key. Even with WM_SYSKEYDOWN
+             * swallowed, DefWindowProc can still be asked to open the window
+             * menu via SC_KEYMENU -- which grabs focus and stops the game
+             * presenting until it is dismissed. A panel key must never be able
+             * to freeze the client. */
+            if ((wp & 0xFFF0) == SC_KEYMENU) return 0;
+            break;
         case WM_KEYDOWN:
             /* Every key is eaten while the panel is open -- WASD must not walk
              * the player into a wall behind a menu -- and the ones the panel
@@ -5455,7 +7847,23 @@ static LRESULT CALLBACK aowl_ov_wndproc(HWND hwnd, UINT msg, WPARAM wp, LPARAM l
              * mean either a lock the wndproc can block on (a window that stops
              * pumping while the GPU is busy shows as "not responding") or a
              * cursor that moves halfway through a frame's layout. */
-            if (wp == VK_ESCAPE) { InterlockedExchange(&g_ov.visible, 0); return 0; }
+            /* ESC closes the panel -- UNLESS something on it owns ESC first.
+             * The search box (and an in-progress text or keybind edit) uses
+             * ESC to back out of itself, and a text field whose cancel key
+             * shuts the whole window instead is a text field nobody can back
+             * out of. Those cases go into the ring like any other key and the
+             * render thread`s handler consumes them; only a bare ESC with
+             * nothing to cancel closes.
+             *
+             * Read here rather than queued because the decision is "who owns
+             * this key", not "what does it do" -- and getting it wrong is not
+             * a cursor landing on the wrong row, it is the panel vanishing. */
+            if (wp == VK_ESCAPE) {
+                int32_t owned = g_ov.settings &&
+                                (g_ov.searchFocus || g_ov.search[0] ||
+                                 g_ov.editItem >= 0 || g_ov.capturing);
+                if (!owned) { InterlockedExchange(&g_ov.visible, 0); return 0; }
+            }
             aowl_ov_push_key((LONG)wp);
             return 0;
         default:
@@ -5581,6 +7989,67 @@ static int32_t aowl_ov_admin_active(void) {
  * 256-entity frame is a needless 10 KB memmove on the stack. */
 static AowlAdminShared g_ovAdminSnap;
 
+/* ------------------------------------------------------------------ *
+ * THE SHARED REGION'S DRAW
+ *
+ * The generic replacement for what `aowl_ov_admin_append` does privately for
+ * one mod. Every participant that registered a DRAW callback with
+ * `abi/aowlspt_region.h` submitted screen-space commands on the Unity thread;
+ * this drains the published buffer here, on the render thread, and rasterises
+ * it with the same primitives the panel uses.
+ *
+ * The overlay is its own module, so it is a plain CLIENT of the region: it
+ * resolves `aowl_region_commands_x` by GetProcAddress on the host DLL, and a
+ * host that predates the region simply returns 0 commands. Nothing here can
+ * fault the game -- an absent host is an empty frame, exactly as an absent
+ * admin mod is an empty HUD.
+ *
+ * True back-buffer pixels: the submitter already projected to pixels, so the
+ * panel's integer scale is forced to 1 across this and restored after, the
+ * same discipline the admin ESP append follows.
+ * ------------------------------------------------------------------ */
+static void aowl_ov_region_append(void) {
+    const AowlRegionCmd* cmds = 0;
+    int32_t n = aowl_region_commands(&cmds);
+    int32_t i, savedScale;
+    if (n <= 0 || !cmds) return;
+    if (n > AOWL_REGION_MAX_CMDS) n = AOWL_REGION_MAX_CMDS;  /* capped */
+    savedScale = g_ov.scale;
+    g_ov.scale = 1;
+    for (i = 0; i < n; i++) {
+        const AowlRegionCmd* c = &cmds[i];
+        switch (c->kind) {
+            case AOWL_REGION_CMD_FILL:
+                aowl_ov_rect(c->x, c->y, c->w, c->h, c->col);
+                break;
+            case AOWL_REGION_CMD_BOX:
+                aowl_ov_frame_rect(c->x, c->y, c->w, c->h,
+                                   c->t > 0.0f ? c->t : 1.0f, c->col);
+                break;
+            case AOWL_REGION_CMD_TEXT:
+                aowl_ov_text(c->x, c->y, c->text, c->col);
+                break;
+            case AOWL_REGION_CMD_LINE: {
+                /* An axis-aligned quad between the two points. The overlay has
+                 * no line primitive and inventing a rotated one here would be
+                 * a second rasteriser to maintain; a thin rect is what the
+                 * admin HUD's own "lines" already are. */
+                float x0 = c->x, y0 = c->y, x1 = c->w, y1 = c->h;
+                float t  = c->t > 0.0f ? c->t : 1.0f;
+                float lx = x0 < x1 ? x0 : x1, ly = y0 < y1 ? y0 : y1;
+                float w  = (x1 > x0 ? x1 - x0 : x0 - x1);
+                float h  = (y1 > y0 ? y1 - y0 : y0 - y1);
+                if (w < t) w = t;
+                if (h < t) h = t;
+                if (w <= t || h <= t) aowl_ov_rect(lx, ly, w, h, c->col);
+                break;
+            }
+            default: break;
+        }
+    }
+    g_ov.scale = savedScale;
+}
+
 /* Append the HUD's geometry into the overlay's vertex scratch, to be flushed by
  * the one `aowl_ov_draw` the Present body already issues. ESP is drawn in true
  * back-buffer pixels (scale forced to 1, since the mod already projected to
@@ -5653,6 +8122,152 @@ static void aowl_ov_admin_append(void) {
     g_ov.needUpload = 1;   /* the vertex buffer changed, so it must re-upload   */
 }
 
+/* ------------------------------------------------------------------ *
+ * The launch hint
+ *
+ * "Press F12 for Mod Settings", top-right, once per launch, gone in a few
+ * seconds. Drawn by this Present hook -- the same one the panel uses -- so it
+ * needs no detour of its own, touches no managed object, and allocates
+ * nothing: both strings are literals and the per-frame work while it is up is
+ * a dozen quads.
+ *
+ * WHEN IT APPEARS, and why:
+ *
+ *   * NOT at process start. The client takes over a minute to reach a menu and
+ *     a hint about a panel that cannot yet show anything is a lie. It arms on
+ *     the first frame after the BACKEND HAS ANSWERED AT LEAST ONCE
+ *     (`everOk`) -- which is the same condition that decides whether F12
+ *     shows a populated panel or an empty one, so the hint is true exactly
+ *     when it appears. This is a check that CAN fail: with the backend down,
+ *     no hint is shown, and the host log says so.
+ *   * ...and not after AOWL_OV_HINT_LATEST of process life. Past that the
+ *     player is in a raid or deep in a menu and a toast is an intrusion. This
+ *     is the "must not appear during a raid" guarantee, and it is a clock,
+ *     not a guess about game state the overlay cannot see.
+ *   * ONCE. `hintState` goes to 2 and never comes back, so backing out of a
+ *     screen does not re-show it.
+ *   * NEVER when the setting is off. `hintEnabled` is the value READ from
+ *     `aowl.uihub`, falling back to the remembered one -- never to this file`s
+ *     default.
+ *
+ * It steals no input: nothing here reads `clickDown`, `mouseHeld` or the key
+ * ring, and it draws no hit-tested rectangle, so a click that lands on it goes
+ * to the game exactly as if it were not there.
+ * ------------------------------------------------------------------ */
+#define AOWL_OV_HINT_HOLD    6000u   /* fully visible, ms */
+#define AOWL_OV_HINT_FADE    1200u   /* then fades out over this */
+#define AOWL_OV_HINT_LATEST 600000u  /* never arms later than this into a run */
+
+static DWORD g_ov_hintBoot = 0;
+
+/* 0..255, or 0 when the toast should not be drawn at all. Advances the state
+ * machine; called once per present. */
+static int32_t aowl_ov_hint_alpha(void) {
+    DWORD now = GetTickCount();
+    DWORD age;
+    if (!g_ov_hintBoot) g_ov_hintBoot = now ? now : 1;
+    if (g_ov.hintState >= 2) return 0;
+    if (!g_ov.hintEnabled) {
+        if (g_ov.hintState != 2) {
+            g_ov.hintState = 2;
+            aowl_ov_note("launch hint suppressed: launchHint is off (value as "
+                         "read, not a default)");
+        }
+        return 0;
+    }
+    if (g_ov.hintState == 0) {
+        if (now - g_ov_hintBoot > AOWL_OV_HINT_LATEST) {
+            g_ov.hintState = 2;
+            aowl_ov_note("launch hint not shown: the backend did not answer "
+                         "inside the arming window");
+            return 0;
+        }
+        if (!g_ov.everOk) return 0;      /* the panel would be empty; wait */
+        g_ov.hintState = 1;
+        g_ov.hintAt = now ? now : 1;
+        aowl_ov_note("launch hint shown");
+    }
+    age = now - g_ov.hintAt;
+    if (age < AOWL_OV_HINT_HOLD) return 255;
+    if (age < AOWL_OV_HINT_HOLD + AOWL_OV_HINT_FADE) {
+        DWORD f = age - AOWL_OV_HINT_HOLD;
+        return (int32_t)(255u - (f * 255u) / AOWL_OV_HINT_FADE);
+    }
+    g_ov.hintState = 2;
+    g_ov.hintGoneAt = now ? now : 1;
+    aowl_ov_note("launch hint gone");
+    return 0;
+}
+
+/* Vertices for the toast, appended to whatever else this frame is drawing --
+ * the same way the admin HUD and the shared region append theirs. */
+static void aowl_ov_hint_append(int32_t a) {
+    static const char* L1 = " Press F12 for Mod Settings ";
+    static const char* L2 = " turn this off in Settings > UI hub ";
+    float k = (float)(g_ov.scale > 0 ? g_ov.scale : 1);
+    float availW = (g_ov.bbW ? (float)g_ov.bbW : 1280.0f) / k;
+    float w = (float)(strlen(L2) + 2) * AOWL_OV_CW;
+    float hgt = (float)(AOWL_OV_LINE_H * 2 + 12);
+    float bx = availW - w - 24.0f, by = 24.0f;
+    uint32_t A = (uint32_t)(a & 0xFF) << 24;
+    if (bx < 8.0f) bx = 8.0f;
+    aowl_ov_rect(bx, by, w, hgt,
+                 (AOWL_OV_TITLEBG & 0x00FFFFFFu) |
+                 ((uint32_t)((a * 235) / 255) << 24));
+    aowl_ov_frame_rect(bx, by, w, hgt, 1.0f, (AOWL_OV_EDGE & 0x00FFFFFFu) | A);
+    aowl_ov_text(bx + 8.0f, by + 6.0f, L1, (AOWL_OV_TEXT & 0x00FFFFFFu) | A);
+    /* "fine/smaller print": this font has one size, so the second line is made
+     * quieter with colour instead -- FAINT against TEXT is the same difference
+     * in emphasis the rest of the panel uses. */
+    aowl_ov_text(bx + 8.0f, by + 6.0f + (float)AOWL_OV_LINE_H, L2,
+                 (AOWL_OV_FAINT & 0x00FFFFFFu) | A);
+    g_ov.hintShownFrames++;
+}
+
+/* For the tests and for `aowl_ov_status`: 0 = never shown, 1 = up now,
+ * 2 = shown and gone. Reading it does not advance it. */
+static int32_t aowl_ov_hint_state(void) { return g_ov.hintState; }
+
+/* WHERE THE PANEL ACTUALLY IS, in panel units, as of the last built frame.
+ *
+ * Exists because `tests/overlayhost` was re-deriving it from
+ * AOWL_OV_PANEL_W and the back-buffer width -- a second, independent
+ * computation of the same thing, which is the shape that breaks silently the
+ * moment the first one changes. It did: adding drag/resize changed the width
+ * clamp by 40 pixels and the test`s synthetic click landed in the next column
+ * along, reporting "the button geometry and the hit test have drifted apart"
+ * about a button that was fine. Ask, do not re-derive. */
+static void aowl_ov_panel_rect(float* px, float* py, float* pw, float* ph) {
+    float k = (float)(g_ov.scale > 0 ? g_ov.scale : 1);
+    float availW = (g_ov.bbW ? (float)g_ov.bbW : 1280.0f) / k;
+    float availH = (g_ov.bbH ? (float)g_ov.bbH : 720.0f) / k;
+    if (g_ov.panMax) {
+        if (px) *px = 0.0f;
+        if (py) *py = 0.0f;
+        if (pw) *pw = availW;
+        if (ph) *ph = availH;
+        return;
+    }
+    {
+        float x = g_ov.panX, y = g_ov.panY, w = g_ov.panW, h = g_ov.panH;
+        if (w < 1.0f) { x = (float)AOWL_OV_PANEL_X; y = (float)AOWL_OV_PANEL_Y;
+                        w = (float)AOWL_OV_PANEL_W; h = (float)AOWL_OV_PANEL_H; }
+        if (w > availW) w = availW;
+        if (w < 480.0f) w = 480.0f;
+        if (h > availH) h = availH;
+        if (h < 220.0f) h = 220.0f;
+        if (y + h > availH) h = availH - y;
+        if (h < 220.0f) h = 220.0f;
+        if (x >= 0.0f && x + w > availW) w = availW - x;
+        if (w < 480.0f) w = 480.0f;
+        if (px) *px = x;
+        if (py) *py = y;
+        if (pw) *pw = w;
+        if (ph) *ph = h;
+    }
+}
+static int32_t aowl_ov_hint_frames(void) { return g_ov.hintShownFrames; }
+
 static HRESULT STDMETHODCALLTYPE aowl_ov_present(IDXGISwapChain* sc, UINT sync,
                                                  UINT flags) {
     AowlPresentFn orig = (AowlPresentFn)g_ov.presentOrig;
@@ -5685,14 +8300,30 @@ static HRESULT STDMETHODCALLTYPE aowl_ov_present(IDXGISwapChain* sc, UINT sync,
          * toggle key and ESC write `visible` directly, and a counter that only
          * the API path reset would be right for the one caller nobody uses. */
         if (g_ov.visible && !g_ov.wasVisible) g_ov.openDrawn = 0;
+        /* CLOSING THE PANEL SENDS WHAT IS HELD. `aowl_ov_s_flush_tick` only
+         * runs from the settings draw, so a value changed and then F12`d away
+         * inside the quiet period would have sat in the slot until the panel
+         * was next opened -- a write that looks applied on screen and is not on
+         * disk, which is the worst outcome this whole slot could produce. */
+        if (!g_ov.visible && g_ov.wasVisible) aowl_ov_s_flush_now();
         g_ov.wasVisible = g_ov.visible;
         int32_t adminOn = aowl_ov_admin_active();
+        /* The shared region draws whenever it has published anything, exactly
+         * as the admin HUD draws whenever it is live -- otherwise a mod's
+         * markers would appear only while the manager panel happened to be
+         * open, which reads to a player as "the mod is broken". */
+        int32_t regionOn = 0;
+        {
+            const AowlRegionCmd* rcPeek = 0;
+            regionOn = aowl_region_commands(&rcPeek) > 0 ? 1 : 0;
+        }
         /* Tell the mod the resolution it must project to, every frame the swap
          * chain is bound, so its screen coordinates match this back buffer even
          * across a resize. */
         if (g_ov_admin && aowl_ov_bind(sc))
             aowl_admin_set_screen(g_ov_admin, (int32_t)g_ov.bbW, (int32_t)g_ov.bbH);
-        if (aowl_ov_bind(sc) && (g_ov.visible || adminOn)) {
+        int32_t hintA = aowl_ov_hint_alpha();
+        if (aowl_ov_bind(sc) && (g_ov.visible || adminOn || regionOn || hintA)) {
             /* What one frame of this costs, measured rather than asserted. The
              * overlay is drawn inside the present loop of a game people play
              * competitively, so "it is cheap" is a claim that has to have a
@@ -5709,7 +8340,7 @@ static HRESULT STDMETHODCALLTYPE aowl_ov_present(IDXGISwapChain* sc, UINT sync,
              * cache is defeated (drawSig = 0) so the per-frame ESP is not held
              * back by the panel's "nothing changed" fast path. */
             if (g_ov.visible) {
-                if (adminOn) g_ov.drawSig = 0;
+                if (adminOn || regionOn) g_ov.drawSig = 0;
                 aowl_ov_build();
             } else {
                 g_ov.vtxCount = 0;
@@ -5717,6 +8348,13 @@ static HRESULT STDMETHODCALLTYPE aowl_ov_present(IDXGISwapChain* sc, UINT sync,
                 g_ov.needUpload = 1;
             }
             if (adminOn) aowl_ov_admin_append();
+            /* And every participant of the SHARED region, generically. */
+            if (regionOn) aowl_ov_region_append();
+            /* The launch hint, last, so it is on top of everything. While it is
+             * up the geometry cache is defeated -- it fades, so its vertices
+             * genuinely differ every frame -- and it stops costing anything the
+             * moment `hintA` reaches 0. */
+            if (hintA) { g_ov.drawSig = 0; aowl_ov_hint_append(hintA); }
             QueryPerformanceCounter(&tb);
             aowl_ov_draw(sc);
             QueryPerformanceCounter(&t1);
@@ -5918,6 +8556,34 @@ static int32_t aowl_ov_start(int32_t toggleVk, int32_t backendPort) {
     g_ov.selItem = 0; g_ov.topItem = 0;
     g_ov.editItem = -1;
     g_ov.dragItem = -1;
+    /* The write slot starts empty, and `showUnimpl` starts OFF -- the house
+     * rule that a new surface ships in the state a beta tester should see. */
+    g_ov.pendArm = 0; g_ov.pendAt = 0; g_ov.writeCount = 0;
+    g_ov.pendPage[0] = 0; g_ov.pendKey[0] = 0; g_ov.pendVal[0] = 0;
+    g_ov.showUnimpl = 0; g_ov.hiddenCount = 0; g_ov.sHiddenCount = 0;
+    g_ov.selCat = -1;      /* -1 is "the whole page", the only sane start */
+    g_ov.search[0] = 0; g_ov.searchFocus = 0;
+    g_ov.filtCount = 0; g_ov.filtStamp = 0;
+    g_ov.dragWin = 0; g_ov.dragGrip = 0;
+    /* Every page starts OPEN. A tree that boots collapsed shows the player a
+     * list of names and no settings, which is indistinguishable from a page
+     * that failed to load -- and the panel has spent enough of its life being
+     * indistinguishable from broken. Collapsing is then something they choose,
+     * and `navOpen` (the per-node half) starts empty, so only the branch the
+     * selection is in is expanded. */
+    {
+        int32_t k;
+        for (k = 0; k < AOWL_OV_MAX_SPAGES; k++) g_ov.pageOpen[k] = 1;
+    }
+    memset(g_ov.navOpen, 0, sizeof(g_ov.navOpen));
+    g_ov.navOpenFor[0] = 0;
+    g_ov.hintState = 0; g_ov.hintFetched = 0; g_ov.hintShownFrames = 0;
+    /* Where the window is, how solid it is, and whether the launch hint is
+     * wanted -- read from disk BEFORE the first present, so the panel never
+     * flashes at a default position on its way to the remembered one. The
+     * value it read is in `status`. */
+    aowl_ov_prefs_load();
+    g_ov.viewLo = 0; g_ov.viewHi = 0;
     g_ov.capturing = 0;
     g_ov.curPage[0] = 0;
     g_ov.itemsPage[0] = 0;
@@ -5926,6 +8592,11 @@ static int32_t aowl_ov_start(int32_t toggleVk, int32_t backendPort) {
     g_ov.pageCount = 0;
     g_ov.sptPageCount = 0;
     g_ov.sptGot = 0;
+    g_ov.idxModCount = 0;
+    g_ov.idxGot = 0;
+    g_ov.idxWhy[0] = 0;
+    g_ov.catCount = 0;
+    g_ov.itemsWhy[0] = 0;
     g_ov.itemCount = 0;
     g_ov.mouseHeld = 0;
     /* -1, not 0: zero is a sequence number the client host really sends on its

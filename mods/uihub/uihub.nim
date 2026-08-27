@@ -65,6 +65,7 @@
 
 import aowlspt
 import aowlspt/server as sv
+import aowlspt/settings
 
 const
   ModGuid = "aowl.uihub"
@@ -429,6 +430,13 @@ function mount(root, opts) {
     var parts = [];
     if (state.guid) parts.push('guid=' + encodeURIComponent(state.guid));
     if (extra && extra.cat) parts.push('cat=' + encodeURIComponent(extra.cat));
+    /* `sub` is a SECOND key rather than a dotted `cat=Loot.Core`, because a
+     * category name may itself contain a dot ("Player / Stamina" does not, but
+     * nothing stops one) and a link that cannot be split back is not a link.
+     * Before this, clicking a sub-tab wrote `cat=Core` -- a subcategory
+     * recorded as though it were a top-level group, which then failed to
+     * resolve on reload because no category is called Core. */
+    if (extra && extra.sub) parts.push('sub=' + encodeURIComponent(extra.sub));
     if (state.query) parts.push('q=' + encodeURIComponent(state.query));
     var h = '#' + parts.join('&');
     if (location.hash !== h) history.replaceState(null, '', h);
@@ -465,7 +473,7 @@ function mount(root, opts) {
         if (isCollapsed) return;
         g.subs.forEach(function (s) {
           if (s.name) flat.push({t: 'sub', guid: src.guid, name: s.name,
-                                 id: catId(src.guid, g.name, s.name)});
+                                 cat: g.name, id: catId(src.guid, g.name, s.name)});
           s.rows.forEach(function (r) { flat.push({t: 'row', guid: src.guid, row: r}); });
         });
       });
@@ -591,7 +599,8 @@ function mount(root, opts) {
          * even where scrollIntoView does not exist (jsdom found this -- the
          * throw skipped the link entirely). */
         if (target) {
-          writeHash({cat: item.name});
+          writeHash(item.t === 'sub' ? {cat: item.cat, sub: item.name}
+                                     : {cat: item.name});
           if (target.scrollIntoView) target.scrollIntoView({block: 'start'});
         }
       };
@@ -668,11 +677,12 @@ function mount(root, opts) {
     var want = h.guid && state.mods.some(function (m) { return m.guid === h.guid; }) ? h.guid : state.mods[0].guid;
     await open(want, true);
     if (h.cat) {
-      var target = root.querySelector('#' + catId(want, h.cat));
+      var anchor = catId(want, h.cat, h.sub || '');
+      var target = root.querySelector('#' + anchor);
       var guard = 0;
       while (!target && state.drawn < state.flat.length && guard++ < 200) {
         drawMore();
-        target = root.querySelector('#' + catId(want, h.cat));
+        target = root.querySelector('#' + anchor);
       }
       if (target && target.scrollIntoView) target.scrollIntoView({block: 'start'});
     }
@@ -776,10 +786,36 @@ proc onPage(url, body, session: string): string =
 proc onLib(url, body, session: string): string =
   result = LibJs
 
+proc onSettings(url, body, session: string): string =
+  ## `GET` serves the schema; a `POST` carrying `{"key":...,"value":...}`
+  ## persists one row into this mod's `config.json`. Same contract every other
+  ## mod's settings route has -- see `aowlspt/settings`.
+  var st = Ok
+  if body.len > 0:
+    st = applySettingFromBody(body)
+  result = declaredSchemaReply(st).text
+
 proc onLoad(): Status =
   if side() != sideServer:
     info ModName & " is a server-side page; nothing to do on this side"
     return Ok
+  # The native F12 overlay reads `launchHint` from this route at start-up and
+  # obeys THE VALUE IT READS -- see `aowl_ov_hint_alpha` in
+  # `abi/aowlspt_overlay.h`. It exists here, rather than as a bare host flag,
+  # so that the "turn this off in Settings" the toast prints is true: the
+  # toggle is a real row on a real settings page the player can reach.
+  declareSettings(@[
+    boolSetting("launchHint", "Show the \"Press F12\" hint at launch", true,
+                category = "Overlay/Launch",
+                description = "A small notice in the top-right corner, once " &
+                              "per launch, that fades after a few seconds"),
+    boolSetting("launchHintFallbackPage", "Advertise the browser settings page",
+                false, category = "Overlay/Launch", implemented = false,
+                description = "Not wired yet: the toast names the in-game " &
+                              "screen only")])
+  if serve("/aowlspt/settings/" & ModGuid, onSettings) != Ok:
+    warn "could not register the uihub settings route -- the launch hint's " &
+         "off-switch will not appear in the settings surface"
   if serve(LibRoute, onLib) != Ok:
     warn "could not register " & LibRoute &
          " -- the settings page will load but do nothing"

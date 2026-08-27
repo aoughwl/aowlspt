@@ -193,6 +193,9 @@ static int aowl_rva_is_code(unsigned int rva) {
 ## thunk that drives it. The implementation is in `modetext.nim` (included
 ## below). See `aowlspt_modetext.h`.
 {.emit: """#include "aowlspt_modetext.h" """.}
+## SKIP THE MODE SCREEN. The three byte-verified selection-screen targets and
+## the profile-data field offsets. See `aowlspt_modeskip.h`.
+{.emit: """#include "aowlspt_modeskip.h" """.}
 ## The in-game, Unity-native debug overlay: the F3 info panel and the
 ## in-world AI markers. Target table, call thunks, guarded scalar stores,
 ## the toggle key and the frame-rate estimate. See `aowlspt_debugui.h`.
@@ -1320,6 +1323,19 @@ var gDebugEsp = false
 var gModeTextSlot = -1
 var gModeTextOn = false
 
+## SKIP THE MODE SCREEN (`modeskip.nim`). Declared here for the same reason
+## `gModeTextSlot` is: `attachDrain` and the two dispatch points all name
+## them and all sit above the include point, and while procs resolve across
+## the whole module regardless of order, module-level `var`s do not.
+##
+## These are two detours on two functions NOTHING ELSE IN THIS HOST TOUCHES
+## (both unshared RVAs), so unlike the PreloaderUI::Update multiplex above
+## there is no rider alias to take and no double-detour hazard.
+var gModeSkipCtorSlot = -1
+var gModeSkipShowSlot = -1
+var gModeSkipOn = false
+var gModeSkipWantId = ""
+
 ## THE LIVE INSPECTOR'S slot -- the THIRD rider on `EFT.UI.PreloaderUI::Update`,
 ## declared here for the same reason `gModeTextSlot` is: `attachDrain` and
 ## `patchFired` both need to name it and both are above the include point.
@@ -1347,7 +1363,25 @@ var gModsLastTabName = ""
 ## The POLLING version brand and the seasons-banner hider. Both live in
 ## `modstab.nim` and ride the same detour; both default OFF.
 var gVerOn = false
+## THE VERSION BRAND'S OWN PRELOADER ANCHOR, and it exists because the brand
+## used to borrow `gInspPreloader` -- which is written ONLY by `inspectFired`,
+## the LIVE INSPECTOR's rider. MEASURED in a real boot: the brand hunted from
+## 14.797 s, the client reached the main menu, and it never once resolved --
+## it logged "no live PreloaderUI anchor yet" throughout, because the
+## inspector's rider had never written that global. A feature must not depend
+## on another feature's flag to find its own target. RCX at
+## `EFT.UI.PreloaderUI::Update` IS the live PreloaderUI in BOTH dispatch
+## halves (the argument registers are saved on entry either way), so the brand
+## captures it itself now, from the very rider call it already receives.
+var gVerPreloader: Il2CppPtr = nil
 var gSeasonsOn = false
+## THE BETA NOTICE IN THE SEASONS BANNER SLOT. A SEPARATE KEY from
+## `uxHideSeasons` on purpose: a player may well want the KORD BREACH banner
+## gone and no notice in its place, and overloading one key would take that
+## choice away. Default OFF, and a brand new name, because a default in source
+## is not a value -- a flag whose default was flipped in source was still
+## `true` in a deployed config.json for two launch cycles.
+var gBetaNoticeOn = false
 ## POSTFX folded into Graphics as a subtab. Default OFF, and it is the one
 ## feature in `modstab.nim` that drives the GAME's own panels rather than
 ## clones of them.
@@ -1358,6 +1392,15 @@ var gCodeGenProbeSlot = -1
   ## `codeGenAudit`. It exists to run the codeGen self-test ON THE UNITY MAIN
   ## THREAD, because that is the one variable in this investigation that was
   ## never controlled -- see `codeGenAuditSelfTest`.
+## THE SHARED PER-FRAME REGION -- the LAST rider on `EFT.UI.PreloaderUI::
+## Update` that will ever need to be added by hand. Every future per-frame
+## draw or tick registers WITH it (`abi/aowlspt_region.h`) instead of editing
+## this file for a slot of its own. Declared here for the same reason every
+## slot above it is: `patchFired` names it and sits above `region.nim`'s
+## include point. Flag `sharedRegion`, default OFF.
+var gRegionSlot = -1
+var gRegionOn = false
+
 var gInspSlot2 = -1
   ## The inspector's SECOND anchor: the main drain's slot, aliased so the
   ## instrument keeps ticking inside a raid where `PreloaderUI::Update` does
@@ -2962,6 +3005,7 @@ var profSlotModeText = -1'i32
 var profSlotInspect  = -1'i32
 var profSlotCodeGen  = -1'i32
 var profSlotModsTab  = -1'i32
+var profSlotRegion   = -1'i32
 var gProfRegistered = false
 
 proc profFrameTick() =
@@ -2977,6 +3021,7 @@ proc profFrameTick() =
     profSlotInspect  = cProfSlot(cstring"host:liveInspector", 2'i32)
     profSlotCodeGen  = cProfSlot(cstring"host:codeGenProbe", 2'i32)
     profSlotModsTab  = cProfSlot(cstring"host:modsTab", 2'i32)
+    profSlotRegion   = cProfSlot(cstring"host:region", 2'i32)
   cProfFrame()
 
 proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
@@ -3012,6 +3057,13 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     # per frame and never runs a batch twice.
     if i == gInspSlot2:
       inspectDrainFired()
+    # SKIP THE MODE SCREEN'S deferred Submit. It rides THIS drain, not
+    # `PreloaderUI::Update`, for two reasons: `TarkovApplication::Update` ticks
+    # for the whole session (the selection screen is up before the main menu
+    # exists, where PreloaderUI's tick cannot be assumed), and riding an
+    # existing drain means no second detour and no second trampoline. Idle cost
+    # is two integer compares.
+    modeSkipDrainTick()
     return 0'i32
   # The render-phase drain, likewise by identity: a second detour on a
   # render-phase method that drains the render queue where GL drawing lands.
@@ -3073,17 +3125,17 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
   # be on at once over ONE detour and ONE trampoline. Its per-frame cost when
   # no command is queued is a single interlocked load (`aowl_insp_have`).
   if i == gDebugUiSlot or i == gModeTextSlot or i == gInspSlot or
-     i == gCodeGenProbeSlot or i == gModsSlot:
+     i == gCodeGenProbeSlot or i == gModsSlot or i == gRegionSlot:
     if not gSharedRidersLoggedPf:
       gSharedRidersLoggedPf = true
       logSharedRiders("patchFired", i)
     # THE FRAME BOUNDARY for the profiler. This block is the shared
     # `EFT.UI.PreloaderUI::Update` rider chain -- exactly once per frame while
     # the preloader ticks -- so it is where a frame is closed and, every
-    # `windowFrames`, every slot's window is rolled. `profFrameTick` is a
-    # no-op that costs one volatile load when the profiler is off, which is
-    # the shipped default. It NEVER installs a detour of its own: this rides
-    # the chain that already exists, per the two-detours-one-trampoline rule.
+    # `windowFrames`, every slot's window is rolled. `profFrameTick` costs one
+    # volatile load when the profiler is off, which is the shipped default. It
+    # installs NO detour: it rides the chain that already exists, per the
+    # two-detours-one-trampoline rule.
     profFrameTick()
     if i == gDebugUiSlot:
       cProfBegin(profSlotDebugUi)
@@ -3105,8 +3157,17 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     # it costs one integer compare when it is off and never a second detour.
     if i == gModsSlot:
       cProfBegin(profSlotModsTab)
-      modsRidersTick()
+      modsRidersTick(regs)
       cProfEnd(profSlotModsTab)
+    # THE SHARED REGION, and the generic one: it dispatches every mod that
+    # registered a draw or tick callback. LAST in the chain on purpose --
+    # the hand-written riders above it predate it and keep their existing
+    # ordering, so arming the region cannot reorder anything that already
+    # works. It opens NO guard of its own here; see `region.nim`.
+    if i == gRegionSlot:
+      cProfBegin(profSlotRegion)
+      regionFired(regs)
+      cProfEnd(profSlotRegion)
     return 0'i32
   # The overlay's GameWorld cache: one register read, nothing walked, never a
   # suppression of RegisterPlayer.
@@ -3200,6 +3261,18 @@ proc patchReturned(slot: int32; regs: Il2CppPtr): int32 {.
   if i == gVersionSlot:
     versionBrandFired(regs)
     return 0'i32
+  # SKIP THE MODE SCREEN: the two READ-ONLY postfix captures, by identity and
+  # before the generic postfix path -- both are host drains (meth == nil), so
+  # they must be handled here rather than falling through to the meth-driven
+  # code below. Both return 0: neither ever changes what the caller gets, and
+  # neither suppresses its original. The selection screen is allowed to build
+  # itself completely and is dismissed from a LATER frame by the drain tick.
+  if i == gModeSkipCtorSlot:
+    modeSkipCtorFired(regs)
+    return 0'i32
+  if i == gModeSkipShowSlot:
+    modeSkipShowSlotFired(regs)
+    return 0'i32
   # The menu mode-text postfix, by identity and for the same reason: a host
   # drain (meth == nil) on `PreloaderUI::Update`. Returns 0 -- it never changes
   # what the caller gets, it only calls a setter the game already has.
@@ -3220,7 +3293,7 @@ proc patchReturned(slot: int32; regs: Il2CppPtr): int32 {.
   # it out here would silently kill the inspector in precisely the arming order
   # (mode-text first, inspector second) that the multiplex exists to tolerate.
   if i == gModeTextSlot or i == gDebugUiSlot or i == gInspSlot or
-     i == gModsSlot:
+     i == gModsSlot or i == gRegionSlot:
     if not gSharedRidersLoggedPr:
       gSharedRidersLoggedPr = true
       logSharedRiders("patchReturned", i)
@@ -3242,8 +3315,12 @@ proc patchReturned(slot: int32; regs: Il2CppPtr): int32 {.
       cProfEnd(profSlotInspect)
     if i == gModsSlot:
       cProfBegin(profSlotModsTab)
-      modsRidersTick()
+      modsRidersTick(regs)
       cProfEnd(profSlotModsTab)
+    if i == gRegionSlot:
+      cProfBegin(profSlotRegion)
+      regionFired(regs)
+      cProfEnd(profSlotRegion)
     return 0'i32
   # Phase 1.5 native-settings control probe, by identity and for the same reason:
   # a host drain (meth == nil) whose whole point is to read AFTER the original
@@ -4383,6 +4460,8 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
               elif kind == 13: "menu-mode-text"
               elif kind == 14: "live-inspector"
               elif kind == 15: "bot-nav"
+              elif kind == 17: "skip-mode-screen-ctor"
+              elif kind == 18: "skip-mode-screen-showslot"
               else: "main-thread")
   tablesLock()
   let claimed = cHookClaim()
@@ -4456,6 +4535,10 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
     gBotNavSlot = int(claimed)
   elif kind == 16:
     gCodeGenProbeSlot = int(claimed)
+  elif kind == 17:
+    gModeSkipCtorSlot = int(claimed)
+  elif kind == 18:
+    gModeSkipShowSlot = int(claimed)
   else:
     gDrainSlot = int(claimed)
   tablesUnlock()
@@ -4464,7 +4547,7 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
   elif kind == 2 or kind == 3 or kind == 4 or kind == 5 or kind == 6 or
        kind == 7 or kind == 8 or kind == 9 or kind == 10 or
        kind == 11 or kind == 12 or kind == 13 or kind == 14 or kind == 15 or
-       kind == 16:
+       kind == 16 or kind == 17 or kind == 18:
     discard
   else:
     gDrainMethod = spec
@@ -4474,7 +4557,8 @@ proc attachDrain(spec: string; fn: Il2CppPtr; meth: Il2CppMethod;
         (if perFrame or kind == 2 or kind == 3 or kind == 4 or kind == 5 or
             kind == 6 or kind == 7 or kind == 8 or kind == 9 or
             kind == 10 or kind == 11 or kind == 12 or kind == 13 or
-            kind == 14 or kind == 15 or kind == 16: "" else:
+            kind == 14 or kind == 15 or kind == 16 or kind == 17 or
+            kind == 18: "" else:
            "; it runs more than once a frame, so its firing count is not a " &
            "frame count")
   return true
@@ -5236,6 +5320,17 @@ proc versionBrandFired(regs: Il2CppPtr) =
     warn "version probe: `this` is null; nothing to read"
     return
   let self = cast[Il2CppPtr](selfRaw)
+  # THE SECOND, INDEPENDENT ANCHOR SOURCE for the polling brand in
+  # `modstab.nim`. This postfix fires at ~1.3 s, more than 13 s before the
+  # first `PreloaderUI::Update` rider tick, and its `this` is the same live
+  # PreloaderUI. It is captured here and ONLY here -- nothing in this probe
+  # writes through it, and the offset this probe goes on to read
+  # (`cUxVersionLabelOffset`) is the fact-#13 WRONG object; the polling brand
+  # ignores that offset entirely and walks by NAME to AlphaLabel instead.
+  # Two independent sources, because one of them being gated behind another
+  # feature's flag is exactly what made this never resolve.
+  if gVerPreloader == nil:
+    gVerPreloader = self
   let off = cUxVersionLabelOffset()
   if cIsReadable(self, off + 8'i32) == 0'i32:
     warn "version probe: this+0x" & hexOf(uint64(off)) & " is not readable"
@@ -5402,6 +5497,12 @@ include "settingspages.nim"
 ## `bindModeText`.
 include "modetext.nim"
 
+## SKIP THE MODE SCREEN. Included after `modetext.nim` and before
+## `inspect.nim`; it shares this file's guarded primitives and logging the
+## same way, and it touches none of the PreloaderUI riders above -- its two
+## detours are on functions nothing else in this host names.
+include "modeskip.nim"
+
 ## THE LIVE INSPECTOR / REPL. `include`d LAST of all, because it stands on every
 ## file above it at once: `settingsui.nim`'s `suiReadString` and tab registry,
 ## `invoke2.nim`'s byte-verified managed-call targets, `debugui.nim`'s `duOk`,
@@ -5422,6 +5523,19 @@ include "inspect.nim"
 ## `debugui.nim`'s guarded call primitives and `settingspages.nim`'s row
 ## renderer. Default OFF (`settingsModsTab`).
 include "modstab.nim"
+
+## THE SHARED PER-FRAME REGION. Included AFTER `modstab.nim` because
+## `bindRegion` names `gModsSlot` and `cDuPreloaderTarget`, and nimony
+## forward-resolves procs across an include boundary but NOT variables.
+include "region.nim"
+
+## THE MAIN-MENU BETA NOTICE, DRAWN ON THE OVERLAY. Included AFTER
+## `region.nim` because it registers with the shared region, and after
+## `invoke2.nim` because it asks `UnityEngine.Screen::get_width` for the
+## back-buffer size through that file's byte-verified target table. It
+## installs NO detour. Default OFF (`uxBetaOverlay`).
+include "betanotice.nim"
+
 
 proc bindCodeGenProbe(verbose: bool): bool =
   ## THE FOURTH RIDER on `EFT.UI.PreloaderUI::Update`, and the only reason it
@@ -5957,6 +6071,41 @@ proc readBoolKey(key: string): bool =
   elif i < text.len and text[i] >= '1' and text[i] <= '9':
     result = true
 
+proc readStrKey(key: string): string =
+  ## A shallow read of one `aowlspt-host.json` STRING key: the contents of the
+  ## first double-quoted run after `"key":`. Deliberately the same shallow shape
+  ## as `readBoolKey` above, and for the same reason -- none of these settings is
+  ## worth dragging a JSON parser into the host for.
+  ##
+  ## Returns "" when the key is absent, when the file is unreadable, or when the
+  ## value is not a quoted string. It does NOT decode escapes: every key read
+  ## this way is an opaque identifier (a Mongo profile id is hex), and silently
+  ## half-decoding an escape would be worse than not accepting one.
+  result = ""
+  var text = ""
+  if not readTextFile(joinPath(gDir, "aowlspt-host.json"), text):
+    return
+  let needle = "\"" & key & "\""
+  let at = find(text, needle)
+  if at < 0:
+    return
+  var i = at + needle.len
+  while i < text.len and (text[i] == ' ' or text[i] == ':' or text[i] == '\t'):
+    inc i
+  if i >= text.len or text[i] != '"':
+    return
+  inc i
+  var acc = ""
+  # CAPPED, like every other loop that reads game-adjacent data: a file with an
+  # unterminated quote must not become an unbounded scan.
+  var guard = 0
+  while i < text.len and text[i] != '"' and guard < 512:
+    acc.add text[i]
+    inc i
+    inc guard
+  if i < text.len and text[i] == '"':
+    result = acc
+
 proc readDrainDisabled(): bool = readBoolKey("bridgeDisableDrain")
 
 proc readWaitMs(): int =
@@ -6317,8 +6466,14 @@ proc takeModSet() =
   if modcontrol.parseInRaid(doc, raid) and raid != gInRaidLast:
     gInRaidLast = raid
     graphicsSetInRaid(raid)
+    betaNoticeSetMenu(raid)
     info "graphics: backend reports " & (if raid: "IN RAID â€” grading the world"
                                          else: "in menu â€” post-process off")
+
+  # The beta notice's FINISHED STATE, once it has one: how many frames it
+  # actually submitted on, not that we called a setter. Zero is the
+  # falsifiable failure and it stays silent until there is a number.
+  betaNoticeReport()
 
   # The menu's bottom-right game-mode label rides this same poll, for exactly
   # the reasons `inRaid` does: the client host has one way to reach the backend
@@ -6446,6 +6601,8 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "parent Unity UI GameObjects on the Unity thread once, to prove the " &
          "native settings-injection path"
   gCodeGenAudit = readBoolKey("codeGenAudit")
+  gRegionOn = readBoolKey("sharedRegion")
+  betaNoticeReadFlags()
   if gCodeGenAudit:
     info "codeGenAudit is set: whenever a method has BOTH a live methodPointer " &
          "and a codeGenModule table entry, the host will log whether the two " &
@@ -6682,6 +6839,27 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "poll-driven -- no game code calls anything when our cloned toggle " &
          "turns on. The old standing-check path is untouched and stays as " &
          "the backstop (and the only path at all when this flag is off)."
+  # SKIP THE MODE SCREEN. Two independent conditions, both explicit: the flag,
+  # and an actual profile id to select. `launchProfileId` is written by
+  # `tools/aowllaunch.nim` from the SAME id it passes as `-token`, which is the
+  # only thing that gives the client a PHPSESSID -- so if the launcher got far
+  # enough to start the client at all, it knew this id.
+  gModeSkipOn = readBoolKey("uxSkipModeScreen")
+  gModeSkipWantId = readStrKey("launchProfileId")
+  if gModeSkipOn and gModeSkipWantId.len == 0:
+    warn "uxSkipModeScreen is set but `launchProfileId` is absent or empty in " &
+         "aowlspt-host.json. There is no profile to select, so NOTHING will " &
+         "be bound and the character/mode selection screen WILL appear. This " &
+         "is a launcher error, not a host one: aowllaunch writes that key " &
+         "from the same id it passes as -token."
+  elif gModeSkipOn:
+    info "uxSkipModeScreen is set: read-only postfix detours on " &
+         "CharacterSelectionScreenController::.ctor and " &
+         "CharacterSelectionScreen::ShowSlot will capture the slot whose " &
+         "ProfileId is " & gModeSkipWantId & ", and the " &
+         "TarkovApplication::Update drain will call the game's own " &
+         "Submit for it a couple of ticks later. Neither detour suppresses " &
+         "its original, so the screen is dismissed rather than prevented."
   gMi2Probe = readBoolKey("managedInvokeProbe")
   if gMi2Probe:
     info "managedInvokeProbe is set: a POSTFIX detour on " &
@@ -6715,7 +6893,38 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # The main menu's bottom-right game-mode label. Default OFF until proven live:
   # it is the first thing this host does that CALLS a managed method on the
   # Unity thread as a feature rather than as a probe.
+  # REMOVE THE BOTTOM-RIGHT MODE BUTTON (`uxHideModeButton`). Default OFF, and
+  # a BRAND NEW KEY on purpose: a default in source is not a value, and a flag
+  # whose default was flipped in source was still `true` in a deployed
+  # config.json for two launch cycles. A new name cannot inherit a stale value.
+  gModeHideOn = readBoolKey("uxHideModeButton")
   gModeTextOn = readBoolKey("uxMenuModeText")
+  # BOTH READ FIRST, THEN LOGGED AS ACTUALLY READ, THEN RESOLVED. The two are
+  # MUTUALLY EXCLUSIVE and that is enforced here rather than left to fight on
+  # the Unity thread: `uxMenuModeText` rewrites the text OF the control
+  # `uxHideModeButton` removes, so with both on the host would walk the tree
+  # twice and paint an object nobody can see.
+  info "uxHideModeButton read as " & (if gModeHideOn: "ON" else: "OFF") &
+       "; uxMenuModeText read as " & (if gModeTextOn: "ON" else: "OFF") &
+       " (these are the values actually read from config, not the defaults)"
+  if gModeHideOn and gModeTextOn:
+    gModeTextOn = false
+    warn "uxHideModeButton and uxMenuModeText are BOTH set. They target the " &
+         "same control (Common UI/ChangeGameModeButton -- fact #116), so " &
+         "uxHideModeButton WINS and uxMenuModeText is FORCED OFF for this " &
+         "session. Rewriting the caption of a hidden button is per-frame work " &
+         "on the Unity main thread for something nobody can see."
+  if gModeHideOn:
+    info "uxHideModeButton is set: the host switches off " &
+         "Common UI/ChangeGameModeButton -- the bottom-right PVE ZONE / " &
+         "switch-game-mode control -- because the character/mode selection " &
+         "screen is skipped on launch and this is the last route back into " &
+         "it. Same primitive as uxHideSeasons: ONE GameObject::SetActive" &
+         "(false), never a destroy, never set back to true. The button is " &
+         "found STRUCTURALLY by walking from a verified scene root, bounded " &
+         "to 4000 nodes and 4 ms per pass, on a 4-frame hunt cadence that " &
+         "drops to 120 frames once hidden or if a pass overruns, and it gives " &
+         "up LOUDLY after 300 s rather than searching forever."
   if gModeTextOn:
     info "uxMenuModeText is set: a postfix detour on EFT.UI.PreloaderUI.Update " &
          "will set the menu's bottom-right corner label by CALLING the game's " &
@@ -6793,6 +7002,36 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "state is driven, because the game switches panels by ESettingsGroup " &
          "and a subtab of ours is not one."
   gSeasonsOn = readBoolKey("uxHideSeasons")
+  gBetaNoticeOn = readBoolKey("uxBetaNotice")
+  # BOTH LOGGED AS ACTUALLY READ, not as defaulted, and then resolved here
+  # rather than left to fight on the Unity thread. They target the SAME
+  # GameObject -- `Common UI/MenuScreen/SeasonsButton` -- from opposite
+  # directions: one switches it off, the other keeps it on and rewrites its
+  # text. With both set the host would hide the object it is branding.
+  info "uxHideSeasons read as " & (if gSeasonsOn: "ON" else: "OFF") &
+       "; uxBetaNotice read as " & (if gBetaNoticeOn: "ON" else: "OFF") &
+       " (these are the values actually read from config, not the defaults)"
+  if gBetaNoticeOn and gSeasonsOn:
+    gSeasonsOn = false
+    warn "uxBetaNotice and uxHideSeasons are BOTH set. They target the same " &
+         "object (Common UI/MenuScreen/SeasonsButton), so uxBetaNotice WINS " &
+         "and uxHideSeasons is FORCED OFF for this session -- the banner " &
+         "stays on screen carrying the aowlspt beta notice instead of the " &
+         "KORD BREACH / Season caption. If the notice cannot find a text " &
+         "node inside the banner it declines and hides the banner itself, so " &
+         "the uxHideSeasons outcome is still what you get in that case."
+  if gBetaNoticeOn:
+    info "uxBetaNotice is set: the host REPURPOSES " &
+         "Common UI/MenuScreen/SeasonsButton -- the KORD BREACH / Season " &
+         "banner above Play -- to read the aowlspt beta notice " &
+         "(aoughwl.com, F12 for mod settings). It is reached as one named " &
+         "child of the SAME MenuScreen uxHideSeasons already resolves, so " &
+         "there is no scene walk and no budget. The text is written by " &
+         "CALLING LocalizedText::SetLabelText and TMP_Text::set_text -- a " &
+         "raw m_text store is clobbered -- and re-applied on a throttle, so " &
+         "a menu rebuild is re-branded. If NO non-empty TextMeshProUGUI is " &
+         "found inside the banner, it writes NOTHING, says so, and switches " &
+         "the banner off: half a notice is worse than none."
   if gSeasonsOn:
     info "uxHideSeasons is set: the host switches off " &
          "Common UI/MenuScreen/SeasonsButton -- the KORD BREACH / Season " &
@@ -6981,11 +7220,17 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       # are live together. Ordering still matters, because whoever arms first is
       # the one that owns the trampoline and the other must be able to see the
       # claimed slot to alias onto it.
-      if gModeTextOn:
+      # `uxHideModeButton` rides the SAME slot for the same reason: it needs a
+      # per-frame tick on the Unity thread and the button it hides is the very
+      # object this rider already walks to. One detour, one trampoline.
+      if gModeTextOn or gModeHideOn:
         if not bindModeText(true):
           info "menu mode text did not arm (PreloaderUI.Update or " &
                "SetGameModeText unverified on this build, or drain disabled)"
-        elif readBackendPort() <= 0:
+        elif gModeTextOn and readBackendPort() <= 0:
+          # Gated on `gModeTextOn`, not on the arm: `uxHideModeButton` needs no
+          # backend at all, and warning it has "no source" would be a
+          # confidently wrong diagnostic.
           # ARMED WITH NO SOURCE, said at boot rather than a minute into the
           # menu. The label's text comes from the backend on the mod-sync poll,
           # and with no port this host cannot ask. `backendPort` falls back to
@@ -6996,6 +7241,18 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
                "backend.json, so this host cannot ask the backend what the " &
                "label should read and the corner will keep the game's stock " &
                "text. Set backendPort to the backend's port to use this."
+
+      # SKIP THE MODE SCREEN (opt-in). Independent of every rider above: its two
+      # detours are on `CharacterSelectionScreenController::.ctor` and
+      # `CharacterSelectionScreen::ShowSlot`, both UNSHARED RVAs that nothing
+      # else in this host touches, so there is no ordering constraint and no
+      # trampoline to contend for. Its deferred `Submit` rides the
+      # `TarkovApplication::Update` drain, which is already bound by now.
+      if gModeSkipOn:
+        if not bindModeSkip(true):
+          info "skip mode screen did not arm (see the reason logged above: " &
+               "no launchProfileId, targets unverified on this build, or " &
+               "drain disabled). The selection screen will appear as normal."
 
       # THE LIVE INSPECTOR (opt-in). Bound LAST of the three riders on
       # `EFT.UI.PreloaderUI::Update`, which is exactly where it wants to be:
@@ -7017,8 +7274,24 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       # on `EFT.UI.PreloaderUI::Update`, so by here any of the other four may
       # have claimed the slot and this aliases onto it for free. It never
       # attaches a detour of its own.
-      if gModsOn or gVerOn or gSeasonsOn or gGfxOn:
+      if gModsOn or gVerOn or gSeasonsOn or gGfxOn or gBetaNoticeOn:
         discard bindModsTab(true)
+
+      # THE SHARED PER-FRAME REGION (opt-in, `sharedRegion`). Armed LAST of
+      # every rider on `EFT.UI.PreloaderUI::Update`, so by here any of the
+      # others may have claimed the slot and this aliases onto it for free
+      # and attaches nothing. It is the generic one: from here on a
+      # per-frame draw or tick is a registration, not another entry in
+      # this list.
+      if gRegionOn:
+        discard bindRegion(true)
+
+      # THE MAIN-MENU BETA NOTICE (opt-in, `uxBetaOverlay`). Not a rider
+      # and not a detour: a REGISTRATION with the region armed just above.
+      # Armed after it so the log reads in the order things happened.
+      if gBetaOverlayOn:
+        discard bindBetaNotice(true)
+
 
   let modsDir = joinPath(gDir, "mods")
   # The runtime may not have come up, and that deliberately does not stop this:

@@ -2065,8 +2065,25 @@ proc iSceneNameOf(handle: int32): string =
   iMark("Scene::GetNameInternal", cast[Il2CppPtr](0))
   result = suiReadString(cast[Il2CppPtr](cInspUI(fnName, handle, nil)))
 
-proc iAnchorSceneHandle(ok: var bool): int32 =
+proc iAnchorSceneHandle(ok: var bool; anchor: Il2CppPtr = nil): int32 =
   ## Ask Unity which scene a KNOWN-LIVE object belongs to.
+  ##
+  ## `anchor` is the object to ask. Pass your OWN live object; `nil` falls back
+  ## to `gInspPreloader`, which is what every caller used to get implicitly.
+  ##
+  ## THE PARAMETER EXISTS BECAUSE THE IMPLICIT FALLBACK CAUSED THREE SEPARATE
+  ## BUGS IN ONE DAY. `gInspPreloader` has exactly ONE writer in the whole
+  ## host -- `inspectFired`, the live inspector's rider -- so any feature that
+  ## reached scene roots through here was silently depending on the inspector
+  ## being armed AND having ticked first. When it had not, `iSceneRoots`
+  ## returned zero roots, and callers reported a confident "not found" for a
+  ## search that had barely run: the mode-button hider searched 66 nodes and
+  ## announced "no MenuScreen within 3 levels of ANY root". The same shape is
+  ## already recorded as fact #108 (the `$settings` anchor read a global only a
+  ## separate experimental hook ever wrote) and it took out the version brand
+  ## too, which polled for a `PreloaderUI` anchor it could never obtain.
+  ##
+  ## A caller with its own live object should pass it and depend on nothing.
   ##
   ## This is what reaches the objects `SceneManager` will not enumerate. On
   ## this build the menu lives in the DontDestroyOnLoad scene, which
@@ -2076,9 +2093,11 @@ proc iAnchorSceneHandle(ok: var bool): int32 =
   ## not a hierarchy climb presented as a scene root.
   ok = false
   result = 0'i32
-  if gInspPreloader == nil:
+  var seed = anchor
+  if seed == nil: seed = gInspPreloader
+  if seed == nil:
     return
-  let go = iGameObjectOf(gInspPreloader)
+  let go = iGameObjectOf(seed)
   if go == nil or not iUnityAlive(go):
     return
   var fn: Il2CppPtr = nil
@@ -2091,10 +2110,16 @@ proc iAnchorSceneHandle(ok: var bool): int32 =
   result = cReadI32At(cNavSceneHandlePtr())
   ok = true
 
-proc iSceneRoots(into: var seq[Il2CppPtr]; report: bool): int =
+proc iSceneRoots(into: var seq[Il2CppPtr]; report: bool;
+                 anchor: Il2CppPtr = nil): int =
   ## Every root GameObject we can legitimately reach, from two sources:
   ## the scenes SceneManager enumerates, and the scene a live anchor actually
   ## belongs to (which is how DontDestroyOnLoad is reached).
+  ##
+  ## `anchor` is that live object. Pass your own; `nil` keeps the historical
+  ## behaviour of using `gInspPreloader`, which ONLY the live inspector's rider
+  ## ever writes -- see `iAnchorSceneHandle` for why depending on that
+  ## implicitly is a trap, and what it cost.
   result = 0
   var fnCount: Il2CppPtr = nil
   var fnAt: Il2CppPtr = nil
@@ -2142,7 +2167,7 @@ proc iSceneRoots(into: var seq[Il2CppPtr]; report: bool): int =
 
   # THE SCENE SCENEMANAGER DOES NOT LIST.
   var haveAnchor = false
-  let ah = iAnchorSceneHandle(haveAnchor)
+  let ah = iAnchorSceneHandle(haveAnchor, anchor)
   if haveAnchor:
     var already = false
     for i in 0 ..< seen.len:
