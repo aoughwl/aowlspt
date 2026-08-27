@@ -96,6 +96,7 @@
 import aowlspt
 import aowlspt/server
 import aowlspt/json
+import raid
 
 const
   MaxCells* = 512
@@ -274,6 +275,19 @@ proc hasText(j: JsonRef; want: string): bool =
 proc buildPlan*(locationId: string): OrbitPlan =
   ## Read the map's two positional layers out of the database and reduce them
   ## to anchors. Called once per raid, off the raid-configured path.
+  # THE MAP KEY, not the name the client said. The client sends `base.Id`
+  # ("Interchange", "Woods"); `db.json` keys its `locations` table by the SPT
+  # directory ("interchange", "bigmap"). Reading `locations.<clientId>`
+  # directly found NOTHING on 13 of 19 maps and this code reported that as
+  # "a map with no positional data here" -- a confidently wrong diagnosis of a
+  # database that has 3,762 spawn points across 24 locations. It is the same
+  # defect that served empty loot on ten of thirteen maps.
+  #
+  # `canonicalLocation` (emu/raid) is the ONE resolver: key -> `_Id` -> `Id` ->
+  # case-insensitive, with post-1.0 VARIANTS (Sandbox_start, Lighthouse2, ...)
+  # reaching their parent through the shared `Name`. Do not add a second one
+  # here and do not special-case a map by name.
+  let key = canonicalLocation(locationId)
   result = OrbitPlan(ok: false, map: locationId, cellSize: orbitCellSize(),
                      anchors: @[], containersSeen: 0, containerRows: 0,
                      spawnPointsSeen: 0, spawnRows: 0, why: "")
@@ -284,7 +298,7 @@ proc buildPlan*(locationId: string): OrbitPlan =
   var pvpUsed = 0
   var roamUsed = 0
 
-  let cont = dbRead("locations." & locationId &
+  let cont = dbRead("locations." & key &
                     ".staticContainers.staticContainers")
   if cont.ok:
     let list = whole(cont.raw)
@@ -314,7 +328,7 @@ proc buildPlan*(locationId: string): OrbitPlan =
                x, y, z, p)
       inc i
 
-  let sp = dbRead("locations." & locationId & ".base.SpawnPointParams")
+  let sp = dbRead("locations." & key & ".base.SpawnPointParams")
   if sp.ok:
     let list = whole(sp.raw)
     let n = count(list)
@@ -365,8 +379,14 @@ proc buildPlan*(locationId: string): OrbitPlan =
   topInto(gRoamCells, roamUsed, orbitLootAnchors(), akRoam, result.anchors)
 
   if result.anchors.len == 0:
+    # Name BOTH ids. "no data for 'Interchange'" and "no data for
+    # 'interchange'" are different bugs and the old message could not tell
+    # them apart: the first is an unresolved id, the second a genuinely
+    # empty map.
     result.why = "no anchor could be built for '" & locationId &
-                 "': " & $result.containersSeen & " usable containers and " &
+                 "' (database key '" &
+                 (if key.len > 0: key else: "<unresolved>") & "'): " &
+                 $result.containersSeen & " usable containers and " &
                  $result.spawnPointsSeen & " player spawn points were read " &
                  "from the database. This is a map with no positional data " &
                  "here, not a map with no loot"

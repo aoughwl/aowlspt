@@ -1184,6 +1184,11 @@ def main():
                                {"locationId": loc}, std_session)
         st, doc, text = w.call("/aowlspt/tarkov/orbit/plan", {}, std_session)
         d = envelope(doc)
+        # The route answers `{"plan": {...}}` -- measured, not assumed: reading
+        # the outer object as the plan gave `ok` absent for every id, which
+        # this reports as INCONCLUSIVE rather than as a pass or a failure.
+        if isinstance(d, dict) and isinstance(d.get("plan"), dict):
+            d = d["plan"]
         if not isinstance(d, dict) or "ok" not in d:
             return None, text
         return d, text
