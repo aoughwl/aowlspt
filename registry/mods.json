@@ -79,10 +79,11 @@
     },
     {
       "id": "aowl.morebots",
-      "name": "MoreBots",
+      "name": "Bot AI: population",
+      "internal": true,
       "author": "TacticalToaster (ported to aowlspt)",
       "version": "1.0.0",
-      "description": "The bot-type and faction API other mods build on. Announces itself with morebots.ready and does the database writing on behalf of whoever answers. NOT SHIPPED ENABLED as of 2026-08-25: it still uses the whenReady(\"EFT.GameWorld\") gate that cannot fail and binds IL2CPP before the Unity thread is live, which kills the client. Meant to be switched on by hand once that gate is replaced with mainThread().bound, the way mods/sain and mods/fov now do.",
+      "description": "The population and bot-type/faction half of Bot AI. Raises how many AI a map runs (cap, per-zone limit and scav wave slots, computed from a stock baseline) and is the bot-type and faction API other mods register against. Hidden from the mod list on purpose: it is not a separate mod to the player, its settings render inside the Bot AI page tree under Population, and its guid, path, dll and routes are internal identifiers kept unchanged.",
       "pipeline": ">=0.1.0",
       "sides": [
         "server",

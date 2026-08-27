@@ -1408,11 +1408,17 @@ proc sainSchema(): seq[Setting] =
   ## control that lies is worse than an absent one. Each becomes true when the
   ## driver ticks against real bots and somebody watches a raid, not before.
   ##
-  ## `moreBots` is the one row with no config-driven work behind it at all: the
-  ## More Bots spawn expansion is presented as part of Bot AI rather than as a
-  ## separate brand, and the mod that would do the work is QUARANTINED because
-  ## it crashes the client. It is declared so the page can say that out loud,
-  ## greyed, rather than leaving the feature unmentioned.
+  ## The spawn-population rows (`Bot AI > Population`) are NOT declared here.
+  ## They belong to the population half of this mod, a separately loaded binary
+  ## (guid `aowl.morebots`, hidden from the player mod list) which owns the
+  ## database write and the in-client bot count. It declares its rows with
+  ## `inIndex = false`, so it claims no nav entry of its own, and THIS page
+  ## proxies them: `mergedPage` asks it for its rows over `SettingsPageQuery`
+  ## and appends them, and a write to a key this mod does not declare is
+  ## forwarded over `SettingsApplyQuery` rather than persisted here. One
+  ## visible mod, one page tree, exactly ONE owner per value -- a row that
+  ## rendered here and also persisted here would be two sources of truth and
+  ## would drift.
   result = @[
     boolSetting("enabled", "Enable Bot AI", true,
                 category = "Bot AI", subcategory = "General",
@@ -1424,10 +1430,6 @@ proc sainSchema(): seq[Setting] =
                 category = "Bot AI", subcategory = "General",
                 description = "Scales how fast every bot moves, from 0.49 at easy to 1.0 at deathwish. Measured live: every bot in a raid took the commanded speed. Needs `botNav` on in aowlspt-host.json.",
                 implemented = true),
-    boolSetting("moreBots", "More Bots (spawn expansion)", false,
-                category = "Bot AI", subcategory = "General",
-                description = "More Bots is part of Bot AI rather than a separate mod. UNAVAILABLE on this build: the component that raises spawn counts crashes the client and is quarantined, so this switch is inert and cannot turn it on.",
-                implemented = false),
     stringSetting("forcePersonality", "Force personality", "",
                   category = "Bot AI", subcategory = "General",
                   description = "Force every bot to one personality (rat, gigachad, chad, coward, ...). It does reach bots -- it picks the coverage roll and the sprint rule behind the goTo orders -- but nobody has yet watched two raids and confirmed the difference is visible, so it stays greyed until somebody has.",
@@ -1595,18 +1597,115 @@ proc sainSchema(): seq[Setting] =
                 description = "A re-measurement switch, not a feature. Turning it on lets this mod resolve game types BY NAME, which on this build returns a plausible random handle and kills the client on first use. Deliberately left un-editable so nobody flips it by accident.",
                 implemented = false)]
 
+# ---------------------------------------------------------------------------
+# The population half's rows, proxied into this page
+# ---------------------------------------------------------------------------
+
+const PopGuid = "aowl.morebots"
+  ## INTERNAL identifier of the population half, and not user-visible anywhere:
+  ## it is hidden from the mod list, declares no nav entry of its own, and its
+  ## rows render as `Bot AI > Population`. Do NOT rename it -- the registry, the
+  ## selection store, its routes and deploy verification all key off this
+  ## exact string.
+
+var gPopRows = ""                 ## the rows it last announced, verbatim
+var gPopKeys: seq[string] = @[]   ## the keys those rows carry
+var gPopSubscribed = false
+
+proc onPopRows(rowsText: string) =
+  gPopRows = rowsText
+  gPopKeys = @[]
+  let rows = parseArray(rowsText)
+  for ri in 0 ..< rows.len:
+    let k = field(at(rows, ri), "key").asText("")
+    if k.len > 0: gPopKeys.add k
+
+proc onPopPage(payload: string): string =
+  if field(payload, "guid").asText("") == PopGuid:
+    onPopRows(field(payload, "rows").raw())
+  result = ""
+
+proc onPopApplied(payload: string): string =
+  if field(payload, "guid").asText("") == PopGuid:
+    onPopRows(field(payload, "rows").raw())
+  result = ""
+
+proc popSubscribe() =
+  if gPopSubscribed: return
+  discard on(SettingsPageAnnounce, onPopPage)
+  discard on(SettingsApplyAnnounce, onPopApplied)
+  gPopSubscribed = true
+
+proc refreshPopRows() =
+  ## Ask the population half for its rows. The broadcast is SYNCHRONOUS --
+  ## `deliverEvent` calls every subscriber before `emit` returns -- so
+  ## `gPopRows` is current when this returns, or stays EMPTY, which means that
+  ## half is not loaded. Empty is reported as an ABSENT section, never as an
+  ## empty one: "I could not look" is not "there is nothing there".
+  popSubscribe()
+  gPopRows = ""
+  discard emit(SettingsPageQuery, PopGuid)
+
+proc ownsKey(key: string): bool =
+  result = false
+  # Bound to a local first: iterating the call directly borrows from a
+  # temporary, which the compiler refuses.
+  let mine = declaredSettings()
+  for st in mine:
+    if st.key == key: return true
+
+proc popOwnsKey(key: string): bool =
+  result = false
+  for pk in gPopKeys:
+    if pk == key: return true
+
+proc mergedPage(): string =
+  ## This mod's rows followed by the population half's, as ONE array.
+  refreshPopRows()
+  var outList = parseArray(schemaJson(declaredSettings()).text)
+  if gPopRows.len > 1:
+    let pop = parseArray(gPopRows)
+    for ri in 0 ..< pop.len:
+      outList.add at(pop, ri).raw()
+  result = outList.text()
+
+proc forwardToPop(body: string; isReset: bool): bool =
+  ## True if the edit named a population row and was handed to its OWNER. A
+  ## key this mod declares always wins, so a proxy can never shadow a local
+  ## row; an unknown key is refused here and falls through to the normal
+  ## local path, which reports it properly.
+  result = false
+  let k = field(body, "key").asText("")
+  if k.len == 0 or ownsKey(k): return false
+  popSubscribe()
+  if gPopKeys.len == 0: refreshPopRows()
+  if not popOwnsKey(k): return false
+  var q = "{\"guid\":\"" & PopGuid & "\",\"key\":\"" & k & "\""
+  if isReset:
+    q = q & ",\"reset\":true}"
+  else:
+    q = q & ",\"value\":" & field(body, "value").raw() & "}"
+  discard emit(SettingsApplyQuery, q)
+  result = true
+
 proc onSainSettings(url, body, session: string): string =
   ## GET serves the schema; a POST body persists one edit into config.json. SAIN
   ## reads its settings inline, so the write is saved and applied at the next
   ## load rather than made live here.
   var st = Ok
-  if body.len > 0:
+  if body.len > 0 and not forwardToPop(body, false):
     st = applySettingFromBody(body)
-  result = declaredSchemaReply(st).text
+  if st != Ok:
+    return declaredSchemaReply(st).text
+  result = mergedPage()
 
 proc onSainSettingsReset(url, body, session: string): string =
-  let st = resetFromBody(body)
-  result = declaredSchemaReply(st).text
+  var st = Ok
+  if not forwardToPop(body, true):
+    st = resetFromBody(body)
+  if st != Ok:
+    return declaredSchemaReply(st).text
+  result = mergedPage()
 
 proc onLoad(): Status =
   declareSettings(sainSchema())
