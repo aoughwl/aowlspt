@@ -3080,10 +3080,30 @@ proc tarkovSchema(): seq[Setting] =
                category = "Emulator",
                description = "The Unix time the emulator's clock starts from"),
 
-    intSetting("insurancePercent", "Insurance return chance (%)", 10,
-               lo = 0, hi = 100, category = "Insurance"),
+    # The label used to read "Insurance return chance (%)", which is not what
+    # this number is: `emu/insurance.premiumFor` multiplies the item's handbook
+    # price by it to work out what the TRADER CHARGES. Nothing anywhere reads
+    # it as a chance. The row is renamed rather than left flattering, because a
+    # row that names the wrong mechanic is worse than no row.
+    #
+    # 0 is "insurance costs nothing" -- the free case, wired at that one site
+    # rather than as a second boolean, since a multiplier that can reach zero
+    # already expresses it and two controls for one number disagree eventually.
+    intSetting("insurancePercent", "Insurance premium (% of item value)", 10,
+               lo = 0, hi = 100, category = "Traders/Insurance",
+               description = "What the trader charges to insure an item, as a " &
+                             "percentage of its handbook price " &
+                             "(emu/insurance.premiumFor). 0 makes insurance free"),
+    # 0 is "instant": `queueReturn` records `dueAt = now`, and the next pass of
+    # `deliverDue` posts the items back through the trader's own mail. The
+    # return is a real mechanic here -- premium taken, items held in the store,
+    # message delivered -- so the instant case is the timer set to zero and not
+    # a separate switch.
     intSetting("insuranceReturnHours", "Insurance return delay (hours)", 24,
-               lo = 0, hi = 168, category = "Insurance"),
+               lo = 0, hi = 168, category = "Traders/Insurance",
+               description = "How long a trader holds insured gear before " &
+                             "mailing it back (emu/insurance.queueReturn / " &
+                             "deliverDue). 0 returns it on the next delivery pass"),
 
     intSetting("scavCooldownSeconds", "Scav cooldown (seconds)", 900,
                lo = 0, hi = 86400, step = 60, category = "Scav"),
@@ -3102,14 +3122,56 @@ proc tarkovSchema(): seq[Setting] =
     intSetting("mailKeepCollected", "Keep collected mail", 1, lo = 0, hi = 1,
                category = "Mail"),
 
+    # ---- the flea market ------------------------------------------------
+    #
+    # Two things this page deliberately does NOT duplicate. "Is the flea open
+    # at all" and "from what level" are `RagFair Enabled` and `RagFair Min
+    # User Level` under `Flea Market > RagFair` -- generated rows that write
+    # `globals.config.RagFair.enabled` / `.minUserLevel` in the document the
+    # client fetches, which is where the client reads both. A second control
+    # for either would be a row that fights the one that actually works.
     intSetting("fleaSpreadPercent", "Flea price spread (%)", 20, lo = 0, hi = 100,
-               category = "Flea Market"),
+               category = "Flea Market/Offers"),
     intSetting("fleaOfferHours", "Flea offer duration (hours)", 12,
-               lo = 1, hi = 168, category = "Flea Market"),
+               lo = 1, hi = 168, category = "Flea Market/Offers"),
     intSetting("fleaMaxOffers", "Flea max offers", 600, lo = 1, hi = 10000,
-               category = "Flea Market"),
+               category = "Flea Market/Offers"),
     intSetting("fleaSaleMinutes", "Flea sale time (minutes)", 30, lo = 0,
-               hi = 1440, category = "Flea Market"),
+               hi = 1440, category = "Flea Market/Offers"),
+    floatSetting("fleaPriceMultiplier", "Flea price multiplier", 1.0,
+                 lo = 0.0, hi = 10.0, step = 0.05,
+                 category = "Flea Market/Offers",
+                 description = "Scales every asking price on the flea, at " &
+                               "BOTH places an offer is born " &
+                               "(emu/market.scaleFleaPrice). `buyOffer` " &
+                               "charges the offer's own price, so the label " &
+                               "and the bill cannot disagree. 0 is free"),
+    intSetting("fleaSellFeePercent", "Flea listing fee (%)", 0, lo = 0, hi = 100,
+               category = "Flea Market/Selling",
+               description = "A percentage of the asking price, taken out of " &
+                             "the stash when you LIST something " &
+                             "(emu/market.addOffer). 0, the default, is what " &
+                             "this server did before: listing is free"),
+    # Declared and NOT wired, with the reason on the row.
+    #
+    # The client-side flag exists (`RagFair Is Only Found In Raid Allowed`
+    # under `Flea Market > RagFair`) and is served, but the SERVER cannot
+    # enforce it: nothing in this emulator ever stamps `upd.SpawnedInSession`
+    # on anything a raid produced -- `emu/repeatable` says so in as many words
+    # about the same field. A server-side found-in-raid check would therefore
+    # not be a restriction, it would refuse every listing, always. That is a
+    # missing mechanic upstream of this row, so the row says so instead of
+    # pretending.
+    boolSetting("fleaSellRequiresFoundInRaid",
+                "Flea selling requires found in raid", false,
+                category = "Flea Market/Selling", implemented = false,
+                description = "NOT WIRED: this server never stamps " &
+                              "upd.SpawnedInSession on raid loot, so a " &
+                              "found-in-raid check could only ever refuse " &
+                              "every listing rather than restrict any. The " &
+                              "client-side flag is separately available as " &
+                              "Flea Market > RagFair > Is Only Found In Raid " &
+                              "Allowed"),
 
     boolSetting("lootEnabled", "Loot enabled", true, category = "Loot"),
     floatSetting("staticLootMultiplier", "Static loot multiplier", 1.0,
@@ -3137,16 +3199,32 @@ proc tarkovSchema(): seq[Setting] =
     # sandbox behaviour is still one switch away; it is just no longer the
     # thing a stranger gets without asking.
     boolSetting("traderUnlockAllOffers", "Unlock every trader offer", false,
-                category = "Traders",
+                category = "Traders/Offers",
                 description = "Sell every trader's whole stock from loyalty " &
                               "level 1, ignoring loyalty and quest gating " &
                               "(emu/traders.traderAssort). Off by default."),
     floatSetting("traderPriceMultiplier", "Trader price multiplier", 1.0,
-                 lo = 0.0, hi = 10.0, step = 0.05, category = "Traders",
+                 lo = 0.0, hi = 10.0, step = 0.05, category = "Traders/Offers",
                  description = "Scales every barter-scheme count, in BOTH " &
                                "the assort the client is shown and the cost " &
                                "the server charges -- scaling only one is a " &
                                "shop that shows one price and takes another"),
+    # The per-item purchase limit, and only that. Loyalty and quest gating is
+    # the row above; the price is the row above that. One switch per mechanic,
+    # because a single "remove restrictions" toggle cannot be turned half on.
+    boolSetting("traderIgnoreStockLimits", "Ignore trader stock limits", false,
+                category = "Traders/Offers",
+                description = "Removes the per-item purchase limit -- the " &
+                              "assort's upd.StackObjectsCount check in " &
+                              "emu/trading.buyFromTrader that answers \"that " &
+                              "trader has only N of those\". Off by default"),
+    floatSetting("repairPriceMultiplier", "Repair price multiplier", 1.0,
+                 lo = 0.0, hi = 10.0, step = 0.05, category = "Traders/Repair",
+                 description = "Scales what a TRADER charges to repair " &
+                               "(emu/repair.doTraderRepair). 0 makes trader " &
+                               "repairs free. A kit repair is paid for in the " &
+                               "kit's own Resource, not in roubles, so this " &
+                               "does not touch it"),
     floatSetting("hideoutConstructionMultiplier",
                  "Hideout construction time multiplier", 1.0,
                  lo = 0.0, hi = 5.0, step = 0.05, category = "Hideout",
@@ -3416,7 +3494,9 @@ proc onLoad(): Status =
   # The five server-side modifiers above, each handed to the module that owns
   # the number. Read here, at load, like every other key on this page.
   configureTraders(setting("traderUnlockAllOffers").asBool(false),
-                   setting("traderPriceMultiplier").asFloat(1.0))
+                   setting("traderPriceMultiplier").asFloat(1.0),
+                   setting("traderIgnoreStockLimits").asBool(false))
+  configureRepairPrices(setting("repairPriceMultiplier").asFloat(1.0))
   configureHideoutTimes(
     setting("hideoutConstructionMultiplier").asFloat(1.0))
   configureCraftTimes(setting("hideoutProductionMultiplier").asFloat(1.0))
@@ -3424,7 +3504,9 @@ proc onLoad(): Status =
   configureMarket(setting("fleaSpreadPercent").asInt(20),
                   setting("fleaOfferHours").asInt(12),
                   setting("fleaMaxOffers").asInt(600),
-                  setting("fleaSaleMinutes").asInt(30))
+                  setting("fleaSaleMinutes").asInt(30),
+                  setting("fleaPriceMultiplier").asFloat(1.0),
+                  setting("fleaSellFeePercent").asInt(0))
 
   # Read the server value modifiers out of config.json BEFORE the schema is
   # declared, so the page and `/client/globals` agree from the first request.

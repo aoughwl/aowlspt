@@ -116,11 +116,25 @@ var gTraderPriceMultiplier = 1.0
   ## payment; scaling only the second produces a shop that quietly takes a
   ## different number from the one on the label.
 
-proc configureTraders*(unlockAll: bool; priceMultiplier: float) =
+var gIgnoreStockLimits = false
+  ## Whether a trader's `upd.StackObjectsCount` bounds a purchase.
+  ##
+  ## The assort's stock count is the per-item purchase limit -- the thing that
+  ## makes `buyFromTrader` answer "that trader has only 2 of those". Turning
+  ## this on removes that one check and nothing else: loyalty and quest gating
+  ## are `traderUnlockAllOffers`, and the price is
+  ## `traderPriceMultiplier`. Off by default, because unlimited stock is a
+  ## different game and nobody should get it without asking.
+
+proc configureTraders*(unlockAll: bool; priceMultiplier: float;
+                       ignoreStockLimits: bool) =
   gUnlockAllOffers = unlockAll
   gTraderPriceMultiplier = priceMultiplier
+  gIgnoreStockLimits = ignoreStockLimits
 
 proc traderPriceMultiplier*(): float = gTraderPriceMultiplier
+
+proc traderIgnoreStockLimits*(): bool = gIgnoreStockLimits
 
 proc scaleTraderCount*(count: int): int =
   ## A requirement count with the price multiplier applied.

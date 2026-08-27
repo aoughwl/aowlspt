@@ -184,6 +184,19 @@ var gOfferHours = DefaultOfferHours
 var gMaxOffers = DefaultMaxOffers
 var gSaleMinutes = DefaultSaleMinutes
 
+var gPriceMultiplier = 1.0
+  ## What every flea asking price is multiplied by.
+  ##
+  ## Applied at the TWO places an offer's price is born -- the trader-derived
+  ## rows in `traderCandidates` and the handbook-derived rows in
+  ## `generatedOffer` -- and nowhere else, because `buyOffer` charges
+  ## `o.price`. Scaling one origin and not the other is a market where half the
+  ## rows ignore the setting, which reads as "the setting does nothing".
+var gSellFeePercent = 0
+  ## A percentage of the asking price, taken out of the stash when the player
+  ## LISTS something. 0 is the default and means listing is free, which is what
+  ## this server did before the setting existed.
+
 var gOffers: seq[Offer] = @[]
 var gCategories: seq[Category] = @[]
 var gBuiltAt = 0
@@ -195,7 +208,8 @@ var gTargeted = 0
   ## rebuilt, which drops them all and starts the count again.
 
 proc configureMarket*(spreadPercent, offerHours, maxOffers,
-                      saleMinutes: int) =
+                      saleMinutes: int; priceMultiplier: float;
+                      sellFeePercent: int) =
   ## Called once at load, from config. Out-of-range values are corrected rather
   ## than refused: a spread of -100% would list every item for nothing and a cap
   ## of zero would produce a flea screen that is empty for a reason no log line
@@ -209,6 +223,11 @@ proc configureMarket*(spreadPercent, offerHours, maxOffers,
   if gMaxOffers < 1: gMaxOffers = 1
   gSaleMinutes = saleMinutes
   if gSaleMinutes < 0: gSaleMinutes = 0
+  gPriceMultiplier = priceMultiplier
+  if gPriceMultiplier < 0.0: gPriceMultiplier = 0.0
+  gSellFeePercent = sellFeePercent
+  if gSellFeePercent < 0: gSellFeePercent = 0
+  if gSellFeePercent > 100: gSellFeePercent = 100
   # Any change to pricing invalidates what was already generated.
   gBuilt = false
 
@@ -287,6 +306,24 @@ proc spreadPrice(base, tpl: string; handbook: int): int =
     p = p + wobble
   if p < 1: p = 1
   result = p
+
+proc scaleFleaPrice*(price: int): int =
+  ## An asking price with `fleaPriceMultiplier` applied.
+  ##
+  ## A multiplier of exactly 0 is the ONE case that may produce 0 -- that is
+  ## the "everything is free" setting, asked for by name, and rounding it up to
+  ## 1 would make the row lie. Any other multiplier floors at 1, because a
+  ## price rounded down to nothing turns "cheap" into "free" for whichever
+  ## items happened to be cheapest, which is not what the number says.
+  if gPriceMultiplier == 1.0:
+    return price
+  if gPriceMultiplier == 0.0:
+    return 0
+  if price <= 0:
+    return price
+  result = int(float(price) * gPriceMultiplier + 0.5)
+  if result < 1:
+    result = 1
 
 const SellerNames = ["Kappa", "Zryachiy", "Tagilla", "Reshala", "Killa",
                      "Glukhar", "Sanitar", "Shturman", "Kaban", "Partisan",
@@ -442,7 +479,7 @@ proc traderCandidates(nowSec: int; onlyTpl: string; cand: var seq[Offer];
       var o = Offer(id: newId(), tpl: tpl, itemsJson: "", rootId: "",
                     sellerId: tid, seller: nickname,
                     memberType: MemberTypeTrader, rating: 1.0,
-                    ratingGrowing: true, price: price, currency: reqTpl,
+                    ratingGrowing: true, price: scaleFleaPrice(price), currency: reqTpl,
                     loyalty: loyalties.child(offerItemId).asInt(1),
                     quantity: count, unlimited: true, sellInOnePiece: false,
                     startTime: nowSec, endTime: nowSec + gOfferHours * 3600,
@@ -472,7 +509,7 @@ proc generatedOffer(nowSec: int; tpl, category: string; base: int): Offer =
   result = Offer(id: newId(), tpl: tpl, itemsJson: "", rootId: "",
                  sellerId: "", seller: seller, memberType: MemberTypePlayer,
                  rating: ratingFor(seller), ratingGrowing: true,
-                 price: spreadPrice(seller, tpl, base) * count,
+                 price: scaleFleaPrice(spreadPrice(seller, tpl, base) * count),
                  currency: CurrencyRoubles, loyalty: 1, quantity: count,
                  unlimited: false, sellInOnePiece: count > 1,
                  startTime: nowSec, endTime: nowSec + gOfferHours * 3600,
@@ -1331,6 +1368,21 @@ proc addOffer*(inv: var Inventory; action: JsonRef; profileId, stashId: string;
       let ki = indexOf(inv, k)
       if ki >= 0:
         kept.add inv.items.items[ki]
+
+  # The listing fee, if `fleaSellFeePercent` is above zero. Charged HERE --
+  # after every item in the offer has been found and before any of them is
+  # removed -- so a listing that is refused for naming an item that is not
+  # there has not already taken money for it. `spendCurrency` refuses when the
+  # stash cannot cover it, and refusing is the whole point of a fee.
+  if gSellFeePercent > 0:
+    let lots = (if action.field("sellInOnePiece").asBool(false): 1 else: total)
+    var fee = (price * lots * gSellFeePercent) div 100
+    if fee < 1: fee = 1
+    if not spendCurrency(inv, CurrencyRoubles, fee, stashId, ch):
+      ch.problems.add "the flea market's listing fee is " & $fee &
+                      " roubles and the stash cannot cover it; nothing " &
+                      "was listed"
+      return false
 
   for id in toRemove:
     if not removeItem(inv, id, ch):
