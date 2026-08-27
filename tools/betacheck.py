@@ -56,6 +56,12 @@ constant is the failure mode this file exists to avoid.
                point past each family's own ceiling -- a correct server must
                go red on all three
     loyalty    accept a trader still sitting at loyalty level 1 as maxed
+    weatherarray  demand that /client/weather sends `weather` as an ARRAY --
+               the shape a WRONG DTO mapping implied and which BSG's own
+               capture contradicts -- so a correct server must go red
+    dictshapes demand that the six declared-Dictionary members of the served
+               profile arrive as JSON ARRAYS -- which is exactly the defect
+               that shipped -- so a correct server must go red
     tolerated  require BSG's own captured payloads to carry `SeasonsSettings`
                and `exchange_rate`.  They do not -- that is the whole basis of
                the CORRECT-AS-IS verdict on those two members -- so a correct
@@ -1003,9 +1009,7 @@ def check_settings_write_client(w, mut):
         return
     mods = (idx or {}).get("mods") if isinstance(idx, dict) else None
     if not isinstance(mods, list) or not mods:
-        record("settings-write-client", INCONC,
                "the settings index named no mods")
-        return
 
     tried = []
     for m in mods:
@@ -1013,19 +1017,15 @@ def check_settings_write_client(w, mut):
             continue
         guid = m.get("guid") or ""
         if not guid:
-            continue
         rows, why = _settings_rows(w.port, guid)
         if rows is None:
             tried.append("%s: %s" % (guid, why))
-            continue
         if not rows:
             # The `waiting` reply: published in the nav, page not pushed yet.
             tried.append("%s: no rows yet (%s)" % (guid, why or "no reason given"))
-            continue
         key, cur = _writable_row(rows)
         if not key:
             tried.append("%s: no implemented bool row" % guid)
-            continue
 
         want = not cur
         wire = "true" if want else "false"
@@ -1039,7 +1039,6 @@ def check_settings_write_client(w, mut):
             waited += poll_s
             after, why2 = _settings_rows(w.port, guid)
             if after is None:
-                continue
             for r in after:
                 if isinstance(r, dict) and r.get("key") == key:
                     got = r.get("value")
@@ -1068,12 +1067,159 @@ def check_settings_write_client(w, mut):
                    "process never applied it (check the host log's `client "
                    "settings bridge:` lines for the refusal)"
                    % (guid, key, wire, st2, json.dumps(got), window_s))
-        return
 
-    record("settings-write-client", INCONC,
            "no client-side page offered an implemented bool row to write (%s)"
            % ("; ".join(tried) if tried else "no client-side pages at all -- "
               "the game process has not published, so this was NOT checked"))
+# ---------------------------------------------------------------------------
+# 15. mail: the TYPE of every member, not its presence
+#
+# The defect this exists for: `/client/mail/dialog/list` served
+# `"systemData": false`.  The client declares
+# `DialogueChatMessageSerializer.systemData` as `ChatMessageSystemData`, a
+# CLASS (measured with tools/fldoff.py), so Newtonsoft threw
+# "Could not cast or convert from System.Boolean" inside ExecuteRequest and the
+# RAID LOAD died -- not the inbox.  Every check we had asked "is the member
+# there?", and it was.
+# So this asserts a NEGATIVE about the FINISHED payload: no message in the
+# served inbox carries a `systemData` that is anything other than an object or
+# null (absent is fine -- a reference member left null is what BSG's own
+# ordinary messages produce, and we do NOT invent a populated one).
+# `--mutate systemdata` demands a BOOLEAN instead, so a correct payload must
+# FAIL -- that is the falsifying input.
+def check_mail_types(w, mut):
+    tag = "%04d" % random.randrange(10000)
+    st, doc, text = make_profile(w, "Mail" + tag, "standard")
+    if doc is None or not session_of(doc):
+        record("mail-types", INCONC, "no profile to post mail to")
+    sess = session_of(doc)
+    w.call("/client/game/profile/select", {"uid": sess}, sess)
+    # A raid that hands an item over is the cheapest way to make the server
+    # post real mail; an empty inbox would make this check unfalsifiable.
+    body = {"serverId": "betacheck.factory4_day.0",
+            "results": {"profile": {"_id": sess}, "result": "Survived",
+                        "killerId": "", "killerAid": "", "exitName": "Gate 0",
+                        "inSession": True, "favorite": False, "playTime": 60},
+            "lostInsuredItems": [],
+            "transferItems": {sess: [{"_id": "aaaaaaaaaaaaaaaaaaaaaa01",
+                                      "_tpl": "5449016a4bdc2d6f028b456f",
+                                      "upd": {"StackObjectsCount": 5000}}]}}
+    w.call("/client/match/local/end", body, sess)
+    st, doc, text = w.call("/client/mail/dialog/list", {}, sess)
+    if doc is None:
+        record("mail-types", INCONC,
+               "mail/dialog/list did not parse as JSON (%d bytes)" % len(text))
+    rows = envelope(doc)
+    if not isinstance(rows, list) or not rows:
+               "the served inbox is empty, so no message TYPE was examined")
+    bad = []
+    for d in rows:
+        m = d.get("message")
+        if not isinstance(m, dict):
+            bad.append("dialog %r has no message object" % d.get("_id"))
+        if "systemData" not in m:
+            sd, kind = None, "absent"
+            sd = m["systemData"]
+            kind = ("null" if sd is None else
+                    "object" if isinstance(sd, dict) else type(sd).__name__)
+        want_bool = (mut == "systemdata")
+        ok = isinstance(sd, bool) if want_bool else kind in ("absent", "null", "object")
+        if not ok:
+            bad.append("dialog %r message.systemData is %s (%r)"
+                       % (d.get("_id"), kind, sd))
+    if bad:
+        record("mail-types", FAIL, "; ".join(bad[:3]))
+    elif mut == "systemdata":
+        record("mail-types", OK,
+               "every message.systemData is a boolean (mutated expectation)")
+               "%d dialog(s): every message.systemData is object/null/absent, "
+               "never a scalar" % len(rows))
+
+
+# 16. profile/list: Dictionary members must be OBJECTS, never empty arrays
+# Same class as check 15 above.  Six members of `EFT.ProfileDescriptor` (and of
+# its `Hideout`) are declared `Dictionary<...>` -- measured with
+# tools/fldoff.py -- and this server emitted `[]` for every one of them,
+# because an "empty collection" default reached for a seq.  Newtonsoft does not
+# degrade on a Dictionary that arrives as a JSON array: it throws, inside the
+# client's own ExecuteRequest, which is how `systemData: false` killed a raid
+# load rather than an inbox.
+# This asserts a NEGATIVE about the FINISHED served payload: no member in
+# DICT_MEMBERS is a list.  Absent is INCONCLUSIVE for that member rather than a
+# pass -- "I could not look" is not a pass -- and a non-dict scalar is a FAIL.
+# `--mutate dictshapes` demands a LIST instead, so a correct server must go red;
+# that is the falsifying input.
+DICT_MEMBERS = [
+    ("Hideout", "MannequinPoses"),   # Dictionary<string, MongoID>
+    (None, "WishList"),              # Dictionary<MongoID, byte>
+    (None, "Achievements"),          # Dictionary<MongoID, int>
+    (None, "Prestige"),              # Dictionary<MongoID, int>
+    (None, "CompletableItems"),      # Dictionary<MongoID, bool>
+    (None, "SeasonalRewards"),       # Dictionary<MongoID, SeasonalRewardData>
+]
+
+
+def check_dict_shapes(w, mut):
+    st, doc, text = make_profile(w, "Dict" + tag, "standard")
+        record("dict-shapes", INCONC, "no profile to read")
+    p, why = read_back(w, sess)
+    if p is None:
+        record("dict-shapes", INCONC, why)
+    want_list = (mut == "dictshapes")
+    bad, missing, seen = [], [], 0
+    for parent, name in DICT_MEMBERS:
+        holder = p if parent is None else p.get(parent)
+        label = name if parent is None else parent + "." + name
+        if not isinstance(holder, dict) or name not in holder:
+            missing.append(label)
+        seen += 1
+        v = holder[name]
+        ok = isinstance(v, list) if want_list else isinstance(v, dict)
+            bad.append("%s is %s (%s)" % (label, type(v).__name__,
+                                          json.dumps(v)[:40]))
+        record("dict-shapes", FAIL, "; ".join(bad))
+    elif seen == 0:
+        record("dict-shapes", INCONC,
+               "none of the %d Dictionary members were on the wire: %s"
+               % (len(DICT_MEMBERS), ", ".join(missing)))
+    elif missing:
+               "%d/%d checked; absent and therefore not examined: %s"
+               % (seen, len(DICT_MEMBERS), ", ".join(missing)))
+    elif want_list:
+        record("dict-shapes", OK,
+               "all %d Dictionary members are arrays (mutated expectation)" % seen)
+               "all %d declared-Dictionary members are JSON objects, "
+               "never arrays" % seen)
+
+
+# 17. /client/weather: `weather` is ONE object, and that is BSG's own shape
+# This is the check that stops a future "fix" from breaking a working route.
+# An audit read `/client/weather` against `JsonType.WeatherResponse`, whose
+# `Weathers` is `WeatherNode[]`, and reported that we send an object where an
+# array is declared.  The mapping was wrong, not the payload: the route's DTO
+# is `JsonType.LocationWeatherTime` (Season, SeasonsSettings, Weather:
+# WeatherNode, Acceleration, Date, Time -- a 5/5 key match against the served
+# body, versus 2/5 for WeatherResponse), and BSG's OWN captured response
+# raid1/responses/131.json sends `"weather": { ... }`, an object.
+# So the assertion is: `data.weather` is a JSON object, exactly as the capture
+# has it.  `--mutate weatherarray` demands an array -- the shape the wrong DTO
+# implied -- so a correct server must go red.
+def check_weather_shape(w, mut):
+    st, doc, text = w.call("/client/weather", {})
+        record("weather-shape", INCONC,
+               "/client/weather did not parse as JSON (%d bytes)" % len(text))
+    d = envelope(doc)
+    if not isinstance(d, dict) or "weather" not in d:
+               "the served body carries no `weather` member to examine")
+    v = d["weather"]
+    want_list = (mut == "weatherarray")
+        record("weather-shape", FAIL,
+               "data.weather is %s, not %s" % (type(v).__name__,
+                                               "an array" if want_list else "an object"))
+        record("weather-shape", OK, "data.weather is an array (mutated expectation)")
+        record("weather-shape", OK,
+               "data.weather is one object with %d members, as BSG capture 131 "
+               "sends it" % len(v))
 
 
 def main():
@@ -1942,6 +2088,24 @@ def main():
         check_trader_unlock(w, mut)
     except Exception as exc:                       # noqa: BLE001
         record("trader-loyalty", INCONC, "%s: %r" % (type(exc).__name__, exc))
+
+    # ------------------------------------------------------------------ 15
+    try:
+        check_mail_types(w, mut)
+    except Exception as exc:                       # noqa: BLE001
+        record("mail-types", INCONC, "%s: %r" % (type(exc).__name__, exc))
+
+    # ------------------------------------------------------------------ 16
+    try:
+        check_dict_shapes(w, mut)
+    except Exception as exc:                       # noqa: BLE001
+        record("dict-shapes", INCONC, "%s: %r" % (type(exc).__name__, exc))
+
+    # ------------------------------------------------------------------ 17
+    try:
+        check_weather_shape(w, mut)
+    except Exception as exc:                       # noqa: BLE001
+        record("weather-shape", INCONC, "%s: %r" % (type(exc).__name__, exc))
 
     # ------------------------------------------------------------------ 14
     try:

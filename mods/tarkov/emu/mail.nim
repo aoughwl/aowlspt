@@ -78,6 +78,26 @@ proc configureMail*(keepHours, keepCollected: int) =
   gKeepHours = keepHours
   gKeepCollected = keepCollected
 
+proc withoutBadSystemData*(messageJson: string): string =
+  ## Drops `systemData` unless it really is an object.
+  ##
+  ## The client DTO (`DialogueChatMessageSerializer.systemData`, measured with
+  ## tools/fldoff.py) is a reference type, so ABSENT and `null` both deserialise
+  ## to null and are fine; ANY scalar is a hard parse error. This never invents
+  ## a populated object -- we have no dump of one -- it only removes a value
+  ## that cannot possibly be right.
+  let m = whole(messageJson)
+  let sd = m.field("systemData")
+  if not sd.exists:
+    return messageJson
+  if sd.isObject or sd.isNull:
+    return messageJson
+  var d = parseObject(messageJson)
+  if not d.ok:
+    return messageJson
+  remove(d, "systemData")
+  result = text(d)
+
 proc loadMail*(profileId: string; usable: var bool): List =
   ## Every message for a profile, oldest first, and whether the inbox could be
   ## read at all.
@@ -93,6 +113,14 @@ proc loadMail*(profileId: string; usable: var bool): List =
   result = parseArray(raw1)
   if not result.ok:
     result = newList()
+  # Heal the stored inbox on the way out. Messages written before this existed
+  # carry `systemData: false`, and the client's `DialogueChatMessageSerializer`
+  # declares that member as `ChatMessageSystemData` -- an OBJECT. Newtonsoft
+  # cannot convert Boolean to a class, throws inside `ExecuteRequest`, and the
+  # exception kills the raid load, not just the inbox. Fixing only the writer
+  # would leave every existing mailbox broken forever, so the read heals too.
+  for i in 0 ..< result.len:
+    result.replaceAt(i, withoutBadSystemData(result.items[i]))
 
 proc loadMail*(profileId: string): List =
   ## For the read-only callers: the inbox screen, the dialog view, the
@@ -171,7 +199,6 @@ proc newMessage*(sender, text1: string; kind: MessageKind; nowSeconds: int;
     # 72 hours, the game's own default. A message whose items have no expiry is
     # one the client draws a blank timer on.
     setNumber(result, "maxStorageTime", 259200)
-  setBool(result, "systemData", false)
 
 proc collected(messageJson: string): bool =
   ## Has this message been emptied? `rewardCollected` is set by
