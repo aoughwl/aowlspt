@@ -25,6 +25,16 @@
 ## A key containing a dot is reachable with `child`, one step at a time. That is
 ## deliberate: an escaping rule inside the path syntax would be one more thing
 ## to get wrong at a call site that reads fine.
+## **Error semantics:** `field`, `child`, and `at` return `notFound` in two
+## cases: (1) a step in the path does not exist, or (2) the path navigation
+## was incorrect (mismatched braces, reached array boundary, etc). The API does
+## not distinguish these two cases. Callers should validate document structure
+## before relying on specific paths; use `exists()` to check if a reference was
+## found. Reading a notFound ref is safe (returns empty string or default values)
+## and will not crash, but confidently reading a default value as if it were the
+## actual data is a silent failure. This is intentional: distinguishing "absent"
+## from "mis-navigated" would require a three-value result type, making every
+## call site more verbose.
 
 import std/strutils
 
@@ -263,9 +273,9 @@ proc child*(j: JsonRef; key: string): JsonRef =
   if i > j.last or s[i] != '{':
     return
   inc i
-  while i <= j.last:
+  while i < s.len:
     skipWs(s, i)
-    if i > j.last or s[i] == '}':
+    if i >= s.len or s[i] == '}':
       return
     if s[i] != '"':
       return
@@ -274,7 +284,7 @@ proc child*(j: JsonRef; key: string): JsonRef =
       return
     let name = unquote(s.substr(nameStart + 1, i - 2))
     skipWs(s, i)
-    if i > j.last or s[i] != ':':
+    if i >= s.len or s[i] != ':':
       return
     inc i
     skipWs(s, i)
@@ -288,7 +298,7 @@ proc child*(j: JsonRef; key: string): JsonRef =
         dec stop
       return JsonRef(text: s, first: valueStart, last: stop, found: true)
     skipWs(s, i)
-    if i <= j.last and s[i] == ',':
+    if i < s.len and s[i] == ',':
       inc i
 
 proc count*(j: JsonRef): int =
