@@ -78,6 +78,59 @@ proc configureMail*(keepHours, keepCollected: int) =
   gKeepHours = keepHours
   gKeepCollected = keepCollected
 
+const SystemSenderId* = "000000000000000000000001"
+  ## The sender a message with no trader behind it comes from.
+  ##
+  ## It has to be a MongoId and it may not be empty. `ChatMessagesList+
+  ## DialogueChatMessageSerializer.Deserialize` hands the message's `uid`
+  ## straight to `UpdatableChatMember.FindOrCreate` -> `EFT.MongoID..ctor`,
+  ## which throws `ArgumentOutOfRangeException: Critical MongoId error:
+  ## incorrect length. Id:` on anything that is not 24 characters -- measured
+  ## in the client's own errors log, and it takes the WHOLE `/client/mail/
+  ## dialog/list` response down with it, not just that one row.
+  ##
+  ## 24 HEX characters: the ctor's message names only the length, but whether
+  ## it also validates the alphabet was NOT measured, so this stays inside what
+  ## a real MongoId looks like. No BSG trader id is a run of zeros, so a system
+  ## dialog cannot collide with a trader's.
+
+proc senderId*(sender: string): string =
+  ## A sender the client can construct a `MongoID` from.
+  ##
+  ## Real trader ids pass through untouched. Everything else -- `""` from the
+  ## BTR hand-over, `"ragfair"` from the three flea notices -- is mapped, and
+  ## mapped DETERMINISTICALLY, so the dialog a player pinned or removed is the
+  ## same dialog after a restart.
+  if sender.len == 24:
+    return sender
+  if sender.len == 0:
+    return SystemSenderId
+  # FNV-1a over the name, twice with different offsets, for 96 stable bits.
+  var a = 0xcbf29ce484222325'i64
+  var b = 0x100000001b3'i64
+  for ch in sender:
+    a = a xor int64(ord(ch))
+    a = a * 0x100000001b3'i64
+    b = b xor int64(ord(ch) + 131)
+    b = b * 0x100000001b3'i64
+  result = hex(a, 12) & hex(b, 12)
+
+proc withHealedSender*(messageJson: string): string =
+  ## Rewrites a stored message's `uid` if it cannot be a MongoId.
+  ##
+  ## Paired with `withoutBadSystemData` and for the same reason: fixing only
+  ## the writer leaves every mailbox that already holds a `""`-sender message
+  ## permanently unable to open its inbox.
+  let uid = field(messageJson, "uid").asText("")
+  let fixed = senderId(uid)
+  if fixed == uid:
+    return messageJson
+  var d = parseObject(messageJson)
+  if not d.ok:
+    return messageJson
+  setText(d, "uid", fixed)
+  result = text(d)
+
 proc withoutBadSystemData*(messageJson: string): string =
   ## Drops `systemData` unless it really is an object.
   ##
@@ -120,7 +173,7 @@ proc loadMail*(profileId: string; usable: var bool): List =
   # exception kills the raid load, not just the inbox. Fixing only the writer
   # would leave every existing mailbox broken forever, so the read heals too.
   for i in 0 ..< result.len:
-    result.replaceAt(i, withoutBadSystemData(result.items[i]))
+    result.replaceAt(i, withHealedSender(withoutBadSystemData(result.items[i])))
 
 proc loadMail*(profileId: string): List =
   ## For the read-only callers: the inbox screen, the dialog view, the
@@ -178,7 +231,7 @@ proc newMessage*(sender, text1: string; kind: MessageKind; nowSeconds: int;
   ## player looking for something that is not there.
   result = newDoc()
   setText(result, "_id", newId())
-  setText(result, "uid", sender)
+  setText(result, "uid", senderId(sender))
   setNumber(result, "type", ord(kind))
   setNumber(result, "dt", nowSeconds)
   setText(result, "templateId", "")

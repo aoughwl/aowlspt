@@ -1154,6 +1154,87 @@ def check_mail_types(w, mut):
                "never a scalar" % len(rows))
 
 
+
+# ---------------------------------------------------------------------------
+# 15b. mail: every sender id the client will build a MongoID from
+#
+# The defect this exists for, found the same way as 15 -- in the CLIENT's own
+# errors log, not in any sweep of ours:
+#
+#   ArgumentOutOfRangeException: ... Critical MongoId error: incorrect length.
+#   Id:
+#     at EFT.MongoID..ctor (System.String id)
+#     at ChatShared.UpdatableChatMember..ctor (System.String id)
+#     at ChatShared.ChatMessagesList+DialogueChatMessageSerializer.Deserialize
+#
+# `DialogueChatMessageSerializer` hands the message's `uid` straight to
+# `MongoID..ctor`, which rejects anything that is not 24 characters.  The BTR
+# hand-over posted mail with sender `""` and the flea notices with
+# `"ragfair"`; either throws, and the throw takes the WHOLE dialog/list
+# response with it -- the inbox does not miss a row, it does not load at all.
+#
+# The assertion is a NEGATIVE about the finished payload: no dialog `_id` and
+# no `message.uid` in the served inbox is anything other than exactly 24
+# characters.  `--mutate senderid` demands 23 instead, so a correct payload
+# must FAIL -- that is the falsifying input.
+def check_mail_sender_id(w, mut):
+    tag = "%04d" % random.randrange(10000)
+    st, doc, text = make_profile(w, "Sender" + tag, "standard")
+    if doc is None or not session_of(doc):
+        record("mail-sender-id", INCONC, "no profile to post mail to")
+        return
+    sess = session_of(doc)
+    w.call("/client/game/profile/select", {"uid": sess}, sess)
+    # The hand-over path is the one that posts a message with NO trader behind
+    # it -- the exact case that used to serve an empty uid.
+    body = {"serverId": "betacheck.factory4_day.0",
+            "results": {"profile": {"_id": sess}, "result": "Survived",
+                        "killerId": "", "killerAid": "", "exitName": "Gate 0",
+                        "inSession": True, "favorite": False, "playTime": 60},
+            "lostInsuredItems": [],
+            "transferItems": {sess: [{"_id": "aaaaaaaaaaaaaaaaaaaaaa01",
+                                      "_tpl": "5449016a4bdc2d6f028b456f",
+                                      "upd": {"StackObjectsCount": 5000}}]}}
+    w.call("/client/match/local/end", body, sess)
+    st, doc, text = w.call("/client/mail/dialog/list", {}, sess)
+    if doc is None:
+        record("mail-sender-id", INCONC,
+               "mail/dialog/list did not parse as JSON (%d bytes)" % len(text))
+        return
+    rows = envelope(doc)
+    if not isinstance(rows, list) or not rows:
+        record("mail-sender-id", INCONC,
+               "the served inbox is empty, so no sender id was examined")
+        return
+    want = 23 if mut == "senderid" else 24
+    bad, seen = [], 0
+    for d in rows:
+        ids = [("_id", d.get("_id"))]
+        m = d.get("message")
+        if isinstance(m, dict):
+            ids.append(("message.uid", m.get("uid")))
+        for where, v in ids:
+            if not isinstance(v, str):
+                bad.append("dialog %s is %s, not a string"
+                           % (where, type(v).__name__))
+                continue
+            seen += 1
+            if len(v) != want:
+                bad.append("%s = %r is %d chars; EFT.MongoID..ctor requires %d"
+                           % (where, v, len(v), want))
+    if bad:
+        record("mail-sender-id", FAIL, "; ".join(bad[:3]))
+    elif mut == "senderid":
+        record("mail-sender-id", OK,
+               "every sender id is 23 chars (mutated expectation)")
+    elif not seen:
+        record("mail-sender-id", INCONC, "no sender id was actually examined")
+    else:
+        record("mail-sender-id", OK,
+               "%d sender id(s) across %d dialog(s), all 24 chars, so "
+               "MongoID..ctor cannot throw" % (seen, len(rows)))
+
+
 # ---------------------------------------------------------------------------
 # 16. profile/list: Dictionary members must be OBJECTS, never empty arrays
 #
@@ -2242,6 +2323,11 @@ def main():
         check_mail_types(w, mut)
     except Exception as exc:                       # noqa: BLE001
         record("mail-types", INCONC, "%s: %r" % (type(exc).__name__, exc))
+
+    try:
+        check_mail_sender_id(w, mut)
+    except Exception as exc:                       # noqa: BLE001
+        record("mail-sender-id", INCONC, "%s: %r" % (type(exc).__name__, exc))
 
     # ------------------------------------------------------------------ 16
     try:
