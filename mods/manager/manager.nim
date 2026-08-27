@@ -460,6 +460,27 @@ proc isProtected(id: string): bool =
   ## that sentence becoming a rule instead of a note.
   result = id == ModGuid
 
+proc isInternal(id: string): bool =
+  ## PRESENTATION ONLY -- `internal` in `registry/mods.json`.
+  ##
+  ## Infrastructure the player has no business being offered: the settings
+  ## index every settings UI reads, the fallback browser page, a one-shot ABI
+  ## experiment. It is a category, not four special cases, and it is a
+  ## different question from `shipped`: `aowl.settingshub` ships in every
+  ## install and must be invisible; `aowl.textures` is not shipped yet and is
+  ## an ordinary player mod.
+  ##
+  ## Nothing here reaches resolution. `resolve`, the load order, `requires`,
+  ## the selection file and `/aowlspt/mods/client` never consult it, so an
+  ## internal mod is still resolved and still LOADED -- it is only absent from
+  ## the player-facing panel. A mod the registry does not know is not internal:
+  ## an unknown id is already a problem row, and calling it infrastructure
+  ## would make an unrecognised stray disappear, which is the one outcome this
+  ## must not produce.
+  var idx = -1
+  if not findMod(gRegistry, id, idx): return false
+  result = gRegistry.mods[idx].internal
+
 proc selectionDocument(): string =
   ## The resolved order, as the host would need it at startup.
   ##
@@ -767,6 +788,10 @@ proc decisionJson(d: Decision): JsonObject =
   put(o, "from", d.fromList)
   put(o, "explicit", d.explicit)
   put(o, "order", d.order)
+  # Present on the DIAGNOSTIC route only, and always -- `/aowlspt/mods/list`
+  # is the route that must never hide anything, so it names the rows the
+  # player-facing panel omits rather than omitting them too.
+  put(o, "internal", isInternal(d.id))
   # Same rule as the panel row: present only when the client host has actually
   # answered about this guid, so that absence stays the one way of saying "no
   # answer yet" on every route that carries it.
@@ -1287,7 +1312,9 @@ proc routePanel(url, body, session: string): string =
       # `unknown` is a list naming a mod the registry does not have. It has no
       # version, no artifact and nothing to toggle, so it is a problem rather
       # than a row -- it is already in `problems` and on `/conflicts`.
-      if d.verdict != vUnknown:
+      # Internal mods are omitted from the PANEL and from nowhere else. The
+      # row is gone; the mod is not. See `isInternal`.
+      if d.verdict != vUnknown and not isInternal(d.id):
         a.add panelRow(d)
     var o = obj()
     put(o, "ok", true)

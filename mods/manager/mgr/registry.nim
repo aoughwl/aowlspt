@@ -52,6 +52,19 @@ type
     provides*: seq[string]
     loadAfter*: seq[string]
     tags*: seq[string]
+    internal*: bool
+      ## PRESENTATION ONLY. True for infrastructure a player has no business
+      ## seeing on the mod list -- the settings index, the fallback browser
+      ## page, an ABI experiment. Nothing in resolution reads it: an internal
+      ## mod is resolved, ordered, required and loaded exactly as before. It
+      ## is a separate axis from `shipped`, on purpose -- `aowl.settingshub`
+      ## ships in every install and must be invisible, `aowl.textures` is not
+      ## shipped yet and is an ordinary player mod. Collapsing the two would
+      ## hide the wrong ones.
+    shipped*: bool
+      ## DISTRIBUTION ONLY. False when the built artifact can never reach an
+      ## install (`aowl payload` stages `mods/*`, so `examples/*` cannot).
+      ## Default true. Read by tooling; it does NOT hide a row -- see above.
 
   ListEntry* = object
     id*: string
@@ -216,7 +229,8 @@ proc readMod(j: JsonRef; warnings: var seq[string]): ModEntry =
                     sourceUrl: "", artifactDir: "", artifactLib: "",
                     license: "", downloadUrl: "", downloadHash: "",
                     requires: @[], conflicts: @[], provides: @[],
-                    loadAfter: @[], tags: @[])
+                    loadAfter: @[], tags: @[],
+                    internal: false, shipped: true)
   result.id = textOf(j.field("id"), "")
   if result.id.len == 0:
     warnings.add "a mod entry has no id and was skipped"
@@ -238,6 +252,8 @@ proc readMod(j: JsonRef; warnings: var seq[string]): ModEntry =
   result.provides = textList(j.field("provides"))
   result.loadAfter = textList(j.field("loadAfter"))
   result.tags = textList(j.field("tags"))
+  result.internal = j.field("internal").asBool(false)
+  result.shipped = j.field("shipped").asBool(true)
 
   let reqs = each(j.field("requires"))
   for r in reqs:

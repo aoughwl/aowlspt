@@ -87,7 +87,10 @@ import sp / page
 
 const
   ModGuid* = "aowl.maps"
-  ModName* = "Spatial"
+  ModName* = "Maps"
+    ## Was "Spatial". That was an internal word for the position feed; the
+    ## player-facing surface is a map, and this string is what both the mod
+    ## list and the F12 settings nav display (`modName()` in aowlspt/settings).
     ## A plain name covering all three views. Not "DynamicMaps", not "Radar",
     ## not any upstream project's name: another agent owns user-facing naming
     ## and no upstream branding is carried into anything a player sees.

@@ -4,7 +4,7 @@
     "id": "aowl.registry.official",
     "name": "aowlspt official registry",
     "description": "Every mod built in this repository, plus the lists that name them. One file with one git history, so a mod list is a document you can send someone.",
-    "revision": 14,
+    "revision": 15,
     "updated": "2026-08-27"
   },
   "mods": [
@@ -198,6 +198,7 @@
     {
       "id": "aowl.settingshub",
       "name": "SPT Settings Surface",
+      "internal": true,
       "author": "savannt",
       "version": "4.1.0",
       "description": "Collects every mod's schema from /aowlspt/settings/<guid> and serves one index, so a UI does not need to know which mods exist. The settings surface that ships in 1.0 is built on this; without it no settings page has anything to list.",
@@ -230,7 +231,8 @@
     },
     {
       "id": "aowl.uihub",
-      "name": "Fallback Settings UI",
+      "name": "Interface",
+      "internal": true,
       "author": "savannt",
       "version": "2.0.0",
       "description": "The browser settings page at /aowlspt/ui/page/settings. It reads and writes the exact same /aowlspt/settings/* routes any other UI would, including the per-row and page-level reset buttons, so it is the reference implementation as well as the shipping surface.",
@@ -370,6 +372,7 @@
     {
       "id": "aowl.callproof",
       "name": "Call Proof",
+      "internal": true,
       "author": "aowlspt",
       "version": "1.0.0",
       "shipped": false,
@@ -402,7 +405,7 @@
     },
     {
       "id": "aowl.maps",
-      "name": "Spatial",
+      "name": "Maps",
       "author": "aowlspt",
       "version": "0.1.0",
       "description": "Map, radar and direction indicators over one guarded position feed. The client half reads positions at measured static field offsets off the GameWorld the host's already-armed RegisterPlayer detour caches -- it resolves no IL2CPP name, installs no detour and calls no game method, because every by-name route is fatal on this build (fact #145). The server half serves 11 maps of real terrain SVG plus their calibration, and the three views are drawn in a browser at /aowlspt/ui/page/spatial. SHIPS DISABLED: the live feed is off until config.json `enabled` is set, and with it off nothing here touches game memory. The map browser works either way.",
