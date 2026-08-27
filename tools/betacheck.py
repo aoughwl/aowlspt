@@ -68,6 +68,7 @@ import json
 import os
 import random
 import sys
+import time
 import zlib
 
 OK, FAIL, INCONC = "PASS", "FAIL", "INCONCLUSIVE"
@@ -712,10 +713,13 @@ def check_settings_write(w, mut):
         return
 
     # SERVER-SIDE pages only.  A `client:true` page is owned by the game
-    # process and its edits are QUEUED, not applied, so re-reading it
-    # immediately shows the old value -- correctly.  Checking that transport
-    # from here would be a check that always fails; the host log's
-    # `client settings bridge:` lines settle that half.
+    # process and its edits are QUEUED, not applied, so an IMMEDIATE
+    # re-read shows the old value -- correctly, which is why this case does
+    # not touch them.  It is no longer unchecked: `check_settings_write_
+    # client` does the same round trip with a bounded wait instead of an
+    # immediate re-read.  Leaving that transport out entirely is how the
+    # client host shipped for months answering ErrUnsupported to every
+    # config write with nothing red anywhere.
     tried = []
     for m in mods:
         if not isinstance(m, dict) or m.get("client"):
@@ -777,6 +781,111 @@ def check_settings_write(w, mut):
     record("settings-write", INCONC,
            "no server-side page offered an implemented bool row to write (%s)"
            % ("; ".join(tried) if tried else "no server-side pages at all"))
+
+
+def check_settings_write_client(w, mut):
+    """The CLIENT-side round trip: write, wait, re-read from a separate GET.
+
+    This case used to be excluded, with the stated reason that a client page's
+    edits are QUEUED rather than applied, so an immediate re-read correctly
+    shows the old value.  That reason was true and the conclusion was wrong:
+    it made the one transport that was completely broken -- the client host
+    answered ErrUnsupported for every config write, so no client-side setting
+    could ever change -- the one transport nothing checked.
+
+    Queued is not unbounded.  The bridge cycle is ~5s, so the honest check is
+    a BOUNDED WAIT on the finished state: poll a separate GET until the value
+    is what was asked for, or until the window closes.  Three outcomes:
+
+      PASS          a separate GET reports the new value inside the window
+      FAIL          the window closed and the value is still the old one
+      INCONCLUSIVE  no client page is published at all, or it is still
+                    `waiting`, or no page offers a flippable bool -- "I could
+                    not look" is not a pass
+    """
+    window_s = 20.0
+    poll_s = 1.0
+
+    st, text = _settings_get(w.port, "/aowlspt/settings/index")
+    try:
+        idx = json.loads(text)
+    except Exception as exc:                       # noqa: BLE001
+        record("settings-write-client", INCONC,
+               "the settings index is not valid JSON (%s)" % exc)
+        return
+    mods = (idx or {}).get("mods") if isinstance(idx, dict) else None
+    if not isinstance(mods, list) or not mods:
+        record("settings-write-client", INCONC,
+               "the settings index named no mods")
+        return
+
+    tried = []
+    for m in mods:
+        if not isinstance(m, dict) or not m.get("client"):
+            continue
+        guid = m.get("guid") or ""
+        if not guid:
+            continue
+        rows, why = _settings_rows(w.port, guid)
+        if rows is None:
+            tried.append("%s: %s" % (guid, why))
+            continue
+        if not rows:
+            # The `waiting` reply: published in the nav, page not pushed yet.
+            tried.append("%s: no rows yet (%s)" % (guid, why or "no reason given"))
+            continue
+        key, cur = _writable_row(rows)
+        if not key:
+            tried.append("%s: no implemented bool row" % guid)
+            continue
+
+        want = not cur
+        wire = "true" if want else "false"
+        st2, _, _ = w.call("/aowlspt/settings/" + guid,
+                           {"key": key, "value": want})
+
+        got = cur
+        waited = 0.0
+        while waited < window_s:
+            time.sleep(poll_s)
+            waited += poll_s
+            after, why2 = _settings_rows(w.port, guid)
+            if after is None:
+                continue
+            for r in after:
+                if isinstance(r, dict) and r.get("key") == key:
+                    got = r.get("value")
+            if got == want:
+                break
+
+        # Put it back, and give the bridge the same window to take it, so a
+        # failing run is not also a destructive one.
+        w.call("/aowlspt/settings/" + guid, {"key": key, "value": cur})
+
+        # THE FALSIFYING INPUT.  `--mutate setwriteclient` demands the value
+        # came back UNCHANGED after the full window -- the shape this whole
+        # case exists to catch -- so a host that really persists goes red.
+        applied = (got == want)
+        if mut == "setwriteclient":
+            applied = (got == cur)
+        if applied:
+            record("settings-write-client", OK,
+                   "%s.%s written %s over HTTP %d and READ BACK %s by a "
+                   "separate GET after %.0fs"
+                   % (guid, key, wire, st2, json.dumps(got), waited))
+        else:
+            record("settings-write-client", FAIL,
+                   "%s.%s was set to %s, the server answered HTTP %d, and a "
+                   "SEPARATE re-read still says %s after %.0fs -- the game "
+                   "process never applied it (check the host log's `client "
+                   "settings bridge:` lines for the refusal)"
+                   % (guid, key, wire, st2, json.dumps(got), window_s))
+        return
+
+    record("settings-write-client", INCONC,
+           "no client-side page offered an implemented bool row to write (%s)"
+           % ("; ".join(tried) if tried else "no client-side pages at all -- "
+              "the game process has not published, so this was NOT checked"))
 
 
 def main():
@@ -1593,6 +1702,13 @@ def main():
         check_settings_write(w, mut)
     except Exception as exc:                       # noqa: BLE001
         record("settings-write", INCONC, "%s: %r" % (type(exc).__name__, exc))
+
+    # ------------------------------------------------------------------ 15
+    try:
+        check_settings_write_client(w, mut)
+    except Exception as exc:                       # noqa: BLE001
+        record("settings-write-client", INCONC,
+               "%s: %r" % (type(exc).__name__, exc))
 
     print()
     bad = [r for r in results if r[1] != OK]

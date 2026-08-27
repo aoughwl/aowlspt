@@ -463,3 +463,127 @@ proc jsonFault*(text: string; into: var string): bool =
         state = 4
       else:
         state = 3
+
+type
+  MergeResult* = enum
+    ## Why a config merge did or did not produce a document. Deliberately
+    ## NOT the host status codes: this module has no host in it, which is
+    ## what lets the merge rules be tested without one. Each host maps
+    ## these onto its own statuses at the one call site.
+    mgOk,
+    mgBadArg,      ## empty key or empty value
+    mgNotFound,    ## a DOTTED path that is not in the document -- refused
+    mgNotObject    ## the document is not a JSON object at all
+
+proc jsonEscapeKey(s: string): string =
+  result = ""
+  for c in s:
+    case c
+    of '"':  result.add "\\\""
+    of '\\': result.add "\\\\"
+    else:    result.add c
+
+proc dominantEol(text: string): string =
+  ## What this file already uses. A config.json written by hand on Windows is
+  ## CRLF; one written by a mod build is LF. Rewriting the whole document in
+  ## the other one turns a one-key edit into a whole-file diff, and it is the
+  ## kind of incidental rewrite that has bitten this project before. So an
+  ## insert matches what is already there rather than picking a favourite.
+  result = "\n"
+  var i = 0
+  while i + 1 < text.len:
+    if text[i] == '\r' and text[i + 1] == '\n':
+      return "\r\n"
+    inc i
+
+proc lastMemberIndent(text: string; closeBrace: int): string =
+  ## The leading whitespace of the line the last member sits on, so an inserted
+  ## member lines up with its siblings instead of landing at column zero.
+  var i = closeBrace - 1
+  while i > 0 and (text[i] == ' ' or text[i] == '\t' or text[i] == '\r' or
+                   text[i] == '\n'):
+    dec i
+  var lineStart = i
+  while lineStart > 0 and text[lineStart - 1] != '\n':
+    dec lineStart
+  result = ""
+  var j = lineStart
+  while j < text.len and (text[j] == ' ' or text[j] == '\t'):
+    result.add text[j]
+    inc j
+  if result.len == 0:
+    result = "  "
+
+proc configMerge*(text, key, valueJson: string; err: var string;
+                  merged: var string): MergeResult =
+  ## `text` with `key` set to `valueJson`, or a refusal that says why.
+  ##
+  ## The reason this is not the backend's `mergeConfigKey`: that one INSERTS a
+  ## member for any key it cannot locate, including a DOTTED one.
+  ## `mods/sain/config.json` is nested (`global`/`roles`/`server`), so an edit
+  ## to `global.brainOn` that missed would create a literal top-level member
+  ## named `"global.brainOn"` -- a key the mod never reads, sitting beside the
+  ## real one, and a POST that answers `Ok` for a value that can never take
+  ## effect. That is exactly the "renders but changes nothing" failure this
+  ## write path exists to stop, so a dotted path that is not already in the
+  ## document is REFUSED, by status, and named in `err`.
+  ##
+  ## A single-segment key is still inserted when absent: a declared setting the
+  ## shipped `config.json` does not list yet is ordinary, and the top level is
+  ## the one place a member can be added without guessing at structure.
+  merged = ""
+  err = ""
+  if key.len == 0:
+    err = "config set needs a key"
+    return mgBadArg
+  if valueJson.len == 0:
+    err = "config set needs a value"
+    return mgBadArg
+  var vs = 0
+  var ve = 0
+  if locatePath(text, key, vs, ve):
+    # In-place span replacement: every other byte of the document -- key order,
+    # indentation, whitespace and line endings alike -- is the bytes that were
+    # already on disk.
+    #
+    # MEASURED (tests/json/test_config_merge.nim, before this trim existed):
+    # `locatePath` ends a BARE literal one byte past the whitespace that
+    # follows it, so splicing over `[vs, ve)` for `"brainOn": false\n  }`
+    # swallowed the newline and the closing brace's indentation and
+    # produced `"brainOn": true}`. A quoted value ends at its closing quote,
+    # which is why the flat string case looked correct and hid this. Every
+    # bool and every number in a nested config went through the broken path.
+    # `pathGet` never noticed because it strips what it returns.
+    var vEnd = ve
+    while vEnd > vs and (text[vEnd - 1] == ' ' or text[vEnd - 1] == '\t' or
+                         text[vEnd - 1] == '\r' or text[vEnd - 1] == '\n'):
+      dec vEnd
+    merged = text.substr(0, vs - 1) & valueJson & text.substr(vEnd)
+    return mgOk
+  if contains(key, "."):
+    err = "no such key: " & key &
+          " -- this config is nested and that path is not in it. Refusing to " &
+          "create a flat member of that name: the mod would never read it, " &
+          "and the edit would report success while changing nothing."
+    return mgNotFound
+  let trimmed = strip(text)
+  if trimmed.len < 2 or trimmed[0] != '{' or trimmed[trimmed.len - 1] != '}':
+    err = "config is not a JSON object; refusing to insert " & key
+    return mgNotObject
+  let member = "\"" & jsonEscapeKey(key) & "\": " & valueJson
+  var closeBrace = text.len - 1
+  while closeBrace > 0 and text[closeBrace] != '}':
+    dec closeBrace
+  var k = closeBrace - 1
+  while k > 0 and (text[k] == ' ' or text[k] == '\t' or text[k] == '\r' or
+                   text[k] == '\n'):
+    dec k
+  let eol = dominantEol(text)
+  if text[k] == '{':
+    merged = text.substr(0, k) & eol & "  " & member & eol &
+             text.substr(closeBrace)
+  else:
+    let indent = lastMemberIndent(text, closeBrace)
+    merged = text.substr(0, k) & "," & eol & indent & member &
+             text.substr(k + 1)
+  result = mgOk

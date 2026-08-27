@@ -1577,6 +1577,59 @@ proc configRead*(index: int; into: var string; err: var string): int32 =
   into = text
   result = StatusOk
 
+proc configWrite*(index: int; key, valueJson: string; err: var string): int32 =
+  ## Persist one edit into mod `index`'s own `config.json`, atomically.
+  ##
+  ## Every early return sets `err` and answers a real status. A write path that
+  ## can only say `Ok` is the check that cannot fail; the caller has to be able
+  ## to tell a persisted edit from a discarded one, and the F12 panel shows
+  ## whatever `err` says.
+  err = ""
+  let dir = modDirOf(index)
+  if dir.len == 0:
+    err = "no such mod context"
+    return ErrBadArg
+  let cfgPath = joinPath(dir, "config.json")
+  var text = ""
+  var readErr = ""
+  let rst = configRead(index, text, readErr)
+  if rst != StatusOk:
+    # Not created here. `ErrNotFound` means the mod ships no config.json and
+    # inventing one gives it a file whose shape we guessed; `ErrConfigParse`
+    # means rewriting would destroy whatever is actually in there.
+    err = readErr
+    return rst
+  var merged = ""
+  # `configMerge` is in `jsonpath` -- pure, no loader, no file system -- so
+  # the merge rules are testable offline without a host. `tests/json`
+  # exercises them directly; that is the only way the nested-refusal case
+  # gets checked without a running client.
+  case configMerge(text, key, valueJson, err, merged)
+  of mgOk: discard
+  of mgBadArg: return ErrBadArg
+  of mgNotFound: return ErrNotFound
+  of mgNotObject: return ErrConfigParse
+  var fault = ""
+  if jsonFault(merged, fault):
+    err = "refusing to write " & cfgPath & ": the merged document would not " &
+          "parse (" & fault & "). The value was almost certainly not a JSON " &
+          "literal."
+    return ErrBadArg
+  # Temp file in the SAME directory, then an atomic replace. A half-written
+  # config.json is a mod that runs on its defaults next start with no error
+  # anywhere, which is the failure `configRead`'s docstring is entirely about.
+  let tmpPath = cfgPath & ".aowltmp"
+  let wr = writeTextFile(tmpPath, merged)
+  if not wr.ok:
+    err = "could not write " & tmpPath
+    return ErrGeneric
+  let mv = replaceFileAt(tmpPath, cfgPath)
+  if not mv.ok:
+    discard removeFileAt(tmpPath)
+    err = "could not replace " & cfgPath & " (win32 " & $mv.err & ")"
+    return ErrGeneric
+  result = StatusOk
+
 proc modVersionOf*(index: int): string =
   if index < 0 or index >= gMods.len:
     return ""
