@@ -211,6 +211,25 @@ const
   WgCrumbHideRest  = 14'i32
   WgCrumbMarkers   = 15'i32
   WgCrumbDone      = 16'i32
+  # Inside duBuild. The live run narrowed the fault to "cloning the label pool",
+  # which is still a dozen distinct managed operations; these split it the rest
+  # of the way rather than inviting another guess.
+  WgCrumbBAnchor      = 17'i32
+  WgCrumbBRoot        = 18'i32
+  WgCrumbBProbeClone  = 19'i32
+  WgCrumbBProbeDraw   = 20'i32
+  WgCrumbBSrcCanvas   = 21'i32
+  WgCrumbBProbeCanvas = 22'i32
+  WgCrumbBDropCanvas  = 23'i32
+  WgCrumbBAssertLog   = 24'i32
+  WgCrumbBProbeReuse  = 25'i32
+  WgCrumbBPanelClone  = 26'i32
+  WgCrumbBPanelDraw   = 27'i32
+  WgCrumbBMarkClone   = 28'i32
+  WgCrumbBMarkDraw    = 29'i32
+  WgCrumbBScale       = 30'i32
+  WgCrumbBDiagDump    = 31'i32
+  WgCrumbBReadback    = 32'i32
 
 # ---- target indices, mirroring the AOWL_DU_* defines ----
 const
@@ -2331,6 +2350,27 @@ proc duDiagDump(anchor: Il2CppPtr) =
 # ---------------------------------------------------------------------------
 # Building and tearing down the label pool
 # ---------------------------------------------------------------------------
+## duBUILD FAULTS, counted separately from widget faults.
+##
+## They are not attributable to any widget -- the pool does not exist yet when
+## they happen -- so the per-widget retirement cannot save the panel from them.
+## That is exactly what the live run hit: eight identical faults in `duBuild`,
+## and a black screen.
+##
+## The response is to DEGRADE, not to die. After `cDuBuildFaultsBeforeMinimal`
+## faults inside `duBuild` the pool is rebuilt at its MINIMUM size -- one panel
+## label, no markers. If the fault is in the ninth clone, or anywhere in the
+## marker loop, a one-label panel still draws and the user gets a read-out
+## instead of nothing.
+##
+## It also PARTITIONS the cause, which is the more valuable half: if the minimum
+## builds, the fault is in the pool size or a later clone; if the minimum faults
+## too, it is in the very first `Instantiate` and nothing about the widget work
+## is implicated at all.
+const cDuBuildFaultsBeforeMinimal = 3
+var gDuBuildFaults = 0
+var gDuMinimalLogged = false
+
 proc duBuild(preloader: Il2CppPtr): bool =
   ## Clone every label the configuration asks for, once. Returns false while the
   ## anchor is not yet reachable (the caller retries next frame) and latches
@@ -2340,9 +2380,12 @@ proc duBuild(preloader: Il2CppPtr): bool =
     return true
   if gDuBuildFailed:
     return false
+  cWgCrumb(WgCrumbBAnchor)
+  cWgCrumbW(-1'i32)
   let anchor = duFindAnchor(preloader)
   if anchor == nil:
     return false                       # not yet; try again next frame
+  cWgCrumb(WgCrumbBRoot)
   let rootGo = duCanvasRootGo(anchor)
   if rootGo == nil:
     return false
@@ -2363,14 +2406,18 @@ proc duBuild(preloader: Il2CppPtr): bool =
   # across those frames precisely so that retrying does not clone every frame.
   # ---------------------------------------------------------------------
   if gDuProbe.tmp == nil:
+    cWgCrumb(WgCrumbBProbeClone)
     gDuProbe = duCloneLabel(anchor, rootGo)
     if gDuProbe.tmp == nil:
       gDuBuildFailed = true
       warn "debugui: Object::Instantiate produced no usable label clone; the " &
            "overlay cannot draw on this build (nothing was changed in the game)"
       return false
+    cWgCrumb(WgCrumbBProbeDraw)
     duMakeDrawable(gDuProbe, 400.0, 20.0)
+  cWgCrumb(WgCrumbBSrcCanvas)
   let srcCv0 = duReadPtrField(anchor, cDuOffTmpGCanvas())
+  cWgCrumb(WgCrumbBProbeCanvas)
   let probeCv = duReadPtrField(gDuProbe.tmp, cDuOffTmpGCanvas())
   if probeCv == nil:
     inc gDuProbeWaits
@@ -2399,6 +2446,7 @@ proc duBuild(preloader: Il2CppPtr): bool =
     # repaired.
     if not gDuCanvasDropTried:
       gDuCanvasDropTried = true
+      cWgCrumb(WgCrumbBDropCanvas)
       discard duDropNestedCanvas(gDuProbe.tmp, srcCv0)
       return false                     # re-check next frame
     inc gDuProbeWaits
@@ -2416,6 +2464,7 @@ proc duBuild(preloader: Il2CppPtr): bool =
          "]. Exactly one clone was made and it has been switched off. " &
          "Nothing else in the game was changed."
     return false
+  cWgCrumb(WgCrumbBAssertLog)
   okLog "debugui: canvas assertion PASSED -- probe clone and source label are " &
         "both on canvas 0x" & hexOf(cast[uint64](srcCv0)) & " (renderMode=" &
         duDescribeInt(DuCanvasMode, srcCv0) & ", scaleFactor=" &
@@ -2433,12 +2482,25 @@ proc duBuild(preloader: Il2CppPtr): bool =
   if not gDuCfg.espOn: nMark = 0
   if nMark > cDuMaxMarkers: nMark = cDuMaxMarkers
 
+  # DEGRADE RATHER THAN DIE -- see `gDuBuildFaults` above. Stop asking for
+  # thirty-three clones once several attempts have faulted, and ask for one.
+  if gDuBuildFaults >= cDuBuildFaultsBeforeMinimal:
+    nPanel = 1
+    nMark = 0
+    if not gDuMinimalLogged:
+      gDuMinimalLogged = true
+      warn "debugui: duBuild has faulted " & $gDuBuildFaults & " times; " &
+           "retrying at MINIMUM size (1 panel label, 0 markers) rather than " &
+           "going dark. If this builds, the fault is in the pool size or in a " &
+           "later clone; if it faults too, it is the first Instantiate."
+
   var panel: seq[DuLabel] = @[]
   # The probe becomes panel line 0 when the panel wants one, so the assertion
   # costs nothing; otherwise it is switched off and left alone.
   var reused = false
   if nPanel > 0:
     var p0 = gDuProbe
+    cWgCrumb(WgCrumbBProbeReuse)
     duStyle(p0, gDuCfg.panelFont, gDuCfg.panelR, gDuCfg.panelG, gDuCfg.panelB)
     duMakeDrawable(p0, 1200.0, gDuCfg.panelLine * 1.6)
     panel.add p0
@@ -2446,9 +2508,14 @@ proc duBuild(preloader: Il2CppPtr): bool =
   else:
     duHide(gDuProbe)
   for i in (if reused: 1 else: 0) ..< nPanel:
+    # The crumb's widget slot carries the CLONE INDEX here, so a fault names
+    # which of the nine died rather than only that one of them did.
+    cWgCrumbW(int32(i))
+    cWgCrumb(WgCrumbBPanelClone)
     var lab = duCloneLabel(anchor, rootGo)
     if lab.tmp == nil:
       break
+    cWgCrumb(WgCrumbBPanelDraw)
     duStyle(lab, gDuCfg.panelFont, gDuCfg.panelR, gDuCfg.panelG, gDuCfg.panelB)
     duMakeDrawable(lab, 1200.0, gDuCfg.panelLine * 1.6)
     # Born hidden. A fresh clone still carries the DONOR'S caption and the
@@ -2459,9 +2526,12 @@ proc duBuild(preloader: Il2CppPtr): bool =
     panel.add lab
   var marks: seq[DuLabel] = @[]
   for i in 0 ..< nMark:
+    cWgCrumbW(int32(i))
+    cWgCrumb(WgCrumbBMarkClone)
     var lab = duCloneLabel(anchor, rootGo)
     if lab.tmp == nil:
       break
+    cWgCrumb(WgCrumbBMarkDraw)
     duStyle(lab, gDuCfg.espFont, gDuCfg.espR, gDuCfg.espG, gDuCfg.espB)
     duMakeDrawable(lab, 400.0, gDuCfg.espFont * 1.6)
     # Markers especially: with ESP off, or in the menu where there are no bots,
@@ -2482,6 +2552,8 @@ proc duBuild(preloader: Il2CppPtr): bool =
   # They are the same number only when the CanvasScaler is at 1, and EFT's menu
   # canvas is not -- so an uncorrected marker for a bot at the middle of the
   # screen lands off the edge of it.
+  cWgCrumb(WgCrumbBScale)
+  cWgCrumbW(-1'i32)
   gDuCanvasScale = 1.0
   if panel.len > 0:
     let cv = duReadPtrField(panel[0].tmp, cDuOffTmpGCanvas())
@@ -2490,11 +2562,13 @@ proc duBuild(preloader: Il2CppPtr): bool =
       let s = cDuCallFP(fn, cv)
       if s > 0.01 and s < 100.0:
         gDuCanvasScale = s
+  cWgCrumb(WgCrumbBDiagDump)
   duDiagDump(anchor)
   # PLACEMENT READ-BACK. The clone starts life at the source's anchoredPosition,
   # which on a centre-pivot parent is the middle of the screen -- that is what
   # the user saw. So place panel line 0 for real and then ASK where it ended up,
   # rather than assuming the write took. Intended vs actual, side by side.
+  cWgCrumb(WgCrumbBReadback)
   if gDuPanel.len > 0:
     let wantX = gDuCfg.panelX
     let wantY = gDuCfg.panelY
@@ -2692,7 +2766,17 @@ proc debugUiFired(regs: Il2CppPtr) =
     let stage = cWgCrumbGet()
     let wi = int(cWgCrumbGetW())
     var where = $cWgCrumbTextC(stage)
-    if wi >= 0 and wi < gDuWidgets.len:
+    # THE SLOT MEANS TWO DIFFERENT THINGS, so it is never rendered ambiguously.
+    # In the draw loop it is a WIDGET index; inside duBuild's two pool loops it
+    # is a CLONE index, and printing a widget id for one of those would name an
+    # innocent widget for a fault raised before any widget existed.
+    let isCloneIdx = (stage == WgCrumbBPanelClone or
+                      stage == WgCrumbBPanelDraw or
+                      stage == WgCrumbBMarkClone or
+                      stage == WgCrumbBMarkDraw)
+    if isCloneIdx and wi >= 0:
+      where.add " -- clone index " & $wi
+    elif not isCloneIdx and wi >= 0 and wi < gDuWidgets.len:
       where.add " -- widget '" & gDuWidgets[wi].id & "' (index " & $wi &
                 ", fields '" & gDuWidgets[wi].fields & "')"
     if gDuFaults == 1 or (gDuFaults mod 240) == 0:
@@ -2704,6 +2788,13 @@ proc debugUiFired(regs: Il2CppPtr) =
     # off and every other widget keeps drawing. This is the difference between
     # "the overlay is off, good luck" and "the prof widget is off, and here is
     # the stage it died in".
+    # A duBuild fault is charged to duBuild, which drives the degrade-to-minimum
+    # retry. It is deliberately NOT counted as "isolated": it is not, and
+    # claiming otherwise would disable the whole-overlay backstop for precisely
+    # the case that needs it.
+    if stage >= WgCrumbBAnchor and stage <= WgCrumbBReadback:
+      inc gDuBuildFaults
+
     var isolated = false
     if wi >= 0 and wi < gDuWidgets.len and wi < gDuWidgetFaults.len and
        (stage == WgCrumbWText or stage == WgCrumbWPlace or
@@ -2761,23 +2852,34 @@ proc aowlHostGameWorldArmed(): int32 {.
   ## decline CLAUDE.md 6 forbids.
   if gDebugEspSlot >= 0 or gBotDiagSlot >= 0: 1'i32 else: 0'i32
 
-# THE DLL EXPORTS. Nim's `exportc` produces a C symbol, NOT a PE export -- and a
-# consumer resolves this by `GetProcAddress`, so without these two wrappers the
-# mod sees "no export" and correctly refuses. MEASURED before this change: the
-# built host DLL's export table held exactly 16 names, every one of them a
-# `aowl_region_*_x` wrapper from `region.nim`, and no `aowl_host_*` at all --
-# which is precisely why mods/admin, mods/sain and mods/morebots all reported
-# state 0. Same `__declspec(dllexport)` pattern as `region.nim`; `extern`
-# declarations keep it independent of emit order. Nothing here binds, walks,
-# calls into the game or writes: both wrappers are a single load of a cached
-# pointer that some OTHER, already-installed read-only detour populated.
+# MEASURED DEFECT: NEITHER OF THE TWO PROCS ABOVE WAS ACTUALLY EXPORTED.
+#
+# `{.exportc.}` gives the generated C function an unmangled NAME. It does NOT
+# put it in the DLL's export table -- that needs `__declspec(dllexport)`, and
+# this build has no .def file. `objdump -p` on the built host lists twelve
+# exports and neither `aowl_host_gameworld` nor `aowl_host_gameworld_armed` was
+# among them.
+#
+# The symptom, in the field: `mods/admin` and `mods/sain` both log
+#
+#     no host export aowl_host_gameworld (host too old, or not in the client)
+#
+# against a host that has the code for it a few lines above. That message is
+# accurate about what it observed and badly misleading about why -- it sends
+# people looking for a stale deployment when the export never existed in ANY
+# build. `region.nim` avoided this only because it wraps every export in an
+# explicit `AOWL_RG_EXPORT` (`__declspec(dllexport)`) thunk.
+#
+# So the Nim procs above are now named `*_impl`, and these thunks publish them
+# under the EXACT names the already-shipped mods call `GetProcAddress` for.
+# Nothing has to be rebuilt on the mod side.
 {.emit: """
 extern void* aowl_host_gameworld_impl(void);
-extern int32_t aowl_host_gameworld_armed_impl(void);
+extern int   aowl_host_gameworld_armed_impl(void);
 __declspec(dllexport) void* aowl_host_gameworld(void) {
     return aowl_host_gameworld_impl();
 }
-__declspec(dllexport) int32_t aowl_host_gameworld_armed(void) {
+__declspec(dllexport) int aowl_host_gameworld_armed(void) {
     return aowl_host_gameworld_armed_impl();
 }
 """.}
