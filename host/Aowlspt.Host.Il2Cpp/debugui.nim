@@ -53,7 +53,7 @@
 
 # ---- the target table, thunks and offsets (abi/aowlspt_debugui.h) ----
 proc cDuFn(i: int32): Il2CppPtr {.importc: "aowl_du_fn", nodecl.}
-proc cDuName(i: int32): Il2CppPtr {.importc: "aowl_du_name", nodecl.}
+proc cDuName(i: int32): cstring {.importc: "aowl_du_name", nodecl.}
 proc cDuRva(i: int32): uint32 {.importc: "aowl_du_rva", nodecl.}
 proc cDuTargetCount(): int32 {.importc: "aowl_du_target_count", nodecl.}
 proc cDuOkCount(): int32 {.importc: "aowl_du_ok_count", nodecl.}
@@ -248,7 +248,21 @@ const
   WgCrumbRClimbParent = 42'i32
   WgCrumbRRectSrc     = 43'i32
 
-# ---- target indices, mirroring the AOWL_DU_* defines ----
+# ---- target indices into `aowl_du_targets` in abi/aowlspt_debugui.h ----
+#
+# These are POSITIONAL indices into a C array, and nothing in either language
+# ties a name here to a row there. On 2026-08-24, commit 7eb60cb inserted
+# `RectTransform::get_anchorMax` into the MIDDLE of that table for the
+# inspector's `rect` verb and did not add a name here, so every index from 13
+# up addressed the row BEFORE the one it meant. `DuGetParent` = 18 resolved to
+# `Transform::set_localPosition` -- a byte-verified, non-shared, perfectly
+# valid function of the WRONG SHAPE. `aowl_du_call_p_p` passes (this, NULL),
+# so the setter read its Vector3 argument through a NULL pointer and faulted
+# inside the call at climb depth 0, on a receiver that had just passed every
+# liveness gate. Four rounds of fixing the walk could not have found it.
+# `duIndicesOk` below is the check that makes this failure mode impossible to
+# ship again -- it compares the NAME the C table actually holds at each index
+# against the name this code believes is there.
 const
   DuCameraMain     = 0'i32
   DuWorldToScreen  = 1'i32
@@ -263,20 +277,21 @@ const
   DuSetSizeDelta   = 10'i32
   DuGetAnchorMin   = 11'i32
   DuGetPivot       = 12'i32
-  DuGetRect        = 13'i32
-  DuGetLocalScale  = 14'i32
-  DuSetLocalScale  = 15'i32
-  DuGetLocalPos    = 16'i32
-  DuSetLocalPos    = 17'i32
-  DuGetParent      = 18'i32
-  DuGoActiveSelf   = 19'i32
-  DuGoActiveInHier = 20'i32
-  DuGoLayer        = 21'i32
-  DuCanvasOrder    = 22'i32
-  DuCanvasMode     = 23'i32
-  DuCanvasScale    = 24'i32
-  DuSetRaycast     = 25'i32
-  DuSetEnabled     = 26'i32
+  DuGetAnchorMax   = 13'i32
+  DuGetRect        = 14'i32
+  DuGetLocalScale  = 15'i32
+  DuSetLocalScale  = 16'i32
+  DuGetLocalPos    = 17'i32
+  DuSetLocalPos    = 18'i32
+  DuGetParent      = 19'i32
+  DuGoActiveSelf   = 20'i32
+  DuGoActiveInHier = 21'i32
+  DuGoLayer        = 22'i32
+  DuCanvasOrder    = 23'i32
+  DuCanvasMode     = 24'i32
+  DuCanvasScale    = 25'i32
+  DuSetRaycast     = 26'i32
+  DuSetEnabled     = 27'i32
 
 # ---------------------------------------------------------------------------
 # Caps
@@ -3150,6 +3165,65 @@ proc debugEspRegisterFired(regs: Il2CppPtr) =
   if gwRaw != 0'u64:
     duNoteGameWorld(cast[Il2CppPtr](gwRaw))
 
+proc duIndicesOk(): bool =
+  ## Assert the FINISHED STATE of the index table, not our own belief about it.
+  ##
+  ## For every index this module calls by name, compare the name the C table
+  ## actually holds at that index with the name the code means. A row inserted
+  ## anywhere in `aowl_du_targets` -- which is what actually happened, and cost
+  ## four rounds -- shifts at least one of these and is caught HERE, at bind,
+  ## instead of as a null-pointer fault inside Unity a hundred frames later.
+  ## Falsifiable by construction: insert or delete any row and it fails.
+  const expect: array[28, string] = [
+    "UnityEngine.Camera::get_main",
+    "UnityEngine.Camera::WorldToScreenPoint(Vector3)",
+    "UnityEngine.RectTransform::set_anchoredPosition",
+    "UnityEngine.RectTransform::set_anchorMin",
+    "UnityEngine.RectTransform::set_anchorMax",
+    "UnityEngine.RectTransform::set_pivot",
+    "UnityEngine.Component::get_transform",
+    "UnityEngine.Transform::get_root",
+    "UnityEngine.RectTransform::get_anchoredPosition",
+    "UnityEngine.RectTransform::get_sizeDelta",
+    "UnityEngine.RectTransform::set_sizeDelta",
+    "UnityEngine.RectTransform::get_anchorMin",
+    "UnityEngine.RectTransform::get_pivot",
+    "UnityEngine.RectTransform::get_anchorMax",
+    "UnityEngine.RectTransform::get_rect",
+    "UnityEngine.Transform::get_localScale",
+    "UnityEngine.Transform::set_localScale",
+    "UnityEngine.Transform::get_localPosition",
+    "UnityEngine.Transform::set_localPosition",
+    "UnityEngine.Transform::get_parent",
+    "UnityEngine.GameObject::get_activeSelf",
+    "UnityEngine.GameObject::get_activeInHierarchy",
+    "UnityEngine.GameObject::get_layer",
+    "UnityEngine.Canvas::get_sortingOrder",
+    "UnityEngine.Canvas::get_renderMode",
+    "UnityEngine.Canvas::get_scaleFactor",
+    "UnityEngine.UI.Graphic::set_raycastTarget",
+    "UnityEngine.Behaviour::set_enabled"]
+  result = true
+  let n = int(cDuTargetCount())
+  if n != expect.len:
+    warn "debugui: the managed-target table holds " & $n & " rows, this " &
+         "module was written against " & $expect.len & ". Every index below " &
+         "the change is addressing the wrong method. NOT arming."
+    return false
+  for i in 0 ..< n:
+    let got = $cDuName(int32(i))
+    if got != expect[i]:
+      warn "debugui: managed-target index " & $i & " holds '" & got &
+           "' but this module calls it as '" & expect[i] & "'. A row was " &
+           "inserted into or removed from aowl_du_targets and the indices in " &
+           "debugui.nim were not moved with it. NOT arming."
+      result = false
+  # Named spot-checks, so the log names the two that have actually bitten.
+  if result:
+    okLog "debugui: managed-target indices self-checked -- get_parent=" &
+          $DuGetParent & " '" & $cDuName(DuGetParent) & "', get_rect=" &
+          $DuGetRect & " '" & $cDuName(DuGetRect) & "'"
+
 proc bindDebugUi(verbose: bool): bool =
   ## Installs the kind=10 PREFIX detour on `EFT.UI.PreloaderUI::Update` from the
   ## verified static target in `aowlspt_debugui.h`. Opt-in (`debugUi`/`debugEsp`);
@@ -3167,6 +3241,8 @@ proc bindDebugUi(verbose: bool): bool =
   duLoadWidgets()
   okLog "debugui: " & $gDuWidgets.len & " widget(s) configured -- " &
         gDuLayoutSource
+  if not duIndicesOk():
+    return false
   var ok = 0
   var bad = 0
   for i in 0 ..< int(cDuTargetCount()):
