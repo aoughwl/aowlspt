@@ -1034,6 +1034,14 @@ proc buildDeploySet(e: Env): int =
       let cut = find(p, "\\bin\\")
       inc mods
       discard buildMod(e, joinPath(e.repo, p.substr(0, cut - 1)))
+    elif find(p, "\\bin\\") < 0 and not startsWith(p, "installer\\build\\") and
+         fileExists(joinPath(e.repo, p)):
+      # Checked-in data that is SHIPPED but not BUILT -- `registry\mods.json`
+      # is the first of these. It is deliberately not silent: the condition
+      # requires the file to exist in the repo right now, so a typo'd or
+      # deleted path still falls through to the loud error below rather than
+      # being waved past as "probably data".
+      note "deploy set: " & s & " is checked-in data, nothing to build"
     else:
       err "tools\\deploy.json ships '" & s & "' and this build target does " &
           "not know how to build it."

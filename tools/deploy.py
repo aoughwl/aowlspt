@@ -45,14 +45,63 @@ real build failure and stays FAIL; if the artifact exists, its markers are
 checked exactly as before and a missing one still FAILs loudly. There is no
 path by which declaring an input can weaken a marker.
 
-Exit codes: 0 ok, 1 a marker was missing or a copy failed, 2 bad usage,
-3 nothing failed but at least one artifact was INCONCLUSIVE. A release
-script can therefore refuse on 1 and tolerate 3 with a visible notice.
+DATA IS PART OF THE ARTIFACT
+----------------------------
+Until 2026-08-27 this tool shipped DLLs and executables and nothing else, and
+three separate live failures in one day were all that same hole:
+
+  * `mods/tarkov/data/post1/globalsgaps.json` was not shipped. tarkov.dll's
+    own self-check found it missing and registered ONLY its selfcheck route;
+    what the player saw was "unable to check client version".
+  * `registry/mods.json` was not shipped, so the manager could not find
+    `aowl.list.beta` and quietly loaded two mods instead of eight.
+  * `mods/maps/data/**` was not shipped -- 8 maps reported no data.
+
+Every one of them was silent at the point of failure and loud somewhere
+unrelated. So an artifact may now declare the data it needs:
+
+    "data": [{"src": "mods/tarkov/data", "dst": "mods/tarkov/data",
+              "exclude": ["capture/**", "*.md"], "minFiles": 600,
+              "why": "the emulator refuses to start a raid without post1/"}]
+
+The file list is DERIVED by walking `src`, never enumerated by hand -- a
+hardcoded list rots the day someone adds a data file, which is the same class
+of bug as the duplicated build list removed earlier the same day.
+
+The exclusion set is not invented here. `aowl payload` / `stageTarkovData` in
+`tools/aowl.nim` already established it for staging, for reasons that apply
+verbatim: `data/capture/**` is a recording of the real backend kept to check
+this server AGAINST -- 690 files the server never serves, most of them
+regenerated rather than stored, so a payload built on one machine would carry
+them and one built on another would not. It is skipped by NAME, not by size,
+because "large" is not the reason. `*.md` is documentation
+(`data/post1/README.md` and friends); nothing loads it.
+
+Marker verification is SOURCE side and gates the deploy. Data verification is
+INSTALL side -- it asks whether the live install actually holds the bytes, so
+it is a post-condition, not a precondition:
+
+    check    markers on the built file  +  data present and identical in the
+             install. A data file that is absent or differs is a FAIL, named.
+    deploy   markers gate the copy; data is copied; then the same install-side
+             data verification runs AGAIN, and a deploy whose post-condition
+             does not hold reports FAIL rather than success.
+
+If a declared data source directory is missing from the repo, or derives zero
+files, nothing was verified -- that is INCONCLUSIVE (exit 3), never a pass.
+
+Exit codes: 0 ok, 1 a marker was missing, a data file was absent/different, or
+a copy failed, 2 bad usage, 3 nothing failed but at least one artifact was
+INCONCLUSIVE. A release script can therefore refuse on 1 and tolerate 3 with a
+visible notice.
 """
 
 import argparse
+import fnmatch
+import hashlib
 import json
 import os
+import posixpath
 import shutil
 import sys
 import time
@@ -116,6 +165,163 @@ def missing_input(art):
     return rel, req.get("why", "")
 
 
+def _excluded(rel, patterns):
+    """Does this repo-relative posix path match any exclusion pattern?
+
+    `a/**` excludes the directory `a` and everything under it. Anything else
+    is an fnmatch against the whole relative path AND against the basename,
+    so `*.md` catches `post1/README.md` as well as `README.md`.
+    """
+    for pat in patterns:
+        if pat.endswith("/**"):
+            head = pat[:-3]
+            if rel == head or rel.startswith(head + "/"):
+                return True
+        elif fnmatch.fnmatch(rel, pat) or \
+                fnmatch.fnmatch(posixpath.basename(rel), pat):
+            return True
+    return False
+
+
+def derive_data(rule):
+    """Walk the rule's source directory. Returns (files, note).
+
+    `files` is a sorted list of repo-relative-to-src posix paths. `note` is
+    None on success, or a string saying why nothing could be derived -- which
+    the caller must surface as INCONCLUSIVE, never as an empty pass.
+    """
+    rel_src = rule["src"].replace("/", os.sep)
+    root = os.path.join(REPO, rel_src)
+    if not os.path.isdir(root):
+        return [], "declared data source is not a directory: %s" % rule["src"]
+    excl = rule.get("exclude", [])
+    out = []
+    for dirpath, dirnames, filenames in os.walk(root):
+        rel_dir = os.path.relpath(dirpath, root).replace(os.sep, "/")
+        if rel_dir == ".":
+            rel_dir = ""
+        # Prune excluded directories rather than walking into them -- on
+        # `data/capture` that is 690 files and tens of megabytes of stat calls.
+        keep = []
+        for d in dirnames:
+            rd = posixpath.join(rel_dir, d) if rel_dir else d
+            if not _excluded(rd, excl):
+                keep.append(d)
+        dirnames[:] = keep
+        for fn in filenames:
+            rel = posixpath.join(rel_dir, fn) if rel_dir else fn
+            if not _excluded(rel, excl):
+                out.append(rel)
+    out.sort()
+    if not out:
+        return [], ("derived ZERO files from %s -- the exclusion set ate "
+                    "everything, so nothing was verified" % rule["src"])
+    return out, None
+
+
+def _sha(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while True:
+            b = f.read(1 << 20)
+            if not b:
+                return h.hexdigest()
+            h.update(b)
+
+
+def verify_data(art, install, C):
+    """Install-side: does the live install hold every declared data file?
+
+    Returns (verdict, problems). This is a post-condition, so it compares the
+    DESTINATION against the repo, not the repo against itself -- a check whose
+    only input is our own write is the failure mode CLAUDE.md 9b names.
+    """
+    rules = art.get("data", [])
+    if not rules and not art.get("verifyInstalled"):
+        return OK, []
+    if not os.path.isdir(install):
+        return INCONCLUSIVE, ["install directory does not exist: %s -- the "
+                              "data could not be looked at at all" % install]
+    problems = []
+    unknown = []
+    checked = 0
+
+    # `verifyInstalled` is for an artifact whose SOURCE is checked-in data
+    # rather than a build output -- `registry/mods.json`. Its markers are
+    # scanned in the repo copy, so marker verification alone says nothing
+    # about the install, and that is precisely how a registry a day old sat
+    # live while `check` printed ok. Compare the bytes.
+    if art.get("verifyInstalled"):
+        s = os.path.join(REPO, art["src"].replace("/", os.sep))
+        d = os.path.join(install, art["dst"].replace("/", os.sep))
+        if not os.path.isfile(s):
+            unknown.append("source is absent: %s -- nothing to compare the "
+                           "install against" % art["src"])
+        elif not os.path.isfile(d):
+            problems.append("ABSENT from the install: %s" % art["dst"])
+        elif os.path.getsize(s) != os.path.getsize(d) or _sha(s) != _sha(d):
+            problems.append("the installed %s DIFFERS from the repo copy -- "
+                            "the install is running a stale one" % art["dst"])
+
+    for rule in rules:
+        files, note = derive_data(rule)
+        if note:
+            unknown.append(note)
+            continue
+        floor = rule.get("minFiles", 1)
+        if len(files) < floor:
+            problems.append(
+                "%s derived only %d file(s), below the declared floor of %d "
+                "-- data is missing from the REPO, not just the install"
+                % (rule["src"], len(files), floor))
+            continue
+        src_root = os.path.join(REPO, rule["src"].replace("/", os.sep))
+        dst_root = os.path.join(install, rule["dst"].replace("/", os.sep))
+        missing = []
+        differs = []
+        for rel in files:
+            s = os.path.join(src_root, rel.replace("/", os.sep))
+            d = os.path.join(dst_root, rel.replace("/", os.sep))
+            if not os.path.isfile(d):
+                missing.append(rel)
+                continue
+            checked += 1
+            if os.path.getsize(s) != os.path.getsize(d) or _sha(s) != _sha(d):
+                differs.append(rel)
+        if missing:
+            problems.append("%s: %d of %d data file(s) ABSENT from the install:"
+                            % (rule["dst"], len(missing), len(files)))
+            for rel in missing[:12]:
+                problems.append("    MISSING  %s/%s" % (rule["dst"], rel))
+            if len(missing) > 12:
+                problems.append("    ... and %d more" % (len(missing) - 12))
+        if differs:
+            problems.append("%s: %d of %d data file(s) DIFFER from the repo:"
+                            % (rule["dst"], len(differs), len(files)))
+            for rel in differs[:12]:
+                problems.append("    DIFFERS  %s/%s" % (rule["dst"], rel))
+            if len(differs) > 12:
+                problems.append("    ... and %d more" % (len(differs) - 12))
+        if (missing or differs) and rule.get("why"):
+            problems.append("    why it matters: %s" % rule["why"])
+    if problems:
+        return FAIL, problems
+    if unknown:
+        return INCONCLUSIVE, unknown + [
+            "nothing was verified for this artifact's data -- this is NOT "
+            "evidence the install is correct."]
+    return OK, []
+
+
+def data_count(art):
+    """How many data files this artifact declares, for the ok line."""
+    n = 0
+    for rule in art.get("data", []):
+        files, note = derive_data(rule)
+        n += len(files)
+    return n
+
+
 def verify(art, src, C):
     """Return (verdict, list-of-problem-strings). Reads the file once."""
     red, green, yellow, dim, reset = C
@@ -157,19 +363,36 @@ def verify(art, src, C):
     return (OK if not problems else FAIL), problems
 
 
-def cmd_check(args, cfg, C):
+def cmd_check(args, cfg, C, check_data=True):
+    """`check_data=False` verifies markers only.
+
+    Used by `deploy` for its PRE-check: before a deploy the install is
+    expected to be out of date -- that is why you are deploying -- so letting
+    an install-side data mismatch refuse the copy would make the tool unable
+    to fix the exact failure it exists to catch. The data check runs again
+    after the copy, where it is a real post-condition.
+    """
     red, green, yellow, dim, reset = C
+    install = args.install or cfg["install"]
     arts = select(cfg, args.only)
     bad = 0
     unknown = 0
     for art in arts:
         src = os.path.join(REPO, art["src"].replace("/", os.sep))
         verdict, problems = verify(art, src, C)
+        if verdict == OK and check_data:
+            dverdict, dproblems = verify_data(art, install, C)
+            if dverdict != OK:
+                verdict, problems = dverdict, dproblems
         n = len(art.get("markers", []))
         if verdict == OK:
-            print("%sok%s   %-8s %s  (%d marker%s, %s bytes)"
+            extra = ""
+            if check_data and art.get("data"):
+                extra = ", %d data file%s" % (data_count(art),
+                                              "" if data_count(art) == 1 else "s")
+            print("%sok%s   %-8s %s  (%d marker%s%s, %s bytes)"
                   % (green, reset, art["name"], art["src"], n,
-                     "" if n == 1 else "s", os.path.getsize(src)))
+                     "" if n == 1 else "s", extra, os.path.getsize(src)))
             continue
         if verdict == INCONCLUSIVE:
             unknown += 1
@@ -184,12 +407,16 @@ def cmd_check(args, cfg, C):
         print("\n%s%d artifact(s) FAILED verification.%s" % (red, bad, reset))
         print("A missing marker means the feature's own text is not in the "
               "binary. Do NOT deploy this; rebuild from the right base.")
+        print("A MISSING or DIFFERS data line means the install does not hold "
+              "the bytes the artifact needs; `deploy` is what fixes that.")
     if unknown:
-        print("\n%s%d artifact(s) INCONCLUSIVE -- not built, and the input "
-              "they are built FROM is absent.%s" % (yellow, unknown, reset))
+        print("\n%s%d artifact(s) INCONCLUSIVE -- either not built with its "
+              "declared input absent, or its declared data could not be "
+              "derived.%s" % (yellow, unknown, reset))
         print("This is not a pass and not a failure: nothing was verified. "
-              "Supply the input and re-run, or deploy only the artifacts you "
-              "did build (--only).")
+              "Read the reason printed above the summary, supply what is "
+              "missing and re-run, or narrow to the artifacts you did build "
+              "(--only).")
     if bad:
         return 1
     return 3 if unknown else 0
@@ -207,7 +434,7 @@ def cmd_deploy(args, cfg, C):
     # Verify EVERYTHING first, then copy. A partial deploy -- new host DLL
     # against an old tarkov.dll -- is its own class of confusing bug, so if any
     # selected artifact is bad, nothing moves.
-    rc = cmd_check(args, cfg, C)
+    rc = cmd_check(args, cfg, C, check_data=False)
     if rc == 3:
         # Not a failure -- but an artifact that was never built cannot be
         # copied either, so the deploy still stops. The distinction matters
@@ -229,6 +456,15 @@ def cmd_deploy(args, cfg, C):
         dst = os.path.join(install, art["dst"].replace("/", os.sep))
         if args.dry_run:
             print("%s(dry-run)%s %-8s -> %s" % (dim, reset, art["name"], dst))
+            for rule in art.get("data", []):
+                files, note = derive_data(rule)
+                print("%s(dry-run)%s          %s -> %s"
+                      % (dim, reset,
+                         note if note else "%d data file(s)" % len(files),
+                         rule["dst"]))
+            for rel in art.get("invalidates", []):
+                print("%s(dry-run)%s          would invalidate %s"
+                      % (dim, reset, rel))
             continue
         os.makedirs(os.path.dirname(dst), exist_ok=True)
         if os.path.isfile(dst):
@@ -246,6 +482,86 @@ def cmd_deploy(args, cfg, C):
                   "still running. Close it and run this again." % (red, reset, dst))
             return 1
         print("%sok%s   %-8s -> %s" % (green, reset, art["name"], dst))
+
+        # The data the artifact declares, derived and copied with it. Copied
+        # unconditionally rather than "if newer": mtime is not evidence, and a
+        # hand-copied file with a fresh mtime and stale bytes is exactly the
+        # state three of today's failures were found in.
+        for rule in art.get("data", []):
+            files, note = derive_data(rule)
+            if note:
+                print("     %sINCONCLUSIVE%s %s -- no data was copied"
+                      % (yellow, reset, note))
+                continue
+            src_root = os.path.join(REPO, rule["src"].replace("/", os.sep))
+            dst_root = os.path.join(install, rule["dst"].replace("/", os.sep))
+            wrote = 0
+            for rel in files:
+                s = os.path.join(src_root, rel.replace("/", os.sep))
+                d = os.path.join(dst_root, rel.replace("/", os.sep))
+                os.makedirs(os.path.dirname(d), exist_ok=True)
+                try:
+                    shutil.copy2(s, d)
+                except PermissionError:
+                    print("%sFAIL%s %s is locked -- the game or "
+                          "aowlspt-backend.exe is still running."
+                          % (red, reset, d))
+                    return 1
+                wrote += 1
+            print("     data  %d file(s) -> %s" % (wrote, rule["dst"]))
+
+        # A DERIVED file downstream of what we just replaced is not evidence
+        # of anything once its input changes. `mods/aowlspt-selection.json` is
+        # written by the manager from `store/aowl.manager/selection` PLUS the
+        # registry; when the registry was stale it silently degraded to two
+        # mods and read as a working selection. Move it aside so the manager
+        # recomputes rather than trusting a file computed against a registry
+        # that no longer exists.
+        for rel in art.get("invalidates", []):
+            victim = os.path.join(install, rel.replace("/", os.sep))
+            if not os.path.isfile(victim):
+                continue
+            bak = backup_name(victim)
+            shutil.move(victim, bak)
+            print("     invalidated %s (derived from this artifact; the "
+                  "manager will recompute it) -> %s"
+                  % (rel, os.path.basename(bak)))
+
+    if not args.dry_run and any(a.get("data") or a.get("verifyInstalled")
+                                for a in arts):
+        # THE POST-CONDITION. Not a restatement of the copy above: it re-reads
+        # the install and hashes what is actually there. A deploy that copied
+        # and still does not hold the right bytes must not print success.
+        print("\nverifying the install now holds the declared data:")
+        post_bad = 0
+        post_unknown = 0
+        for art in arts:
+            if not art.get("data") and not art.get("verifyInstalled"):
+                continue
+            v, probs = verify_data(art, install, C)
+            if v == OK:
+                n = data_count(art)
+                what = ("%d data file(s)" % n) if n else "the installed copy"
+                print("%sok%s   %-8s %s present and identical"
+                      % (green, reset, art["name"], what))
+            elif v == INCONCLUSIVE:
+                post_unknown += 1
+                print("%sINCONCLUSIVE%s %-8s" % (yellow, reset, art["name"]))
+                for p in probs:
+                    print("       %s" % p)
+            else:
+                post_bad += 1
+                print("%sFAIL%s %-8s the copy did not take"
+                      % (red, reset, art["name"]))
+                for p in probs:
+                    print("       %s" % p)
+        if post_bad:
+            print("\n%sthe deploy POST-CONDITION does not hold.%s"
+                  % (red, reset))
+            return 1
+        if post_unknown:
+            print("\n%sdata post-condition INCONCLUSIVE -- the binaries were "
+                  "deployed, the data was not verified.%s" % (yellow, reset))
 
     if rollbacks:
         print("\nrollback:")
