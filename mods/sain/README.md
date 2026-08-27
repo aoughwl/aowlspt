@@ -1015,3 +1015,39 @@ client/     the only files that know Tarkov exists
   driver    who thinks, when: the budget, discovery, the raid-level passes
 server/     brain forcing, per-map difficulty, the preset route
 ```
+
+## What actually reaches a bot (and the two-band test that proves it)
+
+One thing does: **`difficulty` -> `BotMover.MoveSpeed`**, via `server/drive.nim`.
+It resolves no IL2CPP name at run time and binds no RVA of its own. It rides
+`aowlspt/botnav`, whose host side is the already byte-verified kind=15 detour on
+`EFT.BotOwner::UpdateManual` @0x81B7C0. **Zero new RVAs.**
+
+Requires `botNav` ON in `aowlspt-host.json` (default off). Without it nothing
+moves and `/sain/status` says so at `driveCheck`.
+
+`driveCheck` asserts a property of the live census, never of our own write:
+*no bot this mod commands is frozen*. Falsified by a speed that reaches the
+mover but is wrong -- every bot parks, and it returns FAIL. Three outcomes:
+
+* `INCONCLUSIVE` -- no census, or fewer than 3 repeat sightings. We could not
+  look. This is not a pass.
+* `FAIL` -- 3+ repeat sightings and not one bot changed position.
+* `PASS` -- the channel is live and nothing is parked. It does **not** prove the
+  band changed anything.
+
+**The two-band comparison is what settles that**, because bots move on their own
+and one run cannot separate our speed from their brain:
+
+1. `botNav` on. `difficulty` = `easy`. Enter an offline raid with bots.
+2. `curl localhost:6969/sain/status` -> record `driveCheck` and the commanded
+   `MoveSpeed` from `drive` (expect 0.49).
+3. Set `difficulty` = `deathwish`, restart, same map. Expect 1.0.
+4. Bots must be visibly faster in step 3. If they are not, the setting does not
+   bite and `difficulty` should go back to `implemented = false`.
+
+Still `implemented = false`, and why: **`forcePersonality`** is read and changes
+`core/decide.nim`, but nothing the core decides reaches a bot -- reading a value
+is not implementing a setting. **`driveFromHostThread`** governs
+`client/live.nim`, the by-NAME path, which is fatal when used on this build
+(facts #143/#144/#145) and is not used.
