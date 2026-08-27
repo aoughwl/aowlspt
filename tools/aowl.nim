@@ -568,6 +568,19 @@ proc buildOverlayTests(e: Env): bool =
   elif not run(e, "overlay json checks", quoted(joinPath(dir, "jsontest.exe")), dir):
     okAll = false
 
+  # The LOGS screen: the facet rule, the ring, the split-line reader, and --
+  # the part that cannot be argued about -- that `logFilt` is EXACTLY the set
+  # of held lines the predicate passes, over the whole cross product of the
+  # four filters. Built -O2 rather than -O1 because it also MEASURES the
+  # per-frame rebuild and asserts a ceiling on it.
+  if not run(e, "the overlay's logs screen",
+    "gcc -O2 -Wno-unused-function -I" & inc & " " &
+    quoted(joinPath(dir, "logstest.c")) & " -o " &
+    quoted(joinPath(dir, "logstest.exe")), dir):
+    okAll = false
+  elif not run(e, "overlay logs checks", quoted(joinPath(dir, "logstest.exe")), dir):
+    okAll = false
+
   if not run(e, "overlay header needs no extra link library",
     "gcc -O1 -Wno-unused-function -I" & inc & " " &
     quoted(joinPath(dir, "linkprobe.c")) & " -o " &
