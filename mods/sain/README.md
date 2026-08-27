@@ -1,9 +1,21 @@
-# SAIN, rewritten in nimony for post-1.0 Tarkov
+# Bot AI -- the bot behaviour mod, rewritten in nimony for post-1.0 Tarkov
 
-SAIN (Solarint, maintained by ArchangelWTF) replaces Tarkov's bot AI: layered
-decisions, per-bot personalities, real cover use, searching that looks like
-searching, and squads that behave like squads. It is ~64,000 lines of C# built
-on BepInEx, Harmony and BigBrain.
+**Bot AI** is what this mod is called everywhere a player sees it: the F12
+page, the mod manager entry, the log. The directory, the guid (`aowl.sain`)
+and the routes keep their original spelling because they are identities on the
+wire, not names on a screen.
+
+It replaces Tarkov's stock bot AI: layered decisions, per-bot personalities,
+real cover use, searching that looks like searching, and squads that behave
+like squads. The More Bots spawn expansion is part of Bot AI too, rather than a
+separate brand -- though it is quarantined on this build, and the settings page
+says so.
+
+The design is a from-scratch rewrite of the one SAIN (Solarint, maintained by
+ArchangelWTF) established -- ~64,000 lines of C# built on BepInEx, Harmony and
+BigBrain. That attribution is why the name still appears below: this file
+describes what was ported and what was not, and naming the prior art is
+provenance rather than branding.
 
 Post-1.0 Tarkov has none of those three. This is therefore a rewrite of SAIN's
 **design** against a native mod ABI, not a translation of its code — and the
@@ -19,7 +31,7 @@ drawing any conclusion about behaviour in a raid.
 
 ---
 
-## 1. The map: what SAIN does, and what of it is reachable here
+## 1. The map: what this design does, and what of it is reachable here
 
 Four columns' worth of judgement, in three groups.
 

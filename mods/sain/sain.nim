@@ -1354,82 +1354,246 @@ proc runDriveQueueSelfTest(): int =
   result = bad
 
 proc sainSchema(): seq[Setting] =
-  ## The flat top-level scalar keys SAIN reads from config.json. The `global`,
-  ## `roles` and `server` blocks are nested documents resolved into a Preset
-  ## rather than scalar controls, so their members are not declared here.
-  # TWO OF THESE FIVE ARE `implemented = false`. The other three are read AND
-  # ACTED ON, which is the only bar for flipping one.
-  #
-  # What changed: this mod no longer needs a driving call of its own. The host
-  # already has one -- a kind=15 detour on `EFT.BotOwner::UpdateManual`
-  # @0x81B7C0, byte-verified offline, exposed to mods as `aowlspt/botnav`. So
-  # `server/drive.nim` sends `BotMover.MoveSpeed` for every bot, scaled by
-  # `difficulty`, over a channel that resolves no name at run time. Zero new
-  # RVAs; see that file's header for the three it rides and why move speed is
-  # the cheapest observable in the game.
-  #
-  # The bar, restated, because getting this wrong is the worst thing we ship: a
-  # setting is implemented when a tester who changes it can SEE the game differ.
-  # Not when it is parsed, not when it reaches a struct.
-  #
-  #   enabled            READ  preset.nim:201 -> `Preset.enabled`, and acted on
-  #                      at serverside.nim `startServer` (returns before
-  #                      patching brains, neutralising modifiers or arming the
-  #                      drive) and at sain.nim `onLoad`/`onUpdate`. An audit
-  #                      reported this one as a control that lies because the
-  #                      string "enabled" appears once in sain.nim; the read is
-  #                      in preset.nim, so the audit was scoped to the wrong
-  #                      file. It stays TRUE, on the evidence above.
-  #   difficulty         READ  preset.nim:203 -> a 0..1 scale, and now ACTED ON:
-  #                      drive.nim converts it to MoveSpeed and sends it to
-  #                      every bot on every census. Partial, honestly: SAIN's
-  #                      real band moves a dozen brain coefficients that are not
-  #                      reachable without reflection. Speed is the part that
-  #                      is, and it is visible.
-  #   logDecisions       READ  preset.nim:230, and now ACTED ON: it gates the
-  #                      per-census drive line, which names the commanded speed,
-  #                      the bots tracked and how many were seen to move.
-  #
-  # Still false, with the reason each:
-  #
-  #   forcePersonality   Read (preset.nim:222), and it now HAS a channel --
-  #                      `server/dispatch.nim` uses it to choose the coverage
-  #                      roll (how much of the map a bot bothers with) and the
-  #                      sprint rule (whether it runs to an objective), and
-  #                      those go out as `goTo` orders over `aowlspt/botnav`.
-  #                      STILL FALSE, deliberately, because the bar is "a
-  #                      tester who changes it can SEE the game differ" and
-  #                      nobody has looked yet. The exact test that flips it:
-  #                      `botNav` on in aowlspt-host.json, two offline Customs
-  #                      raids with `forcePersonality` "rat" then "gigachad",
-  #                      and `/sain/status`'s `dispatchCheck` reporting PASS in
-  #                      both with a materially different `declined by a
-  #                      coverage roll` count. Until somebody runs that, this
-  #                      is a channel that exists, not a setting that works.
-  #   driveFromHostThread  Read (preset.nim:231), and it governs `client/live.nim`
-  #                      -- the by-NAME path. That path is not merely unused, it
-  #                      is fatal when used (facts #143/#144/#145: the gated
-  #                      il2cpp exports return a plausible RANDOM value, and the
-  #                      client dies on the first dereference). This switch
-  #                      cannot become true while the thing it switches is a way
-  #                      to kill the client.
-
+  ## Every key this mod reads out of `config.json`, declared as a control.
+  ##
+  ## The `global`, `roles` and `server` blocks are nested documents, so their
+  ## members are declared by DOTTED PATH -- `global.engageDistance`,
+  ## `roles.scav.willSearchForEnemy`. That is what `locatePath` in the host's
+  ## config merge already walks, both to read the current value back and to
+  ## splice an edit in place. It only works for a path that EXISTS on disk: a
+  ## missing one would be created as a flat top-level key with a dot in its
+  ## name, which `loadPreset` never looks at -- a control that appears to save
+  ## and does nothing. `config.json` therefore now carries the full uniform set
+  ## for all four roles, with the values each role was already inheriting from
+  ## `global`, so behaviour is byte-for-byte what it was and every declared
+  ## path resolves.
+  ##
+  ## THE BAR FOR `implemented = true`, and it is the whole point of this proc:
+  ## a tester who changes the setting can SEE the game differ. Not parsed, not
+  ## folded into a struct, not reaching a decision -- SEEN.
+  ##
+  ## Five rows clear that bar:
+  ##
+  ##   enabled      gates `startServer` (brains, modifiers, the drive) and the
+  ##                client half entirely.
+  ##   difficulty   `server/drive.nim` turns it into `BotMover.MoveSpeed` and
+  ##                sends it to every bot over `aowlspt/botnav`, which resolves
+  ##                no name at run time. Measured live: every bot in a raid took
+  ##                the commanded speed.
+  ##   logDecisions gates the per-census drive line naming that speed.
+  ##   server.patchBrains, server.neutraliseLocationModifiers
+  ##                both write the served database on server start.
+  ##
+  ## THIRTY-FOUR DO NOT, and every one says why in its own description. The
+  ## reason is nearly always the same single fact, and it is worth stating once
+  ## here in full rather than trusting a reader to infer it from a description:
+  ##
+  ##   `client/bridge.nim` deliberately stops arming at `capReadOnly`. Step 7
+  ##   of its probe REFUSES, because everything past a list read needs
+  ##   `il2cpp_object_get_class` on a receiver, and a by-name entry point on
+  ##   this build returns a plausible RANDOM handle that kills the client on
+  ##   the first dereference. `onUpdate` consequently returns before `scan`
+  ##   and `tick` on every frame, so `client/driver.nim` NEVER TICKS and the
+  ##   `core/decide.nim` cascade never reaches a live bot.
+  ##
+  ## So every knob whose only consumer is that cascade or that driver --
+  ## the whole of `global` and the whole of `roles` -- is read, resolved into a
+  ## `Settings`, and then not acted on. The cover knobs
+  ## (`coverMinEnemyDistance`, `maxCoverPathLength`, `canShiftCoverPosition`)
+  ## are inert twice over: the cover sensor is separately OFF, because sampling
+  ## cover needs `UnityEngine.Physics::Raycast` resolved by name.
+  ##
+  ## Do not flip any of these to make the page look fuller. The page is meant
+  ## to be honest about how much of this mod currently reaches the game; a
+  ## control that lies is worse than an absent one. Each becomes true when the
+  ## driver ticks against real bots and somebody watches a raid, not before.
+  ##
+  ## `moreBots` is the one row with no config-driven work behind it at all: the
+  ## More Bots spawn expansion is presented as part of Bot AI rather than as a
+  ## separate brand, and the mod that would do the work is QUARANTINED because
+  ## it crashes the client. It is declared so the page can say that out loud,
+  ## greyed, rather than leaving the feature unmentioned.
   result = @[
-    boolSetting("enabled", "Enable SAIN", true, category = "AI",
-                description = "Master switch; when off the mod loads and does nothing"),
+    boolSetting("enabled", "Enable Bot AI", true,
+                category = "Bot AI", subcategory = "General",
+                description = "Master switch for the whole Bot AI mod (bot brains, spawn tuning and the raid drive). Off means the mod loads and does nothing.",
+                implemented = true),
     enumSetting("difficulty", "Difficulty", "default",
                 @["easy", "lessdifficult", "default", "harderpmcs",
-                  "veryhard", "deathwish"], category = "AI",
-                description = "Scales how fast every bot moves, from 0.49 at easy to 1.0 at deathwish. Needs `botNav` on in aowlspt-host.json"),
-    stringSetting("forcePersonality", "Force personality", "", category = "AI",
-                  description = "Force every bot to one personality. It now reaches bots -- it picks the ORBIT coverage roll and the sprint rule -- but nobody has yet watched two raids and confirmed the difference is visible",
-                  implemented = false),
-    boolSetting("driveFromHostThread", "Drive from host thread", true,
-                category = "Advanced",
-                description = "Governs the by-NAME client path, which is fatal on this build and is not used; driving goes over aowlspt/botnav instead",
+                  "veryhard", "deathwish"],
+                category = "Bot AI", subcategory = "General",
+                description = "Scales how fast every bot moves, from 0.49 at easy to 1.0 at deathwish. Measured live: every bot in a raid took the commanded speed. Needs `botNav` on in aowlspt-host.json.",
+                implemented = true),
+    boolSetting("moreBots", "More Bots (spawn expansion)", false,
+                category = "Bot AI", subcategory = "General",
+                description = "More Bots is part of Bot AI rather than a separate mod. UNAVAILABLE on this build: the component that raises spawn counts crashes the client and is quarantined, so this switch is inert and cannot turn it on.",
                 implemented = false),
-    boolSetting("logDecisions", "Log decisions", false, category = "Advanced",
-                description = "Log every drive command: the speed sent, the bots tracked, and how many were seen to move")]
+    stringSetting("forcePersonality", "Force personality", "",
+                  category = "Bot AI", subcategory = "General",
+                  description = "Force every bot to one personality (rat, gigachad, chad, coward, ...). It does reach bots -- it picks the coverage roll and the sprint rule behind the goTo orders -- but nobody has yet watched two raids and confirmed the difference is visible, so it stays greyed until somebody has.",
+                  implemented = false),
+    floatSetting("global.engageDistance", "Engage distance (m)", 70.0,
+                 lo = 5.0, hi = 300.0, step = 5.0,
+                 category = "Bot AI/Global", subcategory = "Combat",
+                 description = "How far away a bot will still commit to a fight instead of holding or searching. READ into the preset and then into a decision the cascade computes, but on this build the decision cannot reach a bot: the client half stops arming at read-only by construction (walking a bot needs il2cpp_object_get_class, a by-name entry point that kills this client), so the driver never ticks. Changing this cannot change what you see in a raid.",
+                 implemented = false),
+    floatSetting("global.timeBeforeSearch", "Time before search (s)", 40.0,
+                 lo = 1.0, hi = 180.0, step = 1.0,
+                 category = "Bot AI/Global", subcategory = "Combat",
+                 description = "Seconds a bot waits after losing sight of an enemy before it goes looking. READ into the preset and then into a decision the cascade computes, but on this build the decision cannot reach a bot: the client half stops arming at read-only by construction (walking a bot needs il2cpp_object_get_class, a by-name entry point that kills this client), so the driver never ticks. Changing this cannot change what you see in a raid.",
+                 implemented = false),
+    floatSetting("global.holdGroundBaseTime", "Hold ground time (s)", 1.0,
+                 lo = 0.0, hi = 15.0, step = 0.5,
+                 category = "Bot AI/Global", subcategory = "Combat",
+                 description = "How long a bot stands its ground when first contacted, before choosing to push or fall back. READ into the preset and then into a decision the cascade computes, but on this build the decision cannot reach a bot: the client half stops arming at read-only by construction (walking a bot needs il2cpp_object_get_class, a by-name entry point that kills this client), so the driver never ticks. Changing this cannot change what you see in a raid.",
+                 implemented = false),
+    floatSetting("global.fightBackHealthThreshold", "Fight back above health", 0.55,
+                 lo = 0.0, hi = 1.0, step = 0.05,
+                 category = "Bot AI/Global", subcategory = "Combat",
+                 description = "Fraction of health above which a bot is willing to trade fire rather than break contact. READ into the preset and then into a decision the cascade computes, but on this build the decision cannot reach a bot: the client half stops arming at read-only by construction (walking a bot needs il2cpp_object_get_class, a by-name entry point that kills this client), so the driver never ticks. Changing this cannot change what you see in a raid.",
+                 implemented = false),
+    floatSetting("global.runAwayHealthThreshold", "Run away below health", 0.28,
+                 lo = 0.0, hi = 1.0, step = 0.01,
+                 category = "Bot AI/Global", subcategory = "Combat",
+                 description = "Fraction of health below which a bot disengages and runs. READ into the preset and then into a decision the cascade computes, but on this build the decision cannot reach a bot: the client half stops arming at read-only by construction (walking a bot needs il2cpp_object_get_class, a by-name entry point that kills this client), so the driver never ticks. Changing this cannot change what you see in a raid.",
+                 implemented = false),
+    floatSetting("global.coverMinEnemyDistance", "Cover: min enemy distance (m)", 8.0,
+                 lo = 0.0, hi = 50.0, step = 1.0,
+                 category = "Bot AI/Global", subcategory = "Cover",
+                 description = "A cover point closer to the enemy than this is rejected. Cover knob. Doubly inert: the cover sensor itself is OFF -- sampling cover needs UnityEngine.Physics::Raycast resolved BY NAME, which is fatal on this build -- so this feeds a cover decision that is never taken, in a driver that never ticks.",
+                 implemented = false),
+    floatSetting("global.maxCoverPathLength", "Cover: max path length (m)", 60.0,
+                 lo = 5.0, hi = 200.0, step = 5.0,
+                 category = "Bot AI/Global", subcategory = "Cover",
+                 description = "How far a bot will walk to reach cover before giving up on the point. Cover knob. Doubly inert: the cover sensor itself is OFF -- sampling cover needs UnityEngine.Physics::Raycast resolved BY NAME, which is fatal on this build -- so this feeds a cover decision that is never taken, in a driver that never ticks.",
+                 implemented = false),
+    floatSetting("global.decisionHz", "Decision rate (Hz)", 10.0,
+                 lo = 1.0, hi = 30.0, step = 1.0,
+                 category = "Bot AI/Global", subcategory = "Performance",
+                 description = "How often each bot re-decides. READ into the preset and then into a decision the cascade computes, but on this build the decision cannot reach a bot: the client half stops arming at read-only by construction (walking a bot needs il2cpp_object_get_class, a by-name entry point that kills this client), so the driver never ticks. Changing this cannot change what you see in a raid.",
+                 implemented = false),
+    intSetting("global.maxBotsPerTick", "Bots considered per tick", 8,
+               lo = 1, hi = 64, step = 1,
+               category = "Bot AI/Global", subcategory = "Performance",
+               description = "The per-frame budget: how many bots the driver thinks about each tick, round-robin. READ into the preset and then into a decision the cascade computes, but on this build the decision cannot reach a bot: the client half stops arming at read-only by construction (walking a bot needs il2cpp_object_get_class, a by-name entry point that kills this client), so the driver never ticks. Changing this cannot change what you see in a raid.",
+               implemented = false),
+    floatSetting("global.farFromPlayerDistance", "Far-from-player distance (m)", 150.0,
+                 lo = 10.0, hi = 600.0, step = 10.0,
+                 category = "Bot AI/Global", subcategory = "Performance",
+                 description = "Beyond this distance from you a bot decides less often, to save frame time. READ into the preset and then into a decision the cascade computes, but on this build the decision cannot reach a bot: the client half stops arming at read-only by construction (walking a bot needs il2cpp_object_get_class, a by-name entry point that kills this client), so the driver never ticks. Changing this cannot change what you see in a raid.",
+                 implemented = false),
+    floatSetting("roles.pmc.engageDistance", "PMC: engage distance (m)", 90.0,
+                 lo = 5.0, hi = 300.0, step = 5.0,
+                 category = "Bot AI/Roles", subcategory = "PMC",
+                 description = "Overrides the global engage distance for pmc bots only. READ into the preset and then into a decision the cascade computes, but on this build the decision cannot reach a bot: the client half stops arming at read-only by construction (walking a bot needs il2cpp_object_get_class, a by-name entry point that kills this client), so the driver never ticks. Changing this cannot change what you see in a raid.",
+                 implemented = false),
+    floatSetting("roles.pmc.timeBeforeSearch", "PMC: time before search (s)", 25.0,
+                 lo = 1.0, hi = 180.0, step = 1.0,
+                 category = "Bot AI/Roles", subcategory = "PMC",
+                 description = "Overrides the global search delay for pmc bots only. READ into the preset and then into a decision the cascade computes, but on this build the decision cannot reach a bot: the client half stops arming at read-only by construction (walking a bot needs il2cpp_object_get_class, a by-name entry point that kills this client), so the driver never ticks. Changing this cannot change what you see in a raid.",
+                 implemented = false),
+    boolSetting("roles.pmc.willSearchForEnemy", "PMC: will search for enemy", true,
+                category = "Bot AI/Roles", subcategory = "PMC",
+                description = "Whether pmc bots hunt a lost enemy at all, or hold where they are. READ into the preset and then into a decision the cascade computes, but on this build the decision cannot reach a bot: the client half stops arming at read-only by construction (walking a bot needs il2cpp_object_get_class, a by-name entry point that kills this client), so the driver never ticks. Changing this cannot change what you see in a raid.",
+                implemented = false),
+    floatSetting("roles.pmc.runAwayHealthThreshold", "PMC: run away below health", 0.28,
+                 lo = 0.0, hi = 1.0, step = 0.01,
+                 category = "Bot AI/Roles", subcategory = "PMC",
+                 description = "Overrides the global flee threshold for pmc bots only. READ into the preset and then into a decision the cascade computes, but on this build the decision cannot reach a bot: the client half stops arming at read-only by construction (walking a bot needs il2cpp_object_get_class, a by-name entry point that kills this client), so the driver never ticks. Changing this cannot change what you see in a raid.",
+                 implemented = false),
+    boolSetting("roles.pmc.canShiftCoverPosition", "PMC: may shift cover", true,
+                category = "Bot AI/Roles", subcategory = "PMC",
+                description = "Whether pmc bots reposition between cover points under fire. Cover knob. Doubly inert: the cover sensor itself is OFF -- sampling cover needs UnityEngine.Physics::Raycast resolved BY NAME, which is fatal on this build -- so this feeds a cover decision that is never taken, in a driver that never ticks.",
+                implemented = false),
+    floatSetting("roles.scav.engageDistance", "Scav: engage distance (m)", 50.0,
+                 lo = 5.0, hi = 300.0, step = 5.0,
+                 category = "Bot AI/Roles", subcategory = "Scav",
+                 description = "Overrides the global engage distance for scav bots only. READ into the preset and then into a decision the cascade computes, but on this build the decision cannot reach a bot: the client half stops arming at read-only by construction (walking a bot needs il2cpp_object_get_class, a by-name entry point that kills this client), so the driver never ticks. Changing this cannot change what you see in a raid.",
+                 implemented = false),
+    floatSetting("roles.scav.timeBeforeSearch", "Scav: time before search (s)", 60.0,
+                 lo = 1.0, hi = 180.0, step = 1.0,
+                 category = "Bot AI/Roles", subcategory = "Scav",
+                 description = "Overrides the global search delay for scav bots only. READ into the preset and then into a decision the cascade computes, but on this build the decision cannot reach a bot: the client half stops arming at read-only by construction (walking a bot needs il2cpp_object_get_class, a by-name entry point that kills this client), so the driver never ticks. Changing this cannot change what you see in a raid.",
+                 implemented = false),
+    boolSetting("roles.scav.willSearchForEnemy", "Scav: will search for enemy", false,
+                category = "Bot AI/Roles", subcategory = "Scav",
+                description = "Whether scav bots hunt a lost enemy at all, or hold where they are. READ into the preset and then into a decision the cascade computes, but on this build the decision cannot reach a bot: the client half stops arming at read-only by construction (walking a bot needs il2cpp_object_get_class, a by-name entry point that kills this client), so the driver never ticks. Changing this cannot change what you see in a raid.",
+                implemented = false),
+    floatSetting("roles.scav.runAwayHealthThreshold", "Scav: run away below health", 0.28,
+                 lo = 0.0, hi = 1.0, step = 0.01,
+                 category = "Bot AI/Roles", subcategory = "Scav",
+                 description = "Overrides the global flee threshold for scav bots only. READ into the preset and then into a decision the cascade computes, but on this build the decision cannot reach a bot: the client half stops arming at read-only by construction (walking a bot needs il2cpp_object_get_class, a by-name entry point that kills this client), so the driver never ticks. Changing this cannot change what you see in a raid.",
+                 implemented = false),
+    boolSetting("roles.scav.canShiftCoverPosition", "Scav: may shift cover", true,
+                category = "Bot AI/Roles", subcategory = "Scav",
+                description = "Whether scav bots reposition between cover points under fire. Cover knob. Doubly inert: the cover sensor itself is OFF -- sampling cover needs UnityEngine.Physics::Raycast resolved BY NAME, which is fatal on this build -- so this feeds a cover decision that is never taken, in a driver that never ticks.",
+                implemented = false),
+    floatSetting("roles.boss.engageDistance", "Boss: engage distance (m)", 110.0,
+                 lo = 5.0, hi = 300.0, step = 5.0,
+                 category = "Bot AI/Roles", subcategory = "Boss",
+                 description = "Overrides the global engage distance for boss bots only. READ into the preset and then into a decision the cascade computes, but on this build the decision cannot reach a bot: the client half stops arming at read-only by construction (walking a bot needs il2cpp_object_get_class, a by-name entry point that kills this client), so the driver never ticks. Changing this cannot change what you see in a raid.",
+                 implemented = false),
+    floatSetting("roles.boss.timeBeforeSearch", "Boss: time before search (s)", 5.0,
+                 lo = 1.0, hi = 180.0, step = 1.0,
+                 category = "Bot AI/Roles", subcategory = "Boss",
+                 description = "Overrides the global search delay for boss bots only. READ into the preset and then into a decision the cascade computes, but on this build the decision cannot reach a bot: the client half stops arming at read-only by construction (walking a bot needs il2cpp_object_get_class, a by-name entry point that kills this client), so the driver never ticks. Changing this cannot change what you see in a raid.",
+                 implemented = false),
+    boolSetting("roles.boss.willSearchForEnemy", "Boss: will search for enemy", true,
+                category = "Bot AI/Roles", subcategory = "Boss",
+                description = "Whether boss bots hunt a lost enemy at all, or hold where they are. READ into the preset and then into a decision the cascade computes, but on this build the decision cannot reach a bot: the client half stops arming at read-only by construction (walking a bot needs il2cpp_object_get_class, a by-name entry point that kills this client), so the driver never ticks. Changing this cannot change what you see in a raid.",
+                implemented = false),
+    floatSetting("roles.boss.runAwayHealthThreshold", "Boss: run away below health", 0.1,
+                 lo = 0.0, hi = 1.0, step = 0.01,
+                 category = "Bot AI/Roles", subcategory = "Boss",
+                 description = "Overrides the global flee threshold for boss bots only. READ into the preset and then into a decision the cascade computes, but on this build the decision cannot reach a bot: the client half stops arming at read-only by construction (walking a bot needs il2cpp_object_get_class, a by-name entry point that kills this client), so the driver never ticks. Changing this cannot change what you see in a raid.",
+                 implemented = false),
+    boolSetting("roles.boss.canShiftCoverPosition", "Boss: may shift cover", true,
+                category = "Bot AI/Roles", subcategory = "Boss",
+                description = "Whether boss bots reposition between cover points under fire. Cover knob. Doubly inert: the cover sensor itself is OFF -- sampling cover needs UnityEngine.Physics::Raycast resolved BY NAME, which is fatal on this build -- so this feeds a cover decision that is never taken, in a driver that never ticks.",
+                implemented = false),
+    floatSetting("roles.zombie.engageDistance", "Zombie: engage distance (m)", 200.0,
+                 lo = 5.0, hi = 300.0, step = 5.0,
+                 category = "Bot AI/Roles", subcategory = "Zombie",
+                 description = "Overrides the global engage distance for zombie bots only. READ into the preset and then into a decision the cascade computes, but on this build the decision cannot reach a bot: the client half stops arming at read-only by construction (walking a bot needs il2cpp_object_get_class, a by-name entry point that kills this client), so the driver never ticks. Changing this cannot change what you see in a raid.",
+                 implemented = false),
+    floatSetting("roles.zombie.timeBeforeSearch", "Zombie: time before search (s)", 1.0,
+                 lo = 1.0, hi = 180.0, step = 1.0,
+                 category = "Bot AI/Roles", subcategory = "Zombie",
+                 description = "Overrides the global search delay for zombie bots only. READ into the preset and then into a decision the cascade computes, but on this build the decision cannot reach a bot: the client half stops arming at read-only by construction (walking a bot needs il2cpp_object_get_class, a by-name entry point that kills this client), so the driver never ticks. Changing this cannot change what you see in a raid.",
+                 implemented = false),
+    boolSetting("roles.zombie.willSearchForEnemy", "Zombie: will search for enemy", true,
+                category = "Bot AI/Roles", subcategory = "Zombie",
+                description = "Whether zombie bots hunt a lost enemy at all, or hold where they are. READ into the preset and then into a decision the cascade computes, but on this build the decision cannot reach a bot: the client half stops arming at read-only by construction (walking a bot needs il2cpp_object_get_class, a by-name entry point that kills this client), so the driver never ticks. Changing this cannot change what you see in a raid.",
+                implemented = false),
+    floatSetting("roles.zombie.runAwayHealthThreshold", "Zombie: run away below health", 0.0,
+                 lo = 0.0, hi = 1.0, step = 0.01,
+                 category = "Bot AI/Roles", subcategory = "Zombie",
+                 description = "Overrides the global flee threshold for zombie bots only. READ into the preset and then into a decision the cascade computes, but on this build the decision cannot reach a bot: the client half stops arming at read-only by construction (walking a bot needs il2cpp_object_get_class, a by-name entry point that kills this client), so the driver never ticks. Changing this cannot change what you see in a raid.",
+                 implemented = false),
+    boolSetting("roles.zombie.canShiftCoverPosition", "Zombie: may shift cover", false,
+                category = "Bot AI/Roles", subcategory = "Zombie",
+                description = "Whether zombie bots reposition between cover points under fire. Cover knob. Doubly inert: the cover sensor itself is OFF -- sampling cover needs UnityEngine.Physics::Raycast resolved BY NAME, which is fatal on this build -- so this feeds a cover decision that is never taken, in a driver that never ticks.",
+                implemented = false),
+    boolSetting("server.patchBrains", "Patch bot brains", true,
+                category = "Bot AI/Server", subcategory = "Database",
+                description = "Rewrite the server's brain-assignment tables so bots use the brain this mod drives. Runs on every server start and the edit is visible in the served database.",
+                implemented = true),
+    boolSetting("server.neutraliseLocationModifiers", "Neutralise location modifiers", true,
+                category = "Bot AI/Server", subcategory = "Database",
+                description = "Set every map's BotLocationModifier to 1, so the stock per-map accuracy, vision and scatter multipliers stop distorting bot behaviour. Applied to every location the database carries, including ones that announce themselves later.",
+                implemented = true),
+    boolSetting("logDecisions", "Log decisions", false,
+                category = "Bot AI/Advanced", subcategory = "Diagnostics",
+                description = "Log every drive command: the speed sent, how many bots were tracked and how many were seen to move.",
+                implemented = true),
+    boolSetting("driveFromHostThread", "Drive from host thread", true,
+                category = "Bot AI/Advanced", subcategory = "Diagnostics",
+                description = "Governs the by-NAME client driving path. That path is fatal on this build and is never taken; real driving goes over aowlspt/botnav instead, so this switch changes nothing.",
+                implemented = false),
+    boolSetting("allowIl2cppReflection", "Allow IL2CPP reflection", false,
+                category = "Bot AI/Advanced", subcategory = "Diagnostics",
+                description = "A re-measurement switch, not a feature. Turning it on lets this mod resolve game types BY NAME, which on this build returns a plausible random handle and kills the client on first use. Deliberately left un-editable so nobody flips it by accident.",
+                implemented = false)]
 
 proc onSainSettings(url, body, session: string): string =
   ## GET serves the schema; a POST body persists one edit into config.json. SAIN
