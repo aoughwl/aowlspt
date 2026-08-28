@@ -103,6 +103,7 @@ proc wGetProcAddress(module: Il2CppPtr; name: cstring): Il2CppPtr {.
 #include <stdint.h>
 #include <string.h>
 #include "aowlspt_shim.h"
+#include "sp/mapmath.h"
 
 static void*   sp_p_v  (void* f) { return ((void*  (*)(void))f)(); }
 static int32_t sp_i32_v(void* f) { return ((int32_t(*)(void))f)(); }
@@ -127,6 +128,32 @@ static float sp_rd_f32(void* o, int32_t off) {
   if (!aowl_is_readable(a, 4)) return 0.0f;
   memcpy(&v, a, 4);
   return v;
+}
+/* THE WHOLE Vector3 IN ONE READ, WITH THE READABILITY ANSWERED SEPARATELY.
+ *
+ * `sp_rd_f32` returns 0.0f both for "this page is not mapped" and for "the
+ * float really is zero". `posOf` then rejects (0,0,0) -- so an unmapped page
+ * and a player standing on the origin produce the IDENTICAL, unreported
+ * outcome, and the mod cannot say which happened. That ambiguity is why the
+ * radar drew nothing and explained nothing.
+ *
+ * Returns 1 when all 12 bytes were readable, 0 when they were not. The caller
+ * must NOT infer the position from the return value alone: 1 only means the
+ * bytes were there, and the plausibility tests still apply. */
+static int32_t sp_rd_vec3(void* o, int32_t off, float* out3) {
+  unsigned char* a = (unsigned char*)o + off;
+  out3[0] = 0.0f; out3[1] = 0.0f; out3[2] = 0.0f;
+  if (!aowl_is_readable(a, 12)) return 0;
+  memcpy(out3, a, 12);
+  return 1;
+}
+/* Read the Vector3 AND classify it in one call, so the readability answer and
+ * the plausibility answer cannot drift apart. Returns an MM_POS_* code; the
+ * thresholds live in sp/mapmath.h and are covered by
+ * tests/overlayhost/mapstest.c, so this is not a second implementation. */
+static int32_t sp_pos_read(void* o, int32_t off, float* out3) {
+  int32_t r = sp_rd_vec3(o, off, out3);
+  return (int32_t)mm_pos_classify((int)r, out3[0], out3[1], out3[2]);
 }
 /* A System.String's last 8 hex characters, as ASCII, into `out` (>=9 bytes).
  * The tail rather than the head because a Tarkov profile id is a 24-char
@@ -159,6 +186,19 @@ proc spI32V(f: Il2CppPtr): int32 {.importc: "sp_i32_v", nodecl.}
 proc cRdPtr(o: pointer; off: int32): pointer {.importc: "sp_rd_ptr", nodecl.}
 proc cRdI32(o: pointer; off: int32): int32 {.importc: "sp_rd_i32", nodecl.}
 proc cRdF32(o: pointer; off: int32): cfloat {.importc: "sp_rd_f32", nodecl.}
+proc cRdVec3(o: pointer; off: int32; out3: ptr cfloat): int32 {.
+  importc: "sp_rd_vec3", nodecl.}
+proc cPosRead(o: pointer; off: int32; out3: ptr cfloat): int32 {.
+  importc: "sp_pos_read", nodecl.}
+
+const
+  # Mirrors MM_POS_* in sp/mapmath.h. Kept as named constants so a `case` over
+  # them is exhaustive and a new code cannot be silently ignored.
+  MmPosOk*         = 0
+  MmPosUnreadable* = 1
+  MmPosNan*        = 2
+  MmPosRange*      = 3
+  MmPosAllZero*    = 4
 proc cRdIdTail(s: pointer; lenOff, chOff: int32; outBuf: cstring): int32 {.
   importc: "sp_rd_idtail", nodecl.}
 
@@ -287,30 +327,141 @@ proc feedStateText*(): string =
     return "self-disabled after " & $gFaults & " faults; first was: " & feedDefect()
   gwStateText()
 
+# ---------------------------------------------------------------------------
+# WHY A POSITION READ FAILED. Counters, not a bool.
+# ---------------------------------------------------------------------------
+#
+# `posOf` had SIX distinct ways to return false and reported none of them: it
+# set `ok = false` and returned, spending no fault budget and writing no
+# defect. That is what made the radar silent. A snapshot captured from the
+# live client on 2026-08-28 (seq 12109, in a raid) read
+#
+#   state:"live" inRaid:true ok:false localIdx:-1 ents:[] faults:0 defect:"none"
+#
+# -- the world was live, the player list was walked, and EVERY entry was
+# discarded with nothing recorded anywhere. `defect:"none"` is a lie of
+# omission: nothing was wrong that the code was willing to name.
+#
+# These counters are the whole point. They are per-collection (reset each
+# `collect`) AND cumulative, because "no player passed on THIS frame" and
+# "no player has EVER passed" are different bugs.
+type
+  PosReason* = object
+    nilPlayer*, nilCtx*, unreadable*, nan*, outOfRange*, allZero*, good*: int
+
+var gPosNow: PosReason
+var gPosEver: PosReason
+
+proc posAdd(a: var PosReason; b: PosReason) =
+  a.nilPlayer  = a.nilPlayer  + b.nilPlayer
+  a.nilCtx     = a.nilCtx     + b.nilCtx
+  a.unreadable = a.unreadable + b.unreadable
+  a.nan        = a.nan        + b.nan
+  a.outOfRange = a.outOfRange + b.outOfRange
+  a.allZero    = a.allZero    + b.allZero
+  a.good       = a.good       + b.good
+
+proc posReasonText(r: PosReason): string =
+  "good=" & $r.good & " nilPlayer=" & $r.nilPlayer & " nilMoveCtx=" & $r.nilCtx &
+  " unreadable=" & $r.unreadable & " NaN=" & $r.nan &
+  " outOfRange=" & $r.outOfRange & " allZero=" & $r.allZero
+
+proc posEverText*(): string = posReasonText(gPosEver)
+proc posNowText*(): string = posReasonText(gPosNow)
+proc posEverGood*(): int = gPosEver.good
+proc posEverTried*(): int =
+  gPosEver.good + gPosEver.nilPlayer + gPosEver.nilCtx + gPosEver.unreadable +
+  gPosEver.nan + gPosEver.outOfRange + gPosEver.allZero
+
+proc posVerdict*(): string =
+  ## The single sentence a human needs. It names the DOMINANT reason, because
+  ## "all of them failed" and "one of them failed" want different next moves.
+  let tried = posEverTried()
+  if tried == 0:
+    return "no position read has been ATTEMPTED yet -- either no raid, or the " &
+           "collector is not running. INCONCLUSIVE, not 'the offsets are wrong'"
+  if gPosEver.good > 0:
+    return "positions ARE being read (" & $gPosEver.good & " of " & $tried & ")"
+  # Nothing has ever passed. Say which gate ate them, by name and offset.
+  if gPosEver.unreadable > 0:
+    return "EVERY position read failed and " & $gPosEver.unreadable &
+           " were UNREADABLE -- MovementContext+0x370 is not mapped, so the " &
+           "object is not a MovementContext (a wrong Player+0x60, or a freed " &
+           "object). This is a POINTER problem, not an offset-value problem"
+  if gPosEver.allZero > 0:
+    return "EVERY position read failed and " & $gPosEver.allZero &
+           " came back exactly (0,0,0) from a READABLE page -- the bytes at " &
+           "MovementContext+0x370 are really zero, so that field is not the " &
+           "live pose on this build, or the object is a fresh/unspawned Player"
+  if gPosEver.nan > 0 or gPosEver.outOfRange > 0:
+    return "EVERY position read failed plausibility (NaN=" & $gPosEver.nan &
+           " outOfRange=" & $gPosEver.outOfRange & ") -- the page is mapped " &
+           "and holds non-position bytes, which means Player+0x60 or " &
+           "MovementContext+0x370 is pointing at the wrong thing"
+  if gPosEver.nilCtx > 0:
+    return "EVERY position read failed because Player+0x60 " &
+           "<MovementContext>k__BackingField was NULL for all " &
+           $gPosEver.nilCtx & " players"
+  "EVERY position read failed and no reason was recorded -- this is a BUG in " &
+  "posOf's own accounting, not a measurement"
+
 proc posOf(p: pointer; ok: var bool; x, y, z: var float) =
   ## Player +0x60 -> MovementContext +0x370 (Vector3). This is the pose the
   ## client itself reads, not a transform we chose.
+  ##
+  ## Offsets re-verified offline 2026-08-28 against
+  ## `.cache/global-metadata.dec.dat` (fldoff self-check passed):
+  ##   EFT.Player.<MovementContext>k__BackingField  0x60
+  ##   EFT.MovementContext.PreviousPosition Vector3 0x370
+  ## Both are CORRECT, so a failure here is about the POINTER or the live
+  ## bytes, never about the constants. Every exit below is counted.
   ok = false
   x = 0.0; y = 0.0; z = 0.0
-  if p == nil: return
+  if p == nil:
+    gPosNow.nilPlayer = gPosNow.nilPlayer + 1
+    return
   let mc = rdPtr(p, PlMoveCtx)
   if mc == nil:
+    gPosNow.nilCtx = gPosNow.nilCtx + 1
     note("Player+0x60 <MovementContext>k__BackingField read null")
     return
-  x = rdF32(mc, McPrevPos + 0)
-  y = rdF32(mc, McPrevPos + 4)
-  z = rdF32(mc, McPrevPos + 8)
-  # A property of the FINISHED read, not a restatement of it. Garbage from a
-  # moved object or a stale offset fails every one of these; a real position
-  # passes all of them. The all-zero rejection matters most: an unmapped page
-  # read as zero is the single most likely wrong answer here, and (0,0,0) is
-  # not a position any Tarkov map places a player at.
-  if x != x or y != y or z != z: return
-  if x > 1.0e6 or x < -1.0e6: return
-  if y > 1.0e6 or y < -1.0e6: return
-  if z > 1.0e6 or z < -1.0e6: return
-  if x == 0.0 and y == 0.0 and z == 0.0: return
-  ok = true
+  # One 12-byte read whose READABILITY is answered separately from its
+  # PLAUSIBILITY, so "the page is not mapped" stops masquerading as "the
+  # player is at the origin". The thresholds are mm_pos_classify's, in
+  # sp/mapmath.h, tested offline -- they are not restated here.
+  # Explicitly zeroed: nimony cannot prove an array written only through a
+  # `ptr` passed to C is initialised, and it is right to refuse -- if the C
+  # side ever returned without writing, these would be whatever was on the
+  # stack, which is the "plausible wrong number" failure this file exists to
+  # avoid. `sp_rd_vec3` zeroes them too; agreeing costs nothing.
+  var v: array[3, cfloat] = [0.0'f32, 0.0'f32, 0.0'f32]
+  let code = cPosRead(mc, int32(McPrevPos), addr v[0])
+  x = float(v[0]); y = float(v[1]); z = float(v[2])
+  case int(code)
+  of MmPosUnreadable:
+    gPosNow.unreadable = gPosNow.unreadable + 1
+    note("MovementContext+0x370 PreviousPosition is NOT READABLE (12 bytes) " &
+         "-- a VirtualQuery refusal, not a zero position")
+    x = 0.0; y = 0.0; z = 0.0
+    return
+  of MmPosNan:
+    gPosNow.nan = gPosNow.nan + 1
+    note("MovementContext+0x370 read NaN")
+    x = 0.0; y = 0.0; z = 0.0
+    return
+  of MmPosRange:
+    gPosNow.outOfRange = gPosNow.outOfRange + 1
+    note("MovementContext+0x370 read out of range (|component| > 1e6)")
+    x = 0.0; y = 0.0; z = 0.0
+    return
+  of MmPosAllZero:
+    gPosNow.allZero = gPosNow.allZero + 1
+    note("MovementContext+0x370 read exactly (0,0,0) from a READABLE page")
+    x = 0.0; y = 0.0; z = 0.0
+    return
+  else:
+    gPosNow.good = gPosNow.good + 1
+    ok = true
 
 proc idTailOf(p: pointer): string =
   ## Player +0x9c0 -> Profile +0x10 -> System.String, last 8 chars. Purely a
@@ -330,7 +481,7 @@ proc idTailOf(p: pointer): string =
     result.add buf[i]
     inc i
 
-proc collect*(snap: var Snapshot) =
+proc collectInner(snap: var Snapshot) =
   ## Fill `snap`. Runs on Unity's thread (the caller drives it from everyMain),
   ## so it does raw reads into a caller-owned buffer and allocates nothing per
   ## frame except the id label strings, which are bounded at 8 chars each and
@@ -343,6 +494,11 @@ proc collect*(snap: var Snapshot) =
   snap.heading = 0.0
   inc gSeq
   snap.seq = gSeq
+  # Per-collection reason tally starts empty; the cumulative one never resets.
+  # Both are kept because "nobody passed THIS frame" and "nobody has EVER
+  # passed" are different faults with different fixes.
+  gPosNow = PosReason(nilPlayer: 0, nilCtx: 0, unreadable: 0, nan: 0,
+                      outOfRange: 0, allZero: 0, good: 0)
 
   if feedDisabled():
     snap.state = -1
@@ -415,3 +571,11 @@ proc collect*(snap: var Snapshot) =
                             id: idTailOf(p))
     inc snap.n
     snap.ok = true
+
+proc collect*(snap: var Snapshot) =
+  ## Wrapper over `collectInner` whose ONLY job is that the reason tally is
+  ## accumulated on EVERY exit path -- `collectInner` has six `return`s, and a
+  ## tally that is only summed on the success path is exactly the check that
+  ## cannot fail (CLAUDE.md 9b).
+  collectInner(snap)
+  posAdd(gPosEver, gPosNow)

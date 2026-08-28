@@ -282,6 +282,142 @@ proc onPublishTick(payload: string): string =
     gLastErr = err
   result = ""
 
+# --------------------------------------------------------------------------
+# THE DIAGNOSTIC. This mod's most important output.
+# --------------------------------------------------------------------------
+#
+# The bug this exists for: on 2026-08-28 a human reported "no in-game radar",
+# and the mod had said NOTHING for the whole session -- it announced a
+# successful registration at load and was then silent forever. Every part was
+# working except one, and the one that was not had no voice:
+#
+#   * region ARMED, participant 'maps.hud' registered   (host log, measured)
+#   * config enabled/hudRadar/hudIndicators all true    (config.json)
+#   * GameWorld live, in a raid                         (snapshot state:"live")
+#   * ...and `ok:false localIdx:-1 ents:[] faults:0 defect:"none"`
+#
+# `mhud_draw` was returning at `if (!hasLocal) return;` on every single frame,
+# forever, silently, because `posOf` rejected every player and recorded no
+# reason. A feature that declines silently is the worst outcome we produce
+# (CLAUDE.md 6), so this tick makes that impossible: it reports every stage,
+# every time, and each stage is PASS, FAIL or INCONCLUSIVE -- never a bare
+# two-way "working / not working", because "I could not look" is not a pass
+# (CLAUDE.md 9b).
+#
+# It is NOT gated on anything being wrong: the first tick always prints. After
+# that it prints only when the text CHANGES, plus a heartbeat, so a healthy
+# session costs a handful of lines and a broken one cannot hide.
+
+var gDiagLast = ""
+var gDiagTicks = 0'i64
+
+proc mapsDiagText(): string =
+  ## Assembled from the FINISHED state -- the counters the collector and the
+  ## draw callback actually accumulated -- not from "the call was made".
+  let tried = posEverTried()
+  let good  = posEverGood()
+  let st    = gwState()
+
+  # 1. the shared region: is anything dispatching us at all?
+  var lRegion = ""
+  if not gHudOn:
+    lRegion = "FAIL  the in-game HUD was never registered with the shared " &
+              "region (radar and indicators are both off in config.json, or " &
+              "registration was refused at load -- see the load line above)"
+  elif not hudArmed():
+    lRegion = "FAIL  registered, but the region is NOT armed, so the draw " &
+              "callback can never fire. Set host flag `sharedRegion`"
+  elif hudFrames() <= 0'i64:
+    lRegion = "INCONCLUSIVE  registered and armed, but ZERO frames have been " &
+              "dispatched to us yet -- nothing has called us even once"
+  else:
+    lRegion = "PASS  armed, " & $hudFrames() & " frame(s) dispatched to us"
+
+  # 2. the world: is there a raid, and can we see it?
+  var lWorld = ""
+  case st
+  of 0: lWorld = "FAIL  no host export aowl_host_gameworld -- this host is too old"
+  of 1: lWorld = "INCONCLUSIVE  the host exports the world but NO detour is " &
+                 "armed to populate it. Set host flag `debugEsp` or `botDiag`. " &
+                 "This is NOT 'you are not in a raid'"
+  of 2: lWorld = "INCONCLUSIVE  armed, no GameWorld cached -- consistent with " &
+                 "being in the menu, but it is not proof of it"
+  else: lWorld = "PASS  GameWorld live (borrowed from the host's RegisterPlayer cache)"
+
+  # 3. positions. THE stage that was silent. Never collapses to a bool.
+  var lPos = ""
+  if st != 3:
+    lPos = "INCONCLUSIVE  not attempted -- there is no live world to read"
+  elif tried == 0:
+    lPos = "INCONCLUSIVE  a world is live but ZERO position reads were " &
+           "attempted -- the player list was empty or unreadable"
+  elif good == 0:
+    lPos = "FAIL  " & posVerdict() & " [" & posEverText() & "]"
+  else:
+    lPos = "PASS  " & $good & " of " & $tried & " position read(s) validated " &
+           "[" & posEverText() & "]"
+
+  # 4. the draw itself, asserted on the FINISHED state: did primitives come out?
+  var lDraw = ""
+  if not gHudOn:
+    lDraw = "INCONCLUSIVE  no HUD registered, so no draw was possible"
+  elif hudFrames() <= 0'i64:
+    lDraw = "INCONCLUSIVE  the callback has never been invoked"
+  elif hudDrawn() <= 0'i64:
+    lDraw = "FAIL  the callback ran " & $hudFrames() & " time(s) and drew " &
+            "NOTHING every time. It returns immediately because no local " &
+            "player position validated -- see `positions` above. This is the " &
+            "reason the radar is not on screen"
+  elif hudBlips() <= 0'i64:
+    lDraw = "PASS  radar drawn on " & $hudDrawn() & " frame(s), but 0 blips " &
+            "-- the ring is on screen with nothing in it"
+  else:
+    lDraw = "PASS  drawn on " & $hudDrawn() & " frame(s), " & $hudBlips() &
+            " blip(s)"
+
+  # 5. the back buffer. A 0x0 screen puts every mark in the corner.
+  var lScreen = ""
+  if hudScreenMeasured() != 0'i32:
+    lScreen = "PASS  " & $hudScreenW() & "x" & $hudScreenH() &
+              " (measured back buffer)"
+  else:
+    lScreen = "INCONCLUSIVE  the region has not published a back-buffer size; " &
+              "using the config fallback " & $hudScreenW() & "x" &
+              $hudScreenH() & ". Edge-anchored marks may be misplaced"
+
+  # 6. the projector -- indicators are north-up bearings without one.
+  var lProj = ""
+  if hudIndProjected() > 0'i64:
+    lProj = "PASS  " & $hudIndProjected() & " indicator(s) projected"
+  elif hudIndBearing() > 0'i64:
+    lProj = "INCONCLUSIVE  " & $hudIndBearing() & " indicator(s) drawn as " &
+            "NORTH-UP bearings; no projector is installed (nothing calls " &
+            "aowl_region_set_projector), so they are not look-relative"
+  else:
+    lProj = "INCONCLUSIVE  no indicator has been drawn yet"
+
+  result = "maps diag:\n" &
+           "  region       : " & lRegion & "\n" &
+           "  world        : " & lWorld  & "\n" &
+           "  positions    : " & lPos    & "\n" &
+           "  draw         : " & lDraw   & "\n" &
+           "  screen       : " & lScreen & "\n" &
+           "  projector    : " & lProj   & "\n" &
+           "  feed         : ticks=" & $gTicks & " published=" & $gPublished &
+             " faults=" & $feedFaults() & " defect=" & feedDefect()
+
+proc onDiagTick(payload: string): string =
+  ## Always announces. The FIRST tick prints unconditionally -- so a session in
+  ## which everything is broken from the start still gets a full report -- and
+  ## afterwards it prints on any CHANGE, plus a periodic heartbeat so a
+  ## long-running stuck state cannot scroll away and be forgotten.
+  inc gDiagTicks
+  let text = mapsDiagText()
+  if gDiagLast.len == 0 or text != gDiagLast or (gDiagTicks mod 30'i64) == 0'i64:
+    gDiagLast = text
+    info text
+  result = ""
+
 proc onLoad(): Status =
   gEnabled = asBool(setting("enabled"), false)
   gHz = asInt(setting("hz"), 10)
@@ -355,6 +491,17 @@ proc onLoad(): Status =
     else:
       warn ModName & ": the shared region refused the in-game HUD: " & whyHud &
            ". The map page still works; the radar and the indicators do not."
+
+  # THE DIAGNOSTIC TIMER. Registered LAST and unconditionally, because it is
+  # the thing that explains every branch above -- including the branches that
+  # returned early. Its failure to register is itself announced: a diag that
+  # quietly never runs would reproduce the exact bug it exists to prevent.
+  if every(2000, onDiagTick) != Ok:
+    warn ModName & ": the periodic diagnostic timer did NOT register, so this " &
+         "mod cannot report whether it is drawing. Everything else may still " &
+         "work -- but it will work silently, which is the failure mode this " &
+         "timer exists to stop. Treat any later 'the radar does not appear' " &
+         "as INCONCLUSIVE until this is fixed."
 
   success ModName & " " & ModVersion & ": collector armed at " & $gHz &
           " Hz. " & feedStateText()
