@@ -212,12 +212,46 @@ proc gwGetProcAddress(module: Il2CppPtr; name: cstring): Il2CppPtr {.
 # human is told "no raid" or "nothing is watching".
 {.emit: """
 #include <stdint.h>
+#include <windows.h>
 static void*   sain_gw_p_v  (void* f) { return ((void*  (*)(void))f)(); }
 static int32_t sain_gw_i32_v(void* f) { return ((int32_t(*)(void))f)(); }
+
+/* A VirtualQuery, restated locally -- the same body as `aowl_is_readable` in
+ * abi/aowlspt_shim.h, which is not in this mod's translation unit.
+ *
+ * WHY THIS FILE NEEDED ONE. `il2cpp_object_get_class` is literally
+ * `mov rax,[rcx]; ret`: it validates NOTHING, so a bad receiver yields a
+ * plausible non-nil number rather than a nil, and `resolveOn`'s very next
+ * statement takes that number to `il2cpp_class_get_name` -- one of the 38
+ * TOKEN-GATED exports, which answers a uniform random NON-ZERO uint64 on gate
+ * mismatch. Every nil check on that chain PASSES and the first dereference is
+ * 0xC0000005. That is fact #198, and it is exactly how `fov.dll` killed the
+ * client. A nil check is not a check here; this is. */
+static int32_t sain_is_readable(void* p, int32_t size) {
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!p || size <= 0) return 0;
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0) return 0;
+    if (mbi.State != MEM_COMMIT) return 0;
+    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return 0;
+    if (!(mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                         PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                         PAGE_EXECUTE_WRITECOPY))) return 0;
+    {   uintptr_t start = (uintptr_t)mbi.BaseAddress;
+        uintptr_t end   = start + (uintptr_t)mbi.RegionSize;
+        uintptr_t need  = (uintptr_t)p + (uintptr_t)size;
+        if (need < (uintptr_t)p) return 0;   /* overflow */
+        return need <= end ? 1 : 0;
+    }
+}
 """.}
 
 proc sainGwPV(f: Il2CppPtr): Il2CppPtr {.importc: "sain_gw_p_v", nodecl.}
 proc sainGwI32V(f: Il2CppPtr): int32 {.importc: "sain_gw_i32_v", nodecl.}
+proc sainIsReadable(p: Il2CppPtr; size: int32): int32 {.
+  importc: "sain_is_readable", nodecl.}
+
+proc sainReadable(p: Il2CppPtr; size: int): bool =
+  result = p != nil and sainIsReadable(p, int32(size)) != 0'i32
 
 var gGwFn: Il2CppPtr = cast[Il2CppPtr](0)
 var gGwArmedFn: Il2CppPtr = cast[Il2CppPtr](0)
@@ -601,6 +635,15 @@ proc headerBytes(): int =
   if gHeaderBytes >= 0:
     return gHeaderBytes
   gHeaderBytes = ObjectHeaderFallback
+  # GATED, like every other `findClass` in this file. This one was NOT, and
+  # that was a hole rather than a decision: `findClass` is
+  # `il2cpp_class_from_name`, and `classInstanceSize` two lines below
+  # DEREFERENCES what it hands back. The `!= nil` guard cannot fire on a
+  # token-gate mismatch, because the trap returns a random NON-ZERO uint64.
+  # Refusing costs nothing here -- `ObjectHeaderFallback` is already assigned,
+  # and the range check in `byPointerSize` is what makes holding it safe.
+  if reflectionRefused("System.Int32 / System.Double"):
+    return gHeaderBytes
   let i32 = findClass(gRt, "System.Int32")
   let f64 = findClass(gRt, "System.Double")
   if i32 != nil and f64 != nil:
@@ -618,6 +661,12 @@ proc byPointerSize(tn: string): int =
   ## a general-purpose register; everything else goes to memory.
   result = 0
   if tn.len == 0:
+    return
+  # GATED, for the same reason as `headerBytes` above: this was the second of
+  # the two ungated `findClass` sites in this file, and `classIsValueType` /
+  # `classInstanceSize` below both dereference the handle. Returning 0 is the
+  # answer every caller already handles as "not a size this understands".
+  if reflectionRefused(tn):
     return
   let c = findClass(gRt, tn)
   if c == nil:
@@ -758,7 +807,20 @@ proc resolveOn(l: var LazyCall; cls: Il2CppClass) =
   l.shape = csNone
   l.fills = @[]
   l.gateRefused = false
+  # `fullName` reaches `il2cpp_class_get_name`, which is TOKEN-GATED: on
+  # mismatch it does not return NULL, it returns a uniform random NON-ZERO
+  # uint64, and `readCString` then walks it. An EMPTY name is how that now
+  # announces itself -- `readCString` VirtualQueries its pointer, re-checks at
+  # every page boundary and refuses a byte outside printable ASCII, returning
+  # "" rather than faulting. So an empty owner is treated as a REFUSAL here
+  # rather than being concatenated into a log line and carried on from.
   let owner = fullName(gRt, cls)
+  if owner.len == 0:
+    l.why = "::" & l.member & ": the declaring class name came back EMPTY. " &
+            "il2cpp_class_get_name is token-gated on this build and answers a " &
+            "random non-zero value on mismatch, which readCString refused. " &
+            "Nothing was dereferenced and nothing was bound."
+    return
 
   var usedArgc = l.argc
   var declaring: Il2CppClass = cast[Il2CppClass](0)
@@ -769,7 +831,18 @@ proc resolveOn(l: var LazyCall; cls: Il2CppClass) =
     return
   l.m = found
   l.argc = usedArgc
+  # Same empty-name refusal as on `owner` above, and for the same reason: this
+  # is a SECOND `il2cpp_class_get_name`, on the base class the member was
+  # actually found on, and it is gated identically. A `""` here would be
+  # concatenated straight into `bindInClass`'s key.
   let ownerName = fullName(gRt, declaring)
+  if ownerName.len == 0:
+    l.m = cast[Il2CppMethod](0)
+    l.why = owner & "::" & l.member & ": the member was found, but the name " &
+            "of the class DECLARING it came back EMPTY -- readCString refused " &
+            "what il2cpp_class_get_name answered. Refusing to bind against a " &
+            "class this cannot name."
+    return
 
   # --- the declared-signature gate, before anything is bound.
   #
@@ -880,8 +953,18 @@ proc ensure*(l: var LazyCall; obj: Il2CppPtr): bool =
   # `why` string that says so.
   if reflectionRefused():
     return false
+  # The gate above is the policy check; these two are the ones that can fire
+  # when the gate has been opened deliberately. `il2cpp_object_get_class` is
+  # `mov rax,[rcx]; ret` -- it reads the receiver's first word and validates
+  # nothing -- so the receiver must be readable BEFORE the call, and the class
+  # it answers with must be readable before `resolveOn` takes it to
+  # `fullName`. A `!= nil` check between the two is not a check (fact #198).
+  if not sainReadable(obj, 8):
+    return false
   let c = objectClass(gRt, obj)
   if c == nil:
+    return false
+  if not sainReadable(cast[Il2CppPtr](c), 8):
     return false
   if (not l.tried) or l.cls != c:
     resolveOn(l, c)
@@ -1131,8 +1214,20 @@ proc readStructFloat*(l: var LazyField; boxed: Il2CppPtr;
   result = default
   if boxed == nil or not gLive:
     return
+  # GATED + GUARDED. This was the one `objectClass` site in the file that
+  # `ensure`'s `reflectionRefused()` choke point did NOT cover, so the mod's
+  # "blocked by construction" claim had an exception nobody had noticed.
+  # `findField` and `fieldGetValue` below both dereference the class handle.
+  if reflectionRefused("a boxed value type's field"):
+    return
+  if not sainReadable(boxed, 8):
+    return
   let c = objectClass(gRt, boxed)
   if c == nil:
+    return
+  if not sainReadable(cast[Il2CppPtr](c), 8):
+    # `il2cpp_object_get_class` is `mov rax,[rcx]; ret` and validates nothing,
+    # so a non-nil answer is not evidence of a class. This is.
     return
   if (not l.tried) or l.cls != c:
     l.cls = c

@@ -184,23 +184,49 @@ proc armDeaths*(rt: Il2Cpp; live: bool): bool =
     return false
   let owner = DeathTarget.substr(0, sep - 1)
   let member = DeathTarget.substr(sep + 2)
-  let cls = findClass(rt, owner)
-  if cls == nil:
-    gState = "refused: this client has no " & owner &
-             " -- the name is from the pre-1.0 C# surface and post-1.0 is a " &
-             "different build. No death is counted; the census keeps working"
-    return false
-  let m = findMethod(rt, cls, member, -1)
-  if m == nil:
-    gState = "refused: " & owner & " exists but has no " & member
-    return false
-  if methodIsStatic(rt, m):
-    gState = "refused: " & DeathTarget & " is static, so the payload's " &
-             "`this` is null and there is no receiver to group deaths under. " &
-             "A ledger armed on it would count firings and name no class, " &
-             "which reads exactly like a target that never fires"
-    return false
-  let declared = methodParamCount(rt, m)
+
+  # THE MOD-SIDE `findClass` PRE-FLIGHT THAT USED TO SIT HERE IS GONE.
+  #
+  # It was `findClass(rt, owner)` -> `findMethod` -> `methodIsStatic` ->
+  # `methodParamCount`, and it existed to produce nicer refusal strings. Every
+  # one of those four dereferences the handle `il2cpp_class_from_name` hands
+  # back, and that export is TOKEN-GATED on this build: on mismatch it answers
+  # a uniform random NON-ZERO uint64, so `if cls == nil` cannot fire and the
+  # first dereference is 0xC0000005 (fact #198). Measured in this repo, out of
+  # the game: opening `D:\Games\Tarkov\GameAssembly.dll` in `aowlspt-sim` and
+  # calling `findClass("System.Int32")` kills the process with no diagnostic.
+  # Better error text is not worth that, and the pre-flight bought nothing the
+  # host does not already answer.
+  #
+  # WHAT IT DOES NOT FIX, STATED PLAINLY. `hookArgs` below is still a BY-NAME
+  # target, and the host's `installPatch` resolves a bare `Type::Method` spec
+  # with `findClass` + `findMethod` FIRST and only consults the offline
+  # `aowlspt-names.idx` afterwards, as a fallback for the CODE POINTER when
+  # `MethodInfo.methodPointer` came back null. So a by-name `hook`/`patch`
+  # goes through the GATED EXPORTS, in the host, on the host's thread. The
+  # name index does not remove that hop; it only rescues the address.
+  #
+  # The safe form is the `@0xRVA/<shape>` spec, which takes `installPatch`'s
+  # `resolveByRva` branch and never calls `findClass` at all. This target is
+  # HALF-derived toward it and is deliberately not finished:
+  #
+  #   EFT.BaseStatisticsManager::OnDeath  RVA 0x92C610  ('unique', 1)
+  #   prologue  48 89 5C 24 10 48 89 74 24 18 57 41 56 41 57 48
+  #   signature void OnDeath(Player, IPlayer, DamageInfo, EBodyPart)
+  #
+  # The shape string needs one letter PER DECLARED ARGUMENT, and argument 3's
+  # type `DamageInfo` does not resolve as a type name in this build's metadata
+  # (`fldoff.py` searched all 31,282 type names exhaustively for a zero hit),
+  # so its width -- and therefore `v` versus `V` -- is NOT derived. CLAUDE.md 5
+  # requires a patch frame shape to be derived, never inferred from a name, so
+  # the spec is left unwritten rather than guessed. Finish that one lookup and
+  # this target stops being by-name.
+  # `declared` is now UNKNOWN rather than read from the runtime, and -1 is what
+  # this file already means by that. `argsTruncated` answers 0 for it, so the
+  # note below is skipped instead of printing a number nobody measured -- which
+  # is the right trade: the old number came from `methodParamCount` on a handle
+  # that could not be trusted to exist.
+  let declared = -1
   let cut = argsTruncated(declared, false)
   if cut > 0:
     # Not fatal for *this* handler, which reads no argument. Named anyway, and
