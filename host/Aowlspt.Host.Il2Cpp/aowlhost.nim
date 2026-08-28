@@ -306,6 +306,12 @@ static int aowl_rva_is_code(unsigned int rva) {
 ## SKIP THE MODE SCREEN. The three byte-verified selection-screen targets and
 ## the profile-data field offsets. See `aowlspt_modeskip.h`.
 {.emit: """#include "aowlspt_modeskip.h" """.}
+## FREE THE MOUSE WHILE AN OVERLAY PANEL IS OPEN. The four byte-verified
+## `UnityEngine.Cursor` targets, the pure ref-count/save-restore decision (which
+## `tests/overlayhost/cursortest.c` compiles standalone and asserts against
+## OFFLINE) and the guarded tick body. The implementation is in `cursorfree.nim`
+## (included below). MUST follow `aowlspt_prologue.h`. See `aowlspt_cursor.h`.
+{.emit: """#include "aowlspt_cursor.h" """.}
 ## The in-game, Unity-native debug overlay: the F3 info panel and the
 ## in-world AI markers. Target table, call thunks, guarded scalar stores,
 ## the toggle key and the frame-rate estimate. See `aowlspt_debugui.h`.
@@ -3284,6 +3290,15 @@ proc patchFired(slot: int32; regs: Il2CppPtr): int32 {.
     # existing drain means no second detour and no second trampoline. Idle cost
     # is two integer compares.
     modeSkipDrainTick()
+    # FREE THE MOUSE WHILE AN OVERLAY PANEL IS OPEN. It rides THIS drain, and
+    # not `PreloaderUI::Update` like most of the UI features, for the reason the
+    # inspector's `gInspSlot2` alias two branches up exists: PreloaderUI only
+    # ticks in the MENU, and a raid is the whole point of this feature -- in a
+    # raid the client locks the cursor to screen centre for mouselook and an
+    # overlay panel cannot be clicked. Idle cost is a publish and two integer
+    # compares; it makes NO call into the game on a frame where no panel is open
+    # and no saved state is held.
+    cursorFreeDrainTick()
     return 0'i32
   # The render-phase drain, likewise by identity: a second detour on a
   # render-phase method that drains the render queue where GL drawing lands.
@@ -5742,6 +5757,13 @@ include "modetext.nim"
 ## detours are on functions nothing else in this host names.
 include "modeskip.nim"
 
+## FREE THE MOUSE WHILE AN OVERLAY PANEL IS OPEN. Included after `debugui.nim`
+## because it reads that file's `gDuEdit` to know whether the F3 layout editor
+## is claiming the cursor, and it installs NO detour of its own: it rides the
+## `EFT.TarkovApplication::Update` drain as an alias, the same way the deferred
+## Submit above it does.
+include "cursorfree.nim"
+
 ## THE LIVE INSPECTOR / REPL. `include`d LAST of all, because it stands on every
 ## file above it at once: `settingsui.nim`'s `suiReadString` and tab registry,
 ## `invoke2.nim`'s byte-verified managed-call targets, `debugui.nim`'s `duOk`,
@@ -7137,6 +7159,26 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
          "TarkovApplication::Update drain will call the game's own " &
          "Submit for it a couple of ticks later. Neither detour suppresses " &
          "its original, so the screen is dismissed rather than prevented."
+  # FREE THE MOUSE WHILE AN OVERLAY PANEL IS OPEN. Default OFF. `cursorFreeBoot`
+  # verifies all four `UnityEngine.Cursor` targets against the startup prologue
+  # snapshot and REFUSES to arm unless every one of them passes -- this feature
+  # writes cursor state, and it will not write a state it could not first read.
+  # `cursorFreeBoot` is deliberately NOT called here, for the same reason
+  # `bindNativeUi` is not (see the note just below): this pass runs before
+  # il2cpp is attached, so `GameAssembly.dll` may not be loaded and the prologue
+  # snapshot may not be primed -- a verify run now would reject four perfectly
+  # correct RVAs and blame the game build. It is called from the FIRST drain
+  # tick instead, which by construction runs on Unity's thread with the module
+  # loaded.
+  gCursorFreeOn = readBoolKey("overlayCursorFree")
+  if gCursorFreeOn:
+    info "overlayCursorFree is set: while any aowlspt overlay panel is open " &
+         "the cursor will be freed by calling UnityEngine.Cursor's own " &
+         "set_lockState/set_visible at byte-verified static RVAs, and the " &
+         "game's own state -- read before it is changed, never assumed -- is " &
+         "put back verbatim when the last panel closes. The targets are " &
+         "verified on the first drain tick, not here, because il2cpp is not " &
+         "attached yet at this point in boot."
   # The native-UI layer. Both default OFF. `nativeUi` makes the API answer at
   # all; `nativeUiProof` additionally runs the one-shot visual self-proof.
   gNuOn = readBoolKey("nativeUi")

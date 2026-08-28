@@ -707,6 +707,22 @@ proc buildOverlayTests(e: Env): bool =
                quoted(joinPath(dir, "nativeuitest.exe")), dir):
     okAll = false
 
+  # THE OVERLAY CURSOR-FREE DECISION. `abi/aowlspt_cursor.h` splits so that the
+  # whole decision -- the ref count that is a level rather than a counter, the
+  # save/restore edges, the re-assert hold, the unwind-on-disable -- is pure
+  # arithmetic compiled here with AOWL_CUR_PURE and asserted OFFLINE. It belongs
+  # offline for the reason the F3 widgets do, and for one more: the failure it
+  # guards against is a cursor left FREED in a raid after our code stopped
+  # running, which no amount of looking at a working session would ever reveal.
+  if not run(e, "the overlay cursor-free decision",
+    "gcc -O2 -Wall -Wextra -Wno-unused-function -I" & inc & " " &
+    quoted(joinPath(dir, "cursortest.c")) & " -o " &
+    quoted(joinPath(dir, "cursortest.exe")), dir):
+    okAll = false
+  elif not run(e, "overlay cursor checks",
+               quoted(joinPath(dir, "cursortest.exe")), dir):
+    okAll = false
+
   if not run(e, "overlay header needs no extra link library",
     "gcc -O1 -Wno-unused-function -I" & inc & " " &
     quoted(joinPath(dir, "linkprobe.c")) & " -o " &

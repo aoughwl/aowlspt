@@ -116,6 +116,15 @@
 #include "aowlspt_detour.h"
 #include "aowlspt_admin.h"   /* the admin/cheat HUD's shared-memory surface */
 #include "aowlspt_region.h"  /* the SHARED per-frame region: every mod's draw */
+/* The cursor-free facility, PURE half only: this module needs the panel BITS
+ * and nothing else. The live half calls `UnityEngine.Cursor` and depends on the
+ * host's prologue snapshot, neither of which exists over here -- and must not,
+ * because managed calls belong on Unity's main thread and this is the render
+ * thread. Including the real header rather than re-typing two constants is
+ * deliberate: a duplicated bit value that drifts is a mask that silently stops
+ * matching. See `aowl_ov_publish_cursor_panels` below. */
+#define AOWL_CUR_PURE 1
+#include "aowlspt_cursor.h"
 
 /* The admin/cheat HUD's shared region, mapped in `aowl_ov_start`. NULL until
  * then, and NULL forever if the OS refuses the mapping -- in which case every
@@ -10774,6 +10783,53 @@ static int32_t aowl_ov_admin_active(void) {
 static AowlAdminShared g_ovAdminSnap;
 
 /* ------------------------------------------------------------------ *
+ * WHICH PANELS WANT THE MOUSE
+ *
+ * In a raid the client holds the cursor with `CursorLockMode.Locked` and pins
+ * it to the screen centre every frame, so these panels draw perfectly and
+ * cannot be clicked. Freeing it means calling `UnityEngine.Cursor`'s own
+ * setters, which is MANAGED code and must happen on Unity's main thread -- and
+ * this is the RENDER thread. So the overlay does not free anything. It only
+ * says, once per Present, which of its panels are currently open; the host
+ * reads that on its `TarkovApplication::Update` drain and does the rest.
+ * `abi/aowlspt_cursor.h` is the whole facility.
+ *
+ * The publication is a LEVEL, not an edge: the full mask goes out every frame,
+ * including 0. That is what lets the host release the cursor by itself if this
+ * module stops running, rather than stranding the player with a freed cursor in
+ * a firefight -- and it is why there is no "close" event to forget to send.
+ *
+ * The F6 admin MENU counts; the admin ESP does NOT. ESP is a passive draw over
+ * the world with nothing to click, and taking mouselook control away from a
+ * player who merely has ESP on would be a regression rather than a feature.
+ *
+ * Resolved by `GetProcAddress` on the host DLL exactly as `aowl_region_commands`
+ * is, and for the same reason: a host too old to export it must be a clean
+ * "nothing published", never a load failure.
+ * ------------------------------------------------------------------ */
+typedef int32_t (*AowlOvCursorFn)(int32_t);
+static AowlOvCursorFn aowl_ov_cursor_fn  = 0;
+static int32_t        aowl_ov_cursor_try = 0;
+
+static void aowl_ov_publish_cursor_panels(void) {
+    int32_t mask = 0;
+    if (!aowl_ov_cursor_try) {
+        HMODULE h;
+        aowl_ov_cursor_try = 1;
+        h = GetModuleHandleA("aowlspt-host-il2cpp.dll");
+        if (h)
+            aowl_ov_cursor_fn = (AowlOvCursorFn)(void*)
+                GetProcAddress(h, "aowl_cursor_panels_x");
+    }
+    if (!aowl_ov_cursor_fn) return;
+    if (g_ov.visible) mask |= (int32_t)AOWL_CUR_P_OVERLAY;
+    if (g_ov_admin && g_ov_admin->magic == AOWL_ADM_MAGIC &&
+        aowl_admin_menu_open(g_ov_admin))
+        mask |= (int32_t)AOWL_CUR_P_ADMIN;
+    aowl_ov_cursor_fn(mask);
+}
+
+/* ------------------------------------------------------------------ *
  * THE SHARED REGION'S DRAW
  *
  * The generic replacement for what `aowl_ov_admin_append` does privately for
@@ -11192,6 +11248,13 @@ static HRESULT STDMETHODCALLTYPE aowl_ov_present(IDXGISwapChain* sc, UINT sync,
         if (!g_ov.visible) InterlockedExchange(&g_ov.logWant, 0);
         g_ov.wasVisible = g_ov.visible;
         int32_t adminOn = aowl_ov_admin_active();
+        /* Say which panels are open, EVERY frame and including "none". The host
+         * frees and restores the cursor off the back of this; see
+         * `aowl_ov_publish_cursor_panels`. This is unconditional -- it is not
+         * inside the `aowl_ov_bind(sc) && (visible || ...)` block below -- so
+         * that the frame a panel CLOSES still publishes an empty mask promptly
+         * rather than relying on the staleness timeout to notice. */
+        aowl_ov_publish_cursor_panels();
         /* The shared region draws whenever it has published anything, exactly
          * as the admin HUD draws whenever it is live -- otherwise a mod's
          * markers would appear only while the manager panel happened to be
