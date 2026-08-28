@@ -3557,75 +3557,209 @@ static void aowl_ov_settings_load(const char* pageId, int32_t isMod,
  * cannot fail.
  *
  * Three outcomes, not two: verified (clears the banner), NOT APPLIED (names
- * both values), and INCONCLUSIVE when the re-read did not produce the row at
- * all -- "I could not look" is not a pass.
+ * both values), and INCONCLUSIVE whenever the finished state could not be
+ * OBSERVED -- the row was missing, the pipeline had not republished yet, or
+ * the edit was still queued. "I could not look" is not a pass, and it is not
+ * a failure either. See the pipeline-window comment below.
  *
  * The comparison is on `raw`, the JSON literal, which is exactly the text that
  * was POSTed, so `1.0` vs `1` cannot be read as a revert. Leading/trailing
  * space is ignored; nothing else is normalised, because normalising is how a
  * check stops being able to fail. */
-/* HOW LONG TO WAIT BEFORE CALLING A WRITE LOST.
+/* HOW LONG TO WAIT BEFORE CALLING A WRITE LOST -- AND WHY A CLOCK CANNOT
+ * ANSWER THAT QUESTION.
  *
- * MEASURED, not guessed: a client-side page's rows only change at the backend
- * when the host's settings bridge republishes them, and that is one collect +
- * push cycle -- `cSbPeriodMs = 5000` in
- * `host/Aowlspt.Host.Il2Cpp/settingsbridge.nim`, plus the push itself. So the
- * patience has to exceed 5 s or this check would go red on the WORKING path.
- * 10 x 800 ms = 8 s, and only a write that never lands ever waits that long. */
-#define AOWL_OV_VERIFY_TRIES 10
+ * The previous rule here was a wall clock: 10 x 800 ms = 8 s, derived from ONE
+ * `cSbPeriodMs = 5000` collect+push cycle in
+ * `host/Aowlspt.Host.Il2Cpp/settingsbridge.nim`. That derivation was short by a
+ * whole cycle, and MEASURED to be short: on a live client an edit POSTed at
+ * t+0.0 s was applied by the host at t+6.2 s and only became visible on
+ * `GET /aowlspt/settings/<guid>` at t+13.7 s -- because `sbCollect()` snapshots
+ * the rows BEFORE the sync whose reply carries the edit, so the push that
+ * DRAINS an edit still carries the PRE-edit rows and the new value first
+ * appears on the push after that. Two pushes, not one. The 8 s budget expired
+ * in between every time, and the panel showed NOT APPLIED for an edit the host
+ * log recorded as applied. A check that goes red on the working path is the
+ * same disease as one that cannot go red at all.
+ *
+ * So the wait is no longer timed against a clock. It is gated on OBSERVED
+ * PIPELINE PROGRESS, read from `GET /aowlspt/settings/client/status/<guid>
+ * ?key=<key>` (settingshub, read-only): the verdict window opens only once the
+ * edit has left the queue (`pending == false`) AND this guid has republished
+ * its page at least twice since the POST (`pushes >= pushes0 + 2`). Only inside
+ * that window can a mismatch mean anything -- and inside it, it means the value
+ * genuinely did not stick.
+ *
+ * The clock survives only as a CAP, so a dead pipeline cannot hang the worker
+ * for ever -- and when the cap is what stops the loop the verdict is
+ * INCONCLUSIVE, naming the stage it was stuck at. It is never NOT APPLIED,
+ * because "I ran out of patience" is not evidence about the value.
+ * 40 x 800 ms = 32 s is ~2x the measured 13.7 s worst case; the working path
+ * never reaches it, since the loop returns the moment the row matches. */
+#define AOWL_OV_VERIFY_TRIES 40
 #define AOWL_OV_VERIFY_WAIT  800
+/* A page nobody has ever pushed as a CLIENT page is server-side (or the
+ * panel's own generated one): its store is authoritative the instant the POST
+ * returns, so no window has to open and a verdict is available at once. */
+#define AOWL_OV_VERIFY_LOCAL_TRIES 3
+/* Republishes of this guid that must be observed after the POST before a
+ * mismatch can be believed. MEASURED above: the draining push is still stale. */
+#define AOWL_OV_VERIFY_PUSHES 2
+
+/* One read of the pipeline stage for (guid, key). Returns 1 when the status
+ * route answered in the expected shape and the out-params are meaningful, 0
+ * when it did not answer at all (an older backend, or the hub not loaded) --
+ * in which case the caller must NOT invent progress. Clobbers `buf`, so the
+ * caller re-loads the page afterwards. */
+static int32_t aowl_ov_settings_stage(const char* guid, const char* key,
+                                      char* buf, int32_t cap,
+                                      int32_t* known, int32_t* pending,
+                                      int32_t* pushes) {
+    wchar_t path[288];
+    wchar_t wg[96];
+    wchar_t wk[96];
+    const char* end;
+    const char* v;
+    int32_t i = 0, rc;
+    *known = 0; *pending = 0; *pushes = 0;
+    for (; guid && guid[i] && i < 95; i++) wg[i] = (wchar_t)(unsigned char)guid[i];
+    wg[i] = 0;
+    for (i = 0; key && key[i] && i < 95; i++) wk[i] = (wchar_t)(unsigned char)key[i];
+    wk[i] = 0;
+    _snwprintf(path, 288, L"/aowlspt/settings/client/status/%ls?key=%ls", wg, wk);
+    path[287] = 0;
+    rc = aowl_ov_fetch(L"GET", path, NULL, buf, cap);
+    if (rc <= 0 || !aowl_ov_jwhole(buf, rc)) return 0;
+    end = buf + rc;
+    v = aowl_ov_jmem(buf, end, "known");
+    if (!v) return 0;                   /* answered, but not with this shape */
+    *known = aowl_ov_jbool(v, end, 0);
+    v = aowl_ov_jmem(buf, end, "pending");
+    *pending = v ? aowl_ov_jbool(v, end, 0) : 0;
+    v = aowl_ov_jmem(buf, end, "pushes");
+    *pushes = v ? aowl_ov_jint(v, end, 0) : 0;
+    return 1;
+}
+
+/* Does the row for `key` read back exactly what was `sent`? Sets `*found` and
+ * points `*last` at what it actually reads. The comparison is on `raw`, the
+ * JSON literal, so `1.0` vs `1` cannot be read as a revert; leading space is
+ * ignored and NOTHING else is normalised, because normalising is how a check
+ * stops being able to fail. Called under the same lock discipline as before. */
+static int32_t aowl_ov_verify_match(const char* key, const char* sent,
+                                    int32_t* found, const char** last) {
+    int32_t i;
+    const char* a;
+    const char* b;
+    *found = 0;
+    for (i = 0; i < g_ov.itemCount; i++) {
+        if (strcmp(g_ov.items[i].key, key) != 0) continue;
+        *found = 1;
+        a = g_ov.items[i].raw;
+        b = sent ? sent : "";
+        while (*a == ' ') a++;
+        while (*b == ' ') b++;
+        *last = a;
+        return strcmp(a, b) == 0;
+    }
+    return 0;
+}
 
 static void aowl_ov_settings_verify(const char* guid, const char* key,
                                     const char* sent, int32_t isMod,
                                     char* buf, int32_t cap) {
-    int32_t i, try_;
+    int32_t try_;
     int32_t found = 0;
-    const char* a;
-    const char* b;
+    int32_t haveStage = 0, known = 0, pending = 0, pushes = 0;
+    int32_t pushes0 = -1;               /* republish count before any wait */
+    int32_t sawPending = 0;             /* observed still queued */
+    int32_t drained = 0;                /* ...and then observed gone */
+    int32_t windowOpen = 0;
+    int32_t tries = AOWL_OV_VERIFY_TRIES;
     const char* last = "";
     if (!key || !key[0]) { g_ov.writeWhy[0] = 0; return; }
-    for (try_ = 0; try_ < AOWL_OV_VERIFY_TRIES; try_++) {
-        found = 0;
-        for (i = 0; i < g_ov.itemCount; i++) {
-            if (strcmp(g_ov.items[i].key, key) != 0) continue;
-            found = 1;
-            a = g_ov.items[i].raw;
-            b = sent ? sent : "";
-            while (*a == ' ') a++;
-            while (*b == ' ') b++;
-            last = a;
-            if (strcmp(a, b) == 0) { g_ov.writeWhy[0] = 0; return; }
-            break;
+    for (try_ = 0; try_ < tries; try_++) {
+        /* 1. THE FINISHED STATE. What the row reads NOW against what was sent
+         *    -- never the status code (200 on the silent-revert path and the
+         *    working one alike, fact #135), never our own request. A match
+         *    settles it on either transport and needs no window. */
+        if (aowl_ov_verify_match(key, sent, &found, &last)) {
+            g_ov.writeWhy[0] = 0;
+            return;
         }
-        /* NOT YET IS NOT THE SAME AS NEVER.
-         *
-         * A CLIENT-SIDE mod's page is served by the backend but OWNED by the
-         * game process: `settingshub` QUEUES the edit and the host applies it
-         * on its next `/aowlspt/settings/client/sync` (a few hundred ms to a
-         * few seconds later). The re-read that happens immediately after the
-         * POST is therefore stale BY DESIGN on that transport, and declaring a
-         * revert here would be a check that fails on the working path -- which
-         * is the same disease as a check that cannot fail. So the page is
-         * re-read a bounded number of times before any verdict is given, and
-         * only a value that never lands is reported. */
-        if (try_ + 1 < AOWL_OV_VERIFY_TRIES) {
+        /* 2. WHERE IS IT? Read the stage instead of guessing from a clock. */
+        haveStage = aowl_ov_settings_stage(guid, key, buf, cap,
+                                           &known, &pending, &pushes);
+        if (haveStage) {
+            if (!known) {
+                windowOpen = 1;
+                if (tries > AOWL_OV_VERIFY_LOCAL_TRIES)
+                    tries = AOWL_OV_VERIFY_LOCAL_TRIES;
+            } else {
+                if (pushes0 < 0) pushes0 = pushes;
+                if (pending) { sawPending = 1; drained = 0; }
+                else if (sawPending) drained = 1;
+                if (!pending && pushes >= pushes0 + AOWL_OV_VERIFY_PUSHES)
+                    windowOpen = 1;
+            }
+        } else {
+            /* NO STATUS ROUTE: nothing here can prove progress, so nothing
+             * here may produce a NOT APPLIED. A match is still a pass; the cap
+             * still ends the loop -- as INCONCLUSIVE. */
+            windowOpen = 0;
+        }
+        if (windowOpen) break;
+        if (try_ + 1 < tries) {
             Sleep(AOWL_OV_VERIFY_WAIT);
             aowl_ov_settings_load(guid, isMod, buf, cap);
         }
     }
-    if (found) {
+    /* 3. Inside an open window, re-read once more, then give a real verdict. */
+    if (windowOpen) {
+        aowl_ov_settings_load(guid, isMod, buf, cap);
+        if (aowl_ov_verify_match(key, sent, &found, &last)) {
+            g_ov.writeWhy[0] = 0;
+            return;
+        }
+        if (found)
+            aowl_ov_fmt(g_ov.writeWhy, (int32_t)sizeof(g_ov.writeWhy),
+                        "NOT APPLIED: %s was set to %s and reads back %s. The "
+                        "edit reached the owning process and its page has been "
+                        "republished since, so this IS the finished state, not "
+                        "a delay. This edit is NOT saved.",
+                        key, (sent && sent[0]) ? sent : "(nothing)",
+                        last[0] ? last : "(nothing)");
+        else
+            aowl_ov_fmt(g_ov.writeWhy, (int32_t)sizeof(g_ov.writeWhy),
+                        "INCONCLUSIVE: %s was written and %s has republished "
+                        "since, but the re-read does not contain that row, so "
+                        "whether it took is unknown.",
+                        key, guid ? guid : "the page");
+    } else if (!haveStage) {
         aowl_ov_fmt(g_ov.writeWhy, (int32_t)sizeof(g_ov.writeWhy),
-                    "NOT APPLIED: %s was set to %s and still reads back %s "
-                    "after %d s. The server answered 200; the value did not "
-                    "change. This edit is NOT saved.",
-                    key, (sent && sent[0]) ? sent : "(nothing)",
-                    last[0] ? last : "(nothing)",
-                    (AOWL_OV_VERIFY_TRIES * AOWL_OV_VERIFY_WAIT) / 1000);
+                    "INCONCLUSIVE: %s was written, but this backend has no "
+                    "client/status route, so a value that did not take cannot "
+                    "be told from one still in flight. It reads back %s after "
+                    "%d s.",
+                    key, last[0] ? last : "(nothing)",
+                    (tries * AOWL_OV_VERIFY_WAIT) / 1000);
+    } else if (sawPending && !drained) {
+        aowl_ov_fmt(g_ov.writeWhy, (int32_t)sizeof(g_ov.writeWhy),
+                    "INCONCLUSIVE: %s is still QUEUED for the game process "
+                    "after %d s -- the settings bridge has not collected it. "
+                    "The edit is not lost; nothing has applied it yet.",
+                    key, (tries * AOWL_OV_VERIFY_WAIT) / 1000);
     } else {
         aowl_ov_fmt(g_ov.writeWhy, (int32_t)sizeof(g_ov.writeWhy),
-                    "INCONCLUSIVE: %s was written but the re-read of %s does "
-                    "not contain that row, so whether it took is unknown.",
-                    key, guid ? guid : "the page");
+                    "INCONCLUSIVE: %s left the queue, but %s has republished "
+                    "only %d of the %d times needed to show the result, after "
+                    "%d s. It reads back %s -- that is the OLD value, not a "
+                    "verdict.",
+                    key, guid ? guid : "the page",
+                    pushes0 >= 0 ? pushes - pushes0 : 0,
+                    AOWL_OV_VERIFY_PUSHES,
+                    (tries * AOWL_OV_VERIFY_WAIT) / 1000,
+                    last[0] ? last : "(nothing)");
     }
     aowl_ov_note(g_ov.writeWhy);
 }
