@@ -352,6 +352,17 @@ proc buildMod(e: Env; modPathIn: string): bool =
   # whole reason a native mod beats the C# it replaces -- was unreachable from
   # the one place it was for.
   cmd.add abiInclude(e)
+  # ...and the mod's OWN directory, so a mod may keep private C headers beside
+  # its Nim rather than pushing them into `abi/`.
+  #
+  # The generated C lands in `nimcache/`, not next to the source, so a plain
+  # `#include "foo.h"` in an `{.emit.}` block resolves relative to nimcache and
+  # fails -- which is why the only previous way to share C between a mod's own
+  # files was to add to `abi/`, a surface every other mod and the host also
+  # compile against. `mods/maps/sp/mapmath.h` is the first user: pure geometry
+  # that belongs to one mod and that a shared header has no business carrying.
+  # Include it as "sp/mapmath.h" -- the path is the mod root.
+  cmd.add " --passC:-I" & quoted(dir)
   if e.debugBuild:
     cmd.add " -d:debug"
   cmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
@@ -625,6 +636,23 @@ proc buildOverlayTests(e: Env): bool =
     quoted(joinPath(dir, "f3test.exe")), dir):
     okAll = false
   elif not run(e, "F3 render checks", quoted(joinPath(dir, "f3test.exe")), dir):
+    okAll = false
+
+  # The maps overlay's GEOMETRY: the top-down projection behind the in-game map
+  # and the radar, the screen-edge clamp behind the directional indicators, and
+  # the pocketmap tile selection. All of it is pure arithmetic over its
+  # arguments, so all of it is checkable with no client -- which matters more
+  # here than almost anywhere, because a mirrored map, a radar off by a factor
+  # of two, and an indicator pointing at the reflection of a contact behind the
+  # camera all look completely plausible on screen. Each of those three is a
+  # case in this file.
+  if not run(e, "the maps overlay geometry",
+    "gcc -O2 -Wall -Wno-unused-function -I" & inc & " " &
+    quoted(joinPath(dir, "mapstest.c")) & " -o " &
+    quoted(joinPath(dir, "mapstest.exe")) & " -lm", dir):
+    okAll = false
+  elif not run(e, "maps geometry checks",
+               quoted(joinPath(dir, "mapstest.exe")), dir):
     okAll = false
 
   if not run(e, "overlay header needs no extra link library",
@@ -1300,6 +1328,13 @@ proc cmdBuildOne(e: Env; target: string): int =
     result = if buildVerifyInstall(e): 0 else: 1
   of "probe":
     result = if buildProbe(e): 0 else: 1
+  of "overlaytests", "overlay":
+    # These offline checks existed but had NO named target: `buildOverlayTests`
+    # was reachable only from the bare `aowl build`, which is 18 minutes cold.
+    # So the cheapest, fastest checks in the repo -- the ones whose whole point
+    # is that they need no client and no deploy -- were the most expensive to
+    # run, and the temptation was to skip them. They take seconds this way.
+    result = if buildOverlayTests(e): 0 else: 1
   of "mods":
     for m in modDirs(e):
       discard buildMod(e, m)

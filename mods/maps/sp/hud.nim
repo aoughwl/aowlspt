@@ -59,6 +59,7 @@ import world  # the Snapshot this file mirrors; no game memory is read here
 #include <string.h>
 #include <math.h>
 #include "aowlspt_region.h"
+#include "sp/mapmath.h"
 
 #define MHUD_MAX 128
 #define MHUD_RGBA(r, g, b, a) \
@@ -89,14 +90,31 @@ static struct {
     float    radarSize, radarX, radarY;
     int32_t  showBots, showPlayers;
 
+    /* the MAP pane -- a big top-down view, distinct from the small radar */
+    int32_t  mapOn;
+    float    mapX, mapY, mapSize, mapSpanM;
+    int32_t  mapGrid;          /* grid line count per axis, 0 = none */
+    float    indicatorInset;   /* margin the edge markers clamp onto */
+
     int64_t  frames, drawn, blips;
+    /* Indicators are drawn one of TWO ways and the two are counted apart, on
+     * purpose. `indProjected` is the real, camera-relative answer via the
+     * region's projector; `indBearing` is the north-up fallback used when no
+     * projector is installed, which points at world north and not at what the
+     * player is looking at. One combined number would let a session in which
+     * the projector never arrived read exactly like one in which it did --
+     * which is the failure this project keeps paying for. */
+    int64_t  indProjected, indBearing, indRefused;
+    int32_t  screenFromRegion; /* 1 = measured back buffer, 0 = config guess */
     int32_t  handle;
 } g_mhud;
 
 static void mhud_reset(void) {
     memset(&g_mhud, 0, sizeof(g_mhud));
-    g_mhud.handle  = -1;
-    g_mhud.radiusM = 120.0f;
+    g_mhud.handle         = -1;
+    g_mhud.radiusM        = 120.0f;
+    g_mhud.mapSpanM       = 500.0f;
+    g_mhud.indicatorInset = 48.0f;
 }
 
 /* ---- the mirror, filled on Unity's thread before the draw ------------- */
@@ -135,6 +153,38 @@ static void mhud_configure(float radiusM, float screenW, float screenH,
     g_mhud.showPlayers  = showPlayers ? 1 : 0;
 }
 
+static void mhud_configure_map(int32_t mapOn, float mapX, float mapY,
+                               float mapSize, float mapSpanM, int32_t mapGrid,
+                               float indicatorInset) {
+    g_mhud.mapOn          = mapOn ? 1 : 0;
+    g_mhud.mapX           = mapX;
+    g_mhud.mapY           = mapY;
+    g_mhud.mapSize        = mapSize > 64.0f ? mapSize : 64.0f;
+    g_mhud.mapSpanM       = mapSpanM > 10.0f ? mapSpanM : 10.0f;
+    g_mhud.mapGrid        = (mapGrid > 0 && mapGrid <= 32) ? mapGrid : 0;
+    g_mhud.indicatorInset = indicatorInset > 4.0f ? indicatorInset : 4.0f;
+}
+
+/* THE BACK-BUFFER SIZE, asked of the region rather than guessed.
+ *
+ * `aowl_region_screen_known()` is checked first and the answer is REMEMBERED
+ * as `screenFromRegion`, because the getters return 0 until the host has
+ * published a measurement and 0 is not a refusal -- it is a plausible number
+ * that collapses every edge-anchored mark into the top-left corner. The mod's
+ * config values remain the fallback, and the status line says which was used,
+ * so "my indicators are all in the corner" is a distinguishable report. */
+static void mhud_screen(float* w, float* h) {
+    if (aowl_region_screen_known()) {
+        *w = (float)aowl_region_screen_w();
+        *h = (float)aowl_region_screen_h();
+        g_mhud.screenFromRegion = 1;
+    } else {
+        *w = g_mhud.screenW;
+        *h = g_mhud.screenH;
+        g_mhud.screenFromRegion = 0;
+    }
+}
+
 /* ---- the draw -------------------------------------------------------- *
  *
  * NO LINE COMMANDS. `AOWL_REGION_CMD_LINE` exists, but the overlay renders a
@@ -146,7 +196,7 @@ static void mhud_configure(float radiusM, float screenW, float screenH,
  * 3 + 2*128 + 1 = 260 against AOWL_REGION_MAX_CMDS (2048). It cannot overrun.
  */
 static void mhud_draw(void* user, int64_t frame) {
-    float cx, cy, half, scale, scx, scy, ring;
+    float rot, scrW, scrH;
     int32_t i;
     (void)user; (void)frame;
 
@@ -154,71 +204,165 @@ static void mhud_draw(void* user, int64_t frame) {
     if (!g_mhud.hasLocal) return;   /* no centre => nothing truthful to draw */
     g_mhud.drawn++;
 
-    half  = g_mhud.radarSize * 0.5f;
-    cx    = g_mhud.radarX + half;
-    cy    = g_mhud.radarY + half;
-    scale = half / g_mhud.radiusM;
-    scx   = g_mhud.screenW * 0.5f;
-    scy   = g_mhud.screenH * 0.5f;
-    ring  = (g_mhud.screenH < g_mhud.screenW ? g_mhud.screenH : g_mhud.screenW)
-            * 0.35f;
+    mhud_screen(&scrW, &scrH);
 
+    /* North-up unless a heading was actually MEASURED. `hasHeading` is false
+     * today (sp/world.nim reads no rotation and says so), so this rotates by
+     * nothing rather than by a guessed zero that LOOKS like a heading. When a
+     * heading does arrive, both the radar and the map pane become heading-up
+     * together, because both take `rot` from this one place. */
+    rot = g_mhud.hasHeading ? g_mhud.heading : 0.0f;
+
+    /* ---- the MAP pane: the same top-down view, at map scale -------------- *
+     * Player-CENTRED, not map-anchored. Anchoring to the level would need the
+     * pocketmap pyramid's world origin and extent, which nothing here has
+     * measured; centring on the player needs only the player's position,
+     * which sp/world.nim already validated. A wrong origin would slide every
+     * feature of the map a constant distance off and still look like a map,
+     * so the anchored version waits for a measurement rather than a guess.
+     *
+     * There is NO map ARTWORK under these blips. The region command set is
+     * FILL / BOX / LINE / TEXT -- there is no textured-quad command, so the
+     * pocketmap tiles cannot be submitted through this contract at all. The
+     * grid is a scale reference and is drawn as such, not as scenery. */
+    if (g_mhud.mapOn) {
+        float mx = g_mhud.mapX, my = g_mhud.mapY, ms = g_mhud.mapSize;
+        aowl_region_fill(mx, my, ms, ms, MHUD_RGBA(8, 10, 14, 190));
+        aowl_region_box(mx, my, ms, ms, 2.0f, MHUD_RGBA(150, 180, 210, 220));
+        if (g_mhud.mapGrid > 0) {
+            int32_t g;
+            float step = ms / (float)g_mhud.mapGrid;
+            for (g = 1; g < g_mhud.mapGrid; g++) {
+                float o = (float)g * step;
+                /* 1px FILLs, not LINEs: the overlay renders a LINE as the
+                 * axis-aligned quad spanning its endpoints, which is right for
+                 * these two but wrong for anything diagonal, so this file uses
+                 * FILL everywhere and never has to remember the exception. */
+                aowl_region_fill(mx + o, my, 1.0f, ms,
+                                 MHUD_RGBA(60, 75, 95, 120));
+                aowl_region_fill(mx, my + o, ms, 1.0f,
+                                 MHUD_RGBA(60, 75, 95, 120));
+            }
+        }
+        /* the player, at the pane's centre by construction */
+        {
+            MmPt me = mm_topdown(g_mhud.px, g_mhud.pz, g_mhud.px, g_mhud.pz,
+                                 mx, my, ms, g_mhud.mapSpanM, rot);
+            aowl_region_fill(me.x - 3.0f, me.y - 3.0f, 6.0f, 6.0f,
+                             MHUD_RGBA(255, 255, 255, 255));
+        }
+        /* A north pip, so which way is up is never a guess. It sits at the top
+         * of the pane when north-up and swings with `rot` when heading-up. */
+        {
+            MmPt np = mm_topdown(g_mhud.px, g_mhud.pz + g_mhud.mapSpanM * 0.45f,
+                                 g_mhud.px, g_mhud.pz, mx, my, ms,
+                                 g_mhud.mapSpanM, rot);
+            aowl_region_fill(np.x - 2.0f, np.y - 2.0f, 4.0f, 4.0f,
+                             MHUD_RGBA(255, 210, 90, 230));
+        }
+    }
+
+    /* ---- the RADAR frame ------------------------------------------------ */
     if (g_mhud.radarOn) {
+        MmPt me;
         aowl_region_fill(g_mhud.radarX, g_mhud.radarY,
                          g_mhud.radarSize, g_mhud.radarSize,
                          MHUD_RGBA(10, 12, 16, 150));
         aowl_region_box(g_mhud.radarX, g_mhud.radarY,
                         g_mhud.radarSize, g_mhud.radarSize, 1.0f,
                         MHUD_RGBA(120, 160, 200, 200));
-        /* the player, always dead centre */
-        aowl_region_fill(cx - 2.0f, cy - 2.0f, 4.0f, 4.0f,
+        me = mm_topdown(g_mhud.px, g_mhud.pz, g_mhud.px, g_mhud.pz,
+                        g_mhud.radarX, g_mhud.radarY, g_mhud.radarSize,
+                        g_mhud.radiusM * 2.0f, rot);
+        aowl_region_fill(me.x - 2.0f, me.y - 2.0f, 4.0f, 4.0f,
                          MHUD_RGBA(255, 255, 255, 255));
     }
 
+    /* ---- every contact, on all three surfaces ---------------------------- *
+     * Command budget: the map frame is at most 2 + 2*31 + 2 = 66, the radar
+     * frame 3, and each entity contributes at most 1 (map) + 2 (radar) + 2
+     * (indicator) = 5. With MHUD_MAX 128 that is 66 + 3 + 640 = 709 against
+     * AOWL_REGION_MAX_CMDS (2048). It cannot overrun.
+     */
     for (i = 0; i < g_mhud.n; i++) {
-        float dx = g_mhud.e[i].x - g_mhud.px;
-        float dz = g_mhud.e[i].z - g_mhud.pz;
+        float ex = g_mhud.e[i].x, ez = g_mhud.e[i].z;
         float dy = g_mhud.e[i].y - g_mhud.py;
-        float rx, rz, d, blipX, blipY;
+        float d;
         uint32_t col;
 
         if (g_mhud.e[i].bot && !g_mhud.showBots) continue;
         if (!g_mhud.e[i].bot && !g_mhud.showPlayers) continue;
 
-        /* North-up unless a heading was actually measured. `hasHeading` is
-         * false today (sp/world.nim never reads one), so this rotates by
-         * nothing rather than by a guessed zero that LOOKS like a heading. */
-        if (g_mhud.hasHeading) {
-            float s = (float)sin((double)g_mhud.heading);
-            float c = (float)cos((double)g_mhud.heading);
-            rx =  dx * c - dz * s;
-            rz =  dx * s + dz * c;
-        } else { rx = dx; rz = dz; }
-
-        d = (float)sqrt((double)(rx * rx + rz * rz));
-        if (d > g_mhud.radiusM) continue;
-
         col = g_mhud.e[i].bot ? MHUD_RGBA(230, 70, 60, 235)
                               : MHUD_RGBA(70, 190, 255, 235);
+        d = mm_dist2d(ex, ez, g_mhud.px, g_mhud.pz);
 
-        if (g_mhud.radarOn) {
-            blipX = cx + rx * scale;
-            blipY = cy - rz * scale;          /* +Z is up on the radar */
-            aowl_region_fill(blipX - 2.0f, blipY - 2.0f, 4.0f, 4.0f, col);
+        /* map pane: everything within the pane's span, culled by the RECT and
+         * not by a radius, so the corners of the pane are not dead. */
+        if (g_mhud.mapOn) {
+            MmPt p = mm_topdown(ex, ez, g_mhud.px, g_mhud.pz,
+                                g_mhud.mapX, g_mhud.mapY, g_mhud.mapSize,
+                                g_mhud.mapSpanM, rot);
+            if (mm_in_rect(p, g_mhud.mapX, g_mhud.mapY,
+                           g_mhud.mapSize, g_mhud.mapSize))
+                aowl_region_fill(p.x - 2.0f, p.y - 2.0f, 4.0f, 4.0f, col);
+        }
+
+        /* radar: a tighter radius, and the radius CULL stays a radius here
+         * because a radar is a circle. */
+        if (g_mhud.radarOn && d <= g_mhud.radiusM) {
+            MmPt b = mm_topdown(ex, ez, g_mhud.px, g_mhud.pz,
+                                g_mhud.radarX, g_mhud.radarY,
+                                g_mhud.radarSize, g_mhud.radiusM * 2.0f, rot);
+            aowl_region_fill(b.x - 2.0f, b.y - 2.0f, 4.0f, 4.0f, col);
             /* elevation: a 2px tick above or below the blip, only when the
              * difference is big enough to mean a different floor. */
             if (dy > 2.0f)
-                aowl_region_fill(blipX - 1.0f, blipY - 5.0f, 2.0f, 2.0f, col);
+                aowl_region_fill(b.x - 1.0f, b.y - 5.0f, 2.0f, 2.0f, col);
             else if (dy < -2.0f)
-                aowl_region_fill(blipX - 1.0f, blipY + 4.0f, 2.0f, 2.0f, col);
+                aowl_region_fill(b.x + -1.0f, b.y + 4.0f, 2.0f, 2.0f, col);
         }
 
+        /* ---- the DIRECTIONAL indicator ---------------------------------- *
+         * Preferred path: ask the region's projector where this world point
+         * is on screen and clamp that to the screen edge. That answer is
+         * camera-relative -- it points where the player is actually LOOKING,
+         * which is the whole point of the feature.
+         *
+         * `aowl_region_project` returns 0 when no projector has been installed
+         * (nothing in the host calls `aowl_region_set_projector` yet). That
+         * zero is a REFUSAL and is treated as one: we fall back to the
+         * north-up bearing ring and count the fallback separately, so the
+         * status line can never present a north-up guess as a look-relative
+         * answer. */
         if (g_mhud.indicatorsOn && d > 0.001f) {
-            /* Same answer as the radar, reduced to a bearing: a mark on a ring
-             * around screen centre. */
-            float ux = rx / d, uz = rz / d;
-            aowl_region_fill(scx + ux * ring - 3.0f, scy - uz * ring - 3.0f,
-                             6.0f, 6.0f, col);
+            float sx = 0.0f, sy = 0.0f;
+            MmPt m;
+            int offscreen = 0;
+            if (aowl_region_project(ex, g_mhud.e[i].y, ez, &sx, &sy)) {
+                /* The projector reports nothing about the camera plane through
+                 * this ABI, so `behind` cannot be known here and is passed as
+                 * 0. mm_indicator handles a behind-camera point correctly when
+                 * told; it is simply never told, which is a capability gap in
+                 * the projector contract and is named as one rather than
+                 * papered over with a sign heuristic. */
+                if (mm_indicator(sx, sy, 0, scrW, scrH,
+                                 g_mhud.indicatorInset, &m, &offscreen)) {
+                    aowl_region_fill(m.x - 3.0f, m.y - 3.0f, 6.0f, 6.0f, col);
+                    if (offscreen)
+                        aowl_region_box(m.x - 5.0f, m.y - 5.0f, 10.0f, 10.0f,
+                                        1.0f, col);
+                    g_mhud.indProjected++;
+                } else {
+                    g_mhud.indRefused++;
+                }
+            } else if (mm_bearing_ring(ex, ez, g_mhud.px, g_mhud.pz, rot,
+                                       scrW, scrH, 0.35f, &m)) {
+                aowl_region_fill(m.x - 3.0f, m.y - 3.0f, 6.0f, 6.0f, col);
+                g_mhud.indBearing++;
+            } else {
+                g_mhud.indRefused++;
+            }
         }
     }
     g_mhud.blips += (int64_t)g_mhud.n;
@@ -267,6 +411,14 @@ static int64_t mhud_frames(void)  { return g_mhud.frames; }
 static int64_t mhud_drawn(void)   { return g_mhud.drawn; }
 static int64_t mhud_blips(void)   { return g_mhud.blips; }
 static int32_t mhud_handle(void)  { return g_mhud.handle; }
+static int64_t mhud_ind_projected(void) { return g_mhud.indProjected; }
+static int64_t mhud_ind_bearing(void)   { return g_mhud.indBearing; }
+static int64_t mhud_ind_refused(void)   { return g_mhud.indRefused; }
+static int32_t mhud_screen_measured(void) { return g_mhud.screenFromRegion; }
+static int32_t mhud_screen_w(void) { float w, h; mhud_screen(&w, &h);
+                                     return (int32_t)w; }
+static int32_t mhud_screen_h(void) { float w, h; mhud_screen(&w, &h);
+                                     return (int32_t)h; }
 """.}
 
 proc cHudReset() {.importc: "mhud_reset", nodecl.}
@@ -289,6 +441,15 @@ proc cHudFrames(): int64 {.importc: "mhud_frames", nodecl.}
 proc cHudDrawn(): int64 {.importc: "mhud_drawn", nodecl.}
 proc cHudBlips(): int64 {.importc: "mhud_blips", nodecl.}
 proc cHudHandle(): int32 {.importc: "mhud_handle", nodecl.}
+proc cHudConfigureMap(mapOn: int32; mapX, mapY, mapSize, mapSpanM: cfloat;
+                      mapGrid: int32; indicatorInset: cfloat) {.
+  importc: "mhud_configure_map", nodecl.}
+proc cHudIndProjected(): int64 {.importc: "mhud_ind_projected", nodecl.}
+proc cHudIndBearing(): int64 {.importc: "mhud_ind_bearing", nodecl.}
+proc cHudIndRefused(): int64 {.importc: "mhud_ind_refused", nodecl.}
+proc cHudScreenMeasured(): int32 {.importc: "mhud_screen_measured", nodecl.}
+proc cHudScreenW(): int32 {.importc: "mhud_screen_w", nodecl.}
+proc cHudScreenH(): int32 {.importc: "mhud_screen_h", nodecl.}
 
 type
   HudOpts* = object
@@ -299,6 +460,11 @@ type
     showBots*, showPlayers*: bool
     budgetUs*: int
     order*: int
+    ## the MAP pane -- a separate, larger top-down surface from the radar
+    map*: bool
+    mapX*, mapY*, mapSize*, mapSpanM*: float
+    mapGrid*: int
+    indicatorInset*: float
 
 proc hudInit*(o: HudOpts) =
   ## Resets the mirror and installs the layout. Safe to call before the region
@@ -310,6 +476,10 @@ proc hudInit*(o: HudOpts) =
                 cfloat(o.size), cfloat(o.x), cfloat(o.y),
                 (if o.showBots: 1'i32 else: 0'i32),
                 (if o.showPlayers: 1'i32 else: 0'i32))
+  cHudConfigureMap((if o.map: 1'i32 else: 0'i32),
+                   cfloat(o.mapX), cfloat(o.mapY), cfloat(o.mapSize),
+                   cfloat(o.mapSpanM), int32(o.mapGrid),
+                   cfloat(o.indicatorInset))
 
 proc hudArmed*(): bool =
   ## Whether the HOST has armed the shared region at all. This is the host flag
@@ -363,4 +533,15 @@ proc hudStatusText*(): string =
   " handle=" & $cHudHandle() &
   " frames=" & $cHudFrames() &
   " drawn=" & $cHudDrawn() &
-  " blips=" & $cHudBlips()
+  " blips=" & $cHudBlips() &
+  " screen=" & $cHudScreenW() & "x" & $cHudScreenH() &
+  (if cHudScreenMeasured() != 0'i32: " (measured back buffer)"
+   else: " (CONFIG FALLBACK -- the region has not been told the real size)") &
+  " indicators: projected=" & $cHudIndProjected() &
+  " bearing=" & $cHudIndBearing() &
+  " refused=" & $cHudIndRefused() &
+  (if cHudIndProjected() == 0'i64 and cHudIndBearing() > 0'i64:
+     " -- NO projector is installed, so every indicator drawn so far is a " &
+     "NORTH-UP bearing, not a look-relative direction. The host does not call " &
+     "aowl_region_set_projector yet"
+   else: "")
