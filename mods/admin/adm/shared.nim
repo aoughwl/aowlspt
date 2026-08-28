@@ -92,6 +92,10 @@ proc cSpawnPending(s: AdminRegion): int32 {.
   importc: "aowl_admin_spawn_pending", nodecl.}
 proc cSpawnDone(s: AdminRegion; req: int32; text: cstring) {.
   importc: "aowl_admin_spawn_done", nodecl.}
+proc cSpawnNote(s: AdminRegion; text: cstring) {.
+  importc: "aowl_admin_spawn_note", nodecl.}
+proc cSpawnInflight(s: AdminRegion): int32 {.
+  importc: "aowl_admin_spawn_inflight", nodecl.}
 proc cSpawnCount(s: AdminRegion): int32 {.
   importc: "aowl_admin_spawn_count", nodecl.}
 proc cSpawnCondition(s: AdminRegion): int32 {.
@@ -207,6 +211,20 @@ proc spawnDone*(s: AdminRegion; req: int32; text: string) =
   if s == nil: return
   var t = text
   cSpawnDone(s, req, toCString(t))
+
+proc spawnNote*(s: AdminRegion; text: string) =
+  ## Write the result line as a NOTE -- no ack, no busy flag. This is the
+  ## typeahead channel: the player types, and the line under the query row
+  ## becomes what that query currently matches.
+  if s == nil: return
+  var t = text
+  cSpawnNote(s, toCString(t))
+
+proc spawnInflight*(s: AdminRegion): bool =
+  ## True while a submitted spawn is still being serviced. A search preview is
+  ## suppressed while this holds, so a typeahead line can never overwrite the
+  ## answer to a spawn the player actually asked for.
+  if s == nil: false else: cSpawnInflight(s) != 0'i32
 
 proc modeName*(bit: int32): string =
   ## The menu label for one mode.

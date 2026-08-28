@@ -128,6 +128,32 @@ const
   AssetUrl = "http://127.0.0.1"
 
 var gRequests = 0
+
+# Is a raid being played right now?
+#
+# Set at `/client/match/local/start` and cleared at `/client/match/local/end`.
+# It exists for ONE consumer: the item spawner, which must refuse while a raid
+# is running.
+#
+# WHY. The client plays the raid on its own machine holding its own copy of the
+# profile, and `onMatchEnd` REPLACES the stored profile with the one the client
+# posts back (see the header of `emu/raid.nim`, which says so in as many
+# words). A spawn during a raid therefore writes into a profile document that
+# is about to be overwritten by a client that never saw it: the item appears in
+# no stash, in no raid, and the wire carries a 200 the whole way. That is the
+# silent-success failure this project keeps paying for, so the spawner declines
+# by name instead -- see `raidSpawnRefusal`.
+var gRaidActive = false
+
+proc raidSpawnRefusal(): string =
+  ## The single sentence every spawn surface uses to decline mid-raid, so the
+  ## F6 overlay and the settings page cannot drift into explaining it
+  ## differently -- or, worse, into one of them not explaining it at all.
+  result = "a raid is in progress. Items cannot be spawned now: the client " &
+           "is holding its own copy of your profile and posts it back when " &
+           "the raid ends, which would overwrite anything spawned in the " &
+           "meantime. Extract or die first, then spawn into the stash."
+
 var gEdition = "standard"
 var gDefaultSide = "Usec"
 var gNowSeconds = 0
@@ -2079,6 +2105,10 @@ proc onMatchStart(url, body, session: string): string =
   ## are very unlikely to differ per mode, but that is reasoning rather than
   ## evidence and it is written down here rather than assumed away.
   inc gRequests
+  # The raid has begun; the spawner declines until it ends. Set here rather
+  # than inferred from anything else, because this route is the client saying
+  # so.
+  gRaidActive = true
   # The seven fields the client sends were read by nothing at all before, which
   # is how the map came to be unknown at the end of the raid. Real body:
   # `{serverId, location, timeVariant, mode, playerSide, transitionType,
@@ -2175,6 +2205,12 @@ proc onMatchEnd(url, body, session: string): string =
   ## lost -- and it is also the one place a mistake costs a player their stash,
   ## so the body is checked before it replaces anything.
   inc gRequests
+  # The raid is over, so the spawner is usable again. Cleared FIRST, before any
+  # early return below: every exit from this handler means the client is no
+  # longer holding the profile, including the ones that reject the body. A
+  # clear placed at the bottom would leave the spawner refusing forever after
+  # one malformed raid result.
+  gRaidActive = false
   var p = currentProfile(session)
   if not p.ok:
     return failure(1, "no profile on this session")
@@ -3489,6 +3525,9 @@ proc spawnProfileId(session: string): string =
 
 proc runSpawn(session: string): string =
   ## Perform the spawn the four `spawn*` rows describe and return the outcome.
+  if gRaidActive:
+    warn "spawn refused: " & raidSpawnRefusal()
+    return raidSpawnRefusal()
   let pid = spawnProfileId(session)
   if pid.len == 0:
     let all = allProfileIds()
@@ -3590,6 +3629,46 @@ proc onItemsCapability(request: string): CapReply =
   if query.len == 0:
     return capFail("aowl.items needs a \"query\": part of an item name, or a " &
                    "24-hex template id")
+  # `op: "search"` -- LOOK, do not spawn.
+  #
+  # This is what makes the F6 spawner usable rather than a guessing game. The
+  # overlay has one line to show the player, so what comes back is a rendered
+  # sentence, not a list to format twice: `searchSummary` already composes it
+  # for the settings page, and having a second formatter would be a second
+  # thing to keep true.
+  #
+  # It is also the honest answer to "I typed and nothing showed up": before
+  # this, the only way to learn whether a query matched anything was to spawn
+  # it, and a query that matched nothing looked exactly like a query that had
+  # not been typed at all.
+  #
+  # A search does NOT touch the profile, so it is deliberately allowed during a
+  # raid -- the raid guard above returns before this only because spawning is
+  # what the raid invalidates. Reading is safe; being able to look up an item's
+  # id mid-raid and spawn it on extract is useful.
+  if field(request, "op").asText("") == "search":
+    var matched = 0
+    let hits = searchItemsCounted(query, 10, matched)
+    var o = obj()
+    put(o, "spawned", 0)
+    put(o, "query", query)
+    put(o, "matched", matched)
+    # `matched == 0` is an ANSWER, not a failure: the query is well-formed and
+    # the database genuinely has no such item. Saying so plainly is the whole
+    # point, so it is `capOk` with a message, not `capFail`.
+    put(o, "message", searchSummary(query, 10))
+    return capOk(done(o).text)
+
+  # Mid-raid, refuse before doing any work -- but only a SPAWN, which is why
+  # this sits below the search above rather than at the top of the handler.
+  # The F6 overlay is reachable IN a raid, that being most of the point of it,
+  # so this is the surface most likely to hit this path and the one where a
+  # silent no-op would be least visible: the player is looking at the game,
+  # not at a stash.
+  if gRaidActive:
+    warn "aowl.items refused: " & raidSpawnRefusal()
+    return capFail(raidSpawnRefusal())
+
   var count = field(request, "count").asInt(1)
   if count < 1: count = 1
   var condition = field(request, "condition").asInt(100)

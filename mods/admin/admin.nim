@@ -627,6 +627,84 @@ proc spawnRequestJson(query: string; count, condition: int): string =
   result = "{\"query\":\"" & q & "\",\"count\":" & $count &
            ",\"condition\":" & $condition & "}"
 
+var gSearchLast = ""
+var gSearchFaults = 0
+
+proc searchRequestJson(query: string): string =
+  ## The same escaping `spawnRequestJson` does, with `op:"search"` on the
+  ## front. Composed here rather than by adding a parameter to that proc so
+  ## the two request shapes stay readable side by side.
+  var q = ""
+  for i in 0 ..< query.len:
+    let c = query[i]
+    if c == '"' or c == '\\':
+      q.add '\\'
+      q.add c
+    elif c >= ' ' and c <= '~':
+      q.add c
+  result = "{\"op\":\"search\",\"query\":\"" & q & "\"}"
+
+proc serviceSearch() =
+  ## TYPEAHEAD. What the player has typed so far, answered as they type.
+  ##
+  ## THE REPORTED DEFECT THIS EXISTS FOR: "the item spawner menu, that still
+  ## never worked -- when i typed anything it wouldnt show up anywhere". Even
+  ## with the keystrokes arriving, the F6 spawner had nothing to show for them:
+  ## the only way to find out whether a query matched was to submit it, and a
+  ## query matching nothing was indistinguishable from a query that had never
+  ## been typed. The line under the query row now always says what the current
+  ## text matches -- including, explicitly, that it matches nothing.
+  ##
+  ## Bounded by CHANGE, not by time: the search runs only when the query is
+  ## different from the last one answered, so holding the menu open with a
+  ## settled query costs one string compare per tick and no cross-mod call.
+  if gRegion == nil or gSpawnOff: return
+  # Never speak over a real spawn. `spawnBusy` is set from submit until the
+  # drain acks, and that answer belongs to the player, not to the typeahead.
+  if spawnInflight(gRegion): return
+  let query = spawnQuery(gRegion)
+  if query == gSearchLast: return
+  gSearchLast = query
+  if query.len == 0:
+    spawnNote(gRegion, "type part of an item name, or a 24-hex template id")
+    return
+  # A one- or two-character query is not worth searching for, and saying so is
+  # not a refusal to work -- it is the honest state of a query that has not
+  # been typed yet.
+  #
+  # MEASURED, and the reason this threshold exists rather than being a taste
+  # call: `searchItemsCounted` counts how many items REALLY matched, so it
+  # visits the whole 2.7 MB locale and calls `itemExists` on every name that
+  # matches. For a one-letter query that is most of the ~40,000 entries, on
+  # every keystroke. Three characters is where the match set stops being
+  # "nearly everything".
+  if query.len < 3:
+    spawnNote(gRegion, "keep typing -- " & $query.len &
+              " character(s); 3 are needed before searching")
+    return
+
+  let r = invoke("aowl.items", 1, searchRequestJson(query))
+  if not r.isOk:
+    # A refused search is REPORTED, not swallowed. If the provider is not
+    # loaded this is the line that says so, and it is the difference between
+    # "this database has no such item" and "nothing is answering".
+    gSearchFaults = gSearchFaults + 1
+    spawnNote(gRegion, "search unavailable: " & r.message)
+    if gSearchFaults >= 20:
+      gSpawnOff = true
+      warn "admin: twenty consecutive F6 search refusals -- the spawner has " &
+           "DISABLED itself for this session rather than call a provider that " &
+           "is not answering on every keystroke. Nothing else is affected."
+    return
+  gSearchFaults = 0
+  var msg = field(r.body, "message").asText("")
+  if msg.len == 0:
+    # The provider is contracted to render the sentence. An empty one is a
+    # provider bug, and saying "no matches" on its behalf would invent an
+    # answer -- so this says which of the two it actually is.
+    msg = "the search answered but described nothing; treat as UNVERIFIED"
+  spawnNote(gRegion, msg)
+
 proc serviceSpawn() =
   ## Drain at most ONE request per tick. Bounded by construction: `spawnPending`
   ## returns a single sequence number, and every exit path calls `spawnDone`,
@@ -677,6 +755,9 @@ proc onUpdate(elapsedMs: int64): Status =
     # mod set. It reads no game memory and patches nothing -- there is no game
     # in this process.
     serviceSpawn()
+    # The typeahead runs AFTER the spawn drain, so a submit made on this tick
+    # is serviced before any search can occupy the one result line they share.
+    serviceSearch()
     return Ok
   gTick = gTick + 1
   discard dataOpen()
