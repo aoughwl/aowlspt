@@ -305,6 +305,15 @@ typedef struct AowlNuTarget {
 #define AOWL_NU_TMP_SET_FONTSIZE     22
 #define AOWL_NU_LOC_SET_LABEL_TEXT   23
 #define AOWL_NU_SET_PARENT_ALIGN     24
+/* il2cpp_codegen_initialize_runtime_metadata(uintptr_t* slot). NOT an
+ * il2cpp_* export, so ungated: it is the codegen helper the game itself calls
+ * at the top of every method that uses a metadata-usage slot. Resolves the
+ * slot's encoded token to a real pointer IN PLACE and returns it in RAX.
+ * Measured from TMP_DefaultControls::CreateText@0x5191200: at +0xF
+ * `lea rcx,[slot]` then at +0x16 `call 0x5251C0`. Body confirmed a real
+ * function (atomic `lock xadd`, kind decode `shr eax,0x1d`, jump-table
+ * dispatch) -- not the 0x628110 empty stub. */
+#define AOWL_NU_META_INIT            25
 
 /* Every prologue below was read out of THIS build's GameAssembly.dll with
  * `tools/il2cpp_resolve.py bytes <RVA> 16`, and every RVA with
@@ -401,6 +410,11 @@ static const AowlNuTarget aowl_nu_targets[] = {
     { "TMPro.TMP_DefaultControls::SetParentAndAlign", 0x51903A0u,
       { 0x48,0x89,0x5C,0x24,0x10,0x57,0x48,0x83,0xEC,0x20,0x80,0x3D,0x68,
         0x13,0xF4,0x01 }, 16 },
+    /* The codegen metadata-usage resolver -- warms a COLD AddComponent<T>
+     * slot without running the owning method's body. See AOWL_NU_META_INIT. */
+    { "il2cpp_codegen_initialize_runtime_metadata", 0x5251C0u,
+      { 0x88,0x54,0x24,0x10,0x41,0x56,0x48,0x83,0xEC,0x30,0x45,0x33,0xC9,
+        0x4C,0x8B,0xF1 }, 16 },
 };
 
 #define AOWL_NU_TARGET_COUNT \
@@ -769,6 +783,87 @@ static void* aowl_nu_data_ptr(uint32_t rva) {
 static void* aowl_nu_kind_mi(int32_t k) {
     if (k < 0 || k >= AOWL_NU_MAX_KINDS) return NULL;
     return aowl_nu_data_ptr(aowl_nu_kinds[k].slotRva);
+}
+
+/* ------------------------------------------------------------------ *
+ * 4b. WARM A COLD METADATA-USAGE SLOT  (Route 1: force the resolver)
+ *
+ * A `.data` AddComponent<T> slot is filled LAZILY: until the owning method
+ * (TMP_DefaultControls::CreateText for TextMeshProUGUI) has run this session,
+ * the slot holds not a MethodInfo* but an ENCODED metadata-usage TOKEN. Passing
+ * that token as `const MethodInfo*` faults the shared generic body at +0x38.
+ *
+ * The runtime resolves such a slot with a single codegen helper,
+ * `il2cpp_codegen_initialize_runtime_metadata(uintptr_t* slot)` @0x5251C0, that
+ * the game calls at CreateText's own prologue. It reads the slot, and -- if the
+ * low bit is set (the "unresolved token" marker; a real, aligned MethodInfo*
+ * has bit0 == 0) -- decodes `kind = token>>29`, `index = (token>>1)&0x0FFFFFFF`,
+ * resolves it, writes the pointer back IN PLACE, and returns it. Calling it with
+ * `&slot` warms exactly one slot as a pure side effect, with no UI, no method
+ * body, and -- since it is not an il2cpp_* export -- no token gate.
+ *
+ * The runtime's OWN discriminator is bit0. We additionally require the value to
+ * fit in 32 bits (an encoded token does; a heap MethodInfo* does not) before
+ * feeding it to the resolver, and -- because a token is genuinely all we have to
+ * go on -- we re-read and re-validate the slot AFTER the call. The §9b guard in
+ * aowl_nu_slot_judge / nuAdd is UNCHANGED and still refuses a non-pointer. */
+
+/* The measured token layout, exported for the falsifiable unit test. */
+static int32_t  aowl_nu_token_kind(uint32_t tok)  { return (int32_t)(tok >> 29); }
+static uint32_t aowl_nu_token_index(uint32_t tok) { return (tok >> 1) & 0x0FFFFFFFu; }
+
+/* Does `v` have the shape of an UNRESOLVED usage token (as opposed to a real
+ * MethodInfo*)? bit0 set is the runtime's own test; the 32-bit fit rejects a
+ * heap pointer that merely happens to be odd, and a random gated value (which
+ * is a full 64-bit number). */
+static int32_t aowl_nu_is_cold_token(uintptr_t v) {
+    if (v == 0) return 0;                 /* NULL is LAZY-NOT-YET, not a token */
+    if ((v & 1u) == 0) return 0;          /* aligned -> already a pointer      */
+    if ((v >> 32) != 0) return 0;         /* real MethodInfo* is a heap ptr    */
+    return 1;
+}
+
+typedef void* (*AowlNuMetaInit)(void* /* uintptr_t* slot */);
+
+/* Warm kind `k`'s AddComponent<T> slot if it is cold, and return the resulting
+ * mi (or NULL). MUST be called from inside the proof's single SEH region: it
+ * calls into game code, which can fault, and there is exactly one guard.
+ *
+ * Returns:
+ *   the resolved MethodInfo*      -- slot was warm, or we warmed it
+ *   NULL                          -- unresolvable (still cold / null / refused)
+ * The caller re-reads + VirtualQuery-guards the slot before using it; this
+ * function never itself decides a value is safe to call. */
+static void* aowl_nu_warm_slot(int32_t k, void* metaInitFn) {
+    HMODULE ga;
+    uint32_t rva;
+    void* slotAddr;
+    uintptr_t v;
+    MEMORY_BASIC_INFORMATION mbi;
+    if (k < 0 || k >= AOWL_NU_MAX_KINDS) return NULL;
+    if (!metaInitFn) return NULL;
+    rva = aowl_nu_kinds[k].slotRva;
+    if (rva < 0x6B61000u || rva >= 0x737BD74u) return NULL;   /* .data range   */
+    ga = GetModuleHandleA("GameAssembly.dll");
+    if (!ga) return NULL;
+    slotAddr = (unsigned char*)ga + rva;
+    /* The slot must be committed AND writable -- the resolver stores back. */
+    if (VirtualQuery(slotAddr, &mbi, sizeof(mbi)) == 0) return NULL;
+    if (mbi.State != MEM_COMMIT) return NULL;
+    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return NULL;
+    if (!(mbi.Protect & (PAGE_READWRITE | PAGE_WRITECOPY |
+                         PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+        return NULL;
+    v = *(uintptr_t*)slotAddr;
+    if ((v & 1u) == 0) return (void*)v;   /* already resolved (or NULL->NULL) */
+    if (!aowl_nu_is_cold_token(v)) return NULL;   /* odd garbage, not a token */
+    /* Cold token -> resolve in place. Returns the pointer in RAX and also
+     * stores it into the slot. */
+    ((AowlNuMetaInit)metaInitFn)(slotAddr);
+    /* Trust the SLOT, not the return: re-read what the resolver wrote. */
+    v = *(uintptr_t*)slotAddr;
+    if ((v & 1u) != 0) return NULL;       /* still not a pointer -> refuse    */
+    return (void*)v;
 }
 
 /* An object's Il2CppClass*: the first qword of the object header.

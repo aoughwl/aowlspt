@@ -109,6 +109,11 @@ proc cNuKindSlotRva(k: int32): uint32 {.
   importc: "aowl_nu_kind_slot_rva", nodecl.}
 proc cNuKindCount(): int32 {.importc: "aowl_nu_kind_count", nodecl.}
 proc cNuKindMi(k: int32): Il2CppPtr {.importc: "aowl_nu_kind_mi", nodecl.}
+proc cNuWarmSlot(k: int32; metaInitFn: Il2CppPtr): Il2CppPtr {.
+  importc: "aowl_nu_warm_slot", nodecl.}
+proc cNuTokenKind(tok: uint32): int32 {.importc: "aowl_nu_token_kind", nodecl.}
+proc cNuTokenIndex(tok: uint32): uint32 {.
+  importc: "aowl_nu_token_index", nodecl.}
 proc cNuSlotState(k: int32): int32 {.importc: "aowl_nu_slot_state", nodecl.}
 proc cNuSlotJudge(k: int32; got: Il2CppPtr): int32 {.
   importc: "aowl_nu_slot_judge", nodecl.}
@@ -169,6 +174,7 @@ const
   NuTTmpSetFontSize  = 22'i32  ## TMPro.TMP_Text::set_fontSize
   NuTLocSetLabelText = 23'i32  ## LocalizedText::SetLabelText
   NuTSetParentAlign  = 24'i32  ## TMPro.TMP_DefaultControls::SetParentAndAlign
+  NuTMetaInit        = 25'i32  ## il2cpp_codegen_initialize_runtime_metadata
 
 # ---- field offsets for wiring a from-scratch TMP's dependencies ---------
 #
@@ -427,7 +433,7 @@ proc nuAdd(go: Il2CppPtr; kind: int32): Il2CppPtr =
     return nil
   let fn = nuFn(NuTAddComponentGen)
   if fn == nil or not nuOk(go, 0x10'i32): return nil
-  let mi = cNuKindMi(kind)
+  var mi = cNuKindMi(kind)
   if mi == nil:
     warn "nativeui: add(" & kname & "): the game's MethodInfo* cache slot at " &
          ".data 0x" & hexOf(uint64(cNuKindSlotRva(kind))) & " is still NULL. " &
@@ -435,6 +441,40 @@ proc nuAdd(go: Il2CppPtr; kind: int32): Il2CppPtr =
          "time the owning method runs. Refusing rather than passing a NULL " &
          "MethodInfo, which the shared generic body dereferences at +0x38."
     return nil
+  # ROUTE 1 -- WARM A COLD SLOT. If the slot holds not a readable MethodInfo but
+  # an unresolved metadata-usage TOKEN (bit0 set, fits in 32 bits), ask the
+  # runtime's OWN codegen resolver to fill it, exactly as the game does at the
+  # top of TMP_DefaultControls::CreateText -- no method body, no UI, no gated
+  # export. Then re-read the slot. The §9b refusal below is UNCHANGED and is
+  # still the last word: if warming did not produce a readable pointer, we do
+  # not call AddComponent<T>.
+  if not nuOk(mi, 0x48'i32):
+    let tok = cast[uint32](cast[uint64](mi) and 0xFFFFFFFF'u64)
+    let metaInit = nuFn(NuTMetaInit)
+    if metaInit == nil:
+      warn "nativeui: add(" & kname & "): slot 0x" &
+           hexOf(uint64(cNuKindSlotRva(kind))) & " is COLD (mi=0x" &
+           hexOf(cast[uint64](mi)) & ") and the metadata resolver " &
+           "il2cpp_codegen_initialize_runtime_metadata could not be verified " &
+           "(prologue mismatch or module not loaded); cannot warm it."
+    else:
+      okLog "nativeui: add(" & kname & "): slot 0x" &
+            hexOf(uint64(cNuKindSlotRva(kind))) & " is COLD -- mi=0x" &
+            hexOf(cast[uint64](mi)) & " is an unresolved usage token (kind=" &
+            $int(cNuTokenKind(tok)) & ", index=0x" &
+            hexOf(uint64(cNuTokenIndex(tok))) & "). Warming via " &
+            "il2cpp_codegen_initialize_runtime_metadata @0x5251C0 on the slot " &
+            "address (resolves in place, returns the MethodInfo*)."
+      let warmed = cNuWarmSlot(kind, metaInit)
+      mi = cNuKindMi(kind)   # re-read what the resolver wrote into the slot
+      if warmed != nil and nuOk(mi, 0x48'i32):
+        okLog "nativeui: add(" & kname & "): WARMED -- slot 0x" &
+              hexOf(uint64(cNuKindSlotRva(kind))) & " now holds mi=0x" &
+              hexOf(cast[uint64](mi)) & ", a readable MethodInfo. Proceeding."
+      else:
+        warn "nativeui: add(" & kname & "): warm attempt did NOT yield a " &
+             "readable MethodInfo (slot now 0x" & hexOf(cast[uint64](mi)) &
+             "). Refusing below, unchanged."
   # THE §9b CHECK THAT DID NOT FIRE. A non-NULL slot value is not yet a usable
   # MethodInfo*. Before its owning method has run this session, IL2CPP leaves an
   # UNRESOLVED metadata-usage TOKEN in the slot -- a small, tagged, NON-POINTER

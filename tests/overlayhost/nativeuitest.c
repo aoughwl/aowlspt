@@ -251,7 +251,8 @@ static void test_intern(void) {
 static void test_targets(void) {
     int i, j;
     printf("target table\n");
-    ck(aowl_nu_target_count() == 25, "the table has the 25 documented targets");
+    ck(aowl_nu_target_count() == 26, "the table has the 26 documented targets "
+       "(25 managed + the codegen metadata resolver that warms cold slots)");
     for (i = 0; i < aowl_nu_target_count(); i++) {
         ck(aowl_nu_rva(i) != 0, "no target has a zero RVA");
         ck(strlen(aowl_nu_name(i)) > 0, "every target is named");
@@ -450,6 +451,44 @@ static void test_wire_refs(void) {
        "blanket reject-everything)");
 }
 
+/* ------------------------------------------------------------------ *
+ * The metadata-usage TOKEN DECODE -- Route 1's pure arithmetic.
+ *
+ * The runtime resolver il2cpp_codegen_initialize_runtime_metadata@0x5251C0
+ * decodes an unresolved slot value as: kind = token>>29, index =
+ * (token>>1)&0x0FFFFFFF, and treats bit0 as the "unresolved" marker (a real,
+ * aligned MethodInfo* has bit0 == 0). This mirrors that arithmetic and pins it
+ * to the value measured LIVE in TMP's slot 0x6D50040. Each case names the input
+ * that would break it; the falsifying cases assert a NEGATIVE.
+ * ------------------------------------------------------------------ */
+static void test_token_decode(void) {
+    printf("metadata-usage token decode (Route 1)\n");
+
+    /* The live measurement: 0xc00804f3 -> MethodRef (kind 6), index 0x40279. */
+    ck(aowl_nu_token_kind(0xc00804f3u) == 6,
+       "0xc00804f3 decodes to usage kind 6 (MethodRef), as the resolver's "
+       "`shr eax,0x1d` computes");
+    ck(aowl_nu_token_index(0xc00804f3u) == 0x40279u,
+       "0xc00804f3 decodes to usage index 0x40279, via (token>>1)&0x0FFFFFFF");
+
+    /* The discriminator the resolver itself uses: bit0. A cold token has it
+     * set; a real MethodInfo* (aligned) does not. */
+    ck(aowl_nu_is_cold_token(0xc00804f3u) == 1,
+       "the live token 0xc00804f3 is recognised as a COLD token");
+    ck(aowl_nu_is_cold_token(0) == 0,
+       "a NULL slot is LAZY-NOT-YET, never a cold token (there is nothing to "
+       "decode)");
+    ck(aowl_nu_is_cold_token(0x17b0718a4d0ull) == 0,
+       "the live WARM RectTransform slot value 0x17b0718a4d0 (bit0 clear, a "
+       "real heap pointer) is NOT a token -- so warming would never touch it");
+    ck(aowl_nu_is_cold_token(0x17b0718a4d1ull) == 0,
+       "a high heap pointer that merely happens to be ODD is still NOT a token "
+       "(the 32-bit-fit test rejects it), so we never feed a real pointer to "
+       "the resolver");
+    ck(aowl_nu_is_cold_token(0xffffffffffffffffull) == 0,
+       "a full 64-bit gated-export random value is NOT mistaken for a token");
+}
+
 int main(void) {
     printf("nativeuitest -- offline checks for the native UI layer\n\n");
     test_renderable();
@@ -460,6 +499,7 @@ int main(void) {
     test_targets();
     test_why();
     test_wire_refs();
+    test_token_decode();
     falsify();
     test_faults();        /* LAST: it permanently disables the layer */
 
