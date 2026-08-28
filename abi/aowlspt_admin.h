@@ -638,6 +638,30 @@ static void aowl_admin_wf(void* o, int32_t off, float v) {
     if (aowl_admin_readable(a, 4)) memcpy(a, &v, 4);
 }
 
+/* A managed `bool` is ONE byte in il2cpp, not four. Reading one with
+ * `aowl_admin_ri` pulls in the three bytes that follow -- which for
+ * `PhysicalBase._encumbered` @0x11c are `_overEncumbered`, `UnsubscribeAction`'s
+ * padding and whatever the compiler laid out next -- so a byte field read four
+ * bytes wide is a plausible non-zero number that is not the field. These two
+ * exist so a bool is read and written at its real width, and they carry the
+ * same VirtualQuery guard as every other accessor here. `-1` is the unreadable
+ * sentinel: it is not a legal C# bool, so a caller can tell "false" from
+ * "could not look" -- the two-outcome flattening CLAUDE.md 9b is about. */
+static int32_t aowl_admin_rb(const void* o, int32_t off) {
+    unsigned char v = 0;
+    const char* a = (const char*)o + off;
+    if (!aowl_admin_readable(a, 1)) return -1;
+    memcpy(&v, a, 1);
+    return (int32_t)v;
+}
+static int32_t aowl_admin_wb(void* o, int32_t off, int32_t v) {
+    unsigned char b = (unsigned char)(v ? 1 : 0);
+    char* a = (char*)o + off;
+    if (!aowl_admin_readable(a, 1)) return 0;
+    memcpy(a, &b, 1);
+    return 1;
+}
+
 /* ------------------------------------------------------------------ *
  * God mode: a revertible static byte-patch on the damage function's native
  * code, resolved by RVA (the BE-bypass technique). No managed call, no Unity
