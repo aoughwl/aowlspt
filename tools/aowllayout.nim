@@ -87,6 +87,30 @@ proc markColour*(kind: int): int =
   of MarkFailed: ColRed
   else: ColDim
 
+const
+  StepNameCol* = 5
+    ## Two spaces, a two-cell marker, one space. Where every step's NAME starts.
+
+proc stepNameW*(width: int): int =
+  if width > 24: 17 else: 12
+
+proc stepDetailCol*(width: int): int =
+  ## DERIVED from the name column, not chosen. This used to be a separate
+  ## constant -- 20 wide / 15 narrow -- while `fit` was allowed to write 17 / 12
+  ## characters of name starting at column 5. 5 + 17 = 22 > 20, so ANY name of
+  ## 15 characters or more ran straight into its own detail with no space
+  ## between them, and `padTo` cannot shorten so it silently did nothing.
+  ##
+  ## That is what `character selectwaiting for it (1m 08s)` was. It was not a
+  ## new bug in the row that displayed it: the SAME defect had `IL2CPP runtime`
+  ## colliding at every width of 24 or less, and had been shipping unnoticed.
+  ## The name column merely happened to be short enough at wide widths.
+  ##
+  ## `fit` truncates to `stepNameW`, so the detail now begins at the same column
+  ## on every row for any name whatsoever, and `tests/tuilayout.nim` asserts it
+  ## with a name deliberately longer than the column.
+  StepNameCol + stepNameW(width) + 1
+
 proc stepRow*(kind: int; name, detail: string; width: int): Row =
   ## One progress line. Bounded by `width` by construction: the name column is
   ## fixed and the detail is `fit` into whatever is left, so this can never be
@@ -96,8 +120,8 @@ proc stepRow*(kind: int; name, detail: string; width: int): Row =
   result.putIn markColour(kind), markGlyph(kind)
   result.put " "
   result.putIn (if kind == MarkPending: ColDim else: ColDefault),
-               fit(name, (if width > 24: 17 else: 12))
-  result.padTo (if width > 24: 20 else: 15)
+               fit(name, stepNameW(width))
+  result.padTo stepDetailCol(width)
   let room = width - result.width - 2
   if room > 4 and detail.len > 0:
     result.putIn (if kind == MarkFailed: ColRed else: ColDim), fit(detail, room)
@@ -606,18 +630,52 @@ type
       ## Some screen under `Menu UI` is active and it is not the selector.
     clientAlive*: bool
     elapsedMs*: int64
+    polls*: int
+      ## How many times the channel has been asked.
+    answered*: int
+      ## How many of those came back at all. `polls - answered` is the number
+      ## that got no answer -- a number the screen must show, because a wait
+      ## whose input is silent looks exactly like a wait whose answer is "not
+      ## yet", and only one of those is worth continuing.
+    interactive*: bool
+      ## Whether a human is watching this launcher on a real console.
 
 const
   EnterWaitLimitMs* = 270000'i64
-    ## The client legitimately takes 90s+ to reach the selector on a cold
-    ## IL2CPP boot, so the ceiling stays where it was. What changes is that it
-    ## is now the LAST resort rather than the only one.
+    ## HEADLESS bound. A cold IL2CPP boot legitimately takes 90s+ to reach the
+    ## selector, and when nobody is looking at a screen (`tools/harness.py`,
+    ## any redirected run) auto-enter is the ONLY way into the game, so waiting
+    ## is strictly better than giving up.
+
+  EnterWaitLimitInteractiveMs* = 20000'i64
+    ## HUMAN-PRESENT bound, and the difference is deliberate.
+    ##
+    ## A player sitting in front of character select can press it in one
+    ## second. Everything the launcher can offer them at that moment is in the
+    ## log view, so holding them on a progress screen to do a job they can do
+    ## instantly -- through a slow, contended file channel -- is a bad trade at
+    ## any duration. Measured against that: 60s+ of an apparently frozen screen
+    ## is what the player reported as "weird".
+    ##
+    ## Giving up early costs almost nothing, which is why this is safe: nothing
+    ## is cancelled by handing off, the character-select screen is still there,
+    ## and the player clicks it. Giving up LATE costs the whole minute.
+
+proc enterWaitLimitMs*(interactive: bool): int64 =
+  if interactive: EnterWaitLimitInteractiveMs else: EnterWaitLimitMs
+
+const
+  EwNoChannelPolls* = 3
+    ## Consecutive unanswered polls after which the channel is declared dead.
+    ## Three, not one: a single dropped batch is routine (`runBatch` retries
+    ## precisely because the host drops batches it has already read).
 
   EwWaiting* = 0
   EwSelectorUp* = 1     ## press it
   EwPassed* = 2         ## already past it -- nothing to press
   EwClientGone* = 3
   EwTimedOut* = 4
+  EwNoChannel* = 5      ## the inspector never answered; nothing was observed
 
 proc enterWaitDone*(v: int): bool =
   ## Terminal or not. Every non-`EwWaiting` verdict hands off.
@@ -649,11 +707,53 @@ proc enterWaitVerdict*(w: EnterWait; reason: var string): int =
     reason = "character select has closed and another screen is up, so it " &
              "was got past without us"
     return EwPassed
-  if w.elapsedMs >= EnterWaitLimitMs:
+  # NOTHING HAS BEEN OBSERVED AT ALL. Distinct from "not yet", and it has to
+  # be: a wait whose every poll goes unanswered is not making progress towards
+  # anything, and continuing to sit on it is the blind spot one level down from
+  # the one this whole loop was rewritten to fix. Say it and hand off.
+  if w.polls >= EwNoChannelPolls and w.answered == 0:
+    reason = "the live inspector has not answered " & $w.polls & " polls -- " &
+             "nothing about the client's screens could be observed. Check " &
+             "liveInspector in aowlspt-host.json, or that another tool is " &
+             "not writing aowlspt-inspect.txt at the same time"
+    return EwNoChannel
+  if w.elapsedMs >= enterWaitLimitMs(w.interactive):
     reason = "character select did not appear within " &
-             $(EnterWaitLimitMs div 1000'i64) & "s"
+             $(enterWaitLimitMs(w.interactive) div 1000'i64) & "s" &
+             (if w.interactive:
+                " -- handing over to the logs; press it yourself if it is up"
+              else: "")
     return EwTimedOut
   result = EwWaiting
+
+proc enterWaitDetail*(w: EnterWait; verdict: int): string =
+  ## What the step row SAYS, and it names what was observed rather than only
+  ## how long it has been.
+  ##
+  ## The row this replaces showed a clock and nothing else, so the two states
+  ## that matter -- "the menu is up and we are watching for the selector" and
+  ## "every single poll has gone unanswered and we are learning nothing" --
+  ## rendered identically. A wait that shows only elapsed time cannot be
+  ## distinguished from a hang by the person looking at it.
+  case verdict
+  of EwSelectorUp: return "up -- pressing it"
+  of EwPassed: return "already past it"
+  of EwClientGone: return "the client exited"
+  of EwNoChannel: return "no answer from the live inspector (" & $w.polls &
+                         " polls) -- going to the logs"
+  of EwTimedOut: return "not seen in " & secsText(w.elapsedMs) &
+                        " -- going to the logs"
+  else: discard
+  let unanswered = w.polls - w.answered
+  result = "menu root: " &
+           (if w.menuRootPresent: "yes"
+            elif w.sawMenuRoot: "gone"
+            else: "not seen") &
+           ", selector: " & (if w.sawSelector: "seen" else: "not seen") &
+           ", " & $w.polls & " poll(s)"
+  if unanswered > 0:
+    result.add ", " & $unanswered & " unanswered"
+  result.add " (" & secsText(w.elapsedMs) & ")"
 
 const
   ScreenLauncher* = 1
