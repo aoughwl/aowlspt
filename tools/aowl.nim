@@ -568,6 +568,28 @@ proc buildIl2CppHost(e: Env): bool =
     return false
   result = placeLibrary(dir, "aowlhost", outPath)
 
+proc buildMapTiles(e: Env): bool =
+  ## `mods/maps`' SVG map art -> BC1 tiles + a binary manifest, via
+  ## `tools/maptiles.py`. The output is COMMITTED (it is 18 MiB of art that
+  ## changes only when the calibration does), so this is not part of a normal
+  ## edit loop and is deliberately NOT run by bare `aowl build` -- a full
+  ## rasterise is ~4 minutes and nothing about a host change invalidates it.
+  ##
+  ## It runs `verify` first. That is the whole point of having a target: a
+  ## human who changed a calibration JSON gets told the shipped tiles no longer
+  ## match it, instead of finding out from a misplaced building in a raid.
+  let py = joinPath(e.repo, "tools\\maptiles.py")
+  if not fileExists(py):
+    err "no tools\\maptiles.py under " & e.repo
+    inc failures
+    return false
+  if not run(e, "maptiles selftest", "python " & quoted(py) & " selftest",
+             e.repo):
+    return false
+  if not run(e, "maptiles build", "python " & quoted(py) & " build", e.repo):
+    return false
+  result = run(e, "maptiles verify", "python " & quoted(py) & " verify", e.repo)
+
 proc buildOverlayTests(e: Env): bool =
   ## The overlay's four test binaries. This used to be
   ## `host/Aowlspt.Overlay/build.ps1`; it is here now because the repo has one
@@ -1351,6 +1373,8 @@ proc cmdBuildOne(e: Env; target: string): int =
     # is that they need no client and no deploy -- were the most expensive to
     # run, and the temptation was to skip them. They take seconds this way.
     result = if buildOverlayTests(e): 0 else: 1
+  of "maptiles", "tiles":
+    result = if buildMapTiles(e): 0 else: 1
   of "mods":
     for m in modDirs(e):
       discard buildMod(e, m)
@@ -1366,7 +1390,7 @@ proc cmdBuildOne(e: Env; target: string): int =
   else:
     err "unknown build target: " & target
     note "targets: host backend sim launch installer emutest verify probe " &
-         "mods examples deploy"
+         "maptiles mods examples deploy"
     note "or a mod path, with `aowl build-mod mods\\tarkov`"
     result = 1
 
