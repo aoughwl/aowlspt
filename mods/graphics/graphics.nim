@@ -386,6 +386,21 @@ proc onApplyEvent(payload: string): string =
   let ok = pushGrade()
   result = "{\"ok\":" & (if ok: "true" else: "false") & "}"
 
+proc presetOwns(key: string): bool =
+  ## Is `key` a look slider that the ACTIVE preset overwrites?
+  ##
+  ## Derived from `loadConfig`, not guessed: that proc reads `enabled`,
+  ## `raidOnly`, `diag` and `preset`, and then -- if the preset is anything but
+  ## `custom` -- calls `applyPreset` and RETURNS. Every other key is therefore
+  ## read only in the `custom` branch, so storing one while a preset is active
+  ## is a write that can never be observed. If a key is ever moved above that
+  ## early return in `loadConfig`, add it to this list in the same edit.
+  if gPreset == "custom":
+    return false
+  case key
+  of "enabled", "raidOnly", "diag", "preset": result = false
+  else: result = true
+
 proc onSettingsHotApply(key: string) =
   ## The hot-apply half of the in-process settings bus (`aowlspt/settings`).
   ## graphics is `sides = {sideClient}`, so its `/aowlspt/settings/<guid>`
@@ -394,9 +409,40 @@ proc onSettingsHotApply(key: string) =
   ## config.json and not reach the live grade until the next load, which is a
   ## slider that moves and changes nothing. Same two calls the route handler
   ## makes, deliberately: one apply path, not two.
-  discard key
+  ##
+  ## It must also SAY what it did. Three things here can silently swallow an
+  ## edit, and all three used to look identical in the log:
+  ##
+  ##   1. `enabled` is false -- the whole post-process is off, so a look slider
+  ##      changes nothing visible. (The boot line in the session that prompted
+  ##      this read `enabled=no`.)
+  ##   2. `preset` is anything but `custom` -- `loadConfig` calls `applyPreset`
+  ##      and RETURNS, so every look slider below is overwritten by the preset
+  ##      and the value just stored is ignored. This is the "I changed
+  ##      saturation and nothing happened" report, exactly.
+  ##   3. `pushGrade` returned false -- this host carries no post-process
+  ##      module, so there is nothing to re-grade.
   loadConfig()
-  discard pushGrade()
+  let pushed = pushGrade()
+  if not pushed:
+    settingIgnored("this host carries no post-process module, so there is " &
+                   "nothing to re-grade; the game renders untouched")
+    return
+  if presetOwns(key):
+    settingIgnored("preset=\"" & gPreset & "\" OWNS this slider -- the value " &
+                   "is stored but the preset overwrites it every load. Set " &
+                   "Preset to \"custom\" to drive it yourself.")
+    return
+  if not gGrade.enabled:
+    settingIgnored("the post-process master switch (\"enabled\") is off, so " &
+                   "the grade is not drawn; the value is stored and takes " &
+                   "effect as soon as you enable it")
+    return
+  settingApplied("grade re-pushed: preset=" & gPreset & " tonemapper=" &
+                 $gGrade.tonemapper & " saturation=" & $gGrade.saturation &
+                 " contrast=" & $gGrade.contrast & " exposure=" &
+                 $gGrade.exposure & " raidOnly=" &
+                 (if gGrade.raidOnly: "yes" else: "no"))
 
 # ---------------------------------------------------------------------------
 # Lifecycle

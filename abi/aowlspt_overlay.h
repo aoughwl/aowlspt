@@ -130,6 +130,10 @@ static AowlAdminShared* g_ov_admin = NULL;
 
 #define AOWL_OV_MAX_MODS     64
 #define AOWL_OV_MAX_CMDS     32
+/* How many edits may be in flight at once. Bounded on purpose (rule 4): a
+ * player can outrun the pipeline, and the answer to the 9th simultaneous edit
+ * is a REFUSAL THAT SAYS SO, never a silent drop. */
+#define AOWL_OV_PEND_MAX     8
 #define AOWL_OV_MAX_LISTS    16
 #define AOWL_OV_MAX_ENTRIES 160   /* list entries, flattened across all lists */
 #define AOWL_OV_MAX_ISSUES   24   /* registry problems + excluded decisions   */
@@ -910,6 +914,14 @@ typedef struct AowlOvSItem {
  * sub-tab is a filter that costs two integers rather than an index table --
  * which is why `selItem`/`editItem`/`dragItem` stay item indices and every edit
  * path below is untouched by this. */
+/* ONE edit in flight. See `AowlOvState::opt`. */
+typedef struct AowlOvPend {
+    char    page[80];   /* page the edit belongs to ("" = none)     */
+    char    key[80];    /* the row's key                            */
+    char    raw[64];    /* the JSON literal the player asked for    */
+    int32_t state;      /* AOWL_OV_PEND_*                           */
+} AowlOvPend;
+
 typedef struct AowlOvSCat {
     char    label[64];   /* the LAST segment -- what the nav row prints */
     char    full[160];   /* the whole path -- what the breadcrumb prints */
@@ -1034,10 +1046,16 @@ typedef struct AowlOvState {
      *
      * Written only by the worker (POST and verify both run there) and read by
      * the render thread through the `sItems` snapshot, so no extra lock. */
-    char             optPage[80];  /* page the edit belongs to ("" = none)     */
-    char             optKey[80];   /* the row's key                            */
-    char             optRaw[64];   /* the JSON literal the player asked for    */
-    int32_t          optState;     /* AOWL_OV_PEND_*                           */
+    /* A SET, not a slot. It used to be one slot, and a second edit made while
+     * the first was still in flight OVERWROTE it: the first row kept whatever
+     * badge it happened to be wearing forever (nothing could ever settle it
+     * again, because `pend_settle` looked the row up by the ONE key the slot
+     * held), and the first edit's verdict was written onto the second row.
+     * The user's report -- "if i try to change another setting while one is
+     * saving, it does not work great" -- is that, exactly. Each in-flight edit
+     * now owns its own entry and is settled BY KEY. */
+    AowlOvPend       opt[AOWL_OV_PEND_MAX];
+    int32_t          optCountP;    /* live entries in `opt`                    */
     /* THE WRITE DID NOT TAKE.
      *
      * Set by `aowl_ov_settings_set` when the value it POSTed is NOT the value
@@ -2848,31 +2866,80 @@ static void aowl_ov_sval_display(AowlOvSItem* si) {
  * ------------------------------------------------------------------ */
 
 static void aowl_ov_pend_clear(void) {
-    g_ov.optPage[0] = 0;
-    g_ov.optKey[0]  = 0;
-    g_ov.optRaw[0]  = 0;
-    g_ov.optState   = AOWL_OV_PEND_NONE;
+    int32_t i;
+    for (i = 0; i < AOWL_OV_PEND_MAX; i++) {
+        g_ov.opt[i].page[0] = 0;
+        g_ov.opt[i].key[0]  = 0;
+        g_ov.opt[i].raw[0]  = 0;
+        g_ov.opt[i].state   = AOWL_OV_PEND_NONE;
+    }
+    g_ov.optCountP = 0;
 }
 
-/* Called on the worker the instant an edit is issued -- BEFORE the POST, so
- * that even the re-GET the POST performs cannot paint the old value back. */
-static void aowl_ov_pend_begin(const char* page, const char* key,
-                               const char* raw) {
-    if (!key || !key[0]) { aowl_ov_pend_clear(); return; }
-    aowl_ov_copy(g_ov.optPage, (int32_t)sizeof(g_ov.optPage), page ? page : "");
-    aowl_ov_copy(g_ov.optKey,  (int32_t)sizeof(g_ov.optKey),  key);
-    aowl_ov_copy(g_ov.optRaw,  (int32_t)sizeof(g_ov.optRaw),  raw ? raw : "");
-    g_ov.optState = AOWL_OV_PEND_SAVING;
+/* The entry for `key` on `page`, or -1. Capped by construction. */
+static int32_t aowl_ov_pend_find(const char* page, const char* key) {
+    int32_t i;
+    if (!key || !key[0]) return -1;
+    for (i = 0; i < g_ov.optCountP && i < AOWL_OV_PEND_MAX; i++) {
+        if (g_ov.opt[i].state == AOWL_OV_PEND_NONE) continue;
+        if (strcmp(g_ov.opt[i].key, key) != 0) continue;
+        if (page && strcmp(g_ov.opt[i].page, page) != 0) continue;
+        return i;
+    }
+    return -1;
+}
+
+/* Called the instant an edit is ISSUED -- from the UI thread at queue time and
+ * again on the worker before the POST -- so that neither the wait behind an
+ * earlier edit nor the re-GET the POST performs can paint the old value back.
+ * Re-beginning the same page+key overwrites that entry in place, which is what
+ * a player dragging one slider does and must not consume eight entries.
+ *
+ * Returns 0 and leaves a reason in `writeWhy` when the set is full: refusing
+ * loudly is the only acceptable behaviour left, since the failure this
+ * replaces was a drop nobody could see. */
+static int32_t aowl_ov_pend_begin(const char* page, const char* key,
+                                  const char* raw) {
+    int32_t i;
+    if (!key || !key[0]) return 0;
+    i = aowl_ov_pend_find(page, key);
+    if (i < 0) {
+        for (i = 0; i < AOWL_OV_PEND_MAX; i++)
+            if (i >= g_ov.optCountP || g_ov.opt[i].state == AOWL_OV_PEND_NONE)
+                break;
+        if (i >= AOWL_OV_PEND_MAX) {
+            aowl_ov_fmt(g_ov.writeWhy, (int32_t)sizeof(g_ov.writeWhy),
+                        "NOT SENT: %d edits are already in flight, which is "
+                        "this panel's limit. Nothing was lost and nothing was "
+                        "changed -- wait for one to settle and set %s again.",
+                        (int32_t)AOWL_OV_PEND_MAX, key);
+            return 0;
+        }
+        if (i >= g_ov.optCountP) g_ov.optCountP = i + 1;
+    }
+    aowl_ov_copy(g_ov.opt[i].page, (int32_t)sizeof(g_ov.opt[i].page),
+                 page ? page : "");
+    aowl_ov_copy(g_ov.opt[i].key,  (int32_t)sizeof(g_ov.opt[i].key),  key);
+    aowl_ov_copy(g_ov.opt[i].raw,  (int32_t)sizeof(g_ov.opt[i].raw),
+                 raw ? raw : "");
+    g_ov.opt[i].state = AOWL_OV_PEND_SAVING;
+    return 1;
 }
 
 /* Record the verdict the verify ladder reached. `state` is one of the three
  * AOWL_OV_PEND_* outcomes; NONE means the value was confirmed and the row goes
  * back to being an ordinary row. */
-static void aowl_ov_pend_settle(int32_t state) {
+static void aowl_ov_pend_settle(const char* skey, int32_t state) {
     int32_t i;
+    int32_t slot;
     char key[80];
-    if (g_ov.optState == AOWL_OV_PEND_NONE) return;
-    aowl_ov_copy(key, (int32_t)sizeof(key), g_ov.optKey);
+    /* SETTLE BY KEY, never "the one in flight". With more than one edit in
+     * flight the latter attributes edit A's verdict to row B, which is the
+     * concurrent-edit corruption this signature exists to make impossible. */
+    if (!skey || !skey[0]) return;
+    aowl_ov_copy(key, (int32_t)sizeof(key), skey);
+    slot = aowl_ov_pend_find(NULL, key);
+    if (slot < 0) return;
     /* The verdict must reach the screen NOW, not on whatever load happens
      * next: a row that is still badged SAVING thirty seconds after the verdict
      * is the same lie in the other direction. Never called with `cs` held --
@@ -2892,8 +2959,20 @@ static void aowl_ov_pend_settle(int32_t state) {
         }
         break;
     }
-    if (state == AOWL_OV_PEND_NONE) aowl_ov_pend_clear();
-    else g_ov.optState = state;
+    if (state == AOWL_OV_PEND_NONE) {
+        /* Only THIS entry retires. Clearing the whole set here is what used to
+         * strand a second in-flight edit with a badge nothing would ever
+         * update. */
+        g_ov.opt[slot].page[0] = 0;
+        g_ov.opt[slot].key[0]  = 0;
+        g_ov.opt[slot].raw[0]  = 0;
+        g_ov.opt[slot].state   = AOWL_OV_PEND_NONE;
+        while (g_ov.optCountP > 0 &&
+               g_ov.opt[g_ov.optCountP - 1].state == AOWL_OV_PEND_NONE)
+            g_ov.optCountP--;
+    } else {
+        g_ov.opt[slot].state = state;
+    }
     LeaveCriticalSection(&g_ov.cs);
     g_ov.dataSerial++;
 }
@@ -2910,18 +2989,21 @@ static void aowl_ov_pend_settle(int32_t state) {
  * mode this whole change exists to remove; a snap-back that ANNOUNCES itself
  * is the correct behaviour. */
 static void aowl_ov_pend_apply(void) {
-    int32_t i;
-    if (g_ov.optState == AOWL_OV_PEND_NONE || !g_ov.optKey[0]) return;
-    if (strcmp(g_ov.itemsPage, g_ov.optPage) != 0) return;
-    for (i = 0; i < g_ov.itemCount; i++) {
-        AowlOvSItem* si = &g_ov.items[i];
-        if (strcmp(si->key, g_ov.optKey) != 0) continue;
-        si->pend = g_ov.optState;
-        if (g_ov.optState == AOWL_OV_PEND_SAVING) {
-            aowl_ov_copy(si->raw, (int32_t)sizeof(si->raw), g_ov.optRaw);
-            aowl_ov_sval_text(si);          /* never touches `auth` */
+    int32_t i, p;
+    for (p = 0; p < g_ov.optCountP && p < AOWL_OV_PEND_MAX; p++) {
+        AowlOvPend* pd = &g_ov.opt[p];
+        if (pd->state == AOWL_OV_PEND_NONE || !pd->key[0]) continue;
+        if (strcmp(g_ov.itemsPage, pd->page) != 0) continue;
+        for (i = 0; i < g_ov.itemCount; i++) {
+            AowlOvSItem* si = &g_ov.items[i];
+            if (strcmp(si->key, pd->key) != 0) continue;
+            si->pend = pd->state;
+            if (pd->state == AOWL_OV_PEND_SAVING) {
+                aowl_ov_copy(si->raw, (int32_t)sizeof(si->raw), pd->raw);
+                aowl_ov_sval_text(si);      /* never touches `auth` */
+            }
+            break;
         }
-        return;
     }
 }
 
@@ -3881,7 +3963,7 @@ static void aowl_ov_settings_verify(const char* guid, const char* key,
          *    settles it on either transport and needs no window. */
         if (aowl_ov_verify_match(key, sent, &found, &last)) {
             g_ov.writeWhy[0] = 0;
-            aowl_ov_pend_settle(AOWL_OV_PEND_NONE);   /* APPLIED */
+            aowl_ov_pend_settle(key, AOWL_OV_PEND_NONE);   /* APPLIED */
             return;
         }
         /* 2. WHERE IS IT? Read the stage instead of guessing from a clock. */
@@ -3929,7 +4011,7 @@ static void aowl_ov_settings_verify(const char* guid, const char* key,
         aowl_ov_settings_load(guid, isMod, buf, cap);
         if (aowl_ov_verify_match(key, sent, &found, &last)) {
             g_ov.writeWhy[0] = 0;
-            aowl_ov_pend_settle(AOWL_OV_PEND_NONE);   /* APPLIED */
+            aowl_ov_pend_settle(key, AOWL_OV_PEND_NONE);   /* APPLIED */
             return;
         }
         if (found)
@@ -3977,8 +4059,8 @@ static void aowl_ov_settings_verify(const char* guid, const char* key,
      * the only branch above that has proof the pipeline finished. Every other
      * branch is INCONCLUSIVE and must say so rather than borrowing REJECTED`s
      * certainty -- "I could not look" is not a failure verdict either. */
-    aowl_ov_pend_settle(windowOpen && found ? AOWL_OV_PEND_REJECTED
-                                            : AOWL_OV_PEND_UNKNOWN);
+    aowl_ov_pend_settle(key, windowOpen && found ? AOWL_OV_PEND_REJECTED
+                                                 : AOWL_OV_PEND_UNKNOWN);
 }
 
 static void aowl_ov_settings_set(const AowlOvCmd* cmd, char* buf, int32_t cap) {
@@ -3990,7 +4072,7 @@ static void aowl_ov_settings_set(const AowlOvCmd* cmd, char* buf, int32_t cap) {
     warg[i] = 0;
     /* BEFORE either write leg, so the re-GET each one performs is already
      * overlaid and the player`s value never leaves the screen. */
-    aowl_ov_pend_begin(cmd->guid, cmd->skey, cmd->sval);
+    (void)aowl_ov_pend_begin(cmd->guid, cmd->skey, cmd->sval);
     if (!strcmp(cmd->guid, AOWL_OV_PANEL_PAGE)) {
         /* Applied locally and re-generated, which is the same shape the HTTP
          * path has: write, then RE-READ, so the row shows what was actually
@@ -4984,8 +5066,30 @@ static void aowl_ov_queue_spage(const char* pageId, int32_t isMod) {
 
 static void aowl_ov_queue_sset(const char* pageId, const char* key,
                                const char* val) {
+    int32_t i;
     if (g_ov.backendPort <= 0) return;
     EnterCriticalSection(&g_ov.cs);
+    /* COALESCE, do not append. A slider drag emits an edit per notch; without
+     * this, twelve notches fill a third of the command queue with values that
+     * are all superseded before the worker reaches them, and the 33rd edit of
+     * the session is dropped with nothing said. Replacing the value of an
+     * SSET that is still queued for the same page+key sends exactly what the
+     * player ended on, once. */
+    for (i = 0; i < g_ov.cmdCount; i++) {
+        AowlOvCmd* c = &g_ov.cmds[i];
+        if (c->kind != AOWL_CMD_SSET) continue;
+        if (strcmp(c->guid, pageId ? pageId : "") != 0) continue;
+        if (strcmp(c->skey, key ? key : "") != 0) continue;
+        aowl_ov_copy(c->sval, (int32_t)sizeof(c->sval), val ? val : "");
+        /* Badge it NOW, on the UI thread, rather than when the worker gets to
+         * it: an edit queued behind a verify that can run for tens of seconds
+         * used to sit on screen looking untouched and fully editable. */
+        (void)aowl_ov_pend_begin(pageId, key, val);
+        aowl_ov_pend_apply();
+        LeaveCriticalSection(&g_ov.cs);
+        g_ov.dataSerial++;
+        return;
+    }
     if (g_ov.cmdCount < AOWL_OV_MAX_CMDS) {
         AowlOvCmd* c = &g_ov.cmds[g_ov.cmdCount++];
         memset(c, 0, sizeof(*c));
@@ -4993,8 +5097,18 @@ static void aowl_ov_queue_sset(const char* pageId, const char* key,
         aowl_ov_copy(c->guid, (int32_t)sizeof(c->guid), pageId ? pageId : "");
         aowl_ov_copy(c->skey, (int32_t)sizeof(c->skey), key ? key : "");
         aowl_ov_copy(c->sval, (int32_t)sizeof(c->sval), val ? val : "");
+        (void)aowl_ov_pend_begin(pageId, key, val);
+        aowl_ov_pend_apply();
+    } else {
+        /* NEVER A SILENT DROP. */
+        aowl_ov_fmt(g_ov.writeWhy, (int32_t)sizeof(g_ov.writeWhy),
+                    "NOT SENT: the overlay's command queue is full (%d). This "
+                    "edit to %s was NOT queued and NOT applied -- nothing was "
+                    "changed. Wait for the queue to drain and set it again.",
+                    (int32_t)AOWL_OV_MAX_CMDS, key ? key : "(no key)");
     }
     LeaveCriticalSection(&g_ov.cs);
+    g_ov.dataSerial++;
 }
 
 /* ================================================================== *
@@ -8629,23 +8743,40 @@ static void aowl_ov_view_settings(float x, float y, float w, float bodyH) {
             /* Indented past the group band above, so the hierarchy is a shape
              * and not something the player has to infer from the header text.
              * `rowX`, not `rx`, everywhere the label column is used below. */
-            aowl_ov_textn(rowX, cyy, si->label, lblCol,
-                          (int32_t)((ctlX - rowX - 8.0f) / AOWL_OV_CW));
-
             /* THE THIRD STATE, ON THE ROW. A player must be able to tell
              * "saving" from "saved" from "rejected" without reading a banner
              * at the bottom of the panel. `NI` (unimplemented) can never
              * collide here: an unimplemented row is not editable, so it can
-             * never carry a pending edit. */
-            if (si->pend != AOWL_OV_PEND_NONE) {
-                const char* bt = si->pend == AOWL_OV_PEND_SAVING   ? "SAVING"
-                               : si->pend == AOWL_OV_PEND_REJECTED ? "NOT SAVED"
-                                                                   : "UNCONFIRMED";
+             * never carry a pending edit.
+             *
+             * IT LIVES IN THE LABEL COLUMN, right-aligned against `ctlX`, and
+             * the label is truncated to make room for it. It used to be drawn
+             * at `rrEdge` -- the RIGHT edge of the row -- which is inside the
+             * control column: every widget below draws from `ctlX` rightwards
+             * and every one of them is drawn AFTER this, so the badge was
+             * painted over by the slider/value box and was, exactly as
+             * reported, invisible or overlapping. The label column is the only
+             * horizontal band on the row that no control ever occupies, so the
+             * badge is legible at every panel width; when the column is too
+             * narrow to hold both, the LABEL gives way (truncated with the
+             * same ellipsis every other narrow label uses) rather than the
+             * badge, because a state nobody can see is the failure and a
+             * shortened label is not. */
+            {
+                const char* bt = si->pend == AOWL_OV_PEND_NONE      ? ""
+                               : si->pend == AOWL_OV_PEND_SAVING    ? "SAVING"
+                               : si->pend == AOWL_OV_PEND_REJECTED  ? "NOT SAVED"
+                                                                    : "UNCONFIRMED";
                 uint32_t bc = si->pend == AOWL_OV_PEND_SAVING   ? AOWL_OV_ACCENT
                             : si->pend == AOWL_OV_PEND_REJECTED ? AOWL_OV_ERR
                                                                 : AOWL_OV_WARN;
-                aowl_ov_text(rrEdge - (float)strlen(bt) * AOWL_OV_CW, ry + 3.0f,
-                             bt, bc);
+                float bw = (float)strlen(bt) * AOWL_OV_CW;
+                float lblRight = ctlX - 8.0f - (bt[0] ? bw + AOWL_OV_CW : 0.0f);
+                int32_t lblCols = (int32_t)((lblRight - rowX) / AOWL_OV_CW);
+                if (lblCols < 1) lblCols = 1;
+                aowl_ov_textn(rowX, cyy, si->label, lblCol, lblCols);
+                if (bt[0])
+                    aowl_ov_text(ctlX - 8.0f - bw, ry + 3.0f, bt, bc);
             }
 
             /* Clicking any editable row selects it, so the keyboard follows the

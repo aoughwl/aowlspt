@@ -105,6 +105,98 @@ static int ov_has_word(const char* txt, const char* want) {
     return strstr(txt, want) != NULL;
 }
 
+/* ------------------------------------------------------------------ *
+ * The badge-collision detector.
+ *
+ * Every glyph quad in the frame, decoded to (char, x, y, width). A "badge run"
+ * is a horizontal sequence of glyphs on one scanline spelling `want`. A
+ * COLLISION is any glyph outside that run, on the same scanline, whose x-span
+ * overlaps it -- i.e. the thing the eye reads as "the SAVING text is invisible
+ * / overlaps with other stuff".
+ *
+ * Adjacency is not overlap: consecutive glyphs in a run touch exactly at
+ * x + cw, so the test uses a strict interior overlap with a half-unit slack.
+ * ------------------------------------------------------------------ */
+#define OV_MAX_GLYPHS 8192
+typedef struct { float x, y, w; char c; } OvGlyph;
+
+static int ov_glyphs(OvGlyph* g, int cap) {
+    int n = 0, i;
+    float cw = (float)AOWL_OV_CW * (float)(g_ov.scale > 0 ? g_ov.scale : 1);
+    for (i = 0; i + 5 < g_ov.vtxCount && n < cap; i += 6) {
+        const AowlOvVert* v = &g_ov.vtx[i];
+        int idx, cell;
+        if (v[0].u == v[1].u) continue;             /* a solid rect, not text */
+        cell = (int)(v[0].u * (float)AOWL_OV_ATW / (float)AOWL_OV_CW + 0.5f);
+        idx  = cell + 16 * (int)(v[0].v * (float)AOWL_OV_ATH / (float)AOWL_OV_CH + 0.5f);
+        if (idx < 0 || idx > 94) continue;
+        g[n].c = (char)(idx + 32);
+        g[n].x = v[0].x;
+        g[n].y = v[0].y;
+        g[n].w = cw;
+        n++;
+    }
+    return n;
+}
+
+/* Index of the first glyph of the `nth` run spelling `want`, or -1. */
+static int ov_badge_at(const OvGlyph* g, int n, const char* want, int nth) {
+    int i, k;
+    int len = (int)strlen(want);
+    int seen = 0;
+    for (i = 0; i + len <= n; i++) {
+        for (k = 0; k < len; k++) {
+            if (g[i + k].c != want[k]) break;
+            if (g[i + k].y != g[i].y) break;
+            if (k > 0 && g[i + k].x < g[i + k - 1].x + g[i].w - 0.5f) break;
+            if (k > 0 && g[i + k].x > g[i + k - 1].x + g[i].w + 0.5f) break;
+        }
+        if (k == len) {
+            if (seen == nth) return i;
+            seen++;
+            i += len - 1;
+        }
+    }
+    return -1;
+}
+
+static int ov_badge_runs(const char* want) {
+    static OvGlyph g[OV_MAX_GLYPHS];
+    int n = ov_glyphs(g, OV_MAX_GLYPHS);
+    int c = 0;
+    while (ov_badge_at(g, n, want, c) >= 0) c++;
+    return c;
+}
+
+static int ov_badge_origin(const char* want, int* ox, int* oy) {
+    static OvGlyph g[OV_MAX_GLYPHS];
+    int n = ov_glyphs(g, OV_MAX_GLYPHS);
+    int a = ov_badge_at(g, n, want, 0);
+    if (a < 0) return 0;
+    *ox = (int)g[a].x; *oy = (int)g[a].y;
+    return 1;
+}
+
+static int ov_badge_collisions(const char* want) {
+    static OvGlyph g[OV_MAX_GLYPHS];
+    int n = ov_glyphs(g, OV_MAX_GLYPHS);
+    int len = (int)strlen(want);
+    int hits = 0, run = 0, a, j;
+    while ((a = ov_badge_at(g, n, want, run)) >= 0) {
+        float x0 = g[a].x;
+        float x1 = g[a + len - 1].x + g[a].w;
+        for (j = 0; j < n; j++) {
+            if (j >= a && j < a + len) continue;
+            if (g[j].y != g[a].y) continue;
+            if (g[j].x + g[j].w <= x0 + 0.5f) continue;
+            if (g[j].x >= x1 - 0.5f) continue;
+            hits++;
+        }
+        run++;
+    }
+    return hits;
+}
+
 /* A wide 1px-tall rule inside the nav column -- the ROOT BORDER that used to
  * be drawn above every top-level row. The negative for it. The nav`s vertical
  * divider is the same colour but is 1 unit WIDE and hundreds tall, so it
@@ -321,6 +413,82 @@ int main(void) {
                ov_has_word(txt, "no mods") && !ov_has_word(txt, "no pages"), 1);
 
         stage();
+        aowl_ov_build();
+    }
+
+    printf("-- the SAVING badge is legible at every width --\n");
+    {
+        /* THE USER'S REPORT: "the SAVING text is invisible/overlaps with other
+         * stuff". It was drawn right-aligned at the ROW's right edge, which is
+         * inside the control column -- and every control is drawn AFTER it, so
+         * the value box painted over it.
+         *
+         * The assertion is on the FINISHED VERTEX BUFFER, not on the constant
+         * that positions the badge: find the glyphs that spell SAVING, and
+         * require that NO other glyph in the frame shares their scanline and
+         * overlaps them horizontally. That is a negative, it is checked at
+         * four panel widths, and the falsifiability proof below draws one
+         * colliding glyph and requires the detector to see it. */
+        static const int widths[4] = { 1280, 1600, 1920, 2560 };
+        int w, i;
+        for (w = 0; w < 4; w++) {
+            int over;
+            stage();
+            /* Long labels, so the label column is the crowded one -- if the
+             * badge is going to collide with anything, it is here. */
+            for (i = 0; i < 200; i++) {
+                _snprintf(g_ov.sItems[i].label, sizeof(g_ov.sItems[i].label) - 1,
+                          "a deliberately long setting label %d", i);
+                g_ov.sItems[i].pend = (i % 3 == 0) ? AOWL_OV_PEND_SAVING
+                                                   : AOWL_OV_PEND_NONE;
+                /* A RANGED row with a WIDE value, deliberately: that is the
+                 * shape whose value box reaches the row's right inner edge,
+                 * which is where the badge used to be drawn. Staged with the
+                 * narrow plus/minus control instead, the frame has nothing out
+                 * there and the old, broken position would pass this test --
+                 * a check that cannot fail (CLAUDE.md 9b). The revert proof at
+                 * the end of this block is what verified that. */
+                g_ov.sItems[i].kind = AOWL_S_FLOAT;
+                g_ov.sItems[i].hasRange = 1;
+                g_ov.sItems[i].lo = -99999.0f;
+                g_ov.sItems[i].hi = 99999.0f;
+                g_ov.sItems[i].step = 1.0f;
+                aowl_ov_copy(g_ov.sItems[i].value,
+                             (int32_t)sizeof(g_ov.sItems[i].value), "-98765");
+                aowl_ov_copy(g_ov.sItems[i].raw,
+                             (int32_t)sizeof(g_ov.sItems[i].raw), "-98765");
+            }
+            g_ov.bbW = widths[w];
+            g_ov.drawSig = 0;
+            aowl_ov_build();
+            over = ov_badge_collisions("SAVING");
+            printf("      bbW=%4d  SAVING runs drawn: %d\n",
+                   widths[w], ov_badge_runs("SAVING"));
+            eq_int("at least one SAVING badge was actually drawn",
+                   ov_badge_runs("SAVING") > 0, 1);
+            eq_int("no glyph overlaps the SAVING badge at this width", over, 0);
+        }
+        /* THE INPUT THAT MAKES IT FAIL. Put a single glyph on top of a badge --
+         * which is exactly what the old right-edge position did once the value
+         * box was drawn -- and require the detector to report it. A collision
+         * counter that can only ever return 0 would pass this file forever. */
+        {
+            int bx, by;
+            if (ov_badge_origin("SAVING", &bx, &by)) {
+                aowl_ov_text((float)bx / (float)(g_ov.scale > 0 ? g_ov.scale : 1)
+                                 + 1.0f,
+                             (float)by / (float)(g_ov.scale > 0 ? g_ov.scale : 1),
+                             "X", AOWL_OV_ERR);
+                eq_int("...and the collision detector DOES see one when drawn",
+                       ov_badge_collisions("SAVING") > 0, 1);
+            } else {
+                printf("error the badge origin could not be located -- "
+                       "INCONCLUSIVE, not a pass\n");
+                failures++;
+            }
+        }
+        stage();
+        g_ov.bbW = 1920;
         aowl_ov_build();
     }
 

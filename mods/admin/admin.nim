@@ -362,6 +362,7 @@ proc onSettingsHotApply(key: string) =
   ## there is ONE apply path and not two.
   discard key
   applyConfigToggles()
+  settingApplied("config toggles re-applied to the shared HUD region")
 
 # ---------------------------------------------------------------------------
 # The Unity-thread sampler: the ONLY thing in this mod that calls game code
