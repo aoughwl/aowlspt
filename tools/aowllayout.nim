@@ -558,3 +558,121 @@ proc handoffRow*(w: int; what: string): Row =
   let room = w - result.width - 2
   if room > 4:
     result.putIn ColWhite, fit(what, room)
+
+# ---------------------------------------------------------------------------
+# WHEN the handoff fires
+# ---------------------------------------------------------------------------
+#
+# This is here, in the pure layout module, for exactly one reason: it is the
+# decision that failed in front of a player, and it could not be tested where
+# it used to live. `aowllaunch` is a program -- it ends in `quit(main())` -- so
+# nothing can import it, and the whole of the auto-enter wait was therefore
+# unreachable from any test. 274 grid checks passed while the launcher sat on
+# screen 1 for four and a half minutes with the player already in a raid,
+# because every one of them asked "does this screen render correctly" and none
+# could ask "is this the screen we should be on".
+#
+# THE FAILURE, precisely. After `watchClient` returns (~1.3s, as soon as the
+# host logs `host running`), `main` runs the auto-enter block, which polls
+# `screens(u, "Menu UI", ss)` waiting for a screen named
+# `CharacterSelectionScreen` with `active == triYes`. That is the ONLY thing it
+# looks at. If the player clicks through character select themselves and goes
+# into a raid -- which is what happened -- the `Menu UI` scene root stops
+# existing, so the screen can never be active again and the loop burns its
+# entire 270s wall-clock bound. `panel.settle()` has already frozen screen 1 in
+# the scrollback, so the clock stops at 1.3s and nothing moves.
+#
+# `ScreenSet.rootPresent` already reports this. Its own comment in
+# `tools/aowlui.nim` says the absence of the `Menu UI` root "is not an error --
+# it is the single most reliable IN-RAID signal we have". The library measured
+# it, documented it, and returned it as data; the caller dropped it on the
+# floor and waited for something that could not happen.
+
+type
+  EnterWait* = object
+    ## Everything the auto-enter wait can observe, as plain data, so the
+    ## decision it drives is a function and not a loop body.
+    sawMenuRoot*: bool
+      ## The `Menu UI` root has been seen AT LEAST ONCE this run. This is the
+      ## latch that separates the two states that both look like "no root":
+      ## a cold client that has not loaded the menu yet, and a client that has
+      ## gone into a raid. Without it, breaking on a missing root would abandon
+      ## the wait one poll after launch, every launch.
+    menuRootPresent*: bool
+    sawSelector*: bool
+      ## `CharacterSelectionScreen` has been seen in the set at least once.
+    selectorActive*: bool
+    otherScreenActive*: bool
+      ## Some screen under `Menu UI` is active and it is not the selector.
+    clientAlive*: bool
+    elapsedMs*: int64
+
+const
+  EnterWaitLimitMs* = 270000'i64
+    ## The client legitimately takes 90s+ to reach the selector on a cold
+    ## IL2CPP boot, so the ceiling stays where it was. What changes is that it
+    ## is now the LAST resort rather than the only one.
+
+  EwWaiting* = 0
+  EwSelectorUp* = 1     ## press it
+  EwPassed* = 2         ## already past it -- nothing to press
+  EwClientGone* = 3
+  EwTimedOut* = 4
+
+proc enterWaitDone*(v: int): bool =
+  ## Terminal or not. Every non-`EwWaiting` verdict hands off.
+  v != EwWaiting
+
+proc enterWaitVerdict*(w: EnterWait; reason: var string): int =
+  ## The whole decision, in one place, with a REASON for every terminal answer.
+  ##
+  ## Ordered most-certain first. `clientAlive` is checked before anything about
+  ## screens, because a dead client cannot have a menu and "no Menu UI root"
+  ## would otherwise be reported as "in a raid".
+  reason = ""
+  if not w.clientAlive:
+    reason = "the client exited while the launcher was waiting for " &
+             "character select"
+    return EwClientGone
+  if w.selectorActive:
+    reason = "character select is up"
+    return EwSelectorUp
+  # PAST IT. Two independent signals, either of which is sufficient, and both
+  # of which require the corresponding latch so that a client that has not got
+  # there yet is never mistaken for one that has gone beyond it.
+  if w.sawMenuRoot and not w.menuRootPresent:
+    reason = "the Menu UI scene root is gone -- on this build that means a " &
+             "raid is in progress, so there is no character select left to " &
+             "press"
+    return EwPassed
+  if w.sawSelector and not w.selectorActive and w.otherScreenActive:
+    reason = "character select has closed and another screen is up, so it " &
+             "was got past without us"
+    return EwPassed
+  if w.elapsedMs >= EnterWaitLimitMs:
+    reason = "character select did not appear within " &
+             $(EnterWaitLimitMs div 1000'i64) & "s"
+    return EwTimedOut
+  result = EwWaiting
+
+const
+  ScreenLauncher* = 1
+  ScreenLogView* = 2
+
+proc screenFor*(hostRunning, clientAlive: bool; enterVerdict: int): int =
+  ## WHICH SCREEN THE LAUNCHER SHOULD BE ON, as a function of what it knows.
+  ##
+  ## The assertion this exists to make falsifiable: once the client is up and
+  ## the host is running, the only thing that may still hold the player on
+  ## screen 1 is an auto-enter wait that has NOT reached a verdict. The moment
+  ## it has -- passed, pressed, timed out, client gone -- the log view takes
+  ## over. There is no path on which a terminal verdict leaves screen 1 up.
+  ##
+  ## The terminal check is FIRST and unconditional, and that ordering is the
+  ## whole content of the fix. This is the auto-enter wait loop's actual
+  ## condition in `aowllaunch`, not a model of it written for a test: a
+  ## predicate the test asserts and the program does not call would prove
+  ## nothing about the program.
+  if enterWaitDone(enterVerdict): return ScreenLogView
+  if not hostRunning and clientAlive: return ScreenLauncher
+  result = ScreenLauncher
