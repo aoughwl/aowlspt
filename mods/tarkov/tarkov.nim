@@ -3114,14 +3114,16 @@ proc tarkovSchema(): seq[Setting] =
     enumSetting("edition", "Game edition", "standard",
                 @["standard", "left-behind", "prepare-for-escape",
                   "edge-of-darkness", "unheard"], category = "Emulator",
-                description = "Starting edition applied to a fresh profile"),
+                description = "aowlspt original (server emulator); acts on the SPT-derived database. Starting edition applied to a fresh profile"),
     enumSetting("defaultSide", "Default side", "Usec", @["Usec", "Bear"],
-                category = "Emulator"),
+                category = "Emulator",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database."),
     intSetting("startingRoubles", "Starting roubles", 500000,
-               lo = 0, hi = 100000000, step = 1000, category = "Emulator"),
+               lo = 0, hi = 100000000, step = 1000, category = "Emulator",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database."),
     intSetting("epochBase", "Epoch base (seconds)", 1700000000,
                category = "Emulator",
-               description = "The Unix time the emulator's clock starts from"),
+               description = "aowlspt original (server emulator); acts on the SPT-derived database. The Unix time the emulator's clock starts from"),
 
     # The label used to read "Insurance return chance (%)", which is not what
     # this number is: `emu/insurance.premiumFor` multiplies the item's handbook
@@ -3134,9 +3136,7 @@ proc tarkovSchema(): seq[Setting] =
     # already expresses it and two controls for one number disagree eventually.
     intSetting("insurancePercent", "Insurance premium (% of item value)", 10,
                lo = 0, hi = 100, category = "Traders/Insurance",
-               description = "What the trader charges to insure an item, as a " &
-                             "percentage of its handbook price " &
-                             "(emu/insurance.premiumFor). 0 makes insurance free"),
+               description = "aowlspt original (server emulator); acts on the SPT-derived database. What the trader charges to insure an item, as a percentage of its handbook price (emu/insurance.premiumFor). 0 makes insurance free"),
     # 0 is "instant": `queueReturn` records `dueAt = now`, and the next pass of
     # `deliverDue` posts the items back through the trader's own mail. The
     # return is a real mechanic here -- premium taken, items held in the store,
@@ -3144,26 +3144,28 @@ proc tarkovSchema(): seq[Setting] =
     # a separate switch.
     intSetting("insuranceReturnHours", "Insurance return delay (hours)", 24,
                lo = 0, hi = 168, category = "Traders/Insurance",
-               description = "How long a trader holds insured gear before " &
-                             "mailing it back (emu/insurance.queueReturn / " &
-                             "deliverDue). 0 returns it on the next delivery pass"),
+               description = "aowlspt original (server emulator); acts on the SPT-derived database. How long a trader holds insured gear before mailing it back (emu/insurance.queueReturn / deliverDue). 0 returns it on the next delivery pass"),
 
     intSetting("scavCooldownSeconds", "Scav cooldown (seconds)", 900,
-               lo = 0, hi = 86400, step = 60, category = "Scav"),
+               lo = 0, hi = 86400, step = 60, category = "Scav",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database."),
     floatSetting("fenceKarmaOnScavExtract", "Fence karma on scav extract", 0.01,
-                 lo = -1.0, hi = 1.0, step = 0.01, category = "Scav"),
+                 lo = -1.0, hi = 1.0, step = 0.01, category = "Scav",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database."),
     floatSetting("fenceKarmaOnScavDeath", "Fence karma on scav death", 0.0,
-                 lo = -1.0, hi = 1.0, step = 0.01, category = "Scav"),
+                 lo = -1.0, hi = 1.0, step = 0.01, category = "Scav",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database."),
 
     intSetting("defaultBotLimit", "Default bot limit", 30, lo = 0, hi = 200,
                category = "Bots",
-               description = "Bot limit for a map the database says nothing about"),
+               description = "aowlspt original (server emulator); acts on the SPT-derived database. Bot limit for a map the database says nothing about"),
 
     intSetting("mailKeepHours", "Mail keep (hours)", 72, lo = 0, hi = 8760,
                category = "Mail",
-               description = "Inbox age bound; 0 or below keeps the whole history"),
+               description = "aowlspt original (server emulator); acts on the SPT-derived database. Inbox age bound; 0 or below keeps the whole history"),
     intSetting("mailKeepCollected", "Keep collected mail", 1, lo = 0, hi = 1,
-               category = "Mail"),
+               category = "Mail",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database."),
 
     # ---- the flea market ------------------------------------------------
     #
@@ -3174,27 +3176,24 @@ proc tarkovSchema(): seq[Setting] =
     # client fetches, which is where the client reads both. A second control
     # for either would be a row that fights the one that actually works.
     intSetting("fleaSpreadPercent", "Flea price spread (%)", 20, lo = 0, hi = 100,
-               category = "Flea Market/Offers"),
+               category = "Flea Market/Offers",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database."),
     intSetting("fleaOfferHours", "Flea offer duration (hours)", 12,
-               lo = 1, hi = 168, category = "Flea Market/Offers"),
+               lo = 1, hi = 168, category = "Flea Market/Offers",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database."),
     intSetting("fleaMaxOffers", "Flea max offers", 600, lo = 1, hi = 10000,
-               category = "Flea Market/Offers"),
+               category = "Flea Market/Offers",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database."),
     intSetting("fleaSaleMinutes", "Flea sale time (minutes)", 30, lo = 0,
-               hi = 1440, category = "Flea Market/Offers"),
+               hi = 1440, category = "Flea Market/Offers",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database."),
     floatSetting("fleaPriceMultiplier", "Flea price multiplier", 1.0,
                  lo = 0.0, hi = 10.0, step = 0.05,
                  category = "Flea Market/Offers",
-                 description = "Scales every asking price on the flea, at " &
-                               "BOTH places an offer is born " &
-                               "(emu/market.scaleFleaPrice). `buyOffer` " &
-                               "charges the offer's own price, so the label " &
-                               "and the bill cannot disagree. 0 is free"),
+                 description = "aowlspt original (server emulator); acts on the SPT-derived database. Scales every asking price on the flea, at BOTH places an offer is born (emu/market.scaleFleaPrice). `buyOffer` charges the offer's own price, so the label and the bill cannot disagree. 0 is free"),
     intSetting("fleaSellFeePercent", "Flea listing fee (%)", 0, lo = 0, hi = 100,
                category = "Flea Market/Selling",
-               description = "A percentage of the asking price, taken out of " &
-                             "the stash when you LIST something " &
-                             "(emu/market.addOffer). 0, the default, is what " &
-                             "this server did before: listing is free"),
+               description = "aowlspt original (server emulator); acts on the SPT-derived database. A percentage of the asking price, taken out of the stash when you LIST something (emu/market.addOffer). 0, the default, is what this server did before: listing is free"),
     # Declared and NOT wired, with the reason on the row.
     #
     # The client-side flag exists (`RagFair Is Only Found In Raid Allowed`
@@ -3208,26 +3207,26 @@ proc tarkovSchema(): seq[Setting] =
     boolSetting("fleaSellRequiresFoundInRaid",
                 "Flea selling requires found in raid", false,
                 category = "Flea Market/Selling", implemented = false,
-                description = "NOT WIRED: this server never stamps " &
-                              "upd.SpawnedInSession on raid loot, so a " &
-                              "found-in-raid check could only ever refuse " &
-                              "every listing rather than restrict any. The " &
-                              "client-side flag is separately available as " &
-                              "Flea Market > RagFair > Is Only Found In Raid " &
-                              "Allowed"),
+                description = "aowlspt original (server emulator); acts on the SPT-derived database. NOT WIRED: this server never stamps upd.SpawnedInSession on raid loot, so a found-in-raid check could only ever refuse every listing rather than restrict any. The client-side flag is separately available as Flea Market > RagFair > Is Only Found In Raid Allowed"),
 
-    boolSetting("lootEnabled", "Loot enabled", true, category = "Loot"),
+    boolSetting("lootEnabled", "Loot enabled", true, category = "Loot",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database."),
     floatSetting("staticLootMultiplier", "Static loot multiplier", 1.0,
-                 lo = 0.0, hi = 10.0, step = 0.1, category = "Loot"),
+                 lo = 0.0, hi = 10.0, step = 0.1, category = "Loot",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database."),
     floatSetting("looseLootMultiplier", "Loose loot multiplier", 1.0,
-                 lo = 0.0, hi = 10.0, step = 0.1, category = "Loot"),
+                 lo = 0.0, hi = 10.0, step = 0.1, category = "Loot",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database."),
     intSetting("maxLootItems", "Max loot items", 20000, lo = 0, hi = 200000,
-               step = 1000, category = "Loot"),
+               step = 1000, category = "Loot",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database."),
 
     floatSetting("skillMaxPerRaid", "Skill max per raid", 100.0, lo = 0.0,
-                 hi = 1000.0, step = 1.0, category = "Skills"),
+                 hi = 1000.0, step = 1.0, category = "Skills",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database."),
     intSetting("masteringMaxPerRaid", "Mastering max per raid", 100, lo = 0,
-               hi = 1000, category = "Skills"),
+               hi = 1000, category = "Skills",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database."),
 
     # ---- server-side economy and time modifiers ------------------------
     #
@@ -3252,57 +3251,25 @@ proc tarkovSchema(): seq[Setting] =
     # that is the field the client reads. See the header of `emu/progression`.
     intSetting("progressionPlayerLevel", "Player level", 0, lo = 0, hi = 79,
                category = "Progression/Player",
-               description = "Raise the character to at least this level. " &
-                             "The client derives the level it draws from " &
-                             "Info.Experience against " &
-                             "globals.config.exp.level.exp_table and does not " &
-                             "trust Info.Level, so this writes the matching " &
-                             "EXPERIENCE (emu/progression.xpForLevel) and " &
-                             "sets Info.Level alongside it. 0 is off; 79 is " &
-                             "the length of the exp table on this database"),
+               description = "aowlspt original (server emulator); acts on the SPT-derived database. Raise the character to at least this level. The client derives the level it draws from Info.Experience against globals.config.exp.level.exp_table and does not trust Info.Level, so this writes the matching EXPERIENCE (emu/progression.xpForLevel) and sets Info.Level alongside it. 0 is off; 79 is the length of the exp table on this database"),
 
     intSetting("progressionSkillLevel", "Skill level", 0, lo = 0, hi = 51,
                category = "Progression/Skills",
-               description = "Raise every skill the profile already carries " &
-                             "to at least this level, by writing " &
-                             "Skills.Common[].Progress = level x 100. 51 is " &
-                             "elite. Only ids ALREADY on the profile are " &
-                             "touched, so this cannot reintroduce one of the " &
-                             "17 pre-1.0 ids the client answers \"Can't find " &
-                             "skill to upgrade\" for. 0 is off"),
+               description = "aowlspt original (server emulator); acts on the SPT-derived database. Raise every skill the profile already carries to at least this level, by writing Skills.Common[].Progress = level x 100. 51 is elite. Only ids ALREADY on the profile are touched, so this cannot reintroduce one of the 17 pre-1.0 ids the client answers \\\"Can't find skill to upgrade\\\" for. 0 is off"),
     stringSetting("progressionSkillIds", "Only these skills", "",
                   category = "Progression/Skills",
-                  description = "Comma-separated skill ids " &
-                                "(Endurance, Strength, Perception ...) to " &
-                                "restrict the row above to. Matched on the " &
-                                "WHOLE id, case-insensitively -- a substring " &
-                                "match would make one entry select several. " &
-                                "Empty means every skill on the profile"),
+                  description = "aowlspt original (server emulator); acts on the SPT-derived database. Comma-separated skill ids (Endurance, Strength, Perception ...) to restrict the row above to. Matched on the WHOLE id, case-insensitively -- a substring match would make one entry select several. Empty means every skill on the profile"),
 
     intSetting("progressionMasteryLevel", "Weapon mastery level", 0,
                lo = 0, hi = 3, category = "Progression/Mastery",
-               description = "Raise every weapon family to at least this " &
-                             "mastery level (1, 2 or 3) by writing " &
-                             "Skills.Mastering[].Progress up to that family's " &
-                             "own Level2/Level3 threshold out of " &
-                             "globals.config.Mastering -- the thresholds " &
-                             "differ per family (M4 is 1600/2000, SKS " &
-                             "200/300), so they are read, not assumed. 0 is off"),
+               description = "aowlspt original (server emulator); acts on the SPT-derived database. Raise every weapon family to at least this mastery level (1, 2 or 3) by writing Skills.Mastering[].Progress up to that family's own Level2/Level3 threshold out of globals.config.Mastering -- the thresholds differ per family (M4 is 1600/2000, SKS 200/300), so they are read, not assumed. 0 is off"),
     stringSetting("progressionMasteryFamilies", "Only these weapon families", "",
                   category = "Progression/Mastery",
-                  description = "Comma-separated family names (M4, AKM, " &
-                                "AKSU, SKS ...) to restrict the row above to. " &
-                                "Mastery is per weapon FAMILY, not per " &
-                                "weapon: the 79 families on this database " &
-                                "cover several templates each, which is why " &
-                                "this is a filter and not 79 rows. Empty " &
-                                "means every family"),
+                  description = "aowlspt original (server emulator); acts on the SPT-derived database. Comma-separated family names (M4, AKM, AKSU, SKS ...) to restrict the row above to. Mastery is per weapon FAMILY, not per weapon: the 79 families on this database cover several templates each, which is why this is a filter and not 79 rows. Empty means every family"),
 
     boolSetting("traderUnlockAllOffers", "Unlock every trader offer", false,
                 category = "Traders/Offers",
-                description = "Sell every trader's whole stock from loyalty " &
-                              "level 1, ignoring loyalty and quest gating " &
-                              "(emu/traders.traderAssort). Off by default."),
+                description = "aowlspt original (server emulator); acts on the SPT-derived database. Sell every trader's whole stock from loyalty level 1, ignoring loyalty and quest gating (emu/traders.traderAssort). Off by default."),
     # A DIFFERENT axis from the row above, and the one that answers the error
     # a player actually sees. `traderUnlockAllOffers` moves every OFFER down to
     # loyalty 1; this moves the PLAYER up to the top level each trader defines.
@@ -3312,51 +3279,30 @@ proc tarkovSchema(): seq[Setting] =
     # of which the assort rewrite touches.
     boolSetting("traderMaxLoyalty", "Max trader loyalty level", false,
                 category = "Traders/Offers",
-                description = "Put every trader at the highest loyalty level " &
-                              "their own loyaltyLevels array defines, " &
-                              "ignoring player level, sales sum and standing " &
-                              "(emu/traders.loyaltyLevelFor). Applied in the " &
-                              "derivation rather than written to the profile, " &
-                              "because refreshLoyalty re-derives the stored " &
-                              "number after every trade. Off by default"),
+                description = "aowlspt original (server emulator); acts on the SPT-derived database. Put every trader at the highest loyalty level their own loyaltyLevels array defines, ignoring player level, sales sum and standing (emu/traders.loyaltyLevelFor). Applied in the derivation rather than written to the profile, because refreshLoyalty re-derives the stored number after every trade. Off by default"),
     floatSetting("traderPriceMultiplier", "Trader price multiplier", 1.0,
                  lo = 0.0, hi = 10.0, step = 0.05, category = "Traders/Offers",
-                 description = "Scales every barter-scheme count, in BOTH " &
-                               "the assort the client is shown and the cost " &
-                               "the server charges -- scaling only one is a " &
-                               "shop that shows one price and takes another"),
+                 description = "aowlspt original (server emulator); acts on the SPT-derived database. Scales every barter-scheme count, in BOTH the assort the client is shown and the cost the server charges -- scaling only one is a shop that shows one price and takes another"),
     # The per-item purchase limit, and only that. Loyalty and quest gating is
     # the row above; the price is the row above that. One switch per mechanic,
     # because a single "remove restrictions" toggle cannot be turned half on.
     boolSetting("traderIgnoreStockLimits", "Ignore trader stock limits", false,
                 category = "Traders/Offers",
-                description = "Removes the per-item purchase limit -- the " &
-                              "assort's upd.StackObjectsCount check in " &
-                              "emu/trading.buyFromTrader that answers \"that " &
-                              "trader has only N of those\". Off by default"),
+                description = "aowlspt original (server emulator); acts on the SPT-derived database. Removes the per-item purchase limit -- the assort's upd.StackObjectsCount check in emu/trading.buyFromTrader that answers \\\"that trader has only N of those\\\". Off by default"),
     floatSetting("repairPriceMultiplier", "Repair price multiplier", 1.0,
                  lo = 0.0, hi = 10.0, step = 0.05, category = "Traders/Repair",
-                 description = "Scales what a TRADER charges to repair " &
-                               "(emu/repair.doTraderRepair). 0 makes trader " &
-                               "repairs free. A kit repair is paid for in the " &
-                               "kit's own Resource, not in roubles, so this " &
-                               "does not touch it"),
+                 description = "aowlspt original (server emulator); acts on the SPT-derived database. Scales what a TRADER charges to repair (emu/repair.doTraderRepair). 0 makes trader repairs free. A kit repair is paid for in the kit's own Resource, not in roubles, so this does not touch it"),
     floatSetting("hideoutConstructionMultiplier",
                  "Hideout construction time multiplier", 1.0,
                  lo = 0.0, hi = 5.0, step = 0.05, category = "Hideout",
-                 description = "Scales every area upgrade duration " &
-                               "(emu/hideout.upgradeSeconds). 0 makes " &
-                               "upgrades instant"),
+                 description = "aowlspt original (server emulator); acts on the SPT-derived database. Scales every area upgrade duration (emu/hideout.upgradeSeconds). 0 makes upgrades instant"),
     floatSetting("hideoutProductionMultiplier",
                  "Hideout craft time multiplier", 1.0,
                  lo = 0.0, hi = 5.0, step = 0.05, category = "Hideout",
-                 description = "Scales a craft's duration when it STARTS; a " &
-                               "craft already running keeps the terms it " &
-                               "started on"),
+                 description = "aowlspt original (server emulator); acts on the SPT-derived database. Scales a craft's duration when it STARTS; a craft already running keeps the terms it started on"),
     floatSetting("questXpMultiplier", "Quest experience multiplier", 1.0,
                  lo = 0.0, hi = 100.0, step = 0.1, category = "Quests",
-                 description = "Scales the experience a quest pays out " &
-                               "(emu/quests.rewardExperience)"),
+                 description = "aowlspt original (server emulator); acts on the SPT-derived database. Scales the experience a quest pays out (emu/quests.rewardExperience)"),
 
     # What the main menu's bottom-right corner reads. Three options, wired
     # through aowlspt/menutext (the literal key "menuCornerLabel" is also the
@@ -3364,9 +3310,7 @@ proc tarkovSchema(): seq[Setting] =
     # `applyMenuCornerLabel` below for how each is represented on the wire.
     enumSetting("menuCornerLabel", "Menu corner label", "Profile Name",
                 @["Profile Name", "PVE ZONE", "No text"], category = "Menu",
-                description = "What the main menu's bottom-right corner " &
-                              "shows: the logged-in character's name, the " &
-                              "stock \"PVE ZONE\", or nothing"),
+                description = "aowlspt original (server emulator); acts on the SPT-derived database. What the main menu's bottom-right corner shows: the logged-in character's name, the stock \\\"PVE ZONE\\\", or nothing"),
 
     # ---- item spawning -------------------------------------------------
     #
@@ -3384,22 +3328,18 @@ proc tarkovSchema(): seq[Setting] =
     selectSetting("spawnQuery", "Item to spawn", "", @[],
                   optionsUrl = "/aowlspt/settings/" & ModGuid & "/items",
                   category = "Spawn Items",
-                  description = "Search the item table by name or paste a " &
-                                "24-hex template id"),
+                  description = "aowlspt original (server emulator); acts on the SPT-derived database. Search the item table by name or paste a 24-hex template id"),
     intSetting("spawnCount", "How many", 1, lo = 1, hi = 5000,
-               category = "Spawn Items"),
+               category = "Spawn Items",
+      description = "aowlspt original (server emulator); acts on the SPT-derived database."),
     intSetting("spawnCondition", "Condition (%)", 100, lo = 1, hi = 100,
                category = "Spawn Items",
-               description = "Durability, resource or medkit charge as a " &
-                             "percentage of the template's own maximum; only " &
-                             "the properties the template declares are written"),
+               description = "aowlspt original (server emulator); acts on the SPT-derived database. Durability, resource or medkit charge as a percentage of the template's own maximum; only the properties the template declares are written"),
     boolSetting("spawnNow", "Spawn now", false, category = "Spawn Items",
-                description = "Turn on to spawn. It turns itself back off, " &
-                              "and the outcome appears in the row below"),
+                description = "aowlspt original (server emulator); acts on the SPT-derived database. Turn on to spawn. It turns itself back off, and the outcome appears in the row below"),
     stringSetting("spawnResult", "Last spawn result", "",
                   category = "Spawn Items",
-                  description = "What the last spawn did, or exactly why it " &
-                                "did nothing")]
+                  description = "aowlspt original (server emulator); acts on the SPT-derived database. What the last spawn did, or exactly why it did nothing")]
 
   # Several hundred server value modifiers, generated from the database and
   # applied to the globals document the client fetches. `emu/tuning` builds

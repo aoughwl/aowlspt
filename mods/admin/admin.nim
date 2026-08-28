@@ -258,70 +258,43 @@ proc adminSchema(): seq[Setting] =
     # unbound rows below are the whole admin menu.
     stringSetting("adminSurface", "The admin menu is F6", "press F6 in game",
                   category = "Admin", implemented = false,
-                  description = "The live admin surface is the in-game F6 " &
-                                "overlay -- toggles, and an item spawner " &
-                                "(type a name, set the count and condition, " &
-                                "Enter). The rows on this page set the state " &
-                                "the F6 menu STARTS in; after that F6 owns " &
-                                "them. This row is a signpost and sets " &
-                                "nothing."),
+                  description = "aowlspt original (F6 admin panel). The live admin surface is the in-game F6 overlay -- toggles, and an item spawner (type a name, set the count and condition, Enter). The rows on this page set the state the F6 menu STARTS in; after that F6 owns them. This row is a signpost and sets nothing."),
     boolSetting("esp", "ESP", false, category = "Visuals",
-                description = "Boxes and side-colour on every player (F6 menu). " &
-                              "Needs the host's GameWorld cache: turn on the " &
-                              "debugEsp or botDiag host flag, or adminDiag() " &
-                              "reports ESP unavailable."),
+                description = "aowlspt original (F6 admin panel). Boxes and side-colour on every player (F6 menu). Needs the host's GameWorld cache: turn on the debugEsp or botDiag host flag, or adminDiag() reports ESP unavailable."),
     boolSetting("godmode", "God mode", false, category = "Combat",
-                description = "Neuters EFT.Player::ApplyDamageInfo while in a " &
-                              "raid. GLOBAL: bots stop taking damage too."),
-    boolSetting("infiniteStamina", "Infinite stamina", false, category = "Movement"),
+                description = "aowlspt original (F6 admin panel). Neuters EFT.Player::ApplyDamageInfo while in a raid. GLOBAL: bots stop taking damage too."),
+    boolSetting("infiniteStamina", "Infinite stamina", false, category = "Movement",
+      description = "aowlspt original (F6 admin panel)."),
     boolSetting("noRecoil", "No recoil / sway", false, category = "Combat",
-                implemented = false, description = "NOT BOUND. The offset that would drive this has not been measured on build 1.1.0.1.46777, so the row reads and never writes -- and the F6 menu draws it \"n/a\" for the same reason. Neither surface can turn it on."),
+                implemented = false, description = "aowlspt original (F6 admin panel). NOT BOUND. The offset that would drive this has not been measured on build 1.1.0.1.46777, so the row reads and never writes -- and the F6 menu draws it \\\"n/a\\\" for the same reason. Neither surface can turn it on."),
     boolSetting("noWeight", "No weight", false, category = "Movement",
-                implemented = false, description = "NOT BOUND. The offset that would drive this has not been measured on build 1.1.0.1.46777, so the row reads and never writes -- and the F6 menu draws it \"n/a\" for the same reason. Neither surface can turn it on."),
+                implemented = false, description = "aowlspt original (F6 admin panel). NOT BOUND. The offset that would drive this has not been measured on build 1.1.0.1.46777, so the row reads and never writes -- and the F6 menu draws it \\\"n/a\\\" for the same reason. Neither surface can turn it on."),
     boolSetting("instantHeal", "Instant heal", false, category = "Combat",
-                implemented = false, description = "NOT BOUND. The offset that would drive this has not been measured on build 1.1.0.1.46777, so the row reads and never writes -- and the F6 menu draws it \"n/a\" for the same reason. Neither surface can turn it on."),
+                implemented = false, description = "aowlspt original (F6 admin panel). NOT BOUND. The offset that would drive this has not been measured on build 1.1.0.1.46777, so the row reads and never writes -- and the F6 menu draws it \\\"n/a\\\" for the same reason. Neither surface can turn it on."),
     boolSetting("unlimitedAmmo", "Unlimited ammo", false, category = "Combat",
-                implemented = false, description = "NOT BOUND. The offset that would drive this has not been measured on build 1.1.0.1.46777, so the row reads and never writes -- and the F6 menu draws it \"n/a\" for the same reason. Neither surface can turn it on."),
+                implemented = false, description = "aowlspt original (F6 admin panel). NOT BOUND. The offset that would drive this has not been measured on build 1.1.0.1.46777, so the row reads and never writes -- and the F6 menu draws it \\\"n/a\\\" for the same reason. Neither surface can turn it on."),
     boolSetting("thermalVision", "Thermal vision", false, category = "Visuals",
-                implemented = false, description = "NOT BOUND. The offset that would drive this has not been measured on build 1.1.0.1.46777, so the row reads and never writes -- and the F6 menu draws it \"n/a\" for the same reason. Neither surface can turn it on."),
+                implemented = false, description = "aowlspt original (F6 admin panel). NOT BOUND. The offset that would drive this has not been measured on build 1.1.0.1.46777, so the row reads and never writes -- and the F6 menu draws it \\\"n/a\\\" for the same reason. Neither surface can turn it on."),
     boolSetting("nightVision", "Night vision", false, category = "Visuals",
-                implemented = false, description = "NOT BOUND. The offset that would drive this has not been measured on build 1.1.0.1.46777, so the row reads and never writes -- and the F6 menu draws it \"n/a\" for the same reason. Neither surface can turn it on."),
+                implemented = false, description = "aowlspt original (F6 admin panel). NOT BOUND. The offset that would drive this has not been measured on build 1.1.0.1.46777, so the row reads and never writes -- and the F6 menu draws it \\\"n/a\\\" for the same reason. Neither surface can turn it on."),
     boolSetting("fly", "Fly / noclip", false, category = "Movement",
-                implemented = false, description = "NOT BOUND. The offset that would drive this has not been measured on build 1.1.0.1.46777, so the row reads and never writes -- and the F6 menu draws it \"n/a\" for the same reason. Neither surface can turn it on."),
+                implemented = false, description = "aowlspt original (F6 admin panel). NOT BOUND. The offset that would drive this has not been measured on build 1.1.0.1.46777, so the row reads and never writes -- and the F6 menu draws it \\\"n/a\\\" for the same reason. Neither surface can turn it on."),
     boolSetting("teleport", "Teleport to marker", false, category = "Movement",
-                implemented = false, description = "NOT BOUND. The offset that would drive this has not been measured on build 1.1.0.1.46777, so the row reads and never writes -- and the F6 menu draws it \"n/a\" for the same reason. Neither surface can turn it on."),
+                implemented = false, description = "aowlspt original (F6 admin panel). NOT BOUND. The offset that would drive this has not been measured on build 1.1.0.1.46777, so the row reads and never writes -- and the F6 menu draws it \\\"n/a\\\" for the same reason. Neither surface can turn it on."),
     boolSetting("timeOfDay", "Set time of day", false, category = "World",
-                implemented = false, description = "NOT BOUND. The offset that would drive this has not been measured on build 1.1.0.1.46777, so the row reads and never writes -- and the F6 menu draws it \"n/a\" for the same reason. Neither surface can turn it on."),
+                implemented = false, description = "aowlspt original (F6 admin panel). NOT BOUND. The offset that would drive this has not been measured on build 1.1.0.1.46777, so the row reads and never writes -- and the F6 menu draws it \\\"n/a\\\" for the same reason. Neither surface can turn it on."),
     boolSetting("hotkeys", "Action hotkeys", false, category = "Hotkeys",
-                description = "Master gate for the keys below. OFF by " &
-                              "default; with it off nothing is polled and no " &
-                              "key does anything. The keys are read with the " &
-                              "game's own Input::GetKeyDown, so they are dead " &
-                              "while the window is not focused -- and they " &
-                              "work in a raid, where this page cannot be " &
-                              "reached."),
+                description = "aowlspt original (F6 admin panel). Master gate for the keys below. OFF by default; with it off nothing is polled and no key does anything. The keys are read with the game's own Input::GetKeyDown, so they are dead while the window is not focused -- and they work in a raid, where this page cannot be reached."),
     keybindSetting("hotkeyEsp", "ESP hotkey", "", category = "Hotkeys",
-                   description = "A UnityEngine.KeyCode NAME (F7, Insert, " &
-                                 "KeypadPlus, ...). Empty means unbound. An " &
-                                 "unrecognised name is REFUSED with the name " &
-                                 "printed, in the host log and under the F6 " &
-                                 "menu; it is never read as KeyCode.None, " &
-                                 "which is a real key with ordinal 0. " &
-                                 "Rebindable in the F6 menu too: select the " &
-                                 "row and press K."),
+                   description = "aowlspt original (F6 admin panel). A UnityEngine.KeyCode NAME (F7, Insert, KeypadPlus, ...). Empty means unbound. An unrecognised name is REFUSED with the name printed, in the host log and under the F6 menu; it is never read as KeyCode.None, which is a real key with ordinal 0. Rebindable in the F6 menu too: select the row and press K."),
     keybindSetting("hotkeyGodmode", "God mode hotkey", "", category = "Hotkeys",
-                   description = "As above. REFUSED while God mode reports " &
-                                 "no capability, because a key on an unbound " &
-                                 "action would do nothing, which is worse " &
-                                 "than no key."),
+                   description = "aowlspt original (F6 admin panel). As above. REFUSED while God mode reports no capability, because a key on an unbound action would do nothing, which is worse than no key."),
     keybindSetting("hotkeyStamina", "Infinite stamina hotkey", "",
                    category = "Hotkeys",
-                   description = "As above. REFUSED while infinite stamina " &
-                                 "reports no capability. The other nine " &
-                                 "actions have no hotkey row at all: their " &
-                                 "writes are not bound on this build."),
+                   description = "aowlspt original (F6 admin panel). As above. REFUSED while infinite stamina reports no capability. The other nine actions have no hotkey row at all: their writes are not bound on this build."),
     floatSetting("espMaxDistance", "ESP max distance (m)", 400.0,
-                 lo = 10.0, hi = 2000.0, step = 10.0, category = "Visuals")]
+                 lo = 10.0, hi = 2000.0, step = 10.0, category = "Visuals",
+      description = "aowlspt original (F6 admin panel).")]
 
 proc onAdminSettings(url, body, session: string): string =
   var st = Ok
