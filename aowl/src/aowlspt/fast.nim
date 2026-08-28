@@ -85,11 +85,44 @@ import aowlspt/il2cpp
  * compare. */
 static int64_t aowl_thread_id(void) { return (int64_t)GetCurrentThreadId(); }
 
+/* VirtualQuery, restated locally rather than pulled in from
+ * `abi/aowlspt_shim.h`.
+ *
+ * `{.emit.}` is module-scoped and this module includes `aowlspt_fast.h`, not
+ * `aowlspt_shim.h`; including the shim here to reach its `aowl_is_readable`
+ * would drag its whole surface (and a second copy of every static in it) into
+ * every mod that imports `fast`. The name is DIFFERENT on purpose so the two
+ * can never be confused for one definition. `aowlspt_fast.h` has already
+ * pulled in <windows.h>.
+ *
+ * Semantics match the shim exactly: committed, not a guard page, carrying a
+ * readable protection, and the WHOLE range inside one region. */
+static int32_t aowl_fast_is_readable(void* p, int32_t size) {
+    MEMORY_BASIC_INFORMATION mbi;
+    if (!p || size <= 0) return 0;
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0) return 0;
+    if (mbi.State != MEM_COMMIT) return 0;
+    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return 0;
+    if (!(mbi.Protect & (PAGE_READONLY | PAGE_READWRITE | PAGE_WRITECOPY |
+                         PAGE_EXECUTE_READ | PAGE_EXECUTE_READWRITE |
+                         PAGE_EXECUTE_WRITECOPY))) return 0;
+    {
+        uintptr_t start = (uintptr_t)mbi.BaseAddress;
+        uintptr_t end   = start + (uintptr_t)mbi.RegionSize;
+        uintptr_t need  = (uintptr_t)p + (uintptr_t)size;
+        if (need < (uintptr_t)p) return 0;   /* overflow */
+        return need <= end ? 1 : 0;
+    }
+}
+
 """.}
 
 # ---------------------------------------------------------------------------
 # The C side
 # ---------------------------------------------------------------------------
+
+proc fastIsReadable(p: Il2CppPtr; size: int32): int32 {.
+  importc: "aowl_fast_is_readable", nodecl.}
 
 proc cSetG(a: Il2CppPtr; i: int32; v: int64) {.importc: "aowl_fast_set_g", nodecl.}
 proc cSetP(a: Il2CppPtr; i: int32; v: Il2CppPtr) {.importc: "aowl_fast_set_p", nodecl.}
@@ -690,10 +723,47 @@ proc bindOnObject*(rt: Il2Cpp; obj: Il2CppPtr; member: string;
   ## This is what a mod holding an instance actually wants: the object knows its
   ## own type, including the subclass the game handed it, and including generic
   ## instantiations that cannot be named.
+  ##
+  ## **A NIL CHECK ON THE CLASS BELOW WOULD NOT BE A CHECK, SO THERE IS NOT
+  ## ONE.** `objectClass` is `il2cpp_object_get_class`, which is literally
+  ## `mov rax,[rcx]; ret` -- it validates nothing, so a bad object yields a
+  ## plausible NON-NIL number. `fullName` then reaches
+  ## `il2cpp_class_get_name`, which is TOKEN-GATED and answers a uniform
+  ## random NON-ZERO uint64 on gate mismatch rather than NULL. That pair is
+  ## what killed the client at 10:30:54 (fact #198): every nil check on the
+  ## path passed and the first dereference was 0xC0000005, inside
+  ## `readCString`.
+  ##
+  ## So the gates here are the ones that CAN fail: VirtualQuery on the object
+  ## before its first word is read, VirtualQuery on the class handle before it
+  ## is used, and an EMPTY NAME treated as a refusal -- `readCString` now
+  ## returns "" and bumps `gReadCStringRefusals` when the pointer it was given
+  ## is not readable or is not printable ASCII, which is how a random answer
+  ## announces itself instead of faulting.
+  ##
+  ## This narrows a certain crash to an unlikely one. It does not make a gated
+  ## export safe to call, and a byte-verified static RVA remains the only
+  ## route that bypasses the gate outright.
   if obj == nil:
     return noBinding("::" & member, "no object to bind against")
+  if fastIsReadable(obj, 8'i32) == 0'i32:
+    return noBinding("::" & member,
+                     "the object is non-nil but its first word is not " &
+                     "readable -- refusing to ask it for its class")
   var cls = objectClass(rt, obj)
+  if cls != nil and fastIsReadable(cast[Il2CppPtr](cls), 8'i32) == 0'i32:
+    return noBinding("::" & member,
+                     "il2cpp_object_get_class answered a non-nil value that " &
+                     "is not readable memory. That export validates nothing " &
+                     "(mov rax,[rcx]; ret), so this is what a bad object " &
+                     "looks like -- refusing rather than dereferencing it")
   var name = fullName(rt, cls)
+  if cls != nil and name.len == 0:
+    return noBinding("::" & member,
+                     "the class name came back EMPTY -- il2cpp_class_get_name " &
+                     "is token-gated and answers a random non-zero value on " &
+                     "mismatch, which readCString refused. Nothing was " &
+                     "dereferenced and nothing was bound")
   while cls != nil:
     let b = bindInClass(rt, cls, name, member, argKinds, ret)
     if b.ok:

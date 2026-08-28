@@ -278,20 +278,81 @@ proc missingEssential*(rt: Il2Cpp): seq[string] =
 # Strings
 # ---------------------------------------------------------------------------
 
+var gReadCStringRefusals* = 0
+  ## How many times `readCString` REFUSED a pointer. Non-zero means something
+  ## handed it a value that is not a string; see the comment below for why
+  ## that is the expected failure mode rather than a nil.
+
+proc readCStringPlausible(b: uint8): bool =
+  ## Every string this proc is ever asked for is an IL2CPP name (class,
+  ## namespace, method, field, property, image) or one of the host's own
+  ## static ASCII buffers. None of them contain a byte outside printable
+  ## ASCII plus tab/CR/LF.
+  result = b == 0x09'u8 or b == 0x0a'u8 or b == 0x0d'u8 or
+           (b >= 0x20'u8 and b <= 0x7e'u8)
+
 proc readCString*(p: Il2CppPtr): string =
-  ## Copies a NUL-terminated UTF-8 string the runtime owns.
+  ## Copies a NUL-terminated ASCII string the runtime owns -- or REFUSES.
+  ##
+  ## **THE NIL CHECK BELOW CANNOT FIRE FOR THE CASE THAT KILLED THE CLIENT,
+  ## AND THAT IS WHY THE REST OF THIS PROC EXISTS.** Measured (fact #198,
+  ## `docs/IL2CPP_EXPORTS.md`): 38 of the 241 `il2cpp_*` exports are
+  ## TOKEN-GATED -- they take a trailing 32-byte token argument the stock
+  ## signature does not have and `memcmp` it before doing any work. On
+  ## mismatch they do not return NULL and do not abort: they tail-call a trap
+  ## that seeds a per-thread MT19937-64 and returns a uniform random
+  ## **non-zero** uint64. `il2cpp_class_get_name` is one of them. So `p != nil`
+  ## passes, the first `byteAt` dereferences a random address, and the process
+  ## dies with 0xC0000005 -- which is exactly what took the client down at
+  ## 10:30:54 through `fov`'s `bindOnObject -> fullName -> className` chain,
+  ## faulting at +0x31 inside this loop.
+  ##
+  ## A nil check is therefore not a check. What follows is: a VirtualQuery on
+  ## the pointer (a random 64-bit address is overwhelmingly not committed
+  ## readable memory) re-run at every page-sized step, and a printable-ASCII
+  ## gate on every byte (a random address that IS mapped is overwhelmingly not
+  ## an ASCII identifier). Both can fail on real input and both say so by
+  ## returning "" and bumping `gReadCStringRefusals`, which every caller
+  ## already treats as "the runtime did not answer" -- `className`,
+  ## `classNamespace`, `methodName`, `fieldName`, `propertyName`, `imageName`
+  ## and `typeName` all return "" when the export is simply absent.
+  ##
+  ## This is a refusal, not a guarantee. It narrows a certain crash to an
+  ## unlikely one; it does not make a gated export safe to call.
   result = ""
   if p == nil:
     return
+  # One byte, not a fixed span: a short name legitimately sits at the tail of
+  # a committed region, and demanding N readable bytes would REFUSE it. The
+  # page-boundary re-check below is what keeps that sound -- VirtualQuery
+  # approves a whole region, so the only way a walk leaves approved memory is
+  # by crossing into the next page.
+  const Page = 0x1000'u64
+  if isReadable(p, 1'i32) == 0'i32:
+    gReadCStringRefusals = gReadCStringRefusals + 1
+    return
+  let base = cast[uint64](p)
   var i = 0'u64
   while true:
+    if i > 0'u64 and ((base + i) mod Page) == 0'u64:
+      # Every hop re-checked, not just the first.
+      if isReadable(cast[Il2CppPtr](base + i), 1'i32) == 0'i32:
+        gReadCStringRefusals = gReadCStringRefusals + 1
+        result = ""
+        return
     let b = byteAt(p, i)
     if b == 0'u8:
       break
+    if not readCStringPlausible(b):
+      gReadCStringRefusals = gReadCStringRefusals + 1
+      result = ""
+      return
     result.add char(b)
     i = i + 1'u64
     if i > 4096'u64:   # a runaway read means the pointer was not a string
-      break
+      gReadCStringRefusals = gReadCStringRefusals + 1
+      result = ""
+      return
 
 # ---------------------------------------------------------------------------
 # The typed API
