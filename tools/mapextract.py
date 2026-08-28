@@ -686,6 +686,10 @@ def extract_scene(ddir, level_path, out_dir, scene_label, convert=True,
         rec["worldBBoxMax"] = [max(p[i] for p in wpts) for i in range(3)]
         origin = _xform(world_m, (0.0, 0.0, 0.0))
         rec["worldOrigin"] = list(origin)
+        # NOTE: these are UNITY world coordinates, composed from the raw
+        # Transform chain.  The glTF verifier reports its bbox in glTF space,
+        # where X is negated -- do not compare the two numbers directly.
+        rec["coordinateSpace"] = "unity"
 
         mi = builder.add_mesh("terrain_" + (td["name"] or name), verts, normals,
                               uvs, [idx], [material_index(
@@ -1219,7 +1223,8 @@ def cmd_extract(args):
     tex_exporter = None
     if not args.no_textures:
         tex_exporter = TEX.TextureExporter(os.path.join(root, "_textures"),
-                                           mode=args.tex_format)
+                                           mode=args.tex_format,
+                                           compat=args.dds_compat)
     results = []
     for sc in info["scenes"]:
         i = idx.get(sc["path"])
@@ -1265,9 +1270,9 @@ def cmd_extract(args):
     if tex_exporter is not None:
         s = tex_exporter.stats
         print("\ntextures: %d unique written (%s), %d references deduped (%s saved), "
-              "%d UNRESOLVED" % (s["exported"], human(s["bytesWritten"]),
-                                 s["deduped"], human(s["bytesSaved"]),
-                                 s["unresolved"]))
+              "%d PARTIAL, %d UNRESOLVED"
+              % (s["exported"], human(s["bytesWritten"]), s["deduped"],
+                 human(s["bytesSaved"]), s["partial"], s["unresolved"]))
     print("\noutput: %s" % out_dir)
 
 
@@ -1284,7 +1289,7 @@ def verify_sidecars(out_dir, base, tex_dir):
     Terrain: the per-terrain verdict is recomputed here from the recorded
     declaredSize and vertex counts rather than trusted from the manifest.
     """
-    det = {"slotsOK": 0, "slotsUnresolved": 0, "slotsEmpty": 0,
+    det = {"slotsOK": 0, "slotsUnresolved": 0, "slotsPartial": 0, "slotsEmpty": 0,
            "filesChecked": 0, "filesMissing": 0, "headerMismatch": 0,
            "terrainPass": 0, "terrainFail": 0, "terrainInconclusive": 0,
            "failures": []}
@@ -1299,14 +1304,21 @@ def verify_sidecars(out_dir, base, tex_dir):
                 if st == "EMPTY":
                     det["slotsEmpty"] += 1
                     continue
-                if st != "OK":
+                if st == "PARTIAL":
+                    det["slotsPartial"] += 1
+                    if len(det["failures"]) < 40:
+                        det["failures"].append(
+                            "PARTIAL slot %s on material %s: %s"
+                            % (t.get("slot"), m.get("name"), t.get("caveat") or "?"))
+                elif st != "OK":
                     det["slotsUnresolved"] += 1
                     if len(det["failures"]) < 40:
                         det["failures"].append(
                             "UNRESOLVED slot %s on material %s: %s"
                             % (t.get("slot"), m.get("name"), t.get("reason") or st))
                     continue
-                det["slotsOK"] += 1
+                else:
+                    det["slotsOK"] += 1
                 fn = t.get("file")
                 if not fn:
                     det["failures"].append("slot %s claims OK with no file" % t.get("slot"))
@@ -1401,10 +1413,11 @@ def cmd_verify(args):
         sc = verify_sidecars(out_dir, b, tex_dir)
         side.append(sc)
         if sc["slotsOK"] or sc["slotsUnresolved"] or sc["terrainPass"] or sc["terrainFail"]:
-            print("         textures: %d slots OK / %d UNRESOLVED / %d empty; "
+            print("         textures: %d slots OK / %d PARTIAL / %d UNRESOLVED / %d empty; "
                   "%d files checked, %d missing, %d header mismatch"
-                  % (sc["slotsOK"], sc["slotsUnresolved"], sc["slotsEmpty"],
-                     sc["filesChecked"], sc["filesMissing"], sc["headerMismatch"]))
+                  % (sc["slotsOK"], sc["slotsPartial"], sc["slotsUnresolved"],
+                     sc["slotsEmpty"], sc["filesChecked"], sc["filesMissing"],
+                     sc["headerMismatch"]))
             if sc["terrainPass"] or sc["terrainFail"] or sc["terrainInconclusive"]:
                 print("         terrain:  %d PASS / %d FAIL / %d INCONCLUSIVE"
                       % (sc["terrainPass"], sc["terrainFail"], sc["terrainInconclusive"]))
@@ -1418,9 +1431,11 @@ def cmd_verify(args):
                 agg[k] = agg.get(k, 0) + v
     print("\n%s" % ", ".join("%s=%d" % kv for kv in sorted(verdicts.items())))
     if agg:
-        print("textures: %d slots resolved, %d UNRESOLVED, %d files missing, "
-              "%d header mismatches" % (agg.get("slotsOK", 0), agg.get("slotsUnresolved", 0),
-                                        agg.get("filesMissing", 0), agg.get("headerMismatch", 0)))
+        print("textures: %d slots resolved, %d PARTIAL, %d UNRESOLVED, %d files "
+              "missing, %d header mismatches"
+              % (agg.get("slotsOK", 0), agg.get("slotsPartial", 0),
+                 agg.get("slotsUnresolved", 0), agg.get("filesMissing", 0),
+                 agg.get("headerMismatch", 0)))
         print("terrain:  %d PASS / %d FAIL / %d INCONCLUSIVE"
               % (agg.get("terrainPass", 0), agg.get("terrainFail", 0),
                  agg.get("terrainInconclusive", 0)))
@@ -1456,6 +1471,11 @@ def main(argv=None):
                    help="do not export texture images (names only, old behaviour)")
     p.add_argument("--tex-format", choices=("dds", "png"), default="dds",
                    help="dds = lossless block copy (default); png = decode, lossy for BC")
+    p.add_argument("--dds-compat", action="store_true",
+                   help="emit plain FourCC DXT1/DXT5 even for sRGB textures. "
+                        "MEASURED: Pillow cannot decode the sRGB-typed DX10 form "
+                        "(DXGI 72/78); with this flag the colour space survives "
+                        "only in the sidecar, not in the container")
     p.add_argument("--no-terrain", action="store_true",
                    help="do not emit terrain grid meshes")
     p.add_argument("--terrain-stride", type=int, default=1,

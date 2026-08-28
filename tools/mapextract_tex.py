@@ -103,7 +103,7 @@ def _dx10_header(dxgi, cube=False):
     return struct.pack("<IIIII", dxgi, 3, misc, 1, 0)
 
 
-def build_dds(fmt, width, height, mips, srgb, data, cube=False):
+def build_dds(fmt, width, height, mips, srgb, data, cube=False, compat=False):
     """Wrap raw Unity image bytes in a DDS. Returns (bytes, dds_format_note)
     or (None, reason) when the format is not directly wrappable."""
     if fmt in _BC:
@@ -112,7 +112,7 @@ def build_dds(fmt, width, height, mips, srgb, data, cube=False):
         bh = max(1, (height + blk_dim - 1) // blk_dim)
         linear_size = bw * bh * blk_bytes
         dxgi = dxgi_s if (srgb and dxgi_s is not None) else dxgi_u
-        use_dx10 = fourcc is None or cube or (srgb and dxgi_s is not None)
+        use_dx10 = fourcc is None or cube or (srgb and dxgi_s is not None and not compat)
         if use_dx10:
             hdr = _dds_header(width, height, mips, DDPF_FOURCC, b"DX10", 0,
                               (0, 0, 0, 0), linear_size, True, cube)
@@ -161,16 +161,25 @@ def parse_dds(blob):
 class TextureExporter(object):
     """Content-hash-deduplicated texture writer shared across scenes/maps."""
 
-    def __init__(self, tex_dir, mode="dds", verbose=True):
+    def __init__(self, tex_dir, mode="dds", verbose=True, compat=False):
         self.tex_dir = tex_dir
         self.mode = mode
+        # compat=True emits the plain FourCC DXT1/DXT5 form for BC1/BC3 even
+        # when the texture is sRGB.  MEASURED trade-off: Pillow 11 decodes the
+        # FourCC and linear DX10 files but raises "Unimplemented DXGI format
+        # 72/78" on the sRGB-typed ones, so many simple readers will choke on
+        # the correct file.  Default is still the sRGB-typed DX10, because the
+        # container then states its own colour space and cannot be silently
+        # gamma-decoded (fact #36); with compat the colour space survives only
+        # in the sidecar's colorSpace field.
+        self.compat = compat
         self.verbose = verbose
         os.makedirs(tex_dir, exist_ok=True)
         self.by_ref = {}      # "fid:pid" (scene-scoped) -> record
         self.by_hash = {}     # sha256 -> filename
         self.records = {}     # filename -> record
         self.stats = {"exported": 0, "deduped": 0, "unresolved": 0,
-                      "bytesWritten": 0, "bytesSaved": 0}
+                      "partial": 0, "bytesWritten": 0, "bytesSaved": 0}
         self.unresolved = []
 
     def _fail(self, ref, name, reason):
@@ -234,7 +243,8 @@ class TextureExporter(object):
             if blob is None:
                 return self._fail(ref, name, note)
         else:
-            blob, note = build_dds(fmt, width, height, mips, srgb, data, cube)
+            blob, note = build_dds(fmt, width, height, mips, srgb, data, cube,
+                                   self.compat)
             ext = ".dds"
             if blob is None:
                 # crunched / exotic formats have no lossless container path
@@ -242,6 +252,17 @@ class TextureExporter(object):
                 if blob is None:
                     return self._fail(ref, name, note + "; png fallback: " + note2)
                 note = note + "; DECODED to PNG instead"
+
+        # A cubemap that fell through to the PNG decode keeps only what PIL
+        # hands back -- the other five faces are gone.  That must NOT read as
+        # a clean success, so it is PARTIAL, counted and reported separately.
+        status = "OK"
+        caveat = None
+        if cube and ext == ".png":
+            status = "PARTIAL"
+            caveat = ("cubemap flattened by the PNG decode: faces beyond the "
+                      "first are NOT present in this file")
+            self.stats["partial"] += 1
 
         fn = "%s.%s%s" % (safe, digest[:12], ext)
         path = os.path.join(self.tex_dir, fn)
@@ -252,12 +273,14 @@ class TextureExporter(object):
         self.stats["exported"] += 1
         self.stats["bytesWritten"] += len(blob)
         rec = {
-            "ref": ref, "name": name, "status": "OK", "file": fn,
+            "ref": ref, "name": name, "status": status, "file": fn,
             "width": width, "height": height, "mipCount": mips,
             "unityFormat": format_name(fmt), "unityFormatId": fmt,
             "colorSpace": colour_space, "container": note,
             "sha256": digest, "dedup": False, "cubemap": cube,
         }
+        if caveat:
+            rec["caveat"] = caveat
         self.records[fn] = rec
         return rec
 
@@ -365,7 +388,7 @@ def read_material(env, from_file, ptr, deref, try_name, tex_exporter, tex_cache)
 
 def summarize(materials):
     """resolved vs unresolved texture-slot counts across a material list."""
-    resolved = unresolved = empty = 0
+    resolved = unresolved = empty = partial = 0
     for m in materials:
         for t in m.get("textures", []):
             st = t.get("status")
@@ -373,7 +396,9 @@ def summarize(materials):
                 empty += 1
             elif st == "OK":
                 resolved += 1
+            elif st == "PARTIAL":
+                partial += 1
             else:
                 unresolved += 1
     return {"slotsResolved": resolved, "slotsUnresolved": unresolved,
-            "slotsEmpty": empty}
+            "slotsPartial": partial, "slotsEmpty": empty}
