@@ -13,16 +13,39 @@
  * And nothing appeared on screen.
  *
  * That is the whole reason this file exists, and the shape of the bug is the
- * one CLAUDE.md 9b names: eight checks that could each only say yes. Creation
- * was never the missing piece. LAYOUT was. A `RectTransform` fresh out of
- * `AddComponent` has `sizeDelta == (0,0)`; a UI element with a zero-area rect
- * renders exactly nothing while every call on the way there reports success.
+ * one CLAUDE.md 9b names: eight checks that could each only say yes.
+ *
+ * THE FIRST HYPOTHESIS WAS WRONG, AND THIS LAYER MEASURED IT WRONG ITSELF
+ * ----------------------------------------------------------------------
+ * The hypothesis was: creation works, LAYOUT is missing -- a `RectTransform`
+ * fresh out of `AddComponent` has `sizeDelta == (0,0)`, and a zero-area rect
+ * renders nothing while every call reports success.
+ *
+ * `nuProofRun` was written to MEASURE that rather than assume it: read the
+ * rect back before laying out, and again after. Live, first run, it read
+ *
+ *     rect BEFORE layout = (-50.0, -50.0, 100.0, 100.0)  renderable=true
+ *
+ * So a fresh RectTransform on this build is Unity's default 100x100 centred on
+ * its anchor -- NOT zero-area, and renderable by any measure this layer has.
+ * The zero-area hypothesis is FALSIFIED. Whatever made the invoke2 label
+ * invisible, it was not a zero-size rect.
+ *
+ * That is the before/after measurement doing its job, and it is worth being
+ * blunt about: had the proof asserted the hypothesis instead of measuring it,
+ * this file would now contain a confident, wrong explanation with live
+ * "evidence" behind it. Layout is still REQUIRED -- an element at Unity's
+ * default position and size is not where a caller wants it -- but it is no
+ * longer claimed as the cause of anything. The cause is still open; the log
+ * lines that would narrow it are in `nuProofRun`.
  *
  * So this layer is built around three commitments:
  *
  *   1. Every element it creates is LAID OUT before it is shown -- anchors,
  *      pivot, size and position are not optional arguments, they are part of
- *      creating a thing at all.
+ *      creating a thing at all. (Not because a missing layout was proven to
+ *      cause invisibility -- see above, it was not -- but because Unity's
+ *      default 100x100 at the anchor centre is never what a caller meant.)
  *   2. Every element it creates is PROVED against the finished state: read the
  *      rect back, read the text back, read `activeInHierarchy` back. A
  *      self-comparison ("the size I wrote is the size I meant") is banned.
@@ -387,6 +410,56 @@ static int32_t aowl_nu_verified = 0;
 static int32_t aowl_nu_rejected = 0;
 static int32_t aowl_nu_faults   = 0;
 
+/* WHY A TARGET WAS REFUSED -- and the live bug that made this necessary.
+ *
+ * The first live run of this layer logged, at boot:
+ *
+ *   nativeui: 0 of 25 managed targets verified ... (25 REJECTED)
+ *
+ * and then, at the proof, went on to add a component and read back a real
+ * rect. Both statements were true of different things, and the first one was
+ * a LIE about the second. `aowl_nu_fn` returns NULL for five distinct
+ * reasons, only ONE of which is "the bytes are not what this build's metadata
+ * says"; the census counted all five as a rejection and named them all as a
+ * failed prologue verify. The actual reason was the benign one --
+ * GameAssembly.dll was not loaded yet, because the census ran too early in
+ * host startup.
+ *
+ * Twenty-five confident, wrong warnings blaming the game build. That is the
+ * P0 shape this repo keeps paying for: a diagnostic that asserts a cause it
+ * did not measure. So the reason is now RECORDED per refusal, and the census
+ * reports the breakdown rather than one number that flattens five causes into
+ * the scariest of them. */
+#define AOWL_NU_WHY_OK          0
+#define AOWL_NU_WHY_NO_MODULE   1   /* GameAssembly.dll not loaded (yet)     */
+#define AOWL_NU_WHY_NOT_COMMIT  2   /* the RVA is not committed memory       */
+#define AOWL_NU_WHY_NOT_EXEC    3   /* committed, but not executable         */
+#define AOWL_NU_WHY_MISMATCH    4   /* THE REAL ONE: bytes differ            */
+#define AOWL_NU_WHY_DISABLED    5   /* the layer has self-disabled           */
+#define AOWL_NU_WHY_BADINDEX    6
+
+static int32_t aowl_nu_why[AOWL_NU_TARGET_COUNT];
+
+/* Is GameAssembly.dll even loaded? The census must ask this ONCE, up front,
+ * instead of letting 25 targets each discover it and each blame the build.
+ * `aowl_mi2_base_ok` exists for exactly the same reason. */
+static int32_t aowl_nu_base_ok(void) {
+    return GetModuleHandleA("GameAssembly.dll") ? 1 : 0;
+}
+static int32_t aowl_nu_why_of(int32_t i) {
+    if (i < 0 || i >= AOWL_NU_TARGET_COUNT) return AOWL_NU_WHY_BADINDEX;
+    return aowl_nu_why[i];
+}
+/* How many targets were refused for THE REAL REASON -- a byte mismatch --
+ * as opposed to "the module is not loaded yet". The census prints both, so a
+ * stale-RVA build and an early call can never again read the same. */
+static int32_t aowl_nu_mismatch_count(void) {
+    int32_t i, n = 0;
+    for (i = 0; i < AOWL_NU_TARGET_COUNT; i++)
+        if (aowl_nu_why[i] == AOWL_NU_WHY_MISMATCH) n++;
+    return n;
+}
+
 /* Six faults is enough to distinguish "one bad frame" from "this build is not
  * the build these RVAs came from"; past it the layer refuses everything. */
 #define AOWL_NU_MAX_FAULTS 6
@@ -426,20 +499,26 @@ static void* aowl_nu_fn(int32_t i) {
     unsigned char* p;
     MEMORY_BASIC_INFORMATION mbi;
     if (i < 0 || i >= AOWL_NU_TARGET_COUNT) return NULL;
-    if (aowl_nu_disabled()) return NULL;
+    if (aowl_nu_disabled()) { aowl_nu_why[i] = AOWL_NU_WHY_DISABLED; return NULL; }
     ga = GetModuleHandleA("GameAssembly.dll");
-    if (!ga) return NULL;
+    if (!ga) { aowl_nu_why[i] = AOWL_NU_WHY_NO_MODULE; return NULL; }
     t = &aowl_nu_targets[i];
     p = (unsigned char*)ga + t->rva;
-    if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0) return NULL;
-    if (mbi.State != MEM_COMMIT) return NULL;
-    if (!(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
-                         PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY)))
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0 || mbi.State != MEM_COMMIT) {
+        aowl_nu_why[i] = AOWL_NU_WHY_NOT_COMMIT;
         return NULL;
+    }
+    if (!(mbi.Protect & (PAGE_EXECUTE | PAGE_EXECUTE_READ |
+                         PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY))) {
+        aowl_nu_why[i] = AOWL_NU_WHY_NOT_EXEC;
+        return NULL;
+    }
     if (t->siglen > 0 && !aowl_pro_verify(t->rva, t->sig, t->siglen)) {
+        aowl_nu_why[i] = AOWL_NU_WHY_MISMATCH;
         aowl_nu_rejected++;
         return NULL;
     }
+    aowl_nu_why[i] = AOWL_NU_WHY_OK;
     aowl_nu_verified++;
     return (void*)p;
 }
@@ -839,8 +918,12 @@ static int32_t aowl_nu_own(void* go) {
     return 1;
 }
 static int32_t aowl_nu_owned_count(void) { return g_nu_owned_n; }
+/* Bounded by BOTH the live count and the array size. The count alone would be
+ * enough if `g_nu_owned_n` could never be wrong -- which is exactly the kind of
+ * assumption this host does not get to make about its own state after a
+ * caught fault. gcc's -Warray-bounds flagged it, and it was right to. */
 static void*   aowl_nu_owned_at(int32_t i) {
-    if (i < 0 || i >= g_nu_owned_n) return NULL;
+    if (i < 0 || i >= g_nu_owned_n || i >= AOWL_NU_MAX_OWNED) return NULL;
     return g_nu_owned[i];
 }
 static void aowl_nu_owned_clear(void) {
