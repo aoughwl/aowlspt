@@ -47,6 +47,9 @@ const
     ## if that cycle changes, change this, or the panel will call a normal
     ## wait a failure.
   ClientSyncRoute = "/aowlspt/settings/client/sync"
+  ClientStatusPrefix = "/aowlspt/settings/client/status/"
+    ## Read-only. Longer than `ClientPagePrefix`, and the backend gives the
+    ## LONGEST prefix priority, so this wins over the page fallback.
   ClientPagePrefix = "/aowlspt/settings/"
     ## A FALLBACK prefix, deliberately. `matchRoute` in the backend gives an
     ## exact route priority over any prefix and the longest prefix priority
@@ -142,6 +145,7 @@ type
     count, done: int
     rows: string        ## the schema array, verbatim as the mod emitted it
     stamp: int          ## sync number this page last arrived on
+    pushes: int         ## how many times THIS guid has been pushed, ever
 
 var gClientPages: seq[ClientPage] = @[]
 var gClientPending: seq[string] = @[]   ## queued edits, oldest first
@@ -172,8 +176,12 @@ proc onClientSync(url, body, session: string): string =
   if pg.name.len == 0: pg.name = pg.guid
   if pg.rows.len == 0: pg.rows = "[]"
   let i = clientIndexOf(pg.guid)
-  if i >= 0: gClientPages[i] = pg
-  else: gClientPages.add pg
+  if i >= 0:
+    pg.pushes = gClientPages[i].pushes + 1
+    gClientPages[i] = pg
+  else:
+    pg.pushes = 1
+    gClientPages.add pg
   root.put("ok", true)
   var pend = arr()
   for e in gClientPending:
@@ -258,6 +266,69 @@ proc onClientPage(url, body, session: string): string =
            "dropping the edit for " & want & " rather than growing without bound"
   result = gClientPages[i].rows
 
+proc clientPendingHas(guid, key: string): bool =
+  ## Is an edit for exactly this (guid, key) still sitting in the queue --
+  ## i.e. never yet handed to the game process? Bounded by the queue cap (64).
+  for e in gClientPending:
+    if jr.asText(jr.field(e, "guid"), "") == guid and
+       jr.asText(jr.field(e, "key"), "") == key:
+      return true
+  false
+
+proc onClientStatus(url, body, session: string): string =
+  ## `GET /aowlspt/settings/client/status/<guid>?key=<key>` -- WHERE IN THE
+  ## PIPELINE an edit is. Read-only; queues nothing, changes nothing.
+  ##
+  ## This route exists because the F12 panel could not previously tell "the
+  ## value did not take" from "the value has not got there YET", and so
+  ## reported a working write as NOT APPLIED. An edit to a client-side mod
+  ## travels: POST -> queued here -> drained on the game's next
+  ## `client/sync` push -> applied in the game process -> visible only on the
+  ## push AFTER that. That is TWO pushes of this guid, not one, which is why
+  ## a wall-clock patience tuned to one cycle went red on the working path.
+  ##
+  ##   {"known":bool,      -- has this guid ever pushed a page?
+  ##    "pending":bool,    -- this exact (guid,key) is still queued, undrained
+  ##    "pushes":int,      -- pushes of THIS guid, ever; monotonic
+  ##    "stamp":int,       -- global sync number this page last arrived on
+  ##    "syncs":int}       -- global sync count
+  ##
+  ## A caller confirms a write by waiting for `pending == false` AND
+  ## `pushes >= pushes-at-POST + 2`, and only THEN comparing the row value.
+  ## Before that window opens no verdict is available -- which is
+  ## INCONCLUSIVE, not a failure.
+  var want = pathAfter(url, ClientStatusPrefix)
+  var key = ""
+  var cut = -1
+  for ci in 0 ..< want.len:
+    if want[ci] == '?':
+      cut = ci
+      break
+  if cut >= 0:
+    let q = want.substr(cut + 1, want.len - 1)
+    want = want.substr(0, cut - 1)
+    if q.len > 4 and q.substr(0, 3) == "key=":
+      key = q.substr(4, q.len - 1)
+  var root = obj()
+  root.put("guid", want)
+  root.put("key", key)
+  root.put("syncs", gClientSyncs)
+  root.put("pending", key.len > 0 and clientPendingHas(want, key))
+  root.put("pendingCount", gClientPending.len)
+  let i = clientIndexOf(want)
+  if i < 0:
+    # NOT an error: either a server-side mod (whose store is authoritative
+    # immediately, so a caller needs no pipeline window at all) or a
+    # client-side page that has not published yet.
+    root.put("known", false)
+    root.put("pushes", 0)
+    root.put("stamp", 0)
+  else:
+    root.put("known", true)
+    root.put("pushes", gClientPages[i].pushes)
+    root.put("stamp", gClientPages[i].stamp)
+  result = done(root).text
+
 proc onModsIndex(url, body, session: string): string =
   gAnnounced = @[]
   discard emit(settings.SettingsIndexQuery, "")
@@ -294,6 +365,10 @@ proc onLoad(): Status =
   if serve(ClientSyncRoute, onClientSync) != Ok:
     warn "could not register " & ClientSyncRoute &
          " -- client-side mods will stay invisible in the F12 settings nav"
+  if servePrefix(ClientStatusPrefix, onClientStatus) != Ok:
+    warn "could not register " & ClientStatusPrefix &
+         " -- the F12 panel will fall back to a wall-clock wait and may " &
+         "report a slow-but-working client edit as NOT APPLIED"
   if servePrefix(ClientPagePrefix, onClientPage) != Ok:
     warn "could not register " & ClientPagePrefix
   if on(settings.SettingsIndexAnnounce, onAnnounce) != Ok:
