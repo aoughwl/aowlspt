@@ -23,6 +23,8 @@
 import std/[strutils, syncio, cmdline]
 import aowlsptinstall/[winfs, log, eft, payload, compat, plan, journal]
 import aowlsptinstall/registry
+import aowlsptinstall/[tui, versiongate]
+import aowlterm
 
 const Usage = """
 aowlspt-install -- install aowlspt over a Tarkov client
@@ -51,6 +53,9 @@ Options
   --dry-run        print every step, execute none
   -v, --verbose    name every file
   -q, --quiet      errors only
+  --plain          plain lines, no boxes (also the automatic choice when
+                   output is redirected, piped, or the window is too narrow)
+  --ascii          box in ASCII, for a console whose font has no box glyphs
   -h, --help       this
 
 By default the client's asset bundles -- tens of gigabytes of data that nothing
@@ -81,13 +86,16 @@ type
     force: bool
     assumeYes: bool
     help: bool
+    plain: bool
+    ascii: bool
 
 proc parseArgs(): Options =
   result = Options(command: "", source: "", target: "", payloadPath: "",
                    registryPath: "", listId: registry.DefaultList,
                    positional: @[], copyInstead: false, overlay: false,
                    force: false,
-                   assumeYes: false, help: false)
+                   assumeYes: false, help: false,
+                   plain: false, ascii: false)
   var i = 1
   let n = paramCount()
   while i <= n:
@@ -121,6 +129,10 @@ proc parseArgs(): Options =
       setVerbosity vVerbose
     elif a == "--quiet" or a == "-q":
       setVerbosity vQuiet
+    elif a == "--plain":
+      result.plain = true
+    elif a == "--ascii":
+      result.ascii = true
     elif a == "--help" or a == "-h":
       result.help = true
     elif a.startsWith("-"):
@@ -135,6 +147,25 @@ proc confirm(question: string; assumeYes: bool): bool =
   ## A dry run never asks, because it never does anything.
   if assumeYes or dryRun():
     return true
+  # Two things have to happen before a prompt.
+  #
+  # The open box is flushed, because a question drawn inside a box that has no
+  # bottom border yet reads as part of the report rather than as a question.
+  #
+  # And a run with no console on stdin is refused rather than left blocking:
+  # under CI, a pipe or a service, `readLine` either returns immediately at EOF
+  # or waits for a keypress that will never come. The named cause plus `--yes`
+  # is a better outcome than a hung installer with no output.
+  endSection()
+  if not stdinIsConsole():
+    refusal("Cannot ask", @[
+      "This run has no console on stdin, so there is nobody to answer:",
+      "",
+      "  " & strip(question),
+      "",
+      "What to do: re-run with --yes to answer yes in advance, or with",
+      "--dry-run to see what it would do without being asked."])
+    return false
   write stdout, question & " [y/N] "
   flushFile stdout
   var answer = ""
@@ -373,6 +404,27 @@ proc prepare(o: Options; install: var EftInstall; pay: var Payload;
   verdict = evaluate(install, pay, o.force, whole)
   showVerdict(verdict)
 
+  # ------------------------------------------------------------ the hard gate
+  #
+  # Checked after the compatibility verdict so that the person still gets the
+  # whole report -- hiding the findings behind the version refusal would make a
+  # wrong-version install look like it had only one thing wrong with it.
+  #
+  # `--force` is deliberately not consulted. Everything `compat` produces is
+  # either advisory or forcible; this one is neither, and it is the only check
+  # in the program with no way round it.
+  #
+  # The required version comes from `pay.targetTarkov` -- payload.json's
+  # `targetTarkovVersion` -- and nowhere else. No constant here.
+  #
+  # A beta-expiry check (docs/BETA_PROTECTION_DESIGN.md) would go immediately
+  # below this block: same shape, its own pure decision, its own `refusal` box.
+  let gate = gateVersion(pay.targetTarkov, install.version)
+  if not gateAllows(gate):
+    refusal("Wrong Tarkov version -- refusing to install",
+            gateLines(gate, pay.targetTarkov, install.version, pay.version))
+    return false
+
   # Only meaningful for a full install: a target inside the source would be
   # walked by the very copy that creates it, and a source inside the target
   # would be overwritten while being read. An overlay does not copy the client
@@ -445,6 +497,7 @@ proc cmdInstall(o: Options): int =
 
   heading "Installing"
   let stats = apply(p, not o.copyInstead)
+  endProgress()
 
   if dryRun():
     heading "Dry run"
@@ -513,13 +566,25 @@ proc cmdVerify(o: Options): int =
   let lines = eft.describe(install)
   printLines(lines, "  ")
 
-  if known(install.version) and j.tarkovVersion.len > 0 and
-     $install.version != j.tarkovVersion:
-    warn "the client here is " & $install.version & ", but this was " &
-         "installed against " & j.tarkovVersion
+  # Same gate as `install`, with the required version taken from the journal
+  # rather than from a payload -- this is the version the install was actually
+  # made against, recorded at the time, which is the only version this install
+  # is known to work on. It was previously a `warn` that did not change the
+  # exit code, so a scripted verify reported success on a client that had been
+  # updated out from under the install.
+  var driftFailed = false
+  if j.tarkovVersion.len > 0:
+    let g = gateVersion(parseVersion(j.tarkovVersion), install.version)
+    if not gateAllows(g):
+      refusal("The client here is not the one this was installed against",
+              gateLines(g, parseVersion(j.tarkovVersion), install.version,
+                        j.payloadVersion))
+      driftFailed = true
 
   if missing > 0:
     err $missing & " of " & $j.paths.len & " installed paths are gone"
+    return 1
+  if driftFailed:
     return 1
   ok "all " & $j.paths.len & " installed paths are present"
   result = 0
@@ -577,11 +642,47 @@ proc cmdUninstall(o: Options): int =
 
 # --------------------------------------------------------------- main
 
+proc startFrontEnd(o: Options) =
+  ## The one place the terminal is asked anything, and the one place boxing is
+  ## turned on. Everything downstream reads the answer through `log`.
+  ##
+  ## The degrade ladder is the launcher's, in the launcher's order:
+  ##
+  ##   `--plain`                     the escape hatch for a terminal that
+  ##                                 claims VT and then does not honour it.
+  ##   `termMode() != tmFull`        redirected, piped, or a console with no
+  ##                                 VT. `aowlterm` answers this; we do not
+  ##                                 guess from environment variables.
+  ##   `--quiet`                     a run whose output is being scraped.
+  ##   window narrower than a box    `tui.boxUsable`; a 30-column window gets
+  ##                                 wrapped borders, which is worse than none.
+  ##   font with no box glyphs       `--ascii`, or `termAscii()` when the
+  ##                                 console would not take UTF-8.
+  ##
+  ## Failing any of them is not an error and prints no warning: plain output is
+  ## the output this installer has always produced and is completely readable.
+  if o.plain:
+    forcePlain()
+  if o.ascii:
+    forceAscii()
+  let mode = termStart()
+  var w = 0
+  var h = 0
+  termSize(w, h)
+  let boxes = mode == tmFull and verbosity() >= vNormal and tui.boxUsable(w)
+  setBoxed(boxes, w, termAscii(), mode == tmFull)
+
 proc main(): int =
   let o = parseArgs()
   if o.help or o.command.len == 0:
     echo Usage
     return (if o.help: 0 else: 1)
+
+  startFrontEnd(o)
+  banner("aowlspt-install", @[
+    o.command,
+    "the source install is only ever read; everything goes to --target",
+    "this build installs onto ONE Tarkov version and refuses any other"], true)
 
   case o.command
   of "detect": result = cmdDetect(o)
@@ -591,7 +692,23 @@ proc main(): int =
   of "uninstall": result = cmdUninstall(o)
   else:
     err "unknown command: " & o.command
+    endSection()
     echo Usage
     result = 1
+
+  # Every exit path lands here: the last box gets its bottom border, the
+  # progress paint stops tracking, and the console mode is put back. A program
+  # that exits with the console still in raw mode or still hiding the cursor
+  # has broken the shell it was run from.
+  endProgress()
+  endSection()
+  if result == 0:
+    banner("Done", @["no errors"], true)
+  else:
+    banner("Stopped", @[
+      $errorCount() & " error(s), " & $warningCount() & " warning(s)",
+      "nothing above this line was guessed at; each refusal names its cause"],
+      false)
+  termShutdown()
 
 quit(main())

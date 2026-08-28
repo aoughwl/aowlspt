@@ -1011,6 +1011,10 @@ proc buildInstaller(e: Env): bool =
   if e.debugBuild:
     cmd.add " -d:debug"
   cmd.add " -p:" & quoted(joinPath(dir, "src"))
+  # `tools` for aowlterm: the installer's boxed front end uses the same
+  # terminal library the launcher does, rather than a second copy of the
+  # console detection that could disagree with it.
+  cmd.add " -p:" & quoted(joinPath(e.repo, "tools"))
   cmd.add " -o:" & quoted(joinPath(dir, "build\\aowlspt-install.exe"))
   cmd.add " " & quoted(joinPath(dir, "src\\aowlsptinstall.nim"))
   result = run(e, "aowlspt-install", cmd)

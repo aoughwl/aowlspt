@@ -18,7 +18,7 @@
 
 import std/[strutils, syncio, envvars]
 import aowlsptinstall/[winfs, eft, payload, compat, plan, journal, log,
-                       registry]
+                       registry, tui, versiongate]
 
 var passed = 0
 var failed = 0
@@ -529,6 +529,139 @@ proc testLive() =
     if i.backend == bkIl2Cpp:
       check("  IL2CPP implies post-1.0 in practice", isPostOneZero(i.version))
 
+# --------------------------------------------------------- the version gate
+
+proc testVersionGate() =
+  echo "\nversion gate (hard block)"
+
+  let required = parseVersion("1.1.0.46777")
+
+  # The two cases that matter, asserted in BOTH directions. A gate tested only
+  # on the version it is supposed to accept is a gate that cannot fail, which
+  # is the shape of every serious defect this project has had.
+  check("exact match proceeds",
+        gateVersion(required, parseVersion("1.1.0.46777")) == gProceed)
+  check("exact match is allowed",
+        gateAllows(gateVersion(required, parseVersion("1.1.0.46777"))))
+
+  check("a newer build refuses",
+        gateVersion(required, parseVersion("1.1.0.46778")) == gMismatch)
+  check("an older build refuses",
+        gateVersion(required, parseVersion("1.1.0.46776")) == gMismatch)
+  check("a different minor refuses",
+        gateVersion(required, parseVersion("1.2.0.46777")) == gMismatch)
+  check("a pre-1.0 build refuses",
+        gateVersion(required, parseVersion("0.16.9.40743")) == gMismatch)
+
+  # "I could not look" is not a pass.
+  check("an unreadable client version refuses",
+        gateVersion(required, parseVersion("")) == gUnknownDetected)
+  check("  and is not allowed",
+        not gateAllows(gateVersion(required, parseVersion(""))))
+  check("a payload with no target version refuses",
+        gateVersion(parseVersion(""), parseVersion("1.1.0.46777")) ==
+          gNoRequirement)
+  check("  and is not allowed",
+        not gateAllows(gateVersion(parseVersion(""), parseVersion("1.1.0.46777"))))
+
+  # Trailing zeros are the same build, not a different one; refusing over a
+  # formatting difference would be a false refusal.
+  check("trailing zero is the same build",
+        gateVersion(parseVersion("1.1.0"), parseVersion("1.1.0.0")) == gProceed)
+
+  # FALSIFIABILITY. `allowed` is the single yes/no the installer consults, so
+  # the proof that the gate is real is that exactly one of these five inputs
+  # says yes. If `allowed` were ever inverted, or hardwired to true, or
+  # hardwired to false, this count moves off 1 and the test goes red.
+  var yeses = 0
+  if gateAllows(gateVersion(required, parseVersion("1.1.0.46777"))): inc yeses
+  if gateAllows(gateVersion(required, parseVersion("1.1.0.46778"))): inc yeses
+  if gateAllows(gateVersion(required, parseVersion("0.16.9.40743"))): inc yeses
+  if gateAllows(gateVersion(required, parseVersion(""))): inc yeses
+  if gateAllows(gateVersion(parseVersion(""), parseVersion("1.1.0.46777"))):
+    inc yeses
+  checkEq("exactly one of five inputs is allowed", $yeses, "1")
+
+  # A refusal that does not name the two versions is not a legible refusal.
+  let msg = gateLines(gateVersion(required, parseVersion("1.1.0.46778")),
+                      required, parseVersion("1.1.0.46778"), "0.1.0")
+  var joined = ""
+  for l in msg:
+    joined.add l & "\n"
+  check("the refusal names the required version",
+        joined.contains("1.1.0.46777"))
+  check("the refusal names the detected version",
+        joined.contains("1.1.0.46778"))
+  check("the refusal says what to do", joined.contains("What to do"))
+  check("the refusal is not empty on the unknown paths",
+        gateLines(gUnknownDetected, required, parseVersion(""), "").len > 0 and
+        gateLines(gNoRequirement, parseVersion(""), required, "").len > 0)
+
+# ---------------------------------------------------------------- the boxes
+
+proc testTui() =
+  echo "\nboxed layout"
+
+  let g = asciiGlyphs()
+  let box = boxLines(g, "Source", @["root      D:\\Games\\Tarkov",
+                                    "version   1.1.0.46777"], 40,
+                     bsPlain, false)
+  check("a box has a top, a bottom and its body", box.len == 4)
+
+  # The property that matters: every line is the SAME number of columns. A box
+  # that shears is the whole failure mode of drawing one.
+  var ragged = 0
+  for l in box:
+    if colsOf(l) != 40:
+      inc ragged
+  checkEq("every uncoloured line is exactly the box width", $ragged, "0")
+
+  check("the top carries the title", box[0].contains("Source"))
+  check("the top starts and ends with a corner",
+        box[0].startsWith("+") and box[0].endsWith("+"))
+  check("a body row is bordered both sides",
+        box[1].startsWith("|") and box[1].endsWith("|"))
+
+  # UTF-8 glyphs are three bytes and one column. Measured by columns, not by
+  # `len` -- a box measured by byte length shears by two columns per glyph.
+  let ubox = boxLines(unicodeGlyphs(), "Source", @["ok"], 40, bsGood, false)
+  var uragged = 0
+  for l in ubox:
+    if colsOf(l) != 40:
+      inc uragged
+  checkEq("the UTF-8 box is the same width in columns", $uragged, "0")
+  check("  and is wider in bytes than in columns", ubox[0].len > 40)
+
+  # Overlong content is clipped, never wrapped, and clipping keeps the width.
+  let long = "D:\\Games\\Tarkov\\EscapeFromTarkov_Data\\StreamingAssets\\" &
+             "Windows\\assets\\content\\location_bigmap\\bundle_name.bundle"
+  let cbox = boxLines(g, "Paths", @[long], 40, bsPlain, false)
+  checkEq("a clipped row is still the box width", $colsOf(cbox[1]), "40")
+  check("  and is marked as clipped", cbox[1].contains("~"))
+
+  # An overlong title cannot push the corner off the end.
+  let tbox = boxLines(g, long, @["x"], 40, bsPlain, false)
+  checkEq("an overlong title is clipped to the width", $colsOf(tbox[0]), "40")
+
+  checkEq("fitCols leaves a short string alone", fitCols("abc", 10), "abc")
+  checkEq("fitCols counts columns not bytes", $colsOf("──"), "2")
+
+  # Degrade: `boxUsable` is what makes the installer fall back to plain lines.
+  check("no console (width 0) is not boxable", not boxUsable(0))
+  check("a 30-column window is not boxable", not boxUsable(30))
+  check("an 80-column window is boxable", boxUsable(80))
+  check("width is clamped up", clampWidth(10) == MinBoxWidth)
+  check("width is clamped down", clampWidth(400) == MaxBoxWidth)
+
+  # Progress.
+  check("an empty bar is empty", bar(0, 10, true) == "..........")
+  check("a full bar is full", bar(10, 10, true) == "##########")
+  check("a bar cannot overflow", bar(99, 4, true) == "####")
+  check("no denominator prints a count, not a bar",
+        progressLine(7, 0, 10, true) == "  7 files")
+  check("a denominator prints a bar",
+        progressLine(5, 10, 10, true).contains("5 / 10"))
+
 proc main() =
   setVerbosity vQuiet
   testPaths()
@@ -540,6 +673,8 @@ proc main() =
   testPlan()
   testPayload()
   testRegistry()
+  testVersionGate()
+  testTui()
   testLive()
 
   echo ""

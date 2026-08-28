@@ -276,8 +276,14 @@ proc apply*(p: Plan; mirror: bool): ApplyStats =
                       dirsCreated: 0, bytesCopied: 0'i64, failures: 0,
                       created: @[])
 
+  # Step index is tracked so the front end can draw a progress bar. `apply`
+  # still says what it is doing on every path; `progressStep` degrades to the
+  # `say` this used to be whenever there is no console to repaint on, under
+  # `--verbose`, and under `--dry-run`.
+  var stepNo = 0
   for s in p.steps:
-    say describe(s)
+    inc stepNo
+    progressStep(stepNo, p.steps.len, describe(s))
     if dryRun():
       continue
 
