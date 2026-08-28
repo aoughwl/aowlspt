@@ -323,10 +323,19 @@ static void aowl_gt_survey(void) {
             aowl_gt_refused++;
             continue;
         }
-        /* Obtaining a nonce ARMS a TLS slot ON THIS THREAD ONLY and is
-         * single-use; leaving one armed affects nothing else in the process. */
-        tok = aowl_gate_token(i, &why);
-        if (tok && aowl_is_readable(tok, AOWL_GATE_TOKEN_BYTES)) {
+        /* `aowl_gate_can_arm`, NOT `aowl_gate_token`. The earlier version of
+         * this loop called `aowl_gate_token`, which for a nonce row calls
+         * `il2cpp_nonce` and ARMS a single-use TLS slot that only the export
+         * can consume. Surveying 17 nonce rows therefore left 17 slots armed
+         * on the host thread, which disabled the zero-slot early-out that had
+         * been silently protecting every stock-signature by-name call in the
+         * codebase, and the next such call died in memcmp at +0x6206E0 about a
+         * second later. The comment that used to sit here said leaving a slot
+         * armed "affects nothing else in the process". It killed the client.
+         *
+         * A survey must never change the state it is surveying. */
+        tok = aowl_gate_can_arm(i, &why) ? (void*)1 : (void*)0;
+        if (tok) {
             if (aowl_gate_rows[i].kind == AOWL_GATE_KIND_STATIC)
                 aowl_gt_armed_static++;
             else
@@ -368,6 +377,22 @@ static void aowl_gt_run(void) {
         else if (aowl_gt_cases[i].verdict == AOWL_GT_FAIL) aowl_gt_fail++;
         else                                              aowl_gt_inconc++;
     }
+
+    /* THE CHECK THAT DID NOT FIRE THE FIRST TIME, and the only one that would
+     * have caught what actually killed the client. It is a property of the
+     * FINISHED STATE and it is a NEGATIVE, so it can be falsified: when this
+     * self-test is over, NO nonce slot may be left armed on this thread.
+     *
+     * The fault counter could never have caught it: the crash happened in a
+     * caller that does not go through `aowl_gate_call` at all, which is why
+     * the first live run logged "0 faulted" and died anyway. */
+    if (aowl_gate_nonce_outstanding_count() != 0) {
+        aowl_gt_pass = 0;
+        aowl_gt_fail = 0;
+        aowl_gt_inconc = aowl_gt_ran;
+        for (i = 0; i < AOWL_GT_CASES; i++)
+            aowl_gt_cases[i].verdict = AOWL_GT_INCONCLUSIVE;
+    }
 }
 
 /* ---- read-out for the Nim side (no allocation, caller-owned buffer) ------ */
@@ -377,7 +402,12 @@ static int32_t aowl_gt_pass_count(void)          { return aowl_gt_pass; }
 static int32_t aowl_gt_fail_count(void)          { return aowl_gt_fail; }
 static int32_t aowl_gt_inconc_count(void)        { return aowl_gt_inconc; }
 static int32_t aowl_gt_static_armed(void)        { return aowl_gt_armed_static; }
-static int32_t aowl_gt_nonce_armed(void)         { return aowl_gt_armed_nonce; }
+/* ARMABLE, not ARMED: for a nonce row this is a structural claim from the
+ * generated map, because MEASURING it would mean arming a slot. */
+static int32_t aowl_gt_nonce_armable(void)       { return aowl_gt_armed_nonce; }
+/* Non-zero means this thread has a nonce slot armed that no export consumed,
+ * i.e. the next stock-signature by-name call on it will fault in memcmp. */
+static int32_t aowl_gt_leaked_arms(void)         { return aowl_gate_nonce_outstanding_count(); }
 static int32_t aowl_gt_refused_count(void)       { return aowl_gt_refused; }
 static int32_t aowl_gt_prologue_bad_count(void)  { return aowl_gt_prologue_bad; }
 static int32_t aowl_gt_fault_count(void)         { return aowl_gate_faults; }

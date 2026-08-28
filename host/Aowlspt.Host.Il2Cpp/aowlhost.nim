@@ -854,7 +854,8 @@ proc cGtPassCount(): int32 {.importc: "aowl_gt_pass_count", nodecl.}
 proc cGtFailCount(): int32 {.importc: "aowl_gt_fail_count", nodecl.}
 proc cGtInconcCount(): int32 {.importc: "aowl_gt_inconc_count", nodecl.}
 proc cGtStaticArmed(): int32 {.importc: "aowl_gt_static_armed", nodecl.}
-proc cGtNonceArmed(): int32 {.importc: "aowl_gt_nonce_armed", nodecl.}
+proc cGtNonceArmable(): int32 {.importc: "aowl_gt_nonce_armable", nodecl.}
+proc cGtLeakedArms(): int32 {.importc: "aowl_gt_leaked_arms", nodecl.}
 proc cGtRefused(): int32 {.importc: "aowl_gt_refused_count", nodecl.}
 proc cGtPrologueBad(): int32 {.importc: "aowl_gt_prologue_bad_count", nodecl.}
 proc cGtFaults(): int32 {.importc: "aowl_gt_fault_count", nodecl.}
@@ -7355,8 +7356,8 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
               "other did not; treat by-name as UNPROVEN"
             else: "INCONCLUSIVE -- nothing was proven either way"
           info "il2cpp gates: " & $int(cGtStaticArmed()) & " of " &
-               "22 static ARMED, " & $int(cGtNonceArmed()) & " of 18 " &
-               "nonce ARMED, " & $int(cGtRefused()) & " refused (" &
+               "22 static ARMED, " & $int(cGtNonceArmable()) & " of 18 " &
+               "nonce ARMABLE, " & $int(cGtRefused()) & " refused (" &
                $int(cGtPrologueBad()) & " on prologue), " &
                $int(cGtFaults()) & " faulted; self-test " &
                $int(cGtPassCount()) & " PASS / " & $int(cGtFailCount()) &
@@ -7364,6 +7365,23 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
                verdict
           if cGtRefused() > 0:
             info "il2cpp gates: first refusal was " & $cGtFirstRefusal()
+          # A LEAKED NONCE ARM is worse than a FAIL and is checked first.
+          # `il2cpp_nonce` arms a single-use TLS slot that only the export
+          # itself consumes. A slot left armed disables the zero-slot
+          # early-out that has been silently protecting every
+          # stock-signature by-name call in this codebase -- the ~20 in
+          # mods/sain among them -- and the next one dies in memcmp at
+          # GameAssembly.dll+0x6206E0. That is exactly how this layer killed
+          # the client on its first live run, about a second after logging
+          # a clean 2 PASS / 0 FAIL / 0 faulted.
+          if cGtLeakedArms() != 0'i32:
+            cGateSetEnabled(0'i32)
+            fail "il2cpp gates: DISARMED -- the self-test left " &
+                 $int(cGtLeakedArms()) & " nonce slot(s) ARMED on this " &
+                 "thread. Every stock-signature by-name call on this " &
+                 "thread would now fault inside memcmp instead of " &
+                 "early-outing to the trap. The verdict above is void; " &
+                 "nothing about the gate mechanism was proven by this run."
           if cGtFailCount() > 0:
             # A FAIL means the map is stale or this is a different build.
             # Disarming is the only honest response: leaving it armed
