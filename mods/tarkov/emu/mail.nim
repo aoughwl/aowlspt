@@ -52,6 +52,7 @@ import aowlspt/json
 import store
 import ids
 import notify
+import templates
 
 const KeyPrefix* = "mail."
 
@@ -222,13 +223,49 @@ proc parented*(attachments, containerId: string): string =
     out1.add d
   result = text(out1)
 
+proc withoutContainerRoots*(attachments: string): string =
+  ## Drops stash / container ROOT items from an attachment array.
+  ##
+  ## The last line of defence, not the fix. The fix is in
+  ## `emu/raid.transferredItems`, which no longer hands the transfer
+  ## container's own root item to this module. This is here because a mailbox
+  ## is the one place in this server where a wrong item cannot be undone by
+  ## the player -- a box they cannot open, holding cargo the mail grid will
+  ## not descend into -- and because three other callers (`emu/quests`,
+  ## `emu/insurance`, `emu/market`) build attachment arrays from sources this
+  ## module does not control.
+  ##
+  ## Dropping the root is safe for its contents: anything that was inside it
+  ## now has a `parentId` naming an item that is not in the array, and
+  ## `parented` re-parents exactly those onto the message's own container.
+  let list = parseArray(attachments)
+  if not list.ok:
+    return attachments
+  var out1 = newList()
+  var removed = 0
+  for i in 0 ..< list.len:
+    if isStashTpl(field(list.items[i], "_tpl").asText("")):
+      inc removed
+      continue
+    out1.add list.items[i]
+  if removed == 0:
+    return attachments
+  warn $removed & " container root item(s) were kept out of a mail " &
+       "attachment; a stash is a box, not a reward"
+  result = text(out1)
+
 proc newMessage*(sender, text1: string; kind: MessageKind; nowSeconds: int;
-                 attachments: string = ""): Doc =
+                 attachments0: string = ""): Doc =
   ## One message. `attachments` is a raw JSON array of items when there are any;
   ## a message with an empty one is a message with no rewards, which is the
   ## common case and must not be reported as having them -- the client puts a
   ## badge on the inbox for messages with rewards and a wrong badge sends the
   ## player looking for something that is not there.
+  # Filtered before anything else looks at it, so `hasRewards` and the
+  # container below are both decided on what is really being sent. A message
+  # whose ONLY attachment was a container root is a message with no rewards,
+  # and must not carry the badge that sends a player looking for one.
+  let attachments = withoutContainerRoots(attachments0)
   result = newDoc()
   setText(result, "_id", newId())
   setText(result, "uid", senderId(sender))

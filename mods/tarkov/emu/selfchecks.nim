@@ -44,6 +44,7 @@ import customise
 import tuning
 import globalsgaps
 import itemsgaps
+import mailcheck
 import spawn
 import decorate
 import dialogue
@@ -113,6 +114,12 @@ proc selfCheckFailures*(): seq[string] =
   # overwriting the database and without inventing an item id.
   discard itemsgaps.selfCheckItemsGaps(result)
   discard spawn.selfCheckSpawn(result)
+  # `mailcheck` proves the served-mail payload check can FAIL. It is run on
+  # the exact bad body measured in a live mailbox on 2026-08-28 -- a message
+  # whose one attachment is the tpl of a stash -- and refuses the load if the
+  # checker fails to notice it. A payload checker that has only ever been run
+  # on good input is `return @[]` wearing a hat.
+  discard mailcheck.selfCheckMail(result)
   # The fifth of that shape, and the one with two halves for the same reason
   # `selfCheckCustomisation` has two. The pure half is the whole of the hideout
   # decoration planner -- which offer resolves to which field of

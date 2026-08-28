@@ -5398,6 +5398,71 @@ proc main(): int =
                   "\"attachmentsNew\"") ==
           countOf(inbox4.body, "\"attachmentsNew\""), noId.body)
 
+  heading "transferItems: the box is not the cargo"
+  # -- transferItems: the box is not the cargo ------------------------------
+  #
+  # REGRESSION. A human found a message from "Unknown" in the live client's
+  # inbox holding one item called "Stash" with a missing icon. MEASURED in
+  # `store\aowl.tarkov\mail.00000000000a00000000004f`: one attachment,
+  # `_tpl 566abbc34bdc2d92178b4576` = "Standard stash 10x30", `_id` present in
+  # no profile item list. `EFT.TransferItemsController` keys its containers by
+  # profile id and hands back a `Stash`, so `transferItems` serialises the
+  # container's OWN root alongside its contents, and `transferredItems` posted
+  # the lot.
+  #
+  # The assertions are over the FINISHED payload the client is handed, and the
+  # load-bearing one is negative: no stash template anywhere in the mail body.
+  # The positive one is there to stop the negative passing by way of an empty
+  # mailbox -- which is how a check of this shape usually rots.
+  block transferBox:
+    discard call("/client/match/local/start", "{\"location\":\"factory4_day\"}")
+    let base = call("/client/game/profile/list", "").body
+    let boxId = "d0d0d0d0d0d0d0d0d0d0d0d1"
+    let cargoId = "d0d0d0d0d0d0d0d0d0d0d0d2"
+    let cargoTpl = "590c657e86f77412b013051d"   # IFAK, an ordinary item
+    let stashTpl = "566abbc34bdc2d92178b4576"   # Standard stash 10x30
+    let handed = call("/client/match/local/end",
+      "{\"results\":{\"result\":\"Survived\",\"profile\":" & raidProfile(base, uid) &
+      "},\"transferItems\":{\"" & uid & "\":[" &
+      "{\"_id\":\"" & boxId & "\",\"_tpl\":\"" & stashTpl & "\"}," &
+      "{\"_id\":\"" & cargoId & "\",\"_tpl\":\"" & cargoTpl &
+      "\",\"parentId\":\"" & boxId & "\",\"slotId\":\"hideout\"," &
+      "\"location\":{\"x\":0,\"y\":0,\"r\":0}}]}}")
+    check("a raid that handed items to a container is accepted",
+          handed.ok and handed.contains("\"err\":0"), handed.body)
+
+    let inbox = call("/client/mail/dialog/list", "")
+    check("what was inside the transfer container is posted",
+          inbox.contains(cargoId), inbox.body)
+    check("and the container itself is NOT",
+          not inbox.contains(stashTpl) and not inbox.contains(boxId),
+          inbox.body)
+
+    # And the same over `dialog/view`, because the inbox row carries only the
+    # newest message while the dialog carries every one of them -- a stash
+    # posted by an earlier raid would be invisible to the check above.
+    # The system dialog, named rather than guessed at. `textAt(body, 0, "_id")`
+    # reads the FIRST dialog in the inbox, which is whichever one an earlier
+    # check happened to leave there -- it found the quest payout dialog and
+    # asserted against a body that has nothing to do with this claim.
+    # `emu/mail.SystemSenderId` is the id a message with no trader behind it is
+    # posted from, and the BTR hand-over is exactly that.
+    let view = call("/client/mail/dialog/view",
+                    "{\"dialogId\":\"000000000000000000000001\"}")
+    check("the opened dialog holds the cargo",
+          view.contains(cargoId), view.body)
+    check("and no message in it attaches a stash",
+          not view.contains(stashTpl), view.body)
+    check("the sender is one the client can name, not an empty id",
+          not view.contains("\"uid\":\"\""), view.body)
+
+    # The negative above is only worth anything if a stash template WOULD have
+    # shown up in these bodies. `handed` carried one and the server dropped it;
+    # this is the same claim from the other side -- the cargo the box held did
+    # arrive, so the array was read and not merely ignored wholesale.
+    check("the transfer array was read rather than skipped",
+          view.contains(cargoTpl), view.body)
+
   if not keep:
     cSpawnKill(proc2)
 

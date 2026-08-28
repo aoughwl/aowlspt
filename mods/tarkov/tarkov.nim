@@ -54,6 +54,7 @@ import emu/trading
 import emu/bots
 import emu/orbit
 import emu/mail
+import emu/mailcheck
 import emu/insurance
 import emu/dialogue
 import emu/market
@@ -2625,12 +2626,26 @@ proc onBotDifficulty(url, body, session: string): string =
 # Mail
 # ---------------------------------------------------------------------------
 
+proc mailServed(route, payload: string): string =
+  ## The last thing that happens to a mail body before it goes on the wire.
+  ##
+  ## Announces, and does not alter. `emu/mailcheck.mailPayloadProblems` asserts
+  ## a property of these FINISHED BYTES -- no attachment is a stash/container
+  ## root, every sender id is one the client can name -- rather than of
+  ## anything this server just wrote. Silently repairing here would hide the
+  ## writer's bug, which is the whole reason the last one lived long enough to
+  ## reach a player's inbox: every step of it succeeded.
+  let problems = mailPayloadProblems(payload)
+  for pr in problems:
+    error route & ": " & pr
+  result = payload
+
 proc onMailList(url, body, session: string): string =
   inc gRequests
   let p = currentProfile(session)
   if not p.ok:
     return envelope(emptyArray())
-  result = envelope(raw(dialogList(p.id)))
+  result = envelope(raw(mailServed("mail/dialog/list", dialogList(p.id))))
 
 proc onMailView(url, body, session: string): string =
   inc gRequests
@@ -2638,7 +2653,8 @@ proc onMailView(url, body, session: string): string =
   if not p.ok:
     return envelope(emptyObject())
   let dialogId = field(body, "dialogId").asText("")
-  result = envelope(raw(dialogView(p.id, dialogId)))
+  result = envelope(raw(mailServed("mail/dialog/view",
+                                   dialogView(p.id, dialogId))))
 
 proc onMailDialogInfo(url, body, session: string): string =
   ## `/client/mail/dialog/info` -- the header of ONE dialog: the sender, its
@@ -2681,7 +2697,8 @@ proc onMailAttachments(url, body, session: string): string =
   let p = currentProfile(session)
   if not p.ok:
     return envelope(emptyObject())
-  result = envelope(raw(allAttachments(p.id)))
+  result = envelope(raw(mailServed("mail/dialog/getAllAttachments",
+                                   allAttachments(p.id))))
 
 # The four that used to be `onNullData`. Each answers `null` like the stub did
 # -- that part was right, the reference has no response DTO for any of them --

@@ -19,6 +19,7 @@ import ids
 import loot
 import questcond
 import post1
+import templates
 
 type
   RaidResult* = enum
@@ -89,13 +90,23 @@ proc keepsGear*(r: RaidResult): bool =
 # unreadable `transferItems` must be louder than a readable one.
 
 proc collectItems(a: JsonRef; into: var List; seen: var seq[string];
-                  dropped: var int) =
+                  dropped: var int; containers: var int) =
   ## Every well-formed item in one array, de-duplicated by `_id`.
   ##
   ## An element with no `_id` or no `_tpl` is not an item this server can put
   ## anywhere -- it cannot be parented, drawn or redeemed -- so it is counted
   ## and reported instead of being written into a mailbox as a shape the client
   ## will choke on.
+  ##
+  ## A **container root** is dropped too, and for a different reason. The thing
+  ## `transferItems` is keyed by is a container -- `EFT.TransferItemsController.
+  ## TryGetTransferContainer(string profileId, Stash)` -- so the serialised
+  ## array carries the container's own root item as well as its contents. That
+  ## root is not cargo: it is the box. Mailing it posts an item named "Stash"
+  ## with no icon and buries the real contents inside a container the mail grid
+  ## does not descend into. Its children are kept and become roots on their own
+  ## -- `emu/mail.parented` re-parents anything whose parent is not in the same
+  ## array onto the message's own container.
   let elems = each(a)
   for e in elems:
     if not isObject(e):
@@ -105,6 +116,9 @@ proc collectItems(a: JsonRef; into: var List; seen: var seq[string];
     let tpl = e.field("_tpl").asText("")
     if id.len == 0 or tpl.len == 0:
       inc dropped
+      continue
+    if isStashTpl(tpl):
+      inc containers
       continue
     var already = false
     for s in seen:
@@ -131,18 +145,19 @@ proc transferredItems*(body: string; problems: var seq[string]): string =
   var out1 = newList()
   var seen: seq[string] = @[]
   var dropped = 0
+  var containers = 0
   if isArray(t):
-    collectItems(t, out1, seen, dropped)
+    collectItems(t, out1, seen, dropped, containers)
   elif isObject(t):
     let ms = members(t)
     for m in ms:
       let v = whole(m.value)
       if isArray(v):
-        collectItems(v, out1, seen, dropped)
+        collectItems(v, out1, seen, dropped, containers)
       elif isObject(v) and isArray(v.field("items")):
-        collectItems(v.field("items"), out1, seen, dropped)
+        collectItems(v.field("items"), out1, seen, dropped, containers)
       elif isObject(v) and isArray(v.field("data")):
-        collectItems(v.field("data"), out1, seen, dropped)
+        collectItems(v.field("data"), out1, seen, dropped, containers)
       else:
         problems.add "transferItems entry '" & m.name & "' is not an item " &
                      "array and holds no `items` or `data` array either, so " &
@@ -154,6 +169,13 @@ proc transferredItems*(body: string; problems: var seq[string]): string =
   if dropped > 0:
     problems.add $dropped & " entr(ies) in transferItems had no _id or no " &
                  "_tpl and could not be brought home"
+  # Not added to `problems`: dropping the box is correct, not a loss, and the
+  # caller logs every problem at `error`. Saying nothing at all would be worse
+  # -- a container that was dropped when it should not have been leaves no
+  # trace -- so it is announced, at the level it deserves.
+  if containers > 0:
+    info $containers & " transferItems entr(ies) were container roots (a " &
+         "stash) and were not posted; their contents were"
   result = text(out1)
 
 proc transitDestination*(body: string): string =
