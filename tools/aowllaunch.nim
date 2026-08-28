@@ -22,21 +22,33 @@
 ## the whole of the interface: it checks the install, starts the server, asks
 ## which profile to play, starts the game, and shows both logs live.
 ##
-## It used to do the last two of those on TWO screens, one after the other: a
-## progress view with ticks filling in, and then -- once the client was up -- a
-## two-pane log view. That ordering was the mistake. The moment the progress
-## view becomes interesting is the moment something is going wrong, and that is
-## exactly the moment the logs are wanted; they were minutes away, behind a
-## profile prompt and a client that had to finish coming up first.
+## It does that on TWO screens, in ONE console and ONE process, one after the
+## other. Nothing is spawned for the second one:
 ##
-## There is now ONE screen, `unifiedRows` in `aowllayout`: a header, a
-## launch-progress region, both log panes side by side, a status line. Three
-## phases paint it -- `waitForBackend`, `watchClient`, `runLogView` -- and the
-## only things that change between them are what the progress region holds and
-## whether keys are being read. As the launch finishes the region folds to one
-## summary line and the panes take the space. `pickProfile` still takes the
-## console to itself, because it is a prompt and a prompt needs the cursor; the
-## unified block is left settled in the scrollback above it.
+##   SCREEN 1 -- the launcher (`launcherRows`). The launch-progress region with
+##     its ticks filling in, and a panel listing this install's profiles: which
+##     one is about to be played, and -- on a first run, when there are none --
+##     how to create one. Painted in the scrollback by `waitForBackend` and
+##     `watchClient`.
+##   SCREEN 2 -- the live logs (`logViewRows`). The launch collapsed to one
+##     summary line and both log panes side by side, full screen, keys live.
+##     `runLogView` paints this, and the launcher swaps to it once the client
+##     is up.
+##
+## A revision in between fused the two into a single frame -- progress on top,
+## both panes below, all the time. That is what this undoes, and it is worth
+## writing down why, because the fused frame was not obviously wrong: it spent
+## half of a small window on a client pane that was still showing the PREVIOUS
+## session's log, and it left the profile panel nowhere to live. The two views
+## want the whole window at different moments, and they get it.
+##
+## The swap is marked by `handoffRow` -- one line saying the launch is done and
+## the logs are taking the screen -- so it is an event the player watched
+## happen rather than a frame that silently became a different frame.
+##
+## `pickProfile` still takes the console to itself, because it is a prompt and
+## a prompt needs the cursor; screen 1 is left settled in the scrollback above
+## it.
 ##
 ## Each of those phases has one rule in common.
 ##
@@ -52,12 +64,12 @@
 ##
 ## The other rule is that every phase degrades, and SAYS SO WHEN IT DOES.
 ## `aowlterm` decides whether this is a VT console, a console without VT, or not
-## a console at all; `unifiedRows` decides whether the window can hold the
-## screen. A launcher whose output is being redirected into a file for somebody
+## a console at all; the two layout functions decide whether the window can
+## hold their screen. A launcher whose output is being redirected into a file for somebody
 ## to read on Discord must produce a file with no escape codes in it, and a
 ## launcher in an 80x10 window must produce something legible in an 80x10
 ## window. What it must never do is quietly become a different view: below the
-## minimum, `unifiedRows` refuses and hands back a reason, the phase prints that
+## minimum, the layout refuses and hands back a reason, the phase prints that
 ## reason, and the plain interleaved `streamLogs` takes over. A skipped region
 ## that reads as a rendered one is the failure this whole file is written
 ## against. `tests/tuilayout.nim` renders the grid at five window sizes and
@@ -454,19 +466,15 @@ proc scanHost(t: Tail): HostState =
 # One screen
 # ---------------------------------------------------------------------------
 #
-# The launcher used to show the launch progress and then, afterwards, the two
-# logs. That ordering was the bug: the moment the progress view becomes
-# interesting is the moment something has gone wrong, and that is exactly the
-# moment the logs are needed -- and they were minutes away, behind a profile
-# prompt and a client that had to finish coming up first.
+# Two screens, drawn by `launcherRows` and `logViewRows` in `aowllayout`, in
+# one console and in this one process. What each phase paints:
 #
-# So there is now one screen, drawn by `unifiedRows` in `aowllayout`, and every
-# phase paints it. What changes between phases is the progress region and
-# whether keys are being read:
-#
-#   boot     the backend's steps    + both panes, in the scrollback
-#   client   the client's steps     + both panes, in the scrollback
-#   run      ONE summary line       + both panes, full screen, keys live
+#   boot     SCREEN 1: the backend's steps + the profile panel, in the
+#            scrollback. The panel says "read once the server answers" here,
+#            because the list genuinely has not been read yet.
+#   client   SCREEN 1: the client's steps  + the profile panel, now populated,
+#            with the bound profile marked.
+#   run      SCREEN 2: ONE summary line + both panes, full screen, keys live.
 #
 # The two `Tail`s are created ONCE, in `main`, and threaded through all three.
 # Before this they were opened three times -- `waitForBackend` opened the
@@ -519,6 +527,22 @@ type
     cliCol: int
     summaryKind: int
     summaryText: string
+    # --- screen 1's profile panel -------------------------------------------
+    profilesKnown: bool
+      ## False until the backend has been asked. It is NOT the same as "there
+      ## are none": during the boot wait the list has not been read yet, and a
+      ## panel that offered to create a profile at that moment would be
+      ## offering it because it had not looked, which is the create affordance
+      ## appearing for an install that already has six characters.
+    profiles: seq[Profile]
+    chosenId: string
+      ## The profile the launcher bound, so the panel can mark WHICH row is the
+      ## one being played rather than leaving the player to infer it.
+    canCreate: bool
+      ## Whether the backend's launcher routes are actually reachable. The
+      ## create affordance is drawn only when it can be honoured -- an offer
+      ## the launcher would then refuse is worse than no offer.
+    profileNote: string
 
 proc newScreen(): Screen =
   result = Screen(phase: phBoot,
@@ -533,7 +557,8 @@ proc newScreen(): Screen =
                   answered: false, alive: true, tlsMode: false, port: 0,
                   pid: 0, who: "", srvText: "", srvCol: ColDim,
                   cliText: "", cliCol: ColDim, summaryKind: MarkPending,
-                  summaryText: "")
+                  summaryText: "", profilesKnown: false, profiles: @[],
+                  chosenId: "", canCreate: false, profileNote: "")
 
 proc bootSteps(s: Screen; width: int): seq[Row] =
   let b = s.boot
@@ -718,19 +743,103 @@ proc paneTitles(l: Logs; scrollS, scrollC: int; srv, cli: var string) =
   else:
     cli = "client  not started yet -- last session's log"
 
+proc profileLabel(p: Profile): string =
+  result = (if p.nickname.len > 0: p.nickname else: "(no nickname)")
+  var bits = ""
+  if p.side.len > 0: bits = p.side
+  if p.level > 0:
+    if bits.len > 0: bits.add " "
+    bits.add "level " & $p.level
+  if bits.len > 0: result.add "  " & bits
+
+proc profilePanel(s: Screen; width: int; rows, empty: var seq[Row];
+                  title: var string) =
+  ## Screen 1's panel, as data. THREE states, never two -- because "we have not
+  ## looked yet" and "there are none" are different facts and the second one is
+  ## the one that offers to create a profile. Collapsing them would put the
+  ## create affordance in front of a player who already has characters, during
+  ## the second or two before the list is read.
+  rows = @[]
+  empty = @[]
+  let innerW = width - 6
+  if not s.profilesKnown:
+    title = "profiles"
+    var r = newRow()
+    r.put "  "
+    r.putIn ColDim, fit("read once the server answers", innerW)
+    rows.add r
+    return
+
+  if s.profiles.len == 0:
+    # FIRST RUN. Not an empty box: the way forward, in words.
+    title = "profiles -- none yet"
+    var a = newRow()
+    a.put "  "
+    a.putIn ColYellow, fit("this install has no profiles yet", innerW)
+    empty.add a
+    var b = newRow()
+    b.put "  "
+    if s.canCreate:
+      b.putIn ColDefault, fit("a character is created here before the game " &
+                              "starts -- the launcher asked for a nickname " &
+                              "and a side", innerW)
+    else:
+      # Say WHY rather than offer something that would then be refused.
+      b.putIn ColRed, fit("and the backend's launcher routes are not " &
+                          "reachable, so one cannot be created from here",
+                          innerW)
+    empty.add b
+    if s.profileNote.len > 0:
+      var c = newRow()
+      c.put "  "
+      c.putIn ColDim, fit(s.profileNote, innerW)
+      empty.add c
+    return
+
+  title = "profiles -- " & $s.profiles.len
+  for i in 0 ..< s.profiles.len:
+    let p = s.profiles[i]
+    var r = newRow()
+    r.put "  "
+    # The bound profile is MARKED. Without it the panel lists what exists and
+    # says nothing about which one the game is about to start on, which is the
+    # single thing the player is looking for.
+    let mine = s.chosenId.len > 0 and p.id == s.chosenId
+    r.putIn (if mine: ColGreen else: ColDim),
+            (if mine: markGlyph(MarkActive) else: "  ")
+    r.put " "
+    r.putIn (if mine: ColCyan else: ColDefault),
+            fit(profileLabel(p), (if innerW > 40: 34 else: 18))
+    r.padTo (if innerW > 40: 40 else: 24)
+    let room = width - r.width - 3
+    if room > 8:
+      r.putIn ColDim, fit((if mine: "playing this one -- " & p.id else: p.id),
+                          room)
+    rows.add r
+  if s.profileNote.len > 0:
+    var n = newRow()
+    n.put "  "
+    n.putIn ColDim, fit(s.profileNote, innerW)
+    rows.add n
+
 proc paintPhase(panel: var Panel; logs: var Logs; s: Screen;
                 elapsed: int64): bool =
-  ## The unified screen, repainted in place in the SCROLLBACK rather than on the
-  ## alternate screen. That is deliberate and different from the live log view:
-  ## what is immediately above this block is the preflight report about the
-  ## player's install, which is the thing they will be asked to paste when
-  ## something is wrong with it. The alternate screen would take it away and
-  ## give it back; repainting in place leaves it, and leaves the finished
-  ## progress behind in the scrollback too.
+  ## SCREEN 1, repainted in place in the SCROLLBACK rather than on the alternate
+  ## screen. That is deliberate and different from the live log view: what is
+  ## immediately above this block is the preflight report about the player's
+  ## install, which is the thing they will be asked to paste when something is
+  ## wrong with it. The alternate screen would take it away and give it back;
+  ## repainting in place leaves it, and leaves the finished progress behind in
+  ## the scrollback too.
   ##
-  ## Returns false when the screen cannot hold the unified block; the caller
-  ## then writes its plain one-line-per-change progress instead. It never draws
-  ## a bent frame and never silently drops a region.
+  ## `logs` is still pumped by the callers around this -- the tails are opened
+  ## once, in `newLogs`, and stay open across both screens -- but screen 1 does
+  ## not DRAW them. It draws the launch progress and the profile panel, and
+  ## screen 2 gets the logs a moment later with the whole window to itself.
+  ##
+  ## Returns false when the screen cannot hold the block; the caller then writes
+  ## its plain one-line-per-change progress instead. It never draws a bent frame
+  ## and never silently drops a region.
   if termMode() != tmFull: return false
   var w = 0
   var h = 0
@@ -744,14 +853,14 @@ proc paintPhase(panel: var Panel; logs: var Logs; s: Screen;
   # tall console does not hand the whole thing over to the boot view.
   var ph = h - 3
   if ph > 26: ph = 26
-  var srv = ""
-  var cli = ""
-  paneTitles(logs, 0, 0, srv, cli)
   let dw = w - 1
-  let lay = unifiedRows(dw, ph, screenHeader(s, dw, elapsed),
-                        screenSteps(s, dw), screenSummary(s, dw),
-                        logs.server, logs.client, srv, cli,
-                        0, 0, 0, false, newRow())
+  var prof: seq[Row] = @[]
+  var empty: seq[Row] = @[]
+  var title = "profiles"
+  profilePanel(s, dw, prof, empty, title)
+  let lay = launcherRows(dw, ph, screenHeader(s, dw, elapsed),
+                         screenSteps(s, dw), screenSummary(s, dw),
+                         title, prof, empty, newRow())
   if not lay.renderable: return false
   if not fitsInWindow(lay.rows.len): return false
   panel.paint lay.rows
@@ -870,15 +979,6 @@ proc waitForBackend(port: int; tls: bool; backendProc: uint64;
 # Choosing a profile
 # ---------------------------------------------------------------------------
 
-proc profileLabel(p: Profile): string =
-  result = (if p.nickname.len > 0: p.nickname else: "(no nickname)")
-  var bits = ""
-  if p.side.len > 0: bits = p.side
-  if p.level > 0:
-    if bits.len > 0: bits.add " "
-    bits.add "level " & $p.level
-  if bits.len > 0: result.add "  " & bits
-
 proc drawProfiles(list: ProfileList) =
   ## Printed rather than painted: this stays in the scrollback, and the answer
   ## the player types has to stay next to the list they typed it from.
@@ -914,6 +1014,114 @@ proc readAnswer(prompt: string; into: var string): bool =
   into = ""
   result = readLine(stdin, into)
   into = strip(into)
+
+proc createProfileChecked(port: int; root, nickname, side: string;
+                          made: var Profile): string =
+  ## `createProfile`, and then the check that makes its answer mean something.
+  ## Returns "" only when a profile provably exists afterwards.
+  ##
+  ## A backend started against a missing or empty database comes up perfectly:
+  ## it claims its port, loads all sixteen mods, and answers 200 on every route
+  ## while serving nothing at all. Against that install `create` returns a
+  ## well-formed `{"ok":true,"token":...}` and the launcher would print
+  ## "created" for a character that does not exist -- and the player would find
+  ## out at the game's login screen, a long way from here.
+  ##
+  ## So the server's answer is NOT the evidence. The finished state is: ask for
+  ## the profile list again and require the new id to be IN it. That is a check
+  ## that can fail, which is the entire reason it is worth writing; "the route
+  ## said ok" is a check that cannot.
+  let e = createProfile(port, nickname, side, made)
+  if e.len > 0: return e
+  if made.id.len == 0:
+    return "the profile-create route reported success and named no profile"
+  let after = listProfiles(port, root)
+  if after.error.len > 0:
+    return "the profile was created, but the list could not be read back to " &
+           "confirm it, so whether it exists is UNKNOWN: " & after.error
+  if after.source != psRoute:
+    return "the profile was created, but the list read back came off disk " &
+           "rather than from the backend, so it cannot confirm it. Whether " &
+           "the profile exists is UNKNOWN."
+  for p in after.items:
+    if p.id == made.id:
+      # The row the LIST serves wins over the one `create` echoed: it is the
+      # one every later request will be answered from.
+      if p.nickname.len > 0: made.nickname = p.nickname
+      if p.side.len > 0: made.side = p.side
+      if p.level > 0: made.level = p.level
+      return ""
+  result = "the backend answered 200 with a token for \"" & nickname &
+           "\", but the profile list it serves does NOT contain " & made.id &
+           ", so NOTHING was created. A backend running against a missing or " &
+           "empty database behaves exactly like this -- it answers everywhere " &
+           "and stores nothing. Check aowlspt-backend.log, and check that " &
+           "db.json is where the backend expects it."
+
+proc firstRunCreate(port: int; root: string; list: ProfileList;
+                    chosen: var Profile; reason: var string): bool =
+  ## The FIRST-RUN path: this install has no profiles, so offer to make one.
+  ##
+  ## This is not the profile prompt that was deliberately removed. That prompt
+  ## was removed because it DUPLICATED the game's own character-select screen --
+  ## the player chose in the console and then chose again in the game. With
+  ## zero profiles there is nothing to duplicate: the game's screen has no slot
+  ## to offer, and the alternative here is to launch with no `-token`, which is
+  ## the launcher's one remaining dead end. So this asks only in the case where
+  ## nobody was going to be asked anything at all, and it never runs when the
+  ## install already has a character.
+  reason = ""
+  if list.source != psRoute or port <= 0:
+    reason = "there are no profiles and the backend's launcher routes are " &
+             "not reachable, so one cannot be created from here"
+    return false
+  if not stdinIsConsole():
+    # A scripted launch is not somewhere to invent a character name.
+    reason = "there are no profiles and input is not a terminal, so there is " &
+             "nobody to ask for a nickname. Pass --new <name> to create one"
+    return false
+
+  echo ""
+  sayColoured ColWhite, "  No profiles yet"
+  sayColoured ColDim,
+    "  this install has no characters. One is created here, before the " &
+    "game starts."
+  while true:
+    var answer = ""
+    if not readAnswer("create one now? [Y/n]", answer):
+      reason = "input ended before a profile was created"
+      return false
+    if answer == "n" or answer == "N":
+      reason = "you chose not to create a profile"
+      return false
+    if answer.len == 0 or answer == "y" or answer == "Y": break
+  while true:
+    var nick = ""
+    if not readAnswer("nickname:", nick):
+      reason = "input ended before a nickname was given"
+      return false
+    if nick.len < 3:
+      err "a nickname needs at least three characters"
+      continue
+    var sideAnswer = ""
+    if not readAnswer("side? [Usec/Bear]", sideAnswer):
+      reason = "input ended before a side was chosen"
+      return false
+    var side = "Usec"
+    if toLowerAscii(sideAnswer) == "bear" or toLowerAscii(sideAnswer) == "b":
+      side = "Bear"
+    var made = Profile(id: "", token: "", nickname: "", side: "", level: 0,
+                       edition: "", lastPlayed: 0)
+    let e = createProfileChecked(port, root, nick, side, made)
+    if e.len > 0:
+      err e
+      # Retrying a nickname clash is worth it; retrying an empty database is
+      # not, and the player is told which of the two this was.
+      continue
+    chosen = made
+    ok "created " & profileLabel(made) & " (" & made.id &
+       ") -- confirmed present in the backend's profile list"
+    return true
 
 proc pickProfile(o: Options; port: int; root: string;
                  chosen: var Profile; reason: var string;
@@ -955,12 +1163,13 @@ proc pickProfile(o: Options; port: int; root: string;
       return false
     var made = Profile(id: "", token: "", nickname: "", side: "", level: 0,
                        edition: "", lastPlayed: 0)
-    let err = createProfile(port, o.newProfile, o.side, made)
+    let err = createProfileChecked(port, root, o.newProfile, o.side, made)
     if err.len > 0:
       reason = err
       return false
     chosen = made
-    ok "created " & profileLabel(made) & " (" & made.id & ")"
+    ok "created " & profileLabel(made) & " (" & made.id &
+       ") -- confirmed present in the backend's profile list"
     return true
 
   drawProfiles(list)
@@ -1009,12 +1218,13 @@ proc pickProfile(o: Options; port: int; root: string;
         side = "Bear"
       var made = Profile(id: "", token: "", nickname: "", side: "", level: 0,
                          edition: "", lastPlayed: 0)
-      let e = createProfile(port, nick, side, made)
+      let e = createProfileChecked(port, root, nick, side, made)
       if e.len > 0:
         err e
         continue
       chosen = made
-      ok "created " & profileLabel(made) & " (" & made.id & ")"
+      ok "created " & profileLabel(made) & " (" & made.id &
+         ") -- confirmed present in the backend's profile list"
       return true
     if answer.len == 0 and list.items.len == 1:
       chosen = list.items[0]
@@ -1040,16 +1250,23 @@ proc pickProfile(o: Options; port: int; root: string;
     err "that is not one of the choices"
 
 proc watchClient(launch: LaunchPtr; logs: var Logs; who: string;
+                 profiles: seq[Profile]; chosenId: string;
                  limitMs: int64; exited: var bool) =
   ## Until the host says it is running, or the client dies, or the time is up.
-  ## Whichever happens, the last thing painted is what actually happened -- and
-  ## the server pane is right there beside it, because "the client is stuck" and
-  ## "the server threw on the request the client just made" look identical from
-  ## the client's own log alone.
+  ## Whichever happens, the last thing painted is what actually happened.
+  ##
+  ## This is still SCREEN 1: the client's progress steps above the profile
+  ## panel, with the profile that was bound marked in it. `logs` is pumped
+  ## every tick so that screen 2 -- which takes over the moment this returns --
+  ## opens with the whole history already read, rather than re-opening the
+  ## files and re-parsing from zero.
   exited = false
   var s = newScreen()
   s.phase = phClient
   s.who = who
+  s.profilesKnown = true
+  s.profiles = profiles
+  s.chosenId = chosenId
   s.pid = int(cLaunchPid(launch))
   s.srvText = "server up"
   s.srvCol = ColGreen
@@ -1073,8 +1290,8 @@ proc watchClient(launch: LaunchPtr; logs: var Logs; who: string;
         painting = false
         if not saidDegraded:
           saidDegraded = true
-          warn "this window cannot hold the launch view and both log panes " &
-               "at once; reporting progress as plain lines instead"
+          warn "this window cannot hold the launch view and the profile " &
+               "panel; reporting progress as plain lines instead"
           flushOut()
     if not painting:
       if waited - lastNote >= 5000'i64:
@@ -1405,7 +1622,7 @@ proc runLogView(who: string; backendProc: uint64; launch: LaunchPtr;
     var srv = ""
     var cli = ""
     paneTitles(logs, scrollServer, scrollClient, srv, cli)
-    let lay = unifiedRows(dw, h, screenHeader(s, dw, cNowMs() - began),
+    let lay = logViewRows(dw, h, screenHeader(s, dw, cNowMs() - began),
                           screenSteps(s, dw), screenSummary(s, dw),
                           logs.server, logs.client, srv, cli,
                           focus, scrollServer, scrollClient, solo, help)
@@ -1945,15 +2162,35 @@ proc main(): int =
   var haveChoice = false
   var viaRoute = false
   var why = ""
+  # Carried into screen 1 so its panel lists what this install actually holds,
+  # with the bound one marked. Empty is a legitimate value and means the panel
+  # draws the first-run text rather than an empty box.
+  var knownProfiles: seq[Profile] = @[]
   if autoSelect:
     let list = listProfiles(ctlPort, root)
     viaRoute = list.source == psRoute
+    knownProfiles = list.items
     if list.error.len > 0:
       # Not fatal: a backend with no profile route and no store on disk is an
       # install with nothing to select, which is the first-run case.
       warn list.error
       note "nothing to select, so the client starts with no -token and the " &
            "game's own character-creation flow runs"
+    elif list.items.len == 0:
+      # FIRST RUN. Everything else in this branch deliberately does not ask --
+      # the in-game selector is the one place a profile is chosen. But with no
+      # profiles there is no in-game selector to defer to and nothing to bind,
+      # and launching tokenless is the dead end this case always was. So this
+      # is the one case that asks.
+      if list.note.len > 0: warn list.note
+      var reason = ""
+      if firstRunCreate(ctlPort, root, list, chosen, reason):
+        haveChoice = true
+        viaRoute = true
+        knownProfiles = @[chosen]
+      else:
+        note reason & ", so the client starts with no -token and the game's " &
+             "own character-creation flow runs"
     else:
       if list.note.len > 0: warn list.note
       var reason = ""
@@ -1977,6 +2214,12 @@ proc main(): int =
         cSpawnKill(backendProc)
         line "  backend stopped"
       return 1
+
+  # `--pick`/`--profile`/`--new` do not hand back the list they worked from, so
+  # screen 1's panel shows the profile that was actually bound rather than
+  # nothing. One true row beats a list this code would have to guess at.
+  if knownProfiles.len == 0 and haveChoice:
+    knownProfiles = @[chosen]
 
   # One binding path for both ways of arriving at a profile. Rebind the session
   # to it before the client arrives on it -- for an auto-selected profile as
@@ -2091,7 +2334,8 @@ proc main(): int =
   # Bounded, and the bound is not a deadline for the game -- it is how long
   # this view waits before handing over to the log view, which shows the same
   # thing with more room. A cold IL2CPP launch is minutes.
-  watchClient(launch, logs, "", 90000'i64, clientExited)
+  watchClient(launch, logs, who, knownProfiles, chosen.id, 90000'i64,
+              clientExited)
 
   # UNCONDITIONAL, before any gate. A verdict that never appears could mean
   # "the walk failed" or "this routine was never entered" -- and those look
@@ -2312,10 +2556,10 @@ proc main(): int =
         line "  backend stopped"
   else:
     var detached = false
-    # The launch, collapsed to the one line the unified screen keeps at the top
-    # while the panes take the rest. Read back out of the host's own log rather
-    # than remembered from the phase that painted it, so it states what is true
-    # now and not what was true when that phase returned.
+    # The launch, collapsed to the one line SCREEN 2 keeps at the top while the
+    # panes take the rest. Read back out of the host's own log rather than
+    # remembered from the phase that painted it, so it states what is true now
+    # and not what was true when that phase returned.
     let endHost = scanHost(logs.client)
     var sumKind = MarkDone
     var sumText = "server on 127.0.0.1:" & $port
@@ -2328,6 +2572,25 @@ proc main(): int =
     else:
       sumKind = MarkActive
       sumText = "client started; the host has not reported running yet"
+    # THE HANDOFF. Screen 1 is finished; screen 2 takes the window. Printed
+    # into the scrollback, immediately under the last launcher frame, so the
+    # swap is a line the player can point at afterwards -- and so a launcher
+    # that is redirected to a file, or too small for either view, still records
+    # that the phase changed and why.
+    var hw = 0
+    var hh = 0
+    termSize(hw, hh)
+    if hw <= 0: hw = 80
+    if hw > 160: hw = 160
+    echo ""
+    echo handoffRow(hw - 1,
+                    (if clientExited:
+                       "launch finished with the client gone -- the logs take " &
+                       "the screen now"
+                     else:
+                       "launch complete -- the logs take the screen now " &
+                       "(q quit, d detach)")).text
+    flushOut()
     runLogView(who, backendProc, launch, true, logs, sumKind, sumText, detached)
     if detached:
       line ""

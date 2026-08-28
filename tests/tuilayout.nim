@@ -1,11 +1,12 @@
-## tuilayout -- the launcher's unified screen, rendered into a buffer and
-## checked as a CHARACTER GRID, with no console, no game and no launcher.
+## tuilayout -- the launcher's TWO screens, rendered into a buffer and checked
+## as a CHARACTER GRID, with no console, no game and no launcher.
 ##
 ## ## Why this test exists
 ##
-## `tools/aowllaunch.nim` used to have two screens shown one after the other:
-## the launch progress, then the two log panes. They are now one screen, drawn
-## by `unifiedRows` in `tools/aowllayout.nim`, and the merge is a layout change
+## `tools/aowllaunch.nim` shows two screens, in one console, one after the
+## other: `launcherRows` (the launch progress and the profile panel) and then,
+## once the client is up, `logViewRows` (the two log panes). A revision in
+## between fused them into a single frame, and undoing that is a layout change
 ## -- which is the class of change that fails by being *one column out*. A frame
 ## whose right-hand border lands in the last cell puts the console into the
 ## deferred-wrap state; on some hosts the next carriage return cancels it and on
@@ -13,10 +14,18 @@
 ## It looks like a rendering glitch and it is arithmetic that drifts with the
 ## window width, so it shows up on one player's terminal and not on ours.
 ##
+## The other thing it exists to hold down is the SEPARATION. "Two screens" is
+## easy to claim and easy to lose: one stray call and the profile panel is
+## drawn above two log panes again, which is precisely what was rejected. So
+## `notFused` below asserts it structurally, on the grid -- the launcher frame's
+## top border has TWO corners and the split log frame's has THREE, because the
+## split one carries a junction between the panes. A fused frame fails that
+## count, and it fails it without anybody having to notice it by eye.
+##
 ## ## What it asserts, and what it deliberately does not
 ##
-## It asserts on the FINISHED GRID -- the strings `unifiedRows` actually
-## produced -- never on the inputs it was handed. Concretely, at each size:
+## It asserts on the FINISHED GRID -- the strings the layout actually produced
+## -- never on the inputs it was handed. Concretely, at each size:
 ##
 ##   * no row is wider than the window (the off-by-one above);
 ##   * the frame is exactly as many rows as the window has;
@@ -24,10 +33,14 @@
 ##     carries BOTH pane titles and a `bxTD` junction between them, so a run
 ##     that quietly drew one pane cannot pass;
 ##   * the progress region is present, and the step text is really in the grid;
-##   * lines from BOTH logs appear in the body at the same time -- which is the
-##     entire point of the merge and the one thing the old two-screen launcher
-##     could never do;
-##   * below the minimum size the layout REFUSES (`renderable == false`) and
+##   * lines from BOTH logs appear in the body of screen 2 at the same time;
+##   * screen 1 lists the profiles it was given, ALL of them, and marks nothing
+##     it was not told to mark;
+##   * with an empty profile list screen 1 draws the CREATE path -- real words
+##     about what to do next -- and not an empty box, which is the first-run
+##     dead end this release is fixing;
+##   * neither screen carries the other's furniture (see `notFused`);
+##   * below the minimum size each layout REFUSES (`renderable == false`) and
 ##     carries a reason, rather than returning a bent frame.
 ##
 ## The assertions are negative wherever they can be: "no row exceeds w", "no
@@ -122,7 +135,7 @@ proc buildSteps(w: int): seq[Row] =
 proc runSize(w, h: int; expectRenderable: bool; label: string) =
   var srv = fakeTail("SRVLINE", 40)
   var cli = fakeTail("CLILINE", 40)
-  let lay = unifiedRows(w, h, buildHeader(w), buildSteps(w),
+  let lay = logViewRows(w, h, buildHeader(w), buildSteps(w),
                         stepRow(MarkDone, "launch", "SUMMARYLINE ready", w),
                         srv, cli, "SRVPANE 40", "CLIPANE 40",
                         0, 0, 0, false, buildHelp(w))
@@ -190,7 +203,7 @@ proc runSolo(w, h: int) =
   ## a frame that is correct split can still be one column out solo.
   var srv = fakeTail("SRVLINE", 40)
   var cli = fakeTail("CLILINE", 40)
-  let lay = unifiedRows(w, h, buildHeader(w), buildSteps(w),
+  let lay = logViewRows(w, h, buildHeader(w), buildSteps(w),
                         stepRow(MarkDone, "launch", "SUMMARYLINE ready", w),
                         srv, cli, "SRVPANE 40", "CLIPANE 40",
                         0, 0, 0, true, buildHelp(w))
@@ -205,6 +218,192 @@ proc runSolo(w, h: int) =
   check(has(lay.rows, "SRVLINE"), "solo: the focused pane is drawn")
   check(not has(lay.rows, "CLILINE"),
         "solo: the unfocused pane is NOT drawn (that is what solo means)")
+
+# ---------------------------------------------------------------------------
+# Screen 1 -- the launcher
+# ---------------------------------------------------------------------------
+
+proc countCh(s: string; ch: char): int =
+  result = 0
+  for c in s:
+    if c == ch: inc result
+
+proc buildProfiles(n, w: int): seq[Row] =
+  ## `n` profile rows, each carrying a marker that appears nowhere else in the
+  ## frame, so "the panel is drawn" cannot pass on blank padding.
+  result = @[]
+  for i in 0 ..< n:
+    var r = newRow()
+    r.put "  "
+    r.putIn (if i == 0: ColGreen else: ColDim), (if i == 0: ">>" else: "  ")
+    r.put " "
+    r.putIn ColCyan, fit("PROFROW" & $i, (if w > 46: 34 else: 18))
+    result.add r
+
+proc buildEmpty(w: int): seq[Row] =
+  ## What the panel shows on a FIRST RUN. Two real sentences, because "there
+  ## are none" without a way forward is the dead end being fixed.
+  result = @[]
+  var a = newRow()
+  a.put "  "
+  a.putIn ColYellow, fit("CREATEHINT no profiles yet", w - 6)
+  result.add a
+  var b = newRow()
+  b.put "  "
+  b.putIn ColDefault, fit("CREATESTEP nickname and side, before the game " &
+                          "starts", w - 6)
+  result.add b
+
+proc runLauncher(w, h, nProfiles: int; expectRenderable: bool; label: string) =
+  let profiles = buildProfiles(nProfiles, w)
+  let lay = launcherRows(w, h, buildHeader(w), buildSteps(w),
+                         stepRow(MarkActive, "launch", "SUMMARYLINE starting", w),
+                         "PANELTITLE profiles", profiles, buildEmpty(w),
+                         buildHelp(w))
+  echo ""
+  echo "--- screen1 " & label & "  (w=" & $w & " h=" & $h & " profiles=" &
+       $nProfiles & ") ---"
+  if not expectRenderable:
+    check(not lay.renderable, label & ": REFUSES to draw")
+    check(lay.note.len > 0, label & ": says why it refused")
+    check(lay.rows.len == 0, label & ": returns no rows at all")
+    if lay.note.len > 0: echo "      note: " & lay.note
+    return
+
+  check(lay.renderable, label & ": renders")
+  if not lay.renderable:
+    echo "      note: " & lay.note
+    return
+  for r in lay.rows: echo "|" & r.text & "|"
+
+  check(lay.rows.len == h, label & ": exactly " & $h & " rows (got " &
+        $lay.rows.len & ")")
+  check(widest(lay.rows) <= w, label & ": no row wider than " & $w &
+        " (widest " & $widest(lay.rows) & ")")
+
+  let top = rowIndexOf(lay.rows, "PANELTITLE")
+  check(top >= 0, label & ": the panel title is drawn")
+  check(top >= 0 and lay.rows[top].text[0] == '+',
+        label & ": the panel top border starts with a corner")
+  let bottom = lay.rows.len - 2
+  check(lay.rows[bottom].text[0] == '+' and
+        lay.rows[bottom].text[lay.rows[bottom].text.len - 1] == '+',
+        label & ": the panel bottom border is a full rule with both corners")
+  var bodyOk = true
+  if top >= 0:
+    for i in (top + 1) ..< bottom:
+      let t = lay.rows[i].text
+      if t.len == 0 or t[0] != '|' or t[t.len - 1] != '|': bodyOk = false
+  check(bodyOk, label & ": every panel row is bounded by both verticals")
+
+  # The progress region.
+  if lay.collapsedSteps:
+    check(has(lay.rows, "SUMMARYLINE"),
+          label & ": the progress region collapsed to its summary line")
+    check(lay.note.len > 0, label & ": says on screen that it collapsed")
+    echo "      note: " & lay.note
+  else:
+    check(has(lay.rows, "STEPMODS"),
+          label & ": the progress steps are drawn in full")
+  check(lay.stepsShown > 0, label & ": a progress region is present")
+
+  # The panel's CONTENT -- the part that a frame of blank padding would fail.
+  if nProfiles == 0:
+    check(lay.emptyPath, label & ": reports it drew the first-run path")
+    check(has(lay.rows, "CREATEHINT"),
+          label & ": an empty install renders the CREATE path...")
+    check(has(lay.rows, "CREATESTEP"),
+          label & ": ...including what actually happens next")
+    check(not has(lay.rows, "PROFROW"),
+          label & ": and lists no profiles, because there are none")
+  else:
+    check(not lay.emptyPath,
+          label & ": does NOT take the first-run path when profiles exist")
+    check(not has(lay.rows, "CREATEHINT"),
+          label & ": does NOT offer to create when profiles exist")
+    # EVERY profile, or an explicit count of how many were hidden. A panel that
+    # silently shows four of six is a chooser lying about what there is.
+    var seen = 0
+    for i in 0 ..< nProfiles:
+      if has(lay.rows, "PROFROW" & $i): inc seen
+    check(seen == lay.listed,
+          label & ": " & $seen & " profile rows on screen, and it reports " &
+          $lay.listed)
+    check(seen + lay.hidden == nProfiles,
+          label & ": " & $seen & " shown + " & $lay.hidden & " declared " &
+          "hidden == " & $nProfiles & " given")
+    if lay.hidden > 0:
+      check(lay.note.len > 0, label & ": says on screen that rows were hidden")
+  echo "      stepsShown=" & $lay.stepsShown & " bodyH=" & $lay.bodyH &
+       " listed=" & $lay.listed & " hidden=" & $lay.hidden &
+       " emptyPath=" & $lay.emptyPath & " maxWidth=" & $lay.maxWidth
+
+proc notFused(w, h: int) =
+  ## THE REGRESSION THIS RELEASE IS ABOUT.
+  ##
+  ## The rejected revision drew the progress region, the profile panel and both
+  ## log panes in ONE frame. Two screens is not something to take on trust, so
+  ## it is checked on the grid, both ways round and structurally:
+  ##
+  ##   * the launcher frame must not contain a single log line from either tail,
+  ##     and its panel border must have exactly TWO corners -- a fused frame
+  ##     would carry the pane junction and have three;
+  ##   * the log frame must not contain a profile row or the create hint.
+  ##
+  ## Both are negatives. A fused frame fails them; neither can pass by accident.
+  echo ""
+  echo "--- not fused  (w=" & $w & " h=" & $h & ") ---"
+  var srv = fakeTail("SRVLINE", 40)
+  var cli = fakeTail("CLILINE", 40)
+
+  let one = launcherRows(w, h, buildHeader(w), buildSteps(w),
+                         stepRow(MarkActive, "launch", "SUMMARYLINE starting", w),
+                         "PANELTITLE profiles", buildProfiles(3, w),
+                         buildEmpty(w), buildHelp(w))
+  let two = logViewRows(w, h, buildHeader(w), buildSteps(w),
+                        stepRow(MarkDone, "launch", "SUMMARYLINE ready", w),
+                        srv, cli, "SRVPANE 40", "CLIPANE 40",
+                        0, 0, 0, false, buildHelp(w))
+  check(one.renderable and two.renderable, "not fused: both screens render")
+  if not (one.renderable and two.renderable): return
+
+  check(not has(one.rows, "SRVLINE"),
+        "not fused: screen 1 carries NO server log line")
+  check(not has(one.rows, "CLILINE"),
+        "not fused: screen 1 carries NO client log line")
+  check(not has(one.rows, "SRVPANE") and not has(one.rows, "CLIPANE"),
+        "not fused: screen 1 carries NEITHER pane title")
+
+  check(not has(two.rows, "PROFROW"),
+        "not fused: screen 2 carries NO profile row")
+  check(not has(two.rows, "CREATEHINT"),
+        "not fused: screen 2 carries NO create affordance")
+  check(not has(two.rows, "PANELTITLE"),
+        "not fused: screen 2 carries NO profile panel title")
+
+  # Structural, not marker-based: the number of corners on the top border is a
+  # property of how many boxes are on the row.
+  let t1 = rowIndexOf(one.rows, "PANELTITLE")
+  let t2 = rowIndexOf(two.rows, "SRVPANE")
+  check(t1 >= 0 and countCh(one.rows[t1].text, '+') == 2,
+        "not fused: screen 1's top border has exactly 2 corners (one box), " &
+        "got " & (if t1 >= 0: $countCh(one.rows[t1].text, '+') else: "no row"))
+  check(t2 >= 0 and countCh(two.rows[t2].text, '+') == 3,
+        "not fused: screen 2's top border has exactly 3 (two boxes + the " &
+        "junction), got " &
+        (if t2 >= 0: $countCh(two.rows[t2].text, '+') else: "no row"))
+
+proc handoff(w: int) =
+  ## The line that marks the swap. It is the only thing standing between "the
+  ## screen changed" and "the screen changed and I know why", so it has to
+  ## actually carry its message and actually fit.
+  echo ""
+  echo "--- handoff  (w=" & $w & ") ---"
+  let r = handoffRow(w, "HANDOFFTEXT launch complete -- the logs take the screen")
+  echo "|" & r.text & "|"
+  check(find(r.text, "HANDOFFTEXT") >= 0, "handoff: carries its message")
+  check(colsOf(r.text) <= w, "handoff: fits in " & $w & " columns (got " &
+        $colsOf(r.text) & ")")
 
 proc main(): int =
   # Pin the rendering so the grid is plain ASCII and a match means what it says.
@@ -221,6 +420,25 @@ proc main(): int =
   # to refuse on its own, not only as a side effect of a narrow window.
   runSize(120, 11, false, "120x11")
   runSolo(80, 24)
+
+  # Screen 1, at the same ladder of sizes.
+  runLauncher(200, 50, 6, true, "200x50")
+  runLauncher(120, 30, 6, true, "120x30")
+  runLauncher(80, 24, 6, true, "80x24")
+  runLauncher(40, 12, 6, true, "40x12")
+  runLauncher(39, 11, 6, false, "39x11")
+  runLauncher(120, 11, 6, false, "120x11")
+  # FIRST RUN, at a comfortable size and at the smallest one that renders.
+  runLauncher(120, 30, 0, true, "120x30 first-run")
+  runLauncher(40, 12, 0, true, "40x12 first-run")
+  # More profiles than the panel can hold: it must SAY how many it hid rather
+  # than quietly showing the first few.
+  runLauncher(80, 24, 40, true, "80x24 overflow")
+
+  notFused(120, 30)
+  notFused(80, 24)
+  handoff(119)
+  handoff(39)
 
   echo ""
   if failures == 0:
