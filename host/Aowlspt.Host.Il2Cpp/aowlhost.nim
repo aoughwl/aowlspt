@@ -298,6 +298,11 @@ static int aowl_rva_is_code(unsigned int rva) {
 ## MUST follow `aowlspt_prologue.h` -- every verify goes through the STARTUP
 ## SNAPSHOT, never live memory. See `aowlspt_nativeui.h`.
 {.emit: """#include "aowlspt_nativeui.h" """.}
+## The unified backend-agnostic widget core. This TU is the ONE that defines
+## AOWL_UI_HOST, so `g_ui` (the retained widget table + binding table) is
+## instantiated here exactly once. See `aowlui.nim` and `aowlspt_ui.h`.
+{.emit: """#define AOWL_UI_HOST
+#include "aowlspt_ui.h" """.}
 ## The main menu's bottom-right GAME MODE label: the verified `PreloaderUI`
 ## targets (`Update`, `SetGameModeText`, `RefreshCornerLabel`) and the one call
 ## thunk that drives it. The implementation is in `modetext.nim` (included
@@ -5703,6 +5708,10 @@ include "settingsui.nim"
 ## declarations are what make that legal.
 proc nuProofWanted(): bool
 proc nuProofRun(tab: Il2CppPtr)
+## The unified-framework dual-backend proof rides the SAME drain, for the same
+## reason. Declared here, defined in `aowlui.nim` (included after invoke2).
+proc auProofWanted(): bool
+proc auProofRun(tab: Il2CppPtr)
 
 include "invoke2.nim"
 
@@ -5713,6 +5722,13 @@ include "invoke2.nim"
 ## `nuCreate`/`nuAdd`/`nuLayout`/`nuSetText`/`nuClone`/`nuDestroyAll`,
 ## `bindNativeUi`, and the visual self-proof `nuProofRun`.
 include "nativeui.nim"
+
+## The UNIFIED WIDGET FRAMEWORK, `include`d after `nativeui.nim` so it can use
+## the `nu*` primitives directly. Composable widgets (uiPanel/uiLabel/uiToggle/
+## uiButton/uiTabStrip/uiRow/bindToConfig) over BOTH backends -- the D3D11
+## overlay and native Unity UI -- behind one caller-facing signature, with the
+## backend selectable. The dual-backend self-proof is `auProofRun`.
+include "aowlui.nim"
 
 ## The in-game, Unity-native debug overlay (the F3 panel + in-world AI markers).
 ## `include`d rather than imported, and LAST, because it stands on everything
@@ -7183,6 +7199,11 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
   # all; `nativeUiProof` additionally runs the one-shot visual self-proof.
   gNuOn = readBoolKey("nativeUi")
   gNuProof = gNuOn and readBoolKey("nativeUiProof")
+  # The unified widget framework. `aowlUi` arms the framework (its native
+  # realisation reuses the nativeui primitives, so it implies `nativeUi`);
+  # `aowlUiProof` runs the one-shot dual-backend self-proof.
+  gAuOn = readBoolKey("aowlUi") and gNuOn
+  gAuProof = gAuOn and readBoolKey("aowlUiProof")
   # NOTE: `bindNativeUi` is deliberately NOT called here. It was, and the first
   # live run showed why that is wrong: this pass runs before il2cpp is attached
   # and before GameAssembly.dll is loaded, so all 25 targets refused with "no
@@ -7576,6 +7597,8 @@ proc hostMain() {.exportc: "aowlspt_nim_host_main", cdecl.} =
       # invoke2's postfix below.
       if gNuOn:
         bindNativeUi(true)
+      if gAuOn:
+        bindAowlUi(true)
 
       if gMi2Probe and not bindManagedInvoke(true):
         info "the managed-invoke probe did not verify " &
