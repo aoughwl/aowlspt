@@ -4,8 +4,8 @@
     "id": "aowl.registry.official",
     "name": "aowlspt official registry",
     "description": "Every mod built in this repository, plus the lists that name them. One file with one git history, so a mod list is a document you can send someone.",
-    "revision": 15,
-    "updated": "2026-08-27"
+    "revision": 16,
+    "updated": "2026-08-28"
   },
   "mods": [
     {
@@ -79,6 +79,7 @@
     },
     {
       "id": "aowl.morebots",
+      "parent": "aowl.sain",
       "name": "Bot AI: population",
       "internal": true,
       "author": "TacticalToaster (ported to aowlspt)",
@@ -481,6 +482,8 @@
     },
     {
       "id": "aowl.waypoints",
+      "internal": true,
+      "parent": "aowl.sain",
       "name": "Waypoints",
       "author": "savannt",
       "version": "1.0.0",

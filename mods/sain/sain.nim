@@ -1408,6 +1408,10 @@ proc sainSchema(): seq[Setting] =
   ## control that lies is worse than an absent one. Each becomes true when the
   ## driver ticks against real bots and somebody watches a raid, not before.
   ##
+  ## Two SECTIONS of this page are NOT declared here. `Bot AI > Population`
+  ## and `Bot AI > Waypoints` are declared by the mods that own them and
+  ## proxied in -- see `childGuids` below.
+  ##
   ## The spawn-population rows (`Bot AI > Population`) are NOT declared here.
   ## They belong to the population half of this mod, a separately loaded binary
   ## (guid `aowl.morebots`, hidden from the player mod list) which owns the
@@ -1598,53 +1602,88 @@ proc sainSchema(): seq[Setting] =
                 implemented = false)]
 
 # ---------------------------------------------------------------------------
-# The population half's rows, proxied into this page
+# The child mods' rows, proxied into this page
 # ---------------------------------------------------------------------------
 
-const PopGuid = "aowl.morebots"
-  ## INTERNAL identifier of the population half, and not user-visible anywhere:
-  ## it is hidden from the mod list, declares no nav entry of its own, and its
-  ## rows render as `Bot AI > Population`. Do NOT rename it -- the registry, the
-  ## selection store, its routes and deploy verification all key off this
-  ## exact string.
+proc childGuids(): seq[string] =
+  ## The INTERNAL guids of the mods whose rows render inside this page, in the
+  ## order their sections appear. None of these is user-visible anywhere: each
+  ## is hidden from the mod list, declares its schema with `inIndex = false`
+  ## so it claims no nav entry of its own, and has its rows proxied here --
+  ## `aowl.morebots` as `Bot AI > Population`, `aowl.waypoints` as
+  ## `Bot AI > Waypoints`. Do NOT rename one: the registry, the selection
+  ## store, their routes and deploy verification all key off these exact
+  ## strings, and `registry/mods.json` records the same tree declaratively as
+  ## `"parent": "aowl.sain"`.
+  ##
+  ## Adding a child is this list plus `inIndex = false` in that mod, and
+  ## nothing else. The child keeps its guid, its routes and its own
+  ## `config.json`, and it stays the ONE owner of its values: this page
+  ## renders them and forwards a write back to it. A row that rendered here
+  ## and also persisted here would be two sources of truth and would drift.
+  result = @["aowl.morebots", "aowl.waypoints"]
 
-var gPopRows = ""                 ## the rows it last announced, verbatim
-var gPopKeys: seq[string] = @[]   ## the keys those rows carry
-var gPopSubscribed = false
+var gChildRows: seq[string] = @[]    ## rows each child last announced, by slot
+var gChildKeys: seq[string] = @[]    ## every key any child carries...
+var gChildOwner: seq[string] = @[]   ## ...and the guid that owns it, parallel
+var gChildSubscribed = false
 
-proc onPopRows(rowsText: string) =
-  gPopRows = rowsText
-  gPopKeys = @[]
-  let rows = parseArray(rowsText)
-  for ri in 0 ..< rows.len:
-    let k = field(at(rows, ri), "key").asText("")
-    if k.len > 0: gPopKeys.add k
+proc childIndex(guid: string): int =
+  result = -1
+  let gs = childGuids()
+  for i in 0 ..< gs.len:
+    if gs[i] == guid: return i
 
-proc onPopPage(payload: string): string =
-  if field(payload, "guid").asText("") == PopGuid:
-    onPopRows(field(payload, "rows").raw())
+proc rebuildChildKeys() =
+  ## Recompute the key -> owner table from every slot. Rebuilt whole rather
+  ## than appended to, so a child that re-announces a SHORTER schema does not
+  ## leave a stale key behind pointing at it.
+  gChildKeys = @[]
+  gChildOwner = @[]
+  let gs = childGuids()
+  for i in 0 ..< gChildRows.len:
+    if gChildRows[i].len <= 1: continue
+    let rows = parseArray(gChildRows[i])
+    for ri in 0 ..< rows.len:
+      let k = field(at(rows, ri), "key").asText("")
+      if k.len > 0:
+        gChildKeys.add k
+        gChildOwner.add gs[i]
+
+proc onChildRows(guid, rowsText: string) =
+  let i = childIndex(guid)
+  if i < 0: return
+  while gChildRows.len < childGuids().len: gChildRows.add ""
+  gChildRows[i] = rowsText
+  rebuildChildKeys()
+
+proc onChildPage(payload: string): string =
+  onChildRows(field(payload, "guid").asText(""), field(payload, "rows").raw())
   result = ""
 
-proc onPopApplied(payload: string): string =
-  if field(payload, "guid").asText("") == PopGuid:
-    onPopRows(field(payload, "rows").raw())
+proc onChildApplied(payload: string): string =
+  onChildRows(field(payload, "guid").asText(""), field(payload, "rows").raw())
   result = ""
 
-proc popSubscribe() =
-  if gPopSubscribed: return
-  discard on(SettingsPageAnnounce, onPopPage)
-  discard on(SettingsApplyAnnounce, onPopApplied)
-  gPopSubscribed = true
+proc childSubscribe() =
+  if gChildSubscribed: return
+  discard on(SettingsPageAnnounce, onChildPage)
+  discard on(SettingsApplyAnnounce, onChildApplied)
+  gChildSubscribed = true
 
-proc refreshPopRows() =
-  ## Ask the population half for its rows. The broadcast is SYNCHRONOUS --
-  ## `deliverEvent` calls every subscriber before `emit` returns -- so
-  ## `gPopRows` is current when this returns, or stays EMPTY, which means that
-  ## half is not loaded. Empty is reported as an ABSENT section, never as an
-  ## empty one: "I could not look" is not "there is nothing there".
-  popSubscribe()
-  gPopRows = ""
-  discard emit(SettingsPageQuery, PopGuid)
+proc refreshChildRows() =
+  ## Ask every child for its rows. The broadcast is SYNCHRONOUS --
+  ## `deliverEvent` calls every subscriber before `emit` returns -- so a slot
+  ## is current when this returns, or stays EMPTY, which means that child is
+  ## not loaded. Empty is reported as an ABSENT section, never as an empty
+  ## one: "I could not look" is not "there is nothing there".
+  childSubscribe()
+  gChildRows = @[]
+  let gs = childGuids()
+  for i in 0 ..< gs.len: gChildRows.add ""
+  rebuildChildKeys()
+  for g in gs:
+    discard emit(SettingsPageQuery, g)
 
 proc ownsKey(key: string): bool =
   result = false
@@ -1654,33 +1693,36 @@ proc ownsKey(key: string): bool =
   for st in mine:
     if st.key == key: return true
 
-proc popOwnsKey(key: string): bool =
-  result = false
-  for pk in gPopKeys:
-    if pk == key: return true
+proc childOwnerOf(key: string): string =
+  ## The guid that owns a proxied key, or "" if no child claims it.
+  result = ""
+  for i in 0 ..< gChildKeys.len:
+    if gChildKeys[i] == key: return gChildOwner[i]
 
 proc mergedPage(): string =
-  ## This mod's rows followed by the population half's, as ONE array.
-  refreshPopRows()
+  ## This mod's rows followed by every child's, in section order, as ONE array.
+  refreshChildRows()
   var outList = parseArray(schemaJson(declaredSettings()).text)
-  if gPopRows.len > 1:
-    let pop = parseArray(gPopRows)
-    for ri in 0 ..< pop.len:
-      outList.add at(pop, ri).raw()
+  for i in 0 ..< gChildRows.len:
+    if gChildRows[i].len <= 1: continue
+    let sub = parseArray(gChildRows[i])
+    for ri in 0 ..< sub.len:
+      outList.add at(sub, ri).raw()
   result = outList.text()
 
-proc forwardToPop(body: string; isReset: bool): bool =
-  ## True if the edit named a population row and was handed to its OWNER. A
-  ## key this mod declares always wins, so a proxy can never shadow a local
-  ## row; an unknown key is refused here and falls through to the normal
-  ## local path, which reports it properly.
+proc forwardToChild(body: string; isReset: bool): bool =
+  ## True if the edit named a proxied row and was handed to its OWNER. A key
+  ## this mod declares always wins, so a proxy can never shadow a local row;
+  ## an unknown key is refused here and falls through to the normal local
+  ## path, which reports it properly.
   result = false
   let k = field(body, "key").asText("")
   if k.len == 0 or ownsKey(k): return false
-  popSubscribe()
-  if gPopKeys.len == 0: refreshPopRows()
-  if not popOwnsKey(k): return false
-  var q = "{\"guid\":\"" & PopGuid & "\",\"key\":\"" & k & "\""
+  childSubscribe()
+  if gChildKeys.len == 0: refreshChildRows()
+  let owner = childOwnerOf(k)
+  if owner.len == 0: return false
+  var q = "{\"guid\":\"" & owner & "\",\"key\":\"" & k & "\""
   if isReset:
     q = q & ",\"reset\":true}"
   else:
@@ -1693,7 +1735,7 @@ proc onSainSettings(url, body, session: string): string =
   ## reads its settings inline, so the write is saved and applied at the next
   ## load rather than made live here.
   var st = Ok
-  if body.len > 0 and not forwardToPop(body, false):
+  if body.len > 0 and not forwardToChild(body, false):
     st = applySettingFromBody(body)
   if st != Ok:
     return declaredSchemaReply(st).text
@@ -1701,7 +1743,7 @@ proc onSainSettings(url, body, session: string): string =
 
 proc onSainSettingsReset(url, body, session: string): string =
   var st = Ok
-  if not forwardToPop(body, true):
+  if not forwardToChild(body, true):
     st = resetFromBody(body)
   if st != Ok:
     return declaredSchemaReply(st).text
