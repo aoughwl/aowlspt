@@ -67,6 +67,7 @@ proc cOvSyncAttempts(): int32 {.importc: "aowl_ov_sync_attempts", nodecl.}
 proc cOvPostStart(path: cstring; body: cstring) {.
   importc: "aowl_ov_post_start", nodecl.}
 proc cOvPostPending(): int32 {.importc: "aowl_ov_post_pending", nodecl.}
+proc cOvPostStage(): int32 {.importc: "aowl_ov_post_stage", nodecl.}
 proc cOvPostTake(buf: ptr char; cap: int32; ok: ptr int32): int32 {.
   importc: "aowl_ov_post_take", nodecl.}
 proc cOvSetPrePresent(fn: pointer) {.importc: "aowl_ov_set_pre_present", nodecl.}
@@ -201,6 +202,17 @@ proc overlayPostPending*(): bool =
   ## landed (whether or not `overlayPostTake` has read it yet) -- poll this
   ## before arming the next write into the single slot.
   cOvPostPending() != 0'i32
+
+proc overlayPostStageName*(): string =
+  ## WHICH KIND of busy `overlayPostPending` is reporting, in words a log line
+  ## can use. "never came back" is not a cause; "still armed and unsent"
+  ## (the worker thread never got to the write leg) and "sent, no reply yet"
+  ## (the backend or the network) are different faults with different fixes.
+  case cOvPostStage()
+  of 1'i32: "still ARMED and unsent -- the overlay worker thread has not " &
+            "reached the write leg (it is busy in a long call)"
+  of 2'i32: "SENT and awaiting a reply from the backend"
+  else: "idle -- nothing is armed and nothing is in flight"
 
 proc overlayPostTake*(): tuple[got: bool, ok: bool, body: string] =
   ## The last completed write's outcome, taken once. `got = false` means

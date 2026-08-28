@@ -291,7 +291,15 @@ proc sbTick(now: uint64) =
       return
     if overlayPostPending():
       if gSbArmedAt > 0'u64 and now - gSbArmedAt > cSbStallMs:
-        sbFault("a client settings push to the backend never came back")
+        # NAME THE STAGE (CLAUDE.md 6). "never came back" was a symptom, and
+        # it sent four sessions looking at the backend and the port -- the
+        # backend had answered every one of these. The stall was on OUR side:
+        # `aowl_ov_settings_verify` blocks the single overlay worker thread
+        # for up to 32 s after an F12 edit, so the armed POST was never sent.
+        sbFault("a client settings push for '" & gSbMods[gSbIdx].guid &
+                "' did not complete within " & $cSbStallMs & " ms; the " &
+                "overlay POST slot is " & overlayPostStageName() &
+                ". The edit riding on this push's reply is NOT applied")
         gSbArmedAt = 0'u64
         gSbIdx = gSbIdx + 1
       return

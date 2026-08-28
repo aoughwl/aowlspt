@@ -52,6 +52,11 @@ static void aowl_ov_settings_load(const char* guid, int32_t isMod,
                                   char* buf, int32_t cap);
 static int32_t aowl_ov_fetch(const wchar_t* verb, const wchar_t* path,
                              const char* body, char* buf, int32_t cap);
+/* The write leg the verify wait now pumps. Counted, not modelled: whether
+ * pumping it keeps the pipeline moving is `tools/test_settings_push.c`'s
+ * question, and this file's scenarios drive `pushes` directly. */
+static int32_t g_pumps = 0;
+static void aowl_ov_pump_post(void) { g_pumps++; }
 
 /* ---- the sliced-in production code -------------------------------------- */
 

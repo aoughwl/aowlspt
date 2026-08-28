@@ -353,6 +353,16 @@ static int32_t aowl_ov_sync_attempts(void);
 static void    aowl_ov_post_start(const char* path, const char* body);
 static int32_t aowl_ov_post_pending(void);
 static int32_t aowl_ov_post_take(char* out, int32_t cap, int32_t* ok);
+/* 0 = idle, 1 = armed and NOT YET SENT by the worker, 2 = sent and awaiting a
+ * response. `aowl_ov_post_pending` collapses 1 and 2 into "busy", which is
+ * exactly the distinction a stalled caller needs in order to name a cause
+ * instead of saying "never came back". */
+static int32_t aowl_ov_post_stage(void);
+/* Sends the armed POST, if any, and publishes its outcome. Extracted from the
+ * worker loop so that ANY long-running worker-thread routine can pump it --
+ * see `aowl_ov_settings_verify`, which waits on progress that only this leg
+ * can produce. WORKER THREAD ONLY (it owns the static request buffer). */
+static void    aowl_ov_pump_post(void);
 
 /* ================================================================== *
  * Baked assets
@@ -3598,6 +3608,10 @@ static void aowl_ov_settings_load(const char* pageId, int32_t isMod,
  * never reaches it, since the loop returns the moment the row matches. */
 #define AOWL_OV_VERIFY_TRIES 40
 #define AOWL_OV_VERIFY_WAIT  800
+/* The wait is served in slices, pumping the POST write leg between them --
+ * see `aowl_ov_pump_post`. 100 ms divides 800 exactly, so the wall-clock
+ * budget above is unchanged; it just stops being a starvation window. */
+#define AOWL_OV_VERIFY_SLICE 100
 /* A page nobody has ever pushed as a CLIENT page is server-side (or the
  * panel's own generated one): its store is authoritative the instant the POST
  * returns, so no window has to open and a verdict is available at once. */
@@ -3710,7 +3724,20 @@ static void aowl_ov_settings_verify(const char* guid, const char* key,
         }
         if (windowOpen) break;
         if (try_ + 1 < tries) {
-            Sleep(AOWL_OV_VERIFY_WAIT);
+            /* NOT a bare Sleep. The progress this loop is waiting for --
+             * `pushes` going up -- is produced by the settings bridge's
+             * `client/sync` POST, and the ONLY thread that sends that POST is
+             * this one. Sleeping through the wait starves the write leg for
+             * the whole 32 s cap, which is a deadlock the cap merely hides
+             * (and which made the bridge fault its push away at 12 s). Pump
+             * it in AOWL_OV_VERIFY_SLICE slices instead: the loop still waits
+             * AOWL_OV_VERIFY_WAIT of wall clock, but the pipeline it is
+             * watching keeps running underneath it. */
+            int32_t slept = 0;
+            for (; slept < AOWL_OV_VERIFY_WAIT; slept += AOWL_OV_VERIFY_SLICE) {
+                aowl_ov_pump_post();
+                Sleep(AOWL_OV_VERIFY_SLICE);
+            }
             aowl_ov_settings_load(guid, isMod, buf, cap);
         }
     }
@@ -4484,44 +4511,7 @@ static DWORD WINAPI aowl_ov_worker(LPVOID unused) {
          * published, success or failure: unlike the GET feed, a write's
          * failure is not "keep showing the old value", it is something the
          * caller must be told so it does not believe an edit stuck. */
-        {
-            wchar_t wpath[192];
-            static char reqBody[AOWL_OV_POST_BODY];
-            int32_t wantPost = 0;
-            EnterCriticalSection(&g_ov.cs);
-            if (g_ov.postArm) {
-                int32_t i = 0;
-                for (; g_ov.postPath[i] && i < 191; i++)
-                    wpath[i] = (wchar_t)(unsigned char)g_ov.postPath[i];
-                wpath[i] = 0;
-                aowl_ov_copy(reqBody, (int32_t)sizeof(reqBody), g_ov.postBody);
-                g_ov.postArm = 0;
-                g_ov.postInFlight = 1;
-                wantPost = 1;
-            }
-            LeaveCriticalSection(&g_ov.cs);
-
-            if (wantPost) {
-                int32_t rc = aowl_ov_http(L"POST", wpath, reqBody, buf,
-                                          (int32_t)sizeof(buf));
-                int32_t ok = (rc > 0 && (unsigned char)buf[0] != 0x78);
-                EnterCriticalSection(&g_ov.cs);
-                if (ok) {
-                    int32_t n = rc;
-                    if (n >= AOWL_OV_SYNC_MAX) n = AOWL_OV_SYNC_MAX - 1;
-                    memcpy(g_ov.postResp, buf, (size_t)n);
-                    g_ov.postResp[n] = 0;
-                    g_ov.postRespLen = n;
-                } else {
-                    g_ov.postResp[0] = 0;
-                    g_ov.postRespLen = 0;
-                }
-                g_ov.postOk = ok;
-                g_ov.postInFlight = 0;
-                g_ov.postSerial++;
-                LeaveCriticalSection(&g_ov.cs);
-            }
-        }
+        aowl_ov_pump_post();
 
         /* --- THE LOG TAIL ------------------------------------------------
          *
@@ -4629,6 +4619,81 @@ static int32_t aowl_ov_post_pending(void) {
     n = (g_ov.postArm || g_ov.postInFlight) ? 1 : 0;
     LeaveCriticalSection(&g_ov.cs);
     return n;
+}
+
+/* The three-way stage behind `aowl_ov_post_pending`'s single bit. See the
+ * forward declaration for why the distinction is load-bearing. */
+static int32_t aowl_ov_post_stage(void) {
+    int32_t n;
+    if (!g_ov.started) return 0;
+    EnterCriticalSection(&g_ov.cs);
+    n = g_ov.postInFlight ? 2 : (g_ov.postArm ? 1 : 0);
+    LeaveCriticalSection(&g_ov.cs);
+    return n;
+}
+
+/* THE WRITE LEG, AND WHY IT IS A FUNCTION.
+ *
+ * This used to be an inline block at the tail of the worker loop, which meant
+ * it ran exactly once per pass -- and `aowl_ov_settings_verify` blocks that
+ * same worker thread for up to AOWL_OV_VERIFY_TRIES * AOWL_OV_VERIFY_WAIT
+ * (32 s). MEASURED against a live client on 2026-08-28: from the moment an
+ * edit was POSTed, `GET /aowlspt/mods/panel` and `GET /aowlspt/mods/list`
+ * stopped entirely and `POST /aowlspt/settings/client/sync` dropped from six
+ * per five seconds to ONE per 31.3 s -- one per verify cap. The settings
+ * bridge's 12 s stall budget expired first every time, so it reported "a
+ * client settings push to the backend never came back" and dropped the push,
+ * and the F12 edit riding on that push's reply was never applied.
+ *
+ * Worse, it could not resolve itself: the verify loop waits for this guid to
+ * republish twice, and a republish IS a `client/sync` POST -- which only this
+ * leg can send. Waiting on the worker for progress the worker is the sole
+ * producer of is a deadlock with a 32-second timer on it.
+ *
+ * So the wait pumps this instead of sleeping through it. Cheap when nothing
+ * is armed: one critical section and a return. WORKER THREAD ONLY. */
+static void aowl_ov_pump_post(void) {
+    wchar_t wpath[192];
+    static char reqBody[AOWL_OV_POST_BODY];
+    static char respBuf[AOWL_OV_SYNC_MAX];
+    int32_t wantPost = 0;
+    int32_t rc, ok, n;
+    if (!g_ov.started) return;
+    EnterCriticalSection(&g_ov.cs);
+    if (g_ov.postArm) {
+        int32_t i = 0;
+        for (; g_ov.postPath[i] && i < 191; i++)
+            wpath[i] = (wchar_t)(unsigned char)g_ov.postPath[i];
+        wpath[i] = 0;
+        aowl_ov_copy(reqBody, (int32_t)sizeof(reqBody), g_ov.postBody);
+        g_ov.postArm = 0;
+        g_ov.postInFlight = 1;
+        wantPost = 1;
+    }
+    LeaveCriticalSection(&g_ov.cs);
+    if (!wantPost) return;
+
+    /* Its own response buffer, not the worker loop's `buf`: this now runs from
+     * inside `aowl_ov_settings_verify`, which is holding page bytes in the
+     * buffer it passed down and re-reads them after the wait. */
+    rc = aowl_ov_http(L"POST", wpath, reqBody, respBuf,
+                      (int32_t)sizeof(respBuf));
+    ok = (rc > 0 && (unsigned char)respBuf[0] != 0x78);
+    EnterCriticalSection(&g_ov.cs);
+    if (ok) {
+        n = rc;
+        if (n >= AOWL_OV_SYNC_MAX) n = AOWL_OV_SYNC_MAX - 1;
+        memcpy(g_ov.postResp, respBuf, (size_t)n);
+        g_ov.postResp[n] = 0;
+        g_ov.postRespLen = n;
+    } else {
+        g_ov.postResp[0] = 0;
+        g_ov.postRespLen = 0;
+    }
+    g_ov.postOk = ok;
+    g_ov.postInFlight = 0;
+    g_ov.postSerial++;
+    LeaveCriticalSection(&g_ov.cs);
 }
 
 /* Copies the last completed POST's response out and marks it read, once.
