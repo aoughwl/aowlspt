@@ -137,6 +137,29 @@ type
     spawnRows*: int
     why*: string      ## why `ok` is false, when it is
 
+  ContainerCensus* = object
+    ## What the loot-table walker actually SAW, counted per rejection reason.
+    ##
+    ## This exists because the old diagnostic said "0 of 429 static-container
+    ## rows parsed", which is false and was read as a parser bug by everyone
+    ## who saw it. The rows parse perfectly: 429 of 429 carry `template`, 429
+    ## of 429 carry `template.Position`. Every one of those positions is
+    ## `(0,0,0)` -- MEASURED here, in `D:\Aowlspt\aowlspt\db.json` AND in the
+    ## SPT source it was imported from
+    ## (`SPT_Data\database\locations\woods\staticContainers.json`), on all 13
+    ## maps that have the table: 0 rows with a non-zero x or z, out of 7,092.
+    ## A count of rejections per REASON cannot say "did not parse" about a row
+    ## it read three fields out of.
+    map*: string      ## the id we were asked about
+    key*: string      ## the database key `canonicalLocation` resolved it to
+    rows*: int        ## rows the tables handed back
+    withTemplate*: int      ## rows carrying `template`
+    withPosition*: int      ## ... and `template.Position`
+    positioned*: int        ## ... whose x or z is non-zero
+    zeroProbability*: int   ## positioned, but `probability` <= 0
+    usable*: int            ## positioned and spawnable: what binning gets
+    tables*: string   ## which db tables were read, and their row counts
+
   Cell = object
     used: bool
     cx, cz: int
@@ -269,6 +292,142 @@ proc hasText(j: JsonRef; want: string): bool =
   result = false
 
 # ---------------------------------------------------------------------------
+# The loot tables
+# ---------------------------------------------------------------------------
+
+proc scanLootTable(path: string; cell: float; bin: bool;
+                   lootUsed: var int; c: var ContainerCensus) =
+  ## Walk ONE positional loot table, counting every row and every reason a row
+  ## was not used. Both tables SPT ships have the identical row shape
+  ## `{probability, template:{Id, IsContainer, useGravity, Position:{x,y,z},
+  ## ...}}`, so one walker reads both -- and, more importantly, the counting
+  ## and the binning are the SAME pass. A separate counting pass could report
+  ## a census the binner does not agree with, which is the failure mode this
+  ## whole change is about.
+  let t = dbRead(path)
+  if not t.ok:
+    return
+  let list = whole(t.raw)
+  let n = count(list)
+  if n <= 0:
+    return
+  if c.tables.len > 0:
+    c.tables.add ", "
+  c.tables.add path & " (" & $n & " rows)"
+  c.rows = c.rows + n
+  var i = 0
+  while i < n and i < MaxContainers:
+    let row = at(list, i)
+    # Two single-key steps, not the dotted path `template.Position`.
+    # MEASURED: the dotted form returned not-found for all 552 rows of
+    # Customs while the single-key form on the same JsonRef returns the
+    # object. That WAS a parse bug; it is fixed, and the counters below are
+    # what tell a returning parse bug apart from a table of zeroes.
+    let tpl = field(row, "template")
+    if exists(tpl):
+      inc c.withTemplate
+      let pos = field(tpl, "Position")
+      if exists(pos):
+        inc c.withPosition
+        let x = asFloat(field(pos, "x"), 0.0)
+        let y = asFloat(field(pos, "y"), 0.0)
+        let z = asFloat(field(pos, "z"), 0.0)
+        if x != 0.0 or z != 0.0:
+          inc c.positioned
+          # A probability of 0 is a container that never spawns; it must not
+          # pull the centroid, and it must not count as density.
+          let p = clampf(asFloat(field(row, "probability"), 0.0), 0.0, 1.0)
+          if p <= 0.0:
+            inc c.zeroProbability
+          else:
+            inc c.usable
+            if bin:
+              bump(gLootCells, lootUsed, floorDiv(x, cell), floorDiv(z, cell),
+                   x, y, z, p)
+    inc i
+
+proc lootCensus*(key: string; cell: float; bin: bool;
+                 lootUsed: var int): ContainerCensus =
+  ## Every positional loot table this database has for one map.
+  ##
+  ## `staticContainers` is the table ORBIT was written against and it carries
+  ## no coordinates on any build we have (see `ContainerCensus`). `looseLoot`
+  ## carries REAL ones -- 1,689 rows on Woods, 1,689 of them non-zero, same
+  ## row shape -- and is imported only when `importdb` was run with `--loose`,
+  ## which is why the loot layer is empty on the shipped db.json and lights up
+  ## with no further change on a db that has it. Reading both is the fix: it
+  ## is the only positional loot source SPT actually ships.
+  ##
+  ## `key` must already be a DATABASE key. Callers resolve through
+  ## `canonicalLocation` (emu/raid) -- do NOT add a second resolver here; the
+  ## client sends `base.Id` ("Woods") and the tables are keyed "woods", and
+  ## that confusion has already failed silently in four places.
+  result = ContainerCensus(map: key, key: key, rows: 0, withTemplate: 0,
+                           withPosition: 0, positioned: 0, zeroProbability: 0,
+                           usable: 0, tables: "")
+  if key.len == 0:
+    return
+  scanLootTable("locations." & key & ".staticContainers.staticContainers",
+                cell, bin, lootUsed, result)
+  scanLootTable("locations." & key & ".looseLoot.spawnpoints",
+                cell, bin, lootUsed, result)
+
+proc censusJson*(c: ContainerCensus): string =
+  var o = obj()
+  put(o, "map", c.map)
+  put(o, "key", c.key)
+  put(o, "rows", c.rows)
+  put(o, "withTemplate", c.withTemplate)
+  put(o, "withPosition", c.withPosition)
+  put(o, "positioned", c.positioned)
+  put(o, "zeroProbability", c.zeroProbability)
+  put(o, "usable", c.usable)
+  put(o, "tables", c.tables)
+  # The verdict, computed HERE so every consumer agrees on it. Three outcomes,
+  # never two.
+  var verdict = "PASS"
+  var why = ""
+  if c.key.len == 0:
+    verdict = "INCONCLUSIVE"
+    why = "'" & c.map & "' does not resolve to a database key"
+  elif c.rows == 0:
+    verdict = "INCONCLUSIVE"
+    why = "no positional loot table exists for '" & c.key & "'"
+  elif c.withTemplate < c.rows or c.withPosition < c.withTemplate:
+    verdict = "FAIL"
+    why = "PARSE MISMATCH: of " & $c.rows & " rows, " & $c.withTemplate &
+          " carried 'template' and " & $c.withPosition &
+          " carried 'template.Position'. The row shape changed under the " &
+          "reader; this is a code fix, not a data property"
+  elif c.positioned == 0:
+    verdict = "PASS"
+    why = "all " & $c.rows & " rows parsed (" & $c.withPosition &
+          " with template.Position) and every Position is (0,0,0). That is " &
+          "a measured property of SPT's staticContainers table, not a parse " &
+          "failure. Import with --loose to get looseLoot.spawnpoints, which " &
+          "carries real coordinates"
+  elif c.usable == 0:
+    verdict = "FAIL"
+    why = $c.positioned & " rows carry a real coordinate and NOT ONE is " &
+          "spawnable (" & $c.zeroProbability & " have probability <= 0). A " &
+          "table of positioned containers that all never spawn is a filter " &
+          "bug here, not a database property"
+  put(o, "verdict", verdict)
+  put(o, "why", why)
+  result = done(o).text
+
+proc lootCensusFor*(locationId: string): string =
+  ## The census for one map, by the id the CLIENT uses ("Woods"), resolved
+  ## through the one resolver. Needs no raid, which is what lets a test assert
+  ## the negative over all 24 maps instead of over the one that happened to be
+  ## loaded.
+  var used = 0
+  var c = lootCensus(canonicalLocation(locationId), orbitCellSize(), false,
+                     used)
+  c.map = locationId
+  result = censusJson(c)
+
+# ---------------------------------------------------------------------------
 # The plan
 # ---------------------------------------------------------------------------
 
@@ -298,35 +457,9 @@ proc buildPlan*(locationId: string): OrbitPlan =
   var pvpUsed = 0
   var roamUsed = 0
 
-  let cont = dbRead("locations." & key &
-                    ".staticContainers.staticContainers")
-  if cont.ok:
-    let list = whole(cont.raw)
-    let n = count(list)
-    result.containerRows = n
-    var i = 0
-    while i < n and i < MaxContainers:
-      let row = at(list, i)
-      # Two single-key steps, not the dotted path `template.Position`.
-      # MEASURED: the dotted form returned not-found for all 552 rows of
-      # Customs while the single-key form on the same JsonRef returns the
-      # object -- `containerRows` 552, `containersSeen` 0, every anchor a
-      # spawn point. The plan looked plausible and had no loot layer in it at
-      # all, which is why `orbitCheck` now counts loot anchors separately.
-      let tpl = field(row, "template")
-      let pos = field(tpl, "Position")
-      if exists(pos):
-        let x = asFloat(field(pos, "x"), 0.0)
-        let y = asFloat(field(pos, "y"), 0.0)
-        let z = asFloat(field(pos, "z"), 0.0)
-        # A probability of 0 is a container that never spawns; it must not pull
-        # the centroid, and it must not count as density.
-        let p = clampf(asFloat(field(row, "probability"), 0.0), 0.0, 1.0)
-        if p > 0.0 and (x != 0.0 or z != 0.0):
-          inc result.containersSeen
-          bump(gLootCells, lootUsed, floorDiv(x, cell), floorDiv(z, cell),
-               x, y, z, p)
-      inc i
+  let census = lootCensus(key, cell, true, lootUsed)
+  result.containerRows = census.rows
+  result.containersSeen = census.usable
 
   let sp = dbRead("locations." & key & ".base.SpawnPointParams")
   if sp.ok:
@@ -360,17 +493,29 @@ proc buildPlan*(locationId: string): OrbitPlan =
             inc result.spawnPointsSeen
       inc i
 
-  if result.containerRows > 0 and result.containersSeen == 0:
-    # Say WHAT was in the row rather than that nothing was. A layer that reads
-    # zero of 552 rows is a parse mismatch, and a parse mismatch is only
-    # diagnosable from the bytes.
-    let row0 = at(whole(cont.raw), 0)
-    var head = raw(row0)
-    if head.len > 200:
-      head = head.substr(0, 200)
-    result.why = "0 of " & $result.containerRows &
-                 " static-container rows parsed. First row begins: " & head
-    warn "orbit: " & result.why
+  if census.rows > 0 and census.usable == 0:
+    # The old message here said "0 of 429 static-container rows parsed" and
+    # was READ AS A PARSER BUG, because that is what it says. It was wrong:
+    # every one of those rows parses. Say which rejection reason actually
+    # fired, counted, and escalate only the reason that IS a defect.
+    #
+    # FATAL-loud vs merely reported is the whole point of splitting these:
+    #   - a PARSE MISMATCH is ours and is an `error`, and the plan is refused;
+    #   - an all-zero position table is a measured property of SPT's data on
+    #     every build we have, and shouting it once per raid taught everyone
+    #     to ignore the loot layer's log line entirely.
+    let cj = censusJson(census)
+    let verdict = field(cj, "verdict").asText("")
+    let why = field(cj, "why").asText("")
+    result.why = "loot layer: " & verdict & ": " & why & " [" & census.tables &
+                 "]"
+    if verdict == "FAIL":
+      error "orbit: " & result.why
+      # A shape mismatch must not degrade into a raid with a silently missing
+      # loot layer. It refuses, and the caller reports `why`.
+      return
+    else:
+      warn "orbit: " & result.why
   topInto(gLootCells, lootUsed, orbitLootAnchors(), akLoot, result.anchors)
   topInto(gPvpCells, pvpUsed, orbitPvpAnchors(), akPvp, result.anchors)
   # Roam anchors fill whatever the other two layers left. With the loot layer
