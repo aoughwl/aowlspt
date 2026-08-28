@@ -538,6 +538,15 @@ proc publishCapability() =
 var gTick = 0'i64
 var gReported = false
 var gRaidReported = false
+var gRaidSettle = 0
+
+const RaidSettleTicks = 300
+  ## onUpdate ticks to wait after a GameWorld appears before accepting that a
+  ## still-empty position walk is real. Stated as a falsifiable bound, not a
+  ## safe number: at the mod tick rate this is several seconds -- far longer
+  ## than the gap between RegisterPlayer firing and MainPlayer being assigned,
+  ## and short enough that a genuinely broken offset is still reported within
+  ## the first raid rather than never.
 
 
 # ---------------------------------------------------------------------------
@@ -672,9 +681,45 @@ proc onUpdate(elapsedMs: int64): Status =
   if not gReported and gTick > 200:
     gReported = true
     info "admin: " & dataStatus()
+  # MEASURED DEFECT: THIS REPORT COULD ONLY EVER SAY "positions: FAIL".
+  #
+  # From a live Woods raid at [0:08:09.172], with the player already spawned:
+  #     gameworld    : PASS  GameWorld live
+  #     positions    : FAIL  no player position passed the finite/bounded check
+  #
+  # All six offsets that walk were re-verified OFFLINE against the installed
+  # GameAssembly.dll after that log, with `python tools/fldoff.py`, and every
+  # one is correct on this build:
+  #     EFT.GameWorld.AllAlivePlayersList      0x1c8   List<Player>
+  #     EFT.GameWorld.RegisteredPlayers        0x1d0   List<IPlayer>
+  #     EFT.GameWorld.MainPlayer               0x230   Player
+  #     EFT.Player.<MovementContext>k__Backing 0x60    MovementContext
+  #     EFT.MovementContext.PreviousPosition   0x370   Vector3
+  #     EFT.Player.<AIData>k__BackingField     0xa00   IAIData
+  # so the walk was not what failed. The REPORT was.
+  #
+  # `dataInRaid()` is true the instant `hostGameWorld()` is non-null, and that
+  # cache is populated by the host's `RegisterPlayer` detour -- i.e. on the very
+  # first frame a player registers, which is BEFORE `GameWorld.MainPlayer` has
+  # been assigned and before any MovementContext has a PreviousPosition worth
+  # reading. Latching `gRaidReported` on that frame meant the one diagnostic
+  # anyone ever saw was taken at the single moment it was guaranteed to be
+  # empty. It is the CLAUDE.md 9b shape inverted: a check that could only fail.
+  #
+  # So: report the first time positions actually validate -- which is the answer
+  # everyone wanted -- and otherwise only after the raid has had a fair chance,
+  # at which point a FAIL is real evidence rather than an artifact of timing.
+  # Both branches latch together, so this stays exactly one report per raid.
   if not gRaidReported and dataInRaid():
-    gRaidReported = true
-    info adminDiag()
+    gRaidSettle = gRaidSettle + 1
+    if espSeen() > 0 or gRaidSettle >= RaidSettleTicks:
+      gRaidReported = true
+      info adminDiag()
+  elif not dataInRaid():
+    # Re-arm for the NEXT raid. Leaving these latched meant a session that
+    # entered a second raid reported nothing at all about it.
+    gRaidSettle = 0
+    gRaidReported = false
   result = Ok
 
 # ---------------------------------------------------------------------------

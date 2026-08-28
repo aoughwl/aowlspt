@@ -849,12 +849,74 @@ static void aowl_admin_mat_mul(const float* a, const float* b, float* out) {
 #define AOWL_ADM_RVA_CAM_W2C  0x525F2A0u
 #define AOWL_ADM_RVA_CAM_PROJ 0x525F380u
 
+/* ------------------------------------------------------------------ *
+ * MEASURED DEFECT, 2026-08-28: `Camera::get_main` RETURNS NULL IN A RAID.
+ *
+ * The evidence, from the mod's own diagnostic in a live Woods raid at
+ * [0:08:09.172]:
+ *
+ *     esp sampler  : INCONCLUSIVE  armed on everyMain, ... 24604 firings but
+ *                    NO good sample yet
+ *     esp project  : INCONCLUSIVE  bound, but the Unity-thread sampler has
+ *                    never produced a matrix
+ *
+ * Read that against the code below. `aowl_adm_cam_bind` was 3, so all three
+ * prologues byte-matched and every target was callable -- a bind failure would
+ * have printed the PROLOGUE MISMATCH text instead. The only other way out of
+ * `aowl_admin_cam_sample` without bumping `gen` and without burning the fault
+ * budget is the `!cam` branch, and the diag confirms the budget was untouched
+ * (`faults: 0 of 8`). So `get_main` returned NULL on all 24604 firings, in a
+ * raid, with the player spawned.
+ *
+ * That is not a bug in `get_main`. `UnityEngine.Camera.main` is defined as the
+ * first ENABLED camera whose GameObject carries the tag "MainCamera", and
+ * Tarkov's FPS camera does not carry it -- the game reaches its camera through
+ * `EFT.CameraControl.CameraManager` instead, which is why that type exists and
+ * why it holds the camera in a backing field. `mods/fov` has been taking that
+ * route successfully all along; the same session logged "a live CameraManager
+ * and Camera are in hand, from the static verified get_Instance".
+ *
+ * So the fix is not a new mechanism, it is the ROUTE mods/fov already proves.
+ * `get_main` is KEPT and tried first -- it costs one call, it is correct
+ * wherever it works (the hideout and menu scenes do tag a camera), and dropping
+ * a working path to add a fallback would be trading one blind spot for another.
+ *
+ *   EFT.CameraControl.CameraManager::get_Instance @ 0x1263BD0 -- STATIC,
+ *     0 args -> CameraManager. Byte-verified against the INSTALLED
+ *     D:/Games/Tarkov/GameAssembly.dll, section `il2cpp`:
+ *       48 83 EC 28 80 3D E6 8B E5 05 00 75 18 48 8D 0D
+ *     which is `sub rsp,0x28 ; cmp byte [rip+0x5E58BE6],0 ; jne .. ; lea rcx,..`
+ *     -- the il2cpp class-init guard then the static-field load. A real body:
+ *     it is not this build's universal empty-body stub (`C2 00 00`) and not a
+ *     thunk. These are the SAME bytes `mods/fov/fov.nim` records as
+ *     `ProCamInstance` for the same RVA, arrived at independently here by
+ *     reading the PE, so the two agree without one copying the other.
+ *
+ *   CameraManager.<Camera>k__BackingField @ 0x70 -- a FIELD READ, not a call.
+ *     From `python tools/fldoff.py fields EFT.CameraControl.CameraManager`:
+ *       0x70  <Camera>k__BackingField  Camera  private
+ *     `get_Camera` is deliberately NOT called: mods/fov measured that it folds
+ *     to 0x65ED10, `48 8B 41 70 C3` (`mov rax,[rcx+0x70]; ret`), a body SHARED
+ *     with every other `+0x70` reference getter in the build. The getter IS the
+ *     field read, so reading the field gives the identical answer with no
+ *     shared-RVA exposure and no call at all.
+ *
+ * NOT MORE AGGRESSIVE. This adds at most one static call and one guarded field
+ * read to a tick that already ran 24604 times, and it changes nothing about
+ * WHEN the tick runs. The whole sampler is still gated on the ESP toggle, which
+ * ships OFF, so with default flags this code is not reached at all.
+ * ------------------------------------------------------------------ */
+#define AOWL_ADM_RVA_CAM_MGR  0x1263BD0u
+#define AOWL_ADM_OFF_MGR_CAM  0x70
+
 static const unsigned char AOWL_ADM_SIG_CAM_MAIN[16] = {
     0x48,0x83,0xEC,0x28,0x48,0x8B,0x05,0xD5,0x27,0xE7,0x01,0x48,0x85,0xC0,0x75,0x18 };
 static const unsigned char AOWL_ADM_SIG_CAM_W2C[16] = {
     0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,0x2F,0x3A,0xE7 };
 static const unsigned char AOWL_ADM_SIG_CAM_PROJ[16] = {
     0x48,0x89,0x5C,0x24,0x08,0x57,0x48,0x83,0xEC,0x20,0x48,0x8B,0x05,0x5F,0x39,0xE7 };
+static const unsigned char AOWL_ADM_SIG_CAM_MGR[16] = {
+    0x48,0x83,0xEC,0x28,0x80,0x3D,0xE6,0x8B,0xE5,0x05,0x00,0x75,0x18,0x48,0x8D,0x0D };
 
 typedef void* (*AowlAdmCamMainFn)(void* methodInfo);
 typedef void  (*AowlAdmCamMatFn)(void* retbuf, void* self, void* methodInfo);
@@ -862,6 +924,19 @@ typedef void  (*AowlAdmCamMatFn)(void* retbuf, void* self, void* methodInfo);
 static AowlAdmCamMainFn aowl_adm_cam_main_fn = 0;
 static AowlAdmCamMatFn  aowl_adm_cam_w2c_fn  = 0;
 static AowlAdmCamMatFn  aowl_adm_cam_proj_fn = 0;
+static AowlAdmCamMainFn aowl_adm_cam_mgr_fn  = 0;   /* CameraManager::get_Instance */
+
+/* WHICH ROUTE produced the camera, and how often each was TRIED and came back
+ * empty. These exist so the next reader does not have to re-derive what took a
+ * live raid to find: a diagnostic that only says "no matrix" cannot distinguish
+ * "Camera.main is null" from "CameraManager is null" from "the field is null",
+ * and those have three different fixes.
+ *   0 = nothing yet | 1 = Camera::get_main | 2 = CameraManager.Instance.Camera */
+static int32_t aowl_adm_cam_route     = 0;
+static int32_t aowl_adm_cam_main_null = 0;  /* get_main returned NULL          */
+static int32_t aowl_adm_cam_mgr_null  = 0;  /* get_Instance returned NULL      */
+static int32_t aowl_adm_cam_fld_null  = 0;  /* Instance live, +0x70 read NULL  */
+static int32_t aowl_adm_cam_selftest_fail = 0;  /* finite, but not centre-projecting */
 
 /* 0 = not attempted yet | 1 = GameAssembly.dll not loaded (transient) |
  * 2 = a prologue did NOT byte-match, i.e. a Tarkov update moved these RVAs |
@@ -901,15 +976,64 @@ static void aowl_admin_cam_resolve(void) {
         aowl_admin_bind_rva(base, AOWL_ADM_RVA_CAM_W2C, AOWL_ADM_SIG_CAM_W2C);
     aowl_adm_cam_proj_fn = (AowlAdmCamMatFn)
         aowl_admin_bind_rva(base, AOWL_ADM_RVA_CAM_PROJ, AOWL_ADM_SIG_CAM_PROJ);
+    /* The CameraManager route is OPTIONAL: a build where only this prologue
+     * moved should lose the fallback, not the whole sampler. So its failure is
+     * a NULL fn (reported through aowl_admin_cam_route_text) and never bind
+     * state 2 -- collapsing it into the hard refusal below would turn a partial
+     * regression into a total one. */
+    aowl_adm_cam_mgr_fn = (AowlAdmCamMainFn)
+        aowl_admin_bind_rva(base, AOWL_ADM_RVA_CAM_MGR, AOWL_ADM_SIG_CAM_MGR);
     if (!aowl_adm_cam_main_fn || !aowl_adm_cam_w2c_fn || !aowl_adm_cam_proj_fn) {
         aowl_adm_cam_bind = 2;                   /* prologue mismatch: refuse */
         aowl_adm_cam_main_fn = 0;
         aowl_adm_cam_w2c_fn  = 0;
         aowl_adm_cam_proj_fn = 0;
+        aowl_adm_cam_mgr_fn  = 0;
         return;
     }
     aowl_adm_cam_bind = 3;
 }
+
+/* UNITY THREAD ONLY. The live Camera, or NULL, by whichever route works --
+ * `Camera.main` first, then `CameraManager.Instance.<Camera>k__BackingField`.
+ * Every hop is VirtualQuery-guarded (rule 2: `a->b` is two checks, not one) and
+ * the route that succeeded is recorded so the diagnostic can say which. */
+static void* aowl_admin_cam_object(void) {
+    void* cam;
+    void* mgr;
+
+    cam = aowl_adm_cam_main_fn(0);       /* static: a NULL MethodInfo* is fine */
+    if (cam && aowl_admin_readable(cam, 16)) { aowl_adm_cam_route = 1; return cam; }
+    if (aowl_adm_cam_main_null < 1000000) aowl_adm_cam_main_null++;
+
+    /* Tarkov's FPS camera carries no "MainCamera" tag, so the above is NULL for
+     * the whole raid. This is the route the game itself uses. */
+    if (!aowl_adm_cam_mgr_fn) return 0;
+    mgr = aowl_adm_cam_mgr_fn(0);
+    if (!mgr || !aowl_admin_readable(mgr, AOWL_ADM_OFF_MGR_CAM + 8)) {
+        if (aowl_adm_cam_mgr_null < 1000000) aowl_adm_cam_mgr_null++;
+        return 0;
+    }
+    /* A FIELD READ, not `get_Camera` -- that getter folds to a body SHARED with
+     * every other `+0x70` reference getter in the build. Measured null on this
+     * exact field 16ms before it became live in the same session that produced
+     * the FOV log line, so a null here is EXPECTED during camera construction
+     * and must not burn the fault budget. */
+    cam = *(void**)((unsigned char*)mgr + AOWL_ADM_OFF_MGR_CAM);
+    if (!cam || !aowl_admin_readable(cam, 16)) {
+        if (aowl_adm_cam_fld_null < 1000000) aowl_adm_cam_fld_null++;
+        return 0;
+    }
+    aowl_adm_cam_route = 2;
+    return cam;
+}
+
+static int32_t aowl_admin_cam_route_get(void)     { return aowl_adm_cam_route; }
+static int32_t aowl_admin_cam_mgr_bound(void)     { return aowl_adm_cam_mgr_fn ? 1 : 0; }
+static int32_t aowl_admin_cam_main_nulls(void)    { return aowl_adm_cam_main_null; }
+static int32_t aowl_admin_cam_mgr_nulls(void)     { return aowl_adm_cam_mgr_null; }
+static int32_t aowl_admin_cam_fld_nulls(void)     { return aowl_adm_cam_fld_null; }
+static int32_t aowl_admin_cam_selftest_fails(void) { return aowl_adm_cam_selftest_fail; }
 
 /* State 1 must NOT latch -- GameAssembly.dll is simply not mapped yet when the
  * mod loads, and latching it would report "unavailable" for the whole session
@@ -936,6 +1060,58 @@ static int32_t aowl_admin_mat_sane(const float* m) {
     return acc > 1.0e-3f ? 1 : 0;                   /* not the zeroed retbuf  */
 }
 
+/* THE FINISHED-STATE CHECK (CLAUDE.md 9b).
+ *
+ * `aowl_admin_mat_sane` is necessary and NOT sufficient: it only says the 16
+ * floats are finite and not all zero. A view-projection that is transposed, or
+ * multiplied in the wrong order (V*P instead of P*V), or built from a
+ * row-major reading of a column-major buffer, is finite and non-zero too -- it
+ * passes `mat_sane` and then projects every entity off-screen. That is exactly
+ * the failure the ESP status line already warns reads like success, and it is
+ * the shape a check that cannot fail would let through.
+ *
+ * So assert a property of the FINISHED matrix instead, and one that CANNOT be
+ * satisfied by restating our own arithmetic: a point ten metres DIRECTLY IN
+ * FRONT of the camera must project to the middle of the screen.
+ *
+ * The point is derived from the VIEW matrix, independently of `vp`. `view` is
+ * worldToCamera, a rigid transform c = R*w + t with R the upper-left 3x3 and t
+ * the translation column, so the inverse is w = R^T * (c - t) -- no general
+ * matrix inverse needed. Feed it camera-space (0, 0, -10): Unity's view space
+ * is right-handed and looks down -Z, so that is "ten metres ahead". Push the
+ * resulting WORLD point back through `vp` and it must
+ *
+ *   * be in FRONT of the camera (cw > 0), and
+ *   * land within the middle fifth of the frame in both axes.
+ *
+ * Falsifiable, and each listed defect fails it: a transposed VP rotates the
+ * point away from centre; the wrong multiplication order puts cw <= 0 or throws
+ * it to the edge; a stale or mismatched view/proj pair disagrees about where
+ * forward is. It is checked against a NOMINAL 1000x1000 frame because the
+ * property is about normalised device coordinates, not about the back buffer --
+ * making it depend on the real resolution would add a second thing to get wrong
+ * without making the test stronger. */
+static int32_t aowl_admin_vp_projects(const float* view, const float* vp) {
+    float c[3];
+    float w[3];
+    float sx = 0.0f, sy = 0.0f;
+    int j, r;
+    const float kAhead = 10.0f;
+    c[0] = 0.0f; c[1] = 0.0f; c[2] = -kAhead;
+    for (j = 0; j < 3; j++) {
+        float s = 0.0f;
+        for (r = 0; r < 3; r++) s += view[j*4 + r] * (c[r] - view[12 + r]);
+        w[j] = s;
+        if (s != s || s > 1.0e9f || s < -1.0e9f) return 0;
+    }
+    /* aowl_admin_project already refuses cw <= 0.0001f, i.e. behind the camera. */
+    if (!aowl_admin_project(vp, w[0], w[1], w[2], 1000, 1000, &sx, &sy)) return 0;
+    if (sx != sx || sy != sy) return 0;
+    if (sx < 400.0f || sx > 600.0f) return 0;
+    if (sy < 400.0f || sy > 600.0f) return 0;
+    return 1;
+}
+
 /* UNITY THREAD ONLY. Returns 1 when the snapshot was refreshed by this call.
  *
  * Returning 0 is never silent: the REASON is readable through
@@ -951,10 +1127,12 @@ static int32_t aowl_admin_cam_sample(void) {
     if (aowl_adm_cam_fail >= AOWL_ADM_CAM_MAXFAIL) return 0;  /* self-disabled */
     if (aowl_admin_cam_state() != 3) { aowl_adm_cam_fail++; return 0; }
 
-    cam = aowl_adm_cam_main_fn(0);       /* static: a NULL MethodInfo* is fine */
-    if (!cam || !aowl_admin_readable(cam, 16)) {
-        /* No main camera. Normal in the menu, and NOT a bind failure -- so it
-         * does not burn the fault budget, it only ages the snapshot. */
+    cam = aowl_admin_cam_object();
+    if (!cam) {
+        /* No camera by EITHER route. Normal in the menu and during camera
+         * construction, and NOT a bind failure -- so it does not burn the fault
+         * budget, it only ages the snapshot. Which route came up empty, and how
+         * often, is in aowl_admin_cam_*_nulls(). */
         if (aowl_adm_cam_stale < 1000000) aowl_adm_cam_stale++;
         return 0;
     }
@@ -968,6 +1146,17 @@ static int32_t aowl_admin_cam_sample(void) {
     }
     aowl_admin_mat_mul(proj, view, vp);  /* VP = P * V, Unity column-major */
     if (!aowl_admin_mat_sane(vp)) { aowl_adm_cam_fail++; return 0; }
+    if (!aowl_admin_vp_projects(view, vp)) {
+        /* Counted SEPARATELY from every other refusal. If this is the number
+         * that climbs, the matrices were finite and the self-test above is what
+         * rejected them -- i.e. either the view/proj pair really is unusable,
+         * or the -Z forward convention in aowl_admin_vp_projects is wrong for
+         * this build. Those need opposite fixes, and a single fault counter
+         * cannot tell them apart. */
+        if (aowl_adm_cam_selftest_fail < 1000000) aowl_adm_cam_selftest_fail++;
+        aowl_adm_cam_fail++;
+        return 0;
+    }
     for (i = 0; i < 16; i++) aowl_adm_cam_vp[i] = vp[i];
     aowl_adm_cam_gen++;
     aowl_adm_cam_stale = 0;
