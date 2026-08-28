@@ -2012,15 +2012,23 @@ proc cmdTest(e: Env): int =
 
     # And the launcher's screen, as a character grid.
     #
-    # `tools/aowllaunch.nim` shows the launch progress and both log panes on ONE
-    # screen now, and that merge is a layout change -- the class of change that
-    # fails by being one column out, which looks like a rendering glitch on
-    # somebody else's terminal and is arithmetic that drifts with the window
-    # width. `tools/aowllayout.nim` is the pure half of it, so the frame can be
-    # rendered into a buffer here at five window sizes and checked as the grid
-    # it produced: no row wider than the window, both pane borders present, both
-    # logs on screen at once, and a deliberate REFUSAL below the minimum size
-    # rather than a bent frame.
+    # `tools/aowllaunch.nim` shows TWO screens, in one console, one after the
+    # other: the launcher (progress + the profile panel) and then the two log
+    # panes. That is a layout change -- the class of change that fails by being
+    # one column out, which looks like a rendering glitch on somebody else's
+    # terminal and is arithmetic that drifts with the window width.
+    # `tools/aowllayout.nim` is the pure half of it, so both frames are rendered
+    # into a buffer here at the same ladder of window sizes and checked as the
+    # grid they produced: no row wider than the window, both pane borders
+    # present on screen 2, every profile (or an honest count of the hidden ones)
+    # on screen 1, the CREATE path rather than an empty box when the install has
+    # no profiles, and a deliberate REFUSAL below the minimum size rather than a
+    # bent frame.
+    #
+    # It also holds down the separation itself. The two screens were briefly
+    # fused into one frame and that was rejected, so `notFused` asserts on the
+    # grid that neither screen carries the other's furniture -- structurally,
+    # by counting the corners on the top border, so it cannot pass by accident.
     let tuiExe = joinPath(e.repo, "installer\\build\\tuilayout.exe")
     var tlCmd = quoted(nimonyExe(e))
     tlCmd.add " c"
@@ -2031,8 +2039,8 @@ proc cmdTest(e: Env): int =
     tlCmd.add " -o:" & quoted(tuiExe)
     tlCmd.add " " & quoted(joinPath(e.repo, "tests\\tuilayout.nim"))
     if run(e, "tuilayout builds", tlCmd, e.repo):
-      discard run(e, "the launcher's one screen fits every window it agrees " &
-                     "to draw in", quoted(tuiExe))
+      discard run(e, "both launcher screens fit every window they agree to " &
+                     "draw in, and neither draws the other", quoted(tuiExe))
 
     # And the wire format the post-1.0 client actually speaks, against bodies
     # it actually sent.

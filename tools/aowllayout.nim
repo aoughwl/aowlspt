@@ -1,28 +1,41 @@
-## aowllayout -- the launcher's screen, as a pure function of its inputs.
+## aowllayout -- the launcher's screens, as pure functions of their inputs.
 ##
-## This module exists for one reason: the launcher used to have **two** screens
-## and showed them one after the other. The first was the "fancy" launch view --
-## ticks filling in as the backend claimed its port, read its database, loaded
-## its mods and started answering -- and the second was the two-pane live log
-## view. A player watching a launch could see the progress *or* both logs, never
-## both, and the moment the progress view was interesting (something is wrong)
-## was exactly the moment the logs were needed.
+## ## Two screens, one terminal, one after the other
 ##
-## `unifiedRows` below draws both at once: a header, a launch-progress region,
-## the two log panes side by side, and a status line. Every phase of the
-## launcher calls it -- the boot wait, the client wait, and the live log view --
-## and the only thing that changes between them is what the progress region
-## holds and whether keys are being read. As launch finishes, the progress
-## region collapses to one line and the panes take the space.
+## The launcher shows **two** views, in sequence, in the SAME console and the
+## SAME process. Nothing is spawned for the second one and the two are never on
+## screen together:
+##
+##   1. `launcherRows` -- the LAUNCHER. A header, the launch-progress region
+##      (the ticks filling in as the backend claims its port, reads its
+##      database, loads its mods and starts answering), and a panel listing the
+##      profiles in this install with the affordance to play one or create a
+##      new one. This is what a player looks at while the game is starting.
+##   2. `logViewRows` -- the LIVE LOG view. The launch collapsed to a single
+##      summary line and the two log panes, server and client, side by side.
+##      The launcher swaps to this once the client is up.
+##
+## An earlier revision fused the two into one frame -- progress region on top,
+## both panes below it, all the time -- and that is what this split undoes. The
+## fused frame spent half a small window on panes nobody was reading yet and
+## left the profile panel nowhere to go. `handoffRow` draws the one line that
+## marks the swap, so the transition is something the player SEES rather than a
+## region quietly collapsing under them.
+##
+## Neither function draws the other's furniture, and that is asserted rather
+## than intended: `tests/tuilayout.nim` checks that a `launcherRows` frame does
+## not contain the two-pane junction and that a `logViewRows` frame does not
+## contain the profile panel. A fused frame fails both.
 ##
 ## ## Why the layout is a function and not a method on a view
 ##
 ## Because a function that returns `seq[Row]` can be rendered into a buffer by a
 ## test, with no console, no game and no launcher. `tests/tuilayout.nim` renders
-## this at 200x50, 120x30, 80x24, 40x12 and 39x11 and asserts on the resulting
-## character grid -- that both pane borders are there, that no row is wider than
-## the window, that the progress region and both panes are all present, and that
-## below the minimum the layout **refuses** rather than drawing something bent.
+## both views at 200x50, 120x30, 80x24, 40x12 and 39x11 and asserts on the
+## resulting character grid -- that both pane borders are there, that no row is
+## wider than the window, that the progress region and the profile panel are
+## really populated, and that below the minimum each layout **refuses** rather
+## than drawing something bent.
 ##
 ## That last part is the point. The failure this replaces is a frame that is one
 ## column out: it looks like a rendering glitch and is actually arithmetic that
@@ -166,7 +179,7 @@ proc drawPane*(t: Tail; scroll, rows, width: int; into: var seq[Row]) =
     into.add newRow()
 
 # ---------------------------------------------------------------------------
-# The one screen
+# Screen 2 -- the live log view
 # ---------------------------------------------------------------------------
 
 const
@@ -183,7 +196,7 @@ const
     ## window size the layout would agree to draw at all.
 
 type
-  UnifiedLayout* = object
+  LogViewLayout* = object
     rows*: seq[Row]
     renderable*: bool
       ## false means the caller must fall back to `streamLogs`. `note` says why,
@@ -198,20 +211,24 @@ type
       ## one column out before a player sees it shear.
     note*: string
 
-proc unifiedRows*(w, h: int; header: Row; steps: seq[Row]; summary: Row;
+proc logViewRows*(w, h: int; header: Row; steps: seq[Row]; summary: Row;
                   server, client: var Tail;
                   serverTitle, clientTitle: string;
                   focus, scrollS, scrollC: int; solo: bool;
-                  help: Row): UnifiedLayout =
-  ## Header, progress, both panes, status -- exactly `h` rows, none wider than
-  ## `w`, or `renderable = false` and a reason.
+                  help: Row): LogViewLayout =
+  ## SCREEN 2. Header, the launch summary, both panes, status -- exactly `h`
+  ## rows, none wider than `w`, or `renderable = false` and a reason.
+  ##
+  ## This screen draws no profile panel. The launcher has already finished
+  ## choosing by the time it is shown, and a chooser that is still on screen
+  ## after the choice was made is the fused frame this split exists to undo.
   ##
   ## `w` is the drawing width and callers pass one column fewer than the console
   ## has. A glyph written into the last cell leaves the console in the
   ## deferred-wrap state and what happens next is host-specific: some hosts
   ## cancel it on the following carriage return and some wrap first and scroll
   ## the whole frame by a line, every frame. Giving up one column costs nothing.
-  result = UnifiedLayout(rows: @[], renderable: false, stepsShown: 0,
+  result = LogViewLayout(rows: @[], renderable: false, stepsShown: 0,
                          collapsedSteps: false, bodyH: 0, maxWidth: 0, note: "")
   if w < MinCols or h < MinRows:
     result.note = "the window is " & $w & "x" & $h & ", which is too small " &
@@ -321,3 +338,192 @@ proc unifiedRows*(w, h: int; header: Row; steps: seq[Row]; summary: Row;
 
   for r in result.rows:
     if r.width > result.maxWidth: result.maxWidth = r.width
+
+# ---------------------------------------------------------------------------
+# Screen 1 -- the launcher
+# ---------------------------------------------------------------------------
+
+const
+  MinPick* = 4
+    ## Fewer than four lines in the profile panel is not a list of profiles, it
+    ## is a hint that there might be some. Below this the progress region folds
+    ## to its summary line to give the panel room, exactly as `MinBody` does for
+    ## the log panes -- and for the same reason: a panel squeezed to one row
+    ## would show the first profile and silently hide the rest, which is a
+    ## chooser that lies about what there is to choose.
+    ##
+    ## FOUR, not three, and the difference is the whole value of the constant.
+    ## The panel gets `h - 4 - steps` rows and the boot phase has five steps, so
+    ## at the smallest window this layout will draw at all (`MinRows` = 12) the
+    ## panel has 12 - 4 - 5 = 3. A threshold of 3 is therefore satisfied at
+    ## every size that renders, the collapse never fires, and the branch below
+    ## is DEAD CODE that looks like a working degrade path. That is exactly the
+    ## bug `MinBody` had at 3, found by rendering the grid rather than by
+    ## reading this file, and `tests/tuilayout.nim` now asserts the collapse
+    ## really happens at 12 rows so it cannot come back.
+
+type
+  LauncherLayout* = object
+    rows*: seq[Row]
+    renderable*: bool
+      ## false means the caller must fall back to printing plainly. `note` says
+      ## why, and the caller is expected to print it.
+    stepsShown*: int
+    collapsedSteps*: bool
+    bodyH*: int
+    listed*: int
+      ## How many profile rows actually reached the grid. The caller does not
+      ## need it; the test asserts it against what it passed in, which is how a
+      ## panel that dropped the tail of the list gets caught.
+    hidden*: int
+      ## Profiles that did not fit. Never silently zero when rows were dropped:
+      ## the status line says so, because a list that is quietly short is a
+      ## chooser offering fewer characters than the player owns.
+    emptyPath*: bool
+      ## True when the panel drew the CREATE path instead of a list, i.e. this
+      ## install has no profiles yet. The first-run case is a distinct rendering
+      ## and not an empty box, and this is the flag a test can assert on.
+    maxWidth*: int
+    note*: string
+
+proc launcherRows*(w, h: int; header: Row; steps: seq[Row]; summary: Row;
+                   panelTitle: string; profiles: seq[Row]; empty: seq[Row];
+                   help: Row): LauncherLayout =
+  ## SCREEN 1. Header, the launch-progress region, one full-width panel holding
+  ## the profiles (or the create path when there are none), and a status line --
+  ## exactly `h` rows, none wider than `w`, or `renderable = false` and a
+  ## reason.
+  ##
+  ## This screen draws NO log panes. That is the whole point of it: while the
+  ## backend is still coming up there is nothing in the client log but the last
+  ## session's, and a pane showing a stale log next to a live one is the
+  ## confidently-wrong answer the launcher exists to avoid. The logs get the
+  ## whole window a moment later, in `logViewRows`.
+  ##
+  ## `empty` is drawn INSTEAD of `profiles` when `profiles` is empty. It is not
+  ## optional and it is not decoration: "this install has no profiles" is the
+  ## first-run case the launcher must answer with a way forward, and an empty
+  ## box is a dead end. When both are empty the panel says so in as many words
+  ## rather than rendering nothing.
+  result = LauncherLayout(rows: @[], renderable: false, stepsShown: 0,
+                          collapsedSteps: false, bodyH: 0, listed: 0,
+                          hidden: 0, emptyPath: false, maxWidth: 0, note: "")
+  if w < MinCols or h < MinRows:
+    result.note = "the window is " & $w & "x" & $h & ", which is too small " &
+                  "for the launcher panel; falling back to plain lines"
+    return
+
+  # Header, the two panel borders and the status line are not negotiable.
+  let avail = h - 4
+  var shown = steps.len
+  var collapsed = false
+  if avail - shown < MinPick and shown > 1:
+    shown = 1
+    collapsed = true
+    result.note = "launch progress collapsed to one line -- the window is " &
+                  "only " & $h & " rows"
+  if avail - shown < MinPick:
+    result.note = "the window is " & $w & "x" & $h & ", which cannot hold " &
+                  "the profile panel; falling back to plain lines"
+    return
+
+  result.renderable = true
+  result.stepsShown = shown
+  result.collapsedSteps = collapsed
+  result.bodyH = avail - shown
+  let bodyH = result.bodyH
+
+  result.rows.add header
+  if collapsed:
+    result.rows.add summary
+  else:
+    for i in 0 ..< shown:
+      result.rows.add steps[i]
+
+  # One full-width panel: 1 + (innerW + 2) + 1 == w, written out rather than
+  # fudged with `padTo`, for the same reason the pane arithmetic is.
+  let innerW = w - 4
+
+  var top = newRow()
+  top.putIn ColDim, bxTL()
+  top.putRow borderCell(panelTitle, innerW + 2, true)
+  top.putIn ColDim, bxTR()
+  result.rows.add top
+
+  # What goes in the panel. The empty case is a DIFFERENT rendering, not a
+  # shorter one.
+  var content: seq[Row] = @[]
+  if profiles.len > 0:
+    for r in profiles: content.add r
+  else:
+    result.emptyPath = true
+    if empty.len > 0:
+      for r in empty: content.add r
+    else:
+      # The caller offered neither a list nor a way forward. Say that, rather
+      # than draw a blank box the player would read as "still loading".
+      var r = newRow()
+      r.putIn ColYellow, fit("no profiles, and no way to create one was " &
+                             "offered here", innerW)
+      content.add r
+
+  result.listed = content.len
+  if result.listed > bodyH:
+    result.hidden = result.listed - bodyH
+    result.listed = bodyH
+    let more = $result.hidden & " more not shown -- the window is only " &
+               $h & " rows"
+    if result.note.len > 0: result.note = result.note & "; " & more
+    else: result.note = more
+
+  for i in 0 ..< bodyH:
+    var r = newRow()
+    r.putIn ColDim, bxV()
+    r.put " "
+    if i < result.listed:
+      r.putRow content[i]
+    r.padTo w - 1
+    r.putIn ColDim, bxV()
+    result.rows.add r
+
+  var bottom = newRow()
+  bottom.putIn ColDim, bxBL()
+  bottom.putIn ColDim, rule(innerW + 2)
+  bottom.putIn ColDim, bxBR()
+  result.rows.add bottom
+
+  # Same precedence as screen 2: the degradation note wins over the key
+  # reminder when there is not room for both.
+  var status = newRow()
+  if result.note.len > 0 and w - help.width - 2 < 24:
+    status.put " "
+    status.putIn ColYellow, fit(result.note, w - 1)
+  else:
+    status.putRow help
+    if result.note.len > 0:
+      status.put "  "
+      status.putIn ColYellow, fit(result.note, w - status.width - 1)
+  result.rows.add status
+
+  for r in result.rows:
+    if r.width > result.maxWidth: result.maxWidth = r.width
+
+# ---------------------------------------------------------------------------
+# The handoff between them
+# ---------------------------------------------------------------------------
+
+proc handoffRow*(w: int; what: string): Row =
+  ## The single line that marks screen 1 giving way to screen 2.
+  ##
+  ## It exists so the swap is an event the player watched happen rather than a
+  ## frame that silently became a different frame. The previous revision had no
+  ## such moment -- the progress region just collapsed and the panes grew -- and
+  ## "the screen changed and I do not know what I did" is a bug report nobody
+  ## can act on. Bounded by `w` by construction, like every other row here.
+  result = newRow()
+  result.put "  "
+  result.putIn ColGreen, markGlyph(MarkDone)
+  result.put " "
+  let room = w - result.width - 2
+  if room > 4:
+    result.putIn ColWhite, fit(what, room)
