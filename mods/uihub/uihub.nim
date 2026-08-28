@@ -820,7 +820,21 @@ proc onLoad(): Status =
                 description = "aowlspt original (settings UI). A small notice in the top-right corner, once per launch, that fades after a few seconds"),
     boolSetting("launchHintFallbackPage", "Advertise the browser settings page",
                 false, category = "Overlay/Launch", implemented = false,
-                description = "aowlspt original (settings UI). Not wired yet: the toast names the in-game screen only")])
+                description = "aowlspt original (settings UI). Not wired yet: the toast names the in-game screen only")],
+    # NO NAV ENTRY OF ITS OWN. This mod is infrastructure -- one HTML fallback
+    # page -- and a player asked, fairly, why "Browser Settings Page" was a
+    # whole entry in the settings nav for one row. It is not, any more:
+    # `mods/settingshub` renders these rows on its "Settings Panel" page and
+    # forwards a write back here over `SettingsApplyQuery`.
+    #
+    # Everything else is UNCHANGED and must stay so. This mod is still the ONE
+    # owner of `launchHint`: it keeps this guid, it keeps serving
+    # `/aowlspt/settings/aowl.uihub` below, and it keeps the same key in the
+    # same `config.json` -- so no stored value moves and there is nothing to
+    # migrate. That is not a nicety: `abi/aowlspt_overlay.h` fetches this exact
+    # URL at start-up and reads `launchHint` out of it BY NAME, so moving the
+    # value to another mod would silently turn the launch hint back on.
+    inIndex = false)
   if serve("/aowlspt/settings/" & ModGuid, onSettings) != Ok:
     warn "could not register the uihub settings route -- the launch hint's " &
          "off-switch will not appear in the settings surface"

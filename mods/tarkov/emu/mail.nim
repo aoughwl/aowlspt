@@ -152,40 +152,6 @@ proc withoutBadSystemData*(messageJson: string): string =
   remove(d, "systemData")
   result = text(d)
 
-proc loadMail*(profileId: string; usable: var bool): List =
-  ## Every message for a profile, oldest first, and whether the inbox could be
-  ## read at all.
-  ##
-  ## An empty inbox is `[]`, not an error: a new profile has one. An inbox that
-  ## is *there* and unreadable is a different answer, and the difference matters
-  ## because every writer here rewrites the whole list -- see `emu/store`. The
-  ## mailbox is also the only place a redeemed reward exists before it is
-  ## redeemed, so overwriting it loses items outright.
-  let raw1 = readKey(mailKey(profileId), usable)
-  if raw1.len == 0:
-    return newList()
-  result = parseArray(raw1)
-  if not result.ok:
-    result = newList()
-  # Heal the stored inbox on the way out. Messages written before this existed
-  # carry `systemData: false`, and the client's `DialogueChatMessageSerializer`
-  # declares that member as `ChatMessageSystemData` -- an OBJECT. Newtonsoft
-  # cannot convert Boolean to a class, throws inside `ExecuteRequest`, and the
-  # exception kills the raid load, not just the inbox. Fixing only the writer
-  # would leave every existing mailbox broken forever, so the read heals too.
-  for i in 0 ..< result.len:
-    result.replaceAt(i, withHealedSender(withoutBadSystemData(result.items[i])))
-
-proc loadMail*(profileId: string): List =
-  ## For the read-only callers: the inbox screen, the dialog view, the
-  ## attachment list. A failure shows an empty inbox for one request and is
-  ## logged; it writes nothing.
-  var usable = true
-  result = loadMail(profileId, usable)
-
-proc saveMail*(profileId: string; messages: List): bool =
-  result = save(mailKey(profileId), text(messages)) == Ok
-
 proc parented*(attachments, containerId: string): string =
   ## Re-parents the roots of an item tree onto a container.
   ##
@@ -253,6 +219,130 @@ proc withoutContainerRoots*(attachments: string): string =
   warn $removed & " container root item(s) were kept out of a mail " &
        "attachment; a stash is a box, not a reward"
   result = text(out1)
+
+proc withUnwrappedContainer*(messageJson: string): string =
+  ## REPAIR ON READ for mailboxes written before `emu/raid.transferredItems`
+  ## stopped handing over the transfer container's own root.
+  ##
+  ## The shape of the damage: `EFT.TransferItemsController.TryGetTransferContainer`
+  ## returns a Stash, so the serialised transfer carried the CONTAINER's root
+  ## item beside its contents, and `parented` re-parented only that root onto
+  ## the message. The player is left with a box the mail grid will not descend
+  ## into, and their cargo hanging off an `_id` that is a root no longer.
+  ##
+  ## The repair is the two functions above, composed, and nothing new:
+  ## `withoutContainerRoots` drops the container root, which makes everything
+  ## that was inside it an orphan, and `parented` is *defined* as "re-parent
+  ## the orphans onto the message's container". So the contents become the
+  ## attachments. Reusing them is deliberate -- a second, parallel notion of
+  ## "what is a container root" is exactly how the writer and the reader drift.
+  ##
+  ## This reads and rewrites ONLY the response. The store file is never
+  ## touched, so nothing here can lose a message, and a mailbox repaired by a
+  ## later real fix simply stops matching the fast path below.
+  ##
+  ## THREE outcomes, not two, per CLAUDE.md 9b:
+  ##   * no container root among the attachments -> returned byte-identical;
+  ##   * a container root WITH contents -> the contents are served instead;
+  ##   * a container root with NOTHING inside it -> there is no cargo to serve
+  ##     and pretending otherwise would be the silent failure. The message is
+  ##     served with `hasRewards:false` so no parcel badge sends the player
+  ##     hunting for it, and the loss is stated out loud, naming the message.
+  let m = whole(messageJson)
+  if not m.field("hasRewards").asBool(false):
+    return messageJson
+  let data = m.field("items.data")
+  if not data.found or not isArray(data):
+    return messageJson
+  let before = parseArray(data)
+  if not before.ok or before.len == 0:
+    return messageJson
+  # The fast path, taken by every healthy message in every mailbox: decide
+  # whether there is anything to do BEFORE building a single new document.
+  var anyRoot = false
+  for i in 0 ..< before.len:
+    if isStashTpl(field(before.items[i], "_tpl").asText("")):
+      anyRoot = true
+  if not anyRoot:
+    return messageJson
+
+  var d = parseObject(messageJson)
+  if not d.ok:
+    return messageJson
+  let containerId = get(d, "items").field("stash").asText("")
+  if containerId.len == 0:
+    # No container id means `parented` has nothing to re-parent onto, and a
+    # guessed one would put the items in a window that does not exist.
+    warn "mail repair: message '" & m.field("_id").asText("") &
+         "' holds a container root but names no container; left untouched"
+    return messageJson
+
+  let kept = withoutContainerRoots(text(before))
+  let repaired = parseArray(kept)
+  let count = (if repaired.ok: repaired.len else: 0)
+  if count == 0:
+    warn "mail repair: message '" & m.field("_id").asText("") &
+         "' attached a container root and NOTHING ELSE, so there is no " &
+         "cargo inside it to serve -- the contents were never stored. It is " &
+         "served with no rewards rather than as a box that cannot be opened"
+    setBool(d, "hasRewards", false)
+    var empty = newDoc()
+    setText(empty, "stash", containerId)
+    setRaw(empty, "data", "[]")
+    setRaw(d, "items", text(empty))
+    return text(d)
+
+  var box = newDoc()
+  setText(box, "stash", containerId)
+  setRaw(box, "data", parented(kept, containerId))
+  setRaw(d, "items", text(box))
+  info "mail repair: message '" & m.field("_id").asText("") &
+       "' had its transfer container unwrapped; " & $count &
+       " item(s) inside it are served as the attachments"
+  result = text(d)
+
+proc loadMail*(profileId: string; usable: var bool): List =
+  ## Every message for a profile, oldest first, and whether the inbox could be
+  ## read at all.
+  ##
+  ## An empty inbox is `[]`, not an error: a new profile has one. An inbox that
+  ## is *there* and unreadable is a different answer, and the difference matters
+  ## because every writer here rewrites the whole list -- see `emu/store`. The
+  ## mailbox is also the only place a redeemed reward exists before it is
+  ## redeemed, so overwriting it loses items outright.
+  let raw1 = readKey(mailKey(profileId), usable)
+  if raw1.len == 0:
+    return newList()
+  result = parseArray(raw1)
+  if not result.ok:
+    result = newList()
+  # Heal the stored inbox on the way out. Messages written before this existed
+  # carry `systemData: false`, and the client's `DialogueChatMessageSerializer`
+  # declares that member as `ChatMessageSystemData` -- an OBJECT. Newtonsoft
+  # cannot convert Boolean to a class, throws inside `ExecuteRequest`, and the
+  # exception kills the raid load, not just the inbox. Fixing only the writer
+  # would leave every existing mailbox broken forever, so the read heals too.
+  #
+  # `withUnwrappedContainer` is the third healer, and it is HERE rather than in
+  # the four route handlers on purpose: `dialogList`, `dialogView`,
+  # `allAttachments` and redemption (`attachmentsOf`) all read through this one
+  # proc, so putting it here is what makes the inbox badge, the dialog window,
+  # the collect-all screen and the item the player actually drags out agree.
+  # A repair applied in the view but not in redemption would show cargo that
+  # could not be taken.
+  for i in 0 ..< result.len:
+    result.replaceAt(i, withUnwrappedContainer(
+                          withHealedSender(withoutBadSystemData(result.items[i]))))
+
+proc loadMail*(profileId: string): List =
+  ## For the read-only callers: the inbox screen, the dialog view, the
+  ## attachment list. A failure shows an empty inbox for one request and is
+  ## logged; it writes nothing.
+  var usable = true
+  result = loadMail(profileId, usable)
+
+proc saveMail*(profileId: string; messages: List): bool =
+  result = save(mailKey(profileId), text(messages)) == Ok
 
 proc newMessage*(sender, text1: string; kind: MessageKind; nowSeconds: int;
                  attachments0: string = ""): Doc =

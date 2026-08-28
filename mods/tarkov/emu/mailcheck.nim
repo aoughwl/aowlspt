@@ -141,3 +141,67 @@ proc selfCheckMail*(into: var seq[string]): bool =
     into.add "mailcheck: a well-formed mail payload was reported as broken: " &
              clean[0]
     result = false
+
+  # -------------------------------------------------------------------------
+  # The REPAIR, judged by the same check, on the same two shapes.
+  # -------------------------------------------------------------------------
+  #
+  # `emu/mail.withUnwrappedContainer` heals mailboxes written before the
+  # writer was fixed. It is asserted here, through `mailPayloadProblems`,
+  # rather than by re-reading what it just wrote -- the negative that matters
+  # is "no served attachment list still contains a container root", and this
+  # is the module that already knows how to say that.
+  let wrapped =
+    "{\"_id\":\"aaaaaaaaaaaaaaaaaaaaaaaa\",\"uid\":\"" & SystemSenderId &
+    "\",\"type\":4,\"hasRewards\":true,\"rewardCollected\":false,\"items\":{" &
+    "\"stash\":\"bbbbbbbbbbbbbbbbbbbbbbbb\",\"data\":[" &
+    "{\"_id\":\"656f0f98d80a697f855d34b1\",\"_tpl\":\"" & stashTpl &
+    "\",\"parentId\":\"bbbbbbbbbbbbbbbbbbbbbbbb\",\"slotId\":\"main\"}," &
+    "{\"_id\":\"dddddddddddddddddddddddd\",\"_tpl\":\"590c657e86f77412b013051d\"," &
+    "\"parentId\":\"656f0f98d80a697f855d34b1\",\"slotId\":\"main\"}," &
+    "{\"_id\":\"eeeeeeeeeeeeeeeeeeeeeeee\",\"_tpl\":\"590c657e86f77412b013051d\"," &
+    "\"parentId\":\"656f0f98d80a697f855d34b1\",\"slotId\":\"main\"}]}}"
+  let healed = mail.withUnwrappedContainer(wrapped)
+  let healedBody = "{\"err\":0,\"data\":{\"messages\":[" & healed & "]}}"
+  let healedProblems = mailPayloadProblems(healedBody)
+  if healedProblems.len > 0:
+    into.add "mailcheck: the mail repair left a container root in the served " &
+             "payload: " & healedProblems[0]
+    result = false
+  # The cargo must SURVIVE the unwrap. Dropping the box and its contents would
+  # also produce zero problems above, so the negative alone cannot pass this.
+  if not healed.contains("dddddddddddddddddddddddd") or
+     not healed.contains("eeeeeeeeeeeeeeeeeeeeeeee"):
+    into.add "mailcheck: the mail repair unwrapped the transfer container but " &
+             "did not serve what was INSIDE it -- the player loses the cargo"
+    result = false
+  if healed.contains("656f0f98d80a697f855d34b1"):
+    into.add "mailcheck: the mail repair still serves the transfer container's " &
+             "own root item"
+    result = false
+  if not whole(healed).field("hasRewards").asBool(false):
+    into.add "mailcheck: the mail repair dropped the reward badge from a " &
+             "message that still has two items in it"
+    result = false
+
+  # And the live mailbox's ACTUAL shape: a container root and nothing else.
+  # There is no cargo inside it to recover -- it was never serialised -- so the
+  # only honest outcome is a message with no rewards. A repair that reported
+  # success here would be the failure this file exists to prevent.
+  let emptyWrapped =
+    "{\"_id\":\"aaaaaaaaaaaaaaaaaaaaaaaa\",\"uid\":\"" & SystemSenderId &
+    "\",\"type\":4,\"hasRewards\":true,\"rewardCollected\":false,\"items\":{" &
+    "\"stash\":\"bbbbbbbbbbbbbbbbbbbbbbbb\",\"data\":[" &
+    "{\"_id\":\"656f0f98d80a697f855d34b1\",\"_tpl\":\"" & stashTpl &
+    "\",\"parentId\":\"bbbbbbbbbbbbbbbbbbbbbbbb\",\"slotId\":\"main\"}]}}"
+  let healedEmpty = mail.withUnwrappedContainer(emptyWrapped)
+  if mailPayloadProblems("{\"err\":0,\"data\":{\"messages\":[" & healedEmpty &
+                         "]}}").len > 0:
+    into.add "mailcheck: the mail repair still serves a container root for a " &
+             "message whose only attachment was that container"
+    result = false
+  if whole(healedEmpty).field("hasRewards").asBool(false):
+    into.add "mailcheck: a message whose only attachment was an empty " &
+             "transfer container is still served with a reward badge, which " &
+             "sends the player hunting for cargo that was never stored"
+    result = false
