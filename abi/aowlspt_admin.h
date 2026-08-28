@@ -1008,7 +1008,22 @@ static int32_t aowl_admin_pos_live(void* player, float* out3) {
 typedef struct {
     void* player;
     float x, y, z;
+    int32_t age;   /* sweeps since a FRESH OK sample; 0 = sampled this sweep    */
 } AowlAdmPosEnt;
+
+/* Carry-forward budget (task 2, the ESP FLASH). `posSample()` rebuilds this
+ * snapshot every Unity frame; a SINGLE-frame classification miss (IMITATED
+ * during an animation blend, a transient NILXFORM/NILBONES) or cadence skew
+ * against the host-thread draw drops a player from ONE sweep -- so `posGet()`
+ * returns 0 for that frame, the box vanishes, and it returns next sweep. That
+ * is a genuine 1-frame gap in the position snapshot, NOT a wrong position, so
+ * a bounded hold-last-N is the right fix (CLAUDE.md 9b sanctions it only for a
+ * true 1-frame gap). An entry the current sweep did not freshly sample is
+ * carried into the new buffer with age+1 for up to this many sweeps, then aged
+ * out. The draw loop only ever draws players still in the live GameWorld list,
+ * so a carried entry for a player who genuinely left is never drawn -- it just
+ * ages out silently. */
+#define AOWL_ADM_POS_HOLD 6
 
 static AowlAdmPosEnt aowl_adm_pos_buf[2][AOWL_ADM_POS_MAX];
 static int32_t aowl_adm_pos_n[2]  = { 0, 0 };
@@ -1036,13 +1051,39 @@ static int32_t aowl_admin_pos_add(void* player) {
     aowl_adm_pos_buf[aowl_adm_pos_back][aowl_adm_pos_fill].x = p[0];
     aowl_adm_pos_buf[aowl_adm_pos_back][aowl_adm_pos_fill].y = p[1];
     aowl_adm_pos_buf[aowl_adm_pos_back][aowl_adm_pos_fill].z = p[2];
+    aowl_adm_pos_buf[aowl_adm_pos_back][aowl_adm_pos_fill].age = 0;  /* fresh */
     aowl_adm_pos_fill++;
     return code;
 }
 
 static void aowl_admin_pos_commit(void) {
-    int32_t t;
-    aowl_adm_pos_n[aowl_adm_pos_back] = aowl_adm_pos_fill;
+    int32_t t, i, j;
+    int32_t pub = aowl_adm_pos_pub;      /* the sweep we are about to replace */
+    int32_t back = aowl_adm_pos_back;    /* this sweep's fresh entries live here */
+    int32_t pn = aowl_adm_pos_n[pub];
+    /* CARRY-FORWARD, bridging the 1-frame gap that makes the ESP FLASH. Any
+     * player in the PUBLISHED buffer that this sweep did not freshly sample is
+     * copied into the back buffer with age+1, up to AOWL_ADM_POS_HOLD, then
+     * dropped. Bounded by the 128-entry cap the sweep already carries. */
+    if (pn < 0) pn = 0;
+    if (pn > AOWL_ADM_POS_MAX) pn = AOWL_ADM_POS_MAX;
+    for (i = 0; i < pn && aowl_adm_pos_fill < AOWL_ADM_POS_MAX; i++) {
+        AowlAdmPosEnt* pe = &aowl_adm_pos_buf[pub][i];
+        int32_t found = 0;
+        for (j = 0; j < aowl_adm_pos_fill; j++) {
+            if (aowl_adm_pos_buf[back][j].player == pe->player) { found = 1; break; }
+        }
+        if (found) continue;                        /* freshly sampled already */
+        if (pe->age + 1 >= AOWL_ADM_POS_HOLD) continue;   /* aged out */
+        {
+            AowlAdmPosEnt* ne = &aowl_adm_pos_buf[back][aowl_adm_pos_fill];
+            ne->player = pe->player;
+            ne->x = pe->x; ne->y = pe->y; ne->z = pe->z;
+            ne->age = pe->age + 1;
+            aowl_adm_pos_fill++;
+        }
+    }
+    aowl_adm_pos_n[back] = aowl_adm_pos_fill;
     t = aowl_adm_pos_pub; aowl_adm_pos_pub = aowl_adm_pos_back; aowl_adm_pos_back = t;
     aowl_adm_pos_gen++;
 }
