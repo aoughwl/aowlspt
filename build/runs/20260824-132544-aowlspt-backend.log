@@ -1,0 +1,1466 @@
+aowlspt-backend 0.1.0
+root D:\Aowlspt\aowlspt
+
+[0:00:00.000] ok     port 443 is free
+[0:00:00.063] info   database loaded from D:\Aowlspt\aowlspt\db.json (41313127 bytes)
+[0:00:00.063] info   6 candidate libraries under D:\Aowlspt\aowlspt\mods
+[0:00:00.063] ok     the load order comes from D:\Aowlspt\aowlspt\mods\aowlspt-selection.json: 3 mod(s) selected
+[0:00:00.235] info   the selection names aowl.classicmovement, which is not installed under D:\Aowlspt\aowlspt\mods
+[0:00:00.235] info   aowl.textures is installed and not selected, so it is not loaded
+[0:00:00.235] info   aowl.pathtotarkov is installed and not selected, so it is not loaded
+[0:00:00.235] info   aowl.icebreaker is installed and not selected, so it is not loaded
+[0:00:00.235] info   aowl.graphics is installed and not selected, so it is not loaded
+[0:00:00.235] ok     route /aowlspt/mods
+[0:00:00.235] ok     route /aowlspt/mods/status
+[0:00:00.235] ok     route /aowlspt/mods/list
+[0:00:00.235] ok     route /aowlspt/mods/panel
+[0:00:00.235] ok     route /aowlspt/mods/client
+[0:00:00.235] ok     route /aowlspt/mods/clientreport
+[0:00:00.235] ok     route /aowlspt/mods/toggle
+[0:00:00.235] ok     route /aowlspt/mods/lists
+[0:00:00.235] ok     route /aowlspt/mods/conflicts
+[0:00:00.235] ok     route /aowlspt/mods/reload
+[0:00:00.235] ok     route /aowlspt/mods/apply
+[0:00:00.235] ok     route /aowlspt/mods/select
+[0:00:00.235] ok     route /aowlspt/mods/client/ (prefix)
+[0:00:00.235] ok     route /aowlspt/mods/describe/ (prefix)
+[0:00:00.235] ok     route /aowlspt/mods/enable/ (prefix)
+[0:00:00.235] ok     route /aowlspt/mods/disable/ (prefix)
+[0:00:00.235] ok     route /aowlspt/mods/clear/ (prefix)
+[0:00:00.235] ok     route /aowlspt/mods/toggle/ (prefix)
+[0:00:00.235] ok     route /aowlspt/mods/select/ (prefix)
+[0:00:00.235] ok     subscribed to aowlspt.host.mods.capabilities
+[0:00:00.235] ok     subscribed to aowlspt.host.mods.result
+[0:00:00.235] ok     subscribed to aowlspt.host.mods.listed
+[0:00:00.235] ok     subscribed to tarkov.raid.started
+[0:00:00.235] ok     subscribed to tarkov.raid.ended
+[0:00:00.235] ok     route /aowlspt/mods/registry
+[0:00:00.235] ok     route /aowlspt/mods/registry/fetch
+[0:00:00.235] ok     route /aowlspt/mods/registry/fetch/ (prefix)
+[0:00:00.235] ok     route /aowlspt/mods/registry/revert
+[0:00:00.235] ok     route /aowlspt/mods/lists/local
+[0:00:00.235] ok     route /aowlspt/mods/lists/local/delete/ (prefix)
+[0:00:00.235] ok     manager: D:\Aowlspt\aowlspt/registry/mods.json -- 11 mods, 4 lists
+[0:00:00.235] info   manager: active lists: aowl.list.vanillaplus
+[0:00:00.235] info   manager: 3 of 11 registry mods resolve on the server side
+[0:00:00.235] info   manager:   1. aowl.manager
+[0:00:00.235] info   manager:   2. aowl.tarkov
+[0:00:00.235] info   manager:   3. aowl.classicmovement
+[0:00:00.235] info   manager:   - aowl.fovfix: wrong-side -- declares no server side
+[0:00:00.235] info   manager:   - aowl.perf: wrong-side -- declares no server side
+[0:00:00.235] info   manager:   - com.savannt.sptsway: wrong-side -- declares no server side
+[0:00:00.235] info   manager: nothing has been persisted yet; the selection is stored on the first change
+[0:00:00.235] info   event aowlspt.mods.selection (no subscribers)
+[0:00:00.235] ok     loaded Mod Manager (aowl.manager) v1.0.0 by aowlspt
+[0:00:00.235] ok     subscribed to aowlspt.settings.indexQuery
+[0:00:00.235] ok     route /aowlspt/settings/aowl.tarkov
+[0:00:00.250] info   ids: run 0000000000d0
+[0:00:00.469] ok     route /aowlspt/tarkov/selfcheck
+[0:00:00.469] ok     route /client/metadata
+[0:00:00.469] ok     route /client/game/config
+[0:00:00.469] ok     route /client/game/start
+[0:00:00.469] ok     route /client/game/version/validate
+[0:00:00.469] ok     route /client/game/keepalive
+[0:00:00.469] ok     route /client/game/logout
+[0:00:00.469] ok     route /client/checkVersion
+[0:00:00.469] ok     route /client/server/list
+[0:00:00.469] ok     route /client/game/profile/list
+[0:00:00.469] ok     route /v2/client/game/profiles (prefix)
+[0:00:00.469] ok     route /v2/client/shop/status (prefix)
+[0:00:00.469] ok     route /client/game/profile/select
+[0:00:00.469] ok     route /client/game/profile/create
+[0:00:00.469] ok     route /client/game/profile/nickname/validate
+[0:00:00.469] ok     route /client/game/profile/nickname/reserved
+[0:00:00.469] ok     route /client/game/profile/nickname/change
+[0:00:00.469] ok     route /client/game/profile/savage/regenerate
+[0:00:00.469] ok     route /client/game/profile/voice/change
+[0:00:00.469] ok     route /client/game/mode
+[0:00:00.469] ok     route /aowlspt/tarkov/launcher/ping
+[0:00:00.469] ok     route /aowlspt/tarkov/launcher/profiles
+[0:00:00.469] ok     route /aowlspt/tarkov/launcher/profile/create
+[0:00:00.469] ok     route /aowlspt/tarkov/launcher/profile/select
+[0:00:00.469] ok     route /client/profile/status
+[0:00:00.469] ok     route /client/profile/settings
+[0:00:00.469] ok     route /client/game/profile/search
+[0:00:00.469] ok     route /client/libraries
+[0:00:00.469] ok     route /client/profile/view
+[0:00:00.469] ok     route /files/ (prefix)
+[0:00:00.469] ok     route /regular/files/ (prefix)
+[0:00:00.469] ok     route /client/items
+[0:00:00.469] ok     route /client/globals
+[0:00:00.469] ok     route /client/handbook/templates
+[0:00:00.469] ok     route /client/customization
+[0:00:00.469] ok     route /client/account/customization
+[0:00:00.469] ok     route /client/languages
+[0:00:00.469] ok     route /client/locale/ (prefix)
+[0:00:00.469] ok     route /client/menu/locale/ (prefix)
+[0:00:00.469] ok     route /client/settings
+[0:00:00.469] ok     route /client/quest/list
+[0:00:00.469] ok     route /client/achievement/list
+[0:00:00.469] ok     route /client/achievement/statistic
+[0:00:00.469] ok     route /client/game/profile/items/moving
+[0:00:00.469] ok     route /client/trading/api/traderSettings
+[0:00:00.469] ok     route /client/trading/api/getTraderAssort/ (prefix)
+[0:00:00.469] ok     route /client/trading/api/getUserAssortPrice/ (prefix)
+[0:00:00.469] ok     route /client/trading/api/getTrader/ (prefix)
+[0:00:00.469] ok     route /client/trading/customization/storage
+[0:00:00.469] ok     route /client/items/prices/ (prefix)
+[0:00:00.469] ok     route /client/dialogue
+[0:00:00.469] ok     route /client/quest/getMainQuestsList
+[0:00:00.469] ok     route /client/quest/getMainQuestNotesList
+[0:00:00.469] ok     route /client/variable/group
+[0:00:00.469] ok     route /client/tape/list
+[0:00:00.469] ok     route /client/subtitle-track/list
+[0:00:00.469] ok     route /client/quest/chains
+[0:00:00.469] ok     route /client/getMetricsConfig
+[0:00:00.469] ok     route /client/quest/complete
+[0:00:00.469] ok     route /client/tutor-game/check
+[0:00:00.469] ok     route /client/match/group/invite/cancel-all
+[0:00:00.469] ok     route /client/raid/configuration
+[0:00:00.469] ok     route /client/location/getLocalloot
+[0:00:00.469] ok     route /client/location/getAirdropLoot
+[0:00:00.469] ok     route /client/locations
+[0:00:00.469] ok     route /client/match/local/start
+[0:00:00.469] ok     route /client/match/local/end
+[0:00:00.469] ok     route /client/match/available
+[0:00:00.469] ok     route /client/match/join
+[0:00:00.469] ok     route /client/match/group/current
+[0:00:00.469] ok     route /client/match/group/status
+[0:00:00.469] ok     route /client/match/group/exit_from_menu
+[0:00:00.469] ok     route /client/match/exit
+[0:00:00.469] ok     route /client/weather
+[0:00:00.469] ok     route /client/hideout/areas
+[0:00:00.469] ok     route /client/hideout/production/recipes
+[0:00:00.469] ok     route /client/hideout/settings
+[0:00:00.485] ok     route /client/hideout/qte/list
+[0:00:00.485] ok     route /client/ragfair/find
+[0:00:00.485] ok     route /client/ragfair/itemMarketPrice
+[0:00:00.485] ok     route /client/insurance/items/list/cost
+[0:00:00.485] ok     route /client/hideout/customization/offer/list
+[0:00:00.485] ok     route /client/ragfair/offerfees
+[0:00:00.485] ok     route /client/reports/ragfair/send
+[0:00:00.485] ok     route /client/notifier/channel/create
+[0:00:00.485] ok     route /client/notifier/getwebsocket (prefix)
+[0:00:00.485] ok     route /client/mail/dialog/list
+[0:00:00.485] ok     route /client/mail/dialog/info
+[0:00:00.485] ok     route /client/mail/dialog/view
+[0:00:00.485] ok     route /client/mail/dialog/getAllAttachments
+[0:00:00.485] ok     route /client/mail/dialog/read
+[0:00:00.485] ok     route /client/mail/dialog/pin
+[0:00:00.485] ok     route /client/mail/dialog/unpin
+[0:00:00.485] ok     route /client/mail/dialog/remove
+[0:00:00.485] ok     route /client/game/bot/generate
+[0:00:00.485] ok     route /client/game/bot/limit (prefix)
+[0:00:00.485] ok     route /client/game/bot/difficulty (prefix)
+[0:00:00.485] ok     route /client/friend/list
+[0:00:00.485] ok     route /client/friend/request/list/inbox
+[0:00:00.485] ok     route /client/friend/request/list/outbox
+[0:00:00.485] ok     route /client/chatServer/list
+[0:00:00.485] ok     route /client/survey
+[0:00:00.485] ok     route /client/survey/view
+[0:00:00.485] ok     route /client/survey/opinion
+[0:00:00.485] ok     route /client/prestige/list
+[0:00:00.485] ok     route /client/putMetrics
+[0:00:00.485] ok     route /client/putHWMetrics
+[0:00:00.485] ok     route /client/putLoadMetrics
+[0:00:00.485] ok     route /client/getMetrics
+[0:00:00.485] ok     route /client/seasonal-perks/list
+[0:00:00.485] ok     route /client/season/active
+[0:00:00.485] ok     route /client/battle-pass/active
+[0:00:00.485] ok     route /client/ending/list
+[0:00:00.485] ok     route /client/game/token/issue
+[0:00:00.485] ok     route /client/customization/storage
+[0:00:00.485] ok     route /client/friends
+[0:00:00.485] ok     route /client/analytics/event-disabled
+[0:00:00.485] ok     route /client/repeatalbeQuests/activityPeriods
+[0:00:00.485] ok     route /client/log
+[0:00:00.485] ok     route /client/bsgLogging
+[0:00:00.485] ok     route /client/releaseNotes
+[0:00:00.485] ok     route /client/builds/list
+[0:00:00.485] ok     route /client/builds/weapon/save
+[0:00:00.485] ok     route /client/builds/equipment/save
+[0:00:00.485] ok     route /client/builds/magazine/save
+[0:00:00.485] ok     route /client/builds/delete
+[0:00:00.485] ok     Tarkov emulator loaded, 1 profile(s)
+[0:00:00.485] info     00000000000a00000000004f  Savant (Usec, level 1)
+[0:00:00.485] ok     loaded Tarkov Emulator (aowl.tarkov) v0.1.0 by aowlspt
+[0:00:00.485] ok     listening on https://127.0.0.1:443
+[0:00:00.485] ok     asset listener on http://127.0.0.1:80
+[0:00:00.531] ok     manager: live mod control is available (aowlspt-backend 0.1.0)
+[0:00:00.594] info   manager: the host reports 2 loaded mods
+[0:00:00.797] info   REQ POST /client/metadata
+[0:00:00.797] info   client/metadata HIT: body.len=49 session=00000000000a00000000004f
+[0:00:01.703] info   REQ GET /aowlspt/mods/panel
+[0:00:01.703] info   REQ GET /aowlspt/mods/lists
+[0:00:01.703] info   REQ GET /aowlspt/mods/conflicts
+[0:00:01.703] warn   no route for GET /aowlspt/settings/spt/index
+[0:00:01.750] info   REQ GET /aowlspt/mods/panel
+[0:00:01.750] info   REQ GET /aowlspt/mods/list
+[0:00:02.969] info   REQ GET /aowlspt/mods/panel
+[0:00:02.969] info   REQ GET /aowlspt/mods/list
+[0:00:04.203] info   REQ GET /aowlspt/mods/panel
+[0:00:04.203] info   REQ GET /aowlspt/mods/list
+[0:00:05.391] info   REQ GET /aowlspt/mods/lists
+[0:00:05.391] info   REQ GET /aowlspt/mods/conflicts
+[0:00:05.391] info   REQ GET /aowlspt/mods/client/0.1.0
+[0:00:05.453] info   REQ GET /aowlspt/mods/panel
+[0:00:05.453] info   REQ GET /aowlspt/mods/list
+[0:00:06.688] info   REQ GET /aowlspt/mods/panel
+[0:00:06.688] info   REQ GET /aowlspt/mods/list
+[0:00:07.906] info   REQ GET /aowlspt/mods/panel
+[0:00:07.906] info   REQ GET /aowlspt/mods/list
+[0:00:09.078] info   REQ GET /aowlspt/mods/lists
+[0:00:09.078] info   REQ GET /aowlspt/mods/conflicts
+[0:00:09.078] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n&more=1
+[0:00:09.141] info   REQ GET /aowlspt/mods/panel
+[0:00:09.141] info   REQ GET /aowlspt/mods/list
+[0:00:09.375] info   REQ POST /client/libraries
+[0:00:10.203] info   REQ GET /aowlspt/mods/panel
+[0:00:10.203] info   REQ GET /aowlspt/mods/list
+[0:00:11.203] info   REQ GET /aowlspt/mods/panel
+[0:00:11.203] info   REQ GET /aowlspt/mods/list
+[0:00:12.172] info   REQ GET /aowlspt/mods/lists
+[0:00:12.172] info   REQ GET /aowlspt/mods/conflicts
+[0:00:12.172] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile&more=1
+[0:00:12.219] info   REQ GET /aowlspt/mods/panel
+[0:00:12.219] info   REQ GET /aowlspt/mods/list
+[0:00:13.235] info   REQ GET /aowlspt/mods/panel
+[0:00:13.235] info   REQ GET /aowlspt/mods/list
+[0:00:14.235] info   REQ GET /aowlspt/mods/panel
+[0:00:14.250] info   REQ GET /aowlspt/mods/list
+[0:00:15.203] info   REQ GET /aowlspt/mods/lists
+[0:00:15.203] info   REQ GET /aowlspt/mods/conflicts
+[0:00:15.203] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n&more=1
+[0:00:15.250] info   REQ GET /aowlspt/mods/panel
+[0:00:15.250] info   REQ GET /aowlspt/mods/list
+[0:00:15.985] info   REQ POST /client/game/mode
+[0:00:16.063] info   REQ POST /client/game/start
+[0:00:16.141] info   REQ POST /client/game/version/validate
+[0:00:16.235] info   REQ GET /client/menu/locale/en
+[0:00:16.266] info   REQ GET /aowlspt/mods/panel
+[0:00:16.266] info   REQ GET /aowlspt/mods/list
+[0:00:16.297] info   REQ GET /client/languages
+[0:00:16.313] info   REQ POST /client/game/config
+[0:00:17.281] info   REQ GET /aowlspt/mods/panel
+[0:00:17.281] info   REQ GET /aowlspt/mods/list
+[0:00:18.250] info   REQ GET /aowlspt/mods/lists
+[0:00:18.250] info   REQ GET /aowlspt/mods/conflicts
+[0:00:18.250] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile&more=1
+[0:00:18.297] info   REQ GET /aowlspt/mods/panel
+[0:00:18.297] info   REQ GET /aowlspt/mods/list
+[0:00:19.313] info   REQ GET /aowlspt/mods/panel
+[0:00:19.313] info   REQ GET /aowlspt/mods/list
+[0:00:20.328] info   REQ GET /aowlspt/mods/panel
+[0:00:20.328] info   REQ GET /aowlspt/mods/list
+[0:00:21.281] info   REQ GET /aowlspt/mods/lists
+[0:00:21.281] info   REQ GET /aowlspt/mods/conflicts
+[0:00:21.281] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n&more=1
+[0:00:21.344] info   REQ GET /aowlspt/mods/panel
+[0:00:21.344] info   REQ GET /aowlspt/mods/list
+[0:00:22.110] info   REQ GET /client/settings
+[0:00:22.125] info   REQ POST /client/putHWMetrics
+[0:00:22.281] info   REQ GET /client/items
+[0:00:22.313] info   REQ GET /client/locale/en
+[0:00:22.344] info   REQ GET /client/customization
+[0:00:22.344] info   REQ GET /aowlspt/mods/panel
+[0:00:22.344] info   REQ GET /aowlspt/mods/list
+[0:00:22.360] info   REQ POST /client/seasonal-perks/list
+[0:00:23.360] info   REQ GET /aowlspt/mods/panel
+[0:00:23.360] info   REQ GET /aowlspt/mods/list
+[0:00:24.328] info   REQ GET /aowlspt/mods/lists
+[0:00:24.328] info   REQ GET /aowlspt/mods/conflicts
+[0:00:24.328] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile&more=1
+[0:00:24.375] info   REQ GET /aowlspt/mods/panel
+[0:00:24.375] info   REQ GET /aowlspt/mods/list
+[0:00:25.391] info   REQ GET /aowlspt/mods/panel
+[0:00:25.391] info   REQ GET /aowlspt/mods/list
+[0:00:26.391] info   REQ GET /aowlspt/mods/panel
+[0:00:26.391] info   REQ GET /aowlspt/mods/list
+[0:00:27.297] info   REQ POST /v2/client/game/profiles/
+[0:00:27.360] info   REQ GET /aowlspt/mods/lists
+[0:00:27.360] info   REQ GET /aowlspt/mods/conflicts
+[0:00:27.360] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n&more=1
+[0:00:27.406] info   REQ GET /aowlspt/mods/panel
+[0:00:27.406] info   REQ GET /aowlspt/mods/list
+[0:00:28.422] info   REQ GET /aowlspt/mods/panel
+[0:00:28.422] info   REQ GET /aowlspt/mods/list
+[0:00:29.438] info   REQ GET /aowlspt/mods/panel
+[0:00:29.438] info   REQ GET /aowlspt/mods/list
+[0:00:30.391] info   REQ GET /aowlspt/mods/lists
+[0:00:30.391] info   REQ GET /aowlspt/mods/conflicts
+[0:00:30.391] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n&more=1
+[0:00:30.438] info   REQ GET /aowlspt/mods/panel
+[0:00:30.438] info   REQ GET /aowlspt/mods/list
+[0:00:31.453] info   REQ GET /aowlspt/mods/panel
+[0:00:31.453] info   REQ GET /aowlspt/mods/list
+[0:00:32.469] info   REQ GET /aowlspt/mods/panel
+[0:00:32.469] info   REQ GET /aowlspt/mods/list
+[0:00:33.422] info   REQ GET /aowlspt/mods/lists
+[0:00:33.422] info   REQ GET /aowlspt/mods/conflicts
+[0:00:33.422] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile&more=1
+[0:00:33.485] info   REQ GET /aowlspt/mods/panel
+[0:00:33.485] info   REQ GET /aowlspt/mods/list
+[0:00:34.500] info   REQ GET /aowlspt/mods/panel
+[0:00:34.500] info   REQ GET /aowlspt/mods/list
+[0:00:35.500] info   REQ GET /aowlspt/mods/panel
+[0:00:35.500] info   REQ GET /aowlspt/mods/list
+[0:00:36.469] info   REQ GET /aowlspt/mods/lists
+[0:00:36.469] info   REQ GET /aowlspt/mods/conflicts
+[0:00:36.469] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n&more=1
+[0:00:36.516] info   REQ GET /aowlspt/mods/panel
+[0:00:36.516] info   REQ GET /aowlspt/mods/list
+[0:00:37.531] info   REQ GET /aowlspt/mods/panel
+[0:00:37.531] info   REQ GET /aowlspt/mods/list
+[0:00:38.547] info   REQ GET /aowlspt/mods/panel
+[0:00:38.547] info   REQ GET /aowlspt/mods/list
+[0:00:39.500] info   REQ GET /aowlspt/mods/lists
+[0:00:39.500] info   REQ GET /aowlspt/mods/conflicts
+[0:00:39.500] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile&more=1
+[0:00:39.563] info   REQ GET /aowlspt/mods/panel
+[0:00:39.563] info   REQ GET /aowlspt/mods/list
+[0:00:40.563] info   REQ GET /aowlspt/mods/panel
+[0:00:40.578] info   REQ GET /aowlspt/mods/list
+[0:00:41.578] info   REQ GET /aowlspt/mods/panel
+[0:00:41.578] info   REQ GET /aowlspt/mods/list
+[0:00:42.547] info   REQ GET /aowlspt/mods/lists
+[0:00:42.547] info   REQ GET /aowlspt/mods/conflicts
+[0:00:42.547] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n&more=1
+[0:00:42.594] info   REQ GET /aowlspt/mods/panel
+[0:00:42.594] info   REQ GET /aowlspt/mods/list
+[0:00:43.094] info   REQ GET /client/customization
+[0:00:43.125] info   REQ GET /client/items
+[0:00:43.141] info   REQ POST /client/game/profile/list
+[0:00:43.188] info   REQ GET /client/handbook/templates
+[0:00:43.188] info   REQ GET /client/globals
+[0:00:43.203] info   REQ GET /client/tape/list
+[0:00:43.219] info   REQ GET /client/trading/api/traderSettings
+[0:00:43.235] info   REQ GET /client/quest/getMainQuestsList
+[0:00:43.250] info   REQ POST /client/battle-pass/active
+[0:00:43.266] info   REQ POST /client/season/active
+[0:00:43.281] info   REQ POST /client/customization/storage
+[0:00:43.297] info   REQ GET /client/dialogue
+[0:00:43.313] info   REQ GET /client/subtitle-track/list
+[0:00:43.328] info   REQ POST /client/seasonal-perks/list
+[0:00:43.344] info   REQ GET /client/quest/getMainQuestNotesList
+[0:00:43.360] info   REQ GET /client/prestige/list
+[0:00:43.375] info   REQ GET /client/settings
+[0:00:43.391] info   REQ GET /client/variable/group
+[0:00:43.610] info   REQ GET /aowlspt/mods/panel
+[0:00:43.610] info   REQ GET /aowlspt/mods/list
+[0:00:44.610] info   REQ GET /aowlspt/mods/panel
+[0:00:44.610] info   REQ GET /aowlspt/mods/list
+[0:00:45.578] info   REQ GET /aowlspt/mods/lists
+[0:00:45.578] info   REQ GET /aowlspt/mods/conflicts
+[0:00:45.578] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile&more=1
+[0:00:45.625] info   REQ GET /aowlspt/mods/panel
+[0:00:45.625] info   REQ GET /aowlspt/mods/list
+[0:00:46.641] info   REQ GET /aowlspt/mods/panel
+[0:00:46.641] info   REQ GET /aowlspt/mods/list
+[0:00:47.641] info   REQ GET /aowlspt/mods/panel
+[0:00:47.656] info   REQ GET /aowlspt/mods/list
+[0:00:47.860] info   REQ POST /client/game/profile/select
+[0:00:47.860] ok     session 00000000000a00000000004f -> profile 00000000000a00000000004f (Savant)
+[0:00:47.860] info   event aowlspt.menu.nickname (no subscribers)
+[0:00:48.031] info   REQ POST /client/profile/status
+[0:00:48.610] info   REQ GET /aowlspt/mods/lists
+[0:00:48.610] info   REQ GET /aowlspt/mods/conflicts
+[0:00:48.610] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n&more=1
+[0:00:48.656] info   REQ GET /aowlspt/mods/panel
+[0:00:48.656] info   REQ GET /aowlspt/mods/list
+[0:00:49.672] info   REQ GET /aowlspt/mods/panel
+[0:00:49.672] info   REQ GET /aowlspt/mods/list
+[0:00:50.688] info   REQ GET /aowlspt/mods/panel
+[0:00:50.688] info   REQ GET /aowlspt/mods/list
+[0:00:51.641] info   REQ GET /aowlspt/mods/lists
+[0:00:51.641] info   REQ GET /aowlspt/mods/conflicts
+[0:00:51.641] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile&more=1
+[0:00:51.688] info   REQ GET /aowlspt/mods/panel
+[0:00:51.703] info   REQ GET /aowlspt/mods/list
+[0:00:52.031] info   REQ GET /client/hideout/settings
+[0:00:52.047] info   REQ GET /client/hideout/production/recipes
+[0:00:52.047] info   REQ GET /client/hideout/areas
+[0:00:52.063] info   REQ GET /client/hideout/qte/list
+[0:00:52.078] info   REQ GET /client/hideout/customization/offer/list
+[0:00:52.703] info   REQ GET /aowlspt/mods/panel
+[0:00:52.703] info   REQ GET /aowlspt/mods/list
+[0:00:53.328] info   REQ POST /client/notifier/channel/create
+[0:00:53.375] info   REQ GET /client/achievement/list?completed=True
+[0:00:53.375] info   REQ GET /client/achievement/statistic
+[0:00:53.391] info   REQ POST /client/ending/list
+[0:00:53.406] info   REQ GET /client/locations
+[0:00:53.719] info   REQ GET /aowlspt/mods/panel
+[0:00:53.719] info   REQ GET /aowlspt/mods/list
+[0:00:53.844] info   REQ POST /client/weather
+[0:00:53.860] info   REQ POST /client/builds/list
+[0:00:53.875] info   REQ POST /client/profile/status
+[0:00:53.891] info   REQ POST /client/quest/list
+[0:00:53.922] info   REQ POST /client/friends
+[0:00:54.688] info   REQ GET /aowlspt/mods/lists
+[0:00:54.688] info   REQ GET /aowlspt/mods/conflicts
+[0:00:54.688] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n&more=1
+[0:00:54.719] info   REQ POST /client/mail/dialog/list
+[0:00:54.735] info   REQ GET /aowlspt/mods/panel
+[0:00:54.735] info   REQ GET /aowlspt/mods/list
+[0:00:55.406] info   REQ POST /client/quest/chains
+[0:00:55.750] info   REQ GET /aowlspt/mods/panel
+[0:00:55.750] info   REQ GET /aowlspt/mods/list
+[0:00:55.781] info   REQ POST /client/tutor-game/check
+[0:00:55.844] info   REQ POST /client/server/list
+[0:00:55.860] info   REQ POST /client/match/group/current
+[0:00:56.656] info   REQ POST /client/match/group/current
+[0:00:56.672] info   REQ POST /client/survey
+[0:00:56.672] info   REQ POST /client/repeatalbeQuests/activityPeriods
+[0:00:56.719] info   REQ POST /client/putLoadMetrics
+[0:00:56.750] info   REQ GET /aowlspt/mods/panel
+[0:00:56.750] info   REQ GET /aowlspt/mods/list
+[0:00:57.719] info   REQ GET /aowlspt/mods/lists
+[0:00:57.719] info   REQ GET /aowlspt/mods/conflicts
+[0:00:57.719] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n&more=1
+[0:00:57.766] info   REQ GET /aowlspt/mods/panel
+[0:00:57.766] info   REQ GET /aowlspt/mods/list
+[0:00:58.781] info   REQ GET /aowlspt/mods/panel
+[0:00:58.781] info   REQ GET /aowlspt/mods/list
+[0:00:59.781] info   REQ GET /aowlspt/mods/panel
+[0:00:59.781] info   REQ GET /aowlspt/mods/list
+[0:01:00.750] info   REQ GET /aowlspt/mods/lists
+[0:01:00.750] info   REQ GET /aowlspt/mods/conflicts
+[0:01:00.750] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile&more=1
+[0:01:00.797] info   REQ GET /aowlspt/mods/panel
+[0:01:00.797] info   REQ GET /aowlspt/mods/list
+[0:01:01.813] info   REQ GET /aowlspt/mods/panel
+[0:01:01.813] info   REQ GET /aowlspt/mods/list
+[0:01:02.828] info   REQ GET /aowlspt/mods/panel
+[0:01:02.828] info   REQ GET /aowlspt/mods/list
+[0:01:03.781] info   REQ GET /aowlspt/mods/lists
+[0:01:03.781] info   REQ GET /aowlspt/mods/conflicts
+[0:01:03.781] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n&more=1
+[0:01:03.844] info   REQ GET /aowlspt/mods/panel
+[0:01:03.844] info   REQ GET /aowlspt/mods/list
+[0:01:04.844] info   REQ GET /aowlspt/mods/panel
+[0:01:04.844] info   REQ GET /aowlspt/mods/list
+[0:01:05.860] info   REQ GET /aowlspt/mods/panel
+[0:01:05.860] info   REQ GET /aowlspt/mods/list
+[0:01:06.813] info   REQ GET /aowlspt/mods/lists
+[0:01:06.813] info   REQ GET /aowlspt/mods/conflicts
+[0:01:06.813] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile&more=1
+[0:01:06.875] info   REQ GET /aowlspt/mods/panel
+[0:01:06.875] info   REQ GET /aowlspt/mods/list
+[0:01:07.875] info   REQ GET /aowlspt/mods/panel
+[0:01:07.875] info   REQ GET /aowlspt/mods/list
+[0:01:08.891] info   REQ GET /aowlspt/mods/panel
+[0:01:08.891] info   REQ GET /aowlspt/mods/list
+[0:01:09.938] info   REQ GET /aowlspt/mods/lists
+[0:01:09.938] info   REQ GET /aowlspt/mods/conflicts
+[0:01:09.938] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n&more=1
+[0:01:09.985] info   REQ GET /aowlspt/mods/panel
+[0:01:09.985] info   REQ GET /aowlspt/mods/list
+[0:01:11.000] info   REQ GET /aowlspt/mods/panel
+[0:01:11.000] info   REQ GET /aowlspt/mods/list
+[0:01:12.000] info   REQ GET /aowlspt/mods/panel
+[0:01:12.000] info   REQ GET /aowlspt/mods/list
+[0:01:12.969] info   REQ GET /aowlspt/mods/lists
+[0:01:12.969] info   REQ GET /aowlspt/mods/conflicts
+[0:01:12.969] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile&more=1
+[0:01:13.016] info   REQ GET /aowlspt/mods/panel
+[0:01:13.016] info   REQ GET /aowlspt/mods/list
+[0:01:14.031] info   REQ GET /aowlspt/mods/panel
+[0:01:14.031] info   REQ GET /aowlspt/mods/list
+[0:01:15.031] info   REQ GET /aowlspt/mods/panel
+[0:01:15.031] info   REQ GET /aowlspt/mods/list
+[0:01:16.000] info   REQ GET /aowlspt/mods/lists
+[0:01:16.000] info   REQ GET /aowlspt/mods/conflicts
+[0:01:16.000] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n&more=1
+[0:01:16.047] info   REQ GET /aowlspt/mods/panel
+[0:01:16.047] info   REQ GET /aowlspt/mods/list
+[0:01:17.063] info   REQ GET /aowlspt/mods/panel
+[0:01:17.063] info   REQ GET /aowlspt/mods/list
+[0:01:18.063] info   REQ GET /aowlspt/mods/panel
+[0:01:18.063] info   REQ GET /aowlspt/mods/list
+[0:01:19.031] info   REQ GET /aowlspt/mods/lists
+[0:01:19.031] info   REQ GET /aowlspt/mods/conflicts
+[0:01:19.031] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile&more=1
+[0:01:19.078] info   REQ GET /aowlspt/mods/panel
+[0:01:19.078] info   REQ GET /aowlspt/mods/list
+[0:01:20.094] info   REQ GET /aowlspt/mods/panel
+[0:01:20.094] info   REQ GET /aowlspt/mods/list
+[0:01:21.110] info   REQ GET /aowlspt/mods/panel
+[0:01:21.110] info   REQ GET /aowlspt/mods/list
+[0:01:22.063] info   REQ GET /aowlspt/mods/lists
+[0:01:22.063] info   REQ GET /aowlspt/mods/conflicts
+[0:01:22.063] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n&more=1
+[0:01:22.110] info   REQ GET /aowlspt/mods/panel
+[0:01:22.110] info   REQ GET /aowlspt/mods/list
+[0:01:23.125] info   REQ GET /aowlspt/mods/panel
+[0:01:23.125] info   REQ GET /aowlspt/mods/list
+[0:01:24.141] info   REQ GET /aowlspt/mods/panel
+[0:01:24.141] info   REQ GET /aowlspt/mods/list
+[0:01:25.094] info   REQ GET /aowlspt/mods/lists
+[0:01:25.094] info   REQ GET /aowlspt/mods/conflicts
+[0:01:25.094] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n&more=1
+[0:01:25.156] info   REQ GET /aowlspt/mods/panel
+[0:01:25.156] info   REQ GET /aowlspt/mods/list
+[0:01:26.156] info   REQ GET /aowlspt/mods/panel
+[0:01:26.156] info   REQ GET /aowlspt/mods/list
+[0:01:27.172] info   REQ GET /aowlspt/mods/panel
+[0:01:27.172] info   REQ GET /aowlspt/mods/list
+[0:01:28.141] info   REQ GET /aowlspt/mods/lists
+[0:01:28.141] info   REQ GET /aowlspt/mods/conflicts
+[0:01:28.141] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile&more=1
+[0:01:28.188] info   REQ GET /aowlspt/mods/panel
+[0:01:28.188] info   REQ GET /aowlspt/mods/list
+[0:01:29.203] info   REQ GET /aowlspt/mods/panel
+[0:01:29.203] info   REQ GET /aowlspt/mods/list
+[0:01:30.219] info   REQ GET /aowlspt/mods/panel
+[0:01:30.219] info   REQ GET /aowlspt/mods/list
+[0:01:31.188] info   REQ GET /aowlspt/mods/lists
+[0:01:31.188] info   REQ GET /aowlspt/mods/conflicts
+[0:01:31.188] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n&more=1
+[0:01:31.235] info   REQ GET /aowlspt/mods/panel
+[0:01:31.235] info   REQ GET /aowlspt/mods/list
+[0:01:32.250] info   REQ GET /aowlspt/mods/panel
+[0:01:32.250] info   REQ GET /aowlspt/mods/list
+[0:01:33.266] info   REQ GET /aowlspt/mods/panel
+[0:01:33.266] info   REQ GET /aowlspt/mods/list
+[0:01:34.219] info   REQ GET /aowlspt/mods/lists
+[0:01:34.219] info   REQ GET /aowlspt/mods/conflicts
+[0:01:34.219] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile&more=1
+[0:01:34.266] info   REQ GET /aowlspt/mods/panel
+[0:01:34.266] info   REQ GET /aowlspt/mods/list
+[0:01:35.281] info   REQ GET /aowlspt/mods/panel
+[0:01:35.281] info   REQ GET /aowlspt/mods/list
+[0:01:36.297] info   REQ GET /aowlspt/mods/panel
+[0:01:36.297] info   REQ GET /aowlspt/mods/list
+[0:01:37.250] info   REQ GET /aowlspt/mods/lists
+[0:01:37.250] info   REQ GET /aowlspt/mods/conflicts
+[0:01:37.250] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n&more=1
+[0:01:37.297] info   REQ GET /aowlspt/mods/panel
+[0:01:37.297] info   REQ GET /aowlspt/mods/list
+[0:01:38.313] info   REQ GET /aowlspt/mods/panel
+[0:01:38.313] info   REQ GET /aowlspt/mods/list
+[0:01:39.328] info   REQ GET /aowlspt/mods/panel
+[0:01:39.328] info   REQ GET /aowlspt/mods/list
+[0:01:40.281] info   REQ GET /aowlspt/mods/lists
+[0:01:40.281] info   REQ GET /aowlspt/mods/conflicts
+[0:01:40.281] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile&more=1
+[0:01:40.344] info   REQ GET /aowlspt/mods/panel
+[0:01:40.344] info   REQ GET /aowlspt/mods/list
+[0:01:41.360] info   REQ GET /aowlspt/mods/panel
+[0:01:41.360] info   REQ GET /aowlspt/mods/list
+[0:01:42.375] info   REQ GET /aowlspt/mods/panel
+[0:01:42.375] info   REQ GET /aowlspt/mods/list
+[0:01:43.344] info   REQ GET /aowlspt/mods/lists
+[0:01:43.344] info   REQ GET /aowlspt/mods/conflicts
+[0:01:43.344] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n&more=1
+[0:01:43.391] info   REQ GET /aowlspt/mods/panel
+[0:01:43.391] info   REQ GET /aowlspt/mods/list
+[0:01:44.406] info   REQ GET /aowlspt/mods/panel
+[0:01:44.406] info   REQ GET /aowlspt/mods/list
+[0:01:45.422] info   REQ GET /aowlspt/mods/panel
+[0:01:45.422] info   REQ GET /aowlspt/mods/list
+[0:01:46.391] info   REQ GET /aowlspt/mods/lists
+[0:01:46.391] info   REQ GET /aowlspt/mods/conflicts
+[0:01:46.391] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile&more=1
+[0:01:46.438] info   REQ GET /aowlspt/mods/panel
+[0:01:46.438] info   REQ GET /aowlspt/mods/list
+[0:01:47.453] info   REQ GET /aowlspt/mods/panel
+[0:01:47.453] info   REQ GET /aowlspt/mods/list
+[0:01:48.453] info   REQ GET /aowlspt/mods/panel
+[0:01:48.453] info   REQ GET /aowlspt/mods/list
+[0:01:49.422] info   REQ GET /aowlspt/mods/lists
+[0:01:49.422] info   REQ GET /aowlspt/mods/conflicts
+[0:01:49.422] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n&more=1
+[0:01:49.469] info   REQ GET /aowlspt/mods/panel
+[0:01:49.469] info   REQ GET /aowlspt/mods/list
+[0:01:50.485] info   REQ GET /aowlspt/mods/panel
+[0:01:50.485] info   REQ GET /aowlspt/mods/list
+[0:01:51.500] info   REQ GET /aowlspt/mods/panel
+[0:01:51.500] info   REQ GET /aowlspt/mods/list
+[0:01:52.453] info   REQ GET /aowlspt/mods/lists
+[0:01:52.453] info   REQ GET /aowlspt/mods/conflicts
+[0:01:52.453] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n&more=1
+[0:01:52.516] info   REQ GET /aowlspt/mods/panel
+[0:01:52.516] info   REQ GET /aowlspt/mods/list
+[0:01:53.531] info   REQ GET /aowlspt/mods/panel
+[0:01:53.531] info   REQ GET /aowlspt/mods/list
+[0:01:54.547] info   REQ GET /aowlspt/mods/panel
+[0:01:54.547] info   REQ GET /aowlspt/mods/list
+[0:01:55.500] info   REQ GET /aowlspt/mods/lists
+[0:01:55.500] info   REQ GET /aowlspt/mods/conflicts
+[0:01:55.500] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile&more=1
+[0:01:55.563] info   REQ GET /aowlspt/mods/panel
+[0:01:55.563] info   REQ GET /aowlspt/mods/list
+[0:01:56.578] info   REQ GET /aowlspt/mods/panel
+[0:01:56.578] info   REQ GET /aowlspt/mods/list
+[0:01:57.594] info   REQ GET /aowlspt/mods/panel
+[0:01:57.594] info   REQ GET /aowlspt/mods/list
+[0:01:58.547] info   REQ GET /aowlspt/mods/lists
+[0:01:58.547] info   REQ GET /aowlspt/mods/conflicts
+[0:01:58.547] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n&more=1
+[0:01:58.610] info   REQ GET /aowlspt/mods/panel
+[0:01:58.610] info   REQ GET /aowlspt/mods/list
+[0:01:59.625] info   REQ GET /aowlspt/mods/panel
+[0:01:59.625] info   REQ GET /aowlspt/mods/list
+[0:02:00.641] info   REQ GET /aowlspt/mods/panel
+[0:02:00.641] info   REQ GET /aowlspt/mods/list
+[0:02:01.594] info   REQ GET /aowlspt/mods/lists
+[0:02:01.594] info   REQ GET /aowlspt/mods/conflicts
+[0:02:01.594] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile&more=1
+[0:02:01.656] info   REQ GET /aowlspt/mods/panel
+[0:02:01.656] info   REQ GET /aowlspt/mods/list
+[0:02:02.656] info   REQ GET /aowlspt/mods/panel
+[0:02:02.672] info   REQ GET /aowlspt/mods/list
+[0:02:03.672] info   REQ GET /aowlspt/mods/panel
+[0:02:03.672] info   REQ GET /aowlspt/mods/list
+[0:02:04.641] info   REQ GET /aowlspt/mods/lists
+[0:02:04.641] info   REQ GET /aowlspt/mods/conflicts
+[0:02:04.641] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n&more=1
+[0:02:04.688] info   REQ GET /aowlspt/mods/panel
+[0:02:04.688] info   REQ GET /aowlspt/mods/list
+[0:02:05.703] info   REQ GET /aowlspt/mods/panel
+[0:02:05.703] info   REQ GET /aowlspt/mods/list
+[0:02:06.719] info   REQ GET /aowlspt/mods/panel
+[0:02:06.719] info   REQ GET /aowlspt/mods/list
+[0:02:07.672] info   REQ GET /aowlspt/mods/lists
+[0:02:07.672] info   REQ GET /aowlspt/mods/conflicts
+[0:02:07.672] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile&more=1
+[0:02:07.719] info   REQ GET /aowlspt/mods/panel
+[0:02:07.719] info   REQ GET /aowlspt/mods/list
+[0:02:08.735] info   REQ GET /aowlspt/mods/panel
+[0:02:08.735] info   REQ GET /aowlspt/mods/list
+[0:02:09.750] info   REQ GET /aowlspt/mods/panel
+[0:02:09.750] info   REQ GET /aowlspt/mods/list
+[0:02:10.703] info   REQ GET /aowlspt/mods/lists
+[0:02:10.703] info   REQ GET /aowlspt/mods/conflicts
+[0:02:10.703] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n&more=1
+[0:02:10.766] info   REQ GET /aowlspt/mods/panel
+[0:02:10.766] info   REQ GET /aowlspt/mods/list
+[0:02:11.766] info   REQ GET /aowlspt/mods/panel
+[0:02:11.781] info   REQ GET /aowlspt/mods/list
+[0:02:12.781] info   REQ GET /aowlspt/mods/panel
+[0:02:12.781] info   REQ GET /aowlspt/mods/list
+[0:02:13.750] info   REQ GET /aowlspt/mods/lists
+[0:02:13.750] info   REQ GET /aowlspt/mods/conflicts
+[0:02:13.750] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile&more=1
+[0:02:13.797] info   REQ GET /aowlspt/mods/panel
+[0:02:13.797] info   REQ GET /aowlspt/mods/list
+[0:02:14.813] info   REQ GET /aowlspt/mods/panel
+[0:02:14.813] info   REQ GET /aowlspt/mods/list
+[0:02:15.828] info   REQ GET /aowlspt/mods/panel
+[0:02:15.828] info   REQ GET /aowlspt/mods/list
+[0:02:16.781] info   REQ GET /aowlspt/mods/lists
+[0:02:16.781] info   REQ GET /aowlspt/mods/conflicts
+[0:02:16.781] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n&more=1
+[0:02:16.844] info   REQ GET /aowlspt/mods/panel
+[0:02:16.844] info   REQ GET /aowlspt/mods/list
+[0:02:17.860] info   REQ GET /aowlspt/mods/panel
+[0:02:17.860] info   REQ GET /aowlspt/mods/list
+[0:02:18.875] info   REQ GET /aowlspt/mods/panel
+[0:02:18.875] info   REQ GET /aowlspt/mods/list
+[0:02:19.828] info   REQ GET /aowlspt/mods/lists
+[0:02:19.828] info   REQ GET /aowlspt/mods/conflicts
+[0:02:19.828] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n&more=1
+[0:02:19.875] info   REQ GET /aowlspt/mods/panel
+[0:02:19.891] info   REQ GET /aowlspt/mods/list
+[0:02:20.891] info   REQ GET /aowlspt/mods/panel
+[0:02:20.891] info   REQ GET /aowlspt/mods/list
+[0:02:21.906] info   REQ GET /aowlspt/mods/panel
+[0:02:21.906] info   REQ GET /aowlspt/mods/list
+[0:02:22.860] info   REQ GET /aowlspt/mods/lists
+[0:02:22.860] info   REQ GET /aowlspt/mods/conflicts
+[0:02:22.860] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile&more=1
+[0:02:22.906] info   REQ GET /aowlspt/mods/panel
+[0:02:22.922] info   REQ GET /aowlspt/mods/list
+[0:02:23.922] info   REQ GET /aowlspt/mods/panel
+[0:02:23.922] info   REQ GET /aowlspt/mods/list
+[0:02:24.938] info   REQ GET /aowlspt/mods/panel
+[0:02:24.938] info   REQ GET /aowlspt/mods/list
+[0:02:25.891] info   REQ GET /aowlspt/mods/lists
+[0:02:25.891] info   REQ GET /aowlspt/mods/conflicts
+[0:02:25.891] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n&more=1
+[0:02:25.953] info   REQ GET /aowlspt/mods/panel
+[0:02:25.953] info   REQ GET /aowlspt/mods/list
+[0:02:26.953] info   REQ GET /aowlspt/mods/panel
+[0:02:26.969] info   REQ GET /aowlspt/mods/list
+[0:02:27.969] info   REQ GET /aowlspt/mods/panel
+[0:02:27.969] info   REQ GET /aowlspt/mods/list
+[0:02:28.938] info   REQ GET /aowlspt/mods/lists
+[0:02:28.938] info   REQ GET /aowlspt/mods/conflicts
+[0:02:28.938] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile&more=1
+[0:02:28.985] info   REQ GET /aowlspt/mods/panel
+[0:02:28.985] info   REQ GET /aowlspt/mods/list
+[0:02:30.000] info   REQ GET /aowlspt/mods/panel
+[0:02:30.000] info   REQ GET /aowlspt/mods/list
+[0:02:31.016] info   REQ GET /aowlspt/mods/panel
+[0:02:31.016] info   REQ GET /aowlspt/mods/list
+[0:02:31.969] info   REQ GET /aowlspt/mods/lists
+[0:02:31.969] info   REQ GET /aowlspt/mods/conflicts
+[0:02:31.969] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n&more=1
+[0:02:32.016] info   REQ GET /aowlspt/mods/panel
+[0:02:32.016] info   REQ GET /aowlspt/mods/list
+[0:02:33.031] info   REQ GET /aowlspt/mods/panel
+[0:02:33.031] info   REQ GET /aowlspt/mods/list
+[0:02:34.047] info   REQ GET /aowlspt/mods/panel
+[0:02:34.047] info   REQ GET /aowlspt/mods/list
+[0:02:35.000] info   REQ GET /aowlspt/mods/lists
+[0:02:35.000] info   REQ GET /aowlspt/mods/conflicts
+[0:02:35.000] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile&more=1
+[0:02:35.063] info   REQ GET /aowlspt/mods/panel
+[0:02:35.063] info   REQ GET /aowlspt/mods/list
+[0:02:36.078] info   REQ GET /aowlspt/mods/panel
+[0:02:36.078] info   REQ GET /aowlspt/mods/list
+[0:02:37.078] info   REQ GET /aowlspt/mods/panel
+[0:02:37.078] info   REQ GET /aowlspt/mods/list
+[0:02:38.047] info   REQ GET /aowlspt/mods/lists
+[0:02:38.047] info   REQ GET /aowlspt/mods/conflicts
+[0:02:38.047] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n&more=1
+[0:02:38.094] info   REQ GET /aowlspt/mods/panel
+[0:02:38.094] info   REQ GET /aowlspt/mods/list
+[0:02:39.110] info   REQ GET /aowlspt/mods/panel
+[0:02:39.110] info   REQ GET /aowlspt/mods/list
+[0:02:40.125] info   REQ GET /aowlspt/mods/panel
+[0:02:40.125] info   REQ GET /aowlspt/mods/list
+[0:02:41.078] info   REQ GET /aowlspt/mods/lists
+[0:02:41.078] info   REQ GET /aowlspt/mods/conflicts
+[0:02:41.078] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile&more=1
+[0:02:41.141] info   REQ GET /aowlspt/mods/panel
+[0:02:41.141] info   REQ GET /aowlspt/mods/list
+[0:02:42.141] info   REQ GET /aowlspt/mods/panel
+[0:02:42.141] info   REQ GET /aowlspt/mods/list
+[0:02:43.156] info   REQ GET /aowlspt/mods/panel
+[0:02:43.156] info   REQ GET /aowlspt/mods/list
+[0:02:44.125] info   REQ GET /aowlspt/mods/lists
+[0:02:44.125] info   REQ GET /aowlspt/mods/conflicts
+[0:02:44.125] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n&more=1
+[0:02:44.172] info   REQ GET /aowlspt/mods/panel
+[0:02:44.172] info   REQ GET /aowlspt/mods/list
+[0:02:45.188] info   REQ GET /aowlspt/mods/panel
+[0:02:45.188] info   REQ GET /aowlspt/mods/list
+[0:02:46.203] info   REQ GET /aowlspt/mods/panel
+[0:02:46.203] info   REQ GET /aowlspt/mods/list
+[0:02:47.156] info   REQ GET /aowlspt/mods/lists
+[0:02:47.156] info   REQ GET /aowlspt/mods/conflicts
+[0:02:47.156] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n&more=1
+[0:02:47.219] info   REQ GET /aowlspt/mods/panel
+[0:02:47.219] info   REQ GET /aowlspt/mods/list
+[0:02:48.219] info   REQ GET /aowlspt/mods/panel
+[0:02:48.219] info   REQ GET /aowlspt/mods/list
+[0:02:49.235] info   REQ GET /aowlspt/mods/panel
+[0:02:49.235] info   REQ GET /aowlspt/mods/list
+[0:02:50.203] info   REQ GET /aowlspt/mods/lists
+[0:02:50.203] info   REQ GET /aowlspt/mods/conflicts
+[0:02:50.203] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile&more=1
+[0:02:50.250] info   REQ GET /aowlspt/mods/panel
+[0:02:50.250] info   REQ GET /aowlspt/mods/list
+[0:02:51.266] info   REQ GET /aowlspt/mods/panel
+[0:02:51.266] info   REQ GET /aowlspt/mods/list
+[0:02:52.281] info   REQ GET /aowlspt/mods/panel
+[0:02:52.281] info   REQ GET /aowlspt/mods/list
+[0:02:53.250] info   REQ GET /aowlspt/mods/lists
+[0:02:53.250] info   REQ GET /aowlspt/mods/conflicts
+[0:02:53.250] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n&more=1
+[0:02:53.297] info   REQ GET /aowlspt/mods/panel
+[0:02:53.297] info   REQ GET /aowlspt/mods/list
+[0:02:54.313] info   REQ GET /aowlspt/mods/panel
+[0:02:54.328] info   REQ GET /aowlspt/mods/list
+[0:02:55.344] info   REQ GET /aowlspt/mods/panel
+[0:02:55.344] info   REQ GET /aowlspt/mods/list
+[0:02:56.297] info   REQ GET /aowlspt/mods/lists
+[0:02:56.297] info   REQ GET /aowlspt/mods/conflicts
+[0:02:56.297] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile&more=1
+[0:02:56.360] info   REQ GET /aowlspt/mods/panel
+[0:02:56.360] info   REQ GET /aowlspt/mods/list
+[0:02:57.375] info   REQ GET /aowlspt/mods/panel
+[0:02:57.375] info   REQ GET /aowlspt/mods/list
+[0:02:58.375] info   REQ GET /aowlspt/mods/panel
+[0:02:58.375] info   REQ GET /aowlspt/mods/list
+[0:02:59.344] info   REQ GET /aowlspt/mods/lists
+[0:02:59.344] info   REQ GET /aowlspt/mods/conflicts
+[0:02:59.344] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n&more=1
+[0:02:59.391] info   REQ GET /aowlspt/mods/panel
+[0:02:59.406] info   REQ GET /aowlspt/mods/list
+[0:03:00.422] info   REQ GET /aowlspt/mods/panel
+[0:03:00.422] info   REQ GET /aowlspt/mods/list
+[0:03:01.438] info   REQ GET /aowlspt/mods/panel
+[0:03:01.438] info   REQ GET /aowlspt/mods/list
+[0:03:02.391] info   REQ GET /aowlspt/mods/lists
+[0:03:02.391] info   REQ GET /aowlspt/mods/conflicts
+[0:03:02.391] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile&more=1
+[0:03:02.453] info   REQ GET /aowlspt/mods/panel
+[0:03:02.453] info   REQ GET /aowlspt/mods/list
+[0:03:03.469] info   REQ GET /aowlspt/mods/panel
+[0:03:03.469] info   REQ GET /aowlspt/mods/list
+[0:03:04.485] info   REQ GET /aowlspt/mods/panel
+[0:03:04.485] info   REQ GET /aowlspt/mods/list
+[0:03:05.438] info   REQ GET /aowlspt/mods/lists
+[0:03:05.438] info   REQ GET /aowlspt/mods/conflicts
+[0:03:05.438] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n&more=1
+[0:03:05.500] info   REQ GET /aowlspt/mods/panel
+[0:03:05.500] info   REQ GET /aowlspt/mods/list
+[0:03:06.516] info   REQ GET /aowlspt/mods/panel
+[0:03:06.516] info   REQ GET /aowlspt/mods/list
+[0:03:07.531] info   REQ GET /aowlspt/mods/panel
+[0:03:07.531] info   REQ GET /aowlspt/mods/list
+[0:03:08.485] info   REQ GET /aowlspt/mods/lists
+[0:03:08.500] info   REQ GET /aowlspt/mods/conflicts
+[0:03:08.500] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile&more=1
+[0:03:08.547] info   REQ GET /aowlspt/mods/panel
+[0:03:08.547] info   REQ GET /aowlspt/mods/list
+[0:03:09.563] info   REQ GET /aowlspt/mods/panel
+[0:03:09.563] info   REQ GET /aowlspt/mods/list
+[0:03:10.563] info   REQ GET /aowlspt/mods/panel
+[0:03:10.563] info   REQ GET /aowlspt/mods/list
+[0:03:11.531] info   REQ GET /aowlspt/mods/lists
+[0:03:11.531] info   REQ GET /aowlspt/mods/conflicts
+[0:03:11.531] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n&more=1
+[0:03:11.578] info   REQ GET /aowlspt/mods/panel
+[0:03:11.578] info   REQ GET /aowlspt/mods/list
+[0:03:12.594] info   REQ GET /aowlspt/mods/panel
+[0:03:12.594] info   REQ GET /aowlspt/mods/list
+[0:03:13.610] info   REQ GET /aowlspt/mods/panel
+[0:03:13.610] info   REQ GET /aowlspt/mods/list
+[0:03:14.578] info   REQ GET /aowlspt/mods/lists
+[0:03:14.578] info   REQ GET /aowlspt/mods/conflicts
+[0:03:14.578] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile&more=1
+[0:03:14.625] info   REQ GET /aowlspt/mods/panel
+[0:03:14.625] info   REQ GET /aowlspt/mods/list
+[0:03:15.641] info   REQ GET /aowlspt/mods/panel
+[0:03:15.641] info   REQ GET /aowlspt/mods/list
+[0:03:16.641] info   REQ GET /aowlspt/mods/panel
+[0:03:16.641] info   REQ GET /aowlspt/mods/list
+[0:03:16.797] info   REQ POST /client/game/keepalive
+[0:03:17.610] info   REQ GET /aowlspt/mods/lists
+[0:03:17.610] info   REQ GET /aowlspt/mods/conflicts
+[0:03:17.610] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n&more=1
+[0:03:17.656] info   REQ GET /aowlspt/mods/panel
+[0:03:17.656] info   REQ GET /aowlspt/mods/list
+[0:03:18.672] info   REQ GET /aowlspt/mods/panel
+[0:03:18.672] info   REQ GET /aowlspt/mods/list
+[0:03:19.688] info   REQ GET /aowlspt/mods/panel
+[0:03:19.688] info   REQ GET /aowlspt/mods/list
+[0:03:20.641] info   REQ GET /aowlspt/mods/lists
+[0:03:20.641] info   REQ GET /aowlspt/mods/conflicts
+[0:03:20.641] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile&more=1
+[0:03:20.688] info   REQ GET /aowlspt/mods/panel
+[0:03:20.703] info   REQ GET /aowlspt/mods/list
+[0:03:21.703] info   REQ GET /aowlspt/mods/panel
+[0:03:21.703] info   REQ GET /aowlspt/mods/list
+[0:03:22.719] info   REQ GET /aowlspt/mods/panel
+[0:03:22.719] info   REQ GET /aowlspt/mods/list
+[0:03:23.688] info   REQ GET /aowlspt/mods/lists
+[0:03:23.688] info   REQ GET /aowlspt/mods/conflicts
+[0:03:23.688] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n&more=1
+[0:03:23.735] info   REQ GET /aowlspt/mods/panel
+[0:03:23.750] info   REQ GET /aowlspt/mods/list
+[0:03:24.750] info   REQ GET /aowlspt/mods/panel
+[0:03:24.766] info   REQ GET /aowlspt/mods/list
+[0:03:25.766] info   REQ GET /aowlspt/mods/panel
+[0:03:25.766] info   REQ GET /aowlspt/mods/list
+[0:03:26.735] info   REQ GET /aowlspt/mods/lists
+[0:03:26.735] info   REQ GET /aowlspt/mods/conflicts
+[0:03:26.735] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile&more=1
+[0:03:26.781] info   REQ GET /aowlspt/mods/panel
+[0:03:26.797] info   REQ GET /aowlspt/mods/list
+[0:03:27.813] info   REQ GET /aowlspt/mods/panel
+[0:03:27.813] info   REQ GET /aowlspt/mods/list
+[0:03:28.813] info   REQ GET /aowlspt/mods/panel
+[0:03:28.813] info   REQ GET /aowlspt/mods/list
+[0:03:29.781] info   REQ GET /aowlspt/mods/lists
+[0:03:29.781] info   REQ GET /aowlspt/mods/conflicts
+[0:03:29.781] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n&more=1
+[0:03:29.828] info   REQ GET /aowlspt/mods/panel
+[0:03:29.828] info   REQ GET /aowlspt/mods/list
+[0:03:30.844] info   REQ GET /aowlspt/mods/panel
+[0:03:30.844] info   REQ GET /aowlspt/mods/list
+[0:03:31.860] info   REQ GET /aowlspt/mods/panel
+[0:03:31.860] info   REQ GET /aowlspt/mods/list
+[0:03:32.828] info   REQ GET /aowlspt/mods/lists
+[0:03:32.828] info   REQ GET /aowlspt/mods/conflicts
+[0:03:32.828] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile&more=1
+[0:03:32.875] info   REQ GET /aowlspt/mods/panel
+[0:03:32.875] info   REQ GET /aowlspt/mods/list
+[0:03:33.891] info   REQ GET /aowlspt/mods/panel
+[0:03:33.891] info   REQ GET /aowlspt/mods/list
+[0:03:34.906] info   REQ GET /aowlspt/mods/panel
+[0:03:34.906] info   REQ GET /aowlspt/mods/list
+[0:03:35.860] info   REQ GET /aowlspt/mods/lists
+[0:03:35.875] info   REQ GET /aowlspt/mods/conflicts
+[0:03:35.875] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n&more=1
+[0:03:35.922] info   REQ GET /aowlspt/mods/panel
+[0:03:35.922] info   REQ GET /aowlspt/mods/list
+[0:03:36.938] info   REQ GET /aowlspt/mods/panel
+[0:03:36.938] info   REQ GET /aowlspt/mods/list
+[0:03:37.953] info   REQ GET /aowlspt/mods/panel
+[0:03:37.953] info   REQ GET /aowlspt/mods/list
+[0:03:38.906] info   REQ GET /aowlspt/mods/lists
+[0:03:38.922] info   REQ GET /aowlspt/mods/conflicts
+[0:03:38.922] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n&more=1
+[0:03:38.969] info   REQ GET /aowlspt/mods/panel
+[0:03:38.969] info   REQ GET /aowlspt/mods/list
+[0:03:39.985] info   REQ GET /aowlspt/mods/panel
+[0:03:39.985] info   REQ GET /aowlspt/mods/list
+[0:03:40.985] info   REQ GET /aowlspt/mods/panel
+[0:03:40.985] info   REQ GET /aowlspt/mods/list
+[0:03:41.953] info   REQ GET /aowlspt/mods/lists
+[0:03:41.953] info   REQ GET /aowlspt/mods/conflicts
+[0:03:41.953] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile&more=1
+[0:03:42.000] info   REQ GET /aowlspt/mods/panel
+[0:03:42.000] info   REQ GET /aowlspt/mods/list
+[0:03:43.016] info   REQ GET /aowlspt/mods/panel
+[0:03:43.016] info   REQ GET /aowlspt/mods/list
+[0:03:44.016] info   REQ GET /aowlspt/mods/panel
+[0:03:44.031] info   REQ GET /aowlspt/mods/list
+[0:03:44.985] info   REQ GET /aowlspt/mods/lists
+[0:03:44.985] info   REQ GET /aowlspt/mods/conflicts
+[0:03:44.985] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n&more=1
+[0:03:45.031] info   REQ GET /aowlspt/mods/panel
+[0:03:45.031] info   REQ GET /aowlspt/mods/list
+[0:03:46.063] info   REQ GET /aowlspt/mods/panel
+[0:03:46.063] info   REQ GET /aowlspt/mods/list
+[0:03:47.078] info   REQ GET /aowlspt/mods/panel
+[0:03:47.078] info   REQ GET /aowlspt/mods/list
+[0:03:48.031] info   REQ GET /aowlspt/mods/lists
+[0:03:48.031] info   REQ GET /aowlspt/mods/conflicts
+[0:03:48.031] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile&more=1
+[0:03:48.094] info   REQ GET /aowlspt/mods/panel
+[0:03:48.094] info   REQ GET /aowlspt/mods/list
+[0:03:49.094] info   REQ GET /aowlspt/mods/panel
+[0:03:49.110] info   REQ GET /aowlspt/mods/list
+[0:03:50.110] info   REQ GET /aowlspt/mods/panel
+[0:03:50.110] info   REQ GET /aowlspt/mods/list
+[0:03:51.078] info   REQ GET /aowlspt/mods/lists
+[0:03:51.078] info   REQ GET /aowlspt/mods/conflicts
+[0:03:51.078] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n&more=1
+[0:03:51.125] info   REQ GET /aowlspt/mods/panel
+[0:03:51.141] info   REQ GET /aowlspt/mods/list
+[0:03:52.141] info   REQ GET /aowlspt/mods/panel
+[0:03:52.141] info   REQ GET /aowlspt/mods/list
+[0:03:53.156] info   REQ GET /aowlspt/mods/panel
+[0:03:53.156] info   REQ GET /aowlspt/mods/list
+[0:03:54.125] info   REQ GET /aowlspt/mods/lists
+[0:03:54.125] info   REQ GET /aowlspt/mods/conflicts
+[0:03:54.125] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile&more=1
+[0:03:54.172] info   REQ GET /aowlspt/mods/panel
+[0:03:54.172] info   REQ GET /aowlspt/mods/list
+[0:03:55.188] info   REQ GET /aowlspt/mods/panel
+[0:03:55.188] info   REQ GET /aowlspt/mods/list
+[0:03:56.203] info   REQ GET /aowlspt/mods/panel
+[0:03:56.203] info   REQ GET /aowlspt/mods/list
+[0:03:57.172] info   REQ GET /aowlspt/mods/lists
+[0:03:57.172] info   REQ GET /aowlspt/mods/conflicts
+[0:03:57.172] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n&more=1
+[0:03:57.219] info   REQ GET /aowlspt/mods/panel
+[0:03:57.219] info   REQ GET /aowlspt/mods/list
+[0:03:58.235] info   REQ GET /aowlspt/mods/panel
+[0:03:58.235] info   REQ GET /aowlspt/mods/list
+[0:03:59.250] info   REQ GET /aowlspt/mods/panel
+[0:03:59.250] info   REQ GET /aowlspt/mods/list
+[0:04:00.219] info   REQ GET /aowlspt/mods/lists
+[0:04:00.219] info   REQ GET /aowlspt/mods/conflicts
+[0:04:00.219] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile&more=1
+[0:04:00.266] info   REQ GET /aowlspt/mods/panel
+[0:04:00.266] info   REQ GET /aowlspt/mods/list
+[0:04:01.281] info   REQ GET /aowlspt/mods/panel
+[0:04:01.281] info   REQ GET /aowlspt/mods/list
+[0:04:02.297] info   REQ GET /aowlspt/mods/panel
+[0:04:02.297] info   REQ GET /aowlspt/mods/list
+[0:04:03.266] info   REQ GET /aowlspt/mods/lists
+[0:04:03.266] info   REQ GET /aowlspt/mods/conflicts
+[0:04:03.266] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n&more=1
+[0:04:03.313] info   REQ GET /aowlspt/mods/panel
+[0:04:03.313] info   REQ GET /aowlspt/mods/list
+[0:04:04.328] info   REQ GET /aowlspt/mods/panel
+[0:04:04.328] info   REQ GET /aowlspt/mods/list
+[0:04:05.344] info   REQ GET /aowlspt/mods/panel
+[0:04:05.344] info   REQ GET /aowlspt/mods/list
+[0:04:06.313] info   REQ GET /aowlspt/mods/lists
+[0:04:06.313] info   REQ GET /aowlspt/mods/conflicts
+[0:04:06.313] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n&more=1
+[0:04:06.360] info   REQ GET /aowlspt/mods/panel
+[0:04:06.360] info   REQ GET /aowlspt/mods/list
+[0:04:07.375] info   REQ GET /aowlspt/mods/panel
+[0:04:07.375] info   REQ GET /aowlspt/mods/list
+[0:04:08.391] info   REQ GET /aowlspt/mods/panel
+[0:04:08.391] info   REQ GET /aowlspt/mods/list
+[0:04:09.344] info   REQ GET /aowlspt/mods/lists
+[0:04:09.360] info   REQ GET /aowlspt/mods/conflicts
+[0:04:09.360] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile&more=1
+[0:04:09.406] info   REQ GET /aowlspt/mods/panel
+[0:04:09.406] info   REQ GET /aowlspt/mods/list
+[0:04:10.422] info   REQ GET /aowlspt/mods/panel
+[0:04:10.422] info   REQ GET /aowlspt/mods/list
+[0:04:11.422] info   REQ GET /aowlspt/mods/panel
+[0:04:11.422] info   REQ GET /aowlspt/mods/list
+[0:04:12.391] info   REQ GET /aowlspt/mods/lists
+[0:04:12.391] info   REQ GET /aowlspt/mods/conflicts
+[0:04:12.391] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n&more=1
+[0:04:12.438] info   REQ GET /aowlspt/mods/panel
+[0:04:12.438] info   REQ GET /aowlspt/mods/list
+[0:04:13.453] info   REQ GET /aowlspt/mods/panel
+[0:04:13.453] info   REQ GET /aowlspt/mods/list
+[0:04:14.469] info   REQ GET /aowlspt/mods/panel
+[0:04:14.469] info   REQ GET /aowlspt/mods/list
+[0:04:15.422] info   REQ GET /aowlspt/mods/lists
+[0:04:15.422] info   REQ GET /aowlspt/mods/conflicts
+[0:04:15.422] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile&more=1
+[0:04:15.469] info   REQ GET /aowlspt/mods/panel
+[0:04:15.469] info   REQ GET /aowlspt/mods/list
+[0:04:16.485] info   REQ GET /aowlspt/mods/panel
+[0:04:16.485] info   REQ GET /aowlspt/mods/list
+[0:04:17.500] info   REQ GET /aowlspt/mods/panel
+[0:04:17.500] info   REQ GET /aowlspt/mods/list
+[0:04:18.453] info   REQ GET /aowlspt/mods/lists
+[0:04:18.453] info   REQ GET /aowlspt/mods/conflicts
+[0:04:18.453] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n&more=1
+[0:04:18.500] info   REQ GET /aowlspt/mods/panel
+[0:04:18.516] info   REQ GET /aowlspt/mods/list
+[0:04:19.516] info   REQ GET /aowlspt/mods/panel
+[0:04:19.516] info   REQ GET /aowlspt/mods/list
+[0:04:20.531] info   REQ GET /aowlspt/mods/panel
+[0:04:20.531] info   REQ GET /aowlspt/mods/list
+[0:04:21.485] info   REQ GET /aowlspt/mods/lists
+[0:04:21.485] info   REQ GET /aowlspt/mods/conflicts
+[0:04:21.485] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile&more=1
+[0:04:21.547] info   REQ GET /aowlspt/mods/panel
+[0:04:21.547] info   REQ GET /aowlspt/mods/list
+[0:04:22.547] info   REQ GET /aowlspt/mods/panel
+[0:04:22.547] info   REQ GET /aowlspt/mods/list
+[0:04:23.563] info   REQ GET /aowlspt/mods/panel
+[0:04:23.563] info   REQ GET /aowlspt/mods/list
+[0:04:24.531] info   REQ GET /aowlspt/mods/lists
+[0:04:24.531] info   REQ GET /aowlspt/mods/conflicts
+[0:04:24.531] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n&more=1
+[0:04:24.578] info   REQ GET /aowlspt/mods/panel
+[0:04:24.578] info   REQ GET /aowlspt/mods/list
+[0:04:25.594] info   REQ GET /aowlspt/mods/panel
+[0:04:25.594] info   REQ GET /aowlspt/mods/list
+[0:04:26.594] info   REQ GET /aowlspt/mods/panel
+[0:04:26.610] info   REQ GET /aowlspt/mods/list
+[0:04:27.563] info   REQ GET /aowlspt/mods/lists
+[0:04:27.563] info   REQ GET /aowlspt/mods/conflicts
+[0:04:27.563] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile&more=1
+[0:04:27.610] info   REQ GET /aowlspt/mods/panel
+[0:04:27.610] info   REQ GET /aowlspt/mods/list
+[0:04:28.625] info   REQ GET /aowlspt/mods/panel
+[0:04:28.625] info   REQ GET /aowlspt/mods/list
+[0:04:29.641] info   REQ GET /aowlspt/mods/panel
+[0:04:29.641] info   REQ GET /aowlspt/mods/list
+[0:04:30.594] info   REQ GET /aowlspt/mods/lists
+[0:04:30.594] info   REQ GET /aowlspt/mods/conflicts
+[0:04:30.594] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n&more=1
+[0:04:30.656] info   REQ GET /aowlspt/mods/panel
+[0:04:30.656] info   REQ GET /aowlspt/mods/list
+[0:04:31.656] info   REQ GET /aowlspt/mods/panel
+[0:04:31.656] info   REQ GET /aowlspt/mods/list
+[0:04:32.672] info   REQ GET /aowlspt/mods/panel
+[0:04:32.672] info   REQ GET /aowlspt/mods/list
+[0:04:33.625] info   REQ GET /aowlspt/mods/lists
+[0:04:33.625] info   REQ GET /aowlspt/mods/conflicts
+[0:04:33.625] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n&more=1
+[0:04:33.688] info   REQ GET /aowlspt/mods/panel
+[0:04:33.688] info   REQ GET /aowlspt/mods/list
+[0:04:34.688] info   REQ GET /aowlspt/mods/panel
+[0:04:34.688] info   REQ GET /aowlspt/mods/list
+[0:04:35.703] info   REQ GET /aowlspt/mods/panel
+[0:04:35.703] info   REQ GET /aowlspt/mods/list
+[0:04:36.672] info   REQ GET /aowlspt/mods/lists
+[0:04:36.672] info   REQ GET /aowlspt/mods/conflicts
+[0:04:36.672] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile&more=1
+[0:04:36.719] info   REQ GET /aowlspt/mods/panel
+[0:04:36.719] info   REQ GET /aowlspt/mods/list
+[0:04:37.735] info   REQ GET /aowlspt/mods/panel
+[0:04:37.735] info   REQ GET /aowlspt/mods/list
+[0:04:38.750] info   REQ GET /aowlspt/mods/panel
+[0:04:38.750] info   REQ GET /aowlspt/mods/list
+[0:04:39.703] info   REQ GET /aowlspt/mods/lists
+[0:04:39.703] info   REQ GET /aowlspt/mods/conflicts
+[0:04:39.703] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n&more=1
+[0:04:39.766] info   REQ GET /aowlspt/mods/panel
+[0:04:39.766] info   REQ GET /aowlspt/mods/list
+[0:04:40.766] info   REQ GET /aowlspt/mods/panel
+[0:04:40.766] info   REQ GET /aowlspt/mods/list
+[0:04:41.781] info   REQ GET /aowlspt/mods/panel
+[0:04:41.781] info   REQ GET /aowlspt/mods/list
+[0:04:42.750] info   REQ GET /aowlspt/mods/lists
+[0:04:42.750] info   REQ GET /aowlspt/mods/conflicts
+[0:04:42.750] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile&more=1
+[0:04:42.797] info   REQ GET /aowlspt/mods/panel
+[0:04:42.797] info   REQ GET /aowlspt/mods/list
+[0:04:43.813] info   REQ GET /aowlspt/mods/panel
+[0:04:43.813] info   REQ GET /aowlspt/mods/list
+[0:04:44.813] info   REQ GET /aowlspt/mods/panel
+[0:04:44.813] info   REQ GET /aowlspt/mods/list
+[0:04:45.781] info   REQ GET /aowlspt/mods/lists
+[0:04:45.781] info   REQ GET /aowlspt/mods/conflicts
+[0:04:45.781] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n&more=1
+[0:04:45.828] info   REQ GET /aowlspt/mods/panel
+[0:04:45.828] info   REQ GET /aowlspt/mods/list
+[0:04:46.844] info   REQ GET /aowlspt/mods/panel
+[0:04:46.844] info   REQ GET /aowlspt/mods/list
+[0:04:47.860] info   REQ GET /aowlspt/mods/panel
+[0:04:47.860] info   REQ GET /aowlspt/mods/list
+[0:04:48.906] info   REQ GET /aowlspt/mods/lists
+[0:04:48.906] info   REQ GET /aowlspt/mods/conflicts
+[0:04:48.906] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile&more=1
+[0:04:48.953] info   REQ GET /aowlspt/mods/panel
+[0:04:48.953] info   REQ GET /aowlspt/mods/list
+[0:04:49.969] info   REQ GET /aowlspt/mods/panel
+[0:04:49.969] info   REQ GET /aowlspt/mods/list
+[0:04:50.969] info   REQ GET /aowlspt/mods/panel
+[0:04:50.969] info   REQ GET /aowlspt/mods/list
+[0:04:51.938] info   REQ GET /aowlspt/mods/lists
+[0:04:51.938] info   REQ GET /aowlspt/mods/conflicts
+[0:04:51.938] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n&more=1
+[0:04:51.985] info   REQ GET /aowlspt/mods/panel
+[0:04:51.985] info   REQ GET /aowlspt/mods/list
+[0:04:53.000] info   REQ GET /aowlspt/mods/panel
+[0:04:53.000] info   REQ GET /aowlspt/mods/list
+[0:04:54.000] info   REQ GET /aowlspt/mods/panel
+[0:04:54.000] info   REQ GET /aowlspt/mods/list
+[0:04:54.969] info   REQ GET /aowlspt/mods/lists
+[0:04:54.969] info   REQ GET /aowlspt/mods/conflicts
+[0:04:54.969] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile&more=1
+[0:04:55.016] info   REQ GET /aowlspt/mods/panel
+[0:04:55.016] info   REQ GET /aowlspt/mods/list
+[0:04:56.031] info   REQ GET /aowlspt/mods/panel
+[0:04:56.031] info   REQ GET /aowlspt/mods/list
+[0:04:57.047] info   REQ GET /aowlspt/mods/panel
+[0:04:57.047] info   REQ GET /aowlspt/mods/list
+[0:04:58.000] info   REQ GET /aowlspt/mods/lists
+[0:04:58.000] info   REQ GET /aowlspt/mods/conflicts
+[0:04:58.000] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n&more=1
+[0:04:58.063] info   REQ GET /aowlspt/mods/panel
+[0:04:58.063] info   REQ GET /aowlspt/mods/list
+[0:04:59.063] info   REQ GET /aowlspt/mods/panel
+[0:04:59.063] info   REQ GET /aowlspt/mods/list
+[0:05:00.078] info   REQ GET /aowlspt/mods/panel
+[0:05:00.078] info   REQ GET /aowlspt/mods/list
+[0:05:01.047] info   REQ GET /aowlspt/mods/lists
+[0:05:01.047] info   REQ GET /aowlspt/mods/conflicts
+[0:05:01.047] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n&more=1
+[0:05:01.094] info   REQ GET /aowlspt/mods/panel
+[0:05:01.094] info   REQ GET /aowlspt/mods/list
+[0:05:02.110] info   REQ GET /aowlspt/mods/panel
+[0:05:02.110] info   REQ GET /aowlspt/mods/list
+[0:05:03.110] info   REQ GET /aowlspt/mods/panel
+[0:05:03.110] info   REQ GET /aowlspt/mods/list
+[0:05:04.078] info   REQ GET /aowlspt/mods/lists
+[0:05:04.078] info   REQ GET /aowlspt/mods/conflicts
+[0:05:04.078] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile&more=1
+[0:05:04.125] info   REQ GET /aowlspt/mods/panel
+[0:05:04.125] info   REQ GET /aowlspt/mods/list
+[0:05:05.141] info   REQ GET /aowlspt/mods/panel
+[0:05:05.141] info   REQ GET /aowlspt/mods/list
+[0:05:06.141] info   REQ GET /aowlspt/mods/panel
+[0:05:06.141] info   REQ GET /aowlspt/mods/list
+[0:05:07.110] info   REQ GET /aowlspt/mods/lists
+[0:05:07.110] info   REQ GET /aowlspt/mods/conflicts
+[0:05:07.110] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n&more=1
+[0:05:07.156] info   REQ GET /aowlspt/mods/panel
+[0:05:07.156] info   REQ GET /aowlspt/mods/list
+[0:05:08.172] info   REQ GET /aowlspt/mods/panel
+[0:05:08.172] info   REQ GET /aowlspt/mods/list
+[0:05:09.172] info   REQ GET /aowlspt/mods/panel
+[0:05:09.172] info   REQ GET /aowlspt/mods/list
+[0:05:10.141] info   REQ GET /aowlspt/mods/lists
+[0:05:10.141] info   REQ GET /aowlspt/mods/conflicts
+[0:05:10.141] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile&more=1
+[0:05:10.188] info   REQ GET /aowlspt/mods/panel
+[0:05:10.188] info   REQ GET /aowlspt/mods/list
+[0:05:11.203] info   REQ GET /aowlspt/mods/panel
+[0:05:11.203] info   REQ GET /aowlspt/mods/list
+[0:05:12.203] info   REQ GET /aowlspt/mods/panel
+[0:05:12.219] info   REQ GET /aowlspt/mods/list
+[0:05:13.172] info   REQ GET /aowlspt/mods/lists
+[0:05:13.172] info   REQ GET /aowlspt/mods/conflicts
+[0:05:13.172] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n&more=1
+[0:05:13.219] info   REQ GET /aowlspt/mods/panel
+[0:05:13.219] info   REQ GET /aowlspt/mods/list
+[0:05:14.235] info   REQ GET /aowlspt/mods/panel
+[0:05:14.235] info   REQ GET /aowlspt/mods/list
+[0:05:15.250] info   REQ GET /aowlspt/mods/panel
+[0:05:15.250] info   REQ GET /aowlspt/mods/list
+[0:05:16.203] info   REQ GET /aowlspt/mods/lists
+[0:05:16.203] info   REQ GET /aowlspt/mods/conflicts
+[0:05:16.203] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile&more=1
+[0:05:16.266] info   REQ GET /aowlspt/mods/panel
+[0:05:16.266] info   REQ GET /aowlspt/mods/list
+[0:05:17.266] info   REQ GET /aowlspt/mods/panel
+[0:05:17.281] info   REQ GET /aowlspt/mods/list
+[0:05:18.281] info   REQ GET /aowlspt/mods/panel
+[0:05:18.281] info   REQ GET /aowlspt/mods/list
+[0:05:19.250] info   REQ GET /aowlspt/mods/lists
+[0:05:19.250] info   REQ GET /aowlspt/mods/conflicts
+[0:05:19.250] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n&more=1
+[0:05:19.297] info   REQ GET /aowlspt/mods/panel
+[0:05:19.297] info   REQ GET /aowlspt/mods/list
+[0:05:20.313] info   REQ GET /aowlspt/mods/panel
+[0:05:20.313] info   REQ GET /aowlspt/mods/list
+[0:05:21.328] info   REQ GET /aowlspt/mods/panel
+[0:05:21.328] info   REQ GET /aowlspt/mods/list
+[0:05:22.281] info   REQ GET /aowlspt/mods/lists
+[0:05:22.281] info   REQ GET /aowlspt/mods/conflicts
+[0:05:22.281] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile&more=1
+[0:05:22.328] info   REQ GET /aowlspt/mods/panel
+[0:05:22.328] info   REQ GET /aowlspt/mods/list
+[0:05:23.344] info   REQ GET /aowlspt/mods/panel
+[0:05:23.344] info   REQ GET /aowlspt/mods/list
+[0:05:24.360] info   REQ GET /aowlspt/mods/panel
+[0:05:24.360] info   REQ GET /aowlspt/mods/list
+[0:05:25.313] info   REQ GET /aowlspt/mods/lists
+[0:05:25.313] info   REQ GET /aowlspt/mods/conflicts
+[0:05:25.313] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n&more=1
+[0:05:25.375] info   REQ GET /aowlspt/mods/panel
+[0:05:25.375] info   REQ GET /aowlspt/mods/list
+[0:05:26.375] info   REQ GET /aowlspt/mods/panel
+[0:05:26.375] info   REQ GET /aowlspt/mods/list
+[0:05:27.391] info   REQ GET /aowlspt/mods/panel
+[0:05:27.391] info   REQ GET /aowlspt/mods/list
+[0:05:28.344] info   REQ GET /aowlspt/mods/lists
+[0:05:28.344] info   REQ GET /aowlspt/mods/conflicts
+[0:05:28.344] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n&more=1
+[0:05:28.406] info   REQ GET /aowlspt/mods/panel
+[0:05:28.406] info   REQ GET /aowlspt/mods/list
+[0:05:29.406] info   REQ GET /aowlspt/mods/panel
+[0:05:29.406] info   REQ GET /aowlspt/mods/list
+[0:05:30.422] info   REQ GET /aowlspt/mods/panel
+[0:05:30.422] info   REQ GET /aowlspt/mods/list
+[0:05:31.375] info   REQ GET /aowlspt/mods/lists
+[0:05:31.375] info   REQ GET /aowlspt/mods/conflicts
+[0:05:31.375] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile&more=1
+[0:05:31.438] info   REQ GET /aowlspt/mods/panel
+[0:05:31.438] info   REQ GET /aowlspt/mods/list
+[0:05:32.438] info   REQ GET /aowlspt/mods/panel
+[0:05:32.438] info   REQ GET /aowlspt/mods/list
+[0:05:33.453] info   REQ GET /aowlspt/mods/panel
+[0:05:33.453] info   REQ GET /aowlspt/mods/list
+[0:05:34.406] info   REQ GET /aowlspt/mods/lists
+[0:05:34.422] info   REQ GET /aowlspt/mods/conflicts
+[0:05:34.422] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n&more=1
+[0:05:34.469] info   REQ GET /aowlspt/mods/panel
+[0:05:34.469] info   REQ GET /aowlspt/mods/list
+[0:05:35.469] info   REQ GET /aowlspt/mods/panel
+[0:05:35.469] info   REQ GET /aowlspt/mods/list
+[0:05:36.485] info   REQ GET /aowlspt/mods/panel
+[0:05:36.485] info   REQ GET /aowlspt/mods/list
+[0:05:36.860] info   REQ POST /client/game/keepalive
+[0:05:37.453] info   REQ GET /aowlspt/mods/lists
+[0:05:37.453] info   REQ GET /aowlspt/mods/conflicts
+[0:05:37.453] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile&more=1
+[0:05:37.500] info   REQ GET /aowlspt/mods/panel
+[0:05:37.500] info   REQ GET /aowlspt/mods/list
+[0:05:38.516] info   REQ GET /aowlspt/mods/panel
+[0:05:38.516] info   REQ GET /aowlspt/mods/list
+[0:05:39.531] info   REQ GET /aowlspt/mods/panel
+[0:05:39.531] info   REQ GET /aowlspt/mods/list
+[0:05:40.485] info   REQ GET /aowlspt/mods/lists
+[0:05:40.485] info   REQ GET /aowlspt/mods/conflicts
+[0:05:40.485] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n&more=1
+[0:05:40.531] info   REQ GET /aowlspt/mods/panel
+[0:05:40.531] info   REQ GET /aowlspt/mods/list
+[0:05:41.547] info   REQ GET /aowlspt/mods/panel
+[0:05:41.547] info   REQ GET /aowlspt/mods/list
+[0:05:42.563] info   REQ GET /aowlspt/mods/panel
+[0:05:42.563] info   REQ GET /aowlspt/mods/list
+[0:05:43.516] info   REQ GET /aowlspt/mods/lists
+[0:05:43.516] info   REQ GET /aowlspt/mods/conflicts
+[0:05:43.516] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile&more=1
+[0:05:43.563] info   REQ GET /aowlspt/mods/panel
+[0:05:43.578] info   REQ GET /aowlspt/mods/list
+[0:05:44.578] info   REQ GET /aowlspt/mods/panel
+[0:05:44.578] info   REQ GET /aowlspt/mods/list
+[0:05:45.594] info   REQ GET /aowlspt/mods/panel
+[0:05:45.594] info   REQ GET /aowlspt/mods/list
+[0:05:46.547] info   REQ GET /aowlspt/mods/lists
+[0:05:46.547] info   REQ GET /aowlspt/mods/conflicts
+[0:05:46.547] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n&more=1
+[0:05:46.610] info   REQ GET /aowlspt/mods/panel
+[0:05:46.610] info   REQ GET /aowlspt/mods/list
+[0:05:47.610] info   REQ GET /aowlspt/mods/panel
+[0:05:47.610] info   REQ GET /aowlspt/mods/list
+[0:05:48.625] info   REQ GET /aowlspt/mods/panel
+[0:05:48.625] info   REQ GET /aowlspt/mods/list
+[0:05:49.594] info   REQ GET /aowlspt/mods/lists
+[0:05:49.594] info   REQ GET /aowlspt/mods/conflicts
+[0:05:49.594] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile&more=1
+[0:05:49.641] info   REQ GET /aowlspt/mods/panel
+[0:05:49.641] info   REQ GET /aowlspt/mods/list
+[0:05:50.656] info   REQ GET /aowlspt/mods/panel
+[0:05:50.656] info   REQ GET /aowlspt/mods/list
+[0:05:51.656] info   REQ GET /aowlspt/mods/panel
+[0:05:51.656] info   REQ GET /aowlspt/mods/list
+[0:05:52.625] info   REQ GET /aowlspt/mods/lists
+[0:05:52.625] info   REQ GET /aowlspt/mods/conflicts
+[0:05:52.625] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n&more=1
+[0:05:52.672] info   REQ GET /aowlspt/mods/panel
+[0:05:52.672] info   REQ GET /aowlspt/mods/list
+[0:05:53.688] info   REQ GET /aowlspt/mods/panel
+[0:05:53.688] info   REQ GET /aowlspt/mods/list
+[0:05:54.703] info   REQ GET /aowlspt/mods/panel
+[0:05:54.703] info   REQ GET /aowlspt/mods/list
+[0:05:55.656] info   REQ GET /aowlspt/mods/lists
+[0:05:55.656] info   REQ GET /aowlspt/mods/conflicts
+[0:05:55.656] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n&more=1
+[0:05:55.719] info   REQ GET /aowlspt/mods/panel
+[0:05:55.719] info   REQ GET /aowlspt/mods/list
+[0:05:56.735] info   REQ GET /aowlspt/mods/panel
+[0:05:56.735] info   REQ GET /aowlspt/mods/list
+[0:05:57.735] info   REQ GET /aowlspt/mods/panel
+[0:05:57.735] info   REQ GET /aowlspt/mods/list
+[0:05:58.703] info   REQ GET /aowlspt/mods/lists
+[0:05:58.703] info   REQ GET /aowlspt/mods/conflicts
+[0:05:58.703] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile&more=1
+[0:05:58.750] info   REQ GET /aowlspt/mods/panel
+[0:05:58.750] info   REQ GET /aowlspt/mods/list
+[0:05:59.766] info   REQ GET /aowlspt/mods/panel
+[0:05:59.766] info   REQ GET /aowlspt/mods/list
+[0:06:00.766] info   REQ GET /aowlspt/mods/panel
+[0:06:00.766] info   REQ GET /aowlspt/mods/list
+[0:06:01.735] info   REQ GET /aowlspt/mods/lists
+[0:06:01.735] info   REQ GET /aowlspt/mods/conflicts
+[0:06:01.735] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n&more=1
+[0:06:01.781] info   REQ GET /aowlspt/mods/panel
+[0:06:01.781] info   REQ GET /aowlspt/mods/list
+[0:06:02.797] info   REQ GET /aowlspt/mods/panel
+[0:06:02.797] info   REQ GET /aowlspt/mods/list
+[0:06:03.813] info   REQ GET /aowlspt/mods/panel
+[0:06:03.813] info   REQ GET /aowlspt/mods/list
+[0:06:04.766] info   REQ GET /aowlspt/mods/lists
+[0:06:04.766] info   REQ GET /aowlspt/mods/conflicts
+[0:06:04.766] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile&more=1
+[0:06:04.813] info   REQ GET /aowlspt/mods/panel
+[0:06:04.828] info   REQ GET /aowlspt/mods/list
+[0:06:05.828] info   REQ GET /aowlspt/mods/panel
+[0:06:05.828] info   REQ GET /aowlspt/mods/list
+[0:06:06.828] info   REQ GET /aowlspt/mods/panel
+[0:06:06.844] info   REQ GET /aowlspt/mods/list
+[0:06:07.797] info   REQ GET /aowlspt/mods/lists
+[0:06:07.797] info   REQ GET /aowlspt/mods/conflicts
+[0:06:07.797] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n&more=1
+[0:06:07.844] info   REQ GET /aowlspt/mods/panel
+[0:06:07.844] info   REQ GET /aowlspt/mods/list
+[0:06:08.860] info   REQ GET /aowlspt/mods/panel
+[0:06:08.860] info   REQ GET /aowlspt/mods/list
+[0:06:09.875] info   REQ GET /aowlspt/mods/panel
+[0:06:09.875] info   REQ GET /aowlspt/mods/list
+[0:06:10.844] info   REQ GET /aowlspt/mods/lists
+[0:06:10.844] info   REQ GET /aowlspt/mods/conflicts
+[0:06:10.844] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile&more=1
+[0:06:10.891] info   REQ GET /aowlspt/mods/panel
+[0:06:10.891] info   REQ GET /aowlspt/mods/list
+[0:06:12.031] info   REQ GET /aowlspt/mods/panel
+[0:06:12.094] info   REQ GET /aowlspt/mods/list
+[0:06:13.110] info   REQ GET /aowlspt/mods/panel
+[0:06:13.110] info   REQ GET /aowlspt/mods/list
+[0:06:14.063] info   REQ GET /aowlspt/mods/lists
+[0:06:14.063] info   REQ GET /aowlspt/mods/conflicts
+[0:06:14.063] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n&more=1
+[0:06:14.110] info   REQ GET /aowlspt/mods/panel
+[0:06:14.125] info   REQ GET /aowlspt/mods/list
+[0:06:15.141] info   REQ GET /aowlspt/mods/panel
+[0:06:15.141] info   REQ GET /aowlspt/mods/list
+[0:06:16.156] info   REQ GET /aowlspt/mods/panel
+[0:06:16.156] info   REQ GET /aowlspt/mods/list
+[0:06:17.110] info   REQ GET /aowlspt/mods/lists
+[0:06:17.110] info   REQ GET /aowlspt/mods/conflicts
+[0:06:17.110] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile&more=1
+[0:06:17.156] info   REQ GET /aowlspt/mods/panel
+[0:06:17.156] info   REQ GET /aowlspt/mods/list
+[0:06:18.172] info   REQ GET /aowlspt/mods/panel
+[0:06:18.172] info   REQ GET /aowlspt/mods/list
+[0:06:19.188] info   REQ GET /aowlspt/mods/panel
+[0:06:19.188] info   REQ GET /aowlspt/mods/list
+[0:06:20.453] info   REQ GET /aowlspt/mods/lists
+[0:06:20.453] info   REQ GET /aowlspt/mods/conflicts
+[0:06:20.453] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n&more=1
+[0:06:20.516] info   REQ GET /aowlspt/mods/panel
+[0:06:20.516] info   REQ GET /aowlspt/mods/list
+[0:06:21.516] info   REQ GET /aowlspt/mods/panel
+[0:06:21.516] info   REQ GET /aowlspt/mods/list
+[0:06:22.531] info   REQ GET /aowlspt/mods/panel
+[0:06:22.531] info   REQ GET /aowlspt/mods/list
+[0:06:23.485] info   REQ GET /aowlspt/mods/lists
+[0:06:23.500] info   REQ GET /aowlspt/mods/conflicts
+[0:06:23.500] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n&more=1
+[0:06:23.547] info   REQ GET /aowlspt/mods/panel
+[0:06:23.547] info   REQ GET /aowlspt/mods/list
+[0:06:24.563] info   REQ GET /aowlspt/mods/panel
+[0:06:24.563] info   REQ GET /aowlspt/mods/list
+[0:06:25.578] info   REQ GET /aowlspt/mods/panel
+[0:06:25.578] info   REQ GET /aowlspt/mods/list
+[0:06:26.531] info   REQ GET /aowlspt/mods/lists
+[0:06:26.531] info   REQ GET /aowlspt/mods/conflicts
+[0:06:26.531] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile&more=1
+[0:06:26.594] info   REQ GET /aowlspt/mods/panel
+[0:06:26.594] info   REQ GET /aowlspt/mods/list
+[0:06:27.594] info   REQ GET /aowlspt/mods/panel
+[0:06:27.594] info   REQ GET /aowlspt/mods/list
+[0:06:28.610] info   REQ GET /aowlspt/mods/panel
+[0:06:28.610] info   REQ GET /aowlspt/mods/list
+[0:06:29.563] info   REQ GET /aowlspt/mods/lists
+[0:06:29.563] info   REQ GET /aowlspt/mods/conflicts
+[0:06:29.563] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile&more=1
+[0:06:29.625] info   REQ GET /aowlspt/mods/panel
+[0:06:29.625] info   REQ GET /aowlspt/mods/list
+[0:06:30.625] info   REQ GET /aowlspt/mods/panel
+[0:06:30.625] info   REQ GET /aowlspt/mods/list
+[0:06:31.641] info   REQ GET /aowlspt/mods/panel
+[0:06:31.641] info   REQ GET /aowlspt/mods/list
+[0:06:32.594] info   REQ GET /aowlspt/mods/lists
+[0:06:32.610] info   REQ GET /aowlspt/mods/conflicts
+[0:06:32.610] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n&more=1
+[0:06:32.656] info   REQ GET /aowlspt/mods/panel
+[0:06:32.656] info   REQ GET /aowlspt/mods/list
+[0:06:33.656] info   REQ GET /aowlspt/mods/panel
+[0:06:33.672] info   REQ GET /aowlspt/mods/list
+[0:06:34.672] info   REQ GET /aowlspt/mods/panel
+[0:06:34.672] info   REQ GET /aowlspt/mods/list
+[0:06:35.641] info   REQ GET /aowlspt/mods/lists
+[0:06:35.641] info   REQ GET /aowlspt/mods/conflicts
+[0:06:35.641] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile&more=1
+[0:06:35.688] info   REQ GET /aowlspt/mods/panel
+[0:06:35.688] info   REQ GET /aowlspt/mods/list
+[0:06:36.703] info   REQ GET /aowlspt/mods/panel
+[0:06:36.703] info   REQ GET /aowlspt/mods/list
+[0:06:37.703] info   REQ GET /aowlspt/mods/panel
+[0:06:37.703] info   REQ GET /aowlspt/mods/list
+[0:06:38.672] info   REQ GET /aowlspt/mods/lists
+[0:06:38.672] info   REQ GET /aowlspt/mods/conflicts
+[0:06:38.672] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n&more=1
+[0:06:38.719] info   REQ GET /aowlspt/mods/panel
+[0:06:38.719] info   REQ GET /aowlspt/mods/list
+[0:06:39.735] info   REQ GET /aowlspt/mods/panel
+[0:06:39.735] info   REQ GET /aowlspt/mods/list
+[0:06:40.750] info   REQ GET /aowlspt/mods/panel
+[0:06:40.750] info   REQ GET /aowlspt/mods/list
+[0:06:41.703] info   REQ GET /aowlspt/mods/lists
+[0:06:41.703] info   REQ GET /aowlspt/mods/conflicts
+[0:06:41.703] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.icebreaker~-n!aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile&more=1
+[0:06:41.766] info   REQ GET /aowlspt/mods/panel
+[0:06:41.766] info   REQ GET /aowlspt/mods/list
+[0:06:42.766] info   REQ GET /aowlspt/mods/panel
+[0:06:42.766] info   REQ GET /aowlspt/mods/list
+[0:06:43.781] info   REQ GET /aowlspt/mods/panel
+[0:06:43.781] info   REQ GET /aowlspt/mods/list
+[0:06:44.750] info   REQ GET /aowlspt/mods/lists
+[0:06:44.750] info   REQ GET /aowlspt/mods/conflicts
+[0:06:44.750] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.pathtotarkov~-n!aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n&more=1
+[0:06:44.797] info   REQ GET /aowlspt/mods/panel
+[0:06:44.797] info   REQ GET /aowlspt/mods/list
+[0:06:45.813] info   REQ GET /aowlspt/mods/panel
+[0:06:45.813] info   REQ GET /aowlspt/mods/list
+[0:06:46.828] info   REQ GET /aowlspt/mods/panel
+[0:06:46.828] info   REQ GET /aowlspt/mods/list
+[0:06:47.797] info   REQ GET /aowlspt/mods/lists
+[0:06:47.797] info   REQ GET /aowlspt/mods/conflicts
+[0:06:47.797] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.classicmovement~+s~nofile!aowl.fovfix~+s~nofile!aowl.perf~+s~nofile!com.savannt.sptsway~+s~nofile!aowl.pathtotarkov~-n&more=1
+[0:06:47.844] info   REQ GET /aowlspt/mods/panel
+[0:06:47.844] info   REQ GET /aowlspt/mods/list
+[0:06:48.860] info   REQ GET /aowlspt/mods/panel
+[0:06:48.860] info   REQ GET /aowlspt/mods/list
+[0:06:49.875] info   REQ GET /aowlspt/mods/panel
+[0:06:49.875] info   REQ GET /aowlspt/mods/list
+[0:06:50.828] info   REQ GET /aowlspt/mods/lists
+[0:06:50.828] info   REQ GET /aowlspt/mods/conflicts
+[0:06:50.828] info   REQ GET /aowlspt/mods/client/0.1.0?hs=cd95264d20&sq=11&r=aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile&more=1
+[0:06:50.875] info   REQ GET /aowlspt/mods/panel
+[0:06:50.875] info   REQ GET /aowlspt/mods/list

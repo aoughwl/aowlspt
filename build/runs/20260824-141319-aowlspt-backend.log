@@ -1,0 +1,7 @@
+aowlspt-backend 0.1.0
+root D:\Aowlspt\aowlspt
+
+[0:00:00.000] ok     port 443 is free
+[0:00:00.047] info   database loaded from D:\Aowlspt\aowlspt\db.json (41313127 bytes)
+[0:00:00.047] info   6 candidate libraries under D:\Aowlspt\aowlspt\mods
+[0:00:00.047] ok     the load order comes from D:\Aowlspt\aowlspt\mods\aowlspt-selection.json: 3 mod(s) selected

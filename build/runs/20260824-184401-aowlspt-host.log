@@ -1,0 +1,112 @@
+aowlspt-host-il2cpp 0.1.0
+directory D:\Aowlspt\aowlspt
+thread 13548
+
+[0:00:00.000] ok     BSG's BattlEye service guard is answered from inside the process (4 import slots); BattlEye is not installed, started or loaded
+[0:00:00.015] info   nameIndex: aowlspt-names.idx is parsed and STAGED (373616 entries), but its build stamp is NOT verified yet: GameAssembly.dll is not mapped yet -- GetModuleHandleA(GameAssembly.dll) returned NULL, which at DLL-attach is EXPECTED and is NOT a header-read failure. The index file is parsed and STAGED; its build stamp is verified at first use, and nothing resolves through it until then. No address from it is usable until the stamp matches.
+[0:00:00.015] info   botDiag is set: a READ-ONLY detour on EFT.GameWorld.RegisterPlayer will log each bot/player registration and enumerate the registered list (nickname, side/role, alive-state, position) during an offline raid -- it answers spawned-but-frozen vs absent. NO write is performed.
+[0:00:00.015] info   unlimitedBots is set: a kind=6 detour on EFT.BotSpawner.AddPlayer will poke BotSpawner.MaxBots=0 (unlimited) once at offline-raid init, lifting the cap that defers the scav wave pool (bosses bypass it via IgnoreMaxBots; scavs do not). One guarded int32 write on the Unity thread; fail-safe -- no write if the build/pointer does not check out.
+[0:00:00.015] info   settingsUiProbe is set: read-only detours on SettingsScreen.Show (Phase 1, arming/thread proof) and a POSTFIX on SettingsScreen.EnsureTabInitialized (Phase 1.5, the walk that reads controls -- they do not exist yet at Show) will log every control's label, il2cpp klass pointer and value-widget pointer as each tab is built. Open Settings and click each tab. NO write is ever performed.
+[0:00:00.015] info   settingsRelabelProbe is set: PHASE 2a. On the ShowScreen postfix the host finds the Game-tab control whose stock label is 'FOV:' and rewrites it to 'FOV: [aowlspt]' -- one il2cpp_string_new, one raw store into m_text (+0xE0), one dirty byte (+0x378), which is the same primitive the version brand and the F3 overlay use in production. Idempotent (it never double-brands) and self-disabling after two faults. Open Settings -> Game and read the FOV row.
+[0:00:00.015] info   settingsBindProbe is set: PHASE 2b. On the same postfix the host READS the live value out of every control whose widget type it has learned this session -- a toggle's m_IsOn (+0x120) and a float slider's Slider.m_Value (+0x120) with its range -- and logs each beside its label, so the offsets can be checked against what the screen actually shows. NO value is written.
+[0:00:00.015] warn   settingsNativeLifecycle is set but settingsModsTab is not -- there is no MODS tab for it to drive, so this does nothing
+[0:00:00.015] info   debugUi/debugEsp is set: a per-frame detour on EFT.UI.PreloaderUI.Update (the Unity main thread) will draw a Minecraft-F3-style info panel and in-world markers over every registered AI bot out of Unity UI labels CLONED from the client's own version label (Object::Instantiate -- no reflection, no object creation). Press F3 in game to toggle it; layout is aowlspt-debugui.json and is re-read on every toggle-on, so it can be edited live. The whole body is VEH-guarded and writes only into labels it created.
+[0:00:00.015] info   uxMenuModeText is set: a postfix detour on EFT.UI.PreloaderUI.Update will set the menu's bottom-right corner label by CALLING the game's own PreloaderUI.SetGameModeText. The text comes from the backend's `menuModeText` on the mod-sync poll, which defaults to the logged-in character's name. It needs backendPort + modSyncMs. It SHARES the PreloaderUI.Update detour with debugUi/debugEsp -- one detour, one trampoline, both features dispatched from the same firing -- so all three flags can be on at once.
+[0:00:00.015] info   liveInspector is set: drop commands into aowlspt-inspect.txt beside this DLL and every save with changed content runs them ON UNITY'S MAIN THREAD, with answers in aowlspt-inspect-out.txt and in this log -- no rebuild, no restart. Start with `help` and `anchors`. Every hop is VirtualQuery-guarded, every command runs under its own VEH guard, and a caught fault reports THE LAST HOP ATTEMPTED and its pointer. Reads only unless liveInspectorWrite is also set. liveInspectorWrite IS set: a batch containing `allow write` may store into live managed objects and CALL game code.
+[0:00:00.015] info   uxVersionBrand is set: the host polls for <PreloaderUI>/BottomPanel/Content/UpperPart/AlphaLabel -- the label actually on screen -- and rewrites it to "aowlspt <ver>, aoughwl.com  -  tarkov <ver> | <mode>", carrying both halves of the stock text through. It REFUSES to write to a label whose text reads empty, because an empty label is the fingerprint of the wrong object. It rides the shared PreloaderUI::Update detour on a 120-frame throttle and gives up after 8 applies.
+[0:00:00.015] info   uxHideSeasons is set: the host switches off Common UI/MenuScreen/SeasonsButton -- the KORD BREACH / Season banner above Play -- because seasons do not apply to single-player. It is found STRUCTURALLY (the banner carries no matching text at all) and re-checked on a 120-frame throttle so a menu rebuild is hidden again. It only ever sets active=false, never true, and it does nothing at all if that child is not there.
+[0:00:00.015] info   uxVersionBrand is set: a postfix detour on PreloaderUI.Awake will probe the version label on the Unity thread (read-only: logs thread, readability, class, and String fields; no managed write) (fail-safe: unbranded if the build or timing does not match)
+[0:00:00.015] ok     imageCdnRedirect is set: getaddrinfo hooked (GetAddrInfoW getaddrinfo ); s3-*.escapefromtarkov.com -> 127.0.0.1, and every resolved host is logged once to confirm the real image host
+[0:00:00.015] info   waiting for the IL2CPP runtime (up to 120s)
+[0:00:01.031] ok     il2cpp_init returned 1 after 900ms
+[0:00:01.031] ok     IL2CPP is up after 900ms: il2cpp_init returned 1 and was handed out 2 time(s)
+[0:00:01.031] ok     IL2CPP runtime bound, all essential entry points present
+[0:00:01.031] ok     anti-cheat: BE client validation gate neutered (2/2 patches)
+[0:00:01.031] ok     exit fix: confirmed Exit redirected to ExitProcess(0) (2/2 sites; primary = the confirm-accept lambda, before the async exit-loading shutdown that was hanging)
+[0:00:01.031] info   exit fix: game window not up yet; the OS-close hooks will be installed from the host tick loop once the UI thread exists (Exit button is already patched)
+[0:00:01.031] info   146 assemblies loaded
+[0:00:01.031] info   31282 types visible
+[0:00:01.031] ok     prologue snapshot: captured the original bytes of 52 target(s) before any detour was installed (52 primed). Every later prologue check compares against this, not against live memory, so two features may share one target and both still verify it.
+[0:00:01.031] info   deep-probe: MethodInfo for EFT.TarkovApplication::Update is not readable
+[0:00:01.031] info   name index: EFT.TarkovApplication::Update at il2cpp+0x977b10 is reached by this method ONLY (share count 1), so a detour here has no other callers to hit.
+[0:00:01.031] info   name index: EFT.TarkovApplication::Update -> il2cpp+0x977b10; handing it to the by-RVA binder for prologue/section verification
+[0:00:01.031] warn   patch-by-RVA EFT.TarkovApplication::Update: NO prologue signature was declared, so NOTHING was byte-compared. il2cpp+0x977b10 passed the module, code-page and il2cpp-section checks only. Append the !<hex> suffix to the spec to have its original bytes verified.
+[0:00:01.031] warn   name index: binding the drain for EFT.TarkovApplication::Update at il2cpp+0x977b10, from the offline index (nameIndex is set). The address came from metadata, not from the runtime, and the by-RVA binder byte-verified its prologue.
+[0:00:01.031] ok     main-thread bound to EFT.TarkovApplication::Update (16 bytes)
+[0:00:01.031] info   deep-probe: MethodInfo for OnRenderObjectManager::OnRenderObject is not readable
+[0:00:01.031] info   name index: OnRenderObjectManager::OnRenderObject at il2cpp+0x1f46910 is reached by this method ONLY (share count 1), so a detour here has no other callers to hit.
+[0:00:01.031] info   name index: OnRenderObjectManager::OnRenderObject -> il2cpp+0x1f46910; handing it to the by-RVA binder for prologue/section verification
+[0:00:01.031] warn   patch-by-RVA OnRenderObjectManager::OnRenderObject: NO prologue signature was declared, so NOTHING was byte-compared. il2cpp+0x1f46910 passed the module, code-page and il2cpp-section checks only. Append the !<hex> suffix to the spec to have its original bytes verified.
+[0:00:01.031] warn   name index: binding the drain for OnRenderObjectManager::OnRenderObject at il2cpp+0x1f46910, from the offline index (nameIndex is set). The address came from metadata, not from the runtime, and the by-RVA binder byte-verified its prologue.
+[0:00:01.031] ok     render-phase bound to OnRenderObjectManager::OnRenderObject (16 bytes)
+[0:00:01.031] ok     settings-ui-probe bound to EFT.UI.Settings.SettingsScreen::Show (16 bytes)
+[0:00:01.031] ok     settings-UI probe (Phase 1) armed on EFT.UI.Settings.SettingsScreen::Show; open the in-game settings screen to log its control tree
+[0:00:01.031] ok     settings-tick-probe bound to EFT.UI.Settings.GameSettingsTab::Update (16 bytes)
+[0:00:01.031] ok     settings-UI CONTROL poll (Phase 1.7) armed on EFT.UI.Settings.GameSettingsTab::Update; it polls every registered tab's control list once per 20 frames while Settings is open, and field-scans any tab that stays empty -- so the controls get reported whenever they appear, whatever creates them
+[0:00:01.031] ok     settings-tab-probe bound to EFT.UI.Settings.SettingsScreen::ShowScreen (15 bytes)
+[0:00:01.031] ok     settings-UI control probe (Phase 1.8) armed POSTFIX on EFT.UI.Settings.SettingsScreen::ShowScreen; open Settings and click each tab -- every control's label, klass and value-widget pointer is logged as the tab is built
+[0:00:01.031] ok     version-brand bound to EFT.UI.PreloaderUI::Awake (16 bytes)
+[0:00:01.031] ok     version brand armed on EFT.UI.PreloaderUI::Awake (postfix); the bottom-left version label will read "aowlspt â€” <version>"
+[0:00:01.031] ok     botdiag bound to EFT.GameWorld::RegisterPlayer (18 bytes)
+[0:00:01.031] ok     botdiag (read-only bot/player census) armed on EFT.GameWorld::RegisterPlayer; enter an offline raid to log each spawn + the registered list
+[0:00:01.031] ok     botcap bound to EFT.BotSpawner::AddPlayer (17 bytes)
+[0:00:01.031] ok     botcap (offline bot-cap lift) armed on EFT.BotSpawner::AddPlayer; enter an offline raid to poke BotSpawner.MaxBots=0 (unlimited)
+[0:00:01.031] ok     debugui: 28 of 28 managed targets verified by RVA + prologue on this build
+[0:00:01.031] ok     debug-overlay bound to EFT.UI.PreloaderUI::Update (15 bytes)
+[0:00:01.031] ok     debugui CLAIMED the shared EFT.UI.PreloaderUI::Update detour (slot 8, prefix, per-frame, Unity thread); uxMenuModeText will ride on this same detour if it is on. Press F3 in game to show the panel; layout comes from aowlspt-debugui.json beside the host DLL and is re-read on every toggle-on.
+[0:00:01.031] ok     menu mode text armed as a RIDER on the debug overlay's existing EFT.UI.PreloaderUI::Update detour (slot 8) -- one detour, one trampoline, both features live. The bottom-right corner label follows the backend's `menuModeText`, which defaults to the logged-in character's name
+[0:00:01.031] ok     live inspector: IN-RAID anchor armed as a rider on the main drain's existing detour (slot 0) -- commands will keep running after the menu goes away
+[0:00:01.031] ok     live inspector armed as a RIDER on the debug overlay's existing EFT.UI.PreloaderUI::Update detour (slot 8)
+[0:00:01.031] ok     mods tab / version brand / hide seasons armed as RIDERS on the existing EFT.UI.PreloaderUI::Update detour (slot 8) -- one detour, one trampoline. The tab is built the first time Settings -> Game is opened, because the rows it clones come from that tab.
+[0:00:01.031] info   7 candidate libraries under D:\Aowlspt\aowlspt\mods
+[0:00:01.031] info   not using a selection file: D:\Aowlspt\aowlspt\mods\aowlspt-selection.json was written for the server side and this host is the client one
+[0:00:01.031] info   Fallback Settings UI does not support the client side; skipping
+[0:00:01.047] ok     subscribed to aowlspt.settings.indexQuery
+[0:00:01.047] ok     aowl.textures 1.0.0 loaded on aowlspt-host-il2cpp
+[0:00:01.047] info   textures  manifest: 512 curated replacement(s), tier 2K
+[0:00:01.047] info   textures  VRAM budget 1024 MB fits ~48 resident 2K textures (RGBA32 + mips); the manifest is the candidate set, the budget is the hard resident cap
+[0:00:01.047] info   textures  categories on:  Metal Wood Concrete Brick Fabric 
+[0:00:01.047] info   textures  swapMode=off (or disabled): no swap hooks will be installed, the game uses stock textures. Escalate with swapMode probe -> match -> full in config.json once boot is confirmed stable.
+[0:00:01.047] ok     loaded aowl.textures (aowl.textures) v1.0.0 by savannt
+[0:00:01.047] info   Tarkov Emulator does not support the client side; skipping
+[0:00:01.047] info   SPT Settings Surface does not support the client side; skipping
+[0:00:01.047] info   Path To Tarkov does not support the client side; skipping
+[0:00:01.047] info   Mod Manager does not support the client side; skipping
+[0:00:01.047] ok     subscribed to aowlspt.settings.indexQuery
+[0:00:01.047] ok     subscribed to aowl.graphics.apply
+[0:00:01.047] ok     graphics  grade pushed to the host post-process (tonemapper=1, enabled=yes)
+[0:00:01.047] ok     loaded aowl.graphics (aowl.graphics) v1.0.0 by savannt
+[0:00:01.265] ok     overlay ready (F12 opens settings)
+[0:00:01.265] ok     graphics post-process ready (via the overlay Present hook) â€” driven by the overlay Present hook; waiting for the first frame
+[0:00:01.265] ok     asking the backend on port 80 which client mods should be running, every 3000ms; this host reports back as session 1e62a5f34ec
+[0:00:01.265] ok     host running
+[0:00:01.297] info   live inspector: batch 1 (58 command(s)) handed to Unity's thread; answers land in D:\Aowlspt\aowlspt\aowlspt-inspect-out.txt
+[0:00:03.297] ok     exit fix: OS-close hooks installed on UI thread 18860 (main window 0x1e0a00) -- window X / taskbar Close / Alt+F4 now exit via ExitProcess(0) instead of the hanging async shutdown
+[0:00:03.297] warn   the main-thread drain has not fired for 2s with work queued; running it on the host thread until it comes back
+[0:00:03.297] warn   invoke_main self-test ran on thread 13548, the host's own thread and not Unity's drain thread; no managed call was made (the drain is bound but has not fired on its own thread, or nothing is bound)
+[0:00:04.593] info   the backend wants aowl.classicmovement loaded and there is no D:\Aowlspt\aowlspt\mods\classicmovement\classicmovement.dll on this side; it is installed on the server only
+[0:00:04.593] info   the backend wants aowl.fovfix loaded and there is no D:\Aowlspt\aowlspt\mods\fov\fov.dll on this side; it is installed on the server only
+[0:00:04.593] info   the backend wants aowl.perf loaded and there is no D:\Aowlspt\aowlspt\mods\perf\perf.dll on this side; it is installed on the server only
+[0:00:04.593] info   the backend wants com.savannt.sptsway loaded and there is no D:\Aowlspt\aowlspt\mods\sway\sway.dll on this side; it is installed on the server only
+[0:00:04.593] info   the backend's mod set does not mention aowl.textures, so this host leaves it exactly as it is
+[0:00:04.593] info   the backend's mod set does not mention aowl.graphics, so this host leaves it exactly as it is
+[0:00:04.593] info   telling the backend what happened to its mods: /aowlspt/mods/client/0.1.0?hs=1e62a5f34ec&sq=12&r=aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.classicmovement~+s~nofile&more=1
+[0:00:08.515] ok     the main-thread drain is firing again on EFT.TarkovApplication::Update
+[0:00:08.515] ok     the drain fires on thread 18860; the host runs on 13548
+[0:00:08.515] ok     invoke_main now runs on Unity's main thread (EFT.TarkovApplication::Update)
+[0:00:15.156] ok     version probe: PreloaderUI.Awake postfix fired on thread 18860 (NOT the host thread -> Unity's main thread)
+[0:00:15.156] ok     version probe: label component at this+0x20 is readable; scanning its String slots by raw layout (no reflection)
+[0:00:15.156] ok     version probe: String slot +0xa0 = "1.1.0.1.46777"  <-- version-looking
+[0:00:15.172] ok     version probe: read-only (set uxVersionBrandWrite to attempt a field-write brand; no managed write was performed)
+[0:00:15.172] ok     patchFired: slot=8 riders={debugui:8, modetext:8, inspect:8} -> dispatches debugui modetext inspect
+[0:00:15.172] ok     debugui: PreloaderUI::Update detour is live on thread 18860 (host thread 13548 -- so this is Unity's). 36 of 28 managed targets verified by RVA + prologue. Press the toggle key to show the panel.
+[0:00:15.172] ok     menu mode text: PreloaderUI.Update first fired on thread 18860 (Unity's main thread)
+[0:00:15.172] ok     live inspector: rider FIRST DISPATCHED on thread 18860 (slot 8); EFT.UI.PreloaderUI::Update is now ticking and batches will drain
+[0:00:15.234] ok     menu mode text: not found yet -- iSceneRoots enumerated NO roots (0). Expected before the main menu is up; retried on a throttle.
+[0:00:15.640] warn   menu mode text: GIVING UP after 30 passes -- iSceneRoots enumerated NO roots (0). Stock corner label left alone; this feature is otherwise idle for the session.
+[0:00:17.781] ok     version brand: the label is not reachable yet -- no live PreloaderUI anchor yet. Retrying; this is normal before the menu is up.
+[0:00:20.125] ok     version brand: the label is not reachable yet -- no live PreloaderUI anchor yet. Retrying; this is normal before the menu is up.
+[0:00:20.125] ok     hide seasons: nothing hidden yet -- iSceneRoots enumerated NO roots at all (it returned 0). That is the scene-root walk failing, not the banner being absent -- it needs the nav targets Scene::GetRootGameObjects / GameObject::get_scene_Injected, which come from the name index; check nameIndex loaded. This is expected before the main menu is up; it keeps looking on a 120-frame throttle.
+[0:01:03.406] warn   menu mode text: the PreloaderUI.Update hook has fired 3600 times and the backend has never sent a `menuModeText`, so the corner label is still the game's stock text. The hook is fine; the SOURCE is missing. Check that the backend is reachable (backendPort in aowlspt-host.json, or backendUrl in the installer's backend.json) and that the manager mod is running.
+[0:01:03.406] warn   hide seasons: GIVING UP after 30 passes -- iSceneRoots enumerated NO roots at all (it returned 0). That is the scene-root walk failing, not the banner being absent -- it needs the nav targets Scene::GetRootGameObjects / GameObject::get_scene_Injected, which come from the name index; check nameIndex loaded. The KORD BREACH / Season banner is left exactly as the game made it, and this feature is OFF for the session. It is announcing this rather than continuing to do nothing quietly.
+[0:01:19.187] warn   version brand: GIVING UP after 40 attempts -- no live PreloaderUI anchor yet. The label is stock.

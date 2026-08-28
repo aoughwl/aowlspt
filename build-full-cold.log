@@ -1,0 +1,65 @@
+﻿      repo    C:\Users\savant\Projects\aowlspt\.claude\worktrees\tooling
+      nimony  C:\Users\savant\nimony
+
+Simulator
+---------
+ok    aowlspt-sim
+ok    the .NET tools (Release)
+
+Host (IL2CPP, native)
+---------------------
+ok    aowlspt-host-il2cpp
+ok    overlayhost
+ok    the overlay reads the manager's JSON
+ok    overlay json checks
+ok    overlay header needs no extra link library
+ok    overlaynimtest
+
+Backend
+-------
+ok    aowlspt-backend
+ok    aowlprobe
+ok    emutest
+ok    realtest
+ok    soak
+ok    benchbackend
+ok    aowlspt-verify
+ok    firstrun
+ok    perfbench
+
+Tools
+-----
+ok    aowlspt-install
+ok    aowlspt-launch
+ok    il2cppprobe
+ok    hostharness
+
+Examples
+--------
+ok    mod backend
+ok    mod clientprobe
+ok    mod envelope
+ok    mod gameserver
+ok    mod hello
+ok    mod highlevel
+ok    mod lesson
+ok    mod strictconfig
+
+Mods
+----
+ok    mod admin
+ok    mod blackdivision
+ok    mod classicmovement
+ok    mod fov
+ok    mod graphics
+ok    mod icebreaker
+ok    mod manager
+ok    mod morebots
+ok    mod pathtotarkov
+ok    mod perf
+ok    mod resourcepacks
+ok    mod sain
+ok    mod settingshub
+ok    mod sway
+ok    mod tarkov
+ok    mod textures

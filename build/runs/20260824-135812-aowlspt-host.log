@@ -1,0 +1,797 @@
+aowlspt-host-il2cpp 0.1.0
+directory D:\Aowlspt\aowlspt
+thread 17196
+
+[0:00:00.000] ok     BSG's BattlEye service guard is answered from inside the process (4 import slots); BattlEye is not installed, started or loaded
+[0:00:00.015] info   nameIndex: aowlspt-names.idx is parsed and STAGED (373616 entries), but its build stamp is NOT verified yet: GameAssembly.dll is not mapped yet -- GetModuleHandleA(GameAssembly.dll) returned NULL, which at DLL-attach is EXPECTED and is NOT a header-read failure. The index file is parsed and STAGED; its build stamp is verified at first use, and nothing resolves through it until then. No address from it is usable until the stamp matches.
+[0:00:00.015] info   botDiag is set: a READ-ONLY detour on EFT.GameWorld.RegisterPlayer will log each bot/player registration and enumerate the registered list (nickname, side/role, alive-state, position) during an offline raid -- it answers spawned-but-frozen vs absent. NO write is performed.
+[0:00:00.015] info   unlimitedBots is set: a kind=6 detour on EFT.BotSpawner.AddPlayer will poke BotSpawner.MaxBots=0 (unlimited) once at offline-raid init, lifting the cap that defers the scav wave pool (bosses bypass it via IgnoreMaxBots; scavs do not). One guarded int32 write on the Unity thread; fail-safe -- no write if the build/pointer does not check out.
+[0:00:00.015] info   settingsUiProbe is set: read-only detours on SettingsScreen.Show (Phase 1, arming/thread proof) and a POSTFIX on SettingsScreen.EnsureTabInitialized (Phase 1.5, the walk that reads controls -- they do not exist yet at Show) will log every control's label, il2cpp klass pointer and value-widget pointer as each tab is built. Open Settings and click each tab. NO write is ever performed.
+[0:00:00.015] info   settingsRelabelProbe is set: PHASE 2a. On the ShowScreen postfix the host finds the Game-tab control whose stock label is 'FOV:' and rewrites it to 'FOV: [aowlspt]' -- one il2cpp_string_new, one raw store into m_text (+0xE0), one dirty byte (+0x378), which is the same primitive the version brand and the F3 overlay use in production. Idempotent (it never double-brands) and self-disabling after two faults. Open Settings -> Game and read the FOV row.
+[0:00:00.015] info   settingsBindProbe is set: PHASE 2b. On the same postfix the host READS the live value out of every control whose widget type it has learned this session -- a toggle's m_IsOn (+0x120) and a float slider's Slider.m_Value (+0x120) with its range -- and logs each beside its label, so the offsets can be checked against what the screen actually shows. NO value is written.
+[0:00:00.015] info   settingsPages is set: PHASE 3. On the Game tab the host renders its own settings page into the REAL settings screen, by CLONING a stock toggle row (UnityEngine.Object::Instantiate + TMP_DefaultControls::SetParentAndAlign, both byte-verified direct calls) once per row, relabelling each clone and seeding it with Toggle::SetIsOnWithoutNotify so the row shows its own value without firing the donor setting's handler. The first page is the aowlspt host's own flags out of aowlspt-host.json; a row the player changes is read back and persisted to that file. Rows that are carried but not yet wired are suffixed '(not done yet)'. Nothing the GAME created is ever written -- only clones the host made itself -- and the whole thing shares the Phase-2 fault budget.
+[0:00:00.015] info   settingsModsTab is set: the host adds a SIXTH tab, MODS, to the game's own settings screen by cloning a stock tab button into SettingsScreen/Toggles and a stock panel beside the other five. Inside it, a row of SUBTABS cloned from the game's own tab strip switches between one page of settings per area, each page a set of cloned stock rows laid out by the stock layout group -- nothing is hand-positioned. It rides the existing PreloaderUI::Update detour (never a second one), needs one of debugUi/uxMenuModeText/liveInspector to have claimed that slot, and self-disables after four trapped faults. Open Settings -> Game once to build it.
+[0:00:00.015] info   settingsNativeLifecycle is set: leaving MODS for a stock tab is now driven from the ShowScreen postfix the moment it fires, instead of the next frame's toggle poll. Entering MODS is still poll-driven -- no game code calls anything when our cloned toggle turns on. The old standing-check path is untouched and stays as the backstop (and the only path at all when this flag is off).
+[0:00:00.015] info   debugUi/debugEsp is set: a per-frame detour on EFT.UI.PreloaderUI.Update (the Unity main thread) will draw a Minecraft-F3-style info panel and in-world markers over every registered AI bot out of Unity UI labels CLONED from the client's own version label (Object::Instantiate -- no reflection, no object creation). Press F3 in game to toggle it; layout is aowlspt-debugui.json and is re-read on every toggle-on, so it can be edited live. The whole body is VEH-guarded and writes only into labels it created.
+[0:00:00.015] info   uxMenuModeText is set: a postfix detour on EFT.UI.PreloaderUI.Update will set the menu's bottom-right corner label by CALLING the game's own PreloaderUI.SetGameModeText. The text comes from the backend's `menuModeText` on the mod-sync poll, which defaults to the logged-in character's name. It needs backendPort + modSyncMs. It SHARES the PreloaderUI.Update detour with debugUi/debugEsp -- one detour, one trampoline, both features dispatched from the same firing -- so all three flags can be on at once.
+[0:00:00.015] info   liveInspector is set: drop commands into aowlspt-inspect.txt beside this DLL and every save with changed content runs them ON UNITY'S MAIN THREAD, with answers in aowlspt-inspect-out.txt and in this log -- no rebuild, no restart. Start with `help` and `anchors`. Every hop is VirtualQuery-guarded, every command runs under its own VEH guard, and a caught fault reports THE LAST HOP ATTEMPTED and its pointer. Reads only unless liveInspectorWrite is also set. liveInspectorWrite IS set: a batch containing `allow write` may store into live managed objects and CALL game code.
+[0:00:00.015] info   uxVersionBrand is set: the host polls for <PreloaderUI>/BottomPanel/Content/UpperPart/AlphaLabel -- the label actually on screen -- and rewrites it to "aowlspt <ver>, aoughwl.com  -  tarkov <ver> | <mode>", carrying both halves of the stock text through. It REFUSES to write to a label whose text reads empty, because an empty label is the fingerprint of the wrong object. It rides the shared PreloaderUI::Update detour on a 120-frame throttle and gives up after 8 applies.
+[0:00:00.015] info   settingsPostFxSubtab is set: POSTFX is folded into GRAPHICS as a subtab. The top row loses its POSTFX button (SetActive(false) -- HIDDEN, never destroyed, and restored if the feature faults out) and both the Graphics and PostFX panels gain a cloned two-button strip, GRAPHICS SETTINGS | POSTFX, that switches the two STOCK panels. Neither panel is cloned or written to; only their active state is driven, because the game switches panels by ESettingsGroup and a subtab of ours is not one.
+[0:00:00.015] info   uxHideSeasons is set: the host switches off Common UI/MenuScreen/SeasonsButton -- the KORD BREACH / Season banner above Play -- because seasons do not apply to single-player. It is found STRUCTURALLY (the banner carries no matching text at all) and re-checked on a 120-frame throttle so a menu rebuild is hidden again. It only ever sets active=false, never true, and it does nothing at all if that child is not there.
+[0:00:00.015] info   uxVersionBrand is set: a postfix detour on PreloaderUI.Awake will probe the version label on the Unity thread (read-only: logs thread, readability, class, and String fields; no managed write) (fail-safe: unbranded if the build or timing does not match)
+[0:00:00.015] ok     imageCdnRedirect is set: getaddrinfo hooked (GetAddrInfoW getaddrinfo ); s3-*.escapefromtarkov.com -> 127.0.0.1, and every resolved host is logged once to confirm the real image host
+[0:00:00.015] info   waiting for the IL2CPP runtime (up to 120s)
+[0:00:01.000] ok     il2cpp_init returned 1 after 900ms
+[0:00:01.000] ok     IL2CPP is up after 900ms: il2cpp_init returned 1 and was handed out 2 time(s)
+[0:00:01.000] ok     IL2CPP runtime bound, all essential entry points present
+[0:00:01.000] ok     anti-cheat: BE client validation gate neutered (2/2 patches)
+[0:00:01.000] ok     exit fix: confirmed Exit redirected to ExitProcess(0) (2/2 sites; primary = the confirm-accept lambda, before the async exit-loading shutdown that was hanging)
+[0:00:01.000] info   exit fix: game window not up yet; the OS-close hooks will be installed from the host tick loop once the UI thread exists (Exit button is already patched)
+[0:00:01.000] info   146 assemblies loaded
+[0:00:01.000] info   31282 types visible
+[0:00:01.000] ok     prologue snapshot: captured the original bytes of 51 target(s) before any detour was installed (51 primed). Every later prologue check compares against this, not against live memory, so two features may share one target and both still verify it.
+[0:00:01.000] info   deep-probe: MethodInfo for EFT.TarkovApplication::Update is not readable
+[0:00:01.000] info   name index: EFT.TarkovApplication::Update at il2cpp+0x977b10 is reached by this method ONLY (share count 1), so a detour here has no other callers to hit.
+[0:00:01.000] info   name index: EFT.TarkovApplication::Update -> il2cpp+0x977b10; handing it to the by-RVA binder for prologue/section verification
+[0:00:01.000] warn   patch-by-RVA EFT.TarkovApplication::Update: NO prologue signature was declared, so NOTHING was byte-compared. il2cpp+0x977b10 passed the module, code-page and il2cpp-section checks only. Append the !<hex> suffix to the spec to have its original bytes verified.
+[0:00:01.000] warn   name index: binding the drain for EFT.TarkovApplication::Update at il2cpp+0x977b10, from the offline index (nameIndex is set). The address came from metadata, not from the runtime, and the by-RVA binder byte-verified its prologue.
+[0:00:01.000] ok     main-thread bound to EFT.TarkovApplication::Update (16 bytes)
+[0:00:01.000] info   deep-probe: MethodInfo for OnRenderObjectManager::OnRenderObject is not readable
+[0:00:01.000] info   name index: OnRenderObjectManager::OnRenderObject at il2cpp+0x1f46910 is reached by this method ONLY (share count 1), so a detour here has no other callers to hit.
+[0:00:01.000] info   name index: OnRenderObjectManager::OnRenderObject -> il2cpp+0x1f46910; handing it to the by-RVA binder for prologue/section verification
+[0:00:01.000] warn   patch-by-RVA OnRenderObjectManager::OnRenderObject: NO prologue signature was declared, so NOTHING was byte-compared. il2cpp+0x1f46910 passed the module, code-page and il2cpp-section checks only. Append the !<hex> suffix to the spec to have its original bytes verified.
+[0:00:01.000] warn   name index: binding the drain for OnRenderObjectManager::OnRenderObject at il2cpp+0x1f46910, from the offline index (nameIndex is set). The address came from metadata, not from the runtime, and the by-RVA binder byte-verified its prologue.
+[0:00:01.000] ok     render-phase bound to OnRenderObjectManager::OnRenderObject (16 bytes)
+[0:00:01.000] ok     settings-ui-probe bound to EFT.UI.Settings.SettingsScreen::Show (16 bytes)
+[0:00:01.000] ok     settings-UI probe (Phase 1) armed on EFT.UI.Settings.SettingsScreen::Show; open the in-game settings screen to log its control tree
+[0:00:01.000] ok     settings-tick-probe bound to EFT.UI.Settings.GameSettingsTab::Update (16 bytes)
+[0:00:01.000] ok     settings-UI CONTROL poll (Phase 1.7) armed on EFT.UI.Settings.GameSettingsTab::Update; it polls every registered tab's control list once per 20 frames while Settings is open, and field-scans any tab that stays empty -- so the controls get reported whenever they appear, whatever creates them
+[0:00:01.000] ok     settings-tab-probe bound to EFT.UI.Settings.SettingsScreen::ShowScreen (15 bytes)
+[0:00:01.000] ok     settings-UI control probe (Phase 1.8) armed POSTFIX on EFT.UI.Settings.SettingsScreen::ShowScreen; open Settings and click each tab -- every control's label, klass and value-widget pointer is logged as the tab is built
+[0:00:01.000] ok     version-brand bound to EFT.UI.PreloaderUI::Awake (16 bytes)
+[0:00:01.000] ok     version brand armed on EFT.UI.PreloaderUI::Awake (postfix); the bottom-left version label will read "aowlspt â€” <version>"
+[0:00:01.000] ok     botdiag bound to EFT.GameWorld::RegisterPlayer (18 bytes)
+[0:00:01.000] ok     botdiag (read-only bot/player census) armed on EFT.GameWorld::RegisterPlayer; enter an offline raid to log each spawn + the registered list
+[0:00:01.015] ok     botcap bound to EFT.BotSpawner::AddPlayer (17 bytes)
+[0:00:01.015] ok     botcap (offline bot-cap lift) armed on EFT.BotSpawner::AddPlayer; enter an offline raid to poke BotSpawner.MaxBots=0 (unlimited)
+[0:00:01.015] ok     debugui: 27 of 27 managed targets verified by RVA + prologue on this build
+[0:00:01.015] ok     debug-overlay bound to EFT.UI.PreloaderUI::Update (15 bytes)
+[0:00:01.015] ok     debugui CLAIMED the shared EFT.UI.PreloaderUI::Update detour (slot 8, prefix, per-frame, Unity thread); uxMenuModeText will ride on this same detour if it is on. Press F3 in game to show the panel; layout comes from aowlspt-debugui.json beside the host DLL and is re-read on every toggle-on.
+[0:00:01.015] ok     menu mode text armed as a RIDER on the debug overlay's existing EFT.UI.PreloaderUI::Update detour (slot 8) -- one detour, one trampoline, both features live. The bottom-right corner label follows the backend's `menuModeText`, which defaults to the logged-in character's name
+[0:00:01.015] ok     live inspector: IN-RAID anchor armed as a rider on the main drain's existing detour (slot 0) -- commands will keep running after the menu goes away
+[0:00:01.015] ok     live inspector armed as a RIDER on the debug overlay's existing EFT.UI.PreloaderUI::Update detour (slot 8)
+[0:00:01.015] ok     mods tab / version brand / hide seasons armed as RIDERS on the existing EFT.UI.PreloaderUI::Update detour (slot 8) -- one detour, one trampoline. The tab is built the first time Settings -> Game is opened, because the rows it clones come from that tab.
+[0:00:01.015] info   7 candidate libraries under D:\Aowlspt\aowlspt\mods
+[0:00:01.015] info   not using a selection file: D:\Aowlspt\aowlspt\mods\aowlspt-selection.json was written for the server side and this host is the client one
+[0:00:01.015] ok     subscribed to aowlspt.settings.indexQuery
+[0:00:01.015] ok     aowl.textures 1.0.0 loaded on aowlspt-host-il2cpp
+[0:00:01.015] info   textures  manifest: 512 curated replacement(s), tier 2K
+[0:00:01.015] info   textures  VRAM budget 1024 MB fits ~48 resident 2K textures (RGBA32 + mips); the manifest is the candidate set, the budget is the hard resident cap
+[0:00:01.015] info   textures  categories on:  Metal Wood Concrete Brick Fabric 
+[0:00:01.015] info   textures  swapMode=off (or disabled): no swap hooks will be installed, the game uses stock textures. Escalate with swapMode probe -> match -> full in config.json once boot is confirmed stable.
+[0:00:01.015] ok     loaded aowl.textures (aowl.textures) v1.0.0 by savannt
+[0:00:01.015] info   Tarkov Emulator does not support the client side; skipping
+[0:00:01.015] info   SPT Settings Surface does not support the client side; skipping
+[0:00:01.015] info   Path To Tarkov does not support the client side; skipping
+[0:00:01.015] info   Mod Manager does not support the client side; skipping
+[0:00:01.015] info   Icebreaker does not support the client side; skipping
+[0:00:01.015] ok     subscribed to aowl.graphics.apply
+[0:00:01.015] ok     graphics  grade pushed to the host post-process (tonemapper=1, enabled=yes)
+[0:00:01.015] ok     loaded aowl.graphics (aowl.graphics) v1.0.0 by savannt
+[0:00:01.218] ok     overlay ready (F12 opens settings)
+[0:00:01.218] ok     graphics post-process ready (via the overlay Present hook) â€” driven by the overlay Present hook; waiting for the first frame
+[0:00:01.218] ok     asking the backend on port 80 which client mods should be running, every 3000ms; this host reports back as session de6190432c
+[0:00:01.218] ok     host running
+[0:00:01.250] info   live inspector: batch 1 (5 command(s)) handed to Unity's thread; answers land in D:\Aowlspt\aowlspt\aowlspt-inspect-out.txt
+[0:00:01.250] ok     mod settings render: borrowing the sync slot for /aowlspt/settings/index
+[0:00:01.406] warn   the backend's client mod set was not usable, so nothing was changed: no schema key; this is not the mod-set route
+[0:00:03.234] warn   the main-thread drain has not fired for 2s with work queued; running it on the host thread until it comes back
+[0:00:03.234] warn   invoke_main self-test ran on thread 17196, the host's own thread and not Unity's drain thread; no managed call was made (the drain is bound but has not fired on its own thread, or nothing is bound)
+[0:00:03.265] ok     exit fix: OS-close hooks installed on UI thread 13416 (main window 0x100aa0) -- window X / taskbar Close / Alt+F4 now exit via ExitProcess(0) instead of the hanging async shutdown
+[0:00:06.265] warn   mod settings render: no answer for the settings index within 5000ms (1 of 4)
+[0:00:06.265] ok     mod settings render: gave up waiting for the index; sync slot returned to mod control
+[0:00:08.078] ok     the main-thread drain is firing again on EFT.TarkovApplication::Update
+[0:00:08.078] ok     the drain fires on thread 13416; the host runs on 17196
+[0:00:08.078] ok     invoke_main now runs on Unity's main thread (EFT.TarkovApplication::Update)
+[0:00:08.125] ok     inspect| aowlspt live inspector -- batch 1, 5 command(s), on Unity thread 13416
+[0:00:08.125] ok     inspect| > allow write
+[0:00:08.125] ok     inspect|   writes and calls are armed FOR THIS BATCH ONLY
+[0:00:08.125] ok     inspect| > find CharacterSelectionScreen 0x000002b153a2ca20 120000
+[0:00:08.125] ok     inspect|   ! that root pointer is not readable as a Transform; refusing to walk it. (The unconverted pointer read back readable, but `Component::get_transform` on it did not -- something changed underneath, or it was never a Transform/GameObject.)
+[0:00:08.125] ok     inspect| > call name:Component::get_gameObject p_p $f1
+[0:00:08.125] ok     inspect|   ! argument 0: no such anchor or variable: $f1
+[0:00:08.125] ok     inspect| > call name:get_activeInHierarchy i_p $_
+[0:00:08.125] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:00:08.125] ok     inspect|   !! batch 1 ESCAPED its guard during command 4 (call name:get_activeInHierarchy i_p $_) -- it did not return normally. LAST HOP: CALL UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90  at 0x00007ffed5f88c90
+[0:00:08.125] ok     inspect|   !! the channel has been recovered; whatever ran before the escape is above. Escapes this session: 1
+[0:00:09.640] ok     the backend's client mod set is readable again
+[0:00:09.640] info   the backend wants aowl.classicmovement loaded and there is no D:\Aowlspt\aowlspt\mods\classicmovement\classicmovement.dll on this side; it is installed on the server only
+[0:00:09.640] info   the backend wants aowl.fovfix loaded and there is no D:\Aowlspt\aowlspt\mods\fov\fov.dll on this side; it is installed on the server only
+[0:00:09.640] info   the backend wants aowl.perf loaded and there is no D:\Aowlspt\aowlspt\mods\perf\perf.dll on this side; it is installed on the server only
+[0:00:09.640] info   the backend wants com.savannt.sptsway loaded and there is no D:\Aowlspt\aowlspt\mods\sway\sway.dll on this side; it is installed on the server only
+[0:00:09.640] info   the backend's mod set does not mention aowl.textures, so this host leaves it exactly as it is
+[0:00:09.640] info   the backend's mod set does not mention aowl.graphics, so this host leaves it exactly as it is
+[0:00:09.640] info   telling the backend what happened to its mods: /aowlspt/mods/client/0.1.0?hs=de6190432c&sq=11&r=aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.icebreaker~-n!aowl.classicmovement~+s~nofile&more=1
+[0:00:11.500] warn   live inspector: no batch queued for 10s while the rider IS dispatching (157 fires). polls=442 reads=15 readFails=0 unchanged=14 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:00:14.390] ok     version probe: PreloaderUI.Awake postfix fired on thread 13416 (NOT the host thread -> Unity's main thread)
+[0:00:14.390] ok     version probe: label component at this+0x20 is readable; scanning its String slots by raw layout (no reflection)
+[0:00:14.390] ok     version probe: String slot +0xa0 = "1.1.0.1.46777"  <-- version-looking
+[0:00:14.390] ok     version probe: read-only (set uxVersionBrandWrite to attempt a field-write brand; no managed write was performed)
+[0:00:14.406] ok     patchFired: slot=8 riders={debugui:8, modetext:8, inspect:8} -> dispatches debugui modetext inspect
+[0:00:14.406] ok     debugui: PreloaderUI::Update detour is live on thread 13416 (host thread 17196 -- so this is Unity's). 29 of 27 managed targets verified by RVA + prologue. Press the toggle key to show the panel.
+[0:00:14.406] ok     menu mode text: PreloaderUI.Update first fired on thread 13416 (Unity's main thread)
+[0:00:14.406] ok     menu mode text: FOUND the corner label. parent chain = EFT.UI.PreloaderUI(this=0x16852424450) -> _alphaVersionLabel:LocalizedText(+0x20)=0x168526ed2c0 ; the mode string is _sessionModeText(+0x128) and currently reads "" (this is the "PVE ZONE" slot; identified offline from the decrypted metadata, and confirmed here by SetGameModeText's own mov [rcx+0x128],rdx)
+[0:00:14.406] ok     live inspector: rider FIRST DISPATCHED on thread 13416 (slot 8); EFT.UI.PreloaderUI::Update is now ticking and batches will drain
+[0:00:17.218] ok     settings write: repaint routes on this build -- EFT.UI.LocalizedText::SetLabelText=OK TMPro.TMP_Text::set_text=OK TMPro.TMP_Text::set_havePropertiesChanged=OK
+[0:00:17.218] ok     version brand: the bottom label now reads "aowlspt 1.0, aoughwl.com  -  tarkov 1.1.0.1.46777" -- written through LocalizedText::SetLabelText / TMP_Text::set_text on AlphaLabel (fact #12), NOT the $verlabel anchor, whose m_text is empty and which is why this never showed
+[0:00:20.234] ok     hide seasons: found MenuScreen; looking for its 'SeasonsButton' child on every pass from here
+[0:00:20.234] ok     hide seasons: Common UI/MenuScreen/SeasonsButton switched off (the KORD BREACH / Season banner above Play). It is re-checked on a throttle, so a menu rebuild hides it again; it is never re-enabled by this host.
+[0:00:26.625] warn   live inspector: no batch queued for 25s while the rider IS dispatching (1752 fires). polls=1343 reads=75 readFails=0 unchanged=74 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:00:41.875] warn   live inspector: no batch queued for 40s while the rider IS dispatching (4192 fires). polls=2257 reads=136 readFails=0 unchanged=135 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:00:56.937] warn   live inspector: no batch queued for 55s while the rider IS dispatching (6512 fires). polls=3156 reads=196 readFails=0 unchanged=195 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:01:03.046] warn   menu mode text: the PreloaderUI.Update hook has fired 3600 times and the backend has never sent a `menuModeText`, so the corner label is still the game's stock text. The hook is fine; the SOURCE is missing. Check that the backend is reachable (backendPort in aowlspt-host.json, or backendUrl in the installer's backend.json) and that the manager mod is running.
+[0:01:11.968] warn   live inspector: no batch queued for 70s while the rider IS dispatching (8824 fires). polls=4055 reads=256 readFails=0 unchanged=255 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:01:27.000] warn   live inspector: no batch queued for 85s while the rider IS dispatching (11122 fires). polls=4950 reads=316 readFails=0 unchanged=315 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:01:42.046] warn   live inspector: no batch queued for 100s while the rider IS dispatching (13418 fires). polls=5849 reads=376 readFails=0 unchanged=375 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:01:57.156] warn   live inspector: no batch queued for 115s while the rider IS dispatching (15720 fires). polls=6752 reads=436 readFails=0 unchanged=435 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:02:12.203] warn   live inspector: no batch queued for 130s while the rider IS dispatching (18012 fires). polls=7649 reads=496 readFails=0 unchanged=495 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:02:27.281] warn   live inspector: no batch queued for 146s while the rider IS dispatching (20322 fires). polls=8543 reads=556 readFails=0 unchanged=555 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:02:42.328] warn   live inspector: no batch queued for 161s while the rider IS dispatching (22616 fires). polls=9435 reads=616 readFails=0 unchanged=615 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:02:57.390] warn   live inspector: no batch queued for 176s while the rider IS dispatching (24924 fires). polls=10328 reads=676 readFails=0 unchanged=675 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:03:12.500] warn   live inspector: no batch queued for 191s while the rider IS dispatching (27238 fires). polls=11224 reads=736 readFails=0 unchanged=735 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:03:27.562] warn   live inspector: no batch queued for 206s while the rider IS dispatching (29530 fires). polls=12116 reads=796 readFails=0 unchanged=795 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:03:42.625] warn   live inspector: no batch queued for 221s while the rider IS dispatching (31832 fires). polls=13008 reads=856 readFails=0 unchanged=855 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:03:57.703] warn   live inspector: no batch queued for 236s while the rider IS dispatching (34136 fires). polls=13901 reads=916 readFails=0 unchanged=915 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:04:12.796] warn   live inspector: no batch queued for 251s while the rider IS dispatching (36444 fires). polls=14792 reads=976 readFails=0 unchanged=975 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:04:27.875] warn   live inspector: no batch queued for 266s while the rider IS dispatching (38750 fires). polls=15682 reads=1036 readFails=0 unchanged=1035 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:04:42.984] warn   live inspector: no batch queued for 281s while the rider IS dispatching (41002 fires). polls=16575 reads=1096 readFails=0 unchanged=1095 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:04:53.812] ok     hide seasons: the banner came back after a menu rebuild and was hidden again on the FIRST frame it did, from the cached object -- not on the next throttled pass
+[0:04:56.921] ok     settings probe: SettingsScreen.Show fired on thread 13416 (host thread 17196); this=0x168ca4cdbd0 -- Unity's main thread
+[0:04:56.921] ok     settings probe: tab=game _createdControls list is null/unreadable -- expected for any tab the user has not selected yet; only the SELECTED tab is built
+[0:04:56.921] ok     settings probe: tab=graphics _createdControls list is null/unreadable -- expected for any tab the user has not selected yet; only the SELECTED tab is built
+[0:04:56.921] ok     settings probe: tab=postfx _createdControls list is null/unreadable -- expected for any tab the user has not selected yet; only the SELECTED tab is built
+[0:04:56.921] ok     settings probe: tab=sound _createdControls list is null/unreadable -- expected for any tab the user has not selected yet; only the SELECTED tab is built
+[0:04:56.921] ok     settings probe: tab=controls _createdControls list is null/unreadable -- expected for any tab the user has not selected yet; only the SELECTED tab is built
+[0:04:56.921] ok     settings probe: tab=current field is null (not built yet)
+[0:04:56.921] ok     settings probe: walk done -- 5 distinct tab object(s) examined. Read-only, nothing was written.
+[0:04:57.015] ok     settings probe: ShowScreen (postfix) first fired on thread 13416 (host thread 17196) -- Unity's main thread; this=0x168ca4cdbd0
+[0:04:57.015] ok     settings probe: tab built -- group=game (1) tab=0x168ca4e3c80 klass=0x166509734f0
+[0:04:57.015] ok     settings probe: tab=game _createdControls size=25
+[0:04:57.015] ok     settings probe: tab=game control[0] label='Interface language' type=0x166508c9bb0 widget=0x169615b3a10
+[0:04:57.015] ok     settings probe: tab=game control[1] label='Main menu background' type=0x166508c9bb0 widget=0x169615b38a0
+[0:04:57.015] ok     settings probe: tab=game control[2] label='Profile icon' type=0x166508c9bb0 widget=0x169615b3730
+[0:04:57.015] ok     settings probe: tab=game control[3] label='Quick slots' type=0x166508c9bb0 widget=0x169615b35c0
+[0:04:57.015] ok     settings probe: tab=game control[4] label='Stamina and stance' type=0x166508c9bb0 widget=0x169615b32e0
+[0:04:57.015] ok     settings probe: tab=game control[5] label='Health condition' type=0x166508c9bb0 widget=0x169615b3170
+[0:04:57.015] ok     settings probe: tab=game control[6] label='Health color scheme' type=0x166508c9bb0 widget=0x169615b3000
+[0:04:57.015] ok     settings probe: tab=game control[7] label='Highlight available operations' type=0x166508c9bb0 widget=0x168b90b0e60
+[0:04:57.015] ok     settings probe: tab=game control[8] label='Priority window' type=0x166508c9bb0 widget=0x168b90b0cf0
+[0:04:57.015] ok     settings probe: tab=game control[9] label='Double click item quick use' type=0x166508c9bb0 widget=0x168b90b08a0
+[0:04:57.015] ok     settings probe: tab=game control[10] label='Vaulting over medium obstacles' type=0x166508c9bb0 widget=0x168b90b0730
+[0:04:57.015] ok     settings probe: tab=game control[11] label='Continuous medkit healing' type=0x166508c9bb0 widget=0x168b90b05c0
+[0:04:57.015] ok     settings probe: tab=game control[12] label='Wishlist item notifications' type=0x166508c9bb0 widget=0x168b90b0450
+[0:04:57.015] ok     settings probe: tab=game control[13] label='Auto add to Wishlist' type=0x166508c9bb0 widget=0x168b90b02e0
+[0:04:57.015] ok     settings probe: tab=game control[14] label='Task item warning' type=0x166508c9bb0 widget=0x168b90b0170
+[0:04:57.015] ok     settings probe: tab=game control[15] label='Task item search assistance' type=0x166508c9bb0 widget=0x168b90b0000
+[0:04:57.015] ok     settings probe: tab=game control[16] label='Head bobbing:' type=0x1665263ca80 widget=0x168b8f3fd80
+[0:04:57.031] ok     settings probe: tab=game control[17] label='FOV:' type=0x1665263ca80 widget=0x168b8f3fc00
+[0:04:57.031] ok     settings probe: tab=game control[18] label='Automatic RAM Cleaner' type=0x16652bd24a0 widget=0x168b8f01c80
+[0:04:57.031] ok     settings probe: tab=game control[19] label='Only use physical cores' type=0x16652bd24a0 widget=0x168b8f01b40
+[0:04:57.031] ok     settings probe: tab=game control[20] label='Malfunction notifications' type=0x16652bd24a0 widget=0x168b8f01a00
+[0:04:57.031] ok     settings probe: tab=game control[21] label='Preload Hideout' type=0x16652bd24a0 widget=0x168b8f018c0
+[0:04:57.031] ok     settings probe: tab=game control[22] label='Block group invites' type=0x16652bd24a0 widget=0x168b8f01780
+[0:04:57.031] ok     settings probe: tab=game control[23] label='Trading intermediate screen' type=0x16652bd24a0 widget=0x168b8f01640
+[0:04:57.031] ok     settings probe: tab=game control[24] label='Helmet Camera Mode' type=0x16652bd24a0 widget=0x168b8f01500
+[0:04:57.031] ok     settings probe: tab=game logged 25 controls
+[0:04:57.031] ok     settings probe: controls APPEARED for tab=game after 0 poll(s) -- walking them now
+[0:04:57.031] ok     settings probe: tab=game _createdControls size=25
+[0:04:57.031] ok     settings probe: tab=game control[0] label='Interface language' type=0x166508c9bb0 widget=0x169615b3a10
+[0:04:57.031] ok     settings probe: tab=game control[1] label='Main menu background' type=0x166508c9bb0 widget=0x169615b38a0
+[0:04:57.031] ok     settings probe: tab=game control[2] label='Profile icon' type=0x166508c9bb0 widget=0x169615b3730
+[0:04:57.031] ok     settings probe: tab=game control[3] label='Quick slots' type=0x166508c9bb0 widget=0x169615b35c0
+[0:04:57.031] ok     settings probe: tab=game control[4] label='Stamina and stance' type=0x166508c9bb0 widget=0x169615b32e0
+[0:04:57.031] ok     settings probe: tab=game control[5] label='Health condition' type=0x166508c9bb0 widget=0x169615b3170
+[0:04:57.031] ok     settings probe: tab=game control[6] label='Health color scheme' type=0x166508c9bb0 widget=0x169615b3000
+[0:04:57.031] ok     settings probe: tab=game control[7] label='Highlight available operations' type=0x166508c9bb0 widget=0x168b90b0e60
+[0:04:57.031] ok     settings probe: tab=game control[8] label='Priority window' type=0x166508c9bb0 widget=0x168b90b0cf0
+[0:04:57.031] ok     settings probe: tab=game control[9] label='Double click item quick use' type=0x166508c9bb0 widget=0x168b90b08a0
+[0:04:57.031] ok     settings probe: tab=game control[10] label='Vaulting over medium obstacles' type=0x166508c9bb0 widget=0x168b90b0730
+[0:04:57.031] ok     settings probe: tab=game control[11] label='Continuous medkit healing' type=0x166508c9bb0 widget=0x168b90b05c0
+[0:04:57.031] ok     settings probe: tab=game control[12] label='Wishlist item notifications' type=0x166508c9bb0 widget=0x168b90b0450
+[0:04:57.031] ok     settings probe: tab=game control[13] label='Auto add to Wishlist' type=0x166508c9bb0 widget=0x168b90b02e0
+[0:04:57.031] ok     settings probe: tab=game control[14] label='Task item warning' type=0x166508c9bb0 widget=0x168b90b0170
+[0:04:57.031] ok     settings probe: tab=game control[15] label='Task item search assistance' type=0x166508c9bb0 widget=0x168b90b0000
+[0:04:57.031] ok     settings probe: tab=game control[16] label='Head bobbing:' type=0x1665263ca80 widget=0x168b8f3fd80
+[0:04:57.031] ok     settings probe: tab=game control[17] label='FOV:' type=0x1665263ca80 widget=0x168b8f3fc00
+[0:04:57.031] ok     settings probe: tab=game control[18] label='Automatic RAM Cleaner' type=0x16652bd24a0 widget=0x168b8f01c80
+[0:04:57.031] ok     settings probe: tab=game control[19] label='Only use physical cores' type=0x16652bd24a0 widget=0x168b8f01b40
+[0:04:57.031] ok     settings probe: tab=game control[20] label='Malfunction notifications' type=0x16652bd24a0 widget=0x168b8f01a00
+[0:04:57.031] ok     settings probe: tab=game control[21] label='Preload Hideout' type=0x16652bd24a0 widget=0x168b8f018c0
+[0:04:57.031] ok     settings probe: tab=game control[22] label='Block group invites' type=0x16652bd24a0 widget=0x168b8f01780
+[0:04:57.031] ok     settings probe: tab=game control[23] label='Trading intermediate screen' type=0x16652bd24a0 widget=0x168b8f01640
+[0:04:57.031] ok     settings probe: tab=game control[24] label='Helmet Camera Mode' type=0x16652bd24a0 widget=0x168b8f01500
+[0:04:57.031] ok     settings probe: tab=game logged 25 controls
+[0:04:57.046] ok     settings write: learned float-slider klass = 0x1665263ca80 from the stock label 'FOV:'
+[0:04:57.046] ok     settings write: PHASE 2a tab=game control[17] relabelled 'FOV:' -> 'FOV: [aowlspt]' (tmp=0x168b8fc1000) via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:04:57.046] ok     settings write: PHASE 2b tab=game float-slider 'Head bobbing:' = 1.000 (range 0.200..1.000)
+[0:04:57.046] ok     settings write: PHASE 2b tab=game float-slider 'FOV: [aowlspt]' = 75.000 (range 50.000..75.000)
+[0:04:57.046] ok     settings write: PHASE 2b tab=game read 0 toggle(s) and 2 float slider(s) live. Read-only.
+[0:04:57.046] ok     settings pages: entry #1 tab='game' tabPtr=0x168ca4e3c80 on=true off=false pages=0 toggleKlass(before census)=0x0
+[0:04:57.062] ok     settings pages: after the census on this same tab visit -- toggle=0x0 float=0x1665263ca80 dropdown=0x0 select=0x0. A zero here means the stock anchor label for that type was not found on this tab (a non-English client will do that), which is why the donor is no longer required to be a learned toggle.
+[0:04:57.062] ok     settings pages: registry was empty; built the host page -> 1 page(s), 13 row(s)
+[0:04:57.062] ok     settings pages: row container reached by walking from a live control -- control=0x1696155da80 rowGo=0x16961b8d780 rowT=0x16961b8d860 containerT=0x168ca096220 containerGo=0x168cde91de0. New rows become siblings of the stock rows, so the tab's own layout group places them.
+[0:04:57.078] ok     settings pages: page 'host' donor=0x1696155da80 chosen by most common klass 0x166508c9bb0 (16 row(s) of it on this tab; the toggle klass was never learned, so the donor is chosen by shape rather than by name); parent=0x168cde91de0
+[0:04:57.093] ok     settings pages: cloned row 'aowlspt - host' (control=0x168b8f3f600) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:04:57.093] ok     settings pages: cloned row 'F3 debug panel  (not done yet)' (control=0x168b8f3f540) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:04:57.093] ok     settings pages: NOT seeding a toggle value -- the cloned row's widget klass is 0x16652f43600 and the learned toggle klass is 0x0 (never learned: no stock toggle row was found on this tab, which a non-English client will also do). Calling Toggle::SetIsOnWithoutNotify on it FAULTS, and the caught fault used to abort the rest of the page render -- which is what made the page clone itself on every tab visit. The row is left showing the donor's value; that is cosmetic and safe.
+[0:04:57.093] ok     settings pages/geom: --- donor vs clone, one shot ---
+[0:04:57.093] ok     settings pages/geom DONOR(control): comp=0x1696155da80 go=0x16961b8d780 name='Settings Drop Down(Clone)' activeSelf=1 activeInHierarchy=1 layer=5
+[0:04:57.093] ok     settings pages/geom DONOR(control): rect=[x=-600.0 y=-35.0 w=600.0 h=35.0] anchoredPos=(0.0,0.0) sizeDelta=(600.0,35.0) anchorMin=(0.0,1.0) pivot=(1.0,1.0) localPos=(-376.00,0.00,0.00) localScale=(1.00,1.00,1.00)
+[0:04:57.093] ok     settings pages/geom DONOR(control): parent[0]=0x168ca096220 name='Settings' activeSelf=1 rect=[x=-376.0 y=-664.0 w=752.0 h=664.0] localScale=(1.00,1.00,1.00)
+[0:04:57.093] ok     settings pages/geom CLONE(control): comp=0x168b8f3f540 go=0x1696142cd60 name='Settings Drop Down(Clone)(Clone)' activeSelf=1 activeInHierarchy=1 layer=5
+[0:04:57.093] ok     settings pages/geom CLONE(control): rect=[x=-600.0 y=-35.0 w=600.0 h=35.0] anchoredPos=(0.0,0.0) sizeDelta=(600.0,35.0) anchorMin=(0.0,1.0) pivot=(1.0,1.0) localPos=(-376.00,0.00,0.00) localScale=(1.00,1.00,1.00)
+[0:04:57.093] ok     settings pages/geom CLONE(control): parent[0]=0x168ca096220 name='Settings' activeSelf=1 rect=[x=-376.0 y=-664.0 w=752.0 h=664.0] localScale=(1.00,1.00,1.00)
+[0:04:57.093] ok     settings pages/geom DONOR(label TMP): comp=0x16961106000 go=0x16961b8d760 name='Text' activeSelf=1 activeInHierarchy=1 layer=5
+[0:04:57.093] ok     settings pages/geom DONOR(label TMP): rect=[x=-290.0 y=-17.5 w=290.0 h=35.0] anchoredPos=(-10.0,0.0) sizeDelta=(-10.0,0.0) anchorMin=(0.0,0.0) pivot=(1.0,0.5) localPos=(-310.00,-17.50,0.00) localScale=(1.00,1.00,1.00)
+[0:04:57.093] ok     settings pages/geom DONOR(label TMP): parent[0]=0x16961b8d860 name='Settings Drop Down(Clone)' activeSelf=1 rect=[x=-600.0 y=-35.0 w=600.0 h=35.0] localScale=(1.00,1.00,1.00)
+[0:04:57.093] ok     settings pages/geom CLONE(label TMP): comp=0x168b88c2000 go=0x1696142cd40 name='Text' activeSelf=1 activeInHierarchy=1 layer=5
+[0:04:57.093] ok     settings pages/geom CLONE(label TMP): rect=[x=-290.0 y=-17.5 w=290.0 h=35.0] anchoredPos=(-10.0,0.0) sizeDelta=(-10.0,0.0) anchorMin=(0.0,0.0) pivot=(1.0,0.5) localPos=(-310.00,-17.50,0.00) localScale=(1.00,1.00,1.00)
+[0:04:57.109] ok     settings pages/geom CLONE(label TMP): parent[0]=0x1696142ce80 name='Settings Drop Down(Clone)(Clone)' activeSelf=1 rect=[x=-600.0 y=-35.0 w=600.0 h=35.0] localScale=(1.00,1.00,1.00)
+[0:04:57.109] ok     settings pages/geom PARENT: go=0x168cde91de0 name='Settings' rect=[x=-376.0 y=-664.0 w=752.0 h=664.0] activeSelf=1 localScale=(1.00,1.00,1.00)
+[0:04:57.109] ok     settings pages: cloned row 'In-world AI markers  (not done yet)' (control=0x168b8f3f480) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:04:57.109] ok     settings pages: cloned row 'Bot registration logging  (not done yet)' (control=0x168b8f3f3c0) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:04:57.109] ok     settings pages: cloned row 'Lift the bot cap  (not done yet)' (control=0x168b8f3f300) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:04:57.125] ok     settings pages: cloned row 'Bot navigation API  (not done yet)' (control=0x168b8f3f240) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:04:57.125] ok     settings pages: cloned row 'Bot AI activation rescue  (not done yet)' (control=0x168b8f3f180) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:04:57.125] ok     settings pages: cloned row 'OS window-close fix  (not done yet)' (control=0x168b8f3f0c0) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:04:57.125] ok     settings pages: cloned row 'Brand the version label  (not done yet)' (control=0x168b8f3f000) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:04:57.140] ok     settings pages: cloned row 'Menu corner label  (not done yet)' (control=0x168b8a4ef00) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:04:57.140] ok     settings pages: cloned row 'Settings-screen probe  (not done yet)' (control=0x168b8a4ee40) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:04:57.140] ok     settings pages: cloned row 'Settings relabel proof  (not done yet)' (control=0x168b8a4ed80) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:04:57.140] ok     settings pages: cloned row 'Settings value read-back  (not done yet)' (control=0x168b8a4ecc0) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:04:57.156] ok     settings pages: cloned row 'Native mod settings pages  (not done yet)' (control=0x168b8a4ec00) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:04:57.156] ok     settings pages: page 'host' rendered 13 row(s) of 13
+[0:04:57.156] ok     settings pages: write-back check -- local pg.renderedFor=0x168ca4e3c80 registry gSwPages[i].renderedFor=0x168ca4e3c80  local rows=13 registry rows=13  local row0.clone=0x168b8f3f540 registry row0.clone=0x168b8f3f540
+[0:04:57.156] ok     settings write: VERDICT (revisit tab=game) m_text has REVERTED to 'FOV:' (we wrote 'FOV: [aowlspt]'). This is cause (b) OVERWRITE -- LocalizedText re-applied its own string over ours. The relabel is re-applied on every tab visit from this build, so watch whether it now sticks.
+[0:04:57.171] ok     settings write: PHASE 2a tab=game control[17] relabelled 'FOV:' -> 'FOV: [aowlspt]' (tmp=0x168b8fc1000) via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:04:57.171] ok     settings pages: entry #2 tab='game' tabPtr=0x168ca4e3c80 on=true off=false pages=1 renderedFor=0x168ca4e3c80 row0.clone=0x168b8f3f540 toggleKlass(before census)=0x0
+[0:04:57.187] ok     settings pages: after the census on this same tab visit -- toggle=0x0 float=0x1665263ca80 dropdown=0x0 select=0x0. A zero here means the stock anchor label for that type was not found on this tab (a non-English client will do that), which is why the donor is no longer required to be a learned toggle.
+[0:04:57.203] ok     settings pages: row container reached by walking from a live control -- control=0x1696155da80 rowGo=0x16961b8d780 rowT=0x16961b8d860 containerT=0x168ca096220 containerGo=0x168cde91de0. New rows become siblings of the stock rows, so the tab's own layout group places them.
+[0:04:57.218] ok     mods tab: caption 'MODS' is now on 2 of the clone's 4 TextMeshProUGUI, matching the donor, which shows 'CONTROLS' on 2. Verified by re-reading the clone, not by trusting the write.
+[0:04:57.218] ok     mods tab: the MODS tab button after the reap -> toggle=0x00000168b8be77e0 objectActive=true m_IsOn=false m_Group=0x00000168ca4e8b00
+[0:04:57.343] ok     mods tab: pages go into 'Settings' inside our cloned 'Game Settings' panel, name-matched against the container swRowContainerGo walks to on the live tab (). The stock layout group on it does all the spacing -- nothing in this feature positions a rect.
+[0:04:57.375] ok     mods tab: switched off 40 inherited row(s) inside our page container and 3 inherited sibling(s) on the spine above it (that is where 'Nickname Panel' lived), so the MODS body starts EMPTY instead of showing a second copy of Game Settings
+[0:04:57.390] ok     mods tab: caption 'Interface' is now on 2 of the clone's 2 TextMeshProUGUI, matching the donor, which shows 'SOME TEXT' on 2. Verified by re-reading the clone, not by trusting the write.
+[0:04:57.390] ok     mods tab: subtab 'interface' after the reap -> toggle=0x00000168b83f5150 objectActive=true m_IsOn=false m_Group=0x0000000000000000
+[0:04:57.406] ok     mods tab: caption 'Bots' is now on 2 of the clone's 2 TextMeshProUGUI, matching the donor, which shows 'SOME TEXT' on 2. Verified by re-reading the clone, not by trusting the write.
+[0:04:57.406] ok     mods tab: subtab 'bots' after the reap -> toggle=0x00000168b461de70 objectActive=true m_IsOn=false m_Group=0x0000000000000000
+[0:04:57.421] ok     mods tab: caption 'Assets' is now on 2 of the clone's 2 TextMeshProUGUI, matching the donor, which shows 'SOME TEXT' on 2. Verified by re-reading the clone, not by trusting the write.
+[0:04:57.421] ok     mods tab: subtab 'assets' after the reap -> toggle=0x00000168b461dbd0 objectActive=true m_IsOn=false m_Group=0x0000000000000000
+[0:04:57.437] ok     mods tab: caption 'Diagnostics' is now on 2 of the clone's 2 TextMeshProUGUI, matching the donor, which shows 'SOME TEXT' on 2. Verified by re-reading the clone, not by trusting the write.
+[0:04:57.437] ok     mods tab: subtab 'dev' after the reap -> toggle=0x00000168b461d930 objectActive=true m_IsOn=false m_Group=0x0000000000000000
+[0:04:57.437] ok     mods tab: 4 subtab BUTTON(s) cloned into a clone of the game's own in-panel strip (donor 'Control Settings'/Toggles/ControlToggle); the strip's 2 inherited button(s) are hidden. Exclusivity is NATIVE (Instantiate remapped each clone's m_Group onto the cloned group, so the game's own group logic runs the strip)
+[0:04:58.062] warn   live inspector: no batch queued for 296s while the rider IS dispatching (42150 fires). polls=17449 reads=1156 readFails=0 unchanged=1155 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:04:59.000] ok     settings pages: page 'interface' donor=0x1696155da80 chosen by most common klass 0x166508c9bb0 (16 row(s) of it on this tab; the toggle klass was never learned, so the donor is chosen by shape rather than by name); parent=0x16961536060
+[0:04:59.000] ok     settings pages: cloned row 'Interface' (control=0x16961e1eb40) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:04:59.015] ok     settings pages: cloned row 'F3 debug panel  (not done yet)' (control=0x16961e1ea80) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:04:59.015] ok     settings pages: cloned row 'In-world AI markers  (not done yet)' (control=0x16961e1e9c0) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:04:59.015] ok     settings pages: cloned row 'Brand the version label  (not done yet)' (control=0x16961e1e900) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:04:59.015] ok     settings pages: cloned row 'Menu corner label  (not done yet)' (control=0x16961e1e840) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:04:59.031] ok     settings pages: cloned row 'OS window-close fix  (not done yet)' (control=0x16961e1e780) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:04:59.031] ok     settings pages: page 'interface' rendered 5 row(s) of 5
+[0:04:59.031] ok     mods tab: caption 'F3 debug panel  (not done yet)' is now on 1 of the clone's 3 TextMeshProUGUI, matching the donor, which shows 'Interface language' on 1. Verified by re-reading the clone, not by trusting the write.
+[0:04:59.046] ok     mods tab: caption 'In-world AI markers  (not done yet)' is now on 1 of the clone's 3 TextMeshProUGUI, matching the donor, which shows 'Interface language' on 1. Verified by re-reading the clone, not by trusting the write.
+[0:04:59.062] ok     mods tab: caption 'Brand the version label  (not done yet)' is now on 1 of the clone's 3 TextMeshProUGUI, matching the donor, which shows 'Interface language' on 1. Verified by re-reading the clone, not by trusting the write.
+[0:04:59.078] ok     mods tab: caption 'Menu corner label  (not done yet)' is now on 1 of the clone's 3 TextMeshProUGUI, matching the donor, which shows 'Interface language' on 1. Verified by re-reading the clone, not by trusting the write.
+[0:04:59.078] ok     mods tab: caption 'OS window-close fix  (not done yet)' is now on 1 of the clone's 3 TextMeshProUGUI, matching the donor, which shows 'Interface language' on 1. Verified by re-reading the clone, not by trusting the write.
+[0:04:59.109] ok     settings pages: page 'bots' donor=0x1696155da80 chosen by most common klass 0x166508c9bb0 (16 row(s) of it on this tab; the toggle klass was never learned, so the donor is chosen by shape rather than by name); parent=0x169615e0600
+[0:04:59.109] ok     settings pages: cloned row 'Bots' (control=0x16961e1e6c0) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:04:59.109] ok     settings pages: cloned row 'Lift the bot cap  (not done yet)' (control=0x16961e1e600) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:04:59.125] ok     settings pages: cloned row 'Bot registration logging  (not done yet)' (control=0x16961e1e540) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:04:59.125] ok     settings pages: cloned row 'Bot navigation API  (not done yet)' (control=0x16961e1e480) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:04:59.125] ok     settings pages: cloned row 'Bot AI activation rescue  (not done yet)' (control=0x16961e1e3c0) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:04:59.125] ok     settings pages: page 'bots' rendered 4 row(s) of 4
+[0:04:59.140] ok     mods tab: caption 'Lift the bot cap  (not done yet)' is now on 1 of the clone's 3 TextMeshProUGUI, matching the donor, which shows 'Interface language' on 1. Verified by re-reading the clone, not by trusting the write.
+[0:04:59.156] ok     mods tab: caption 'Bot registration logging  (not done yet)' is now on 1 of the clone's 3 TextMeshProUGUI, matching the donor, which shows 'Interface language' on 1. Verified by re-reading the clone, not by trusting the write.
+[0:04:59.171] ok     mods tab: caption 'Bot navigation API  (not done yet)' is now on 1 of the clone's 3 TextMeshProUGUI, matching the donor, which shows 'Interface language' on 1. Verified by re-reading the clone, not by trusting the write.
+[0:04:59.171] ok     mods tab: caption 'Bot AI activation rescue  (not done yet)' is now on 1 of the clone's 3 TextMeshProUGUI, matching the donor, which shows 'Interface language' on 1. Verified by re-reading the clone, not by trusting the write.
+[0:04:59.203] ok     settings pages: page 'assets' donor=0x1696155da80 chosen by most common klass 0x166508c9bb0 (16 row(s) of it on this tab; the toggle klass was never learned, so the donor is chosen by shape rather than by name); parent=0x1696171e500
+[0:04:59.203] ok     settings pages: cloned row 'Assets' (control=0x16961e1e300) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:04:59.203] ok     settings pages: cloned row 'Serve images locally  (not done yet)' (control=0x16961e1e240) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:04:59.203] ok     settings pages: page 'assets' rendered 1 row(s) of 1
+[0:04:59.218] ok     mods tab: caption 'Serve images locally  (not done yet)' is now on 1 of the clone's 3 TextMeshProUGUI, matching the donor, which shows 'Interface language' on 1. Verified by re-reading the clone, not by trusting the write.
+[0:04:59.250] ok     settings pages: page 'dev' donor=0x1696155da80 chosen by most common klass 0x166508c9bb0 (16 row(s) of it on this tab; the toggle klass was never learned, so the donor is chosen by shape rather than by name); parent=0x16961246080
+[0:04:59.250] ok     settings pages: cloned row 'Diagnostics' (control=0x16961e1e180) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:04:59.250] ok     settings pages: cloned row 'Live inspector  (not done yet)' (control=0x16961e1e0c0) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:04:59.265] ok     settings pages: cloned row 'Inspector may write  (not done yet)' (control=0x16961e1e000) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:04:59.265] ok     settings pages: cloned row 'Settings-screen probe  (not done yet)' (control=0x16961c13f00) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:04:59.265] ok     settings pages: cloned row 'Native mod settings pages  (not done yet)' (control=0x16961c13e40) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:04:59.265] ok     settings pages: cloned row 'MODS tab hide rides ShowScreen  (not done yet)' (control=0x16961c13d80) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:04:59.281] ok     settings pages: cloned row 'CodeGen audit  (not done yet)' (control=0x16961c13cc0) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:04:59.281] ok     settings pages: page 'dev' rendered 6 row(s) of 6
+[0:04:59.281] ok     mods tab: caption 'Live inspector  (not done yet)' is now on 1 of the clone's 3 TextMeshProUGUI, matching the donor, which shows 'Interface language' on 1. Verified by re-reading the clone, not by trusting the write.
+[0:04:59.296] ok     mods tab: caption 'Inspector may write  (not done yet)' is now on 1 of the clone's 3 TextMeshProUGUI, matching the donor, which shows 'Interface language' on 1. Verified by re-reading the clone, not by trusting the write.
+[0:04:59.312] ok     mods tab: caption 'Settings-screen probe  (not done yet)' is now on 1 of the clone's 3 TextMeshProUGUI, matching the donor, which shows 'Interface language' on 1. Verified by re-reading the clone, not by trusting the write.
+[0:04:59.328] ok     mods tab: caption 'Native mod settings pages  (not done yet)' is now on 1 of the clone's 3 TextMeshProUGUI, matching the donor, which shows 'Interface language' on 1. Verified by re-reading the clone, not by trusting the write.
+[0:04:59.328] ok     mods tab: caption 'MODS tab hide rides ShowScreen  (not done yet)' is now on 1 of the clone's 3 TextMeshProUGUI, matching the donor, which shows 'Interface language' on 1. Verified by re-reading the clone, not by trusting the write.
+[0:04:59.343] ok     mods tab: caption 'CodeGen audit  (not done yet)' is now on 1 of the clone's 3 TextMeshProUGUI, matching the donor, which shows 'Interface language' on 1. Verified by re-reading the clone, not by trusting the write.
+[0:04:59.343] ok     mods tab: re-asserted 16 row caption(s) across every TextMeshProUGUI they carry (0 did not take), using the row donor chosen by most common klass 0x166508c9bb0 (16 row(s) of it on this tab; the toggle klass was never learned, so the donor is chosen by shape rather than by name). Without this the rows keep the donor's caption -- which is why every row on every page read 'Interface language' while the write reported success.
+[0:04:59.375] ok     mods tab: the body shows exactly the subtab strip and ONE of the 4 page(s), which is the correct steady state
+[0:04:59.375] ok     mods tab: built -- a sixth tab button cloned into SettingsScreen/Toggles (labelled MODS, sharing the stock ToggleGroup so selection is the game's own), a panel cloned from 'Game Settings' beside the stock five, a subtab strip cloned from the game's own in-panel strip holding 4 cloned BUTTON(s), and one page of cloned rows behind each. Selecting MODS switches the incumbent stock panel OFF; leaving MODS switches it back ON.
+[0:04:59.406] ok     mods tab: caption 'GRAPHICS SETTINGS' is now on 2 of the clone's 2 TextMeshProUGUI, matching the donor, which shows 'SOME TEXT' on 2. Verified by re-reading the clone, not by trusting the write.
+[0:04:59.406] ok     mods tab: postfx strip button GRAPHICS SETTINGS -> toggle=0x0000016961f40bd0 objectActive=true m_IsOn=false m_Group=0x0000000000000000
+[0:04:59.406] ok     mods tab: caption 'POSTFX' is now on 2 of the clone's 2 TextMeshProUGUI, matching the donor, which shows 'SOME TEXT' on 2. Verified by re-reading the clone, not by trusting the write.
+[0:04:59.406] ok     mods tab: postfx strip button POSTFX -> toggle=0x0000016961f40930 objectActive=true m_IsOn=false m_Group=0x0000000000000000
+[0:04:59.421] ok     mods tab: caption 'GRAPHICS SETTINGS' is now on 2 of the clone's 2 TextMeshProUGUI, matching the donor, which shows 'SOME TEXT' on 2. Verified by re-reading the clone, not by trusting the write.
+[0:04:59.421] ok     mods tab: postfx strip button GRAPHICS SETTINGS -> toggle=0x0000016961f40150 objectActive=true m_IsOn=false m_Group=0x0000000000000000
+[0:04:59.421] ok     mods tab: caption 'POSTFX' is now on 2 of the clone's 2 TextMeshProUGUI, matching the donor, which shows 'SOME TEXT' on 2. Verified by re-reading the clone, not by trusting the write.
+[0:04:59.437] ok     mods tab: postfx strip button POSTFX -> toggle=0x000001696141de70 objectActive=true m_IsOn=false m_Group=0x0000000000000000
+[0:04:59.437] ok     postfx subtab: the top row now shows 5 tab button(s) (expected 5, accounting for the MODS clone = true) -- POSTFX has been folded into Graphics as a subtab. The stock button is HIDDEN, never destroyed, and comes back on its own if this feature turns itself off.
+[0:05:00.062] ok     settings probe: Unity-thread tick is live on thread 13416 -- polling each registered tab's control list from here
+[0:05:00.750] ok     mods tab: switched off 1 extra toggle(s) inside a cloned spawner -- the donor has 1 child(ren) and the clone had 2. A *ToggleSpawner clone keeps spawning (fact #93), so the copy is the captioned one at index 0 and the spawner's own is switched off. Without this there is an unlabelled rectangle beside every button we clone.
+[0:05:03.625] ok     settings probe: tab built -- group=graphics (0) tab=0x168ca4abc60 klass=0x166524dda70
+[0:05:03.625] ok     settings probe: tab=graphics _createdControls size=33
+[0:05:03.625] ok     settings probe: tab=graphics control[0] label='Screen resolution:' type=0x166508c9bb0 widget=0x16962b43a10
+[0:05:03.625] ok     settings probe: tab=graphics control[1] label='Aspect ratio:' type=0x166508c9bb0 widget=0x16962b438a0
+[0:05:03.625] ok     settings probe: tab=graphics control[2] label='Screen mode:' type=0x166508c9bb0 widget=0x16962b435c0
+[0:05:03.625] ok     settings probe: tab=graphics control[3] label='Monitor:' type=0x166508c9bb0 widget=0x16962b432e0
+[0:05:03.625] ok     settings probe: tab=graphics control[4] label='VSync' type=0x16652bd24a0 widget=0x169622f3b40
+[0:05:03.625] ok     settings probe: tab=graphics control[5] label='Overall graphics quality:' type=0x1665091ad60 widget=0x16961c13780
+[0:05:03.625] ok     settings probe: tab=graphics control[6] label='Texture quality:' type=0x166508c9bb0 widget=0x16962b43000
+[0:05:03.625] ok     settings probe: tab=graphics control[7] label='Shadows quality:' type=0x166508c9bb0 widget=0x16963aa2e60
+[0:05:03.625] ok     settings probe: tab=graphics control[8] label='Object LOD quality:' type=0x1665091ad60 widget=0x16961c13480
+[0:05:03.625] ok     settings probe: tab=graphics control[9] label='Overall visibility:' type=0x1665091ad60 widget=0x16961c13300
+[0:05:03.625] ok     settings probe: tab=graphics control[10] label='Clouds quality:' type=0x166508c9bb0 widget=0x16963aa2a10
+[0:05:03.625] ok     settings probe: tab=graphics control[11] label='Anti-aliasing:' type=0x166508c9bb0 widget=0x16963aa28a0
+[0:05:03.625] ok     settings probe: tab=graphics control[12] label='Volumetric lighting' type=0x166508c9bb0 widget=0x16963aa2730
+[0:05:03.625] ok     settings probe: tab=graphics control[13] label='NVIDIA DLSS:' type=0x166508c9bb0 widget=0x16963aa25c0
+[0:05:03.625] ok     settings probe: tab=graphics control[14] label='DLSS Preset:' type=0x166508c9bb0 widget=0x16963aa2450
+[0:05:03.625] ok     settings probe: tab=graphics control[15] label='AMD FSR 2.2:' type=0x166508c9bb0 widget=0x16963aa22e0
+[0:05:03.625] ok     settings probe: tab=graphics control[16] label='AMD FSR 3.0:' type=0x166508c9bb0 widget=0x16963aa2170
+[0:05:03.625] ok     settings probe: tab=graphics control[17] label='Resampling:' type=0x166508c9bb0 widget=0x16963aa2000
+[0:05:03.625] ok     settings probe: tab=graphics control[18] label='HBAO:' type=0x166508c9bb0 widget=0x16963aaee60
+[0:05:03.625] ok     settings probe: tab=graphics control[19] label='SSR:' type=0x166508c9bb0 widget=0x16963aaecf0
+[0:05:03.625] ok     settings probe: tab=graphics control[20] label='Anisotropic filtering:' type=0x166508c9bb0 widget=0x16963aaeb80
+[0:05:03.625] ok     settings probe: tab=graphics control[21] label='NVIDIA Reflex Low Latency:' type=0x166508c9bb0 widget=0x16963aae8a0
+[0:05:03.625] ok     settings probe: tab=graphics control[22] label='Sharpness:' type=0x1665263ca80 widget=0x1696216a840
+[0:05:03.625] ok     settings probe: tab=graphics control[23] label='Disable game FPS limit' type=0x16652bd24a0 widget=0x169622f3780
+[0:05:03.625] ok     settings probe: tab=graphics control[24] label='Lobby FPS Limit:' type=0x1665263ca80 widget=0x1696216a600
+[0:05:03.640] ok     settings probe: tab=graphics control[25] label='Game FPS Limit:' type=0x1665263ca80 widget=0x1696216a480
+[0:05:03.640] ok     settings probe: tab=graphics control[26] label='High-quality color' type=0x16652bd24a0 widget=0x169622f3640
+[0:05:03.640] ok     settings probe: tab=graphics control[27] label='Z-Blur' type=0x16652bd24a0 widget=0x169622f3500
+[0:05:03.640] ok     settings probe: tab=graphics control[28] label='Area Light Instancing' type=0x16652bd24a0 widget=0x169622f33c0
+[0:05:03.640] ok     settings probe: tab=graphics control[29] label='Chrom. aberrations' type=0x16652bd24a0 widget=0x169622f3280
+[0:05:03.640] ok     settings probe: tab=graphics control[30] label='Noise' type=0x16652bd24a0 widget=0x169622f3140
+[0:05:03.640] ok     settings probe: tab=graphics control[31] label='Grass shadows' type=0x16652bd24a0 widget=0x169622f3000
+[0:05:03.640] ok     settings probe: tab=graphics control[32] label='Streets of Tarkov Lower Texture Resolution Mode' type=0x16652bd24a0 widget=0x16961eecdc0
+[0:05:03.640] ok     settings probe: tab=graphics logged 33 controls
+[0:05:03.640] ok     settings probe: controls APPEARED for tab=graphics after 0 poll(s) -- walking them now
+[0:05:03.640] ok     settings probe: tab=graphics _createdControls size=33
+[0:05:03.640] ok     settings probe: tab=graphics control[0] label='Screen resolution:' type=0x166508c9bb0 widget=0x16962b43a10
+[0:05:03.640] ok     settings probe: tab=graphics control[1] label='Aspect ratio:' type=0x166508c9bb0 widget=0x16962b438a0
+[0:05:03.640] ok     settings probe: tab=graphics control[2] label='Screen mode:' type=0x166508c9bb0 widget=0x16962b435c0
+[0:05:03.640] ok     settings probe: tab=graphics control[3] label='Monitor:' type=0x166508c9bb0 widget=0x16962b432e0
+[0:05:03.640] ok     settings probe: tab=graphics control[4] label='VSync' type=0x16652bd24a0 widget=0x169622f3b40
+[0:05:03.640] ok     settings probe: tab=graphics control[5] label='Overall graphics quality:' type=0x1665091ad60 widget=0x16961c13780
+[0:05:03.640] ok     settings probe: tab=graphics control[6] label='Texture quality:' type=0x166508c9bb0 widget=0x16962b43000
+[0:05:03.640] ok     settings probe: tab=graphics control[7] label='Shadows quality:' type=0x166508c9bb0 widget=0x16963aa2e60
+[0:05:03.640] ok     settings probe: tab=graphics control[8] label='Object LOD quality:' type=0x1665091ad60 widget=0x16961c13480
+[0:05:03.640] ok     settings probe: tab=graphics control[9] label='Overall visibility:' type=0x1665091ad60 widget=0x16961c13300
+[0:05:03.640] ok     settings probe: tab=graphics control[10] label='Clouds quality:' type=0x166508c9bb0 widget=0x16963aa2a10
+[0:05:03.640] ok     settings probe: tab=graphics control[11] label='Anti-aliasing:' type=0x166508c9bb0 widget=0x16963aa28a0
+[0:05:03.640] ok     settings probe: tab=graphics control[12] label='Volumetric lighting' type=0x166508c9bb0 widget=0x16963aa2730
+[0:05:03.640] ok     settings probe: tab=graphics control[13] label='NVIDIA DLSS:' type=0x166508c9bb0 widget=0x16963aa25c0
+[0:05:03.640] ok     settings probe: tab=graphics control[14] label='DLSS Preset:' type=0x166508c9bb0 widget=0x16963aa2450
+[0:05:03.640] ok     settings probe: tab=graphics control[15] label='AMD FSR 2.2:' type=0x166508c9bb0 widget=0x16963aa22e0
+[0:05:03.640] ok     settings probe: tab=graphics control[16] label='AMD FSR 3.0:' type=0x166508c9bb0 widget=0x16963aa2170
+[0:05:03.640] ok     settings probe: tab=graphics control[17] label='Resampling:' type=0x166508c9bb0 widget=0x16963aa2000
+[0:05:03.640] ok     settings probe: tab=graphics control[18] label='HBAO:' type=0x166508c9bb0 widget=0x16963aaee60
+[0:05:03.640] ok     settings probe: tab=graphics control[19] label='SSR:' type=0x166508c9bb0 widget=0x16963aaecf0
+[0:05:03.640] ok     settings probe: tab=graphics control[20] label='Anisotropic filtering:' type=0x166508c9bb0 widget=0x16963aaeb80
+[0:05:03.640] ok     settings probe: tab=graphics control[21] label='NVIDIA Reflex Low Latency:' type=0x166508c9bb0 widget=0x16963aae8a0
+[0:05:03.640] ok     settings probe: tab=graphics control[22] label='Sharpness:' type=0x1665263ca80 widget=0x1696216a840
+[0:05:03.640] ok     settings probe: tab=graphics control[23] label='Disable game FPS limit' type=0x16652bd24a0 widget=0x169622f3780
+[0:05:03.656] ok     settings probe: tab=graphics control[24] label='Lobby FPS Limit:' type=0x1665263ca80 widget=0x1696216a600
+[0:05:03.656] ok     settings probe: tab=graphics control[25] label='Game FPS Limit:' type=0x1665263ca80 widget=0x1696216a480
+[0:05:03.656] ok     settings probe: tab=graphics control[26] label='High-quality color' type=0x16652bd24a0 widget=0x169622f3640
+[0:05:03.656] ok     settings probe: tab=graphics control[27] label='Z-Blur' type=0x16652bd24a0 widget=0x169622f3500
+[0:05:03.656] ok     settings probe: tab=graphics control[28] label='Area Light Instancing' type=0x16652bd24a0 widget=0x169622f33c0
+[0:05:03.656] ok     settings probe: tab=graphics control[29] label='Chrom. aberrations' type=0x16652bd24a0 widget=0x169622f3280
+[0:05:03.656] ok     settings probe: tab=graphics control[30] label='Noise' type=0x16652bd24a0 widget=0x169622f3140
+[0:05:03.656] ok     settings probe: tab=graphics control[31] label='Grass shadows' type=0x16652bd24a0 widget=0x169622f3000
+[0:05:03.656] ok     settings probe: tab=graphics control[32] label='Streets of Tarkov Lower Texture Resolution Mode' type=0x16652bd24a0 widget=0x16961eecdc0
+[0:05:03.656] ok     settings probe: tab=graphics logged 33 controls
+[0:05:03.656] ok     settings write: VERDICT (build tab=graphics) m_text STILL HOLDS 'FOV: [aowlspt]'. The store survived, so this is cause (a) NO REPAINT -- the model is ours and TMP never rebuilt its mesh. The fix is the real setter / a forced mesh update, not the dirty byte.
+[0:05:03.671] ok     settings write: PHASE 2a tab=graphics has no control labelled 'FOV:'; nothing was written (this is expected on every tab but Game)
+[0:05:03.687] ok     settings write: PHASE 2b tab=graphics float-slider 'Sharpness:' = 0.600 (range 0.000..3.000)
+[0:05:03.687] ok     settings write: PHASE 2b tab=graphics float-slider 'Lobby FPS Limit:' = 60.000 (range 30.000..60.000)
+[0:05:03.687] ok     settings write: PHASE 2b tab=graphics float-slider 'Game FPS Limit:' = 144.000 (range 30.000..144.000)
+[0:05:03.687] ok     settings write: PHASE 2b tab=graphics read 0 toggle(s) and 3 float slider(s) live. Read-only.
+[0:05:03.687] ok     settings pages: entry #3 tab='graphics' tabPtr=0x168ca4abc60 on=true off=false pages=1 renderedFor=0x168ca4e3c80 row0.clone=0x168b8f3f540 toggleKlass(before census)=0x0
+[0:05:03.687] ok     settings pages: DECLINED -- pages render only onto the Game tab and this is 'graphics' (expected; open Settings -> Game)
+[0:05:07.046] ok     settings probe: tab built -- group=sound (2) tab=0x168ca5cc420 klass=0x16652caaea0
+[0:05:07.046] ok     settings probe: tab=sound _createdControls size=11
+[0:05:07.046] ok     settings probe: tab=sound control[0] label='Overall volume:' type=0x1665091ad60 widget=0x16961eedd80
+[0:05:07.046] ok     settings probe: tab=sound control[1] label='Interface volume:' type=0x1665091ad60 widget=0x16961eedc00
+[0:05:07.046] ok     settings probe: tab=sound control[2] label='Chat volume:' type=0x1665091ad60 widget=0x16961eeda80
+[0:05:07.046] ok     settings probe: tab=sound control[3] label='Music volume:' type=0x1665091ad60 widget=0x16961eed900
+[0:05:07.046] ok     settings probe: tab=sound control[4] label='Hideout volume:' type=0x1665091ad60 widget=0x16961eed780
+[0:05:07.046] ok     settings probe: tab=sound control[5] label='Music on raid end' type=0x16652bd24a0 widget=0x16961eec500
+[0:05:07.046] ok     settings probe: tab=sound control[6] label='Enable VoIP' type=0x16652bd24a0 widget=0x16961eec3c0
+[0:05:07.046] ok     settings probe: tab=sound control[7] label='Device:' type=0x166508c9bb0 widget=0x16963949730
+[0:05:07.062] ok     settings probe: tab=sound control[8] label='Noise reduction:' type=0x166508c9bb0 widget=0x169639495c0
+[0:05:07.062] ok     settings probe: tab=sound control[9] label='Microphone sensitivity:' type=0x1665263ca80 widget=0x16961eed300
+[0:05:07.062] ok     settings probe: tab=sound control[10] label='Voice chat volume:' type=0x1665263ca80 widget=0x16961eed180
+[0:05:07.062] ok     settings probe: tab=sound logged 11 controls
+[0:05:07.062] ok     settings probe: controls APPEARED for tab=sound after 0 poll(s) -- walking them now
+[0:05:07.062] ok     settings probe: tab=sound _createdControls size=11
+[0:05:07.062] ok     settings probe: tab=sound control[0] label='Overall volume:' type=0x1665091ad60 widget=0x16961eedd80
+[0:05:07.062] ok     settings probe: tab=sound control[1] label='Interface volume:' type=0x1665091ad60 widget=0x16961eedc00
+[0:05:07.062] ok     settings probe: tab=sound control[2] label='Chat volume:' type=0x1665091ad60 widget=0x16961eeda80
+[0:05:07.062] ok     settings probe: tab=sound control[3] label='Music volume:' type=0x1665091ad60 widget=0x16961eed900
+[0:05:07.062] ok     settings probe: tab=sound control[4] label='Hideout volume:' type=0x1665091ad60 widget=0x16961eed780
+[0:05:07.062] ok     settings probe: tab=sound control[5] label='Music on raid end' type=0x16652bd24a0 widget=0x16961eec500
+[0:05:07.062] ok     settings probe: tab=sound control[6] label='Enable VoIP' type=0x16652bd24a0 widget=0x16961eec3c0
+[0:05:07.062] ok     settings probe: tab=sound control[7] label='Device:' type=0x166508c9bb0 widget=0x16963949730
+[0:05:07.062] ok     settings probe: tab=sound control[8] label='Noise reduction:' type=0x166508c9bb0 widget=0x169639495c0
+[0:05:07.062] ok     settings probe: tab=sound control[9] label='Microphone sensitivity:' type=0x1665263ca80 widget=0x16961eed300
+[0:05:07.062] ok     settings probe: tab=sound control[10] label='Voice chat volume:' type=0x1665263ca80 widget=0x16961eed180
+[0:05:07.062] ok     settings probe: tab=sound logged 11 controls
+[0:05:07.062] ok     settings write: VERDICT (build tab=sound) m_text STILL HOLDS 'FOV: [aowlspt]'. The store survived, so this is cause (a) NO REPAINT -- the model is ours and TMP never rebuilt its mesh. The fix is the real setter / a forced mesh update, not the dirty byte.
+[0:05:07.062] ok     settings write: learned select-slider klass = 0x1665091ad60 from the stock label 'Overall volume:'
+[0:05:07.062] ok     settings write: learned toggle klass = 0x16652bd24a0 from the stock label 'Enable VoIP'
+[0:05:07.062] ok     settings write: learned dropdown klass = 0x166508c9bb0 from the stock label 'Device:'
+[0:05:07.062] ok     settings write: PHASE 2a tab=sound has no control labelled 'FOV:'; nothing was written (this is expected on every tab but Game)
+[0:05:07.062] ok     settings write: PHASE 2b tab=sound toggle 'Music on raid end' = true
+[0:05:07.062] ok     settings write: PHASE 2b tab=sound toggle 'Enable VoIP' = true
+[0:05:07.062] ok     settings write: PHASE 2b tab=sound float-slider 'Microphone sensitivity:' = 4.000 (range 1.000..4.000)
+[0:05:07.062] ok     settings write: PHASE 2b tab=sound float-slider 'Voice chat volume:' = 100.000 (range 0.000..100.000)
+[0:05:07.062] ok     settings write: PHASE 2b tab=sound read 2 toggle(s) and 2 float slider(s) live. Read-only.
+[0:05:07.062] ok     settings pages: entry #4 tab='sound' tabPtr=0x168ca5cc420 on=true off=false pages=1 renderedFor=0x168ca4e3c80 row0.clone=0x168b8f3f540 toggleKlass(before census)=0x16652bd24a0
+[0:05:07.078] ok     settings pages: DECLINED -- pages render only onto the Game tab and this is 'sound' (expected; open Settings -> Game)
+[0:05:07.484] ok     settings write: VERDICT (revisit tab=graphics) m_text STILL HOLDS 'FOV: [aowlspt]'. The store survived, so this is cause (a) NO REPAINT -- the model is ours and TMP never rebuilt its mesh. The fix is the real setter / a forced mesh update, not the dirty byte.
+[0:05:07.500] ok     settings pages: entry #5 tab='graphics' tabPtr=0x168ca4abc60 on=true off=false pages=1 renderedFor=0x168ca4e3c80 row0.clone=0x168b8f3f540 toggleKlass(before census)=0x16652bd24a0
+[0:05:07.500] ok     settings pages: DECLINED -- pages render only onto the Game tab and this is 'graphics' (expected; open Settings -> Game)
+[0:05:07.859] ok     settings write: VERDICT (revisit tab=game) m_text has REVERTED to 'FOV:' (we wrote 'FOV: [aowlspt]'). This is cause (b) OVERWRITE -- LocalizedText re-applied its own string over ours. The relabel is re-applied on every tab visit from this build, so watch whether it now sticks.
+[0:05:07.875] ok     settings write: PHASE 2a tab=game control[17] relabelled 'FOV:' -> 'FOV: [aowlspt]' (tmp=0x168b8fc1000) via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:05:07.875] ok     settings pages: entry #6 tab='game' tabPtr=0x168ca4e3c80 on=true off=false pages=1 renderedFor=0x168ca4e3c80 row0.clone=0x168b8f3f540 toggleKlass(before census)=0x16652bd24a0
+[0:05:07.875] ok     settings pages: after the census on this same tab visit -- toggle=0x16652bd24a0 float=0x1665263ca80 dropdown=0x166508c9bb0 select=0x1665091ad60. A zero here means the stock anchor label for that type was not found on this tab (a non-English client will do that), which is why the donor is no longer required to be a learned toggle.
+[0:05:08.171] ok     settings write: VERDICT (revisit tab=graphics) m_text STILL HOLDS 'FOV: [aowlspt]'. The store survived, so this is cause (a) NO REPAINT -- the model is ours and TMP never rebuilt its mesh. The fix is the real setter / a forced mesh update, not the dirty byte.
+[0:05:08.187] ok     settings pages: entry #7 tab='graphics' tabPtr=0x168ca4abc60 on=true off=false pages=1 renderedFor=0x168ca4e3c80 row0.clone=0x168b8f3f540 toggleKlass(before census)=0x16652bd24a0
+[0:05:08.187] ok     settings pages: DECLINED -- pages render only onto the Game tab and this is 'graphics' (expected; open Settings -> Game)
+[0:05:13.000] ok     settings write: VERDICT (revisit tab=sound) m_text STILL HOLDS 'FOV: [aowlspt]'. The store survived, so this is cause (a) NO REPAINT -- the model is ours and TMP never rebuilt its mesh. The fix is the real setter / a forced mesh update, not the dirty byte.
+[0:05:13.000] ok     settings pages: entry #8 tab='sound' tabPtr=0x168ca5cc420 on=true off=false pages=1 renderedFor=0x168ca4e3c80 row0.clone=0x168b8f3f540 toggleKlass(before census)=0x16652bd24a0
+[0:05:13.000] ok     settings pages: DECLINED -- pages render only onto the Game tab and this is 'sound' (expected; open Settings -> Game)
+[0:05:13.140] warn   live inspector: no batch queued for 311s while the rider IS dispatching (43712 fires). polls=18346 reads=1216 readFails=0 unchanged=1215 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:05:13.812] ok     settings probe: tab built -- group=controls (3) tab=0x168c9e0a300 klass=0x16652982f60
+[0:05:13.828] ok     settings probe: tab=controls _createdControls size=6
+[0:05:13.828] ok     settings probe: tab=controls control[0] label='Mouse sensitivity' type=0x1665263ca80 widget=0x16961eed000
+[0:05:13.828] ok     settings probe: tab=controls control[1] label='Mouse sensitivity (aiming)' type=0x1665263ca80 widget=0x16962bd0e40
+[0:05:13.828] ok     settings probe: tab=controls control[2] label='Double click timeout' type=0x1665263ca80 widget=0x16962bd0cc0
+[0:05:13.828] ok     settings probe: tab=controls control[3] label='Scope zoom adjustment sensitivity' type=0x1665263ca80 widget=0x16962bd0b40
+[0:05:13.828] ok     settings probe: tab=controls control[4] label='Inverted X axis' type=0x16652bd24a0 widget=0x16962220dc0
+[0:05:13.828] ok     settings probe: tab=controls control[5] label='Inverted Y axis' type=0x16652bd24a0 widget=0x16962220c80
+[0:05:13.828] ok     settings probe: tab=controls logged 6 controls
+[0:05:13.828] ok     settings probe: controls APPEARED for tab=controls after 0 poll(s) -- walking them now
+[0:05:13.828] ok     settings probe: tab=controls _createdControls size=6
+[0:05:13.828] ok     settings probe: tab=controls control[0] label='Mouse sensitivity' type=0x1665263ca80 widget=0x16961eed000
+[0:05:13.828] ok     settings probe: tab=controls control[1] label='Mouse sensitivity (aiming)' type=0x1665263ca80 widget=0x16962bd0e40
+[0:05:13.828] ok     settings probe: tab=controls control[2] label='Double click timeout' type=0x1665263ca80 widget=0x16962bd0cc0
+[0:05:13.828] ok     settings probe: tab=controls control[3] label='Scope zoom adjustment sensitivity' type=0x1665263ca80 widget=0x16962bd0b40
+[0:05:13.828] ok     settings probe: tab=controls control[4] label='Inverted X axis' type=0x16652bd24a0 widget=0x16962220dc0
+[0:05:13.828] ok     settings probe: tab=controls control[5] label='Inverted Y axis' type=0x16652bd24a0 widget=0x16962220c80
+[0:05:13.828] ok     settings probe: tab=controls logged 6 controls
+[0:05:13.828] ok     settings write: VERDICT (build tab=controls) m_text STILL HOLDS 'FOV: [aowlspt]'. The store survived, so this is cause (a) NO REPAINT -- the model is ours and TMP never rebuilt its mesh. The fix is the real setter / a forced mesh update, not the dirty byte.
+[0:05:13.828] ok     settings write: PHASE 2a tab=controls has no control labelled 'FOV:'; nothing was written (this is expected on every tab but Game)
+[0:05:13.828] ok     settings write: PHASE 2b tab=controls float-slider 'Mouse sensitivity' = 0.700 (range 0.100..5.000)
+[0:05:13.828] ok     settings write: PHASE 2b tab=controls float-slider 'Mouse sensitivity (aiming)' = 0.500 (range 0.100..5.000)
+[0:05:13.828] ok     settings write: PHASE 2b tab=controls float-slider 'Double click timeout' = 0.300 (range 0.300..1.000)
+[0:05:13.828] ok     settings write: PHASE 2b tab=controls float-slider 'Scope zoom adjustment sensitivity' = 1.000 (range 1.000..5.000)
+[0:05:13.828] ok     settings write: PHASE 2b tab=controls toggle 'Inverted X axis' = false
+[0:05:13.828] ok     settings write: PHASE 2b tab=controls toggle 'Inverted Y axis' = false
+[0:05:13.828] ok     settings write: PHASE 2b tab=controls read 2 toggle(s) and 4 float slider(s) live. Read-only.
+[0:05:14.500] ok     mods tab: the MODS panel is showing; 1 stock panel(s) were switched off for it and are switched back on when MODS is deselected
+[0:05:17.671] ok     mods tab: native lifecycle rider hid the MODS panel from the ShowScreen(group=0) postfix -- driven by the game's own tab switch, not the standing check
+[0:05:17.671] ok     settings write: VERDICT (revisit tab=graphics) m_text STILL HOLDS 'FOV: [aowlspt]'. The store survived, so this is cause (a) NO REPAINT -- the model is ours and TMP never rebuilt its mesh. The fix is the real setter / a forced mesh update, not the dirty byte.
+[0:05:19.203] ok     settings write: VERDICT (revisit tab=game) m_text has REVERTED to 'FOV:' (we wrote 'FOV: [aowlspt]'). This is cause (b) OVERWRITE -- LocalizedText re-applied its own string over ours. The relabel is re-applied on every tab visit from this build, so watch whether it now sticks.
+[0:05:19.218] ok     settings write: PHASE 2a tab=game control[17] relabelled 'FOV:' -> 'FOV: [aowlspt]' (tmp=0x168b8fc1000) via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:05:20.828] ok     settings probe: SettingsScreen.Show fired on thread 13416 (host thread 17196); this=0x168ca4cdbd0 -- Unity's main thread
+[0:05:20.937] ok     settings write: VERDICT (revisit tab=game) m_text STILL HOLDS 'FOV: [aowlspt]'. The store survived, so this is cause (a) NO REPAINT -- the model is ours and TMP never rebuilt its mesh. The fix is the real setter / a forced mesh update, not the dirty byte.
+[0:05:20.953] ok     settings write: PHASE 2a tab=game control[17] relabelled 'FOV:' -> 'FOV: [aowlspt]' (tmp=0x16963ea1800) via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:05:28.171] warn   live inspector: no batch queued for 326s while the rider IS dispatching (45414 fires). polls=19241 reads=1276 readFails=0 unchanged=1275 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:05:31.875] ok     settings write: VERDICT (revisit tab=graphics) m_text STILL HOLDS 'FOV: [aowlspt]'. The store survived, so this is cause (a) NO REPAINT -- the model is ours and TMP never rebuilt its mesh. The fix is the real setter / a forced mesh update, not the dirty byte.
+[0:05:43.234] warn   live inspector: no batch queued for 341s while the rider IS dispatching (47196 fires). polls=20138 reads=1336 readFails=0 unchanged=1335 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:05:58.328] warn   live inspector: no batch queued for 357s while the rider IS dispatching (48966 fires). polls=21026 reads=1396 readFails=0 unchanged=1395 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:06:13.375] warn   live inspector: no batch queued for 372s while the rider IS dispatching (50758 fires). polls=21922 reads=1456 readFails=0 unchanged=1455 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:06:28.421] warn   live inspector: no batch queued for 387s while the rider IS dispatching (52550 fires). polls=22820 reads=1516 readFails=0 unchanged=1515 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:06:43.500] warn   live inspector: no batch queued for 402s while the rider IS dispatching (54346 fires). polls=23719 reads=1576 readFails=0 unchanged=1575 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:06:55.484] ok     settings write: VERDICT (revisit tab=sound) m_text STILL HOLDS 'FOV: [aowlspt]'. The store survived, so this is cause (a) NO REPAINT -- the model is ours and TMP never rebuilt its mesh. The fix is the real setter / a forced mesh update, not the dirty byte.
+[0:06:57.671] ok     settings write: VERDICT (revisit tab=graphics) m_text STILL HOLDS 'FOV: [aowlspt]'. The store survived, so this is cause (a) NO REPAINT -- the model is ours and TMP never rebuilt its mesh. The fix is the real setter / a forced mesh update, not the dirty byte.
+[0:06:58.187] ok     settings write: VERDICT (revisit tab=sound) m_text STILL HOLDS 'FOV: [aowlspt]'. The store survived, so this is cause (a) NO REPAINT -- the model is ours and TMP never rebuilt its mesh. The fix is the real setter / a forced mesh update, not the dirty byte.
+[0:06:58.546] warn   live inspector: no batch queued for 417s while the rider IS dispatching (56134 fires). polls=24617 reads=1636 readFails=0 unchanged=1635 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:06:59.078] ok     settings write: VERDICT (revisit tab=controls) m_text STILL HOLDS 'FOV: [aowlspt]'. The store survived, so this is cause (a) NO REPAINT -- the model is ours and TMP never rebuilt its mesh. The fix is the real setter / a forced mesh update, not the dirty byte.
+[0:06:59.687] ok     settings write: VERDICT (revisit tab=game) m_text has REVERTED to 'FOV:' (we wrote 'FOV: [aowlspt]'). This is cause (b) OVERWRITE -- LocalizedText re-applied its own string over ours. The relabel is re-applied on every tab visit from this build, so watch whether it now sticks.
+[0:06:59.703] ok     settings write: PHASE 2a tab=game control[17] relabelled 'FOV:' -> 'FOV: [aowlspt]' (tmp=0x16963ea1800) via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:07:00.203] ok     settings write: VERDICT (revisit tab=sound) m_text STILL HOLDS 'FOV: [aowlspt]'. The store survived, so this is cause (a) NO REPAINT -- the model is ours and TMP never rebuilt its mesh. The fix is the real setter / a forced mesh update, not the dirty byte.
+[0:07:00.562] ok     settings write: VERDICT (revisit tab=controls) m_text STILL HOLDS 'FOV: [aowlspt]'. The store survived, so this is cause (a) NO REPAINT -- the model is ours and TMP never rebuilt its mesh. The fix is the real setter / a forced mesh update, not the dirty byte.
+[0:07:01.546] ok     settings write: VERDICT (revisit tab=sound) m_text STILL HOLDS 'FOV: [aowlspt]'. The store survived, so this is cause (a) NO REPAINT -- the model is ours and TMP never rebuilt its mesh. The fix is the real setter / a forced mesh update, not the dirty byte.
+[0:07:02.578] ok     settings write: VERDICT (revisit tab=controls) m_text STILL HOLDS 'FOV: [aowlspt]'. The store survived, so this is cause (a) NO REPAINT -- the model is ours and TMP never rebuilt its mesh. The fix is the real setter / a forced mesh update, not the dirty byte.
+[0:07:04.515] ok     settings write: VERDICT (revisit tab=graphics) m_text STILL HOLDS 'FOV: [aowlspt]'. The store survived, so this is cause (a) NO REPAINT -- the model is ours and TMP never rebuilt its mesh. The fix is the real setter / a forced mesh update, not the dirty byte.
+[0:07:06.890] ok     settings write: VERDICT (revisit tab=controls) m_text STILL HOLDS 'FOV: [aowlspt]'. The store survived, so this is cause (a) NO REPAINT -- the model is ours and TMP never rebuilt its mesh. The fix is the real setter / a forced mesh update, not the dirty byte.
+[0:07:08.140] ok     settings write: VERDICT (revisit tab=sound) m_text STILL HOLDS 'FOV: [aowlspt]'. The store survived, so this is cause (a) NO REPAINT -- the model is ours and TMP never rebuilt its mesh. The fix is the real setter / a forced mesh update, not the dirty byte.
+[0:07:08.984] ok     settings write: VERDICT (revisit tab=controls) m_text STILL HOLDS 'FOV: [aowlspt]'. The store survived, so this is cause (a) NO REPAINT -- the model is ours and TMP never rebuilt its mesh. The fix is the real setter / a forced mesh update, not the dirty byte.
+[0:07:09.843] ok     settings write: VERDICT (revisit tab=controls) m_text STILL HOLDS 'FOV: [aowlspt]'. The store survived, so this is cause (a) NO REPAINT -- the model is ours and TMP never rebuilt its mesh. The fix is the real setter / a forced mesh update, not the dirty byte.
+[0:07:10.718] ok     settings write: VERDICT (revisit tab=controls) m_text STILL HOLDS 'FOV: [aowlspt]'. The store survived, so this is cause (a) NO REPAINT -- the model is ours and TMP never rebuilt its mesh. The fix is the real setter / a forced mesh update, not the dirty byte.
+[0:07:12.218] ok     settings write: VERDICT (revisit tab=graphics) m_text STILL HOLDS 'FOV: [aowlspt]'. The store survived, so this is cause (a) NO REPAINT -- the model is ours and TMP never rebuilt its mesh. The fix is the real setter / a forced mesh update, not the dirty byte.
+[0:07:13.296] ok     settings write: VERDICT (revisit tab=game) m_text has REVERTED to 'FOV:' (we wrote 'FOV: [aowlspt]'). This is cause (b) OVERWRITE -- LocalizedText re-applied its own string over ours. The relabel is re-applied on every tab visit from this build, so watch whether it now sticks.
+[0:07:13.312] ok     settings write: PHASE 2a tab=game control[17] relabelled 'FOV:' -> 'FOV: [aowlspt]' (tmp=0x16963ea1800) via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:07:13.578] warn   live inspector: no batch queued for 432s while the rider IS dispatching (57736 fires). polls=25511 reads=1696 readFails=0 unchanged=1695 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:07:15.015] ok     settings write: VERDICT (revisit tab=controls) m_text has REVERTED to 'FOV:' (we wrote 'FOV: [aowlspt]'). This is cause (b) OVERWRITE -- LocalizedText re-applied its own string over ours. The relabel is re-applied on every tab visit from this build, so watch whether it now sticks.
+[0:07:16.500] ok     settings write: VERDICT (revisit tab=controls) m_text has REVERTED to 'FOV:' (we wrote 'FOV: [aowlspt]'). This is cause (b) OVERWRITE -- LocalizedText re-applied its own string over ours. The relabel is re-applied on every tab visit from this build, so watch whether it now sticks.
+[0:07:17.296] ok     settings write: VERDICT (revisit tab=sound) m_text has REVERTED to 'FOV:' (we wrote 'FOV: [aowlspt]'). This is cause (b) OVERWRITE -- LocalizedText re-applied its own string over ours. The relabel is re-applied on every tab visit from this build, so watch whether it now sticks.
+[0:07:18.796] ok     settings write: VERDICT (revisit tab=graphics) m_text has REVERTED to 'FOV:' (we wrote 'FOV: [aowlspt]'). This is cause (b) OVERWRITE -- LocalizedText re-applied its own string over ours. The relabel is re-applied on every tab visit from this build, so watch whether it now sticks.
+[0:07:21.828] ok     settings write: VERDICT (revisit tab=graphics) m_text has REVERTED to 'FOV:' (we wrote 'FOV: [aowlspt]'). This is cause (b) OVERWRITE -- LocalizedText re-applied its own string over ours. The relabel is re-applied on every tab visit from this build, so watch whether it now sticks.
+[0:07:25.234] ok     settings write: VERDICT (revisit tab=graphics) m_text has REVERTED to 'FOV:' (we wrote 'FOV: [aowlspt]'). This is cause (b) OVERWRITE -- LocalizedText re-applied its own string over ours. The relabel is re-applied on every tab visit from this build, so watch whether it now sticks.
+[0:07:26.437] ok     settings write: VERDICT (revisit tab=game) m_text has REVERTED to 'FOV:' (we wrote 'FOV: [aowlspt]'). This is cause (b) OVERWRITE -- LocalizedText re-applied its own string over ours. The relabel is re-applied on every tab visit from this build, so watch whether it now sticks.
+[0:07:26.437] ok     settings write: PHASE 2a tab=game control[17] relabelled 'FOV:' -> 'FOV: [aowlspt]' (tmp=0x16963ea1800) via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:07:27.875] ok     settings write: VERDICT (revisit tab=sound) m_text has REVERTED to 'FOV:' (we wrote 'FOV: [aowlspt]'). This is cause (b) OVERWRITE -- LocalizedText re-applied its own string over ours. The relabel is re-applied on every tab visit from this build, so watch whether it now sticks.
+[0:07:28.656] warn   live inspector: no batch queued for 447s while the rider IS dispatching (59360 fires). polls=26409 reads=1756 readFails=0 unchanged=1755 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:07:28.734] ok     settings write: VERDICT (revisit tab=graphics) m_text has REVERTED to 'FOV:' (we wrote 'FOV: [aowlspt]'). This is cause (b) OVERWRITE -- LocalizedText re-applied its own string over ours. The relabel is re-applied on every tab visit from this build, so watch whether it now sticks.
+[0:07:29.921] ok     settings write: VERDICT (revisit tab=game) m_text has REVERTED to 'FOV:' (we wrote 'FOV: [aowlspt]'). This is cause (b) OVERWRITE -- LocalizedText re-applied its own string over ours. The relabel is re-applied on every tab visit from this build, so watch whether it now sticks.
+[0:07:29.937] ok     settings write: PHASE 2a tab=game control[17] relabelled 'FOV:' -> 'FOV: [aowlspt]' (tmp=0x16963ea1800) via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:07:43.703] warn   live inspector: no batch queued for 462s while the rider IS dispatching (61116 fires). polls=27306 reads=1816 readFails=0 unchanged=1815 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:07:58.765] warn   live inspector: no batch queued for 477s while the rider IS dispatching (62908 fires). polls=28206 reads=1876 readFails=0 unchanged=1875 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:08:13.843] warn   live inspector: no batch queued for 492s while the rider IS dispatching (64702 fires). polls=29106 reads=1936 readFails=0 unchanged=1935 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:08:28.906] warn   live inspector: no batch queued for 507s while the rider IS dispatching (66494 fires). polls=30009 reads=1996 readFails=0 unchanged=1995 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:08:43.984] warn   live inspector: no batch queued for 522s while the rider IS dispatching (68288 fires). polls=30909 reads=2056 readFails=0 unchanged=2055 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:08:59.015] warn   live inspector: no batch queued for 537s while the rider IS dispatching (70078 fires). polls=31808 reads=2116 readFails=0 unchanged=2115 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:09:14.078] warn   live inspector: no batch queued for 552s while the rider IS dispatching (71876 fires). polls=32708 reads=2176 readFails=0 unchanged=2175 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:09:29.171] warn   live inspector: no batch queued for 567s while the rider IS dispatching (73678 fires). polls=33610 reads=2236 readFails=0 unchanged=2235 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:09:44.187] warn   live inspector: no batch queued for 582s while the rider IS dispatching (75430 fires). polls=34508 reads=2296 readFails=0 unchanged=2295 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:09:59.265] warn   live inspector: no batch queued for 598s while the rider IS dispatching (77221 fires). polls=35408 reads=2356 readFails=0 unchanged=2355 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:10:14.312] warn   live inspector: no batch queued for 613s while the rider IS dispatching (79002 fires). polls=36306 reads=2416 readFails=0 unchanged=2415 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:10:29.343] warn   live inspector: no batch queued for 628s while the rider IS dispatching (80718 fires). polls=37204 reads=2476 readFails=0 unchanged=2475 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:10:44.406] warn   live inspector: no batch queued for 643s while the rider IS dispatching (82512 fires). polls=38103 reads=2536 readFails=0 unchanged=2535 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:10:59.437] warn   live inspector: no batch queued for 658s while the rider IS dispatching (84304 fires). polls=39001 reads=2596 readFails=0 unchanged=2595 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:11:14.484] warn   live inspector: no batch queued for 673s while the rider IS dispatching (86096 fires). polls=39898 reads=2656 readFails=0 unchanged=2655 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:11:29.562] warn   live inspector: no batch queued for 688s while the rider IS dispatching (87886 fires). polls=40796 reads=2716 readFails=0 unchanged=2715 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:11:44.609] warn   live inspector: no batch queued for 703s while the rider IS dispatching (89678 fires). polls=41693 reads=2776 readFails=0 unchanged=2775 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:11:59.671] warn   live inspector: no batch queued for 718s while the rider IS dispatching (91468 fires). polls=42590 reads=2836 readFails=0 unchanged=2835 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:12:14.734] warn   live inspector: no batch queued for 733s while the rider IS dispatching (93256 fires). polls=43487 reads=2896 readFails=0 unchanged=2895 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:12:29.781] warn   live inspector: no batch queued for 748s while the rider IS dispatching (95048 fires). polls=44384 reads=2956 readFails=0 unchanged=2955 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:12:44.796] warn   live inspector: no batch queued for 763s while the rider IS dispatching (96834 fires). polls=45280 reads=3016 readFails=0 unchanged=3015 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:12:59.875] warn   live inspector: no batch queued for 778s while the rider IS dispatching (98628 fires). polls=46179 reads=3076 readFails=0 unchanged=3075 lastRead=180B lastKnown=180B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:13:09.953] info   live inspector: batch 2 (2 command(s)) handed to Unity's thread; answers land in D:\Aowlspt\aowlspt\aowlspt-inspect-out.txt
+[0:13:09.968] ok     inspect| aowlspt live inspector -- batch 2, 2 command(s), on Unity thread 13416
+[0:13:09.968] ok     inspect| > state
+[0:13:09.968] ok     inspect|   anchors: $preloader=0x0000016852424450 $settings=0x00000168ca4cdbd0
+[0:13:09.968] ok     inspect|   inspector: menu anchor slot=8, in-raid anchor slot=0, dispatches=99825 (of those in-raid=50040)
+[0:13:09.968] ok     inspect|   channel: polls=46778 reads=3116 readFails=0 unchanged=3114 batch=2 ticks=2 faults=0 escapes=1
+[0:13:09.968] ok     inspect|   settings: _currentTab(+0x118)=0x0000000000000000  _initializedTabs(+0x138)=0x00000168c9da9f00
+[0:13:09.968] ok     inspect|   no tab is selected yet (the screen may still be building).
+[0:13:09.968] ok     inspect| > echo aowl-batch-815189
+[0:13:09.968] ok     inspect|   aowl-batch-815189
+[0:13:09.968] ok     inspect| aowlspt live inspector -- batch 2 complete, 9 line(s)
+[0:13:12.734] info   live inspector: batch 3 (5 command(s)) handed to Unity's thread; answers land in D:\Aowlspt\aowlspt\aowlspt-inspect-out.txt
+[0:13:12.906] ok     inspect| aowlspt live inspector -- batch 3, 5 command(s), on Unity thread 13416
+[0:13:12.906] ok     inspect| > open
+[0:13:12.906] ok     inspect|   ! open REFUSED: this batch has not said `allow write`. Nothing was called and nothing on screen changed. Put `allow write` on a line before this one.
+[0:13:12.906] ok     inspect| > tab $settings 1
+[0:13:12.906] ok     inspect|   ! tab REFUSED: this batch has not said `allow write`. Nothing was called and nothing on screen changed. Put `allow write` on a line before this one.
+[0:13:12.906] ok     inspect|   wait: waiting up to 20 frame(s)
+[0:13:12.906] ok     inspect| > state
+[0:13:12.906] ok     inspect|   anchors: $preloader=0x0000016852424450 $settings=0x00000168ca4cdbd0
+[0:13:12.906] ok     inspect|   inspector: menu anchor slot=8, in-raid anchor slot=0, dispatches=100174 (of those in-raid=50214)
+[0:13:12.906] ok     inspect|   channel: polls=46952 reads=3127 readFails=0 unchanged=3124 batch=3 ticks=3 faults=0 escapes=1
+[0:13:12.906] ok     inspect|   settings: _currentTab(+0x118)=0x0000000000000000  _initializedTabs(+0x138)=0x00000168c9da9f00
+[0:13:12.906] ok     inspect|   no tab is selected yet (the screen may still be building).
+[0:13:12.906] ok     inspect| > echo aowl-batch-817856
+[0:13:12.906] ok     inspect|   aowl-batch-817856
+[0:13:12.906] ok     inspect| aowlspt live inspector -- batch 3 complete, 14 line(s)
+[0:13:15.250] info   live inspector: batch 4 (6 command(s)) handed to Unity's thread; answers land in D:\Aowlspt\aowlspt\aowlspt-inspect-out.txt
+[0:13:15.265] ok     inspect| aowlspt live inspector -- batch 4, 6 command(s), on Unity thread 13416
+[0:13:15.265] ok     inspect| > allow write
+[0:13:15.265] ok     inspect|   writes and calls are armed FOR THIS BATCH ONLY
+[0:13:15.265] ok     inspect| > open
+[0:13:15.265] ok     inspect|   via EFT.UI.SettingsScreen::ShowScreen @0x720de0 (call) on 0x00000168ca4cdbd0, group=0
+[0:13:15.265] ok     inspect|   !! batch 4 ESCAPED its guard during command 2 (open) -- it did not return normally. LAST HOP: SettingsScreen::ShowScreen  at 0x00000168ca4cdbd0
+[0:13:15.265] ok     inspect|   !! the channel has been recovered; whatever ran before the escape is above. Escapes this session: 2
+[0:13:25.250] warn   live inspector: no batch queued for 10s while the rider IS dispatching (101642 fires). polls=47689 reads=3177 readFails=0 unchanged=3173 lastRead=78B lastKnown=78B pending=0 batch=4 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:13:40.296] warn   live inspector: no batch queued for 25s while the rider IS dispatching (103432 fires). polls=48585 reads=3237 readFails=0 unchanged=3233 lastRead=78B lastKnown=78B pending=0 batch=4 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:13:43.078] info   live inspector: batch 5 (2 command(s)) handed to Unity's thread; answers land in D:\Aowlspt\aowlspt\aowlspt-inspect-out.txt
+[0:13:43.093] ok     inspect| aowlspt live inspector -- batch 5, 2 command(s), on Unity thread 13416
+[0:13:43.093] ok     inspect| > state
+[0:13:43.093] ok     inspect|   anchors: $preloader=0x0000016852424450 $settings=0x00000168ca4cdbd0
+[0:13:43.093] ok     inspect|   inspector: menu anchor slot=8, in-raid anchor slot=0, dispatches=103763 (of those in-raid=52009)
+[0:13:43.093] ok     inspect|   channel: polls=48750 reads=3248 readFails=0 unchanged=3243 batch=5 ticks=5 faults=0 escapes=2
+[0:13:43.093] ok     inspect|   settings: _currentTab(+0x118)=0x0000000000000000  _initializedTabs(+0x138)=0x00000168c9da9f00
+[0:13:43.093] ok     inspect|   no tab is selected yet (the screen may still be building).
+[0:13:43.093] ok     inspect| > echo aowl-batch-848136
+[0:13:43.093] ok     inspect|   aowl-batch-848136
+[0:13:43.093] ok     inspect| aowlspt live inspector -- batch 5 complete, 9 line(s)
+[0:13:46.312] info   live inspector: batch 6 (2 command(s)) handed to Unity's thread; answers land in D:\Aowlspt\aowlspt\aowlspt-inspect-out.txt
+[0:13:46.328] ok     inspect| aowlspt live inspector -- batch 6, 2 command(s), on Unity thread 13416
+[0:13:46.328] ok     inspect| > help
+[0:13:46.328] ok     inspect|   aowlspt live inspector -- commands (addresses are EXPR, see below)
+[0:13:46.328] ok     inspect|     anchors                       list named anchors + variables
+[0:13:46.328] ok     inspect|     let NAME EXPR                 bind a name to an address
+[0:13:46.328] ok     inspect|     read EXPR TYPE                typed read
+[0:13:46.328] ok     inspect|     write EXPR TYPE VALUE         typed write (needs `allow write`)
+[0:13:46.328] ok     inspect|     dump EXPR [N]                 N raw bytes, hex + ascii
+[0:13:46.328] ok     inspect|     fields EXPR [N]               per-8-byte-slot guess table
+[0:13:46.328] ok     inspect|     scan EXPR N TYPE VALUE        find the offset of a value
+[0:13:46.328] ok     inspect|     parent EXPR [DEPTH]           walk the Transform parent chain
+[0:13:46.328] ok     inspect|     canvas EXPR                   the Graphic's cached Canvas + its mode
+[0:13:46.328] ok     inspect|     call TARGET SIG [ARG..]       direct RVA call (needs `allow write`)
+[0:13:46.328] ok     inspect|     targets [SUBSTR]              list byte-verified call targets
+[0:13:46.328] ok     inspect|   -- state + navigation (navigation needs `allow write`) --
+[0:13:46.328] ok     inspect|     state | where                 what screen/tab is up RIGHT NOW
+[0:13:46.328] ok     inspect|                                   e.g.  state
+[0:13:46.328] ok     inspect|     wait N                        park the batch for N frames
+[0:13:46.328] ok     inspect|                                   e.g.  wait 10
+[0:13:46.328] ok     inspect|     until EXPR [FRAMES]           park until the ptr at EXPR is non-0
+[0:13:46.328] ok     inspect|                                   e.g.  until $settings+0x118 120
+[0:13:46.328] ok     inspect|     open [GROUP]                  SettingsScreen::ShowScreen (async!)
+[0:13:46.328] ok     inspect|                                   e.g.  allow write | open 0
+[0:13:46.328] ok     inspect|     tab EXPR [0|1]                SettingsTab::set_IsSelected
+[0:13:46.328] ok     inspect|   -- hierarchy (children/find are READ-ONLY; click/invoke need write) --
+[0:13:46.328] ok     inspect|     children EXPR [N]             list child transforms, bind $c0..$cN
+[0:13:46.328] ok     inspect|                                   e.g.  children $preloader
+[0:13:46.328] ok     inspect|     tree EXPR [DEPTH]             the subtree, indented (learn names)
+[0:13:46.328] ok     inspect|                                   e.g.  tree $preloader 3
+[0:13:46.328] ok     inspect|     roots                         every scene root -> $r0..$rN
+[0:13:46.328] ok     inspect|                                   e.g.  roots
+[0:13:46.328] ok     inspect|     find NAME [ROOT] [BUDGET]     name search; NO ROOT = ALL scenes
+[0:13:46.328] ok     inspect|     find NAME in ROOTNAME         narrow by a root named, not pointed
+[0:13:46.328] ok     inspect|     find more [BUDGET]            RESUME a search that hit its cap
+[0:13:46.328] ok     inspect|     findtext SUBSTR [ROOT] [BUDGET] [all]  TEXT A CONTROL DISPLAYS
+[0:13:46.328] ok     inspect|                                   (TMP_Text only), not GameObject name
+[0:13:46.328] ok     inspect|                                   ACTIVE nodes only by default; `all`
+[0:13:46.328] ok     inspect|                                   includes inactive (unpressable) hits
+[0:13:46.328] ok     inspect|     findtext more [BUDGET]        RESUME a text search that hit its cap
+[0:13:46.328] ok     inspect|     component EXPR TypeName       GameObject/Transform -> component
+[0:13:46.328] ok     inspect|     components EXPR [BaseType]    LIST every component, named  -> $k0..
+[0:13:46.328] ok     inspect|                                   e.g.  component $g0 Button   -> $comp
+[0:13:46.328] ok     inspect|     rect EXPR                     RectTransform geometry probe
+[0:13:46.328] ok     inspect|     label EXPR                    TMP_Text.m_text as a field read
+[0:13:46.328] ok     inspect|     settext EXPR TEXT...          WRITE a label, via the real setters
+[0:13:46.328] ok     inspect|                                   e.g.  find PvE
+[0:13:46.328] ok     inspect|     press EXPR [OFF]              EFT DefaultUIButton.OnClick (+0x120)
+[0:13:46.328] ok     inspect|     click EXPR                    Button::Press (checks interactable)
+[0:13:46.328] ok     inspect|                                   e.g.  allow write | click $f1
+[0:13:46.328] ok     inspect|     invoke EXPR                   fire m_OnClick directly, no checks
+[0:13:46.328] ok     inspect|                                   e.g.  tab $settings@0x118 1
+[0:13:46.328] ok     inspect|     image                         GameAssembly base + il2cpp section
+[0:13:46.328] ok     inspect|     allow write                   arm writes/calls for this batch
+[0:13:46.328] ok     inspect|     echo TEXT                     put a marker in the output
+[0:13:46.328] ok     inspect|   TYPE  i8 u8 i16 u16 i32 u32 i64 u64 f32 f64 ptr bool str klass
+[0:13:46.343] ok     inspect|   EXPR  ATOM ( +0xNN | @0xNN )*   `+` moves, `@` DEREFERENCES
+[0:13:46.343] ok     inspect|         ATOM is 0x<hex>, a decimal, or $name
+[0:13:46.343] ok     inspect|         e.g.  $preloader@0x20        the version label
+[0:13:46.343] ok     inspect|               $verlabel+0xe0         where TMP.m_text lives
+[0:13:46.343] ok     inspect|   TARGET  name:<substring>  or  rva:0x<hex>[/<expected prologue hex>]
+[0:13:46.343] ok     inspect|   SIG     <ret>_<args>, ret in v/b/i/l/p/f/s, args in p/i/b/f/l
+[0:13:46.343] ok     inspect|         e.g.  s_p   String return, one pointer argument (get_name)
+[0:13:46.343] ok     inspect| > echo aowl-batch-851416
+[0:13:46.343] ok     inspect|   aowl-batch-851416
+[0:13:46.343] ok     inspect| aowlspt live inspector -- batch 6 complete, 64 line(s)
+[0:13:49.328] info   live inspector: batch 7 (2 command(s)) handed to Unity's thread; answers land in D:\Aowlspt\aowlspt\aowlspt-inspect-out.txt
+[0:13:49.343] ok     inspect| aowlspt live inspector -- batch 7, 2 command(s), on Unity thread 13416
+[0:13:49.343] ok     inspect| > help
+[0:13:49.343] ok     inspect|   aowlspt live inspector -- commands (addresses are EXPR, see below)
+[0:13:49.343] ok     inspect|     anchors                       list named anchors + variables
+[0:13:49.343] ok     inspect|     let NAME EXPR                 bind a name to an address
+[0:13:49.343] ok     inspect|     read EXPR TYPE                typed read
+[0:13:49.343] ok     inspect|     write EXPR TYPE VALUE         typed write (needs `allow write`)
+[0:13:49.343] ok     inspect|     dump EXPR [N]                 N raw bytes, hex + ascii
+[0:13:49.343] ok     inspect|     fields EXPR [N]               per-8-byte-slot guess table
+[0:13:49.343] ok     inspect|     scan EXPR N TYPE VALUE        find the offset of a value
+[0:13:49.343] ok     inspect|     parent EXPR [DEPTH]           walk the Transform parent chain
+[0:13:49.343] ok     inspect|     canvas EXPR                   the Graphic's cached Canvas + its mode
+[0:13:49.343] ok     inspect|     call TARGET SIG [ARG..]       direct RVA call (needs `allow write`)
+[0:13:49.343] ok     inspect|     targets [SUBSTR]              list byte-verified call targets
+[0:13:49.343] ok     inspect|   -- state + navigation (navigation needs `allow write`) --
+[0:13:49.343] ok     inspect|     state | where                 what screen/tab is up RIGHT NOW
+[0:13:49.343] ok     inspect|                                   e.g.  state
+[0:13:49.343] ok     inspect|     wait N                        park the batch for N frames
+[0:13:49.343] ok     inspect|                                   e.g.  wait 10
+[0:13:49.343] ok     inspect|     until EXPR [FRAMES]           park until the ptr at EXPR is non-0
+[0:13:49.343] ok     inspect|                                   e.g.  until $settings+0x118 120
+[0:13:49.343] ok     inspect|     open [GROUP]                  SettingsScreen::ShowScreen (async!)
+[0:13:49.343] ok     inspect|                                   e.g.  allow write | open 0
+[0:13:49.343] ok     inspect|     tab EXPR [0|1]                SettingsTab::set_IsSelected
+[0:13:49.343] ok     inspect|   -- hierarchy (children/find are READ-ONLY; click/invoke need write) --
+[0:13:49.343] ok     inspect|     children EXPR [N]             list child transforms, bind $c0..$cN
+[0:13:49.343] ok     inspect|                                   e.g.  children $preloader
+[0:13:49.343] ok     inspect|     tree EXPR [DEPTH]             the subtree, indented (learn names)
+[0:13:49.343] ok     inspect|                                   e.g.  tree $preloader 3
+[0:13:49.343] ok     inspect|     roots                         every scene root -> $r0..$rN
+[0:13:49.343] ok     inspect|                                   e.g.  roots
+[0:13:49.343] ok     inspect|     find NAME [ROOT] [BUDGET]     name search; NO ROOT = ALL scenes
+[0:13:49.343] ok     inspect|     find NAME in ROOTNAME         narrow by a root named, not pointed
+[0:13:49.343] ok     inspect|     find more [BUDGET]            RESUME a search that hit its cap
+[0:13:49.359] ok     inspect|     findtext SUBSTR [ROOT] [BUDGET] [all]  TEXT A CONTROL DISPLAYS
+[0:13:49.359] ok     inspect|                                   (TMP_Text only), not GameObject name
+[0:13:49.359] ok     inspect|                                   ACTIVE nodes only by default; `all`
+[0:13:49.359] ok     inspect|                                   includes inactive (unpressable) hits
+[0:13:49.359] ok     inspect|     findtext more [BUDGET]        RESUME a text search that hit its cap
+[0:13:49.359] ok     inspect|     component EXPR TypeName       GameObject/Transform -> component
+[0:13:49.359] ok     inspect|     components EXPR [BaseType]    LIST every component, named  -> $k0..
+[0:13:49.359] ok     inspect|                                   e.g.  component $g0 Button   -> $comp
+[0:13:49.359] ok     inspect|     rect EXPR                     RectTransform geometry probe
+[0:13:49.359] ok     inspect|     label EXPR                    TMP_Text.m_text as a field read
+[0:13:49.359] ok     inspect|     settext EXPR TEXT...          WRITE a label, via the real setters
+[0:13:49.359] ok     inspect|                                   e.g.  find PvE
+[0:13:49.359] ok     inspect|     press EXPR [OFF]              EFT DefaultUIButton.OnClick (+0x120)
+[0:13:49.359] ok     inspect|     click EXPR                    Button::Press (checks interactable)
+[0:13:49.359] ok     inspect|                                   e.g.  allow write | click $f1
+[0:13:49.359] ok     inspect|     invoke EXPR                   fire m_OnClick directly, no checks
+[0:13:49.359] ok     inspect|                                   e.g.  tab $settings@0x118 1
+[0:13:49.359] ok     inspect|     image                         GameAssembly base + il2cpp section
+[0:13:49.359] ok     inspect|     allow write                   arm writes/calls for this batch
+[0:13:49.359] ok     inspect|     echo TEXT                     put a marker in the output
+[0:13:49.359] ok     inspect|   TYPE  i8 u8 i16 u16 i32 u32 i64 u64 f32 f64 ptr bool str klass
+[0:13:49.359] ok     inspect|   EXPR  ATOM ( +0xNN | @0xNN )*   `+` moves, `@` DEREFERENCES
+[0:13:49.359] ok     inspect|         ATOM is 0x<hex>, a decimal, or $name
+[0:13:49.359] ok     inspect|         e.g.  $preloader@0x20        the version label
+[0:13:49.359] ok     inspect|               $verlabel+0xe0         where TMP.m_text lives
+[0:13:49.359] ok     inspect|   TARGET  name:<substring>  or  rva:0x<hex>[/<expected prologue hex>]
+[0:13:49.359] ok     inspect|   SIG     <ret>_<args>, ret in v/b/i/l/p/f/s, args in p/i/b/f/l
+[0:13:49.359] ok     inspect|         e.g.  s_p   String return, one pointer argument (get_name)
+[0:13:49.359] ok     inspect| > echo aowl-batch-854458
+[0:13:49.359] ok     inspect|   aowl-batch-854458
+[0:13:49.359] ok     inspect| aowlspt live inspector -- batch 7 complete, 64 line(s)
+[0:13:53.328] info   live inspector: batch 8 (5 command(s)) handed to Unity's thread; answers land in D:\Aowlspt\aowlspt\aowlspt-inspect-out.txt
+[0:13:53.343] ok     inspect| aowlspt live inspector -- batch 8, 5 command(s), on Unity thread 13416
+[0:13:53.343] ok     inspect| > allow write
+[0:13:53.343] ok     inspect|   writes and calls are armed FOR THIS BATCH ONLY
+[0:13:53.343] ok     inspect| > open 1
+[0:13:53.343] ok     inspect|   via EFT.UI.SettingsScreen::ShowScreen @0x720de0 (call) on 0x00000168ca4cdbd0, group=1
+[0:13:53.343] ok     inspect|   !! batch 8 ESCAPED its guard during command 2 (open 1) -- it did not return normally. LAST HOP: SettingsScreen::ShowScreen  at 0x00000168ca4cdbd0
+[0:13:53.343] ok     inspect|   !! the channel has been recovered; whatever ran before the escape is above. Escapes this session: 3
+[0:14:03.359] warn   live inspector: no batch queued for 10s while the rider IS dispatching (106178 fires). polls=49958 reads=3329 readFails=0 unchanged=3321 lastRead=64B lastKnown=64B pending=0 batch=8 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:14:18.453] warn   live inspector: no batch queued for 25s while the rider IS dispatching (107970 fires). polls=50857 reads=3389 readFails=0 unchanged=3381 lastRead=64B lastKnown=64B pending=0 batch=8 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:14:33.500] warn   live inspector: no batch queued for 40s while the rider IS dispatching (109758 fires). polls=51754 reads=3449 readFails=0 unchanged=3441 lastRead=64B lastKnown=64B pending=0 batch=8 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:14:36.765] info   live inspector: batch 9 (2 command(s)) handed to Unity's thread; answers land in D:\Aowlspt\aowlspt\aowlspt-inspect-out.txt
+[0:14:36.781] ok     inspect| aowlspt live inspector -- batch 9, 2 command(s), on Unity thread 13416
+[0:14:36.781] ok     inspect| > where
+[0:14:36.781] ok     inspect|   anchors: $preloader=0x0000016852424450 $settings=0x00000168ca4cdbd0
+[0:14:36.781] ok     inspect|   inspector: menu anchor slot=8, in-raid anchor slot=0, dispatches=110149 (of those in-raid=55202)
+[0:14:36.781] ok     inspect|   channel: polls=51948 reads=3462 readFails=0 unchanged=3453 batch=9 ticks=9 faults=0 escapes=3
+[0:14:36.781] ok     inspect|   settings: _currentTab(+0x118)=0x0000000000000000  _initializedTabs(+0x138)=0x00000168c9da9f00
+[0:14:36.781] ok     inspect|   no tab is selected yet (the screen may still be building).
+[0:14:36.781] ok     inspect| > echo aowl-batch-901880
+[0:14:36.781] ok     inspect|   aowl-batch-901880
+[0:14:36.781] ok     inspect| aowlspt live inspector -- batch 9 complete, 9 line(s)
+[0:14:42.781] info   live inspector: batch 10 (2 command(s)) handed to Unity's thread; answers land in D:\Aowlspt\aowlspt\aowlspt-inspect-out.txt
+[0:14:42.796] ok     inspect| aowlspt live inspector -- batch 10, 2 command(s), on Unity thread 13416
+[0:14:42.796] ok     inspect| > find Graphics Settings in Common UI
+[0:14:42.796] ok     inspect|   ! not an address: Settings
+[0:14:42.796] ok     inspect| > echo aowl-batch-907805
+[0:14:42.796] ok     inspect|   aowl-batch-907805
+[0:14:42.796] ok     inspect| aowlspt live inspector -- batch 10 complete, 5 line(s)
+[0:14:52.812] warn   live inspector: no batch queued for 10s while the rider IS dispatching (112028 fires). polls=52891 reads=3526 readFails=0 unchanged=3516 lastRead=67B lastKnown=67B pending=0 batch=10 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:15:07.875] warn   live inspector: no batch queued for 25s while the rider IS dispatching (113756 fires). polls=53776 reads=3586 readFails=0 unchanged=3576 lastRead=67B lastKnown=67B pending=0 batch=10 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:15:22.921] warn   live inspector: no batch queued for 40s while the rider IS dispatching (115550 fires). polls=54673 reads=3646 readFails=0 unchanged=3636 lastRead=67B lastKnown=67B pending=0 batch=10 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:15:37.984] warn   live inspector: no batch queued for 55s while the rider IS dispatching (117342 fires). polls=55569 reads=3706 readFails=0 unchanged=3696 lastRead=67B lastKnown=67B pending=0 batch=10 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:15:53.031] warn   live inspector: no batch queued for 70s while the rider IS dispatching (119108 fires). polls=56453 reads=3766 readFails=0 unchanged=3756 lastRead=67B lastKnown=67B pending=0 batch=10 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:16:08.078] warn   live inspector: no batch queued for 85s while the rider IS dispatching (120900 fires). polls=57350 reads=3826 readFails=0 unchanged=3816 lastRead=67B lastKnown=67B pending=0 batch=10 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:16:23.125] warn   live inspector: no batch queued for 100s while the rider IS dispatching (122694 fires). polls=58247 reads=3886 readFails=0 unchanged=3876 lastRead=67B lastKnown=67B pending=0 batch=10 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:16:38.187] warn   live inspector: no batch queued for 115s while the rider IS dispatching (124490 fires). polls=59145 reads=3946 readFails=0 unchanged=3936 lastRead=67B lastKnown=67B pending=0 batch=10 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:16:53.250] warn   live inspector: no batch queued for 130s while the rider IS dispatching (126288 fires). polls=60044 reads=4006 readFails=0 unchanged=3996 lastRead=67B lastKnown=67B pending=0 batch=10 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:17:08.281] warn   live inspector: no batch queued for 145s while the rider IS dispatching (128060 fires). polls=60929 reads=4066 readFails=0 unchanged=4056 lastRead=67B lastKnown=67B pending=0 batch=10 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:17:23.359] warn   live inspector: no batch queued for 160s while the rider IS dispatching (129812 fires). polls=61818 reads=4126 readFails=0 unchanged=4116 lastRead=67B lastKnown=67B pending=0 batch=10 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:17:38.390] warn   live inspector: no batch queued for 175s while the rider IS dispatching (131602 fires). polls=62714 reads=4186 readFails=0 unchanged=4176 lastRead=67B lastKnown=67B pending=0 batch=10 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:17:53.437] warn   live inspector: no batch queued for 190s while the rider IS dispatching (133382 fires). polls=63610 reads=4246 readFails=0 unchanged=4236 lastRead=67B lastKnown=67B pending=0 batch=10 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:18:08.515] warn   live inspector: no batch queued for 205s while the rider IS dispatching (135180 fires). polls=64514 reads=4306 readFails=0 unchanged=4296 lastRead=67B lastKnown=67B pending=0 batch=10 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:18:23.546] warn   live inspector: no batch queued for 220s while the rider IS dispatching (136974 fires). polls=65414 reads=4366 readFails=0 unchanged=4356 lastRead=67B lastKnown=67B pending=0 batch=10 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:18:38.796] warn   live inspector: no batch queued for 236s while the rider IS dispatching (138792 fires). polls=66328 reads=4427 readFails=0 unchanged=4417 lastRead=67B lastKnown=67B pending=0 batch=10 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:18:53.906] warn   live inspector: no batch queued for 251s while the rider IS dispatching (140594 fires). polls=67235 reads=4487 readFails=0 unchanged=4477 lastRead=67B lastKnown=67B pending=0 batch=10 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:19:08.968] warn   live inspector: no batch queued for 266s while the rider IS dispatching (142390 fires). polls=68139 reads=4547 readFails=0 unchanged=4537 lastRead=67B lastKnown=67B pending=0 batch=10 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:19:24.046] warn   live inspector: no batch queued for 281s while the rider IS dispatching (144190 fires). polls=69044 reads=4607 readFails=0 unchanged=4597 lastRead=67B lastKnown=67B pending=0 batch=10 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:19:39.078] warn   live inspector: no batch queued for 296s while the rider IS dispatching (145986 fires). polls=69947 reads=4667 readFails=0 unchanged=4657 lastRead=67B lastKnown=67B pending=0 batch=10 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:19:54.109] warn   live inspector: no batch queued for 311s while the rider IS dispatching (147778 fires). polls=70849 reads=4727 readFails=0 unchanged=4717 lastRead=67B lastKnown=67B pending=0 batch=10 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:20:09.125] warn   live inspector: no batch queued for 326s while the rider IS dispatching (149570 fires). polls=71751 reads=4787 readFails=0 unchanged=4777 lastRead=67B lastKnown=67B pending=0 batch=10 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:20:24.203] warn   live inspector: no batch queued for 341s while the rider IS dispatching (151370 fires). polls=72664 reads=4847 readFails=0 unchanged=4837 lastRead=67B lastKnown=67B pending=0 batch=10 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:20:39.218] warn   live inspector: no batch queued for 356s while the rider IS dispatching (153162 fires). polls=73575 reads=4907 readFails=0 unchanged=4897 lastRead=67B lastKnown=67B pending=0 batch=10 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:20:54.265] warn   live inspector: no batch queued for 371s while the rider IS dispatching (154932 fires). polls=74473 reads=4967 readFails=0 unchanged=4957 lastRead=67B lastKnown=67B pending=0 batch=10 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt

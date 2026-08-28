@@ -1,0 +1,601 @@
+aowlspt-host-il2cpp 0.1.0
+directory D:\Aowlspt\aowlspt
+thread 16580
+
+[0:00:00.000] ok     BSG's BattlEye service guard is answered from inside the process (4 import slots); BattlEye is not installed, started or loaded
+[0:00:00.016] info   nameIndex: aowlspt-names.idx is parsed and STAGED (373616 entries), but its build stamp is NOT verified yet: GameAssembly.dll is not mapped yet -- GetModuleHandleA(GameAssembly.dll) returned NULL, which at DLL-attach is EXPECTED and is NOT a header-read failure. The index file is parsed and STAGED; its build stamp is verified at first use, and nothing resolves through it until then. No address from it is usable until the stamp matches.
+[0:00:00.016] info   botDiag is set: a READ-ONLY detour on EFT.GameWorld.RegisterPlayer will log each bot/player registration and enumerate the registered list (nickname, side/role, alive-state, position) during an offline raid -- it answers spawned-but-frozen vs absent. NO write is performed.
+[0:00:00.016] info   unlimitedBots is set: a kind=6 detour on EFT.BotSpawner.AddPlayer will poke BotSpawner.MaxBots=0 (unlimited) once at offline-raid init, lifting the cap that defers the scav wave pool (bosses bypass it via IgnoreMaxBots; scavs do not). One guarded int32 write on the Unity thread; fail-safe -- no write if the build/pointer does not check out.
+[0:00:00.016] info   settingsUiProbe is set: read-only detours on SettingsScreen.Show (Phase 1, arming/thread proof) and a POSTFIX on SettingsScreen.EnsureTabInitialized (Phase 1.5, the walk that reads controls -- they do not exist yet at Show) will log every control's label, il2cpp klass pointer and value-widget pointer as each tab is built. Open Settings and click each tab. NO write is ever performed.
+[0:00:00.016] info   settingsRelabelProbe is set: PHASE 2a. On the ShowScreen postfix the host finds the Game-tab control whose stock label is 'FOV:' and rewrites it to 'FOV: [aowlspt]' -- one il2cpp_string_new, one raw store into m_text (+0xE0), one dirty byte (+0x378), which is the same primitive the version brand and the F3 overlay use in production. Idempotent (it never double-brands) and self-disabling after two faults. Open Settings -> Game and read the FOV row.
+[0:00:00.016] info   settingsBindProbe is set: PHASE 2b. On the same postfix the host READS the live value out of every control whose widget type it has learned this session -- a toggle's m_IsOn (+0x120) and a float slider's Slider.m_Value (+0x120) with its range -- and logs each beside its label, so the offsets can be checked against what the screen actually shows. NO value is written.
+[0:00:00.016] warn   settingsNativeLifecycle is set but settingsModsTab is not -- there is no MODS tab for it to drive, so this does nothing
+[0:00:00.016] info   debugUi/debugEsp is set: a per-frame detour on EFT.UI.PreloaderUI.Update (the Unity main thread) will draw a Minecraft-F3-style info panel and in-world markers over every registered AI bot out of Unity UI labels CLONED from the client's own version label (Object::Instantiate -- no reflection, no object creation). Press F3 in game to toggle it; layout is aowlspt-debugui.json and is re-read on every toggle-on, so it can be edited live. The whole body is VEH-guarded and writes only into labels it created.
+[0:00:00.016] info   uxMenuModeText is set: a postfix detour on EFT.UI.PreloaderUI.Update will set the menu's bottom-right corner label by CALLING the game's own PreloaderUI.SetGameModeText. The text comes from the backend's `menuModeText` on the mod-sync poll, which defaults to the logged-in character's name. It needs backendPort + modSyncMs. It SHARES the PreloaderUI.Update detour with debugUi/debugEsp -- one detour, one trampoline, both features dispatched from the same firing -- so all three flags can be on at once.
+[0:00:00.016] info   liveInspector is set: drop commands into aowlspt-inspect.txt beside this DLL and every save with changed content runs them ON UNITY'S MAIN THREAD, with answers in aowlspt-inspect-out.txt and in this log -- no rebuild, no restart. Start with `help` and `anchors`. Every hop is VirtualQuery-guarded, every command runs under its own VEH guard, and a caught fault reports THE LAST HOP ATTEMPTED and its pointer. Reads only unless liveInspectorWrite is also set. liveInspectorWrite IS set: a batch containing `allow write` may store into live managed objects and CALL game code.
+[0:00:00.016] info   uxVersionBrand is set: the host polls for <PreloaderUI>/BottomPanel/Content/UpperPart/AlphaLabel -- the label actually on screen -- and rewrites it to "aowlspt <ver>, aoughwl.com  -  tarkov <ver> | <mode>", carrying both halves of the stock text through. It REFUSES to write to a label whose text reads empty, because an empty label is the fingerprint of the wrong object. It rides the shared PreloaderUI::Update detour on a 120-frame throttle and gives up after 8 applies.
+[0:00:00.016] info   uxHideSeasons is set: the host switches off Common UI/MenuScreen/SeasonsButton -- the KORD BREACH / Season banner above Play -- because seasons do not apply to single-player. It is found STRUCTURALLY (the banner carries no matching text at all) and re-checked on a 120-frame throttle so a menu rebuild is hidden again. It only ever sets active=false, never true, and it does nothing at all if that child is not there.
+[0:00:00.016] info   uxVersionBrand is set: a postfix detour on PreloaderUI.Awake will probe the version label on the Unity thread (read-only: logs thread, readability, class, and String fields; no managed write) (fail-safe: unbranded if the build or timing does not match)
+[0:00:00.016] ok     imageCdnRedirect is set: getaddrinfo hooked (GetAddrInfoW getaddrinfo ); s3-*.escapefromtarkov.com -> 127.0.0.1, and every resolved host is logged once to confirm the real image host
+[0:00:00.016] info   waiting for the IL2CPP runtime (up to 120s)
+[0:00:01.047] ok     il2cpp_init returned 1 after 900ms
+[0:00:01.047] ok     IL2CPP is up after 900ms: il2cpp_init returned 1 and was handed out 2 time(s)
+[0:00:01.047] ok     IL2CPP runtime bound, all essential entry points present
+[0:00:01.047] ok     anti-cheat: BE client validation gate neutered (2/2 patches)
+[0:00:01.047] ok     exit fix: confirmed Exit redirected to ExitProcess(0) (2/2 sites; primary = the confirm-accept lambda, before the async exit-loading shutdown that was hanging)
+[0:00:01.047] info   exit fix: game window not up yet; the OS-close hooks will be installed from the host tick loop once the UI thread exists (Exit button is already patched)
+[0:00:01.047] info   146 assemblies loaded
+[0:00:01.047] info   31282 types visible
+[0:00:01.047] ok     prologue snapshot: captured the original bytes of 52 target(s) before any detour was installed (52 primed). Every later prologue check compares against this, not against live memory, so two features may share one target and both still verify it.
+[0:00:01.047] info   deep-probe: MethodInfo for EFT.TarkovApplication::Update is not readable
+[0:00:01.047] info   name index: EFT.TarkovApplication::Update at il2cpp+0x977b10 is reached by this method ONLY (share count 1), so a detour here has no other callers to hit.
+[0:00:01.047] info   name index: EFT.TarkovApplication::Update -> il2cpp+0x977b10; handing it to the by-RVA binder for prologue/section verification
+[0:00:01.047] warn   patch-by-RVA EFT.TarkovApplication::Update: NO prologue signature was declared, so NOTHING was byte-compared. il2cpp+0x977b10 passed the module, code-page and il2cpp-section checks only. Append the !<hex> suffix to the spec to have its original bytes verified.
+[0:00:01.047] warn   name index: binding the drain for EFT.TarkovApplication::Update at il2cpp+0x977b10, from the offline index (nameIndex is set). The address came from metadata, not from the runtime, and the by-RVA binder byte-verified its prologue.
+[0:00:01.047] ok     main-thread bound to EFT.TarkovApplication::Update (16 bytes)
+[0:00:01.047] info   deep-probe: MethodInfo for OnRenderObjectManager::OnRenderObject is not readable
+[0:00:01.047] info   name index: OnRenderObjectManager::OnRenderObject at il2cpp+0x1f46910 is reached by this method ONLY (share count 1), so a detour here has no other callers to hit.
+[0:00:01.047] info   name index: OnRenderObjectManager::OnRenderObject -> il2cpp+0x1f46910; handing it to the by-RVA binder for prologue/section verification
+[0:00:01.047] warn   patch-by-RVA OnRenderObjectManager::OnRenderObject: NO prologue signature was declared, so NOTHING was byte-compared. il2cpp+0x1f46910 passed the module, code-page and il2cpp-section checks only. Append the !<hex> suffix to the spec to have its original bytes verified.
+[0:00:01.047] warn   name index: binding the drain for OnRenderObjectManager::OnRenderObject at il2cpp+0x1f46910, from the offline index (nameIndex is set). The address came from metadata, not from the runtime, and the by-RVA binder byte-verified its prologue.
+[0:00:01.047] ok     render-phase bound to OnRenderObjectManager::OnRenderObject (16 bytes)
+[0:00:01.047] ok     settings-ui-probe bound to EFT.UI.Settings.SettingsScreen::Show (16 bytes)
+[0:00:01.047] ok     settings-UI probe (Phase 1) armed on EFT.UI.Settings.SettingsScreen::Show; open the in-game settings screen to log its control tree
+[0:00:01.047] ok     settings-tick-probe bound to EFT.UI.Settings.GameSettingsTab::Update (16 bytes)
+[0:00:01.047] ok     settings-UI CONTROL poll (Phase 1.7) armed on EFT.UI.Settings.GameSettingsTab::Update; it polls every registered tab's control list once per 20 frames while Settings is open, and field-scans any tab that stays empty -- so the controls get reported whenever they appear, whatever creates them
+[0:00:01.047] ok     settings-tab-probe bound to EFT.UI.Settings.SettingsScreen::ShowScreen (15 bytes)
+[0:00:01.047] ok     settings-UI control probe (Phase 1.8) armed POSTFIX on EFT.UI.Settings.SettingsScreen::ShowScreen; open Settings and click each tab -- every control's label, klass and value-widget pointer is logged as the tab is built
+[0:00:01.047] ok     version-brand bound to EFT.UI.PreloaderUI::Awake (16 bytes)
+[0:00:01.047] ok     version brand armed on EFT.UI.PreloaderUI::Awake (postfix); the bottom-left version label will read "aowlspt â€” <version>"
+[0:00:01.047] ok     botdiag bound to EFT.GameWorld::RegisterPlayer (18 bytes)
+[0:00:01.047] ok     botdiag (read-only bot/player census) armed on EFT.GameWorld::RegisterPlayer; enter an offline raid to log each spawn + the registered list
+[0:00:01.047] ok     botcap bound to EFT.BotSpawner::AddPlayer (17 bytes)
+[0:00:01.047] ok     botcap (offline bot-cap lift) armed on EFT.BotSpawner::AddPlayer; enter an offline raid to poke BotSpawner.MaxBots=0 (unlimited)
+[0:00:01.047] ok     debugui: 28 of 28 managed targets verified by RVA + prologue on this build
+[0:00:01.047] ok     debug-overlay bound to EFT.UI.PreloaderUI::Update (15 bytes)
+[0:00:01.047] ok     debugui CLAIMED the shared EFT.UI.PreloaderUI::Update detour (slot 8, prefix, per-frame, Unity thread); uxMenuModeText will ride on this same detour if it is on. Press F3 in game to show the panel; layout comes from aowlspt-debugui.json beside the host DLL and is re-read on every toggle-on.
+[0:00:01.047] ok     menu mode text armed as a RIDER on the debug overlay's existing EFT.UI.PreloaderUI::Update detour (slot 8) -- one detour, one trampoline, both features live. The bottom-right corner label follows the backend's `menuModeText`, which defaults to the logged-in character's name
+[0:00:01.047] ok     live inspector: IN-RAID anchor armed as a rider on the main drain's existing detour (slot 0) -- commands will keep running after the menu goes away
+[0:00:01.047] ok     live inspector armed as a RIDER on the debug overlay's existing EFT.UI.PreloaderUI::Update detour (slot 8)
+[0:00:01.047] ok     mods tab / version brand / hide seasons armed as RIDERS on the existing EFT.UI.PreloaderUI::Update detour (slot 8) -- one detour, one trampoline. The tab is built the first time Settings -> Game is opened, because the rows it clones come from that tab.
+[0:00:01.047] info   7 candidate libraries under D:\Aowlspt\aowlspt\mods
+[0:00:01.047] info   not using a selection file: D:\Aowlspt\aowlspt\mods\aowlspt-selection.json was written for the server side and this host is the client one
+[0:00:01.047] info   Fallback Settings UI does not support the client side; skipping
+[0:00:01.063] ok     subscribed to aowlspt.settings.indexQuery
+[0:00:01.063] ok     aowl.textures 1.0.0 loaded on aowlspt-host-il2cpp
+[0:00:01.063] info   textures  manifest: 512 curated replacement(s), tier 2K
+[0:00:01.063] info   textures  VRAM budget 1024 MB fits ~48 resident 2K textures (RGBA32 + mips); the manifest is the candidate set, the budget is the hard resident cap
+[0:00:01.063] info   textures  categories on:  Metal Wood Concrete Brick Fabric 
+[0:00:01.063] info   textures  swapMode=off (or disabled): no swap hooks will be installed, the game uses stock textures. Escalate with swapMode probe -> match -> full in config.json once boot is confirmed stable.
+[0:00:01.063] ok     loaded aowl.textures (aowl.textures) v1.0.0 by savannt
+[0:00:01.063] info   Tarkov Emulator does not support the client side; skipping
+[0:00:01.063] info   SPT Settings Surface does not support the client side; skipping
+[0:00:01.063] info   Path To Tarkov does not support the client side; skipping
+[0:00:01.063] info   Mod Manager does not support the client side; skipping
+[0:00:01.063] ok     subscribed to aowlspt.settings.indexQuery
+[0:00:01.063] ok     subscribed to aowl.graphics.apply
+[0:00:01.063] ok     graphics  grade pushed to the host post-process (tonemapper=1, enabled=yes)
+[0:00:01.063] ok     loaded aowl.graphics (aowl.graphics) v1.0.0 by savannt
+[0:00:01.219] ok     overlay ready (F12 opens settings)
+[0:00:01.219] ok     graphics post-process ready (via the overlay Present hook) â€” driven by the overlay Present hook; waiting for the first frame
+[0:00:01.219] ok     asking the backend on port 80 which client mods should be running, every 3000ms; this host reports back as session 1df663240c4
+[0:00:01.219] ok     host running
+[0:00:01.250] info   live inspector: batch 1 (6 command(s)) handed to Unity's thread; answers land in D:\Aowlspt\aowlspt\aowlspt-inspect-out.txt
+[0:00:03.234] warn   the main-thread drain has not fired for 2s with work queued; running it on the host thread until it comes back
+[0:00:03.234] warn   invoke_main self-test ran on thread 16580, the host's own thread and not Unity's drain thread; no managed call was made (the drain is bound but has not fired on its own thread, or nothing is bound)
+[0:00:03.250] ok     exit fix: OS-close hooks installed on UI thread 16184 (main window 0x1b0a00) -- window X / taskbar Close / Alt+F4 now exit via ExitProcess(0) instead of the hanging async shutdown
+[0:00:04.703] info   the backend wants aowl.classicmovement loaded and there is no D:\Aowlspt\aowlspt\mods\classicmovement\classicmovement.dll on this side; it is installed on the server only
+[0:00:04.703] info   the backend wants aowl.fovfix loaded and there is no D:\Aowlspt\aowlspt\mods\fov\fov.dll on this side; it is installed on the server only
+[0:00:04.703] info   the backend wants aowl.perf loaded and there is no D:\Aowlspt\aowlspt\mods\perf\perf.dll on this side; it is installed on the server only
+[0:00:04.703] info   the backend wants com.savannt.sptsway loaded and there is no D:\Aowlspt\aowlspt\mods\sway\sway.dll on this side; it is installed on the server only
+[0:00:04.703] info   the backend's mod set does not mention aowl.textures, so this host leaves it exactly as it is
+[0:00:04.703] info   the backend's mod set does not mention aowl.graphics, so this host leaves it exactly as it is
+[0:00:04.703] info   telling the backend what happened to its mods: /aowlspt/mods/client/0.1.0?hs=1df663240c4&sq=12&r=aowl.manager~-n!aowl.tarkov~-n!aowl.morebots~-n!aowl.blackdivision~-n!aowl.sain~-n!aowl.classicmovement~+s~nofile&more=1
+[0:00:08.438] ok     the main-thread drain is firing again on EFT.TarkovApplication::Update
+[0:00:08.438] ok     the drain fires on thread 16184; the host runs on 16580
+[0:00:08.438] ok     invoke_main now runs on Unity's main thread (EFT.TarkovApplication::Update)
+[0:00:11.391] warn   live inspector: no batch queued for 10s while the rider IS dispatching (138 fires). polls=471 reads=13 readFails=0 unchanged=12 lastRead=125B lastKnown=125B pending=0 batch=1 done=-1 suspended=true inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:00:14.484] ok     inspect| aowlspt live inspector -- batch 1, 6 command(s), on Unity thread 16184
+[0:00:14.484] ok     inspect| > echo T323
+[0:00:14.484] ok     inspect|   T323
+[0:00:14.484] ok     inspect| > children 0x0000029f464b71a0
+[0:00:14.484] ok     inspect|   ! that pointer is not readable; refusing to walk it.
+[0:00:14.484] ok     inspect| > component $c0 AnimatedToggle
+[0:00:14.484] ok     inspect|   ! no such anchor or variable: $c0
+[0:00:14.484] ok     inspect| > allow write
+[0:00:14.484] ok     inspect|   writes and calls are armed FOR THIS BATCH ONLY
+[0:00:14.484] ok     inspect| > call rva:0x55ba430 v_pb $comp 1
+[0:00:14.484] ok     inspect|   calling rva 0x55ba430 -> 0x00007ffed629a430 (unverified prologue) sig=v_pb mi=0x0000000000000000
+[0:00:14.484] ok     inspect|   !! FAULTED (caught; the game survived). LAST HOP: CALL rva 0x55ba430 -> 0x00007ffed629a430 (unverified prologue)  at 0x00007ffed629a430
+[0:00:14.484] ok     inspect|   !! fault 1 of 8 before the inspector switches itself off for this session
+[0:00:14.484] ok     inspect|   wait: waiting up to 240 frame(s)
+[0:00:14.484] ok     inspect| aowlspt live inspector -- batch 1 complete, 14 line(s)
+[0:00:15.203] ok     version probe: PreloaderUI.Awake postfix fired on thread 16184 (NOT the host thread -> Unity's main thread)
+[0:00:15.203] ok     version probe: label component at this+0x20 is readable; scanning its String slots by raw layout (no reflection)
+[0:00:15.203] ok     version probe: String slot +0xa0 = "1.1.0.1.46777"  <-- version-looking
+[0:00:15.203] ok     version probe: read-only (set uxVersionBrandWrite to attempt a field-write brand; no managed write was performed)
+[0:00:15.203] ok     patchFired: slot=8 riders={debugui:8, modetext:8, inspect:8} -> dispatches debugui modetext inspect
+[0:00:15.203] ok     debugui: PreloaderUI::Update detour is live on thread 16184 (host thread 16580 -- so this is Unity's). 28 of 28 managed targets verified by RVA + prologue. Press the toggle key to show the panel.
+[0:00:15.203] ok     menu mode text: PreloaderUI.Update first fired on thread 16184 (Unity's main thread)
+[0:00:15.203] ok     live inspector: rider FIRST DISPATCHED on thread 16184 (slot 8); EFT.UI.PreloaderUI::Update is now ticking and batches will drain
+[0:00:16.328] ok     menu mode text: not found yet -- no 'ChangeGameModeButton' within 8 levels of any of the 11 scene root(s): 'StandaloneWebPlugin' 'WebView Thread Dispatcher' '[Technical Systems]' 'Application (Main Client)' 'Canvas' 'AudioListener' 'Easy Assets' '___Input' 'Environment UI' 'Login UI' 'Preloader UI' . Expected before the main menu is up; retried on a throttle.
+[0:00:26.469] warn   live inspector: no batch queued for 25s while the rider IS dispatching (302 fires). polls=1371 reads=73 readFails=0 unchanged=72 lastRead=125B lastKnown=125B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:00:38.234] ok     mods tab: GetComponent bound @0x52a48e0 -- SELF-TESTED true, found TextMeshProUGUI = 0x000001f259460000 on MainText
+[0:00:38.250] ok     menu mode text: FOUND both corner-label TMPs by WALKING (never hardcoded) Common UI/.../ChangeGameModeButton/Available/MainTextContainer/{MainText,MainTextHover} from a verified scene root. MainText=0x1f259460000 currently reads "EGameMode/Regular"; MainTextHover=0x1f259c9a800 currently reads "EGameMode/Regular". LocalizedText siblings: main=none, hover=none. The old EFT.UI.PreloaderUI::SetGameModeText path is REMOVED: measured that _sessionModeText genuinely updates but never reaches the screen, and these two TMPs are what actually renders.
+[0:00:40.047] ok     settings write: repaint routes on this build -- EFT.UI.LocalizedText::SetLabelText=OK TMPro.TMP_Text::set_text=OK TMPro.TMP_Text::set_havePropertiesChanged=OK
+[0:00:40.047] ok     version brand: the bottom label now reads "aowlspt 1.0, aoughwl.com  -  tarkov 1.1.0.1.46777" -- written through LocalizedText::SetLabelText / TMP_Text::set_text on AlphaLabel (fact #12), NOT the $verlabel anchor, whose m_text is empty and which is why this never showed
+[0:00:40.422] ok     hide seasons: found MenuScreen; looking for its 'SeasonsButton' child on every pass from here
+[0:00:40.422] ok     hide seasons: Common UI/MenuScreen/SeasonsButton switched off (the KORD BREACH / Season banner above Play). It is re-checked on a throttle, so a menu rebuild hides it again; it is never re-enabled by this host.
+[0:00:41.531] warn   live inspector: no batch queued for 40s while the rider IS dispatching (649 fires). polls=2269 reads=133 readFails=0 unchanged=132 lastRead=125B lastKnown=125B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:00:56.563] warn   live inspector: no batch queued for 55s while the rider IS dispatching (3119 fires). polls=3170 reads=193 readFails=0 unchanged=192 lastRead=125B lastKnown=125B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:01:11.578] warn   live inspector: no batch queued for 70s while the rider IS dispatching (5429 fires). polls=4068 reads=253 readFails=0 unchanged=252 lastRead=125B lastKnown=125B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:01:25.141] warn   menu mode text: the PreloaderUI.Update hook has fired 3600 times and the backend has never sent a `menuModeText`, so the corner label is still the game's stock text. The hook is fine; the SOURCE is missing. Check that the backend is reachable (backendPort in aowlspt-host.json, or backendUrl in the installer's backend.json) and that the manager mod is running.
+[0:01:26.625] warn   live inspector: no batch queued for 85s while the rider IS dispatching (7697 fires). polls=4965 reads=313 readFails=0 unchanged=312 lastRead=125B lastKnown=125B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:01:41.688] warn   live inspector: no batch queued for 100s while the rider IS dispatching (9957 fires). polls=5863 reads=373 readFails=0 unchanged=372 lastRead=125B lastKnown=125B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:01:56.719] warn   live inspector: no batch queued for 115s while the rider IS dispatching (12227 fires). polls=6759 reads=433 readFails=0 unchanged=432 lastRead=125B lastKnown=125B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:02:11.750] warn   live inspector: no batch queued for 130s while the rider IS dispatching (14497 fires). polls=7655 reads=493 readFails=0 unchanged=492 lastRead=125B lastKnown=125B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:02:26.828] warn   live inspector: no batch queued for 145s while the rider IS dispatching (16723 fires). polls=8553 reads=553 readFails=0 unchanged=552 lastRead=125B lastKnown=125B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:02:29.344] info   live inspector: batch 2 (2 command(s)) handed to Unity's thread; answers land in D:\Aowlspt\aowlspt\aowlspt-inspect-out.txt
+[0:02:29.375] ok     inspect| aowlspt live inspector -- batch 2, 2 command(s), on Unity thread 16184
+[0:02:29.375] ok     inspect| > roots
+[0:02:29.375] ok     inspect|   via SceneManager::get_sceneCount / GetSceneAt, Scene::GetNameInternal / GetIsLoadedInternal / GetRootCountInternal, GameObject::get_scene_Injected, Scene::GetRootGameObjects (calls; the last one ALLOCATES)
+[0:02:29.375] ok     inspect|   2 scene(s) from SceneManager
+[0:02:29.375] ok     inspect|   scene[0] handle=-126508 name="CommonUIScene" loaded=true rootCount=0
+[0:02:29.375] ok     inspect|     CommonUIScene: 0 roots
+[0:02:29.375] ok     inspect|   scene[1] handle=-127824 name="MenuUIScene" loaded=true rootCount=0
+[0:02:29.375] ok     inspect|     MenuUIScene: 0 roots
+[0:02:29.375] ok     inspect|   scene[anchor] handle=-12 name="DontDestroyOnLoad"  <- the scene $preloader actually belongs to. SceneManager does NOT list it, which on this build is where the live UI is.
+[0:02:29.375] ok     inspect|     [$r0] transform=0x000001f258072580  go=0x000001f0bea9c620 ($rgo0)  name="StandaloneWebPlugin"   (DontDestroyOnLoad)
+[0:02:29.375] ok     inspect|     [$r1] transform=0x000001f258072540  go=0x000001f0bea9c560 ($rgo1)  name="WebView Thread Dispatcher"   (DontDestroyOnLoad)
+[0:02:29.375] ok     inspect|     [$r2] transform=0x000001f258072520  go=0x000001f0befa5660 ($rgo2)  name="[Technical Systems]"   (DontDestroyOnLoad)
+[0:02:29.375] ok     inspect|     [$r3] transform=0x000001f1e06ebf20  go=0x000001f16d1f2120 ($rgo3)  name="Application (Main Client)"   (DontDestroyOnLoad)
+[0:02:29.375] ok     inspect|     [$r4] transform=0x000001f16d2aa5e0  go=0x000001f16d2aa880 ($rgo4)  name="Canvas"   (DontDestroyOnLoad)
+[0:02:29.375] ok     inspect|     [$r5] transform=0x000001f1e06ebf60  go=0x000001f1e06e7020 ($rgo5)  name="AudioListener"   (DontDestroyOnLoad)
+[0:02:29.375] ok     inspect|     [$r6] transform=0x000001f2580724e0  go=0x000001f0c0bbcfa0 ($rgo6)  name="Easy Assets"   (DontDestroyOnLoad)
+[0:02:29.375] ok     inspect|     [$r7] transform=0x000001f2580724c0  go=0x000001f1e62027c0 ($rgo7)  name="___Input"   (DontDestroyOnLoad)
+[0:02:29.375] ok     inspect|     [$r8] transform=0x000001f1e62ae880  go=0x000001f1e6202ee0 ($rgo8)  name="Environment UI"   (DontDestroyOnLoad)
+[0:02:29.375] ok     inspect|     [$r9] transform=0x000001f2580724a0  go=0x000001f1e5ee76c0 ($rgo9)  name="Login UI"   (DontDestroyOnLoad)
+[0:02:29.375] ok     inspect|     [$r10] transform=0x000001f258042160  go=0x000001f258042120 ($rgo10)  name="Preloader UI"   (DontDestroyOnLoad)
+[0:02:29.375] ok     inspect|     [$r11] transform=0x000001f259221f40  go=0x000001f259125480 ($rgo11)  name="[DOTween]"   (DontDestroyOnLoad)
+[0:02:29.375] ok     inspect|     [$r12] transform=0x000001f259d80fc0  go=0x000001f22266a620 ($rgo12)  name="Common UI"   (DontDestroyOnLoad)
+[0:02:29.375] ok     inspect|     [$r13] transform=0x000001f1eebc8e40  go=0x000001f1eebc8f20 ($rgo13)  name="Menu UI"   (DontDestroyOnLoad)
+[0:02:29.375] ok     inspect|   14 root(s) bound to $r0..$r13 as TRANSFORMS -- the same kind of pointer $c0 and $f1 are, so they go straight into children/tree/parent/find. The GameObject of each is $rgo0..$rgo13 (that is what `component` wants).
+[0:02:29.375] ok     inspect|   e.g.  find PvE $r9        or   children $r9
+[0:02:29.375] ok     inspect| > echo aowl-batch-18456
+[0:02:29.375] ok     inspect|   aowl-batch-18456
+[0:02:29.375] ok     inspect| aowlspt live inspector -- batch 2 complete, 27 line(s)
+[0:02:29.578] info   live inspector: batch 3 (2 command(s)) handed to Unity's thread; answers land in D:\Aowlspt\aowlspt\aowlspt-inspect-out.txt
+[0:02:29.594] ok     inspect| aowlspt live inspector -- batch 3, 2 command(s), on Unity thread 16184
+[0:02:29.594] ok     inspect| > children 0x000001f1eebc8e40
+[0:02:29.594] ok     inspect|   childCount = 1
+[0:02:29.594] ok     inspect|   via Transform::GetChild / get_childCount, Object::get_name (calls)
+[0:02:29.594] ok     inspect|     [0] transform=0x000001f1eebb77a0 ($c0)  go=0x000001f1eebb7780 ($g0)  name="UI"
+[0:02:29.594] ok     inspect|   transforms bound to $c0..$c0, GameObjects to $g0..$g0. NOTE: these are TRANSFORMS, not components -- `click` needs the Button, so go through `component $g0 Button` first.
+[0:02:29.594] ok     inspect| > echo aowl-batch-18607
+[0:02:29.594] ok     inspect|   aowl-batch-18607
+[0:02:29.594] ok     inspect| aowlspt live inspector -- batch 3 complete, 8 line(s)
+[0:02:29.844] info   live inspector: batch 4 (2 command(s)) handed to Unity's thread; answers land in D:\Aowlspt\aowlspt\aowlspt-inspect-out.txt
+[0:02:29.875] ok     inspect| aowlspt live inspector -- batch 4, 2 command(s), on Unity thread 16184
+[0:02:29.875] ok     inspect| > children 0x000001f1eebb77a0
+[0:02:29.875] ok     inspect|   childCount = 28
+[0:02:29.875] ok     inspect|   via Transform::GetChild / get_childCount, Object::get_name (calls)
+[0:02:29.875] ok     inspect|     [0] transform=0x000001f1eebb75e0 ($c0)  go=0x000001f1eebb75c0 ($g0)  name="MatchmakerIntroVideoScreen"
+[0:02:29.875] ok     inspect|     [1] transform=0x000001f1eebb7ce0 ($c1)  go=0x000001f1eebb7cc0 ($g1)  name="CharacterSelectionScreen"
+[0:02:29.875] ok     inspect|     [2] transform=0x000001f1eebb8b80 ($c2)  go=0x000001f1eebb8b60 ($g2)  name="SeasonsHubScreen"
+[0:02:29.875] ok     inspect|     [3] transform=0x000001f1eebb7be0 ($c3)  go=0x000001f1eebb7bc0 ($g3)  name="SeasonsIntroScreen"
+[0:02:29.875] ok     inspect|     [4] transform=0x000001f1eebb9720 ($c4)  go=0x000001f1eebb9700 ($g4)  name="Trading Screen"
+[0:02:29.875] ok     inspect|     [5] transform=0x000001f1eebb9560 ($c5)  go=0x000001f1eebb9540 ($g5)  name="Merchants List"
+[0:02:29.875] ok     inspect|     [6] transform=0x000001f1eebb9380 ($c6)  go=0x000001f1eebb9360 ($g6)  name="Ragfair Screen"
+[0:02:29.875] ok     inspect|     [7] transform=0x000001f1eebbb2a0 ($c7)  go=0x000001f1eebbb280 ($g7)  name="Trader Screens Group"
+[0:02:29.875] ok     inspect|     [8] transform=0x000001f1eebbb0a0 ($c8)  go=0x000001f1eebbb080 ($g8)  name="MatchMaker Side Selection Screen"
+[0:02:29.875] ok     inspect|     [9] transform=0x000001f1eebbcac0 ($c9)  go=0x000001f1eebbcaa0 ($g9)  name="Matchmaker Location Selection"
+[0:02:29.875] ok     inspect|     [10] transform=0x000001f1eebbc220 ($c10)  go=0x000001f1eebbc200 ($g10)  name="Matchmaker Key Access"
+[0:02:29.875] ok     inspect|     [11] transform=0x000001f1eebb7a20 ($c11)  go=0x000001f1eebb7a00 ($g11)  name="MatchMaker AcceptScreen"
+[0:02:29.875] ok     inspect|     [12] transform=0x000001f1eebb79c0 ($c12)  go=0x000001f1eebb79a0 ($g12)  name="Matchmaker Insurance"
+[0:02:29.875] ok     inspect|     [13] transform=0x000001f1eebbe8e0 ($c13)  go=0x000001f1eebbe8c0 ($g13)  name="Matchmaker Points Screen"
+[0:02:29.875] ok     inspect|     [14] transform=0x000001f1eebbe780 ($c14)  go=0x000001f1eebbe760 ($g14)  name="Matchmaker Time Has Come"
+[0:02:29.875] ok     inspect|     [15] transform=0x000001f1eebb78c0 ($c15)  go=0x000001f1eebb78a0 ($g15)  name="Matchmaker Offline Raid Screen"
+[0:02:29.875] ok     inspect|     [16] transform=0x000001f1eebbf2c0 ($c16)  go=0x000001f1eebbf2a0 ($g16)  name="Matchmaker Final Countdown"
+[0:02:29.875] ok     inspect|     [17] transform=0x000001f1eebc8e60 ($c17)  go=0x000001f1eebc8e80 ($g17)  name="Operation Queue Indicator"
+[0:02:29.875] ok     inspect|     [18] transform=0x000001f1f5609160 ($c18)  go=0x000001f1f5609140 ($g18)  name="HideoutAreaTransferItemsScreen"
+[0:02:29.875] ok     inspect|     [19] transform=0x000001f1eebb7860 ($c19)  go=0x000001f1eebb7840 ($g19)  name="EquipmentBuildsScreen"
+[0:02:29.875] ok     inspect|     [20] transform=0x000001f1eebb7820 ($c20)  go=0x000001f1eebb7800 ($g20)  name="InventoryOtherPlayerProfile"
+[0:02:29.875] ok     inspect|     [21] transform=0x000001f1eebb77c0 ($c21)  go=0x000001f1eebc13e0 ($g21)  name="NewsHubScreen"
+[0:02:29.875] ok     inspect|     [22] transform=0x000001f1eebb7740 ($c22)  go=0x000001f1eebb7720 ($g22)  name="ObtainPrestigeScreen"
+[0:02:29.875] ok     inspect|     [23] transform=0x000001f1eebc3a80 ($c23)  go=0x000001f1eebc3a60 ($g23)  name="HideoutMannequinEquipmentScreen"
+[0:02:29.875] ok     inspect|     [24] transform=0x000001f1f5609120 ($c24)  go=0x000001f1f5609100 ($g24)  name="HideoutCircleOfCultistsScreen"
+[0:02:29.875] ok     inspect|     [25] transform=0x000001f1eebb76e0 ($c25)  go=0x000001f1eebb76c0 ($g25)  name="EventDialogScreen"
+[0:02:29.875] ok     inspect|     [26] transform=0x000001f1eebc4d80 ($c26)  go=0x000001f1eebc4d60 ($g26)  name="HideoutCustomizationScreen"
+[0:02:29.875] ok     inspect|     [27] transform=0x000001f1eebc66c0 ($c27)  go=0x000001f1eebc66a0 ($g27)  name="FinalStatisticsScreen"
+[0:02:29.875] ok     inspect|   transforms bound to $c0..$c27, GameObjects to $g0..$g27. NOTE: these are TRANSFORMS, not components -- `click` needs the Button, so go through `component $g0 Button` first.
+[0:02:29.875] ok     inspect| > echo aowl-batch-18909
+[0:02:29.875] ok     inspect|   aowl-batch-18909
+[0:02:29.875] ok     inspect| aowlspt live inspector -- batch 4 complete, 35 line(s)
+[0:02:30.078] info   live inspector: batch 5 (58 command(s)) handed to Unity's thread; answers land in D:\Aowlspt\aowlspt\aowlspt-inspect-out.txt
+[0:02:30.094] ok     inspect| aowlspt live inspector -- batch 5, 58 command(s), on Unity thread 16184
+[0:02:30.094] ok     inspect| > allow write
+[0:02:30.094] ok     inspect|   writes and calls are armed FOR THIS BATCH ONLY
+[0:02:30.094] ok     inspect| > echo UIQ0
+[0:02:30.094] ok     inspect|   UIQ0
+[0:02:30.094] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebb75c0
+[0:02:30.094] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:02:30.094] ok     inspect|   -> i32 0
+[0:02:30.094] ok     inspect| > echo UIQ1
+[0:02:30.094] ok     inspect|   UIQ1
+[0:02:30.094] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebb7cc0
+[0:02:30.094] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:02:30.094] ok     inspect|   -> i32 1
+[0:02:30.094] ok     inspect| > echo UIQ2
+[0:02:30.094] ok     inspect|   UIQ2
+[0:02:30.094] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebb8b60
+[0:02:30.094] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:02:30.094] ok     inspect|   -> i32 0
+[0:02:30.094] ok     inspect| > echo UIQ3
+[0:02:30.094] ok     inspect|   UIQ3
+[0:02:30.094] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebb7bc0
+[0:02:30.094] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:02:30.094] ok     inspect|   -> i32 0
+[0:02:30.094] ok     inspect| > echo UIQ4
+[0:02:30.094] ok     inspect|   UIQ4
+[0:02:30.094] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebb9700
+[0:02:30.094] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:02:30.094] ok     inspect|   -> i32 0
+[0:02:30.094] ok     inspect| > echo UIQ5
+[0:02:30.094] ok     inspect|   UIQ5
+[0:02:30.094] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebb9540
+[0:02:30.094] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:02:30.094] ok     inspect|   -> i32 0
+[0:02:30.094] ok     inspect| > echo UIQ6
+[0:02:30.094] ok     inspect|   UIQ6
+[0:02:30.094] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebb9360
+[0:02:30.094] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:02:30.094] ok     inspect|   -> i32 0
+[0:02:30.094] ok     inspect| > echo UIQ7
+[0:02:30.094] ok     inspect|   UIQ7
+[0:02:30.094] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebbb280
+[0:02:30.094] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:02:30.094] ok     inspect|   -> i32 0
+[0:02:30.094] ok     inspect| > echo UIQ8
+[0:02:30.094] ok     inspect|   UIQ8
+[0:02:30.094] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebbb080
+[0:02:30.094] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:02:30.094] ok     inspect|   -> i32 0
+[0:02:30.094] ok     inspect| > echo UIQ9
+[0:02:30.094] ok     inspect|   UIQ9
+[0:02:30.094] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebbcaa0
+[0:02:30.094] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:02:30.094] ok     inspect|   -> i32 0
+[0:02:30.094] ok     inspect| > echo UIQ10
+[0:02:30.094] ok     inspect|   UIQ10
+[0:02:30.094] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebbc200
+[0:02:30.094] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:02:30.094] ok     inspect|   -> i32 0
+[0:02:30.094] ok     inspect| > echo UIQ11
+[0:02:30.094] ok     inspect|   UIQ11
+[0:02:30.094] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebb7a00
+[0:02:30.094] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:02:30.094] ok     inspect|   -> i32 0
+[0:02:30.094] ok     inspect| > echo UIQ12
+[0:02:30.094] ok     inspect|   UIQ12
+[0:02:30.094] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebb79a0
+[0:02:30.094] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:02:30.094] ok     inspect|   -> i32 0
+[0:02:30.094] ok     inspect| > echo UIQ13
+[0:02:30.094] ok     inspect|   UIQ13
+[0:02:30.094] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebbe8c0
+[0:02:30.094] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:02:30.094] ok     inspect|   -> i32 0
+[0:02:30.094] ok     inspect| > echo UIQ14
+[0:02:30.094] ok     inspect|   UIQ14
+[0:02:30.094] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebbe760
+[0:02:30.094] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:02:30.094] ok     inspect|   -> i32 0
+[0:02:30.094] ok     inspect| > echo UIQ15
+[0:02:30.094] ok     inspect|   UIQ15
+[0:02:30.094] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebb78a0
+[0:02:30.094] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:02:30.094] ok     inspect|   -> i32 0
+[0:02:30.094] ok     inspect| > echo UIQ16
+[0:02:30.094] ok     inspect|   UIQ16
+[0:02:30.094] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebbf2a0
+[0:02:30.094] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:02:30.094] ok     inspect|   -> i32 0
+[0:02:30.094] ok     inspect| > echo UIQ17
+[0:02:30.094] ok     inspect|   UIQ17
+[0:02:30.109] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebc8e80
+[0:02:30.109] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:02:30.109] ok     inspect|   -> i32 1
+[0:02:30.109] ok     inspect| > echo UIQ18
+[0:02:30.109] ok     inspect|   UIQ18
+[0:02:30.109] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1f5609140
+[0:02:30.109] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:02:30.109] ok     inspect|   -> i32 0
+[0:02:30.109] ok     inspect| > echo UIQ19
+[0:02:30.109] ok     inspect|   UIQ19
+[0:02:30.109] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebb7840
+[0:02:30.109] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:02:30.109] ok     inspect|   -> i32 0
+[0:02:30.109] ok     inspect| > echo UIQ20
+[0:02:30.109] ok     inspect|   UIQ20
+[0:02:30.109] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebb7800
+[0:02:30.109] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:02:30.109] ok     inspect|   -> i32 0
+[0:02:30.109] ok     inspect| > echo UIQ21
+[0:02:30.109] ok     inspect|   UIQ21
+[0:02:30.109] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebc13e0
+[0:02:30.109] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:02:30.109] ok     inspect|   -> i32 0
+[0:02:30.109] ok     inspect| > echo UIQ22
+[0:02:30.109] ok     inspect|   UIQ22
+[0:02:30.109] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebb7720
+[0:02:30.109] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:02:30.109] ok     inspect|   -> i32 0
+[0:02:30.109] ok     inspect| > echo UIQ23
+[0:02:30.109] ok     inspect|   UIQ23
+[0:02:30.109] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebc3a60
+[0:02:30.109] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:02:30.109] ok     inspect|   -> i32 0
+[0:02:30.109] ok     inspect| > echo UIQ24
+[0:02:30.109] ok     inspect|   UIQ24
+[0:02:30.109] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1f5609100
+[0:02:30.109] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:02:30.109] ok     inspect|   -> i32 0
+[0:02:30.109] ok     inspect| > echo UIQ25
+[0:02:30.109] ok     inspect|   UIQ25
+[0:02:30.109] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebb76c0
+[0:02:30.109] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:02:30.109] ok     inspect|   -> i32 0
+[0:02:30.109] ok     inspect| > echo UIQ26
+[0:02:30.109] ok     inspect|   UIQ26
+[0:02:30.109] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebc4d60
+[0:02:30.109] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:02:30.109] ok     inspect|   -> i32 0
+[0:02:30.109] ok     inspect| > echo UIQ27
+[0:02:30.109] ok     inspect|   UIQ27
+[0:02:30.109] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebc66a0
+[0:02:30.109] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:02:30.109] ok     inspect|   -> i32 0
+[0:02:30.109] ok     inspect| > echo aowl-batch-19210
+[0:02:30.109] ok     inspect|   aowl-batch-19210
+[0:02:30.109] ok     inspect| aowlspt live inspector -- batch 5 complete, 145 line(s)
+[0:02:41.891] warn   live inspector: no batch queued for 11s while the rider IS dispatching (18981 fires). polls=9448 reads=613 readFails=0 unchanged=608 lastRead=1879B lastKnown=1879B pending=0 batch=5 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:02:56.922] warn   live inspector: no batch queued for 26s while the rider IS dispatching (21205 fires). polls=10343 reads=673 readFails=0 unchanged=668 lastRead=1879B lastKnown=1879B pending=0 batch=5 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:03:11.969] warn   live inspector: no batch queued for 41s while the rider IS dispatching (23461 fires). polls=11239 reads=733 readFails=0 unchanged=728 lastRead=1879B lastKnown=1879B pending=0 batch=5 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:03:27.063] warn   live inspector: no batch queued for 56s while the rider IS dispatching (25737 fires). polls=12137 reads=793 readFails=0 unchanged=788 lastRead=1879B lastKnown=1879B pending=0 batch=5 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:03:40.141] info   live inspector: batch 6 (2 command(s)) handed to Unity's thread; answers land in D:\Aowlspt\aowlspt\aowlspt-inspect-out.txt
+[0:03:40.172] ok     inspect| aowlspt live inspector -- batch 6, 2 command(s), on Unity thread 16184
+[0:03:40.172] ok     inspect| > roots
+[0:03:40.172] ok     inspect|   via SceneManager::get_sceneCount / GetSceneAt, Scene::GetNameInternal / GetIsLoadedInternal / GetRootCountInternal, GameObject::get_scene_Injected, Scene::GetRootGameObjects (calls; the last one ALLOCATES)
+[0:03:40.172] ok     inspect|   2 scene(s) from SceneManager
+[0:03:40.172] ok     inspect|   scene[0] handle=-126508 name="CommonUIScene" loaded=true rootCount=0
+[0:03:40.172] ok     inspect|     CommonUIScene: 0 roots
+[0:03:40.172] ok     inspect|   scene[1] handle=-127824 name="MenuUIScene" loaded=true rootCount=0
+[0:03:40.172] ok     inspect|     MenuUIScene: 0 roots
+[0:03:40.172] ok     inspect|   scene[anchor] handle=-12 name="DontDestroyOnLoad"  <- the scene $preloader actually belongs to. SceneManager does NOT list it, which on this build is where the live UI is.
+[0:03:40.172] ok     inspect|     [$r0] transform=0x000001f258072580  go=0x000001f0bea9c620 ($rgo0)  name="StandaloneWebPlugin"   (DontDestroyOnLoad)
+[0:03:40.172] ok     inspect|     [$r1] transform=0x000001f258072540  go=0x000001f0bea9c560 ($rgo1)  name="WebView Thread Dispatcher"   (DontDestroyOnLoad)
+[0:03:40.172] ok     inspect|     [$r2] transform=0x000001f258072520  go=0x000001f0befa5660 ($rgo2)  name="[Technical Systems]"   (DontDestroyOnLoad)
+[0:03:40.172] ok     inspect|     [$r3] transform=0x000001f1e06ebf20  go=0x000001f16d1f2120 ($rgo3)  name="Application (Main Client)"   (DontDestroyOnLoad)
+[0:03:40.172] ok     inspect|     [$r4] transform=0x000001f16d2aa5e0  go=0x000001f16d2aa880 ($rgo4)  name="Canvas"   (DontDestroyOnLoad)
+[0:03:40.172] ok     inspect|     [$r5] transform=0x000001f1e06ebf60  go=0x000001f1e06e7020 ($rgo5)  name="AudioListener"   (DontDestroyOnLoad)
+[0:03:40.172] ok     inspect|     [$r6] transform=0x000001f2580724e0  go=0x000001f0c0bbcfa0 ($rgo6)  name="Easy Assets"   (DontDestroyOnLoad)
+[0:03:40.172] ok     inspect|     [$r7] transform=0x000001f2580724c0  go=0x000001f1e62027c0 ($rgo7)  name="___Input"   (DontDestroyOnLoad)
+[0:03:40.172] ok     inspect|     [$r8] transform=0x000001f1e62ae880  go=0x000001f1e6202ee0 ($rgo8)  name="Environment UI"   (DontDestroyOnLoad)
+[0:03:40.172] ok     inspect|     [$r9] transform=0x000001f2580724a0  go=0x000001f1e5ee76c0 ($rgo9)  name="Login UI"   (DontDestroyOnLoad)
+[0:03:40.172] ok     inspect|     [$r10] transform=0x000001f258042160  go=0x000001f258042120 ($rgo10)  name="Preloader UI"   (DontDestroyOnLoad)
+[0:03:40.172] ok     inspect|     [$r11] transform=0x000001f259221f40  go=0x000001f259125480 ($rgo11)  name="[DOTween]"   (DontDestroyOnLoad)
+[0:03:40.172] ok     inspect|     [$r12] transform=0x000001f259d80fc0  go=0x000001f22266a620 ($rgo12)  name="Common UI"   (DontDestroyOnLoad)
+[0:03:40.172] ok     inspect|     [$r13] transform=0x000001f1eebc8e40  go=0x000001f1eebc8f20 ($rgo13)  name="Menu UI"   (DontDestroyOnLoad)
+[0:03:40.172] ok     inspect|   14 root(s) bound to $r0..$r13 as TRANSFORMS -- the same kind of pointer $c0 and $f1 are, so they go straight into children/tree/parent/find. The GameObject of each is $rgo0..$rgo13 (that is what `component` wants).
+[0:03:40.172] ok     inspect|   e.g.  find PvE $r9        or   children $r9
+[0:03:40.172] ok     inspect| > echo aowl-batch-89175
+[0:03:40.172] ok     inspect|   aowl-batch-89175
+[0:03:40.172] ok     inspect| aowlspt live inspector -- batch 6 complete, 27 line(s)
+[0:03:40.406] info   live inspector: batch 7 (2 command(s)) handed to Unity's thread; answers land in D:\Aowlspt\aowlspt\aowlspt-inspect-out.txt
+[0:03:40.422] ok     inspect| aowlspt live inspector -- batch 7, 2 command(s), on Unity thread 16184
+[0:03:40.422] ok     inspect| > children 0x000001f1eebc8e40
+[0:03:40.422] ok     inspect|   childCount = 1
+[0:03:40.422] ok     inspect|   via Transform::GetChild / get_childCount, Object::get_name (calls)
+[0:03:40.422] ok     inspect|     [0] transform=0x000001f1eebb77a0 ($c0)  go=0x000001f1eebb7780 ($g0)  name="UI"
+[0:03:40.422] ok     inspect|   transforms bound to $c0..$c0, GameObjects to $g0..$g0. NOTE: these are TRANSFORMS, not components -- `click` needs the Button, so go through `component $g0 Button` first.
+[0:03:40.422] ok     inspect| > echo aowl-batch-89477
+[0:03:40.422] ok     inspect|   aowl-batch-89477
+[0:03:40.422] ok     inspect| aowlspt live inspector -- batch 7 complete, 8 line(s)
+[0:03:40.641] info   live inspector: batch 8 (2 command(s)) handed to Unity's thread; answers land in D:\Aowlspt\aowlspt\aowlspt-inspect-out.txt
+[0:03:40.672] ok     inspect| aowlspt live inspector -- batch 8, 2 command(s), on Unity thread 16184
+[0:03:40.672] ok     inspect| > children 0x000001f1eebb77a0
+[0:03:40.672] ok     inspect|   childCount = 28
+[0:03:40.672] ok     inspect|   via Transform::GetChild / get_childCount, Object::get_name (calls)
+[0:03:40.672] ok     inspect|     [0] transform=0x000001f1eebb75e0 ($c0)  go=0x000001f1eebb75c0 ($g0)  name="MatchmakerIntroVideoScreen"
+[0:03:40.672] ok     inspect|     [1] transform=0x000001f1eebb7ce0 ($c1)  go=0x000001f1eebb7cc0 ($g1)  name="CharacterSelectionScreen"
+[0:03:40.672] ok     inspect|     [2] transform=0x000001f1eebb8b80 ($c2)  go=0x000001f1eebb8b60 ($g2)  name="SeasonsHubScreen"
+[0:03:40.672] ok     inspect|     [3] transform=0x000001f1eebb7be0 ($c3)  go=0x000001f1eebb7bc0 ($g3)  name="SeasonsIntroScreen"
+[0:03:40.672] ok     inspect|     [4] transform=0x000001f1eebb9720 ($c4)  go=0x000001f1eebb9700 ($g4)  name="Trading Screen"
+[0:03:40.672] ok     inspect|     [5] transform=0x000001f1eebb9560 ($c5)  go=0x000001f1eebb9540 ($g5)  name="Merchants List"
+[0:03:40.672] ok     inspect|     [6] transform=0x000001f1eebb9380 ($c6)  go=0x000001f1eebb9360 ($g6)  name="Ragfair Screen"
+[0:03:40.672] ok     inspect|     [7] transform=0x000001f1eebbb2a0 ($c7)  go=0x000001f1eebbb280 ($g7)  name="Trader Screens Group"
+[0:03:40.672] ok     inspect|     [8] transform=0x000001f1eebbb0a0 ($c8)  go=0x000001f1eebbb080 ($g8)  name="MatchMaker Side Selection Screen"
+[0:03:40.672] ok     inspect|     [9] transform=0x000001f1eebbcac0 ($c9)  go=0x000001f1eebbcaa0 ($g9)  name="Matchmaker Location Selection"
+[0:03:40.672] ok     inspect|     [10] transform=0x000001f1eebbc220 ($c10)  go=0x000001f1eebbc200 ($g10)  name="Matchmaker Key Access"
+[0:03:40.672] ok     inspect|     [11] transform=0x000001f1eebb7a20 ($c11)  go=0x000001f1eebb7a00 ($g11)  name="MatchMaker AcceptScreen"
+[0:03:40.672] ok     inspect|     [12] transform=0x000001f1eebb79c0 ($c12)  go=0x000001f1eebb79a0 ($g12)  name="Matchmaker Insurance"
+[0:03:40.672] ok     inspect|     [13] transform=0x000001f1eebbe8e0 ($c13)  go=0x000001f1eebbe8c0 ($g13)  name="Matchmaker Points Screen"
+[0:03:40.672] ok     inspect|     [14] transform=0x000001f1eebbe780 ($c14)  go=0x000001f1eebbe760 ($g14)  name="Matchmaker Time Has Come"
+[0:03:40.672] ok     inspect|     [15] transform=0x000001f1eebb78c0 ($c15)  go=0x000001f1eebb78a0 ($g15)  name="Matchmaker Offline Raid Screen"
+[0:03:40.672] ok     inspect|     [16] transform=0x000001f1eebbf2c0 ($c16)  go=0x000001f1eebbf2a0 ($g16)  name="Matchmaker Final Countdown"
+[0:03:40.672] ok     inspect|     [17] transform=0x000001f1eebc8e60 ($c17)  go=0x000001f1eebc8e80 ($g17)  name="Operation Queue Indicator"
+[0:03:40.672] ok     inspect|     [18] transform=0x000001f1f5609160 ($c18)  go=0x000001f1f5609140 ($g18)  name="HideoutAreaTransferItemsScreen"
+[0:03:40.672] ok     inspect|     [19] transform=0x000001f1eebb7860 ($c19)  go=0x000001f1eebb7840 ($g19)  name="EquipmentBuildsScreen"
+[0:03:40.672] ok     inspect|     [20] transform=0x000001f1eebb7820 ($c20)  go=0x000001f1eebb7800 ($g20)  name="InventoryOtherPlayerProfile"
+[0:03:40.672] ok     inspect|     [21] transform=0x000001f1eebb77c0 ($c21)  go=0x000001f1eebc13e0 ($g21)  name="NewsHubScreen"
+[0:03:40.672] ok     inspect|     [22] transform=0x000001f1eebb7740 ($c22)  go=0x000001f1eebb7720 ($g22)  name="ObtainPrestigeScreen"
+[0:03:40.672] ok     inspect|     [23] transform=0x000001f1eebc3a80 ($c23)  go=0x000001f1eebc3a60 ($g23)  name="HideoutMannequinEquipmentScreen"
+[0:03:40.672] ok     inspect|     [24] transform=0x000001f1f5609120 ($c24)  go=0x000001f1f5609100 ($g24)  name="HideoutCircleOfCultistsScreen"
+[0:03:40.672] ok     inspect|     [25] transform=0x000001f1eebb76e0 ($c25)  go=0x000001f1eebb76c0 ($g25)  name="EventDialogScreen"
+[0:03:40.672] ok     inspect|     [26] transform=0x000001f1eebc4d80 ($c26)  go=0x000001f1eebc4d60 ($g26)  name="HideoutCustomizationScreen"
+[0:03:40.672] ok     inspect|     [27] transform=0x000001f1eebc66c0 ($c27)  go=0x000001f1eebc66a0 ($g27)  name="FinalStatisticsScreen"
+[0:03:40.672] ok     inspect|   transforms bound to $c0..$c27, GameObjects to $g0..$g27. NOTE: these are TRANSFORMS, not components -- `click` needs the Button, so go through `component $g0 Button` first.
+[0:03:40.672] ok     inspect| > echo aowl-batch-89632
+[0:03:40.672] ok     inspect|   aowl-batch-89632
+[0:03:40.672] ok     inspect| aowlspt live inspector -- batch 8 complete, 35 line(s)
+[0:03:40.906] info   live inspector: batch 9 (58 command(s)) handed to Unity's thread; answers land in D:\Aowlspt\aowlspt\aowlspt-inspect-out.txt
+[0:03:40.922] ok     inspect| aowlspt live inspector -- batch 9, 58 command(s), on Unity thread 16184
+[0:03:40.922] ok     inspect| > allow write
+[0:03:40.922] ok     inspect|   writes and calls are armed FOR THIS BATCH ONLY
+[0:03:40.922] ok     inspect| > echo UIQ0
+[0:03:40.922] ok     inspect|   UIQ0
+[0:03:40.922] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebb75c0
+[0:03:40.922] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:03:40.922] ok     inspect|   -> i32 0
+[0:03:40.922] ok     inspect| > echo UIQ1
+[0:03:40.922] ok     inspect|   UIQ1
+[0:03:40.922] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebb7cc0
+[0:03:40.922] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:03:40.922] ok     inspect|   -> i32 1
+[0:03:40.922] ok     inspect| > echo UIQ2
+[0:03:40.922] ok     inspect|   UIQ2
+[0:03:40.922] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebb8b60
+[0:03:40.922] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:03:40.922] ok     inspect|   -> i32 0
+[0:03:40.922] ok     inspect| > echo UIQ3
+[0:03:40.922] ok     inspect|   UIQ3
+[0:03:40.922] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebb7bc0
+[0:03:40.922] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:03:40.922] ok     inspect|   -> i32 0
+[0:03:40.922] ok     inspect| > echo UIQ4
+[0:03:40.922] ok     inspect|   UIQ4
+[0:03:40.922] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebb9700
+[0:03:40.922] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:03:40.922] ok     inspect|   -> i32 0
+[0:03:40.922] ok     inspect| > echo UIQ5
+[0:03:40.922] ok     inspect|   UIQ5
+[0:03:40.922] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebb9540
+[0:03:40.922] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:03:40.922] ok     inspect|   -> i32 0
+[0:03:40.922] ok     inspect| > echo UIQ6
+[0:03:40.922] ok     inspect|   UIQ6
+[0:03:40.922] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebb9360
+[0:03:40.922] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:03:40.922] ok     inspect|   -> i32 0
+[0:03:40.922] ok     inspect| > echo UIQ7
+[0:03:40.922] ok     inspect|   UIQ7
+[0:03:40.922] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebbb280
+[0:03:40.922] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:03:40.922] ok     inspect|   -> i32 0
+[0:03:40.922] ok     inspect| > echo UIQ8
+[0:03:40.922] ok     inspect|   UIQ8
+[0:03:40.922] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebbb080
+[0:03:40.922] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:03:40.922] ok     inspect|   -> i32 0
+[0:03:40.922] ok     inspect| > echo UIQ9
+[0:03:40.922] ok     inspect|   UIQ9
+[0:03:40.922] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebbcaa0
+[0:03:40.922] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:03:40.922] ok     inspect|   -> i32 0
+[0:03:40.922] ok     inspect| > echo UIQ10
+[0:03:40.922] ok     inspect|   UIQ10
+[0:03:40.922] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebbc200
+[0:03:40.922] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:03:40.922] ok     inspect|   -> i32 0
+[0:03:40.922] ok     inspect| > echo UIQ11
+[0:03:40.922] ok     inspect|   UIQ11
+[0:03:40.922] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebb7a00
+[0:03:40.922] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:03:40.922] ok     inspect|   -> i32 0
+[0:03:40.922] ok     inspect| > echo UIQ12
+[0:03:40.922] ok     inspect|   UIQ12
+[0:03:40.922] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebb79a0
+[0:03:40.922] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:03:40.922] ok     inspect|   -> i32 0
+[0:03:40.922] ok     inspect| > echo UIQ13
+[0:03:40.922] ok     inspect|   UIQ13
+[0:03:40.922] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebbe8c0
+[0:03:40.922] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:03:40.922] ok     inspect|   -> i32 0
+[0:03:40.922] ok     inspect| > echo UIQ14
+[0:03:40.922] ok     inspect|   UIQ14
+[0:03:40.922] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebbe760
+[0:03:40.922] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:03:40.922] ok     inspect|   -> i32 0
+[0:03:40.922] ok     inspect| > echo UIQ15
+[0:03:40.922] ok     inspect|   UIQ15
+[0:03:40.922] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebb78a0
+[0:03:40.922] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:03:40.922] ok     inspect|   -> i32 0
+[0:03:40.922] ok     inspect| > echo UIQ16
+[0:03:40.922] ok     inspect|   UIQ16
+[0:03:40.922] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebbf2a0
+[0:03:40.922] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:03:40.922] ok     inspect|   -> i32 0
+[0:03:40.922] ok     inspect| > echo UIQ17
+[0:03:40.922] ok     inspect|   UIQ17
+[0:03:40.922] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebc8e80
+[0:03:40.922] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:03:40.922] ok     inspect|   -> i32 1
+[0:03:40.922] ok     inspect| > echo UIQ18
+[0:03:40.922] ok     inspect|   UIQ18
+[0:03:40.922] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1f5609140
+[0:03:40.922] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:03:40.922] ok     inspect|   -> i32 0
+[0:03:40.922] ok     inspect| > echo UIQ19
+[0:03:40.922] ok     inspect|   UIQ19
+[0:03:40.922] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebb7840
+[0:03:40.922] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:03:40.922] ok     inspect|   -> i32 0
+[0:03:40.922] ok     inspect| > echo UIQ20
+[0:03:40.922] ok     inspect|   UIQ20
+[0:03:40.922] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebb7800
+[0:03:40.922] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:03:40.922] ok     inspect|   -> i32 0
+[0:03:40.922] ok     inspect| > echo UIQ21
+[0:03:40.922] ok     inspect|   UIQ21
+[0:03:40.922] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebc13e0
+[0:03:40.922] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:03:40.922] ok     inspect|   -> i32 0
+[0:03:40.922] ok     inspect| > echo UIQ22
+[0:03:40.922] ok     inspect|   UIQ22
+[0:03:40.922] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebb7720
+[0:03:40.922] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:03:40.922] ok     inspect|   -> i32 0
+[0:03:40.922] ok     inspect| > echo UIQ23
+[0:03:40.922] ok     inspect|   UIQ23
+[0:03:40.922] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebc3a60
+[0:03:40.922] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:03:40.922] ok     inspect|   -> i32 0
+[0:03:40.922] ok     inspect| > echo UIQ24
+[0:03:40.922] ok     inspect|   UIQ24
+[0:03:40.922] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1f5609100
+[0:03:40.922] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:03:40.922] ok     inspect|   -> i32 0
+[0:03:40.922] ok     inspect| > echo UIQ25
+[0:03:40.922] ok     inspect|   UIQ25
+[0:03:40.922] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebb76c0
+[0:03:40.922] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:03:40.922] ok     inspect|   -> i32 0
+[0:03:40.922] ok     inspect| > echo UIQ26
+[0:03:40.922] ok     inspect|   UIQ26
+[0:03:40.922] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebc4d60
+[0:03:40.922] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:03:40.922] ok     inspect|   -> i32 0
+[0:03:40.922] ok     inspect| > echo UIQ27
+[0:03:40.922] ok     inspect|   UIQ27
+[0:03:40.922] ok     inspect| > call name:get_activeInHierarchy i_p 0x000001f1eebc66a0
+[0:03:40.922] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:03:40.922] ok     inspect|   -> i32 0
+[0:03:40.922] ok     inspect| > echo aowl-batch-89934
+[0:03:40.922] ok     inspect|   aowl-batch-89934
+[0:03:40.922] ok     inspect| aowlspt live inspector -- batch 9 complete, 145 line(s)
+[0:03:50.953] warn   live inspector: no batch queued for 10s while the rider IS dispatching (29323 fires). polls=13559 reads=888 readFails=0 unchanged=879 lastRead=1879B lastKnown=1879B pending=0 batch=9 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:04:06.016] warn   live inspector: no batch queued for 25s while the rider IS dispatching (31591 fires). polls=14455 reads=948 readFails=0 unchanged=939 lastRead=1879B lastKnown=1879B pending=0 batch=9 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:04:21.063] warn   live inspector: no batch queued for 40s while the rider IS dispatching (33777 fires). polls=15352 reads=1008 readFails=0 unchanged=999 lastRead=1879B lastKnown=1879B pending=0 batch=9 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:04:36.109] warn   live inspector: no batch queued for 55s while the rider IS dispatching (36045 fires). polls=16249 reads=1068 readFails=0 unchanged=1059 lastRead=1879B lastKnown=1879B pending=0 batch=9 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:04:51.172] warn   live inspector: no batch queued for 70s while the rider IS dispatching (38325 fires). polls=17143 reads=1128 readFails=0 unchanged=1119 lastRead=1879B lastKnown=1879B pending=0 batch=9 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:05:06.203] warn   live inspector: no batch queued for 85s while the rider IS dispatching (40591 fires). polls=18031 reads=1188 readFails=0 unchanged=1179 lastRead=1879B lastKnown=1879B pending=0 batch=9 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:05:21.297] warn   live inspector: no batch queued for 100s while the rider IS dispatching (42883 fires). polls=18922 reads=1248 readFails=0 unchanged=1239 lastRead=1879B lastKnown=1879B pending=0 batch=9 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:05:36.328] warn   live inspector: no batch queued for 115s while the rider IS dispatching (45171 fires). polls=19810 reads=1308 readFails=0 unchanged=1299 lastRead=1879B lastKnown=1879B pending=0 batch=9 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:05:51.391] warn   live inspector: no batch queued for 130s while the rider IS dispatching (47343 fires). polls=20700 reads=1368 readFails=0 unchanged=1359 lastRead=1879B lastKnown=1879B pending=0 batch=9 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:06:06.422] warn   live inspector: no batch queued for 145s while the rider IS dispatching (49631 fires). polls=21589 reads=1428 readFails=0 unchanged=1419 lastRead=1879B lastKnown=1879B pending=0 batch=9 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:06:21.516] warn   live inspector: no batch queued for 160s while the rider IS dispatching (51915 fires). polls=22480 reads=1488 readFails=0 unchanged=1479 lastRead=1879B lastKnown=1879B pending=0 batch=9 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:06:36.594] warn   live inspector: no batch queued for 175s while the rider IS dispatching (54175 fires). polls=23370 reads=1548 readFails=0 unchanged=1539 lastRead=1879B lastKnown=1879B pending=0 batch=9 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:06:51.656] warn   live inspector: no batch queued for 190s while the rider IS dispatching (56463 fires). polls=24263 reads=1608 readFails=0 unchanged=1599 lastRead=1879B lastKnown=1879B pending=0 batch=9 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:07:06.703] warn   live inspector: no batch queued for 205s while the rider IS dispatching (58729 fires). polls=25159 reads=1668 readFails=0 unchanged=1659 lastRead=1879B lastKnown=1879B pending=0 batch=9 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt

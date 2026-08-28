@@ -1,0 +1,539 @@
+aowlspt-host-il2cpp 0.1.0
+directory D:\Aowlspt\aowlspt
+thread 22792
+
+[0:00:00.000] ok     BSG's BattlEye service guard is answered from inside the process (4 import slots); BattlEye is not installed, started or loaded
+[0:00:00.000] info   botDiag is set: a READ-ONLY detour on EFT.GameWorld.RegisterPlayer will log each bot/player registration and enumerate the registered list (nickname, side/role, alive-state, position) during an offline raid -- it answers spawned-but-frozen vs absent. NO write is performed.
+[0:00:00.000] info   unlimitedBots is set: a kind=6 detour on EFT.BotSpawner.AddPlayer will poke BotSpawner.MaxBots=0 (unlimited) once at offline-raid init, lifting the cap that defers the scav wave pool (bosses bypass it via IgnoreMaxBots; scavs do not). One guarded int32 write on the Unity thread; fail-safe -- no write if the build/pointer does not check out.
+[0:00:00.000] info   settingsUiProbe is set: read-only detours on SettingsScreen.Show (Phase 1, arming/thread proof) and a POSTFIX on SettingsScreen.EnsureTabInitialized (Phase 1.5, the walk that reads controls -- they do not exist yet at Show) will log every control's label, il2cpp klass pointer and value-widget pointer as each tab is built. Open Settings and click each tab. NO write is ever performed.
+[0:00:00.000] info   settingsRelabelProbe is set: PHASE 2a. On the ShowScreen postfix the host finds the Game-tab control whose stock label is 'FOV:' and rewrites it to 'FOV: [aowlspt]' -- one il2cpp_string_new, one raw store into m_text (+0xE0), one dirty byte (+0x378), which is the same primitive the version brand and the F3 overlay use in production. Idempotent (it never double-brands) and self-disabling after two faults. Open Settings -> Game and read the FOV row.
+[0:00:00.000] info   settingsBindProbe is set: PHASE 2b. On the same postfix the host READS the live value out of every control whose widget type it has learned this session -- a toggle's m_IsOn (+0x120) and a float slider's Slider.m_Value (+0x120) with its range -- and logs each beside its label, so the offsets can be checked against what the screen actually shows. NO value is written.
+[0:00:00.000] info   settingsModsTab is set: a SIXTH tab. A stock *ToggleSpawner is cloned into SettingsScreen/Toggles and relabelled MODS, and a stock tab panel is cloned beside the other five. The clone inherits the real ToggleGroup, so selecting it deselects the stock tab and vice versa through the GAME's own logic -- that part is not simulated. The one thing the game will not do is show our panel, because it switches panels by ESettingsGroup and ours is not one, so the panel's active state is driven from the toggle each frame (one guarded byte read; a call only on an edge).
+[0:00:00.000] info   settingsPages is set: PHASE 3. On the Game tab the host renders its own settings page into the REAL settings screen, by CLONING a stock toggle row (UnityEngine.Object::Instantiate + TMP_DefaultControls::SetParentAndAlign, both byte-verified direct calls) once per row, relabelling each clone and seeding it with Toggle::SetIsOnWithoutNotify so the row shows its own value without firing the donor setting's handler. The first page is the aowlspt host's own flags out of aowlspt-host.json; a row the player changes is read back and persisted to that file. Rows that are carried but not yet wired are suffixed '(not done yet)'. Nothing the GAME created is ever written -- only clones the host made itself -- and the whole thing shares the Phase-2 fault budget.
+[0:00:00.000] info   debugUi/debugEsp is set: a per-frame detour on EFT.UI.PreloaderUI.Update (the Unity main thread) will draw a Minecraft-F3-style info panel and in-world markers over every registered AI bot out of Unity UI labels CLONED from the client's own version label (Object::Instantiate -- no reflection, no object creation). Press F3 in game to toggle it; layout is aowlspt-debugui.json and is re-read on every toggle-on, so it can be edited live. The whole body is VEH-guarded and writes only into labels it created.
+[0:00:00.000] info   uxMenuModeText is set: a postfix detour on EFT.UI.PreloaderUI.Update will set the menu's bottom-right corner label by CALLING the game's own PreloaderUI.SetGameModeText. The text comes from the backend's `menuModeText` on the mod-sync poll, which defaults to the logged-in character's name. It needs backendPort + modSyncMs. It SHARES the PreloaderUI.Update detour with debugUi/debugEsp -- one detour, one trampoline, both features dispatched from the same firing -- so all three flags can be on at once.
+[0:00:00.000] info   liveInspector is set: drop commands into aowlspt-inspect.txt beside this DLL and every save with changed content runs them ON UNITY'S MAIN THREAD, with answers in aowlspt-inspect-out.txt and in this log -- no rebuild, no restart. Start with `help` and `anchors`. Every hop is VirtualQuery-guarded, every command runs under its own VEH guard, and a caught fault reports THE LAST HOP ATTEMPTED and its pointer. Reads only unless liveInspectorWrite is also set. liveInspectorWrite IS set: a batch containing `allow write` may store into live managed objects and CALL game code.
+[0:00:00.000] info   uxVersionBrand is set: a postfix detour on PreloaderUI.Awake will probe the version label on the Unity thread (read-only: logs thread, readability, class, and String fields; no managed write) (fail-safe: unbranded if the build or timing does not match)
+[0:00:00.000] ok     imageCdnRedirect is set: getaddrinfo hooked (GetAddrInfoW getaddrinfo ); s3-*.escapefromtarkov.com -> 127.0.0.1, and every resolved host is logged once to confirm the real image host
+[0:00:00.000] info   waiting for the IL2CPP runtime (up to 120s)
+[0:00:01.078] ok     il2cpp_init returned 1 after 1000ms
+[0:00:01.078] ok     IL2CPP is up after 1000ms: il2cpp_init returned 1 and was handed out 2 time(s)
+[0:00:01.078] ok     IL2CPP runtime bound, all essential entry points present
+[0:00:01.078] ok     anti-cheat: BE client validation gate neutered (2/2 patches)
+[0:00:01.078] ok     exit fix: confirmed Exit redirected to ExitProcess(0) (2/2 sites; primary = the confirm-accept lambda, before the async exit-loading shutdown that was hanging)
+[0:00:01.078] info   exit fix: game window not up yet; the OS-close hooks will be installed from the host tick loop once the UI thread exists (Exit button is already patched)
+[0:00:01.078] info   146 assemblies loaded
+[0:00:01.078] info   31282 types visible
+[0:00:01.078] ok     prologue snapshot: captured the original bytes of 48 target(s) before any detour was installed (48 primed). Every later prologue check compares against this, not against live memory, so two features may share one target and both still verify it.
+[0:00:01.078] info   deep-probe: MethodInfo for EFT.TarkovApplication::Update is not readable
+[0:00:01.078] info   no usable code pointer for EFT.TarkovApplication::Update
+[0:00:01.078] info   deep-probe: MethodInfo for EFT.GameWorldUnityTickListener::Update is not readable
+[0:00:01.078] info   no usable code pointer for EFT.GameWorldUnityTickListener::Update
+[0:00:01.078] info   deep-probe: MethodInfo for EFT.GameWorld::Update is not readable
+[0:00:01.078] info   no usable code pointer for EFT.GameWorld::Update
+[0:00:01.078] info   deep-probe: MethodInfo for UnityEngine.UI.CanvasUpdateRegistry::PerformUpdate is not readable
+[0:00:01.078] info   no usable code pointer for UnityEngine.UI.CanvasUpdateRegistry::PerformUpdate
+[0:00:01.078] info   deep-probe: MethodInfo for UnityEngine.Time::get_deltaTime is not readable
+[0:00:01.078] info   no usable code pointer for UnityEngine.Time::get_deltaTime
+[0:00:01.078] warn   no per-frame method could be detoured, so invoke_main runs on the host's own thread (22792) and not Unity's; a callback that touches a Unity object is unsafe
+[0:00:01.078] info   deep-probe: MethodInfo for OnRenderObjectManager::OnRenderObject is not readable
+[0:00:01.078] info   no usable code pointer for OnRenderObjectManager::OnRenderObject
+[0:00:01.078] info   deep-probe: MethodInfo for EFT.CameraControl.CameraLodBiasController::OnPostRender is not readable
+[0:00:01.078] info   no usable code pointer for EFT.CameraControl.CameraLodBiasController::OnPostRender
+[0:00:01.078] info   no render-phase point bound yet; invoke_render (GL/ESP drawing) is unavailable until a raid brings up a render callback to detour
+[0:00:01.078] ok     settings-ui-probe bound to EFT.UI.Settings.SettingsScreen::Show (16 bytes)
+[0:00:01.078] ok     settings-UI probe (Phase 1) armed on EFT.UI.Settings.SettingsScreen::Show; open the in-game settings screen to log its control tree
+[0:00:01.078] ok     settings-tick-probe bound to EFT.UI.Settings.GameSettingsTab::Update (16 bytes)
+[0:00:01.078] ok     settings-UI CONTROL poll (Phase 1.7) armed on EFT.UI.Settings.GameSettingsTab::Update; it polls every registered tab's control list once per 20 frames while Settings is open, and field-scans any tab that stays empty -- so the controls get reported whenever they appear, whatever creates them
+[0:00:01.078] ok     settings-tab-probe bound to EFT.UI.Settings.SettingsScreen::ShowScreen (15 bytes)
+[0:00:01.078] ok     settings-UI control probe (Phase 1.8) armed POSTFIX on EFT.UI.Settings.SettingsScreen::ShowScreen; open Settings and click each tab -- every control's label, klass and value-widget pointer is logged as the tab is built
+[0:00:01.078] ok     version-brand bound to EFT.UI.PreloaderUI::Awake (16 bytes)
+[0:00:01.078] ok     version brand armed on EFT.UI.PreloaderUI::Awake (postfix); the bottom-left version label will read "aowlspt â€” <version>"
+[0:00:01.078] ok     botdiag bound to EFT.GameWorld::RegisterPlayer (18 bytes)
+[0:00:01.078] ok     botdiag (read-only bot/player census) armed on EFT.GameWorld::RegisterPlayer; enter an offline raid to log each spawn + the registered list
+[0:00:01.078] ok     botcap bound to EFT.BotSpawner::AddPlayer (17 bytes)
+[0:00:01.078] ok     botcap (offline bot-cap lift) armed on EFT.BotSpawner::AddPlayer; enter an offline raid to poke BotSpawner.MaxBots=0 (unlimited)
+[0:00:01.078] ok     debugui: 27 of 27 managed targets verified by RVA + prologue on this build
+[0:00:01.094] ok     debug-overlay bound to EFT.UI.PreloaderUI::Update (15 bytes)
+[0:00:01.094] ok     debugui CLAIMED the shared EFT.UI.PreloaderUI::Update detour (slot 6, prefix, per-frame, Unity thread); uxMenuModeText will ride on this same detour if it is on. Press F3 in game to show the panel; layout comes from aowlspt-debugui.json beside the host DLL and is re-read on every toggle-on.
+[0:00:01.094] ok     menu mode text armed as a RIDER on the debug overlay's existing EFT.UI.PreloaderUI::Update detour (slot 6) -- one detour, one trampoline, both features live. The bottom-right corner label follows the backend's `menuModeText`, which defaults to the logged-in character's name
+[0:00:01.094] ok     live inspector armed as a RIDER on the debug overlay's existing EFT.UI.PreloaderUI::Update detour (slot 6)
+[0:00:01.094] info   6 candidate libraries under D:\Aowlspt\aowlspt\mods
+[0:00:01.094] info   not using a selection file: D:\Aowlspt\aowlspt\mods\aowlspt-selection.json was written for the server side and this host is the client one
+[0:00:01.094] ok     aowl.textures 1.0.0 loaded on aowlspt-host-il2cpp
+[0:00:01.094] info   textures  manifest: 512 curated replacement(s), tier 2K
+[0:00:01.094] info   textures  VRAM budget 1024 MB fits ~48 resident 2K textures (RGBA32 + mips); the manifest is the candidate set, the budget is the hard resident cap
+[0:00:01.094] info   textures  categories on:  Metal Wood Concrete Brick Fabric 
+[0:00:01.094] info   textures  swapMode=off (or disabled): no hooks will be installed, the game uses stock textures. Escalate with swapMode probe -> match -> full in config.json once boot is confirmed stable.
+[0:00:01.094] ok     loaded aowl.textures (aowl.textures) v1.0.0 by savannt
+[0:00:01.094] info   Tarkov Emulator does not support the client side; skipping
+[0:00:01.094] info   Path To Tarkov does not support the client side; skipping
+[0:00:01.094] info   Mod Manager does not support the client side; skipping
+[0:00:01.094] info   Icebreaker does not support the client side; skipping
+[0:00:01.094] ok     subscribed to aowl.graphics.apply
+[0:00:01.094] ok     graphics  grade pushed to the host post-process (tonemapper=1, enabled=yes)
+[0:00:01.094] ok     loaded aowl.graphics (aowl.graphics) v1.0.0 by savannt
+[0:00:01.312] ok     overlay ready (F12 opens settings)
+[0:00:01.312] ok     graphics post-process ready (via the overlay Present hook) â€” driven by the overlay Present hook; waiting for the first frame
+[0:00:01.312] ok     asking the backend on port 1 which client mods should be running, every 3000ms; this host reports back as session c5ec7305908
+[0:00:01.312] ok     host running
+[0:00:01.344] info   live inspector: batch 1 (6 command(s)) handed to Unity's thread; answers land in D:\Aowlspt\aowlspt\aowlspt-inspect-out.txt
+[0:00:01.344] warn   invoke_main self-test ran on thread 22792, the host's own thread and not Unity's drain thread; no managed call was made (the drain is bound but has not fired on its own thread, or nothing is bound)
+[0:00:03.344] ok     exit fix: OS-close hooks installed on UI thread 24728 (main window 0x3b0cf8) -- window X / taskbar Close / Alt+F4 now exit via ExitProcess(0) instead of the hanging async shutdown
+[0:00:06.328] info   deep-probe: MethodInfo for EFT.TarkovApplication::Update is not readable
+[0:00:09.484] ok     live inspector: batch 1 is QUEUED and will run as soon as EFT.UI.PreloaderUI::Update starts ticking -- the rider (slot 6) has not been dispatched yet, which on a cold start just means the client is still on the loading screen. Nothing has been lost; reach the MENU.
+[0:00:15.500] ok     version probe: PreloaderUI.Awake postfix fired on thread 24728 (NOT the host thread -> Unity's main thread)
+[0:00:15.500] ok     version probe: label component at this+0x20 is readable; scanning its String slots by raw layout (no reflection)
+[0:00:15.500] ok     version probe: String slot +0xa0 = "1.1.0.1.46777"  <-- version-looking
+[0:00:15.515] ok     version probe: read-only (set uxVersionBrandWrite to attempt a field-write brand; no managed write was performed)
+[0:00:15.515] ok     patchFired: slot=6 riders={debugui:6, modetext:6, inspect:6} -> dispatches debugui modetext inspect
+[0:00:15.515] ok     debugui: PreloaderUI::Update detour is live on thread 24728 (host thread 22792 -- so this is Unity's). 27 of 27 managed targets verified by RVA + prologue. Press the toggle key to show the panel.
+[0:00:15.515] ok     menu mode text: PreloaderUI.Update first fired on thread 24728 (Unity's main thread)
+[0:00:15.515] ok     menu mode text: FOUND the corner label. parent chain = EFT.UI.PreloaderUI(this=0x173db5d0a10) -> _alphaVersionLabel:LocalizedText(+0x20)=0x1744e23d0b0 ; the mode string is _sessionModeText(+0x128) and currently reads "" (this is the "PVE ZONE" slot; identified offline from the decrypted metadata, and confirmed here by SetGameModeText's own mov [rcx+0x128],rdx)
+[0:00:15.515] ok     live inspector: rider FIRST DISPATCHED on thread 24728 (slot 6); EFT.UI.PreloaderUI::Update is now ticking and batches will drain
+[0:00:15.734] warn   live inspector: no batch queued for 14s while the rider IS dispatching (10 fires). polls=757 reads=2 readFails=0 unchanged=0 lastRead=35B lastKnown=172B pending=0 batch=1 done=-1 suspended=true inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:00:15.734] info   live inspector: batch 2 (2 command(s)) handed to Unity's thread; answers land in D:\Aowlspt\aowlspt\aowlspt-inspect-out.txt
+[0:00:15.765] ok     inspect| aowlspt live inspector -- batch 2, 2 command(s), on Unity thread 24728
+[0:00:15.765] ok     inspect| > roots
+[0:00:15.765] ok     inspect|   via SceneManager::get_sceneCount / GetSceneAt, Scene::GetNameInternal / GetIsLoadedInternal / GetRootCountInternal, GameObject::get_scene_Injected, Scene::GetRootGameObjects (calls; the last one ALLOCATES)
+[0:00:15.765] ok     inspect|   3 scene(s) from SceneManager
+[0:00:15.765] ok     inspect|   scene[0] handle=-9632 name="EnvironmentUIScene" loaded=true rootCount=0
+[0:00:15.765] ok     inspect|     EnvironmentUIScene: 0 roots
+[0:00:15.765] ok     inspect|   scene[1] handle=-15990 name="LoginUIScene" loaded=true rootCount=0
+[0:00:15.765] ok     inspect|     LoginUIScene: 0 roots
+[0:00:15.765] ok     inspect|   scene[2] handle=-24920 name="PreloaderUIScene" loaded=true rootCount=0
+[0:00:15.765] ok     inspect|     PreloaderUIScene: 0 roots
+[0:00:15.765] ok     inspect|   scene[anchor] handle=-12 name="DontDestroyOnLoad"  <- the scene $preloader actually belongs to. SceneManager does NOT list it, which on this build is where the live UI is.
+[0:00:15.765] ok     inspect|     [$r0] transform=0x00000174530b2a40  go=0x00000172b4d0d620 ($rgo0)  name="StandaloneWebPlugin"   (DontDestroyOnLoad)
+[0:00:15.765] ok     inspect|     [$r1] transform=0x00000174530b2a20  go=0x00000172b4d0d560 ($rgo1)  name="WebView Thread Dispatcher"   (DontDestroyOnLoad)
+[0:00:15.765] ok     inspect|     [$r2] transform=0x00000174530b2a00  go=0x00000172b4ad9580 ($rgo2)  name="[Technical Systems]"   (DontDestroyOnLoad)
+[0:00:15.765] ok     inspect|     [$r3] transform=0x00000173db0bc380  go=0x00000172d96d45e0 ($rgo3)  name="Application (Main Client)"   (DontDestroyOnLoad)
+[0:00:15.765] ok     inspect|     [$r4] transform=0x00000172b6a680a0  go=0x00000172b6a68340 ($rgo4)  name="Canvas"   (DontDestroyOnLoad)
+[0:00:15.765] ok     inspect|     [$r5] transform=0x00000173db0bc3c0  go=0x00000173db0bc480 ($rgo5)  name="AudioListener"   (DontDestroyOnLoad)
+[0:00:15.765] ok     inspect|     [$r6] transform=0x00000174530b29e0  go=0x00000173daa023c0 ($rgo6)  name="Easy Assets"   (DontDestroyOnLoad)
+[0:00:15.765] ok     inspect|     [$r7] transform=0x00000174530b29c0  go=0x00000173dbec3140 ($rgo7)  name="___Input"   (DontDestroyOnLoad)
+[0:00:15.765] ok     inspect|     [$r8] transform=0x00000173dc229040  go=0x00000173dc026fc0 ($rgo8)  name="Environment UI"   (DontDestroyOnLoad)
+[0:00:30.812] warn   live inspector: no batch queued for 15s while the rider IS dispatching (1067 fires). polls=1661 reads=62 readFails=0 unchanged=60 lastRead=35B lastKnown=35B pending=0 batch=2 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:00:45.828] warn   live inspector: no batch queued for 30s while the rider IS dispatching (2285 fires). polls=2561 reads=122 readFails=0 unchanged=120 lastRead=35B lastKnown=35B pending=0 batch=2 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:00:50.125] info   live inspector: batch 3 (2 command(s)) handed to Unity's thread; answers land in D:\Aowlspt\aowlspt\aowlspt-inspect-out.txt
+[0:00:50.156] ok     inspect| aowlspt live inspector -- batch 3, 2 command(s), on Unity thread 24728
+[0:00:50.156] ok     inspect| > roots
+[0:00:50.156] ok     inspect|   via SceneManager::get_sceneCount / GetSceneAt, Scene::GetNameInternal / GetIsLoadedInternal / GetRootCountInternal, GameObject::get_scene_Injected, Scene::GetRootGameObjects (calls; the last one ALLOCATES)
+[0:00:50.156] ok     inspect|   2 scene(s) from SceneManager
+[0:00:50.156] ok     inspect|   scene[0] handle=-123462 name="CommonUIScene" loaded=true rootCount=0
+[0:00:50.156] ok     inspect|     CommonUIScene: 0 roots
+[0:00:50.156] ok     inspect|   scene[1] handle=-213018 name="MenuUIScene" loaded=true rootCount=0
+[0:00:50.156] ok     inspect|     MenuUIScene: 0 roots
+[0:00:50.156] ok     inspect|   scene[anchor] handle=-12 name="DontDestroyOnLoad"  <- the scene $preloader actually belongs to. SceneManager does NOT list it, which on this build is where the live UI is.
+[0:00:50.156] ok     inspect|     [$r0] transform=0x00000174530b2a40  go=0x00000172b4d0d620 ($rgo0)  name="StandaloneWebPlugin"   (DontDestroyOnLoad)
+[0:00:50.156] ok     inspect|     [$r1] transform=0x00000174530b2a20  go=0x00000172b4d0d560 ($rgo1)  name="WebView Thread Dispatcher"   (DontDestroyOnLoad)
+[0:00:50.156] ok     inspect|     [$r2] transform=0x00000174530b2a00  go=0x00000172b4ad9580 ($rgo2)  name="[Technical Systems]"   (DontDestroyOnLoad)
+[0:00:50.156] ok     inspect|     [$r3] transform=0x00000173db0bc380  go=0x00000172d96d45e0 ($rgo3)  name="Application (Main Client)"   (DontDestroyOnLoad)
+[0:00:50.156] ok     inspect|     [$r4] transform=0x00000172b6a680a0  go=0x00000172b6a68340 ($rgo4)  name="Canvas"   (DontDestroyOnLoad)
+[0:00:50.156] ok     inspect|     [$r5] transform=0x00000173db0bc3c0  go=0x00000173db0bc480 ($rgo5)  name="AudioListener"   (DontDestroyOnLoad)
+[0:00:50.156] ok     inspect|     [$r6] transform=0x00000174530b29e0  go=0x00000173daa023c0 ($rgo6)  name="Easy Assets"   (DontDestroyOnLoad)
+[0:00:50.156] ok     inspect|     [$r7] transform=0x00000174530b29c0  go=0x00000173dbec3140 ($rgo7)  name="___Input"   (DontDestroyOnLoad)
+[0:00:50.156] ok     inspect|     [$r8] transform=0x00000173dc229040  go=0x00000173dc026fc0 ($rgo8)  name="Environment UI"   (DontDestroyOnLoad)
+[0:00:50.156] ok     inspect|     [$r9] transform=0x00000174530b29a0  go=0x00000173dac103c0 ($rgo9)  name="Login UI"   (DontDestroyOnLoad)
+[0:00:50.156] ok     inspect|     [$r10] transform=0x0000017452dcf840  go=0x0000017452dcf800 ($rgo10)  name="Preloader UI"   (DontDestroyOnLoad)
+[0:00:50.156] ok     inspect|     [$r11] transform=0x000001741f23c5a0  go=0x00000174531a4560 ($rgo11)  name="[DOTween]"   (DontDestroyOnLoad)
+[0:00:50.156] ok     inspect|     [$r12] transform=0x000001741f23c580  go=0x000001745764ff60 ($rgo12)  name="Common UI"   (DontDestroyOnLoad)
+[0:00:50.156] ok     inspect|     [$r13] transform=0x00000174563cf620  go=0x00000174563cf700 ($rgo13)  name="Menu UI"   (DontDestroyOnLoad)
+[0:00:50.156] ok     inspect|   14 root(s) bound to $r0..$r13 as TRANSFORMS -- the same kind of pointer $c0 and $f1 are, so they go straight into children/tree/parent/find. The GameObject of each is $rgo0..$rgo13 (that is what `component` wants).
+[0:00:50.156] ok     inspect|   e.g.  find PvE $r9        or   children $r9
+[0:00:50.156] ok     inspect| > echo aowl-batch-121764
+[0:00:50.156] ok     inspect|   aowl-batch-121764
+[0:00:50.156] ok     inspect| aowlspt live inspector -- batch 3 complete, 27 line(s)
+[0:00:50.359] info   live inspector: batch 4 (5 command(s)) handed to Unity's thread; answers land in D:\Aowlspt\aowlspt\aowlspt-inspect-out.txt
+[0:00:55.609] ok     inspect| aowlspt live inspector -- batch 4, 5 command(s), on Unity thread 24728
+[0:00:55.609] ok     inspect| > allow write
+[0:00:55.609] ok     inspect|   writes and calls are armed FOR THIS BATCH ONLY
+[0:00:55.609] ok     inspect| > find CharacterSelectionScreen 0x00000174563cf620 120000
+[0:00:55.609] ok     inspect|   searching from 0x00000174563cf620 name="Menu UI" for name containing "CharacterSelectionScreen" (case-insensitive; budget 120000 nodes, 12ms per frame, continuing across frames automatically)
+[0:00:55.609] ok     inspect|     HIT 0x00000174563bf4c0 name="CharacterSelectionScreen"  parent="UI"   ($f1)
+[0:00:55.609] ok     inspect|   visited 10085 node(s) over 79 frame(s), 1 match(es), frontier 0 node(s)
+[0:00:55.609] ok     inspect|   -- the subtree was searched EXHAUSTIVELY. Every match is listed above.
+[0:00:55.609] ok     inspect|   matches are bound to $f1..$f1 for the rest of this batch
+[0:00:55.609] ok     inspect| > call name:Component::get_gameObject p_p $f1
+[0:00:55.609] ok     inspect|   calling UnityEngine.Component::get_gameObject @0x11f57e0 sig=p_p mi=0x0000000000000000
+[0:00:55.609] ok     inspect|   -> ptr 0x00000174563bf4a0  readable, klass=0x00000171e12067d0   (bound to $_)
+[0:00:55.609] ok     inspect| > call name:get_activeInHierarchy i_p $_
+[0:00:55.609] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:00:55.609] ok     inspect|   -> i32 1
+[0:00:55.609] ok     inspect| > echo aowl-batch-122066
+[0:00:55.609] ok     inspect|   aowl-batch-122066
+[0:00:55.609] ok     inspect| aowlspt live inspector -- batch 4 complete, 17 line(s)
+[0:00:55.640] info   live inspector: batch 5 (2 command(s)) handed to Unity's thread; answers land in D:\Aowlspt\aowlspt\aowlspt-inspect-out.txt
+[0:01:01.125] ok     inspect| aowlspt live inspector -- batch 5, 2 command(s), on Unity thread 24728
+[0:01:01.125] ok     inspect| > find CharacterSlotView 0x00000174563cf620 120000
+[0:01:01.125] ok     inspect|   searching from 0x00000174563cf620 name="Menu UI" for name containing "CharacterSlotView" (case-insensitive; budget 120000 nodes, 12ms per frame, continuing across frames automatically)
+[0:01:01.125] ok     inspect|     HIT 0x000001741e54fdc0 name="CharacterSlotView_pve"  parent="CharactersContainer"   ($f1)
+[0:01:01.125] ok     inspect|     HIT 0x000001741e54f960 name="CharacterSlotView_pvp"  parent="CharactersContainer"   ($f2)
+[0:01:01.125] ok     inspect|     HIT 0x000001741e54f480 name="CharacterSlotView_seasonal"  parent="CharactersContainer"   ($f3)
+[0:01:01.125] ok     inspect|   visited 10085 node(s) over 79 frame(s), 3 match(es), frontier 0 node(s)
+[0:01:01.125] ok     inspect|   -- the subtree was searched EXHAUSTIVELY. Every match is listed above.
+[0:01:01.125] ok     inspect|   matches are bound to $f1..$f3 for the rest of this batch
+[0:01:01.125] ok     inspect| > echo aowl-batch-127494
+[0:01:01.125] ok     inspect|   aowl-batch-127494
+[0:01:01.125] ok     inspect| aowlspt live inspector -- batch 5 complete, 11 line(s)
+[0:01:01.422] info   live inspector: batch 6 (4 command(s)) handed to Unity's thread; answers land in D:\Aowlspt\aowlspt\aowlspt-inspect-out.txt
+[0:01:01.469] ok     inspect| aowlspt live inspector -- batch 6, 4 command(s), on Unity thread 24728
+[0:01:01.469] ok     inspect| > find Title 0x000001741e54fdc0 5000
+[0:01:01.469] ok     inspect|   searching from 0x000001741e54fdc0 name="CharacterSlotView_pve" for name containing "Title" (case-insensitive; budget 5000 nodes, 12ms per frame, continuing across frames automatically)
+[0:01:01.469] ok     inspect|     HIT 0x000001741e54fc60 name="Title"  parent="Texts"   ($f1)
+[0:01:01.469] ok     inspect|   visited 65 node(s) over 1 frame(s), 1 match(es), frontier 0 node(s)
+[0:01:01.469] ok     inspect|   -- the subtree was searched EXHAUSTIVELY. Every match is listed above.
+[0:01:01.469] ok     inspect|   matches are bound to $f1..$f1 for the rest of this batch
+[0:01:01.469] ok     inspect| > component $f1 TextMeshProUGUI
+[0:01:01.469] ok     inspect|   via UnityEngine.Component::GetComponent(System.String) @0x2a48e0 (call) on 0x000001741e54fc60   type string = 0x00000173f5a50a80
+[0:01:01.469] ok     inspect|   FOUND TextMeshProUGUI component = 0x00000174578d5800  klass=0x00000171e283d7d0   ($comp)
+[0:01:01.469] ok     inspect|   bound to $comp -- e.g.  allow write   then   click $comp
+[0:01:01.469] ok     inspect| > label $comp
+[0:01:01.469] ok     inspect|   klass = 0x00000171e283d7d0   m_text(+0xE0) = 0x00000173e52d2f90
+[0:01:01.469] ok     inspect|   text = "PvE Zone"
+[0:01:01.469] ok     inspect| > echo aowl-batch-133068
+[0:01:01.469] ok     inspect|   aowl-batch-133068
+[0:01:01.469] ok     inspect| aowlspt live inspector -- batch 6 complete, 16 line(s)
+[0:01:01.656] info   live inspector: batch 7 (4 command(s)) handed to Unity's thread; answers land in D:\Aowlspt\aowlspt\aowlspt-inspect-out.txt
+[0:01:01.719] ok     inspect| aowlspt live inspector -- batch 7, 4 command(s), on Unity thread 24728
+[0:01:01.719] ok     inspect| > find Title 0x000001741e54f960 5000
+[0:01:01.719] ok     inspect|   searching from 0x000001741e54f960 name="CharacterSlotView_pvp" for name containing "Title" (case-insensitive; budget 5000 nodes, 12ms per frame, continuing across frames automatically)
+[0:01:01.719] ok     inspect|     HIT 0x000001741e54f800 name="Title"  parent="Texts"   ($f1)
+[0:01:01.719] ok     inspect|   visited 65 node(s) over 1 frame(s), 1 match(es), frontier 0 node(s)
+[0:01:01.719] ok     inspect|   -- the subtree was searched EXHAUSTIVELY. Every match is listed above.
+[0:01:01.719] ok     inspect|   matches are bound to $f1..$f1 for the rest of this batch
+[0:01:01.719] ok     inspect| > component $f1 TextMeshProUGUI
+[0:01:01.719] ok     inspect|   via UnityEngine.Component::GetComponent(System.String) @0x2a48e0 (call) on 0x000001741e54f800   type string = 0x00000173f5b15f00
+[0:01:01.719] ok     inspect|   FOUND TextMeshProUGUI component = 0x00000173e2881800  klass=0x00000171e283d7d0   ($comp)
+[0:01:01.719] ok     inspect|   bound to $comp -- e.g.  allow write   then   click $comp
+[0:01:01.719] ok     inspect| > label $comp
+[0:01:01.719] ok     inspect|   klass = 0x00000171e283d7d0   m_text(+0xE0) = 0x00000173e52d2f60
+[0:01:01.719] ok     inspect|   text = "PvE"
+[0:01:01.719] ok     inspect| > echo aowl-batch-133369
+[0:01:01.719] ok     inspect|   aowl-batch-133369
+[0:01:01.719] ok     inspect| aowlspt live inspector -- batch 7 complete, 16 line(s)
+[0:01:01.922] info   live inspector: batch 8 (4 command(s)) handed to Unity's thread; answers land in D:\Aowlspt\aowlspt\aowlspt-inspect-out.txt
+[0:01:01.984] ok     inspect| aowlspt live inspector -- batch 8, 4 command(s), on Unity thread 24728
+[0:01:01.984] ok     inspect| > find Title 0x000001741e54f480 5000
+[0:01:01.984] ok     inspect|   searching from 0x000001741e54f480 name="CharacterSlotView_seasonal" for name containing "Title" (case-insensitive; budget 5000 nodes, 12ms per frame, continuing across frames automatically)
+[0:01:01.984] ok     inspect|     HIT 0x000001741e54f2c0 name="Title"  parent="Texts"   ($f1)
+[0:01:01.984] ok     inspect|   visited 117 node(s) over 1 frame(s), 1 match(es), frontier 0 node(s)
+[0:01:01.984] ok     inspect|   -- the subtree was searched EXHAUSTIVELY. Every match is listed above.
+[0:01:01.984] ok     inspect|   matches are bound to $f1..$f1 for the rest of this batch
+[0:01:01.984] ok     inspect| > component $f1 TextMeshProUGUI
+[0:01:01.984] ok     inspect|   via UnityEngine.Component::GetComponent(System.String) @0x2a48e0 (call) on 0x000001741e54f2c0   type string = 0x00000173f5b36d40
+[0:01:01.984] ok     inspect|   FOUND TextMeshProUGUI component = 0x00000173e2aa8000  klass=0x00000171e283d7d0   ($comp)
+[0:01:01.984] ok     inspect|   bound to $comp -- e.g.  allow write   then   click $comp
+[0:01:01.984] ok     inspect| > label $comp
+[0:01:01.984] ok     inspect|   klass = 0x00000171e283d7d0   m_text(+0xE0) = 0x00000173e52d2f30
+[0:01:01.984] ok     inspect|   text = "PvP Season"
+[0:01:01.984] ok     inspect| > echo aowl-batch-133670
+[0:01:01.984] ok     inspect|   aowl-batch-133670
+[0:01:01.984] ok     inspect| aowlspt live inspector -- batch 8 complete, 16 line(s)
+[0:01:02.156] info   live inspector: batch 9 (6 command(s)) handed to Unity's thread; answers land in D:\Aowlspt\aowlspt\aowlspt-inspect-out.txt
+[0:01:05.969] ok     inspect| aowlspt live inspector -- batch 9, 6 command(s), on Unity thread 24728
+[0:01:05.969] ok     inspect| > allow write
+[0:01:05.969] ok     inspect|   writes and calls are armed FOR THIS BATCH ONLY
+[0:01:05.969] ok     inspect| > find Apply 0x000001741e54fdc0 5000
+[0:01:05.969] ok     inspect|   searching from 0x000001741e54fdc0 name="CharacterSlotView_pve" for name containing "Apply" (case-insensitive; budget 5000 nodes, 12ms per frame, continuing across frames automatically)
+[0:01:05.969] ok     inspect|     HIT 0x00000174563c0b80 name="Apply"  parent="ButtonContainer"   ($f1)
+[0:01:05.969] ok     inspect|   visited 65 node(s) over 1 frame(s), 1 match(es), frontier 0 node(s)
+[0:01:05.969] ok     inspect|   -- the subtree was searched EXHAUSTIVELY. Every match is listed above.
+[0:01:05.969] ok     inspect|   matches are bound to $f1..$f1 for the rest of this batch
+[0:01:05.969] ok     inspect| > component $f1 DefaultUIButton
+[0:01:05.969] ok     inspect|   via UnityEngine.Component::GetComponent(System.String) @0x2a48e0 (call) on 0x00000174563c0b80   type string = 0x00000173f5b36280
+[0:01:05.969] ok     inspect|   FOUND DefaultUIButton component = 0x00000174579c8150  klass=0x00000171e2664810   ($comp)
+[0:01:05.969] ok     inspect|   bound to $comp -- e.g.  allow write   then   click $comp
+[0:01:05.969] ok     inspect| > press $comp
+[0:01:05.969] ok     inspect|   target klass = 0x00000171e2664810   _text(+0xB8) = "Select"   OnClick(+0x120) = 0x0000017457a948c0
+[0:01:05.969] ok     inspect|   via UnityEngine.Events.UnityEvent::Invoke @0x2c34a0 (call) on 0x0000017457a948c0
+[0:01:05.969] ok     inspect|   returned without faulting.
+[0:01:05.969] ok     inspect|   NOTE: that the handler returned is NOT proof the intended thing happened -- a click handler acts on OTHER objects. Confirm the EFFECT with `state`, `roots`, or `until`, never with this line.
+[0:01:05.969] ok     inspect|   wait: waiting up to 300 frame(s)
+[0:01:05.969] ok     inspect| > echo aowl-batch-133971
+[0:01:05.969] ok     inspect|   aowl-batch-133971
+[0:01:05.969] ok     inspect| aowlspt live inspector -- batch 9 complete, 21 line(s)
+[0:01:06.172] info   live inspector: batch 10 (5 command(s)) handed to Unity's thread; answers land in D:\Aowlspt\aowlspt\aowlspt-inspect-out.txt
+[0:01:16.187] warn   live inspector: no batch queued for 10s while the rider IS dispatching (3260 fires). polls=4362 reads=243 readFails=0 unchanged=233 lastRead=182B lastKnown=182B pending=0 batch=10 done=-1 suspended=true inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:01:18.437] ok     inspect| aowlspt live inspector -- batch 10, 5 command(s), on Unity thread 24728
+[0:01:18.437] ok     inspect| > allow write
+[0:01:18.437] ok     inspect|   writes and calls are armed FOR THIS BATCH ONLY
+[0:01:18.437] ok     inspect| > find CharacterSelectionScreen 0x00000174563cf620 120000
+[0:01:18.437] ok     inspect|   searching from 0x00000174563cf620 name="Menu UI" for name containing "CharacterSelectionScreen" (case-insensitive; budget 120000 nodes, 12ms per frame, continuing across frames automatically)
+[0:01:18.437] ok     inspect|     HIT 0x00000174563bf4c0 name="CharacterSelectionScreen"  parent="UI"   ($f1)
+[0:01:18.437] ok     inspect|   visited 10065 node(s) over 79 frame(s), 1 match(es), frontier 0 node(s)
+[0:01:18.437] ok     inspect|   -- the subtree was searched EXHAUSTIVELY. Every match is listed above.
+[0:01:18.437] ok     inspect|   matches are bound to $f1..$f1 for the rest of this batch
+[0:01:18.437] ok     inspect| > call name:Component::get_gameObject p_p $f1
+[0:01:18.437] ok     inspect|   calling UnityEngine.Component::get_gameObject @0x11f57e0 sig=p_p mi=0x0000000000000000
+[0:01:18.437] ok     inspect|   -> ptr 0x00000174563bf4a0  readable, klass=0x00000171e12067d0   (bound to $_)
+[0:01:18.437] ok     inspect| > call name:get_activeInHierarchy i_p $_
+[0:01:18.437] ok     inspect|   calling UnityEngine.GameObject::get_activeInHierarchy @0x52a8c90 sig=i_p mi=0x0000000000000000
+[0:01:18.437] ok     inspect|   -> i32 0
+[0:01:18.437] ok     inspect| > echo aowl-batch-137890
+[0:01:18.437] ok     inspect|   aowl-batch-137890
+[0:01:18.437] ok     inspect| aowlspt live inspector -- batch 10 complete, 17 line(s)
+[0:01:23.969] info   live inspector: batch 11 (3 command(s)) handed to Unity's thread; answers land in D:\Aowlspt\aowlspt\aowlspt-inspect-out.txt
+[0:01:24.000] ok     inspect| aowlspt live inspector -- batch 11, 3 command(s), on Unity thread 24728
+[0:01:24.000] ok     inspect| > allow write
+[0:01:24.000] ok     inspect|   writes and calls are armed FOR THIS BATCH ONLY
+[0:01:24.000] ok     inspect| > roots
+[0:01:24.000] ok     inspect|   via SceneManager::get_sceneCount / GetSceneAt, Scene::GetNameInternal / GetIsLoadedInternal / GetRootCountInternal, GameObject::get_scene_Injected, Scene::GetRootGameObjects (calls; the last one ALLOCATES)
+[0:01:24.000] ok     inspect|   3 scene(s) from SceneManager
+[0:01:24.000] ok     inspect|   scene[0] handle=-123462 name="CommonUIScene" loaded=true rootCount=0
+[0:01:24.000] ok     inspect|     CommonUIScene: 0 roots
+[0:01:24.000] ok     inspect|   scene[1] handle=-213018 name="MenuUIScene" loaded=true rootCount=0
+[0:01:24.000] ok     inspect|     MenuUIScene: 0 roots
+[0:01:24.015] ok     inspect|   scene[2] handle=-1111678 name="GameUIScene" loaded=true rootCount=0
+[0:01:24.015] ok     inspect|     GameUIScene: 0 roots
+[0:01:24.015] ok     inspect|   scene[anchor] handle=-12 name="DontDestroyOnLoad"  <- the scene $preloader actually belongs to. SceneManager does NOT list it, which on this build is where the live UI is.
+[0:01:24.015] ok     inspect|     [$r0] transform=0x00000174530b2a40  go=0x00000172b4d0d620 ($rgo0)  name="StandaloneWebPlugin"   (DontDestroyOnLoad)
+[0:01:24.015] ok     inspect|     [$r1] transform=0x00000174530b2a20  go=0x00000172b4d0d560 ($rgo1)  name="WebView Thread Dispatcher"   (DontDestroyOnLoad)
+[0:01:24.015] ok     inspect|     [$r2] transform=0x00000174530b2a00  go=0x00000172b4ad9580 ($rgo2)  name="[Technical Systems]"   (DontDestroyOnLoad)
+[0:01:24.015] ok     inspect|     [$r3] transform=0x00000173db0bc380  go=0x00000172d96d45e0 ($rgo3)  name="Application (Main Client)"   (DontDestroyOnLoad)
+[0:01:24.015] ok     inspect|     [$r4] transform=0x00000172b6a680a0  go=0x00000172b6a68340 ($rgo4)  name="Canvas"   (DontDestroyOnLoad)
+[0:01:24.015] ok     inspect|     [$r5] transform=0x00000173db0bc3c0  go=0x00000173db0bc480 ($rgo5)  name="AudioListener"   (DontDestroyOnLoad)
+[0:01:24.015] ok     inspect|     [$r6] transform=0x00000174530b29e0  go=0x00000173daa023c0 ($rgo6)  name="Easy Assets"   (DontDestroyOnLoad)
+[0:01:24.015] ok     inspect|     [$r7] transform=0x00000174530b29c0  go=0x00000173dbec3140 ($rgo7)  name="___Input"   (DontDestroyOnLoad)
+[0:01:24.015] ok     inspect|     [$r8] transform=0x00000173dc229040  go=0x00000173dc026fc0 ($rgo8)  name="Environment UI"   (DontDestroyOnLoad)
+[0:01:24.015] ok     inspect|     [$r9] transform=0x00000174530b29a0  go=0x00000173dac103c0 ($rgo9)  name="Login UI"   (DontDestroyOnLoad)
+[0:01:24.015] ok     inspect|     [$r10] transform=0x0000017452dcf840  go=0x0000017452dcf800 ($rgo10)  name="Preloader UI"   (DontDestroyOnLoad)
+[0:01:24.015] ok     inspect|     [$r11] transform=0x000001741f23c5a0  go=0x00000174531a4560 ($rgo11)  name="[DOTween]"   (DontDestroyOnLoad)
+[0:01:24.015] ok     inspect|     [$r12] transform=0x000001741f23c580  go=0x000001745764ff60 ($rgo12)  name="Common UI"   (DontDestroyOnLoad)
+[0:01:24.015] ok     inspect|     [$r13] transform=0x00000174563cf620  go=0x00000174563cf700 ($rgo13)  name="Menu UI"   (DontDestroyOnLoad)
+[0:01:24.015] ok     inspect|     [$r14] transform=0x000001744d44ba20  go=0x000001744d44bb40 ($rgo14)  name="Game Scene"   (DontDestroyOnLoad)
+[0:01:24.015] ok     inspect|     [$r15] transform=0x00000174e3dec320  go=0x00000174e3dec340 ($rgo15)  name="POOLS"   (DontDestroyOnLoad)
+[0:01:24.015] ok     inspect|   16 root(s) bound to $r0..$r15 as TRANSFORMS -- the same kind of pointer $c0 and $f1 are, so they go straight into children/tree/parent/find. The GameObject of each is $rgo0..$rgo15 (that is what `component` wants).
+[0:01:24.015] ok     inspect|   e.g.  find PvE $r9        or   children $r9
+[0:01:24.015] ok     inspect| > echo aowl-batch-155700
+[0:01:24.015] ok     inspect|   aowl-batch-155700
+[0:01:24.015] ok     inspect| aowlspt live inspector -- batch 11 complete, 33 line(s)
+[0:01:24.015] warn   menu mode text: the PreloaderUI.Update hook has fired 3600 times and the backend has never sent a `menuModeText`, so the corner label is still the game's stock text. The hook is fine; the SOURCE is missing. Check that the backend is reachable (backendPort in aowlspt-host.json, or backendUrl in the installer's backend.json) and that the manager mod is running.
+[0:01:24.484] info   live inspector: batch 12 (6 command(s)) handed to Unity's thread; answers land in D:\Aowlspt\aowlspt\aowlspt-inspect-out.txt
+[0:01:25.875] ok     settings probe: SettingsScreen.Show fired on thread 24728 (host thread 22792); this=0x172d9f42bd0 -- Unity's main thread
+[0:01:25.875] ok     settings probe: tab=game _createdControls list is null/unreadable -- expected for any tab the user has not selected yet; only the SELECTED tab is built
+[0:01:25.875] ok     settings probe: tab=graphics _createdControls list is null/unreadable -- expected for any tab the user has not selected yet; only the SELECTED tab is built
+[0:01:25.875] ok     settings probe: tab=postfx _createdControls list is null/unreadable -- expected for any tab the user has not selected yet; only the SELECTED tab is built
+[0:01:25.875] ok     settings probe: tab=sound _createdControls list is null/unreadable -- expected for any tab the user has not selected yet; only the SELECTED tab is built
+[0:01:25.875] ok     settings probe: tab=controls _createdControls list is null/unreadable -- expected for any tab the user has not selected yet; only the SELECTED tab is built
+[0:01:25.875] ok     settings probe: tab=current field is null (not built yet)
+[0:01:25.875] ok     settings probe: walk done -- 5 distinct tab object(s) examined. Read-only, nothing was written.
+[0:01:25.969] ok     settings probe: ShowScreen (postfix) first fired on thread 24728 (host thread 22792) -- Unity's main thread; this=0x172d9f42bd0
+[0:01:25.969] ok     settings probe: tab built -- group=game (1) tab=0x1744ed38c80 klass=0x171e09734f0
+[0:01:25.969] ok     settings probe: tab=game _createdControls size=25
+[0:01:25.969] ok     settings probe: tab=game control[0] label='Interface language' type=0x171e08c9bb0 widget=0x1744cf7db80
+[0:01:25.969] ok     settings probe: tab=game control[1] label='Main menu background' type=0x171e08c9bb0 widget=0x1744cf7da10
+[0:01:25.969] ok     settings probe: tab=game control[2] label='Profile icon' type=0x171e08c9bb0 widget=0x1744cf7d8a0
+[0:01:25.969] ok     settings probe: tab=game control[3] label='Quick slots' type=0x171e08c9bb0 widget=0x1744cf7d730
+[0:01:25.969] ok     settings probe: tab=game control[4] label='Stamina and stance' type=0x171e08c9bb0 widget=0x1744cf7d450
+[0:01:25.969] ok     settings probe: tab=game control[5] label='Health condition' type=0x171e08c9bb0 widget=0x1744cf7d2e0
+[0:01:25.969] ok     settings probe: tab=game control[6] label='Health color scheme' type=0x171e08c9bb0 widget=0x1744cf7d170
+[0:01:25.969] ok     settings probe: tab=game control[7] label='Highlight available operations' type=0x171e08c9bb0 widget=0x1744cf7d000
+[0:01:25.969] ok     settings probe: tab=game control[8] label='Priority window' type=0x171e08c9bb0 widget=0x1744c751e60
+[0:01:25.969] ok     settings probe: tab=game control[9] label='Double click item quick use' type=0x171e08c9bb0 widget=0x1744c751a10
+[0:01:25.969] ok     settings probe: tab=game control[10] label='Vaulting over medium obstacles' type=0x171e08c9bb0 widget=0x1744c7518a0
+[0:01:25.969] ok     settings probe: tab=game control[11] label='Continuous medkit healing' type=0x171e08c9bb0 widget=0x1744c751730
+[0:01:25.969] ok     settings probe: tab=game control[12] label='Wishlist item notifications' type=0x171e08c9bb0 widget=0x1744c7515c0
+[0:01:25.969] ok     settings probe: tab=game control[13] label='Auto add to Wishlist' type=0x171e08c9bb0 widget=0x1744c751450
+[0:01:25.969] ok     settings probe: tab=game control[14] label='Task item warning' type=0x171e08c9bb0 widget=0x1744c7512e0
+[0:01:25.969] ok     settings probe: tab=game control[15] label='Task item search assistance' type=0x171e08c9bb0 widget=0x1744c751170
+[0:01:25.984] ok     settings probe: tab=game control[16] label='Head bobbing:' type=0x171e263ca80 widget=0x1744c6806c0
+[0:01:25.984] ok     settings probe: tab=game control[17] label='FOV:' type=0x171e263ca80 widget=0x1744c680540
+[0:01:25.984] ok     settings probe: tab=game control[18] label='Automatic RAM Cleaner' type=0x171e2bd24a0 widget=0x1743b1483c0
+[0:01:25.984] ok     settings probe: tab=game control[19] label='Only use physical cores' type=0x171e2bd24a0 widget=0x1743a21ac80
+[0:01:25.984] ok     settings probe: tab=game control[20] label='Malfunction notifications' type=0x171e2bd24a0 widget=0x1743a21ab40
+[0:01:25.984] ok     settings probe: tab=game control[21] label='Preload Hideout' type=0x171e2bd24a0 widget=0x1742cf323c0
+[0:01:25.984] ok     settings probe: tab=game control[22] label='Block group invites' type=0x171e2bd24a0 widget=0x1742cf32280
+[0:01:25.984] ok     settings probe: tab=game control[23] label='Trading intermediate screen' type=0x171e2bd24a0 widget=0x1744c349dc0
+[0:01:25.984] ok     settings probe: tab=game control[24] label='Helmet Camera Mode' type=0x171e2bd24a0 widget=0x1744c349c80
+[0:01:25.984] ok     settings probe: tab=game logged 25 controls
+[0:01:25.984] ok     settings probe: controls APPEARED for tab=game after 0 poll(s) -- walking them now
+[0:01:25.984] ok     settings probe: tab=game _createdControls size=25
+[0:01:25.984] ok     settings probe: tab=game control[0] label='Interface language' type=0x171e08c9bb0 widget=0x1744cf7db80
+[0:01:25.984] ok     settings probe: tab=game control[1] label='Main menu background' type=0x171e08c9bb0 widget=0x1744cf7da10
+[0:01:25.984] ok     settings probe: tab=game control[2] label='Profile icon' type=0x171e08c9bb0 widget=0x1744cf7d8a0
+[0:01:25.984] ok     settings probe: tab=game control[3] label='Quick slots' type=0x171e08c9bb0 widget=0x1744cf7d730
+[0:01:25.984] ok     settings probe: tab=game control[4] label='Stamina and stance' type=0x171e08c9bb0 widget=0x1744cf7d450
+[0:01:25.984] ok     settings probe: tab=game control[5] label='Health condition' type=0x171e08c9bb0 widget=0x1744cf7d2e0
+[0:01:25.984] ok     settings probe: tab=game control[6] label='Health color scheme' type=0x171e08c9bb0 widget=0x1744cf7d170
+[0:01:25.984] ok     settings probe: tab=game control[7] label='Highlight available operations' type=0x171e08c9bb0 widget=0x1744cf7d000
+[0:01:25.984] ok     settings probe: tab=game control[8] label='Priority window' type=0x171e08c9bb0 widget=0x1744c751e60
+[0:01:25.984] ok     settings probe: tab=game control[9] label='Double click item quick use' type=0x171e08c9bb0 widget=0x1744c751a10
+[0:01:25.984] ok     settings probe: tab=game control[10] label='Vaulting over medium obstacles' type=0x171e08c9bb0 widget=0x1744c7518a0
+[0:01:25.984] ok     settings probe: tab=game control[11] label='Continuous medkit healing' type=0x171e08c9bb0 widget=0x1744c751730
+[0:01:25.984] ok     settings probe: tab=game control[12] label='Wishlist item notifications' type=0x171e08c9bb0 widget=0x1744c7515c0
+[0:01:25.984] ok     settings probe: tab=game control[13] label='Auto add to Wishlist' type=0x171e08c9bb0 widget=0x1744c751450
+[0:01:25.984] ok     settings probe: tab=game control[14] label='Task item warning' type=0x171e08c9bb0 widget=0x1744c7512e0
+[0:01:25.984] ok     settings probe: tab=game control[15] label='Task item search assistance' type=0x171e08c9bb0 widget=0x1744c751170
+[0:01:25.984] ok     settings probe: tab=game control[16] label='Head bobbing:' type=0x171e263ca80 widget=0x1744c6806c0
+[0:01:25.984] ok     settings probe: tab=game control[17] label='FOV:' type=0x171e263ca80 widget=0x1744c680540
+[0:01:25.984] ok     settings probe: tab=game control[18] label='Automatic RAM Cleaner' type=0x171e2bd24a0 widget=0x1743b1483c0
+[0:01:25.984] ok     settings probe: tab=game control[19] label='Only use physical cores' type=0x171e2bd24a0 widget=0x1743a21ac80
+[0:01:25.984] ok     settings probe: tab=game control[20] label='Malfunction notifications' type=0x171e2bd24a0 widget=0x1743a21ab40
+[0:01:25.984] ok     settings probe: tab=game control[21] label='Preload Hideout' type=0x171e2bd24a0 widget=0x1742cf323c0
+[0:01:25.984] ok     settings probe: tab=game control[22] label='Block group invites' type=0x171e2bd24a0 widget=0x1742cf32280
+[0:01:25.984] ok     settings probe: tab=game control[23] label='Trading intermediate screen' type=0x171e2bd24a0 widget=0x1744c349dc0
+[0:01:25.984] ok     settings probe: tab=game control[24] label='Helmet Camera Mode' type=0x171e2bd24a0 widget=0x1744c349c80
+[0:01:25.984] ok     settings probe: tab=game logged 25 controls
+[0:01:26.000] ok     settings write: learned float-slider klass = 0x171e263ca80 from the stock label 'FOV:'
+[0:01:26.000] ok     settings write: repaint routes on this build -- EFT.UI.LocalizedText::SetLabelText=OK TMPro.TMP_Text::set_text=OK TMPro.TMP_Text::set_havePropertiesChanged=OK
+[0:01:26.000] ok     settings write: PHASE 2a tab=game control[17] relabelled 'FOV:' -> 'FOV: [aowlspt]' (tmp=0x1744c1d8800) via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:01:26.015] ok     settings write: PHASE 2b tab=game float-slider 'Head bobbing:' = 1.000 (range 0.200..1.000)
+[0:01:26.015] ok     settings write: PHASE 2b tab=game float-slider 'FOV: [aowlspt]' = 75.000 (range 50.000..75.000)
+[0:01:26.015] ok     settings write: PHASE 2b tab=game read 0 toggle(s) and 2 float slider(s) live. Read-only.
+[0:01:26.015] ok     settings pages: entry #1 tab='game' tabPtr=0x1744ed38c80 on=true off=false pages=0 toggleKlass(before census)=0x0
+[0:01:26.015] ok     settings pages: after the census on this same tab visit -- toggle=0x0 float=0x171e263ca80 dropdown=0x0 select=0x0. A zero here means the stock anchor label for that type was not found on this tab (a non-English client will do that), which is why the donor is no longer required to be a learned toggle.
+[0:01:26.031] ok     settings pages: registry was empty; built the host page -> 1 page(s), 13 row(s)
+[0:01:26.031] ok     settings pages: row container reached by walking from a live control -- control=0x1744cf133c0 rowGo=0x1744cf57c80 rowT=0x1744cf57d60 containerT=0x174563451e0 containerGo=0x1745763b800. New rows become siblings of the stock rows, so the tab's own layout group places them.
+[0:01:26.078] ok     settings pages: page 'host' donor=0x1744cf133c0 chosen by most common klass 0x171e08c9bb0 (16 row(s) of it on this tab; the toggle klass was never learned, so the donor is chosen by shape rather than by name); parent=0x1745763b800
+[0:01:26.094] ok     settings pages: cloned row 'aowlspt - host' (control=0x1744c3c1f00) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:01:26.094] ok     settings pages: cloned row 'F3 debug panel  (not done yet)' (control=0x1744c3c1e40) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:01:26.094] ok     settings pages: NOT seeding a toggle value -- the cloned row's widget klass is 0x171e2f43600 and the learned toggle klass is 0x0 (never learned: no stock toggle row was found on this tab, which a non-English client will also do). Calling Toggle::SetIsOnWithoutNotify on it FAULTS, and the caught fault used to abort the rest of the page render -- which is what made the page clone itself on every tab visit. The row is left showing the donor's value; that is cosmetic and safe.
+[0:01:26.094] ok     settings pages/geom: --- donor vs clone, one shot ---
+[0:01:26.094] ok     settings pages/geom DONOR(control): comp=0x1744cf133c0 go=0x1744cf57c80 name='Settings Drop Down(Clone)' activeSelf=1 activeInHierarchy=1 layer=5
+[0:01:26.094] ok     settings pages/geom DONOR(control): rect=[x=-600.0 y=-35.0 w=600.0 h=35.0] anchoredPos=(0.0,0.0) sizeDelta=(600.0,35.0) anchorMin=(0.0,1.0) pivot=(1.0,1.0) localPos=(-376.00,0.00,0.00) localScale=(1.00,1.00,1.00)
+[0:01:26.094] ok     settings pages/geom DONOR(control): parent[0]=0x174563451e0 name='Settings' activeSelf=1 rect=[x=-376.0 y=-664.0 w=752.0 h=664.0] localScale=(1.00,1.00,1.00)
+[0:01:26.094] ok     settings pages/geom CLONE(control): comp=0x1744c3c1e40 go=0x1744cfd1b40 name='Settings Drop Down(Clone)(Clone)' activeSelf=1 activeInHierarchy=1 layer=5
+[0:01:26.094] ok     settings pages/geom CLONE(control): rect=[x=-600.0 y=-35.0 w=600.0 h=35.0] anchoredPos=(0.0,0.0) sizeDelta=(600.0,35.0) anchorMin=(0.0,1.0) pivot=(1.0,1.0) localPos=(-376.00,0.00,0.00) localScale=(1.00,1.00,1.00)
+[0:01:26.094] ok     settings pages/geom CLONE(control): parent[0]=0x174563451e0 name='Settings' activeSelf=1 rect=[x=-376.0 y=-664.0 w=752.0 h=664.0] localScale=(1.00,1.00,1.00)
+[0:01:26.094] ok     settings pages/geom DONOR(label TMP): comp=0x1744c4f4800 go=0x1744cf57c60 name='Text' activeSelf=1 activeInHierarchy=1 layer=5
+[0:01:26.094] ok     settings pages/geom DONOR(label TMP): rect=[x=-290.0 y=-17.5 w=290.0 h=35.0] anchoredPos=(-10.0,0.0) sizeDelta=(-10.0,0.0) anchorMin=(0.0,0.0) pivot=(1.0,0.5) localPos=(-310.00,-17.50,0.00) localScale=(1.00,1.00,1.00)
+[0:01:26.109] ok     settings pages/geom DONOR(label TMP): parent[0]=0x1744cf57d60 name='Settings Drop Down(Clone)' activeSelf=1 rect=[x=-600.0 y=-35.0 w=600.0 h=35.0] localScale=(1.00,1.00,1.00)
+[0:01:26.109] ok     settings pages/geom CLONE(label TMP): comp=0x17447001800 go=0x1744cfd1b20 name='Text' activeSelf=1 activeInHierarchy=1 layer=5
+[0:01:26.109] ok     settings pages/geom CLONE(label TMP): rect=[x=-290.0 y=-17.5 w=290.0 h=35.0] anchoredPos=(-10.0,0.0) sizeDelta=(-10.0,0.0) anchorMin=(0.0,0.0) pivot=(1.0,0.5) localPos=(-310.00,-17.50,0.00) localScale=(1.00,1.00,1.00)
+[0:01:26.109] ok     settings pages/geom CLONE(label TMP): parent[0]=0x1744cfd1c20 name='Settings Drop Down(Clone)(Clone)' activeSelf=1 rect=[x=-600.0 y=-35.0 w=600.0 h=35.0] localScale=(1.00,1.00,1.00)
+[0:01:26.109] ok     settings pages/geom PARENT: go=0x1745763b800 name='Settings' rect=[x=-376.0 y=-664.0 w=752.0 h=664.0] activeSelf=1 localScale=(1.00,1.00,1.00)
+[0:01:26.109] ok     settings pages: cloned row 'In-world AI markers  (not done yet)' (control=0x1744c3c1d80) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:01:26.109] ok     settings pages: cloned row 'Bot registration logging  (not done yet)' (control=0x1744c3c1cc0) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:01:26.125] ok     settings pages: cloned row 'Lift the bot cap  (not done yet)' (control=0x1744c3c1c00) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:01:26.125] ok     settings pages: cloned row 'Bot navigation API  (not done yet)' (control=0x1744c3c1b40) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:01:26.125] ok     settings pages: cloned row 'Bot AI activation rescue  (not done yet)' (control=0x1744c3c1a80) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:01:26.140] ok     settings pages: cloned row 'OS window-close fix  (not done yet)' (control=0x1744c3c19c0) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:01:26.140] ok     settings pages: cloned row 'Brand the version label  (not done yet)' (control=0x1744c3c1900) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:01:26.140] ok     settings pages: cloned row 'Menu corner label  (not done yet)' (control=0x1744c3c1840) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:01:26.156] ok     settings pages: cloned row 'Settings-screen probe  (not done yet)' (control=0x1744c3c1780) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:01:26.156] ok     settings pages: cloned row 'Settings relabel proof  (not done yet)' (control=0x1744c3c16c0) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:01:26.156] ok     settings pages: cloned row 'Settings value read-back  (not done yet)' (control=0x1744c3c1600) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:01:26.172] ok     settings pages: cloned row 'Native mod settings pages  (not done yet)' (control=0x1744c3c1540) labelled via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:01:26.172] ok     settings pages: page 'host' rendered 13 row(s) of 13
+[0:01:26.172] ok     settings pages: write-back check -- local pg.renderedFor=0x1744ed38c80 registry gSwPages[i].renderedFor=0x1744ed38c80  local rows=13 registry rows=13  local row0.clone=0x1744c3c1e40 registry row0.clone=0x1744c3c1e40
+[0:01:26.172] ok     settings write: VERDICT (revisit tab=game) m_text has REVERTED to 'FOV:' (we wrote 'FOV: [aowlspt]'). This is cause (b) OVERWRITE -- LocalizedText re-applied its own string over ours. The relabel is re-applied on every tab visit from this build, so watch whether it now sticks.
+[0:01:26.187] ok     settings write: PHASE 2a tab=game control[17] relabelled 'FOV:' -> 'FOV: [aowlspt]' (tmp=0x1744c1d8800) via LocalizedText::SetLabelText TMP_Text::set_text 
+[0:01:26.187] ok     settings pages: entry #2 tab='game' tabPtr=0x1744ed38c80 on=true off=false pages=1 renderedFor=0x1744ed38c80 row0.clone=0x1744c3c1e40 toggleKlass(before census)=0x0
+[0:01:26.187] ok     settings pages: after the census on this same tab visit -- toggle=0x0 float=0x171e263ca80 dropdown=0x0 select=0x0. A zero here means the stock anchor label for that type was not found on this tab (a non-English client will do that), which is why the donor is no longer required to be a learned toggle.
+[0:01:26.547] ok     settings probe: Unity-thread tick is live on thread 24728 -- polling each registered tab's control list from here
+[0:01:30.234] ok     inspect| aowlspt live inspector -- batch 12, 6 command(s), on Unity thread 24728
+[0:01:30.234] ok     inspect| > allow write
+[0:01:30.234] ok     inspect|   writes and calls are armed FOR THIS BATCH ONLY
+[0:01:30.234] ok     inspect| > find SettingsButton $r10 60000
+[0:01:30.234] ok     inspect|   searching from 0x0000017452dcf840 name="Preloader UI" for name containing "SettingsButton" (case-insensitive; budget 60000 nodes, 12ms per frame, continuing across frames automatically)
+[0:01:30.234] ok     inspect|     HIT 0x0000017452dc9fa0 name="SettingsButton"  parent="Settings"   ($f1)
+[0:01:30.234] ok     inspect|   visited 4095 node(s) over 32 frame(s), 1 match(es), frontier 0 node(s)
+[0:01:30.234] ok     inspect|   -- the subtree was searched EXHAUSTIVELY. Every match is listed above.
+[0:01:30.234] ok     inspect|   matches are bound to $f1..$f1 for the rest of this batch
+[0:01:30.234] ok     inspect| > component $f1 AnimatedToggle
+[0:01:30.234] ok     inspect|   via UnityEngine.Component::GetComponent(System.String) @0x2a48e0 (call) on 0x0000017452dc9fa0   type string = 0x000001743a11d400
+[0:01:30.234] ok     inspect|   FOUND AnimatedToggle component = 0x00000173db303bd0  klass=0x00000171e2f98030   ($comp)
+[0:01:30.234] ok     inspect|   bound to $comp -- e.g.  allow write   then   click $comp
+[0:01:30.234] ok     inspect| > call rva:0x55ba430 v_pb $comp 1
+[0:01:30.234] ok     inspect|   calling rva 0x55ba430 -> 0x00007ffdaaa2a430 (unverified prologue) sig=v_pb mi=0x0000000000000000
+[0:01:30.234] ok     inspect|   -> returned without faulting (void)
+[0:01:30.234] ok     inspect|   wait: waiting up to 240 frame(s)
+[0:01:30.234] ok     inspect| > echo aowl-batch-156136
+[0:01:30.234] ok     inspect|   aowl-batch-156136
+[0:01:30.234] ok     inspect| aowlspt live inspector -- batch 12 complete, 19 line(s)
+[0:01:34.484] warn   live inspector: no batch queued for 10s while the rider IS dispatching (4151 fires). polls=5462 reads=316 readFails=0 unchanged=304 lastRead=144B lastKnown=144B pending=0 batch=12 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:01:45.781] info   live inspector: batch 13 (2 command(s)) handed to Unity's thread; answers land in D:\Aowlspt\aowlspt\aowlspt-inspect-out.txt
+[0:01:45.797] ok     inspect| aowlspt live inspector -- batch 13, 2 command(s), on Unity thread 24728
+[0:01:45.797] ok     inspect| > state
+[0:01:45.797] ok     inspect|   anchors: $preloader=0x00000173db5d0a10 $settings=0x0000000000000000
+[0:01:45.797] ok     inspect|   inspector: menu anchor slot=6, in-raid anchor slot=-1, dispatches=4827 (of those in-raid=0)
+[0:01:45.797] ok     inspect|   channel: polls=6142 reads=361 readFails=0 unchanged=348 batch=13 ticks=13 faults=1 escapes=0
+[0:01:45.797] ok     inspect|   settings: NOT KNOWN. The host learns the SettingsScreen pointer the first time that screen is opened; it has not been opened this session. This is why the anchor is null -- not a read failure.
+[0:01:45.797] ok     inspect| > echo aowl-batch-177459
+[0:01:45.797] ok     inspect|   aowl-batch-177459
+[0:01:45.797] ok     inspect| aowlspt live inspector -- batch 13 complete, 8 line(s)
+[0:01:55.828] warn   live inspector: no batch queued for 10s while the rider IS dispatching (5426 fires). polls=6747 reads=401 readFails=0 unchanged=388 lastRead=37B lastKnown=37B pending=0 batch=13 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:02:11.015] warn   live inspector: no batch queued for 25s while the rider IS dispatching (6332 fires). polls=7661 reads=461 readFails=0 unchanged=448 lastRead=37B lastKnown=37B pending=0 batch=13 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:02:22.031] info   live inspector: batch 14 (2 command(s)) handed to Unity's thread; answers land in D:\Aowlspt\aowlspt\aowlspt-inspect-out.txt
+[0:02:22.062] ok     inspect| aowlspt live inspector -- batch 14, 2 command(s), on Unity thread 24728
+[0:02:22.062] ok     inspect| > roots
+[0:02:22.062] ok     inspect|   via SceneManager::get_sceneCount / GetSceneAt, Scene::GetNameInternal / GetIsLoadedInternal / GetRootCountInternal, GameObject::get_scene_Injected, Scene::GetRootGameObjects (calls; the last one ALLOCATES)
+[0:02:22.062] ok     inspect|   3 scene(s) from SceneManager
+[0:02:22.062] ok     inspect|   scene[0] handle=-123462 name="CommonUIScene" loaded=true rootCount=0
+[0:02:22.062] ok     inspect|     CommonUIScene: 0 roots
+[0:02:22.062] ok     inspect|   scene[1] handle=-213018 name="MenuUIScene" loaded=true rootCount=0
+[0:02:22.062] ok     inspect|     MenuUIScene: 0 roots
+[0:02:22.062] ok     inspect|   scene[2] handle=-1111678 name="GameUIScene" loaded=true rootCount=0
+[0:02:22.062] ok     inspect|     GameUIScene: 0 roots
+[0:02:22.062] ok     inspect|   scene[anchor] handle=-12 name="DontDestroyOnLoad"  <- the scene $preloader actually belongs to. SceneManager does NOT list it, which on this build is where the live UI is.
+[0:02:22.062] ok     inspect|     [$r0] transform=0x00000174530b2a40  go=0x00000172b4d0d620 ($rgo0)  name="StandaloneWebPlugin"   (DontDestroyOnLoad)
+[0:02:22.062] ok     inspect|     [$r1] transform=0x00000174530b2a20  go=0x00000172b4d0d560 ($rgo1)  name="WebView Thread Dispatcher"   (DontDestroyOnLoad)
+[0:02:22.062] ok     inspect|     [$r2] transform=0x00000174530b2a00  go=0x00000172b4ad9580 ($rgo2)  name="[Technical Systems]"   (DontDestroyOnLoad)
+[0:02:22.062] ok     inspect|     [$r3] transform=0x00000173db0bc380  go=0x00000172d96d45e0 ($rgo3)  name="Application (Main Client)"   (DontDestroyOnLoad)
+[0:02:22.062] ok     inspect|     [$r4] transform=0x00000172b6a680a0  go=0x00000172b6a68340 ($rgo4)  name="Canvas"   (DontDestroyOnLoad)
+[0:02:22.062] ok     inspect|     [$r5] transform=0x00000173db0bc3c0  go=0x00000173db0bc480 ($rgo5)  name="AudioListener"   (DontDestroyOnLoad)
+[0:02:22.062] ok     inspect|     [$r6] transform=0x00000174530b29e0  go=0x00000173daa023c0 ($rgo6)  name="Easy Assets"   (DontDestroyOnLoad)
+[0:02:22.062] ok     inspect|     [$r7] transform=0x00000174530b29c0  go=0x00000173dbec3140 ($rgo7)  name="___Input"   (DontDestroyOnLoad)
+[0:02:22.062] ok     inspect|     [$r8] transform=0x00000173dc229040  go=0x00000173dc026fc0 ($rgo8)  name="Environment UI"   (DontDestroyOnLoad)
+[0:02:22.062] ok     inspect|     [$r9] transform=0x00000174530b29a0  go=0x00000173dac103c0 ($rgo9)  name="Login UI"   (DontDestroyOnLoad)
+[0:02:22.062] ok     inspect|     [$r10] transform=0x0000017452dcf840  go=0x0000017452dcf800 ($rgo10)  name="Preloader UI"   (DontDestroyOnLoad)
+[0:02:22.062] ok     inspect|     [$r11] transform=0x000001741f23c5a0  go=0x00000174531a4560 ($rgo11)  name="[DOTween]"   (DontDestroyOnLoad)
+[0:02:22.062] ok     inspect|     [$r12] transform=0x000001741f23c580  go=0x000001745764ff60 ($rgo12)  name="Common UI"   (DontDestroyOnLoad)
+[0:02:22.062] ok     inspect|     [$r13] transform=0x00000174563cf620  go=0x00000174563cf700 ($rgo13)  name="Menu UI"   (DontDestroyOnLoad)
+[0:02:22.062] ok     inspect|     [$r14] transform=0x000001744d44ba20  go=0x000001744d44bb40 ($rgo14)  name="Game Scene"   (DontDestroyOnLoad)
+[0:02:22.062] ok     inspect|     [$r15] transform=0x00000174e3dec320  go=0x00000174e3dec340 ($rgo15)  name="POOLS"   (DontDestroyOnLoad)
+[0:02:22.062] ok     inspect|   16 root(s) bound to $r0..$r15 as TRANSFORMS -- the same kind of pointer $c0 and $f1 are, so they go straight into children/tree/parent/find. The GameObject of each is $rgo0..$rgo15 (that is what `component` wants).
+[0:02:22.062] ok     inspect|   e.g.  find PvE $r9        or   children $r9
+[0:02:22.062] ok     inspect| > echo aowl-batch-213763
+[0:02:22.062] ok     inspect|   aowl-batch-213763
+[0:02:22.062] ok     inspect| aowlspt live inspector -- batch 14 complete, 31 line(s)
+[0:02:22.281] info   live inspector: batch 15 (4 command(s)) handed to Unity's thread; answers land in D:\Aowlspt\aowlspt\aowlspt-inspect-out.txt
+[0:02:23.750] ok     inspect| aowlspt live inspector -- batch 15, 4 command(s), on Unity thread 24728
+[0:02:23.765] ok     inspect| > find AlphaLabel 0x0000017452dcf840 60000
+[0:02:23.765] ok     inspect|   searching from 0x0000017452dcf840 name="Preloader UI" for name containing "AlphaLabel" (case-insensitive; budget 60000 nodes, 12ms per frame, continuing across frames automatically)
+[0:02:23.765] ok     inspect|     HIT 0x00000173dc555ba0 name="AlphaLabel"  parent="UpperPart"   ($f1)
+[0:02:23.765] ok     inspect|   visited 4095 node(s) over 32 frame(s), 1 match(es), frontier 0 node(s)
+[0:02:23.765] ok     inspect|   -- the subtree was searched EXHAUSTIVELY. Every match is listed above.
+[0:02:23.765] ok     inspect|   matches are bound to $f1..$f1 for the rest of this batch
+[0:02:23.765] ok     inspect| > component $f1 TextMeshProUGUI
+[0:02:23.765] ok     inspect|   via UnityEngine.Component::GetComponent(System.String) @0x2a48e0 (call) on 0x00000173dc555ba0   type string = 0x000001743986f180
+[0:02:23.765] ok     inspect|   FOUND TextMeshProUGUI component = 0x000001744e2c2800  klass=0x00000171e283cda0   ($comp)
+[0:02:23.765] ok     inspect|   bound to $comp -- e.g.  allow write   then   click $comp
+[0:02:23.765] ok     inspect| > label $comp
+[0:02:23.765] ok     inspect|   klass = 0x00000171e283cda0   m_text(+0xE0) = 0x00000174530054b0
+[0:02:23.765] ok     inspect|   text = "1.1.0.1.46777 | PvE"
+[0:02:23.765] ok     inspect| > echo aowl-batch-214064
+[0:02:23.765] ok     inspect|   aowl-batch-214064
+[0:02:23.765] ok     inspect| aowlspt live inspector -- batch 15 complete, 16 line(s)
+[0:02:24.031] info   live inspector: batch 16 (3 command(s)) handed to Unity's thread; answers land in D:\Aowlspt\aowlspt\aowlspt-inspect-out.txt
+[0:02:24.047] ok     inspect| aowlspt live inspector -- batch 16, 3 command(s), on Unity thread 24728
+[0:02:24.047] ok     inspect| > allow write
+[0:02:24.047] ok     inspect|   writes and calls are armed FOR THIS BATCH ONLY
+[0:02:24.047] ok     inspect| > settext 0x000001744e2c2800 aowlspt 1.0, aoughwl.com  -  tarkov 1.1.0.1.46777 | PvE
+[0:02:24.047] ok     inspect|   before = "1.1.0.1.46777 | PvE"
+[0:02:24.047] ok     inspect|   routes  = TMP_Text::set_text 
+[0:02:24.047] ok     inspect|   after  = "aowlspt 1.0, aoughwl.com - tarkov 1.1.0.1.46777 | PvE"
+[0:02:24.047] ok     inspect|   VERIFIED: the label now reads what was asked for.
+[0:02:24.047] ok     inspect| > echo aowl-batch-215721
+[0:02:24.047] ok     inspect|   aowl-batch-215721
+[0:02:24.047] ok     inspect| aowlspt live inspector -- batch 16 complete, 10 line(s)
+[0:02:34.078] warn   live inspector: no batch queued for 10s while the rider IS dispatching (7653 fires). polls=9049 reads=553 readFails=0 unchanged=537 lastRead=126B lastKnown=126B pending=0 batch=16 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:02:49.125] warn   live inspector: no batch queued for 25s while the rider IS dispatching (8550 fires). polls=9954 reads=613 readFails=0 unchanged=597 lastRead=126B lastKnown=126B pending=0 batch=16 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:03:04.172] warn   live inspector: no batch queued for 40s while the rider IS dispatching (9449 fires). polls=10860 reads=673 readFails=0 unchanged=657 lastRead=126B lastKnown=126B pending=0 batch=16 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:03:19.359] warn   live inspector: no batch queued for 55s while the rider IS dispatching (10355 fires). polls=11774 reads=733 readFails=0 unchanged=717 lastRead=126B lastKnown=126B pending=0 batch=16 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:03:34.390] warn   live inspector: no batch queued for 70s while the rider IS dispatching (11252 fires). polls=12679 reads=793 readFails=0 unchanged=777 lastRead=126B lastKnown=126B pending=0 batch=16 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:03:49.437] warn   live inspector: no batch queued for 85s while the rider IS dispatching (12151 fires). polls=13585 reads=853 readFails=0 unchanged=837 lastRead=126B lastKnown=126B pending=0 batch=16 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:04:04.453] warn   live inspector: no batch queued for 100s while the rider IS dispatching (13046 fires). polls=14489 reads=913 readFails=0 unchanged=897 lastRead=126B lastKnown=126B pending=0 batch=16 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:04:19.500] warn   live inspector: no batch queued for 115s while the rider IS dispatching (13944 fires). polls=15395 reads=973 readFails=0 unchanged=957 lastRead=126B lastKnown=126B pending=0 batch=16 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:04:34.515] warn   live inspector: no batch queued for 130s while the rider IS dispatching (14841 fires). polls=16299 reads=1033 readFails=0 unchanged=1017 lastRead=126B lastKnown=126B pending=0 batch=16 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:04:49.562] warn   live inspector: no batch queued for 145s while the rider IS dispatching (15738 fires). polls=17205 reads=1093 readFails=0 unchanged=1077 lastRead=126B lastKnown=126B pending=0 batch=16 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:05:04.734] warn   live inspector: no batch queued for 160s while the rider IS dispatching (16644 fires). polls=18117 reads=1153 readFails=0 unchanged=1137 lastRead=126B lastKnown=126B pending=0 batch=16 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:05:19.984] warn   live inspector: no batch queued for 175s while the rider IS dispatching (17554 fires). polls=19036 reads=1214 readFails=0 unchanged=1198 lastRead=126B lastKnown=126B pending=0 batch=16 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:05:35.015] warn   live inspector: no batch queued for 190s while the rider IS dispatching (18451 fires). polls=19940 reads=1274 readFails=0 unchanged=1258 lastRead=126B lastKnown=126B pending=0 batch=16 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:05:50.047] warn   live inspector: no batch queued for 206s while the rider IS dispatching (19348 fires). polls=20844 reads=1334 readFails=0 unchanged=1318 lastRead=126B lastKnown=126B pending=0 batch=16 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:06:05.094] warn   live inspector: no batch queued for 221s while the rider IS dispatching (20245 fires). polls=21750 reads=1394 readFails=0 unchanged=1378 lastRead=126B lastKnown=126B pending=0 batch=16 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:06:20.187] warn   live inspector: no batch queued for 236s while the rider IS dispatching (21146 fires). polls=22657 reads=1454 readFails=0 unchanged=1438 lastRead=126B lastKnown=126B pending=0 batch=16 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:06:35.437] warn   live inspector: no batch queued for 251s while the rider IS dispatching (22056 fires). polls=23575 reads=1515 readFails=0 unchanged=1499 lastRead=126B lastKnown=126B pending=0 batch=16 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:06:50.515] warn   live inspector: no batch queued for 266s while the rider IS dispatching (22955 fires). polls=24483 reads=1575 readFails=0 unchanged=1559 lastRead=126B lastKnown=126B pending=0 batch=16 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:07:05.594] warn   live inspector: no batch queued for 281s while the rider IS dispatching (23843 fires). polls=25386 reads=1635 readFails=0 unchanged=1619 lastRead=126B lastKnown=126B pending=0 batch=16 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt

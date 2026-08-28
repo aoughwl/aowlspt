@@ -1,0 +1,240 @@
+aowlspt-host-il2cpp 0.1.0
+directory D:\Aowlspt\aowlspt
+thread 27616
+
+[0:00:00.000] ok     BSG's BattlEye service guard is answered from inside the process (4 import slots); BattlEye is not installed, started or loaded
+[0:00:00.000] info   codeGenAudit is set: whenever a method has BOTH a live methodPointer and a codeGenModule table entry, the host will log whether the two agree. Read-only -- it patches nothing.
+[0:00:00.000] info   botDiag is set: a READ-ONLY detour on EFT.GameWorld.RegisterPlayer will log each bot/player registration and enumerate the registered list (nickname, side/role, alive-state, position) during an offline raid -- it answers spawned-but-frozen vs absent. NO write is performed.
+[0:00:00.000] info   unlimitedBots is set: a kind=6 detour on EFT.BotSpawner.AddPlayer will poke BotSpawner.MaxBots=0 (unlimited) once at offline-raid init, lifting the cap that defers the scav wave pool (bosses bypass it via IgnoreMaxBots; scavs do not). One guarded int32 write on the Unity thread; fail-safe -- no write if the build/pointer does not check out.
+[0:00:00.000] info   settingsUiProbe is set: read-only detours on SettingsScreen.Show (Phase 1, arming/thread proof) and a POSTFIX on SettingsScreen.EnsureTabInitialized (Phase 1.5, the walk that reads controls -- they do not exist yet at Show) will log every control's label, il2cpp klass pointer and value-widget pointer as each tab is built. Open Settings and click each tab. NO write is ever performed.
+[0:00:00.000] info   settingsRelabelProbe is set: PHASE 2a. On the ShowScreen postfix the host finds the Game-tab control whose stock label is 'FOV:' and rewrites it to 'FOV: [aowlspt]' -- one il2cpp_string_new, one raw store into m_text (+0xE0), one dirty byte (+0x378), which is the same primitive the version brand and the F3 overlay use in production. Idempotent (it never double-brands) and self-disabling after two faults. Open Settings -> Game and read the FOV row.
+[0:00:00.000] info   settingsBindProbe is set: PHASE 2b. On the same postfix the host READS the live value out of every control whose widget type it has learned this session -- a toggle's m_IsOn (+0x120) and a float slider's Slider.m_Value (+0x120) with its range -- and logs each beside its label, so the offsets can be checked against what the screen actually shows. NO value is written.
+[0:00:00.000] info   settingsPages is set: PHASE 3. On the Game tab the host renders its own settings page into the REAL settings screen, by CLONING a stock toggle row (UnityEngine.Object::Instantiate + TMP_DefaultControls::SetParentAndAlign, both byte-verified direct calls) once per row, relabelling each clone and seeding it with Toggle::SetIsOnWithoutNotify so the row shows its own value without firing the donor setting's handler. The first page is the aowlspt host's own flags out of aowlspt-host.json; a row the player changes is read back and persisted to that file. Rows that are carried but not yet wired are suffixed '(not done yet)'. Nothing the GAME created is ever written -- only clones the host made itself -- and the whole thing shares the Phase-2 fault budget.
+[0:00:00.000] info   debugUi/debugEsp is set: a per-frame detour on EFT.UI.PreloaderUI.Update (the Unity main thread) will draw a Minecraft-F3-style info panel and in-world markers over every registered AI bot out of Unity UI labels CLONED from the client's own version label (Object::Instantiate -- no reflection, no object creation). Press F3 in game to toggle it; layout is aowlspt-debugui.json and is re-read on every toggle-on, so it can be edited live. The whole body is VEH-guarded and writes only into labels it created.
+[0:00:00.000] info   uxMenuModeText is set: a postfix detour on EFT.UI.PreloaderUI.Update will set the menu's bottom-right corner label by CALLING the game's own PreloaderUI.SetGameModeText. The text comes from the backend's `menuModeText` on the mod-sync poll, which defaults to the logged-in character's name. It needs backendPort + modSyncMs. It SHARES the PreloaderUI.Update detour with debugUi/debugEsp -- one detour, one trampoline, both features dispatched from the same firing -- so all three flags can be on at once.
+[0:00:00.000] info   liveInspector is set: drop commands into aowlspt-inspect.txt beside this DLL and every save with changed content runs them ON UNITY'S MAIN THREAD, with answers in aowlspt-inspect-out.txt and in this log -- no rebuild, no restart. Start with `help` and `anchors`. Every hop is VirtualQuery-guarded, every command runs under its own VEH guard, and a caught fault reports THE LAST HOP ATTEMPTED and its pointer. Reads only unless liveInspectorWrite is also set. liveInspectorWrite IS set: a batch containing `allow write` may store into live managed objects and CALL game code.
+[0:00:00.000] info   uxVersionBrand is set: a postfix detour on PreloaderUI.Awake will probe the version label on the Unity thread (read-only: logs thread, readability, class, and String fields; no managed write) (fail-safe: unbranded if the build or timing does not match)
+[0:00:00.000] ok     imageCdnRedirect is set: getaddrinfo hooked (GetAddrInfoW getaddrinfo ); s3-*.escapefromtarkov.com -> 127.0.0.1, and every resolved host is logged once to confirm the real image host
+[0:00:00.000] info   waiting for the IL2CPP runtime (up to 120s)
+[0:00:01.016] ok     il2cpp_init returned 1 after 900ms
+[0:00:01.016] ok     IL2CPP is up after 900ms: il2cpp_init returned 1 and was handed out 2 time(s)
+[0:00:01.016] ok     IL2CPP runtime bound, all essential entry points present
+[0:00:01.016] ok     anti-cheat: BE client validation gate neutered (2/2 patches)
+[0:00:01.016] ok     exit fix: confirmed Exit redirected to ExitProcess(0) (2/2 sites; primary = the confirm-accept lambda, before the async exit-loading shutdown that was hanging)
+[0:00:01.016] info   exit fix: game window not up yet; the OS-close hooks will be installed from the host tick loop once the UI thread exists (Exit button is already patched)
+[0:00:01.016] info   146 assemblies loaded
+[0:00:01.016] info   31282 types visible
+[0:00:01.016] ok     prologue snapshot: captured the original bytes of 48 target(s) before any detour was installed (48 primed). Every later prologue check compares against this, not against live memory, so two features may share one target and both still verify it.
+[0:00:01.016] info   deep-probe: MethodInfo for EFT.TarkovApplication::Update is not readable
+[0:00:01.016] info   no usable code pointer for EFT.TarkovApplication::Update
+[0:00:01.016] info   deep-probe: MethodInfo for EFT.GameWorldUnityTickListener::Update is not readable
+[0:00:01.016] info   no usable code pointer for EFT.GameWorldUnityTickListener::Update
+[0:00:01.016] info   deep-probe: MethodInfo for EFT.GameWorld::Update is not readable
+[0:00:01.016] info   no usable code pointer for EFT.GameWorld::Update
+[0:00:01.016] info   deep-probe: MethodInfo for UnityEngine.UI.CanvasUpdateRegistry::PerformUpdate is not readable
+[0:00:01.016] info   no usable code pointer for UnityEngine.UI.CanvasUpdateRegistry::PerformUpdate
+[0:00:01.016] info   deep-probe: MethodInfo for UnityEngine.Time::get_deltaTime is not readable
+[0:00:01.016] info   no usable code pointer for UnityEngine.Time::get_deltaTime
+[0:00:01.016] warn   no per-frame method could be detoured, so invoke_main runs on the host's own thread (27616) and not Unity's; a callback that touches a Unity object is unsafe
+[0:00:01.016] info   deep-probe: MethodInfo for OnRenderObjectManager::OnRenderObject is not readable
+[0:00:01.016] info   no usable code pointer for OnRenderObjectManager::OnRenderObject
+[0:00:01.016] info   deep-probe: MethodInfo for EFT.CameraControl.CameraLodBiasController::OnPostRender is not readable
+[0:00:01.016] info   no usable code pointer for EFT.CameraControl.CameraLodBiasController::OnPostRender
+[0:00:01.016] info   no render-phase point bound yet; invoke_render (GL/ESP drawing) is unavailable until a raid brings up a render callback to detour
+[0:00:01.016] ok     settings-ui-probe bound to EFT.UI.Settings.SettingsScreen::Show (16 bytes)
+[0:00:01.016] ok     settings-UI probe (Phase 1) armed on EFT.UI.Settings.SettingsScreen::Show; open the in-game settings screen to log its control tree
+[0:00:01.016] ok     settings-tick-probe bound to EFT.UI.Settings.GameSettingsTab::Update (16 bytes)
+[0:00:01.016] ok     settings-UI CONTROL poll (Phase 1.7) armed on EFT.UI.Settings.GameSettingsTab::Update; it polls every registered tab's control list once per 20 frames while Settings is open, and field-scans any tab that stays empty -- so the controls get reported whenever they appear, whatever creates them
+[0:00:01.016] ok     settings-tab-probe bound to EFT.UI.Settings.SettingsScreen::ShowScreen (15 bytes)
+[0:00:01.016] ok     settings-UI control probe (Phase 1.8) armed POSTFIX on EFT.UI.Settings.SettingsScreen::ShowScreen; open Settings and click each tab -- every control's label, klass and value-widget pointer is logged as the tab is built
+[0:00:01.016] ok     version-brand bound to EFT.UI.PreloaderUI::Awake (16 bytes)
+[0:00:01.016] ok     version brand armed on EFT.UI.PreloaderUI::Awake (postfix); the bottom-left version label will read "aowlspt â€” <version>"
+[0:00:01.016] ok     botdiag bound to EFT.GameWorld::RegisterPlayer (18 bytes)
+[0:00:01.016] ok     botdiag (read-only bot/player census) armed on EFT.GameWorld::RegisterPlayer; enter an offline raid to log each spawn + the registered list
+[0:00:01.016] ok     botcap bound to EFT.BotSpawner::AddPlayer (17 bytes)
+[0:00:01.016] ok     botcap (offline bot-cap lift) armed on EFT.BotSpawner::AddPlayer; enter an offline raid to poke BotSpawner.MaxBots=0 (unlimited)
+[0:00:01.016] ok     debugui: 27 of 27 managed targets verified by RVA + prologue on this build
+[0:00:01.032] ok     debug-overlay bound to EFT.UI.PreloaderUI::Update (15 bytes)
+[0:00:01.032] ok     debugui CLAIMED the shared EFT.UI.PreloaderUI::Update detour (slot 6, prefix, per-frame, Unity thread); uxMenuModeText will ride on this same detour if it is on. Press F3 in game to show the panel; layout comes from aowlspt-debugui.json beside the host DLL and is re-read on every toggle-on.
+[0:00:01.032] ok     menu mode text armed as a RIDER on the debug overlay's existing EFT.UI.PreloaderUI::Update detour (slot 6) -- one detour, one trampoline, both features live. The bottom-right corner label follows the backend's `menuModeText`, which defaults to the logged-in character's name
+[0:00:01.032] ok     live inspector armed as a RIDER on the debug overlay's existing EFT.UI.PreloaderUI::Update detour (slot 6)
+[0:00:01.032] info   6 candidate libraries under D:\Aowlspt\aowlspt\mods
+[0:00:01.032] info   not using a selection file: D:\Aowlspt\aowlspt\mods\aowlspt-selection.json was written for the server side and this host is the client one
+[0:00:01.032] ok     aowl.textures 1.0.0 loaded on aowlspt-host-il2cpp
+[0:00:01.032] info   textures  manifest: 512 curated replacement(s), tier 2K
+[0:00:01.032] info   textures  VRAM budget 1024 MB fits ~48 resident 2K textures (RGBA32 + mips); the manifest is the candidate set, the budget is the hard resident cap
+[0:00:01.032] info   textures  categories on:  Metal Wood Concrete Brick Fabric 
+[0:00:01.032] info   textures  will arm in mode 'probe' ~45s after load, once the game's assemblies are up (drain-independent — the postfix runs on the Unity thread because the game calls LoadAsset there)
+[0:00:01.032] ok     loaded aowl.textures (aowl.textures) v1.0.0 by savannt
+[0:00:01.032] info   Tarkov Emulator does not support the client side; skipping
+[0:00:01.032] info   Path To Tarkov does not support the client side; skipping
+[0:00:01.032] info   Mod Manager does not support the client side; skipping
+[0:00:01.032] info   Icebreaker does not support the client side; skipping
+[0:00:01.032] ok     subscribed to aowl.graphics.apply
+[0:00:01.032] ok     graphics  grade pushed to the host post-process (tonemapper=1, enabled=yes)
+[0:00:01.032] ok     loaded aowl.graphics (aowl.graphics) v1.0.0 by savannt
+[0:00:01.188] ok     overlay ready (F12 opens settings)
+[0:00:01.188] ok     graphics post-process ready (via the overlay Present hook) â€” driven by the overlay Present hook; waiting for the first frame
+[0:00:01.188] ok     asking the backend on port 1 which client mods should be running, every 3000ms; this host reports back as session ffe72586be0
+[0:00:01.188] ok     host running
+[0:00:01.219] info   live inspector: batch 1 (2 command(s)) handed to Unity's thread; answers land in D:\Aowlspt\aowlspt\aowlspt-inspect-out.txt
+[0:00:01.219] warn   invoke_main self-test ran on thread 27616, the host's own thread and not Unity's drain thread; no managed call was made (the drain is bound but has not fired on its own thread, or nothing is bound)
+[0:00:03.219] ok     exit fix: OS-close hooks installed on UI thread 7628 (main window 0x80260) -- window X / taskbar Close / Alt+F4 now exit via ExitProcess(0) instead of the hanging async shutdown
+[0:00:06.188] info   deep-probe: MethodInfo for EFT.TarkovApplication::Update is not readable
+[0:00:09.360] ok     live inspector: batch 1 is QUEUED and will run as soon as EFT.UI.PreloaderUI::Update starts ticking -- the rider (slot 6) has not been dispatched yet, which on a cold start just means the client is still on the loading screen. Nothing has been lost; reach the MENU.
+[0:00:14.141] ok     version probe: PreloaderUI.Awake postfix fired on thread 7628 (NOT the host thread -> Unity's main thread)
+[0:00:14.141] ok     version probe: label component at this+0x20 is readable; scanning its String slots by raw layout (no reflection)
+[0:00:14.141] ok     version probe: String slot +0xa0 = "1.1.0.1.46777"  <-- version-looking
+[0:00:14.141] ok     version probe: read-only (set uxVersionBrandWrite to attempt a field-write brand; no managed write was performed)
+[0:00:14.157] ok     patchFired: slot=6 riders={debugui:6, modetext:6, inspect:6} -> dispatches debugui modetext inspect
+[0:00:14.157] ok     debugui: PreloaderUI::Update detour is live on thread 7628 (host thread 27616 -- so this is Unity's). 27 of 27 managed targets verified by RVA + prologue. Press the toggle key to show the panel.
+[0:00:14.157] ok     menu mode text: PreloaderUI.Update first fired on thread 7628 (Unity's main thread)
+[0:00:14.157] ok     menu mode text: FOUND the corner label. parent chain = EFT.UI.PreloaderUI(this=0x15159dcfe60) -> _alphaVersionLabel:LocalizedText(+0x20)=0x15159ff5000 ; the mode string is _sessionModeText(+0x128) and currently reads "" (this is the "PVE ZONE" slot; identified offline from the decrypted metadata, and confirmed here by SetGameModeText's own mov [rcx+0x128],rdx)
+[0:00:14.157] ok     live inspector: rider FIRST DISPATCHED on thread 7628 (slot 6); EFT.UI.PreloaderUI::Update is now ticking and batches will drain
+[0:00:14.172] ok     inspect| aowlspt live inspector -- batch 1, 2 command(s), on Unity thread 7628
+[0:00:14.172] ok     inspect| > help
+[0:00:14.172] ok     inspect|   aowlspt live inspector -- commands (addresses are EXPR, see below)
+[0:00:14.172] ok     inspect|     anchors                       list named anchors + variables
+[0:00:14.172] ok     inspect|     let NAME EXPR                 bind a name to an address
+[0:00:14.172] ok     inspect|     read EXPR TYPE                typed read
+[0:00:14.172] ok     inspect|     write EXPR TYPE VALUE         typed write (needs `allow write`)
+[0:00:14.172] ok     inspect|     dump EXPR [N]                 N raw bytes, hex + ascii
+[0:00:14.172] ok     inspect|     fields EXPR [N]               per-8-byte-slot guess table
+[0:00:14.172] ok     inspect|     scan EXPR N TYPE VALUE        find the offset of a value
+[0:00:14.172] ok     inspect|     parent EXPR [DEPTH]           walk the Transform parent chain
+[0:00:14.172] ok     inspect|     canvas EXPR                   the Graphic's cached Canvas + its mode
+[0:00:14.172] ok     inspect|     call TARGET SIG [ARG..]       direct RVA call (needs `allow write`)
+[0:00:14.172] ok     inspect|     targets [SUBSTR]              list byte-verified call targets
+[0:00:14.172] ok     inspect|   -- state + navigation (navigation needs `allow write`) --
+[0:00:14.172] ok     inspect|     state | where                 what screen/tab is up RIGHT NOW
+[0:00:14.172] ok     inspect|                                   e.g.  state
+[0:00:14.172] ok     inspect|     wait N                        park the batch for N frames
+[0:00:14.172] ok     inspect|                                   e.g.  wait 10
+[0:00:14.172] ok     inspect|     until EXPR [FRAMES]           park until the ptr at EXPR is non-0
+[0:00:14.172] ok     inspect|                                   e.g.  until $settings+0x118 120
+[0:00:14.172] ok     inspect|     open [GROUP]                  SettingsScreen::ShowScreen (async!)
+[0:00:14.172] ok     inspect|                                   e.g.  allow write | open 0
+[0:00:14.172] ok     inspect|     tab EXPR [0|1]                SettingsTab::set_IsSelected
+[0:00:14.172] ok     inspect|   -- hierarchy (children/find are READ-ONLY; click/invoke need write) --
+[0:00:14.172] ok     inspect|     children EXPR [N]             list child transforms, bind $c0..$cN
+[0:00:14.172] ok     inspect|                                   e.g.  children $preloader
+[0:00:14.172] ok     inspect|     tree EXPR [DEPTH]             the subtree, indented (learn names)
+[0:00:14.172] ok     inspect|                                   e.g.  tree $preloader 3
+[0:00:14.172] ok     inspect|     roots                         every scene root -> $r0..$rN
+[0:00:14.172] ok     inspect|                                   e.g.  roots
+[0:00:14.172] ok     inspect|     find NAME [ROOT] [BUDGET]     name search; NO ROOT = ALL scenes
+[0:00:14.172] ok     inspect|     find NAME in ROOTNAME         narrow by a root named, not pointed
+[0:00:14.172] ok     inspect|     find more [BUDGET]            RESUME a search that hit its cap
+[0:00:14.172] ok     inspect|     component EXPR TypeName       GameObject/Transform -> component
+[0:00:14.172] ok     inspect|                                   e.g.  component $g0 Button   -> $comp
+[0:00:14.172] ok     inspect|     rect EXPR                     RectTransform geometry probe
+[0:00:14.172] ok     inspect|     label EXPR                    TMP_Text.m_text as a field read
+[0:00:14.172] ok     inspect|     settext EXPR TEXT...          WRITE a label, via the real setters
+[0:00:14.172] ok     inspect|                                   e.g.  find PvE
+[0:00:14.172] ok     inspect|     press EXPR [OFF]              EFT DefaultUIButton.OnClick (+0x120)
+[0:00:14.172] ok     inspect|     click EXPR                    Button::Press (checks interactable)
+[0:00:14.172] ok     inspect|                                   e.g.  allow write | click $f1
+[0:00:14.172] ok     inspect|     invoke EXPR                   fire m_OnClick directly, no checks
+[0:00:14.172] ok     inspect|                                   e.g.  tab $settings@0x118 1
+[0:00:14.172] ok     inspect|     image                         GameAssembly base + il2cpp section
+[0:00:14.172] ok     inspect|     allow write                   arm writes/calls for this batch
+[0:00:14.172] ok     inspect|     echo TEXT                     put a marker in the output
+[0:00:14.172] ok     inspect|   TYPE  i8 u8 i16 u16 i32 u32 i64 u64 f32 f64 ptr bool str klass
+[0:00:14.172] ok     inspect|   EXPR  ATOM ( +0xNN | @0xNN )*   `+` moves, `@` DEREFERENCES
+[0:00:14.172] ok     inspect|         ATOM is 0x<hex>, a decimal, or $name
+[0:00:14.172] ok     inspect|         e.g.  $preloader@0x20        the version label
+[0:00:14.172] ok     inspect|               $verlabel+0xe0         where TMP.m_text lives
+[0:00:14.172] ok     inspect|   TARGET  name:<substring>  or  rva:0x<hex>[/<expected prologue hex>]
+[0:00:14.172] ok     inspect|   SIG     <ret>_<args>, ret in v/b/i/l/p/f/s, args in p/i/b/f/l
+[0:00:14.172] ok     inspect|         e.g.  s_p   String return, one pointer argument (get_name)
+[0:00:14.172] ok     inspect| > anchors
+[0:00:14.172] ok     inspect|   anchors and variables (9):
+[0:00:14.172] ok     inspect|     $_ = 0x0000000000000000   (not live yet)
+[0:00:14.172] ok     inspect|     $preloader = 0x0000015159dcfe60   klass=0x0000014f2302df90
+[0:00:14.172] ok     inspect|     $verlabel = 0x0000015159ff5000   klass=0x0000014f22988330
+[0:00:14.172] ok     inspect|     $modetext = 0x0000000000000000   (not live yet)
+[0:00:14.172] ok     inspect|     $duanchor = 0x0000000000000000   (not live yet)
+[0:00:14.172] ok     inspect|     $duroot = 0x0000000000000000   (not live yet)
+[0:00:14.172] ok     inspect|     $gameworld = 0x0000000000000000   (not live yet)
+[0:00:14.172] ok     inspect|     $you = 0x0000000000000000   (not live yet)
+[0:00:14.172] ok     inspect|     $settings = 0x0000000000000000   (not live yet)
+[0:00:14.172] ok     inspect| aowlspt live inspector -- batch 1 complete, 67 line(s)
+[0:00:14.407] warn   live inspector: no batch queued for 13s while the rider IS dispatching (13 fires). polls=681 reads=2 readFails=0 unchanged=1 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:00:29.469] warn   live inspector: no batch queued for 28s while the rider IS dispatching (1051 fires). polls=1577 reads=62 readFails=0 unchanged=61 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:00:44.532] warn   live inspector: no batch queued for 43s while the rider IS dispatching (2286 fires). polls=2474 reads=122 readFails=0 unchanged=121 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:00:46.032] warn   textures  NOT hooking UnityEngine.AssetBundle::LoadAsset: methodPointer is null — the host would refuse this too, no patch
+[0:00:46.032] warn   textures  nothing hooked; the mod is a no-op (stock textures)
+[0:00:59.610] warn   live inspector: no batch queued for 58s while the rider IS dispatching (3509 fires). polls=3372 reads=182 readFails=0 unchanged=181 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:01:00.719] warn   menu mode text: the PreloaderUI.Update hook has fired 3600 times and the backend has never sent a `menuModeText`, so the corner label is still the game's stock text. The hook is fine; the SOURCE is missing. Check that the backend is reachable (backendPort in aowlspt-host.json, or backendUrl in the installer's backend.json) and that the manager mod is running.
+[0:01:14.688] warn   live inspector: no batch queued for 73s while the rider IS dispatching (4734 fires). polls=4270 reads=242 readFails=0 unchanged=241 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:01:29.750] warn   live inspector: no batch queued for 88s while the rider IS dispatching (5962 fires). polls=5170 reads=302 readFails=0 unchanged=301 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:01:44.828] warn   live inspector: no batch queued for 103s while the rider IS dispatching (7194 fires). polls=6068 reads=362 readFails=0 unchanged=361 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:01:59.907] warn   live inspector: no batch queued for 118s while the rider IS dispatching (8417 fires). polls=6966 reads=422 readFails=0 unchanged=421 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:02:14.938] warn   live inspector: no batch queued for 133s while the rider IS dispatching (9636 fires). polls=7864 reads=482 readFails=0 unchanged=481 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:02:29.985] warn   live inspector: no batch queued for 148s while the rider IS dispatching (10856 fires). polls=8763 reads=542 readFails=0 unchanged=541 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:02:45.047] warn   live inspector: no batch queued for 163s while the rider IS dispatching (12083 fires). polls=9664 reads=602 readFails=0 unchanged=601 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:03:00.110] warn   live inspector: no batch queued for 178s while the rider IS dispatching (13311 fires). polls=10563 reads=662 readFails=0 unchanged=661 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:03:01.219] ok     codeGen audit self-test: comparing methodPointer against methodPointers[rid-1] for 6 named methods, 180s after the runtime came up (146 modules, 146 with readable names). Read-only.
+[0:03:01.219] warn   codeGen: cannot resolve EFT.GameWorld::RegisterPlayer -- even the first 8 bytes of its MethodInfo are unreadable, so the handle is not a struct at all. Spans: +0=- +8=- +10=- +18=- +20=- +28=- +40=- span0x48=-
+[0:03:01.219] warn   codeGen audit self-test: EFT.GameWorld::RegisterPlayer -- neither side resolved. table said: ok. spans: +0=- +8=- +10=- +18=- +20=- +28=- +40=- span0x48=-. NOTE: this is not proof the target is permanently unfixable -- the same sentence was printed at 1.1s for a method that resolved fine at 46s.
+[0:03:01.219] warn   codeGen: cannot resolve EFT.BotSpawner::AddPlayer -- even the first 8 bytes of its MethodInfo are unreadable, so the handle is not a struct at all. Spans: +0=- +8=- +10=- +18=- +20=- +28=- +40=- span0x48=-
+[0:03:01.219] warn   codeGen audit self-test: EFT.BotSpawner::AddPlayer -- neither side resolved. table said: ok. spans: +0=- +8=- +10=- +18=- +20=- +28=- +40=- span0x48=-. NOTE: this is not proof the target is permanently unfixable -- the same sentence was printed at 1.1s for a method that resolved fine at 46s.
+[0:03:01.219] warn   codeGen: cannot resolve EFT.TarkovApplication::ExitApplication -- even the first 8 bytes of its MethodInfo are unreadable, so the handle is not a struct at all. Spans: +0=- +8=- +10=- +18=- +20=- +28=- +40=- span0x48=-
+[0:03:01.219] warn   codeGen audit self-test: EFT.TarkovApplication::ExitApplication -- neither side resolved. table said: ok. spans: +0=- +8=- +10=- +18=- +20=- +28=- +40=- span0x48=-. NOTE: this is not proof the target is permanently unfixable -- the same sentence was printed at 1.1s for a method that resolved fine at 46s.
+[0:03:01.219] warn   codeGen: cannot resolve UnityEngine.AssetBundle::LoadAsset -- even the first 8 bytes of its MethodInfo are unreadable, so the handle is not a struct at all. Spans: +0=- +8=- +10=- +18=- +20=- +28=- +40=- span0x48=-
+[0:03:01.219] warn   codeGen audit self-test: UnityEngine.AssetBundle::LoadAsset -- neither side resolved. table said: ok. spans: +0=- +8=- +10=- +18=- +20=- +28=- +40=- span0x48=-. NOTE: this is not proof the target is permanently unfixable -- the same sentence was printed at 1.1s for a method that resolved fine at 46s.
+[0:03:01.219] warn   codeGen: cannot resolve UnityEngine.Time::get_deltaTime -- even the first 8 bytes of its MethodInfo are unreadable, so the handle is not a struct at all. Spans: +0=- +8=- +10=- +18=- +20=- +28=- +40=- span0x48=-
+[0:03:01.219] warn   codeGen audit self-test: UnityEngine.Time::get_deltaTime -- neither side resolved. table said: ok. spans: +0=- +8=- +10=- +18=- +20=- +28=- +40=- span0x48=-. NOTE: this is not proof the target is permanently unfixable -- the same sentence was printed at 1.1s for a method that resolved fine at 46s.
+[0:03:01.219] warn   codeGen: cannot resolve EFT.TarkovApplication::Update -- even the first 8 bytes of its MethodInfo are unreadable, so the handle is not a struct at all. Spans: +0=- +8=- +10=- +18=- +20=- +28=- +40=- span0x48=-
+[0:03:01.219] warn   codeGen audit self-test: EFT.TarkovApplication::Update -- neither side resolved. table said: ok. spans: +0=- +8=- +10=- +18=- +20=- +28=- +40=- span0x48=-. NOTE: this is not proof the target is permanently unfixable -- the same sentence was printed at 1.1s for a method that resolved fine at 46s.
+[0:03:01.219] warn   codeGen audit self-test: VERDICT INCONCLUSIVE -- nothing could be compared (0 methods had both a live methodPointer and a table entry). This is NOT a green light: it is the absence of evidence, not evidence of agreement. Do not read "disagreements=0" as safe here.
+[0:03:15.157] warn   live inspector: no batch queued for 193s while the rider IS dispatching (14531 fires). polls=11462 reads=722 readFails=0 unchanged=721 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:03:30.172] warn   live inspector: no batch queued for 208s while the rider IS dispatching (15752 fires). polls=12359 reads=782 readFails=0 unchanged=781 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:03:45.250] warn   live inspector: no batch queued for 224s while the rider IS dispatching (16979 fires). polls=13256 reads=842 readFails=0 unchanged=841 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:04:00.407] warn   live inspector: no batch queued for 239s while the rider IS dispatching (18214 fires). polls=14164 reads=902 readFails=0 unchanged=901 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:04:15.469] warn   live inspector: no batch queued for 254s while the rider IS dispatching (19432 fires). polls=15064 reads=962 readFails=0 unchanged=961 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:04:30.547] warn   live inspector: no batch queued for 269s while the rider IS dispatching (20627 fires). polls=15963 reads=1022 readFails=0 unchanged=1021 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:04:45.594] warn   live inspector: no batch queued for 284s while the rider IS dispatching (21842 fires). polls=16858 reads=1082 readFails=0 unchanged=1081 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:05:00.657] warn   live inspector: no batch queued for 299s while the rider IS dispatching (23072 fires). polls=17753 reads=1142 readFails=0 unchanged=1141 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:05:15.703] warn   live inspector: no batch queued for 314s while the rider IS dispatching (24297 fires). polls=18643 reads=1202 readFails=0 unchanged=1201 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:05:30.797] warn   live inspector: no batch queued for 329s while the rider IS dispatching (25518 fires). polls=19536 reads=1262 readFails=0 unchanged=1261 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:05:45.860] warn   live inspector: no batch queued for 344s while the rider IS dispatching (26741 fires). polls=20428 reads=1322 readFails=0 unchanged=1321 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:06:00.938] warn   live inspector: no batch queued for 359s while the rider IS dispatching (27964 fires). polls=21323 reads=1382 readFails=0 unchanged=1381 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:06:16.000] warn   live inspector: no batch queued for 374s while the rider IS dispatching (29191 fires). polls=22216 reads=1442 readFails=0 unchanged=1441 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:06:31.078] warn   live inspector: no batch queued for 389s while the rider IS dispatching (30410 fires). polls=23108 reads=1502 readFails=0 unchanged=1501 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:06:46.157] warn   live inspector: no batch queued for 404s while the rider IS dispatching (31644 fires). polls=24002 reads=1562 readFails=0 unchanged=1561 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:07:01.203] warn   live inspector: no batch queued for 419s while the rider IS dispatching (32872 fires). polls=24893 reads=1622 readFails=0 unchanged=1621 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:07:16.297] warn   live inspector: no batch queued for 435s while the rider IS dispatching (34100 fires). polls=25786 reads=1682 readFails=0 unchanged=1681 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:07:31.344] warn   live inspector: no batch queued for 450s while the rider IS dispatching (35314 fires). polls=26677 reads=1742 readFails=0 unchanged=1741 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:07:46.391] warn   live inspector: no batch queued for 465s while the rider IS dispatching (36539 fires). polls=27567 reads=1802 readFails=0 unchanged=1801 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:08:01.469] warn   live inspector: no batch queued for 480s while the rider IS dispatching (37767 fires). polls=28458 reads=1862 readFails=0 unchanged=1861 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:08:16.516] warn   live inspector: no batch queued for 495s while the rider IS dispatching (38987 fires). polls=29352 reads=1922 readFails=0 unchanged=1921 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:08:31.610] warn   live inspector: no batch queued for 510s while the rider IS dispatching (40212 fires). polls=30247 reads=1982 readFails=0 unchanged=1981 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:08:46.703] warn   live inspector: no batch queued for 525s while the rider IS dispatching (41442 fires). polls=31142 reads=2042 readFails=0 unchanged=2041 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:09:01.750] warn   live inspector: no batch queued for 540s while the rider IS dispatching (42669 fires). polls=32034 reads=2102 readFails=0 unchanged=2101 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:09:16.828] warn   live inspector: no batch queued for 555s while the rider IS dispatching (43898 fires). polls=32931 reads=2162 readFails=0 unchanged=2161 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:09:31.891] warn   live inspector: no batch queued for 570s while the rider IS dispatching (45123 fires). polls=33823 reads=2222 readFails=0 unchanged=2221 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:09:46.985] warn   live inspector: no batch queued for 585s while the rider IS dispatching (46346 fires). polls=34719 reads=2282 readFails=0 unchanged=2281 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:10:02.047] warn   live inspector: no batch queued for 600s while the rider IS dispatching (47570 fires). polls=35611 reads=2342 readFails=0 unchanged=2341 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:10:17.110] warn   live inspector: no batch queued for 615s while the rider IS dispatching (48795 fires). polls=36502 reads=2402 readFails=0 unchanged=2401 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:10:32.172] warn   live inspector: no batch queued for 630s while the rider IS dispatching (50023 fires). polls=37392 reads=2462 readFails=0 unchanged=2461 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:10:47.235] warn   live inspector: no batch queued for 646s while the rider IS dispatching (51253 fires). polls=38282 reads=2522 readFails=0 unchanged=2521 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:11:02.313] warn   live inspector: no batch queued for 661s while the rider IS dispatching (52484 fires). polls=39173 reads=2582 readFails=0 unchanged=2581 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:11:17.344] warn   live inspector: no batch queued for 676s while the rider IS dispatching (53703 fires). polls=40056 reads=2642 readFails=0 unchanged=2641 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:11:32.407] warn   live inspector: no batch queued for 691s while the rider IS dispatching (54924 fires). polls=40952 reads=2702 readFails=0 unchanged=2701 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:11:47.485] warn   live inspector: no batch queued for 706s while the rider IS dispatching (56135 fires). polls=41851 reads=2762 readFails=0 unchanged=2761 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:12:02.563] warn   live inspector: no batch queued for 721s while the rider IS dispatching (57362 fires). polls=42752 reads=2822 readFails=0 unchanged=2821 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:12:17.688] warn   live inspector: no batch queued for 736s while the rider IS dispatching (58586 fires). polls=43654 reads=2882 readFails=0 unchanged=2881 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:12:32.750] warn   live inspector: no batch queued for 751s while the rider IS dispatching (59802 fires). polls=44552 reads=2942 readFails=0 unchanged=2941 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:12:47.813] warn   live inspector: no batch queued for 766s while the rider IS dispatching (61014 fires). polls=45450 reads=3002 readFails=0 unchanged=3001 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:13:02.922] warn   live inspector: no batch queued for 781s while the rider IS dispatching (62238 fires). polls=46353 reads=3062 readFails=0 unchanged=3061 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:13:18.000] warn   live inspector: no batch queued for 796s while the rider IS dispatching (63459 fires). polls=47254 reads=3122 readFails=0 unchanged=3121 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:13:33.078] warn   live inspector: no batch queued for 811s while the rider IS dispatching (64676 fires). polls=48151 reads=3182 readFails=0 unchanged=3181 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:13:48.110] warn   live inspector: no batch queued for 826s while the rider IS dispatching (65888 fires). polls=49048 reads=3242 readFails=0 unchanged=3241 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:14:03.172] warn   live inspector: no batch queued for 841s while the rider IS dispatching (67114 fires). polls=49946 reads=3302 readFails=0 unchanged=3301 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:14:18.203] warn   live inspector: no batch queued for 856s while the rider IS dispatching (68320 fires). polls=50841 reads=3362 readFails=0 unchanged=3361 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:14:33.282] warn   live inspector: no batch queued for 872s while the rider IS dispatching (69543 fires). polls=51737 reads=3422 readFails=0 unchanged=3421 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:14:48.375] warn   live inspector: no batch queued for 887s while the rider IS dispatching (70774 fires). polls=52635 reads=3482 readFails=0 unchanged=3481 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:15:03.438] warn   live inspector: no batch queued for 902s while the rider IS dispatching (72000 fires). polls=53531 reads=3542 readFails=0 unchanged=3541 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:15:18.485] warn   live inspector: no batch queued for 917s while the rider IS dispatching (73223 fires). polls=54426 reads=3602 readFails=0 unchanged=3601 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt
+[0:15:33.516] warn   live inspector: no batch queued for 932s while the rider IS dispatching (74447 fires). polls=55322 reads=3662 readFails=0 unchanged=3661 lastRead=280B lastKnown=280B pending=0 batch=1 done=-1 suspended=false inFlight=-1  file=D:\Aowlspt\aowlspt\aowlspt-inspect.txt

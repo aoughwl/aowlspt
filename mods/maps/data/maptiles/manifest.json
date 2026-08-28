@@ -1,0 +1,4014 @@
+{
+ "schema": "aowlspt.maptiles/1",
+ "generator": "tools/maptiles.py",
+ "tilePx": 512,
+ "grid": 2,
+ "format": "BC1",
+ "colorSpace": "srgb",
+ "tileBytes": 131072,
+ "texMax": 32,
+ "slotBytes": 1048576,
+ "maps": [
+  {
+   "id": "Customs_TarkovDev",
+   "displayName": "Customs (TarkovDev)",
+   "internalNames": [
+    "bigmap"
+   ],
+   "coordinateRotation": 180,
+   "bounds": {
+    "Min": {
+     "x": -372,
+     "y": -306
+    },
+    "Max": {
+     "x": 698,
+     "y": 235
+    }
+   },
+   "defaultLevel": 0,
+   "layers": [
+    {
+     "name": "Underground",
+     "slug": "Underground",
+     "level": -1,
+     "imageBounds": {
+      "Min": {
+       "x": -372,
+       "y": -306
+      },
+      "Max": {
+       "x": 698,
+       "y": 235
+      }
+     },
+     "gameBounds": [
+      {
+       "Min": {
+        "x": 98,
+        "y": -78,
+        "z": -100
+       },
+       "Max": {
+        "x": 127,
+        "y": -30,
+        "z": 0.5
+       }
+      },
+      {
+       "Min": {
+        "x": 239,
+        "y": -41,
+        "z": -100
+       },
+       "Max": {
+        "x": 270,
+        "y": 4,
+        "z": 0.5
+       }
+      },
+      {
+       "Min": {
+        "x": 620,
+        "y": -137,
+        "z": -100
+       },
+       "Max": {
+        "x": 635,
+        "y": -125,
+        "z": 0.5
+       }
+      },
+      {
+       "Min": {
+        "x": 458,
+        "y": -122,
+        "z": -100
+       },
+       "Max": {
+        "x": 473,
+        "y": -110,
+        "z": 0.5
+       }
+      },
+      {
+       "Min": {
+        "x": 308,
+        "y": -184,
+        "z": -100
+       },
+       "Max": {
+        "x": 314,
+        "y": -173,
+        "z": 0.5
+       }
+      },
+      {
+       "Min": {
+        "x": 323,
+        "y": -88,
+        "z": -100
+       },
+       "Max": {
+        "x": 349,
+        "y": -32,
+        "z": 0.5
+       }
+      },
+      {
+       "Min": {
+        "x": 193,
+        "y": -158,
+        "z": -100
+       },
+       "Max": {
+        "x": 219,
+        "y": -137,
+        "z": 0.5
+       }
+      }
+     ],
+     "cols": 2,
+     "rows": 2,
+     "tilePx": 512,
+     "slotsNeeded": 4,
+     "tiles": [
+      {
+       "col": 0,
+       "row": 0,
+       "file": "Customs_TarkovDev/Underground/z0_0x0.dds",
+       "world": {
+        "minX": -372.0,
+        "maxX": 163.0,
+        "maxY": 235.0,
+        "minY": -35.5
+       }
+      },
+      {
+       "col": 1,
+       "row": 0,
+       "file": "Customs_TarkovDev/Underground/z0_1x0.dds",
+       "world": {
+        "minX": 163.0,
+        "maxX": 698.0,
+        "maxY": 235.0,
+        "minY": -35.5
+       }
+      },
+      {
+       "col": 0,
+       "row": 1,
+       "file": "Customs_TarkovDev/Underground/z0_0x1.dds",
+       "world": {
+        "minX": -372.0,
+        "maxX": 163.0,
+        "maxY": -35.5,
+        "minY": -306.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 1,
+       "file": "Customs_TarkovDev/Underground/z0_1x1.dds",
+       "world": {
+        "minX": 163.0,
+        "maxX": 698.0,
+        "maxY": -35.5,
+        "minY": -306.0
+       }
+      }
+     ]
+    },
+    {
+     "name": "Ground Floor",
+     "slug": "Ground_Floor",
+     "level": 0,
+     "imageBounds": {
+      "Min": {
+       "x": -372,
+       "y": -306
+      },
+      "Max": {
+       "x": 698,
+       "y": 235
+      }
+     },
+     "gameBounds": [
+      {
+       "Min": {
+        "x": -372,
+        "y": -306,
+        "z": -100
+       },
+       "Max": {
+        "x": 698,
+        "y": 235,
+        "z": 100
+       }
+      }
+     ],
+     "cols": 2,
+     "rows": 2,
+     "tilePx": 512,
+     "slotsNeeded": 4,
+     "tiles": [
+      {
+       "col": 0,
+       "row": 0,
+       "file": "Customs_TarkovDev/Ground_Floor/z0_0x0.dds",
+       "world": {
+        "minX": -372.0,
+        "maxX": 163.0,
+        "maxY": 235.0,
+        "minY": -35.5
+       }
+      },
+      {
+       "col": 1,
+       "row": 0,
+       "file": "Customs_TarkovDev/Ground_Floor/z0_1x0.dds",
+       "world": {
+        "minX": 163.0,
+        "maxX": 698.0,
+        "maxY": 235.0,
+        "minY": -35.5
+       }
+      },
+      {
+       "col": 0,
+       "row": 1,
+       "file": "Customs_TarkovDev/Ground_Floor/z0_0x1.dds",
+       "world": {
+        "minX": -372.0,
+        "maxX": 163.0,
+        "maxY": -35.5,
+        "minY": -306.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 1,
+       "file": "Customs_TarkovDev/Ground_Floor/z0_1x1.dds",
+       "world": {
+        "minX": 163.0,
+        "maxX": 698.0,
+        "maxY": -35.5,
+        "minY": -306.0
+       }
+      }
+     ]
+    },
+    {
+     "name": "2nd Floor",
+     "slug": "2nd_Floor",
+     "level": 1,
+     "imageBounds": {
+      "Min": {
+       "x": -372,
+       "y": -306
+      },
+      "Max": {
+       "x": 698,
+       "y": 235
+      }
+     },
+     "gameBounds": [
+      {
+       "Min": {
+        "x": 406,
+        "y": -98,
+        "z": 2.7
+       },
+       "Max": {
+        "x": 422,
+        "y": -83,
+        "z": 100
+       }
+      },
+      {
+       "Min": {
+        "x": 80,
+        "y": -82,
+        "z": 2.7
+       },
+       "Max": {
+        "x": 130,
+        "y": -27,
+        "z": 6.5
+       }
+      },
+      {
+       "Min": {
+        "x": 17,
+        "y": -100,
+        "z": 2.7
+       },
+       "Max": {
+        "x": 77,
+        "y": -28,
+        "z": 7.5
+       }
+      },
+      {
+       "Min": {
+        "x": 240,
+        "y": -85,
+        "z": 2.7
+       },
+       "Max": {
+        "x": 300,
+        "y": 4,
+        "z": 7.5
+       }
+      },
+      {
+       "Min": {
+        "x": 165,
+        "y": 125,
+        "z": 2.7
+       },
+       "Max": {
+        "x": 243,
+        "y": 190,
+        "z": 5.0
+       }
+      },
+      {
+       "Min": {
+        "x": 72,
+        "y": -170,
+        "z": 2.7
+       },
+       "Max": {
+        "x": 116,
+        "y": -83,
+        "z": 6.5
+       }
+      },
+      {
+       "Min": {
+        "x": 341,
+        "y": -84,
+        "z": 2.7
+       },
+       "Max": {
+        "x": 356,
+        "y": -30,
+        "z": 6.5
+       }
+      },
+      {
+       "Min": {
+        "x": 321,
+        "y": -59,
+        "z": 2.7
+       },
+       "Max": {
+        "x": 334,
+        "y": -52,
+        "z": 6.5
+       }
+      },
+      {
+       "Min": {
+        "x": 577,
+        "y": -1,
+        "z": 2.7
+       },
+       "Max": {
+        "x": 589,
+        "y": 10,
+        "z": 6.5
+       }
+      },
+      {
+       "Min": {
+        "x": 532,
+        "y": -134,
+        "z": 2.7
+       },
+       "Max": {
+        "x": 580,
+        "y": -104,
+        "z": 100
+       }
+      },
+      {
+       "Min": {
+        "x": 599,
+        "y": -139,
+        "z": 2.7
+       },
+       "Max": {
+        "x": 625,
+        "y": -120,
+        "z": 100
+       }
+      },
+      {
+       "Min": {
+        "x": -223,
+        "y": -131,
+        "z": 5.7
+       },
+       "Max": {
+        "x": -199,
+        "y": -90,
+        "z": 100
+       }
+      },
+      {
+       "Min": {
+        "x": 169,
+        "y": -160,
+        "z": 5.7
+       },
+       "Max": {
+        "x": 239,
+        "y": 3,
+        "z": 100
+       }
+      },
+      {
+       "Min": {
+        "x": 316,
+        "y": -95,
+        "z": 5.7
+       },
+       "Max": {
+        "x": 336,
+        "y": -56,
+        "z": 100
+       }
+      },
+      {
+       "Min": {
+        "x": 556,
+        "y": -92,
+        "z": 5.7
+       },
+       "Max": {
+        "x": 584,
+        "y": -46,
+        "z": 100
+       }
+      },
+      {
+       "Min": {
+        "x": 65,
+        "y": -22,
+        "z": 5.7
+       },
+       "Max": {
+        "x": 93,
+        "y": 0,
+        "z": 100
+       }
+      },
+      {
+       "Min": {
+        "x": 450,
+        "y": -90,
+        "z": 14
+       },
+       "Max": {
+        "x": 497,
+        "y": -44,
+        "z": 15
+       }
+      }
+     ],
+     "cols": 2,
+     "rows": 2,
+     "tilePx": 512,
+     "slotsNeeded": 4,
+     "tiles": [
+      {
+       "col": 0,
+       "row": 0,
+       "file": "Customs_TarkovDev/2nd_Floor/z0_0x0.dds",
+       "world": {
+        "minX": -372.0,
+        "maxX": 163.0,
+        "maxY": 235.0,
+        "minY": -35.5
+       }
+      },
+      {
+       "col": 1,
+       "row": 0,
+       "file": "Customs_TarkovDev/2nd_Floor/z0_1x0.dds",
+       "world": {
+        "minX": 163.0,
+        "maxX": 698.0,
+        "maxY": 235.0,
+        "minY": -35.5
+       }
+      },
+      {
+       "col": 0,
+       "row": 1,
+       "file": "Customs_TarkovDev/2nd_Floor/z0_0x1.dds",
+       "world": {
+        "minX": -372.0,
+        "maxX": 163.0,
+        "maxY": -35.5,
+        "minY": -306.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 1,
+       "file": "Customs_TarkovDev/2nd_Floor/z0_1x1.dds",
+       "world": {
+        "minX": 163.0,
+        "maxX": 698.0,
+        "maxY": -35.5,
+        "minY": -306.0
+       }
+      }
+     ]
+    },
+    {
+     "name": "3rd Floor",
+     "slug": "3rd_Floor",
+     "level": 2,
+     "imageBounds": {
+      "Min": {
+       "x": -372,
+       "y": -306
+      },
+      "Max": {
+       "x": 698,
+       "y": 235
+      }
+     },
+     "gameBounds": [
+      {
+       "Min": {
+        "x": 80,
+        "y": -82,
+        "z": 6.5
+       },
+       "Max": {
+        "x": 130,
+        "y": -27,
+        "z": 100
+       }
+      },
+      {
+       "Min": {
+        "x": 17,
+        "y": -100,
+        "z": 7.5
+       },
+       "Max": {
+        "x": 77,
+        "y": -28,
+        "z": 100
+       }
+      },
+      {
+       "Min": {
+        "x": 240,
+        "y": -85,
+        "z": 7.5
+       },
+       "Max": {
+        "x": 300,
+        "y": 4,
+        "z": 9.8
+       }
+      },
+      {
+       "Min": {
+        "x": 165,
+        "y": 125,
+        "z": 5.0
+       },
+       "Max": {
+        "x": 234,
+        "y": 190,
+        "z": 100
+       }
+      }
+     ],
+     "cols": 2,
+     "rows": 2,
+     "tilePx": 512,
+     "slotsNeeded": 4,
+     "tiles": [
+      {
+       "col": 0,
+       "row": 0,
+       "file": "Customs_TarkovDev/3rd_Floor/z0_0x0.dds",
+       "world": {
+        "minX": -372.0,
+        "maxX": 163.0,
+        "maxY": 235.0,
+        "minY": -35.5
+       }
+      },
+      {
+       "col": 1,
+       "row": 0,
+       "file": "Customs_TarkovDev/3rd_Floor/z0_1x0.dds",
+       "world": {
+        "minX": 163.0,
+        "maxX": 698.0,
+        "maxY": 235.0,
+        "minY": -35.5
+       }
+      },
+      {
+       "col": 0,
+       "row": 1,
+       "file": "Customs_TarkovDev/3rd_Floor/z0_0x1.dds",
+       "world": {
+        "minX": -372.0,
+        "maxX": 163.0,
+        "maxY": -35.5,
+        "minY": -306.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 1,
+       "file": "Customs_TarkovDev/3rd_Floor/z0_1x1.dds",
+       "world": {
+        "minX": 163.0,
+        "maxX": 698.0,
+        "maxY": -35.5,
+        "minY": -306.0
+       }
+      }
+     ]
+    },
+    {
+     "name": "4th Floor",
+     "slug": "4th_Floor",
+     "level": 3,
+     "imageBounds": {
+      "Min": {
+       "x": -372,
+       "y": -306
+      },
+      "Max": {
+       "x": 698,
+       "y": 235
+      }
+     },
+     "gameBounds": [
+      {
+       "Min": {
+        "x": 237,
+        "y": -85,
+        "z": 9.8
+       },
+       "Max": {
+        "x": 300,
+        "y": 4,
+        "z": 100
+       }
+      }
+     ],
+     "cols": 2,
+     "rows": 2,
+     "tilePx": 512,
+     "slotsNeeded": 4,
+     "tiles": [
+      {
+       "col": 0,
+       "row": 0,
+       "file": "Customs_TarkovDev/4th_Floor/z0_0x0.dds",
+       "world": {
+        "minX": -372.0,
+        "maxX": 163.0,
+        "maxY": 235.0,
+        "minY": -35.5
+       }
+      },
+      {
+       "col": 1,
+       "row": 0,
+       "file": "Customs_TarkovDev/4th_Floor/z0_1x0.dds",
+       "world": {
+        "minX": 163.0,
+        "maxX": 698.0,
+        "maxY": 235.0,
+        "minY": -35.5
+       }
+      },
+      {
+       "col": 0,
+       "row": 1,
+       "file": "Customs_TarkovDev/4th_Floor/z0_0x1.dds",
+       "world": {
+        "minX": -372.0,
+        "maxX": 163.0,
+        "maxY": -35.5,
+        "minY": -306.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 1,
+       "file": "Customs_TarkovDev/4th_Floor/z0_1x1.dds",
+       "world": {
+        "minX": 163.0,
+        "maxX": 698.0,
+        "maxY": -35.5,
+        "minY": -306.0
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "id": "Factory_TarkovDev",
+   "displayName": "Factory (TarkovDev)",
+   "internalNames": [
+    "factory4_day",
+    "factory4_night"
+   ],
+   "coordinateRotation": 90,
+   "bounds": {
+    "Min": {
+     "x": -65,
+     "y": -64.5
+    },
+    "Max": {
+     "x": 77.6,
+     "y": 67.2
+    }
+   },
+   "defaultLevel": 0,
+   "layers": [
+    {
+     "name": "Tunnels",
+     "slug": "Tunnels",
+     "level": -1,
+     "imageBounds": {
+      "Min": {
+       "x": -65,
+       "y": -64.5
+      },
+      "Max": {
+       "x": 77.6,
+       "y": 67.2
+      }
+     },
+     "gameBounds": [
+      {
+       "Min": {
+        "x": -65,
+        "y": -64.5,
+        "z": -100
+       },
+       "Max": {
+        "x": 77.6,
+        "y": 67.2,
+        "z": -1
+       }
+      }
+     ],
+     "cols": 2,
+     "rows": 2,
+     "tilePx": 512,
+     "slotsNeeded": 4,
+     "tiles": [
+      {
+       "col": 0,
+       "row": 0,
+       "file": "Factory_TarkovDev/Tunnels/z0_0x0.dds",
+       "world": {
+        "minX": -65.0,
+        "maxX": 6.299999999999997,
+        "maxY": 67.2,
+        "minY": 1.3500000000000085
+       }
+      },
+      {
+       "col": 1,
+       "row": 0,
+       "file": "Factory_TarkovDev/Tunnels/z0_1x0.dds",
+       "world": {
+        "minX": 6.299999999999997,
+        "maxX": 77.6,
+        "maxY": 67.2,
+        "minY": 1.3500000000000085
+       }
+      },
+      {
+       "col": 0,
+       "row": 1,
+       "file": "Factory_TarkovDev/Tunnels/z0_0x1.dds",
+       "world": {
+        "minX": -65.0,
+        "maxX": 6.299999999999997,
+        "maxY": 1.3500000000000085,
+        "minY": -64.49999999999999
+       }
+      },
+      {
+       "col": 1,
+       "row": 1,
+       "file": "Factory_TarkovDev/Tunnels/z0_1x1.dds",
+       "world": {
+        "minX": 6.299999999999997,
+        "maxX": 77.6,
+        "maxY": 1.3500000000000085,
+        "minY": -64.49999999999999
+       }
+      }
+     ]
+    },
+    {
+     "name": "Ground Floor",
+     "slug": "Ground_Floor",
+     "level": 0,
+     "imageBounds": {
+      "Min": {
+       "x": -65,
+       "y": -64.5
+      },
+      "Max": {
+       "x": 77.6,
+       "y": 67.2
+      }
+     },
+     "gameBounds": [
+      {
+       "Min": {
+        "x": -65,
+        "y": -64.5,
+        "z": -1
+       },
+       "Max": {
+        "x": 77.6,
+        "y": 67.2,
+        "z": 3
+       }
+      }
+     ],
+     "cols": 2,
+     "rows": 2,
+     "tilePx": 512,
+     "slotsNeeded": 4,
+     "tiles": [
+      {
+       "col": 0,
+       "row": 0,
+       "file": "Factory_TarkovDev/Ground_Floor/z0_0x0.dds",
+       "world": {
+        "minX": -65.0,
+        "maxX": 6.299999999999997,
+        "maxY": 67.2,
+        "minY": 1.3500000000000085
+       }
+      },
+      {
+       "col": 1,
+       "row": 0,
+       "file": "Factory_TarkovDev/Ground_Floor/z0_1x0.dds",
+       "world": {
+        "minX": 6.299999999999997,
+        "maxX": 77.6,
+        "maxY": 67.2,
+        "minY": 1.3500000000000085
+       }
+      },
+      {
+       "col": 0,
+       "row": 1,
+       "file": "Factory_TarkovDev/Ground_Floor/z0_0x1.dds",
+       "world": {
+        "minX": -65.0,
+        "maxX": 6.299999999999997,
+        "maxY": 1.3500000000000085,
+        "minY": -64.49999999999999
+       }
+      },
+      {
+       "col": 1,
+       "row": 1,
+       "file": "Factory_TarkovDev/Ground_Floor/z0_1x1.dds",
+       "world": {
+        "minX": 6.299999999999997,
+        "maxX": 77.6,
+        "maxY": 1.3500000000000085,
+        "minY": -64.49999999999999
+       }
+      }
+     ]
+    },
+    {
+     "name": "2nd Floor",
+     "slug": "2nd_Floor",
+     "level": 1,
+     "imageBounds": {
+      "Min": {
+       "x": -65,
+       "y": -64.5
+      },
+      "Max": {
+       "x": 77.6,
+       "y": 67.2
+      }
+     },
+     "gameBounds": [
+      {
+       "Min": {
+        "x": -65,
+        "y": -64.5,
+        "z": 3
+       },
+       "Max": {
+        "x": 77.6,
+        "y": 67.2,
+        "z": 6
+       }
+      }
+     ],
+     "cols": 2,
+     "rows": 2,
+     "tilePx": 512,
+     "slotsNeeded": 4,
+     "tiles": [
+      {
+       "col": 0,
+       "row": 0,
+       "file": "Factory_TarkovDev/2nd_Floor/z0_0x0.dds",
+       "world": {
+        "minX": -65.0,
+        "maxX": 6.299999999999997,
+        "maxY": 67.2,
+        "minY": 1.3500000000000085
+       }
+      },
+      {
+       "col": 1,
+       "row": 0,
+       "file": "Factory_TarkovDev/2nd_Floor/z0_1x0.dds",
+       "world": {
+        "minX": 6.299999999999997,
+        "maxX": 77.6,
+        "maxY": 67.2,
+        "minY": 1.3500000000000085
+       }
+      },
+      {
+       "col": 0,
+       "row": 1,
+       "file": "Factory_TarkovDev/2nd_Floor/z0_0x1.dds",
+       "world": {
+        "minX": -65.0,
+        "maxX": 6.299999999999997,
+        "maxY": 1.3500000000000085,
+        "minY": -64.49999999999999
+       }
+      },
+      {
+       "col": 1,
+       "row": 1,
+       "file": "Factory_TarkovDev/2nd_Floor/z0_1x1.dds",
+       "world": {
+        "minX": 6.299999999999997,
+        "maxX": 77.6,
+        "maxY": 1.3500000000000085,
+        "minY": -64.49999999999999
+       }
+      }
+     ]
+    },
+    {
+     "name": "3rd Floor",
+     "slug": "3rd_Floor",
+     "level": 2,
+     "imageBounds": {
+      "Min": {
+       "x": -65,
+       "y": -64.5
+      },
+      "Max": {
+       "x": 77.6,
+       "y": 67.2
+      }
+     },
+     "gameBounds": [
+      {
+       "Min": {
+        "x": -65,
+        "y": -64.5,
+        "z": 6
+       },
+       "Max": {
+        "x": 77.6,
+        "y": 67.2,
+        "z": 100
+       }
+      }
+     ],
+     "cols": 2,
+     "rows": 2,
+     "tilePx": 512,
+     "slotsNeeded": 4,
+     "tiles": [
+      {
+       "col": 0,
+       "row": 0,
+       "file": "Factory_TarkovDev/3rd_Floor/z0_0x0.dds",
+       "world": {
+        "minX": -65.0,
+        "maxX": 6.299999999999997,
+        "maxY": 67.2,
+        "minY": 1.3500000000000085
+       }
+      },
+      {
+       "col": 1,
+       "row": 0,
+       "file": "Factory_TarkovDev/3rd_Floor/z0_1x0.dds",
+       "world": {
+        "minX": 6.299999999999997,
+        "maxX": 77.6,
+        "maxY": 67.2,
+        "minY": 1.3500000000000085
+       }
+      },
+      {
+       "col": 0,
+       "row": 1,
+       "file": "Factory_TarkovDev/3rd_Floor/z0_0x1.dds",
+       "world": {
+        "minX": -65.0,
+        "maxX": 6.299999999999997,
+        "maxY": 1.3500000000000085,
+        "minY": -64.49999999999999
+       }
+      },
+      {
+       "col": 1,
+       "row": 1,
+       "file": "Factory_TarkovDev/3rd_Floor/z0_1x1.dds",
+       "world": {
+        "minX": 6.299999999999997,
+        "maxX": 77.6,
+        "maxY": 1.3500000000000085,
+        "minY": -64.49999999999999
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "id": "GroundZero_TarkovDev",
+   "displayName": "Ground Zero (TarkovDev)",
+   "internalNames": [
+    "Sandbox",
+    "Sandbox_high"
+   ],
+   "coordinateRotation": 180,
+   "bounds": {
+    "Min": {
+     "x": -99,
+     "y": -124
+    },
+    "Max": {
+     "x": 249,
+     "y": 364
+    }
+   },
+   "defaultLevel": 0,
+   "layers": [
+    {
+     "name": "Garage",
+     "slug": "Garage",
+     "level": -1,
+     "imageBounds": {
+      "Min": {
+       "x": -99,
+       "y": -124
+      },
+      "Max": {
+       "x": 249,
+       "y": 364
+      }
+     },
+     "gameBounds": [
+      {
+       "Min": {
+        "x": 43,
+        "y": -100,
+        "z": -100
+       },
+       "Max": {
+        "x": 117,
+        "y": 190,
+        "z": 21
+       }
+      },
+      {
+       "Min": {
+        "x": 117,
+        "y": 49,
+        "z": -100
+       },
+       "Max": {
+        "x": 143,
+        "y": 80,
+        "z": 21
+       }
+      }
+     ],
+     "cols": 2,
+     "rows": 2,
+     "tilePx": 512,
+     "slotsNeeded": 4,
+     "tiles": [
+      {
+       "col": 0,
+       "row": 0,
+       "file": "GroundZero_TarkovDev/Garage/z0_0x0.dds",
+       "world": {
+        "minX": -99.0,
+        "maxX": 75.0,
+        "maxY": 364.0,
+        "minY": 120.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 0,
+       "file": "GroundZero_TarkovDev/Garage/z0_1x0.dds",
+       "world": {
+        "minX": 75.0,
+        "maxX": 249.0,
+        "maxY": 364.0,
+        "minY": 120.0
+       }
+      },
+      {
+       "col": 0,
+       "row": 1,
+       "file": "GroundZero_TarkovDev/Garage/z0_0x1.dds",
+       "world": {
+        "minX": -99.0,
+        "maxX": 75.0,
+        "maxY": 120.0,
+        "minY": -124.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 1,
+       "file": "GroundZero_TarkovDev/Garage/z0_1x1.dds",
+       "world": {
+        "minX": 75.0,
+        "maxX": 249.0,
+        "maxY": 120.0,
+        "minY": -124.0
+       }
+      }
+     ]
+    },
+    {
+     "name": "Ground Floor",
+     "slug": "Ground_Floor",
+     "level": 0,
+     "imageBounds": {
+      "Min": {
+       "x": -99,
+       "y": -124
+      },
+      "Max": {
+       "x": 249,
+       "y": 364
+      }
+     },
+     "gameBounds": [
+      {
+       "Min": {
+        "x": -99,
+        "y": -124,
+        "z": -100
+       },
+       "Max": {
+        "x": 249,
+        "y": 364,
+        "z": 100
+       }
+      }
+     ],
+     "cols": 2,
+     "rows": 2,
+     "tilePx": 512,
+     "slotsNeeded": 4,
+     "tiles": [
+      {
+       "col": 0,
+       "row": 0,
+       "file": "GroundZero_TarkovDev/Ground_Floor/z0_0x0.dds",
+       "world": {
+        "minX": -99.0,
+        "maxX": 75.0,
+        "maxY": 364.0,
+        "minY": 120.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 0,
+       "file": "GroundZero_TarkovDev/Ground_Floor/z0_1x0.dds",
+       "world": {
+        "minX": 75.0,
+        "maxX": 249.0,
+        "maxY": 364.0,
+        "minY": 120.0
+       }
+      },
+      {
+       "col": 0,
+       "row": 1,
+       "file": "GroundZero_TarkovDev/Ground_Floor/z0_0x1.dds",
+       "world": {
+        "minX": -99.0,
+        "maxX": 75.0,
+        "maxY": 120.0,
+        "minY": -124.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 1,
+       "file": "GroundZero_TarkovDev/Ground_Floor/z0_1x1.dds",
+       "world": {
+        "minX": 75.0,
+        "maxX": 249.0,
+        "maxY": 120.0,
+        "minY": -124.0
+       }
+      }
+     ]
+    },
+    {
+     "name": "2nd Floor",
+     "slug": "2nd_Floor",
+     "level": 1,
+     "imageBounds": {
+      "Min": {
+       "x": -99,
+       "y": -124
+      },
+      "Max": {
+       "x": 249,
+       "y": 364
+      }
+     },
+     "gameBounds": [
+      {
+       "Min": {
+        "x": -99,
+        "y": -124,
+        "z": 28
+       },
+       "Max": {
+        "x": 249,
+        "y": 364,
+        "z": 32.3
+       }
+      },
+      {
+       "Min": {
+        "x": 91,
+        "y": 216,
+        "z": 26
+       },
+       "Max": {
+        "x": 98,
+        "y": 228,
+        "z": 31
+       }
+      }
+     ],
+     "cols": 2,
+     "rows": 2,
+     "tilePx": 512,
+     "slotsNeeded": 4,
+     "tiles": [
+      {
+       "col": 0,
+       "row": 0,
+       "file": "GroundZero_TarkovDev/2nd_Floor/z0_0x0.dds",
+       "world": {
+        "minX": -99.0,
+        "maxX": 75.0,
+        "maxY": 364.0,
+        "minY": 120.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 0,
+       "file": "GroundZero_TarkovDev/2nd_Floor/z0_1x0.dds",
+       "world": {
+        "minX": 75.0,
+        "maxX": 249.0,
+        "maxY": 364.0,
+        "minY": 120.0
+       }
+      },
+      {
+       "col": 0,
+       "row": 1,
+       "file": "GroundZero_TarkovDev/2nd_Floor/z0_0x1.dds",
+       "world": {
+        "minX": -99.0,
+        "maxX": 75.0,
+        "maxY": 120.0,
+        "minY": -124.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 1,
+       "file": "GroundZero_TarkovDev/2nd_Floor/z0_1x1.dds",
+       "world": {
+        "minX": 75.0,
+        "maxX": 249.0,
+        "maxY": 120.0,
+        "minY": -124.0
+       }
+      }
+     ]
+    },
+    {
+     "name": "3rd Floor",
+     "slug": "3rd_Floor",
+     "level": 2,
+     "imageBounds": {
+      "Min": {
+       "x": -99,
+       "y": -124
+      },
+      "Max": {
+       "x": 249,
+       "y": 364
+      }
+     },
+     "gameBounds": [
+      {
+       "Min": {
+        "x": -99,
+        "y": -124,
+        "z": 32.3
+       },
+       "Max": {
+        "x": 249,
+        "y": 364,
+        "z": 100
+       }
+      }
+     ],
+     "cols": 2,
+     "rows": 2,
+     "tilePx": 512,
+     "slotsNeeded": 4,
+     "tiles": [
+      {
+       "col": 0,
+       "row": 0,
+       "file": "GroundZero_TarkovDev/3rd_Floor/z0_0x0.dds",
+       "world": {
+        "minX": -99.0,
+        "maxX": 75.0,
+        "maxY": 364.0,
+        "minY": 120.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 0,
+       "file": "GroundZero_TarkovDev/3rd_Floor/z0_1x0.dds",
+       "world": {
+        "minX": 75.0,
+        "maxX": 249.0,
+        "maxY": 364.0,
+        "minY": 120.0
+       }
+      },
+      {
+       "col": 0,
+       "row": 1,
+       "file": "GroundZero_TarkovDev/3rd_Floor/z0_0x1.dds",
+       "world": {
+        "minX": -99.0,
+        "maxX": 75.0,
+        "maxY": 120.0,
+        "minY": -124.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 1,
+       "file": "GroundZero_TarkovDev/3rd_Floor/z0_1x1.dds",
+       "world": {
+        "minX": 75.0,
+        "maxX": 249.0,
+        "maxY": 120.0,
+        "minY": -124.0
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "id": "Interchange_TarkovDev",
+   "displayName": "Interchange (TarkovDev)",
+   "internalNames": [
+    "Interchange"
+   ],
+   "coordinateRotation": 180,
+   "bounds": {
+    "Min": {
+     "x": -364,
+     "y": -443
+    },
+    "Max": {
+     "x": 534,
+     "y": 452
+    }
+   },
+   "defaultLevel": 0,
+   "layers": [
+    {
+     "name": "Ground Floor",
+     "slug": "Ground_Floor",
+     "level": 0,
+     "imageBounds": {
+      "Min": {
+       "x": -364,
+       "y": -443
+      },
+      "Max": {
+       "x": 534,
+       "y": 452
+      }
+     },
+     "gameBounds": [
+      {
+       "Min": {
+        "x": -364,
+        "y": -443,
+        "z": -100
+       },
+       "Max": {
+        "x": 534,
+        "y": 452,
+        "z": 100
+       }
+      }
+     ],
+     "cols": 2,
+     "rows": 2,
+     "tilePx": 512,
+     "slotsNeeded": 4,
+     "tiles": [
+      {
+       "col": 0,
+       "row": 0,
+       "file": "Interchange_TarkovDev/Ground_Floor/z0_0x0.dds",
+       "world": {
+        "minX": -364.0,
+        "maxX": 85.0,
+        "maxY": 452.0,
+        "minY": 4.5
+       }
+      },
+      {
+       "col": 1,
+       "row": 0,
+       "file": "Interchange_TarkovDev/Ground_Floor/z0_1x0.dds",
+       "world": {
+        "minX": 85.0,
+        "maxX": 534.0,
+        "maxY": 452.0,
+        "minY": 4.5
+       }
+      },
+      {
+       "col": 0,
+       "row": 1,
+       "file": "Interchange_TarkovDev/Ground_Floor/z0_0x1.dds",
+       "world": {
+        "minX": -364.0,
+        "maxX": 85.0,
+        "maxY": 4.5,
+        "minY": -443.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 1,
+       "file": "Interchange_TarkovDev/Ground_Floor/z0_1x1.dds",
+       "world": {
+        "minX": 85.0,
+        "maxX": 534.0,
+        "maxY": 4.5,
+        "minY": -443.0
+       }
+      }
+     ]
+    },
+    {
+     "name": "2nd Floor",
+     "slug": "2nd_Floor",
+     "level": 1,
+     "imageBounds": {
+      "Min": {
+       "x": -364,
+       "y": -443
+      },
+      "Max": {
+       "x": 534,
+       "y": 452
+      }
+     },
+     "gameBounds": [
+      {
+       "Min": {
+        "x": -222,
+        "y": -327,
+        "z": 25
+       },
+       "Max": {
+        "x": 120,
+        "y": 218,
+        "z": 34
+       }
+      }
+     ],
+     "cols": 2,
+     "rows": 2,
+     "tilePx": 512,
+     "slotsNeeded": 4,
+     "tiles": [
+      {
+       "col": 0,
+       "row": 0,
+       "file": "Interchange_TarkovDev/2nd_Floor/z0_0x0.dds",
+       "world": {
+        "minX": -364.0,
+        "maxX": 85.0,
+        "maxY": 452.0,
+        "minY": 4.5
+       }
+      },
+      {
+       "col": 1,
+       "row": 0,
+       "file": "Interchange_TarkovDev/2nd_Floor/z0_1x0.dds",
+       "world": {
+        "minX": 85.0,
+        "maxX": 534.0,
+        "maxY": 452.0,
+        "minY": 4.5
+       }
+      },
+      {
+       "col": 0,
+       "row": 1,
+       "file": "Interchange_TarkovDev/2nd_Floor/z0_0x1.dds",
+       "world": {
+        "minX": -364.0,
+        "maxX": 85.0,
+        "maxY": 4.5,
+        "minY": -443.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 1,
+       "file": "Interchange_TarkovDev/2nd_Floor/z0_1x1.dds",
+       "world": {
+        "minX": 85.0,
+        "maxX": 534.0,
+        "maxY": 4.5,
+        "minY": -443.0
+       }
+      }
+     ]
+    },
+    {
+     "name": "3rd Floor",
+     "slug": "3rd_Floor",
+     "level": 2,
+     "imageBounds": {
+      "Min": {
+       "x": -364,
+       "y": -443
+      },
+      "Max": {
+       "x": 534,
+       "y": 452
+      }
+     },
+     "gameBounds": [
+      {
+       "Min": {
+        "x": -222,
+        "y": -443,
+        "z": 34
+       },
+       "Max": {
+        "x": 120,
+        "y": 218,
+        "z": 100
+       }
+      }
+     ],
+     "cols": 2,
+     "rows": 2,
+     "tilePx": 512,
+     "slotsNeeded": 4,
+     "tiles": [
+      {
+       "col": 0,
+       "row": 0,
+       "file": "Interchange_TarkovDev/3rd_Floor/z0_0x0.dds",
+       "world": {
+        "minX": -364.0,
+        "maxX": 85.0,
+        "maxY": 452.0,
+        "minY": 4.5
+       }
+      },
+      {
+       "col": 1,
+       "row": 0,
+       "file": "Interchange_TarkovDev/3rd_Floor/z0_1x0.dds",
+       "world": {
+        "minX": 85.0,
+        "maxX": 534.0,
+        "maxY": 452.0,
+        "minY": 4.5
+       }
+      },
+      {
+       "col": 0,
+       "row": 1,
+       "file": "Interchange_TarkovDev/3rd_Floor/z0_0x1.dds",
+       "world": {
+        "minX": -364.0,
+        "maxX": 85.0,
+        "maxY": 4.5,
+        "minY": -443.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 1,
+       "file": "Interchange_TarkovDev/3rd_Floor/z0_1x1.dds",
+       "world": {
+        "minX": 85.0,
+        "maxX": 534.0,
+        "maxY": 4.5,
+        "minY": -443.0
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "id": "Labs_TarkovDev",
+   "displayName": "Labs (TarkovDev)",
+   "internalNames": [
+    "laboratory"
+   ],
+   "coordinateRotation": 270,
+   "bounds": {
+    "Min": {
+     "x": -292,
+     "y": -441
+    },
+    "Max": {
+     "x": -96,
+     "y": -223
+    }
+   },
+   "defaultLevel": 0,
+   "layers": [
+    {
+     "name": "Technical",
+     "slug": "Technical",
+     "level": -1,
+     "imageBounds": {
+      "Min": {
+       "x": -292,
+       "y": -441
+      },
+      "Max": {
+       "x": -96,
+       "y": -223
+      }
+     },
+     "gameBounds": [
+      {
+       "Min": {
+        "x": -292,
+        "y": -441,
+        "z": -100
+       },
+       "Max": {
+        "x": -96,
+        "y": -223,
+        "z": -0.9
+       }
+      }
+     ],
+     "cols": 2,
+     "rows": 2,
+     "tilePx": 512,
+     "slotsNeeded": 4,
+     "tiles": [
+      {
+       "col": 0,
+       "row": 0,
+       "file": "Labs_TarkovDev/Technical/z0_0x0.dds",
+       "world": {
+        "minX": -292.0,
+        "maxX": -194.0,
+        "maxY": -223.0,
+        "minY": -332.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 0,
+       "file": "Labs_TarkovDev/Technical/z0_1x0.dds",
+       "world": {
+        "minX": -194.0,
+        "maxX": -96.0,
+        "maxY": -223.0,
+        "minY": -332.0
+       }
+      },
+      {
+       "col": 0,
+       "row": 1,
+       "file": "Labs_TarkovDev/Technical/z0_0x1.dds",
+       "world": {
+        "minX": -292.0,
+        "maxX": -194.0,
+        "maxY": -332.0,
+        "minY": -441.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 1,
+       "file": "Labs_TarkovDev/Technical/z0_1x1.dds",
+       "world": {
+        "minX": -194.0,
+        "maxX": -96.0,
+        "maxY": -332.0,
+        "minY": -441.0
+       }
+      }
+     ]
+    },
+    {
+     "name": "First Level",
+     "slug": "First_Level",
+     "level": 0,
+     "imageBounds": {
+      "Min": {
+       "x": -292,
+       "y": -441
+      },
+      "Max": {
+       "x": -96,
+       "y": -223
+      }
+     },
+     "gameBounds": [
+      {
+       "Min": {
+        "x": -292,
+        "y": -441,
+        "z": -0.9
+       },
+       "Max": {
+        "x": -96,
+        "y": -223,
+        "z": 3
+       }
+      }
+     ],
+     "cols": 2,
+     "rows": 2,
+     "tilePx": 512,
+     "slotsNeeded": 4,
+     "tiles": [
+      {
+       "col": 0,
+       "row": 0,
+       "file": "Labs_TarkovDev/First_Level/z0_0x0.dds",
+       "world": {
+        "minX": -292.0,
+        "maxX": -194.0,
+        "maxY": -223.0,
+        "minY": -332.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 0,
+       "file": "Labs_TarkovDev/First_Level/z0_1x0.dds",
+       "world": {
+        "minX": -194.0,
+        "maxX": -96.0,
+        "maxY": -223.0,
+        "minY": -332.0
+       }
+      },
+      {
+       "col": 0,
+       "row": 1,
+       "file": "Labs_TarkovDev/First_Level/z0_0x1.dds",
+       "world": {
+        "minX": -292.0,
+        "maxX": -194.0,
+        "maxY": -332.0,
+        "minY": -441.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 1,
+       "file": "Labs_TarkovDev/First_Level/z0_1x1.dds",
+       "world": {
+        "minX": -194.0,
+        "maxX": -96.0,
+        "maxY": -332.0,
+        "minY": -441.0
+       }
+      }
+     ]
+    },
+    {
+     "name": "Second Level",
+     "slug": "Second_Level",
+     "level": 1,
+     "imageBounds": {
+      "Min": {
+       "x": -292,
+       "y": -441
+      },
+      "Max": {
+       "x": -96,
+       "y": -223
+      }
+     },
+     "gameBounds": [
+      {
+       "Min": {
+        "x": -271,
+        "y": -422,
+        "z": 3
+       },
+       "Max": {
+        "x": -101,
+        "y": -270,
+        "z": 100
+       }
+      }
+     ],
+     "cols": 2,
+     "rows": 2,
+     "tilePx": 512,
+     "slotsNeeded": 4,
+     "tiles": [
+      {
+       "col": 0,
+       "row": 0,
+       "file": "Labs_TarkovDev/Second_Level/z0_0x0.dds",
+       "world": {
+        "minX": -292.0,
+        "maxX": -194.0,
+        "maxY": -223.0,
+        "minY": -332.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 0,
+       "file": "Labs_TarkovDev/Second_Level/z0_1x0.dds",
+       "world": {
+        "minX": -194.0,
+        "maxX": -96.0,
+        "maxY": -223.0,
+        "minY": -332.0
+       }
+      },
+      {
+       "col": 0,
+       "row": 1,
+       "file": "Labs_TarkovDev/Second_Level/z0_0x1.dds",
+       "world": {
+        "minX": -292.0,
+        "maxX": -194.0,
+        "maxY": -332.0,
+        "minY": -441.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 1,
+       "file": "Labs_TarkovDev/Second_Level/z0_1x1.dds",
+       "world": {
+        "minX": -194.0,
+        "maxX": -96.0,
+        "maxY": -332.0,
+        "minY": -441.0
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "id": "Labyrinth",
+   "displayName": "Labyrinth",
+   "internalNames": [
+    "Labyrinth"
+   ],
+   "coordinateRotation": 90,
+   "bounds": {
+    "Min": {
+     "x": -52.5,
+     "y": -36.5
+    },
+    "Max": {
+     "x": 50.7,
+     "y": 75.3
+    }
+   },
+   "defaultLevel": 0,
+   "layers": [
+    {
+     "name": "Ground Level",
+     "slug": "Ground_Level",
+     "level": 0,
+     "imageBounds": {
+      "Min": {
+       "x": -52.5,
+       "y": -36.5
+      },
+      "Max": {
+       "x": 50.7,
+       "y": 75.3
+      }
+     },
+     "gameBounds": [
+      {
+       "Min": {
+        "x": -52.5,
+        "y": -36.5,
+        "z": -100
+       },
+       "Max": {
+        "x": 50.7,
+        "y": 75.3,
+        "z": 100
+       }
+      }
+     ],
+     "cols": 2,
+     "rows": 2,
+     "tilePx": 512,
+     "slotsNeeded": 4,
+     "tiles": [
+      {
+       "col": 0,
+       "row": 0,
+       "file": "Labyrinth/Ground_Level/z0_0x0.dds",
+       "world": {
+        "minX": -52.5,
+        "maxX": -0.8999999999999986,
+        "maxY": 75.3,
+        "minY": 19.4
+       }
+      },
+      {
+       "col": 1,
+       "row": 0,
+       "file": "Labyrinth/Ground_Level/z0_1x0.dds",
+       "world": {
+        "minX": -0.8999999999999986,
+        "maxX": 50.7,
+        "maxY": 75.3,
+        "minY": 19.4
+       }
+      },
+      {
+       "col": 0,
+       "row": 1,
+       "file": "Labyrinth/Ground_Level/z0_0x1.dds",
+       "world": {
+        "minX": -52.5,
+        "maxX": -0.8999999999999986,
+        "maxY": 19.4,
+        "minY": -36.5
+       }
+      },
+      {
+       "col": 1,
+       "row": 1,
+       "file": "Labyrinth/Ground_Level/z0_1x1.dds",
+       "world": {
+        "minX": -0.8999999999999986,
+        "maxX": 50.7,
+        "maxY": 19.4,
+        "minY": -36.5
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "id": "Lighthouse_TarkovData",
+   "displayName": "Lighthouse (TarkovData)",
+   "internalNames": [
+    "Lighthouse"
+   ],
+   "coordinateRotation": 180,
+   "bounds": {
+    "Min": {
+     "x": -545,
+     "y": -998
+    },
+    "Max": {
+     "x": 512,
+     "y": 721
+    }
+   },
+   "defaultLevel": 0,
+   "layers": [
+    {
+     "name": "Ground Floor",
+     "slug": "Ground_Floor",
+     "level": 0,
+     "imageBounds": {
+      "Min": {
+       "x": -545,
+       "y": -998
+      },
+      "Max": {
+       "x": 512,
+       "y": 721
+      }
+     },
+     "gameBounds": [
+      {
+       "Min": {
+        "x": -545,
+        "y": -998,
+        "z": -100
+       },
+       "Max": {
+        "x": 512,
+        "y": 721,
+        "z": 100
+       }
+      }
+     ],
+     "cols": 2,
+     "rows": 2,
+     "tilePx": 512,
+     "slotsNeeded": 4,
+     "tiles": [
+      {
+       "col": 0,
+       "row": 0,
+       "file": "Lighthouse_TarkovData/Ground_Floor/z0_0x0.dds",
+       "world": {
+        "minX": -545.0,
+        "maxX": -16.5,
+        "maxY": 721.0,
+        "minY": -138.5
+       }
+      },
+      {
+       "col": 1,
+       "row": 0,
+       "file": "Lighthouse_TarkovData/Ground_Floor/z0_1x0.dds",
+       "world": {
+        "minX": -16.5,
+        "maxX": 512.0,
+        "maxY": 721.0,
+        "minY": -138.5
+       }
+      },
+      {
+       "col": 0,
+       "row": 1,
+       "file": "Lighthouse_TarkovData/Ground_Floor/z0_0x1.dds",
+       "world": {
+        "minX": -545.0,
+        "maxX": -16.5,
+        "maxY": -138.5,
+        "minY": -998.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 1,
+       "file": "Lighthouse_TarkovData/Ground_Floor/z0_1x1.dds",
+       "world": {
+        "minX": -16.5,
+        "maxX": 512.0,
+        "maxY": -138.5,
+        "minY": -998.0
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "id": "Reserve_TarkovData",
+   "displayName": "Reserve (TarkovData)",
+   "internalNames": [
+    "RezervBase"
+   ],
+   "coordinateRotation": 180,
+   "bounds": {
+    "Min": {
+     "x": -303.5,
+     "y": -275
+    },
+    "Max": {
+     "x": 292,
+     "y": 271.5
+    }
+   },
+   "defaultLevel": 0,
+   "layers": [
+    {
+     "name": "Bunkers",
+     "slug": "Bunkers",
+     "level": -1,
+     "imageBounds": {
+      "Min": {
+       "x": -303.5,
+       "y": -275
+      },
+      "Max": {
+       "x": 292,
+       "y": 271.5
+      }
+     },
+     "gameBounds": [
+      {
+       "Min": {
+        "x": -303.5,
+        "y": -275,
+        "z": -100
+       },
+       "Max": {
+        "x": 292,
+        "y": 271.5,
+        "z": -8
+       }
+      }
+     ],
+     "cols": 2,
+     "rows": 2,
+     "tilePx": 512,
+     "slotsNeeded": 4,
+     "tiles": [
+      {
+       "col": 0,
+       "row": 0,
+       "file": "Reserve_TarkovData/Bunkers/z0_0x0.dds",
+       "world": {
+        "minX": -303.5,
+        "maxX": -5.75,
+        "maxY": 271.5,
+        "minY": -1.75
+       }
+      },
+      {
+       "col": 1,
+       "row": 0,
+       "file": "Reserve_TarkovData/Bunkers/z0_1x0.dds",
+       "world": {
+        "minX": -5.75,
+        "maxX": 292.0,
+        "maxY": 271.5,
+        "minY": -1.75
+       }
+      },
+      {
+       "col": 0,
+       "row": 1,
+       "file": "Reserve_TarkovData/Bunkers/z0_0x1.dds",
+       "world": {
+        "minX": -303.5,
+        "maxX": -5.75,
+        "maxY": -1.75,
+        "minY": -275.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 1,
+       "file": "Reserve_TarkovData/Bunkers/z0_1x1.dds",
+       "world": {
+        "minX": -5.75,
+        "maxX": 292.0,
+        "maxY": -1.75,
+        "minY": -275.0
+       }
+      }
+     ]
+    },
+    {
+     "name": "Ground Level",
+     "slug": "Ground_Level",
+     "level": 0,
+     "imageBounds": {
+      "Min": {
+       "x": -303.5,
+       "y": -275
+      },
+      "Max": {
+       "x": 292,
+       "y": 271.5
+      }
+     },
+     "gameBounds": [
+      {
+       "Min": {
+        "x": -303.5,
+        "y": -275,
+        "z": -8
+       },
+       "Max": {
+        "x": 292,
+        "y": 271.5,
+        "z": 100
+       }
+      }
+     ],
+     "cols": 2,
+     "rows": 2,
+     "tilePx": 512,
+     "slotsNeeded": 4,
+     "tiles": [
+      {
+       "col": 0,
+       "row": 0,
+       "file": "Reserve_TarkovData/Ground_Level/z0_0x0.dds",
+       "world": {
+        "minX": -303.5,
+        "maxX": -5.75,
+        "maxY": 271.5,
+        "minY": -1.75
+       }
+      },
+      {
+       "col": 1,
+       "row": 0,
+       "file": "Reserve_TarkovData/Ground_Level/z0_1x0.dds",
+       "world": {
+        "minX": -5.75,
+        "maxX": 292.0,
+        "maxY": 271.5,
+        "minY": -1.75
+       }
+      },
+      {
+       "col": 0,
+       "row": 1,
+       "file": "Reserve_TarkovData/Ground_Level/z0_0x1.dds",
+       "world": {
+        "minX": -303.5,
+        "maxX": -5.75,
+        "maxY": -1.75,
+        "minY": -275.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 1,
+       "file": "Reserve_TarkovData/Ground_Level/z0_1x1.dds",
+       "world": {
+        "minX": -5.75,
+        "maxX": 292.0,
+        "maxY": -1.75,
+        "minY": -275.0
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "id": "Shoreline_TarkovData",
+   "displayName": "Shoreline (TarkovData)",
+   "internalNames": [
+    "Shoreline"
+   ],
+   "coordinateRotation": 180,
+   "bounds": {
+    "Min": {
+     "x": -1060,
+     "y": -415
+    },
+    "Max": {
+     "x": 508,
+     "y": 622
+    }
+   },
+   "defaultLevel": 0,
+   "layers": [
+    {
+     "name": "Underground",
+     "slug": "Underground",
+     "level": -1,
+     "imageBounds": {
+      "Min": {
+       "x": -1060,
+       "y": -415
+      },
+      "Max": {
+       "x": 508,
+       "y": 622
+      }
+     },
+     "gameBounds": [
+      {
+       "Min": {
+        "x": -237,
+        "y": -104,
+        "z": -100
+       },
+       "Max": {
+        "x": -137,
+        "y": -68,
+        "z": -5
+       }
+      },
+      {
+       "Min": {
+        "x": -268,
+        "y": -163,
+        "z": -100
+       },
+       "Max": {
+        "x": -234,
+        "y": -134,
+        "z": -5
+       }
+      }
+     ],
+     "cols": 2,
+     "rows": 2,
+     "tilePx": 512,
+     "slotsNeeded": 4,
+     "tiles": [
+      {
+       "col": 0,
+       "row": 0,
+       "file": "Shoreline_TarkovData/Underground/z0_0x0.dds",
+       "world": {
+        "minX": -1060.0,
+        "maxX": -276.0,
+        "maxY": 622.0,
+        "minY": 103.5
+       }
+      },
+      {
+       "col": 1,
+       "row": 0,
+       "file": "Shoreline_TarkovData/Underground/z0_1x0.dds",
+       "world": {
+        "minX": -276.0,
+        "maxX": 508.0,
+        "maxY": 622.0,
+        "minY": 103.5
+       }
+      },
+      {
+       "col": 0,
+       "row": 1,
+       "file": "Shoreline_TarkovData/Underground/z0_0x1.dds",
+       "world": {
+        "minX": -1060.0,
+        "maxX": -276.0,
+        "maxY": 103.5,
+        "minY": -415.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 1,
+       "file": "Shoreline_TarkovData/Underground/z0_1x1.dds",
+       "world": {
+        "minX": -276.0,
+        "maxX": 508.0,
+        "maxY": 103.5,
+        "minY": -415.0
+       }
+      }
+     ]
+    },
+    {
+     "name": "Ground Floor",
+     "slug": "Ground_Floor",
+     "level": 0,
+     "imageBounds": {
+      "Min": {
+       "x": -1060,
+       "y": -415
+      },
+      "Max": {
+       "x": 508,
+       "y": 622
+      }
+     },
+     "gameBounds": [
+      {
+       "Min": {
+        "x": -1060,
+        "y": -415,
+        "z": -100
+       },
+       "Max": {
+        "x": 508,
+        "y": 622,
+        "z": 100
+       }
+      }
+     ],
+     "cols": 2,
+     "rows": 2,
+     "tilePx": 512,
+     "slotsNeeded": 4,
+     "tiles": [
+      {
+       "col": 0,
+       "row": 0,
+       "file": "Shoreline_TarkovData/Ground_Floor/z0_0x0.dds",
+       "world": {
+        "minX": -1060.0,
+        "maxX": -276.0,
+        "maxY": 622.0,
+        "minY": 103.5
+       }
+      },
+      {
+       "col": 1,
+       "row": 0,
+       "file": "Shoreline_TarkovData/Ground_Floor/z0_1x0.dds",
+       "world": {
+        "minX": -276.0,
+        "maxX": 508.0,
+        "maxY": 622.0,
+        "minY": 103.5
+       }
+      },
+      {
+       "col": 0,
+       "row": 1,
+       "file": "Shoreline_TarkovData/Ground_Floor/z0_0x1.dds",
+       "world": {
+        "minX": -1060.0,
+        "maxX": -276.0,
+        "maxY": 103.5,
+        "minY": -415.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 1,
+       "file": "Shoreline_TarkovData/Ground_Floor/z0_1x1.dds",
+       "world": {
+        "minX": -276.0,
+        "maxX": 508.0,
+        "maxY": 103.5,
+        "minY": -415.0
+       }
+      }
+     ]
+    },
+    {
+     "name": "2nd Floor",
+     "slug": "2nd_Floor",
+     "level": 1,
+     "imageBounds": {
+      "Min": {
+       "x": -1060,
+       "y": -415
+      },
+      "Max": {
+       "x": 508,
+       "y": 622
+      }
+     },
+     "gameBounds": [
+      {
+       "Min": {
+        "x": -375,
+        "y": -178,
+        "z": -1
+       },
+       "Max": {
+        "x": -128,
+        "y": -55,
+        "z": 2
+       }
+      }
+     ],
+     "cols": 2,
+     "rows": 2,
+     "tilePx": 512,
+     "slotsNeeded": 4,
+     "tiles": [
+      {
+       "col": 0,
+       "row": 0,
+       "file": "Shoreline_TarkovData/2nd_Floor/z0_0x0.dds",
+       "world": {
+        "minX": -1060.0,
+        "maxX": -276.0,
+        "maxY": 622.0,
+        "minY": 103.5
+       }
+      },
+      {
+       "col": 1,
+       "row": 0,
+       "file": "Shoreline_TarkovData/2nd_Floor/z0_1x0.dds",
+       "world": {
+        "minX": -276.0,
+        "maxX": 508.0,
+        "maxY": 622.0,
+        "minY": 103.5
+       }
+      },
+      {
+       "col": 0,
+       "row": 1,
+       "file": "Shoreline_TarkovData/2nd_Floor/z0_0x1.dds",
+       "world": {
+        "minX": -1060.0,
+        "maxX": -276.0,
+        "maxY": 103.5,
+        "minY": -415.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 1,
+       "file": "Shoreline_TarkovData/2nd_Floor/z0_1x1.dds",
+       "world": {
+        "minX": -276.0,
+        "maxX": 508.0,
+        "maxY": 103.5,
+        "minY": -415.0
+       }
+      }
+     ]
+    },
+    {
+     "name": "3rd Floor",
+     "slug": "3rd_Floor",
+     "level": 2,
+     "imageBounds": {
+      "Min": {
+       "x": -1060,
+       "y": -415
+      },
+      "Max": {
+       "x": 508,
+       "y": 622
+      }
+     },
+     "gameBounds": [
+      {
+       "Min": {
+        "x": -375,
+        "y": -178,
+        "z": 2
+       },
+       "Max": {
+        "x": -128,
+        "y": -55,
+        "z": 100
+       }
+      }
+     ],
+     "cols": 2,
+     "rows": 2,
+     "tilePx": 512,
+     "slotsNeeded": 4,
+     "tiles": [
+      {
+       "col": 0,
+       "row": 0,
+       "file": "Shoreline_TarkovData/3rd_Floor/z0_0x0.dds",
+       "world": {
+        "minX": -1060.0,
+        "maxX": -276.0,
+        "maxY": 622.0,
+        "minY": 103.5
+       }
+      },
+      {
+       "col": 1,
+       "row": 0,
+       "file": "Shoreline_TarkovData/3rd_Floor/z0_1x0.dds",
+       "world": {
+        "minX": -276.0,
+        "maxX": 508.0,
+        "maxY": 622.0,
+        "minY": 103.5
+       }
+      },
+      {
+       "col": 0,
+       "row": 1,
+       "file": "Shoreline_TarkovData/3rd_Floor/z0_0x1.dds",
+       "world": {
+        "minX": -1060.0,
+        "maxX": -276.0,
+        "maxY": 103.5,
+        "minY": -415.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 1,
+       "file": "Shoreline_TarkovData/3rd_Floor/z0_1x1.dds",
+       "world": {
+        "minX": -276.0,
+        "maxX": 508.0,
+        "maxY": 103.5,
+        "minY": -415.0
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "id": "Streets_TarkovData",
+   "displayName": "Streets of Tarkov (TarkovData)",
+   "internalNames": [
+    "TarkovStreets"
+   ],
+   "coordinateRotation": 180,
+   "bounds": {
+    "Min": {
+     "x": -279,
+     "y": -299
+    },
+    "Max": {
+     "x": 324,
+     "y": 533
+    }
+   },
+   "defaultLevel": 0,
+   "layers": [
+    {
+     "name": "Underground",
+     "slug": "Underground",
+     "level": -1,
+     "imageBounds": {
+      "Min": {
+       "x": -279,
+       "y": -299
+      },
+      "Max": {
+       "x": 324,
+       "y": 533
+      }
+     },
+     "gameBounds": [
+      {
+       "Min": {
+        "x": 147,
+        "y": 338,
+        "z": -4
+       },
+       "Max": {
+        "x": 277,
+        "y": 416,
+        "z": 0
+       }
+      },
+      {
+       "Min": {
+        "x": -15,
+        "y": -25,
+        "z": -5
+       },
+       "Max": {
+        "x": 39,
+        "y": 33,
+        "z": -2
+       }
+      }
+     ],
+     "cols": 2,
+     "rows": 2,
+     "tilePx": 512,
+     "slotsNeeded": 4,
+     "tiles": [
+      {
+       "col": 0,
+       "row": 0,
+       "file": "Streets_TarkovData/Underground/z0_0x0.dds",
+       "world": {
+        "minX": -279.0,
+        "maxX": 22.5,
+        "maxY": 533.0,
+        "minY": 117.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 0,
+       "file": "Streets_TarkovData/Underground/z0_1x0.dds",
+       "world": {
+        "minX": 22.5,
+        "maxX": 324.0,
+        "maxY": 533.0,
+        "minY": 117.0
+       }
+      },
+      {
+       "col": 0,
+       "row": 1,
+       "file": "Streets_TarkovData/Underground/z0_0x1.dds",
+       "world": {
+        "minX": -279.0,
+        "maxX": 22.5,
+        "maxY": 117.0,
+        "minY": -299.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 1,
+       "file": "Streets_TarkovData/Underground/z0_1x1.dds",
+       "world": {
+        "minX": 22.5,
+        "maxX": 324.0,
+        "maxY": 117.0,
+        "minY": -299.0
+       }
+      }
+     ]
+    },
+    {
+     "name": "Ground Floor",
+     "slug": "Ground_Floor",
+     "level": 0,
+     "imageBounds": {
+      "Min": {
+       "x": -279,
+       "y": -299
+      },
+      "Max": {
+       "x": 324,
+       "y": 533
+      }
+     },
+     "gameBounds": [
+      {
+       "Min": {
+        "x": -279,
+        "y": -299,
+        "z": -100
+       },
+       "Max": {
+        "x": 324,
+        "y": 533,
+        "z": 100
+       }
+      }
+     ],
+     "cols": 2,
+     "rows": 2,
+     "tilePx": 512,
+     "slotsNeeded": 4,
+     "tiles": [
+      {
+       "col": 0,
+       "row": 0,
+       "file": "Streets_TarkovData/Ground_Floor/z0_0x0.dds",
+       "world": {
+        "minX": -279.0,
+        "maxX": 22.5,
+        "maxY": 533.0,
+        "minY": 117.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 0,
+       "file": "Streets_TarkovData/Ground_Floor/z0_1x0.dds",
+       "world": {
+        "minX": 22.5,
+        "maxX": 324.0,
+        "maxY": 533.0,
+        "minY": 117.0
+       }
+      },
+      {
+       "col": 0,
+       "row": 1,
+       "file": "Streets_TarkovData/Ground_Floor/z0_0x1.dds",
+       "world": {
+        "minX": -279.0,
+        "maxX": 22.5,
+        "maxY": 117.0,
+        "minY": -299.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 1,
+       "file": "Streets_TarkovData/Ground_Floor/z0_1x1.dds",
+       "world": {
+        "minX": 22.5,
+        "maxX": 324.0,
+        "maxY": 117.0,
+        "minY": -299.0
+       }
+      }
+     ]
+    },
+    {
+     "name": "2nd Floor",
+     "slug": "2nd_Floor",
+     "level": 1,
+     "imageBounds": {
+      "Min": {
+       "x": -279,
+       "y": -299
+      },
+      "Max": {
+       "x": 324,
+       "y": 533
+      }
+     },
+     "gameBounds": [
+      {
+       "Min": {
+        "x": 128,
+        "y": 339,
+        "z": 6
+       },
+       "Max": {
+        "x": 287,
+        "y": 416,
+        "z": 9
+       }
+      },
+      {
+       "Min": {
+        "x": 128,
+        "y": 335,
+        "z": 6
+       },
+       "Max": {
+        "x": 152,
+        "y": 460,
+        "z": 9
+       }
+      },
+      {
+       "Min": {
+        "x": -68,
+        "y": 449,
+        "z": 6
+       },
+       "Max": {
+        "x": -34,
+        "y": 475,
+        "z": 10
+       }
+      },
+      {
+       "Min": {
+        "x": -197,
+        "y": 370,
+        "z": 6
+       },
+       "Max": {
+        "x": -120,
+        "y": 432,
+        "z": 12
+       }
+      },
+      {
+       "Min": {
+        "x": -175,
+        "y": 477,
+        "z": 6
+       },
+       "Max": {
+        "x": -160,
+        "y": 491,
+        "z": 10
+       }
+      },
+      {
+       "Min": {
+        "x": -189,
+        "y": 451,
+        "z": 6
+       },
+       "Max": {
+        "x": -171,
+        "y": 473,
+        "z": 10
+       }
+      },
+      {
+       "Min": {
+        "x": 188,
+        "y": 284,
+        "z": 6
+       },
+       "Max": {
+        "x": 218,
+        "y": 314,
+        "z": 10
+       }
+      },
+      {
+       "Min": {
+        "x": 107,
+        "y": 283,
+        "z": 6
+       },
+       "Max": {
+        "x": 132,
+        "y": 294,
+        "z": 10
+       }
+      },
+      {
+       "Min": {
+        "x": 46,
+        "y": 257,
+        "z": 5.5
+       },
+       "Max": {
+        "x": 106,
+        "y": 352,
+        "z": 10
+       }
+      },
+      {
+       "Min": {
+        "x": -156,
+        "y": 265,
+        "z": 3
+       },
+       "Max": {
+        "x": -77,
+        "y": 305,
+        "z": 6
+       }
+      },
+      {
+       "Min": {
+        "x": -214,
+        "y": 235,
+        "z": 6
+       },
+       "Max": {
+        "x": -163,
+        "y": 307,
+        "z": 10
+       }
+      },
+      {
+       "Min": {
+        "x": -190,
+        "y": 217,
+        "z": 5.5
+       },
+       "Max": {
+        "x": -157,
+        "y": 235,
+        "z": 8
+       }
+      },
+      {
+       "Min": {
+        "x": -234,
+        "y": 271,
+        "z": 4.5
+       },
+       "Max": {
+        "x": -209,
+        "y": 290,
+        "z": 7
+       }
+      },
+      {
+       "Min": {
+        "x": 31,
+        "y": 198,
+        "z": 6
+       },
+       "Max": {
+        "x": 88,
+        "y": 240,
+        "z": 9
+       }
+      },
+      {
+       "Min": {
+        "x": 91,
+        "y": 205,
+        "z": 6
+       },
+       "Max": {
+        "x": 161,
+        "y": 240,
+        "z": 9
+       }
+      },
+      {
+       "Min": {
+        "x": 32,
+        "y": 144,
+        "z": 5
+       },
+       "Max": {
+        "x": 57,
+        "y": 173,
+        "z": 8
+       }
+      },
+      {
+       "Min": {
+        "x": 31,
+        "y": 60,
+        "z": 3
+       },
+       "Max": {
+        "x": 59,
+        "y": 140,
+        "z": 6
+       }
+      },
+      {
+       "Min": {
+        "x": 74,
+        "y": 122,
+        "z": 3.5
+       },
+       "Max": {
+        "x": 90,
+        "y": 146,
+        "z": 7
+       }
+      },
+      {
+       "Min": {
+        "x": 99,
+        "y": 118,
+        "z": 3.5
+       },
+       "Max": {
+        "x": 140,
+        "y": 159,
+        "z": 7
+       }
+      },
+      {
+       "Min": {
+        "x": 209,
+        "y": 166,
+        "z": 3
+       },
+       "Max": {
+        "x": 235,
+        "y": 183,
+        "z": 6
+       }
+      },
+      {
+       "Min": {
+        "x": 180,
+        "y": 91,
+        "z": 1
+       },
+       "Max": {
+        "x": 197,
+        "y": 127,
+        "z": 4
+       }
+      },
+      {
+       "Min": {
+        "x": 199,
+        "y": 96,
+        "z": 3
+       },
+       "Max": {
+        "x": 224,
+        "y": 160,
+        "z": 6
+       }
+      },
+      {
+       "Min": {
+        "x": 173,
+        "y": 48,
+        "z": -2
+       },
+       "Max": {
+        "x": 199,
+        "y": 85,
+        "z": 1
+       }
+      },
+      {
+       "Min": {
+        "x": 241,
+        "y": 45,
+        "z": -2
+       },
+       "Max": {
+        "x": 253,
+        "y": 62,
+        "z": 1
+       }
+      },
+      {
+       "Min": {
+        "x": -125,
+        "y": 45,
+        "z": 4
+       },
+       "Max": {
+        "x": -13,
+        "y": 173,
+        "z": 6.5
+       }
+      },
+      {
+       "Min": {
+        "x": -171,
+        "y": -89,
+        "z": 4
+       },
+       "Max": {
+        "x": -14,
+        "y": -7,
+        "z": 6.5
+       }
+      },
+      {
+       "Min": {
+        "x": -97,
+        "y": -73,
+        "z": 2
+       },
+       "Max": {
+        "x": 149,
+        "y": -14,
+        "z": 6
+       }
+      },
+      {
+       "Min": {
+        "x": 39,
+        "y": -160,
+        "z": 8.5
+       },
+       "Max": {
+        "x": 77,
+        "y": -114,
+        "z": 12
+       }
+      },
+      {
+       "Min": {
+        "x": -73,
+        "y": -160,
+        "z": 5
+       },
+       "Max": {
+        "x": -44,
+        "y": -141,
+        "z": 8
+       }
+      }
+     ],
+     "cols": 2,
+     "rows": 2,
+     "tilePx": 512,
+     "slotsNeeded": 4,
+     "tiles": [
+      {
+       "col": 0,
+       "row": 0,
+       "file": "Streets_TarkovData/2nd_Floor/z0_0x0.dds",
+       "world": {
+        "minX": -279.0,
+        "maxX": 22.5,
+        "maxY": 533.0,
+        "minY": 117.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 0,
+       "file": "Streets_TarkovData/2nd_Floor/z0_1x0.dds",
+       "world": {
+        "minX": 22.5,
+        "maxX": 324.0,
+        "maxY": 533.0,
+        "minY": 117.0
+       }
+      },
+      {
+       "col": 0,
+       "row": 1,
+       "file": "Streets_TarkovData/2nd_Floor/z0_0x1.dds",
+       "world": {
+        "minX": -279.0,
+        "maxX": 22.5,
+        "maxY": 117.0,
+        "minY": -299.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 1,
+       "file": "Streets_TarkovData/2nd_Floor/z0_1x1.dds",
+       "world": {
+        "minX": 22.5,
+        "maxX": 324.0,
+        "maxY": 117.0,
+        "minY": -299.0
+       }
+      }
+     ]
+    },
+    {
+     "name": "3rd Floor",
+     "slug": "3rd_Floor",
+     "level": 2,
+     "imageBounds": {
+      "Min": {
+       "x": -279,
+       "y": -299
+      },
+      "Max": {
+       "x": 324,
+       "y": 533
+      }
+     },
+     "gameBounds": [
+      {
+       "Min": {
+        "x": 128,
+        "y": 339,
+        "z": 9
+       },
+       "Max": {
+        "x": 287,
+        "y": 416,
+        "z": 12
+       }
+      },
+      {
+       "Min": {
+        "x": -179,
+        "y": 377,
+        "z": 12
+       },
+       "Max": {
+        "x": -155,
+        "y": 423,
+        "z": 18
+       }
+      },
+      {
+       "Min": {
+        "x": -156,
+        "y": 265,
+        "z": 6
+       },
+       "Max": {
+        "x": -77,
+        "y": 305,
+        "z": 11
+       }
+      },
+      {
+       "Min": {
+        "x": -234,
+        "y": 271,
+        "z": 7
+       },
+       "Max": {
+        "x": -209,
+        "y": 290,
+        "z": 10
+       }
+      },
+      {
+       "Min": {
+        "x": 31,
+        "y": 198,
+        "z": 9
+       },
+       "Max": {
+        "x": 88,
+        "y": 240,
+        "z": 12
+       }
+      },
+      {
+       "Min": {
+        "x": 91,
+        "y": 205,
+        "z": 9
+       },
+       "Max": {
+        "x": 161,
+        "y": 240,
+        "z": 12
+       }
+      },
+      {
+       "Min": {
+        "x": 31,
+        "y": 60,
+        "z": 6
+       },
+       "Max": {
+        "x": 59,
+        "y": 140,
+        "z": 9
+       }
+      },
+      {
+       "Min": {
+        "x": 99,
+        "y": 118,
+        "z": 7
+       },
+       "Max": {
+        "x": 140,
+        "y": 159,
+        "z": 9
+       }
+      },
+      {
+       "Min": {
+        "x": 173,
+        "y": 48,
+        "z": 1
+       },
+       "Max": {
+        "x": 199,
+        "y": 85,
+        "z": 4
+       }
+      },
+      {
+       "Min": {
+        "x": -125,
+        "y": 45,
+        "z": 6.5
+       },
+       "Max": {
+        "x": -13,
+        "y": 173,
+        "z": 12
+       }
+      },
+      {
+       "Min": {
+        "x": -171,
+        "y": -79,
+        "z": 6.5
+       },
+       "Max": {
+        "x": -14,
+        "y": -5,
+        "z": 12
+       }
+      },
+      {
+       "Min": {
+        "x": 39,
+        "y": -160,
+        "z": 12
+       },
+       "Max": {
+        "x": 77,
+        "y": -114,
+        "z": 15
+       }
+      },
+      {
+       "Min": {
+        "x": -73,
+        "y": -160,
+        "z": 8
+       },
+       "Max": {
+        "x": -44,
+        "y": -141,
+        "z": 12
+       }
+      }
+     ],
+     "cols": 2,
+     "rows": 2,
+     "tilePx": 512,
+     "slotsNeeded": 4,
+     "tiles": [
+      {
+       "col": 0,
+       "row": 0,
+       "file": "Streets_TarkovData/3rd_Floor/z0_0x0.dds",
+       "world": {
+        "minX": -279.0,
+        "maxX": 22.5,
+        "maxY": 533.0,
+        "minY": 117.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 0,
+       "file": "Streets_TarkovData/3rd_Floor/z0_1x0.dds",
+       "world": {
+        "minX": 22.5,
+        "maxX": 324.0,
+        "maxY": 533.0,
+        "minY": 117.0
+       }
+      },
+      {
+       "col": 0,
+       "row": 1,
+       "file": "Streets_TarkovData/3rd_Floor/z0_0x1.dds",
+       "world": {
+        "minX": -279.0,
+        "maxX": 22.5,
+        "maxY": 117.0,
+        "minY": -299.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 1,
+       "file": "Streets_TarkovData/3rd_Floor/z0_1x1.dds",
+       "world": {
+        "minX": 22.5,
+        "maxX": 324.0,
+        "maxY": 117.0,
+        "minY": -299.0
+       }
+      }
+     ]
+    },
+    {
+     "name": "4th Floor",
+     "slug": "4th_Floor",
+     "level": 3,
+     "imageBounds": {
+      "Min": {
+       "x": -279,
+       "y": -299
+      },
+      "Max": {
+       "x": 324,
+       "y": 533
+      }
+     },
+     "gameBounds": [
+      {
+       "Min": {
+        "x": -140,
+        "y": 263,
+        "z": 11
+       },
+       "Max": {
+        "x": -123,
+        "y": 278,
+        "z": 15
+       }
+      },
+      {
+       "Min": {
+        "x": -234,
+        "y": 271,
+        "z": 10
+       },
+       "Max": {
+        "x": -209,
+        "y": 290,
+        "z": 14
+       }
+      },
+      {
+       "Min": {
+        "x": 31,
+        "y": 198,
+        "z": 12
+       },
+       "Max": {
+        "x": 88,
+        "y": 240,
+        "z": 15
+       }
+      },
+      {
+       "Min": {
+        "x": 31,
+        "y": 60,
+        "z": 9
+       },
+       "Max": {
+        "x": 59,
+        "y": 164,
+        "z": 14
+       }
+      },
+      {
+       "Min": {
+        "x": 99,
+        "y": 118,
+        "z": 9
+       },
+       "Max": {
+        "x": 140,
+        "y": 159,
+        "z": 12
+       }
+      },
+      {
+       "Min": {
+        "x": 173,
+        "y": 48,
+        "z": 4
+       },
+       "Max": {
+        "x": 199,
+        "y": 85,
+        "z": 8
+       }
+      }
+     ],
+     "cols": 2,
+     "rows": 2,
+     "tilePx": 512,
+     "slotsNeeded": 4,
+     "tiles": [
+      {
+       "col": 0,
+       "row": 0,
+       "file": "Streets_TarkovData/4th_Floor/z0_0x0.dds",
+       "world": {
+        "minX": -279.0,
+        "maxX": 22.5,
+        "maxY": 533.0,
+        "minY": 117.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 0,
+       "file": "Streets_TarkovData/4th_Floor/z0_1x0.dds",
+       "world": {
+        "minX": 22.5,
+        "maxX": 324.0,
+        "maxY": 533.0,
+        "minY": 117.0
+       }
+      },
+      {
+       "col": 0,
+       "row": 1,
+       "file": "Streets_TarkovData/4th_Floor/z0_0x1.dds",
+       "world": {
+        "minX": -279.0,
+        "maxX": 22.5,
+        "maxY": 117.0,
+        "minY": -299.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 1,
+       "file": "Streets_TarkovData/4th_Floor/z0_1x1.dds",
+       "world": {
+        "minX": 22.5,
+        "maxX": 324.0,
+        "maxY": 117.0,
+        "minY": -299.0
+       }
+      }
+     ]
+    },
+    {
+     "name": "5th Floor",
+     "slug": "5th_Floor",
+     "level": 4,
+     "imageBounds": {
+      "Min": {
+       "x": -279,
+       "y": -299
+      },
+      "Max": {
+       "x": 324,
+       "y": 533
+      }
+     },
+     "gameBounds": [
+      {
+       "Min": {
+        "x": 99,
+        "y": 118,
+        "z": 12
+       },
+       "Max": {
+        "x": 140,
+        "y": 159,
+        "z": 15
+       }
+      },
+      {
+       "Min": {
+        "x": 170,
+        "y": 81,
+        "z": 8
+       },
+       "Max": {
+        "x": 181,
+        "y": 89,
+        "z": 12
+       }
+      }
+     ],
+     "cols": 2,
+     "rows": 2,
+     "tilePx": 512,
+     "slotsNeeded": 4,
+     "tiles": [
+      {
+       "col": 0,
+       "row": 0,
+       "file": "Streets_TarkovData/5th_Floor/z0_0x0.dds",
+       "world": {
+        "minX": -279.0,
+        "maxX": 22.5,
+        "maxY": 533.0,
+        "minY": 117.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 0,
+       "file": "Streets_TarkovData/5th_Floor/z0_1x0.dds",
+       "world": {
+        "minX": 22.5,
+        "maxX": 324.0,
+        "maxY": 533.0,
+        "minY": 117.0
+       }
+      },
+      {
+       "col": 0,
+       "row": 1,
+       "file": "Streets_TarkovData/5th_Floor/z0_0x1.dds",
+       "world": {
+        "minX": -279.0,
+        "maxX": 22.5,
+        "maxY": 117.0,
+        "minY": -299.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 1,
+       "file": "Streets_TarkovData/5th_Floor/z0_1x1.dds",
+       "world": {
+        "minX": 22.5,
+        "maxX": 324.0,
+        "maxY": 117.0,
+        "minY": -299.0
+       }
+      }
+     ]
+    }
+   ]
+  },
+  {
+   "id": "Woods_TarkovData",
+   "displayName": "Woods (TarkovData)",
+   "internalNames": [
+    "Woods"
+   ],
+   "coordinateRotation": 180,
+   "bounds": {
+    "Min": {
+     "x": -756,
+     "y": -915
+    },
+    "Max": {
+     "x": 647,
+     "y": 443
+    }
+   },
+   "defaultLevel": 0,
+   "layers": [
+    {
+     "name": "Underground",
+     "slug": "Underground",
+     "level": -1,
+     "imageBounds": {
+      "Min": {
+       "x": -756,
+       "y": -915
+      },
+      "Max": {
+       "x": 647,
+       "y": 443
+      }
+     },
+     "gameBounds": [
+      {
+       "Min": {
+        "x": 435,
+        "y": 55,
+        "z": -100
+       },
+       "Max": {
+        "x": 455,
+        "y": 75,
+        "z": -12.4
+       }
+      },
+      {
+       "Min": {
+        "x": -399,
+        "y": 9,
+        "z": -100
+       },
+       "Max": {
+        "x": -385,
+        "y": 24,
+        "z": 5.1
+       }
+      },
+      {
+       "Min": {
+        "x": 211,
+        "y": -715,
+        "z": -100
+       },
+       "Max": {
+        "x": 245,
+        "y": -691,
+        "z": 22.2
+       }
+      }
+     ],
+     "cols": 2,
+     "rows": 2,
+     "tilePx": 512,
+     "slotsNeeded": 4,
+     "tiles": [
+      {
+       "col": 0,
+       "row": 0,
+       "file": "Woods_TarkovData/Underground/z0_0x0.dds",
+       "world": {
+        "minX": -756.0,
+        "maxX": -54.5,
+        "maxY": 443.0,
+        "minY": -236.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 0,
+       "file": "Woods_TarkovData/Underground/z0_1x0.dds",
+       "world": {
+        "minX": -54.5,
+        "maxX": 647.0,
+        "maxY": 443.0,
+        "minY": -236.0
+       }
+      },
+      {
+       "col": 0,
+       "row": 1,
+       "file": "Woods_TarkovData/Underground/z0_0x1.dds",
+       "world": {
+        "minX": -756.0,
+        "maxX": -54.5,
+        "maxY": -236.0,
+        "minY": -915.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 1,
+       "file": "Woods_TarkovData/Underground/z0_1x1.dds",
+       "world": {
+        "minX": -54.5,
+        "maxX": 647.0,
+        "maxY": -236.0,
+        "minY": -915.0
+       }
+      }
+     ]
+    },
+    {
+     "name": "Ground Level",
+     "slug": "Ground_Level",
+     "level": 0,
+     "imageBounds": {
+      "Min": {
+       "x": -756,
+       "y": -915
+      },
+      "Max": {
+       "x": 647,
+       "y": 443
+      }
+     },
+     "gameBounds": [
+      {
+       "Min": {
+        "x": -756,
+        "y": -915,
+        "z": -100
+       },
+       "Max": {
+        "x": 647,
+        "y": 443,
+        "z": 100
+       }
+      }
+     ],
+     "cols": 2,
+     "rows": 2,
+     "tilePx": 512,
+     "slotsNeeded": 4,
+     "tiles": [
+      {
+       "col": 0,
+       "row": 0,
+       "file": "Woods_TarkovData/Ground_Level/z0_0x0.dds",
+       "world": {
+        "minX": -756.0,
+        "maxX": -54.5,
+        "maxY": 443.0,
+        "minY": -236.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 0,
+       "file": "Woods_TarkovData/Ground_Level/z0_1x0.dds",
+       "world": {
+        "minX": -54.5,
+        "maxX": 647.0,
+        "maxY": 443.0,
+        "minY": -236.0
+       }
+      },
+      {
+       "col": 0,
+       "row": 1,
+       "file": "Woods_TarkovData/Ground_Level/z0_0x1.dds",
+       "world": {
+        "minX": -756.0,
+        "maxX": -54.5,
+        "maxY": -236.0,
+        "minY": -915.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 1,
+       "file": "Woods_TarkovData/Ground_Level/z0_1x1.dds",
+       "world": {
+        "minX": -54.5,
+        "maxX": 647.0,
+        "maxY": -236.0,
+        "minY": -915.0
+       }
+      }
+     ]
+    },
+    {
+     "name": "2nd Floor",
+     "slug": "2nd_Floor",
+     "level": 1,
+     "imageBounds": {
+      "Min": {
+       "x": -756,
+       "y": -915
+      },
+      "Max": {
+       "x": 647,
+       "y": 443
+      }
+     },
+     "gameBounds": [
+      {
+       "Min": {
+        "x": -671,
+        "y": 108,
+        "z": 9.6
+       },
+       "Max": {
+        "x": -548,
+        "y": 174,
+        "z": 100
+       }
+      }
+     ],
+     "cols": 2,
+     "rows": 2,
+     "tilePx": 512,
+     "slotsNeeded": 4,
+     "tiles": [
+      {
+       "col": 0,
+       "row": 0,
+       "file": "Woods_TarkovData/2nd_Floor/z0_0x0.dds",
+       "world": {
+        "minX": -756.0,
+        "maxX": -54.5,
+        "maxY": 443.0,
+        "minY": -236.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 0,
+       "file": "Woods_TarkovData/2nd_Floor/z0_1x0.dds",
+       "world": {
+        "minX": -54.5,
+        "maxX": 647.0,
+        "maxY": 443.0,
+        "minY": -236.0
+       }
+      },
+      {
+       "col": 0,
+       "row": 1,
+       "file": "Woods_TarkovData/2nd_Floor/z0_0x1.dds",
+       "world": {
+        "minX": -756.0,
+        "maxX": -54.5,
+        "maxY": -236.0,
+        "minY": -915.0
+       }
+      },
+      {
+       "col": 1,
+       "row": 1,
+       "file": "Woods_TarkovData/2nd_Floor/z0_1x1.dds",
+       "world": {
+        "minX": -54.5,
+        "maxX": 647.0,
+        "maxY": -236.0,
+        "minY": -915.0
+       }
+      }
+     ]
+    }
+   ]
+  }
+ ]
+}

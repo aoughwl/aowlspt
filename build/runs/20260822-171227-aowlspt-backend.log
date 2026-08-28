@@ -1,0 +1,265 @@
+aowlspt-backend 0.1.0
+root D:\Aowlspt\aowlspt
+
+[0:00:00.016] ok     port 443 is free
+[0:00:00.063] info   database loaded from D:\Aowlspt\aowlspt\db.json (41313127 bytes)
+[0:00:00.063] info   6 candidate libraries under D:\Aowlspt\aowlspt\mods
+[0:00:00.063] ok     the load order comes from D:\Aowlspt\aowlspt\mods\aowlspt-selection.json: 3 mod(s) selected
+[0:00:00.063] info   the selection names aowl.classicmovement, which is not installed under D:\Aowlspt\aowlspt\mods
+[0:00:00.063] info   aowl.textures is installed and not selected, so it is not loaded
+[0:00:00.063] info   aowl.pathtotarkov is installed and not selected, so it is not loaded
+[0:00:00.063] info   aowl.icebreaker is installed and not selected, so it is not loaded
+[0:00:00.063] info   aowl.graphics is installed and not selected, so it is not loaded
+[0:00:00.063] ok     route /aowlspt/mods
+[0:00:00.063] ok     route /aowlspt/mods/status
+[0:00:00.063] ok     route /aowlspt/mods/list
+[0:00:00.063] ok     route /aowlspt/mods/panel
+[0:00:00.063] ok     route /aowlspt/mods/client
+[0:00:00.063] ok     route /aowlspt/mods/clientreport
+[0:00:00.063] ok     route /aowlspt/mods/toggle
+[0:00:00.063] ok     route /aowlspt/mods/lists
+[0:00:00.063] ok     route /aowlspt/mods/conflicts
+[0:00:00.063] ok     route /aowlspt/mods/reload
+[0:00:00.063] ok     route /aowlspt/mods/apply
+[0:00:00.063] ok     route /aowlspt/mods/select
+[0:00:00.063] ok     route /aowlspt/mods/client/ (prefix)
+[0:00:00.063] ok     route /aowlspt/mods/describe/ (prefix)
+[0:00:00.063] ok     route /aowlspt/mods/enable/ (prefix)
+[0:00:00.063] ok     route /aowlspt/mods/disable/ (prefix)
+[0:00:00.063] ok     route /aowlspt/mods/clear/ (prefix)
+[0:00:00.063] ok     route /aowlspt/mods/toggle/ (prefix)
+[0:00:00.063] ok     route /aowlspt/mods/select/ (prefix)
+[0:00:00.063] ok     subscribed to aowlspt.host.mods.capabilities
+[0:00:00.063] ok     subscribed to aowlspt.host.mods.result
+[0:00:00.063] ok     subscribed to aowlspt.host.mods.listed
+[0:00:00.063] ok     subscribed to tarkov.raid.started
+[0:00:00.063] ok     subscribed to tarkov.raid.ended
+[0:00:00.063] ok     route /aowlspt/mods/registry
+[0:00:00.063] ok     route /aowlspt/mods/registry/fetch
+[0:00:00.063] ok     route /aowlspt/mods/registry/fetch/ (prefix)
+[0:00:00.063] ok     route /aowlspt/mods/registry/revert
+[0:00:00.063] ok     route /aowlspt/mods/lists/local
+[0:00:00.063] ok     route /aowlspt/mods/lists/local/delete/ (prefix)
+[0:00:00.063] ok     manager: D:\Aowlspt\aowlspt/registry/mods.json -- 11 mods, 4 lists
+[0:00:00.063] info   manager: active lists: aowl.list.vanillaplus
+[0:00:00.063] info   manager: 3 of 11 registry mods resolve on the server side
+[0:00:00.063] info   manager:   1. aowl.manager
+[0:00:00.063] info   manager:   2. aowl.tarkov
+[0:00:00.063] info   manager:   3. aowl.classicmovement
+[0:00:00.063] info   manager:   - aowl.fovfix: wrong-side -- declares no server side
+[0:00:00.063] info   manager:   - aowl.perf: wrong-side -- declares no server side
+[0:00:00.063] info   manager:   - com.savannt.sptsway: wrong-side -- declares no server side
+[0:00:00.063] info   manager: nothing has been persisted yet; the selection is stored on the first change
+[0:00:00.063] info   event aowlspt.mods.selection (no subscribers)
+[0:00:00.063] ok     loaded Mod Manager (aowl.manager) v1.0.0 by aowlspt
+[0:00:00.063] ok     route /aowlspt/settings/aowl.tarkov
+[0:00:00.078] info   ids: run 0000000000a4
+[0:00:00.313] ok     route /aowlspt/tarkov/selfcheck
+[0:00:00.313] ok     route /client/metadata
+[0:00:00.313] ok     route /client/game/config
+[0:00:00.313] ok     route /client/game/start
+[0:00:00.313] ok     route /client/game/version/validate
+[0:00:00.313] ok     route /client/game/keepalive
+[0:00:00.313] ok     route /client/game/logout
+[0:00:00.313] ok     route /client/checkVersion
+[0:00:00.313] ok     route /client/server/list
+[0:00:00.313] ok     route /client/game/profile/list
+[0:00:00.313] ok     route /v2/client/game/profiles (prefix)
+[0:00:00.313] ok     route /v2/client/shop/status (prefix)
+[0:00:00.313] ok     route /client/game/profile/select
+[0:00:00.313] ok     route /client/game/profile/create
+[0:00:00.313] ok     route /client/game/profile/nickname/validate
+[0:00:00.313] ok     route /client/game/profile/nickname/reserved
+[0:00:00.313] ok     route /client/game/profile/nickname/change
+[0:00:00.313] ok     route /client/game/profile/savage/regenerate
+[0:00:00.313] ok     route /client/game/profile/voice/change
+[0:00:00.313] ok     route /client/game/mode
+[0:00:00.313] ok     route /aowlspt/tarkov/launcher/ping
+[0:00:00.313] ok     route /aowlspt/tarkov/launcher/profiles
+[0:00:00.313] ok     route /aowlspt/tarkov/launcher/profile/create
+[0:00:00.313] ok     route /aowlspt/tarkov/launcher/profile/select
+[0:00:00.313] ok     route /aowlspt/tarkov/launcher/creation-session
+[0:00:00.313] ok     route /client/profile/status
+[0:00:00.313] ok     route /client/profile/settings
+[0:00:00.313] ok     route /client/game/profile/search
+[0:00:00.313] ok     route /client/libraries
+[0:00:00.313] ok     route /client/profile/view
+[0:00:00.313] ok     route /files/ (prefix)
+[0:00:00.313] ok     route /regular/files/ (prefix)
+[0:00:00.313] ok     route /client/items
+[0:00:00.313] ok     route /client/globals
+[0:00:00.313] ok     route /client/handbook/templates
+[0:00:00.313] ok     route /client/customization
+[0:00:00.313] ok     route /client/account/customization
+[0:00:00.313] ok     route /client/languages
+[0:00:00.313] ok     route /client/locale/ (prefix)
+[0:00:00.313] ok     route /client/menu/locale/ (prefix)
+[0:00:00.313] ok     route /client/settings
+[0:00:00.313] ok     route /client/quest/list
+[0:00:00.313] ok     route /client/achievement/list
+[0:00:00.313] ok     route /client/achievement/statistic
+[0:00:00.313] ok     route /client/game/profile/items/moving
+[0:00:00.313] ok     route /client/trading/api/traderSettings
+[0:00:00.313] ok     route /client/trading/api/getTraderAssort/ (prefix)
+[0:00:00.313] ok     route /client/trading/api/getUserAssortPrice/ (prefix)
+[0:00:00.313] ok     route /client/trading/api/getTrader/ (prefix)
+[0:00:00.313] ok     route /client/trading/customization/storage
+[0:00:00.313] ok     route /client/items/prices/ (prefix)
+[0:00:00.313] ok     route /client/dialogue
+[0:00:00.313] ok     route /client/quest/getMainQuestsList
+[0:00:00.313] ok     route /client/quest/getMainQuestNotesList
+[0:00:00.313] ok     route /client/variable/group
+[0:00:00.313] ok     route /client/tape/list
+[0:00:00.313] ok     route /client/subtitle-track/list
+[0:00:00.313] ok     route /client/quest/chains
+[0:00:00.313] ok     route /client/getMetricsConfig
+[0:00:00.313] ok     route /client/quest/complete
+[0:00:00.313] ok     route /client/tutor-game/check
+[0:00:00.313] ok     route /client/match/group/invite/cancel-all
+[0:00:00.313] ok     route /client/raid/configuration
+[0:00:00.313] ok     route /client/location/getLocalloot
+[0:00:00.313] ok     route /client/location/getAirdropLoot
+[0:00:00.313] ok     route /client/locations
+[0:00:00.313] ok     route /client/match/local/start
+[0:00:00.313] ok     route /client/match/local/end
+[0:00:00.313] ok     route /client/match/available
+[0:00:00.313] ok     route /client/match/join
+[0:00:00.313] ok     route /client/match/group/current
+[0:00:00.313] ok     route /client/match/group/status
+[0:00:00.313] ok     route /client/match/group/exit_from_menu
+[0:00:00.313] ok     route /client/match/exit
+[0:00:00.313] ok     route /client/weather
+[0:00:00.313] ok     route /client/hideout/areas
+[0:00:00.313] ok     route /client/hideout/production/recipes
+[0:00:00.313] ok     route /client/hideout/settings
+[0:00:00.313] ok     route /client/hideout/qte/list
+[0:00:00.313] ok     route /client/ragfair/find
+[0:00:00.313] ok     route /client/ragfair/itemMarketPrice
+[0:00:00.313] ok     route /client/insurance/items/list/cost
+[0:00:00.313] ok     route /client/hideout/customization/offer/list
+[0:00:00.313] ok     route /client/ragfair/offerfees
+[0:00:00.313] ok     route /client/reports/ragfair/send
+[0:00:00.313] ok     route /client/notifier/channel/create
+[0:00:00.313] ok     route /client/notifier/getwebsocket (prefix)
+[0:00:00.313] ok     route /client/mail/dialog/list
+[0:00:00.313] ok     route /client/mail/dialog/info
+[0:00:00.313] ok     route /client/mail/dialog/view
+[0:00:00.313] ok     route /client/mail/dialog/getAllAttachments
+[0:00:00.313] ok     route /client/mail/dialog/read
+[0:00:00.313] ok     route /client/mail/dialog/pin
+[0:00:00.313] ok     route /client/mail/dialog/unpin
+[0:00:00.313] ok     route /client/mail/dialog/remove
+[0:00:00.313] ok     route /client/game/bot/generate
+[0:00:00.313] ok     route /client/game/bot/limit (prefix)
+[0:00:00.313] ok     route /client/game/bot/difficulty (prefix)
+[0:00:00.313] ok     route /client/friend/list
+[0:00:00.313] ok     route /client/friend/request/list/inbox
+[0:00:00.313] ok     route /client/friend/request/list/outbox
+[0:00:00.313] ok     route /client/chatServer/list
+[0:00:00.313] ok     route /client/survey
+[0:00:00.313] ok     route /client/survey/view
+[0:00:00.313] ok     route /client/survey/opinion
+[0:00:00.313] ok     route /client/prestige/list
+[0:00:00.313] ok     route /client/putMetrics
+[0:00:00.313] ok     route /client/putHWMetrics
+[0:00:00.313] ok     route /client/putLoadMetrics
+[0:00:00.313] ok     route /client/getMetrics
+[0:00:00.313] ok     route /client/seasonal-perks/list
+[0:00:00.313] ok     route /client/season/active
+[0:00:00.313] ok     route /client/battle-pass/active
+[0:00:00.313] ok     route /client/ending/list
+[0:00:00.313] ok     route /client/game/token/issue
+[0:00:00.313] ok     route /client/customization/storage
+[0:00:00.328] ok     route /client/friends
+[0:00:00.328] ok     route /client/analytics/event-disabled
+[0:00:00.328] ok     route /client/repeatalbeQuests/activityPeriods
+[0:00:00.328] ok     route /client/log
+[0:00:00.328] ok     route /client/bsgLogging
+[0:00:00.328] ok     route /client/releaseNotes
+[0:00:00.328] ok     route /client/builds/list
+[0:00:00.328] ok     route /client/builds/weapon/save
+[0:00:00.328] ok     route /client/builds/equipment/save
+[0:00:00.328] ok     route /client/builds/magazine/save
+[0:00:00.328] ok     route /client/builds/delete
+[0:00:00.328] ok     Tarkov emulator loaded, 1 profile(s)
+[0:00:00.328] info     00000000000a00000000004f  Savant (Usec, level 1)
+[0:00:00.328] ok     loaded Tarkov Emulator (aowl.tarkov) v0.1.0 by aowlspt
+[0:00:00.328] ok     listening on https://127.0.0.1:443
+[0:00:00.328] ok     asset listener on http://127.0.0.1:80
+[0:00:00.391] ok     manager: live mod control is available (aowlspt-backend 0.1.0)
+[0:00:00.453] info   manager: the host reports 2 loaded mods
+[0:00:00.734] info   REQ POST /client/metadata
+[0:00:00.734] info   client/metadata HIT: body.len=49 session=00000000000a00000000004f
+[0:00:08.828] info   REQ POST /client/libraries
+[0:00:15.469] info   REQ POST /client/game/mode
+[0:00:15.469] info   PROBE REQ  /client/game/mode sess=00000000000a00000000004f len=20 body={"sessionMode":null}
+[0:00:15.469] info   PROBE RES  /client/game/mode len=82 body={"err":0,"errmsg":null,"data":{"gameMode":"pve","backendUrl":"https://127.0.0.1"}}
+[0:00:15.547] info   REQ POST /client/game/start
+[0:00:15.547] info   PROBE REQ  /client/game/start sess=00000000000a00000000004f len=0 body=
+[0:00:15.547] info   PROBE RES  /client/game/start len=54 body={"err":0,"errmsg":null,"data":{"utc_time":1700000015}}
+[0:00:15.625] info   REQ POST /client/game/version/validate
+[0:00:15.688] info   REQ GET /client/menu/locale/en
+[0:00:15.750] info   REQ GET /client/languages
+[0:00:15.750] info   REQ POST /client/game/config
+[0:00:15.750] info   PROBE REQ  /client/game/config sess=00000000000a00000000004f len=0 body=
+[0:00:15.750] info   PROBE RES  /client/game/config len=915 body={"err":0,"errmsg":null,"data":{"aid":0,"lang":"en","languages":{"ch":"Chinese","cz":"Czech","en":"English","fr":"French","ge":"German","hu":"Hungarian","it":"Italian","jp":"Japanese","kr":"Korean","pl":"Polish","po":"Portugal","sk":"Slovak","es":"Spanish","es-mx":"Spanish Mexico","tu":"Turkish","ru":"Русский","ro":"Romanian"},"ndid":"00000000000a00000000004f","ndaFree":false,"taxonomy":341,"activeProfileId":"00000000000a00000000004f","backend":{"Main":"https://127.0.0.1","Trading":"https://127.0.0.1","Messaging":"https://127.0.0.1","RagFair":"https://127.0.0.1","Lobby":"https://127.0.0.1","Static":"http://127.0.0.1"},"useProtobuf":false,"utc_time":1700000015,"totalInGame":0,"reportAvailable":false,"twitchEventMember":false,"sessionMode":"pve","purchasedGames":{"eft":true,"arena":false},"isGameSynced":true,"linkedPlatforms":[],"availableGameModes":{"regular":false,"pve":true,"pvp-season":false}}}
+[0:00:21.891] info   REQ GET /client/settings
+[0:00:21.922] info   REQ POST /client/putHWMetrics
+[0:00:22.031] info   REQ GET /client/items
+[0:00:22.063] info   REQ POST /client/seasonal-perks/list
+[0:00:22.078] info   REQ GET /client/customization
+[0:00:22.094] info   REQ GET /client/locale/en
+[0:00:26.891] info   REQ POST /v2/client/game/profiles/
+[0:00:26.891] info   PROBE REQ  /v2/client/game/profiles/ sess=00000000000a00000000004f len=0 body=
+[0:00:26.891] info   PROBE RES  /v2/client/game/profiles/ len=180 body={"err":0,"errmsg":null,"data":{"regular":{"SeasonalInfo":null,"status":"locked"},"pve":{"SeasonalInfo":null,"status":"empty"},"pvp-season":{"SeasonalInfo":null,"status":"locked"}}}
+[0:00:32.266] info   REQ GET /client/items
+[0:00:32.297] info   REQ GET /client/customization
+[0:00:32.344] info   REQ GET /client/subtitle-track/list
+[0:00:32.359] info   REQ GET /client/globals
+[0:00:32.359] info   REQ GET /client/tape/list
+[0:00:32.375] info   REQ GET /client/quest/getMainQuestsList
+[0:00:32.391] info   REQ GET /client/handbook/templates
+[0:00:32.391] info   REQ GET /client/quest/getMainQuestNotesList
+[0:00:32.406] info   REQ GET /client/settings
+[0:00:32.422] info   REQ POST /client/seasonal-perks/list
+[0:00:32.438] info   REQ GET /client/variable/group
+[0:00:32.453] info   REQ POST /client/game/profile/list
+[0:00:32.453] info   PROBE REQ  /client/game/profile/list sess=00000000000a00000000004f len=0 body=
+[0:00:32.453] info   PROBE RES  /client/game/profile/list len=115477 body={"err":0,"errmsg":null,"data":[{"_id":"00000000000a00000000004f","aid":"18760087","savage":"00000000000a000000000055","karmaValue":0.0,"Info":{"Nickname":"Savant","MainProfileNickname":null,"Side":"Usec","PrestigeLevel":0,"RegistrationDate":1700000005,"SavageLockTime":0.0,"GroupId":null,"TeamId":null,"EntryPoint":"Factory","NicknameChangeDate":0,"GameVersion":"standard","Type":"Eft","HasCoopExtension":false,"HasPveGame":false,"IsStreamerModeAvailable":false,"SquadInviteRestriction":false,"Bans":[],"Settings":{"Role":"assault","BotDifficulty":"normal","Experience":0,"StandingForKill":0.0,"AggressorBonus":0.0,"UseSimpleAnimator":false},"MemberCategory":"Default","SelectedMemberCategory":"Default","Experience":463,"Level":1,"lockedMoveCommands":false},"Customization":{"Head":"6764194e4dec6d46f106f9f6","Body":"5cde95d97d6c8b647a3769b0","Feet":"5cde95ef7d6c8b04713c4f2d","Hands":"5cde95fa7d6c8b04737c2d13","Voice":"5fc615110b735e7b024c76ea","DogTag":"674731d1170146228c0d222a"},"Encyclopedia":{"686e34696c2a18ed6b0eb025":true},"Health":{"BodyParts":{"Head":{"Health":{"Current":35.0,"Minimum":0.0,"Maximum":35.0,"OverDamageReceivedMultiplier":0.0,"EnvironmentDamageMultiplier":0.0},"Effects":{}},"Chest":{"Health":{"Current":85.0,"Minimum":0.0,"Maximum":85.0,"OverDamageReceivedMultiplier":0.0,"EnvironmentDamageMultiplier":0.0},"Effects":{}},"Stomach":{"Health":{"Current":70.0,"Minimum":0.0,"Maximum":70.0,"OverDamageReceivedMultiplier":0.0,"EnvironmentDamageMultiplier":0.0},"Effects":{}},"LeftArm":{"Health":{"Current":60.0,"Minimum":0.0,"Maximum":60.0,"OverDamageReceivedMultiplier":0.0,"EnvironmentDamageMultiplier":0.0},"Effects":{}},"RightArm":{"Health":{"Current":60.0,"Minimum":0.0,"Maximum":60.0,"OverDamageReceivedMultiplier":0.0,"EnvironmentDamageMultiplier":0.0},"Effects":{}},"LeftLeg":{"Health":{"Current":65.0,"Minimum":0.0,"Maximum":65.0,"OverDamageReceivedMultiplier":0.0,"EnvironmentDamageMultiplier":0.0},"Effects":{}},"RightLeg":{"Health":{"Current":65.0,"Minimum":0.0,"Maximum":65.0,"OverDamageReceivedMultiplier":0.0,"EnvironmentDamageMultiplier":0.0},"Effects":{}}},"Energy":{"Current":100.0,"Minimum":0.0,"Maximum":100.0,"OverDamageReceivedMultiplier":0.0,"EnvironmentDamageMultiplier":0.0},"Hydration":{"Current":100.0,"Minimum":0.0,"Maximum":100.0,"OverDamageReceivedMultiplier":0.0,"EnvironmentDamageMultiplier":0.0},"Temperature":{"Current":36.0,"Minimum":28.0,"Maximum":40.0,"OverDamageReceivedMultiplier":0.0,"EnvironmentDamageMultiplier":0.0},"Poison":{"Current":0.0,"Minimum":0.0,"Maximum":100.0,"OverDamageReceivedMultiplier":0.0,"EnvironmentDamageMultiplier":0.0},"UpdateTime":null},"Inventory":{"items": [{"_id": "00000000000a000000000051", "_tpl": "55d7217a4bdc2d86028b456d"},{"_id": "00000000000a000000000050", "_tpl": "5811ce572459770cba1a34ea"},{"_id": "00000000000a000000000052", "_tpl": "5963866286f7747bf429b572"},{"_id": "00000000000a000000000053", "_tpl": "5963866b86f7747bfa1c4462"},{"_id": "00000000000a000000000054", "_tpl": "602543c13fee350cd564d032"},{"_id":"00000000000a000000000056","_tpl":"5449016a4bdc2d6f028b456f","parentId":"00000000000a000000000050","slotId":"hideout","location":{"x":0,"y":0,"r":"Horizontal"},"upd":{"StackObjectsCount":483670}},{"_id":"00000000004a000000000050","_tpl":"57d14e1724597714010c3f4b","parentId":"00000000000a000000000050","slotId":"hideout","location":{"x":1,"y":0,"r":"Horizontal"}},{"_id":"00000000004b00000000004f","_tpl":"57d14e1724597714010c3f4b","parentId":"00000000000a000000000050","slotId":"hideout","location":{"x":2,"y":0,"r":0},"upd":{"StackObjectsCount":1}},{"_id":"00000000004b000000000050","_tpl":"57d14e1724597714010c3f4b","parentId":"00000000000a000000000050","slotId":"hideout","location":{"x":3,"y":0,"r":0},"upd":{"StackObjectsCount":1}},{"_id":"00000000004c00000000004f","_tpl":"5448c12b4bdc2d02308b456f","parentId":"00000000000a000000000050","slotId":"hideout","location":{"x":4,"y":0,"r":0},"upd":{"StackObjectsCount":1}},{"_id":"00000000004c000000000050","_tpl":"5448c12b4bdc2d02308b456f","parentId":"00000000000a000000000050","slotId":"hideout","location":{"x":5,"y":0,"r":0},"upd":{"StackObjectsCount":1}},{"_id":"00000000004c000000000051","_tpl":"5448c12b4bdc2d02308b456f","parentId":"00000000000a000000000050","slotId":"hideout","location":{"x":6,"y":0,"r":0},"upd":{"StackObjectsCount":1}},{"_id":"00000000004c000000000052","_tpl":"5448c12b4bdc2d02308b456f","parentId":"00000000000a000000000050","slotId":"hideout","location":{"x":7,"y":0,"r":0},"upd":{"StackObjectsCount":1}},{"_id":"00000000004c000000000053","_tpl":"5448c12b4bdc2d02308b456f","parentId":"00000000000a000000000050","slotId":"hideout","location":{"x":8,"y":0,"r":0},"upd":{"StackObjectsCount":1}},{"_id":"00000000004c000000000054","_tpl":"5448c12b4bdc2d02308b456f","parentId":"00000000000a000000000050","slotId":"hideout","location":{"x":9,"y":0,"r":0},"upd":{"StackObjectsCount":1}},{"_id":"00000000004c000000000055","_tpl":"5448c12b4bdc2d02308b456f","parentId":"00000000000a000000000050","slotId":"hideout","location":{"x":0,"y":1,"r":0},"upd":{"StackObjectsCount":1}},{"_id":"00000000004c000000000056","_tpl":"5448c12b4bdc2d02308b456f","parentId":"00000000000a000000000050","slotId":"hideout","location":{"x":1,"y":1,"r":"Horizontal"},"upd":{"StackObjectsCount":1}},{"_id":"00000000004c000000000057","_tpl":"5448c12b4bdc2d02308b456f","parentId":"00000000000a000000000050","slotId":"hideout","location":{"x":2,"y":1,"r":0},"upd":{"StackObjectsCount":1}},{"_id":"00000000004c000000000058","_tpl":"5448c12b4bdc2d02308b456f","parentId":"00000000000a000000000050","slotId":"hideout","location":{"x":3,"y":1,"r":0},"upd":{"StackObjectsCount":1}},{"_id":"00000000004c000000000059","_tpl":"5448c12b4bdc2d02308b456f","parentId":"00000000000a000000000050","slotId":"hideout","location":{"x":4,"y":1,"r":0},"upd":{"StackObjectsCount":1}},{"_id":"00000000006500000000004f","_tpl":"5737201124597760fc4431f1","parentId":"00000000000a000000000050","slotId":"hideout","location":{"x":5,"y":1,"r":0},"upd":{"StackObjectsCo...<cut>
+[0:00:32.469] info   REQ GET /client/trading/api/traderSettings
+[0:00:32.484] info   REQ POST /client/battle-pass/active
+[0:00:32.500] info   REQ POST /client/season/active
+[0:00:32.516] info   REQ GET /client/dialogue
+[0:00:32.938] info   REQ POST /client/customization/storage
+[0:00:32.938] info   PROBE REQ  /client/customization/storage sess=00000000000a00000000004f len=0 body=
+[0:00:32.938] info   PROBE RES  /client/customization/storage len=3428 body={"err":0,"errmsg":null,"data":[{"id":"674731c8bafff850080488bb","source":"default","type":"dogTag"},{"id":"674731d1170146228c0d222a","source":"default","type":"dogTag"},{"id":"67584eda8b8204ec00019362","source":"default","type":"environment"},{"id":"675850678b8204ec0001936c","source":"default","type":"environment"},{"id":"6758501933627edb710b058c","source":"default","type":"environment"},{"id":"67585083ff58ff0e7909e440","source":"default","type":"environment"},{"id":"67519adaba5968fd800a01f0","source":"default","type":"gesture"},{"id":"67519b33490b32072c06f1c4","source":"default","type":"gesture"},{"id":"67519b21ba5968fd800a01f5","source":"default","type":"gesture"},{"id":"67519afca34a61ba7f053e5c","source":"default","type":"gesture"},{"id":"67519b77a34a61ba7f053e67","source":"default","type":"gesture"},{"id":"67519b66490b32072c06f1c9","source":"default","type":"gesture"},{"id":"67519b48ba5968fd800a01fa","source":"default","type":"gesture"},{"id":"62aca6a1310e67685a2fc2e7","source":"default","type":"head"},{"id":"619f9e338858a474c8685cc9","source":"default","type":"head"},{"id":"6574aa9a1b144de18c0fba45","source":"default","type":"head"},{"id":"5cde96047d6c8b20b577f016","source":"default","type":"head"},{"id":"5fdb7571e4ed5b5ea251e529","source":"default","type":"head"},{"id":"60a6aaad42fd2735e4589978","source":"default","type":"head"},{"id":"675ac3957908e416a20861e6","source":"default","type":"head"},{"id":"5fdb4139e4ed5b5ea251e4ed","source":"default","type":"head"},{"id":"5fdb5950f5264a66150d1c6e","source":"default","type":"head"},{"id":"6764194e4dec6d46f106f9f6","source":"default","type":"head"},{"id":"619f94f5b90286142b59d45f","source":"default","type":"head"},{"id":"60a6aa8fd559ae040d0d951f","source":"default","type":"head"},{"id":"5fdb50bb2b730a787b3f78cf","source":"default","type":"head"},{"id":"62a9e7d15ea3b87d6f642a28","source":"default","type":"head"},{"id":"6574aabee0423b9ebe0c79cf","source":"default","type":"head"},{"id":"5cc084dd14c02e000b0550a3","source":"default","type":"head"},{"id":"67604ab20aa8253ebe05fd08","source":"default","type":"mannequinPose"},{"id":"67604a9a8491fd0a830f3576","source":"default","type":"mannequinPose"},{"id":"67600aa8e9db590d5601665f","source":"default","type":"mannequinPose"},{"id":"67604aa550dfa9253901a546","source":"default","type":"mannequinPose"},{"id":"67604a890aa8253ebe05fd06","source":"default","type":"mannequinPose"},{"id":"5cd946231388ce000d572fe3","source":"default","type":"suite"},{"id":"5cde9e957d6c8b0474535da7","source":"default","type":"suite"},{"id":"5cd945d71388ce000a659dfb","source":"default","type":"suite"},{"id":"5cde9ec17d6c8b04723cf479","source":"default","type":"suite"},{"id":"668677330ae95580780867c6","source":"default","type":"voice"},{"id":"5fc614da00efd824885865c2","source":"default","type":"voice"},{"id":"5fc1223595572123ae7384a3","source":"default","type":"voice"},{"id":"6284d67f8e4092597733b7a4","source":"default","type":"voice"},{"id":"6284d6ab8e4092597733b7a7","source":"default","type":"voice"},{"id":"5fc50bddb4965a7a2f48c5af","source":"default","type":"voice"},{"id":"5fc614f40b735e7b024c76e9","source":"default","type":"voice"},{"id":"5fc1221a95572123ae7384a2","source":"default","type":"voice"},{"id":"5fc615110b735e7b024c76ea","source":"default","type":"voice"},{"id":"6284d6a28e4092597733b7a6","source":"default","type":"voice"},{"id":"6284d6948e4092597733b7a5","source":"default","type":"voice"}]}
+[0:00:36.984] info   REQ POST /client/game/profile/select
+[0:00:36.984] info   PROBE REQ  /client/game/profile/select sess=00000000000a00000000004f len=34 body={"uid":"00000000000a00000000004f"}
+[0:00:36.984] ok     session 00000000000a00000000004f -> profile 00000000000a00000000004f (Savant)
+[0:00:36.984] info   PROBE RES  /client/game/profile/select len=147 body={"err":0,"errmsg":null,"data":{"status":"ok","notifier":{"server":"aowlspt","channel_id":"00000000000a00000000004f","url":""},"notifierServer":""}}
+[0:00:37.125] info   REQ POST /client/profile/status
+[0:00:41.688] info   REQ GET /client/hideout/settings
+[0:00:41.703] info   REQ GET /client/hideout/qte/list
+[0:00:41.719] info   REQ GET /client/hideout/areas
+[0:00:41.734] info   REQ GET /client/hideout/customization/offer/list
+[0:00:41.750] info   REQ GET /client/hideout/production/recipes
+[0:00:42.938] info   REQ POST /client/notifier/channel/create
+[0:00:42.953] info   REQ POST /client/profile/status
+[0:00:42.969] info   REQ POST /client/quest/list
+[0:00:43.000] info   REQ POST /client/friends
+[0:00:43.000] info   REQ GET /client/achievement/list?completed=True
+[0:00:43.016] info   REQ POST /client/ending/list
+[0:00:43.031] info   REQ POST /client/weather
+[0:00:43.047] info   REQ POST /client/builds/list
+[0:00:43.063] info   REQ GET /client/locations
+[0:00:43.516] info   REQ GET /client/achievement/statistic
+[0:00:43.531] info   REQ POST /client/mail/dialog/list
+[0:00:44.453] info   REQ POST /client/quest/chains
+[0:00:45.000] info   REQ POST /client/tutor-game/check
+[0:00:45.188] info   REQ POST /client/server/list
+[0:00:45.250] info   REQ POST /client/match/group/current
+[0:00:46.344] info   REQ POST /client/match/group/current
+[0:00:46.359] info   REQ POST /client/repeatalbeQuests/activityPeriods
+[0:00:46.375] info   REQ POST /client/survey
+[0:00:46.438] info   REQ POST /client/putLoadMetrics
+[0:03:06.531] info   REQ POST /client/game/keepalive
