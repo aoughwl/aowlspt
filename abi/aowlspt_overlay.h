@@ -7519,11 +7519,11 @@ static void aowl_ov_view_settings(float x, float y, float w, float bodyH) {
     if (pc == 0) {
         aowl_ov_wrap(x + (float)AOWL_OV_PAD, ny,
                      g_ov.backendPort <= 0
-                       ? "no pages -- the settings screen needs a backend to "
+                       ? "no mods -- the settings screen needs a backend to "
                          "read the schema from"
                        : (g_ov.sIdxWhy[0]
                             ? g_ov.sIdxWhy
-                            : "no pages yet -- waiting for the settings index"),
+                            : "no mods yet -- waiting for the settings index"),
                      AOWL_OV_DIM, 24, 6);
     }
     for (i = 0; i < navRows && g_ov.topPage + i < navCount; i++) {
@@ -7762,7 +7762,7 @@ static void aowl_ov_view_settings(float x, float y, float w, float bodyH) {
         aowl_ov_rect(trackX, trackY + tt, 3.0f, th, AOWL_OV_ACCENT);
         if (g_ov.topPage > 0) {
             aowl_ov_fmt(more, (int32_t)sizeof(more), "^ %d more", g_ov.topPage);
-            /* Right-aligned in the nav's own column, beside the "pages"
+            /* Right-aligned in the nav's own column, beside the "mods"
              * caption rather than on top of it. */
             aowl_ov_text(x + (float)AOWL_OV_PAD + leftW
                            - (float)strlen(more) * AOWL_OV_CW, y,
@@ -9525,7 +9525,7 @@ static void aowl_ov_build(void) {
         {
             int32_t cols = (int32_t)(innerW / AOWL_OV_CW);
             aowl_ov_fmt(line, (int32_t)sizeof(line),
-                        "%d mod pages  |  %d SPT config pages", mods, spt);
+                        "%d mods  |  %d SPT config sections", mods, spt);
             if ((int32_t)strlen(line) + 26 <= cols) {
                 int32_t L = (int32_t)strlen(line);
                 _snprintf(line + L, sizeof(line) - 1 - (size_t)L,
