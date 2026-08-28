@@ -136,6 +136,46 @@ static const char* aowl_gate_why(int32_t w) {
 }
 
 /* ---- module state -------------------------------------------------------- */
+/* THE MOST DANGEROUS PROPERTY OF THIS WHOLE LAYER. Read this before touching
+ * anything below.
+ *
+ * A nonce-gated export begins:
+ *
+ *     49 83 3C 07 00     cmp qword ptr [tls_slot], 0
+ *     74 7E              je   -> the trap
+ *
+ * If the slot is ZERO it jumps STRAIGHT to the trap, returns a random value,
+ * and NEVER TOUCHES THE CALLER'S TOKEN. The slot has been zero for the entire
+ * life of this project, because nothing ever called `il2cpp_nonce`. That
+ * accident is the ONLY reason years of stock-signature by-name calls -- the
+ * ~20 in `mods/sain` alone -- returned garbage instead of crashing.
+ *
+ * `il2cpp_nonce(apiId)` ARMS that slot, and the arming is SINGLE USE: only the
+ * export itself consumes it (it zeroes the slot as it reads it). So arming a
+ * slot and not immediately calling the export LEAVES A LOADED GUN ON THIS
+ * THREAD: the next stock-signature caller no longer early-outs, and instead
+ * reaches `memcmp(caller_token, deriv(nonce), 32)` with a token that is
+ * whatever junk was in the register. That is an access violation inside
+ * memcmp, at GameAssembly.dll+0x6206E0.
+ *
+ * MEASURED, in a scratch process against the real GameAssembly.dll:
+ *   slot zero   -> il2cpp_field_get_offset(staged, 0xCDCD..) = 396CF427.. , no fault
+ *   slot armed  -> same call = ACCESS VIOLATION at +0x6206E0 reading 0xFFFF..
+ * That offset is byte-identical to the WER fault offset that killed the live
+ * client the first time this layer ran, ~1s after the self-test PASSED.
+ *
+ * Note what did NOT happen: the crash never went through `aowl_gate_call`, so
+ * the fault counter stayed at 0 and the layer never self-disabled. A gate can
+ * only count its own faults; it cannot count the ones it ARMED FOR SOMEONE
+ * ELSE. Hence `aowl_gate_nonce_outstanding` below, which is the check that
+ * actually fires.
+ *
+ * THE RULE: never arm a nonce you will not consume in the same breath. If you
+ * only want to know whether a row COULD arm, call `aowl_gate_can_arm`, which
+ * reads the static map and never touches the runtime.
+ */
+static int32_t        aowl_gate_nonce_outstanding = 0;
+
 static unsigned char* aowl_gate_base    = 0;
 static size_t         aowl_gate_size    = 0;
 static int32_t        aowl_gate_enabled = 0;   /* rule 5: DEFAULT OFF          */
@@ -268,10 +308,54 @@ static void* aowl_gate_token(int32_t row, int32_t* why) {
          * So this pair must run immediately before each call, never cached. */
         n = nonce(apiId);
         if (n == 0) { *why = AOWL_GATE_NO_NONCE; return 0; }
+        /* THE SLOT IS NOW ARMED AND ONLY THE EXPORT CAN DISARM IT. From here
+         * to the call there must be no early return that does not account for
+         * it -- see the block comment at the top of this file. */
+        aowl_gate_nonce_outstanding++;
         tok = deriv(n);
-        if (!aowl_is_readable(tok, AOWL_GATE_TOKEN_BYTES)) { *why = AOWL_GATE_BAD_TOKEN; return 0; }
+        if (!aowl_is_readable(tok, AOWL_GATE_TOKEN_BYTES)) {
+            /* The slot stays armed and we cannot clear it without a blind
+             * write into TLS (rule 8). Leave the counter incremented so the
+             * caller learns this thread is now unsafe for stock-signature
+             * calls into this export, and say why. */
+            *why = AOWL_GATE_BAD_TOKEN; return 0;
+        }
         return tok;
     }
+}
+
+/* Would this row be able to produce a token? PURE: it reads the generated map
+ * and the mapped image only, and NEVER calls `il2cpp_nonce`, so it cannot arm
+ * anything. This is what a survey must use. Calling `aowl_gate_token` merely
+ * to count what works is what killed the client. */
+static int32_t aowl_gate_can_arm(int32_t row, int32_t* why) {
+    const aowl_gate_row_t* r;
+    unsigned apiId;
+    *why = AOWL_GATE_OK;
+    if (row < 0 || row >= AOWL_GATE_ROWS) { *why = AOWL_GATE_UNKNOWN; return 0; }
+    if (!aowl_gate_bind_module())         { *why = AOWL_GATE_NO_MODULE; return 0; }
+    r = &aowl_gate_rows[row];
+    if (r->kind == AOWL_GATE_KIND_STATIC) {
+        /* For a static row this is a real MEASUREMENT, not a structural claim:
+         * the expected bytes are read out of .rdata and checked. */
+        unsigned char* t;
+        if (r->token_rva == 0 || r->token_rva >= aowl_gate_size) { *why = AOWL_GATE_BAD_TOKEN; return 0; }
+        t = aowl_gate_base + r->token_rva;
+        if (!aowl_is_readable(t, AOWL_GATE_TOKEN_BYTES))         { *why = AOWL_GATE_BAD_TOKEN; return 0; }
+        return 1;
+    }
+    /* For a nonce row this is STRUCTURAL ONLY -- it says the map has a
+     * derivation and an apiId, not that a nonce would come back. Report it as
+     * ARMABLE, never as ARMED. */
+    if (r->deriv_rva == 0 || r->deriv_rva >= aowl_gate_size) { *why = AOWL_GATE_NO_DERIV; return 0; }
+    if (!aowl_gate_apiid_for_slot(r->tls_slot, &apiId))      { *why = AOWL_GATE_NO_NONCE; return 0; }
+    if (AOWL_IL2CPP_NONCE_RVA == 0 ||
+        AOWL_IL2CPP_NONCE_RVA >= aowl_gate_size)             { *why = AOWL_GATE_NO_NONCE; return 0; }
+    return 1;
+}
+
+static int32_t aowl_gate_nonce_outstanding_count(void) {
+    return aowl_gate_nonce_outstanding;
 }
 
 /* ---- the call ------------------------------------------------------------ */
@@ -362,6 +446,12 @@ static int32_t aowl_gate_call(const char* name, void** argv, int32_t argc,
         c.args[3] = slots[2];
         c.ret     = slots[3];
         rv = aowl_p_p_seh((void*)aowl_gate_invoke_thunk, &c);
+        /* The export zeroes the nonce slot as it READS it, which happens
+         * before the memcmp that can fault -- so the arm is consumed whether
+         * or not the call completed. Account for it on BOTH paths, or the
+         * outstanding counter drifts and reports a hazard that is not there. */
+        if (r->kind == AOWL_GATE_KIND_NONCE && aowl_gate_nonce_outstanding > 0)
+            aowl_gate_nonce_outstanding--;
         if (!c.done) {
             /* An access violation inside the call, caught by the guard. This
              * used to be reported as AOWL_GATE_OK with a 0 return, which is a
