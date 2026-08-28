@@ -189,11 +189,18 @@ const
   MinRows* = 12
   MinBody* = 5
     ## Fewer than five log lines per pane is not a log view, it is a teaser.
-    ## This is what makes the collapse REACHABLE: with a five-step progress
-    ## region, a window of 13 rows or fewer cannot hold both, and the region
-    ## folds to its one summary line rather than the panes shrinking to
-    ## nothing. A threshold of 3 made the collapse branch dead code at every
-    ## window size the layout would agree to draw at all.
+    ##
+    ## This is no longer a THRESHOLD -- it is a GUARANTEE. `logViewRows` spends
+    ## a fixed five rows on chrome (header, the one summary line, the two pane
+    ## borders and the status line), so at `MinRows` the body is `12 - 6 = 6`
+    ## and every larger window has more. There is therefore no size at which a
+    ## degrade branch could fire, and one is not written: a branch that cannot
+    ## fire is dead code that reads as a working degrade path, which is the bug
+    ## this constant was given the value 5 to fix in the first place.
+    ##
+    ## `tests/tuilayout.nim` asserts `bodyH >= MinBody` at exactly `MinRows`, on
+    ## the produced layout. That check goes red if anyone lowers `MinRows` or
+    ## adds a row of chrome, which is the only way this guarantee can be lost.
 
 type
   LogViewLayout* = object
@@ -202,8 +209,6 @@ type
       ## false means the caller must fall back to `streamLogs`. `note` says why,
       ## and the caller is expected to print it: a view that silently becomes a
       ## different view is the failure mode this whole file is written against.
-    stepsShown*: int
-    collapsedSteps*: bool
     bodyH*: int
     maxWidth*: int
       ## The widest row actually produced. The caller does not need it; the test
@@ -211,7 +216,7 @@ type
       ## one column out before a player sees it shear.
     note*: string
 
-proc logViewRows*(w, h: int; header: Row; steps: seq[Row]; summary: Row;
+proc logViewRows*(w, h: int; header: Row; summary: Row;
                   server, client: var Tail;
                   serverTitle, clientTitle: string;
                   focus, scrollS, scrollC: int; solo: bool;
@@ -219,49 +224,41 @@ proc logViewRows*(w, h: int; header: Row; steps: seq[Row]; summary: Row;
   ## SCREEN 2. Header, the launch summary, both panes, status -- exactly `h`
   ## rows, none wider than `w`, or `renderable = false` and a reason.
   ##
-  ## This screen draws no profile panel. The launcher has already finished
-  ## choosing by the time it is shown, and a chooser that is still on screen
-  ## after the choice was made is the fused frame this split exists to undo.
+  ## This screen draws no profile panel and NO PROGRESS STEPS. It cannot: it is
+  ## not given them. That is the fix for the defect the player actually
+  ## reported -- "i can still see those checkboxes for the il2cpp and the other
+  ## few items when we are side by side".
+  ##
+  ## The steps were never leaking out of the scrollback (the log view takes the
+  ## alternate screen, so the scrollback is hidden while it runs). They were
+  ## being drawn INSIDE this frame. The old signature took `steps` and folded
+  ## them to `summary` only when the window was too short to hold both -- which
+  ## at 120x30 it never is, so the five ticked boxes sat above the panes for the
+  ## whole session while this docstring claimed the launch was "collapsed to one
+  ## line". The parameter is gone rather than the branch reordered, because a
+  ## screen that is not handed the rows cannot regress into drawing them.
   ##
   ## `w` is the drawing width and callers pass one column fewer than the console
   ## has. A glyph written into the last cell leaves the console in the
   ## deferred-wrap state and what happens next is host-specific: some hosts
   ## cancel it on the following carriage return and some wrap first and scroll
   ## the whole frame by a line, every frame. Giving up one column costs nothing.
-  result = LogViewLayout(rows: @[], renderable: false, stepsShown: 0,
-                         collapsedSteps: false, bodyH: 0, maxWidth: 0, note: "")
+  result = LogViewLayout(rows: @[], renderable: false,
+                         bodyH: 0, maxWidth: 0, note: "")
   if w < MinCols or h < MinRows:
     result.note = "the window is " & $w & "x" & $h & ", which is too small " &
                   "for the split view; falling back to one line per entry"
     return
 
-  # Header, the two borders and the status line are not negotiable; everything
-  # else is fought over between the progress region and the panes.
-  let avail = h - 4
-  var shown = steps.len
-  var collapsed = false
-  if avail - shown < MinBody and shown > 1:
-    shown = 1
-    collapsed = true
-    result.note = "launch progress collapsed to one line -- the window is " &
-                  "only " & $h & " rows"
-  if avail - shown < MinBody:
-    result.note = "the window is " & $w & "x" & $h & ", which cannot hold " &
-                  "even three log lines; falling back to one line per entry"
-    return
-
+  # Five rows of chrome and no negotiation: header, the one summary line, the
+  # two pane borders, the status line. Everything else is body. See `MinBody`
+  # for why there is no degrade branch here any more.
   result.renderable = true
-  result.stepsShown = shown
-  result.collapsedSteps = collapsed
-  result.bodyH = avail - shown
+  result.bodyH = h - 5
   let bodyH = result.bodyH
 
   result.rows.add header
-  if collapsed:
-    result.rows.add summary
-  else:
-    for i in 0 ..< shown:
-      result.rows.add steps[i]
+  result.rows.add summary
 
   # The pane arithmetic is written out rather than fudged with `padTo`, because
   # a frame whose columns are one out looks like a rendering bug and is actually
@@ -321,20 +318,13 @@ proc logViewRows*(w, h: int; header: Row; steps: seq[Row]; summary: Row;
   bottom.putIn ColDim, bxBR()
   result.rows.add bottom
 
-  # The status line carries the degradation note when there is one, and the
-  # note wins over the key reminder if there is not room for both. A player can
-  # rediscover `tab`; nobody can rediscover "your progress region was dropped
-  # and that is why this screen looks different from the one in the README".
-  var status = newRow()
-  if result.note.len > 0 and w - help.width - 2 < 24:
-    status.put " "
-    status.putIn ColYellow, fit(result.note, w - 1)
-  else:
-    status.putRow help
-    if result.note.len > 0:
-      status.put "  "
-      status.putIn ColYellow, fit(result.note, w - status.width - 1)
-  result.rows.add status
+  # The status line is the key reminder, and only that. It used to share the
+  # row with a degradation note -- and at 40 columns the note WON, so the
+  # smallest window was the one that told the player "launch progress collapsed
+  # to one line" instead of telling them which key quits. There is no longer a
+  # collapse to report: this screen never draws the progress region at any size,
+  # so the note it was announcing does not exist.
+  result.rows.add help
 
   for r in result.rows:
     if r.width > result.maxWidth: result.maxWidth = r.width
@@ -383,6 +373,11 @@ type
       ## True when the panel drew the CREATE path instead of a list, i.e. this
       ## install has no profiles yet. The first-run case is a distinct rendering
       ## and not an empty box, and this is the flag a test can assert on.
+    usedRows*: int
+      ## How many of `rows` carry anything. `rows` is always exactly `h` long,
+      ## because a full-screen caller needs every row; a caller repainting a
+      ## BLOCK in the scrollback (`paintPhase`) wants only this many, or it
+      ## writes a screenful of blank lines into the transcript on every tick.
     maxWidth*: int
     note*: string
 
@@ -407,7 +402,8 @@ proc launcherRows*(w, h: int; header: Row; steps: seq[Row]; summary: Row;
   ## rather than rendering nothing.
   result = LauncherLayout(rows: @[], renderable: false, stepsShown: 0,
                           collapsedSteps: false, bodyH: 0, listed: 0,
-                          hidden: 0, emptyPath: false, maxWidth: 0, note: "")
+                          hidden: 0, emptyPath: false, usedRows: 0,
+                          maxWidth: 0, note: "")
   if w < MinCols or h < MinRows:
     result.note = "the window is " & $w & "x" & $h & ", which is too small " &
                   "for the launcher panel; falling back to plain lines"
@@ -476,7 +472,25 @@ proc launcherRows*(w, h: int; header: Row; steps: seq[Row]; summary: Row;
     if result.note.len > 0: result.note = result.note & "; " & more
     else: result.note = more
 
-  for i in 0 ..< bodyH:
+  # THE BOX IS SIZED TO WHAT IS IN IT, not to the window.
+  #
+  # It used to be `bodyH` rows tall unconditionally, so an install with six
+  # profiles got a box with six rows of names and FIFTEEN blank rows under them
+  # at 120x30 -- thirty-five at 200x50. That is not a panel with room to grow,
+  # it is a frame that looks half-drawn, and it is the largest single thing
+  # wrong with this screen by area. One trailing row is kept as breathing space;
+  # the rest of the window is left blank BELOW the box, where empty space reads
+  # as empty space instead of as a box someone forgot to fill.
+  # `listed + 1`, and no `MinPick` floor. `MinPick` still decides whether the
+  # progress region has to fold to make room -- that is a question about the
+  # WINDOW -- but it has no business padding the box out past its contents,
+  # which is a question about the LIST. A three-row floor over a one-row list is
+  # two blank rows inside a border, i.e. the defect in miniature.
+  var panelH = result.listed + 1
+  if panelH > bodyH: panelH = bodyH
+  if panelH < 1: panelH = 1
+
+  for i in 0 ..< panelH:
     var r = newRow()
     r.putIn ColDim, bxV()
     r.put " "
@@ -496,14 +510,31 @@ proc launcherRows*(w, h: int; header: Row; steps: seq[Row]; summary: Row;
   # reminder when there is not room for both.
   var status = newRow()
   if result.note.len > 0 and w - help.width - 2 < 24:
-    status.put " "
-    status.putIn ColYellow, fit(result.note, w - 1)
+    # Two spaces, not one: every other row this file produces starts its text
+    # in column 2 (see `stepRow`, `handoffRow`, and the box interior, which is
+    # a vertical plus one space). A single space here put the status line one
+    # column left of everything above it -- small, and exactly the kind of
+    # small that reads as "this was thrown together".
+    status.put "  "
+    status.putIn ColYellow, fit(result.note, w - 2)
   else:
     status.putRow help
     if result.note.len > 0:
       status.put "  "
       status.putIn ColYellow, fit(result.note, w - status.width - 1)
   result.rows.add status
+
+  # The window still owes exactly `h` rows, and the slack the box gave back is
+  # spent HERE, below everything.
+  #
+  # It was briefly spent between the box and the status line instead, which was
+  # a straight trade of one ugly frame for another: the keys ended up marooned
+  # at the bottom of a window whose content stopped fourteen rows above them.
+  # Everything the screen has to say is now in one block at the top, in reading
+  # order, and the empty part of the window is simply empty.
+  result.usedRows = result.rows.len
+  for i in 0 ..< (bodyH - panelH):
+    result.rows.add newRow()
 
   for r in result.rows:
     if r.width > result.maxWidth: result.maxWidth = r.width
