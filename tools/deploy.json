@@ -155,6 +155,13 @@
    "name": "tarkov",
    "src": "mods/tarkov/bin/tarkov.dll",
    "dst": "mods/tarkov/tarkov.dll",
+   "seed": [
+    {
+     "src": "mods/tarkov/config.json",
+     "dst": "mods/tarkov/config.json",
+     "why": "map lock/unlock, loot, trader, flea and progression settings"
+    }
+   ],
    "minBytes": 100000,
    "markers": [
     "aowl.tarkov",
@@ -190,6 +197,13 @@
    "name": "manager",
    "src": "mods/manager/bin/manager.dll",
    "dst": "mods/manager/manager.dll",
+   "seed": [
+    {
+     "src": "mods/manager/config.json",
+     "dst": "mods/manager/config.json",
+     "why": "the mod selection and load order"
+    }
+   ],
    "minBytes": 400000,
    "markers": [
     "/aowlspt/mods/list",
@@ -209,6 +223,13 @@
    "name": "sain",
    "src": "mods/sain/bin/sain.dll",
    "dst": "mods/sain/sain.dll",
+   "seed": [
+    {
+     "src": "mods/sain/config.json",
+     "dst": "mods/sain/config.json",
+     "why": "the bot-behaviour settings"
+    }
+   ],
    "minBytes": 500000,
    "markers": [
     "aowl.sain",
@@ -229,6 +250,13 @@
    "name": "morebots",
    "src": "mods/morebots/bin/morebots.dll",
    "dst": "mods/morebots/morebots.dll",
+   "seed": [
+    {
+     "src": "mods/morebots/config.json",
+     "dst": "mods/morebots/config.json",
+     "why": "the bot-count settings"
+    }
+   ],
    "minBytes": 400000,
    "markers": [
     "morebots.type.register",
@@ -255,6 +283,13 @@
    "name": "fov",
    "src": "mods/fov/bin/fov.dll",
    "dst": "mods/fov/fov.dll",
+   "seed": [
+    {
+     "src": "mods/fov/config.json",
+     "dst": "mods/fov/config.json",
+     "why": "the FOV, sensitivity and toggle-zoom settings"
+    }
+   ],
    "minBytes": 400000,
    "markers": [
     "aowl.fovfix",
@@ -273,6 +308,13 @@
    "name": "settingshub",
    "src": "mods/settingshub/bin/settingshub.dll",
    "dst": "mods/settingshub/settingshub.dll",
+   "seed": [
+    {
+     "src": "mods/settingshub/config.json",
+     "dst": "mods/settingshub/config.json",
+     "why": "the settings hub's own configuration"
+    }
+   ],
    "minBytes": 300000,
    "markers": [
     "/aowlspt/settings/index",
@@ -288,6 +330,13 @@
    "name": "uihub",
    "src": "mods/uihub/bin/uihub.dll",
    "dst": "mods/uihub/uihub.dll",
+   "seed": [
+    {
+     "src": "mods/uihub/config.json",
+     "dst": "mods/uihub/config.json",
+     "why": "launchHint -- the native F12 overlay reads it out of this mod's settings route BY NAME at start-up. The file did not exist at all until 2026-08-28, so the toggle was accepted and discarded"
+    }
+   ],
    "minBytes": 300000,
    "markers": [
     "/aowlspt/ui/page/settings",
@@ -307,6 +356,13 @@
    "name": "admin",
    "src": "mods/admin/bin/admin.dll",
    "dst": "mods/admin/admin.dll",
+   "seed": [
+    {
+     "src": "mods/admin/config.json",
+     "dst": "mods/admin/config.json",
+     "why": "the admin panel's settings"
+    }
+   ],
    "minBytes": 300000,
    "markers": [
     "aowl.admin",
@@ -328,6 +384,13 @@
    "name": "graphics",
    "src": "mods/graphics/bin/graphics.dll",
    "dst": "mods/graphics/graphics.dll",
+   "seed": [
+    {
+     "src": "mods/graphics/config.json",
+     "dst": "mods/graphics/config.json",
+     "why": "the graphics settings"
+    }
+   ],
    "minBytes": 300000,
    "markers": [
     "aowl.graphics.apply",
@@ -349,6 +412,13 @@
    "name": "textures",
    "src": "mods/textures/bin/textures.dll",
    "dst": "mods/textures/textures.dll",
+   "seed": [
+    {
+     "src": "mods/textures/config.json",
+     "dst": "mods/textures/config.json",
+     "why": "swapMode/redirectMode/packRoot -- with no file the mod runs on schema defaults and every F12 edit is discarded"
+    }
+   ],
    "minBytes": 300000,
    "markers": [
     "aowl.textures",
@@ -381,6 +451,13 @@
    "name": "maps",
    "src": "mods/maps/bin/maps.dll",
    "dst": "mods/maps/maps.dll",
+   "seed": [
+    {
+     "src": "mods/maps/config.json",
+     "dst": "mods/maps/config.json",
+     "why": "the map/radar settings"
+    }
+   ],
    "minBytes": 400000,
    "markers": [
     "aowl.maps",
@@ -417,6 +494,13 @@
    "name": "debug",
    "src": "mods/debug/bin/debug.dll",
    "dst": "mods/debug/debug.dll",
+   "seed": [
+    {
+     "src": "mods/debug/config.json",
+     "dst": "mods/debug/config.json",
+     "why": "overlayFields and the per-mod profiler. MEASURED 2026-08-28: absent from the live install, so four F3 profiler toggles were accepted, queued, and discarded -- 'no config.json for aowl.debug' in the host log"
+    }
+   ],
    "minBytes": 400000,
    "markers": [
     "aowl.debug",
@@ -440,6 +524,13 @@
    "name": "waypoints",
    "src": "mods/waypoints/bin/waypoints.dll",
    "dst": "mods/waypoints/waypoints.dll",
+   "seed": [
+    {
+     "src": "mods/waypoints/config.json",
+     "dst": "mods/waypoints/config.json",
+     "why": "patrolTuning"
+    }
+   ],
    "minBytes": 300000,
    "markers": [
     "aowl.waypoints",

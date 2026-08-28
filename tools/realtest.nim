@@ -693,6 +693,67 @@ proc boolField(s: string; objAt: int; key: string): bool =
   let at = memberValue(s, objAt, key)
   result = at >= 0 and at < s.len and s[at] == 't'
 
+# -- the map lock/unlock post-condition ------------------------------------
+#
+# Module level rather than nested inside the check block that uses them, for
+# consistency with every other helper in this file.
+#
+# A note for whoever builds this by hand next, because it cost three wrong
+# fixes here: `Response` comes from `backend/wire.nim`, so realtest needs
+# `-p:<repo>\backend` on the nimony command line (see `buildRealTest` in
+# tools/aowl.nim). Without it nimony does not say "cannot open wire" -- it
+# aborts in its RENDERER with an AssertionDefect, "expected ')' but got:
+# (else ... undeclared identifier: Response". That message points at whatever
+# expression happened to mention the type and invites you to rewrite correct
+# code. It is a missing import path, nothing else. Build with
+# `aowl build verify` or copy the flags from `buildRealTest`; do not hand-roll
+# the nimony invocation.
+
+const TarkovSettings = "/aowlspt/settings/aowl.tarkov"
+
+proc setMapSetting(key, valueJson: string): bool =
+  ## One settings edit through the REAL route, so the persist path, the
+  ## re-apply and the serve path are all inside the assertion.
+  let r: Response = call(TarkovSettings,
+               "{\"key\":\"" & key & "\",\"value\":" & valueJson & "}")
+  # A POST that did not persist answers `{"err":...,"rows":[...]}` rather than
+  # the bare array the GET returns, so "did it save" is answerable here without
+  # re-reading -- and re-reading our own write is what 9b forbids anyway.
+  #
+  var okCode = r.ok
+  if okCode:
+    okCode = findAt(r.body, "\"err\"", 0) < 0
+  result = okCode
+
+proc lockCensus(lk, un, mi: var int) =
+  ## Locked / unlocked / unreadable, counted over EVERY map
+  ## `/client/locations` actually serves.
+  ##
+  ## `mi` is the third outcome and it is not decoration: a map whose base
+  ## carries no `Locked`, or carries one that is not a JSON bool, is neither
+  ## locked nor unlocked. Folding it into either total would make one of them
+  ## a lie, and a non-bool is the case the client's deserialiser THROWS on --
+  ## the one most worth catching here rather than in a raid.
+  lk = 0
+  un = 0
+  mi = 0
+  let r: Response = call("/client/locations", "")
+  var ks: seq[string] = @[]
+  var vs: seq[int] = @[]
+  members(r.body, memberValue(r.body, dataAt(r), "locations"), ks, vs)
+  for i in 0 ..< vs.len:
+    let at = memberValue(r.body, vs[i], "Locked")
+    if at < 0 or at >= r.body.len:
+      inc mi
+    else:
+      let c = r.body[at]
+      if c == 't':
+        inc lk
+      elif c == 'f':
+        inc un
+      else:
+        inc mi
+
 proc hexId(n: int): string =
   ## A 24-character id, which is the only shape this server and its client
   ## accept. Derived from a counter rather than random so that a failing run
@@ -1850,6 +1911,83 @@ proc main(): int =
           findAt(locR.body, "\"" & absent & "\"", 0) < 0,
           "it is in the body, which is what made this route 560 MiB")
   line "  " & $mapKeys.len & " maps, " & kib(locR.body.len) & " of map data"
+
+  # -- map lock / unlock ---------------------------------------------------
+  #
+  # The post-condition is asserted on the SERVED PAYLOAD, over EVERY map, and
+  # it is phrased as a negative -- "no map reports unlocked" -- because that is
+  # what can be falsified. Asking "is Woods locked?" cannot fail usefully: it
+  # passes on a server that locked Woods and nothing else, and it passes on one
+  # that locked everything by accident. Re-reading what we just wrote could not
+  # fail at all, which is the shape CLAUDE.md 9b names.
+  #
+  # It also drives the setting through the real route rather than editing
+  # config.json underneath the server, so the persist path, the re-apply and
+  # the serve path are all in the loop.
+  # SHAPE FIRST. Measured from BSG's own reply for this build
+  # (data/post1/locations.json, capture seq 134): `Locked` is a plain JSON
+  # bool on all 24 maps. An object or a string here does not degrade, it
+  # throws in the client's deserialiser.
+  var l0 = 0
+  var u0 = 0
+  var m0 = 0
+  lockCensus(l0, u0, m0)
+  check("every map carries Locked as a JSON bool",
+        m0 == 0 and (l0 + u0) == mapKeys.len,
+        $m0 & " map(s) with no bool Locked; " & $(l0 + u0) & " of " &
+        $mapKeys.len & " readable")
+
+  if not setMapSetting("mapsUnlockedByDefault", "false"):
+    skip("locking every map is served to the client",
+         "the settings POST did not persist, so nothing was changed to look at")
+    skip("unlocking every map is served to the client", "same POST failure")
+    skip("one map locked by its client-side Id spelling", "same POST failure")
+  else:
+    var l1 = 0
+    var u1 = 0
+    var m1 = 0
+    lockCensus(l1, u1, m1)
+    check("with the default OFF, NO map is served unlocked",
+          u1 == 0 and m1 == 0 and l1 == mapKeys.len,
+          $u1 & " map(s) still unlocked, " & $m1 & " unreadable, " & $l1 &
+          " locked of " & $mapKeys.len)
+
+    discard setMapSetting("mapsUnlockedByDefault", "true")
+    var l2 = 0
+    var u2 = 0
+    var m2 = 0
+    lockCensus(l2, u2, m2)
+    check("with the default ON, NO map is served locked",
+          l2 == 0 and m2 == 0 and u2 == mapKeys.len,
+          $l2 & " map(s) still locked, " & $m2 & " unreadable, " & $u2 &
+          " unlocked of " & $mapKeys.len)
+
+    # THE NAME TRAP, as a check. "Woods" is the client-side `base.Id`; the
+    # database key is `woods`. Facts #183/#185: only 4 of 19 maps spell the two
+    # alike, and three earlier consumers of this distinction failed SILENTLY
+    # with a wrong value. If `mapsLocked` did not go through
+    # `canonicalLocation`, this locks nothing and the count stays 0 -- so the
+    # check fails rather than passing quietly, which is the whole point of
+    # asserting an exact count instead of ">= 0".
+    discard setMapSetting("mapsLocked", "\"Woods\"")
+    var l3 = 0
+    var u3 = 0
+    var m3 = 0
+    lockCensus(l3, u3, m3)
+    check("a map named by its client-side Id (\"Woods\") locks exactly one map",
+          l3 == 1 and m3 == 0 and u3 == mapKeys.len - 1,
+          $l3 & " locked (expected exactly 1), " & $u3 & " unlocked, " & $m3 &
+          " unreadable -- 0 locked means the Id spelling did not resolve to " &
+          "the database key, which is fact #183")
+
+    # Put it back, so a run does not leave the install locked.
+    discard setMapSetting("mapsLocked", "\"\"")
+    var l4 = 0
+    var u4 = 0
+    var m4 = 0
+    lockCensus(l4, u4, m4)
+    check("clearing the lock list unlocks the map again",
+          l4 == 0, $l4 & " map(s) still locked after clearing mapsLocked")
 
   # -- the two tables a `daytime` window is decided from -------------------
   #

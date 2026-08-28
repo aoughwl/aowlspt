@@ -1,0 +1,9 @@
+{
+  "_comment": "aowl.uihub -- the settings UI's browser fallback page and the launch hint. This file did not exist until 2026-08-28: the mod declared two settings and had nowhere to persist either, so the F12 toggle for the launch hint was accepted and discarded every time. tools/settingscheck.py now fails when a mod declares settings and has no config.json.",
+
+  "_launchHint": "The small top-right notice, once per launch, that fades after a few seconds. The NATIVE F12 overlay reads this key out of this mod's settings route BY NAME at start-up, which is why the key must keep this spelling and must live on this guid.",
+  "launchHint": true,
+
+  "_launchHintFallbackPage": "Declared implemented=false in uihub.nim and marked as such in the UI -- the toast names the in-game screen only and does not yet advertise the browser page. Given a path here so the choice persists and is already in place when the toast text is extended.",
+  "launchHintFallbackPage": false
+}

@@ -201,9 +201,15 @@ proc texturesSchema(): seq[Setting] =
                 category = "Advanced",
                 description = "From TarkovTextures, rewritten from scratch for aowlspt. DIAGNOSTIC, default OFF. Empty or 'off' installs nothing. Otherwise a comma list of GROUPS (ab eb ea am bm ex tc abx bsg all) or TAGS (ab6, eb42, am100582, tc56889, ...), installing a count-only typed PREFIX on each and logging one line every 10s: grep 'textures  loadprobe fires'. Start with 'bsg' -- BSG's own asset layer (Diz.Resources.EasyAssets/EasyBundle, EFT.AssetsManager, TextureCache) plus the ab6 control, which must read 0. A bare number still means an AssetBundle rid, and only that. Requires swapMode=off (both would detour ab6)."),
 
-    boolSetting("packRootSet", "Custom pack root", false, category = "Advanced",
-                implemented = false,
-                description = "From TarkovTextures, rewritten from scratch for aowlspt. packRoot in config.json points at the replacement images; edited there, not here."),
+    # `packRootSet` was REMOVED (2026-08-28). It was a bool named "Custom pack
+    # root" that no code anywhere read, whose own description said the real
+    # value "is edited there, not here" -- i.e. a control that rendered, took a
+    # click, saved a key nothing consumes, and pointed the player at a file.
+    # There was nothing to wire it to: `packRoot` is a path, not a flag, and
+    # the flag carried no information the path does not already carry (empty
+    # means "use the mod's own data/pack"). Deleting it is the fix; a row that
+    # exists to say "edit the config file instead" is worse than no row.
+    # Not a deploy marker -- checked before removal.
   ]
 
 proc onSettings(url, body, session: string): string =

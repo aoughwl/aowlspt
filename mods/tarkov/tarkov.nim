@@ -47,6 +47,7 @@ import emu/templates
 import emu/traders
 import emu/inventory
 import emu/raid
+import emu/maplock
 import emu/questcond
 import emu/quests
 import emu/hideout
@@ -621,6 +622,33 @@ proc onShopStatus(url, body, session: string): string =
   put(o, "labels", raw("[]"))
   put(o, "tarcoins", 0)
   result = envelope(o)
+
+proc applyMapLockSettings*() =
+  ## Read the three map-lock keys and write `Locked` into every map's base.
+  ##
+  ## ONE apply path, called from both the load-time config read and the
+  ## settings POST -- not two copies of the same three `setting()` calls. The
+  ## fov mod learned this the expensive way: an edit that persisted to
+  ## config.json while the live value kept what it was loaded with is a slider
+  ## that moves and changes nothing.
+  ##
+  ## And it MUST be hot: measured with tools/realtest.nim before this proc
+  ## existed, turning `mapsUnlockedByDefault` off persisted correctly and left
+  ## all 24 maps still served unlocked, because the apply only ran at load.
+  ## The check that caught it is "with the default OFF, NO map is served
+  ## unlocked", asked of the served payload over every map.
+  let rep = applyMapLocks(LockConfig(
+    unlockedByDefault: setting("mapsUnlockedByDefault").asBool(true),
+    lockList: setting("mapsLocked").asText(""),
+    unlockList: setting("mapsUnlocked").asText("")))
+  let msg = lockSummary(rep)
+  # An unresolved map name is a WARN, not an info: the setting saved cleanly
+  # and locked nothing, which reads as success everywhere else.
+  if rep.unresolved.len > 0 or rep.failed > 0:
+    warn "map locks: " & msg
+  else:
+    info "map locks: " & msg
+  discard applySetting("mapsLockResult", quoted(msg))
 
 proc applyMenuCornerLabel() =
   ## Drives the main menu's bottom-right corner label from the
@@ -3329,6 +3357,28 @@ proc tarkovSchema(): seq[Setting] =
                 @["Profile Name", "PVE ZONE", "No text"], category = "Menu",
                 description = "aowlspt original (server emulator); acts on the SPT-derived database. What the main menu's bottom-right corner shows: the logged-in character's name, the stock \\\"PVE ZONE\\\", or nothing"),
 
+    # ---- which maps the player may load into ---------------------------
+    #
+    # The three rows behind `emu/maplock`. `Locked` only, never `Enabled`:
+    # BSG's own /client/locations reply for this build carries Enabled=false
+    # on 9 of its 24 maps as its own "not in the game right now" axis, and
+    # overwriting that would remove maps from the selection screen for a
+    # reason the player did not ask for. See emu/maplock.nim for the measured
+    # wire shape (both fields are plain JSON bools) and for why this is here
+    # rather than in the phantom `mods/icebreaker` three files still cite.
+    boolSetting("mapsUnlockedByDefault", "All maps unlocked by default", true,
+                category = "Maps",
+                description = "aowlspt original (server emulator); acts on the SPT-derived database. Writes locations.<map>.base.Locked on every map in the table, which /client/locations sends to the client verbatim. ON is the stock behaviour -- the database ships Locked=false on all 19 maps. Turn it OFF to lock every map except the ones named in \\\"Maps to leave unlocked\\\" below. Every map is rewritten on every apply, so this is reversible; locking only the locked ones would strand a map locked forever"),
+    stringSetting("mapsLocked", "Maps to lock", "",
+                  category = "Maps",
+                  description = "aowlspt original (server emulator); acts on the SPT-derived database. Comma-separated maps to lock even when the switch above is ON. Any spelling works -- the database key (bigmap), the client's own Id (Woods, Interchange, RezervBase) or the _Id GUID -- because each name is resolved through emu/raid.canonicalLocation. Only 4 of 19 maps spell the key and the Id alike, so a name that resolves to no map is REPORTED in the row below rather than silently ignored"),
+    stringSetting("mapsUnlocked", "Maps to leave unlocked", "",
+                  category = "Maps",
+                  description = "aowlspt original (server emulator); acts on the SPT-derived database. Comma-separated maps to keep unlocked when \\\"All maps unlocked by default\\\" is OFF -- the per-map half of the lock. Same name resolution as the row above. Empty with the switch off locks everything"),
+    stringSetting("mapsLockResult", "Last lock result", "",
+                  category = "Maps",
+                  description = "aowlspt original (server emulator); acts on the SPT-derived database. What the last apply did: how many maps were locked and unlocked, how many database writes succeeded, and any map name in the two lists above that resolved to NO map -- which is the case where the setting saves cleanly and locks nothing"),
+
     # ---- item spawning -------------------------------------------------
     #
     # Four ordinary rows rather than a control type the settings UI does not
@@ -3452,6 +3502,13 @@ proc onTarkovSettings(url, body, session: string): string =
     # a row that does nothing. Re-read all of both groups rather than the one
     # key: the configure procs take the whole set and a partial call would
     # reset the others to their defaults.
+    # Hot-apply: the map locks. Same reason as the trader switches below --
+    # the client fetches /client/locations without being restarted, so a
+    # saved value that did not rewrite the bases here is a control that
+    # renders, saves, and leaves every map exactly as it was.
+    if key == "mapsUnlockedByDefault" or key == "mapsLocked" or
+       key == "mapsUnlocked":
+      applyMapLockSettings()
     if key.startsWith("progression"):
       configureProgression(setting("progressionPlayerLevel").asInt(0),
                            setting("progressionSkillLevel").asInt(0),
@@ -3602,6 +3659,8 @@ proc onLoad(): Status =
     setting("hideoutConstructionMultiplier").asFloat(1.0))
   configureCraftTimes(setting("hideoutProductionMultiplier").asFloat(1.0))
   configureQuestXp(setting("questXpMultiplier").asFloat(1.0))
+
+  applyMapLockSettings()
   configureMarket(setting("fleaSpreadPercent").asInt(20),
                   setting("fleaOfferHours").asInt(12),
                   setting("fleaMaxOffers").asInt(600),

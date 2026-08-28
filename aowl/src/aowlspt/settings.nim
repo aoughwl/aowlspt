@@ -394,7 +394,23 @@ proc statusMessage(st: Status): string =
   case st
   of Ok: "ok"
   of ErrBadArg: "the POST body was not {\"key\":...,\"value\":...}"
-  of ErrNotFound: "no such declared key on this mod"
+  # NOT "no such declared key". That wording was a CAUSE asserted from a
+  # status that does not carry one, and it was wrong for the case that
+  # actually happens. Measured 2026-08-28 against the live client: the F3
+  # profiler toggle produced, on the same millisecond,
+  #   "config set profiler on aowl.debug did not persist: no config.json for aowl.debug"
+  #   "'aowl.debug' refused an F12 edit: no such declared key on this mod"
+  # `profiler` IS declared -- it is in debug.nim's schema and in the repo's
+  # mods/debug/config.json -- and the second line sent whoever read it looking
+  # for a schema bug that does not exist. The client host answers ErrNotFound
+  # for BOTH "the file has no such key" and "there is no file", and from here
+  # the two are indistinguishable, so this now names both and points at
+  # `lastError()`, which does know which. Say what was observed, not why.
+  of ErrNotFound: "the host did not persist it and reported ErrNotFound. " &
+                  "That is EITHER no config.json for this mod at all -- in " &
+                  "which case nothing this mod declares can ever be saved -- " &
+                  "OR a key the schema does not declare. lastError() " &
+                  "distinguishes them; check the mod's config.json exists first"
   of ErrConfigParse: "this mod's config.json does not parse; lastError() names why"
   of ErrUnsupported: "this host does not support writing config"
   else: "could not persist (status " & $st & ")"

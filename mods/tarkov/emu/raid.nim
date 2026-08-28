@@ -360,7 +360,17 @@ proc locationsBody*(d: LootDb; idx: LocationIndex): string =
       var key = idx.ids[i]
       if key.len == 0:
         key = idx.names[i]
-      put(maps, key, raw(base))
+      # The lock is applied HERE as well as in `post1LocationsTuned`, because
+      # this is the other document that can be served. Two apply sites is one
+      # more than anybody wants, but the alternative -- applying it in the
+      # route handler -- would have to re-parse whichever document came back;
+      # both call `lockedFor`, so the POLICY still lives in exactly one place.
+      var one = parseObject(base)
+      if one.ok:
+        setBool(one, "Locked", lockedFor(idx.names[i]))
+        put(maps, key, raw(text(one)))
+      else:
+        put(maps, key, raw(base))
     inc i
   var o = obj()
   put(o, "locations", maps)
@@ -839,6 +849,76 @@ proc tuneOfflineSpawns*(d: var Doc) =
 
 var gTunedLocations: string = ""
 
+# ---------------------------------------------------------------------------
+# Map lock policy
+# ---------------------------------------------------------------------------
+#
+# WHERE THIS HAD TO GO, and the stale comment that sent it somewhere else.
+#
+# The section comment above still says `base` goes out "verbatim, byte for
+# byte", and that whatever a mod writes into `locations.<map>.base` therefore
+# "still arrives". **That is true only of the SPT-db fallback path.** On any
+# install where `data/post1/locations.json` is present -- which is every real
+# one -- `/client/locations` answers out of `post1LocationsTuned` below, which
+# is built from the POST-1.0 TABLE and never reads the database's `locations`
+# at all.
+#
+# Measured 2026-08-28 with tools/realtest.nim against the imported db: the
+# first version of the map lock wrote `Locked` into all 19 database bases,
+# logged "19 db write(s) ok", and the served payload still reported all 24
+# maps unlocked. Nineteen successful writes to a document nobody serves.
+#
+# So the policy is held here and applied while the SERVED document is built,
+# in both paths. `gTunedLocations` is a cache of that document, so changing
+# the policy must drop it -- otherwise the first request after an edit is
+# answered from a document built under the old policy.
+#
+# NOTE for whoever owns mods/morebots: `BotMax`, `BotMaxPvE`, `MaxBotPerZone`
+# and `waves[].slots_*` are written to `locations.<map>.base` by
+# `bots/spawnscale.nim` and are subject to exactly this problem. That is NOT
+# fixed here -- it is a different mod and a different measurement -- but the
+# comment claiming those writes arrive should not be trusted without checking.
+
+type
+  MapLockPolicy* = object
+    unlockedByDefault*: bool
+    lockKeys*: seq[string]     ## database keys to lock
+    unlockKeys*: seq[string]   ## database keys to leave unlocked
+
+var gLockPolicy = MapLockPolicy(unlockedByDefault: true,
+                                lockKeys: @[], unlockKeys: @[])
+
+proc setMapLockPolicy*(p: MapLockPolicy) =
+  ## Install the policy and DROP the tuned-locations cache.
+  ##
+  ## Dropping the cache is the whole correctness of the hot-apply: without it
+  ## the setting persists, the policy changes, and `/client/locations` keeps
+  ## answering the document it built the first time it was asked.
+  gLockPolicy = p
+  gTunedLocations = ""
+
+proc lockedFor*(id: string): bool =
+  ## Whether the map named `id` -- by database key, `_Id`, `Id` or `Name` --
+  ## should be served locked.
+  ##
+  ## `canonicalLocation` is the ONE resolver (facts #183/#185): the post-1.0
+  ## table is keyed by `_Id` while the lists the player typed are resolved to
+  ## database keys, and only 4 of 19 maps spell any two of their names alike.
+  ## A post-1.0-only map the database has never heard of (Icebreaker,
+  ## Terminal_ui, the Sandbox variants) resolves to itself, which is a name no
+  ## list will match -- so it follows the default, which is the honest answer
+  ## rather than a guess about which parent map it belongs to.
+  let key = canonicalLocation(id)
+  if gLockPolicy.unlockedByDefault:
+    for k in gLockPolicy.lockKeys:
+      if k == key or k == id:
+        return true
+    return false
+  for k in gLockPolicy.unlockKeys:
+    if k == key or k == id:
+      return false
+  result = true
+
 proc post1LocationsTuned*(): string =
   ## The post-1.0 `locations` table with every map's spawn tuning applied --
   ## what `/client/locations` must answer with.
@@ -868,6 +948,19 @@ proc post1LocationsTuned*(): string =
     var one = parseObject(locs.field(k).raw)
     if one.ok:
       tuneOfflineSpawns(one)
+      # `Locked` is written on EVERY map, not only the locked ones, so that
+      # unlocking is reachable: a map whose `Locked` was left alone would keep
+      # whatever the table shipped forever. Measured from BSG's own reply, the
+      # field is a plain JSON bool on all 24 -- `setBool` matches that shape,
+      # and Newtonsoft throws rather than degrades on anything else.
+      #
+      # Resolved by the map's own `Id` when it has one -- that is the spelling
+      # the client sends and the one a player is likeliest to type -- falling
+      # back to `k`, which is the `_Id` this table is keyed by.
+      var who = field(locs.field(k).raw, "Id").asText("")
+      if who.len == 0:
+        who = k
+      setBool(one, "Locked", lockedFor(who))
       setRaw(tuned, k, text(one))
     else:
       setRaw(tuned, k, locs.field(k).raw)

@@ -515,11 +515,20 @@ proc moreBotsSchema(): seq[Setting] =
                category = "Bot AI/Population", subcategory = "Limits",
                description = "From MoreBotsAPI (TacticalToaster), rewritten from scratch for aowlspt. The largest slots_max any single scav wave may reach. A wave asking for more bots at once than the zone can place is a wave that arrives partly.",
                implemented = true),
-    intSetting("increaseBotCapAmount", "Increase bot cap amount", 0,
-               lo = 0, hi = 50,
-               category = "Bot AI/Population", subcategory = "Limits",
-               description = "From MoreBotsAPI (TacticalToaster), rewritten from scratch for aowlspt. Deprecated and does nothing: it writes bots.config.maxBotCap, a database path nothing on this stack reads. Use the preset above instead.",
-               implemented = false),
+    # `increaseBotCapAmount` was REMOVED from the settings UI (2026-08-28).
+    #
+    # Its own description said "deprecated and does nothing", which is exactly
+    # the control that should not be drawn: a slider with a range of 0..50 that
+    # the player can move and that cannot affect the game is worse than its
+    # absence, because moving it looks like an action. `bots.config.maxBotCap`
+    # is not a path anything on this stack reads -- a stock SPT 4.x database
+    # has no `bots.config` at all.
+    #
+    # The KEY stays in config.json and `bumpBotCaps` still reads it and still
+    # warns. That is deliberate: an install that set it years ago must keep
+    # getting the line telling it to use `population` instead, and deleting
+    # the key would take the warning away along with the row. What is gone is
+    # only the affordance to set it anew.
     boolSetting("clientCensus", "Count the bots that arrived", false,
                 category = "Bot AI/Advanced", subcategory = "Population diagnostics",
                 description = "From MoreBotsAPI (TacticalToaster), rewritten from scratch for aowlspt. The in-client half, off by default: it opens the IL2CPP runtime in the game process to count live bots. Raising bot counts is the server half and needs none of this.",

@@ -571,8 +571,19 @@ proc fovSchema(): seq[Setting] =
                  step = 0.1, category = "Camera", implemented = false,
                  description = "From Fontaine's FOV Fix (com.fontaine.fovfix), rewritten from scratch for aowlspt. Read only. Same LerpCameraPatch semantics gap as rifleCameraZOffset; the per-axis speed fields are not identifiable without the upstream source."),
 
-    boolSetting("verifyHooks", "Verify hooks at load", true, category = "Advanced",
-                description = "From Fontaine's FOV Fix (com.fontaine.fovfix), rewritten from scratch for aowlspt. Assert each detour bound before trusting it")]
+    # The KEY is `verifyHooksByName`, not `verifyHooks`. This row used to
+    # declare `verifyHooks` -- a key `loadConfig` deliberately stopped reading,
+    # and which this mod WARNS about when it finds it on disk ("the deployed
+    # config.json still has \"verifyHooks\" in it ... it does nothing"). So the
+    # control rendered, defaulted to the opposite of the real default, wrote a
+    # key nothing reads, and made the mod complain about a file the settings
+    # UI had just written. Default is `false` here because that is what
+    # `cfgBool("verifyHooksByName", false)` actually uses -- a schema default
+    # that disagrees with the code's default is a row that lies before it is
+    # ever touched.
+    boolSetting("verifyHooksByName", "Verify hooks by name at load", false,
+                category = "Advanced",
+                description = "From Fontaine's FOV Fix (com.fontaine.fovfix), rewritten from scratch for aowlspt. Attach the by-name target-verification watch, which resolves each patched method by name at raid start and reports whether the live target still matches the one the detour bound. DIAGNOSTIC: it does not drive the FOV write -- that has its own driver and is armed regardless -- so leaving this off does not switch the mod off. Off by default because by-name resolution on this build can return a non-nil handle into unmapped memory")]
 
 proc onFovSettings(url, body, session: string): string =
   ## GET: the declared schema with current values folded in, for the settings
