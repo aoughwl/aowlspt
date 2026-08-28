@@ -1975,6 +1975,30 @@ proc cmdTest(e: Env): int =
       discard run(e, "every registration is reached by the handler it named",
                   quoted(regRaceExe))
 
+    # And the launcher's screen, as a character grid.
+    #
+    # `tools/aowllaunch.nim` shows the launch progress and both log panes on ONE
+    # screen now, and that merge is a layout change -- the class of change that
+    # fails by being one column out, which looks like a rendering glitch on
+    # somebody else's terminal and is arithmetic that drifts with the window
+    # width. `tools/aowllayout.nim` is the pure half of it, so the frame can be
+    # rendered into a buffer here at five window sizes and checked as the grid
+    # it produced: no row wider than the window, both pane borders present, both
+    # logs on screen at once, and a deliberate REFUSAL below the minimum size
+    # rather than a bent frame.
+    let tuiExe = joinPath(e.repo, "installer\\build\\tuilayout.exe")
+    var tlCmd = quoted(nimonyExe(e))
+    tlCmd.add " c"
+    tlCmd.add abiInclude(e)
+    tlCmd.add " -p:" & quoted(joinPath(e.repo, "installer\\src"))
+    tlCmd.add " -p:" & quoted(joinPath(e.repo, "aowl\\src"))
+    tlCmd.add " -p:" & quoted(joinPath(e.repo, "tools"))
+    tlCmd.add " -o:" & quoted(tuiExe)
+    tlCmd.add " " & quoted(joinPath(e.repo, "tests\\tuilayout.nim"))
+    if run(e, "tuilayout builds", tlCmd, e.repo):
+      discard run(e, "the launcher's one screen fits every window it agrees " &
+                     "to draw in", quoted(tuiExe))
+
     # And the wire format the post-1.0 client actually speaks, against bodies
     # it actually sent.
     #

@@ -20,9 +20,25 @@
 ##
 ## There is no GUI launcher and there is not going to be one, so the console is
 ## the whole of the interface: it checks the install, starts the server, asks
-## which profile to play, starts the game, and then becomes a live view of the
-## two logs. Those four phases are `bootView`, `pickProfile`, `clientView` and
-## `runLogView` below, and each of them has one rule in common.
+## which profile to play, starts the game, and shows both logs live.
+##
+## It used to do the last two of those on TWO screens, one after the other: a
+## progress view with ticks filling in, and then -- once the client was up -- a
+## two-pane log view. That ordering was the mistake. The moment the progress
+## view becomes interesting is the moment something is going wrong, and that is
+## exactly the moment the logs are wanted; they were minutes away, behind a
+## profile prompt and a client that had to finish coming up first.
+##
+## There is now ONE screen, `unifiedRows` in `aowllayout`: a header, a
+## launch-progress region, both log panes side by side, a status line. Three
+## phases paint it -- `waitForBackend`, `watchClient`, `runLogView` -- and the
+## only things that change between them are what the progress region holds and
+## whether keys are being read. As the launch finishes the region folds to one
+## summary line and the panes take the space. `pickProfile` still takes the
+## console to itself, because it is a prompt and a prompt needs the cursor; the
+## unified block is left settled in the scrollback above it.
+##
+## Each of those phases has one rule in common.
 ##
 ## **Nothing on the screen advances on a timer.** Every mark that fills in is a
 ## fact that was observed: the port answered, the backend's own log said
@@ -34,17 +50,24 @@
 ## something cannot be known, the screen says so and shows the last log line
 ## instead of inventing a percentage.
 ##
-## The other rule is that all four phases degrade. `aowlterm` decides whether
-## this is a VT console, a console without VT, or not a console at all; the
-## views ask it and take one of three paths. A launcher whose output is being
-## redirected into a file for somebody to read on Discord must produce a file
-## with no escape codes in it, and a launcher in an 80x10 window must produce
-## something legible in an 80x10 window. Both are checked in `runLogView`.
+## The other rule is that every phase degrades, and SAYS SO WHEN IT DOES.
+## `aowlterm` decides whether this is a VT console, a console without VT, or not
+## a console at all; `unifiedRows` decides whether the window can hold the
+## screen. A launcher whose output is being redirected into a file for somebody
+## to read on Discord must produce a file with no escape codes in it, and a
+## launcher in an 80x10 window must produce something legible in an 80x10
+## window. What it must never do is quietly become a different view: below the
+## minimum, `unifiedRows` refuses and hands back a reason, the phase prints that
+## reason, and the plain interleaved `streamLogs` takes over. A skipped region
+## that reads as a rendered one is the failure this whole file is written
+## against. `tests/tuilayout.nim` renders the grid at five window sizes and
+## checks it, so none of that depends on somebody launching the game to look.
 
 import std/[strutils, syncio, cmdline]
 import aowlsptinstall/[winfs, log, eft]
 import "../host/common/jsonpath"
 import aowlterm
+import aowllayout
 import aowlsession
 import aowlui
 
@@ -317,77 +340,12 @@ proc parseArgs(): Options =
 # Small formatting
 # ---------------------------------------------------------------------------
 
-proc secsText(ms: int64): string =
-  ## `4.2s`, `1m 04s`. Tenths below a minute because that is the range in which
-  ## a difference of a tenth is something the reader is watching for.
-  if ms < 0'i64: return "0.0s"
-  if ms < 60000'i64:
-    let tenths = int(ms div 100'i64)
-    return $(tenths div 10) & "." & $(tenths mod 10) & "s"
-  let secs = int(ms div 1000'i64)
-  let m = secs div 60
-  let s = secs mod 60
-  result = $m & "m " & (if s < 10: "0" else: "") & $s & "s"
-
 proc sizeText(bytes: int64): string =
   if bytes <= 0'i64: return "0 B"
   if bytes < 1024'i64: return $int(bytes) & " B"
   if bytes < 1048576'i64: return $int(bytes div 1024'i64) & " KB"
   let mb10 = int(bytes div 104858'i64)
   result = $(mb10 div 10) & "." & $(mb10 mod 10) & " MB"
-
-const
-  MarkDone = 0
-  MarkActive = 1
-  MarkPending = 2
-  MarkFailed = 3
-
-proc markGlyph(kind: int): string =
-  if termAscii():
-    case kind
-    of MarkDone: "ok"
-    of MarkActive: ">>"
-    of MarkFailed: "!!"
-    else: "  "
-  else:
-    case kind
-    of MarkDone: "✔ "
-    of MarkActive: "▸ "
-    of MarkFailed: "✖ "
-    else: "  "
-
-proc markColour(kind: int): int =
-  case kind
-  of MarkDone: ColGreen
-  of MarkActive: ColCyan
-  of MarkFailed: ColRed
-  else: ColDim
-
-proc stepRow(kind: int; name, detail: string; width: int): Row =
-  result = newRow()
-  result.put "  "
-  result.putIn markColour(kind), markGlyph(kind)
-  result.put " "
-  result.putIn (if kind == MarkPending: ColDim else: ColDefault), name
-  result.padTo 20
-  let room = width - result.width - 2
-  if room > 4 and detail.len > 0:
-    result.putIn (if kind == MarkFailed: ColRed else: ColDim), fit(detail, room)
-
-proc logRow(l: LogLine; width: int): Row =
-  result = newRow()
-  result.put "  "
-  if l.stamp.len > 0:
-    result.putIn ColDim, fit(l.stamp, 9)
-    result.padTo 12
-  let name = levelName(l.level)
-  if name.len > 0:
-    result.putIn levelOf(l.level), name
-  result.padTo (if l.stamp.len > 0: 18 else: 8)
-  let room = width - result.width - 1
-  if room > 4:
-    result.putIn (if l.level == lvError: ColRed else: ColDefault),
-                 fit(l.text, room)
 
 # ---------------------------------------------------------------------------
 # What the backend's own log says about how far it has got
@@ -493,22 +451,95 @@ proc scanHost(t: Tail): HostState =
       inc result.modsLoaded
 
 # ---------------------------------------------------------------------------
-# The boot view
+# One screen
 # ---------------------------------------------------------------------------
+#
+# The launcher used to show the launch progress and then, afterwards, the two
+# logs. That ordering was the bug: the moment the progress view becomes
+# interesting is the moment something has gone wrong, and that is exactly the
+# moment the logs are needed -- and they were minutes away, behind a profile
+# prompt and a client that had to finish coming up first.
+#
+# So there is now one screen, drawn by `unifiedRows` in `aowllayout`, and every
+# phase paints it. What changes between phases is the progress region and
+# whether keys are being read:
+#
+#   boot     the backend's steps    + both panes, in the scrollback
+#   client   the client's steps     + both panes, in the scrollback
+#   run      ONE summary line       + both panes, full screen, keys live
+#
+# The two `Tail`s are created ONCE, in `main`, and threaded through all three.
+# Before this they were opened three times -- `waitForBackend` opened the
+# backend log, `watchClient` opened the host log, and `runLogView` opened both
+# again from offset zero -- which meant the log view re-read and re-parsed
+# everything the boot view had already read, and the boot view could not show
+# the client's log at all because it did not have it. Sharing them is not an
+# optimisation; it is what makes one screen possible.
 
-proc bootRows(b: BootState; answered: bool; elapsed: int64; port: int;
-              tls: bool; t: Tail; width, logRows: int): seq[Row] =
+type
+  Logs = object
+    server: Tail
+    client: Tail
+    clientStarted: bool
+      ## False until the client process has been created and the injected host
+      ## has had the chance to truncate its log. While it is false the client
+      ## pane is showing the PREVIOUS session's file, and the pane title says
+      ## so -- an old log presented as a live one is the kind of confidently
+      ## wrong answer this launcher exists to avoid.
+
+proc newLogs(root: string): Logs =
+  result = Logs(server: newTail(joinPath(root, "aowlspt\\aowlspt-backend.log")),
+                client: newTail(joinPath(root, "aowlspt\\aowlspt-host.log")),
+                clientStarted: false)
+
+proc pumpBoth(l: var Logs) =
+  discard l.server.pump()
+  discard l.client.pump()
+
+type
+  Phase = enum
+    phBoot, phClient, phRun
+
+  Screen = object
+    ## Everything the unified screen draws, as data. Filled by the phase that
+    ## owns the moment; the drawing code has no opinion about which phase it is
+    ## in beyond which progress rows to build.
+    phase: Phase
+    boot: BootState
+    host: HostState
+    answered: bool
+    alive: bool
+    tlsMode: bool
+    port: int
+    pid: int
+    who: string
+    srvText: string
+    srvCol: int
+    cliText: string
+    cliCol: int
+    summaryKind: int
+    summaryText: string
+
+proc newScreen(): Screen =
+  result = Screen(phase: phBoot,
+                  boot: BootState(portFree: false, dbBytes: 0'i64,
+                                  dbLoaded: false, modsTotal: 0,
+                                  modsTotalKnown: false, modsLoaded: 0,
+                                  lastLoaded: "", listening: false, errors: 0,
+                                  lastError: ""),
+                  host: HostState(wroteAnything: false, guardAnswered: false,
+                                  runtimeUp: false, running: false,
+                                  modsLoaded: 0, errors: 0, lastError: ""),
+                  answered: false, alive: true, tlsMode: false, port: 0,
+                  pid: 0, who: "", srvText: "", srvCol: ColDim,
+                  cliText: "", cliCol: ColDim, summaryKind: MarkPending,
+                  summaryText: "")
+
+proc bootSteps(s: Screen; width: int): seq[Row] =
+  let b = s.boot
   result = @[]
-  var head = newRow()
-  head.put "  "
-  head.putIn ColWhite, "starting the server"
-  head.padTo width - 10
-  head.putIn ColDim, secsText(elapsed)
-  result.add head
-  result.add newRow()
-
   result.add stepRow((if b.portFree: MarkDone else: MarkActive),
-                     "port " & $port,
+                     "port " & $s.port,
                      (if b.portFree: "claimed" else: "asking for it"), width)
 
   let dbMark =
@@ -543,41 +574,194 @@ proc bootRows(b: BootState; answered: bool; elapsed: int64; port: int;
                       elif modMark == MarkDone: MarkActive
                       else: MarkPending),
                      "listening",
-                     (if b.listening: "127.0.0.1:" & $port &
-                        (if tls: " (TLS)" else: "") else: ""), width)
+                     (if b.listening: "127.0.0.1:" & $s.port &
+                        (if s.tlsMode: " (TLS)" else: "") else: ""), width)
   # In TLS mode the launcher cannot probe HTTPS, so readiness *is* the backend's
   # own "listening" line rather than a request coming back -- and the label says
   # which, so a green tick never claims more than was actually observed.
-  result.add stepRow((if answered: MarkDone
+  result.add stepRow((if s.answered: MarkDone
                       elif b.listening: MarkActive
                       else: MarkPending),
-                     (if tls: "ready" else: "answering"),
-                     (if answered:
-                        (if tls: "the backend logged it is listening on TLS"
+                     (if s.tlsMode: "ready" else: "answering"),
+                     (if s.answered:
+                        (if s.tlsMode: "the backend logged it is listening on TLS"
                          else: "/aowlspt/tarkov/selfcheck came back")
                       else: ""), width)
   if b.errors > 0:
     result.add stepRow(MarkFailed, $b.errors & " error(s)", b.lastError, width)
 
-  if logRows > 0:
-    result.add newRow()
-    var sep = newRow()
-    sep.put "  "
-    sep.putIn ColDim, rule(width - 4)
-    result.add sep
-    var first = t.lines.len - logRows
-    if first < 0: first = 0
-    for i in first ..< t.lines.len:
-      result.add logRow(t.lines[i], width)
-    var pad = logRows - (t.lines.len - first)
-    while pad > 0:
-      result.add newRow()
-      dec pad
+proc clientSteps(s: Screen; width: int): seq[Row] =
+  let h = s.host
+  result = @[]
+  result.add stepRow(MarkDone, "process", "pid " & $s.pid & ", host injected",
+                     width)
+  result.add stepRow((if not s.alive: MarkFailed
+                      elif h.wroteAnything: MarkDone else: MarkActive),
+                     "host log",
+                     (if not s.alive: "the client exited"
+                      elif h.wroteAnything: "writing"
+                      else: "waiting for the first line"), width)
+  result.add stepRow((if h.runtimeUp: MarkDone
+                      elif h.wroteAnything: MarkActive else: MarkPending),
+                     "IL2CPP runtime",
+                     (if h.runtimeUp: "up" else:
+                        "the game brings this up on its own; a cold launch " &
+                        "takes a while"), width)
+  result.add stepRow((if h.running: MarkDone
+                      elif h.runtimeUp: MarkActive else: MarkPending),
+                     "host",
+                     (if h.running: $h.modsLoaded & " client mod(s) loaded"
+                      else: ""), width)
+  if h.errors > 0:
+    result.add stepRow(MarkFailed, $h.errors & " error(s)", h.lastError, width)
 
-proc waitForBackend(root: string; port: int; tls: bool; backendProc: uint64;
-                    limitSecs: int; logPath: string;
+proc screenSteps(s: Screen; width: int): seq[Row] =
+  case s.phase
+  of phBoot: bootSteps(s, width)
+  of phClient: clientSteps(s, width)
+  of phRun: @[stepRow(s.summaryKind, "launch", s.summaryText, width)]
+
+proc progressText(s: Screen; kind: var int): string =
+  ## The whole progress region in one PLAIN sentence, and the mark that goes in
+  ## front of it. Plain because this same text is what a redirected launcher
+  ## writes into a file, where an escape sequence is not colour, it is noise --
+  ## and because one routine deciding it means the collapsed line on screen and
+  ## the line in the file can never drift apart and say two different things.
+  ##
+  ## Every branch is a sentence the backend or the host WROTE. Nothing here is
+  ## derived from how long it has been.
+  case s.phase
+  of phBoot:
+    let b = s.boot
+    kind = MarkActive
+    result = "starting"
+    if s.answered:
+      kind = MarkDone
+      result = "ready on 127.0.0.1:" & $s.port &
+               (if s.tlsMode: " (TLS)" else: "")
+    elif b.listening: result = "listening, waiting for it to answer"
+    elif b.modsTotalKnown:
+      result = "loading mods, " & $b.modsLoaded & " of " & $b.modsTotal
+    elif b.dbLoaded: result = "database read, reading the load order"
+    elif b.portFree: result = "port " & $s.port & " claimed"
+    if b.errors > 0:
+      kind = MarkFailed
+      result = result & " -- " & $b.errors & " error(s): " & b.lastError
+  of phClient:
+    let h = s.host
+    kind = MarkActive
+    result = "waiting for the host's first log line"
+    if not s.alive:
+      kind = MarkFailed
+      result = "the client exited while starting"
+    elif h.running:
+      kind = MarkDone
+      result = "host running, " & $h.modsLoaded & " client mod(s) loaded"
+    elif h.runtimeUp: result = "IL2CPP up, host binding"
+    elif h.wroteAnything: result = "host started, waiting for the runtime"
+    if h.errors > 0 and kind != MarkFailed:
+      kind = MarkFailed
+      result = result & " -- " & $h.errors & " error(s): " & h.lastError
+  of phRun:
+    kind = s.summaryKind
+    result = s.summaryText
+
+proc progressName(s: Screen): string =
+  case s.phase
+  of phBoot: "server"
+  of phClient: "client"
+  of phRun: "launch"
+
+proc screenSummary(s: Screen; width: int): Row =
+  ## The progress region collapsed to one line. Still a fact that was observed
+  ## -- the count the backend logged, the line the host wrote -- never a
+  ## percentage of an elapsed time.
+  var kind = MarkActive
+  let what = progressText(s, kind)
+  result = stepRow(kind, progressName(s), what, width)
+
+proc screenHeader(s: Screen; w: int; elapsed: int64): Row =
+  result = newRow()
+  result.put " "
+  result.putIn ColWhite, "aowlspt"
+  result.put "  "
+  result.putIn ColDim, bxV()
+  result.put " "
+  let label =
+    case s.phase
+    of phBoot: "starting the server"
+    of phClient: "starting the client"
+    of phRun: (if s.who.len > 0: s.who else: "no profile")
+  result.putIn (if s.phase == phRun and s.who.len > 0: ColCyan else: ColDim),
+               fit(label, 26)
+  result.put " "
+  result.putIn ColDim, bxV()
+  result.put " "
+  result.putIn s.srvCol, fit(s.srvText, 30)
+  result.put " "
+  result.putIn ColDim, bxV()
+  result.put " "
+  result.putIn s.cliCol, fit(s.cliText, 22)
+  # Guarded rather than padded blindly: `padTo` cannot shorten, so a header that
+  # has already run past `w - 10` would otherwise have the clock appended past
+  # the right-hand edge and shear the frame.
+  if result.width <= w - 10:
+    result.padTo w - 10
+    result.putIn ColDim, secsText(elapsed)
+
+proc paneTitles(l: Logs; scrollS, scrollC: int; srv, cli: var string) =
+  srv = "server  " & $l.server.lines.len & " lines" &
+        (if scrollS > 0: "  back " & $scrollS else: "")
+  if l.clientStarted:
+    cli = "client  " & $l.client.lines.len & " lines" &
+          (if scrollC > 0: "  back " & $scrollC else: "")
+  else:
+    cli = "client  not started yet -- last session's log"
+
+proc paintPhase(panel: var Panel; logs: var Logs; s: Screen;
+                elapsed: int64): bool =
+  ## The unified screen, repainted in place in the SCROLLBACK rather than on the
+  ## alternate screen. That is deliberate and different from the live log view:
+  ## what is immediately above this block is the preflight report about the
+  ## player's install, which is the thing they will be asked to paste when
+  ## something is wrong with it. The alternate screen would take it away and
+  ## give it back; repainting in place leaves it, and leaves the finished
+  ## progress behind in the scrollback too.
+  ##
+  ## Returns false when the screen cannot hold the unified block; the caller
+  ## then writes its plain one-line-per-change progress instead. It never draws
+  ## a bent frame and never silently drops a region.
+  if termMode() != tmFull: return false
+  var w = 0
+  var h = 0
+  termSize(w, h)
+  if w <= 0: w = 100
+  if h <= 0: h = 25
+  if w > 160: w = 160
+  # `Panel` repaints by walking the cursor up over its own last paint, so a
+  # block as tall as the window scrolls and the paint then climbs the screen a
+  # line per frame. Three rows are kept back, and the block is capped so a very
+  # tall console does not hand the whole thing over to the boot view.
+  var ph = h - 3
+  if ph > 26: ph = 26
+  var srv = ""
+  var cli = ""
+  paneTitles(logs, 0, 0, srv, cli)
+  let dw = w - 1
+  let lay = unifiedRows(dw, ph, screenHeader(s, dw, elapsed),
+                        screenSteps(s, dw), screenSummary(s, dw),
+                        logs.server, logs.client, srv, cli,
+                        0, 0, 0, false, newRow())
+  if not lay.renderable: return false
+  if not fitsInWindow(lay.rows.len): return false
+  panel.paint lay.rows
+  result = true
+
+proc waitForBackend(port: int; tls: bool; backendProc: uint64;
+                    limitSecs: int; logs: var Logs;
                     died, answered, probeBroken: var bool) =
-  ## Poll until the backend is ready, showing its own progress while it does.
+  ## Poll until the backend is ready, showing its own progress -- and both logs
+  ## -- while it does.
   ##
   ## "Ready" is observed two different ways, because the launcher speaks plain
   ## HTTP and cannot open a TLS request. In plain mode readiness is a request
@@ -588,18 +772,18 @@ proc waitForBackend(root: string; port: int; tls: bool; backendProc: uint64;
   died = false
   answered = false
   probeBroken = false
-  var tail = newTail(logPath)
+  var s = newScreen()
+  s.phase = phBoot
+  s.port = port
+  s.tlsMode = tls
+  s.srvText = "server starting"
+  s.srvCol = ColYellow
+  s.cliText = "client not started"
+  s.cliCol = ColDim
   let began = cNowMs()
   var panel = newPanel()
-  var w = 0
-  var h = 0
-  termSize(w, h)
-  if w <= 0: w = 100
-  if w > 120: w = 120
-  var logRows = 6
-  if not fitsInWindow(9 + logRows + 2):
-    logRows = 0
-  let painting = fitsInWindow(11) and termMode() == tmFull
+  var painting = termMode() == tmFull
+  var saidDegraded = false
   var lastNote = 0'i64
   var lastPaint = -1000'i64
 
@@ -607,13 +791,17 @@ proc waitForBackend(root: string; port: int; tls: bool; backendProc: uint64;
     let waited = cNowMs() - began
     if limitSecs > 0 and waited >= int64(limitSecs) * 1000'i64:
       break
-    discard tail.pump()
+    # BOTH logs, not just the backend's. The client pane is showing the previous
+    # session at this point and its title says so, but the tail has to be kept
+    # current from here so that the moment the injected host truncates the file
+    # the pane empties and refills with this run.
+    pumpBoth(logs)
     if tls:
       # Cannot probe HTTPS, so the log is the signal. The `listening` line is
       # written after the TLS bind, so it means exactly what an answered request
       # would in plain mode -- with the process-alive check still underneath, so
       # a backend that died before it logged anything is not waited for.
-      let b = scanBoot(tail)
+      let b = scanBoot(logs.server)
       if b.listening:
         answered = true
       elif backendProc != 0'u64 and cSpawnAlive(backendProc) == 0'i32:
@@ -631,25 +819,36 @@ proc waitForBackend(root: string; port: int; tls: bool; backendProc: uint64;
       elif backendProc != 0'u64 and cSpawnAlive(backendProc) == 0'i32:
         died = true
 
+    s.boot = scanBoot(logs.server)
+    s.answered = answered
+    if answered:
+      s.srvText = "server ready"
+      s.srvCol = ColGreen
+    elif died:
+      s.srvText = "server exited"
+      s.srvCol = ColRed
+
     if painting:
       if waited - lastPaint >= 100'i64 or answered or died or probeBroken:
         lastPaint = waited
-        let b = scanBoot(tail)
-        panel.paint bootRows(b, answered, waited, port, tls, tail, w, logRows)
-    else:
-      # No repainting here: this is the redirected case, and the only useful
-      # thing to write into a file is a line whenever something changed.
+        if not paintPhase(panel, logs, s, waited):
+          # Said out loud, once. A view that quietly becomes a different view is
+          # the failure this file is written against: the reader would see plain
+          # lines and have no way to tell whether the launcher chose them or the
+          # fancy view had crashed.
+          painting = false
+          if not saidDegraded:
+            saidDegraded = true
+            warn "this window cannot hold the launch view and both log " &
+                 "panes at once; reporting progress as plain lines instead"
+            flushOut()
+    if not painting:
+      # The redirected case, and the too-small case. The only useful thing to
+      # write is a line whenever something changed.
       if waited - lastNote >= 5000'i64:
         lastNote = waited
-        let b = scanBoot(tail)
-        var what = "starting"
-        if b.listening:
-          what = (if tls: "listening on TLS -- ready" else:
-                  "listening, waiting for it to answer")
-        elif b.modsTotalKnown:
-          what = "loading mods, " & $b.modsLoaded & " of " & $b.modsTotal
-        elif b.dbLoaded: what = "database read, reading the load order"
-        line "  " & secsText(waited) & " -- " & what
+        var kind = MarkActive
+        line "  " & secsText(waited) & " -- " & progressText(s, kind)
         flushOut()
 
     if answered or died or probeBroken:
@@ -661,9 +860,10 @@ proc waitForBackend(root: string; port: int; tls: bool; backendProc: uint64;
   if painting:
     # One last paint so the finished state is what is left in the scrollback,
     # then let ordinary output carry on underneath it.
-    discard tail.pump()
-    let b = scanBoot(tail)
-    panel.paint bootRows(b, answered, cNowMs() - began, port, tls, tail, w, logRows)
+    pumpBoth(logs)
+    s.boot = scanBoot(logs.server)
+    s.answered = answered
+    discard paintPhase(panel, logs, s, cNowMs() - began)
     panel.settle()
 
 # ---------------------------------------------------------------------------
@@ -839,94 +1039,52 @@ proc pickProfile(o: Options; port: int; root: string;
         return true
     err "that is not one of the choices"
 
-# ---------------------------------------------------------------------------
-# The client view
-# ---------------------------------------------------------------------------
-
-proc clientRows(h: HostState; alive: bool; elapsed: int64; pid: int;
-                t: Tail; width, logRows: int): seq[Row] =
-  result = @[]
-  var head = newRow()
-  head.put "  "
-  head.putIn ColWhite, "starting the client"
-  head.padTo width - 10
-  head.putIn ColDim, secsText(elapsed)
-  result.add head
-  result.add newRow()
-  result.add stepRow(MarkDone, "process", "pid " & $pid & ", host injected",
-                     width)
-  result.add stepRow((if not alive: MarkFailed
-                      elif h.wroteAnything: MarkDone else: MarkActive),
-                     "host log",
-                     (if not alive: "the client exited"
-                      elif h.wroteAnything: $t.lines.len & " lines"
-                      else: "waiting for the first line"), width)
-  result.add stepRow((if h.runtimeUp: MarkDone
-                      elif h.wroteAnything: MarkActive else: MarkPending),
-                     "IL2CPP runtime",
-                     (if h.runtimeUp: "up" else:
-                        "the game brings this up on its own; a cold launch " &
-                        "takes a while"), width)
-  result.add stepRow((if h.running: MarkDone
-                      elif h.runtimeUp: MarkActive else: MarkPending),
-                     "host",
-                     (if h.running: $h.modsLoaded & " client mod(s) loaded"
-                      else: ""), width)
-  if h.errors > 0:
-    result.add stepRow(MarkFailed, $h.errors & " error(s)", h.lastError, width)
-  if logRows > 0:
-    result.add newRow()
-    var sep = newRow()
-    sep.put "  "
-    sep.putIn ColDim, rule(width - 4)
-    result.add sep
-    var first = t.lines.len - logRows
-    if first < 0: first = 0
-    for i in first ..< t.lines.len:
-      result.add logRow(t.lines[i], width)
-    var pad = logRows - (t.lines.len - first)
-    while pad > 0:
-      result.add newRow()
-      dec pad
-
-proc watchClient(launch: LaunchPtr; hostLog: string; limitMs: int64;
-                 exited: var bool) =
+proc watchClient(launch: LaunchPtr; logs: var Logs; who: string;
+                 limitMs: int64; exited: var bool) =
   ## Until the host says it is running, or the client dies, or the time is up.
-  ## Whichever happens, the last thing painted is what actually happened.
+  ## Whichever happens, the last thing painted is what actually happened -- and
+  ## the server pane is right there beside it, because "the client is stuck" and
+  ## "the server threw on the request the client just made" look identical from
+  ## the client's own log alone.
   exited = false
-  var tail = newTail(hostLog)
+  var s = newScreen()
+  s.phase = phClient
+  s.who = who
+  s.pid = int(cLaunchPid(launch))
+  s.srvText = "server up"
+  s.srvCol = ColGreen
   let began = cNowMs()
   var panel = newPanel()
-  var w = 0
-  var h = 0
-  termSize(w, h)
-  if w <= 0: w = 100
-  if w > 120: w = 120
-  var logRows = 6
-  if not fitsInWindow(8 + logRows + 2): logRows = 0
-  let painting = fitsInWindow(10) and termMode() == tmFull
+  var painting = termMode() == tmFull
+  var saidDegraded = false
   var lastNote = 0'i64
-  let pid = int(cLaunchPid(launch))
 
   while true:
     let waited = cNowMs() - began
-    discard tail.pump()
-    let st = scanHost(tail)
+    pumpBoth(logs)
+    s.host = scanHost(logs.client)
     let alive = cLaunchAlive(launch) != 0'i32
+    s.alive = alive
+    s.cliText = (if alive: "client up" else: "client exited")
+    s.cliCol = (if alive: ColGreen else: ColRed)
     if not alive: exited = true
     if painting:
-      panel.paint clientRows(st, alive, waited, pid, tail, w, logRows)
-    elif waited - lastNote >= 5000'i64:
-      lastNote = waited
-      var what = "waiting for the host's first log line"
-      if st.running: what = "host running"
-      elif st.runtimeUp: what = "IL2CPP up, host binding"
-      elif st.wroteAnything: what = "host started, waiting for the runtime"
-      line "  " & secsText(waited) & " -- " & what
-      flushOut()
-    if st.running or exited or waited >= limitMs:
+      if not paintPhase(panel, logs, s, waited):
+        painting = false
+        if not saidDegraded:
+          saidDegraded = true
+          warn "this window cannot hold the launch view and both log panes " &
+               "at once; reporting progress as plain lines instead"
+          flushOut()
+    if not painting:
+      if waited - lastNote >= 5000'i64:
+        lastNote = waited
+        var kind = MarkActive
+        line "  " & secsText(waited) & " -- " & progressText(s, kind)
+        flushOut()
+    if s.host.running or exited or waited >= limitMs:
       if painting:
-        panel.paint clientRows(st, alive, waited, pid, tail, w, logRows)
+        discard paintPhase(panel, logs, s, waited)
         panel.settle()
       return
     if interrupted():
@@ -1094,71 +1252,7 @@ proc wdCurrentHandle(backendProc: uint64): uint64 =
 # window, and another gives it back. That is the benefit of a dedicated window
 # without any of the four costs above.
 
-proc borderCell(title: string; n: int; focused: bool): Row =
-  ## Exactly `n` columns of horizontal rule with a title sunk into it. Exactly,
-  ## because it is one segment of a border that has to meet the next one.
-  result = newRow()
-  let h = bxH()
-  result.putIn ColDim, h
-  if n > 3:
-    result.putIn (if focused: ColWhite else: ColDim), fit(" " & title & " ", n - 2)
-  while result.width < n:
-    result.putIn ColDim, h
-
-proc drawPane(t: Tail; scroll, rows, width: int; into: var seq[Row]) =
-  ## `rows` lines of `t`, ending `scroll` lines from the newest. Padded to
-  ## exactly `rows` so that the caller's loop does not have to know how many
-  ## lines there were -- an empty pane is an empty pane, not a short frame.
-  into = @[]
-  let n = t.lines.len
-  var last = n - scroll
-  if last > n: last = n
-  if last < 0: last = 0
-  var first = last - rows
-  if first < 0: first = 0
-  for i in first ..< last:
-    var r = newRow()
-    let l = t.lines[i]
-    if l.stamp.len > 0:
-      r.putIn ColDim, fit(l.stamp, 8)
-      r.padTo 9
-    let nm = levelName(l.level)
-    if nm.len > 0:
-      r.putIn levelOf(l.level), nm
-    r.padTo (if l.stamp.len > 0: 15 else: 6)
-    let room = width - r.width
-    if room > 2:
-      r.putIn (if l.level == lvError: ColRed
-               elif l.level == lvWarn: ColYellow
-               else: ColDefault), fit(l.text, room)
-    into.add r
-  while into.len < rows:
-    into.add newRow()
-
-proc padded(s: string; n: int): string =
-  result = s
-  while result.len < n: result.add ' '
-
-proc streamText(tag: string; l: LogLine): string =
-  ## `server  [985ms] warn   the message`.
-  ##
-  ## The level is written out rather than being carried by the colour alone.
-  ## This is the form that ends up in a redirected file, where there is no
-  ## colour -- and a warning that reads exactly like an ordinary line is a
-  ## warning nobody will find in three hundred lines of boot log. Built by
-  ## padding a plain string rather than through `Row`, because `Row` may hold
-  ## escapes and this line must be able to promise it holds none.
-  result = padded(tag, 8)
-  if l.stamp.len > 0:
-    result = padded(result & "[" & l.stamp & "]", 8 + 11)
-  else:
-    result = padded(result, 8 + 11)
-  let nm = levelName(l.level)
-  if nm.len > 0: result.add nm
-  result = padded(result, 8 + 11 + 6)
-  result.add l.text
-
-proc streamLogs(server, client: var Tail; backendProc: uint64;
+proc streamLogs(logs: var Logs; backendProc: uint64;
                 launch: LaunchPtr; keys, owned: bool) =
   ## The view for a console that cannot be painted, and for output that is not
   ## a console at all. Same two logs, one line each as they arrive, tagged with
@@ -1173,14 +1267,19 @@ proc streamLogs(server, client: var Tail; backendProc: uint64;
   var seenServer = 0
   var seenClient = 0
   while true:
-    discard server.pump()
-    discard client.pump()
-    while seenServer < server.lines.len:
-      let l = server.lines[seenServer]
+    pumpBoth(logs)
+    # Both tails may have been read for minutes already by the boot and client
+    # phases -- they are the SAME tails. Starting from zero here is what makes
+    # the handover seamless rather than a replay: the counters begin at whatever
+    # has not been printed to this stream yet.
+    if seenServer > logs.server.lines.len: seenServer = 0
+    if seenClient > logs.client.lines.len: seenClient = 0
+    while seenServer < logs.server.lines.len:
+      let l = logs.server.lines[seenServer]
       inc seenServer
       sayColoured levelOf(l.level), streamText("server", l)
-    while seenClient < client.lines.len:
-      let l = client.lines[seenClient]
+    while seenClient < logs.client.lines.len:
+      let l = logs.client.lines[seenClient]
       inc seenClient
       sayColoured levelOf(l.level), streamText("client", l)
     if interrupted():
@@ -1203,23 +1302,32 @@ proc streamLogs(server, client: var Tail; backendProc: uint64;
         return
     sleepMs 250
 
-proc runLogView(root: string; who: string; backendProc: uint64;
-                launch: LaunchPtr; owned: bool; detached: var bool) =
-  ## Two panes, live, until `q` or `d` or Ctrl+C, or until both processes are
-  ## gone. `detached` says which: on `d` the backend is left running.
+proc runLogView(who: string; backendProc: uint64; launch: LaunchPtr;
+                owned: bool; logs: var Logs;
+                summaryKind: int; summaryText: string; detached: var bool) =
+  ## The same one screen the boot and client phases painted, now full screen and
+  ## with the keys live: the launch collapsed to its one summary line at the
+  ## top, both panes underneath. Runs until `q` or `d` or Ctrl+C, or until both
+  ## processes are gone. `detached` says which: on `d` the backend is left
+  ## running.
   detached = false
-  var server = newTail(joinPath(root, "aowlspt\\aowlspt-backend.log"))
-  var client = newTail(joinPath(root, "aowlspt\\aowlspt-host.log"))
 
   var w = 0
   var h = 0
   termSize(w, h)
-  if termMode() != tmFull or not stdinIsConsole() or w < 40 or h < 12:
+  if termMode() != tmFull or not stdinIsConsole() or
+     w < MinCols + 1 or h < MinRows:
     if termMode() == tmFull and stdinIsConsole():
       warn "the window is " & $w & "x" & $h & ", which is too small for the " &
            "split view; falling back to one line per entry"
-    streamLogs(server, client, backendProc, launch, stdinIsConsole(), owned)
+    streamLogs(logs, backendProc, launch, stdinIsConsole(), owned)
     return
+
+  var s = newScreen()
+  s.phase = phRun
+  s.who = who
+  s.summaryKind = summaryKind
+  s.summaryText = summaryText
 
   var focus = 0        ## 0 server, 1 client
   var solo = false
@@ -1227,6 +1335,7 @@ proc runLogView(root: string; who: string; backendProc: uint64;
   var confirmQuit = false
   var scrollServer = 0
   var scrollClient = 0
+  var bodyH = 3
   enterFullScreen()
   rawMode true
   drainKeys()
@@ -1242,129 +1351,30 @@ proc runLogView(root: string; who: string; backendProc: uint64;
     # on the carriage return that follows, and some wrap first and scroll the
     # whole frame by a line every frame. Giving up one column costs nothing and
     # makes the frame the same everywhere.
-    w = w - 1
-    discard server.pump()
-    discard client.pump()
+    let dw = w - 1
+    pumpBoth(logs)
     if not paused:
       scrollServer = 0
       scrollClient = 0
-
-    let bodyH = h - 5
-    if bodyH < 3 or w < 40:
-      # Resized under us into something that cannot hold the view. Leave
-      # cleanly rather than draw a broken frame.
-      rawMode false
-      leaveFullScreen()
-      warn "the window became too small for the split view"
-      streamLogs(server, client, backendProc, launch, true, owned)
-      return
 
     let clientAlive = launch != nil and cLaunchAlive(launch) != 0'i32
     # Through the watchdog when owned: this poll is what restarts a dead backend.
     let backendAlive = wdBackendAlive(backendProc, owned, clientAlive)
 
-    var f = newFrame(w, h)
-
-    # Header
-    var head = newRow()
-    head.put " "
-    head.putIn ColWhite, "aowlspt"
-    head.put "  "
-    head.putIn ColDim, bxV()
-    head.put " "
-    head.putIn (if who.len > 0: ColCyan else: ColDim),
-               (if who.len > 0: who elif owned: "no profile" else: "attached")
-    head.put " "
-    head.putIn ColDim, bxV()
-    head.put " "
-    var srvCol = ColGreen
-    var srvText = "server up"
     if gWd.givenUp:
-      srvCol = ColRed
-      srvText = "SERVER DOWN"
+      s.srvCol = ColRed
+      s.srvText = "SERVER DOWN"
     elif not backendAlive:
-      srvCol = ColRed
-      srvText = "server down"
+      s.srvCol = ColRed
+      s.srvText = "server down"
     elif gWd.active and gWd.restarts > 0:
-      srvCol = ColYellow
-      srvText = "server up (restarted x" & $gWd.restarts & ")"
-    head.putIn srvCol, srvText
-    head.put " "
-    head.putIn ColDim, bxV()
-    head.put " "
-    head.putIn (if clientAlive: ColGreen else: ColRed),
-               (if clientAlive: "client up" else: "client exited")
-    head.padTo w - 10
-    head.putIn ColDim, secsText(cNowMs() - began)
-    f.addRow head
-
-    # Panes.
-    #
-    # The arithmetic is written out rather than fudged with `padTo`, because a
-    # frame whose columns are one out looks like a rendering bug and is
-    # actually an off-by-one that will drift with the window width. Split:
-    #   1 + (leftW+2) + 1 + (rightW+2) + 1 == w
-    # Solo:
-    #   1 + (soloW+2) + 1 == w
-    var leftW = 0
-    var rightW = 0
-    if solo:
-      leftW = w - 4
+      s.srvCol = ColYellow
+      s.srvText = "server up (restarted x" & $gWd.restarts & ")"
     else:
-      leftW = (w - 7) div 2
-      rightW = (w - 7) - leftW
-
-    let serverTitle = "server  " & $server.lines.len & " lines" &
-                      (if scrollServer > 0: "  back " & $scrollServer else: "")
-    let clientTitle = "client  " & $client.lines.len & " lines" &
-                      (if scrollClient > 0: "  back " & $scrollClient else: "")
-
-    var top = newRow()
-    top.putIn ColDim, bxTL()
-    if solo:
-      top.putRow borderCell((if focus == 0: serverTitle else: clientTitle),
-                            leftW + 2, true)
-    else:
-      top.putRow borderCell(serverTitle, leftW + 2, focus == 0)
-      top.putIn ColDim, bxTD()
-      top.putRow borderCell(clientTitle, rightW + 2, focus == 1)
-    top.putIn ColDim, bxTR()
-    f.addRow top
-
-    var leftRows: seq[Row] = @[]
-    var rightRows: seq[Row] = @[]
-    if solo:
-      if focus == 0: drawPane(server, scrollServer, bodyH, leftW, leftRows)
-      else: drawPane(client, scrollClient, bodyH, leftW, leftRows)
-    else:
-      drawPane(server, scrollServer, bodyH, leftW, leftRows)
-      drawPane(client, scrollClient, bodyH, rightW, rightRows)
-
-    for i in 0 ..< bodyH:
-      var r = newRow()
-      r.putIn ColDim, bxV()
-      r.put " "
-      r.putRow leftRows[i]
-      r.padTo 2 + leftW
-      if not solo:
-        r.put " "
-        r.putIn ColDim, bxV()
-        r.put " "
-        r.putRow rightRows[i]
-      r.padTo w - 1
-      r.putIn ColDim, bxV()
-      f.addRow r
-
-    var bottom = newRow()
-    bottom.putIn ColDim, bxBL()
-    if solo:
-      bottom.putIn ColDim, rule(leftW + 2)
-    else:
-      bottom.putIn ColDim, rule(leftW + 2)
-      bottom.putIn ColDim, bxTU()
-      bottom.putIn ColDim, rule(rightW + 2)
-    bottom.putIn ColDim, bxBR()
-    f.addRow bottom
+      s.srvCol = ColGreen
+      s.srvText = "server up"
+    s.cliCol = (if clientAlive: ColGreen else: ColRed)
+    s.cliText = (if clientAlive: "client up" else: "client exited")
 
     var help = newRow()
     help.put " "
@@ -1372,22 +1382,46 @@ proc runLogView(root: string; who: string; backendProc: uint64;
       # The hard, user-facing error. The backend is gone for good and the game
       # cannot reach its server; say so loudly and say what to do, rather than
       # leave the player staring at a frozen game.
-      help.putIn ColRed,
+      help.putIn ColRed, fit(
         "BACKEND DOWN -- the game cannot reach its server on 127.0.0.1:" &
         $gWd.port & " and auto-restart gave up. See the server pane / " &
-        "aowlspt-backend.log. Press q to quit and relaunch."
+        "aowlspt-backend.log. Press q to quit and relaunch.", dw - 2)
     elif confirmQuit:
-      help.putIn ColYellow,
+      help.putIn ColYellow, fit(
         "the game is still running and will lose its server -- q again to " &
-        "stop it anyway, d to leave everything running, any other key to stay"
+        "stop it anyway, d to leave everything running, any other key to stay",
+        dw - 2)
     else:
-      help.putIn ColDim, "q quit   d detach   tab swap   f full   space " &
-                         (if paused: "follow" else: "pause") &
-                         "   pgup/pgdn scroll"
-      if paused:
+      # `fit` rather than a bare string: at 40 columns the full reminder is
+      # nearly twice the width of the window, and a status line that wraps
+      # scrolls the whole frame by a row every frame.
+      help.putIn ColDim, fit("q quit   d detach   tab swap   f full   space " &
+                             (if paused: "follow" else: "pause") &
+                             "   pgup/pgdn scroll", dw - 2)
+      if paused and help.width + 9 < dw:
         help.put "   "
         help.putIn ColYellow, "paused"
-    f.addRow help
+
+    var srv = ""
+    var cli = ""
+    paneTitles(logs, scrollServer, scrollClient, srv, cli)
+    let lay = unifiedRows(dw, h, screenHeader(s, dw, cNowMs() - began),
+                          screenSteps(s, dw), screenSummary(s, dw),
+                          logs.server, logs.client, srv, cli,
+                          focus, scrollServer, scrollClient, solo, help)
+    if not lay.renderable:
+      # Resized under us into something that cannot hold the view. Leave
+      # cleanly rather than draw a broken frame, and say which it was.
+      rawMode false
+      leaveFullScreen()
+      warn lay.note
+      streamLogs(logs, backendProc, launch, true, owned)
+      return
+    bodyH = lay.bodyH
+
+    var f = newFrame(w, h)
+    for r in lay.rows:
+      f.addRow r
     endFrame(f)
 
     # Keys
@@ -1434,8 +1468,8 @@ proc runLogView(root: string; who: string; backendProc: uint64;
         confirmQuit = false
       elif k == KeyHome:
         paused = true
-        if focus == 0: scrollServer = server.lines.len
-        else: scrollClient = client.lines.len
+        if focus == 0: scrollServer = logs.server.lines.len
+        else: scrollClient = logs.client.lines.len
       elif k == KeyEnd:
         paused = false
         scrollServer = 0
@@ -1444,8 +1478,8 @@ proc runLogView(root: string; who: string; backendProc: uint64;
         confirmQuit = false
     if acted:
       # Clamp after the fact rather than in every branch above.
-      if scrollServer > server.lines.len: scrollServer = server.lines.len
-      if scrollClient > client.lines.len: scrollClient = client.lines.len
+      if scrollServer > logs.server.lines.len: scrollServer = logs.server.lines.len
+      if scrollClient > logs.client.lines.len: scrollClient = logs.client.lines.len
 
     if interrupted():
       clearInterrupt()
@@ -1529,6 +1563,13 @@ proc main(): int =
       root = here
   root = absolutePathOf(root)
 
+  # The two logs are opened ONCE, here, and every phase below shares them: the
+  # backend wait, the client wait and the live view. Opening them per phase was
+  # what made the launch view single-source -- the boot view had only the
+  # backend's log in hand and so could not show the client's, which is the whole
+  # reason there used to be two screens.
+  var logs = newLogs(root)
+
   let exePath = joinPath(root, o.exeName)
   let hostDll = joinPath(root, "aowlspt\\aowlspt-host-il2cpp.dll")
 
@@ -1539,7 +1580,11 @@ proc main(): int =
     # when a session is already going wrong, and refusing to show them the logs
     # because the install looks odd would withhold the one thing that says why.
     var detachedOnly = false
-    runLogView(root, "", 0'u64, nil, false, detachedOnly)
+    # Attached, not launched: the progress line says exactly that rather than
+    # claiming a launch this process did not perform.
+    logs.clientStarted = true
+    runLogView("", 0'u64, nil, false, logs, MarkPending,
+               "attached to a session this launcher did not start", detachedOnly)
     termRestore()
     return 0
 
@@ -1818,8 +1863,7 @@ proc main(): int =
         var died = false
         var answered = false
         var probeBroken = false
-        waitForBackend(root, port, https, backendProc, o.backendWait,
-                       joinPath(root, "aowlspt\\aowlspt-backend.log"),
+        waitForBackend(port, https, backendProc, o.backendWait, logs,
                        died, answered, probeBroken)
         if died:
           err "the backend exited while starting; see " &
@@ -2026,6 +2070,11 @@ proc main(): int =
     if backendProc != 0'u64: cSpawnKill(backendProc)
     return 1
   ok "host injected"
+  # From here the client pane is this run's log: the injected host truncates the
+  # file as it opens it, and `Tail.pump` clears its lines when it sees the
+  # reset. Before this point the pane holds the PREVIOUS session and its title
+  # says so.
+  logs.clientStarted = true
 
   if cLaunchResume(launch) == 0'i32:
     err "could not resume the client (error " & $int(cLaunchError(launch)) & ")"
@@ -2042,7 +2091,7 @@ proc main(): int =
   # Bounded, and the bound is not a deadline for the game -- it is how long
   # this view waits before handing over to the log view, which shows the same
   # thing with more room. A cold IL2CPP launch is minutes.
-  watchClient(launch, hostLog, 90000'i64, clientExited)
+  watchClient(launch, logs, "", 90000'i64, clientExited)
 
   # UNCONDITIONAL, before any gate. A verdict that never appears could mean
   # "the walk failed" or "this routine was never entered" -- and those look
@@ -2263,7 +2312,23 @@ proc main(): int =
         line "  backend stopped"
   else:
     var detached = false
-    runLogView(root, who, backendProc, launch, true, detached)
+    # The launch, collapsed to the one line the unified screen keeps at the top
+    # while the panes take the rest. Read back out of the host's own log rather
+    # than remembered from the phase that painted it, so it states what is true
+    # now and not what was true when that phase returned.
+    let endHost = scanHost(logs.client)
+    var sumKind = MarkDone
+    var sumText = "server on 127.0.0.1:" & $port
+    if clientExited:
+      sumKind = MarkFailed
+      sumText = "the client exited while starting -- see the client pane"
+    elif endHost.running:
+      sumText = "host running, " & $endHost.modsLoaded &
+                " client mod(s) loaded; server on 127.0.0.1:" & $port
+    else:
+      sumKind = MarkActive
+      sumText = "client started; the host has not reported running yet"
+    runLogView(who, backendProc, launch, true, logs, sumKind, sumText, detached)
     if detached:
       line ""
       ok "detached: the game and the backend are still running"
