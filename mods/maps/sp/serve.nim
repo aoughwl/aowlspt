@@ -290,6 +290,13 @@ proc snapshotJson*(s: Snapshot; stateText, defect: string; faults: int;
                    else: "self-disabled"))
   put(o, "stateText", stateText)
   put(o, "inRaid", s.inRaid)
+  # The raid's map KEY (GameWorld.LocationId), so the browser view can select
+  # the calibrated map by name via index.json's internalNames instead of the
+  # bounds guess that put Lighthouse art on Woods (bug 2). Empty when unread.
+  put(o, "locationId", s.locationId)
+  # Spawned-and-in-world THIS collection: the browser can distinguish an active
+  # raid from a stale borrowed cache (bug 1) exactly as the in-game HUD does.
+  put(o, "localAlive", s.localAlive)
   put(o, "ok", s.ok)
   put(o, "seq", int(s.seq))
   put(o, "faults", faults)

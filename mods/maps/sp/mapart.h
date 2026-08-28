@@ -105,6 +105,9 @@ typedef struct {
 #define MA_REFUSE_NOPOS      4   /* no validated player position               */
 #define MA_REFUSE_NOTEX      5   /* no tile of the chosen layer is resident    */
 #define MA_REFUSE_OFFPANE    6   /* the layer is real but entirely off-pane    */
+#define MA_REFUSE_NORAID     7   /* not an active, spawned, in-world raid       */
+#define MA_REFUSE_MAPKEY     8   /* raid map key had no calibration entry       */
+#define MA_REFUSE_MISMATCH   9   /* resolved map's bounds do not contain player */
 
 static const char* ma_refusal_text(int32_t r)
 {
@@ -120,6 +123,13 @@ static const char* ma_refusal_text(int32_t r)
                                      "in the region texture cache";
     case MA_REFUSE_OFFPANE:   return "the chosen layer lies entirely outside "
                                      "the visible pane";
+    case MA_REFUSE_NORAID:    return "not in a raid, HUD idle";
+    case MA_REFUSE_MAPKEY:    return "the raid's map key has no calibration "
+                                     "entry -- refusing rather than guessing a "
+                                     "map by bounds";
+    case MA_REFUSE_MISMATCH:  return "the map resolved from the raid's key does "
+                                     "NOT contain the player position -- a "
+                                     "calibration/coordinate mismatch, refused";
     default:                  return "unknown";
     }
 }

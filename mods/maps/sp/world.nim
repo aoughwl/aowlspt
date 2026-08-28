@@ -397,6 +397,34 @@ static int32_t sp_rd_idtail(void* s, int32_t lenOff, int32_t chOff, char* out) {
   out[take] = 0;
   return take;
 }
+
+/* A System.String's HEAD, narrowed to ASCII, into `out` (>= cap bytes). Used
+ * for EFT.GameWorld.LocationId -- the raid's map key ("Woods", "bigmap",
+ * "factory4_day") -- which is a short identifier, not a MongoID tail, so the
+ * head is what matters and the whole thing must fit. Every read is
+ * VirtualQuery-guarded, the length is bounds-checked, and iteration is capped
+ * at `cap-1` whatever the length field claims. A wrong offset yields visible
+ * junk or an empty string, never a smuggled pointer. */
+static int32_t sp_rd_str(void* s, int32_t lenOff, int32_t chOff,
+                         char* out, int32_t cap) {
+  int32_t n, take, i;
+  if (!out || cap <= 0) return 0;
+  out[0] = 0;
+  if (!s) return 0;
+  if (!aowl_is_readable((unsigned char*)s + lenOff, 4)) return 0;
+  memcpy(&n, (unsigned char*)s + lenOff, 4);
+  if (n <= 0 || n > 4096) return 0;
+  take = n > (cap - 1) ? (cap - 1) : n;
+  for (i = 0; i < take; i++) {
+    unsigned short c = 0;
+    unsigned char* a = (unsigned char*)s + chOff + i * 2;
+    if (!aowl_is_readable(a, 2)) { out[i] = 0; return i; }
+    memcpy(&c, a, 2);
+    out[i] = (c >= 32 && c < 127) ? (char)c : '?';
+  }
+  out[take] = 0;
+  return take;
+}
 """.}
 
 proc spPV(f: Il2CppPtr): Il2CppPtr {.importc: "sp_p_v", nodecl.}
@@ -424,6 +452,8 @@ const
   SpPosNoCall*     = 13
 proc cRdIdTail(s: pointer; lenOff, chOff: int32; outBuf: cstring): int32 {.
   importc: "sp_rd_idtail", nodecl.}
+proc cRdStr(s: pointer; lenOff, chOff: int32; outBuf: cstring; cap: int32): int32 {.
+  importc: "sp_rd_str", nodecl.}
 proc cGetPosArm(base: pointer): int32 {.importc: "sp_getpos_arm", nodecl.}
 proc cGetPosArmed(): int32 {.importc: "sp_getpos_armed", nodecl.}
 proc cPosLive(player: pointer; out3: ptr cfloat): int32 {.
@@ -465,6 +495,13 @@ const
   GwAllAlive   = 0x1C8
   GwRegistered = 0x1D0
   GwMainPlayer = 0x230
+  GwLocationId = 0xE8   ## EFT.GameWorld.<LocationId>k__BackingField (string).
+                        ## Resolved 2026-08-28 by `python tools/fldoff.py
+                        ## fields EFT.GameWorld`, corroborated in the same dump
+                        ## by the three offsets above matching this file's
+                        ## constants exactly. This is the raid's map KEY
+                        ## ("Woods", "bigmap", "factory4_day"), used to pick the
+                        ## calibrated map by name instead of by a bounds guess.
   PlMoveCtx    = 0x60
   PlProfile    = 0x9C0
   PlAIData     = 0xA00
@@ -550,7 +587,15 @@ proc gwStateText*(): string =
 type
   Snapshot* = object
     ok*: bool            ## a world was live AND at least the local player read
-    inRaid*: bool
+    inRaid*: bool        ## GameWorld was live (borrowed cache) -- NOT proof of
+                         ## an active, spawned raid; see `localAlive`/`activeRaid`
+    localAlive*: bool    ## the local player pointer was found in the LIVE
+                         ## AllAlivePlayersList this collection -- i.e. spawned
+                         ## and in-world. False in the menu, on the deploy screen
+                         ## before spawn, and after extract/death, even while the
+                         ## borrowed GameWorld cache still answers non-null.
+    locationId*: string  ## GameWorld.LocationId -- the raid's map KEY, or "" when
+                         ## unreadable/absent. Never dereferenced downstream.
     n*: int
     ents*: array[MaxEntities, Ent]
     localIdx*: int       ## index into ents of the local player, or -1
@@ -956,6 +1001,8 @@ proc collectInner(snap: var Snapshot) =
   ## only built for entities that already validated.
   snap.ok = false
   snap.inRaid = false
+  snap.localAlive = false
+  snap.locationId = ""
   snap.n = 0
   snap.localIdx = -1
   snap.hasHeading = false
@@ -984,6 +1031,24 @@ proc collectInner(snap: var Snapshot) =
     snap.state = 2
     return
   snap.inRaid = true
+
+  # The raid's map key, read from the live world. Guarded, capped, narrowed to
+  # ASCII. A stale borrowed cache may still answer here, so this is used to
+  # SELECT the map (bug: Woods was drawing Lighthouse art via a bounds guess),
+  # NOT as the active-raid gate -- that is `localAlive` below.
+  block:
+    let loc = rdPtr(world, GwLocationId)
+    if loc != nil:
+      var lbuf = "                                "   # 32 bytes
+      let ln = cRdStr(loc, int32(StrLenOff), int32(StrCharOff),
+                      toCString(lbuf), int32(lbuf.len))
+      if ln > 0:
+        var s = ""
+        var k = 0
+        while k < int(ln) and k < lbuf.len:
+          s.add lbuf[k]
+          inc k
+        snap.locationId = s
 
   var localPtr = 0'u64
   let me = rdPtr(world, GwMainPlayer)
@@ -1035,7 +1100,12 @@ proc collectInner(snap: var Snapshot) =
     let p = rdPtr(items, ArrDataOff + i * 8)
     inc i
     if p == nil: continue
-    if cast[uint64](p) == localPtr: continue     # already emitted as ents[0]
+    if cast[uint64](p) == localPtr:
+      # The local player is present in the LIVE alive-players list: this is the
+      # game's own "spawned and in-world" set, and its membership is the
+      # active-raid signal (bug 1). Already emitted as ents[0], so just record it.
+      if localPtr != 0'u64: snap.localAlive = true
+      continue
     var pok = false
     var px = 0.0
     var py = 0.0
@@ -1058,3 +1128,28 @@ proc collect*(snap: var Snapshot) =
   ## cannot fail (CLAUDE.md 9b).
   collectInner(snap)
   posAdd(gPosEver, gPosNow)
+
+proc activeRaid*(snap: Snapshot): bool =
+  ## THE lifecycle gate (bug 1). Three signals must ALL hold, and each can
+  ## independently be false, so this is not a check that cannot fail:
+  ##   * state == 3      -- the host has a live GameWorld (not menu state 2)
+  ##   * ok              -- a real local pose validated this collection
+  ##   * localAlive      -- the local player is in the LIVE alive-players list,
+  ##                        i.e. spawned and in-world THIS frame
+  ## The borrowed RegisterPlayer cache can make the first two true in the menu,
+  ## during loading before spawn, and after extract (fact #141). `localAlive` is
+  ## the one that goes false the instant the player is not a spawned participant,
+  ## which is exactly when the HUD must idle.
+  snap.state == 3 and snap.ok and snap.localAlive
+
+proc activeRaidWhy*(snap: Snapshot): string =
+  ## Why the gate is closed, for the diag. Never "I could not look" == "no raid".
+  if snap.state != 3:
+    return "world not live (state " & $snap.state & "): " & gwStateText()
+  if not snap.ok:
+    return "world live but no local pose validated this collection -- see positions"
+  if not snap.localAlive:
+    return "world live and a pose read, but the local player is NOT in the live " &
+           "AllAlivePlayersList -- menu, deploy-before-spawn, or post-extract, " &
+           "not an active raid"
+  "active raid"

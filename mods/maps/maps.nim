@@ -341,8 +341,49 @@ proc artSlurp(path: string; into: var string): bool =
   into = got
   result = true
 
-proc artTick(px, pz: float) =
-  ## Unity's thread. Binds the map the player is on and feeds at most one tile.
+# The raid's map KEY (GameWorld.LocationId, e.g. "Woods", "bigmap",
+# "factory4_day") -> the calibration FOLDER id under data/maps. This mirrors
+# the `internalNames` arrays in data/maps/index.json EXACTLY; a divergence does
+# not silently draw the wrong map, because the C binder REFUSES an id absent
+# from the tile manifest (MA_REFUSE_MAPKEY) and REFUSES a map whose bounds do
+# not contain the player (MA_REFUSE_MISMATCH). Both surface in the diag's `art`
+# line. Verified against index.json on 2026-08-28. If a map is ADDED, add its
+# internalNames here.
+const MapKeyTable: array[13, (string, string)] = [
+  ("bigmap",         "Customs_TarkovDev"),
+  ("factory4_day",   "Factory_TarkovDev"),
+  ("factory4_night", "Factory_TarkovDev"),
+  ("sandbox",        "GroundZero_TarkovDev"),
+  ("sandbox_high",   "GroundZero_TarkovDev"),
+  ("interchange",    "Interchange_TarkovDev"),
+  ("laboratory",     "Labs_TarkovDev"),
+  ("labyrinth",      "Labyrinth"),
+  ("lighthouse",     "Lighthouse_TarkovData"),
+  ("rezervbase",     "Reserve_TarkovData"),
+  ("shoreline",      "Shoreline_TarkovData"),
+  ("tarkovstreets",  "Streets_TarkovData"),
+  ("woods",          "Woods_TarkovData")]
+
+proc lowerAscii(s: string): string =
+  result = ""
+  for c in s:
+    if c >= 'A' and c <= 'Z': result.add chr(ord(c) + 32)
+    else: result.add c
+
+proc resolveMapId*(locKey: string): string =
+  ## The raid map key -> calibration folder id, case-insensitively. "" when the
+  ## key is empty or has no calibration (the caller then refuses rather than
+  ## falling back to a bounds guess). Exposed for the offline acceptance check.
+  if locKey.len == 0: return ""
+  let k = lowerAscii(locKey)
+  for pair in MapKeyTable:
+    if pair[0] == k: return pair[1]
+  return ""
+
+var gArtMapKey = ""   ## last raid key we tried to resolve, for the diag
+
+proc artTick(px, pz: float; locKey: string) =
+  ## Unity's thread. Binds the map named by the raid key and feeds one tile.
   if not gArtTried:
     gArtTried = true
     gArtRoot = artJoin(artJoin(modDir(), "data"), "maptiles")
@@ -353,7 +394,17 @@ proc artTick(px, pz: float) =
       return
   if gArtBin.len == 0: return
 
-  let n = artBindAt(gArtBin, px, pz)
+  gArtMapKey = locKey
+  let wantId = resolveMapId(locKey)
+  var n = 0
+  if wantId.len > 0:
+    # BY KEY (bug 2): the raid tells us the map, so bind it and guard it. No
+    # bounds guess, so Woods can no longer resolve to Lighthouse.
+    n = artBindId(gArtBin, wantId, px, pz)
+  else:
+    # No raid key (unreadable, or a map with no calibration). Fall back to the
+    # old smallest-area bounds heuristic, which is a labelled GUESS in the diag.
+    n = artBindAt(gArtBin, px, pz)
   if n <= 0: return
 
   var i = 0
@@ -396,8 +447,12 @@ proc onMainTick(payload: string): string =
   # The ART, on the same thread and after the mirror is filled. Gated on a
   # VALIDATED local position: binding a map from a position that failed
   # `mm_pos_classify` would pick a map by a number we already know is wrong.
-  if gHudOn and gSnap.ok and gSnap.localIdx >= 0 and gSnap.localIdx < gSnap.n:
-    artTick(gSnap.ents[gSnap.localIdx].x, gSnap.ents[gSnap.localIdx].z)
+  # Gated on an ACTIVE RAID (bug 1), not merely a validated pose: a stale
+  # borrowed GameWorld cache in the menu can validate a pose but is not a raid,
+  # and binding art there would upload tiles and paint an overlay off-raid.
+  if gHudOn and activeRaid(gSnap) and gSnap.localIdx >= 0 and gSnap.localIdx < gSnap.n:
+    artTick(gSnap.ents[gSnap.localIdx].x, gSnap.ents[gSnap.localIdx].z,
+            gSnap.locationId)
   unlockMod()
   result = ""
 
@@ -455,6 +510,15 @@ proc mapsDiagText(): string =
   let tried = posEverTried()
   let good  = posEverGood()
   let st    = gwState()
+
+  # The raid-lifecycle fields live in gSnap, which the Unity thread rewrites
+  # under lockMod; copy them here under the same lock so the diag thread never
+  # reads a torn string. `hudInRaid()` reads the C mirror and needs no lock.
+  lockMod()
+  let diagInRaid = hudInRaid()
+  let diagRaidWhy = activeRaidWhy(gSnap)
+  let diagLocKey = gSnap.locationId
+  unlockMod()
 
   # 1. the shared region: is anything dispatching us at all?
   var lRegion = ""
@@ -584,7 +648,9 @@ proc mapsDiagText(): string =
   # it names the map, the layer and WHY that layer, or it names the reason
   # there is no art. Three outcomes, and "I could not look" is not a pass.
   var lArt = ""
-  if not artLoaded():
+  if not diagInRaid:
+    lArt = "not in a raid, HUD idle -- " & diagRaidWhy
+  elif not artLoaded():
     lArt = "FAIL  " & (if gArtWhy.len > 0: gArtWhy
                        else: "the tile manifest has not been read yet")
   elif not artValid():
@@ -593,18 +659,25 @@ proc mapsDiagText(): string =
            "raid, so the pane draws the LABELLED GRID and no art. " &
            artRefusalText()
   elif artDrawn() > 0:
+    let byKey = resolveMapId(diagLocKey)
     lArt = "PASS  map=" & artMapId() &
            " layer level=" & $artLayerLevel() & " (" & artLayerWhy() & ")" &
            "  tiles " & $artDrawn() & " drawn / " & $artResident() &
            " resident / " & $artTiles() & " bound" &
            "  " & $artTilePx() & "px BC1" &
-           (if artCandidates() > 1:
-              "  [GUESS: " & $artCandidates() & " maps' bounds contain this " &
-              "position; the smallest was taken. The raid's location id is " &
-              "not available to this mod]"
+           (if byKey.len > 0:
+              "  [by raid key '" & diagLocKey & "' -> " & byKey & "]"
+            elif artCandidates() > 1:
+              "  [GUESS: raid key '" & diagLocKey & "' has no calibration; " &
+              $artCandidates() & " maps' bounds contain this position, smallest " &
+              "taken]"
             else: "")
   else:
-    lArt = "FAIL  map=" & artMapId() & " bound with " & $artTiles() &
+    let failId = resolveMapId(diagLocKey)
+    let failIdText = (if failId.len > 0: failId else: "NO CALIBRATION")
+    lArt = "FAIL  map=" & artMapId() &
+           " (raid key '" & diagLocKey & "' -> " & failIdText &
+           ") bound with " & $artTiles() &
            " tiles (" & $artResident() & " resident) but NOTHING was drawn: " &
            artRefusalText() &
            (if gArtWhy.len > 0: "  [" & gArtWhy & "]" else: "") &

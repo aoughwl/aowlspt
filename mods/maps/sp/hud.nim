@@ -121,6 +121,9 @@ static struct {
     int64_t  holdMs, fadeMs;
     float    px, py, pz;
     int32_t  hasLocal;
+    int32_t  inRaid;         /* active, spawned, in-world raid (bug 1 gate).
+                              * Set by the publisher from world.activeRaid().
+                              * When 0 the draw submits NOTHING. */
     float    heading;        /* radians; 0 = +Z. Only used if hasHeading. */
     int32_t  hasHeading;
     float    radiusM;
@@ -191,10 +194,11 @@ static void mhud_reset(void) {
 /* ---- the mirror, filled on Unity's thread before the draw ------------- */
 
 static void mhud_begin(float px, float py, float pz, int32_t hasLocal,
-                       float heading, int32_t hasHeading) {
+                       float heading, int32_t hasHeading, int32_t inRaid) {
     g_mhud.n = 0;
     g_mhud.px = px; g_mhud.py = py; g_mhud.pz = pz;
     g_mhud.hasLocal = hasLocal ? 1 : 0;
+    g_mhud.inRaid = inRaid ? 1 : 0;
     g_mhud.heading = heading;
     g_mhud.hasHeading = hasHeading ? 1 : 0;
     g_mhud.nowMs = mhud_now_ms();   /* diagnostic only; the draw re-reads it */
@@ -544,6 +548,55 @@ static int32_t mhud_art_bind_at(const uint8_t* bin, uint32_t n,
     return g_art.art.nTiles;
 }
 
+/* BIND BY MAP KEY (bug 2). The raid's map is now selected by the calibration
+ * folder id the caller resolved from GameWorld.LocationId via index.json's
+ * internalNames -- NOT by the smallest-area bounds guess, which put Lighthouse
+ * art on Woods because the two maps' world bounds overlap. `wantId` is a
+ * calibration folder id like "Woods_TarkovData".
+ *
+ * TWO independent guards, either of which refuses rather than drawing a wrong
+ * map:
+ *   * the id must actually be a map in the tile manifest (else MA_REFUSE_MAPKEY)
+ *   * that map's bounds must CONTAIN the player (else MA_REFUSE_MISMATCH) -- a
+ *     calibration/coordinate error that would slide every feature off.
+ * Returns tiles bound, 0 on any refusal (refusal code left in g_art.refusal).
+ * Re-binding the same map is the same no-op the bounds path had. */
+static int32_t mhud_art_bind_id(const uint8_t* bin, uint32_t n,
+                                const char* wantId, float wx, float wz)
+{
+    uint32_t nMaps, nLayers, nTiles, tilePx, tb, oM, oL, oT;
+    uint32_t m;
+    int32_t pick = -1;
+    if (!wantId || !wantId[0]) { g_art.refusal = MA_REFUSE_MAPKEY; return 0; }
+    if (!ma_bin_head(bin, n, &nMaps, &nLayers, &nTiles, &tilePx, &tb,
+                     &oM, &oL, &oT)) { g_art.loaded = 0; return 0; }
+    g_art.loaded = 1;
+    for (m = 0; m < nMaps; m++) {
+        const uint8_t* mr = bin + oM + m * MA_ART_MAPREC;
+        if (strncmp((const char*)mr, wantId, 31) == 0) { pick = (int32_t)m; break; }
+    }
+    if (pick < 0) { g_art.art.valid = 0; g_art.refusal = MA_REFUSE_MAPKEY; return 0; }
+    {
+        const uint8_t* mr = bin + oM + (uint32_t)pick * MA_ART_MAPREC;
+        float x0 = ma_f32(mr + 96 + 16), y0 = ma_f32(mr + 96 + 20);
+        float x1 = ma_f32(mr + 96 + 24), y1 = ma_f32(mr + 96 + 28);
+        float lo, hi;
+        g_art.candidates = 1;
+        lo = x0 < x1 ? x0 : x1; hi = x0 < x1 ? x1 : x0;
+        if (wx < lo || wx > hi) { g_art.art.valid = 0;
+                                  g_art.refusal = MA_REFUSE_MISMATCH; return 0; }
+        lo = y0 < y1 ? y0 : y1; hi = y0 < y1 ? y1 : y0;
+        if (wz < lo || wz > hi) { g_art.art.valid = 0;
+                                  g_art.refusal = MA_REFUSE_MISMATCH; return 0; }
+        /* Already bound to this exact map: keep the uploaded bytes. */
+        if (g_art.art.valid && strncmp(g_art.mapId, (const char*)mr, 31) == 0)
+            return g_art.art.nTiles;
+    }
+    memset(g_art.haveBytes, 0, sizeof(g_art.haveBytes));
+    if (!ma_bind_index(bin, n, pick)) { g_art.refusal = MA_REFUSE_NOMAP; return 0; }
+    return g_art.art.nTiles;
+}
+
 static int32_t mhud_art_candidates(void) { return g_art.candidates; }
 
 static int32_t mhud_art_tile_file(int32_t idx, char* out, int32_t cap) {
@@ -653,23 +706,58 @@ static int32_t mhud_art_draw_pane(float px, float py, float size, float spanM,
  * Command budget: 3 fixed marks + at most 2 per entity + 1 label, so at most
  * 3 + 2*128 + 1 = 260 against AOWL_REGION_MAX_CMDS (2048). It cannot overrun.
  */
+/* The player marker on a NORTH-UP pane: a centre dot plus a facing nub offset
+ * in the heading direction, so a turning player is shown by the nub swinging
+ * rather than by rotating the whole map. `headRot` is 0 = +Z (north) increasing
+ * toward +X (east); on screen north is up (-y) and east is right (+x), so the
+ * facing vector is (sin, -cos). When no heading was measured (`has` == 0) only
+ * the centre dot is drawn -- never a nub pointing at a guessed north. */
+static void mhud_player_arrow(float cx, float cy, float headRot, int32_t has,
+                              float r, uint32_t col) {
+    aowl_region_fill(cx - 3.0f, cy - 3.0f, 6.0f, 6.0f, col);
+    if (has) {
+        float nx = cx + (float)sin((double)headRot) * r;
+        float ny = cy - (float)cos((double)headRot) * r;
+        aowl_region_fill(nx - 2.0f, ny - 2.0f, 4.0f, 4.0f,
+                         MHUD_RGBA(255, 230, 120, 255));
+    }
+}
+
 static void mhud_draw(void* user, int64_t frame) {
-    float rot, scrW, scrH;
+    float rot, headRot, scrW, scrH;
     int32_t i;
     (void)user; (void)frame;
 
     g_mhud.frames++;
+    /* THE LIFECYCLE GATE (bug 1). The HUD draws ONLY during an active, spawned,
+     * in-world raid. `inRaid` is world.activeRaid() -- a validated local pose
+     * that is ALSO in the live alive-players list -- so the borrowed GameWorld
+     * cache that lingers in the menu, on the deploy screen before spawn, and
+     * after extract no longer paints an overlay. Nothing is submitted, and the
+     * diag says `not in a raid, HUD idle`. */
+    if (!g_mhud.inRaid) { g_art.refusal = MA_REFUSE_NORAID; return; }
     if (!g_mhud.hasLocal) return;   /* no centre => nothing truthful to draw */
     g_mhud.drawn++;
 
     mhud_screen(&scrW, &scrH);
 
-    /* North-up unless a heading was actually MEASURED. `hasHeading` is false
-     * today (sp/world.nim reads no rotation and says so), so this rotates by
-     * nothing rather than by a guessed zero that LOOKS like a heading. When a
-     * heading does arrive, both the radar and the map pane become heading-up
-     * together, because both take `rot` from this one place. */
-    rot = g_mhud.hasHeading ? g_mhud.heading : 0.0f;
+    /* THE MAP AND RADAR ARE NORTH-UP, ALWAYS (bug 3).
+     *
+     * The region's textured QUAD is an axis-aligned dest rect with an
+     * axis-aligned UV rect: it can represent NEITHER a rotated dest nor rotated
+     * UV sampling, and a 4-corner quad command would be a host+overlay ABI
+     * change owned elsewhere. So the earlier code REFUSED to draw the art
+     * whenever a heading was measured (MA_REFUSE_ROTATED), which is why
+     * heading-up showed grid+dots and no art. The correct, cheapest fix that
+     * lives entirely in this mod is the standard minimap: keep the map and every
+     * blip NORTH-UP (`rot = 0`, so the tiles are axis-aligned and DO draw) and
+     * show heading with a rotating PLAYER ARROW instead of spinning the world.
+     *
+     * `headRot` is the measured facing (0 = +Z north, increasing toward +X
+     * east), used only for that arrow, and only when a heading was actually
+     * MEASURED -- never a guessed zero that looks like "facing north". */
+    rot = 0.0f;
+    headRot = g_mhud.hasHeading ? g_mhud.heading : 0.0f;
 
     /* ---- the MAP pane: the same top-down view, at map scale -------------- *
      * Player-CENTRED, not map-anchored. Anchoring to the level would need the
@@ -716,15 +804,16 @@ static void mhud_draw(void* user, int64_t frame) {
                                  MHUD_RGBA(60, 75, 95, 120));
             }
         }
-        /* the player, at the pane's centre by construction */
+        /* the player, at the pane's centre by construction, drawn as a
+         * facing arrow (north-up map, rotating player -- see mhud_player_arrow). */
         {
             MmPt me = mm_topdown(g_mhud.px, g_mhud.pz, g_mhud.px, g_mhud.pz,
                                  mx, my, ms, g_mhud.mapSpanM, rot);
-            aowl_region_fill(me.x - 3.0f, me.y - 3.0f, 6.0f, 6.0f,
-                             MHUD_RGBA(255, 255, 255, 255));
+            mhud_player_arrow(me.x, me.y, headRot, g_mhud.hasHeading,
+                              ms * 0.12f, MHUD_RGBA(255, 255, 255, 255));
         }
-        /* A north pip, so which way is up is never a guess. It sits at the top
-         * of the pane when north-up and swings with `rot` when heading-up. */
+        /* A north pip, so which way is up is never a guess. The pane is now
+         * always north-up, so it sits fixed at the top of the pane. */
         {
             MmPt np = mm_topdown(g_mhud.px, g_mhud.pz + g_mhud.mapSpanM * 0.45f,
                                  g_mhud.px, g_mhud.pz, mx, my, ms,
@@ -751,8 +840,8 @@ static void mhud_draw(void* user, int64_t frame) {
         me = mm_topdown(g_mhud.px, g_mhud.pz, g_mhud.px, g_mhud.pz,
                         g_mhud.radarX, g_mhud.radarY, g_mhud.radarSize,
                         g_mhud.radiusM * 2.0f, rot);
-        aowl_region_fill(me.x - 2.0f, me.y - 2.0f, 4.0f, 4.0f,
-                         MHUD_RGBA(255, 255, 255, 255));
+        mhud_player_arrow(me.x, me.y, headRot, g_mhud.hasHeading,
+                          g_mhud.radarSize * 0.18f, MHUD_RGBA(255, 255, 255, 255));
     }
 
     /* ---- every contact, on all three surfaces ---------------------------- *
@@ -878,7 +967,7 @@ static void mhud_draw(void* user, int64_t frame) {
             } else {
                 g_mhud.indRefused++;
             }
-        } else if (mm_bearing_ring(ex, ez, g_mhud.px, g_mhud.pz, rot,
+        } else if (mm_bearing_ring(ex, ez, g_mhud.px, g_mhud.pz, headRot,
                                    scrW, scrH, 0.35f, &m)) {
             aowl_region_fill(m.x - 3.0f, m.y - 3.0f, 6.0f, 6.0f, col);
             g_mhud.indBearing++;
@@ -993,6 +1082,7 @@ static int64_t mhud_fade_ms(void) { return g_mhud.fadeMs; }
 static int32_t mhud_has_heading(void) { return g_mhud.hasHeading; }
 static float   mhud_heading(void) { return g_mhud.hasHeading ? g_mhud.heading
                                                              : 0.0f; }
+static int32_t mhud_in_raid(void) { return g_mhud.inRaid; }
 static int32_t mhud_screen_measured(void) { return g_mhud.screenFromRegion; }
 static int32_t mhud_screen_w(void) { float w, h; mhud_screen(&w, &h);
                                      return (int32_t)w; }
@@ -1002,8 +1092,9 @@ static int32_t mhud_screen_h(void) { float w, h; mhud_screen(&w, &h);
 
 proc cHudReset() {.importc: "mhud_reset", nodecl.}
 proc cHudBegin(px, py, pz: cfloat; hasLocal: int32;
-               heading: cfloat; hasHeading: int32) {.
+               heading: cfloat; hasHeading: int32; inRaid: int32) {.
   importc: "mhud_begin", nodecl.}
+proc cHudInRaid(): int32 {.importc: "mhud_in_raid", nodecl.}
 proc cHudAdd(x, y, z: cfloat; bot: int32; key: uint64) {.
   importc: "mhud_add", nodecl.}
 proc cHudLifetime(holdMs, fadeMs: int64) {.importc: "mhud_lifetime", nodecl.}
@@ -1066,6 +1157,8 @@ proc hudScreenH*(): int32 = cHudScreenH()
 
 proc cArtBindAt(bin: cstring; n: uint32; wx, wz: cfloat): int32 {.
   importc: "mhud_art_bind_at", nodecl.}
+proc cArtBindId(bin: cstring; n: uint32; wantId: cstring; wx, wz: cfloat): int32 {.
+  importc: "mhud_art_bind_id", nodecl.}
 proc cArtTileDds(idx: int32; data: cstring; n: uint32): int32 {.
   importc: "mhud_art_tile_dds", nodecl.}
 proc cArtTileFile(idx: int32; outBuf: cstring; cap: int32): int32 {.
@@ -1148,6 +1241,19 @@ proc artBindAt*(binBytes: var string; wx, wz: float): int =
   if binBytes.len < 32: return 0
   result = int(cArtBindAt(toCString(binBytes), uint32(binBytes.len),
                           cfloat(wx), cfloat(wz)))
+
+proc artBindId*(binBytes: var string; wantId: string; wx, wz: float): int =
+  ## UNITY THREAD. Bind the calibration map named `wantId` (a folder id such as
+  ## "Woods_TarkovData", resolved by the caller from GameWorld.LocationId via
+  ## index.json's internalNames) and guard it against the player position (bug
+  ## 2). Returns tiles bound, 0 on refusal -- `artRefusalText()` says which of
+  ## MAPKEY (unknown key) / MISMATCH (bounds do not contain the player) it was.
+  ## `binBytes`/`wantId` are `var`/passed as-is only for `toCString`; nothing
+  ## here mutates or copies them per frame.
+  if binBytes.len < 32: return 0
+  var idBuf = wantId
+  result = int(cArtBindId(toCString(binBytes), uint32(binBytes.len),
+                          toCString(idBuf), cfloat(wx), cfloat(wz)))
 
 proc artTileFile*(idx: int): string =
   ## The tile's path RELATIVE to data/maptiles, as recorded in the manifest.
@@ -1246,12 +1352,16 @@ proc hudUnregister*() =
 proc hudPublish*(snap: Snapshot) =
   ## Unity's thread, right after `collect`. Copies the already-guarded POD
   ## positions into the C mirror. Reads no game memory of its own.
-  if snap.localIdx < 0 or snap.localIdx >= snap.n:
-    cHudBegin(0.0, 0.0, 0.0, 0'i32, 0.0, 0'i32)
+  let active = activeRaid(snap)
+  if snap.localIdx < 0 or snap.localIdx >= snap.n or not active:
+    # No validated centre, or not an active raid: publish an idle mirror so the
+    # draw callback submits nothing. The `not active` arm is the lifecycle gate
+    # (bug 1) -- it holds even when a stale borrowed cache still yields a pose.
+    cHudBegin(0.0, 0.0, 0.0, 0'i32, 0.0, 0'i32, 0'i32)
     return
   let me = snap.ents[snap.localIdx]
   cHudBegin(cfloat(me.x), cfloat(me.y), cfloat(me.z), 1'i32,
-            cfloat(snap.heading), (if snap.hasHeading: 1'i32 else: 0'i32))
+            cfloat(snap.heading), (if snap.hasHeading: 1'i32 else: 0'i32), 1'i32)
   var i = 0
   while i < snap.n:
     if i != snap.localIdx:
@@ -1304,3 +1414,4 @@ proc hudHoldMs*(): int = int(cHudHoldMs())
 proc hudFadeMs*(): int = int(cHudFadeMs())
 proc hudHasHeading*(): bool = cHudHasHeading() != 0'i32
 proc hudHeading*(): float = float(cHudHeading())
+proc hudInRaid*(): bool = cHudInRaid() != 0'i32
