@@ -421,6 +421,54 @@ proc gateFindClass*(rt: Il2Cpp; qualified: string): Il2CppClass =
     if c != nil:
       return c
 
+proc gateClassInstanceSize*(rt: Il2Cpp; cls: Il2CppClass): int =
+  ## `il2cpp_class_instance_size` THROUGH the token gate. On this build that
+  ## export is STATIC-gated (`abi/aowlspt_il2cpp_gates_data.h`): called in the
+  ## stock shape it does NOT fail, it returns a random uint from the trap. So a
+  ## RAW `classInstanceSize` two hops after a `gateFindClass` was a hole the
+  ## comments here already named -- it dereferences nothing, but it feeds a size
+  ## into `headerBytes` / `byPointerSize` as though it were real. Routed here it
+  ## is real or REFUSED; 0 means refused-or-unknown, which every caller already
+  ## treats as "not a size this understands", so the refusal costs nothing.
+  ##
+  ## This closes only what CAN be closed the same way `findClass` was. It does
+  ## NOT and cannot bring `il2cpp_class_get_method_from_name` along:
+  ## that export's third argument is an `int argc`, and the gate VirtualQuerys
+  ## EVERY argument as a pointer (host thunk + `aowl_gate_call`), so a non-zero
+  ## argc reads as an unreadable address and the gate refuses it. Instance size
+  ## takes one pointer and no integer, which is why it passes and method lookup
+  ## does not. The driver's per-tick bind path (`resolveOn`/`findOn`) therefore
+  ## remains un-gated and is NOT unblocked by this or by the merged gateFindClass.
+  result = 0
+  if cls == nil:
+    return
+  if not gateAvailable():
+    discard gateClassFromName(rt, cast[Il2CppImage](0), "", "")  # logs once
+    return
+  var ret: Il2CppPtr = cast[Il2CppPtr](0)
+  var why: int32 = -1'i32
+  var outstanding: int32 = -1'i32
+  var exportName = "il2cpp_class_instance_size"
+  let ok = sainGateCall(gGateFn, toCString(exportName), 1'i32,
+                        cls, cast[Il2CppPtr](0), cast[Il2CppPtr](0),
+                        addr ret, addr why, addr outstanding)
+  if ok == 0'i32:
+    debug "sain: gated il2cpp_class_instance_size refused: " & gateWhyText()
+    return
+  # A STATIC row arms no nonce, so nothing should be left outstanding. If the
+  # host says otherwise, treat the whole answer as INCONCLUSIVE (CLAUDE.md 9b)
+  # rather than trusting a number that came back beside a hazard.
+  if outstanding != 0'i32:
+    warn "sain: gated il2cpp_class_instance_size left " & $outstanding &
+         " nonce arm(s) OUTSTANDING -- refusing the result as INCONCLUSIVE."
+    return
+  # The size is in RAX, zero-extended into `ret`. It is small and positive; a
+  # wild value is read as unknown, which is the same 0 a refusal returns.
+  let sz = cast[int](ret)
+  if sz <= 0 or sz > 0x100000:
+    return
+  result = sz
+
 proc gwState*(): int =
   ## 0 no host export (host too old, or this is not the client)
   ## 1 export present but NO detour armed -- INCONCLUSIVE, not "no raid"
@@ -798,8 +846,8 @@ proc headerBytes(): int =
   let i32 = gateFindClass(gRt, "System.Int32")
   let f64 = gateFindClass(gRt, "System.Double")
   if i32 != nil and f64 != nil:
-    let a = classInstanceSize(gRt, i32)
-    let b = classInstanceSize(gRt, f64)
+    let a = gateClassInstanceSize(gRt, i32)
+    let b = gateClassInstanceSize(gRt, f64)
     if b - a == 4 and a >= 4:
       gHeaderBytes = a - 4
   result = gHeaderBytes
@@ -824,7 +872,7 @@ proc byPointerSize(tn: string): int =
     return
   if not classIsValueType(gRt, c):
     return
-  let sz = classInstanceSize(gRt, c) - headerBytes()
+  let sz = gateClassInstanceSize(gRt, c) - headerBytes()
   if sz <= 0 or sz > 64:
     # Not a size this understands. Refusing here is what makes the header
     # constant above safe to hold.
@@ -1914,7 +1962,7 @@ proc payloadSizeOf*(tn: string): int =
     return
   if not classIsValueType(gRt, c):
     return
-  let sz = classInstanceSize(gRt, c) - headerBytes()
+  let sz = gateClassInstanceSize(gRt, c) - headerBytes()
   if sz <= 0 or sz > 256:
     return
   result = sz
