@@ -1912,7 +1912,10 @@ proc onBuildsList(url, body, session: string): string =
     # Still all three lists. A client without a profile selected asks for this
     # too, and the shape it gets must not depend on that.
     var o = obj()
-    put(o, "equipmentBuilds", arr())
+    # The stock loadouts still, for the same reason the profile path serves
+    # them: an empty `equipmentBuilds` makes `EquipmentBuildsScreen.Show`
+    # throw out of `Enumerable.First`.
+    put(o, "equipmentBuilds", raw(text(defaultEquipmentBuilds())))
     put(o, "weaponBuilds", arr())
     put(o, "magazineBuilds", arr())
     return envelope(o)
@@ -1926,7 +1929,11 @@ proc saveOneBuild(session, kind, body: string): string =
   let id = saveBuild(p.id, kind, body, problem)
   if id.len == 0:
     return failure(1, problem)
-  result = envelope(objOf("id", id))
+  # `{"err":0,"data":null,"errmsg":null}` -- measured, capture seq 305
+  # (`/client/builds/weapon/save`) and 359 (`.../equipment/save`), both
+  # `resp_declen: 81`. We used to answer `{"id": ...}`; the client does not
+  # read it back, it re-reads `/client/builds/list`, which is seq 441.
+  result = envelopeNull()
 
 proc onBuildWeapon(url, body, session: string): string =
   inc gRequests

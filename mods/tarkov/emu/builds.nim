@@ -28,6 +28,7 @@ import aowlspt/server
 import aowlspt/json
 import store
 import ids
+import post1
 
 const
   KeyPrefix* = "builds."
@@ -70,14 +71,62 @@ proc loadBuilds*(profileId: string): Doc =
 proc saveBuilds*(profileId: string; d: Doc): bool =
   result = save(buildsKey(profileId), text(d)) == Ok
 
-proc buildsJson*(profileId: string): string =
-  ## The body `/client/builds/list` answers with.
-  result = text(loadBuilds(profileId))
-
 proc listOf(d: Doc; kind: string): List =
   result = parseArray(getRaw(d, kind))
   if not result.ok:
     result = newList()
+
+proc containsId(list: List; id: string): bool =
+  for i in 0 ..< list.len:
+    if field(list.items[i], "Id").asText("") == id:
+      return true
+  result = false
+
+proc defaultEquipmentBuilds*(): List =
+  ## The twelve stock loadouts the real backend ships with every profile --
+  ## Papasha, Hunter, Shotgunner, Scout, Fighter, Guard, Gunslinger,
+  ## Sharpshooter, Operator, Marksman, Raider, Robber -- each
+  ## `BuildType: "Standard"`. Lifted verbatim from capture seq 123/253 (the
+  ## same twelve appear again in 441 alongside a player's own `Custom`), so
+  ## this is the backend's own data rather than an invention.
+  ##
+  ## They are NOT stored under the profile's builds key. A stock preset the
+  ## player never saved must not become a row the player can delete, and must
+  ## not be written back by the next save; it is a constant of the install.
+  result = parseArray(post1Table("defaultequipmentpresets"))
+  if not result.ok:
+    result = newList()
+
+proc withDefaultEquipment*(all: var Doc) =
+  ## Merges the stock loadouts into `equipmentBuilds`, after the player's own.
+  ##
+  ## ## Why an empty list is not a valid answer
+  ##
+  ## `EquipmentBuildsScreen.Show` calls `System.Linq.Enumerable.First` on this
+  ## list. With zero entries that throws `InvalidOperationException: Sequence
+  ## contains no elements` *during* `Show`, so the screen opens and closes in
+  ## the same frame -- the client logs `_buildList empty` from
+  ## `UpdateBuildList()` immediately before it. Measured live, client
+  ## `errors_000.log`, 2026-08-28 14:06:45.
+  ##
+  ## The response was well-formed, correctly typed and complete on every key
+  ## the audit checks. It was empty, and empty is what broke it.
+  let defaults = defaultEquipmentBuilds()
+  if defaults.len == 0:
+    return
+  var eq = listOf(all, "equipmentBuilds")
+  for i in 0 ..< defaults.len:
+    let id = field(defaults.items[i], "Id").asText("")
+    # A saved build carrying a stock id wins: it is the player's edit of it.
+    if id.len > 0 and not containsId(eq, id):
+      eq.add defaults.items[i]
+  setRaw(all, "equipmentBuilds", text(eq))
+
+proc buildsJson*(profileId: string): string =
+  ## The body `/client/builds/list` answers with.
+  var all = loadBuilds(profileId)
+  withDefaultEquipment(all)
+  result = text(all)
 
 proc replaceOrAdd(list: var List; id, entry: string): bool =
   ## Saving a build under a name that already exists replaces it rather than
