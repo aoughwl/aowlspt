@@ -1912,6 +1912,63 @@ proc main(): int =
           "it is in the body, which is what made this route 560 MiB")
   line "  " & $mapKeys.len & " maps, " & kib(locR.body.len) & " of map data"
 
+  # -- the ORBIT loot-table census, over EVERY map -------------------------
+  #
+  # The bug this replaces was a live `warn` reading "0 of 429 static-container
+  # rows parsed", which named a parser defect that does not exist: all 429
+  # rows parse, and all 429 positions are (0,0,0) in db.json AND in the SPT
+  # source. So the assertion is the NEGATIVE that can actually be falsified --
+  # no map's loot tables fail to parse -- asked of ORBIT's OWN walker through
+  # `/orbit/containers`, per map, with no raid running. Asking it of a
+  # reimplementation of the walker here would be the self-comparison CLAUDE.md
+  # 9b forbids.
+  #
+  # Falsifiability, verified by hand: change the reader's field name from
+  # "template" to "templates" and `parseFailures` becomes 13 of 24 and this
+  # goes red.
+  var censusAsked = 0
+  var parseFailures = 0
+  var unresolved = 0
+  var positionedMaps = 0
+  var rowsTotal = 0
+  var firstFail = ""
+  for i in 0 ..< mapKeys.len:
+    let cr = call("/aowlspt/tarkov/orbit/containers?map=" & mapKeys[i], "")
+    if not cr.ok or cr.body.len == 0:
+      continue
+    inc censusAsked
+    let verdict = textVal(cr.body, memberValue(cr.body, 0, "verdict"))
+    let key = textVal(cr.body, memberValue(cr.body, 0, "key"))
+    rowsTotal = rowsTotal + intVal(cr.body, memberValue(cr.body, 0, "rows"))
+    if intVal(cr.body, memberValue(cr.body, 0, "positioned")) > 0:
+      inc positionedMaps
+    if key.len == 0:
+      inc unresolved
+    if verdict == "FAIL":
+      inc parseFailures
+      if firstFail.len == 0:
+        firstFail = mapKeys[i] & ": " &
+                    textVal(cr.body, memberValue(cr.body, 0, "why"))
+  if censusAsked == 0:
+    skip("the ORBIT loot-table census answers",
+         "/aowlspt/tarkov/orbit/containers returned nothing for any of the " &
+         $mapKeys.len & " maps -- INCONCLUSIVE, not a pass")
+  else:
+    check("every map answers the loot-table census",
+          censusAsked == mapKeys.len,
+          $censusAsked & " of " & $mapKeys.len & " answered")
+    # The negative. A parse mismatch on ANY map fails the run.
+    check("no map's loot tables fail to parse", parseFailures == 0,
+          $parseFailures & " map(s) reported FAIL; first: " & firstFail)
+    # And the id confusion that has failed silently four times: the census
+    # reports the key it resolved to, so an unresolved id is visible rather
+    # than reading as an empty map.
+    check("every map id resolves to a database key", unresolved == 0,
+          $unresolved & " of " & $censusAsked & " did not resolve")
+    line "  census: " & $rowsTotal & " loot rows over " & $censusAsked &
+         " maps, " & $positionedMaps &
+         " with real coordinates (0 is expected without --loose)"
+
   # -- map lock / unlock ---------------------------------------------------
   #
   # The post-condition is asserted on the SERVED PAYLOAD, over EVERY map, and

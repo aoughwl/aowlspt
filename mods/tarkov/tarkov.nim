@@ -2004,6 +2004,7 @@ proc onOrbitPlan(url, body, session: string): string =
   put(o, "state", orbitState())
   result = done(o).text
 
+
 # ---------------------------------------------------------------------------
 # Raids
 # ---------------------------------------------------------------------------
@@ -2594,6 +2595,24 @@ proc queryValue(url, name: string): string =
     result.add url[i]
     inc i
 
+proc onOrbitContainers(url, body, session: string): string =
+  ## The loot-table census for ONE map, named in the query (`?map=Woods`) or
+  ## in the body, with no raid running.
+  ##
+  ## It exists so the falsifiable assertion can be a NEGATIVE over EVERY map
+  ## -- "no map's loot tables fail to parse" -- rather than an observation
+  ## about whichever map a raid happened to load. `/orbit/plan` cannot answer
+  ## that: it reports the last plan built, and there is at most one.
+  ##
+  ## Takes the id the CLIENT uses ("Woods"); `lootCensusFor` resolves it
+  ## through `canonicalLocation` and reports BOTH spellings, so an unresolved
+  ## id and an empty map are distinguishable in the answer.
+  inc gRequests
+  var map = queryValue(url, "map")
+  if map.len == 0:
+    map = field(body, "map").asText("")
+  result = lootCensusFor(map)
+
 proc onBotLimit(url, body, session: string): string =
   ## How many bots the client may have alive on this map at once.
   ##
@@ -2986,6 +3005,7 @@ proc registerRoutes() =
   # 404s on a running backend while `/aowlspt/tarkov/launcher/ping` beside it
   # answers, so that namespace does not reach a mod on this host.
   discard serve("/aowlspt/tarkov/orbit/plan", onOrbitPlan)
+  discard serve("/aowlspt/tarkov/orbit/containers", onOrbitContainers)
 
   discard serve("/client/profile/status", onProfileStatus)
   # `GetProfileSettings` answers a bare `true`; the client only checks that the
