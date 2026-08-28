@@ -76,6 +76,12 @@ proc cCamReady(): int32 {.importc: "aowl_admin_cam_ready", nodecl.}
 proc cCamGen(): int32 {.importc: "aowl_admin_cam_gen", nodecl.}
 proc cCamStale(): int32 {.importc: "aowl_admin_cam_stale", nodecl.}
 proc cCamDisabled(): int32 {.importc: "aowl_admin_cam_disabled", nodecl.}
+proc cCamRoute(): int32 {.importc: "aowl_admin_cam_route_get", nodecl.}
+proc cCamMgrBound(): int32 {.importc: "aowl_admin_cam_mgr_bound", nodecl.}
+proc cCamMainNulls(): int32 {.importc: "aowl_admin_cam_main_nulls", nodecl.}
+proc cCamMgrNulls(): int32 {.importc: "aowl_admin_cam_mgr_nulls", nodecl.}
+proc cCamFldNulls(): int32 {.importc: "aowl_admin_cam_fld_nulls", nodecl.}
+proc cCamSelftestFails(): int32 {.importc: "aowl_admin_cam_selftest_fails", nodecl.}
 proc cW2s(x, y, z: cfloat; w, h: int32; sx, sy: ptr cfloat): int32 {.
   importc: "aowl_admin_w2s", nodecl.}
 
@@ -342,6 +348,31 @@ proc camGen*(): int = int(cCamGen())
 proc camStale*(): int = int(cCamStale())
 proc camDisabled*(): bool = cCamDisabled() != 0'i32
 
+proc camRoute*(): int = int(cCamRoute())
+  ## 0 = no camera has ever been acquired | 1 = Camera::get_main |
+  ## 2 = CameraManager.Instance.<Camera>k__BackingField.
+
+proc camRouteText*(): string =
+  ## WHICH acquisition route came up empty, and how often. Without this the
+  ## sampler can only report "no matrix", and a live raid was needed to work out
+  ## that `Camera.main` was the null -- 24604 firings that all said the same
+  ## uninformative thing. Never collapse the three nulls into one.
+  case camRoute()
+  of 1: "Camera::get_main"
+  of 2: "CameraManager.Instance.Camera"
+  else:
+    var r = "NO camera acquired yet: Camera::get_main returned null " &
+            $int(cCamMainNulls()) & " time(s)"
+    if cCamMgrBound() == 0:
+      r.add "; the CameraManager fallback is NOT bound (get_Instance" &
+            "@0x1263BD0 did not byte-match this build), so there is no " &
+            "second route"
+    else:
+      r.add "; CameraManager::get_Instance returned null " &
+            $int(cCamMgrNulls()) & " time(s) and Instance+0x70 read null " &
+            $int(cCamFldNulls()) & " time(s)"
+    r
+
 proc camStateText*(): string =
   ## Why there is no projection, in words. Never collapses a bind failure or an
   ## un-driven sampler into "not in a raid".
@@ -358,13 +389,23 @@ proc camStateText*(): string =
     "tools/il2cpp_resolve.py"
   else:
     if camGen() == 0:
-      "bound, but the Unity-thread sampler has never produced a matrix " &
-      "(no main camera yet, or the everyMain driver did not arm)"
+      # The old text said "no main camera yet, or the everyMain driver did not
+      # arm" -- two causes, no way to tell them apart, which is what made the
+      # 24604-firing log unreadable. Say which.
+      var r = "bound, but the Unity-thread sampler has never produced a " &
+              "matrix -- " & camRouteText()
+      if int(cCamSelftestFails()) > 0:
+        r.add "; and " & $int(cCamSelftestFails()) & " matrix/matrices WERE " &
+              "obtained but failed the centre-projection self-test (a point " &
+              "10m ahead of the camera did not land near the middle of the " &
+              "frame), so the view/proj pair is unusable or the -Z forward " &
+              "convention is wrong for this build"
+      r
     elif camStale() >= 120:
-      "bound and sampled " & $camGen() & " times, but the last good sample " &
-      "was " & $camStale() & " drains ago (no main camera right now)"
+      "bound and sampled " & $camGen() & " times via " & camRouteText() &
+      ", but the last good sample was " & $camStale() & " drains ago"
     else:
-      "live (gen " & $camGen() & ")"
+      "live (gen " & $camGen() & ", via " & camRouteText() & ")"
 
 proc worldToScreen*(x, y, z: float; w, h: int; sx, sy: var float): bool =
   ## ANY thread. World point -> pixel through the published snapshot. False when
