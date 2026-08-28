@@ -380,6 +380,58 @@ def verify_data(art, install, C):
     return OK, []
 
 
+def verify_seed(art, install):
+    """Install-side: does every SEED file this artifact declares exist there?
+
+    A seed is a file the install needs to have but that the install OWNS once
+    it exists -- `config.json` is the only kind today. It is emphatically not
+    a data file: data is copied every deploy and must be byte-identical to the
+    repo, whereas a config.json legitimately DIVERGES the moment a player
+    moves a slider. So the post-condition here is EXISTENCE, not equality.
+    Asserting equality would fail every install that had ever been configured,
+    and asserting nothing is how this was missed.
+
+    Measured 2026-08-28: no artifact shipped config.json at all. The mods that
+    had one in the live install got it from some earlier hand-copy; the three
+    newest -- debug, textures, waypoints -- never did. The user-visible symptom
+    was the F3 profiler toggle doing nothing, four times, while the host log
+    said exactly why ("no config.json for aowl.debug") and nobody was reading
+    that line. The setting rendered, the edit was accepted and queued, and it
+    had nowhere to land.
+
+    Returns (verdict, problems).
+    """
+    rules = art.get("seed", [])
+    if not rules:
+        return OK, []
+    if not os.path.isdir(install):
+        return INCONCLUSIVE, ["install directory does not exist: %s -- the "
+                              "seed files could not be looked at at all"
+                              % install]
+    problems = []
+    unknown = []
+    for rule in rules:
+        s = os.path.join(REPO, rule["src"].replace("/", os.sep))
+        d = os.path.join(install, rule["dst"].replace("/", os.sep))
+        if not os.path.isfile(s):
+            unknown.append("seed source is absent from the REPO: %s -- so "
+                           "nothing can be said about the install" % rule["src"])
+            continue
+        if not os.path.isfile(d):
+            problems.append(
+                "SEED ABSENT from the install: %s -- every setting this mod "
+                "declares will be read at its schema default, and every edit "
+                "the settings UI accepts will be DISCARDED (the host answers "
+                "ErrNotFound for a config set with no file)." % rule["dst"])
+            if rule.get("why"):
+                problems.append("    why it matters: %s" % rule["why"])
+    if problems:
+        return FAIL, problems
+    if unknown:
+        return INCONCLUSIVE, unknown
+    return OK, []
+
+
 def data_count(art):
     """How many data files this artifact declares, for the ok line."""
     n = 0
@@ -581,6 +633,10 @@ def cmd_check(args, cfg, C, check_data=True):
             dverdict, dproblems = verify_data(art, install, C)
             if dverdict != OK:
                 verdict, problems = dverdict, dproblems
+        if verdict == OK and check_data:
+            sverdict, sproblems = verify_seed(art, install)
+            if sverdict != OK:
+                verdict, problems = sverdict, sproblems
         n = len(art.get("markers", []))
         if verdict == OK:
             extra = ""
@@ -759,6 +815,35 @@ def cmd_deploy(args, cfg, C):
                 wrote += 1
             print("     data  %d file(s) -> %s" % (wrote, rule["dst"]))
 
+        # SEED files: copied ONLY when the destination does not exist.
+        #
+        # The opposite rule from `data` above, deliberately. A config.json is
+        # the player's own state the moment they touch a slider, so copying it
+        # unconditionally would silently reset every setting on every deploy --
+        # a far worse bug than the one this fixes. "Absent" is the only state
+        # where we know we are not destroying an answer somebody gave.
+        for rule in art.get("seed", []):
+            s = os.path.join(REPO, rule["src"].replace("/", os.sep))
+            d = os.path.join(install, rule["dst"].replace("/", os.sep))
+            if not os.path.isfile(s):
+                print("     %sINCONCLUSIVE%s seed source absent from the repo: "
+                      "%s" % (yellow, reset, rule["src"]))
+                continue
+            if os.path.isfile(d):
+                print("     seed  %s already present -- LEFT ALONE (it is the "
+                      "install's own settings state)" % rule["dst"])
+                continue
+            os.makedirs(os.path.dirname(d), exist_ok=True)
+            try:
+                shutil.copy2(s, d)
+            except PermissionError:
+                print("%sFAIL%s %s is locked -- the game or "
+                      "aowlspt-backend.exe is still running."
+                      % (red, reset, d))
+                return 1
+            print("     seed  %s was ABSENT -- seeded from the repo defaults"
+                  % rule["dst"])
+
         # A DERIVED file downstream of what we just replaced is not evidence
         # of anything once its input changes. `mods/aowlspt-selection.json` is
         # written by the manager from `store/aowl.manager/selection` PLUS the
@@ -777,7 +862,7 @@ def cmd_deploy(args, cfg, C):
                   % (rel, os.path.basename(bak)))
 
     if not args.dry_run and any(a.get("data") or a.get("verifyInstalled")
-                                for a in arts):
+                                or a.get("seed") for a in arts):
         # THE POST-CONDITION. Not a restatement of the copy above: it re-reads
         # the install and hashes what is actually there. A deploy that copied
         # and still does not hold the right bytes must not print success.
@@ -785,9 +870,12 @@ def cmd_deploy(args, cfg, C):
         post_bad = 0
         post_unknown = 0
         for art in arts:
-            if not art.get("data") and not art.get("verifyInstalled"):
+            if (not art.get("data") and not art.get("verifyInstalled")
+                    and not art.get("seed")):
                 continue
             v, probs = verify_data(art, install, C)
+            if v == OK:
+                v, probs = verify_seed(art, install)
             if v == OK:
                 n = data_count(art)
                 what = ("%d data file(s)" % n) if n else "the installed copy"

@@ -43,6 +43,26 @@
   "skillMaxPerRaid": 100.0,
   "masteringMaxPerRaid": 100,
 
+  "hideoutConstructionMultiplier": 1.0,
+  "hideoutProductionMultiplier": 1.0,
+  "questXpMultiplier": 1.0,
+
+  "_menuCornerLabel": "Profile Name | PVE ZONE | No text. The literal key name is also this feature's deploy marker (tools/deploy.json) -- do not rename it without moving the marker.",
+  "menuCornerLabel": "Profile Name",
+
+  "_mapsComment": "Which maps the player may load into. Writes locations.<map>.base.Locked, which /client/locations sends verbatim; Enabled is deliberately NOT written (BSG's own reply for this build carries Enabled=false on 9 of 24 maps as its own axis). Map names in the two lists may be spelled any way -- database key (bigmap), client Id (Woods, RezervBase) or _Id GUID -- because they go through emu/raid.canonicalLocation; only 4 of 19 maps spell key and Id alike. mapsLockResult is written BY the server after each apply and names any map that resolved to nothing.",
+  "mapsUnlockedByDefault": true,
+  "mapsLocked": "",
+  "mapsUnlocked": "",
+  "mapsLockResult": "",
+
+  "_spawnComment": "The Spawn Items row group. spawnNow is MOMENTARY -- onTarkovSettings intercepts the POST, runs the spawn and writes the key back to false -- and spawnResult is written BY the server, not by the player. They are still ordinary persisted keys, which is what lets the page render the last outcome after a reload; they are listed here so that no declared setting is missing a path (tools/settingscheck.py).",
+  "spawnQuery": "",
+  "spawnCount": 1,
+  "spawnCondition": 100,
+  "spawnNow": false,
+  "spawnResult": "",
+
   "orbitEnabled": true,
   "orbitCellSize": 50.0,
   "orbitLootAnchors": 12,
