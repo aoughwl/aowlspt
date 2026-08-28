@@ -967,4 +967,62 @@ static void* aowl_nu_object_new(void* klass) {
     return g_nu_object_new(klass);
 }
 
+/* ------------------------------------------------------------------------
+ * Reference-field read/write, for wiring a FROM-SCRATCH component's
+ * dependencies (font asset, material) out of a LIVE donor BEFORE the
+ * component's Awake/OnEnable runs and dereferences them.
+ *
+ * This is a raw pointer-sized field store, and it is NOT a blind write:
+ *   * the source read is VirtualQuery-gated (aowl_is_readable);
+ *   * the destination store is gated on the slot lying inside a COMMITTED,
+ *     WRITABLE region -- aowl_nu_is_writable below rejects READONLY, guard
+ *     and no-access pages, so a bad offset can never fault or clobber code.
+ * No GC write barrier is issued: this build's IL2CPP uses a conservative
+ * collector that scans without one, and both objects are independently kept
+ * alive (the donor by the live label it belongs to, the target by
+ * aowl_nu_own), so a plain store cannot create a dangling reference here.
+ * ------------------------------------------------------------------------ */
+/* Self-contained region check (does NOT depend on the shim, so the header
+ * still compiles alone for the offline test). `needWrite` requires a
+ * RW/WRITECOPY protection; otherwise READONLY is accepted too. */
+static int32_t aowl_nu_region_ok(void* p, int32_t size, int32_t needWrite) {
+    MEMORY_BASIC_INFORMATION mbi;
+    DWORD readMask, writeMask;
+    if (!p || size <= 0) return 0;
+    if (VirtualQuery(p, &mbi, sizeof(mbi)) == 0) return 0;
+    if (mbi.State != MEM_COMMIT) return 0;
+    if (mbi.Protect & (PAGE_NOACCESS | PAGE_GUARD)) return 0;
+    writeMask = PAGE_READWRITE | PAGE_WRITECOPY |
+                PAGE_EXECUTE_READWRITE | PAGE_EXECUTE_WRITECOPY;
+    readMask  = writeMask | PAGE_READONLY | PAGE_EXECUTE_READ;
+    if (!(mbi.Protect & (needWrite ? writeMask : readMask))) return 0;
+    {
+        uintptr_t start = (uintptr_t)mbi.BaseAddress;
+        uintptr_t end   = start + (uintptr_t)mbi.RegionSize;
+        uintptr_t need  = (uintptr_t)p + (uintptr_t)size;
+        if (need < (uintptr_t)p) return 0;   /* overflow */
+        return need <= end ? 1 : 0;
+    }
+}
+static int32_t aowl_nu_is_writable(void* p, int32_t size) {
+    return aowl_nu_region_ok(p, size, 1);
+}
+
+static void* aowl_nu_get_ref(void* obj, int32_t off) {
+    void* v;
+    if (!obj || off < 0) return NULL;
+    if (!aowl_nu_region_ok((char*)obj + off, (int32_t)sizeof(void*), 0))
+        return NULL;
+    v = NULL;
+    memcpy(&v, (const char*)obj + off, sizeof(void*));
+    return v;
+}
+
+static int32_t aowl_nu_set_ref(void* obj, int32_t off, void* val) {
+    if (!obj || off < 0) return 0;
+    if (!aowl_nu_is_writable((char*)obj + off, (int32_t)sizeof(void*))) return 0;
+    memcpy((char*)obj + off, &val, sizeof(void*));
+    return 1;
+}
+
 #endif /* AOWLSPT_NATIVEUI_H */

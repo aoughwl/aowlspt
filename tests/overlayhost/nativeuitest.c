@@ -385,6 +385,56 @@ static void falsify(void) {
        "class is refused, permanently");
 }
 
+/* ------------------------------------------------------------------ *
+ * The from-scratch dependency wiring, as pure logic: a reference-field
+ * copy from a "donor" buffer to a "fresh" buffer, plus the region gating
+ * that makes it never a blind write. The offsets used live (0x100/0x118/
+ * 0x20) are DATA measured from metadata and cannot be checked offline;
+ * this checks the MECHANISM -- read the pointer at an offset, store it at
+ * the same offset in another object, and refuse every bad address.
+ * ------------------------------------------------------------------ */
+static void test_wire_refs(void) {
+    /* Two heap-like buffers big enough to hold a field past 0x118. */
+    static unsigned char donor[0x140];
+    static unsigned char fresh[0x140];
+    void* font = (void*)0xF0F0F0F0;
+    void* mat  = (void*)0xADADADAD;
+    int rejected = 0;
+
+    printf("from-scratch dependency wiring\n");
+
+    memset(donor, 0, sizeof(donor));
+    memset(fresh, 0, sizeof(fresh));
+    memcpy(donor + 0x100, &font, sizeof(void*));   /* m_fontAsset */
+    memcpy(donor + 0x118, &mat,  sizeof(void*));    /* m_sharedMaterial */
+
+    /* read-back through the guarded getter */
+    ck(aowl_nu_get_ref(donor, 0x100) == font,
+       "get_ref reads the font asset pointer at the donor's m_fontAsset");
+    ck(aowl_nu_get_ref(donor, 0x118) == mat,
+       "get_ref reads the shared material pointer");
+
+    /* the store lands, and reads back independently of the store call */
+    ck(aowl_nu_set_ref(fresh, 0x100, font) == 1, "set_ref stores the font");
+    ck(aowl_nu_set_ref(fresh, 0x118, mat) == 1, "set_ref stores the material");
+    {
+        void* got = NULL;
+        memcpy(&got, fresh + 0x100, sizeof(void*));
+        ck(got == font, "the fresh object's m_fontAsset now equals the donor's");
+    }
+
+    /* REFUSALS -- a bad address must never fault or clobber. */
+    if (aowl_nu_get_ref(NULL, 0x100) == NULL) rejected++;
+    if (aowl_nu_get_ref(donor, -1) == NULL) rejected++;
+    if (aowl_nu_get_ref((void*)0x10, 0) == NULL) rejected++;      /* unmapped */
+    if (aowl_nu_set_ref(NULL, 0x100, font) == 0) rejected++;
+    if (aowl_nu_set_ref(donor, -8, font) == 0) rejected++;
+    if (aowl_nu_set_ref((void*)0x10, 0, font) == 0) rejected++;   /* unmapped */
+    ck(rejected == 6,
+       "all six bad get/set addresses were REFUSED (a different count means a "
+       "guard accepts an address it must not, which is exactly a blind write)");
+}
+
 int main(void) {
     printf("nativeuitest -- offline checks for the native UI layer\n\n");
     test_renderable();
@@ -394,6 +444,7 @@ int main(void) {
     test_intern();
     test_targets();
     test_why();
+    test_wire_refs();
     falsify();
     test_faults();        /* LAST: it permanently disables the layer */
 

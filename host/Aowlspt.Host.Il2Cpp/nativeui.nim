@@ -130,6 +130,10 @@ proc cNuOwnedAt(i: int32): Il2CppPtr {.importc: "aowl_nu_owned_at", nodecl.}
 proc cNuOwnedClear() {.importc: "aowl_nu_owned_clear", nodecl.}
 proc cNuObjectNew(klass: Il2CppPtr): Il2CppPtr {.
   importc: "aowl_nu_object_new", nodecl.}
+proc cNuGetRef(obj: Il2CppPtr; off: int32): Il2CppPtr {.
+  importc: "aowl_nu_get_ref", nodecl.}
+proc cNuSetRef(obj: Il2CppPtr; off: int32; val: Il2CppPtr): int32 {.
+  importc: "aowl_nu_set_ref", nodecl.}
 
 # ---- target indices, mirroring the AOWL_NU_* defines --------------------
 #
@@ -165,6 +169,20 @@ const
   NuTTmpSetFontSize  = 22'i32  ## TMPro.TMP_Text::set_fontSize
   NuTLocSetLabelText = 23'i32  ## LocalizedText::SetLabelText
   NuTSetParentAlign  = 24'i32  ## TMPro.TMP_DefaultControls::SetParentAndAlign
+
+# ---- field offsets for wiring a from-scratch TMP's dependencies ---------
+#
+# MEASURED offline from Il2CppMetadataRegistration.fieldOffsets via
+# `tools/fldoff.py fields "TMPro.TMP_Text"` (self-check on System.String
+# passed), 2026-08-28. These are the reference fields TMP's Awake/OnEnable
+# dereferences; a from-scratch component has them NULL and faults, so they are
+# copied from a live donor BEFORE the component is activated. Read/written raw
+# because they are native-side references with no by-name accessor a mod may
+# safely call (set_font is not exercised on this build).
+const
+  NuOffTmpFontAsset      = 0x100'i32  ## TMPro.TMP_Text.m_fontAsset (TMP_FontAsset)
+  NuOffTmpSharedMaterial = 0x118'i32  ## TMPro.TMP_Text.m_sharedMaterial (Material)
+  NuOffGraphicMaterial   = 0x20'i32   ## UnityEngine.UI.Graphic.m_Material (Material)
 
 # ---- component kinds, mirroring the AOWL_NU_KIND_* defines --------------
 const
@@ -590,6 +608,57 @@ proc nuSetFontSize(tmp: Il2CppPtr; size: float32): bool =
   true
 
 # ---------------------------------------------------------------------------
+# WIRE DEPENDENCIES -- the from-scratch gap
+#
+# A cloned TMP (Stage A) works because it inherits a fully-wired component: a
+# font asset, a material, mesh/renderer state. A component built from scratch
+# has `m_fontAsset` / `m_sharedMaterial` / (Graphic) `m_Material` NULL, and
+# TMP's Awake/OnEnable dereferences them -- LoadFontAsset reaches for the
+# default font through TMP_Settings and faults. This copies those references
+# out of a LIVE donor TMP so the fresh one has them BEFORE it renders.
+#
+# It MUST be called while the target GameObject is INACTIVE. On this build the
+# fault fires synchronously from AddComponent when the GameObject is active
+# (run 1 died "on or immediately after AddComponent<TextMeshProUGUI>", which is
+# Awake/OnEnable firing inline), so there is no window to set fields "after
+# AddComponent, before render" on an active object -- the render IS the add.
+# Deferring Awake by keeping the GameObject inactive is the only place the
+# wiring fits. See Stage B.
+# ---------------------------------------------------------------------------
+proc nuWireTextDeps(fresh, donor: Il2CppPtr): bool =
+  ## Copy font asset + materials from a live donor TMP into a from-scratch TMP.
+  ## Returns false (and logs) if the donor's font asset is unreadable -- that
+  ## is the one reference whose absence provably faults, so a missing font is a
+  ## refusal, not a maybe. The materials are best-effort: a null donor material
+  ## is copied as null only if it was already null (TMP rebuilds it from the
+  ## font in that case), never fabricated.
+  if not nuOk(fresh, 0x120'i32) or not nuOk(donor, 0x120'i32):
+    warn "nativeui: wireTextDeps: the fresh or donor TMP is null/too-small to " &
+         "hold m_sharedMaterial@0x118; refusing"
+    return false
+  let font = cNuGetRef(donor, NuOffTmpFontAsset)
+  if not nuOk(font, 0x10'i32):
+    warn "nativeui: wireTextDeps: the donor's m_fontAsset@0x100 is null or " &
+         "unreadable -- without it TMP's Awake faults on the default-font " &
+         "path, so refusing to build a TMP that cannot render"
+    return false
+  let sharedMat = cNuGetRef(donor, NuOffTmpSharedMaterial)
+  let gMat      = cNuGetRef(donor, NuOffGraphicMaterial)
+  if cNuSetRef(fresh, NuOffTmpFontAsset, font) == 0'i32:
+    warn "nativeui: wireTextDeps: m_fontAsset slot on the fresh TMP is not " &
+         "writable; refusing"
+    return false
+  okLog "nativeui: wireTextDeps: font asset 0x" & hexOf(cast[uint64](font)) &
+        " copied from donor 0x" & hexOf(cast[uint64](donor))
+  if nuOk(sharedMat, 0x10'i32):
+    if cNuSetRef(fresh, NuOffTmpSharedMaterial, sharedMat) != 0'i32:
+      okLog "nativeui: wireTextDeps: shared material 0x" &
+            hexOf(cast[uint64](sharedMat)) & " copied"
+  if nuOk(gMat, 0x10'i32):
+    discard cNuSetRef(fresh, NuOffGraphicMaterial, gMat)
+  result = true
+
+# ---------------------------------------------------------------------------
 # INPUT -- POLLED, v1
 #
 # There is no delegate path here on purpose. A Button.onClick handler needs a
@@ -905,11 +974,14 @@ proc nuProofStageA(tabPtr: Il2CppPtr) =
 # it -- and every call now has a breadcrumb, so the next run names the exact
 # one rather than leaving a gap.
 #
-# The most likely candidate, stated as a hypothesis and NOT as a finding:
-# `AddComponent<TextMeshProUGUI>` runs TMP's `Awake`, which reaches for
-# TMP_Settings and a default font asset. That is a far larger blast radius than
-# `AddComponent<RectTransform>`, which is a pure native component and worked.
-# The breadcrumbs below are what will settle it; nothing here assumes it.
+# Run 1's fault was `AddComponent<TextMeshProUGUI>` running TMP's Awake, which
+# reaches for a default font asset (through TMP_Settings) and a material a
+# from-scratch component has as NULL. THE FIX, implemented below: keep the
+# GameObject INACTIVE across the add so Awake is deferred, copy the font asset
+# and material out of the live donor TMP into the fresh one, THEN activate --
+# at which point Awake runs with its dependencies already set. The activation
+# is the new, breadcrumbed fault point: if TMP needs more than font+material,
+# the log stops at "SetActive(true)" and names it.
 # ---------------------------------------------------------------------------
 proc nuProofStageB(tabPtr: Il2CppPtr) =
   gNuVerdictB = "INCONCLUSIVE"
@@ -955,11 +1027,23 @@ proc nuProofStageB(tabPtr: Il2CppPtr) =
           nuF(by) & ", " & nuF(bw) & ", " & nuF(bh) & ")  renderable=" &
           $(cNuRectRenderable(bw, bh) != 0'i32)
 
-  # THE CALL RUN 1 FAULTED ON (or just after). It is now the last thing
-  # attempted, it is breadcrumbed, and a fault here costs Stage A nothing.
-  nuStep("B", "AddComponent<TextMeshProUGUI> -- THIS is the call run 1 " &
-              "faulted on or immediately after. It runs TMP's Awake. If the " &
-              "log stops here, that is the answer.")
+  # DEFER TMP's Awake. Run 1 faulted on/just after AddComponent<TMP> while the
+  # GameObject was active -- which means Awake/OnEnable fired SYNCHRONOUSLY from
+  # the add, reached for a null default font asset, and died. There is no
+  # "after AddComponent, before render" window on an active object: the add IS
+  # the render. So deactivate the GameObject first; Unity then holds Awake and
+  # OnEnable until re-activation, giving us a place to wire the dependencies.
+  nuStep("B", "SetActive(false) -- defer TMP's Awake so its NULL font/material " &
+              "are not dereferenced on the add (this is the diagnosis: the " &
+              "fault is at Awake, not first render)")
+  if not nuSetActive(go, false):
+    warn "nativeui PROOF B: INCONCLUSIVE -- could not deactivate before the " &
+         "TMP add; refusing to add TMP to an active object; tearing down"
+    discard nuDestroy(go)
+    return
+
+  nuStep("B", "AddComponent<TextMeshProUGUI> on the INACTIVE object -- Awake " &
+              "is deferred, so this no longer runs TMP's font-loading path")
   let tmp = nuAdd(go, NuKindTmpText)
   if tmp == nil:
     gNuVerdictB = (if cNuSlotState(NuKindTmpText) == NuSlotPoisoned:
@@ -968,12 +1052,22 @@ proc nuProofStageB(tabPtr: Il2CppPtr) =
          "could not be settled; tearing down"
     discard nuDestroy(go)
     return
-  okLog "nativeui PROOF B: AddComponent<TextMeshProUGUI> SURVIVED -- building " &
-        "a TMP label from scratch is possible on this build"
+  okLog "nativeui PROOF B: AddComponent<TextMeshProUGUI> on the inactive " &
+        "object SURVIVED"
 
-  nuStep("B", "set_fontSize + set_text")
+  # THE FIX. Copy font asset + materials from the live donor TMP (gMi2Tmp,
+  # the anchor Stage A walked to and registered as the reference instance)
+  # BEFORE the component is activated, so its deferred Awake finds them set.
+  nuStep("B", "wireTextDeps -- copy font asset + material from the live donor")
+  if not nuWireTextDeps(tmp, gMi2Tmp):
+    warn "nativeui PROOF B: FAIL -- could not wire the TMP's font/material " &
+         "dependencies; activating it would fault. Tearing down."
+    gNuVerdictB = "FAIL"
+    discard nuDestroy(go)
+    return
+
+  nuStep("B", "set_fontSize (still inactive, no render yet)")
   discard nuSetFontSize(tmp, 28.0'f32)
-  discard nuSetText(tmp, NuProofTextB)
 
   nuStep("B", "nuLayout")
   if not nuLayout(rt,
@@ -987,8 +1081,15 @@ proc nuProofStageB(tabPtr: Il2CppPtr) =
     discard nuDestroy(go)
     return
 
-  nuStep("B", "SetActive(true) + re-apply set_text")
+  # NOW Awake/OnEnable fires -- with font and material wired. This is the new
+  # fault point if the deps are still insufficient; it is breadcrumbed so the
+  # next run names it rather than leaving a gap.
+  nuStep("B", "SetActive(true) -- TMP's Awake/OnEnable runs HERE now, with " &
+              "font+material wired. If the log stops here, TMP needs more than " &
+              "font+material.")
   discard nuSetActive(go, true)
+  nuStep("B", "set_text through the real setter + re-apply after activation")
+  discard nuSetText(tmp, NuProofTextB)
   discard nuSetText(tmp, NuProofTextB)
 
   gNuVerdictB = nuReportFinished("B", go, rt, tmp, NuProofTextB)
