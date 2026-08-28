@@ -15,10 +15,17 @@
 ## and `il2cpp_class_get_method_from_name` return NON-NIL pointers into
 ## UNMAPPED memory (fact #35), so a `if cls == nil` guard is a check that
 ## CANNOT FAIL and the process dies at the first dereference through the
-## handle. So this file resolves NOTHING by name. It has no bindings, installs
-## no detour, and calls no game method.
+## handle. So this file resolves NOTHING by name. It has no bindings and
+## installs no detour.
 ##
-## What is left is exactly two things, and they are enough:
+## It does make ONE game call, and only one: a direct call at the STATIC,
+## BYTE-VERIFIED RVA 0x6F32C0. That is a different mechanism from a by-name
+## lookup and is unaffected by fact #145 or by the export gates -- it never
+## touches the il2cpp export ABI at all. It exists because the live world
+## position is not a managed field on this build and cannot be read as one;
+## see `posOf`.
+##
+## What is left is exactly three things, and they are enough:
 ##
 ##   1. **A borrowed world pointer.** `aowl_host_gameworld` is a host export
 ##      populated by the host's OWN, ALREADY-ARMED `RegisterPlayer` detour. We
@@ -29,6 +36,11 @@
 ##   2. **Raw reads at MEASURED static field offsets**, each one guarded by
 ##      `aowl_is_readable` (VirtualQuery) so a stale offset or a moved object is
 ##      a zero rather than a fault.
+##
+##   3. **One direct call at a byte-verified static RVA**, armed once, and
+##      preceded by a guarded walk of every pointer the callee will
+##      dereference, so the callee's managed-throw branches are provably
+##      unreachable before the call is made.
 ##
 ## ---------------------------------------------------------------------------
 ## PROVENANCE OF EVERY OFFSET BELOW
@@ -47,7 +59,25 @@
 ##   EFT.Player        <Profile>k__BackingField         0x9c0
 ##   EFT.Player        <AIData>k__BackingField          0xa00
 ##   EFT.MovementContext PreviousPosition               0x370   (Vector3)
+##       -- CORRECT, AND PERMANENTLY ZERO ON THIS BUILD. Kept named here only
+##          so nobody re-derives it and thinks they have found the answer.
+##   EFT.Player        <PlayerBones>k__BackingField      0xb40   (PlayerBones)
+##   PlayerBones       BodyTransform                    0x178   (BifacialTransform)
+##   EFT.BifacialTransform Original                     0x10    (Transform)
+##   EFT.BifacialTransform _useImitation                0xa8    (bool)
+##   EFT.BifacialTransform _accumulatePositionAndRotation 0xa9  (bool)
 ##   EFT.Profile       Id                               0x10    (System.String)
+##
+## Each of the five position-path offsets above is corroborated by a SECOND,
+## independent source: the instruction bytes of the client's own accessors,
+## `EFT.Player::get_Position` @0x6F32C0 and
+## `EFT.BifacialTransform::get_position` @0x8D3FA0. Neither offset was taken
+## from metadata alone. The decode is in the C block below.
+##
+## THIS FILE NOW MAKES EXACTLY ONE GAME CALL: a direct call at the static,
+## byte-verified RVA 0x6F32C0. That is not a by-name route and is not a
+## detour -- it is the one thing fact #145 leaves standing, and it is
+## necessary because the live pose exists ONLY on Unity's native side.
 ##
 ## They are constants, not runtime lookups, precisely because the runtime
 ## lookup needs the faulting API. The cost is that a Tarkov update invalidates
@@ -161,6 +191,136 @@ static int32_t sp_pos_read(void* o, int32_t off, float* out3) {
  * narrowed and anything outside printable ASCII becomes '?', so a wrong
  * offset yields visible junk rather than smuggling bytes into JSON. Capped by
  * construction: at most 8 iterations whatever the length field says. */
+/* ===================================================================
+ * THE LIVE WORLD POSITION IS NOT A MANAGED FIELD ON THIS BUILD.
+ * ===================================================================
+ *
+ * `EFT.MovementContext.PreviousPosition` @0x370 EXISTS (metadata confirms the
+ * name and the offset) and is genuinely, permanently zero -- 66331 readable
+ * reads, all (0,0,0), measured live in a raid on 2026-08-28. It is declared
+ * and never written on this build.
+ *
+ * Where the pose really lives, read out of the client's OWN accessor bytes,
+ * corroborated field-by-field against metadata:
+ *
+ *   EFT.Player::get_Position  RVA 0x6F32C0
+ *     40 53 48 83 EC 30              push rbx; sub rsp,0x30
+ *     48 8B 82 40 0B 00 00           mov rax,[rdx+0xB40]   Player.PlayerBones
+ *     48 8B D9                       mov rbx,rcx           (sret buffer)
+ *     48 85 C0 74 30                 null -> throw path
+ *     48 8B 90 78 01 00 00           mov rdx,[rax+0x178]   PlayerBones.BodyTransform
+ *     48 85 D2 74 24                 null -> throw path
+ *     45 33 C0                       xor r8d,r8d           MethodInfo* = NULL
+ *     48 8D 4C 24 20                 lea rcx,[rsp+0x20]
+ *     E8 B2 0C 1E 00                 call 0x8D3FA0  BifacialTransform::get_position
+ *     ... F2 0F 11 03 / 89 43 08     store 12 bytes to [rbx]; return rbx
+ *
+ *   metadata: EFT.Player.<PlayerBones>k__BackingField @0xB40  (PlayerBones)
+ *   metadata: PlayerBones.BodyTransform              @0x178  (BifacialTransform)
+ *
+ *   EFT.BifacialTransform::get_position  RVA 0x8D3FA0
+ *     80 BA A9 00 00 00 00  cmp byte [rdx+0xA9],0   _accumulatePositionAndRotation
+ *     80 BA A8 00 00 00 00  cmp byte [rdx+0xA8],0   _useImitation
+ *     48 8B 7A 10           mov rdi,[rdx+0x10]      Original (UnityEngine.Transform)
+ *     ... FF D0             Transform::get_position_Injected(this, out Vector3)
+ *
+ *   metadata: BifacialTransform.Original @0x10, _useImitation @0xA8,
+ *             _accumulatePositionAndRotation @0xA9   -- all three match.
+ *
+ * The fast path bottoms out in a UNITY NATIVE ICall. There is therefore NO
+ * managed offset that holds the live pose, and no amount of hunting for one
+ * will produce it. A direct call at a byte-verified static RVA is the only
+ * route, and it is the route CLAUDE.md sanctions.
+ *
+ * WHY WE WALK THE CHAIN OURSELVES BEFORE CALLING. Both `get_Position` and
+ * `get_position` THROW a managed NullReferenceException on their null
+ * branches (`E8 26 F2 ED FF` at the tail of 0x6F32C0). A managed throw
+ * unwinding out of a raw native call, 128 times a frame, is not something we
+ * survive. So every pointer the callee will dereference is validated HERE
+ * first, and the call only happens once the throw branches are proven
+ * unreachable. The pre-walk is not redundant with the callee's checks; it is
+ * what makes the callee's checks never fire.
+ * =================================================================== */
+#define SP_GETPOS_RVA  0x6F32C0
+#define SP_PL_BONES    0xB40
+#define SP_PB_BODYXF   0x178
+#define SP_BT_ORIGINAL 0x10
+#define SP_BT_USEIMIT  0xA8
+#define SP_BT_ACCUM    0xA9
+
+/* Exit codes ABOVE the MM_POS_* range, so the six-way classification the
+ * diagnostic already reports survives intact and these are additive. A future
+ * wrong offset that lands on a mapped, zeroed page STILL comes back as
+ * MM_POS_ALLZERO -- "readable page, all zeros" -- which is the report that
+ * made this bug findable at all. */
+#define SP_POS_NILBONES 10
+#define SP_POS_NILXFORM 11
+#define SP_POS_IMITATED 12
+#define SP_POS_NOCALL   13
+
+static const unsigned char sp_getpos_prologue[16] = {
+  0x40,0x53,0x48,0x83,0xEC,0x30,0x48,0x8B,
+  0x82,0x40,0x0B,0x00,0x00,0x48,0x8B,0xD9
+};
+static void*   sp_getpos_fn    = 0;
+static int32_t sp_getpos_state = 0;   /* 0 untried, 1 armed, -1 refused */
+
+/* Arm ONCE. `base` is GameAssembly.dll's module handle, obtained on the Nim
+ * side through the OS loader (GetModuleHandleA), which cannot fault and is
+ * not an il2cpp by-name lookup. Refusal is sticky: a build whose prologue
+ * does not match never gets a second chance, and never calls. */
+static int32_t sp_getpos_arm(void* base) {
+  unsigned char* fn;
+  if (sp_getpos_state != 0) return sp_getpos_state;
+  if (!base) { sp_getpos_state = -1; return -1; }
+  fn = (unsigned char*)base + SP_GETPOS_RVA;
+  if (!aowl_is_readable(fn, 16))                        { sp_getpos_state = -1; return -1; }
+  if (memcmp(fn, sp_getpos_prologue, 16) != 0)          { sp_getpos_state = -1; return -1; }
+  sp_getpos_fn = (void*)fn;
+  sp_getpos_state = 1;
+  return 1;
+}
+static int32_t sp_getpos_armed(void) { return sp_getpos_state; }
+
+static int32_t sp_rd_u8(void* o, int32_t off, unsigned char* out) {
+  unsigned char* a = (unsigned char*)o + off;
+  *out = 0;
+  if (!aowl_is_readable(a, 1)) return 0;
+  *out = *a;
+  return 1;
+}
+
+/* Vector3 (12 bytes) is bigger than 8, so Win64 returns it through a HIDDEN
+ * BUFFER: (retbuf in RCX, this in RDX, MethodInfo* in R8). That shape is not
+ * inferred from the name -- it is read off `48 8B D9` (mov rbx,rcx) at entry
+ * and `F2 0F 11 03 / 89 43 08 / 48 8B C3` (store 12 bytes to [rbx], return
+ * rbx) at exit. MethodInfo* NULL is safe: get_Position is not generic. */
+static int32_t sp_pos_live(void* player, float* out3) {
+  void* bones; void* bt; void* orig;
+  unsigned char flag = 0;
+  float tmp[3];
+  out3[0] = 0.0f; out3[1] = 0.0f; out3[2] = 0.0f;
+  if (sp_getpos_state != 1) return SP_POS_NOCALL;
+  if (!player)              return SP_POS_NILBONES;
+  bones = sp_rd_ptr(player, SP_PL_BONES);
+  if (!bones)               return SP_POS_NILBONES;
+  bt = sp_rd_ptr(bones, SP_PB_BODYXF);
+  if (!bt)                  return SP_POS_NILXFORM;
+  /* Both imitation flags must be clear, or get_position takes a delegate path
+   * we have NOT proven throw-free. Declining is an ANSWER, not a silence. */
+  if (!sp_rd_u8(bt, SP_BT_ACCUM, &flag)   || flag) return SP_POS_IMITATED;
+  if (!sp_rd_u8(bt, SP_BT_USEIMIT, &flag) || flag) return SP_POS_IMITATED;
+  orig = sp_rd_ptr(bt, SP_BT_ORIGINAL);
+  if (!orig)                return SP_POS_NILXFORM;
+  tmp[0] = 0.0f; tmp[1] = 0.0f; tmp[2] = 0.0f;
+  ((void* (*)(void*, void*, void*))sp_getpos_fn)((void*)tmp, player, (void*)0);
+  out3[0] = tmp[0]; out3[1] = tmp[1]; out3[2] = tmp[2];
+  /* readable=1: the buffer is OUR stack, so readability is not in question
+   * here -- it was answered by the guarded walk above. The plausibility gates
+   * (NaN / out-of-range / exactly-zero) still apply unchanged. */
+  return (int32_t)mm_pos_classify(1, tmp[0], tmp[1], tmp[2]);
+}
+
 static int32_t sp_rd_idtail(void* s, int32_t lenOff, int32_t chOff, char* out) {
   int32_t n, take, i;
   out[0] = 0;
@@ -199,8 +359,17 @@ const
   MmPosNan*        = 2
   MmPosRange*      = 3
   MmPosAllZero*    = 4
+  # Above the MM_POS_* range; see the C block for why these are additive.
+  SpPosNilBones*   = 10
+  SpPosNilXform*   = 11
+  SpPosImitated*   = 12
+  SpPosNoCall*     = 13
 proc cRdIdTail(s: pointer; lenOff, chOff: int32; outBuf: cstring): int32 {.
   importc: "sp_rd_idtail", nodecl.}
+proc cGetPosArm(base: pointer): int32 {.importc: "sp_getpos_arm", nodecl.}
+proc cGetPosArmed(): int32 {.importc: "sp_getpos_armed", nodecl.}
+proc cPosLive(player: pointer; out3: ptr cfloat): int32 {.
+  importc: "sp_pos_live", nodecl.}
 
 proc rdPtr(o: pointer; off: int): pointer =
   if o == nil: return nil
@@ -266,6 +435,12 @@ proc resolveHost() =
   var n2 = "aowl_host_gameworld_armed"
   gFn = wGetProcAddress(h, toCString(n1))
   gArmedFn = wGetProcAddress(h, toCString(n2))
+  # Arm the position accessor at the same time, and by the same OS-loader
+  # route. GameAssembly.dll is already loaded in the client; GetModuleHandleA
+  # does NOT load it, so this returns NULL server-side and the call is simply
+  # never armed there. No il2cpp name is involved at any point.
+  var gaName = "GameAssembly.dll"
+  discard cGetPosArm(cast[pointer](wGetModuleHandleA(toCString(gaName))))
 
 proc gwState*(): int =
   ## FOUR answers, never flattened to a bool. CLAUDE.md 9b: "I could not look"
@@ -348,6 +523,7 @@ proc feedStateText*(): string =
 type
   PosReason* = object
     nilPlayer*, nilCtx*, unreadable*, nan*, outOfRange*, allZero*, good*: int
+    nilBones*, nilXform*, imitated*, noCall*: int
 
 var gPosNow: PosReason
 var gPosEver: PosReason
@@ -360,18 +536,25 @@ proc posAdd(a: var PosReason; b: PosReason) =
   a.outOfRange = a.outOfRange + b.outOfRange
   a.allZero    = a.allZero    + b.allZero
   a.good       = a.good       + b.good
+  a.nilBones   = a.nilBones   + b.nilBones
+  a.nilXform   = a.nilXform   + b.nilXform
+  a.imitated   = a.imitated   + b.imitated
+  a.noCall     = a.noCall     + b.noCall
 
 proc posReasonText(r: PosReason): string =
   "good=" & $r.good & " nilPlayer=" & $r.nilPlayer & " nilMoveCtx=" & $r.nilCtx &
   " unreadable=" & $r.unreadable & " NaN=" & $r.nan &
-  " outOfRange=" & $r.outOfRange & " allZero=" & $r.allZero
+  " outOfRange=" & $r.outOfRange & " allZero=" & $r.allZero &
+  " nilBones=" & $r.nilBones & " nilBodyTransform=" & $r.nilXform &
+  " imitatedTransform=" & $r.imitated & " getPosNotArmed=" & $r.noCall
 
 proc posEverText*(): string = posReasonText(gPosEver)
 proc posNowText*(): string = posReasonText(gPosNow)
 proc posEverGood*(): int = gPosEver.good
 proc posEverTried*(): int =
   gPosEver.good + gPosEver.nilPlayer + gPosEver.nilCtx + gPosEver.unreadable +
-  gPosEver.nan + gPosEver.outOfRange + gPosEver.allZero
+  gPosEver.nan + gPosEver.outOfRange + gPosEver.allZero + gPosEver.nilBones +
+  gPosEver.nilXform + gPosEver.imitated + gPosEver.noCall
 
 proc posVerdict*(): string =
   ## The single sentence a human needs. It names the DOMINANT reason, because
@@ -383,21 +566,47 @@ proc posVerdict*(): string =
   if gPosEver.good > 0:
     return "positions ARE being read (" & $gPosEver.good & " of " & $tried & ")"
   # Nothing has ever passed. Say which gate ate them, by name and offset.
+  if gPosEver.noCall > 0:
+    return "EVERY position read was DECLINED for all " & $gPosEver.noCall &
+           " players because EFT.Player::get_Position @0x6F32C0 is NOT ARMED " &
+           "-- either GameAssembly.dll was not in this process, or its first " &
+           "16 bytes did not match the recorded prologue " &
+           "(40 53 48 83 EC 30 48 8B 82 40 0B 00 00 48 8B D9). A Tarkov " &
+           "update moves that RVA; re-derive it, do not widen the check"
+  if gPosEver.nilBones > 0:
+    return "EVERY position read failed and " & $gPosEver.nilBones &
+           " had a NULL Player+0xB40 <PlayerBones>k__BackingField -- the " &
+           "player object is real but its bones are not built yet, or " &
+           "Player+0xB40 is wrong on this build. A POINTER problem"
+  if gPosEver.nilXform > 0:
+    return "EVERY position read failed and " & $gPosEver.nilXform &
+           " had a NULL PlayerBones+0x178 BodyTransform (or a NULL " &
+           "BifacialTransform+0x10 Original). The call was correctly NOT " &
+           "made -- get_Position throws on exactly this branch"
+  if gPosEver.imitated > 0:
+    return "EVERY position read was DECLINED for all " & $gPosEver.imitated &
+           " players because BifacialTransform+0xA8 _useImitation or +0xA9 " &
+           "_accumulatePositionAndRotation was SET, so get_position would " &
+           "take a delegate path this code has not proven throw-free. This " &
+           "is a deliberate refusal, not a failure to read"
   if gPosEver.unreadable > 0:
     return "EVERY position read failed and " & $gPosEver.unreadable &
-           " were UNREADABLE -- MovementContext+0x370 is not mapped, so the " &
-           "object is not a MovementContext (a wrong Player+0x60, or a freed " &
-           "object). This is a POINTER problem, not an offset-value problem"
+           " were UNREADABLE -- a VirtualQuery refusal partway down " &
+           "Player+0xB40 -> PlayerBones+0x178 -> BifacialTransform. This is " &
+           "a POINTER problem, not an offset-value problem"
   if gPosEver.allZero > 0:
     return "EVERY position read failed and " & $gPosEver.allZero &
-           " came back exactly (0,0,0) from a READABLE page -- the bytes at " &
-           "MovementContext+0x370 are really zero, so that field is not the " &
-           "live pose on this build, or the object is a fresh/unspawned Player"
+           " came back exactly (0,0,0) from a READABLE page -- " &
+           "EFT.Player::get_Position @0x6F32C0 returned the origin for every " &
+           "player, so the object we passed is not a live Player, or the " &
+           "walk reached a BifacialTransform that is not the body. THIS IS " &
+           "THE EXACT SHAPE THE OLD MovementContext+0x370 BUG PRODUCED -- " &
+           "treat it as 'the source of the pose is wrong', not as a fault"
   if gPosEver.nan > 0 or gPosEver.outOfRange > 0:
     return "EVERY position read failed plausibility (NaN=" & $gPosEver.nan &
-           " outOfRange=" & $gPosEver.outOfRange & ") -- the page is mapped " &
-           "and holds non-position bytes, which means Player+0x60 or " &
-           "MovementContext+0x370 is pointing at the wrong thing"
+           " outOfRange=" & $gPosEver.outOfRange & ") -- get_Position " &
+           "returned non-position bytes, which means Player+0xB40 or " &
+           "PlayerBones+0x178 is pointing at the wrong thing on this build"
   if gPosEver.nilCtx > 0:
     return "EVERY position read failed because Player+0x60 " &
            "<MovementContext>k__BackingField was NULL for all " &
@@ -406,57 +615,86 @@ proc posVerdict*(): string =
   "posOf's own accounting, not a measurement"
 
 proc posOf(p: pointer; ok: var bool; x, y, z: var float) =
-  ## Player +0x60 -> MovementContext +0x370 (Vector3). This is the pose the
-  ## client itself reads, not a transform we chose.
+  ## The live world pose, via `EFT.Player::get_Position` @0x6F32C0.
   ##
-  ## Offsets re-verified offline 2026-08-28 against
-  ## `.cache/global-metadata.dec.dat` (fldoff self-check passed):
-  ##   EFT.Player.<MovementContext>k__BackingField  0x60
-  ##   EFT.MovementContext.PreviousPosition Vector3 0x370
-  ## Both are CORRECT, so a failure here is about the POINTER or the live
-  ## bytes, never about the constants. Every exit below is counted.
+  ## WHAT CHANGED AND WHY. This used to read Player+0x60 -> MovementContext
+  ## +0x370 `PreviousPosition`. That offset is CORRECT -- metadata names the
+  ## field at exactly 0x370 -- and it is also permanently ZERO: measured live
+  ## in a raid on 2026-08-28, 66331 readable reads, every one (0,0,0). The
+  ## field is declared and never written on this build. No other offset holds
+  ## the pose either: the client's own accessor bottoms out in the Unity
+  ## native ICall `Transform::get_position_Injected`, so there IS no managed
+  ## field to point at. The C block above shows the instruction bytes that
+  ## establish that, hop by hop, each corroborated against metadata.
+  ##
+  ## So this now walks Player+0xB40 (PlayerBones) -> +0x178 (BodyTransform)
+  ## -> BifacialTransform, validating and null-checking every hop precisely so
+  ## the callee's throw branches are unreachable, then makes ONE direct call
+  ## at a byte-verified static RVA. No name is resolved; no detour is bound.
+  ##
+  ## Every exit is still counted and named. `allZero` in particular is kept as
+  ## a first-class outcome rather than folded into a generic failure -- it is
+  ## the report that found this bug, and it must still be able to find the
+  ## next one.
   ok = false
   x = 0.0; y = 0.0; z = 0.0
   if p == nil:
     gPosNow.nilPlayer = gPosNow.nilPlayer + 1
     return
-  let mc = rdPtr(p, PlMoveCtx)
-  if mc == nil:
-    gPosNow.nilCtx = gPosNow.nilCtx + 1
-    note("Player+0x60 <MovementContext>k__BackingField read null")
-    return
-  # One 12-byte read whose READABILITY is answered separately from its
-  # PLAUSIBILITY, so "the page is not mapped" stops masquerading as "the
-  # player is at the origin". The thresholds are mm_pos_classify's, in
-  # sp/mapmath.h, tested offline -- they are not restated here.
   # Explicitly zeroed: nimony cannot prove an array written only through a
   # `ptr` passed to C is initialised, and it is right to refuse -- if the C
   # side ever returned without writing, these would be whatever was on the
   # stack, which is the "plausible wrong number" failure this file exists to
-  # avoid. `sp_rd_vec3` zeroes them too; agreeing costs nothing.
+  # avoid. `sp_pos_live` zeroes them too; agreeing costs nothing.
   var v: array[3, cfloat] = [0.0'f32, 0.0'f32, 0.0'f32]
-  let code = cPosRead(mc, int32(McPrevPos), addr v[0])
+  let code = cPosLive(p, addr v[0])
   x = float(v[0]); y = float(v[1]); z = float(v[2])
   case int(code)
+  of SpPosNoCall:
+    gPosNow.noCall = gPosNow.noCall + 1
+    note("EFT.Player::get_Position @0x6F32C0 is NOT ARMED -- GameAssembly.dll " &
+         "absent, or its prologue did not byte-verify. No call was made")
+    x = 0.0; y = 0.0; z = 0.0
+    return
+  of SpPosNilBones:
+    gPosNow.nilBones = gPosNow.nilBones + 1
+    note("Player+0xB40 <PlayerBones>k__BackingField read null")
+    x = 0.0; y = 0.0; z = 0.0
+    return
+  of SpPosNilXform:
+    gPosNow.nilXform = gPosNow.nilXform + 1
+    note("PlayerBones+0x178 BodyTransform (or BifacialTransform+0x10 " &
+         "Original) read null -- get_Position would have THROWN here, so it " &
+         "was deliberately not called")
+    x = 0.0; y = 0.0; z = 0.0
+    return
+  of SpPosImitated:
+    gPosNow.imitated = gPosNow.imitated + 1
+    note("BifacialTransform+0xA8 _useImitation / +0xA9 " &
+         "_accumulatePositionAndRotation is SET -- declined rather than take " &
+         "an unproven delegate path")
+    x = 0.0; y = 0.0; z = 0.0
+    return
   of MmPosUnreadable:
     gPosNow.unreadable = gPosNow.unreadable + 1
-    note("MovementContext+0x370 PreviousPosition is NOT READABLE (12 bytes) " &
-         "-- a VirtualQuery refusal, not a zero position")
+    note("a hop on Player+0xB40 -> PlayerBones+0x178 was NOT READABLE -- a " &
+         "VirtualQuery refusal, not a zero position")
     x = 0.0; y = 0.0; z = 0.0
     return
   of MmPosNan:
     gPosNow.nan = gPosNow.nan + 1
-    note("MovementContext+0x370 read NaN")
+    note("get_Position @0x6F32C0 returned NaN")
     x = 0.0; y = 0.0; z = 0.0
     return
   of MmPosRange:
     gPosNow.outOfRange = gPosNow.outOfRange + 1
-    note("MovementContext+0x370 read out of range (|component| > 1e6)")
+    note("get_Position @0x6F32C0 returned out of range (|component| > 1e6)")
     x = 0.0; y = 0.0; z = 0.0
     return
   of MmPosAllZero:
     gPosNow.allZero = gPosNow.allZero + 1
-    note("MovementContext+0x370 read exactly (0,0,0) from a READABLE page")
+    note("get_Position @0x6F32C0 returned exactly (0,0,0) from a READABLE " &
+         "page -- the walk succeeded but the pose source is wrong")
     x = 0.0; y = 0.0; z = 0.0
     return
   else:

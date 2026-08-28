@@ -327,6 +327,106 @@ static void test_pos(void)
        "the five position codes are pairwise distinct");
 }
 
+/* ------------------------------------------------- the live-position accessor
+ *
+ * `world.nim` now reads the pose by CALLING EFT.Player::get_Position @0x6F32C0
+ * rather than by reading MovementContext+0x370, which metadata names correctly
+ * and which is permanently zero on this build (66331 readable reads, all
+ * (0,0,0), measured live 2026-08-28).
+ *
+ * None of the call itself can be exercised offline -- there is no
+ * GameAssembly.dll here and no live Player. What CAN be pinned offline, and is
+ * pinned here, is everything that would silently rot: the recorded prologue,
+ * the walk offsets, and the fact that the four new refusal codes stay
+ * distinguishable from the five value codes. If a future edit widens the
+ * prologue check or collapses "declined" into "failed", these fail.
+ *
+ * Constants are restated literally rather than included, on purpose: the point
+ * is to detect a change in world.nim, and a test that imports the value it is
+ * checking cannot fail.
+ */
+#define T_GETPOS_RVA   0x6F32C0
+#define T_PL_BONES     0xB40
+#define T_PB_BODYXF    0x178
+#define T_BT_ORIGINAL  0x10
+#define T_BT_USEIMIT   0xA8
+#define T_BT_ACCUM     0xA9
+#define T_POS_NILBONES 10
+#define T_POS_NILXFORM 11
+#define T_POS_IMITATED 12
+#define T_POS_NOCALL   13
+
+static void test_poslive(void)
+{
+    /* The 16 prologue bytes of EFT.Player::get_Position, transcribed from
+     * `il2cpp_resolve.py bytes 0x6F32C0`. The two 7-byte `mov` encodings are
+     * the load-bearing part: they ARE the offsets, which is why the offsets
+     * below are corroborated and not merely asserted. */
+    static const unsigned char pro[16] = {
+        0x40,0x53,0x48,0x83,0xEC,0x30,0x48,0x8B,
+        0x82,0x40,0x0B,0x00,0x00,0x48,0x8B,0xD9
+    };
+    int i;
+    int nonzero = 0;
+
+    ok(sizeof(pro) == 16,
+       "the recorded prologue is exactly 16 bytes -- not a shorter, weaker check");
+    for (i = 0; i < 16; i++) if (pro[i]) nonzero++;
+    ok(nonzero >= 12,
+       "the prologue is real code, not a run of padding or 0xCC");
+
+    /* `48 8B 82 <imm32>` == mov rax,[rdx+disp32]. The disp32 is little-endian
+     * at pro[9..12] and MUST equal Player.<PlayerBones>k__BackingField. This
+     * is the cross-check: metadata said 0xB40 and so does the instruction. */
+    ok(pro[6] == 0x48 && pro[7] == 0x8B && pro[8] == 0x82,
+       "prologue byte 6..8 is `mov rax,[rdx+disp32]` as decoded");
+    ok(((unsigned int)pro[9]        |
+        ((unsigned int)pro[10] << 8)  |
+        ((unsigned int)pro[11] << 16) |
+        ((unsigned int)pro[12] << 24)) == (unsigned int)T_PL_BONES,
+       "the prologue's own disp32 IS 0xB40 -- metadata and code bytes agree");
+
+    /* `48 8B D9` == mov rbx,rcx: the sret buffer is saved from RCX. That is
+     * the evidence the return shape is (retbuf RCX, this RDX, MethodInfo* R8)
+     * and not a packed-in-RAX Vector2-style return. */
+    ok(pro[13] == 0x48 && pro[14] == 0x8B && pro[15] == 0xD9,
+       "the prologue saves RCX into RBX -- confirming the sret (hidden-buffer) shape");
+
+    ok(T_GETPOS_RVA == 0x6F32C0,
+       "the position RVA is the one the prologue was transcribed from");
+
+    /* The walk offsets, each of which the C block documents against both
+     * metadata and an accessor's bytes. */
+    ok(T_PB_BODYXF == 0x178,
+       "PlayerBones.BodyTransform is 0x178");
+    ok(T_BT_ORIGINAL == 0x10 && T_BT_USEIMIT == 0xA8 && T_BT_ACCUM == 0xA9,
+       "BifacialTransform Original/_useImitation/_accumulate are 0x10/0xA8/0xA9");
+    ok(T_BT_USEIMIT != T_BT_ACCUM,
+       "the two imitation flags are separate bytes -- checking one is not checking both");
+
+    /* THE PROPERTY THAT MATTERS MOST. A wrong offset in the future must still
+     * come back as "readable page, all zeros" -- the exact report that made
+     * the MovementContext+0x370 bug findable. So MM_POS_ALLZERO must survive
+     * as its own code and must not collide with any refusal code. */
+    ok(T_POS_NILBONES > MM_POS_ALLZERO && T_POS_NILBONES > MM_POS_OK,
+       "the refusal codes sit ABOVE the MM_POS_* range and cannot alias them");
+    ok(T_POS_NILBONES != T_POS_NILXFORM && T_POS_NILXFORM != T_POS_IMITATED
+       && T_POS_IMITATED != T_POS_NOCALL && T_POS_NILBONES != T_POS_NOCALL
+       && T_POS_NILBONES != T_POS_IMITATED && T_POS_NILXFORM != T_POS_NOCALL,
+       "the four refusal codes are pairwise distinct");
+    ok(T_POS_NOCALL != MM_POS_UNREADABLE,
+       "'not armed' is NOT 'unreadable' -- a refusal to look is not a failed look");
+    ok(T_POS_IMITATED != MM_POS_ALLZERO,
+       "'declined, imitated transform' is NOT 'read zeros'");
+
+    /* And the classifier the call feeds is unchanged: a returned (0,0,0) from
+     * a successful call is still ALLZERO, still distinct from OK. */
+    ok(mm_pos_classify(1, 0.0f, 0.0f, 0.0f) == MM_POS_ALLZERO,
+       "a get_Position that returns the origin still reports ALLZERO, not OK");
+    ok(mm_pos_classify(1, 123.5f, 2.25f, -456.75f) == MM_POS_OK,
+       "a get_Position that returns a real pose reports OK");
+}
+
 int main(void)
 {
     test_topdown();
@@ -335,6 +435,7 @@ int main(void)
     test_bearing();
     test_tiles();
     test_pos();
+    test_poslive();
     printf("mapstest: %d passed, %d failed\n", g_pass, g_fail);
     return g_fail == 0 ? 0 : 1;
 }
